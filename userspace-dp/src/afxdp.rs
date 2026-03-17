@@ -66,8 +66,8 @@ mod tx;
 use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
     AfXdpBindStrategy, binding_frame_count, ifinfo_from_binding, interface_driver_name,
-    open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets,
-    reserved_tx_frames, umem_ring_size,
+    open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets, reserved_tx_frames,
+    umem_ring_size,
 };
 #[cfg(test)]
 use self::bind::{
@@ -1575,7 +1575,6 @@ struct PendingForwardRequest {
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
     flow_key: Option<SessionKey>,
-    frame_build_ctx: Option<ForwardFrameBuildCtx>,
     /// NAT64 reverse info for cross-AF translation (IPv4 reply → IPv6).
     nat64_reverse: Option<Nat64ReverseInfo>,
     /// Pre-built frame bytes that bypass normal frame building.
@@ -2108,9 +2107,7 @@ fn poll_binding(
         if ident.is_none() {
             ident = Some(binding.identity());
         }
-        let ident = ident
-            .as_ref()
-            .expect("identity initialized when RX has work");
+        let ident = ident.as_ref().expect("identity initialized when RX has work");
 
         let mut received = binding.rx.receive(available);
         binding.scratch_recycle.clear();
@@ -2849,7 +2846,6 @@ fn poll_binding(
                                                 apply_nat_on_fabric: false,
                                                 expected_ports: None,
                                                 flow_key: None,
-                                                frame_build_ctx: None,
                                                 nat64_reverse: None,
                                                 prebuilt_frame: Some(rewritten_frame),
                                             });
@@ -3848,7 +3844,6 @@ fn build_live_forward_request(
     {
         decision.resolution.src_mac = zone_redirect.src_mac;
     }
-    let frame_build_ctx = forward_frame_build_ctx(meta, &decision, apply_nat_on_fabric);
     Some(PendingForwardRequest {
         target_ifindex,
         target_binding_index,
@@ -3860,7 +3855,6 @@ fn build_live_forward_request(
         apply_nat_on_fabric,
         expected_ports,
         flow_key: flow.map(|flow| flow.forward_key.clone()),
-        frame_build_ctx,
         nat64_reverse: None,
         prebuilt_frame: None,
     })
@@ -8146,10 +8140,7 @@ mod tests {
             ),
             None
         );
-        assert_eq!(
-            shared_umem_group_key_for_device(Some("mlx5_core"), None),
-            None
-        );
+        assert_eq!(shared_umem_group_key_for_device(Some("mlx5_core"), None), None);
     }
 
     #[test]
@@ -11605,13 +11596,6 @@ mod tests {
 
         assert_eq!(req.target_ifindex, 11);
         assert_eq!(req.target_binding_index, Some(5));
-        let frame_ctx = req.frame_build_ctx.expect("frame build ctx");
-        assert_eq!(frame_ctx.dst_mac, [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
-        assert_eq!(frame_ctx.src_mac, [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]);
-        assert_eq!(frame_ctx.vlan_id, 80);
-        assert_eq!(frame_ctx.eth_len, 18);
-        assert_eq!(frame_ctx.ether_type, 0x0800);
-        assert!(frame_ctx.apply_nat);
     }
 
     #[test]
