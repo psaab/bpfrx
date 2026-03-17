@@ -2183,6 +2183,14 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 		return nil
 	}
 	desired := m.desiredForwardingArmedLocked()
+	if m.clusterHA && !desired {
+		slog.Info(
+			"userspace: forwarding arm state remains disarmed",
+			"current", m.lastStatus.ForwardingArmed,
+			"config_has_data_rg", m.configHasDataRGLocked(),
+			"ha_group_count", len(m.haGroups),
+		)
+	}
 	if m.lastStatus.ForwardingArmed == desired {
 		return nil
 	}
