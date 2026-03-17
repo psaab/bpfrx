@@ -814,6 +814,10 @@ struct BindingStatus {
     tx_bytes: u64,
     #[serde(rename = "tx_errors", default)]
     tx_errors: u64,
+    #[serde(rename = "direct_tx_packets", default)]
+    direct_tx_packets: u64,
+    #[serde(rename = "copy_tx_packets", default)]
+    copy_tx_packets: u64,
     #[serde(rename = "in_place_tx_packets", default)]
     in_place_tx_packets: u64,
     #[serde(rename = "last_heartbeat", skip_serializing_if = "Option::is_none")]
@@ -1245,9 +1249,7 @@ fn handle_stream(
                 if let Some(snapshot) = request.snapshot {
                     eprintln!(
                         "CTRL_REQ: apply_snapshot generation={} fib_generation={} forwarding_armed_before={}",
-                        snapshot.generation,
-                        snapshot.fib_generation,
-                        guard.status.forwarding_armed
+                        snapshot.generation, snapshot.fib_generation, guard.status.forwarding_armed
                     );
                     guard.status.last_snapshot_generation = snapshot.generation;
                     guard.status.last_fib_generation = snapshot.fib_generation;
@@ -1273,8 +1275,7 @@ fn handle_stream(
                 if let Some(forwarding_req) = request.forwarding {
                     eprintln!(
                         "CTRL_REQ: set_forwarding_state armed={} forwarding_armed_before={}",
-                        forwarding_req.armed,
-                        guard.status.forwarding_armed
+                        forwarding_req.armed, guard.status.forwarding_armed
                     );
                     if forwarding_req.armed && !guard.status.capabilities.forwarding_supported {
                         response.ok = false;

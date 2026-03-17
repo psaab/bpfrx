@@ -35,8 +35,8 @@ func TestFormatStatusSummary(t *testing.T) {
 			{QueueID: 1, Armed: false, Ready: false},
 		},
 		Bindings: []BindingStatus{
-			{Slot: 0, Armed: false, Ready: true, Bound: true, XSKRegistered: true, XSKBindMode: "zerocopy", ZeroCopy: true, RXPackets: 10, ValidatedPackets: 8, ExceptionPackets: 1, TXPackets: 3, TXBytes: 420},
-			{Slot: 1, Armed: false, Ready: false, Bound: true, XSKRegistered: false, RXPackets: 5, ValidatedPackets: 4, ExceptionPackets: 2, TXErrors: 1},
+			{Slot: 0, Armed: false, Ready: true, Bound: true, XSKRegistered: true, XSKBindMode: "zerocopy", ZeroCopy: true, RXPackets: 10, ValidatedPackets: 8, ExceptionPackets: 1, TXPackets: 3, TXBytes: 420, DirectTXPackets: 2, InPlaceTXPackets: 1},
+			{Slot: 1, Armed: false, Ready: false, Bound: true, XSKRegistered: false, RXPackets: 5, ValidatedPackets: 4, ExceptionPackets: 2, TXErrors: 1, CopyTXPackets: 4},
 		},
 		RecentExceptions: []ExceptionStatus{
 			{Timestamp: now, Slot: 1, QueueID: 0, Interface: "ge-0-0-2", Reason: "metadata_parse", PacketLength: 128},
@@ -67,6 +67,9 @@ func TestFormatStatusSummary(t *testing.T) {
 		"TX packets:                3",
 		"TX bytes:                  420",
 		"TX errors:                 1",
+		"Direct TX packets:         2",
+		"Copy-path TX packets:      4",
+		"In-place TX packets:       1",
 		"Recent exceptions:         1",
 		"Worker 0 heartbeat age:",
 	} {
@@ -85,7 +88,7 @@ func TestFormatBindings(t *testing.T) {
 			{QueueID: 0, WorkerID: 0, Interfaces: []string{"ge-0-0-1", "ge-0-0-2"}, Registered: true, Armed: false, Ready: false},
 		},
 		Bindings: []BindingStatus{
-			{Slot: 0, QueueID: 0, WorkerID: 0, Registered: true, Armed: false, Ready: false, Bound: true, XSKRegistered: true, XSKBindMode: "zerocopy", ZeroCopy: true, Ifindex: 5, Interface: "ge-0-0-1", RXPackets: 99, TXPackets: 7, ExceptionPackets: 3},
+			{Slot: 0, QueueID: 0, WorkerID: 0, Registered: true, Armed: false, Ready: false, Bound: true, XSKRegistered: true, XSKBindMode: "zerocopy", ZeroCopy: true, Ifindex: 5, Interface: "ge-0-0-1", RXPackets: 99, TXPackets: 7, DirectTXPackets: 5, CopyTXPackets: 1, InPlaceTXPackets: 1, ExceptionPackets: 3},
 			{Slot: 1, QueueID: 0, WorkerID: 0, Registered: true, Armed: false, Ready: false, Bound: true, XSKRegistered: false, Ifindex: 6, Interface: "ge-0-0-2", ExceptionPackets: 1, LastError: "xsk map update failed"},
 		},
 		RecentExceptions: []ExceptionStatus{
@@ -104,6 +107,9 @@ func TestFormatBindings(t *testing.T) {
 		"ge-0-0-2",
 		"zerocopy",
 		"TXPkts",
+		"DirTx",
+		"CopyTx",
+		"InPlTx",
 		"xsk map update failed",
 		"Recent userspace exceptions:",
 		"fib_generation_mismatch",
