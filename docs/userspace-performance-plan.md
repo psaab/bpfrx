@@ -11,7 +11,20 @@ completed cleanup work in [userspace-dataplane-cleanup-plan.md](userspace-datapl
 ## Status Snapshot
 
 All issues described here were identified via code audit on 2026-03-17 against
-current `master`. No fixes have been started.
+current `master`.
+
+Current status:
+
+- Phases 1-6 in this document are still not started.
+- Phase 7 is now in progress on the same-device shared-UMEM prototype branch.
+- The latest transit perf profile shows the remaining dominant cost is the
+  direct-path payload copy, not the copy-path fallback:
+  - `poll_binding` about `17.6%`
+  - `__memmove_evex_unaligned_erms` about `16.7%`
+  - `enqueue_pending_forwards` about `5.8%`
+- Runtime counters on the same run showed `Copy-path TX packets: 0`, so
+  the current optimization target is the direct builder in
+  `build_forwarded_frame_into_from_frame()`.
 
 ## Issue Inventory
 
@@ -35,7 +48,7 @@ current `master`. No fixes have been started.
 
 | ID | Issue | Location | Impact |
 |----|-------|----------|--------|
-| M1 | Cross-binding forwards always copy (2x memcpy) | `enqueue_pending_forwards()` | Performance: extra memcpy on every cross-interface forward |
+| M1 | Cross-binding forwards still require full-payload copy | `enqueue_pending_forwards()` | Performance: direct transit still pays a full packet copy on every cross-allocation forward |
 | M2 | Session lifecycle mismatch userspace vs BPF | `expire_stale()` + BPF map | Stale BPF map entries after session expiry or crash |
 | M3 | Frame ownership audit for all paths | `enqueue_pending_forwards()` all `continue` paths | Verify no other NAT64-style frame leaks exist |
 | M4 | No frame leak detection in production builds | Frame accounting debug-gated | Progressive exhaustion invisible until stall |
@@ -216,21 +229,44 @@ Extract MSS/window scale, create session, forward.
 
 ## Phase 7: Cross-Binding Forward Optimization (M1)
 
-Status: Not Started
+Status: In Progress
 
 ### Root Cause
 
-Each binding owns its own UMEM. Cross-interface forwards must copy into
-heap then into target UMEM (2x memcpy). Direct TX into target UMEM exists
-but fails when free TX frames exhausted.
+Each binding currently owns its own UMEM by default. The old "copy path"
+is no longer the dominant cost. On current `master`, the hot transit path
+is the direct TX builder that still copies the full payload into the
+target UMEM:
+
+```rust
+out.get_mut(eth_len..frame_len)?.copy_from_slice(payload);
+```
+
+So the real root cause is:
+
+- cross-allocation transit still needs a full payload copy
+- copy-path fallback is already near-zero in measured steady-state runs
+- broad worker-wide shared UMEM is not safe across different physical NICs
+  in this lab
 
 ### Fix
 
 Near-term: aggressively drain all bindings' TX completions before falling
 back to copy path.
 
-Long-term: shared UMEM per worker — all bindings share one UMEM, enabling
-in-place rewrite for cross-interface forwards (0 memcpy).
+Long-term: same-device shared UMEM, not worker-global shared UMEM.
+
+Current prototype direction:
+
+1. group bindings by driver + physical device path
+2. only allow shared UMEM for same-device `mlx5_core`
+3. keep `virtio_net` and cross-NIC bindings on private UMEM
+4. widen in-place rewrite eligibility from same-binding hairpin to
+   same-allocation forwards
+
+This is the only safe reintegration point on current `master`. It does
+not remove the copy from the HA lab's cross-NIC transit path by itself,
+but it is the right structural fix for same-device hot paths.
 
 ### Files
 
@@ -240,6 +276,8 @@ in-place rewrite for cross-interface forwards (0 memcpy).
 ### Test Criteria
 
 - Direct TX ratio > 90% under sustained forwarding
+- Copy-path TX remains effectively zero on the current baseline
+- Same-allocation forwards use in-place rewrite instead of payload copy
 - Throughput improvement measured by `userspace-perf-compare.sh`
 
 ## Phase 8: Session Lifecycle BPF Map Sync (M2)
