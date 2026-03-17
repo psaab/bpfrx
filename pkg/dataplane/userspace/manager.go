@@ -2191,6 +2191,15 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 	if m.lastStatus.ForwardingArmed == desired {
 		return nil
 	}
+	if m.clusterHA {
+		slog.Info(
+			"userspace: forwarding arm state change",
+			"desired", desired,
+			"current", m.lastStatus.ForwardingArmed,
+			"config_has_data_rg", m.configHasDataRGLocked(),
+			"ha_group_count", len(m.haGroups),
+		)
+	}
 	var status ProcessStatus
 	req := ControlRequest{
 		Type: "set_forwarding_state",

@@ -1564,6 +1564,7 @@ struct TxRequest {
 
 struct PendingForwardRequest {
     target_ifindex: i32,
+    target_binding_index: Option<usize>,
     ingress_queue_id: u32,
     source_offset: u64,
     desc: XdpDesc,
@@ -1950,6 +1951,7 @@ fn poll_binding(
 ) -> bool {
     #[derive(Default)]
     struct BatchCounters {
+        touched: bool,
         rx_packets: u64,
         rx_bytes: u64,
         rx_batches: u64,
@@ -1966,6 +1968,9 @@ fn poll_binding(
 
     impl BatchCounters {
         fn flush(&mut self, live: &BindingLiveState) {
+            if !self.touched {
+                return;
+            }
             if self.rx_packets != 0 {
                 live.rx_packets
                     .fetch_add(self.rx_packets, Ordering::Relaxed);
@@ -2025,6 +2030,7 @@ fn poll_binding(
                     .fetch_add(self.dnat_packets, Ordering::Relaxed);
                 self.dnat_packets = 0;
             }
+            self.touched = false;
         }
     }
 
@@ -2048,6 +2054,8 @@ fn poll_binding(
     let fill_work = drain_pending_fill(binding, now_ns);
     let mut did_work = tx_work || fill_work;
     binding.dbg_poll_cycles += 1;
+    let mut counters = BatchCounters::default();
+    let mut ident: Option<BindingIdentity> = None;
     for _ in 0..MAX_RX_BATCHES_PER_POLL {
         // Backpressure: skip RX when TX queues are heavily loaded to prevent
         // fill ring exhaustion. The NIC holds packets until we refill (#201).
@@ -2068,6 +2076,8 @@ fn poll_binding(
             // still receive packets. Without this, fill ring starvation causes
             // mlx5 to fall back to non-XSK NAPI, leaking packets to the kernel.
             let _ = drain_pending_fill(binding, now_ns);
+            counters.flush(&binding.live);
+            update_binding_debug_state(binding);
             return did_work;
         }
 
@@ -2087,16 +2097,22 @@ fn poll_binding(
         if available == 0 {
             binding.dbg_rx_empty += 1;
             maybe_wake_rx(binding, false, now_ns);
+            counters.flush(&binding.live);
+            update_binding_debug_state(binding);
             return did_work;
         }
         binding.empty_rx_polls = 0;
+        if ident.is_none() {
+            ident = Some(binding.identity());
+        }
+        let ident = ident.as_ref().expect("identity initialized when RX has work");
 
         let mut received = binding.rx.receive(available);
         binding.scratch_recycle.clear();
         binding.scratch_forwards.clear();
         let mut rst_teardowns: Vec<(SessionKey, NatDecision)> = Vec::new();
-        let mut counters = BatchCounters::default();
         while let Some(desc) = received.read() {
+            counters.touched = true;
             counters.rx_packets += 1;
             counters.rx_bytes += desc.len as u64;
             dbg.rx += 1;
@@ -2449,6 +2465,8 @@ fn poll_binding(
                                     };
                                     if let Some(request) = build_live_forward_request(
                                         unsafe { &*area },
+                                        binding_lookup,
+                                        binding_index,
                                         &ingress_ident,
                                         desc,
                                         meta,
@@ -2812,6 +2830,12 @@ fn poll_binding(
                                                 };
                                             binding.scratch_forwards.push(PendingForwardRequest {
                                                 target_ifindex,
+                                                target_binding_index: binding_lookup.target_index(
+                                                    binding_index,
+                                                    ident.ifindex,
+                                                    ident.queue_id,
+                                                    target_ifindex,
+                                                ),
                                                 ingress_queue_id: ident.queue_id,
                                                 source_offset: desc.addr,
                                                 desc,
@@ -3520,6 +3544,8 @@ fn poll_binding(
                         }
                         if let Some(request) = build_live_forward_request(
                             unsafe { &*area },
+                            binding_lookup,
+                            binding_index,
                             &ident,
                             desc,
                             meta,
@@ -3757,16 +3783,17 @@ fn poll_binding(
         }
         let _ = drain_pending_fill(binding, now_ns);
         counters.rx_batches += 1;
-        counters.flush(&binding.live);
-        update_binding_debug_state(binding);
         did_work = true;
     }
+    counters.flush(&binding.live);
     update_binding_debug_state(binding);
     did_work
 }
 
 fn build_live_forward_request(
     area: &MmapArea,
+    binding_lookup: &WorkerBindingLookup,
+    current_binding_index: usize,
     ingress_ident: &BindingIdentity,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
@@ -3781,6 +3808,12 @@ fn build_live_forward_request(
     } else {
         resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
     };
+    let target_binding_index = binding_lookup.target_index(
+        current_binding_index,
+        ingress_ident.ifindex,
+        ingress_ident.queue_id,
+        target_ifindex,
+    );
     // Verify the UMEM slice is accessible (validates addr/len).
     let _ = area.slice(desc.addr as usize, desc.len as usize)?;
     // Prefer session flow ports (set by conntrack, immune to DMA races),
@@ -3811,6 +3844,7 @@ fn build_live_forward_request(
     }
     Some(PendingForwardRequest {
         target_ifindex,
+        target_binding_index,
         ingress_queue_id: ingress_ident.queue_id,
         source_offset: desc.addr,
         desc,
@@ -11288,6 +11322,8 @@ mod tests {
 
         let req = build_live_forward_request(
             &area,
+            &WorkerBindingLookup::default(),
+            0,
             &ingress,
             XdpDesc {
                 addr: 0,
@@ -11388,6 +11424,8 @@ mod tests {
         // No session flow — live frame ports should be used (over meta ports)
         let req = build_live_forward_request(
             &area,
+            &WorkerBindingLookup::default(),
+            0,
             &ingress,
             XdpDesc {
                 addr: 0,
@@ -11459,6 +11497,8 @@ mod tests {
         };
         let req = build_live_forward_request(
             &area,
+            &WorkerBindingLookup::default(),
+            0,
             &ingress_ident,
             XdpDesc {
                 addr: 0,
@@ -11525,6 +11565,8 @@ mod tests {
 
         let req = build_live_forward_request(
             &area,
+            &WorkerBindingLookup::default(),
+            0,
             &ingress_ident,
             XdpDesc {
                 addr: 0,
@@ -11546,6 +11588,83 @@ mod tests {
             ForwardingDisposition::FabricRedirect
         );
         assert_eq!(req.decision.resolution.src_mac, zone_redirect.src_mac);
+    }
+
+    #[test]
+    fn build_live_forward_request_caches_target_binding_index() {
+        let mut area = MmapArea::new(256).expect("mmap");
+        area.slice_mut(0, 64).expect("slice").fill(0xaa);
+        let ingress_ident = BindingIdentity {
+            slot: 7,
+            queue_id: 3,
+            worker_id: 0,
+            interface: Arc::<str>::from("ge-0-0-1"),
+            ifindex: 10,
+        };
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            flow_src_port: 12345,
+            flow_dst_port: 5201,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 11,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+                neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision::default(),
+        };
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            12,
+            EgressInterface {
+                bind_ifindex: 11,
+                vlan_id: 80,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+                zone: "wan".to_string(),
+                redundancy_group: 1,
+                primary_v4: Some(Ipv4Addr::new(172, 16, 80, 8)),
+                primary_v6: None,
+            },
+        );
+        let mut lookup = WorkerBindingLookup::default();
+        lookup.by_if_queue.insert((11, 3), 5);
+        lookup.first_by_if.insert(11, 4);
+
+        let req = build_live_forward_request(
+            &area,
+            &lookup,
+            2,
+            &ingress_ident,
+            XdpDesc {
+                addr: 0,
+                len: 64,
+                options: 0,
+            },
+            meta,
+            &decision,
+            &forwarding,
+            None,
+            None,
+            false,
+        )
+        .expect("request");
+
+        assert_eq!(req.target_ifindex, 11);
+        assert_eq!(req.target_binding_index, Some(5));
     }
 
     #[test]

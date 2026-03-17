@@ -527,16 +527,39 @@ pub(super) fn lookup_shared_forward_wire_match(
 }
 
 #[derive(Clone, Debug)]
+pub(super) enum ResolvedSessionKey {
+    QueryKey,
+    Canonical(SessionKey),
+}
+
+impl ResolvedSessionKey {
+    fn as_ref<'a>(&'a self, query_key: &'a SessionKey) -> &'a SessionKey {
+        match self {
+            Self::QueryKey => query_key,
+            Self::Canonical(key) => key,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct ResolvedSessionLookup {
-    pub(super) key: SessionKey,
+    pub(super) key: ResolvedSessionKey,
     pub(super) lookup: SessionLookup,
     pub(super) shared_entry: Option<SyncedSessionEntry>,
 }
 
 impl ResolvedSessionLookup {
+    fn local_query(lookup: SessionLookup) -> Self {
+        Self {
+            key: ResolvedSessionKey::QueryKey,
+            lookup,
+            shared_entry: None,
+        }
+    }
+
     fn local(key: SessionKey, lookup: SessionLookup) -> Self {
         Self {
-            key,
+            key: ResolvedSessionKey::Canonical(key),
             lookup,
             shared_entry: None,
         }
@@ -544,7 +567,7 @@ impl ResolvedSessionLookup {
 
     fn shared(entry: SyncedSessionEntry) -> Self {
         Self {
-            key: entry.key.clone(),
+            key: ResolvedSessionKey::Canonical(entry.key.clone()),
             lookup: SessionLookup {
                 decision: entry.decision,
                 metadata: entry.metadata.clone(),
@@ -571,7 +594,7 @@ pub(super) fn lookup_session_across_scopes(
 ) -> Option<ResolvedSessionLookup> {
     sessions
         .lookup(key, now_ns, tcp_flags)
-        .map(|lookup| ResolvedSessionLookup::local(key.clone(), lookup))
+        .map(ResolvedSessionLookup::local_query)
         .or_else(|| {
             sessions.find_forward_wire_match(key).map(|matched| {
                 ResolvedSessionLookup::local(
@@ -608,11 +631,11 @@ pub(super) fn lookup_forward_nat_across_scopes(
 
 fn materialize_shared_session_hit(
     sessions: &mut SessionTable,
-    resolved: ResolvedSessionLookup,
+    resolved: &mut ResolvedSessionLookup,
     now_ns: u64,
     tcp_flags: u8,
 ) -> SessionLookup {
-    if let Some(shared) = resolved.shared_entry {
+    if let Some(shared) = resolved.shared_entry.take() {
         let replica = synced_replica_entry(&shared);
         sessions.upsert_synced(
             replica.key.clone(),
@@ -628,7 +651,7 @@ fn materialize_shared_session_hit(
             metadata: replica.metadata,
         };
     }
-    resolved.lookup
+    resolved.lookup.clone()
 }
 
 fn build_reverse_session_from_forward_match(
@@ -846,7 +869,7 @@ pub(super) fn resolve_flow_session_decision(
     tcp_flags: u8,
     ingress_ifindex: i32,
 ) -> Option<ResolvedFlowSessionDecision> {
-    let (resolved_key, resolved, created) = if let Some(hit) = lookup_session_across_scopes(
+    if let Some(mut hit) = lookup_session_across_scopes(
         sessions,
         shared_sessions,
         shared_forward_wire_sessions,
@@ -854,37 +877,65 @@ pub(super) fn resolve_flow_session_decision(
         now_ns,
         tcp_flags,
     ) {
-        let resolved_key = hit.key.clone();
-        (
-            resolved_key,
-            materialize_shared_session_hit(sessions, hit, now_ns, tcp_flags),
-            false,
-        )
-    } else {
-        let forward_match =
-            lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &flow.forward_key)?;
-        (
-            flow.forward_key.clone(),
-            install_reverse_session_from_forward_match(
-                sessions,
-                session_map_fd,
-                shared_sessions,
-                shared_nat_sessions,
-                shared_forward_wire_sessions,
-                peer_worker_commands,
+        let resolved = materialize_shared_session_hit(sessions, &mut hit, now_ns, tcp_flags);
+        let resolved_key = hit.key.as_ref(&flow.forward_key);
+        let mut decision = resolved.decision;
+        decision.resolution = redirect_via_fabric_if_needed(
+            forwarding,
+            enforce_ha_resolution_snapshot(
                 forwarding,
                 ha_state,
-                dynamic_neighbors,
-                &flow.forward_key,
-                forward_match,
-                now_ns,
                 now_secs,
-                protocol,
-                tcp_flags,
+                lookup_forwarding_resolution_for_session(
+                    forwarding,
+                    dynamic_neighbors,
+                    flow,
+                    decision,
+                ),
             ),
-            true,
-        )
-    };
+            ingress_ifindex,
+        );
+        let metadata = maybe_promote_synced_session(
+            sessions,
+            session_map_fd,
+            shared_sessions,
+            shared_nat_sessions,
+            shared_forward_wire_sessions,
+            peer_worker_commands,
+            forwarding,
+            resolved_key,
+            decision,
+            resolved.metadata,
+            now_ns,
+            protocol,
+            tcp_flags,
+        );
+        return Some(ResolvedFlowSessionDecision {
+            decision,
+            metadata,
+            created: false,
+        });
+    }
+
+    let forward_match =
+        lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &flow.forward_key)?;
+    let resolved = install_reverse_session_from_forward_match(
+        sessions,
+        session_map_fd,
+        shared_sessions,
+        shared_nat_sessions,
+        shared_forward_wire_sessions,
+        peer_worker_commands,
+        forwarding,
+        ha_state,
+        dynamic_neighbors,
+        &flow.forward_key,
+        forward_match,
+        now_ns,
+        now_secs,
+        protocol,
+        tcp_flags,
+    );
 
     let mut decision = resolved.decision;
     decision.resolution = redirect_via_fabric_if_needed(
@@ -905,7 +956,7 @@ pub(super) fn resolve_flow_session_decision(
         shared_forward_wire_sessions,
         peer_worker_commands,
         forwarding,
-        &resolved_key,
+        &flow.forward_key,
         decision,
         resolved.metadata,
         now_ns,
@@ -915,7 +966,7 @@ pub(super) fn resolve_flow_session_decision(
     Some(ResolvedFlowSessionDecision {
         decision,
         metadata,
-        created,
+        created: true,
     })
 }
 
@@ -1094,7 +1145,7 @@ mod tests {
         )
         .expect("shared hit");
         assert!(resolved.shared_entry.is_some());
-        assert_eq!(resolved.key, key);
+        assert_eq!(resolved.key.as_ref(&key), &key);
         assert_eq!(resolved.lookup.decision, entry.decision);
         assert_eq!(resolved.lookup.metadata, entry.metadata);
     }
@@ -1139,7 +1190,7 @@ mod tests {
         )
         .expect("shared forward-wire hit");
         assert!(resolved.shared_entry.is_some());
-        assert_eq!(resolved.key, key);
+        assert_eq!(resolved.key.as_ref(&translated_key), &key);
         assert_eq!(resolved.lookup.decision, entry.decision);
         assert_eq!(resolved.lookup.metadata, entry.metadata);
     }
