@@ -1888,11 +1888,8 @@ pub(super) fn build_forwarded_frame_into_from_frame(
             let old_ttl = out[ip_start + 8];
             // IHL already computed above — use directly instead of re-parsing.
             let rel_l4 = ihl;
-            let repaired_ports = if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-                restore_l4_tuple_from_meta(&mut out[ip_start..], meta, rel_l4).unwrap_or(false)
-            } else {
-                false
-            };
+            let repaired_ports =
+                restore_l4_tuple_from_meta(&mut out[ip_start..], meta, rel_l4).unwrap_or(false);
             if apply_nat {
                 apply_nat_ipv4(&mut out[ip_start..], meta.protocol, decision.nat)?;
             }
@@ -1931,11 +1928,8 @@ pub(super) fn build_forwarded_frame_into_from_frame(
             } else {
                 packet_rel_l4_offset(&out[ip_start..], meta.addr_family)?
             };
-            let repaired_ports = if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-                restore_l4_tuple_from_meta(&mut out[ip_start..], meta, rel_l4).unwrap_or(false)
-            } else {
-                false
-            };
+            let repaired_ports =
+                restore_l4_tuple_from_meta(&mut out[ip_start..], meta, rel_l4).unwrap_or(false);
             if apply_nat {
                 apply_nat_ipv6(&mut out[ip_start..], meta.protocol, decision.nat)?;
             }
@@ -2171,11 +2165,8 @@ pub(super) fn rewrite_forwarded_frame_in_place(
             );
             let old_ttl = packet[ip_start + 8];
             let rel_l4 = ihl;
-            let repaired_ports = if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-                restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false)
-            } else {
-                false
-            };
+            let repaired_ports =
+                restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false);
             if apply_nat {
                 apply_nat_ipv4(&mut packet[ip_start..], meta.protocol, decision.nat)?;
             }
@@ -2206,11 +2197,8 @@ pub(super) fn rewrite_forwarded_frame_in_place(
             } else {
                 packet_rel_l4_offset(&packet[ip_start..], meta.addr_family)?
             };
-            let repaired_ports = if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-                restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false)
-            } else {
-                false
-            };
+            let repaired_ports =
+                restore_l4_tuple_from_meta(&mut packet[ip_start..], meta, rel_l4).unwrap_or(false);
             if apply_nat {
                 apply_nat_ipv6(&mut packet[ip_start..], meta.protocol, decision.nat)?;
             }
@@ -2544,8 +2532,8 @@ pub(super) fn enforce_expected_ports_at(
     match addr_family as i32 {
         libc::AF_INET => {
             let packet = frame.get_mut(l3..)?;
-            let rel_l4 = l4.checked_sub(l3)?;
-            recompute_l4_checksum_ipv4(packet, rel_l4, protocol, true)?;
+            let ihl = packet_rel_l4_offset(packet, addr_family)?;
+            recompute_l4_checksum_ipv4(packet, ihl, protocol, true)?;
         }
         libc::AF_INET6 => {
             let packet = frame.get_mut(l3..)?;
