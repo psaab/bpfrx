@@ -1963,7 +1963,6 @@ fn poll_binding(
     let Some((binding, right)) = rest.split_first_mut() else {
         return false;
     };
-    update_binding_debug_state(binding);
     let area = (&binding.umem.area) as *const MmapArea;
     let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
@@ -1979,6 +1978,7 @@ fn poll_binding(
     let fill_work = drain_pending_fill(binding, now_ns);
     let mut did_work = tx_work || fill_work;
     binding.dbg_poll_cycles += 1;
+    let mut counters = BatchCounters::default();
     for _ in 0..MAX_RX_BATCHES_PER_POLL {
         // Backpressure: skip RX when TX queues are heavily loaded to prevent
         // fill ring exhaustion. The NIC holds packets until we refill (#201).
@@ -1999,6 +1999,8 @@ fn poll_binding(
             // still receive packets. Without this, fill ring starvation causes
             // mlx5 to fall back to non-XSK NAPI, leaking packets to the kernel.
             let _ = drain_pending_fill(binding, now_ns);
+            counters.flush(&binding.live);
+            update_binding_debug_state(binding);
             return did_work;
         }
 
@@ -2018,6 +2020,8 @@ fn poll_binding(
         if available == 0 {
             binding.dbg_rx_empty += 1;
             maybe_wake_rx(binding, false, now_ns);
+            counters.flush(&binding.live);
+            update_binding_debug_state(binding);
             return did_work;
         }
         binding.empty_rx_polls = 0;
@@ -2026,7 +2030,6 @@ fn poll_binding(
         binding.scratch_recycle.clear();
         binding.scratch_forwards.clear();
         let mut rst_teardowns: Vec<(SessionKey, NatDecision)> = Vec::new();
-        let mut counters = BatchCounters::default();
         while let Some(desc) = received.read() {
             counters.rx_packets += 1;
             counters.rx_bytes += desc.len as u64;
@@ -3637,10 +3640,9 @@ fn poll_binding(
         }
         let _ = drain_pending_fill(binding, now_ns);
         counters.rx_batches += 1;
-        counters.flush(&binding.live);
-        update_binding_debug_state(binding);
         did_work = true;
     }
+    counters.flush(&binding.live);
     update_binding_debug_state(binding);
     did_work
 }
