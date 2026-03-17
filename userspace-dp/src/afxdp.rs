@@ -2365,6 +2365,19 @@ fn poll_binding(
                                         resolution: fabric_return_resolution,
                                         nat: NatDecision::default(),
                                     };
+                                    let ingress_zone_arc = Arc::<str>::from(ingress_zone);
+                                    let fabric_return_metadata = SessionMetadata {
+                                        ingress_zone: ingress_zone_arc.clone(),
+                                        egress_zone: ingress_zone_arc,
+                                        owner_rg_id: owner_rg_for_flow(
+                                            forwarding,
+                                            fabric_return_decision.resolution.egress_ifindex,
+                                        ),
+                                        fabric_ingress: true,
+                                        is_reverse: true,
+                                        synced: false,
+                                        nat64_reverse: None,
+                                    };
                                     let ingress_ident = BindingIdentity {
                                         slot: binding.slot,
                                         queue_id: binding.queue_id,
@@ -2383,6 +2396,21 @@ fn poll_binding(
                                         None,
                                         false,
                                     ) {
+                                        if sessions.install_with_protocol(
+                                            flow.forward_key.clone(),
+                                            fabric_return_decision,
+                                            fabric_return_metadata,
+                                            now_ns,
+                                            meta.protocol,
+                                            meta.tcp_flags,
+                                        ) {
+                                            let _ = publish_live_session_entry(
+                                                binding.session_map_fd,
+                                                &flow.forward_key,
+                                                NatDecision::default(),
+                                                true,
+                                            );
+                                        }
                                         binding.scratch_forwards.push(request);
                                         continue;
                                     }
