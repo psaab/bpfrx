@@ -3751,6 +3751,7 @@ fn poll_binding(
             binding,
             right,
             binding_lookup,
+            shared_recycles,
             &mut pending_forwards,
             now_ns,
             forwarding,
