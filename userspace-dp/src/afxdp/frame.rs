@@ -1852,7 +1852,13 @@ pub(super) fn build_forwarded_frame_into_from_frame(
         vlan_id,
         ether_type,
     )?;
-    out.get_mut(eth_len..frame_len)?.copy_from_slice(payload);
+    let payload_out = out.get_mut(eth_len..frame_len)?;
+    // Source and destination are distinct buffers on the direct-build path.
+    // Use an explicit non-overlapping copy so the hot path does not route
+    // through memmove semantics.
+    unsafe {
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), payload_out.as_mut_ptr(), payload.len());
+    }
     let out = &mut out[..frame_len];
     let ip_start = eth_len;
     match meta.addr_family as i32 {
