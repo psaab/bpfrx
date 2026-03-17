@@ -2042,16 +2042,26 @@ fn poll_binding(
     update_binding_debug_state(binding);
     let area = binding.umem.area() as *const MmapArea;
     maybe_touch_heartbeat(binding, now_ns);
-    let tx_work = drain_pending_tx(binding, now_ns, shared_recycles);
-    apply_shared_recycles(
-        left,
-        binding_index,
-        binding,
-        right,
-        binding_lookup,
-        shared_recycles,
-    );
-    let fill_work = drain_pending_fill(binding, now_ns);
+    let tx_work = if binding_has_pending_tx_work(binding) {
+        drain_pending_tx(binding, now_ns, shared_recycles)
+    } else {
+        false
+    };
+    if !shared_recycles.is_empty() {
+        apply_shared_recycles(
+            left,
+            binding_index,
+            binding,
+            right,
+            binding_lookup,
+            shared_recycles,
+        );
+    }
+    let fill_work = if binding.pending_fill_frames.is_empty() {
+        false
+    } else {
+        drain_pending_fill(binding, now_ns)
+    };
     let mut did_work = tx_work || fill_work;
     binding.dbg_poll_cycles += 1;
     let mut counters = BatchCounters::default();
@@ -2063,19 +2073,25 @@ fn poll_binding(
         if tx_backlog >= binding.max_pending_tx {
             binding.dbg_backpressure += 1;
             // Try to drain TX first — completions free frames for both TX and fill.
-            let _ = drain_pending_tx(binding, now_ns, shared_recycles);
-            apply_shared_recycles(
-                left,
-                binding_index,
-                binding,
-                right,
-                binding_lookup,
-                shared_recycles,
-            );
+            if binding_has_pending_tx_work(binding) {
+                let _ = drain_pending_tx(binding, now_ns, shared_recycles);
+            }
+            if !shared_recycles.is_empty() {
+                apply_shared_recycles(
+                    left,
+                    binding_index,
+                    binding,
+                    right,
+                    binding_lookup,
+                    shared_recycles,
+                );
+            }
             // Critical: drain fill ring even under backpressure so the NIC can
             // still receive packets. Without this, fill ring starvation causes
             // mlx5 to fall back to non-XSK NAPI, leaking packets to the kernel.
-            let _ = drain_pending_fill(binding, now_ns);
+            if !binding.pending_fill_frames.is_empty() {
+                let _ = drain_pending_fill(binding, now_ns);
+            }
             counters.flush(&binding.live);
             update_binding_debug_state(binding);
             return did_work;
