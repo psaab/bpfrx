@@ -113,6 +113,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.clusterHA = cfg != nil && cfg.Chassis.Cluster != nil
+	m.seedHAGroupInventoryLocked(cfg)
 	m.lastSnapshot = snap
 	if err := m.programBootstrapMapsLocked(snap, ucfg); err != nil {
 		return result, err
@@ -2088,6 +2089,26 @@ func (m *Manager) refreshHAStateFromMapsLocked() error {
 	}
 	m.haGroups = merged
 	return nil
+}
+
+func (m *Manager) seedHAGroupInventoryLocked(cfg *config.Config) {
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return
+	}
+	seeded := make(map[int]HAGroupStatus, len(cfg.Chassis.Cluster.RedundancyGroups)+1)
+	if group, ok := m.haGroups[0]; ok {
+		group.RGID = 0
+		seeded[0] = group
+	}
+	for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+		if rg == nil || rg.ID < 0 {
+			continue
+		}
+		group := m.haGroups[rg.ID]
+		group.RGID = rg.ID
+		seeded[rg.ID] = group
+	}
+	m.haGroups = seeded
 }
 
 func mergeHAStateFromMaps(rgMap, wdMap *ebpf.Map, existing map[int]HAGroupStatus) (map[int]HAGroupStatus, error) {

@@ -221,6 +221,67 @@ func TestMergeHAStateFromMaps(t *testing.T) {
 	}
 }
 
+func TestSeedHAGroupInventoryLockedSeedsConfiguredStandbyGroups(t *testing.T) {
+	m := &Manager{
+		haGroups: map[int]HAGroupStatus{
+			0: {RGID: 0, Active: true, WatchdogTimestamp: 111},
+			2: {RGID: 2, Active: true, WatchdogTimestamp: 222},
+			9: {RGID: 9, Active: true, WatchdogTimestamp: 999},
+		},
+	}
+	cfg := &config.Config{
+		Chassis: config.ChassisConfig{
+			Cluster: &config.ClusterConfig{
+				RedundancyGroups: []*config.RedundancyGroup{
+					{ID: 1},
+					{ID: 2},
+				},
+			},
+		},
+	}
+
+	m.seedHAGroupInventoryLocked(cfg)
+
+	if _, ok := m.haGroups[1]; !ok {
+		t.Fatal("expected configured standby RG1 to be seeded")
+	}
+	if group := m.haGroups[2]; !group.Active || group.WatchdogTimestamp != 222 {
+		t.Fatalf("configured RG2 state not preserved: %+v", group)
+	}
+	if group := m.haGroups[0]; !group.Active || group.WatchdogTimestamp != 111 {
+		t.Fatalf("RG0 state not preserved: %+v", group)
+	}
+	if _, ok := m.haGroups[9]; ok {
+		t.Fatal("unexpected stale RG9 retained after seeding from config")
+	}
+}
+
+func TestDesiredForwardingArmedUsesSeededConfiguredDataRGs(t *testing.T) {
+	m := &Manager{
+		clusterHA: true,
+		lastStatus: ProcessStatus{
+			Capabilities: UserspaceCapabilities{ForwardingSupported: true},
+		},
+		haGroups: make(map[int]HAGroupStatus),
+	}
+	cfg := &config.Config{
+		Chassis: config.ChassisConfig{
+			Cluster: &config.ClusterConfig{
+				RedundancyGroups: []*config.RedundancyGroup{
+					{ID: 1},
+					{ID: 2},
+				},
+			},
+		},
+	}
+
+	m.seedHAGroupInventoryLocked(cfg)
+
+	if !m.desiredForwardingArmedLocked() {
+		t.Fatal("desiredForwardingArmedLocked() = false, want true for seeded standby data RGs")
+	}
+}
+
 func TestMacStringSuppressesZeroAndFormatsValue(t *testing.T) {
 	if got := macString([]byte{0, 0, 0, 0, 0, 0}); got != "" {
 		t.Fatalf("zero MAC = %q, want empty", got)
