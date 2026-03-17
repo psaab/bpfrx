@@ -83,7 +83,7 @@ pub(super) fn enqueue_pending_forwards(
 ) {
     let ingress_area = ingress_binding.umem.area() as *const MmapArea;
     let mut post_recycles: Vec<(u32, u64)> = Vec::new();
-    for mut request in pending_forwards.drain(..) {
+    for request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
 
@@ -271,7 +271,6 @@ pub(super) fn enqueue_pending_forwards(
                 });
             }
             if !copied_source_frame {
-                let mut single_frame_flow_key = request.flow_key.take();
                 // NAT64: header size changes prevent in-place rewrite.
                 // Always use copy path with NAT64-specific frame builder.
                 let is_nat64 = request.decision.nat.nat64;
@@ -303,7 +302,7 @@ pub(super) fn enqueue_pending_forwards(
                                     expected_ports,
                                     expected_addr_family: request.meta.addr_family,
                                     expected_protocol: request.meta.protocol,
-                                    flow_key: single_frame_flow_key.take(),
+                                    flow_key: request.flow_key.clone(),
                                 });
                             bound_pending_tx_prepared(target_binding);
                             target_binding.pending_in_place_tx_packets += 1;
@@ -376,7 +375,7 @@ pub(super) fn enqueue_pending_forwards(
                                     expected_ports,
                                     expected_addr_family: request.meta.addr_family,
                                     expected_protocol: request.meta.protocol,
-                                    flow_key: single_frame_flow_key.take(),
+                                    flow_key: request.flow_key.clone(),
                                 });
                                 bound_pending_tx_local(target_binding);
                                 dbg.enqueue_ok += 1;
@@ -489,7 +488,7 @@ pub(super) fn enqueue_pending_forwards(
                                         expected_ports,
                                         expected_addr_family: request.meta.addr_family,
                                         expected_protocol: request.meta.protocol,
-                                        flow_key: single_frame_flow_key.take(),
+                                        flow_key: request.flow_key.clone(),
                                     });
                                 bound_pending_tx_prepared(target_binding);
                                 dbg.enqueue_ok += 1;
@@ -571,7 +570,7 @@ pub(super) fn enqueue_pending_forwards(
                                     expected_ports,
                                     expected_addr_family: request.meta.addr_family,
                                     expected_protocol: request.meta.protocol,
-                                    flow_key: single_frame_flow_key.take(),
+                                    flow_key: request.flow_key.clone(),
                                 });
                                 bound_pending_tx_local(target_binding);
                                 dbg.enqueue_ok += 1;
