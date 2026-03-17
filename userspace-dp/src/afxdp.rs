@@ -3854,7 +3854,13 @@ fn build_live_forward_request(
         decision,
         apply_nat_on_fabric,
         expected_ports,
-        flow_key: flow.map(|flow| flow.forward_key.clone()),
+        // RST-driven queued-flow teardown is currently disabled, so carrying
+        // the full session key through every forward request is dead hot-path
+        // work. Keep the field for future teardown re-enable, but only fill it
+        // when teardown would actually consume it.
+        flow_key: flow.and_then(|flow| {
+            should_teardown_tcp_rst(meta, Some(flow)).then(|| flow.forward_key.clone())
+        }),
         nat64_reverse: None,
         prebuilt_frame: None,
     })
