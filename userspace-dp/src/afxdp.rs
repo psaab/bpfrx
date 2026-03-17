@@ -795,7 +795,12 @@ impl Coordinator {
                 reverse,
             );
             if let Some(session_map_fd) = self.session_map_fd.as_ref() {
-                let _ = publish_live_session_entry(session_map_fd.fd, &reverse.key, reverse.decision.nat, true);
+                let _ = publish_live_session_entry(
+                    session_map_fd.fd,
+                    &reverse.key,
+                    reverse.decision.nat,
+                    true,
+                );
             }
         }
         for handle in self.workers.values() {
@@ -1059,6 +1064,8 @@ impl Coordinator {
                 binding.tx_bytes = snap.tx_bytes;
                 binding.tx_completions = snap.tx_completions;
                 binding.tx_errors = snap.tx_errors;
+                binding.direct_tx_packets = snap.direct_tx_packets;
+                binding.copy_tx_packets = snap.copy_tx_packets;
                 binding.in_place_tx_packets = snap.in_place_tx_packets;
                 binding.debug_pending_fill_frames = snap.debug_pending_fill_frames;
                 binding.debug_spare_fill_frames = 0;
@@ -1121,6 +1128,8 @@ impl Coordinator {
                 binding.tx_bytes = 0;
                 binding.tx_completions = 0;
                 binding.tx_errors = 0;
+                binding.direct_tx_packets = 0;
+                binding.copy_tx_packets = 0;
                 binding.in_place_tx_packets = 0;
                 binding.debug_pending_fill_frames = 0;
                 binding.debug_spare_fill_frames = 0;
@@ -1406,6 +1415,9 @@ struct BindingWorker {
     dbg_rx_wake_sendto_ok: u64,    // sendto() returned >= 0 in maybe_wake_rx
     dbg_rx_wake_sendto_err: u64,   // sendto() returned < 0 in maybe_wake_rx
     dbg_rx_wake_sendto_errno: i32, // last errno from sendto in maybe_wake_rx
+    pending_direct_tx_packets: u64,
+    pending_copy_tx_packets: u64,
+    pending_in_place_tx_packets: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1740,6 +1752,9 @@ impl BindingWorker {
             dbg_rx_wake_sendto_ok: 0,
             dbg_rx_wake_sendto_err: 0,
             dbg_rx_wake_sendto_errno: 0,
+            pending_direct_tx_packets: 0,
+            pending_copy_tx_packets: 0,
+            pending_in_place_tx_packets: 0,
         };
         update_binding_debug_state(&mut binding);
         Ok(binding)
@@ -2350,6 +2365,19 @@ fn poll_binding(
                                         resolution: fabric_return_resolution,
                                         nat: NatDecision::default(),
                                     };
+                                    let ingress_zone_arc = Arc::<str>::from(ingress_zone);
+                                    let fabric_return_metadata = SessionMetadata {
+                                        ingress_zone: ingress_zone_arc.clone(),
+                                        egress_zone: ingress_zone_arc,
+                                        owner_rg_id: owner_rg_for_flow(
+                                            forwarding,
+                                            fabric_return_decision.resolution.egress_ifindex,
+                                        ),
+                                        fabric_ingress: true,
+                                        is_reverse: true,
+                                        synced: false,
+                                        nat64_reverse: None,
+                                    };
                                     let ingress_ident = BindingIdentity {
                                         slot: binding.slot,
                                         queue_id: binding.queue_id,
@@ -2368,6 +2396,21 @@ fn poll_binding(
                                         None,
                                         false,
                                     ) {
+                                        if sessions.install_with_protocol(
+                                            flow.forward_key.clone(),
+                                            fabric_return_decision,
+                                            fabric_return_metadata,
+                                            now_ns,
+                                            meta.protocol,
+                                            meta.tcp_flags,
+                                        ) {
+                                            let _ = publish_live_session_entry(
+                                                binding.session_map_fd,
+                                                &flow.forward_key,
+                                                NatDecision::default(),
+                                                true,
+                                            );
+                                        }
                                         binding.scratch_forwards.push(request);
                                         continue;
                                     }
@@ -4261,7 +4304,12 @@ fn worker_loop(
         let loop_now_ns = monotonic_nanos();
         let loop_now_secs = loop_now_ns / 1_000_000_000;
         let ha_runtime = ha_state.load();
-        apply_worker_commands(&commands, &mut sessions, session_map_fd, ha_runtime.as_ref());
+        apply_worker_commands(
+            &commands,
+            &mut sessions,
+            session_map_fd,
+            ha_runtime.as_ref(),
+        );
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
         let expired = sessions.expire_stale(loop_now_ns);
         if expired > 0 {
@@ -7404,6 +7452,8 @@ struct BindingLiveState {
     tx_bytes: AtomicU64,
     tx_completions: AtomicU64,
     tx_errors: AtomicU64,
+    direct_tx_packets: AtomicU64,
+    copy_tx_packets: AtomicU64,
     in_place_tx_packets: AtomicU64,
     debug_pending_fill_frames: AtomicU32,
     debug_spare_fill_frames: AtomicU32,
@@ -7469,6 +7519,8 @@ impl BindingLiveState {
             tx_bytes: AtomicU64::new(0),
             tx_completions: AtomicU64::new(0),
             tx_errors: AtomicU64::new(0),
+            direct_tx_packets: AtomicU64::new(0),
+            copy_tx_packets: AtomicU64::new(0),
             in_place_tx_packets: AtomicU64::new(0),
             debug_pending_fill_frames: AtomicU32::new(0),
             debug_spare_fill_frames: AtomicU32::new(0),
@@ -7585,6 +7637,8 @@ impl BindingLiveState {
             tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
             tx_completions: self.tx_completions.load(Ordering::Relaxed),
             tx_errors: self.tx_errors.load(Ordering::Relaxed),
+            direct_tx_packets: self.direct_tx_packets.load(Ordering::Relaxed),
+            copy_tx_packets: self.copy_tx_packets.load(Ordering::Relaxed),
             in_place_tx_packets: self.in_place_tx_packets.load(Ordering::Relaxed),
             debug_pending_fill_frames: self.debug_pending_fill_frames.load(Ordering::Relaxed),
             debug_spare_fill_frames: self.debug_spare_fill_frames.load(Ordering::Relaxed),
@@ -7687,6 +7741,27 @@ fn update_binding_debug_state(binding: &mut BindingWorker) {
     if binding.debug_state_counter & 0xFFFF != 0 {
         return;
     }
+    if binding.pending_direct_tx_packets != 0 {
+        binding
+            .live
+            .direct_tx_packets
+            .fetch_add(binding.pending_direct_tx_packets, Ordering::Relaxed);
+        binding.pending_direct_tx_packets = 0;
+    }
+    if binding.pending_copy_tx_packets != 0 {
+        binding
+            .live
+            .copy_tx_packets
+            .fetch_add(binding.pending_copy_tx_packets, Ordering::Relaxed);
+        binding.pending_copy_tx_packets = 0;
+    }
+    if binding.pending_in_place_tx_packets != 0 {
+        binding
+            .live
+            .in_place_tx_packets
+            .fetch_add(binding.pending_in_place_tx_packets, Ordering::Relaxed);
+        binding.pending_in_place_tx_packets = 0;
+    }
     binding
         .live
         .debug_pending_fill_frames
@@ -7766,6 +7841,8 @@ struct BindingLiveSnapshot {
     tx_bytes: u64,
     tx_completions: u64,
     tx_errors: u64,
+    direct_tx_packets: u64,
+    copy_tx_packets: u64,
     in_place_tx_packets: u64,
     debug_pending_fill_frames: u32,
     #[allow(dead_code)]
@@ -8788,7 +8865,10 @@ mod tests {
             monotonic_nanos() / 1_000_000_000,
         );
 
-        assert_eq!(resolved.disposition, ForwardingDisposition::ForwardCandidate);
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
         assert_eq!(resolved.egress_ifindex, 24);
         assert_eq!(resolved.tx_ifindex, 24);
     }

@@ -814,6 +814,10 @@ struct BindingStatus {
     tx_bytes: u64,
     #[serde(rename = "tx_errors", default)]
     tx_errors: u64,
+    #[serde(rename = "direct_tx_packets", default)]
+    direct_tx_packets: u64,
+    #[serde(rename = "copy_tx_packets", default)]
+    copy_tx_packets: u64,
     #[serde(rename = "in_place_tx_packets", default)]
     in_place_tx_packets: u64,
     #[serde(rename = "last_heartbeat", skip_serializing_if = "Option::is_none")]

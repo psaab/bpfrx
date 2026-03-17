@@ -113,6 +113,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.clusterHA = cfg != nil && cfg.Chassis.Cluster != nil
+	m.seedHAGroupInventoryLocked(cfg)
 	m.lastSnapshot = snap
 	if err := m.programBootstrapMapsLocked(snap, ucfg); err != nil {
 		return result, err
@@ -2090,6 +2091,26 @@ func (m *Manager) refreshHAStateFromMapsLocked() error {
 	return nil
 }
 
+func (m *Manager) seedHAGroupInventoryLocked(cfg *config.Config) {
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		return
+	}
+	seeded := make(map[int]HAGroupStatus, len(cfg.Chassis.Cluster.RedundancyGroups)+1)
+	if group, ok := m.haGroups[0]; ok {
+		group.RGID = 0
+		seeded[0] = group
+	}
+	for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+		if rg == nil || rg.ID < 0 {
+			continue
+		}
+		group := m.haGroups[rg.ID]
+		group.RGID = rg.ID
+		seeded[rg.ID] = group
+	}
+	m.haGroups = seeded
+}
+
 func mergeHAStateFromMaps(rgMap, wdMap *ebpf.Map, existing map[int]HAGroupStatus) (map[int]HAGroupStatus, error) {
 	seen := make(map[int]HAGroupStatus, len(existing))
 	for rgID, group := range existing {
@@ -2135,17 +2156,7 @@ func (m *Manager) desiredForwardingArmedLocked() bool {
 	if !m.clusterHA {
 		return true
 	}
-	if len(m.haGroups) == 0 {
-		return false
-	}
-	hasDataRG := false
-	for rgID := range m.haGroups {
-		if rgID <= 0 {
-			continue
-		}
-		hasDataRG = true
-	}
-	if hasDataRG {
+	if m.configHasDataRGLocked() {
 		// Keep the helper armed on standby HA nodes so stale-MAC traffic can
 		// stay in the userspace fabric redirect path during ownership moves.
 		// Per-packet HA resolution still decides whether traffic is forwarded
@@ -2154,6 +2165,18 @@ func (m *Manager) desiredForwardingArmedLocked() bool {
 	}
 	for _, group := range m.haGroups {
 		if group.Active {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) configHasDataRGLocked() bool {
+	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil || m.lastSnapshot.Config.Chassis.Cluster == nil {
+		return false
+	}
+	for _, rg := range m.lastSnapshot.Config.Chassis.Cluster.RedundancyGroups {
+		if rg != nil && rg.ID > 0 {
 			return true
 		}
 	}
