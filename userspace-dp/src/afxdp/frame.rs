@@ -134,14 +134,13 @@ pub(super) fn enqueue_pending_forwards(
         };
         let expected_ports = request.expected_ports;
         let ingress_umem_ptr = ingress_binding.umem.allocation_ptr();
-        let Some(target_binding) = resolve_pending_forward_target_binding(
+        let Some(target_binding) = find_target_binding_mut(
             left,
             ingress_index,
             ingress_binding,
             request.ingress_queue_id,
             right,
             binding_lookup,
-            request.target_binding_index,
             request.target_ifindex,
         ) else {
             // No XSK binding for the target interface.  Normally fabric
