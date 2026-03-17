@@ -81,7 +81,7 @@ pub(super) fn enqueue_pending_forwards(
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     dbg: &mut DebugPollCounters,
 ) {
-    let ingress_area = (&ingress_binding.umem.area) as *const MmapArea;
+    let ingress_area = ingress_binding.umem.area() as *const MmapArea;
     let mut post_recycles: Vec<(u32, u64)> = Vec::new();
     for request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
@@ -132,6 +132,7 @@ pub(super) fn enqueue_pending_forwards(
             continue;
         };
         let expected_ports = request.expected_ports;
+        let ingress_umem_ptr = ingress_binding.umem.allocation_ptr();
         let Some(target_binding) = find_target_binding_mut(
             left,
             ingress_index,
@@ -274,14 +275,13 @@ pub(super) fn enqueue_pending_forwards(
 
                 /*
                  * In-place TX optimization: rewrite the ingress frame directly in UMEM
-                 * and submit it to the TX ring without copying. This avoids a memcpy but
-                 * only works when ingress and egress share the same UMEM — which currently
-                 * means same-interface hairpin only (each binding owns its own UMEM).
-                 * Cross-interface forwards always take the copy path below.
-                 *
-                 * TODO(#205): extend to cross-interface by using shared UMEM across bindings.
+                 * and submit it to the target binding's TX ring without copying.
+                 * This is valid whenever ingress and egress bindings share the same
+                 * UMEM allocation. That includes same-binding hairpin and the narrow
+                 * same-device shared-UMEM prototype.
                  */
-                let can_rewrite_in_place = target_binding.slot == ingress_slot && !is_nat64;
+                let can_rewrite_in_place =
+                    target_binding.umem.allocation_ptr() == ingress_umem_ptr && !is_nat64;
                 if can_rewrite_in_place {
                     match rewrite_forwarded_frame_in_place(
                         unsafe { &*ingress_area },
@@ -412,7 +412,7 @@ pub(super) fn enqueue_pending_forwards(
                         }
                         false
                     } else if let Some(tx_offset) = direct_tx_offset {
-                        let target_area = &target_binding.umem.area;
+                        let target_area = target_binding.umem.area();
                         let written = unsafe {
                             target_area.slice_mut_unchecked(tx_offset as usize, tx_frame_capacity())
                         }

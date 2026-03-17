@@ -195,6 +195,32 @@ pub(super) fn interface_driver_name(ifname: &str) -> Option<String> {
     target.file_name()?.to_str().map(str::to_string)
 }
 
+pub(super) fn interface_device_path(ifname: &str) -> Option<String> {
+    if ifname.is_empty() {
+        return None;
+    }
+    let device_link = Path::new("/sys/class/net").join(ifname).join("device");
+    let target = std::fs::canonicalize(device_link).ok()?;
+    Some(target.to_string_lossy().into_owned())
+}
+
+pub(super) fn shared_umem_group_key_for_device(
+    driver: Option<&str>,
+    device_path: Option<&str>,
+) -> Option<String> {
+    match (driver, device_path) {
+        // Narrow prototype only: same-device mlx5 bindings can share UMEM safely.
+        (Some("mlx5_core"), Some(path)) if !path.is_empty() => Some(format!("mlx5:{path}")),
+        _ => None,
+    }
+}
+
+pub(super) fn shared_umem_group_key(binding: &BindingStatus) -> Option<String> {
+    let driver = interface_driver_name(&binding.interface);
+    let device_path = interface_device_path(&binding.interface);
+    shared_umem_group_key_for_device(driver.as_deref(), device_path.as_deref())
+}
+
 fn try_open_bind(
     worker_umem: &WorkerUmem,
     info: &IfInfo,
@@ -214,26 +240,38 @@ fn try_open_bind(
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let (device, user, rx, tx, bind_mode) = if bind_strategy.uses_umem_owner_socket() {
-        let sock = Socket::with_shared(info, &worker_umem.umem)
+        let sock = Socket::with_shared(info, worker_umem.umem())
             .map_err(|e| format!("create shared socket: {e}"))?;
         let device = worker_umem
-            .umem
+            .umem()
             .fq_cq(&sock)
             .map_err(|e| format!("create fq/cq: {e}"))?;
         let (user, rx, tx, _requested_mode) =
-            open_user_rings(&worker_umem.umem, &sock, ring_entries, flags)?;
-        let bind_mode = bind_user_rings(&worker_umem.umem, &device, &user, bind_strategy, poll_mode)?;
+            open_user_rings(worker_umem.umem(), &sock, ring_entries, flags)?;
+        let bind_mode = bind_user_rings(
+            worker_umem.umem(),
+            &device,
+            &user,
+            bind_strategy,
+            poll_mode,
+        )?;
         (device, user, rx, tx, bind_mode)
     } else {
         let owner_sock = Socket::new(info).map_err(|e| format!("create owner socket: {e}"))?;
         let device = worker_umem
-            .umem
+            .umem()
             .fq_cq(&owner_sock)
             .map_err(|e| format!("create fq/cq: {e}"))?;
         let user_sock = Socket::new(info).map_err(|e| format!("create user socket: {e}"))?;
         let (user, rx, tx, _requested_mode) =
-            open_user_rings(&worker_umem.umem, &user_sock, ring_entries, flags)?;
-        let bind_mode = bind_user_rings(&worker_umem.umem, &device, &user, bind_strategy, poll_mode)?;
+            open_user_rings(worker_umem.umem(), &user_sock, ring_entries, flags)?;
+        let bind_mode = bind_user_rings(
+            worker_umem.umem(),
+            &device,
+            &user,
+            bind_strategy,
+            poll_mode,
+        )?;
         (device, user, rx, tx, bind_mode)
     };
     Ok((user, rx, tx, bind_mode, bind_strategy, device))
