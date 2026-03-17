@@ -1796,33 +1796,45 @@ pub(super) fn build_forwarded_frame_into_from_frame(
         return None;
     }
     let raw_payload = &frame[l3..];
-    // Trim Ethernet padding: use the address-family-specific packet length so
-    // small padded frames do not carry trailing bytes into the new TX frame.
-    let trimmed_payload_len = match meta.addr_family as i32 {
-        libc::AF_INET if raw_payload.len() >= 4 => {
+    // Trim Ethernet padding: use ip_total_len so we don't carry trailing
+    // pad bytes (small frames padded to 60/64 by hardware).
+    let payload = if raw_payload.len() >= 4 {
+        let ip_version = raw_payload[0] >> 4;
+        if ip_version == 4 {
             let ip_total_len = u16::from_be_bytes([raw_payload[2], raw_payload[3]]) as usize;
             if ip_total_len > 0 && ip_total_len < raw_payload.len() {
-                ip_total_len
+                &raw_payload[..ip_total_len]
             } else {
-                raw_payload.len()
+                raw_payload
             }
-        }
-        libc::AF_INET6 if raw_payload.len() >= 40 => {
+        } else if ip_version == 6 && raw_payload.len() >= 40 {
             let ipv6_payload_len = u16::from_be_bytes([raw_payload[4], raw_payload[5]]) as usize;
             let ip6_total = 40 + ipv6_payload_len;
             if ip6_total > 0 && ip6_total < raw_payload.len() {
-                ip6_total
+                &raw_payload[..ip6_total]
             } else {
-                raw_payload.len()
+                raw_payload
             }
+        } else {
+            raw_payload
         }
-        _ => raw_payload.len(),
+    } else {
+        raw_payload
     };
-    let payload = &raw_payload[..trimmed_payload_len];
-    let src_mac = decision.resolution.src_mac?;
-    let vlan_id = decision.resolution.tx_vlan_id;
-    let apply_nat = decision.resolution.disposition != ForwardingDisposition::FabricRedirect
-        || apply_nat_on_fabric;
+    let (src_mac, vlan_id, apply_nat) =
+        if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
+            (
+                decision.resolution.src_mac?,
+                decision.resolution.tx_vlan_id,
+                apply_nat_on_fabric,
+            )
+        } else {
+            (
+                decision.resolution.src_mac?,
+                decision.resolution.tx_vlan_id,
+                true,
+            )
+        };
     let eth_len = if vlan_id > 0 { 18 } else { 14 };
     let ether_type = match meta.addr_family as i32 {
         libc::AF_INET => 0x0800,
