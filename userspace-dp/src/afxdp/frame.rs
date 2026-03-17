@@ -396,9 +396,18 @@ pub(super) fn enqueue_pending_forwards(
                     // intermediate Vec allocation and one memcpy.
                     // NAT64 cannot use direct TX (header size changes), so
                     // it falls through to the copy path below.
+                    let mut direct_tx_offset = target_binding.free_tx_frames.pop_front();
+                    if direct_tx_offset.is_none()
+                        && (target_binding.outstanding_tx > 0
+                            || !target_binding.pending_tx_prepared.is_empty()
+                            || !target_binding.pending_tx_local.is_empty())
+                    {
+                        let _ = drain_pending_tx(target_binding, now_ns, &mut post_recycles);
+                        direct_tx_offset = target_binding.free_tx_frames.pop_front();
+                    }
                     let direct_built = if is_nat64 {
                         false
-                    } else if let Some(tx_offset) = target_binding.free_tx_frames.pop_front() {
+                    } else if let Some(tx_offset) = direct_tx_offset {
                         let target_area = &target_binding.umem.area;
                         let written = unsafe {
                             target_area.slice_mut_unchecked(tx_offset as usize, tx_frame_capacity())
