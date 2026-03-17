@@ -1796,31 +1796,9 @@ pub(super) fn build_forwarded_frame_into_from_frame(
         return None;
     }
     let raw_payload = &frame[l3..];
-    // Trim Ethernet padding: use ip_total_len so we don't carry trailing
-    // pad bytes (small frames padded to 60/64 by hardware).
-    let payload = if raw_payload.len() >= 4 {
-        let ip_version = raw_payload[0] >> 4;
-        if ip_version == 4 {
-            let ip_total_len = u16::from_be_bytes([raw_payload[2], raw_payload[3]]) as usize;
-            if ip_total_len > 0 && ip_total_len < raw_payload.len() {
-                &raw_payload[..ip_total_len]
-            } else {
-                raw_payload
-            }
-        } else if ip_version == 6 && raw_payload.len() >= 40 {
-            let ipv6_payload_len = u16::from_be_bytes([raw_payload[4], raw_payload[5]]) as usize;
-            let ip6_total = 40 + ipv6_payload_len;
-            if ip6_total > 0 && ip6_total < raw_payload.len() {
-                &raw_payload[..ip6_total]
-            } else {
-                raw_payload
-            }
-        } else {
-            raw_payload
-        }
-    } else {
-        raw_payload
-    };
+    // Trim Ethernet padding without reparsing the common-path IP length when
+    // the XDP metadata already stamped a valid L3 packet length.
+    let payload = &raw_payload[..effective_l3_packet_len(raw_payload, meta)];
     let (src_mac, vlan_id, apply_nat) =
         if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
             (
@@ -2079,24 +2057,7 @@ pub(super) fn rewrite_forwarded_frame_in_place(
     if l3 >= current_len {
         return None;
     }
-    let mut payload_len = current_len.checked_sub(l3)?;
-    // Trim Ethernet padding: use ip_total_len when available so we don't
-    // carry trailing pad bytes (small frames padded to 60/64 by hardware).
-    if payload_len >= 4 {
-        let ip_version = frame[l3] >> 4;
-        if ip_version == 4 {
-            let ip_total_len = u16::from_be_bytes([frame[l3 + 2], frame[l3 + 3]]) as usize;
-            if ip_total_len > 0 && ip_total_len < payload_len {
-                payload_len = ip_total_len;
-            }
-        } else if ip_version == 6 && payload_len >= 40 {
-            let ipv6_payload_len = u16::from_be_bytes([frame[l3 + 4], frame[l3 + 5]]) as usize;
-            let ip6_total = 40 + ipv6_payload_len;
-            if ip6_total > 0 && ip6_total < payload_len {
-                payload_len = ip6_total;
-            }
-        }
-    }
+    let payload_len = effective_l3_packet_len(&frame[l3..current_len], meta);
     let (src_mac, vlan_id, apply_nat) =
         if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
             (
@@ -2242,6 +2203,37 @@ pub(super) fn rewrite_forwarded_frame_in_place(
         verify_built_frame_checksums(&packet[..frame_len]);
     }
     Some(frame_len as u32)
+}
+
+#[inline]
+fn effective_l3_packet_len(raw_payload: &[u8], meta: UserspaceDpMeta) -> usize {
+    let meta_len = meta.pkt_len as usize;
+    let min_len = match meta.addr_family as i32 {
+        libc::AF_INET => 20,
+        libc::AF_INET6 => 40,
+        _ => 0,
+    };
+    if meta_len >= min_len && meta_len <= raw_payload.len() {
+        return meta_len;
+    }
+    // Fallback for malformed or absent metadata: derive the L3 length from
+    // the packet header so trailing Ethernet padding is still trimmed safely.
+    if raw_payload.len() >= 4 {
+        let ip_version = raw_payload[0] >> 4;
+        if ip_version == 4 {
+            let ip_total_len = u16::from_be_bytes([raw_payload[2], raw_payload[3]]) as usize;
+            if ip_total_len > 0 && ip_total_len < raw_payload.len() {
+                return ip_total_len;
+            }
+        } else if ip_version == 6 && raw_payload.len() >= 40 {
+            let ipv6_payload_len = u16::from_be_bytes([raw_payload[4], raw_payload[5]]) as usize;
+            let ip6_total = 40 + ipv6_payload_len;
+            if ip6_total > 0 && ip6_total < raw_payload.len() {
+                return ip6_total;
+            }
+        }
+    }
+    raw_payload.len()
 }
 
 pub(super) fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<()> {
