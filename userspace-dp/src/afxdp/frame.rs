@@ -1,5 +1,42 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ForwardFrameBuildCtx {
+    pub(super) dst_mac: [u8; 6],
+    pub(super) src_mac: [u8; 6],
+    pub(super) vlan_id: u16,
+    pub(super) eth_len: usize,
+    pub(super) ether_type: u16,
+    pub(super) apply_nat: bool,
+}
+
+pub(super) fn forward_frame_build_ctx(
+    meta: UserspaceDpMeta,
+    decision: &SessionDecision,
+    apply_nat_on_fabric: bool,
+) -> Option<ForwardFrameBuildCtx> {
+    let dst_mac = decision.resolution.neighbor_mac?;
+    let src_mac = decision.resolution.src_mac?;
+    let vlan_id = decision.resolution.tx_vlan_id;
+    let ether_type = match meta.addr_family as i32 {
+        libc::AF_INET => 0x0800,
+        libc::AF_INET6 => 0x86dd,
+        _ => return None,
+    };
+    Some(ForwardFrameBuildCtx {
+        dst_mac,
+        src_mac,
+        vlan_id,
+        eth_len: if vlan_id > 0 { 18 } else { 14 },
+        ether_type,
+        apply_nat: if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
+            apply_nat_on_fabric
+        } else {
+            true
+        },
+    })
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn authoritative_forward_ports(
     frame: &[u8],
@@ -419,14 +456,16 @@ pub(super) fn enqueue_pending_forwards(
                             target_area.slice_mut_unchecked(tx_offset as usize, tx_frame_capacity())
                         }
                         .and_then(|out| {
-                            build_forwarded_frame_into_from_frame(
-                                out,
-                                source_frame,
-                                request.meta,
-                                &request.decision,
-                                request.apply_nat_on_fabric,
-                                expected_ports,
-                            )
+                            request.frame_build_ctx.as_ref().and_then(|frame_ctx| {
+                                build_forwarded_frame_into_with_ctx(
+                                    out,
+                                    source_frame,
+                                    request.meta,
+                                    request.decision.nat,
+                                    frame_ctx,
+                                    expected_ports,
+                                )
+                            })
                         });
                         if let Some(written) = written {
                             // Debug-only: validate built frame ports match expected.
@@ -1578,13 +1617,14 @@ pub(super) fn build_forwarded_frame_from_frame(
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<Vec<u8>> {
+    let frame_ctx = forward_frame_build_ctx(meta, decision, apply_nat_on_fabric)?;
     let mut out = vec![0u8; frame.len().saturating_add(4)];
-    let written = build_forwarded_frame_into_from_frame(
+    let written = build_forwarded_frame_into_with_ctx(
         &mut out,
         frame,
         meta,
-        decision,
-        apply_nat_on_fabric,
+        decision.nat,
+        &frame_ctx,
         expected_ports,
     )?;
     out.truncate(written);
@@ -1787,7 +1827,18 @@ pub(super) fn build_forwarded_frame_into_from_frame(
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<usize> {
-    let dst_mac = decision.resolution.neighbor_mac?;
+    let frame_ctx = forward_frame_build_ctx(meta, decision, apply_nat_on_fabric)?;
+    build_forwarded_frame_into_with_ctx(out, frame, meta, decision.nat, &frame_ctx, expected_ports)
+}
+
+pub(super) fn build_forwarded_frame_into_with_ctx(
+    out: &mut [u8],
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    nat: NatDecision,
+    frame_ctx: &ForwardFrameBuildCtx,
+    expected_ports: Option<(u16, u16)>,
+) -> Option<usize> {
     let enforced_ports = expected_ports;
     // Use meta L3 offset when it's a valid Ethernet header size (14 or 18),
     // otherwise re-derive from the frame's ethertype.
@@ -1824,36 +1875,17 @@ pub(super) fn build_forwarded_frame_into_from_frame(
     } else {
         raw_payload
     };
-    let (src_mac, vlan_id, apply_nat) =
-        if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
-            (
-                decision.resolution.src_mac?,
-                decision.resolution.tx_vlan_id,
-                apply_nat_on_fabric,
-            )
-        } else {
-            (
-                decision.resolution.src_mac?,
-                decision.resolution.tx_vlan_id,
-                true,
-            )
-        };
-    let eth_len = if vlan_id > 0 { 18 } else { 14 };
-    let ether_type = match meta.addr_family as i32 {
-        libc::AF_INET => 0x0800,
-        libc::AF_INET6 => 0x86dd,
-        _ => return None,
-    };
+    let eth_len = frame_ctx.eth_len;
     let frame_len = eth_len + payload.len();
     if frame_len > out.len() {
         return None;
     }
     write_eth_header_slice(
         out.get_mut(..eth_len)?,
-        dst_mac,
-        src_mac,
-        vlan_id,
-        ether_type,
+        frame_ctx.dst_mac,
+        frame_ctx.src_mac,
+        frame_ctx.vlan_id,
+        frame_ctx.ether_type,
     )?;
     let payload_out = out.get_mut(eth_len..frame_len)?;
     // SAFETY: source (payload) and destination (payload_out) are distinct
@@ -1894,8 +1926,8 @@ pub(super) fn build_forwarded_frame_into_from_frame(
             let rel_l4 = ihl;
             let repaired_ports =
                 restore_l4_tuple_from_meta(&mut out[ip_start..], meta, rel_l4).unwrap_or(false);
-            if apply_nat {
-                apply_nat_ipv4(&mut out[ip_start..], meta.protocol, decision.nat)?;
+            if frame_ctx.apply_nat {
+                apply_nat_ipv4(&mut out[ip_start..], meta.protocol, nat)?;
             }
             out[ip_start + 8] -= 1;
             let enforced = enforce_expected_ports_at(
@@ -1934,8 +1966,8 @@ pub(super) fn build_forwarded_frame_into_from_frame(
             };
             let repaired_ports =
                 restore_l4_tuple_from_meta(&mut out[ip_start..], meta, rel_l4).unwrap_or(false);
-            if apply_nat {
-                apply_nat_ipv6(&mut out[ip_start..], meta.protocol, decision.nat)?;
+            if frame_ctx.apply_nat {
+                apply_nat_ipv6(&mut out[ip_start..], meta.protocol, nat)?;
             }
             out[ip_start + 7] -= 1;
             let enforced = enforce_expected_ports_at(
@@ -1965,7 +1997,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
                 let pkt_detail = decode_frame_summary(out);
                 eprintln!(
                     "DBG BUILT_ETH[{}]: vlan={} frame_len={} proto={} {}",
-                    n, vlan_id, frame_len, meta.protocol, pkt_detail,
+                    n, frame_ctx.vlan_id, frame_len, meta.protocol, pkt_detail,
                 );
                 // For the first 3 frames, also dump the full IP+TCP header hex
                 if n < 3 {
