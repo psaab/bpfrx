@@ -94,10 +94,16 @@ pub(super) fn lookup_forwarding_resolution_for_session(
     flow: &SessionFlow,
     decision: SessionDecision,
 ) -> ForwardingResolution {
+    if decision.resolution.disposition == ForwardingDisposition::LocalDelivery {
+        return decision.resolution;
+    }
     if let Some(cached) = cached_session_resolution(forwarding, decision.resolution) {
         return cached;
     }
     let target = resolution_target_for_session(flow, decision);
+    if let Some(local) = super::interface_nat_local_resolution(forwarding, target) {
+        return local;
+    }
     let resolved = lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target);
     match resolved.disposition {
         ForwardingDisposition::NoRoute | ForwardingDisposition::MissingNeighbor => {
@@ -696,6 +702,9 @@ pub(super) fn reverse_resolution_for_session(
     fabric_ingress: bool,
     now_secs: u64,
 ) -> ForwardingResolution {
+    if let Some(local) = super::interface_nat_local_resolution(forwarding, target_ip) {
+        return local;
+    }
     let resolved = lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip);
     if fabric_ingress
         && owner_rg_for_flow(forwarding, resolved.egress_ifindex) > 0
