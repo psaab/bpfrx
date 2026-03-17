@@ -1,231 +1,368 @@
-# Userspace Performance Plan
+# Userspace AF_XDP Dataplane: Performance and Correctness Hardening Plan
 
 Date: 2026-03-17
-Active branch baseline: `fix/userspace-cross-nic-ha-perf-baseline`
 
-This is the current performance plan for the Rust AF_XDP userspace dataplane.
-It replaces the older mixed backlog that targeted the eBPF/XDP pipeline.
+This document is the phased execution plan for addressing ten identified issues
+in the Rust AF_XDP userspace dataplane, organized by priority. It builds on the
+completed cleanup work in [userspace-dataplane-cleanup-plan.md](userspace-dataplane-cleanup-plan.md)
+(Phases 1-5 complete, Phase 6 in progress) and the HA failover work in
+[userspace-ha-failover-parity-plan.md](userspace-ha-failover-parity-plan.md).
 
-## Validity Check
+## Status Snapshot
 
-Current perf documentation in this tree is mixed in quality:
+All issues described here were identified via code audit on 2026-03-17 against
+current `master`.
 
-1. [userspace-perf-compare.md](../docs/userspace-perf-compare.md) is valid.
-   - It is the right measurement workflow for current userspace branches.
-2. [shared-umem-plan.md](../docs/shared-umem-plan.md) is valid, but only as a
-   constrained side plan.
-   - It matters for same-device `mlx5` cases.
-   - It does not address the current HA lab's cross-NIC transit bottleneck.
-3. [perf-ranked-backlog.md](../docs/perf-ranked-backlog.md) is not valid for
-   the current branch as a primary plan.
-   - It describes the older eBPF/XDP pipeline hotspots such as `xdp_main_prog`
-     and `xdp_nat_prog`.
-   - The current userspace dataplane hotspot stack is different.
+Current status:
 
-## Current Measured Read
+- Phases 1-6 in this document are still not started.
+- Phase 7 is now in progress on the same-device shared-UMEM prototype branch.
+- The latest transit perf profile shows the remaining dominant cost is the
+  direct-path payload copy, not the copy-path fallback:
+  - `poll_binding` about `17.6%`
+  - `__memmove_evex_unaligned_erms` about `16.7%`
+  - `enqueue_pending_forwards` about `5.8%`
+- Runtime counters on the same run showed `Copy-path TX packets: 0`, so
+  the current optimization target is the direct builder in
+  `build_forwarded_frame_into_from_frame()`.
 
-Latest clean cross-NIC transit perf on this branch shows:
+## Issue Inventory
 
-1. `bpfrx_userspace_dp::afxdp::poll_binding` around `17.9%`
-2. `__memmove_evex_unaligned_erms` around `12.7%`
-3. `bpfrx_userspace_dp::afxdp::frame::enqueue_pending_forwards` around `3.7%`
-4. `bpfrx_userspace_dp::afxdp::session_glue::resolve_flow_session_decision` around `2.6%`
-5. `xdpilone::xsk::user::<impl RingRx>::available` around `1.5%`
-6. `bpfrx_userspace_dp::afxdp::frame::build_forwarded_frame_into_from_frame` around `1.5%`
+### CRITICAL
 
-First measured Phase 2 slice on this branch:
+| ID | Issue | Location | Impact |
+|----|-------|----------|--------|
+| C1 | TX backpressure starves fill ring | `poll_binding()` backpressure path | Fill ring exhausts under burst; kernel fallback emits RSTs |
+| C2 | Hot-path lock contention on shared state | `Arc<Mutex<>>` on shared sessions + neighbors | Per-packet mutex across all workers; contention at scale |
 
-1. `eb958ec` plus the current target-binding cache keeps a steady manual IPv4
-   transit run at about `15.9 Gbps`
-2. `resolve_flow_session_decision` moved from about `2.56%` in the earlier
-   clean baseline to about `2.30%` in the current matched manual perf sample
-3. `poll_binding` and the direct-path `memmove` remain the dominant costs
+### HIGH
 
-Interpretation:
+| ID | Issue | Location | Impact |
+|----|-------|----------|--------|
+| H1 | In-flight TX timeout missing | `in_flight_prepared_recycles` in tx.rs | Kernel never completing TX → permanent UMEM frame leak |
+| H2 | Session sync race between shared map and BPF map | `upsert_synced_session()` | Window during HA failover where BPF/shared maps disagree |
+| H3 | Incomplete reverse session metadata | `build_reverse_session_from_forward_match()` | Routing table + DSCP lost on reverse path |
+| H4 | SYN cookies not implemented | screen.rs | SYN flood protection degrades to rate-limiting only |
 
-1. The main remaining cost is userspace fixed poll overhead plus the direct-path
-   cross-NIC frame copy.
-2. The old firewall-local TUN dependence is no longer the main issue.
-3. Same-device shared UMEM is worth keeping as a limited optimization track,
-   but it does not solve the active HA-lab topology.
+### MEDIUM
 
-## Constraints
+| ID | Issue | Location | Impact |
+|----|-------|----------|--------|
+| M1 | Cross-binding forwards still require full-payload copy | `enqueue_pending_forwards()` | Performance: direct transit still pays a full packet copy on every cross-allocation forward |
+| M2 | Session lifecycle mismatch userspace vs BPF | `expire_stale()` + BPF map | Stale BPF map entries after session expiry or crash |
+| M3 | Frame ownership audit for all paths | `enqueue_pending_forwards()` all `continue` paths | Verify no other NAT64-style frame leaks exist |
+| M4 | No frame leak detection in production builds | Frame accounting debug-gated | Progressive exhaustion invisible until stall |
 
-1. The active HA lab is cross-NIC transit.
-   - The large `memmove` cost is structural in the current direct-TX design.
-2. Reliability gates must stay green while optimizing.
-   - no aggregate zero-throughput intervals
-   - no per-stream zero-throughput intervals
-   - traceroute and `mtr` must keep working
-3. Shared UMEM is not a blanket answer.
-   - same-device `mlx5`: plausible optimization
-   - cross-device `mlx5`: not feasible in zerocopy mode for this topology
+## Phase 1: Fill Ring Starvation Fix (C1)
 
-## Phases
+Status: Not Started
 
-### Phase 1: Measurement And Acceptance Discipline
+### Root Cause
 
-Status: Complete enough to support active work
+In `poll_binding()`, when TX backpressure triggers, the function drains TX
+completions and returns early. But frames consumed by RX sit in `scratch_recycle`
+across the entire batch and are only moved to `pending_fill_frames` after the
+batch completes. Under sustained forwarding bursts, the fill ring starves because
+recycled frames never reach it.
 
-Purpose:
-- make every perf change compete against a current userspace baseline, not
-  stale target numbers
+### Fix
 
-Current state:
-1. `userspace-perf-compare.sh` is the profiling workflow
-2. `userspace-ha-validation.sh` catches sustained-throughput cliffs
-3. `userspace-ha-failover-validation.sh` checks stream survival and captures
-   retransmit-aware `iperf3` JSON-stream artifacts
+1. Move `scratch_recycle` drain into `pending_fill_frames` after each RX batch
+   iteration, not just at the end of all batches.
+2. Under backpressure, drain `scratch_recycle` into `pending_fill_frames` before
+   returning early.
+3. Add fill ring watermark check: if available fill frames < total/4, force
+   immediate fill ring drain even mid-batch.
 
-Remaining improvement:
-1. turn retransmit telemetry into an enforced threshold after a stable good
-   baseline is established
+### Files
 
-### Phase 2: Session-Hit And Binding-Resolution Overhead
+- `userspace-dp/src/afxdp.rs` — backpressure path + post-batch recycle drain
+- `userspace-dp/src/afxdp/tx.rs` — `drain_pending_fill()`
 
-Status: In progress on `fix/userspace-cross-nic-ha-perf-baseline`
+### Test Criteria
 
-Purpose:
-- remove avoidable lookup and key-materialization work from the steady-state
-  established-flow path
+- `iperf3 -P 8 -t 30` does not collapse
+- Frame accounting balanced under sustained load
+- `rx_fill_ring_empty_descs` does not grow monotonically
 
-Landed or active slices:
-1. `eb958ec` trims session-hit resolution overhead in
-   [session_glue.rs](../userspace-dp/src/afxdp/session_glue.rs)
-2. the current branch adds target-binding index caching for normal forward
-   requests so `enqueue_pending_forwards()` does not redo the same binding
-   lookup on the hot path
+## Phase 2: Lock Contention Reduction (C2)
 
-Measured result so far:
-1. this phase is reducing lookup-side cost modestly, not changing the
-   structural cross-NIC copy cost
-2. the next worthwhile slice is still Phase 3, not more speculative work in
-   the same request builder
+Status: Not Started
 
-Exit criteria:
-1. local/shared session-hit paths stop doing avoidable key rebuilding
-2. normal forward requests carry enough target-binding information to avoid
-   repeated lookup work
+### Root Cause
 
-### Phase 3: Poll Loop Fixed-Cost Reduction
+Four `Arc<Mutex<>>` maps acquired per-packet: `shared_sessions`,
+`shared_nat_sessions`, `shared_forward_wire_sessions`, `dynamic_neighbors`.
 
-Status: In progress
+### Fix
 
-Purpose:
-- reduce `poll_binding` cost without reintroducing stalls or failover lag
+**Phase 2A:** Batch shared session publishes — collect during poll cycle,
+lock once per batch instead of per-session.
 
-Focus areas:
-1. RX wake policy only when there is evidence it is profitable
-2. reduce idle binding work without skipping real traffic
-3. keep `RingRx::available()` from becoming the dominant empty-poll tax
+**Phase 2B:** Replace `dynamic_neighbors` `Arc<Mutex<>>` with `ArcSwap` —
+reads are lock-free (atomic pointer load), writes clone-and-swap. The
+`last_learned_neighbor` dedup already eliminates most writes.
 
-Current measured slice:
-1. `cf3878c` batches binding live-counter flushes once per poll instead of once
-   per received batch
-2. a clean manual IPv4 transit run after deploy stayed steady at about
-   `18.7 Gbps`
-3. matched perf on active `fw0` showed:
-   - `poll_binding` about `16.47%`
-   - `__memmove_evex_unaligned_erms` about `16.85%`
-   - `enqueue_pending_forwards` about `5.07%`
-4. this is a valid keep, but it is not the main win; the direct-path copy is
-   still the largest remaining single cost
-5. the current slice on top of that defers ingress-identity construction until
-   RX work actually exists and skips zero-counter flush walks on empty polls
-6. matched perf on active `fw0` for that slice showed:
-   - `poll_binding` about `16.06%`
-   - `__memmove_evex_unaligned_erms` about `14.38%`
-   - `enqueue_pending_forwards` about `4.68%`
-   - `resolve_flow_session_decision` about `2.72%`
-7. the same slice stayed clean under the HA failover gate:
-   - `0` aggregate zero-throughput intervals
-   - `0` per-stream zero-throughput intervals
-   - about `21.1 Gbps` sender throughput during the 30s RG1 failover run
+**Phase 2C (if needed):** Replace shared session maps with `ArcSwap` if
+profiling confirms they remain a bottleneck after 2A.
 
-Non-goal:
-1. no more blind wake-throttling or idle-thinning experiments
-   - previous versions preserved correctness poorly or reduced throughput
+### Files
 
-Exit criteria:
-1. `poll_binding` drops materially in perf
-2. split-RG steady-state and failover gates remain green
+- `userspace-dp/src/afxdp.rs` — Coordinator struct fields
+- `userspace-dp/src/afxdp/session_glue.rs` — `lookup_session_across_scopes()`,
+  `publish_shared_session()`
 
-### Phase 4: Forward Enqueue And Builder Overhead
+### Test Criteria
 
-Status: Pending
+- `perf stat` shows reduced mutex lock time
+- Throughput does not regress
+- HA failover tests pass
 
-Purpose:
-- reduce per-packet control overhead around the direct-TX path
+## Phase 3: In-Flight TX Timeout (H1)
 
-Focus areas:
-1. `enqueue_pending_forwards()`
-2. `build_forwarded_frame_into_from_frame()`
-3. unnecessary re-resolution or revalidation inside the forward loop
+Status: Not Started
 
-Known boundaries:
-1. this is separate from the structural cross-NIC payload copy itself
-2. `Copy-path TX` is already near zero in the current HA baseline, so work here
-   should target the direct path, not the old fallback path
+### Root Cause
 
-Exit criteria:
-1. direct-path control overhead drops in perf
-2. no increase in retransmits or zero-throughput intervals
+`in_flight_prepared_recycles` tracks UMEM frames submitted to the TX ring.
+If the kernel never completes them (driver bug, hardware reset), those frames
+are permanently leaked. No timeout or recovery exists.
 
-### Phase 5: Cross-NIC Copy Bottleneck
+### Fix
 
-Status: Planned
+1. Add timestamp alongside `PreparedTxRecycle` entries.
+2. Forcibly recycle frames outstanding > 5 seconds.
+3. Expose overflow counter in production status.
 
-Purpose:
-- separate the truly structural copy cost from the smaller userspace-control
-  overheads
+### Files
 
-Current read:
-1. the large `memmove` sample is from the direct-TX builder copying payload
-   between separate UMEM regions
-2. same-device shared UMEM can help on eligible topologies
-3. the current HA lab's cross-NIC path will still pay this copy
+- `userspace-dp/src/afxdp/tx.rs` — `recycle_completed_tx_offset()`,
+  `transmit_prepared_batch()`
+- `userspace-dp/src/afxdp.rs` — `BindingWorker` periodic check
 
-Work split:
-1. keep same-device shared-UMEM work isolated and topology-gated
-2. do not let the cross-NIC HA branch depend on that prototype
-3. if cross-NIC transit still needs more headroom after Phases 2-4, evaluate
-   whether a deeper frame-ownership redesign is justified
+### Test Criteria
 
-Exit criteria:
-1. same-device prototype is either validated on a real proof topology or left
-   explicitly out of the HA branch
-2. cross-NIC limitations are documented honestly
+- Under artificial TX stall, frames are recovered after timeout
+- Frame accounting balanced after 60s sustained forwarding
 
-### Phase 6: HA Reliability And Perf Parity
+## Phase 4: Session Sync Atomicity (H2)
 
-Status: In progress
+Status: Not Started
 
-Purpose:
-- ensure throughput work does not regress the HA behavior we already recovered
+### Root Cause
 
-Required gates:
-1. split-RG steady-state fabric `iperf3`
-2. RG1 failover/failback survival
-3. IPv4/IPv6 traceroute and `mtr`
-4. per-stream and aggregate zero-throughput interval checks
+`publish_shared_session()` and `publish_live_session_entry()` are called
+sequentially but not atomically. During HA failover, XDP shim may redirect
+a packet before the shared session is installed (or vice versa).
 
-Remaining work:
-1. establish a stable retransmit baseline and then enforce it
-2. keep post-failover throughput from regressing while Phases 2-4 land
+### Fix
 
-## Recommended Execution Order
+Reorder: always write BPF map before shared session map. A session miss
+in the worker is handled gracefully (policy eval or slow-path fallback).
+For deletion: delete shared session before BPF map entry.
 
-1. Finish Phase 2 on the active cross-NIC branch.
-2. Take the next measured slice in Phase 3.
-3. Move to Phase 4 only after Phase 3 has at least one kept win.
-4. Keep Phase 5 isolated from the HA branch unless the topology actually makes
-   it relevant.
-5. Run Phase 6 gates after every kept performance slice.
+### Files
 
-## What Not To Do
+- `userspace-dp/src/afxdp.rs` — `upsert_synced_session()`,
+  `delete_synced_session()`
+- `userspace-dp/src/afxdp/session_glue.rs` — publication order
 
-1. Do not optimize against the old `xdp_main_prog` / `xdp_nat_prog` backlog for
-   this branch.
-2. Do not treat same-device shared UMEM as the answer for the cross-NIC HA lab.
-3. Do not keep perf changes that only look good in one short run but fail the
-   steady-state or failover gates.
+### Test Criteria
+
+- HA failover: 0 zero-throughput intervals
+- Repeated 3-cycle failover/failback stress passes
+
+## Phase 5: Reverse Session Metadata Completeness (H3)
+
+Status: Not Started
+
+### Root Cause
+
+`build_reverse_session_from_forward_match()` loses routing table, DSCP,
+and MSS clamp info from the forward session. Reverse path does a fresh
+FIB lookup which may return different results in multi-VRF deployments.
+
+### Fix
+
+1. Add `routing_table` to `ForwardingResolution`.
+2. Use forward session's egress zone routing table for reverse FIB lookup.
+3. Preserve DSCP rewrite decisions through session metadata.
+
+### Files
+
+- `userspace-dp/src/afxdp/session_glue.rs` — reverse session construction
+- `userspace-dp/src/afxdp.rs` — `ForwardingResolution` struct
+
+### Test Criteria
+
+- VRF-aware reverse session lookup returns correct egress interface
+- DSCP rewrite applied correctly on both paths
+
+## Phase 6: SYN Cookie Implementation (H4)
+
+Status: Not Started
+
+### Root Cause
+
+Screen module drops SYN floods but cannot issue SYN-ACK cookies like the
+eBPF dataplane (`xdp_screen.c`).
+
+### Fix
+
+**6A:** Add `ScreenVerdict::SynCookie`. Build SYN-ACK frame with cookie
+sequence number, enqueue as hairpin TX. No session created.
+
+**6B:** On non-SYN ACK without session, validate ACK as SYN cookie.
+Extract MSS/window scale, create session, forward.
+
+### Files
+
+- `userspace-dp/src/screen.rs` — `ScreenVerdict` enum
+- `userspace-dp/src/afxdp.rs` — screen handling in `poll_binding()`
+- `bpf/xdp/xdp_screen.c` — reference cookie algorithm
+
+### Test Criteria
+
+- SYN flood to protected zone results in SYN-ACK cookies
+- Legitimate connections complete through cookie path
+- `deriveUserspaceCapabilities()` gate updated
+
+## Phase 7: Cross-Binding Forward Optimization (M1)
+
+Status: In Progress
+
+### Root Cause
+
+Each binding currently owns its own UMEM by default. The old "copy path"
+is no longer the dominant cost. On current `master`, the hot transit path
+is the direct TX builder that still copies the full payload into the
+target UMEM:
+
+```rust
+out.get_mut(eth_len..frame_len)?.copy_from_slice(payload);
+```
+
+So the real root cause is:
+
+- cross-allocation transit still needs a full payload copy
+- copy-path fallback is already near-zero in measured steady-state runs
+- broad worker-wide shared UMEM is not safe across different physical NICs
+  in this lab
+
+### Fix
+
+Near-term: aggressively drain all bindings' TX completions before falling
+back to copy path.
+
+Long-term: same-device shared UMEM, not worker-global shared UMEM.
+
+Current prototype direction:
+
+1. group bindings by driver + physical device path
+2. only allow shared UMEM for same-device `mlx5_core`
+3. keep `virtio_net` and cross-NIC bindings on private UMEM
+4. widen in-place rewrite eligibility from same-binding hairpin to
+   same-allocation forwards
+
+This is the only safe reintegration point on current `master`. It does
+not remove the copy from the HA lab's cross-NIC transit path by itself,
+but it is the right structural fix for same-device hot paths.
+
+Current validation status:
+
+- the current HA lab's WAN50 -> WAN80 path is only a no-regression check,
+  not proof that the new same-allocation cross-binding path is exercised
+- the prototype branch still regresses multi-queue `mlx5` AF_XDP bind on
+  the HA lab (`create fq/cq: Device or resource busy` on the second queue
+  in a shared group)
+
+So Phase 7 is still structurally correct as a direction, but not ready to
+use as the active HA perf branch. Cross-NIC HA performance work should stay
+on the normal HA branch and remain focused on:
+
+- `poll_binding`
+- `enqueue_pending_forwards`
+- `session_glue::resolve_flow_session_decision`
+
+### Files
+
+- `userspace-dp/src/afxdp/frame.rs` — `enqueue_pending_forwards()`
+- `userspace-dp/src/afxdp.rs` — `BindingWorker::create()`, UMEM allocation
+
+### Test Criteria
+
+- Direct TX ratio > 90% under sustained forwarding
+- Copy-path TX remains effectively zero on the current baseline
+- Same-allocation forwards use in-place rewrite instead of payload copy
+- Throughput improvement measured by `userspace-perf-compare.sh`
+
+## Phase 8: Session Lifecycle BPF Map Sync (M2)
+
+Status: Not Started
+
+### Fix
+
+1. Startup sweep: iterate BPF `USERSPACE_SESSIONS` map, remove entries not
+   in preserved synced sessions.
+2. Verify reverse session BPF cleanup handles already-removed forward entries.
+3. Tighten GC interval for TCP CLOSING sessions.
+
+### Test Criteria
+
+- After restart, BPF map reflects only active synced sessions
+- No stale entries after 120s idle
+
+## Phase 9: Frame Ownership Audit (M3)
+
+Status: Not Started
+
+### Fix
+
+Audit every `continue` in `enqueue_pending_forwards()` and every early
+return in `transmit_batch()`/`transmit_prepared_batch()`. Verify
+`source_offset` is always returned to fill or retained.
+
+### Test Criteria
+
+- Frame accounting balanced after NAT64 traffic for 60s
+- No `FRAME_LEAK` messages
+
+## Phase 10: Production Frame Leak Detection (M4)
+
+Status: Not Started
+
+### Fix
+
+1. Move `FRAME_LEAK` detection to production code (one integer comparison).
+2. Expose `frame_deficit` counter in `BindingLiveState`.
+3. Add `frame_leak_detected` to `BindingStatus` for Go manager alerting.
+
+### Test Criteria
+
+- Frame leak counter visible in `show system dataplane userspace`
+- No false positives under normal forwarding
+
+## Execution Order
+
+1. **Phase 1** (C1) — fill ring starvation, highest throughput impact
+2. **Phase 3** (H1) — in-flight TX timeout, same file area
+3. **Phase 9** (M3) — frame audit, validates Phase 1+3
+4. **Phase 10** (M4) — production visibility for frame issues
+5. **Phase 2** (C2) — lock contention, second highest measured impact
+6. **Phase 4** (H2) — session sync atomicity, HA correctness
+7. **Phase 5** (H3) — reverse session metadata, HA correctness
+8. **Phase 8** (M2) — session lifecycle cleanup
+9. **Phase 7** (M1) — cross-binding optimization, requires stable frames
+10. **Phase 6** (H4) — SYN cookies, eBPF fallback provides coverage
+
+Frame lifecycle correctness first, lock contention second, HA correctness
+third, performance optimization fourth, feature gap last.
+
+## Measurement Discipline
+
+All changes measured using:
+- `scripts/userspace-perf-compare.sh` for A/B throughput
+- `iperf3 -P 4 -t 30` (min 3 runs)
+- `perf record`/`perf report` for hot-symbol validation
+- Frame accounting in periodic debug report
+- `scripts/userspace-ha-failover-validation.sh` for HA regression

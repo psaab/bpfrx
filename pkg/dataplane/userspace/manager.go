@@ -1915,11 +1915,16 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 		return fmt.Errorf("mkdir state dir: %w", err)
 	}
 	_ = os.Remove(cfg.ControlSocket)
+	pollMode := cfg.PollMode
+	if pollMode == "" {
+		pollMode = "busy-poll"
+	}
 	cmd := exec.Command(binary,
 		"--control-socket", cfg.ControlSocket,
 		"--state-file", cfg.StateFile,
 		"--workers", fmt.Sprintf("%d", cfg.Workers),
 		"--ring-entries", fmt.Sprintf("%d", cfg.RingEntries),
+		"--poll-mode", pollMode,
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

@@ -94,10 +94,16 @@ pub(super) fn lookup_forwarding_resolution_for_session(
     flow: &SessionFlow,
     decision: SessionDecision,
 ) -> ForwardingResolution {
+    if decision.resolution.disposition == ForwardingDisposition::LocalDelivery {
+        return decision.resolution;
+    }
     if let Some(cached) = cached_session_resolution(forwarding, decision.resolution) {
         return cached;
     }
     let target = resolution_target_for_session(flow, decision);
+    if let Some(local) = super::interface_nat_local_resolution(forwarding, target) {
+        return local;
+    }
     let resolved = lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target);
     match resolved.disposition {
         ForwardingDisposition::NoRoute | ForwardingDisposition::MissingNeighbor => {
@@ -151,7 +157,7 @@ pub(super) fn apply_worker_commands(
             }
             WorkerCommand::UpsertSynced(entry) => {
                 let key = entry.key.clone();
-                let is_reverse = entry.metadata.is_reverse;
+                let metadata = entry.metadata.clone();
                 let allow_replace_local = !owner_rg_is_locally_active(
                     ha_state,
                     entry.metadata.owner_rg_id,
@@ -166,21 +172,24 @@ pub(super) fn apply_worker_commands(
                     entry.tcp_flags,
                     allow_replace_local,
                 ) {
-                    let _ = publish_live_session_entry(
+                    let _ = publish_session_map_entry_for_session(
                         session_map_fd,
                         &key,
-                        entry.decision.nat,
-                        is_reverse,
+                        entry.decision,
+                        &metadata,
                     );
                 }
             }
             WorkerCommand::DeleteSynced(key) => {
-                let delete_alias = sessions.lookup(&key, now_ns, 0).map(|lookup| {
-                    (lookup.decision.nat, lookup.metadata.is_reverse)
-                });
+                let delete_alias = sessions.lookup(&key, now_ns, 0);
                 sessions.delete(&key);
-                if let Some((nat, is_reverse)) = delete_alias {
-                    delete_live_session_entry(session_map_fd, &key, nat, is_reverse);
+                if let Some(lookup) = delete_alias {
+                    delete_session_map_entry_for_removed_session(
+                        session_map_fd,
+                        &key,
+                        lookup.decision,
+                        &lookup.metadata,
+                    );
                 } else {
                     delete_live_session_key(session_map_fd, &key);
                 }
@@ -304,7 +313,12 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
             shared_forward_wire_sessions,
             &reverse,
         );
-        let _ = publish_live_session_entry(session_map_fd, &reverse.key, reverse.decision.nat, true);
+        let _ = publish_session_map_entry_for_session(
+            session_map_fd,
+            &reverse.key,
+            reverse.decision,
+            &reverse.metadata,
+        );
         for commands in worker_commands {
             if let Ok(mut pending) = commands.lock() {
                 pending.push_back(WorkerCommand::UpsertSynced(reverse.clone()));
@@ -719,6 +733,9 @@ pub(super) fn reverse_resolution_for_session(
     fabric_ingress: bool,
     now_secs: u64,
 ) -> ForwardingResolution {
+    if let Some(local) = super::interface_nat_local_resolution(forwarding, target_ip) {
+        return local;
+    }
     let resolved = lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip);
     if fabric_ingress
         && owner_rg_for_flow(forwarding, resolved.egress_ifindex) > 0
@@ -816,7 +833,7 @@ fn maybe_promote_synced_session(
         promoted.owner_rg_id = owner_rg_for_flow(forwarding, decision.resolution.egress_ifindex);
     }
     if sessions.promote_synced(key, decision, promoted.clone(), now_ns, protocol, tcp_flags) {
-        let _ = publish_live_session_entry(session_map_fd, key, decision.nat, promoted.is_reverse);
+        let _ = publish_session_map_entry_for_session(session_map_fd, key, decision, &promoted);
         let promoted_entry = SyncedSessionEntry {
             key: key.clone(),
             decision,

@@ -1021,12 +1021,28 @@ struct SessionDeltaInfo {
     fabric_ingress: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollMode {
+    BusyPoll,
+    Interrupt,
+}
+
+impl PollMode {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "interrupt" => PollMode::Interrupt,
+            _ => PollMode::BusyPoll,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Args {
     control_socket: String,
     state_file: String,
     workers: usize,
     ring_entries: usize,
+    poll_mode: PollMode,
 }
 
 struct ServerState {
@@ -1056,20 +1072,23 @@ fn run() -> Result<(), String> {
             eprintln!("set {sysctl}=16777216");
         }
     }
-    // Enable NAPI busy polling: when AF_XDP sockets call sendto(), the
-    // kernel will spin-poll the NIC's NAPI context directly instead of
-    // deferring to softirq.  This reduces user↔softirq context switches.
-    for (path, val) in &[
-        ("/proc/sys/net/core/busy_poll", "50"),
-        ("/proc/sys/net/core/busy_read", "50"),
-    ] {
-        if let Err(e) = fs::write(path, val) {
-            eprintln!("warn: set {path}: {e}");
-        } else {
-            eprintln!("set {path}={val}");
-        }
-    }
     let args = parse_args()?;
+    // Enable NAPI busy polling sysctls only in busy-poll mode.
+    // In interrupt mode, skip these so the kernel uses normal interrupt delivery.
+    if args.poll_mode == PollMode::BusyPoll {
+        for (path, val) in &[
+            ("/proc/sys/net/core/busy_poll", "50"),
+            ("/proc/sys/net/core/busy_read", "50"),
+        ] {
+            if let Err(e) = fs::write(path, val) {
+                eprintln!("warn: set {path}: {e}");
+            } else {
+                eprintln!("set {path}={val}");
+            }
+        }
+    } else {
+        eprintln!("bpfrx-userspace-dp: interrupt mode — skipping busy_poll sysctls");
+    }
     if let Some(parent) = Path::new(&args.control_socket).parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create control dir: {e}"))?;
     }
@@ -1126,9 +1145,14 @@ fn run() -> Result<(), String> {
             debug_reconcile_stage: String::new(),
         },
         snapshot: None,
-        afxdp: afxdp::Coordinator::new(),
+        afxdp: {
+            let mut c = afxdp::Coordinator::new();
+            c.poll_mode = args.poll_mode;
+            c
+        },
         state_writer: state_writer.clone(),
     }));
+    eprintln!("bpfrx-userspace-dp: poll_mode={:?}", args.poll_mode);
 
     {
         let running = running.clone();
@@ -1175,6 +1199,7 @@ fn parse_args() -> Result<Args, String> {
         .to_string();
     let mut workers = 1usize;
     let mut ring_entries = 4096usize;
+    let mut poll_mode = PollMode::BusyPoll;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1196,6 +1221,7 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|e| format!("parse --ring-entries: {e}"))?
                     .max(1)
             }
+            "--poll-mode" => poll_mode = PollMode::from_str(&val),
             other => return Err(format!("unknown argument {other}")),
         }
     }
@@ -1205,6 +1231,7 @@ fn parse_args() -> Result<Args, String> {
         state_file,
         workers,
         ring_entries,
+        poll_mode,
     })
 }
 

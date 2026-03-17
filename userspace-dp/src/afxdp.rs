@@ -28,6 +28,7 @@ use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -35,6 +36,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use xdpilone::xdp::XdpDesc;
 use xdpilone::{BufIdx, SocketConfig, Umem, UmemConfig, User};
+
+const USERSPACE_SESSION_ACTION_REDIRECT: u8 = 1;
+const USERSPACE_SESSION_ACTION_PASS_TO_KERNEL: u8 = 2;
 
 /// Hot-path debug logging — compiled out unless `debug-log` feature is enabled.
 #[allow(unused_macros)]
@@ -63,7 +67,7 @@ use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
     AfXdpBindStrategy, binding_frame_count, ifinfo_from_binding, interface_driver_name,
     open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets,
-    reserved_tx_frames, umem_ring_size,
+    reserved_tx_frames, shared_umem_group_key, shared_umem_group_key_for_device, umem_ring_size,
 };
 #[cfg(test)]
 use self::bind::{
@@ -120,6 +124,7 @@ const XSK_BIND_FLAGS_ZEROCOPY: u16 =
 const XSK_BIND_FLAGS_COPY: u16 = SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_COPY;
 const IDLE_SPIN_ITERS: u32 = 256;
 const IDLE_SLEEP_US: u64 = 1;
+const INTERRUPT_POLL_TIMEOUT_MS: i32 = 1;
 const RX_WAKE_IDLE_POLLS: u32 = 32;
 const RX_WAKE_MIN_INTERVAL_NS: u64 = 200_000;
 /// Safety-net interval for fill ring wakes when needs_wakeup is clear.
@@ -221,6 +226,7 @@ pub struct Coordinator {
     last_planned_bindings: usize,
     reconcile_calls: u64,
     last_reconcile_stage: String,
+    pub poll_mode: crate::PollMode,
 }
 
 impl Coordinator {
@@ -250,6 +256,7 @@ impl Coordinator {
             last_planned_bindings: 0,
             reconcile_calls: 0,
             last_reconcile_stage: "idle".to_string(),
+            poll_mode: crate::PollMode::BusyPoll,
         }
     }
 
@@ -514,6 +521,7 @@ impl Coordinator {
                     session_map_fd: session_map_fd.fd,
                     ring_entries,
                     bind_strategy: preferred_bind_strategy(binding),
+                    poll_mode: self.poll_mode,
                 });
         }
         for plans in workers.values_mut() {
@@ -582,6 +590,7 @@ impl Coordinator {
             let forwarding = forwarding.clone();
             let ha_state = self.ha_state.clone();
             let dynamic_neighbors = self.dynamic_neighbors.clone();
+            let worker_poll_mode = self.poll_mode;
             let join = thread::Builder::new()
                 .name(format!("bpfrx-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -603,6 +612,7 @@ impl Coordinator {
                         peer_commands_clone,
                         stop_clone,
                         heartbeat_clone,
+                        worker_poll_mode,
                     );
                 });
             match join {
@@ -1156,6 +1166,7 @@ struct BindingPlan {
     session_map_fd: c_int,
     ring_entries: u32,
     bind_strategy: AfXdpBindStrategy,
+    poll_mode: crate::PollMode,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1622,26 +1633,38 @@ impl BindingWorker {
         session_map_fd: c_int,
         live: Arc<BindingLiveState>,
         bind_strategy: AfXdpBindStrategy,
+        poll_mode: crate::PollMode,
+        worker_umem: WorkerUmem,
+        frame_pool: &mut VecDeque<u64>,
+        shared_umem: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let total_frames = binding_frame_count(ring_entries).max(1);
-        let worker_umem =
-            WorkerUmem::new(total_frames).map_err(|err| format!("create binding umem: {err}"))?;
         let driver_name = interface_driver_name(&binding.interface);
-        let reserved_tx = reserved_tx_frames(ring_entries);
+        let reserved_tx = reserved_tx_frames(ring_entries).min(total_frames);
         let mut reserved_tx_frames = VecDeque::with_capacity(reserved_tx as usize);
-        for idx in 0..reserved_tx {
-            if let Some(frame) = worker_umem.umem.frame(BufIdx(idx)) {
-                reserved_tx_frames.push_back(frame.offset);
-            }
+        for _ in 0..reserved_tx {
+            let Some(offset) = frame_pool.pop_front() else {
+                return Err(format!(
+                    "insufficient shared UMEM frames for reserved TX on {} if{}q{}",
+                    binding.interface, binding.ifindex, binding.queue_id
+                )
+                .into());
+            };
+            reserved_tx_frames.push_back(offset);
         }
         // Pre-populate fill ring with ALL remaining frames — no spare held back.
         // This maximizes the kernel's ability to place received packets and
         // prevents fill ring starvation under burst conditions (copy-mode fix).
         let mut initial_fill_frames = Vec::with_capacity((total_frames - reserved_tx) as usize);
-        for idx in reserved_tx..total_frames {
-            if let Some(frame) = worker_umem.umem.frame(BufIdx(idx)) {
-                initial_fill_frames.push(frame.offset);
-            }
+        for _ in reserved_tx..total_frames {
+            let Some(offset) = frame_pool.pop_front() else {
+                return Err(format!(
+                    "insufficient shared UMEM frames for fill ring on {} if{}q{}",
+                    binding.interface, binding.ifindex, binding.queue_id
+                )
+                .into());
+            };
+            initial_fill_frames.push(offset);
         }
         let info = ifinfo_from_binding(binding)?;
         let (user, rx, tx, bind_mode, actual_bind_strategy, mut device) =
@@ -1651,6 +1674,7 @@ impl BindingWorker {
                 ring_entries,
                 bind_strategy,
                 driver_name.as_deref(),
+                poll_mode,
             )
             .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
         prime_fill_ring_offsets(&mut device, &initial_fill_frames)?;
@@ -1663,13 +1687,14 @@ impl BindingWorker {
         // ifindex/queue_id directly — umem.bind() already validated these.
         live.set_socket_binding(binding.ifindex, binding.queue_id, 0);
         eprintln!(
-            "bpfrx-userspace-dp: binding slot={} fd={} strategy={} bound if{}q{} mode={:?}",
+            "bpfrx-userspace-dp: binding slot={} fd={} strategy={} bound if{}q{} mode={:?} shared_umem={}",
             binding.slot,
             user_fd,
             actual_bind_strategy.describe(),
             binding.ifindex,
             binding.queue_id,
             bind_mode,
+            shared_umem,
         );
         if let Err(err) = register_xsk_slot(xsk_map_fd, binding.slot, user_fd) {
             eprintln!(
@@ -1764,10 +1789,15 @@ impl BindingWorker {
     }
 }
 
-struct WorkerUmem {
+struct WorkerUmemInner {
     area: MmapArea,
     umem: Umem,
     total_frames: u32,
+}
+
+#[derive(Clone)]
+struct WorkerUmem {
+    inner: Rc<WorkerUmemInner>,
 }
 
 impl WorkerUmem {
@@ -1784,10 +1814,50 @@ impl WorkerUmem {
         let umem = unsafe { Umem::new(umem_cfg, area.as_nonnull_slice()) }
             .map_err(|e| format!("create umem: {e}"))?;
         Ok(Self {
-            area,
-            umem,
-            total_frames,
+            inner: Rc::new(WorkerUmemInner {
+                area,
+                umem,
+                total_frames,
+            }),
         })
+    }
+
+    fn area(&self) -> &MmapArea {
+        &self.inner.area
+    }
+
+    fn umem(&self) -> &Umem {
+        &self.inner.umem
+    }
+
+    fn total_frames(&self) -> u32 {
+        self.inner.total_frames
+    }
+
+    fn shares_allocation_with(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn allocation_ptr(&self) -> *const WorkerUmemInner {
+        Rc::as_ptr(&self.inner)
+    }
+}
+
+struct WorkerUmemPool {
+    umem: WorkerUmem,
+    free_frames: VecDeque<u64>,
+}
+
+impl WorkerUmemPool {
+    fn new(total_frames: u32) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let umem = WorkerUmem::new(total_frames.max(1))?;
+        let mut free_frames = VecDeque::with_capacity(total_frames.max(1) as usize);
+        for idx in 0..total_frames.max(1) {
+            if let Some(frame) = umem.umem().frame(BufIdx(idx)) {
+                free_frames.push_back(frame.offset);
+            }
+        }
+        Ok(Self { umem, free_frames })
     }
 }
 
@@ -1968,7 +2038,9 @@ fn poll_binding(
     let Some((binding, right)) = rest.split_first_mut() else {
         return false;
     };
-    let area = (&binding.umem.area) as *const MmapArea;
+    update_binding_debug_state(binding);
+    let area = binding.umem.area() as *const MmapArea;
+    let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
     let tx_work = drain_pending_tx(binding, now_ns, shared_recycles);
     apply_shared_recycles(
@@ -2619,6 +2691,61 @@ fn poll_binding(
                                 debug.from_zone = Some(from_zone_arc.clone());
                                 debug.to_zone = Some(to_zone_arc.clone());
                             }
+                            if resolution.disposition == ForwardingDisposition::LocalDelivery {
+                                let local_metadata = SessionMetadata {
+                                    ingress_zone: from_zone_arc.clone(),
+                                    egress_zone: to_zone_arc.clone(),
+                                    owner_rg_id: 0,
+                                    fabric_ingress: false,
+                                    is_reverse: false,
+                                    // Keep firewall-local sessions in the helper only for HA
+                                    // state. Publish only the exact observed key back into the
+                                    // BPF session map so subsequent established packets bypass
+                                    // userspace and return directly to the kernel.
+                                    synced: true,
+                                    nat64_reverse: None,
+                                };
+                                if let Some(previous) =
+                                    sessions.take_synced_local(&flow.forward_key)
+                                {
+                                    delete_session_map_entry_for_removed_session(
+                                        binding.session_map_fd,
+                                        &flow.forward_key,
+                                        previous.decision,
+                                        &previous.metadata,
+                                    );
+                                }
+                                if sessions.install_with_protocol(
+                                    flow.forward_key.clone(),
+                                    decision,
+                                    local_metadata.clone(),
+                                    now_ns,
+                                    meta.protocol,
+                                    meta.tcp_flags,
+                                ) {
+                                    let local_entry = SyncedSessionEntry {
+                                        key: flow.forward_key.clone(),
+                                        decision,
+                                        metadata: local_metadata,
+                                        protocol: meta.protocol,
+                                        tcp_flags: meta.tcp_flags,
+                                    };
+                                    publish_shared_session(
+                                        shared_sessions,
+                                        shared_nat_sessions,
+                                        shared_forward_wire_sessions,
+                                        &local_entry,
+                                    );
+                                    let _ = publish_session_map_entry_for_session(
+                                        binding.session_map_fd,
+                                        &flow.forward_key,
+                                        decision,
+                                        &local_entry.metadata,
+                                    );
+                                    counters.session_creates += 1;
+                                    dbg.session_create += 1;
+                                }
+                            }
                             // Embedded ICMP NAT reversal applies only to actual ICMP error
                             // packets. Echo and other non-error ICMP traffic should follow
                             // the ordinary policy/session path.
@@ -2885,6 +3012,8 @@ fn poll_binding(
                                         recycle_now = false;
                                     } else {
                                         let mut created = 0u64;
+                                        let track_in_userspace = decision.resolution.disposition
+                                            != ForwardingDisposition::LocalDelivery;
                                         let fabric_ingress = ingress_is_fabric(
                                             forwarding,
                                             meta.ingress_ifindex as i32,
@@ -2898,20 +3027,16 @@ fn poll_binding(
                                             synced: false,
                                             nat64_reverse: nat64_info,
                                         };
-                                        if sessions.install_with_protocol(
-                                            flow.forward_key.clone(),
-                                            decision,
-                                            forward_metadata.clone(),
-                                            now_ns,
-                                            meta.protocol,
-                                            meta.tcp_flags,
-                                        ) {
-                                            let _ = publish_live_session_entry(
-                                                binding.session_map_fd,
-                                                &flow.forward_key,
-                                                decision.nat,
-                                                false,
-                                            );
+                                        if track_in_userspace
+                                            && sessions.install_with_protocol(
+                                                flow.forward_key.clone(),
+                                                decision,
+                                                forward_metadata.clone(),
+                                                now_ns,
+                                                meta.protocol,
+                                                meta.tcp_flags,
+                                            )
+                                        {
                                             created += 1;
                                             let forward_entry = SyncedSessionEntry {
                                                 key: flow.forward_key.clone(),
@@ -2920,6 +3045,12 @@ fn poll_binding(
                                                 protocol: meta.protocol,
                                                 tcp_flags: meta.tcp_flags,
                                             };
+                                            let _ = publish_live_session_entry(
+                                                binding.session_map_fd,
+                                                &flow.forward_key,
+                                                decision.nat,
+                                                false,
+                                            );
                                             publish_shared_session(
                                                 shared_sessions,
                                                 shared_nat_sessions,
@@ -3014,14 +3145,16 @@ fn poll_binding(
                                             synced: false,
                                             nat64_reverse: nat64_info,
                                         };
-                                        if sessions.install_with_protocol(
-                                            reverse_key.clone(),
-                                            reverse_decision,
-                                            reverse_metadata.clone(),
-                                            now_ns,
-                                            meta.protocol,
-                                            meta.tcp_flags,
-                                        ) {
+                                        if track_in_userspace
+                                            && sessions.install_with_protocol(
+                                                reverse_key.clone(),
+                                                reverse_decision,
+                                                reverse_metadata.clone(),
+                                                now_ns,
+                                                meta.protocol,
+                                                meta.tcp_flags,
+                                            )
+                                        {
                                             let _ = publish_live_session_key(
                                                 binding.session_map_fd,
                                                 &reverse_key,
@@ -3039,7 +3172,7 @@ fn poll_binding(
                                                         .fetch_add(1, Ordering::Relaxed);
                                                     debug_log!(
                                                         "SESS_VERIFY_FAIL: reverse key NOT found after publish! \
-                                                         af={} proto={} {}:{} -> {}:{} (map_fd={})",
+                                                             af={} proto={} {}:{} -> {}:{} (map_fd={})",
                                                         reverse_key.addr_family,
                                                         reverse_key.protocol,
                                                         reverse_key.src_ip,
@@ -3055,7 +3188,7 @@ fn poll_binding(
                                                 ) {
                                                     debug_log!(
                                                         "SESS_VERIFY_FAIL: forward key NOT found! \
-                                                         af={} proto={} {}:{} -> {}:{}",
+                                                             af={} proto={} {}:{} -> {}:{}",
                                                         flow.forward_key.addr_family,
                                                         flow.forward_key.protocol,
                                                         flow.forward_key.src_ip,
@@ -3069,9 +3202,9 @@ fn poll_binding(
                                                 if logged < 10 {
                                                     debug_log!(
                                                         "SESS_CREATE[{}]: FWD af={} proto={} {}:{} -> {}:{} \
-                                                         | REV af={} proto={} {}:{} -> {}:{} \
-                                                         | NAT src={:?} dst={:?} \
-                                                         | map_fd={} bpf_entries={}",
+                                                             | REV af={} proto={} {}:{} -> {}:{} \
+                                                             | NAT src={:?} dst={:?} \
+                                                             | map_fd={} bpf_entries={}",
                                                         logged,
                                                         flow.forward_key.addr_family,
                                                         flow.forward_key.protocol,
@@ -4204,28 +4337,123 @@ fn worker_loop(
     peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
+    poll_mode: crate::PollMode,
 ) {
     pin_current_thread(worker_id);
     let mut sessions = SessionTable::new();
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
     sessions.set_timeouts(forwarding.session_timeouts);
+    let mut shared_group_members: BTreeMap<String, usize> = BTreeMap::new();
+    let mut shared_group_frames: BTreeMap<String, u32> = BTreeMap::new();
+    for plan in &binding_plans {
+        if let Some(group_key) = shared_umem_group_key(&plan.status) {
+            *shared_group_members.entry(group_key.clone()).or_default() += 1;
+            *shared_group_frames.entry(group_key).or_default() +=
+                binding_frame_count(plan.ring_entries).max(1);
+        }
+    }
+    let mut shared_umem_pools: BTreeMap<String, WorkerUmemPool> = BTreeMap::new();
+    for (group_key, members) in &shared_group_members {
+        if *members < 2 {
+            continue;
+        }
+        let total_frames = shared_group_frames.get(group_key).copied().unwrap_or(0);
+        match WorkerUmemPool::new(total_frames) {
+            Ok(pool) => {
+                eprintln!(
+                    "bpfrx-userspace-dp: worker_id={} shared-umem group={} members={} frames={}",
+                    worker_id, group_key, members, total_frames,
+                );
+                shared_umem_pools.insert(group_key.clone(), pool);
+            }
+            Err(err) => {
+                eprintln!(
+                    "bpfrx-userspace-dp: worker_id={} failed shared-umem group={} members={} err={}",
+                    worker_id, group_key, members, err,
+                );
+            }
+        }
+    }
     let mut bindings = Vec::with_capacity(binding_plans.len());
     for plan in binding_plans {
-        match BindingWorker::create(
-            &plan.status,
-            plan.ring_entries,
-            plan.xsk_map_fd,
-            plan.heartbeat_map_fd,
-            plan.session_map_fd,
-            plan.live.clone(),
-            plan.bind_strategy,
-        ) {
+        let shared_group = shared_umem_group_key(&plan.status)
+            .filter(|key| shared_group_members.get(key).copied().unwrap_or(0) > 1);
+        let binding = if let Some(group_key) = shared_group.as_ref() {
+            if let Some(pool) = shared_umem_pools.get_mut(group_key) {
+                BindingWorker::create(
+                    &plan.status,
+                    plan.ring_entries,
+                    plan.xsk_map_fd,
+                    plan.heartbeat_map_fd,
+                    plan.session_map_fd,
+                    plan.live.clone(),
+                    plan.bind_strategy,
+                    plan.poll_mode,
+                    pool.umem.clone(),
+                    &mut pool.free_frames,
+                    true,
+                )
+            } else {
+                let total_frames = binding_frame_count(plan.ring_entries).max(1);
+                let mut private_pool = WorkerUmemPool::new(total_frames)
+                    .map_err(|err| format!("create binding umem: {err}"));
+                match private_pool.as_mut() {
+                    Ok(pool) => BindingWorker::create(
+                        &plan.status,
+                        plan.ring_entries,
+                        plan.xsk_map_fd,
+                        plan.heartbeat_map_fd,
+                        plan.session_map_fd,
+                        plan.live.clone(),
+                        plan.bind_strategy,
+                        plan.poll_mode,
+                        pool.umem.clone(),
+                        &mut pool.free_frames,
+                        false,
+                    ),
+                    Err(err) => Err(err.to_string().into()),
+                }
+            }
+        } else {
+            let total_frames = binding_frame_count(plan.ring_entries).max(1);
+            let mut private_pool =
+                WorkerUmemPool::new(total_frames).map_err(|err| format!("create binding umem: {err}"));
+            match private_pool.as_mut() {
+                Ok(pool) => BindingWorker::create(
+                    &plan.status,
+                    plan.ring_entries,
+                    plan.xsk_map_fd,
+                    plan.heartbeat_map_fd,
+                    plan.session_map_fd,
+                    plan.live.clone(),
+                    plan.bind_strategy,
+                    plan.poll_mode,
+                    pool.umem.clone(),
+                    &mut pool.free_frames,
+                    false,
+                ),
+                Err(err) => Err(err.to_string().into()),
+            }
+        };
+        match binding {
             Ok(binding) => bindings.push(binding),
             Err(err) => plan.live.set_error(err.to_string()),
         }
     }
     let binding_lookup = WorkerBindingLookup::from_bindings(&bindings);
+    let mut interrupt_poll_fds = if poll_mode == crate::PollMode::Interrupt {
+        bindings
+            .iter()
+            .map(|binding| libc::pollfd {
+                fd: binding.device.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut idle_iters = 0u32;
     let mut poll_start = 0usize;
     let mut shared_recycles = Vec::with_capacity((RX_BATCH_SIZE as usize).saturating_mul(2));
@@ -4333,7 +4561,16 @@ fn worker_loop(
             ha_runtime.as_ref(),
         );
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
-        let expired = sessions.expire_stale(loop_now_ns);
+        let expired_entries = sessions.expire_stale_entries(loop_now_ns);
+        let expired = expired_entries.len() as u64;
+        for expired_entry in expired_entries {
+            delete_session_map_entry_for_removed_session(
+                session_map_fd,
+                &expired_entry.key,
+                expired_entry.decision,
+                &expired_entry.metadata,
+            );
+        }
         if expired > 0 {
             if let Some(binding) = bindings.first() {
                 binding
@@ -4482,7 +4719,7 @@ fn worker_loop(
                         + inflight_recycles
                         + scratch_recycle_len
                         + ptx_prepared; // prepared TX holds UMEM frames
-                    let expected_total = b.umem.total_frames;
+                    let expected_total = b.umem.total_frames();
                     let _ = write!(
                         binding_summary,
                         " [{}:if{}q{} pfill={} fring={} rxring={} free_tx={} otx={} ifl={} scr={} ptxp={} ptxl={} total={}/{} fill_ok={} polls={} bp={} rx_empty={} wake={}",
@@ -4763,7 +5000,7 @@ fn worker_loop(
                                 ptxp,
                                 ptxl,
                                 total,
-                                sb.umem.total_frames,
+                                sb.umem.total_frames(),
                             );
                             if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) = raw {
                                 let _ = write!(
@@ -4877,10 +5114,35 @@ fn worker_loop(
             continue;
         }
         idle_iters = idle_iters.saturating_add(1);
-        if idle_iters <= IDLE_SPIN_ITERS {
-            std::hint::spin_loop();
-        } else {
-            thread::sleep(Duration::from_micros(IDLE_SLEEP_US));
+        match poll_mode {
+            crate::PollMode::BusyPoll => {
+                if idle_iters <= IDLE_SPIN_ITERS {
+                    std::hint::spin_loop();
+                } else {
+                    thread::sleep(Duration::from_micros(IDLE_SLEEP_US));
+                }
+            }
+            crate::PollMode::Interrupt => {
+                // Interrupt mode still needs a short local spin before blocking.
+                // Firewall-local TCP flows are ACK-latency-sensitive; blocking
+                // immediately on the first empty poll collapses cwnd badly.
+                if idle_iters <= IDLE_SPIN_ITERS {
+                    std::hint::spin_loop();
+                } else if !interrupt_poll_fds.is_empty() {
+                    for pfd in &mut interrupt_poll_fds {
+                        pfd.revents = 0;
+                    }
+                    unsafe {
+                        libc::poll(
+                            interrupt_poll_fds.as_mut_ptr(),
+                            interrupt_poll_fds.len() as libc::nfds_t,
+                            INTERRUPT_POLL_TIMEOUT_MS,
+                        );
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(INTERRUPT_POLL_TIMEOUT_MS as u64));
+                }
+            }
         }
     }
     heartbeat.store(monotonic_nanos(), Ordering::Relaxed);
@@ -6241,11 +6503,8 @@ fn interface_nat_local_resolution(
 fn interface_nat_local_resolution_on_session_miss(
     state: &ForwardingState,
     dst: IpAddr,
-    protocol: u8,
+    _protocol: u8,
 ) -> Option<ForwardingResolution> {
-    if !matches!(protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        return None;
-    }
     interface_nat_local_resolution(state, dst)
 }
 
@@ -6290,11 +6549,8 @@ fn ingress_interface_local_resolution_on_session_miss(
     ingress_ifindex: i32,
     ingress_vlan_id: u16,
     dst: IpAddr,
-    protocol: u8,
+    _protocol: u8,
 ) -> Option<ForwardingResolution> {
-    if !matches!(protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        return None;
-    }
     ingress_interface_local_resolution(state, ingress_ifindex, ingress_vlan_id, dst)
 }
 
@@ -7082,9 +7338,8 @@ fn session_map_key(key: &SessionKey) -> UserspaceSessionMapKey {
     }
 }
 
-fn publish_live_session_key(map_fd: c_int, key: &SessionKey) -> io::Result<()> {
+fn publish_session_map_key(map_fd: c_int, key: &SessionKey, value: u8) -> io::Result<()> {
     let map_key = session_map_key(key);
-    let value = 1u8;
     let rc = unsafe {
         libbpf_sys::bpf_map_update_elem(
             map_fd,
@@ -7097,6 +7352,14 @@ fn publish_live_session_key(map_fd: c_int, key: &SessionKey) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+fn publish_live_session_key(map_fd: c_int, key: &SessionKey) -> io::Result<()> {
+    publish_session_map_key(map_fd, key, USERSPACE_SESSION_ACTION_REDIRECT)
+}
+
+fn publish_kernel_local_session_key(map_fd: c_int, key: &SessionKey) -> io::Result<()> {
+    publish_session_map_key(map_fd, key, USERSPACE_SESSION_ACTION_PASS_TO_KERNEL)
 }
 
 fn publish_live_session_entry(
@@ -7121,6 +7384,21 @@ fn publish_live_session_entry(
         }
     }
     Ok(())
+}
+
+fn publish_session_map_entry_for_session(
+    map_fd: c_int,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+) -> io::Result<()> {
+    if metadata.synced
+        && !metadata.is_reverse
+        && decision.resolution.disposition == ForwardingDisposition::LocalDelivery
+    {
+        return publish_kernel_local_session_key(map_fd, key);
+    }
+    publish_live_session_entry(map_fd, key, decision.nat, metadata.is_reverse)
 }
 
 /// Verify a session key exists in the BPF map (read-back after publish).
@@ -7346,6 +7624,22 @@ fn delete_live_session_entry(map_fd: c_int, key: &SessionKey, nat: NatDecision, 
             delete_live_session_key(map_fd, &reverse_canonical);
         }
     }
+}
+
+fn delete_session_map_entry_for_removed_session(
+    map_fd: c_int,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+) {
+    if metadata.synced
+        && !metadata.is_reverse
+        && decision.resolution.disposition == ForwardingDisposition::LocalDelivery
+    {
+        delete_live_session_key(map_fd, key);
+        return;
+    }
+    delete_live_session_entry(map_fd, key, decision.nat, metadata.is_reverse);
 }
 
 struct MmapArea {
@@ -7897,6 +8191,46 @@ mod tests {
             bind_flag_candidates_for_driver(Some("mlx5_core")),
             &[XSK_BIND_FLAGS_ZEROCOPY, XSK_BIND_FLAGS_COPY]
         );
+    }
+
+    #[test]
+    fn shared_umem_group_key_is_same_device_mlx5_only() {
+        assert_eq!(
+            shared_umem_group_key_for_device(
+                Some("mlx5_core"),
+                Some("/sys/devices/pci0000:00/0000:08:00.0")
+            ),
+            Some("mlx5:/sys/devices/pci0000:00/0000:08:00.0".to_string())
+        );
+        assert_eq!(
+            shared_umem_group_key_for_device(
+                Some("virtio_net"),
+                Some("/sys/devices/pci0000:00/0000:00:07.0")
+            ),
+            None
+        );
+        assert_eq!(shared_umem_group_key_for_device(Some("mlx5_core"), None), None);
+    }
+
+    #[test]
+    fn cloned_worker_umem_shares_allocation_identity() {
+        let shared = match WorkerUmem::new(64) {
+            Ok(shared) => shared,
+            Err(err) => {
+                eprintln!("skipping UMEM identity test: {err}");
+                return;
+            }
+        };
+        let shared_clone = shared.clone();
+        let private = match WorkerUmem::new(64) {
+            Ok(private) => private,
+            Err(err) => {
+                eprintln!("skipping UMEM identity test: {err}");
+                return;
+            }
+        };
+        assert!(shared.shares_allocation_with(&shared_clone));
+        assert!(!shared.shares_allocation_with(&private));
     }
 
     #[test]
@@ -8907,6 +9241,108 @@ mod tests {
     }
 
     #[test]
+    fn reverse_session_prefers_interface_snat_ipv4_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let ha_state = BTreeMap::new();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+
+        let resolved = reverse_resolution_for_session(
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            "wan",
+            false,
+            monotonic_nanos() / 1_000_000_000,
+        );
+
+        assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
+        assert_eq!(resolved.local_ifindex, 12);
+        assert_eq!(resolved.egress_ifindex, 12);
+        assert_eq!(resolved.tx_ifindex, 12);
+    }
+
+    #[test]
+    fn reverse_session_prefers_interface_snat_ipv6_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let ha_state = BTreeMap::new();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+
+        let resolved = reverse_resolution_for_session(
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+            "2001:559:8585:80::8".parse().expect("dst"),
+            "wan",
+            false,
+            monotonic_nanos() / 1_000_000_000,
+        );
+
+        assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
+        assert_eq!(resolved.local_ifindex, 12);
+        assert_eq!(resolved.egress_ifindex, 12);
+        assert_eq!(resolved.tx_ifindex, 12);
+    }
+
+    #[test]
+    fn session_hit_keeps_interface_snat_ipv4_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let flow = SessionFlow {
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+                src_port: 5201,
+                dst_port: 43600,
+            },
+        };
+        let decision = SessionDecision {
+            resolution: interface_nat_local_resolution(&state, flow.dst_ip)
+                .expect("interface nat local delivery"),
+            nat: NatDecision::default(),
+        };
+
+        let resolved =
+            lookup_forwarding_resolution_for_session(&state, &dynamic_neighbors, &flow, decision);
+
+        assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
+        assert_eq!(resolved.local_ifindex, 12);
+    }
+
+    #[test]
+    fn session_hit_keeps_interface_snat_ipv6_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let flow = SessionFlow {
+            src_ip: "2001:559:8585:80::200".parse().expect("src"),
+            dst_ip: "2001:559:8585:80::8".parse().expect("dst"),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: PROTO_TCP,
+                src_ip: "2001:559:8585:80::200".parse().expect("src"),
+                dst_ip: "2001:559:8585:80::8".parse().expect("dst"),
+                src_port: 5201,
+                dst_port: 43600,
+            },
+        };
+        let decision = SessionDecision {
+            resolution: interface_nat_local_resolution(&state, flow.dst_ip)
+                .expect("interface nat local delivery"),
+            nat: NatDecision::default(),
+        };
+
+        let resolved =
+            lookup_forwarding_resolution_for_session(&state, &dynamic_neighbors, &flow, decision);
+
+        assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
+        assert_eq!(resolved.local_ifindex, 12);
+    }
+
+    #[test]
     fn embedded_icmp_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let ha_state = BTreeMap::from([(
@@ -9260,24 +9696,31 @@ mod tests {
     }
 
     #[test]
-    fn tcp_session_miss_does_not_local_deliver_interface_nat_address() {
+    fn tcp_session_miss_local_delivers_interface_nat_address() {
         let state = build_forwarding_state(&nat_snapshot());
-        assert!(
-            interface_nat_local_resolution_on_session_miss(
-                &state,
-                "172.16.80.8".parse().expect("v4"),
-                PROTO_TCP,
-            )
-            .is_none()
+        let resolved_v4 = interface_nat_local_resolution_on_session_miss(
+            &state,
+            "172.16.80.8".parse().expect("v4"),
+            PROTO_TCP,
+        )
+        .expect("tcp v4 nat local delivery");
+        assert_eq!(
+            resolved_v4.disposition,
+            ForwardingDisposition::LocalDelivery
         );
-        assert!(
-            interface_nat_local_resolution_on_session_miss(
-                &state,
-                "2001:559:8585:80::8".parse().expect("v6"),
-                PROTO_UDP,
-            )
-            .is_none()
+        assert_eq!(resolved_v4.local_ifindex, 12);
+
+        let resolved_v6 = interface_nat_local_resolution_on_session_miss(
+            &state,
+            "2001:559:8585:80::8".parse().expect("v6"),
+            PROTO_UDP,
+        )
+        .expect("udp v6 nat local delivery");
+        assert_eq!(
+            resolved_v6.disposition,
+            ForwardingDisposition::LocalDelivery
         );
+        assert_eq!(resolved_v6.local_ifindex, 12);
     }
 
     #[test]
@@ -9291,28 +9734,35 @@ mod tests {
     }
 
     #[test]
-    fn tcp_session_miss_does_not_local_deliver_ingress_vlan_address() {
+    fn tcp_session_miss_local_delivers_ingress_vlan_address() {
         let state = build_forwarding_state(&nat_snapshot());
-        assert!(
-            ingress_interface_local_resolution_on_session_miss(
-                &state,
-                11,
-                80,
-                "172.16.80.8".parse().expect("dst"),
-                PROTO_TCP,
-            )
-            .is_none()
+        let resolved_v4 = ingress_interface_local_resolution_on_session_miss(
+            &state,
+            11,
+            80,
+            "172.16.80.8".parse().expect("dst"),
+            PROTO_TCP,
+        )
+        .expect("tcp ingress local delivery");
+        assert_eq!(
+            resolved_v4.disposition,
+            ForwardingDisposition::LocalDelivery
         );
-        assert!(
-            ingress_interface_local_resolution_on_session_miss(
-                &state,
-                11,
-                80,
-                "2001:559:8585:80::8".parse().expect("dst"),
-                PROTO_UDP,
-            )
-            .is_none()
+        assert_eq!(resolved_v4.local_ifindex, 12);
+
+        let resolved_v6 = ingress_interface_local_resolution_on_session_miss(
+            &state,
+            11,
+            80,
+            "2001:559:8585:80::8".parse().expect("dst"),
+            PROTO_UDP,
+        )
+        .expect("udp ingress local delivery");
+        assert_eq!(
+            resolved_v6.disposition,
+            ForwardingDisposition::LocalDelivery
         );
+        assert_eq!(resolved_v6.local_ifindex, 12);
     }
 
     #[test]
