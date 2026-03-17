@@ -221,7 +221,11 @@ The remaining optimization path is to make the existing memcpy cheaper
 ## Current Prototype Status (2026-03-17)
 
 The safe reintegration path is now started in the code on the prototype
-branch.
+branch, but live validation exposed two important limits:
+
+- the current HA lab does not have a proof topology for this prototype
+- the current implementation is not yet deployable on the HA lab because
+  shared UMEM still uses the wrong AF_XDP queue ownership contract
 
 ### Narrow scope
 
@@ -253,20 +257,53 @@ This prototype will not, by itself, fix the current HA lab's main
 cross-NIC transit bottleneck, because the hot path there still crosses
 different physical devices and therefore still requires a copy.
 
+### What live validation actually proved
+
+On the current HA lab:
+
+- `ge-0-0-1`/`ge-7-0-1` and `ge-0-0-2`/`ge-7-0-2` are different physical
+  `mlx5` PCI devices
+- the WAN50 -> WAN80 path on the active owner already collapses to the
+  existing in-place hairpin behavior on `master`
+- that means WAN50 -> WAN80 is only a no-regression check, not proof
+  that the new same-allocation cross-binding path is exercised
+
+So the current lab can answer:
+
+- did the prototype regress an existing same-device-ish path?
+
+It cannot answer:
+
+- did the prototype materially improve a true same-device cross-binding
+  forward path?
+
+### Current implementation gap
+
+The current prototype shares one `WorkerUmem` across multiple bindings in
+the same `(driver, device_path)` group, but still opens per-binding AF_XDP
+ring ownership the same way as private UMEM bindings.
+
+In live deployment this caused the second queue on the shared group to fail
+with:
+
+- `configure AF_XDP rings: create fq/cq: Device or resource busy`
+
+That means the next implementation step is not more performance work. It is
+correct AF_XDP shared-UMEM bring-up:
+
+1. establish the right FQ/CQ ownership model for one shared UMEM
+2. bind secondary queues/sockets against that owner correctly
+3. only then retry same-device throughput validation
+
 ### Success criteria for the prototype
 
 - compile and unit-test cleanly on current `master`
-- preserve current per-binding bind strategy behavior
+- preserve current per-binding bind strategy behavior for non-shared paths
 - no change for `virtio_net`
 - no change for cross-NIC traffic
+- no AF_XDP bind regressions on multi-queue `mlx5`
 - same-allocation forwards use the in-place rewrite path instead of the
   direct builder copy path
-with prefetch).
-
-### Changes reverted
-
-The implementation in `userspace-dp/src/afxdp.rs` was reverted to the
-per-binding UMEM approach. This plan document is retained for reference.
 
 ## Original Testing Plan
 

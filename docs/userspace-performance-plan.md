@@ -268,6 +268,22 @@ This is the only safe reintegration point on current `master`. It does
 not remove the copy from the HA lab's cross-NIC transit path by itself,
 but it is the right structural fix for same-device hot paths.
 
+Current validation status:
+
+- the current HA lab's WAN50 -> WAN80 path is only a no-regression check,
+  not proof that the new same-allocation cross-binding path is exercised
+- the prototype branch still regresses multi-queue `mlx5` AF_XDP bind on
+  the HA lab (`create fq/cq: Device or resource busy` on the second queue
+  in a shared group)
+
+So Phase 7 is still structurally correct as a direction, but not ready to
+use as the active HA perf branch. Cross-NIC HA performance work should stay
+on the normal HA branch and remain focused on:
+
+- `poll_binding`
+- `enqueue_pending_forwards`
+- `session_glue::resolve_flow_session_decision`
+
 ### Files
 
 - `userspace-dp/src/afxdp/frame.rs` — `enqueue_pending_forwards()`
