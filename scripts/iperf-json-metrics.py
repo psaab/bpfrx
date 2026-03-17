@@ -21,11 +21,47 @@ def interval_bps(interval):
     return total, float(start or 0.0), float(end or 0.0)
 
 
+def load_iperf_payload(path):
+    text = path.read_text(encoding="utf-8")
+    try:
+        return {"format": "json", "data": json.loads(text)}
+    except Exception:
+        pass
+
+    events = []
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            events.append(json.loads(raw))
+        except Exception as exc:
+            raise ValueError(f"failed to parse iperf JSON stream line {lineno}: {exc}") from exc
+    return {"format": "json-stream", "data": events}
+
+
+def collect_intervals(payload):
+    if payload["format"] == "json":
+        return [interval_bps(interval) for interval in payload["data"].get("intervals", [])], payload["data"].get("end", {})
+
+    intervals = []
+    end = {}
+    for event in payload["data"]:
+        if event.get("event") == "interval":
+            intervals.append(interval_bps(event.get("data") or {}))
+        elif event.get("event") == "end":
+            end = event.get("data") or {}
+    return intervals, end
+
+
 def summarize(path, args):
     summary = {
         "path": str(path),
         "ok": False,
         "error": "",
+        "format": "",
+        "completed": False,
+        "observed_end_sec": 0.0,
         "avg_gbps": 0.0,
         "retransmits": 0,
         "interval_gbps": [],
@@ -35,32 +71,61 @@ def summarize(path, args):
         "tail_median_gbps": 0.0,
         "tail_min_gbps": 0.0,
         "tail_peak_ratio": 0.0,
+        "zero_intervals_total": 0,
+        "stream_zero_intervals_total": 0,
+        "zero_streams_total": 0,
         "zero_intervals_after_peak": 0,
         "stalled_intervals_after_peak": 0,
         "collapse_detected": False,
         "collapse_reason": "",
     }
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        payload = load_iperf_payload(path)
     except Exception as exc:
         summary["error"] = f"failed to parse iperf JSON: {exc}"
         return summary
 
-    if data.get("error"):
+    summary["format"] = payload["format"]
+    data = payload["data"]
+    if payload["format"] == "json" and data.get("error"):
         summary["error"] = str(data["error"])
         return summary
 
-    end = data.get("end", {})
+    intervals, end = collect_intervals(payload)
+    summary["completed"] = bool(end)
     sum_sent = end.get("sum_sent") or end.get("sum") or {}
     summary["avg_gbps"] = float(sum_sent.get("bits_per_second") or 0.0) / 1e9
     summary["retransmits"] = int(sum_sent.get("retransmits") or 0)
 
     full_intervals = []
-    for interval in data.get("intervals", []):
-        bps, start, end_s = interval_bps(interval)
+    observed_end = 0.0
+    normalized_intervals = []
+    if payload["format"] == "json":
+        normalized_intervals = list(data.get("intervals", []))
+    else:
+        normalized_intervals = [
+            (event.get("data") or {}) for event in payload["data"] if event.get("event") == "interval"
+        ]
+    stream_zero_total = 0
+    zero_stream_ids = set()
+    for interval in normalized_intervals:
+        for stream in interval.get("streams", []):
+            if float(stream.get("bits_per_second") or 0.0) <= args.zero_gbps * 1e9:
+                stream_zero_total += 1
+                zero_stream_ids.add(str(stream.get("socket") or stream.get("id") or "?"))
+    for bps, start, end_s in intervals:
+        observed_end = max(observed_end, end_s)
         duration = end_s - start
         if duration >= args.min_full_interval_sec:
             full_intervals.append(bps / 1e9)
+    if end:
+        observed_end = max(observed_end, float((sum_sent.get("end") or 0.0)))
+    summary["observed_end_sec"] = observed_end
+    summary["stream_zero_intervals_total"] = stream_zero_total
+    summary["zero_streams_total"] = len(zero_stream_ids)
+    summary["zero_intervals_total"] = (
+        sum(1 for value in full_intervals if value <= args.zero_gbps) + stream_zero_total
+    )
 
     summary["interval_gbps"] = full_intervals
     if not full_intervals:
