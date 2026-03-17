@@ -1853,9 +1853,10 @@ pub(super) fn build_forwarded_frame_into_from_frame(
         ether_type,
     )?;
     let payload_out = out.get_mut(eth_len..frame_len)?;
-    // Source and destination are distinct buffers on the direct-build path.
-    // Use an explicit non-overlapping copy so the hot path does not route
-    // through memmove semantics.
+    // SAFETY: source (payload) and destination (payload_out) are distinct
+    // buffers — payload is from the ingress UMEM, payload_out is in the
+    // egress UMEM. Lengths are equal because both span eth_len..frame_len.
+    debug_assert_eq!(payload_out.len(), payload.len());
     unsafe {
         core::ptr::copy_nonoverlapping(payload.as_ptr(), payload_out.as_mut_ptr(), payload.len());
     }
@@ -2687,6 +2688,9 @@ pub(super) fn write_eth_header_slice(
         return None;
     }
     let ether_type_bytes = ether_type.to_be_bytes();
+    // SAFETY: buf.len() >= eth_len is guaranteed by the guard above.
+    // eth_len is 14 (no VLAN) or 18 (VLAN), so all writes are in-bounds.
+    debug_assert!(buf.len() >= eth_len);
     unsafe {
         let ptr = buf.as_mut_ptr();
         core::ptr::copy_nonoverlapping(dst.as_ptr(), ptr, 6);
