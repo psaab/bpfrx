@@ -253,14 +253,17 @@ static USERSPACE_INTERFACE_NAT_V6: HashMap<UserspaceLocalV6Key, u8> =
     HashMap::with_max_entries(8192, 0);
 
 #[map(name = "userspace_sessions")]
-static USERSPACE_SESSIONS: HashMap<UserspaceSessionKey, u8> =
-    HashMap::with_max_entries(262144, 0);
+static USERSPACE_SESSIONS: HashMap<UserspaceSessionKey, u8> = HashMap::with_max_entries(262144, 0);
+
+const USERSPACE_SESSION_ACTION_REDIRECT: u8 = 1;
+const USERSPACE_SESSION_ACTION_PASS_TO_KERNEL: u8 = 2;
 
 #[map(name = "userspace_fallback_progs")]
 static USERSPACE_FALLBACK_PROGS: ProgramArray = ProgramArray::with_max_entries(1, 0);
 
 #[map(name = "userspace_fallback_stats")]
-static USERSPACE_FALLBACK_STATS: Array<u64> = Array::with_max_entries(USERSPACE_FALLBACK_REASON_MAX, 0);
+static USERSPACE_FALLBACK_STATS: Array<u64> =
+    Array::with_max_entries(USERSPACE_FALLBACK_REASON_MAX, 0);
 
 #[map(name = "userspace_trace")]
 static USERSPACE_TRACE: HashMap<u32, UserspaceTraceValue> = HashMap::with_max_entries(1024, 0);
@@ -297,7 +300,10 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     };
 
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
-    if USERSPACE_INGRESS_IFACES.get(ingress_ifindex).map_or(true, |v| *v == 0) {
+    if USERSPACE_INGRESS_IFACES
+        .get(ingress_ifindex)
+        .map_or(true, |v| *v == 0)
+    {
         return Ok(cpumap_or_pass(ctrl));
     }
     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
@@ -410,29 +416,11 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         );
         return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
-    // Fast path: for established TCP/UDP sessions, skip LOCAL and
-    // INTERFACE_NAT hash map lookups — if the session exists, the
-    // destination cannot be local (userspace DP only creates sessions
-    // for transit traffic). This eliminates 2-3 hash map lookups per
-    // packet on the hot path.
-    if has_live_userspace_session(&parsed) {
-        // Session exists — go directly to metadata stamping + XSK redirect.
-    } else {
-        // Session miss — run full checks for new connections.
-        if is_icmp_to_interface_nat_local(&parsed) {
-            record_trace(
-                ctrl.flags,
-                ingress_ifindex,
-                rx_queue_index,
-                selected_queue,
-                binding.slot,
-                USERSPACE_TRACE_STAGE_INTERFACE_NAT_LOCAL,
-                0,
-                &parsed,
-            );
-            return Ok(cpumap_or_pass(ctrl));
+    match live_userspace_session_action(&parsed) {
+        USERSPACE_SESSION_ACTION_REDIRECT => {
+            // Session exists and stays on the userspace dataplane.
         }
-        if is_local_destination(&parsed) {
+        USERSPACE_SESSION_ACTION_PASS_TO_KERNEL => {
             record_trace(
                 ctrl.flags,
                 ingress_ifindex,
@@ -445,9 +433,38 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             );
             return Ok(cpumap_or_pass(ctrl));
         }
-        // Let all session misses through to the userspace dataplane.
-        // The userspace DP will evaluate policy and either create a
-        // session (new flow) or drop (stale non-SYN TCP / policy deny).
+        _ => {
+            // Session miss — run full checks for new connections.
+            if is_icmp_to_interface_nat_local(&parsed) {
+                record_trace(
+                    ctrl.flags,
+                    ingress_ifindex,
+                    rx_queue_index,
+                    selected_queue,
+                    binding.slot,
+                    USERSPACE_TRACE_STAGE_INTERFACE_NAT_LOCAL,
+                    0,
+                    &parsed,
+                );
+                return Ok(cpumap_or_pass(ctrl));
+            }
+            if is_local_destination(&parsed) {
+                record_trace(
+                    ctrl.flags,
+                    ingress_ifindex,
+                    rx_queue_index,
+                    selected_queue,
+                    binding.slot,
+                    USERSPACE_TRACE_STAGE_LOCAL_DESTINATION,
+                    0,
+                    &parsed,
+                );
+                return Ok(cpumap_or_pass(ctrl));
+            }
+            // Let all session misses through to the userspace dataplane.
+            // The userspace DP will evaluate policy and either create a
+            // session (new flow) or drop (stale non-SYN TCP / policy deny).
+        }
     }
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
@@ -809,15 +826,15 @@ fn is_icmp_to_interface_nat_local(pkt: &ParsedPacket) -> bool {
 fn is_interface_nat_destination(pkt: &ParsedPacket) -> bool {
     match pkt.addr_family {
         AF_INET => unsafe { USERSPACE_INTERFACE_NAT_V4.get(&pkt.dst_v4) }.is_some(),
-        AF_INET6 => unsafe {
-            USERSPACE_INTERFACE_NAT_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_v6 })
+        AF_INET6 => {
+            unsafe { USERSPACE_INTERFACE_NAT_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_v6 }) }
+                .is_some()
         }
-        .is_some(),
         _ => false,
     }
 }
 
-fn has_live_userspace_session(pkt: &ParsedPacket) -> bool {
+fn live_userspace_session_action(pkt: &ParsedPacket) -> u8 {
     let key = UserspaceSessionKey {
         addr_family: pkt.addr_family,
         protocol: pkt.protocol,
@@ -827,7 +844,7 @@ fn has_live_userspace_session(pkt: &ParsedPacket) -> bool {
         src_addr: pkt.src_addr,
         dst_addr: pkt.dst_addr,
     };
-    unsafe { USERSPACE_SESSIONS.get(&key) }.is_some()
+    unsafe { USERSPACE_SESSIONS.get(&key).copied() }.unwrap_or(0)
 }
 
 fn is_connection_initiating(pkt: &ParsedPacket) -> bool {
@@ -850,7 +867,11 @@ fn is_ipv6_link_local(ip: [u8; 16]) -> bool {
     ip[0] == 0xfe && (ip[1] & 0xc0) == 0x80
 }
 
-fn select_userspace_queue(ctrl: &UserspaceCtrl, rx_queue_index: u32, _parsed: &ParsedPacket) -> u32 {
+fn select_userspace_queue(
+    ctrl: &UserspaceCtrl,
+    rx_queue_index: u32,
+    _parsed: &ParsedPacket,
+) -> u32 {
     let queue_count = if ctrl.queue_count == 0 {
         ctrl.workers
     } else {
