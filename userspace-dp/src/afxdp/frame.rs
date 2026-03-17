@@ -406,6 +406,10 @@ pub(super) fn enqueue_pending_forwards(
                         direct_tx_offset = target_binding.free_tx_frames.pop_front();
                     }
                     let direct_built = if is_nat64 {
+                        // NAT64 can't use direct TX — return the frame if we popped one.
+                        if let Some(off) = direct_tx_offset {
+                            target_binding.free_tx_frames.push_front(off);
+                        }
                         false
                     } else if let Some(tx_offset) = direct_tx_offset {
                         let target_area = &target_binding.umem.area;
