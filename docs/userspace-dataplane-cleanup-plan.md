@@ -15,7 +15,7 @@ Related documents:
 
 ## Status Snapshot
 
-Current execution state as of 2026-03-15:
+Current execution state as of 2026-03-17:
 
 1. Phase 1 is complete and merged on `master` via PR `#222`.
 2. Phase 2 is complete and merged on `master` via PRs `#223` and `#225`.
@@ -23,7 +23,8 @@ Current execution state as of 2026-03-15:
 4. Phase 4 is complete and merged on `master` via PR `#229`.
 5. Phase 5 is complete and merged on `master` via PRs `#221`, `#230`, and
    `#231`.
-6. Phase 6 is in progress on branch `fix/userspace-phase6-performance`.
+6. Phase 6 remains the active area, but the first current job inside it was
+   baseline recovery on `fix/userspace-disable-shared-umem-runtime`.
 
 Latest status-sync update for this document:
 
@@ -70,14 +71,26 @@ Completed under this plan:
      via the UMEM-owner path with `bind_flags=0`
    - active node validation on `bpfrx-userspace-fw0` shows `24/24` bound and
      `24/24` ready bindings after deploy
+9. A later merge regressed the HA lab by enabling the same-device shared-UMEM
+   prototype in normal worker startup on `master`, which left the lab at
+   `16/24` ready bindings.
+10. The current restore branch disables that runtime path again and brings the
+    HA lab back to:
+    - `24/24` bound bindings
+    - `24/24` ready bindings
+    - working IPv4/IPv6 internal reachability
+    - working IPv4/IPv6 TTL or hop-limit time-exceeded replies
+    - passing short userspace HA validation
 
 Still left to do at a high level:
 
-1. Continue sustained-throughput optimization work in Phase 6 on top of the
-   cleaned dataplane surface.
-2. Convert the currently kept Phase 6 micro-optimizations into a clean PR and
-   keep the rejected experiments out of the branch history.
-3. Tighten measurement discipline before landing more hot-path changes because
+1. Keep the restored `24/24` HA baseline intact before accepting any new
+   performance results.
+2. Continue sustained-throughput optimization work in Phase 6 on top of that
+   restored baseline.
+3. Keep the same-device shared-UMEM work explicitly experimental rather than
+   part of the normal runtime path.
+4. Tighten measurement discipline before landing more hot-path changes because
    the lab currently shows meaningful run-to-run throughput variance.
 
 ## Current Baseline
@@ -508,6 +521,12 @@ Status: In Progress
 
 Current measured state on the Phase 6 branch:
 
+0. The first current Phase 6 task is already complete:
+   - restore a valid HA lab runtime after the shared-UMEM prototype was merged
+     into normal worker startup
+   - current restore branch returns the lab to `24/24` ready bindings and a
+     passing short HA validation baseline
+
 1. The current kept Phase 6 slice is intentionally small:
    - `userspace-dp/src/afxdp/tx.rs`
      - only `PreparedTxRecycle::FillOnSlot(_)` is tracked in
@@ -622,12 +641,14 @@ This order is deliberate.
 1. Keep the resolved driver split intact:
    - `mlx5_core` on zerocopy UMEM-owner
    - `virtio_net` on auto-mode copy UMEM-owner
-2. Keep the traceroute, `mtr`, and throughput-collapse checks as the mandatory
+2. Keep the same-device shared-UMEM prototype out of the baseline runtime until
+   it proves clean on a real same-device topology.
+3. Keep the traceroute, `mtr`, and throughput-collapse checks as the mandatory
    correctness gate for any Phase 6 performance changes.
-3. Continue Phase 6 on the measured remaining costs:
+4. Continue Phase 6 on the measured remaining costs:
    - `poll_binding`
    - `enqueue_pending_forwards`
    - `build_forwarded_frame_into_from_frame`
    - `apply_nat_ipv6`
-4. Keep release-build warning debt in non-hot subsystems visible while Phase 6
+5. Keep release-build warning debt in non-hot subsystems visible while Phase 6
    work continues so new perf changes do not disappear into unrelated noise.

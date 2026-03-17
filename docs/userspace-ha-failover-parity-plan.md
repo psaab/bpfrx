@@ -15,6 +15,11 @@ request chassis cluster failover redundancy-group 1 node <peer>
 
 Current status:
 
+- the current HA reliability work has to assume a restored baseline, not raw
+  `master`, because a later merge enabled the same-device shared-UMEM prototype
+  in normal worker startup and left the HA lab at `16/24` ready bindings
+- the current restore branch disables that runtime path again and returns the
+  lab to `24/24` ready bindings before failover/perf validation resumes
 - the original userspace failover collapse is fixed in the local working tree
 - current `master` still shows a bounded but unacceptable failover trough in the
   dedicated validator:
