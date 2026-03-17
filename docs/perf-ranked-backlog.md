@@ -1,5 +1,11 @@
 # Ranked Performance Backlog
 
+This document is historical and primarily describes the older eBPF/XDP
+performance backlog. It is not the primary plan for the current Rust AF_XDP
+userspace dataplane. Use
+[userspace-performance-plan.md](/home/ps/git/codex-bpfrx/docs/userspace-performance-plan.md)
+for current userspace optimization work.
+
 Date: 2026-03-07
 Baseline perf snapshot: `/tmp/perf-results.md`
 Current code baseline: `master` at `1cedfc7`
