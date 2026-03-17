@@ -49,7 +49,7 @@ pub(super) fn drain_pending_fill(binding: &mut BindingWorker, now_ns: u64) -> bo
         // descriptor without writing packet data (stale/uninit frame).
         if cfg!(feature = "debug-log") {
             if let Some(frame) =
-                unsafe { binding.umem.area.slice_mut_unchecked(offset as usize, 8) }
+                unsafe { binding.umem.area().slice_mut_unchecked(offset as usize, 8) }
             {
                 frame.copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_ne_bytes());
             }
@@ -374,7 +374,7 @@ pub(super) fn transmit_batch(
         let Some(frame) = (unsafe {
             binding
                 .umem
-                .area
+                .area()
                 .slice_mut_unchecked(offset as usize, req.bytes.len())
         }) else {
             binding.free_tx_frames.push_front(offset);
@@ -510,7 +510,7 @@ pub(super) fn transmit_prepared_batch(
     for req in &binding.scratch_prepared_tx {
         if binding
             .umem
-            .area
+            .area()
             .slice(req.offset as usize, req.len as usize)
             .is_none()
         {
@@ -532,7 +532,7 @@ pub(super) fn transmit_prepared_batch(
         for req in &binding.scratch_prepared_tx {
             if let Some(frame_data) = binding
                 .umem
-                .area
+                .area()
                 .slice(req.offset as usize, req.len as usize)
             {
                 if frame_has_tcp_rst(frame_data) {

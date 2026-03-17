@@ -28,6 +28,7 @@ use std::ffi::CString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -66,7 +67,7 @@ use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
     AfXdpBindStrategy, binding_frame_count, ifinfo_from_binding, interface_driver_name,
     open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets,
-    reserved_tx_frames, umem_ring_size,
+    reserved_tx_frames, shared_umem_group_key, shared_umem_group_key_for_device, umem_ring_size,
 };
 #[cfg(test)]
 use self::bind::{
@@ -1632,26 +1633,37 @@ impl BindingWorker {
         live: Arc<BindingLiveState>,
         bind_strategy: AfXdpBindStrategy,
         poll_mode: crate::PollMode,
+        worker_umem: WorkerUmem,
+        frame_pool: &mut VecDeque<u64>,
+        shared_umem: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let total_frames = binding_frame_count(ring_entries).max(1);
-        let worker_umem =
-            WorkerUmem::new(total_frames).map_err(|err| format!("create binding umem: {err}"))?;
         let driver_name = interface_driver_name(&binding.interface);
-        let reserved_tx = reserved_tx_frames(ring_entries);
+        let reserved_tx = reserved_tx_frames(ring_entries).min(total_frames);
         let mut reserved_tx_frames = VecDeque::with_capacity(reserved_tx as usize);
-        for idx in 0..reserved_tx {
-            if let Some(frame) = worker_umem.umem.frame(BufIdx(idx)) {
-                reserved_tx_frames.push_back(frame.offset);
-            }
+        for _ in 0..reserved_tx {
+            let Some(offset) = frame_pool.pop_front() else {
+                return Err(format!(
+                    "insufficient shared UMEM frames for reserved TX on {} if{}q{}",
+                    binding.interface, binding.ifindex, binding.queue_id
+                )
+                .into());
+            };
+            reserved_tx_frames.push_back(offset);
         }
         // Pre-populate fill ring with ALL remaining frames — no spare held back.
         // This maximizes the kernel's ability to place received packets and
         // prevents fill ring starvation under burst conditions (copy-mode fix).
         let mut initial_fill_frames = Vec::with_capacity((total_frames - reserved_tx) as usize);
-        for idx in reserved_tx..total_frames {
-            if let Some(frame) = worker_umem.umem.frame(BufIdx(idx)) {
-                initial_fill_frames.push(frame.offset);
-            }
+        for _ in reserved_tx..total_frames {
+            let Some(offset) = frame_pool.pop_front() else {
+                return Err(format!(
+                    "insufficient shared UMEM frames for fill ring on {} if{}q{}",
+                    binding.interface, binding.ifindex, binding.queue_id
+                )
+                .into());
+            };
+            initial_fill_frames.push(offset);
         }
         let info = ifinfo_from_binding(binding)?;
         let (user, rx, tx, bind_mode, actual_bind_strategy, mut device) =
@@ -1674,13 +1686,14 @@ impl BindingWorker {
         // ifindex/queue_id directly — umem.bind() already validated these.
         live.set_socket_binding(binding.ifindex, binding.queue_id, 0);
         eprintln!(
-            "bpfrx-userspace-dp: binding slot={} fd={} strategy={} bound if{}q{} mode={:?}",
+            "bpfrx-userspace-dp: binding slot={} fd={} strategy={} bound if{}q{} mode={:?} shared_umem={}",
             binding.slot,
             user_fd,
             actual_bind_strategy.describe(),
             binding.ifindex,
             binding.queue_id,
             bind_mode,
+            shared_umem,
         );
         if let Err(err) = register_xsk_slot(xsk_map_fd, binding.slot, user_fd) {
             eprintln!(
@@ -1775,10 +1788,15 @@ impl BindingWorker {
     }
 }
 
-struct WorkerUmem {
+struct WorkerUmemInner {
     area: MmapArea,
     umem: Umem,
     total_frames: u32,
+}
+
+#[derive(Clone)]
+struct WorkerUmem {
+    inner: Rc<WorkerUmemInner>,
 }
 
 impl WorkerUmem {
@@ -1795,10 +1813,50 @@ impl WorkerUmem {
         let umem = unsafe { Umem::new(umem_cfg, area.as_nonnull_slice()) }
             .map_err(|e| format!("create umem: {e}"))?;
         Ok(Self {
-            area,
-            umem,
-            total_frames,
+            inner: Rc::new(WorkerUmemInner {
+                area,
+                umem,
+                total_frames,
+            }),
         })
+    }
+
+    fn area(&self) -> &MmapArea {
+        &self.inner.area
+    }
+
+    fn umem(&self) -> &Umem {
+        &self.inner.umem
+    }
+
+    fn total_frames(&self) -> u32 {
+        self.inner.total_frames
+    }
+
+    fn shares_allocation_with(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn allocation_ptr(&self) -> *const WorkerUmemInner {
+        Rc::as_ptr(&self.inner)
+    }
+}
+
+struct WorkerUmemPool {
+    umem: WorkerUmem,
+    free_frames: VecDeque<u64>,
+}
+
+impl WorkerUmemPool {
+    fn new(total_frames: u32) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let umem = WorkerUmem::new(total_frames.max(1))?;
+        let mut free_frames = VecDeque::with_capacity(total_frames.max(1) as usize);
+        for idx in 0..total_frames.max(1) {
+            if let Some(frame) = umem.umem().frame(BufIdx(idx)) {
+                free_frames.push_back(frame.offset);
+            }
+        }
+        Ok(Self { umem, free_frames })
     }
 }
 
@@ -1975,7 +2033,7 @@ fn poll_binding(
         return false;
     };
     update_binding_debug_state(binding);
-    let area = (&binding.umem.area) as *const MmapArea;
+    let area = binding.umem.area() as *const MmapArea;
     let ident = binding.identity();
     maybe_touch_heartbeat(binding, now_ns);
     let tx_work = drain_pending_tx(binding, now_ns, shared_recycles);
@@ -4252,18 +4310,99 @@ fn worker_loop(
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
     sessions.set_timeouts(forwarding.session_timeouts);
+    let mut shared_group_members: BTreeMap<String, usize> = BTreeMap::new();
+    let mut shared_group_frames: BTreeMap<String, u32> = BTreeMap::new();
+    for plan in &binding_plans {
+        if let Some(group_key) = shared_umem_group_key(&plan.status) {
+            *shared_group_members.entry(group_key.clone()).or_default() += 1;
+            *shared_group_frames.entry(group_key).or_default() +=
+                binding_frame_count(plan.ring_entries).max(1);
+        }
+    }
+    let mut shared_umem_pools: BTreeMap<String, WorkerUmemPool> = BTreeMap::new();
+    for (group_key, members) in &shared_group_members {
+        if *members < 2 {
+            continue;
+        }
+        let total_frames = shared_group_frames.get(group_key).copied().unwrap_or(0);
+        match WorkerUmemPool::new(total_frames) {
+            Ok(pool) => {
+                eprintln!(
+                    "bpfrx-userspace-dp: worker_id={} shared-umem group={} members={} frames={}",
+                    worker_id, group_key, members, total_frames,
+                );
+                shared_umem_pools.insert(group_key.clone(), pool);
+            }
+            Err(err) => {
+                eprintln!(
+                    "bpfrx-userspace-dp: worker_id={} failed shared-umem group={} members={} err={}",
+                    worker_id, group_key, members, err,
+                );
+            }
+        }
+    }
     let mut bindings = Vec::with_capacity(binding_plans.len());
     for plan in binding_plans {
-        match BindingWorker::create(
-            &plan.status,
-            plan.ring_entries,
-            plan.xsk_map_fd,
-            plan.heartbeat_map_fd,
-            plan.session_map_fd,
-            plan.live.clone(),
-            plan.bind_strategy,
-            plan.poll_mode,
-        ) {
+        let shared_group = shared_umem_group_key(&plan.status)
+            .filter(|key| shared_group_members.get(key).copied().unwrap_or(0) > 1);
+        let binding = if let Some(group_key) = shared_group.as_ref() {
+            if let Some(pool) = shared_umem_pools.get_mut(group_key) {
+                BindingWorker::create(
+                    &plan.status,
+                    plan.ring_entries,
+                    plan.xsk_map_fd,
+                    plan.heartbeat_map_fd,
+                    plan.session_map_fd,
+                    plan.live.clone(),
+                    plan.bind_strategy,
+                    plan.poll_mode,
+                    pool.umem.clone(),
+                    &mut pool.free_frames,
+                    true,
+                )
+            } else {
+                let total_frames = binding_frame_count(plan.ring_entries).max(1);
+                let mut private_pool = WorkerUmemPool::new(total_frames)
+                    .map_err(|err| format!("create binding umem: {err}"));
+                match private_pool.as_mut() {
+                    Ok(pool) => BindingWorker::create(
+                        &plan.status,
+                        plan.ring_entries,
+                        plan.xsk_map_fd,
+                        plan.heartbeat_map_fd,
+                        plan.session_map_fd,
+                        plan.live.clone(),
+                        plan.bind_strategy,
+                        plan.poll_mode,
+                        pool.umem.clone(),
+                        &mut pool.free_frames,
+                        false,
+                    ),
+                    Err(err) => Err(err.to_string().into()),
+                }
+            }
+        } else {
+            let total_frames = binding_frame_count(plan.ring_entries).max(1);
+            let mut private_pool =
+                WorkerUmemPool::new(total_frames).map_err(|err| format!("create binding umem: {err}"));
+            match private_pool.as_mut() {
+                Ok(pool) => BindingWorker::create(
+                    &plan.status,
+                    plan.ring_entries,
+                    plan.xsk_map_fd,
+                    plan.heartbeat_map_fd,
+                    plan.session_map_fd,
+                    plan.live.clone(),
+                    plan.bind_strategy,
+                    plan.poll_mode,
+                    pool.umem.clone(),
+                    &mut pool.free_frames,
+                    false,
+                ),
+                Err(err) => Err(err.to_string().into()),
+            }
+        };
+        match binding {
             Ok(binding) => bindings.push(binding),
             Err(err) => plan.live.set_error(err.to_string()),
         }
@@ -4546,7 +4685,7 @@ fn worker_loop(
                         + inflight_recycles
                         + scratch_recycle_len
                         + ptx_prepared; // prepared TX holds UMEM frames
-                    let expected_total = b.umem.total_frames;
+                    let expected_total = b.umem.total_frames();
                     let _ = write!(
                         binding_summary,
                         " [{}:if{}q{} pfill={} fring={} rxring={} free_tx={} otx={} ifl={} scr={} ptxp={} ptxl={} total={}/{} fill_ok={} polls={} bp={} rx_empty={} wake={}",
@@ -4827,7 +4966,7 @@ fn worker_loop(
                                 ptxp,
                                 ptxl,
                                 total,
-                                sb.umem.total_frames,
+                                sb.umem.total_frames(),
                             );
                             if let Some((rxp, rxc, frp, frc, txp, txc, crp, crc)) = raw {
                                 let _ = write!(
@@ -8018,6 +8157,46 @@ mod tests {
             bind_flag_candidates_for_driver(Some("mlx5_core")),
             &[XSK_BIND_FLAGS_ZEROCOPY, XSK_BIND_FLAGS_COPY]
         );
+    }
+
+    #[test]
+    fn shared_umem_group_key_is_same_device_mlx5_only() {
+        assert_eq!(
+            shared_umem_group_key_for_device(
+                Some("mlx5_core"),
+                Some("/sys/devices/pci0000:00/0000:08:00.0")
+            ),
+            Some("mlx5:/sys/devices/pci0000:00/0000:08:00.0".to_string())
+        );
+        assert_eq!(
+            shared_umem_group_key_for_device(
+                Some("virtio_net"),
+                Some("/sys/devices/pci0000:00/0000:00:07.0")
+            ),
+            None
+        );
+        assert_eq!(shared_umem_group_key_for_device(Some("mlx5_core"), None), None);
+    }
+
+    #[test]
+    fn cloned_worker_umem_shares_allocation_identity() {
+        let shared = match WorkerUmem::new(64) {
+            Ok(shared) => shared,
+            Err(err) => {
+                eprintln!("skipping UMEM identity test: {err}");
+                return;
+            }
+        };
+        let shared_clone = shared.clone();
+        let private = match WorkerUmem::new(64) {
+            Ok(private) => private,
+            Err(err) => {
+                eprintln!("skipping UMEM identity test: {err}");
+                return;
+            }
+        };
+        assert!(shared.shares_allocation_with(&shared_clone));
+        assert!(!shared.shares_allocation_with(&private));
     }
 
     #[test]

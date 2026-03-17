@@ -1,18 +1,49 @@
 # Shared UMEM Implementation Plan (#205)
 
+Status: In Progress
+
 ## Problem
 
-Cross-interface AF_XDP forwarding copies each 1500-byte frame between
-separate UMEM regions (11.5% CPU at 20 Gbps). This is the primary
-remaining bottleneck preventing the userspace dataplane from reaching
-native XDP line rate (22 Gbps on 25G mlx5).
+Cross-interface AF_XDP forwarding still copies each frame between
+separate UMEM allocations. On current `master`, the steady-state hot
+transit path is not the copy-path fallback; it is the direct TX builder
+itself. The measured profile on a live transit run shows:
+
+- `bpfrx_userspace_dp::afxdp::poll_binding` about `17.6%`
+- `__memmove_evex_unaligned_erms` about `16.7%`
+- `bpfrx_userspace_dp::afxdp::frame::enqueue_pending_forwards` about `5.8%`
+
+Helper counters on the same run showed:
+
+- `Direct TX packets`: climbing rapidly
+- `Copy-path TX packets`: `0`
+- `Slow path injected`: `0`
+
+So the remaining copy bottleneck is the full-payload copy inside the
+direct path in `build_forwarded_frame_into_from_frame()`:
+
+```rust
+out.get_mut(eth_len..frame_len)?.copy_from_slice(payload);
+```
+
+This is the primary remaining bottleneck preventing the userspace
+dataplane from reaching native XDP line rate on transit traffic.
 
 ## Goal
 
-Eliminate cross-UMEM memcpy by sharing a single UMEM region across all
-AF_XDP bindings within the same worker thread. Frames received on one
-binding can be rewritten in-place and submitted directly to another
-binding's TX ring without any copy.
+Eliminate the direct-path cross-UMEM payload copy where that is safe.
+The viable target is no longer "all bindings in a worker share one
+UMEM". The viable target is:
+
+- same-device shared UMEM only
+- `mlx5_core` only
+- no cross-NIC shared UMEM
+- no `virtio_net` shared UMEM
+
+Frames received on one binding can then be rewritten in-place and
+submitted directly to another binding's TX ring without any copy, but
+only when both bindings share the same physical device and the same UMEM
+allocation.
 
 ## Current Architecture
 
@@ -36,181 +67,106 @@ Forward A→B: copy frame from UMEM-A to UMEM-B (memcpy ~1500 bytes)
 
 ```
 Worker 0
-  ├── SharedUmem (one MmapArea, one Umem)
-  ├── Binding A (ge-0-0-1 queue 0)
-  │     ├── Socket A (with_shared → same UMEM FD)
+  ├── SharedUmem group for mlx5 device 0000:08:00.0
+  ├── Binding A (ge-0-0-1 queue 0, same device)
+  │     ├── Socket A (with_shared → shared UMEM FD)
   │     ├── Fill/Completion rings A (per-socket)
   │     └── RX/TX rings A
-  └── Binding B (ge-0-0-2 queue 0)
-        ├── Socket B (with_shared → same UMEM FD)
+  └── Binding B (same physical device / queue or sub-interface)
+        ├── Socket B (with_shared → shared UMEM FD)
         ├── Fill/Completion rings B (per-socket)
         └── RX/TX rings B
 
 Forward A→B: rewrite frame in-place at same offset, submit to TX-B (zero copy)
+
+Bindings on different physical devices keep private UMEM and still copy.
 ```
 
 ## Implementation Steps
 
-### Step 1: Create shared UMEM in worker_loop (not BindingWorker)
+### Step 1: Identify safe shared-UMEM groups
 
-Move UMEM creation from `BindingWorker::create()` to the worker thread
-startup in `worker_loop()`. All bindings in the worker share one UMEM.
+At worker startup, group bindings by `(driver, device_path)`.
 
-```rust
-// In worker_loop(), before creating bindings:
-let total_frames_per_binding = binding_frame_count(ring_entries);
-let total_shared_frames = total_frames_per_binding * (binding_plans.len() as u32);
-let shared_umem = WorkerUmem::new(total_shared_frames)?;
+- only `mlx5_core` with a non-empty device path is eligible
+- only groups with two or more bindings are candidates
+- `virtio_net` is always excluded
+- different PCI devices are always excluded
 
-// Global free frame pool for this worker
-let mut free_frames: VecDeque<u64> = VecDeque::with_capacity(total_shared_frames as usize);
-for idx in 0..total_shared_frames {
-    if let Some(frame) = shared_umem.umem.frame(BufIdx(idx)) {
-        free_frames.push_back(frame.offset);
-    }
-}
-```
+### Step 2: Create one UMEM pool per eligible device group
 
-### Step 2: Change BindingWorker::create to accept shared UMEM
+Create a `WorkerUmemPool` per eligible group, not per worker. Each pool owns:
 
-New signature:
+- one `WorkerUmem`
+- one `VecDeque<u64>` of free frame offsets
 
-```rust
-fn create_shared(
-    binding: &BindingStatus,
-    shared_umem: &WorkerUmem,   // borrowed, owned by worker
-    is_first: bool,             // first binding creates the "owner" socket
-    ring_entries: u32,
-    initial_fill: &mut VecDeque<u64>,  // take frames from shared pool
-    initial_tx: &mut VecDeque<u64>,    // take TX frames from shared pool
-    ...
-) -> Result<Self, ...>
-```
+Bindings with no eligible group still allocate a private pool and behave exactly
+like current `master`.
 
-- First binding: `Socket::new(info)` then register UMEM
-- Subsequent bindings: `Socket::with_shared(info, &shared_umem.umem)`
-- Each binding takes its share of frames from the global pool for fill ring
+### Step 3: Pass the chosen UMEM pool into `BindingWorker::create()`
 
-### Step 3: Unify frame management
+`BindingWorker::create()` now accepts:
 
-Remove per-binding `free_tx_frames` and `pending_fill_frames`. Replace
-with a worker-level shared pool.
+- the `WorkerUmem` to use
+- a mutable frame pool for reserved TX and initial fill offsets
+- a `shared_umem` flag for diagnostics
+
+This preserves current bind/open behavior while moving UMEM ownership out of the
+binding constructor.
+
+### Step 4: Widen in-place rewrite eligibility to same-allocation forwards
+
+The forwarding predicate changes from "same binding only" to "same UMEM allocation":
 
 ```rust
-struct WorkerFramePool {
-    free: VecDeque<u64>,          // frames not in any ring
-    fill_deficit: [u32; MAX_BINDINGS],  // how many fill frames each binding needs
-}
+let can_rewrite_in_place =
+    target_binding.umem.allocation_ptr() == ingress_binding.umem.allocation_ptr();
 ```
 
-After each poll cycle:
-1. Reap TX completions from each binding → return offsets to `free`
-2. Reap fill frames needed → distribute from `free` to binding fill rings
-3. Process RX → forward frames in-place (no allocation needed)
+This keeps the optimization narrow:
 
-### Step 4: Enable in-place rewrite for all same-worker bindings
+- same-binding hairpin still works
+- same-device shared-UMEM bindings can now rewrite in place
+- cross-device forwards still take the existing direct builder copy path
 
-Change the forwarding decision:
+### Step 5: Keep current recycle and ownership semantics
 
-```rust
-// OLD:
-let can_rewrite_in_place = target_binding.slot == ingress_slot;
+This prototype does not attempt a full worker-global frame rebalance rewrite.
+It keeps the existing prepared-TX recycle model and only changes how eligible
+bindings source their offsets up front. That makes the prototype materially safer
+than the older "share everything in the worker" plan.
 
-// NEW: All bindings in same worker share UMEM → always in-place
-let can_rewrite_in_place = true;  // within same worker, always shared UMEM
-```
+### Step 6: Validate the safe boundary
 
-When `rewrite_forwarded_frame_in_place` succeeds:
-- Submit the same frame offset to target binding's TX ring
-- Mark frame as "in flight" (don't return to fill ring yet)
-- On TX completion, return to shared free pool
-- From free pool, replenish source binding's fill ring
+The prototype is only acceptable if:
 
-### Step 5: Handle the copy fallback path
-
-`rewrite_forwarded_frame_in_place` can fail when the Ethernet header
-size changes (14→18 for VLAN insert, or 18→14 for VLAN strip). In this
-case, the payload needs to be shifted within the frame (memmove, not
-cross-UMEM copy).
-
-The in-place function already handles this with `copy_within()`:
-```rust
-if eth_len != l3 {
-    frame.copy_within(l3..l3 + payload_len, eth_len);
-}
-```
-
-This is a 4-byte shift of the payload, vastly cheaper than a full
-1500-byte cross-UMEM copy. So even the "fallback" is near-zero-copy.
-
-The remaining fallback (build_forwarded_frame_from_frame → Vec<u8>)
-should only trigger when in-place rewrite fails for other reasons
-(malformed frames, etc.). This path can allocate from the shared free
-pool instead of per-binding free_tx_frames.
-
-### Step 6: Frame accounting and leak detection
-
-Current per-binding accounting:
-```
-total = pending_fill + fill_ring + rx_ring + free_tx + outstanding_tx
-        + in_flight_recycles + scratch + prepared_tx
-```
-
-New worker-level accounting:
-```
-total = shared_pool.free
-        + sum(binding.fill_ring_pending)
-        + sum(binding.rx_avail)
-        + sum(binding.outstanding_tx)
-        + sum(binding.in_flight_forwards)
-        + sum(binding.prepared_tx)
-```
-
-The invariant `total == shared_umem.total_frames` must hold.
-
-### Step 7: Fill ring rebalancing
-
-Each binding's fill ring needs frames to receive packets. After TX
-completions return frames to the shared pool, distribute them:
-
-```rust
-fn rebalance_fill_rings(
-    bindings: &mut [BindingWorker],
-    pool: &mut WorkerFramePool,
-) {
-    // Round-robin distribute free frames to bindings that need fill
-    let per_binding_target = pool.total / bindings.len();
-    for binding in bindings {
-        let deficit = per_binding_target - binding.fill_ring_count();
-        let give = deficit.min(pool.free.len());
-        for _ in 0..give {
-            if let Some(offset) = pool.free.pop_front() {
-                binding.submit_fill(offset);
-            }
-        }
-    }
-}
-```
+- it compiles and unit-tests cleanly
+- `virtio_net` behavior is unchanged
+- cross-NIC `mlx5` behavior is unchanged
+- same-allocation forwards can use the in-place path
+- no bind strategy regressions are introduced
 
 ## Performance Impact Estimate
 
-- memcpy (AVX-512 1500B copy): 11.5% CPU → eliminated
-- `build_forwarded_frame_into_from_frame`: 1.64% CPU → replaced by in-place (0.3%)
-- Net CPU savings: ~12.8%
-- Expected throughput: 20 Gbps / (1 - 0.128) ≈ 23 Gbps (exceeds 22 Gbps target)
+- For eligible same-device paths, this should eliminate the direct-path payload
+  copy that currently shows up as about `16.7%` `memmove`.
+- For the current HA lab's cross-NIC transit path, this should not be expected
+  to improve throughput by itself.
+- The right expectation is structural correctness first, then targeted same-device
+  performance gains where the topology actually permits shared UMEM.
 
 ## Risk Mitigation
 
 1. **xdpilone shared socket support**: Already uses `Socket::with_shared()`
    — the API exists and is used (shared_owner=true). Need to verify it
-   works when multiple sockets share one UMEM across different interfaces.
+   works when multiple sockets share one UMEM across bindings on the same
+   physical device.
 
-2. **Fill ring starvation**: If one direction has burst traffic, it could
-   drain the shared pool and starve the other binding's fill ring. The
-   rebalance logic must ensure minimum fill frames per binding.
+2. **Scope control**: Do not silently widen this to `virtio_net` or cross-NIC
+   `mlx5`. Those are known bad directions in this environment.
 
-3. **Frame leak**: Shared accounting is harder to debug. Keep per-binding
-   tracking of "frames I donated to the pool" for leak detection.
+3. **Frame leak**: Shared accounting is harder to debug. Keep the existing
+   per-binding recycle semantics until the same-device path is proven.
 
 4. **VLAN header size change**: In-place rewrite handles this via
    `copy_within()` (4-byte shift). Verified this already works in
@@ -225,9 +181,12 @@ fn rebalance_fill_rings(
 
 | File | Change |
 |------|--------|
-| `userspace-dp/src/afxdp.rs` | Shared UMEM creation, frame pool, in-place forwarding |
+| `userspace-dp/src/afxdp.rs` | `WorkerUmem` ownership model, grouped UMEM pool creation, tests |
+| `userspace-dp/src/afxdp/bind.rs` | driver/device grouping helpers, UMEM accessor updates |
+| `userspace-dp/src/afxdp/frame.rs` | same-allocation in-place forwarding predicate |
+| `userspace-dp/src/afxdp/tx.rs` | UMEM accessor updates for shared allocation support |
 
-## Result: NOT FEASIBLE (2026-03-14)
+## Result: Broad Cross-NIC Shared UMEM Is Not Feasible (2026-03-14)
 
 **Shared UMEM across different NICs does not support zero-copy mode.**
 
@@ -257,13 +216,94 @@ Shared UMEM zero-copy works when all sockets bind to the **same NIC**
 
 For cross-NIC forwarding, the memcpy is unavoidable at the AF_XDP level.
 The remaining optimization path is to make the existing memcpy cheaper
-(e.g., page flipping, io_uring registered buffers, or batched copies
-with prefetch).
+(e.g., page flipping, io_uring registered buffers, or batched copies).
 
-### Changes reverted
+## Current Prototype Status (2026-03-17)
 
-The implementation in `userspace-dp/src/afxdp.rs` was reverted to the
-per-binding UMEM approach. This plan document is retained for reference.
+The safe reintegration path is now started in the code on the prototype
+branch, but live validation exposed two important limits:
+
+- the current HA lab does not have a proof topology for this prototype
+- the current implementation is not yet deployable on the HA lab because
+  shared UMEM still uses the wrong AF_XDP queue ownership contract
+
+### Narrow scope
+
+- group bindings by `(driver, device_path)`
+- only create a shared group for same-device `mlx5_core`
+- keep `virtio_net` on private UMEM
+- keep cross-NIC traffic on private UMEM
+
+### Current prototype shape
+
+1. `BindingWorker::create()` no longer unconditionally allocates its own
+   UMEM.
+2. Worker startup can create a `WorkerUmemPool` for eligible same-device
+   groups.
+3. Bindings in the same eligible group clone the same `WorkerUmem`
+   allocation and draw offsets from the same frame pool.
+4. In-place rewrite eligibility is widened from "same binding only" to
+   "same UMEM allocation".
+
+### What this can and cannot improve
+
+This prototype can improve:
+
+- same-NIC transit between bindings on the same `mlx5` device
+- same-device VLAN/sub-interface forwarding
+- any worker-local forward where ingress and egress share the same UMEM
+
+This prototype will not, by itself, fix the current HA lab's main
+cross-NIC transit bottleneck, because the hot path there still crosses
+different physical devices and therefore still requires a copy.
+
+### What live validation actually proved
+
+On the current HA lab:
+
+- `ge-0-0-1`/`ge-7-0-1` and `ge-0-0-2`/`ge-7-0-2` are different physical
+  `mlx5` PCI devices
+- the WAN50 -> WAN80 path on the active owner already collapses to the
+  existing in-place hairpin behavior on `master`
+- that means WAN50 -> WAN80 is only a no-regression check, not proof
+  that the new same-allocation cross-binding path is exercised
+
+So the current lab can answer:
+
+- did the prototype regress an existing same-device-ish path?
+
+It cannot answer:
+
+- did the prototype materially improve a true same-device cross-binding
+  forward path?
+
+### Current implementation gap
+
+The current prototype shares one `WorkerUmem` across multiple bindings in
+the same `(driver, device_path)` group, but still opens per-binding AF_XDP
+ring ownership the same way as private UMEM bindings.
+
+In live deployment this caused the second queue on the shared group to fail
+with:
+
+- `configure AF_XDP rings: create fq/cq: Device or resource busy`
+
+That means the next implementation step is not more performance work. It is
+correct AF_XDP shared-UMEM bring-up:
+
+1. establish the right FQ/CQ ownership model for one shared UMEM
+2. bind secondary queues/sockets against that owner correctly
+3. only then retry same-device throughput validation
+
+### Success criteria for the prototype
+
+- compile and unit-test cleanly on current `master`
+- preserve current per-binding bind strategy behavior for non-shared paths
+- no change for `virtio_net`
+- no change for cross-NIC traffic
+- no AF_XDP bind regressions on multi-queue `mlx5`
+- same-allocation forwards use the in-place rewrite path instead of the
+  direct builder copy path
 
 ## Original Testing Plan
 
