@@ -2112,7 +2112,7 @@ fn poll_binding(
         let mut received = binding.rx.receive(available);
         binding.scratch_recycle.clear();
         binding.scratch_forwards.clear();
-        let mut rst_teardowns: Option<Vec<(SessionKey, NatDecision)>> = None;
+        let mut rst_teardowns: Vec<(SessionKey, NatDecision)> = Vec::new();
         while let Some(desc) = received.read() {
             counters.touched = true;
             counters.rx_packets += 1;
@@ -3535,9 +3535,7 @@ fn poll_binding(
                         if should_teardown_tcp_rst(meta, flow.as_ref())
                             && let Some(flow) = flow.as_ref()
                         {
-                            rst_teardowns
-                                .get_or_insert_with(Vec::new)
-                                .push((flow.forward_key.clone(), decision.nat));
+                            rst_teardowns.push((flow.forward_key.clone(), decision.nat));
                         }
                         counters.forward_candidate_packets += 1;
                         if decision.nat.rewrite_src.is_some() {
@@ -3727,22 +3725,20 @@ fn poll_binding(
         received.release();
         drop(received);
         let mut pending_forwards = core::mem::take(&mut binding.scratch_forwards);
-        if let Some(rst_teardowns) = rst_teardowns {
-            for (forward_key, nat) in rst_teardowns {
-                teardown_tcp_rst_flow(
-                    left,
-                    binding,
-                    right,
-                    sessions,
-                    shared_sessions,
-                    shared_nat_sessions,
-                    shared_forward_wire_sessions,
-                    peer_worker_commands,
-                    &forward_key,
-                    nat,
-                    &mut pending_forwards,
-                );
-            }
+        for (forward_key, nat) in rst_teardowns {
+            teardown_tcp_rst_flow(
+                left,
+                binding,
+                right,
+                sessions,
+                shared_sessions,
+                shared_nat_sessions,
+                shared_forward_wire_sessions,
+                peer_worker_commands,
+                &forward_key,
+                nat,
+                &mut pending_forwards,
+            );
         }
         // Use raw pointer to avoid Arc::clone (~5% CPU from lock incq).
         // Safety: the Arc<BindingLiveState> outlives this function call;
