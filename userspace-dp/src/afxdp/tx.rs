@@ -462,26 +462,18 @@ pub(super) fn transmit_batch(
 
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
-    let inserted = inserted as usize;
-    if inserted == binding.scratch_local_tx.len() {
-        for (_offset, req) in binding.scratch_local_tx.drain(..) {
+    let mut retry_tail = Vec::new();
+    for (idx, (offset, req)) in binding.scratch_local_tx.drain(..).enumerate() {
+        if idx < inserted as usize {
             sent_packets += 1;
             sent_bytes += req.bytes.len() as u64;
+        } else {
+            binding.free_tx_frames.push_front(offset);
+            retry_tail.push(req);
         }
-    } else {
-        let mut retry_tail = Vec::with_capacity(binding.scratch_local_tx.len() - inserted);
-        for (idx, (offset, req)) in binding.scratch_local_tx.drain(..).enumerate() {
-            if idx < inserted {
-                sent_packets += 1;
-                sent_bytes += req.bytes.len() as u64;
-            } else {
-                binding.free_tx_frames.push_front(offset);
-                retry_tail.push(req);
-            }
-        }
-        for req in retry_tail.into_iter().rev() {
-            pending.push_front(req);
-        }
+    }
+    for req in retry_tail.into_iter().rev() {
+        pending.push_front(req);
     }
 
     // Latency-sensitive reply traffic can stall indefinitely on otherwise idle zerocopy
@@ -606,27 +598,18 @@ pub(super) fn transmit_prepared_batch(
 
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
-    let inserted = inserted as usize;
-    if inserted == binding.scratch_prepared_tx.len() {
-        for req in binding.scratch_prepared_tx.drain(..) {
+    let mut retry_tail = Vec::new();
+    for (idx, req) in binding.scratch_prepared_tx.drain(..).enumerate() {
+        if idx < inserted as usize {
             remember_prepared_recycle(&mut binding.in_flight_prepared_recycles, &req);
             sent_packets += 1;
             sent_bytes += req.len as u64;
+        } else {
+            retry_tail.push(req);
         }
-    } else {
-        let mut retry_tail = Vec::with_capacity(binding.scratch_prepared_tx.len() - inserted);
-        for (idx, req) in binding.scratch_prepared_tx.drain(..).enumerate() {
-            if idx < inserted {
-                remember_prepared_recycle(&mut binding.in_flight_prepared_recycles, &req);
-                sent_packets += 1;
-                sent_bytes += req.len as u64;
-            } else {
-                retry_tail.push(req);
-            }
-        }
-        for req in retry_tail.into_iter().rev() {
-            binding.pending_tx_prepared.push_front(req);
-        }
+    }
+    for req in retry_tail.into_iter().rev() {
+        binding.pending_tx_prepared.push_front(req);
     }
 
     // Prepared cross-binding forwards need the same explicit TX kick.
