@@ -1852,7 +1852,14 @@ pub(super) fn build_forwarded_frame_into_from_frame(
         vlan_id,
         ether_type,
     )?;
-    out.get_mut(eth_len..frame_len)?.copy_from_slice(payload);
+    let payload_out = out.get_mut(eth_len..frame_len)?;
+    // SAFETY: source (payload) and destination (payload_out) are distinct
+    // buffers — payload is from the ingress UMEM, payload_out is in the
+    // egress UMEM. Lengths are equal because both span eth_len..frame_len.
+    debug_assert_eq!(payload_out.len(), payload.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(payload.as_ptr(), payload_out.as_mut_ptr(), payload.len());
+    }
     let out = &mut out[..frame_len];
     let ip_start = eth_len;
     match meta.addr_family as i32 {
@@ -2680,18 +2687,25 @@ pub(super) fn write_eth_header_slice(
     if buf.len() < eth_len {
         return None;
     }
-    buf.get_mut(0..6)?.copy_from_slice(&dst);
-    buf.get_mut(6..12)?.copy_from_slice(&src);
-    if vlan_id > 0 {
-        buf.get_mut(12..14)?
-            .copy_from_slice(&0x8100u16.to_be_bytes());
-        buf.get_mut(14..16)?
-            .copy_from_slice(&(vlan_id & 0x0fff).to_be_bytes());
-        buf.get_mut(16..18)?
-            .copy_from_slice(&ether_type.to_be_bytes());
-    } else {
-        buf.get_mut(12..14)?
-            .copy_from_slice(&ether_type.to_be_bytes());
+    let ether_type_bytes = ether_type.to_be_bytes();
+    // SAFETY: buf.len() >= eth_len is guaranteed by the guard above.
+    // eth_len is 14 (no VLAN) or 18 (VLAN), so all writes are in-bounds.
+    debug_assert!(buf.len() >= eth_len);
+    unsafe {
+        let ptr = buf.as_mut_ptr();
+        core::ptr::copy_nonoverlapping(dst.as_ptr(), ptr, 6);
+        core::ptr::copy_nonoverlapping(src.as_ptr(), ptr.add(6), 6);
+        if vlan_id > 0 {
+            core::ptr::copy_nonoverlapping(0x8100u16.to_be_bytes().as_ptr(), ptr.add(12), 2);
+            core::ptr::copy_nonoverlapping(
+                (vlan_id & 0x0fff).to_be_bytes().as_ptr(),
+                ptr.add(14),
+                2,
+            );
+            core::ptr::copy_nonoverlapping(ether_type_bytes.as_ptr(), ptr.add(16), 2);
+        } else {
+            core::ptr::copy_nonoverlapping(ether_type_bytes.as_ptr(), ptr.add(12), 2);
+        }
     }
     Some(())
 }
