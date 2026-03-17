@@ -2686,18 +2686,22 @@ pub(super) fn write_eth_header_slice(
     if buf.len() < eth_len {
         return None;
     }
-    buf.get_mut(0..6)?.copy_from_slice(&dst);
-    buf.get_mut(6..12)?.copy_from_slice(&src);
-    if vlan_id > 0 {
-        buf.get_mut(12..14)?
-            .copy_from_slice(&0x8100u16.to_be_bytes());
-        buf.get_mut(14..16)?
-            .copy_from_slice(&(vlan_id & 0x0fff).to_be_bytes());
-        buf.get_mut(16..18)?
-            .copy_from_slice(&ether_type.to_be_bytes());
-    } else {
-        buf.get_mut(12..14)?
-            .copy_from_slice(&ether_type.to_be_bytes());
+    let ether_type_bytes = ether_type.to_be_bytes();
+    unsafe {
+        let ptr = buf.as_mut_ptr();
+        core::ptr::copy_nonoverlapping(dst.as_ptr(), ptr, 6);
+        core::ptr::copy_nonoverlapping(src.as_ptr(), ptr.add(6), 6);
+        if vlan_id > 0 {
+            core::ptr::copy_nonoverlapping(0x8100u16.to_be_bytes().as_ptr(), ptr.add(12), 2);
+            core::ptr::copy_nonoverlapping(
+                (vlan_id & 0x0fff).to_be_bytes().as_ptr(),
+                ptr.add(14),
+                2,
+            );
+            core::ptr::copy_nonoverlapping(ether_type_bytes.as_ptr(), ptr.add(16), 2);
+        } else {
+            core::ptr::copy_nonoverlapping(ether_type_bytes.as_ptr(), ptr.add(12), 2);
+        }
     }
     Some(())
 }
