@@ -32,19 +32,25 @@ Implemented on the native GRE branch:
   - outer GRE packets move on `ge-*-0-2.80`
   - `gr-0-0-0` transit RX/TX deltas stay at zero
 
+Validated on the native GRE branch:
+
+- clean post-deploy isolated-cluster validation after primaries re-elect
+- firewall-originated host/control-plane GRE ping still works
+- active GRE failover from `node1 -> node0` now recovers and passes the native
+  GRE validator tail gate
+
 Still required for full migration parity:
 
-- clean post-deploy HA validation after the cluster re-elects primaries again
-- failover/failback validation for active tunnel sessions
-- explicit proof that firewall-originated host/control-plane tunnel traffic still works
+- symmetric failover/failback validation for active tunnel sessions
+- explicit TCP/UDP/native-GRE throughput validation, not only ICMP transit
 - final cleanup of remaining hybrid tunnel assumptions outside transit forwarding
 
 Current blocker:
 
-- after a full isolated-cluster deploy, RG primaries are not re-electing because
-  the existing HA readiness gate reports `fabric forwarding path not ready`
-  (`fabric_fwd` not populated). That is blocking the remaining failover/host
-  validation steps on this branch.
+- failback `node0 -> node1` is still lossy during the transition window
+- the remaining live signal is post-NAT `sfmix -> lan` traffic arriving on
+  fabric ingress during failback and still hitting `ha_inactive` handling on the
+  inactive node before the new owner fully absorbs the flow
 
 ## Why This Is Necessary
 

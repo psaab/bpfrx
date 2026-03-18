@@ -775,9 +775,7 @@ impl Coordinator {
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = self.ha_state.load();
-        let reverse_entry = if !entry.metadata.is_reverse
-            && owner_rg_is_locally_active(ha_state.as_ref(), entry.metadata.owner_rg_id, now_secs)
-        {
+        let reverse_entry = if !entry.metadata.is_reverse {
             synthesized_synced_reverse_entry(
                 &self.forwarding,
                 ha_state.as_ref(),
@@ -2436,15 +2434,15 @@ fn poll_binding(
                                     .unwrap_or(flow.dst_ip);
 
                             // Cluster peer return fast path:
-                            // a non-initiating TCP packet arriving from zone-encoded fabric
-                            // ingress has already been policy/NAT-validated by the active owner.
-                            // The first SYN-ACK can beat session publication to the inactive
-                            // owner, so allow a one-packet local forward here instead of
-                            // treating it as a fresh lan->lan flow and dropping it in policy.
-                            if meta.protocol == PROTO_TCP
-                                && ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
+                            // a packet arriving from zone-encoded fabric ingress has already
+                            // been policy/NAT-validated by the active owner. Allow the inactive
+                            // peer to hand it to the local egress zone instead of treating it as
+                            // a brand-new flow. Keep pure TCP SYN excluded so brand-new connects
+                            // still require local session ownership.
+                            if ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
                                 && let Some(ingress_zone) = ingress_zone_override.as_deref()
-                                && ((meta.tcp_flags & TCP_FLAG_SYN) == 0
+                                && (meta.protocol != PROTO_TCP
+                                    || (meta.tcp_flags & TCP_FLAG_SYN) == 0
                                     || (meta.tcp_flags & 0x10) != 0)
                             {
                                 let fabric_return_resolution =

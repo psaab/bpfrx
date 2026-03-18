@@ -147,6 +147,7 @@ pub(crate) struct SessionTable {
     sessions: FxHashMap<SessionKey, SessionEntry>,
     nat_reverse_index: FxHashMap<SessionKey, SessionKey>,
     forward_wire_index: FxHashMap<SessionKey, SessionKey>,
+    reverse_translated_index: FxHashMap<SessionKey, SessionKey>,
     deltas: VecDeque<SessionDelta>,
     last_gc_ns: u64,
     max_sessions: usize,
@@ -163,6 +164,7 @@ impl SessionTable {
             sessions: FxHashMap::default(),
             nat_reverse_index: FxHashMap::default(),
             forward_wire_index: FxHashMap::default(),
+            reverse_translated_index: FxHashMap::default(),
             deltas: VecDeque::with_capacity(MAX_SESSION_DELTAS.min(256)),
             last_gc_ns: 0,
             max_sessions: DEFAULT_MAX_SESSIONS,
@@ -250,7 +252,14 @@ impl SessionTable {
         now_ns: u64,
         tcp_flags: u8,
     ) -> Option<SessionLookup> {
-        self.sessions.get_mut(key).map(|entry| {
+        let actual_key = if self.sessions.contains_key(key) {
+            key.clone()
+        } else if let Some(alias) = self.reverse_translated_index.get(key) {
+            alias.clone()
+        } else {
+            return None;
+        };
+        self.sessions.get_mut(&actual_key).map(|entry| {
             if matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0 {
                 if !entry.closing {
                     debug_log!(
@@ -439,20 +448,12 @@ impl SessionTable {
             return 0;
         }
         let mut affected = 0usize;
-        let mut drop_reverse = Vec::new();
-        for (key, entry) in &mut self.sessions {
+        for entry in self.sessions.values_mut() {
             if entry.metadata.owner_rg_id != owner_rg_id || entry.metadata.synced {
                 continue;
             }
-            if entry.metadata.is_reverse {
-                drop_reverse.push(key.clone());
-            } else {
-                entry.metadata.synced = true;
-            }
+            entry.metadata.synced = true;
             affected = affected.saturating_add(1);
-        }
-        for key in drop_reverse {
-            self.remove_entry(&key);
         }
         affected
     }
@@ -513,6 +514,10 @@ impl SessionTable {
         metadata: &SessionMetadata,
     ) {
         if metadata.is_reverse {
+            let translated = translated_session_key(key, decision.nat);
+            if translated != *key {
+                self.reverse_translated_index.insert(translated, key.clone());
+            }
             return;
         }
         self.nat_reverse_index
@@ -535,6 +540,13 @@ impl SessionTable {
         metadata: &SessionMetadata,
     ) {
         if metadata.is_reverse {
+            let translated = translated_session_key(key, decision.nat);
+            if matches!(
+                self.reverse_translated_index.get(&translated),
+                Some(existing) if existing == key
+            ) {
+                self.reverse_translated_index.remove(&translated);
+            }
             return;
         }
         let reverse_wire = reverse_wire_key(key, decision.nat);
@@ -614,6 +626,25 @@ pub(crate) fn forward_wire_key(forward_key: &SessionKey, nat: NatDecision) -> Se
     }
 }
 
+pub(crate) fn translated_session_key(key: &SessionKey, nat: NatDecision) -> SessionKey {
+    let (src_port, dst_port) = if matches!(key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        (key.src_port, key.dst_port)
+    } else {
+        (
+            nat.rewrite_src_port.unwrap_or(key.src_port),
+            nat.rewrite_dst_port.unwrap_or(key.dst_port),
+        )
+    };
+    SessionKey {
+        addr_family: key.addr_family,
+        protocol: key.protocol,
+        src_ip: nat.rewrite_src.unwrap_or(key.src_ip),
+        dst_ip: nat.rewrite_dst.unwrap_or(key.dst_ip),
+        src_port,
+        dst_port,
+    }
+}
+
 fn reverse_wire_key(forward_key: &SessionKey, nat: NatDecision) -> SessionKey {
     let (src_port, dst_port) = if matches!(forward_key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
         (forward_key.src_port, forward_key.dst_port)
@@ -655,13 +686,18 @@ fn reverse_wire_key(forward_key: &SessionKey, nat: NatDecision) -> SessionKey {
 }
 
 pub(crate) fn reverse_canonical_key(forward_key: &SessionKey, _nat: NatDecision) -> SessionKey {
+    let (src_port, dst_port) = if matches!(forward_key.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        (forward_key.src_port, forward_key.dst_port)
+    } else {
+        (forward_key.dst_port, forward_key.src_port)
+    };
     SessionKey {
         addr_family: forward_key.addr_family,
         protocol: forward_key.protocol,
         src_ip: forward_key.dst_ip,
         dst_ip: forward_key.src_ip,
-        src_port: forward_key.dst_port,
-        dst_port: forward_key.src_port,
+        src_port,
+        dst_port,
     }
 }
 
@@ -1054,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn demote_owner_rg_marks_forward_entries_synced_and_drops_reverse_entries() {
+    fn demote_owner_rg_marks_forward_and_reverse_entries_synced() {
         let mut table = SessionTable::new();
         let now = 1_000_000_000u64;
         let key_a = key_v4();
@@ -1107,7 +1143,13 @@ mod tests {
                 .metadata
                 .synced
         );
-        assert!(table.lookup(&key_b, now + 1_000_000, 0x10).is_none());
+        assert!(
+            table
+                .lookup(&key_b, now + 1_000_000, 0x10)
+                .expect("demoted reverse key")
+                .metadata
+                .synced
+        );
         assert_eq!(
             table
                 .lookup(&key_other, now + 1_000_000, 0x10)
@@ -1269,6 +1311,69 @@ mod tests {
     }
 
     #[test]
+    fn reverse_canonical_key_keeps_icmp_identifier_position() {
+        let forward = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_ICMP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            src_port: 0x1234,
+            dst_port: 0,
+        };
+        let reply = reverse_canonical_key(&forward, NatDecision::default());
+        assert_eq!(reply.src_ip, IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)));
+        assert_eq!(reply.dst_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)));
+        assert_eq!(reply.src_port, 0x1234);
+        assert_eq!(reply.dst_port, 0);
+    }
+
+    #[test]
+    fn find_forward_nat_match_uses_canonical_reverse_index_for_icmp() {
+        let mut table = SessionTable::new();
+        let forward = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_ICMP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            src_port: 0x1234,
+            dst_port: 0,
+        };
+        let canonical_reply = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_ICMP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            src_port: 0x1234,
+            dst_port: 0,
+        };
+        let nat = NatDecision {
+            rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(10, 255, 192, 42))),
+            ..NatDecision::default()
+        };
+        let decision = SessionDecision {
+            resolution: resolution(),
+            nat,
+        };
+        assert!(table.install_with_protocol(
+            forward.clone(),
+            decision,
+            metadata(),
+            1_000_000_000,
+            PROTO_ICMP,
+            0
+        ));
+
+        let hit = table
+            .find_forward_nat_match(&canonical_reply)
+            .expect("icmp canonical reverse match");
+        assert_eq!(hit.key, forward);
+        assert_eq!(hit.decision.nat, nat);
+
+        table.delete(&hit.key);
+        assert!(table.find_forward_nat_match(&canonical_reply).is_none());
+    }
+
+    #[test]
     fn find_forward_wire_match_uses_translated_forward_index() {
         let mut table = SessionTable::new();
         let forward = SessionKey {
@@ -1313,6 +1418,53 @@ mod tests {
 
         table.delete(&hit.key);
         assert!(table.find_forward_wire_match(&translated).is_none());
+    }
+
+    #[test]
+    fn lookup_uses_translated_reverse_alias() {
+        let mut table = SessionTable::new();
+        let reverse_wire = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 42)),
+            src_port: 5201,
+            dst_port: 42424,
+        };
+        let reverse_canonical = SessionKey {
+            addr_family: 2,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            src_port: 5201,
+            dst_port: 42424,
+        };
+        let mut reverse_metadata = metadata();
+        reverse_metadata.is_reverse = true;
+        let reverse_decision = SessionDecision {
+            resolution: resolution(),
+            nat: NatDecision {
+                rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                ..NatDecision::default()
+            },
+        };
+        assert!(table.install_with_protocol(
+            reverse_wire.clone(),
+            reverse_decision,
+            reverse_metadata.clone(),
+            1_000_000_000,
+            PROTO_TCP,
+            0x10
+        ));
+
+        let hit = table
+            .lookup(&reverse_canonical, 1_001_000_000, 0x10)
+            .expect("translated reverse alias");
+        assert_eq!(hit.decision, reverse_decision);
+        assert_eq!(hit.metadata, reverse_metadata);
+
+        table.delete(&reverse_wire);
+        assert!(table.lookup(&reverse_canonical, 1_002_000_000, 0x10).is_none());
     }
 
     #[test]

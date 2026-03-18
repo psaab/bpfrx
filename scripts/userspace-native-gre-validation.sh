@@ -5,16 +5,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${BPFRX_CLUSTER_ENV:-${PROJECT_ROOT}/test/incus/loss-userspace-cluster.env}"
 DEPLOY=0
+FAILOVER=0
 GRE_TARGET="${GRE_TARGET:-10.255.192.41}"
 GRE_OUTER_REMOTE="${GRE_OUTER_REMOTE:-2602:ffd3:0:2::7}"
 GRE_LOGICAL_DEV="${GRE_LOGICAL_DEV:-gr-0-0-0}"
 PING_COUNT="${PING_COUNT:-5}"
+FAILOVER_PING_COUNT="${FAILOVER_PING_COUNT:-40}"
+FAILOVER_PREP_SECS="${FAILOVER_PREP_SECS:-3}"
 PREFERRED_ACTIVE_NODE="${PREFERRED_ACTIVE_NODE:-1}"
 PREFERRED_ACTIVE_RGS="${PREFERRED_ACTIVE_RGS:-1 2}"
+TRANSIT_PING_ID="${TRANSIT_PING_ID:-$(( ( ( $$ + RANDOM ) % 60000 ) + 1024 ))}"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--deploy) DEPLOY=1 ;;
+	--failover) FAILOVER=1 ;;
 	--env) ENV_FILE="$2"; shift ;;
 	--target) GRE_TARGET="$2"; shift ;;
 	--outer-remote) GRE_OUTER_REMOTE="$2"; shift ;;
@@ -104,9 +109,10 @@ primary_vm_for_rg() {
 	esac
 }
 
-ensure_preferred_active_node() {
+pin_active_node() {
+	local target_node="$1"
 	local preferred_name="node0"
-	if [[ "$PREFERRED_ACTIVE_NODE" == "1" ]]; then
+	if [[ "$target_node" == "1" ]]; then
 		preferred_name="node1"
 	fi
 	info "pinning native GRE validation to ${preferred_name} for RGs:${PREFERRED_ACTIVE_RGS}"
@@ -116,7 +122,7 @@ ensure_preferred_active_node() {
 		if [[ "$current" == "$preferred_name" ]]; then
 			continue
 		fi
-		run_vm "$FW0" "cli -c \"request chassis cluster failover redundancy-group ${rg} node ${PREFERRED_ACTIVE_NODE}\" >/tmp/userspace-native-gre-rg${rg}.out"
+		run_vm "$FW0" "cli -c \"request chassis cluster failover redundancy-group ${rg} node ${target_node}\" >/tmp/userspace-native-gre-rg${rg}.out"
 	done
 	local tries=45
 	while (( tries > 0 )); do
@@ -184,6 +190,21 @@ read_link_packets() {
 	run_vm "$vm" "printf '%s %s\n' \$(cat /sys/class/net/${dev}/statistics/rx_packets) \$(cat /sys/class/net/${dev}/statistics/tx_packets)"
 }
 
+start_logical_transit_capture() {
+	local vm="$1"
+	local outfile="$2"
+	run_vm "$vm" "rm -f ${outfile}; nohup sh -c \"timeout 6 tcpdump -n -i ${GRE_LOGICAL_DEV} -vv 'icmp and host ${GRE_TARGET} and icmp[4:2] == ${TRANSIT_PING_ID}' >${outfile} 2>&1\" >/dev/null 2>&1 &"
+}
+
+logical_transit_matches() {
+	local vm="$1"
+	local outfile="$2"
+	local capture
+	capture="$(run_vm "$vm" "cat ${outfile} 2>/dev/null || true")"
+	printf '%s\n' "$capture" >&2
+	grep -c 'ICMP echo' <<<"$capture" || true
+}
+
 if (( DEPLOY == 1 )); then
 	info "deploying isolated userspace cluster from ${ENV_FILE}"
 	BPFRX_CLUSTER_ENV="$ENV_FILE" "${PROJECT_ROOT}/test/incus/cluster-setup.sh" deploy all
@@ -214,7 +235,7 @@ wait_for_cluster_settle() {
 if (( DEPLOY == 1 )); then
 	wait_for_cluster_settle
 fi
-ensure_preferred_active_node
+pin_active_node "$PREFERRED_ACTIVE_NODE"
 arm_supported_runtime
 
 OUTER_DEV="$(run_vm "$ACTIVE_FW" "set -- \$(ip -6 route get ${GRE_OUTER_REMOTE} 2>/dev/null); while (( \$# > 0 )); do if [[ \$1 == dev ]]; then printf '%s\n' \"\$2\"; break; fi; shift; done | head -n 1")"
@@ -223,15 +244,19 @@ run_vm "$ACTIVE_FW" "[ -d /sys/class/net/${GRE_LOGICAL_DEV} ]" >/dev/null 2>&1 |
 
 before_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
 before_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
+logical_capture_file="/tmp/userspace-native-gre-logical-capture.out"
+start_logical_transit_capture "$ACTIVE_FW" "$logical_capture_file"
 
 info "running GRE transit probe to ${GRE_TARGET} from ${HOST}"
-run_host "ping -c ${PING_COUNT} -W 1 ${GRE_TARGET} >/tmp/userspace-native-gre-ping.out 2>&1 || true"
+run_host "ping -c ${PING_COUNT} -W 1 -e ${TRANSIT_PING_ID} ${GRE_TARGET} >/tmp/userspace-native-gre-ping.out 2>&1 || true"
 ping_output="$(run_host 'cat /tmp/userspace-native-gre-ping.out')"
 printf '%s\n' "$ping_output"
 grep -q 'bytes from' <<<"$ping_output" || die "GRE ping failed"
+sleep 4
 
 after_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
 after_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
+logical_matches="$(logical_transit_matches "$ACTIVE_FW" "$logical_capture_file")"
 
 read -r outer_rx_before outer_tx_before <<<"$before_outer"
 read -r outer_rx_after outer_tx_after <<<"$after_outer"
@@ -243,13 +268,12 @@ outer_tx_delta=$((outer_tx_after - outer_tx_before))
 logical_rx_delta=$((logical_rx_after - logical_rx_before))
 logical_tx_delta=$((logical_tx_after - logical_tx_before))
 
-printf 'outer_dev=%s outer_rx_delta=%d outer_tx_delta=%d logical_dev=%s logical_rx_delta=%d logical_tx_delta=%d\n' \
-	"$OUTER_DEV" "$outer_rx_delta" "$outer_tx_delta" "$GRE_LOGICAL_DEV" "$logical_rx_delta" "$logical_tx_delta"
+printf 'outer_dev=%s outer_rx_delta=%d outer_tx_delta=%d logical_dev=%s logical_rx_delta=%d logical_tx_delta=%d logical_probe_matches=%d ping_id=%d\n' \
+	"$OUTER_DEV" "$outer_rx_delta" "$outer_tx_delta" "$GRE_LOGICAL_DEV" "$logical_rx_delta" "$logical_tx_delta" "$logical_matches" "$TRANSIT_PING_ID"
 
 (( outer_rx_delta > 0 )) || die "outer device ${OUTER_DEV} saw no GRE receive traffic"
 (( outer_tx_delta > 0 )) || die "outer device ${OUTER_DEV} saw no GRE transmit traffic"
-(( logical_rx_delta == 0 )) || die "logical GRE device ${GRE_LOGICAL_DEV} still received transit packets"
-(( logical_tx_delta == 0 )) || die "logical GRE device ${GRE_LOGICAL_DEV} still transmitted transit packets"
+(( logical_matches == 0 )) || die "logical GRE device ${GRE_LOGICAL_DEV} still received tagged transit packets"
 
 pass "native GRE transit stayed on ${OUTER_DEV} and off ${GRE_LOGICAL_DEV}"
 
@@ -260,3 +284,30 @@ printf '%s\n' "$host_ping_output"
 grep -q 'bytes from' <<<"$host_ping_output" || die "firewall-originated GRE ping failed"
 
 pass "native GRE host/control-plane traffic still works on ${ACTIVE_FW}"
+
+if (( FAILOVER == 1 )); then
+	current_node="$PREFERRED_ACTIVE_NODE"
+	failover_node=0
+	if [[ "$current_node" == "0" ]]; then
+		failover_node=1
+	fi
+	info "running active GRE failover probe from ${HOST} while moving RGs to node${failover_node}"
+	failover_ping_log="$(mktemp)"
+	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "ping -i 0.2 -c ${FAILOVER_PING_COUNT} -W 1 ${GRE_TARGET}")" >"${failover_ping_log}" 2>&1 &
+	failover_ping_pid=$!
+	sleep "$FAILOVER_PREP_SECS"
+	pin_active_node "$failover_node"
+	arm_supported_runtime
+	wait "$failover_ping_pid" || true
+	failover_ping_output="$(cat "${failover_ping_log}")"
+	rm -f "${failover_ping_log}"
+	printf '%s\n' "$failover_ping_output"
+	max_seq="$(awk -F'icmp_seq=' '/bytes from/ { split($2, a, /[[:space:]]+/); if (a[1] > max) max=a[1] } END { print max+0 }' <<<"$failover_ping_output")"
+	[[ "$max_seq" -ge $((FAILOVER_PING_COUNT - 5)) ]] || die "active GRE failover ping did not recover near the tail (max_seq=${max_seq})"
+	grep -q 'bytes from' <<<"$failover_ping_output" || die "active GRE failover ping produced no replies"
+	run_vm "$ACTIVE_FW" "ping -c ${PING_COUNT} -W 1 ${GRE_TARGET} >/tmp/userspace-native-gre-post-failover-host-ping.out 2>&1 || true"
+	post_failover_host_ping_output="$(run_vm "$ACTIVE_FW" 'cat /tmp/userspace-native-gre-post-failover-host-ping.out')"
+	printf '%s\n' "$post_failover_host_ping_output"
+	grep -q 'bytes from' <<<"$post_failover_host_ping_output" || die "post-failover firewall-originated GRE ping failed"
+	pass "native GRE active tunnel traffic survived failover to ${ACTIVE_FW}"
+fi
