@@ -228,9 +228,9 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	}
 	// IPsec: kernel XFRM handles ESP encryption/decryption; the userspace
 	// dataplane passes ESP/IKE traffic to the kernel via the slow-path.
-	// Tunnel interfaces (GRE, ip6gre, XFRM) are handled by the eBPF
-	// pipeline which prepends/strips the pseudo-Ethernet header. The
-	// userspace worker detects ESP/IKE and routes to slow-path for XFRM.
+	// GRE transit is now modeled as native userspace tunnel endpoints on the
+	// physical NIC path. Kernel tunnel interfaces remain only for host/control
+	// plane compatibility during migration.
 	if cfg.ForwardingOptions.PortMirroring != nil {
 		addReason("port mirroring is not implemented in the userspace dataplane")
 	}

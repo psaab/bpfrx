@@ -2180,6 +2180,35 @@ mod tests {
     }
 
     #[test]
+    fn queue_planner_ignores_tunnel_netdevices_for_transit() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "gr-0/0/0.0".to_string(),
+                    linux_name: "gr-0-0-0".to_string(),
+                    ifindex: 586,
+                    rx_queues: 1,
+                    tunnel: true,
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "ge-0/0/2.80".to_string(),
+                    linux_name: "ge-0-0-2.80".to_string(),
+                    ifindex: 24,
+                    parent_ifindex: 6,
+                    rx_queues: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let bindings = replan_queues(Some(&snapshot), 1, &[]);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].interface, "ge-0-0-2.80");
+        assert_eq!(bindings[0].ifindex, 24);
+    }
+
+    #[test]
     fn queue_planner_preserves_manual_unregistration() {
         let existing = vec![BindingStatus {
             slot: 0,

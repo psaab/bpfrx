@@ -15,6 +15,21 @@ That means:
 The current `gr-0-0-0` netdevice path may still exist temporarily for host-only
 traffic or migration safety, but it must not be the transit dataplane path.
 
+## Status
+
+Implemented on the native GRE branch:
+
+- logical tunnel endpoint snapshots and route resolution
+- native GRE decapsulation on physical NIC ingress
+- native GRE encapsulation on physical NIC egress
+- tunnel-aware session sync so synced userspace sessions preserve tunnel context
+
+Still required for full migration parity:
+
+- live native GRE validation on the isolated userspace cluster
+- failover/failback validation for active tunnel sessions
+- final cleanup of remaining hybrid tunnel assumptions outside transit forwarding
+
 ## Why This Is Necessary
 
 The current tunnel path is hybrid:
@@ -393,6 +408,12 @@ Specific acceptance checks:
 - no `vrf-sfmix` local `ICMP host unreachable` for valid tunnel replies
 - HA failover keeps tunnel sessions alive
 
+Scripted gate:
+
+- [`scripts/userspace-native-gre-validation.sh`](../scripts/userspace-native-gre-validation.sh)
+  validates GRE transit reachability and asserts that the physical WAN device
+  moves GRE packets while `gr-0-0-0` stays dataplane-idle
+
 ## Recommendation
 
 If the goal is truly “userspace dataplane owns GRE”, then the project should:
@@ -403,4 +424,3 @@ If the goal is truly “userspace dataplane owns GRE”, then the project should
 4. treat dummy interfaces as optional address anchors, not dataplane objects
 
 That is the clean architecture.
-
