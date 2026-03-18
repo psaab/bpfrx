@@ -1656,6 +1656,65 @@ func TestBuildUserspaceIngressIfindexesSkipsTunnelInterfaces(t *testing.T) {
 	}
 }
 
+func TestBuildUserspaceIngressIfindexesIncludesVLANChildAndParent(t *testing.T) {
+	snapshot := &ConfigSnapshot{
+		Interfaces: []InterfaceSnapshot{
+			{
+				Name:    "ge-0/0/2",
+				Zone:    "wan",
+				Ifindex: 6,
+			},
+			{
+				Name:          "ge-0/0/2.80",
+				Zone:          "wan",
+				Ifindex:       12,
+				ParentIfindex: 6,
+				VLANID:        80,
+			},
+		},
+	}
+	ifindexes := buildUserspaceIngressIfindexes(snapshot)
+	if len(ifindexes) != 2 || ifindexes[0] != 6 || ifindexes[1] != 12 {
+		t.Fatalf("unexpected ingress ifindexes: %v", ifindexes)
+	}
+}
+
+func TestBuildUserspaceIngressBindingAliasesIncludesVLANChild(t *testing.T) {
+	snapshot := &ConfigSnapshot{
+		Interfaces: []InterfaceSnapshot{
+			{
+				Name:    "ge-0/0/2",
+				Zone:    "wan",
+				Ifindex: 6,
+			},
+			{
+				Name:          "ge-0/0/2.80",
+				Zone:          "wan",
+				Ifindex:       12,
+				ParentIfindex: 6,
+				VLANID:        80,
+			},
+			{
+				Name:      "gr-0/0/0",
+				Zone:      "sfmix",
+				Ifindex:   362,
+				Tunnel:    true,
+				LinuxName: "gr-0-0-0",
+			},
+		},
+	}
+	aliases := buildUserspaceIngressBindingAliases(snapshot)
+	if len(aliases) != 1 {
+		t.Fatalf("unexpected alias count: %v", aliases)
+	}
+	if got := aliases[12]; got != 6 {
+		t.Fatalf("alias 12 => %d, want 6", got)
+	}
+	if _, ok := aliases[362]; ok {
+		t.Fatalf("tunnel interface unexpectedly aliased: %v", aliases)
+	}
+}
+
 func TestSnapshotHasNativeGRE(t *testing.T) {
 	snapshot := &ConfigSnapshot{
 		TunnelEndpoints: []TunnelEndpointSnapshot{{

@@ -2547,6 +2547,33 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		}
 		m.lastBindingIndices = append(m.lastBindingIndices, idx)
 	}
+	for childIfindex, parentIfindex := range buildUserspaceIngressBindingAliases(m.lastSnapshot) {
+		for _, binding := range status.Bindings {
+			if binding.Ifindex != int(parentIfindex) {
+				continue
+			}
+			flags := uint32(0)
+			if binding.Registered && binding.Armed && binding.Ready {
+				flags = userspaceBindingReady
+			}
+			idx := childIfindex*bindingQueuesPerIface + binding.QueueID
+			val := userspaceBindingValue{
+				Slot:  binding.Slot,
+				Flags: flags,
+			}
+			if err := bindingsMap.Update(idx, val, ebpf.UpdateAny); err != nil {
+				return fmt.Errorf(
+					"update aliased userspace_bindings idx=%d (if=%d parent=%d q=%d): %w",
+					idx,
+					childIfindex,
+					parentIfindex,
+					binding.QueueID,
+					err,
+				)
+			}
+			m.lastBindingIndices = append(m.lastBindingIndices, idx)
+		}
+	}
 	if err := m.syncIngressIfaceMapLocked(m.lastSnapshot); err != nil {
 		return err
 	}
@@ -3249,6 +3276,13 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 			continue
 		}
 		if iface.ParentIfindex > 0 {
+			if iface.Ifindex > 0 {
+				key := uint32(iface.Ifindex)
+				if !seen[key] {
+					seen[key] = true
+					out = append(out, key)
+				}
+			}
 			key := uint32(iface.ParentIfindex)
 			if seen[key] {
 				continue
@@ -3282,6 +3316,23 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 		out = append(out, key)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]uint32 {
+	if snapshot == nil {
+		return nil
+	}
+	out := make(map[uint32]uint32)
+	for _, iface := range snapshot.Interfaces {
+		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
+			continue
+		}
+		if iface.Ifindex <= 0 || iface.ParentIfindex <= 0 {
+			continue
+		}
+		out[uint32(iface.Ifindex)] = uint32(iface.ParentIfindex)
+	}
 	return out
 }
 
