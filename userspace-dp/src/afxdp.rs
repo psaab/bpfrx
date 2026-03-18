@@ -11664,61 +11664,6 @@ mod tests {
     }
 
     #[test]
-    fn build_forwarded_frame_trims_padding_only_for_minimum_size_frame() {
-        let forwarding = build_forwarding_state(&nat_snapshot());
-        let mut frame = Vec::new();
-        write_eth_header(
-            &mut frame,
-            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
-            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
-            0,
-            0x0800,
-        );
-        frame.extend_from_slice(&[
-            0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 64, PROTO_ICMP, 0x00, 0x00, 10, 0,
-            61, 102, 172, 16, 80, 200, 8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01,
-        ]);
-        frame.resize(60, 0);
-        let ip_sum = checksum16(&frame[14..34]);
-        frame[24] = (ip_sum >> 8) as u8;
-        frame[25] = ip_sum as u8;
-
-        let meta = UserspaceDpMeta {
-            magic: USERSPACE_META_MAGIC,
-            version: USERSPACE_META_VERSION,
-            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
-            l3_offset: 14,
-            addr_family: libc::AF_INET as u8,
-            protocol: PROTO_ICMP,
-            ..UserspaceDpMeta::default()
-        };
-        let out = build_forwarded_frame_from_frame(
-            &frame,
-            meta,
-            &SessionDecision {
-                resolution: ForwardingResolution {
-                    disposition: ForwardingDisposition::ForwardCandidate,
-                    local_ifindex: 0,
-                    egress_ifindex: 12,
-                    tx_ifindex: 11,
-                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
-                    neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
-                    src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
-                    tx_vlan_id: 0,
-                },
-                nat: NatDecision::default(),
-            },
-            &forwarding,
-            false,
-            None,
-        )
-        .expect("trimmed frame");
-
-        assert_eq!(out.len(), 14 + 28);
-        assert_eq!(out[22], 63);
-    }
-
-    #[test]
     fn build_forwarded_frame_into_keeps_ipv6_ports_when_frame_and_metadata_disagree() {
         let src_ip = "2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap();
         let dst_ip = "2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap();

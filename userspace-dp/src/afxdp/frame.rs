@@ -1801,7 +1801,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
     let raw_payload = &frame[l3..];
     // Trim Ethernet padding: use ip_total_len so we don't carry trailing
     // pad bytes (small frames padded to 60/64 by hardware).
-    let payload = if frame.len() <= 60 && raw_payload.len() >= 4 {
+    let payload = if raw_payload.len() >= 4 {
         let ip_version = raw_payload[0] >> 4;
         if ip_version == 4 {
             let ip_total_len = u16::from_be_bytes([raw_payload[2], raw_payload[3]]) as usize;
