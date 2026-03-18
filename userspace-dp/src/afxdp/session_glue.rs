@@ -287,16 +287,19 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     if owner_rgs.is_empty() {
         return;
     }
+    // Reverse companions depend on the current HA state of the client-side
+    // egress RG, not only on the forward session's owner RG. When a second RG
+    // becomes active during failback (for example, LAN after WAN/tunnel), a
+    // previously synthesized reverse session can flip from FabricRedirect back
+    // to local ForwardCandidate. Recompute all synced forward entries on RG
+    // activation so stale reverse companions are refreshed against the new HA
+    // snapshot instead of staying pinned to the earlier inactive result.
     let forward_entries = shared_sessions
         .lock()
         .map(|sessions| {
             sessions
                 .values()
-                .filter(|entry| {
-                    !entry.metadata.is_reverse
-                        && entry.metadata.synced
-                        && owner_rgs.contains(&entry.metadata.owner_rg_id)
-                })
+                .filter(|entry| !entry.metadata.is_reverse && entry.metadata.synced)
                 .cloned()
                 .collect::<Vec<_>>()
         })
@@ -689,7 +692,12 @@ fn build_reverse_session_from_forward_match(
     let metadata = SessionMetadata {
         ingress_zone: forward_match.metadata.egress_zone.clone(),
         egress_zone: forward_match.metadata.ingress_zone.clone(),
-        owner_rg_id: forward_match.metadata.owner_rg_id,
+        // Reverse companions are owned by the RG that currently owns the
+        // client-side egress resolution, not necessarily the RG that owned the
+        // original forward session. This matters during failback when a second
+        // RG comes up later and stale reverse entries must be repointed away
+        // from prior FabricRedirect results.
+        owner_rg_id: owner_rg_for_flow(forwarding, decision.resolution.egress_ifindex),
         fabric_ingress: forward_match.metadata.fabric_ingress,
         is_reverse: true,
         synced: false,
@@ -1165,6 +1173,24 @@ mod tests {
             peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
             local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
         });
+        forwarding
+    }
+
+    fn test_forwarding_state_split_rgs() -> ForwardingState {
+        let mut forwarding = test_forwarding_state_with_fabric();
+        forwarding.egress.insert(
+            6,
+            EgressInterface {
+                bind_ifindex: 6,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x61, 0x01],
+                zone: "lan".to_string(),
+                redundancy_group: 2,
+                primary_v4: Some(Ipv4Addr::new(10, 0, 61, 1)),
+                primary_v6: None,
+            },
+        );
         forwarding
     }
 
@@ -1910,5 +1936,70 @@ mod tests {
         assert!(reverse.metadata.is_reverse);
         assert!(reverse.metadata.synced);
         assert_eq!(worker_commands[0].lock().expect("commands").len(), 1);
+    }
+
+    #[test]
+    fn prewarm_reverse_synced_sessions_refreshes_reverse_for_other_activated_rg() {
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let worker_commands = vec![Arc::new(Mutex::new(VecDeque::new()))];
+        let forwarding = test_forwarding_state_split_rgs();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(
+            2,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: 1,
+            },
+        );
+        let mut entry = SyncedSessionEntry {
+            key: test_key(),
+            decision: test_decision(),
+            metadata: SessionMetadata {
+                synced: true,
+                fabric_ingress: true,
+                ..test_metadata()
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+        };
+        entry.metadata.owner_rg_id = 1;
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &entry,
+        );
+
+        prewarm_reverse_synced_sessions_for_owner_rgs(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &worker_commands,
+            -1,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+            &[2],
+            1,
+        );
+
+        let reverse_key = reverse_session_key(&entry.key, entry.decision.nat);
+        let reverse = shared_sessions
+            .lock()
+            .expect("shared sessions")
+            .get(&reverse_key)
+            .cloned()
+            .expect("reverse entry");
+        assert!(reverse.metadata.is_reverse);
+        assert!(reverse.metadata.synced);
+        assert_eq!(
+            reverse.decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(reverse.decision.resolution.egress_ifindex, 6);
+        assert_eq!(reverse.metadata.owner_rg_id, 2);
     }
 }

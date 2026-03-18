@@ -2432,50 +2432,21 @@ fn poll_binding(
                             let resolution_target =
                                 parse_packet_destination_from_frame(packet_frame, meta)
                                     .unwrap_or(flow.dst_ip);
-
                             // Cluster peer return fast path:
                             // a packet arriving from zone-encoded fabric ingress has already
                             // been policy/NAT-validated by the active owner. Allow the inactive
-                            // peer to hand it to the local egress zone instead of treating it as
-                            // a brand-new flow. Keep pure TCP SYN excluded so brand-new connects
-                            // still require local session ownership.
-                            if ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
-                                && let Some(ingress_zone) = ingress_zone_override.as_deref()
-                                && (meta.protocol != PROTO_TCP
-                                    || (meta.tcp_flags & TCP_FLAG_SYN) == 0
-                                    || (meta.tcp_flags & 0x10) != 0)
+                            // peer to hand it to the resolved local egress zone instead of
+                            // treating it as a brand-new flow. Keep pure TCP SYN excluded so
+                            // brand-new connects still require local session ownership.
+                            if let Some((fabric_return_decision, fabric_return_metadata)) =
+                                cluster_peer_return_fast_path(
+                                    forwarding,
+                                    dynamic_neighbors,
+                                    meta,
+                                    ingress_zone_override.as_deref(),
+                                    resolution_target,
+                                )
                             {
-                                let fabric_return_resolution =
-                                    lookup_forwarding_resolution_with_dynamic(
-                                        forwarding,
-                                        dynamic_neighbors,
-                                        resolution_target,
-                                    );
-                                let fabric_return_zone = forwarding
-                                    .ifindex_to_zone
-                                    .get(&fabric_return_resolution.egress_ifindex)
-                                    .map(|zone| zone.as_str());
-                                if fabric_return_resolution.disposition
-                                    == ForwardingDisposition::ForwardCandidate
-                                    && fabric_return_zone == Some(ingress_zone)
-                                {
-                                    let fabric_return_decision = SessionDecision {
-                                        resolution: fabric_return_resolution,
-                                        nat: NatDecision::default(),
-                                    };
-                                    let ingress_zone_arc = Arc::<str>::from(ingress_zone);
-                                    let fabric_return_metadata = SessionMetadata {
-                                        ingress_zone: ingress_zone_arc.clone(),
-                                        egress_zone: ingress_zone_arc,
-                                        owner_rg_id: owner_rg_for_flow(
-                                            forwarding,
-                                            fabric_return_decision.resolution.egress_ifindex,
-                                        ),
-                                        fabric_ingress: true,
-                                        is_reverse: true,
-                                        synced: false,
-                                        nat64_reverse: None,
-                                    };
                                     let ingress_ident = BindingIdentity {
                                         slot: binding.slot,
                                         queue_id: binding.queue_id,
@@ -2515,7 +2486,6 @@ fn poll_binding(
                                         binding.scratch_forwards.push(request);
                                         continue;
                                     }
-                                }
                             }
 
                             // --- DNAT pre-routing ---
@@ -6171,6 +6141,51 @@ fn redirect_via_fabric_if_needed(
     resolve_fabric_redirect(forwarding).unwrap_or(resolution)
 }
 
+fn cluster_peer_return_fast_path(
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    meta: UserspaceDpMeta,
+    ingress_zone_override: Option<&str>,
+    resolution_target: IpAddr,
+) -> Option<(SessionDecision, SessionMetadata)> {
+    if !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32) {
+        return None;
+    }
+    let ingress_zone = ingress_zone_override?;
+    if meta.protocol == PROTO_TCP
+        && (meta.tcp_flags & TCP_FLAG_SYN) != 0
+        && (meta.tcp_flags & 0x10) == 0
+    {
+        return None;
+    }
+
+    let fabric_return_resolution =
+        lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, resolution_target);
+    if fabric_return_resolution.disposition != ForwardingDisposition::ForwardCandidate {
+        return None;
+    }
+    let egress_zone = forwarding
+        .ifindex_to_zone
+        .get(&fabric_return_resolution.egress_ifindex)?
+        .clone();
+    let metadata = SessionMetadata {
+        ingress_zone: Arc::<str>::from(ingress_zone),
+        egress_zone: Arc::<str>::from(egress_zone),
+        owner_rg_id: owner_rg_for_flow(forwarding, fabric_return_resolution.egress_ifindex),
+        fabric_ingress: true,
+        is_reverse: true,
+        synced: false,
+        nat64_reverse: None,
+    };
+    Some((
+        SessionDecision {
+            resolution: fabric_return_resolution,
+            nat: NatDecision::default(),
+        },
+        metadata,
+    ))
+}
+
 fn resolve_ingress_logical_ifindex(
     forwarding: &ForwardingState,
     ingress_ifindex: i32,
@@ -9742,6 +9757,79 @@ mod tests {
         assert_eq!(
             resolved.src_mac,
             Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01])
+        );
+    }
+
+    #[test]
+    fn cluster_peer_return_fast_path_allows_sfmix_to_lan_reply() {
+        let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+        state.fabrics.push(FabricLink {
+            parent_ifindex: 4,
+            overlay_ifindex: 104,
+            peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+            peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        });
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        dynamic_neighbors.lock().expect("neighbors").insert(
+            (5, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+            NeighborEntry {
+                mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+            },
+        );
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 4,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+
+        let (decision, metadata) = cluster_peer_return_fast_path(
+            &state,
+            &dynamic_neighbors,
+            meta,
+            Some("sfmix"),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        )
+        .expect("fabric return fast path");
+
+        assert_eq!(
+            decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(decision.resolution.egress_ifindex, 5);
+        assert_eq!(metadata.ingress_zone.as_ref(), "sfmix");
+        assert_eq!(metadata.egress_zone.as_ref(), "lan");
+        assert!(metadata.fabric_ingress);
+        assert!(metadata.is_reverse);
+    }
+
+    #[test]
+    fn cluster_peer_return_fast_path_skips_pure_tcp_syn() {
+        let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+        state.fabrics.push(FabricLink {
+            parent_ifindex: 4,
+            overlay_ifindex: 104,
+            peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+            peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        });
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 4,
+            protocol: PROTO_TCP,
+            tcp_flags: TCP_FLAG_SYN,
+            ..UserspaceDpMeta::default()
+        };
+
+        assert!(
+            cluster_peer_return_fast_path(
+                &state,
+                &dynamic_neighbors,
+                meta,
+                Some("sfmix"),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            )
+            .is_none()
         );
     }
 
