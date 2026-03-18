@@ -47,9 +47,10 @@ type CompileResult struct {
 	// pendingXDP/TC collect interface indexes for deferred program attachment.
 	// Attachment happens AFTER all compilation phases so that link.Update()
 	// atomically switches to programs with fully-populated maps.
-	pendingXDP      []int
-	pendingTC       []int
-	tunnelIfindexes map[int]bool // tunnel interfaces: XDP ingress only, no redirect
+	pendingXDP          []int
+	pendingTC           []int
+	tunnelIfindexes     map[int]bool // tunnel interfaces: XDP ingress only, no redirect
+	genericXDPIfindexes map[int]bool // interfaces that must use generic XDP only
 
 	// ManagedInterfaces describes all interfaces managed by the firewall,
 	// used by the networkd manager to generate .link and .network files.
@@ -128,21 +129,22 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 	}
 
 	result := &CompileResult{
-		ZoneIDs:          make(map[string]uint16),
-		ScreenIDs:        make(map[string]uint16),
-		AddrIDs:          make(map[string]uint32),
-		AppIDs:           make(map[string]uint32),
-		PoolIDs:          make(map[string]uint8),
-		implicitSets:     make(map[string]uint32),
-		nextNATCounterID: 1, // 0 = no counter
-		NATCounterIDs:    make(map[string]uint16),
-		Lo0FilterV4:      0xFFFFFFFF, // sentinel: no lo0 filter
-		Lo0FilterV6:      0xFFFFFFFF,
-		ifCache:          make(map[string]*net.Interface),
-		linkCache:        make(map[string]netlink.Link),
-		linkIdxMap:       make(map[int]netlink.Link),
-		rxVlanOffCache:   make(map[string]bool),
-		ethtoolApplied:   make(map[string]bool),
+		ZoneIDs:             make(map[string]uint16),
+		ScreenIDs:           make(map[string]uint16),
+		AddrIDs:             make(map[string]uint32),
+		AppIDs:              make(map[string]uint32),
+		PoolIDs:             make(map[string]uint8),
+		implicitSets:        make(map[string]uint32),
+		nextNATCounterID:    1, // 0 = no counter
+		NATCounterIDs:       make(map[string]uint16),
+		Lo0FilterV4:         0xFFFFFFFF, // sentinel: no lo0 filter
+		Lo0FilterV6:         0xFFFFFFFF,
+		ifCache:             make(map[string]*net.Interface),
+		linkCache:           make(map[string]netlink.Link),
+		linkIdxMap:          make(map[int]netlink.Link),
+		rxVlanOffCache:      make(map[string]bool),
+		ethtoolApplied:      make(map[string]bool),
+		genericXDPIfindexes: make(map[int]bool),
 	}
 
 	// Phase 1: Assign zone IDs (1-based; 0 = unassigned).
@@ -306,7 +308,7 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		// all other interfaces into generic mode.
 		needGeneric := false
 		for _, ifidx := range result.pendingXDP {
-			if result.tunnelIfindexes[ifidx] {
+			if result.tunnelIfindexes[ifidx] || result.genericXDPIfindexes[ifidx] {
 				continue // tunnels always get generic below
 			}
 			if err := m.AttachXDP(ifidx, false); err != nil {
@@ -329,9 +331,10 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 			m.clearNativeXDPFlags()
 		}
 		// Attach remaining interfaces: generic-only for tunnels,
-		// or all interfaces if needGeneric.
+		// VLAN child subinterfaces, or all interfaces if needGeneric.
 		for _, ifidx := range result.pendingXDP {
-			if !needGeneric && !result.tunnelIfindexes[ifidx] {
+			forceGeneric := needGeneric || result.tunnelIfindexes[ifidx] || result.genericXDPIfindexes[ifidx]
+			if !forceGeneric {
 				continue // already attached native above
 			}
 			if err := m.AttachXDP(ifidx, true); err != nil {
@@ -566,9 +569,11 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 		}
 	}
 
-	// Track which physical interfaces we've already attached to
+	// Track which physical interfaces have already had one-time parent setup.
 	attached := make(map[int]bool)
-	// Collect physical ifindexes for deferred XDP attachment
+	// Track which interfaces already have a deferred XDP attachment queued.
+	attachedXDP := make(map[int]bool)
+	// Collect ifindexes for deferred XDP attachment.
 	var xdpIfindexes []int
 	// Tunnel interfaces need XDP for ingress but must NOT be in
 	// redirect_capable or tx_ports — bpf_redirect_map sends the full
@@ -693,6 +698,16 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				slog.Info("VLAN sub-interface configured",
 					"parent", physName, "vlan_id", vlanID,
 					"sub_ifindex", subIfindex, "zone", name)
+
+				// Native GRE on VLAN transport needs XDP on the child interface
+				// itself; packets can ingress via ge-*.VID without ever running
+				// the parent's driver XDP hook. VLAN children do not support the
+				// fast path reliably here, so keep them on generic XDP only.
+				if !attachedXDP[subIfindex] {
+					xdpIfindexes = append(xdpIfindexes, subIfindex)
+					result.genericXDPIfindexes[subIfindex] = true
+					attachedXDP[subIfindex] = true
+				}
 			}
 
 			// Set zone mapping using composite key {physIfindex, vlanID}
@@ -813,7 +828,10 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				} else {
 					// Defer actual XDP/TC attachment to after all compile phases
 					// so link.Update() switches to programs with fully-populated maps.
-					xdpIfindexes = append(xdpIfindexes, physIface.Index)
+					if !attachedXDP[physIface.Index] {
+						xdpIfindexes = append(xdpIfindexes, physIface.Index)
+						attachedXDP[physIface.Index] = true
+					}
 					// Skip TC egress for tunnel interfaces — kernel forwards
 					// the inner packet to the tunnel device, and TC egress
 					// would see it with ingress_ifindex != 0 and drop it.
