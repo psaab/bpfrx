@@ -1627,3 +1627,46 @@ func TestBuildUserspaceIngressIfindexesDeduplicatesFabricParent(t *testing.T) {
 		t.Fatalf("fabric parent ifindex 21 appeared %d times in ingress ifindexes: %v", count, ifindexes)
 	}
 }
+
+func TestBuildUserspaceIngressIfindexesSkipsTunnelInterfaces(t *testing.T) {
+	snapshot := &ConfigSnapshot{
+		Interfaces: []InterfaceSnapshot{
+			{
+				Name:    "reth1.0",
+				Zone:    "lan",
+				Ifindex: 5,
+			},
+			{
+				Name:      "gr-0/0/0",
+				Zone:      "sfmix",
+				Ifindex:   586,
+				LinuxName: "gr-0-0-0",
+				Tunnel:    true,
+			},
+		},
+	}
+	ifindexes := buildUserspaceIngressIfindexes(snapshot)
+	for _, idx := range ifindexes {
+		if idx == 586 {
+			t.Fatalf("tunnel ifindex 586 unexpectedly present in ingress ifindexes: %v", ifindexes)
+		}
+	}
+	if len(ifindexes) != 1 || ifindexes[0] != 5 {
+		t.Fatalf("unexpected ingress ifindexes: %v", ifindexes)
+	}
+}
+
+func TestSnapshotHasNativeGRE(t *testing.T) {
+	snapshot := &ConfigSnapshot{
+		TunnelEndpoints: []TunnelEndpointSnapshot{{
+			ID:   1,
+			Mode: "ip6gre",
+		}},
+	}
+	if !snapshotHasNativeGRE(snapshot) {
+		t.Fatal("expected native GRE snapshot to be detected")
+	}
+	if snapshotHasNativeGRE(&ConfigSnapshot{}) {
+		t.Fatal("did not expect empty snapshot to enable native GRE")
+	}
+}

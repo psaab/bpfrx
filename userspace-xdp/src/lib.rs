@@ -52,6 +52,7 @@ const USERSPACE_FALLBACK_REASON_NO_SESSION: u32 = 12;
 const USERSPACE_FALLBACK_REASON_MAX: u32 = 16;
 const USERSPACE_CTRL_FLAG_CPUMAP: u32 = 1;
 const USERSPACE_CTRL_FLAG_TRACE: u32 = 2;
+const USERSPACE_CTRL_FLAG_NATIVE_GRE: u32 = 4;
 const BINDING_QUEUES_PER_IFACE: u32 = 16;
 const BINDING_ARRAY_MAX_ENTRIES: u32 = 1024 * BINDING_QUEUES_PER_IFACE; // 16384
 const USERSPACE_TRACE_STAGE_RECEIVED: u32 = 1;
@@ -397,10 +398,12 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     }
 
     let packet_len = data_end.saturating_sub(data);
-    // GRE (47) and ESP (50) must be delivered to the kernel for tunnel
-    // decapsulation. XDP_PASS directly — do NOT use fallback_to_main
-    // (the tail-call can fail silently, dropping the packet).
-    if matches!(parsed.protocol, PROTO_GRE | PROTO_ESP) {
+    // ESP still relies on the kernel XFRM path. Native GRE is different:
+    // when enabled, outer GRE must stay on the physical NIC userspace path
+    // so Linux never owns transit decap on gr-* tunnel netdevices.
+    if parsed.protocol == PROTO_ESP
+        || (parsed.protocol == PROTO_GRE && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) == 0)
+    {
         return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
     if should_fallback_early(&parsed) {

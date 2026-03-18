@@ -2368,6 +2368,7 @@ type userspaceCtrlValue struct {
 const userspaceMetadataVersion = 4
 const userspaceCtrlFlagCPUMap = 1
 const userspaceCtrlFlagTrace = 2
+const userspaceCtrlFlagNativeGRE = 4
 const bindingQueuesPerIface = 16 // must match BINDING_QUEUES_PER_IFACE in BPF
 
 func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg config.UserspaceConfig) error {
@@ -2400,6 +2401,9 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	var ctrlFlags uint32
 	if cpumapReady {
 		ctrlFlags |= userspaceCtrlFlagCPUMap
+	}
+	if snapshotHasNativeGRE(snapshot) {
+		ctrlFlags |= userspaceCtrlFlagNativeGRE
 	}
 	ctrl := userspaceCtrlValue{
 		Enabled:            0,
@@ -2502,6 +2506,9 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	var ctrlFlags uint32
 	if cpuMap := m.inner.Map("userspace_cpumap"); cpuMap != nil {
 		ctrlFlags |= userspaceCtrlFlagCPUMap
+	}
+	if snapshotHasNativeGRE(m.lastSnapshot) {
+		ctrlFlags |= userspaceCtrlFlagNativeGRE
 	}
 
 	zero := uint32(0)
@@ -3279,6 +3286,9 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 }
 
 func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
+	if iface.Tunnel {
+		return true
+	}
 	name := iface.Name
 	base := name
 	if idx := strings.IndexByte(base, '.'); idx >= 0 {
@@ -3300,6 +3310,22 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 	}
 	if iface.LocalFabric != "" {
 		return true
+	}
+	return false
+}
+
+func snapshotHasNativeGRE(snapshot *ConfigSnapshot) bool {
+	if snapshot == nil {
+		return false
+	}
+	for _, endpoint := range snapshot.TunnelEndpoints {
+		if endpoint.ID == 0 {
+			continue
+		}
+		switch endpoint.Mode {
+		case "", "gre", "ip6gre":
+			return true
+		}
 	}
 	return false
 }
