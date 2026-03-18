@@ -2041,6 +2041,7 @@ fn poll_binding(
     let Some((binding, right)) = rest.split_first_mut() else {
         return false;
     };
+    update_binding_debug_state(binding);
     let area = binding.umem.area() as *const MmapArea;
     maybe_touch_heartbeat(binding, now_ns);
     let tx_work = drain_pending_tx(binding, now_ns, shared_recycles);
