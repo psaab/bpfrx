@@ -2601,6 +2601,8 @@ fn poll_binding(
                                         None => resolution_target,
                                     }
                                 };
+                            let route_table_override =
+                                ingress_route_table_override(forwarding, meta, flow);
 
                             let resolution = ingress_interface_local_resolution_on_session_miss(
                                 forwarding,
@@ -2621,10 +2623,11 @@ fn poll_binding(
                                     forwarding,
                                     ha_state,
                                     now_secs,
-                                    lookup_forwarding_resolution_with_dynamic(
+                                    lookup_forwarding_resolution_in_table_with_dynamic(
                                         forwarding,
                                         dynamic_neighbors,
                                         effective_resolution_target,
+                                        route_table_override.as_deref(),
                                     ),
                                 )
                             });
@@ -6431,7 +6434,7 @@ fn lookup_forwarding_for_ip(state: &ForwardingState, dst: IpAddr) -> ForwardingD
 }
 
 fn lookup_forwarding_resolution(state: &ForwardingState, dst: IpAddr) -> ForwardingResolution {
-    lookup_forwarding_resolution_inner(state, None, dst)
+    lookup_forwarding_resolution_inner(state, None, dst, None)
 }
 
 fn lookup_forwarding_resolution_with_dynamic(
@@ -6439,13 +6442,23 @@ fn lookup_forwarding_resolution_with_dynamic(
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     dst: IpAddr,
 ) -> ForwardingResolution {
-    lookup_forwarding_resolution_inner(state, Some(dynamic_neighbors), dst)
+    lookup_forwarding_resolution_inner(state, Some(dynamic_neighbors), dst, None)
+}
+
+fn lookup_forwarding_resolution_in_table_with_dynamic(
+    state: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dst: IpAddr,
+    table: Option<&str>,
+) -> ForwardingResolution {
+    lookup_forwarding_resolution_inner(state, Some(dynamic_neighbors), dst, table)
 }
 
 fn lookup_forwarding_resolution_inner(
     state: &ForwardingState,
     dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
     dst: IpAddr,
+    table: Option<&str>,
 ) -> ForwardingResolution {
     match dst {
         IpAddr::V4(ip) => {
@@ -6468,7 +6481,10 @@ fn lookup_forwarding_resolution_inner(
                     tx_vlan_id: 0,
                 };
             }
-            lookup_forwarding_resolution_v4(state, dynamic_neighbors, ip, DEFAULT_V4_TABLE, 0, true)
+            let table = table
+                .map(|table| canonical_route_table(table, false))
+                .unwrap_or_else(|| DEFAULT_V4_TABLE.to_string());
+            lookup_forwarding_resolution_v4(state, dynamic_neighbors, ip, &table, 0, true)
         }
         IpAddr::V6(ip) => {
             if state.local_v6.contains(&ip) {
@@ -6490,9 +6506,42 @@ fn lookup_forwarding_resolution_inner(
                     tx_vlan_id: 0,
                 };
             }
-            lookup_forwarding_resolution_v6(state, dynamic_neighbors, ip, DEFAULT_V6_TABLE, 0, true)
+            let table = table
+                .map(|table| canonical_route_table(table, true))
+                .unwrap_or_else(|| DEFAULT_V6_TABLE.to_string());
+            lookup_forwarding_resolution_v6(state, dynamic_neighbors, ip, &table, 0, true)
         }
     }
+}
+
+fn ingress_route_table_override(
+    forwarding: &ForwardingState,
+    meta: UserspaceDpMeta,
+    flow: &SessionFlow,
+) -> Option<String> {
+    let ingress_ifindex =
+        resolve_ingress_logical_ifindex(forwarding, meta.ingress_ifindex as i32, meta.ingress_vlan_id)
+            .unwrap_or(meta.ingress_ifindex as i32);
+    let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
+    let result = crate::filter::evaluate_interface_filter(
+        &forwarding.filter_state,
+        ingress_ifindex,
+        is_v6,
+        flow.src_ip,
+        flow.dst_ip,
+        meta.protocol,
+        flow.forward_key.src_port,
+        flow.forward_key.dst_port,
+        meta.dscp,
+    );
+    if result.routing_instance.is_empty() {
+        return None;
+    }
+    Some(if is_v6 {
+        format!("{}.inet6.0", result.routing_instance)
+    } else {
+        format!("{}.inet.0", result.routing_instance)
+    })
 }
 
 fn interface_nat_local_resolution(
@@ -8292,9 +8341,9 @@ struct BindingLiveSnapshot {
 mod tests {
     use super::*;
     use crate::{
-        FabricSnapshot, InterfaceAddressSnapshot, InterfaceSnapshot, NeighborSnapshot,
-        PolicyRuleSnapshot, RouteSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot,
-        TunnelEndpointSnapshot, ZoneSnapshot,
+        FabricSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot, InterfaceAddressSnapshot,
+        InterfaceSnapshot, NeighborSnapshot, PolicyRuleSnapshot, RouteSnapshot,
+        SourceNATRuleSnapshot, StaticNATRuleSnapshot, TunnelEndpointSnapshot, ZoneSnapshot,
     };
 
     #[test]
@@ -8571,6 +8620,48 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn native_gre_pbr_snapshot(include_neighbor: bool) -> ConfigSnapshot {
+        let mut snapshot = native_gre_snapshot(include_neighbor);
+        snapshot.zones.insert(
+            0,
+            ZoneSnapshot {
+                name: "lan".to_string(),
+                id: 3,
+            },
+        );
+        snapshot.interfaces.push(InterfaceSnapshot {
+            name: "reth1.0".to_string(),
+            zone: "lan".to_string(),
+            linux_name: "ge-0-0-1".to_string(),
+            ifindex: 5,
+            filter_input_v4: "sfmix-pbr".to_string(),
+            addresses: vec![InterfaceAddressSnapshot {
+                family: "inet".to_string(),
+                address: "10.0.61.1/24".to_string(),
+                scope: 0,
+            }],
+            ..Default::default()
+        });
+        snapshot.filters = vec![FirewallFilterSnapshot {
+            name: "sfmix-pbr".to_string(),
+            family: "inet".to_string(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "sfmix-route".to_string(),
+                    destination_addresses: vec!["10.255.192.40/30".to_string()],
+                    routing_instance: "sfmix".to_string(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "default".to_string(),
+                    action: "accept".to_string(),
+                    ..Default::default()
+                },
+            ],
+        }];
+        snapshot
     }
 
     fn forwarding_snapshot_with_next_table(include_neighbor: bool) -> ConfigSnapshot {
@@ -9244,6 +9335,41 @@ mod tests {
         assert_eq!(resolved.tunnel_endpoint_id, 1);
         assert_eq!(resolved.src_mac, Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]));
         assert_eq!(resolved.tx_vlan_id, 80);
+    }
+
+    #[test]
+    fn ingress_filter_routing_instance_steers_flow_into_native_gre_table() {
+        let state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+        let flow = SessionFlow {
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_ICMP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+                src_port: 0,
+                dst_port: 0,
+            },
+        };
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 5,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..Default::default()
+        };
+        let override_table = ingress_route_table_override(&state, meta, &flow);
+        assert_eq!(override_table.as_deref(), Some("sfmix.inet.0"));
+        let resolved = lookup_forwarding_resolution_in_table_with_dynamic(
+            &state,
+            &Default::default(),
+            flow.dst_ip,
+            override_table.as_deref(),
+        );
+        assert_eq!(resolved.disposition, ForwardingDisposition::ForwardCandidate);
+        assert_eq!(resolved.egress_ifindex, 362);
+        assert_eq!(resolved.tx_ifindex, 6);
+        assert_eq!(resolved.tunnel_endpoint_id, 1);
     }
 
     #[test]
