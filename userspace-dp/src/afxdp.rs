@@ -66,8 +66,8 @@ mod tx;
 use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
     AfXdpBindStrategy, binding_frame_count, ifinfo_from_binding, interface_driver_name,
-    open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets, reserved_tx_frames,
-    umem_ring_size,
+    open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets,
+    reserved_tx_frames, umem_ring_size,
 };
 #[cfg(test)]
 use self::bind::{
@@ -1196,6 +1196,8 @@ struct ForwardingState {
     connected_v6: Vec<ConnectedRouteV6>,
     routes_v4: FastMap<String, Vec<RouteEntryV4>>,
     routes_v6: FastMap<String, Vec<RouteEntryV6>>,
+    tunnel_endpoints: FastMap<u16, TunnelEndpoint>,
+    tunnel_endpoint_by_ifindex: FastMap<i32, u16>,
     neighbors: FastMap<(i32, IpAddr), NeighborEntry>,
     ifindex_to_name: FastMap<i32, String>,
     ifindex_to_zone: FastMap<i32, String>,
@@ -1242,18 +1244,21 @@ struct HAGroupRuntime {
 struct ConnectedRouteV4 {
     prefix: PrefixV4,
     ifindex: i32,
+    tunnel_endpoint_id: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ConnectedRouteV6 {
     prefix: PrefixV6,
     ifindex: i32,
+    tunnel_endpoint_id: u16,
 }
 
 #[derive(Clone, Debug)]
 struct RouteEntryV4 {
     prefix: PrefixV4,
     ifindex: i32,
+    tunnel_endpoint_id: u16,
     next_hop: Option<Ipv4Addr>,
     discard: bool,
     next_table: String,
@@ -1263,6 +1268,7 @@ struct RouteEntryV4 {
 struct RouteEntryV6 {
     prefix: PrefixV6,
     ifindex: i32,
+    tunnel_endpoint_id: u16,
     next_hop: Option<Ipv6Addr>,
     discard: bool,
     next_table: String,
@@ -1284,6 +1290,20 @@ struct EgressInterface {
     redundancy_group: i32,
     primary_v4: Option<Ipv4Addr>,
     primary_v6: Option<Ipv6Addr>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct TunnelEndpoint {
+    id: u16,
+    logical_ifindex: i32,
+    mode: String,
+    outer_family: i32,
+    source: IpAddr,
+    destination: IpAddr,
+    key: u32,
+    ttl: u8,
+    transport_table: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1314,6 +1334,7 @@ pub(crate) struct ForwardingResolution {
     pub(crate) local_ifindex: i32,
     pub(crate) egress_ifindex: i32,
     pub(crate) tx_ifindex: i32,
+    pub(crate) tunnel_endpoint_id: u16,
     pub(crate) next_hop: Option<IpAddr>,
     pub(crate) neighbor_mac: Option<[u8; 6]>,
     pub(crate) src_mac: Option<[u8; 6]>,
@@ -2105,7 +2126,9 @@ fn poll_binding(
         if ident.is_none() {
             ident = Some(binding.identity());
         }
-        let ident = ident.as_ref().expect("identity initialized when RX has work");
+        let ident = ident
+            .as_ref()
+            .expect("identity initialized when RX has work");
 
         let mut received = binding.rx.receive(available);
         binding.scratch_recycle.clear();
@@ -2329,6 +2352,7 @@ fn poll_binding(
                                     local_ifindex: 0,
                                     egress_ifindex: 0,
                                     tx_ifindex: 0,
+                                    tunnel_endpoint_id: 0,
                                     next_hop: None,
                                     neighbor_mac: None,
                                     src_mac: None,
@@ -5199,6 +5223,43 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         state.zone_id_to_name.insert(zone.id, zone.name.clone());
     }
 
+    for endpoint in &snapshot.tunnel_endpoints {
+        if endpoint.id == 0 || endpoint.ifindex <= 0 {
+            continue;
+        }
+        let Ok(source) = endpoint.source.parse::<IpAddr>() else {
+            continue;
+        };
+        let Ok(destination) = endpoint.destination.parse::<IpAddr>() else {
+            continue;
+        };
+        let outer_family = match (endpoint.outer_family.as_str(), destination) {
+            ("inet6", _) => libc::AF_INET6,
+            ("inet", _) => libc::AF_INET,
+            (_, IpAddr::V6(_)) => libc::AF_INET6,
+            _ => libc::AF_INET,
+        };
+        let transport_table =
+            canonical_route_table(&endpoint.transport_table, outer_family == libc::AF_INET6);
+        state.tunnel_endpoints.insert(
+            endpoint.id,
+            TunnelEndpoint {
+                id: endpoint.id,
+                logical_ifindex: endpoint.ifindex,
+                mode: endpoint.mode.clone(),
+                outer_family,
+                source,
+                destination,
+                key: endpoint.key,
+                ttl: endpoint.ttl.max(0) as u8,
+                transport_table,
+            },
+        );
+        state
+            .tunnel_endpoint_by_ifindex
+            .insert(endpoint.ifindex, endpoint.id);
+    }
+
     for iface in &snapshot.interfaces {
         if iface.ifindex <= 0 {
             continue;
@@ -5234,6 +5295,11 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         if let Some(mac) = parse_mac(&iface.hardware_addr) {
             mac_by_ifindex.insert(iface.ifindex, mac);
         }
+        let tunnel_endpoint_id = state
+            .tunnel_endpoint_by_ifindex
+            .get(&iface.ifindex)
+            .copied()
+            .unwrap_or(0);
         for addr in &iface.addresses {
             let Ok(net) = addr.address.parse::<IpNet>() else {
                 continue;
@@ -5248,6 +5314,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                     state.connected_v4.push(ConnectedRouteV4 {
                         prefix: PrefixV4::from_net(v4),
                         ifindex: iface.ifindex,
+                        tunnel_endpoint_id,
                     });
                 }
                 IpNet::V6(v6) => {
@@ -5259,6 +5326,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                     state.connected_v6.push(ConnectedRouteV6 {
                         prefix: PrefixV6::from_net(v6),
                         ifindex: iface.ifindex,
+                        tunnel_endpoint_id,
                     });
                 }
             }
@@ -5304,7 +5372,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
 
     for route in &snapshot.routes {
         if let Ok(prefix) = route.destination.parse::<Ipv4Net>() {
-            let (next_hop, ifindex) =
+            let (next_hop, ifindex, tunnel_endpoint_id) =
                 resolve_route_target_v4(route, &name_to_ifindex, &linux_to_ifindex, &state);
             let table = canonical_route_table(&route.table, false);
             state
@@ -5314,6 +5382,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                 .push(RouteEntryV4 {
                     prefix: PrefixV4::from_net(prefix),
                     ifindex,
+                    tunnel_endpoint_id,
                     next_hop,
                     discard: route.discard,
                     next_table: route.next_table.clone(),
@@ -5321,7 +5390,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             continue;
         }
         if let Ok(prefix) = route.destination.parse::<Ipv6Net>() {
-            let (next_hop, ifindex) =
+            let (next_hop, ifindex, tunnel_endpoint_id) =
                 resolve_route_target_v6(route, &name_to_ifindex, &linux_to_ifindex, &state);
             let table = canonical_route_table(&route.table, true);
             state
@@ -5331,6 +5400,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                 .push(RouteEntryV6 {
                     prefix: PrefixV6::from_net(prefix),
                     ifindex,
+                    tunnel_endpoint_id,
                     next_hop,
                     discard: route.discard,
                     next_table: route.next_table.clone(),
@@ -5764,22 +5834,33 @@ fn resolve_route_target_v4(
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
     state: &ForwardingState,
-) -> (Option<Ipv4Addr>, i32) {
+) -> (Option<Ipv4Addr>, i32, u16) {
     if route.discard || !route.next_table.is_empty() {
-        return (None, 0);
+        return (None, 0, 0);
     }
     let Some((next_hop, interface)) = route
         .next_hops
         .first()
         .map(|nh| parse_route_next_hop(nh.as_str()))
     else {
-        return (None, 0);
+        return (None, 0, 0);
     };
-    let egress = interface
+    let target = interface
         .as_deref()
         .and_then(|name| resolve_ifindex(name, names, linux_names))
-        .or_else(|| next_hop.and_then(|ip| infer_connected_ifindex_v4(state, ip)));
-    (next_hop, egress.unwrap_or(0))
+        .map(|ifindex| {
+            (
+                ifindex,
+                state
+                    .tunnel_endpoint_by_ifindex
+                    .get(&ifindex)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        })
+        .or_else(|| next_hop.and_then(|ip| infer_connected_route_target_v4(state, ip)));
+    let (ifindex, tunnel_endpoint_id) = target.unwrap_or((0, 0));
+    (next_hop, ifindex, tunnel_endpoint_id)
 }
 
 fn resolve_route_target_v6(
@@ -5787,22 +5868,33 @@ fn resolve_route_target_v6(
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
     state: &ForwardingState,
-) -> (Option<Ipv6Addr>, i32) {
+) -> (Option<Ipv6Addr>, i32, u16) {
     if route.discard || !route.next_table.is_empty() {
-        return (None, 0);
+        return (None, 0, 0);
     }
     let Some((next_hop, interface)) = route
         .next_hops
         .first()
         .map(|nh| parse_route_next_hop_v6(nh.as_str()))
     else {
-        return (None, 0);
+        return (None, 0, 0);
     };
-    let egress = interface
+    let target = interface
         .as_deref()
         .and_then(|name| resolve_ifindex(name, names, linux_names))
-        .or_else(|| next_hop.and_then(|ip| infer_connected_ifindex_v6(state, ip)));
-    (next_hop, egress.unwrap_or(0))
+        .map(|ifindex| {
+            (
+                ifindex,
+                state
+                    .tunnel_endpoint_by_ifindex
+                    .get(&ifindex)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        })
+        .or_else(|| next_hop.and_then(|ip| infer_connected_route_target_v6(state, ip)));
+    let (ifindex, tunnel_endpoint_id) = target.unwrap_or((0, 0));
+    (next_hop, ifindex, tunnel_endpoint_id)
 }
 
 fn parse_route_next_hop(spec: &str) -> (Option<Ipv4Addr>, Option<String>) {
@@ -5854,20 +5946,20 @@ fn resolve_ifindex(
         .or_else(|| linux_names.get(name).copied())
 }
 
-fn infer_connected_ifindex_v4(state: &ForwardingState, ip: Ipv4Addr) -> Option<i32> {
+fn infer_connected_route_target_v4(state: &ForwardingState, ip: Ipv4Addr) -> Option<(i32, u16)> {
     state
         .connected_v4
         .iter()
         .find(|entry| entry.prefix.contains(ip))
-        .map(|entry| entry.ifindex)
+        .map(|entry| (entry.ifindex, entry.tunnel_endpoint_id))
 }
 
-fn infer_connected_ifindex_v6(state: &ForwardingState, ip: Ipv6Addr) -> Option<i32> {
+fn infer_connected_route_target_v6(state: &ForwardingState, ip: Ipv6Addr) -> Option<(i32, u16)> {
     state
         .connected_v6
         .iter()
         .find(|entry| entry.prefix.contains(ip))
-        .map(|entry| entry.ifindex)
+        .map(|entry| (entry.ifindex, entry.tunnel_endpoint_id))
 }
 
 fn neighbor_state_usable(state: &str) -> bool {
@@ -5940,6 +6032,7 @@ fn resolve_forwarding(
             local_ifindex: 0,
             egress_ifindex: 0,
             tx_ifindex: 0,
+            tunnel_endpoint_id: 0,
             next_hop: None,
             neighbor_mac: None,
             src_mac: None,
@@ -6025,6 +6118,7 @@ fn resolve_fabric_redirect(forwarding: &ForwardingState) -> Option<ForwardingRes
         local_ifindex: 0,
         egress_ifindex: fabric.parent_ifindex,
         tx_ifindex: fabric.parent_ifindex,
+        tunnel_endpoint_id: 0,
         next_hop: Some(fabric.peer_addr),
         neighbor_mac: Some(fabric.peer_mac),
         src_mac: Some(fabric.local_mac),
@@ -6337,7 +6431,7 @@ fn lookup_forwarding_resolution_inner(
     dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
     dst: IpAddr,
 ) -> ForwardingResolution {
-    let mut resolution = match dst {
+    match dst {
         IpAddr::V4(ip) => {
             if state.local_v4.contains(&ip) {
                 let local_ifindex = state
@@ -6351,13 +6445,14 @@ fn lookup_forwarding_resolution_inner(
                     local_ifindex,
                     egress_ifindex: local_ifindex,
                     tx_ifindex: local_ifindex,
+                    tunnel_endpoint_id: 0,
                     next_hop: None,
                     neighbor_mac: None,
                     src_mac: None,
                     tx_vlan_id: 0,
                 };
             }
-            lookup_forwarding_resolution_v4(state, dynamic_neighbors, ip, DEFAULT_V4_TABLE, 0)
+            lookup_forwarding_resolution_v4(state, dynamic_neighbors, ip, DEFAULT_V4_TABLE, 0, true)
         }
         IpAddr::V6(ip) => {
             if state.local_v6.contains(&ip) {
@@ -6372,25 +6467,16 @@ fn lookup_forwarding_resolution_inner(
                     local_ifindex,
                     egress_ifindex: local_ifindex,
                     tx_ifindex: local_ifindex,
+                    tunnel_endpoint_id: 0,
                     next_hop: None,
                     neighbor_mac: None,
                     src_mac: None,
                     tx_vlan_id: 0,
                 };
             }
-            lookup_forwarding_resolution_v6(state, dynamic_neighbors, ip, DEFAULT_V6_TABLE, 0)
+            lookup_forwarding_resolution_v6(state, dynamic_neighbors, ip, DEFAULT_V6_TABLE, 0, true)
         }
-    };
-    // Tunnel interfaces (GRE, ip6gre, XFRM) can't be reached via AF_XDP TX.
-    // Route these to slow-path so the kernel handles encapsulation.
-    if matches!(
-        resolution.disposition,
-        ForwardingDisposition::ForwardCandidate | ForwardingDisposition::MissingNeighbor
-    ) && state.tunnel_interfaces.contains(&resolution.egress_ifindex)
-    {
-        resolution.disposition = ForwardingDisposition::MissingNeighbor;
     }
-    resolution
 }
 
 fn interface_nat_local_resolution(
@@ -6407,6 +6493,7 @@ fn interface_nat_local_resolution(
                 local_ifindex,
                 egress_ifindex: local_ifindex,
                 tx_ifindex: local_ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop: None,
                 neighbor_mac: None,
                 src_mac: None,
@@ -6421,6 +6508,7 @@ fn interface_nat_local_resolution(
                 local_ifindex,
                 egress_ifindex: local_ifindex,
                 tx_ifindex: local_ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop: None,
                 neighbor_mac: None,
                 src_mac: None,
@@ -6466,6 +6554,7 @@ fn ingress_interface_local_resolution(
         local_ifindex: logical_ifindex,
         egress_ifindex: logical_ifindex,
         tx_ifindex: logical_ifindex,
+        tunnel_endpoint_id: 0,
         next_hop: None,
         neighbor_mac: None,
         src_mac: None,
@@ -6489,6 +6578,7 @@ fn lookup_forwarding_resolution_v4(
     ip: Ipv4Addr,
     table: &str,
     depth: usize,
+    allow_tunnels: bool,
 ) -> ForwardingResolution {
     if depth >= MAX_NEXT_TABLE_DEPTH {
         return ForwardingResolution {
@@ -6496,6 +6586,7 @@ fn lookup_forwarding_resolution_v4(
             local_ifindex: 0,
             egress_ifindex: 0,
             tx_ifindex: 0,
+            tunnel_endpoint_id: 0,
             next_hop: Some(IpAddr::V4(ip)),
             neighbor_mac: None,
             src_mac: None,
@@ -6511,7 +6602,22 @@ fn lookup_forwarding_resolution_v4(
         .iter()
         .find(|entry| entry.prefix.contains(ip));
     match choose_v4_route(static_match, connected_match) {
-        Some(ResolvedRouteV4::Connected { ifindex }) => {
+        Some(ResolvedRouteV4::Connected {
+            ifindex,
+            tunnel_endpoint_id,
+        }) => {
+            if tunnel_endpoint_id != 0 {
+                return if allow_tunnels {
+                    resolve_tunnel_forwarding_resolution(
+                        state,
+                        dynamic_neighbors,
+                        tunnel_endpoint_id,
+                        depth,
+                    )
+                } else {
+                    no_route_resolution(Some(IpAddr::V4(ip)))
+                };
+            }
             let neighbor = lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V4(ip));
             let mut resolution = ForwardingResolution {
                 disposition: if neighbor.is_some() {
@@ -6522,6 +6628,7 @@ fn lookup_forwarding_resolution_v4(
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
                 tx_ifindex: ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(ip)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
                 src_mac: None,
@@ -6532,6 +6639,7 @@ fn lookup_forwarding_resolution_v4(
         }
         Some(ResolvedRouteV4::Static {
             ifindex,
+            tunnel_endpoint_id,
             next_hop,
             discard,
             next_table,
@@ -6542,6 +6650,7 @@ fn lookup_forwarding_resolution_v4(
                     local_ifindex: 0,
                     egress_ifindex: ifindex,
                     tx_ifindex: ifindex,
+                    tunnel_endpoint_id,
                     next_hop: next_hop.map(IpAddr::V4),
                     neighbor_mac: None,
                     src_mac: None,
@@ -6555,6 +6664,7 @@ fn lookup_forwarding_resolution_v4(
                         local_ifindex: 0,
                         egress_ifindex: 0,
                         tx_ifindex: 0,
+                        tunnel_endpoint_id: 0,
                         next_hop: Some(IpAddr::V4(ip)),
                         neighbor_mac: None,
                         src_mac: None,
@@ -6567,19 +6677,23 @@ fn lookup_forwarding_resolution_v4(
                     ip,
                     &next_table_name,
                     depth + 1,
+                    allow_tunnels,
                 );
             }
-            if ifindex <= 0 {
-                return ForwardingResolution {
-                    disposition: ForwardingDisposition::NoRoute,
-                    local_ifindex: 0,
-                    egress_ifindex: 0,
-                    tx_ifindex: 0,
-                    next_hop: next_hop.map(IpAddr::V4),
-                    neighbor_mac: None,
-                    src_mac: None,
-                    tx_vlan_id: 0,
+            if tunnel_endpoint_id != 0 {
+                return if allow_tunnels {
+                    resolve_tunnel_forwarding_resolution(
+                        state,
+                        dynamic_neighbors,
+                        tunnel_endpoint_id,
+                        depth,
+                    )
+                } else {
+                    no_route_resolution(next_hop.map(IpAddr::V4).or(Some(IpAddr::V4(ip))))
                 };
+            }
+            if ifindex <= 0 {
+                return no_route_resolution(next_hop.map(IpAddr::V4));
             }
             let target = next_hop.unwrap_or(ip);
             let neighbor =
@@ -6593,6 +6707,7 @@ fn lookup_forwarding_resolution_v4(
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
                 tx_ifindex: ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(target)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
                 src_mac: None,
@@ -6601,16 +6716,7 @@ fn lookup_forwarding_resolution_v4(
             populate_egress_resolution(state, ifindex, &mut resolution);
             resolution
         }
-        None => ForwardingResolution {
-            disposition: ForwardingDisposition::NoRoute,
-            local_ifindex: 0,
-            egress_ifindex: 0,
-            tx_ifindex: 0,
-            next_hop: None,
-            neighbor_mac: None,
-            src_mac: None,
-            tx_vlan_id: 0,
-        },
+        None => no_route_resolution(None),
     }
 }
 
@@ -6620,6 +6726,7 @@ fn lookup_forwarding_resolution_v6(
     ip: Ipv6Addr,
     table: &str,
     depth: usize,
+    allow_tunnels: bool,
 ) -> ForwardingResolution {
     if depth >= MAX_NEXT_TABLE_DEPTH {
         return ForwardingResolution {
@@ -6627,6 +6734,7 @@ fn lookup_forwarding_resolution_v6(
             local_ifindex: 0,
             egress_ifindex: 0,
             tx_ifindex: 0,
+            tunnel_endpoint_id: 0,
             next_hop: Some(IpAddr::V6(ip)),
             neighbor_mac: None,
             src_mac: None,
@@ -6642,7 +6750,22 @@ fn lookup_forwarding_resolution_v6(
         .iter()
         .find(|entry| entry.prefix.contains(ip));
     match choose_v6_route(static_match, connected_match) {
-        Some(ResolvedRouteV6::Connected { ifindex }) => {
+        Some(ResolvedRouteV6::Connected {
+            ifindex,
+            tunnel_endpoint_id,
+        }) => {
+            if tunnel_endpoint_id != 0 {
+                return if allow_tunnels {
+                    resolve_tunnel_forwarding_resolution(
+                        state,
+                        dynamic_neighbors,
+                        tunnel_endpoint_id,
+                        depth,
+                    )
+                } else {
+                    no_route_resolution(Some(IpAddr::V6(ip)))
+                };
+            }
             let neighbor = lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V6(ip));
             let mut resolution = ForwardingResolution {
                 disposition: if neighbor.is_some() {
@@ -6653,6 +6776,7 @@ fn lookup_forwarding_resolution_v6(
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
                 tx_ifindex: ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(ip)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
                 src_mac: None,
@@ -6663,6 +6787,7 @@ fn lookup_forwarding_resolution_v6(
         }
         Some(ResolvedRouteV6::Static {
             ifindex,
+            tunnel_endpoint_id,
             next_hop,
             discard,
             next_table,
@@ -6673,6 +6798,7 @@ fn lookup_forwarding_resolution_v6(
                     local_ifindex: 0,
                     egress_ifindex: ifindex,
                     tx_ifindex: ifindex,
+                    tunnel_endpoint_id,
                     next_hop: next_hop.map(IpAddr::V6),
                     neighbor_mac: None,
                     src_mac: None,
@@ -6686,6 +6812,7 @@ fn lookup_forwarding_resolution_v6(
                         local_ifindex: 0,
                         egress_ifindex: 0,
                         tx_ifindex: 0,
+                        tunnel_endpoint_id: 0,
                         next_hop: Some(IpAddr::V6(ip)),
                         neighbor_mac: None,
                         src_mac: None,
@@ -6698,19 +6825,23 @@ fn lookup_forwarding_resolution_v6(
                     ip,
                     &next_table_name,
                     depth + 1,
+                    allow_tunnels,
                 );
             }
-            if ifindex <= 0 {
-                return ForwardingResolution {
-                    disposition: ForwardingDisposition::NoRoute,
-                    local_ifindex: 0,
-                    egress_ifindex: 0,
-                    tx_ifindex: 0,
-                    next_hop: next_hop.map(IpAddr::V6),
-                    neighbor_mac: None,
-                    src_mac: None,
-                    tx_vlan_id: 0,
+            if tunnel_endpoint_id != 0 {
+                return if allow_tunnels {
+                    resolve_tunnel_forwarding_resolution(
+                        state,
+                        dynamic_neighbors,
+                        tunnel_endpoint_id,
+                        depth,
+                    )
+                } else {
+                    no_route_resolution(next_hop.map(IpAddr::V6).or(Some(IpAddr::V6(ip))))
                 };
+            }
+            if ifindex <= 0 {
+                return no_route_resolution(next_hop.map(IpAddr::V6));
             }
             let target = next_hop.unwrap_or(ip);
             let neighbor =
@@ -6724,6 +6855,7 @@ fn lookup_forwarding_resolution_v6(
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
                 tx_ifindex: ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(target)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
                 src_mac: None,
@@ -6732,16 +6864,66 @@ fn lookup_forwarding_resolution_v6(
             populate_egress_resolution(state, ifindex, &mut resolution);
             resolution
         }
-        None => ForwardingResolution {
-            disposition: ForwardingDisposition::NoRoute,
-            local_ifindex: 0,
-            egress_ifindex: 0,
-            tx_ifindex: 0,
-            next_hop: None,
-            neighbor_mac: None,
-            src_mac: None,
-            tx_vlan_id: 0,
-        },
+        None => no_route_resolution(None),
+    }
+}
+
+fn no_route_resolution(next_hop: Option<IpAddr>) -> ForwardingResolution {
+    ForwardingResolution {
+        disposition: ForwardingDisposition::NoRoute,
+        local_ifindex: 0,
+        egress_ifindex: 0,
+        tx_ifindex: 0,
+        tunnel_endpoint_id: 0,
+        next_hop,
+        neighbor_mac: None,
+        src_mac: None,
+        tx_vlan_id: 0,
+    }
+}
+
+fn resolve_tunnel_forwarding_resolution(
+    state: &ForwardingState,
+    dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
+    tunnel_endpoint_id: u16,
+    depth: usize,
+) -> ForwardingResolution {
+    let Some(endpoint) = state.tunnel_endpoints.get(&tunnel_endpoint_id) else {
+        return no_route_resolution(None);
+    };
+    let outer = match endpoint.destination {
+        IpAddr::V4(ip) => lookup_forwarding_resolution_v4(
+            state,
+            dynamic_neighbors,
+            ip,
+            &endpoint.transport_table,
+            depth + 1,
+            false,
+        ),
+        IpAddr::V6(ip) => lookup_forwarding_resolution_v6(
+            state,
+            dynamic_neighbors,
+            ip,
+            &endpoint.transport_table,
+            depth + 1,
+            false,
+        ),
+    };
+    if outer.disposition == ForwardingDisposition::LocalDelivery
+        || state.tunnel_interfaces.contains(&outer.egress_ifindex)
+    {
+        return no_route_resolution(Some(endpoint.destination));
+    }
+    ForwardingResolution {
+        disposition: outer.disposition,
+        local_ifindex: outer.local_ifindex,
+        egress_ifindex: endpoint.logical_ifindex,
+        tx_ifindex: outer.tx_ifindex,
+        tunnel_endpoint_id,
+        next_hop: outer.next_hop,
+        neighbor_mac: outer.neighbor_mac,
+        src_mac: outer.src_mac,
+        tx_vlan_id: outer.tx_vlan_id,
     }
 }
 
@@ -6934,9 +7116,11 @@ fn parse_neighbor_entries(output: &str) -> Vec<(IpAddr, NeighborEntry)> {
 enum ResolvedRouteV4 {
     Connected {
         ifindex: i32,
+        tunnel_endpoint_id: u16,
     },
     Static {
         ifindex: i32,
+        tunnel_endpoint_id: u16,
         next_hop: Option<Ipv4Addr>,
         discard: bool,
         next_table: Option<String>,
@@ -6946,9 +7130,11 @@ enum ResolvedRouteV4 {
 enum ResolvedRouteV6 {
     Connected {
         ifindex: i32,
+        tunnel_endpoint_id: u16,
     },
     Static {
         ifindex: i32,
+        tunnel_endpoint_id: u16,
         next_hop: Option<Ipv6Addr>,
         discard: bool,
         next_table: Option<String>,
@@ -6963,10 +7149,12 @@ fn choose_v4_route(
         (Some(route), Some(conn)) if conn.prefix.prefix_len() >= route.prefix.prefix_len() => {
             Some(ResolvedRouteV4::Connected {
                 ifindex: conn.ifindex,
+                tunnel_endpoint_id: conn.tunnel_endpoint_id,
             })
         }
         (Some(route), _) => Some(ResolvedRouteV4::Static {
             ifindex: route.ifindex,
+            tunnel_endpoint_id: route.tunnel_endpoint_id,
             next_hop: route.next_hop,
             discard: route.discard,
             next_table: if route.next_table.is_empty() {
@@ -6977,6 +7165,7 @@ fn choose_v4_route(
         }),
         (None, Some(conn)) => Some(ResolvedRouteV4::Connected {
             ifindex: conn.ifindex,
+            tunnel_endpoint_id: conn.tunnel_endpoint_id,
         }),
         (None, None) => None,
     }
@@ -6990,10 +7179,12 @@ fn choose_v6_route(
         (Some(route), Some(conn)) if conn.prefix.prefix_len() >= route.prefix.prefix_len() => {
             Some(ResolvedRouteV6::Connected {
                 ifindex: conn.ifindex,
+                tunnel_endpoint_id: conn.tunnel_endpoint_id,
             })
         }
         (Some(route), _) => Some(ResolvedRouteV6::Static {
             ifindex: route.ifindex,
+            tunnel_endpoint_id: route.tunnel_endpoint_id,
             next_hop: route.next_hop,
             discard: route.discard,
             next_table: if route.next_table.is_empty() {
@@ -7004,6 +7195,7 @@ fn choose_v6_route(
         }),
         (None, Some(conn)) => Some(ResolvedRouteV6::Connected {
             ifindex: conn.ifindex,
+            tunnel_endpoint_id: conn.tunnel_endpoint_id,
         }),
         (None, None) => None,
     }
@@ -8086,7 +8278,7 @@ mod tests {
     use crate::{
         FabricSnapshot, InterfaceAddressSnapshot, InterfaceSnapshot, NeighborSnapshot,
         PolicyRuleSnapshot, RouteSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot,
-        ZoneSnapshot,
+        TunnelEndpointSnapshot, ZoneSnapshot,
     };
 
     #[test]
@@ -8138,7 +8330,10 @@ mod tests {
             ),
             None
         );
-        assert_eq!(shared_umem_group_key_for_device(Some("mlx5_core"), None), None);
+        assert_eq!(
+            shared_umem_group_key_for_device(Some("mlx5_core"), None),
+            None
+        );
     }
 
     #[test]
@@ -8260,6 +8455,104 @@ mod tests {
                 interface_mode: true,
                 ..Default::default()
             }],
+            ..Default::default()
+        }
+    }
+
+    fn native_gre_snapshot(include_neighbor: bool) -> ConfigSnapshot {
+        ConfigSnapshot {
+            zones: vec![
+                ZoneSnapshot {
+                    name: "wan".to_string(),
+                    id: 1,
+                },
+                ZoneSnapshot {
+                    name: "sfmix".to_string(),
+                    id: 2,
+                },
+            ],
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "reth0.80".to_string(),
+                    zone: "wan".to_string(),
+                    linux_name: "ge-0-0-2.80".to_string(),
+                    ifindex: 12,
+                    parent_ifindex: 6,
+                    vlan_id: 80,
+                    mtu: 1500,
+                    redundancy_group: 1,
+                    hardware_addr: "02:bf:72:00:50:08".to_string(),
+                    addresses: vec![InterfaceAddressSnapshot {
+                        family: "inet6".to_string(),
+                        address: "2001:559:8585:80::8/64".to_string(),
+                        scope: 0,
+                    }],
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "gr-0/0/0.0".to_string(),
+                    zone: "sfmix".to_string(),
+                    linux_name: "gr-0-0-0".to_string(),
+                    ifindex: 362,
+                    mtu: 1476,
+                    redundancy_group: 1,
+                    tunnel: true,
+                    addresses: vec![InterfaceAddressSnapshot {
+                        family: "inet".to_string(),
+                        address: "10.255.192.42/30".to_string(),
+                        scope: 0,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            tunnel_endpoints: vec![TunnelEndpointSnapshot {
+                id: 1,
+                interface: "gr-0/0/0.0".to_string(),
+                linux_name: "gr-0-0-0".to_string(),
+                ifindex: 362,
+                zone: "sfmix".to_string(),
+                redundancy_group: 1,
+                mtu: 1476,
+                mode: "gre".to_string(),
+                outer_family: "inet6".to_string(),
+                source: "2001:559:8585:80::8".to_string(),
+                destination: "2602:ffd3:0:2::7".to_string(),
+                key: 0,
+                ttl: 64,
+                transport_table: "inet6.0".to_string(),
+            }],
+            routes: vec![
+                RouteSnapshot {
+                    table: "inet6.0".to_string(),
+                    family: "inet6".to_string(),
+                    destination: "2602:ffd3:0:2::/64".to_string(),
+                    next_hops: vec!["2001:559:8585:80::1@reth0.80".to_string()],
+                    discard: false,
+                    next_table: String::new(),
+                },
+                RouteSnapshot {
+                    table: "sfmix.inet.0".to_string(),
+                    family: "inet".to_string(),
+                    destination: "0.0.0.0/0".to_string(),
+                    next_hops: vec!["10.255.192.41".to_string()],
+                    discard: false,
+                    next_table: String::new(),
+                },
+            ],
+            neighbors: if include_neighbor {
+                vec![NeighborSnapshot {
+                    interface: "ge-0-0-2.80".to_string(),
+                    ifindex: 12,
+                    family: "inet6".to_string(),
+                    ip: "2001:559:8585:80::1".to_string(),
+                    mac: "00:11:22:33:44:55".to_string(),
+                    state: "reachable".to_string(),
+                    router: true,
+                    link_local: false,
+                }]
+            } else {
+                vec![]
+            },
             ..Default::default()
         }
     }
@@ -8889,6 +9182,55 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_route_resolves_to_logical_tunnel_and_physical_tx() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let resolved = lookup_forwarding_resolution_v4(
+            &state,
+            None,
+            Ipv4Addr::new(8, 8, 8, 8),
+            "sfmix.inet.0",
+            0,
+            true,
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(resolved.egress_ifindex, 362);
+        assert_eq!(resolved.tx_ifindex, 6);
+        assert_eq!(resolved.tunnel_endpoint_id, 1);
+        assert_eq!(
+            resolved.next_hop,
+            Some(IpAddr::V6("2001:559:8585:80::1".parse().expect("outer nh")))
+        );
+        assert_eq!(
+            resolved.neighbor_mac,
+            Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+        );
+        assert_eq!(resolved.src_mac, Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]));
+        assert_eq!(resolved.tx_vlan_id, 80);
+    }
+
+    #[test]
+    fn tunnel_route_preserves_logical_egress_on_outer_neighbor_miss() {
+        let state = build_forwarding_state(&native_gre_snapshot(false));
+        let resolved = lookup_forwarding_resolution_v4(
+            &state,
+            None,
+            Ipv4Addr::new(8, 8, 8, 8),
+            "sfmix.inet.0",
+            0,
+            true,
+        );
+        assert_eq!(resolved.disposition, ForwardingDisposition::MissingNeighbor);
+        assert_eq!(resolved.egress_ifindex, 362);
+        assert_eq!(resolved.tx_ifindex, 6);
+        assert_eq!(resolved.tunnel_endpoint_id, 1);
+        assert_eq!(resolved.src_mac, Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]));
+        assert_eq!(resolved.tx_vlan_id, 80);
+    }
+
+    #[test]
     fn ha_resolution_blocks_inactive_owner_rg() {
         let state = build_forwarding_state(&nat_snapshot());
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
@@ -9294,6 +9636,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 24,
                 tx_ifindex: 24,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x01, 0x00, 0x01]),
@@ -9343,6 +9686,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 0,
                 tx_ifindex: 0,
+                tunnel_endpoint_id: 0,
                 next_hop: None,
                 neighbor_mac: None,
                 src_mac: None,
@@ -9392,6 +9736,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 24,
                 tx_ifindex: 24,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
                 neighbor_mac: None,
                 src_mac: None,
@@ -9443,6 +9788,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 24,
                 tx_ifindex: 24,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x01, 0x00, 0x01]),
@@ -9477,6 +9823,7 @@ mod tests {
             local_ifindex: 0,
             egress_ifindex: 12,
             tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
             next_hop: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
             neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
             src_mac: None,
@@ -10230,6 +10577,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 5,
                 tx_ifindex: 5,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(
                     "2001:559:8585:ef00::100".parse().expect("next hop"),
                 )),
@@ -10271,6 +10619,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 0,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
                 neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
                 src_mac: None,
@@ -10459,6 +10808,7 @@ mod tests {
                     local_ifindex: 0,
                     egress_ifindex: 21,
                     tx_ifindex: 21,
+                    tunnel_endpoint_id: 0,
                     next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
                     neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
                     src_mac: Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]),
@@ -10667,6 +11017,7 @@ mod tests {
                     local_ifindex: 0,
                     egress_ifindex: 12,
                     tx_ifindex: 11,
+                    tunnel_endpoint_id: 0,
                     next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
                     neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                     src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -10728,6 +11079,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -10829,6 +11181,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -10958,6 +11311,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11040,6 +11394,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11126,6 +11481,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11217,6 +11573,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11318,6 +11675,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11407,6 +11765,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11548,6 +11907,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11708,6 +12068,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11784,6 +12145,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11863,6 +12225,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11944,6 +12307,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -12040,6 +12404,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -12157,6 +12522,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -12260,6 +12626,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -12366,6 +12733,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -12694,6 +13062,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x16, 0x01, 0x00]),
@@ -12804,6 +13173,7 @@ mod tests {
                     local_ifindex: 0,
                     egress_ifindex: 12,
                     tx_ifindex: 11,
+                    tunnel_endpoint_id: 0,
                     next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
                     neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                     src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -12877,6 +13247,7 @@ mod tests {
                     local_ifindex: 0,
                     egress_ifindex: 5,
                     tx_ifindex: 5,
+                    tunnel_endpoint_id: 0,
                     next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
                     neighbor_mac: Some([0x02, 0x66, 0x6a, 0x82, 0xfb, 0x2f]),
                     src_mac: Some([0x02, 0xbf, 0x72, 0x01, 0x01, 0x00]),
@@ -13548,6 +13919,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 5,
                 tx_ifindex: 5,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(client_ip)),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -13670,6 +14042,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 5,
                 tx_ifindex: 5,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(client_ip)),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -13785,6 +14158,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 5,
                 tx_ifindex: 5,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(client_ip)),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -13917,6 +14291,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 5,
                 tx_ifindex: 5,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(client_ip)),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -14039,6 +14414,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 24,
                 tx_ifindex: 24,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(internal_client)),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -14155,6 +14531,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(server_ip)),
                 neighbor_mac: Some([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -14185,6 +14562,7 @@ mod tests {
             local_ifindex: 0,
             egress_ifindex: 24,
             tx_ifindex: 24,
+            tunnel_endpoint_id: 0,
             next_hop: Some(IpAddr::V6(internal_client)),
             neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
             src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]),
@@ -14337,6 +14715,7 @@ mod tests {
                     local_ifindex: 0,
                     egress_ifindex: 12,
                     tx_ifindex: 12,
+                    tunnel_endpoint_id: 0,
                     next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
                     neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                     src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -14470,6 +14849,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 6,
                 tx_ifindex: 6,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
                 neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
                 src_mac: Some([6, 7, 8, 9, 10, 11]),
@@ -14526,6 +14906,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 0,
                 tx_ifindex: 0,
+                tunnel_endpoint_id: 0,
                 next_hop: None,
                 neighbor_mac: None,
                 src_mac: None,
@@ -14585,6 +14966,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 0,
                 tx_ifindex: 0,
+                tunnel_endpoint_id: 0,
                 next_hop: None,
                 neighbor_mac: None,
                 src_mac: None,
@@ -14641,6 +15023,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 0,
                 tx_ifindex: 0,
+                tunnel_endpoint_id: 0,
                 next_hop: None,
                 neighbor_mac: None,
                 src_mac: None,
@@ -14708,6 +15091,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
                 neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
                 src_mac: Some([6, 7, 8, 9, 10, 11]),

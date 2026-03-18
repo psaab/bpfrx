@@ -31,32 +31,33 @@ type ControlResponse struct {
 }
 
 type ConfigSnapshot struct {
-	Version        int                          `json:"version"`
-	Generation     uint64                       `json:"generation"`
-	FIBGeneration  uint32                       `json:"fib_generation,omitempty"`
-	GeneratedAt    time.Time                    `json:"generated_at"`
-	Summary        SnapshotSummary              `json:"summary"`
-	Capabilities   UserspaceCapabilities        `json:"capabilities"`
-	MapPins        UserspaceMapPins             `json:"map_pins"`
-	Zones          []ZoneSnapshot               `json:"zones,omitempty"`
-	Interfaces     []InterfaceSnapshot          `json:"interfaces,omitempty"`
-	Fabrics        []FabricSnapshot             `json:"fabrics,omitempty"`
-	Neighbors      []NeighborSnapshot           `json:"neighbors,omitempty"`
-	Routes         []RouteSnapshot              `json:"routes,omitempty"`
-	Flow           FlowSnapshot                 `json:"flow,omitempty"`
-	DefaultPolicy  string                       `json:"default_policy,omitempty"`
-	Policies       []PolicyRuleSnapshot         `json:"policies,omitempty"`
-	SourceNAT      []SourceNATRuleSnapshot      `json:"source_nat_rules,omitempty"`
-	StaticNAT      []StaticNATRuleSnapshot      `json:"static_nat_rules,omitempty"`
-	DestinationNAT []DestinationNATRuleSnapshot `json:"destination_nat_rules,omitempty"`
-	NAT64          []NAT64RuleSnapshot          `json:"nat64_rules,omitempty"`
-	Nptv6          []Nptv6RuleSnapshot          `json:"nptv6_rules,omitempty"`
-	Screens        []ScreenProfileSnapshot      `json:"screens,omitempty"`
-	Filters        []FirewallFilterSnapshot     `json:"filters,omitempty"`
-	Policers       []PolicerSnapshot            `json:"policers,omitempty"`
-	FlowExport     *FlowExportSnapshot          `json:"flow_export,omitempty"`
-	Config         *config.Config               `json:"config,omitempty"`
-	Userspace      config.UserspaceConfig       `json:"userspace"`
+	Version         int                          `json:"version"`
+	Generation      uint64                       `json:"generation"`
+	FIBGeneration   uint32                       `json:"fib_generation,omitempty"`
+	GeneratedAt     time.Time                    `json:"generated_at"`
+	Summary         SnapshotSummary              `json:"summary"`
+	Capabilities    UserspaceCapabilities        `json:"capabilities"`
+	MapPins         UserspaceMapPins             `json:"map_pins"`
+	Zones           []ZoneSnapshot               `json:"zones,omitempty"`
+	Interfaces      []InterfaceSnapshot          `json:"interfaces,omitempty"`
+	Fabrics         []FabricSnapshot             `json:"fabrics,omitempty"`
+	TunnelEndpoints []TunnelEndpointSnapshot     `json:"tunnel_endpoints,omitempty"`
+	Neighbors       []NeighborSnapshot           `json:"neighbors,omitempty"`
+	Routes          []RouteSnapshot              `json:"routes,omitempty"`
+	Flow            FlowSnapshot                 `json:"flow,omitempty"`
+	DefaultPolicy   string                       `json:"default_policy,omitempty"`
+	Policies        []PolicyRuleSnapshot         `json:"policies,omitempty"`
+	SourceNAT       []SourceNATRuleSnapshot      `json:"source_nat_rules,omitempty"`
+	StaticNAT       []StaticNATRuleSnapshot      `json:"static_nat_rules,omitempty"`
+	DestinationNAT  []DestinationNATRuleSnapshot `json:"destination_nat_rules,omitempty"`
+	NAT64           []NAT64RuleSnapshot          `json:"nat64_rules,omitempty"`
+	Nptv6           []Nptv6RuleSnapshot          `json:"nptv6_rules,omitempty"`
+	Screens         []ScreenProfileSnapshot      `json:"screens,omitempty"`
+	Filters         []FirewallFilterSnapshot     `json:"filters,omitempty"`
+	Policers        []PolicerSnapshot            `json:"policers,omitempty"`
+	FlowExport      *FlowExportSnapshot          `json:"flow_export,omitempty"`
+	Config          *config.Config               `json:"config,omitempty"`
+	Userspace       config.UserspaceConfig       `json:"userspace"`
 }
 
 type FlowSnapshot struct {
@@ -120,6 +121,23 @@ type FabricSnapshot struct {
 	PeerAddress     string `json:"peer_address,omitempty"`
 	LocalMAC        string `json:"local_mac,omitempty"`
 	PeerMAC         string `json:"peer_mac,omitempty"`
+}
+
+type TunnelEndpointSnapshot struct {
+	ID              uint16 `json:"id,omitempty"`
+	Interface       string `json:"interface,omitempty"`
+	LinuxName       string `json:"linux_name,omitempty"`
+	Ifindex         int    `json:"ifindex,omitempty"`
+	Zone            string `json:"zone,omitempty"`
+	RedundancyGroup int    `json:"redundancy_group,omitempty"`
+	MTU             int    `json:"mtu,omitempty"`
+	Mode            string `json:"mode,omitempty"`
+	OuterFamily     string `json:"outer_family,omitempty"`
+	Source          string `json:"source,omitempty"`
+	Destination     string `json:"destination,omitempty"`
+	Key             uint32 `json:"key,omitempty"`
+	TTL             int    `json:"ttl,omitempty"`
+	TransportTable  string `json:"transport_table,omitempty"`
 }
 
 type SourceNATRuleSnapshot struct {

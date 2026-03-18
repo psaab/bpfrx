@@ -158,11 +158,8 @@ pub(super) fn apply_worker_commands(
             WorkerCommand::UpsertSynced(entry) => {
                 let key = entry.key.clone();
                 let metadata = entry.metadata.clone();
-                let allow_replace_local = !owner_rg_is_locally_active(
-                    ha_state,
-                    entry.metadata.owner_rg_id,
-                    now_secs,
-                );
+                let allow_replace_local =
+                    !owner_rg_is_locally_active(ha_state, entry.metadata.owner_rg_id, now_secs);
                 if sessions.upsert_synced(
                     entry.key,
                     entry.decision,
@@ -230,7 +227,8 @@ pub(super) fn demote_shared_owner_rgs(
     if owner_rgs.is_empty() {
         return;
     }
-    let should_demote = |entry: &SyncedSessionEntry| owner_rgs.contains(&entry.metadata.owner_rg_id);
+    let should_demote =
+        |entry: &SyncedSessionEntry| owner_rgs.contains(&entry.metadata.owner_rg_id);
     if let Ok(mut sessions) = shared_sessions.lock() {
         sessions.retain(|_, entry| {
             if !should_demote(entry) {
@@ -736,7 +734,8 @@ pub(super) fn reverse_resolution_for_session(
     if let Some(local) = super::interface_nat_local_resolution(forwarding, target_ip) {
         return local;
     }
-    let resolved = lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip);
+    let resolved =
+        lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip);
     if fabric_ingress
         && owner_rg_for_flow(forwarding, resolved.egress_ifindex) > 0
         && !matches!(
@@ -1036,6 +1035,7 @@ mod tests {
             local_ifindex: 0,
             egress_ifindex: 12,
             tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
             next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
             neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
             src_mac: Some([6, 7, 8, 9, 10, 11]),
@@ -1067,6 +1067,7 @@ mod tests {
         forwarding.connected_v4.push(ConnectedRouteV4 {
             prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(10, 0, 61, 0), 24).unwrap()),
             ifindex: 6,
+            tunnel_endpoint_id: 0,
         });
         forwarding.neighbors.insert(
             (6, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
@@ -1303,11 +1304,9 @@ mod tests {
             &shared_forward_wire_sessions,
             &entry,
         );
-        let alias_hit = lookup_shared_forward_wire_match(
-            &shared_forward_wire_sessions,
-            &translated_key,
-        )
-        .expect("forward-wire alias should be published");
+        let alias_hit =
+            lookup_shared_forward_wire_match(&shared_forward_wire_sessions, &translated_key)
+                .expect("forward-wire alias should be published");
         assert_eq!(alias_hit.key, key);
 
         remove_shared_session(
@@ -1684,7 +1683,10 @@ mod tests {
         assert!(reverse.metadata.fabric_ingress);
         assert_eq!(reverse.metadata.ingress_zone.as_ref(), "wan");
         assert_eq!(reverse.metadata.egress_zone.as_ref(), "lan");
-        assert_eq!(reverse.key, reverse_session_key(&entry.key, entry.decision.nat));
+        assert_eq!(
+            reverse.key,
+            reverse_session_key(&entry.key, entry.decision.nat)
+        );
     }
 
     #[test]
@@ -1710,16 +1712,14 @@ mod tests {
             },
         );
 
-        let reverse = synthesized_synced_reverse_entry(
-            &forwarding,
-            &ha_state,
-            &dynamic_neighbors,
-            &entry,
-            1,
-        )
-        .expect("reverse companion");
+        let reverse =
+            synthesized_synced_reverse_entry(&forwarding, &ha_state, &dynamic_neighbors, &entry, 1)
+                .expect("reverse companion");
 
-        assert_eq!(reverse.decision.resolution.disposition, ForwardingDisposition::ForwardCandidate);
+        assert_eq!(
+            reverse.decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
         assert_eq!(reverse.decision.resolution.egress_ifindex, 6);
     }
 

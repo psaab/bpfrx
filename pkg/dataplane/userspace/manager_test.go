@@ -518,6 +518,88 @@ func TestBuildRouteSnapshotsIncludesConnectedPrefixes(t *testing.T) {
 	}
 }
 
+func TestBuildTunnelEndpointSnapshotsBuildsUnitEndpoint(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"gr-0/0/0": {
+			Name: "gr-0/0/0",
+			Units: map[int]*config.InterfaceUnit{
+				0: {
+					Number: 0,
+				},
+			},
+			Tunnel: &config.TunnelConfig{
+				Name:        "gr-0-0-0",
+				Mode:        "gre",
+				Source:      "2001:559:8585:80::8",
+				Destination: "2602:ffd3:0:2::7",
+			},
+		},
+	}
+	endpoints := buildTunnelEndpointSnapshots(cfg, []InterfaceSnapshot{
+		{
+			Name:            "gr-0/0/0.0",
+			Zone:            "sfmix",
+			LinuxName:       "gr-0-0-0",
+			Ifindex:         362,
+			RedundancyGroup: 1,
+			MTU:             1476,
+		},
+	})
+	if len(endpoints) != 1 {
+		t.Fatalf("len(endpoints) = %d, want 1", len(endpoints))
+	}
+	if endpoints[0].ID != 1 {
+		t.Fatalf("endpoint id = %d, want 1", endpoints[0].ID)
+	}
+	if endpoints[0].Interface != "gr-0/0/0.0" {
+		t.Fatalf("endpoint interface = %q, want gr-0/0/0.0", endpoints[0].Interface)
+	}
+	if endpoints[0].TransportTable != "inet6.0" {
+		t.Fatalf("endpoint transport table = %q, want inet6.0", endpoints[0].TransportTable)
+	}
+	if endpoints[0].OuterFamily != "inet6" {
+		t.Fatalf("endpoint outer family = %q, want inet6", endpoints[0].OuterFamily)
+	}
+}
+
+func TestBuildTunnelEndpointSnapshotsUsesConfiguredTransportTable(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"gr-0/0/0": {
+			Name: "gr-0/0/0",
+			Units: map[int]*config.InterfaceUnit{
+				0: {
+					Number: 0,
+				},
+			},
+			Tunnel: &config.TunnelConfig{
+				Name:            "gr-0-0-0",
+				Mode:            "gre",
+				Source:          "172.16.50.8",
+				Destination:     "198.51.100.7",
+				RoutingInstance: "transport",
+			},
+		},
+	}
+	endpoints := buildTunnelEndpointSnapshots(cfg, []InterfaceSnapshot{
+		{
+			Name:      "gr-0/0/0.0",
+			LinuxName: "gr-0-0-0",
+			Ifindex:   362,
+		},
+	})
+	if len(endpoints) != 1 {
+		t.Fatalf("len(endpoints) = %d, want 1", len(endpoints))
+	}
+	if endpoints[0].TransportTable != "transport.inet.0" {
+		t.Fatalf("endpoint transport table = %q, want transport.inet.0", endpoints[0].TransportTable)
+	}
+	if endpoints[0].OuterFamily != "inet" {
+		t.Fatalf("endpoint outer family = %q, want inet", endpoints[0].OuterFamily)
+	}
+}
+
 func TestBuildLocalAddressEntries(t *testing.T) {
 	snapshot := &ConfigSnapshot{
 		Interfaces: []InterfaceSnapshot{

@@ -168,6 +168,8 @@ struct ConfigSnapshot {
     interfaces: Vec<InterfaceSnapshot>,
     #[serde(default)]
     fabrics: Vec<FabricSnapshot>,
+    #[serde(rename = "tunnel_endpoints", default)]
+    tunnel_endpoints: Vec<TunnelEndpointSnapshot>,
     #[serde(default)]
     neighbors: Vec<NeighborSnapshot>,
     #[serde(default)]
@@ -230,6 +232,38 @@ struct FabricSnapshot {
     local_mac: String,
     #[serde(rename = "peer_mac", default)]
     peer_mac: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct TunnelEndpointSnapshot {
+    #[serde(default)]
+    id: u16,
+    #[serde(default)]
+    interface: String,
+    #[serde(rename = "linux_name", default)]
+    linux_name: String,
+    #[serde(default)]
+    ifindex: i32,
+    #[serde(default)]
+    zone: String,
+    #[serde(rename = "redundancy_group", default)]
+    redundancy_group: i32,
+    #[serde(default)]
+    mtu: i32,
+    #[serde(default)]
+    mode: String,
+    #[serde(rename = "outer_family", default)]
+    outer_family: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    destination: String,
+    #[serde(default)]
+    key: u32,
+    #[serde(default)]
+    ttl: i32,
+    #[serde(rename = "transport_table", default)]
+    transport_table: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1658,6 +1692,7 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
                 local_ifindex: 0,
                 egress_ifindex: req.egress_ifindex,
                 tx_ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop,
                 neighbor_mac,
                 src_mac,
