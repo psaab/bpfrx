@@ -78,6 +78,16 @@ rg_primary_node() {
 	fi
 }
 
+primary_vm_for_rg() {
+	local rg="$1"
+	local primary=""
+	primary="$(rg_primary_node "$FW0" "$rg" || true)"
+	case "$primary" in
+	node0) printf '%s\n' "$FW0" ;;
+	node1) printf '%s\n' "$FW1" ;;
+	esac
+}
+
 ensure_preferred_active_node() {
 	local preferred_name="node0"
 	if [[ "$PREFERRED_ACTIVE_NODE" == "1" ]]; then
@@ -121,16 +131,13 @@ enabled_userspace_vm() {
 		grep -Eq 'Ready bindings:[[:space:]]+[1-9][0-9]*/[0-9]+' <<<"$stats"
 }
 
-wait_for_active_supported_runtime() {
+wait_for_userspace_vm() {
+	local vm="$1"
 	local tries=45
 	while (( tries > 0 )); do
-		local vm
-		for vm in "$FW0" "$FW1"; do
-			if enabled_userspace_vm "$vm" >/dev/null 2>&1; then
-				printf '%s\n' "$vm"
-				return 0
-			fi
-		done
+		if enabled_userspace_vm "$vm" >/dev/null 2>&1; then
+			return 0
+		fi
 		sleep 1
 		tries=$((tries - 1))
 	done
@@ -138,13 +145,20 @@ wait_for_active_supported_runtime() {
 }
 
 arm_supported_runtime() {
+	local primary_rg primary_vm
+	primary_rg="${PREFERRED_ACTIVE_RGS%% *}"
+	[[ -n "$primary_rg" ]] || die "no preferred active RG configured"
+	primary_vm="$(primary_vm_for_rg "$primary_rg")"
+	[[ -n "$primary_vm" ]] || die "failed to determine RG${primary_rg} primary VM"
 	info "waiting for userspace forwarding to arm"
-	if ACTIVE_FW="$(wait_for_active_supported_runtime)"; then
+	if wait_for_userspace_vm "$primary_vm"; then
+		ACTIVE_FW="$primary_vm"
 		info "active userspace firewall: ${ACTIVE_FW}"
 		return 0
 	fi
 	run_vm "$FW0" 'cli -c "request chassis cluster data-plane userspace forwarding arm" >/tmp/userspace-native-gre-arm.out'
-	ACTIVE_FW="$(wait_for_active_supported_runtime)" || die "userspace runtime did not arm"
+	wait_for_userspace_vm "$primary_vm" || die "userspace runtime did not arm on ${primary_vm}"
+	ACTIVE_FW="$primary_vm"
 	info "active userspace firewall: ${ACTIVE_FW}"
 }
 
@@ -164,7 +178,7 @@ wait_for_vm_cli "$FW1" || die "fw1 bpfrxd did not become reachable in time"
 ensure_preferred_active_node
 arm_supported_runtime
 
-OUTER_DEV="$(run_vm "$ACTIVE_FW" "ip -6 route get ${GRE_OUTER_REMOTE} 2>/dev/null | sed -n 's/.* dev \\([^ ]*\\) .*/\\1/p' | head -n 1")"
+OUTER_DEV="$(run_vm "$ACTIVE_FW" "set -- \$(ip -6 route get ${GRE_OUTER_REMOTE} 2>/dev/null); while (( \$# > 0 )); do if [[ \$1 == dev ]]; then printf '%s\n' \"\$2\"; break; fi; shift; done | head -n 1")"
 [[ -n "$OUTER_DEV" ]] || die "failed to derive outer device for ${GRE_OUTER_REMOTE}"
 run_vm "$ACTIVE_FW" "[ -d /sys/class/net/${GRE_LOGICAL_DEV} ]" >/dev/null 2>&1 || die "missing logical GRE device ${GRE_LOGICAL_DEV}"
 
