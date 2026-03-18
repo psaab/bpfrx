@@ -423,6 +423,31 @@ impl SessionTable {
         true
     }
 
+    pub fn refresh_local(
+        &mut self,
+        key: &SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        now_ns: u64,
+        tcp_flags: u8,
+    ) -> bool {
+        let Some(mut entry) = self.remove_entry(key) else {
+            return false;
+        };
+        if entry.metadata.synced {
+            self.sessions.insert(key.clone(), entry);
+            return false;
+        }
+        entry.decision = decision;
+        entry.metadata = metadata.clone();
+        entry.last_seen_ns = now_ns;
+        entry.expires_after_ns = session_timeout_ns(key.protocol, tcp_flags, &self.timeouts);
+        entry.closing = matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
+        self.sessions.insert(key.clone(), entry);
+        self.index_forward_nat_key(key, decision, &metadata);
+        true
+    }
+
     pub fn delete(&mut self, key: &SessionKey) {
         self.remove_entry(key);
     }

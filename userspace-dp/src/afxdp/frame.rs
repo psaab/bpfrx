@@ -1668,9 +1668,10 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
     let egress = forwarding
         .egress
         .get(&decision.resolution.egress_ifindex)
-        .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex))?;
+        .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex));
+    let Some(egress) = egress else { return None; };
     let mtu = egress.mtu.max(1280);
-    let l3 = frame_l3_offset(frame)?;
+    let Some(l3) = frame_l3_offset(frame) else { return None; };
     if l3 >= frame.len() {
         return None;
     }
@@ -1678,7 +1679,8 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
     if payload.len() <= mtu {
         return None;
     }
-    let tcp_offset = frame_l4_offset(frame, meta.addr_family)?.checked_sub(l3)?;
+    let Some(frame_l4) = frame_l4_offset(frame, meta.addr_family) else { return None; };
+    let Some(tcp_offset) = frame_l4.checked_sub(l3) else { return None; };
     let (ip_header_len, tcp_offset) = match meta.addr_family as i32 {
         libc::AF_INET => {
             if payload.len() < 20 {
@@ -1707,16 +1709,16 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
     if (tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_RST)) != 0 {
         return None;
     }
-    let segment_payload_max = mtu.checked_sub(ip_header_len + tcp_header_len)?;
+    let Some(segment_payload_max) = mtu.checked_sub(ip_header_len + tcp_header_len) else { return None; };
     if segment_payload_max == 0 {
         return None;
     }
-    let data = payload.get(tcp_offset + tcp_header_len..)?;
+    let Some(data) = payload.get(tcp_offset + tcp_header_len..) else { return None; };
     if data.len() <= segment_payload_max {
         return None;
     }
 
-    let dst_mac = decision.resolution.neighbor_mac?;
+    let Some(dst_mac) = decision.resolution.neighbor_mac else { return None; };
     let (src_mac, vlan_id, apply_nat) =
         if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
             (
@@ -1743,13 +1745,9 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
         *payload.get(tcp_offset + 6)?,
         *payload.get(tcp_offset + 7)?,
     ]);
-    let enforced_ports = expected_ports.or(live_frame_ports_bytes(
-        frame,
-        meta.addr_family,
-        meta.protocol,
-    ));
-    let tcp_header = payload.get(tcp_offset..tcp_offset + tcp_header_len)?;
-    let ip_header = payload.get(..ip_header_len)?;
+    let enforced_ports = expected_ports.or(live_frame_ports_bytes(frame, meta.addr_family, meta.protocol));
+    let Some(tcp_header) = payload.get(tcp_offset..tcp_offset + tcp_header_len) else { return None; };
+    let Some(ip_header) = payload.get(..ip_header_len) else { return None; };
     let mut out = Vec::with_capacity((data.len() / segment_payload_max) + 1);
     let mut data_offset = 0usize;
     while data_offset < data.len() {

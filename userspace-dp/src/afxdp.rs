@@ -160,6 +160,7 @@ const TCP_FLAG_FIN: u8 = 0x01;
 const TCP_FLAG_RST: u8 = 0x04;
 const TCP_FLAG_PSH: u8 = 0x08;
 const TCP_FLAG_SYN: u8 = 0x02;
+const TUNNEL_HA_STARTUP_GRACE_SECS: u64 = 10;
 const SOL_XDP: c_int = 283;
 const XDP_OPTIONS: c_int = 8;
 const XDP_OPTIONS_ZEROCOPY: u32 = 1;
@@ -757,6 +758,11 @@ impl Coordinator {
                 &activated_rgs,
                 now_secs,
             );
+            for handle in self.workers.values() {
+                if let Ok(mut pending) = handle.commands.lock() {
+                    pending.push_back(WorkerCommand::RefreshOwnerRGs(activated_rgs.clone()));
+                }
+            }
         }
     }
 
@@ -1644,6 +1650,7 @@ enum WorkerCommand {
     UpsertSynced(SyncedSessionEntry),
     DeleteSynced(SessionKey),
     DemoteOwnerRG(i32),
+    RefreshOwnerRGs(Vec<i32>),
 }
 
 impl BindingWorker {
@@ -1957,6 +1964,7 @@ fn poll_binding(
     validation: ValidationState,
     now_ns: u64,
     now_secs: u64,
+    ha_startup_grace_until_secs: u64,
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
@@ -2392,6 +2400,7 @@ fn poll_binding(
                             meta.protocol,
                             meta.tcp_flags,
                             meta.ingress_ifindex as i32,
+                            ha_startup_grace_until_secs,
                         ) {
                             counters.session_hits += 1;
                             dbg.session_hit += 1;
@@ -3065,6 +3074,7 @@ fn poll_binding(
                                             from_zone_arc.as_ref(),
                                             fabric_ingress,
                                             now_secs,
+                                            false,
                                         );
                                         // Install the reverse entry even if the initial reply-side
                                         // resolution is not immediately usable. On live traffic the
@@ -4351,6 +4361,8 @@ fn worker_loop(
     poll_mode: crate::PollMode,
 ) {
     pin_current_thread(worker_id);
+    let ha_startup_grace_until_secs = (monotonic_nanos() / 1_000_000_000)
+        .saturating_add(TUNNEL_HA_STARTUP_GRACE_SECS);
     let mut sessions = SessionTable::new();
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
@@ -4498,7 +4510,9 @@ fn worker_loop(
             &commands,
             &mut sessions,
             session_map_fd,
+            &forwarding,
             ha_runtime.as_ref(),
+            &dynamic_neighbors,
         );
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
         let expired_entries = sessions.expire_stale_entries(loop_now_ns);
@@ -4536,6 +4550,7 @@ fn worker_loop(
                 validation,
                 loop_now_ns,
                 loop_now_secs,
+                ha_startup_grace_until_secs,
                 &forwarding,
                 ha_runtime.as_ref(),
                 &dynamic_neighbors,
@@ -9480,6 +9495,68 @@ mod tests {
     }
 
     #[test]
+    fn build_forwarded_frame_from_frame_encapsulates_native_gre_after_ipv4_snat() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let inner = build_icmp_echo_frame_v4(
+            Ipv4Addr::new(10, 0, 61, 102),
+            Ipv4Addr::new(10, 255, 192, 41),
+            64,
+        );
+        let inner_meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 42,
+            pkt_len: (inner.len() - 14) as u16,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            flow_src_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&[10, 0, 61, 102]);
+                addr
+            },
+            flow_dst_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&[10, 255, 192, 41]);
+                addr
+            },
+            flow_src_port: 0x1234,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: lookup_forwarding_resolution_v4(
+                &state,
+                None,
+                Ipv4Addr::new(10, 255, 192, 41),
+                "sfmix.inet.0",
+                0,
+                true,
+            ),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(10, 255, 192, 42))),
+                ..NatDecision::default()
+            },
+        };
+        let built = build_forwarded_frame_from_frame(
+            &inner,
+            inner_meta,
+            &decision,
+            &state,
+            false,
+            Some((0x1234, 0)),
+        )
+        .expect("encapsulated native gre frame with snat");
+        assert_eq!(&built[12..16], &[0x81, 0x00, 0x00, 0x50]);
+        assert_eq!(&built[16..18], &[0x86, 0xdd]);
+        assert_eq!(built[24], PROTO_GRE);
+        assert_eq!(&built[74..78], &[10, 255, 192, 42]);
+        assert_eq!(&built[78..82], &[10, 255, 192, 41]);
+    }
+
+    #[test]
     fn ha_resolution_blocks_inactive_owner_rg() {
         let state = build_forwarding_state(&nat_snapshot());
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
@@ -9718,6 +9795,7 @@ mod tests {
             "lan",
             true,
             monotonic_nanos() / 1_000_000_000,
+            false,
         );
 
         assert_eq!(
@@ -9749,6 +9827,7 @@ mod tests {
             "lan",
             true,
             monotonic_nanos() / 1_000_000_000,
+            false,
         );
 
         assert_eq!(resolved.disposition, ForwardingDisposition::FabricRedirect);
@@ -9847,6 +9926,7 @@ mod tests {
             "wan",
             false,
             monotonic_nanos() / 1_000_000_000,
+            false,
         );
 
         assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
@@ -9869,6 +9949,7 @@ mod tests {
             "wan",
             false,
             monotonic_nanos() / 1_000_000_000,
+            false,
         );
 
         assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
@@ -13440,6 +13521,129 @@ mod tests {
             let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
             assert_eq!(seq, expected_seq);
             let seg_payload = seg.len() - 18 - 20 - tcp_header_len;
+            total_payload += seg_payload;
+            expected_seq = expected_seq.wrapping_add(seg_payload as u32);
+        }
+        assert_eq!(total_payload, tcp_payload_len);
+    }
+
+    #[test]
+    fn segment_forwarded_tcp_frames_keeps_ipv4_snat_inside_native_gre() {
+        let src_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let dst_ip = Ipv4Addr::new(10, 255, 192, 41);
+        let snat_ip = Ipv4Addr::new(10, 255, 192, 42);
+        let src_port = 47308u16;
+        let dst_port = 5201u16;
+        let tcp_payload_len = 30_408usize;
+        let tcp_header_len = 32usize;
+        let total_len = (20 + tcp_header_len + tcp_payload_len) as u16;
+
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45,
+            0x00,
+            (total_len >> 8) as u8,
+            total_len as u8,
+            0xd1,
+            0x43,
+            0x40,
+            0x00,
+            64,
+            PROTO_TCP,
+            0x00,
+            0x00,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x52, 0x04, 0xc1, 0xa3, 0x73, 0x7f, 0x63, 0x1c, 0x80, 0x10, 0x00, 0x3f, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x01, 0x08, 0x0a, 0x91, 0x9b, 0x0d, 0x5f, 0xd3, 0x53, 0x0f, 0x7f,
+        ]);
+        frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+
+        let mut area = MmapArea::new(65_536).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            flow_src_port: 1041,
+            flow_dst_port: dst_port,
+            ..UserspaceDpMeta::default()
+        };
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let decision = SessionDecision {
+            resolution: lookup_forwarding_resolution_v4(
+                &state,
+                None,
+                dst_ip,
+                "sfmix.inet.0",
+                0,
+                true,
+            ),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                ..NatDecision::default()
+            },
+        };
+
+        let segments = segment_forwarded_tcp_frames(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &decision,
+            &state,
+            Some((src_port, dst_port)),
+        )
+        .expect("segmented native gre");
+        assert!(segments.len() > 1);
+        let outer_eth_len = 18usize;
+        let outer_ip_len = 40usize;
+        let gre_len = 4usize;
+        let inner_start = outer_eth_len + outer_ip_len + gre_len;
+        let mut total_payload = 0usize;
+        let mut expected_seq = 0x5204c1a3u32;
+        for seg in &segments {
+            assert_eq!(&seg[16..18], &[0x86, 0xdd]);
+            assert_eq!(seg[24], PROTO_GRE);
+            let inner = &seg[inner_start..];
+            assert_eq!(&inner[12..16], &snat_ip.octets());
+            assert_eq!(&inner[16..20], &dst_ip.octets());
+            assert!(tcp_checksum_ok_ipv4(inner));
+            let tcp = &inner[20..];
+            assert_eq!(
+                (
+                    u16::from_be_bytes([tcp[0], tcp[1]]),
+                    u16::from_be_bytes([tcp[2], tcp[3]])
+                ),
+                (src_port, dst_port)
+            );
+            let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+            assert_eq!(seq, expected_seq);
+            let seg_payload = inner.len() - 20 - tcp_header_len;
             total_payload += seg_payload;
             expected_seq = expected_seq.wrapping_add(seg_payload as u32);
         }

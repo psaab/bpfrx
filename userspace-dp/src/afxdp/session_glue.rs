@@ -144,11 +144,45 @@ pub(super) fn owner_rg_is_locally_active(
         )
 }
 
+fn owner_rg_is_unseeded(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    resolution: ForwardingResolution,
+) -> bool {
+    let owner_rg_id = owner_rg_for_flow(forwarding, resolution.egress_ifindex);
+    owner_rg_id > 0
+        && matches!(
+            ha_state.get(&owner_rg_id),
+            None | Some(HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: 0,
+            })
+        )
+}
+
+fn should_bypass_unseeded_tunnel_ha(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    resolution: ForwardingResolution,
+    ingress_ifindex: i32,
+    ha_startup_grace_until_secs: u64,
+) -> bool {
+    resolution.disposition == ForwardingDisposition::ForwardCandidate
+        && now_secs <= ha_startup_grace_until_secs
+        && forwarding
+            .tunnel_endpoint_by_ifindex
+            .contains_key(&ingress_ifindex)
+        && owner_rg_is_unseeded(forwarding, ha_state, resolution)
+}
+
 pub(super) fn apply_worker_commands(
     commands: &Arc<Mutex<VecDeque<WorkerCommand>>>,
     sessions: &mut SessionTable,
     session_map_fd: c_int,
+    forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
 ) {
     // Hot path: try_lock avoids blocking on the mutex when another thread
     // holds it (rare) and avoids the cost of lock+unlock on empty queues
@@ -168,6 +202,18 @@ pub(super) fn apply_worker_commands(
         match cmd {
             WorkerCommand::DemoteOwnerRG(owner_rg_id) => {
                 sessions.demote_owner_rg(owner_rg_id);
+            }
+            WorkerCommand::RefreshOwnerRGs(owner_rgs) => {
+                refresh_live_reverse_sessions_for_owner_rgs(
+                    sessions,
+                    session_map_fd,
+                    forwarding,
+                    ha_state,
+                    dynamic_neighbors,
+                    &owner_rgs,
+                    now_ns,
+                    now_secs,
+                );
             }
             WorkerCommand::UpsertSynced(entry) => {
                 let key = entry.key.clone();
@@ -333,6 +379,66 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
             if let Ok(mut pending) = commands.lock() {
                 pending.push_back(WorkerCommand::UpsertSynced(reverse.clone()));
             }
+        }
+    }
+}
+
+pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
+    sessions: &mut SessionTable,
+    session_map_fd: c_int,
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    owner_rgs: &[i32],
+    now_ns: u64,
+    now_secs: u64,
+) {
+    if owner_rgs.is_empty() {
+        return;
+    }
+    let candidates = {
+        let mut out = Vec::new();
+        sessions.iter(|key, decision, metadata| {
+            if metadata.synced || !metadata.is_reverse {
+                return;
+            }
+            out.push((key.clone(), decision, metadata.clone()));
+        });
+        out
+    };
+    for (key, decision, metadata) in candidates {
+        let flow = SessionFlow {
+            src_ip: key.src_ip,
+            dst_ip: key.dst_ip,
+            forward_key: key.clone(),
+        };
+        let looked_up =
+            lookup_forwarding_resolution_for_session(forwarding, dynamic_neighbors, &flow, decision);
+        let refreshed_resolution =
+            enforce_session_ha_resolution(forwarding, ha_state, now_secs, looked_up, 0, 0);
+        let refreshed_owner_rg = owner_rg_for_flow(forwarding, refreshed_resolution.egress_ifindex);
+        if !owner_rgs.contains(&refreshed_owner_rg)
+            && !owner_rgs.contains(&metadata.owner_rg_id)
+            && refreshed_resolution == decision.resolution
+            && refreshed_owner_rg == metadata.owner_rg_id
+        {
+            continue;
+        }
+        let refreshed_decision = SessionDecision {
+            resolution: refreshed_resolution,
+            ..decision
+        };
+        let refreshed_metadata = SessionMetadata {
+            owner_rg_id: refreshed_owner_rg,
+            ..metadata
+        };
+        if sessions.refresh_local(&key, refreshed_decision, refreshed_metadata.clone(), now_ns, 0) {
+            let _ = publish_session_map_entry_for_session(
+                session_map_fd,
+                &key,
+                refreshed_decision,
+                &refreshed_metadata,
+            );
         }
     }
 }
@@ -670,6 +776,7 @@ fn build_reverse_session_from_forward_match(
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     forward_match: ForwardSessionMatch,
     now_secs: u64,
+    ha_startup_grace_until_secs: u64,
 ) -> SessionLookup {
     let resolution = reverse_resolution_for_session(
         forwarding,
@@ -679,6 +786,8 @@ fn build_reverse_session_from_forward_match(
         forward_match.metadata.ingress_zone.as_ref(),
         forward_match.metadata.fabric_ingress,
         now_secs,
+        forward_match.decision.resolution.tunnel_endpoint_id != 0
+            && now_secs <= ha_startup_grace_until_secs,
     );
     let decision = SessionDecision {
         resolution,
@@ -727,6 +836,7 @@ pub(super) fn synthesized_synced_reverse_entry(
             metadata: entry.metadata.clone(),
         },
         now_secs,
+        0,
     );
     let mut metadata = reverse.metadata;
     metadata.synced = true;
@@ -747,6 +857,7 @@ pub(super) fn reverse_resolution_for_session(
     ingress_zone: &str,
     fabric_ingress: bool,
     now_secs: u64,
+    allow_unseeded_tunnel_local: bool,
 ) -> ForwardingResolution {
     if let Some(local) = super::interface_nat_local_resolution(forwarding, target_ip) {
         return local;
@@ -768,7 +879,14 @@ pub(super) fn reverse_resolution_for_session(
     {
         return redirect;
     }
-    enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, resolved)
+    let enforced = enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, resolved);
+    if allow_unseeded_tunnel_local
+        && enforced.disposition == ForwardingDisposition::HAInactive
+        && owner_rg_is_unseeded(forwarding, ha_state, resolved)
+    {
+        return resolved;
+    }
+    enforced
 }
 
 fn install_reverse_session_from_forward_match(
@@ -785,6 +903,7 @@ fn install_reverse_session_from_forward_match(
     forward_match: ForwardSessionMatch,
     now_ns: u64,
     now_secs: u64,
+    ha_startup_grace_until_secs: u64,
     protocol: u8,
     tcp_flags: u8,
 ) -> SessionLookup {
@@ -794,6 +913,7 @@ fn install_reverse_session_from_forward_match(
         dynamic_neighbors,
         forward_match,
         now_secs,
+        ha_startup_grace_until_secs,
     );
     if sessions.install_with_protocol(
         reverse_key.clone(),
@@ -884,6 +1004,7 @@ pub(super) fn resolve_flow_session_decision(
     protocol: u8,
     tcp_flags: u8,
     ingress_ifindex: i32,
+    ha_startup_grace_until_secs: u64,
 ) -> Option<ResolvedFlowSessionDecision> {
     if let Some(mut hit) = lookup_session_across_scopes(
         sessions,
@@ -896,20 +1017,19 @@ pub(super) fn resolve_flow_session_decision(
         let resolved = materialize_shared_session_hit(sessions, &mut hit, now_ns, tcp_flags);
         let resolved_key = hit.key.as_ref(&flow.forward_key);
         let mut decision = resolved.decision;
+        let looked_up_resolution =
+            lookup_forwarding_resolution_for_session(forwarding, dynamic_neighbors, flow, decision);
+        let enforced_resolution = enforce_session_ha_resolution(
+            forwarding,
+            ha_state,
+            now_secs,
+            looked_up_resolution,
+            ingress_ifindex,
+            ha_startup_grace_until_secs,
+        );
         decision.resolution = redirect_session_via_fabric_if_needed(
             forwarding,
-            enforce_session_ha_resolution(
-                forwarding,
-                ha_state,
-                now_secs,
-                lookup_forwarding_resolution_for_session(
-                    forwarding,
-                    dynamic_neighbors,
-                    flow,
-                    decision,
-                ),
-                ingress_ifindex,
-            ),
+            enforced_resolution,
             ingress_ifindex,
             resolved.metadata.ingress_zone.as_ref(),
         );
@@ -937,7 +1057,7 @@ pub(super) fn resolve_flow_session_decision(
 
     let forward_match =
         lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &flow.forward_key)?;
-    let resolved = install_reverse_session_from_forward_match(
+        let resolved = install_reverse_session_from_forward_match(
         sessions,
         session_map_fd,
         shared_sessions,
@@ -947,13 +1067,14 @@ pub(super) fn resolve_flow_session_decision(
         forwarding,
         ha_state,
         dynamic_neighbors,
-        &flow.forward_key,
-        forward_match,
-        now_ns,
-        now_secs,
-        protocol,
-        tcp_flags,
-    );
+            &flow.forward_key,
+            forward_match,
+            now_ns,
+            now_secs,
+            ha_startup_grace_until_secs,
+            protocol,
+            tcp_flags,
+        );
 
     let mut decision = resolved.decision;
     decision.resolution = redirect_session_via_fabric_if_needed(
@@ -964,6 +1085,7 @@ pub(super) fn resolve_flow_session_decision(
             now_secs,
             lookup_forwarding_resolution_for_session(forwarding, dynamic_neighbors, flow, decision),
             ingress_ifindex,
+            ha_startup_grace_until_secs,
         ),
         ingress_ifindex,
         resolved.metadata.ingress_zone.as_ref(),
@@ -1013,10 +1135,23 @@ fn enforce_session_ha_resolution(
     now_secs: u64,
     resolution: ForwardingResolution,
     ingress_ifindex: i32,
+    ha_startup_grace_until_secs: u64,
 ) -> ForwardingResolution {
     let enforced = enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, resolution);
     if enforced.disposition == ForwardingDisposition::HAInactive
         && ingress_is_fabric(forwarding, ingress_ifindex)
+    {
+        return resolution;
+    }
+    if enforced.disposition == ForwardingDisposition::HAInactive
+        && should_bypass_unseeded_tunnel_ha(
+            forwarding,
+            ha_state,
+            now_secs,
+            resolution,
+            ingress_ifindex,
+            ha_startup_grace_until_secs,
+        )
     {
         return resolution;
     }
@@ -1191,6 +1326,12 @@ mod tests {
                 primary_v6: None,
             },
         );
+        forwarding
+    }
+
+    fn test_forwarding_state_split_rgs_with_tunnel() -> ForwardingState {
+        let mut forwarding = test_forwarding_state_split_rgs();
+        forwarding.tunnel_endpoint_by_ifindex.insert(586, 1);
         forwarding
     }
 
@@ -1510,6 +1651,7 @@ mod tests {
             PROTO_TCP,
             0x10,
             0,
+            0,
         )
         .expect("translated forward hit should resolve");
 
@@ -1567,8 +1709,17 @@ mod tests {
                 watchdog_timestamp: 0,
             },
         );
+        let forwarding = test_forwarding_state();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
 
-        apply_worker_commands(&commands, &mut sessions, -1, &ha_state);
+        apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+        );
 
         let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("synced hit");
         assert_eq!(hit.metadata, synced_metadata);
@@ -1619,8 +1770,17 @@ mod tests {
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
             },
         );
+        let forwarding = test_forwarding_state();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
 
-        apply_worker_commands(&commands, &mut sessions, -1, &ha_state);
+        apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+        );
 
         let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("live hit");
         assert_eq!(hit.metadata, live_metadata);
@@ -1646,15 +1806,24 @@ mod tests {
             .lock()
             .expect("commands lock")
             .push_back(WorkerCommand::DemoteOwnerRG(1));
+        let forwarding = test_forwarding_state();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
 
-        apply_worker_commands(&commands, &mut sessions, -1, &BTreeMap::new());
+        apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            &forwarding,
+            &BTreeMap::new(),
+            &dynamic_neighbors,
+        );
 
         let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("demoted hit");
         assert!(hit.metadata.synced);
     }
 
     #[test]
-    fn apply_worker_commands_drops_reverse_local_sessions_for_owner_rg() {
+    fn apply_worker_commands_marks_reverse_local_sessions_synced_for_owner_rg() {
         let commands = Arc::new(Mutex::new(VecDeque::new()));
         let mut sessions = SessionTable::new();
         let mut key = test_key();
@@ -1675,10 +1844,95 @@ mod tests {
             .lock()
             .expect("commands lock")
             .push_back(WorkerCommand::DemoteOwnerRG(1));
+        let forwarding = test_forwarding_state();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
 
-        apply_worker_commands(&commands, &mut sessions, -1, &BTreeMap::new());
+        apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            &forwarding,
+            &BTreeMap::new(),
+            &dynamic_neighbors,
+        );
 
-        assert!(sessions.lookup(&key, 2_000_000, 0x10).is_none());
+        let hit = sessions
+            .lookup(&key, 2_000_000, 0x10)
+            .expect("demoted reverse hit");
+        assert!(hit.metadata.synced);
+    }
+
+    #[test]
+    fn apply_worker_commands_refreshes_live_reverse_sessions_for_activated_owner_rg() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sessions = SessionTable::new();
+        let key = SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            src_port: 5201,
+            dst_port: 42424,
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::HAInactive,
+                local_ifindex: 0,
+                egress_ifindex: 6,
+                tx_ifindex: 6,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                neighbor_mac: Some([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]),
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+        let metadata = SessionMetadata {
+            ingress_zone: Arc::<str>::from("wan"),
+            egress_zone: Arc::<str>::from("lan"),
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: true,
+            synced: false,
+            nat64_reverse: None,
+        };
+        assert!(sessions.install_with_protocol(
+            key.clone(),
+            decision,
+            metadata,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        commands
+            .lock()
+            .expect("commands lock")
+            .push_back(WorkerCommand::RefreshOwnerRGs(vec![1]));
+        let forwarding = test_forwarding_state();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        );
+
+        apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+        );
+
+        let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("refreshed reverse hit");
+        assert_eq!(hit.decision.resolution.disposition, ForwardingDisposition::ForwardCandidate);
+        assert_eq!(hit.decision.resolution.egress_ifindex, 6);
+        assert_eq!(hit.metadata.owner_rg_id, 1);
     }
 
     #[test]
@@ -1871,12 +2125,110 @@ mod tests {
                 tx_vlan_id: 0,
             },
             21,
+            0,
         );
         assert_eq!(
             resolved.disposition,
             ForwardingDisposition::ForwardCandidate
         );
         assert_eq!(resolved.egress_ifindex, 6);
+    }
+
+    #[test]
+    fn tunnel_ingress_session_hit_bypasses_unseeded_ha_during_startup_grace() {
+        let forwarding = test_forwarding_state_split_rgs_with_tunnel();
+        let ha_state = BTreeMap::from([(
+            2,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: 0,
+            },
+        )]);
+        let resolved = enforce_session_ha_resolution(
+            &forwarding,
+            &ha_state,
+            100,
+            ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 6,
+                tx_ifindex: 6,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                neighbor_mac: Some([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]),
+                tx_vlan_id: 0,
+            },
+            586,
+            110,
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(resolved.egress_ifindex, 6);
+    }
+
+    #[test]
+    fn reverse_session_from_tunnel_forward_bypasses_unseeded_ha_during_startup_grace() {
+        let forwarding = test_forwarding_state_split_rgs_with_tunnel();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let ha_state = BTreeMap::from([(
+            2,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: 0,
+            },
+        )]);
+        let reverse = build_reverse_session_from_forward_match(
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+            ForwardSessionMatch {
+                key: SessionKey {
+                    addr_family: libc::AF_INET as u8,
+                    protocol: PROTO_TCP,
+                    src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+                    dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+                    src_port: 42424,
+                    dst_port: 5201,
+                },
+                decision: SessionDecision {
+                    resolution: ForwardingResolution {
+                        disposition: ForwardingDisposition::ForwardCandidate,
+                        local_ifindex: 0,
+                        egress_ifindex: 12,
+                        tx_ifindex: 12,
+                        tunnel_endpoint_id: 1,
+                        next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41))),
+                        neighbor_mac: Some([0xde, 0xad, 0xbe, 0xef, 0x00, 0x02]),
+                        src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                        tx_vlan_id: 80,
+                    },
+                    nat: NatDecision {
+                        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(10, 255, 192, 42))),
+                        ..NatDecision::default()
+                    },
+                },
+                metadata: SessionMetadata {
+                    ingress_zone: Arc::<str>::from("lan"),
+                    egress_zone: Arc::<str>::from("sfmix"),
+                    owner_rg_id: 2,
+                    fabric_ingress: false,
+                    is_reverse: false,
+                    synced: false,
+                    nat64_reverse: None,
+                },
+            },
+            100,
+            110,
+        );
+        assert_eq!(
+            reverse.decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(reverse.decision.resolution.egress_ifindex, 6);
+        assert_eq!(reverse.metadata.owner_rg_id, 2);
     }
 
     #[test]
