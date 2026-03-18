@@ -1667,12 +1667,20 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
     if meta.protocol != PROTO_TCP {
         return None;
     }
-    let egress = forwarding
-        .egress
-        .get(&decision.resolution.egress_ifindex)
-        .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex));
-    let Some(egress) = egress else { return None; };
-    let mtu = egress.mtu.max(1280);
+    let mtu = if decision.resolution.tunnel_endpoint_id != 0 {
+        native_gre_inner_mtu(forwarding, decision)
+    } else {
+        forwarding
+            .egress
+            .get(&decision.resolution.egress_ifindex)
+            .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex))
+            .map(|egress| egress.mtu)
+            .unwrap_or_default()
+    }
+    .max(1280);
+    if mtu == 0 {
+        return None;
+    }
     let Some(l3) = frame_l3_offset(frame) else { return None; };
     if l3 >= frame.len() {
         return None;

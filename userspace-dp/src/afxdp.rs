@@ -6322,6 +6322,47 @@ fn effective_tcp_mss(forwarding: &ForwardingState) -> u16 {
     0
 }
 
+fn native_gre_inner_mtu(
+    forwarding: &ForwardingState,
+    decision: &SessionDecision,
+) -> usize {
+    if decision.resolution.tunnel_endpoint_id == 0 {
+        return 0;
+    }
+    let Some(endpoint) = forwarding
+        .tunnel_endpoints
+        .get(&decision.resolution.tunnel_endpoint_id)
+        .cloned()
+    else {
+        return 0;
+    };
+    let transport_ifindex = resolve_ingress_logical_ifindex(
+        forwarding,
+        decision.resolution.tx_ifindex,
+        decision.resolution.tx_vlan_id,
+    )
+    .unwrap_or(decision.resolution.tx_ifindex);
+    let transport_mtu = forwarding
+        .egress
+        .get(&transport_ifindex)
+        .or_else(|| forwarding.egress.get(&decision.resolution.egress_ifindex))
+        .or_else(|| forwarding.egress.get(&endpoint.logical_ifindex))
+        .map(|egress| egress.mtu)
+        .unwrap_or_default();
+    if transport_mtu == 0 {
+        return 0;
+    }
+    let outer_ip_header_len = match endpoint.outer_family {
+        libc::AF_INET => 20usize,
+        libc::AF_INET6 => 40usize,
+        _ => return 0,
+    };
+    let gre_header_len = 4usize + if endpoint.key != 0 { 4 } else { 0 };
+    transport_mtu
+        .checked_sub(outer_ip_header_len + gre_header_len)
+        .unwrap_or_default()
+}
+
 fn native_gre_tcp_mss(
     forwarding: &ForwardingState,
     decision: &SessionDecision,
@@ -6333,47 +6374,16 @@ fn native_gre_tcp_mss(
     if forwarding.tcp_mss_gre_out > 0 {
         return forwarding.tcp_mss_gre_out;
     }
-    let endpoint = forwarding
-        .tunnel_endpoints
-        .get(&decision.resolution.tunnel_endpoint_id)
-        .cloned();
-    let transport_ifindex = resolve_ingress_logical_ifindex(
-        forwarding,
-        decision.resolution.tx_ifindex,
-        decision.resolution.tx_vlan_id,
-    )
-    .unwrap_or(decision.resolution.tx_ifindex);
-    let mtu = forwarding
-        .egress
-        .get(&transport_ifindex)
-        .or_else(|| forwarding.egress.get(&decision.resolution.egress_ifindex))
-        .or_else(|| {
-            endpoint
-                .as_ref()
-                .and_then(|endpoint| forwarding.egress.get(&endpoint.logical_ifindex))
-        })
-        .map(|egress| egress.mtu)
-        .unwrap_or_default();
+    let mtu = native_gre_inner_mtu(forwarding, decision);
     if mtu == 0 {
         return 0;
     }
-    let outer_ip_header_len = match endpoint.as_ref().map(|endpoint| endpoint.outer_family) {
-        Some(libc::AF_INET) => 20usize,
-        Some(libc::AF_INET6) => 40usize,
-        _ => 0,
-    };
-    let gre_header_len = 4usize
-        + endpoint
-            .as_ref()
-            .map(|endpoint| if endpoint.key != 0 { 4 } else { 0 })
-            .unwrap_or(0);
     let ip_header_len = match addr_family as i32 {
         libc::AF_INET => 20usize,
         libc::AF_INET6 => 40usize,
         _ => return 0,
     };
-    let total_overhead = outer_ip_header_len + gre_header_len + ip_header_len + 20;
-    let Some(max_mss) = mtu.checked_sub(total_overhead) else {
+    let Some(max_mss) = mtu.checked_sub(ip_header_len + 20) else {
         return 0;
     };
     u16::try_from(max_mss).unwrap_or_default()
@@ -13860,10 +13870,17 @@ mod tests {
         let outer_eth_len = 18usize;
         let outer_ip_len = 40usize;
         let gre_len = 4usize;
+        let transport_mtu = 1500usize;
         let inner_start = outer_eth_len + outer_ip_len + gre_len;
         let mut total_payload = 0usize;
         let mut expected_seq = 0x5204c1a3u32;
         for seg in &segments {
+            assert!(seg.len() >= outer_eth_len);
+            assert!(
+                seg.len() - outer_eth_len <= transport_mtu,
+                "native GRE segment exceeds transport MTU: {}",
+                seg.len() - outer_eth_len
+            );
             assert_eq!(&seg[16..18], &[0x86, 0xdd]);
             assert_eq!(seg[24], PROTO_GRE);
             let inner = &seg[inner_start..];
