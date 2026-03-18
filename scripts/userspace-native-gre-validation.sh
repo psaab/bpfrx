@@ -191,6 +191,29 @@ fi
 
 wait_for_vm_cli "$FW0" || die "fw0 bpfrxd did not become reachable in time"
 wait_for_vm_cli "$FW1" || die "fw1 bpfrxd did not become reachable in time"
+wait_for_cluster_primary() {
+	local rg="$1"
+	local tries=60
+	while (( tries > 0 )); do
+		if cluster_rg_primary_node "$rg" >/dev/null 2>&1; then
+			return 0
+		fi
+		sleep 1
+		tries=$((tries - 1))
+	done
+	return 1
+}
+
+wait_for_cluster_settle() {
+	info "waiting for cluster primaries to settle"
+	for rg in $PREFERRED_ACTIVE_RGS; do
+		wait_for_cluster_primary "$rg" || die "RG${rg} did not elect a primary after deploy"
+	done
+}
+
+if (( DEPLOY == 1 )); then
+	wait_for_cluster_settle
+fi
 ensure_preferred_active_node
 arm_supported_runtime
 
@@ -229,3 +252,11 @@ printf 'outer_dev=%s outer_rx_delta=%d outer_tx_delta=%d logical_dev=%s logical_
 (( logical_tx_delta == 0 )) || die "logical GRE device ${GRE_LOGICAL_DEV} still transmitted transit packets"
 
 pass "native GRE transit stayed on ${OUTER_DEV} and off ${GRE_LOGICAL_DEV}"
+
+info "running firewall-originated GRE probe from ${ACTIVE_FW}"
+run_vm "$ACTIVE_FW" "ping -c ${PING_COUNT} -W 1 ${GRE_TARGET} >/tmp/userspace-native-gre-host-ping.out 2>&1 || true"
+host_ping_output="$(run_vm "$ACTIVE_FW" 'cat /tmp/userspace-native-gre-host-ping.out')"
+printf '%s\n' "$host_ping_output"
+grep -q 'bytes from' <<<"$host_ping_output" || die "firewall-originated GRE ping failed"
+
+pass "native GRE host/control-plane traffic still works on ${ACTIVE_FW}"
