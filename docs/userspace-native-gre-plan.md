@@ -38,19 +38,23 @@ Validated on the native GRE branch:
 - firewall-originated host/control-plane GRE ping still works
 - active GRE failover from `node1 -> node0` now recovers and passes the native
   GRE validator tail gate
+- active GRE failover from `node0 -> node1` now recovers and passes the native
+  GRE validator tail gate
+- clean bidirectional failover validation on the isolated userspace cluster:
+  - `PREFERRED_ACTIVE_NODE=0 ... --deploy --failover --count 3`: pass
+  - `PREFERRED_ACTIVE_NODE=1 ... --failover --count 3`: pass
 
 Still required for full migration parity:
 
-- symmetric failover/failback validation for active tunnel sessions
 - explicit TCP/UDP/native-GRE throughput validation, not only ICMP transit
 - final cleanup of remaining hybrid tunnel assumptions outside transit forwarding
 
 Current blocker:
 
-- failback `node0 -> node1` is still lossy during the transition window
-- the remaining live signal is post-NAT `sfmix -> lan` traffic arriving on
-  fabric ingress during failback and still hitting `ha_inactive` handling on the
-  inactive node before the new owner fully absorbs the flow
+- transport/performance validation beyond ICMP is still thin
+- the branch proves native GRE transit, reverse-NAT, and failover/failback for
+  active ICMP sessions, but it does not yet have the same TCP/UDP/perf evidence
+  as the main HA validation workflow
 
 ## Why This Is Necessary
 
@@ -414,8 +418,9 @@ Current state:
 
 - PBR-based tunnel selection: done
 - isolated-cluster ICMP transit + dataplane-idle `gr-0-0-0`: done
-- failover/failback and host/control-plane validation: blocked on the existing
-  post-deploy `fabric_fwd` readiness regression
+- failover/failback and host/control-plane validation: done on the isolated
+  userspace cluster
+- remaining work: TCP/UDP throughput and traceroute-style tunnel validation
 
 ## Validation Plan
 
