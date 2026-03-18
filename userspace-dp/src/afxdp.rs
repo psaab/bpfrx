@@ -3952,24 +3952,6 @@ fn binding_by_index_mut<'a>(
     right.get_mut(target_index.saturating_sub(current_index + 1))
 }
 
-fn find_target_binding_mut<'a>(
-    left: &'a mut [BindingWorker],
-    current_index: usize,
-    ingress_binding: &'a mut BindingWorker,
-    ingress_queue_id: u32,
-    right: &'a mut [BindingWorker],
-    binding_lookup: &WorkerBindingLookup,
-    egress_ifindex: i32,
-) -> Option<&'a mut BindingWorker> {
-    let target_index = binding_lookup.target_index(
-        current_index,
-        ingress_binding.ifindex,
-        ingress_queue_id,
-        egress_ifindex,
-    )?;
-    binding_by_index_mut(left, current_index, ingress_binding, right, target_index)
-}
-
 fn purge_queued_flows_for_closed_deltas(bindings: &mut [BindingWorker], deltas: &[SessionDelta]) {
     for delta in deltas {
         if delta.kind != SessionDeltaKind::Close {
