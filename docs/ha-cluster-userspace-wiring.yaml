@@ -69,6 +69,13 @@ instances:
             vlan_id: 80
             ipv4: 172.16.80.8/24
             ipv6: 2001:559:8585:80::8/64
+      sfmix_tunnel:
+        guest_runtime_name: gr-0-0-0
+        junos_name: gr-0/0/0.0
+        zone: sfmix
+        source_ipv6: 2001:559:8585:80::8
+        destination_ipv6: 2602:ffd3:0:2::7
+        inner_ipv4: 10.255.192.42/30
       lan_vf:
         incus_device: lan-vf
         attach_mode: pci
@@ -142,6 +149,13 @@ instances:
             vlan_id: 80
             ipv4: 172.16.80.8/24
             ipv6: 2001:559:8585:80::8/64
+      sfmix_tunnel:
+        guest_runtime_name: gr-0-0-0
+        junos_name: gr-0/0/0.0
+        zone: sfmix
+        source_ipv6: 2001:559:8585:80::8
+        destination_ipv6: 2602:ffd3:0:2::7
+        inner_ipv4: 10.255.192.42/30
       lan_vf:
         incus_device: lan-vf
         attach_mode: pci
@@ -188,6 +202,9 @@ zones:
     interfaces:
       - reth0.50
       - reth0.80
+  sfmix:
+    interfaces:
+      - gr-0/0/0.0
   lan:
     interfaces:
       - reth1.0
