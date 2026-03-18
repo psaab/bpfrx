@@ -7,6 +7,8 @@ ENV_FILE="${BPFRX_CLUSTER_ENV:-${PROJECT_ROOT}/test/incus/loss-userspace-cluster
 DEPLOY=0
 FAILOVER=0
 GRE_TARGET="${GRE_TARGET:-10.255.192.41}"
+GRE_TCP_TARGET="${GRE_TCP_TARGET:-${GRE_TARGET}}"
+GRE_TCP_PORT="${GRE_TCP_PORT:-22}"
 GRE_OUTER_REMOTE="${GRE_OUTER_REMOTE:-2602:ffd3:0:2::7}"
 GRE_LOGICAL_DEV="${GRE_LOGICAL_DEV:-gr-0-0-0}"
 PING_COUNT="${PING_COUNT:-5}"
@@ -45,6 +47,12 @@ ACTIVE_FW="${FW0}"
 info() { printf '==> %s\n' "$*"; }
 pass() { printf 'PASS  %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+tcp_probe_cmd() {
+	local target="$1"
+	local port="$2"
+	printf 'timeout 2 bash -lc %q' "exec 3<>/dev/tcp/${target}/${port}"
+}
 
 run_host() {
 	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "$1")"
@@ -277,6 +285,14 @@ printf 'outer_dev=%s outer_rx_delta=%d outer_tx_delta=%d logical_dev=%s logical_
 
 pass "native GRE transit stayed on ${OUTER_DEV} and off ${GRE_LOGICAL_DEV}"
 
+info "running GRE TCP probe to ${GRE_TCP_TARGET}:${GRE_TCP_PORT} from ${HOST}"
+run_host "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/tmp/userspace-native-gre-host-tcp.out 2>&1 || true"
+host_tcp_output="$(run_host 'cat /tmp/userspace-native-gre-host-tcp.out 2>/dev/null || true')"
+printf '%s\n' "$host_tcp_output"
+run_host "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1" || die "GRE TCP connect from ${HOST} failed"
+
+pass "native GRE transit TCP connect works from ${HOST}"
+
 info "running firewall-originated GRE probe from ${ACTIVE_FW}"
 run_vm "$ACTIVE_FW" "ping -c ${PING_COUNT} -W 1 ${GRE_TARGET} >/tmp/userspace-native-gre-host-ping.out 2>&1 || true"
 host_ping_output="$(run_vm "$ACTIVE_FW" 'cat /tmp/userspace-native-gre-host-ping.out')"
@@ -284,6 +300,14 @@ printf '%s\n' "$host_ping_output"
 grep -q 'bytes from' <<<"$host_ping_output" || die "firewall-originated GRE ping failed"
 
 pass "native GRE host/control-plane traffic still works on ${ACTIVE_FW}"
+
+info "running firewall-originated GRE TCP probe from ${ACTIVE_FW}"
+run_vm "$ACTIVE_FW" "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/tmp/userspace-native-gre-fw-tcp.out 2>&1 || true"
+host_tcp_output="$(run_vm "$ACTIVE_FW" 'cat /tmp/userspace-native-gre-fw-tcp.out 2>/dev/null || true')"
+printf '%s\n' "$host_tcp_output"
+run_vm "$ACTIVE_FW" "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1" || die "firewall-originated GRE TCP connect failed"
+
+pass "native GRE host/control-plane TCP connect works on ${ACTIVE_FW}"
 
 if (( FAILOVER == 1 )); then
 	current_node="$PREFERRED_ACTIVE_NODE"
@@ -295,19 +319,30 @@ if (( FAILOVER == 1 )); then
 	failover_ping_log="$(mktemp)"
 	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "ping -i 0.2 -c ${FAILOVER_PING_COUNT} -W 1 ${GRE_TARGET}")" >"${failover_ping_log}" 2>&1 &
 	failover_ping_pid=$!
+	failover_tcp_log="$(mktemp)"
+	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "for seq in \$(seq 1 ${FAILOVER_PING_COUNT}); do if $(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1; then echo ok seq=\${seq}; else echo fail seq=\${seq}; fi; sleep 0.2; done")" >"${failover_tcp_log}" 2>&1 &
+	failover_tcp_pid=$!
 	sleep "$FAILOVER_PREP_SECS"
 	pin_active_node "$failover_node"
 	arm_supported_runtime
 	wait "$failover_ping_pid" || true
+	wait "$failover_tcp_pid" || true
 	failover_ping_output="$(cat "${failover_ping_log}")"
 	rm -f "${failover_ping_log}"
+	failover_tcp_output="$(cat "${failover_tcp_log}")"
+	rm -f "${failover_tcp_log}"
 	printf '%s\n' "$failover_ping_output"
 	max_seq="$(awk -F'icmp_seq=' '/bytes from/ { split($2, a, /[[:space:]]+/); if (a[1] > max) max=a[1] } END { print max+0 }' <<<"$failover_ping_output")"
 	[[ "$max_seq" -ge $((FAILOVER_PING_COUNT - 5)) ]] || die "active GRE failover ping did not recover near the tail (max_seq=${max_seq})"
 	grep -q 'bytes from' <<<"$failover_ping_output" || die "active GRE failover ping produced no replies"
+	printf '%s\n' "$failover_tcp_output"
+	max_tcp_seq="$(awk -F'seq=' '/^ok seq=/ { if ($2 > max) max = $2 } END { print max+0 }' <<<"$failover_tcp_output")"
+	[[ "$max_tcp_seq" -ge $((FAILOVER_PING_COUNT - 5)) ]] || die "active GRE failover TCP did not recover near the tail (max_seq=${max_tcp_seq})"
+	grep -q '^ok seq=' <<<"$failover_tcp_output" || die "active GRE failover TCP produced no successful connects"
 	run_vm "$ACTIVE_FW" "ping -c ${PING_COUNT} -W 1 ${GRE_TARGET} >/tmp/userspace-native-gre-post-failover-host-ping.out 2>&1 || true"
 	post_failover_host_ping_output="$(run_vm "$ACTIVE_FW" 'cat /tmp/userspace-native-gre-post-failover-host-ping.out')"
 	printf '%s\n' "$post_failover_host_ping_output"
 	grep -q 'bytes from' <<<"$post_failover_host_ping_output" || die "post-failover firewall-originated GRE ping failed"
+	run_vm "$ACTIVE_FW" "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1" || die "post-failover firewall-originated GRE TCP connect failed"
 	pass "native GRE active tunnel traffic survived failover to ${ACTIVE_FW}"
 fi

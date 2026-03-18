@@ -36,6 +36,8 @@ Validated on the native GRE branch:
 
 - clean post-deploy isolated-cluster validation after primaries re-elect
 - firewall-originated host/control-plane GRE ping still works
+- transit TCP connect from `cluster-userspace-host` to `10.255.192.41:22` works
+- firewall-originated TCP connect to `10.255.192.41:22` works
 - active GRE failover from `node1 -> node0` now recovers and passes the native
   GRE validator tail gate
 - active GRE failover from `node0 -> node1` now recovers and passes the native
@@ -46,15 +48,15 @@ Validated on the native GRE branch:
 
 Still required for full migration parity:
 
-- explicit TCP/UDP/native-GRE throughput validation, not only ICMP transit
+- explicit UDP and throughput validation, not only ICMP/TCP connect transit
 - final cleanup of remaining hybrid tunnel assumptions outside transit forwarding
 
 Current blocker:
 
-- transport/performance validation beyond ICMP is still thin
+- transport/performance validation beyond ICMP/TCP-connect is still thin
 - the branch proves native GRE transit, reverse-NAT, and failover/failback for
-  active ICMP sessions, but it does not yet have the same TCP/UDP/perf evidence
-  as the main HA validation workflow
+  active ICMP sessions plus SSH-class TCP connects, but it does not yet have
+  UDP or throughput evidence comparable to the main HA validation workflow
 
 ## Why This Is Necessary
 
@@ -418,9 +420,10 @@ Current state:
 
 - PBR-based tunnel selection: done
 - isolated-cluster ICMP transit + dataplane-idle `gr-0-0-0`: done
+- isolated-cluster TCP connect transit/failover validation: done
 - failover/failback and host/control-plane validation: done on the isolated
   userspace cluster
-- remaining work: TCP/UDP throughput and traceroute-style tunnel validation
+- remaining work: UDP/throughput and traceroute-style tunnel validation
 
 ## Validation Plan
 
