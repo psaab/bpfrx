@@ -50,11 +50,11 @@ This is only about plaintext GRE/ip6gre dataplane transit.
 
 Today the code explicitly treats tunnels as non-userspace transit:
 
-- [manager.go](/home/ps/git/codex-bpfrx/pkg/dataplane/userspace/manager.go)
+- [manager.go](../pkg/dataplane/userspace/manager.go)
   says tunnel interfaces are handled by the eBPF pipeline
-- [afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
+- [afxdp.rs](../userspace-dp/src/afxdp.rs)
   forces tunnel egress to slow-path so the kernel handles encapsulation
-- [tc_main.c](/home/ps/git/codex-bpfrx/bpf/tc/tc_main.c)
+- [tc_main.c](../bpf/tc/tc_main.c)
   bypasses tunnel egress because kernel tunnel encapsulation happens after TC
 
 So the required work is architectural, not a small bugfix.
@@ -270,8 +270,8 @@ Add native tunnel objects to the userspace snapshot:
 
 Update:
 
-- [pkg/dataplane/userspace/protocol.go](/home/ps/git/codex-bpfrx/pkg/dataplane/userspace/protocol.go)
-- [pkg/dataplane/userspace/manager.go](/home/ps/git/codex-bpfrx/pkg/dataplane/userspace/manager.go)
+- [pkg/dataplane/userspace/protocol.go](../pkg/dataplane/userspace/protocol.go)
+- [pkg/dataplane/userspace/manager.go](../pkg/dataplane/userspace/manager.go)
 - compiler route emission so route next-hops can point to logical tunnel IDs
 
 ### Rust Forwarding State
@@ -285,9 +285,9 @@ Add:
 
 Primary files:
 
-- [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
-- [userspace-dp/src/afxdp/frame.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/frame.rs)
-- likely a new [userspace-dp/src/afxdp/gre.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/gre.rs)
+- [userspace-dp/src/afxdp.rs](../userspace-dp/src/afxdp.rs)
+- [userspace-dp/src/afxdp/frame.rs](../userspace-dp/src/afxdp/frame.rs)
+- likely a new [userspace-dp/src/afxdp/gre.rs](../userspace-dp/src/afxdp/gre.rs)
 
 ### Session Sync
 
@@ -300,9 +300,9 @@ Extend cluster sync for tunnel-aware sessions:
 
 Files:
 
-- [pkg/daemon/daemon.go](/home/ps/git/codex-bpfrx/pkg/daemon/daemon.go)
-- [pkg/dataplane/userspace/manager.go](/home/ps/git/codex-bpfrx/pkg/dataplane/userspace/manager.go)
-- [userspace-dp/src/main.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/main.rs)
+- [pkg/daemon/daemon.go](../pkg/daemon/daemon.go)
+- [pkg/dataplane/userspace/manager.go](../pkg/dataplane/userspace/manager.go)
+- [userspace-dp/src/main.rs](../userspace-dp/src/main.rs)
 
 ### Slow-Path Reduction
 
