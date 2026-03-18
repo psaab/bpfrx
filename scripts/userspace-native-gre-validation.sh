@@ -78,10 +78,26 @@ rg_primary_node() {
 	fi
 }
 
-primary_vm_for_rg() {
+cluster_rg_primary_node() {
 	local rg="$1"
 	local primary=""
 	primary="$(rg_primary_node "$FW0" "$rg" || true)"
+	if [[ -n "$primary" ]]; then
+		printf '%s\n' "$primary"
+		return 0
+	fi
+	primary="$(rg_primary_node "$FW1" "$rg" || true)"
+	if [[ -n "$primary" ]]; then
+		printf '%s\n' "$primary"
+		return 0
+	fi
+	return 1
+}
+
+primary_vm_for_rg() {
+	local rg="$1"
+	local primary=""
+	primary="$(cluster_rg_primary_node "$rg" || true)"
 	case "$primary" in
 	node0) printf '%s\n' "$FW0" ;;
 	node1) printf '%s\n' "$FW1" ;;
@@ -96,7 +112,7 @@ ensure_preferred_active_node() {
 	info "pinning native GRE validation to ${preferred_name} for RGs:${PREFERRED_ACTIVE_RGS}"
 	for rg in $PREFERRED_ACTIVE_RGS; do
 		local current=""
-		current="$(rg_primary_node "$FW0" "$rg" || true)"
+		current="$(cluster_rg_primary_node "$rg" || true)"
 		if [[ "$current" == "$preferred_name" ]]; then
 			continue
 		fi
@@ -107,7 +123,7 @@ ensure_preferred_active_node() {
 		local all_good=1
 		for rg in $PREFERRED_ACTIVE_RGS; do
 			local current=""
-			current="$(rg_primary_node "$FW0" "$rg" || true)"
+			current="$(cluster_rg_primary_node "$rg" || true)"
 			if [[ "$current" != "$preferred_name" ]]; then
 				all_good=0
 				break

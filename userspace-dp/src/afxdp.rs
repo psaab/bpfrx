@@ -5363,6 +5363,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         };
         let src_mac = match parse_mac(&iface.hardware_addr)
             .or_else(|| mac_by_ifindex.get(&bind_ifindex).copied())
+            .or_else(|| iface.tunnel.then_some([0; 6]))
         {
             Some(mac) => mac,
             None => continue,
@@ -9370,6 +9371,14 @@ mod tests {
         assert_eq!(resolved.egress_ifindex, 362);
         assert_eq!(resolved.tx_ifindex, 6);
         assert_eq!(resolved.tunnel_endpoint_id, 1);
+    }
+
+    #[test]
+    fn native_gre_logical_egress_retains_zone_without_mac() {
+        let state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+        let egress = state.egress.get(&362).expect("logical tunnel egress");
+        assert_eq!(egress.zone, "sfmix");
+        assert_eq!(egress.primary_v4, Some(Ipv4Addr::new(10, 255, 192, 42)));
     }
 
     #[test]
