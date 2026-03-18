@@ -721,11 +721,9 @@ pub(super) fn apply_shared_recycles(
                 binding_by_index_mut(left, current_index, current, right, target_index)
         {
             binding.pending_fill_frames.push_back(offset);
-            update_binding_debug_state(binding);
             continue;
         }
         current.pending_fill_frames.push_back(offset);
-        update_binding_debug_state(current);
     }
 }
 
