@@ -1931,6 +1931,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
         core::ptr::copy_nonoverlapping(payload.as_ptr(), payload_out.as_mut_ptr(), payload.len());
     }
     let out = &mut out[..frame_len];
+    let force_tunnel_l4_recompute = decision.resolution.tunnel_endpoint_id != 0;
     let ip_start = eth_len;
     match meta.addr_family as i32 {
         libc::AF_INET => {
@@ -1980,7 +1981,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
                 old_dst,
                 old_ttl,
             )?;
-            if repaired_ports && !enforced {
+            if force_tunnel_l4_recompute || (repaired_ports && !enforced) {
                 recompute_l4_checksum_ipv4(&mut out[ip_start..], ihl, meta.protocol, true)?;
             }
         }
@@ -2014,7 +2015,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
                 enforced_ports,
             )
             .unwrap_or(false);
-            if repaired_ports && !enforced {
+            if force_tunnel_l4_recompute || (repaired_ports && !enforced) {
                 recompute_l4_checksum_ipv6(&mut out[ip_start..], meta.protocol)?;
             }
         }

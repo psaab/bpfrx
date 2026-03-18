@@ -9557,6 +9557,95 @@ mod tests {
     }
 
     #[test]
+    fn build_forwarded_frame_from_frame_recomputes_tcp_checksum_for_native_gre_snat() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let src_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let dst_ip = Ipv4Addr::new(10, 255, 192, 41);
+        let snat_ip = Ipv4Addr::new(10, 255, 192, 42);
+        let src_port = 50420u16;
+        let dst_port = 5201u16;
+
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x30, 0x12, 0x34, 0x40, 0x00, 64, PROTO_TCP, 0x00, 0x00,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x01, // seq
+            0x00, 0x00, 0x00, 0x01, // ack
+            0x50, 0x18, 0x20, 0x00, // data offset/flags/window
+            0x18, 0x29, 0x00, 0x00, // intentionally bogus partial/offload checksum + urg
+            b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+        ]);
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 54,
+            pkt_len: (frame.len() - 14) as u16,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            flow_src_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&src_ip.octets());
+                addr
+            },
+            flow_dst_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&dst_ip.octets());
+                addr
+            },
+            flow_src_port: src_port,
+            flow_dst_port: dst_port,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: lookup_forwarding_resolution_v4(
+                &state,
+                None,
+                dst_ip,
+                "sfmix.inet.0",
+                0,
+                true,
+            ),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                ..NatDecision::default()
+            },
+        };
+        let built = build_forwarded_frame_from_frame(
+            &frame,
+            meta,
+            &decision,
+            &state,
+            false,
+            Some((src_port, dst_port)),
+        )
+        .expect("encapsulated native gre frame with tcp snat");
+        let inner = &built[62..];
+        assert_eq!(&inner[12..16], &snat_ip.octets());
+        assert_eq!(&inner[16..20], &dst_ip.octets());
+        assert!(tcp_checksum_ok_ipv4(inner));
+    }
+
+    #[test]
     fn ha_resolution_blocks_inactive_owner_rg() {
         let state = build_forwarding_state(&nat_snapshot());
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
