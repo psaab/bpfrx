@@ -605,10 +605,7 @@ pub(super) fn enqueue_pending_forwards(
                 &mut post_recycles,
             );
         }
-        if ingress_binding.pending_fill_frames.len() >= FILL_BATCH_SIZE {
-            let _ = drain_pending_fill(ingress_binding, now_ns);
-            update_binding_debug_state(ingress_binding);
-        }
+        update_binding_debug_state(ingress_binding);
         if build_failed {
             handle_forward_build_failure(
                 ingress_ident,
@@ -631,18 +628,14 @@ pub(super) fn enqueue_pending_forwards(
         if !retained_source_frame {
             ingress_binding.pending_fill_frames.push_back(source_offset);
         }
-        // Coalesce small fill-ring returns within the same forward batch, but
-        // still drain immediately once a full batch has accumulated so we do
-        // not starve the RX side under sustained forwarding.
-        if ingress_binding.pending_fill_frames.len() >= FILL_BATCH_SIZE {
+        // Always drain fill immediately — no watermark delay. In copy mode,
+        // the kernel queues packets in the socket buffer when the fill ring
+        // is low, causing latency spikes that stall TCP.
+        if !ingress_binding.pending_fill_frames.is_empty() {
             let _ = drain_pending_fill(ingress_binding, now_ns);
-            update_binding_debug_state(ingress_binding);
         }
+        update_binding_debug_state(ingress_binding);
     }
-    if !ingress_binding.pending_fill_frames.is_empty() {
-        let _ = drain_pending_fill(ingress_binding, now_ns);
-    }
-    update_binding_debug_state(ingress_binding);
 }
 
 fn resolve_pending_forward_target_binding<'a>(
