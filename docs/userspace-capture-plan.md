@@ -37,7 +37,8 @@ $ tcpdump -ni mon-ge-0-0-2-egress   # egress on ge-0-0-2
 - `tcpdump` works unchanged — no custom tools needed
 - Live streaming — no need to stop/start capture or rotate files
 - Kernel BPF filters on the tap interface — `tcpdump -ni mon-ge-0-0-1 'tcp port 443'`
-  offloads filtering to the kernel, so the worker only copies matching packets
+  filters at the socket level (the worker still enqueues all captured packets
+  to the tap; filtering happens on the read side, not the write side)
 - Works with `wireshark`, `tshark`, `ngrep`, and any libpcap consumer
 - Multiple concurrent captures with different filters are trivial
 
@@ -169,11 +170,13 @@ Drop captures include the original (unrewritten) frame plus a reason string.
 
 ```rust
 struct CaptureConfig {
-    /// Per-ifindex capture enable flags
-    ingress: FastMap<i32, bool>,
-    egress: FastMap<i32, bool>,
+    /// Dense bitset indexed by ifindex (max 1024 interfaces).
+    /// Single array lookup — NOT a HashMap — so the enabled check
+    /// is truly a single branch on a bool, not a hash probe.
+    ingress: [bool; 1024],
+    egress: [bool; 1024],
     drops: bool,
-    /// 1-in-N sampling (1 = capture all, 100 = 1%, 0 = disabled)
+    /// 1-in-N sampling (1 = capture all, 100 = 1%). 0 = disabled.
     sampling_rate: u32,
     /// Max bytes per frame to capture (0 = full frame)
     snap_len: u32,
@@ -185,6 +188,8 @@ struct CaptureConfig {
 ### CaptureEntry (ring buffer element)
 
 ```rust
+/// Fixed-size entry to avoid per-packet heap allocation.
+/// Uses an inline byte array sized to snap_len (default 256).
 struct CaptureEntry {
     timestamp_ns: u64,         // monotonic_nanos()
     ifindex: i32,              // ingress or egress interface
@@ -192,7 +197,7 @@ struct CaptureEntry {
     original_len: u32,         // full frame length
     captured_len: u32,         // after snap_len truncation
     drop_reason: Option<&'static str>,
-    bytes: Vec<u8>,            // truncated frame bytes
+    bytes: [u8; 256],          // inline buffer, no heap allocation
 }
 
 enum CapturePoint {
@@ -209,32 +214,39 @@ struct CaptureDispatcher {
     config: CaptureConfig,
     ring: crossbeam_queue::ArrayQueue<CaptureEntry>,
     stats: CaptureStats,
-    sample_counter: u32,
+    sample_counter: u32,  // mutable — owned by worker thread, no sharing
 }
 
 impl CaptureDispatcher {
-    fn enqueue(&self, point: CapturePoint, ifindex: i32, frame: &[u8]) {
-        // Sampling check
-        self.sample_counter += 1;
+    fn enqueue(&mut self, point: CapturePoint, ifindex: i32, frame: &[u8]) {
+        // Sampling check (sampling_rate=0 means disabled)
+        if self.config.sampling_rate == 0 {
+            return;
+        }
+        self.sample_counter = self.sample_counter.wrapping_add(1);
         if self.sample_counter % self.config.sampling_rate != 0 {
             return;
         }
         // Snap length truncation
+        let max_snap = 256; // matches CaptureEntry inline buffer size
         let snap = if self.config.snap_len > 0 {
-            frame.len().min(self.config.snap_len as usize)
+            frame.len().min(self.config.snap_len as usize).min(max_snap)
         } else {
-            frame.len()
+            frame.len().min(max_snap)
         };
-        // Try non-blocking enqueue (drop if ring full)
-        let entry = CaptureEntry {
+        // Build entry with inline buffer — no heap allocation
+        let mut entry = CaptureEntry {
             timestamp_ns: monotonic_nanos(),
             ifindex,
             point,
             original_len: frame.len() as u32,
             captured_len: snap as u32,
             drop_reason: None,
-            bytes: frame[..snap].to_vec(),
+            bytes: [0u8; 256],
         };
+        entry.bytes[..snap].copy_from_slice(&frame[..snap]);
+        // Try non-blocking enqueue (drop capture entry if ring full,
+        // NEVER drop the actual packet)
         if self.ring.push(entry).is_err() {
             self.stats.ring_drops += 1;
         }
@@ -346,7 +358,8 @@ func (m *Manager) EnableCapture(cfg CaptureConfig) error {
 ### Zero overhead when disabled
 
 When capture is disabled (the default):
-- `capture.ingress_enabled(ifindex)` is a single branch on a bool
+- `capture.ingress_enabled(ifindex)` is an array index + branch on a bool
+  (the `[bool; 1024]` bitset is constant-time, no hash probe)
 - The compiler can predict this branch as not-taken
 - No allocation, no ring access, no tap write
 - Cost: ~1 CPU cycle per packet (branch prediction hit)
@@ -370,15 +383,21 @@ When capture is disabled (the default):
 
 ## Implementation phases
 
-### Phase 1: Ingress-only capture via TUN
+### Phase 1: Ingress-only capture via TAP
 
-Reuse the existing `SlowPathReinjector` pattern:
-- Add a second TUN device per monitored interface (e.g., `mon-ge-0-0-1`)
-- In `poll_binding()`, after RX read, conditionally write to TUN
+Use TAP interfaces (IFF_TAP, not IFF_TUN) to preserve the full L2
+Ethernet frame including VLAN tags. TUN is L3-only and would strip
+the Ethernet header.
+
+Reuse the existing `SlowPathReinjector` pattern for async writes:
+- Create a TAP device per monitored interface (e.g., `mon-ge-0-0-1`)
+- In `poll_binding()`, after RX read, conditionally enqueue to ring
+- `CaptureWriter` thread reads ring and writes to TAP fds
 - Control via existing control socket (`"capture"` request type)
 - No egress capture yet
 
 **Deliverable**: `tcpdump -ni mon-ge-0-0-1` shows ingress packets
+with full Ethernet headers
 
 ### Phase 2: Egress capture + ring buffer
 
