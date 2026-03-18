@@ -446,6 +446,7 @@ pub(super) fn enqueue_pending_forwards(
                                 source_frame,
                                 request.meta,
                                 &request.decision,
+                                forwarding,
                                 request.apply_nat_on_fabric,
                                 expected_ports,
                             )
@@ -1644,6 +1645,7 @@ pub(super) fn build_forwarded_frame_from_frame(
         frame,
         meta,
         decision,
+        forwarding,
         apply_nat_on_fabric,
         expected_ports,
     )?;
@@ -1851,6 +1853,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
     frame: &[u8],
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
+    forwarding: &ForwardingState,
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<usize> {
@@ -1932,6 +1935,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
     }
     let out = &mut out[..frame_len];
     let force_tunnel_l4_recompute = decision.resolution.tunnel_endpoint_id != 0;
+    let tunnel_tcp_mss = native_gre_tcp_mss(forwarding, decision, meta.addr_family);
     let ip_start = eth_len;
     match meta.addr_family as i32 {
         libc::AF_INET => {
@@ -1981,6 +1985,9 @@ pub(super) fn build_forwarded_frame_into_from_frame(
                 old_dst,
                 old_ttl,
             )?;
+            if tunnel_tcp_mss > 0 {
+                let _ = clamp_tcp_mss_frame(out, ip_start, tunnel_tcp_mss);
+            }
             if force_tunnel_l4_recompute || (repaired_ports && !enforced) {
                 recompute_l4_checksum_ipv4(&mut out[ip_start..], ihl, meta.protocol, true)?;
             }
@@ -2015,6 +2022,9 @@ pub(super) fn build_forwarded_frame_into_from_frame(
                 enforced_ports,
             )
             .unwrap_or(false);
+            if tunnel_tcp_mss > 0 {
+                let _ = clamp_tcp_mss_frame(out, ip_start, tunnel_tcp_mss);
+            }
             if force_tunnel_l4_recompute || (repaired_ports && !enforced) {
                 recompute_l4_checksum_ipv6(&mut out[ip_start..], meta.protocol)?;
             }
@@ -2133,10 +2143,19 @@ pub(super) fn build_forwarded_frame_into(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
+    forwarding: &ForwardingState,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<usize> {
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
-    build_forwarded_frame_into_from_frame(out, frame, meta, decision, false, expected_ports)
+    build_forwarded_frame_into_from_frame(
+        out,
+        frame,
+        meta,
+        decision,
+        forwarding,
+        false,
+        expected_ports,
+    )
 }
 
 pub(super) fn rewrite_forwarded_frame_in_place(
