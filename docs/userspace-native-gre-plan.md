@@ -23,12 +23,28 @@ Implemented on the native GRE branch:
 - native GRE decapsulation on physical NIC ingress
 - native GRE encapsulation on physical NIC egress
 - tunnel-aware session sync so synced userspace sessions preserve tunnel context
+- ingress PBR steering into tunnel routing-instances
+- tunnel-zone visibility preserved for policy evaluation
+- userspace XDP now keeps outer GRE on the physical NIC path when native GRE is enabled
+- tunnel netdevices are no longer userspace ingress interfaces for transit
+- live isolated-cluster GRE transit validation now passes:
+  - `cluster-userspace-host -> 10.255.192.41` ping succeeds
+  - outer GRE packets move on `ge-*-0-2.80`
+  - `gr-0-0-0` transit RX/TX deltas stay at zero
 
 Still required for full migration parity:
 
-- live native GRE validation on the isolated userspace cluster
+- clean post-deploy HA validation after the cluster re-elects primaries again
 - failover/failback validation for active tunnel sessions
+- explicit proof that firewall-originated host/control-plane tunnel traffic still works
 - final cleanup of remaining hybrid tunnel assumptions outside transit forwarding
+
+Current blocker:
+
+- after a full isolated-cluster deploy, RG primaries are not re-electing because
+  the existing HA readiness gate reports `fabric forwarding path not ready`
+  (`fabric_fwd` not populated). That is blocking the remaining failover/host
+  validation steps on this branch.
 
 ## Why This Is Necessary
 
@@ -387,6 +403,13 @@ Exit criteria:
 - failover/failback under load
 - mixed IPv4/IPv6 tunnel traffic
 - ICMP, TCP, UDP, traceroute, iperf, failover tests
+
+Current state:
+
+- PBR-based tunnel selection: done
+- isolated-cluster ICMP transit + dataplane-idle `gr-0-0-0`: done
+- failover/failback and host/control-plane validation: blocked on the existing
+  post-deploy `fabric_fwd` readiness regression
 
 ## Validation Plan
 
