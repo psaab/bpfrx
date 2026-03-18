@@ -27,6 +27,13 @@ const PROTO_ICMP: u8 = 1;
 const PROTO_GRE: u8 = 47;
 const PROTO_ESP: u8 = 50;
 const PROTO_ICMPV6: u8 = 58;
+const GRE_FLAG_CHECKSUM: u16 = 0x8000;
+const GRE_FLAG_ROUTING: u16 = 0x4000;
+const GRE_FLAG_KEY: u16 = 0x2000;
+const GRE_FLAG_SEQUENCE: u16 = 0x1000;
+const GRE_VERSION_MASK: u16 = 0x0007;
+const GRE_PROTO_IPV4: u16 = 0x0800;
+const GRE_PROTO_IPV6: u16 = 0x86dd;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_ACK: u8 = 0x10;
 const MAX_EXT_HDRS: usize = 6;
@@ -307,8 +314,19 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     {
         return Ok(cpumap_or_pass(ctrl));
     }
+    let flow_parsed = if parsed.protocol == PROTO_GRE
+        && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) != 0
+    {
+        match parse_native_gre_inner(data, data_end, &parsed) {
+            Some(inner) => inner,
+            None => return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL),
+        }
+    } else {
+        parsed
+    };
+
     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
-    let selected_queue = select_userspace_queue(ctrl, rx_queue_index, &parsed);
+    let selected_queue = select_userspace_queue(ctrl, rx_queue_index, &flow_parsed);
     record_trace(
         ctrl.flags,
         ingress_ifindex,
@@ -317,7 +335,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         u32::MAX,
         USERSPACE_TRACE_STAGE_RECEIVED,
         0,
-        &parsed,
+        &flow_parsed,
     );
     let binding_idx = ingress_ifindex * BINDING_QUEUES_PER_IFACE + selected_queue;
     let mut binding = USERSPACE_BINDINGS.get(binding_idx);
@@ -337,7 +355,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 u32::MAX,
                 USERSPACE_TRACE_STAGE_BINDING_MISSING,
                 USERSPACE_FALLBACK_REASON_BINDING_MISSING,
-                &parsed,
+                &flow_parsed,
             );
             // Drop all TCP on DP-managed interfaces: legacy BPF has no session
             // for DP-managed flows, so falling back generates RSTs that kill the
@@ -355,7 +373,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             binding.slot,
             USERSPACE_TRACE_STAGE_BINDING_NOT_READY,
             USERSPACE_FALLBACK_REASON_BINDING_NOT_READY,
-            &parsed,
+            &flow_parsed,
         );
         incr_fallback_stat(USERSPACE_FALLBACK_REASON_BINDING_NOT_READY);
         return Ok(xdp_action::XDP_DROP);
@@ -370,7 +388,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             binding.slot,
             USERSPACE_TRACE_STAGE_HEARTBEAT_MISSING,
             USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING,
-            &parsed,
+            &flow_parsed,
         );
         incr_fallback_stat(USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING);
         return Ok(xdp_action::XDP_DROP);
@@ -391,7 +409,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             binding.slot,
             USERSPACE_TRACE_STAGE_HEARTBEAT_STALE,
             USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE,
-            &parsed,
+            &flow_parsed,
         );
         incr_fallback_stat(USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
         return Ok(xdp_action::XDP_DROP);
@@ -406,7 +424,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     {
         return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
-    if should_fallback_early(&parsed) {
+    if should_fallback_early(&flow_parsed) {
         record_trace(
             ctrl.flags,
             ingress_ifindex,
@@ -415,11 +433,11 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             binding.slot,
             USERSPACE_TRACE_STAGE_EARLY_FILTER,
             USERSPACE_FALLBACK_REASON_EARLY_FILTER,
-            &parsed,
+            &flow_parsed,
         );
         return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
-    match live_userspace_session_action(&parsed) {
+    match live_userspace_session_action(&flow_parsed) {
         USERSPACE_SESSION_ACTION_REDIRECT => {
             // Session exists and stays on the userspace dataplane.
         }
@@ -432,13 +450,13 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 binding.slot,
                 USERSPACE_TRACE_STAGE_LOCAL_DESTINATION,
                 0,
-                &parsed,
+                &flow_parsed,
             );
             return Ok(cpumap_or_pass(ctrl));
         }
         _ => {
             // Session miss — run full checks for new connections.
-            if is_icmp_to_interface_nat_local(&parsed) {
+            if is_icmp_to_interface_nat_local(&flow_parsed) {
                 record_trace(
                     ctrl.flags,
                     ingress_ifindex,
@@ -447,11 +465,11 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                     binding.slot,
                     USERSPACE_TRACE_STAGE_INTERFACE_NAT_LOCAL,
                     0,
-                    &parsed,
+                    &flow_parsed,
                 );
                 return Ok(cpumap_or_pass(ctrl));
             }
-            if is_local_destination(&parsed) {
+            if is_local_destination(&flow_parsed) || is_interface_nat_destination(&flow_parsed) {
                 record_trace(
                     ctrl.flags,
                     ingress_ifindex,
@@ -460,7 +478,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                     binding.slot,
                     USERSPACE_TRACE_STAGE_LOCAL_DESTINATION,
                     0,
-                    &parsed,
+                    &flow_parsed,
                 );
                 return Ok(cpumap_or_pass(ctrl));
             }
@@ -519,7 +537,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         binding.slot,
         USERSPACE_TRACE_STAGE_REDIRECT,
         0,
-        &parsed,
+        &flow_parsed,
     );
     match USERSPACE_XSK_MAP.redirect(binding.slot, 0) {
         Ok(action) => Ok(action),
@@ -532,14 +550,39 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 binding.slot,
                 USERSPACE_TRACE_STAGE_REDIRECT_ERR,
                 USERSPACE_FALLBACK_REASON_REDIRECT_ERR,
-                &parsed,
+                &flow_parsed,
             );
-            if is_interface_nat_destination(&parsed) {
+            if is_interface_nat_destination(&flow_parsed) {
                 incr_fallback_stat(USERSPACE_FALLBACK_REASON_REDIRECT_ERR);
                 return Ok(xdp_action::XDP_DROP);
             }
             fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_REDIRECT_ERR)
         }
+    }
+}
+
+fn parse_native_gre_inner(data: usize, data_end: usize, outer: &ParsedPacket) -> Option<ParsedPacket> {
+    let gre_offset = outer.l4_offset as usize;
+    let base = read_bytes(data, data_end, gre_offset, 4)?;
+    let flags_version = u16::from_be_bytes([base[0], base[1]]);
+    if (flags_version & GRE_VERSION_MASK) != 0 {
+        return None;
+    }
+    if (flags_version & (GRE_FLAG_CHECKSUM | GRE_FLAG_ROUTING)) != 0 {
+        return None;
+    }
+    let gre_proto = u16::from_be_bytes([base[2], base[3]]);
+    let mut inner_offset = gre_offset.checked_add(4)?;
+    if (flags_version & GRE_FLAG_KEY) != 0 {
+        inner_offset = inner_offset.checked_add(4)?;
+    }
+    if (flags_version & GRE_FLAG_SEQUENCE) != 0 {
+        inner_offset = inner_offset.checked_add(4)?;
+    }
+    match gre_proto {
+        GRE_PROTO_IPV4 => parse_ipv4(data, data_end, 0, inner_offset as u16),
+        GRE_PROTO_IPV6 => parse_ipv6(data, data_end, 0, inner_offset as u16),
+        _ => None,
     }
 }
 
