@@ -2,6 +2,13 @@
 
 Use [userspace-perf-compare.sh](/home/ps/git/codex-bpfrx/scripts/userspace-perf-compare.sh) when you need a repeatable IPv4/IPv6 performance capture on the isolated userspace cluster without coupling the result to the pass/fail thresholds in `userspace-ha-validation.sh`.
 
+For branch landing decisions on noisy cross-NIC transit work, prefer
+[userspace-transit-perf-gate.sh](/home/ps/git/codex-bpfrx/scripts/userspace-transit-perf-gate.sh).
+It runs repeated transit samples and reports median/min/max consistency before
+you decide to keep or revert a slice. It also records active-node helper
+counter deltas per run so you can correlate bad samples with actual dataplane
+behavior.
+
 This is the authoritative workflow for current-tree measurements. During active
 performance work, do not cite the validation doc’s `22-23 Gbps` target as if it
 describes the current tree state. Use this workflow and the saved artifacts instead.

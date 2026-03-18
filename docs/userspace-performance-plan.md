@@ -21,10 +21,21 @@ Current execution state on 2026-03-17:
   - `24/24` ready bindings
   - working IPv4/IPv6 internal reachability
   - working IPv4/IPv6 TTL or hop-limit time-exceeded replies
-- A short userspace HA validation pass on the restored baseline is healthy:
+- A short userspace HA validation pass on the restored baseline can be healthy:
   - IPv4 about `17.45 Gbps`
   - IPv6 about `19.77 Gbps`
   - IPv4/IPv6 `mtr` and traceroute visibility: `ok`
+- Recent phase attempts on `fix/userspace-perf-remaining-phases` show that
+  single short HA runs are not a sufficient acceptance gate for cross-NIC
+  transit changes:
+  - several structurally-correct hot-path slices passed local tests and traceroute
+    checks but swung between roughly `12-19 Gbps` across repeated IPv4 runs
+  - those slices have been preserved and reverted, not kept
+- The active bottleneck picture is still:
+  - `poll_binding`
+  - direct-path payload copy (`__memmove_evex_unaligned_erms`)
+  - `enqueue_pending_forwards`
+  - session lookup/resolution after that
 - The current transit hotspot stack on that restored baseline is:
   - `poll_binding` about `17.4%`
   - `__memmove_evex_unaligned_erms` about `12.8-16.7%`
@@ -32,6 +43,10 @@ Current execution state on 2026-03-17:
   - `resolve_flow_session_decision` about `2.3-2.6%`
 - Runtime counters on the same runs show `Copy-path TX packets: 0`, so the
   current throughput ceiling is the direct cross-NIC path, not fallback.
+- The repeated transit gate now captures active-node helper counter deltas per
+  run, so unstable samples can be correlated with session misses, neighbor
+  misses, policy denies, TX errors, or slow-path usage before treating them as
+  code regressions.
 
 ## Active Phase Order
 
@@ -41,23 +56,33 @@ This active phase order supersedes the older issue-first ordering below.
    - Status: Complete on `fix/userspace-disable-shared-umem-runtime`
    - Purpose: keep the HA lab at `24/24` ready bindings before any more perf
      work
-2. Phase 1: `poll_binding` fixed-cost reduction.
+2. Phase 1: Measurement hardening.
+   - Status: In Progress
+   - Scope: repeated transit runs, matched perf capture, explicit consistency
+     gate before accepting or rejecting throughput changes
+   - Current gate: `scripts/userspace-transit-perf-gate.sh`
+     - saves before/after helper status for each repeated run
+     - summarizes counter deltas for session misses, neighbor misses, policy
+       denies, TX errors, direct/copy/in-place TX, and slow-path injection
+     - treats repeated-run inconsistency as a measurement/debugging problem
+       first, not an automatic perf-slice regression
+3. Phase 2: `poll_binding` fixed-cost reduction.
    - Status: In Progress
    - Scope: empty-poll overhead, unnecessary per-poll work, `RingRx::available`
      pressure
-3. Phase 2: direct-build control overhead.
-   - Status: Next
+4. Phase 3: direct-build control overhead.
+   - Status: In Progress
    - Scope: `enqueue_pending_forwards()` and
      `build_forwarded_frame_into_from_frame()` control cost, not refill policy
-4. Phase 3: session-resolution overhead.
+5. Phase 4: session-resolution overhead.
    - Status: Next
    - Scope: `resolve_flow_session_decision()` and
      `lookup_session_across_scopes()` after direct-build control work
-5. Phase 4: structural cross-NIC copy ceiling.
+6. Phase 5: structural cross-NIC copy ceiling.
    - Status: Deferred
    - Scope: accept that cross-NIC transit still pays a full payload copy and
      only tackle this after the control overhead work is exhausted
-6. Phase 5: reliability and observability backlog.
+7. Phase 6: reliability and observability backlog.
    - Status: Deferred
    - Scope: frame leak detection, in-flight TX timeout, session-sync atomicity,
      SYN cookies
@@ -396,8 +421,14 @@ Status: Not Started
 All changes measured using:
 - `show chassis cluster data-plane interfaces` must show `24/24` bound and
   `24/24` ready before any perf result is accepted
-- `scripts/userspace-perf-compare.sh` for A/B throughput
-- `iperf3 -P 4 -t 30` (min 3 runs)
+- `scripts/userspace-transit-perf-gate.sh` for repeated IPv4/IPv6 transit runs
+  and one matched perf capture on the active node
+- `scripts/userspace-perf-compare.sh` remains useful for one-shot A/B capture,
+  but not for landing decisions on noisy branches
+- at least 3 repeated IPv4 transit runs before a branch slice is treated as a
+  keep
+- consistency gate: short-run `min/median >= 0.90` before spending a failover
+  cycle on a new throughput slice
 - `perf record`/`perf report` for hot-symbol validation
 - Frame accounting in periodic debug report
 - `scripts/userspace-ha-failover-validation.sh` for HA regression
