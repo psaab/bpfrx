@@ -4050,6 +4050,7 @@ fn flush_session_deltas(
             owner_rg_id: delta.metadata.owner_rg_id,
             egress_ifindex: delta.decision.resolution.egress_ifindex,
             tx_ifindex: delta.decision.resolution.tx_ifindex,
+            tunnel_endpoint_id: delta.decision.resolution.tunnel_endpoint_id,
             tx_vlan_id: delta.decision.resolution.tx_vlan_id,
             next_hop: delta
                 .decision

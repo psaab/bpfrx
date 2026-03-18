@@ -2939,7 +2939,9 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		EgressZone:  egressZone,
 		ReverseKey:  userspaceReverseKeyV4(key, delta),
 	}
-	if delta.TXIfindex > 0 {
+	if delta.TunnelEndpointID != 0 && delta.EgressIfindex > 0 {
+		val.FibIfindex = uint32(delta.EgressIfindex)
+	} else if delta.TXIfindex > 0 {
 		val.FibIfindex = uint32(delta.TXIfindex)
 	} else if delta.EgressIfindex > 0 {
 		val.FibIfindex = uint32(delta.EgressIfindex)
@@ -2993,7 +2995,9 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		EgressZone:  egressZone,
 		ReverseKey:  userspaceReverseKeyV6(key, delta),
 	}
-	if delta.TXIfindex > 0 {
+	if delta.TunnelEndpointID != 0 && delta.EgressIfindex > 0 {
+		val.FibIfindex = uint32(delta.EgressIfindex)
+	} else if delta.TXIfindex > 0 {
 		val.FibIfindex = uint32(delta.TXIfindex)
 	} else if delta.EgressIfindex > 0 {
 		val.FibIfindex = uint32(delta.EgressIfindex)

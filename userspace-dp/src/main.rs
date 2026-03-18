@@ -970,6 +970,8 @@ struct SessionSyncRequest {
     egress_ifindex: i32,
     #[serde(rename = "tx_ifindex", default)]
     tx_ifindex: i32,
+    #[serde(rename = "tunnel_endpoint_id", default)]
+    tunnel_endpoint_id: u16,
     #[serde(rename = "tx_vlan_id", default)]
     tx_vlan_id: u16,
     #[serde(rename = "next_hop", default)]
@@ -1035,6 +1037,8 @@ struct SessionDeltaInfo {
     egress_ifindex: i32,
     #[serde(rename = "tx_ifindex", default)]
     tx_ifindex: i32,
+    #[serde(rename = "tunnel_endpoint_id", default)]
+    tunnel_endpoint_id: u16,
     #[serde(rename = "tx_vlan_id", default)]
     tx_vlan_id: u16,
     #[serde(rename = "next_hop", default)]
@@ -1645,7 +1649,9 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
         .map_err(|e| format!("parse neighbor_mac {}: {e}", req.neighbor_mac))?;
     let src_mac = parse_session_sync_mac(&req.src_mac)
         .map_err(|e| format!("parse src_mac {}: {e}", req.src_mac))?;
-    let tx_ifindex = if req.tx_ifindex > 0 {
+    let tx_ifindex = if req.tunnel_endpoint_id != 0 {
+        req.tx_ifindex.max(0)
+    } else if req.tx_ifindex > 0 {
         req.tx_ifindex
     } else {
         req.egress_ifindex
@@ -1684,7 +1690,10 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
         key,
         decision: crate::session::SessionDecision {
             resolution: afxdp::ForwardingResolution {
-                disposition: if req.egress_ifindex > 0 || req.tx_ifindex > 0 {
+                disposition: if req.egress_ifindex > 0
+                    || req.tx_ifindex > 0
+                    || req.tunnel_endpoint_id != 0
+                {
                     afxdp::ForwardingDisposition::ForwardCandidate
                 } else {
                     afxdp::ForwardingDisposition::NoRoute
@@ -1692,7 +1701,7 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
                 local_ifindex: 0,
                 egress_ifindex: req.egress_ifindex,
                 tx_ifindex,
-                tunnel_endpoint_id: 0,
+                tunnel_endpoint_id: req.tunnel_endpoint_id,
                 next_hop,
                 neighbor_mac,
                 src_mac,
@@ -2114,6 +2123,31 @@ mod tests {
         assert!(entry.metadata.fabric_ingress);
         assert!(entry.metadata.synced);
         assert_eq!(entry.metadata.owner_rg_id, 1);
+    }
+
+    #[test]
+    fn build_synced_session_entry_preserves_tunnel_endpoint_id() {
+        let req = SessionSyncRequest {
+            operation: "upsert".to_string(),
+            addr_family: libc::AF_INET as u8,
+            protocol: 1,
+            src_ip: "10.0.61.102".to_string(),
+            dst_ip: "10.255.192.41".to_string(),
+            ingress_zone: "lan".to_string(),
+            egress_zone: "sfmix".to_string(),
+            egress_ifindex: 586,
+            tx_ifindex: 0,
+            tunnel_endpoint_id: 3,
+            ..SessionSyncRequest::default()
+        };
+
+        let entry = build_synced_session_entry(&req).expect("synced session entry");
+        assert_eq!(entry.decision.resolution.tunnel_endpoint_id, 3);
+        assert_eq!(entry.decision.resolution.egress_ifindex, 586);
+        assert_eq!(
+            entry.decision.resolution.disposition,
+            afxdp::ForwardingDisposition::ForwardCandidate
+        );
     }
 
     #[test]

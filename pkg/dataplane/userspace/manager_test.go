@@ -71,6 +71,23 @@ func TestSessionSyncEgressLockedDerivesOwnerAndTxPath(t *testing.T) {
 	}
 }
 
+func TestSessionSyncTunnelEndpointIDLockedMatchesLogicalTunnelIfindex(t *testing.T) {
+	m := &Manager{
+		lastSnapshot: &ConfigSnapshot{
+			TunnelEndpoints: []TunnelEndpointSnapshot{{
+				ID:      3,
+				Ifindex: 586,
+			}},
+		},
+	}
+	if got := m.sessionSyncTunnelEndpointIDLocked(586); got != 3 {
+		t.Fatalf("tunnel endpoint id = %d, want 3", got)
+	}
+	if got := m.sessionSyncTunnelEndpointIDLocked(24); got != 0 {
+		t.Fatalf("tunnel endpoint id for non-tunnel ifindex = %d, want 0", got)
+	}
+}
+
 func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
 	m := &Manager{
 		inner: dataplane.New(),
@@ -110,6 +127,48 @@ func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
 	}
 	if !req.FabricIngress {
 		t.Fatalf("expected fabric_ingress to be preserved: %+v", req)
+	}
+}
+
+func TestBuildSessionSyncRequestV4PreservesTunnelEndpointIdentity(t *testing.T) {
+	m := &Manager{
+		inner: dataplane.New(),
+		lastSnapshot: &ConfigSnapshot{
+			Interfaces: []InterfaceSnapshot{{
+				Name:            "gr-0/0/0.0",
+				Ifindex:         586,
+				RedundancyGroup: 1,
+			}},
+			TunnelEndpoints: []TunnelEndpointSnapshot{{
+				ID:      3,
+				Ifindex: 586,
+			}},
+		},
+	}
+	key := dataplane.SessionKey{
+		SrcIP:    [4]byte{10, 0, 61, 102},
+		DstIP:    [4]byte{10, 255, 192, 41},
+		SrcPort:  hostToNetwork16(4459),
+		DstPort:  hostToNetwork16(4459),
+		Protocol: 1,
+	}
+	val := &dataplane.SessionValue{
+		IngressZone: 1,
+		EgressZone:  2,
+		FibIfindex:  586,
+		FibVlanID:   80,
+		FibDmac:     [6]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
+		FibSmac:     [6]byte{0x02, 0xbf, 0x72, 0x00, 0x50, 0x08},
+	}
+	req := m.buildSessionSyncRequestV4("upsert", key, val)
+	if req.TunnelEndpointID != 3 {
+		t.Fatalf("unexpected tunnel endpoint id: %d", req.TunnelEndpointID)
+	}
+	if req.EgressIfindex != 586 {
+		t.Fatalf("unexpected egress ifindex: %d", req.EgressIfindex)
+	}
+	if req.TXIfindex != 0 {
+		t.Fatalf("unexpected tx ifindex: %d", req.TXIfindex)
 	}
 }
 

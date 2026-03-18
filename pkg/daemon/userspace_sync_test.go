@@ -68,6 +68,36 @@ func TestUserspaceSessionFromDeltaV4(t *testing.T) {
 	}
 }
 
+func TestUserspaceSessionFromDeltaV4PreservesLogicalTunnelEgress(t *testing.T) {
+	zoneIDs := map[string]uint16{"lan": 1, "sfmix": 2}
+	delta := dpuserspace.SessionDeltaInfo{
+		Event:            "open",
+		AddrFamily:       2,
+		Protocol:         1,
+		SrcIP:            "10.0.61.102",
+		DstIP:            "10.255.192.41",
+		SrcPort:          4459,
+		DstPort:          4459,
+		IngressZone:      "lan",
+		EgressZone:       "sfmix",
+		EgressIfindex:    586,
+		TXIfindex:        24,
+		TunnelEndpointID: 3,
+		TXVLANID:         80,
+		NeighborMAC:      "aa:bb:cc:dd:ee:ff",
+		SrcMAC:           "02:bf:72:00:50:08",
+		NATSrcIP:         "10.255.192.42",
+	}
+
+	_, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
+	if !ok {
+		t.Fatal("expected v4 tunnel delta to convert")
+	}
+	if val.FibIfindex != 586 {
+		t.Fatalf("unexpected fib ifindex: %d", val.FibIfindex)
+	}
+}
+
 func TestUserspaceSessionFromDeltaV6(t *testing.T) {
 	zoneIDs := map[string]uint16{"lan": 1, "wan": 2}
 	delta := dpuserspace.SessionDeltaInfo{
@@ -124,6 +154,36 @@ func TestUserspaceSessionFromDeltaV6(t *testing.T) {
 	}
 	if val.LogFlags&dataplane.LogFlagUserspaceFabricIngress == 0 {
 		t.Fatalf("expected fabric ingress marker in log flags: %#x", val.LogFlags)
+	}
+}
+
+func TestUserspaceSessionFromDeltaV6PreservesLogicalTunnelEgress(t *testing.T) {
+	zoneIDs := map[string]uint16{"lan": 1, "sfmix": 2}
+	delta := dpuserspace.SessionDeltaInfo{
+		Event:            "open",
+		AddrFamily:       10,
+		Protocol:         17,
+		SrcIP:            "2001:559:8585:ef00::100",
+		DstIP:            "2001:db8::1",
+		SrcPort:          5555,
+		DstPort:          53,
+		IngressZone:      "lan",
+		EgressZone:       "sfmix",
+		EgressIfindex:    586,
+		TXIfindex:        24,
+		TunnelEndpointID: 7,
+		TXVLANID:         80,
+		NeighborMAC:      "00:11:22:33:44:55",
+		SrcMAC:           "02:bf:72:00:50:08",
+		NATSrcIP:         "2001:db8::2",
+	}
+
+	_, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
+	if !ok {
+		t.Fatal("expected v6 tunnel delta to convert")
+	}
+	if val.FibIfindex != 586 {
+		t.Fatalf("unexpected fib ifindex: %d", val.FibIfindex)
 	}
 }
 

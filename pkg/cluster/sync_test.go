@@ -202,8 +202,13 @@ func TestDecodeSessionV4RoundTrip(t *testing.T) {
 			DstPort:  1024,
 			Protocol: 6,
 		},
-		ALGType:  1,
-		LogFlags: 2,
+		ALGType:    1,
+		LogFlags:   2,
+		FibIfindex: 586,
+		FibVlanID:  80,
+		FibDmac:    [6]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
+		FibSmac:    [6]byte{0x02, 0xbf, 0x72, 0x00, 0x50, 0x08},
+		FibGen:     7,
 	}
 
 	payload := encodeSessionV4Payload(key, val)
@@ -251,6 +256,12 @@ func TestDecodeSessionV4RoundTrip(t *testing.T) {
 	if dVal.ALGType != val.ALGType || dVal.LogFlags != val.LogFlags {
 		t.Fatalf("ALG/log mismatch")
 	}
+	if dVal.FibIfindex != val.FibIfindex || dVal.FibVlanID != val.FibVlanID {
+		t.Fatalf("fib ifindex/vlan mismatch")
+	}
+	if dVal.FibDmac != val.FibDmac || dVal.FibSmac != val.FibSmac || dVal.FibGen != val.FibGen {
+		t.Fatalf("fib metadata mismatch")
+	}
 }
 
 func TestDecodeSessionV6RoundTrip(t *testing.T) {
@@ -276,6 +287,11 @@ func TestDecodeSessionV6RoundTrip(t *testing.T) {
 		FwdPackets:  200,
 		FwdBytes:    100000,
 		ALGType:     2,
+		FibIfindex:  586,
+		FibVlanID:   80,
+		FibDmac:     [6]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
+		FibSmac:     [6]byte{0x02, 0xbf, 0x72, 0x00, 0x50, 0x08},
+		FibGen:      9,
 	}
 
 	payload := encodeSessionV6Payload(key, val)
@@ -304,6 +320,12 @@ func TestDecodeSessionV6RoundTrip(t *testing.T) {
 	}
 	if dVal.FwdPackets != val.FwdPackets || dVal.FwdBytes != val.FwdBytes {
 		t.Fatalf("fwd counter mismatch")
+	}
+	if dVal.FibIfindex != val.FibIfindex || dVal.FibVlanID != val.FibVlanID {
+		t.Fatalf("fib ifindex/vlan mismatch")
+	}
+	if dVal.FibDmac != val.FibDmac || dVal.FibSmac != val.FibSmac || dVal.FibGen != val.FibGen {
+		t.Fatalf("fib metadata mismatch")
 	}
 }
 

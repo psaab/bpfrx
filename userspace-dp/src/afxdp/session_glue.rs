@@ -97,6 +97,20 @@ pub(super) fn lookup_forwarding_resolution_for_session(
     if decision.resolution.disposition == ForwardingDisposition::LocalDelivery {
         return decision.resolution;
     }
+    if decision.resolution.tunnel_endpoint_id != 0 {
+        let resolved = super::resolve_tunnel_forwarding_resolution(
+            forwarding,
+            Some(dynamic_neighbors),
+            decision.resolution.tunnel_endpoint_id,
+            0,
+        );
+        return match resolved.disposition {
+            ForwardingDisposition::NoRoute | ForwardingDisposition::MissingNeighbor => {
+                cached_session_resolution(forwarding, decision.resolution).unwrap_or(resolved)
+            }
+            _ => resolved,
+        };
+    }
     if let Some(cached) = cached_session_resolution(forwarding, decision.resolution) {
         return cached;
     }

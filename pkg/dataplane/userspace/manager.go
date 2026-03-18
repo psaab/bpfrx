@@ -2843,8 +2843,46 @@ func (m *Manager) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionVa
 	return nil
 }
 
+func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
+	installVal := val
+	installVal.FibIfindex = 0
+	installVal.FibVlanID = 0
+	installVal.FibDmac = [6]byte{}
+	installVal.FibSmac = [6]byte{}
+	installVal.FibGen = 0
+	if err := m.inner.SetSessionV4(key, installVal); err != nil {
+		return err
+	}
+	if !shouldMirrorUserspaceSession(val.IsReverse) {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_ = m.syncSessionV4Locked("upsert", key, &val)
+	return nil
+}
+
 func (m *Manager) SetSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
 	if err := m.inner.SetSessionV6(key, val); err != nil {
+		return err
+	}
+	if !shouldMirrorUserspaceSession(val.IsReverse) {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_ = m.syncSessionV6Locked("upsert", key, &val)
+	return nil
+}
+
+func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
+	installVal := val
+	installVal.FibIfindex = 0
+	installVal.FibVlanID = 0
+	installVal.FibDmac = [6]byte{}
+	installVal.FibSmac = [6]byte{}
+	installVal.FibGen = 0
+	if err := m.inner.SetSessionV6(key, installVal); err != nil {
 		return err
 	}
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
@@ -2902,6 +2940,10 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 		req.IngressZone = m.zoneNameByID(val.IngressZone)
 		req.EgressZone = m.zoneNameByID(val.EgressZone)
 		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID)
+		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
+		if req.TunnelEndpointID != 0 {
+			req.TXIfindex = 0
+		}
 		req.TXVLANID = val.FibVlanID
 		req.NeighborMAC = macString(val.FibDmac[:])
 		req.SrcMAC = macString(val.FibSmac[:])
@@ -2945,6 +2987,10 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		req.IngressZone = m.zoneNameByID(val.IngressZone)
 		req.EgressZone = m.zoneNameByID(val.EgressZone)
 		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID)
+		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
+		if req.TunnelEndpointID != 0 {
+			req.TXIfindex = 0
+		}
 		req.TXVLANID = val.FibVlanID
 		req.NeighborMAC = macString(val.FibDmac[:])
 		req.SrcMAC = macString(val.FibSmac[:])
@@ -2964,6 +3010,19 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		}
 	}
 	return req
+}
+
+func (m *Manager) sessionSyncTunnelEndpointIDLocked(egressIfindex int) uint16 {
+	snapshot := m.lastSnapshot
+	if snapshot == nil || egressIfindex <= 0 {
+		return 0
+	}
+	for _, endpoint := range snapshot.TunnelEndpoints {
+		if endpoint.Ifindex == egressIfindex {
+			return endpoint.ID
+		}
+	}
+	return 0
 }
 
 func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
