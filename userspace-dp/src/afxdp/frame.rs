@@ -25,6 +25,7 @@ pub(super) fn authoritative_forward_ports(
     flow_ports.or(meta_ports).or(frame_ports)
 }
 
+#[allow(dead_code)]
 pub(super) fn live_frame_ports(
     area: &MmapArea,
     desc: XdpDesc,
@@ -126,9 +127,14 @@ pub(super) fn enqueue_pending_forwards(
         // Read source frame directly from ingress UMEM — no heap copy needed.
         // The frame is safe to read: RX ring released but frame not yet returned
         // to fill ring (that happens after this function completes).
-        let Some(source_frame) = (unsafe { &*ingress_area })
+        let owned_source_frame = request.source_frame.as_deref();
+        let source_frame = if let Some(frame) = owned_source_frame {
+            frame
+        } else if let Some(frame) = (unsafe { &*ingress_area })
             .slice(request.source_offset as usize, request.desc.len as usize)
-        else {
+        {
+            frame
+        } else {
             ingress_binding.pending_fill_frames.push_back(source_offset);
             continue;
         };
@@ -148,16 +154,29 @@ pub(super) fn enqueue_pending_forwards(
             // parents have bindings; this is a safety-net fallback in case
             // the binding is not yet ready or bind() failed.
             if request.decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
-                maybe_reinject_slow_path(
-                    ingress_ident,
-                    ingress_live,
-                    slow_path,
-                    unsafe { &*ingress_area },
-                    request.desc,
-                    request.meta,
-                    request.decision,
-                    recent_exceptions,
-                );
+                if request.source_frame.is_some() {
+                    maybe_reinject_slow_path_from_frame(
+                        ingress_ident,
+                        ingress_live,
+                        slow_path,
+                        source_frame,
+                        request.meta,
+                        request.decision,
+                        recent_exceptions,
+                        "slow_path",
+                    );
+                } else {
+                    maybe_reinject_slow_path(
+                        ingress_ident,
+                        ingress_live,
+                        slow_path,
+                        unsafe { &*ingress_area },
+                        request.desc,
+                        request.meta,
+                        request.decision,
+                        recent_exceptions,
+                    );
+                }
                 ingress_binding.pending_fill_frames.push_back(source_offset);
                 continue;
             }
@@ -274,6 +293,7 @@ pub(super) fn enqueue_pending_forwards(
                 // NAT64: header size changes prevent in-place rewrite.
                 // Always use copy path with NAT64-specific frame builder.
                 let is_nat64 = request.decision.nat.nat64;
+                let uses_native_tunnel = request.decision.resolution.tunnel_endpoint_id != 0;
 
                 /*
                  * In-place TX optimization: rewrite the ingress frame directly in UMEM
@@ -282,8 +302,10 @@ pub(super) fn enqueue_pending_forwards(
                  * UMEM allocation. That includes same-binding hairpin and the narrow
                  * same-device shared-UMEM prototype.
                  */
-                let can_rewrite_in_place =
-                    target_binding.umem.allocation_ptr() == ingress_umem_ptr && !is_nat64;
+                let can_rewrite_in_place = target_binding.umem.allocation_ptr() == ingress_umem_ptr
+                    && !is_nat64
+                    && !uses_native_tunnel
+                    && request.source_frame.is_none();
                 if can_rewrite_in_place {
                     match rewrite_forwarded_frame_in_place(
                         unsafe { &*ingress_area },
@@ -407,7 +429,7 @@ pub(super) fn enqueue_pending_forwards(
                         let _ = drain_pending_tx(target_binding, now_ns, &mut post_recycles);
                         direct_tx_offset = target_binding.free_tx_frames.pop_front();
                     }
-                    let direct_built = if is_nat64 {
+                    let direct_built = if is_nat64 || uses_native_tunnel {
                         // NAT64 can't use direct TX — return the frame if we popped one.
                         if let Some(off) = direct_tx_offset {
                             target_binding.free_tx_frames.push_front(off);
@@ -899,16 +921,13 @@ pub(super) fn extract_l3_packet_with_nat(
     Some(packet)
 }
 
-pub(super) fn parse_session_flow(
-    area: &MmapArea,
-    desc: XdpDesc,
+pub(super) fn parse_session_flow_from_bytes(
+    frame: &[u8],
     meta: UserspaceDpMeta,
 ) -> Option<SessionFlow> {
     // Fast path: for TCP/UDP with complete metadata tuple, use meta directly
-    // without parsing the frame. This avoids UMEM reads and L3/L4 header
-    // parsing for every established-flow packet. ICMP is excluded because
-    // BPF may stamp outer-header IPs that differ from the session key
-    // (e.g., ICMP error messages with embedded inner headers).
+    // without parsing the frame. This avoids extra L3/L4 parsing for the
+    // common established-flow case.
     if matches!(meta.protocol, PROTO_TCP | PROTO_UDP)
         && let Some(meta_flow) = parse_session_flow_from_meta(meta)
         && metadata_tuple_complete(meta, &meta_flow)
@@ -916,17 +935,12 @@ pub(super) fn parse_session_flow(
         return Some(meta_flow);
     }
 
-    // Slow path: meta incomplete or non-TCP/UDP — parse from the actual frame
-    // and cross-reference with meta.
-    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
     let frame_flow = if matches!(meta.addr_family as i32, libc::AF_INET) {
         parse_ipv4_session_flow_from_frame(frame, meta)
     } else {
         parse_session_flow_from_frame(frame, meta)
     };
 
-    // For non-TCP/UDP (e.g. ICMP): when meta is complete, prefer meta unless
-    // frame IPs disagree (e.g. ICMP error with embedded inner header).
     if let Some(meta_flow) = parse_session_flow_from_meta(meta)
         && metadata_tuple_complete(meta, &meta_flow)
     {
@@ -943,8 +957,6 @@ pub(super) fn parse_session_flow(
         return Some(flow);
     }
 
-    // Final defensive fallback for malformed metadata where the frame parser
-    // could not recover either.
     let l3 = meta.l3_offset as usize;
     let l4 = meta.l4_offset as usize;
     match meta.addr_family as i32 {
@@ -1004,6 +1016,15 @@ pub(super) fn parse_session_flow(
         }
         _ => None,
     }
+}
+
+pub(super) fn parse_session_flow(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+) -> Option<SessionFlow> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    parse_session_flow_from_bytes(frame, meta)
 }
 
 /// Check if a frame contains a TCP RST flag. Returns (is_rst, summary) for logging.
@@ -1492,10 +1513,18 @@ pub(super) fn parse_zone_encoded_fabric_ingress(
     meta: UserspaceDpMeta,
     forwarding: &ForwardingState,
 ) -> Option<String> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    parse_zone_encoded_fabric_ingress_from_frame(frame, meta, forwarding)
+}
+
+pub(super) fn parse_zone_encoded_fabric_ingress_from_frame(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    forwarding: &ForwardingState,
+) -> Option<String> {
     if !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32) {
         return None;
     }
-    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
     if frame.len() < 12 {
         return None;
     }
@@ -1508,6 +1537,37 @@ pub(super) fn parse_zone_encoded_fabric_ingress(
         return None;
     }
     forwarding.zone_id_to_name.get(&(frame[11] as u16)).cloned()
+}
+
+pub(super) fn parse_packet_destination_from_frame(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+) -> Option<IpAddr> {
+    let l3 = meta.l3_offset as usize;
+    match meta.addr_family as i32 {
+        libc::AF_INET => {
+            let end = l3.checked_add(20)?;
+            if end > frame.len() {
+                return None;
+            }
+            Some(IpAddr::V4(Ipv4Addr::new(
+                frame[l3 + 16],
+                frame[l3 + 17],
+                frame[l3 + 18],
+                frame[l3 + 19],
+            )))
+        }
+        libc::AF_INET6 => {
+            let end = l3.checked_add(40)?;
+            if end > frame.len() {
+                return None;
+            }
+            Some(IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[l3 + 24..l3 + 40]).ok()?,
+            )))
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn build_injected_packet(
@@ -1574,7 +1634,7 @@ pub(super) fn build_forwarded_frame_from_frame(
     frame: &[u8],
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
-    _forwarding: &ForwardingState,
+    forwarding: &ForwardingState,
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<Vec<u8>> {
@@ -1588,6 +1648,9 @@ pub(super) fn build_forwarded_frame_from_frame(
         expected_ports,
     )?;
     out.truncate(written);
+    if decision.resolution.tunnel_endpoint_id != 0 {
+        return encapsulate_native_gre_frame(&out, meta, decision, forwarding);
+    }
     Some(out)
 }
 
@@ -1773,7 +1836,13 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
             }
             _ => return None,
         }
-        out.push(frame_out);
+        if decision.resolution.tunnel_endpoint_id != 0 {
+            out.push(encapsulate_native_gre_frame(
+                &frame_out, meta, decision, forwarding,
+            )?);
+        } else {
+            out.push(frame_out);
+        }
         data_offset += chunk_len;
     }
     Some(out)

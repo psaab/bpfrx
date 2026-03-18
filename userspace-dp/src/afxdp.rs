@@ -9,9 +9,7 @@ use crate::nat64::{Nat64ReverseInfo, Nat64State};
 use crate::nptv6::Nptv6State;
 use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
 use crate::prefix::{PrefixV4, PrefixV6};
-use crate::screen::{
-    ScreenPacketInfo, ScreenProfile, ScreenState, ScreenVerdict, extract_screen_info,
-};
+use crate::screen::{ScreenProfile, ScreenState, ScreenVerdict, extract_screen_info};
 use crate::session::{
     ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
     SessionLookup, SessionMetadata, SessionTable, forward_wire_key, reverse_canonical_key,
@@ -53,6 +51,8 @@ macro_rules! debug_log {
 mod bind;
 #[path = "afxdp/frame.rs"]
 mod frame;
+#[path = "afxdp/gre.rs"]
+mod gre;
 #[path = "afxdp/icmp.rs"]
 mod icmp;
 #[path = "afxdp/icmp_embed.rs"]
@@ -75,6 +75,7 @@ use self::bind::{
     shared_umem_group_key_for_device,
 };
 use self::frame::*;
+use self::gre::{encapsulate_native_gre_frame, try_native_gre_decap_from_frame};
 use self::icmp::{build_local_time_exceeded_request, is_icmp_error};
 #[cfg(test)]
 use self::icmp::{
@@ -1590,6 +1591,7 @@ struct PendingForwardRequest {
     ingress_queue_id: u32,
     source_offset: u64,
     desc: XdpDesc,
+    source_frame: Option<Vec<u8>>,
     meta: UserspaceDpMeta,
     decision: SessionDecision,
     apply_nat_on_fabric: bool,
@@ -2265,8 +2267,24 @@ fn poll_binding(
                 if disposition == PacketDisposition::Valid {
                     counters.validated_packets += 1;
                     counters.validated_bytes += desc.len as u64;
-                    let flow = parse_session_flow(unsafe { &*area }, desc, meta);
-                    if let Some(flow) = flow.as_ref() {
+                    let Some(raw_frame) =
+                        unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
+                    else {
+                        binding.scratch_recycle.push(desc.addr);
+                        continue;
+                    };
+                    let native_gre_packet =
+                        try_native_gre_decap_from_frame(raw_frame, meta, forwarding);
+                    let meta = native_gre_packet
+                        .as_ref()
+                        .map(|packet| packet.meta)
+                        .unwrap_or(meta);
+                    let mut owned_packet_frame = native_gre_packet.map(|packet| packet.frame);
+                    let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);
+                    let flow = parse_session_flow_from_bytes(packet_frame, meta);
+                    if owned_packet_frame.is_none()
+                        && let Some(flow) = flow.as_ref()
+                    {
                         learn_dynamic_neighbor_from_packet(
                             unsafe { &*area },
                             desc,
@@ -2277,9 +2295,8 @@ fn poll_binding(
                             dynamic_neighbors,
                         );
                     }
-                    let ingress_zone_override = parse_zone_encoded_fabric_ingress(
-                        unsafe { &*area },
-                        desc,
+                    let ingress_zone_override = parse_zone_encoded_fabric_ingress_from_frame(
+                        packet_frame,
                         meta,
                         forwarding,
                     );
@@ -2299,37 +2316,18 @@ fn poll_binding(
                                 } else {
                                     14 // default Ethernet header
                                 };
-                                let screen_pkt = if let Some(rx_frame) =
-                                    unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
-                                {
-                                    extract_screen_info(
-                                        rx_frame,
-                                        meta.addr_family,
-                                        meta.protocol,
-                                        meta.tcp_flags,
-                                        meta.pkt_len,
-                                        flow.src_ip,
-                                        flow.dst_ip,
-                                        flow.forward_key.src_port,
-                                        flow.forward_key.dst_port,
-                                        l3_off,
-                                    )
-                                } else {
-                                    ScreenPacketInfo {
-                                        addr_family: meta.addr_family,
-                                        protocol: meta.protocol,
-                                        tcp_flags: meta.tcp_flags,
-                                        src_ip: flow.src_ip,
-                                        dst_ip: flow.dst_ip,
-                                        src_port: flow.forward_key.src_port,
-                                        dst_port: flow.forward_key.dst_port,
-                                        pkt_len: meta.pkt_len,
-                                        is_fragment: false,
-                                        ip_ihl: 5,
-                                        ip_frag_off: 0,
-                                        ip_total_len: 0,
-                                    }
-                                };
+                                let screen_pkt = extract_screen_info(
+                                    packet_frame,
+                                    meta.addr_family,
+                                    meta.protocol,
+                                    meta.tcp_flags,
+                                    meta.pkt_len,
+                                    flow.src_ip,
+                                    flow.dst_ip,
+                                    flow.forward_key.src_port,
+                                    flow.forward_key.dst_port,
+                                    l3_off,
+                                );
                                 if let ScreenVerdict::Drop(_reason) =
                                     screen.check_packet(zone_name, &screen_pkt, now_secs)
                                 {
@@ -2360,15 +2358,15 @@ fn poll_binding(
                                 },
                                 nat: NatDecision::default(),
                             };
-                            maybe_reinject_slow_path(
+                            maybe_reinject_slow_path_from_frame(
                                 &ident,
                                 &binding.live,
                                 slow_path,
-                                unsafe { &*area },
-                                desc,
+                                packet_frame,
                                 meta,
                                 ipsec_decision,
                                 recent_exceptions,
+                                "slow_path",
                             );
                             binding.scratch_recycle.push(desc.addr);
                             continue;
@@ -2434,7 +2432,7 @@ fn poll_binding(
                             counters.session_misses += 1;
                             dbg.session_miss += 1;
                             let resolution_target =
-                                parse_packet_destination(unsafe { &*area }, desc, meta)
+                                parse_packet_destination_from_frame(packet_frame, meta)
                                     .unwrap_or(flow.dst_ip);
 
                             // Cluster peer return fast path:
@@ -2487,12 +2485,12 @@ fn poll_binding(
                                         interface: binding.interface.clone(),
                                         ifindex: binding.ifindex,
                                     };
-                                    if let Some(request) = build_live_forward_request(
-                                        unsafe { &*area },
+                                    if let Some(mut request) = build_live_forward_request_from_frame(
                                         binding_lookup,
                                         binding_index,
                                         &ingress_ident,
                                         desc,
+                                        packet_frame,
                                         meta,
                                         &fabric_return_decision,
                                         forwarding,
@@ -2500,6 +2498,7 @@ fn poll_binding(
                                         None,
                                         false,
                                     ) {
+                                        request.source_frame = owned_packet_frame.take();
                                         if sessions.install_with_protocol(
                                             flow.forward_key.clone(),
                                             fabric_return_decision,
@@ -2863,6 +2862,7 @@ fn poll_binding(
                                                 ingress_queue_id: ident.queue_id,
                                                 source_offset: desc.addr,
                                                 desc,
+                                                source_frame: None,
                                                 meta,
                                                 decision: icmp_decision,
                                                 apply_nat_on_fabric: false,
@@ -3566,12 +3566,12 @@ fn poll_binding(
                         if decision.nat.rewrite_dst.is_some() {
                             counters.dnat_packets += 1;
                         }
-                        if let Some(request) = build_live_forward_request(
-                            unsafe { &*area },
+                        if let Some(mut request) = build_live_forward_request_from_frame(
                             binding_lookup,
                             binding_index,
                             &ident,
                             desc,
+                            packet_frame,
                             meta,
                             &decision,
                             forwarding,
@@ -3579,6 +3579,7 @@ fn poll_binding(
                             session_ingress_zone.as_ref(),
                             apply_nat_on_fabric,
                         ) {
+                            request.source_frame = owned_packet_frame.take();
                             dbg.tx += 1; // track forward requests queued
                             if cfg!(feature = "debug-log") {
                                 if dbg.tx <= 5 {
@@ -3707,15 +3708,15 @@ fn poll_binding(
                             recent_exceptions,
                             last_resolution,
                         );
-                        maybe_reinject_slow_path(
+                        maybe_reinject_slow_path_from_frame(
                             &ident,
                             &binding.live,
                             slow_path,
-                            unsafe { &*area },
-                            desc,
+                            packet_frame,
                             meta,
                             decision,
                             recent_exceptions,
+                            "slow_path",
                         );
                     }
                 } else {
@@ -3827,6 +3828,35 @@ fn build_live_forward_request(
     fabric_ingress_zone: Option<&Arc<str>>,
     apply_nat_on_fabric: bool,
 ) -> Option<PendingForwardRequest> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    build_live_forward_request_from_frame(
+        binding_lookup,
+        current_binding_index,
+        ingress_ident,
+        desc,
+        frame,
+        meta,
+        decision,
+        forwarding,
+        flow,
+        fabric_ingress_zone,
+        apply_nat_on_fabric,
+    )
+}
+
+fn build_live_forward_request_from_frame(
+    binding_lookup: &WorkerBindingLookup,
+    current_binding_index: usize,
+    ingress_ident: &BindingIdentity,
+    desc: XdpDesc,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    flow: Option<&SessionFlow>,
+    fabric_ingress_zone: Option<&Arc<str>>,
+    apply_nat_on_fabric: bool,
+) -> Option<PendingForwardRequest> {
     let target_ifindex = if decision.resolution.tx_ifindex > 0 {
         decision.resolution.tx_ifindex
     } else {
@@ -3838,26 +3868,10 @@ fn build_live_forward_request(
         ingress_ident.queue_id,
         target_ifindex,
     );
-    // Verify the UMEM slice is accessible (validates addr/len).
-    let _ = area.slice(desc.addr as usize, desc.len as usize)?;
     // Prefer session flow ports (set by conntrack, immune to DMA races),
     // then live frame ports (lazy — only parsed if session ports unavailable),
     // then metadata as last resort.
-    let session_ports = flow.and_then(|f| {
-        if f.forward_key.src_port != 0 && f.forward_key.dst_port != 0 {
-            Some((f.forward_key.src_port, f.forward_key.dst_port))
-        } else {
-            None
-        }
-    });
-    let meta_ports = if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
-        Some((meta.flow_src_port, meta.flow_dst_port))
-    } else {
-        None
-    };
-    let expected_ports = session_ports
-        .or_else(|| live_frame_ports(area, desc, meta))
-        .or(meta_ports);
+    let expected_ports = authoritative_forward_ports(frame, meta, flow);
     let mut decision = *decision;
     if decision.resolution.disposition == ForwardingDisposition::FabricRedirect
         && let Some(ingress_zone) = fabric_ingress_zone
@@ -3872,6 +3886,7 @@ fn build_live_forward_request(
         ingress_queue_id: ingress_ident.queue_id,
         source_offset: desc.addr,
         desc,
+        source_frame: None,
         meta,
         decision,
         apply_nat_on_fabric,
@@ -9231,6 +9246,91 @@ mod tests {
     }
 
     #[test]
+    fn native_gre_decap_maps_inner_packet_to_logical_tunnel_ingress() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let inner = build_icmp_echo_frame_v4(
+            Ipv4Addr::new(10, 255, 192, 41),
+            Ipv4Addr::new(10, 255, 192, 42),
+            63,
+        );
+        let outer = build_ipv6_gre_frame(
+            &inner[14..],
+            "2602:ffd3:0:2::7".parse().unwrap(),
+            "2001:559:8585:80::8".parse().unwrap(),
+            None,
+        );
+        let packet = try_native_gre_decap_from_frame(&outer, native_gre_outer_meta(), &state)
+            .expect("native gre decap");
+        assert_eq!(packet.meta.ingress_ifindex, 362);
+        assert_eq!(packet.meta.addr_family, libc::AF_INET as u8);
+        assert_eq!(packet.meta.protocol, PROTO_ICMP);
+        assert_eq!(packet.meta.l3_offset, 14);
+        assert_eq!(&packet.frame[12..14], &[0x08, 0x00]);
+        assert_eq!(&packet.frame[26..30], &[10, 255, 192, 41]);
+        assert_eq!(&packet.frame[30..34], &[10, 255, 192, 42]);
+    }
+
+    #[test]
+    fn build_forwarded_frame_from_frame_encapsulates_native_gre() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let inner =
+            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(8, 8, 8, 8), 64);
+        let inner_meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 11,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 42,
+            pkt_len: (inner.len() - 14) as u16,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            flow_src_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&[10, 0, 61, 102]);
+                addr
+            },
+            flow_dst_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&[8, 8, 8, 8]);
+                addr
+            },
+            flow_src_port: 0x1234,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: lookup_forwarding_resolution_v4(
+                &state,
+                None,
+                Ipv4Addr::new(8, 8, 8, 8),
+                "sfmix.inet.0",
+                0,
+                true,
+            ),
+            nat: NatDecision::default(),
+        };
+        let built = build_forwarded_frame_from_frame(
+            &inner,
+            inner_meta,
+            &decision,
+            &state,
+            false,
+            Some((0x1234, 0)),
+        )
+        .expect("encapsulated gre frame");
+        assert_eq!(&built[12..16], &[0x81, 0x00, 0x00, 0x50]);
+        assert_eq!(&built[16..18], &[0x86, 0xdd]);
+        assert_eq!(&built[22..24], &[0x00, 0x20]);
+        assert_eq!(built[24], PROTO_GRE);
+        assert_eq!(built[25], 64);
+        assert_eq!(&built[60..62], &[0x08, 0x00]);
+        assert_eq!(built[70], 63);
+        assert_eq!(&built[74..78], &[10, 0, 61, 102]);
+        assert_eq!(&built[78..82], &[8, 8, 8, 8]);
+    }
+
+    #[test]
     fn ha_resolution_blocks_inactive_owner_rg() {
         let state = build_forwarding_state(&nat_snapshot());
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
@@ -13642,6 +13742,62 @@ mod tests {
         let icmp_csum = checksum16_ipv6(src, dst, PROTO_ICMPV6, &frame[icmp_start..]);
         frame[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_csum.to_be_bytes());
         frame
+    }
+
+    fn build_ipv6_gre_frame(
+        inner_packet: &[u8],
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        key: Option<u32>,
+    ) -> Vec<u8> {
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+            [0xde, 0xad, 0xbe, 0xef, 0x00, 0x02],
+            0,
+            0x86dd,
+        );
+        let gre_len = if key.is_some() { 8usize } else { 4usize };
+        let payload_len = u16::try_from(gre_len + inner_packet.len()).unwrap();
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+        frame.extend_from_slice(&payload_len.to_be_bytes());
+        frame.push(PROTO_GRE);
+        frame.push(64);
+        frame.extend_from_slice(&src.octets());
+        frame.extend_from_slice(&dst.octets());
+        let flags = if key.is_some() { 0x2000u16 } else { 0u16 };
+        frame.extend_from_slice(&flags.to_be_bytes());
+        frame.extend_from_slice(
+            &(if inner_packet.first().map(|b| b >> 4) == Some(4) {
+                0x0800u16
+            } else {
+                0x86ddu16
+            })
+            .to_be_bytes(),
+        );
+        if let Some(key) = key {
+            frame.extend_from_slice(&key.to_be_bytes());
+        }
+        frame.extend_from_slice(inner_packet);
+        frame
+    }
+
+    fn native_gre_outer_meta() -> UserspaceDpMeta {
+        UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 6,
+            rx_queue_index: 0,
+            l3_offset: 14,
+            l4_offset: 54,
+            payload_offset: 58,
+            pkt_len: 92,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_GRE,
+            ..UserspaceDpMeta::default()
+        }
     }
 
     #[test]

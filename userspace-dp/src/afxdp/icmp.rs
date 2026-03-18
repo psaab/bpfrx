@@ -49,6 +49,7 @@ pub(super) fn build_local_time_exceeded_request(
         ingress_queue_id: ingress_ident.queue_id,
         source_offset: desc.addr,
         desc,
+        source_frame: None,
         meta,
         decision: SessionDecision {
             resolution: ForwardingResolution {
