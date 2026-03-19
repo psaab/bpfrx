@@ -3275,9 +3275,9 @@ pub(super) fn recompute_l4_checksum_ipv6(packet: &mut [u8], protocol: u8) -> Opt
 
 /// Verify IP + TCP/UDP checksums on a fully-built forwarded frame.
 /// Returns (ip_ok, l4_ok). Logs mismatches for the first N frames.
-static CSUM_VERIFIED_TOTAL: AtomicU64 = AtomicU64::new(0);
-static CSUM_BAD_IP_TOTAL: AtomicU64 = AtomicU64::new(0);
-static CSUM_BAD_L4_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub(super) static CSUM_VERIFIED_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub(super) static CSUM_BAD_IP_TOTAL: AtomicU64 = AtomicU64::new(0);
+pub(super) static CSUM_BAD_L4_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn verify_built_frame_checksums(frame: &[u8]) -> (bool, bool) {
     let l3 = match frame_l3_offset(frame) {

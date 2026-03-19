@@ -519,6 +519,8 @@ struct ControlRequest {
     session_sync: Option<SessionSyncRequest>,
     #[serde(rename = "session_deltas", default)]
     session_deltas: Option<SessionDeltaDrainRequest>,
+    #[serde(default)]
+    neighbors: Option<Vec<NeighborSnapshot>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1375,6 +1377,36 @@ fn handle_stream(
                 } else {
                     response.ok = false;
                     response.error = "missing HA state".to_string();
+                }
+            }
+            "update_neighbors" => {
+                if let Some(neighbors) = request.neighbors.as_ref() {
+                    let mut count = 0usize;
+                    for neigh in neighbors {
+                        if neigh.ifindex <= 0 || neigh.mac.is_empty() {
+                            continue;
+                        }
+                        let Ok(ip) = neigh.ip.parse::<std::net::IpAddr>() else {
+                            continue;
+                        };
+                        let Some(mac) = afxdp::parse_mac_str(&neigh.mac) else {
+                            continue;
+                        };
+                        if !afxdp::neighbor_state_usable_str(&neigh.state) {
+                            continue;
+                        }
+                        if let Ok(mut cache) = guard.afxdp.dynamic_neighbors_ref().lock() {
+                            cache.insert(
+                                (neigh.ifindex, ip),
+                                afxdp::NeighborEntry { mac },
+                            );
+                            count += 1;
+                        }
+                    }
+                    #[cfg(feature = "debug-log")]
+                    if count > 0 {
+                        eprintln!("CTRL_REQ: update_neighbors count={}", count);
+                    }
                 }
             }
             "set_queue_state" => {

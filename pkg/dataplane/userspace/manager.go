@@ -2430,7 +2430,7 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 		Flags:              ctrlFlags,
 		ConfigGeneration:   0,
 		FIBGeneration:      0,
-		HeartbeatTimeoutMS: 5000,
+		HeartbeatTimeoutMS: 30000,
 	}
 	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update userspace_ctrl: %w", err)
@@ -2531,7 +2531,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		Flags:              ctrlFlags,
 		ConfigGeneration:   status.LastSnapshotGeneration,
 		FIBGeneration:      status.LastFIBGeneration,
-		HeartbeatTimeoutMS: 5000,
+		HeartbeatTimeoutMS: 30000,
 	}
 	if status.Enabled {
 		ctrl.Enabled = 1
@@ -2545,7 +2545,11 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			continue
 		}
 		flags := uint32(0)
-		if binding.Registered && binding.Armed && binding.Ready {
+		if binding.Registered && binding.Armed && binding.Bound {
+			// Mark ready if bound (XSK socket exists), not just if
+			// heartbeat is fresh. The heartbeat check is too strict
+			// during startup — a brief stale period shouldn't cause
+			// the XDP shim to drop ALL packets on that queue.
 			flags = userspaceBindingReady
 		}
 		idx := uint32(binding.Ifindex)*bindingQueuesPerIface + binding.QueueID
@@ -2567,7 +2571,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 				continue
 			}
 			flags := uint32(0)
-			if binding.Registered && binding.Armed && binding.Ready {
+			if binding.Registered && binding.Armed && binding.Bound {
 				flags = userspaceBindingReady
 			}
 			idx := childIfindex*bindingQueuesPerIface + binding.QueueID
@@ -3545,6 +3549,7 @@ func (m *Manager) ensureStatusLoopLocked() {
 func (m *Manager) statusLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	var neighborTick int
 
 	for {
 		select {
@@ -3570,8 +3575,36 @@ func (m *Manager) statusLoop(ctx context.Context) {
 			} else {
 				slog.Warn("userspace dataplane status poll failed", "err", err)
 			}
+			// Refresh kernel neighbors every 5 ticks (5 seconds).
+			// The Rust helper can't see kernel ARP entries directly;
+			// this pushes them so MissingNeighbor resolves quickly.
+			neighborTick++
+			if neighborTick >= 5 && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
+				neighborTick = 0
+				m.refreshNeighborSnapshotLocked()
+			}
 			m.mu.Unlock()
 		}
+	}
+}
+
+func (m *Manager) refreshNeighborSnapshotLocked() {
+	if m.proc == nil || m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
+		return
+	}
+	neighbors := buildNeighborSnapshots(m.lastSnapshot.Config)
+	if len(neighbors) == 0 {
+		return
+	}
+	// Update the snapshot's neighbors and push to the helper.
+	m.lastSnapshot.Neighbors = neighbors
+	var status ProcessStatus
+	req := ControlRequest{
+		Type: "update_neighbors",
+		Neighbors: neighbors,
+	}
+	if err := m.requestLocked(req, &status); err != nil {
+		slog.Warn("userspace neighbor refresh failed", "err", err)
 	}
 }
 

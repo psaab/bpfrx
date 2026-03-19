@@ -274,6 +274,10 @@ impl Coordinator {
         self.stop_inner(true);
     }
 
+    pub fn dynamic_neighbors_ref(&self) -> &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>> {
+        &self.dynamic_neighbors
+    }
+
     fn stop_inner(&mut self, clear_synced_state: bool) {
         for handle in self.tunnel_sources.values_mut() {
             handle.stop.store(true, Ordering::Relaxed);
@@ -1410,8 +1414,8 @@ struct RouteEntryV6 {
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
-struct NeighborEntry {
-    mac: [u8; 6],
+pub struct NeighborEntry {
+    pub mac: [u8; 6],
 }
 
 #[derive(Clone, Debug)]
@@ -3806,11 +3810,24 @@ fn poll_binding(
                             }
                             ForwardingDisposition::MissingNeighbor => {
                                 dbg.missing_neigh += 1;
+                                // Reinject to slow-path so kernel can forward
+                                // (kernel has ARP table, we don't yet).
+                                maybe_reinject_slow_path_from_frame(
+                                    &ident,
+                                    &binding.live,
+                                    slow_path,
+                                    local_tunnel_deliveries,
+                                    packet_frame,
+                                    meta,
+                                    decision,
+                                    recent_exceptions,
+                                    "missing_neighbor_slow_path",
+                                );
                                 if cfg!(feature = "debug-log") {
                                     if dbg.missing_neigh <= 3 {
                                         if let Some(flow) = flow.as_ref() {
                                             eprintln!(
-                                                "DBG MISS_NEIGH: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
+                                                "DBG MISS_NEIGH→SLOW: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
                                                 flow.src_ip,
                                                 flow.forward_key.src_port,
                                                 flow.dst_ip,
@@ -6480,6 +6497,14 @@ fn neighbor_state_usable(state: &str) -> bool {
     !(normalized.contains("failed") || normalized.contains("incomplete"))
 }
 
+pub fn neighbor_state_usable_str(state: &str) -> bool {
+    neighbor_state_usable(state)
+}
+
+pub fn parse_mac_str(s: &str) -> Option<[u8; 6]> {
+    parse_mac(s)
+}
+
 fn parse_mac(s: &str) -> Option<[u8; 6]> {
     let mut out = [0u8; 6];
     let mut parts = s.split(':');
@@ -7653,12 +7678,10 @@ fn lookup_neighbor_entry(
             return Some(entry);
         }
     }
-    let ifname = state.ifindex_to_name.get(&ifindex)?.clone();
-    let entry = refresh_dynamic_neighbor(&ifname, target)?;
-    if let Ok(mut cache) = dynamic_neighbors.lock() {
-        cache.insert((ifindex, target), entry);
-    }
-    Some(entry)
+    // The worker hot path must not block on shelling out to `ip neigh` or
+    // active probes. Neighbor discovery is refreshed asynchronously by the
+    // manager snapshot path and the periodic update_neighbors control request.
+    None
 }
 
 #[allow(dead_code)]

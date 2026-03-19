@@ -21,6 +21,7 @@ type ControlRequest struct {
 	Packet        *InjectPacketRequest      `json:"packet,omitempty"`
 	SessionSync   *SessionSyncRequest       `json:"session_sync,omitempty"`
 	SessionDeltas *SessionDeltaDrainRequest `json:"session_deltas,omitempty"`
+	Neighbors     []NeighborSnapshot        `json:"neighbors,omitempty"`
 }
 
 type ControlResponse struct {
