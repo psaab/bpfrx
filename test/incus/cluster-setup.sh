@@ -62,7 +62,10 @@ LAN_GW="${LAN_GW:-}"
 SRIOV_PARENT="${SRIOV_PARENT:-eno6np1}"
 SRIOV_LAN_PARENT="${SRIOV_LAN_PARENT:-}"   # Container LAN: nictype=sriov parent
 
-# WAN VF PCI addresses per VM (VF_PCI is legacy alias for VF_WAN_PCI)
+# WAN VF identifiers per VM.
+# Prefer stable VF indices on the PF and resolve the live PCI BDF at runtime.
+# VF_PCI is a legacy alias for VF_WAN_PCI.
+if [[ -z "${VF_WAN_INDEX+x}" ]]; then VF_WAN_INDEX=(); fi
 if [[ -z "${VF_WAN_PCI+x}" ]]; then
 	if [[ -z "${VF_PCI+x}" ]]; then
 		VF_WAN_PCI=("0000:b7:06.0" "0000:b7:06.1")
@@ -71,7 +74,8 @@ if [[ -z "${VF_WAN_PCI+x}" ]]; then
 	fi
 fi
 VF_WAN_TRUST="${VF_WAN_TRUST:-true}"
-# LAN VF PCI addresses per VM (empty = no LAN VF passthrough)
+# LAN VF identifiers per VM (empty = no LAN VF passthrough)
+if [[ -z "${VF_LAN_INDEX+x}" ]]; then VF_LAN_INDEX=(); fi
 if [[ -z "${VF_LAN_PCI+x}" ]]; then VF_LAN_PCI=(); fi
 
 # Network names (parameterized for remote)
@@ -126,6 +130,93 @@ wait_for_agent() {
 			die "VM agent for $inst did not become ready after $((max * 2)) seconds"
 		fi
 	done
+}
+
+host_readlink_basename() {
+	local path="$1"
+	if [[ -n "${INCUS_REMOTE:-}" ]]; then
+		ssh "$INCUS_REMOTE" "readlink -f '$path' 2>/dev/null | xargs basename 2>/dev/null"
+	else
+		readlink -f "$path" 2>/dev/null | xargs basename 2>/dev/null
+	fi
+}
+
+resolve_vf_pci() {
+	local parent="$1"
+	local vf_idx="$2"
+	local vf_path="/sys/class/net/${parent}/device/virtfn${vf_idx}"
+	local vf_pci
+
+	vf_pci=$(host_readlink_basename "$vf_path")
+	[[ -n "${vf_pci:-}" ]] || die "Unable to resolve PCI BDF for ${parent} vf ${vf_idx}"
+	echo "$vf_pci"
+}
+
+resolve_vm_vf_pci() {
+	local kind="$1"
+	local idx="$2"
+	local parent index pci
+
+	case "$kind" in
+		wan)
+			parent="$SRIOV_PARENT"
+			index="${VF_WAN_INDEX[$idx]:-}"
+			pci="${VF_WAN_PCI[$idx]:-}"
+			;;
+		lan)
+			parent="$SRIOV_LAN_PARENT"
+			index="${VF_LAN_INDEX[$idx]:-}"
+			pci="${VF_LAN_PCI[$idx]:-}"
+			;;
+		*)
+			die "Unknown VF kind: $kind"
+			;;
+	esac
+
+	if [[ -n "${index:-}" ]]; then
+		[[ -n "${parent:-}" ]] || die "Cannot resolve ${kind} VF index without parent PF"
+		resolve_vf_pci "$parent" "$index"
+		return
+	fi
+
+	[[ -n "${pci:-}" ]] || die "No ${kind} VF configured for node ${idx}"
+	echo "$pci"
+}
+
+resolve_vm_vf_index() {
+	local kind="$1"
+	local idx="$2"
+	case "$kind" in
+		wan)
+			if [[ -n "${VF_WAN_INDEX[$idx]:-}" ]]; then
+				echo "${VF_WAN_INDEX[$idx]}"
+			fi
+			;;
+		lan)
+			if [[ -n "${VF_LAN_INDEX[$idx]:-}" ]]; then
+				echo "${VF_LAN_INDEX[$idx]}"
+			fi
+			;;
+		*)
+			die "Unknown VF kind: $kind"
+			;;
+	esac
+}
+
+find_vf_index_by_pci() {
+	local parent="$1"
+	local target_pci="$2"
+	local vf_path vf_pci
+
+	for vf_path in /sys/class/net/"${parent}"/device/virtfn*; do
+		vf_pci=$(host_readlink_basename "$vf_path")
+		if [[ "$vf_pci" == "$target_pci" ]]; then
+			basename "$vf_path" | sed 's/virtfn//'
+			return 0
+		fi
+	done
+
+	return 1
 }
 
 # ── Init ─────────────────────────────────────────────────────────────
@@ -240,7 +331,8 @@ create_vm() {
 	sleep 2
 
 	# WAN VF (always present)
-	local wan_pci="${VF_WAN_PCI[$idx]}"
+	local wan_pci
+	wan_pci=$(resolve_vm_vf_pci wan "$idx")
 	info "Adding WAN SR-IOV VF PCI $wan_pci to $vm..."
 	incus config device add "$(r "$vm")" wan-vf pci address="$wan_pci"
 
@@ -248,19 +340,11 @@ create_vm() {
 	# VLAN subinterfaces (e.g. reth0.50/reth0.80), which requires trust on
 	# the passed-through VF.
 	if [[ "${VF_WAN_TRUST}" == "true" && -n "${SRIOV_PARENT:-}" ]]; then
-		local wan_vf_idx=""
-		for vf_path in /sys/class/net/"${SRIOV_PARENT}"/device/virtfn*; do
-			local vf_pci
-			if [[ -n "${INCUS_REMOTE:-}" ]]; then
-				vf_pci=$(ssh "$INCUS_REMOTE" "readlink -f '$vf_path' | xargs basename")
-			else
-				vf_pci=$(readlink -f "$vf_path" | xargs basename)
-			fi
-			if [[ "$vf_pci" == "$wan_pci" ]]; then
-				wan_vf_idx=$(basename "$vf_path" | sed 's/virtfn//')
-				break
-			fi
-		done
+		local wan_vf_idx
+		wan_vf_idx=$(resolve_vm_vf_index wan "$idx" || true)
+		if [[ -z "${wan_vf_idx:-}" ]]; then
+			wan_vf_idx=$(find_vf_index_by_pci "$SRIOV_PARENT" "$wan_pci" || true)
+		fi
 		if [[ -n "${wan_vf_idx:-}" ]]; then
 			info "Setting host WAN VF trust on $SRIOV_PARENT vf $wan_vf_idx ($wan_pci)..."
 			if [[ -n "${INCUS_REMOTE:-}" ]]; then
@@ -272,29 +356,21 @@ create_vm() {
 	fi
 
 	# LAN VF (optional — only if VF_LAN_PCI is configured)
-	if [[ ${#VF_LAN_PCI[@]} -gt 0 ]]; then
-		local lan_pci="${VF_LAN_PCI[$idx]}"
+	if [[ -n "${VF_LAN_INDEX[$idx]:-}" || ${#VF_LAN_PCI[@]} -gt 0 ]]; then
+		local lan_pci
+		lan_pci=$(resolve_vm_vf_pci lan "$idx")
 		info "Adding LAN SR-IOV VF PCI $lan_pci to $vm..."
 		incus config device add "$(r "$vm")" lan-vf pci address="$lan_pci"
 	fi
 
 	# Set host-level VF VLAN for LAN VFs (PCI passthrough doesn't get incus vlan= option)
-	if [[ -n "${VF_LAN_VLAN:-}" && -n "${SRIOV_LAN_PARENT:-}" && ${#VF_LAN_PCI[@]} -gt 0 ]]; then
-		local lan_pci="${VF_LAN_PCI[$idx]}"
-		# Find VF index from PCI address
-		local vf_idx
-		for vf_path in /sys/class/net/"${SRIOV_LAN_PARENT}"/device/virtfn*; do
-			local vf_pci
-			if [[ -n "${INCUS_REMOTE:-}" ]]; then
-				vf_pci=$(ssh "$INCUS_REMOTE" "readlink -f '$vf_path' | xargs basename")
-			else
-				vf_pci=$(readlink -f "$vf_path" | xargs basename)
-			fi
-			if [[ "$vf_pci" == "$lan_pci" ]]; then
-				vf_idx=$(basename "$vf_path" | sed 's/virtfn//')
-				break
-			fi
-		done
+	if [[ -n "${VF_LAN_VLAN:-}" && -n "${SRIOV_LAN_PARENT:-}" && (-n "${VF_LAN_INDEX[$idx]:-}" || ${#VF_LAN_PCI[@]} -gt 0) ]]; then
+		local lan_pci vf_idx
+		lan_pci=$(resolve_vm_vf_pci lan "$idx")
+		vf_idx=$(resolve_vm_vf_index lan "$idx" || true)
+		if [[ -z "${vf_idx:-}" ]]; then
+			vf_idx=$(find_vf_index_by_pci "$SRIOV_LAN_PARENT" "$lan_pci" || true)
+		fi
 		if [[ -n "${vf_idx:-}" ]]; then
 			info "Setting host VF VLAN $VF_LAN_VLAN on $SRIOV_LAN_PARENT vf $vf_idx ($lan_pci)..."
 			if [[ -n "${INCUS_REMOTE:-}" ]]; then
