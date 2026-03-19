@@ -71,23 +71,6 @@ func TestSessionSyncEgressLockedDerivesOwnerAndTxPath(t *testing.T) {
 	}
 }
 
-func TestSessionSyncTunnelEndpointIDLockedMatchesLogicalTunnelIfindex(t *testing.T) {
-	m := &Manager{
-		lastSnapshot: &ConfigSnapshot{
-			TunnelEndpoints: []TunnelEndpointSnapshot{{
-				ID:      3,
-				Ifindex: 586,
-			}},
-		},
-	}
-	if got := m.sessionSyncTunnelEndpointIDLocked(586); got != 3 {
-		t.Fatalf("tunnel endpoint id = %d, want 3", got)
-	}
-	if got := m.sessionSyncTunnelEndpointIDLocked(24); got != 0 {
-		t.Fatalf("tunnel endpoint id for non-tunnel ifindex = %d, want 0", got)
-	}
-}
-
 func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
 	m := &Manager{
 		inner: dataplane.New(),
@@ -127,108 +110,6 @@ func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
 	}
 	if !req.FabricIngress {
 		t.Fatalf("expected fabric_ingress to be preserved: %+v", req)
-	}
-}
-
-func TestBuildSessionSyncRequestV4PreservesTunnelEndpointIdentity(t *testing.T) {
-	m := &Manager{
-		inner: dataplane.New(),
-		lastSnapshot: &ConfigSnapshot{
-			Interfaces: []InterfaceSnapshot{{
-				Name:            "gr-0/0/0.0",
-				Ifindex:         586,
-				RedundancyGroup: 1,
-			}},
-			TunnelEndpoints: []TunnelEndpointSnapshot{{
-				ID:              3,
-				Ifindex:         586,
-				RedundancyGroup: 1,
-			}},
-		},
-	}
-	key := dataplane.SessionKey{
-		SrcIP:    [4]byte{10, 0, 61, 102},
-		DstIP:    [4]byte{10, 255, 192, 41},
-		SrcPort:  hostToNetwork16(4459),
-		DstPort:  hostToNetwork16(4459),
-		Protocol: 1,
-	}
-	val := &dataplane.SessionValue{
-		IngressZone: 1,
-		EgressZone:  2,
-		LogFlags:    dataplane.LogFlagUserspaceTunnelEndpoint,
-		FibIfindex:  894,
-		FibGen:      3,
-		FibVlanID:   80,
-		FibDmac:     [6]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
-		FibSmac:     [6]byte{0x02, 0xbf, 0x72, 0x00, 0x50, 0x08},
-	}
-	req := m.buildSessionSyncRequestV4("upsert", key, val)
-	if req.TunnelEndpointID != 3 {
-		t.Fatalf("unexpected tunnel endpoint id: %d", req.TunnelEndpointID)
-	}
-	if req.EgressIfindex != 586 {
-		t.Fatalf("unexpected egress ifindex: %d", req.EgressIfindex)
-	}
-	if req.TXIfindex != 0 {
-		t.Fatalf("unexpected tx ifindex: %d", req.TXIfindex)
-	}
-	if req.OwnerRGID != 1 {
-		t.Fatalf("unexpected owner rg: %d", req.OwnerRGID)
-	}
-	if req.TXVLANID != 0 {
-		t.Fatalf("unexpected tx vlan id: %d", req.TXVLANID)
-	}
-	if req.NeighborMAC != "" || req.SrcMAC != "" {
-		t.Fatalf("unexpected tunnel L2 metadata: %+v", req)
-	}
-}
-
-func TestBuildSessionSyncRequestV6PreservesTunnelEndpointIdentity(t *testing.T) {
-	m := &Manager{
-		inner: dataplane.New(),
-		lastSnapshot: &ConfigSnapshot{
-			Interfaces: []InterfaceSnapshot{{
-				Name:            "gr-0/0/0.0",
-				Ifindex:         586,
-				RedundancyGroup: 1,
-			}},
-			TunnelEndpoints: []TunnelEndpointSnapshot{{
-				ID:              7,
-				Ifindex:         586,
-				RedundancyGroup: 1,
-			}},
-		},
-	}
-	var srcIP, dstIP [16]byte
-	copy(srcIP[:], net.ParseIP("2001:559:8585:ef00::100").To16())
-	copy(dstIP[:], net.ParseIP("2001:db8::1").To16())
-	val := &dataplane.SessionValueV6{
-		IngressZone: 1,
-		EgressZone:  2,
-		LogFlags:    dataplane.LogFlagUserspaceTunnelEndpoint,
-		FibIfindex:  1133,
-		FibGen:      7,
-		FibVlanID:   80,
-	}
-	req := m.buildSessionSyncRequestV6("upsert", dataplane.SessionKeyV6{
-		SrcIP:    srcIP,
-		DstIP:    dstIP,
-		SrcPort:  hostToNetwork16(5555),
-		DstPort:  hostToNetwork16(53),
-		Protocol: 17,
-	}, val)
-	if req.TunnelEndpointID != 7 {
-		t.Fatalf("unexpected tunnel endpoint id: %d", req.TunnelEndpointID)
-	}
-	if req.EgressIfindex != 586 {
-		t.Fatalf("unexpected egress ifindex: %d", req.EgressIfindex)
-	}
-	if req.OwnerRGID != 1 {
-		t.Fatalf("unexpected owner rg: %d", req.OwnerRGID)
-	}
-	if req.TXIfindex != 0 || req.TXVLANID != 0 {
-		t.Fatalf("unexpected tx path for tunnel sync: %+v", req)
 	}
 }
 
@@ -285,6 +166,90 @@ func TestShouldMirrorUserspaceSessionSkipsReverseEntries(t *testing.T) {
 	}
 	if shouldMirrorUserspaceSession(1) {
 		t.Fatal("expected reverse sessions to be skipped")
+	}
+}
+
+func TestShouldMirrorTunnelDeltaToLocalLegacyLocked(t *testing.T) {
+	m := &Manager{
+		lastSnapshot: &ConfigSnapshot{
+			Interfaces: []InterfaceSnapshot{
+				{Name: "reth1.0", Ifindex: 5},
+				{Name: "gr-0/0/0.0", Ifindex: 30, Tunnel: true},
+			},
+		},
+	}
+	if !m.shouldMirrorTunnelDeltaToLocalLegacyLocked(SessionDeltaInfo{
+		Event:         "open",
+		AddrFamily:    dataplane.AFInet,
+		EgressIfindex: 30,
+	}) {
+		t.Fatal("expected tunnel egress delta to mirror locally")
+	}
+	if m.shouldMirrorTunnelDeltaToLocalLegacyLocked(SessionDeltaInfo{
+		Event:         "open",
+		AddrFamily:    dataplane.AFInet,
+		EgressIfindex: 5,
+	}) {
+		t.Fatal("non-tunnel egress delta unexpectedly mirrored locally")
+	}
+}
+
+func TestSessionValueFromDeltaV4BuildsReverseAndSNATMirror(t *testing.T) {
+	zoneIDs := map[string]uint16{"lan": 1, "sfmix": 2}
+	delta := SessionDeltaInfo{
+		AddrFamily:    dataplane.AFInet,
+		Protocol:      1,
+		SrcIP:         "10.0.61.102",
+		DstIP:         "10.255.192.41",
+		SrcPort:       34149,
+		DstPort:       34149,
+		IngressZone:   "lan",
+		EgressZone:    "sfmix",
+		EgressIfindex: 30,
+		TXIfindex:     30,
+		NATSrcIP:      "10.255.192.42",
+		SrcMAC:        "02:aa:bb:cc:dd:ee",
+		NeighborMAC:   "02:11:22:33:44:55",
+	}
+	key, val, ok := sessionValueFromDeltaV4(delta, zoneIDs)
+	if !ok {
+		t.Fatal("sessionValueFromDeltaV4 returned !ok")
+	}
+	if val.Flags&dataplane.SessFlagSNAT == 0 {
+		t.Fatalf("expected SNAT flag set: %+v", val)
+	}
+	if got := net.IP(key.SrcIP[:]).String(); got != "10.0.61.102" {
+		t.Fatalf("key src ip = %s", got)
+	}
+	if got := net.IP(val.ReverseKey.SrcIP[:]).String(); got != "10.255.192.41" {
+		t.Fatalf("reverse src ip = %s, want tunnel peer", got)
+	}
+	if got := net.IP(val.ReverseKey.DstIP[:]).String(); got != "10.0.61.102" {
+		t.Fatalf("reverse dst ip = %s, want original client", got)
+	}
+	if got := networkUint16ToHost(key.DstPort); got != 34149 {
+		t.Fatalf("key dst port = %d, want 34149 for legacy icmp mirror", got)
+	}
+	if got := networkUint16ToHost(val.ReverseKey.SrcPort); got != 34149 {
+		t.Fatalf("reverse src port = %d, want 34149 for legacy icmp mirror", got)
+	}
+	if got := networkUint16ToHost(val.NATSrcPort); got != 34149 {
+		t.Fatalf("nat src port = %d, want 34149", got)
+	}
+	if got := val.FibIfindex; got != 30 {
+		t.Fatalf("FibIfindex = %d, want 30", got)
+	}
+}
+
+func TestZoneIDsFromSnapshotUsesSnapshotZones(t *testing.T) {
+	got := zoneIDsFromSnapshot(&ConfigSnapshot{
+		Zones: []ZoneSnapshot{
+			{Name: "lan", ID: 1},
+			{Name: "sfmix", ID: 2},
+		},
+	})
+	if got["lan"] != 1 || got["sfmix"] != 2 {
+		t.Fatalf("unexpected zone ids: %+v", got)
 	}
 }
 
@@ -634,130 +599,6 @@ func TestBuildRouteSnapshotsIncludesConnectedPrefixes(t *testing.T) {
 	}
 	if routes[1].Destination != "2001:559:8585:ef00::/64" || routes[1].Table != "inet6.0" {
 		t.Fatalf("routes[1] = %+v", routes[1])
-	}
-}
-
-func TestBuildTunnelEndpointSnapshotsBuildsUnitEndpoint(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
-		"gr-0/0/0": {
-			Name: "gr-0/0/0",
-			Units: map[int]*config.InterfaceUnit{
-				0: {
-					Number: 0,
-				},
-			},
-			Tunnel: &config.TunnelConfig{
-				Name:        "gr-0-0-0",
-				Mode:        "gre",
-				Source:      "2001:559:8585:80::8",
-				Destination: "2602:ffd3:0:2::7",
-			},
-		},
-	}
-	endpoints := buildTunnelEndpointSnapshots(cfg, []InterfaceSnapshot{
-		{
-			Name:            "gr-0/0/0.0",
-			Zone:            "sfmix",
-			LinuxName:       "gr-0-0-0",
-			Ifindex:         362,
-			RedundancyGroup: 1,
-			MTU:             1476,
-		},
-	})
-	if len(endpoints) != 1 {
-		t.Fatalf("len(endpoints) = %d, want 1", len(endpoints))
-	}
-	if endpoints[0].ID != 1 {
-		t.Fatalf("endpoint id = %d, want 1", endpoints[0].ID)
-	}
-	if endpoints[0].Interface != "gr-0/0/0.0" {
-		t.Fatalf("endpoint interface = %q, want gr-0/0/0.0", endpoints[0].Interface)
-	}
-	if endpoints[0].TransportTable != "inet6.0" {
-		t.Fatalf("endpoint transport table = %q, want inet6.0", endpoints[0].TransportTable)
-	}
-	if endpoints[0].OuterFamily != "inet6" {
-		t.Fatalf("endpoint outer family = %q, want inet6", endpoints[0].OuterFamily)
-	}
-}
-
-func TestBuildTunnelEndpointSnapshotsUsesConfiguredTransportTable(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
-		"gr-0/0/0": {
-			Name: "gr-0/0/0",
-			Units: map[int]*config.InterfaceUnit{
-				0: {
-					Number: 0,
-				},
-			},
-			Tunnel: &config.TunnelConfig{
-				Name:            "gr-0-0-0",
-				Mode:            "gre",
-				Source:          "172.16.50.8",
-				Destination:     "198.51.100.7",
-				RoutingInstance: "transport",
-			},
-		},
-	}
-	endpoints := buildTunnelEndpointSnapshots(cfg, []InterfaceSnapshot{
-		{
-			Name:      "gr-0/0/0.0",
-			LinuxName: "gr-0-0-0",
-			Ifindex:   362,
-		},
-	})
-	if len(endpoints) != 1 {
-		t.Fatalf("len(endpoints) = %d, want 1", len(endpoints))
-	}
-	if endpoints[0].TransportTable != "transport.inet.0" {
-		t.Fatalf("endpoint transport table = %q, want transport.inet.0", endpoints[0].TransportTable)
-	}
-	if endpoints[0].OuterFamily != "inet" {
-		t.Fatalf("endpoint outer family = %q, want inet", endpoints[0].OuterFamily)
-	}
-}
-
-func TestBuildTunnelEndpointSnapshotsDerivesRGFromTunnelSourceAddress(t *testing.T) {
-	cfg := &config.Config{}
-	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
-		"gr-0/0/0": {
-			Name: "gr-0/0/0",
-			Units: map[int]*config.InterfaceUnit{
-				0: {Number: 0},
-			},
-			Tunnel: &config.TunnelConfig{
-				Name:        "gr-0-0-0",
-				Mode:        "gre",
-				Source:      "2001:559:8585:80::8",
-				Destination: "2602:ffd3:0:2::7",
-			},
-		},
-	}
-	endpoints := buildTunnelEndpointSnapshots(cfg, []InterfaceSnapshot{
-		{
-			Name:      "gr-0/0/0.0",
-			Zone:      "sfmix",
-			LinuxName: "gr-0-0-0",
-			Ifindex:   1116,
-			MTU:       1500,
-		},
-		{
-			Name:            "reth0.80",
-			LinuxName:       "ge-7-0-2",
-			Ifindex:         12,
-			RedundancyGroup: 1,
-			Addresses: []InterfaceAddressSnapshot{
-				{Family: "inet6", Address: "2001:559:8585:80::8/64"},
-			},
-		},
-	})
-	if len(endpoints) != 1 {
-		t.Fatalf("len(endpoints) = %d, want 1", len(endpoints))
-	}
-	if endpoints[0].RedundancyGroup != 1 {
-		t.Fatalf("endpoint RG = %d, want 1", endpoints[0].RedundancyGroup)
 	}
 }
 
@@ -1730,104 +1571,32 @@ func TestBuildUserspaceIngressIfindexesDeduplicatesFabricParent(t *testing.T) {
 	}
 }
 
-func TestBuildUserspaceIngressIfindexesSkipsTunnelInterfaces(t *testing.T) {
+func TestBuildUserspaceTunnelIfindexesIncludesTunnelParentOnce(t *testing.T) {
 	snapshot := &ConfigSnapshot{
 		Interfaces: []InterfaceSnapshot{
-			{
-				Name:    "reth1.0",
-				Zone:    "lan",
-				Ifindex: 5,
-			},
-			{
-				Name:      "gr-0/0/0",
-				Zone:      "sfmix",
-				Ifindex:   586,
-				LinuxName: "gr-0-0-0",
-				Tunnel:    true,
-			},
+			{Name: "reth1.0", Ifindex: 5, Zone: "lan"},
+			{Name: "gr-0/0/0", Ifindex: 586, Zone: "sfmix", Tunnel: true},
+			{Name: "gr-0/0/0.0", Ifindex: 586, ParentIfindex: 586, Zone: "sfmix", Tunnel: true},
 		},
 	}
-	ifindexes := buildUserspaceIngressIfindexes(snapshot)
-	for _, idx := range ifindexes {
-		if idx == 586 {
-			t.Fatalf("tunnel ifindex 586 unexpectedly present in ingress ifindexes: %v", ifindexes)
-		}
+	ifindexes := buildUserspaceTunnelIfindexes(snapshot)
+	if len(ifindexes) != 1 {
+		t.Fatalf("expected 1 tunnel ifindex, got %d: %v", len(ifindexes), ifindexes)
 	}
-	if len(ifindexes) != 1 || ifindexes[0] != 5 {
-		t.Fatalf("unexpected ingress ifindexes: %v", ifindexes)
+	if ifindexes[0] != 586 {
+		t.Fatalf("tunnel ifindex = %d, want 586", ifindexes[0])
 	}
 }
 
-func TestBuildUserspaceIngressIfindexesIncludesVLANChildAndParent(t *testing.T) {
+func TestBuildUserspaceTunnelIfindexesSkipsNonTunnelInterfaces(t *testing.T) {
 	snapshot := &ConfigSnapshot{
 		Interfaces: []InterfaceSnapshot{
-			{
-				Name:    "ge-0/0/2",
-				Zone:    "wan",
-				Ifindex: 6,
-			},
-			{
-				Name:          "ge-0/0/2.80",
-				Zone:          "wan",
-				Ifindex:       12,
-				ParentIfindex: 6,
-				VLANID:        80,
-			},
+			{Name: "reth0.80", Ifindex: 12, Zone: "wan"},
+			{Name: "reth1.0", Ifindex: 5, Zone: "lan"},
 		},
 	}
-	ifindexes := buildUserspaceIngressIfindexes(snapshot)
-	if len(ifindexes) != 2 || ifindexes[0] != 6 || ifindexes[1] != 12 {
-		t.Fatalf("unexpected ingress ifindexes: %v", ifindexes)
-	}
-}
-
-func TestBuildUserspaceIngressBindingAliasesIncludesVLANChild(t *testing.T) {
-	snapshot := &ConfigSnapshot{
-		Interfaces: []InterfaceSnapshot{
-			{
-				Name:    "ge-0/0/2",
-				Zone:    "wan",
-				Ifindex: 6,
-			},
-			{
-				Name:          "ge-0/0/2.80",
-				Zone:          "wan",
-				Ifindex:       12,
-				ParentIfindex: 6,
-				VLANID:        80,
-			},
-			{
-				Name:      "gr-0/0/0",
-				Zone:      "sfmix",
-				Ifindex:   362,
-				Tunnel:    true,
-				LinuxName: "gr-0-0-0",
-			},
-		},
-	}
-	aliases := buildUserspaceIngressBindingAliases(snapshot)
-	if len(aliases) != 1 {
-		t.Fatalf("unexpected alias count: %v", aliases)
-	}
-	if got := aliases[12]; got != 6 {
-		t.Fatalf("alias 12 => %d, want 6", got)
-	}
-	if _, ok := aliases[362]; ok {
-		t.Fatalf("tunnel interface unexpectedly aliased: %v", aliases)
-	}
-}
-
-func TestSnapshotHasNativeGRE(t *testing.T) {
-	snapshot := &ConfigSnapshot{
-		TunnelEndpoints: []TunnelEndpointSnapshot{{
-			ID:   1,
-			Mode: "ip6gre",
-		}},
-	}
-	if !snapshotHasNativeGRE(snapshot) {
-		t.Fatal("expected native GRE snapshot to be detected")
-	}
-	if snapshotHasNativeGRE(&ConfigSnapshot{}) {
-		t.Fatal("did not expect empty snapshot to enable native GRE")
+	ifindexes := buildUserspaceTunnelIfindexes(snapshot)
+	if len(ifindexes) != 0 {
+		t.Fatalf("expected no tunnel ifindexes, got %v", ifindexes)
 	}
 }

@@ -402,6 +402,21 @@ func (m *Manager) XDPLinks() map[int]link.Link {
 	return m.xdpLinks
 }
 
+func (m *Manager) UpdateXDPLink(ifindex int, programName string) error {
+	l, ok := m.xdpLinks[ifindex]
+	if !ok {
+		return fmt.Errorf("XDP not attached to ifindex %d", ifindex)
+	}
+	prog, ok := m.programs[programName]
+	if !ok {
+		return fmt.Errorf("XDP program %q not found", programName)
+	}
+	if err := l.Update(prog); err != nil {
+		return fmt.Errorf("update XDP link on ifindex %d to %s: %w", ifindex, programName, err)
+	}
+	return nil
+}
+
 func (m *Manager) TCLinks() map[int]link.Link {
 	return m.tcLinks
 }

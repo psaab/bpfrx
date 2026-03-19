@@ -166,6 +166,17 @@ func (m *Manager) syncInterfaceAttachments(result *dataplane.CompileResult, snap
 			slog.Warn("userspace: detach TC from non-data interface failed", "ifindex", ifindex, "err", err)
 		}
 	}
+	m.ensureTunnelInterfacesUseMainXDP(snapshot)
+}
+
+func (m *Manager) ensureTunnelInterfacesUseMainXDP(snapshot *ConfigSnapshot) {
+	for _, ifindex := range buildUserspaceTunnelIfindexes(snapshot) {
+		if err := m.inner.UpdateXDPLink(int(ifindex), "xdp_main_prog"); err != nil {
+			slog.Warn("userspace: force xdp_main on tunnel interface failed", "ifindex", ifindex, "err", err)
+			continue
+		}
+		slog.Info("userspace: forced xdp_main on tunnel interface", "ifindex", ifindex)
+	}
 }
 
 func (m *Manager) bumpGeneration() uint64 {
@@ -228,9 +239,9 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	}
 	// IPsec: kernel XFRM handles ESP encryption/decryption; the userspace
 	// dataplane passes ESP/IKE traffic to the kernel via the slow-path.
-	// GRE transit is now modeled as native userspace tunnel endpoints on the
-	// physical NIC path. Kernel tunnel interfaces remain only for host/control
-	// plane compatibility during migration.
+	// Tunnel interfaces (GRE, ip6gre, XFRM) are handled by the eBPF
+	// pipeline which prepends/strips the pseudo-Ethernet header. The
+	// userspace worker detects ESP/IKE and routes to slow-path for XFRM.
 	if cfg.ForwardingOptions.PortMirroring != nil {
 		addReason("port mirroring is not implemented in the userspace dataplane")
 	}
@@ -506,32 +517,31 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 	policyCount := len(cfg.Security.Policies)
 	interfaces := buildInterfaceSnapshots(cfg)
 	return &ConfigSnapshot{
-		Version:         ProtocolVersion,
-		Generation:      generation,
-		FIBGeneration:   fibGeneration,
-		GeneratedAt:     time.Now().UTC(),
-		Capabilities:    deriveUserspaceCapabilities(cfg),
-		MapPins:         userspaceMapPins(),
-		Userspace:       ucfg,
-		Zones:           buildZoneSnapshots(cfg),
-		Interfaces:      interfaces,
-		Fabrics:         buildFabricSnapshots(cfg),
-		TunnelEndpoints: buildTunnelEndpointSnapshots(cfg, interfaces),
-		Neighbors:       buildNeighborSnapshots(cfg),
-		Routes:          buildRouteSnapshots(cfg, interfaces),
-		Flow:            buildFlowSnapshot(cfg),
-		DefaultPolicy:   policyActionString(cfg.Security.DefaultPolicy),
-		Policies:        buildPolicySnapshots(cfg),
-		SourceNAT:       buildSourceNATSnapshots(cfg),
-		StaticNAT:       buildStaticNATSnapshots(cfg),
-		DestinationNAT:  buildDestinationNATSnapshots(cfg),
-		NAT64:           buildNAT64Snapshots(cfg),
-		Nptv6:           buildNptv6Snapshots(cfg),
-		Screens:         buildScreenSnapshots(cfg),
-		Filters:         buildFirewallFilterSnapshots(cfg),
-		Policers:        buildPolicerSnapshots(cfg),
-		FlowExport:      buildFlowExportSnapshot(cfg),
-		Config:          cfg,
+		Version:        ProtocolVersion,
+		Generation:     generation,
+		FIBGeneration:  fibGeneration,
+		GeneratedAt:    time.Now().UTC(),
+		Capabilities:   deriveUserspaceCapabilities(cfg),
+		MapPins:        userspaceMapPins(),
+		Userspace:      ucfg,
+		Zones:          buildZoneSnapshots(cfg),
+		Interfaces:     interfaces,
+		Fabrics:        buildFabricSnapshots(cfg),
+		Neighbors:      buildNeighborSnapshots(cfg),
+		Routes:         buildRouteSnapshots(cfg, interfaces),
+		Flow:           buildFlowSnapshot(cfg),
+		DefaultPolicy:  policyActionString(cfg.Security.DefaultPolicy),
+		Policies:       buildPolicySnapshots(cfg),
+		SourceNAT:      buildSourceNATSnapshots(cfg),
+		StaticNAT:      buildStaticNATSnapshots(cfg),
+		DestinationNAT: buildDestinationNATSnapshots(cfg),
+		NAT64:          buildNAT64Snapshots(cfg),
+		Nptv6:          buildNptv6Snapshots(cfg),
+		Screens:        buildScreenSnapshots(cfg),
+		Filters:        buildFirewallFilterSnapshots(cfg),
+		Policers:       buildPolicerSnapshots(cfg),
+		FlowExport:     buildFlowExportSnapshot(cfg),
+		Config:         cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
 			DataplaneType:  cfg.System.DataplaneType,
@@ -747,125 +757,6 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				FilterInputV4:   unit.FilterInputV4,
 				FilterInputV6:   unit.FilterInputV6,
 			})
-		}
-	}
-	return out
-}
-
-func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []TunnelEndpointSnapshot {
-	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
-		return nil
-	}
-	ifaceByName := make(map[string]InterfaceSnapshot, len(interfaces))
-	rgByAddress := make(map[string]int)
-	for _, iface := range interfaces {
-		if iface.Name == "" || iface.Ifindex <= 0 {
-			continue
-		}
-		ifaceByName[iface.Name] = iface
-		if iface.RedundancyGroup <= 0 {
-			continue
-		}
-		for _, addr := range iface.Addresses {
-			ip, _, err := net.ParseCIDR(addr.Address)
-			if err != nil || ip == nil {
-				continue
-			}
-			rgByAddress[ip.String()] = iface.RedundancyGroup
-		}
-	}
-	if len(ifaceByName) == 0 {
-		return nil
-	}
-	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
-	for name := range cfg.Interfaces.Interfaces {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	out := make([]TunnelEndpointSnapshot, 0)
-	var nextID uint16 = 1
-	addEndpoint := func(ifName string, tunnel *config.TunnelConfig) {
-		if tunnel == nil || tunnel.Source == "" || tunnel.Destination == "" || nextID == 0 {
-			return
-		}
-		iface, ok := ifaceByName[ifName]
-		if !ok {
-			return
-		}
-		outerFamily := "inet"
-		transportTable := "inet.0"
-		if dst := net.ParseIP(tunnel.Destination); dst != nil && dst.To4() == nil {
-			outerFamily = "inet6"
-			transportTable = "inet6.0"
-		} else if src := net.ParseIP(tunnel.Source); src != nil && src.To4() == nil {
-			outerFamily = "inet6"
-			transportTable = "inet6.0"
-		}
-		if tunnel.RoutingInstance != "" {
-			if outerFamily == "inet6" {
-				transportTable = tunnel.RoutingInstance + ".inet6.0"
-			} else {
-				transportTable = tunnel.RoutingInstance + ".inet.0"
-			}
-		}
-		redundancyGroup := iface.RedundancyGroup
-		if redundancyGroup <= 0 {
-			if src := net.ParseIP(tunnel.Source); src != nil {
-				redundancyGroup = rgByAddress[src.String()]
-			}
-		}
-		out = append(out, TunnelEndpointSnapshot{
-			ID:              nextID,
-			Interface:       ifName,
-			LinuxName:       iface.LinuxName,
-			Ifindex:         iface.Ifindex,
-			Zone:            iface.Zone,
-			RedundancyGroup: redundancyGroup,
-			MTU:             iface.MTU,
-			Mode:            tunnel.Mode,
-			OuterFamily:     outerFamily,
-			Source:          tunnel.Source,
-			Destination:     tunnel.Destination,
-			Key:             tunnel.Key,
-			TTL:             tunnel.TTL,
-			TransportTable:  transportTable,
-		})
-		nextID++
-	}
-	for _, name := range names {
-		iface := cfg.Interfaces.Interfaces[name]
-		if iface == nil {
-			continue
-		}
-		if iface.Tunnel != nil {
-			if len(iface.Units) == 0 {
-				addEndpoint(name, iface.Tunnel)
-				continue
-			}
-			unitNums := make([]int, 0, len(iface.Units))
-			for unitNum := range iface.Units {
-				unitNums = append(unitNums, unitNum)
-			}
-			sort.Ints(unitNums)
-			for _, unitNum := range unitNums {
-				addEndpoint(fmt.Sprintf("%s.%d", name, unitNum), iface.Tunnel)
-			}
-			continue
-		}
-		if len(iface.Units) == 0 {
-			continue
-		}
-		unitNums := make([]int, 0, len(iface.Units))
-		for unitNum := range iface.Units {
-			unitNums = append(unitNums, unitNum)
-		}
-		sort.Ints(unitNums)
-		for _, unitNum := range unitNums {
-			unit := iface.Units[unitNum]
-			if unit == nil || unit.Tunnel == nil {
-				continue
-			}
-			addEndpoint(fmt.Sprintf("%s.%d", name, unitNum), unit.Tunnel)
 		}
 	}
 	return out
@@ -2385,7 +2276,6 @@ type userspaceCtrlValue struct {
 const userspaceMetadataVersion = 4
 const userspaceCtrlFlagCPUMap = 1
 const userspaceCtrlFlagTrace = 2
-const userspaceCtrlFlagNativeGRE = 4
 const bindingQueuesPerIface = 16 // must match BINDING_QUEUES_PER_IFACE in BPF
 
 func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg config.UserspaceConfig) error {
@@ -2418,9 +2308,6 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	var ctrlFlags uint32
 	if cpumapReady {
 		ctrlFlags |= userspaceCtrlFlagCPUMap
-	}
-	if snapshotHasNativeGRE(snapshot) {
-		ctrlFlags |= userspaceCtrlFlagNativeGRE
 	}
 	ctrl := userspaceCtrlValue{
 		Enabled:            0,
@@ -2510,16 +2397,19 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		return errors.New("userspace_bindings map not loaded")
 	}
 
-	var newBindingIndices []uint32
-	newBindingIndexSet := make(map[uint32]struct{})
+	// Bindings map is now an Array — zero previously-set indices.
+	{
+		var zeroBinding userspaceBindingValue
+		for _, idx := range m.lastBindingIndices {
+			_ = bindingsMap.Update(idx, zeroBinding, ebpf.UpdateAny)
+		}
+		m.lastBindingIndices = nil
+	}
 
 	// Preserve cpumap flag if cpumap is populated.
 	var ctrlFlags uint32
 	if cpuMap := m.inner.Map("userspace_cpumap"); cpuMap != nil {
 		ctrlFlags |= userspaceCtrlFlagCPUMap
-	}
-	if snapshotHasNativeGRE(m.lastSnapshot) {
-		ctrlFlags |= userspaceCtrlFlagNativeGRE
 	}
 
 	zero := uint32(0)
@@ -2556,50 +2446,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		if err := bindingsMap.Update(idx, val, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update userspace_bindings idx=%d (if=%d q=%d): %w", idx, binding.Ifindex, binding.QueueID, err)
 		}
-		if _, seen := newBindingIndexSet[idx]; !seen {
-			newBindingIndexSet[idx] = struct{}{}
-			newBindingIndices = append(newBindingIndices, idx)
-		}
-	}
-	for childIfindex, parentIfindex := range buildUserspaceIngressBindingAliases(m.lastSnapshot) {
-		for _, binding := range status.Bindings {
-			if binding.Ifindex != int(parentIfindex) {
-				continue
-			}
-			flags := uint32(0)
-			if binding.Registered && binding.Armed && binding.Ready {
-				flags = userspaceBindingReady
-			}
-			idx := childIfindex*bindingQueuesPerIface + binding.QueueID
-			val := userspaceBindingValue{
-				Slot:  binding.Slot,
-				Flags: flags,
-			}
-			if err := bindingsMap.Update(idx, val, ebpf.UpdateAny); err != nil {
-				return fmt.Errorf(
-					"update aliased userspace_bindings idx=%d (if=%d parent=%d q=%d): %w",
-					idx,
-					childIfindex,
-					parentIfindex,
-					binding.QueueID,
-					err,
-				)
-			}
-			if _, seen := newBindingIndexSet[idx]; !seen {
-				newBindingIndexSet[idx] = struct{}{}
-				newBindingIndices = append(newBindingIndices, idx)
-			}
-		}
-	}
-	{
-		var zeroBinding userspaceBindingValue
-		for _, idx := range m.lastBindingIndices {
-			if _, keep := newBindingIndexSet[idx]; keep {
-				continue
-			}
-			_ = bindingsMap.Update(idx, zeroBinding, ebpf.UpdateAny)
-		}
-		m.lastBindingIndices = newBindingIndices
+		m.lastBindingIndices = append(m.lastBindingIndices, idx)
 	}
 	if err := m.syncIngressIfaceMapLocked(m.lastSnapshot); err != nil {
 		return err
@@ -2620,21 +2467,17 @@ func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
 		return errors.New("userspace_ingress_ifaces map not loaded")
 	}
 
-	newIngress := buildUserspaceIngressIfindexes(snapshot)
-	newIngressSet := make(map[uint32]struct{}, len(newIngress))
-	for _, ifindex := range newIngress {
-		newIngressSet[ifindex] = struct{}{}
+	// Map is now an Array[1024] — zero previous entries, set new ones to 1.
+	for _, k := range m.lastIngressIfaces {
+		_ = ifaceMap.Update(k, uint8(0), ebpf.UpdateAny)
+	}
+	m.lastIngressIfaces = nil
+	for _, ifindex := range buildUserspaceIngressIfindexes(snapshot) {
 		if err := ifaceMap.Update(ifindex, uint8(1), ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update userspace_ingress_ifaces %d: %w", ifindex, err)
 		}
+		m.lastIngressIfaces = append(m.lastIngressIfaces, ifindex)
 	}
-	for _, k := range m.lastIngressIfaces {
-		if _, keep := newIngressSet[k]; keep {
-			continue
-		}
-		_ = ifaceMap.Update(k, uint8(0), ebpf.UpdateAny)
-	}
-	m.lastIngressIfaces = newIngress
 	return nil
 }
 
@@ -2892,6 +2735,9 @@ func (m *Manager) DrainSessionDeltas(max uint32) ([]SessionDeltaInfo, ProcessSta
 			return resp.SessionDeltas, status, err
 		}
 	}
+	if err := m.mirrorTunnelSessionDeltasToLocalLegacyLocked(resp.SessionDeltas); err != nil {
+		return resp.SessionDeltas, status, err
+	}
 	return resp.SessionDeltas, status, nil
 }
 
@@ -2908,46 +2754,8 @@ func (m *Manager) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionVa
 	return nil
 }
 
-func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
-	installVal := val
-	installVal.FibIfindex = 0
-	installVal.FibVlanID = 0
-	installVal.FibDmac = [6]byte{}
-	installVal.FibSmac = [6]byte{}
-	installVal.FibGen = 0
-	if err := m.inner.SetSessionV4(key, installVal); err != nil {
-		return err
-	}
-	if !shouldMirrorUserspaceSession(val.IsReverse) {
-		return nil
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	_ = m.syncSessionV4Locked("upsert", key, &val)
-	return nil
-}
-
 func (m *Manager) SetSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
 	if err := m.inner.SetSessionV6(key, val); err != nil {
-		return err
-	}
-	if !shouldMirrorUserspaceSession(val.IsReverse) {
-		return nil
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	_ = m.syncSessionV6Locked("upsert", key, &val)
-	return nil
-}
-
-func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
-	installVal := val
-	installVal.FibIfindex = 0
-	installVal.FibVlanID = 0
-	installVal.FibDmac = [6]byte{}
-	installVal.FibSmac = [6]byte{}
-	installVal.FibGen = 0
-	if err := m.inner.SetSessionV6(key, installVal); err != nil {
 		return err
 	}
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
@@ -3005,27 +2813,9 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 		req.IngressZone = m.zoneNameByID(val.IngressZone)
 		req.EgressZone = m.zoneNameByID(val.EgressZone)
 		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID)
-		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
-		if val.LogFlags&dataplane.LogFlagUserspaceTunnelEndpoint != 0 && val.FibGen != 0 {
-			req.TunnelEndpointID = val.FibGen
-		}
-		if req.TunnelEndpointID != 0 {
-			if endpoint, ok := m.sessionSyncTunnelEndpointLocked(req.TunnelEndpointID); ok {
-				req.EgressIfindex = endpoint.Ifindex
-				req.OwnerRGID = endpoint.RedundancyGroup
-			} else {
-				req.EgressIfindex = 0
-				req.OwnerRGID = 0
-			}
-			req.TXIfindex = 0
-			req.TXVLANID = 0
-			req.NeighborMAC = ""
-			req.SrcMAC = ""
-		} else {
-			req.TXVLANID = val.FibVlanID
-			req.NeighborMAC = macString(val.FibDmac[:])
-			req.SrcMAC = macString(val.FibSmac[:])
-		}
+		req.TXVLANID = val.FibVlanID
+		req.NeighborMAC = macString(val.FibDmac[:])
+		req.SrcMAC = macString(val.FibSmac[:])
 		req.NATSrcIP = ipString(nativeUint32ToIP(val.NATSrcIP))
 		req.NATDstIP = ipString(nativeUint32ToIP(val.NATDstIP))
 		req.NATSrcPort = networkUint16ToHost(val.NATSrcPort)
@@ -3066,27 +2856,9 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		req.IngressZone = m.zoneNameByID(val.IngressZone)
 		req.EgressZone = m.zoneNameByID(val.EgressZone)
 		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID)
-		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
-		if val.LogFlags&dataplane.LogFlagUserspaceTunnelEndpoint != 0 && val.FibGen != 0 {
-			req.TunnelEndpointID = val.FibGen
-		}
-		if req.TunnelEndpointID != 0 {
-			if endpoint, ok := m.sessionSyncTunnelEndpointLocked(req.TunnelEndpointID); ok {
-				req.EgressIfindex = endpoint.Ifindex
-				req.OwnerRGID = endpoint.RedundancyGroup
-			} else {
-				req.EgressIfindex = 0
-				req.OwnerRGID = 0
-			}
-			req.TXIfindex = 0
-			req.TXVLANID = 0
-			req.NeighborMAC = ""
-			req.SrcMAC = ""
-		} else {
-			req.TXVLANID = val.FibVlanID
-			req.NeighborMAC = macString(val.FibDmac[:])
-			req.SrcMAC = macString(val.FibSmac[:])
-		}
+		req.TXVLANID = val.FibVlanID
+		req.NeighborMAC = macString(val.FibDmac[:])
+		req.SrcMAC = macString(val.FibSmac[:])
 		req.NATSrcIP = ipString(net.IP(val.NATSrcIP[:]))
 		req.NATDstIP = ipString(net.IP(val.NATDstIP[:]))
 		req.NATSrcPort = networkUint16ToHost(val.NATSrcPort)
@@ -3103,32 +2875,6 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		}
 	}
 	return req
-}
-
-func (m *Manager) sessionSyncTunnelEndpointIDLocked(egressIfindex int) uint16 {
-	snapshot := m.lastSnapshot
-	if snapshot == nil || egressIfindex <= 0 {
-		return 0
-	}
-	for _, endpoint := range snapshot.TunnelEndpoints {
-		if endpoint.Ifindex == egressIfindex {
-			return endpoint.ID
-		}
-	}
-	return 0
-}
-
-func (m *Manager) sessionSyncTunnelEndpointLocked(id uint16) (TunnelEndpointSnapshot, bool) {
-	snapshot := m.lastSnapshot
-	if snapshot == nil || id == 0 {
-		return TunnelEndpointSnapshot{}, false
-	}
-	for _, endpoint := range snapshot.TunnelEndpoints {
-		if endpoint.ID == id {
-			return endpoint, true
-		}
-	}
-	return TunnelEndpointSnapshot{}, false
 }
 
 func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
@@ -3159,6 +2905,383 @@ func (m *Manager) zoneNameByID(zoneID uint16) string {
 		}
 	}
 	return ""
+}
+
+func (m *Manager) mirrorTunnelSessionDeltasToLocalLegacyLocked(deltas []SessionDeltaInfo) error {
+	if len(deltas) == 0 || m.lastSnapshot == nil {
+		return nil
+	}
+	zoneIDs := zoneIDsFromSnapshot(m.lastSnapshot)
+	if len(zoneIDs) == 0 {
+		return nil
+	}
+	for _, delta := range deltas {
+		if !m.shouldMirrorTunnelDeltaToLocalLegacyLocked(delta) {
+			continue
+		}
+		switch strings.ToLower(delta.Event) {
+		case "open":
+			if err := m.installTunnelDeltaLegacyMirrorLocked(delta, zoneIDs); err != nil {
+				return err
+			}
+		case "close":
+			if err := m.deleteTunnelDeltaLegacyMirrorLocked(delta, zoneIDs); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) shouldMirrorTunnelDeltaToLocalLegacyLocked(delta SessionDeltaInfo) bool {
+	if m.lastSnapshot == nil {
+		return false
+	}
+	switch strings.ToLower(delta.Event) {
+	case "open", "close":
+	default:
+		return false
+	}
+	targets := []int{delta.EgressIfindex}
+	if delta.TXIfindex > 0 && delta.TXIfindex != delta.EgressIfindex {
+		targets = append(targets, delta.TXIfindex)
+	}
+	for _, iface := range m.lastSnapshot.Interfaces {
+		if !iface.Tunnel {
+			continue
+		}
+		for _, ifindex := range targets {
+			if ifindex > 0 && iface.Ifindex == ifindex {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func zoneIDsFromSnapshot(snapshot *ConfigSnapshot) map[string]uint16 {
+	if snapshot == nil {
+		return nil
+	}
+	out := make(map[string]uint16, len(snapshot.Zones))
+	for _, zone := range snapshot.Zones {
+		if zone.Name == "" || zone.ID == 0 {
+			continue
+		}
+		out[zone.Name] = zone.ID
+	}
+	return out
+}
+
+func hostUint16ToNetwork(v uint16) uint16 {
+	var raw [2]byte
+	binary.BigEndian.PutUint16(raw[:], v)
+	return binary.NativeEndian.Uint16(raw[:])
+}
+
+func effectiveDeltaNATSrcPort(delta SessionDeltaInfo) uint16 {
+	if delta.NATSrcPort != 0 {
+		return delta.NATSrcPort
+	}
+	return delta.SrcPort
+}
+
+func effectiveDeltaNATDstPort(delta SessionDeltaInfo) uint16 {
+	if delta.NATDstPort != 0 {
+		return delta.NATDstPort
+	}
+	return delta.DstPort
+}
+
+func parseSyncMAC(raw string) [6]byte {
+	var out [6]byte
+	if raw == "" {
+		return out
+	}
+	mac, err := net.ParseMAC(raw)
+	if err != nil || len(mac) != len(out) {
+		return out
+	}
+	copy(out[:], mac)
+	return out
+}
+
+func deltaReverseKeyV4(key dataplane.SessionKey) dataplane.SessionKey {
+	rev := dataplane.SessionKey{
+		SrcIP:    key.DstIP,
+		DstIP:    key.SrcIP,
+		SrcPort:  key.DstPort,
+		DstPort:  key.SrcPort,
+		Protocol: key.Protocol,
+	}
+	return rev
+}
+
+func deltaReverseKeyV6(key dataplane.SessionKeyV6) dataplane.SessionKeyV6 {
+	rev := dataplane.SessionKeyV6{
+		SrcIP:    key.DstIP,
+		DstIP:    key.SrcIP,
+		SrcPort:  key.DstPort,
+		DstPort:  key.SrcPort,
+		Protocol: key.Protocol,
+	}
+	return rev
+}
+
+func sessionValueFromDeltaV4(delta SessionDeltaInfo, zoneIDs map[string]uint16) (dataplane.SessionKey, dataplane.SessionValue, bool) {
+	src := net.ParseIP(delta.SrcIP).To4()
+	dst := net.ParseIP(delta.DstIP).To4()
+	if src == nil || dst == nil {
+		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
+	}
+	var key dataplane.SessionKey
+	copy(key.SrcIP[:], src)
+	copy(key.DstIP[:], dst)
+	key.SrcPort = hostUint16ToNetwork(delta.SrcPort)
+	key.DstPort = hostUint16ToNetwork(delta.DstPort)
+	if (delta.Protocol == 1 || delta.Protocol == 58) && delta.DstPort == 0 && delta.SrcPort != 0 {
+		key.DstPort = key.SrcPort
+	}
+	key.Protocol = delta.Protocol
+
+	ingressZone := zoneIDs[delta.IngressZone]
+	egressZone := zoneIDs[delta.EgressZone]
+	if ingressZone == 0 || egressZone == 0 {
+		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
+	}
+
+	val := dataplane.SessionValue{
+		State:       4,
+		SessionID:   uint64(time.Now().UnixNano()),
+		Created:     uint64(time.Now().Unix()),
+		LastSeen:    uint64(time.Now().Unix()),
+		Timeout:     300,
+		IngressZone: ingressZone,
+		EgressZone:  egressZone,
+		ReverseKey:  deltaReverseKeyV4(key),
+	}
+	if delta.TXIfindex > 0 {
+		val.FibIfindex = uint32(delta.TXIfindex)
+	} else if delta.EgressIfindex > 0 {
+		val.FibIfindex = uint32(delta.EgressIfindex)
+	}
+	val.FibVlanID = delta.TXVLANID
+	val.FibDmac = parseSyncMAC(delta.NeighborMAC)
+	val.FibSmac = parseSyncMAC(delta.SrcMAC)
+	if ip := net.ParseIP(delta.NATSrcIP).To4(); ip != nil {
+		val.Flags |= dataplane.SessFlagSNAT
+		val.NATSrcIP = binary.NativeEndian.Uint32(ip)
+		val.NATSrcPort = hostUint16ToNetwork(effectiveDeltaNATSrcPort(delta))
+	}
+	if ip := net.ParseIP(delta.NATDstIP).To4(); ip != nil {
+		val.Flags |= dataplane.SessFlagDNAT
+		val.NATDstIP = binary.NativeEndian.Uint32(ip)
+		val.NATDstPort = hostUint16ToNetwork(effectiveDeltaNATDstPort(delta))
+	}
+	if delta.FabricIngress {
+		val.LogFlags |= dataplane.LogFlagUserspaceFabricIngress
+	}
+	return key, val, true
+}
+
+func sessionValueFromDeltaV6(delta SessionDeltaInfo, zoneIDs map[string]uint16) (dataplane.SessionKeyV6, dataplane.SessionValueV6, bool) {
+	src := net.ParseIP(delta.SrcIP).To16()
+	dst := net.ParseIP(delta.DstIP).To16()
+	if src == nil || dst == nil {
+		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false
+	}
+	var key dataplane.SessionKeyV6
+	copy(key.SrcIP[:], src)
+	copy(key.DstIP[:], dst)
+	key.SrcPort = hostUint16ToNetwork(delta.SrcPort)
+	key.DstPort = hostUint16ToNetwork(delta.DstPort)
+	if (delta.Protocol == 1 || delta.Protocol == 58) && delta.DstPort == 0 && delta.SrcPort != 0 {
+		key.DstPort = key.SrcPort
+	}
+	key.Protocol = delta.Protocol
+
+	ingressZone := zoneIDs[delta.IngressZone]
+	egressZone := zoneIDs[delta.EgressZone]
+	if ingressZone == 0 || egressZone == 0 {
+		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false
+	}
+
+	val := dataplane.SessionValueV6{
+		State:       4,
+		SessionID:   uint64(time.Now().UnixNano()),
+		Created:     uint64(time.Now().Unix()),
+		LastSeen:    uint64(time.Now().Unix()),
+		Timeout:     300,
+		IngressZone: ingressZone,
+		EgressZone:  egressZone,
+		ReverseKey:  deltaReverseKeyV6(key),
+	}
+	if delta.TXIfindex > 0 {
+		val.FibIfindex = uint32(delta.TXIfindex)
+	} else if delta.EgressIfindex > 0 {
+		val.FibIfindex = uint32(delta.EgressIfindex)
+	}
+	val.FibVlanID = delta.TXVLANID
+	val.FibDmac = parseSyncMAC(delta.NeighborMAC)
+	val.FibSmac = parseSyncMAC(delta.SrcMAC)
+	if ip := net.ParseIP(delta.NATSrcIP).To16(); ip != nil {
+		val.Flags |= dataplane.SessFlagSNAT
+		copy(val.NATSrcIP[:], ip)
+		val.NATSrcPort = hostUint16ToNetwork(effectiveDeltaNATSrcPort(delta))
+	}
+	if ip := net.ParseIP(delta.NATDstIP).To16(); ip != nil {
+		val.Flags |= dataplane.SessFlagDNAT
+		copy(val.NATDstIP[:], ip)
+		val.NATDstPort = hostUint16ToNetwork(effectiveDeltaNATDstPort(delta))
+	}
+	if delta.FabricIngress {
+		val.LogFlags |= dataplane.LogFlagUserspaceFabricIngress
+	}
+	return key, val, true
+}
+
+func (m *Manager) installTunnelDeltaLegacyMirrorLocked(delta SessionDeltaInfo, zoneIDs map[string]uint16) error {
+	switch delta.AddrFamily {
+	case dataplane.AFInet:
+		key, val, ok := sessionValueFromDeltaV4(delta, zoneIDs)
+		if !ok {
+			return nil
+		}
+		return m.installLegacyMirrorV4Locked(key, val)
+	case dataplane.AFInet6:
+		key, val, ok := sessionValueFromDeltaV6(delta, zoneIDs)
+		if !ok {
+			return nil
+		}
+		return m.installLegacyMirrorV6Locked(key, val)
+	default:
+		return nil
+	}
+}
+
+func (m *Manager) deleteTunnelDeltaLegacyMirrorLocked(delta SessionDeltaInfo, zoneIDs map[string]uint16) error {
+	switch delta.AddrFamily {
+	case dataplane.AFInet:
+		key, val, ok := sessionValueFromDeltaV4(delta, zoneIDs)
+		if !ok {
+			return nil
+		}
+		return m.deleteLegacyMirrorV4Locked(key, val)
+	case dataplane.AFInet6:
+		key, val, ok := sessionValueFromDeltaV6(delta, zoneIDs)
+		if !ok {
+			return nil
+		}
+		return m.deleteLegacyMirrorV6Locked(key, val)
+	default:
+		return nil
+	}
+}
+
+func (m *Manager) installLegacyMirrorV4Locked(key dataplane.SessionKey, val dataplane.SessionValue) error {
+	if err := m.inner.SetSessionV4(key, val); err != nil {
+		return fmt.Errorf("install local v4 session mirror: %w", err)
+	}
+	if val.IsReverse == 0 && val.ReverseKey.Protocol != 0 {
+		revVal := val
+		revVal.IsReverse = 1
+		revVal.ReverseKey = key
+		revVal.IngressZone = val.EgressZone
+		revVal.EgressZone = val.IngressZone
+		revVal.FibIfindex = 0
+		revVal.FibVlanID = 0
+		revVal.FibDmac = [6]byte{}
+		revVal.FibSmac = [6]byte{}
+		revVal.FibGen = 0
+		if err := m.inner.SetSessionV4(val.ReverseKey, revVal); err != nil {
+			return fmt.Errorf("install local v4 reverse session mirror: %w", err)
+		}
+	}
+	if val.IsReverse == 0 &&
+		val.Flags&dataplane.SessFlagSNAT != 0 &&
+		val.Flags&dataplane.SessFlagStaticNAT == 0 {
+		if err := m.inner.SetDNATEntry(dataplane.DNATKey{
+			Protocol: key.Protocol,
+			DstIP:    val.NATSrcIP,
+			DstPort:  val.NATSrcPort,
+		}, dataplane.DNATValue{
+			NewDstIP:   binary.NativeEndian.Uint32(key.SrcIP[:]),
+			NewDstPort: key.SrcPort,
+		}); err != nil {
+			return fmt.Errorf("install local v4 dnat mirror: %w", err)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) installLegacyMirrorV6Locked(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
+	if err := m.inner.SetSessionV6(key, val); err != nil {
+		return fmt.Errorf("install local v6 session mirror: %w", err)
+	}
+	if val.IsReverse == 0 && val.ReverseKey.Protocol != 0 {
+		revVal := val
+		revVal.IsReverse = 1
+		revVal.ReverseKey = key
+		revVal.IngressZone = val.EgressZone
+		revVal.EgressZone = val.IngressZone
+		revVal.FibIfindex = 0
+		revVal.FibVlanID = 0
+		revVal.FibDmac = [6]byte{}
+		revVal.FibSmac = [6]byte{}
+		revVal.FibGen = 0
+		if err := m.inner.SetSessionV6(val.ReverseKey, revVal); err != nil {
+			return fmt.Errorf("install local v6 reverse session mirror: %w", err)
+		}
+	}
+	if val.IsReverse == 0 &&
+		val.Flags&dataplane.SessFlagSNAT != 0 &&
+		val.Flags&dataplane.SessFlagStaticNAT == 0 {
+		if err := m.inner.SetDNATEntryV6(dataplane.DNATKeyV6{
+			Protocol: key.Protocol,
+			DstIP:    val.NATSrcIP,
+			DstPort:  val.NATSrcPort,
+		}, dataplane.DNATValueV6{
+			NewDstIP:   key.SrcIP,
+			NewDstPort: key.SrcPort,
+		}); err != nil {
+			return fmt.Errorf("install local v6 dnat mirror: %w", err)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) deleteLegacyMirrorV4Locked(key dataplane.SessionKey, val dataplane.SessionValue) error {
+	if val.ReverseKey.Protocol != 0 {
+		_ = m.inner.DeleteSession(val.ReverseKey)
+	}
+	if val.Flags&dataplane.SessFlagSNAT != 0 && val.Flags&dataplane.SessFlagStaticNAT == 0 {
+		_ = m.inner.DeleteDNATEntry(dataplane.DNATKey{
+			Protocol: key.Protocol,
+			DstIP:    val.NATSrcIP,
+			DstPort:  val.NATSrcPort,
+		})
+	}
+	if err := m.inner.DeleteSession(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("delete local v4 session mirror: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) deleteLegacyMirrorV6Locked(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
+	if val.ReverseKey.Protocol != 0 {
+		_ = m.inner.DeleteSessionV6(val.ReverseKey)
+	}
+	if val.Flags&dataplane.SessFlagSNAT != 0 && val.Flags&dataplane.SessFlagStaticNAT == 0 {
+		_ = m.inner.DeleteDNATEntryV6(dataplane.DNATKeyV6{
+			Protocol: key.Protocol,
+			DstIP:    val.NATSrcIP,
+			DstPort:  val.NATSrcPort,
+		})
+	}
+	if err := m.inner.DeleteSessionV6(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("delete local v6 session mirror: %w", err)
+	}
+	return nil
 }
 
 func nativeUint32ToIP(v uint32) net.IP {
@@ -3348,13 +3471,6 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 			continue
 		}
 		if iface.ParentIfindex > 0 {
-			if iface.Ifindex > 0 {
-				key := uint32(iface.Ifindex)
-				if !seen[key] {
-					seen[key] = true
-					out = append(out, key)
-				}
-			}
 			key := uint32(iface.ParentIfindex)
 			if seen[key] {
 				continue
@@ -3391,27 +3507,31 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	return out
 }
 
-func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]uint32 {
+func buildUserspaceTunnelIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	if snapshot == nil {
 		return nil
 	}
-	out := make(map[uint32]uint32)
+	seen := make(map[uint32]bool)
+	out := make([]uint32, 0)
 	for _, iface := range snapshot.Interfaces {
-		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
+		if !iface.Tunnel {
 			continue
 		}
-		if iface.Ifindex <= 0 || iface.ParentIfindex <= 0 {
+		if iface.Ifindex <= 0 {
 			continue
 		}
-		out[uint32(iface.Ifindex)] = uint32(iface.ParentIfindex)
+		key := uint32(iface.Ifindex)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, key)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
 	return out
 }
 
 func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
-	if iface.Tunnel {
-		return true
-	}
 	name := iface.Name
 	base := name
 	if idx := strings.IndexByte(base, '.'); idx >= 0 {
@@ -3433,22 +3553,6 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 	}
 	if iface.LocalFabric != "" {
 		return true
-	}
-	return false
-}
-
-func snapshotHasNativeGRE(snapshot *ConfigSnapshot) bool {
-	if snapshot == nil {
-		return false
-	}
-	for _, endpoint := range snapshot.TunnelEndpoints {
-		if endpoint.ID == 0 {
-			continue
-		}
-		switch endpoint.Mode {
-		case "", "gre", "ip6gre":
-			return true
-		}
 	}
 	return false
 }
