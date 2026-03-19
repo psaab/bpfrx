@@ -27,6 +27,8 @@ const PROTO_ICMP: u8 = 1;
 const PROTO_GRE: u8 = 47;
 const PROTO_ESP: u8 = 50;
 const PROTO_ICMPV6: u8 = 58;
+const GRE_PROTO_IPV4: u16 = 0x0800;
+const GRE_PROTO_IPV6: u16 = 0x86dd;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_ACK: u8 = 0x10;
 const MAX_EXT_HDRS: usize = 6;
@@ -52,6 +54,7 @@ const USERSPACE_FALLBACK_REASON_NO_SESSION: u32 = 12;
 const USERSPACE_FALLBACK_REASON_MAX: u32 = 16;
 const USERSPACE_CTRL_FLAG_CPUMAP: u32 = 1;
 const USERSPACE_CTRL_FLAG_TRACE: u32 = 2;
+const USERSPACE_CTRL_FLAG_NATIVE_GRE: u32 = 4;
 const BINDING_QUEUES_PER_IFACE: u32 = 16;
 const BINDING_ARRAY_MAX_ENTRIES: u32 = 1024 * BINDING_QUEUES_PER_IFACE; // 16384
 const USERSPACE_TRACE_STAGE_RECEIVED: u32 = 1;
@@ -129,6 +132,25 @@ struct UserspaceBindingValue {
 #[derive(Clone, Copy)]
 struct UserspaceLocalV6Key {
     addr: [u8; 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnatKeyV4 {
+    protocol: u8,
+    pad: [u8; 3],
+    dst_ip: u32,
+    dst_port: u16,
+    pad2: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DnatValueV4 {
+    new_dst_ip: u32,
+    new_dst_port: u16,
+    flags: u8,
+    pad: u8,
 }
 
 #[repr(C)]
@@ -252,6 +274,13 @@ static USERSPACE_INTERFACE_NAT_V4: HashMap<u32, u8> = HashMap::with_max_entries(
 static USERSPACE_INTERFACE_NAT_V6: HashMap<UserspaceLocalV6Key, u8> =
     HashMap::with_max_entries(8192, 0);
 
+// NOTE: This map MUST be pinned/reused from the main eBPF pipeline's
+// dnat_table so dynamic SNAT-return entries are visible here. The Go
+// loader (pkg/dataplane/loader.go) must ensure the userspace XDP
+// collection shares the same pinned dnat_table map fd.
+#[map(name = "dnat_table")]
+static DNAT_TABLE: HashMap<DnatKeyV4, DnatValueV4> = HashMap::with_max_entries(262144, 0);
+
 #[map(name = "userspace_sessions")]
 static USERSPACE_SESSIONS: HashMap<UserspaceSessionKey, u8> = HashMap::with_max_entries(262144, 0);
 
@@ -306,6 +335,9 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     {
         return Ok(cpumap_or_pass(ctrl));
     }
+    let native_gre =
+        parsed.protocol == PROTO_GRE && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) != 0;
+
     let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
     let selected_queue = select_userspace_queue(ctrl, rx_queue_index, &parsed);
     record_trace(
@@ -397,11 +429,17 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     }
 
     let packet_len = data_end.saturating_sub(data);
-    // GRE (47) and ESP (50) must be delivered to the kernel for tunnel
-    // decapsulation. XDP_PASS directly — do NOT use fallback_to_main
-    // (the tail-call can fail silently, dropping the packet).
-    if matches!(parsed.protocol, PROTO_GRE | PROTO_ESP) {
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
+    // ESP still relies on the kernel XFRM path. Use cpumap_or_pass
+    // instead of fallback_to_main — the tail-call can fail silently
+    // during early boot when the prog-array isn't populated, which
+    // would drop ESP/IKE packets. cpumap_or_pass delivers to the
+    // kernel stack reliably.
+    if parsed.protocol == PROTO_ESP {
+        return Ok(cpumap_or_pass(ctrl));
+    }
+    // Non-native GRE also goes to kernel for tunnel decap.
+    if parsed.protocol == PROTO_GRE && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) == 0 {
+        return Ok(cpumap_or_pass(ctrl));
     }
     if should_fallback_early(&parsed) {
         record_trace(
@@ -416,39 +454,12 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         );
         return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
-    match live_userspace_session_action(&parsed) {
-        USERSPACE_SESSION_ACTION_REDIRECT => {
-            // Session exists and stays on the userspace dataplane.
-        }
-        USERSPACE_SESSION_ACTION_PASS_TO_KERNEL => {
-            record_trace(
-                ctrl.flags,
-                ingress_ifindex,
-                rx_queue_index,
-                selected_queue,
-                binding.slot,
-                USERSPACE_TRACE_STAGE_LOCAL_DESTINATION,
-                0,
-                &parsed,
-            );
-            return Ok(cpumap_or_pass(ctrl));
-        }
-        _ => {
-            // Session miss — run full checks for new connections.
-            if is_icmp_to_interface_nat_local(&parsed) {
-                record_trace(
-                    ctrl.flags,
-                    ingress_ifindex,
-                    rx_queue_index,
-                    selected_queue,
-                    binding.slot,
-                    USERSPACE_TRACE_STAGE_INTERFACE_NAT_LOCAL,
-                    0,
-                    &parsed,
-                );
-                return Ok(cpumap_or_pass(ctrl));
+    if !native_gre {
+        match live_userspace_session_action(&parsed) {
+            USERSPACE_SESSION_ACTION_REDIRECT => {
+                // Session exists and stays on the userspace dataplane.
             }
-            if is_local_destination(&parsed) {
+            USERSPACE_SESSION_ACTION_PASS_TO_KERNEL => {
                 record_trace(
                     ctrl.flags,
                     ingress_ifindex,
@@ -461,9 +472,58 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 );
                 return Ok(cpumap_or_pass(ctrl));
             }
-            // Let all session misses through to the userspace dataplane.
-            // The userspace DP will evaluate policy and either create a
-            // session (new flow) or drop (stale non-SYN TCP / policy deny).
+            _ => {
+                // Session miss — run full checks for new connections.
+                if is_icmp_to_interface_nat_local(&parsed) {
+                    record_trace(
+                        ctrl.flags,
+                        ingress_ifindex,
+                        rx_queue_index,
+                        selected_queue,
+                        binding.slot,
+                        USERSPACE_TRACE_STAGE_INTERFACE_NAT_LOCAL,
+                        0,
+                        &parsed,
+                    );
+                    return Ok(cpumap_or_pass(ctrl));
+                }
+                if is_local_destination(&parsed) || is_interface_nat_destination(&parsed) {
+                    record_trace(
+                        ctrl.flags,
+                        ingress_ifindex,
+                        rx_queue_index,
+                        selected_queue,
+                        binding.slot,
+                        USERSPACE_TRACE_STAGE_LOCAL_DESTINATION,
+                        0,
+                        &parsed,
+                    );
+                    return Ok(cpumap_or_pass(ctrl));
+                }
+                // Let all session misses through to the userspace dataplane.
+                // The userspace DP will evaluate policy and either create a
+                // session (new flow) or drop (stale non-SYN TCP / policy deny).
+            }
+        }
+    } else {
+        match classify_native_gre_inner(data, data_end, &parsed) {
+            USERSPACE_SESSION_ACTION_REDIRECT => {
+                // Transit GRE flow already belongs to the userspace dataplane.
+            }
+            USERSPACE_SESSION_ACTION_PASS_TO_KERNEL => {
+                record_trace(
+                    ctrl.flags,
+                    ingress_ifindex,
+                    rx_queue_index,
+                    selected_queue,
+                    binding.slot,
+                    USERSPACE_TRACE_STAGE_LOCAL_DESTINATION,
+                    0,
+                    &parsed,
+                );
+                return Ok(cpumap_or_pass(ctrl));
+            }
+            _ => {}
         }
     }
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
@@ -538,6 +598,212 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_REDIRECT_ERR)
         }
     }
+}
+
+#[inline(never)]
+fn classify_native_gre_inner(data: usize, data_end: usize, outer: &ParsedPacket) -> u8 {
+    let gre_offset = outer.l4_offset as usize;
+    let Some(gre) = read_bytes(data, data_end, gre_offset, 4) else {
+        return 0;
+    };
+    if gre[0] != 0 || gre[1] != 0 {
+        return 0;
+    }
+    let gre_proto = u16::from_be_bytes([gre[2], gre[3]]);
+    let Some(inner_offset) = gre_offset.checked_add(4) else {
+        return 0;
+    };
+    match gre_proto {
+        GRE_PROTO_IPV4 => classify_native_gre_inner_ipv4(data, data_end, inner_offset),
+        GRE_PROTO_IPV6 => classify_native_gre_inner_ipv6(data, data_end, inner_offset),
+        _ => 0,
+    }
+}
+
+#[inline(never)]
+fn classify_native_gre_inner_ipv4(data: usize, data_end: usize, l3_offset: usize) -> u8 {
+    let Some(iph) = read_bytes(data, data_end, l3_offset, 20) else {
+        return 0;
+    };
+    let version_ihl = iph[0];
+    if (version_ihl >> 4) != 4 {
+        return 0;
+    }
+    let ihl = ((version_ihl & 0x0f) as usize) * 4;
+    if ihl < 20 {
+        return 0;
+    }
+    if read_bytes(data, data_end, l3_offset, ihl).is_none() {
+        return 0;
+    }
+    let protocol = iph[9];
+    let mut key = UserspaceSessionKey {
+        addr_family: AF_INET,
+        protocol,
+        pad: 0,
+        src_port: 0,
+        dst_port: 0,
+        src_addr: [0; 16],
+        dst_addr: [0; 16],
+    };
+    key.src_addr[..4].copy_from_slice(&iph[12..16]);
+    key.dst_addr[..4].copy_from_slice(&iph[16..20]);
+    // Use native-endian to match Go's binary.NativeEndian.Uint32() used
+    // for BPF map keys (DNAT_TABLE, USERSPACE_INTERFACE_NAT_V4, USERSPACE_LOCAL_V4).
+    let dst_v4 = u32::from_ne_bytes([iph[16], iph[17], iph[18], iph[19]]);
+    let Some(l4_offset) = l3_offset.checked_add(ihl) else {
+        return 0;
+    };
+    let mut icmp_type = 0u8;
+    match protocol {
+        PROTO_TCP => {
+            let Some(tcp) = read_bytes(data, data_end, l4_offset, 14) else {
+                return 0;
+            };
+            key.src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+            key.dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+        }
+        PROTO_UDP => {
+            let Some(udp) = read_bytes(data, data_end, l4_offset, 8) else {
+                return 0;
+            };
+            key.src_port = u16::from_be_bytes([udp[0], udp[1]]);
+            key.dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+        }
+        PROTO_ICMP => {
+            let Some(icmp) = read_bytes(data, data_end, l4_offset, 8) else {
+                return 0;
+            };
+            key.src_port = u16::from_be_bytes([icmp[4], icmp[5]]);
+            icmp_type = icmp[0];
+        }
+        _ => {}
+    }
+    let action = unsafe { USERSPACE_SESSIONS.get(&key).copied() }.unwrap_or(0);
+    if action != 0 {
+        return action;
+    }
+    // ICMP echo flows store the identifier in src_port in the userspace
+    // session-key shape. Dynamic SNAT-return DNAT entries use that identifier
+    // as the port key, so native GRE must use the same field here or the first
+    // reply falls through to the kernel path.
+    let dnat_port = if protocol == PROTO_ICMP {
+        key.src_port
+    } else {
+        key.dst_port
+    };
+    if dnat_lookup_v4(protocol, dst_v4, dnat_port).is_some() {
+        return USERSPACE_SESSION_ACTION_REDIRECT;
+    }
+    if protocol == PROTO_ICMP
+        && icmp_type == 8
+        && unsafe { USERSPACE_INTERFACE_NAT_V4.get(&dst_v4) }.is_some()
+    {
+        return USERSPACE_SESSION_ACTION_PASS_TO_KERNEL;
+    }
+    if unsafe { USERSPACE_INTERFACE_NAT_V4.get(&dst_v4) }.is_some() {
+        return USERSPACE_SESSION_ACTION_PASS_TO_KERNEL;
+    }
+    if unsafe { USERSPACE_LOCAL_V4.get(&dst_v4) }.is_some() {
+        return USERSPACE_SESSION_ACTION_PASS_TO_KERNEL;
+    }
+    0
+}
+
+#[inline(always)]
+fn dnat_lookup_v4(protocol: u8, dst_ip: u32, dst_port: u16) -> Option<DnatValueV4> {
+    let exact = DnatKeyV4 {
+        protocol,
+        pad: [0; 3],
+        dst_ip,
+        dst_port,
+        pad2: 0,
+    };
+    if let Some(value) = unsafe { DNAT_TABLE.get(&exact).copied() } {
+        return Some(value);
+    }
+    let wildcard = DnatKeyV4 {
+        protocol,
+        pad: [0; 3],
+        dst_ip,
+        dst_port: 0,
+        pad2: 0,
+    };
+    unsafe { DNAT_TABLE.get(&wildcard).copied() }
+}
+
+#[inline(never)]
+fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize) -> u8 {
+    let Some(ip6) = read_bytes(data, data_end, l3_offset, 40) else {
+        return 0;
+    };
+    if (ip6[0] >> 4) != 6 {
+        return 0;
+    }
+    let protocol = ip6[6];
+    match protocol {
+        NEXTHDR_HOP | NEXTHDR_ROUTING | NEXTHDR_DEST | NEXTHDR_AUTH | NEXTHDR_FRAGMENT => {
+            return 0;
+        }
+        _ => {}
+    }
+    let mut key = UserspaceSessionKey {
+        addr_family: AF_INET6,
+        protocol,
+        pad: 0,
+        src_port: 0,
+        dst_port: 0,
+        src_addr: [0; 16],
+        dst_addr: [0; 16],
+    };
+    key.src_addr.copy_from_slice(&ip6[8..24]);
+    key.dst_addr.copy_from_slice(&ip6[24..40]);
+    let dst_key = UserspaceLocalV6Key { addr: key.dst_addr };
+    let Some(l4_offset) = l3_offset.checked_add(40) else {
+        return 0;
+    };
+    let mut icmp_type = 0u8;
+    match protocol {
+        PROTO_TCP => {
+            let Some(tcp) = read_bytes(data, data_end, l4_offset, 14) else {
+                return 0;
+            };
+            key.src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+            key.dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+        }
+        PROTO_UDP => {
+            let Some(udp) = read_bytes(data, data_end, l4_offset, 8) else {
+                return 0;
+            };
+            key.src_port = u16::from_be_bytes([udp[0], udp[1]]);
+            key.dst_port = u16::from_be_bytes([udp[2], udp[3]]);
+        }
+        PROTO_ICMPV6 => {
+            let Some(icmp) = read_bytes(data, data_end, l4_offset, 8) else {
+                return 0;
+            };
+            key.src_port = u16::from_be_bytes([icmp[4], icmp[5]]);
+            icmp_type = icmp[0];
+        }
+        _ => {}
+    }
+    let action = unsafe { USERSPACE_SESSIONS.get(&key).copied() }.unwrap_or(0);
+    if action != 0 {
+        return action;
+    }
+    if protocol == PROTO_ICMPV6
+        && icmp_type == 128
+        && unsafe { USERSPACE_INTERFACE_NAT_V6.get(&dst_key) }.is_some()
+    {
+        return USERSPACE_SESSION_ACTION_PASS_TO_KERNEL;
+    }
+    if unsafe { USERSPACE_INTERFACE_NAT_V6.get(&dst_key) }.is_some() {
+        return USERSPACE_SESSION_ACTION_PASS_TO_KERNEL;
+    }
+    if unsafe { USERSPACE_LOCAL_V6.get(&dst_key) }.is_some() {
+        return USERSPACE_SESSION_ACTION_PASS_TO_KERNEL;
+    }
+    0
 }
 
 fn fallback_to_main(ctx: &XdpContext, _ctrl: &UserspaceCtrl, reason: u32) -> Result<u32, i64> {

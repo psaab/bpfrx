@@ -225,6 +225,33 @@ func New(opts Options) *Daemon {
 	}
 }
 
+func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
+	if cfg == nil {
+		return nil
+	}
+	anchorOnly := cfg.System.DataplaneType == dataplane.TypeUserspace
+	var tunnels []*config.TunnelConfig
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
+		if ifc.Tunnel != nil && ifc.Tunnel.Source != "" {
+			tc := *ifc.Tunnel
+			tc.AnchorOnly = anchorOnly
+			tunnels = append(tunnels, &tc)
+		}
+		for _, unit := range ifc.Units {
+			if unit == nil || unit.Tunnel == nil {
+				continue
+			}
+			tc := *unit.Tunnel
+			tc.AnchorOnly = anchorOnly
+			tunnels = append(tunnels, &tc)
+		}
+	}
+	return tunnels
+}
+
 // Run starts the daemon and blocks until shutdown.
 func (d *Daemon) Run(ctx context.Context) error {
 	d.daemonCtx = ctx
@@ -1519,19 +1546,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 
 	// 1. Create tunnel interfaces (interface-level + per-unit tunnels)
 	if d.routing != nil {
-		var tunnels []*config.TunnelConfig
-		for _, ifc := range cfg.Interfaces.Interfaces {
-			if ifc.Tunnel != nil && ifc.Tunnel.Source != "" {
-				tunnels = append(tunnels, ifc.Tunnel)
-			}
-			// Collect per-unit tunnels (each unit with its own tunnel config)
-			for _, unit := range ifc.Units {
-				if unit.Tunnel != nil {
-					tunnels = append(tunnels, unit.Tunnel)
-				}
-			}
-		}
-		if err := d.routing.ApplyTunnels(tunnels); err != nil {
+		if err := d.routing.ApplyTunnels(collectAppliedTunnels(cfg)); err != nil {
 			slog.Warn("failed to apply tunnels", "err", err)
 		}
 	}
@@ -2939,7 +2954,9 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		EgressZone:  egressZone,
 		ReverseKey:  userspaceReverseKeyV4(key, delta),
 	}
-	if delta.TXIfindex > 0 {
+	if delta.TunnelEndpointID != 0 && delta.EgressIfindex > 0 {
+		val.FibIfindex = uint32(delta.EgressIfindex)
+	} else if delta.TXIfindex > 0 {
 		val.FibIfindex = uint32(delta.TXIfindex)
 	} else if delta.EgressIfindex > 0 {
 		val.FibIfindex = uint32(delta.EgressIfindex)
@@ -2993,7 +3010,9 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 		EgressZone:  egressZone,
 		ReverseKey:  userspaceReverseKeyV6(key, delta),
 	}
-	if delta.TXIfindex > 0 {
+	if delta.TunnelEndpointID != 0 && delta.EgressIfindex > 0 {
+		val.FibIfindex = uint32(delta.EgressIfindex)
+	} else if delta.TXIfindex > 0 {
 		val.FibIfindex = uint32(delta.TXIfindex)
 	} else if delta.EgressIfindex > 0 {
 		val.FibIfindex = uint32(delta.EgressIfindex)

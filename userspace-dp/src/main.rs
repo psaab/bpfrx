@@ -168,6 +168,8 @@ struct ConfigSnapshot {
     interfaces: Vec<InterfaceSnapshot>,
     #[serde(default)]
     fabrics: Vec<FabricSnapshot>,
+    #[serde(rename = "tunnel_endpoints", default)]
+    tunnel_endpoints: Vec<TunnelEndpointSnapshot>,
     #[serde(default)]
     neighbors: Vec<NeighborSnapshot>,
     #[serde(default)]
@@ -230,6 +232,38 @@ struct FabricSnapshot {
     local_mac: String,
     #[serde(rename = "peer_mac", default)]
     peer_mac: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct TunnelEndpointSnapshot {
+    #[serde(default)]
+    id: u16,
+    #[serde(default)]
+    interface: String,
+    #[serde(rename = "linux_name", default)]
+    linux_name: String,
+    #[serde(default)]
+    ifindex: i32,
+    #[serde(default)]
+    zone: String,
+    #[serde(rename = "redundancy_group", default)]
+    redundancy_group: i32,
+    #[serde(default)]
+    mtu: i32,
+    #[serde(default)]
+    mode: String,
+    #[serde(rename = "outer_family", default)]
+    outer_family: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    destination: String,
+    #[serde(default)]
+    key: u32,
+    #[serde(default)]
+    ttl: i32,
+    #[serde(rename = "transport_table", default)]
+    transport_table: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -936,6 +970,8 @@ struct SessionSyncRequest {
     egress_ifindex: i32,
     #[serde(rename = "tx_ifindex", default)]
     tx_ifindex: i32,
+    #[serde(rename = "tunnel_endpoint_id", default)]
+    tunnel_endpoint_id: u16,
     #[serde(rename = "tx_vlan_id", default)]
     tx_vlan_id: u16,
     #[serde(rename = "next_hop", default)]
@@ -1001,6 +1037,8 @@ struct SessionDeltaInfo {
     egress_ifindex: i32,
     #[serde(rename = "tx_ifindex", default)]
     tx_ifindex: i32,
+    #[serde(rename = "tunnel_endpoint_id", default)]
+    tunnel_endpoint_id: u16,
     #[serde(rename = "tx_vlan_id", default)]
     tx_vlan_id: u16,
     #[serde(rename = "next_hop", default)]
@@ -1611,7 +1649,9 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
         .map_err(|e| format!("parse neighbor_mac {}: {e}", req.neighbor_mac))?;
     let src_mac = parse_session_sync_mac(&req.src_mac)
         .map_err(|e| format!("parse src_mac {}: {e}", req.src_mac))?;
-    let tx_ifindex = if req.tx_ifindex > 0 {
+    let tx_ifindex = if req.tunnel_endpoint_id != 0 {
+        req.tx_ifindex.max(0)
+    } else if req.tx_ifindex > 0 {
         req.tx_ifindex
     } else {
         req.egress_ifindex
@@ -1650,7 +1690,10 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
         key,
         decision: crate::session::SessionDecision {
             resolution: afxdp::ForwardingResolution {
-                disposition: if req.egress_ifindex > 0 || req.tx_ifindex > 0 {
+                disposition: if req.egress_ifindex > 0
+                    || req.tx_ifindex > 0
+                    || req.tunnel_endpoint_id != 0
+                {
                     afxdp::ForwardingDisposition::ForwardCandidate
                 } else {
                     afxdp::ForwardingDisposition::NoRoute
@@ -1658,6 +1701,7 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
                 local_ifindex: 0,
                 egress_ifindex: req.egress_ifindex,
                 tx_ifindex,
+                tunnel_endpoint_id: req.tunnel_endpoint_id,
                 next_hop,
                 neighbor_mac,
                 src_mac,
@@ -2082,6 +2126,31 @@ mod tests {
     }
 
     #[test]
+    fn build_synced_session_entry_preserves_tunnel_endpoint_id() {
+        let req = SessionSyncRequest {
+            operation: "upsert".to_string(),
+            addr_family: libc::AF_INET as u8,
+            protocol: 1,
+            src_ip: "10.0.61.102".to_string(),
+            dst_ip: "10.255.192.41".to_string(),
+            ingress_zone: "lan".to_string(),
+            egress_zone: "sfmix".to_string(),
+            egress_ifindex: 586,
+            tx_ifindex: 0,
+            tunnel_endpoint_id: 3,
+            ..SessionSyncRequest::default()
+        };
+
+        let entry = build_synced_session_entry(&req).expect("synced session entry");
+        assert_eq!(entry.decision.resolution.tunnel_endpoint_id, 3);
+        assert_eq!(entry.decision.resolution.egress_ifindex, 586);
+        assert_eq!(
+            entry.decision.resolution.disposition,
+            afxdp::ForwardingDisposition::ForwardCandidate
+        );
+    }
+
+    #[test]
     fn queue_planner_preserves_existing_state() {
         let existing = vec![BindingStatus {
             slot: 0,
@@ -2108,6 +2177,35 @@ mod tests {
         } else {
             panic!("binding 0 missing");
         }
+    }
+
+    #[test]
+    fn queue_planner_ignores_tunnel_netdevices_for_transit() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "gr-0/0/0.0".to_string(),
+                    linux_name: "gr-0-0-0".to_string(),
+                    ifindex: 586,
+                    rx_queues: 1,
+                    tunnel: true,
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "ge-0/0/2.80".to_string(),
+                    linux_name: "ge-0-0-2.80".to_string(),
+                    ifindex: 24,
+                    parent_ifindex: 6,
+                    rx_queues: 1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let bindings = replan_queues(Some(&snapshot), 1, &[]);
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].interface, "ge-0-0-2.80");
+        assert_eq!(bindings[0].ifindex, 24);
     }
 
     #[test]

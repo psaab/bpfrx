@@ -228,9 +228,9 @@ func deriveUserspaceCapabilities(cfg *config.Config) UserspaceCapabilities {
 	}
 	// IPsec: kernel XFRM handles ESP encryption/decryption; the userspace
 	// dataplane passes ESP/IKE traffic to the kernel via the slow-path.
-	// Tunnel interfaces (GRE, ip6gre, XFRM) are handled by the eBPF
-	// pipeline which prepends/strips the pseudo-Ethernet header. The
-	// userspace worker detects ESP/IKE and routes to slow-path for XFRM.
+	// GRE transit is now modeled as native userspace tunnel endpoints on the
+	// physical NIC path. Kernel tunnel interfaces remain only for host/control
+	// plane compatibility during migration.
 	if cfg.ForwardingOptions.PortMirroring != nil {
 		addReason("port mirroring is not implemented in the userspace dataplane")
 	}
@@ -506,31 +506,32 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 	policyCount := len(cfg.Security.Policies)
 	interfaces := buildInterfaceSnapshots(cfg)
 	return &ConfigSnapshot{
-		Version:        ProtocolVersion,
-		Generation:     generation,
-		FIBGeneration:  fibGeneration,
-		GeneratedAt:    time.Now().UTC(),
-		Capabilities:   deriveUserspaceCapabilities(cfg),
-		MapPins:        userspaceMapPins(),
-		Userspace:      ucfg,
-		Zones:          buildZoneSnapshots(cfg),
-		Interfaces:     interfaces,
-		Fabrics:        buildFabricSnapshots(cfg),
-		Neighbors:      buildNeighborSnapshots(cfg),
-		Routes:         buildRouteSnapshots(cfg, interfaces),
-		Flow:           buildFlowSnapshot(cfg),
-		DefaultPolicy:  policyActionString(cfg.Security.DefaultPolicy),
-		Policies:       buildPolicySnapshots(cfg),
-		SourceNAT:      buildSourceNATSnapshots(cfg),
-		StaticNAT:      buildStaticNATSnapshots(cfg),
-		DestinationNAT: buildDestinationNATSnapshots(cfg),
-		NAT64:          buildNAT64Snapshots(cfg),
-		Nptv6:          buildNptv6Snapshots(cfg),
-		Screens:        buildScreenSnapshots(cfg),
-		Filters:        buildFirewallFilterSnapshots(cfg),
-		Policers:       buildPolicerSnapshots(cfg),
-		FlowExport:     buildFlowExportSnapshot(cfg),
-		Config:         cfg,
+		Version:         ProtocolVersion,
+		Generation:      generation,
+		FIBGeneration:   fibGeneration,
+		GeneratedAt:     time.Now().UTC(),
+		Capabilities:    deriveUserspaceCapabilities(cfg),
+		MapPins:         userspaceMapPins(),
+		Userspace:       ucfg,
+		Zones:           buildZoneSnapshots(cfg),
+		Interfaces:      interfaces,
+		Fabrics:         buildFabricSnapshots(cfg),
+		TunnelEndpoints: buildTunnelEndpointSnapshots(cfg, interfaces),
+		Neighbors:       buildNeighborSnapshots(cfg),
+		Routes:          buildRouteSnapshots(cfg, interfaces),
+		Flow:            buildFlowSnapshot(cfg),
+		DefaultPolicy:   policyActionString(cfg.Security.DefaultPolicy),
+		Policies:        buildPolicySnapshots(cfg),
+		SourceNAT:       buildSourceNATSnapshots(cfg),
+		StaticNAT:       buildStaticNATSnapshots(cfg),
+		DestinationNAT:  buildDestinationNATSnapshots(cfg),
+		NAT64:           buildNAT64Snapshots(cfg),
+		Nptv6:           buildNptv6Snapshots(cfg),
+		Screens:         buildScreenSnapshots(cfg),
+		Filters:         buildFirewallFilterSnapshots(cfg),
+		Policers:        buildPolicerSnapshots(cfg),
+		FlowExport:      buildFlowExportSnapshot(cfg),
+		Config:          cfg,
 		Summary: SnapshotSummary{
 			HostName:       cfg.System.HostName,
 			DataplaneType:  cfg.System.DataplaneType,
@@ -746,6 +747,108 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				FilterInputV4:   unit.FilterInputV4,
 				FilterInputV6:   unit.FilterInputV6,
 			})
+		}
+	}
+	return out
+}
+
+func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []TunnelEndpointSnapshot {
+	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
+		return nil
+	}
+	ifaceByName := make(map[string]InterfaceSnapshot, len(interfaces))
+	for _, iface := range interfaces {
+		if iface.Name == "" || iface.Ifindex <= 0 {
+			continue
+		}
+		ifaceByName[iface.Name] = iface
+	}
+	if len(ifaceByName) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]TunnelEndpointSnapshot, 0)
+	var nextID uint16 = 1
+	addEndpoint := func(ifName string, tunnel *config.TunnelConfig) {
+		if tunnel == nil || tunnel.Source == "" || tunnel.Destination == "" || nextID == 0 {
+			return
+		}
+		iface, ok := ifaceByName[ifName]
+		if !ok {
+			return
+		}
+		outerFamily := "inet"
+		transportTable := "inet.0"
+		if dst := net.ParseIP(tunnel.Destination); dst != nil && dst.To4() == nil {
+			outerFamily = "inet6"
+			transportTable = "inet6.0"
+		} else if src := net.ParseIP(tunnel.Source); src != nil && src.To4() == nil {
+			outerFamily = "inet6"
+			transportTable = "inet6.0"
+		}
+		if tunnel.RoutingInstance != "" {
+			if outerFamily == "inet6" {
+				transportTable = tunnel.RoutingInstance + ".inet6.0"
+			} else {
+				transportTable = tunnel.RoutingInstance + ".inet.0"
+			}
+		}
+		out = append(out, TunnelEndpointSnapshot{
+			ID:              nextID,
+			Interface:       ifName,
+			LinuxName:       iface.LinuxName,
+			Ifindex:         iface.Ifindex,
+			Zone:            iface.Zone,
+			RedundancyGroup: iface.RedundancyGroup,
+			MTU:             iface.MTU,
+			Mode:            tunnel.Mode,
+			OuterFamily:     outerFamily,
+			Source:          tunnel.Source,
+			Destination:     tunnel.Destination,
+			Key:             tunnel.Key,
+			TTL:             tunnel.TTL,
+			TransportTable:  transportTable,
+		})
+		nextID++
+	}
+	for _, name := range names {
+		iface := cfg.Interfaces.Interfaces[name]
+		if iface == nil {
+			continue
+		}
+		if iface.Tunnel != nil {
+			if len(iface.Units) == 0 {
+				addEndpoint(name, iface.Tunnel)
+				continue
+			}
+			unitNums := make([]int, 0, len(iface.Units))
+			for unitNum := range iface.Units {
+				unitNums = append(unitNums, unitNum)
+			}
+			sort.Ints(unitNums)
+			for _, unitNum := range unitNums {
+				addEndpoint(fmt.Sprintf("%s.%d", name, unitNum), iface.Tunnel)
+			}
+			continue
+		}
+		if len(iface.Units) == 0 {
+			continue
+		}
+		unitNums := make([]int, 0, len(iface.Units))
+		for unitNum := range iface.Units {
+			unitNums = append(unitNums, unitNum)
+		}
+		sort.Ints(unitNums)
+		for _, unitNum := range unitNums {
+			unit := iface.Units[unitNum]
+			if unit == nil || unit.Tunnel == nil {
+				continue
+			}
+			addEndpoint(fmt.Sprintf("%s.%d", name, unitNum), unit.Tunnel)
 		}
 	}
 	return out
@@ -2265,6 +2368,7 @@ type userspaceCtrlValue struct {
 const userspaceMetadataVersion = 4
 const userspaceCtrlFlagCPUMap = 1
 const userspaceCtrlFlagTrace = 2
+const userspaceCtrlFlagNativeGRE = 4
 const bindingQueuesPerIface = 16 // must match BINDING_QUEUES_PER_IFACE in BPF
 
 func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg config.UserspaceConfig) error {
@@ -2297,6 +2401,9 @@ func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg confi
 	var ctrlFlags uint32
 	if cpumapReady {
 		ctrlFlags |= userspaceCtrlFlagCPUMap
+	}
+	if snapshotHasNativeGRE(snapshot) {
+		ctrlFlags |= userspaceCtrlFlagNativeGRE
 	}
 	ctrl := userspaceCtrlValue{
 		Enabled:            0,
@@ -2400,6 +2507,9 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	if cpuMap := m.inner.Map("userspace_cpumap"); cpuMap != nil {
 		ctrlFlags |= userspaceCtrlFlagCPUMap
 	}
+	if snapshotHasNativeGRE(m.lastSnapshot) {
+		ctrlFlags |= userspaceCtrlFlagNativeGRE
+	}
 
 	zero := uint32(0)
 	ctrl := userspaceCtrlValue{
@@ -2436,6 +2546,33 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			return fmt.Errorf("update userspace_bindings idx=%d (if=%d q=%d): %w", idx, binding.Ifindex, binding.QueueID, err)
 		}
 		m.lastBindingIndices = append(m.lastBindingIndices, idx)
+	}
+	for childIfindex, parentIfindex := range buildUserspaceIngressBindingAliases(m.lastSnapshot) {
+		for _, binding := range status.Bindings {
+			if binding.Ifindex != int(parentIfindex) {
+				continue
+			}
+			flags := uint32(0)
+			if binding.Registered && binding.Armed && binding.Ready {
+				flags = userspaceBindingReady
+			}
+			idx := childIfindex*bindingQueuesPerIface + binding.QueueID
+			val := userspaceBindingValue{
+				Slot:  binding.Slot,
+				Flags: flags,
+			}
+			if err := bindingsMap.Update(idx, val, ebpf.UpdateAny); err != nil {
+				return fmt.Errorf(
+					"update aliased userspace_bindings idx=%d (if=%d parent=%d q=%d): %w",
+					idx,
+					childIfindex,
+					parentIfindex,
+					binding.QueueID,
+					err,
+				)
+			}
+			m.lastBindingIndices = append(m.lastBindingIndices, idx)
+		}
 	}
 	if err := m.syncIngressIfaceMapLocked(m.lastSnapshot); err != nil {
 		return err
@@ -2740,8 +2877,46 @@ func (m *Manager) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionVa
 	return nil
 }
 
+func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
+	installVal := val
+	installVal.FibIfindex = 0
+	installVal.FibVlanID = 0
+	installVal.FibDmac = [6]byte{}
+	installVal.FibSmac = [6]byte{}
+	installVal.FibGen = 0
+	if err := m.inner.SetSessionV4(key, installVal); err != nil {
+		return err
+	}
+	if !shouldMirrorUserspaceSession(val.IsReverse) {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_ = m.syncSessionV4Locked("upsert", key, &val)
+	return nil
+}
+
 func (m *Manager) SetSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
 	if err := m.inner.SetSessionV6(key, val); err != nil {
+		return err
+	}
+	if !shouldMirrorUserspaceSession(val.IsReverse) {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_ = m.syncSessionV6Locked("upsert", key, &val)
+	return nil
+}
+
+func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error {
+	installVal := val
+	installVal.FibIfindex = 0
+	installVal.FibVlanID = 0
+	installVal.FibDmac = [6]byte{}
+	installVal.FibSmac = [6]byte{}
+	installVal.FibGen = 0
+	if err := m.inner.SetSessionV6(key, installVal); err != nil {
 		return err
 	}
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
@@ -2799,6 +2974,10 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 		req.IngressZone = m.zoneNameByID(val.IngressZone)
 		req.EgressZone = m.zoneNameByID(val.EgressZone)
 		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID)
+		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
+		if req.TunnelEndpointID != 0 {
+			req.TXIfindex = 0
+		}
 		req.TXVLANID = val.FibVlanID
 		req.NeighborMAC = macString(val.FibDmac[:])
 		req.SrcMAC = macString(val.FibSmac[:])
@@ -2842,6 +3021,10 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		req.IngressZone = m.zoneNameByID(val.IngressZone)
 		req.EgressZone = m.zoneNameByID(val.EgressZone)
 		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID)
+		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
+		if req.TunnelEndpointID != 0 {
+			req.TXIfindex = 0
+		}
 		req.TXVLANID = val.FibVlanID
 		req.NeighborMAC = macString(val.FibDmac[:])
 		req.SrcMAC = macString(val.FibSmac[:])
@@ -2861,6 +3044,19 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		}
 	}
 	return req
+}
+
+func (m *Manager) sessionSyncTunnelEndpointIDLocked(egressIfindex int) uint16 {
+	snapshot := m.lastSnapshot
+	if snapshot == nil || egressIfindex <= 0 {
+		return 0
+	}
+	for _, endpoint := range snapshot.TunnelEndpoints {
+		if endpoint.Ifindex == egressIfindex {
+			return endpoint.ID
+		}
+	}
+	return 0
 }
 
 func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
@@ -3080,6 +3276,13 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 			continue
 		}
 		if iface.ParentIfindex > 0 {
+			if iface.Ifindex > 0 {
+				key := uint32(iface.Ifindex)
+				if !seen[key] {
+					seen[key] = true
+					out = append(out, key)
+				}
+			}
 			key := uint32(iface.ParentIfindex)
 			if seen[key] {
 				continue
@@ -3116,7 +3319,27 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	return out
 }
 
+func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]uint32 {
+	if snapshot == nil {
+		return nil
+	}
+	out := make(map[uint32]uint32)
+	for _, iface := range snapshot.Interfaces {
+		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
+			continue
+		}
+		if iface.Ifindex <= 0 || iface.ParentIfindex <= 0 {
+			continue
+		}
+		out[uint32(iface.Ifindex)] = uint32(iface.ParentIfindex)
+	}
+	return out
+}
+
 func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
+	if iface.Tunnel {
+		return true
+	}
 	name := iface.Name
 	base := name
 	if idx := strings.IndexByte(base, '.'); idx >= 0 {
@@ -3138,6 +3361,22 @@ func userspaceSkipsIngressInterface(iface InterfaceSnapshot) bool {
 	}
 	if iface.LocalFabric != "" {
 		return true
+	}
+	return false
+}
+
+func snapshotHasNativeGRE(snapshot *ConfigSnapshot) bool {
+	if snapshot == nil {
+		return false
+	}
+	for _, endpoint := range snapshot.TunnelEndpoints {
+		if endpoint.ID == 0 {
+			continue
+		}
+		switch endpoint.Mode {
+		case "", "gre", "ip6gre":
+			return true
+		}
 	}
 	return false
 }

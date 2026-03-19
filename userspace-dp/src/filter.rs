@@ -155,6 +155,7 @@ pub(crate) struct FilterResult {
     pub(crate) action: FilterAction,
     pub(crate) dscp_rewrite: Option<u8>,
     pub(crate) policer_name: String,
+    pub(crate) routing_instance: String,
     pub(crate) log: bool,
 }
 
@@ -164,6 +165,7 @@ impl Default for FilterResult {
             action: FilterAction::Accept,
             dscp_rewrite: None,
             policer_name: String::new(),
+            routing_instance: String::new(),
             log: false,
         }
     }
@@ -192,6 +194,7 @@ pub(crate) fn evaluate_filter(
             action: term.action.clone(),
             dscp_rewrite: term.dscp_rewrite,
             policer_name: term.policer_name.clone(),
+            routing_instance: term.routing_instance.clone(),
             log: term.log,
         };
     }

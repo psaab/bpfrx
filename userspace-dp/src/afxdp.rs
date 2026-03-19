@@ -9,9 +9,7 @@ use crate::nat64::{Nat64ReverseInfo, Nat64State};
 use crate::nptv6::Nptv6State;
 use crate::policy::{PolicyAction, PolicyState, evaluate_policy, parse_policy_state};
 use crate::prefix::{PrefixV4, PrefixV6};
-use crate::screen::{
-    ScreenPacketInfo, ScreenProfile, ScreenState, ScreenVerdict, extract_screen_info,
-};
+use crate::screen::{ScreenProfile, ScreenState, ScreenVerdict, extract_screen_info};
 use crate::session::{
     ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
     SessionLookup, SessionMetadata, SessionTable, forward_wire_key, reverse_canonical_key,
@@ -53,6 +51,8 @@ macro_rules! debug_log {
 mod bind;
 #[path = "afxdp/frame.rs"]
 mod frame;
+#[path = "afxdp/gre.rs"]
+mod gre;
 #[path = "afxdp/icmp.rs"]
 mod icmp;
 #[path = "afxdp/icmp_embed.rs"]
@@ -66,8 +66,8 @@ mod tx;
 use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
     AfXdpBindStrategy, binding_frame_count, ifinfo_from_binding, interface_driver_name,
-    open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets, reserved_tx_frames,
-    umem_ring_size,
+    open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets,
+    reserved_tx_frames, umem_ring_size,
 };
 #[cfg(test)]
 use self::bind::{
@@ -75,6 +75,7 @@ use self::bind::{
     shared_umem_group_key_for_device,
 };
 use self::frame::*;
+use self::gre::{encapsulate_native_gre_frame, try_native_gre_decap_from_frame};
 use self::icmp::{build_local_time_exceeded_request, is_icmp_error};
 #[cfg(test)]
 use self::icmp::{
@@ -159,6 +160,7 @@ const TCP_FLAG_FIN: u8 = 0x01;
 const TCP_FLAG_RST: u8 = 0x04;
 const TCP_FLAG_PSH: u8 = 0x08;
 const TCP_FLAG_SYN: u8 = 0x02;
+const TUNNEL_HA_STARTUP_GRACE_SECS: u64 = 10;
 const SOL_XDP: c_int = 283;
 const XDP_OPTIONS: c_int = 8;
 const XDP_OPTIONS_ZEROCOPY: u32 = 1;
@@ -756,6 +758,11 @@ impl Coordinator {
                 &activated_rgs,
                 now_secs,
             );
+            for handle in self.workers.values() {
+                if let Ok(mut pending) = handle.commands.lock() {
+                    pending.push_back(WorkerCommand::RefreshOwnerRGs(activated_rgs.clone()));
+                }
+            }
         }
     }
 
@@ -774,9 +781,7 @@ impl Coordinator {
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = self.ha_state.load();
-        let reverse_entry = if !entry.metadata.is_reverse
-            && owner_rg_is_locally_active(ha_state.as_ref(), entry.metadata.owner_rg_id, now_secs)
-        {
+        let reverse_entry = if !entry.metadata.is_reverse {
             synthesized_synced_reverse_entry(
                 &self.forwarding,
                 ha_state.as_ref(),
@@ -1196,6 +1201,8 @@ struct ForwardingState {
     connected_v6: Vec<ConnectedRouteV6>,
     routes_v4: FastMap<String, Vec<RouteEntryV4>>,
     routes_v6: FastMap<String, Vec<RouteEntryV6>>,
+    tunnel_endpoints: FastMap<u16, TunnelEndpoint>,
+    tunnel_endpoint_by_ifindex: FastMap<i32, u16>,
     neighbors: FastMap<(i32, IpAddr), NeighborEntry>,
     ifindex_to_name: FastMap<i32, String>,
     ifindex_to_zone: FastMap<i32, String>,
@@ -1242,18 +1249,21 @@ struct HAGroupRuntime {
 struct ConnectedRouteV4 {
     prefix: PrefixV4,
     ifindex: i32,
+    tunnel_endpoint_id: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ConnectedRouteV6 {
     prefix: PrefixV6,
     ifindex: i32,
+    tunnel_endpoint_id: u16,
 }
 
 #[derive(Clone, Debug)]
 struct RouteEntryV4 {
     prefix: PrefixV4,
     ifindex: i32,
+    tunnel_endpoint_id: u16,
     next_hop: Option<Ipv4Addr>,
     discard: bool,
     next_table: String,
@@ -1263,6 +1273,7 @@ struct RouteEntryV4 {
 struct RouteEntryV6 {
     prefix: PrefixV6,
     ifindex: i32,
+    tunnel_endpoint_id: u16,
     next_hop: Option<Ipv6Addr>,
     discard: bool,
     next_table: String,
@@ -1284,6 +1295,20 @@ struct EgressInterface {
     redundancy_group: i32,
     primary_v4: Option<Ipv4Addr>,
     primary_v6: Option<Ipv6Addr>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct TunnelEndpoint {
+    id: u16,
+    logical_ifindex: i32,
+    mode: String,
+    outer_family: i32,
+    source: IpAddr,
+    destination: IpAddr,
+    key: u32,
+    ttl: u8,
+    transport_table: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1314,6 +1339,7 @@ pub(crate) struct ForwardingResolution {
     pub(crate) local_ifindex: i32,
     pub(crate) egress_ifindex: i32,
     pub(crate) tx_ifindex: i32,
+    pub(crate) tunnel_endpoint_id: u16,
     pub(crate) next_hop: Option<IpAddr>,
     pub(crate) neighbor_mac: Option<[u8; 6]>,
     pub(crate) src_mac: Option<[u8; 6]>,
@@ -1569,6 +1595,7 @@ struct PendingForwardRequest {
     ingress_queue_id: u32,
     source_offset: u64,
     desc: XdpDesc,
+    source_frame: Option<Vec<u8>>,
     meta: UserspaceDpMeta,
     decision: SessionDecision,
     apply_nat_on_fabric: bool,
@@ -1623,6 +1650,7 @@ enum WorkerCommand {
     UpsertSynced(SyncedSessionEntry),
     DeleteSynced(SessionKey),
     DemoteOwnerRG(i32),
+    RefreshOwnerRGs(Vec<i32>),
 }
 
 impl BindingWorker {
@@ -1936,6 +1964,7 @@ fn poll_binding(
     validation: ValidationState,
     now_ns: u64,
     now_secs: u64,
+    ha_startup_grace_until_secs: u64,
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
@@ -2105,7 +2134,9 @@ fn poll_binding(
         if ident.is_none() {
             ident = Some(binding.identity());
         }
-        let ident = ident.as_ref().expect("identity initialized when RX has work");
+        let ident = ident
+            .as_ref()
+            .expect("identity initialized when RX has work");
 
         let mut received = binding.rx.receive(available);
         binding.scratch_recycle.clear();
@@ -2242,8 +2273,24 @@ fn poll_binding(
                 if disposition == PacketDisposition::Valid {
                     counters.validated_packets += 1;
                     counters.validated_bytes += desc.len as u64;
-                    let flow = parse_session_flow(unsafe { &*area }, desc, meta);
-                    if let Some(flow) = flow.as_ref() {
+                    let Some(raw_frame) =
+                        unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
+                    else {
+                        binding.scratch_recycle.push(desc.addr);
+                        continue;
+                    };
+                    let native_gre_packet =
+                        try_native_gre_decap_from_frame(raw_frame, meta, forwarding);
+                    let meta = native_gre_packet
+                        .as_ref()
+                        .map(|packet| packet.meta)
+                        .unwrap_or(meta);
+                    let mut owned_packet_frame = native_gre_packet.map(|packet| packet.frame);
+                    let packet_frame = owned_packet_frame.as_deref().unwrap_or(raw_frame);
+                    let flow = parse_session_flow_from_bytes(packet_frame, meta);
+                    if owned_packet_frame.is_none()
+                        && let Some(flow) = flow.as_ref()
+                    {
                         learn_dynamic_neighbor_from_packet(
                             unsafe { &*area },
                             desc,
@@ -2254,9 +2301,8 @@ fn poll_binding(
                             dynamic_neighbors,
                         );
                     }
-                    let ingress_zone_override = parse_zone_encoded_fabric_ingress(
-                        unsafe { &*area },
-                        desc,
+                    let ingress_zone_override = parse_zone_encoded_fabric_ingress_from_frame(
+                        packet_frame,
                         meta,
                         forwarding,
                     );
@@ -2276,37 +2322,18 @@ fn poll_binding(
                                 } else {
                                     14 // default Ethernet header
                                 };
-                                let screen_pkt = if let Some(rx_frame) =
-                                    unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
-                                {
-                                    extract_screen_info(
-                                        rx_frame,
-                                        meta.addr_family,
-                                        meta.protocol,
-                                        meta.tcp_flags,
-                                        meta.pkt_len,
-                                        flow.src_ip,
-                                        flow.dst_ip,
-                                        flow.forward_key.src_port,
-                                        flow.forward_key.dst_port,
-                                        l3_off,
-                                    )
-                                } else {
-                                    ScreenPacketInfo {
-                                        addr_family: meta.addr_family,
-                                        protocol: meta.protocol,
-                                        tcp_flags: meta.tcp_flags,
-                                        src_ip: flow.src_ip,
-                                        dst_ip: flow.dst_ip,
-                                        src_port: flow.forward_key.src_port,
-                                        dst_port: flow.forward_key.dst_port,
-                                        pkt_len: meta.pkt_len,
-                                        is_fragment: false,
-                                        ip_ihl: 5,
-                                        ip_frag_off: 0,
-                                        ip_total_len: 0,
-                                    }
-                                };
+                                let screen_pkt = extract_screen_info(
+                                    packet_frame,
+                                    meta.addr_family,
+                                    meta.protocol,
+                                    meta.tcp_flags,
+                                    meta.pkt_len,
+                                    flow.src_ip,
+                                    flow.dst_ip,
+                                    flow.forward_key.src_port,
+                                    flow.forward_key.dst_port,
+                                    l3_off,
+                                );
                                 if let ScreenVerdict::Drop(_reason) =
                                     screen.check_packet(zone_name, &screen_pkt, now_secs)
                                 {
@@ -2329,6 +2356,7 @@ fn poll_binding(
                                     local_ifindex: 0,
                                     egress_ifindex: 0,
                                     tx_ifindex: 0,
+                                    tunnel_endpoint_id: 0,
                                     next_hop: None,
                                     neighbor_mac: None,
                                     src_mac: None,
@@ -2336,15 +2364,15 @@ fn poll_binding(
                                 },
                                 nat: NatDecision::default(),
                             };
-                            maybe_reinject_slow_path(
+                            maybe_reinject_slow_path_from_frame(
                                 &ident,
                                 &binding.live,
                                 slow_path,
-                                unsafe { &*area },
-                                desc,
+                                packet_frame,
                                 meta,
                                 ipsec_decision,
                                 recent_exceptions,
+                                "slow_path",
                             );
                             binding.scratch_recycle.push(desc.addr);
                             continue;
@@ -2372,6 +2400,7 @@ fn poll_binding(
                             meta.protocol,
                             meta.tcp_flags,
                             meta.ingress_ifindex as i32,
+                            ha_startup_grace_until_secs,
                         ) {
                             counters.session_hits += 1;
                             dbg.session_hit += 1;
@@ -2410,52 +2439,23 @@ fn poll_binding(
                             counters.session_misses += 1;
                             dbg.session_miss += 1;
                             let resolution_target =
-                                parse_packet_destination(unsafe { &*area }, desc, meta)
+                                parse_packet_destination_from_frame(packet_frame, meta)
                                     .unwrap_or(flow.dst_ip);
-
                             // Cluster peer return fast path:
-                            // a non-initiating TCP packet arriving from zone-encoded fabric
-                            // ingress has already been policy/NAT-validated by the active owner.
-                            // The first SYN-ACK can beat session publication to the inactive
-                            // owner, so allow a one-packet local forward here instead of
-                            // treating it as a fresh lan->lan flow and dropping it in policy.
-                            if meta.protocol == PROTO_TCP
-                                && ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
-                                && let Some(ingress_zone) = ingress_zone_override.as_deref()
-                                && ((meta.tcp_flags & TCP_FLAG_SYN) == 0
-                                    || (meta.tcp_flags & 0x10) != 0)
+                            // a packet arriving from zone-encoded fabric ingress has already
+                            // been policy/NAT-validated by the active owner. Allow the inactive
+                            // peer to hand it to the resolved local egress zone instead of
+                            // treating it as a brand-new flow. Keep pure TCP SYN excluded so
+                            // brand-new connects still require local session ownership.
+                            if let Some((fabric_return_decision, fabric_return_metadata)) =
+                                cluster_peer_return_fast_path(
+                                    forwarding,
+                                    dynamic_neighbors,
+                                    meta,
+                                    ingress_zone_override.as_deref(),
+                                    resolution_target,
+                                )
                             {
-                                let fabric_return_resolution =
-                                    lookup_forwarding_resolution_with_dynamic(
-                                        forwarding,
-                                        dynamic_neighbors,
-                                        resolution_target,
-                                    );
-                                let fabric_return_zone = forwarding
-                                    .ifindex_to_zone
-                                    .get(&fabric_return_resolution.egress_ifindex)
-                                    .map(|zone| zone.as_str());
-                                if fabric_return_resolution.disposition
-                                    == ForwardingDisposition::ForwardCandidate
-                                    && fabric_return_zone == Some(ingress_zone)
-                                {
-                                    let fabric_return_decision = SessionDecision {
-                                        resolution: fabric_return_resolution,
-                                        nat: NatDecision::default(),
-                                    };
-                                    let ingress_zone_arc = Arc::<str>::from(ingress_zone);
-                                    let fabric_return_metadata = SessionMetadata {
-                                        ingress_zone: ingress_zone_arc.clone(),
-                                        egress_zone: ingress_zone_arc,
-                                        owner_rg_id: owner_rg_for_flow(
-                                            forwarding,
-                                            fabric_return_decision.resolution.egress_ifindex,
-                                        ),
-                                        fabric_ingress: true,
-                                        is_reverse: true,
-                                        synced: false,
-                                        nat64_reverse: None,
-                                    };
                                     let ingress_ident = BindingIdentity {
                                         slot: binding.slot,
                                         queue_id: binding.queue_id,
@@ -2463,12 +2463,12 @@ fn poll_binding(
                                         interface: binding.interface.clone(),
                                         ifindex: binding.ifindex,
                                     };
-                                    if let Some(request) = build_live_forward_request(
-                                        unsafe { &*area },
+                                    if let Some(mut request) = build_live_forward_request_from_frame(
                                         binding_lookup,
                                         binding_index,
                                         &ingress_ident,
                                         desc,
+                                        packet_frame,
                                         meta,
                                         &fabric_return_decision,
                                         forwarding,
@@ -2476,6 +2476,7 @@ fn poll_binding(
                                         None,
                                         false,
                                     ) {
+                                        request.source_frame = owned_packet_frame.take();
                                         if sessions.install_with_protocol(
                                             flow.forward_key.clone(),
                                             fabric_return_decision,
@@ -2494,7 +2495,6 @@ fn poll_binding(
                                         binding.scratch_forwards.push(request);
                                         continue;
                                     }
-                                }
                             }
 
                             // --- DNAT pre-routing ---
@@ -2578,6 +2578,8 @@ fn poll_binding(
                                         None => resolution_target,
                                     }
                                 };
+                            let route_table_override =
+                                ingress_route_table_override(forwarding, meta, flow);
 
                             let resolution = ingress_interface_local_resolution_on_session_miss(
                                 forwarding,
@@ -2598,10 +2600,11 @@ fn poll_binding(
                                     forwarding,
                                     ha_state,
                                     now_secs,
-                                    lookup_forwarding_resolution_with_dynamic(
+                                    lookup_forwarding_resolution_in_table_with_dynamic(
                                         forwarding,
                                         dynamic_neighbors,
                                         effective_resolution_target,
+                                        route_table_override.as_deref(),
                                     ),
                                 )
                             });
@@ -2839,6 +2842,7 @@ fn poll_binding(
                                                 ingress_queue_id: ident.queue_id,
                                                 source_offset: desc.addr,
                                                 desc,
+                                                source_frame: None,
                                                 meta,
                                                 decision: icmp_decision,
                                                 apply_nat_on_fabric: false,
@@ -3070,6 +3074,7 @@ fn poll_binding(
                                             from_zone_arc.as_ref(),
                                             fabric_ingress,
                                             now_secs,
+                                            false,
                                         );
                                         // Install the reverse entry even if the initial reply-side
                                         // resolution is not immediately usable. On live traffic the
@@ -3542,12 +3547,12 @@ fn poll_binding(
                         if decision.nat.rewrite_dst.is_some() {
                             counters.dnat_packets += 1;
                         }
-                        if let Some(request) = build_live_forward_request(
-                            unsafe { &*area },
+                        if let Some(mut request) = build_live_forward_request_from_frame(
                             binding_lookup,
                             binding_index,
                             &ident,
                             desc,
+                            packet_frame,
                             meta,
                             &decision,
                             forwarding,
@@ -3555,6 +3560,7 @@ fn poll_binding(
                             session_ingress_zone.as_ref(),
                             apply_nat_on_fabric,
                         ) {
+                            request.source_frame = owned_packet_frame.take();
                             dbg.tx += 1; // track forward requests queued
                             if cfg!(feature = "debug-log") {
                                 if dbg.tx <= 5 {
@@ -3683,15 +3689,15 @@ fn poll_binding(
                             recent_exceptions,
                             last_resolution,
                         );
-                        maybe_reinject_slow_path(
+                        maybe_reinject_slow_path_from_frame(
                             &ident,
                             &binding.live,
                             slow_path,
-                            unsafe { &*area },
-                            desc,
+                            packet_frame,
                             meta,
                             decision,
                             recent_exceptions,
+                            "slow_path",
                         );
                     }
                 } else {
@@ -3803,6 +3809,35 @@ fn build_live_forward_request(
     fabric_ingress_zone: Option<&Arc<str>>,
     apply_nat_on_fabric: bool,
 ) -> Option<PendingForwardRequest> {
+    let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    build_live_forward_request_from_frame(
+        binding_lookup,
+        current_binding_index,
+        ingress_ident,
+        desc,
+        frame,
+        meta,
+        decision,
+        forwarding,
+        flow,
+        fabric_ingress_zone,
+        apply_nat_on_fabric,
+    )
+}
+
+fn build_live_forward_request_from_frame(
+    binding_lookup: &WorkerBindingLookup,
+    current_binding_index: usize,
+    ingress_ident: &BindingIdentity,
+    desc: XdpDesc,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    flow: Option<&SessionFlow>,
+    fabric_ingress_zone: Option<&Arc<str>>,
+    apply_nat_on_fabric: bool,
+) -> Option<PendingForwardRequest> {
     let target_ifindex = if decision.resolution.tx_ifindex > 0 {
         decision.resolution.tx_ifindex
     } else {
@@ -3814,26 +3849,10 @@ fn build_live_forward_request(
         ingress_ident.queue_id,
         target_ifindex,
     );
-    // Verify the UMEM slice is accessible (validates addr/len).
-    let _ = area.slice(desc.addr as usize, desc.len as usize)?;
     // Prefer session flow ports (set by conntrack, immune to DMA races),
     // then live frame ports (lazy — only parsed if session ports unavailable),
     // then metadata as last resort.
-    let session_ports = flow.and_then(|f| {
-        if f.forward_key.src_port != 0 && f.forward_key.dst_port != 0 {
-            Some((f.forward_key.src_port, f.forward_key.dst_port))
-        } else {
-            None
-        }
-    });
-    let meta_ports = if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
-        Some((meta.flow_src_port, meta.flow_dst_port))
-    } else {
-        None
-    };
-    let expected_ports = session_ports
-        .or_else(|| live_frame_ports(area, desc, meta))
-        .or(meta_ports);
+    let expected_ports = authoritative_forward_ports(frame, meta, flow);
     let mut decision = *decision;
     if decision.resolution.disposition == ForwardingDisposition::FabricRedirect
         && let Some(ingress_zone) = fabric_ingress_zone
@@ -3848,6 +3867,7 @@ fn build_live_forward_request(
         ingress_queue_id: ingress_ident.queue_id,
         source_offset: desc.addr,
         desc,
+        source_frame: None,
         meta,
         decision,
         apply_nat_on_fabric,
@@ -4011,6 +4031,7 @@ fn flush_session_deltas(
             owner_rg_id: delta.metadata.owner_rg_id,
             egress_ifindex: delta.decision.resolution.egress_ifindex,
             tx_ifindex: delta.decision.resolution.tx_ifindex,
+            tunnel_endpoint_id: delta.decision.resolution.tunnel_endpoint_id,
             tx_vlan_id: delta.decision.resolution.tx_vlan_id,
             next_hop: delta
                 .decision
@@ -4340,6 +4361,8 @@ fn worker_loop(
     poll_mode: crate::PollMode,
 ) {
     pin_current_thread(worker_id);
+    let ha_startup_grace_until_secs = (monotonic_nanos() / 1_000_000_000)
+        .saturating_add(TUNNEL_HA_STARTUP_GRACE_SECS);
     let mut sessions = SessionTable::new();
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
@@ -4487,7 +4510,9 @@ fn worker_loop(
             &commands,
             &mut sessions,
             session_map_fd,
+            &forwarding,
             ha_runtime.as_ref(),
+            &dynamic_neighbors,
         );
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
         let expired_entries = sessions.expire_stale_entries(loop_now_ns);
@@ -4525,6 +4550,7 @@ fn worker_loop(
                 validation,
                 loop_now_ns,
                 loop_now_secs,
+                ha_startup_grace_until_secs,
                 &forwarding,
                 ha_runtime.as_ref(),
                 &dynamic_neighbors,
@@ -5199,6 +5225,43 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         state.zone_id_to_name.insert(zone.id, zone.name.clone());
     }
 
+    for endpoint in &snapshot.tunnel_endpoints {
+        if endpoint.id == 0 || endpoint.ifindex <= 0 {
+            continue;
+        }
+        let Ok(source) = endpoint.source.parse::<IpAddr>() else {
+            continue;
+        };
+        let Ok(destination) = endpoint.destination.parse::<IpAddr>() else {
+            continue;
+        };
+        let outer_family = match (endpoint.outer_family.as_str(), destination) {
+            ("inet6", _) => libc::AF_INET6,
+            ("inet", _) => libc::AF_INET,
+            (_, IpAddr::V6(_)) => libc::AF_INET6,
+            _ => libc::AF_INET,
+        };
+        let transport_table =
+            canonical_route_table(&endpoint.transport_table, outer_family == libc::AF_INET6);
+        state.tunnel_endpoints.insert(
+            endpoint.id,
+            TunnelEndpoint {
+                id: endpoint.id,
+                logical_ifindex: endpoint.ifindex,
+                mode: endpoint.mode.clone(),
+                outer_family,
+                source,
+                destination,
+                key: endpoint.key,
+                ttl: endpoint.ttl.max(0) as u8,
+                transport_table,
+            },
+        );
+        state
+            .tunnel_endpoint_by_ifindex
+            .insert(endpoint.ifindex, endpoint.id);
+    }
+
     for iface in &snapshot.interfaces {
         if iface.ifindex <= 0 {
             continue;
@@ -5234,6 +5297,11 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         if let Some(mac) = parse_mac(&iface.hardware_addr) {
             mac_by_ifindex.insert(iface.ifindex, mac);
         }
+        let tunnel_endpoint_id = state
+            .tunnel_endpoint_by_ifindex
+            .get(&iface.ifindex)
+            .copied()
+            .unwrap_or(0);
         for addr in &iface.addresses {
             let Ok(net) = addr.address.parse::<IpNet>() else {
                 continue;
@@ -5248,6 +5316,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                     state.connected_v4.push(ConnectedRouteV4 {
                         prefix: PrefixV4::from_net(v4),
                         ifindex: iface.ifindex,
+                        tunnel_endpoint_id,
                     });
                 }
                 IpNet::V6(v6) => {
@@ -5259,6 +5328,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                     state.connected_v6.push(ConnectedRouteV6 {
                         prefix: PrefixV6::from_net(v6),
                         ifindex: iface.ifindex,
+                        tunnel_endpoint_id,
                     });
                 }
             }
@@ -5276,6 +5346,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
         };
         let src_mac = match parse_mac(&iface.hardware_addr)
             .or_else(|| mac_by_ifindex.get(&bind_ifindex).copied())
+            .or_else(|| iface.tunnel.then_some([0; 6]))
         {
             Some(mac) => mac,
             None => continue,
@@ -5304,7 +5375,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
 
     for route in &snapshot.routes {
         if let Ok(prefix) = route.destination.parse::<Ipv4Net>() {
-            let (next_hop, ifindex) =
+            let (next_hop, ifindex, tunnel_endpoint_id) =
                 resolve_route_target_v4(route, &name_to_ifindex, &linux_to_ifindex, &state);
             let table = canonical_route_table(&route.table, false);
             state
@@ -5314,6 +5385,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                 .push(RouteEntryV4 {
                     prefix: PrefixV4::from_net(prefix),
                     ifindex,
+                    tunnel_endpoint_id,
                     next_hop,
                     discard: route.discard,
                     next_table: route.next_table.clone(),
@@ -5321,7 +5393,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
             continue;
         }
         if let Ok(prefix) = route.destination.parse::<Ipv6Net>() {
-            let (next_hop, ifindex) =
+            let (next_hop, ifindex, tunnel_endpoint_id) =
                 resolve_route_target_v6(route, &name_to_ifindex, &linux_to_ifindex, &state);
             let table = canonical_route_table(&route.table, true);
             state
@@ -5331,6 +5403,7 @@ fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
                 .push(RouteEntryV6 {
                     prefix: PrefixV6::from_net(prefix),
                     ifindex,
+                    tunnel_endpoint_id,
                     next_hop,
                     discard: route.discard,
                     next_table: route.next_table.clone(),
@@ -5764,22 +5837,33 @@ fn resolve_route_target_v4(
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
     state: &ForwardingState,
-) -> (Option<Ipv4Addr>, i32) {
+) -> (Option<Ipv4Addr>, i32, u16) {
     if route.discard || !route.next_table.is_empty() {
-        return (None, 0);
+        return (None, 0, 0);
     }
     let Some((next_hop, interface)) = route
         .next_hops
         .first()
         .map(|nh| parse_route_next_hop(nh.as_str()))
     else {
-        return (None, 0);
+        return (None, 0, 0);
     };
-    let egress = interface
+    let target = interface
         .as_deref()
         .and_then(|name| resolve_ifindex(name, names, linux_names))
-        .or_else(|| next_hop.and_then(|ip| infer_connected_ifindex_v4(state, ip)));
-    (next_hop, egress.unwrap_or(0))
+        .map(|ifindex| {
+            (
+                ifindex,
+                state
+                    .tunnel_endpoint_by_ifindex
+                    .get(&ifindex)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        })
+        .or_else(|| next_hop.and_then(|ip| infer_connected_route_target_v4(state, ip)));
+    let (ifindex, tunnel_endpoint_id) = target.unwrap_or((0, 0));
+    (next_hop, ifindex, tunnel_endpoint_id)
 }
 
 fn resolve_route_target_v6(
@@ -5787,22 +5871,33 @@ fn resolve_route_target_v6(
     names: &BTreeMap<String, i32>,
     linux_names: &BTreeMap<String, i32>,
     state: &ForwardingState,
-) -> (Option<Ipv6Addr>, i32) {
+) -> (Option<Ipv6Addr>, i32, u16) {
     if route.discard || !route.next_table.is_empty() {
-        return (None, 0);
+        return (None, 0, 0);
     }
     let Some((next_hop, interface)) = route
         .next_hops
         .first()
         .map(|nh| parse_route_next_hop_v6(nh.as_str()))
     else {
-        return (None, 0);
+        return (None, 0, 0);
     };
-    let egress = interface
+    let target = interface
         .as_deref()
         .and_then(|name| resolve_ifindex(name, names, linux_names))
-        .or_else(|| next_hop.and_then(|ip| infer_connected_ifindex_v6(state, ip)));
-    (next_hop, egress.unwrap_or(0))
+        .map(|ifindex| {
+            (
+                ifindex,
+                state
+                    .tunnel_endpoint_by_ifindex
+                    .get(&ifindex)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        })
+        .or_else(|| next_hop.and_then(|ip| infer_connected_route_target_v6(state, ip)));
+    let (ifindex, tunnel_endpoint_id) = target.unwrap_or((0, 0));
+    (next_hop, ifindex, tunnel_endpoint_id)
 }
 
 fn parse_route_next_hop(spec: &str) -> (Option<Ipv4Addr>, Option<String>) {
@@ -5854,20 +5949,20 @@ fn resolve_ifindex(
         .or_else(|| linux_names.get(name).copied())
 }
 
-fn infer_connected_ifindex_v4(state: &ForwardingState, ip: Ipv4Addr) -> Option<i32> {
+fn infer_connected_route_target_v4(state: &ForwardingState, ip: Ipv4Addr) -> Option<(i32, u16)> {
     state
         .connected_v4
         .iter()
         .find(|entry| entry.prefix.contains(ip))
-        .map(|entry| entry.ifindex)
+        .map(|entry| (entry.ifindex, entry.tunnel_endpoint_id))
 }
 
-fn infer_connected_ifindex_v6(state: &ForwardingState, ip: Ipv6Addr) -> Option<i32> {
+fn infer_connected_route_target_v6(state: &ForwardingState, ip: Ipv6Addr) -> Option<(i32, u16)> {
     state
         .connected_v6
         .iter()
         .find(|entry| entry.prefix.contains(ip))
-        .map(|entry| entry.ifindex)
+        .map(|entry| (entry.ifindex, entry.tunnel_endpoint_id))
 }
 
 fn neighbor_state_usable(state: &str) -> bool {
@@ -5940,6 +6035,7 @@ fn resolve_forwarding(
             local_ifindex: 0,
             egress_ifindex: 0,
             tx_ifindex: 0,
+            tunnel_endpoint_id: 0,
             next_hop: None,
             neighbor_mac: None,
             src_mac: None,
@@ -6025,6 +6121,7 @@ fn resolve_fabric_redirect(forwarding: &ForwardingState) -> Option<ForwardingRes
         local_ifindex: 0,
         egress_ifindex: fabric.parent_ifindex,
         tx_ifindex: fabric.parent_ifindex,
+        tunnel_endpoint_id: 0,
         next_hop: Some(fabric.peer_addr),
         neighbor_mac: Some(fabric.peer_mac),
         src_mac: Some(fabric.local_mac),
@@ -6057,6 +6154,51 @@ fn redirect_via_fabric_if_needed(
         return resolution;
     }
     resolve_fabric_redirect(forwarding).unwrap_or(resolution)
+}
+
+fn cluster_peer_return_fast_path(
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    meta: UserspaceDpMeta,
+    ingress_zone_override: Option<&str>,
+    resolution_target: IpAddr,
+) -> Option<(SessionDecision, SessionMetadata)> {
+    if !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32) {
+        return None;
+    }
+    let ingress_zone = ingress_zone_override?;
+    if meta.protocol == PROTO_TCP
+        && (meta.tcp_flags & TCP_FLAG_SYN) != 0
+        && (meta.tcp_flags & 0x10) == 0
+    {
+        return None;
+    }
+
+    let fabric_return_resolution =
+        lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, resolution_target);
+    if fabric_return_resolution.disposition != ForwardingDisposition::ForwardCandidate {
+        return None;
+    }
+    let egress_zone = forwarding
+        .ifindex_to_zone
+        .get(&fabric_return_resolution.egress_ifindex)?
+        .clone();
+    let metadata = SessionMetadata {
+        ingress_zone: Arc::<str>::from(ingress_zone),
+        egress_zone: Arc::<str>::from(egress_zone),
+        owner_rg_id: owner_rg_for_flow(forwarding, fabric_return_resolution.egress_ifindex),
+        fabric_ingress: true,
+        is_reverse: true,
+        synced: false,
+        nat64_reverse: None,
+    };
+    Some((
+        SessionDecision {
+            resolution: fabric_return_resolution,
+            nat: NatDecision::default(),
+        },
+        metadata,
+    ))
 }
 
 fn resolve_ingress_logical_ifindex(
@@ -6178,6 +6320,73 @@ fn effective_tcp_mss(forwarding: &ForwardingState) -> u16 {
         return forwarding.tcp_mss_ipsec_vpn;
     }
     0
+}
+
+fn native_gre_inner_mtu(
+    forwarding: &ForwardingState,
+    decision: &SessionDecision,
+) -> usize {
+    if decision.resolution.tunnel_endpoint_id == 0 {
+        return 0;
+    }
+    let Some(endpoint) = forwarding
+        .tunnel_endpoints
+        .get(&decision.resolution.tunnel_endpoint_id)
+        .cloned()
+    else {
+        return 0;
+    };
+    let transport_ifindex = resolve_ingress_logical_ifindex(
+        forwarding,
+        decision.resolution.tx_ifindex,
+        decision.resolution.tx_vlan_id,
+    )
+    .unwrap_or(decision.resolution.tx_ifindex);
+    let transport_mtu = forwarding
+        .egress
+        .get(&transport_ifindex)
+        .or_else(|| forwarding.egress.get(&decision.resolution.egress_ifindex))
+        .or_else(|| forwarding.egress.get(&endpoint.logical_ifindex))
+        .map(|egress| egress.mtu)
+        .unwrap_or_default();
+    if transport_mtu == 0 {
+        return 0;
+    }
+    let outer_ip_header_len = match endpoint.outer_family {
+        libc::AF_INET => 20usize,
+        libc::AF_INET6 => 40usize,
+        _ => return 0,
+    };
+    let gre_header_len = 4usize + if endpoint.key != 0 { 4 } else { 0 };
+    transport_mtu
+        .checked_sub(outer_ip_header_len + gre_header_len)
+        .unwrap_or_default()
+}
+
+fn native_gre_tcp_mss(
+    forwarding: &ForwardingState,
+    decision: &SessionDecision,
+    addr_family: u8,
+) -> u16 {
+    if decision.resolution.tunnel_endpoint_id == 0 {
+        return 0;
+    }
+    if forwarding.tcp_mss_gre_out > 0 {
+        return forwarding.tcp_mss_gre_out;
+    }
+    let mtu = native_gre_inner_mtu(forwarding, decision);
+    if mtu == 0 {
+        return 0;
+    }
+    let ip_header_len = match addr_family as i32 {
+        libc::AF_INET => 20usize,
+        libc::AF_INET6 => 40usize,
+        _ => return 0,
+    };
+    let Some(max_mss) = mtu.checked_sub(ip_header_len + 20) else {
+        return 0;
+    };
+    u16::try_from(max_mss).unwrap_or_default()
 }
 
 /// Clamp TCP MSS option in-place in an L3 packet (starting at IP header).
@@ -6321,7 +6530,7 @@ fn lookup_forwarding_for_ip(state: &ForwardingState, dst: IpAddr) -> ForwardingD
 }
 
 fn lookup_forwarding_resolution(state: &ForwardingState, dst: IpAddr) -> ForwardingResolution {
-    lookup_forwarding_resolution_inner(state, None, dst)
+    lookup_forwarding_resolution_inner(state, None, dst, None)
 }
 
 fn lookup_forwarding_resolution_with_dynamic(
@@ -6329,15 +6538,25 @@ fn lookup_forwarding_resolution_with_dynamic(
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     dst: IpAddr,
 ) -> ForwardingResolution {
-    lookup_forwarding_resolution_inner(state, Some(dynamic_neighbors), dst)
+    lookup_forwarding_resolution_inner(state, Some(dynamic_neighbors), dst, None)
+}
+
+fn lookup_forwarding_resolution_in_table_with_dynamic(
+    state: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    dst: IpAddr,
+    table: Option<&str>,
+) -> ForwardingResolution {
+    lookup_forwarding_resolution_inner(state, Some(dynamic_neighbors), dst, table)
 }
 
 fn lookup_forwarding_resolution_inner(
     state: &ForwardingState,
     dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
     dst: IpAddr,
+    table: Option<&str>,
 ) -> ForwardingResolution {
-    let mut resolution = match dst {
+    match dst {
         IpAddr::V4(ip) => {
             if state.local_v4.contains(&ip) {
                 let local_ifindex = state
@@ -6351,13 +6570,17 @@ fn lookup_forwarding_resolution_inner(
                     local_ifindex,
                     egress_ifindex: local_ifindex,
                     tx_ifindex: local_ifindex,
+                    tunnel_endpoint_id: 0,
                     next_hop: None,
                     neighbor_mac: None,
                     src_mac: None,
                     tx_vlan_id: 0,
                 };
             }
-            lookup_forwarding_resolution_v4(state, dynamic_neighbors, ip, DEFAULT_V4_TABLE, 0)
+            let table = table
+                .map(|table| canonical_route_table(table, false))
+                .unwrap_or_else(|| DEFAULT_V4_TABLE.to_string());
+            lookup_forwarding_resolution_v4(state, dynamic_neighbors, ip, &table, 0, true)
         }
         IpAddr::V6(ip) => {
             if state.local_v6.contains(&ip) {
@@ -6372,25 +6595,49 @@ fn lookup_forwarding_resolution_inner(
                     local_ifindex,
                     egress_ifindex: local_ifindex,
                     tx_ifindex: local_ifindex,
+                    tunnel_endpoint_id: 0,
                     next_hop: None,
                     neighbor_mac: None,
                     src_mac: None,
                     tx_vlan_id: 0,
                 };
             }
-            lookup_forwarding_resolution_v6(state, dynamic_neighbors, ip, DEFAULT_V6_TABLE, 0)
+            let table = table
+                .map(|table| canonical_route_table(table, true))
+                .unwrap_or_else(|| DEFAULT_V6_TABLE.to_string());
+            lookup_forwarding_resolution_v6(state, dynamic_neighbors, ip, &table, 0, true)
         }
-    };
-    // Tunnel interfaces (GRE, ip6gre, XFRM) can't be reached via AF_XDP TX.
-    // Route these to slow-path so the kernel handles encapsulation.
-    if matches!(
-        resolution.disposition,
-        ForwardingDisposition::ForwardCandidate | ForwardingDisposition::MissingNeighbor
-    ) && state.tunnel_interfaces.contains(&resolution.egress_ifindex)
-    {
-        resolution.disposition = ForwardingDisposition::MissingNeighbor;
     }
-    resolution
+}
+
+fn ingress_route_table_override(
+    forwarding: &ForwardingState,
+    meta: UserspaceDpMeta,
+    flow: &SessionFlow,
+) -> Option<String> {
+    let ingress_ifindex =
+        resolve_ingress_logical_ifindex(forwarding, meta.ingress_ifindex as i32, meta.ingress_vlan_id)
+            .unwrap_or(meta.ingress_ifindex as i32);
+    let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
+    let result = crate::filter::evaluate_interface_filter(
+        &forwarding.filter_state,
+        ingress_ifindex,
+        is_v6,
+        flow.src_ip,
+        flow.dst_ip,
+        meta.protocol,
+        flow.forward_key.src_port,
+        flow.forward_key.dst_port,
+        meta.dscp,
+    );
+    if result.routing_instance.is_empty() {
+        return None;
+    }
+    Some(if is_v6 {
+        format!("{}.inet6.0", result.routing_instance)
+    } else {
+        format!("{}.inet.0", result.routing_instance)
+    })
 }
 
 fn interface_nat_local_resolution(
@@ -6407,6 +6654,7 @@ fn interface_nat_local_resolution(
                 local_ifindex,
                 egress_ifindex: local_ifindex,
                 tx_ifindex: local_ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop: None,
                 neighbor_mac: None,
                 src_mac: None,
@@ -6421,6 +6669,7 @@ fn interface_nat_local_resolution(
                 local_ifindex,
                 egress_ifindex: local_ifindex,
                 tx_ifindex: local_ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop: None,
                 neighbor_mac: None,
                 src_mac: None,
@@ -6466,6 +6715,7 @@ fn ingress_interface_local_resolution(
         local_ifindex: logical_ifindex,
         egress_ifindex: logical_ifindex,
         tx_ifindex: logical_ifindex,
+        tunnel_endpoint_id: 0,
         next_hop: None,
         neighbor_mac: None,
         src_mac: None,
@@ -6489,6 +6739,7 @@ fn lookup_forwarding_resolution_v4(
     ip: Ipv4Addr,
     table: &str,
     depth: usize,
+    allow_tunnels: bool,
 ) -> ForwardingResolution {
     if depth >= MAX_NEXT_TABLE_DEPTH {
         return ForwardingResolution {
@@ -6496,6 +6747,7 @@ fn lookup_forwarding_resolution_v4(
             local_ifindex: 0,
             egress_ifindex: 0,
             tx_ifindex: 0,
+            tunnel_endpoint_id: 0,
             next_hop: Some(IpAddr::V4(ip)),
             neighbor_mac: None,
             src_mac: None,
@@ -6511,7 +6763,22 @@ fn lookup_forwarding_resolution_v4(
         .iter()
         .find(|entry| entry.prefix.contains(ip));
     match choose_v4_route(static_match, connected_match) {
-        Some(ResolvedRouteV4::Connected { ifindex }) => {
+        Some(ResolvedRouteV4::Connected {
+            ifindex,
+            tunnel_endpoint_id,
+        }) => {
+            if tunnel_endpoint_id != 0 {
+                return if allow_tunnels {
+                    resolve_tunnel_forwarding_resolution(
+                        state,
+                        dynamic_neighbors,
+                        tunnel_endpoint_id,
+                        depth,
+                    )
+                } else {
+                    no_route_resolution(Some(IpAddr::V4(ip)))
+                };
+            }
             let neighbor = lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V4(ip));
             let mut resolution = ForwardingResolution {
                 disposition: if neighbor.is_some() {
@@ -6522,6 +6789,7 @@ fn lookup_forwarding_resolution_v4(
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
                 tx_ifindex: ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(ip)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
                 src_mac: None,
@@ -6532,6 +6800,7 @@ fn lookup_forwarding_resolution_v4(
         }
         Some(ResolvedRouteV4::Static {
             ifindex,
+            tunnel_endpoint_id,
             next_hop,
             discard,
             next_table,
@@ -6542,6 +6811,7 @@ fn lookup_forwarding_resolution_v4(
                     local_ifindex: 0,
                     egress_ifindex: ifindex,
                     tx_ifindex: ifindex,
+                    tunnel_endpoint_id,
                     next_hop: next_hop.map(IpAddr::V4),
                     neighbor_mac: None,
                     src_mac: None,
@@ -6555,6 +6825,7 @@ fn lookup_forwarding_resolution_v4(
                         local_ifindex: 0,
                         egress_ifindex: 0,
                         tx_ifindex: 0,
+                        tunnel_endpoint_id: 0,
                         next_hop: Some(IpAddr::V4(ip)),
                         neighbor_mac: None,
                         src_mac: None,
@@ -6567,19 +6838,23 @@ fn lookup_forwarding_resolution_v4(
                     ip,
                     &next_table_name,
                     depth + 1,
+                    allow_tunnels,
                 );
             }
-            if ifindex <= 0 {
-                return ForwardingResolution {
-                    disposition: ForwardingDisposition::NoRoute,
-                    local_ifindex: 0,
-                    egress_ifindex: 0,
-                    tx_ifindex: 0,
-                    next_hop: next_hop.map(IpAddr::V4),
-                    neighbor_mac: None,
-                    src_mac: None,
-                    tx_vlan_id: 0,
+            if tunnel_endpoint_id != 0 {
+                return if allow_tunnels {
+                    resolve_tunnel_forwarding_resolution(
+                        state,
+                        dynamic_neighbors,
+                        tunnel_endpoint_id,
+                        depth,
+                    )
+                } else {
+                    no_route_resolution(next_hop.map(IpAddr::V4).or(Some(IpAddr::V4(ip))))
                 };
+            }
+            if ifindex <= 0 {
+                return no_route_resolution(next_hop.map(IpAddr::V4));
             }
             let target = next_hop.unwrap_or(ip);
             let neighbor =
@@ -6593,6 +6868,7 @@ fn lookup_forwarding_resolution_v4(
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
                 tx_ifindex: ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(target)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
                 src_mac: None,
@@ -6601,16 +6877,7 @@ fn lookup_forwarding_resolution_v4(
             populate_egress_resolution(state, ifindex, &mut resolution);
             resolution
         }
-        None => ForwardingResolution {
-            disposition: ForwardingDisposition::NoRoute,
-            local_ifindex: 0,
-            egress_ifindex: 0,
-            tx_ifindex: 0,
-            next_hop: None,
-            neighbor_mac: None,
-            src_mac: None,
-            tx_vlan_id: 0,
-        },
+        None => no_route_resolution(None),
     }
 }
 
@@ -6620,6 +6887,7 @@ fn lookup_forwarding_resolution_v6(
     ip: Ipv6Addr,
     table: &str,
     depth: usize,
+    allow_tunnels: bool,
 ) -> ForwardingResolution {
     if depth >= MAX_NEXT_TABLE_DEPTH {
         return ForwardingResolution {
@@ -6627,6 +6895,7 @@ fn lookup_forwarding_resolution_v6(
             local_ifindex: 0,
             egress_ifindex: 0,
             tx_ifindex: 0,
+            tunnel_endpoint_id: 0,
             next_hop: Some(IpAddr::V6(ip)),
             neighbor_mac: None,
             src_mac: None,
@@ -6642,7 +6911,22 @@ fn lookup_forwarding_resolution_v6(
         .iter()
         .find(|entry| entry.prefix.contains(ip));
     match choose_v6_route(static_match, connected_match) {
-        Some(ResolvedRouteV6::Connected { ifindex }) => {
+        Some(ResolvedRouteV6::Connected {
+            ifindex,
+            tunnel_endpoint_id,
+        }) => {
+            if tunnel_endpoint_id != 0 {
+                return if allow_tunnels {
+                    resolve_tunnel_forwarding_resolution(
+                        state,
+                        dynamic_neighbors,
+                        tunnel_endpoint_id,
+                        depth,
+                    )
+                } else {
+                    no_route_resolution(Some(IpAddr::V6(ip)))
+                };
+            }
             let neighbor = lookup_neighbor_entry(state, dynamic_neighbors, ifindex, IpAddr::V6(ip));
             let mut resolution = ForwardingResolution {
                 disposition: if neighbor.is_some() {
@@ -6653,6 +6937,7 @@ fn lookup_forwarding_resolution_v6(
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
                 tx_ifindex: ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(ip)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
                 src_mac: None,
@@ -6663,6 +6948,7 @@ fn lookup_forwarding_resolution_v6(
         }
         Some(ResolvedRouteV6::Static {
             ifindex,
+            tunnel_endpoint_id,
             next_hop,
             discard,
             next_table,
@@ -6673,6 +6959,7 @@ fn lookup_forwarding_resolution_v6(
                     local_ifindex: 0,
                     egress_ifindex: ifindex,
                     tx_ifindex: ifindex,
+                    tunnel_endpoint_id,
                     next_hop: next_hop.map(IpAddr::V6),
                     neighbor_mac: None,
                     src_mac: None,
@@ -6686,6 +6973,7 @@ fn lookup_forwarding_resolution_v6(
                         local_ifindex: 0,
                         egress_ifindex: 0,
                         tx_ifindex: 0,
+                        tunnel_endpoint_id: 0,
                         next_hop: Some(IpAddr::V6(ip)),
                         neighbor_mac: None,
                         src_mac: None,
@@ -6698,19 +6986,23 @@ fn lookup_forwarding_resolution_v6(
                     ip,
                     &next_table_name,
                     depth + 1,
+                    allow_tunnels,
                 );
             }
-            if ifindex <= 0 {
-                return ForwardingResolution {
-                    disposition: ForwardingDisposition::NoRoute,
-                    local_ifindex: 0,
-                    egress_ifindex: 0,
-                    tx_ifindex: 0,
-                    next_hop: next_hop.map(IpAddr::V6),
-                    neighbor_mac: None,
-                    src_mac: None,
-                    tx_vlan_id: 0,
+            if tunnel_endpoint_id != 0 {
+                return if allow_tunnels {
+                    resolve_tunnel_forwarding_resolution(
+                        state,
+                        dynamic_neighbors,
+                        tunnel_endpoint_id,
+                        depth,
+                    )
+                } else {
+                    no_route_resolution(next_hop.map(IpAddr::V6).or(Some(IpAddr::V6(ip))))
                 };
+            }
+            if ifindex <= 0 {
+                return no_route_resolution(next_hop.map(IpAddr::V6));
             }
             let target = next_hop.unwrap_or(ip);
             let neighbor =
@@ -6724,6 +7016,7 @@ fn lookup_forwarding_resolution_v6(
                 local_ifindex: 0,
                 egress_ifindex: ifindex,
                 tx_ifindex: ifindex,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(target)),
                 neighbor_mac: neighbor.map(|entry| entry.mac),
                 src_mac: None,
@@ -6732,16 +7025,66 @@ fn lookup_forwarding_resolution_v6(
             populate_egress_resolution(state, ifindex, &mut resolution);
             resolution
         }
-        None => ForwardingResolution {
-            disposition: ForwardingDisposition::NoRoute,
-            local_ifindex: 0,
-            egress_ifindex: 0,
-            tx_ifindex: 0,
-            next_hop: None,
-            neighbor_mac: None,
-            src_mac: None,
-            tx_vlan_id: 0,
-        },
+        None => no_route_resolution(None),
+    }
+}
+
+fn no_route_resolution(next_hop: Option<IpAddr>) -> ForwardingResolution {
+    ForwardingResolution {
+        disposition: ForwardingDisposition::NoRoute,
+        local_ifindex: 0,
+        egress_ifindex: 0,
+        tx_ifindex: 0,
+        tunnel_endpoint_id: 0,
+        next_hop,
+        neighbor_mac: None,
+        src_mac: None,
+        tx_vlan_id: 0,
+    }
+}
+
+fn resolve_tunnel_forwarding_resolution(
+    state: &ForwardingState,
+    dynamic_neighbors: Option<&Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>>,
+    tunnel_endpoint_id: u16,
+    depth: usize,
+) -> ForwardingResolution {
+    let Some(endpoint) = state.tunnel_endpoints.get(&tunnel_endpoint_id) else {
+        return no_route_resolution(None);
+    };
+    let outer = match endpoint.destination {
+        IpAddr::V4(ip) => lookup_forwarding_resolution_v4(
+            state,
+            dynamic_neighbors,
+            ip,
+            &endpoint.transport_table,
+            depth + 1,
+            false,
+        ),
+        IpAddr::V6(ip) => lookup_forwarding_resolution_v6(
+            state,
+            dynamic_neighbors,
+            ip,
+            &endpoint.transport_table,
+            depth + 1,
+            false,
+        ),
+    };
+    if outer.disposition == ForwardingDisposition::LocalDelivery
+        || state.tunnel_interfaces.contains(&outer.egress_ifindex)
+    {
+        return no_route_resolution(Some(endpoint.destination));
+    }
+    ForwardingResolution {
+        disposition: outer.disposition,
+        local_ifindex: outer.local_ifindex,
+        egress_ifindex: endpoint.logical_ifindex,
+        tx_ifindex: outer.tx_ifindex,
+        tunnel_endpoint_id,
+        next_hop: outer.next_hop,
+        neighbor_mac: outer.neighbor_mac,
+        src_mac: outer.src_mac,
+        tx_vlan_id: outer.tx_vlan_id,
     }
 }
 
@@ -6934,9 +7277,11 @@ fn parse_neighbor_entries(output: &str) -> Vec<(IpAddr, NeighborEntry)> {
 enum ResolvedRouteV4 {
     Connected {
         ifindex: i32,
+        tunnel_endpoint_id: u16,
     },
     Static {
         ifindex: i32,
+        tunnel_endpoint_id: u16,
         next_hop: Option<Ipv4Addr>,
         discard: bool,
         next_table: Option<String>,
@@ -6946,9 +7291,11 @@ enum ResolvedRouteV4 {
 enum ResolvedRouteV6 {
     Connected {
         ifindex: i32,
+        tunnel_endpoint_id: u16,
     },
     Static {
         ifindex: i32,
+        tunnel_endpoint_id: u16,
         next_hop: Option<Ipv6Addr>,
         discard: bool,
         next_table: Option<String>,
@@ -6963,10 +7310,12 @@ fn choose_v4_route(
         (Some(route), Some(conn)) if conn.prefix.prefix_len() >= route.prefix.prefix_len() => {
             Some(ResolvedRouteV4::Connected {
                 ifindex: conn.ifindex,
+                tunnel_endpoint_id: conn.tunnel_endpoint_id,
             })
         }
         (Some(route), _) => Some(ResolvedRouteV4::Static {
             ifindex: route.ifindex,
+            tunnel_endpoint_id: route.tunnel_endpoint_id,
             next_hop: route.next_hop,
             discard: route.discard,
             next_table: if route.next_table.is_empty() {
@@ -6977,6 +7326,7 @@ fn choose_v4_route(
         }),
         (None, Some(conn)) => Some(ResolvedRouteV4::Connected {
             ifindex: conn.ifindex,
+            tunnel_endpoint_id: conn.tunnel_endpoint_id,
         }),
         (None, None) => None,
     }
@@ -6990,10 +7340,12 @@ fn choose_v6_route(
         (Some(route), Some(conn)) if conn.prefix.prefix_len() >= route.prefix.prefix_len() => {
             Some(ResolvedRouteV6::Connected {
                 ifindex: conn.ifindex,
+                tunnel_endpoint_id: conn.tunnel_endpoint_id,
             })
         }
         (Some(route), _) => Some(ResolvedRouteV6::Static {
             ifindex: route.ifindex,
+            tunnel_endpoint_id: route.tunnel_endpoint_id,
             next_hop: route.next_hop,
             discard: route.discard,
             next_table: if route.next_table.is_empty() {
@@ -7004,6 +7356,7 @@ fn choose_v6_route(
         }),
         (None, Some(conn)) => Some(ResolvedRouteV6::Connected {
             ifindex: conn.ifindex,
+            tunnel_endpoint_id: conn.tunnel_endpoint_id,
         }),
         (None, None) => None,
     }
@@ -8084,9 +8437,9 @@ struct BindingLiveSnapshot {
 mod tests {
     use super::*;
     use crate::{
-        FabricSnapshot, InterfaceAddressSnapshot, InterfaceSnapshot, NeighborSnapshot,
-        PolicyRuleSnapshot, RouteSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot,
-        ZoneSnapshot,
+        FabricSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot, InterfaceAddressSnapshot,
+        InterfaceSnapshot, NeighborSnapshot, PolicyRuleSnapshot, RouteSnapshot,
+        SourceNATRuleSnapshot, StaticNATRuleSnapshot, TunnelEndpointSnapshot, ZoneSnapshot,
     };
 
     #[test]
@@ -8138,7 +8491,10 @@ mod tests {
             ),
             None
         );
-        assert_eq!(shared_umem_group_key_for_device(Some("mlx5_core"), None), None);
+        assert_eq!(
+            shared_umem_group_key_for_device(Some("mlx5_core"), None),
+            None
+        );
     }
 
     #[test]
@@ -8262,6 +8618,146 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    fn native_gre_snapshot(include_neighbor: bool) -> ConfigSnapshot {
+        ConfigSnapshot {
+            zones: vec![
+                ZoneSnapshot {
+                    name: "wan".to_string(),
+                    id: 1,
+                },
+                ZoneSnapshot {
+                    name: "sfmix".to_string(),
+                    id: 2,
+                },
+            ],
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "reth0.80".to_string(),
+                    zone: "wan".to_string(),
+                    linux_name: "ge-0-0-2.80".to_string(),
+                    ifindex: 12,
+                    parent_ifindex: 6,
+                    vlan_id: 80,
+                    mtu: 1500,
+                    redundancy_group: 1,
+                    hardware_addr: "02:bf:72:00:50:08".to_string(),
+                    addresses: vec![InterfaceAddressSnapshot {
+                        family: "inet6".to_string(),
+                        address: "2001:559:8585:80::8/64".to_string(),
+                        scope: 0,
+                    }],
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "gr-0/0/0.0".to_string(),
+                    zone: "sfmix".to_string(),
+                    linux_name: "gr-0-0-0".to_string(),
+                    ifindex: 362,
+                    mtu: 1476,
+                    redundancy_group: 1,
+                    tunnel: true,
+                    addresses: vec![InterfaceAddressSnapshot {
+                        family: "inet".to_string(),
+                        address: "10.255.192.42/30".to_string(),
+                        scope: 0,
+                    }],
+                    ..Default::default()
+                },
+            ],
+            tunnel_endpoints: vec![TunnelEndpointSnapshot {
+                id: 1,
+                interface: "gr-0/0/0.0".to_string(),
+                linux_name: "gr-0-0-0".to_string(),
+                ifindex: 362,
+                zone: "sfmix".to_string(),
+                redundancy_group: 1,
+                mtu: 1476,
+                mode: "gre".to_string(),
+                outer_family: "inet6".to_string(),
+                source: "2001:559:8585:80::8".to_string(),
+                destination: "2602:ffd3:0:2::7".to_string(),
+                key: 0,
+                ttl: 64,
+                transport_table: "inet6.0".to_string(),
+            }],
+            routes: vec![
+                RouteSnapshot {
+                    table: "inet6.0".to_string(),
+                    family: "inet6".to_string(),
+                    destination: "2602:ffd3:0:2::/64".to_string(),
+                    next_hops: vec!["2001:559:8585:80::1@reth0.80".to_string()],
+                    discard: false,
+                    next_table: String::new(),
+                },
+                RouteSnapshot {
+                    table: "sfmix.inet.0".to_string(),
+                    family: "inet".to_string(),
+                    destination: "0.0.0.0/0".to_string(),
+                    next_hops: vec!["10.255.192.41".to_string()],
+                    discard: false,
+                    next_table: String::new(),
+                },
+            ],
+            neighbors: if include_neighbor {
+                vec![NeighborSnapshot {
+                    interface: "ge-0-0-2.80".to_string(),
+                    ifindex: 12,
+                    family: "inet6".to_string(),
+                    ip: "2001:559:8585:80::1".to_string(),
+                    mac: "00:11:22:33:44:55".to_string(),
+                    state: "reachable".to_string(),
+                    router: true,
+                    link_local: false,
+                }]
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        }
+    }
+
+    fn native_gre_pbr_snapshot(include_neighbor: bool) -> ConfigSnapshot {
+        let mut snapshot = native_gre_snapshot(include_neighbor);
+        snapshot.zones.insert(
+            0,
+            ZoneSnapshot {
+                name: "lan".to_string(),
+                id: 3,
+            },
+        );
+        snapshot.interfaces.push(InterfaceSnapshot {
+            name: "reth1.0".to_string(),
+            zone: "lan".to_string(),
+            linux_name: "ge-0-0-1".to_string(),
+            ifindex: 5,
+            filter_input_v4: "sfmix-pbr".to_string(),
+            addresses: vec![InterfaceAddressSnapshot {
+                family: "inet".to_string(),
+                address: "10.0.61.1/24".to_string(),
+                scope: 0,
+            }],
+            ..Default::default()
+        });
+        snapshot.filters = vec![FirewallFilterSnapshot {
+            name: "sfmix-pbr".to_string(),
+            family: "inet".to_string(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "sfmix-route".to_string(),
+                    destination_addresses: vec!["10.255.192.40/30".to_string()],
+                    routing_instance: "sfmix".to_string(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "default".to_string(),
+                    action: "accept".to_string(),
+                    ..Default::default()
+                },
+            ],
+        }];
+        snapshot
     }
 
     fn forwarding_snapshot_with_next_table(include_neighbor: bool) -> ConfigSnapshot {
@@ -8889,6 +9385,419 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_route_resolves_to_logical_tunnel_and_physical_tx() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let resolved = lookup_forwarding_resolution_v4(
+            &state,
+            None,
+            Ipv4Addr::new(8, 8, 8, 8),
+            "sfmix.inet.0",
+            0,
+            true,
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(resolved.egress_ifindex, 362);
+        assert_eq!(resolved.tx_ifindex, 6);
+        assert_eq!(resolved.tunnel_endpoint_id, 1);
+        assert_eq!(
+            resolved.next_hop,
+            Some(IpAddr::V6("2001:559:8585:80::1".parse().expect("outer nh")))
+        );
+        assert_eq!(
+            resolved.neighbor_mac,
+            Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+        );
+        assert_eq!(resolved.src_mac, Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]));
+        assert_eq!(resolved.tx_vlan_id, 80);
+    }
+
+    #[test]
+    fn tunnel_route_preserves_logical_egress_on_outer_neighbor_miss() {
+        let state = build_forwarding_state(&native_gre_snapshot(false));
+        let resolved = lookup_forwarding_resolution_v4(
+            &state,
+            None,
+            Ipv4Addr::new(8, 8, 8, 8),
+            "sfmix.inet.0",
+            0,
+            true,
+        );
+        assert_eq!(resolved.disposition, ForwardingDisposition::MissingNeighbor);
+        assert_eq!(resolved.egress_ifindex, 362);
+        assert_eq!(resolved.tx_ifindex, 6);
+        assert_eq!(resolved.tunnel_endpoint_id, 1);
+        assert_eq!(resolved.src_mac, Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]));
+        assert_eq!(resolved.tx_vlan_id, 80);
+    }
+
+    #[test]
+    fn ingress_filter_routing_instance_steers_flow_into_native_gre_table() {
+        let state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+        let flow = SessionFlow {
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_ICMP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(10, 255, 192, 41)),
+                src_port: 0,
+                dst_port: 0,
+            },
+        };
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 5,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..Default::default()
+        };
+        let override_table = ingress_route_table_override(&state, meta, &flow);
+        assert_eq!(override_table.as_deref(), Some("sfmix.inet.0"));
+        let resolved = lookup_forwarding_resolution_in_table_with_dynamic(
+            &state,
+            &Default::default(),
+            flow.dst_ip,
+            override_table.as_deref(),
+        );
+        assert_eq!(resolved.disposition, ForwardingDisposition::ForwardCandidate);
+        assert_eq!(resolved.egress_ifindex, 362);
+        assert_eq!(resolved.tx_ifindex, 6);
+        assert_eq!(resolved.tunnel_endpoint_id, 1);
+    }
+
+    #[test]
+    fn native_gre_logical_egress_retains_zone_without_mac() {
+        let state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+        let egress = state.egress.get(&362).expect("logical tunnel egress");
+        assert_eq!(egress.zone, "sfmix");
+        assert_eq!(egress.primary_v4, Some(Ipv4Addr::new(10, 255, 192, 42)));
+    }
+
+    #[test]
+    fn native_gre_decap_maps_inner_packet_to_logical_tunnel_ingress() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let inner = build_icmp_echo_frame_v4(
+            Ipv4Addr::new(10, 255, 192, 41),
+            Ipv4Addr::new(10, 255, 192, 42),
+            63,
+        );
+        let outer = build_ipv6_gre_frame(
+            &inner[14..],
+            "2602:ffd3:0:2::7".parse().unwrap(),
+            "2001:559:8585:80::8".parse().unwrap(),
+            None,
+        );
+        let packet = try_native_gre_decap_from_frame(&outer, native_gre_outer_meta(), &state)
+            .expect("native gre decap");
+        assert_eq!(packet.meta.ingress_ifindex, 362);
+        assert_eq!(packet.meta.addr_family, libc::AF_INET as u8);
+        assert_eq!(packet.meta.protocol, PROTO_ICMP);
+        assert_eq!(packet.meta.l3_offset, 14);
+        assert_eq!(&packet.frame[12..14], &[0x08, 0x00]);
+        assert_eq!(&packet.frame[26..30], &[10, 255, 192, 41]);
+        assert_eq!(&packet.frame[30..34], &[10, 255, 192, 42]);
+    }
+
+    #[test]
+    fn build_forwarded_frame_from_frame_encapsulates_native_gre() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let inner =
+            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(8, 8, 8, 8), 64);
+        let inner_meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 11,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 42,
+            pkt_len: (inner.len() - 14) as u16,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            flow_src_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&[10, 0, 61, 102]);
+                addr
+            },
+            flow_dst_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&[8, 8, 8, 8]);
+                addr
+            },
+            flow_src_port: 0x1234,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: lookup_forwarding_resolution_v4(
+                &state,
+                None,
+                Ipv4Addr::new(8, 8, 8, 8),
+                "sfmix.inet.0",
+                0,
+                true,
+            ),
+            nat: NatDecision::default(),
+        };
+        let built = build_forwarded_frame_from_frame(
+            &inner,
+            inner_meta,
+            &decision,
+            &state,
+            false,
+            Some((0x1234, 0)),
+        )
+        .expect("encapsulated gre frame");
+        assert_eq!(&built[12..16], &[0x81, 0x00, 0x00, 0x50]);
+        assert_eq!(&built[16..18], &[0x86, 0xdd]);
+        assert_eq!(&built[22..24], &[0x00, 0x20]);
+        assert_eq!(built[24], PROTO_GRE);
+        assert_eq!(built[25], 64);
+        assert_eq!(&built[60..62], &[0x08, 0x00]);
+        assert_eq!(built[70], 63);
+        assert_eq!(&built[74..78], &[10, 0, 61, 102]);
+        assert_eq!(&built[78..82], &[8, 8, 8, 8]);
+    }
+
+    #[test]
+    fn build_forwarded_frame_from_frame_encapsulates_native_gre_after_ipv4_snat() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let inner = build_icmp_echo_frame_v4(
+            Ipv4Addr::new(10, 0, 61, 102),
+            Ipv4Addr::new(10, 255, 192, 41),
+            64,
+        );
+        let inner_meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 42,
+            pkt_len: (inner.len() - 14) as u16,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            flow_src_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&[10, 0, 61, 102]);
+                addr
+            },
+            flow_dst_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&[10, 255, 192, 41]);
+                addr
+            },
+            flow_src_port: 0x1234,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: lookup_forwarding_resolution_v4(
+                &state,
+                None,
+                Ipv4Addr::new(10, 255, 192, 41),
+                "sfmix.inet.0",
+                0,
+                true,
+            ),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(10, 255, 192, 42))),
+                ..NatDecision::default()
+            },
+        };
+        let built = build_forwarded_frame_from_frame(
+            &inner,
+            inner_meta,
+            &decision,
+            &state,
+            false,
+            Some((0x1234, 0)),
+        )
+        .expect("encapsulated native gre frame with snat");
+        assert_eq!(&built[12..16], &[0x81, 0x00, 0x00, 0x50]);
+        assert_eq!(&built[16..18], &[0x86, 0xdd]);
+        assert_eq!(built[24], PROTO_GRE);
+        assert_eq!(&built[74..78], &[10, 255, 192, 42]);
+        assert_eq!(&built[78..82], &[10, 255, 192, 41]);
+    }
+
+    #[test]
+    fn build_forwarded_frame_from_frame_recomputes_tcp_checksum_for_native_gre_snat() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let src_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let dst_ip = Ipv4Addr::new(10, 255, 192, 41);
+        let snat_ip = Ipv4Addr::new(10, 255, 192, 42);
+        let src_port = 50420u16;
+        let dst_port = 5201u16;
+
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x30, 0x12, 0x34, 0x40, 0x00, 64, PROTO_TCP, 0x00, 0x00,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x01, // seq
+            0x00, 0x00, 0x00, 0x01, // ack
+            0x50, 0x18, 0x20, 0x00, // data offset/flags/window
+            0x18, 0x29, 0x00, 0x00, // intentionally bogus partial/offload checksum + urg
+            b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+        ]);
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 54,
+            pkt_len: (frame.len() - 14) as u16,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            flow_src_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&src_ip.octets());
+                addr
+            },
+            flow_dst_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&dst_ip.octets());
+                addr
+            },
+            flow_src_port: src_port,
+            flow_dst_port: dst_port,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: lookup_forwarding_resolution_v4(
+                &state,
+                None,
+                dst_ip,
+                "sfmix.inet.0",
+                0,
+                true,
+            ),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                ..NatDecision::default()
+            },
+        };
+        let built = build_forwarded_frame_from_frame(
+            &frame,
+            meta,
+            &decision,
+            &state,
+            false,
+            Some((src_port, dst_port)),
+        )
+        .expect("encapsulated native gre frame with tcp snat");
+        let inner = &built[62..];
+        assert_eq!(&inner[12..16], &snat_ip.octets());
+        assert_eq!(&inner[16..20], &dst_ip.octets());
+        assert!(tcp_checksum_ok_ipv4(inner));
+    }
+
+    #[test]
+    fn build_forwarded_frame_from_frame_clamps_tcp_mss_for_native_gre() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let src_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let dst_ip = Ipv4Addr::new(10, 255, 192, 41);
+        let src_port = 44028u16;
+        let dst_port = 5201u16;
+
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x2c, 0x12, 0x34, 0x40, 0x00, 64, PROTO_TCP, 0x00, 0x00,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x01, // seq
+            0x00, 0x00, 0x00, 0x00, // ack
+            0x60, TCP_FLAG_SYN, 0xfa, 0xf0, // data offset / flags / window
+            0x00, 0x00, 0x00, 0x00, // checksum + urg
+            0x02, 0x04, 0x05, 0xb4, // MSS 1460
+        ]);
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            payload_offset: 58,
+            pkt_len: (frame.len() - 14) as u16,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            tcp_flags: TCP_FLAG_SYN,
+            flow_src_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&src_ip.octets());
+                addr
+            },
+            flow_dst_addr: {
+                let mut addr = [0u8; 16];
+                addr[..4].copy_from_slice(&dst_ip.octets());
+                addr
+            },
+            flow_src_port: src_port,
+            flow_dst_port: dst_port,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: lookup_forwarding_resolution_v4(
+                &state,
+                None,
+                dst_ip,
+                "sfmix.inet.0",
+                0,
+                true,
+            ),
+            nat: NatDecision::default(),
+        };
+        let built = build_forwarded_frame_from_frame(
+            &frame,
+            meta,
+            &decision,
+            &state,
+            false,
+            Some((src_port, dst_port)),
+        )
+        .expect("encapsulated native gre frame with tcp syn");
+        let inner = &built[62..];
+        assert_eq!(&inner[40..44], &[0x02, 0x04, 0x05, 0x88]);
+        assert!(tcp_checksum_ok_ipv4(inner));
+    }
+
+    #[test]
     fn ha_resolution_blocks_inactive_owner_rg() {
         let state = build_forwarding_state(&nat_snapshot());
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
@@ -9127,6 +10036,7 @@ mod tests {
             "lan",
             true,
             monotonic_nanos() / 1_000_000_000,
+            false,
         );
 
         assert_eq!(
@@ -9158,6 +10068,7 @@ mod tests {
             "lan",
             true,
             monotonic_nanos() / 1_000_000_000,
+            false,
         );
 
         assert_eq!(resolved.disposition, ForwardingDisposition::FabricRedirect);
@@ -9166,6 +10077,79 @@ mod tests {
         assert_eq!(
             resolved.src_mac,
             Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01])
+        );
+    }
+
+    #[test]
+    fn cluster_peer_return_fast_path_allows_sfmix_to_lan_reply() {
+        let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+        state.fabrics.push(FabricLink {
+            parent_ifindex: 4,
+            overlay_ifindex: 104,
+            peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+            peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        });
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        dynamic_neighbors.lock().expect("neighbors").insert(
+            (5, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+            NeighborEntry {
+                mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+            },
+        );
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 4,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+
+        let (decision, metadata) = cluster_peer_return_fast_path(
+            &state,
+            &dynamic_neighbors,
+            meta,
+            Some("sfmix"),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        )
+        .expect("fabric return fast path");
+
+        assert_eq!(
+            decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(decision.resolution.egress_ifindex, 5);
+        assert_eq!(metadata.ingress_zone.as_ref(), "sfmix");
+        assert_eq!(metadata.egress_zone.as_ref(), "lan");
+        assert!(metadata.fabric_ingress);
+        assert!(metadata.is_reverse);
+    }
+
+    #[test]
+    fn cluster_peer_return_fast_path_skips_pure_tcp_syn() {
+        let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+        state.fabrics.push(FabricLink {
+            parent_ifindex: 4,
+            overlay_ifindex: 104,
+            peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+            peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        });
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 4,
+            protocol: PROTO_TCP,
+            tcp_flags: TCP_FLAG_SYN,
+            ..UserspaceDpMeta::default()
+        };
+
+        assert!(
+            cluster_peer_return_fast_path(
+                &state,
+                &dynamic_neighbors,
+                meta,
+                Some("sfmix"),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            )
+            .is_none()
         );
     }
 
@@ -9183,6 +10167,7 @@ mod tests {
             "wan",
             false,
             monotonic_nanos() / 1_000_000_000,
+            false,
         );
 
         assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
@@ -9205,6 +10190,7 @@ mod tests {
             "wan",
             false,
             monotonic_nanos() / 1_000_000_000,
+            false,
         );
 
         assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
@@ -9294,6 +10280,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 24,
                 tx_ifindex: 24,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x01, 0x00, 0x01]),
@@ -9343,6 +10330,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 0,
                 tx_ifindex: 0,
+                tunnel_endpoint_id: 0,
                 next_hop: None,
                 neighbor_mac: None,
                 src_mac: None,
@@ -9392,6 +10380,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 24,
                 tx_ifindex: 24,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
                 neighbor_mac: None,
                 src_mac: None,
@@ -9443,6 +10432,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 24,
                 tx_ifindex: 24,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x01, 0x00, 0x01]),
@@ -9477,6 +10467,7 @@ mod tests {
             local_ifindex: 0,
             egress_ifindex: 12,
             tx_ifindex: 12,
+            tunnel_endpoint_id: 0,
             next_hop: Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
             neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
             src_mac: None,
@@ -10230,6 +11221,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 5,
                 tx_ifindex: 5,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(
                     "2001:559:8585:ef00::100".parse().expect("next hop"),
                 )),
@@ -10271,6 +11263,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 0,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
                 neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
                 src_mac: None,
@@ -10459,6 +11452,7 @@ mod tests {
                     local_ifindex: 0,
                     egress_ifindex: 21,
                     tx_ifindex: 21,
+                    tunnel_endpoint_id: 0,
                     next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
                     neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
                     src_mac: Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]),
@@ -10667,6 +11661,7 @@ mod tests {
                     local_ifindex: 0,
                     egress_ifindex: 12,
                     tx_ifindex: 11,
+                    tunnel_endpoint_id: 0,
                     next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
                     neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                     src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -10728,6 +11723,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -10829,6 +11825,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -10958,6 +11955,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11040,6 +12038,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11061,6 +12060,7 @@ mod tests {
             },
             meta,
             &decision,
+            &ForwardingState::default(),
             Some((54688, 5201)),
         )
         .expect("build forwarded frame");
@@ -11126,6 +12126,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11147,6 +12148,7 @@ mod tests {
             },
             meta,
             &decision,
+            &ForwardingState::default(),
             Some((real_src_port, real_dst_port)),
         )
         .expect("build forwarded frame");
@@ -11217,6 +12219,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11318,6 +12321,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11407,6 +12411,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11548,6 +12553,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11708,6 +12714,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11729,6 +12736,7 @@ mod tests {
             },
             meta,
             &decision,
+            &ForwardingState::default(),
             Some((real_src_port, real_dst_port)),
         )
         .expect("build forwarded frame");
@@ -11784,6 +12792,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11805,6 +12814,7 @@ mod tests {
             },
             meta,
             &decision,
+            &ForwardingState::default(),
             Some((1042, real_dst_port)),
         )
         .expect("build forwarded frame");
@@ -11863,6 +12873,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -11884,6 +12895,7 @@ mod tests {
             },
             meta,
             &decision,
+            &ForwardingState::default(),
             Some((expected_src_port, dst_port)),
         )
         .expect("build forwarded frame");
@@ -11944,6 +12956,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -11965,6 +12978,7 @@ mod tests {
             },
             meta,
             &decision,
+            &ForwardingState::default(),
             Some((real_src_port, real_dst_port)),
         )
         .expect("build forwarded frame");
@@ -12040,6 +13054,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -12157,6 +13172,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -12260,6 +13276,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -12366,6 +13383,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -12694,6 +13712,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(dst_ip)),
                 neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x16, 0x01, 0x00]),
@@ -12756,6 +13775,136 @@ mod tests {
     }
 
     #[test]
+    fn segment_forwarded_tcp_frames_keeps_ipv4_snat_inside_native_gre() {
+        let src_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let dst_ip = Ipv4Addr::new(10, 255, 192, 41);
+        let snat_ip = Ipv4Addr::new(10, 255, 192, 42);
+        let src_port = 47308u16;
+        let dst_port = 5201u16;
+        let tcp_payload_len = 30_408usize;
+        let tcp_header_len = 32usize;
+        let total_len = (20 + tcp_header_len + tcp_payload_len) as u16;
+
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45,
+            0x00,
+            (total_len >> 8) as u8,
+            total_len as u8,
+            0xd1,
+            0x43,
+            0x40,
+            0x00,
+            64,
+            PROTO_TCP,
+            0x00,
+            0x00,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&src_port.to_be_bytes());
+        frame.extend_from_slice(&dst_port.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x52, 0x04, 0xc1, 0xa3, 0x73, 0x7f, 0x63, 0x1c, 0x80, 0x10, 0x00, 0x3f, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x01, 0x08, 0x0a, 0x91, 0x9b, 0x0d, 0x5f, 0xd3, 0x53, 0x0f, 0x7f,
+        ]);
+        frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+
+        let mut area = MmapArea::new(65_536).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            flow_src_port: 1041,
+            flow_dst_port: dst_port,
+            ..UserspaceDpMeta::default()
+        };
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let decision = SessionDecision {
+            resolution: lookup_forwarding_resolution_v4(
+                &state,
+                None,
+                dst_ip,
+                "sfmix.inet.0",
+                0,
+                true,
+            ),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                ..NatDecision::default()
+            },
+        };
+
+        let segments = segment_forwarded_tcp_frames(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &decision,
+            &state,
+            Some((src_port, dst_port)),
+        )
+        .expect("segmented native gre");
+        assert!(segments.len() > 1);
+        let outer_eth_len = 18usize;
+        let outer_ip_len = 40usize;
+        let gre_len = 4usize;
+        let transport_mtu = 1500usize;
+        let inner_start = outer_eth_len + outer_ip_len + gre_len;
+        let mut total_payload = 0usize;
+        let mut expected_seq = 0x5204c1a3u32;
+        for seg in &segments {
+            assert!(seg.len() >= outer_eth_len);
+            assert!(
+                seg.len() - outer_eth_len <= transport_mtu,
+                "native GRE segment exceeds transport MTU: {}",
+                seg.len() - outer_eth_len
+            );
+            assert_eq!(&seg[16..18], &[0x86, 0xdd]);
+            assert_eq!(seg[24], PROTO_GRE);
+            let inner = &seg[inner_start..];
+            assert_eq!(&inner[12..16], &snat_ip.octets());
+            assert_eq!(&inner[16..20], &dst_ip.octets());
+            assert!(tcp_checksum_ok_ipv4(inner));
+            let tcp = &inner[20..];
+            assert_eq!(
+                (
+                    u16::from_be_bytes([tcp[0], tcp[1]]),
+                    u16::from_be_bytes([tcp[2], tcp[3]])
+                ),
+                (src_port, dst_port)
+            );
+            let seq = u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]);
+            assert_eq!(seq, expected_seq);
+            let seg_payload = inner.len() - 20 - tcp_header_len;
+            total_payload += seg_payload;
+            expected_seq = expected_seq.wrapping_add(seg_payload as u32);
+        }
+        assert_eq!(total_payload, tcp_payload_len);
+    }
+
+    #[test]
     fn rewrite_forwarded_frame_in_place_keeps_tcp_checksum_valid_after_vlan_snat() {
         let mut frame = Vec::new();
         write_eth_header(
@@ -12804,6 +13953,7 @@ mod tests {
                     local_ifindex: 0,
                     egress_ifindex: 12,
                     tx_ifindex: 11,
+                    tunnel_endpoint_id: 0,
                     next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
                     neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
                     src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
@@ -12877,6 +14027,7 @@ mod tests {
                     local_ifindex: 0,
                     egress_ifindex: 5,
                     tx_ifindex: 5,
+                    tunnel_endpoint_id: 0,
                     next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
                     neighbor_mac: Some([0x02, 0x66, 0x6a, 0x82, 0xfb, 0x2f]),
                     src_mac: Some([0x02, 0xbf, 0x72, 0x01, 0x01, 0x00]),
@@ -13273,6 +14424,62 @@ mod tests {
         frame
     }
 
+    fn build_ipv6_gre_frame(
+        inner_packet: &[u8],
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        key: Option<u32>,
+    ) -> Vec<u8> {
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+            [0xde, 0xad, 0xbe, 0xef, 0x00, 0x02],
+            0,
+            0x86dd,
+        );
+        let gre_len = if key.is_some() { 8usize } else { 4usize };
+        let payload_len = u16::try_from(gre_len + inner_packet.len()).unwrap();
+        frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+        frame.extend_from_slice(&payload_len.to_be_bytes());
+        frame.push(PROTO_GRE);
+        frame.push(64);
+        frame.extend_from_slice(&src.octets());
+        frame.extend_from_slice(&dst.octets());
+        let flags = if key.is_some() { 0x2000u16 } else { 0u16 };
+        frame.extend_from_slice(&flags.to_be_bytes());
+        frame.extend_from_slice(
+            &(if inner_packet.first().map(|b| b >> 4) == Some(4) {
+                0x0800u16
+            } else {
+                0x86ddu16
+            })
+            .to_be_bytes(),
+        );
+        if let Some(key) = key {
+            frame.extend_from_slice(&key.to_be_bytes());
+        }
+        frame.extend_from_slice(inner_packet);
+        frame
+    }
+
+    fn native_gre_outer_meta() -> UserspaceDpMeta {
+        UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: 6,
+            rx_queue_index: 0,
+            l3_offset: 14,
+            l4_offset: 54,
+            payload_offset: 58,
+            pkt_len: 92,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: PROTO_GRE,
+            ..UserspaceDpMeta::default()
+        }
+    }
+
     #[test]
     fn packet_ttl_would_expire_identifies_v4_and_v6() {
         let frame_v4 =
@@ -13548,6 +14755,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 5,
                 tx_ifindex: 5,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(client_ip)),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -13670,6 +14878,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 5,
                 tx_ifindex: 5,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(client_ip)),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -13785,6 +14994,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 5,
                 tx_ifindex: 5,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(client_ip)),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -13917,6 +15127,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 5,
                 tx_ifindex: 5,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(client_ip)),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -14039,6 +15250,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 24,
                 tx_ifindex: 24,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(internal_client)),
                 neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -14155,6 +15367,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V6(server_ip)),
                 neighbor_mac: Some([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]),
                 src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -14185,6 +15398,7 @@ mod tests {
             local_ifindex: 0,
             egress_ifindex: 24,
             tx_ifindex: 24,
+            tunnel_endpoint_id: 0,
             next_hop: Some(IpAddr::V6(internal_client)),
             neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
             src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]),
@@ -14337,6 +15551,7 @@ mod tests {
                     local_ifindex: 0,
                     egress_ifindex: 12,
                     tx_ifindex: 12,
+                    tunnel_endpoint_id: 0,
                     next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 1))),
                     neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
                     src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
@@ -14470,6 +15685,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 6,
                 tx_ifindex: 6,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
                 neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
                 src_mac: Some([6, 7, 8, 9, 10, 11]),
@@ -14526,6 +15742,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 0,
                 tx_ifindex: 0,
+                tunnel_endpoint_id: 0,
                 next_hop: None,
                 neighbor_mac: None,
                 src_mac: None,
@@ -14585,6 +15802,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 0,
                 tx_ifindex: 0,
+                tunnel_endpoint_id: 0,
                 next_hop: None,
                 neighbor_mac: None,
                 src_mac: None,
@@ -14641,6 +15859,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 0,
                 tx_ifindex: 0,
+                tunnel_endpoint_id: 0,
                 next_hop: None,
                 neighbor_mac: None,
                 src_mac: None,
@@ -14708,6 +15927,7 @@ mod tests {
                 local_ifindex: 0,
                 egress_ifindex: 12,
                 tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
                 next_hop: Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
                 neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
                 src_mac: Some([6, 7, 8, 9, 10, 11]),

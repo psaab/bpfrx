@@ -15,6 +15,57 @@ That means:
 The current `gr-0-0-0` netdevice path may still exist temporarily for host-only
 traffic or migration safety, but it must not be the transit dataplane path.
 
+## Status
+
+Implemented on the native GRE branch:
+
+- logical tunnel endpoint snapshots and route resolution
+- native GRE decapsulation on physical NIC ingress
+- native GRE encapsulation on physical NIC egress
+- tunnel-aware session sync so synced userspace sessions preserve tunnel context
+- ingress PBR steering into tunnel routing-instances
+- tunnel-zone visibility preserved for policy evaluation
+- userspace XDP now keeps outer GRE on the physical NIC path when native GRE is enabled
+- tunnel netdevices are no longer userspace ingress interfaces for transit
+- live isolated-cluster GRE transit validation now passes:
+  - `cluster-userspace-host -> 10.255.192.41` ping succeeds
+  - outer GRE packets move on `ge-*-0-2.80`
+  - `gr-0-0-0` transit RX/TX deltas stay at zero
+
+Validated on the native GRE branch:
+
+- clean post-deploy isolated-cluster validation after primaries re-elect
+- transit TCP connect from `cluster-userspace-host` to `10.255.192.41:22` works
+- transit `iperf3 -c 10.255.192.41` stays up without zero-throughput intervals
+- active GRE failover from `node1 -> node0` now recovers and passes the native
+  GRE validator tail gate
+- active GRE failover from `node0 -> node1` now recovers and passes the native
+  GRE validator tail gate
+- manual `request chassis cluster failover redundancy-group 1 node ...` keeps
+  the single-stream `iperf3` flow alive in both directions with no
+  zero-throughput intervals
+- clean bidirectional failover validation on the isolated userspace cluster:
+  - `PREFERRED_ACTIVE_NODE=0 ... --deploy --failover --count 3`: pass
+  - `PREFERRED_ACTIVE_NODE=1 ... --failover --count 3`: pass
+
+Still required for full migration parity:
+
+- explicit UDP validation, not only ICMP/TCP/iperf transit
+- a separate local-origin tunnel handoff if firewall-originated GRE traffic must
+  keep working without a kernel GRE device
+- final cleanup of remaining hybrid tunnel assumptions outside transit forwarding
+
+Current blocker:
+
+- transport validation beyond ICMP/TCP/iperf is still thin
+- the branch proves native GRE transit, reverse-NAT, and failover/failback for
+  active ICMP sessions, SSH-class TCP connects, and single-stream `iperf3`, but
+  it does not yet have UDP evidence comparable to the main HA validation workflow
+- local firewall-originated traffic to tunnel destinations is no longer part of
+  the default transit gate once `gr-0-0-0` is replaced by a dummy anchor
+- a broader simultaneous multi-RG move is still stricter than the exact RG1
+  manual failover case and remains a separate follow-up if we want that covered
+
 ## Why This Is Necessary
 
 The current tunnel path is hybrid:
@@ -373,6 +424,18 @@ Exit criteria:
 - mixed IPv4/IPv6 tunnel traffic
 - ICMP, TCP, UDP, traceroute, iperf, failover tests
 
+Current state:
+
+- PBR-based tunnel selection: done
+- isolated-cluster ICMP transit + dataplane-idle `gr-0-0-0`: done
+- isolated-cluster TCP connect transit/failover validation: done
+- isolated-cluster `iperf3` transit/failover validation: done for single-stream
+  TCP over GRE with manual RG1 failover
+- failover/failback validation for transit traffic: done on the isolated
+  userspace cluster
+- remaining work: UDP and traceroute-style tunnel validation, plus optional
+  local-origin tunnel handoff if host-generated GRE traffic must remain supported
+
 ## Validation Plan
 
 Minimum validation matrix:
@@ -393,6 +456,12 @@ Specific acceptance checks:
 - no `vrf-sfmix` local `ICMP host unreachable` for valid tunnel replies
 - HA failover keeps tunnel sessions alive
 
+Scripted gate:
+
+- [`scripts/userspace-native-gre-validation.sh`](../scripts/userspace-native-gre-validation.sh)
+  validates GRE transit reachability and asserts that the physical WAN device
+  moves GRE packets while `gr-0-0-0` stays dataplane-idle
+
 ## Recommendation
 
 If the goal is truly “userspace dataplane owns GRE”, then the project should:
@@ -403,4 +472,3 @@ If the goal is truly “userspace dataplane owns GRE”, then the project should
 4. treat dummy interfaces as optional address anchors, not dataplane objects
 
 That is the clean architecture.
-

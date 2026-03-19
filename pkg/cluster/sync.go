@@ -204,6 +204,11 @@ type sessionSyncSweepProfiler interface {
 	SessionSyncSweepProfile() (enabled bool, activeInterval, idleInterval time.Duration)
 }
 
+type clusterSyncedSessionInstaller interface {
+	SetClusterSyncedSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error
+	SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) error
+}
+
 // deleteJournalDefaultCap is the default max entries in the delete journal.
 const deleteJournalDefaultCap = 10000
 
@@ -1078,13 +1083,22 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 				val.Created = rebaseTimestamp(val.Created, offset)
 				val.LastSeen = rebaseTimestamp(val.LastSeen, offset)
 
-				// Invalidate FIB cache — peer's cached ifindex/MAC/gen
-				// are meaningless on this node.  Forces a fresh
-				// bpf_fib_lookup so hairpin and RG-active checks work.
-				val.FibIfindex = 0
-
-				if err := s.dp.SetSessionV4(key, val); err == nil {
-					s.stats.SessionsInstalled.Add(1)
+				if installer, ok := s.dp.(clusterSyncedSessionInstaller); ok {
+					if err := installer.SetClusterSyncedSessionV4(key, val); err == nil {
+						s.stats.SessionsInstalled.Add(1)
+					}
+				} else {
+					// Invalidate FIB cache — peer's cached ifindex/MAC/gen
+					// are meaningless on this node. Forces a fresh
+					// bpf_fib_lookup so hairpin and RG-active checks work.
+					val.FibIfindex = 0
+					val.FibVlanID = 0
+					val.FibDmac = [6]byte{}
+					val.FibSmac = [6]byte{}
+					val.FibGen = 0
+					if err := s.dp.SetSessionV4(key, val); err == nil {
+						s.stats.SessionsInstalled.Add(1)
+					}
 				}
 				// Create reverse session entry from forward entries so return
 				// traffic matches conntrack on the takeover node.
@@ -1096,8 +1110,19 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 					// and exits on ingress zone.
 					revVal.IngressZone = val.EgressZone
 					revVal.EgressZone = val.IngressZone
-					if err := s.dp.SetSessionV4(val.ReverseKey, revVal); err != nil {
-						slog.Warn("cluster sync: failed to create reverse session", "err", err)
+					if installer, ok := s.dp.(clusterSyncedSessionInstaller); ok {
+						if err := installer.SetClusterSyncedSessionV4(val.ReverseKey, revVal); err != nil {
+							slog.Warn("cluster sync: failed to create reverse session", "err", err)
+						}
+					} else {
+						revVal.FibIfindex = 0
+						revVal.FibVlanID = 0
+						revVal.FibDmac = [6]byte{}
+						revVal.FibSmac = [6]byte{}
+						revVal.FibGen = 0
+						if err := s.dp.SetSessionV4(val.ReverseKey, revVal); err != nil {
+							slog.Warn("cluster sync: failed to create reverse session", "err", err)
+						}
 					}
 				}
 				// Create dnat_table entry for SNAT reverse pre-routing.
@@ -1143,11 +1168,20 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 				val.Created = rebaseTimestamp(val.Created, offset)
 				val.LastSeen = rebaseTimestamp(val.LastSeen, offset)
 
-				// Invalidate FIB cache (same as V4 above).
-				val.FibIfindex = 0
-
-				if err := s.dp.SetSessionV6(key, val); err == nil {
-					s.stats.SessionsInstalled.Add(1)
+				if installer, ok := s.dp.(clusterSyncedSessionInstaller); ok {
+					if err := installer.SetClusterSyncedSessionV6(key, val); err == nil {
+						s.stats.SessionsInstalled.Add(1)
+					}
+				} else {
+					// Invalidate FIB cache (same as V4 above).
+					val.FibIfindex = 0
+					val.FibVlanID = 0
+					val.FibDmac = [6]byte{}
+					val.FibSmac = [6]byte{}
+					val.FibGen = 0
+					if err := s.dp.SetSessionV6(key, val); err == nil {
+						s.stats.SessionsInstalled.Add(1)
+					}
 				}
 				if val.IsReverse == 0 && val.ReverseKey.Protocol != 0 {
 					revVal := val
@@ -1155,8 +1189,19 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 					revVal.ReverseKey = key
 					revVal.IngressZone = val.EgressZone
 					revVal.EgressZone = val.IngressZone
-					if err := s.dp.SetSessionV6(val.ReverseKey, revVal); err != nil {
-						slog.Warn("cluster sync: failed to create reverse v6 session", "err", err)
+					if installer, ok := s.dp.(clusterSyncedSessionInstaller); ok {
+						if err := installer.SetClusterSyncedSessionV6(val.ReverseKey, revVal); err != nil {
+							slog.Warn("cluster sync: failed to create reverse v6 session", "err", err)
+						}
+					} else {
+						revVal.FibIfindex = 0
+						revVal.FibVlanID = 0
+						revVal.FibDmac = [6]byte{}
+						revVal.FibSmac = [6]byte{}
+						revVal.FibGen = 0
+						if err := s.dp.SetSessionV6(val.ReverseKey, revVal); err != nil {
+							slog.Warn("cluster sync: failed to create reverse v6 session", "err", err)
+						}
 					}
 				}
 				if val.IsReverse == 0 &&
@@ -1605,7 +1650,7 @@ func encodeSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) []byt
 
 func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue) []byte {
 	keySize := 16  // SessionKey: 4+4+2+2+1+3
-	valSize := 128 // approximate SessionValue size
+	valSize := 160 // includes userspace FIB cache metadata
 	buf := make([]byte, keySize+valSize)
 	off := 0
 
@@ -1683,6 +1728,17 @@ func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue
 	off++
 	buf[off] = val.LogFlags
 	off += 3 // include pad1
+
+	binary.LittleEndian.PutUint32(buf[off:], val.FibIfindex)
+	off += 4
+	binary.LittleEndian.PutUint16(buf[off:], val.FibVlanID)
+	off += 2
+	copy(buf[off:], val.FibDmac[:])
+	off += 6
+	copy(buf[off:], val.FibSmac[:])
+	off += 6
+	binary.LittleEndian.PutUint16(buf[off:], val.FibGen)
+	off += 2
 
 	return buf[:off]
 }
@@ -1773,6 +1829,17 @@ func encodeSessionV6Payload(key dataplane.SessionKeyV6, val dataplane.SessionVal
 	off++
 	buf[off] = val.LogFlags
 	off += 3
+
+	binary.LittleEndian.PutUint32(buf[off:], val.FibIfindex)
+	off += 4
+	binary.LittleEndian.PutUint16(buf[off:], val.FibVlanID)
+	off += 2
+	copy(buf[off:], val.FibDmac[:])
+	off += 6
+	copy(buf[off:], val.FibSmac[:])
+	off += 6
+	binary.LittleEndian.PutUint16(buf[off:], val.FibGen)
+	off += 2
 
 	return buf[:off]
 }
@@ -1909,6 +1976,18 @@ func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.Ses
 		val.ALGType = payload[off]
 		off++
 		val.LogFlags = payload[off]
+		off += 3 // include pad1
+	}
+	if off+20 <= len(payload) {
+		val.FibIfindex = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
+		val.FibVlanID = binary.LittleEndian.Uint16(payload[off:])
+		off += 2
+		copy(val.FibDmac[:], payload[off:off+6])
+		off += 6
+		copy(val.FibSmac[:], payload[off:off+6])
+		off += 6
+		val.FibGen = binary.LittleEndian.Uint16(payload[off:])
 	}
 
 	return key, val, true
@@ -2011,6 +2090,18 @@ func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.S
 		val.ALGType = payload[off]
 		off++
 		val.LogFlags = payload[off]
+		off += 3 // include pad1
+	}
+	if off+20 <= len(payload) {
+		val.FibIfindex = binary.LittleEndian.Uint32(payload[off:])
+		off += 4
+		val.FibVlanID = binary.LittleEndian.Uint16(payload[off:])
+		off += 2
+		copy(val.FibDmac[:], payload[off:off+6])
+		off += 6
+		copy(val.FibSmac[:], payload[off:off+6])
+		off += 6
+		val.FibGen = binary.LittleEndian.Uint16(payload[off:])
 	}
 
 	return key, val, true

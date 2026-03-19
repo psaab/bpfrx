@@ -210,6 +210,52 @@ func (m *Manager) ApplyTunnels(tunnels []*config.TunnelConfig) error {
 	}
 
 	for _, tc := range tunnels {
+		if existing, err := m.nlHandle.LinkByName(tc.Name); err == nil {
+			if err := m.nlHandle.LinkDel(existing); err != nil {
+				slog.Warn("failed to replace existing tunnel link",
+					"name", tc.Name, "existing_type", existing.Type(), "err", err)
+				continue
+			}
+			slog.Info("removed existing tunnel link before apply",
+				"name", tc.Name, "existing_type", existing.Type())
+		}
+
+		if tc.AnchorOnly {
+			anchor := &netlink.Dummy{
+				LinkAttrs: netlink.LinkAttrs{Name: tc.Name},
+			}
+			if err := m.nlHandle.LinkAdd(anchor); err != nil {
+				slog.Warn("failed to create tunnel anchor",
+					"name", tc.Name, "err", err)
+				continue
+			}
+			if err := m.nlHandle.LinkSetUp(anchor); err != nil {
+				slog.Warn("failed to bring up tunnel anchor",
+					"name", tc.Name, "err", err)
+			}
+			for _, addrStr := range tc.Addresses {
+				addr, err := netlink.ParseAddr(addrStr)
+				if err != nil {
+					slog.Warn("invalid tunnel anchor address",
+						"name", tc.Name, "addr", addrStr, "err", err)
+					continue
+				}
+				if err := m.nlHandle.AddrAdd(anchor, addr); err != nil {
+					slog.Warn("failed to add tunnel anchor address",
+						"name", tc.Name, "addr", addrStr, "err", err)
+				}
+			}
+			if tc.RoutingInstance != "" {
+				if err := m.BindInterfaceToVRF(tc.Name, tc.RoutingInstance); err != nil {
+					slog.Warn("failed to bind tunnel anchor to VRF",
+						"name", tc.Name, "vrf", tc.RoutingInstance, "err", err)
+				}
+			}
+			slog.Info("tunnel anchor created", "name", tc.Name, "mode", "dummy")
+			m.tunnels = append(m.tunnels, tc.Name)
+			continue
+		}
+
 		localIP := net.ParseIP(tc.Source)
 		remoteIP := net.ParseIP(tc.Destination)
 		if localIP == nil || remoteIP == nil {
