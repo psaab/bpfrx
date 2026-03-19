@@ -31,6 +31,8 @@ GRE_VALIDATE_HOST_PROBES="${GRE_VALIDATE_HOST_PROBES:-0}"
 GRE_OUTER_REMOTE="${GRE_OUTER_REMOTE:-2602:ffd3:0:2::7}"
 GRE_LOGICAL_DEV="${GRE_LOGICAL_DEV:-gr-0-0-0}"
 PING_COUNT="${PING_COUNT:-5}"
+GRE_PING_RETRIES="${GRE_PING_RETRIES:-3}"
+GRE_PING_RETRY_SLEEP="${GRE_PING_RETRY_SLEEP:-0.2}"
 FAILOVER_PING_COUNT="${FAILOVER_PING_COUNT:-40}"
 FAILOVER_PREP_SECS="${FAILOVER_PREP_SECS:-3}"
 PREFERRED_ACTIVE_NODE="${PREFERRED_ACTIVE_NODE:-1}"
@@ -85,6 +87,28 @@ run_host_tcp_probe_with_retry() {
 	local attempt=1
 	while (( attempt <= tries )); do
 		if run_host "$(tcp_probe_cmd "${target}" "${port}") >/dev/null 2>&1"; then
+			return 0
+		fi
+		if (( attempt < tries )); then
+			sleep "${sleep_secs}"
+		fi
+		attempt=$((attempt + 1))
+	done
+	return 1
+}
+
+run_host_ping_with_retry() {
+	local target="$1"
+	local ping_id="$2"
+	local tries="${3:-$GRE_PING_RETRIES}"
+	local sleep_secs="${4:-$GRE_PING_RETRY_SLEEP}"
+	local attempt=1
+	while (( attempt <= tries )); do
+		run_host "ping -c ${PING_COUNT} -W 1 -e ${ping_id} ${target} >/tmp/userspace-native-gre-ping.out 2>&1 || true"
+		local output
+		output="$(run_host 'cat /tmp/userspace-native-gre-ping.out')"
+		printf '%s\n' "$output"
+		if grep -q 'bytes from' <<<"$output"; then
 			return 0
 		fi
 		if (( attempt < tries )); then
@@ -420,10 +444,7 @@ logical_capture_file="/tmp/userspace-native-gre-logical-capture.out"
 start_logical_transit_capture "$ACTIVE_FW" "$logical_capture_file" "icmp and host ${GRE_TARGET} and icmp[4:2] == ${TRANSIT_PING_ID}"
 
 info "running GRE transit probe to ${GRE_TARGET} from ${HOST}"
-run_host "ping -c ${PING_COUNT} -W 1 -e ${TRANSIT_PING_ID} ${GRE_TARGET} >/tmp/userspace-native-gre-ping.out 2>&1 || true"
-ping_output="$(run_host 'cat /tmp/userspace-native-gre-ping.out')"
-printf '%s\n' "$ping_output"
-grep -q 'bytes from' <<<"$ping_output" || die "GRE ping failed"
+run_host_ping_with_retry "${GRE_TARGET}" "${TRANSIT_PING_ID}" || die "GRE ping failed"
 sleep 4
 
 after_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
