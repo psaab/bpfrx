@@ -12,8 +12,8 @@ That means:
 - encapsulate GRE on the physical WAN AF_XDP egress path
 - stop depending on `gr-0-0-0` for transit forwarding
 
-The current `gr-0-0-0` netdevice path may still exist temporarily for host-only
-traffic or migration safety, but it must not be the transit dataplane path.
+The current `gr-0-0-0` netdevice may still exist for host-originated/control-plane
+handoff, but it must not be the transit dataplane path.
 
 ## Status
 
@@ -48,25 +48,31 @@ Validated on the native GRE branch:
   - `PREFERRED_ACTIVE_NODE=0 ... --deploy --failover --count 3`: pass
   - `PREFERRED_ACTIVE_NODE=1 ... --failover --count 3`: pass
 
+Now validated beyond basic transit:
+
+- local-origin tunnel handoff works through a persistent TUN anchor on the active
+  firewall without reintroducing kernel GRE transit
+- firewall-originated ICMP and TCP connect to `10.255.192.41` work on the active
+  node
+- firewall-originated single-stream `iperf3` over GRE stays up on the active node
+- post-failover firewall-originated ICMP and TCP connect still work on the new
+  active node
+- full `--failover --udp --traceroute --iperf` validation is now green on the
+  isolated userspace cluster for `node0 -> node1`
+
 Still required for full migration parity:
 
-- a separate local-origin tunnel handoff if firewall-originated GRE traffic must
-  keep working without a kernel GRE device
 - final cleanup of remaining hybrid tunnel assumptions outside transit forwarding
-- clean post-failover validation of the new UDP and traceroute checks
-  (TCP iperf failover passes per above, but the new GRE-specific probes
-  have not yet been run through the full failover cycle)
+- broader repeated failover/failback stress with the expanded native GRE gates
+- explicit post-failover firewall-originated `iperf3` stress beyond the current
+  single validation run
 
 Current blocker:
 
-- local firewall-originated traffic to tunnel destinations is no longer part of
-  the default transit gate once `gr-0-0-0` is replaced by a dummy anchor
-- the new UDP burst and traceroute checks have not been validated through
-  the full RG1 failover cycle yet (the TCP iperf failover works, but the
-  broader native GRE validation script hit an unrelated TCP tail-connect
-  regression that prevented a clean end-to-end run of ALL probes together)
 - a broader simultaneous multi-RG move is still stricter than the exact RG1
   manual failover case and remains a separate follow-up if we want that covered
+- firewall-originated GRE currently depends on the persistent TUN anchor and is
+  not yet a fully TUN-free host-origin path
 
 ## Why This Is Necessary
 
@@ -267,7 +273,7 @@ Dummy interfaces are acceptable only as control-plane anchors.
 
 They are not the right dataplane object for tunnel transit.
 
-### Good Uses For Dummy Interfaces
+### Good Uses For Anchor Interfaces
 
 1. address ownership anchors
 - hold tunnel local addresses if Linux services need them
@@ -293,20 +299,22 @@ They are not the right dataplane object for tunnel transit.
 
 ### Recommended Compromise
 
-Use a dummy interface only if Linux needs an address anchor.
+Use a persistent TUN anchor if Linux host-originated traffic must keep working.
 
 Example:
 
-- `du-sfmix0` in `vrf-sfmix`
+- `gr-0-0-0` as a persistent `tun` device in `vrf-sfmix`
 - owns `10.255.192.42/30`
+- carries only host-originated/control-plane handoff traffic
 - never carries transit packets
 
-Transit uses native userspace GRE on the physical WAN NICs.
+Transit still uses native userspace GRE on the physical WAN NICs.
 
 That gives:
 
 - stable local addresses for host tools
-- no kernel tunnel device in the transit dataplane
+- a clean host-originated handoff path
+- no kernel GRE device in the transit dataplane
 
 ## Required Code Changes
 
@@ -439,10 +447,8 @@ Current state:
   active native GRE path, with the logical tunnel anchor kept dataplane-idle
 - isolated-cluster traceroute/mtr transit validation: done in steady state on
   the active native GRE path, with the logical tunnel anchor kept dataplane-idle
-- remaining work: local-origin tunnel handoff if host-generated GRE traffic
-  must remain supported, plus a clean post-failover run of the new UDP and
-  traceroute gates once the existing `node0 -> node1` TCP failover regression is
-  fixed
+- remaining work: broader failover/failback stress and any future decision to
+  remove the TUN-based host-originated handoff entirely
 
 ## Validation Plan
 
@@ -454,7 +460,7 @@ Minimum validation matrix:
 4. PBR selecting tunnel routing-instance
 5. failover/failback with active tunnel sessions
 6. traceroute / ICMP TE through tunnel path
-7. host-originated traffic if dummy anchors are kept
+7. host-originated traffic if TUN anchors are kept
 
 Specific acceptance checks:
 
@@ -477,6 +483,6 @@ If the goal is truly “userspace dataplane owns GRE”, then the project should
 1. stop investing in tunnel-netdevice transit fixes
 2. keep only enough hybrid behavior to avoid regressions during migration
 3. implement native GRE as a physical-NIC userspace feature
-4. treat dummy interfaces as optional address anchors, not dataplane objects
+4. treat TUN or dummy anchors as host/control-plane objects, not transit dataplane objects
 
 That is the clean architecture.

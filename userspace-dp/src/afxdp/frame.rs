@@ -79,6 +79,7 @@ pub(super) fn enqueue_pending_forwards(
     ingress_ident: &BindingIdentity,
     ingress_live: &BindingLiveState,
     slow_path: Option<&Arc<SlowPathReinjector>>,
+    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     dbg: &mut DebugPollCounters,
 ) {
@@ -159,6 +160,7 @@ pub(super) fn enqueue_pending_forwards(
                         ingress_ident,
                         ingress_live,
                         slow_path,
+                        local_tunnel_deliveries,
                         source_frame,
                         request.meta,
                         request.decision,
@@ -170,6 +172,7 @@ pub(super) fn enqueue_pending_forwards(
                         ingress_ident,
                         ingress_live,
                         slow_path,
+                        local_tunnel_deliveries,
                         unsafe { &*ingress_area },
                         request.desc,
                         request.meta,
@@ -634,6 +637,7 @@ pub(super) fn enqueue_pending_forwards(
                 ingress_ident,
                 ingress_live,
                 slow_path,
+                local_tunnel_deliveries,
                 recent_exceptions,
                 dbg,
                 request.target_ifindex,
@@ -689,6 +693,7 @@ pub(super) fn handle_forward_build_failure(
     binding: &BindingIdentity,
     live: &BindingLiveState,
     slow_path: Option<&Arc<SlowPathReinjector>>,
+    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     dbg: &mut DebugPollCounters,
     _target_ifindex: i32,
@@ -721,6 +726,7 @@ pub(super) fn handle_forward_build_failure(
             binding,
             live,
             slow_path,
+            local_tunnel_deliveries,
             frame,
             meta,
             decision,
@@ -772,6 +778,7 @@ pub(super) fn maybe_reinject_slow_path(
     binding: &BindingIdentity,
     live: &BindingLiveState,
     slow_path: Option<&Arc<SlowPathReinjector>>,
+    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     area: &MmapArea,
     desc: XdpDesc,
     meta: UserspaceDpMeta,
@@ -803,6 +810,7 @@ pub(super) fn maybe_reinject_slow_path(
         binding,
         live,
         slow_path,
+        local_tunnel_deliveries,
         frame,
         meta,
         decision,
@@ -815,6 +823,7 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
     binding: &BindingIdentity,
     live: &BindingLiveState,
     slow_path: Option<&Arc<SlowPathReinjector>>,
+    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     frame: &[u8],
     meta: UserspaceDpMeta,
     decision: SessionDecision,
@@ -834,7 +843,50 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
         return;
     };
     let packet_len = packet.len() as u64;
-    let Some(slow_path) = slow_path else {
+    let tunnel_delivery = if decision.resolution.disposition == ForwardingDisposition::LocalDelivery
+        && decision.resolution.local_ifindex > 0
+    {
+        local_tunnel_deliveries
+            .load()
+            .get(&decision.resolution.local_ifindex)
+            .cloned()
+    } else {
+        None
+    };
+    if let Some(delivery) = tunnel_delivery {
+        match delivery.try_send(packet) {
+            Ok(()) => {
+                live.slow_path_packets.fetch_add(1, Ordering::Relaxed);
+                live.slow_path_bytes
+                    .fetch_add(packet_len, Ordering::Relaxed);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
+                record_exception(
+                    recent_exceptions,
+                    binding,
+                    "local_tunnel_delivery_queue_full",
+                    frame.len() as u32,
+                    Some(meta),
+                    None,
+                );
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
+                record_exception(
+                    recent_exceptions,
+                    binding,
+                    "local_tunnel_delivery_unavailable",
+                    frame.len() as u32,
+                    Some(meta),
+                    None,
+                );
+            }
+        }
+        return;
+    }
+    let selected_path = slow_path.cloned();
+    let Some(slow_path) = selected_path else {
         live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
         record_exception(
             recent_exceptions,

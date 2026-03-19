@@ -346,7 +346,7 @@ fn write_packet_io_uring(ring: &mut IoUring, fd: i32, bytes: &[u8]) -> Result<()
     Ok(())
 }
 
-fn open_tun(name: &str) -> Result<(std::fs::File, String), String> {
+pub(crate) fn open_tun(name: &str) -> Result<(std::fs::File, String), String> {
     let tun = OpenOptions::new()
         .read(true)
         .write(true)

@@ -757,11 +757,22 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 		return nil
 	}
 	ifaceByName := make(map[string]InterfaceSnapshot, len(interfaces))
+	rgByAddress := make(map[string]int)
 	for _, iface := range interfaces {
 		if iface.Name == "" || iface.Ifindex <= 0 {
 			continue
 		}
 		ifaceByName[iface.Name] = iface
+		if iface.RedundancyGroup <= 0 {
+			continue
+		}
+		for _, addr := range iface.Addresses {
+			ip, _, err := net.ParseCIDR(addr.Address)
+			if err != nil || ip == nil {
+				continue
+			}
+			rgByAddress[ip.String()] = iface.RedundancyGroup
+		}
 	}
 	if len(ifaceByName) == 0 {
 		return nil
@@ -797,13 +808,19 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 				transportTable = tunnel.RoutingInstance + ".inet.0"
 			}
 		}
+		redundancyGroup := iface.RedundancyGroup
+		if redundancyGroup <= 0 {
+			if src := net.ParseIP(tunnel.Source); src != nil {
+				redundancyGroup = rgByAddress[src.String()]
+			}
+		}
 		out = append(out, TunnelEndpointSnapshot{
 			ID:              nextID,
 			Interface:       ifName,
 			LinuxName:       iface.LinuxName,
 			Ifindex:         iface.Ifindex,
 			Zone:            iface.Zone,
-			RedundancyGroup: iface.RedundancyGroup,
+			RedundancyGroup: redundancyGroup,
 			MTU:             iface.MTU,
 			Mode:            tunnel.Mode,
 			OuterFamily:     outerFamily,
@@ -2493,14 +2510,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		return errors.New("userspace_bindings map not loaded")
 	}
 
-	// Bindings map is now an Array — zero previously-set indices.
-	{
-		var zeroBinding userspaceBindingValue
-		for _, idx := range m.lastBindingIndices {
-			_ = bindingsMap.Update(idx, zeroBinding, ebpf.UpdateAny)
-		}
-		m.lastBindingIndices = nil
-	}
+	var newBindingIndices []uint32
+	newBindingIndexSet := make(map[uint32]struct{})
 
 	// Preserve cpumap flag if cpumap is populated.
 	var ctrlFlags uint32
@@ -2545,7 +2556,10 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		if err := bindingsMap.Update(idx, val, ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update userspace_bindings idx=%d (if=%d q=%d): %w", idx, binding.Ifindex, binding.QueueID, err)
 		}
-		m.lastBindingIndices = append(m.lastBindingIndices, idx)
+		if _, seen := newBindingIndexSet[idx]; !seen {
+			newBindingIndexSet[idx] = struct{}{}
+			newBindingIndices = append(newBindingIndices, idx)
+		}
 	}
 	for childIfindex, parentIfindex := range buildUserspaceIngressBindingAliases(m.lastSnapshot) {
 		for _, binding := range status.Bindings {
@@ -2571,8 +2585,21 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 					err,
 				)
 			}
-			m.lastBindingIndices = append(m.lastBindingIndices, idx)
+			if _, seen := newBindingIndexSet[idx]; !seen {
+				newBindingIndexSet[idx] = struct{}{}
+				newBindingIndices = append(newBindingIndices, idx)
+			}
 		}
+	}
+	{
+		var zeroBinding userspaceBindingValue
+		for _, idx := range m.lastBindingIndices {
+			if _, keep := newBindingIndexSet[idx]; keep {
+				continue
+			}
+			_ = bindingsMap.Update(idx, zeroBinding, ebpf.UpdateAny)
+		}
+		m.lastBindingIndices = newBindingIndices
 	}
 	if err := m.syncIngressIfaceMapLocked(m.lastSnapshot); err != nil {
 		return err
@@ -2593,17 +2620,21 @@ func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
 		return errors.New("userspace_ingress_ifaces map not loaded")
 	}
 
-	// Map is now an Array[1024] — zero previous entries, set new ones to 1.
-	for _, k := range m.lastIngressIfaces {
-		_ = ifaceMap.Update(k, uint8(0), ebpf.UpdateAny)
-	}
-	m.lastIngressIfaces = nil
-	for _, ifindex := range buildUserspaceIngressIfindexes(snapshot) {
+	newIngress := buildUserspaceIngressIfindexes(snapshot)
+	newIngressSet := make(map[uint32]struct{}, len(newIngress))
+	for _, ifindex := range newIngress {
+		newIngressSet[ifindex] = struct{}{}
 		if err := ifaceMap.Update(ifindex, uint8(1), ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update userspace_ingress_ifaces %d: %w", ifindex, err)
 		}
-		m.lastIngressIfaces = append(m.lastIngressIfaces, ifindex)
 	}
+	for _, k := range m.lastIngressIfaces {
+		if _, keep := newIngressSet[k]; keep {
+			continue
+		}
+		_ = ifaceMap.Update(k, uint8(0), ebpf.UpdateAny)
+	}
+	m.lastIngressIfaces = newIngress
 	return nil
 }
 
@@ -2975,12 +3006,26 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 		req.EgressZone = m.zoneNameByID(val.EgressZone)
 		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID)
 		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
-		if req.TunnelEndpointID != 0 {
-			req.TXIfindex = 0
+		if val.LogFlags&dataplane.LogFlagUserspaceTunnelEndpoint != 0 && val.FibGen != 0 {
+			req.TunnelEndpointID = val.FibGen
 		}
-		req.TXVLANID = val.FibVlanID
-		req.NeighborMAC = macString(val.FibDmac[:])
-		req.SrcMAC = macString(val.FibSmac[:])
+		if req.TunnelEndpointID != 0 {
+			if endpoint, ok := m.sessionSyncTunnelEndpointLocked(req.TunnelEndpointID); ok {
+				req.EgressIfindex = endpoint.Ifindex
+				req.OwnerRGID = endpoint.RedundancyGroup
+			} else {
+				req.EgressIfindex = 0
+				req.OwnerRGID = 0
+			}
+			req.TXIfindex = 0
+			req.TXVLANID = 0
+			req.NeighborMAC = ""
+			req.SrcMAC = ""
+		} else {
+			req.TXVLANID = val.FibVlanID
+			req.NeighborMAC = macString(val.FibDmac[:])
+			req.SrcMAC = macString(val.FibSmac[:])
+		}
 		req.NATSrcIP = ipString(nativeUint32ToIP(val.NATSrcIP))
 		req.NATDstIP = ipString(nativeUint32ToIP(val.NATDstIP))
 		req.NATSrcPort = networkUint16ToHost(val.NATSrcPort)
@@ -3022,12 +3067,26 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		req.EgressZone = m.zoneNameByID(val.EgressZone)
 		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID)
 		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
-		if req.TunnelEndpointID != 0 {
-			req.TXIfindex = 0
+		if val.LogFlags&dataplane.LogFlagUserspaceTunnelEndpoint != 0 && val.FibGen != 0 {
+			req.TunnelEndpointID = val.FibGen
 		}
-		req.TXVLANID = val.FibVlanID
-		req.NeighborMAC = macString(val.FibDmac[:])
-		req.SrcMAC = macString(val.FibSmac[:])
+		if req.TunnelEndpointID != 0 {
+			if endpoint, ok := m.sessionSyncTunnelEndpointLocked(req.TunnelEndpointID); ok {
+				req.EgressIfindex = endpoint.Ifindex
+				req.OwnerRGID = endpoint.RedundancyGroup
+			} else {
+				req.EgressIfindex = 0
+				req.OwnerRGID = 0
+			}
+			req.TXIfindex = 0
+			req.TXVLANID = 0
+			req.NeighborMAC = ""
+			req.SrcMAC = ""
+		} else {
+			req.TXVLANID = val.FibVlanID
+			req.NeighborMAC = macString(val.FibDmac[:])
+			req.SrcMAC = macString(val.FibSmac[:])
+		}
 		req.NATSrcIP = ipString(net.IP(val.NATSrcIP[:]))
 		req.NATDstIP = ipString(net.IP(val.NATDstIP[:]))
 		req.NATSrcPort = networkUint16ToHost(val.NATSrcPort)
@@ -3057,6 +3116,19 @@ func (m *Manager) sessionSyncTunnelEndpointIDLocked(egressIfindex int) uint16 {
 		}
 	}
 	return 0
+}
+
+func (m *Manager) sessionSyncTunnelEndpointLocked(id uint16) (TunnelEndpointSnapshot, bool) {
+	snapshot := m.lastSnapshot
+	if snapshot == nil || id == 0 {
+		return TunnelEndpointSnapshot{}, false
+	}
+	for _, endpoint := range snapshot.TunnelEndpoints {
+		if endpoint.ID == id {
+			return endpoint, true
+		}
+	}
+	return TunnelEndpointSnapshot{}, false
 }
 
 func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
