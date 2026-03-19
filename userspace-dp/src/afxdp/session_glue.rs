@@ -149,7 +149,7 @@ fn owner_rg_is_unseeded(
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     resolution: ForwardingResolution,
 ) -> bool {
-    let owner_rg_id = owner_rg_for_flow(forwarding, resolution.egress_ifindex);
+    let owner_rg_id = owner_rg_for_resolution(forwarding, resolution);
     owner_rg_id > 0
         && matches!(
             ha_state.get(&owner_rg_id),
@@ -236,6 +236,16 @@ pub(super) fn apply_worker_commands(
                         &metadata,
                     );
                 }
+            }
+            WorkerCommand::UpsertLocal(entry) => {
+                sessions.install_with_protocol(
+                    entry.key,
+                    entry.decision,
+                    entry.metadata,
+                    now_ns,
+                    entry.protocol,
+                    entry.tcp_flags,
+                );
             }
             WorkerCommand::DeleteSynced(key) => {
                 let delete_alias = sessions.lookup(&key, now_ns, 0);
@@ -416,7 +426,7 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
             lookup_forwarding_resolution_for_session(forwarding, dynamic_neighbors, &flow, decision);
         let refreshed_resolution =
             enforce_session_ha_resolution(forwarding, ha_state, now_secs, looked_up, 0, 0);
-        let refreshed_owner_rg = owner_rg_for_flow(forwarding, refreshed_resolution.egress_ifindex);
+        let refreshed_owner_rg = owner_rg_for_resolution(forwarding, refreshed_resolution);
         if !owner_rgs.contains(&refreshed_owner_rg)
             && !owner_rgs.contains(&metadata.owner_rg_id)
             && refreshed_resolution == decision.resolution
@@ -806,7 +816,7 @@ fn build_reverse_session_from_forward_match(
         // original forward session. This matters during failback when a second
         // RG comes up later and stale reverse entries must be repointed away
         // from prior FabricRedirect results.
-        owner_rg_id: owner_rg_for_flow(forwarding, decision.resolution.egress_ifindex),
+        owner_rg_id: owner_rg_for_resolution(forwarding, decision.resolution),
         fabric_ingress: forward_match.metadata.fabric_ingress,
         is_reverse: true,
         synced: false,
@@ -865,9 +875,9 @@ pub(super) fn reverse_resolution_for_session(
     let resolved =
         lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip);
     if fabric_ingress
-        && owner_rg_for_flow(forwarding, resolved.egress_ifindex) > 0
+        && owner_rg_for_resolution(forwarding, resolved) > 0
         && !matches!(
-            ha_state.get(&owner_rg_for_flow(forwarding, resolved.egress_ifindex)),
+            ha_state.get(&owner_rg_for_resolution(forwarding, resolved)),
             Some(group)
                 if group.active
                     && group.watchdog_timestamp != 0
@@ -966,7 +976,7 @@ fn maybe_promote_synced_session(
     let mut promoted = metadata;
     promoted.synced = false;
     if promoted.owner_rg_id <= 0 {
-        promoted.owner_rg_id = owner_rg_for_flow(forwarding, decision.resolution.egress_ifindex);
+        promoted.owner_rg_id = owner_rg_for_resolution(forwarding, decision.resolution);
     }
     if sessions.promote_synced(key, decision, promoted.clone(), now_ns, protocol, tcp_flags) {
         let _ = publish_session_map_entry_for_session(session_map_fd, key, decision, &promoted);
