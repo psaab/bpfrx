@@ -60,10 +60,13 @@ def summarize(path, args):
         "ok": False,
         "error": "",
         "format": "",
+        "protocol": "",
         "completed": False,
         "observed_end_sec": 0.0,
         "avg_gbps": 0.0,
         "retransmits": 0,
+        "udp_loss_percent": 0.0,
+        "udp_jitter_ms": 0.0,
         "interval_gbps": [],
         "peak_gbps": 0.0,
         "peak_interval_index": -1,
@@ -93,9 +96,35 @@ def summarize(path, args):
 
     intervals, end = collect_intervals(payload)
     summary["completed"] = bool(end)
+    test_start = {}
+    if payload["format"] == "json":
+        test_start = data.get("start", {}).get("test_start", {}) or {}
+    elif payload["format"] == "json-stream":
+        start = next((event.get("data") or {} for event in data if event.get("event") == "start"), {})
+        test_start = start.get("test_start", {}) or {}
+    summary["protocol"] = str(test_start.get("protocol") or "").upper()
     sum_sent = end.get("sum_sent") or end.get("sum") or {}
     summary["avg_gbps"] = float(sum_sent.get("bits_per_second") or 0.0) / 1e9
     summary["retransmits"] = int(sum_sent.get("retransmits") or 0)
+    sum_received = end.get("sum_received") or {}
+    # Use `is not None` instead of `or` chaining — 0.0 is a valid value
+    # that `or` would treat as falsy, falling through to the wrong source.
+    def _first_defined(*sources):
+        for v in sources:
+            if v is not None:
+                return float(v)
+        return 0.0
+
+    summary["udp_loss_percent"] = _first_defined(
+        sum_received.get("lost_percent"),
+        sum_sent.get("lost_percent"),
+        end.get("sum", {}).get("lost_percent"),
+    )
+    summary["udp_jitter_ms"] = _first_defined(
+        sum_received.get("jitter_ms"),
+        sum_sent.get("jitter_ms"),
+        end.get("sum", {}).get("jitter_ms"),
+    )
 
     full_intervals = []
     observed_end = 0.0
