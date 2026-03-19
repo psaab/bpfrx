@@ -51,7 +51,6 @@ type CompileResult struct {
 	pendingTC           []int
 	tunnelIfindexes     map[int]bool // tunnel interfaces: XDP ingress only, no redirect
 	genericXDPIfindexes map[int]bool // interfaces that must use generic XDP only
-	forceGenericXDP     bool         // force generic XDP for all pending interfaces
 
 	// ManagedInterfaces describes all interfaces managed by the firewall,
 	// used by the networkd manager to generate .link and .network files.
@@ -146,27 +145,6 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 		rxVlanOffCache:      make(map[string]bool),
 		ethtoolApplied:      make(map[string]bool),
 		genericXDPIfindexes: make(map[int]bool),
-	}
-	// Native GRE userspace validation in the isolated lab still depends on
-	// skb-visible ingress for bulk TCP flows. Force generic XDP while tunnel
-	// interfaces exist so those flows do not bypass xdp_userspace_p.
-	for _, ifCfg := range cfg.Interfaces.Interfaces {
-		if ifCfg == nil {
-			continue
-		}
-		if ifCfg.Tunnel != nil {
-			result.forceGenericXDP = true
-			break
-		}
-		for _, unit := range ifCfg.Units {
-			if unit.Tunnel != nil {
-				result.forceGenericXDP = true
-				break
-			}
-		}
-		if result.forceGenericXDP {
-			break
-		}
 	}
 
 	// Phase 1: Assign zone IDs (1-based; 0 = unassigned).
@@ -328,13 +306,10 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		// Tunnel interfaces (GRE, ip6gre, XFRM) lack native XDP support
 		// and must always use generic mode — but they should NOT force
 		// all other interfaces into generic mode.
-		needGeneric := result.forceGenericXDP
+		needGeneric := false
 		for _, ifidx := range result.pendingXDP {
 			if result.tunnelIfindexes[ifidx] || result.genericXDPIfindexes[ifidx] {
 				continue // tunnels always get generic below
-			}
-			if needGeneric {
-				break
 			}
 			if err := m.AttachXDP(ifidx, false); err != nil {
 				if strings.Contains(err.Error(), "already attached") {
@@ -765,7 +740,7 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 			}
 			if izFlags&IfaceFlagTunnel != 0 {
 				tunnelIfindexes[physIface.Index] = true
-			} else if !result.forceGenericXDP {
+			} else {
 				// Optimistically set native XDP flag for non-tunnel
 				// interfaces.  Cleared in needGeneric fallback below.
 				izFlags |= IfaceFlagNativeXDP
