@@ -57,6 +57,8 @@ IMAGE_VM="${IMAGE_VM:-images:debian/13}"
 IMAGE_CT="${IMAGE_CT:-images:debian/13}"
 LAN_ADDR="${LAN_ADDR:-}"
 LAN_GW="${LAN_GW:-}"
+LAN_HOST_ATTACH_MODE="${LAN_HOST_ATTACH_MODE:-}"
+LAN_HOST_VF_INDEX="${LAN_HOST_VF_INDEX:-}"
 
 # SR-IOV: PCI passthrough for VM VFs, nictype=sriov for container VFs
 SRIOV_PARENT="${SRIOV_PARENT:-eno6np1}"
@@ -132,6 +134,10 @@ wait_for_agent() {
 	done
 }
 
+instance_is_running() {
+	incus exec "$(r "$1")" -- true &>/dev/null
+}
+
 host_readlink_basename() {
 	local path="$1"
 	if [[ -n "${INCUS_REMOTE:-}" ]]; then
@@ -150,6 +156,22 @@ resolve_vf_pci() {
 	vf_pci=$(host_readlink_basename "$vf_path")
 	[[ -n "${vf_pci:-}" ]] || die "Unable to resolve PCI BDF for ${parent} vf ${vf_idx}"
 	echo "$vf_pci"
+}
+
+resolve_vf_netdev() {
+	local parent="$1"
+	local vf_idx="$2"
+	local netdir="/sys/class/net/${parent}/device/virtfn${vf_idx}/net"
+	local vf_netdev
+
+	if [[ -n "${INCUS_REMOTE:-}" ]]; then
+		vf_netdev=$(ssh "$INCUS_REMOTE" "ls '$netdir' 2>/dev/null | head -n1")
+	else
+		vf_netdev=$(ls "$netdir" 2>/dev/null | head -n1)
+	fi
+
+	[[ -n "${vf_netdev:-}" ]] || die "Unable to resolve host netdev for ${parent} vf ${vf_idx}"
+	echo "$vf_netdev"
 }
 
 resolve_vm_vf_pci() {
@@ -217,6 +239,17 @@ find_vf_index_by_pci() {
 	done
 
 	return 1
+}
+
+apply_lan_host_vf_state() {
+	if [[ -n "${VF_LAN_VLAN:-}" && -n "${SRIOV_LAN_PARENT:-}" && -n "${LAN_HOST_VF_INDEX:-}" ]]; then
+		info "Applying host LAN host VF VLAN $VF_LAN_VLAN on $SRIOV_LAN_PARENT vf $LAN_HOST_VF_INDEX..."
+		if [[ -n "${INCUS_REMOTE:-}" ]]; then
+			ssh "$INCUS_REMOTE" "sudo ip link set dev $SRIOV_LAN_PARENT vf $LAN_HOST_VF_INDEX vlan $VF_LAN_VLAN"
+		else
+			sudo ip link set dev "$SRIOV_LAN_PARENT" vf "$LAN_HOST_VF_INDEX" vlan "$VF_LAN_VLAN"
+		fi
+	fi
 }
 
 # ── Init ─────────────────────────────────────────────────────────────
@@ -314,6 +347,7 @@ cmd_refresh_vfs() {
 	for idx in 0 1; do
 		reconcile_vm_vfs "$idx"
 	done
+	reconcile_lan_host_vf
 	info "VF reconciliation complete."
 }
 
@@ -408,7 +442,7 @@ reconcile_vm_vfs() {
 		return
 	fi
 
-	if incus info "$(r "$vm")" | grep -q "^Status: RUNNING"; then
+	if instance_is_running "$vm"; then
 		was_running=1
 	else
 		was_running=0
@@ -421,7 +455,7 @@ reconcile_vm_vfs() {
 
 	apply_vm_vf_host_state "$idx"
 
-	if [[ "$was_running" == "1" ]] && ! incus info "$(r "$vm")" | grep -q "^Status: RUNNING"; then
+	if [[ "$was_running" == "1" ]] && ! instance_is_running "$vm"; then
 		info "Starting $vm after VF reconciliation..."
 		incus start "$(r "$vm")"
 		wait_for_agent "$vm"
@@ -444,7 +478,7 @@ reconcile_vm_vf_device() {
 	fi
 
 	info "Updating $vm $dev_name from ${current:-<unset>} to $expected..."
-	if incus info "$(r "$vm")" | grep -q "^Status: RUNNING"; then
+	if instance_is_running "$vm"; then
 		incus stop "$(r "$vm")" --force
 	fi
 	incus config device remove "$(r "$vm")" "$dev_name" 2>/dev/null || true
@@ -582,7 +616,14 @@ create_lan_host() {
 	info "Launching test container $LAN_HOST..."
 	incus launch "$IMAGE_CT" "$rinst" -s default
 
-	if [[ -n "$SRIOV_LAN_PARENT" ]]; then
+	if [[ "${LAN_HOST_ATTACH_MODE:-}" == "physical" ]]; then
+		[[ -n "${SRIOV_LAN_PARENT:-}" && -n "${LAN_HOST_VF_INDEX:-}" ]] || die "LAN_HOST_ATTACH_MODE=physical requires SRIOV_LAN_PARENT and LAN_HOST_VF_INDEX"
+		local host_netdev
+		host_netdev=$(resolve_vf_netdev "$SRIOV_LAN_PARENT" "$LAN_HOST_VF_INDEX")
+		info "Adding LAN host VF (physical parent=$host_netdev) to $LAN_HOST..."
+		incus config device add "$rinst" eth0 nic nictype=physical parent="$host_netdev" name=eth0
+		apply_lan_host_vf_state
+	elif [[ -n "$SRIOV_LAN_PARENT" ]]; then
 		# SR-IOV LAN: incus picks a free VF, applies VLAN at host level
 		local lan_host_args=(nictype=sriov parent="$SRIOV_LAN_PARENT")
 		if [[ -n "${VF_LAN_VLAN:-}" ]]; then
@@ -634,6 +675,43 @@ EOF"
 	fi
 
 	info "Container $LAN_HOST ready ($lan_addr)."
+}
+
+reconcile_lan_host_vf() {
+	local rinst current_parent expected_parent
+	rinst=$(r "$LAN_HOST")
+
+	if ! incus info "$rinst" &>/dev/null 2>&1; then
+		warn "Container $LAN_HOST does not exist, skipping LAN host VF reconciliation"
+		return
+	fi
+
+	if [[ "${LAN_HOST_ATTACH_MODE:-}" == "physical" ]]; then
+		[[ -n "${SRIOV_LAN_PARENT:-}" && -n "${LAN_HOST_VF_INDEX:-}" ]] || die "LAN_HOST_ATTACH_MODE=physical requires SRIOV_LAN_PARENT and LAN_HOST_VF_INDEX"
+		current_parent=$(incus config device get "$rinst" eth0 parent 2>/dev/null || true)
+		if expected_parent=$(resolve_vf_netdev "$SRIOV_LAN_PARENT" "$LAN_HOST_VF_INDEX" 2>/dev/null); then
+			:
+		else
+			expected_parent=""
+		fi
+		if [[ -z "${expected_parent:-}" ]]; then
+			expected_parent="$current_parent"
+		fi
+		[[ -n "${expected_parent:-}" ]] || die "Unable to resolve LAN host VF parent for $LAN_HOST"
+		if [[ "$current_parent" != "$expected_parent" ]]; then
+			info "Updating $LAN_HOST eth0 parent from ${current_parent:-<unset>} to $expected_parent..."
+			incus stop "$rinst" --force
+			incus config device remove "$rinst" eth0 2>/dev/null || true
+			incus config device add "$rinst" eth0 nic nictype=physical parent="$expected_parent" name=eth0
+			incus start "$rinst"
+			sleep 3
+		else
+			info "$LAN_HOST eth0 already points at $expected_parent"
+		fi
+		apply_lan_host_vf_state
+	else
+		info "$LAN_HOST uses Incus-managed ${LAN_HOST_ATTACH_MODE:-sriov} attachment; no host VF rebinding needed"
+	fi
 }
 
 # ── Destroy ──────────────────────────────────────────────────────────
