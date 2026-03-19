@@ -2724,7 +2724,6 @@ fn poll_binding(
 
                             let resolution = if should_block_tunnel_interface_nat_session_miss(
                                 forwarding,
-                                meta.ingress_ifindex as i32,
                                 effective_resolution_target,
                                 meta.protocol,
                             ) {
@@ -7221,12 +7220,10 @@ fn interface_nat_local_resolution_on_session_miss(
 
 fn should_block_tunnel_interface_nat_session_miss(
     state: &ForwardingState,
-    ingress_ifindex: i32,
     dst: IpAddr,
     protocol: u8,
 ) -> bool {
-    matches!(protocol, PROTO_TCP | PROTO_UDP)
-        && state.tunnel_endpoint_by_ifindex.contains_key(&ingress_ifindex)
+    matches!(protocol, PROTO_TCP | PROTO_UDP | PROTO_ICMP | PROTO_ICMPV6)
         && matches!(
             interface_nat_local_resolution(state, dst),
             Some(local) if local.tunnel_endpoint_id != 0
@@ -11263,7 +11260,7 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_tcp_session_miss_blocks_interface_nat_local_delivery() {
+    fn tunnel_session_miss_blocks_interface_nat_local_delivery() {
         let mut snapshot = native_gre_snapshot(true);
         snapshot.source_nat_rules = vec![SourceNATRuleSnapshot {
             name: "lan-to-sfmix".to_string(),
@@ -11274,27 +11271,19 @@ mod tests {
             ..Default::default()
         }];
         let state = build_forwarding_state(&snapshot);
-        let tunnel_ifindex = state
-            .tunnel_endpoints
-            .get(&1)
-            .expect("tunnel endpoint")
-            .logical_ifindex;
         let tunnel_snat_ip = "10.255.192.42".parse().expect("tunnel snat");
         assert!(should_block_tunnel_interface_nat_session_miss(
             &state,
-            tunnel_ifindex,
             tunnel_snat_ip,
             PROTO_TCP,
         ));
         assert!(should_block_tunnel_interface_nat_session_miss(
             &state,
-            tunnel_ifindex,
             tunnel_snat_ip,
             PROTO_UDP,
         ));
-        assert!(!should_block_tunnel_interface_nat_session_miss(
+        assert!(should_block_tunnel_interface_nat_session_miss(
             &state,
-            tunnel_ifindex,
             tunnel_snat_ip,
             PROTO_ICMP,
         ));
