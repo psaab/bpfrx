@@ -6,9 +6,16 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${BPFRX_CLUSTER_ENV:-${PROJECT_ROOT}/test/incus/loss-userspace-cluster.env}"
 DEPLOY=0
 FAILOVER=0
+IPERF=0
 GRE_TARGET="${GRE_TARGET:-10.255.192.41}"
 GRE_TCP_TARGET="${GRE_TCP_TARGET:-${GRE_TARGET}}"
 GRE_TCP_PORT="${GRE_TCP_PORT:-22}"
+GRE_IPERF_TARGET="${GRE_IPERF_TARGET:-${GRE_TARGET}}"
+GRE_IPERF_PORT="${GRE_IPERF_PORT:-5201}"
+GRE_IPERF_DURATION="${GRE_IPERF_DURATION:-20}"
+GRE_IPERF_PARALLEL="${GRE_IPERF_PARALLEL:-1}"
+GRE_IPERF_MIN_GBPS="${GRE_IPERF_MIN_GBPS:-1.0}"
+GRE_VALIDATE_HOST_PROBES="${GRE_VALIDATE_HOST_PROBES:-0}"
 GRE_OUTER_REMOTE="${GRE_OUTER_REMOTE:-2602:ffd3:0:2::7}"
 GRE_LOGICAL_DEV="${GRE_LOGICAL_DEV:-gr-0-0-0}"
 PING_COUNT="${PING_COUNT:-5}"
@@ -22,6 +29,7 @@ while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--deploy) DEPLOY=1 ;;
 	--failover) FAILOVER=1 ;;
+	--iperf) IPERF=1 ;;
 	--env) ENV_FILE="$2"; shift ;;
 	--target) GRE_TARGET="$2"; shift ;;
 	--outer-remote) GRE_OUTER_REMOTE="$2"; shift ;;
@@ -52,6 +60,53 @@ tcp_probe_cmd() {
 	local target="$1"
 	local port="$2"
 	printf 'timeout 2 bash -lc %q' "exec 3<>/dev/tcp/${target}/${port}"
+}
+
+run_iperf_stream_to_log() {
+	local log_path="$1"
+	local target="$2"
+	local port="$3"
+	local duration="$4"
+	local parallel="$5"
+	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "iperf3 -c ${target} -p ${port} -P ${parallel} -t ${duration} --json-stream")" >"${log_path}" 2>&1 || true
+}
+
+summarize_iperf_log() {
+	local log_path="$1"
+	python3 "${PROJECT_ROOT}/scripts/iperf-json-metrics.py" \
+		"${log_path}" \
+		--min-peak-gbps "${GRE_IPERF_MIN_GBPS}"
+}
+
+assert_iperf_log_healthy() {
+	local log_path="$1"
+	local label="$2"
+	local summary
+	summary="$(summarize_iperf_log "${log_path}")"
+	printf '%s\n' "$summary"
+	python3 - "$summary" "$GRE_IPERF_MIN_GBPS" "$label" <<'PY'
+import json
+import sys
+
+summary = json.loads(sys.argv[1])
+min_gbps = float(sys.argv[2])
+label = sys.argv[3]
+
+if not summary.get("ok"):
+    raise SystemExit(f"{label}: failed to parse iperf log: {summary.get('error')}")
+if not summary.get("completed"):
+    raise SystemExit(f"{label}: iperf did not complete")
+if summary.get("collapse_detected"):
+    raise SystemExit(f"{label}: iperf collapsed: {summary.get('collapse_reason')}")
+if float(summary.get("avg_gbps") or 0.0) < min_gbps:
+    raise SystemExit(
+        f"{label}: avg_gbps {float(summary.get('avg_gbps') or 0.0):.3f} below {min_gbps:.3f}"
+    )
+if int(summary.get("zero_intervals_total") or 0) > 0:
+    raise SystemExit(
+        f"{label}: observed {int(summary.get('zero_intervals_total') or 0)} zero interval(s)"
+    )
+PY
 }
 
 run_host() {
@@ -293,21 +348,32 @@ run_host "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1
 
 pass "native GRE transit TCP connect works from ${HOST}"
 
-info "running firewall-originated GRE probe from ${ACTIVE_FW}"
-run_vm "$ACTIVE_FW" "ping -c ${PING_COUNT} -W 1 ${GRE_TARGET} >/tmp/userspace-native-gre-host-ping.out 2>&1 || true"
-host_ping_output="$(run_vm "$ACTIVE_FW" 'cat /tmp/userspace-native-gre-host-ping.out')"
-printf '%s\n' "$host_ping_output"
-grep -q 'bytes from' <<<"$host_ping_output" || die "firewall-originated GRE ping failed"
+if (( GRE_VALIDATE_HOST_PROBES == 1 )); then
+	info "running firewall-originated GRE probe from ${ACTIVE_FW}"
+	run_vm "$ACTIVE_FW" "ping -c ${PING_COUNT} -W 1 ${GRE_TARGET} >/tmp/userspace-native-gre-host-ping.out 2>&1 || true"
+	host_ping_output="$(run_vm "$ACTIVE_FW" 'cat /tmp/userspace-native-gre-host-ping.out')"
+	printf '%s\n' "$host_ping_output"
+	grep -q 'bytes from' <<<"$host_ping_output" || die "firewall-originated GRE ping failed"
 
-pass "native GRE host/control-plane traffic still works on ${ACTIVE_FW}"
+	pass "native GRE host/control-plane traffic still works on ${ACTIVE_FW}"
 
-info "running firewall-originated GRE TCP probe from ${ACTIVE_FW}"
-run_vm "$ACTIVE_FW" "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/tmp/userspace-native-gre-fw-tcp.out 2>&1 || true"
-host_tcp_output="$(run_vm "$ACTIVE_FW" 'cat /tmp/userspace-native-gre-fw-tcp.out 2>/dev/null || true')"
-printf '%s\n' "$host_tcp_output"
-run_vm "$ACTIVE_FW" "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1" || die "firewall-originated GRE TCP connect failed"
+	info "running firewall-originated GRE TCP probe from ${ACTIVE_FW}"
+	run_vm "$ACTIVE_FW" "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/tmp/userspace-native-gre-fw-tcp.out 2>&1 || true"
+	host_tcp_output="$(run_vm "$ACTIVE_FW" 'cat /tmp/userspace-native-gre-fw-tcp.out 2>/dev/null || true')"
+	printf '%s\n' "$host_tcp_output"
+	run_vm "$ACTIVE_FW" "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1" || die "firewall-originated GRE TCP connect failed"
 
-pass "native GRE host/control-plane TCP connect works on ${ACTIVE_FW}"
+	pass "native GRE host/control-plane TCP connect works on ${ACTIVE_FW}"
+fi
+
+if (( IPERF == 1 )); then
+	info "running GRE iperf3 probe to ${GRE_IPERF_TARGET}:${GRE_IPERF_PORT} from ${HOST}"
+	iperf_log="$(mktemp)"
+	run_iperf_stream_to_log "${iperf_log}" "${GRE_IPERF_TARGET}" "${GRE_IPERF_PORT}" "${GRE_IPERF_DURATION}" "${GRE_IPERF_PARALLEL}"
+	assert_iperf_log_healthy "${iperf_log}" "steady native GRE iperf"
+	rm -f "${iperf_log}"
+	pass "native GRE iperf stayed up from ${HOST}"
+fi
 
 if (( FAILOVER == 1 )); then
 	current_node="$PREFERRED_ACTIVE_NODE"
@@ -316,33 +382,63 @@ if (( FAILOVER == 1 )); then
 		failover_node=1
 	fi
 	info "running active GRE failover probe from ${HOST} while moving RGs to node${failover_node}"
-	failover_ping_log="$(mktemp)"
-	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "ping -i 0.2 -c ${FAILOVER_PING_COUNT} -W 1 ${GRE_TARGET}")" >"${failover_ping_log}" 2>&1 &
-	failover_ping_pid=$!
-	failover_tcp_log="$(mktemp)"
-	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "for seq in \$(seq 1 ${FAILOVER_PING_COUNT}); do if $(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1; then echo ok seq=\${seq}; else echo fail seq=\${seq}; fi; sleep 0.2; done")" >"${failover_tcp_log}" 2>&1 &
-	failover_tcp_pid=$!
+	failover_ping_log=""
+	failover_ping_pid=""
+	failover_tcp_log=""
+	failover_tcp_pid=""
+	if (( IPERF == 0 )); then
+		failover_ping_log="$(mktemp)"
+		sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "ping -i 0.2 -c ${FAILOVER_PING_COUNT} -W 1 ${GRE_TARGET}")" >"${failover_ping_log}" 2>&1 &
+		failover_ping_pid=$!
+		failover_tcp_log="$(mktemp)"
+		sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "for seq in \$(seq 1 ${FAILOVER_PING_COUNT}); do if $(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1; then echo ok seq=\${seq}; else echo fail seq=\${seq}; fi; sleep 0.2; done")" >"${failover_tcp_log}" 2>&1 &
+		failover_tcp_pid=$!
+	fi
+	failover_iperf_log=""
+	failover_iperf_pid=""
+	if (( IPERF == 1 )); then
+		failover_iperf_log="$(mktemp)"
+		run_iperf_stream_to_log "${failover_iperf_log}" "${GRE_IPERF_TARGET}" "${GRE_IPERF_PORT}" "${GRE_IPERF_DURATION}" "${GRE_IPERF_PARALLEL}" &
+		failover_iperf_pid=$!
+	fi
 	sleep "$FAILOVER_PREP_SECS"
 	pin_active_node "$failover_node"
 	arm_supported_runtime
-	wait "$failover_ping_pid" || true
-	wait "$failover_tcp_pid" || true
-	failover_ping_output="$(cat "${failover_ping_log}")"
-	rm -f "${failover_ping_log}"
-	failover_tcp_output="$(cat "${failover_tcp_log}")"
-	rm -f "${failover_tcp_log}"
-	printf '%s\n' "$failover_ping_output"
-	max_seq="$(awk -F'icmp_seq=' '/bytes from/ { split($2, a, /[[:space:]]+/); if (a[1] > max) max=a[1] } END { print max+0 }' <<<"$failover_ping_output")"
-	[[ "$max_seq" -ge $((FAILOVER_PING_COUNT - 5)) ]] || die "active GRE failover ping did not recover near the tail (max_seq=${max_seq})"
-	grep -q 'bytes from' <<<"$failover_ping_output" || die "active GRE failover ping produced no replies"
-	printf '%s\n' "$failover_tcp_output"
-	max_tcp_seq="$(awk -F'seq=' '/^ok seq=/ { if ($2 > max) max = $2 } END { print max+0 }' <<<"$failover_tcp_output")"
-	[[ "$max_tcp_seq" -ge $((FAILOVER_PING_COUNT - 5)) ]] || die "active GRE failover TCP did not recover near the tail (max_seq=${max_tcp_seq})"
-	grep -q '^ok seq=' <<<"$failover_tcp_output" || die "active GRE failover TCP produced no successful connects"
-	run_vm "$ACTIVE_FW" "ping -c ${PING_COUNT} -W 1 ${GRE_TARGET} >/tmp/userspace-native-gre-post-failover-host-ping.out 2>&1 || true"
-	post_failover_host_ping_output="$(run_vm "$ACTIVE_FW" 'cat /tmp/userspace-native-gre-post-failover-host-ping.out')"
-	printf '%s\n' "$post_failover_host_ping_output"
-	grep -q 'bytes from' <<<"$post_failover_host_ping_output" || die "post-failover firewall-originated GRE ping failed"
-	run_vm "$ACTIVE_FW" "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1" || die "post-failover firewall-originated GRE TCP connect failed"
+	if [[ -n "$failover_ping_pid" ]]; then
+		wait "$failover_ping_pid" || true
+	fi
+	if [[ -n "$failover_tcp_pid" ]]; then
+		wait "$failover_tcp_pid" || true
+	fi
+	if [[ -n "$failover_iperf_pid" ]]; then
+		wait "$failover_iperf_pid" || true
+	fi
+	if [[ -n "$failover_ping_log" ]]; then
+		failover_ping_output="$(cat "${failover_ping_log}")"
+		rm -f "${failover_ping_log}"
+		printf '%s\n' "$failover_ping_output"
+		max_seq="$(awk -F'icmp_seq=' '/bytes from/ { split($2, a, /[[:space:]]+/); if (a[1] > max) max=a[1] } END { print max+0 }' <<<"$failover_ping_output")"
+		[[ "$max_seq" -ge $((FAILOVER_PING_COUNT - 5)) ]] || die "active GRE failover ping did not recover near the tail (max_seq=${max_seq})"
+		grep -q 'bytes from' <<<"$failover_ping_output" || die "active GRE failover ping produced no replies"
+	fi
+	if [[ -n "$failover_tcp_log" ]]; then
+		failover_tcp_output="$(cat "${failover_tcp_log}")"
+		rm -f "${failover_tcp_log}"
+		printf '%s\n' "$failover_tcp_output"
+		max_tcp_seq="$(awk -F'seq=' '/^ok seq=/ { if ($2 > max) max = $2 } END { print max+0 }' <<<"$failover_tcp_output")"
+		[[ "$max_tcp_seq" -ge $((FAILOVER_PING_COUNT - 5)) ]] || die "active GRE failover TCP did not recover near the tail (max_seq=${max_tcp_seq})"
+		grep -q '^ok seq=' <<<"$failover_tcp_output" || die "active GRE failover TCP produced no successful connects"
+	fi
+	if [[ -n "$failover_iperf_log" ]]; then
+		assert_iperf_log_healthy "${failover_iperf_log}" "failover native GRE iperf"
+		rm -f "${failover_iperf_log}"
+	fi
+	if (( GRE_VALIDATE_HOST_PROBES == 1 )); then
+		run_vm "$ACTIVE_FW" "ping -c ${PING_COUNT} -W 1 ${GRE_TARGET} >/tmp/userspace-native-gre-post-failover-host-ping.out 2>&1 || true"
+		post_failover_host_ping_output="$(run_vm "$ACTIVE_FW" 'cat /tmp/userspace-native-gre-post-failover-host-ping.out')"
+		printf '%s\n' "$post_failover_host_ping_output"
+		grep -q 'bytes from' <<<"$post_failover_host_ping_output" || die "post-failover firewall-originated GRE ping failed"
+		run_vm "$ACTIVE_FW" "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1" || die "post-failover firewall-originated GRE TCP connect failed"
+	fi
 	pass "native GRE active tunnel traffic survived failover to ${ACTIVE_FW}"
 fi
