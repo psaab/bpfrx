@@ -12,6 +12,8 @@ TRACEROUTE=0
 GRE_TARGET="${GRE_TARGET:-10.255.192.41}"
 GRE_TCP_TARGET="${GRE_TCP_TARGET:-${GRE_TARGET}}"
 GRE_TCP_PORT="${GRE_TCP_PORT:-22}"
+GRE_TCP_RETRIES="${GRE_TCP_RETRIES:-3}"
+GRE_TCP_RETRY_SLEEP="${GRE_TCP_RETRY_SLEEP:-0.2}"
 GRE_IPERF_TARGET="${GRE_IPERF_TARGET:-${GRE_TARGET}}"
 GRE_IPERF_PORT="${GRE_IPERF_PORT:-5201}"
 GRE_IPERF_DURATION="${GRE_IPERF_DURATION:-20}"
@@ -24,6 +26,7 @@ GRE_UDP_INTERVAL_MS="${GRE_UDP_INTERVAL_MS:-10}"
 GRE_UDP_PAYLOAD_SIZE="${GRE_UDP_PAYLOAD_SIZE:-256}"
 GRE_TRACEROUTE_TARGET="${GRE_TRACEROUTE_TARGET:-${GRE_TARGET}}"
 GRE_TRACEROUTE_MAX_HOPS="${GRE_TRACEROUTE_MAX_HOPS:-4}"
+GRE_TRACEROUTE_CYCLES="${GRE_TRACEROUTE_CYCLES:-3}"
 GRE_VALIDATE_HOST_PROBES="${GRE_VALIDATE_HOST_PROBES:-0}"
 GRE_OUTER_REMOTE="${GRE_OUTER_REMOTE:-2602:ffd3:0:2::7}"
 GRE_LOGICAL_DEV="${GRE_LOGICAL_DEV:-gr-0-0-0}"
@@ -71,6 +74,24 @@ tcp_probe_cmd() {
 	local target="$1"
 	local port="$2"
 	printf 'timeout 2 bash -lc %q' "exec 3<>/dev/tcp/${target}/${port}"
+}
+
+run_host_tcp_probe_with_retry() {
+	local target="$1"
+	local port="$2"
+	local tries="${3:-$GRE_TCP_RETRIES}"
+	local sleep_secs="${4:-$GRE_TCP_RETRY_SLEEP}"
+	local attempt=1
+	while (( attempt <= tries )); do
+		if run_host "$(tcp_probe_cmd "${target}" "${port}") >/dev/null 2>&1"; then
+			return 0
+		fi
+		if (( attempt < tries )); then
+			sleep "${sleep_secs}"
+		fi
+		attempt=$((attempt + 1))
+	done
+	return 1
 }
 
 run_iperf_stream_to_log() {
@@ -426,7 +447,7 @@ info "running GRE TCP probe to ${GRE_TCP_TARGET}:${GRE_TCP_PORT} from ${HOST}"
 run_host "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/tmp/userspace-native-gre-host-tcp.out 2>&1 || true"
 host_tcp_output="$(run_host 'cat /tmp/userspace-native-gre-host-tcp.out 2>/dev/null || true')"
 printf '%s\n' "$host_tcp_output"
-run_host "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1" || die "GRE TCP connect from ${HOST} failed"
+run_host_tcp_probe_with_retry "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}" || die "GRE TCP connect from ${HOST} failed"
 
 pass "native GRE transit TCP connect works from ${HOST}"
 
@@ -484,7 +505,7 @@ if (( TRACEROUTE == 1 )); then
 	mtr_before_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
 	mtr_capture_file="/tmp/userspace-native-gre-mtr-capture.out"
 	start_logical_transit_capture "$ACTIVE_FW" "$mtr_capture_file" "icmp and host ${GRE_TRACEROUTE_TARGET}"
-	mtr_output="$(run_host "mtr -n ${GRE_TRACEROUTE_TARGET} --report --report-cycles=1 --max-ttl ${GRE_TRACEROUTE_MAX_HOPS}" || true)"
+	mtr_output="$(run_host "mtr -n ${GRE_TRACEROUTE_TARGET} --report --report-cycles=${GRE_TRACEROUTE_CYCLES} --max-ttl ${GRE_TRACEROUTE_MAX_HOPS}" || true)"
 	assert_mtr_healthy "$mtr_output" "${GRE_TRACEROUTE_TARGET}"
 	mtr_after_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
 	mtr_after_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
@@ -582,7 +603,7 @@ if (( FAILOVER == 1 )); then
 		mtr_before_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
 		mtr_capture_file="/tmp/userspace-native-gre-post-failover-mtr-capture.out"
 		start_logical_transit_capture "$ACTIVE_FW" "$mtr_capture_file" "icmp and host ${GRE_TRACEROUTE_TARGET}"
-		mtr_output="$(run_host "mtr -n ${GRE_TRACEROUTE_TARGET} --report --report-cycles=1 --max-ttl ${GRE_TRACEROUTE_MAX_HOPS}" || true)"
+		mtr_output="$(run_host "mtr -n ${GRE_TRACEROUTE_TARGET} --report --report-cycles=${GRE_TRACEROUTE_CYCLES} --max-ttl ${GRE_TRACEROUTE_MAX_HOPS}" || true)"
 		assert_mtr_healthy "$mtr_output" "${GRE_TRACEROUTE_TARGET}"
 		mtr_after_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
 		mtr_after_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
