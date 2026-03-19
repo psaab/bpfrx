@@ -680,7 +680,8 @@ const (
 // These bits are NOT defined in the BPF C headers — they are only used by the
 // Go/Rust userspace dataplane for session sync and are never written by eBPF.
 const (
-	LogFlagUserspaceFabricIngress = 1 << 7
+	LogFlagUserspaceTunnelEndpoint = 1 << 6
+	LogFlagUserspaceFabricIngress  = 1 << 7
 )
 
 // Event type constants.
