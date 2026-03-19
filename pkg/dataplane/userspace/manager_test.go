@@ -140,8 +140,9 @@ func TestBuildSessionSyncRequestV4PreservesTunnelEndpointIdentity(t *testing.T) 
 				RedundancyGroup: 1,
 			}},
 			TunnelEndpoints: []TunnelEndpointSnapshot{{
-				ID:      3,
-				Ifindex: 586,
+				ID:              3,
+				Ifindex:         586,
+				RedundancyGroup: 1,
 			}},
 		},
 	}
@@ -155,7 +156,9 @@ func TestBuildSessionSyncRequestV4PreservesTunnelEndpointIdentity(t *testing.T) 
 	val := &dataplane.SessionValue{
 		IngressZone: 1,
 		EgressZone:  2,
-		FibIfindex:  586,
+		LogFlags:    dataplane.LogFlagUserspaceTunnelEndpoint,
+		FibIfindex:  894,
+		FibGen:      3,
 		FibVlanID:   80,
 		FibDmac:     [6]byte{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff},
 		FibSmac:     [6]byte{0x02, 0xbf, 0x72, 0x00, 0x50, 0x08},
@@ -169,6 +172,63 @@ func TestBuildSessionSyncRequestV4PreservesTunnelEndpointIdentity(t *testing.T) 
 	}
 	if req.TXIfindex != 0 {
 		t.Fatalf("unexpected tx ifindex: %d", req.TXIfindex)
+	}
+	if req.OwnerRGID != 1 {
+		t.Fatalf("unexpected owner rg: %d", req.OwnerRGID)
+	}
+	if req.TXVLANID != 0 {
+		t.Fatalf("unexpected tx vlan id: %d", req.TXVLANID)
+	}
+	if req.NeighborMAC != "" || req.SrcMAC != "" {
+		t.Fatalf("unexpected tunnel L2 metadata: %+v", req)
+	}
+}
+
+func TestBuildSessionSyncRequestV6PreservesTunnelEndpointIdentity(t *testing.T) {
+	m := &Manager{
+		inner: dataplane.New(),
+		lastSnapshot: &ConfigSnapshot{
+			Interfaces: []InterfaceSnapshot{{
+				Name:            "gr-0/0/0.0",
+				Ifindex:         586,
+				RedundancyGroup: 1,
+			}},
+			TunnelEndpoints: []TunnelEndpointSnapshot{{
+				ID:              7,
+				Ifindex:         586,
+				RedundancyGroup: 1,
+			}},
+		},
+	}
+	var srcIP, dstIP [16]byte
+	copy(srcIP[:], net.ParseIP("2001:559:8585:ef00::100").To16())
+	copy(dstIP[:], net.ParseIP("2001:db8::1").To16())
+	val := &dataplane.SessionValueV6{
+		IngressZone: 1,
+		EgressZone:  2,
+		LogFlags:    dataplane.LogFlagUserspaceTunnelEndpoint,
+		FibIfindex:  1133,
+		FibGen:      7,
+		FibVlanID:   80,
+	}
+	req := m.buildSessionSyncRequestV6("upsert", dataplane.SessionKeyV6{
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+		SrcPort:  hostToNetwork16(5555),
+		DstPort:  hostToNetwork16(53),
+		Protocol: 17,
+	}, val)
+	if req.TunnelEndpointID != 7 {
+		t.Fatalf("unexpected tunnel endpoint id: %d", req.TunnelEndpointID)
+	}
+	if req.EgressIfindex != 586 {
+		t.Fatalf("unexpected egress ifindex: %d", req.EgressIfindex)
+	}
+	if req.OwnerRGID != 1 {
+		t.Fatalf("unexpected owner rg: %d", req.OwnerRGID)
+	}
+	if req.TXIfindex != 0 || req.TXVLANID != 0 {
+		t.Fatalf("unexpected tx path for tunnel sync: %+v", req)
 	}
 }
 

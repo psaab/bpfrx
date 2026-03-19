@@ -68,7 +68,7 @@ func TestUserspaceSessionFromDeltaV4(t *testing.T) {
 	}
 }
 
-func TestUserspaceSessionFromDeltaV4PreservesLogicalTunnelEgress(t *testing.T) {
+func TestUserspaceSessionFromDeltaV4CarriesTunnelEndpointMetadata(t *testing.T) {
 	zoneIDs := map[string]uint16{"lan": 1, "sfmix": 2}
 	delta := dpuserspace.SessionDeltaInfo{
 		Event:            "open",
@@ -93,8 +93,14 @@ func TestUserspaceSessionFromDeltaV4PreservesLogicalTunnelEgress(t *testing.T) {
 	if !ok {
 		t.Fatal("expected v4 tunnel delta to convert")
 	}
-	if val.FibIfindex != 586 {
+	if val.FibIfindex != 0 {
 		t.Fatalf("unexpected fib ifindex: %d", val.FibIfindex)
+	}
+	if val.FibGen != 3 {
+		t.Fatalf("unexpected fib gen tunnel id: %d", val.FibGen)
+	}
+	if val.LogFlags&dataplane.LogFlagUserspaceTunnelEndpoint == 0 {
+		t.Fatalf("expected tunnel endpoint marker in log flags: %#x", val.LogFlags)
 	}
 }
 
@@ -157,7 +163,7 @@ func TestUserspaceSessionFromDeltaV6(t *testing.T) {
 	}
 }
 
-func TestUserspaceSessionFromDeltaV6PreservesLogicalTunnelEgress(t *testing.T) {
+func TestUserspaceSessionFromDeltaV6CarriesTunnelEndpointMetadata(t *testing.T) {
 	zoneIDs := map[string]uint16{"lan": 1, "sfmix": 2}
 	delta := dpuserspace.SessionDeltaInfo{
 		Event:            "open",
@@ -182,8 +188,14 @@ func TestUserspaceSessionFromDeltaV6PreservesLogicalTunnelEgress(t *testing.T) {
 	if !ok {
 		t.Fatal("expected v6 tunnel delta to convert")
 	}
-	if val.FibIfindex != 586 {
+	if val.FibIfindex != 0 {
 		t.Fatalf("unexpected fib ifindex: %d", val.FibIfindex)
+	}
+	if val.FibGen != 7 {
+		t.Fatalf("unexpected fib gen tunnel id: %d", val.FibGen)
+	}
+	if val.LogFlags&dataplane.LogFlagUserspaceTunnelEndpoint == 0 {
+		t.Fatalf("expected tunnel endpoint marker in log flags: %#x", val.LogFlags)
 	}
 }
 
