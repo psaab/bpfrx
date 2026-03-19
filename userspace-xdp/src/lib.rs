@@ -274,6 +274,10 @@ static USERSPACE_INTERFACE_NAT_V4: HashMap<u32, u8> = HashMap::with_max_entries(
 static USERSPACE_INTERFACE_NAT_V6: HashMap<UserspaceLocalV6Key, u8> =
     HashMap::with_max_entries(8192, 0);
 
+// NOTE: This map MUST be pinned/reused from the main eBPF pipeline's
+// dnat_table so dynamic SNAT-return entries are visible here. The Go
+// loader (pkg/dataplane/loader.go) must ensure the userspace XDP
+// collection shares the same pinned dnat_table map fd.
 #[map(name = "dnat_table")]
 static DNAT_TABLE: HashMap<DnatKeyV4, DnatValueV4> = HashMap::with_max_entries(262144, 0);
 
@@ -425,13 +429,17 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     }
 
     let packet_len = data_end.saturating_sub(data);
-    // ESP still relies on the kernel XFRM path. Native GRE is different:
-    // when enabled, outer GRE must stay on the physical NIC userspace path
-    // so Linux never owns transit decap on gr-* tunnel netdevices.
-    if parsed.protocol == PROTO_ESP
-        || (parsed.protocol == PROTO_GRE && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) == 0)
-    {
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
+    // ESP still relies on the kernel XFRM path. Use cpumap_or_pass
+    // instead of fallback_to_main — the tail-call can fail silently
+    // during early boot when the prog-array isn't populated, which
+    // would drop ESP/IKE packets. cpumap_or_pass delivers to the
+    // kernel stack reliably.
+    if parsed.protocol == PROTO_ESP {
+        return Ok(cpumap_or_pass(ctrl));
+    }
+    // Non-native GRE also goes to kernel for tunnel decap.
+    if parsed.protocol == PROTO_GRE && (ctrl.flags & USERSPACE_CTRL_FLAG_NATIVE_GRE) == 0 {
+        return Ok(cpumap_or_pass(ctrl));
     }
     if should_fallback_early(&parsed) {
         record_trace(
@@ -640,7 +648,9 @@ fn classify_native_gre_inner_ipv4(data: usize, data_end: usize, l3_offset: usize
     };
     key.src_addr[..4].copy_from_slice(&iph[12..16]);
     key.dst_addr[..4].copy_from_slice(&iph[16..20]);
-    let dst_v4 = u32::from_be_bytes([iph[16], iph[17], iph[18], iph[19]]);
+    // Use native-endian to match Go's binary.NativeEndian.Uint32() used
+    // for BPF map keys (DNAT_TABLE, USERSPACE_INTERFACE_NAT_V4, USERSPACE_LOCAL_V4).
+    let dst_v4 = u32::from_ne_bytes([iph[16], iph[17], iph[18], iph[19]]);
     let Some(l4_offset) = l3_offset.checked_add(ihl) else {
         return 0;
     };

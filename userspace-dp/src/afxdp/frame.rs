@@ -1359,6 +1359,59 @@ pub(super) fn packet_rel_l4_offset(packet: &[u8], addr_family: u8) -> Option<usi
     }
 }
 
+/// Like `packet_rel_l4_offset` but also returns the final L4 protocol
+/// after walking IPv6 extension headers. For IPv4, returns the protocol
+/// byte from the IP header. Needed for GRE inner packet parsing where
+/// the initial next-header (packet[6]) may be an extension header, not
+/// the actual L4 protocol.
+pub(super) fn packet_rel_l4_offset_and_protocol(packet: &[u8], addr_family: u8) -> Option<(usize, u8)> {
+    match addr_family as i32 {
+        libc::AF_INET => {
+            if packet.len() < 20 {
+                return None;
+            }
+            let ihl = usize::from(packet[0] & 0x0f) * 4;
+            if ihl < 20 || packet.len() < ihl {
+                return None;
+            }
+            Some((ihl, packet[9]))
+        }
+        libc::AF_INET6 => {
+            if packet.len() < 40 {
+                return None;
+            }
+            let mut protocol = *packet.get(6)?;
+            let mut offset = 40usize;
+            for _ in 0..6 {
+                match protocol {
+                    0 | 43 | 60 => {
+                        let opt = packet.get(offset..offset + 2)?;
+                        protocol = opt[0];
+                        offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
+                        if packet.len() < offset { return None; }
+                    }
+                    51 => {
+                        let opt = packet.get(offset..offset + 2)?;
+                        protocol = opt[0];
+                        offset = offset.checked_add((usize::from(opt[1]) + 2) * 4)?;
+                        if packet.len() < offset { return None; }
+                    }
+                    44 => {
+                        let frag = packet.get(offset..offset + 8)?;
+                        protocol = frag[0];
+                        offset = offset.checked_add(8)?;
+                        if packet.len() < offset { return None; }
+                    }
+                    59 => return None,
+                    _ => return Some((offset, protocol)),
+                }
+            }
+            Some((offset, protocol))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn metadata_tuple_complete(meta: UserspaceDpMeta, flow: &SessionFlow) -> bool {
     if flow.src_ip.is_unspecified() || flow.dst_ip.is_unspecified() {
         return false;

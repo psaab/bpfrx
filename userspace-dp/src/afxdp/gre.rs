@@ -143,8 +143,11 @@ fn parse_inner_protocol_and_offsets(packet: &[u8], addr_family: u8) -> Option<(u
             if packet.len() < 40 {
                 return None;
             }
-            let protocol = packet[6];
-            let rel_l4 = packet_rel_l4_offset(packet, addr_family)? as u16;
+            // Use the extension-header-aware helper to get both the final L4
+            // protocol and the correct offset. packet[6] may be an extension
+            // header type, not the actual L4 protocol.
+            let (l4_off, protocol) = packet_rel_l4_offset_and_protocol(packet, addr_family)?;
+            let rel_l4 = l4_off as u16;
             let payload_offset = match protocol {
                 PROTO_TCP => {
                     let l4 = rel_l4 as usize;
