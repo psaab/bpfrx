@@ -107,17 +107,23 @@ def summarize(path, args):
     summary["avg_gbps"] = float(sum_sent.get("bits_per_second") or 0.0) / 1e9
     summary["retransmits"] = int(sum_sent.get("retransmits") or 0)
     sum_received = end.get("sum_received") or {}
-    summary["udp_loss_percent"] = float(
-        sum_received.get("lost_percent")
-        or sum_sent.get("lost_percent")
-        or end.get("sum", {}).get("lost_percent")
-        or 0.0
+    # Use `is not None` instead of `or` chaining — 0.0 is a valid value
+    # that `or` would treat as falsy, falling through to the wrong source.
+    def _first_defined(*sources):
+        for v in sources:
+            if v is not None:
+                return float(v)
+        return 0.0
+
+    summary["udp_loss_percent"] = _first_defined(
+        sum_received.get("lost_percent"),
+        sum_sent.get("lost_percent"),
+        end.get("sum", {}).get("lost_percent"),
     )
-    summary["udp_jitter_ms"] = float(
-        sum_received.get("jitter_ms")
-        or sum_sent.get("jitter_ms")
-        or end.get("sum", {}).get("jitter_ms")
-        or 0.0
+    summary["udp_jitter_ms"] = _first_defined(
+        sum_received.get("jitter_ms"),
+        sum_sent.get("jitter_ms"),
+        end.get("sum", {}).get("jitter_ms"),
     )
 
     full_intervals = []

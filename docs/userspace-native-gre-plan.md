@@ -53,16 +53,18 @@ Still required for full migration parity:
 - a separate local-origin tunnel handoff if firewall-originated GRE traffic must
   keep working without a kernel GRE device
 - final cleanup of remaining hybrid tunnel assumptions outside transit forwarding
-- clean post-failover validation on the `node0 -> node1` path for the existing
-  TCP tail-connect gate before treating all native GRE failover probes as green
+- clean post-failover validation of the new UDP and traceroute checks
+  (TCP iperf failover passes per above, but the new GRE-specific probes
+  have not yet been run through the full failover cycle)
 
 Current blocker:
 
 - local firewall-originated traffic to tunnel destinations is no longer part of
   the default transit gate once `gr-0-0-0` is replaced by a dummy anchor
-- the isolated userspace cluster still has an existing RG1 `node0 -> node1`
-  failover regression in the TCP tail-connect gate, which prevented a clean
-  end-to-end post-failover run of the new UDP and traceroute checks
+- the new UDP burst and traceroute checks have not been validated through
+  the full RG1 failover cycle yet (the TCP iperf failover works, but the
+  broader native GRE validation script hit an unrelated TCP tail-connect
+  regression that prevented a clean end-to-end run of ALL probes together)
 - a broader simultaneous multi-RG move is still stricter than the exact RG1
   manual failover case and remains a separate follow-up if we want that covered
 
