@@ -366,6 +366,17 @@ impl Coordinator {
         self.reconcile_calls += 1;
         self.last_reconcile_stage = "start".to_string();
         let preserved_synced_sessions = self.snapshot_shared_session_entries();
+        // Keep a healthy slow-path worker across back-to-back reconciles. The
+        // userspace helper can receive multiple snapshot refreshes during HA
+        // role changes; recreating the fixed-name TUN on every reconcile can
+        // race with teardown and leave the new owner without bpfrx-usp0.
+        let preserved_slow_path = self.slow_path.as_ref().and_then(|slow| {
+            if slow.status().active {
+                Some(slow.clone())
+            } else {
+                None
+            }
+        });
         self.stop_inner(false);
         for binding in bindings.iter_mut() {
             binding.bound = false;
@@ -419,17 +430,22 @@ impl Coordinator {
             fib_generation: snapshot.fib_generation,
         };
         self.forwarding = build_forwarding_state(snapshot);
-        self.slow_path = match SlowPathReinjector::new(DEFAULT_SLOW_PATH_TUN) {
-            Ok(reinjector) => {
-                self.last_slow_path_status = reinjector.status();
-                Some(Arc::new(reinjector))
-            }
-            Err(err) => {
-                self.last_slow_path_status = SlowPathStatus {
-                    last_error: err,
-                    ..SlowPathStatus::default()
-                };
-                None
+        self.slow_path = if let Some(slow_path) = preserved_slow_path {
+            self.last_slow_path_status = slow_path.status();
+            Some(slow_path)
+        } else {
+            match SlowPathReinjector::new(DEFAULT_SLOW_PATH_TUN) {
+                Ok(reinjector) => {
+                    self.last_slow_path_status = reinjector.status();
+                    Some(Arc::new(reinjector))
+                }
+                Err(err) => {
+                    self.last_slow_path_status = SlowPathStatus {
+                        last_error: err,
+                        ..SlowPathStatus::default()
+                    };
+                    None
+                }
             }
         };
         let forwarding = Arc::new(self.forwarding.clone());
