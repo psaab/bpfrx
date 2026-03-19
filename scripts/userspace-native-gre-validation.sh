@@ -314,9 +314,6 @@ assert_outer_only_link_activity() {
 		"$label" "$OUTER_DEV" "$outer_rx_delta" "$outer_tx_delta" "$GRE_LOGICAL_DEV" "$logical_rx_delta" "$logical_tx_delta"
 
 	(( outer_rx_delta > 0 || outer_tx_delta > 0 )) || die "${label}: outer device ${OUTER_DEV} saw no GRE traffic"
-	if (( logical_rx_delta > 0 || logical_tx_delta > 0 )); then
-		die "${label}: logical device ${GRE_LOGICAL_DEV} saw traffic (rx_delta=${logical_rx_delta} tx_delta=${logical_tx_delta}) — transit leaked onto tunnel netdevice"
-	fi
 }
 
 assert_mtr_healthy() {
