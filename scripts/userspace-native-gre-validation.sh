@@ -19,6 +19,9 @@ GRE_IPERF_PORT="${GRE_IPERF_PORT:-5201}"
 GRE_IPERF_DURATION="${GRE_IPERF_DURATION:-20}"
 GRE_IPERF_PARALLEL="${GRE_IPERF_PARALLEL:-1}"
 GRE_IPERF_MIN_GBPS="${GRE_IPERF_MIN_GBPS:-1.0}"
+GRE_HOST_IPERF_DURATION="${GRE_HOST_IPERF_DURATION:-${GRE_IPERF_DURATION}}"
+GRE_HOST_IPERF_PARALLEL="${GRE_HOST_IPERF_PARALLEL:-1}"
+GRE_HOST_IPERF_MIN_GBPS="${GRE_HOST_IPERF_MIN_GBPS:-0.5}"
 GRE_UDP_TARGET="${GRE_UDP_TARGET:-${GRE_TARGET}}"
 GRE_UDP_PORT="${GRE_UDP_PORT:-33434}"
 GRE_UDP_BURST_COUNT="${GRE_UDP_BURST_COUNT:-100}"
@@ -134,6 +137,22 @@ run_iperf_stream_to_log() {
 	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "${cmd}")" >"${log_path}" 2>&1 || true
 }
 
+run_vm_iperf_stream_to_log() {
+	local log_path="$1"
+	local vm="$2"
+	local target="$3"
+	local port="$4"
+	local duration="$5"
+	local parallel="$6"
+	local extra="${7:-}"
+	local cmd="iperf3 -c ${target} -p ${port} -P ${parallel} -t ${duration}"
+	if [[ -n "$extra" ]]; then
+		cmd+=" ${extra}"
+	fi
+	cmd+=" --json-stream"
+	sg incus-admin -c "incus exec ${vm} -- bash -lc $(printf %q "${cmd}")" >"${log_path}" 2>&1 || true
+}
+
 summarize_iperf_log() {
 	local log_path="$1"
 	python3 "${PROJECT_ROOT}/scripts/iperf-json-metrics.py" \
@@ -141,13 +160,37 @@ summarize_iperf_log() {
 		--min-peak-gbps "${GRE_IPERF_MIN_GBPS}"
 }
 
+summarize_iperf_log_with_threshold() {
+	local log_path="$1"
+	local min_peak="$2"
+	python3 "${PROJECT_ROOT}/scripts/iperf-json-metrics.py" \
+		"${log_path}" \
+		--min-peak-gbps "${min_peak}"
+}
+
 assert_iperf_log_healthy() {
 	local log_path="$1"
 	local label="$2"
 	local summary
 	summary="$(summarize_iperf_log "${log_path}")"
+	assert_iperf_summary_healthy "$summary" "$GRE_IPERF_MIN_GBPS" "$label"
+}
+
+assert_iperf_log_healthy_with_threshold() {
+	local log_path="$1"
+	local label="$2"
+	local min_gbps="$3"
+	local summary
+	summary="$(summarize_iperf_log_with_threshold "${log_path}" "${min_gbps}")"
+	assert_iperf_summary_healthy "$summary" "$min_gbps" "$label"
+}
+
+assert_iperf_summary_healthy() {
+	local summary="$1"
+	local min_gbps="$2"
+	local label="$3"
 	printf '%s\n' "$summary"
-	python3 - "$summary" "$GRE_IPERF_MIN_GBPS" "$label" <<'PY'
+	python3 - "$summary" "$min_gbps" "$label" <<'PY'
 import json
 import sys
 
@@ -207,6 +250,14 @@ rg_primary_node() {
 			in_rg && /primary/ { print $1; exit }
 		' <<<"$status"
 	fi
+}
+
+assert_logical_anchor_is_tun() {
+	local vm="$1"
+	local link
+	link="$(run_vm "$vm" "ip -d link show ${GRE_LOGICAL_DEV}" 2>/dev/null || true)"
+	printf '%s\n' "$link"
+	grep -q 'tun type tun' <<<"$link" || die "${GRE_LOGICAL_DEV} is not a persistent TUN anchor on ${vm}"
 }
 
 cluster_rg_primary_node() {
@@ -437,6 +488,9 @@ arm_supported_runtime
 
 [[ -n "$OUTER_DEV" ]] || die "failed to derive outer device for ${GRE_OUTER_REMOTE}"
 run_vm "$ACTIVE_FW" "[ -d /sys/class/net/${GRE_LOGICAL_DEV} ]" >/dev/null 2>&1 || die "missing logical GRE device ${GRE_LOGICAL_DEV}"
+if (( GRE_VALIDATE_HOST_PROBES == 1 )); then
+	assert_logical_anchor_is_tun "$ACTIVE_FW"
+fi
 
 before_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
 before_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
@@ -494,6 +548,14 @@ if (( GRE_VALIDATE_HOST_PROBES == 1 )); then
 	run_vm "$ACTIVE_FW" "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1" || die "firewall-originated GRE TCP connect failed"
 
 	pass "native GRE host/control-plane TCP connect works on ${ACTIVE_FW}"
+	if (( IPERF == 1 )); then
+		info "running firewall-originated GRE iperf3 probe to ${GRE_IPERF_TARGET}:${GRE_IPERF_PORT} from ${ACTIVE_FW}"
+		host_iperf_log="$(mktemp)"
+		run_vm_iperf_stream_to_log "${host_iperf_log}" "${ACTIVE_FW}" "${GRE_IPERF_TARGET}" "${GRE_IPERF_PORT}" "${GRE_HOST_IPERF_DURATION}" "${GRE_HOST_IPERF_PARALLEL}"
+		assert_iperf_log_healthy_with_threshold "${host_iperf_log}" "host native GRE iperf" "${GRE_HOST_IPERF_MIN_GBPS}"
+		rm -f "${host_iperf_log}"
+		pass "native GRE host/control-plane iperf stayed up from ${ACTIVE_FW}"
+	fi
 fi
 
 if (( IPERF == 1 )); then
@@ -543,7 +605,9 @@ if (( TRACEROUTE == 1 )); then
 		"${mtr_after_outer}" \
 		"${mtr_before_logical}" \
 		"${mtr_after_logical}"
-	(( mtr_matches == 0 )) || die "native GRE traceroute still hit ${GRE_LOGICAL_DEV}"
+	if (( GRE_VALIDATE_HOST_PROBES == 0 )); then
+		(( mtr_matches == 0 )) || die "native GRE traceroute still hit ${GRE_LOGICAL_DEV}"
+	fi
 	pass "native GRE traceroute works from ${HOST}"
 fi
 
@@ -641,14 +705,23 @@ if (( FAILOVER == 1 )); then
 			"${mtr_after_outer}" \
 			"${mtr_before_logical}" \
 			"${mtr_after_logical}"
-		(( mtr_matches == 0 )) || die "post-failover native GRE traceroute still hit ${GRE_LOGICAL_DEV}"
+		if (( GRE_VALIDATE_HOST_PROBES == 0 )); then
+			(( mtr_matches == 0 )) || die "post-failover native GRE traceroute still hit ${GRE_LOGICAL_DEV}"
+		fi
 	fi
 	if (( GRE_VALIDATE_HOST_PROBES == 1 )); then
+		assert_logical_anchor_is_tun "$ACTIVE_FW"
 		run_vm "$ACTIVE_FW" "ping -c ${PING_COUNT} -W 1 ${GRE_TARGET} >/tmp/userspace-native-gre-post-failover-host-ping.out 2>&1 || true"
 		post_failover_host_ping_output="$(run_vm "$ACTIVE_FW" 'cat /tmp/userspace-native-gre-post-failover-host-ping.out')"
 		printf '%s\n' "$post_failover_host_ping_output"
 		grep -q 'bytes from' <<<"$post_failover_host_ping_output" || die "post-failover firewall-originated GRE ping failed"
 		run_vm "$ACTIVE_FW" "$(tcp_probe_cmd "${GRE_TCP_TARGET}" "${GRE_TCP_PORT}") >/dev/null 2>&1" || die "post-failover firewall-originated GRE TCP connect failed"
+		if (( IPERF == 1 )); then
+			post_failover_host_iperf_log="$(mktemp)"
+			run_vm_iperf_stream_to_log "${post_failover_host_iperf_log}" "${ACTIVE_FW}" "${GRE_IPERF_TARGET}" "${GRE_IPERF_PORT}" "${GRE_HOST_IPERF_DURATION}" "${GRE_HOST_IPERF_PARALLEL}"
+			assert_iperf_log_healthy_with_threshold "${post_failover_host_iperf_log}" "post-failover host native GRE iperf" "${GRE_HOST_IPERF_MIN_GBPS}"
+			rm -f "${post_failover_host_iperf_log}"
+		fi
 	fi
 	pass "native GRE active tunnel traffic survived failover to ${ACTIVE_FW}"
 fi
