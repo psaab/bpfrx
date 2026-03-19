@@ -659,6 +659,48 @@ func TestBuildTunnelEndpointSnapshotsUsesConfiguredTransportTable(t *testing.T) 
 	}
 }
 
+func TestBuildTunnelEndpointSnapshotsDerivesRGFromTunnelSourceAddress(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"gr-0/0/0": {
+			Name: "gr-0/0/0",
+			Units: map[int]*config.InterfaceUnit{
+				0: {Number: 0},
+			},
+			Tunnel: &config.TunnelConfig{
+				Name:        "gr-0-0-0",
+				Mode:        "gre",
+				Source:      "2001:559:8585:80::8",
+				Destination: "2602:ffd3:0:2::7",
+			},
+		},
+	}
+	endpoints := buildTunnelEndpointSnapshots(cfg, []InterfaceSnapshot{
+		{
+			Name:      "gr-0/0/0.0",
+			Zone:      "sfmix",
+			LinuxName: "gr-0-0-0",
+			Ifindex:   1116,
+			MTU:       1500,
+		},
+		{
+			Name:            "reth0.80",
+			LinuxName:       "ge-7-0-2",
+			Ifindex:         12,
+			RedundancyGroup: 1,
+			Addresses: []InterfaceAddressSnapshot{
+				{Family: "inet6", Address: "2001:559:8585:80::8/64"},
+			},
+		},
+	})
+	if len(endpoints) != 1 {
+		t.Fatalf("len(endpoints) = %d, want 1", len(endpoints))
+	}
+	if endpoints[0].RedundancyGroup != 1 {
+		t.Fatalf("endpoint RG = %d, want 1", endpoints[0].RedundancyGroup)
+	}
+}
+
 func TestBuildLocalAddressEntries(t *testing.T) {
 	snapshot := &ConfigSnapshot{
 		Interfaces: []InterfaceSnapshot{

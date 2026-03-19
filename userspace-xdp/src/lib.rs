@@ -695,17 +695,21 @@ fn classify_native_gre_inner_ipv4(data: usize, data_end: usize, l3_offset: usize
     if dnat_lookup_v4(protocol, dst_v4, dnat_port).is_some() {
         return USERSPACE_SESSION_ACTION_REDIRECT;
     }
+    // Native GRE owns inner-packet delivery. When the inner destination is a
+    // tunnel-local/control-plane address, passing the outer GRE packet to the
+    // kernel no longer works once the kernel GRE device has been replaced by a
+    // logical anchor. Keep these packets on the userspace dataplane instead.
     if protocol == PROTO_ICMP
         && icmp_type == 8
         && unsafe { USERSPACE_INTERFACE_NAT_V4.get(&dst_v4) }.is_some()
     {
-        return USERSPACE_SESSION_ACTION_PASS_TO_KERNEL;
+        return USERSPACE_SESSION_ACTION_REDIRECT;
     }
     if unsafe { USERSPACE_INTERFACE_NAT_V4.get(&dst_v4) }.is_some() {
-        return USERSPACE_SESSION_ACTION_PASS_TO_KERNEL;
+        return USERSPACE_SESSION_ACTION_REDIRECT;
     }
     if unsafe { USERSPACE_LOCAL_V4.get(&dst_v4) }.is_some() {
-        return USERSPACE_SESSION_ACTION_PASS_TO_KERNEL;
+        return USERSPACE_SESSION_ACTION_REDIRECT;
     }
     0
 }
@@ -795,13 +799,13 @@ fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize
         && icmp_type == 128
         && unsafe { USERSPACE_INTERFACE_NAT_V6.get(&dst_key) }.is_some()
     {
-        return USERSPACE_SESSION_ACTION_PASS_TO_KERNEL;
+        return USERSPACE_SESSION_ACTION_REDIRECT;
     }
     if unsafe { USERSPACE_INTERFACE_NAT_V6.get(&dst_key) }.is_some() {
-        return USERSPACE_SESSION_ACTION_PASS_TO_KERNEL;
+        return USERSPACE_SESSION_ACTION_REDIRECT;
     }
     if unsafe { USERSPACE_LOCAL_V6.get(&dst_key) }.is_some() {
-        return USERSPACE_SESSION_ACTION_PASS_TO_KERNEL;
+        return USERSPACE_SESSION_ACTION_REDIRECT;
     }
     0
 }
@@ -840,7 +844,11 @@ fn record_trace(
     reason: u32,
     parsed: &ParsedPacket,
 ) {
-    if (ctrl_flags & USERSPACE_CTRL_FLAG_TRACE) == 0 {
+    let forced = matches!(
+        stage,
+        USERSPACE_TRACE_STAGE_BINDING_MISSING | USERSPACE_TRACE_STAGE_EARLY_FILTER
+    );
+    if !forced && (ctrl_flags & USERSPACE_CTRL_FLAG_TRACE) == 0 {
         return;
     }
     if matches!(parsed.protocol, PROTO_ICMP | PROTO_ICMPV6) {
@@ -863,7 +871,11 @@ fn record_trace(
         src_addr: parsed.src_addr,
         dst_addr: parsed.dst_addr,
     };
-    let _ = unsafe { USERSPACE_TRACE.insert(&ingress_ifindex, &value, 0) };
+    let trace_key = ingress_ifindex
+        ^ ((parsed.protocol as u32) << 24)
+        ^ ((parsed.flow_src_port as u32) << 8)
+        ^ (parsed.flow_dst_port as u32);
+    let _ = USERSPACE_TRACE.insert(&trace_key, &value, 0);
 }
 
 fn pass_to_kernel_or_abort() -> u32 {
