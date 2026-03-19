@@ -7,6 +7,8 @@ ENV_FILE="${BPFRX_CLUSTER_ENV:-${PROJECT_ROOT}/test/incus/loss-userspace-cluster
 DEPLOY=0
 FAILOVER=0
 IPERF=0
+UDP=0
+TRACEROUTE=0
 GRE_TARGET="${GRE_TARGET:-10.255.192.41}"
 GRE_TCP_TARGET="${GRE_TCP_TARGET:-${GRE_TARGET}}"
 GRE_TCP_PORT="${GRE_TCP_PORT:-22}"
@@ -15,6 +17,13 @@ GRE_IPERF_PORT="${GRE_IPERF_PORT:-5201}"
 GRE_IPERF_DURATION="${GRE_IPERF_DURATION:-20}"
 GRE_IPERF_PARALLEL="${GRE_IPERF_PARALLEL:-1}"
 GRE_IPERF_MIN_GBPS="${GRE_IPERF_MIN_GBPS:-1.0}"
+GRE_UDP_TARGET="${GRE_UDP_TARGET:-${GRE_TARGET}}"
+GRE_UDP_PORT="${GRE_UDP_PORT:-33434}"
+GRE_UDP_BURST_COUNT="${GRE_UDP_BURST_COUNT:-100}"
+GRE_UDP_INTERVAL_MS="${GRE_UDP_INTERVAL_MS:-10}"
+GRE_UDP_PAYLOAD_SIZE="${GRE_UDP_PAYLOAD_SIZE:-256}"
+GRE_TRACEROUTE_TARGET="${GRE_TRACEROUTE_TARGET:-${GRE_TARGET}}"
+GRE_TRACEROUTE_MAX_HOPS="${GRE_TRACEROUTE_MAX_HOPS:-4}"
 GRE_VALIDATE_HOST_PROBES="${GRE_VALIDATE_HOST_PROBES:-0}"
 GRE_OUTER_REMOTE="${GRE_OUTER_REMOTE:-2602:ffd3:0:2::7}"
 GRE_LOGICAL_DEV="${GRE_LOGICAL_DEV:-gr-0-0-0}"
@@ -30,6 +39,8 @@ while [[ $# -gt 0 ]]; do
 	--deploy) DEPLOY=1 ;;
 	--failover) FAILOVER=1 ;;
 	--iperf) IPERF=1 ;;
+	--udp) UDP=1 ;;
+	--traceroute) TRACEROUTE=1 ;;
 	--env) ENV_FILE="$2"; shift ;;
 	--target) GRE_TARGET="$2"; shift ;;
 	--outer-remote) GRE_OUTER_REMOTE="$2"; shift ;;
@@ -68,7 +79,13 @@ run_iperf_stream_to_log() {
 	local port="$3"
 	local duration="$4"
 	local parallel="$5"
-	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "iperf3 -c ${target} -p ${port} -P ${parallel} -t ${duration} --json-stream")" >"${log_path}" 2>&1 || true
+	local extra="${6:-}"
+	local cmd="iperf3 -c ${target} -p ${port} -P ${parallel} -t ${duration}"
+	if [[ -n "$extra" ]]; then
+		cmd+=" ${extra}"
+	fi
+	cmd+=" --json-stream"
+	sg incus-admin -c "incus exec ${HOST} -- bash -lc $(printf %q "${cmd}")" >"${log_path}" 2>&1 || true
 }
 
 summarize_iperf_log() {
@@ -253,10 +270,70 @@ read_link_packets() {
 	run_vm "$vm" "printf '%s %s\n' \$(cat /sys/class/net/${dev}/statistics/rx_packets) \$(cat /sys/class/net/${dev}/statistics/tx_packets)"
 }
 
+assert_outer_only_link_activity() {
+	local label="$1"
+	local before_outer="$2"
+	local after_outer="$3"
+	local before_logical="$4"
+	local after_logical="$5"
+
+	local outer_rx_before outer_tx_before outer_rx_after outer_tx_after
+	local logical_rx_before logical_tx_before logical_rx_after logical_tx_after
+	read -r outer_rx_before outer_tx_before <<<"$before_outer"
+	read -r outer_rx_after outer_tx_after <<<"$after_outer"
+	read -r logical_rx_before logical_tx_before <<<"$before_logical"
+	read -r logical_rx_after logical_tx_after <<<"$after_logical"
+
+	local outer_rx_delta=$((outer_rx_after - outer_rx_before))
+	local outer_tx_delta=$((outer_tx_after - outer_tx_before))
+	local logical_rx_delta=$((logical_rx_after - logical_rx_before))
+	local logical_tx_delta=$((logical_tx_after - logical_tx_before))
+
+	printf '%s outer_dev=%s outer_rx_delta=%d outer_tx_delta=%d logical_dev=%s logical_rx_delta=%d logical_tx_delta=%d\n' \
+		"$label" "$OUTER_DEV" "$outer_rx_delta" "$outer_tx_delta" "$GRE_LOGICAL_DEV" "$logical_rx_delta" "$logical_tx_delta"
+
+	(( outer_rx_delta > 0 || outer_tx_delta > 0 )) || die "${label}: outer device ${OUTER_DEV} saw no GRE traffic"
+}
+
+assert_mtr_healthy() {
+	local output="$1"
+	local target="$2"
+	printf '%s\n' "$output"
+	grep -q "  1.|-- " <<<"$output" || die "native GRE traceroute: missing first hop"
+	grep -q "  2.|-- ${target}" <<<"$output" || die "native GRE traceroute: destination ${target} did not resolve"
+}
+
+run_udp_burst_probe() {
+	local target="$1"
+	local port="$2"
+	local count="$3"
+	local interval_ms="$4"
+	local payload_size="$5"
+	run_host "python3 - <<'PY'
+import socket
+import time
+
+target = ${target@Q}
+port = int(${port@Q})
+count = int(${count@Q})
+interval_ms = int(${interval_ms@Q})
+payload_size = int(${payload_size@Q})
+payload = (b'BPFRX-GRE-UDP-' + b'X' * max(0, payload_size - 14))[:payload_size]
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for _ in range(count):
+    sock.sendto(payload, (target, port))
+    if interval_ms > 0:
+        time.sleep(interval_ms / 1000.0)
+sock.close()
+PY"
+}
+
 start_logical_transit_capture() {
 	local vm="$1"
 	local outfile="$2"
-	run_vm "$vm" "rm -f ${outfile}; nohup sh -c \"timeout 6 tcpdump -n -i ${GRE_LOGICAL_DEV} -vv 'icmp and host ${GRE_TARGET} and icmp[4:2] == ${TRANSIT_PING_ID}' >${outfile} 2>&1\" >/dev/null 2>&1 &"
+	local filter="$3"
+	run_vm "$vm" "rm -f ${outfile}; nohup sh -c \"timeout 6 tcpdump -n -i ${GRE_LOGICAL_DEV} -vv '${filter}' >${outfile} 2>&1\" >/dev/null 2>&1 &"
 }
 
 logical_transit_matches() {
@@ -265,7 +342,7 @@ logical_transit_matches() {
 	local capture
 	capture="$(run_vm "$vm" "cat ${outfile} 2>/dev/null || true")"
 	printf '%s\n' "$capture" >&2
-	grep -c 'ICMP echo' <<<"$capture" || true
+	grep -cE '^[0-9:.]+ (IP|IP6) ' <<<"$capture" || true
 }
 
 if (( DEPLOY == 1 )); then
@@ -308,7 +385,7 @@ run_vm "$ACTIVE_FW" "[ -d /sys/class/net/${GRE_LOGICAL_DEV} ]" >/dev/null 2>&1 |
 before_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
 before_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
 logical_capture_file="/tmp/userspace-native-gre-logical-capture.out"
-start_logical_transit_capture "$ACTIVE_FW" "$logical_capture_file"
+start_logical_transit_capture "$ACTIVE_FW" "$logical_capture_file" "icmp and host ${GRE_TARGET} and icmp[4:2] == ${TRANSIT_PING_ID}"
 
 info "running GRE transit probe to ${GRE_TARGET} from ${HOST}"
 run_host "ping -c ${PING_COUNT} -W 1 -e ${TRANSIT_PING_ID} ${GRE_TARGET} >/tmp/userspace-native-gre-ping.out 2>&1 || true"
@@ -375,6 +452,48 @@ if (( IPERF == 1 )); then
 	pass "native GRE iperf stayed up from ${HOST}"
 fi
 
+if (( UDP == 1 )); then
+	info "running GRE UDP probe to ${GRE_UDP_TARGET}:${GRE_UDP_PORT} from ${HOST}"
+	udp_before_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
+	udp_before_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
+	udp_capture_file="/tmp/userspace-native-gre-udp-capture.out"
+	start_logical_transit_capture "$ACTIVE_FW" "$udp_capture_file" "udp and host ${GRE_UDP_TARGET} and port ${GRE_UDP_PORT}"
+	run_udp_burst_probe "${GRE_UDP_TARGET}" "${GRE_UDP_PORT}" "${GRE_UDP_BURST_COUNT}" "${GRE_UDP_INTERVAL_MS}" "${GRE_UDP_PAYLOAD_SIZE}"
+	sleep 2
+	udp_after_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
+	udp_after_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
+	udp_matches="$(logical_transit_matches "$ACTIVE_FW" "$udp_capture_file")"
+	assert_outer_only_link_activity \
+		"steady_native_gre_udp" \
+		"${udp_before_outer}" \
+		"${udp_after_outer}" \
+		"${udp_before_logical}" \
+		"${udp_after_logical}"
+	(( udp_matches == 0 )) || die "native GRE UDP probe still hit ${GRE_LOGICAL_DEV}"
+	pass "native GRE UDP transit stayed on ${OUTER_DEV} and off ${GRE_LOGICAL_DEV}"
+fi
+
+if (( TRACEROUTE == 1 )); then
+	info "running GRE traceroute probe to ${GRE_TRACEROUTE_TARGET} from ${HOST}"
+	mtr_before_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
+	mtr_before_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
+	mtr_capture_file="/tmp/userspace-native-gre-mtr-capture.out"
+	start_logical_transit_capture "$ACTIVE_FW" "$mtr_capture_file" "icmp and host ${GRE_TRACEROUTE_TARGET}"
+	mtr_output="$(run_host "mtr -n ${GRE_TRACEROUTE_TARGET} --report --report-cycles=1 --max-ttl ${GRE_TRACEROUTE_MAX_HOPS}" || true)"
+	assert_mtr_healthy "$mtr_output" "${GRE_TRACEROUTE_TARGET}"
+	mtr_after_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
+	mtr_after_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
+	mtr_matches="$(logical_transit_matches "$ACTIVE_FW" "$mtr_capture_file")"
+	assert_outer_only_link_activity \
+		"steady_native_gre_mtr" \
+		"${mtr_before_outer}" \
+		"${mtr_after_outer}" \
+		"${mtr_before_logical}" \
+		"${mtr_after_logical}"
+	(( mtr_matches == 0 )) || die "native GRE traceroute still hit ${GRE_LOGICAL_DEV}"
+	pass "native GRE traceroute works from ${HOST}"
+fi
+
 if (( FAILOVER == 1 )); then
 	current_node="$PREFERRED_ACTIVE_NODE"
 	failover_node=0
@@ -432,6 +551,44 @@ if (( FAILOVER == 1 )); then
 	if [[ -n "$failover_iperf_log" ]]; then
 		assert_iperf_log_healthy "${failover_iperf_log}" "failover native GRE iperf"
 		rm -f "${failover_iperf_log}"
+	fi
+	if (( UDP == 1 )); then
+		info "running post-failover GRE UDP probe to ${GRE_UDP_TARGET}:${GRE_UDP_PORT} from ${HOST}"
+		udp_before_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
+		udp_before_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
+		udp_capture_file="/tmp/userspace-native-gre-post-failover-udp-capture.out"
+		start_logical_transit_capture "$ACTIVE_FW" "$udp_capture_file" "udp and host ${GRE_UDP_TARGET} and port ${GRE_UDP_PORT}"
+		run_udp_burst_probe "${GRE_UDP_TARGET}" "${GRE_UDP_PORT}" "${GRE_UDP_BURST_COUNT}" "${GRE_UDP_INTERVAL_MS}" "${GRE_UDP_PAYLOAD_SIZE}"
+		sleep 2
+		udp_after_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
+		udp_after_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
+		udp_matches="$(logical_transit_matches "$ACTIVE_FW" "$udp_capture_file")"
+		assert_outer_only_link_activity \
+			"post_failover_native_gre_udp" \
+			"${udp_before_outer}" \
+			"${udp_after_outer}" \
+			"${udp_before_logical}" \
+			"${udp_after_logical}"
+		(( udp_matches == 0 )) || die "post-failover native GRE UDP probe still hit ${GRE_LOGICAL_DEV}"
+	fi
+	if (( TRACEROUTE == 1 )); then
+		info "running post-failover GRE traceroute probe to ${GRE_TRACEROUTE_TARGET} from ${HOST}"
+		mtr_before_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
+		mtr_before_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
+		mtr_capture_file="/tmp/userspace-native-gre-post-failover-mtr-capture.out"
+		start_logical_transit_capture "$ACTIVE_FW" "$mtr_capture_file" "icmp and host ${GRE_TRACEROUTE_TARGET}"
+		mtr_output="$(run_host "mtr -n ${GRE_TRACEROUTE_TARGET} --report --report-cycles=1 --max-ttl ${GRE_TRACEROUTE_MAX_HOPS}" || true)"
+		assert_mtr_healthy "$mtr_output" "${GRE_TRACEROUTE_TARGET}"
+		mtr_after_outer="$(read_link_packets "$ACTIVE_FW" "$OUTER_DEV")"
+		mtr_after_logical="$(read_link_packets "$ACTIVE_FW" "$GRE_LOGICAL_DEV")"
+		mtr_matches="$(logical_transit_matches "$ACTIVE_FW" "$mtr_capture_file")"
+		assert_outer_only_link_activity \
+			"post_failover_native_gre_mtr" \
+			"${mtr_before_outer}" \
+			"${mtr_after_outer}" \
+			"${mtr_before_logical}" \
+			"${mtr_after_logical}"
+		(( mtr_matches == 0 )) || die "post-failover native GRE traceroute still hit ${GRE_LOGICAL_DEV}"
 	fi
 	if (( GRE_VALIDATE_HOST_PROBES == 1 )); then
 		run_vm "$ACTIVE_FW" "ping -c ${PING_COUNT} -W 1 ${GRE_TARGET} >/tmp/userspace-native-gre-post-failover-host-ping.out 2>&1 || true"
