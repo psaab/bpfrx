@@ -210,6 +210,16 @@ func (m *Manager) ApplyTunnels(tunnels []*config.TunnelConfig) error {
 	}
 
 	for _, tc := range tunnels {
+		if existing, err := m.nlHandle.LinkByName(tc.Name); err == nil {
+			if err := m.nlHandle.LinkDel(existing); err != nil {
+				slog.Warn("failed to replace existing tunnel link",
+					"name", tc.Name, "existing_type", existing.Type(), "err", err)
+				continue
+			}
+			slog.Info("removed existing tunnel link before apply",
+				"name", tc.Name, "existing_type", existing.Type())
+		}
+
 		if tc.AnchorOnly {
 			anchor := &netlink.Dummy{
 				LinkAttrs: netlink.LinkAttrs{Name: tc.Name},
