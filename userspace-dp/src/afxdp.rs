@@ -5272,7 +5272,7 @@ fn local_tunnel_source_loop(
     stop: Arc<AtomicBool>,
 ) {
     let mut tun = match open_tun(&tunnel_name) {
-        Ok(file) => file,
+        Ok((file, _actual_name)) => file,
         Err(err) => {
             record_local_tunnel_exception(&recent_exceptions, &tunnel_name, err);
             return;

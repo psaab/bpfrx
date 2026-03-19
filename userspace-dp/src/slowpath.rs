@@ -239,7 +239,7 @@ impl SlowPathReinjector {
 }
 
 fn slow_path_worker(name: &str, rx: Receiver<PacketRequest>, status: Arc<SharedStatus>) {
-    let tun = match open_tun(name) {
+    let (tun, actual_name) = match open_tun(name) {
         Ok(v) => v,
         Err(err) => {
             status.set_last_error(err);
@@ -247,7 +247,7 @@ fn slow_path_worker(name: &str, rx: Receiver<PacketRequest>, status: Arc<SharedS
             return;
         }
     };
-    status.set_device_name(name);
+    status.set_device_name(&actual_name);
     status.active.store(true, Ordering::Relaxed);
 
     let mut mode = match IoUring::new(256) {
@@ -346,7 +346,7 @@ fn write_packet_io_uring(ring: &mut IoUring, fd: i32, bytes: &[u8]) -> Result<()
     Ok(())
 }
 
-pub(crate) fn open_tun(name: &str) -> Result<std::fs::File, String> {
+pub(crate) fn open_tun(name: &str) -> Result<(std::fs::File, String), String> {
     let tun = OpenOptions::new()
         .read(true)
         .write(true)
@@ -367,7 +367,7 @@ pub(crate) fn open_tun(name: &str) -> Result<std::fs::File, String> {
     // reverse route still points at the real egress interface. Disable
     // per-device rp_filter so the kernel accepts those packets.
     set_ipv4_sysctl(&actual_name, "rp_filter", "0")?;
-    Ok(tun)
+    Ok((tun, actual_name))
 }
 
 fn set_if_up(name: &str) -> Result<(), String> {

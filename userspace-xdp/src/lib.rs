@@ -871,10 +871,15 @@ fn record_trace(
         src_addr: parsed.src_addr,
         dst_addr: parsed.dst_addr,
     };
+    // Keep the key in u32 for the BPF map, but avoid overlapping the two port
+    // fields directly. Mix each component into a separate avalanche step so
+    // distinct (src_port, dst_port) pairs do not alias trivially.
     let trace_key = ingress_ifindex
-        ^ ((parsed.protocol as u32) << 24)
-        ^ ((parsed.flow_src_port as u32) << 8)
-        ^ (parsed.flow_dst_port as u32);
+        .wrapping_mul(0x9e37_79b1)
+        .rotate_left(5)
+        ^ ((((parsed.protocol as u32) << 16) | (parsed.flow_src_port as u32))
+            .wrapping_mul(0x85eb_ca6b))
+        ^ ((parsed.flow_dst_port as u32).wrapping_mul(0xc2b2_ae35));
     let _ = USERSPACE_TRACE.insert(&trace_key, &value, 0);
 }
 
