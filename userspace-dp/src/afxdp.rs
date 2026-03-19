@@ -14,7 +14,7 @@ use crate::session::{
     ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
     SessionLookup, SessionMetadata, SessionTable, forward_wire_key, reverse_canonical_key,
 };
-use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus};
+use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus, open_tun};
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use core::ffi::{c_int, c_void};
@@ -23,8 +23,9 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::CString;
-use std::io;
+use std::io::{self, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::os::fd::AsRawFd;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -211,6 +212,7 @@ pub struct Coordinator {
     heartbeat_map_fd: Option<OwnedFd>,
     session_map_fd: Option<OwnedFd>,
     slow_path: Option<Arc<SlowPathReinjector>>,
+    tunnel_sources: BTreeMap<u16, LocalTunnelSourceHandle>,
     last_slow_path_status: SlowPathStatus,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
@@ -239,6 +241,7 @@ impl Coordinator {
             heartbeat_map_fd: None,
             session_map_fd: None,
             slow_path: None,
+            tunnel_sources: BTreeMap::new(),
             last_slow_path_status: SlowPathStatus::default(),
             ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
@@ -268,6 +271,15 @@ impl Coordinator {
     }
 
     fn stop_inner(&mut self, clear_synced_state: bool) {
+        for handle in self.tunnel_sources.values_mut() {
+            handle.stop.store(true, Ordering::Relaxed);
+        }
+        for (_, handle) in self.tunnel_sources.iter_mut() {
+            if let Some(join) = handle.join.take() {
+                let _ = join.join();
+            }
+        }
+        self.tunnel_sources.clear();
         for handle in self.workers.values_mut() {
             handle.stop.store(true, Ordering::Relaxed);
         }
@@ -675,7 +687,75 @@ impl Coordinator {
             self.identities.len(),
             self.live.len()
         );
+        self.spawn_local_tunnel_sources();
         self.refresh_bindings(bindings);
+    }
+
+    fn spawn_local_tunnel_sources(&mut self) {
+        for endpoint in self.forwarding.tunnel_endpoints.values() {
+            if endpoint.mode != "gre" && endpoint.mode != "ip6gre" {
+                continue;
+            }
+            let Some(tunnel_name) = self
+                .forwarding
+                .ifindex_to_name
+                .get(&endpoint.logical_ifindex)
+                .cloned()
+            else {
+                continue;
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_clone = stop.clone();
+            let forwarding = self.forwarding.clone();
+            let ha_state = self.ha_state.clone();
+            let dynamic_neighbors = self.dynamic_neighbors.clone();
+            let live = self.live.clone();
+            let identities = self.identities.clone();
+            let recent_exceptions = self.recent_exceptions.clone();
+            let tunnel_endpoint_id = endpoint.id;
+            let thread_tunnel_name = tunnel_name.clone();
+            let join = thread::Builder::new()
+                .name(format!("bpfrx-native-gre-origin-{}", tunnel_name))
+                .spawn(move || {
+                    local_tunnel_source_loop(
+                        thread_tunnel_name,
+                        tunnel_endpoint_id,
+                        forwarding,
+                        ha_state,
+                        dynamic_neighbors,
+                        live,
+                        identities,
+                        recent_exceptions,
+                        stop_clone,
+                    );
+                });
+            match join {
+                Ok(join) => {
+                    self.tunnel_sources.insert(
+                        tunnel_endpoint_id,
+                        LocalTunnelSourceHandle {
+                            stop,
+                            join: Some(join),
+                        },
+                    );
+                }
+                Err(err) => {
+                    if let Ok(mut recent) = self.recent_exceptions.lock() {
+                        push_recent_exception(
+                            &mut recent,
+                            ExceptionStatus {
+                                timestamp: Utc::now(),
+                                interface: tunnel_name,
+                                reason: format!(
+                                    "spawn_local_tunnel_source_failed:{tunnel_endpoint_id}:{err}"
+                                ),
+                                ..ExceptionStatus::default()
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
 
     pub fn recent_exceptions(&self) -> Vec<ExceptionStatus> {
@@ -1177,6 +1257,11 @@ struct WorkerHandle {
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
     commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
+    join: Option<JoinHandle<()>>,
+}
+
+struct LocalTunnelSourceHandle {
+    stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -5117,6 +5202,228 @@ fn worker_loop(
         }
     }
     heartbeat.store(monotonic_nanos(), Ordering::Relaxed);
+}
+
+fn local_tunnel_source_loop(
+    tunnel_name: String,
+    tunnel_endpoint_id: u16,
+    forwarding: ForwardingState,
+    ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
+    dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    live: BTreeMap<u32, Arc<BindingLiveState>>,
+    identities: BTreeMap<u32, BindingIdentity>,
+    recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut tun = match open_tun(&tunnel_name) {
+        Ok(file) => file,
+        Err(err) => {
+            record_local_tunnel_exception(&recent_exceptions, &tunnel_name, err);
+            return;
+        }
+    };
+    if let Err(err) = set_fd_nonblocking(tun.as_raw_fd()) {
+        record_local_tunnel_exception(&recent_exceptions, &tunnel_name, err);
+        return;
+    }
+
+    let mut packet = vec![0u8; 65_536];
+    let mut next_slot = 0usize;
+    while !stop.load(Ordering::Relaxed) {
+        match tun.read(&mut packet) {
+            Ok(0) => thread::sleep(Duration::from_millis(1)),
+            Ok(len) => {
+                let packet = &packet[..len];
+                match build_local_origin_tunnel_tx_request(
+                    packet,
+                    tunnel_endpoint_id,
+                    &forwarding,
+                    &ha_state,
+                    &dynamic_neighbors,
+                ) {
+                    Ok((tx_ifindex, req)) => {
+                        if let Some(target_live) =
+                            select_live_binding_for_ifindex(&identities, &live, tx_ifindex, next_slot)
+                        {
+                            next_slot = next_slot.wrapping_add(1);
+                            if let Err(err) = target_live.enqueue_tx(req) {
+                                record_local_tunnel_exception(
+                                    &recent_exceptions,
+                                    &tunnel_name,
+                                    format!("enqueue_local_tunnel_tx:{err}"),
+                                );
+                            }
+                        } else {
+                            record_local_tunnel_exception(
+                                &recent_exceptions,
+                                &tunnel_name,
+                                format!("no_live_binding_for_tx_ifindex:{tx_ifindex}"),
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        #[cfg(not(feature = "debug-log"))]
+                        let _ = &err;
+                        debug_log!(
+                            "LOCAL_TUNNEL[{}]: drop endpoint={} reason={}",
+                            tunnel_name,
+                            tunnel_endpoint_id,
+                            err
+                        );
+                    }
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(err) => {
+                record_local_tunnel_exception(
+                    &recent_exceptions,
+                    &tunnel_name,
+                    format!("read_local_tunnel:{err}"),
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn build_local_origin_tunnel_tx_request(
+    packet: &[u8],
+    tunnel_endpoint_id: u16,
+    forwarding: &ForwardingState,
+    ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+) -> Result<(i32, TxRequest), String> {
+    let mut meta =
+        local_origin_packet_meta(packet).ok_or_else(|| "unsupported_local_origin_packet".to_string())?;
+    let inner_frame = wrap_raw_ip_packet_for_tunnel(packet, meta.addr_family);
+    meta.l3_offset = 14;
+    meta.l4_offset = meta.l4_offset.saturating_add(14);
+    meta.payload_offset = meta.payload_offset.saturating_add(14);
+    let resolution = enforce_ha_resolution_at(
+        forwarding,
+        ha_state,
+        monotonic_nanos() / 1_000_000_000,
+        resolve_tunnel_forwarding_resolution(
+            forwarding,
+            Some(dynamic_neighbors),
+            tunnel_endpoint_id,
+            0,
+        ),
+    );
+    if resolution.disposition != ForwardingDisposition::ForwardCandidate {
+        return Err(format!(
+            "local_tunnel_resolution:{}",
+            resolution.status(None).disposition
+        ));
+    }
+    let decision = SessionDecision {
+        resolution,
+        nat: NatDecision::default(),
+    };
+    let bytes = encapsulate_native_gre_frame(&inner_frame, meta, &decision, forwarding)
+        .ok_or_else(|| "encapsulate_native_gre_frame_failed".to_string())?;
+    Ok((
+        decision.resolution.tx_ifindex,
+        TxRequest {
+            bytes,
+            expected_ports: None,
+            expected_addr_family: 0,
+            expected_protocol: 0,
+            flow_key: None,
+        },
+    ))
+}
+
+fn local_origin_packet_meta(packet: &[u8]) -> Option<UserspaceDpMeta> {
+    let version = packet.first()? >> 4;
+    let addr_family = match version {
+        4 => libc::AF_INET as u8,
+        6 => libc::AF_INET6 as u8,
+        _ => return None,
+    };
+    let (l4_offset, protocol) = packet_rel_l4_offset_and_protocol(packet, addr_family)?;
+    Some(UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l4_offset: l4_offset.min(u16::MAX as usize) as u16,
+        payload_offset: l4_offset.min(u16::MAX as usize) as u16,
+        pkt_len: packet.len().min(u16::MAX as usize) as u16,
+        addr_family,
+        protocol,
+        ..UserspaceDpMeta::default()
+    })
+}
+
+fn wrap_raw_ip_packet_for_tunnel(packet: &[u8], addr_family: u8) -> Vec<u8> {
+    let mut frame = vec![0u8; 14 + packet.len()];
+    frame[12..14].copy_from_slice(if addr_family as i32 == libc::AF_INET {
+        &[0x08, 0x00]
+    } else {
+        &[0x86, 0xdd]
+    });
+    frame[14..].copy_from_slice(packet);
+    frame
+}
+
+fn select_live_binding_for_ifindex(
+    identities: &BTreeMap<u32, BindingIdentity>,
+    live: &BTreeMap<u32, Arc<BindingLiveState>>,
+    tx_ifindex: i32,
+    next_slot: usize,
+) -> Option<Arc<BindingLiveState>> {
+    let candidates = identities
+        .values()
+        .filter_map(|identity| {
+            if identity.ifindex != tx_ifindex {
+                return None;
+            }
+            let live = live.get(&identity.slot)?;
+            live.bound.load(Ordering::Relaxed).then_some(live.clone())
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    Some(candidates[next_slot % candidates.len()].clone())
+}
+
+fn set_fd_nonblocking(fd: c_int) -> Result<(), String> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(format!(
+            "fcntl(F_GETFL) failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc < 0 {
+        return Err(format!(
+            "fcntl(F_SETFL,O_NONBLOCK) failed: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+fn record_local_tunnel_exception(
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    tunnel_name: &str,
+    reason: String,
+) {
+    if let Ok(mut recent) = recent_exceptions.lock() {
+        push_recent_exception(
+            &mut recent,
+            ExceptionStatus {
+                timestamp: Utc::now(),
+                interface: tunnel_name.to_string(),
+                reason,
+                ..ExceptionStatus::default()
+            },
+        );
+    }
 }
 
 fn push_recent_exception(
@@ -9575,6 +9882,60 @@ mod tests {
         assert_eq!(built[70], 63);
         assert_eq!(&built[74..78], &[10, 0, 61, 102]);
         assert_eq!(&built[78..82], &[8, 8, 8, 8]);
+    }
+
+    #[test]
+    fn local_origin_tunnel_tx_request_encapsulates_raw_ip_for_active_owner() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )])));
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let packet =
+            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 255, 192, 42), Ipv4Addr::new(10, 255, 192, 41), 64);
+        let (tx_ifindex, req) = build_local_origin_tunnel_tx_request(
+            &packet[14..],
+            1,
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+        )
+        .expect("local-origin tunnel tx request");
+        assert_eq!(tx_ifindex, 6);
+        assert_eq!(&req.bytes[12..16], &[0x81, 0x00, 0x00, 0x50]);
+        assert_eq!(&req.bytes[16..18], &[0x86, 0xdd]);
+        assert_eq!(req.bytes[24], PROTO_GRE);
+        assert_eq!(&req.bytes[60..62], &[0x08, 0x00]);
+        assert_eq!(&req.bytes[74..78], &[10, 255, 192, 42]);
+        assert_eq!(&req.bytes[78..82], &[10, 255, 192, 41]);
+    }
+
+    #[test]
+    fn local_origin_tunnel_tx_request_rejects_inactive_owner() {
+        let state = build_forwarding_state(&native_gre_snapshot(true));
+        let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )])));
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let packet =
+            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 255, 192, 42), Ipv4Addr::new(10, 255, 192, 41), 64);
+        let err = build_local_origin_tunnel_tx_request(
+            &packet[14..],
+            1,
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+        )
+        .expect_err("inactive owner should not originate tunnel traffic");
+        assert!(err.contains("ha_inactive"), "unexpected error: {err}");
     }
 
     #[test]
