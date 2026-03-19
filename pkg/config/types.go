@@ -1488,6 +1488,7 @@ type TunnelConfig struct {
 	RoutingInstance string   // destination routing-instance (VRF)
 	Keepalive       int      // keepalive interval in seconds (0 = disabled)
 	KeepaliveRetry  int      // number of missed keepalives before declaring down (0 = default 3)
+	AnchorOnly      bool     // create a dummy anchor instead of a kernel tunnel device
 }
 
 // TunnelNameMap returns a mapping from Junos interface reference (e.g. "gr-0/0/0.0")
