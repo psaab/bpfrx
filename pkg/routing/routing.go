@@ -230,10 +230,30 @@ func (m *Manager) ApplyTunnels(tunnels []*config.TunnelConfig) error {
 				NonPersist: false,
 			}
 			if err := m.nlHandle.LinkAdd(anchor); err != nil {
-				slog.Warn("failed to create tunnel anchor",
-					"name", tc.Name, "err", err)
-				continue
+				// Handle upgrade from dummy-anchor to TUN: if a link with
+				// this name already exists, check if it's already a TUN.
+				// If it's a different type (e.g. dummy), delete and recreate.
+				if existing, lookupErr := m.nlHandle.LinkByName(tc.Name); lookupErr == nil {
+					if _, isTun := existing.(*netlink.Tuntap); isTun {
+						slog.Info("tunnel anchor already exists as TUN, reusing",
+							"name", tc.Name)
+						goto anchorReady
+					}
+					slog.Info("replacing non-TUN tunnel anchor",
+						"name", tc.Name, "type", existing.Type())
+					_ = m.nlHandle.LinkDel(existing)
+					if retryErr := m.nlHandle.LinkAdd(anchor); retryErr != nil {
+						slog.Warn("failed to recreate tunnel anchor",
+							"name", tc.Name, "err", retryErr)
+						continue
+					}
+				} else {
+					slog.Warn("failed to create tunnel anchor",
+						"name", tc.Name, "err", err)
+					continue
+				}
 			}
+		anchorReady:
 			closeTuntapFiles(anchor.Fds)
 			if err := m.nlHandle.LinkSetUp(anchor); err != nil {
 				slog.Warn("failed to bring up tunnel anchor",
