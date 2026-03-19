@@ -310,6 +310,13 @@ cmd_create() {
 	info "Cluster environment ready. Run '$0 deploy all' to push bpfrxd."
 }
 
+cmd_refresh_vfs() {
+	for idx in 0 1; do
+		reconcile_vm_vfs "$idx"
+	done
+	info "VF reconciliation complete."
+}
+
 create_vm() {
 	local idx="$1"
 	local vm
@@ -389,6 +396,96 @@ create_vm() {
 
 	provision_vm "$vm" "$idx"
 	info "VM $vm ready."
+}
+
+reconcile_vm_vfs() {
+	local idx="$1"
+	local vm current expected was_running
+	vm=$(vm_name "$idx")
+
+	if ! incus info "$(r "$vm")" &>/dev/null 2>&1; then
+		warn "VM $vm does not exist, skipping VF reconciliation"
+		return
+	fi
+
+	if incus info "$(r "$vm")" | grep -q "^Status: RUNNING"; then
+		was_running=1
+	else
+		was_running=0
+	fi
+
+	reconcile_vm_vf_device "$idx" "$vm" wan wan-vf
+	if [[ -n "${VF_LAN_INDEX[$idx]:-}" || ${#VF_LAN_PCI[@]} -gt 0 ]]; then
+		reconcile_vm_vf_device "$idx" "$vm" lan lan-vf
+	fi
+
+	apply_vm_vf_host_state "$idx"
+
+	if [[ "$was_running" == "1" ]] && ! incus info "$(r "$vm")" | grep -q "^Status: RUNNING"; then
+		info "Starting $vm after VF reconciliation..."
+		incus start "$(r "$vm")"
+		wait_for_agent "$vm"
+	fi
+}
+
+reconcile_vm_vf_device() {
+	local idx="$1"
+	local vm="$2"
+	local kind="$3"
+	local dev_name="$4"
+	local expected current
+
+	expected=$(resolve_vm_vf_pci "$kind" "$idx")
+	current=$(incus config device get "$(r "$vm")" "$dev_name" address 2>/dev/null || true)
+
+	if [[ "$current" == "$expected" ]]; then
+		info "$vm $dev_name already points at $expected"
+		return
+	fi
+
+	info "Updating $vm $dev_name from ${current:-<unset>} to $expected..."
+	if incus info "$(r "$vm")" | grep -q "^Status: RUNNING"; then
+		incus stop "$(r "$vm")" --force
+	fi
+	incus config device remove "$(r "$vm")" "$dev_name" 2>/dev/null || true
+	incus config device add "$(r "$vm")" "$dev_name" pci address="$expected"
+}
+
+apply_vm_vf_host_state() {
+	local idx="$1"
+	local wan_pci wan_vf_idx lan_pci lan_vf_idx
+
+	if [[ -n "${SRIOV_PARENT:-}" ]]; then
+		wan_pci=$(resolve_vm_vf_pci wan "$idx")
+		wan_vf_idx=$(resolve_vm_vf_index wan "$idx" || true)
+		if [[ -z "${wan_vf_idx:-}" ]]; then
+			wan_vf_idx=$(find_vf_index_by_pci "$SRIOV_PARENT" "$wan_pci" || true)
+		fi
+		if [[ "${VF_WAN_TRUST}" == "true" && -n "${wan_vf_idx:-}" ]]; then
+			info "Applying host WAN VF trust on $SRIOV_PARENT vf $wan_vf_idx ($wan_pci)..."
+			if [[ -n "${INCUS_REMOTE:-}" ]]; then
+				ssh "$INCUS_REMOTE" "sudo ip link set dev $SRIOV_PARENT vf $wan_vf_idx trust on"
+			else
+				sudo ip link set dev "$SRIOV_PARENT" vf "$wan_vf_idx" trust on
+			fi
+		fi
+	fi
+
+	if [[ -n "${VF_LAN_VLAN:-}" && -n "${SRIOV_LAN_PARENT:-}" && (-n "${VF_LAN_INDEX[$idx]:-}" || ${#VF_LAN_PCI[@]} -gt 0) ]]; then
+		lan_pci=$(resolve_vm_vf_pci lan "$idx")
+		lan_vf_idx=$(resolve_vm_vf_index lan "$idx" || true)
+		if [[ -z "${lan_vf_idx:-}" ]]; then
+			lan_vf_idx=$(find_vf_index_by_pci "$SRIOV_LAN_PARENT" "$lan_pci" || true)
+		fi
+		if [[ -n "${lan_vf_idx:-}" ]]; then
+			info "Applying host LAN VF VLAN $VF_LAN_VLAN on $SRIOV_LAN_PARENT vf $lan_vf_idx ($lan_pci)..."
+			if [[ -n "${INCUS_REMOTE:-}" ]]; then
+				ssh "$INCUS_REMOTE" "sudo ip link set dev $SRIOV_LAN_PARENT vf $lan_vf_idx vlan $VF_LAN_VLAN"
+			else
+				sudo ip link set dev "$SRIOV_LAN_PARENT" vf "$lan_vf_idx" vlan "$VF_LAN_VLAN"
+			fi
+		fi
+	fi
 }
 
 provision_vm() {
@@ -803,13 +900,14 @@ cmd_restart() {
 # ── Main ─────────────────────────────────────────────────────────────
 
 usage() {
-	echo "Usage: $0 {init|create|destroy|deploy|ssh|status|logs|journal|start|stop|restart} [args]"
+	echo "Usage: $0 {init|create|destroy|deploy|refresh-vfs|ssh|status|logs|journal|start|stop|restart} [args]"
 	echo ""
 	echo "Commands:"
 	echo "  init                 Create networks and profile"
 	echo "  create               Launch both VMs + test container"
 	echo "  destroy              Tear down VMs + container, optionally networks/profile"
 	echo "  deploy [0|1|all]     Build bpfrxd and push to VM(s) (default: all)"
+	echo "  refresh-vfs          Reconcile VM VF PCI devices and host trust/VLAN state"
 	echo "  ssh 0|1              Shell into VM"
 	echo "  status               Show all VM/container/network status"
 	echo "  logs 0|1             Show recent bpfrxd logs for VM"
@@ -825,6 +923,7 @@ case "${1:-}" in
 	create)     cmd_create ;;
 	destroy)    cmd_destroy ;;
 	deploy)     cmd_deploy "${2:-all}" ;;
+	refresh-vfs) cmd_refresh_vfs ;;
 	ssh)        cmd_ssh "${2:-}" ;;
 	status)     cmd_status ;;
 	logs)       cmd_logs "${2:-}" ;;
