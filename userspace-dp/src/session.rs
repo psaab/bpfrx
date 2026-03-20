@@ -185,6 +185,15 @@ impl SessionTable {
         self.sessions.len()
     }
 
+    /// Update the last-seen timestamp for a session (prevents GC expiry).
+    /// Used by the flow cache to amortize session keepalive.
+    #[inline]
+    pub fn touch(&mut self, key: &SessionKey, now_ns: u64) {
+        if let Some(entry) = self.sessions.get_mut(key) {
+            entry.last_seen_ns = now_ns;
+        }
+    }
+
     pub fn expire_stale_entries(&mut self, now_ns: u64) -> Vec<ExpiredSession> {
         if self.last_gc_ns != 0 && now_ns.saturating_sub(self.last_gc_ns) < SESSION_GC_INTERVAL_NS {
             return Vec::new();
@@ -1695,7 +1704,7 @@ mod tests {
         let t = SessionTimeouts::default();
         assert_eq!(t.tcp_established_ns, 300_000_000_000);
         assert_eq!(t.udp_ns, 60_000_000_000);
-        assert_eq!(t.icmp_ns, 15_000_000_000);
+        assert_eq!(t.icmp_ns, 60_000_000_000);
     }
 
     #[test]

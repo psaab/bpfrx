@@ -22,7 +22,7 @@ pub(super) fn authoritative_forward_ports(
         None
     };
     let frame_ports = live_frame_ports_bytes(frame, meta.addr_family, meta.protocol);
-    flow_ports.or(meta_ports).or(frame_ports)
+    flow_ports.or(frame_ports).or(meta_ports)
 }
 
 #[allow(dead_code)]
@@ -440,6 +440,16 @@ pub(super) fn enqueue_pending_forwards(
                         false
                     } else if let Some(tx_offset) = direct_tx_offset {
                         let target_area = target_binding.umem.area();
+                        // Prefetch target frame to warm cache before copy.
+                        #[cfg(target_arch = "x86_64")]
+                        if let Some(pf) = target_area.slice(tx_offset as usize, 64) {
+                            unsafe {
+                                core::arch::x86_64::_mm_prefetch(
+                                    pf.as_ptr() as *const i8,
+                                    core::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
+                        }
                         let written = unsafe {
                             target_area.slice_mut_unchecked(tx_offset as usize, tx_frame_capacity())
                         }

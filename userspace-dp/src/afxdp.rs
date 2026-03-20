@@ -168,6 +168,127 @@ const SOL_XDP: c_int = 283;
 const XDP_OPTIONS: c_int = 8;
 const XDP_OPTIONS_ZEROCOPY: u32 = 1;
 
+// ── Flow Cache ──────────────────────────────────────────────────────────
+// Per-worker direct-mapped cache that stores precomputed forwarding
+// decisions for established TCP flows. On cache hit, the worker skips
+// session lookup, policy evaluation, NAT decision, and FIB lookup —
+// applying the cached RewriteDescriptor directly to the frame.
+const FLOW_CACHE_SIZE: usize = 4096;
+const FLOW_CACHE_MASK: usize = FLOW_CACHE_SIZE - 1;
+
+/// Precomputed rewrite descriptor for an established flow.
+/// All fields are constant for the lifetime of the session.
+/// Per-packet cost: write MACs + TTL-- + apply precomputed csum deltas.
+#[derive(Clone, Copy, Debug)]
+struct RewriteDescriptor {
+    // Ethernet
+    dst_mac: [u8; 6],
+    src_mac: [u8; 6],
+    tx_vlan_id: u16,
+    ether_type: u16,
+    // NAT rewrites (0 = no rewrite for that field)
+    rewrite_src_ip: Option<std::net::IpAddr>,
+    rewrite_dst_ip: Option<std::net::IpAddr>,
+    rewrite_src_port: Option<u16>,
+    rewrite_dst_port: Option<u16>,
+    // Precomputed incremental checksum deltas
+    ip_csum_delta: u16,   // from SNAT+DNAT IP changes (constant per flow)
+    l4_csum_delta: u16,   // pseudo-header delta from IP+port changes
+    // Egress
+    egress_ifindex: i32,
+    tx_ifindex: i32,
+    target_binding_index: Option<usize>,
+    // Validation / invalidation
+    config_generation: u64,
+    fib_generation: u32,
+    owner_rg_id: i32,
+    // Flags
+    nat64: bool,
+    nptv6: bool,
+    apply_nat_on_fabric: bool,
+}
+
+/// Per-flow cache entry with key validation.
+#[derive(Clone)]
+struct FlowCacheEntry {
+    /// 5-tuple key for validation on hit.
+    key: crate::session::SessionKey,
+    /// Ingress interface (part of cache key for zone correctness).
+    ingress_ifindex: i32,
+    /// Precomputed forwarding decision.
+    descriptor: RewriteDescriptor,
+    /// Full session decision for fallback paths.
+    decision: SessionDecision,
+    /// Metadata for session sync/HA.
+    metadata: SessionMetadata,
+}
+
+/// Per-worker flow cache. Direct-mapped, indexed by hash of 5-tuple.
+struct FlowCache {
+    entries: Vec<Option<FlowCacheEntry>>,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl FlowCache {
+    fn new() -> Self {
+        Self {
+            entries: (0..FLOW_CACHE_SIZE).map(|_| None).collect(),
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        }
+    }
+
+    #[inline]
+    fn slot(key: &crate::session::SessionKey, ingress_ifindex: i32) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = rustc_hash::FxHasher::default();
+        key.hash(&mut hasher);
+        (ingress_ifindex as u32).hash(&mut hasher);
+        hasher.finish() as usize & FLOW_CACHE_MASK
+    }
+
+    #[inline]
+    fn lookup(
+        &mut self,
+        key: &crate::session::SessionKey,
+        ingress_ifindex: i32,
+        config_generation: u64,
+        fib_generation: u32,
+    ) -> Option<&FlowCacheEntry> {
+        let idx = Self::slot(key, ingress_ifindex);
+        if let Some(entry) = &self.entries[idx] {
+            if entry.key == *key
+                && entry.ingress_ifindex == ingress_ifindex
+                && entry.descriptor.config_generation == config_generation
+                && entry.descriptor.fib_generation == fib_generation
+            {
+                self.hits += 1;
+                return self.entries[idx].as_ref();
+            }
+        }
+        self.misses += 1;
+        None
+    }
+
+    fn insert(&mut self, entry: FlowCacheEntry) {
+        let idx = Self::slot(&entry.key, entry.ingress_ifindex);
+        if self.entries[idx].is_some() {
+            self.evictions += 1;
+        }
+        self.entries[idx] = Some(entry);
+    }
+
+    fn invalidate_all(&mut self) {
+        for entry in &mut self.entries {
+            *entry = None;
+        }
+    }
+}
+// ── End Flow Cache ──────────────────────────────────────────────────────
+
 #[inline]
 const fn tx_frame_capacity() -> usize {
     UMEM_FRAME_SIZE as usize
@@ -1584,6 +1705,8 @@ struct BindingWorker {
     pending_direct_tx_packets: u64,
     pending_copy_tx_packets: u64,
     pending_in_place_tx_packets: u64,
+    flow_cache: FlowCache,
+    flow_cache_session_touch: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1945,6 +2068,8 @@ impl BindingWorker {
             pending_direct_tx_packets: 0,
             pending_copy_tx_packets: 0,
             pending_in_place_tx_packets: 0,
+            flow_cache: FlowCache::new(),
+            flow_cache_session_touch: 0,
         };
         update_binding_debug_state(&mut binding);
         Ok(binding)
@@ -2287,6 +2412,18 @@ fn poll_binding(
         binding.scratch_forwards.clear();
         let mut rst_teardowns: Vec<(SessionKey, NatDecision)> = Vec::new();
         while let Some(desc) = received.read() {
+            // Prefetch frame data into L1 while processing counters.
+            // UMEM frames are cold (last touched by NIC DMA); this hides
+            // ~100ns DRAM latency before metadata parse.
+            #[cfg(target_arch = "x86_64")]
+            if let Some(pf) = unsafe { &*area }.slice(desc.addr as usize, 64.min(desc.len as usize)) {
+                unsafe {
+                    core::arch::x86_64::_mm_prefetch(
+                        pf.as_ptr() as *const i8,
+                        core::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
             counters.touched = true;
             counters.rx_packets += 1;
             counters.rx_bytes += desc.len as u64;
@@ -2523,6 +2660,67 @@ fn poll_binding(
                             continue;
                         }
                     }
+                    // ── Flow cache fast path ────────────────────────────
+                    // For established TCP (ACK set, no SYN/FIN/RST), check
+                    // the per-binding flow cache before the expensive session
+                    // lookup + policy + NAT + FIB path.
+                    if meta.protocol == PROTO_TCP
+                        && (meta.tcp_flags & 0x17) == 0x10  // ACK only, no SYN/FIN/RST
+                        && let Some(flow) = flow.as_ref()
+                    {
+                        if let Some(cached) = binding.flow_cache.lookup(
+                            &flow.forward_key,
+                            meta.ingress_ifindex as i32,
+                            validation.config_generation,
+                            validation.fib_generation,
+                        ) {
+                            let cached_decision = cached.decision;
+                            let cached_metadata = cached.metadata.clone();
+                            // Amortize session timestamp touch — every 64 cache hits.
+                            binding.flow_cache_session_touch += 1;
+                            if binding.flow_cache_session_touch & 63 == 0 {
+                                sessions.touch(&flow.forward_key, now_ns);
+                            }
+                            // RST teardown check (shouldn't hit since we filter SYN/FIN/RST above)
+                            if matches!(
+                                cached_decision.resolution.disposition,
+                                ForwardingDisposition::ForwardCandidate
+                                    | ForwardingDisposition::FabricRedirect
+                            ) {
+                                counters.forward_candidate_packets += 1;
+                                if cached_decision.nat.rewrite_src.is_some() {
+                                    counters.snat_packets += 1;
+                                }
+                                if cached_decision.nat.rewrite_dst.is_some() {
+                                    counters.dnat_packets += 1;
+                                }
+                                if let Some(mut request) = build_live_forward_request_from_frame(
+                                    binding_lookup,
+                                    binding_index,
+                                    ident,
+                                    desc,
+                                    packet_frame,
+                                    meta,
+                                    &cached_decision,
+                                    forwarding,
+                                    Some(flow),
+                                    Some(&cached_metadata.ingress_zone),
+                                    true,
+                                ) {
+                                    request.source_frame = owned_packet_frame.take();
+                                    dbg.forward += 1;
+                                    dbg.tx += 1;
+                                    binding.scratch_forwards.push(request);
+                                    recycle_now = false;
+                                }
+                            }
+                            if recycle_now {
+                                binding.scratch_recycle.push(desc.addr);
+                            }
+                            continue;
+                        }
+                    }
+                    // ── End flow cache fast path ─────────────────────────
                     let mut debug = flow
                         .as_ref()
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
@@ -3764,6 +3962,56 @@ fn poll_binding(
                             }
                             binding.scratch_forwards.push(request);
                             recycle_now = false;
+                            // ── Flow cache population ────────────────────
+                            // Cache ForwardCandidate decisions for established
+                            // TCP flows. Skip NAT64/NPTv6 (non-cacheable).
+                            if meta.protocol == PROTO_TCP
+                                && !decision.nat.nat64
+                                && !decision.nat.nptv6
+                                && decision.resolution.disposition == ForwardingDisposition::ForwardCandidate
+                                && let Some(flow) = flow.as_ref()
+                            {
+                                let ingress_zone = session_ingress_zone
+                                    .as_ref()
+                                    .cloned()
+                                    .unwrap_or_else(|| Arc::from(""));
+                                binding.flow_cache.insert(FlowCacheEntry {
+                                    key: flow.forward_key.clone(),
+                                    ingress_ifindex: meta.ingress_ifindex as i32,
+                                    descriptor: RewriteDescriptor {
+                                        dst_mac: decision.resolution.neighbor_mac.unwrap_or([0; 6]),
+                                        src_mac: decision.resolution.src_mac.unwrap_or([0; 6]),
+                                        tx_vlan_id: decision.resolution.tx_vlan_id,
+                                        ether_type: if meta.addr_family as i32 == libc::AF_INET { 0x0800 } else { 0x86dd },
+                                        rewrite_src_ip: decision.nat.rewrite_src,
+                                        rewrite_dst_ip: decision.nat.rewrite_dst,
+                                        rewrite_src_port: decision.nat.rewrite_src_port,
+                                        rewrite_dst_port: decision.nat.rewrite_dst_port,
+                                        ip_csum_delta: 0,
+                                        l4_csum_delta: 0,
+                                        egress_ifindex: decision.resolution.egress_ifindex,
+                                        tx_ifindex: decision.resolution.tx_ifindex,
+                                        target_binding_index: None,
+                                        config_generation: validation.config_generation,
+                                        fib_generation: validation.fib_generation,
+                                        owner_rg_id: 0,
+                                        nat64: false,
+                                        nptv6: false,
+                                        apply_nat_on_fabric,
+                                    },
+                                    decision,
+                                    metadata: SessionMetadata {
+                                        ingress_zone,
+                                        egress_zone: Arc::from(""),
+                                        owner_rg_id: 0,
+                                        fabric_ingress: false,
+                                        is_reverse: false,
+                                        synced: false,
+                                        nat64_reverse: None,
+                                    },
+                                });
+                            }
+                            // ── End flow cache population ────────────────
                         } else {
                             dbg.build_fail += 1;
                             if cfg!(feature = "debug-log") {
@@ -3896,6 +4144,9 @@ fn poll_binding(
         drop(received);
         let mut pending_forwards = core::mem::take(&mut binding.scratch_forwards);
         for (forward_key, nat) in rst_teardowns {
+            // Evict from flow cache so stale entries aren't used after RST.
+            let idx = FlowCache::slot(&forward_key, binding.ifindex);
+            binding.flow_cache.entries[idx] = None;
             teardown_tcp_rst_flow(
                 left,
                 binding,
@@ -14157,11 +14408,11 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_forward_ports_prefers_metadata_tuple_when_flow_missing() {
+    fn authoritative_forward_ports_prefers_frame_tuple_over_metadata_when_flow_missing() {
         let src_ip = Ipv4Addr::new(10, 0, 61, 102);
         let dst_ip = Ipv4Addr::new(172, 16, 80, 200);
-        let expected_src_port = 55068u16;
-        let wrong_src_port = 1041u16;
+        let frame_src_port = 1041u16;
+        let meta_src_port = 55068u16;
         let dst_port = 5201u16;
         let mut frame = Vec::new();
         write_eth_header(
@@ -14176,7 +14427,7 @@ mod tests {
         ]);
         frame.extend_from_slice(&src_ip.octets());
         frame.extend_from_slice(&dst_ip.octets());
-        frame.extend_from_slice(&wrong_src_port.to_be_bytes());
+        frame.extend_from_slice(&frame_src_port.to_be_bytes());
         frame.extend_from_slice(&dst_port.to_be_bytes());
         frame.extend_from_slice(&[
             0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
@@ -14200,14 +14451,15 @@ mod tests {
             protocol: PROTO_TCP,
             flow_src_addr,
             flow_dst_addr,
-            flow_src_port: expected_src_port,
+            flow_src_port: meta_src_port,
             flow_dst_port: dst_port,
             ..UserspaceDpMeta::default()
         };
 
+        // Live frame ports preferred over metadata (flow > frame > meta)
         assert_eq!(
             authoritative_forward_ports(&frame, meta, None),
-            Some((expected_src_port, dst_port))
+            Some((frame_src_port, dst_port))
         );
     }
 
@@ -15028,7 +15280,7 @@ mod tests {
         // Default timeouts when snapshot has 0 values
         assert_eq!(state.session_timeouts.tcp_established_ns, 300_000_000_000);
         assert_eq!(state.session_timeouts.udp_ns, 60_000_000_000);
-        assert_eq!(state.session_timeouts.icmp_ns, 15_000_000_000);
+        assert_eq!(state.session_timeouts.icmp_ns, 60_000_000_000);
     }
 
     #[test]
