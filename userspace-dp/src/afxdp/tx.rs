@@ -99,9 +99,11 @@ pub(super) fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, now_ns: u6
     // consumes them and posts new RX WQEs. Without this, mlx5 increments
     // rx_xsk_buff_alloc_err and silently drops all incoming packets.
     //
-    // DeviceQueue::wake() calls poll(fd, events=0, timeout=0) — a literal
-    // no-op that does NOT trigger NAPI. We use sendto() instead, which
-    // triggers NAPI processing of both fill ring and TX ring entries.
+    // poll(POLLIN) triggers xsk_poll → ndo_xsk_wakeup(XDP_WAKEUP_RX),
+    // which makes the driver consume fill ring entries and post WQEs.
+    // sendto() only triggers XDP_WAKEUP_TX (TX kick), NOT RX fill ring
+    // processing — using sendto() for RX wake was the root cause of
+    // fill ring starvation on idle interfaces with zero-copy mlx5.
     if !force {
         binding.empty_rx_polls = binding.empty_rx_polls.saturating_add(1);
         if binding.empty_rx_polls < RX_WAKE_IDLE_POLLS {
@@ -112,7 +114,21 @@ pub(super) fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, now_ns: u6
         }
     }
     let fd = binding.device.as_raw_fd();
-    let rc = unsafe {
+    // Use poll(POLLIN) for RX wakeup — triggers XDP_WAKEUP_RX.
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if rc >= 0 {
+        binding.dbg_rx_wake_sendto_ok += 1;
+    } else {
+        binding.dbg_rx_wake_sendto_err += 1;
+        binding.dbg_rx_wake_sendto_errno = unsafe { *libc::__errno_location() };
+    }
+    // Also sendto for TX completions (needed for copy mode and TX kick).
+    unsafe {
         libc::sendto(
             fd,
             core::ptr::null_mut(),
@@ -120,13 +136,7 @@ pub(super) fn maybe_wake_rx(binding: &mut BindingWorker, force: bool, now_ns: u6
             libc::MSG_DONTWAIT,
             core::ptr::null_mut(),
             0,
-        )
-    };
-    if rc >= 0 {
-        binding.dbg_rx_wake_sendto_ok += 1;
-    } else {
-        binding.dbg_rx_wake_sendto_err += 1;
-        binding.dbg_rx_wake_sendto_errno = unsafe { *libc::__errno_location() };
+        );
     }
     binding.dbg_rx_wakeups += 1;
     binding.live.rx_wakeups.fetch_add(1, Ordering::Relaxed);

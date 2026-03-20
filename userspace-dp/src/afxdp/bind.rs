@@ -139,8 +139,19 @@ pub(super) fn prime_fill_ring_offsets(
     if inserted != offsets.len() as u32 {
         return Err(format!("prefill fill ring inserted {inserted}/{}", offsets.len()).into());
     }
-    if device.needs_wakeup() {
-        device.wake();
+    // Kick RX NAPI repeatedly to bootstrap fill ring processing.
+    // poll(POLLIN, timeout>0) enters the kernel's xsk_poll path which
+    // calls napi_schedule on the XSK channel, triggering the driver to
+    // consume fill ring entries and post RX WQEs. Multiple kicks with
+    // small delays ensure the NAPI softirq actually runs between calls.
+    let fd = device.as_raw_fd();
+    for _ in 0..10 {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut pfd, 1, 1) }; // 1ms timeout
     }
     Ok(())
 }
