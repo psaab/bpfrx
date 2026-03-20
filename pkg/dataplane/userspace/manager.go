@@ -2038,6 +2038,14 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 		return fmt.Errorf("mkdir state dir: %w", err)
 	}
 	_ = os.Remove(cfg.ControlSocket)
+	// Clear stale XSKMAP entries from previous helper instance.
+	// Old entries point to dead socket fds; new helper will repopulate.
+	if xskMap := m.inner.Map("userspace_xsk_map"); xskMap != nil {
+		for i := uint32(0); i < 4096; i++ {
+			_ = xskMap.Delete(i)
+		}
+		slog.Debug("userspace: cleared stale XSKMAP entries")
+	}
 	pollMode := cfg.PollMode
 	if pollMode == "" {
 		pollMode = "busy-poll"
@@ -3625,6 +3633,11 @@ func (m *Manager) stopLocked() {
 		m.lastStatus = ProcessStatus{}
 		return
 	}
+	// Disable userspace forwarding BEFORE stopping the helper.
+	// Without this, the XDP shim continues redirecting to XSK after
+	// the helper exits, sending packets to dead socket fds. Setting
+	// ctrl.enabled=0 makes the shim fall back to the eBPF pipeline.
+	m.disableUserspaceCtrlLocked()
 	_ = m.requestLocked(ControlRequest{Type: "shutdown"}, nil)
 	done := make(chan struct{})
 	go func(cmd *exec.Cmd) {
@@ -3648,6 +3661,25 @@ func (m *Manager) stopLocked() {
 	}
 	m.proc = nil
 	m.lastStatus = ProcessStatus{}
+}
+
+// disableUserspaceCtrlLocked sets ctrl.enabled=0 in the BPF map so the XDP
+// shim stops redirecting packets to XSK. This MUST be called before the
+// helper exits to prevent packets being sent to dead socket fds.
+func (m *Manager) disableUserspaceCtrlLocked() {
+	ctrlMap := m.inner.Map("userspace_ctrl")
+	if ctrlMap == nil {
+		return
+	}
+	zero := uint32(0)
+	// Read current ctrl, set enabled=0, write back.
+	var ctrl userspaceCtrlValue
+	if err := ctrlMap.Lookup(zero, &ctrl); err != nil {
+		return
+	}
+	ctrl.Enabled = 0
+	_ = ctrlMap.Update(zero, ctrl, ebpf.UpdateAny)
+	slog.Info("userspace: disabled ctrl (helper stopping)")
 }
 
 func configEqual(a, b config.UserspaceConfig) bool {
