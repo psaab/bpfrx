@@ -138,6 +138,9 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		return result, fmt.Errorf("sync userspace forwarding state: %w", err)
 	}
 	m.ensureStatusLoopLocked()
+	// Immediately push kernel neighbors so the helper can forward
+	// without waiting for the first 5-second status loop tick.
+	m.refreshNeighborSnapshotLocked()
 	m.cfg = ucfg
 	return result, nil
 }
@@ -3550,6 +3553,7 @@ func (m *Manager) statusLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	var neighborTick int
+	startTime := time.Now()
 
 	for {
 		select {
@@ -3575,11 +3579,15 @@ func (m *Manager) statusLoop(ctx context.Context) {
 			} else {
 				slog.Warn("userspace dataplane status poll failed", "err", err)
 			}
-			// Refresh kernel neighbors every 5 ticks (5 seconds).
-			// The Rust helper can't see kernel ARP entries directly;
-			// this pushes them so MissingNeighbor resolves quickly.
+			// Refresh kernel neighbors. During the first 30 seconds
+			// after startup, refresh every tick (1s) so cold-start
+			// neighbor resolution is fast. After that, every 5 ticks.
 			neighborTick++
-			if neighborTick >= 5 && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
+			neighborInterval := 5
+			if time.Since(startTime) < 30*time.Second {
+				neighborInterval = 1
+			}
+			if neighborTick >= neighborInterval && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
 				neighborTick = 0
 				m.refreshNeighborSnapshotLocked()
 			}
