@@ -322,31 +322,10 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let parsed = match eth_proto {
         ETH_P_IP => parse_ipv4(data, data_end, vlan_id, l3_offset),
         ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, l3_offset),
-        // Non-IP (LLDP, etc.): XDP_PASS to kernel.
-        // ARP (0x0806): redirect to XSK so the helper can learn neighbors
-        // from ARP replies. The helper also injects learned neighbors into
-        // the kernel via netlink. This eliminates kernel slow-path dependency.
-        0x0806 => {
-            // ARP: redirect to XSK if heartbeat valid, else XDP_PASS.
-            let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
-            let rx_queue_index = unsafe { (*ctx.ctx).rx_queue_index };
-            let selected_queue = rx_queue_index % ctrl.queue_count;
-            let slot = ingress_ifindex * 16 + selected_queue;
-            if let Some(binding) = USERSPACE_BINDINGS.get(slot) {
-                if binding.flags == USERSPACE_BINDING_READY {
-                    if let Some(last_heartbeat) = USERSPACE_HEARTBEAT.get(binding.slot) {
-                        let timeout_ns = (ctrl.heartbeat_timeout_ms as u64) * 1_000_000;
-                        let now_ns = unsafe { bpf_ktime_get_ns() };
-                        if now_ns >= *last_heartbeat && now_ns.saturating_sub(*last_heartbeat) <= timeout_ns {
-                            if let Ok(action) = USERSPACE_XSK_MAP.redirect(binding.slot, 0) {
-                                return Ok(action);
-                            }
-                        }
-                    }
-                }
-            }
-            return Ok(xdp_action::XDP_PASS);
-        }
+        // Non-IP (ARP, LLDP, etc.): always XDP_PASS to kernel.
+        // ARP MUST reach the kernel for neighbor table updates.
+        // Redirecting ARP to XSK steals replies from the kernel's
+        // ARP state machine, breaking all L2 reachability.
         _ => return Ok(xdp_action::XDP_PASS),
     };
     let Some(parsed) = parsed else {

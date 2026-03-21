@@ -3808,24 +3808,12 @@ func (m *Manager) bootstrapNAPIQueuesLocked() {
 			if target == "" {
 				continue
 			}
-			// Send TCP SYN probes to different destination ports on the
-			// gateway. RSS distributes by 5-tuple hash — varying dst_port
-			// hits different queues. Each SYN gets RST back (closed port),
-			// generating a hardware RX event that triggers NAPI on the
-			// corresponding queue and posts fill ring WQEs.
-			var wg sync.WaitGroup
-			for dstPort := 1; dstPort <= 24; dstPort++ {
-				wg.Add(1)
-				go func(p int) {
-					defer wg.Done()
-					d := net.Dialer{Timeout: 200 * time.Millisecond}
-					conn, err := d.Dial("tcp4", fmt.Sprintf("%s:%d", target, p))
-					if err == nil {
-						conn.Close()
-					}
-				}(dstPort)
-			}
-			wg.Wait()
+			// Ping the target to generate a hardware RX event that
+			// triggers NAPI, which posts fill ring WQEs for zero-copy.
+			cmd := exec.Command("ping", "-c", "1", "-W", "1", "-I", linuxName, target)
+			cmd.Stdout = nil
+			cmd.Stderr = nil
+			_ = cmd.Run()
 		}
 	}
 }
