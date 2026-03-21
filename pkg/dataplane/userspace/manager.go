@@ -50,6 +50,7 @@ type Manager struct {
 	haGroups           map[int]HAGroupStatus
 	lastIngressIfaces  []uint32
 	lastBindingIndices []uint32
+	neighborsPrewarmed bool
 }
 
 func New() *Manager {
@@ -2546,6 +2547,19 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 	}
 	if status.Enabled {
 		ctrl.Enabled = 1
+		// Before enabling the XDP shim, ensure the helper has
+		// up-to-date neighbor entries. Without this, the first
+		// transit packets hit MissingNeighbor and go to slow-path,
+		// which may fail if the kernel hasn't resolved ARP/NDP yet.
+		// On every status tick where ctrl is enabled, push fresh
+		// kernel neighbors to the helper. The proactive resolve
+		// runs once to force ARP/NDP re-resolution after VIP
+		// assignment.
+		if !m.neighborsPrewarmed {
+			m.neighborsPrewarmed = true
+			m.proactiveNeighborResolveLocked()
+		}
+		m.refreshNeighborSnapshotLocked()
 	}
 	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update userspace_ctrl from helper status: %w", err)
@@ -3587,16 +3601,24 @@ func (m *Manager) statusLoop(ctx context.Context) {
 			} else {
 				slog.Warn("userspace dataplane status poll failed", "err", err)
 			}
-			// Refresh kernel neighbors. During the first 30 seconds
-			// after startup, refresh every tick (1s) so cold-start
-			// neighbor resolution is fast. After that, every 5 ticks.
+			// Refresh kernel neighbors. During the first 60 seconds
+			// after startup, refresh every tick (1s) and proactively
+			// resolve stale entries. This covers the VRRP election
+			// window (30-40s) plus neighbor resolution time.
 			neighborTick++
 			neighborInterval := 5
-			if time.Since(startTime) < 30*time.Second {
+			sinceStart := time.Since(startTime)
+			if sinceStart < 60*time.Second {
 				neighborInterval = 1
 			}
 			if neighborTick >= neighborInterval && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
 				neighborTick = 0
+				// During startup, also proactively resolve stale/failed
+				// neighbors so the helper has fresh entries as soon as
+				// VIPs are assigned.
+				if sinceStart < 60*time.Second {
+					m.proactiveNeighborResolveAsyncLocked()
+				}
 				m.refreshNeighborSnapshotLocked()
 			}
 			m.mu.Unlock()
@@ -3661,6 +3683,122 @@ func (m *Manager) stopLocked() {
 	}
 	m.proc = nil
 	m.lastStatus = ProcessStatus{}
+	m.neighborsPrewarmed = false
+}
+
+// proactiveNeighborResolveLocked reads the kernel neighbor table and
+// pings any STALE/FAILED entries to force re-resolution. Also pings
+// the default gateway on each managed interface. This ensures the
+// helper has fresh neighbor entries when ctrl is enabled.
+func (m *Manager) proactiveNeighborResolveLocked() {
+	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
+		return
+	}
+	// Collect all managed interface names
+	seen := make(map[string]bool)
+	var ifaces []string
+	for ifName, ifc := range m.lastSnapshot.Config.Interfaces.Interfaces {
+		base := config.LinuxIfName(ifName)
+		if !seen[base] {
+			seen[base] = true
+			ifaces = append(ifaces, base)
+		}
+		for _, unit := range ifc.Units {
+			if unit.VlanID > 0 {
+				vlanName := fmt.Sprintf("%s.%d", base, unit.VlanID)
+				if !seen[vlanName] {
+					seen[vlanName] = true
+					ifaces = append(ifaces, vlanName)
+				}
+			}
+		}
+	}
+	// For each interface, read neighbors and ping any that need resolution
+	var resolved int
+	for _, ifName := range ifaces {
+		link, err := netlink.LinkByName(ifName)
+		if err != nil || link == nil {
+			continue
+		}
+		for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+			neighs, err := netlink.NeighList(link.Attrs().Index, family)
+			if err != nil {
+				continue
+			}
+			for _, n := range neighs {
+				if n.IP == nil || n.IP.IsLinkLocalUnicast() {
+					continue
+				}
+				// Ping STALE, DELAY, PROBE, or entries with no MAC to refresh
+				if n.HardwareAddr == nil || len(n.HardwareAddr) == 0 ||
+					n.State == netlink.NUD_STALE || n.State == netlink.NUD_DELAY ||
+					n.State == netlink.NUD_PROBE || n.State == netlink.NUD_FAILED {
+					pingCmd := "ping"
+					if family == netlink.FAMILY_V6 {
+						pingCmd = "ping6"
+					}
+					cmd := exec.Command(pingCmd, "-c", "1", "-W", "1", "-I", ifName, n.IP.String())
+					cmd.Stdout = nil
+					cmd.Stderr = nil
+					_ = cmd.Run()
+					resolved++
+				}
+			}
+		}
+	}
+	if resolved > 0 {
+		slog.Info("userspace: proactive neighbor resolution",
+			"resolved", resolved, "interfaces", len(ifaces))
+	}
+}
+
+// proactiveNeighborResolveAsyncLocked is the non-blocking version that
+// fires pings in background goroutines. Used by the status loop.
+func (m *Manager) proactiveNeighborResolveAsyncLocked() {
+	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
+		return
+	}
+	var targets []struct{ iface, ip, cmd string }
+	for ifName, ifc := range m.lastSnapshot.Config.Interfaces.Interfaces {
+		for _, unit := range ifc.Units {
+			base := config.LinuxIfName(ifName)
+			linuxName := base
+			if unit.VlanID > 0 {
+				linuxName = fmt.Sprintf("%s.%d", base, unit.VlanID)
+			}
+			link, err := netlink.LinkByName(linuxName)
+			if err != nil || link == nil {
+				continue
+			}
+			for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+				neighs, err := netlink.NeighList(link.Attrs().Index, family)
+				if err != nil {
+					continue
+				}
+				for _, n := range neighs {
+					if n.IP == nil || n.IP.IsLinkLocalUnicast() {
+						continue
+					}
+					if n.HardwareAddr == nil || len(n.HardwareAddr) == 0 ||
+						n.State == netlink.NUD_STALE || n.State == netlink.NUD_FAILED {
+						pingCmd := "ping"
+						if family == netlink.FAMILY_V6 {
+							pingCmd = "ping6"
+						}
+						targets = append(targets, struct{ iface, ip, cmd string }{linuxName, n.IP.String(), pingCmd})
+					}
+				}
+			}
+		}
+	}
+	for _, t := range targets {
+		go func(cmd, iface, ip string) {
+			c := exec.Command(cmd, "-c", "1", "-W", "1", "-I", iface, ip)
+			c.Stdout = nil
+			c.Stderr = nil
+			_ = c.Run()
+		}(t.cmd, t.iface, t.ip)
+	}
 }
 
 // disableUserspaceCtrlLocked sets ctrl.enabled=0 in the BPF map so the XDP
