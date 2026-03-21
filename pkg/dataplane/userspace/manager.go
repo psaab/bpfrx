@@ -2047,6 +2047,23 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 		}
 		slog.Debug("userspace: cleared stale XSKMAP entries")
 	}
+	// Delete XDP link pins to force fresh attachment on next compile.
+	// On restart, AttachXDP() reuses pinned links and does l.Update()
+	// which is a program swap that does NOT reinit mlx5 XSK RQs.
+	// Removing the pins forces a full detach+re-attach which triggers
+	// netdev_bpf(XDP_SETUP_PROG) and properly initializes the XSK
+	// buffer pool for zero-copy fill ring consumption.
+	if linkPinDir := "/sys/fs/bpf/bpfrx/links"; true {
+		entries, _ := os.ReadDir(linkPinDir)
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "xdp_") {
+				path := filepath.Join(linkPinDir, e.Name())
+				if err := os.Remove(path); err == nil {
+					slog.Info("userspace: removed XDP link pin for fresh attach", "path", path)
+				}
+			}
+		}
+	}
 	pollMode := cfg.PollMode
 	if pollMode == "" {
 		pollMode = "busy-poll"
