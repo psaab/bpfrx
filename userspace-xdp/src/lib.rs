@@ -829,12 +829,14 @@ fn fallback_to_main(ctx: &XdpContext, ctrl: &UserspaceCtrl, reason: u32) -> Resu
     unsafe {
         let _ = USERSPACE_FALLBACK_PROGS.tail_call(ctx, USERSPACE_FALLBACK_MAIN);
     }
-    // Tail call failed (known aya-ebpf issue). Deliver to kernel via cpumap
-    // (preferred in zero-copy mode) so the kernel stack can forward the
-    // packet. cpumap avoids the zero-copy UMEM frame leak that raw XDP_PASS
-    // can cause. TC egress still enforces egress policy. Once heartbeat is
-    // established, XSK takes over for full userspace processing.
-    Ok(cpumap_or_pass(ctrl))
+    // Tail call failed (known aya-ebpf issue). Use XDP_PASS to deliver to
+    // the kernel stack for forwarding. Although cpumap is generally preferred
+    // in zero-copy mode, cpumap adds ~40% overhead for bulk transit traffic
+    // (cross-CPU re-queue + full stack processing). XDP_PASS stays on the
+    // same CPU and lets the kernel forward directly. The UMEM frame is
+    // safely handled: mlx5 copies the data to an SKB on XDP_PASS and
+    // recycles the zero-copy buffer.
+    Ok(xdp_action::XDP_PASS)
 }
 
 fn incr_fallback_stat(reason: u32) {
