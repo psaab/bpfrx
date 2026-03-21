@@ -3777,27 +3777,55 @@ func (m *Manager) bootstrapNAPIQueuesLocked() {
 				continue
 			}
 			seen[linuxName] = true
-			// Ping broadcast on each interface — ARP replies trigger HW RX
+			// Send many parallel pings to hit all RSS queues. Each ping
+			// process gets a different ICMP echo ID from the kernel, causing
+			// RSS to distribute replies across different NIC queues. This
+			// triggers NAPI on each queue, which posts fill ring WQEs for
+			// zero-copy XSK packet reception.
 			link, err := netlink.LinkByName(linuxName)
 			if err != nil || link == nil {
 				continue
 			}
-			addrs, _ := netlink.AddrList(link, netlink.FAMILY_V4)
-			for _, addr := range addrs {
-				if addr.IP == nil || addr.IP.To4() == nil || addr.IPNet == nil {
-					continue
+			// Find a target: gateway or any neighbor
+			var target string
+			routes, _ := netlink.RouteList(link, netlink.FAMILY_V4)
+			for _, r := range routes {
+				if r.Gw != nil && r.Gw.To4() != nil {
+					target = r.Gw.String()
+					break
 				}
-				// Compute broadcast address
-				bcast := make(net.IP, 4)
-				for i := 0; i < 4; i++ {
-					bcast[i] = addr.IP.To4()[i] | ^addr.IPNet.Mask[i]
-				}
-				cmd := exec.Command("ping", "-c", "1", "-W", "1", "-b", "-I", linuxName, bcast.String())
-				cmd.Stdout = nil
-				cmd.Stderr = nil
-				_ = cmd.Run()
-				break
 			}
+			if target == "" {
+				neighs, _ := netlink.NeighList(link.Attrs().Index, netlink.FAMILY_V4)
+				for _, n := range neighs {
+					if n.IP != nil && n.IP.To4() != nil && n.HardwareAddr != nil &&
+						n.State != netlink.NUD_FAILED {
+						target = n.IP.String()
+						break
+					}
+				}
+			}
+			if target == "" {
+				continue
+			}
+			// Send TCP SYN probes to different destination ports on the
+			// gateway. RSS distributes by 5-tuple hash — varying dst_port
+			// hits different queues. Each SYN gets RST back (closed port),
+			// generating a hardware RX event that triggers NAPI on the
+			// corresponding queue and posts fill ring WQEs.
+			var wg sync.WaitGroup
+			for dstPort := 1; dstPort <= 24; dstPort++ {
+				wg.Add(1)
+				go func(p int) {
+					defer wg.Done()
+					d := net.Dialer{Timeout: 200 * time.Millisecond}
+					conn, err := d.Dial("tcp4", fmt.Sprintf("%s:%d", target, p))
+					if err == nil {
+						conn.Close()
+					}
+				}(dstPort)
+			}
+			wg.Wait()
 		}
 	}
 }

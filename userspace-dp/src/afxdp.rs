@@ -1803,9 +1803,10 @@ struct BindingWorker {
     pending_in_place_tx_packets: u64,
     flow_cache: FlowCache,
     flow_cache_session_touch: u64,
-    /// Timestamp when this binding was created, used to enforce a grace
-    /// period before writing heartbeat (NAPI needs time to bootstrap).
+    /// Timestamp when this binding was created.
     bind_time_ns: u64,
+    /// Zero-copy vs copy mode (affects heartbeat gating).
+    bind_mode: XskBindMode,
     /// Set true once the XSK RX ring has delivered at least one packet,
     /// proving the NIC's XSK receive queue is active for this binding.
     xsk_rx_confirmed: bool,
@@ -2182,6 +2183,7 @@ impl BindingWorker {
                 ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
             },
             xsk_rx_confirmed: false,
+            bind_mode,
         };
         update_binding_debug_state(&mut binding);
         Ok(binding)
@@ -4370,12 +4372,23 @@ fn poll_binding(
                                         }
                                     }
                                 }
-                                // Drop the packet — don't reinject to kernel slow
-                                // path. The ARP/NDP solicitation above resolves in
-                                // <1ms. The sender (TCP SYN, UDP, ICMP) retransmits
-                                // and finds the neighbor resolved on the next attempt.
-                                // This eliminates the kernel forwarding dependency
-                                // and keeps all transit traffic in the userspace path.
+                                // Reinject to kernel slow path for the first packet.
+                                // The kernel will also ARP and forward once resolved.
+                                // The ARP reply (from our raw socket request) feeds
+                                // BOTH the kernel (via XDP_PASS) and the helper's
+                                // dynamic_neighbors (via XSK ARP redirect). Future
+                                // packets find the neighbor and forward via XSK.
+                                maybe_reinject_slow_path_from_frame(
+                                    &ident,
+                                    &binding.live,
+                                    slow_path,
+                                    local_tunnel_deliveries,
+                                    packet_frame,
+                                    meta,
+                                    decision,
+                                    recent_exceptions,
+                                    "missing_neighbor_slow_path",
+                                );
                                 if cfg!(feature = "debug-log") {
                                     if dbg.missing_neigh <= 3 {
                                         if let Some(flow) = flow.as_ref() {
@@ -8600,13 +8613,13 @@ fn delete_heartbeat_slot(map_fd: c_int, slot: u32) -> io::Result<()> {
 }
 
 fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
-    // Don't write heartbeat until either:
-    // 1. XSK RX has delivered a packet (xsk_rx_confirmed), OR
-    // 2. The grace period has elapsed (allows copy-mode and already-
-    //    bootstrapped zero-copy bindings to start immediately)
-    if !binding.xsk_rx_confirmed
-        && now_ns.saturating_sub(binding.bind_time_ns) < HEARTBEAT_GRACE_PERIOD_NS
-    {
+    // Zero-copy bindings: only write heartbeat after XSK RX has delivered
+    // at least one packet, proving the NIC's fill ring WQEs are posted.
+    // Until then, XDP_PASS lets the kernel forward (slower but correct).
+    // Under load, all queues bootstrap naturally via RSS distribution.
+    //
+    // Copy-mode bindings: always write heartbeat (no fill ring dependency).
+    if !binding.xsk_rx_confirmed && binding.bind_mode == XskBindMode::ZeroCopy {
         return;
     }
     let age_ns = now_ns.saturating_sub(binding.last_heartbeat_update_ns);
