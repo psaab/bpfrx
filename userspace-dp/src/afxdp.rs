@@ -2073,9 +2073,9 @@ impl BindingWorker {
                 bind_strategy,
                 driver_name.as_deref(),
                 poll_mode,
+                Some(&initial_fill_frames),
             )
             .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
-        prime_fill_ring_offsets(&mut device, &initial_fill_frames)?;
 
         let user_fd = user.as_raw_fd();
         live.set_bound(user_fd);

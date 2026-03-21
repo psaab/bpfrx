@@ -59,6 +59,7 @@ pub(super) fn open_binding_worker_rings(
     bind_strategy: AfXdpBindStrategy,
     driver_name: Option<&str>,
     poll_mode: crate::PollMode,
+    pre_bind_fill_offsets: Option<&[u64]>,
 ) -> Result<
     (
         User,
@@ -78,7 +79,7 @@ pub(super) fn open_binding_worker_rings(
     let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
     for (strategy_idx, strategy) in strategies.iter().copied().enumerate() {
         for (flags_idx, flags) in bind_flag_candidates.iter().copied().enumerate() {
-            match try_open_bind(worker_umem, info, ring_entries, strategy, flags, poll_mode) {
+            match try_open_bind(worker_umem, info, ring_entries, strategy, flags, poll_mode, pre_bind_fill_offsets) {
                 Ok(result) => return Ok(result),
                 Err(err) => {
                     last_err = Some(err);
@@ -240,6 +241,7 @@ fn try_open_bind(
     bind_strategy: AfXdpBindStrategy,
     flags: u16,
     poll_mode: crate::PollMode,
+    pre_bind_fill_offsets: Option<&[u64]>,
 ) -> Result<
     (
         User,
@@ -260,6 +262,14 @@ fn try_open_bind(
             .map_err(|e| format!("create fq/cq: {e}"))?;
         let (user, rx, tx, _requested_mode) =
             open_user_rings(worker_umem.umem(), &sock, ring_entries, flags)?;
+        // Prime the fill ring BEFORE bind. The mlx5 driver runs NAPI
+        // during channel activation (triggered by bind). If the fill ring
+        // is empty at that point, xsk_buff_alloc_batch fails and the
+        // driver never retries — leaving the hardware RQ with zero WQEs.
+        // By priming first, the initial NAPI posts the WQEs immediately.
+        if let Some(offsets) = pre_bind_fill_offsets {
+            prime_fill_ring_offsets(&mut device, offsets)?;
+        }
         let bind_mode = bind_user_rings(
             worker_umem.umem(),
             &device,
@@ -270,13 +280,16 @@ fn try_open_bind(
         (device, user, rx, tx, bind_mode)
     } else {
         let owner_sock = Socket::new(info).map_err(|e| format!("create owner socket: {e}"))?;
-        let device = worker_umem
+        let mut device = worker_umem
             .umem()
             .fq_cq(&owner_sock)
             .map_err(|e| format!("create fq/cq: {e}"))?;
         let user_sock = Socket::new(info).map_err(|e| format!("create user socket: {e}"))?;
         let (user, rx, tx, _requested_mode) =
             open_user_rings(worker_umem.umem(), &user_sock, ring_entries, flags)?;
+        if let Some(offsets) = pre_bind_fill_offsets {
+            prime_fill_ring_offsets(&mut device, offsets)?;
+        }
         let bind_mode = bind_user_rings(
             worker_umem.umem(),
             &device,
@@ -410,19 +423,14 @@ fn bind_user_rings(
 }
 
 fn set_busy_poll_opts(fd: c_int, poll_mode: crate::PollMode) {
-    if poll_mode == crate::PollMode::Interrupt {
-        // Interrupt mode: don't set SO_BUSY_POLL. The napi_busy_loop()
-        // overhead is severe (~15% CPU) even with 50us timeout because
-        // it runs on EVERY poll() call. The fill ring bootstrap is
-        // handled by bootstrapNAPIQueuesLocked() (broadcast ping) on
-        // the Go side, which generates hardware RX events that trigger
-        // NAPI without ongoing busy-poll cost.
-        return;
-    }
     const SO_BUSY_POLL: c_int = 46;
     const SO_PREFER_BUSY_POLL: c_int = 69;
     const SO_BUSY_POLL_BUDGET: c_int = 70;
-    let busy_poll_us: c_int = 50;
+    // Use 1µs timeout: just enough to trigger one napi_busy_loop() cycle
+    // per poll() call, which posts fill ring WQEs. The 50µs value caused
+    // 15% CPU overhead from spin-waiting. 1µs triggers NAPI and returns
+    // immediately, bootstrapping the fill ring with negligible overhead.
+    let busy_poll_us: c_int = if poll_mode == crate::PollMode::Interrupt { 1 } else { 50 };
     let prefer: c_int = 1;
     let budget: c_int = RX_BATCH_SIZE as c_int;
 
