@@ -51,6 +51,7 @@ type Manager struct {
 	lastIngressIfaces  []uint32
 	lastBindingIndices []uint32
 	neighborsPrewarmed bool
+	ctrlEnableAt       time.Time
 }
 
 func New() *Manager {
@@ -2574,20 +2575,25 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		HeartbeatTimeoutMS: 30000,
 	}
 	if status.Enabled {
-		ctrl.Enabled = 1
-		// Before enabling the XDP shim, ensure the helper has
-		// up-to-date neighbor entries. Without this, the first
-		// transit packets hit MissingNeighbor and go to slow-path,
-		// which may fail if the kernel hasn't resolved ARP/NDP yet.
+		// Delay ctrl enable by 10 seconds after the helper first
+		// reports ready. During this window, ctrl stays at 0 so the
+		// XDP shim falls back to the eBPF pipeline. Background traffic
+		// (VRRP, RA, ARP) during this window generates hardware RX
+		// events that bootstrap the mlx5 XSK fill ring consumer on
+		// ALL queues. Without this delay, queues that don't receive
+		// traffic during the eBPF window have unconsumed fill rings
+		// and silently drop all XDP_REDIRECT'd packets.
 		if !m.neighborsPrewarmed {
 			m.neighborsPrewarmed = true
-			// After enabling ctrl, send broadcast pings to generate
-			// hardware RX events that bootstrap the XSK fill ring.
-			// The first packet per queue is dropped (fill ring unconsumed)
-			// but the hardware IRQ triggers NAPI which processes
-			// xp_fill_cb and consumes fill entries for subsequent packets.
+			m.ctrlEnableAt = time.Now().Add(10 * time.Second)
+			slog.Info("userspace: delaying ctrl enable by 10s for fill ring bootstrap")
 			go m.bootstrapNAPIQueuesLocked()
 			m.proactiveNeighborResolveLocked()
+		}
+		if time.Now().Before(m.ctrlEnableAt) {
+			ctrl.Enabled = 0 // keep disabled during bootstrap window
+		} else {
+			ctrl.Enabled = 1
 		}
 		m.refreshNeighborSnapshotLocked()
 	}
@@ -3714,6 +3720,7 @@ func (m *Manager) stopLocked() {
 	m.proc = nil
 	m.lastStatus = ProcessStatus{}
 	m.neighborsPrewarmed = false
+	m.ctrlEnableAt = time.Time{}
 }
 
 // bootstrapNAPIQueuesLocked sends UDP probe packets to each managed
