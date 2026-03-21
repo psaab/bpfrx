@@ -4012,6 +4012,12 @@ func (m *Manager) NotifyLinkCycle() {
 		"forwarding_armed", status.ForwardingArmed,
 		"bindings", len(status.Bindings),
 		"ready", ready)
+	// Re-bootstrap NAPI queues after rebind. The link DOWN/UP cycle
+	// destroyed the XSK channels; the rebind created new sockets but
+	// the fill ring WQEs haven't been posted to the NIC yet. Broadcast
+	// pings generate hardware RX events that trigger NAPI, which posts
+	// fill ring WQEs so zero-copy XSK can receive packets.
+	go m.bootstrapNAPIQueuesLocked()
 }
 
 func maxInt(a, b int) int {

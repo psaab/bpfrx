@@ -8504,17 +8504,13 @@ fn delete_heartbeat_slot(map_fd: c_int, slot: u32) -> io::Result<()> {
 }
 
 fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
-    // Only write heartbeat once the XSK RX ring has delivered at least
-    // one packet, proving the NIC's XSK receive queue is active for this
-    // binding. Before that, the XDP shim sees no heartbeat → XDP_PASS →
-    // kernel forwards normally. This solves the zero-copy bootstrap
-    // problem: after fresh bind, the NIC's XSK RQ needs its own NAPI
-    // cycle to post fill ring entries as HW DMA WQEs. Background traffic
-    // (VRRP, heartbeats, ARP) or iperf3 load on the interface triggers
-    // this NAPI activity, bootstrapping the XSK RQ. Once working, the
-    // heartbeat is written and XDP redirects to XSK for full speed.
-    // Quiet queues (no traffic yet) stay on XDP_PASS — correct but slower.
-    if !binding.xsk_rx_confirmed {
+    // Don't write heartbeat until either:
+    // 1. XSK RX has delivered a packet (xsk_rx_confirmed), OR
+    // 2. The grace period has elapsed (allows copy-mode and already-
+    //    bootstrapped zero-copy bindings to start immediately)
+    if !binding.xsk_rx_confirmed
+        && now_ns.saturating_sub(binding.bind_time_ns) < HEARTBEAT_GRACE_PERIOD_NS
+    {
         return;
     }
     let age_ns = now_ns.saturating_sub(binding.last_heartbeat_update_ns);

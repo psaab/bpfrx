@@ -409,13 +409,16 @@ fn bind_user_rings(
     Err(format!("bind AF_XDP socket via {binder_name}: exhausted retries").into())
 }
 
-fn set_busy_poll_opts(fd: c_int, poll_mode: crate::PollMode) {
-    if poll_mode == crate::PollMode::Interrupt {
-        // Interrupt mode: don't set busy-poll sockopts.
-        // The kernel will use normal interrupt-driven NAPI delivery,
-        // which uses less CPU but has higher per-packet latency.
-        return;
-    }
+fn set_busy_poll_opts(fd: c_int, _poll_mode: crate::PollMode) {
+    // Always set SO_BUSY_POLL, even in interrupt mode. This is critical
+    // for zero-copy XSK bootstrap: the mlx5 ndo_xsk_wakeup sends a NOP
+    // WQE to the ICOSQ which should trigger NAPI, but when NAPI is
+    // already scheduled from other sources, the NOP is skipped and the
+    // fill ring is never consumed. SO_BUSY_POLL makes recvmsg/poll call
+    // napi_busy_loop() inline, which directly runs the NAPI handler and
+    // posts fill ring WQEs to the hardware RQ. The 50us timeout adds
+    // negligible CPU overhead in interrupt mode since the worker only
+    // calls poll() when idle (no RX packets available).
     const SO_BUSY_POLL: c_int = 46;
     const SO_PREFER_BUSY_POLL: c_int = 69;
     const SO_BUSY_POLL_BUDGET: c_int = 70;
