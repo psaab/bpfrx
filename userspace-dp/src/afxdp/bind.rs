@@ -254,12 +254,37 @@ fn try_open_bind(
     let (device, user, rx, tx, bind_mode) = if bind_strategy.uses_umem_owner_socket() {
         let sock = Socket::with_shared(info, worker_umem.umem())
             .map_err(|e| format!("create shared socket: {e}"))?;
-        let device = worker_umem
+        let mut device = worker_umem
             .umem()
             .fq_cq(&sock)
             .map_err(|e| format!("create fq/cq: {e}"))?;
         let (user, rx, tx, _requested_mode) =
             open_user_rings(worker_umem.umem(), &sock, ring_entries, flags)?;
+        // Prime fill ring BEFORE bind so mlx5 zero-copy pool init
+        // sees the entries and posts WQEs. After bind, fill ring
+        // entries are never re-read if the pool was initialized empty.
+        {
+            let total = super::binding_frame_count(ring_entries).max(1);
+            let reserved_tx = super::reserved_tx_frames(ring_entries).min(total);
+            let fill_count = (total - reserved_tx) as usize;
+            let mut offsets = Vec::with_capacity(fill_count);
+            let frame_size = super::UMEM_FRAME_SIZE as u64;
+            // Fill offsets start after reserved TX frames
+            for i in reserved_tx..total {
+                offsets.push(i as u64 * frame_size);
+            }
+            let inserted = {
+                let mut fill = device.fill(fill_count as u32);
+                let inserted = fill.insert(offsets.iter().copied());
+                fill.commit();
+                inserted
+            };
+            if inserted != fill_count as u32 {
+                eprintln!(
+                    "bpfrx-userspace-dp: pre-bind fill prime: {inserted}/{fill_count}"
+                );
+            }
+        }
         let bind_mode = bind_user_rings(
             worker_umem.umem(),
             &device,

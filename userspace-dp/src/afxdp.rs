@@ -1972,7 +1972,12 @@ impl BindingWorker {
                 poll_mode,
             )
             .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
-        prime_fill_ring_offsets(&mut device, &initial_fill_frames)?;
+        // Fill ring is already primed pre-bind (in try_open_bind) for
+        // zero-copy pool initialization. Post-bind prime handles any
+        // frames that weren't covered by the pre-bind prime.
+        if !initial_fill_frames.is_empty() {
+            let _ = prime_fill_ring_offsets(&mut device, &initial_fill_frames);
+        }
 
         let user_fd = user.as_raw_fd();
         live.set_bound(user_fd);

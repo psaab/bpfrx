@@ -97,6 +97,20 @@ func (m *Manager) Teardown() error {
 }
 
 func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) {
+	// Delete XDP link pins BEFORE inner.Compile() so AttachXDP does
+	// a fresh attach. This is critical for zero-copy: fresh attach
+	// triggers mlx5 to initialize XSK buffer pool from fill ring.
+	// Pinned link reuse (l.Update) only swaps the program without
+	// reinitializing XSK RQs, leaving the fill ring unconsumed.
+	if linkPinDir := "/sys/fs/bpf/bpfrx/links"; true {
+		entries, _ := os.ReadDir(linkPinDir)
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "xdp_") {
+				path := filepath.Join(linkPinDir, e.Name())
+				_ = os.Remove(path)
+			}
+		}
+	}
 	caps := deriveUserspaceCapabilities(cfg)
 	if caps.ForwardingSupported {
 		m.inner.XDPEntryProg = "xdp_userspace_prog"
@@ -2047,23 +2061,6 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 		}
 		slog.Debug("userspace: cleared stale XSKMAP entries")
 	}
-	// Delete XDP link pins to force fresh attachment on next compile.
-	// On restart, AttachXDP() reuses pinned links and does l.Update()
-	// which is a program swap that does NOT reinit mlx5 XSK RQs.
-	// Removing the pins forces a full detach+re-attach which triggers
-	// netdev_bpf(XDP_SETUP_PROG) and properly initializes the XSK
-	// buffer pool for zero-copy fill ring consumption.
-	if linkPinDir := "/sys/fs/bpf/bpfrx/links"; true {
-		entries, _ := os.ReadDir(linkPinDir)
-		for _, e := range entries {
-			if strings.HasPrefix(e.Name(), "xdp_") {
-				path := filepath.Join(linkPinDir, e.Name())
-				if err := os.Remove(path); err == nil {
-					slog.Info("userspace: removed XDP link pin for fresh attach", "path", path)
-				}
-			}
-		}
-	}
 	pollMode := cfg.PollMode
 	if pollMode == "" {
 		pollMode = "busy-poll"
@@ -2570,6 +2567,12 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// which may fail if the kernel hasn't resolved ARP/NDP yet.
 		if !m.neighborsPrewarmed {
 			m.neighborsPrewarmed = true
+			// After enabling ctrl, send broadcast pings to generate
+			// hardware RX events that bootstrap the XSK fill ring.
+			// The first packet per queue is dropped (fill ring unconsumed)
+			// but the hardware IRQ triggers NAPI which processes
+			// xp_fill_cb and consumes fill entries for subsequent packets.
+			go m.bootstrapNAPIQueuesLocked()
 			m.proactiveNeighborResolveLocked()
 		}
 		m.refreshNeighborSnapshotLocked()
@@ -3712,43 +3715,45 @@ func (m *Manager) bootstrapNAPIQueuesLocked() {
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
 		return
 	}
-	// Force mlx5 channel reinit by cycling ethtool combined channels.
-	// Setting the same channel count tears down and recreates XSK RQs,
-	// causing the driver to read from the fill ring and post WQEs.
+	// Send ARP requests on each managed interface to generate hardware RX
+	// events from ARP replies. This triggers mlx5 NAPI which processes
+	// the XSK fill ring and posts WQEs for zero-copy packet reception.
+	// Without at least one HW RX event per queue, the fill ring entries
+	// added after socket bind are never consumed by the driver's pool.
 	seen := make(map[string]bool)
 	for ifName, ifc := range m.lastSnapshot.Config.Interfaces.Interfaces {
-		base := config.LinuxIfName(ifName)
-		if seen[base] || ifc == nil {
-			continue
-		}
-		seen[base] = true
-		// Read current combined channel count
-		out, err := exec.Command("ethtool", "-l", base).Output()
-		if err != nil {
-			continue
-		}
-		// Parse "Combined:\tN" from current settings section
-		lines := strings.Split(string(out), "\n")
-		inCurrent := false
-		var combined string
-		for _, line := range lines {
-			if strings.Contains(line, "Current hardware settings") {
-				inCurrent = true
+		for _, unit := range ifc.Units {
+			base := config.LinuxIfName(ifName)
+			linuxName := base
+			if unit.VlanID > 0 {
+				linuxName = fmt.Sprintf("%s.%d", base, unit.VlanID)
 			}
-			if inCurrent && strings.HasPrefix(line, "Combined:") {
-				combined = strings.TrimSpace(strings.TrimPrefix(line, "Combined:"))
+			if seen[linuxName] {
+				continue
+			}
+			seen[linuxName] = true
+			// Ping broadcast on each interface — ARP replies trigger HW RX
+			link, err := netlink.LinkByName(linuxName)
+			if err != nil || link == nil {
+				continue
+			}
+			addrs, _ := netlink.AddrList(link, netlink.FAMILY_V4)
+			for _, addr := range addrs {
+				if addr.IP == nil || addr.IP.To4() == nil || addr.IPNet == nil {
+					continue
+				}
+				// Compute broadcast address
+				bcast := make(net.IP, 4)
+				for i := 0; i < 4; i++ {
+					bcast[i] = addr.IP.To4()[i] | ^addr.IPNet.Mask[i]
+				}
+				cmd := exec.Command("ping", "-c", "1", "-W", "1", "-b", "-I", linuxName, bcast.String())
+				cmd.Stdout = nil
+				cmd.Stderr = nil
+				_ = cmd.Run()
 				break
 			}
 		}
-		if combined == "" || combined == "n/a" {
-			continue
-		}
-		slog.Info("userspace: reinit XSK channels via ethtool", "iface", base, "combined", combined)
-		cmd := exec.Command("ethtool", "-L", base, "combined", combined)
-		cmd.Stdout = nil
-		cmd.Stderr = nil
-		_ = cmd.Run()
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
