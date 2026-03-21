@@ -291,6 +291,91 @@ impl FlowCache {
         }
     }
 }
+// ── Precomputed Checksum Deltas ─────────────────────────────────────────
+// Compute the one's complement incremental delta for IP and L4 checksums
+// from the NAT decision. These are constant for the flow's lifetime.
+
+/// Compute IP header checksum delta from NAT IP rewrites.
+/// Returns a 16-bit value that can be added to `!old_csum` along with
+/// the TTL delta (`0x0100`) to produce the new checksum.
+fn compute_ip_csum_delta(flow: &SessionFlow, nat: &NatDecision) -> u16 {
+    let mut sum: u32 = 0;
+    // Source IP change
+    if let Some(new_src) = nat.rewrite_src {
+        if let (IpAddr::V4(old), IpAddr::V4(new)) = (flow.src_ip, new_src) {
+            let old_w = ipv4_csum_words(old);
+            let new_w = ipv4_csum_words(new);
+            sum += (!old_w[0] as u32) & 0xffff;
+            sum += (!old_w[1] as u32) & 0xffff;
+            sum += new_w[0] as u32;
+            sum += new_w[1] as u32;
+        }
+    }
+    // Dest IP change
+    if let Some(new_dst) = nat.rewrite_dst {
+        if let (IpAddr::V4(old), IpAddr::V4(new)) = (flow.dst_ip, new_dst) {
+            let old_w = ipv4_csum_words(old);
+            let new_w = ipv4_csum_words(new);
+            sum += (!old_w[0] as u32) & 0xffff;
+            sum += (!old_w[1] as u32) & 0xffff;
+            sum += new_w[0] as u32;
+            sum += new_w[1] as u32;
+        }
+    }
+    // Fold to 16 bits
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum as u16
+}
+
+/// Compute L4 (TCP/UDP) pseudo-header checksum delta from NAT rewrites.
+/// Includes both IP address and port changes.
+fn compute_l4_csum_delta(flow: &SessionFlow, nat: &NatDecision) -> u16 {
+    let mut sum: u32 = 0;
+    // IP address changes (same as IP header delta)
+    if let Some(new_src) = nat.rewrite_src {
+        if let (IpAddr::V4(old), IpAddr::V4(new)) = (flow.src_ip, new_src) {
+            let old_w = ipv4_csum_words(old);
+            let new_w = ipv4_csum_words(new);
+            sum += (!old_w[0] as u32) & 0xffff;
+            sum += (!old_w[1] as u32) & 0xffff;
+            sum += new_w[0] as u32;
+            sum += new_w[1] as u32;
+        }
+    }
+    if let Some(new_dst) = nat.rewrite_dst {
+        if let (IpAddr::V4(old), IpAddr::V4(new)) = (flow.dst_ip, new_dst) {
+            let old_w = ipv4_csum_words(old);
+            let new_w = ipv4_csum_words(new);
+            sum += (!old_w[0] as u32) & 0xffff;
+            sum += (!old_w[1] as u32) & 0xffff;
+            sum += new_w[0] as u32;
+            sum += new_w[1] as u32;
+        }
+    }
+    // Port changes
+    if let Some(new_port) = nat.rewrite_src_port {
+        let old_port = flow.forward_key.src_port;
+        sum += (!old_port as u32) & 0xffff;
+        sum += new_port as u32;
+    }
+    if let Some(new_port) = nat.rewrite_dst_port {
+        let old_port = flow.forward_key.dst_port;
+        sum += (!old_port as u32) & 0xffff;
+        sum += new_port as u32;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum as u16
+}
+
+#[inline]
+fn ipv4_csum_words(ip: Ipv4Addr) -> [u16; 2] {
+    let o = ip.octets();
+    [u16::from_be_bytes([o[0], o[1]]), u16::from_be_bytes([o[2], o[3]])]
+}
 // ── End Flow Cache ──────────────────────────────────────────────────────
 
 #[inline]
@@ -4191,8 +4276,8 @@ fn poll_binding(
                                         rewrite_dst_ip: decision.nat.rewrite_dst,
                                         rewrite_src_port: decision.nat.rewrite_src_port,
                                         rewrite_dst_port: decision.nat.rewrite_dst_port,
-                                        ip_csum_delta: 0,
-                                        l4_csum_delta: 0,
+                                        ip_csum_delta: compute_ip_csum_delta(flow, &decision.nat),
+                                        l4_csum_delta: compute_l4_csum_delta(flow, &decision.nat),
                                         egress_ifindex: decision.resolution.egress_ifindex,
                                         tx_ifindex: decision.resolution.tx_ifindex,
                                         target_binding_index: None,
