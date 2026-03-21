@@ -74,6 +74,7 @@ pub(super) fn enqueue_pending_forwards(
     right: &mut [BindingWorker],
     binding_lookup: &WorkerBindingLookup,
     pending_forwards: &mut Vec<PendingForwardRequest>,
+    post_recycles: &mut Vec<(u32, u64)>,
     now_ns: u64,
     forwarding: &ForwardingState,
     ingress_ident: &BindingIdentity,
@@ -84,7 +85,7 @@ pub(super) fn enqueue_pending_forwards(
     dbg: &mut DebugPollCounters,
 ) {
     let ingress_area = ingress_binding.umem.area() as *const MmapArea;
-    let mut post_recycles: Vec<(u32, u64)> = Vec::new();
+    post_recycles.clear();
     for request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
@@ -263,7 +264,7 @@ pub(super) fn enqueue_pending_forwards(
                 }
                 copied_source_frame = true;
                 if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
-                    let _ = drain_pending_tx(target_binding, now_ns, &mut post_recycles);
+                    let _ = drain_pending_tx(target_binding, now_ns, post_recycles);
                 }
             }
             // Track when segmentation was needed but returned None
@@ -429,7 +430,7 @@ pub(super) fn enqueue_pending_forwards(
                             || !target_binding.pending_tx_prepared.is_empty()
                             || !target_binding.pending_tx_local.is_empty())
                     {
-                        let _ = drain_pending_tx(target_binding, now_ns, &mut post_recycles);
+                        let _ = drain_pending_tx(target_binding, now_ns, post_recycles);
                         direct_tx_offset = target_binding.free_tx_frames.pop_front();
                     }
                     let direct_built = if is_nat64 || uses_native_tunnel {
@@ -628,7 +629,7 @@ pub(super) fn enqueue_pending_forwards(
             if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE
                 || target_binding.pending_tx_local.len() >= TX_BATCH_SIZE
             {
-                let _ = drain_pending_tx(target_binding, now_ns, &mut post_recycles);
+                let _ = drain_pending_tx(target_binding, now_ns, post_recycles);
             }
         }
         if !post_recycles.is_empty() {
@@ -638,7 +639,7 @@ pub(super) fn enqueue_pending_forwards(
                 ingress_binding,
                 right,
                 binding_lookup,
-                &mut post_recycles,
+                post_recycles,
             );
         }
         update_binding_debug_state(ingress_binding);
@@ -754,17 +755,18 @@ pub(super) fn apply_shared_recycles(
     binding_lookup: &WorkerBindingLookup,
     shared_recycles: &mut Vec<(u32, u64)>,
 ) {
+    if shared_recycles.is_empty() {
+        return;
+    }
     for (slot, offset) in shared_recycles.drain(..) {
         if let Some(target_index) = binding_lookup.slot_index(slot)
             && let Some(binding) =
                 binding_by_index_mut(left, current_index, current, right, target_index)
         {
             binding.pending_fill_frames.push_back(offset);
-            update_binding_debug_state(binding);
             continue;
         }
         current.pending_fill_frames.push_back(offset);
-        update_binding_debug_state(current);
     }
 }
 

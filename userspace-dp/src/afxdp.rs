@@ -26,7 +26,6 @@ use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
@@ -143,8 +142,6 @@ const MAX_RECENT_SESSION_DELTAS: usize = 64;
 const MAX_PENDING_SESSION_DELTAS: usize = 4096;
 const BIND_RETRY_ATTEMPTS: usize = 10;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
-const NEIGHBOR_PROBE_ATTEMPTS: usize = 5;
-const NEIGHBOR_PROBE_DELAY: Duration = Duration::from_millis(50);
 const DEFAULT_SLOW_PATH_TUN: &str = "bpfrx-usp0";
 const LOCAL_TUNNEL_DELIVERY_QUEUE_DEPTH: usize = 4096;
 
@@ -1668,6 +1665,9 @@ struct BindingWorker {
     scratch_fill: Vec<u64>,
     scratch_prepared_tx: Vec<PreparedTxRequest>,
     scratch_local_tx: Vec<(u64, TxRequest)>,
+    scratch_completed_offsets: Vec<u64>,
+    scratch_post_recycles: Vec<(u32, u64)>,
+    scratch_rst_teardowns: Vec<(SessionKey, NatDecision)>,
     in_flight_prepared_recycles: FastMap<u64, PreparedTxRecycle>,
     heartbeat_map_fd: c_int,
     session_map_fd: c_int,
@@ -2033,6 +2033,9 @@ impl BindingWorker {
             scratch_fill: Vec::with_capacity(FILL_BATCH_SIZE),
             scratch_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
             scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
+            scratch_completed_offsets: Vec::with_capacity(ring_entries as usize),
+            scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
+            scratch_rst_teardowns: Vec::with_capacity(16),
             in_flight_prepared_recycles: FastMap::default(),
             heartbeat_map_fd,
             session_map_fd,
@@ -2337,7 +2340,6 @@ fn poll_binding(
     let Some((binding, right)) = rest.split_first_mut() else {
         return false;
     };
-    update_binding_debug_state(binding);
     let area = binding.umem.area() as *const MmapArea;
     maybe_touch_heartbeat(binding, now_ns);
     let tx_work = drain_pending_tx(binding, now_ns, shared_recycles);
@@ -2410,7 +2412,7 @@ fn poll_binding(
         let mut received = binding.rx.receive(available);
         binding.scratch_recycle.clear();
         binding.scratch_forwards.clear();
-        let mut rst_teardowns: Vec<(SessionKey, NatDecision)> = Vec::new();
+        binding.scratch_rst_teardowns.clear();
         while let Some(desc) = received.read() {
             // Prefetch frame data into L1 while processing counters.
             // UMEM frames are cold (last touched by NIC DMA); this hides
@@ -3888,7 +3890,7 @@ fn poll_binding(
                         if should_teardown_tcp_rst(meta, flow.as_ref())
                             && let Some(flow) = flow.as_ref()
                         {
-                            rst_teardowns.push((flow.forward_key.clone(), decision.nat));
+                            binding.scratch_rst_teardowns.push((flow.forward_key.clone(), decision.nat));
                         }
                         counters.forward_candidate_packets += 1;
                         if decision.nat.rewrite_src.is_some() {
@@ -4143,7 +4145,8 @@ fn poll_binding(
         received.release();
         drop(received);
         let mut pending_forwards = core::mem::take(&mut binding.scratch_forwards);
-        for (forward_key, nat) in rst_teardowns {
+        let mut rst_teardowns = core::mem::take(&mut binding.scratch_rst_teardowns);
+        for (forward_key, nat) in rst_teardowns.drain(..) {
             // Evict from flow cache so stale entries aren't used after RST.
             let idx = FlowCache::slot(&forward_key, binding.ifindex);
             binding.flow_cache.entries[idx] = None;
@@ -4161,11 +4164,13 @@ fn poll_binding(
                 &mut pending_forwards,
             );
         }
+        binding.scratch_rst_teardowns = rst_teardowns;
         // Use raw pointer to avoid Arc::clone (~5% CPU from lock incq).
         // Safety: the Arc<BindingLiveState> outlives this function call;
         // binding is borrowed mutably by enqueue_pending_forwards but
         // ingress_live is only used for read-only error logging inside it.
         let ingress_live: *const BindingLiveState = &*binding.live;
+        let mut scratch_post_recycles = core::mem::take(&mut binding.scratch_post_recycles);
         enqueue_pending_forwards(
             left,
             binding_index,
@@ -4173,6 +4178,7 @@ fn poll_binding(
             right,
             binding_lookup,
             &mut pending_forwards,
+            &mut scratch_post_recycles,
             now_ns,
             forwarding,
             &ident,
@@ -4182,6 +4188,7 @@ fn poll_binding(
             recent_exceptions,
             dbg,
         );
+        binding.scratch_post_recycles = scratch_post_recycles;
         binding.scratch_forwards = pending_forwards;
         // Eager TX completion reaping: free TX frames immediately after
         // enqueueing forwards so they can be recycled to fill ring within
@@ -7933,140 +7940,6 @@ fn lookup_neighbor_entry(
     // active probes. Neighbor discovery is refreshed asynchronously by the
     // manager snapshot path and the periodic update_neighbors control request.
     None
-}
-
-#[allow(dead_code)]
-fn sync_dynamic_neighbors(
-    state: &ForwardingState,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
-) {
-    let mut updates = Vec::new();
-    for (ifindex, iface) in &state.egress {
-        let Some(ifname) = state.ifindex_to_name.get(ifindex) else {
-            continue;
-        };
-        updates.extend(
-            read_neighbor_entries(ifname)
-                .into_iter()
-                .map(|(ip, entry)| ((*ifindex, ip), entry)),
-        );
-        if iface.bind_ifindex > 0 && iface.bind_ifindex != *ifindex {
-            updates.extend(
-                read_neighbor_entries(ifname)
-                    .into_iter()
-                    .map(|(ip, entry)| ((iface.bind_ifindex, ip), entry)),
-            );
-        }
-    }
-    if updates.is_empty() {
-        return;
-    }
-    if let Ok(mut cache) = dynamic_neighbors.lock() {
-        for (key, entry) in updates {
-            cache.insert(key, entry);
-        }
-    }
-}
-
-fn refresh_dynamic_neighbor(ifname: &str, target: IpAddr) -> Option<NeighborEntry> {
-    if let Some(entry) = read_neighbor_entry(ifname, target) {
-        return Some(entry);
-    }
-    trigger_neighbor_probe(ifname, target);
-    for attempt in 0..NEIGHBOR_PROBE_ATTEMPTS {
-        if attempt > 0 {
-            thread::sleep(NEIGHBOR_PROBE_DELAY);
-        }
-        if let Some(entry) = read_neighbor_entry(ifname, target) {
-            return Some(entry);
-        }
-    }
-    None
-}
-
-fn read_neighbor_entry(ifname: &str, target: IpAddr) -> Option<NeighborEntry> {
-    let family = match target {
-        IpAddr::V4(_) => "-4",
-        IpAddr::V6(_) => "-6",
-    };
-    let output = Command::new("ip")
-        .args([
-            family,
-            "neigh",
-            "show",
-            "to",
-            &target.to_string(),
-            "dev",
-            ifname,
-        ])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        if let Some(entry) =
-            parse_neighbor_output(String::from_utf8_lossy(&output.stdout).as_ref(), target)
-        {
-            return Some(entry);
-        }
-    }
-    read_neighbor_entries(ifname)
-        .into_iter()
-        .find_map(|(ip, entry)| if ip == target { Some(entry) } else { None })
-}
-
-fn read_neighbor_entries(ifname: &str) -> Vec<(IpAddr, NeighborEntry)> {
-    let mut out = Vec::new();
-    for family in ["-4", "-6"] {
-        let Ok(output) = Command::new("ip")
-            .args([family, "neigh", "show", "dev", ifname])
-            .output()
-        else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        out.extend(parse_neighbor_entries(
-            String::from_utf8_lossy(&output.stdout).as_ref(),
-        ));
-    }
-    out
-}
-
-fn trigger_neighbor_probe(ifname: &str, target: IpAddr) {
-    let mut cmd = Command::new("ping");
-    match target {
-        IpAddr::V4(_) => {
-            cmd.args([
-                "-4",
-                "-c",
-                "1",
-                "-W",
-                "1",
-                "-I",
-                ifname,
-                &target.to_string(),
-            ]);
-        }
-        IpAddr::V6(_) => {
-            cmd.args([
-                "-6",
-                "-c",
-                "1",
-                "-W",
-                "1",
-                "-I",
-                ifname,
-                &target.to_string(),
-            ]);
-        }
-    }
-    let _ = cmd.output();
-}
-
-fn parse_neighbor_output(output: &str, target: IpAddr) -> Option<NeighborEntry> {
-    parse_neighbor_entries(output)
-        .into_iter()
-        .find_map(|(ip, entry)| if ip == target { Some(entry) } else { None })
 }
 
 fn parse_neighbor_entries(output: &str) -> Vec<(IpAddr, NeighborEntry)> {
