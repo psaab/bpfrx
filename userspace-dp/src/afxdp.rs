@@ -6397,7 +6397,7 @@ fn neigh_monitor_thread(
     let fd = unsafe {
         libc::socket(
             libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
             libc::NETLINK_ROUTE,
         )
     };
@@ -6421,18 +6421,20 @@ fn neigh_monitor_thread(
         unsafe { libc::close(fd) };
         return;
     }
+    // Set 500ms receive timeout for periodic stop check.
+    // Neighbor events arrive instantly via the multicast group —
+    // recv() returns immediately when the kernel pushes an update.
+    let tv = libc::timeval { tv_sec: 0, tv_usec: 500_000 };
+    unsafe {
+        libc::setsockopt(
+            fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+            &tv as *const libc::timeval as *const libc::c_void,
+            core::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
     eprintln!("neigh_monitor: listening for kernel neighbor events");
     let mut buf = vec![0u8; 8192];
     while !stop.load(Ordering::Relaxed) {
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let rc = unsafe { libc::poll(&mut pfd, 1, 10) }; // 10ms — fast neighbor learning
-        if rc <= 0 {
-            continue;
-        }
         let n = unsafe {
             libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
         };
