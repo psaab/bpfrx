@@ -1674,6 +1674,10 @@ struct BindingWorker {
     scratch_local_tx: Vec<(u64, TxRequest)>,
     scratch_completed_offsets: Vec<u64>,
     scratch_post_recycles: Vec<(u32, u64)>,
+    /// Flow cache fast-path: cross-binding in-place rewrites deferred
+    /// until after the RX batch (borrow checker prevents mutable access
+    /// to two bindings simultaneously inside the RX loop).
+    scratch_cross_binding_tx: Vec<(usize, PreparedTxRequest)>,
     scratch_rst_teardowns: Vec<(SessionKey, NatDecision)>,
     in_flight_prepared_recycles: FastMap<u64, PreparedTxRecycle>,
     heartbeat_map_fd: c_int,
@@ -2048,6 +2052,7 @@ impl BindingWorker {
             scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
             scratch_completed_offsets: Vec::with_capacity(ring_entries as usize),
             scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
+            scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
             scratch_rst_teardowns: Vec::with_capacity(16),
             in_flight_prepared_recycles: FastMap::default(),
             heartbeat_map_fd,
@@ -2864,7 +2869,6 @@ fn poll_binding(
                                 // For simplicity, only do in-place fast path when target == self.
                                 let is_self_target = target_bi == Some(binding_index);
                                 if is_self_target && owned_packet_frame.is_none() {
-                                    // In-place rewrite: frame stays in ingress UMEM.
                                     let expected_ports = authoritative_forward_ports(packet_frame, meta, Some(flow));
                                     let ingress_slot = binding.slot;
                                     let flow_key = flow.forward_key.clone();
@@ -2875,10 +2879,6 @@ fn poll_binding(
                                         &cached_decision,
                                         expected_ports,
                                     ) {
-                                        // Self-target: push to own TX prepared queue.
-                                        // Skip bound_pending_tx_prepared() to avoid double
-                                        // mutable borrow — queue overflow is checked in the
-                                        // drain loop that follows the RX batch.
                                         binding.pending_tx_prepared.push_back(PreparedTxRequest {
                                             offset: desc.addr,
                                             len: frame_len,
@@ -2894,7 +2894,7 @@ fn poll_binding(
                                         recycle_now = false;
                                     }
                                 }
-                                // Fallback: use PendingForwardRequest path for cross-UMEM or failure.
+                                // Fallback: use PendingForwardRequest path for cross-binding or failure.
                                 if recycle_now {
                                     if let Some(mut request) = build_live_forward_request_from_frame(
                                         binding_lookup,
@@ -4416,6 +4416,9 @@ fn poll_binding(
         );
         binding.scratch_post_recycles = scratch_post_recycles;
         binding.scratch_forwards = pending_forwards;
+        // Reserved: cross-binding in-place TX from flow cache fast path.
+        // Currently only self-target (hairpin) uses the inline path;
+        // cross-binding goes through enqueue_pending_forwards above.
         // Eager TX completion reaping: free TX frames immediately after
         // enqueueing forwards so they can be recycled to fill ring within
         // the same poll cycle. Without this, completions wait until next
