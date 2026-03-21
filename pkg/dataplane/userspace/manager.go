@@ -2585,8 +2585,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// and silently drop all XDP_REDIRECT'd packets.
 		if !m.neighborsPrewarmed {
 			m.neighborsPrewarmed = true
-			m.ctrlEnableAt = time.Now().Add(10 * time.Second)
-			slog.Info("userspace: delaying ctrl enable by 10s for fill ring bootstrap")
+			m.ctrlEnableAt = time.Now().Add(3 * time.Second)
+			slog.Info("userspace: delaying ctrl enable by 3s for fill ring bootstrap")
 			go m.bootstrapNAPIQueuesLocked()
 			m.proactiveNeighborResolveLocked()
 		}
@@ -2752,6 +2752,30 @@ func (m *Manager) syncLocalAddressMapsLocked(snapshot *ConfigSnapshot) error {
 		}
 		if err := localV6Map.Update(entry.v6Key, uint8(1), ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update userspace_local_v6 %+v: %w", entry.v6Key, err)
+		}
+	}
+	// Also add kernel addresses (VIPs added by VRRP) that aren't in the
+	// config snapshot. Without this, the XDP shim doesn't recognize VIP
+	// destinations as local and redirects them to XSK instead of the kernel.
+	// Use AddrList(nil, ...) to enumerate ALL addresses on the system.
+	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+		addrs, err := netlink.AddrList(nil, family)
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ip := addr.IP
+			if ip == nil {
+				continue
+			}
+			if v4 := ip.To4(); v4 != nil && family == netlink.FAMILY_V4 {
+				key := binary.BigEndian.Uint32(v4)
+				_ = localV4Map.Update(key, uint8(1), ebpf.UpdateAny)
+			} else if v6 := ip.To16(); v6 != nil && family == netlink.FAMILY_V6 {
+				var key [16]byte
+				copy(key[:], v6)
+				_ = localV6Map.Update(userspaceLocalV6Key{Addr: key}, uint8(1), ebpf.UpdateAny)
+			}
 		}
 	}
 	return nil

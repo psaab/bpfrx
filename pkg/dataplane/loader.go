@@ -34,15 +34,16 @@ const linkPinPath = "/sys/fs/bpf/bpfrx/links"
 
 // Manager manages the eBPF dataplane: programs, maps, and attachments.
 type Manager struct {
-	loaded        bool
-	programs      map[string]*ebpf.Program
-	maps          map[string]*ebpf.Map
-	xdpLinks      map[int]link.Link
-	tcLinks       map[int]link.Link
-	lastCompile   *CompileResult
-	PersistentNAT *PersistentNATTable
-	EnableCPUMap  bool // Enable cpumap multi-CPU distribution (adds startup overhead)
-	XDPEntryProg  string
+	loaded             bool
+	programs           map[string]*ebpf.Program
+	maps               map[string]*ebpf.Map
+	xdpLinks           map[int]link.Link
+	tcLinks            map[int]link.Link
+	lastCompile        *CompileResult
+	PersistentNAT      *PersistentNATTable
+	EnableCPUMap       bool // Enable cpumap multi-CPU distribution (adds startup overhead)
+	XDPEntryProg       string
+	VlanSubInterfaces  map[int]bool // VLAN sub-interface ifindexes (skip XDP swap for these)
 }
 
 // New creates a new dataplane Manager.
@@ -52,8 +53,9 @@ func New() *Manager {
 		maps:          make(map[string]*ebpf.Map),
 		xdpLinks:      make(map[int]link.Link),
 		tcLinks:       make(map[int]link.Link),
-		PersistentNAT: NewPersistentNATTable(),
-		XDPEntryProg:  "xdp_main_prog",
+		PersistentNAT:     NewPersistentNATTable(),
+		XDPEntryProg:      "xdp_main_prog",
+		VlanSubInterfaces: make(map[int]bool),
 	}
 }
 
@@ -158,6 +160,13 @@ func (m *Manager) SwapXDPEntryProg(name string) error {
 	}
 	var errs []error
 	for ifindex, l := range m.xdpLinks {
+		// Skip VLAN sub-interfaces: the parent's XDP handles VLAN-tagged
+		// traffic. Swapping the shim onto VLAN sub-interfaces breaks NDP
+		// because generic XDP + XDP_PASS doesn't properly deliver to the
+		// kernel's IPv6 NDP stack on VLAN devices.
+		if m.VlanSubInterfaces[ifindex] {
+			continue
+		}
 		if err := l.Update(prog); err != nil {
 			errs = append(errs, fmt.Errorf("swap XDP on ifindex %d: %w", ifindex, err))
 		}

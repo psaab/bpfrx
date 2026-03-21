@@ -135,6 +135,13 @@ const RX_WAKE_MIN_INTERVAL_NS: u64 = 200_000;
 /// (clear) → kernel exhausts cache → sets needs_wakeup → userspace doesn't see it.
 const FILL_WAKE_SAFETY_INTERVAL_NS: u64 = 500_000; // 500µs
 const HEARTBEAT_UPDATE_INTERVAL_NS: u64 = 250_000_000;
+/// Grace period after binding before writing heartbeat. During this window
+/// the XDP shim sees no heartbeat → XDP_PASS → kernel forwards packets AND
+/// NAPI bootstraps the NIC's XSK receive queue from the fill ring. After
+/// this period, heartbeat is written and the XDP shim redirects to XSK.
+/// Must exceed the Go-side ctrl enable delay (3s) plus time for
+/// NAPI to bootstrap the XSK RQ from the fill ring (~2-3 seconds).
+const HEARTBEAT_GRACE_PERIOD_NS: u64 = 6_000_000_000; // 6 seconds
 const TX_WAKE_MIN_INTERVAL_NS: u64 = 50_000;
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
@@ -1707,6 +1714,12 @@ struct BindingWorker {
     pending_in_place_tx_packets: u64,
     flow_cache: FlowCache,
     flow_cache_session_touch: u64,
+    /// Timestamp when this binding was created, used to enforce a grace
+    /// period before writing heartbeat (NAPI needs time to bootstrap).
+    bind_time_ns: u64,
+    /// Set true once the XSK RX ring has delivered at least one packet,
+    /// proving the NIC's XSK receive queue is active for this binding.
+    xsk_rx_confirmed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2073,6 +2086,12 @@ impl BindingWorker {
             pending_in_place_tx_packets: 0,
             flow_cache: FlowCache::new(),
             flow_cache_session_touch: 0,
+            bind_time_ns: {
+                let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+                ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+            },
+            xsk_rx_confirmed: false,
         };
         update_binding_debug_state(&mut binding);
         Ok(binding)
@@ -2383,6 +2402,9 @@ fn poll_binding(
 
         let raw_avail = binding.rx.available();
         let available = raw_avail.min(RX_BATCH_SIZE);
+        if raw_avail > 0 && !binding.xsk_rx_confirmed {
+            binding.xsk_rx_confirmed = true;
+        }
         if cfg!(feature = "debug-log") {
             if raw_avail > 0 {
                 binding.dbg_rx_avail_nonzero += 1;
@@ -2603,6 +2625,16 @@ fn poll_binding(
                                         NeighborEntry { mac: sender_mac },
                                     );
                                 }
+                                // Add learned ARP entry to kernel neighbor table
+                                // via netlink. This keeps the kernel's ARP table
+                                // in sync (needed for XDP_PASS fallback and
+                                // kernel-originated traffic).
+                                let neigh_ifindex = resolve_ingress_logical_ifindex(
+                                    forwarding,
+                                    meta.ingress_ifindex as i32,
+                                    meta.ingress_vlan_id,
+                                ).unwrap_or(meta.ingress_ifindex as i32);
+                                add_kernel_neighbor(neigh_ifindex, sender_ip, sender_mac);
                             }
                             // Recycle frame — ARP is not a transit packet
                             binding.scratch_recycle.push(desc.addr);
@@ -2663,14 +2695,21 @@ fn poll_binding(
                                                     NeighborEntry { mac },
                                                 );
                                             }
+                                            // Add to kernel neighbor table via netlink.
+                                            // Use the logical VLAN sub-interface ifindex
+                                            // so the kernel associates it correctly.
+                                            let neigh_ifindex = resolve_ingress_logical_ifindex(
+                                                forwarding,
+                                                meta.ingress_ifindex as i32,
+                                                meta.ingress_vlan_id,
+                                            ).unwrap_or(meta.ingress_ifindex as i32);
+                                            add_kernel_neighbor(neigh_ifindex, target_ip, mac);
                                             break;
                                         }
                                         opt_off += opt_len;
                                     }
                                 }
-                                // Don't consume — let the NA fall through to normal
-                                // processing so it also reaches the kernel via
-                                // slow-path if needed.
+                                // Also let the NA fall through to normal processing.
                             }
                         }
                     }
@@ -6104,6 +6143,69 @@ fn send_raw_frame(ifindex: i32, frame: &[u8]) {
     }
 }
 
+/// Add a neighbor entry to the kernel's neighbor table via raw netlink.
+/// This ensures the kernel can forward IPv6 (and IPv4) traffic to hosts
+/// whose ARP/NDP replies were captured by XSK instead of reaching the kernel.
+fn add_kernel_neighbor(ifindex: i32, ip: IpAddr, mac: [u8; 6]) {
+    // RTM_NEWNEIGH = 28, NLM_F_REQUEST=1, NLM_F_CREATE=0x400, NLM_F_REPLACE=0x100
+    const RTM_NEWNEIGH: u16 = 28;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_CREATE: u16 = 0x400;
+    const NLM_F_REPLACE: u16 = 0x100;
+    const NDA_DST: u16 = 1;
+    const NDA_LLADDR: u16 = 2;
+    const NUD_REACHABLE: u16 = 0x02;
+    let (family, ip_bytes): (u8, Vec<u8>) = match ip {
+        IpAddr::V4(v4) => (libc::AF_INET as u8, v4.octets().to_vec()),
+        IpAddr::V6(v6) => (libc::AF_INET6 as u8, v6.octets().to_vec()),
+    };
+    let ip_attr_len = 4 + ip_bytes.len(); // NLA header (4) + payload
+    let ip_attr_padded = (ip_attr_len + 3) & !3;
+    let mac_attr_len = 4 + 6;
+    let mac_attr_padded = (mac_attr_len + 3) & !3;
+    // ndmsg: family(1) + pad1(1) + pad2(2) + ifindex(4) + state(2) + flags(1) + type(1) = 12
+    let ndmsg_len = 12;
+    let total_len = 16 + ndmsg_len + ip_attr_padded + mac_attr_padded; // nlmsghdr(16) + ndmsg + attrs
+    let mut buf = vec![0u8; total_len];
+    // nlmsghdr
+    buf[0..4].copy_from_slice(&(total_len as u32).to_ne_bytes());
+    buf[4..6].copy_from_slice(&RTM_NEWNEIGH.to_ne_bytes());
+    buf[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_CREATE | NLM_F_REPLACE).to_ne_bytes());
+    buf[8..12].copy_from_slice(&1u32.to_ne_bytes()); // seq
+    buf[12..16].copy_from_slice(&0u32.to_ne_bytes()); // pid
+    // ndmsg
+    buf[16] = family;
+    buf[20..24].copy_from_slice(&ifindex.to_ne_bytes());
+    buf[24..26].copy_from_slice(&NUD_REACHABLE.to_ne_bytes());
+    // NDA_DST attribute
+    let off = 16 + ndmsg_len;
+    buf[off..off + 2].copy_from_slice(&(ip_attr_len as u16).to_ne_bytes());
+    buf[off + 2..off + 4].copy_from_slice(&NDA_DST.to_ne_bytes());
+    buf[off + 4..off + 4 + ip_bytes.len()].copy_from_slice(&ip_bytes);
+    // NDA_LLADDR attribute
+    let off2 = off + ip_attr_padded;
+    buf[off2..off2 + 2].copy_from_slice(&(mac_attr_len as u16).to_ne_bytes());
+    buf[off2 + 2..off2 + 4].copy_from_slice(&NDA_LLADDR.to_ne_bytes());
+    buf[off2 + 4..off2 + 10].copy_from_slice(&mac);
+    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return;
+    }
+    let mut sa: libc::sockaddr_nl = unsafe { core::mem::zeroed() };
+    sa.nl_family = libc::AF_NETLINK as u16;
+    unsafe {
+        libc::sendto(
+            fd,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+            libc::MSG_DONTWAIT,
+            &sa as *const libc::sockaddr_nl as *const libc::sockaddr,
+            core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        );
+        libc::close(fd);
+    }
+}
+
 fn pin_current_thread(worker_id: u32) {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -8351,6 +8453,19 @@ fn delete_heartbeat_slot(map_fd: c_int, slot: u32) -> io::Result<()> {
 }
 
 fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
+    // Only write heartbeat once the XSK RX ring has delivered at least
+    // one packet, proving the NIC's XSK receive queue is active for this
+    // binding. Before that, the XDP shim sees no heartbeat → XDP_PASS →
+    // kernel forwards normally. This solves the zero-copy bootstrap
+    // problem: after fresh bind, the NIC's XSK RQ needs its own NAPI
+    // cycle to post fill ring entries as HW DMA WQEs. Background traffic
+    // (VRRP, heartbeats, ARP) or iperf3 load on the interface triggers
+    // this NAPI activity, bootstrapping the XSK RQ. Once working, the
+    // heartbeat is written and XDP redirects to XSK for full speed.
+    // Quiet queues (no traffic yet) stay on XDP_PASS — correct but slower.
+    if !binding.xsk_rx_confirmed {
+        return;
+    }
     let age_ns = now_ns.saturating_sub(binding.last_heartbeat_update_ns);
     if age_ns < HEARTBEAT_UPDATE_INTERVAL_NS {
         return;

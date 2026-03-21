@@ -389,7 +389,10 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             &parsed,
         );
         incr_fallback_stat(USERSPACE_FALLBACK_REASON_BINDING_NOT_READY);
-        return Ok(xdp_action::XDP_DROP);
+        // XDP_PASS instead of DROP: this fires on VLAN sub-interfaces that
+        // have the XDP shim attached but no XSK binding (XSK binds to the
+        // parent HW interface only). Must pass to kernel for VLAN demux.
+        return Ok(xdp_action::XDP_PASS);
     }
     let last_heartbeat = USERSPACE_HEARTBEAT.get(binding.slot);
     let Some(last_heartbeat) = last_heartbeat else {
@@ -404,7 +407,10 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             &parsed,
         );
         incr_fallback_stat(USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING);
-        return Ok(xdp_action::XDP_DROP);
+        // Fall back to eBPF pipeline instead of dropping. This lets
+        // the kernel forward the packet AND generates a hardware RX
+        // event that bootstraps the XSK fill ring for this queue.
+        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING);
     };
     let timeout_ms = if ctrl.heartbeat_timeout_ms == 0 {
         USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS
@@ -425,7 +431,9 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             &parsed,
         );
         incr_fallback_stat(USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
-        return Ok(xdp_action::XDP_DROP);
+        // Fall back to eBPF pipeline instead of dropping — same rationale
+        // as heartbeat-missing: let kernel forward + bootstrap fill ring.
+        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
     }
 
     let packet_len = data_end.saturating_sub(data);
@@ -812,15 +820,16 @@ fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize
 
 fn fallback_to_main(ctx: &XdpContext, _ctrl: &UserspaceCtrl, reason: u32) -> Result<u32, i64> {
     incr_fallback_stat(reason);
-    // Always tail-call to the main eBPF pipeline for firewall processing.
-    // The main pipeline handles zone lookup, policy, NAT, and forwarding.
-    // Do NOT use cpumap here — it bypasses the firewall entirely.
-    // XDP_PASS from the main pipeline is safe in zero-copy mode: mlx5
-    // copies data and frees the XSK buffer automatically.
+    // Try tail-call to the main eBPF pipeline for full firewall processing.
     unsafe {
         let _ = USERSPACE_FALLBACK_PROGS.tail_call(ctx, USERSPACE_FALLBACK_MAIN);
     }
-    Ok(xdp_action::XDP_DROP)
+    // Tail call failed (known aya-ebpf issue). Fall back to XDP_PASS so the
+    // kernel stack can forward the packet via its routing table. This keeps
+    // the zero-copy fill ring healthy (mlx5 copies data to SKB, recycles
+    // UMEM buffer). TC egress still enforces egress policy. Once heartbeat
+    // is established, XSK takes over for full userspace processing.
+    Ok(xdp_action::XDP_PASS)
 }
 
 fn incr_fallback_stat(reason: u32) {

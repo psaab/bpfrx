@@ -332,10 +332,19 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		}
 		// Attach remaining interfaces: generic-only for tunnels,
 		// VLAN child subinterfaces, or all interfaces if needGeneric.
+		// Skip VLAN sub-interfaces when the userspace XDP shim is active —
+		// the parent's XDP handles VLAN-tagged traffic. Attaching the shim
+		// to VLAN sub-interfaces (generic XDP) breaks IPv6 NDP because
+		// XDP_PASS on generic mode doesn't properly deliver NDP to the
+		// kernel on VLAN devices.
+		isUserspaceShim := m.XDPEntryProg == "xdp_userspace_prog"
 		for _, ifidx := range result.pendingXDP {
 			forceGeneric := needGeneric || result.tunnelIfindexes[ifidx] || result.genericXDPIfindexes[ifidx]
 			if !forceGeneric {
 				continue // already attached native above
+			}
+			if isUserspaceShim && result.genericXDPIfindexes[ifidx] && !result.tunnelIfindexes[ifidx] {
+				continue // skip VLAN sub-interfaces with userspace shim
 			}
 			if err := m.AttachXDP(ifidx, true); err != nil {
 				if !strings.Contains(err.Error(), "already attached") {
@@ -345,6 +354,14 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 		}
 	}
 
+	// Record VLAN sub-interfaces so SwapXDPEntryProg can skip them.
+	// The shim on VLAN sub-interfaces breaks NDP because generic XDP
+	// + XDP_PASS doesn't deliver properly to kernel NDP on VLAN devices.
+	for ifidx := range result.genericXDPIfindexes {
+		if !result.tunnelIfindexes[ifidx] {
+			m.VlanSubInterfaces[ifidx] = true
+		}
+	}
 	m.lastCompile = result
 	return result, nil
 }

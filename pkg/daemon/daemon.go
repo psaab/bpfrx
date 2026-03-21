@@ -350,7 +350,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// Without this, standalone nodes or nodes with permanently-down
 		// peers would never become primary.
 		if cc.PrivateRGElection && cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
-			time.AfterFunc(30*time.Second, func() {
+			time.AfterFunc(5*time.Second, func() {
 				if !d.cluster.IsSyncReady() {
 					slog.Info("cluster: sync readiness timeout, releasing hold")
 					d.cluster.SetSyncReady(true)
