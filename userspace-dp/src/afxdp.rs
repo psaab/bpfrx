@@ -6252,24 +6252,39 @@ fn monotonic_timestamp_to_datetime(
 /// Send a raw Ethernet frame via AF_PACKET on the given interface.
 /// Used for ARP/NDP solicitations that must bypass XSK (because the
 /// XSK fill ring may not be bootstrapped on the egress interface).
+
 fn send_raw_frame(ifindex: i32, frame: &[u8]) {
+    if frame.len() < 14 {
+        return;
+    }
+    let proto = u16::from_be_bytes([frame[12], frame[13]]);
+    // Create a fresh socket per-send. VLAN sub-interfaces require bind()
+    // before send — a persistent unbound socket with sendto(sll_ifindex)
+    // doesn't work reliably on VLAN devices.
     let fd = unsafe {
         libc::socket(
             libc::AF_PACKET,
             libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
+            (proto as i32).to_be(),
         )
     };
     if fd < 0 {
         return;
     }
-    let mut addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
-    addr.sll_family = libc::AF_PACKET as u16;
-    addr.sll_ifindex = ifindex;
-    addr.sll_halen = 6;
-    if frame.len() >= 6 {
-        addr.sll_addr[..6].copy_from_slice(&frame[..6]);
+    let mut bind_addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
+    bind_addr.sll_family = libc::AF_PACKET as u16;
+    bind_addr.sll_ifindex = ifindex;
+    bind_addr.sll_protocol = proto.to_be();
+    unsafe {
+        libc::bind(
+            fd,
+            &bind_addr as *const libc::sockaddr_ll as *const libc::sockaddr,
+            core::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        );
     }
+    let mut addr: libc::sockaddr_ll = bind_addr;
+    addr.sll_halen = 6;
+    addr.sll_addr[..6].copy_from_slice(&frame[..6]);
     unsafe {
         libc::sendto(
             fd,

@@ -317,12 +317,15 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let data = ctx.data();
     let data_end = ctx.data_end();
     let Some((eth_proto, vlan_id, l3_offset)) = parse_l2(data, data_end) else {
-        return Ok(cpumap_or_pass(ctrl));
+        return Ok(xdp_action::XDP_PASS);
     };
     let parsed = match eth_proto {
         ETH_P_IP => parse_ipv4(data, data_end, vlan_id, l3_offset),
         ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, l3_offset),
-        _ => return Ok(cpumap_or_pass(ctrl)),
+        // Non-IP (ARP, LLDP, etc.) must use XDP_PASS, not cpumap.
+        // cpumap delivers at L3, skipping L2 ARP processing — the kernel
+        // never learns ARP entries from cpumap'd ARP replies.
+        _ => return Ok(xdp_action::XDP_PASS),
     };
     let Some(parsed) = parsed else {
         return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
