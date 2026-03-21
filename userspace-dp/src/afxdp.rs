@@ -4370,20 +4370,12 @@ fn poll_binding(
                                         }
                                     }
                                 }
-                                // Always reinject to slow-path — kernel forwards
-                                // the packet once ARP/NDP resolves via the raw
-                                // socket solicitation above.
-                                maybe_reinject_slow_path_from_frame(
-                                    &ident,
-                                    &binding.live,
-                                    slow_path,
-                                    local_tunnel_deliveries,
-                                    packet_frame,
-                                    meta,
-                                    decision,
-                                    recent_exceptions,
-                                    "missing_neighbor_slow_path",
-                                );
+                                // Drop the packet — don't reinject to kernel slow
+                                // path. The ARP/NDP solicitation above resolves in
+                                // <1ms. The sender (TCP SYN, UDP, ICMP) retransmits
+                                // and finds the neighbor resolved on the next attempt.
+                                // This eliminates the kernel forwarding dependency
+                                // and keeps all transit traffic in the userspace path.
                                 if cfg!(feature = "debug-log") {
                                     if dbg.missing_neigh <= 3 {
                                         if let Some(flow) = flow.as_ref() {
