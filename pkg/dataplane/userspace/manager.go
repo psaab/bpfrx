@@ -2079,6 +2079,20 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	}
 	m.cfg = cfg
 	m.proc = cmd
+	// Bootstrap XSK fill ring on all queues: send broadcast pings
+	// 3 seconds after helper start. During this window, ctrl is disabled
+	// so the XDP shim falls back to eBPF. The broadcast pings generate
+	// hardware RX events on multiple queues, triggering NAPI which
+	// consumes fill ring entries and posts WQEs for zero-copy.
+	go func() {
+		time.Sleep(3 * time.Second)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.proc == nil {
+			return
+		}
+		m.bootstrapNAPIQueuesLocked()
+	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(cfg.ControlSocket); err == nil {
