@@ -3746,6 +3746,44 @@ func (m *Manager) proactiveNeighborResolveLocked() {
 			}
 		}
 	}
+	// Also resolve route next-hops that aren't in the neighbor table yet.
+	// After VRRP election, the kernel may not have ARP for destinations
+	// like .200 that were previously known but got purged on restart.
+	routes, _ := netlink.RouteList(nil, netlink.FAMILY_ALL)
+	for _, r := range routes {
+		if r.Gw == nil || r.Gw.IsLinkLocalUnicast() {
+			continue
+		}
+		link, err := netlink.LinkByIndex(r.LinkIndex)
+		if err != nil || link == nil {
+			continue
+		}
+		ifName := link.Attrs().Name
+		if !seen[ifName] {
+			continue // only managed interfaces
+		}
+		// Check if this gateway is already in neighbor table
+		existing, _ := netlink.NeighList(r.LinkIndex, netlink.FAMILY_ALL)
+		found := false
+		for _, n := range existing {
+			if n.IP.Equal(r.Gw) && n.HardwareAddr != nil && len(n.HardwareAddr) > 0 &&
+				n.State != netlink.NUD_FAILED {
+				found = true
+				break
+			}
+		}
+		if !found {
+			pingCmd := "ping"
+			if r.Gw.To4() == nil {
+				pingCmd = "ping6"
+			}
+			cmd := exec.Command(pingCmd, "-c", "1", "-W", "1", "-I", ifName, r.Gw.String())
+			cmd.Stdout = nil
+			cmd.Stderr = nil
+			_ = cmd.Run()
+			resolved++
+		}
+	}
 	if resolved > 0 {
 		slog.Info("userspace: proactive neighbor resolution",
 			"resolved", resolved, "interfaces", len(ifaces))

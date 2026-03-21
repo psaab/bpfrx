@@ -3488,3 +3488,84 @@ pub(super) fn try_parse_metadata(area: &MmapArea, desc: XdpDesc) -> Option<Users
     }
     Some(meta)
 }
+
+/// Build an ICMPv6 Neighbor Solicitation frame (86 bytes).
+/// Uses solicited-node multicast destination (ff02::1:ffXX:XXXX).
+pub(super) fn build_ndp_neighbor_solicitation(
+    src_mac: [u8; 6],
+    src_ip: Ipv6Addr,
+    target_ip: Ipv6Addr,
+) -> Vec<u8> {
+    let target_bytes = target_ip.octets();
+    // Solicited-node multicast: ff02::1:ff00:0000 | last 24 bits of target
+    let sol_node: [u8; 16] = [
+        0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, target_bytes[13], target_bytes[14],
+        target_bytes[15],
+    ];
+    // Multicast MAC: 33:33:XX:XX:XX:XX (last 4 bytes of multicast IP)
+    let dst_mac = [
+        0x33, 0x33, sol_node[12], sol_node[13], sol_node[14], sol_node[15],
+    ];
+
+    let mut frame = Vec::with_capacity(86);
+    // Ethernet header (14 bytes)
+    frame.extend_from_slice(&dst_mac);
+    frame.extend_from_slice(&src_mac);
+    frame.extend_from_slice(&[0x86, 0xdd]); // ethertype: IPv6
+
+    // IPv6 header (40 bytes)
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]); // version=6, TC=0, flow=0
+    frame.extend_from_slice(&[0x00, 0x20]); // payload length = 32 (NS + option)
+    frame.push(58); // next header: ICMPv6
+    frame.push(255); // hop limit
+    frame.extend_from_slice(&src_ip.octets()); // source
+    frame.extend_from_slice(&sol_node); // destination (solicited-node multicast)
+
+    // ICMPv6 Neighbor Solicitation (32 bytes)
+    // type=135, code=0, checksum placeholder, reserved(4), target(16), option(8)
+    let icmpv6_start = frame.len();
+    frame.push(135); // type: NS
+    frame.push(0); // code
+    frame.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+    frame.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // reserved
+    frame.extend_from_slice(&target_bytes); // target address
+    // Source link-layer address option (8 bytes)
+    frame.push(1); // option type: source link-layer address
+    frame.push(1); // option length: 1 (in units of 8 bytes)
+    frame.extend_from_slice(&src_mac);
+
+    // Compute ICMPv6 checksum using the existing helper.
+    // checksum16_ipv6 expects the ICMPv6 body with the checksum field zeroed.
+    let sol_node_addr = Ipv6Addr::from(sol_node);
+    let csum = checksum16_ipv6(src_ip, sol_node_addr, 58, &frame[icmpv6_start..]);
+    frame[icmpv6_start + 2] = (csum >> 8) as u8;
+    frame[icmpv6_start + 3] = (csum & 0xff) as u8;
+
+    frame
+}
+
+/// Build a 42-byte ARP request frame.
+pub(super) fn build_arp_request(
+    src_mac: [u8; 6],
+    src_ip: Ipv4Addr,
+    target_ip: Ipv4Addr,
+) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(42);
+    // Ethernet header
+    frame.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]); // dst: broadcast
+    frame.extend_from_slice(&src_mac);
+    frame.extend_from_slice(&[0x08, 0x06]); // ethertype: ARP
+    // ARP header
+    frame.extend_from_slice(&[0x00, 0x01]); // hardware type: Ethernet
+    frame.extend_from_slice(&[0x08, 0x00]); // protocol type: IPv4
+    frame.push(6); // hardware size
+    frame.push(4); // protocol size
+    frame.extend_from_slice(&[0x00, 0x01]); // opcode: request
+    // Sender
+    frame.extend_from_slice(&src_mac);
+    frame.extend_from_slice(&src_ip.octets());
+    // Target
+    frame.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // target MAC: unknown
+    frame.extend_from_slice(&target_ip.octets());
+    frame
+}

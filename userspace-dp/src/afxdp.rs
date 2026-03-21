@@ -2562,6 +2562,118 @@ fn poll_binding(
                         binding.scratch_recycle.push(desc.addr);
                         continue;
                     };
+                    // Check for ARP reply (ethertype 0x0806, opcode 0x0002).
+                    // Parse it and update the dynamic neighbor cache.
+                    // Handles both untagged and VLAN-tagged (802.1Q) ARP frames.
+                    if raw_frame.len() >= 42 {
+                        let (arp_start, ethertype) = if raw_frame.len() >= 18
+                            && u16::from_be_bytes([raw_frame[12], raw_frame[13]]) == 0x8100
+                        {
+                            (18, u16::from_be_bytes([raw_frame[16], raw_frame[17]]))
+                        } else {
+                            (14, u16::from_be_bytes([raw_frame[12], raw_frame[13]]))
+                        };
+                        if ethertype == 0x0806
+                            && raw_frame.len() >= arp_start + 28
+                        {
+                            let opcode = u16::from_be_bytes([
+                                raw_frame[arp_start + 6],
+                                raw_frame[arp_start + 7],
+                            ]);
+                            if opcode == 2 {
+                                // ARP reply — extract sender MAC and IP
+                                let sender_mac = [
+                                    raw_frame[arp_start + 8],
+                                    raw_frame[arp_start + 9],
+                                    raw_frame[arp_start + 10],
+                                    raw_frame[arp_start + 11],
+                                    raw_frame[arp_start + 12],
+                                    raw_frame[arp_start + 13],
+                                ];
+                                let sender_ip = IpAddr::V4(Ipv4Addr::new(
+                                    raw_frame[arp_start + 14],
+                                    raw_frame[arp_start + 15],
+                                    raw_frame[arp_start + 16],
+                                    raw_frame[arp_start + 17],
+                                ));
+                                // Update dynamic neighbor cache
+                                if let Ok(mut neighbors) = dynamic_neighbors.lock() {
+                                    neighbors.insert(
+                                        (meta.ingress_ifindex as i32, sender_ip),
+                                        NeighborEntry { mac: sender_mac },
+                                    );
+                                }
+                            }
+                            // Recycle frame — ARP is not a transit packet
+                            binding.scratch_recycle.push(desc.addr);
+                            continue;
+                        }
+                    }
+                    // Check for ICMPv6 Neighbor Advertisement (type 136).
+                    // Parse the target address and target link-layer address option,
+                    // then update the dynamic neighbor cache.
+                    // Handles both untagged and VLAN-tagged (802.1Q) IPv6 frames.
+                    if raw_frame.len() >= 78 {
+                        let (l3_start, ethertype) = if raw_frame.len() >= 18
+                            && u16::from_be_bytes([raw_frame[12], raw_frame[13]]) == 0x8100
+                        {
+                            (18, u16::from_be_bytes([raw_frame[16], raw_frame[17]]))
+                        } else {
+                            (14, u16::from_be_bytes([raw_frame[12], raw_frame[13]]))
+                        };
+                        if ethertype == 0x86dd && raw_frame.len() >= l3_start + 40 {
+                            let next_header = raw_frame[l3_start + 6];
+                            let l4_start = l3_start + 40;
+                            // ICMPv6 NA: next_header=58, type=136, need at least 24 bytes of ICMPv6 body
+                            if next_header == 58
+                                && raw_frame.len() >= l4_start + 24
+                                && raw_frame[l4_start] == 136
+                            {
+                                // Target address at ICMPv6 offset + 8 (after type/code/checksum/flags)
+                                if let Ok(target_bytes) =
+                                    <[u8; 16]>::try_from(&raw_frame[l4_start + 8..l4_start + 24])
+                                {
+                                    let target_ip =
+                                        IpAddr::V6(Ipv6Addr::from(target_bytes));
+                                    // Look for target link-layer address option (type 2)
+                                    let mut opt_off = l4_start + 24;
+                                    while opt_off + 2 <= raw_frame.len() {
+                                        let opt_type = raw_frame[opt_off];
+                                        let opt_len = raw_frame[opt_off + 1] as usize * 8;
+                                        if opt_len == 0 {
+                                            break;
+                                        }
+                                        if opt_type == 2
+                                            && opt_len >= 8
+                                            && opt_off + 8 <= raw_frame.len()
+                                        {
+                                            let mac = [
+                                                raw_frame[opt_off + 2],
+                                                raw_frame[opt_off + 3],
+                                                raw_frame[opt_off + 4],
+                                                raw_frame[opt_off + 5],
+                                                raw_frame[opt_off + 6],
+                                                raw_frame[opt_off + 7],
+                                            ];
+                                            if let Ok(mut neighbors) =
+                                                dynamic_neighbors.lock()
+                                            {
+                                                neighbors.insert(
+                                                    (meta.ingress_ifindex as i32, target_ip),
+                                                    NeighborEntry { mac },
+                                                );
+                                            }
+                                            break;
+                                        }
+                                        opt_off += opt_len;
+                                    }
+                                }
+                                // Don't consume — let the NA fall through to normal
+                                // processing so it also reaches the kernel via
+                                // slow-path if needed.
+                            }
+                        }
+                    }
                     let native_gre_packet =
                         try_native_gre_decap_from_frame(raw_frame, meta, forwarding);
                     let meta = native_gre_packet
@@ -4060,24 +4172,109 @@ fn poll_binding(
                             }
                             ForwardingDisposition::MissingNeighbor => {
                                 dbg.missing_neigh += 1;
-                                // Reinject to slow-path so kernel can forward
-                                // (kernel has ARP table, we don't yet).
-                                maybe_reinject_slow_path_from_frame(
-                                    &ident,
-                                    &binding.live,
-                                    slow_path,
-                                    local_tunnel_deliveries,
-                                    packet_frame,
-                                    meta,
-                                    decision,
-                                    recent_exceptions,
-                                    "missing_neighbor_slow_path",
-                                );
+                                // Send ARP request (IPv4) or NDP Neighbor Solicitation
+                                // (IPv6) for the missing next-hop via egress TX.
+                                let mut solicit_sent = false;
+                                if let Some(next_hop) = decision.resolution.next_hop {
+                                    if let IpAddr::V4(target_v4) = next_hop {
+                                        if let Some(egress) = forwarding.egress.get(&decision.resolution.egress_ifindex) {
+                                            if let Some(src_v4) = egress.primary_v4 {
+                                                let arp_frame = build_arp_request(
+                                                    egress.src_mac,
+                                                    src_v4,
+                                                    target_v4,
+                                                );
+                                                let target_ifindex = if decision.resolution.tx_ifindex > 0 {
+                                                    decision.resolution.tx_ifindex
+                                                } else {
+                                                    resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
+                                                };
+                                                let target_binding_index = binding_lookup.target_index(
+                                                    binding_index,
+                                                    ident.ifindex,
+                                                    ident.queue_id,
+                                                    target_ifindex,
+                                                );
+                                                binding.scratch_forwards.push(PendingForwardRequest {
+                                                    target_ifindex,
+                                                    target_binding_index,
+                                                    ingress_queue_id: ident.queue_id,
+                                                    source_offset: desc.addr,
+                                                    desc,
+                                                    source_frame: None,
+                                                    meta,
+                                                    decision,
+                                                    apply_nat_on_fabric: false,
+                                                    expected_ports: None,
+                                                    flow_key: None,
+                                                    nat64_reverse: None,
+                                                    prebuilt_frame: Some(arp_frame),
+                                                });
+                                                recycle_now = false;
+                                                solicit_sent = true;
+                                            }
+                                        }
+                                    } else if let IpAddr::V6(target_v6) = next_hop {
+                                        if let Some(egress) = forwarding.egress.get(&decision.resolution.egress_ifindex) {
+                                            if let Some(src_v6) = egress.primary_v6 {
+                                                let ns_frame = build_ndp_neighbor_solicitation(
+                                                    egress.src_mac,
+                                                    src_v6,
+                                                    target_v6,
+                                                );
+                                                let target_ifindex = if decision.resolution.tx_ifindex > 0 {
+                                                    decision.resolution.tx_ifindex
+                                                } else {
+                                                    resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
+                                                };
+                                                let target_binding_index = binding_lookup.target_index(
+                                                    binding_index,
+                                                    ident.ifindex,
+                                                    ident.queue_id,
+                                                    target_ifindex,
+                                                );
+                                                binding.scratch_forwards.push(PendingForwardRequest {
+                                                    target_ifindex,
+                                                    target_binding_index,
+                                                    ingress_queue_id: ident.queue_id,
+                                                    source_offset: desc.addr,
+                                                    desc,
+                                                    source_frame: None,
+                                                    meta,
+                                                    decision,
+                                                    apply_nat_on_fabric: false,
+                                                    expected_ports: None,
+                                                    flow_key: None,
+                                                    nat64_reverse: None,
+                                                    prebuilt_frame: Some(ns_frame),
+                                                });
+                                                recycle_now = false;
+                                                solicit_sent = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                // ALSO send to slow-path as fallback — the kernel may resolve
+                                // the neighbor even if our solicitation fails.
+                                if !solicit_sent {
+                                    maybe_reinject_slow_path_from_frame(
+                                        &ident,
+                                        &binding.live,
+                                        slow_path,
+                                        local_tunnel_deliveries,
+                                        packet_frame,
+                                        meta,
+                                        decision,
+                                        recent_exceptions,
+                                        "missing_neighbor_slow_path",
+                                    );
+                                }
                                 if cfg!(feature = "debug-log") {
                                     if dbg.missing_neigh <= 3 {
                                         if let Some(flow) = flow.as_ref() {
                                             eprintln!(
-                                                "DBG MISS_NEIGH→SLOW: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
+                                                "DBG MISS_NEIGH→{}: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
+                                                if solicit_sent { "SOLICIT" } else { "SLOW" },
                                                 flow.src_ip,
                                                 flow.forward_key.src_port,
                                                 flow.dst_ip,
