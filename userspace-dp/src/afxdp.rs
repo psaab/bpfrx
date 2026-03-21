@@ -2819,11 +2819,12 @@ fn poll_binding(
                         }
                     }
                     // ── Flow cache fast path ────────────────────────────
-                    // For established TCP (ACK set, no SYN/FIN/RST), check
-                    // the per-binding flow cache before the expensive session
-                    // lookup + policy + NAT + FIB path.
-                    if meta.protocol == PROTO_TCP
-                        && (meta.tcp_flags & 0x17) == 0x10  // ACK only, no SYN/FIN/RST
+                    // For established TCP (ACK-only) and UDP, check the per-
+                    // binding flow cache before the expensive session lookup
+                    // + policy + NAT + FIB path. TCP SYN/FIN/RST skip the
+                    // cache to ensure proper session lifecycle handling.
+                    if ((meta.protocol == PROTO_TCP && (meta.tcp_flags & 0x17) == 0x10)
+                        || meta.protocol == PROTO_UDP)
                         && let Some(flow) = flow.as_ref()
                     {
                         if let Some(cached) = binding.flow_cache.lookup(
@@ -4167,8 +4168,8 @@ fn poll_binding(
                             recycle_now = false;
                             // ── Flow cache population ────────────────────
                             // Cache ForwardCandidate decisions for established
-                            // TCP flows. Skip NAT64/NPTv6 (non-cacheable).
-                            if meta.protocol == PROTO_TCP
+                            // TCP/UDP flows. Skip NAT64/NPTv6 (non-cacheable).
+                            if (meta.protocol == PROTO_TCP || meta.protocol == PROTO_UDP)
                                 && !decision.nat.nat64
                                 && !decision.nat.nptv6
                                 && decision.resolution.disposition == ForwardingDisposition::ForwardCandidate
