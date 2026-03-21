@@ -291,6 +291,18 @@ impl FlowCache {
         }
     }
 }
+/// Packet buffered while waiting for ARP/NDP neighbor resolution.
+struct PendingNeighPacket {
+    addr: u64,          // UMEM frame offset (held, not recycled)
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    decision: SessionDecision,
+    queued_ns: u64,     // monotonic timestamp
+}
+
+const PENDING_NEIGH_TIMEOUT_NS: u64 = 2_000_000_000; // 2 seconds
+const MAX_PENDING_NEIGH: usize = 64;
+
 // ── Precomputed Checksum Deltas ─────────────────────────────────────────
 // Compute the one's complement incremental delta for IP and L4 checksums
 // from the NAT decision. These are constant for the flow's lifetime.
@@ -1777,6 +1789,9 @@ struct BindingWorker {
     scratch_local_tx: Vec<(u64, TxRequest)>,
     scratch_completed_offsets: Vec<u64>,
     scratch_post_recycles: Vec<(u32, u64)>,
+    /// Packets waiting for neighbor resolution. The UMEM frame is held
+    /// (not recycled) until the neighbor resolves or the entry times out.
+    pending_neigh: VecDeque<PendingNeighPacket>,
     /// Flow cache fast-path: cross-binding in-place rewrites deferred
     /// until after the RX batch (borrow checker prevents mutable access
     /// to two bindings simultaneously inside the RX loop).
@@ -2156,6 +2171,7 @@ impl BindingWorker {
             scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
             scratch_completed_offsets: Vec::with_capacity(ring_entries as usize),
             scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
+            pending_neigh: VecDeque::with_capacity(MAX_PENDING_NEIGH),
             scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
             scratch_rst_teardowns: Vec::with_capacity(16),
             in_flight_prepared_recycles: FastMap::default(),
@@ -4390,22 +4406,21 @@ fn poll_binding(
                                         }
                                     }
                                 }
-                                // Reinject to kernel slow path. The kernel resolves
-                                // ARP and forwards the first packet. The netlink
-                                // neighbor monitor learns the result in ~10ms.
-                                // Subsequent packets find the neighbor and forward
-                                // directly via XSK.
-                                maybe_reinject_slow_path_from_frame(
-                                    &ident,
-                                    &binding.live,
-                                    slow_path,
-                                    local_tunnel_deliveries,
-                                    packet_frame,
-                                    meta,
-                                    decision,
-                                    recent_exceptions,
-                                    "missing_neighbor_slow_path",
-                                );
+                                // Buffer the packet and hold the UMEM frame.
+                                // The netlink neighbor monitor will learn the
+                                // ARP/NDP result; the retry loop below will
+                                // re-forward the packet once the neighbor resolves.
+                                // No kernel slow-path dependency.
+                                if binding.pending_neigh.len() < MAX_PENDING_NEIGH {
+                                    binding.pending_neigh.push_back(PendingNeighPacket {
+                                        addr: desc.addr,
+                                        desc,
+                                        meta,
+                                        decision,
+                                        queued_ns: now_ns,
+                                    });
+                                    recycle_now = false; // hold the UMEM frame
+                                }
                                 if cfg!(feature = "debug-log") {
                                     if dbg.missing_neigh <= 3 {
                                         if let Some(flow) = flow.as_ref() {
@@ -4552,6 +4567,78 @@ fn poll_binding(
         let _ = drain_pending_fill(binding, now_ns);
         counters.rx_batches += 1;
         did_work = true;
+    }
+    // Retry pending-neighbor packets: check if the netlink monitor
+    // has learned the neighbor since we buffered the packet.
+    {
+        let mut i = 0;
+        while i < binding.pending_neigh.len() {
+            let pkt = &binding.pending_neigh[i];
+            // Timeout: recycle frame and drop
+            if now_ns.saturating_sub(pkt.queued_ns) > PENDING_NEIGH_TIMEOUT_NS {
+                let addr = pkt.addr;
+                binding.pending_neigh.remove(i);
+                binding.pending_fill_frames.push_back(addr);
+                continue;
+            }
+            // Check if neighbor MAC is now in dynamic_neighbors
+            let mac = if let Some(hop) = pkt.decision.resolution.next_hop {
+                dynamic_neighbors
+                    .lock()
+                    .ok()
+                    .and_then(|n| n.get(&(pkt.decision.resolution.egress_ifindex, hop)).map(|e| e.mac))
+            } else {
+                None
+            };
+            if let Some(neighbor_mac) = mac {
+                let ingress_slot = binding.slot;
+                let ingress_ifindex = binding.ifindex;
+                let ingress_queue = binding.queue_id;
+                let pkt = binding.pending_neigh.remove(i).unwrap();
+                let mut decision = pkt.decision;
+                decision.resolution.neighbor_mac = Some(neighbor_mac);
+                decision.resolution.disposition = ForwardingDisposition::ForwardCandidate;
+                let expected_ports = None;
+                if let Some(frame_len) = rewrite_forwarded_frame_in_place(
+                    unsafe { &*area }, pkt.desc, pkt.meta, &decision, expected_ports,
+                ) {
+                    let target_ifindex = if decision.resolution.tx_ifindex > 0 {
+                        decision.resolution.tx_ifindex
+                    } else {
+                        resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
+                    };
+                    if let Some(target_idx) = binding_lookup.target_index(
+                        binding_index, ingress_ifindex, ingress_queue, target_ifindex,
+                    ) {
+                        let req = PreparedTxRequest {
+                            offset: pkt.desc.addr,
+                            len: frame_len,
+                            recycle: PreparedTxRecycle::FillOnSlot(ingress_slot),
+                            expected_ports: None,
+                            expected_addr_family: pkt.meta.addr_family,
+                            expected_protocol: pkt.meta.protocol,
+                            flow_key: None,
+                        };
+                        if target_idx == binding_index {
+                            binding.pending_tx_prepared.push_back(req);
+                        } else if let Some(target) = binding_by_index_mut(
+                            left, binding_index, binding, right, target_idx,
+                        ) {
+                            target.pending_tx_prepared.push_back(req);
+                            bound_pending_tx_prepared(target);
+                        } else {
+                            binding.pending_fill_frames.push_back(pkt.addr);
+                        }
+                    } else {
+                        binding.pending_fill_frames.push_back(pkt.addr);
+                    }
+                } else {
+                    binding.pending_fill_frames.push_back(pkt.addr);
+                }
+                continue;
+            }
+            i += 1;
+        }
     }
     counters.flush(&binding.live);
     update_binding_debug_state(binding);
