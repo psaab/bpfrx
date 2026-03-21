@@ -139,19 +139,34 @@ pub(super) fn prime_fill_ring_offsets(
     if inserted != offsets.len() as u32 {
         return Err(format!("prefill fill ring inserted {inserted}/{}", offsets.len()).into());
     }
-    // Kick RX NAPI repeatedly to bootstrap fill ring processing.
-    // poll(POLLIN, timeout>0) enters the kernel's xsk_poll path which
-    // calls napi_schedule on the XSK channel, triggering the driver to
-    // consume fill ring entries and post RX WQEs. Multiple kicks with
-    // small delays ensure the NAPI softirq actually runs between calls.
+    // Trigger NAPI to consume fill ring entries and post RX WQEs.
+    // mlx5 zero-copy processes the fill ring during RX NAPI poll.
+    // We trigger it by calling recvmsg() which enters the busy-poll
+    // path (if SO_BUSY_POLL is set) and drives NAPI processing.
+    // Also use poll(POLLIN) and sendto() as belt-and-suspenders.
     let fd = device.as_raw_fd();
-    for _ in 0..10 {
+    for _ in 0..20 {
+        // recvmsg with MSG_DONTWAIT triggers xsk_recvmsg → busy-poll
+        let mut iov = libc::iovec {
+            iov_base: core::ptr::null_mut(),
+            iov_len: 0,
+        };
+        let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
+        // Also poll and sendto
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
             revents: 0,
         };
-        unsafe { libc::poll(&mut pfd, 1, 1) }; // 1ms timeout
+        unsafe { libc::poll(&mut pfd, 1, 1) };
+        unsafe {
+            libc::sendto(fd, core::ptr::null_mut(), 0, libc::MSG_DONTWAIT,
+                core::ptr::null_mut(), 0);
+        }
+        std::thread::yield_now();
     }
     Ok(())
 }

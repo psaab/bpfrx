@@ -2551,10 +2551,6 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// up-to-date neighbor entries. Without this, the first
 		// transit packets hit MissingNeighbor and go to slow-path,
 		// which may fail if the kernel hasn't resolved ARP/NDP yet.
-		// On every status tick where ctrl is enabled, push fresh
-		// kernel neighbors to the helper. The proactive resolve
-		// runs once to force ARP/NDP re-resolution after VIP
-		// assignment.
 		if !m.neighborsPrewarmed {
 			m.neighborsPrewarmed = true
 			m.proactiveNeighborResolveLocked()
@@ -3684,6 +3680,59 @@ func (m *Manager) stopLocked() {
 	m.proc = nil
 	m.lastStatus = ProcessStatus{}
 	m.neighborsPrewarmed = false
+}
+
+// bootstrapNAPIQueuesLocked sends UDP probe packets to each managed
+// interface to trigger hardware RX events on all NIC queues. This is
+// needed for mlx5 zero-copy: the driver only consumes XSK fill ring
+// entries during NAPI poll, and NAPI only runs when there are HW RX
+// events. Without at least one packet per queue, the fill ring stays
+// unconsumed and XDP_REDIRECT silently drops packets.
+//
+// The probes are sent while ctrl is disabled, so the XDP shim falls
+// back to the eBPF pipeline which handles them normally (XDP_PASS).
+func (m *Manager) bootstrapNAPIQueuesLocked() {
+	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
+		return
+	}
+	// Force mlx5 channel reinit by cycling ethtool combined channels.
+	// Setting the same channel count tears down and recreates XSK RQs,
+	// causing the driver to read from the fill ring and post WQEs.
+	seen := make(map[string]bool)
+	for ifName, ifc := range m.lastSnapshot.Config.Interfaces.Interfaces {
+		base := config.LinuxIfName(ifName)
+		if seen[base] || ifc == nil {
+			continue
+		}
+		seen[base] = true
+		// Read current combined channel count
+		out, err := exec.Command("ethtool", "-l", base).Output()
+		if err != nil {
+			continue
+		}
+		// Parse "Combined:\tN" from current settings section
+		lines := strings.Split(string(out), "\n")
+		inCurrent := false
+		var combined string
+		for _, line := range lines {
+			if strings.Contains(line, "Current hardware settings") {
+				inCurrent = true
+			}
+			if inCurrent && strings.HasPrefix(line, "Combined:") {
+				combined = strings.TrimSpace(strings.TrimPrefix(line, "Combined:"))
+				break
+			}
+		}
+		if combined == "" || combined == "n/a" {
+			continue
+		}
+		slog.Info("userspace: reinit XSK channels via ethtool", "iface", base, "combined", combined)
+		cmd := exec.Command("ethtool", "-L", base, "combined", combined)
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+		_ = cmd.Run()
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // proactiveNeighborResolveLocked reads the kernel neighbor table and
