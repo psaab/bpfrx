@@ -317,16 +317,17 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let data = ctx.data();
     let data_end = ctx.data_end();
     let Some((eth_proto, vlan_id, l3_offset)) = parse_l2(data, data_end) else {
-        return Ok(xdp_action::XDP_PASS);
+        return Ok(cpumap_or_pass(ctrl));
     };
     let parsed = match eth_proto {
         ETH_P_IP => parse_ipv4(data, data_end, vlan_id, l3_offset),
         ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, l3_offset),
-        // Non-IP (ARP, LLDP, etc.): always XDP_PASS to kernel.
-        // ARP MUST reach the kernel for neighbor table updates.
-        // Redirecting ARP to XSK steals replies from the kernel's
-        // ARP state machine, breaking all L2 reachability.
-        _ => return Ok(xdp_action::XDP_PASS),
+        // Non-IP (ARP, LLDP, etc.): deliver to kernel via cpumap.
+        // The kernel owns ARP/NDP resolution and the authoritative
+        // neighbor table. The helper learns neighbors opportunistically
+        // from IP traffic seen on XSK (learn_dynamic_neighbor_from_packet),
+        // not by intercepting ARP/NDP directly.
+        _ => return Ok(cpumap_or_pass(ctrl)),
     };
     let Some(parsed) = parsed else {
         return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
@@ -822,18 +823,18 @@ fn classify_native_gre_inner_ipv6(data: usize, data_end: usize, l3_offset: usize
     0
 }
 
-fn fallback_to_main(ctx: &XdpContext, _ctrl: &UserspaceCtrl, reason: u32) -> Result<u32, i64> {
+fn fallback_to_main(ctx: &XdpContext, ctrl: &UserspaceCtrl, reason: u32) -> Result<u32, i64> {
     incr_fallback_stat(reason);
     // Try tail-call to the main eBPF pipeline for full firewall processing.
     unsafe {
         let _ = USERSPACE_FALLBACK_PROGS.tail_call(ctx, USERSPACE_FALLBACK_MAIN);
     }
-    // Tail call failed (known aya-ebpf issue). Fall back to XDP_PASS so the
-    // kernel stack can forward the packet via its routing table. This keeps
-    // the zero-copy fill ring healthy (mlx5 copies data to SKB, recycles
-    // UMEM buffer). TC egress still enforces egress policy. Once heartbeat
-    // is established, XSK takes over for full userspace processing.
-    Ok(xdp_action::XDP_PASS)
+    // Tail call failed (known aya-ebpf issue). Deliver to kernel via cpumap
+    // (preferred in zero-copy mode) so the kernel stack can forward the
+    // packet. cpumap avoids the zero-copy UMEM frame leak that raw XDP_PASS
+    // can cause. TC egress still enforces egress policy. Once heartbeat is
+    // established, XSK takes over for full userspace processing.
+    Ok(cpumap_or_pass(ctrl))
 }
 
 fn incr_fallback_stat(reason: u32) {
