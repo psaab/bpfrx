@@ -429,6 +429,7 @@ pub struct Coordinator {
     last_slow_path_status: SlowPathStatus,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    neigh_monitor_stop: Option<Arc<AtomicBool>>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -459,6 +460,7 @@ impl Coordinator {
             last_slow_path_status: SlowPathStatus::default(),
             ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
+            neigh_monitor_stop: None,
             shared_sessions: Arc::new(Mutex::new(FastMap::default())),
             shared_nat_sessions: Arc::new(Mutex::new(FastMap::default())),
             shared_forward_wire_sessions: Arc::new(Mutex::new(FastMap::default())),
@@ -489,6 +491,9 @@ impl Coordinator {
     }
 
     fn stop_inner(&mut self, clear_synced_state: bool) {
+        if let Some(stop) = self.neigh_monitor_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
         for handle in self.tunnel_sources.values_mut() {
             handle.stop.store(true, Ordering::Relaxed);
         }
@@ -910,6 +915,19 @@ impl Coordinator {
             self.identities.len(),
             self.live.len()
         );
+        // Start neighbor monitor thread to learn kernel ARP/NDP entries
+        // instantly via netlink RTM_NEWNEIGH events. Without this, the
+        // helper waits 1-5s for the Go-side snapshot refresh.
+        if self.neigh_monitor_stop.is_none() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_clone = stop.clone();
+            let dynamic_neighbors = self.dynamic_neighbors.clone();
+            thread::Builder::new()
+                .name("neigh-monitor".to_string())
+                .spawn(move || neigh_monitor_thread(stop_clone, dynamic_neighbors))
+                .ok();
+            self.neigh_monitor_stop = Some(stop);
+        }
         self.spawn_local_tunnel_sources();
         self.refresh_bindings(bindings);
     }
@@ -6364,6 +6382,131 @@ fn add_kernel_neighbor(ifindex: i32, ip: IpAddr, mac: [u8; 6]) {
         );
         libc::close(fd);
     }
+}
+
+/// Monitor kernel neighbor table changes via netlink RTM_NEWNEIGH events.
+/// When the kernel resolves ARP/NDP (from our send_raw_frame solicitations
+/// or from slow-path reinject), it sends a netlink notification. This thread
+/// receives it and updates the helper's dynamic_neighbors cache instantly,
+/// so the next packet for that destination finds the neighbor and forwards
+/// directly through XSK — no waiting for the Go-side snapshot refresh.
+fn neigh_monitor_thread(
+    stop: Arc<AtomicBool>,
+    dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+) {
+    // Create NETLINK_ROUTE socket and subscribe to neighbor events
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        )
+    };
+    if fd < 0 {
+        eprintln!("neigh_monitor: failed to create netlink socket");
+        return;
+    }
+    // Bind to RTMGRP_NEIGH group to receive neighbor notifications
+    let mut sa: libc::sockaddr_nl = unsafe { core::mem::zeroed() };
+    sa.nl_family = libc::AF_NETLINK as u16;
+    sa.nl_groups = 1 << (libc::RTNLGRP_NEIGH - 1) as u32; // RTMGRP_NEIGH
+    let rc = unsafe {
+        libc::bind(
+            fd,
+            &sa as *const libc::sockaddr_nl as *const libc::sockaddr,
+            core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        eprintln!("neigh_monitor: bind failed");
+        unsafe { libc::close(fd) };
+        return;
+    }
+    eprintln!("neigh_monitor: listening for kernel neighbor events");
+    let mut buf = vec![0u8; 8192];
+    while !stop.load(Ordering::Relaxed) {
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 500) }; // 500ms timeout
+        if rc <= 0 {
+            continue;
+        }
+        let n = unsafe {
+            libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
+        };
+        if n <= 0 {
+            continue;
+        }
+        // Parse netlink messages
+        let mut offset = 0usize;
+        while offset + 16 <= n as usize {
+            let nlmsg_len = u32::from_ne_bytes([buf[offset], buf[offset+1], buf[offset+2], buf[offset+3]]) as usize;
+            let nlmsg_type = u16::from_ne_bytes([buf[offset+4], buf[offset+5]]);
+            if nlmsg_len < 16 || offset + nlmsg_len > n as usize {
+                break;
+            }
+            // RTM_NEWNEIGH = 28
+            if nlmsg_type == 28 {
+                // ndmsg starts at offset+16: family(1) pad(3) ifindex(4) state(2) flags(1) type(1)
+                let ndm_start = offset + 16;
+                if ndm_start + 12 <= n as usize {
+                    let family = buf[ndm_start];
+                    let ifindex = i32::from_ne_bytes([
+                        buf[ndm_start+4], buf[ndm_start+5], buf[ndm_start+6], buf[ndm_start+7],
+                    ]);
+                    let state = u16::from_ne_bytes([buf[ndm_start+8], buf[ndm_start+9]]);
+                    // Only learn REACHABLE, STALE, DELAY, PROBE states
+                    // NUD_REACHABLE=2, NUD_STALE=4, NUD_DELAY=8, NUD_PROBE=16
+                    if state & 0x1e != 0 {
+                        // Parse NDA attributes
+                        let mut attr_off = ndm_start + 12;
+                        let mut ip: Option<IpAddr> = None;
+                        let mut mac: Option<[u8; 6]> = None;
+                        while attr_off + 4 <= offset + nlmsg_len {
+                            let attr_len = u16::from_ne_bytes([buf[attr_off], buf[attr_off+1]]) as usize;
+                            let attr_type = u16::from_ne_bytes([buf[attr_off+2], buf[attr_off+3]]);
+                            if attr_len < 4 { break; }
+                            let payload = &buf[attr_off+4..attr_off+attr_len.min(offset+nlmsg_len-attr_off)];
+                            match attr_type {
+                                1 => { // NDA_DST
+                                    if family == libc::AF_INET as u8 && payload.len() >= 4 {
+                                        ip = Some(IpAddr::V4(Ipv4Addr::new(
+                                            payload[0], payload[1], payload[2], payload[3],
+                                        )));
+                                    } else if family == libc::AF_INET6 as u8 && payload.len() >= 16 {
+                                        let mut bytes = [0u8; 16];
+                                        bytes.copy_from_slice(&payload[..16]);
+                                        ip = Some(IpAddr::V6(Ipv6Addr::from(bytes)));
+                                    }
+                                }
+                                2 => { // NDA_LLADDR
+                                    if payload.len() >= 6 {
+                                        mac = Some([
+                                            payload[0], payload[1], payload[2],
+                                            payload[3], payload[4], payload[5],
+                                        ]);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            attr_off += (attr_len + 3) & !3; // align to 4
+                        }
+                        if let (Some(ip), Some(mac)) = (ip, mac) {
+                            if let Ok(mut neighbors) = dynamic_neighbors.lock() {
+                                neighbors.insert((ifindex, ip), NeighborEntry { mac });
+                            }
+                        }
+                    }
+                }
+            }
+            offset += (nlmsg_len + 3) & !3; // align to 4
+        }
+    }
+    unsafe { libc::close(fd) };
+    eprintln!("neigh_monitor: stopped");
 }
 
 fn pin_current_thread(worker_id: u32) {
