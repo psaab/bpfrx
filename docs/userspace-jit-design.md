@@ -1,6 +1,26 @@
 # Userspace Dataplane JIT Compiler Design
 
 Date: 2026-03-17
+Updated: 2026-03-21
+
+## Current Status
+
+| Phase | Description | Status | Measured Gain |
+|-------|-------------|--------|---------------|
+| 1 | Flow cache + rewrite descriptors | **PARTIAL** — cache hit skips session/policy/NAT/FIB but still uses generic frame builder; descriptor populated but not applied directly | +35% (13→17.5 Gbps) |
+| 2 | Policy decision trees | Not started | — |
+| 3 | Address-book trie compilation | Not started | — |
+| 4 | Cranelift JIT | Not started | — |
+| 5 | Screen function specialization | Not started | — |
+
+**Phase 1 remaining work**: Implement `apply_rewrite_descriptor()` to
+bypass the generic `build_live_forward_request_from_frame()` on cache
+hit. The descriptor has all the fields (MACs, VLAN, NAT IPs/ports,
+precomputed csum deltas) but the hot path doesn't use them yet —
+it still calls the full frame builder with its ~8 branches.
+
+**Current throughput**: 21.4 Gbps (IPv6, 8 parallel streams via iperf3,
+2026-03-21). Baseline before flow cache was ~13 Gbps.
 
 ## Motivation
 
@@ -332,24 +352,51 @@ Cons:
 **Recommendation: Start with Option C**, measure, then graduate to
 Option A (Cranelift) if the interpreted fast-path isn't enough.
 
+**Decision (2026-03-18):** Option C chosen and partially implemented.
+The `RewriteDescriptor` struct and `FlowCache` are in place. Initial
+measurements show +35% from cache-hit alone (skipping session/policy/
+NAT/FIB). The straight-line rewrite from the descriptor is the
+remaining Phase 1 work.
+
 ## Implementation phases
 
-### Phase 1: Flow cache + rewrite descriptors (Option C)
+### Phase 1: Flow cache + rewrite descriptors (Option C) — PARTIALLY COMPLETE
 
-**Scope**: Add a per-worker flow cache and precomputed rewrite
-descriptors. No JIT compilation.
+**Status**: Flow cache and RewriteDescriptor struct are implemented.
+Cache hit skips session lookup, policy, NAT, and FIB. However, the
+hit path still calls `build_live_forward_request_from_frame()` (the
+generic frame builder) instead of applying the RewriteDescriptor
+directly. The descriptor fields are populated but not used for
+straight-line rewriting.
 
-1. Define `RewriteDescriptor` struct with all rewrite fields
-2. At session creation, precompute the descriptor from the NAT
-   decision and forwarding resolution
-3. Add `FlowCache` (4096-entry direct-mapped) to each worker
-4. In `poll_binding()`, check flow cache before session lookup
-5. On cache hit, apply descriptor with straight-line writes
-6. On cache miss, run full pipeline, populate cache
+**What's done** (as of `30383e6`, 2026-03-21):
+- [x] `RewriteDescriptor` struct defined (`afxdp.rs:187`) with MACs, VLAN,
+      NAT IPs/ports, precomputed csum deltas, egress info, validation
+- [x] `FlowCache` (4096-entry direct-mapped, `afxdp.rs:231`)
+- [x] Flow cache lookup in `poll_binding()` hot path (`afxdp.rs:2824`)
+      — TCP ACK-only packets checked before session lookup
+- [x] Cache population on ForwardCandidate after full pipeline (`afxdp.rs:4131`)
+- [x] Config/FIB generation invalidation on lookup
+- [x] Amortized session timestamp touch (every 64 hits)
+- [x] Per-worker hit/miss/eviction counters
+
+**What's NOT done** (remaining Phase 1 work):
+- [ ] `apply_rewrite_descriptor()` — straight-line frame rewrite using
+      the descriptor's precomputed offsets and values. Currently the
+      cache-hit path still calls the generic frame builder with ~8
+      branches for AF, VLAN, NAT type, protocol, etc.
+- [ ] Incremental checksum from precomputed deltas — the descriptor
+      has `ip_csum_delta` and `l4_csum_delta` fields but they're not
+      applied directly; the generic builder recomputes checksums
+- [ ] IPv6 flow cache entries — currently only IPv4 TCP ACK-only
+
+**Measured gain so far**: ~35% throughput improvement (13 → 17.5 Gbps)
+from skipping session/policy/NAT/FIB on cache hit. Completing the
+descriptor-based rewrite should add another 15-30%.
 
 **Files**:
 - `userspace-dp/src/afxdp.rs` — flow cache integration in poll_binding
-- `userspace-dp/src/afxdp/frame.rs` — `apply_rewrite_descriptor()`
+- `userspace-dp/src/afxdp/frame.rs` — `apply_rewrite_descriptor()` (TODO)
 - `userspace-dp/src/afxdp/session_glue.rs` — descriptor construction
 
 **Test criteria**:
@@ -357,10 +404,10 @@ descriptors. No JIT compilation.
 - `flow_cache_hits / total_packets > 0.9` for sustained TCP
 - No regression in HA failover tests
 
-**Expected gain**: 1.5-2x for established flows (eliminates session
-lookup, policy check, NAT decision, FIB lookup on cache hit).
+**Expected remaining gain**: 15-30% from straight-line descriptor
+rewrite (eliminates ~8 branches in frame build path).
 
-### Phase 2: Policy decision trees
+### Phase 2: Policy decision trees — NOT STARTED
 
 **Scope**: Compile policies into zone-pair decision functions at
 config apply time.
@@ -374,7 +421,7 @@ config apply time.
 **Expected gain**: O(1)-O(log N) policy evaluation vs O(N) linear scan.
 Significant for rulesets with 20+ rules per zone-pair.
 
-### Phase 3: Address-book trie compilation
+### Phase 3: Address-book trie compilation — NOT STARTED
 
 **Scope**: Replace linear CIDR matching with precomputed tries.
 
@@ -384,7 +431,7 @@ Significant for rulesets with 20+ rules per zone-pair.
 3. In Rust, deserialize into a flat array trie (cache-friendly)
 4. Replace `match_address()` linear scan with trie lookup
 
-### Phase 4: Cranelift JIT for flow rewrite functions
+### Phase 4: Cranelift JIT for flow rewrite functions — NOT STARTED
 
 **Scope**: Replace rewrite descriptors with native code generation.
 
@@ -397,7 +444,7 @@ Significant for rulesets with 20+ rules per zone-pair.
 **Expected gain**: Additional 30-50% over descriptors for the rewrite
 path (eliminates dispatch loop overhead).
 
-### Phase 5: Screen function specialization
+### Phase 5: Screen function specialization — NOT STARTED
 
 **Scope**: Generate per-zone screen functions at config apply time.
 
