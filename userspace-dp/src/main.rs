@@ -1622,10 +1622,13 @@ fn refresh_status(state: &mut ServerState) {
     state.status.debug_reconcile_calls = reconcile_calls;
     state.status.debug_reconcile_stage = reconcile_stage;
     state.status.ha_groups = state.afxdp.ha_groups();
-    // Only report enabled after ALL bindings are ready, not just any.
-    // The Go manager sets ctrl.Enabled=1 based on this flag, which makes
-    // the XDP shim redirect to XSK. If some slots aren't registered yet,
-    // redirected packets are silently dropped.
+    // Report enabled when all bindings are registered+armed (XSKMAP slots
+    // populated). The per-queue xsk_rx_confirmed heartbeat gating handles
+    // queues whose XSK RQ hasn't been bootstrapped yet — those get XDP_PASS
+    // until they bootstrap naturally from background traffic.
+    // Previously this required all bindings to be `ready` (first RX packet
+    // received), which created a deadlock: ctrl=0 → XDP_PASS → no XSK RX
+    // → not ready → ctrl stays 0.
     state.status.enabled = state.status.forwarding_armed
         && state.status.capabilities.forwarding_supported
         && !state.status.bindings.is_empty()
@@ -1633,7 +1636,7 @@ fn refresh_status(state: &mut ServerState) {
             .status
             .bindings
             .iter()
-            .all(|b| b.registered && b.armed && b.ready);
+            .all(|b| b.registered && b.armed);
     state.status.queues = summarize_queues(&state.status.bindings);
     state.status.recent_session_deltas = state.afxdp.recent_session_deltas();
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
