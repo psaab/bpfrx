@@ -4390,12 +4390,11 @@ fn poll_binding(
                                         }
                                     }
                                 }
-                                // Reinject to kernel slow path for the first packet.
-                                // The kernel will also ARP and forward once resolved.
-                                // The ARP reply (from our raw socket request) feeds
-                                // BOTH the kernel (via XDP_PASS) and the helper's
-                                // dynamic_neighbors (via XSK ARP redirect). Future
-                                // packets find the neighbor and forward via XSK.
+                                // Reinject to kernel slow path. The kernel resolves
+                                // ARP and forwards the first packet. The netlink
+                                // neighbor monitor learns the result in ~10ms.
+                                // Subsequent packets find the neighbor and forward
+                                // directly via XSK.
                                 maybe_reinject_slow_path_from_frame(
                                     &ident,
                                     &binding.live,
@@ -6430,7 +6429,7 @@ fn neigh_monitor_thread(
             events: libc::POLLIN,
             revents: 0,
         };
-        let rc = unsafe { libc::poll(&mut pfd, 1, 500) }; // 500ms timeout
+        let rc = unsafe { libc::poll(&mut pfd, 1, 10) }; // 10ms — fast neighbor learning
         if rc <= 0 {
             continue;
         }
