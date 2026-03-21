@@ -4177,109 +4177,49 @@ fn poll_binding(
                             }
                             ForwardingDisposition::MissingNeighbor => {
                                 dbg.missing_neigh += 1;
-                                // Send ARP request (IPv4) or NDP Neighbor Solicitation
-                                // (IPv6) for the missing next-hop via egress TX.
-                                let mut solicit_sent = false;
+                                // Send ARP/NDP solicitation via RAW socket (not XSK)
+                                // so the reply goes through the kernel's normal RX
+                                // path (cpumap_or_pass), bypassing XSK fill ring issues.
+                                // Also reinject original packet to slow-path for kernel
+                                // to forward once the neighbor is resolved.
                                 if let Some(next_hop) = decision.resolution.next_hop {
+                                    let egress_ifindex = decision.resolution.egress_ifindex;
                                     if let IpAddr::V4(target_v4) = next_hop {
-                                        if let Some(egress) = forwarding.egress.get(&decision.resolution.egress_ifindex) {
+                                        if let Some(egress) = forwarding.egress.get(&egress_ifindex) {
                                             if let Some(src_v4) = egress.primary_v4 {
-                                                let arp_frame = build_arp_request(
-                                                    egress.src_mac,
-                                                    src_v4,
-                                                    target_v4,
-                                                );
-                                                let target_ifindex = if decision.resolution.tx_ifindex > 0 {
-                                                    decision.resolution.tx_ifindex
-                                                } else {
-                                                    resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
-                                                };
-                                                let target_binding_index = binding_lookup.target_index(
-                                                    binding_index,
-                                                    ident.ifindex,
-                                                    ident.queue_id,
-                                                    target_ifindex,
-                                                );
-                                                binding.scratch_forwards.push(PendingForwardRequest {
-                                                    target_ifindex,
-                                                    target_binding_index,
-                                                    ingress_queue_id: ident.queue_id,
-                                                    source_offset: desc.addr,
-                                                    desc,
-                                                    source_frame: None,
-                                                    meta,
-                                                    decision,
-                                                    apply_nat_on_fabric: false,
-                                                    expected_ports: None,
-                                                    flow_key: None,
-                                                    nat64_reverse: None,
-                                                    prebuilt_frame: Some(arp_frame),
-                                                });
-                                                recycle_now = false;
-                                                solicit_sent = true;
+                                                let arp = build_arp_request(egress.src_mac, src_v4, target_v4);
+                                                send_raw_frame(egress_ifindex, &arp);
                                             }
                                         }
                                     } else if let IpAddr::V6(target_v6) = next_hop {
-                                        if let Some(egress) = forwarding.egress.get(&decision.resolution.egress_ifindex) {
+                                        if let Some(egress) = forwarding.egress.get(&egress_ifindex) {
                                             if let Some(src_v6) = egress.primary_v6 {
-                                                let ns_frame = build_ndp_neighbor_solicitation(
-                                                    egress.src_mac,
-                                                    src_v6,
-                                                    target_v6,
-                                                );
-                                                let target_ifindex = if decision.resolution.tx_ifindex > 0 {
-                                                    decision.resolution.tx_ifindex
-                                                } else {
-                                                    resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
-                                                };
-                                                let target_binding_index = binding_lookup.target_index(
-                                                    binding_index,
-                                                    ident.ifindex,
-                                                    ident.queue_id,
-                                                    target_ifindex,
-                                                );
-                                                binding.scratch_forwards.push(PendingForwardRequest {
-                                                    target_ifindex,
-                                                    target_binding_index,
-                                                    ingress_queue_id: ident.queue_id,
-                                                    source_offset: desc.addr,
-                                                    desc,
-                                                    source_frame: None,
-                                                    meta,
-                                                    decision,
-                                                    apply_nat_on_fabric: false,
-                                                    expected_ports: None,
-                                                    flow_key: None,
-                                                    nat64_reverse: None,
-                                                    prebuilt_frame: Some(ns_frame),
-                                                });
-                                                recycle_now = false;
-                                                solicit_sent = true;
+                                                let ns = build_ndp_neighbor_solicitation(egress.src_mac, src_v6, target_v6);
+                                                send_raw_frame(egress_ifindex, &ns);
                                             }
                                         }
                                     }
                                 }
-                                // ALSO send to slow-path as fallback — the kernel may resolve
-                                // the neighbor even if our solicitation fails.
-                                if !solicit_sent {
-                                    maybe_reinject_slow_path_from_frame(
-                                        &ident,
-                                        &binding.live,
-                                        slow_path,
-                                        local_tunnel_deliveries,
-                                        packet_frame,
-                                        meta,
-                                        decision,
-                                        recent_exceptions,
-                                        "missing_neighbor_slow_path",
-                                    );
-                                }
+                                // Always reinject to slow-path — kernel forwards
+                                // the packet once ARP/NDP resolves via the raw
+                                // socket solicitation above.
+                                maybe_reinject_slow_path_from_frame(
+                                    &ident,
+                                    &binding.live,
+                                    slow_path,
+                                    local_tunnel_deliveries,
+                                    packet_frame,
+                                    meta,
+                                    decision,
+                                    recent_exceptions,
+                                    "missing_neighbor_slow_path",
+                                );
                                 if cfg!(feature = "debug-log") {
                                     if dbg.missing_neigh <= 3 {
                                         if let Some(flow) = flow.as_ref() {
                                             eprintln!(
                                                 "DBG MISS_NEIGH→{}: {}:{} -> {}:{} proto={} egress_if={} next_hop={:?}",
-                                                if solicit_sent { "SOLICIT" } else { "SLOW" },
+                                                "SOLICIT+SLOW",
                                                 flow.src_ip,
                                                 flow.forward_key.src_port,
                                                 flow.dst_ip,
@@ -6133,6 +6073,40 @@ fn monotonic_timestamp_to_datetime(
     }
     let age_ns = now_mono.saturating_sub(last_nanos).min(i64::MAX as u64) as i64;
     now_wall.checked_sub_signed(chrono::TimeDelta::nanoseconds(age_ns))
+}
+
+/// Send a raw Ethernet frame via AF_PACKET on the given interface.
+/// Used for ARP/NDP solicitations that must bypass XSK (because the
+/// XSK fill ring may not be bootstrapped on the egress interface).
+fn send_raw_frame(ifindex: i32, frame: &[u8]) {
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return;
+    }
+    let mut addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
+    addr.sll_family = libc::AF_PACKET as u16;
+    addr.sll_ifindex = ifindex;
+    addr.sll_halen = 6;
+    if frame.len() >= 6 {
+        addr.sll_addr[..6].copy_from_slice(&frame[..6]);
+    }
+    unsafe {
+        libc::sendto(
+            fd,
+            frame.as_ptr() as *const libc::c_void,
+            frame.len(),
+            libc::MSG_DONTWAIT,
+            &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
+            core::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+        );
+        libc::close(fd);
+    }
 }
 
 fn pin_current_thread(worker_id: u32) {
