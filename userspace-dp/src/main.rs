@@ -1127,15 +1127,7 @@ fn run() -> Result<(), String> {
             }
         }
     } else {
-        eprintln!("bpfrx-userspace-dp: interrupt mode — skipping global busy_poll sysctls");
-    }
-    // Always set per-socket busy poll sysctls so SO_BUSY_POLL works.
-    // This is needed for zero-copy fill ring bootstrap even in interrupt mode.
-    for (path, val) in &[
-        ("/proc/sys/net/core/busy_poll", "50"),
-        ("/proc/sys/net/core/busy_read", "50"),
-    ] {
-        let _ = fs::write(path, val);
+        eprintln!("bpfrx-userspace-dp: interrupt mode — skipping busy_poll sysctls");
     }
     if let Some(parent) = Path::new(&args.control_socket).parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create control dir: {e}"))?;
