@@ -2834,7 +2834,6 @@ fn poll_binding(
                             if binding.flow_cache_session_touch & 63 == 0 {
                                 sessions.touch(&flow.forward_key, now_ns);
                             }
-                            // RST teardown check (shouldn't hit since we filter SYN/FIN/RST above)
                             if matches!(
                                 cached_decision.resolution.disposition,
                                 ForwardingDisposition::ForwardCandidate
@@ -2847,24 +2846,75 @@ fn poll_binding(
                                 if cached_decision.nat.rewrite_dst.is_some() {
                                     counters.dnat_packets += 1;
                                 }
-                                if let Some(mut request) = build_live_forward_request_from_frame(
-                                    binding_lookup,
+                                // ── Inline in-place rewrite fast path ──
+                                // Skip PendingForwardRequest + enqueue_pending_forwards entirely.
+                                // Resolve target binding, rewrite frame in UMEM, push PreparedTxRequest.
+                                let target_ifindex = if cached_decision.resolution.tx_ifindex > 0 {
+                                    cached_decision.resolution.tx_ifindex
+                                } else {
+                                    resolve_tx_binding_ifindex(forwarding, cached_decision.resolution.egress_ifindex)
+                                };
+                                let target_bi = binding_lookup.target_index(
                                     binding_index,
-                                    ident,
-                                    desc,
-                                    packet_frame,
-                                    meta,
-                                    &cached_decision,
-                                    forwarding,
-                                    Some(flow),
-                                    Some(&cached_metadata.ingress_zone),
-                                    true,
-                                ) {
-                                    request.source_frame = owned_packet_frame.take();
-                                    dbg.forward += 1;
-                                    dbg.tx += 1;
-                                    binding.scratch_forwards.push(request);
-                                    recycle_now = false;
+                                    ident.ifindex,
+                                    ident.queue_id,
+                                    target_ifindex,
+                                );
+                                // Check if target is same binding (hairpin) or same-UMEM.
+                                // For simplicity, only do in-place fast path when target == self.
+                                let is_self_target = target_bi == Some(binding_index);
+                                if is_self_target && owned_packet_frame.is_none() {
+                                    // In-place rewrite: frame stays in ingress UMEM.
+                                    let expected_ports = authoritative_forward_ports(packet_frame, meta, Some(flow));
+                                    let ingress_slot = binding.slot;
+                                    let flow_key = flow.forward_key.clone();
+                                    if let Some(frame_len) = rewrite_forwarded_frame_in_place(
+                                        unsafe { &*area },
+                                        desc,
+                                        meta,
+                                        &cached_decision,
+                                        expected_ports,
+                                    ) {
+                                        // Self-target: push to own TX prepared queue.
+                                        // Skip bound_pending_tx_prepared() to avoid double
+                                        // mutable borrow — queue overflow is checked in the
+                                        // drain loop that follows the RX batch.
+                                        binding.pending_tx_prepared.push_back(PreparedTxRequest {
+                                            offset: desc.addr,
+                                            len: frame_len,
+                                            recycle: PreparedTxRecycle::FillOnSlot(ingress_slot),
+                                            expected_ports,
+                                            expected_addr_family: meta.addr_family,
+                                            expected_protocol: meta.protocol,
+                                            flow_key: Some(flow_key),
+                                        });
+                                        binding.pending_in_place_tx_packets += 1;
+                                        dbg.forward += 1;
+                                        dbg.tx += 1;
+                                        recycle_now = false;
+                                    }
+                                }
+                                // Fallback: use PendingForwardRequest path for cross-UMEM or failure.
+                                if recycle_now {
+                                    if let Some(mut request) = build_live_forward_request_from_frame(
+                                        binding_lookup,
+                                        binding_index,
+                                        ident,
+                                        desc,
+                                        packet_frame,
+                                        meta,
+                                        &cached_decision,
+                                        forwarding,
+                                        Some(flow),
+                                        Some(&cached_metadata.ingress_zone),
+                                        true,
+                                    ) {
+                                        request.source_frame = owned_packet_frame.take();
+                                        dbg.forward += 1;
+                                        dbg.tx += 1;
+                                        binding.scratch_forwards.push(request);
+                                        recycle_now = false;
+                                    }
                                 }
                             }
                             if recycle_now {
@@ -4588,6 +4638,7 @@ fn find_target_binding_mut<'a>(
     )?;
     binding_by_index_mut(left, current_index, ingress_binding, right, target_index)
 }
+
 
 fn purge_queued_flows_for_closed_deltas(bindings: &mut [BindingWorker], deltas: &[SessionDelta]) {
     for delta in deltas {
