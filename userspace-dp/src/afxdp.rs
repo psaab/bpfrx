@@ -8756,15 +8756,9 @@ fn delete_heartbeat_slot(map_fd: c_int, slot: u32) -> io::Result<()> {
 }
 
 fn maybe_touch_heartbeat(binding: &mut BindingWorker, now_ns: u64) {
-    // Zero-copy bindings: only write heartbeat after XSK RX has delivered
-    // at least one packet, proving the NIC's fill ring WQEs are posted.
-    // Until then, XDP_PASS lets the kernel forward (slower but correct).
-    // Under load, all queues bootstrap naturally via RSS distribution.
-    //
-    // Copy-mode bindings: always write heartbeat (no fill ring dependency).
-    if !binding.xsk_rx_confirmed && binding.bind_mode == XskBindMode::ZeroCopy {
-        return;
-    }
+    // The fill ring is primed before bind, so the driver's initial NAPI
+    // posts WQEs immediately. All queues should be ready to receive.
+    // No xsk_rx_confirmed gating needed.
     let age_ns = now_ns.saturating_sub(binding.last_heartbeat_update_ns);
     if age_ns < HEARTBEAT_UPDATE_INTERVAL_NS {
         return;
