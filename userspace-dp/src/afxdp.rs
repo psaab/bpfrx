@@ -4412,13 +4412,59 @@ fn poll_binding(
                                         }
                                     }
                                 }
-                                // Drop the packet. The ICMP probe above triggers
-                                // kernel ARP in ~1ms. The sender's TCP retransmit
-                                // (~200ms) arrives with the neighbor resolved and
-                                // goes through the full pipeline (session creation,
-                                // policy, NAT, FIB) — creating a proper bidirectional
-                                // session. Buffering doesn't work because the retry
-                                // path can't create sessions.
+                                // Create the session NOW so the SYN-ACK (reverse
+                                // direction) finds the forward NAT match and creates
+                                // a reverse session. Without this, the SYN-ACK hits
+                                // session miss → policy deny (no rule for WAN→LAN).
+                                if let Some(flow) = flow.as_ref() {
+                                    let sess_zone = session_ingress_zone
+                                        .as_ref()
+                                        .cloned()
+                                        .unwrap_or_else(|| Arc::from(""));
+                                    let sess_meta = SessionMetadata {
+                                        ingress_zone: sess_zone,
+                                        egress_zone: Arc::from(""),
+                                        owner_rg_id: 0,
+                                        fabric_ingress: false,
+                                        is_reverse: false,
+                                        synced: true,
+                                        nat64_reverse: None,
+                                    };
+                                    if sessions.install_with_protocol(
+                                        flow.forward_key.clone(),
+                                        decision,
+                                        sess_meta.clone(),
+                                        now_ns,
+                                        meta.protocol,
+                                        meta.tcp_flags,
+                                    ) {
+                                        let entry = SyncedSessionEntry {
+                                            key: flow.forward_key.clone(),
+                                            decision,
+                                            metadata: sess_meta,
+                                            protocol: meta.protocol,
+                                            tcp_flags: meta.tcp_flags,
+                                        };
+                                        publish_shared_session(
+                                            shared_sessions,
+                                            shared_nat_sessions,
+                                            shared_forward_wire_sessions,
+                                            &entry,
+                                        );
+                                        let _ = publish_session_map_entry_for_session(
+                                            binding.session_map_fd,
+                                            &flow.forward_key,
+                                            decision,
+                                            &entry.metadata,
+                                        );
+                                        counters.session_creates += 1;
+                                    }
+                                }
+                                // Drop the packet. The ICMP probe resolves ARP in
+                                // ~1ms. The SYN-ACK from the target finds the session
+                                // we just created and forwards via the reverse path.
+                                // The retransmitted SYN then finds the neighbor
+                                // resolved and forwards directly.
                                 if cfg!(feature = "debug-log") {
                                     if dbg.missing_neigh <= 3 {
                                         if let Some(flow) = flow.as_ref() {
