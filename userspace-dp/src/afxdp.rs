@@ -6450,54 +6450,27 @@ fn monotonic_timestamp_to_datetime(
 fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
     match target {
         IpAddr::V4(v4) => {
-            // SOCK_DGRAM ICMP (unprivileged ping) — triggers kernel ARP
+            // SOCK_RAW ICMP echo — triggers kernel ARP on the bound
+            // interface. SOCK_DGRAM IPPROTO_ICMP fails with EINVAL on
+            // sendto so we use SOCK_RAW directly.
             let fd = unsafe {
-                libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP)
+                libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP)
             };
-            if fd < 0 {
-                // Fallback: SOCK_RAW if DGRAM not available
-                let fd2 = unsafe {
-                    libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP)
-                };
-                if fd2 < 0 { return; }
-                // bind to device
-                let name_c = std::ffi::CString::new(iface_name).unwrap_or_default();
-                unsafe {
-                    libc::setsockopt(fd2, libc::SOL_SOCKET, libc::SO_BINDTODEVICE,
-                        name_c.as_ptr() as *const libc::c_void,
-                        name_c.to_bytes_with_nul().len() as libc::socklen_t);
-                }
-                // Send minimal ICMP echo: type=8, code=0, checksum, id, seq
-                let mut icmp = [0u8; 8];
-                icmp[0] = 8; // echo request
-                // checksum: ~(8<<8) = 0xf7ff
-                icmp[2] = 0xf7;
-                icmp[3] = 0xff;
-                let mut sa: libc::sockaddr_in = unsafe { core::mem::zeroed() };
-                sa.sin_family = libc::AF_INET as u16;
-                sa.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
-                unsafe {
-                    libc::sendto(fd2, icmp.as_ptr() as *const libc::c_void, 8, libc::MSG_DONTWAIT,
-                        &sa as *const libc::sockaddr_in as *const libc::sockaddr,
-                        core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t);
-                    libc::close(fd2);
-                }
-                return;
-            }
-            // DGRAM path: bind to device, connect, send
+            if fd < 0 { return; }
             let name_c = std::ffi::CString::new(iface_name).unwrap_or_default();
             unsafe {
                 libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_BINDTODEVICE,
                     name_c.as_ptr() as *const libc::c_void,
                     name_c.to_bytes_with_nul().len() as libc::socklen_t);
             }
+            // ICMP echo request: type=8, code=0, checksum=0xf7ff
+            let icmp: [u8; 8] = [8, 0, 0xf7, 0xff, 0, 0, 0, 0];
             let mut sa: libc::sockaddr_in = unsafe { core::mem::zeroed() };
             sa.sin_family = libc::AF_INET as u16;
             sa.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
-            // ICMP echo via DGRAM: type=8, code=0, id+seq auto-filled
-            let icmp = [8u8, 0, 0, 0, 0, 0, 0, 0]; // type=echo, rest zero (kernel fills checksum)
             unsafe {
-                libc::sendto(fd, icmp.as_ptr() as *const libc::c_void, 8, libc::MSG_DONTWAIT,
+                libc::sendto(fd, icmp.as_ptr() as *const libc::c_void, 8,
+                    libc::MSG_DONTWAIT,
                     &sa as *const libc::sockaddr_in as *const libc::sockaddr,
                     core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t);
                 libc::close(fd);
