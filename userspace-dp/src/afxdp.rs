@@ -2545,6 +2545,15 @@ fn poll_binding(
         if available == 0 {
             binding.dbg_rx_empty += 1;
             maybe_wake_rx(binding, false, now_ns);
+            // Check pending neighbor buffer even when RX is empty.
+            // Without this, buffered SYN packets wait until the next
+            // RX packet arrives (TCP retransmit ~1s) instead of being
+            // retried as soon as the netlink monitor resolves ARP.
+            retry_pending_neigh(
+                binding, left, binding_index, right, binding_lookup,
+                forwarding, dynamic_neighbors, now_ns,
+                unsafe { &*(binding.umem.area() as *const MmapArea) },
+            );
             counters.flush(&binding.live);
             update_binding_debug_state(binding);
             return did_work;
@@ -4623,8 +4632,29 @@ fn poll_binding(
         counters.rx_batches += 1;
         did_work = true;
     }
-    // Retry pending-neighbor packets: check if the netlink monitor
-    // has learned the neighbor since we buffered the packet.
+    retry_pending_neigh(
+        binding, left, binding_index, right, binding_lookup,
+        forwarding, dynamic_neighbors, now_ns, unsafe { &*area },
+    );
+    counters.flush(&binding.live);
+    update_binding_debug_state(binding);
+    did_work
+}
+
+fn retry_pending_neigh(
+    binding: &mut BindingWorker,
+    left: &mut [BindingWorker],
+    binding_index: usize,
+    right: &mut [BindingWorker],
+    binding_lookup: &WorkerBindingLookup,
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    now_ns: u64,
+    area: &MmapArea,
+) {
+    if binding.pending_neigh.is_empty() {
+        return;
+    }
     {
         let mut i = 0;
         while i < binding.pending_neigh.len() {
@@ -4695,9 +4725,6 @@ fn poll_binding(
             i += 1;
         }
     }
-    counters.flush(&binding.live);
-    update_binding_debug_state(binding);
-    did_work
 }
 
 fn build_live_forward_request(
