@@ -4640,10 +4640,15 @@ fn poll_binding(
                                 }
                                 // Buffer the packet. The ICMP probe resolves ARP
                                 // in ~1ms. The retry loop below re-forwards the
-                                // buffered SYN once the neighbor resolves via the
+                                // buffered packet once the neighbor resolves via the
                                 // netlink monitor. The session was already created
                                 // above so the SYN-ACK reverse path works too.
                                 // Total latency: ~2ms (ARP + netlink + retry).
+                                //
+                                // NOTE: we do NOT reinject to slow-path here because
+                                // kernel ARP resolution via XDP_PASS breaks VLAN demux
+                                // in zero-copy mode (mlx5). The ICMP probe + netlink
+                                // monitor + buffer-retry path bypasses this issue.
                                 if binding.pending_neigh.len() < MAX_PENDING_NEIGH {
                                     binding.pending_neigh.push_back(PendingNeighPacket {
                                         addr: desc.addr,
