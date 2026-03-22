@@ -4460,11 +4460,22 @@ fn poll_binding(
                                         counters.session_creates += 1;
                                     }
                                 }
-                                // Drop the packet. The ICMP probe resolves ARP in
-                                // ~1ms. The SYN-ACK from the target finds the session
-                                // we just created and forwards via the reverse path.
-                                // The retransmitted SYN then finds the neighbor
-                                // resolved and forwards directly.
+                                // Buffer the packet. The ICMP probe resolves ARP
+                                // in ~1ms. The retry loop below re-forwards the
+                                // buffered SYN once the neighbor resolves via the
+                                // netlink monitor. The session was already created
+                                // above so the SYN-ACK reverse path works too.
+                                // Total latency: ~2ms (ARP + netlink + retry).
+                                if binding.pending_neigh.len() < MAX_PENDING_NEIGH {
+                                    binding.pending_neigh.push_back(PendingNeighPacket {
+                                        addr: desc.addr,
+                                        desc,
+                                        meta,
+                                        decision,
+                                        queued_ns: now_ns,
+                                    });
+                                    recycle_now = false;
+                                }
                                 if cfg!(feature = "debug-log") {
                                     if dbg.missing_neigh <= 3 {
                                         if let Some(flow) = flow.as_ref() {
