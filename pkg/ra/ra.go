@@ -111,6 +111,18 @@ func (m *Manager) Withdraw() error {
 	return nil
 }
 
+// ResendBurst tells all running senders to re-send their startup burst.
+// Used after RETH MAC link cycles that kill the NDP socket — the sender
+// restarts but the original startup burst was lost during the link DOWN.
+func (m *Manager) ResendBurst() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for name, s := range m.senders {
+		slog.Info("ra: re-sending startup burst after link cycle", "interface", name)
+		go s.sendStartupBurst()
+	}
+}
+
 // WithdrawInterfaces sends goodbye RAs and stops senders only for the
 // named interfaces. Other senders are left running.
 func (m *Manager) WithdrawInterfaces(names []string) {

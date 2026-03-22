@@ -1795,6 +1795,12 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// dataplane so it can recreate the sockets.
 	if d.dp != nil && d.cluster != nil && cfg.Chassis.Cluster != nil {
 		d.dp.NotifyLinkCycle()
+		// Re-send RA startup burst AFTER the link is back up.  The
+		// previous startup burst fires during/before the link cycle
+		// and gets lost — hosts lose their IPv6 default gateway.
+		if d.ra != nil {
+			d.ra.ResendBurst()
+		}
 	}
 
 	// 2.6c. Reconcile proxy ARP entries for NAT addresses.

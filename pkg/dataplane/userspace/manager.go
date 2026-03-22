@@ -673,8 +673,10 @@ func userspaceMapPins() UserspaceMapPins {
 		XSK:       dataplane.UserspaceXSKMapPinPath(),
 		LocalV4:   dataplane.UserspaceLocalV4PinPath(),
 		LocalV6:   dataplane.UserspaceLocalV6PinPath(),
-		Sessions:  dataplane.UserspaceSessionsPinPath(),
-		Trace:     dataplane.UserspaceTracePinPath(),
+		Sessions:    dataplane.UserspaceSessionsPinPath(),
+		DnatTable:   dataplane.UserspaceDnatTablePinPath(),
+		DnatTableV6: dataplane.UserspaceDnatTableV6PinPath(),
+		Trace:       dataplane.UserspaceTracePinPath(),
 	}
 }
 
@@ -2575,18 +2577,26 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		HeartbeatTimeoutMS: 30000,
 	}
 	if status.Enabled {
-		// Delay ctrl enable by 10 seconds after the helper first
-		// reports ready. During this window, ctrl stays at 0 so the
-		// XDP shim falls back to the eBPF pipeline. Background traffic
-		// (VRRP, RA, ARP) during this window generates hardware RX
-		// events that bootstrap the mlx5 XSK fill ring consumer on
-		// ALL queues. Without this delay, queues that don't receive
-		// traffic during the eBPF window have unconsumed fill rings
-		// and silently drop all XDP_REDIRECT'd packets.
+		// Delay ctrl enable until AFTER VIPs are configured in HA mode.
+		// The VRRP election + VIP add takes ~10-14s after restart.
+		// If we enable ctrl before VIPs, the XSK path gets packets but
+		// can't SNAT (no source address) → all transit dropped.  The
+		// eBPF pipeline (XDP_PASS fallback) handles traffic correctly
+		// during this window since the kernel has the same FIB state.
+		//
+		// Also delay by 3s for fill ring bootstrap: mlx5 zero-copy
+		// needs NAPI to post fill ring WQEs, and NAPI only runs on
+		// hardware RX events.  Background traffic (VRRP, ARP) during
+		// the delay generates these events.
 		if !m.neighborsPrewarmed {
 			m.neighborsPrewarmed = true
-			m.ctrlEnableAt = time.Now().Add(3 * time.Second)
-			slog.Info("userspace: delaying ctrl enable by 3s for fill ring bootstrap")
+			delay := 3 * time.Second
+			if m.clusterHA {
+				delay = 15 * time.Second // wait for VRRP election + VIP add
+			}
+			m.ctrlEnableAt = time.Now().Add(delay)
+			slog.Info("userspace: delaying ctrl enable for fill ring + VIP bootstrap",
+				"delay", delay, "cluster_ha", m.clusterHA)
 			go m.bootstrapNAPIQueuesLocked()
 			m.proactiveNeighborResolveLocked()
 		}
@@ -4012,6 +4022,14 @@ func (m *Manager) NotifyLinkCycle() {
 	if m.proc == nil || m.proc.Process == nil {
 		return
 	}
+	// Reset the ctrl enable gate so the 3s fill-ring bootstrap delay
+	// restarts from scratch after rebind.  Without this, ctrl stays
+	// enabled while the new bindings aren't ready — packets redirected
+	// to dead XSK sockets are silently dropped (cold-start blackout).
+	m.neighborsPrewarmed = false
+	m.ctrlEnableAt = time.Time{}
+	m.disableUserspaceCtrlLocked()
+
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "rebind"}, &status); err != nil {
 		slog.Warn("userspace: rebind after link cycle failed", "err", err)
