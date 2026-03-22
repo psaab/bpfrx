@@ -1124,6 +1124,20 @@ fn is_icmp_to_interface_nat_local(pkt: &ParsedPacket) -> bool {
 }
 
 fn is_interface_nat_destination(pkt: &ParsedPacket) -> bool {
+    // ICMP errors (TTL Exceeded, Unreachable, etc.) to NAT addresses must NOT
+    // be passed to the kernel — they need embedded-ICMP NAT reversal in the
+    // userspace helper.  Return false so they fall through to XSK redirect.
+    if pkt.protocol == PROTO_ICMP
+        && (pkt.icmp_type == 3 || pkt.icmp_type == 11 || pkt.icmp_type == 4 || pkt.icmp_type == 12)
+    {
+        return false;
+    }
+    if pkt.protocol == PROTO_ICMPV6
+        && pkt.icmp_type >= 1
+        && pkt.icmp_type <= 4
+    {
+        return false;
+    }
     match pkt.addr_family {
         AF_INET => unsafe { USERSPACE_INTERFACE_NAT_V4.get(&pkt.dst_v4) }.is_some(),
         AF_INET6 => {

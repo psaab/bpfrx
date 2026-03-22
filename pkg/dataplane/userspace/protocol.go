@@ -303,8 +303,10 @@ type UserspaceMapPins struct {
 	XSK       string `json:"xsk,omitempty"`
 	LocalV4   string `json:"local_v4,omitempty"`
 	LocalV6   string `json:"local_v6,omitempty"`
-	Sessions  string `json:"sessions,omitempty"`
-	Trace     string `json:"trace,omitempty"`
+	Sessions    string `json:"sessions,omitempty"`
+	DnatTable   string `json:"dnat_table,omitempty"`
+	DnatTableV6 string `json:"dnat_table_v6,omitempty"`
+	Trace       string `json:"trace,omitempty"`
 }
 
 type UserspaceCapabilities struct {

@@ -487,6 +487,10 @@ struct MapPins {
     local_v6: String,
     #[serde(default)]
     sessions: String,
+    #[serde(rename = "dnat_table", default)]
+    dnat_table: String,
+    #[serde(rename = "dnat_table_v6", default)]
+    dnat_table_v6: String,
     #[serde(default)]
     trace: String,
 }

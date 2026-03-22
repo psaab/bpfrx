@@ -55,6 +55,14 @@ func UserspaceSessionsPinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_sessions")
 }
 
+func UserspaceDnatTablePinPath() string {
+	return filepath.Join(bpfPinPath, "dnat_table")
+}
+
+func UserspaceDnatTableV6PinPath() string {
+	return filepath.Join(bpfPinPath, "dnat_table_v6")
+}
+
 func UserspaceTracePinPath() string {
 	return filepath.Join(bpfPinPath, "userspace_trace")
 }
