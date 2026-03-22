@@ -4395,44 +4395,30 @@ fn poll_binding(
                                 // tagging and TX offload. The netlink monitor then
                                 // picks up the resolved entry instantly.
                                 if let Some(next_hop) = decision.resolution.next_hop {
-                                    // Spawn a background ping to trigger kernel ARP.
-                                    // This is the only reliable way to resolve neighbors
-                                    // on VLAN sub-interfaces with zero-copy XDP: the
-                                    // kernel's own ARP through the normal stack handles
-                                    // VLAN tagging correctly, and the reply is processed
-                                    // via the normal receive path (not XDP ZC XDP_PASS
-                                    // which breaks VLAN demux on mlx5).
-                                    let hop_str = next_hop.to_string();
-                                    if let Some(egress) = forwarding.egress.get(&decision.resolution.egress_ifindex) {
-                                        let iface = forwarding.ifindex_to_name
+                                    // Only spawn ping if we don't already have a
+                                    // pending probe for this (ifindex, hop).
+                                    let already_probing = binding.pending_neigh.iter().any(|p| {
+                                        p.decision.resolution.egress_ifindex == decision.resolution.egress_ifindex
+                                            && p.decision.resolution.next_hop == Some(next_hop)
+                                    });
+                                    if !already_probing {
+                                        let iface_name = forwarding.ifindex_to_name
                                             .get(&decision.resolution.egress_ifindex)
                                             .cloned();
-                                        if let Some(iface_name) = iface {
-                                            std::thread::spawn(move || {
-                                                let _ = std::process::Command::new("ping")
-                                                    .args(["-c", "1", "-W", "1", "-I", &iface_name, &hop_str])
-                                                    .stdout(std::process::Stdio::null())
-                                                    .stderr(std::process::Stdio::null())
-                                                    .status();
-                                            });
+                                        if let Some(name) = iface_name {
+                                            // Fast path: ICMP socket triggers kernel ARP
+                                            // in microseconds (no fork/exec).
+                                            trigger_kernel_arp_probe(&name, next_hop);
                                         }
                                     }
                                 }
-                                // Buffer the packet and hold the UMEM frame.
-                                // The netlink neighbor monitor will learn the
-                                // ARP/NDP result; the retry loop below will
-                                // re-forward the packet once the neighbor resolves.
-                                // No kernel slow-path dependency.
-                                if binding.pending_neigh.len() < MAX_PENDING_NEIGH {
-                                    binding.pending_neigh.push_back(PendingNeighPacket {
-                                        addr: desc.addr,
-                                        desc,
-                                        meta,
-                                        decision,
-                                        queued_ns: now_ns,
-                                    });
-                                    recycle_now = false; // hold the UMEM frame
-                                }
+                                // Drop the packet. The ICMP probe above triggers
+                                // kernel ARP in ~1ms. The sender's TCP retransmit
+                                // (~200ms) arrives with the neighbor resolved and
+                                // goes through the full pipeline (session creation,
+                                // policy, NAT, FIB) — creating a proper bidirectional
+                                // session. Buffering doesn't work because the retry
+                                // path can't create sessions.
                                 if cfg!(feature = "debug-log") {
                                     if dbg.missing_neigh <= 3 {
                                         if let Some(flow) = flow.as_ref() {
@@ -6373,6 +6359,92 @@ fn monotonic_timestamp_to_datetime(
 /// Send a raw Ethernet frame via AF_PACKET on the given interface.
 /// Used for ARP/NDP solicitations that must bypass XSK (because the
 /// XSK fill ring may not be bootstrapped on the egress interface).
+
+/// Trigger kernel ARP/NDP resolution by sending an ICMP echo via a
+/// DGRAM socket bound to the egress interface. The kernel's own ARP
+/// stack handles VLAN tagging correctly. No fork/exec overhead.
+fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
+    match target {
+        IpAddr::V4(v4) => {
+            // SOCK_DGRAM ICMP (unprivileged ping) — triggers kernel ARP
+            let fd = unsafe {
+                libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP)
+            };
+            if fd < 0 {
+                // Fallback: SOCK_RAW if DGRAM not available
+                let fd2 = unsafe {
+                    libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP)
+                };
+                if fd2 < 0 { return; }
+                // bind to device
+                let name_c = std::ffi::CString::new(iface_name).unwrap_or_default();
+                unsafe {
+                    libc::setsockopt(fd2, libc::SOL_SOCKET, libc::SO_BINDTODEVICE,
+                        name_c.as_ptr() as *const libc::c_void,
+                        name_c.to_bytes_with_nul().len() as libc::socklen_t);
+                }
+                // Send minimal ICMP echo: type=8, code=0, checksum, id, seq
+                let mut icmp = [0u8; 8];
+                icmp[0] = 8; // echo request
+                // checksum: ~(8<<8) = 0xf7ff
+                icmp[2] = 0xf7;
+                icmp[3] = 0xff;
+                let mut sa: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+                sa.sin_family = libc::AF_INET as u16;
+                sa.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
+                unsafe {
+                    libc::sendto(fd2, icmp.as_ptr() as *const libc::c_void, 8, libc::MSG_DONTWAIT,
+                        &sa as *const libc::sockaddr_in as *const libc::sockaddr,
+                        core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t);
+                    libc::close(fd2);
+                }
+                return;
+            }
+            // DGRAM path: bind to device, connect, send
+            let name_c = std::ffi::CString::new(iface_name).unwrap_or_default();
+            unsafe {
+                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_BINDTODEVICE,
+                    name_c.as_ptr() as *const libc::c_void,
+                    name_c.to_bytes_with_nul().len() as libc::socklen_t);
+            }
+            let mut sa: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+            sa.sin_family = libc::AF_INET as u16;
+            sa.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
+            // ICMP echo via DGRAM: type=8, code=0, id+seq auto-filled
+            let icmp = [8u8, 0, 0, 0, 0, 0, 0, 0]; // type=echo, rest zero (kernel fills checksum)
+            unsafe {
+                libc::sendto(fd, icmp.as_ptr() as *const libc::c_void, 8, libc::MSG_DONTWAIT,
+                    &sa as *const libc::sockaddr_in as *const libc::sockaddr,
+                    core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t);
+                libc::close(fd);
+            }
+        }
+        IpAddr::V6(v6) => {
+            // ICMPv6 echo via DGRAM
+            let fd = unsafe {
+                libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_ICMPV6)
+            };
+            if fd < 0 { return; }
+            let name_c = std::ffi::CString::new(iface_name).unwrap_or_default();
+            unsafe {
+                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_BINDTODEVICE,
+                    name_c.as_ptr() as *const libc::c_void,
+                    name_c.to_bytes_with_nul().len() as libc::socklen_t);
+            }
+            let mut sa6: libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
+            sa6.sin6_family = libc::AF_INET6 as u16;
+            sa6.sin6_addr.s6_addr = v6.octets();
+            // ICMPv6 echo request: type=128
+            let icmp6 = [128u8, 0, 0, 0, 0, 0, 0, 0];
+            unsafe {
+                libc::sendto(fd, icmp6.as_ptr() as *const libc::c_void, 8, libc::MSG_DONTWAIT,
+                    &sa6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t);
+                libc::close(fd);
+            }
+        }
+    }
+}
 
 /// Trigger kernel-side ARP/NDP resolution by adding a NUD_INCOMPLETE
 /// neighbor entry via netlink. This makes the kernel send its own ARP
