@@ -6477,9 +6477,9 @@ fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
             }
         }
         IpAddr::V6(v6) => {
-            // ICMPv6 echo via DGRAM
+            // ICMPv6 echo via SOCK_RAW (DGRAM sendto fails with EINVAL)
             let fd = unsafe {
-                libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, libc::IPPROTO_ICMPV6)
+                libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6)
             };
             if fd < 0 { return; }
             let name_c = std::ffi::CString::new(iface_name).unwrap_or_default();
@@ -6491,8 +6491,15 @@ fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
             let mut sa6: libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
             sa6.sin6_family = libc::AF_INET6 as u16;
             sa6.sin6_addr.s6_addr = v6.octets();
-            // ICMPv6 echo request: type=128
+            // ICMPv6 echo request: type=128, code=0, checksum=0 (kernel fills)
             let icmp6 = [128u8, 0, 0, 0, 0, 0, 0, 0];
+            // Tell kernel to auto-compute ICMPv6 checksum at offset 2
+            let offset: c_int = 2;
+            unsafe {
+                libc::setsockopt(fd, libc::IPPROTO_ICMPV6, libc::IPV6_CHECKSUM,
+                    &offset as *const c_int as *const libc::c_void,
+                    core::mem::size_of::<c_int>() as libc::socklen_t);
+            }
             unsafe {
                 libc::sendto(fd, icmp6.as_ptr() as *const libc::c_void, 8, libc::MSG_DONTWAIT,
                     &sa6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
