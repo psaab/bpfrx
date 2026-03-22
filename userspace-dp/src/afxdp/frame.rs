@@ -2466,6 +2466,265 @@ pub(super) fn rewrite_forwarded_frame_in_place(
     Some(frame_len as u32)
 }
 
+/// Straight-line frame rewrite using a precomputed `RewriteDescriptor`.
+///
+/// Eliminates per-packet branches for address family, VLAN presence, NAT type,
+/// and checksum recomputation — all decisions are baked into the descriptor at
+/// session / flow-cache insertion time.
+///
+/// Returns the new frame length on success, or `None` if the frame is corrupt,
+/// too short, or has a port mismatch (caller falls back to generic rewrite).
+///
+/// **Scope**: IPv4/IPv6 TCP and UDP only (flow cache gates on ACK-only TCP + UDP).
+/// Does NOT handle: ICMP identifier repair, NAT64 (header-size change), NPTv6
+/// (checksum-neutral — no L4 csum adjust needed, but address rewrite differs).
+#[inline]
+pub(super) fn apply_rewrite_descriptor(
+    area: &MmapArea,
+    desc: XdpDesc,
+    meta: UserspaceDpMeta,
+    rd: &super::RewriteDescriptor,
+    expected_ports: Option<(u16, u16)>,
+) -> Option<u32> {
+    // NAT64 and NPTv6 use the generic path — they need special handling.
+    if rd.nat64 || rd.nptv6 {
+        return None;
+    }
+
+    let frame = unsafe { area.slice_mut_unchecked(desc.addr as usize, UMEM_FRAME_SIZE as usize)? };
+    let current_len = desc.len as usize;
+
+    // L3 offset: trust XDP shim metadata when it's a standard value.
+    let l3 = match meta.l3_offset {
+        14 | 18 => meta.l3_offset as usize,
+        _ => frame_l3_offset(&frame[..current_len])?,
+    };
+    if l3 >= current_len {
+        return None;
+    }
+
+    // Trim Ethernet padding using IP total length.
+    let mut payload_len = current_len.checked_sub(l3)?;
+    if payload_len >= 4 {
+        let ip_version = frame[l3] >> 4;
+        if ip_version == 4 {
+            let ip_total_len = u16::from_be_bytes([frame[l3 + 2], frame[l3 + 3]]) as usize;
+            if ip_total_len > 0 && ip_total_len < payload_len {
+                payload_len = ip_total_len;
+            }
+        } else if ip_version == 6 && payload_len >= 40 {
+            let ipv6_payload_len = u16::from_be_bytes([frame[l3 + 4], frame[l3 + 5]]) as usize;
+            let ip6_total = 40 + ipv6_payload_len;
+            if ip6_total > 0 && ip6_total < payload_len {
+                payload_len = ip6_total;
+            }
+        }
+    }
+
+    // Target Ethernet header length (14 = no VLAN, 18 = 802.1Q).
+    let eth_len = if rd.tx_vlan_id > 0 { 18usize } else { 14usize };
+    let frame_len = eth_len.checked_add(payload_len)?;
+    if frame_len > frame.len() {
+        return None;
+    }
+
+    // Shift payload if L3 offset changes (adding/removing VLAN tag).
+    if eth_len != l3 {
+        frame.copy_within(l3..l3 + payload_len, eth_len);
+    }
+
+    // Write Ethernet header — precomputed MACs, VLAN, ether_type.
+    write_eth_header_slice(
+        frame.get_mut(..eth_len)?,
+        rd.dst_mac,
+        rd.src_mac,
+        rd.tx_vlan_id,
+        rd.ether_type,
+    )?;
+
+    let packet = &mut frame[..frame_len];
+    let ip = eth_len;
+
+    match rd.ether_type {
+        0x0800 => {
+            // ── IPv4 straight-line rewrite ──
+            if packet.len() < ip + 20 {
+                return None;
+            }
+            let ihl = ((packet[ip] & 0x0f) as usize) * 4;
+            if ihl < 20 || packet.len() < ip + ihl {
+                return None;
+            }
+            if packet[ip + 8] <= 1 {
+                return None; // TTL expired
+            }
+            let l4 = ip + ihl;
+
+            // Port validation (DMA race guard).
+            // If ports don't match, fall back to generic path for repair.
+            if let Some((exp_src, exp_dst)) = expected_ports {
+                if matches!(meta.protocol, PROTO_TCP | PROTO_UDP) && packet.len() >= l4 + 4 {
+                    let cur_src = u16::from_be_bytes([packet[l4], packet[l4 + 1]]);
+                    let cur_dst = u16::from_be_bytes([packet[l4 + 2], packet[l4 + 3]]);
+                    if cur_src != exp_src || cur_dst != exp_dst {
+                        return None;
+                    }
+                }
+            }
+
+            // NAT: direct byte writes for IP addresses.
+            if let Some(IpAddr::V4(new_src)) = rd.rewrite_src_ip {
+                packet[ip + 12..ip + 16].copy_from_slice(&new_src.octets());
+            }
+            if let Some(IpAddr::V4(new_dst)) = rd.rewrite_dst_ip {
+                packet[ip + 16..ip + 20].copy_from_slice(&new_dst.octets());
+            }
+
+            // NAT: direct byte writes for L4 ports.
+            if let Some(new_sport) = rd.rewrite_src_port {
+                if packet.len() >= l4 + 2 {
+                    packet[l4..l4 + 2].copy_from_slice(&new_sport.to_be_bytes());
+                }
+            }
+            if let Some(new_dport) = rd.rewrite_dst_port {
+                if packet.len() >= l4 + 4 {
+                    packet[l4 + 2..l4 + 4].copy_from_slice(&new_dport.to_be_bytes());
+                }
+            }
+
+            // TTL decrement.
+            packet[ip + 8] -= 1;
+
+            // IP header checksum: precomputed NAT delta + constant TTL-1 delta.
+            // TTL-1 delta is always 0xFEFF in one's complement arithmetic:
+            //   !old_ttl_word + new_ttl_word = 0xFFFF - (T<<8|P) + ((T-1)<<8|P) = 0xFEFF
+            let old_csum = u16::from_be_bytes([packet[ip + 10], packet[ip + 11]]);
+            let mut sum = (!old_csum as u32) & 0xffff;
+            sum += rd.ip_csum_delta as u32;
+            sum += 0xFEFF; // TTL-1 delta (constant regardless of TTL value)
+            while (sum >> 16) != 0 {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            let new_csum = !(sum as u16);
+            packet[ip + 10..ip + 12].copy_from_slice(&new_csum.to_be_bytes());
+
+            // L4 checksum: precomputed delta covers IP + port changes.
+            if rd.l4_csum_delta != 0 {
+                let l4_csum_off = match meta.protocol {
+                    PROTO_TCP => l4 + 16,
+                    PROTO_UDP => l4 + 6,
+                    _ => 0,
+                };
+                if l4_csum_off > 0 && packet.len() >= l4_csum_off + 2 {
+                    let old_l4_csum =
+                        u16::from_be_bytes([packet[l4_csum_off], packet[l4_csum_off + 1]]);
+                    // Skip UDP checksum update if zero (no checksum, RFC 768).
+                    if meta.protocol != PROTO_UDP || old_l4_csum != 0 {
+                        let mut l4sum = (!old_l4_csum as u32) & 0xffff;
+                        l4sum += rd.l4_csum_delta as u32;
+                        while (l4sum >> 16) != 0 {
+                            l4sum = (l4sum & 0xffff) + (l4sum >> 16);
+                        }
+                        let new_l4 = !(l4sum as u16);
+                        // UDP: 0x0000 means "no checksum" — use 0xFFFF (RFC 768).
+                        let final_csum = if meta.protocol == PROTO_UDP && new_l4 == 0 {
+                            0xFFFFu16
+                        } else {
+                            new_l4
+                        };
+                        packet[l4_csum_off..l4_csum_off + 2]
+                            .copy_from_slice(&final_csum.to_be_bytes());
+                    }
+                }
+            }
+        }
+        0x86dd => {
+            // ── IPv6 straight-line rewrite ──
+            // No IP header checksum; only L4 pseudo-header changes matter.
+            if packet.len() < ip + 40 {
+                return None;
+            }
+            if packet[ip + 7] <= 1 {
+                return None; // Hop limit expired
+            }
+
+            // L4 offset from metadata or by parsing extension headers.
+            let meta_rel = meta.l4_offset.wrapping_sub(meta.l3_offset) as usize;
+            let rel_l4 = if meta_rel >= 40 && meta.l4_offset > meta.l3_offset {
+                meta_rel
+            } else {
+                packet_rel_l4_offset(&packet[ip..], meta.addr_family)?
+            };
+            let l4 = ip + rel_l4;
+
+            // Port validation (DMA race guard).
+            if let Some((exp_src, exp_dst)) = expected_ports {
+                if matches!(meta.protocol, PROTO_TCP | PROTO_UDP) && packet.len() >= l4 + 4 {
+                    let cur_src = u16::from_be_bytes([packet[l4], packet[l4 + 1]]);
+                    let cur_dst = u16::from_be_bytes([packet[l4 + 2], packet[l4 + 3]]);
+                    if cur_src != exp_src || cur_dst != exp_dst {
+                        return None;
+                    }
+                }
+            }
+
+            // NAT: direct byte writes for IPv6 addresses.
+            if let Some(IpAddr::V6(new_src)) = rd.rewrite_src_ip {
+                packet[ip + 8..ip + 24].copy_from_slice(&new_src.octets());
+            }
+            if let Some(IpAddr::V6(new_dst)) = rd.rewrite_dst_ip {
+                packet[ip + 24..ip + 40].copy_from_slice(&new_dst.octets());
+            }
+
+            // NAT: direct byte writes for L4 ports.
+            if let Some(new_sport) = rd.rewrite_src_port {
+                if packet.len() >= l4 + 2 {
+                    packet[l4..l4 + 2].copy_from_slice(&new_sport.to_be_bytes());
+                }
+            }
+            if let Some(new_dport) = rd.rewrite_dst_port {
+                if packet.len() >= l4 + 4 {
+                    packet[l4 + 2..l4 + 4].copy_from_slice(&new_dport.to_be_bytes());
+                }
+            }
+
+            // Hop limit decrement.
+            packet[ip + 7] -= 1;
+
+            // L4 checksum: precomputed delta covers IPv6 address + port changes.
+            if rd.l4_csum_delta != 0 {
+                let l4_csum_off = match meta.protocol {
+                    PROTO_TCP => l4 + 16,
+                    PROTO_UDP => l4 + 6,
+                    PROTO_ICMPV6 => l4 + 2,
+                    _ => 0,
+                };
+                if l4_csum_off > 0 && packet.len() >= l4_csum_off + 2 {
+                    let old_l4_csum =
+                        u16::from_be_bytes([packet[l4_csum_off], packet[l4_csum_off + 1]]);
+                    let mut l4sum = (!old_l4_csum as u32) & 0xffff;
+                    l4sum += rd.l4_csum_delta as u32;
+                    while (l4sum >> 16) != 0 {
+                        l4sum = (l4sum & 0xffff) + (l4sum >> 16);
+                    }
+                    let new_l4 = !(l4sum as u16);
+                    // IPv6 UDP must have non-zero checksum; use 0xFFFF for all.
+                    let final_csum = if new_l4 == 0 { 0xFFFFu16 } else { new_l4 };
+                    packet[l4_csum_off..l4_csum_off + 2]
+                        .copy_from_slice(&final_csum.to_be_bytes());
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    // Checksum verification for descriptor path (debug only).
+    if cfg!(feature = "debug-log") {
+        verify_built_frame_checksums(&packet[..frame_len]);
+    }
+    Some(frame_len as u32)
+}
+
 pub(super) fn apply_nat_ipv4(packet: &mut [u8], protocol: u8, nat: NatDecision) -> Option<()> {
     if nat == NatDecision::default() {
         return Some(());
