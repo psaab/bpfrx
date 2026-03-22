@@ -4395,13 +4395,28 @@ fn poll_binding(
                                 // tagging and TX offload. The netlink monitor then
                                 // picks up the resolved entry instantly.
                                 if let Some(next_hop) = decision.resolution.next_hop {
-                                    // Trigger kernel ARP/NDP via netlink NUD_INCOMPLETE.
-                                    // Use the egress ifindex (VLAN sub) directly — the
-                                    // kernel knows how to ARP on VLAN interfaces.
-                                    add_kernel_neighbor_probe(
-                                        decision.resolution.egress_ifindex,
-                                        next_hop,
-                                    );
+                                    // Spawn a background ping to trigger kernel ARP.
+                                    // This is the only reliable way to resolve neighbors
+                                    // on VLAN sub-interfaces with zero-copy XDP: the
+                                    // kernel's own ARP through the normal stack handles
+                                    // VLAN tagging correctly, and the reply is processed
+                                    // via the normal receive path (not XDP ZC XDP_PASS
+                                    // which breaks VLAN demux on mlx5).
+                                    let hop_str = next_hop.to_string();
+                                    if let Some(egress) = forwarding.egress.get(&decision.resolution.egress_ifindex) {
+                                        let iface = forwarding.ifindex_to_name
+                                            .get(&decision.resolution.egress_ifindex)
+                                            .cloned();
+                                        if let Some(iface_name) = iface {
+                                            std::thread::spawn(move || {
+                                                let _ = std::process::Command::new("ping")
+                                                    .args(["-c", "1", "-W", "1", "-I", &iface_name, &hop_str])
+                                                    .stdout(std::process::Stdio::null())
+                                                    .stderr(std::process::Stdio::null())
+                                                    .status();
+                                            });
+                                        }
+                                    }
                                 }
                                 // Buffer the packet and hold the UMEM frame.
                                 // The netlink neighbor monitor will learn the
