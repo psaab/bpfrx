@@ -4388,23 +4388,20 @@ fn poll_binding(
                                 // path (cpumap_or_pass), bypassing XSK fill ring issues.
                                 // Also reinject original packet to slow-path for kernel
                                 // to forward once the neighbor is resolved.
+                                // Trigger ARP/NDP resolution via kernel netlink.
+                                // Adding an INCOMPLETE neighbor entry makes the
+                                // kernel send its own ARP/NDP solicitation through
+                                // the normal stack, which correctly handles VLAN
+                                // tagging and TX offload. The netlink monitor then
+                                // picks up the resolved entry instantly.
                                 if let Some(next_hop) = decision.resolution.next_hop {
-                                    let egress_ifindex = decision.resolution.egress_ifindex;
-                                    if let IpAddr::V4(target_v4) = next_hop {
-                                        if let Some(egress) = forwarding.egress.get(&egress_ifindex) {
-                                            if let Some(src_v4) = egress.primary_v4 {
-                                                let arp = build_arp_request(egress.src_mac, src_v4, target_v4);
-                                                send_raw_frame(egress_ifindex, &arp);
-                                            }
-                                        }
-                                    } else if let IpAddr::V6(target_v6) = next_hop {
-                                        if let Some(egress) = forwarding.egress.get(&egress_ifindex) {
-                                            if let Some(src_v6) = egress.primary_v6 {
-                                                let ns = build_ndp_neighbor_solicitation(egress.src_mac, src_v6, target_v6);
-                                                send_raw_frame(egress_ifindex, &ns);
-                                            }
-                                        }
-                                    }
+                                    // Trigger kernel ARP/NDP via netlink NUD_INCOMPLETE.
+                                    // Use the egress ifindex (VLAN sub) directly — the
+                                    // kernel knows how to ARP on VLAN interfaces.
+                                    add_kernel_neighbor_probe(
+                                        decision.resolution.egress_ifindex,
+                                        next_hop,
+                                    );
                                 }
                                 // Buffer the packet and hold the UMEM frame.
                                 // The netlink neighbor monitor will learn the
@@ -6362,6 +6359,64 @@ fn monotonic_timestamp_to_datetime(
 /// Used for ARP/NDP solicitations that must bypass XSK (because the
 /// XSK fill ring may not be bootstrapped on the egress interface).
 
+/// Trigger kernel-side ARP/NDP resolution by adding a NUD_INCOMPLETE
+/// neighbor entry via netlink. This makes the kernel send its own ARP
+/// request through the normal stack, correctly handling VLAN tagging
+/// and hardware TX offload.
+fn add_kernel_neighbor_probe(ifindex: i32, ip: IpAddr) {
+    const RTM_NEWNEIGH: u16 = 28;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_CREATE: u16 = 0x400;
+    const NDA_DST: u16 = 1;
+    const NUD_INCOMPLETE: u16 = 0x01;
+    let (family, ip_bytes): (u8, Vec<u8>) = match ip {
+        IpAddr::V4(v4) => (libc::AF_INET as u8, v4.octets().to_vec()),
+        IpAddr::V6(v6) => (libc::AF_INET6 as u8, v6.octets().to_vec()),
+    };
+    let ip_attr_len = 4 + ip_bytes.len();
+    let ip_attr_padded = (ip_attr_len + 3) & !3;
+    let ndmsg_len = 12;
+    let total_len = 16 + ndmsg_len + ip_attr_padded;
+    let mut buf = vec![0u8; total_len];
+    buf[0..4].copy_from_slice(&(total_len as u32).to_ne_bytes());
+    buf[4..6].copy_from_slice(&RTM_NEWNEIGH.to_ne_bytes());
+    buf[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_CREATE).to_ne_bytes());
+    buf[8..12].copy_from_slice(&1u32.to_ne_bytes());
+    buf[16] = family;
+    buf[20..24].copy_from_slice(&ifindex.to_ne_bytes());
+    buf[24..26].copy_from_slice(&NUD_INCOMPLETE.to_ne_bytes());
+    let off = 16 + ndmsg_len;
+    buf[off..off + 2].copy_from_slice(&(ip_attr_len as u16).to_ne_bytes());
+    buf[off + 2..off + 4].copy_from_slice(&NDA_DST.to_ne_bytes());
+    buf[off + 4..off + 4 + ip_bytes.len()].copy_from_slice(&ip_bytes);
+    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 { return; }
+    let mut sa: libc::sockaddr_nl = unsafe { core::mem::zeroed() };
+    sa.nl_family = libc::AF_NETLINK as u16;
+    unsafe {
+        libc::sendto(fd, buf.as_ptr() as *const libc::c_void, buf.len(),
+            libc::MSG_DONTWAIT,
+            &sa as *const libc::sockaddr_nl as *const libc::sockaddr,
+            core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t);
+        libc::close(fd);
+    }
+}
+
+/// Insert an 802.1Q VLAN tag at offset 12 in an Ethernet frame.
+/// The frame is expanded by 4 bytes: [dst(6)][src(6)][0x8100][vlan][original ethertype][payload]
+fn insert_vlan_tag(frame: &mut Vec<u8>, vlan_id: u16) {
+    if frame.len() < 14 {
+        return;
+    }
+    let original_ethertype = [frame[12], frame[13]];
+    // Insert 4 bytes at position 12: 0x8100 (TPID) + vlan_id
+    let tag = [0x81, 0x00, (vlan_id >> 8) as u8, (vlan_id & 0xff) as u8];
+    frame.splice(12..12, tag.iter().copied());
+    // The original ethertype is now at offset 16 (pushed by the insert)
+    // which is correct: [dst][src][8100][vlan][ethertype][payload]
+    let _ = original_ethertype; // already in place after splice
+}
+
 fn send_raw_frame(ifindex: i32, frame: &[u8]) {
     if frame.len() < 14 {
         return;
@@ -6370,41 +6425,61 @@ fn send_raw_frame(ifindex: i32, frame: &[u8]) {
     // Create a fresh socket per-send. VLAN sub-interfaces require bind()
     // before send — a persistent unbound socket with sendto(sll_ifindex)
     // doesn't work reliably on VLAN devices.
+    // Match the Python pattern exactly: socket(AF_PACKET, SOCK_RAW, htons(proto))
+    let proto_be = (proto as u16).to_be();
     let fd = unsafe {
         libc::socket(
             libc::AF_PACKET,
-            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            (proto as i32).to_be(),
+            libc::SOCK_RAW,
+            proto_be as c_int,
         )
     };
     if fd < 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        eprintln!("send_raw_frame: socket() failed: errno={errno} ifindex={ifindex} proto=0x{proto:04x}");
         return;
     }
     let mut bind_addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
     bind_addr.sll_family = libc::AF_PACKET as u16;
     bind_addr.sll_ifindex = ifindex;
-    bind_addr.sll_protocol = proto.to_be();
-    unsafe {
+    bind_addr.sll_protocol = proto_be;
+    let bind_rc = unsafe {
         libc::bind(
             fd,
             &bind_addr as *const libc::sockaddr_ll as *const libc::sockaddr,
             core::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-        );
+        )
+    };
+    if bind_rc < 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        eprintln!("send_raw_frame: bind() failed: errno={errno} ifindex={ifindex}");
+        unsafe { libc::close(fd) };
+        return;
     }
-    let mut addr: libc::sockaddr_ll = bind_addr;
-    addr.sll_halen = 6;
-    addr.sll_addr[..6].copy_from_slice(&frame[..6]);
-    unsafe {
+    // Use sendto with explicit sockaddr_ll for reliable delivery.
+    // The sll_pkttype=PACKET_OUTGOING ensures the frame goes to the wire.
+    let mut send_addr = bind_addr;
+    send_addr.sll_halen = 6;
+    if frame.len() >= 6 {
+        send_addr.sll_addr[..6].copy_from_slice(&frame[..6]);
+    }
+    let send_rc = unsafe {
         libc::sendto(
             fd,
             frame.as_ptr() as *const libc::c_void,
             frame.len(),
-            libc::MSG_DONTWAIT,
-            &addr as *const libc::sockaddr_ll as *const libc::sockaddr,
+            0,
+            &send_addr as *const libc::sockaddr_ll as *const libc::sockaddr,
             core::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-        );
-        libc::close(fd);
+        )
+    };
+    if send_rc < 0 {
+        let errno = unsafe { *libc::__errno_location() };
+        eprintln!("send_raw_frame: send() failed: errno={errno} ifindex={ifindex} len={}", frame.len());
+    } else {
+        eprintln!("send_raw_frame: OK ifindex={ifindex} len={} sent={send_rc}", frame.len());
     }
+    unsafe { libc::close(fd) };
 }
 
 /// Add a neighbor entry to the kernel's neighbor table via raw netlink.

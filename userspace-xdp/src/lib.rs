@@ -322,12 +322,13 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let parsed = match eth_proto {
         ETH_P_IP => parse_ipv4(data, data_end, vlan_id, l3_offset),
         ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, l3_offset),
-        // Non-IP (ARP, LLDP, etc.): deliver to kernel via cpumap.
-        // The kernel owns ARP/NDP resolution and the authoritative
-        // neighbor table. The helper learns neighbors opportunistically
-        // from IP traffic seen on XSK (learn_dynamic_neighbor_from_packet),
-        // not by intercepting ARP/NDP directly.
-        _ => return Ok(cpumap_or_pass(ctrl)),
+        // Non-IP (ARP, LLDP, etc.): XDP_PASS to kernel stack.
+        // cpumap redirect for ARP breaks kernel neighbor resolution:
+        // the cpumap processing path on the remote CPU doesn't trigger
+        // the L2 ARP state machine, leaving entries in INCOMPLETE state.
+        // XDP_PASS delivers directly to the local kernel stack which
+        // correctly updates the neighbor table.
+        _ => return Ok(xdp_action::XDP_PASS),
     };
     let Some(parsed) = parsed else {
         return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
