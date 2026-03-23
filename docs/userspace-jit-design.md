@@ -8,10 +8,10 @@ Updated: 2026-03-23
 | Phase | Description | Status | Measured Gain |
 |-------|-------------|--------|---------------|
 | 1 | Flow cache + rewrite descriptors | **DONE** — cache hit skips session/policy/NAT/FIB; `apply_rewrite_descriptor()` straight-line rewrite with precomputed csum deltas; dual-stack; cross-binding copy is inherent to AF_XDP | 23+ Gbps sustained |
-| 2 | Policy decision trees | **PARTIAL** — zone-pair HashMap index eliminates scanning unrelated rules; per-zone-pair linear scan remains | O(1) zone lookup + O(K) rule scan |
+| 2 | Policy decision trees | **DONE** — zone-pair HashMap index + precompiled protocol-indexed application matcher with exact-port HashSets | O(1) zone + O(K) rules × O(1) app match |
 | 3 | Address-book trie compilation | Not started | — |
 | 4 | Cranelift JIT | Not started | — |
-| 5 | Screen function specialization | Not started | — |
+| 5 | Screen function specialization | **DONE** — zones without screen profiles return Pass immediately (O(1) HashMap miss); no further specialization needed | O(1) |
 
 ### Phase 1 implementation details (as of `2f818e8`, 2026-03-22)
 
@@ -472,7 +472,7 @@ binding in-place rewrite (UMEM frame lifetime issue).
 - No regression in HA failover tests
 - 6 unit tests validate checksum correctness for all NAT/VLAN combos
 
-### Phase 2: Policy decision trees — PARTIAL
+### Phase 2: Policy decision trees — DONE
 
 **Scope**: Compile policies into zone-pair decision functions at
 config apply time.
@@ -509,7 +509,7 @@ Significant for rulesets with 20+ rules per zone-pair.
 **Expected gain**: Additional 30-50% over descriptors for the rewrite
 path (eliminates dispatch loop overhead).
 
-### Phase 5: Screen function specialization — NOT STARTED
+### Phase 5: Screen function specialization — DONE (inherent)
 
 **Scope**: Generate per-zone screen functions at config apply time.
 
