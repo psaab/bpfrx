@@ -2628,10 +2628,9 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			go m.bootstrapNAPIQueuesLocked()
 			m.proactiveNeighborResolveLocked()
 		}
-		m.refreshNeighborSnapshotLocked()
-
-		// Readiness-based enable: check concrete conditions instead
-		// of just waiting for a timer.
+		// Check readiness gates BEFORE refreshing neighbors (which
+		// bumps the generation). The status reports the generation
+		// from the previous refresh cycle.
 		allBindingsReady := true
 		for _, b := range status.Bindings {
 			if b.Ifindex > 0 && b.Registered && !b.Bound {
@@ -2641,6 +2640,9 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		}
 		neighborGenOK := m.neighborGeneration == 0 ||
 			status.NeighborGeneration >= m.neighborGeneration
+
+		// Now refresh neighbors for the next cycle.
+		m.refreshNeighborSnapshotLocked()
 
 		if allBindingsReady && neighborGenOK {
 			ctrl.Enabled = 1
