@@ -1,6 +1,7 @@
 use crate::prefix::{PrefixV4, PrefixV6};
 use crate::{PolicyApplicationSnapshot, PolicyRuleSnapshot};
 use ipnet::IpNet;
+use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -67,10 +68,23 @@ pub(crate) struct ApplicationMatch {
     pub(crate) destination_ports: Vec<PortRange>,
 }
 
+/// Zone-pair key for the policy index.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ZonePairKey {
+    from: String,
+    to: String,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PolicyState {
     pub(crate) default_action: PolicyAction,
+    /// All rules in original order (kept for hit-counter reporting).
     pub(crate) rules: Vec<PolicyRule>,
+    /// Zone-pair index: maps (from_zone, to_zone) → indices into `rules`.
+    /// Avoids scanning unrelated zone-pairs during evaluation.
+    zone_pair_index: FxHashMap<ZonePairKey, Vec<usize>>,
+    /// Indices of global rules (from_zone = "junos-global").
+    global_indices: Vec<usize>,
 }
 
 impl Default for PolicyState {
@@ -78,6 +92,8 @@ impl Default for PolicyState {
         Self {
             default_action: PolicyAction::Deny,
             rules: Vec::new(),
+            zone_pair_index: FxHashMap::default(),
+            global_indices: Vec::new(),
         }
     }
 }
@@ -89,6 +105,8 @@ pub(crate) fn parse_policy_state(
     let mut state = PolicyState {
         default_action: parse_action(default_policy),
         rules: Vec::with_capacity(rules.len()),
+        zone_pair_index: FxHashMap::default(),
+        global_indices: Vec::new(),
     };
     for snap in rules {
         let mut rule = PolicyRule {
@@ -104,7 +122,19 @@ pub(crate) fn parse_policy_state(
             parse_address(prefix, &mut rule.destination_v4, &mut rule.destination_v6);
         }
         rule.applications = parse_applications(&snap.application_terms);
+        let idx = state.rules.len();
+        let is_global = rule.from_zone == "junos-global" || rule.to_zone == "junos-global";
         state.rules.push(rule);
+
+        if is_global {
+            state.global_indices.push(idx);
+        } else {
+            let key = ZonePairKey {
+                from: snap.from_zone.clone(),
+                to: snap.to_zone.clone(),
+            };
+            state.zone_pair_index.entry(key).or_default().push(idx);
+        }
     }
     state
 }
@@ -119,41 +149,61 @@ pub(crate) fn evaluate_policy(
     src_port: u16,
     dst_port: u16,
 ) -> PolicyAction {
-    for rule in &state.rules {
-        if !rule.from_zone.is_empty()
-            && rule.from_zone != from_zone
-            && rule.from_zone != "junos-global"
-        {
-            continue;
-        }
-        if !rule.to_zone.is_empty()
-            && rule.to_zone != to_zone
-            && rule.to_zone != "junos-global"
-        {
-            continue;
-        }
-        if !applications_match(&rule.applications, protocol, src_port, dst_port) {
-            continue;
-        }
-        match (src_ip, dst_ip) {
-            (IpAddr::V4(src), IpAddr::V4(dst))
-                if nets_match_v4(&rule.source_v4, src)
-                    && nets_match_v4(&rule.destination_v4, dst) =>
-            {
-                rule.hit_count.fetch_add(1, Ordering::Relaxed);
-                return rule.action;
+    // Phase 2 optimisation: look up only the rules for this zone-pair
+    // instead of scanning all rules. Global rules are checked afterward.
+    // The ZonePairKey allocation is acceptable because evaluate_policy
+    // only runs on session miss (new flows), not on the hot path.
+    let key = ZonePairKey {
+        from: from_zone.to_string(),
+        to: to_zone.to_string(),
+    };
+    if let Some(indices) = state.zone_pair_index.get(&key) {
+        for &idx in indices {
+            if let Some(action) = try_match_rule(&state.rules[idx], src_ip, dst_ip, protocol, src_port, dst_port) {
+                return action;
             }
-            (IpAddr::V6(src), IpAddr::V6(dst))
-                if nets_match_v6(&rule.source_v6, src)
-                    && nets_match_v6(&rule.destination_v6, dst) =>
-            {
-                rule.hit_count.fetch_add(1, Ordering::Relaxed);
-                return rule.action;
-            }
-            _ => {}
+        }
+    }
+    // Global policies (junos-global) apply to any zone-pair.
+    for &idx in &state.global_indices {
+        if let Some(action) = try_match_rule(&state.rules[idx], src_ip, dst_ip, protocol, src_port, dst_port) {
+            return action;
         }
     }
     state.default_action
+}
+
+/// Try to match a single policy rule against packet fields.
+/// Returns the rule's action if all criteria match, None otherwise.
+#[inline]
+fn try_match_rule(
+    rule: &PolicyRule,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+) -> Option<PolicyAction> {
+    if !applications_match(&rule.applications, protocol, src_port, dst_port) {
+        return None;
+    }
+    match (src_ip, dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst))
+            if nets_match_v4(&rule.source_v4, src)
+                && nets_match_v4(&rule.destination_v4, dst) =>
+        {
+            rule.hit_count.fetch_add(1, Ordering::Relaxed);
+            Some(rule.action)
+        }
+        (IpAddr::V6(src), IpAddr::V6(dst))
+            if nets_match_v6(&rule.source_v6, src)
+                && nets_match_v6(&rule.destination_v6, dst) =>
+        {
+            rule.hit_count.fetch_add(1, Ordering::Relaxed);
+            Some(rule.action)
+        }
+        _ => None,
+    }
 }
 
 fn parse_action(action: &str) -> PolicyAction {

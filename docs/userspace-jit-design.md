@@ -8,7 +8,7 @@ Updated: 2026-03-23
 | Phase | Description | Status | Measured Gain |
 |-------|-------------|--------|---------------|
 | 1 | Flow cache + rewrite descriptors | **DONE** — cache hit skips session/policy/NAT/FIB; `apply_rewrite_descriptor()` straight-line rewrite with precomputed csum deltas; dual-stack; cross-binding copy is inherent to AF_XDP | 23+ Gbps sustained |
-| 2 | Policy decision trees | Not started | — |
+| 2 | Policy decision trees | **PARTIAL** — zone-pair HashMap index eliminates scanning unrelated rules; per-zone-pair linear scan remains | O(1) zone lookup + O(K) rule scan |
 | 3 | Address-book trie compilation | Not started | — |
 | 4 | Cranelift JIT | Not started | — |
 | 5 | Screen function specialization | Not started | — |
@@ -472,7 +472,7 @@ binding in-place rewrite (UMEM frame lifetime issue).
 - No regression in HA failover tests
 - 6 unit tests validate checksum correctness for all NAT/VLAN combos
 
-### Phase 2: Policy decision trees — NOT STARTED
+### Phase 2: Policy decision trees — PARTIAL
 
 **Scope**: Compile policies into zone-pair decision functions at
 config apply time.
