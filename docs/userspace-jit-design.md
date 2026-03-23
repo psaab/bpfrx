@@ -1,7 +1,7 @@
 # Userspace Dataplane JIT Compiler Design
 
 Date: 2026-03-17
-Updated: 2026-03-22
+Updated: 2026-03-23
 
 ## Current Status
 
@@ -421,22 +421,36 @@ binding in-place rewrite (UMEM frame lifetime issue).
 - [x] Retry pending neighbors on empty RX poll (`293b818`)
 - [x] Heartbeat gating removal — unconditional after grace period (`161053a`)
 
-**What's NOT done** (remaining Phase 1 work):
-- [ ] `apply_rewrite_descriptor()` — straight-line frame rewrite using
-      the descriptor's precomputed offsets and values. Currently the
-      cache-hit path still calls the generic frame builder with ~8
-      branches for AF, VLAN, NAT type, protocol, etc.
-- [ ] Apply precomputed csum deltas in the rewrite hot path — the
-      descriptor has `ip_csum_delta` and `l4_csum_delta` fields but
-      the generic builder still recomputes checksums from scratch
+**Done since Phase 1 core (2026-03-22 → 2026-03-23):**
+- [x] `apply_rewrite_descriptor()` straight-line rewrite with precomputed
+      csum deltas (commit `6df734d`). 6 unit tests.
+- [x] Precomputed csum deltas applied in hot path (ip_csum_delta + 0xFEFF
+      TTL constant, l4_csum_delta for TCP/UDP)
+- [x] Embedded ICMP NAT reversal — XDP shim routes ICMP errors to XSK,
+      helper does `try_embedded_icmp_nat_match`, dnat_table populated
+      for BPF fallback (`949facf`)
+- [x] LocalDelivery slow-path reinject — host-bound packets (NDP, ICMP
+      echo, BGP) reinjected to TUN for kernel processing (`949facf`)
+- [x] RA ResendBurst after RETH MAC link cycle (`49c4cb8`)
+- [x] HA ctrl enable delay 15s for cluster, rebind gate reset (`49c4cb8`)
+- [x] Fabric-ingress TTL skip — no double decrement on cross-chassis
+      packets (`efd79d7`)
+- [x] Dynamic fabric state sync — SyncFabricState pushes peer MACs to
+      helper via shared_fabrics ArcSwap for cross-RG redirect (`48b7f2a`)
+- [x] BPF dnat_table population for embedded ICMP (`949facf`)
+
+**Not done (Phase 1 remaining):**
 - [ ] Cross-binding in-place rewrite — attempted and reverted due to
       UMEM frame lifetime issues (self-target only works for hairpin)
 
-**Measured throughput** (as of 2026-03-22):
+**Measured throughput** (as of 2026-03-23):
 - Cold TCP connect: ~2ms (after ARP/NDP flush)
 - Cold iperf3 IPv4: 20.1 Gbps (8 streams, 5s)
 - Cold iperf3 IPv6: 20.0 Gbps (8 streams, 5s)
 - Warm iperf3: 23+ Gbps (8 streams, 10s)
+- Fabric redirect iperf3: 16.9 Gbps (cross-chassis, 4 streams)
+- Warm ICMP: 0% loss, consistent TTL=63 (50 probes)
+- mtr IPv4/IPv6: intermediate hops visible (embedded ICMP NAT reversal)
 - Baseline before userspace dataplane: ~13 Gbps (eBPF kernel path)
 - Flow cache hit path (skipping session/policy/NAT/FIB) contributed
   ~35% of the improvement; remaining gains from zero-copy XSK path
