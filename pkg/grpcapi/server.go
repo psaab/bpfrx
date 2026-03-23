@@ -8156,7 +8156,13 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 					return nil, status.Errorf(codes.InvalidArgument, "invalid node ID: %s", nodeStr)
 				}
 				if targetNode == s.cluster.NodeID() {
-					// Target is local → ask peer to failover
+					// Target is local — make us primary.
+					if s.cluster.IsLocalPrimary(rgID) {
+						return &pb.SystemActionResponse{
+							Message: fmt.Sprintf("Redundancy group %d is already primary on node %d", rgID, targetNode),
+						}, nil
+					}
+					// Ask peer to resign so we can take primary.
 					if err := s.cluster.RequestPeerFailover(rgID); err != nil {
 						return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 					}
