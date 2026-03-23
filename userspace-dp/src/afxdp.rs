@@ -751,6 +751,9 @@ impl Coordinator {
             binding.config_gen_mismatches = 0;
             binding.fib_gen_mismatches = 0;
             binding.unsupported_packets = 0;
+            binding.flow_cache_hits = 0;
+            binding.flow_cache_misses = 0;
+            binding.flow_cache_evictions = 0;
             binding.session_hits = 0;
             binding.session_misses = 0;
             binding.session_creates = 0;
@@ -1568,6 +1571,9 @@ impl Coordinator {
                 binding.config_gen_mismatches = snap.config_gen_mismatches;
                 binding.fib_gen_mismatches = snap.fib_gen_mismatches;
                 binding.unsupported_packets = snap.unsupported_packets;
+                binding.flow_cache_hits = snap.flow_cache_hits;
+                binding.flow_cache_misses = snap.flow_cache_misses;
+                binding.flow_cache_evictions = snap.flow_cache_evictions;
                 binding.session_hits = snap.session_hits;
                 binding.session_misses = snap.session_misses;
                 binding.session_creates = snap.session_creates;
@@ -1633,6 +1639,9 @@ impl Coordinator {
                 binding.config_gen_mismatches = 0;
                 binding.fib_gen_mismatches = 0;
                 binding.unsupported_packets = 0;
+                binding.flow_cache_hits = 0;
+                binding.flow_cache_misses = 0;
+                binding.flow_cache_evictions = 0;
                 binding.session_hits = 0;
                 binding.session_misses = 0;
                 binding.session_creates = 0;
@@ -9867,6 +9876,9 @@ struct BindingLiveState {
     config_gen_mismatches: AtomicU64,
     fib_gen_mismatches: AtomicU64,
     unsupported_packets: AtomicU64,
+    flow_cache_hits: AtomicU64,
+    flow_cache_misses: AtomicU64,
+    flow_cache_evictions: AtomicU64,
     session_hits: AtomicU64,
     session_misses: AtomicU64,
     session_creates: AtomicU64,
@@ -9934,6 +9946,9 @@ impl BindingLiveState {
             config_gen_mismatches: AtomicU64::new(0),
             fib_gen_mismatches: AtomicU64::new(0),
             unsupported_packets: AtomicU64::new(0),
+            flow_cache_hits: AtomicU64::new(0),
+            flow_cache_misses: AtomicU64::new(0),
+            flow_cache_evictions: AtomicU64::new(0),
             session_hits: AtomicU64::new(0),
             session_misses: AtomicU64::new(0),
             session_creates: AtomicU64::new(0),
@@ -10051,6 +10066,9 @@ impl BindingLiveState {
             config_gen_mismatches: self.config_gen_mismatches.load(Ordering::Relaxed),
             fib_gen_mismatches: self.fib_gen_mismatches.load(Ordering::Relaxed),
             unsupported_packets: self.unsupported_packets.load(Ordering::Relaxed),
+            flow_cache_hits: self.flow_cache_hits.load(Ordering::Relaxed),
+            flow_cache_misses: self.flow_cache_misses.load(Ordering::Relaxed),
+            flow_cache_evictions: self.flow_cache_evictions.load(Ordering::Relaxed),
             session_hits: self.session_hits.load(Ordering::Relaxed),
             session_misses: self.session_misses.load(Ordering::Relaxed),
             session_creates: self.session_creates.load(Ordering::Relaxed),
@@ -10198,6 +10216,28 @@ fn update_binding_debug_state(binding: &mut BindingWorker) {
             .fetch_add(binding.pending_in_place_tx_packets, Ordering::Relaxed);
         binding.pending_in_place_tx_packets = 0;
     }
+    // Flush flow cache counters to live state.
+    if binding.flow_cache.hits != 0 {
+        binding
+            .live
+            .flow_cache_hits
+            .fetch_add(binding.flow_cache.hits, Ordering::Relaxed);
+        binding.flow_cache.hits = 0;
+    }
+    if binding.flow_cache.misses != 0 {
+        binding
+            .live
+            .flow_cache_misses
+            .fetch_add(binding.flow_cache.misses, Ordering::Relaxed);
+        binding.flow_cache.misses = 0;
+    }
+    if binding.flow_cache.evictions != 0 {
+        binding
+            .live
+            .flow_cache_evictions
+            .fetch_add(binding.flow_cache.evictions, Ordering::Relaxed);
+        binding.flow_cache.evictions = 0;
+    }
     binding
         .live
         .debug_pending_fill_frames
@@ -10255,6 +10295,9 @@ struct BindingLiveSnapshot {
     config_gen_mismatches: u64,
     fib_gen_mismatches: u64,
     unsupported_packets: u64,
+    flow_cache_hits: u64,
+    flow_cache_misses: u64,
+    flow_cache_evictions: u64,
     session_hits: u64,
     session_misses: u64,
     session_creates: u64,

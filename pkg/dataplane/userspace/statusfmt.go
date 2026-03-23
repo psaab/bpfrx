@@ -30,6 +30,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	var routeMisses uint64
 	var neighborMisses uint64
 	var exceptionPackets uint64
+	var flowCacheHits uint64
+	var flowCacheMisses uint64
+	var flowCacheEvictions uint64
 	var sessionHits uint64
 	var sessionMisses uint64
 	var sessionCreates uint64
@@ -71,6 +74,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 		routeMisses += binding.RouteMissPackets
 		neighborMisses += binding.NeighborMissPackets
 		exceptionPackets += binding.ExceptionPackets
+		flowCacheHits += binding.FlowCacheHits
+		flowCacheMisses += binding.FlowCacheMisses
+		flowCacheEvictions += binding.FlowCacheEvictions
 		sessionHits += binding.SessionHits
 		sessionMisses += binding.SessionMisses
 		sessionCreates += binding.SessionCreates
@@ -182,6 +188,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  Route misses:              %d\n", routeMisses)
 	fmt.Fprintf(&b, "  Neighbor misses:           %d\n", neighborMisses)
 	fmt.Fprintf(&b, "  Exception packets:         %d\n", exceptionPackets)
+	fmt.Fprintf(&b, "  Flow cache hits:           %d\n", flowCacheHits)
+	fmt.Fprintf(&b, "  Flow cache misses:         %d\n", flowCacheMisses)
+	fmt.Fprintf(&b, "  Flow cache evictions:      %d\n", flowCacheEvictions)
 	fmt.Fprintf(&b, "  Session hits:              %d\n", sessionHits)
 	fmt.Fprintf(&b, "  Session misses:            %d\n", sessionMisses)
 	fmt.Fprintf(&b, "  Session creates:           %d\n", sessionCreates)

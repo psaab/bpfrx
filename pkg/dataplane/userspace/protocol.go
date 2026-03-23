@@ -445,6 +445,9 @@ type BindingStatus struct {
 	ConfigGenMismatches   uint64    `json:"config_gen_mismatches,omitempty"`
 	FIBGenMismatches      uint64    `json:"fib_gen_mismatches,omitempty"`
 	UnsupportedPackets    uint64    `json:"unsupported_packets,omitempty"`
+	FlowCacheHits         uint64    `json:"flow_cache_hits,omitempty"`
+	FlowCacheMisses       uint64    `json:"flow_cache_misses,omitempty"`
+	FlowCacheEvictions    uint64    `json:"flow_cache_evictions,omitempty"`
 	SessionHits           uint64    `json:"session_hits,omitempty"`
 	SessionMisses         uint64    `json:"session_misses,omitempty"`
 	SessionCreates        uint64    `json:"session_creates,omitempty"`

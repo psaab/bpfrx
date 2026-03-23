@@ -814,6 +814,12 @@ struct BindingStatus {
     fib_gen_mismatches: u64,
     #[serde(rename = "unsupported_packets", default)]
     unsupported_packets: u64,
+    #[serde(rename = "flow_cache_hits", default)]
+    flow_cache_hits: u64,
+    #[serde(rename = "flow_cache_misses", default)]
+    flow_cache_misses: u64,
+    #[serde(rename = "flow_cache_evictions", default)]
+    flow_cache_evictions: u64,
     #[serde(rename = "session_hits", default)]
     session_hits: u64,
     #[serde(rename = "session_misses", default)]
