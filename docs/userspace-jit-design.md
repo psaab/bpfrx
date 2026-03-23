@@ -7,7 +7,7 @@ Updated: 2026-03-23
 
 | Phase | Description | Status | Measured Gain |
 |-------|-------------|--------|---------------|
-| 1 | Flow cache + rewrite descriptors | **DONE** — cache hit skips session/policy/NAT/FIB; `apply_rewrite_descriptor()` straight-line rewrite with precomputed csum deltas; dual-stack; cross-binding not yet in-place | 23+ Gbps sustained |
+| 1 | Flow cache + rewrite descriptors | **DONE** — cache hit skips session/policy/NAT/FIB; `apply_rewrite_descriptor()` straight-line rewrite with precomputed csum deltas; dual-stack; cross-binding copy is inherent to AF_XDP | 23+ Gbps sustained |
 | 2 | Policy decision trees | Not started | — |
 | 3 | Address-book trie compilation | Not started | — |
 | 4 | Cranelift JIT | Not started | — |
@@ -439,9 +439,13 @@ binding in-place rewrite (UMEM frame lifetime issue).
       helper via shared_fabrics ArcSwap for cross-RG redirect (`48b7f2a`)
 - [x] BPF dnat_table population for embedded ICMP (`949facf`)
 
-**Not done (Phase 1 remaining):**
-- [ ] Cross-binding in-place rewrite — attempted and reverted due to
-      UMEM frame lifetime issues (self-target only works for hairpin)
+**Not possible:**
+- Cross-binding in-place rewrite — architecturally impossible. XSK TX
+  requires the frame to reside in the target binding's UMEM. Frames
+  from a different binding's UMEM cannot be submitted to another
+  binding's TX ring. The frame copy between bindings is fundamental
+  to AF_XDP's per-queue UMEM ownership model. Only self-target
+  (hairpin) in-place rewrite works, and that's already implemented.
 
 **Measured throughput** (as of 2026-03-23):
 - Cold TCP connect: ~2ms (after ARP/NDP flush)
