@@ -160,6 +160,9 @@ Tests:
 - failover and failback with the native GRE path
 - optional host-origin validation with `GRE_VALIDATE_HOST_PROBES=1`
 
+See [native-gre.md](native-gre.md) for the GRE-specific acceptance bar and
+capture workflow.
+
 ### Benchmark Placement Discipline
 
 For any HA throughput comparison, pin the full dataplane RG set before drawing

@@ -10,7 +10,8 @@ dataplane and the userspace AF_XDP dataplane.
 | [unit-tests.md](unit-tests.md) | Go + Rust unit tests | `make test` + `cargo test` |
 | [standalone-vm.md](standalone-vm.md) | Single-VM forwarding, NAT, policy | `make test-deploy` |
 | [ha-cluster.md](ha-cluster.md) | HA failover, crash recovery, session sync | `make test-failover` |
-| [userspace-dataplane.md](userspace-dataplane.md) | AF_XDP forwarding, cold start, neighbor resolution, native GRE | Manual + scripts |
+| [userspace-dataplane.md](userspace-dataplane.md) | AF_XDP forwarding, cold start, neighbor resolution | Manual + scripts |
+| [native-gre.md](native-gre.md) | Native GRE transit, failover, host-origin validation | `scripts/userspace-native-gre-validation.sh` |
 | [performance.md](performance.md) | Throughput, latency, perf profiling | `scripts/userspace-perf-compare.sh` |
 | [regression-checklist.md](regression-checklist.md) | Pre-commit validation checklist | Manual |
 
@@ -78,4 +79,4 @@ See [CLAUDE.md](../CLAUDE.md) for full network topology details.
 - `cluster-userspace-host` container
 - Config: `docs/ha-cluster-userspace.conf`
 - Test targets: 172.16.80.200 (IPv4), 2001:559:8585:80::200 (IPv6)
-- Native GRE target: 10.255.192.41 (validated via `scripts/userspace-native-gre-validation.sh`)
+- Native GRE target: 10.255.192.41

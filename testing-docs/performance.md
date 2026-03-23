@@ -171,4 +171,5 @@ scripts/userspace-native-gre-validation.sh --iperf --udp --traceroute
 ```
 
 This catches GRE-specific regressions without mixing them into normal WAN
-forwarding measurements.
+forwarding measurements. See [native-gre.md](native-gre.md) for the full GRE
+test matrix.

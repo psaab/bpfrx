@@ -9,7 +9,6 @@ The userspace AF_XDP dataplane processes transit packets in a Rust helper proces
 - Cluster: `loss:bpfrx-userspace-fw0` / `loss:bpfrx-userspace-fw1`
 - Host: `loss:cluster-userspace-host`
 - Test targets: 172.16.80.200 (IPv4), 2001:559:8585:80::200 (IPv6)
-- Native GRE target: 10.255.192.41
 
 Important:
 
@@ -191,67 +190,19 @@ incus exec loss:cluster-userspace-host -- ping -c 20 -i 0.2 172.16.80.200 2>&1 |
 
 **Pass criteria**: ALL packets have TTL=63 (not 62). No TTL=62 in the output.
 
-## Test 10: Native GRE Transit
+## GRE Coverage
 
-**What it tests**: Native GRE dataplane on the physical WAN path, without
-kernel GRE transit forwarding.
+Native GRE validation has its own test plan:
 
-```bash
-scripts/userspace-native-gre-validation.sh --iperf --udp --traceroute
-```
+- [native-gre.md](native-gre.md)
 
-**Pass criteria**:
-- ICMP to `10.255.192.41` works
-- TCP connect to the GRE target works
-- GRE `iperf3` does not collapse to zero
-- UDP burst over GRE passes
-- traceroute / `mtr` over GRE show the expected path
-- transit stays on the WAN path, not the logical tunnel anchor
+Keep this document focused on the normal `.200` / `::200` userspace dataplane
+path. Use the native GRE doc when the change affects:
 
-## Test 11: Native GRE Failover
-
-**What it tests**: GRE traffic survives HA failover/failback with the userspace
-native GRE path.
-
-```bash
-scripts/userspace-native-gre-validation.sh --failover --iperf --udp --traceroute --count 3
-```
-
-If the change touches firewall-origin traffic too:
-
-```bash
-GRE_VALIDATE_HOST_PROBES=1 \
-scripts/userspace-native-gre-validation.sh --failover --iperf --udp --traceroute --count 2
-```
-
-**Pass criteria**:
-- steady-state GRE path is healthy before failover
-- no zero-throughput collapse during failover
-- post-failover GRE ICMP / TCP / iperf / UDP / traceroute still pass
-
-## Test 12: Real Target Packet Capture
-
-When `.200` / `::200` traffic looks wrong, capture on the real target instead
-of guessing from firewall-side symptoms alone. Use the capture gRPC service
-documented in `~/README.md`.
-
-Typical capture workflow:
-
-```bash
-capture-client \
-  -server <capture-server>:50051 \
-  -interface <target-interface> \
-  -filter "host 172.16.80.200 or host 2001:559:8585:80::200" \
-  -duration 30 \
-  -text \
-  -no-resolve
-```
-
-This is the authoritative way to answer:
-
-- did the SYN/ICMP request reach the real target?
-- did the reply leave the target?
-- did only some `iperf3` streams collapse?
+- tunnel handoff
+- native GRE decap / encap
+- GRE failover or failback
+- firewall-originated GRE traffic
 
 ## Known Limitations
 

@@ -72,6 +72,7 @@ scripts/userspace-perf-compare.sh --duration 10 --parallel 8
 - [ ] `scripts/userspace-native-gre-validation.sh --iperf --udp --traceroute` — steady-state passes
 - [ ] `scripts/userspace-native-gre-validation.sh --failover --iperf --udp --traceroute` — failover path passes
 - [ ] If host-origin traffic is affected: rerun with `GRE_VALIDATE_HOST_PROBES=1`
+- [ ] Review [native-gre.md](native-gre.md) if the change affects tunnel ownership, host-origin handoff, or GRE failover behavior
 
 ## Commit Message Convention
 
