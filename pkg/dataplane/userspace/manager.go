@@ -3757,9 +3757,12 @@ func (m *Manager) refreshNeighborSnapshotLocked() {
 	if len(neighbors) == 0 {
 		return
 	}
-	// Bump generation and push authoritative neighbor set to the helper.
-	// The helper replaces its authoritative_neighbors with this set and
-	// reports the installed generation in its status.
+	// Bump generation and push neighbor update to the helper.
+	// Use additive mode (replace=false) so learned neighbors from
+	// the netlink monitor and packet path are preserved. The manager's
+	// entries are authoritative and override any learned entry for the
+	// same (ifindex, ip) key, but learned entries for hosts not in the
+	// manager snapshot (e.g. 172.16.80.200) survive.
 	m.neighborGeneration++
 	m.lastSnapshot.Neighbors = neighbors
 	var status ProcessStatus
@@ -3767,7 +3770,7 @@ func (m *Manager) refreshNeighborSnapshotLocked() {
 		Type:               "update_neighbors",
 		Neighbors:          neighbors,
 		NeighborGeneration: m.neighborGeneration,
-		NeighborReplace:    true,
+		NeighborReplace:    false,
 	}
 	if err := m.requestLocked(req, &status); err != nil {
 		slog.Warn("userspace neighbor refresh failed", "err", err)
