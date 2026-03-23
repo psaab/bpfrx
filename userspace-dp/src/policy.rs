@@ -26,7 +26,7 @@ impl Default for PolicyAction {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct PolicyRule {
     pub(crate) from_zone: String,
     pub(crate) to_zone: String,
@@ -35,8 +35,27 @@ pub(crate) struct PolicyRule {
     pub(crate) destination_v4: Vec<PrefixV4>,
     pub(crate) destination_v6: Vec<PrefixV6>,
     pub(crate) applications: Vec<ApplicationMatch>,
+    /// Precompiled application matcher (protocol-indexed, exact-port sets).
+    compiled_apps: CompiledApplications,
     pub(crate) action: PolicyAction,
     pub(crate) hit_count: AtomicU64,
+}
+
+impl Default for PolicyRule {
+    fn default() -> Self {
+        Self {
+            from_zone: String::new(),
+            to_zone: String::new(),
+            source_v4: Vec::new(),
+            source_v6: Vec::new(),
+            destination_v4: Vec::new(),
+            destination_v6: Vec::new(),
+            applications: Vec::new(),
+            compiled_apps: CompiledApplications { match_any: true, by_protocol: FxHashMap::default() },
+            action: PolicyAction::Deny,
+            hit_count: AtomicU64::new(0),
+        }
+    }
 }
 
 impl Clone for PolicyRule {
@@ -49,6 +68,7 @@ impl Clone for PolicyRule {
             destination_v4: self.destination_v4.clone(),
             destination_v6: self.destination_v6.clone(),
             applications: self.applications.clone(),
+            compiled_apps: self.compiled_apps.clone(),
             action: self.action,
             hit_count: AtomicU64::new(self.hit_count.load(Ordering::Relaxed)),
         }
@@ -66,6 +86,75 @@ pub(crate) struct ApplicationMatch {
     pub(crate) protocol: u8,
     pub(crate) source_ports: Vec<PortRange>,
     pub(crate) destination_ports: Vec<PortRange>,
+}
+
+/// Pre-indexed application matcher: groups terms by protocol for O(1) lookup.
+/// For exact single-port rules (the common case), stores them in a set
+/// for O(1) hit instead of linear range scan.
+#[derive(Clone, Debug)]
+struct CompiledApplications {
+    /// If true, matches any protocol/port (application "any").
+    match_any: bool,
+    /// Grouped by protocol for fast lookup. Key = protocol number.
+    by_protocol: FxHashMap<u8, ProtoTerms>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProtoTerms {
+    /// Exact destination port set (single-port terms compiled for O(1) lookup).
+    exact_dst_ports: rustc_hash::FxHashSet<u16>,
+    /// Port range terms that need linear scan (multi-port ranges).
+    range_terms: Vec<(Vec<PortRange>, Vec<PortRange>)>, // (src_ranges, dst_ranges)
+}
+
+impl CompiledApplications {
+    fn from_matches(apps: &[ApplicationMatch]) -> Self {
+        if apps.is_empty() {
+            return Self {
+                match_any: true,
+                by_protocol: FxHashMap::default(),
+            };
+        }
+        let mut by_protocol: FxHashMap<u8, ProtoTerms> = FxHashMap::default();
+        for app in apps {
+            let entry = by_protocol.entry(app.protocol).or_default();
+            // Optimise the common case: single exact dst port, no src port restriction.
+            if app.source_ports.is_empty()
+                && app.destination_ports.len() == 1
+                && app.destination_ports[0].low == app.destination_ports[0].high
+            {
+                entry.exact_dst_ports.insert(app.destination_ports[0].low);
+            } else {
+                entry.range_terms.push((
+                    app.source_ports.clone(),
+                    app.destination_ports.clone(),
+                ));
+            }
+        }
+        Self {
+            match_any: false,
+            by_protocol,
+        }
+    }
+
+    #[inline]
+    fn matches(&self, protocol: u8, src_port: u16, dst_port: u16) -> bool {
+        if self.match_any {
+            return true;
+        }
+        let Some(terms) = self.by_protocol.get(&protocol) else {
+            return false;
+        };
+        // Fast path: check exact dst port set first (O(1)).
+        if terms.exact_dst_ports.contains(&dst_port) {
+            return true;
+        }
+        // Slow path: check range terms.
+        terms.range_terms.iter().any(|(src_ranges, dst_ranges)| {
+            port_ranges_match(src_ranges, src_port)
+                && port_ranges_match(dst_ranges, dst_port)
+        })
+    }
 }
 
 /// Zone-pair key for the policy index.
@@ -122,6 +211,7 @@ pub(crate) fn parse_policy_state(
             parse_address(prefix, &mut rule.destination_v4, &mut rule.destination_v6);
         }
         rule.applications = parse_applications(&snap.application_terms);
+        rule.compiled_apps = CompiledApplications::from_matches(&rule.applications);
         let idx = state.rules.len();
         let is_global = rule.from_zone == "junos-global" || rule.to_zone == "junos-global";
         state.rules.push(rule);
@@ -184,7 +274,7 @@ fn try_match_rule(
     src_port: u16,
     dst_port: u16,
 ) -> Option<PolicyAction> {
-    if !applications_match(&rule.applications, protocol, src_port, dst_port) {
+    if !rule.compiled_apps.matches(protocol, src_port, dst_port) {
         return None;
     }
     match (src_ip, dst_ip) {
