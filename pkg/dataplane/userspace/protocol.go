@@ -21,8 +21,10 @@ type ControlRequest struct {
 	Packet        *InjectPacketRequest      `json:"packet,omitempty"`
 	SessionSync   *SessionSyncRequest       `json:"session_sync,omitempty"`
 	SessionDeltas *SessionDeltaDrainRequest `json:"session_deltas,omitempty"`
-	Neighbors     []NeighborSnapshot        `json:"neighbors,omitempty"`
-	Fabrics       []FabricSnapshot          `json:"fabrics,omitempty"`
+	Neighbors           []NeighborSnapshot   `json:"neighbors,omitempty"`
+	NeighborGeneration  uint64              `json:"neighbor_generation,omitempty"`
+	NeighborReplace     bool                `json:"neighbor_replace,omitempty"`
+	Fabrics             []FabricSnapshot    `json:"fabrics,omitempty"`
 }
 
 type ControlResponse struct {
@@ -335,6 +337,7 @@ type ProcessStatus struct {
 	LastSnapshotAt         time.Time             `json:"last_snapshot_at,omitempty"`
 	InterfaceAddresses     int                   `json:"interface_addresses,omitempty"`
 	NeighborEntries        int                   `json:"neighbor_entries,omitempty"`
+	NeighborGeneration     uint64                `json:"neighbor_generation,omitempty"`
 	RouteEntries           int                   `json:"route_entries,omitempty"`
 	WorkerHeartbeats       []time.Time           `json:"worker_heartbeats,omitempty"`
 	HAGroups               []HAGroupStatus       `json:"ha_groups,omitempty"`

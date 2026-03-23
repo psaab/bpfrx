@@ -2456,17 +2456,13 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 		// IPv6 additionally sends an explicit NS before pinging so the
 		// failover path also nudges peer neighbor caches directly.
 		go func(ip net.IP, iface string) {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-			defer cancel()
-			if ip.To4() != nil {
-				exec.CommandContext(ctx, "ping", "-c1", "-W1", "-I", iface, ip.String()).Run()
-			} else {
+			if ip.To4() == nil {
 				if err := cluster.SendNDSolicitationFromInterface(iface, ip); err != nil {
 					slog.Debug("neighbor warmup: IPv6 NS probe failed",
 						"iface", iface, "ip", ip, "err", err)
 				}
-				exec.CommandContext(ctx, "ping", "-6", "-c1", "-W1", "-I", iface, ip.String()).Run()
 			}
+			sendICMPProbe(iface, ip)
 		}(t.neighborIP, ifName)
 	}
 
@@ -5053,13 +5049,42 @@ func (d *Daemon) probeFabricNeighbor(ctx context.Context, fabIface string, peerI
 		}
 	}
 
-	// No neighbor entry — trigger resolution via ping.
-	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	if peerIP.To4() != nil {
-		exec.CommandContext(probeCtx, "ping", "-c1", "-W1", "-I", fabIface, peerIP.String()).Run()
+	// No neighbor entry — trigger ARP/NDP resolution via raw ICMP probe.
+	// In-process probe replaces the previous ping shell-out for
+	// deterministic startup timing and observability.
+	sendICMPProbe(fabIface, peerIP)
+}
+
+// sendICMPProbe sends a single raw ICMP/ICMPv6 echo request bound to
+// the given interface. This triggers kernel ARP/NDP resolution without
+// shelling out to ping. Non-blocking: sendto MSG_DONTWAIT.
+func sendICMPProbe(iface string, target net.IP) {
+	if target.To4() != nil {
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
+		if err != nil {
+			return
+		}
+		defer unix.Close(fd)
+		_ = unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, iface)
+		// ICMP echo: type=8, code=0, checksum=0xf7ff, id=0, seq=0
+		icmp := [8]byte{8, 0, 0xf7, 0xff, 0, 0, 0, 0}
+		sa := &unix.SockaddrInet4{}
+		copy(sa.Addr[:], target.To4())
+		_ = unix.Sendto(fd, icmp[:], unix.MSG_DONTWAIT, sa)
 	} else {
-		exec.CommandContext(probeCtx, "ping", "-6", "-c1", "-W1", "-I", fabIface, peerIP.String()).Run()
+		fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6)
+		if err != nil {
+			return
+		}
+		defer unix.Close(fd)
+		_ = unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, iface)
+		// ICMPv6 auto-checksum at offset 2
+		_ = unix.SetsockoptInt(fd, unix.IPPROTO_ICMPV6, unix.IPV6_CHECKSUM, 2)
+		// ICMPv6 echo: type=128, code=0, checksum=0 (kernel fills), id=0, seq=0
+		icmp6 := [8]byte{128, 0, 0, 0, 0, 0, 0, 0}
+		sa6 := &unix.SockaddrInet6{}
+		copy(sa6.Addr[:], target.To16())
+		_ = unix.Sendto(fd, icmp6[:], unix.MSG_DONTWAIT, sa6)
 	}
 }
 

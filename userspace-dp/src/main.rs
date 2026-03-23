@@ -525,6 +525,10 @@ struct ControlRequest {
     session_deltas: Option<SessionDeltaDrainRequest>,
     #[serde(default)]
     neighbors: Option<Vec<NeighborSnapshot>>,
+    #[serde(rename = "neighbor_generation", default)]
+    neighbor_generation: u64,
+    #[serde(rename = "neighbor_replace", default)]
+    neighbor_replace: bool,
     #[serde(default)]
     fabrics: Option<Vec<FabricSnapshot>>,
 }
@@ -567,6 +571,8 @@ struct ProcessStatus {
     interface_addresses: usize,
     #[serde(rename = "neighbor_entries", default)]
     neighbor_entries: usize,
+    #[serde(rename = "neighbor_generation", default)]
+    neighbor_generation: u64,
     #[serde(rename = "route_entries", default)]
     route_entries: usize,
     #[serde(rename = "worker_heartbeats", default)]
@@ -1178,6 +1184,7 @@ fn run() -> Result<(), String> {
             last_snapshot_at: None,
             interface_addresses: 0,
             neighbor_entries: 0,
+            neighbor_generation: 0,
             route_entries: 0,
             worker_heartbeats: Vec::new(),
             ha_groups: Vec::new(),
@@ -1399,31 +1406,35 @@ fn handle_stream(
             }
             "update_neighbors" => {
                 if let Some(neighbors) = request.neighbors.as_ref() {
-                    let mut count = 0usize;
-                    for neigh in neighbors {
-                        if neigh.ifindex <= 0 || neigh.mac.is_empty() {
-                            continue;
+                    let neigh_gen = request.neighbor_generation;
+                    let replace = request.neighbor_replace;
+                    if let Ok(mut cache) = guard.afxdp.dynamic_neighbors_ref().lock() {
+                        if replace {
+                            // Authoritative full replacement: clear existing
+                            // entries and rebuild from the manager's view.
+                            cache.clear();
                         }
-                        let Ok(ip) = neigh.ip.parse::<std::net::IpAddr>() else {
-                            continue;
-                        };
-                        let Some(mac) = afxdp::parse_mac_str(&neigh.mac) else {
-                            continue;
-                        };
-                        if !afxdp::neighbor_state_usable_str(&neigh.state) {
-                            continue;
-                        }
-                        if let Ok(mut cache) = guard.afxdp.dynamic_neighbors_ref().lock() {
+                        for neigh in neighbors {
+                            if neigh.ifindex <= 0 || neigh.mac.is_empty() {
+                                continue;
+                            }
+                            let Ok(ip) = neigh.ip.parse::<std::net::IpAddr>() else {
+                                continue;
+                            };
+                            let Some(mac) = afxdp::parse_mac_str(&neigh.mac) else {
+                                continue;
+                            };
+                            if !afxdp::neighbor_state_usable_str(&neigh.state) {
+                                continue;
+                            }
                             cache.insert(
                                 (neigh.ifindex, ip),
                                 afxdp::NeighborEntry { mac },
                             );
-                            count += 1;
                         }
                     }
-                    #[cfg(feature = "debug-log")]
-                    if count > 0 {
-                        eprintln!("CTRL_REQ: update_neighbors count={}", count);
+                    if neigh_gen > 0 {
+                        guard.status.neighbor_generation = neigh_gen;
                     }
                 }
             }

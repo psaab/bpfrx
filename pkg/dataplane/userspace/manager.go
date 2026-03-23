@@ -25,6 +25,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/dataplane"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 var _ dataplane.DataPlane = (*Manager)(nil)
@@ -50,8 +51,9 @@ type Manager struct {
 	haGroups           map[int]HAGroupStatus
 	lastIngressIfaces  []uint32
 	lastBindingIndices []uint32
-	neighborsPrewarmed bool
-	ctrlEnableAt       time.Time
+	neighborsPrewarmed  bool
+	ctrlEnableAt        time.Time
+	neighborGeneration  uint64
 }
 
 func New() *Manager {
@@ -2613,22 +2615,48 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// the delay generates these events.
 		if !m.neighborsPrewarmed {
 			m.neighborsPrewarmed = true
+			// Hard timeout fallback — ctrl enables after this even if
+			// readiness checks haven't passed. Prevents infinite stall
+			// if a readiness condition can never be met.
 			delay := 3 * time.Second
 			if m.clusterHA {
-				delay = 15 * time.Second // wait for VRRP election + VIP add
+				delay = 15 * time.Second
 			}
 			m.ctrlEnableAt = time.Now().Add(delay)
-			slog.Info("userspace: delaying ctrl enable for fill ring + VIP bootstrap",
-				"delay", delay, "cluster_ha", m.clusterHA)
+			slog.Info("userspace: delaying ctrl enable for readiness",
+				"hard_timeout", delay, "cluster_ha", m.clusterHA)
 			go m.bootstrapNAPIQueuesLocked()
 			m.proactiveNeighborResolveLocked()
 		}
-		if time.Now().Before(m.ctrlEnableAt) {
-			ctrl.Enabled = 0 // keep disabled during bootstrap window
-		} else {
-			ctrl.Enabled = 1
-		}
 		m.refreshNeighborSnapshotLocked()
+
+		// Readiness-based enable: check concrete conditions instead
+		// of just waiting for a timer.
+		allBindingsReady := true
+		for _, b := range status.Bindings {
+			if b.Ifindex > 0 && b.Registered && !b.Bound {
+				allBindingsReady = false
+				break
+			}
+		}
+		neighborGenOK := m.neighborGeneration == 0 ||
+			status.NeighborGeneration >= m.neighborGeneration
+
+		if allBindingsReady && neighborGenOK {
+			ctrl.Enabled = 1
+		} else if time.Now().After(m.ctrlEnableAt) {
+			// Hard timeout: enable anyway to prevent indefinite stall.
+			ctrl.Enabled = 1
+			if !allBindingsReady || !neighborGenOK {
+				slog.Warn("userspace: ctrl enabled by hard timeout, not all readiness gates met",
+					"bindings_ready", allBindingsReady,
+					"neighbor_gen_ok", neighborGenOK,
+					"expected_gen", m.neighborGeneration,
+					"installed_gen", status.NeighborGeneration)
+			}
+		} else {
+			ctrl.Enabled = 0
+		}
 	}
 	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update userspace_ctrl from helper status: %w", err)
@@ -3727,12 +3755,17 @@ func (m *Manager) refreshNeighborSnapshotLocked() {
 	if len(neighbors) == 0 {
 		return
 	}
-	// Update the snapshot's neighbors and push to the helper.
+	// Bump generation and push authoritative neighbor set to the helper.
+	// The helper replaces its authoritative_neighbors with this set and
+	// reports the installed generation in its status.
+	m.neighborGeneration++
 	m.lastSnapshot.Neighbors = neighbors
 	var status ProcessStatus
 	req := ControlRequest{
-		Type: "update_neighbors",
-		Neighbors: neighbors,
+		Type:               "update_neighbors",
+		Neighbors:          neighbors,
+		NeighborGeneration: m.neighborGeneration,
+		NeighborReplace:    true,
 	}
 	if err := m.requestLocked(req, &status); err != nil {
 		slog.Warn("userspace neighbor refresh failed", "err", err)
@@ -3841,12 +3874,13 @@ func (m *Manager) bootstrapNAPIQueuesLocked() {
 			if target == "" {
 				continue
 			}
-			// Ping the target to generate a hardware RX event that
+			// Send raw ICMP probe to generate a hardware RX event that
 			// triggers NAPI, which posts fill ring WQEs for zero-copy.
-			cmd := exec.Command("ping", "-c", "1", "-W", "1", "-I", linuxName, target)
-			cmd.Stdout = nil
-			cmd.Stderr = nil
-			_ = cmd.Run()
+			// In-process probe replaces ping shell-out.
+			targetIP := net.ParseIP(target)
+			if targetIP != nil {
+				sendICMPProbeFromManager(linuxName, targetIP)
+			}
 		}
 	}
 }
@@ -3894,18 +3928,11 @@ func (m *Manager) proactiveNeighborResolveLocked() {
 				if n.IP == nil || n.IP.IsLinkLocalUnicast() {
 					continue
 				}
-				// Ping STALE, DELAY, PROBE, or entries with no MAC to refresh
+				// Trigger ARP/NDP resolution for STALE/FAILED/absent entries.
 				if n.HardwareAddr == nil || len(n.HardwareAddr) == 0 ||
 					n.State == netlink.NUD_STALE || n.State == netlink.NUD_DELAY ||
 					n.State == netlink.NUD_PROBE || n.State == netlink.NUD_FAILED {
-					pingCmd := "ping"
-					if family == netlink.FAMILY_V6 {
-						pingCmd = "ping6"
-					}
-					cmd := exec.Command(pingCmd, "-c", "1", "-W", "1", "-I", ifName, n.IP.String())
-					cmd.Stdout = nil
-					cmd.Stderr = nil
-					_ = cmd.Run()
+					sendICMPProbeFromManager(ifName, n.IP)
 					resolved++
 				}
 			}
@@ -3938,14 +3965,7 @@ func (m *Manager) proactiveNeighborResolveLocked() {
 			}
 		}
 		if !found {
-			pingCmd := "ping"
-			if r.Gw.To4() == nil {
-				pingCmd = "ping6"
-			}
-			cmd := exec.Command(pingCmd, "-c", "1", "-W", "1", "-I", ifName, r.Gw.String())
-			cmd.Stdout = nil
-			cmd.Stderr = nil
-			_ = cmd.Run()
+			sendICMPProbeFromManager(ifName, r.Gw)
 			resolved++
 		}
 	}
@@ -3955,13 +3975,43 @@ func (m *Manager) proactiveNeighborResolveLocked() {
 	}
 }
 
+// sendICMPProbeFromManager sends a single raw ICMP/ICMPv6 echo request
+// bound to the given interface. Triggers kernel ARP/NDP resolution
+// without shelling out to ping. Non-blocking.
+func sendICMPProbeFromManager(iface string, target net.IP) {
+	if target.To4() != nil {
+		fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_ICMP)
+		if err != nil {
+			return
+		}
+		defer unix.Close(fd)
+		_ = unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, iface)
+		icmp := [8]byte{8, 0, 0xf7, 0xff}
+		sa := &unix.SockaddrInet4{}
+		copy(sa.Addr[:], target.To4())
+		_ = unix.Sendto(fd, icmp[:], unix.MSG_DONTWAIT, sa)
+	} else {
+		fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6)
+		if err != nil {
+			return
+		}
+		defer unix.Close(fd)
+		_ = unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, iface)
+		_ = unix.SetsockoptInt(fd, unix.IPPROTO_ICMPV6, unix.IPV6_CHECKSUM, 2)
+		icmp6 := [8]byte{128, 0}
+		sa6 := &unix.SockaddrInet6{}
+		copy(sa6.Addr[:], target.To16())
+		_ = unix.Sendto(fd, icmp6[:], unix.MSG_DONTWAIT, sa6)
+	}
+}
+
 // proactiveNeighborResolveAsyncLocked is the non-blocking version that
-// fires pings in background goroutines. Used by the status loop.
+// fires probes in background goroutines. Used by the status loop.
 func (m *Manager) proactiveNeighborResolveAsyncLocked() {
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
 		return
 	}
-	var targets []struct{ iface, ip, cmd string }
+	var targets []struct{ iface, ip string }
 	for ifName, ifc := range m.lastSnapshot.Config.Interfaces.Interfaces {
 		for _, unit := range ifc.Units {
 			base := config.LinuxIfName(ifName)
@@ -3984,23 +4034,19 @@ func (m *Manager) proactiveNeighborResolveAsyncLocked() {
 					}
 					if n.HardwareAddr == nil || len(n.HardwareAddr) == 0 ||
 						n.State == netlink.NUD_STALE || n.State == netlink.NUD_FAILED {
-						pingCmd := "ping"
-						if family == netlink.FAMILY_V6 {
-							pingCmd = "ping6"
-						}
-						targets = append(targets, struct{ iface, ip, cmd string }{linuxName, n.IP.String(), pingCmd})
+						targets = append(targets, struct{ iface, ip string }{linuxName, n.IP.String()})
 					}
 				}
 			}
 		}
 	}
 	for _, t := range targets {
-		go func(cmd, iface, ip string) {
-			c := exec.Command(cmd, "-c", "1", "-W", "1", "-I", iface, ip)
-			c.Stdout = nil
-			c.Stderr = nil
-			_ = c.Run()
-		}(t.cmd, t.iface, t.ip)
+		go func(iface, ip string) {
+			targetIP := net.ParseIP(ip)
+			if targetIP != nil {
+				sendICMPProbeFromManager(iface, targetIP)
+			}
+		}(t.iface, t.ip)
 	}
 }
 
