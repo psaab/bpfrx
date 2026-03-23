@@ -15,7 +15,16 @@ BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
   ./test/incus/cluster-setup.sh deploy all
 ```
 
-**IMPORTANT**: After deploying new code, ALWAYS restart the daemons on BOTH nodes. The deploy script does NOT auto-restart.
+`deploy all` already performs a rolling restart. Use
+`./test/incus/cluster-setup.sh restart all` only when you are explicitly
+testing restart behavior without rebuilding.
+
+After a reboot of the remote `loss` host, run `refresh-vfs` first:
+
+```bash
+BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
+  ./test/incus/cluster-setup.sh refresh-vfs
+```
 
 ## Test 1: Basic Failover (`make test-failover`)
 
@@ -108,18 +117,60 @@ make test-restart-connectivity
 ### Full Validation Suite
 
 ```bash
+RUNS=3 DURATION=5 PARALLEL=4 \
+PREFERRED_ACTIVE_NODE=0 \
+PREFERRED_ACTIVE_RGS="1 2" \
 scripts/userspace-ha-validation.sh
 ```
 
-Tests: cluster status, iperf3 IPv4/IPv6, mtr (embedded ICMP), cold start after restart, neighbor resolution.
+Tests:
+- active-node settle and userspace arm
+- IPv4/IPv6 reachability to `.200` / `::200`
+- TTL / hop-limit time-exceeded behavior
+- `mtr` embedded-ICMP NAT reversal
+- `iperf3` collapse detection via JSON metrics
+- cold-start / neighbor warmup behavior
 
 ### Failover Validation
 
 ```bash
-scripts/userspace-ha-failover-validation.sh
+IPERF_TARGET=172.16.80.200 \
+TOTAL_CYCLES=3 CYCLE_INTERVAL=10 \
+scripts/userspace-ha-failover-validation.sh --duration 90 --parallel 4
 ```
 
-Tests: failover timing, session continuity, VIP migration, GARP/NA burst.
+Tests:
+- RG ownership move and userspace arm on the new owner
+- pre-failover and post-failover `iperf3` continuity
+- zero-interval and retransmit collapse detection
+- session pickup on both nodes
+
+### Native GRE Validation
+
+```bash
+PREFERRED_ACTIVE_NODE=1 \
+scripts/userspace-native-gre-validation.sh --deploy --iperf --udp --traceroute --failover --count 3
+```
+
+Tests:
+- steady GRE ICMP and TCP transit
+- GRE `iperf3` continuity
+- UDP burst over native GRE
+- traceroute / `mtr` style probes over GRE
+- failover and failback with the native GRE path
+- optional host-origin validation with `GRE_VALIDATE_HOST_PROBES=1`
+
+### Benchmark Placement Discipline
+
+For any HA throughput comparison, pin the full dataplane RG set before drawing
+conclusions. Otherwise you can accidentally compare split ownership against
+single-owner placement and mislabel the result as a regression.
+
+At minimum, verify:
+
+- RG `0`, `1`, and `2` ownership is the intended node
+- the active userspace firewall is the node you expect
+- the standby node is healthy and ready before failover tests
 
 ## Manual Validation Checklist
 
@@ -130,7 +181,9 @@ After any HA code change, verify:
 - [ ] VIPs present on primary only
 - [ ] Session sync count > 0 after establishing flows
 - [ ] Ping 172.16.80.200 / 2001:559:8585:80::200 from host — 0% loss
-- [ ] iperf3 -P 8 > 18 Gbps (userspace) or > 13 Gbps (eBPF)
+- [ ] `scripts/userspace-ha-validation.sh` passes with current thresholds
+- [ ] `iperf3 -P 8` does not collapse to zero on any stream
 - [ ] mtr shows intermediate hops (embedded ICMP NAT reversal)
 - [ ] After `systemctl restart bpfrxd` on primary: connectivity recovers within 40s
 - [ ] After failover: connectivity recovers within 500ms
+- [ ] If GRE is affected: `scripts/userspace-native-gre-validation.sh --iperf --udp --traceroute --failover` passes

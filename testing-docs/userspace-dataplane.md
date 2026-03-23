@@ -9,7 +9,32 @@ The userspace AF_XDP dataplane processes transit packets in a Rust helper proces
 - Cluster: `loss:bpfrx-userspace-fw0` / `loss:bpfrx-userspace-fw1`
 - Host: `loss:cluster-userspace-host`
 - Test targets: 172.16.80.200 (IPv4), 2001:559:8585:80::200 (IPv6)
-- **These targets live on a separate host and are always reachable. If they don't respond, the bug is in the firewall code.**
+- Native GRE target: 10.255.192.41
+
+Important:
+
+- `172.16.80.200` and `2001:559:8585:80::200` live on a separate host. They are
+  not `userspace-wan80-host`.
+- When you need a packet capture on the real `.200` / `::200` endpoint, use the
+  gRPC capture service described in `~/README.md` (`capture-client` or
+  `grpcurl`), not assumptions about a local container.
+- After a reboot of the remote `loss` host, repair VF trust/VLAN state first:
+
+```bash
+BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
+  ./test/incus/cluster-setup.sh refresh-vfs
+```
+
+## Deployment / Restart Discipline
+
+```bash
+BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
+  ./test/incus/cluster-setup.sh deploy all
+```
+
+`deploy all` already performs the rolling stop/cleanup/push/restart sequence.
+Do not manually restart both nodes immediately afterward unless the point of the
+test is specifically restart behavior.
 
 ## Test 1: Cold Start — New Connection After Restart
 
@@ -93,8 +118,15 @@ incus exec loss:cluster-userspace-host -- iperf3 -c 2001:559:8585:80::200 -P 8 -
 
 **Automated**:
 ```bash
-scripts/userspace-perf-compare.sh
+scripts/userspace-perf-compare.sh --duration 10 --parallel 8
 ```
+
+Before treating a low number as a regression, verify:
+
+- RG ownership is where you expect it
+- the active userspace firewall is settled
+- neighbors for `.200` / `::200` are warm
+- the post-deploy path is not still in cold-start convergence
 
 ## Test 5: Embedded ICMP (mtr/traceroute)
 
@@ -159,9 +191,74 @@ incus exec loss:cluster-userspace-host -- ping -c 20 -i 0.2 172.16.80.200 2>&1 |
 
 **Pass criteria**: ALL packets have TTL=63 (not 62). No TTL=62 in the output.
 
+## Test 10: Native GRE Transit
+
+**What it tests**: Native GRE dataplane on the physical WAN path, without
+kernel GRE transit forwarding.
+
+```bash
+scripts/userspace-native-gre-validation.sh --iperf --udp --traceroute
+```
+
+**Pass criteria**:
+- ICMP to `10.255.192.41` works
+- TCP connect to the GRE target works
+- GRE `iperf3` does not collapse to zero
+- UDP burst over GRE passes
+- traceroute / `mtr` over GRE show the expected path
+- transit stays on the WAN path, not the logical tunnel anchor
+
+## Test 11: Native GRE Failover
+
+**What it tests**: GRE traffic survives HA failover/failback with the userspace
+native GRE path.
+
+```bash
+scripts/userspace-native-gre-validation.sh --failover --iperf --udp --traceroute --count 3
+```
+
+If the change touches firewall-origin traffic too:
+
+```bash
+GRE_VALIDATE_HOST_PROBES=1 \
+scripts/userspace-native-gre-validation.sh --failover --iperf --udp --traceroute --count 2
+```
+
+**Pass criteria**:
+- steady-state GRE path is healthy before failover
+- no zero-throughput collapse during failover
+- post-failover GRE ICMP / TCP / iperf / UDP / traceroute still pass
+
+## Test 12: Real Target Packet Capture
+
+When `.200` / `::200` traffic looks wrong, capture on the real target instead
+of guessing from firewall-side symptoms alone. Use the capture gRPC service
+documented in `~/README.md`.
+
+Typical capture workflow:
+
+```bash
+capture-client \
+  -server <capture-server>:50051 \
+  -interface <target-interface> \
+  -filter "host 172.16.80.200 or host 2001:559:8585:80::200" \
+  -duration 30 \
+  -text \
+  -no-resolve
+```
+
+This is the authoritative way to answer:
+
+- did the SYN/ICMP request reach the real target?
+- did the reply leave the target?
+- did only some `iperf3` streams collapse?
+
 ## Known Limitations
 
 - **XDP shim tail-call**: `fallback_to_main` tail call to the eBPF pipeline fails silently on some aya-ebpf versions. Workaround: `XDP_PASS` to kernel.
 - **Zero-copy VLAN demux**: mlx5 `XDP_PASS` in zero-copy mode breaks VLAN demux for ARP/NDP replies. Workaround: ICMP SOCK_RAW probes for neighbor resolution.
 - **BPF stack limit**: XDP shim must stay within 512 bytes combined stack. New functions must be inlined or minimize stack usage.
 - **ICMP session map**: Each `ping` invocation uses a different ICMP echo ID. The BPF session map entry from the previous ping doesn't match. First packet of a new flow always goes through the full session-miss path.
+- **Restart/bootstrap diagnosis**: Do not label a zero-copy issue as an mlx5
+  kernel bug until you have first ruled out stale deploy state, stale VF
+  programming, neighbor propagation failures, and helper heartbeat stalls.

@@ -13,16 +13,14 @@ Pre-commit validation checklist. Check the boxes that apply to your change.
 
 - [ ] `cargo build --release` — release build succeeds
 - [ ] Deploy to loss userspace cluster: `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env ./test/incus/cluster-setup.sh deploy all`
-- [ ] Restart BOTH nodes: `incus exec loss:bpfrx-userspace-fw{0,1} -- systemctl restart bpfrxd`
-- [ ] Wait 40s, then: `ping -c 10 172.16.80.200` — 0% loss, all TTL=63
-- [ ] Wait 40s, then: `ping6 -c 10 2001:559:8585:80::200` — 0% loss, all TTL=63
-- [ ] `iperf3 -c 172.16.80.200 -P 8 -t 5` — > 18 Gbps
-- [ ] `mtr -n --report --report-cycles=5 -4 142.251.32.46` — intermediate hops visible
+- [ ] `RUNS=1 DURATION=5 PARALLEL=4 scripts/userspace-ha-validation.sh` — passes
+- [ ] `scripts/userspace-ha-failover-validation.sh --duration 60 --parallel 4` — no zero-throughput collapse
+- [ ] Manual IPv4 + IPv6 `iperf3 -P 8` from `cluster-userspace-host` stay stable (no stream stuck at 0)
+- [ ] If the host rebooted recently: `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env ./test/incus/cluster-setup.sh refresh-vfs`
 
 ## If You Changed XDP Shim (`userspace-xdp/`)
 
-- [ ] `cd userspace-xdp && cargo +nightly build --release` — BPF object compiles
-- [ ] Copy to embed: `cp target/bpfel-unknown-none/release/libbpfrx_userspace_xdp.so ../pkg/dataplane/userspace_xdp_bpfel.o`
+- [ ] `bash pkg/dataplane/build-userspace-xdp.sh` — BPF object compiles and embedded object is refreshed
 - [ ] `make build` — Go daemon embeds new XDP object
 - [ ] Deploy and check: `journalctl -u bpfrxd | grep "stack.*too large"` — NO stack overflow
 - [ ] Cluster comes up: `show chassis cluster status` — both nodes have primary/secondary
@@ -64,10 +62,16 @@ Pre-commit validation checklist. Check the boxes that apply to your change.
 
 Run before and after:
 ```bash
-scripts/userspace-perf-compare.sh --runs 3 --duration 10
+scripts/userspace-perf-compare.sh --duration 10 --parallel 8
 ```
 
 **Red flag**: > 5% sustained throughput drop.
+
+## If You Changed Native GRE / Tunnel Handoff
+
+- [ ] `scripts/userspace-native-gre-validation.sh --iperf --udp --traceroute` — steady-state passes
+- [ ] `scripts/userspace-native-gre-validation.sh --failover --iperf --udp --traceroute` — failover path passes
+- [ ] If host-origin traffic is affected: rerun with `GRE_VALIDATE_HOST_PROBES=1`
 
 ## Commit Message Convention
 

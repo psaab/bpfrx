@@ -72,4 +72,11 @@ cargo test rewrite_forwarded_frame   # Frame rewrite + checksum
 2. `cd userspace-dp && cargo test` — all Rust tests
 3. `make build` — Go daemon compiles
 4. `cargo build --release` — Rust helper compiles
-5. `cd userspace-xdp && cargo +nightly build --release` — XDP shim compiles (if changed)
+5. `bash pkg/dataplane/build-userspace-xdp.sh` — XDP shim compiles and refreshes the embedded object (if changed)
+
+For userspace dataplane changes, build-only checks are not enough. Continue
+with the runtime validation in:
+
+- [userspace-dataplane.md](userspace-dataplane.md)
+- [ha-cluster.md](ha-cluster.md)
+- [performance.md](performance.md)
