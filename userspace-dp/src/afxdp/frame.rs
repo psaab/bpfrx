@@ -1920,7 +1920,9 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
                     if apply_nat {
                         apply_nat_ipv4(packet, meta.protocol, decision.nat)?;
                     }
-                    packet[8] -= 1;
+                    if (meta.meta_flags & 0x80) == 0 {
+                        packet[8] -= 1;
+                    }
                 }
                 let _ = enforce_expected_ports(
                     &mut frame_out,
@@ -1942,13 +1944,15 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
                     packet
                         .get_mut(4..6)?
                         .copy_from_slice(&((tcp_header_len + chunk_len) as u16).to_be_bytes());
-                    if packet[7] <= 1 {
+                    if (meta.meta_flags & 0x80) == 0 && packet[7] <= 1 {
                         return None;
                     }
                     if apply_nat {
                         apply_nat_ipv6(packet, meta.protocol, decision.nat)?;
                     }
-                    packet[7] -= 1;
+                    if (meta.meta_flags & 0x80) == 0 {
+                        packet[7] -= 1;
+                    }
                 }
                 let _ = enforce_expected_ports(
                     &mut frame_out,
@@ -2071,7 +2075,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
             if ihl < 20 || out.len() < ip_start + ihl {
                 return None;
             }
-            if out[ip_start + 8] <= 1 {
+            if (meta.meta_flags & 0x80) == 0 && out[ip_start + 8] <= 1 {
                 return None;
             }
             let old_src = Ipv4Addr::new(
@@ -2094,7 +2098,10 @@ pub(super) fn build_forwarded_frame_into_from_frame(
             if apply_nat {
                 apply_nat_ipv4(&mut out[ip_start..], meta.protocol, decision.nat)?;
             }
-            out[ip_start + 8] -= 1;
+            let skip_ttl = (meta.meta_flags & 0x80) != 0;
+            if !skip_ttl {
+                out[ip_start + 8] -= 1;
+            }
             let enforced = enforce_expected_ports_at(
                 out,
                 ip_start,
@@ -2121,7 +2128,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
             if out.len() < ip_start + 40 {
                 return None;
             }
-            if out[ip_start + 7] <= 1 {
+            if (meta.meta_flags & 0x80) == 0 && out[ip_start + 7] <= 1 {
                 return None;
             }
             // Use meta-derived L4 offset when valid (>= 40 for IPv6 base header,
@@ -2137,7 +2144,9 @@ pub(super) fn build_forwarded_frame_into_from_frame(
             if apply_nat {
                 apply_nat_ipv6(&mut out[ip_start..], meta.protocol, decision.nat)?;
             }
-            out[ip_start + 7] -= 1;
+            if (meta.meta_flags & 0x80) == 0 {
+                out[ip_start + 7] -= 1;
+            }
             let enforced = enforce_expected_ports_at(
                 out,
                 ip_start,
@@ -2355,6 +2364,8 @@ pub(super) fn rewrite_forwarded_frame_in_place(
     )?;
     let packet = &mut frame[..frame_len];
     let ip_start = eth_len;
+    // Fabric-ingress packets already had TTL decremented by the sending peer.
+    let skip_ttl = (meta.meta_flags & 0x80) != 0;
     match meta.addr_family as i32 {
         libc::AF_INET => {
             if packet.len() < ip_start + 20 {
@@ -2364,7 +2375,7 @@ pub(super) fn rewrite_forwarded_frame_in_place(
             if ihl < 20 || packet.len() < ip_start + ihl {
                 return None;
             }
-            if packet[ip_start + 8] <= 1 {
+            if !skip_ttl && packet[ip_start + 8] <= 1 {
                 return None;
             }
             let old_src = Ipv4Addr::new(
@@ -2386,7 +2397,9 @@ pub(super) fn rewrite_forwarded_frame_in_place(
             if apply_nat {
                 apply_nat_ipv4(&mut packet[ip_start..], meta.protocol, decision.nat)?;
             }
-            packet[ip_start + 8] -= 1;
+            if !skip_ttl {
+                packet[ip_start + 8] -= 1;
+            }
             adjust_ipv4_header_checksum(
                 &mut packet[ip_start..ip_start + ihl],
                 old_src,
@@ -2404,7 +2417,7 @@ pub(super) fn rewrite_forwarded_frame_in_place(
             if packet.len() < ip_start + 40 {
                 return None;
             }
-            if packet[ip_start + 7] <= 1 {
+            if !skip_ttl && packet[ip_start + 7] <= 1 {
                 return None;
             }
             let meta_rel = meta.l4_offset.wrapping_sub(meta.l3_offset) as usize;
@@ -2418,7 +2431,9 @@ pub(super) fn rewrite_forwarded_frame_in_place(
             if apply_nat {
                 apply_nat_ipv6(&mut packet[ip_start..], meta.protocol, decision.nat)?;
             }
-            packet[ip_start + 7] -= 1;
+            if !skip_ttl {
+                packet[ip_start + 7] -= 1;
+            }
             let enforced =
                 enforce_expected_ports(packet, meta.addr_family, meta.protocol, enforced_ports)
                     .unwrap_or(false);
@@ -2544,6 +2559,7 @@ pub(super) fn apply_rewrite_descriptor(
 
     let packet = &mut frame[..frame_len];
     let ip = eth_len;
+    let skip_ttl = (meta.meta_flags & 0x80) != 0;
 
     match rd.ether_type {
         0x0800 => {
@@ -2555,7 +2571,7 @@ pub(super) fn apply_rewrite_descriptor(
             if ihl < 20 || packet.len() < ip + ihl {
                 return None;
             }
-            if packet[ip + 8] <= 1 {
+            if !skip_ttl && packet[ip + 8] <= 1 {
                 return None; // TTL expired
             }
             let l4 = ip + ihl;
@@ -2592,16 +2608,19 @@ pub(super) fn apply_rewrite_descriptor(
                 }
             }
 
-            // TTL decrement.
-            packet[ip + 8] -= 1;
+            // TTL decrement (skip for fabric-ingress — peer already decremented).
+            if !skip_ttl {
+                packet[ip + 8] -= 1;
+            }
 
-            // IP header checksum: precomputed NAT delta + constant TTL-1 delta.
-            // TTL-1 delta is always 0xFEFF in one's complement arithmetic:
-            //   !old_ttl_word + new_ttl_word = 0xFFFF - (T<<8|P) + ((T-1)<<8|P) = 0xFEFF
+            // IP header checksum: precomputed NAT delta + TTL-1 delta.
             let old_csum = u16::from_be_bytes([packet[ip + 10], packet[ip + 11]]);
             let mut sum = (!old_csum as u32) & 0xffff;
             sum += rd.ip_csum_delta as u32;
-            sum += 0xFEFF; // TTL-1 delta (constant regardless of TTL value)
+            if !skip_ttl {
+                // TTL-1 delta is always 0xFEFF in one's complement arithmetic
+                sum += 0xFEFF;
+            }
             while (sum >> 16) != 0 {
                 sum = (sum & 0xffff) + (sum >> 16);
             }
@@ -2644,7 +2663,7 @@ pub(super) fn apply_rewrite_descriptor(
             if packet.len() < ip + 40 {
                 return None;
             }
-            if packet[ip + 7] <= 1 {
+            if !skip_ttl && packet[ip + 7] <= 1 {
                 return None; // Hop limit expired
             }
 
@@ -2688,8 +2707,10 @@ pub(super) fn apply_rewrite_descriptor(
                 }
             }
 
-            // Hop limit decrement.
-            packet[ip + 7] -= 1;
+            // Hop limit decrement (skip for fabric-ingress).
+            if !skip_ttl {
+                packet[ip + 7] -= 1;
+            }
 
             // L4 checksum: precomputed delta covers IPv6 address + port changes.
             if rd.l4_csum_delta != 0 {

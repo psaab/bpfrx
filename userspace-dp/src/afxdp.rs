@@ -2971,7 +2971,7 @@ fn poll_binding(
                     }
                     let native_gre_packet =
                         try_native_gre_decap_from_frame(raw_frame, meta, forwarding);
-                    let meta = native_gre_packet
+                    let mut meta = native_gre_packet
                         .as_ref()
                         .map(|packet| packet.meta)
                         .unwrap_or(meta);
@@ -2996,6 +2996,14 @@ fn poll_binding(
                         meta,
                         forwarding,
                     );
+                    // Flag fabric-ingress packets so rewrite functions skip TTL
+                    // decrement. The sending peer already decremented TTL when
+                    // it forwarded the packet across the fabric link.
+                    if ingress_zone_override.is_some()
+                        || ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
+                    {
+                        meta.meta_flags |= 0x80; // FABRIC_INGRESS_FLAG
+                    }
                     // Screen/IDS check — runs BEFORE session lookup.
                     // Resolve ingress zone name for screen profile lookup.
                     if screen.has_profiles() {
