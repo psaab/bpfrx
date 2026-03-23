@@ -22,6 +22,7 @@ type ControlRequest struct {
 	SessionSync   *SessionSyncRequest       `json:"session_sync,omitempty"`
 	SessionDeltas *SessionDeltaDrainRequest `json:"session_deltas,omitempty"`
 	Neighbors     []NeighborSnapshot        `json:"neighbors,omitempty"`
+	Fabrics       []FabricSnapshot          `json:"fabrics,omitempty"`
 }
 
 type ControlResponse struct {

@@ -251,6 +251,10 @@ type DataPlane interface {
 	// link cycle.  No-op for the eBPF-only and DPDK dataplanes.
 	NotifyLinkCycle()
 
+	// SyncFabricState pushes updated fabric MACs to the userspace helper.
+	// No-op for eBPF-only and DPDK dataplanes.
+	SyncFabricState()
+
 	// Map statistics
 	GetMapStats() []MapStats
 

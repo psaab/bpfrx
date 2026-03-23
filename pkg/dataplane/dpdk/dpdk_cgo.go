@@ -1714,6 +1714,7 @@ func (m *Manager) ClearFIBRoutes() {
 }
 
 func (m *Manager) NotifyLinkCycle() {} // no-op for DPDK
+func (m *Manager) SyncFabricState()  {} // no-op for DPDK
 
 func (m *Manager) BumpFIBGeneration() {
 	shm := m.platform.shm

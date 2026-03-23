@@ -5170,6 +5170,14 @@ func (d *Daemon) refreshFabricFwd(fabIface, overlay string, peerIP net.IP, logWa
 		"interface", fabIface, "ifindex", info.Ifindex,
 		"fib_ifindex", info.FIBIfindex,
 		"local_mac", localMAC, "peer_mac", peerMAC)
+
+	// Push updated fabric MACs to userspace helper so it can do
+	// cross-chassis fabric redirect. The initial snapshot may have
+	// been built before the peer MAC was resolved.
+	if d.dp != nil {
+		d.dp.SyncFabricState()
+	}
+
 	return true
 }
 

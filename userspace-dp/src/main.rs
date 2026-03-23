@@ -525,6 +525,8 @@ struct ControlRequest {
     session_deltas: Option<SessionDeltaDrainRequest>,
     #[serde(default)]
     neighbors: Option<Vec<NeighborSnapshot>>,
+    #[serde(default)]
+    fabrics: Option<Vec<FabricSnapshot>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1381,6 +1383,12 @@ fn handle_stream(
                 } else {
                     response.ok = false;
                     response.error = "missing HA state".to_string();
+                }
+            }
+            "update_fabrics" => {
+                if let Some(fabrics) = request.fabrics.as_ref() {
+                    guard.afxdp.refresh_fabric_links(fabrics);
+                    refresh_status(&mut guard);
                 }
             }
             "update_neighbors" => {

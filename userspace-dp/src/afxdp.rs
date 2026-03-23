@@ -536,6 +536,7 @@ pub struct Coordinator {
     tunnel_sources: BTreeMap<u16, LocalTunnelSourceHandle>,
     last_slow_path_status: SlowPathStatus,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
+    shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     neigh_monitor_stop: Option<Arc<AtomicBool>>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -569,6 +570,7 @@ impl Coordinator {
             tunnel_sources: BTreeMap::new(),
             last_slow_path_status: SlowPathStatus::default(),
             ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
+            shared_fabrics: Arc::new(ArcSwap::from_pointee(Vec::new())),
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
             neigh_monitor_stop: None,
             shared_sessions: Arc::new(Mutex::new(FastMap::default())),
@@ -798,6 +800,7 @@ impl Coordinator {
             }
         };
         self.local_tunnel_deliveries.store(Arc::new(BTreeMap::new()));
+        self.shared_fabrics.store(Arc::new(self.forwarding.fabrics.clone()));
         let forwarding = Arc::new(self.forwarding.clone());
         if snapshot.map_pins.xsk.is_empty() {
             self.last_reconcile_stage = "missing_xsk_pin".to_string();
@@ -980,6 +983,7 @@ impl Coordinator {
             let ha_state = self.ha_state.clone();
             let dynamic_neighbors = self.dynamic_neighbors.clone();
             let worker_poll_mode = self.poll_mode;
+            let shared_fabrics = self.shared_fabrics.clone();
             let join = thread::Builder::new()
                 .name(format!("bpfrx-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -1004,6 +1008,7 @@ impl Coordinator {
                         heartbeat_clone,
                         worker_poll_mode,
                         dnat_fds,
+                        shared_fabrics,
                     );
                 });
             match join {
@@ -1190,6 +1195,28 @@ impl Coordinator {
             out.extend(drained);
         }
         out
+    }
+
+    /// Refresh fabric link info from updated snapshots. Called when the
+    /// Go daemon's refreshFabricFwd resolves a peer MAC that wasn't
+    /// available at initial snapshot build time.
+    ///
+    /// NOTE: this updates self.forwarding directly. Workers that were spawned
+    /// with an Arc of the previous forwarding state won't see this change
+    /// until the next full reconcile. This is acceptable because fabric
+    /// redirects check the forwarding state on every packet — the workers
+    /// will get the updated state on the next reconcile (which happens
+    /// on config change or rebind).
+    pub fn refresh_fabric_links(&mut self, snapshots: &[crate::FabricSnapshot]) {
+        let new_fabrics = resolve_fabric_links_from_snapshots(
+            snapshots,
+            &self.forwarding.egress,
+            &self.dynamic_neighbors,
+        );
+        if !new_fabrics.is_empty() {
+            self.forwarding.fabrics = new_fabrics.clone();
+            self.shared_fabrics.store(Arc::new(new_fabrics));
+        }
     }
 
     pub fn update_ha_state(&self, groups: &[HAGroupStatus]) {
@@ -1805,7 +1832,7 @@ struct TunnelEndpoint {
     transport_table: String,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct FabricLink {
     parent_ifindex: i32,
     overlay_ifindex: i32,
@@ -5458,7 +5485,7 @@ fn worker_loop(
     worker_id: u32,
     binding_plans: Vec<BindingPlan>,
     validation: ValidationState,
-    forwarding: Arc<ForwardingState>,
+    mut forwarding: Arc<ForwardingState>,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -5475,6 +5502,7 @@ fn worker_loop(
     heartbeat: Arc<AtomicU64>,
     poll_mode: crate::PollMode,
     dnat_fds: DnatTableFds,
+    shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
 ) {
     pin_current_thread(worker_id);
     let ha_startup_grace_until_secs = (monotonic_nanos() / 1_000_000_000)
@@ -5647,6 +5675,17 @@ fn worker_loop(
                     .live
                     .session_expires
                     .fetch_add(expired, Ordering::Relaxed);
+            }
+        }
+        // Check if fabric links were updated by the coordinator (e.g. after
+        // RG failover when peer MAC was resolved). If so, rebuild the
+        // forwarding Arc with the new fabric links so fabric redirect works.
+        {
+            let live_fabrics = shared_fabrics.load();
+            if !live_fabrics.is_empty() && live_fabrics.as_ref() != &forwarding.fabrics {
+                let mut updated = (*forwarding).clone();
+                updated.fabrics = live_fabrics.as_ref().clone();
+                forwarding = Arc::new(updated);
             }
         }
         let mut did_work = false;
@@ -7991,9 +8030,56 @@ fn ingress_is_fabric(forwarding: &ForwardingState, ingress_ifindex: i32) -> bool
     })
 }
 
+fn resolve_fabric_links_from_snapshots(
+    snapshots: &[crate::FabricSnapshot],
+    egress: &FastMap<i32, EgressInterface>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+) -> Vec<FabricLink> {
+    let mut out = Vec::with_capacity(snapshots.len());
+    for fabric in snapshots {
+        if fabric.parent_ifindex <= 0 {
+            continue;
+        }
+        let Ok(peer_addr) = fabric.peer_address.parse::<IpAddr>() else {
+            continue;
+        };
+        let local_mac = parse_mac(&fabric.local_mac)
+            .or_else(|| egress.get(&fabric.parent_ifindex).map(|e| e.src_mac));
+        let Some(local_mac) = local_mac else { continue };
+        let peer_mac = parse_mac(&fabric.peer_mac).or_else(|| {
+            dynamic_neighbors.lock().ok().and_then(|n| {
+                n.get(&(fabric.overlay_ifindex, peer_addr))
+                    .or_else(|| n.get(&(fabric.parent_ifindex, peer_addr)))
+                    .map(|e| e.mac)
+            })
+        });
+        let Some(peer_mac) = peer_mac else { continue };
+        out.push(FabricLink {
+            parent_ifindex: fabric.parent_ifindex,
+            overlay_ifindex: fabric.overlay_ifindex,
+            peer_addr,
+            peer_mac,
+            local_mac,
+        });
+    }
+    out
+}
+
 fn resolve_fabric_redirect(forwarding: &ForwardingState) -> Option<ForwardingResolution> {
-    let fabric = forwarding
-        .fabrics
+    resolve_fabric_redirect_from_list(&forwarding.fabrics)
+}
+
+fn resolve_fabric_redirect_from_shared(
+    forwarding: &ForwardingState,
+    shared_fabrics: &ArcSwap<Vec<FabricLink>>,
+) -> Option<ForwardingResolution> {
+    // Try static forwarding state first, then shared (dynamically updated) fabrics.
+    resolve_fabric_redirect_from_list(&forwarding.fabrics)
+        .or_else(|| resolve_fabric_redirect_from_list(&shared_fabrics.load()))
+}
+
+fn resolve_fabric_redirect_from_list(fabrics: &[FabricLink]) -> Option<ForwardingResolution> {
+    let fabric = fabrics
         .iter()
         .find(|fabric| fabric.parent_ifindex > 0)
         .copied()?;

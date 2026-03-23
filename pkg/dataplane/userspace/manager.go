@@ -2234,6 +2234,29 @@ func (m *Manager) syncHAStateLocked() error {
 	return m.syncDesiredForwardingStateLocked()
 }
 
+// SyncFabricState pushes current fabric snapshots (with fresh peer MACs)
+// to the Rust helper. Called from the daemon after refreshFabricFwd succeeds
+// so the helper has up-to-date fabric MAC info for cross-chassis redirect.
+func (m *Manager) SyncFabricState() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.proc == nil || m.proc.Process == nil || m.lastSnapshot == nil {
+		return
+	}
+	fabrics := buildFabricSnapshots(m.lastSnapshot.Config)
+	if len(fabrics) == 0 {
+		return
+	}
+	var status ProcessStatus
+	req := ControlRequest{
+		Type:    "update_fabrics",
+		Fabrics: fabrics,
+	}
+	if err := m.requestLocked(req, &status); err != nil {
+		slog.Debug("userspace: failed to sync fabric state", "err", err)
+	}
+}
+
 func (m *Manager) refreshHAStateFromMapsLocked() error {
 	rgMap := m.inner.Map("rg_active")
 	if rgMap == nil {

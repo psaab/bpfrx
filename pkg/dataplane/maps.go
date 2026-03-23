@@ -1864,6 +1864,7 @@ func (m *Manager) ZeroStaleFilterConfigs(startID uint32) {
 func (m *Manager) StartFIBSync(_ context.Context) {}
 
 func (m *Manager) NotifyLinkCycle() {} // no-op: eBPF programs survive link cycles
+func (m *Manager) SyncFabricState()  {} // no-op: eBPF uses fabric_fwd BPF map directly
 
 func (m *Manager) BumpFIBGeneration() {
 	zm, ok := m.maps["fib_gen_map"]
