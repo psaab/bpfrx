@@ -22,3 +22,4 @@
 
 # OS
 .DS_Store
+test/xsk-repro/target/

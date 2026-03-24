@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"mod":["xdp"],"struct":["BufIdx","DeviceQueue","Errno","IfInfo","ReadComplete","ReadRx","RingCons","RingProd","RingRx","RingTx","Socket","SocketConfig","Umem","UmemChunk","UmemConfig","User","WriteFill","WriteTx"]};
