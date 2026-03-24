@@ -4158,34 +4158,46 @@ fn poll_binding(
                             } else if resolution.disposition == ForwardingDisposition::HAInactive
                                 && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
                             {
-                                if let Some((Some(from_zone), _)) = debug
-                                    .as_ref()
-                                    .map(|debug| (debug.from_zone.clone(), debug.to_zone.clone()))
+                                // New flow to inactive RG: fabric-redirect to the peer
+                                // that owns the egress RG.  Use from_zone_arc directly
+                                // (always in scope) rather than going through the debug
+                                // struct which may not have been populated.
+                                if let Some(redirect) = resolve_zone_encoded_fabric_redirect(
+                                    forwarding,
+                                    from_zone_arc.as_ref(),
+                                )
+                                .or_else(|| resolve_fabric_redirect(forwarding))
                                 {
-                                    if let Some(redirect) = resolve_zone_encoded_fabric_redirect(
-                                        forwarding,
-                                        from_zone.as_ref(),
-                                    ) {
-                                        decision.resolution = redirect;
-                                    }
+                                    decision.resolution = redirect;
                                 }
                             }
                             decision
                         }
                     } else {
-                        SessionDecision {
-                            resolution: enforce_ha_resolution_snapshot(
+                        let non_flow_resolution = enforce_ha_resolution_snapshot(
+                            forwarding,
+                            ha_state,
+                            now_secs,
+                            resolve_forwarding(
+                                unsafe { &*area },
+                                desc,
+                                meta,
                                 forwarding,
-                                ha_state,
-                                now_secs,
-                                resolve_forwarding(
-                                    unsafe { &*area },
-                                    desc,
-                                    meta,
-                                    forwarding,
-                                    dynamic_neighbors,
-                                ),
+                                dynamic_neighbors,
                             ),
+                        );
+                        // For non-flow packets (no L4 ports), also attempt fabric
+                        // redirect when the egress RG is inactive.
+                        let final_resolution = if non_flow_resolution.disposition
+                            == ForwardingDisposition::HAInactive
+                            && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
+                        {
+                            resolve_fabric_redirect(forwarding).unwrap_or(non_flow_resolution)
+                        } else {
+                            non_flow_resolution
+                        };
+                        SessionDecision {
+                            resolution: final_resolution,
                             nat: NatDecision::default(),
                         }
                     };

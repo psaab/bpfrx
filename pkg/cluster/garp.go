@@ -426,8 +426,12 @@ func buildUnsolicitedNA(mac net.HardwareAddr, ip net.IP) []byte {
 	pkt[54] = 136 // Type: Neighbor Advertisement
 	pkt[55] = 0   // Code: 0
 	// pkt[56:58] = checksum (filled below)
-	// Flags: Override=1, Router=0, Solicited=0
-	pkt[58] = 0x20 // Override flag (bit 29, byte offset 0 bit 5)
+	// Flags: Router=1, Override=1, Solicited=0
+	// RFC 4861 §7.2.5: if IsRouter was true in the neighbor cache and the
+	// received NA has Router=0, the host MUST remove that router from the
+	// Default Router List. We MUST set Router=1 to preserve the host's
+	// default route through this link-local address across failover.
+	pkt[58] = 0xA0 // Router(bit 31)=0x80 + Override(bit 29)=0x20
 	// pkt[59:62] = 0 (reserved)
 	// Target address
 	copy(pkt[62:78], ip.To16())

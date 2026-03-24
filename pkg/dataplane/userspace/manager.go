@@ -2618,13 +2618,19 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			// Hard timeout fallback — ctrl enables after this even if
 			// readiness checks haven't passed. Prevents infinite stall
 			// if a readiness condition can never be met.
-			delay := 3 * time.Second
-			if m.clusterHA {
-				delay = 15 * time.Second
+			//
+			// Only set ctrlEnableAt on the FIRST prewarm so that
+			// subsequent rebind cycles (which reset neighborsPrewarmed)
+			// don't push the hard timeout forward indefinitely.
+			if m.ctrlEnableAt.IsZero() {
+				delay := 3 * time.Second
+				if m.clusterHA {
+					delay = 15 * time.Second
+				}
+				m.ctrlEnableAt = time.Now().Add(delay)
+				slog.Info("userspace: delaying ctrl enable for readiness",
+					"hard_timeout", delay, "cluster_ha", m.clusterHA)
 			}
-			m.ctrlEnableAt = time.Now().Add(delay)
-			slog.Info("userspace: delaying ctrl enable for readiness",
-				"hard_timeout", delay, "cluster_ha", m.clusterHA)
 			go m.bootstrapNAPIQueuesLocked()
 			m.proactiveNeighborResolveLocked()
 		}
@@ -4096,12 +4102,16 @@ func (m *Manager) NotifyLinkCycle() {
 	if m.proc == nil || m.proc.Process == nil {
 		return
 	}
-	// Reset the ctrl enable gate so the 3s fill-ring bootstrap delay
+	// Reset the ctrl enable gate so the fill-ring bootstrap delay
 	// restarts from scratch after rebind.  Without this, ctrl stays
 	// enabled while the new bindings aren't ready — packets redirected
 	// to dead XSK sockets are silently dropped (cold-start blackout).
+	//
+	// Preserve ctrlEnableAt across rebinds: the hard timeout should
+	// count from the FIRST prewarm, not restart on every link cycle.
+	// Otherwise repeated rebinds (e.g. RETH MAC programming) keep
+	// pushing the hard timeout forward and ctrl never enables.
 	m.neighborsPrewarmed = false
-	m.ctrlEnableAt = time.Time{}
 	m.disableUserspaceCtrlLocked()
 
 	var status ProcessStatus

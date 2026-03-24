@@ -225,9 +225,9 @@ func TestBuildUnsolicitedNA(t *testing.T) {
 		t.Errorf("ICMPv6 code = %d, want 0", pkt[55])
 	}
 
-	// Flags: Override=1 (0x20).
-	if pkt[58] != 0x20 {
-		t.Errorf("NA flags = 0x%02x, want 0x20 (Override)", pkt[58])
+	// Flags: Router=1 + Override=1 (0xA0).
+	if pkt[58] != 0xA0 {
+		t.Errorf("NA flags = 0x%02x, want 0xA0 (Router+Override)", pkt[58])
 	}
 
 	// Target address: our IPv6 address.
