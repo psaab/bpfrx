@@ -8,9 +8,12 @@ fn main() {
         .opt_level(2)
         .compile("xsk_bridge");
 
-    // Link libxdp (provides xsk_umem__create, xsk_socket__create_shared, etc.)
-    // and libbpf (dependency of libxdp).
-    println!("cargo:rustc-link-lib=xdp");
-    println!("cargo:rustc-link-lib=bpf");
+    // Statically link libxdp and its transitive dependencies so the
+    // binary is self-contained (no libxdp.so.1 needed on target VMs).
+    println!("cargo:rustc-link-lib=static=xdp");
+    println!("cargo:rustc-link-lib=static=bpf");
+    println!("cargo:rustc-link-lib=static=elf");
+    println!("cargo:rustc-link-lib=static=z");
+    println!("cargo:rustc-link-lib=static=zstd");
     println!("cargo:rerun-if-changed=csrc/xsk_bridge.c");
 }
