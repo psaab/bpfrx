@@ -2687,26 +2687,13 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			// XSK proven working — keep ctrl enabled.
 			ctrl.Enabled = 1
 		} else if allBindingsReady && neighborGenOK {
-			// Probe: temporarily enable ctrl + swap to XDP shim to test
-			// if XSK can sustain forwarding. If rx increases within 10s,
-			// keep the shim permanently. Otherwise revert to eBPF pipeline.
-			if m.xskProbeStart.IsZero() {
-				m.xskProbeStart = time.Now()
-				ctrl.Enabled = 1
-				slog.Info("userspace: starting XSK liveness probe (ctrl=1)")
-				_ = m.inner.SwapXDPEntryProg("xdp_userspace_prog")
-			} else if xskReceiveLive {
-				m.xskLivenessProven = true
-				ctrl.Enabled = 1
-				slog.Info("userspace: XSK liveness probe PASSED, userspace dataplane active")
-			} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
-				m.xskLivenessFailed = true
-				ctrl.Enabled = 0
-				slog.Warn("userspace: XSK liveness probe FAILED after 10s, using eBPF pipeline")
-				_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
-			} else {
-				ctrl.Enabled = 1
-			}
+			// XSK probe disabled: mlx5 zero-copy UMEM is invalidated by
+			// link DOWN/UP (RETH MAC programming) causing segfaults in
+			// worker threads accessing stale UMEM pages. The libxdp FFI
+			// ring fixes (reserve_up_to, cancel on Drop) are correct but
+			// the link-cycle UMEM invalidation needs a safe rebind path
+			// before the userspace dataplane can be activated.
+			ctrl.Enabled = 0
 		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt) {
 			// Hard timeout: enable even if not all readiness gates met.
 			ctrl.Enabled = 1
