@@ -1,2 +1,0 @@
-# BPF binaries
-libxdp1: binary-from-other-architecture [usr/lib/*/bpf/*.o]

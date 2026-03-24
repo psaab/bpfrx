@@ -23,3 +23,4 @@
 # OS
 .DS_Store
 test/xsk-repro/target/
+test/xsk-repro/xdp-tools*

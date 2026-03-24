@@ -1,3 +1,0 @@
-Test-Command: /usr/libexec/xdp-tools/run_tests.sh
-Restrictions: isolation-machine, needs-root, allow-stderr
-Depends: xdp-tests, ethtool, iproute2, iputils-ping, netcat-openbsd, tcpdump, tshark, mount, socat, ndisc6, arping
