@@ -300,8 +300,8 @@ impl IfInfo {
 /// UMEM region backed by libxdp's `xsk_umem__create`.
 pub struct Umem {
     inner: *mut XskUmemOpaque,
-    fill: Box<XskRingProd>,
-    comp: Box<XskRingCons>,
+    pub(crate) fill: Box<XskRingProd>,
+    pub(crate) comp: Box<XskRingCons>,
     config: UmemConfig,
     umem_area: NonNull<[u8]>,
 }
@@ -892,7 +892,7 @@ impl Drop for ReadComplete<'_> {
 ///
 /// `bind_flags` is the raw XDP bind flags (copy/zerocopy/need_wakeup).
 pub fn create_xsk_binding(
-    umem: &Umem,
+    umem: &mut Umem,
     info: &IfInfo,
     ring_entries: u32,
     bind_flags: u16,
@@ -946,10 +946,13 @@ pub fn create_xsk_binding(
         fd,
     };
 
+    // xsk_socket__create (non-shared) uses the umem's fill/comp rings.
+    // The socket-specific fill_ring/comp_ring passed to create_shared were
+    // ignored by the non-shared path. Use the umem's rings for DeviceQueue.
     let device = DeviceQueue {
         xsk: xsk_ptr,
-        fill: fill_ring,
-        comp: comp_ring,
+        fill: std::mem::replace(&mut umem.fill, Box::new(unsafe { core::mem::zeroed() })),
+        comp: std::mem::replace(&mut umem.comp, Box::new(unsafe { core::mem::zeroed() })),
         fd,
     };
 

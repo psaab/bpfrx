@@ -53,7 +53,7 @@ pub(super) fn preferred_bind_strategy(binding: &BindingStatus) -> AfXdpBindStrat
 }
 
 pub(super) fn open_binding_worker_rings(
-    worker_umem: &WorkerUmem,
+    worker_umem: &mut WorkerUmem,
     info: &IfInfo,
     ring_entries: u32,
     bind_strategy: AfXdpBindStrategy,
@@ -243,7 +243,7 @@ pub(super) fn shared_umem_group_key_for_device(
 /// single libxdp call that does UMEM registration, ring setup, and bind
 /// atomically — matching the proven libbpf xsk code path.
 fn try_open_bind(
-    worker_umem: &WorkerUmem,
+    worker_umem: &mut WorkerUmem,
     info: &IfInfo,
     ring_entries: u32,
     bind_flags: u16,
@@ -260,7 +260,7 @@ fn try_open_bind(
     Box<dyn std::error::Error + Send + Sync>,
 > {
     for attempt in 0..BIND_RETRY_ATTEMPTS {
-        match xsk_ffi::create_xsk_binding(worker_umem.umem(), info, ring_entries, bind_flags) {
+        match xsk_ffi::create_xsk_binding(worker_umem.umem_mut(), info, ring_entries, bind_flags) {
             Ok((user, rx, tx, mut device)) => {
                 let user_fd = user.as_raw_fd();
 
