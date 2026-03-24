@@ -1803,16 +1803,76 @@ zone_session_update:
 			}
 		}
 		if (sv4 != NULL) {
-			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
+			if (meta->meta_flags & META_FLAG_FABRIC_FWD) {
+				/* Fabric-forwarded session hit NO_NEIGH.
+				 * Re-FIB in main table: the initial FIB
+				 * may have used a VRF where the neighbor
+				 * isn't present.  If main-table FIB
+				 * resolves, use it; otherwise drop. */
+				struct bpf_fib_lookup fib_nn4 = {};
+				setup_main_table_fib(&fib_nn4, meta,
+						     ff_cached,
+						     ff1_cached);
+				int rc_nn4 = bpf_fib_lookup(ctx,
+					&fib_nn4, sizeof(fib_nn4),
+					BPF_FIB_LOOKUP_DIRECT_TBID);
+				if (rc_nn4 ==
+				    BPF_FIB_LKUP_RET_SUCCESS) {
+					resolve_fib_result(meta,
+							   &fib_nn4);
+					sv4->fib_ifindex =
+						meta->fwd_ifindex;
+					sv4->fib_vlan_id =
+						meta->egress_vlan_id;
+					__builtin_memcpy(sv4->fib_dmac,
+						meta->fwd_dmac, 6);
+					__builtin_memcpy(sv4->fib_smac,
+						meta->fwd_smac, 6);
+					sv4->fib_gen = (__u16)fib_gen;
+					return zone_ct_update_v4(
+						ctx, meta, sv4,
+						ct_direction, fc);
+				}
+				inc_counter(
+					GLOBAL_CTR_FABRIC_FWD_DROP);
 				return XDP_DROP;
+			}
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
 			return XDP_PASS;
 		}
 		if (sv6 != NULL) {
-			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
+			if (meta->meta_flags & META_FLAG_FABRIC_FWD) {
+				/* Same as IPv4 above. */
+				struct bpf_fib_lookup fib_nn6 = {};
+				setup_main_table_fib(&fib_nn6, meta,
+						     ff_cached,
+						     ff1_cached);
+				int rc_nn6 = bpf_fib_lookup(ctx,
+					&fib_nn6, sizeof(fib_nn6),
+					BPF_FIB_LOOKUP_DIRECT_TBID);
+				if (rc_nn6 ==
+				    BPF_FIB_LKUP_RET_SUCCESS) {
+					resolve_fib_result(meta,
+							   &fib_nn6);
+					sv6->fib_ifindex =
+						meta->fwd_ifindex;
+					sv6->fib_vlan_id =
+						meta->egress_vlan_id;
+					__builtin_memcpy(sv6->fib_dmac,
+						meta->fwd_dmac, 6);
+					__builtin_memcpy(sv6->fib_smac,
+						meta->fwd_smac, 6);
+					sv6->fib_gen = (__u16)fib_gen;
+					return zone_ct_update_v6(
+						ctx, meta, sv6,
+						ct_direction, fc);
+				}
+				inc_counter(
+					GLOBAL_CTR_FABRIC_FWD_DROP);
 				return XDP_DROP;
+			}
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
@@ -1947,16 +2007,84 @@ zone_session_update:
 			}
 		}
 		if (sv4 != NULL) {
-			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
+			if (meta->meta_flags & META_FLAG_FABRIC_FWD) {
+				/* Fabric-forwarded existing session hit
+				 * BLACKHOLE/UNREACHABLE.  The initial FIB
+				 * used a VRF table or hit a blackhole for
+				 * an inactive RG's subnet.  Re-FIB in the
+				 * main table which has connected routes
+				 * for the locally-active RG.  Without this,
+				 * per-RG failover kills existing TCP:
+				 * the old primary fabric-redirects return
+				 * traffic here, but this DROP prevents it
+				 * from reaching the LAN client. */
+				struct bpf_fib_lookup fib_bh4 = {};
+				setup_main_table_fib(&fib_bh4, meta,
+						     ff_cached,
+						     ff1_cached);
+				int rc_bh4 = bpf_fib_lookup(ctx,
+					&fib_bh4, sizeof(fib_bh4),
+					BPF_FIB_LOOKUP_DIRECT_TBID);
+				if (rc_bh4 ==
+				    BPF_FIB_LKUP_RET_SUCCESS) {
+					resolve_fib_result(meta,
+							   &fib_bh4);
+					sv4->fib_ifindex =
+						meta->fwd_ifindex;
+					sv4->fib_vlan_id =
+						meta->egress_vlan_id;
+					__builtin_memcpy(sv4->fib_dmac,
+						meta->fwd_dmac, 6);
+					__builtin_memcpy(sv4->fib_smac,
+						meta->fwd_smac, 6);
+					sv4->fib_gen = (__u16)fib_gen;
+					return zone_ct_update_v4(
+						ctx, meta, sv4,
+						ct_direction, fc);
+				}
+				/* Main-table FIB also failed: both RGs
+				 * inactive during transition.  Drop;
+				 * TCP retransmits recover. */
+				inc_counter(
+					GLOBAL_CTR_FABRIC_FWD_DROP);
 				return XDP_DROP;
+			}
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
 			return XDP_PASS;
 		}
 		if (sv6 != NULL) {
-			if (meta->meta_flags & META_FLAG_FABRIC_FWD)
+			if (meta->meta_flags & META_FLAG_FABRIC_FWD) {
+				/* Same as IPv4 above. */
+				struct bpf_fib_lookup fib_bh6 = {};
+				setup_main_table_fib(&fib_bh6, meta,
+						     ff_cached,
+						     ff1_cached);
+				int rc_bh6 = bpf_fib_lookup(ctx,
+					&fib_bh6, sizeof(fib_bh6),
+					BPF_FIB_LOOKUP_DIRECT_TBID);
+				if (rc_bh6 ==
+				    BPF_FIB_LKUP_RET_SUCCESS) {
+					resolve_fib_result(meta,
+							   &fib_bh6);
+					sv6->fib_ifindex =
+						meta->fwd_ifindex;
+					sv6->fib_vlan_id =
+						meta->egress_vlan_id;
+					__builtin_memcpy(sv6->fib_dmac,
+						meta->fwd_dmac, 6);
+					__builtin_memcpy(sv6->fib_smac,
+						meta->fwd_smac, 6);
+					sv6->fib_gen = (__u16)fib_gen;
+					return zone_ct_update_v6(
+						ctx, meta, sv6,
+						ct_direction, fc);
+				}
+				inc_counter(
+					GLOBAL_CTR_FABRIC_FWD_DROP);
 				return XDP_DROP;
+			}
 			meta->meta_flags |= META_FLAG_KERNEL_ROUTE;
 			bpf_tail_call(ctx, &xdp_progs,
 				      XDP_PROG_CONNTRACK);
