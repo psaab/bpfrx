@@ -2651,10 +2651,21 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// Now refresh neighbors for the next cycle.
 		m.refreshNeighborSnapshotLocked()
 
-		if allBindingsReady && neighborGenOK {
+		// XSK receive liveness check: if bindings are ready but no
+		// packets have been received after 30s, the AF_XDP deliver path
+		// is broken (e.g. xdpilone + mlx5 incompatibility). Enabling
+		// ctrl in this state sends ALL transit packets into a black hole.
+		xskReceiveLive := false
+		for _, b := range status.Bindings {
+			if b.RXPackets > 0 {
+				xskReceiveLive = true
+				break
+			}
+		}
+		if allBindingsReady && neighborGenOK && xskReceiveLive {
 			ctrl.Enabled = 1
-		} else if time.Now().After(m.ctrlEnableAt) {
-			// Hard timeout: enable anyway to prevent indefinite stall.
+		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt) && xskReceiveLive {
+			// Hard timeout: enable if XSK is actually receiving.
 			ctrl.Enabled = 1
 			if !allBindingsReady || !neighborGenOK {
 				slog.Warn("userspace: ctrl enabled by hard timeout, not all readiness gates met",
@@ -2665,6 +2676,19 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			}
 		} else {
 			ctrl.Enabled = 0
+			if allBindingsReady && !xskReceiveLive && !m.ctrlEnableAt.IsZero() &&
+				time.Now().After(m.ctrlEnableAt.Add(30*time.Second)) {
+				// XSK can't receive after 30s. Swap to the eBPF pipeline
+				// entry program so packets go through xdp_main instead
+				// of the broken XDP shim (which does XDP_PASS → no SNAT).
+				if m.inner.XDPEntryProg == "xdp_userspace_prog" {
+					slog.Warn("userspace: XSK receive not live after 30s, swapping to eBPF pipeline",
+						"bindings_ready", allBindingsReady)
+					if err := m.inner.SwapXDPEntryProg("xdp_main_prog"); err != nil {
+						slog.Warn("userspace: failed to swap XDP entry prog", "err", err)
+					}
+				}
+			}
 		}
 	}
 	// Flush stale BPF session entries when ctrl transitions from
@@ -4191,9 +4215,22 @@ func (m *Manager) StartFIBSync(ctx context.Context) {
 // In mlx5 (and other drivers), a link DOWN/UP cycle destroys the kernel-side
 // XSK receive queue.  The sockets remain open but no longer receive packets.
 // This is called after programRethMAC which takes RETH interfaces DOWN/UP.
+//
+// A 200ms delay before rebind lets the mlx5 NIC fully reinitialize its UMR
+// (User Memory Region) subsystem after link reactivation. Without this, the
+// NIC's UMR WQE queue overflows when all XSK sockets are recreated
+// simultaneously (rx_xsk_congst_umr), causing UMEM pages to not be mapped
+// and packets to be silently dropped despite successful XDP_REDIRECT.
 func (m *Manager) NotifyLinkCycle() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.proc == nil || m.proc.Process == nil {
+		return
+	}
+	// Let the NIC reinitialize after link UP before recreating XSK sockets.
+	m.mu.Unlock()
+	time.Sleep(200 * time.Millisecond)
+	m.mu.Lock()
 	if m.proc == nil || m.proc.Process == nil {
 		return
 	}
