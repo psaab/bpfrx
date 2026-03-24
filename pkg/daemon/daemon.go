@@ -1241,25 +1241,38 @@ func renameRethMember(targetName string, expectedMAC net.HardwareAddr) string {
 // programRethMAC sets a deterministic virtual MAC on a RETH member interface.
 // Skips if the interface already has the correct MAC.
 // The interface must be brought DOWN to change its MAC, then back UP.
-func programRethMAC(ifName string, mac net.HardwareAddr) error {
+func programRethMAC(ifName string, mac net.HardwareAddr) (linkCycled bool, err error) {
 	link, err := netlink.LinkByName(ifName)
 	if err != nil {
-		return fmt.Errorf("interface %s: %w", ifName, err)
+		return false, fmt.Errorf("interface %s: %w", ifName, err)
 	}
 	current := link.Attrs().HardwareAddr
 	if bytes.Equal(current, mac) {
-		return nil
+		return false, nil
 	}
 	slog.Info("setting RETH virtual MAC", "iface", ifName, "mac", mac)
-	// Must bring link down to change MAC (EAGAIN if UP).
+	// Try setting MAC while link is UP (avoids link DOWN/UP cycle).
+	// mlx5 zero-copy AF_XDP sockets break on link cycle — the driver
+	// doesn't reinitialize XSK WQEs after link UP. If the driver
+	// supports IFF_LIVE_ADDR_CHANGE, this succeeds without any cycle.
+	if err := netlink.LinkSetHardwareAddr(link, mac); err == nil {
+		slog.Info("RETH MAC set without link cycle", "iface", ifName)
+		return false, nil
+	}
+	// Fallback: bring link down, set MAC, bring back up.
+	slog.Info("RETH MAC requires link cycle (driver does not support live change)",
+		"iface", ifName)
 	if err := netlink.LinkSetDown(link); err != nil {
-		return fmt.Errorf("link down %s: %w", ifName, err)
+		return false, fmt.Errorf("link down %s: %w", ifName, err)
 	}
 	if err := netlink.LinkSetHardwareAddr(link, mac); err != nil {
 		netlink.LinkSetUp(link) // best-effort restore
-		return fmt.Errorf("set mac %s: %w", ifName, err)
+		return false, fmt.Errorf("set mac %s: %w", ifName, err)
 	}
-	return netlink.LinkSetUp(link)
+	if err := netlink.LinkSetUp(link); err != nil {
+		return true, fmt.Errorf("link up %s: %w", ifName, err)
+	}
+	return true, nil
 }
 
 // clearDadFailed removes any dadfailed link-local IPv6 addresses and re-adds
@@ -1663,6 +1676,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// when both nodes' members are on the same L2 domain. VRRP + gratuitous NA
 	// handle failover; RA goodbye packets handle IPv6 default gateway transitions.
 	// Must run AFTER networkd.Apply() so .link renames are applied first.
+	needLinkCycleRecovery := false
 	if d.cluster != nil && cfg.Chassis.Cluster != nil {
 		cc := cfg.Chassis.Cluster
 		rethToPhys := cfg.RethToPhysical()
@@ -1699,9 +1713,11 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			addrGenPath := fmt.Sprintf("/proc/sys/net/ipv6/conf/%s/addr_gen_mode", linuxName)
 			os.WriteFile(addrGenPath, []byte("1"), 0644)
 			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
-			if err := programRethMAC(linuxName, mac); err != nil {
+			linkCycled, err := programRethMAC(linuxName, mac)
+			if err != nil {
 				slog.Warn("failed to set RETH MAC", "iface", linuxName, "mac", mac, "err", err)
 			}
+			needLinkCycleRecovery = needLinkCycleRecovery || linkCycled
 			clearDadFailed(linuxName)
 			removeAutoLinkLocal(linuxName)
 			// Re-add link-local if this parent interface has IPv6 on unit 0.
@@ -1761,10 +1777,10 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	}
 
 	// 2.6b. Reconcile VRRP VIPs and stable link-locals after RETH MAC
-	// programming. programRethMAC brings the interface DOWN/UP which
-	// removes all addresses including VRRP VIPs and stable link-locals.
-	// Re-add them on MASTER instances.
-	if d.isNoRethVRRP() {
+	// programming. Only needed when programRethMAC had to bring the
+	// interface DOWN/UP (link cycle), which removes all addresses
+	// including VRRP VIPs and stable link-locals.
+	if needLinkCycleRecovery && d.isNoRethVRRP() {
 		// Direct mode: re-add VIPs + stable link-locals for each RG
 		// where we are primary.
 		if d.cluster != nil {
@@ -1776,7 +1792,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				}
 			}
 		}
-	} else if d.vrrpMgr != nil {
+	} else if needLinkCycleRecovery && d.vrrpMgr != nil {
 		d.vrrpMgr.ReconcileVIPs()
 		// Re-add stable link-locals for active RGs after MAC bounce.
 		if d.cluster != nil && cfg.Chassis.Cluster != nil {
@@ -1790,10 +1806,10 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	}
 
 	// 2.6b2. Rebind AF_XDP sockets after RETH MAC programming.
-	// programRethMAC brings links DOWN/UP which destroys the kernel-side
-	// XSK receive queue for AF_XDP sockets.  Notify the userspace
-	// dataplane so it can recreate the sockets.
-	if d.dp != nil && d.cluster != nil && cfg.Chassis.Cluster != nil {
+	// Only needed when programRethMAC brought links DOWN/UP which
+	// destroys the kernel-side XSK receive queue.  If MAC was set
+	// without a link cycle, AF_XDP sockets are unaffected.
+	if needLinkCycleRecovery && d.dp != nil && d.cluster != nil && cfg.Chassis.Cluster != nil {
 		d.dp.NotifyLinkCycle()
 		// Re-send RA startup burst AFTER the link is back up.  The
 		// previous startup burst fires during/before the link cycle
