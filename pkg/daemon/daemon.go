@@ -6694,7 +6694,7 @@ func (d *Daemon) directRemoveVIPs(rgID int) {
 				continue
 			}
 			if err := netlink.AddrDel(link, addr); err != nil {
-				if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ESRCH) {
+				if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ESRCH) && !errors.Is(err, syscall.EADDRNOTAVAIL) {
 					slog.Warn("directRemoveVIPs: failed to remove", "iface", ifName, "addr", cidr, "err", err)
 				}
 			} else {
@@ -6820,7 +6820,7 @@ func removeStableLLFromInterface(ifName string, ll net.IP) {
 		IPNet: &net.IPNet{IP: ll, Mask: net.CIDRMask(128, 128)},
 	}
 	if err := netlink.AddrDel(link, addr); err != nil {
-		if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ESRCH) {
+		if !errors.Is(err, syscall.ENOENT) && !errors.Is(err, syscall.ESRCH) && !errors.Is(err, syscall.EADDRNOTAVAIL) {
 			slog.Warn("failed to remove stable link-local", "iface", ifName, "addr", ll, "err", err)
 		}
 	} else {
