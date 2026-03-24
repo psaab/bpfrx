@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"struct":["SockAddrXdp","XdpDesc","XdpMmapOffsets","XdpMmapOffsetsV1","XdpRingOffsets","XdpRingOffsetsV1","XdpStatistics","XdpStatisticsV2","XdpUmemReg"]};
