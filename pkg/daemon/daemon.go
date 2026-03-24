@@ -1803,6 +1803,10 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
+	// NOTE: stable link-local cleanup for secondary RGs is handled by
+	// the reconcile loop (reconcileRGState) after election settles,
+	// not here — we don't know who's primary during config apply.
+
 	// 2.6c. Reconcile proxy ARP entries for NAT addresses.
 	if len(cfg.Security.NAT.ProxyARP) > 0 {
 		ifaceMap := make(map[string]int)
@@ -1978,6 +1982,8 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// link-local), so both nodes appear as separate routers to hosts.
 	// Only the primary sends RAs (via applyRethServicesForRG on MASTER);
 	// the reconcile loop sends goodbye RAs for inactive RGs.
+	//
+	// Stable link-local cleanup: handled by reconcile after election.
 
 	// 6. Apply IPsec config
 	// Always call Apply so stale swanctl config is removed when VPNs are
@@ -6057,16 +6063,24 @@ func (d *Daemon) reconcileRGState() {
 
 		// RA/DHCP service reconciliation (#93): safety net for dropped
 		// VRRP events that should have started or stopped per-RG services.
-		// Only trigger on actual state change to avoid thrashing services
-		// every reconcile tick (RA/DHCP apply restarts daemons).
+		// Services (RA/DHCP) only start/stop on actual state change to
+		// avoid thrashing restarts every reconcile tick.
 		if tr.Changed {
 			if tr.Active {
-				d.addStableRethLinkLocal(rgID)
 				d.applyRethServicesForRG(rgID)
 			} else {
-				d.removeStableRethLinkLocal(rgID)
 				d.clearRethServicesForRG(rgID)
 			}
+		}
+		// Stable link-local: ensure correct on EVERY reconcile tick.
+		// The kernel preserves NODAD addresses across daemon restarts,
+		// so stale addresses can exist without a state transition.
+		// Primary: add (idempotent — AddrAdd returns EEXIST if present).
+		// Secondary: remove (idempotent — AddrDel returns ENOENT if absent).
+		if tr.Active {
+			d.addStableRethLinkLocal(rgID)
+		} else {
+			d.removeStableRethLinkLocal(rgID)
 		}
 
 		// Startup goodbye RA: when an RG is inactive on the first
