@@ -1680,6 +1680,43 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	if d.cluster != nil && cfg.Chassis.Cluster != nil {
 		cc := cfg.Chassis.Cluster
 		rethToPhys := cfg.RethToPhysical()
+
+		// Pre-check: will any interface need a MAC change? If so, disable
+		// XSK BEFORE the link cycle to prevent segfaults from workers
+		// accessing UMEM pages that mlx5 unmaps during link DOWN.
+		macChangeNeeded := false
+		for rethName, physName := range rethToPhys {
+			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
+			if !ok || rethCfg.RedundancyGroup <= 0 {
+				continue
+			}
+			linuxName := config.LinuxIfName(physName)
+			link, err := netlink.LinkByName(linuxName)
+			if err != nil {
+				continue
+			}
+			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
+			if !bytes.Equal(link.Attrs().HardwareAddr, mac) {
+				macChangeNeeded = true
+				break
+			}
+		}
+		if macChangeNeeded && d.dp != nil {
+			// Disable ctrl and swap to eBPF pipeline BEFORE link cycle.
+			// This prevents the XDP shim from redirecting packets to XSK
+			// while the NIC tears down DMA-mapped UMEM pages (link DOWN
+			// on mlx5 zero-copy). Workers keep running but poll empty
+			// rings since ctrl=0 stops new redirects. NotifyLinkCycle
+			// after MAC programming will stop workers and rebind.
+			type xskDisabler interface {
+				DisableAndStopHelper()
+			}
+			if stopper, ok := d.dp.(xskDisabler); ok {
+				slog.Info("userspace: disabling ctrl before RETH MAC programming")
+				stopper.DisableAndStopHelper()
+			}
+		}
+
 		for rethName, physName := range rethToPhys {
 			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
 			if !ok || rethCfg.RedundancyGroup <= 0 {

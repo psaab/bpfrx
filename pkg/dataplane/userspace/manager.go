@@ -2686,14 +2686,29 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		} else if m.xskLivenessProven {
 			// XSK proven working — keep ctrl enabled.
 			ctrl.Enabled = 1
-		} else if allBindingsReady && neighborGenOK {
-			// XSK probe disabled: mlx5 zero-copy UMEM is invalidated by
-			// link DOWN/UP (RETH MAC programming) causing segfaults in
-			// worker threads accessing stale UMEM pages. The libxdp FFI
-			// ring fixes (reserve_up_to, cancel on Drop) are correct but
-			// the link-cycle UMEM invalidation needs a safe rebind path
-			// before the userspace dataplane can be activated.
-			ctrl.Enabled = 0
+		} else if allBindingsReady && neighborGenOK &&
+			!m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt.Add(30*time.Second)) {
+			// Probe: enable ctrl + swap to XDP shim to test XSK.
+			// Delayed 30s past the hard timeout to ensure the cluster
+			// has settled (RETH MACs programmed, VRRP elections done,
+			// VIPs assigned) — no more link cycles expected.
+			if m.xskProbeStart.IsZero() {
+				m.xskProbeStart = time.Now()
+				ctrl.Enabled = 1
+				slog.Info("userspace: starting XSK liveness probe (ctrl=1)")
+				_ = m.inner.SwapXDPEntryProg("xdp_userspace_prog")
+			} else if xskReceiveLive {
+				m.xskLivenessProven = true
+				ctrl.Enabled = 1
+				slog.Info("userspace: XSK liveness probe PASSED, userspace dataplane active")
+			} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
+				m.xskLivenessFailed = true
+				ctrl.Enabled = 0
+				slog.Warn("userspace: XSK liveness probe FAILED, using eBPF pipeline")
+				_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
+			} else {
+				ctrl.Enabled = 1
+			}
 		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt) {
 			// Hard timeout: enable even if not all readiness gates met.
 			ctrl.Enabled = 1
@@ -4212,6 +4227,25 @@ func (m *Manager) disableUserspaceCtrlLocked() {
 	ctrl.Enabled = 0
 	_ = ctrlMap.Update(zero, ctrl, ebpf.UpdateAny)
 	slog.Info("userspace: disabled ctrl (helper stopping)")
+}
+
+// DisableAndStopHelper disables ctrl and swaps to the eBPF pipeline entry
+// program. This prevents the XDP shim from redirecting new packets to XSK.
+// Must be called BEFORE any operation that invalidates UMEM (e.g. link
+// DOWN on mlx5 zero-copy). Worker threads keep running but see no new
+// packets since ctrl=0 stops XSK redirects.
+func (m *Manager) DisableAndStopHelper() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.proc == nil || m.proc.Process == nil {
+		return
+	}
+	m.disableUserspaceCtrlLocked()
+	// Swap to eBPF pipeline so packets go through xdp_main_prog
+	// even if the XDP shim was previously attached.
+	if m.inner.XDPEntryProg != "xdp_main_prog" {
+		_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
+	}
 }
 
 func configEqual(a, b config.UserspaceConfig) bool {
