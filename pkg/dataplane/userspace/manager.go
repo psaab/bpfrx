@@ -55,6 +55,7 @@ type Manager struct {
 	ctrlEnableAt        time.Time
 	ctrlWasEnabled      bool
 	xskLivenessFailed   bool
+	xskProbeStart       time.Time
 	lastXSKRX           uint64
 	neighborGeneration  uint64
 }
@@ -2656,20 +2657,15 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// Now refresh neighbors for the next cycle.
 		m.refreshNeighborSnapshotLocked()
 
-		// XSK receive liveness check: if bindings are ready but rx hasn't
-		// increased since the last check, the AF_XDP delivery path is
-		// broken (e.g. xdpilone + mlx5 incompatibility). Enabling ctrl
-		// in this state sends ALL transit packets into a black hole.
+		// XSK receive liveness: enable ctrl optimistically once bindings
+		// are ready. If XSK is truly broken (xdpilone on mlx5), the
+		// liveness probe will detect zero rx delta and swap to eBPF.
+		// With libxdp, XSK should work and ctrl stays enabled.
 		var currentRX uint64
 		for _, b := range status.Bindings {
 			currentRX += b.RXPackets
 		}
-		// Delta check: XSK is live only if rx INCREASED since last check.
-		// On the first check, initialize lastXSKRX to current (no delta).
-		xskReceiveLive := false
-		if m.lastXSKRX > 0 {
-			xskReceiveLive = currentRX > m.lastXSKRX
-		}
+		xskReceiveLive := currentRX > m.lastXSKRX
 		m.lastXSKRX = currentRX
 		slog.Debug("userspace: ctrl gate check",
 			"allBindingsReady", allBindingsReady,
@@ -2680,33 +2676,40 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			"neighborsPrewarmed", m.neighborsPrewarmed,
 			"xskLivenessFailed", m.xskLivenessFailed,
 			"xdpEntryProg", m.inner.XDPEntryProg)
-		if allBindingsReady && neighborGenOK && xskReceiveLive {
+		if m.xskLivenessFailed {
+			// XSK proven broken — stay on eBPF pipeline, ctrl disabled.
+			ctrl.Enabled = 0
+		} else if allBindingsReady && neighborGenOK {
+			// Optimistically enable ctrl. If XSK is working (libxdp),
+			// packets flow through the Rust helper. If broken (xdpilone),
+			// the liveness probe below detects it and swaps to eBPF.
 			ctrl.Enabled = 1
-		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt) && xskReceiveLive {
-			// Hard timeout: enable if XSK is actually receiving.
+			if m.xskProbeStart.IsZero() && !xskReceiveLive {
+				m.xskProbeStart = time.Now()
+				slog.Info("userspace: ctrl enabled, starting XSK liveness probe")
+			}
+			if xskReceiveLive {
+				// XSK is receiving — clear probe timer, stay enabled.
+				m.xskProbeStart = time.Time{}
+			} else if !m.xskProbeStart.IsZero() && time.Now().After(m.xskProbeStart.Add(10*time.Second)) {
+				// 10s of ctrl=1 with no XSK rx: XSK is broken.
+				m.xskLivenessFailed = true
+				ctrl.Enabled = 0
+				slog.Warn("userspace: XSK liveness probe failed after 10s, switching to eBPF pipeline")
+				if err := m.inner.SwapXDPEntryProg("xdp_main_prog"); err != nil {
+					slog.Warn("userspace: failed to swap XDP entry prog", "err", err)
+				}
+			}
+		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt) {
+			// Hard timeout: enable even if not all readiness gates met.
 			ctrl.Enabled = 1
 			if !allBindingsReady || !neighborGenOK {
-				slog.Warn("userspace: ctrl enabled by hard timeout, not all readiness gates met",
+				slog.Warn("userspace: ctrl enabled by hard timeout",
 					"bindings_ready", allBindingsReady,
-					"neighbor_gen_ok", neighborGenOK,
-					"expected_gen", m.neighborGeneration,
-					"installed_gen", status.NeighborGeneration)
+					"neighbor_gen_ok", neighborGenOK)
 			}
 		} else {
 			ctrl.Enabled = 0
-			if allBindingsReady && !xskReceiveLive && m.neighborsPrewarmed {
-				// XSK bindings ready but no packets received. Swap to eBPF pipeline
-				// entry program so packets go through xdp_main instead
-				// of the broken XDP shim (which does XDP_PASS → no SNAT).
-				if !m.xskLivenessFailed {
-					m.xskLivenessFailed = true
-					slog.Warn("userspace: XSK receive not live after 30s, forcing eBPF pipeline",
-						"bindings_ready", allBindingsReady)
-					if err := m.inner.SwapXDPEntryProg("xdp_main_prog"); err != nil {
-						slog.Warn("userspace: failed to swap XDP entry prog", "err", err)
-					}
-				}
-			}
 		}
 	}
 	// Flush stale BPF session entries when ctrl transitions from
