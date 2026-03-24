@@ -53,6 +53,7 @@ type Manager struct {
 	lastBindingIndices []uint32
 	neighborsPrewarmed  bool
 	ctrlEnableAt        time.Time
+	ctrlWasEnabled      bool
 	neighborGeneration  uint64
 }
 
@@ -2666,6 +2667,36 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			ctrl.Enabled = 0
 		}
 	}
+	// Flush stale BPF session entries when ctrl transitions from
+	// disabled to enabled. During ctrl-disabled, the eBPF pipeline
+	// creates PASS_TO_KERNEL entries in the userspace session map.
+	// These poison the XDP shim after ctrl enables — it sees the stale
+	// entry and bypasses XSK, routing packets to the eBPF pipeline
+	// instead of the userspace helper.
+	if ctrl.Enabled == 1 && !m.ctrlWasEnabled {
+		if usMap := m.inner.Map("userspace_sessions"); usMap != nil {
+			var key, nextKey []byte
+			key = make([]byte, usMap.KeySize())
+			nextKey = make([]byte, usMap.KeySize())
+			deleted := 0
+			for {
+				if err := usMap.NextKey(key, nextKey); err != nil {
+					break
+				}
+				copy(key, nextKey)
+				_ = usMap.Delete(key)
+				deleted++
+				if deleted > 100000 {
+					break
+				}
+			}
+			if deleted > 0 {
+				slog.Info("userspace: flushed stale BPF session entries on ctrl enable",
+					"deleted", deleted)
+			}
+		}
+	}
+	m.ctrlWasEnabled = ctrl.Enabled == 1
 	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update userspace_ctrl from helper status: %w", err)
 	}
