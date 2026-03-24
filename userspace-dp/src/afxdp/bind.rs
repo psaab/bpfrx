@@ -1,7 +1,6 @@
 use super::*;
-use core::num::NonZeroU32;
 use std::path::Path;
-use xdpilone::{IfInfo, Socket, SocketConfig};
+use crate::xsk_ffi::{self, DeviceQueue, IfInfo, RingRx, RingTx, SocketConfig};
 
 const AUTO_BIND_FLAGS: [u16; 1] = [0];
 const EXPLICIT_MODE_BIND_FLAGS: [u16; 2] = [XSK_BIND_FLAGS_ZEROCOPY, XSK_BIND_FLAGS_COPY];
@@ -14,6 +13,7 @@ pub(super) enum AfXdpBindStrategy {
 }
 
 impl AfXdpBindStrategy {
+    #[allow(dead_code)]
     fn uses_umem_owner_socket(self) -> bool {
         matches!(self, Self::UmemOwnerSocket)
     }
@@ -63,11 +63,11 @@ pub(super) fn open_binding_worker_rings(
 ) -> Result<
     (
         User,
-        xdpilone::RingRx,
-        xdpilone::RingTx,
+        RingRx,
+        RingTx,
         XskBindMode,
         AfXdpBindStrategy,
-        xdpilone::DeviceQueue,
+        DeviceQueue,
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
@@ -79,8 +79,10 @@ pub(super) fn open_binding_worker_rings(
     let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
     for (strategy_idx, strategy) in strategies.iter().copied().enumerate() {
         for (flags_idx, flags) in bind_flag_candidates.iter().copied().enumerate() {
-            match try_open_bind(worker_umem, info, ring_entries, strategy, flags, poll_mode, pre_bind_fill_offsets) {
-                Ok(result) => return Ok(result),
+            match try_open_bind(worker_umem, info, ring_entries, flags, poll_mode, pre_bind_fill_offsets) {
+                Ok((user, rx, tx, bind_mode, device)) => {
+                    return Ok((user, rx, tx, bind_mode, strategy, device));
+                }
                 Err(err) => {
                     last_err = Some(err);
                     let more_flag_attempts = flags_idx + 1 < bind_flag_candidates.len();
@@ -128,7 +130,7 @@ fn describe_bind_flags(flags: u16) -> &'static str {
 }
 
 pub(super) fn prime_fill_ring_offsets(
-    device: &mut xdpilone::DeviceQueue,
+    device: &mut DeviceQueue,
     offsets: &[u64],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let inserted = {
@@ -234,101 +236,68 @@ pub(super) fn shared_umem_group_key_for_device(
     }
 }
 
+/// Create and bind an XSK socket using libxdp's `xsk_socket__create_shared`.
+///
+/// This replaces the multi-step xdpilone flow (Socket::with_shared →
+/// umem.fq_cq → umem.rx_tx → user.map_rx/map_tx → umem.bind) with a
+/// single libxdp call that does UMEM registration, ring setup, and bind
+/// atomically — matching the proven libbpf xsk code path.
 fn try_open_bind(
     worker_umem: &WorkerUmem,
     info: &IfInfo,
     ring_entries: u32,
-    bind_strategy: AfXdpBindStrategy,
-    flags: u16,
+    bind_flags: u16,
     poll_mode: crate::PollMode,
     pre_bind_fill_offsets: Option<&[u64]>,
 ) -> Result<
     (
         User,
-        xdpilone::RingRx,
-        xdpilone::RingTx,
+        RingRx,
+        RingTx,
         XskBindMode,
-        AfXdpBindStrategy,
-        xdpilone::DeviceQueue,
+        DeviceQueue,
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let (device, user, rx, tx, bind_mode) = if bind_strategy.uses_umem_owner_socket() {
-        let sock = Socket::with_shared(info, worker_umem.umem())
-            .map_err(|e| format!("create shared socket: {e}"))?;
-        let mut device = worker_umem
-            .umem()
-            .fq_cq(&sock)
-            .map_err(|e| format!("create fq/cq: {e}"))?;
-        let (user, rx, tx, _requested_mode) =
-            open_user_rings(worker_umem.umem(), &sock, ring_entries, flags)?;
-        // Prime the fill ring BEFORE bind. The mlx5 driver runs NAPI
-        // during channel activation (triggered by bind). If the fill ring
-        // is empty at that point, xsk_buff_alloc_batch fails and the
-        // driver never retries — leaving the hardware RQ with zero WQEs.
-        // By priming first, the initial NAPI posts the WQEs immediately.
-        if let Some(offsets) = pre_bind_fill_offsets {
-            prime_fill_ring_offsets(&mut device, offsets)?;
-        }
-        let bind_mode = bind_user_rings(
-            worker_umem.umem(),
-            &device,
-            &user,
-            bind_strategy,
-            poll_mode,
-        )?;
-        (device, user, rx, tx, bind_mode)
-    } else {
-        let owner_sock = Socket::new(info).map_err(|e| format!("create owner socket: {e}"))?;
-        let mut device = worker_umem
-            .umem()
-            .fq_cq(&owner_sock)
-            .map_err(|e| format!("create fq/cq: {e}"))?;
-        let user_sock = Socket::new(info).map_err(|e| format!("create user socket: {e}"))?;
-        let (user, rx, tx, _requested_mode) =
-            open_user_rings(worker_umem.umem(), &user_sock, ring_entries, flags)?;
-        if let Some(offsets) = pre_bind_fill_offsets {
-            prime_fill_ring_offsets(&mut device, offsets)?;
-        }
-        let bind_mode = bind_user_rings(
-            worker_umem.umem(),
-            &device,
-            &user,
-            bind_strategy,
-            poll_mode,
-        )?;
-        (device, user, rx, tx, bind_mode)
-    };
-    Ok((user, rx, tx, bind_mode, bind_strategy, device))
-}
+    for attempt in 0..BIND_RETRY_ATTEMPTS {
+        match xsk_ffi::create_xsk_binding(worker_umem.umem(), info, ring_entries, bind_flags) {
+            Ok((user, rx, tx, mut device)) => {
+                let user_fd = user.as_raw_fd();
 
-fn open_user_rings(
-    umem: &Umem,
-    sock: &Socket,
-    ring_entries: u32,
-    bind_flags: u16,
-) -> Result<
-    (User, xdpilone::RingRx, xdpilone::RingTx, XskBindMode),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    let user = umem
-        .rx_tx(
-            sock,
-            &SocketConfig {
-                rx_size: NonZeroU32::new(ring_entries),
-                tx_size: NonZeroU32::new(ring_entries),
-                bind_flags,
-            },
-        )
-        .map_err(|e| format!("configure rx/tx rings: {e}"))?;
-    let rx = user.map_rx().map_err(|e| format!("map rx ring: {e}"))?;
-    let tx = user.map_tx().map_err(|e| format!("map tx ring: {e}"))?;
-    let bind_mode = if (bind_flags & SocketConfig::XDP_BIND_ZEROCOPY) != 0 {
-        XskBindMode::ZeroCopy
-    } else {
-        XskBindMode::Copy
-    };
-    Ok((user, rx, tx, bind_mode))
+                // Prime the fill ring AFTER bind — libxdp already binds
+                // the socket during create_shared. Post-bind fill ring
+                // priming triggers NAPI to consume entries and post WQEs.
+                if let Some(offsets) = pre_bind_fill_offsets {
+                    prime_fill_ring_offsets(&mut device, offsets)?;
+                }
+
+                let bind_mode = query_bound_xsk_mode(user_fd)
+                    .unwrap_or(XskBindMode::Copy);
+                set_busy_poll_opts(user_fd, poll_mode);
+                eprintln!(
+                    "bpfrx-userspace-dp: libxdp bind(fd={}) OK on attempt {} mode={:?} flags=0x{:04x}",
+                    user_fd, attempt, bind_mode, bind_flags,
+                );
+
+                return Ok((user, rx, tx, bind_mode, device));
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                if attempt + 1 < BIND_RETRY_ATTEMPTS && msg.contains("Device or resource busy") {
+                    thread::sleep(BIND_RETRY_DELAY);
+                    continue;
+                }
+                return Err(format!(
+                    "libxdp xsk_socket__create_shared(flags=0x{:04x}): {msg}",
+                    bind_flags,
+                ).into());
+            }
+        }
+    }
+    Err(format!(
+        "libxdp bind: exhausted {} retries with flags=0x{:04x}",
+        BIND_RETRY_ATTEMPTS, bind_flags,
+    ).into())
 }
 
 fn query_bound_xsk_mode(fd: c_int) -> Option<XskBindMode> {
@@ -353,82 +322,13 @@ fn query_bound_xsk_mode(fd: c_int) -> Option<XskBindMode> {
     })
 }
 
-#[allow(dead_code)]
-fn bind_user_with_retry(
-    umem: &Umem,
-    user: &User,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    for attempt in 0..BIND_RETRY_ATTEMPTS {
-        match umem.bind(user) {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                let msg = err.to_string();
-                if attempt + 1 < BIND_RETRY_ATTEMPTS && msg.contains("Device or resource busy") {
-                    thread::sleep(BIND_RETRY_DELAY);
-                    continue;
-                }
-                return Err(format!("bind AF_XDP socket: {msg}").into());
-            }
-        }
-    }
-    Err("bind AF_XDP socket: exhausted retries".into())
-}
-
-fn bind_user_rings(
-    umem: &Umem,
-    device: &xdpilone::DeviceQueue,
-    user: &User,
-    bind_strategy: AfXdpBindStrategy,
-    poll_mode: crate::PollMode,
-) -> Result<XskBindMode, Box<dyn std::error::Error + Send + Sync>> {
-    let user_fd = user.as_raw_fd();
-    let binder = binder_for_strategy(bind_strategy);
-    for attempt in 0..BIND_RETRY_ATTEMPTS {
-        let bind_result = match binder {
-            AfXdpBinder::Umem => umem.bind(user),
-            AfXdpBinder::DeviceQueue => device.bind(user),
-        };
-        match bind_result {
-            Ok(()) => {
-                let bind_mode = query_bound_xsk_mode(user_fd).unwrap_or(XskBindMode::Copy);
-                set_busy_poll_opts(user_fd, poll_mode);
-                eprintln!(
-                    "bpfrx-userspace-dp: umem.bind(fd={}) OK on attempt {} mode={:?} strategy={}",
-                    user_fd,
-                    attempt,
-                    bind_mode,
-                    bind_strategy.describe(),
-                );
-                return Ok(bind_mode);
-            }
-            Err(err) => {
-                let msg = err.to_string();
-                if attempt + 1 < BIND_RETRY_ATTEMPTS && msg.contains("Device or resource busy") {
-                    thread::sleep(BIND_RETRY_DELAY);
-                    continue;
-                }
-                let binder_name = match binder {
-                    AfXdpBinder::Umem => "umem.bind(umem-owner)",
-                    AfXdpBinder::DeviceQueue => "device.bind(separate-owner)",
-                };
-                return Err(format!("bind AF_XDP socket via {binder_name}: {msg}").into());
-            }
-        }
-    }
-    let binder_name = match binder {
-        AfXdpBinder::Umem => "umem.bind(umem-owner)",
-        AfXdpBinder::DeviceQueue => "device.bind(separate-owner)",
-    };
-    Err(format!("bind AF_XDP socket via {binder_name}: exhausted retries").into())
-}
-
 fn set_busy_poll_opts(fd: c_int, poll_mode: crate::PollMode) {
     const SO_BUSY_POLL: c_int = 46;
     const SO_PREFER_BUSY_POLL: c_int = 69;
     const SO_BUSY_POLL_BUDGET: c_int = 70;
-    // Use 1µs timeout: just enough to trigger one napi_busy_loop() cycle
-    // per poll() call, which posts fill ring WQEs. The 50µs value caused
-    // 15% CPU overhead from spin-waiting. 1µs triggers NAPI and returns
+    // Use 1us timeout: just enough to trigger one napi_busy_loop() cycle
+    // per poll() call, which posts fill ring WQEs. The 50us value caused
+    // 15% CPU overhead from spin-waiting. 1us triggers NAPI and returns
     // immediately, bootstrapping the fill ring with negligible overhead.
     let busy_poll_us: c_int = if poll_mode == crate::PollMode::Interrupt { 1 } else { 50 };
     let prefer: c_int = 1;

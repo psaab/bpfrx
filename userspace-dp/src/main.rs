@@ -10,6 +10,8 @@ mod screen;
 mod session;
 mod slowpath;
 mod state_writer;
+#[allow(dead_code)]
+mod xsk_ffi;
 
 use afxdp::SyncedSessionEntry;
 use chrono::{DateTime, Utc};

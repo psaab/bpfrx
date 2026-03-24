@@ -33,8 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use xdpilone::xdp::XdpDesc;
-use xdpilone::{BufIdx, SocketConfig, Umem, UmemConfig, User};
+use crate::xsk_ffi::xdp::XdpDesc;
+use crate::xsk_ffi::{BufIdx, SocketConfig, Umem, UmemConfig, User};
 
 const USERSPACE_SESSION_ACTION_REDIRECT: u8 = 1;
 const USERSPACE_SESSION_ACTION_PASS_TO_KERNEL: u8 = 2;
@@ -67,7 +67,7 @@ mod tx;
 use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
     AfXdpBindStrategy, binding_frame_count, ifinfo_from_binding, interface_driver_name,
-    open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets,
+    open_binding_worker_rings, preferred_bind_strategy,
     reserved_tx_frames, umem_ring_size,
 };
 #[cfg(test)]
@@ -1930,9 +1930,9 @@ struct BindingWorker {
     live: Arc<BindingLiveState>,
     #[allow(dead_code)]
     user: User,
-    device: xdpilone::DeviceQueue,
-    rx: xdpilone::RingRx,
-    tx: xdpilone::RingTx,
+    device: crate::xsk_ffi::DeviceQueue,
+    rx: crate::xsk_ffi::RingRx,
+    tx: crate::xsk_ffi::RingTx,
     free_tx_frames: VecDeque<u64>,
     pending_tx_prepared: VecDeque<PreparedTxRequest>,
     pending_tx_local: VecDeque<TxRequest>,
@@ -1979,7 +1979,7 @@ struct BindingWorker {
     dbg_sendto_enobufs: u64,     // sendto returned ENOBUFS (kernel TX drop)
     dbg_pending_overflow: u64,   // drops from bound_pending overflow
     dbg_tx_tcp_rst: u64,         // TCP RST packets transmitted
-    // Ring diagnostics — raw values from xdpilone API
+    // Ring diagnostics — raw values from xsk_ffi API
     dbg_rx_avail_nonzero: u64,     // times rx.available() > 0
     dbg_rx_avail_max: u32,         // max rx.available() seen this interval
     dbg_fill_pending: u32,         // fill ring: userspace produced - kernel consumed
@@ -5925,7 +5925,7 @@ fn worker_loop(
                             let _ = write!(binding_summary, " SO_ERR={so_err}");
                         }
                     }
-                    // Ring diagnostics from xdpilone API
+                    // Ring diagnostics from xsk_ffi API
                     if cfg!(feature = "debug-log") {
                         let _ = write!(
                             binding_summary,
