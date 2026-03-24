@@ -612,8 +612,27 @@ impl RingRx {
         }
     }
 
-    /// Advisory count of available RX descriptors (relaxed).
-    pub fn available(&self) -> u32 {
+    /// Count of available RX descriptors using the same cached ring state
+    /// that `receive`/`peek` uses internally (`xsk_cons_nb_avail`).
+    ///
+    /// Previous implementation read raw `*producer` / `*consumer` mmap
+    /// pointers via relaxed atomics — a different code-path from the
+    /// `cached_prod` / `cached_cons` state that `xsk_ring_cons__peek`
+    /// maintains.  If `cached_prod` had not yet been refreshed (still 0
+    /// from initialisation), `peek(n)` would load `*producer`, see the
+    /// new value, and return entries — but the separate `available()`
+    /// read could race or disagree with that cached state.
+    ///
+    /// By calling `xsk_cons_nb_avail` (the exact helper `peek` calls
+    /// first), `available()` now refreshes `cached_prod` on the same
+    /// struct the next `peek` will use, keeping them in sync.
+    pub fn available(&mut self) -> u32 {
+        unsafe { bridge_xsk_cons_nb_avail(&mut *self.ring, u32::MAX) }
+    }
+
+    /// Relaxed read of raw kernel producer/consumer pointers.
+    /// Use for diagnostics only — does NOT touch cached ring state.
+    pub fn available_relaxed(&self) -> u32 {
         let prod = unsafe { bridge_xsk_ring_cons_producer(&*self.ring) };
         let cons = unsafe { bridge_xsk_ring_cons_consumer(&*self.ring) };
         prod.wrapping_sub(cons)
@@ -933,6 +952,27 @@ pub fn create_xsk_binding(
     }
 
     let fd = unsafe { bridge_xsk_socket_fd(xsk_ptr) };
+
+    // Diagnostic: verify ring structs were populated by create_shared.
+    // If any pointer is null or size/mask is 0, the ring wasn't initialised.
+    eprintln!(
+        "bpfrx-xsk-ffi: create_xsk_binding fd={} rx_ring=[mask={:#x} size={} \
+         producer={:?} consumer={:?} ring={:?} flags={:?} cached_prod={} cached_cons={}] \
+         fill_ring=[mask={:#x} size={} cached_prod={} cached_cons={}]",
+        fd,
+        rx_ring.mask,
+        rx_ring.size,
+        rx_ring.producer,
+        rx_ring.consumer,
+        rx_ring.ring,
+        rx_ring.flags,
+        rx_ring.cached_prod,
+        rx_ring.cached_cons,
+        fill_ring.mask,
+        fill_ring.size,
+        fill_ring.cached_prod,
+        fill_ring.cached_cons,
+    );
 
     let user = User { fd };
 

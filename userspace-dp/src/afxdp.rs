@@ -5838,7 +5838,7 @@ fn worker_loop(
                 for (i, b) in bindings.iter().enumerate() {
                     use std::fmt::Write;
                     let fill_pending = b.device.pending();
-                    let rx_avail = b.rx.available();
+                    let rx_avail = b.rx.available_relaxed();
                     let xsk_stats = b.device.statistics_v2().ok();
                     let inflight_recycles = b.in_flight_prepared_recycles.len() as u32;
                     let scratch_recycle_len = b.scratch_recycle.len() as u32;
@@ -6106,7 +6106,7 @@ fn worker_loop(
                         for (si, sb) in bindings.iter().enumerate() {
                             use std::fmt::Write;
                             let fill_p = sb.device.pending();
-                            let rx_a = sb.rx.available();
+                            let rx_a = sb.rx.available_relaxed();
                             let ifl = sb.in_flight_prepared_recycles.len() as u32;
                             let ptxp = sb.pending_tx_prepared.len() as u32;
                             let ptxl = sb.pending_tx_local.len() as u32;
