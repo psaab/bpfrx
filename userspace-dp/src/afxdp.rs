@@ -2221,7 +2221,7 @@ impl BindingWorker {
         live: Arc<BindingLiveState>,
         bind_strategy: AfXdpBindStrategy,
         poll_mode: crate::PollMode,
-        mut worker_umem: WorkerUmem,
+        worker_umem: WorkerUmem,
         frame_pool: &mut VecDeque<u64>,
         shared_umem: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -2256,7 +2256,7 @@ impl BindingWorker {
         let info = ifinfo_from_binding(binding)?;
         let (user, rx, tx, bind_mode, actual_bind_strategy, mut device) =
             open_binding_worker_rings(
-                &mut worker_umem,
+                &worker_umem,
                 &info,
                 ring_entries,
                 bind_strategy,
@@ -2396,12 +2396,6 @@ struct WorkerUmemInner {
     total_frames: u32,
 }
 
-impl WorkerUmemInner {
-    fn umem_mut(&mut self) -> &mut Umem {
-        &mut self.umem
-    }
-}
-
 #[derive(Clone)]
 struct WorkerUmem {
     inner: Rc<WorkerUmemInner>,
@@ -2435,11 +2429,6 @@ impl WorkerUmem {
 
     fn umem(&self) -> &Umem {
         &self.inner.umem
-    }
-
-    fn umem_mut(&mut self) -> &mut Umem {
-        // Safety: Rc is single-owner (never cloned) within a single worker
-        Rc::get_mut(&mut self.inner).expect("umem_mut: single owner").umem_mut()
     }
 
     fn total_frames(&self) -> u32 {

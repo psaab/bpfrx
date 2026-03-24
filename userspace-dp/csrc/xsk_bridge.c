@@ -73,12 +73,9 @@ int bridge_xsk_socket_create(
         .xdp_flags    = xdp_flags,
         .bind_flags   = bind_flags,
     };
-    (void)fill;
-    (void)comp;
-    /* Use non-shared create — it uses the umem's fill/comp rings
-     * directly. create_shared allocates separate per-socket rings
-     * which may not be properly connected on some kernel/driver combos. */
-    return xsk_socket__create(xsk_out, ifname, queue_id, umem, rx, tx, &cfg);
+    return xsk_socket__create_shared(
+        xsk_out, ifname, queue_id, umem,
+        rx, tx, fill, comp, &cfg);
 }
 
 void bridge_xsk_socket_delete(struct xsk_socket *xsk)
