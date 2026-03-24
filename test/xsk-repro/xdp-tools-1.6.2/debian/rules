@@ -1,0 +1,29 @@
+#!/usr/bin/make -f
+
+include /usr/share/dpkg/default.mk
+include /usr/share/debhelper/dh_package_notes/package-notes.mk
+
+export DEB_BUILD_MAINT_OPTIONS=hardening=+all
+export PREFIX=/usr
+export LIBDIR=/usr/lib/$(DEB_HOST_MULTIARCH)
+export FORCE_SYSTEM_LIBBPF=1
+export PRODUCTION=1
+# For asm/types.h
+export BPF_CFLAGS=-Wno-visibility -I/usr/include/$(DEB_HOST_MULTIARCH)
+# Workaround for LP: #2103416
+export BPF_CFLAGS+=-Wno-unused-command-line-argument
+ifneq (,$(filter $(DEB_HOST_MULTIARCH), mips64el-linux-gnuabi64 mipsel-linux-gnu))
+export BPF_CFLAGS+= -D__MIPSEL__=1
+endif
+
+ifneq (,$(findstring terse,$(DEB_BUILD_OPTIONS)))
+export VERBOSE=0
+else
+export VERBOSE=1
+endif
+
+%:
+	dh $@
+
+# Tests require root and break the testbed
+override_dh_auto_test:

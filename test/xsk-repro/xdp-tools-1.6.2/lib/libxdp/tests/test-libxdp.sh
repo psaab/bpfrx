@@ -1,0 +1,157 @@
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-2-Clause)
+
+ALL_TESTS="test_link_so test_link_a test_old_dispatcher test_xdp_devbound test_xdp_frags test_xsk_prog_refcnt_bpffs test_xsk_prog_refcnt_legacy test_xsk_non_privileged test_link_detach test_xsk_umem_flags"
+
+TESTS_DIR=$(dirname "${BASH_SOURCE[0]}")
+
+skip_if_missing_libxdp_compat()
+{
+    if ! $TESTS_DIR/check_kern_compat; then
+        exit "$SKIPPED_TEST"
+    fi
+}
+
+test_link_so()
+{
+        [ -n "${CC:-}" ] || return $SKIPPED_TEST
+
+        TMPDIR=$(mktemp --tmpdir -d libxdp-test.XXXXXX)
+        cat >$TMPDIR/libxdptest.c <<EOF
+#include <xdp/libxdp.h>
+int main(int argc, char **argv) {
+    (void) argc; (void) argv;
+    (void) xdp_program__open_file("filename", "section_name", NULL);
+    return 0;
+}
+EOF
+        $CC -o $TMPDIR/libxdptest $TMPDIR/libxdptest.c $CFLAGS $CPPFLAGS -lxdp $LDLIBS 2>&1
+        retval=$?
+        rm -rf "$TMPDIR"
+        return $retval
+}
+
+test_link_a()
+{
+        [ -n "${CC:-}" ] || return $SKIPPED_TEST
+
+        TMPDIR=$(mktemp --tmpdir -d libxdp-test.XXXXXX)
+        cat >$TMPDIR/libxdptest.c <<EOF
+#include <xdp/libxdp.h>
+int main(int argc, char **argv) {
+    (void) argc; (void) argv;
+    (void) xdp_program__open_file("filename", "section_name", NULL);
+    return 0;
+}
+EOF
+        $CC -o $TMPDIR/libxdptest $TMPDIR/libxdptest.c $CFLAGS $CPPFLAGS -l:libxdp.a $LDLIBS 2>&1
+        retval=$?
+        rm -rf "$TMPDIR"
+        return $retval
+}
+
+test_refcnt_once()
+{
+	# We need multiple queues for this test
+	NUM_QUEUES_REQUIRED=3
+        ip link add xsk_veth0 numrxqueues $NUM_QUEUES_REQUIRED type veth peer name xsk_veth1
+        check_run $TESTS_DIR/test_xsk_refcnt xsk_veth0 2>&1
+        ip link delete xsk_veth0
+}
+
+check_mount_bpffs()
+{
+	mount | grep -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf/ || echo "Unable to mount /sys/fs/bpf"
+	mount | grep -q /sys/fs/bpf
+}
+
+check_unmount_bpffs()
+{
+	while mount | grep -q /sys/fs/bpf; do
+            umount /sys/fs/bpf/ || break
+        done
+	! mount | grep -q /sys/fs/bpf
+}
+
+test_xsk_prog_refcnt_bpffs()
+{
+	check_mount_bpffs && test_refcnt_once "$@"
+}
+
+test_xsk_prog_refcnt_legacy()
+{
+	check_unmount_bpffs && test_refcnt_once "$@"
+}
+
+test_xdp_frags()
+{
+        check_mount_bpffs || return 1
+        skip_if_missing_libxdp_compat
+
+        ip link add xdp_veth_big0 mtu 5000 type veth peer name xdp_veth_big1 mtu 5000
+        ip link add xdp_veth_small0 type veth peer name xdp_veth_small1
+        check_run $TESTS_DIR/test_xdp_frags xdp_veth_big0 xdp_veth_small0 2>&1
+        ip link delete xdp_veth_big0
+        ip link delete xdp_veth_small0
+}
+
+test_xdp_devbound()
+{
+	check_mount_bpffs || return 1
+	skip_if_missing_libxdp_compat
+
+	ip link add xdp_veth0 type veth peer name xdp_veth1
+	ip link add xdp_veth2 type veth peer name xdp_veth3
+	check_run $TESTS_DIR/test_xdp_devbound xdp_veth1 xdp_veth3 2>&1
+	ip link delete xdp_veth0
+	ip link delete xdp_veth2
+}
+
+test_old_dispatcher()
+{
+        check_mount_bpffs || return 1
+        skip_if_missing_libxdp_compat
+
+        export LIBXDP_OBJECT_PATH=$TESTS_DIR
+
+        ip link add xdp_veth0 type veth peer name xdp_veth1
+        check_run $TESTS_DIR/test_dispatcher_versions xdp_veth0
+        ip link delete xdp_veth0
+}
+
+test_xsk_non_privileged()
+{
+	if test ! -f $TESTS_DIR/test_xsk_non_privileged; then
+		exit "$SKIPPED_TEST"
+	fi
+
+	ip link add xdp_veth0 type veth peer name xdp_veth1
+	check_run $TESTS_DIR/test_xsk_non_privileged xdp_veth0 xdp_veth1
+	ip link delete xdp_veth0
+}
+
+test_link_detach()
+{
+        if test ! -f $TESTS_DIR/test_link_detach; then
+		exit "$SKIPPED_TEST"
+	fi
+        export LIBXDP_OBJECT_PATH=$TESTS_DIR
+
+	ip link add xdp_veth0 type veth peer name xdp_veth1
+	check_run $TESTS_DIR/test_link_detach xdp_veth0
+	ip link delete xdp_veth0
+}
+
+test_xsk_umem_flags()
+{
+	ip link add xdp_veth0 type veth peer name xdp_veth1
+	check_run $TESTS_DIR/test_xsk_umem_flags xdp_veth0
+	ip link delete xdp_veth0
+}
+
+cleanup_tests()
+{
+    ip link del dev xdp_veth_big0 >/dev/null 2>&1
+    ip link del dev xdp_veth_small0 >/dev/null 2>&1
+    ip link del dev xsk_veth0 >/dev/null 2>&1
+    ip link del dev xdp_veth0 >/dev/null 2>&1
+}

@@ -1,0 +1,56 @@
+Source: xdp-tools
+Section: devel
+Maintainer: Luca Boccassi <bluca@debian.org>
+Build-Depends: bpftool (>= 7.5.0~),
+               clang,
+               debhelper-compat (= 13),
+               dh-package-notes,
+               libbpf-dev,
+               libelf-dev,
+               libpcap-dev,
+               llvm,
+               pkgconf,
+               zlib1g-dev,
+Standards-Version: 4.7.3
+Homepage: https://github.com/xdp-project/xdp-tools
+Vcs-Browser: https://salsa.debian.org/debian/xdp-tools
+Vcs-Git: https://salsa.debian.org/debian/xdp-tools.git
+
+Package: libxdp1
+Section: libs
+Architecture: linux-any
+Multi-Arch: same
+Depends: ${misc:Depends}, ${shlibs:Depends},
+Pre-Depends: ${misc:Pre-Depends}
+Description: library and utilities for use with XDP - shared library
+ Library for working with the eXpress Data Path facility of the Linux kernel,
+ and a collection of utilities and example code that uses the library.
+
+Package: libxdp-dev
+Section: libdevel
+Architecture: linux-any
+Multi-Arch: same
+Depends: libxdp1 (= ${binary:Version}), ${misc:Depends}, libbpf-dev,
+Description: library and utilities for use with XDP - development files
+ Library for working with the eXpress Data Path facility of the Linux kernel,
+ and a collection of utilities and example code that uses the library.
+ .
+ This package provides the development files for libxdp1.
+
+Package: xdp-tools
+Architecture: linux-any
+Depends: libxdp1 (= ${binary:Version}), ${misc:Depends}, ${shlibs:Depends},
+Description: library and utilities for use with XDP
+ Library for working with the eXpress Data Path facility of the Linux kernel,
+ and a collection of utilities and example code that uses the library.
+ .
+ This package provides tools for the xdp ecosystem.
+
+Package: xdp-tests
+Architecture: linux-any
+Depends: xdp-tools (= ${binary:Version}), ${misc:Depends}, ${shlibs:Depends},
+Description: library and utilities for use with XDP - test scripts and programs
+ Library for working with the eXpress Data Path facility of the Linux kernel,
+ and a collection of utilities and example code that uses the library.
+ .
+ This package provides tests for the xdp tools.

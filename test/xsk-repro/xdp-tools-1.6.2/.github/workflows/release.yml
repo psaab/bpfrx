@@ -1,0 +1,32 @@
+---
+name: "tagged-release"
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  tagged-release:
+    name: "Tagged Release"
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: "Create source archive"
+        run: |
+          ./mkarchive.sh
+
+      - uses: "softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b" # v2.5.0
+        with:
+          prerelease: false
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            *.tar.gz

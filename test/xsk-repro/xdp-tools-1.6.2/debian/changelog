@@ -1,0 +1,250 @@
+xdp-tools (1.6.2-1) unstable; urgency=medium
+
+  [ Gianfranco Costamagna ]
+  * Backport new version of upstream 554.patch
+  * Another patch refresh from upstream codereview
+
+  [ Luca Boccassi ]
+  * Update upstream source from tag 'upstream/1.6.2'
+  * Drop patches, all merged upstream
+
+ -- Luca Boccassi <bluca@debian.org>  Mon, 23 Feb 2026 22:24:18 +0000
+
+xdp-tools (1.6.1-1) unstable; urgency=medium
+
+  [ Gianfranco Costamagna ]
+  * Add an upstrea-proposed patch to fix build when stringop-overread
+    gcc flag is used
+
+  [ Luca Boccassi ]
+  * Fix watch file to find release tags
+  * Update upstream source from tag 'upstream/1.6.1'
+  * Drop 0001-lib-xdpsock-fix-32bit-builds.patch, merged upstream
+  * Adjust DEP-3 header in 554.patch
+  * Add patch to fix make clean to remove all built objects (Closes:
+    #1046253)
+  * Backport patch to fix 32bit build
+  * Update d/copyright for removed files
+
+ -- Luca Boccassi <bluca@debian.org>  Wed, 18 Feb 2026 23:53:17 +0000
+
+xdp-tools (1.6.0-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/1.6.0'
+  * Drop priority from d/control, now defaults to optional
+  * Drop Rules-Requires-Root, now defaults to no
+  * Bump Standards-version to 4.7.3
+  * Backport patch to fix 32bit builds
+  * Update symbols file for 1.6.0
+
+ -- Luca Boccassi <bluca@debian.org>  Sat, 10 Jan 2026 12:13:15 +0100
+
+xdp-tools (1.5.8-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/1.5.8'
+  * Drop patches, merged upstream
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 30 Nov 2025 10:11:39 +0000
+
+xdp-tools (1.5.7-3) unstable; urgency=medium
+
+  * Backport patch to fix flaky tests
+
+ -- Luca Boccassi <bluca@debian.org>  Mon, 06 Oct 2025 16:17:27 +0100
+
+xdp-tools (1.5.7-2) unstable; urgency=medium
+
+  * autopkgtest: add dependencies for new tests
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 05 Oct 2025 22:21:47 +0100
+
+xdp-tools (1.5.7-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/1.5.7'
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 05 Oct 2025 13:40:43 +0100
+
+xdp-tools (1.5.6-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/1.5.6'
+
+ -- Luca Boccassi <bluca@debian.org>  Mon, 18 Aug 2025 11:27:47 +0100
+
+xdp-tools (1.5.5-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/1.5.5'
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 10 Aug 2025 11:42:04 +0100
+
+xdp-tools (1.5.4-1) unstable; urgency=medium
+
+  [ Frode Nordahl ]
+  * d/rules: add workaround for clang 20 issue
+
+  [ Luca Boccassi ]
+  * Update upstream source from tag 'upstream/1.5.4'
+  * d/control: bump Standards-Version to 4.7.2, no changes
+  * d/copyright: use GPL URL instead of old FSF postal address
+
+ -- Luca Boccassi <bluca@debian.org>  Wed, 30 Apr 2025 10:49:11 +0100
+
+xdp-tools (1.5.3-2) unstable; urgency=medium
+
+  * Team upload.
+  * d/control: Set minimum bpftool build dependency version.
+  * d/rules: Drop Ubuntu specific workaround for bpftool.
+
+ -- Frode Nordahl <fnordahl@ubuntu.com>  Mon, 17 Mar 2025 11:04:16 +0000
+
+xdp-tools (1.5.3-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/1.5.3'
+
+ -- Luca Boccassi <bluca@debian.org>  Tue, 11 Mar 2025 12:26:10 +0000
+
+xdp-tools (1.5.2-1) unstable; urgency=medium
+
+  * Team upload.
+
+  [ Frode Nordahl ]
+  * Update upstream source from tag 'upstream/1.5.2'
+
+  [ Sudip Mukherjee ]
+  * d/rules: Use 'find -L' to find bpftool from symlinks in Ubuntu.
+
+ -- Frode Nordahl <fnordahl@ubuntu.com>  Wed, 19 Feb 2025 12:39:58 +0000
+
+xdp-tools (1.5.1-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/1.5.1'
+  * Drop all patches, merged upstream
+
+ -- Luca Boccassi <bluca@debian.org>  Sat, 18 Jan 2025 02:29:30 +0000
+
+xdp-tools (1.5.0-2) unstable; urgency=medium
+
+  * d/t/control: add socat dependency for new tests
+  * Backport patch to fix autopkgtest
+
+ -- Luca Boccassi <bluca@debian.org>  Mon, 13 Jan 2025 22:38:59 +0000
+
+xdp-tools (1.5.0-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/1.5.0'
+  * Install new xdp-forward tool
+  * Update symbols file for 1.5.0
+  * Patch makefile to fix blhc warnings
+
+ -- Luca Boccassi <bluca@debian.org>  Mon, 13 Jan 2025 10:28:53 +0000
+
+xdp-tools (1.4.3-2) unstable; urgency=medium
+
+  * autopkgtest: add mount to the list of dependencies
+  * autopkgtest: add allow-stderr to restrictions
+
+ -- Luca Boccassi <bluca@debian.org>  Tue, 24 Dec 2024 07:57:57 +0000
+
+xdp-tools (1.4.3-1) unstable; urgency=medium
+
+  * d/rules: fix bpftool detection in Ubuntu
+  * d/rules: simply bpftool lookup in Ubuntu
+  * Update upstream source from tag 'upstream/1.4.3' (Closes: #1046253,
+    #1068532)
+  * d/control: bump Standards-Version to 4.7.0, no changes
+  * Switch to pkgconf
+
+ -- Luca Boccassi <bluca@debian.org>  Fri, 09 Aug 2024 11:04:36 +0100
+
+xdp-tools (1.4.2-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/1.4.2'
+
+ -- Luca Boccassi <bluca@debian.org>  Mon, 05 Feb 2024 21:38:35 +0000
+
+xdp-tools (1.4.0-1) unstable; urgency=medium
+
+  * Enable ELF metadata stamping
+  * d//rules: Fix discovery of real bpftool binary for Ubuntu
+  * Update upstream source from tag 'upstream/1.4.0'
+  * Add new symbols for 1.4.0
+
+ -- Luca Boccassi <bluca@debian.org>  Sat, 08 Jul 2023 16:10:01 +0100
+
+xdp-tools (1.3.1-1) unstable; urgency=medium
+
+  * Revert "d/control: Add conditional build dep to allow building on
+    Ubuntu."
+  * Update upstream source from tag 'upstream/1.3.1'
+  * Drop libm.patch, merged upstream
+  * Upload to unstable.
+
+ -- Luca Boccassi <bluca@debian.org>  Sat, 25 Feb 2023 19:59:15 +0000
+
+xdp-tools (1.3.0-3~exp1) experimental; urgency=medium
+
+  [ Frode Nordahl ]
+  * d/control: Add conditional build dep to allow building on Ubuntu.
+  * d/rules: Conditionally set BPFTOOL variable for build.
+
+ -- Luca Boccassi <bluca@debian.org>  Tue, 21 Feb 2023 15:58:46 +0000
+
+xdp-tools (1.3.0-2) unstable; urgency=medium
+
+  * Add patch to fix build on arm/mips
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 12 Feb 2023 13:47:23 +0000
+
+xdp-tools (1.3.0-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/1.3.0'
+  * Add build dependency on bpftool
+  * Install new tools
+  * Update symbols file
+  * Drop unused Lintian override
+
+ -- Luca Boccassi <bluca@debian.org>  Sat, 11 Feb 2023 12:29:26 +0000
+
+xdp-tools (1.2.9-2) unstable; urgency=medium
+
+  * Bump Standards-Version to 4.6.2, no changes
+  * Bump copyright year ranges in d/copyright
+  * libxdp-dev: depend on libbpf-dev for pkgconfig's Requires.private
+
+ -- Luca Boccassi <bluca@debian.org>  Fri, 13 Jan 2023 10:29:31 +0000
+
+xdp-tools (1.2.9-1) unstable; urgency=medium
+
+  * Update upstream source from tag 'upstream/1.2.9'
+
+ -- Luca Boccassi <bluca@debian.org>  Wed, 14 Dec 2022 23:17:25 +0000
+
+xdp-tools (1.2.8-1) unstable; urgency=medium
+
+  * d/watch: use api.github.com
+  * Update upstream source from tag 'upstream/1.2.8'
+
+ -- Luca Boccassi <bluca@debian.org>  Sat, 12 Nov 2022 00:21:06 +0000
+
+xdp-tools (1.2.6-2) unstable; urgency=medium
+
+  * Do not build-depend on gcc-multilib and instead export
+    -I/usr/include/<multiarch> for asm/types.h
+  * Export __MIPSEL__=1 to Clang on mipsel*
+
+ -- Luca Boccassi <bluca@debian.org>  Sat, 20 Aug 2022 16:17:21 +0100
+
+xdp-tools (1.2.6-1) unstable; urgency=medium
+
+  * Do not depend on gcc-multilib on architectures where it's not
+    available
+  * d/copyright: rearrange stanzas
+  * Update upstream source from tag 'upstream/1.2.6'
+  * Drop patches, all merged upstream
+
+ -- Luca Boccassi <bluca@debian.org>  Sat, 20 Aug 2022 02:55:59 +0100
+
+xdp-tools (1.2.5-1) unstable; urgency=medium
+
+  * Initial release. (Closes: #1015880)
+
+ -- Luca Boccassi <bluca@debian.org>  Sun, 24 Jul 2022 22:45:17 +0100

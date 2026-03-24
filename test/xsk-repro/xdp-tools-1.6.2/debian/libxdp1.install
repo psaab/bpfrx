@@ -1,0 +1,2 @@
+usr/lib/*/bpf/
+usr/lib/*/lib*.so.*

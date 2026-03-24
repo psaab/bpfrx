@@ -1,0 +1,2 @@
+xdp-tests: binary-from-other-architecture [usr/libexec/xdp-tools/*.o]
+xdp-tests: executable-not-elf-or-script

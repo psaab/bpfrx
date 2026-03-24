@@ -2686,29 +2686,13 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		} else if m.xskLivenessProven {
 			// XSK proven working — keep ctrl enabled.
 			ctrl.Enabled = 1
-		} else if allBindingsReady && neighborGenOK &&
-			!m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt.Add(30*time.Second)) {
-			// Probe: enable ctrl + swap to XDP shim to test XSK.
-			// Delayed 30s past the hard timeout to ensure the cluster
-			// has settled (RETH MACs programmed, VRRP elections done,
-			// VIPs assigned) — no more link cycles expected.
-			if m.xskProbeStart.IsZero() {
-				m.xskProbeStart = time.Now()
-				ctrl.Enabled = 1
-				slog.Info("userspace: starting XSK liveness probe (ctrl=1)")
-				_ = m.inner.SwapXDPEntryProg("xdp_userspace_prog")
-			} else if xskReceiveLive {
-				m.xskLivenessProven = true
-				ctrl.Enabled = 1
-				slog.Info("userspace: XSK liveness probe PASSED, userspace dataplane active")
-			} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
-				m.xskLivenessFailed = true
-				ctrl.Enabled = 0
-				slog.Warn("userspace: XSK liveness probe FAILED, using eBPF pipeline")
-				_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
-			} else {
-				ctrl.Enabled = 1
-			}
+		} else if allBindingsReady && neighborGenOK {
+			// XSK probe disabled: mlx5 zero-copy UMEM segfaults on link
+			// DOWN/UP. The libxdp FFI is correct (C test rx=29) but
+			// workers access UMEM during link cycles and crash. Needs a
+			// pre-link-cycle shutdown hook before the probe can be safe.
+			// eBPF pipeline handles traffic at 20+ Gbps.
+			ctrl.Enabled = 0
 		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt) {
 			// Hard timeout: enable even if not all readiness gates met.
 			ctrl.Enabled = 1
@@ -4275,6 +4259,14 @@ func (m *Manager) NotifyLinkCycle() {
 	defer m.mu.Unlock()
 	if m.proc == nil || m.proc.Process == nil {
 		return
+	}
+	// CRITICAL: disable ctrl FIRST so the XDP shim stops redirecting
+	// to XSK. Workers may still be accessing UMEM frames that the NIC
+	// is about to unmap during link DOWN. With ctrl=0, no new packets
+	// enter the XSK path, and workers drain safely.
+	m.disableUserspaceCtrlLocked()
+	if m.inner.XDPEntryProg != "xdp_main_prog" {
+		_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
 	}
 	// Let the NIC reinitialize after link UP before recreating XSK sockets.
 	m.mu.Unlock()

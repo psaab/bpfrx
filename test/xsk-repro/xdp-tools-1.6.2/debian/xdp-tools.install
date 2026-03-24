@@ -1,0 +1,7 @@
+usr/sbin/xdp-bench
+usr/sbin/xdp-filter
+usr/sbin/xdp-forward
+usr/sbin/xdp-loader
+usr/sbin/xdp-monitor
+usr/sbin/xdp-trafficgen
+usr/sbin/xdpdump
