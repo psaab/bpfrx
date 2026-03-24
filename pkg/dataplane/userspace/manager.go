@@ -125,9 +125,10 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		m.inner.XDPEntryProg = "xdp_main_prog"
 	} else if m.xskLivenessProven {
 		m.inner.XDPEntryProg = "xdp_userspace_prog"
+	} else if !m.xskProbeStart.IsZero() {
+		// Probe in progress — keep shim attached.
+		m.inner.XDPEntryProg = "xdp_userspace_prog"
 	} else {
-		// Default: eBPF pipeline. XSK probe disabled until libxdp
-		// FFI fill ring management is validated end-to-end.
 		m.inner.XDPEntryProg = "xdp_main_prog"
 	}
 	result, err := m.inner.Compile(cfg)
@@ -2686,10 +2687,26 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			// XSK proven working — keep ctrl enabled.
 			ctrl.Enabled = 1
 		} else if allBindingsReady && neighborGenOK {
-			// XSK probe disabled — libxdp FFI fill ring management
-			// needs validation before enabling the userspace path.
-			// Use eBPF pipeline (xdp_main_prog) for reliable forwarding.
-			ctrl.Enabled = 0
+			// Probe: temporarily enable ctrl + swap to XDP shim to test
+			// if XSK can sustain forwarding. If rx increases within 10s,
+			// keep the shim permanently. Otherwise revert to eBPF pipeline.
+			if m.xskProbeStart.IsZero() {
+				m.xskProbeStart = time.Now()
+				ctrl.Enabled = 1
+				slog.Info("userspace: starting XSK liveness probe (ctrl=1)")
+				_ = m.inner.SwapXDPEntryProg("xdp_userspace_prog")
+			} else if xskReceiveLive {
+				m.xskLivenessProven = true
+				ctrl.Enabled = 1
+				slog.Info("userspace: XSK liveness probe PASSED, userspace dataplane active")
+			} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
+				m.xskLivenessFailed = true
+				ctrl.Enabled = 0
+				slog.Warn("userspace: XSK liveness probe FAILED after 10s, using eBPF pipeline")
+				_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
+			} else {
+				ctrl.Enabled = 1
+			}
 		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt) {
 			// Hard timeout: enable even if not all readiness gates met.
 			ctrl.Enabled = 1

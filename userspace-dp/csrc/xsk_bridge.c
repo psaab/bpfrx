@@ -103,6 +103,11 @@ void bridge_xsk_ring_prod_submit(struct xsk_ring_prod *ring, __u32 nb)
     xsk_ring_prod__submit(ring, nb);
 }
 
+void bridge_xsk_ring_prod_cancel(struct xsk_ring_prod *ring, __u32 nb)
+{
+    ring->cached_prod -= nb;
+}
+
 int bridge_xsk_ring_prod_needs_wakeup(const struct xsk_ring_prod *ring)
 {
     return xsk_ring_prod__needs_wakeup(ring);

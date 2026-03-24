@@ -94,6 +94,7 @@ unsafe extern "C" {
         idx_out: *mut u32,
     ) -> u32;
     fn bridge_xsk_ring_prod_submit(ring: *mut XskRingProd, nb: u32);
+    fn bridge_xsk_ring_prod_cancel(ring: *mut XskRingProd, nb: u32);
     fn bridge_xsk_ring_prod_needs_wakeup(ring: *const XskRingProd) -> c_int;
     fn bridge_xsk_fill_addr_set(fill: *mut XskRingProd, idx: u32, addr: u64);
     fn bridge_xsk_tx_desc_set(
@@ -432,6 +433,38 @@ impl std::os::fd::AsRawFd for User {
     }
 }
 
+// ── Partial-reservation helper ───────────────────────────────────────
+//
+// libxdp's `xsk_ring_prod__reserve(ring, n, idx)` is **all-or-nothing**:
+// it returns `n` when `free >= n`, otherwise 0.  xdpilone accepted a
+// *range* `1..=n` and reserved however many slots were available (≥1).
+//
+// This helper restores partial-reservation semantics.  It queries the
+// actual free count via `xsk_prod_nb_free`, clamps it to `max`, and
+// calls reserve with the clamped value.  Because `nb_free` already
+// refreshed `cached_cons`, the subsequent `reserve(clamped)` is
+// guaranteed to succeed (no entries can become *less* free between the
+// two calls — the kernel only advances the consumer).
+
+fn reserve_up_to(ring: &mut XskRingProd, max: u32, idx: &mut u32) -> u32 {
+    if max == 0 {
+        return 0;
+    }
+    // First try the fast path: ask for everything at once.
+    let reserved = unsafe { bridge_xsk_ring_prod_reserve(ring, max, idx) };
+    if reserved > 0 {
+        return reserved;
+    }
+    // All-or-nothing failed.  Query actual free count (this refreshes
+    // the cached consumer from the kernel side) and retry with that.
+    let free = unsafe { bridge_xsk_prod_nb_free(ring, max) };
+    let want = free.min(max);
+    if want == 0 {
+        return 0;
+    }
+    unsafe { bridge_xsk_ring_prod_reserve(ring, want, idx) }
+}
+
 // ── DeviceQueue ──────────────────────────────────────────────────────
 
 /// Fill/completion ring pair + the underlying libxdp socket handle.
@@ -446,10 +479,14 @@ unsafe impl Send for DeviceQueue {}
 
 impl DeviceQueue {
     /// Submit buffers to the fill ring.
+    ///
+    /// Unlike libxdp's all-or-nothing `xsk_ring_prod__reserve`, this
+    /// accepts a **partial** reservation (1..=max) matching xdpilone's
+    /// `reserve(1..=n)` semantics. Without this, `reserve(max)` returns
+    /// 0 whenever `free < max`, starving the fill ring and stalling TX.
     pub fn fill(&mut self, max: u32) -> WriteFill<'_> {
         let mut idx: u32 = 0;
-        let reserved =
-            unsafe { bridge_xsk_ring_prod_reserve(&mut *self.fill, max, &mut idx) };
+        let reserved = reserve_up_to(&mut *self.fill, max, &mut idx);
         WriteFill {
             ring: &mut *self.fill,
             base_idx: idx,
@@ -609,10 +646,12 @@ unsafe impl Send for RingTx {}
 
 impl RingTx {
     /// Reserve slots and begin transmitting up to `n` descriptors.
+    ///
+    /// Uses partial-reservation semantics (1..=n) to match xdpilone.
+    /// See [`DeviceQueue::fill`] for rationale.
     pub fn transmit(&mut self, n: u32) -> WriteTx<'_> {
         let mut idx: u32 = 0;
-        let reserved =
-            unsafe { bridge_xsk_ring_prod_reserve(&mut *self.ring, n, &mut idx) };
+        let reserved = reserve_up_to(&mut *self.ring, n, &mut idx);
         WriteTx {
             ring: &mut *self.ring,
             base_idx: idx,
@@ -678,9 +717,15 @@ impl ReadRx<'_> {
 
 impl Drop for ReadRx<'_> {
     fn drop(&mut self) {
+        let ring_ptr = self.ring as *const XskRingCons as *mut XskRingCons;
         if !self.released && self.read_count > 0 {
-            let ring_ptr = self.ring as *const XskRingCons as *mut XskRingCons;
             unsafe { bridge_xsk_ring_cons_release(ring_ptr, self.read_count) };
+        }
+        // Cancel any peeked-but-unread entries so cached_cons doesn't
+        // drift ahead of the real consumer pointer.
+        let unreleased = self.peeked - self.read_count;
+        if unreleased > 0 {
+            unsafe { bridge_xsk_ring_cons_cancel(ring_ptr, unreleased) };
         }
     }
 }
@@ -727,12 +772,15 @@ impl WriteTx<'_> {
 
 impl Drop for WriteTx<'_> {
     fn drop(&mut self) {
-        // If we reserved but didn't commit all, the ring state is inconsistent.
-        // The original xdpilone cancels un-committed reservations on drop.
-        // We commit what was written, and the remaining reserved slots are
-        // effectively lost (same as xdpilone's cancel behavior).
+        // Submit anything written, then cancel only the *unused* part
+        // of the reservation so `cached_prod` doesn't drift ahead of
+        // the real producer — matching xdpilone's cancel-on-drop.
         if self.written > 0 {
             unsafe { bridge_xsk_ring_prod_submit(self.ring, self.written) };
+        }
+        let unused = self.reserved.saturating_sub(self.written);
+        if unused > 0 {
+            unsafe { bridge_xsk_ring_prod_cancel(self.ring, unused) };
         }
     }
 }
@@ -777,6 +825,10 @@ impl Drop for WriteFill<'_> {
         if self.written > 0 {
             unsafe { bridge_xsk_ring_prod_submit(self.ring, self.written) };
         }
+        let unused = self.reserved.saturating_sub(self.written);
+        if unused > 0 {
+            unsafe { bridge_xsk_ring_prod_cancel(self.ring, unused) };
+        }
     }
 }
 
@@ -815,6 +867,11 @@ impl Drop for ReadComplete<'_> {
     fn drop(&mut self) {
         if self.read_count > 0 {
             unsafe { bridge_xsk_ring_cons_release(self.ring, self.read_count) };
+        }
+        // Cancel peeked-but-unread entries (mirrors xdpilone cancel-on-drop).
+        let unreleased = self.peeked - self.read_count;
+        if unreleased > 0 {
+            unsafe { bridge_xsk_ring_cons_cancel(self.ring, unreleased) };
         }
     }
 }
