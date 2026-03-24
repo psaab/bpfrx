@@ -55,6 +55,7 @@ type Manager struct {
 	ctrlEnableAt        time.Time
 	ctrlWasEnabled      bool
 	xskLivenessFailed   bool
+	xskLivenessProven   bool
 	xskProbeStart       time.Time
 	lastXSKRX           uint64
 	neighborGeneration  uint64
@@ -62,7 +63,7 @@ type Manager struct {
 
 func New() *Manager {
 	inner := dataplane.New()
-	inner.XDPEntryProg = "xdp_userspace_prog"
+	inner.XDPEntryProg = "xdp_main_prog"
 	return &Manager{
 		DataPlane: inner,
 		inner:     inner,
@@ -119,12 +120,14 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		}
 	}
 	caps := deriveUserspaceCapabilities(cfg)
+	_ = caps // used below for helper config
 	if m.xskLivenessFailed {
-		// XSK receive was proven broken — stay on the eBPF pipeline.
 		m.inner.XDPEntryProg = "xdp_main_prog"
-	} else if caps.ForwardingSupported {
+	} else if m.xskLivenessProven {
 		m.inner.XDPEntryProg = "xdp_userspace_prog"
 	} else {
+		// Default: eBPF pipeline. XSK probe disabled until libxdp
+		// FFI fill ring management is validated end-to-end.
 		m.inner.XDPEntryProg = "xdp_main_prog"
 	}
 	result, err := m.inner.Compile(cfg)
@@ -2679,27 +2682,14 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		if m.xskLivenessFailed {
 			// XSK proven broken — stay on eBPF pipeline, ctrl disabled.
 			ctrl.Enabled = 0
-		} else if allBindingsReady && neighborGenOK {
-			// Optimistically enable ctrl. If XSK is working (libxdp),
-			// packets flow through the Rust helper. If broken (xdpilone),
-			// the liveness probe below detects it and swaps to eBPF.
+		} else if m.xskLivenessProven {
+			// XSK proven working — keep ctrl enabled.
 			ctrl.Enabled = 1
-			if m.xskProbeStart.IsZero() && !xskReceiveLive {
-				m.xskProbeStart = time.Now()
-				slog.Info("userspace: ctrl enabled, starting XSK liveness probe")
-			}
-			if xskReceiveLive {
-				// XSK is receiving — clear probe timer, stay enabled.
-				m.xskProbeStart = time.Time{}
-			} else if !m.xskProbeStart.IsZero() && time.Now().After(m.xskProbeStart.Add(10*time.Second)) {
-				// 10s of ctrl=1 with no XSK rx: XSK is broken.
-				m.xskLivenessFailed = true
-				ctrl.Enabled = 0
-				slog.Warn("userspace: XSK liveness probe failed after 10s, switching to eBPF pipeline")
-				if err := m.inner.SwapXDPEntryProg("xdp_main_prog"); err != nil {
-					slog.Warn("userspace: failed to swap XDP entry prog", "err", err)
-				}
-			}
+		} else if allBindingsReady && neighborGenOK {
+			// XSK probe disabled — libxdp FFI fill ring management
+			// needs validation before enabling the userspace path.
+			// Use eBPF pipeline (xdp_main_prog) for reliable forwarding.
+			ctrl.Enabled = 0
 		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt) {
 			// Hard timeout: enable even if not all readiness gates met.
 			ctrl.Enabled = 1
