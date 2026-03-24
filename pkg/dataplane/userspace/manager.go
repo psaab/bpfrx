@@ -54,6 +54,8 @@ type Manager struct {
 	neighborsPrewarmed  bool
 	ctrlEnableAt        time.Time
 	ctrlWasEnabled      bool
+	xskLivenessFailed   bool
+	lastXSKRX           uint64
 	neighborGeneration  uint64
 }
 
@@ -116,7 +118,10 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		}
 	}
 	caps := deriveUserspaceCapabilities(cfg)
-	if caps.ForwardingSupported {
+	if m.xskLivenessFailed {
+		// XSK receive was proven broken — stay on the eBPF pipeline.
+		m.inner.XDPEntryProg = "xdp_main_prog"
+	} else if caps.ForwardingSupported {
 		m.inner.XDPEntryProg = "xdp_userspace_prog"
 	} else {
 		m.inner.XDPEntryProg = "xdp_main_prog"
@@ -2651,17 +2656,30 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// Now refresh neighbors for the next cycle.
 		m.refreshNeighborSnapshotLocked()
 
-		// XSK receive liveness check: if bindings are ready but no
-		// packets have been received after 30s, the AF_XDP deliver path
-		// is broken (e.g. xdpilone + mlx5 incompatibility). Enabling
-		// ctrl in this state sends ALL transit packets into a black hole.
-		xskReceiveLive := false
+		// XSK receive liveness check: if bindings are ready but rx hasn't
+		// increased since the last check, the AF_XDP delivery path is
+		// broken (e.g. xdpilone + mlx5 incompatibility). Enabling ctrl
+		// in this state sends ALL transit packets into a black hole.
+		var currentRX uint64
 		for _, b := range status.Bindings {
-			if b.RXPackets > 0 {
-				xskReceiveLive = true
-				break
-			}
+			currentRX += b.RXPackets
 		}
+		// Delta check: XSK is live only if rx INCREASED since last check.
+		// On the first check, initialize lastXSKRX to current (no delta).
+		xskReceiveLive := false
+		if m.lastXSKRX > 0 {
+			xskReceiveLive = currentRX > m.lastXSKRX
+		}
+		m.lastXSKRX = currentRX
+		slog.Debug("userspace: ctrl gate check",
+			"allBindingsReady", allBindingsReady,
+			"neighborGenOK", neighborGenOK,
+			"xskReceiveLive", xskReceiveLive,
+			"currentRX", currentRX,
+			"lastXSKRX", m.lastXSKRX,
+			"neighborsPrewarmed", m.neighborsPrewarmed,
+			"xskLivenessFailed", m.xskLivenessFailed,
+			"xdpEntryProg", m.inner.XDPEntryProg)
 		if allBindingsReady && neighborGenOK && xskReceiveLive {
 			ctrl.Enabled = 1
 		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt) && xskReceiveLive {
@@ -2676,13 +2694,13 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			}
 		} else {
 			ctrl.Enabled = 0
-			if allBindingsReady && !xskReceiveLive && !m.ctrlEnableAt.IsZero() &&
-				time.Now().After(m.ctrlEnableAt.Add(30*time.Second)) {
-				// XSK can't receive after 30s. Swap to the eBPF pipeline
+			if allBindingsReady && !xskReceiveLive && m.neighborsPrewarmed {
+				// XSK bindings ready but no packets received. Swap to eBPF pipeline
 				// entry program so packets go through xdp_main instead
 				// of the broken XDP shim (which does XDP_PASS → no SNAT).
-				if m.inner.XDPEntryProg == "xdp_userspace_prog" {
-					slog.Warn("userspace: XSK receive not live after 30s, swapping to eBPF pipeline",
+				if !m.xskLivenessFailed {
+					m.xskLivenessFailed = true
+					slog.Warn("userspace: XSK receive not live after 30s, forcing eBPF pipeline",
 						"bindings_ready", allBindingsReady)
 					if err := m.inner.SwapXDPEntryProg("xdp_main_prog"); err != nil {
 						slog.Warn("userspace: failed to swap XDP entry prog", "err", err)
