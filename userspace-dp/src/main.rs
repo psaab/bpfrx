@@ -1593,6 +1593,31 @@ fn handle_stream(
                     guard.status.bindings.len()
                 );
             }
+            "stop_workers" => {
+                // Stop all AF_XDP workers without recreating them.
+                // Used by PrepareLinkCycle: stops workers BEFORE link
+                // DOWN/UP so they don't access DMA-mapped UMEM pages
+                // that the NIC unmaps during link cycle. The subsequent
+                // "rebind" request (sent by NotifyLinkCycle after the
+                // link is back UP) recreates workers with fresh sockets.
+                eprintln!("stop_workers: stopping all AF_XDP workers");
+                guard.afxdp.stop();
+                for binding in &mut guard.status.bindings {
+                    binding.bound = false;
+                    binding.xsk_registered = false;
+                    binding.xsk_bind_mode.clear();
+                    binding.zero_copy = false;
+                    binding.socket_fd = 0;
+                    binding.ready = false;
+                    binding.last_error.clear();
+                }
+                refresh_status(&mut guard);
+                persist_state = true;
+                eprintln!(
+                    "stop_workers: all workers stopped, bindings={}",
+                    guard.status.bindings.len()
+                );
+            }
             "shutdown" => {
                 guard.afxdp.stop();
                 running.store(false, Ordering::SeqCst);

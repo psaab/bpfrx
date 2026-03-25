@@ -1702,18 +1702,19 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			}
 		}
 		if macChangeNeeded && d.dp != nil {
-			// Disable ctrl and swap to eBPF pipeline BEFORE link cycle.
-			// This prevents the XDP shim from redirecting packets to XSK
-			// while the NIC tears down DMA-mapped UMEM pages (link DOWN
-			// on mlx5 zero-copy). Workers keep running but poll empty
-			// rings since ctrl=0 stops new redirects. NotifyLinkCycle
-			// after MAC programming will stop workers and rebind.
-			type xskDisabler interface {
-				DisableAndStopHelper()
+			// Stop XSK workers BEFORE the link cycle. PrepareLinkCycle
+			// disables ctrl, swaps to eBPF pipeline, and sends
+			// "stop_workers" to the Rust helper which joins all worker
+			// threads. No worker touches UMEM after this returns, so
+			// the NIC can safely unmap DMA pages during link DOWN.
+			// NotifyLinkCycle after MAC programming sends "rebind" to
+			// recreate workers with fresh AF_XDP sockets.
+			type linkCyclePreparer interface {
+				PrepareLinkCycle()
 			}
-			if stopper, ok := d.dp.(xskDisabler); ok {
-				slog.Info("userspace: disabling ctrl before RETH MAC programming")
-				stopper.DisableAndStopHelper()
+			if preparer, ok := d.dp.(linkCyclePreparer); ok {
+				slog.Info("userspace: stopping workers before RETH MAC programming")
+				preparer.PrepareLinkCycle()
 			}
 		}
 

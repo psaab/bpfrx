@@ -2687,12 +2687,28 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			// XSK proven working — keep ctrl enabled.
 			ctrl.Enabled = 1
 		} else if allBindingsReady && neighborGenOK {
-			// XSK probe disabled: mlx5 zero-copy UMEM segfaults on link
-			// DOWN/UP. The libxdp FFI is correct (C test rx=29) but
-			// workers access UMEM during link cycles and crash. Needs a
-			// pre-link-cycle shutdown hook before the probe can be safe.
-			// eBPF pipeline handles traffic at 20+ Gbps.
-			ctrl.Enabled = 0
+			// Probe: temporarily enable ctrl + swap to XDP shim to test
+			// if XSK can sustain forwarding. If rx increases within 10s,
+			// keep the shim permanently. Otherwise revert to eBPF pipeline.
+			// Safe because PrepareLinkCycle stops workers BEFORE any link
+			// DOWN/UP, preventing UMEM segfaults during link cycles.
+			if m.xskProbeStart.IsZero() {
+				m.xskProbeStart = time.Now()
+				ctrl.Enabled = 1
+				slog.Info("userspace: starting XSK liveness probe (ctrl=1)")
+				_ = m.inner.SwapXDPEntryProg("xdp_userspace_prog")
+			} else if xskReceiveLive {
+				m.xskLivenessProven = true
+				ctrl.Enabled = 1
+				slog.Info("userspace: XSK liveness probe PASSED, userspace dataplane active")
+			} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
+				m.xskLivenessFailed = true
+				ctrl.Enabled = 0
+				slog.Warn("userspace: XSK liveness probe FAILED after 10s, using eBPF pipeline")
+				_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
+			} else {
+				ctrl.Enabled = 1
+			}
 		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt) {
 			// Hard timeout: enable even if not all readiness gates met.
 			ctrl.Enabled = 1
@@ -4218,6 +4234,8 @@ func (m *Manager) disableUserspaceCtrlLocked() {
 // Must be called BEFORE any operation that invalidates UMEM (e.g. link
 // DOWN on mlx5 zero-copy). Worker threads keep running but see no new
 // packets since ctrl=0 stops XSK redirects.
+//
+// Deprecated: use PrepareLinkCycle which also stops the Rust workers.
 func (m *Manager) DisableAndStopHelper() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -4230,6 +4248,37 @@ func (m *Manager) DisableAndStopHelper() {
 	if m.inner.XDPEntryProg != "xdp_main_prog" {
 		_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
 	}
+}
+
+// PrepareLinkCycle must be called BEFORE any link DOWN/UP cycle (e.g. RETH
+// MAC programming). It:
+//  1. Disables ctrl so the XDP shim stops redirecting to XSK
+//  2. Swaps to xdp_main_prog (eBPF pipeline)
+//  3. Sends "stop_workers" to the Rust helper, which joins all worker
+//     threads — no thread touches UMEM after this returns
+//
+// The caller then performs the link DOWN/UP. Afterwards, NotifyLinkCycle
+// sends "rebind" to recreate workers with fresh AF_XDP sockets.
+func (m *Manager) PrepareLinkCycle() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.proc == nil || m.proc.Process == nil {
+		return
+	}
+	m.disableUserspaceCtrlLocked()
+	if m.inner.XDPEntryProg != "xdp_main_prog" {
+		_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
+	}
+	// Tell the Rust helper to stop all workers. This joins worker
+	// threads so they stop touching UMEM before the NIC unmaps pages
+	// during link DOWN.
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "stop_workers"}, &status); err != nil {
+		slog.Warn("userspace: stop_workers before link cycle failed", "err", err)
+		return
+	}
+	slog.Info("userspace: workers stopped before link cycle",
+		"bindings", len(status.Bindings))
 }
 
 func configEqual(a, b config.UserspaceConfig) bool {
@@ -4249,31 +4298,30 @@ func (m *Manager) StartFIBSync(ctx context.Context) {
 // XSK receive queue.  The sockets remain open but no longer receive packets.
 // This is called after programRethMAC which takes RETH interfaces DOWN/UP.
 //
-// A 200ms delay before rebind lets the mlx5 NIC fully reinitialize its UMR
-// (User Memory Region) subsystem after link reactivation. Without this, the
+// PrepareLinkCycle should have been called BEFORE the link cycle to stop
+// workers (so they don't access UMEM during link DOWN). This method
+// waits 200ms for NIC reinitialization then sends "rebind" to recreate
+// workers with fresh AF_XDP sockets.
+//
+// The 200ms delay lets the mlx5 NIC fully reinitialize its UMR (User
+// Memory Region) subsystem after link reactivation. Without this, the
 // NIC's UMR WQE queue overflows when all XSK sockets are recreated
 // simultaneously (rx_xsk_congst_umr), causing UMEM pages to not be mapped
 // and packets to be silently dropped despite successful XDP_REDIRECT.
 func (m *Manager) NotifyLinkCycle() {
+	// Let the NIC reinitialize after link UP before recreating XSK sockets.
+	time.Sleep(200 * time.Millisecond)
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.proc == nil || m.proc.Process == nil {
 		return
 	}
-	// CRITICAL: disable ctrl FIRST so the XDP shim stops redirecting
-	// to XSK. Workers may still be accessing UMEM frames that the NIC
-	// is about to unmap during link DOWN. With ctrl=0, no new packets
-	// enter the XSK path, and workers drain safely.
+	// Ensure ctrl is disabled (PrepareLinkCycle should have done this,
+	// but guard against callers that skip it).
 	m.disableUserspaceCtrlLocked()
 	if m.inner.XDPEntryProg != "xdp_main_prog" {
 		_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
-	}
-	// Let the NIC reinitialize after link UP before recreating XSK sockets.
-	m.mu.Unlock()
-	time.Sleep(200 * time.Millisecond)
-	m.mu.Lock()
-	if m.proc == nil || m.proc.Process == nil {
-		return
 	}
 	// Reset the ctrl enable gate so the fill-ring bootstrap delay
 	// restarts from scratch after rebind.  Without this, ctrl stays
@@ -4285,7 +4333,13 @@ func (m *Manager) NotifyLinkCycle() {
 	// Otherwise repeated rebinds (e.g. RETH MAC programming) keep
 	// pushing the hard timeout forward and ctrl never enables.
 	m.neighborsPrewarmed = false
-	m.disableUserspaceCtrlLocked()
+	// Reset liveness state so the XSK probe runs fresh after rebind.
+	// The old probe result is stale — the link cycle destroyed the
+	// previous XSK sockets and the new ones need re-validation.
+	m.xskLivenessProven = false
+	m.xskLivenessFailed = false
+	m.xskProbeStart = time.Time{}
+	m.lastXSKRX = 0
 
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "rebind"}, &status); err != nil {
