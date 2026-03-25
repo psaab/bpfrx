@@ -147,9 +147,27 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	defer m.mu.Unlock()
 	m.clusterHA = cfg != nil && cfg.Chassis.Cluster != nil
 	m.seedHAGroupInventoryLocked(cfg)
+	prevPlanKey := snapshotBindingPlanKey(m.lastSnapshot)
+	newPlanKey := snapshotBindingPlanKey(snap)
+	samePlanRefresh := m.proc != nil &&
+		m.proc.Process != nil &&
+		prevPlanKey != "" &&
+		prevPlanKey == newPlanKey
 	m.lastSnapshot = snap
-	if err := m.programBootstrapMapsLocked(snap, ucfg); err != nil {
-		return result, err
+	if samePlanRefresh {
+		if err := m.syncIngressIfaceMapLocked(snap); err != nil {
+			return result, err
+		}
+		if err := m.syncLocalAddressMapsLocked(snap); err != nil {
+			return result, err
+		}
+		if err := m.syncInterfaceNATAddressMapsLocked(snap); err != nil {
+			return result, err
+		}
+	} else {
+		if err := m.programBootstrapMapsLocked(snap, ucfg); err != nil {
+			return result, err
+		}
 	}
 	if err := m.ensureProcessLocked(ucfg); err != nil {
 		return result, err
@@ -159,7 +177,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		return result, fmt.Errorf("publish userspace snapshot: %w", err)
 	}
 	m.publishedSnapshot = snap.Generation
-	m.publishedPlanKey = snapshotBindingPlanKey(snap)
+	m.publishedPlanKey = newPlanKey
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return result, fmt.Errorf("sync helper status: %w", err)
 	}

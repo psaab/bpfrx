@@ -1343,17 +1343,26 @@ fn handle_stream(
                     guard.status.last_fib_generation = snapshot.fib_generation;
                     guard.status.last_snapshot_at = Some(snapshot.generated_at);
                     guard.status.capabilities = snapshot.capabilities.clone();
-                    guard.snapshot = Some(snapshot);
                     let existing_bindings = guard.status.bindings.clone();
-                    let replanned = replan_queues(
-                        guard.snapshot.as_ref(),
-                        guard.status.workers,
-                        &existing_bindings,
-                    );
-                    guard.status.bindings = replanned;
-                    reconcile_status_bindings(&mut guard);
-                    refresh_status(&mut guard);
-                    persist_state = true;
+                    let previous_snapshot = guard.snapshot.as_ref();
+                    let same_plan =
+                        previous_snapshot.is_some_and(|prev| same_binding_plan(prev, &snapshot));
+                    guard.snapshot = Some(snapshot.clone());
+                    if same_plan {
+                        guard.afxdp.refresh_runtime_snapshot(&snapshot);
+                        refresh_status(&mut guard);
+                        persist_state = true;
+                    } else {
+                        let replanned = replan_queues(
+                            guard.snapshot.as_ref(),
+                            guard.status.workers,
+                            &existing_bindings,
+                        );
+                        guard.status.bindings = replanned;
+                        reconcile_status_bindings(&mut guard);
+                        refresh_status(&mut guard);
+                        persist_state = true;
+                    }
                 } else {
                     response.ok = false;
                     response.error = "missing snapshot".to_string();
@@ -1429,10 +1438,7 @@ fn handle_stream(
                             if !afxdp::neighbor_state_usable_str(&neigh.state) {
                                 continue;
                             }
-                            cache.insert(
-                                (neigh.ifindex, ip),
-                                afxdp::NeighborEntry { mac },
-                            );
+                            cache.insert((neigh.ifindex, ip), afxdp::NeighborEntry { mac });
                         }
                     }
                     if neigh_gen > 0 {
@@ -1894,6 +1900,67 @@ fn bindings_settled(bindings: &[BindingStatus]) -> bool {
         }
         binding.ready || !binding.last_error.is_empty()
     })
+}
+
+fn same_binding_plan(current: &ConfigSnapshot, next: &ConfigSnapshot) -> bool {
+    if current.userspace != next.userspace {
+        return false;
+    }
+    if current.interfaces.len() != next.interfaces.len()
+        || current.fabrics.len() != next.fabrics.len()
+    {
+        return false;
+    }
+    let current_ifaces = current
+        .interfaces
+        .iter()
+        .map(|iface| {
+            (
+                iface.name.as_str(),
+                iface.linux_name.as_str(),
+                iface.ifindex,
+                iface.parent_ifindex,
+                iface.rx_queues,
+                iface.tunnel,
+            )
+        })
+        .collect::<Vec<_>>();
+    let next_ifaces = next
+        .interfaces
+        .iter()
+        .map(|iface| {
+            (
+                iface.name.as_str(),
+                iface.linux_name.as_str(),
+                iface.ifindex,
+                iface.parent_ifindex,
+                iface.rx_queues,
+                iface.tunnel,
+            )
+        })
+        .collect::<Vec<_>>();
+    if current_ifaces != next_ifaces {
+        return false;
+    }
+    current
+        .fabrics
+        .iter()
+        .map(|fab| {
+            (
+                fab.name.as_str(),
+                fab.parent_linux_name.as_str(),
+                fab.parent_ifindex,
+                fab.rx_queues,
+            )
+        })
+        .eq(next.fabrics.iter().map(|fab| {
+            (
+                fab.name.as_str(),
+                fab.parent_linux_name.as_str(),
+                fab.parent_ifindex,
+                fab.rx_queues,
+            )
+        }))
 }
 
 fn replan_queues(
