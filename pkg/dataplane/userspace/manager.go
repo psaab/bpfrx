@@ -2461,8 +2461,14 @@ func (m *Manager) hasActiveDataRGLocked() bool {
 	return false
 }
 
-func (m *Manager) shouldExtendXSKLivenessIdleLocked(currentRX uint64) bool {
-	return currentRX == 0 && !m.hasActiveDataRGLocked()
+func (m *Manager) shouldExtendXSKLivenessIdleLocked(currentRX uint64, allBindingsBound bool) bool {
+	if currentRX != 0 {
+		return false
+	}
+	if allBindingsBound {
+		return true
+	}
+	return !m.hasActiveDataRGLocked()
 }
 
 func (m *Manager) configHasDataRGLocked() bool {
@@ -2818,7 +2824,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 					m.xskProbeStart = time.Now()
 					slog.Info("userspace: starting XSK liveness probe")
 				} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
-					if m.shouldExtendXSKLivenessIdleLocked(currentRX) {
+					if m.shouldExtendXSKLivenessIdleLocked(currentRX, allBindingsBound) {
 						m.xskProbeStart = time.Now()
 						slog.Info("userspace: extending XSK liveness probe while idle")
 						goto ctrlReady

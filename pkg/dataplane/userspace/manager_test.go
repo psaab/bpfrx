@@ -1024,20 +1024,23 @@ func TestHasActiveDataRGLockedIgnoresRG0(t *testing.T) {
 	}
 }
 
-func TestShouldExtendXSKLivenessIdleLockedRequiresNoActiveDataRG(t *testing.T) {
+func TestShouldExtendXSKLivenessIdleLocked(t *testing.T) {
 	m := &Manager{
 		haGroups: map[int]HAGroupStatus{
 			0: {RGID: 0, Active: true},
 		},
 	}
-	if !m.shouldExtendXSKLivenessIdleLocked(0) {
+	if !m.shouldExtendXSKLivenessIdleLocked(0, false) {
 		t.Fatal("shouldExtendXSKLivenessIdleLocked(0) = false, want true with no active data RG")
 	}
 	m.haGroups[1] = HAGroupStatus{RGID: 1, Active: true}
-	if m.shouldExtendXSKLivenessIdleLocked(0) {
+	if !m.shouldExtendXSKLivenessIdleLocked(0, true) {
+		t.Fatal("shouldExtendXSKLivenessIdleLocked(0, true) = false, want true when all bindings are bound")
+	}
+	if m.shouldExtendXSKLivenessIdleLocked(0, false) {
 		t.Fatal("shouldExtendXSKLivenessIdleLocked(0) = true, want false with active data RG")
 	}
-	if m.shouldExtendXSKLivenessIdleLocked(42) {
+	if m.shouldExtendXSKLivenessIdleLocked(42, true) {
 		t.Fatal("shouldExtendXSKLivenessIdleLocked(42) = true, want false when RX is already live")
 	}
 }
