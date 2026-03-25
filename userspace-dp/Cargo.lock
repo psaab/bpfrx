@@ -46,7 +46,6 @@ name = "bpfrx-userspace-dp"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "cc",
  "chrono",
  "ctrlc",
  "io-uring",
@@ -57,6 +56,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
+ "xdpilone",
 ]
 
 [[package]]
@@ -444,6 +444,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "spin"
+version = "0.9.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+
+[[package]]
 name = "strum"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -609,6 +615,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "xdpilone"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90eeede639168fc380cebc42ed53905a9edcdfb6017644d14f71cabf8b8ca376"
+dependencies = [
+ "libc",
+ "spin",
 ]
 
 [[package]]
