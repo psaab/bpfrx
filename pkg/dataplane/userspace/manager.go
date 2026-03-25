@@ -121,12 +121,16 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	}
 	caps := deriveUserspaceCapabilities(cfg)
 	_ = caps // used below for helper config
-	// Always use xdp_main_prog during Compile. The userspace dataplane
-	// will be activated via the probe in applyHelperStatusLocked AFTER
-	// the cluster has settled (MAC programming, VRRP elections done).
-	// This prevents XSK socket creation during link cycles that cause
-	// libxdp segfaults in __xsk_setup_xdp_prog.
-	m.inner.XDPEntryProg = "xdp_main_prog"
+	// Use the shim when forwarding is supported. The shim redirects to
+	// XSK when ctrl=1; when ctrl=0 it falls through to XDP_PASS which
+	// delivers to the kernel at the same throughput as xdp_main_prog.
+	// XSK socket creation is deferred by the arm delay (45s) to avoid
+	// segfaults from __xsk_setup_xdp_prog during link cycles.
+	if caps.ForwardingSupported {
+		m.inner.XDPEntryProg = "xdp_userspace_prog"
+	} else {
+		m.inner.XDPEntryProg = "xdp_main_prog"
+	}
 	result, err := m.inner.Compile(cfg)
 	if err != nil {
 		return nil, err
@@ -2689,30 +2693,13 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		} else if m.xskLivenessProven {
 			// XSK proven working — keep ctrl enabled.
 			ctrl.Enabled = 1
-		} else if neighborGenOK && !m.ctrlEnableAt.IsZero() &&
-			time.Now().After(m.ctrlEnableAt.Add(60*time.Second)) {
-			// XSK probe: enable ctrl + swap to shim AFTER 60s settle.
-			// The long delay ensures MAC programming + VRRP elections
-			// + VIP assignments are all done. No link cycles expected.
-			// PrepareLinkCycle handles MAC programming; the 60s covers
-			// other transient link events (networkd, VRRP transitions).
-			if m.xskProbeStart.IsZero() {
-				m.xskProbeStart = time.Now()
-				ctrl.Enabled = 1
-				slog.Info("userspace: starting XSK liveness probe (ctrl=1)")
-				_ = m.inner.SwapXDPEntryProg("xdp_userspace_prog")
-			} else if xskReceiveLive {
-				m.xskLivenessProven = true
-				ctrl.Enabled = 1
-				slog.Info("userspace: XSK liveness probe PASSED, userspace dataplane active")
-			} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
-				m.xskLivenessFailed = true
-				ctrl.Enabled = 0
-				slog.Warn("userspace: XSK liveness probe FAILED, using eBPF pipeline")
-				_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
-			} else {
-				ctrl.Enabled = 1
-			}
+		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt.Add(60*time.Second)) {
+			// Enable ctrl after 60s settle. The shim is already attached
+			// (from Compile). If XSK works, traffic goes through the
+			// Rust helper. If XSK rx=0, the shim falls through to
+			// XDP_PASS → kernel → TC egress at the same throughput.
+			// No probe needed — both paths work.
+			ctrl.Enabled = 1
 		} else {
 			ctrl.Enabled = 0
 		}
