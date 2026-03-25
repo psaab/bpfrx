@@ -11,13 +11,15 @@
 //!
 //! Must run as root. Sends traffic to itself via raw socket.
 
+#[path = "../../userspace-dp/src/xsk_ffi.rs"]
+mod xsk_ffi;
+
 use std::ffi::CString;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
-use xdpilone::{BufIdx, IfInfo, Socket, SocketConfig, Umem, UmemConfig};
+use xsk_ffi::{create_xsk_binding, BufIdx, IfInfo, SocketConfig, Umem, UmemConfig, XdpDesc};
 
 const FRAME_SIZE: u32 = 4096;
 const FRAME_COUNT: u32 = 4096;
@@ -119,14 +121,11 @@ fn run_xsk_phase(iface: &str, queue: u32, xsk_map_fd: i32, use_copy: bool, durat
         headroom: HEADROOM,
         flags: 0,
     };
-    let umem = unsafe { Umem::new(cfg, area_slice) }.expect("create umem");
+    let mut umem = unsafe { Umem::new(cfg, area_slice) }.expect("create umem");
 
     let mut info = IfInfo::invalid();
     info.from_ifindex(if_nametoindex(iface)).expect("ifindex lookup");
     info.set_queue(queue);
-
-    let sock = Socket::with_shared(&info, &umem).expect("create socket");
-    let mut device = umem.fq_cq(&sock).expect("create fq/cq");
 
     let mut offsets = Vec::with_capacity(FRAME_COUNT as usize);
     for idx in 0..FRAME_COUNT {
@@ -135,29 +134,32 @@ fn run_xsk_phase(iface: &str, queue: u32, xsk_map_fd: i32, use_copy: bool, durat
         }
     }
 
-    // Prime fill ring BEFORE bind
-    {
-        let mut fill = device.fill(offsets.len() as u32);
-        let inserted = fill.insert(offsets.iter().copied());
-        fill.commit();
-        eprintln!("  fill ring primed: {}/{}", inserted, offsets.len());
-    }
-
     let bind_flags = if use_copy {
         SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_COPY
     } else {
         SocketConfig::XDP_BIND_NEED_WAKEUP | SocketConfig::XDP_BIND_ZEROCOPY
     };
-    let sock_cfg = SocketConfig {
-        rx_size: std::num::NonZeroU32::new(FRAME_COUNT),
-        tx_size: std::num::NonZeroU32::new(256),
-        bind_flags,
-    };
-    let user = umem.rx_tx(&sock, &sock_cfg).expect("bind rx/tx");
-    let mut rx = user.map_rx().expect("map rx ring");
+    let (user, mut rx, _tx, mut device) =
+        create_xsk_binding(&mut umem, &info, FRAME_COUNT, bind_flags)
+            .expect("create/bind xsk");
     let user_fd = user.as_raw_fd();
     let mode = if use_copy { "copy" } else { "zero-copy" };
     eprintln!("  bound fd={} {}", user_fd, mode);
+
+    // Prime fill ring AFTER bind. The libxdp create path already created
+    // and bound the socket; post-bind priming mirrors the dataplane path.
+    {
+        let mut fill = device.fill(offsets.len() as u32);
+        let inserted = fill.insert(offsets.iter().copied());
+        fill.commit();
+        drop(fill);
+        eprintln!(
+            "  fill ring primed: {}/{} pending={}",
+            inserted,
+            offsets.len(),
+            device.pending()
+        );
+    }
 
     // Register in xskmap
     xskmap_update(xsk_map_fd, queue, user_fd as u32);
@@ -180,12 +182,13 @@ fn run_xsk_phase(iface: &str, queue: u32, xsk_map_fd: i32, use_copy: bool, durat
         let available = rx.available();
         if available > 0 {
             let mut recv = rx.receive(available);
-            while recv.read().is_some() {
+            let mut recycled = Vec::with_capacity(available as usize);
+            while let Some(XdpDesc { addr, .. }) = recv.read() {
                 total_rx += 1;
+                recycled.push(addr);
             }
-            let needed = available.min(offsets.len() as u32);
-            let mut fill = device.fill(needed);
-            fill.insert(offsets.iter().take(needed as usize).copied());
+            let mut fill = device.fill(recycled.len() as u32);
+            fill.insert(recycled.into_iter());
             fill.commit();
         } else {
             poll_count += 1;
@@ -198,6 +201,10 @@ fn run_xsk_phase(iface: &str, queue: u32, xsk_map_fd: i32, use_copy: bool, durat
 
     // Cleanup
     xskmap_delete(xsk_map_fd, queue);
+    drop(device);
+    drop(rx);
+    drop(user);
+    drop(umem);
     unsafe { libc::munmap(area_ptr, area_size) };
     total_rx
 }

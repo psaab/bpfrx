@@ -8,6 +8,8 @@ name = "xsk-rebind-test"
 path = "main.rs"
 
 [dependencies]
-xdpilone = "1.2"
 libc = "0.2"
 libbpf-sys = "1.7"
+
+[build-dependencies]
+cc = "1.2"
