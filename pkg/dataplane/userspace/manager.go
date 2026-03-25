@@ -51,14 +51,14 @@ type Manager struct {
 	haGroups           map[int]HAGroupStatus
 	lastIngressIfaces  []uint32
 	lastBindingIndices []uint32
-	neighborsPrewarmed  bool
-	ctrlEnableAt        time.Time
-	ctrlWasEnabled      bool
-	xskLivenessFailed   bool
-	xskLivenessProven   bool
-	xskProbeStart       time.Time
-	lastXSKRX           uint64
-	neighborGeneration  uint64
+	neighborsPrewarmed bool
+	ctrlEnableAt       time.Time
+	ctrlWasEnabled     bool
+	xskLivenessFailed  bool
+	xskLivenessProven  bool
+	xskProbeStart      time.Time
+	lastXSKRX          uint64
+	neighborGeneration uint64
 }
 
 func New() *Manager {
@@ -682,12 +682,12 @@ func buildFabricPeerMAC(overlayIfindex, parentIfindex int, peer string) string {
 
 func userspaceMapPins() UserspaceMapPins {
 	return UserspaceMapPins{
-		Ctrl:      dataplane.UserspaceCtrlPinPath(),
-		Bindings:  dataplane.UserspaceBindingsPinPath(),
-		Heartbeat: dataplane.UserspaceHeartbeatPinPath(),
-		XSK:       dataplane.UserspaceXSKMapPinPath(),
-		LocalV4:   dataplane.UserspaceLocalV4PinPath(),
-		LocalV6:   dataplane.UserspaceLocalV6PinPath(),
+		Ctrl:        dataplane.UserspaceCtrlPinPath(),
+		Bindings:    dataplane.UserspaceBindingsPinPath(),
+		Heartbeat:   dataplane.UserspaceHeartbeatPinPath(),
+		XSK:         dataplane.UserspaceXSKMapPinPath(),
+		LocalV4:     dataplane.UserspaceLocalV4PinPath(),
+		LocalV6:     dataplane.UserspaceLocalV6PinPath(),
 		Sessions:    dataplane.UserspaceSessionsPinPath(),
 		DnatTable:   dataplane.UserspaceDnatTablePinPath(),
 		DnatTableV6: dataplane.UserspaceDnatTableV6PinPath(),
@@ -2657,11 +2657,22 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// Check readiness gates BEFORE refreshing neighbors (which
 		// bumps the generation). The status reports the generation
 		// from the previous refresh cycle.
-		allBindingsReady := true
+		//
+		// The helper can only prove RX liveness after ctrl enables the
+		// shim and the userspace_bindings map exposes the binding slots.
+		// Requiring Bound here deadlocks startup: ctrl stays off, the shim
+		// keeps passing packets away from XSK, and Bound never flips true.
+		probeBindingsReady := len(status.Bindings) > 0
+		allBindingsBound := len(status.Bindings) > 0
 		for _, b := range status.Bindings {
-			if b.Ifindex > 0 && b.Registered && !b.Bound {
-				allBindingsReady = false
-				break
+			if b.Ifindex <= 0 {
+				continue
+			}
+			if !b.Registered || !b.Armed {
+				probeBindingsReady = false
+			}
+			if b.Registered && !b.Bound {
+				allBindingsBound = false
 			}
 		}
 		neighborGenOK := m.neighborGeneration == 0 ||
@@ -2682,7 +2693,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		xskReceiveLive := currentRX > m.lastXSKRX
 		m.lastXSKRX = currentRX
 		slog.Warn("userspace: ctrl gate check",
-			"allBindingsReady", allBindingsReady,
+			"probeBindingsReady", probeBindingsReady,
+			"allBindingsBound", allBindingsBound,
 			"neighborGenOK", neighborGenOK,
 			"xskReceiveLive", xskReceiveLive,
 			"currentRX", currentRX,
@@ -2693,7 +2705,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		if m.xskLivenessFailed {
 			// XSK proven broken — stay on eBPF pipeline, ctrl disabled.
 			ctrl.Enabled = 0
-		} else if allBindingsReady && neighborGenOK {
+		} else if probeBindingsReady && neighborGenOK {
 			ctrl.Enabled = 1
 			if m.xskLivenessProven {
 				if m.inner.XDPEntryProg != "xdp_userspace_prog" {
