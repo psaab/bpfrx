@@ -1429,28 +1429,23 @@ fn handle_stream(
                 if let Some(neighbors) = request.neighbors.as_ref() {
                     let neigh_gen = request.neighbor_generation;
                     let replace = request.neighbor_replace;
-                    if let Ok(mut cache) = guard.afxdp.dynamic_neighbors_ref().lock() {
-                        if replace {
-                            // Authoritative full replacement: clear existing
-                            // entries and rebuild from the manager's view.
-                            cache.clear();
+                    let mut resolved = Vec::with_capacity(neighbors.len());
+                    for neigh in neighbors {
+                        if neigh.ifindex <= 0 || neigh.mac.is_empty() {
+                            continue;
                         }
-                        for neigh in neighbors {
-                            if neigh.ifindex <= 0 || neigh.mac.is_empty() {
-                                continue;
-                            }
-                            let Ok(ip) = neigh.ip.parse::<std::net::IpAddr>() else {
-                                continue;
-                            };
-                            let Some(mac) = afxdp::parse_mac_str(&neigh.mac) else {
-                                continue;
-                            };
-                            if !afxdp::neighbor_state_usable_str(&neigh.state) {
-                                continue;
-                            }
-                            cache.insert((neigh.ifindex, ip), afxdp::NeighborEntry { mac });
+                        let Ok(ip) = neigh.ip.parse::<std::net::IpAddr>() else {
+                            continue;
+                        };
+                        let Some(mac) = afxdp::parse_mac_str(&neigh.mac) else {
+                            continue;
+                        };
+                        if !afxdp::neighbor_state_usable_str(&neigh.state) {
+                            continue;
                         }
+                        resolved.push((neigh.ifindex, ip, afxdp::NeighborEntry { mac }));
                     }
+                    guard.afxdp.apply_manager_neighbors(replace, &resolved);
                     if neigh_gen > 0 {
                         guard.status.neighbor_generation = neigh_gen;
                     }

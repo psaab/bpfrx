@@ -546,6 +546,7 @@ pub struct Coordinator {
     shared_forwarding: Arc<ArcSwap<ForwardingState>>,
     shared_validation: Arc<ArcSwap<ValidationState>>,
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    manager_neighbor_keys: Arc<Mutex<FastSet<(i32, IpAddr)>>>,
     neigh_monitor_stop: Option<Arc<AtomicBool>>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -582,6 +583,7 @@ impl Coordinator {
             shared_forwarding: Arc::new(ArcSwap::from_pointee(ForwardingState::default())),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
+            manager_neighbor_keys: Arc::new(Mutex::new(FastSet::default())),
             neigh_monitor_stop: None,
             shared_sessions: Arc::new(Mutex::new(FastMap::default())),
             shared_nat_sessions: Arc::new(Mutex::new(FastMap::default())),
@@ -610,6 +612,29 @@ impl Coordinator {
 
     pub fn dynamic_neighbors_ref(&self) -> &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>> {
         &self.dynamic_neighbors
+    }
+
+    pub fn apply_manager_neighbors(
+        &self,
+        replace: bool,
+        neighbors: &[(i32, IpAddr, NeighborEntry)],
+    ) {
+        let Ok(mut cache) = self.dynamic_neighbors.lock() else {
+            return;
+        };
+        let Ok(mut manager_keys) = self.manager_neighbor_keys.lock() else {
+            return;
+        };
+        if replace {
+            for key in manager_keys.drain() {
+                cache.remove(&key);
+            }
+        }
+        for (ifindex, ip, entry) in neighbors {
+            let key = (*ifindex, *ip);
+            cache.insert(key, *entry);
+            manager_keys.insert(key);
+        }
     }
 
     fn stop_inner(&mut self, clear_synced_state: bool) {
@@ -667,6 +692,9 @@ impl Coordinator {
         self.shared_fabrics.store(Arc::new(Vec::new()));
         if let Ok(mut neighbors) = self.dynamic_neighbors.lock() {
             neighbors.clear();
+        }
+        if let Ok(mut manager_keys) = self.manager_neighbor_keys.lock() {
+            manager_keys.clear();
         }
         if clear_synced_state {
             if let Ok(mut sessions) = self.shared_sessions.lock() {
@@ -12136,6 +12164,49 @@ mod tests {
             &neighbors,
         );
         assert!(neighbors.lock().expect("neighbors").is_empty());
+    }
+
+    #[test]
+    fn manager_neighbor_replace_preserves_packet_learned_entries() {
+        let coordinator = Coordinator::new();
+        {
+            let mut neighbors = coordinator
+                .dynamic_neighbors_ref()
+                .lock()
+                .expect("neighbors");
+            neighbors.insert(
+                (5, IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0x559, 0x8585, 0xef00, 0x1266, 0x6aff, 0xfe0b, 0xd017,
+                ))),
+                NeighborEntry {
+                    mac: [0x10, 0x66, 0x6a, 0x0b, 0xd0, 0x17],
+                },
+            );
+        }
+
+        coordinator.apply_manager_neighbors(
+            true,
+            &[(
+                13,
+                IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                NeighborEntry {
+                    mac: [0x56, 0x4a, 0xe8, 0x1e, 0xa8, 0x32],
+                },
+            )],
+        );
+
+        let neighbors = coordinator
+            .dynamic_neighbors_ref()
+            .lock()
+            .expect("neighbors");
+        assert_eq!(neighbors.len(), 2);
+        assert!(neighbors.contains_key(&(
+            5,
+            IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0x559, 0x8585, 0xef00, 0x1266, 0x6aff, 0xfe0b, 0xd017,
+            ))
+        )));
+        assert!(neighbors.contains_key(&(13, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)))));
     }
 
     #[test]
