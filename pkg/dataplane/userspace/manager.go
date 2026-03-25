@@ -2248,10 +2248,8 @@ func (m *Manager) syncHAStateLocked() error {
 	if m.proc == nil || m.proc.Process == nil {
 		return nil
 	}
-	if len(m.haGroups) == 0 {
-		if err := m.refreshHAStateFromMapsLocked(); err != nil {
-			return err
-		}
+	if err := m.refreshHAStateFromMapsLocked(); err != nil {
+		return err
 	}
 	if len(m.haGroups) == 0 {
 		return nil
@@ -3883,7 +3881,10 @@ func (m *Manager) statusLoop(ctx context.Context) {
 				if err := m.applyHelperStatusLocked(&status); err != nil {
 					slog.Warn("userspace dataplane status sync failed", "err", err)
 				}
-				if m.clusterHA && len(m.haGroups) == 0 {
+				if err := m.syncSnapshotLocked(); err != nil {
+					slog.Warn("userspace dataplane snapshot sync failed", "err", err)
+				}
+				if m.clusterHA {
 					_ = m.refreshHAStateFromMapsLocked()
 				}
 				if err := m.syncDesiredForwardingStateLocked(); err != nil {
