@@ -59,6 +59,7 @@ type Manager struct {
 	xskProbeStart      time.Time
 	lastXSKRX          uint64
 	publishedSnapshot  uint64
+	publishedPlanKey   string
 	neighborGeneration uint64
 }
 
@@ -2219,7 +2220,11 @@ func (m *Manager) syncSnapshotLocked() error {
 	if m.proc == nil || m.proc.Process == nil || m.lastSnapshot == nil {
 		return nil
 	}
+	planKey := snapshotBindingPlanKey(m.lastSnapshot)
 	if m.publishedSnapshot >= m.lastSnapshot.Generation {
+		return nil
+	}
+	if m.publishedSnapshot != 0 && m.xskLivenessProven && m.publishedPlanKey == planKey {
 		return nil
 	}
 	if m.lastStatus.LastSnapshotGeneration >= m.lastSnapshot.Generation {
@@ -2239,6 +2244,7 @@ func (m *Manager) syncSnapshotLocked() error {
 		return fmt.Errorf("publish userspace snapshot: %w", err)
 	}
 	m.publishedSnapshot = m.lastSnapshot.Generation
+	m.publishedPlanKey = planKey
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return fmt.Errorf("sync helper status: %w", err)
 	}
@@ -3709,6 +3715,40 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	return out
 }
 
+func snapshotBindingPlanKey(snapshot *ConfigSnapshot) string {
+	if snapshot == nil {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "workers=%d;ring=%d;", snapshot.Userspace.Workers, snapshot.Userspace.RingEntries)
+	for _, iface := range snapshot.Interfaces {
+		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
+			continue
+		}
+		fmt.Fprintf(
+			&b,
+			"iface=%s/%s/%d/%d/%d/%t;",
+			iface.Name,
+			iface.LinuxName,
+			iface.Ifindex,
+			iface.ParentIfindex,
+			iface.RXQueues,
+			iface.Tunnel,
+		)
+	}
+	for _, fab := range snapshot.Fabrics {
+		fmt.Fprintf(
+			&b,
+			"fabric=%s/%s/%d/%d;",
+			fab.Name,
+			fab.ParentLinuxName,
+			fab.ParentIfindex,
+			fab.RXQueues,
+		)
+	}
+	return b.String()
+}
+
 func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]uint32 {
 	if snapshot == nil {
 		return nil
@@ -3990,6 +4030,7 @@ func (m *Manager) stopLocked() {
 	m.xskProbeStart = time.Time{}
 	m.lastXSKRX = 0
 	m.publishedSnapshot = 0
+	m.publishedPlanKey = ""
 }
 
 // bootstrapNAPIQueuesLocked sends UDP probe packets to each managed
