@@ -126,7 +126,9 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// delivers to the kernel at the same throughput as xdp_main_prog.
 	// XSK socket creation is deferred by the arm delay (45s) to avoid
 	// segfaults from __xsk_setup_xdp_prog during link cycles.
-	if caps.ForwardingSupported {
+	if m.xskLivenessFailed {
+		m.inner.XDPEntryProg = "xdp_main_prog"
+	} else if caps.ForwardingSupported {
 		m.inner.XDPEntryProg = "xdp_userspace_prog"
 	} else {
 		m.inner.XDPEntryProg = "xdp_main_prog"
@@ -2668,10 +2670,11 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// Now refresh neighbors for the next cycle.
 		m.refreshNeighborSnapshotLocked()
 
-		// XSK receive liveness: enable ctrl optimistically once bindings
-		// are ready. If XSK is truly broken (xdpilone on mlx5), the
-		// liveness probe will detect zero rx delta and swap to eBPF.
-		// With libxdp, XSK should work and ctrl stays enabled.
+		// XSK receive liveness: once bindings and neighbor state are ready,
+		// arm ctrl and explicitly probe the userspace shim. A working XSK
+		// path must show RX progress while ctrl=1 and the shim is active.
+		// Otherwise swap back to the eBPF pipeline instead of assuming
+		// the userspace AF_XDP path is healthy.
 		var currentRX uint64
 		for _, b := range status.Bindings {
 			currentRX += b.RXPackets
@@ -2690,15 +2693,46 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		if m.xskLivenessFailed {
 			// XSK proven broken — stay on eBPF pipeline, ctrl disabled.
 			ctrl.Enabled = 0
-		} else if m.xskLivenessProven {
-			// XSK proven working — keep ctrl enabled.
+		} else if allBindingsReady && neighborGenOK {
 			ctrl.Enabled = 1
+			if m.xskLivenessProven {
+				if m.inner.XDPEntryProg != "xdp_userspace_prog" {
+					if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+						slog.Warn("userspace: failed to restore XDP shim after liveness success", "err", err)
+					}
+				}
+			} else if xskReceiveLive {
+				m.xskLivenessProven = true
+				m.xskProbeStart = time.Time{}
+				if m.inner.XDPEntryProg != "xdp_userspace_prog" {
+					if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+						slog.Warn("userspace: failed to swap XDP shim after XSK RX became live", "err", err)
+					}
+				}
+				slog.Info("userspace: XSK liveness proven")
+			} else {
+				if m.inner.XDPEntryProg != "xdp_userspace_prog" {
+					if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+						slog.Warn("userspace: failed to activate XDP shim for XSK liveness probe", "err", err)
+					}
+				}
+				if m.xskProbeStart.IsZero() {
+					m.xskProbeStart = time.Now()
+					slog.Info("userspace: starting XSK liveness probe")
+				} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
+					m.xskLivenessFailed = true
+					m.xskProbeStart = time.Time{}
+					ctrl.Enabled = 0
+					slog.Warn("userspace: XSK liveness probe failed, falling back to eBPF pipeline")
+					if err := m.inner.SwapXDPEntryProg("xdp_main_prog"); err != nil {
+						slog.Warn("userspace: failed to swap to eBPF pipeline after XSK liveness failure", "err", err)
+					}
+				}
+			}
 		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt.Add(60*time.Second)) {
-			// Enable ctrl after 60s settle. The shim is already attached
-			// (from Compile). If XSK works, traffic goes through the
-			// Rust helper. If XSK rx=0, the shim falls through to
-			// XDP_PASS → kernel → TC egress at the same throughput.
-			// No probe needed — both paths work.
+			// Hard timeout fallback: allow ctrl even if readiness has not been
+			// fully proven yet. The XSK liveness probe still decides whether
+			// the userspace shim stays active or we fall back to xdp_main.
 			ctrl.Enabled = 1
 		} else {
 			ctrl.Enabled = 0
@@ -3891,6 +3925,10 @@ func (m *Manager) stopLocked() {
 	m.lastStatus = ProcessStatus{}
 	m.neighborsPrewarmed = false
 	m.ctrlEnableAt = time.Time{}
+	m.xskLivenessProven = false
+	m.xskLivenessFailed = false
+	m.xskProbeStart = time.Time{}
+	m.lastXSKRX = 0
 }
 
 // bootstrapNAPIQueuesLocked sends UDP probe packets to each managed
