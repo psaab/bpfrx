@@ -58,6 +58,7 @@ type Manager struct {
 	xskLivenessProven  bool
 	xskProbeStart      time.Time
 	lastXSKRX          uint64
+	publishedSnapshot  uint64
 	neighborGeneration uint64
 }
 
@@ -2214,6 +2215,35 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 	return resp, nil
 }
 
+func (m *Manager) syncSnapshotLocked() error {
+	if m.proc == nil || m.proc.Process == nil || m.lastSnapshot == nil {
+		return nil
+	}
+	if m.publishedSnapshot >= m.lastSnapshot.Generation {
+		return nil
+	}
+	if m.lastStatus.LastSnapshotGeneration >= m.lastSnapshot.Generation {
+		m.publishedSnapshot = m.lastStatus.LastSnapshotGeneration
+		return nil
+	}
+	// Publish the initial snapshot immediately so the helper can plan its
+	// bindings. After that, defer newer snapshots until the first XSK
+	// liveness outcome is known. HA startup can emit several snapshots in
+	// quick succession as VIPs and routes converge; pushing every one of
+	// them forces back-to-back full AF_XDP reconciles and self-collides.
+	if m.publishedSnapshot != 0 && !m.xskLivenessProven && !m.xskLivenessFailed {
+		return nil
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: m.lastSnapshot}, &status); err != nil {
+		return fmt.Errorf("publish userspace snapshot: %w", err)
+	}
+	m.publishedSnapshot = m.lastSnapshot.Generation
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return fmt.Errorf("sync helper status: %w", err)
+	}
+	return nil
+}
 func (m *Manager) syncHAStateLocked() error {
 	if m.proc == nil || m.proc.Process == nil {
 		return nil
@@ -3960,6 +3990,7 @@ func (m *Manager) stopLocked() {
 	m.xskLivenessFailed = false
 	m.xskProbeStart = time.Time{}
 	m.lastXSKRX = 0
+	m.publishedSnapshot = 0
 }
 
 // bootstrapNAPIQueuesLocked sends UDP probe packets to each managed
