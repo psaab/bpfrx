@@ -149,11 +149,35 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	m.seedHAGroupInventoryLocked(cfg)
 	prevPlanKey := snapshotBindingPlanKey(m.lastSnapshot)
 	newPlanKey := snapshotBindingPlanKey(snap)
+	pendingXSKStartup := m.proc != nil &&
+		m.proc.Process != nil &&
+		m.publishedSnapshot != 0 &&
+		!m.xskLivenessProven &&
+		!m.xskLivenessFailed
 	samePlanRefresh := m.proc != nil &&
 		m.proc.Process != nil &&
 		prevPlanKey != "" &&
 		prevPlanKey == newPlanKey
 	m.lastSnapshot = snap
+	if pendingXSKStartup {
+		if err := m.syncIngressIfaceMapLocked(snap); err != nil {
+			return result, err
+		}
+		if err := m.syncLocalAddressMapsLocked(snap); err != nil {
+			return result, err
+		}
+		if err := m.syncInterfaceNATAddressMapsLocked(snap); err != nil {
+			return result, err
+		}
+		m.cfg = ucfg
+		slog.Info(
+			"userspace: deferring snapshot publish during XSK startup",
+			"generation", snap.Generation,
+			"fib_generation", snap.FIBGeneration,
+			"same_plan", samePlanRefresh,
+		)
+		return result, nil
+	}
 	if samePlanRefresh {
 		if err := m.syncIngressIfaceMapLocked(snap); err != nil {
 			return result, err
