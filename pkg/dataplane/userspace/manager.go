@@ -2686,43 +2686,12 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		} else if m.xskLivenessProven {
 			// XSK proven working — keep ctrl enabled.
 			ctrl.Enabled = 1
-		} else if neighborGenOK {
-			// Don't gate on allBindingsReady — bindings report Bound
-			// asynchronously from worker threads. The probe needs ctrl
-			// enabled to test if XSK works; gating on Bound creates a
-			// chicken-and-egg where bindings never stabilize as Bound
-			// because config reconciles keep restarting workers.
-			// Probe: temporarily enable ctrl + swap to XDP shim to test
-			// if XSK can sustain forwarding. If rx increases within 10s,
-			// keep the shim permanently. Otherwise revert to eBPF pipeline.
-			// Safe because PrepareLinkCycle stops workers BEFORE any link
-			// DOWN/UP, preventing UMEM segfaults during link cycles.
-			if m.xskProbeStart.IsZero() {
-				m.xskProbeStart = time.Now()
-				ctrl.Enabled = 1
-				slog.Info("userspace: starting XSK liveness probe (ctrl=1)")
-				_ = m.inner.SwapXDPEntryProg("xdp_userspace_prog")
-			} else if xskReceiveLive {
-				m.xskLivenessProven = true
-				ctrl.Enabled = 1
-				slog.Info("userspace: XSK liveness probe PASSED, userspace dataplane active")
-			} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
-				m.xskLivenessFailed = true
-				ctrl.Enabled = 0
-				slog.Warn("userspace: XSK liveness probe FAILED after 10s, using eBPF pipeline")
-				_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
-			} else {
-				ctrl.Enabled = 1
-			}
-		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt) {
-			// Hard timeout: enable even if not all readiness gates met.
-			ctrl.Enabled = 1
-			if !allBindingsReady || !neighborGenOK {
-				slog.Warn("userspace: ctrl enabled by hard timeout",
-					"bindings_ready", allBindingsReady,
-					"neighbor_gen_ok", neighborGenOK)
-			}
 		} else {
+			// XSK probe disabled: link cycle events (VRRP, VIP changes)
+			// aren't all preceded by PrepareLinkCycle. Workers segfault
+			// accessing invalidated UMEM during unexpected link DOWN/UP.
+			// Needs a netlink-based pre-link-cycle hook for ALL sources.
+			// eBPF pipeline handles traffic at 20+ Gbps.
 			ctrl.Enabled = 0
 		}
 	}

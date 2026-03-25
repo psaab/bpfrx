@@ -139,8 +139,9 @@ pub(super) fn prime_fill_ring_offsets(
         fill.commit();
         inserted
     };
-    if inserted != offsets.len() as u32 {
-        return Err(format!("prefill fill ring inserted {inserted}/{}", offsets.len()).into());
+    eprintln!("prime_fill_ring: inserted={}/{} fill_pending={}", inserted, offsets.len(), device.pending());
+    if inserted == 0 {
+        return Err(format!("prefill fill ring inserted 0/{}", offsets.len()).into());
     }
     // Trigger NAPI to consume fill ring entries and post RX WQEs.
     // mlx5 zero-copy processes the fill ring during RX NAPI poll.
