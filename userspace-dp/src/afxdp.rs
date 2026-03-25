@@ -5548,10 +5548,13 @@ fn worker_loop(
     let mut bindings = Vec::with_capacity(binding_plans.len());
     for plan in binding_plans {
         let total_frames = binding_frame_count(plan.ring_entries).max(1);
-        let mut private_pool =
-            WorkerUmemPool::new(total_frames).map_err(|err| format!("create binding umem: {err}"));
-        let binding = match private_pool.as_mut() {
-            Ok(pool) => BindingWorker::create(
+        let binding = match WorkerUmemPool::new(total_frames)
+            .map_err(|err| format!("create binding umem: {err}"))
+        {
+            Ok(WorkerUmemPool {
+                umem,
+                mut free_frames,
+            }) => BindingWorker::create(
                 &plan.status,
                 plan.ring_entries,
                 plan.xsk_map_fd,
@@ -5560,8 +5563,8 @@ fn worker_loop(
                 plan.live.clone(),
                 plan.bind_strategy,
                 plan.poll_mode,
-                pool.umem.clone(),
-                &mut pool.free_frames,
+                umem,
+                &mut free_frames,
                 false,
             ),
             Err(err) => Err(err.to_string().into()),
