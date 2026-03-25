@@ -1545,6 +1545,9 @@ impl Coordinator {
         for binding in bindings.iter_mut() {
             if let Some(live) = self.live.get(&binding.slot) {
                 let snap = live.snapshot();
+                if snap.bound && !binding.bound {
+                    eprintln!("refresh_bindings: slot={} transitioning bound=false->true fd={}", binding.slot, snap.socket_fd);
+                }
                 binding.bound = snap.bound;
                 binding.xsk_registered = snap.xsk_registered;
                 binding.xsk_bind_mode = snap.xsk_bind_mode;

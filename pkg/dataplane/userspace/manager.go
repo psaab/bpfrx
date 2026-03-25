@@ -2671,7 +2671,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		}
 		xskReceiveLive := currentRX > m.lastXSKRX
 		m.lastXSKRX = currentRX
-		slog.Debug("userspace: ctrl gate check",
+		slog.Warn("userspace: ctrl gate check",
 			"allBindingsReady", allBindingsReady,
 			"neighborGenOK", neighborGenOK,
 			"xskReceiveLive", xskReceiveLive,
@@ -2686,7 +2686,12 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		} else if m.xskLivenessProven {
 			// XSK proven working — keep ctrl enabled.
 			ctrl.Enabled = 1
-		} else if allBindingsReady && neighborGenOK {
+		} else if neighborGenOK {
+			// Don't gate on allBindingsReady — bindings report Bound
+			// asynchronously from worker threads. The probe needs ctrl
+			// enabled to test if XSK works; gating on Bound creates a
+			// chicken-and-egg where bindings never stabilize as Bound
+			// because config reconciles keep restarting workers.
 			// Probe: temporarily enable ctrl + swap to XDP shim to test
 			// if XSK can sustain forwarding. If rx increases within 10s,
 			// keep the shim permanently. Otherwise revert to eBPF pipeline.
