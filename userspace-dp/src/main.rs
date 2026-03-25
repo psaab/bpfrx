@@ -1345,8 +1345,18 @@ fn handle_stream(
                     guard.status.capabilities = snapshot.capabilities.clone();
                     let existing_bindings = guard.status.bindings.clone();
                     let previous_snapshot = guard.snapshot.as_ref();
-                    let same_plan =
-                        previous_snapshot.is_some_and(|prev| same_binding_plan(prev, &snapshot));
+                    let same_plan = previous_snapshot.is_some_and(|prev| {
+                        let prev_key = snapshot_binding_plan_key(prev);
+                        let next_key = snapshot_binding_plan_key(&snapshot);
+                        let same = prev_key == next_key;
+                        if !same {
+                            eprintln!(
+                                "CTRL_REQ: binding plan changed prev_key={} next_key={}",
+                                prev_key, next_key
+                            );
+                        }
+                        same
+                    });
                     guard.snapshot = Some(snapshot.clone());
                     if same_plan {
                         guard.afxdp.refresh_runtime_snapshot(&snapshot);
