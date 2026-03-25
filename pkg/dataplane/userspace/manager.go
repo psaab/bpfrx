@@ -2765,11 +2765,12 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			continue
 		}
 		flags := uint32(0)
-		if binding.Registered && binding.Armed && binding.Bound {
-			// Mark ready if bound (XSK socket exists), not just if
-			// heartbeat is fresh. The heartbeat check is too strict
-			// during startup — a brief stale period shouldn't cause
-			// the XDP shim to drop ALL packets on that queue.
+		if binding.Registered && binding.Armed {
+			// Mark ready once registered + armed. Don't wait for Bound:
+			// the Bound flag is set asynchronously by worker threads
+			// after XSK socket creation. Waiting creates a chicken-and-egg
+			// where the XDP shim drops packets (flags=0) preventing the
+			// XSK socket from ever receiving (so Bound never becomes true).
 			flags = userspaceBindingReady
 		}
 		idx := uint32(binding.Ifindex)*bindingQueuesPerIface + binding.QueueID
