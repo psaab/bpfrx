@@ -121,16 +121,12 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	}
 	caps := deriveUserspaceCapabilities(cfg)
 	_ = caps // used below for helper config
-	if m.xskLivenessFailed {
-		m.inner.XDPEntryProg = "xdp_main_prog"
-	} else if m.xskLivenessProven {
-		m.inner.XDPEntryProg = "xdp_userspace_prog"
-	} else if !m.xskProbeStart.IsZero() {
-		// Probe in progress — keep shim attached.
-		m.inner.XDPEntryProg = "xdp_userspace_prog"
-	} else {
-		m.inner.XDPEntryProg = "xdp_main_prog"
-	}
+	// Always use xdp_main_prog during Compile. The userspace dataplane
+	// will be activated via the probe in applyHelperStatusLocked AFTER
+	// the cluster has settled (MAC programming, VRRP elections done).
+	// This prevents XSK socket creation during link cycles that cause
+	// libxdp segfaults in __xsk_setup_xdp_prog.
+	m.inner.XDPEntryProg = "xdp_main_prog"
 	result, err := m.inner.Compile(cfg)
 	if err != nil {
 		return nil, err
@@ -2686,12 +2682,31 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		} else if m.xskLivenessProven {
 			// XSK proven working — keep ctrl enabled.
 			ctrl.Enabled = 1
+		} else if neighborGenOK && !m.ctrlEnableAt.IsZero() &&
+			time.Now().After(m.ctrlEnableAt.Add(60*time.Second)) {
+			// XSK probe: enable ctrl + swap to shim AFTER 60s settle.
+			// The long delay ensures MAC programming + VRRP elections
+			// + VIP assignments are all done. No link cycles expected.
+			// PrepareLinkCycle handles MAC programming; the 60s covers
+			// other transient link events (networkd, VRRP transitions).
+			if m.xskProbeStart.IsZero() {
+				m.xskProbeStart = time.Now()
+				ctrl.Enabled = 1
+				slog.Info("userspace: starting XSK liveness probe (ctrl=1)")
+				_ = m.inner.SwapXDPEntryProg("xdp_userspace_prog")
+			} else if xskReceiveLive {
+				m.xskLivenessProven = true
+				ctrl.Enabled = 1
+				slog.Info("userspace: XSK liveness probe PASSED, userspace dataplane active")
+			} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
+				m.xskLivenessFailed = true
+				ctrl.Enabled = 0
+				slog.Warn("userspace: XSK liveness probe FAILED, using eBPF pipeline")
+				_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
+			} else {
+				ctrl.Enabled = 1
+			}
 		} else {
-			// XSK probe disabled: link cycle events (VRRP, VIP changes)
-			// aren't all preceded by PrepareLinkCycle. Workers segfault
-			// accessing invalidated UMEM during unexpected link DOWN/UP.
-			// Needs a netlink-based pre-link-cycle hook for ALL sources.
-			// eBPF pipeline handles traffic at 20+ Gbps.
 			ctrl.Enabled = 0
 		}
 	}
