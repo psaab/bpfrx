@@ -2348,6 +2348,12 @@ func (m *Manager) desiredForwardingArmedLocked() bool {
 	if !m.lastStatus.Capabilities.ForwardingSupported {
 		return false
 	}
+	// Don't arm during the settle window: xsk_socket__create_shared calls
+	// __xsk_setup_xdp_prog which segfaults if a link cycle is in progress.
+	// The 60s window covers MAC programming + VRRP elections + networkd.
+	if !m.ctrlEnableAt.IsZero() && time.Now().Before(m.ctrlEnableAt.Add(60*time.Second)) {
+		return false
+	}
 	if !m.clusterHA {
 		return true
 	}
