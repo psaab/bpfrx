@@ -158,6 +158,19 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		m.proc.Process != nil &&
 		prevPlanKey != "" &&
 		prevPlanKey == newPlanKey
+	publishedPlanChangedDuringStartup := pendingXSKStartup &&
+		m.publishedPlanKey != "" &&
+		m.publishedPlanKey != newPlanKey
+	if publishedPlanChangedDuringStartup {
+		slog.Info(
+			"userspace: restarting helper during XSK startup for binding plan change",
+			"generation", snap.Generation,
+			"fib_generation", snap.FIBGeneration,
+		)
+		m.stopLocked()
+		pendingXSKStartup = false
+		samePlanRefresh = false
+	}
 	m.lastSnapshot = snap
 	if pendingXSKStartup {
 		if err := m.syncIngressIfaceMapLocked(snap); err != nil {
@@ -2279,6 +2292,18 @@ func (m *Manager) syncSnapshotLocked() error {
 	// them forces back-to-back full AF_XDP reconciles and self-collides.
 	if m.publishedSnapshot != 0 && !m.xskLivenessProven && !m.xskLivenessFailed {
 		return nil
+	}
+	if m.publishedSnapshot != 0 && m.publishedPlanKey != "" && m.publishedPlanKey != planKey {
+		slog.Info(
+			"userspace: restarting helper for binding plan change",
+			"generation", m.lastSnapshot.Generation,
+			"fib_generation", m.lastSnapshot.FIBGeneration,
+		)
+		cfg := m.cfg
+		m.stopLocked()
+		if err := m.ensureProcessLocked(cfg); err != nil {
+			return fmt.Errorf("restart userspace helper for binding plan change: %w", err)
+		}
 	}
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: m.lastSnapshot}, &status); err != nil {
