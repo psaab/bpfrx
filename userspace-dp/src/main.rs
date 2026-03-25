@@ -1903,64 +1903,55 @@ fn bindings_settled(bindings: &[BindingStatus]) -> bool {
 }
 
 fn same_binding_plan(current: &ConfigSnapshot, next: &ConfigSnapshot) -> bool {
-    if current.userspace != next.userspace {
-        return false;
-    }
-    if current.interfaces.len() != next.interfaces.len()
-        || current.fabrics.len() != next.fabrics.len()
+    snapshot_binding_plan_key(current) == snapshot_binding_plan_key(next)
+}
+
+fn snapshot_binding_plan_key(snapshot: &ConfigSnapshot) -> String {
+    let mut out = String::new();
+    let workers = snapshot
+        .userspace
+        .get("workers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_default();
+    let ring_entries = snapshot
+        .userspace
+        .get("ring_entries")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_default();
+    out.push_str(&format!("workers={workers};ring={ring_entries};"));
+    for iface in snapshot
+        .interfaces
+        .iter()
+        .filter(|iface| include_userspace_binding_interface(iface))
     {
+        out.push_str(&format!(
+            "iface={}/{}/{}/{}/{}/{};",
+            iface.name,
+            iface.linux_name,
+            iface.ifindex,
+            iface.parent_ifindex,
+            iface.rx_queues,
+            iface.tunnel
+        ));
+    }
+    for fab in &snapshot.fabrics {
+        out.push_str(&format!(
+            "fabric={}/{}/{}/{};",
+            fab.name, fab.parent_linux_name, fab.parent_ifindex, fab.rx_queues
+        ));
+    }
+    out
+}
+
+fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> bool {
+    if iface.zone.is_empty() {
         return false;
     }
-    let current_ifaces = current
-        .interfaces
-        .iter()
-        .map(|iface| {
-            (
-                iface.name.as_str(),
-                iface.linux_name.as_str(),
-                iface.ifindex,
-                iface.parent_ifindex,
-                iface.rx_queues,
-                iface.tunnel,
-            )
-        })
-        .collect::<Vec<_>>();
-    let next_ifaces = next
-        .interfaces
-        .iter()
-        .map(|iface| {
-            (
-                iface.name.as_str(),
-                iface.linux_name.as_str(),
-                iface.ifindex,
-                iface.parent_ifindex,
-                iface.rx_queues,
-                iface.tunnel,
-            )
-        })
-        .collect::<Vec<_>>();
-    if current_ifaces != next_ifaces {
+    if iface.tunnel {
         return false;
     }
-    current
-        .fabrics
-        .iter()
-        .map(|fab| {
-            (
-                fab.name.as_str(),
-                fab.parent_linux_name.as_str(),
-                fab.parent_ifindex,
-                fab.rx_queues,
-            )
-        })
-        .eq(next.fabrics.iter().map(|fab| {
-            (
-                fab.name.as_str(),
-                fab.parent_linux_name.as_str(),
-                fab.parent_ifindex,
-                fab.rx_queues,
-            )
-        }))
+    let base = iface.name.split('.').next().unwrap_or(iface.name.as_str());
+    !(base.starts_with("fxp") || base.starts_with("em"))
 }
 
 fn replan_queues(
@@ -2142,6 +2133,97 @@ fn write_state(state_file: &str, state: &Arc<Mutex<ServerState>>) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_binding_plan_ignores_runtime_only_snapshot_changes() {
+        let current = ConfigSnapshot {
+            userspace: serde_json::json!({
+                "binary": "/usr/libexec/bpfrx-userspace-dp",
+                "control_socket": "/run/bpfrx/control.sock",
+                "state_file": "/run/bpfrx/state.json",
+                "workers": 2,
+                "ring_entries": 2048,
+                "poll_mode": "interrupt",
+            }),
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "ge-0/0/1.0".to_string(),
+                    zone: "lan".to_string(),
+                    linux_name: "ge-0-0-1".to_string(),
+                    ifindex: 11,
+                    rx_queues: 4,
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "gr-0/0/0.0".to_string(),
+                    zone: "sfmix".to_string(),
+                    linux_name: "gr-0-0-0".to_string(),
+                    ifindex: 586,
+                    rx_queues: 1,
+                    tunnel: true,
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "fxp0.0".to_string(),
+                    zone: "mgmt".to_string(),
+                    linux_name: "fxp0".to_string(),
+                    ifindex: 42,
+                    rx_queues: 1,
+                    ..Default::default()
+                },
+            ],
+            fabrics: vec![FabricSnapshot {
+                name: "fab0".to_string(),
+                parent_linux_name: "ge-0-0-0".to_string(),
+                parent_ifindex: 21,
+                rx_queues: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut next = current.clone();
+        next.userspace = serde_json::json!({
+            "binary": "/tmp/other-helper",
+            "control_socket": "/tmp/control.sock",
+            "state_file": "/tmp/state.json",
+            "workers": 2,
+            "ring_entries": 2048,
+            "poll_mode": "busy-poll",
+        });
+        next.interfaces.push(InterfaceSnapshot {
+            name: "em0.0".to_string(),
+            zone: "mgmt".to_string(),
+            linux_name: "em0".to_string(),
+            ifindex: 99,
+            rx_queues: 1,
+            ..Default::default()
+        });
+
+        assert!(same_binding_plan(&current, &next));
+    }
+
+    #[test]
+    fn same_binding_plan_detects_binding_topology_change() {
+        let current = ConfigSnapshot {
+            userspace: serde_json::json!({
+                "workers": 2,
+                "ring_entries": 2048,
+            }),
+            interfaces: vec![InterfaceSnapshot {
+                name: "ge-0/0/1.0".to_string(),
+                zone: "lan".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                ifindex: 11,
+                rx_queues: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut next = current.clone();
+        next.interfaces[0].rx_queues = 8;
+
+        assert!(!same_binding_plan(&current, &next));
+    }
 
     #[test]
     fn queue_planner_filters_non_data_interfaces() {
