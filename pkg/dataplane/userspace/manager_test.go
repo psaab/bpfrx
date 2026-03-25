@@ -1007,6 +1007,41 @@ func TestDesiredForwardingArmedRequiresDataRGOrActiveLocalOnlyGroup(t *testing.T
 	}
 }
 
+func TestHasActiveDataRGLockedIgnoresRG0(t *testing.T) {
+	m := &Manager{
+		haGroups: map[int]HAGroupStatus{
+			0: {RGID: 0, Active: true},
+			1: {RGID: 1, Active: false},
+			2: {RGID: 2, Active: false},
+		},
+	}
+	if m.hasActiveDataRGLocked() {
+		t.Fatal("hasActiveDataRGLocked() = true, want false when only RG0 is active")
+	}
+	m.haGroups[2] = HAGroupStatus{RGID: 2, Active: true}
+	if !m.hasActiveDataRGLocked() {
+		t.Fatal("hasActiveDataRGLocked() = false, want true when a data RG is active")
+	}
+}
+
+func TestShouldExtendXSKLivenessIdleLockedRequiresNoActiveDataRG(t *testing.T) {
+	m := &Manager{
+		haGroups: map[int]HAGroupStatus{
+			0: {RGID: 0, Active: true},
+		},
+	}
+	if !m.shouldExtendXSKLivenessIdleLocked(0) {
+		t.Fatal("shouldExtendXSKLivenessIdleLocked(0) = false, want true with no active data RG")
+	}
+	m.haGroups[1] = HAGroupStatus{RGID: 1, Active: true}
+	if m.shouldExtendXSKLivenessIdleLocked(0) {
+		t.Fatal("shouldExtendXSKLivenessIdleLocked(0) = true, want false with active data RG")
+	}
+	if m.shouldExtendXSKLivenessIdleLocked(42) {
+		t.Fatal("shouldExtendXSKLivenessIdleLocked(42) = true, want false when RX is already live")
+	}
+}
+
 func TestDesiredForwardingArmedDefaultsOnStandalone(t *testing.T) {
 	m := &Manager{
 		clusterHA: false,

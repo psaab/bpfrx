@@ -2379,6 +2379,19 @@ func (m *Manager) desiredForwardingArmedLocked() bool {
 	return false
 }
 
+func (m *Manager) hasActiveDataRGLocked() bool {
+	for _, group := range m.haGroups {
+		if group.RGID > 0 && group.Active {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) shouldExtendXSKLivenessIdleLocked(currentRX uint64) bool {
+	return currentRX == 0 && !m.hasActiveDataRGLocked()
+}
+
 func (m *Manager) configHasDataRGLocked() bool {
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil || m.lastSnapshot.Config.Chassis.Cluster == nil {
 		return false
@@ -2732,6 +2745,11 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 					m.xskProbeStart = time.Now()
 					slog.Info("userspace: starting XSK liveness probe")
 				} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
+					if m.shouldExtendXSKLivenessIdleLocked(currentRX) {
+						m.xskProbeStart = time.Now()
+						slog.Info("userspace: extending XSK liveness probe while idle")
+						goto ctrlReady
+					}
 					m.xskLivenessFailed = true
 					m.xskProbeStart = time.Time{}
 					ctrl.Enabled = 0
@@ -2750,6 +2768,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			ctrl.Enabled = 0
 		}
 	}
+ctrlReady:
 	// Flush stale BPF session entries when ctrl transitions from
 	// disabled to enabled. During ctrl-disabled, the eBPF pipeline
 	// creates PASS_TO_KERNEL entries in the userspace session map.
