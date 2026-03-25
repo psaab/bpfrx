@@ -14,7 +14,7 @@ Pre-commit validation checklist. Check the boxes that apply to your change.
 - [ ] `cargo build --release` — release build succeeds
 - [ ] Deploy to loss userspace cluster: `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env ./test/incus/cluster-setup.sh deploy all`
 - [ ] `RUNS=1 DURATION=5 PARALLEL=4 scripts/userspace-ha-validation.sh` — passes
-- [ ] `scripts/userspace-ha-failover-validation.sh --duration 60 --parallel 4` — no zero-throughput collapse
+- [ ] `scripts/userspace-ha-failover-validation.sh --duration 60 --parallel 4` — no zero-throughput collapse and external IPv4/IPv6 stay reachable during failover/failback
 - [ ] Manual IPv4 + IPv6 `iperf3 -P 8` from `cluster-userspace-host` stay stable (no stream stuck at 0)
 - [ ] If the host rebooted recently: `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env ./test/incus/cluster-setup.sh refresh-vfs`
 

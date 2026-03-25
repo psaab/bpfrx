@@ -9,6 +9,9 @@ RG="${RG:-1}"
 SOURCE_NODE="${SOURCE_NODE:-0}"
 TARGET_NODE="${TARGET_NODE:-1}"
 IPERF_TARGET="${IPERF_TARGET:-172.16.80.200}"
+EXTERNAL_V4_TARGET="${EXTERNAL_V4_TARGET:-1.1.1.1}"
+EXTERNAL_V6_TARGET="${EXTERNAL_V6_TARGET:-2606:4700:4700::1111}"
+EXTERNAL_PING_COUNT="${EXTERNAL_PING_COUNT:-4}"
 TOTAL_CYCLES="${TOTAL_CYCLES:-1}"
 CYCLE_INTERVAL="${CYCLE_INTERVAL:-10}"
 if [[ -z "${IPERF_DURATION:-}" ]]; then
@@ -279,6 +282,45 @@ validate_target_reachability() {
 		return 0
 	fi
 	return 1
+}
+
+external_ping_path() {
+	local label="$1"
+	printf '%s\n' "${ARTIFACT_DIR}/external-${label}.txt"
+}
+
+check_external_ping() {
+	local label="$1"
+	local family="$2"
+	local target="$3"
+	local path remote_path
+	path="$(external_ping_path "${label}")"
+	remote_path="/tmp/userspace-rg${RG}-${label}.txt"
+	if [[ "$family" == "6" ]]; then
+		run_host "ping -6 -c ${EXTERNAL_PING_COUNT} -W 1 ${target} >${remote_path} 2>&1 || true"
+	else
+		run_host "ping -c ${EXTERNAL_PING_COUNT} -W 1 ${target} >${remote_path} 2>&1 || true"
+	fi
+	run_host "cat ${remote_path} 2>/dev/null || true" >"${path}"
+	run_host "grep -q 'bytes from' ${remote_path}"
+}
+
+validate_external_connectivity() {
+	local label="$1"
+	local ok=0
+	if check_external_ping "${label}-ipv4" 4 "${EXTERNAL_V4_TARGET}"; then
+		pass "${label}: external IPv4 reachable (${EXTERNAL_V4_TARGET})"
+	else
+		fail "${label}: external IPv4 unreachable (${EXTERNAL_V4_TARGET})"
+		ok=1
+	fi
+	if check_external_ping "${label}-ipv6" 6 "${EXTERNAL_V6_TARGET}"; then
+		pass "${label}: external IPv6 reachable (${EXTERNAL_V6_TARGET})"
+	else
+		fail "${label}: external IPv6 unreachable (${EXTERNAL_V6_TARGET})"
+		ok=1
+	fi
+	return "$ok"
 }
 
 start_iperf() {
@@ -580,6 +622,7 @@ validate_pre_failover_health() {
 	capture_vm_state "$SOURCE_VM" "pre-failover-source"
 	capture_vm_state "$TARGET_VM" "pre-failover-target"
 	validate_cycle_health 0 "steady-state" "$owner_vm" "$owner_name" 0
+	validate_external_connectivity "steady-state"
 
 	zero_intervals="$(count_recent_zero_intervals "$PRE_FAILOVER_OBSERVE")"
 	if [[ "$zero_intervals" -le "$MAX_PREFLIGHT_ZERO_INTERVALS" ]]; then
@@ -615,11 +658,13 @@ run_failover_phase() {
 	ACTIVE_FW="$(wait_for_userspace_rg_owner "$RG")" || die "userspace forwarding did not settle on ${to_name} during cycle ${cycle} ${phase}"
 	pass "cycle ${cycle} ${phase}: userspace forwarding active on ${ACTIVE_FW}"
 	capture_cycle_state "$cycle" "$phase"
+	validate_external_connectivity "cycle${cycle}-${phase}"
 	if ! cycle_sleep "$CYCLE_INTERVAL" "$final_phase"; then
 		fail "cycle ${cycle} ${phase}: iperf3 exited before ${CYCLE_INTERVAL}s interval elapsed"
 	fi
 	capture_cycle_state "$cycle" "${phase}-post"
 	validate_cycle_health "$cycle" "$phase" "$to_vm" "$to_name" "$final_phase"
+	validate_external_connectivity "cycle${cycle}-${phase}-post"
 }
 
 restore_cluster() {

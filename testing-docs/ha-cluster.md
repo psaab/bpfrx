@@ -142,6 +142,7 @@ scripts/userspace-ha-failover-validation.sh --duration 90 --parallel 4
 Tests:
 - RG ownership move and userspace arm on the new owner
 - pre-failover and post-failover `iperf3` continuity
+- external IPv4/IPv6 reachability during steady state and after each failover/failback phase
 - zero-interval and retransmit collapse detection
 - session pickup on both nodes
 
