@@ -1960,8 +1960,18 @@ fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> bool {
     if iface.tunnel {
         return false;
     }
+    if !iface.local_fabric_member.is_empty() {
+        return false;
+    }
     let base = iface.name.split('.').next().unwrap_or(iface.name.as_str());
-    !(base.starts_with("fxp") || base.starts_with("em"))
+    if base.starts_with("fxp")
+        || base.starts_with("em")
+        || base.starts_with("fab")
+        || base == "lo0"
+    {
+        return false;
+    }
+    !matches!(iface.zone.as_str(), "mgmt" | "control")
 }
 
 fn replan_queues(
@@ -2165,6 +2175,14 @@ mod tests {
                     ..Default::default()
                 },
                 InterfaceSnapshot {
+                    name: "fab0".to_string(),
+                    zone: "control".to_string(),
+                    linux_name: "fab0".to_string(),
+                    ifindex: 149,
+                    rx_queues: 16,
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
                     name: "gr-0/0/0.0".to_string(),
                     zone: "sfmix".to_string(),
                     linux_name: "gr-0-0-0".to_string(),
@@ -2208,6 +2226,7 @@ mod tests {
             rx_queues: 1,
             ..Default::default()
         });
+        next.interfaces[1].ifindex = 154;
 
         assert!(same_binding_plan(&current, &next));
     }
