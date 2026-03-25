@@ -73,9 +73,16 @@ int bridge_xsk_socket_create(
         .xdp_flags    = xdp_flags,
         .bind_flags   = bind_flags,
     };
-    return xsk_socket__create_shared(
-        xsk_out, ifname, queue_id, umem,
-        rx, tx, fill, comp, &cfg);
+    /* Use non-shared create. Each binding has its own UMEM (one socket
+     * per UMEM), so create_shared's multi-socket support isn't needed.
+     * Non-shared create avoids the __xsk_setup_xdp_prog segfault that
+     * occurs with create_shared during socket deletion (ctx->xdp_prog
+     * gets set despite INHIBIT_PROG_LOAD on libxdp 1.6.0).
+     * The fill/comp parameters are ignored — non-shared create uses
+     * the UMEM's fill/comp rings directly. */
+    (void)fill;
+    (void)comp;
+    return xsk_socket__create(xsk_out, ifname, queue_id, umem, rx, tx, &cfg);
 }
 
 void bridge_xsk_socket_delete(struct xsk_socket *xsk)

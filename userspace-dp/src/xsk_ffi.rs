@@ -911,7 +911,7 @@ impl Drop for ReadComplete<'_> {
 ///
 /// `bind_flags` is the raw XDP bind flags (copy/zerocopy/need_wakeup).
 pub fn create_xsk_binding(
-    umem: &Umem,
+    umem: &mut Umem,
     info: &IfInfo,
     ring_entries: u32,
     bind_flags: u16,
@@ -986,10 +986,12 @@ pub fn create_xsk_binding(
         fd,
     };
 
+    // Non-shared create uses the UMEM's fill/comp rings (not per-socket).
+    // Take ownership from the umem to use in DeviceQueue.
     let device = DeviceQueue {
         xsk: xsk_ptr,
-        fill: fill_ring,
-        comp: comp_ring,
+        fill: std::mem::replace(&mut umem.fill, fill_ring),
+        comp: std::mem::replace(&mut umem.comp, comp_ring),
         fd,
     };
 
