@@ -716,6 +716,7 @@ impl Coordinator {
     ) {
         self.reconcile_calls += 1;
         self.last_reconcile_stage = "start".to_string();
+        let had_live_workers = !self.workers.is_empty();
         let preserved_synced_sessions = self.snapshot_shared_session_entries();
         // Keep a healthy slow-path worker across back-to-back reconciles. The
         // userspace helper can receive multiple snapshot refreshes during HA
@@ -729,6 +730,12 @@ impl Coordinator {
             }
         });
         self.stop_inner(false);
+        if had_live_workers {
+            // Zero-copy queue teardown is not synchronously reusable on mlx5.
+            // A short quiesce avoids EBUSY when a later snapshot refresh
+            // rebuilds the same queue set immediately after shutdown.
+            thread::sleep(Duration::from_millis(500));
+        }
         for binding in bindings.iter_mut() {
             binding.bound = false;
             binding.xsk_registered = false;
