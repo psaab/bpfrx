@@ -158,6 +158,8 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: snap}, &status); err != nil {
 		return result, fmt.Errorf("publish userspace snapshot: %w", err)
 	}
+	m.publishedSnapshot = snap.Generation
+	m.publishedPlanKey = snapshotBindingPlanKey(snap)
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return result, fmt.Errorf("sync helper status: %w", err)
 	}
