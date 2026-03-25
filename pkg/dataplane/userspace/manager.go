@@ -2268,9 +2268,6 @@ func (m *Manager) syncSnapshotLocked() error {
 	if m.publishedSnapshot >= m.lastSnapshot.Generation {
 		return nil
 	}
-	if m.publishedSnapshot != 0 && m.xskLivenessProven && m.publishedPlanKey == planKey {
-		return nil
-	}
 	if m.lastStatus.LastSnapshotGeneration >= m.lastSnapshot.Generation {
 		m.publishedSnapshot = m.lastStatus.LastSnapshotGeneration
 		return nil
