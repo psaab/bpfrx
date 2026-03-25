@@ -398,7 +398,8 @@ impl Drop for Umem {
 
 /// In xdpilone, Socket was a raw XDP socket FD with interface info.
 /// With libxdp, socket creation and binding happen in one call
-/// (`xsk_socket__create_shared`), so this is now just a marker.
+/// (`xsk_socket__create` in our current bridge), so this is now just
+/// a marker.
 pub struct Socket;
 
 impl Socket {
@@ -415,7 +416,7 @@ impl Socket {
 // ── User (placeholder for API compat) ────────────────────────────────
 
 /// In xdpilone, User owned the rx/tx ring configuration on a socket FD.
-/// With libxdp, `xsk_socket__create_shared` does everything, so User
+/// With libxdp, `xsk_socket__create` does everything, so User
 /// just holds the resulting socket FD for XSK map registration.
 pub struct User {
     fd: c_int,
@@ -904,7 +905,8 @@ impl Drop for ReadComplete<'_> {
 //   4. user.map_rx() / user.map_tx()
 //   5. umem.bind(&user)
 //
-// With libxdp, `xsk_socket__create_shared` does ALL of this in one call.
+// With libxdp, the bridged `xsk_socket__create` path does all of this in
+// one call.
 
 /// Create an XSK socket bound to `ifname:queue_id`, returning all ring
 /// handles needed by the worker.
@@ -920,7 +922,9 @@ pub fn create_xsk_binding(
 
     let mut rx_ring: Box<XskRingCons> = Box::new(unsafe { core::mem::zeroed() });
     let mut tx_ring: Box<XskRingProd> = Box::new(unsafe { core::mem::zeroed() });
-    // libxdp allocates per-socket fill/comp rings in create_shared.
+    // The bridge takes pointers for fill/comp regardless of the create mode.
+    // In the current non-shared path these are replaced with the UMEM-owned
+    // rings after socket creation.
     let mut fill_ring: Box<XskRingProd> = Box::new(unsafe { core::mem::zeroed() });
     let mut comp_ring: Box<XskRingCons> = Box::new(unsafe { core::mem::zeroed() });
     let mut xsk_ptr: *mut XskSocketOpaque = core::ptr::null_mut();
@@ -953,7 +957,7 @@ pub fn create_xsk_binding(
 
     let fd = unsafe { bridge_xsk_socket_fd(xsk_ptr) };
 
-    // Diagnostic: verify ring structs were populated by create_shared.
+    // Diagnostic: verify ring structs were populated by socket creation.
     // If any pointer is null or size/mask is 0, the ring wasn't initialised.
     eprintln!(
         "bpfrx-xsk-ffi: create_xsk_binding fd={} rx_ring=[mask={:#x} size={} \

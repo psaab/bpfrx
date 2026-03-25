@@ -237,7 +237,8 @@ pub(super) fn shared_umem_group_key_for_device(
     }
 }
 
-/// Create and bind an XSK socket using libxdp's `xsk_socket__create_shared`.
+/// Create and bind an XSK socket using libxdp's non-shared
+/// `xsk_socket__create` path via the FFI bridge.
 ///
 /// This replaces the multi-step xdpilone flow (Socket::with_shared →
 /// umem.fq_cq → umem.rx_tx → user.map_rx/map_tx → umem.bind) with a
@@ -265,9 +266,9 @@ fn try_open_bind(
             Ok((user, rx, tx, mut device)) => {
                 let user_fd = user.as_raw_fd();
 
-                // Prime the fill ring AFTER bind — libxdp already binds
-                // the socket during create_shared. Post-bind fill ring
-                // priming triggers NAPI to consume entries and post WQEs.
+                // Prime the fill ring AFTER create. The bridged libxdp call
+                // already created and bound the socket, so post-bind priming
+                // triggers NAPI to consume entries and post RX WQEs.
                 if let Some(offsets) = pre_bind_fill_offsets {
                     prime_fill_ring_offsets(&mut device, offsets)?;
                 }
@@ -289,7 +290,7 @@ fn try_open_bind(
                     continue;
                 }
                 return Err(format!(
-                    "libxdp xsk_socket__create_shared(flags=0x{:04x}): {msg}",
+                    "libxdp xsk_socket__create(flags=0x{:04x}): {msg}",
                     bind_flags,
                 ).into());
             }

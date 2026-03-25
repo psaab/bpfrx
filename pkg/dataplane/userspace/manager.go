@@ -2352,10 +2352,11 @@ func (m *Manager) desiredForwardingArmedLocked() bool {
 	if !m.lastStatus.Capabilities.ForwardingSupported {
 		return false
 	}
-	// Don't arm during the settle window: xsk_socket__create_shared calls
-	// __xsk_setup_xdp_prog which segfaults if a link cycle is in progress.
-	// 45s covers MAC programming + VRRP elections + networkd. The probe
-	// starts at 60s, so bindings are armed 15s before the probe fires.
+	// Don't arm during the settle window. The current libxdp AF_XDP path
+	// still needs time to ride out link-cycle churn during MAC programming,
+	// VRRP elections, and networkd reconfiguration. Keep bindings disarmed
+	// for 45s so the later 60s ctrl-enable window starts from a settled NIC
+	// state instead of a transient link event.
 	if !m.ctrlEnableAt.IsZero() && time.Now().Before(m.ctrlEnableAt.Add(45*time.Second)) {
 		return false
 	}
