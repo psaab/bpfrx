@@ -201,7 +201,13 @@ pub(super) fn apply_worker_commands(
     for cmd in pending {
         match cmd {
             WorkerCommand::DemoteOwnerRG(owner_rg_id) => {
-                sessions.demote_owner_rg(owner_rg_id);
+                // Mark sessions as synced AND remove from the USERSPACE_SESSIONS
+                // BPF map so the XDP shim falls through to the eBPF pipeline.
+                // The eBPF pipeline checks rg_active and redirects via fabric.
+                let demoted = sessions.demote_owner_rg(owner_rg_id);
+                for key in &demoted {
+                    delete_live_session_key(session_map_fd, key);
+                }
             }
             WorkerCommand::RefreshOwnerRGs(owner_rgs) => {
                 refresh_live_reverse_sessions_for_owner_rgs(

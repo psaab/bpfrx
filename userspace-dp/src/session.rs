@@ -477,19 +477,19 @@ impl SessionTable {
         })
     }
 
-    pub fn demote_owner_rg(&mut self, owner_rg_id: i32) -> usize {
+    pub fn demote_owner_rg(&mut self, owner_rg_id: i32) -> Vec<crate::session::SessionKey> {
         if owner_rg_id <= 0 {
-            return 0;
+            return Vec::new();
         }
-        let mut affected = 0usize;
-        for entry in self.sessions.values_mut() {
+        let mut demoted_keys = Vec::new();
+        for (key, entry) in self.sessions.iter_mut() {
             if entry.metadata.owner_rg_id != owner_rg_id || entry.metadata.synced {
                 continue;
             }
             entry.metadata.synced = true;
-            affected = affected.saturating_add(1);
+            demoted_keys.push(key.clone());
         }
-        affected
+        demoted_keys
     }
 
     pub fn drain_deltas(&mut self, max: usize) -> Vec<SessionDelta> {
@@ -1168,7 +1168,7 @@ mod tests {
             0x10,
         ));
 
-        assert_eq!(table.demote_owner_rg(1), 2);
+        assert_eq!(table.demote_owner_rg(1).len(), 2);
 
         assert!(
             table
