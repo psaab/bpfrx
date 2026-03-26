@@ -1848,10 +1848,10 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	}
 
 	// 2.6b2. Rebind AF_XDP sockets after RETH MAC programming.
-	// Only needed when programRethMAC brought links DOWN/UP which
-	// destroys the kernel-side XSK receive queue.  If MAC was set
-	// without a link cycle, AF_XDP sockets are unaffected.
-	if needLinkCycleRecovery && d.dp != nil && d.cluster != nil && cfg.Chassis.Cluster != nil {
+	// PrepareLinkCycle stops all workers unconditionally, so we must
+	// always rebind — even when MAC was set without a link cycle
+	// (the workers are still stopped and need to be restarted).
+	if d.dp != nil && d.cluster != nil && cfg.Chassis.Cluster != nil {
 		d.dp.NotifyLinkCycle()
 		// Re-send RA startup burst AFTER the link is back up.  The
 		// previous startup burst fires during/before the link cycle
