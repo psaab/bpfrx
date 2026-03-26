@@ -5154,13 +5154,13 @@ func sendICMPProbe(iface string, target net.IP) {
 
 func (d *Daemon) logFabricRefreshFailure(slot int, msg string, args ...any) {
 	d.fabricMu.Lock()
-	defer d.fabricMu.Unlock()
 	now := time.Now()
 	last := d.lastFabricLog0
 	if slot == 1 {
 		last = d.lastFabricLog1
 	}
 	if now.Sub(last) < 2*time.Second {
+		d.fabricMu.Unlock()
 		return
 	}
 	if slot == 0 {
@@ -5168,6 +5168,7 @@ func (d *Daemon) logFabricRefreshFailure(slot int, msg string, args ...any) {
 	} else {
 		d.lastFabricLog1 = now
 	}
+	d.fabricMu.Unlock()
 	slog.Info(msg, args...)
 }
 
@@ -6019,7 +6020,7 @@ func (d *Daemon) reconcileRGState() {
 		fp := d.fabricPopulated
 		d.fabricMu.RUnlock()
 		if !fp {
-			go d.RefreshFabricFwd()
+			d.triggerFabricRefresh()
 			fabricReady = false
 		}
 	}
