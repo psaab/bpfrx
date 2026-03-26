@@ -546,6 +546,7 @@ pub struct Coordinator {
     shared_forwarding: Arc<ArcSwap<ForwardingState>>,
     shared_validation: Arc<ArcSwap<ValidationState>>,
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    neighbor_generation: Arc<AtomicU64>,
     manager_neighbor_keys: Arc<Mutex<FastSet<(i32, IpAddr)>>>,
     neigh_monitor_stop: Option<Arc<AtomicBool>>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -583,6 +584,7 @@ impl Coordinator {
             shared_forwarding: Arc::new(ArcSwap::from_pointee(ForwardingState::default())),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
+            neighbor_generation: Arc::new(AtomicU64::new(0)),
             manager_neighbor_keys: Arc::new(Mutex::new(FastSet::default())),
             neigh_monitor_stop: None,
             shared_sessions: Arc::new(Mutex::new(FastMap::default())),
@@ -635,6 +637,13 @@ impl Coordinator {
             cache.insert(key, *entry);
             manager_keys.insert(key);
         }
+        self.neighbor_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dynamic_neighbor_status(&self) -> (usize, u64) {
+        let entries = self.dynamic_neighbors.lock().map(|n| n.len()).unwrap_or(0);
+        let generation = self.neighbor_generation.load(Ordering::Relaxed);
+        (entries, generation)
     }
 
     fn stop_inner(&mut self, clear_synced_state: bool) {
@@ -690,6 +699,7 @@ impl Coordinator {
         self.shared_validation
             .store(Arc::new(ValidationState::default()));
         self.shared_fabrics.store(Arc::new(Vec::new()));
+        self.neighbor_generation.store(0, Ordering::Relaxed);
         if let Ok(mut neighbors) = self.dynamic_neighbors.lock() {
             neighbors.clear();
         }
@@ -1109,16 +1119,19 @@ impl Coordinator {
             self.identities.len(),
             self.live.len()
         );
-        // Start neighbor monitor thread to learn kernel ARP/NDP entries
-        // instantly via netlink RTM_NEWNEIGH events. Without this, the
-        // helper waits 1-5s for the Go-side snapshot refresh.
+        // Start the helper-owned neighbor sync path. It does an initial
+        // RTM_GETNEIGH dump so startup sees the existing kernel table, then
+        // subscribes to RTM_{NEW,DEL}NEIGH for incremental updates.
         if self.neigh_monitor_stop.is_none() {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
             let dynamic_neighbors = self.dynamic_neighbors.clone();
+            let neighbor_generation = self.neighbor_generation.clone();
             thread::Builder::new()
                 .name("neigh-monitor".to_string())
-                .spawn(move || neigh_monitor_thread(stop_clone, dynamic_neighbors))
+                .spawn(move || {
+                    neigh_monitor_thread(stop_clone, dynamic_neighbors, neighbor_generation)
+                })
                 .ok();
             self.neigh_monitor_stop = Some(stop);
         }
@@ -3404,6 +3417,7 @@ fn poll_binding(
                                 cluster_peer_return_fast_path(
                                     forwarding,
                                     dynamic_neighbors,
+                                    packet_frame,
                                     meta,
                                     ingress_zone_override.as_deref(),
                                     resolution_target,
@@ -4752,19 +4766,12 @@ fn poll_binding(
                                 // a reverse session. Without this, the SYN-ACK hits
                                 // session miss → policy deny (no rule for WAN→LAN).
                                 if let Some(flow) = flow.as_ref() {
-                                    let sess_zone = session_ingress_zone
-                                        .as_ref()
-                                        .cloned()
-                                        .unwrap_or_else(|| Arc::from(""));
-                                    let sess_meta = SessionMetadata {
-                                        ingress_zone: sess_zone,
-                                        egress_zone: Arc::from(""),
-                                        owner_rg_id: 0,
-                                        fabric_ingress: false,
-                                        is_reverse: false,
-                                        synced: true,
-                                        nat64_reverse: None,
-                                    };
+                                    let sess_meta = build_missing_neighbor_session_metadata(
+                                        forwarding,
+                                        session_ingress_zone.as_ref(),
+                                        meta.ingress_ifindex as i32,
+                                        decision,
+                                    );
                                     if sessions.install_with_protocol(
                                         flow.forward_key.clone(),
                                         decision,
@@ -5232,6 +5239,25 @@ fn learn_dynamic_neighbor(
         for ifindex in ifindexes {
             cache.insert((ifindex, src_ip), NeighborEntry { mac: src_mac });
         }
+    }
+}
+
+fn build_missing_neighbor_session_metadata(
+    forwarding: &ForwardingState,
+    session_ingress_zone: Option<&Arc<str>>,
+    ingress_ifindex: i32,
+    decision: SessionDecision,
+) -> SessionMetadata {
+    SessionMetadata {
+        ingress_zone: session_ingress_zone
+            .cloned()
+            .unwrap_or_else(|| Arc::from("")),
+        egress_zone: Arc::from(""),
+        owner_rg_id: owner_rg_for_resolution(forwarding, decision.resolution),
+        fabric_ingress: ingress_is_fabric(forwarding, ingress_ifindex),
+        is_reverse: false,
+        synced: true,
+        nat64_reverse: None,
     }
 }
 
@@ -7110,9 +7136,201 @@ fn add_kernel_neighbor(ifindex: i32, ip: IpAddr, mac: [u8; 6]) {
 /// receives it and updates the helper's dynamic_neighbors cache instantly,
 /// so the next packet for that destination finds the neighbor and forwards
 /// directly through XSK — no waiting for the Go-side snapshot refresh.
+fn update_dynamic_neighbor(
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    ifindex: i32,
+    ip: IpAddr,
+    entry: NeighborEntry,
+) -> bool {
+    let Ok(mut neighbors) = dynamic_neighbors.lock() else {
+        return false;
+    };
+    let key = (ifindex, ip);
+    if neighbors.get(&key).map(|existing| existing.mac) == Some(entry.mac) {
+        return false;
+    }
+    neighbors.insert(key, entry);
+    true
+}
+
+fn remove_dynamic_neighbor(
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    ifindex: i32,
+    ip: IpAddr,
+) -> bool {
+    let Ok(mut neighbors) = dynamic_neighbors.lock() else {
+        return false;
+    };
+    neighbors.remove(&(ifindex, ip)).is_some()
+}
+
+fn parse_neighbor_msg(
+    nlmsg_type: u16,
+    body: &[u8],
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+) -> bool {
+    if body.len() < 12 {
+        return false;
+    }
+    let family = body[0];
+    let ifindex = i32::from_ne_bytes([body[4], body[5], body[6], body[7]]);
+    let state = u16::from_ne_bytes([body[8], body[9]]);
+    let mut attr_off = 12usize;
+    let mut ip: Option<IpAddr> = None;
+    let mut mac: Option<[u8; 6]> = None;
+    while attr_off + 4 <= body.len() {
+        let attr_len = u16::from_ne_bytes([body[attr_off], body[attr_off + 1]]) as usize;
+        let attr_type = u16::from_ne_bytes([body[attr_off + 2], body[attr_off + 3]]);
+        if attr_len < 4 || attr_off + attr_len > body.len() {
+            break;
+        }
+        let payload = &body[attr_off + 4..attr_off + attr_len];
+        match attr_type {
+            1 => {
+                if family == libc::AF_INET as u8 && payload.len() >= 4 {
+                    ip = Some(IpAddr::V4(Ipv4Addr::new(
+                        payload[0], payload[1], payload[2], payload[3],
+                    )));
+                } else if family == libc::AF_INET6 as u8 && payload.len() >= 16 {
+                    let mut bytes = [0u8; 16];
+                    bytes.copy_from_slice(&payload[..16]);
+                    ip = Some(IpAddr::V6(Ipv6Addr::from(bytes)));
+                }
+            }
+            2 => {
+                if payload.len() >= 6 {
+                    mac = Some([
+                        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                    ]);
+                }
+            }
+            _ => {}
+        }
+        attr_off += (attr_len + 3) & !3;
+    }
+    let Some(ip) = ip else {
+        return false;
+    };
+    match nlmsg_type {
+        28 => {
+            if state & 0x1e == 0 {
+                return remove_dynamic_neighbor(dynamic_neighbors, ifindex, ip);
+            }
+            let Some(mac) = mac else {
+                return false;
+            };
+            update_dynamic_neighbor(dynamic_neighbors, ifindex, ip, NeighborEntry { mac })
+        }
+        29 => remove_dynamic_neighbor(dynamic_neighbors, ifindex, ip),
+        _ => false,
+    }
+}
+
+fn request_neighbor_dump(fd: c_int, family: u8, seq: u32) -> io::Result<()> {
+    const RTM_GETNEIGH: u16 = 30;
+    const NLM_F_REQUEST: u16 = 0x1;
+    const NLM_F_ROOT: u16 = 0x100;
+    const NLM_F_MATCH: u16 = 0x200;
+    let mut buf = [0u8; 28];
+    buf[0..4].copy_from_slice(&(28u32).to_ne_bytes());
+    buf[4..6].copy_from_slice(&RTM_GETNEIGH.to_ne_bytes());
+    buf[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ROOT | NLM_F_MATCH).to_ne_bytes());
+    buf[8..12].copy_from_slice(&seq.to_ne_bytes());
+    buf[12..16].copy_from_slice(&0u32.to_ne_bytes());
+    buf[16] = family;
+    let mut sa: libc::sockaddr_nl = unsafe { core::mem::zeroed() };
+    sa.nl_family = libc::AF_NETLINK as u16;
+    let rc = unsafe {
+        libc::sendto(
+            fd,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+            0,
+            &sa as *const libc::sockaddr_nl as *const libc::sockaddr,
+            core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn initial_neighbor_dump(
+    fd: c_int,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+) -> io::Result<u64> {
+    const NLMSG_DONE: u16 = 3;
+    const NLMSG_ERROR: u16 = 2;
+    let mut next_seq = 1u32;
+    let mut changed = false;
+    let mut buf = vec![0u8; 8192];
+    for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+        request_neighbor_dump(fd, family, next_seq)?;
+        loop {
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                let kind = err.kind();
+                if kind == io::ErrorKind::WouldBlock || kind == io::ErrorKind::TimedOut {
+                    return Err(err);
+                }
+                continue;
+            }
+            let mut offset = 0usize;
+            let mut dump_done = false;
+            while offset + 16 <= n as usize {
+                let nlmsg_len = u32::from_ne_bytes([
+                    buf[offset],
+                    buf[offset + 1],
+                    buf[offset + 2],
+                    buf[offset + 3],
+                ]) as usize;
+                let nlmsg_type = u16::from_ne_bytes([buf[offset + 4], buf[offset + 5]]);
+                let nlmsg_seq = u32::from_ne_bytes([
+                    buf[offset + 8],
+                    buf[offset + 9],
+                    buf[offset + 10],
+                    buf[offset + 11],
+                ]);
+                if nlmsg_len < 16 || offset + nlmsg_len > n as usize {
+                    break;
+                }
+                if nlmsg_seq != next_seq {
+                    offset += (nlmsg_len + 3) & !3;
+                    continue;
+                }
+                match nlmsg_type {
+                    NLMSG_DONE => {
+                        dump_done = true;
+                    }
+                    NLMSG_ERROR => {
+                        return Err(io::Error::other("netlink neighbor dump failed"));
+                    }
+                    28 | 29 => {
+                        changed |= parse_neighbor_msg(
+                            nlmsg_type,
+                            &buf[offset + 16..offset + nlmsg_len],
+                            dynamic_neighbors,
+                        );
+                    }
+                    _ => {}
+                }
+                offset += (nlmsg_len + 3) & !3;
+            }
+            if dump_done {
+                break;
+            }
+        }
+        next_seq += 1;
+    }
+    Ok(if changed { 1 } else { 0 })
+}
+
 fn neigh_monitor_thread(
     stop: Arc<AtomicBool>,
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    neighbor_generation: Arc<AtomicU64>,
 ) {
     // Create NETLINK_ROUTE socket and subscribe to neighbor events
     let fd = unsafe {
@@ -7158,6 +7376,16 @@ fn neigh_monitor_thread(
             core::mem::size_of::<libc::timeval>() as libc::socklen_t,
         );
     }
+    match initial_neighbor_dump(fd, &dynamic_neighbors) {
+        Ok(_) => {
+            neighbor_generation.store(1, Ordering::Relaxed);
+            eprintln!("neigh_monitor: initial kernel neighbor dump complete");
+        }
+        Err(err) => {
+            neighbor_generation.store(1, Ordering::Relaxed);
+            eprintln!("neigh_monitor: initial dump failed: {err}");
+        }
+    }
     eprintln!("neigh_monitor: listening for kernel neighbor events");
     let mut buf = vec![0u8; 8192];
     while !stop.load(Ordering::Relaxed) {
@@ -7165,8 +7393,8 @@ fn neigh_monitor_thread(
         if n <= 0 {
             continue;
         }
-        // Parse netlink messages
         let mut offset = 0usize;
+        let mut changed = false;
         while offset + 16 <= n as usize {
             let nlmsg_len = u32::from_ne_bytes([
                 buf[offset],
@@ -7178,72 +7406,17 @@ fn neigh_monitor_thread(
             if nlmsg_len < 16 || offset + nlmsg_len > n as usize {
                 break;
             }
-            // RTM_NEWNEIGH = 28
-            if nlmsg_type == 28 {
-                // ndmsg starts at offset+16: family(1) pad(3) ifindex(4) state(2) flags(1) type(1)
-                let ndm_start = offset + 16;
-                if ndm_start + 12 <= n as usize {
-                    let family = buf[ndm_start];
-                    let ifindex = i32::from_ne_bytes([
-                        buf[ndm_start + 4],
-                        buf[ndm_start + 5],
-                        buf[ndm_start + 6],
-                        buf[ndm_start + 7],
-                    ]);
-                    let state = u16::from_ne_bytes([buf[ndm_start + 8], buf[ndm_start + 9]]);
-                    // Only learn REACHABLE, STALE, DELAY, PROBE states
-                    // NUD_REACHABLE=2, NUD_STALE=4, NUD_DELAY=8, NUD_PROBE=16
-                    if state & 0x1e != 0 {
-                        // Parse NDA attributes
-                        let mut attr_off = ndm_start + 12;
-                        let mut ip: Option<IpAddr> = None;
-                        let mut mac: Option<[u8; 6]> = None;
-                        while attr_off + 4 <= offset + nlmsg_len {
-                            let attr_len =
-                                u16::from_ne_bytes([buf[attr_off], buf[attr_off + 1]]) as usize;
-                            let attr_type =
-                                u16::from_ne_bytes([buf[attr_off + 2], buf[attr_off + 3]]);
-                            if attr_len < 4 {
-                                break;
-                            }
-                            let payload = &buf[attr_off + 4
-                                ..attr_off + attr_len.min(offset + nlmsg_len - attr_off)];
-                            match attr_type {
-                                1 => {
-                                    // NDA_DST
-                                    if family == libc::AF_INET as u8 && payload.len() >= 4 {
-                                        ip = Some(IpAddr::V4(Ipv4Addr::new(
-                                            payload[0], payload[1], payload[2], payload[3],
-                                        )));
-                                    } else if family == libc::AF_INET6 as u8 && payload.len() >= 16
-                                    {
-                                        let mut bytes = [0u8; 16];
-                                        bytes.copy_from_slice(&payload[..16]);
-                                        ip = Some(IpAddr::V6(Ipv6Addr::from(bytes)));
-                                    }
-                                }
-                                2 => {
-                                    // NDA_LLADDR
-                                    if payload.len() >= 6 {
-                                        mac = Some([
-                                            payload[0], payload[1], payload[2], payload[3],
-                                            payload[4], payload[5],
-                                        ]);
-                                    }
-                                }
-                                _ => {}
-                            }
-                            attr_off += (attr_len + 3) & !3; // align to 4
-                        }
-                        if let (Some(ip), Some(mac)) = (ip, mac) {
-                            if let Ok(mut neighbors) = dynamic_neighbors.lock() {
-                                neighbors.insert((ifindex, ip), NeighborEntry { mac });
-                            }
-                        }
-                    }
-                }
+            if nlmsg_type == 28 || nlmsg_type == 29 {
+                changed |= parse_neighbor_msg(
+                    nlmsg_type,
+                    &buf[offset + 16..offset + nlmsg_len],
+                    &dynamic_neighbors,
+                );
             }
             offset += (nlmsg_len + 3) & !3; // align to 4
+        }
+        if changed {
+            neighbor_generation.fetch_add(1, Ordering::Relaxed);
         }
     }
     unsafe { libc::close(fd) };
@@ -8327,6 +8500,7 @@ fn redirect_via_fabric_if_needed(
 fn cluster_peer_return_fast_path(
     forwarding: &ForwardingState,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    packet_frame: &[u8],
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<&str>,
     resolution_target: IpAddr,
@@ -8335,6 +8509,9 @@ fn cluster_peer_return_fast_path(
         return None;
     }
     let ingress_zone = ingress_zone_override?;
+    if is_icmp_echo_request(packet_frame, meta) {
+        return None;
+    }
     if meta.protocol == PROTO_TCP
         && (meta.tcp_flags & TCP_FLAG_SYN) != 0
         && (meta.tcp_flags & 0x10) == 0
@@ -8367,6 +8544,22 @@ fn cluster_peer_return_fast_path(
         },
         metadata,
     ))
+}
+
+fn is_icmp_echo_request(packet_frame: &[u8], meta: UserspaceDpMeta) -> bool {
+    if !matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        return false;
+    }
+    packet_frame
+        .get(meta.l4_offset as usize)
+        .copied()
+        .map(|icmp_type| {
+            matches!(
+                (meta.protocol, icmp_type),
+                (PROTO_ICMP, 8) | (PROTO_ICMPV6, 128)
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn resolve_ingress_logical_ifindex(
@@ -8412,7 +8605,10 @@ fn enforce_ha_resolution_snapshot(
     now_secs: u64,
     resolution: ForwardingResolution,
 ) -> ForwardingResolution {
-    if resolution.disposition != ForwardingDisposition::ForwardCandidate {
+    if !matches!(
+        resolution.disposition,
+        ForwardingDisposition::ForwardCandidate | ForwardingDisposition::MissingNeighbor
+    ) {
         return resolution;
     }
     let owner_rg_id = owner_rg_for_resolution(forwarding, resolution);
@@ -9298,8 +9494,8 @@ fn lookup_neighbor_entry(
         }
     }
     // The worker hot path must not block on shelling out to `ip neigh` or
-    // active probes. Neighbor discovery is refreshed asynchronously by the
-    // manager snapshot path and the periodic update_neighbors control request.
+    // active probes. Runtime neighbor discovery is maintained asynchronously
+    // by the helper's own netlink dump+subscribe path.
     None
 }
 
@@ -12059,6 +12255,39 @@ mod tests {
     }
 
     #[test]
+    fn inactive_owner_missing_neighbor_redirects_to_fabric() {
+        let mut snapshot = nat_snapshot_with_fabric();
+        snapshot
+            .neighbors
+            .retain(|neighbor| neighbor.ip != "172.16.80.1");
+        let state = build_forwarding_state(&snapshot);
+        let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )])));
+        let blocked = enforce_ha_resolution(
+            &state,
+            &ha_state,
+            lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        );
+        assert_eq!(blocked.disposition, ForwardingDisposition::HAInactive);
+        let redirected = redirect_via_fabric_if_needed(&state, blocked, 24);
+        assert_eq!(
+            redirected.disposition,
+            ForwardingDisposition::FabricRedirect
+        );
+        assert_eq!(redirected.egress_ifindex, 21);
+        assert_eq!(redirected.tx_ifindex, 21);
+        assert_eq!(
+            redirected.next_hop,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)))
+        );
+    }
+
+    #[test]
     fn build_forwarding_state_uses_fabric_snapshot_macs_without_parent_interface() {
         let mut snapshot = nat_snapshot();
         snapshot.fabrics = vec![FabricSnapshot {
@@ -12175,9 +12404,12 @@ mod tests {
                 .lock()
                 .expect("neighbors");
             neighbors.insert(
-                (5, IpAddr::V6(Ipv6Addr::new(
-                    0x2001, 0x559, 0x8585, 0xef00, 0x1266, 0x6aff, 0xfe0b, 0xd017,
-                ))),
+                (
+                    5,
+                    IpAddr::V6(Ipv6Addr::new(
+                        0x2001, 0x559, 0x8585, 0xef00, 0x1266, 0x6aff, 0xfe0b, 0xd017,
+                    )),
+                ),
                 NeighborEntry {
                     mac: [0x10, 0x66, 0x6a, 0x0b, 0xd0, 0x17],
                 },
@@ -12328,12 +12560,15 @@ mod tests {
         let meta = UserspaceDpMeta {
             ingress_ifindex: 4,
             protocol: PROTO_ICMP,
+            l4_offset: 0,
             ..UserspaceDpMeta::default()
         };
+        let packet_frame = [0u8];
 
         let (decision, metadata) = cluster_peer_return_fast_path(
             &state,
             &dynamic_neighbors,
+            &packet_frame,
             meta,
             Some("sfmix"),
             IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
@@ -12373,12 +12608,114 @@ mod tests {
             cluster_peer_return_fast_path(
                 &state,
                 &dynamic_neighbors,
+                &[],
                 meta,
                 Some("sfmix"),
                 IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn cluster_peer_return_fast_path_skips_icmp_echo_request() {
+        let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+        state.fabrics.push(FabricLink {
+            parent_ifindex: 4,
+            overlay_ifindex: 104,
+            peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+            peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        });
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 4,
+            protocol: PROTO_ICMP,
+            l4_offset: 0,
+            ..UserspaceDpMeta::default()
+        };
+        let packet_frame = [8u8];
+
+        assert!(
+            cluster_peer_return_fast_path(
+                &state,
+                &dynamic_neighbors,
+                &packet_frame,
+                meta,
+                Some("lan"),
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cluster_peer_return_fast_path_skips_icmpv6_echo_request() {
+        let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+        state.fabrics.push(FabricLink {
+            parent_ifindex: 4,
+            overlay_ifindex: 104,
+            peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+            peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        });
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 4,
+            protocol: PROTO_ICMPV6,
+            l4_offset: 0,
+            ..UserspaceDpMeta::default()
+        };
+        let packet_frame = [128u8];
+
+        assert!(
+            cluster_peer_return_fast_path(
+                &state,
+                &dynamic_neighbors,
+                &packet_frame,
+                meta,
+                Some("lan"),
+                IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_neighbor_session_metadata_preserves_fabric_ingress() {
+        let mut state = build_forwarding_state(&native_gre_pbr_snapshot(false));
+        state.fabrics.push(FabricLink {
+            parent_ifindex: 4,
+            overlay_ifindex: 104,
+            peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+            peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        });
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::MissingNeighbor,
+                local_ifindex: 0,
+                egress_ifindex: 13,
+                tx_ifindex: 13,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0x559, 0x8585, 0x50, 0, 0, 0, 0x1,
+                ))),
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+
+        let ingress_zone = Arc::<str>::from("lan");
+        let metadata =
+            build_missing_neighbor_session_metadata(&state, Some(&ingress_zone), 4, decision);
+
+        assert_eq!(metadata.ingress_zone.as_ref(), "lan");
+        assert!(metadata.fabric_ingress);
+        assert!(metadata.synced);
+        assert!(!metadata.is_reverse);
     }
 
     #[test]

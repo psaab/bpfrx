@@ -422,8 +422,12 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
             dst_ip: key.dst_ip,
             forward_key: key.clone(),
         };
-        let looked_up =
-            lookup_forwarding_resolution_for_session(forwarding, dynamic_neighbors, &flow, decision);
+        let looked_up = lookup_forwarding_resolution_for_session(
+            forwarding,
+            dynamic_neighbors,
+            &flow,
+            decision,
+        );
         let refreshed_resolution =
             enforce_session_ha_resolution(forwarding, ha_state, now_secs, looked_up, 0, 0);
         let refreshed_owner_rg = owner_rg_for_resolution(forwarding, refreshed_resolution);
@@ -442,7 +446,13 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
             owner_rg_id: refreshed_owner_rg,
             ..metadata
         };
-        if sessions.refresh_local(&key, refreshed_decision, refreshed_metadata.clone(), now_ns, 0) {
+        if sessions.refresh_local(
+            &key,
+            refreshed_decision,
+            refreshed_metadata.clone(),
+            now_ns,
+            0,
+        ) {
             let _ = publish_session_map_entry_for_session(
                 session_map_fd,
                 &key,
@@ -963,6 +973,7 @@ fn maybe_promote_synced_session(
     key: &SessionKey,
     decision: SessionDecision,
     metadata: SessionMetadata,
+    ingress_ifindex: i32,
     now_ns: u64,
     protocol: u8,
     tcp_flags: u8,
@@ -977,6 +988,9 @@ fn maybe_promote_synced_session(
     promoted.synced = false;
     if promoted.owner_rg_id <= 0 {
         promoted.owner_rg_id = owner_rg_for_resolution(forwarding, decision.resolution);
+    }
+    if ingress_is_fabric(forwarding, ingress_ifindex) {
+        promoted.fabric_ingress = true;
     }
     if sessions.promote_synced(key, decision, promoted.clone(), now_ns, protocol, tcp_flags) {
         let _ = publish_session_map_entry_for_session(session_map_fd, key, decision, &promoted);
@@ -1054,6 +1068,7 @@ pub(super) fn resolve_flow_session_decision(
             resolved_key,
             decision,
             resolved.metadata,
+            ingress_ifindex,
             now_ns,
             protocol,
             tcp_flags,
@@ -1067,7 +1082,7 @@ pub(super) fn resolve_flow_session_decision(
 
     let forward_match =
         lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &flow.forward_key)?;
-        let resolved = install_reverse_session_from_forward_match(
+    let resolved = install_reverse_session_from_forward_match(
         sessions,
         session_map_fd,
         shared_sessions,
@@ -1077,14 +1092,14 @@ pub(super) fn resolve_flow_session_decision(
         forwarding,
         ha_state,
         dynamic_neighbors,
-            &flow.forward_key,
-            forward_match,
-            now_ns,
-            now_secs,
-            ha_startup_grace_until_secs,
-            protocol,
-            tcp_flags,
-        );
+        &flow.forward_key,
+        forward_match,
+        now_ns,
+        now_secs,
+        ha_startup_grace_until_secs,
+        protocol,
+        tcp_flags,
+    );
 
     let mut decision = resolved.decision;
     decision.resolution = redirect_session_via_fabric_if_needed(
@@ -1111,6 +1126,7 @@ pub(super) fn resolve_flow_session_decision(
         &flow.forward_key,
         decision,
         resolved.metadata,
+        ingress_ifindex,
         now_ns,
         protocol,
         tcp_flags,
@@ -1305,12 +1321,8 @@ mod tests {
 
     fn test_forwarding_state_with_fabric() -> ForwardingState {
         let mut forwarding = test_forwarding_state();
-        forwarding
-            .zone_name_to_id
-            .insert("lan".to_string(), 1);
-        forwarding
-            .zone_name_to_id
-            .insert("sfmix".to_string(), 2);
+        forwarding.zone_name_to_id.insert("lan".to_string(), 1);
+        forwarding.zone_name_to_id.insert("sfmix".to_string(), 2);
         forwarding.fabrics.push(FabricLink {
             parent_ifindex: 21,
             overlay_ifindex: 101,
@@ -1354,6 +1366,49 @@ mod tests {
             src_port: 55068,
             dst_port: 5201,
         }
+    }
+
+    #[test]
+    fn maybe_promote_synced_session_sets_fabric_ingress_on_fabric_hit() {
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let decision = test_decision();
+        let mut metadata = test_metadata();
+        metadata.synced = true;
+        assert!(sessions.install_with_protocol(
+            key.clone(),
+            decision,
+            metadata.clone(),
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+        let forwarding = test_forwarding_state_with_fabric();
+
+        let promoted = maybe_promote_synced_session(
+            &mut sessions,
+            -1,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &peer_worker_commands,
+            &forwarding,
+            &key,
+            decision,
+            metadata,
+            21,
+            2_000_000,
+            PROTO_TCP,
+            0x10,
+        );
+
+        assert!(promoted.fabric_ingress);
+        assert!(!promoted.synced);
     }
 
     #[test]
@@ -1939,8 +1994,13 @@ mod tests {
             &dynamic_neighbors,
         );
 
-        let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("refreshed reverse hit");
-        assert_eq!(hit.decision.resolution.disposition, ForwardingDisposition::ForwardCandidate);
+        let hit = sessions
+            .lookup(&key, 2_000_000, 0x10)
+            .expect("refreshed reverse hit");
+        assert_eq!(
+            hit.decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
         assert_eq!(hit.decision.resolution.egress_ifindex, 6);
         assert_eq!(hit.metadata.owner_rg_id, 1);
     }

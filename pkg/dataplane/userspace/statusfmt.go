@@ -123,6 +123,7 @@ func FormatStatusSummary(status ProcessStatus) string {
 	}
 	fmt.Fprintf(&b, "  Interface addresses:       %d\n", status.InterfaceAddresses)
 	fmt.Fprintf(&b, "  Neighbor entries:          %d\n", status.NeighborEntries)
+	fmt.Fprintf(&b, "  Neighbor generation:       %d\n", status.NeighborGeneration)
 	fmt.Fprintf(&b, "  Route entries:             %d\n", status.RouteEntries)
 	if len(status.HAGroups) > 0 {
 		parts := make([]string, 0, len(status.HAGroups))

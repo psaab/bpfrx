@@ -375,6 +375,57 @@ func TestSeedHAGroupInventoryLockedSeedsConfiguredStandbyGroups(t *testing.T) {
 	}
 }
 
+func TestActiveHAGroupSignatureUsesSortedActiveRGs(t *testing.T) {
+	got := activeHAGroupSignature(map[int]HAGroupStatus{
+		2: {RGID: 2, Active: true},
+		1: {RGID: 1, Active: false},
+		7: {RGID: 7, Active: true},
+		0: {RGID: 0, Active: true},
+	})
+	if got != "0,2,7" {
+		t.Fatalf("activeHAGroupSignature = %q, want 0,2,7", got)
+	}
+}
+
+func TestActiveHAGroupSignatureSliceUsesSortedActiveRGs(t *testing.T) {
+	got := activeHAGroupSignatureSlice([]HAGroupStatus{
+		{RGID: 7, Active: true},
+		{RGID: 1, Active: false},
+		{RGID: 0, Active: true},
+		{RGID: 2, Active: true},
+	})
+	if got != "0,2,7" {
+		t.Fatalf("activeHAGroupSignatureSlice = %q, want 0,2,7", got)
+	}
+}
+
+func TestUserspaceBootstrapProbeInterfacesIncludesBaseAndVLANUnits(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"ge-7/0/1": {
+			Name: "ge-7/0/1",
+		},
+		"ge-7/0/2": {
+			Name: "ge-7/0/2",
+			Units: map[int]*config.InterfaceUnit{
+				0:  {Number: 0},
+				50: {Number: 50, VlanID: 50},
+				80: {Number: 80, VlanID: 80},
+			},
+		},
+	}
+	got := userspaceBootstrapProbeInterfaces(cfg)
+	want := []string{"ge-7-0-1", "ge-7-0-2", "ge-7-0-2.50", "ge-7-0-2.80"}
+	if len(got) != len(want) {
+		t.Fatalf("len(userspaceBootstrapProbeInterfaces) = %d, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("userspaceBootstrapProbeInterfaces[%d] = %q, want %q (%v)", i, got[i], want[i], got)
+		}
+	}
+}
+
 func TestDesiredForwardingArmedUsesSeededConfiguredDataRGs(t *testing.T) {
 	m := &Manager{
 		clusterHA: true,

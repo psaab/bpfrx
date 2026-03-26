@@ -1427,7 +1427,6 @@ fn handle_stream(
             }
             "update_neighbors" => {
                 if let Some(neighbors) = request.neighbors.as_ref() {
-                    let neigh_gen = request.neighbor_generation;
                     let replace = request.neighbor_replace;
                     let mut resolved = Vec::with_capacity(neighbors.len());
                     for neigh in neighbors {
@@ -1446,9 +1445,7 @@ fn handle_stream(
                         resolved.push((neigh.ifindex, ip, afxdp::NeighborEntry { mac }));
                     }
                     guard.afxdp.apply_manager_neighbors(replace, &resolved);
-                    if neigh_gen > 0 {
-                        guard.status.neighbor_generation = neigh_gen;
-                    }
+                    refresh_status(&mut guard);
                 }
             }
             "set_queue_state" => {
@@ -1667,11 +1664,9 @@ fn refresh_status(state: &mut ServerState) {
         .as_ref()
         .map(|s| s.interfaces.iter().map(|iface| iface.addresses.len()).sum())
         .unwrap_or(0);
-    state.status.neighbor_entries = state
-        .snapshot
-        .as_ref()
-        .map(|s| s.neighbors.len())
-        .unwrap_or(0);
+    let (neighbor_entries, neighbor_generation) = state.afxdp.dynamic_neighbor_status();
+    state.status.neighbor_entries = neighbor_entries;
+    state.status.neighbor_generation = neighbor_generation;
     state.status.route_entries = state.snapshot.as_ref().map(|s| s.routes.len()).unwrap_or(0);
     state.status.fabrics = state
         .snapshot
@@ -1959,10 +1954,7 @@ fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> bool {
         return false;
     }
     let base = iface.name.split('.').next().unwrap_or(iface.name.as_str());
-    if base.starts_with("fxp")
-        || base.starts_with("em")
-        || base.starts_with("fab")
-        || base == "lo0"
+    if base.starts_with("fxp") || base.starts_with("em") || base.starts_with("fab") || base == "lo0"
     {
         return false;
     }
