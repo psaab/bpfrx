@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"bytes"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
+	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 	"github.com/psaab/bpfrx/pkg/logging"
 )
 
@@ -234,6 +237,181 @@ func TestExtractPort(t *testing.T) {
 		got := extractPort(tt.input)
 		if got != tt.want {
 			t.Fatalf("extractPort(%q) = %d, want %d", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestAggregateUserspaceIfaceSnapshot(t *testing.T) {
+	status := dpuserspace.ProcessStatus{
+		Enabled:                true,
+		ForwardingArmed:        true,
+		NeighborGeneration:     11,
+		LastSnapshotGeneration: 29,
+		Bindings: []dpuserspace.BindingStatus{
+			{
+				Interface:           "ge-0-0-0",
+				Ready:               true,
+				Bound:               true,
+				XSKRegistered:       true,
+				ZeroCopy:            true,
+				RXPackets:           10,
+				RXBytes:             1000,
+				TXPackets:           9,
+				TXBytes:             900,
+				DirectTXPackets:     8,
+				CopyTXPackets:       1,
+				InPlaceTXPackets:    2,
+				SessionMisses:       3,
+				NeighborMissPackets: 4,
+				RouteMissPackets:    5,
+				PolicyDeniedPackets: 6,
+				ExceptionPackets:    7,
+				SlowPathPackets:     8,
+				LastError:           "bind failed",
+			},
+			{
+				Interface:           "ge-0-0-0",
+				Ready:               true,
+				Bound:               true,
+				XSKRegistered:       true,
+				ZeroCopy:            false,
+				RXPackets:           20,
+				RXBytes:             2000,
+				TXPackets:           19,
+				TXBytes:             1900,
+				DirectTXPackets:     18,
+				CopyTXPackets:       2,
+				InPlaceTXPackets:    3,
+				SessionMisses:       1,
+				NeighborMissPackets: 2,
+				RouteMissPackets:    3,
+				PolicyDeniedPackets: 4,
+				ExceptionPackets:    5,
+				SlowPathPackets:     6,
+				LastError:           "bind failed",
+			},
+			{
+				Interface:     "ge-0-0-1",
+				SessionMisses: 99,
+			},
+		},
+		RecentExceptions: []dpuserspace.ExceptionStatus{
+			{Interface: "ge-0-0-0", Reason: "ha_inactive", SrcIP: "10.0.0.1", DstIP: "1.1.1.1", FromZone: "lan", ToZone: "wan"},
+			{Interface: "ge-0-0-1", Reason: "ignored"},
+		},
+	}
+
+	snap := aggregateUserspaceIfaceSnapshot("ge-0-0-0", status)
+	if snap == nil {
+		t.Fatal("expected userspace snapshot")
+	}
+	if !snap.helperEnabled || !snap.forwardingArmed {
+		t.Fatal("expected helper enabled and armed")
+	}
+	if snap.bindings != 2 || snap.readyBindings != 2 || snap.boundBindings != 2 {
+		t.Fatalf("unexpected binding counts: %+v", snap)
+	}
+	if snap.xskRegistered != 2 || snap.zeroCopyBindings != 1 {
+		t.Fatalf("unexpected xsk/zc counts: %+v", snap)
+	}
+	if snap.rxPackets != 30 || snap.txPackets != 28 {
+		t.Fatalf("unexpected packet totals: rx=%d tx=%d", snap.rxPackets, snap.txPackets)
+	}
+	if snap.directTXPackets != 26 || snap.copyTXPackets != 3 || snap.inPlaceTXPackets != 5 {
+		t.Fatalf("unexpected tx mode totals: direct=%d copy=%d inplace=%d", snap.directTXPackets, snap.copyTXPackets, snap.inPlaceTXPackets)
+	}
+	if snap.sessionMisses != 4 || snap.neighborMissPackets != 6 || snap.routeMissPackets != 8 {
+		t.Fatalf("unexpected miss totals: session=%d neigh=%d route=%d", snap.sessionMisses, snap.neighborMissPackets, snap.routeMissPackets)
+	}
+	if len(snap.lastErrors) != 1 || snap.lastErrors[0] != "bind failed" {
+		t.Fatalf("unexpected last errors: %#v", snap.lastErrors)
+	}
+	if len(snap.recentExceptions) != 1 || !strings.Contains(snap.recentExceptions[0], "ha_inactive") {
+		t.Fatalf("unexpected exceptions: %#v", snap.recentExceptions)
+	}
+}
+
+func TestRenderSingleInterfaceIncludesUserspaceSection(t *testing.T) {
+	now := time.Now()
+	baseline := &ifaceSnapshot{
+		rxBytes: 1000,
+		txBytes: 2000,
+		rxPkts:  10,
+		txPkts:  20,
+		ts:      now.Add(-time.Second),
+		userspace: &userspaceIfaceSnapshot{
+			rxBytes:             100,
+			txBytes:             200,
+			rxPackets:           10,
+			txPackets:           20,
+			directTXPackets:     5,
+			copyTXPackets:       1,
+			inPlaceTXPackets:    2,
+			sessionMisses:       1,
+			neighborMissPackets: 2,
+			routeMissPackets:    3,
+			policyDeniedPackets: 4,
+			exceptionPackets:    5,
+			slowPathPackets:     6,
+		},
+	}
+	prev := &ifaceSnapshot{
+		ts: now.Add(-time.Second),
+		userspace: &userspaceIfaceSnapshot{
+			rxBytes:   100,
+			txBytes:   200,
+			rxPackets: 10,
+			txPackets: 20,
+		},
+	}
+	snap := &ifaceSnapshot{
+		rxBytes: 2000,
+		txBytes: 4000,
+		rxPkts:  20,
+		txPkts:  40,
+		ts:      now,
+		userspace: &userspaceIfaceSnapshot{
+			helperEnabled:       true,
+			forwardingArmed:     true,
+			neighborGeneration:  7,
+			lastSnapshotGen:     8,
+			bindings:            2,
+			readyBindings:       2,
+			boundBindings:       2,
+			xskRegistered:       2,
+			zeroCopyBindings:    1,
+			rxBytes:             300,
+			txBytes:             500,
+			rxPackets:           30,
+			txPackets:           50,
+			directTXPackets:     15,
+			copyTXPackets:       2,
+			inPlaceTXPackets:    3,
+			sessionMisses:       4,
+			neighborMissPackets: 5,
+			routeMissPackets:    6,
+			policyDeniedPackets: 7,
+			exceptionPackets:    8,
+			slowPathPackets:     9,
+			lastErrors:          []string{"bind failed"},
+			recentExceptions:    []string{"ha_inactive | 10.0.0.1 -> 1.1.1.1"},
+		},
+	}
+
+	var buf bytes.Buffer
+	renderSingleInterface(&buf, "host", "fab0", "ge-0-0-0", snap, prev, baseline, now.Add(-5*time.Second))
+	out := buf.String()
+	for _, want := range []string{
+		"Userspace dataplane:",
+		"Helper state:",
+		"Binding state:",
+		"Direct TX packets:",
+		"Session misses:",
+		"Recent exceptions:",
+		"bind failed",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("render output missing %q:\n%s", want, out)
 		}
 	}
 }

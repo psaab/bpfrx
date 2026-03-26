@@ -10,6 +10,7 @@ dataplane and the userspace AF_XDP dataplane.
 | [unit-tests.md](unit-tests.md) | Go + Rust unit tests | `make test` + `cargo test` |
 | [standalone-vm.md](standalone-vm.md) | Single-VM forwarding, NAT, policy | `make test-deploy` |
 | [ha-cluster.md](ha-cluster.md) | HA failover, crash recovery, session sync | `make test-failover` |
+| [userspace-fabric-failover.md](userspace-fabric-failover.md) | Userspace RG move across fabric, failover hardening, artifact interpretation | `scripts/userspace-ha-failover-validation.sh` |
 | [userspace-dataplane.md](userspace-dataplane.md) | AF_XDP forwarding, cold start, neighbor resolution | Manual + scripts |
 | [native-gre.md](native-gre.md) | Native GRE transit, failover, host-origin validation | `scripts/userspace-native-gre-validation.sh` |
 | [performance.md](performance.md) | Throughput, latency, perf profiling | `scripts/userspace-perf-compare.sh` |
@@ -39,6 +40,11 @@ scripts/userspace-ha-failover-validation.sh  # Failover-specific
 scripts/userspace-native-gre-validation.sh   # Native GRE transit/failover
 ```
 
+For userspace RG-move failover specifically, use
+[userspace-fabric-failover.md](userspace-fabric-failover.md) as the reference
+for the hardened acceptance bar, stale-owner fabric workflow, and artifact
+interpretation.
+
 ## Operational Notes
 
 - `test/incus/cluster-setup.sh deploy all` builds, pushes, and restarts
@@ -59,6 +65,14 @@ BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
   you need captures from the remote endpoint, use the gRPC capture service
   documented in `~/README.md` (`capture-client` / `grpcurl`), not ad-hoc
   `tcpdump` assumptions on unrelated lab hosts.
+- For userspace split-RG failover, `monitor interface <fabric-parent>` is now a
+  required live-debug tool, not just a convenience command. It exposes the
+  userspace binding state, queue readiness, direct/copy/in-place TX, misses,
+  policy denies, binding errors, and recent exceptions for a single interface.
+  Use it during RG moves to distinguish:
+  - "traffic never hit the old owner"
+  - "traffic hit the old owner and redirected across fabric"
+  - "traffic hit the old owner but died on the copy-mode fabric path"
 
 ## Test Environment Topology
 

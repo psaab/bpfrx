@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/psaab/bpfrx/pkg/config"
+	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -34,13 +35,122 @@ func resolveFabricParent(name string) string {
 
 // ifaceSnapshot holds a point-in-time sample of interface counters.
 type ifaceSnapshot struct {
-	rxBytes, txBytes       uint64
-	rxPkts, txPkts         uint64
-	rxErrors, txErrors     uint64
-	rxDrops, txDrops       uint64
-	rxFrame, txCarrier     uint64
-	collisions             uint64
-	ts                     time.Time
+	rxBytes, txBytes   uint64
+	rxPkts, txPkts     uint64
+	rxErrors, txErrors uint64
+	rxDrops, txDrops   uint64
+	rxFrame, txCarrier uint64
+	collisions         uint64
+	userspace          *userspaceIfaceSnapshot
+	ts                 time.Time
+}
+
+type userspaceIfaceSnapshot struct {
+	statusNote          string
+	helperEnabled       bool
+	forwardingArmed     bool
+	neighborGeneration  uint64
+	lastSnapshotGen     uint64
+	bindings            int
+	readyBindings       int
+	boundBindings       int
+	xskRegistered       int
+	zeroCopyBindings    int
+	rxPackets           uint64
+	rxBytes             uint64
+	txPackets           uint64
+	txBytes             uint64
+	directTXPackets     uint64
+	copyTXPackets       uint64
+	inPlaceTXPackets    uint64
+	sessionMisses       uint64
+	neighborMissPackets uint64
+	routeMissPackets    uint64
+	policyDeniedPackets uint64
+	exceptionPackets    uint64
+	slowPathPackets     uint64
+	lastErrors          []string
+	recentExceptions    []string
+}
+
+func aggregateUserspaceIfaceSnapshot(kernelName string, status dpuserspace.ProcessStatus) *userspaceIfaceSnapshot {
+	snap := &userspaceIfaceSnapshot{
+		helperEnabled:      status.Enabled,
+		forwardingArmed:    status.ForwardingArmed,
+		neighborGeneration: status.NeighborGeneration,
+		lastSnapshotGen:    status.LastSnapshotGeneration,
+	}
+	errorSet := map[string]struct{}{}
+	for _, binding := range status.Bindings {
+		if binding.Interface != kernelName {
+			continue
+		}
+		snap.bindings++
+		if binding.Ready {
+			snap.readyBindings++
+		}
+		if binding.Bound {
+			snap.boundBindings++
+		}
+		if binding.XSKRegistered {
+			snap.xskRegistered++
+		}
+		if binding.ZeroCopy {
+			snap.zeroCopyBindings++
+		}
+		snap.rxPackets += binding.RXPackets
+		snap.rxBytes += binding.RXBytes
+		snap.txPackets += binding.TXPackets
+		snap.txBytes += binding.TXBytes
+		snap.directTXPackets += binding.DirectTXPackets
+		snap.copyTXPackets += binding.CopyTXPackets
+		snap.inPlaceTXPackets += binding.InPlaceTXPackets
+		snap.sessionMisses += binding.SessionMisses
+		snap.neighborMissPackets += binding.NeighborMissPackets
+		snap.routeMissPackets += binding.RouteMissPackets
+		snap.policyDeniedPackets += binding.PolicyDeniedPackets
+		snap.exceptionPackets += binding.ExceptionPackets
+		snap.slowPathPackets += binding.SlowPathPackets
+		if binding.LastError != "" {
+			errorSet[binding.LastError] = struct{}{}
+		}
+	}
+	for _, exc := range status.RecentExceptions {
+		if exc.Interface != kernelName {
+			continue
+		}
+		snap.recentExceptions = append(snap.recentExceptions, formatUserspaceException(exc))
+	}
+	for msg := range errorSet {
+		snap.lastErrors = append(snap.lastErrors, msg)
+	}
+	sort.Strings(snap.lastErrors)
+	if len(snap.recentExceptions) > 3 {
+		snap.recentExceptions = snap.recentExceptions[:3]
+	}
+	if snap.bindings == 0 && len(snap.recentExceptions) == 0 {
+		snap.statusNote = fmt.Sprintf("no userspace bindings or exceptions matched %s", kernelName)
+	}
+	return snap
+}
+
+func formatUserspaceException(exc dpuserspace.ExceptionStatus) string {
+	fields := []string{exc.Reason}
+	if exc.SrcIP != "" || exc.DstIP != "" {
+		flow := exc.SrcIP
+		if exc.SrcPort != 0 {
+			flow = fmt.Sprintf("%s:%d", flow, exc.SrcPort)
+		}
+		flow += " -> " + exc.DstIP
+		if exc.DstPort != 0 {
+			flow += fmt.Sprintf(":%d", exc.DstPort)
+		}
+		fields = append(fields, flow)
+	}
+	if exc.FromZone != "" || exc.ToZone != "" {
+		fields = append(fields, fmt.Sprintf("%s->%s", exc.FromZone, exc.ToZone))
+	}
+	return strings.Join(fields, " | ")
 }
 
 // readIfaceSnapshot reads BPF counters (rx/tx packets/bytes) and kernel
@@ -83,6 +193,14 @@ func (c *CLI) readIfaceSnapshot(name string) (ifaceSnapshot, error) {
 		}
 	}
 	return snap, nil
+}
+
+func (c *CLI) readUserspaceIfaceSnapshot(kernelName string) *userspaceIfaceSnapshot {
+	status, err := c.userspaceDataplaneStatus()
+	if err != nil {
+		return &userspaceIfaceSnapshot{statusNote: err.Error()}
+	}
+	return aggregateUserspaceIfaceSnapshot(kernelName, status)
 }
 
 // formatLinkSpeed formats a speed in Mbps to a human-readable string.
@@ -231,11 +349,12 @@ func (c *CLI) monitorInterfaceSingle(ifaceName string) error {
 
 	// Render immediately.
 	renderNow := func() {
-		kn := c.resolveToKernel(displayName)
+		kn := resolveFabricParent(c.resolveToKernel(displayName))
 		snap, err := c.readIfaceSnapshot(kn)
 		if err != nil {
 			return
 		}
+		snap.userspace = c.readUserspaceIfaceSnapshot(kn)
 		if baseline == nil {
 			baseline = &snap
 		}
@@ -345,6 +464,75 @@ func renderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 	fmt.Fprintf(w, "  Output carrier:       %20d          [%d]\n", snap.txCarrier, txCarrierDelta)
 	fmt.Fprintf(w, "  Collisions:           %20d          [%d]\n", snap.collisions, colDelta)
 	fmt.Fprintf(w, "\n")
+
+	if snap.userspace != nil {
+		var (
+			usRxBps, usTxBps, usRxPps, usTxPps                           uint64
+			usRxBytesDelta, usTxBytesDelta, usRxPktsDelta, usTxPktsDelta uint64
+			usDirectDelta, usCopyDelta, usInPlaceDelta                   uint64
+			usSessionMissDelta, usNeighborMissDelta, usRouteMissDelta    uint64
+			usPolicyDeniedDelta, usExceptionDelta, usSlowPathDelta       uint64
+		)
+		if prev != nil && prev.userspace != nil {
+			dt := snap.ts.Sub(prev.ts).Seconds()
+			if dt > 0 {
+				usRxBps = uint64(float64(snap.userspace.rxBytes-prev.userspace.rxBytes) * 8 / dt)
+				usTxBps = uint64(float64(snap.userspace.txBytes-prev.userspace.txBytes) * 8 / dt)
+				usRxPps = uint64(float64(snap.userspace.rxPackets-prev.userspace.rxPackets) / dt)
+				usTxPps = uint64(float64(snap.userspace.txPackets-prev.userspace.txPackets) / dt)
+			}
+		}
+		if baseline != nil && baseline.userspace != nil {
+			usRxBytesDelta = snap.userspace.rxBytes - baseline.userspace.rxBytes
+			usTxBytesDelta = snap.userspace.txBytes - baseline.userspace.txBytes
+			usRxPktsDelta = snap.userspace.rxPackets - baseline.userspace.rxPackets
+			usTxPktsDelta = snap.userspace.txPackets - baseline.userspace.txPackets
+			usDirectDelta = snap.userspace.directTXPackets - baseline.userspace.directTXPackets
+			usCopyDelta = snap.userspace.copyTXPackets - baseline.userspace.copyTXPackets
+			usInPlaceDelta = snap.userspace.inPlaceTXPackets - baseline.userspace.inPlaceTXPackets
+			usSessionMissDelta = snap.userspace.sessionMisses - baseline.userspace.sessionMisses
+			usNeighborMissDelta = snap.userspace.neighborMissPackets - baseline.userspace.neighborMissPackets
+			usRouteMissDelta = snap.userspace.routeMissPackets - baseline.userspace.routeMissPackets
+			usPolicyDeniedDelta = snap.userspace.policyDeniedPackets - baseline.userspace.policyDeniedPackets
+			usExceptionDelta = snap.userspace.exceptionPackets - baseline.userspace.exceptionPackets
+			usSlowPathDelta = snap.userspace.slowPathPackets - baseline.userspace.slowPathPackets
+		}
+
+		fmt.Fprintf(w, "Userspace dataplane:\n")
+		if snap.userspace.statusNote != "" {
+			fmt.Fprintf(w, "  Note:                 %s\n", snap.userspace.statusNote)
+		}
+		fmt.Fprintf(w, "  Helper state:         enabled=%t armed=%t snapshot_gen=%d neighbor_gen=%d\n",
+			snap.userspace.helperEnabled, snap.userspace.forwardingArmed, snap.userspace.lastSnapshotGen, snap.userspace.neighborGeneration)
+		fmt.Fprintf(w, "  Binding state:        bindings=%d ready=%d bound=%d xsk=%d zc=%d\n",
+			snap.userspace.bindings, snap.userspace.readyBindings, snap.userspace.boundBindings, snap.userspace.xskRegistered, snap.userspace.zeroCopyBindings)
+		fmt.Fprintf(w, "  RX bytes:             %20d (%d bps)    [%d]\n", snap.userspace.rxBytes, usRxBps, usRxBytesDelta)
+		fmt.Fprintf(w, "  TX bytes:             %20d (%d bps)    [%d]\n", snap.userspace.txBytes, usTxBps, usTxBytesDelta)
+		fmt.Fprintf(w, "  RX packets:           %20d (%d pps)    [%d]\n", snap.userspace.rxPackets, usRxPps, usRxPktsDelta)
+		fmt.Fprintf(w, "  TX packets:           %20d (%d pps)    [%d]\n", snap.userspace.txPackets, usTxPps, usTxPktsDelta)
+		fmt.Fprintf(w, "  Direct TX packets:    %20d          [%d]\n", snap.userspace.directTXPackets, usDirectDelta)
+		fmt.Fprintf(w, "  Copy TX packets:      %20d          [%d]\n", snap.userspace.copyTXPackets, usCopyDelta)
+		fmt.Fprintf(w, "  In-place TX packets:  %20d          [%d]\n", snap.userspace.inPlaceTXPackets, usInPlaceDelta)
+		fmt.Fprintf(w, "  Session misses:       %20d          [%d]\n", snap.userspace.sessionMisses, usSessionMissDelta)
+		fmt.Fprintf(w, "  Neighbor misses:      %20d          [%d]\n", snap.userspace.neighborMissPackets, usNeighborMissDelta)
+		fmt.Fprintf(w, "  Route misses:         %20d          [%d]\n", snap.userspace.routeMissPackets, usRouteMissDelta)
+		fmt.Fprintf(w, "  Policy denied:        %20d          [%d]\n", snap.userspace.policyDeniedPackets, usPolicyDeniedDelta)
+		fmt.Fprintf(w, "  Exception packets:    %20d          [%d]\n", snap.userspace.exceptionPackets, usExceptionDelta)
+		fmt.Fprintf(w, "  Slow path packets:    %20d          [%d]\n", snap.userspace.slowPathPackets, usSlowPathDelta)
+		if len(snap.userspace.lastErrors) > 0 {
+			fmt.Fprintf(w, "  Binding errors:\n")
+			for _, msg := range snap.userspace.lastErrors {
+				fmt.Fprintf(w, "    %s\n", msg)
+			}
+		}
+		if len(snap.userspace.recentExceptions) > 0 {
+			fmt.Fprintf(w, "  Recent exceptions:\n")
+			for _, msg := range snap.userspace.recentExceptions {
+				fmt.Fprintf(w, "    %s\n", msg)
+			}
+		}
+		fmt.Fprintf(w, "\n")
+	}
 	fmt.Fprintf(w, "Keys: q=quit  n=next interface  f=freeze  t=thaw  c=clear baseline\n")
 }
 
