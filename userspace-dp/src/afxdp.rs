@@ -66,9 +66,9 @@ mod tx;
 #[cfg(test)]
 use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
-    AfXdpBindStrategy, binding_frame_count_for_driver, ifinfo_from_binding,
-    interface_driver_name, open_binding_worker_rings, preferred_bind_strategy,
-    reserved_tx_frames_for_driver, umem_ring_size,
+    AfXdpBindStrategy, binding_frame_count_for_driver, ifinfo_from_binding, interface_driver_name,
+    open_binding_worker_rings, preferred_bind_strategy, reserved_tx_frames_for_driver,
+    umem_ring_size,
 };
 #[cfg(test)]
 use self::bind::{
@@ -1687,6 +1687,11 @@ impl Coordinator {
                 binding.direct_tx_packets = snap.direct_tx_packets;
                 binding.copy_tx_packets = snap.copy_tx_packets;
                 binding.in_place_tx_packets = snap.in_place_tx_packets;
+                binding.direct_tx_no_frame_fallback_packets =
+                    snap.direct_tx_no_frame_fallback_packets;
+                binding.direct_tx_build_fallback_packets = snap.direct_tx_build_fallback_packets;
+                binding.direct_tx_disallowed_fallback_packets =
+                    snap.direct_tx_disallowed_fallback_packets;
                 binding.debug_pending_fill_frames = snap.debug_pending_fill_frames;
                 binding.debug_spare_fill_frames = 0;
                 binding.debug_free_tx_frames = snap.debug_free_tx_frames;
@@ -1754,6 +1759,9 @@ impl Coordinator {
                 binding.direct_tx_packets = 0;
                 binding.copy_tx_packets = 0;
                 binding.in_place_tx_packets = 0;
+                binding.direct_tx_no_frame_fallback_packets = 0;
+                binding.direct_tx_build_fallback_packets = 0;
+                binding.direct_tx_disallowed_fallback_packets = 0;
                 binding.debug_pending_fill_frames = 0;
                 binding.debug_spare_fill_frames = 0;
                 binding.debug_free_tx_frames = 0;
@@ -2078,6 +2086,9 @@ struct BindingWorker {
     pending_direct_tx_packets: u64,
     pending_copy_tx_packets: u64,
     pending_in_place_tx_packets: u64,
+    pending_direct_tx_no_frame_fallback_packets: u64,
+    pending_direct_tx_build_fallback_packets: u64,
+    pending_direct_tx_disallowed_fallback_packets: u64,
     flow_cache: FlowCache,
     flow_cache_session_touch: u64,
     /// Timestamp when this binding was created.
@@ -2224,8 +2235,7 @@ fn fabric_queue_hash(
         mix(&mut seed, flow.forward_key.dst_port as u64);
         return seed;
     }
-    let (src_port, dst_port) =
-        expected_ports.unwrap_or((meta.flow_src_port, meta.flow_dst_port));
+    let (src_port, dst_port) = expected_ports.unwrap_or((meta.flow_src_port, meta.flow_dst_port));
     mix(&mut seed, src_port as u64);
     mix(&mut seed, dst_port as u64);
     seed
@@ -2369,7 +2379,8 @@ impl BindingWorker {
         shared_umem: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let driver_name = interface_driver_name(&binding.interface);
-        let total_frames = binding_frame_count_for_driver(driver_name.as_deref(), ring_entries).max(1);
+        let total_frames =
+            binding_frame_count_for_driver(driver_name.as_deref(), ring_entries).max(1);
         let reserved_tx =
             reserved_tx_frames_for_driver(driver_name.as_deref(), ring_entries).min(total_frames);
         let mut reserved_tx_frames = VecDeque::with_capacity(reserved_tx as usize);
@@ -2509,6 +2520,9 @@ impl BindingWorker {
             pending_direct_tx_packets: 0,
             pending_copy_tx_packets: 0,
             pending_in_place_tx_packets: 0,
+            pending_direct_tx_no_frame_fallback_packets: 0,
+            pending_direct_tx_build_fallback_packets: 0,
+            pending_direct_tx_disallowed_fallback_packets: 0,
             flow_cache: FlowCache::new(),
             flow_cache_session_touch: 0,
             bind_time_ns: {
@@ -4787,6 +4801,14 @@ fn poll_binding(
                             }
                             ForwardingDisposition::MissingNeighbor => {
                                 dbg.missing_neigh += 1;
+                                let (from_zone, to_zone) = zone_pair_for_flow_with_override(
+                                    forwarding,
+                                    meta.ingress_ifindex as i32,
+                                    ingress_zone_override.as_deref(),
+                                    decision.resolution.egress_ifindex,
+                                );
+                                let from_zone_arc = Arc::<str>::from(from_zone.as_str());
+                                let to_zone_arc = Arc::<str>::from(to_zone.as_str());
                                 // Send ARP/NDP solicitation via RAW socket (not XSK)
                                 // so the reply goes through the kernel's normal RX
                                 // path (cpumap_or_pass), bypassing XSK fill ring issues.
@@ -4822,16 +4844,60 @@ fn poll_binding(
                                 // direction) finds the forward NAT match and creates
                                 // a reverse session. Without this, the SYN-ACK hits
                                 // session miss → policy deny (no rule for WAN→LAN).
+                                let mut pending_decision = decision;
                                 if let Some(flow) = flow.as_ref() {
+                                    if let PolicyAction::Permit = evaluate_policy(
+                                        &forwarding.policy,
+                                        &from_zone,
+                                        &to_zone,
+                                        flow.src_ip,
+                                        flow.dst_ip,
+                                        flow.forward_key.protocol,
+                                        flow.forward_key.src_port,
+                                        flow.forward_key.dst_port,
+                                    ) {
+                                        if pending_decision.nat.rewrite_dst.is_none() {
+                                            pending_decision.nat = forwarding
+                                                .static_nat
+                                                .match_snat(flow.src_ip, &from_zone)
+                                                .or_else(|| {
+                                                    match_source_nat_for_flow(
+                                                        forwarding,
+                                                        &from_zone,
+                                                        &to_zone,
+                                                        pending_decision.resolution.egress_ifindex,
+                                                        flow,
+                                                    )
+                                                })
+                                                .unwrap_or_default();
+                                        } else {
+                                            let snat_decision = forwarding
+                                                .static_nat
+                                                .match_snat(flow.src_ip, &from_zone)
+                                                .or_else(|| {
+                                                    match_source_nat_for_flow(
+                                                        forwarding,
+                                                        &from_zone,
+                                                        &to_zone,
+                                                        pending_decision.resolution.egress_ifindex,
+                                                        flow,
+                                                    )
+                                                })
+                                                .unwrap_or_default();
+                                            pending_decision.nat =
+                                                pending_decision.nat.merge(snat_decision);
+                                        }
+                                    }
                                     let sess_meta = build_missing_neighbor_session_metadata(
                                         forwarding,
-                                        session_ingress_zone.as_ref(),
+                                        &from_zone_arc,
+                                        &to_zone_arc,
                                         meta.ingress_ifindex as i32,
-                                        decision,
+                                        pending_decision,
                                     );
                                     if sessions.install_with_protocol(
                                         flow.forward_key.clone(),
-                                        decision,
+                                        pending_decision,
                                         sess_meta.clone(),
                                         now_ns,
                                         meta.protocol,
@@ -4839,7 +4905,7 @@ fn poll_binding(
                                     ) {
                                         let entry = SyncedSessionEntry {
                                             key: flow.forward_key.clone(),
-                                            decision,
+                                            decision: pending_decision,
                                             metadata: sess_meta,
                                             protocol: meta.protocol,
                                             tcp_flags: meta.tcp_flags,
@@ -4853,13 +4919,13 @@ fn poll_binding(
                                         let _ = publish_session_map_entry_for_session(
                                             binding.session_map_fd,
                                             &flow.forward_key,
-                                            decision,
+                                            pending_decision,
                                             &entry.metadata,
                                         );
                                         publish_dnat_table_entry(
                                             &dnat_fds,
                                             &flow.forward_key,
-                                            decision.nat,
+                                            pending_decision.nat,
                                         );
                                         counters.session_creates += 1;
                                     }
@@ -4880,7 +4946,7 @@ fn poll_binding(
                                         addr: desc.addr,
                                         desc,
                                         meta,
-                                        decision,
+                                        decision: pending_decision,
                                         queued_ns: now_ns,
                                     });
                                     recycle_now = false;
@@ -4896,8 +4962,8 @@ fn poll_binding(
                                                 flow.dst_ip,
                                                 flow.forward_key.dst_port,
                                                 meta.protocol,
-                                                decision.resolution.egress_ifindex,
-                                                decision.resolution.next_hop,
+                                                pending_decision.resolution.egress_ifindex,
+                                                pending_decision.resolution.next_hop,
                                             );
                                         }
                                     }
@@ -5192,21 +5258,20 @@ fn build_live_forward_request_from_frame(
     // then live frame ports (lazy — only parsed if session ports unavailable),
     // then metadata as last resort.
     let expected_ports = authoritative_forward_ports(frame, meta, flow);
-    let target_binding_index = if decision.resolution.disposition
-        == ForwardingDisposition::FabricRedirect
-    {
-        binding_lookup.fabric_target_index(
-            target_ifindex,
-            fabric_queue_hash(flow, expected_ports, meta),
-        )
-    } else {
-        binding_lookup.target_index(
-            current_binding_index,
-            ingress_ident.ifindex,
-            ingress_ident.queue_id,
-            target_ifindex,
-        )
-    };
+    let target_binding_index =
+        if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
+            binding_lookup.fabric_target_index(
+                target_ifindex,
+                fabric_queue_hash(flow, expected_ports, meta),
+            )
+        } else {
+            binding_lookup.target_index(
+                current_binding_index,
+                ingress_ident.ifindex,
+                ingress_ident.queue_id,
+                target_ifindex,
+            )
+        };
     let mut decision = *decision;
     if decision.resolution.disposition == ForwardingDisposition::FabricRedirect
         && let Some(ingress_zone) = fabric_ingress_zone
@@ -5310,15 +5375,14 @@ fn learn_dynamic_neighbor(
 
 fn build_missing_neighbor_session_metadata(
     forwarding: &ForwardingState,
-    session_ingress_zone: Option<&Arc<str>>,
+    ingress_zone: &Arc<str>,
+    egress_zone: &Arc<str>,
     ingress_ifindex: i32,
     decision: SessionDecision,
 ) -> SessionMetadata {
     SessionMetadata {
-        ingress_zone: session_ingress_zone
-            .cloned()
-            .unwrap_or_else(|| Arc::from("")),
-        egress_zone: Arc::from(""),
+        ingress_zone: ingress_zone.clone(),
+        egress_zone: egress_zone.clone(),
         owner_rg_id: owner_rg_for_resolution(forwarding, decision.resolution),
         fabric_ingress: ingress_is_fabric(forwarding, ingress_ifindex),
         is_reverse: false,
@@ -10364,6 +10428,9 @@ struct BindingLiveState {
     direct_tx_packets: AtomicU64,
     copy_tx_packets: AtomicU64,
     in_place_tx_packets: AtomicU64,
+    direct_tx_no_frame_fallback_packets: AtomicU64,
+    direct_tx_build_fallback_packets: AtomicU64,
+    direct_tx_disallowed_fallback_packets: AtomicU64,
     debug_pending_fill_frames: AtomicU32,
     debug_spare_fill_frames: AtomicU32,
     debug_free_tx_frames: AtomicU32,
@@ -10434,6 +10501,9 @@ impl BindingLiveState {
             direct_tx_packets: AtomicU64::new(0),
             copy_tx_packets: AtomicU64::new(0),
             in_place_tx_packets: AtomicU64::new(0),
+            direct_tx_no_frame_fallback_packets: AtomicU64::new(0),
+            direct_tx_build_fallback_packets: AtomicU64::new(0),
+            direct_tx_disallowed_fallback_packets: AtomicU64::new(0),
             debug_pending_fill_frames: AtomicU32::new(0),
             debug_spare_fill_frames: AtomicU32::new(0),
             debug_free_tx_frames: AtomicU32::new(0),
@@ -10555,6 +10625,15 @@ impl BindingLiveState {
             direct_tx_packets: self.direct_tx_packets.load(Ordering::Relaxed),
             copy_tx_packets: self.copy_tx_packets.load(Ordering::Relaxed),
             in_place_tx_packets: self.in_place_tx_packets.load(Ordering::Relaxed),
+            direct_tx_no_frame_fallback_packets: self
+                .direct_tx_no_frame_fallback_packets
+                .load(Ordering::Relaxed),
+            direct_tx_build_fallback_packets: self
+                .direct_tx_build_fallback_packets
+                .load(Ordering::Relaxed),
+            direct_tx_disallowed_fallback_packets: self
+                .direct_tx_disallowed_fallback_packets
+                .load(Ordering::Relaxed),
             debug_pending_fill_frames: self.debug_pending_fill_frames.load(Ordering::Relaxed),
             debug_spare_fill_frames: self.debug_spare_fill_frames.load(Ordering::Relaxed),
             debug_free_tx_frames: self.debug_free_tx_frames.load(Ordering::Relaxed),
@@ -10677,6 +10756,30 @@ fn update_binding_debug_state(binding: &mut BindingWorker) {
             .fetch_add(binding.pending_in_place_tx_packets, Ordering::Relaxed);
         binding.pending_in_place_tx_packets = 0;
     }
+    if binding.pending_direct_tx_no_frame_fallback_packets != 0 {
+        binding.live.direct_tx_no_frame_fallback_packets.fetch_add(
+            binding.pending_direct_tx_no_frame_fallback_packets,
+            Ordering::Relaxed,
+        );
+        binding.pending_direct_tx_no_frame_fallback_packets = 0;
+    }
+    if binding.pending_direct_tx_build_fallback_packets != 0 {
+        binding.live.direct_tx_build_fallback_packets.fetch_add(
+            binding.pending_direct_tx_build_fallback_packets,
+            Ordering::Relaxed,
+        );
+        binding.pending_direct_tx_build_fallback_packets = 0;
+    }
+    if binding.pending_direct_tx_disallowed_fallback_packets != 0 {
+        binding
+            .live
+            .direct_tx_disallowed_fallback_packets
+            .fetch_add(
+                binding.pending_direct_tx_disallowed_fallback_packets,
+                Ordering::Relaxed,
+            );
+        binding.pending_direct_tx_disallowed_fallback_packets = 0;
+    }
     // Flush flow cache counters to live state.
     if binding.flow_cache.hits != 0 {
         binding
@@ -10784,6 +10887,9 @@ struct BindingLiveSnapshot {
     direct_tx_packets: u64,
     copy_tx_packets: u64,
     in_place_tx_packets: u64,
+    direct_tx_no_frame_fallback_packets: u64,
+    direct_tx_build_fallback_packets: u64,
+    direct_tx_disallowed_fallback_packets: u64,
     debug_pending_fill_frames: u32,
     #[allow(dead_code)]
     debug_spare_fill_frames: u32,
@@ -12797,10 +12903,17 @@ mod tests {
         };
 
         let ingress_zone = Arc::<str>::from("lan");
-        let metadata =
-            build_missing_neighbor_session_metadata(&state, Some(&ingress_zone), 4, decision);
+        let egress_zone = Arc::<str>::from("wan");
+        let metadata = build_missing_neighbor_session_metadata(
+            &state,
+            &ingress_zone,
+            &egress_zone,
+            4,
+            decision,
+        );
 
         assert_eq!(metadata.ingress_zone.as_ref(), "lan");
+        assert_eq!(metadata.egress_zone.as_ref(), "wan");
         assert!(metadata.fabric_ingress);
         assert!(metadata.synced);
         assert!(!metadata.is_reverse);
@@ -14623,7 +14736,8 @@ mod tests {
         let ip_sum = checksum16(&frame[18..38]);
         frame[28] = (ip_sum >> 8) as u8;
         frame[29] = ip_sum as u8;
-        recompute_l4_checksum_ipv4(&mut frame[18..], 20, PROTO_TCP, true).expect("initial checksum");
+        recompute_l4_checksum_ipv4(&mut frame[18..], 20, PROTO_TCP, true)
+            .expect("initial checksum");
         assert!(tcp_checksum_ok_ipv4(&frame[18..]));
 
         let repaired = enforce_expected_ports(

@@ -8919,31 +8919,34 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 	// TODO: this aggregation logic is duplicated in pkg/cli/monitor_interface.go.
 	// Consider factoring into a shared helper to prevent drift.
 	type userspaceIfSnap struct {
-		statusNote          string
-		helperEnabled       bool
-		forwardingArmed     bool
-		neighborGeneration  uint64
-		lastSnapshotGen     uint64
-		bindings            int
-		readyBindings       int
-		boundBindings       int
-		xskRegistered       int
-		zeroCopyBindings    int
-		rxPackets           uint64
-		rxBytes             uint64
-		txPackets           uint64
-		txBytes             uint64
-		directTXPackets     uint64
-		copyTXPackets       uint64
-		inPlaceTXPackets    uint64
-		sessionMisses       uint64
-		neighborMissPackets uint64
-		routeMissPackets    uint64
-		policyDeniedPackets uint64
-		exceptionPackets    uint64
-		slowPathPackets     uint64
-		lastErrors          []string
-		recentExceptions    []string
+		statusNote                        string
+		helperEnabled                     bool
+		forwardingArmed                   bool
+		neighborGeneration                uint64
+		lastSnapshotGen                   uint64
+		bindings                          int
+		readyBindings                     int
+		boundBindings                     int
+		xskRegistered                     int
+		zeroCopyBindings                  int
+		rxPackets                         uint64
+		rxBytes                           uint64
+		txPackets                         uint64
+		txBytes                           uint64
+		directTXPackets                   uint64
+		copyTXPackets                     uint64
+		inPlaceTXPackets                  uint64
+		directTXNoFrameFallbackPackets    uint64
+		directTXBuildFallbackPackets      uint64
+		directTXDisallowedFallbackPackets uint64
+		sessionMisses                     uint64
+		neighborMissPackets               uint64
+		routeMissPackets                  uint64
+		policyDeniedPackets               uint64
+		exceptionPackets                  uint64
+		slowPathPackets                   uint64
+		lastErrors                        []string
+		recentExceptions                  []string
 	}
 	type ifSnap struct {
 		rxBytes, txBytes, rxPkts, txPkts     uint64
@@ -9002,6 +9005,9 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 			snap.directTXPackets += binding.DirectTXPackets
 			snap.copyTXPackets += binding.CopyTXPackets
 			snap.inPlaceTXPackets += binding.InPlaceTXPackets
+			snap.directTXNoFrameFallbackPackets += binding.DirectTXNoFrameFallbackPackets
+			snap.directTXBuildFallbackPackets += binding.DirectTXBuildFallbackPackets
+			snap.directTXDisallowedFallbackPackets += binding.DirectTXDisallowedFallbackPackets
 			snap.sessionMisses += binding.SessionMisses
 			snap.neighborMissPackets += binding.NeighborMissPackets
 			snap.routeMissPackets += binding.RouteMissPackets
@@ -9185,11 +9191,12 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 
 				if snap.userspace != nil {
 					var (
-						usRxBps, usTxBps, usRxPps, usTxPps                           uint64
-						usRxBytesDelta, usTxBytesDelta, usRxPktsDelta, usTxPktsDelta uint64
-						usDirectDelta, usCopyDelta, usInPlaceDelta                   uint64
-						usSessionMissDelta, usNeighborMissDelta, usRouteMissDelta    uint64
-						usPolicyDeniedDelta, usExceptionDelta, usSlowPathDelta       uint64
+						usRxBps, usTxBps, usRxPps, usTxPps                                uint64
+						usRxBytesDelta, usTxBytesDelta, usRxPktsDelta, usTxPktsDelta      uint64
+						usDirectDelta, usCopyDelta, usInPlaceDelta                        uint64
+						usDirectNoFrameDelta, usDirectBuildDelta, usDirectDisallowedDelta uint64
+						usSessionMissDelta, usNeighborMissDelta, usRouteMissDelta         uint64
+						usPolicyDeniedDelta, usExceptionDelta, usSlowPathDelta            uint64
 					)
 					if prevSingle != nil && prevSingle.userspace != nil {
 						dt := snap.ts.Sub(prevSingle.ts).Seconds()
@@ -9208,6 +9215,9 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 						usDirectDelta = snap.userspace.directTXPackets - baselineSingle.userspace.directTXPackets
 						usCopyDelta = snap.userspace.copyTXPackets - baselineSingle.userspace.copyTXPackets
 						usInPlaceDelta = snap.userspace.inPlaceTXPackets - baselineSingle.userspace.inPlaceTXPackets
+						usDirectNoFrameDelta = snap.userspace.directTXNoFrameFallbackPackets - baselineSingle.userspace.directTXNoFrameFallbackPackets
+						usDirectBuildDelta = snap.userspace.directTXBuildFallbackPackets - baselineSingle.userspace.directTXBuildFallbackPackets
+						usDirectDisallowedDelta = snap.userspace.directTXDisallowedFallbackPackets - baselineSingle.userspace.directTXDisallowedFallbackPackets
 						usSessionMissDelta = snap.userspace.sessionMisses - baselineSingle.userspace.sessionMisses
 						usNeighborMissDelta = snap.userspace.neighborMissPackets - baselineSingle.userspace.neighborMissPackets
 						usRouteMissDelta = snap.userspace.routeMissPackets - baselineSingle.userspace.routeMissPackets
@@ -9231,6 +9241,9 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 					fmt.Fprintf(&buf, "  Direct TX packets:    %20d          [%d]\n", snap.userspace.directTXPackets, usDirectDelta)
 					fmt.Fprintf(&buf, "  Copy TX packets:      %20d          [%d]\n", snap.userspace.copyTXPackets, usCopyDelta)
 					fmt.Fprintf(&buf, "  In-place TX packets:  %20d          [%d]\n", snap.userspace.inPlaceTXPackets, usInPlaceDelta)
+					fmt.Fprintf(&buf, "  Direct TX no-frame:   %20d          [%d]\n", snap.userspace.directTXNoFrameFallbackPackets, usDirectNoFrameDelta)
+					fmt.Fprintf(&buf, "  Direct TX build-none: %20d          [%d]\n", snap.userspace.directTXBuildFallbackPackets, usDirectBuildDelta)
+					fmt.Fprintf(&buf, "  Direct TX disallowed: %20d          [%d]\n", snap.userspace.directTXDisallowedFallbackPackets, usDirectDisallowedDelta)
 					fmt.Fprintf(&buf, "  Session misses:       %20d          [%d]\n", snap.userspace.sessionMisses, usSessionMissDelta)
 					fmt.Fprintf(&buf, "  Neighbor misses:      %20d          [%d]\n", snap.userspace.neighborMissPackets, usNeighborMissDelta)
 					fmt.Fprintf(&buf, "  Route misses:         %20d          [%d]\n", snap.userspace.routeMissPackets, usRouteMissDelta)

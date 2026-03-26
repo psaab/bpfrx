@@ -50,6 +50,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	var directTXPackets uint64
 	var copyTXPackets uint64
 	var inPlaceTXPackets uint64
+	var directTXNoFrameFallbackPackets uint64
+	var directTXBuildFallbackPackets uint64
+	var directTXDisallowedFallbackPackets uint64
 	var slowPathPackets uint64
 	var slowPathDrops uint64
 	for _, binding := range status.Bindings {
@@ -94,6 +97,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 		directTXPackets += binding.DirectTXPackets
 		copyTXPackets += binding.CopyTXPackets
 		inPlaceTXPackets += binding.InPlaceTXPackets
+		directTXNoFrameFallbackPackets += binding.DirectTXNoFrameFallbackPackets
+		directTXBuildFallbackPackets += binding.DirectTXBuildFallbackPackets
+		directTXDisallowedFallbackPackets += binding.DirectTXDisallowedFallbackPackets
 		slowPathPackets += binding.SlowPathPackets
 		slowPathDrops += binding.SlowPathDrops
 	}
@@ -209,6 +215,9 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  Direct TX packets:         %d\n", directTXPackets)
 	fmt.Fprintf(&b, "  Copy-path TX packets:      %d\n", copyTXPackets)
 	fmt.Fprintf(&b, "  In-place TX packets:       %d\n", inPlaceTXPackets)
+	fmt.Fprintf(&b, "  Direct TX no-frame fb:     %d\n", directTXNoFrameFallbackPackets)
+	fmt.Fprintf(&b, "  Direct TX build-none fb:   %d\n", directTXBuildFallbackPackets)
+	fmt.Fprintf(&b, "  Direct TX disallowed fb:   %d\n", directTXDisallowedFallbackPackets)
 	fmt.Fprintf(&b, "  Slow path active:          %t\n", status.SlowPath.Active)
 	if status.SlowPath.DeviceName != "" {
 		fmt.Fprintf(&b, "  Slow path device:          %s\n", status.SlowPath.DeviceName)

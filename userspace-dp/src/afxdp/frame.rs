@@ -210,7 +210,30 @@ pub(super) fn enqueue_pending_forwards(
         let mut copied_source_frame = false;
         let mut retained_source_frame = false;
         {
-            if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
+            if let Some((segments, bytes, max_frame)) = segment_forwarded_tcp_frames_into_prepared(
+                target_binding,
+                source_frame,
+                request.meta,
+                &request.decision,
+                forwarding,
+                request.apply_nat_on_fabric,
+                expected_ports,
+                request.flow_key.clone(),
+                now_ns,
+                post_recycles,
+            ) {
+                dbg.enqueue_ok += segments as u64;
+                dbg.enqueue_direct += segments as u64;
+                target_binding.pending_direct_tx_packets += segments as u64;
+                dbg.tx_bytes_total += bytes;
+                if max_frame > dbg.tx_max_frame {
+                    dbg.tx_max_frame = max_frame;
+                }
+                copied_source_frame = true;
+                if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE {
+                    let _ = drain_pending_tx(target_binding, now_ns, post_recycles);
+                }
+            } else if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
                 source_frame,
                 request.meta,
                 &request.decision,
@@ -419,6 +442,11 @@ pub(super) fn enqueue_pending_forwards(
                         },
                     }
                 } else {
+                    enum DirectTxFallbackReason {
+                        NoFreeTxFrame,
+                        BuildReturnedNone,
+                        DisallowedByRewriteMode,
+                    }
                     // Direct TX build: write the forwarded frame directly into
                     // the target binding's UMEM TX frame, eliminating the
                     // intermediate Vec allocation and one memcpy.
@@ -433,11 +461,14 @@ pub(super) fn enqueue_pending_forwards(
                         let _ = drain_pending_tx(target_binding, now_ns, post_recycles);
                         direct_tx_offset = target_binding.free_tx_frames.pop_front();
                     }
+                    let mut direct_tx_fallback_reason = None;
                     let direct_built = if is_nat64 || uses_native_tunnel {
                         // NAT64 can't use direct TX — return the frame if we popped one.
                         if let Some(off) = direct_tx_offset {
                             target_binding.free_tx_frames.push_front(off);
                         }
+                        direct_tx_fallback_reason =
+                            Some(DirectTxFallbackReason::DisallowedByRewriteMode);
                         false
                     } else if let Some(tx_offset) = direct_tx_offset {
                         let target_area = target_binding.umem.area();
@@ -539,13 +570,28 @@ pub(super) fn enqueue_pending_forwards(
                             }
                         } else {
                             target_binding.free_tx_frames.push_front(tx_offset);
+                            direct_tx_fallback_reason =
+                                Some(DirectTxFallbackReason::BuildReturnedNone);
                             false
                         }
                     } else {
+                        direct_tx_fallback_reason = Some(DirectTxFallbackReason::NoFreeTxFrame);
                         false
                     };
                     // Fallback: Vec copy path when direct build unavailable.
                     if !direct_built {
+                        match direct_tx_fallback_reason {
+                            Some(DirectTxFallbackReason::NoFreeTxFrame) => {
+                                target_binding.pending_direct_tx_no_frame_fallback_packets += 1;
+                            }
+                            Some(DirectTxFallbackReason::BuildReturnedNone) => {
+                                target_binding.pending_direct_tx_build_fallback_packets += 1;
+                            }
+                            Some(DirectTxFallbackReason::DisallowedByRewriteMode) => {
+                                target_binding.pending_direct_tx_disallowed_fallback_packets += 1;
+                            }
+                            None => {}
+                        }
                         match if is_nat64 {
                             build_nat64_forwarded_frame(
                                 source_frame,
@@ -1428,7 +1474,10 @@ pub(super) fn packet_rel_l4_offset(packet: &[u8], addr_family: u8) -> Option<usi
 /// byte from the IP header. Needed for GRE inner packet parsing where
 /// the initial next-header (packet[6]) may be an extension header, not
 /// the actual L4 protocol.
-pub(super) fn packet_rel_l4_offset_and_protocol(packet: &[u8], addr_family: u8) -> Option<(usize, u8)> {
+pub(super) fn packet_rel_l4_offset_and_protocol(
+    packet: &[u8],
+    addr_family: u8,
+) -> Option<(usize, u8)> {
     match addr_family as i32 {
         libc::AF_INET => {
             if packet.len() < 20 {
@@ -1452,19 +1501,25 @@ pub(super) fn packet_rel_l4_offset_and_protocol(packet: &[u8], addr_family: u8) 
                         let opt = packet.get(offset..offset + 2)?;
                         protocol = opt[0];
                         offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
-                        if packet.len() < offset { return None; }
+                        if packet.len() < offset {
+                            return None;
+                        }
                     }
                     51 => {
                         let opt = packet.get(offset..offset + 2)?;
                         protocol = opt[0];
                         offset = offset.checked_add((usize::from(opt[1]) + 2) * 4)?;
-                        if packet.len() < offset { return None; }
+                        if packet.len() < offset {
+                            return None;
+                        }
                     }
                     44 => {
                         let frag = packet.get(offset..offset + 8)?;
                         protocol = frag[0];
                         offset = offset.checked_add(8)?;
-                        if packet.len() < offset { return None; }
+                        if packet.len() < offset {
+                            return None;
+                        }
                     }
                     59 => return None,
                     _ => return Some((offset, protocol)),
@@ -1798,7 +1853,9 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
     if mtu == 0 {
         return None;
     }
-    let Some(l3) = frame_l3_offset(frame) else { return None; };
+    let Some(l3) = frame_l3_offset(frame) else {
+        return None;
+    };
     if l3 >= frame.len() {
         return None;
     }
@@ -1806,8 +1863,12 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
     if payload.len() <= mtu {
         return None;
     }
-    let Some(frame_l4) = frame_l4_offset(frame, meta.addr_family) else { return None; };
-    let Some(tcp_offset) = frame_l4.checked_sub(l3) else { return None; };
+    let Some(frame_l4) = frame_l4_offset(frame, meta.addr_family) else {
+        return None;
+    };
+    let Some(tcp_offset) = frame_l4.checked_sub(l3) else {
+        return None;
+    };
     let (ip_header_len, tcp_offset) = match meta.addr_family as i32 {
         libc::AF_INET => {
             if payload.len() < 20 {
@@ -1836,16 +1897,22 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
     if (tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_RST)) != 0 {
         return None;
     }
-    let Some(segment_payload_max) = mtu.checked_sub(ip_header_len + tcp_header_len) else { return None; };
+    let Some(segment_payload_max) = mtu.checked_sub(ip_header_len + tcp_header_len) else {
+        return None;
+    };
     if segment_payload_max == 0 {
         return None;
     }
-    let Some(data) = payload.get(tcp_offset + tcp_header_len..) else { return None; };
+    let Some(data) = payload.get(tcp_offset + tcp_header_len..) else {
+        return None;
+    };
     if data.len() <= segment_payload_max {
         return None;
     }
 
-    let Some(dst_mac) = decision.resolution.neighbor_mac else { return None; };
+    let Some(dst_mac) = decision.resolution.neighbor_mac else {
+        return None;
+    };
     let (src_mac, vlan_id, apply_nat) =
         if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
             (
@@ -1872,9 +1939,17 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
         *payload.get(tcp_offset + 6)?,
         *payload.get(tcp_offset + 7)?,
     ]);
-    let enforced_ports = expected_ports.or(live_frame_ports_bytes(frame, meta.addr_family, meta.protocol));
-    let Some(tcp_header) = payload.get(tcp_offset..tcp_offset + tcp_header_len) else { return None; };
-    let Some(ip_header) = payload.get(..ip_header_len) else { return None; };
+    let enforced_ports = expected_ports.or(live_frame_ports_bytes(
+        frame,
+        meta.addr_family,
+        meta.protocol,
+    ));
+    let Some(tcp_header) = payload.get(tcp_offset..tcp_offset + tcp_header_len) else {
+        return None;
+    };
+    let Some(ip_header) = payload.get(..ip_header_len) else {
+        return None;
+    };
     let mut out = Vec::with_capacity((data.len() / segment_payload_max) + 1);
     let mut data_offset = 0usize;
     while data_offset < data.len() {
@@ -1975,6 +2050,273 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
         data_offset += chunk_len;
     }
     Some(out)
+}
+
+fn segment_forwarded_tcp_frames_into_prepared(
+    target_binding: &mut BindingWorker,
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    apply_nat_on_fabric: bool,
+    expected_ports: Option<(u16, u16)>,
+    flow_key: Option<SessionKey>,
+    now_ns: u64,
+    post_recycles: &mut Vec<(u32, u64)>,
+) -> Option<(u32, u64, u32)> {
+    if meta.protocol != PROTO_TCP || decision.resolution.tunnel_endpoint_id != 0 {
+        return None;
+    }
+    let mtu = forwarding
+        .egress
+        .get(&decision.resolution.egress_ifindex)
+        .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex))
+        .map(|egress| egress.mtu)
+        .unwrap_or_default()
+        .max(1280);
+    if mtu == 0 {
+        return None;
+    }
+    let l3 = frame_l3_offset(frame)?;
+    if l3 >= frame.len() {
+        return None;
+    }
+    let payload = &frame[l3..];
+    if payload.len() <= mtu {
+        return None;
+    }
+    let frame_l4 = frame_l4_offset(frame, meta.addr_family)?;
+    let tcp_offset = frame_l4.checked_sub(l3)?;
+    let (ip_header_len, tcp_offset) = match meta.addr_family as i32 {
+        libc::AF_INET => {
+            if payload.len() < 20 {
+                return None;
+            }
+            let ihl = ((payload[0] & 0x0f) as usize) * 4;
+            if ihl < 20 || payload.len() < ihl + 20 {
+                return None;
+            }
+            (ihl, ihl)
+        }
+        libc::AF_INET6 => {
+            let ip_header_len = tcp_offset;
+            if ip_header_len < 40 || payload.len() < ip_header_len + 20 {
+                return None;
+            }
+            (ip_header_len, ip_header_len)
+        }
+        _ => return None,
+    };
+    let tcp_header_len = ((payload.get(tcp_offset + 12)? >> 4) as usize) * 4;
+    if tcp_header_len < 20 || payload.len() < tcp_offset + tcp_header_len {
+        return None;
+    }
+    let tcp_flags = *payload.get(tcp_offset + 13)?;
+    if (tcp_flags & (TCP_FLAG_SYN | TCP_FLAG_FIN | TCP_FLAG_RST)) != 0 {
+        return None;
+    }
+    let segment_payload_max = mtu.checked_sub(ip_header_len + tcp_header_len)?;
+    if segment_payload_max == 0 {
+        return None;
+    }
+    let data = payload.get(tcp_offset + tcp_header_len..)?;
+    if data.len() <= segment_payload_max {
+        return None;
+    }
+
+    let segment_count = data.len().div_ceil(segment_payload_max);
+    if target_binding.free_tx_frames.len() < segment_count
+        && (target_binding.outstanding_tx > 0
+            || !target_binding.pending_tx_prepared.is_empty()
+            || !target_binding.pending_tx_local.is_empty())
+    {
+        let _ = drain_pending_tx(target_binding, now_ns, post_recycles);
+    }
+    if target_binding.free_tx_frames.len() < segment_count {
+        return None;
+    }
+
+    let dst_mac = decision.resolution.neighbor_mac?;
+    let (src_mac, vlan_id, apply_nat) =
+        if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
+            (
+                decision.resolution.src_mac?,
+                decision.resolution.tx_vlan_id,
+                apply_nat_on_fabric,
+            )
+        } else {
+            (
+                decision.resolution.src_mac?,
+                decision.resolution.tx_vlan_id,
+                true,
+            )
+        };
+    let eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let ether_type = match meta.addr_family as i32 {
+        libc::AF_INET => 0x0800,
+        libc::AF_INET6 => 0x86dd,
+        _ => return None,
+    };
+    let original_seq = u32::from_be_bytes([
+        *payload.get(tcp_offset + 4)?,
+        *payload.get(tcp_offset + 5)?,
+        *payload.get(tcp_offset + 6)?,
+        *payload.get(tcp_offset + 7)?,
+    ]);
+    let enforced_ports = expected_ports.or(live_frame_ports_bytes(
+        frame,
+        meta.addr_family,
+        meta.protocol,
+    ));
+    let tcp_header = payload.get(tcp_offset..tcp_offset + tcp_header_len)?;
+    let ip_header = payload.get(..ip_header_len)?;
+    let mut prepared: Vec<PreparedTxRequest> = Vec::with_capacity(segment_count);
+    let mut total_bytes = 0u64;
+    let mut max_frame = 0u32;
+    let mut data_offset = 0usize;
+    while data_offset < data.len() {
+        let chunk_len = (data.len() - data_offset).min(segment_payload_max);
+        let is_last = data_offset + chunk_len == data.len();
+        let total_ip_len = ip_header_len + tcp_header_len + chunk_len;
+        let frame_len = eth_len + total_ip_len;
+        if frame_len > tx_frame_capacity() {
+            for req in prepared.drain(..).rev() {
+                target_binding.free_tx_frames.push_front(req.offset);
+            }
+            return None;
+        }
+        let Some(tx_offset) = target_binding.free_tx_frames.pop_front() else {
+            for req in prepared.drain(..).rev() {
+                target_binding.free_tx_frames.push_front(req.offset);
+            }
+            return None;
+        };
+        let Some(frame_out) = (unsafe {
+            target_binding
+                .umem
+                .area()
+                .slice_mut_unchecked(tx_offset as usize, frame_len)
+        }) else {
+            target_binding.free_tx_frames.push_front(tx_offset);
+            for req in prepared.drain(..).rev() {
+                target_binding.free_tx_frames.push_front(req.offset);
+            }
+            return None;
+        };
+
+        let built = (|| -> Option<()> {
+            write_eth_header_slice(
+                frame_out.get_mut(..eth_len)?,
+                dst_mac,
+                src_mac,
+                vlan_id,
+                ether_type,
+            )?;
+            {
+                let packet = frame_out.get_mut(eth_len..)?;
+                packet.get_mut(..ip_header_len)?.copy_from_slice(ip_header);
+                packet
+                    .get_mut(ip_header_len..ip_header_len + tcp_header_len)?
+                    .copy_from_slice(tcp_header);
+                packet
+                    .get_mut(ip_header_len + tcp_header_len..total_ip_len)?
+                    .copy_from_slice(data.get(data_offset..data_offset + chunk_len)?);
+
+                let tcp = packet.get_mut(tcp_offset..)?;
+                let seq = original_seq.wrapping_add(data_offset as u32);
+                tcp.get_mut(4..8)?.copy_from_slice(&seq.to_be_bytes());
+                if !is_last {
+                    tcp[13] &= !TCP_FLAG_PSH;
+                }
+            }
+
+            match meta.addr_family as i32 {
+                libc::AF_INET => {
+                    {
+                        let packet = frame_out.get_mut(eth_len..)?;
+                        packet
+                            .get_mut(2..4)?
+                            .copy_from_slice(&(total_ip_len as u16).to_be_bytes());
+                        if packet[8] <= 1 {
+                            return None;
+                        }
+                        if apply_nat {
+                            apply_nat_ipv4(packet, meta.protocol, decision.nat)?;
+                        }
+                        if (meta.meta_flags & 0x80) == 0 {
+                            packet[8] -= 1;
+                        }
+                    }
+                    let _ = enforce_expected_ports(
+                        frame_out,
+                        meta.addr_family,
+                        meta.protocol,
+                        enforced_ports,
+                    )?;
+                    let packet = frame_out.get_mut(eth_len..)?;
+                    packet.get_mut(10..12)?.copy_from_slice(&[0, 0]);
+                    let ip_sum = checksum16(packet.get(..ip_header_len)?);
+                    packet
+                        .get_mut(10..12)?
+                        .copy_from_slice(&ip_sum.to_be_bytes());
+                    recompute_l4_checksum_ipv4(packet, ip_header_len, meta.protocol, false)?;
+                }
+                libc::AF_INET6 => {
+                    {
+                        let packet = frame_out.get_mut(eth_len..)?;
+                        packet
+                            .get_mut(4..6)?
+                            .copy_from_slice(&((tcp_header_len + chunk_len) as u16).to_be_bytes());
+                        if (meta.meta_flags & 0x80) == 0 && packet[7] <= 1 {
+                            return None;
+                        }
+                        if apply_nat {
+                            apply_nat_ipv6(packet, meta.protocol, decision.nat)?;
+                        }
+                        if (meta.meta_flags & 0x80) == 0 {
+                            packet[7] -= 1;
+                        }
+                    }
+                    let _ = enforce_expected_ports(
+                        frame_out,
+                        meta.addr_family,
+                        meta.protocol,
+                        enforced_ports,
+                    )?;
+                    let packet = frame_out.get_mut(eth_len..)?;
+                    recompute_l4_checksum_ipv6(packet, meta.protocol)?;
+                }
+                _ => return None,
+            }
+            Some(())
+        })();
+        if built.is_none() {
+            target_binding.free_tx_frames.push_front(tx_offset);
+            for req in prepared.drain(..).rev() {
+                target_binding.free_tx_frames.push_front(req.offset);
+            }
+            return None;
+        }
+
+        prepared.push(PreparedTxRequest {
+            offset: tx_offset,
+            len: frame_len as u32,
+            recycle: PreparedTxRecycle::FreeTxFrame,
+            expected_ports,
+            expected_addr_family: meta.addr_family,
+            expected_protocol: meta.protocol,
+            flow_key: flow_key.clone(),
+        });
+        total_bytes += frame_len as u64;
+        max_frame = max_frame.max(frame_len as u32);
+        data_offset += chunk_len;
+    }
+
+    for req in prepared {
+        target_binding.pending_tx_prepared.push_back(req);
+    }
+    bound_pending_tx_prepared(target_binding);
+    Some((segment_count as u32, total_bytes, max_frame))
 }
 
 pub(super) fn build_forwarded_frame_into_from_frame(
@@ -2731,8 +3073,7 @@ pub(super) fn apply_rewrite_descriptor(
                     let new_l4 = !(l4sum as u16);
                     // IPv6 UDP must have non-zero checksum; use 0xFFFF for all.
                     let final_csum = if new_l4 == 0 { 0xFFFFu16 } else { new_l4 };
-                    packet[l4_csum_off..l4_csum_off + 2]
-                        .copy_from_slice(&final_csum.to_be_bytes());
+                    packet[l4_csum_off..l4_csum_off + 2].copy_from_slice(&final_csum.to_be_bytes());
                 }
             }
         }
@@ -3781,12 +4122,31 @@ pub(super) fn build_ndp_neighbor_solicitation(
     let target_bytes = target_ip.octets();
     // Solicited-node multicast: ff02::1:ff00:0000 | last 24 bits of target
     let sol_node: [u8; 16] = [
-        0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, target_bytes[13], target_bytes[14],
+        0xff,
+        0x02,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0x01,
+        0xff,
+        target_bytes[13],
+        target_bytes[14],
         target_bytes[15],
     ];
     // Multicast MAC: 33:33:XX:XX:XX:XX (last 4 bytes of multicast IP)
     let dst_mac = [
-        0x33, 0x33, sol_node[12], sol_node[13], sol_node[14], sol_node[15],
+        0x33,
+        0x33,
+        sol_node[12],
+        sol_node[13],
+        sol_node[14],
+        sol_node[15],
     ];
 
     let mut frame = Vec::with_capacity(86);
