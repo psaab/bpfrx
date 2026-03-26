@@ -373,6 +373,15 @@ func (r *heartbeatReceiver) timeoutLoop() {
 				continue
 			}
 			last := time.Unix(0, lastNano)
+			// During the first 30 seconds after startup, suppress
+			// peer-lost entirely. The config apply phase (VRF binding,
+			// FRR reload, fabric creation, RETH MAC) can disrupt the
+			// UDP receive path on the control link for 10-15+ seconds.
+			// Without this grace, the recovering node sees one peer
+			// heartbeat then declares peer lost — creating split-brain.
+			if time.Since(r.startedAt) < 30*time.Second {
+				continue
+			}
 			if time.Since(last) > timeout {
 				r.mgr.handlePeerTimeout()
 			}
