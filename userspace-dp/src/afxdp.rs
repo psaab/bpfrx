@@ -33,8 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use xdpilone::xdp::XdpDesc;
-use xdpilone::{BufIdx, SocketConfig, Umem, UmemConfig, User};
+use crate::xsk_ffi::xdp::XdpDesc;
+use crate::xsk_ffi::{BufIdx, SocketConfig, Umem, UmemConfig, User};
 
 const USERSPACE_SESSION_ACTION_REDIRECT: u8 = 1;
 const USERSPACE_SESSION_ACTION_PASS_TO_KERNEL: u8 = 2;
@@ -67,7 +67,7 @@ mod tx;
 use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
     AfXdpBindStrategy, binding_frame_count, ifinfo_from_binding, interface_driver_name,
-    open_binding_worker_rings, preferred_bind_strategy, prime_fill_ring_offsets,
+    open_binding_worker_rings, preferred_bind_strategy,
     reserved_tx_frames, umem_ring_size,
 };
 #[cfg(test)]
@@ -1545,6 +1545,9 @@ impl Coordinator {
         for binding in bindings.iter_mut() {
             if let Some(live) = self.live.get(&binding.slot) {
                 let snap = live.snapshot();
+                if snap.bound && !binding.bound {
+                    eprintln!("refresh_bindings: slot={} transitioning bound=false->true fd={}", binding.slot, snap.socket_fd);
+                }
                 binding.bound = snap.bound;
                 binding.xsk_registered = snap.xsk_registered;
                 binding.xsk_bind_mode = snap.xsk_bind_mode;
@@ -1930,9 +1933,9 @@ struct BindingWorker {
     live: Arc<BindingLiveState>,
     #[allow(dead_code)]
     user: User,
-    device: xdpilone::DeviceQueue,
-    rx: xdpilone::RingRx,
-    tx: xdpilone::RingTx,
+    device: crate::xsk_ffi::DeviceQueue,
+    rx: crate::xsk_ffi::RingRx,
+    tx: crate::xsk_ffi::RingTx,
     free_tx_frames: VecDeque<u64>,
     pending_tx_prepared: VecDeque<PreparedTxRequest>,
     pending_tx_local: VecDeque<TxRequest>,
@@ -1979,7 +1982,7 @@ struct BindingWorker {
     dbg_sendto_enobufs: u64,     // sendto returned ENOBUFS (kernel TX drop)
     dbg_pending_overflow: u64,   // drops from bound_pending overflow
     dbg_tx_tcp_rst: u64,         // TCP RST packets transmitted
-    // Ring diagnostics — raw values from xdpilone API
+    // Ring diagnostics — raw values from xsk_ffi API
     dbg_rx_avail_nonzero: u64,     // times rx.available() > 0
     dbg_rx_avail_max: u32,         // max rx.available() seen this interval
     dbg_fill_pending: u32,         // fill ring: userspace produced - kernel consumed
@@ -2221,7 +2224,7 @@ impl BindingWorker {
         live: Arc<BindingLiveState>,
         bind_strategy: AfXdpBindStrategy,
         poll_mode: crate::PollMode,
-        worker_umem: WorkerUmem,
+        mut worker_umem: WorkerUmem,
         frame_pool: &mut VecDeque<u64>,
         shared_umem: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -2256,7 +2259,7 @@ impl BindingWorker {
         let info = ifinfo_from_binding(binding)?;
         let (user, rx, tx, bind_mode, actual_bind_strategy, mut device) =
             open_binding_worker_rings(
-                &worker_umem,
+                &mut worker_umem,
                 &info,
                 ring_entries,
                 bind_strategy,
@@ -2396,6 +2399,12 @@ struct WorkerUmemInner {
     total_frames: u32,
 }
 
+impl WorkerUmemInner {
+    fn umem_mut(&mut self) -> &mut Umem {
+        &mut self.umem
+    }
+}
+
 #[derive(Clone)]
 struct WorkerUmem {
     inner: Rc<WorkerUmemInner>,
@@ -2429,6 +2438,10 @@ impl WorkerUmem {
 
     fn umem(&self) -> &Umem {
         &self.inner.umem
+    }
+
+    fn umem_mut(&mut self) -> &mut Umem {
+        Rc::get_mut(&mut self.inner).expect("single-owner umem").umem_mut()
     }
 
     fn total_frames(&self) -> u32 {
@@ -5838,7 +5851,7 @@ fn worker_loop(
                 for (i, b) in bindings.iter().enumerate() {
                     use std::fmt::Write;
                     let fill_pending = b.device.pending();
-                    let rx_avail = b.rx.available();
+                    let rx_avail = b.rx.available_relaxed();
                     let xsk_stats = b.device.statistics_v2().ok();
                     let inflight_recycles = b.in_flight_prepared_recycles.len() as u32;
                     let scratch_recycle_len = b.scratch_recycle.len() as u32;
@@ -5925,7 +5938,7 @@ fn worker_loop(
                             let _ = write!(binding_summary, " SO_ERR={so_err}");
                         }
                     }
-                    // Ring diagnostics from xdpilone API
+                    // Ring diagnostics from xsk_ffi API
                     if cfg!(feature = "debug-log") {
                         let _ = write!(
                             binding_summary,
@@ -6106,7 +6119,7 @@ fn worker_loop(
                         for (si, sb) in bindings.iter().enumerate() {
                             use std::fmt::Write;
                             let fill_p = sb.device.pending();
-                            let rx_a = sb.rx.available();
+                            let rx_a = sb.rx.available_relaxed();
                             let ifl = sb.in_flight_prepared_recycles.len() as u32;
                             let ptxp = sb.pending_tx_prepared.len() as u32;
                             let ptxl = sb.pending_tx_local.len() as u32;
