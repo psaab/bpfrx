@@ -283,6 +283,7 @@ import sys
 path = pathlib.Path(sys.argv[1])
 label = sys.argv[2]
 if not path.exists():
+    print(f"WARN: status_summary_value: '{path}' missing, defaulting to 0", file=sys.stderr)
     print("0")
     raise SystemExit(0)
 
@@ -291,9 +292,14 @@ for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
     if not line.startswith(pattern):
         continue
     match = re.search(r"(-?\d+)", line.split(":", 1)[1])
-    print(match.group(1) if match else "0")
+    if match:
+        print(match.group(1))
+    else:
+        print(f"WARN: status_summary_value: unparseable value for '{label}' in '{path}'", file=sys.stderr)
+        print("0")
     break
 else:
+    print(f"WARN: status_summary_value: label '{label}' not found in '{path}'", file=sys.stderr)
     print("0")
 PY
 }
@@ -338,6 +344,9 @@ for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
             parents.add(parts[1])
         continue
     if section == "bindings":
+        # Column layout from 'show chassis cluster data-plane interfaces':
+        #   [0]=slot [1]=queue ... [11]=TX_pkts ... [19]=interface
+        # If the CLI format changes, these indices must be updated.
         parts = stripped.split()
         if len(parts) < 20:
             continue

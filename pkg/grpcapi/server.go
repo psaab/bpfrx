@@ -8916,6 +8916,8 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 	}
 
 	// Helper: read interface counters.
+	// TODO: this aggregation logic is duplicated in pkg/cli/monitor_interface.go.
+	// Consider factoring into a shared helper to prevent drift.
 	type userspaceIfSnap struct {
 		statusNote          string
 		helperEnabled       bool

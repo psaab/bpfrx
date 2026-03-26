@@ -33,6 +33,10 @@ pub(super) enum AfXdpBinder {
     DeviceQueue,
 }
 
+/// Total UMEM frames per binding: reserved TX + 2×ring_entries for RX fill.
+/// For virtio_net (fabric parent), reserved TX = ring_entries, so total is
+/// 3×ring_entries frames. At UMEM_FRAME_SIZE=4096 and ring_entries=8192,
+/// that's ~96 MB per binding (×queues per interface).
 pub(super) fn binding_frame_count_for_driver(driver: Option<&str>, ring_entries: u32) -> u32 {
     reserved_tx_frames_for_driver(driver, ring_entries)
         .saturating_add(ring_entries.saturating_mul(2).max(1))
