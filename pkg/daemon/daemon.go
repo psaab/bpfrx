@@ -1617,8 +1617,23 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			addrs = unit.Addresses
 		}
 		if err := ensureFabricIPVLAN(parentLinux, fabLinux, addrs); err != nil {
-			slog.Warn("failed to create fabric IPVLAN",
-				"parent", parentLinux, "name", fabLinux, "err", err)
+			// Fabric overlay is critical for cluster heartbeat and VRRP.
+			// Retry up to 5 times with 1s delay — the parent interface
+			// might not be ready yet after a power cycle.
+			var retryErr error
+			for retry := 0; retry < 5; retry++ {
+				time.Sleep(time.Second)
+				slog.Info("retrying fabric IPVLAN creation",
+					"parent", parentLinux, "name", fabLinux, "attempt", retry+2)
+				retryErr = ensureFabricIPVLAN(parentLinux, fabLinux, addrs)
+				if retryErr == nil {
+					break
+				}
+			}
+			if retryErr != nil {
+				slog.Error("CRITICAL: fabric IPVLAN creation failed after retries — cluster heartbeat will not work",
+					"parent", parentLinux, "name", fabLinux, "err", retryErr)
+			}
 			continue
 		}
 	}
