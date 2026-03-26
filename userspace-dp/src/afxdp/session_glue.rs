@@ -409,7 +409,11 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
     let candidates = {
         let mut out = Vec::new();
         sessions.iter(|key, decision, metadata| {
-            if metadata.synced || !metadata.is_reverse {
+            // Refresh both local reverse sessions AND synced sessions
+            // whose owner RG just became locally active. Synced sessions
+            // need re-resolution because their egress info was computed
+            // on the peer node and may not be valid locally.
+            if !metadata.is_reverse && !metadata.synced {
                 return;
             }
             out.push((key.clone(), decision, metadata.clone()));
