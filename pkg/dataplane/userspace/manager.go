@@ -51,14 +51,16 @@ type Manager struct {
 	haGroups           map[int]HAGroupStatus
 	lastIngressIfaces  []uint32
 	lastBindingIndices []uint32
-	neighborsPrewarmed  bool
-	ctrlEnableAt        time.Time
-	ctrlWasEnabled      bool
-	xskLivenessFailed   bool
-	xskLivenessProven   bool
-	xskProbeStart       time.Time
-	lastXSKRX           uint64
-	neighborGeneration  uint64
+	neighborsPrewarmed bool
+	ctrlEnableAt       time.Time
+	ctrlWasEnabled     bool
+	xskLivenessFailed  bool
+	xskLivenessProven  bool
+	xskProbeStart      time.Time
+	lastXSKRX          uint64
+	lastNAPIBootstrap  time.Time
+	publishedSnapshot  uint64
+	publishedPlanKey   string
 }
 
 func New() *Manager {
@@ -126,7 +128,9 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// delivers to the kernel at the same throughput as xdp_main_prog.
 	// XSK socket creation is deferred by the arm delay (45s) to avoid
 	// segfaults from __xsk_setup_xdp_prog during link cycles.
-	if caps.ForwardingSupported {
+	if m.xskLivenessFailed {
+		m.inner.XDPEntryProg = "xdp_main_prog"
+	} else if caps.ForwardingSupported {
 		m.inner.XDPEntryProg = "xdp_userspace_prog"
 	} else {
 		m.inner.XDPEntryProg = "xdp_main_prog"
@@ -143,9 +147,64 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	defer m.mu.Unlock()
 	m.clusterHA = cfg != nil && cfg.Chassis.Cluster != nil
 	m.seedHAGroupInventoryLocked(cfg)
+	prevPlanKey := snapshotBindingPlanKey(m.lastSnapshot)
+	newPlanKey := snapshotBindingPlanKey(snap)
+	pendingXSKStartup := m.proc != nil &&
+		m.proc.Process != nil &&
+		m.publishedSnapshot != 0 &&
+		!m.xskLivenessProven &&
+		!m.xskLivenessFailed
+	samePlanRefresh := m.proc != nil &&
+		m.proc.Process != nil &&
+		prevPlanKey != "" &&
+		prevPlanKey == newPlanKey
+	publishedPlanChangedDuringStartup := pendingXSKStartup &&
+		m.publishedPlanKey != "" &&
+		m.publishedPlanKey != newPlanKey
+	if publishedPlanChangedDuringStartup {
+		slog.Info(
+			"userspace: restarting helper during XSK startup for binding plan change",
+			"generation", snap.Generation,
+			"fib_generation", snap.FIBGeneration,
+		)
+		m.stopLocked()
+		pendingXSKStartup = false
+		samePlanRefresh = false
+	}
 	m.lastSnapshot = snap
-	if err := m.programBootstrapMapsLocked(snap, ucfg); err != nil {
-		return result, err
+	if pendingXSKStartup {
+		if err := m.syncIngressIfaceMapLocked(snap); err != nil {
+			return result, err
+		}
+		if err := m.syncLocalAddressMapsLocked(snap); err != nil {
+			return result, err
+		}
+		if err := m.syncInterfaceNATAddressMapsLocked(snap); err != nil {
+			return result, err
+		}
+		m.cfg = ucfg
+		slog.Info(
+			"userspace: deferring snapshot publish during XSK startup",
+			"generation", snap.Generation,
+			"fib_generation", snap.FIBGeneration,
+			"same_plan", samePlanRefresh,
+		)
+		return result, nil
+	}
+	if samePlanRefresh {
+		if err := m.syncIngressIfaceMapLocked(snap); err != nil {
+			return result, err
+		}
+		if err := m.syncLocalAddressMapsLocked(snap); err != nil {
+			return result, err
+		}
+		if err := m.syncInterfaceNATAddressMapsLocked(snap); err != nil {
+			return result, err
+		}
+	} else {
+		if err := m.programBootstrapMapsLocked(snap, ucfg); err != nil {
+			return result, err
+		}
 	}
 	if err := m.ensureProcessLocked(ucfg); err != nil {
 		return result, err
@@ -154,6 +213,8 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: snap}, &status); err != nil {
 		return result, fmt.Errorf("publish userspace snapshot: %w", err)
 	}
+	m.publishedSnapshot = snap.Generation
+	m.publishedPlanKey = newPlanKey
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return result, fmt.Errorf("sync helper status: %w", err)
 	}
@@ -167,9 +228,6 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		return result, fmt.Errorf("sync userspace forwarding state: %w", err)
 	}
 	m.ensureStatusLoopLocked()
-	// Immediately push kernel neighbors so the helper can forward
-	// without waiting for the first 5-second status loop tick.
-	m.refreshNeighborSnapshotLocked()
 	m.cfg = ucfg
 	return result, nil
 }
@@ -680,12 +738,12 @@ func buildFabricPeerMAC(overlayIfindex, parentIfindex int, peer string) string {
 
 func userspaceMapPins() UserspaceMapPins {
 	return UserspaceMapPins{
-		Ctrl:      dataplane.UserspaceCtrlPinPath(),
-		Bindings:  dataplane.UserspaceBindingsPinPath(),
-		Heartbeat: dataplane.UserspaceHeartbeatPinPath(),
-		XSK:       dataplane.UserspaceXSKMapPinPath(),
-		LocalV4:   dataplane.UserspaceLocalV4PinPath(),
-		LocalV6:   dataplane.UserspaceLocalV6PinPath(),
+		Ctrl:        dataplane.UserspaceCtrlPinPath(),
+		Bindings:    dataplane.UserspaceBindingsPinPath(),
+		Heartbeat:   dataplane.UserspaceHeartbeatPinPath(),
+		XSK:         dataplane.UserspaceXSKMapPinPath(),
+		LocalV4:     dataplane.UserspaceLocalV4PinPath(),
+		LocalV6:     dataplane.UserspaceLocalV6PinPath(),
 		Sessions:    dataplane.UserspaceSessionsPinPath(),
 		DnatTable:   dataplane.UserspaceDnatTablePinPath(),
 		DnatTableV6: dataplane.UserspaceDnatTableV6PinPath(),
@@ -2107,7 +2165,7 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 		if m.proc == nil {
 			return
 		}
-		m.bootstrapNAPIQueuesLocked()
+		m.bootstrapNAPIQueuesAsyncLocked("startup")
 	}()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -2212,14 +2270,55 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 	return resp, nil
 }
 
+func (m *Manager) syncSnapshotLocked() error {
+	if m.proc == nil || m.proc.Process == nil || m.lastSnapshot == nil {
+		return nil
+	}
+	planKey := snapshotBindingPlanKey(m.lastSnapshot)
+	if m.publishedSnapshot >= m.lastSnapshot.Generation {
+		return nil
+	}
+	if m.lastStatus.LastSnapshotGeneration >= m.lastSnapshot.Generation {
+		m.publishedSnapshot = m.lastStatus.LastSnapshotGeneration
+		return nil
+	}
+	// Publish the initial snapshot immediately so the helper can plan its
+	// bindings. After that, defer newer snapshots until the first XSK
+	// liveness outcome is known. HA startup can emit several snapshots in
+	// quick succession as VIPs and routes converge; pushing every one of
+	// them forces back-to-back full AF_XDP reconciles and self-collides.
+	if m.publishedSnapshot != 0 && !m.xskLivenessProven && !m.xskLivenessFailed {
+		return nil
+	}
+	if m.publishedSnapshot != 0 && m.publishedPlanKey != "" && m.publishedPlanKey != planKey {
+		slog.Info(
+			"userspace: restarting helper for binding plan change",
+			"generation", m.lastSnapshot.Generation,
+			"fib_generation", m.lastSnapshot.FIBGeneration,
+		)
+		cfg := m.cfg
+		m.stopLocked()
+		if err := m.ensureProcessLocked(cfg); err != nil {
+			return fmt.Errorf("restart userspace helper for binding plan change: %w", err)
+		}
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: m.lastSnapshot}, &status); err != nil {
+		return fmt.Errorf("publish userspace snapshot: %w", err)
+	}
+	m.publishedSnapshot = m.lastSnapshot.Generation
+	m.publishedPlanKey = planKey
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return fmt.Errorf("sync helper status: %w", err)
+	}
+	return nil
+}
 func (m *Manager) syncHAStateLocked() error {
 	if m.proc == nil || m.proc.Process == nil {
 		return nil
 	}
-	if len(m.haGroups) == 0 {
-		if err := m.refreshHAStateFromMapsLocked(); err != nil {
-			return err
-		}
+	if err := m.refreshHAStateFromMapsLocked(); err != nil {
+		return err
 	}
 	if len(m.haGroups) == 0 {
 		return nil
@@ -2352,13 +2451,11 @@ func (m *Manager) desiredForwardingArmedLocked() bool {
 	if !m.lastStatus.Capabilities.ForwardingSupported {
 		return false
 	}
-	// Don't arm during the settle window: xsk_socket__create_shared calls
-	// __xsk_setup_xdp_prog which segfaults if a link cycle is in progress.
-	// 45s covers MAC programming + VRRP elections + networkd. The probe
-	// starts at 60s, so bindings are armed 15s before the probe fires.
-	if !m.ctrlEnableAt.IsZero() && time.Now().Before(m.ctrlEnableAt.Add(45*time.Second)) {
-		return false
-	}
+	// Keep bindings armed as soon as the helper is allowed to forward.
+	// Startup settle and XSK bring-up are now controlled by userspace_ctrl
+	// and the liveness probe in applyHelperStatusLocked(). Disarming the
+	// helper here races against the initial armed=true request and tears
+	// down AF_XDP before the probe can ever observe RX progress.
 	if !m.clusterHA {
 		return true
 	}
@@ -2375,6 +2472,25 @@ func (m *Manager) desiredForwardingArmedLocked() bool {
 		}
 	}
 	return false
+}
+
+func (m *Manager) hasActiveDataRGLocked() bool {
+	for _, group := range m.haGroups {
+		if group.RGID > 0 && group.Active {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) shouldExtendXSKLivenessIdleLocked(currentRX uint64, allBindingsBound bool) bool {
+	if currentRX != 0 {
+		return false
+	}
+	if allBindingsBound {
+		return true
+	}
+	return !m.hasActiveDataRGLocked()
 }
 
 func (m *Manager) configHasDataRGLocked() bool {
@@ -2429,6 +2545,10 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	group.RGID = rgID
 	group.Active = active
 	m.haGroups[rgID] = group
+	if active {
+		m.bootstrapNAPIQueuesAsyncLocked("ha-update-active")
+		m.proactiveNeighborResolveAsyncLocked()
+	}
 	return m.syncHAStateLocked()
 }
 
@@ -2649,29 +2769,37 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 				slog.Info("userspace: delaying ctrl enable for readiness",
 					"hard_timeout", delay, "cluster_ha", m.clusterHA)
 			}
-			go m.bootstrapNAPIQueuesLocked()
+			m.bootstrapNAPIQueuesAsyncLocked("startup-prewarm")
 			m.proactiveNeighborResolveLocked()
 		}
 		// Check readiness gates BEFORE refreshing neighbors (which
 		// bumps the generation). The status reports the generation
 		// from the previous refresh cycle.
-		allBindingsReady := true
+		//
+		// The helper can only prove RX liveness after ctrl enables the
+		// shim and the userspace_bindings map exposes the binding slots.
+		// Requiring Bound here deadlocks startup: ctrl stays off, the shim
+		// keeps passing packets away from XSK, and Bound never flips true.
+		probeBindingsReady := len(status.Bindings) > 0
+		allBindingsBound := len(status.Bindings) > 0
 		for _, b := range status.Bindings {
-			if b.Ifindex > 0 && b.Registered && !b.Bound {
-				allBindingsReady = false
-				break
+			if b.Ifindex <= 0 {
+				continue
+			}
+			if !b.Registered || !b.Armed {
+				probeBindingsReady = false
+			}
+			if b.Registered && !b.Bound {
+				allBindingsBound = false
 			}
 		}
-		neighborGenOK := m.neighborGeneration == 0 ||
-			status.NeighborGeneration >= m.neighborGeneration
+		neighborSyncReady := status.NeighborGeneration > 0
 
-		// Now refresh neighbors for the next cycle.
-		m.refreshNeighborSnapshotLocked()
-
-		// XSK receive liveness: enable ctrl optimistically once bindings
-		// are ready. If XSK is truly broken (xdpilone on mlx5), the
-		// liveness probe will detect zero rx delta and swap to eBPF.
-		// With libxdp, XSK should work and ctrl stays enabled.
+		// XSK receive liveness: once bindings and neighbor state are ready,
+		// arm ctrl and explicitly probe the userspace shim. A working XSK
+		// path must show RX progress while ctrl=1 and the shim is active.
+		// Otherwise swap back to the eBPF pipeline instead of assuming
+		// the userspace AF_XDP path is healthy.
 		var currentRX uint64
 		for _, b := range status.Bindings {
 			currentRX += b.RXPackets
@@ -2679,8 +2807,9 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		xskReceiveLive := currentRX > m.lastXSKRX
 		m.lastXSKRX = currentRX
 		slog.Warn("userspace: ctrl gate check",
-			"allBindingsReady", allBindingsReady,
-			"neighborGenOK", neighborGenOK,
+			"probeBindingsReady", probeBindingsReady,
+			"allBindingsBound", allBindingsBound,
+			"neighborSyncReady", neighborSyncReady,
 			"xskReceiveLive", xskReceiveLive,
 			"currentRX", currentRX,
 			"lastXSKRX", m.lastXSKRX,
@@ -2690,20 +2819,57 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		if m.xskLivenessFailed {
 			// XSK proven broken — stay on eBPF pipeline, ctrl disabled.
 			ctrl.Enabled = 0
-		} else if m.xskLivenessProven {
-			// XSK proven working — keep ctrl enabled.
+		} else if probeBindingsReady && neighborSyncReady {
 			ctrl.Enabled = 1
+			if m.xskLivenessProven {
+				if m.inner.XDPEntryProg != "xdp_userspace_prog" {
+					if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+						slog.Warn("userspace: failed to restore XDP shim after liveness success", "err", err)
+					}
+				}
+			} else if xskReceiveLive {
+				m.xskLivenessProven = true
+				m.xskProbeStart = time.Time{}
+				if m.inner.XDPEntryProg != "xdp_userspace_prog" {
+					if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+						slog.Warn("userspace: failed to swap XDP shim after XSK RX became live", "err", err)
+					}
+				}
+				slog.Info("userspace: XSK liveness proven")
+			} else {
+				if m.inner.XDPEntryProg != "xdp_userspace_prog" {
+					if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+						slog.Warn("userspace: failed to activate XDP shim for XSK liveness probe", "err", err)
+					}
+				}
+				if m.xskProbeStart.IsZero() {
+					m.xskProbeStart = time.Now()
+					slog.Info("userspace: starting XSK liveness probe")
+				} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
+					if m.shouldExtendXSKLivenessIdleLocked(currentRX, allBindingsBound) {
+						m.xskProbeStart = time.Now()
+						slog.Info("userspace: extending XSK liveness probe while idle")
+						goto ctrlReady
+					}
+					m.xskLivenessFailed = true
+					m.xskProbeStart = time.Time{}
+					ctrl.Enabled = 0
+					slog.Warn("userspace: XSK liveness probe failed, falling back to eBPF pipeline")
+					if err := m.inner.SwapXDPEntryProg("xdp_main_prog"); err != nil {
+						slog.Warn("userspace: failed to swap to eBPF pipeline after XSK liveness failure", "err", err)
+					}
+				}
+			}
 		} else if !m.ctrlEnableAt.IsZero() && time.Now().After(m.ctrlEnableAt.Add(60*time.Second)) {
-			// Enable ctrl after 60s settle. The shim is already attached
-			// (from Compile). If XSK works, traffic goes through the
-			// Rust helper. If XSK rx=0, the shim falls through to
-			// XDP_PASS → kernel → TC egress at the same throughput.
-			// No probe needed — both paths work.
+			// Hard timeout fallback: allow ctrl even if readiness has not been
+			// fully proven yet. The XSK liveness probe still decides whether
+			// the userspace shim stays active or we fall back to xdp_main.
 			ctrl.Enabled = 1
 		} else {
 			ctrl.Enabled = 0
 		}
 	}
+ctrlReady:
 	// Flush stale BPF session entries when ctrl transitions from
 	// disabled to enabled. During ctrl-disabled, the eBPF pipeline
 	// creates PASS_TO_KERNEL entries in the userspace session map.
@@ -3433,6 +3599,93 @@ func macString(raw []byte) string {
 	return net.HardwareAddr(raw[:6]).String()
 }
 
+func activeHAGroupSignature(groups map[int]HAGroupStatus) string {
+	if len(groups) == 0 {
+		return ""
+	}
+	active := make([]int, 0, len(groups))
+	for rgID, group := range groups {
+		if group.Active {
+			active = append(active, rgID)
+		}
+	}
+	if len(active) == 0 {
+		return ""
+	}
+	sort.Ints(active)
+	parts := make([]string, 0, len(active))
+	for _, rgID := range active {
+		parts = append(parts, strconv.Itoa(rgID))
+	}
+	return strings.Join(parts, ",")
+}
+
+func activeHAGroupSignatureSlice(groups []HAGroupStatus) string {
+	if len(groups) == 0 {
+		return ""
+	}
+	active := make([]int, 0, len(groups))
+	for _, group := range groups {
+		if group.Active {
+			active = append(active, group.RGID)
+		}
+	}
+	if len(active) == 0 {
+		return ""
+	}
+	sort.Ints(active)
+	parts := make([]string, 0, len(active))
+	for _, rgID := range active {
+		parts = append(parts, strconv.Itoa(rgID))
+	}
+	return strings.Join(parts, ",")
+}
+
+func userspaceBootstrapProbeInterfaces(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	out := make([]string, 0, len(cfg.Interfaces.Interfaces)*2)
+	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for ifName := range cfg.Interfaces.Interfaces {
+		names = append(names, ifName)
+	}
+	sort.Strings(names)
+	for _, ifName := range names {
+		ifc := cfg.Interfaces.Interfaces[ifName]
+		if ifc == nil {
+			continue
+		}
+		base := config.LinuxIfName(ifName)
+		if !seen[base] {
+			seen[base] = true
+			out = append(out, base)
+		}
+		if len(ifc.Units) == 0 {
+			continue
+		}
+		unitNums := make([]int, 0, len(ifc.Units))
+		for unitNum := range ifc.Units {
+			unitNums = append(unitNums, unitNum)
+		}
+		sort.Ints(unitNums)
+		for _, unitNum := range unitNums {
+			unit := ifc.Units[unitNum]
+			if unit == nil || unit.VlanID <= 0 {
+				continue
+			}
+			linuxName := fmt.Sprintf("%s.%d", base, unit.VlanID)
+			if seen[linuxName] {
+				continue
+			}
+			seen[linuxName] = true
+			out = append(out, linuxName)
+		}
+	}
+	return out
+}
+
 func (m *Manager) sessionSyncEgressLocked(fibIfindex int, fibVlanID uint16) (egressIfindex, txIfindex, ownerRGID int) {
 	snapshot := m.lastSnapshot
 	if snapshot == nil || fibIfindex <= 0 {
@@ -3618,6 +3871,40 @@ func buildUserspaceIngressIfindexes(snapshot *ConfigSnapshot) []uint32 {
 	return out
 }
 
+func snapshotBindingPlanKey(snapshot *ConfigSnapshot) string {
+	if snapshot == nil {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "workers=%d;ring=%d;", snapshot.Userspace.Workers, snapshot.Userspace.RingEntries)
+	for _, iface := range snapshot.Interfaces {
+		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
+			continue
+		}
+		fmt.Fprintf(
+			&b,
+			"iface=%s/%s/%d/%d/%d/%t;",
+			iface.Name,
+			iface.LinuxName,
+			iface.Ifindex,
+			iface.ParentIfindex,
+			iface.RXQueues,
+			iface.Tunnel,
+		)
+	}
+	for _, fab := range snapshot.Fabrics {
+		fmt.Fprintf(
+			&b,
+			"fabric=%s/%s/%d/%d;",
+			fab.Name,
+			fab.ParentLinuxName,
+			fab.ParentIfindex,
+			fab.RXQueues,
+		)
+	}
+	return b.String()
+}
+
 func buildUserspaceIngressBindingAliases(snapshot *ConfigSnapshot) map[uint32]uint32 {
 	if snapshot == nil {
 		return nil
@@ -3772,7 +4059,6 @@ func (m *Manager) ensureStatusLoopLocked() {
 func (m *Manager) statusLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	var neighborTick int
 	startTime := time.Now()
 
 	for {
@@ -3785,13 +4071,30 @@ func (m *Manager) statusLoop(ctx context.Context) {
 				m.mu.Unlock()
 				return
 			}
+			prevActiveSig := activeHAGroupSignature(m.haGroups)
 			var status ProcessStatus
 			if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
 				if err := m.applyHelperStatusLocked(&status); err != nil {
 					slog.Warn("userspace dataplane status sync failed", "err", err)
 				}
-				if m.clusterHA && len(m.haGroups) == 0 {
+				if err := m.syncSnapshotLocked(); err != nil {
+					slog.Warn("userspace dataplane snapshot sync failed", "err", err)
+				}
+				helperActiveSig := activeHAGroupSignatureSlice(status.HAGroups)
+				if m.clusterHA {
 					_ = m.refreshHAStateFromMapsLocked()
+				}
+				newActiveSig := activeHAGroupSignature(m.haGroups)
+				if m.clusterHA && newActiveSig != "" {
+					if helperActiveSig != newActiveSig || newActiveSig != prevActiveSig {
+						if err := m.syncHAStateLocked(); err != nil {
+							slog.Warn("userspace dataplane HA state sync failed", "err", err)
+						}
+					}
+					if newActiveSig != prevActiveSig {
+						m.bootstrapNAPIQueuesAsyncLocked("ha-active-change")
+						m.proactiveNeighborResolveAsyncLocked()
+					}
 				}
 				if err := m.syncDesiredForwardingStateLocked(); err != nil {
 					slog.Warn("userspace dataplane forwarding sync failed", "err", err)
@@ -3799,57 +4102,32 @@ func (m *Manager) statusLoop(ctx context.Context) {
 			} else {
 				slog.Warn("userspace dataplane status poll failed", "err", err)
 			}
-			// Refresh kernel neighbors. During the first 60 seconds
-			// after startup, refresh every tick (1s) and proactively
-			// resolve stale entries. This covers the VRRP election
-			// window (30-40s) plus neighbor resolution time.
-			neighborTick++
-			neighborInterval := 5
-			sinceStart := time.Since(startTime)
-			if sinceStart < 60*time.Second {
-				neighborInterval = 1
-			}
-			if neighborTick >= neighborInterval && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
-				neighborTick = 0
-				// During startup, also proactively resolve stale/failed
-				// neighbors so the helper has fresh entries as soon as
-				// VIPs are assigned.
-				if sinceStart < 60*time.Second {
-					m.proactiveNeighborResolveAsyncLocked()
-				}
-				m.refreshNeighborSnapshotLocked()
+			// Keep the targeted kernel prewarm during initial startup, but
+			// let the helper own neighbor-table sync via its own dump+subscribe
+			// netlink path instead of pushing periodic manager snapshots.
+			if time.Since(startTime) < 60*time.Second && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
+				m.proactiveNeighborResolveAsyncLocked()
 			}
 			m.mu.Unlock()
 		}
 	}
 }
 
-func (m *Manager) refreshNeighborSnapshotLocked() {
-	if m.proc == nil || m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
+func (m *Manager) bootstrapNAPIQueuesAsyncLocked(reason string) {
+	now := time.Now()
+	if !m.lastNAPIBootstrap.IsZero() && now.Sub(m.lastNAPIBootstrap) < 2*time.Second {
 		return
 	}
-	neighbors := buildNeighborSnapshots(m.lastSnapshot.Config)
-	if len(neighbors) == 0 {
-		return
-	}
-	// Bump generation and push neighbor update to the helper.
-	// Use additive mode (replace=false) so learned neighbors from
-	// the netlink monitor and packet path are preserved. The manager's
-	// entries are authoritative and override any learned entry for the
-	// same (ifindex, ip) key, but learned entries for hosts not in the
-	// manager snapshot (e.g. 172.16.80.200) survive.
-	m.neighborGeneration++
-	m.lastSnapshot.Neighbors = neighbors
-	var status ProcessStatus
-	req := ControlRequest{
-		Type:               "update_neighbors",
-		Neighbors:          neighbors,
-		NeighborGeneration: m.neighborGeneration,
-		NeighborReplace:    false,
-	}
-	if err := m.requestLocked(req, &status); err != nil {
-		slog.Warn("userspace neighbor refresh failed", "err", err)
-	}
+	m.lastNAPIBootstrap = now
+	go func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.proc == nil || m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
+			return
+		}
+		slog.Info("userspace: bootstrapping NAPI queues", "reason", reason)
+		m.bootstrapNAPIQueuesLocked()
+	}()
 }
 
 func (m *Manager) stopLocked() {
@@ -3891,6 +4169,13 @@ func (m *Manager) stopLocked() {
 	m.lastStatus = ProcessStatus{}
 	m.neighborsPrewarmed = false
 	m.ctrlEnableAt = time.Time{}
+	m.xskLivenessProven = false
+	m.xskLivenessFailed = false
+	m.xskProbeStart = time.Time{}
+	m.lastXSKRX = 0
+	m.lastNAPIBootstrap = time.Time{}
+	m.publishedSnapshot = 0
+	m.publishedPlanKey = ""
 }
 
 // bootstrapNAPIQueuesLocked sends UDP probe packets to each managed
@@ -3911,71 +4196,59 @@ func (m *Manager) bootstrapNAPIQueuesLocked() {
 	// the XSK fill ring and posts WQEs for zero-copy packet reception.
 	// Without at least one HW RX event per queue, the fill ring entries
 	// added after socket bind are never consumed by the driver's pool.
-	seen := make(map[string]bool)
-	for ifName, ifc := range m.lastSnapshot.Config.Interfaces.Interfaces {
-		for _, unit := range ifc.Units {
-			base := config.LinuxIfName(ifName)
-			linuxName := base
-			if unit.VlanID > 0 {
-				linuxName = fmt.Sprintf("%s.%d", base, unit.VlanID)
+	for _, linuxName := range userspaceBootstrapProbeInterfaces(m.lastSnapshot.Config) {
+		// Send many parallel pings to hit all RSS queues. Each ping
+		// process gets a different ICMP echo ID from the kernel, causing
+		// RSS to distribute replies across different NIC queues. This
+		// triggers NAPI on each queue, which posts fill ring WQEs for
+		// zero-copy XSK packet reception.
+		link, err := netlink.LinkByName(linuxName)
+		if err != nil || link == nil {
+			continue
+		}
+		// Find a target: gateway or any neighbor
+		var target string
+		routes, _ := netlink.RouteList(link, netlink.FAMILY_V4)
+		for _, r := range routes {
+			if r.Gw != nil && r.Gw.To4() != nil {
+				target = r.Gw.String()
+				break
 			}
-			if seen[linuxName] {
-				continue
-			}
-			seen[linuxName] = true
-			// Send many parallel pings to hit all RSS queues. Each ping
-			// process gets a different ICMP echo ID from the kernel, causing
-			// RSS to distribute replies across different NIC queues. This
-			// triggers NAPI on each queue, which posts fill ring WQEs for
-			// zero-copy XSK packet reception.
-			link, err := netlink.LinkByName(linuxName)
-			if err != nil || link == nil {
-				continue
-			}
-			// Find a target: gateway or any neighbor
-			var target string
-			routes, _ := netlink.RouteList(link, netlink.FAMILY_V4)
-			for _, r := range routes {
-				if r.Gw != nil && r.Gw.To4() != nil {
-					target = r.Gw.String()
+		}
+		if target == "" {
+			neighs, _ := netlink.NeighList(link.Attrs().Index, netlink.FAMILY_V4)
+			for _, n := range neighs {
+				if n.IP != nil && n.IP.To4() != nil && n.HardwareAddr != nil &&
+					n.State != netlink.NUD_FAILED {
+					target = n.IP.String()
 					break
 				}
 			}
-			if target == "" {
-				neighs, _ := netlink.NeighList(link.Attrs().Index, netlink.FAMILY_V4)
-				for _, n := range neighs {
-					if n.IP != nil && n.IP.To4() != nil && n.HardwareAddr != nil &&
-						n.State != netlink.NUD_FAILED {
-						target = n.IP.String()
-						break
-					}
+		}
+		if target == "" {
+			continue
+		}
+		// Send multiple ICMP probes with different ICMP echo IDs to
+		// trigger NAPI on ALL NIC queues. mlx5 RSS distributes replies
+		// across queues based on hash(src, dst, proto, id). Sending
+		// ~2× the queue count with varying IDs makes it very likely
+		// that every queue sees at least one hardware RX event, which
+		// posts XSK fill ring WQEs for zero-copy packet reception.
+		targetIP := net.ParseIP(target)
+		if targetIP != nil {
+			// ICMP RSS hashes on (src, dst, proto) only — varying
+			// ICMP ID doesn't change the target queue. Use UDP probes
+			// with varying ports: mlx5 RSS hashes (src, dst, sport,
+			// dport) for UDP, distributing across all queues.
+			// Send 30 probes across port range 40000-40029.
+			for i := 0; i < 30; i++ {
+				sendUDPProbeForNAPI(linuxName, targetIP, uint16(40000+i))
+				if i%6 == 5 {
+					time.Sleep(time.Millisecond)
 				}
 			}
-			if target == "" {
-				continue
-			}
-			// Send multiple ICMP probes with different ICMP echo IDs to
-			// trigger NAPI on ALL NIC queues. mlx5 RSS distributes replies
-			// across queues based on hash(src, dst, proto, id). Sending
-			// ~2× the queue count with varying IDs makes it very likely
-			// that every queue sees at least one hardware RX event, which
-			// posts XSK fill ring WQEs for zero-copy packet reception.
-			targetIP := net.ParseIP(target)
-			if targetIP != nil {
-				// ICMP RSS hashes on (src, dst, proto) only — varying
-				// ICMP ID doesn't change the target queue. Use UDP probes
-				// with varying ports: mlx5 RSS hashes (src, dst, sport,
-				// dport) for UDP, distributing across all queues.
-				// Send 30 probes across port range 40000-40029.
-				for i := 0; i < 30; i++ {
-					sendUDPProbeForNAPI(linuxName, targetIP, uint16(40000+i))
-					if i%6 == 5 {
-						time.Sleep(time.Millisecond)
-					}
-				}
-				// Also send one ICMP probe for neighbor resolution.
-				sendICMPProbeFromManager(linuxName, targetIP)
-			}
+			// Also send one ICMP probe for neighbor resolution.
+			sendICMPProbeFromManager(linuxName, targetIP)
 		}
 	}
 }
@@ -4155,6 +4428,8 @@ func (m *Manager) proactiveNeighborResolveAsyncLocked() {
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
 		return
 	}
+	seen := make(map[string]bool)
+	targetSet := make(map[string]struct{})
 	var targets []struct{ iface, ip string }
 	for ifName, ifc := range m.lastSnapshot.Config.Interfaces.Interfaces {
 		for _, unit := range ifc.Units {
@@ -4163,6 +4438,7 @@ func (m *Manager) proactiveNeighborResolveAsyncLocked() {
 			if unit.VlanID > 0 {
 				linuxName = fmt.Sprintf("%s.%d", base, unit.VlanID)
 			}
+			seen[linuxName] = true
 			link, err := netlink.LinkByName(linuxName)
 			if err != nil || link == nil {
 				continue
@@ -4178,11 +4454,48 @@ func (m *Manager) proactiveNeighborResolveAsyncLocked() {
 					}
 					if n.HardwareAddr == nil || len(n.HardwareAddr) == 0 ||
 						n.State == netlink.NUD_STALE || n.State == netlink.NUD_FAILED {
+						key := linuxName + "|" + n.IP.String()
+						if _, ok := targetSet[key]; ok {
+							continue
+						}
+						targetSet[key] = struct{}{}
 						targets = append(targets, struct{ iface, ip string }{linuxName, n.IP.String()})
 					}
 				}
 			}
 		}
+	}
+	routes, _ := netlink.RouteList(nil, netlink.FAMILY_ALL)
+	for _, r := range routes {
+		if r.Gw == nil || r.Gw.IsLinkLocalUnicast() {
+			continue
+		}
+		link, err := netlink.LinkByIndex(r.LinkIndex)
+		if err != nil || link == nil {
+			continue
+		}
+		ifName := link.Attrs().Name
+		if !seen[ifName] {
+			continue
+		}
+		existing, _ := netlink.NeighList(r.LinkIndex, netlink.FAMILY_ALL)
+		found := false
+		for _, n := range existing {
+			if n.IP.Equal(r.Gw) && n.HardwareAddr != nil && len(n.HardwareAddr) > 0 &&
+				n.State != netlink.NUD_FAILED {
+				found = true
+				break
+			}
+		}
+		if found {
+			continue
+		}
+		key := ifName + "|" + r.Gw.String()
+		if _, ok := targetSet[key]; ok {
+			continue
+		}
+		targetSet[key] = struct{}{}
+		targets = append(targets, struct{ iface, ip string }{ifName, r.Gw.String()})
 	}
 	for _, t := range targets {
 		go func(iface, ip string) {
@@ -4346,7 +4659,7 @@ func (m *Manager) NotifyLinkCycle() {
 	// the fill ring WQEs haven't been posted to the NIC yet. Broadcast
 	// pings generate hardware RX events that trigger NAPI, which posts
 	// fill ring WQEs so zero-copy XSK can receive packets.
-	go m.bootstrapNAPIQueuesLocked()
+	m.bootstrapNAPIQueuesAsyncLocked("link-cycle")
 }
 
 func maxInt(a, b int) int {

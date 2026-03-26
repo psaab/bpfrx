@@ -1343,17 +1343,36 @@ fn handle_stream(
                     guard.status.last_fib_generation = snapshot.fib_generation;
                     guard.status.last_snapshot_at = Some(snapshot.generated_at);
                     guard.status.capabilities = snapshot.capabilities.clone();
-                    guard.snapshot = Some(snapshot);
                     let existing_bindings = guard.status.bindings.clone();
-                    let replanned = replan_queues(
-                        guard.snapshot.as_ref(),
-                        guard.status.workers,
-                        &existing_bindings,
-                    );
-                    guard.status.bindings = replanned;
-                    reconcile_status_bindings(&mut guard);
-                    refresh_status(&mut guard);
-                    persist_state = true;
+                    let previous_snapshot = guard.snapshot.as_ref();
+                    let same_plan = previous_snapshot.is_some_and(|prev| {
+                        let prev_key = snapshot_binding_plan_key(prev);
+                        let next_key = snapshot_binding_plan_key(&snapshot);
+                        let same = prev_key == next_key;
+                        if !same {
+                            eprintln!(
+                                "CTRL_REQ: binding plan changed prev_key={} next_key={}",
+                                prev_key, next_key
+                            );
+                        }
+                        same
+                    });
+                    guard.snapshot = Some(snapshot.clone());
+                    if same_plan {
+                        guard.afxdp.refresh_runtime_snapshot(&snapshot);
+                        refresh_status(&mut guard);
+                        persist_state = true;
+                    } else {
+                        let replanned = replan_queues(
+                            guard.snapshot.as_ref(),
+                            guard.status.workers,
+                            &existing_bindings,
+                        );
+                        guard.status.bindings = replanned;
+                        reconcile_status_bindings(&mut guard);
+                        refresh_status(&mut guard);
+                        persist_state = true;
+                    }
                 } else {
                     response.ok = false;
                     response.error = "missing snapshot".to_string();
@@ -1408,36 +1427,25 @@ fn handle_stream(
             }
             "update_neighbors" => {
                 if let Some(neighbors) = request.neighbors.as_ref() {
-                    let neigh_gen = request.neighbor_generation;
                     let replace = request.neighbor_replace;
-                    if let Ok(mut cache) = guard.afxdp.dynamic_neighbors_ref().lock() {
-                        if replace {
-                            // Authoritative full replacement: clear existing
-                            // entries and rebuild from the manager's view.
-                            cache.clear();
+                    let mut resolved = Vec::with_capacity(neighbors.len());
+                    for neigh in neighbors {
+                        if neigh.ifindex <= 0 || neigh.mac.is_empty() {
+                            continue;
                         }
-                        for neigh in neighbors {
-                            if neigh.ifindex <= 0 || neigh.mac.is_empty() {
-                                continue;
-                            }
-                            let Ok(ip) = neigh.ip.parse::<std::net::IpAddr>() else {
-                                continue;
-                            };
-                            let Some(mac) = afxdp::parse_mac_str(&neigh.mac) else {
-                                continue;
-                            };
-                            if !afxdp::neighbor_state_usable_str(&neigh.state) {
-                                continue;
-                            }
-                            cache.insert(
-                                (neigh.ifindex, ip),
-                                afxdp::NeighborEntry { mac },
-                            );
+                        let Ok(ip) = neigh.ip.parse::<std::net::IpAddr>() else {
+                            continue;
+                        };
+                        let Some(mac) = afxdp::parse_mac_str(&neigh.mac) else {
+                            continue;
+                        };
+                        if !afxdp::neighbor_state_usable_str(&neigh.state) {
+                            continue;
                         }
+                        resolved.push((neigh.ifindex, ip, afxdp::NeighborEntry { mac }));
                     }
-                    if neigh_gen > 0 {
-                        guard.status.neighbor_generation = neigh_gen;
-                    }
+                    guard.afxdp.apply_manager_neighbors(replace, &resolved);
+                    refresh_status(&mut guard);
                 }
             }
             "set_queue_state" => {
@@ -1656,11 +1664,9 @@ fn refresh_status(state: &mut ServerState) {
         .as_ref()
         .map(|s| s.interfaces.iter().map(|iface| iface.addresses.len()).sum())
         .unwrap_or(0);
-    state.status.neighbor_entries = state
-        .snapshot
-        .as_ref()
-        .map(|s| s.neighbors.len())
-        .unwrap_or(0);
+    let (neighbor_entries, neighbor_generation) = state.afxdp.dynamic_neighbor_status();
+    state.status.neighbor_entries = neighbor_entries;
+    state.status.neighbor_generation = neighbor_generation;
     state.status.route_entries = state.snapshot.as_ref().map(|s| s.routes.len()).unwrap_or(0);
     state.status.fabrics = state
         .snapshot
@@ -1896,6 +1902,65 @@ fn bindings_settled(bindings: &[BindingStatus]) -> bool {
     })
 }
 
+fn same_binding_plan(current: &ConfigSnapshot, next: &ConfigSnapshot) -> bool {
+    snapshot_binding_plan_key(current) == snapshot_binding_plan_key(next)
+}
+
+fn snapshot_binding_plan_key(snapshot: &ConfigSnapshot) -> String {
+    let mut out = String::new();
+    let workers = snapshot
+        .userspace
+        .get("workers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_default();
+    let ring_entries = snapshot
+        .userspace
+        .get("ring_entries")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_default();
+    out.push_str(&format!("workers={workers};ring={ring_entries};"));
+    for iface in snapshot
+        .interfaces
+        .iter()
+        .filter(|iface| include_userspace_binding_interface(iface))
+    {
+        out.push_str(&format!(
+            "iface={}/{}/{}/{}/{}/{};",
+            iface.name,
+            iface.linux_name,
+            iface.ifindex,
+            iface.parent_ifindex,
+            iface.rx_queues,
+            iface.tunnel
+        ));
+    }
+    for fab in &snapshot.fabrics {
+        out.push_str(&format!(
+            "fabric={}/{}/{}/{};",
+            fab.name, fab.parent_linux_name, fab.parent_ifindex, fab.rx_queues
+        ));
+    }
+    out
+}
+
+fn include_userspace_binding_interface(iface: &InterfaceSnapshot) -> bool {
+    if iface.zone.is_empty() {
+        return false;
+    }
+    if iface.tunnel {
+        return false;
+    }
+    if !iface.local_fabric_member.is_empty() {
+        return false;
+    }
+    let base = iface.name.split('.').next().unwrap_or(iface.name.as_str());
+    if base.starts_with("fxp") || base.starts_with("em") || base.starts_with("fab") || base == "lo0"
+    {
+        return false;
+    }
+    !matches!(iface.zone.as_str(), "mgmt" | "control")
+}
+
 fn replan_queues(
     snapshot: Option<&ConfigSnapshot>,
     workers: usize,
@@ -2075,6 +2140,106 @@ fn write_state(state_file: &str, state: &Arc<Mutex<ServerState>>) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_binding_plan_ignores_runtime_only_snapshot_changes() {
+        let current = ConfigSnapshot {
+            userspace: serde_json::json!({
+                "binary": "/usr/libexec/bpfrx-userspace-dp",
+                "control_socket": "/run/bpfrx/control.sock",
+                "state_file": "/run/bpfrx/state.json",
+                "workers": 2,
+                "ring_entries": 2048,
+                "poll_mode": "interrupt",
+            }),
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "ge-0/0/1.0".to_string(),
+                    zone: "lan".to_string(),
+                    linux_name: "ge-0-0-1".to_string(),
+                    ifindex: 11,
+                    rx_queues: 4,
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "fab0".to_string(),
+                    zone: "control".to_string(),
+                    linux_name: "fab0".to_string(),
+                    ifindex: 149,
+                    rx_queues: 16,
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "gr-0/0/0.0".to_string(),
+                    zone: "sfmix".to_string(),
+                    linux_name: "gr-0-0-0".to_string(),
+                    ifindex: 586,
+                    rx_queues: 1,
+                    tunnel: true,
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "fxp0.0".to_string(),
+                    zone: "mgmt".to_string(),
+                    linux_name: "fxp0".to_string(),
+                    ifindex: 42,
+                    rx_queues: 1,
+                    ..Default::default()
+                },
+            ],
+            fabrics: vec![FabricSnapshot {
+                name: "fab0".to_string(),
+                parent_linux_name: "ge-0-0-0".to_string(),
+                parent_ifindex: 21,
+                rx_queues: 1,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut next = current.clone();
+        next.userspace = serde_json::json!({
+            "binary": "/tmp/other-helper",
+            "control_socket": "/tmp/control.sock",
+            "state_file": "/tmp/state.json",
+            "workers": 2,
+            "ring_entries": 2048,
+            "poll_mode": "busy-poll",
+        });
+        next.interfaces.push(InterfaceSnapshot {
+            name: "em0.0".to_string(),
+            zone: "mgmt".to_string(),
+            linux_name: "em0".to_string(),
+            ifindex: 99,
+            rx_queues: 1,
+            ..Default::default()
+        });
+        next.interfaces[1].ifindex = 154;
+
+        assert!(same_binding_plan(&current, &next));
+    }
+
+    #[test]
+    fn same_binding_plan_detects_binding_topology_change() {
+        let current = ConfigSnapshot {
+            userspace: serde_json::json!({
+                "workers": 2,
+                "ring_entries": 2048,
+            }),
+            interfaces: vec![InterfaceSnapshot {
+                name: "ge-0/0/1.0".to_string(),
+                zone: "lan".to_string(),
+                linux_name: "ge-0-0-1".to_string(),
+                ifindex: 11,
+                rx_queues: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut next = current.clone();
+        next.interfaces[0].rx_queues = 8;
+
+        assert!(!same_binding_plan(&current, &next));
+    }
 
     #[test]
     fn queue_planner_filters_non_data_interfaces() {

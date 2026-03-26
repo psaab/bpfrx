@@ -15,6 +15,8 @@ use crate::session::{
     SessionLookup, SessionMetadata, SessionTable, forward_wire_key, reverse_canonical_key,
 };
 use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus, open_tun};
+use crate::xsk_ffi::xdp::XdpDesc;
+use crate::xsk_ffi::{BufIdx, SocketConfig, Umem, UmemConfig, User};
 use arc_swap::ArcSwap;
 use chrono::Utc;
 use core::ffi::{c_int, c_void};
@@ -27,14 +29,12 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use crate::xsk_ffi::xdp::XdpDesc;
-use crate::xsk_ffi::{BufIdx, SocketConfig, Umem, UmemConfig, User};
 
 const USERSPACE_SESSION_ACTION_REDIRECT: u8 = 1;
 const USERSPACE_SESSION_ACTION_PASS_TO_KERNEL: u8 = 2;
@@ -67,8 +67,7 @@ mod tx;
 use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
     AfXdpBindStrategy, binding_frame_count, ifinfo_from_binding, interface_driver_name,
-    open_binding_worker_rings, preferred_bind_strategy,
-    reserved_tx_frames, umem_ring_size,
+    open_binding_worker_rings, preferred_bind_strategy, reserved_tx_frames, umem_ring_size,
 };
 #[cfg(test)]
 use self::bind::{
@@ -196,8 +195,8 @@ struct RewriteDescriptor {
     rewrite_src_port: Option<u16>,
     rewrite_dst_port: Option<u16>,
     // Precomputed incremental checksum deltas
-    ip_csum_delta: u16,   // from SNAT+DNAT IP changes (constant per flow)
-    l4_csum_delta: u16,   // pseudo-header delta from IP+port changes
+    ip_csum_delta: u16, // from SNAT+DNAT IP changes (constant per flow)
+    l4_csum_delta: u16, // pseudo-header delta from IP+port changes
     // Egress
     egress_ifindex: i32,
     tx_ifindex: i32,
@@ -293,11 +292,11 @@ impl FlowCache {
 }
 /// Packet buffered while waiting for ARP/NDP neighbor resolution.
 struct PendingNeighPacket {
-    addr: u64,          // UMEM frame offset (held, not recycled)
+    addr: u64, // UMEM frame offset (held, not recycled)
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     decision: SessionDecision,
-    queued_ns: u64,     // monotonic timestamp
+    queued_ns: u64, // monotonic timestamp
 }
 
 const PENDING_NEIGH_TIMEOUT_NS: u64 = 2_000_000_000; // 2 seconds
@@ -416,7 +415,10 @@ fn compute_l4_csum_delta(flow: &SessionFlow, nat: &NatDecision) -> u16 {
 #[inline]
 fn ipv4_csum_words(ip: Ipv4Addr) -> [u16; 2] {
     let o = ip.octets();
-    [u16::from_be_bytes([o[0], o[1]]), u16::from_be_bytes([o[2], o[3]])]
+    [
+        u16::from_be_bytes([o[0], o[1]]),
+        u16::from_be_bytes([o[2], o[3]]),
+    ]
 }
 // ── End Flow Cache ──────────────────────────────────────────────────────
 
@@ -440,12 +442,16 @@ fn publish_dnat_table_entry(
     nat: NatDecision,
 ) {
     // Only SNAT (rewrite_src) needs a dnat_table entry for embedded ICMP.
-    let Some(snat_ip) = nat.rewrite_src else { return };
+    let Some(snat_ip) = nat.rewrite_src else {
+        return;
+    };
     match (key.addr_family as i32, snat_ip) {
         (libc::AF_INET, IpAddr::V4(snat_v4)) => {
             let Some(fd) = fds.v4 else { return };
             let snat_port = nat.rewrite_src_port.unwrap_or(key.src_port);
-            let IpAddr::V4(orig_v4) = key.src_ip else { return };
+            let IpAddr::V4(orig_v4) = key.src_ip else {
+                return;
+            };
             // struct dnat_key { u8 protocol; u8 pad[3]; __be32 dst_ip; __be16 dst_port; __be16 pad2; }
             let mut map_key = [0u8; 8];
             map_key[0] = key.protocol;
@@ -537,7 +543,11 @@ pub struct Coordinator {
     last_slow_path_status: SlowPathStatus,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
+    shared_forwarding: Arc<ArcSwap<ForwardingState>>,
+    shared_validation: Arc<ArcSwap<ValidationState>>,
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    neighbor_generation: Arc<AtomicU64>,
+    manager_neighbor_keys: Arc<Mutex<FastSet<(i32, IpAddr)>>>,
     neigh_monitor_stop: Option<Arc<AtomicBool>>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -571,7 +581,11 @@ impl Coordinator {
             last_slow_path_status: SlowPathStatus::default(),
             ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_fabrics: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            shared_forwarding: Arc::new(ArcSwap::from_pointee(ForwardingState::default())),
+            shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
+            neighbor_generation: Arc::new(AtomicU64::new(0)),
+            manager_neighbor_keys: Arc::new(Mutex::new(FastSet::default())),
             neigh_monitor_stop: None,
             shared_sessions: Arc::new(Mutex::new(FastMap::default())),
             shared_nat_sessions: Arc::new(Mutex::new(FastMap::default())),
@@ -600,6 +614,36 @@ impl Coordinator {
 
     pub fn dynamic_neighbors_ref(&self) -> &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>> {
         &self.dynamic_neighbors
+    }
+
+    pub fn apply_manager_neighbors(
+        &self,
+        replace: bool,
+        neighbors: &[(i32, IpAddr, NeighborEntry)],
+    ) {
+        let Ok(mut cache) = self.dynamic_neighbors.lock() else {
+            return;
+        };
+        let Ok(mut manager_keys) = self.manager_neighbor_keys.lock() else {
+            return;
+        };
+        if replace {
+            for key in manager_keys.drain() {
+                cache.remove(&key);
+            }
+        }
+        for (ifindex, ip, entry) in neighbors {
+            let key = (*ifindex, *ip);
+            cache.insert(key, *entry);
+            manager_keys.insert(key);
+        }
+        self.neighbor_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dynamic_neighbor_status(&self) -> (usize, u64) {
+        let entries = self.dynamic_neighbors.lock().map(|n| n.len()).unwrap_or(0);
+        let generation = self.neighbor_generation.load(Ordering::Relaxed);
+        (entries, generation)
     }
 
     fn stop_inner(&mut self, clear_synced_state: bool) {
@@ -650,8 +694,17 @@ impl Coordinator {
         self.dnat_table_fd = None;
         self.dnat_table_v6_fd = None;
         self.forwarding = ForwardingState::default();
+        self.shared_forwarding
+            .store(Arc::new(ForwardingState::default()));
+        self.shared_validation
+            .store(Arc::new(ValidationState::default()));
+        self.shared_fabrics.store(Arc::new(Vec::new()));
+        self.neighbor_generation.store(0, Ordering::Relaxed);
         if let Ok(mut neighbors) = self.dynamic_neighbors.lock() {
             neighbors.clear();
+        }
+        if let Ok(mut manager_keys) = self.manager_neighbor_keys.lock() {
+            manager_keys.clear();
         }
         if clear_synced_state {
             if let Ok(mut sessions) = self.shared_sessions.lock() {
@@ -716,6 +769,7 @@ impl Coordinator {
     ) {
         self.reconcile_calls += 1;
         self.last_reconcile_stage = "start".to_string();
+        let had_live_workers = !self.workers.is_empty();
         let preserved_synced_sessions = self.snapshot_shared_session_entries();
         // Keep a healthy slow-path worker across back-to-back reconciles. The
         // userspace helper can receive multiple snapshot refreshes during HA
@@ -729,6 +783,12 @@ impl Coordinator {
             }
         });
         self.stop_inner(false);
+        if had_live_workers {
+            // Zero-copy queue teardown is not synchronously reusable on mlx5.
+            // A short quiesce avoids EBUSY when a later snapshot refresh
+            // rebuilds the same queue set immediately after shutdown.
+            thread::sleep(Duration::from_millis(500));
+        }
         for binding in bindings.iter_mut() {
             binding.bound = false;
             binding.xsk_registered = false;
@@ -784,6 +844,9 @@ impl Coordinator {
             fib_generation: snapshot.fib_generation,
         };
         self.forwarding = build_forwarding_state(snapshot);
+        self.shared_validation.store(Arc::new(self.validation));
+        self.shared_forwarding
+            .store(Arc::new(self.forwarding.clone()));
         self.slow_path = if let Some(slow_path) = preserved_slow_path {
             self.last_slow_path_status = slow_path.status();
             Some(slow_path)
@@ -802,9 +865,10 @@ impl Coordinator {
                 }
             }
         };
-        self.local_tunnel_deliveries.store(Arc::new(BTreeMap::new()));
-        self.shared_fabrics.store(Arc::new(self.forwarding.fabrics.clone()));
-        let forwarding = Arc::new(self.forwarding.clone());
+        self.local_tunnel_deliveries
+            .store(Arc::new(BTreeMap::new()));
+        self.shared_fabrics
+            .store(Arc::new(self.forwarding.fabrics.clone()));
         if snapshot.map_pins.xsk.is_empty() {
             self.last_reconcile_stage = "missing_xsk_pin".to_string();
             for binding in bindings.iter_mut() {
@@ -970,6 +1034,8 @@ impl Coordinator {
             let last_resolution = self.last_resolution.clone();
             let slow_path = self.slow_path.clone();
             let local_tunnel_deliveries = self.local_tunnel_deliveries.clone();
+            let shared_forwarding = self.shared_forwarding.clone();
+            let shared_validation = self.shared_validation.clone();
             let shared_sessions = self.shared_sessions.clone();
             let shared_nat_sessions = self.shared_nat_sessions.clone();
             let shared_forward_wire_sessions = self.shared_forward_wire_sessions.clone();
@@ -981,8 +1047,6 @@ impl Coordinator {
                 .filter(|(id, _)| **id != worker_id)
                 .map(|(_, queue)| queue.clone())
                 .collect::<Vec<_>>();
-            let validation = self.validation;
-            let forwarding = forwarding.clone();
             let ha_state = self.ha_state.clone();
             let dynamic_neighbors = self.dynamic_neighbors.clone();
             let worker_poll_mode = self.poll_mode;
@@ -993,8 +1057,8 @@ impl Coordinator {
                     worker_loop(
                         worker_id,
                         binding_plans,
-                        validation,
-                        forwarding,
+                        shared_validation,
+                        shared_forwarding,
                         ha_state,
                         dynamic_neighbors,
                         shared_sessions,
@@ -1055,16 +1119,19 @@ impl Coordinator {
             self.identities.len(),
             self.live.len()
         );
-        // Start neighbor monitor thread to learn kernel ARP/NDP entries
-        // instantly via netlink RTM_NEWNEIGH events. Without this, the
-        // helper waits 1-5s for the Go-side snapshot refresh.
+        // Start the helper-owned neighbor sync path. It does an initial
+        // RTM_GETNEIGH dump so startup sees the existing kernel table, then
+        // subscribes to RTM_{NEW,DEL}NEIGH for incremental updates.
         if self.neigh_monitor_stop.is_none() {
             let stop = Arc::new(AtomicBool::new(false));
             let stop_clone = stop.clone();
             let dynamic_neighbors = self.dynamic_neighbors.clone();
+            let neighbor_generation = self.neighbor_generation.clone();
             thread::Builder::new()
                 .name("neigh-monitor".to_string())
-                .spawn(move || neigh_monitor_thread(stop_clone, dynamic_neighbors))
+                .spawn(move || {
+                    neigh_monitor_thread(stop_clone, dynamic_neighbors, neighbor_generation)
+                })
                 .ok();
             self.neigh_monitor_stop = Some(stop);
         }
@@ -1220,6 +1287,20 @@ impl Coordinator {
             self.forwarding.fabrics = new_fabrics.clone();
             self.shared_fabrics.store(Arc::new(new_fabrics));
         }
+    }
+
+    pub fn refresh_runtime_snapshot(&mut self, snapshot: &crate::ConfigSnapshot) {
+        self.validation = ValidationState {
+            snapshot_installed: true,
+            config_generation: snapshot.generation,
+            fib_generation: snapshot.fib_generation,
+        };
+        self.forwarding = build_forwarding_state(snapshot);
+        self.shared_validation.store(Arc::new(self.validation));
+        self.shared_forwarding
+            .store(Arc::new(self.forwarding.clone()));
+        self.shared_fabrics
+            .store(Arc::new(self.forwarding.fabrics.clone()));
     }
 
     pub fn update_ha_state(&self, groups: &[HAGroupStatus]) {
@@ -1546,7 +1627,10 @@ impl Coordinator {
             if let Some(live) = self.live.get(&binding.slot) {
                 let snap = live.snapshot();
                 if snap.bound && !binding.bound {
-                    eprintln!("refresh_bindings: slot={} transitioning bound=false->true fd={}", binding.slot, snap.socket_fd);
+                    eprintln!(
+                        "refresh_bindings: slot={} transitioning bound=false->true fd={}",
+                        binding.slot, snap.socket_fd
+                    );
                 }
                 binding.bound = snap.bound;
                 binding.xsk_registered = snap.xsk_registered;
@@ -1707,7 +1791,7 @@ struct BindingPlan {
     poll_mode: crate::PollMode,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ValidationState {
     snapshot_installed: bool,
     config_generation: u64,
@@ -2371,7 +2455,10 @@ impl BindingWorker {
             flow_cache: FlowCache::new(),
             flow_cache_session_touch: 0,
             bind_time_ns: {
-                let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                let mut ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
                 unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
                 ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
             },
@@ -2441,7 +2528,9 @@ impl WorkerUmem {
     }
 
     fn umem_mut(&mut self) -> &mut Umem {
-        Rc::get_mut(&mut self.inner).expect("single-owner umem").umem_mut()
+        Rc::get_mut(&mut self.inner)
+            .expect("single-owner umem")
+            .umem_mut()
     }
 
     fn total_frames(&self) -> u32 {
@@ -2720,8 +2809,14 @@ fn poll_binding(
             // RX packet arrives (TCP retransmit ~1s) instead of being
             // retried as soon as the netlink monitor resolves ARP.
             retry_pending_neigh(
-                binding, left, binding_index, right, binding_lookup,
-                forwarding, dynamic_neighbors, now_ns,
+                binding,
+                left,
+                binding_index,
+                right,
+                binding_lookup,
+                forwarding,
+                dynamic_neighbors,
+                now_ns,
                 unsafe { &*(binding.umem.area() as *const MmapArea) },
             );
             counters.flush(&binding.live);
@@ -2745,7 +2840,8 @@ fn poll_binding(
             // UMEM frames are cold (last touched by NIC DMA); this hides
             // ~100ns DRAM latency before metadata parse.
             #[cfg(target_arch = "x86_64")]
-            if let Some(pf) = unsafe { &*area }.slice(desc.addr as usize, 64.min(desc.len as usize)) {
+            if let Some(pf) = unsafe { &*area }.slice(desc.addr as usize, 64.min(desc.len as usize))
+            {
                 unsafe {
                     core::arch::x86_64::_mm_prefetch(
                         pf.as_ptr() as *const i8,
@@ -2900,9 +2996,7 @@ fn poll_binding(
                         } else {
                             (14, u16::from_be_bytes([raw_frame[12], raw_frame[13]]))
                         };
-                        if ethertype == 0x0806
-                            && raw_frame.len() >= arp_start + 28
-                        {
+                        if ethertype == 0x0806 && raw_frame.len() >= arp_start + 28 {
                             let opcode = u16::from_be_bytes([
                                 raw_frame[arp_start + 6],
                                 raw_frame[arp_start + 7],
@@ -2938,7 +3032,8 @@ fn poll_binding(
                                     forwarding,
                                     meta.ingress_ifindex as i32,
                                     meta.ingress_vlan_id,
-                                ).unwrap_or(meta.ingress_ifindex as i32);
+                                )
+                                .unwrap_or(meta.ingress_ifindex as i32);
                                 add_kernel_neighbor(neigh_ifindex, sender_ip, sender_mac);
                             }
                             // Recycle frame — ARP is not a transit packet
@@ -2970,8 +3065,7 @@ fn poll_binding(
                                 if let Ok(target_bytes) =
                                     <[u8; 16]>::try_from(&raw_frame[l4_start + 8..l4_start + 24])
                                 {
-                                    let target_ip =
-                                        IpAddr::V6(Ipv6Addr::from(target_bytes));
+                                    let target_ip = IpAddr::V6(Ipv6Addr::from(target_bytes));
                                     // Look for target link-layer address option (type 2)
                                     let mut opt_off = l4_start + 24;
                                     while opt_off + 2 <= raw_frame.len() {
@@ -2992,9 +3086,7 @@ fn poll_binding(
                                                 raw_frame[opt_off + 6],
                                                 raw_frame[opt_off + 7],
                                             ];
-                                            if let Ok(mut neighbors) =
-                                                dynamic_neighbors.lock()
-                                            {
+                                            if let Ok(mut neighbors) = dynamic_neighbors.lock() {
                                                 neighbors.insert(
                                                     (meta.ingress_ifindex as i32, target_ip),
                                                     NeighborEntry { mac },
@@ -3007,7 +3099,8 @@ fn poll_binding(
                                                 forwarding,
                                                 meta.ingress_ifindex as i32,
                                                 meta.ingress_vlan_id,
-                                            ).unwrap_or(meta.ingress_ifindex as i32);
+                                            )
+                                            .unwrap_or(meta.ingress_ifindex as i32);
                                             add_kernel_neighbor(neigh_ifindex, target_ip, mac);
                                             break;
                                         }
@@ -3167,7 +3260,10 @@ fn poll_binding(
                                 let target_ifindex = if cached_decision.resolution.tx_ifindex > 0 {
                                     cached_decision.resolution.tx_ifindex
                                 } else {
-                                    resolve_tx_binding_ifindex(forwarding, cached_decision.resolution.egress_ifindex)
+                                    resolve_tx_binding_ifindex(
+                                        forwarding,
+                                        cached_decision.resolution.egress_ifindex,
+                                    )
                                 };
                                 let target_bi = binding_lookup.target_index(
                                     binding_index,
@@ -3179,7 +3275,8 @@ fn poll_binding(
                                 // For simplicity, only do in-place fast path when target == self.
                                 let is_self_target = target_bi == Some(binding_index);
                                 if is_self_target && owned_packet_frame.is_none() {
-                                    let expected_ports = authoritative_forward_ports(packet_frame, meta, Some(flow));
+                                    let expected_ports =
+                                        authoritative_forward_ports(packet_frame, meta, Some(flow));
                                     let ingress_slot = binding.slot;
                                     let flow_key = flow.forward_key.clone();
                                     // Try descriptor-based straight-line rewrite first (no branches
@@ -3320,50 +3417,51 @@ fn poll_binding(
                                 cluster_peer_return_fast_path(
                                     forwarding,
                                     dynamic_neighbors,
+                                    packet_frame,
                                     meta,
                                     ingress_zone_override.as_deref(),
                                     resolution_target,
                                 )
                             {
-                                    let ingress_ident = BindingIdentity {
-                                        slot: binding.slot,
-                                        queue_id: binding.queue_id,
-                                        worker_id: binding.worker_id,
-                                        interface: binding.interface.clone(),
-                                        ifindex: binding.ifindex,
-                                    };
-                                    if let Some(mut request) = build_live_forward_request_from_frame(
-                                        binding_lookup,
-                                        binding_index,
-                                        &ingress_ident,
-                                        desc,
-                                        packet_frame,
-                                        meta,
-                                        &fabric_return_decision,
-                                        forwarding,
-                                        Some(flow),
-                                        None,
-                                        false,
+                                let ingress_ident = BindingIdentity {
+                                    slot: binding.slot,
+                                    queue_id: binding.queue_id,
+                                    worker_id: binding.worker_id,
+                                    interface: binding.interface.clone(),
+                                    ifindex: binding.ifindex,
+                                };
+                                if let Some(mut request) = build_live_forward_request_from_frame(
+                                    binding_lookup,
+                                    binding_index,
+                                    &ingress_ident,
+                                    desc,
+                                    packet_frame,
+                                    meta,
+                                    &fabric_return_decision,
+                                    forwarding,
+                                    Some(flow),
+                                    None,
+                                    false,
+                                ) {
+                                    request.source_frame = owned_packet_frame.take();
+                                    if sessions.install_with_protocol(
+                                        flow.forward_key.clone(),
+                                        fabric_return_decision,
+                                        fabric_return_metadata,
+                                        now_ns,
+                                        meta.protocol,
+                                        meta.tcp_flags,
                                     ) {
-                                        request.source_frame = owned_packet_frame.take();
-                                        if sessions.install_with_protocol(
-                                            flow.forward_key.clone(),
-                                            fabric_return_decision,
-                                            fabric_return_metadata,
-                                            now_ns,
-                                            meta.protocol,
-                                            meta.tcp_flags,
-                                        ) {
-                                            let _ = publish_live_session_entry(
-                                                binding.session_map_fd,
-                                                &flow.forward_key,
-                                                NatDecision::default(),
-                                                true,
-                                            );
-                                        }
-                                        binding.scratch_forwards.push(request);
-                                        continue;
+                                        let _ = publish_live_session_entry(
+                                            binding.session_map_fd,
+                                            &flow.forward_key,
+                                            NatDecision::default(),
+                                            true,
+                                        );
                                     }
+                                    binding.scratch_forwards.push(request);
+                                    continue;
+                                }
                             }
 
                             // --- DNAT pre-routing ---
@@ -4436,7 +4534,9 @@ fn poll_binding(
                         if should_teardown_tcp_rst(meta, flow.as_ref())
                             && let Some(flow) = flow.as_ref()
                         {
-                            binding.scratch_rst_teardowns.push((flow.forward_key.clone(), decision.nat));
+                            binding
+                                .scratch_rst_teardowns
+                                .push((flow.forward_key.clone(), decision.nat));
                         }
                         counters.forward_candidate_packets += 1;
                         if decision.nat.rewrite_src.is_some() {
@@ -4516,7 +4616,8 @@ fn poll_binding(
                             if (meta.protocol == PROTO_TCP || meta.protocol == PROTO_UDP)
                                 && !decision.nat.nat64
                                 && !decision.nat.nptv6
-                                && decision.resolution.disposition == ForwardingDisposition::ForwardCandidate
+                                && decision.resolution.disposition
+                                    == ForwardingDisposition::ForwardCandidate
                                 && let Some(flow) = flow.as_ref()
                             {
                                 let ingress_zone = session_ingress_zone
@@ -4530,7 +4631,11 @@ fn poll_binding(
                                         dst_mac: decision.resolution.neighbor_mac.unwrap_or([0; 6]),
                                         src_mac: decision.resolution.src_mac.unwrap_or([0; 6]),
                                         tx_vlan_id: decision.resolution.tx_vlan_id,
-                                        ether_type: if meta.addr_family as i32 == libc::AF_INET { 0x0800 } else { 0x86dd },
+                                        ether_type: if meta.addr_family as i32 == libc::AF_INET {
+                                            0x0800
+                                        } else {
+                                            0x86dd
+                                        },
                                         rewrite_src_ip: decision.nat.rewrite_src,
                                         rewrite_dst_ip: decision.nat.rewrite_dst,
                                         rewrite_src_port: decision.nat.rewrite_src_port,
@@ -4640,11 +4745,13 @@ fn poll_binding(
                                     // Only spawn ping if we don't already have a
                                     // pending probe for this (ifindex, hop).
                                     let already_probing = binding.pending_neigh.iter().any(|p| {
-                                        p.decision.resolution.egress_ifindex == decision.resolution.egress_ifindex
+                                        p.decision.resolution.egress_ifindex
+                                            == decision.resolution.egress_ifindex
                                             && p.decision.resolution.next_hop == Some(next_hop)
                                     });
                                     if !already_probing {
-                                        let iface_name = forwarding.ifindex_to_name
+                                        let iface_name = forwarding
+                                            .ifindex_to_name
                                             .get(&decision.resolution.egress_ifindex)
                                             .cloned();
                                         if let Some(name) = iface_name {
@@ -4659,19 +4766,12 @@ fn poll_binding(
                                 // a reverse session. Without this, the SYN-ACK hits
                                 // session miss → policy deny (no rule for WAN→LAN).
                                 if let Some(flow) = flow.as_ref() {
-                                    let sess_zone = session_ingress_zone
-                                        .as_ref()
-                                        .cloned()
-                                        .unwrap_or_else(|| Arc::from(""));
-                                    let sess_meta = SessionMetadata {
-                                        ingress_zone: sess_zone,
-                                        egress_zone: Arc::from(""),
-                                        owner_rg_id: 0,
-                                        fabric_ingress: false,
-                                        is_reverse: false,
-                                        synced: true,
-                                        nat64_reverse: None,
-                                    };
+                                    let sess_meta = build_missing_neighbor_session_metadata(
+                                        forwarding,
+                                        session_ingress_zone.as_ref(),
+                                        meta.ingress_ifindex as i32,
+                                        decision,
+                                    );
                                     if sessions.install_with_protocol(
                                         flow.forward_key.clone(),
                                         decision,
@@ -4876,8 +4976,15 @@ fn poll_binding(
         did_work = true;
     }
     retry_pending_neigh(
-        binding, left, binding_index, right, binding_lookup,
-        forwarding, dynamic_neighbors, now_ns, unsafe { &*area },
+        binding,
+        left,
+        binding_index,
+        right,
+        binding_lookup,
+        forwarding,
+        dynamic_neighbors,
+        now_ns,
+        unsafe { &*area },
     );
     counters.flush(&binding.live);
     update_binding_debug_state(binding);
@@ -4911,10 +5018,10 @@ fn retry_pending_neigh(
             }
             // Check if neighbor MAC is now in dynamic_neighbors
             let mac = if let Some(hop) = pkt.decision.resolution.next_hop {
-                dynamic_neighbors
-                    .lock()
-                    .ok()
-                    .and_then(|n| n.get(&(pkt.decision.resolution.egress_ifindex, hop)).map(|e| e.mac))
+                dynamic_neighbors.lock().ok().and_then(|n| {
+                    n.get(&(pkt.decision.resolution.egress_ifindex, hop))
+                        .map(|e| e.mac)
+                })
             } else {
                 None
             };
@@ -4928,7 +5035,11 @@ fn retry_pending_neigh(
                 decision.resolution.disposition = ForwardingDisposition::ForwardCandidate;
                 let expected_ports = None;
                 if let Some(frame_len) = rewrite_forwarded_frame_in_place(
-                    unsafe { &*area }, pkt.desc, pkt.meta, &decision, expected_ports,
+                    unsafe { &*area },
+                    pkt.desc,
+                    pkt.meta,
+                    &decision,
+                    expected_ports,
                 ) {
                     let target_ifindex = if decision.resolution.tx_ifindex > 0 {
                         decision.resolution.tx_ifindex
@@ -4936,7 +5047,10 @@ fn retry_pending_neigh(
                         resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
                     };
                     if let Some(target_idx) = binding_lookup.target_index(
-                        binding_index, ingress_ifindex, ingress_queue, target_ifindex,
+                        binding_index,
+                        ingress_ifindex,
+                        ingress_queue,
+                        target_ifindex,
                     ) {
                         let req = PreparedTxRequest {
                             offset: pkt.desc.addr,
@@ -4949,9 +5063,9 @@ fn retry_pending_neigh(
                         };
                         if target_idx == binding_index {
                             binding.pending_tx_prepared.push_back(req);
-                        } else if let Some(target) = binding_by_index_mut(
-                            left, binding_index, binding, right, target_idx,
-                        ) {
+                        } else if let Some(target) =
+                            binding_by_index_mut(left, binding_index, binding, right, target_idx)
+                        {
                             target.pending_tx_prepared.push_back(req);
                             bound_pending_tx_prepared(target);
                         } else {
@@ -5128,6 +5242,25 @@ fn learn_dynamic_neighbor(
     }
 }
 
+fn build_missing_neighbor_session_metadata(
+    forwarding: &ForwardingState,
+    session_ingress_zone: Option<&Arc<str>>,
+    ingress_ifindex: i32,
+    decision: SessionDecision,
+) -> SessionMetadata {
+    SessionMetadata {
+        ingress_zone: session_ingress_zone
+            .cloned()
+            .unwrap_or_else(|| Arc::from("")),
+        egress_zone: Arc::from(""),
+        owner_rg_id: owner_rg_for_resolution(forwarding, decision.resolution),
+        fabric_ingress: ingress_is_fabric(forwarding, ingress_ifindex),
+        is_reverse: false,
+        synced: true,
+        nat64_reverse: None,
+    }
+}
+
 fn binding_by_index_mut<'a>(
     left: &'a mut [BindingWorker],
     current_index: usize,
@@ -5161,7 +5294,6 @@ fn find_target_binding_mut<'a>(
     )?;
     binding_by_index_mut(left, current_index, ingress_binding, right, target_index)
 }
-
 
 fn purge_queued_flows_for_closed_deltas(bindings: &mut [BindingWorker], deltas: &[SessionDelta]) {
     for delta in deltas {
@@ -5518,8 +5650,8 @@ fn update_last_resolution(
 fn worker_loop(
     worker_id: u32,
     binding_plans: Vec<BindingPlan>,
-    validation: ValidationState,
-    mut forwarding: Arc<ForwardingState>,
+    shared_validation: Arc<ArcSwap<ValidationState>>,
+    shared_forwarding: Arc<ArcSwap<ForwardingState>>,
     ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -5539,8 +5671,10 @@ fn worker_loop(
     shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
 ) {
     pin_current_thread(worker_id);
-    let ha_startup_grace_until_secs = (monotonic_nanos() / 1_000_000_000)
-        .saturating_add(TUNNEL_HA_STARTUP_GRACE_SECS);
+    let ha_startup_grace_until_secs =
+        (monotonic_nanos() / 1_000_000_000).saturating_add(TUNNEL_HA_STARTUP_GRACE_SECS);
+    let mut validation = **shared_validation.load();
+    let mut forwarding = shared_forwarding.load_full();
     let mut sessions = SessionTable::new();
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
@@ -5548,10 +5682,13 @@ fn worker_loop(
     let mut bindings = Vec::with_capacity(binding_plans.len());
     for plan in binding_plans {
         let total_frames = binding_frame_count(plan.ring_entries).max(1);
-        let mut private_pool =
-            WorkerUmemPool::new(total_frames).map_err(|err| format!("create binding umem: {err}"));
-        let binding = match private_pool.as_mut() {
-            Ok(pool) => BindingWorker::create(
+        let binding = match WorkerUmemPool::new(total_frames)
+            .map_err(|err| format!("create binding umem: {err}"))
+        {
+            Ok(WorkerUmemPool {
+                umem,
+                mut free_frames,
+            }) => BindingWorker::create(
                 &plan.status,
                 plan.ring_entries,
                 plan.xsk_map_fd,
@@ -5560,8 +5697,8 @@ fn worker_loop(
                 plan.live.clone(),
                 plan.bind_strategy,
                 plan.poll_mode,
-                pool.umem.clone(),
-                &mut pool.free_frames,
+                umem,
+                &mut free_frames,
                 false,
             ),
             Err(err) => Err(err.to_string().into()),
@@ -5683,6 +5820,16 @@ fn worker_loop(
             .unwrap_or(-1);
         let loop_now_ns = monotonic_nanos();
         let loop_now_secs = loop_now_ns / 1_000_000_000;
+        let live_validation = shared_validation.load();
+        if **live_validation != validation {
+            validation = **live_validation;
+        }
+        let live_forwarding = shared_forwarding.load_full();
+        if !Arc::ptr_eq(&forwarding, &live_forwarding) {
+            forwarding = live_forwarding;
+            screen_state.update_profiles(forwarding.screen_profiles.clone());
+            sessions.set_timeouts(forwarding.session_timeouts);
+        }
         let ha_runtime = ha_state.load();
         apply_worker_commands(
             &commands,
@@ -6362,14 +6509,12 @@ fn local_tunnel_source_loop(
                             &mut local_sessions,
                             &plan,
                         );
-                        if let Some(target_live) =
-                            select_live_binding_for_ifindex(
-                                &identities,
-                                &live,
-                                plan.tx_ifindex,
-                                next_slot,
-                            )
-                        {
+                        if let Some(target_live) = select_live_binding_for_ifindex(
+                            &identities,
+                            &live,
+                            plan.tx_ifindex,
+                            next_slot,
+                        ) {
                             next_slot = next_slot.wrapping_add(1);
                             if let Err(err) = target_live.enqueue_tx(plan.tx_request) {
                                 record_local_tunnel_exception(
@@ -6420,8 +6565,8 @@ fn build_local_origin_tunnel_tx_request(
     ha_state: &Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
 ) -> Result<LocalTunnelTxPlan, String> {
-    let mut meta =
-        local_origin_packet_meta(packet).ok_or_else(|| "unsupported_local_origin_packet".to_string())?;
+    let mut meta = local_origin_packet_meta(packet)
+        .ok_or_else(|| "unsupported_local_origin_packet".to_string())?;
     let inner_frame = wrap_raw_ip_packet_for_tunnel(packet, meta.addr_family);
     meta.l3_offset = 14;
     meta.l4_offset = meta.l4_offset.saturating_add(14);
@@ -6582,9 +6727,12 @@ fn wait_for_local_tunnel_session_install(
     deadline_ns: u64,
 ) {
     while monotonic_nanos() < deadline_ns {
-        let all_drained = worker_commands
-            .iter()
-            .all(|pending| pending.lock().map(|pending| pending.is_empty()).unwrap_or(false));
+        let all_drained = worker_commands.iter().all(|pending| {
+            pending
+                .lock()
+                .map(|pending| pending.is_empty())
+                .unwrap_or(false)
+        });
         if all_drained {
             break;
         }
@@ -6710,15 +6858,19 @@ fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
             // SOCK_RAW ICMP echo — triggers kernel ARP on the bound
             // interface. SOCK_DGRAM IPPROTO_ICMP fails with EINVAL on
             // sendto so we use SOCK_RAW directly.
-            let fd = unsafe {
-                libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP)
-            };
-            if fd < 0 { return; }
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP) };
+            if fd < 0 {
+                return;
+            }
             let name_c = std::ffi::CString::new(iface_name).unwrap_or_default();
             unsafe {
-                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_BINDTODEVICE,
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
                     name_c.as_ptr() as *const libc::c_void,
-                    name_c.to_bytes_with_nul().len() as libc::socklen_t);
+                    name_c.to_bytes_with_nul().len() as libc::socklen_t,
+                );
             }
             // ICMP echo request: type=8, code=0, checksum=0xf7ff
             let icmp: [u8; 8] = [8, 0, 0xf7, 0xff, 0, 0, 0, 0];
@@ -6726,24 +6878,32 @@ fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
             sa.sin_family = libc::AF_INET as u16;
             sa.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
             unsafe {
-                libc::sendto(fd, icmp.as_ptr() as *const libc::c_void, 8,
+                libc::sendto(
+                    fd,
+                    icmp.as_ptr() as *const libc::c_void,
+                    8,
                     libc::MSG_DONTWAIT,
                     &sa as *const libc::sockaddr_in as *const libc::sockaddr,
-                    core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t);
+                    core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                );
                 libc::close(fd);
             }
         }
         IpAddr::V6(v6) => {
             // ICMPv6 echo via SOCK_RAW (DGRAM sendto fails with EINVAL)
-            let fd = unsafe {
-                libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6)
-            };
-            if fd < 0 { return; }
+            let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6) };
+            if fd < 0 {
+                return;
+            }
             let name_c = std::ffi::CString::new(iface_name).unwrap_or_default();
             unsafe {
-                libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_BINDTODEVICE,
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_BINDTODEVICE,
                     name_c.as_ptr() as *const libc::c_void,
-                    name_c.to_bytes_with_nul().len() as libc::socklen_t);
+                    name_c.to_bytes_with_nul().len() as libc::socklen_t,
+                );
             }
             let mut sa6: libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
             sa6.sin6_family = libc::AF_INET6 as u16;
@@ -6753,14 +6913,23 @@ fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
             // Tell kernel to auto-compute ICMPv6 checksum at offset 2
             let offset: c_int = 2;
             unsafe {
-                libc::setsockopt(fd, libc::IPPROTO_ICMPV6, libc::IPV6_CHECKSUM,
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_ICMPV6,
+                    libc::IPV6_CHECKSUM,
                     &offset as *const c_int as *const libc::c_void,
-                    core::mem::size_of::<c_int>() as libc::socklen_t);
+                    core::mem::size_of::<c_int>() as libc::socklen_t,
+                );
             }
             unsafe {
-                libc::sendto(fd, icmp6.as_ptr() as *const libc::c_void, 8, libc::MSG_DONTWAIT,
+                libc::sendto(
+                    fd,
+                    icmp6.as_ptr() as *const libc::c_void,
+                    8,
+                    libc::MSG_DONTWAIT,
                     &sa6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
-                    core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t);
+                    core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                );
                 libc::close(fd);
             }
         }
@@ -6798,14 +6967,20 @@ fn add_kernel_neighbor_probe(ifindex: i32, ip: IpAddr) {
     buf[off + 2..off + 4].copy_from_slice(&NDA_DST.to_ne_bytes());
     buf[off + 4..off + 4 + ip_bytes.len()].copy_from_slice(&ip_bytes);
     let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 { return; }
+    if fd < 0 {
+        return;
+    }
     let mut sa: libc::sockaddr_nl = unsafe { core::mem::zeroed() };
     sa.nl_family = libc::AF_NETLINK as u16;
     unsafe {
-        libc::sendto(fd, buf.as_ptr() as *const libc::c_void, buf.len(),
+        libc::sendto(
+            fd,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
             libc::MSG_DONTWAIT,
             &sa as *const libc::sockaddr_nl as *const libc::sockaddr,
-            core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t);
+            core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        );
         libc::close(fd);
     }
 }
@@ -6835,16 +7010,12 @@ fn send_raw_frame(ifindex: i32, frame: &[u8]) {
     // doesn't work reliably on VLAN devices.
     // Match the Python pattern exactly: socket(AF_PACKET, SOCK_RAW, htons(proto))
     let proto_be = (proto as u16).to_be();
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_PACKET,
-            libc::SOCK_RAW,
-            proto_be as c_int,
-        )
-    };
+    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, proto_be as c_int) };
     if fd < 0 {
         let errno = unsafe { *libc::__errno_location() };
-        eprintln!("send_raw_frame: socket() failed: errno={errno} ifindex={ifindex} proto=0x{proto:04x}");
+        eprintln!(
+            "send_raw_frame: socket() failed: errno={errno} ifindex={ifindex} proto=0x{proto:04x}"
+        );
         return;
     }
     let mut bind_addr: libc::sockaddr_ll = unsafe { core::mem::zeroed() };
@@ -6883,9 +7054,15 @@ fn send_raw_frame(ifindex: i32, frame: &[u8]) {
     };
     if send_rc < 0 {
         let errno = unsafe { *libc::__errno_location() };
-        eprintln!("send_raw_frame: send() failed: errno={errno} ifindex={ifindex} len={}", frame.len());
+        eprintln!(
+            "send_raw_frame: send() failed: errno={errno} ifindex={ifindex} len={}",
+            frame.len()
+        );
     } else {
-        eprintln!("send_raw_frame: OK ifindex={ifindex} len={} sent={send_rc}", frame.len());
+        eprintln!(
+            "send_raw_frame: OK ifindex={ifindex} len={} sent={send_rc}",
+            frame.len()
+        );
     }
     unsafe { libc::close(fd) };
 }
@@ -6959,9 +7136,201 @@ fn add_kernel_neighbor(ifindex: i32, ip: IpAddr, mac: [u8; 6]) {
 /// receives it and updates the helper's dynamic_neighbors cache instantly,
 /// so the next packet for that destination finds the neighbor and forwards
 /// directly through XSK — no waiting for the Go-side snapshot refresh.
+fn update_dynamic_neighbor(
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    ifindex: i32,
+    ip: IpAddr,
+    entry: NeighborEntry,
+) -> bool {
+    let Ok(mut neighbors) = dynamic_neighbors.lock() else {
+        return false;
+    };
+    let key = (ifindex, ip);
+    if neighbors.get(&key).map(|existing| existing.mac) == Some(entry.mac) {
+        return false;
+    }
+    neighbors.insert(key, entry);
+    true
+}
+
+fn remove_dynamic_neighbor(
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    ifindex: i32,
+    ip: IpAddr,
+) -> bool {
+    let Ok(mut neighbors) = dynamic_neighbors.lock() else {
+        return false;
+    };
+    neighbors.remove(&(ifindex, ip)).is_some()
+}
+
+fn parse_neighbor_msg(
+    nlmsg_type: u16,
+    body: &[u8],
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+) -> bool {
+    if body.len() < 12 {
+        return false;
+    }
+    let family = body[0];
+    let ifindex = i32::from_ne_bytes([body[4], body[5], body[6], body[7]]);
+    let state = u16::from_ne_bytes([body[8], body[9]]);
+    let mut attr_off = 12usize;
+    let mut ip: Option<IpAddr> = None;
+    let mut mac: Option<[u8; 6]> = None;
+    while attr_off + 4 <= body.len() {
+        let attr_len = u16::from_ne_bytes([body[attr_off], body[attr_off + 1]]) as usize;
+        let attr_type = u16::from_ne_bytes([body[attr_off + 2], body[attr_off + 3]]);
+        if attr_len < 4 || attr_off + attr_len > body.len() {
+            break;
+        }
+        let payload = &body[attr_off + 4..attr_off + attr_len];
+        match attr_type {
+            1 => {
+                if family == libc::AF_INET as u8 && payload.len() >= 4 {
+                    ip = Some(IpAddr::V4(Ipv4Addr::new(
+                        payload[0], payload[1], payload[2], payload[3],
+                    )));
+                } else if family == libc::AF_INET6 as u8 && payload.len() >= 16 {
+                    let mut bytes = [0u8; 16];
+                    bytes.copy_from_slice(&payload[..16]);
+                    ip = Some(IpAddr::V6(Ipv6Addr::from(bytes)));
+                }
+            }
+            2 => {
+                if payload.len() >= 6 {
+                    mac = Some([
+                        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
+                    ]);
+                }
+            }
+            _ => {}
+        }
+        attr_off += (attr_len + 3) & !3;
+    }
+    let Some(ip) = ip else {
+        return false;
+    };
+    match nlmsg_type {
+        28 => {
+            if state & 0x1e == 0 {
+                return remove_dynamic_neighbor(dynamic_neighbors, ifindex, ip);
+            }
+            let Some(mac) = mac else {
+                return false;
+            };
+            update_dynamic_neighbor(dynamic_neighbors, ifindex, ip, NeighborEntry { mac })
+        }
+        29 => remove_dynamic_neighbor(dynamic_neighbors, ifindex, ip),
+        _ => false,
+    }
+}
+
+fn request_neighbor_dump(fd: c_int, family: u8, seq: u32) -> io::Result<()> {
+    const RTM_GETNEIGH: u16 = 30;
+    const NLM_F_REQUEST: u16 = 0x1;
+    const NLM_F_ROOT: u16 = 0x100;
+    const NLM_F_MATCH: u16 = 0x200;
+    let mut buf = [0u8; 28];
+    buf[0..4].copy_from_slice(&(28u32).to_ne_bytes());
+    buf[4..6].copy_from_slice(&RTM_GETNEIGH.to_ne_bytes());
+    buf[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ROOT | NLM_F_MATCH).to_ne_bytes());
+    buf[8..12].copy_from_slice(&seq.to_ne_bytes());
+    buf[12..16].copy_from_slice(&0u32.to_ne_bytes());
+    buf[16] = family;
+    let mut sa: libc::sockaddr_nl = unsafe { core::mem::zeroed() };
+    sa.nl_family = libc::AF_NETLINK as u16;
+    let rc = unsafe {
+        libc::sendto(
+            fd,
+            buf.as_ptr() as *const libc::c_void,
+            buf.len(),
+            0,
+            &sa as *const libc::sockaddr_nl as *const libc::sockaddr,
+            core::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn initial_neighbor_dump(
+    fd: c_int,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+) -> io::Result<u64> {
+    const NLMSG_DONE: u16 = 3;
+    const NLMSG_ERROR: u16 = 2;
+    let mut next_seq = 1u32;
+    let mut changed = false;
+    let mut buf = vec![0u8; 8192];
+    for family in [libc::AF_INET as u8, libc::AF_INET6 as u8] {
+        request_neighbor_dump(fd, family, next_seq)?;
+        loop {
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                let kind = err.kind();
+                if kind == io::ErrorKind::WouldBlock || kind == io::ErrorKind::TimedOut {
+                    return Err(err);
+                }
+                continue;
+            }
+            let mut offset = 0usize;
+            let mut dump_done = false;
+            while offset + 16 <= n as usize {
+                let nlmsg_len = u32::from_ne_bytes([
+                    buf[offset],
+                    buf[offset + 1],
+                    buf[offset + 2],
+                    buf[offset + 3],
+                ]) as usize;
+                let nlmsg_type = u16::from_ne_bytes([buf[offset + 4], buf[offset + 5]]);
+                let nlmsg_seq = u32::from_ne_bytes([
+                    buf[offset + 8],
+                    buf[offset + 9],
+                    buf[offset + 10],
+                    buf[offset + 11],
+                ]);
+                if nlmsg_len < 16 || offset + nlmsg_len > n as usize {
+                    break;
+                }
+                if nlmsg_seq != next_seq {
+                    offset += (nlmsg_len + 3) & !3;
+                    continue;
+                }
+                match nlmsg_type {
+                    NLMSG_DONE => {
+                        dump_done = true;
+                    }
+                    NLMSG_ERROR => {
+                        return Err(io::Error::other("netlink neighbor dump failed"));
+                    }
+                    28 | 29 => {
+                        changed |= parse_neighbor_msg(
+                            nlmsg_type,
+                            &buf[offset + 16..offset + nlmsg_len],
+                            dynamic_neighbors,
+                        );
+                    }
+                    _ => {}
+                }
+                offset += (nlmsg_len + 3) & !3;
+            }
+            if dump_done {
+                break;
+            }
+        }
+        next_seq += 1;
+    }
+    Ok(if changed { 1 } else { 0 })
+}
+
 fn neigh_monitor_thread(
     stop: Arc<AtomicBool>,
     dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    neighbor_generation: Arc<AtomicU64>,
 ) {
     // Create NETLINK_ROUTE socket and subscribe to neighbor events
     let fd = unsafe {
@@ -6994,86 +7363,60 @@ fn neigh_monitor_thread(
     // Set 500ms receive timeout for periodic stop check.
     // Neighbor events arrive instantly via the multicast group —
     // recv() returns immediately when the kernel pushes an update.
-    let tv = libc::timeval { tv_sec: 0, tv_usec: 500_000 };
+    let tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 500_000,
+    };
     unsafe {
         libc::setsockopt(
-            fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
             &tv as *const libc::timeval as *const libc::c_void,
             core::mem::size_of::<libc::timeval>() as libc::socklen_t,
         );
     }
+    match initial_neighbor_dump(fd, &dynamic_neighbors) {
+        Ok(_) => {
+            neighbor_generation.store(1, Ordering::Relaxed);
+            eprintln!("neigh_monitor: initial kernel neighbor dump complete");
+        }
+        Err(err) => {
+            neighbor_generation.store(1, Ordering::Relaxed);
+            eprintln!("neigh_monitor: initial dump failed: {err}");
+        }
+    }
     eprintln!("neigh_monitor: listening for kernel neighbor events");
     let mut buf = vec![0u8; 8192];
     while !stop.load(Ordering::Relaxed) {
-        let n = unsafe {
-            libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0)
-        };
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
         if n <= 0 {
             continue;
         }
-        // Parse netlink messages
         let mut offset = 0usize;
+        let mut changed = false;
         while offset + 16 <= n as usize {
-            let nlmsg_len = u32::from_ne_bytes([buf[offset], buf[offset+1], buf[offset+2], buf[offset+3]]) as usize;
-            let nlmsg_type = u16::from_ne_bytes([buf[offset+4], buf[offset+5]]);
+            let nlmsg_len = u32::from_ne_bytes([
+                buf[offset],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
+            ]) as usize;
+            let nlmsg_type = u16::from_ne_bytes([buf[offset + 4], buf[offset + 5]]);
             if nlmsg_len < 16 || offset + nlmsg_len > n as usize {
                 break;
             }
-            // RTM_NEWNEIGH = 28
-            if nlmsg_type == 28 {
-                // ndmsg starts at offset+16: family(1) pad(3) ifindex(4) state(2) flags(1) type(1)
-                let ndm_start = offset + 16;
-                if ndm_start + 12 <= n as usize {
-                    let family = buf[ndm_start];
-                    let ifindex = i32::from_ne_bytes([
-                        buf[ndm_start+4], buf[ndm_start+5], buf[ndm_start+6], buf[ndm_start+7],
-                    ]);
-                    let state = u16::from_ne_bytes([buf[ndm_start+8], buf[ndm_start+9]]);
-                    // Only learn REACHABLE, STALE, DELAY, PROBE states
-                    // NUD_REACHABLE=2, NUD_STALE=4, NUD_DELAY=8, NUD_PROBE=16
-                    if state & 0x1e != 0 {
-                        // Parse NDA attributes
-                        let mut attr_off = ndm_start + 12;
-                        let mut ip: Option<IpAddr> = None;
-                        let mut mac: Option<[u8; 6]> = None;
-                        while attr_off + 4 <= offset + nlmsg_len {
-                            let attr_len = u16::from_ne_bytes([buf[attr_off], buf[attr_off+1]]) as usize;
-                            let attr_type = u16::from_ne_bytes([buf[attr_off+2], buf[attr_off+3]]);
-                            if attr_len < 4 { break; }
-                            let payload = &buf[attr_off+4..attr_off+attr_len.min(offset+nlmsg_len-attr_off)];
-                            match attr_type {
-                                1 => { // NDA_DST
-                                    if family == libc::AF_INET as u8 && payload.len() >= 4 {
-                                        ip = Some(IpAddr::V4(Ipv4Addr::new(
-                                            payload[0], payload[1], payload[2], payload[3],
-                                        )));
-                                    } else if family == libc::AF_INET6 as u8 && payload.len() >= 16 {
-                                        let mut bytes = [0u8; 16];
-                                        bytes.copy_from_slice(&payload[..16]);
-                                        ip = Some(IpAddr::V6(Ipv6Addr::from(bytes)));
-                                    }
-                                }
-                                2 => { // NDA_LLADDR
-                                    if payload.len() >= 6 {
-                                        mac = Some([
-                                            payload[0], payload[1], payload[2],
-                                            payload[3], payload[4], payload[5],
-                                        ]);
-                                    }
-                                }
-                                _ => {}
-                            }
-                            attr_off += (attr_len + 3) & !3; // align to 4
-                        }
-                        if let (Some(ip), Some(mac)) = (ip, mac) {
-                            if let Ok(mut neighbors) = dynamic_neighbors.lock() {
-                                neighbors.insert((ifindex, ip), NeighborEntry { mac });
-                            }
-                        }
-                    }
-                }
+            if nlmsg_type == 28 || nlmsg_type == 29 {
+                changed |= parse_neighbor_msg(
+                    nlmsg_type,
+                    &buf[offset + 16..offset + nlmsg_len],
+                    &dynamic_neighbors,
+                );
             }
             offset += (nlmsg_len + 3) & !3; // align to 4
+        }
+        if changed {
+            neighbor_generation.fetch_add(1, Ordering::Relaxed);
         }
     }
     unsafe { libc::close(fd) };
@@ -8044,10 +8387,7 @@ fn owner_rg_for_flow(forwarding: &ForwardingState, egress_ifindex: i32) -> i32 {
         .unwrap_or_default()
 }
 
-fn owner_rg_for_resolution(
-    forwarding: &ForwardingState,
-    resolution: ForwardingResolution,
-) -> i32 {
+fn owner_rg_for_resolution(forwarding: &ForwardingState, resolution: ForwardingResolution) -> i32 {
     if resolution.tunnel_endpoint_id != 0 {
         return forwarding
             .tunnel_endpoints
@@ -8160,6 +8500,7 @@ fn redirect_via_fabric_if_needed(
 fn cluster_peer_return_fast_path(
     forwarding: &ForwardingState,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    packet_frame: &[u8],
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<&str>,
     resolution_target: IpAddr,
@@ -8168,6 +8509,9 @@ fn cluster_peer_return_fast_path(
         return None;
     }
     let ingress_zone = ingress_zone_override?;
+    if is_icmp_echo_request(packet_frame, meta) {
+        return None;
+    }
     if meta.protocol == PROTO_TCP
         && (meta.tcp_flags & TCP_FLAG_SYN) != 0
         && (meta.tcp_flags & 0x10) == 0
@@ -8200,6 +8544,22 @@ fn cluster_peer_return_fast_path(
         },
         metadata,
     ))
+}
+
+fn is_icmp_echo_request(packet_frame: &[u8], meta: UserspaceDpMeta) -> bool {
+    if !matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        return false;
+    }
+    packet_frame
+        .get(meta.l4_offset as usize)
+        .copied()
+        .map(|icmp_type| {
+            matches!(
+                (meta.protocol, icmp_type),
+                (PROTO_ICMP, 8) | (PROTO_ICMPV6, 128)
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn resolve_ingress_logical_ifindex(
@@ -8245,7 +8605,10 @@ fn enforce_ha_resolution_snapshot(
     now_secs: u64,
     resolution: ForwardingResolution,
 ) -> ForwardingResolution {
-    if resolution.disposition != ForwardingDisposition::ForwardCandidate {
+    if !matches!(
+        resolution.disposition,
+        ForwardingDisposition::ForwardCandidate | ForwardingDisposition::MissingNeighbor
+    ) {
         return resolution;
     }
     let owner_rg_id = owner_rg_for_resolution(forwarding, resolution);
@@ -8323,10 +8686,7 @@ fn effective_tcp_mss(forwarding: &ForwardingState) -> u16 {
     0
 }
 
-fn native_gre_inner_mtu(
-    forwarding: &ForwardingState,
-    decision: &SessionDecision,
-) -> usize {
+fn native_gre_inner_mtu(forwarding: &ForwardingState, decision: &SessionDecision) -> usize {
     if decision.resolution.tunnel_endpoint_id == 0 {
         return 0;
     }
@@ -8616,9 +8976,12 @@ fn ingress_route_table_override(
     meta: UserspaceDpMeta,
     flow: &SessionFlow,
 ) -> Option<String> {
-    let ingress_ifindex =
-        resolve_ingress_logical_ifindex(forwarding, meta.ingress_ifindex as i32, meta.ingress_vlan_id)
-            .unwrap_or(meta.ingress_ifindex as i32);
+    let ingress_ifindex = resolve_ingress_logical_ifindex(
+        forwarding,
+        meta.ingress_ifindex as i32,
+        meta.ingress_vlan_id,
+    )
+    .unwrap_or(meta.ingress_ifindex as i32);
     let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
     let result = crate::filter::evaluate_interface_filter(
         &forwarding.filter_state,
@@ -9131,8 +9494,8 @@ fn lookup_neighbor_entry(
         }
     }
     // The worker hot path must not block on shelling out to `ip neigh` or
-    // active probes. Neighbor discovery is refreshed asynchronously by the
-    // manager snapshot path and the periodic update_neighbors control request.
+    // active probes. Runtime neighbor discovery is maintained asynchronously
+    // by the helper's own netlink dump+subscribe path.
     None
 }
 
@@ -11389,7 +11752,10 @@ mod tests {
             flow.dst_ip,
             override_table.as_deref(),
         );
-        assert_eq!(resolved.disposition, ForwardingDisposition::ForwardCandidate);
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
         assert_eq!(resolved.egress_ifindex, 362);
         assert_eq!(resolved.tx_ifindex, 6);
         assert_eq!(resolved.tunnel_endpoint_id, 1);
@@ -11511,8 +11877,11 @@ mod tests {
             },
         )])));
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let packet =
-            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 255, 192, 42), Ipv4Addr::new(10, 255, 192, 41), 64);
+        let packet = build_icmp_echo_frame_v4(
+            Ipv4Addr::new(10, 255, 192, 42),
+            Ipv4Addr::new(10, 255, 192, 41),
+            64,
+        );
         let plan = build_local_origin_tunnel_tx_request(
             &packet[14..],
             1,
@@ -11542,8 +11911,11 @@ mod tests {
             },
         )])));
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let packet =
-            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 255, 192, 42), Ipv4Addr::new(10, 255, 192, 41), 64);
+        let packet = build_icmp_echo_frame_v4(
+            Ipv4Addr::new(10, 255, 192, 42),
+            Ipv4Addr::new(10, 255, 192, 41),
+            64,
+        );
         let err = build_local_origin_tunnel_tx_request(
             &packet[14..],
             1,
@@ -11730,11 +12102,26 @@ mod tests {
         frame.extend_from_slice(&src_port.to_be_bytes());
         frame.extend_from_slice(&dst_port.to_be_bytes());
         frame.extend_from_slice(&[
-            0x00, 0x00, 0x00, 0x01, // seq
-            0x00, 0x00, 0x00, 0x00, // ack
-            0x60, TCP_FLAG_SYN, 0xfa, 0xf0, // data offset / flags / window
-            0x00, 0x00, 0x00, 0x00, // checksum + urg
-            0x02, 0x04, 0x05, 0xb4, // MSS 1460
+            0x00,
+            0x00,
+            0x00,
+            0x01, // seq
+            0x00,
+            0x00,
+            0x00,
+            0x00, // ack
+            0x60,
+            TCP_FLAG_SYN,
+            0xfa,
+            0xf0, // data offset / flags / window
+            0x00,
+            0x00,
+            0x00,
+            0x00, // checksum + urg
+            0x02,
+            0x04,
+            0x05,
+            0xb4, // MSS 1460
         ]);
         let ip_sum = checksum16(&frame[14..34]);
         frame[24] = (ip_sum >> 8) as u8;
@@ -11868,6 +12255,39 @@ mod tests {
     }
 
     #[test]
+    fn inactive_owner_missing_neighbor_redirects_to_fabric() {
+        let mut snapshot = nat_snapshot_with_fabric();
+        snapshot
+            .neighbors
+            .retain(|neighbor| neighbor.ip != "172.16.80.1");
+        let state = build_forwarding_state(&snapshot);
+        let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )])));
+        let blocked = enforce_ha_resolution(
+            &state,
+            &ha_state,
+            lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        );
+        assert_eq!(blocked.disposition, ForwardingDisposition::HAInactive);
+        let redirected = redirect_via_fabric_if_needed(&state, blocked, 24);
+        assert_eq!(
+            redirected.disposition,
+            ForwardingDisposition::FabricRedirect
+        );
+        assert_eq!(redirected.egress_ifindex, 21);
+        assert_eq!(redirected.tx_ifindex, 21);
+        assert_eq!(
+            redirected.next_hop,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)))
+        );
+    }
+
+    #[test]
     fn build_forwarding_state_uses_fabric_snapshot_macs_without_parent_interface() {
         let mut snapshot = nat_snapshot();
         snapshot.fabrics = vec![FabricSnapshot {
@@ -11973,6 +12393,52 @@ mod tests {
             &neighbors,
         );
         assert!(neighbors.lock().expect("neighbors").is_empty());
+    }
+
+    #[test]
+    fn manager_neighbor_replace_preserves_packet_learned_entries() {
+        let coordinator = Coordinator::new();
+        {
+            let mut neighbors = coordinator
+                .dynamic_neighbors_ref()
+                .lock()
+                .expect("neighbors");
+            neighbors.insert(
+                (
+                    5,
+                    IpAddr::V6(Ipv6Addr::new(
+                        0x2001, 0x559, 0x8585, 0xef00, 0x1266, 0x6aff, 0xfe0b, 0xd017,
+                    )),
+                ),
+                NeighborEntry {
+                    mac: [0x10, 0x66, 0x6a, 0x0b, 0xd0, 0x17],
+                },
+            );
+        }
+
+        coordinator.apply_manager_neighbors(
+            true,
+            &[(
+                13,
+                IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                NeighborEntry {
+                    mac: [0x56, 0x4a, 0xe8, 0x1e, 0xa8, 0x32],
+                },
+            )],
+        );
+
+        let neighbors = coordinator
+            .dynamic_neighbors_ref()
+            .lock()
+            .expect("neighbors");
+        assert_eq!(neighbors.len(), 2);
+        assert!(neighbors.contains_key(&(
+            5,
+            IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0x559, 0x8585, 0xef00, 0x1266, 0x6aff, 0xfe0b, 0xd017,
+            ))
+        )));
+        assert!(neighbors.contains_key(&(13, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)))));
     }
 
     #[test]
@@ -12094,12 +12560,15 @@ mod tests {
         let meta = UserspaceDpMeta {
             ingress_ifindex: 4,
             protocol: PROTO_ICMP,
+            l4_offset: 0,
             ..UserspaceDpMeta::default()
         };
+        let packet_frame = [0u8];
 
         let (decision, metadata) = cluster_peer_return_fast_path(
             &state,
             &dynamic_neighbors,
+            &packet_frame,
             meta,
             Some("sfmix"),
             IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
@@ -12139,12 +12608,114 @@ mod tests {
             cluster_peer_return_fast_path(
                 &state,
                 &dynamic_neighbors,
+                &[],
                 meta,
                 Some("sfmix"),
                 IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn cluster_peer_return_fast_path_skips_icmp_echo_request() {
+        let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+        state.fabrics.push(FabricLink {
+            parent_ifindex: 4,
+            overlay_ifindex: 104,
+            peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+            peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        });
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 4,
+            protocol: PROTO_ICMP,
+            l4_offset: 0,
+            ..UserspaceDpMeta::default()
+        };
+        let packet_frame = [8u8];
+
+        assert!(
+            cluster_peer_return_fast_path(
+                &state,
+                &dynamic_neighbors,
+                &packet_frame,
+                meta,
+                Some("lan"),
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cluster_peer_return_fast_path_skips_icmpv6_echo_request() {
+        let mut state = build_forwarding_state(&native_gre_pbr_snapshot(true));
+        state.fabrics.push(FabricLink {
+            parent_ifindex: 4,
+            overlay_ifindex: 104,
+            peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+            peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        });
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 4,
+            protocol: PROTO_ICMPV6,
+            l4_offset: 0,
+            ..UserspaceDpMeta::default()
+        };
+        let packet_frame = [128u8];
+
+        assert!(
+            cluster_peer_return_fast_path(
+                &state,
+                &dynamic_neighbors,
+                &packet_frame,
+                meta,
+                Some("lan"),
+                IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn missing_neighbor_session_metadata_preserves_fabric_ingress() {
+        let mut state = build_forwarding_state(&native_gre_pbr_snapshot(false));
+        state.fabrics.push(FabricLink {
+            parent_ifindex: 4,
+            overlay_ifindex: 104,
+            peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+            peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        });
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::MissingNeighbor,
+                local_ifindex: 0,
+                egress_ifindex: 13,
+                tx_ifindex: 13,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V6(Ipv6Addr::new(
+                    0x2001, 0x559, 0x8585, 0x50, 0, 0, 0, 0x1,
+                ))),
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+
+        let ingress_zone = Arc::<str>::from("lan");
+        let metadata =
+            build_missing_neighbor_session_metadata(&state, Some(&ingress_zone), 4, decision);
+
+        assert_eq!(metadata.ingress_zone.as_ref(), "lan");
+        assert!(metadata.fabric_ingress);
+        assert!(metadata.synced);
+        assert!(!metadata.is_reverse);
     }
 
     #[test]
@@ -16116,8 +16687,8 @@ mod tests {
             0x45, 0x00, 0x00, 0x28, // IPv4, IHL=5, total_len=40
             0x00, 0x01, 0x00, 0x00, // ID, flags/frag
             64, PROTO_TCP, 0x00, 0x00, // TTL=64, proto=TCP, checksum placeholder
-            10, 0, 1, 102,          // src = 10.0.1.102
-            172, 16, 80, 200,       // dst = 172.16.80.200
+            10, 0, 1, 102, // src = 10.0.1.102
+            172, 16, 80, 200, // dst = 172.16.80.200
             // TCP header (20 bytes)
             0x9c, 0x40, 0x01, 0xbb, // src_port=40000 dst_port=443
             0x00, 0x00, 0x00, 0x01, // seq
@@ -16160,7 +16731,9 @@ mod tests {
         let rd = test_descriptor(&flow, &decision, 0, 0x0800);
 
         let mut area = MmapArea::new(4096).expect("mmap");
-        area.slice_mut(0, frame.len()).unwrap().copy_from_slice(&frame);
+        area.slice_mut(0, frame.len())
+            .unwrap()
+            .copy_from_slice(&frame);
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
             version: USERSPACE_META_VERSION,
@@ -16172,11 +16745,16 @@ mod tests {
         };
         let frame_len = apply_rewrite_descriptor(
             &area,
-            XdpDesc { addr: 0, len: frame.len() as u32, options: 0 },
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
             meta,
             &rd,
             None,
-        ).expect("descriptor rewrite");
+        )
+        .expect("descriptor rewrite");
 
         let out = area.slice(0, frame_len as usize).expect("out");
         // Ethernet header
@@ -16198,14 +16776,12 @@ mod tests {
         write_eth_header(&mut frame, [0xaa; 6], [0xbb; 6], 0, 0x0800);
         frame.extend_from_slice(&[
             0x45, 0x00, 0x00, 0x30, // IPv4, total_len=48
-            0x00, 0x01, 0x00, 0x00,
-            64, PROTO_TCP, 0x00, 0x00,
-            10, 0, 61, 102,         // src = 10.0.61.102
-            172, 16, 80, 200,       // dst = 172.16.80.200
+            0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
+            102, // src = 10.0.61.102
+            172, 16, 80, 200, // dst = 172.16.80.200
             0x9c, 0x40, 0x14, 0x51, // src_port=40000 dst_port=5201
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-            0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
-            b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00,
+            0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
         ]);
         let ip_sum = checksum16(&frame[14..34]);
         frame[24] = (ip_sum >> 8) as u8;
@@ -16245,7 +16821,9 @@ mod tests {
         let rd = test_descriptor(&flow, &decision, 80, 0x0800);
 
         let mut area = MmapArea::new(4096).expect("mmap");
-        area.slice_mut(0, frame.len()).unwrap().copy_from_slice(&frame);
+        area.slice_mut(0, frame.len())
+            .unwrap()
+            .copy_from_slice(&frame);
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
             version: USERSPACE_META_VERSION,
@@ -16257,11 +16835,16 @@ mod tests {
         };
         let frame_len = apply_rewrite_descriptor(
             &area,
-            XdpDesc { addr: 0, len: frame.len() as u32, options: 0 },
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
             meta,
             &rd,
             None,
-        ).expect("descriptor snat rewrite");
+        )
+        .expect("descriptor snat rewrite");
 
         let out = area.slice(0, frame_len as usize).expect("out");
         // VLAN tag added
@@ -16285,15 +16868,12 @@ mod tests {
         let mut frame = Vec::new();
         write_eth_header(&mut frame, [0xaa; 6], [0xbb; 6], 80, 0x0800);
         frame.extend_from_slice(&[
-            0x45, 0x00, 0x00, 0x30,
-            0x00, 0x02, 0x00, 0x00,
-            64, PROTO_TCP, 0x00, 0x00,
-            172, 16, 80, 200,       // src
-            172, 16, 80, 8,         // dst (pre-DNAT)
+            0x45, 0x00, 0x00, 0x30, 0x00, 0x02, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 172, 16, 80,
+            200, // src
+            172, 16, 80, 8, // dst (pre-DNAT)
             0x14, 0x51, 0x9c, 0x40, // src_port=5201 dst_port=40000
-            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02,
-            0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
-            b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+            0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00,
+            0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
         ]);
         let ip_sum = checksum16(&frame[18..38]);
         frame[28] = (ip_sum >> 8) as u8;
@@ -16332,7 +16912,9 @@ mod tests {
         let rd = test_descriptor(&flow, &decision, 0, 0x0800);
 
         let mut area = MmapArea::new(4096).expect("mmap");
-        area.slice_mut(0, frame.len()).unwrap().copy_from_slice(&frame);
+        area.slice_mut(0, frame.len())
+            .unwrap()
+            .copy_from_slice(&frame);
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
             version: USERSPACE_META_VERSION,
@@ -16344,11 +16926,16 @@ mod tests {
         };
         let frame_len = apply_rewrite_descriptor(
             &area,
-            XdpDesc { addr: 0, len: frame.len() as u32, options: 0 },
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
             meta,
             &rd,
             None,
-        ).expect("descriptor dnat rewrite");
+        )
+        .expect("descriptor dnat rewrite");
 
         let out = area.slice(0, frame_len as usize).expect("out");
         // No VLAN
@@ -16369,17 +16956,20 @@ mod tests {
         write_eth_header(&mut frame, [0xaa; 6], [0xbb; 6], 0, 0x86dd);
         let src = Ipv6Addr::new(0x2001, 0x0559, 0x8585, 0xbf01, 0, 0, 0, 0x102);
         let dst = Ipv6Addr::new(0x2001, 0x0559, 0x8585, 0x80, 0, 0, 0, 0x200);
-        frame.push(0x60); frame.push(0x00); frame.push(0x00); frame.push(0x00); // version+flow
+        frame.push(0x60);
+        frame.push(0x00);
+        frame.push(0x00);
+        frame.push(0x00); // version+flow
         frame.extend_from_slice(&20u16.to_be_bytes()); // payload_len = 20 (TCP header only)
         frame.push(PROTO_TCP); // next header
-        frame.push(64);        // hop limit = 64
+        frame.push(64); // hop limit = 64
         frame.extend_from_slice(&src.octets());
         frame.extend_from_slice(&dst.octets());
         // TCP header (20 bytes)
         frame.extend_from_slice(&40000u16.to_be_bytes()); // src port
-        frame.extend_from_slice(&443u16.to_be_bytes());   // dst port
-        frame.extend_from_slice(&1u32.to_be_bytes());     // seq
-        frame.extend_from_slice(&0u32.to_be_bytes());     // ack
+        frame.extend_from_slice(&443u16.to_be_bytes()); // dst port
+        frame.extend_from_slice(&1u32.to_be_bytes()); // seq
+        frame.extend_from_slice(&0u32.to_be_bytes()); // ack
         frame.extend_from_slice(&[0x50, 0x10, 0x20, 0x00]); // data_off=5, ACK, win=8192
         frame.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // checksum + urgent
         recompute_l4_checksum_ipv6(&mut frame[14..], PROTO_TCP).expect("tcp6 sum");
@@ -16413,7 +17003,9 @@ mod tests {
         let rd = test_descriptor(&flow, &decision, 0, 0x86dd);
 
         let mut area = MmapArea::new(4096).expect("mmap");
-        area.slice_mut(0, frame.len()).unwrap().copy_from_slice(&frame);
+        area.slice_mut(0, frame.len())
+            .unwrap()
+            .copy_from_slice(&frame);
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
             version: USERSPACE_META_VERSION,
@@ -16426,11 +17018,16 @@ mod tests {
         };
         let frame_len = apply_rewrite_descriptor(
             &area,
-            XdpDesc { addr: 0, len: frame.len() as u32, options: 0 },
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
             meta,
             &rd,
             None,
-        ).expect("descriptor ipv6 rewrite");
+        )
+        .expect("descriptor ipv6 rewrite");
 
         let out = area.slice(0, frame_len as usize).expect("out");
         assert_eq!(&out[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
@@ -16454,12 +17051,9 @@ mod tests {
         let mut frame = Vec::new();
         write_eth_header(&mut frame, [0xaa; 6], [0xbb; 6], 0, 0x0800);
         frame.extend_from_slice(&[
-            0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00,
-            64, PROTO_TCP, 0x00, 0x00,
-            10, 0, 1, 102, 172, 16, 80, 200,
-            0x9c, 0x40, 0x01, 0xbb, // src=40000 dst=443
-            0, 0, 0, 1, 0, 0, 0, 0,
-            0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 1,
+            102, 172, 16, 80, 200, 0x9c, 0x40, 0x01, 0xbb, // src=40000 dst=443
+            0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
         ]);
         let ip_sum = checksum16(&frame[14..34]);
         frame[24] = (ip_sum >> 8) as u8;
@@ -16494,7 +17088,9 @@ mod tests {
         let rd = test_descriptor(&flow, &decision, 0, 0x0800);
 
         let mut area = MmapArea::new(4096).expect("mmap");
-        area.slice_mut(0, frame.len()).unwrap().copy_from_slice(&frame);
+        area.slice_mut(0, frame.len())
+            .unwrap()
+            .copy_from_slice(&frame);
         let meta = UserspaceDpMeta {
             magic: USERSPACE_META_MAGIC,
             version: USERSPACE_META_VERSION,
@@ -16507,7 +17103,11 @@ mod tests {
         // Expected ports don't match frame (99/99 vs 40000/443).
         let result = apply_rewrite_descriptor(
             &area,
-            XdpDesc { addr: 0, len: frame.len() as u32, options: 0 },
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
             meta,
             &rd,
             Some((99, 99)),
@@ -16542,7 +17142,11 @@ mod tests {
         let meta = UserspaceDpMeta::default();
         let result = apply_rewrite_descriptor(
             &area,
-            XdpDesc { addr: 0, len: 64, options: 0 },
+            XdpDesc {
+                addr: 0,
+                len: 64,
+                options: 0,
+            },
             meta,
             &rd,
             None,
