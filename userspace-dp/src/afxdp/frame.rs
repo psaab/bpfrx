@@ -2975,23 +2975,19 @@ pub(super) fn enforce_expected_ports(
     if current_src == expected_src && current_dst == expected_dst {
         return Some(false);
     }
-    frame
-        .get_mut(l4..l4 + 2)?
-        .copy_from_slice(&expected_src.to_be_bytes());
-    frame
-        .get_mut(l4 + 2..l4 + 4)?
-        .copy_from_slice(&expected_dst.to_be_bytes());
-    match addr_family as i32 {
-        libc::AF_INET => {
-            let packet = frame.get_mut(l3..)?;
-            let ihl = packet_rel_l4_offset(packet, addr_family)?;
-            recompute_l4_checksum_ipv4(packet, ihl, protocol, true)?;
-        }
-        libc::AF_INET6 => {
-            let packet = frame.get_mut(l3..)?;
-            recompute_l4_checksum_ipv6(packet, protocol)?;
-        }
-        _ => return Some(false),
+    let packet = frame.get_mut(l3..)?;
+    let rel_l4 = l4.checked_sub(l3)?;
+    if current_src != expected_src {
+        packet
+            .get_mut(rel_l4..rel_l4 + 2)?
+            .copy_from_slice(&expected_src.to_be_bytes());
+        adjust_l4_checksum_port(packet, rel_l4, protocol, current_src, expected_src)?;
+    }
+    if current_dst != expected_dst {
+        packet
+            .get_mut(rel_l4 + 2..rel_l4 + 4)?
+            .copy_from_slice(&expected_dst.to_be_bytes());
+        adjust_l4_checksum_port(packet, rel_l4, protocol, current_dst, expected_dst)?;
     }
     Some(true)
 }
@@ -3003,7 +2999,7 @@ pub(super) fn enforce_expected_ports_at(
     frame: &mut [u8],
     l3: usize,
     l4: usize,
-    addr_family: u8,
+    _addr_family: u8,
     protocol: u8,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<bool> {
@@ -3019,23 +3015,19 @@ pub(super) fn enforce_expected_ports_at(
     if current_src == expected_src && current_dst == expected_dst {
         return Some(false);
     }
-    frame
-        .get_mut(l4..l4 + 2)?
-        .copy_from_slice(&expected_src.to_be_bytes());
-    frame
-        .get_mut(l4 + 2..l4 + 4)?
-        .copy_from_slice(&expected_dst.to_be_bytes());
-    match addr_family as i32 {
-        libc::AF_INET => {
-            let packet = frame.get_mut(l3..)?;
-            let ihl = packet_rel_l4_offset(packet, addr_family)?;
-            recompute_l4_checksum_ipv4(packet, ihl, protocol, true)?;
-        }
-        libc::AF_INET6 => {
-            let packet = frame.get_mut(l3..)?;
-            recompute_l4_checksum_ipv6(packet, protocol)?;
-        }
-        _ => return Some(false),
+    let packet = frame.get_mut(l3..)?;
+    let rel_l4 = l4.checked_sub(l3)?;
+    if current_src != expected_src {
+        packet
+            .get_mut(rel_l4..rel_l4 + 2)?
+            .copy_from_slice(&expected_src.to_be_bytes());
+        adjust_l4_checksum_port(packet, rel_l4, protocol, current_src, expected_src)?;
+    }
+    if current_dst != expected_dst {
+        packet
+            .get_mut(rel_l4 + 2..rel_l4 + 4)?
+            .copy_from_slice(&expected_dst.to_be_bytes());
+        adjust_l4_checksum_port(packet, rel_l4, protocol, current_dst, expected_dst)?;
     }
     Some(true)
 }
@@ -3220,6 +3212,17 @@ pub(super) fn checksum16(bytes: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+pub(super) fn checksum16_add_bytes(mut sum: u32, bytes: &[u8]) -> u32 {
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+    }
+    if let Some(last) = chunks.remainder().first() {
+        sum += (*last as u32) << 8;
+    }
+    sum
+}
+
 pub(super) fn checksum16_finish(mut sum: u32) -> u16 {
     while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -3298,24 +3301,23 @@ pub(super) fn checksum16_ipv6(
     next_header: u8,
     payload: &[u8],
 ) -> u16 {
-    let mut pseudo = Vec::with_capacity(40 + payload.len());
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, next_header]);
-    pseudo.extend_from_slice(payload);
-    checksum16(&pseudo)
+    let mut sum = 0u32;
+    sum = checksum16_add_bytes(sum, &src.octets());
+    sum = checksum16_add_bytes(sum, &dst.octets());
+    sum = checksum16_add_bytes(sum, &(payload.len() as u32).to_be_bytes());
+    sum = checksum16_add_bytes(sum, &[0, 0, 0, next_header]);
+    sum = checksum16_add_bytes(sum, payload);
+    checksum16_finish(sum)
 }
 
 pub(super) fn checksum16_ipv4(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, payload: &[u8]) -> u16 {
-    let mut pseudo = Vec::with_capacity(12 + payload.len());
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.push(0);
-    pseudo.push(protocol);
-    pseudo.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    pseudo.extend_from_slice(payload);
-    checksum16(&pseudo)
+    let mut sum = 0u32;
+    sum = checksum16_add_bytes(sum, &src.octets());
+    sum = checksum16_add_bytes(sum, &dst.octets());
+    sum = checksum16_add_bytes(sum, &[0, protocol]);
+    sum = checksum16_add_bytes(sum, &(payload.len() as u16).to_be_bytes());
+    sum = checksum16_add_bytes(sum, payload);
+    checksum16_finish(sum)
 }
 
 pub(super) fn adjust_l4_checksum_ipv4(

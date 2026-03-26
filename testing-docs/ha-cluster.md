@@ -145,6 +145,7 @@ Tests:
 - external IPv4/IPv6 reachability during steady state and after each failover/failback phase
 - immediate `.200` target reachability after each phase
 - proof that the old owner actually transmitted on the fabric path
+- proof that standby WAN egress stayed flat while the stale-owner redirect was active
 - bounded session/neighbor/route/policy deltas during each move
 - standby helper readiness on the old owner after each move
 - zero-interval and retransmit collapse detection
@@ -156,6 +157,39 @@ phase-level acceptance bar, thresholds, and artifact interpretation.
 For multi-cycle runs, prefer letting the script pick the duration from the
 cycle count. The hardened validator now rejects too-short runs up front instead
 of misreporting them as mid-cycle `iperf3` completion failures.
+
+### Manual stale-owner fabric check
+
+When the user reports "traffic is still showing up on the standby WAN," do not
+trust aggregate interface counters or `bwm-ng` alone. Measure fresh deltas
+around one RG move and one traffic run.
+
+Example:
+
+```bash
+# Put RG1 on node0 so node1 becomes the stale owner for LAN ingress.
+incus exec loss:bpfrx-userspace-fw1 -- \
+  bash -lc 'cli -c "request chassis cluster failover redundancy-group 1 node 0"'
+
+# On node1, watch the standby WAN and fabric parent in real time.
+incus exec loss:bpfrx-userspace-fw1 -- \
+  bash -lc 'timeout 5 cli -c "monitor interface ge-7-0-2"'
+incus exec loss:bpfrx-userspace-fw1 -- \
+  bash -lc 'timeout 5 cli -c "monitor interface ge-7-0-0"'
+
+# Then run the stale-owner load from cluster-userspace-host.
+incus exec loss:cluster-userspace-host -- \
+  bash -lc 'iperf3 -J -c 172.16.80.200 -P 4 -t 5'
+```
+
+Interpretation:
+
+- `ge-7-0-0` TX rising with `ge-7-0-2` TX flat means stale-owner redirect is
+  working and the traffic is crossing fabric.
+- `ge-7-0-2` TX rising on the standby while RG1 is inactive there is a real
+  leak or owner-state bug.
+- high `Copy TX`, high retransmits, and low bitrate on `ge-7-0-0` indicate a
+  fabric performance problem, not a missing redirect.
 
 ### Native GRE Validation
 
@@ -198,6 +232,7 @@ After any HA code change, verify:
 - [ ] Ping 172.16.80.200 / 2001:559:8585:80::200 from host — 0% loss
 - [ ] `scripts/userspace-ha-validation.sh` passes with current thresholds
 - [ ] `scripts/userspace-ha-failover-validation.sh` shows positive fabric TX delta on the old owner for each RG move
+- [ ] Standby WAN TX stays flat during the stale-owner phase when fabric redirect is expected
 - [ ] `scripts/userspace-ha-failover-validation.sh` keeps session/neighbor/route/policy deltas within threshold during each RG move
 - [ ] `iperf3 -P 8` does not collapse to zero on any stream
 - [ ] mtr shows intermediate hops (embedded ICMP NAT reversal)

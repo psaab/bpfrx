@@ -33,8 +33,8 @@ pub(super) enum AfXdpBinder {
     DeviceQueue,
 }
 
-pub(super) fn binding_frame_count(ring_entries: u32) -> u32 {
-    reserved_tx_frames(ring_entries)
+pub(super) fn binding_frame_count_for_driver(driver: Option<&str>, ring_entries: u32) -> u32 {
+    reserved_tx_frames_for_driver(driver, ring_entries)
         .saturating_add(ring_entries.saturating_mul(2).max(1))
 }
 
@@ -198,11 +198,14 @@ pub(super) fn alternate_bind_strategy(
     }
 }
 
-pub(super) fn reserved_tx_frames(ring_entries: u32) -> u32 {
-    ring_entries
-        .saturating_div(2)
+pub(super) fn reserved_tx_frames_for_driver(driver: Option<&str>, ring_entries: u32) -> u32 {
+    let preferred = match driver {
+        Some("virtio_net") => ring_entries,
+        _ => ring_entries.saturating_div(2),
+    };
+    preferred
         .clamp(MIN_RESERVED_TX_FRAMES, MAX_RESERVED_TX_FRAMES)
-        .min(ring_entries.saturating_sub(1))
+        .min(ring_entries.saturating_mul(2).saturating_sub(1))
         .max(1)
 }
 

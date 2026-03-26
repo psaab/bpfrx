@@ -16,9 +16,15 @@ Pre-commit validation checklist. Check the boxes that apply to your change.
 - [ ] `RUNS=1 DURATION=5 PARALLEL=4 scripts/userspace-ha-validation.sh` — passes
 - [ ] `scripts/userspace-ha-failover-validation.sh --duration 60 --parallel 4` — no zero-throughput collapse and external IPv4/IPv6 stay reachable during failover/failback
 - [ ] The failover artifacts show positive fabric TX delta on the old owner for each RG move
+- [ ] Fresh standby WAN deltas stay flat during stale-owner fabric redirect checks
 - [ ] The failover artifacts keep session/neighbor/route/policy deltas within threshold for each RG move
 - [ ] The old owner stays `Enabled=true`, `Forwarding armed=true`, and `Ready bindings > 0` through failover/failback
 - [ ] Manual IPv4 + IPv6 `iperf3 -P 8` from `cluster-userspace-host` stay stable (no stream stuck at 0)
+- [ ] If the change affects split-RG failover or fabric forwarding, run at least one manual stale-owner fabric case:
+  - `RG1` moved to `node0`
+  - `cluster-userspace-host -> 172.16.80.200`
+  - `monitor interface ge-7-0-0` on `node1`
+  - confirm traffic crosses fabric and does not egress standby WAN
 - [ ] If the host rebooted recently: `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env ./test/incus/cluster-setup.sh refresh-vfs`
 - [ ] Review [userspace-fabric-failover.md](userspace-fabric-failover.md) if the change affects HA redirect, session sync, standby arming, or failover recovery quality
 

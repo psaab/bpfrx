@@ -17,6 +17,23 @@ still being wrong in practice:
 
 The goal of the hardened validator is to detect those cases directly.
 
+## What we proved in the latest hardening pass
+
+The most important correction from the latest live work on `loss`:
+
+- stale-owner traffic was not leaking out the standby WAN
+- it was redirecting across the fabric correctly
+- the real remaining failure was performance on the copy-mode fabric path
+
+Fresh failover deltas and `monitor interface` output showed:
+
+- standby WAN `ge-7-0-2` stayed flat during the stale-owner test
+- fabric parent `ge-7-0-0` / `fab1` carried the redirected traffic
+- the fabric parent is `virtio_net` in copy mode, not `mlx5` zero-copy
+
+That distinction matters. A low stale-owner bitrate is not automatically a
+fabric-redirect correctness bug.
+
 ## Current validator
 
 Primary script:
@@ -215,6 +232,66 @@ Effect:
 - failover ownership inside the helper now matches the live RG map more
   reliably
 
+### 9. Single-interface monitor output had to expose userspace dataplane state
+
+Problem:
+
+- `monitor interface <iface>` did not surface the helper-side userspace view
+- operators could see link counters, but not whether an interface had userspace
+  bindings, misses, copy/direct TX, or exceptions
+
+Fix:
+
+- extend the gRPC monitor-interface response to include userspace dataplane
+  state for the selected interface
+
+Effect:
+
+- live failover debugging can now distinguish:
+  - no traffic on the old owner
+  - correct fabric redirect on the old owner
+  - copy-mode fabric performance collapse on the old owner
+
+### 10. Fabric redirect had to spread across all fabric queues
+
+Problem:
+
+- stale-owner redirects inherited ingress queue affinity
+- the copy-mode fabric parent could leave most queues idle while one or two
+  queues accumulated the whole redirected workload
+
+Fix:
+
+- hash fabric redirects across all bindings on the target fabric interface
+  instead of preserving ingress queue affinity
+
+Effect:
+
+- stale-owner fabric traffic now spreads across the available fabric queues
+- this improved throughput and reduced the worst per-queue hot spots, even
+  though the fabric path is still fundamentally limited by `virtio_net`
+  copy-mode TX
+
+### 11. L4 checksum recompute had to stop allocating per packet
+
+Problem:
+
+- `checksum16_ipv4` / `checksum16_ipv6` still built temporary vectors in the
+  hot stale-owner path
+- perf kept showing checksum work as a visible local hotspot
+
+Fix:
+
+- switch pseudo-header checksum calculation to a zero-allocation incremental sum
+
+Effect:
+
+- checksum allocation noise dropped out of the top stale-owner profile
+- the remaining hot path is now mostly:
+  - `poll_binding`
+  - `__xsk_generic_xmit`
+  - `virtqueue_add_outbuf`
+
 ## What the hardened validator proves now
 
 For each failover or failback phase, it captures pre-phase and post-phase
@@ -345,6 +422,30 @@ Typical root causes:
 - route or next-hop prewarm missing
 - fabric-ingress continuity not preserved
 
+### Fabric TX is present but throughput is still poor
+
+Meaning:
+
+- redirect correctness is likely fine
+- the old owner is using the fabric path
+- the remaining issue is the quality of the copy-mode fabric dataplane
+
+Typical causes:
+
+- `virtio_net` fabric parent in copy mode
+- poor queue spread on the fabric parent
+- high retransmits on the redirected TCP streams
+
+Use `monitor interface ge-*-0-0` on the stale owner and check:
+
+- `Copy TX packets`
+- queue-level activity
+- `Binding errors`
+- recent exceptions
+
+If WAN egress on the standby stays flat while fabric TX rises, treat this as a
+performance issue, not a missing-redirect issue.
+
 ### external IPv4 or IPv6 fails while `.200` survives
 
 Meaning:
@@ -393,6 +494,36 @@ specific reason to override it. The hardened validator now reserves time for:
    - fabric TX delta not positive when old-owner churn exceeds the trigger
    - miss/deny deltas over threshold
 
+## Manual stale-owner workflow
+
+When a report says "traffic is still showing up on the standby WAN," use this
+workflow before assuming redirect is broken:
+
+```bash
+# 1. Force RG1 to node0 so node1 becomes the stale owner for LAN ingress.
+incus exec loss:bpfrx-userspace-fw1 -- \
+  bash -lc 'cli -c "request chassis cluster failover redundancy-group 1 node 0"'
+
+# 2. Watch both the standby WAN and the standby fabric parent.
+incus exec loss:bpfrx-userspace-fw1 -- \
+  bash -lc 'timeout 5 cli -c "monitor interface ge-7-0-2"'
+incus exec loss:bpfrx-userspace-fw1 -- \
+  bash -lc 'timeout 5 cli -c "monitor interface ge-7-0-0"'
+
+# 3. Drive traffic from the LAN host.
+incus exec loss:cluster-userspace-host -- \
+  bash -lc 'ping -c 5 172.16.80.200 >/dev/null && iperf3 -J -c 172.16.80.200 -P 4 -t 5'
+```
+
+Read the result like this:
+
+- `ge-7-0-0` TX rises, `ge-7-0-2` TX flat:
+  - redirect is working
+- `ge-7-0-2` TX rises materially while RG1 is inactive there:
+  - real standby WAN leak / owner-state bug
+- `ge-7-0-0` TX rises but bitrate is low and retransmits are high:
+  - copy-mode fabric path is the bottleneck
+
 ## Artifact files worth checking first
 
 For each phase:
@@ -414,3 +545,9 @@ Those are the first files to compare when a phase reports:
 - policy deny spikes
 - unexpected session or neighbor churn
 - external IPv4 or IPv6 loss
+
+For stale-owner performance analysis, also capture:
+
+- one `monitor interface ge-*-0-0` sample on the stale owner
+- one `monitor interface ge-*-0-2` sample on the stale owner
+- the `iperf3` JSON so retransmits can be compared against the fabric counters

@@ -66,8 +66,9 @@ mod tx;
 #[cfg(test)]
 use self::bind::bind_flag_candidates_for_driver;
 use self::bind::{
-    AfXdpBindStrategy, binding_frame_count, ifinfo_from_binding, interface_driver_name,
-    open_binding_worker_rings, preferred_bind_strategy, reserved_tx_frames, umem_ring_size,
+    AfXdpBindStrategy, binding_frame_count_for_driver, ifinfo_from_binding,
+    interface_driver_name, open_binding_worker_rings, preferred_bind_strategy,
+    reserved_tx_frames_for_driver, umem_ring_size,
 };
 #[cfg(test)]
 use self::bind::{
@@ -99,7 +100,7 @@ const UMEM_FRAME_SIZE: u32 = 4096;
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 256;
 const MIN_RESERVED_TX_FRAMES: u32 = 256;
-const MAX_RESERVED_TX_FRAMES: u32 = 4096;
+const MAX_RESERVED_TX_FRAMES: u32 = 8192;
 const TX_BATCH_SIZE: usize = 256;
 const PENDING_TX_LIMIT_MULTIPLIER: usize = 2;
 const FILL_BATCH_SIZE: usize = 1024;
@@ -2138,6 +2139,7 @@ struct BindingIdentity {
 pub(super) struct WorkerBindingLookup {
     by_if_queue: FastMap<(i32, u32), usize>,
     first_by_if: FastMap<i32, usize>,
+    all_by_if: FastMap<i32, Vec<usize>>,
     by_slot: FastMap<u32, usize>,
 }
 
@@ -2149,6 +2151,11 @@ impl WorkerBindingLookup {
                 .by_if_queue
                 .insert((binding.ifindex, binding.queue_id), index);
             lookup.first_by_if.entry(binding.ifindex).or_insert(index);
+            lookup
+                .all_by_if
+                .entry(binding.ifindex)
+                .or_default()
+                .push(index);
             lookup.by_slot.insert(binding.slot, index);
         }
         lookup
@@ -2173,6 +2180,55 @@ impl WorkerBindingLookup {
     fn slot_index(&self, slot: u32) -> Option<usize> {
         self.by_slot.get(&slot).copied()
     }
+
+    fn fabric_target_index(&self, egress_ifindex: i32, flow_hash: u64) -> Option<usize> {
+        let indices = self.all_by_if.get(&egress_ifindex)?;
+        if indices.is_empty() {
+            return None;
+        }
+        Some(indices[(flow_hash as usize) % indices.len()])
+    }
+}
+
+fn fabric_queue_hash(
+    flow: Option<&SessionFlow>,
+    expected_ports: Option<(u16, u16)>,
+    meta: UserspaceDpMeta,
+) -> u64 {
+    fn mix(seed: &mut u64, value: u64) {
+        *seed ^= value
+            .wrapping_add(0x9e3779b97f4a7c15)
+            .wrapping_add(*seed << 6)
+            .wrapping_add(*seed >> 2);
+    }
+
+    let mut seed = meta.protocol as u64;
+    if let Some(flow) = flow {
+        match flow.src_ip {
+            IpAddr::V4(ip) => mix(&mut seed, u32::from(ip) as u64),
+            IpAddr::V6(ip) => {
+                for chunk in ip.octets().chunks_exact(8) {
+                    mix(&mut seed, u64::from_be_bytes(chunk.try_into().unwrap()));
+                }
+            }
+        }
+        match flow.dst_ip {
+            IpAddr::V4(ip) => mix(&mut seed, u32::from(ip) as u64),
+            IpAddr::V6(ip) => {
+                for chunk in ip.octets().chunks_exact(8) {
+                    mix(&mut seed, u64::from_be_bytes(chunk.try_into().unwrap()));
+                }
+            }
+        }
+        mix(&mut seed, flow.forward_key.src_port as u64);
+        mix(&mut seed, flow.forward_key.dst_port as u64);
+        return seed;
+    }
+    let (src_port, dst_port) =
+        expected_ports.unwrap_or((meta.flow_src_port, meta.flow_dst_port));
+    mix(&mut seed, src_port as u64);
+    mix(&mut seed, dst_port as u64);
+    seed
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2312,9 +2368,10 @@ impl BindingWorker {
         frame_pool: &mut VecDeque<u64>,
         shared_umem: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let total_frames = binding_frame_count(ring_entries).max(1);
         let driver_name = interface_driver_name(&binding.interface);
-        let reserved_tx = reserved_tx_frames(ring_entries).min(total_frames);
+        let total_frames = binding_frame_count_for_driver(driver_name.as_deref(), ring_entries).max(1);
+        let reserved_tx =
+            reserved_tx_frames_for_driver(driver_name.as_deref(), ring_entries).min(total_frames);
         let mut reserved_tx_frames = VecDeque::with_capacity(reserved_tx as usize);
         for _ in 0..reserved_tx {
             let Some(offset) = frame_pool.pop_front() else {
@@ -5131,16 +5188,25 @@ fn build_live_forward_request_from_frame(
     } else {
         resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
     };
-    let target_binding_index = binding_lookup.target_index(
-        current_binding_index,
-        ingress_ident.ifindex,
-        ingress_ident.queue_id,
-        target_ifindex,
-    );
     // Prefer session flow ports (set by conntrack, immune to DMA races),
     // then live frame ports (lazy — only parsed if session ports unavailable),
     // then metadata as last resort.
     let expected_ports = authoritative_forward_ports(frame, meta, flow);
+    let target_binding_index = if decision.resolution.disposition
+        == ForwardingDisposition::FabricRedirect
+    {
+        binding_lookup.fabric_target_index(
+            target_ifindex,
+            fabric_queue_hash(flow, expected_ports, meta),
+        )
+    } else {
+        binding_lookup.target_index(
+            current_binding_index,
+            ingress_ident.ifindex,
+            ingress_ident.queue_id,
+            target_ifindex,
+        )
+    };
     let mut decision = *decision;
     if decision.resolution.disposition == ForwardingDisposition::FabricRedirect
         && let Some(ingress_zone) = fabric_ingress_zone
@@ -5681,7 +5747,9 @@ fn worker_loop(
     sessions.set_timeouts(forwarding.session_timeouts);
     let mut bindings = Vec::with_capacity(binding_plans.len());
     for plan in binding_plans {
-        let total_frames = binding_frame_count(plan.ring_entries).max(1);
+        let driver_name = interface_driver_name(&plan.status.interface);
+        let total_frames =
+            binding_frame_count_for_driver(driver_name.as_deref(), plan.ring_entries).max(1);
         let binding = match WorkerUmemPool::new(total_frames)
             .map_err(|err| format!("create binding umem: {err}"))
         {
@@ -10819,10 +10887,25 @@ mod tests {
         lookup.by_if_queue.insert((5, 0), 0);
         lookup.by_if_queue.insert((5, 1), 1);
         lookup.first_by_if.insert(5, 0);
+        lookup.all_by_if.insert(5, vec![0, 1]);
 
         assert_eq!(lookup.target_index(2, 7, 1, 5), Some(1));
         assert_eq!(lookup.target_index(2, 7, 3, 5), Some(0));
         assert_eq!(lookup.target_index(2, 5, 1, 5), Some(2));
+    }
+
+    #[test]
+    fn worker_binding_lookup_hashes_fabric_target_across_queues() {
+        let mut lookup = WorkerBindingLookup::default();
+        lookup.all_by_if.insert(5, vec![10, 11, 12, 13]);
+
+        let indices = [
+            lookup.fabric_target_index(5, 0),
+            lookup.fabric_target_index(5, 1),
+            lookup.fabric_target_index(5, 2),
+            lookup.fabric_target_index(5, 3),
+        ];
+        assert_eq!(indices, [Some(10), Some(11), Some(12), Some(13)]);
     }
 
     #[test]
@@ -14080,6 +14163,14 @@ mod tests {
         checksum16_ipv4(src, dst, PROTO_TCP, &packet[ihl..]) == 0
     }
 
+    fn tcp_ports_ipv4(packet: &[u8]) -> (u16, u16) {
+        let ihl = usize::from(packet[0] & 0x0f) * 4;
+        (
+            u16::from_be_bytes([packet[ihl], packet[ihl + 1]]),
+            u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]),
+        )
+    }
+
     fn icmpv6_checksum_ok(packet: &[u8]) -> bool {
         let src = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).expect("src"));
         let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).expect("dst"));
@@ -14505,6 +14596,46 @@ mod tests {
         assert!(repaired);
         assert_eq!(tcp_ports_ipv6(&frame[18..]), (54688, 5201));
         assert!(tcp_checksum_ok_ipv6(&frame[18..]));
+    }
+
+    #[test]
+    fn enforce_expected_ports_repairs_ipv4_tcp_ports_and_checksum() {
+        let src_ip = Ipv4Addr::new(172, 16, 80, 8);
+        let dst_ip = Ipv4Addr::new(172, 16, 80, 200);
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+            [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+            80,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x34, 0x00, 0x01, 0x00, 0x00, 63, PROTO_TCP, 0x00, 0x00,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&[
+            0x04, 0x01, 0x14, 0x51, // wrong src port 1025 -> 54688
+            0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
+            0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+        ]);
+        let ip_sum = checksum16(&frame[18..38]);
+        frame[28] = (ip_sum >> 8) as u8;
+        frame[29] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut frame[18..], 20, PROTO_TCP, true).expect("initial checksum");
+        assert!(tcp_checksum_ok_ipv4(&frame[18..]));
+
+        let repaired = enforce_expected_ports(
+            &mut frame,
+            libc::AF_INET as u8,
+            PROTO_TCP,
+            Some((54688, 5201)),
+        )
+        .expect("repair");
+        assert!(repaired);
+        assert_eq!(tcp_ports_ipv4(&frame[18..]), (54688, 5201));
+        assert!(tcp_checksum_ok_ipv4(&frame[18..]));
     }
 
     #[test]

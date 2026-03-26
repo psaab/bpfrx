@@ -173,3 +173,46 @@ scripts/userspace-native-gre-validation.sh --iperf --udp --traceroute
 This catches GRE-specific regressions without mixing them into normal WAN
 forwarding measurements. See [native-gre.md](native-gre.md) for the full GRE
 test matrix.
+
+## Test 8: Stale-Owner Fabric Throughput
+
+Use this when RG ownership is intentionally split and you need to measure the
+old-owner fabric redirect path, not the normal local-owner dataplane.
+
+Example workflow:
+
+```bash
+# Make node0 own RG1 so node1 becomes the stale owner for LAN ingress.
+incus exec loss:bpfrx-userspace-fw1 -- \
+  bash -lc 'cli -c "request chassis cluster failover redundancy-group 1 node 0"'
+
+# Warm the target, then measure from cluster-userspace-host.
+incus exec loss:cluster-userspace-host -- \
+  bash -lc 'ping -c 5 172.16.80.200 >/dev/null && iperf3 -J -c 172.16.80.200 -P 4 -t 5'
+```
+
+At the same time, inspect the standby old owner:
+
+```bash
+incus exec loss:bpfrx-userspace-fw1 -- \
+  bash -lc 'timeout 5 cli -c "monitor interface ge-7-0-0"'
+incus exec loss:bpfrx-userspace-fw1 -- \
+  bash -lc 'timeout 5 cli -c "monitor interface ge-7-0-2"'
+```
+
+What to look for:
+
+- fabric parent `ge-7-0-0` / `fab1` carries the traffic
+- standby WAN `ge-7-0-2` stays flat
+- queue spread on the fabric parent is healthy
+- retransmits stay bounded
+
+Current lab reality:
+
+- the userspace stale-owner path does redirect correctly across fabric
+- the fabric parent is `virtio_net` in copy mode
+- so stale-owner throughput is materially lower than the steady local-owner
+  `mlx5` dataplane path
+
+Treat this as a separate benchmark class. Do not compare stale-owner fabric
+numbers directly to normal `.200` / `::200` steady-state throughput.

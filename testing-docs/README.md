@@ -42,7 +42,8 @@ scripts/userspace-native-gre-validation.sh   # Native GRE transit/failover
 
 For userspace RG-move failover specifically, use
 [userspace-fabric-failover.md](userspace-fabric-failover.md) as the reference
-for the hardened acceptance bar and artifact interpretation.
+for the hardened acceptance bar, stale-owner fabric workflow, and artifact
+interpretation.
 
 ## Operational Notes
 
@@ -64,6 +65,14 @@ BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
   you need captures from the remote endpoint, use the gRPC capture service
   documented in `~/README.md` (`capture-client` / `grpcurl`), not ad-hoc
   `tcpdump` assumptions on unrelated lab hosts.
+- For userspace split-RG failover, `monitor interface <fabric-parent>` is now a
+  required live-debug tool, not just a convenience command. It exposes the
+  userspace binding state, queue readiness, direct/copy/in-place TX, misses,
+  policy denies, binding errors, and recent exceptions for a single interface.
+  Use it during RG moves to distinguish:
+  - "traffic never hit the old owner"
+  - "traffic hit the old owner and redirected across fabric"
+  - "traffic hit the old owner but died on the copy-mode fabric path"
 
 ## Test Environment Topology
 
