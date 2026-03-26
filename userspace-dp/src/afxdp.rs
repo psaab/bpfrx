@@ -7213,7 +7213,12 @@ fn parse_neighbor_msg(
     };
     match nlmsg_type {
         28 => {
-            if state & 0x1e == 0 {
+            // Treat INCOMPLETE (0x01) and FAILED (0x20) as unusable;
+            // everything else (REACHABLE, STALE, DELAY, PROBE,
+            // PERMANENT, NOARP) is a valid resolved neighbor.
+            const NUD_INCOMPLETE: u16 = 0x01;
+            const NUD_FAILED: u16 = 0x20;
+            if (state & (NUD_INCOMPLETE | NUD_FAILED)) != 0 {
                 return remove_dynamic_neighbor(dynamic_neighbors, ifindex, ip);
             }
             let Some(mac) = mac else {

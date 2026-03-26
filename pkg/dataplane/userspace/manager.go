@@ -4432,8 +4432,9 @@ func (m *Manager) proactiveNeighborResolveAsyncLocked() {
 	targetSet := make(map[string]struct{})
 	var targets []struct{ iface, ip string }
 	for ifName, ifc := range m.lastSnapshot.Config.Interfaces.Interfaces {
+		base := config.LinuxIfName(ifName)
+		seen[base] = true // include base interface for route-GW probing
 		for _, unit := range ifc.Units {
-			base := config.LinuxIfName(ifName)
 			linuxName := base
 			if unit.VlanID > 0 {
 				linuxName = fmt.Sprintf("%s.%d", base, unit.VlanID)

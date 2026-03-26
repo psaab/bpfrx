@@ -1357,12 +1357,13 @@ fn handle_stream(
                         }
                         same
                     });
-                    guard.snapshot = Some(snapshot.clone());
                     if same_plan {
                         guard.afxdp.refresh_runtime_snapshot(&snapshot);
+                        guard.snapshot = Some(snapshot);
                         refresh_status(&mut guard);
                         persist_state = true;
                     } else {
+                        guard.snapshot = Some(snapshot);
                         let replanned = replan_queues(
                             guard.snapshot.as_ref(),
                             guard.status.workers,
@@ -1902,6 +1903,7 @@ fn bindings_settled(bindings: &[BindingStatus]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn same_binding_plan(current: &ConfigSnapshot, next: &ConfigSnapshot) -> bool {
     snapshot_binding_plan_key(current) == snapshot_binding_plan_key(next)
 }

@@ -296,13 +296,17 @@ check_external_ping() {
 	local path remote_path
 	path="$(external_ping_path "${label}")"
 	remote_path="/tmp/userspace-rg${RG}-${label}.txt"
+	local escaped_target escaped_count escaped_remote_path
+	escaped_target=$(printf '%q' "${target}")
+	escaped_count=$(printf '%q' "${EXTERNAL_PING_COUNT}")
+	escaped_remote_path=$(printf '%q' "${remote_path}")
 	if [[ "$family" == "6" ]]; then
-		run_host "ping -6 -c ${EXTERNAL_PING_COUNT} -W 1 ${target} >${remote_path} 2>&1 || true"
+		run_host "ping -6 -c ${escaped_count} -W 1 ${escaped_target} >${escaped_remote_path} 2>&1 || true"
 	else
-		run_host "ping -c ${EXTERNAL_PING_COUNT} -W 1 ${target} >${remote_path} 2>&1 || true"
+		run_host "ping -c ${escaped_count} -W 1 ${escaped_target} >${escaped_remote_path} 2>&1 || true"
 	fi
-	run_host "cat ${remote_path} 2>/dev/null || true" >"${path}"
-	run_host "grep -q 'bytes from' ${remote_path}"
+	run_host "cat ${escaped_remote_path} 2>/dev/null || true" >"${path}"
+	run_host "grep -q 'bytes from' ${escaped_remote_path}"
 }
 
 validate_external_connectivity() {
