@@ -10,6 +10,7 @@ dataplane and the userspace AF_XDP dataplane.
 | [unit-tests.md](unit-tests.md) | Go + Rust unit tests | `make test` + `cargo test` |
 | [standalone-vm.md](standalone-vm.md) | Single-VM forwarding, NAT, policy | `make test-deploy` |
 | [ha-cluster.md](ha-cluster.md) | HA failover, crash recovery, session sync | `make test-failover` |
+| [userspace-fabric-failover.md](userspace-fabric-failover.md) | Userspace RG move across fabric, failover hardening, artifact interpretation | `scripts/userspace-ha-failover-validation.sh` |
 | [userspace-dataplane.md](userspace-dataplane.md) | AF_XDP forwarding, cold start, neighbor resolution | Manual + scripts |
 | [native-gre.md](native-gre.md) | Native GRE transit, failover, host-origin validation | `scripts/userspace-native-gre-validation.sh` |
 | [performance.md](performance.md) | Throughput, latency, perf profiling | `scripts/userspace-perf-compare.sh` |
@@ -38,6 +39,10 @@ scripts/userspace-ha-validation.sh           # Full validation suite
 scripts/userspace-ha-failover-validation.sh  # Failover-specific
 scripts/userspace-native-gre-validation.sh   # Native GRE transit/failover
 ```
+
+For userspace RG-move failover specifically, use
+[userspace-fabric-failover.md](userspace-fabric-failover.md) as the reference
+for the hardened acceptance bar and artifact interpretation.
 
 ## Operational Notes
 

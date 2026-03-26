@@ -143,8 +143,19 @@ Tests:
 - RG ownership move and userspace arm on the new owner
 - pre-failover and post-failover `iperf3` continuity
 - external IPv4/IPv6 reachability during steady state and after each failover/failback phase
+- immediate `.200` target reachability after each phase
+- proof that the old owner actually transmitted on the fabric path
+- bounded session/neighbor/route/policy deltas during each move
+- standby helper readiness on the old owner after each move
 - zero-interval and retransmit collapse detection
 - session pickup on both nodes
+
+Use [userspace-fabric-failover.md](userspace-fabric-failover.md) for the
+phase-level acceptance bar, thresholds, and artifact interpretation.
+
+For multi-cycle runs, prefer letting the script pick the duration from the
+cycle count. The hardened validator now rejects too-short runs up front instead
+of misreporting them as mid-cycle `iperf3` completion failures.
 
 ### Native GRE Validation
 
@@ -186,6 +197,8 @@ After any HA code change, verify:
 - [ ] Session sync count > 0 after establishing flows
 - [ ] Ping 172.16.80.200 / 2001:559:8585:80::200 from host — 0% loss
 - [ ] `scripts/userspace-ha-validation.sh` passes with current thresholds
+- [ ] `scripts/userspace-ha-failover-validation.sh` shows positive fabric TX delta on the old owner for each RG move
+- [ ] `scripts/userspace-ha-failover-validation.sh` keeps session/neighbor/route/policy deltas within threshold during each RG move
 - [ ] `iperf3 -P 8` does not collapse to zero on any stream
 - [ ] mtr shows intermediate hops (embedded ICMP NAT reversal)
 - [ ] After `systemctl restart bpfrxd` on primary: connectivity recovers within 40s

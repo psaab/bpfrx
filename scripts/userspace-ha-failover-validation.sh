@@ -14,9 +14,12 @@ EXTERNAL_V6_TARGET="${EXTERNAL_V6_TARGET:-2606:4700:4700::1111}"
 EXTERNAL_PING_COUNT="${EXTERNAL_PING_COUNT:-4}"
 TOTAL_CYCLES="${TOTAL_CYCLES:-1}"
 CYCLE_INTERVAL="${CYCLE_INTERVAL:-10}"
+SYNC_WAIT="${SYNC_WAIT:-5}"
+FAILOVER_WAIT="${FAILOVER_WAIT:-30}"
+PRE_FAILOVER_OBSERVE="${PRE_FAILOVER_OBSERVE:-10}"
 if [[ -z "${IPERF_DURATION:-}" ]]; then
 	if (( TOTAL_CYCLES > 1 )); then
-		IPERF_DURATION="$(( TOTAL_CYCLES * CYCLE_INTERVAL * 2 + 30 ))"
+		IPERF_DURATION="$(( PRE_FAILOVER_OBSERVE + SYNC_WAIT + TOTAL_CYCLES * (CYCLE_INTERVAL * 2 + FAILOVER_WAIT) + 20 ))"
 	else
 		IPERF_DURATION=60
 	fi
@@ -24,15 +27,20 @@ else
 	IPERF_DURATION="${IPERF_DURATION}"
 fi
 IPERF_STREAMS="${IPERF_STREAMS:-4}"
-SYNC_WAIT="${SYNC_WAIT:-5}"
-FAILOVER_WAIT="${FAILOVER_WAIT:-30}"
-PRE_FAILOVER_OBSERVE="${PRE_FAILOVER_OBSERVE:-10}"
 MIN_SESSIONS="${MIN_SESSIONS:-4}"
 MIN_THROUGHPUT="${MIN_THROUGHPUT:-1.0}"
 MAX_ZERO_INTERVALS="${MAX_ZERO_INTERVALS:-2}"
 MAX_STREAM_ZERO_INTERVALS="${MAX_STREAM_ZERO_INTERVALS:-0}"
 MAX_PREFLIGHT_ZERO_INTERVALS="${MAX_PREFLIGHT_ZERO_INTERVALS:-0}"
 MAX_PREFLIGHT_STREAM_ZERO_INTERVALS="${MAX_PREFLIGHT_STREAM_ZERO_INTERVALS:-0}"
+REQUIRE_FABRIC_ACTIVITY="${REQUIRE_FABRIC_ACTIVITY:-1}"
+REQUIRE_STANDBY_READY="${REQUIRE_STANDBY_READY:-1}"
+MIN_FABRIC_TX_DELTA="${MIN_FABRIC_TX_DELTA:-1}"
+FABRIC_ACTIVITY_TRIGGER_DELTA="${FABRIC_ACTIVITY_TRIGGER_DELTA:-8}"
+MAX_FAILOVER_SESSION_MISS_DELTA="${MAX_FAILOVER_SESSION_MISS_DELTA:-64}"
+MAX_FAILOVER_NEIGHBOR_MISS_DELTA="${MAX_FAILOVER_NEIGHBOR_MISS_DELTA:-20}"
+MAX_FAILOVER_ROUTE_MISS_DELTA="${MAX_FAILOVER_ROUTE_MISS_DELTA:-32}"
+MAX_FAILOVER_POLICY_DENIED_DELTA="${MAX_FAILOVER_POLICY_DENIED_DELTA:-0}"
 MAX_RETRANSMITS="${MAX_RETRANSMITS:-}"
 MAX_RETRANSMITS_PER_GBPS="${MAX_RETRANSMITS_PER_GBPS:-}"
 POST_FAILOVER_OBSERVE="${POST_FAILOVER_OBSERVE:-10}"
@@ -92,7 +100,7 @@ required_iperf_duration() {
 		return 0
 	fi
 	if (( cycles > 1 )); then
-		printf '%s\n' "$(( cycles * interval * 2 + cycles * 10 + SYNC_WAIT + 20 ))"
+		printf '%s\n' "$(( PRE_FAILOVER_OBSERVE + SYNC_WAIT + cycles * (interval * 2 + FAILOVER_WAIT) + 20 ))"
 	else
 		printf '%s\n' "$(( POST_FAILOVER_OBSERVE + SYNC_WAIT + 10 ))"
 	fi
@@ -231,6 +239,7 @@ capture_vm_state() {
 	local label="$2"
 	run_vm "$vm" 'cli -c "show chassis cluster status"' >"${ARTIFACT_DIR}/${label}-status.txt" 2>&1 || true
 	run_vm "$vm" 'cli -c "show chassis cluster data-plane statistics"' >"${ARTIFACT_DIR}/${label}-dp-stats.txt" 2>&1 || true
+	run_vm "$vm" 'cli -c "show chassis cluster data-plane interfaces"' >"${ARTIFACT_DIR}/${label}-dp-interfaces.txt" 2>&1 || true
 	run_vm "$vm" "cli -c \"show security flow session destination-prefix ${IPERF_TARGET}\"" >"${ARTIFACT_DIR}/${label}-sessions.txt" 2>&1 || true
 }
 
@@ -239,6 +248,212 @@ capture_cycle_state() {
 	local phase="$2"
 	capture_vm_state "$FW0" "cycle${cycle}-${phase}-fw0"
 	capture_vm_state "$FW1" "cycle${cycle}-${phase}-fw1"
+}
+
+vm_artifact_suffix() {
+	case "$1" in
+	"$FW0") printf 'fw0\n' ;;
+	"$FW1") printf 'fw1\n' ;;
+	*) die "unsupported vm for artifact path: $1" ;;
+	esac
+}
+
+cycle_stats_path() {
+	local cycle="$1"
+	local phase="$2"
+	local vm="$3"
+	printf '%s/cycle%s-%s-%s-dp-stats.txt\n' "${ARTIFACT_DIR}" "${cycle}" "${phase}" "$(vm_artifact_suffix "$vm")"
+}
+
+cycle_interfaces_path() {
+	local cycle="$1"
+	local phase="$2"
+	local vm="$3"
+	printf '%s/cycle%s-%s-%s-dp-interfaces.txt\n' "${ARTIFACT_DIR}" "${cycle}" "${phase}" "$(vm_artifact_suffix "$vm")"
+}
+
+status_summary_value() {
+	local path="$1"
+	local label="$2"
+	python3 - "$path" "$label" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+label = sys.argv[2]
+if not path.exists():
+    print("0")
+    raise SystemExit(0)
+
+pattern = f"  {label}:"
+for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    if not line.startswith(pattern):
+        continue
+    match = re.search(r"(-?\d+)", line.split(":", 1)[1])
+    print(match.group(1) if match else "0")
+    break
+else:
+    print("0")
+PY
+}
+
+status_fabric_tx_packets() {
+	local path="$1"
+	python3 - "$path" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    print("0")
+    raise SystemExit(0)
+
+parents = set()
+total = 0
+section = None
+skip_header = False
+
+for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    line = raw_line.rstrip("\n")
+    stripped = line.strip()
+    if line.strip() == "Userspace fabric links:":
+        section = "fabric"
+        skip_header = True
+        continue
+    if line.strip() == "Userspace bindings:":
+        section = "bindings"
+        skip_header = True
+        continue
+    if section and not stripped:
+        section = None
+        skip_header = False
+        continue
+    if skip_header:
+        skip_header = False
+        continue
+    if section == "fabric":
+        parts = stripped.split()
+        if len(parts) >= 2:
+            parents.add(parts[1])
+        continue
+    if section == "bindings":
+        parts = stripped.split()
+        if len(parts) < 20:
+            continue
+        interface = parts[19]
+        if interface in parents:
+            try:
+                total += int(parts[11])
+            except ValueError:
+                pass
+
+print(total)
+PY
+}
+
+standby_userspace_ready_vm() {
+	local vm="$1"
+	local rg="$2"
+	local stats
+	stats="$(run_vm "$vm" 'cli -c "show chassis cluster data-plane statistics"' 2>/dev/null || true)"
+	grep -Eq 'Enabled:[[:space:]]+true' <<<"$stats" &&
+		grep -Eq 'Forwarding armed:[[:space:]]+true' <<<"$stats" &&
+		grep -Eq "rg${rg} active=false" <<<"$stats" &&
+		grep -Eq 'Ready bindings:[[:space:]]+[1-9][0-9]*/[0-9]+' <<<"$stats"
+}
+
+validate_target_connectivity() {
+	local label="$1"
+	if validate_target_reachability; then
+		pass "${label}: target ${IPERF_TARGET} reachable"
+	else
+		fail "${label}: target ${IPERF_TARGET} unreachable"
+	fi
+}
+
+validate_phase_fabric_path() {
+	local cycle="$1"
+	local phase="$2"
+	local from_vm="$3"
+	local from_name="$4"
+	local to_vm="$5"
+	local to_name="$6"
+	local from_pre from_post to_pre to_post
+	local from_if_pre from_if_post
+	local from_fabric_pre from_fabric_post from_fabric_delta
+	local from_session_delta to_session_delta session_delta
+	local from_neighbor_delta to_neighbor_delta neighbor_delta
+	local from_route_delta to_route_delta route_delta
+	local from_policy_delta to_policy_delta policy_delta
+	local from_churn
+
+	from_pre="$(cycle_stats_path "$cycle" "${phase}-pre" "$from_vm")"
+	from_post="$(cycle_stats_path "$cycle" "${phase}-post" "$from_vm")"
+	to_pre="$(cycle_stats_path "$cycle" "${phase}-pre" "$to_vm")"
+	to_post="$(cycle_stats_path "$cycle" "${phase}-post" "$to_vm")"
+	from_if_pre="$(cycle_interfaces_path "$cycle" "${phase}-pre" "$from_vm")"
+	from_if_post="$(cycle_interfaces_path "$cycle" "${phase}-post" "$from_vm")"
+
+	from_fabric_pre="$(status_fabric_tx_packets "$from_if_pre")"
+	from_fabric_post="$(status_fabric_tx_packets "$from_if_post")"
+	from_fabric_delta=$(( from_fabric_post - from_fabric_pre ))
+	from_session_delta=$(( $(status_summary_value "$from_post" "Session misses") - $(status_summary_value "$from_pre" "Session misses") ))
+	to_session_delta=$(( $(status_summary_value "$to_post" "Session misses") - $(status_summary_value "$to_pre" "Session misses") ))
+	session_delta=$(( from_session_delta + to_session_delta ))
+	if (( session_delta <= MAX_FAILOVER_SESSION_MISS_DELTA )); then
+		pass "cycle ${cycle} ${phase}: session miss delta ${session_delta} (source=${from_session_delta} target=${to_session_delta})"
+	else
+		fail "cycle ${cycle} ${phase}: session miss delta ${session_delta} (source=${from_session_delta} target=${to_session_delta}) exceeds ${MAX_FAILOVER_SESSION_MISS_DELTA}"
+	fi
+
+	from_neighbor_delta=$(( $(status_summary_value "$from_post" "Neighbor misses") - $(status_summary_value "$from_pre" "Neighbor misses") ))
+	to_neighbor_delta=$(( $(status_summary_value "$to_post" "Neighbor misses") - $(status_summary_value "$to_pre" "Neighbor misses") ))
+	neighbor_delta=$(( from_neighbor_delta + to_neighbor_delta ))
+	if (( neighbor_delta <= MAX_FAILOVER_NEIGHBOR_MISS_DELTA )); then
+		pass "cycle ${cycle} ${phase}: neighbor miss delta ${neighbor_delta} (source=${from_neighbor_delta} target=${to_neighbor_delta})"
+	else
+		fail "cycle ${cycle} ${phase}: neighbor miss delta ${neighbor_delta} (source=${from_neighbor_delta} target=${to_neighbor_delta}) exceeds ${MAX_FAILOVER_NEIGHBOR_MISS_DELTA}"
+	fi
+
+	from_route_delta=$(( $(status_summary_value "$from_post" "Route misses") - $(status_summary_value "$from_pre" "Route misses") ))
+	to_route_delta=$(( $(status_summary_value "$to_post" "Route misses") - $(status_summary_value "$to_pre" "Route misses") ))
+	route_delta=$(( from_route_delta + to_route_delta ))
+	if (( route_delta <= MAX_FAILOVER_ROUTE_MISS_DELTA )); then
+		pass "cycle ${cycle} ${phase}: route miss delta ${route_delta} (source=${from_route_delta} target=${to_route_delta})"
+	else
+		fail "cycle ${cycle} ${phase}: route miss delta ${route_delta} (source=${from_route_delta} target=${to_route_delta}) exceeds ${MAX_FAILOVER_ROUTE_MISS_DELTA}"
+	fi
+
+	from_policy_delta=$(( $(status_summary_value "$from_post" "Policy denied packets") - $(status_summary_value "$from_pre" "Policy denied packets") ))
+	to_policy_delta=$(( $(status_summary_value "$to_post" "Policy denied packets") - $(status_summary_value "$to_pre" "Policy denied packets") ))
+	policy_delta=$(( from_policy_delta + to_policy_delta ))
+	if (( policy_delta <= MAX_FAILOVER_POLICY_DENIED_DELTA )); then
+		pass "cycle ${cycle} ${phase}: policy denied delta ${policy_delta} (source=${from_policy_delta} target=${to_policy_delta})"
+	else
+		fail "cycle ${cycle} ${phase}: policy denied delta ${policy_delta} (source=${from_policy_delta} target=${to_policy_delta}) exceeds ${MAX_FAILOVER_POLICY_DENIED_DELTA}"
+	fi
+
+	from_churn=$(( from_session_delta + from_neighbor_delta + from_route_delta + from_policy_delta ))
+	if [[ "${REQUIRE_FABRIC_ACTIVITY}" == "1" ]]; then
+		if (( from_fabric_delta >= MIN_FABRIC_TX_DELTA )); then
+			pass "cycle ${cycle} ${phase}: ${from_name} fabric TX delta ${from_fabric_delta}"
+		elif (( from_churn >= FABRIC_ACTIVITY_TRIGGER_DELTA )); then
+			fail "cycle ${cycle} ${phase}: ${from_name} fabric TX delta ${from_fabric_delta} with old-owner churn ${from_churn} (>= ${FABRIC_ACTIVITY_TRIGGER_DELTA})"
+		else
+			pass "cycle ${cycle} ${phase}: ${from_name} fabric TX delta ${from_fabric_delta}; old-owner churn ${from_churn} below trigger ${FABRIC_ACTIVITY_TRIGGER_DELTA}"
+		fi
+	else
+		pass "cycle ${cycle} ${phase}: ${from_name} fabric TX delta ${from_fabric_delta}"
+	fi
+
+	if [[ "${REQUIRE_STANDBY_READY}" == "1" ]]; then
+		if standby_userspace_ready_vm "$from_vm" "$RG"; then
+			pass "cycle ${cycle} ${phase}: standby ${from_name} remained armed with ready bindings"
+		else
+			fail "cycle ${cycle} ${phase}: standby ${from_name} lost userspace readiness"
+		fi
+	fi
 }
 
 zero_port_tcp_sessions() {
@@ -654,20 +869,26 @@ run_failover_phase() {
 	from_vm="$(vm_for_node "$from_node")"
 	to_vm="$(vm_for_node "$to_node")"
 	to_name="$(node_name "$to_node")"
+	local from_name
+	from_name="$(node_name "$from_node")"
 
 	info "cycle ${cycle}: ${phase} RG${RG} to ${to_name}"
+	capture_cycle_state "$cycle" "${phase}-pre"
 	run_vm "$from_vm" "cli -c \"request chassis cluster failover redundancy-group ${RG} node ${to_node}\" >/tmp/userspace-rg${RG}-${phase}-cycle${cycle}.out"
 	wait_for_rg_owner "$RG" "$to_node" "$FAILOVER_WAIT" || die "RG${RG} did not move to ${to_name} during cycle ${cycle} ${phase}"
 	pass "cycle ${cycle} ${phase}: RG${RG} moved to ${to_name}"
 	ACTIVE_FW="$(wait_for_userspace_rg_owner "$RG")" || die "userspace forwarding did not settle on ${to_name} during cycle ${cycle} ${phase}"
 	pass "cycle ${cycle} ${phase}: userspace forwarding active on ${ACTIVE_FW}"
 	capture_cycle_state "$cycle" "$phase"
+	validate_target_connectivity "cycle ${cycle} ${phase}"
 	validate_external_connectivity "cycle${cycle}-${phase}"
 	if ! cycle_sleep "$CYCLE_INTERVAL" "$final_phase"; then
 		fail "cycle ${cycle} ${phase}: iperf3 exited before ${CYCLE_INTERVAL}s interval elapsed"
 	fi
 	capture_cycle_state "$cycle" "${phase}-post"
 	validate_cycle_health "$cycle" "$phase" "$to_vm" "$to_name" "$final_phase"
+	validate_phase_fabric_path "$cycle" "$phase" "$from_vm" "$from_name" "$to_vm" "$to_name"
+	validate_target_connectivity "cycle ${cycle} ${phase} post"
 	validate_external_connectivity "cycle${cycle}-${phase}-post"
 }
 
