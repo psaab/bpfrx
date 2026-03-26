@@ -35,8 +35,8 @@ func TestFormatStatusSummary(t *testing.T) {
 			{QueueID: 1, Armed: false, Ready: false},
 		},
 		Bindings: []BindingStatus{
-			{Slot: 0, Armed: false, Ready: true, Bound: true, XSKRegistered: true, XSKBindMode: "zerocopy", ZeroCopy: true, RXPackets: 10, ValidatedPackets: 8, ExceptionPackets: 1, TXPackets: 3, TXBytes: 420, DirectTXPackets: 2, InPlaceTXPackets: 1},
-			{Slot: 1, Armed: false, Ready: false, Bound: true, XSKRegistered: false, RXPackets: 5, ValidatedPackets: 4, ExceptionPackets: 2, TXErrors: 1, CopyTXPackets: 4},
+			{Slot: 0, Armed: false, Ready: true, Bound: true, XSKRegistered: true, XSKBindMode: "zerocopy", ZeroCopy: true, RXPackets: 10, ValidatedPackets: 8, ExceptionPackets: 1, TXPackets: 3, TXBytes: 420, DirectTXPackets: 2, InPlaceTXPackets: 1, DirectTXNoFrameFallbackPackets: 5, DirectTXBuildFallbackPackets: 6},
+			{Slot: 1, Armed: false, Ready: false, Bound: true, XSKRegistered: false, RXPackets: 5, ValidatedPackets: 4, ExceptionPackets: 2, TXErrors: 1, CopyTXPackets: 4, DirectTXDisallowedFallbackPackets: 7},
 		},
 		RecentExceptions: []ExceptionStatus{
 			{Timestamp: now, Slot: 1, QueueID: 0, Interface: "ge-0-0-2", Reason: "metadata_parse", PacketLength: 128},
@@ -70,6 +70,9 @@ func TestFormatStatusSummary(t *testing.T) {
 		"Direct TX packets:         2",
 		"Copy-path TX packets:      4",
 		"In-place TX packets:       1",
+		"Direct TX no-frame fb:     5",
+		"Direct TX build-none fb:   6",
+		"Direct TX disallowed fb:   7",
 		"Recent exceptions:         1",
 		"Worker 0 heartbeat age:",
 	} {

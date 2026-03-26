@@ -876,6 +876,12 @@ struct BindingStatus {
     copy_tx_packets: u64,
     #[serde(rename = "in_place_tx_packets", default)]
     in_place_tx_packets: u64,
+    #[serde(rename = "direct_tx_no_frame_fallback_packets", default)]
+    direct_tx_no_frame_fallback_packets: u64,
+    #[serde(rename = "direct_tx_build_fallback_packets", default)]
+    direct_tx_build_fallback_packets: u64,
+    #[serde(rename = "direct_tx_disallowed_fallback_packets", default)]
+    direct_tx_disallowed_fallback_packets: u64,
     #[serde(rename = "last_heartbeat", skip_serializing_if = "Option::is_none")]
     last_heartbeat: Option<DateTime<Utc>>,
     #[serde(rename = "tx_completions", default)]

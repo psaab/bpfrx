@@ -46,31 +46,34 @@ type ifaceSnapshot struct {
 }
 
 type userspaceIfaceSnapshot struct {
-	statusNote          string
-	helperEnabled       bool
-	forwardingArmed     bool
-	neighborGeneration  uint64
-	lastSnapshotGen     uint64
-	bindings            int
-	readyBindings       int
-	boundBindings       int
-	xskRegistered       int
-	zeroCopyBindings    int
-	rxPackets           uint64
-	rxBytes             uint64
-	txPackets           uint64
-	txBytes             uint64
-	directTXPackets     uint64
-	copyTXPackets       uint64
-	inPlaceTXPackets    uint64
-	sessionMisses       uint64
-	neighborMissPackets uint64
-	routeMissPackets    uint64
-	policyDeniedPackets uint64
-	exceptionPackets    uint64
-	slowPathPackets     uint64
-	lastErrors          []string
-	recentExceptions    []string
+	statusNote                        string
+	helperEnabled                     bool
+	forwardingArmed                   bool
+	neighborGeneration                uint64
+	lastSnapshotGen                   uint64
+	bindings                          int
+	readyBindings                     int
+	boundBindings                     int
+	xskRegistered                     int
+	zeroCopyBindings                  int
+	rxPackets                         uint64
+	rxBytes                           uint64
+	txPackets                         uint64
+	txBytes                           uint64
+	directTXPackets                   uint64
+	copyTXPackets                     uint64
+	inPlaceTXPackets                  uint64
+	directTXNoFrameFallbackPackets    uint64
+	directTXBuildFallbackPackets      uint64
+	directTXDisallowedFallbackPackets uint64
+	sessionMisses                     uint64
+	neighborMissPackets               uint64
+	routeMissPackets                  uint64
+	policyDeniedPackets               uint64
+	exceptionPackets                  uint64
+	slowPathPackets                   uint64
+	lastErrors                        []string
+	recentExceptions                  []string
 }
 
 func aggregateUserspaceIfaceSnapshot(kernelName string, status dpuserspace.ProcessStatus) *userspaceIfaceSnapshot {
@@ -105,6 +108,9 @@ func aggregateUserspaceIfaceSnapshot(kernelName string, status dpuserspace.Proce
 		snap.directTXPackets += binding.DirectTXPackets
 		snap.copyTXPackets += binding.CopyTXPackets
 		snap.inPlaceTXPackets += binding.InPlaceTXPackets
+		snap.directTXNoFrameFallbackPackets += binding.DirectTXNoFrameFallbackPackets
+		snap.directTXBuildFallbackPackets += binding.DirectTXBuildFallbackPackets
+		snap.directTXDisallowedFallbackPackets += binding.DirectTXDisallowedFallbackPackets
 		snap.sessionMisses += binding.SessionMisses
 		snap.neighborMissPackets += binding.NeighborMissPackets
 		snap.routeMissPackets += binding.RouteMissPackets
@@ -467,11 +473,12 @@ func renderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 
 	if snap.userspace != nil {
 		var (
-			usRxBps, usTxBps, usRxPps, usTxPps                           uint64
-			usRxBytesDelta, usTxBytesDelta, usRxPktsDelta, usTxPktsDelta uint64
-			usDirectDelta, usCopyDelta, usInPlaceDelta                   uint64
-			usSessionMissDelta, usNeighborMissDelta, usRouteMissDelta    uint64
-			usPolicyDeniedDelta, usExceptionDelta, usSlowPathDelta       uint64
+			usRxBps, usTxBps, usRxPps, usTxPps                                uint64
+			usRxBytesDelta, usTxBytesDelta, usRxPktsDelta, usTxPktsDelta      uint64
+			usDirectDelta, usCopyDelta, usInPlaceDelta                        uint64
+			usDirectNoFrameDelta, usDirectBuildDelta, usDirectDisallowedDelta uint64
+			usSessionMissDelta, usNeighborMissDelta, usRouteMissDelta         uint64
+			usPolicyDeniedDelta, usExceptionDelta, usSlowPathDelta            uint64
 		)
 		if prev != nil && prev.userspace != nil {
 			dt := snap.ts.Sub(prev.ts).Seconds()
@@ -490,6 +497,9 @@ func renderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 			usDirectDelta = snap.userspace.directTXPackets - baseline.userspace.directTXPackets
 			usCopyDelta = snap.userspace.copyTXPackets - baseline.userspace.copyTXPackets
 			usInPlaceDelta = snap.userspace.inPlaceTXPackets - baseline.userspace.inPlaceTXPackets
+			usDirectNoFrameDelta = snap.userspace.directTXNoFrameFallbackPackets - baseline.userspace.directTXNoFrameFallbackPackets
+			usDirectBuildDelta = snap.userspace.directTXBuildFallbackPackets - baseline.userspace.directTXBuildFallbackPackets
+			usDirectDisallowedDelta = snap.userspace.directTXDisallowedFallbackPackets - baseline.userspace.directTXDisallowedFallbackPackets
 			usSessionMissDelta = snap.userspace.sessionMisses - baseline.userspace.sessionMisses
 			usNeighborMissDelta = snap.userspace.neighborMissPackets - baseline.userspace.neighborMissPackets
 			usRouteMissDelta = snap.userspace.routeMissPackets - baseline.userspace.routeMissPackets
@@ -513,6 +523,9 @@ func renderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 		fmt.Fprintf(w, "  Direct TX packets:    %20d          [%d]\n", snap.userspace.directTXPackets, usDirectDelta)
 		fmt.Fprintf(w, "  Copy TX packets:      %20d          [%d]\n", snap.userspace.copyTXPackets, usCopyDelta)
 		fmt.Fprintf(w, "  In-place TX packets:  %20d          [%d]\n", snap.userspace.inPlaceTXPackets, usInPlaceDelta)
+		fmt.Fprintf(w, "  Direct TX no-frame:   %20d          [%d]\n", snap.userspace.directTXNoFrameFallbackPackets, usDirectNoFrameDelta)
+		fmt.Fprintf(w, "  Direct TX build-none: %20d          [%d]\n", snap.userspace.directTXBuildFallbackPackets, usDirectBuildDelta)
+		fmt.Fprintf(w, "  Direct TX disallowed: %20d          [%d]\n", snap.userspace.directTXDisallowedFallbackPackets, usDirectDisallowedDelta)
 		fmt.Fprintf(w, "  Session misses:       %20d          [%d]\n", snap.userspace.sessionMisses, usSessionMissDelta)
 		fmt.Fprintf(w, "  Neighbor misses:      %20d          [%d]\n", snap.userspace.neighborMissPackets, usNeighborMissDelta)
 		fmt.Fprintf(w, "  Route misses:         %20d          [%d]\n", snap.userspace.routeMissPackets, usRouteMissDelta)
