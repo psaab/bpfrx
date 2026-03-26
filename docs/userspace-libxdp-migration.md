@@ -14,13 +14,13 @@ Important clarification:
 
 Current production files:
 
-- [xsk_ffi.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/xsk_ffi.rs)
-- [xsk_bridge.c](/home/ps/git/codex-bpfrx/userspace-dp/csrc/xsk_bridge.c)
-- [bind.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/bind.rs)
+- [xsk_ffi.rs](userspace-dp/src/xsk_ffi.rs)
+- [xsk_bridge.c](userspace-dp/csrc/xsk_bridge.c)
+- [bind.rs](userspace-dp/src/afxdp/bind.rs)
 
 Related GitHub issue:
 
-- `#253` Userspace AF_XDP libxdp migration postmortem
+- #253 Userspace AF_XDP libxdp migration postmortem
 
 ## Executive summary
 
@@ -67,10 +67,10 @@ Those assumptions were good enough under `xdpilone`. They were not valid under
 
 What changed:
 
-- added [xsk_bridge.c](/home/ps/git/codex-bpfrx/userspace-dp/csrc/xsk_bridge.c)
-- added [xsk_ffi.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/xsk_ffi.rs)
+- added [xsk_bridge.c](userspace-dp/csrc/xsk_bridge.c)
+- added [xsk_ffi.rs](userspace-dp/src/xsk_ffi.rs)
 - rewired the AF_XDP bind/open path in
-  [bind.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/bind.rs)
+  [bind.rs](userspace-dp/src/afxdp/bind.rs)
 
 Why it was necessary:
 
@@ -137,7 +137,7 @@ Observed consequence:
 
 Where this lives:
 
-- [xsk_ffi.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/xsk_ffi.rs)
+- [xsk_ffi.rs](userspace-dp/src/xsk_ffi.rs)
 
 Lesson:
 
@@ -174,8 +174,8 @@ What had to change:
 
 Where this lives:
 
-- [xsk_ffi.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/xsk_ffi.rs)
-- [xsk_bridge.c](/home/ps/git/codex-bpfrx/userspace-dp/csrc/xsk_bridge.c)
+- [xsk_ffi.rs](userspace-dp/src/xsk_ffi.rs)
+- [xsk_bridge.c](userspace-dp/csrc/xsk_bridge.c)
 
 This is one of the most important migration fixes. Without it, the rest of the
 dataplane was making invalid assumptions about ring progress.
@@ -290,15 +290,15 @@ As of current `master`, the important landed facts are:
 
 Current `master` still has artifacts from the migration era:
 
-- [test/xsk-repro/main.rs](/home/ps/git/codex-bpfrx/test/xsk-repro/main.rs)
+- [test/xsk-repro/main.rs](test/xsk-repro/main.rs)
   still imports `xdpilone`
-- [test/xsk-repro/Cargo.toml](/home/ps/git/codex-bpfrx/test/xsk-repro/Cargo.toml)
+- [test/xsk-repro/Cargo.toml](test/xsk-repro/Cargo.toml)
   still depends on `xdpilone`
-- [test/xsk-repro/README.md](/home/ps/git/codex-bpfrx/test/xsk-repro/README.md)
+- [test/xsk-repro/README.md](test/xsk-repro/README.md)
   is still framed around the older `xdpilone` vs `libbpf` comparison
-- [xsk_ffi.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/xsk_ffi.rs)
+- [xsk_ffi.rs](userspace-dp/src/xsk_ffi.rs)
   still contains stale `create_shared` wording in comments
-- [bind.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/bind.rs)
+- [bind.rs](userspace-dp/src/afxdp/bind.rs)
   still describes the bind path as `xsk_socket__create_shared`
 
 So the runtime path moved on, but the repro and comments did not fully keep up.
@@ -373,15 +373,15 @@ For this path, stale comments are not harmless.
 
 ## Recommended follow-up
 
-1. Port [test/xsk-repro/main.rs](/home/ps/git/codex-bpfrx/test/xsk-repro/main.rs)
-   and [test/xsk-repro/Cargo.toml](/home/ps/git/codex-bpfrx/test/xsk-repro/Cargo.toml)
-   to the current [xsk_ffi.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/xsk_ffi.rs)
+1. Port [test/xsk-repro/main.rs](test/xsk-repro/main.rs)
+   and [test/xsk-repro/Cargo.toml](test/xsk-repro/Cargo.toml)
+   to the current [xsk_ffi.rs](userspace-dp/src/xsk_ffi.rs)
    path on `master`.
-2. Update [test/xsk-repro/README.md](/home/ps/git/codex-bpfrx/test/xsk-repro/README.md)
+2. Update [test/xsk-repro/README.md](test/xsk-repro/README.md)
    so it matches the production implementation and the current failure modes.
 3. Clean stale `create_shared` wording in:
-   - [xsk_ffi.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/xsk_ffi.rs)
-   - [bind.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/bind.rs)
+   - [xsk_ffi.rs](userspace-dp/src/xsk_ffi.rs)
+   - [bind.rs](userspace-dp/src/afxdp/bind.rs)
 4. Keep treating any remaining zero-copy restart issue as a separate runtime
    investigation unless it reproduces in the minimal wrapper repro.
 
