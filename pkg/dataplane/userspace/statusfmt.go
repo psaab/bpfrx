@@ -47,12 +47,22 @@ func FormatStatusSummary(status ProcessStatus) string {
 	var txPackets uint64
 	var txBytes uint64
 	var txErrors uint64
+	var txCompletions uint64
+	var kernelRXDropped uint64
+	var kernelRXInvalidDescs uint64
 	var directTXPackets uint64
 	var copyTXPackets uint64
 	var inPlaceTXPackets uint64
 	var directTXNoFrameFallbackPackets uint64
 	var directTXBuildFallbackPackets uint64
 	var directTXDisallowedFallbackPackets uint64
+	var debugPendingFillFrames uint64
+	var debugSpareFillFrames uint64
+	var debugFreeTXFrames uint64
+	var debugPendingTXPrepared uint64
+	var debugPendingTXLocal uint64
+	var debugOutstandingTX uint64
+	var debugInFlightRecycles uint64
 	var slowPathPackets uint64
 	var slowPathDrops uint64
 	for _, binding := range status.Bindings {
@@ -94,12 +104,22 @@ func FormatStatusSummary(status ProcessStatus) string {
 		txPackets += binding.TXPackets
 		txBytes += binding.TXBytes
 		txErrors += binding.TXErrors
+		txCompletions += binding.TXCompletions
+		kernelRXDropped += binding.KernelRXDropped
+		kernelRXInvalidDescs += binding.KernelRXInvalidDescs
 		directTXPackets += binding.DirectTXPackets
 		copyTXPackets += binding.CopyTXPackets
 		inPlaceTXPackets += binding.InPlaceTXPackets
 		directTXNoFrameFallbackPackets += binding.DirectTXNoFrameFallbackPackets
 		directTXBuildFallbackPackets += binding.DirectTXBuildFallbackPackets
 		directTXDisallowedFallbackPackets += binding.DirectTXDisallowedFallbackPackets
+		debugPendingFillFrames += uint64(binding.DebugPendingFillFrames)
+		debugSpareFillFrames += uint64(binding.DebugSpareFillFrames)
+		debugFreeTXFrames += uint64(binding.DebugFreeTXFrames)
+		debugPendingTXPrepared += uint64(binding.DebugPendingTXPrepared)
+		debugPendingTXLocal += uint64(binding.DebugPendingTXLocal)
+		debugOutstandingTX += uint64(binding.DebugOutstandingTX)
+		debugInFlightRecycles += uint64(binding.DebugInFlightRecycles)
 		slowPathPackets += binding.SlowPathPackets
 		slowPathDrops += binding.SlowPathDrops
 	}
@@ -212,12 +232,22 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  TX packets:                %d\n", txPackets)
 	fmt.Fprintf(&b, "  TX bytes:                  %d\n", txBytes)
 	fmt.Fprintf(&b, "  TX errors:                 %d\n", txErrors)
+	fmt.Fprintf(&b, "  TX completions:            %d\n", txCompletions)
+	fmt.Fprintf(&b, "  Kernel RX dropped:         %d\n", kernelRXDropped)
+	fmt.Fprintf(&b, "  Kernel RX invalid descs:   %d\n", kernelRXInvalidDescs)
 	fmt.Fprintf(&b, "  Direct TX packets:         %d\n", directTXPackets)
 	fmt.Fprintf(&b, "  Copy-path TX packets:      %d\n", copyTXPackets)
 	fmt.Fprintf(&b, "  In-place TX packets:       %d\n", inPlaceTXPackets)
 	fmt.Fprintf(&b, "  Direct TX no-frame fb:     %d\n", directTXNoFrameFallbackPackets)
 	fmt.Fprintf(&b, "  Direct TX build-none fb:   %d\n", directTXBuildFallbackPackets)
 	fmt.Fprintf(&b, "  Direct TX disallowed fb:   %d\n", directTXDisallowedFallbackPackets)
+	fmt.Fprintf(&b, "  Pending fill frames:       %d\n", debugPendingFillFrames)
+	fmt.Fprintf(&b, "  Spare fill frames:         %d\n", debugSpareFillFrames)
+	fmt.Fprintf(&b, "  Free TX frames:            %d\n", debugFreeTXFrames)
+	fmt.Fprintf(&b, "  Pending TX prepared:       %d\n", debugPendingTXPrepared)
+	fmt.Fprintf(&b, "  Pending TX local:          %d\n", debugPendingTXLocal)
+	fmt.Fprintf(&b, "  Outstanding TX:            %d\n", debugOutstandingTX)
+	fmt.Fprintf(&b, "  In-flight recycles:        %d\n", debugInFlightRecycles)
 	fmt.Fprintf(&b, "  Slow path active:          %t\n", status.SlowPath.Active)
 	if status.SlowPath.DeviceName != "" {
 		fmt.Fprintf(&b, "  Slow path device:          %s\n", status.SlowPath.DeviceName)

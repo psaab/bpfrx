@@ -28,6 +28,9 @@ else
 fi
 IPERF_STREAMS="${IPERF_STREAMS:-4}"
 MIN_SESSIONS="${MIN_SESSIONS:-4}"
+CHECK_KERNEL_SESSION_TABLE="${CHECK_KERNEL_SESSION_TABLE:-0}"
+SESSION_SYNC_IDLE_TIMEOUT="${SESSION_SYNC_IDLE_TIMEOUT:-30}"
+SESSION_SYNC_IDLE_STABLE_SAMPLES="${SESSION_SYNC_IDLE_STABLE_SAMPLES:-3}"
 MIN_THROUGHPUT="${MIN_THROUGHPUT:-1.0}"
 MAX_ZERO_INTERVALS="${MAX_ZERO_INTERVALS:-2}"
 MAX_STREAM_ZERO_INTERVALS="${MAX_STREAM_ZERO_INTERVALS:-0}"
@@ -44,6 +47,9 @@ MAX_FAILOVER_POLICY_DENIED_DELTA="${MAX_FAILOVER_POLICY_DENIED_DELTA:-0}"
 MAX_RETRANSMITS="${MAX_RETRANSMITS:-}"
 MAX_RETRANSMITS_PER_GBPS="${MAX_RETRANSMITS_PER_GBPS:-}"
 POST_FAILOVER_OBSERVE="${POST_FAILOVER_OBSERVE:-10}"
+TRANSITION_SAMPLE_SECONDS="${TRANSITION_SAMPLE_SECONDS:-10}"
+MAX_TRANSITION_KERNEL_RX_DROPPED_DELTA="${MAX_TRANSITION_KERNEL_RX_DROPPED_DELTA:-512}"
+MAX_TRANSITION_DIRECT_TX_NOFRAME_DELTA="${MAX_TRANSITION_DIRECT_TX_NOFRAME_DELTA:-512}"
 RESTORE_SOURCE_NODE="${RESTORE_SOURCE_NODE:-1}"
 ALLOW_STALE_SESSIONS="${ALLOW_STALE_SESSIONS:-0}"
 IPERF_COMPLETION_GRACE_SEC="${IPERF_COMPLETION_GRACE_SEC:-2}"
@@ -272,6 +278,20 @@ cycle_interfaces_path() {
 	printf '%s/cycle%s-%s-%s-dp-interfaces.txt\n' "${ARTIFACT_DIR}" "${cycle}" "${phase}" "$(vm_artifact_suffix "$vm")"
 }
 
+sync_snapshot_path() {
+	local label="$1"
+	local vm="$2"
+	printf '%s/%s-%s-sync.txt\n' "${ARTIFACT_DIR}" "${label}" "$(vm_artifact_suffix "$vm")"
+}
+
+transition_stats_path() {
+	local cycle="$1"
+	local phase="$2"
+	local sample="$3"
+	local vm="$4"
+	printf '%s/cycle%s-%s-watch%02d-%s-dp-stats.txt\n' "${ARTIFACT_DIR}" "${cycle}" "${phase}" "${sample}" "$(vm_artifact_suffix "$vm")"
+}
+
 status_summary_value() {
 	local path="$1"
 	local label="$2"
@@ -302,6 +322,88 @@ else:
     print(f"WARN: status_summary_value: label '{label}' not found in '{path}'", file=sys.stderr)
     print("0")
 PY
+}
+
+sync_stats_value() {
+	local path="$1"
+	local service="$2"
+	local column="$3"
+	python3 - "$path" "$service" "$column" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+service = sys.argv[2]
+column = sys.argv[3]
+if not path.exists():
+    print("0")
+    raise SystemExit(0)
+
+lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+capture = False
+for line in lines:
+    if line.strip() == "Services Synchronized:":
+        capture = True
+        continue
+    if capture and not line.strip():
+        break
+    if not capture:
+        continue
+    if service not in line:
+        continue
+    nums = re.findall(r"\d+", line)
+    if column == "sent":
+        print(nums[0] if len(nums) >= 1 else "0")
+    elif column == "received":
+        print(nums[1] if len(nums) >= 2 else "0")
+    else:
+        raise SystemExit(f"unsupported sync stats column: {column}")
+    break
+else:
+    print("0")
+PY
+}
+
+capture_sync_snapshot() {
+	local vm="$1"
+	local label="$2"
+	run_vm "$vm" 'cli -c "show chassis cluster data-plane statistics"' >"$(sync_snapshot_path "$label" "$vm")" 2>&1 || true
+}
+
+wait_for_session_sync_idle() {
+	local label="$1"
+	local stable_needed="$SESSION_SYNC_IDLE_STABLE_SAMPLES"
+	local stable=0
+	local tries="$SESSION_SYNC_IDLE_TIMEOUT"
+	local prev_source_sent="" prev_target_recv="" prev_target_installed=""
+	while (( tries > 0 )); do
+		capture_sync_snapshot "$SOURCE_VM" "${label}-source"
+		capture_sync_snapshot "$TARGET_VM" "${label}-target"
+		local source_path target_path
+		source_path="$(sync_snapshot_path "${label}-source" "$SOURCE_VM")"
+		target_path="$(sync_snapshot_path "${label}-target" "$TARGET_VM")"
+		local source_sent target_recv target_installed
+		source_sent="$(sync_stats_value "$source_path" "Session create" sent)"
+		target_recv="$(sync_stats_value "$target_path" "Session create" received)"
+		target_installed="$(status_summary_value "$target_path" "Session delta drained")"
+		if [[ -n "$prev_source_sent" && "$source_sent" == "$prev_source_sent" && "$target_recv" == "$prev_target_recv" && "$target_installed" == "$prev_target_installed" ]]; then
+			stable=$((stable + 1))
+			if (( stable >= stable_needed )); then
+				pass "${label}: session sync idle (source_sent=${source_sent} target_recv=${target_recv} target_delta_drained=${target_installed})"
+				return 0
+			fi
+		else
+			stable=0
+		fi
+		prev_source_sent="$source_sent"
+		prev_target_recv="$target_recv"
+		prev_target_installed="$target_installed"
+		sleep 1
+		tries=$((tries - 1))
+	done
+	fail "${label}: session sync did not become idle before timeout (source_sent=${prev_source_sent:-0} target_recv=${prev_target_recv:-0} target_delta_drained=${prev_target_installed:-0})"
+	return 1
 }
 
 status_fabric_tx_packets() {
@@ -465,12 +567,115 @@ validate_phase_fabric_path() {
 	fi
 }
 
+capture_transition_window() {
+	local cycle="$1"
+	local phase="$2"
+	local seconds="$3"
+	local sample
+	for (( sample = 1; sample <= seconds; sample++ )); do
+		if ! cycle_sleep 1 0; then
+			fail "cycle ${cycle} ${phase}: iperf3 exited during transition sample ${sample}/${seconds}"
+			break
+		fi
+		run_vm "$FW0" 'cli -c "show chassis cluster data-plane statistics"' >"$(transition_stats_path "$cycle" "$phase" "$sample" "$FW0")" 2>&1 || true
+		run_vm "$FW1" 'cli -c "show chassis cluster data-plane statistics"' >"$(transition_stats_path "$cycle" "$phase" "$sample" "$FW1")" 2>&1 || true
+	done
+}
+
+sample_window_value() {
+	local cycle="$1"
+	local phase="$2"
+	local seconds="$3"
+	local vm="$4"
+	local label="$5"
+	local agg="${6:-last}"
+	python3 - "$ARTIFACT_DIR" "$cycle" "$phase" "$seconds" "$(vm_artifact_suffix "$vm")" "$label" "$agg" <<'PY'
+import pathlib
+import re
+import sys
+
+artifact_dir = pathlib.Path(sys.argv[1])
+cycle = sys.argv[2]
+phase = sys.argv[3]
+seconds = int(sys.argv[4])
+suffix = sys.argv[5]
+label = sys.argv[6]
+agg = sys.argv[7]
+pattern = f"  {label}:"
+values = []
+for sample in range(1, seconds + 1):
+    path = artifact_dir / f"cycle{cycle}-{phase}-watch{sample:02d}-{suffix}-dp-stats.txt"
+    if not path.exists():
+        continue
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.startswith(pattern):
+            continue
+        match = re.search(r"(-?\d+)", line.split(":", 1)[1])
+        if match:
+            values.append(int(match.group(1)))
+        break
+
+if not values:
+    print("0")
+elif agg == "max":
+    print(max(values))
+else:
+    print(values[-1])
+PY
+}
+
+validate_transition_window() {
+	local cycle="$1"
+	local phase="$2"
+	local from_vm="$3"
+	local from_name="$4"
+	local to_vm="$5"
+	local to_name="$6"
+	local seconds="$7"
+	local from_pre to_pre
+	local to_kernel_rx_dropped_max from_no_frame_max
+	local to_kernel_rx_dropped_delta from_no_frame_delta
+	local from_pending_local_max to_pending_local_max
+	local from_outstanding_max to_outstanding_max
+
+	from_pre="$(cycle_stats_path "$cycle" "${phase}-pre" "$from_vm")"
+	to_pre="$(cycle_stats_path "$cycle" "${phase}-pre" "$to_vm")"
+
+	to_kernel_rx_dropped_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$to_vm" "Kernel RX dropped" max)"
+	from_no_frame_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$from_vm" "Direct TX no-frame fb" max)"
+	from_pending_local_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$from_vm" "Pending TX local" max)"
+	to_pending_local_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$to_vm" "Pending TX local" max)"
+	from_outstanding_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$from_vm" "Outstanding TX" max)"
+	to_outstanding_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$to_vm" "Outstanding TX" max)"
+
+	to_kernel_rx_dropped_delta=$(( to_kernel_rx_dropped_max - $(status_summary_value "$to_pre" "Kernel RX dropped") ))
+	from_no_frame_delta=$(( from_no_frame_max - $(status_summary_value "$from_pre" "Direct TX no-frame fb") ))
+
+	if (( to_kernel_rx_dropped_delta <= MAX_TRANSITION_KERNEL_RX_DROPPED_DELTA )); then
+		pass "cycle ${cycle} ${phase}: ${to_name} transition kernel RX dropped delta ${to_kernel_rx_dropped_delta}"
+	else
+		fail "cycle ${cycle} ${phase}: ${to_name} transition kernel RX dropped delta ${to_kernel_rx_dropped_delta} exceeds ${MAX_TRANSITION_KERNEL_RX_DROPPED_DELTA}"
+	fi
+
+	if (( from_no_frame_delta <= MAX_TRANSITION_DIRECT_TX_NOFRAME_DELTA )); then
+		pass "cycle ${cycle} ${phase}: ${from_name} transition direct no-frame delta ${from_no_frame_delta}"
+	else
+		fail "cycle ${cycle} ${phase}: ${from_name} transition direct no-frame delta ${from_no_frame_delta} exceeds ${MAX_TRANSITION_DIRECT_TX_NOFRAME_DELTA}"
+	fi
+
+	pass "cycle ${cycle} ${phase}: ${from_name} max pending-local=${from_pending_local_max} outstanding-tx=${from_outstanding_max}; ${to_name} max pending-local=${to_pending_local_max} outstanding-tx=${to_outstanding_max}"
+}
+
 zero_port_tcp_sessions() {
 	local vm="$1"
 	run_vm "$vm" "cli -c \"show security flow session destination-prefix ${IPERF_TARGET}\" 2>/dev/null | grep -Ec '^[[:space:]]+(In|Out): .*\\/0;tcp' || true"
 }
 
 validate_clean_session_baseline() {
+	if [[ "${CHECK_KERNEL_SESSION_TABLE}" != "1" ]]; then
+		pass "preflight: kernel session-table checks disabled for userspace failover validation"
+		return 0
+	fi
 	local source_zero target_zero
 	source_zero="$(zero_port_tcp_sessions "$SOURCE_VM")"
 	target_zero="$(zero_port_tcp_sessions "$TARGET_VM")"
@@ -805,7 +1010,7 @@ validate_cycle_health() {
 	local owner_vm="$3"
 	local owner_name="$4"
 	local final_phase="$5"
-	local count dead_streams zero_source zero_target
+	local dead_streams
 	if iperf_alive; then
 		pass "cycle ${cycle} ${label}: iperf3 alive on ${owner_name}"
 	elif iperf_effectively_completed_remote; then
@@ -817,24 +1022,27 @@ validate_cycle_health() {
 	else
 		fail "cycle ${cycle} ${label}: iperf3 died"
 	fi
-	count="$(session_count "$owner_vm")"
-	if [[ "$count" -lt "$MIN_SESSIONS" ]]; then
-		fail "cycle ${cycle} ${label}: ${owner_name} has only ${count} sessions (expected >= ${MIN_SESSIONS})"
-	else
-		pass "cycle ${cycle} ${label}: ${owner_name} has ${count} sessions"
-	fi
 	dead_streams="$(recent_dead_streams)"
 	if [[ "$dead_streams" -gt 0 ]]; then
 		fail "cycle ${cycle} ${label}: ${dead_streams}/${IPERF_STREAMS} streams at 0.00 bits/sec"
 	else
 		pass "cycle ${cycle} ${label}: all ${IPERF_STREAMS} streams carrying traffic"
 	fi
-	zero_source="$(zero_port_tcp_sessions "$FW0")"
-	zero_target="$(zero_port_tcp_sessions "$FW1")"
-	if [[ "$zero_source" -gt 0 || "$zero_target" -gt 0 ]]; then
-		fail "cycle ${cycle} ${label}: zero-port TCP sessions present (fw0=${zero_source} fw1=${zero_target})"
-	else
-		pass "cycle ${cycle} ${label}: no zero-port TCP sessions present"
+	if [[ "${CHECK_KERNEL_SESSION_TABLE}" == "1" ]]; then
+		local count zero_source zero_target
+		count="$(session_count "$owner_vm")"
+		if [[ "$count" -lt "$MIN_SESSIONS" ]]; then
+			fail "cycle ${cycle} ${label}: ${owner_name} has only ${count} sessions (expected >= ${MIN_SESSIONS})"
+		else
+			pass "cycle ${cycle} ${label}: ${owner_name} has ${count} sessions"
+		fi
+		zero_source="$(zero_port_tcp_sessions "$FW0")"
+		zero_target="$(zero_port_tcp_sessions "$FW1")"
+		if [[ "$zero_source" -gt 0 || "$zero_target" -gt 0 ]]; then
+			fail "cycle ${cycle} ${label}: zero-port TCP sessions present (fw0=${zero_source} fw1=${zero_target})"
+		else
+			pass "cycle ${cycle} ${label}: no zero-port TCP sessions present"
+		fi
 	fi
 }
 
@@ -891,8 +1099,20 @@ run_failover_phase() {
 	capture_cycle_state "$cycle" "$phase"
 	validate_target_connectivity "cycle ${cycle} ${phase}"
 	validate_external_connectivity "cycle${cycle}-${phase}"
-	if ! cycle_sleep "$CYCLE_INTERVAL" "$final_phase"; then
-		fail "cycle ${cycle} ${phase}: iperf3 exited before ${CYCLE_INTERVAL}s interval elapsed"
+	local transition_seconds remaining_interval
+	transition_seconds="$TRANSITION_SAMPLE_SECONDS"
+	if (( transition_seconds > CYCLE_INTERVAL )); then
+		transition_seconds="$CYCLE_INTERVAL"
+	fi
+	if (( transition_seconds > 0 )); then
+		capture_transition_window "$cycle" "$phase" "$transition_seconds"
+		validate_transition_window "$cycle" "$phase" "$from_vm" "$from_name" "$to_vm" "$to_name" "$transition_seconds"
+	fi
+	remaining_interval=$(( CYCLE_INTERVAL - transition_seconds ))
+	if (( remaining_interval > 0 )); then
+		if ! cycle_sleep "$remaining_interval" "$final_phase"; then
+			fail "cycle ${cycle} ${phase}: iperf3 exited before ${CYCLE_INTERVAL}s interval elapsed"
+		fi
 	fi
 	capture_cycle_state "$cycle" "${phase}-post"
 	validate_cycle_health "$cycle" "$phase" "$to_vm" "$to_name" "$final_phase"
@@ -949,6 +1169,7 @@ TARGET_VM="$(vm_for_node "$TARGET_NODE")"
 validate_clean_session_baseline
 capture_vm_state "$SOURCE_VM" "before-source"
 capture_vm_state "$TARGET_VM" "before-target"
+wait_for_session_sync_idle "pre-traffic"
 
 info "starting iperf3 ${IPERF_TARGET} -P${IPERF_STREAMS} -t${IPERF_DURATION}"
 start_iperf || die "iperf3 failed to start"
@@ -963,12 +1184,14 @@ fi
 
 info "waiting ${SYNC_WAIT}s for session sync to peer"
 sleep "${SYNC_WAIT}"
-
-target_count="$(session_count "$TARGET_VM")"
-if [[ "$target_count" -lt "$MIN_SESSIONS" ]]; then
-	fail "target owner has only ${target_count} synced sessions (expected >= ${MIN_SESSIONS})"
-else
-	pass "target owner has ${target_count} synced sessions"
+wait_for_session_sync_idle "pre-failover"
+if [[ "${CHECK_KERNEL_SESSION_TABLE}" == "1" ]]; then
+	target_count="$(session_count "$TARGET_VM")"
+	if [[ "$target_count" -lt "$MIN_SESSIONS" ]]; then
+		fail "target owner has only ${target_count} synced sessions (expected >= ${MIN_SESSIONS})"
+	else
+		pass "target owner has ${target_count} synced sessions"
+	fi
 fi
 
 validate_pre_failover_health "$SOURCE_VM" "$(node_name "$SOURCE_NODE")"

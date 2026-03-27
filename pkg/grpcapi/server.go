@@ -8939,6 +8939,16 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 		directTXNoFrameFallbackPackets    uint64
 		directTXBuildFallbackPackets      uint64
 		directTXDisallowedFallbackPackets uint64
+		txCompletions                     uint64
+		kernelRXDropped                   uint64
+		kernelRXInvalidDescs              uint64
+		debugPendingFillFrames            uint64
+		debugSpareFillFrames              uint64
+		debugFreeTXFrames                 uint64
+		debugPendingTXPrepared            uint64
+		debugPendingTXLocal               uint64
+		debugOutstandingTX                uint64
+		debugInFlightRecycles             uint64
 		sessionMisses                     uint64
 		neighborMissPackets               uint64
 		routeMissPackets                  uint64
@@ -9008,6 +9018,16 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 			snap.directTXNoFrameFallbackPackets += binding.DirectTXNoFrameFallbackPackets
 			snap.directTXBuildFallbackPackets += binding.DirectTXBuildFallbackPackets
 			snap.directTXDisallowedFallbackPackets += binding.DirectTXDisallowedFallbackPackets
+			snap.txCompletions += binding.TXCompletions
+			snap.kernelRXDropped += binding.KernelRXDropped
+			snap.kernelRXInvalidDescs += binding.KernelRXInvalidDescs
+			snap.debugPendingFillFrames += uint64(binding.DebugPendingFillFrames)
+			snap.debugSpareFillFrames += uint64(binding.DebugSpareFillFrames)
+			snap.debugFreeTXFrames += uint64(binding.DebugFreeTXFrames)
+			snap.debugPendingTXPrepared += uint64(binding.DebugPendingTXPrepared)
+			snap.debugPendingTXLocal += uint64(binding.DebugPendingTXLocal)
+			snap.debugOutstandingTX += uint64(binding.DebugOutstandingTX)
+			snap.debugInFlightRecycles += uint64(binding.DebugInFlightRecycles)
 			snap.sessionMisses += binding.SessionMisses
 			snap.neighborMissPackets += binding.NeighborMissPackets
 			snap.routeMissPackets += binding.RouteMissPackets
@@ -9195,6 +9215,10 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 						usRxBytesDelta, usTxBytesDelta, usRxPktsDelta, usTxPktsDelta      uint64
 						usDirectDelta, usCopyDelta, usInPlaceDelta                        uint64
 						usDirectNoFrameDelta, usDirectBuildDelta, usDirectDisallowedDelta uint64
+						usTxCompletionsDelta, usKernelRXDroppedDelta, usKernelRXInvalidDelta uint64
+						usPendingFillDelta, usSpareFillDelta, usFreeTXDelta                uint64
+						usPendingPreparedDelta, usPendingLocalDelta                        uint64
+						usOutstandingTXDelta, usInFlightRecycleDelta                       uint64
 						usSessionMissDelta, usNeighborMissDelta, usRouteMissDelta         uint64
 						usPolicyDeniedDelta, usExceptionDelta, usSlowPathDelta            uint64
 					)
@@ -9218,6 +9242,16 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 						usDirectNoFrameDelta = snap.userspace.directTXNoFrameFallbackPackets - baselineSingle.userspace.directTXNoFrameFallbackPackets
 						usDirectBuildDelta = snap.userspace.directTXBuildFallbackPackets - baselineSingle.userspace.directTXBuildFallbackPackets
 						usDirectDisallowedDelta = snap.userspace.directTXDisallowedFallbackPackets - baselineSingle.userspace.directTXDisallowedFallbackPackets
+						usTxCompletionsDelta = snap.userspace.txCompletions - baselineSingle.userspace.txCompletions
+						usKernelRXDroppedDelta = snap.userspace.kernelRXDropped - baselineSingle.userspace.kernelRXDropped
+						usKernelRXInvalidDelta = snap.userspace.kernelRXInvalidDescs - baselineSingle.userspace.kernelRXInvalidDescs
+						usPendingFillDelta = snap.userspace.debugPendingFillFrames - baselineSingle.userspace.debugPendingFillFrames
+						usSpareFillDelta = snap.userspace.debugSpareFillFrames - baselineSingle.userspace.debugSpareFillFrames
+						usFreeTXDelta = snap.userspace.debugFreeTXFrames - baselineSingle.userspace.debugFreeTXFrames
+						usPendingPreparedDelta = snap.userspace.debugPendingTXPrepared - baselineSingle.userspace.debugPendingTXPrepared
+						usPendingLocalDelta = snap.userspace.debugPendingTXLocal - baselineSingle.userspace.debugPendingTXLocal
+						usOutstandingTXDelta = snap.userspace.debugOutstandingTX - baselineSingle.userspace.debugOutstandingTX
+						usInFlightRecycleDelta = snap.userspace.debugInFlightRecycles - baselineSingle.userspace.debugInFlightRecycles
 						usSessionMissDelta = snap.userspace.sessionMisses - baselineSingle.userspace.sessionMisses
 						usNeighborMissDelta = snap.userspace.neighborMissPackets - baselineSingle.userspace.neighborMissPackets
 						usRouteMissDelta = snap.userspace.routeMissPackets - baselineSingle.userspace.routeMissPackets
@@ -9241,9 +9275,19 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 					fmt.Fprintf(&buf, "  Direct TX packets:    %20d          [%d]\n", snap.userspace.directTXPackets, usDirectDelta)
 					fmt.Fprintf(&buf, "  Copy TX packets:      %20d          [%d]\n", snap.userspace.copyTXPackets, usCopyDelta)
 					fmt.Fprintf(&buf, "  In-place TX packets:  %20d          [%d]\n", snap.userspace.inPlaceTXPackets, usInPlaceDelta)
+					fmt.Fprintf(&buf, "  TX completions:       %20d          [%d]\n", snap.userspace.txCompletions, usTxCompletionsDelta)
+					fmt.Fprintf(&buf, "  Kernel RX dropped:    %20d          [%d]\n", snap.userspace.kernelRXDropped, usKernelRXDroppedDelta)
+					fmt.Fprintf(&buf, "  Kernel RX invalid:    %20d          [%d]\n", snap.userspace.kernelRXInvalidDescs, usKernelRXInvalidDelta)
 					fmt.Fprintf(&buf, "  Direct TX no-frame:   %20d          [%d]\n", snap.userspace.directTXNoFrameFallbackPackets, usDirectNoFrameDelta)
 					fmt.Fprintf(&buf, "  Direct TX build-none: %20d          [%d]\n", snap.userspace.directTXBuildFallbackPackets, usDirectBuildDelta)
 					fmt.Fprintf(&buf, "  Direct TX disallowed: %20d          [%d]\n", snap.userspace.directTXDisallowedFallbackPackets, usDirectDisallowedDelta)
+					fmt.Fprintf(&buf, "  Pending fill frames:  %20d          [%d]\n", snap.userspace.debugPendingFillFrames, usPendingFillDelta)
+					fmt.Fprintf(&buf, "  Spare fill frames:    %20d          [%d]\n", snap.userspace.debugSpareFillFrames, usSpareFillDelta)
+					fmt.Fprintf(&buf, "  Free TX frames:       %20d          [%d]\n", snap.userspace.debugFreeTXFrames, usFreeTXDelta)
+					fmt.Fprintf(&buf, "  Pending TX prepared:  %20d          [%d]\n", snap.userspace.debugPendingTXPrepared, usPendingPreparedDelta)
+					fmt.Fprintf(&buf, "  Pending TX local:     %20d          [%d]\n", snap.userspace.debugPendingTXLocal, usPendingLocalDelta)
+					fmt.Fprintf(&buf, "  Outstanding TX:       %20d          [%d]\n", snap.userspace.debugOutstandingTX, usOutstandingTXDelta)
+					fmt.Fprintf(&buf, "  In-flight recycles:   %20d          [%d]\n", snap.userspace.debugInFlightRecycles, usInFlightRecycleDelta)
 					fmt.Fprintf(&buf, "  Session misses:       %20d          [%d]\n", snap.userspace.sessionMisses, usSessionMissDelta)
 					fmt.Fprintf(&buf, "  Neighbor misses:      %20d          [%d]\n", snap.userspace.neighborMissPackets, usNeighborMissDelta)
 					fmt.Fprintf(&buf, "  Route misses:         %20d          [%d]\n", snap.userspace.routeMissPackets, usRouteMissDelta)

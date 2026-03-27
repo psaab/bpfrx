@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,6 +50,7 @@ type syncHeader struct {
 }
 
 const syncHeaderSize = 12
+const syncWriteDeadline = 2 * time.Second
 
 // SyncStats tracks session synchronization statistics.
 type SyncStats struct {
@@ -123,6 +125,10 @@ type SessionSync struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	sendCh     chan []byte // buffered channel for outgoing messages
+	// incrementalPauseDepth temporarily pauses background incremental
+	// producers (periodic sweeps) during HA demotion handoff so ordered
+	// demotion barriers are not queued behind unrelated backlog.
+	incrementalPauseDepth atomic.Int32
 
 	// OnConfigReceived is called when a config sync message arrives from peer.
 	// The callback receives the full config text. Set by the daemon before Start().
@@ -202,6 +208,7 @@ type SessionSync struct {
 	bulkZoneSnapshot map[uint16]bool // snapshot of ShouldSyncZone at BulkStart
 
 	barrierSeq     atomic.Uint64
+	barrierAckSeq  atomic.Uint64
 	barrierWaitMu  sync.Mutex
 	barrierWaiters map[uint64]chan struct{}
 }
@@ -241,6 +248,21 @@ func NewDualSessionSync(local, peer, local1, peer1 string, dp dataplane.DataPlan
 		sendCh:           make(chan []byte, 4096),
 		deleteJournalCap: deleteJournalDefaultCap,
 	}
+}
+
+func shouldInitiateFabricDial(localAddr, peerAddr string) bool {
+	local, err := netip.ParseAddrPort(localAddr)
+	if err != nil {
+		return true
+	}
+	peer, err := netip.ParseAddrPort(peerAddr)
+	if err != nil {
+		return true
+	}
+	if cmp := local.Addr().Compare(peer.Addr()); cmp != 0 {
+		return cmp < 0
+	}
+	return local.Port() < peer.Port()
 }
 
 // SetVRFDevice sets the VRF device for SO_BINDTODEVICE on sync sockets.
@@ -419,15 +441,19 @@ func (s *SessionSync) Start(ctx context.Context) error {
 		}
 	}
 
-	// Connect to peer on primary fabric (retry loop).
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.fabricConnectLoop(ctx, 0, s.peerAddr)
-	}()
+	// Use one deterministic TCP initiator per fabric. Dual dialers create
+	// duplicate sync streams, mid-bulk connection replacement, and lost
+	// failover-handoff messages during reconnect windows.
+	if shouldInitiateFabricDial(s.localAddr, s.peerAddr) {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.fabricConnectLoop(ctx, 0, s.peerAddr)
+		}()
+	}
 
 	// Connect to peer on secondary fabric if configured.
-	if s.peerAddr1 != "" {
+	if s.peerAddr1 != "" && shouldInitiateFabricDial(s.localAddr1, s.peerAddr1) {
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -566,6 +592,9 @@ func (s *SessionSync) syncSweep() int {
 	if s.IsPrimaryFn == nil && s.IsPrimaryForRGFn == nil {
 		return 0
 	}
+	if s.incrementalPauseDepth.Load() > 0 {
+		return 0
+	}
 	if !s.stats.Connected.Load() {
 		return 0
 	}
@@ -660,6 +689,43 @@ func (s *SessionSync) syncSweep() int {
 		slog.Info("cluster sync: sweep synced sessions", "count", count)
 	}
 	return count
+}
+
+// PauseIncrementalSync temporarily disables background sweep-driven session
+// replication. Explicit sync producers (for example demotion-prep republish)
+// are unaffected and may continue queueing messages.
+func (s *SessionSync) PauseIncrementalSync(reason string) {
+	depth := s.incrementalPauseDepth.Add(1)
+	if depth == 1 {
+		stats := s.Stats()
+		slog.Info("cluster sync: incremental sync paused",
+			"reason", reason,
+			"depth", depth,
+			"sessions_sent", stats.SessionsSent,
+			"sessions_received", stats.SessionsReceived,
+			"sessions_installed", stats.SessionsInstalled,
+			"queue_len", len(s.sendCh),
+			"queue_cap", cap(s.sendCh))
+	}
+}
+
+// ResumeIncrementalSync releases a previous PauseIncrementalSync call.
+func (s *SessionSync) ResumeIncrementalSync(reason string) {
+	depth := s.incrementalPauseDepth.Add(-1)
+	if depth < 0 {
+		s.incrementalPauseDepth.Store(0)
+		depth = 0
+	}
+	if depth == 0 {
+		stats := s.Stats()
+		slog.Info("cluster sync: incremental sync resumed",
+			"reason", reason,
+			"sessions_sent", stats.SessionsSent,
+			"sessions_received", stats.SessionsReceived,
+			"sessions_installed", stats.SessionsInstalled,
+			"queue_len", len(s.sendCh),
+			"queue_cap", cap(s.sendCh))
+	}
 }
 
 func (s *SessionSync) queueMessage(msg []byte, sentCounter *atomic.Uint64, source string) bool {
@@ -990,17 +1056,28 @@ func (s *SessionSync) sendLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case msg := <-s.sendCh:
-			conn := s.getActiveConn()
-			if conn == nil {
-				continue
-			}
-			s.writeMu.Lock()
-			err := writeFull(conn, msg)
-			s.writeMu.Unlock()
-			if err != nil {
-				slog.Debug("cluster sync: send error", "err", err)
-				s.stats.Errors.Add(1)
-				s.handleDisconnect(conn)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				conn := s.getActiveConn()
+				if conn == nil {
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+				s.writeMu.Lock()
+				err := writeFull(conn, msg)
+				s.writeMu.Unlock()
+				if err != nil {
+					slog.Debug("cluster sync: send error", "err", err)
+					s.stats.Errors.Add(1)
+					s.handleDisconnect(conn)
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+				break
 			}
 		}
 	}
@@ -1355,7 +1432,7 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		rgID := int(payload[0])
 		slog.Info("cluster sync: remote failover request received", "rg", rgID)
 		if s.OnRemoteFailover != nil {
-			s.OnRemoteFailover(rgID)
+			go s.OnRemoteFailover(rgID)
 		}
 
 	case syncMsgFence:
@@ -1383,7 +1460,13 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			return
 		}
 		seq := binary.LittleEndian.Uint64(payload[:8])
-		slog.Info("cluster sync: barrier received", "seq", seq)
+		stats := s.Stats()
+		slog.Info("cluster sync: barrier received",
+			"seq", seq,
+			"sessions_received", stats.SessionsReceived,
+			"sessions_installed", stats.SessionsInstalled,
+			"queue_len", len(s.sendCh),
+			"queue_cap", cap(s.sendCh))
 		s.sendBarrierAck(conn, seq)
 	case syncMsgBarrierAck:
 		if len(payload) < 8 {
@@ -1391,14 +1474,38 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			return
 		}
 		seq := binary.LittleEndian.Uint64(payload[:8])
-		slog.Info("cluster sync: barrier ack received", "seq", seq)
+		stats := s.Stats()
+		peerSessionsReceived := uint64(0)
+		peerSessionsInstalled := uint64(0)
+		if len(payload) >= 24 {
+			peerSessionsReceived = binary.LittleEndian.Uint64(payload[8:16])
+			peerSessionsInstalled = binary.LittleEndian.Uint64(payload[16:24])
+		}
+		slog.Info("cluster sync: barrier ack received",
+			"seq", seq,
+			"sessions_sent", stats.SessionsSent,
+			"sessions_received", stats.SessionsReceived,
+			"sessions_installed", stats.SessionsInstalled,
+			"peer_sessions_received", peerSessionsReceived,
+			"peer_sessions_installed", peerSessionsInstalled,
+			"queue_len", len(s.sendCh),
+			"queue_cap", cap(s.sendCh))
+		for {
+			current := s.barrierAckSeq.Load()
+			if seq <= current || s.barrierAckSeq.CompareAndSwap(current, seq) {
+				break
+			}
+		}
 		s.completeBarrierWait(seq)
 	}
 }
 
 func (s *SessionSync) sendBarrierAck(conn net.Conn, seq uint64) {
-	var payload [8]byte
+	var payload [24]byte
 	binary.LittleEndian.PutUint64(payload[:], seq)
+	stats := s.Stats()
+	binary.LittleEndian.PutUint64(payload[8:16], stats.SessionsReceived)
+	binary.LittleEndian.PutUint64(payload[16:24], stats.SessionsInstalled)
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if err := writeMsg(conn, syncMsgBarrierAck, payload[:]); err != nil {
@@ -1406,7 +1513,12 @@ func (s *SessionSync) sendBarrierAck(conn net.Conn, seq uint64) {
 		slog.Debug("cluster sync: failed to send barrier ack", "seq", seq, "err", err)
 		return
 	}
-	slog.Info("cluster sync: barrier ack sent", "seq", seq)
+	slog.Info("cluster sync: barrier ack sent",
+		"seq", seq,
+		"sessions_received", stats.SessionsReceived,
+		"sessions_installed", stats.SessionsInstalled,
+		"queue_len", len(s.sendCh),
+		"queue_cap", cap(s.sendCh))
 }
 
 func (s *SessionSync) completeBarrierWait(seq uint64) {
@@ -1432,6 +1544,35 @@ func (s *SessionSync) waitForSendQueueDrain(timeout time.Duration) error {
 	}
 }
 
+func (s *SessionSync) enqueueBarrierMessage(msg []byte, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case s.sendCh <- msg:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("timed out queueing session sync barrier")
+	}
+}
+
+func (s *SessionSync) writeBarrierMessage(payload []byte, timeout time.Duration) error {
+	if err := s.waitForSendQueueDrain(timeout); err != nil {
+		return err
+	}
+	conn := s.getActiveConn()
+	if conn == nil {
+		return fmt.Errorf("session sync not connected")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := writeMsg(conn, syncMsgBarrier, payload); err != nil {
+		s.stats.Errors.Add(1)
+		s.handleDisconnect(conn)
+		return err
+	}
+	return nil
+}
+
 // WaitForPeerBarrier queues an ordered marker on the session-sync stream and
 // waits until the peer acknowledges that it processed all earlier messages.
 func (s *SessionSync) WaitForPeerBarrier(timeout time.Duration) error {
@@ -1449,20 +1590,19 @@ func (s *SessionSync) WaitForPeerBarrier(timeout time.Duration) error {
 
 	var payload [8]byte
 	binary.LittleEndian.PutUint64(payload[:], seq)
-	slog.Info("cluster sync: queueing barrier", "seq", seq)
-	// Enqueue barrier onto sendCh rather than writing directly to the socket.
-	// Writing directly after waitForSendQueueDrain has a race: sendLoop may
-	// have dequeued a message but not yet acquired writeMu, so the barrier
-	// could overtake an in-flight message and break ordering guarantees.
-	// Using sendCh preserves strict FIFO order with all other messages.
-	msg := encodeRawMessage(syncMsgBarrier, payload[:])
-	select {
-	case s.sendCh <- msg:
-	default:
+	stats := s.Stats()
+	slog.Info("cluster sync: queueing barrier",
+		"seq", seq,
+		"sessions_sent", stats.SessionsSent,
+		"sessions_received", stats.SessionsReceived,
+		"sessions_installed", stats.SessionsInstalled,
+		"queue_len", len(s.sendCh),
+		"queue_cap", cap(s.sendCh))
+	if err := s.writeBarrierMessage(payload[:], timeout/2); err != nil {
 		s.barrierWaitMu.Lock()
 		delete(s.barrierWaiters, seq)
 		s.barrierWaitMu.Unlock()
-		return fmt.Errorf("session sync send queue full, cannot enqueue barrier")
+		return err
 	}
 
 	timer := time.NewTimer(timeout)
@@ -1474,7 +1614,43 @@ func (s *SessionSync) WaitForPeerBarrier(timeout time.Duration) error {
 		s.barrierWaitMu.Lock()
 		delete(s.barrierWaiters, seq)
 		s.barrierWaitMu.Unlock()
-		return fmt.Errorf("timed out waiting for session sync barrier ack seq=%d", seq)
+		stats := s.Stats()
+		return fmt.Errorf(
+			"timed out waiting for session sync barrier ack seq=%d sessions_sent=%d sessions_received=%d sessions_installed=%d queue_len=%d",
+			seq,
+			stats.SessionsSent,
+			stats.SessionsReceived,
+			stats.SessionsInstalled,
+			len(s.sendCh),
+		)
+	}
+}
+
+// WaitForPeerBarriersDrained waits until all previously queued barriers have
+// been acknowledged by the peer. This avoids stacking a new demotion barrier
+// behind an older timed-out barrier that the peer is still draining.
+func (s *SessionSync) WaitForPeerBarriersDrained(timeout time.Duration) error {
+	target := s.barrierSeq.Load()
+	if target == 0 || s.barrierAckSeq.Load() >= target {
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if s.barrierAckSeq.Load() >= target {
+			return nil
+		}
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			return fmt.Errorf(
+				"timed out waiting for previous session sync barriers acked through seq=%d last_acked=%d",
+				target,
+				s.barrierAckSeq.Load(),
+			)
+		}
 	}
 }
 
@@ -1724,6 +1900,10 @@ func rebaseTimestamp(peerTS uint64, offset int64) uint64 {
 // writeFull loops until all bytes are written or an error occurs,
 // handling short writes from TCP backpressure.
 func writeFull(conn net.Conn, buf []byte) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(syncWriteDeadline)); err != nil {
+		return err
+	}
+	defer conn.SetWriteDeadline(time.Time{})
 	for len(buf) > 0 {
 		n, err := conn.Write(buf)
 		if err != nil {

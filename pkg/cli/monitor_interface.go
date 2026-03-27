@@ -66,6 +66,16 @@ type userspaceIfaceSnapshot struct {
 	directTXNoFrameFallbackPackets    uint64
 	directTXBuildFallbackPackets      uint64
 	directTXDisallowedFallbackPackets uint64
+	txCompletions                     uint64
+	kernelRXDropped                   uint64
+	kernelRXInvalidDescs              uint64
+	debugPendingFillFrames            uint64
+	debugSpareFillFrames              uint64
+	debugFreeTXFrames                 uint64
+	debugPendingTXPrepared            uint64
+	debugPendingTXLocal               uint64
+	debugOutstandingTX                uint64
+	debugInFlightRecycles             uint64
 	sessionMisses                     uint64
 	neighborMissPackets               uint64
 	routeMissPackets                  uint64
@@ -111,6 +121,16 @@ func aggregateUserspaceIfaceSnapshot(kernelName string, status dpuserspace.Proce
 		snap.directTXNoFrameFallbackPackets += binding.DirectTXNoFrameFallbackPackets
 		snap.directTXBuildFallbackPackets += binding.DirectTXBuildFallbackPackets
 		snap.directTXDisallowedFallbackPackets += binding.DirectTXDisallowedFallbackPackets
+		snap.txCompletions += binding.TXCompletions
+		snap.kernelRXDropped += binding.KernelRXDropped
+		snap.kernelRXInvalidDescs += binding.KernelRXInvalidDescs
+		snap.debugPendingFillFrames += uint64(binding.DebugPendingFillFrames)
+		snap.debugSpareFillFrames += uint64(binding.DebugSpareFillFrames)
+		snap.debugFreeTXFrames += uint64(binding.DebugFreeTXFrames)
+		snap.debugPendingTXPrepared += uint64(binding.DebugPendingTXPrepared)
+		snap.debugPendingTXLocal += uint64(binding.DebugPendingTXLocal)
+		snap.debugOutstandingTX += uint64(binding.DebugOutstandingTX)
+		snap.debugInFlightRecycles += uint64(binding.DebugInFlightRecycles)
 		snap.sessionMisses += binding.SessionMisses
 		snap.neighborMissPackets += binding.NeighborMissPackets
 		snap.routeMissPackets += binding.RouteMissPackets
@@ -477,6 +497,10 @@ func renderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 			usRxBytesDelta, usTxBytesDelta, usRxPktsDelta, usTxPktsDelta      uint64
 			usDirectDelta, usCopyDelta, usInPlaceDelta                        uint64
 			usDirectNoFrameDelta, usDirectBuildDelta, usDirectDisallowedDelta uint64
+			usTxCompletionsDelta, usKernelRXDroppedDelta, usKernelRXInvalidDelta uint64
+			usPendingFillDelta, usSpareFillDelta, usFreeTXDelta                uint64
+			usPendingPreparedDelta, usPendingLocalDelta                        uint64
+			usOutstandingTXDelta, usInFlightRecycleDelta                       uint64
 			usSessionMissDelta, usNeighborMissDelta, usRouteMissDelta         uint64
 			usPolicyDeniedDelta, usExceptionDelta, usSlowPathDelta            uint64
 		)
@@ -500,6 +524,16 @@ func renderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 			usDirectNoFrameDelta = snap.userspace.directTXNoFrameFallbackPackets - baseline.userspace.directTXNoFrameFallbackPackets
 			usDirectBuildDelta = snap.userspace.directTXBuildFallbackPackets - baseline.userspace.directTXBuildFallbackPackets
 			usDirectDisallowedDelta = snap.userspace.directTXDisallowedFallbackPackets - baseline.userspace.directTXDisallowedFallbackPackets
+			usTxCompletionsDelta = snap.userspace.txCompletions - baseline.userspace.txCompletions
+			usKernelRXDroppedDelta = snap.userspace.kernelRXDropped - baseline.userspace.kernelRXDropped
+			usKernelRXInvalidDelta = snap.userspace.kernelRXInvalidDescs - baseline.userspace.kernelRXInvalidDescs
+			usPendingFillDelta = snap.userspace.debugPendingFillFrames - baseline.userspace.debugPendingFillFrames
+			usSpareFillDelta = snap.userspace.debugSpareFillFrames - baseline.userspace.debugSpareFillFrames
+			usFreeTXDelta = snap.userspace.debugFreeTXFrames - baseline.userspace.debugFreeTXFrames
+			usPendingPreparedDelta = snap.userspace.debugPendingTXPrepared - baseline.userspace.debugPendingTXPrepared
+			usPendingLocalDelta = snap.userspace.debugPendingTXLocal - baseline.userspace.debugPendingTXLocal
+			usOutstandingTXDelta = snap.userspace.debugOutstandingTX - baseline.userspace.debugOutstandingTX
+			usInFlightRecycleDelta = snap.userspace.debugInFlightRecycles - baseline.userspace.debugInFlightRecycles
 			usSessionMissDelta = snap.userspace.sessionMisses - baseline.userspace.sessionMisses
 			usNeighborMissDelta = snap.userspace.neighborMissPackets - baseline.userspace.neighborMissPackets
 			usRouteMissDelta = snap.userspace.routeMissPackets - baseline.userspace.routeMissPackets
@@ -523,9 +557,19 @@ func renderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 		fmt.Fprintf(w, "  Direct TX packets:    %20d          [%d]\n", snap.userspace.directTXPackets, usDirectDelta)
 		fmt.Fprintf(w, "  Copy TX packets:      %20d          [%d]\n", snap.userspace.copyTXPackets, usCopyDelta)
 		fmt.Fprintf(w, "  In-place TX packets:  %20d          [%d]\n", snap.userspace.inPlaceTXPackets, usInPlaceDelta)
+		fmt.Fprintf(w, "  TX completions:       %20d          [%d]\n", snap.userspace.txCompletions, usTxCompletionsDelta)
+		fmt.Fprintf(w, "  Kernel RX dropped:    %20d          [%d]\n", snap.userspace.kernelRXDropped, usKernelRXDroppedDelta)
+		fmt.Fprintf(w, "  Kernel RX invalid:    %20d          [%d]\n", snap.userspace.kernelRXInvalidDescs, usKernelRXInvalidDelta)
 		fmt.Fprintf(w, "  Direct TX no-frame:   %20d          [%d]\n", snap.userspace.directTXNoFrameFallbackPackets, usDirectNoFrameDelta)
 		fmt.Fprintf(w, "  Direct TX build-none: %20d          [%d]\n", snap.userspace.directTXBuildFallbackPackets, usDirectBuildDelta)
 		fmt.Fprintf(w, "  Direct TX disallowed: %20d          [%d]\n", snap.userspace.directTXDisallowedFallbackPackets, usDirectDisallowedDelta)
+		fmt.Fprintf(w, "  Pending fill frames:  %20d          [%d]\n", snap.userspace.debugPendingFillFrames, usPendingFillDelta)
+		fmt.Fprintf(w, "  Spare fill frames:    %20d          [%d]\n", snap.userspace.debugSpareFillFrames, usSpareFillDelta)
+		fmt.Fprintf(w, "  Free TX frames:       %20d          [%d]\n", snap.userspace.debugFreeTXFrames, usFreeTXDelta)
+		fmt.Fprintf(w, "  Pending TX prepared:  %20d          [%d]\n", snap.userspace.debugPendingTXPrepared, usPendingPreparedDelta)
+		fmt.Fprintf(w, "  Pending TX local:     %20d          [%d]\n", snap.userspace.debugPendingTXLocal, usPendingLocalDelta)
+		fmt.Fprintf(w, "  Outstanding TX:       %20d          [%d]\n", snap.userspace.debugOutstandingTX, usOutstandingTXDelta)
+		fmt.Fprintf(w, "  In-flight recycles:   %20d          [%d]\n", snap.userspace.debugInFlightRecycles, usInFlightRecycleDelta)
 		fmt.Fprintf(w, "  Session misses:       %20d          [%d]\n", snap.userspace.sessionMisses, usSessionMissDelta)
 		fmt.Fprintf(w, "  Neighbor misses:      %20d          [%d]\n", snap.userspace.neighborMissPackets, usNeighborMissDelta)
 		fmt.Fprintf(w, "  Route misses:         %20d          [%d]\n", snap.userspace.routeMissPackets, usRouteMissDelta)

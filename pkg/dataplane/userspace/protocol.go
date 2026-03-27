@@ -13,6 +13,7 @@ const (
 
 type ControlRequest struct {
 	Type               string                    `json:"type"`
+	SuppressStatus     bool                      `json:"suppress_status,omitempty"`
 	Snapshot           *ConfigSnapshot           `json:"snapshot,omitempty"`
 	Forwarding         *ForwardingControlRequest `json:"forwarding,omitempty"`
 	HAState            *HAStateUpdateRequest     `json:"ha_state,omitempty"`
@@ -478,12 +479,20 @@ type BindingStatus struct {
 	TXPackets                         uint64    `json:"tx_packets,omitempty"`
 	TXBytes                           uint64    `json:"tx_bytes,omitempty"`
 	TXErrors                          uint64    `json:"tx_errors,omitempty"`
+	TXCompletions                     uint64    `json:"tx_completions,omitempty"`
 	DirectTXPackets                   uint64    `json:"direct_tx_packets,omitempty"`
 	CopyTXPackets                     uint64    `json:"copy_tx_packets,omitempty"`
 	InPlaceTXPackets                  uint64    `json:"in_place_tx_packets,omitempty"`
 	DirectTXNoFrameFallbackPackets    uint64    `json:"direct_tx_no_frame_fallback_packets,omitempty"`
 	DirectTXBuildFallbackPackets      uint64    `json:"direct_tx_build_fallback_packets,omitempty"`
 	DirectTXDisallowedFallbackPackets uint64    `json:"direct_tx_disallowed_fallback_packets,omitempty"`
+	DebugPendingFillFrames            uint32    `json:"debug_pending_fill_frames,omitempty"`
+	DebugSpareFillFrames              uint32    `json:"debug_spare_fill_frames,omitempty"`
+	DebugFreeTXFrames                 uint32    `json:"debug_free_tx_frames,omitempty"`
+	DebugPendingTXPrepared            uint32    `json:"debug_pending_tx_prepared,omitempty"`
+	DebugPendingTXLocal               uint32    `json:"debug_pending_tx_local,omitempty"`
+	DebugOutstandingTX                uint32    `json:"debug_outstanding_tx,omitempty"`
+	DebugInFlightRecycles             uint32    `json:"debug_in_flight_recycles,omitempty"`
 	LastHeartbeat                     time.Time `json:"last_heartbeat,omitempty"`
 	LastError                         string    `json:"last_error,omitempty"`
 	LastChange                        time.Time `json:"last_change,omitempty"`

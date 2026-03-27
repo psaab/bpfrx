@@ -543,6 +543,49 @@ func TestSyncSweepNewSessions(t *testing.T) {
 	}
 }
 
+func TestSyncSweepPausedSkipsIncrementalReplay(t *testing.T) {
+	now := monotonicSeconds()
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{
+				SrcIP:    [4]byte{10, 0, 0, 1},
+				DstIP:    [4]byte{10, 0, 0, 2},
+				SrcPort:  1234,
+				DstPort:  80,
+				Protocol: 6,
+			}: {
+				Created:     now,
+				LastSeen:    now,
+				IngressZone: 1,
+			},
+		},
+		sessionCounter: 1,
+	}
+	ss := NewSessionSync(":4785", "10.0.0.2:4785", dp)
+	ss.stats.Connected.Store(true)
+	ss.IsPrimaryFn = func() bool { return true }
+	ss.lastSweepTime = now - 1
+
+	ss.PauseIncrementalSync("test")
+	if got := ss.syncSweep(); got != 0 {
+		t.Fatalf("expected paused sweep to queue 0 sessions, got %d", got)
+	}
+	if len(ss.sendCh) != 0 {
+		t.Fatalf("expected paused sweep to leave send queue empty, got len=%d", len(ss.sendCh))
+	}
+	if ss.lastSweepTime != now-1 {
+		t.Fatalf("expected paused sweep to preserve lastSweepTime, got %d", ss.lastSweepTime)
+	}
+
+	ss.ResumeIncrementalSync("test")
+	if got := ss.syncSweep(); got != 1 {
+		t.Fatalf("expected resumed sweep to queue 1 session, got %d", got)
+	}
+	if len(ss.sendCh) != 1 {
+		t.Fatalf("expected resumed sweep to queue one message, got len=%d", len(ss.sendCh))
+	}
+}
+
 func TestSyncSweepSkipsReverse(t *testing.T) {
 	now := monotonicSeconds()
 	dp := &mockSweepDP{
@@ -773,6 +816,18 @@ type shortWriteConn struct {
 	buf []byte
 }
 
+func (c *shortWriteConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (c *shortWriteConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *shortWriteConn) SetWriteDeadline(time.Time) error {
+	return nil
+}
+
 func (c *shortWriteConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -856,11 +911,45 @@ func TestWriteFullDirectShortWrites(t *testing.T) {
 	}
 }
 
+func TestShouldInitiateFabricDial(t *testing.T) {
+	tests := []struct {
+		name     string
+		local    string
+		peer     string
+		expected bool
+	}{
+		{name: "lower address dials", local: "10.99.12.1:4785", peer: "10.99.12.2:4785", expected: true},
+		{name: "higher address listens", local: "10.99.12.2:4785", peer: "10.99.12.1:4785", expected: false},
+		{name: "lower port dials when ip same", local: "10.99.12.1:4784", peer: "10.99.12.1:4785", expected: true},
+		{name: "unparsable local preserves legacy dial", local: ":4785", peer: "10.99.12.2:4785", expected: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldInitiateFabricDial(tc.local, tc.peer); got != tc.expected {
+				t.Fatalf("shouldInitiateFabricDial(%q, %q)=%t want %t", tc.local, tc.peer, got, tc.expected)
+			}
+		})
+	}
+}
+
 // msgCapture wraps a net.Conn and records message types in order.
 type msgCapture struct {
 	net.Conn
 	mu       sync.Mutex
 	msgTypes []uint8
+}
+
+func (c *msgCapture) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (c *msgCapture) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *msgCapture) SetWriteDeadline(time.Time) error {
+	return nil
 }
 
 func (c *msgCapture) Write(b []byte) (int, error) {
@@ -1037,6 +1126,18 @@ func TestReconcileUsesSnapshotNotLive(t *testing.T) {
 type countingWriter struct {
 	net.Conn
 	sessionMsgs int
+}
+
+func (c *countingWriter) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (c *countingWriter) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *countingWriter) SetWriteDeadline(time.Time) error {
+	return nil
 }
 
 func (c *countingWriter) Write(b []byte) (int, error) {
@@ -1626,35 +1727,16 @@ func TestWaitForPeerBarrierRequiresConnection(t *testing.T) {
 
 func TestWaitForPeerBarrierCompletesOnAck(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	localConn, peerConn := net.Pipe()
+	defer localConn.Close()
+	defer peerConn.Close()
+	ss.conn0 = localConn
 	ss.stats.Connected.Store(true)
-	local, peer := net.Pipe()
-	defer local.Close()
-	defer peer.Close()
-	ss.mu.Lock()
-	ss.conn0 = local
-	ss.mu.Unlock()
-
-	// Start a goroutine to drain sendCh and write to the connection,
-	// simulating sendLoop (barrier is now enqueued via sendCh).
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case msg := <-ss.sendCh:
-				ss.writeMu.Lock()
-				_ = writeFull(local, msg)
-				ss.writeMu.Unlock()
-			}
-		}
-	}()
 
 	done := make(chan error, 1)
 	go func() {
 		msg := make([]byte, syncHeaderSize+8)
-		if _, err := io.ReadFull(peer, msg); err != nil {
+		if _, err := io.ReadFull(peerConn, msg); err != nil {
 			done <- fmt.Errorf("read barrier message: %w", err)
 			return
 		}
@@ -1666,7 +1748,11 @@ func TestWaitForPeerBarrierCompletesOnAck(t *testing.T) {
 			done <- fmt.Errorf("unexpected message type %d", msg[4])
 			return
 		}
-		ss.handleMessage(local, syncMsgBarrierAck, msg[syncHeaderSize:])
+		var ack [24]byte
+		copy(ack[:8], msg[syncHeaderSize:])
+		binary.LittleEndian.PutUint64(ack[8:16], 12)
+		binary.LittleEndian.PutUint64(ack[16:24], 9)
+		ss.handleMessage(nil, syncMsgBarrierAck, ack[:])
 		done <- nil
 	}()
 
@@ -1675,6 +1761,110 @@ func TestWaitForPeerBarrierCompletesOnAck(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("barrier helper failed: %v", err)
+	}
+}
+
+func TestWaitForPeerBarriersDrainedCompletesAfterAck(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.barrierSeq.Store(2)
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		ss.barrierAckSeq.Store(2)
+	}()
+
+	if err := ss.WaitForPeerBarriersDrained(100 * time.Millisecond); err != nil {
+		t.Fatalf("WaitForPeerBarriersDrained returned error: %v", err)
+	}
+}
+
+func TestWaitForPeerBarriersDrainedTimesOutWhenUnacked(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.barrierSeq.Store(3)
+	ss.barrierAckSeq.Store(1)
+
+	if err := ss.WaitForPeerBarriersDrained(20 * time.Millisecond); err == nil {
+		t.Fatal("expected WaitForPeerBarriersDrained to time out")
+	}
+}
+
+func TestHandleMessageFailoverDoesNotBlockReceiveLoop(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	started := make(chan int, 1)
+	release := make(chan struct{})
+	ss.OnRemoteFailover = func(rgID int) {
+		started <- rgID
+		<-release
+	}
+
+	done := make(chan struct{})
+	go func() {
+		ss.handleMessage(nil, syncMsgFailover, []byte{7})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("handleMessage blocked on remote failover callback")
+	}
+
+	select {
+	case rgID := <-started:
+		if rgID != 7 {
+			t.Fatalf("unexpected rgID %d", rgID)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("remote failover callback did not run")
+	}
+
+	close(release)
+}
+
+func TestSendLoopRetainsQueuedMessageUntilConnectionAvailable(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.stats.Connected.Store(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go ss.sendLoop(ctx)
+
+	done := make(chan error, 1)
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+
+	go func() {
+		msg := make([]byte, syncHeaderSize+8)
+		if _, err := io.ReadFull(peer, msg); err != nil {
+			done <- fmt.Errorf("read queued barrier: %w", err)
+			return
+		}
+		if msg[4] != syncMsgBarrier {
+			done <- fmt.Errorf("unexpected queued type %d", msg[4])
+			return
+		}
+		done <- nil
+	}()
+
+	var payload [8]byte
+	binary.LittleEndian.PutUint64(payload[:], 42)
+	msg := encodeRawMessage(syncMsgBarrier, payload[:])
+
+	ss.sendCh <- msg
+	time.Sleep(20 * time.Millisecond)
+
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.mu.Unlock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timed out waiting for queued barrier delivery")
 	}
 }
 
