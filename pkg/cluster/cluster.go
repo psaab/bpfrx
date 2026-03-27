@@ -111,6 +111,9 @@ type Manager struct {
 	controlInterface string
 	hbInterval       time.Duration
 	hbThreshold      int
+	hbLocalAddr      string // last StartHeartbeat localAddr (for restart)
+	hbPeerAddr       string // last StartHeartbeat peerAddr (for restart)
+	hbVRFDevice      string // last StartHeartbeat vrfDevice (for restart)
 
 	// Sync stats provider (set by daemon after sessionSync creation).
 	syncStats SyncStatsProvider
@@ -806,6 +809,9 @@ func (m *Manager) StartHeartbeat(localAddr, peerAddr, vrfDevice string) error {
 	m.mu.Lock()
 	m.hbSender = newHeartbeatSender(m, sendConn, peer, interval)
 	m.hbReceiver = newHeartbeatReceiver(m, recvConn, threshold, interval)
+	m.hbLocalAddr = localAddr
+	m.hbPeerAddr = peerAddr
+	m.hbVRFDevice = vrfDevice
 	m.mu.Unlock()
 
 	m.hbReceiver.start()
@@ -857,6 +863,41 @@ func (m *Manager) StopHeartbeat() {
 	if receiver != nil {
 		receiver.stop()
 	}
+}
+
+// RestartHeartbeat stops and restarts the heartbeat with the same parameters.
+// This is needed when the control interface's VRF binding changes (e.g. during
+// DHCP-triggered recompile) which invalidates the existing UDP sockets.
+// Retries up to 5 times with 1s delay if the bind fails (address may briefly
+// disappear during VRF rebind). Returns false if heartbeat was not running.
+func (m *Manager) RestartHeartbeat() bool {
+	m.mu.RLock()
+	running := m.hbSender != nil || m.hbReceiver != nil
+	localAddr := m.hbLocalAddr
+	peerAddr := m.hbPeerAddr
+	vrfDevice := m.hbVRFDevice
+	m.mu.RUnlock()
+
+	if !running || localAddr == "" {
+		return false
+	}
+
+	slog.Info("cluster: restarting heartbeat after VRF rebind",
+		"local", localAddr, "peer", peerAddr, "vrf", vrfDevice)
+
+	m.StopHeartbeat()
+
+	for i := 0; i < 5; i++ {
+		if err := m.StartHeartbeat(localAddr, peerAddr, vrfDevice); err != nil {
+			slog.Warn("cluster: heartbeat restart bind failed, retrying",
+				"err", err, "attempt", i+1)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		return true
+	}
+	slog.Error("cluster: heartbeat restart failed after retries")
+	return false
 }
 
 // buildHeartbeat creates a heartbeat packet from current state.

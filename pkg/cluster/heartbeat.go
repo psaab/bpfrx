@@ -25,10 +25,10 @@ const (
 	maxHeartbeatSize = 1472
 
 	// DefaultHeartbeatInterval is the default heartbeat send interval.
-	DefaultHeartbeatInterval = 1000 * time.Millisecond
+	DefaultHeartbeatInterval = 100 * time.Millisecond
 
 	// DefaultHeartbeatThreshold is the default missed heartbeat count before peer is lost.
-	DefaultHeartbeatThreshold = 3
+	DefaultHeartbeatThreshold = 5
 )
 
 // HeartbeatPacket is the wire format for cluster heartbeats.
