@@ -60,6 +60,132 @@ Updated live finding after the flow-cache invalidation work:
 - The old owner continues to process and redirect the flow over fabric, but the
   new owner never materializes the matching forward session alias.
 
+Updated live finding after staged demotion-prep and peer barrier ack:
+
+- The staged handoff now completes successfully for manual `RG1 node0 -> node1`
+  moves.
+- The old owner logs:
+  - `cluster sync: barrier ack received`
+  - `userspace: prepared rg demotion`
+  - `cluster: manual failover`
+- The new owner logs:
+  - `cluster sync: barrier received`
+  - `cluster sync: barrier ack sent`
+  - `cluster: primary transition`
+- After that, the established `iperf3 -P 4` flow stays healthy for roughly
+  5-6 seconds on the stale-owner fabric path, then collapses without a
+  `session_miss` storm.
+
+High-resolution monitor captures from
+`/tmp/failover-debug/continuous-monitors-long-20260327-085209` show:
+
+- old owner LAN ingress (`ge-0/0/1`) continues strongly through
+  `15:52:17` and then goes flat around `15:52:18`
+- old owner fabric TX (`ge-0/0/0`) continues strongly through
+  `15:52:17` and then goes flat around `15:52:18`
+- new owner fabric RX/TX (`ge-7/0/0`) continues strongly through
+  `15:52:17` and then goes flat around `15:52:18`
+- new owner WAN TX (`ge-7/0/2`) continues strongly through
+  `15:52:17` and then goes flat around `15:52:18`
+- no corresponding spike in userspace `Session misses`
+
+Interpretation:
+
+- The barrier/handoff stage is no longer the primary blocker.
+- The established redirected flow now survives the ownership move.
+- The remaining failure is a post-transition stale-owner fabric dataplane
+  collapse under sustained load, not a pre-transition demotion-prep miss.
+
+Latest gated failover result after pre-failover sync-idle checks and
+transition-window sampling:
+
+- The run now gets through:
+  - pre-failover sync-idle
+  - demotion prepare
+  - barrier ack
+  - RG1 move to `node1`
+- Immediate failover checks pass:
+  - target reachability
+  - external IPv4/IPv6 reachability
+  - zero transition-window `Kernel RX dropped`
+  - zero transition-window `Direct TX no-frame`
+- But the flow still is not healthy under sustained load:
+  - all four `iperf3` streams can hit `0.00 bits/sec` in the failover phase
+  - the new owner shows small but real `Policy denied packets` growth
+  - the remote `iperf3` client can stall at zero throughput and remain hung
+    until explicitly terminated
+
+Interpretation:
+
+- the remaining failure is not a simple barrier timeout anymore
+- it is a sustained post-transition transport failure on the redirected path
+- the failover harness must treat a hung remote `iperf3` client as a hard
+  failover failure rather than letting the run hang indefinitely
+
+Latest gated failover result after repeated direct-mode post-failover
+re-announcement bursts:
+
+- One-cycle harness run now passes end-to-end:
+  - sender throughput `20.685 Gbps`
+  - sender retransmits `4047`
+  - `0` zero-throughput intervals
+  - target + external IPv4/IPv6 reachability all pass
+- Transition-window path counters from
+  `/tmp/userspace-ha-failover-rg1-20260327-100223` show:
+  - old-owner LAN RX delta `11`
+  - old-owner fabric TX delta `11`
+  - new-owner fabric RX delta `14`
+  - new-owner WAN TX delta `11`
+
+Interpretation:
+
+- The repeated GARP/NA schedule materially improves the LAN-side ownership move.
+- In the passing gated run, traffic does not remain pinned to the old owner:
+  the stale-owner window is tiny and redirected packets are observed on the
+  new owner immediately.
+- The remaining manual-failover issue is no longer "traffic always collapses
+  after the move"; it is "manual failover is still blocked unless the session
+  sync path is quiescent enough to admit the move."
+
+Manual failover behavior after the runtime quiescence gate work:
+
+- early manual failover under active load now fails closed instead of
+  blackholing traffic:
+  - the CLI returns a demotion-prep quiescence error
+  - the daemon logs repeated preflight barrier attempts
+- later manual failover, after the sync stream has settled, is admitted and the
+  RG move completes
+- but even in that admitted case the redirected `iperf3` flow still degrades to
+  zero throughput and hangs until terminated
+
+Interpretation:
+
+- the quiescence gate is a keep: it stops unsafe failover attempts from
+  proceeding blindly
+- it does not solve the remaining dataplane problem
+- once failover is admitted, the surviving bug is still sustained
+  post-transition fabric transport collapse
+
+Latest manual failover admission result after bounded retry:
+
+- The exact operator command now blocks and succeeds instead of failing closed:
+  - `request chassis cluster failover redundancy-group 1 node 1`
+  - `rc=0`
+  - `elapsed_ms=6531`
+- Artifact:
+  - `/tmp/manual-failover-retry2-20260327-102950`
+- The data-plane result is still bad after admission:
+  - flow reaches `~20.4 Gbps` peak before failover
+  - then drops to `12.7 Gbps`
+  - then goes to sustained `0.0 Gbps`
+  - `52` zero intervals after peak
+
+Interpretation:
+
+- Manual failover admission is no longer the blocker.
+- The remaining manual-failover bug is now clearly post-admission dataplane
+  continuity, not control-plane quiescence gating.
+
 ### 2. Crash/rejoin of the active node
 
 Repro:
@@ -94,6 +220,38 @@ Interpretation:
 - The rebooted node is not returning quietly.
 - A management-only DHCP lease refresh is triggering a full dataplane recompile.
 - That recompile restarts cluster transport and destabilizes sync/fabric readiness while the survivor is already primary.
+
+Latest crash/rejoin result on the re-announce build:
+
+- Artifact:
+  - `/tmp/sysrqb-rejoin-20260327-103142`
+- Repro:
+  - long `iperf3 -c 172.16.80.200 -P 4`
+  - `echo b > /proc/sysrq-trigger` on active `node0`
+- Observed:
+  - short disruption during crash takeover:
+    - one interval `2.79 Gbps`
+    - then two `0.0 Gbps` intervals
+    - then one `9.57 Gbps` interval
+  - after that, traffic recovers to `~15-16 Gbps` and stays there
+  - no late collapse after the rebooted node returns
+  - end-of-run tail throughput stays healthy:
+    - tail median `15.79 Gbps`
+    - tail/peak ratio `0.95`
+  - external `1.1.1.1` ping log shows replies at the end of the observation
+  - final cluster state is stable:
+    - `node1` primary
+    - `node0` secondary
+    - both takeover-ready
+
+Interpretation:
+
+- The repeated re-announce + current failover gating materially improve the
+  crash/rejoin case.
+- The survivor takeover and returning-node rejoin no longer reproduce the old
+  “comes back and kills traffic again” behavior in this run.
+- The remaining high-value failure is the manual failover dataplane collapse
+  after an admitted RG move.
 
 ### 3. Warm standby is treated like a cold standby
 
@@ -230,6 +388,44 @@ Interpretation:
 - Those actions need a defined ordering, not just "same control update, best
   effort by workers."
 
+Status after the staged demotion-prep work:
+
+- This root cause is now largely addressed for manual failover.
+- The peer barrier is delivered and acked.
+- Duplicate demotion-prep is suppressed across the barrier wait.
+- Manual `RG1` failover now succeeds without the earlier immediate
+  blackhole-or-timeout failure.
+
+That means the remaining long-lived flow collapse is no longer explained by
+the original unstaged handoff itself.
+
+### Root cause F: stale-owner fabric transit cannot sustain the inherited established-flow rate after failover
+
+What the latest long-window capture shows:
+
+- immediately after the new owner becomes primary, the stale-owner path carries
+  the already-established flow at tens of Gbps for several seconds
+- the new owner fabric interface records an immediate input-drop jump when the
+  redirected burst arrives
+- the stale-owner fabric path and new-owner WAN path then flatten together
+  around 5-6 seconds after primary transition
+- userspace miss counters stay essentially flat during the collapse
+
+Interpretation:
+
+- The connection is no longer dying because the new owner missed the session
+  alias before the first redirected packets arrived.
+- It is now dying because the post-transition fabric path is too lossy under
+  the inherited established-flow rate, and TCP eventually collapses.
+- This matches the earlier stale-owner fabric performance ceiling work:
+  the path is functionally correct, but materially weaker than the direct WAN
+  path.
+
+The failover problem is therefore split into two layers:
+
+1. control correctness: barrier, session handoff, peer install ordering
+2. post-handoff transport quality: stale-owner fabric throughput/drop behavior
+
 ## Plan
 
 ### Phase 1: stage demotion before redirect
@@ -263,6 +459,12 @@ Expected result:
 
 - cache hits stop extending the stale-owner local-forward window
 - but they no longer race ahead of forward-session republish
+
+Status:
+
+- No longer the top blocker for the current manual failover repro.
+- The latest capture shows the established flow surviving the ownership move
+  and then collapsing later without miss growth.
 
 ### Phase 3: stop management-only DHCP from destabilizing rejoin
 
@@ -326,6 +528,42 @@ Expected result:
 - established `iperf3` flows survive manual RG moves instead of falling into
   `session_miss -> slow_path`
 
+Status:
+
+- The staged handoff work plus barrier delivery now appear to have solved the
+  original forward-wire install race for the manual failover case.
+- The next failure is no longer `session_miss -> slow_path`; it is
+  post-transition throughput collapse on the fabric path.
+
+### Phase 7: instrument and mitigate post-transition fabric collapse
+
+1. Keep the staged demotion-prep/barrier logic as-is for manual failover.
+2. Treat the remaining problem as stale-owner fabric transport quality, not
+   as another pre-transition sync bug.
+3. Add explicit failover metrics for the full post-transition collapse window,
+   not only the first 10 seconds after primary transition:
+   - old owner LAN RX
+   - old owner fabric TX
+   - new owner fabric RX/TX
+   - new owner WAN TX
+   - fabric interface drops
+   - retransmits / zero-throughput intervals
+4. Confirm whether the collapse is:
+   - immediate fabric drop saturation on the new owner
+   - old-owner fabric TX starvation/backpressure
+   - return-path loss causing client TCP to back off to zero
+5. Only after that choose the mitigation:
+   - temporary failover pacing / dampening on stale-owner fabric redirect
+   - higher-capacity / lower-loss fabric dataplane path
+   - queueing / wake / batching changes specific to the fabric bindings
+
+Expected result:
+
+- we stop conflating control-plane handoff correctness with fabric throughput
+  collapse
+- the next code changes target the actual remaining bottleneck instead of
+  reopening the now-working barrier path
+
 ## Execution order
 
 1. Implement staged demotion-prep and worker acking for RG handoff.
@@ -336,6 +574,9 @@ Expected result:
 6. Re-test crash/rejoin and manual failback.
 7. Extend failover validation to cover crash/rejoin.
 8. Keep the stale-owner fabric-redirect sync exemption and retest manual RG move.
+9. After the handoff is proven correct, instrument the first 10 seconds of
+   stale-owner fabric forwarding and address the remaining throughput collapse
+   as a transport-quality problem.
 
 ## Acceptance criteria
 
@@ -344,8 +585,9 @@ Expected result:
 - `iperf3` no longer dies permanently on `request chassis cluster failover redundancy-group 1 node 1`
 - old owner no longer shows a sustained local WAN forward window after demotion
 - new owner actually carries the flow
-- new owner shows forward-wire session hits instead of large `session_miss`
-  growth for the already-SNATed wire flow after the move
+- the post-transition stale-owner fabric path stays alive instead of collapsing
+  a few seconds after primary transition
+- retransmits and fabric input drops stay within the failover budget
 
 ### Crash/rejoin
 
