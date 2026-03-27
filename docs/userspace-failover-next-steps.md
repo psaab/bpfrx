@@ -98,9 +98,9 @@ Required behavior:
 
 Likely files:
 
-- [userspace-dp/src/main.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/main.rs)
-- [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
-- [userspace-dp/src/afxdp/session_glue.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/session_glue.rs)
+- [userspace-dp/src/main.rs](../userspace-dp/src/main.rs)
+- [userspace-dp/src/afxdp.rs](../userspace-dp/src/afxdp.rs)
+- [userspace-dp/src/afxdp/session_glue.rs](../userspace-dp/src/afxdp/session_glue.rs)
 
 ### 2. Make HA resolution treat a demoting RG like an inactive RG for local forwarding
 
