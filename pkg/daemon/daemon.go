@@ -1650,12 +1650,53 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
+	// 1.9. Pre-check: will RETH MAC programming require a link cycle?
+	// If yes, tell the userspace DP to skip initial worker startup during
+	// Compile(). Workers will be started by NotifyLinkCycle() after MAC
+	// programming is done. This avoids the double-bind that causes EBUSY
+	// on mlx5 zero-copy queues.
+	rethMACPending := false
+	if d.cluster != nil && cfg.Chassis.Cluster != nil && d.dp != nil {
+		cc := cfg.Chassis.Cluster
+		for rethName, physName := range cfg.RethToPhysical() {
+			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
+			if !ok || rethCfg.RedundancyGroup <= 0 {
+				continue
+			}
+			linuxName := config.LinuxIfName(physName)
+			link, err := netlink.LinkByName(linuxName)
+			if err != nil {
+				continue
+			}
+			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
+			if !bytes.Equal(link.Attrs().HardwareAddr, mac) {
+				rethMACPending = true
+				break
+			}
+		}
+		if rethMACPending {
+			type deferSetter interface{ SetDeferWorkers(bool) }
+			if ds, ok := d.dp.(deferSetter); ok {
+				ds.SetDeferWorkers(true)
+			}
+		}
+	}
+
 	// 2. Compile eBPF dataplane
 	var compileResult *dataplane.CompileResult
 	if d.dp != nil {
 		var err error
 		if compileResult, err = d.dp.Compile(cfg); err != nil {
 			slog.Warn("failed to compile dataplane", "err", err)
+		}
+	}
+
+	// Clear defer flag after Compile so subsequent recompiles (where MAC
+	// is already set) don't skip workers.
+	if rethMACPending {
+		type deferSetter interface{ SetDeferWorkers(bool) }
+		if ds, ok := d.dp.(deferSetter); ok {
+			ds.SetDeferWorkers(false)
 		}
 	}
 
@@ -1700,42 +1741,9 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		cc := cfg.Chassis.Cluster
 		rethToPhys := cfg.RethToPhysical()
 
-		// Pre-check: will any interface need a MAC change? If so, disable
-		// XSK BEFORE the link cycle to prevent segfaults from workers
-		// accessing UMEM pages that mlx5 unmaps during link DOWN.
-		macChangeNeeded := false
-		for rethName, physName := range rethToPhys {
-			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
-			if !ok || rethCfg.RedundancyGroup <= 0 {
-				continue
-			}
-			linuxName := config.LinuxIfName(physName)
-			link, err := netlink.LinkByName(linuxName)
-			if err != nil {
-				continue
-			}
-			mac := cluster.RethMAC(cc.ClusterID, rethCfg.RedundancyGroup, cc.NodeID)
-			if !bytes.Equal(link.Attrs().HardwareAddr, mac) {
-				macChangeNeeded = true
-				break
-			}
-		}
-		if macChangeNeeded && d.dp != nil {
-			// Stop XSK workers BEFORE the link cycle. PrepareLinkCycle
-			// disables ctrl, swaps to eBPF pipeline, and sends
-			// "stop_workers" to the Rust helper which joins all worker
-			// threads. No worker touches UMEM after this returns, so
-			// the NIC can safely unmap DMA pages during link DOWN.
-			// NotifyLinkCycle after MAC programming sends "rebind" to
-			// recreate workers with fresh AF_XDP sockets.
-			type linkCyclePreparer interface {
-				PrepareLinkCycle()
-			}
-			if preparer, ok := d.dp.(linkCyclePreparer); ok {
-				slog.Info("userspace: stopping workers before RETH MAC programming")
-				preparer.PrepareLinkCycle()
-			}
-		}
+		// PrepareLinkCycle is called on-demand after programRethMAC reports
+		// an actual link DOWN/UP cycle. Most drivers (mlx5, virtio) support
+		// IFF_LIVE_ADDR_CHANGE so no cycle is needed and workers keep running.
 
 		for rethName, physName := range rethToPhys {
 			rethCfg, ok := cfg.Interfaces.Interfaces[rethName]
@@ -1773,6 +1781,18 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			linkCycled, err := programRethMAC(linuxName, mac)
 			if err != nil {
 				slog.Warn("failed to set RETH MAC", "iface", linuxName, "mac", mac, "err", err)
+			}
+			if linkCycled && !needLinkCycleRecovery {
+				// First link cycle — stop workers NOW (they may have
+				// been accessing UMEM during the DOWN/UP). The rebind
+				// in NotifyLinkCycle will restart them.
+				if d.dp != nil {
+					type linkCyclePreparer interface{ PrepareLinkCycle() }
+					if preparer, ok := d.dp.(linkCyclePreparer); ok {
+						slog.Info("userspace: stopping workers after RETH MAC link cycle")
+						preparer.PrepareLinkCycle()
+					}
+				}
 			}
 			needLinkCycleRecovery = needLinkCycleRecovery || linkCycled
 			clearDadFailed(linuxName)
@@ -1863,16 +1883,23 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	}
 
 	// 2.6b2. Rebind AF_XDP sockets after RETH MAC programming.
-	// PrepareLinkCycle stops all workers unconditionally, so we must
-	// always rebind — even when MAC was set without a link cycle
-	// (the workers are still stopped and need to be restarted).
-	if d.dp != nil && d.cluster != nil && cfg.Chassis.Cluster != nil {
+	// Only needed when PrepareLinkCycle was called (macChangeNeeded=true
+	// or rethMACPending=true). Calling NotifyLinkCycle without a prior
+	// PrepareLinkCycle causes a spurious rebind that gets EBUSY on mlx5
+	// zero-copy queues because the first bind is still in progress.
+	if d.dp != nil && needLinkCycleRecovery {
+		// Actual link DOWN/UP occurred — old XSK sockets are dead.
+		// Rebind to create fresh sockets on the reinitialized queues.
 		d.dp.NotifyLinkCycle()
-		// Re-send RA startup burst AFTER the link is back up.  The
-		// previous startup burst fires during/before the link cycle
-		// and gets lost — hosts lose their IPv6 default gateway.
 		if d.ra != nil {
 			d.ra.ResendBurst()
+		}
+	} else if d.dp != nil && rethMACPending && !needLinkCycleRecovery {
+		// MAC set live (no link cycle) but workers were deferred.
+		// Trigger a re-Compile to start workers with the now-correct MAC.
+		// This is cheaper than NotifyLinkCycle (no stop_workers/rebind).
+		if _, err := d.dp.Compile(cfg); err != nil {
+			slog.Warn("failed to re-compile after deferred MAC", "err", err)
 		}
 	}
 
@@ -1924,6 +1951,14 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				slog.Warn("failed to re-bind interface to management VRF",
 					"interface", ifName, "err", err)
 			}
+		}
+		// Restart heartbeat after VRF rebind — networkd reconfigure moves
+		// the control interface (em0) out of vrf-mgmt temporarily, which
+		// invalidates the heartbeat UDP sockets. Without this restart,
+		// the recovering node stops receiving peer heartbeats and declares
+		// split-brain after the grace period expires.
+		if d.cluster != nil {
+			d.cluster.RestartHeartbeat()
 		}
 	}
 
@@ -5129,9 +5164,21 @@ func (d *Daemon) probeFabricNeighbor(ctx context.Context, fabIface string, peerI
 	}
 
 	// No neighbor entry — trigger ARP/NDP resolution via raw ICMP probe.
-	// In-process probe replaces the previous ping shell-out for
-	// deterministic startup timing and observability.
 	sendICMPProbe(fabIface, peerIP)
+
+	// Also probe on the parent interface if this is an IPVLAN overlay.
+	// After crash recovery, the IPVLAN overlay may not respond to ARP
+	// (stale MAC, vrf-mgmt routing isolation). The parent (ge-X-0-0)
+	// is a real NIC on the same L2 segment — ARP on it is more reliable.
+	// Additionally, send IPv6 ff02::1 multicast on the parent to populate
+	// the NDP table with the peer's MAC as a fallback.
+	if parentIdx := link.Attrs().ParentIndex; parentIdx > 0 {
+		if parent, err := netlink.LinkByIndex(parentIdx); err == nil {
+			parentName := parent.Attrs().Name
+			sendICMPProbe(parentName, peerIP)
+			sendIPv6MulticastProbe(parentName, parentIdx)
+		}
+	}
 }
 
 // sendICMPProbe sends a single raw ICMP/ICMPv6 echo request bound to
@@ -5165,6 +5212,27 @@ func sendICMPProbe(iface string, target net.IP) {
 		copy(sa6.Addr[:], target.To16())
 		_ = unix.Sendto(fd, icmp6[:], unix.MSG_DONTWAIT, sa6)
 	}
+}
+
+// sendIPv6MulticastProbe sends an ICMPv6 echo request to ff02::1 (all-nodes
+// multicast) on the given interface. All link-local nodes respond, populating
+// the IPv6 neighbor table with their MACs. This provides a reliable fallback
+// for discovering the fabric peer's MAC when IPv4 ARP fails (e.g. after
+// crash recovery with RETH MAC changes on IPVLAN overlays).
+func sendIPv6MulticastProbe(iface string, ifindex int) {
+	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6)
+	if err != nil {
+		return
+	}
+	defer unix.Close(fd)
+	_ = unix.SetsockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, iface)
+	_ = unix.SetsockoptInt(fd, unix.IPPROTO_ICMPV6, unix.IPV6_CHECKSUM, 2)
+	// ICMPv6 echo request: type=128, code=0, checksum=0 (kernel fills)
+	icmp6 := [8]byte{128, 0, 0, 0, 0, 0, 0, 1}
+	sa6 := &unix.SockaddrInet6{ZoneId: uint32(ifindex)}
+	// ff02::1 — all-nodes link-local multicast
+	copy(sa6.Addr[:], net.ParseIP("ff02::1").To16())
+	_ = unix.Sendto(fd, icmp6[:], unix.MSG_DONTWAIT, sa6)
 }
 
 func (d *Daemon) logFabricRefreshFailure(slot int, msg string, args ...any) {
@@ -5238,6 +5306,9 @@ func (d *Daemon) refreshFabricFwd(fabIface, overlay string, peerIP net.IP, logWa
 	if peerIP.To4() == nil {
 		neighFamily = netlink.FAMILY_V6
 	}
+
+	validState := netlink.NUD_REACHABLE | netlink.NUD_STALE | netlink.NUD_PERMANENT | netlink.NUD_DELAY | netlink.NUD_PROBE
+
 	neighs, err := netlink.NeighList(neighLink.Attrs().Index, neighFamily)
 	if err != nil {
 		d.logFabricRefreshFailure(0, "cluster: fabric refresh failed (neighbor list)",
@@ -5248,11 +5319,53 @@ func (d *Daemon) refreshFabricFwd(fabIface, overlay string, peerIP net.IP, logWa
 	var peerMAC net.HardwareAddr
 	for _, n := range neighs {
 		if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
-			(n.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|netlink.NUD_PERMANENT|netlink.NUD_DELAY|netlink.NUD_PROBE)) != 0 {
+			(n.State&validState) != 0 {
 			peerMAC = n.HardwareAddr
 			break
 		}
 	}
+
+	// Fallback: if overlay ARP failed, try the parent interface's neighbor
+	// tables (both IPv4 and IPv6). After crash recovery, the IPVLAN overlay
+	// may not resolve ARP due to stale MAC or VRF isolation, but the parent
+	// (ge-X-0-0) is a real NIC on the same L2 — its ARP/NDP is reliable.
+	if peerMAC == nil {
+		parentIdx := neighLink.Attrs().ParentIndex
+		if parentIdx == 0 {
+			parentIdx = link.Attrs().Index // use fabric parent directly
+		}
+		// Check parent IPv4 neighbors for the peer IP.
+		parentNeighs, _ := netlink.NeighList(parentIdx, neighFamily)
+		for _, n := range parentNeighs {
+			if n.IP.Equal(peerIP) && len(n.HardwareAddr) == 6 &&
+				(n.State&validState) != 0 {
+				peerMAC = n.HardwareAddr
+				slog.Info("cluster: fabric peer MAC resolved via parent ARP",
+					"peer_mac", peerMAC, "overlay", overlay)
+				break
+			}
+		}
+		// Check parent IPv6 NDP neighbors (populated via ff02::1 probe).
+		if peerMAC == nil {
+			v6Neighs, _ := netlink.NeighList(parentIdx, netlink.FAMILY_V6)
+			for _, n := range v6Neighs {
+				if len(n.HardwareAddr) != 6 || (n.State&validState) == 0 {
+					continue
+				}
+				if !n.IP.IsLinkLocalUnicast() {
+					continue
+				}
+				if bytes.Equal(n.HardwareAddr, localMAC) {
+					continue
+				}
+				peerMAC = n.HardwareAddr
+				slog.Info("cluster: fabric peer MAC resolved via parent IPv6 NDP",
+					"peer_mac", peerMAC, "peer_ll", n.IP, "overlay", overlay)
+				break
+			}
+		}
+	}
+
 	if peerMAC == nil {
 		if logWaiting {
 			slog.Info("cluster: waiting for fabric peer neighbor entry",
