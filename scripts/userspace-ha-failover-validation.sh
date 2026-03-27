@@ -784,12 +784,20 @@ validate_transition_window() {
 	to_fabric_rx_max="$(sample_window_interface_packets "$cycle" "$phase" "$seconds" "$to_vm" 'ge-[0-9]+-0-0' rx max)"
 	to_wan_tx_max="$(sample_window_interface_packets "$cycle" "$phase" "$seconds" "$to_vm" 'ge-[0-9]+-0-2' tx max)"
 
+	# Clamp deltas at 0: counter resets (helper restart/rebind) can produce
+	# negative values that silently pass the threshold checks.
 	to_kernel_rx_dropped_delta=$(( to_kernel_rx_dropped_max - $(status_summary_value "$to_pre" "Kernel RX dropped") ))
+	(( to_kernel_rx_dropped_delta < 0 )) && to_kernel_rx_dropped_delta=0
 	from_no_frame_delta=$(( from_no_frame_max - $(status_summary_value "$from_pre" "Direct TX no-frame fb") ))
+	(( from_no_frame_delta < 0 )) && from_no_frame_delta=0
 	from_lan_rx_delta=$(( from_lan_rx_max - $(interface_packets_value "$from_if_pre" 'ge-[0-9]+-0-1' rx) ))
+	(( from_lan_rx_delta < 0 )) && from_lan_rx_delta=0
 	from_fabric_tx_delta=$(( from_fabric_tx_max - $(interface_packets_value "$from_if_pre" 'ge-[0-9]+-0-0' tx) ))
+	(( from_fabric_tx_delta < 0 )) && from_fabric_tx_delta=0
 	to_fabric_rx_delta=$(( to_fabric_rx_max - $(interface_packets_value "$to_if_pre" 'ge-[0-9]+-0-0' rx) ))
+	(( to_fabric_rx_delta < 0 )) && to_fabric_rx_delta=0
 	to_wan_tx_delta=$(( to_wan_tx_max - $(interface_packets_value "$to_if_pre" 'ge-[0-9]+-0-2' tx) ))
+	(( to_wan_tx_delta < 0 )) && to_wan_tx_delta=0
 
 	if (( to_kernel_rx_dropped_delta <= MAX_TRANSITION_KERNEL_RX_DROPPED_DELTA )); then
 		pass "cycle ${cycle} ${phase}: ${to_name} transition kernel RX dropped delta ${to_kernel_rx_dropped_delta}"

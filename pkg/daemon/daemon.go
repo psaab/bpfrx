@@ -540,17 +540,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// Deletes are synced if this node is primary for any RG — the peer
 		// ignores deletes for sessions it doesn't have.
 		gc.OnDeleteV4 = func(key dataplane.SessionKey) {
-			if d.userspaceDemotionPrepActive() {
-				return
-			}
+			// Always sync deletes, even during demotion prep. Dropping
+			// deletes leaves stale sessions on the peer indefinitely.
 			if d.cluster != nil && d.cluster.IsLocalPrimaryAny() && d.sessionSync != nil {
 				d.sessionSync.QueueDeleteV4(key)
 			}
 		}
 		gc.OnDeleteV6 = func(key dataplane.SessionKeyV6) {
-			if d.userspaceDemotionPrepActive() {
-				return
-			}
 			if d.cluster != nil && d.cluster.IsLocalPrimaryAny() && d.sessionSync != nil {
 				d.sessionSync.QueueDeleteV6(key)
 			}
@@ -3584,6 +3580,14 @@ func (d *Daemon) acquireUserspaceRGDemotionPrep(rgID int, hold time.Duration) bo
 	return true
 }
 
+// releaseUserspaceRGDemotionPrep clears the suppression window so retries
+// (e.g. manual failover admission) can re-attempt demotion prep immediately.
+func (d *Daemon) releaseUserspaceRGDemotionPrep(rgID int) {
+	d.userspaceDemotionPrepMu.Lock()
+	delete(d.userspaceDemotionPrepUntil, rgID)
+	d.userspaceDemotionPrepMu.Unlock()
+}
+
 func (d *Daemon) prepareUserspaceRGDemotion(rgID int) error {
 	return d.prepareUserspaceRGDemotionWithTimeout(rgID, 30*time.Second)
 }
@@ -3612,6 +3616,13 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		slog.Info("userspace: skipping duplicate rg demotion prepare", "rg", rgID)
 		return nil
 	}
+	// On failure, clear the suppression window so retries can re-attempt.
+	var succeeded bool
+	defer func() {
+		if !succeeded {
+			d.releaseUserspaceRGDemotionPrep(rgID)
+		}
+	}()
 	preparer, ok := d.dp.(userspaceRGDemotionPreparer)
 	if !ok {
 		return nil
@@ -3693,6 +3704,7 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		return fmt.Errorf("demotion peer barrier failed queued_deltas=%d: %w", queued, err)
 	}
 	slog.Info("userspace: prepared rg demotion", "rg", rgID, "queued_deltas", queued)
+	succeeded = true
 	return nil
 }
 

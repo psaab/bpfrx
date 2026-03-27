@@ -77,7 +77,7 @@ Updated live finding after staged demotion-prep and peer barrier ack:
   `session_miss` storm.
 
 High-resolution monitor captures from
-`/tmp/failover-debug/continuous-monitors-long-20260327-085209` show:
+`./failover-debug/continuous-monitors-long-20260327-085209` show:
 
 - old owner LAN ingress (`ge-0/0/1`) continues strongly through
   `15:52:17` and then goes flat around `15:52:18`
@@ -131,7 +131,7 @@ re-announcement bursts:
   - `0` zero-throughput intervals
   - target + external IPv4/IPv6 reachability all pass
 - Transition-window path counters from
-  `/tmp/userspace-ha-failover-rg1-20260327-100223` show:
+  `./userspace-ha-failover-rg1-20260327-100223` show:
   - old-owner LAN RX delta `11`
   - old-owner fabric TX delta `11`
   - new-owner fabric RX delta `14`
@@ -173,7 +173,7 @@ Latest manual failover admission result after bounded retry:
   - `rc=0`
   - `elapsed_ms=6531`
 - Artifact:
-  - `/tmp/manual-failover-retry2-20260327-102950`
+  - `./manual-failover-retry2-20260327-102950`
 - The data-plane result is still bad after admission:
   - flow reaches `~20.4 Gbps` peak before failover
   - then drops to `12.7 Gbps`
@@ -224,7 +224,7 @@ Interpretation:
 Latest crash/rejoin result on the re-announce build:
 
 - Artifact:
-  - `/tmp/sysrqb-rejoin-20260327-103142`
+  - `./sysrqb-rejoin-20260327-103142`
 - Repro:
   - long `iperf3 -c 172.16.80.200 -P 4`
   - `echo b > /proc/sysrq-trigger` on active `node0`
