@@ -1020,6 +1020,35 @@ func TestBulkSyncSerialization(t *testing.T) {
 	}
 }
 
+func TestBulkSyncWriteFailureClearsActiveConnection(t *testing.T) {
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 1, 1}, Protocol: 6, SrcPort: 1000, DstPort: 80}: {
+				IsReverse: 0, IngressZone: 1,
+			},
+		},
+	}
+
+	local, peer := net.Pipe()
+	peer.Close()
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return true }
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.mu.Unlock()
+
+	if err := ss.BulkSync(); err == nil {
+		t.Fatal("BulkSync() unexpectedly succeeded on broken connection")
+	}
+	if ss.getActiveConn() != nil {
+		t.Fatal("BulkSync() write failure should clear the active connection")
+	}
+	if ss.IsConnected() {
+		t.Fatal("BulkSync() write failure should mark sync disconnected")
+	}
+}
+
 func TestBulkEpochMismatchIgnored(t *testing.T) {
 	// BulkEnd with mismatched epoch should be ignored (no reconciliation, no callback).
 	dp := &mockSweepDP{
@@ -1817,6 +1846,41 @@ func TestWaitForPeerBarriersDrainedTimesOutWhenUnacked(t *testing.T) {
 
 	if err := ss.WaitForPeerBarriersDrained(20 * time.Millisecond); err == nil {
 		t.Fatal("expected WaitForPeerBarriersDrained to time out")
+	}
+}
+
+func TestHandleDisconnectResetsBarrierStateAfterTotalDisconnect(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	local, peer := net.Pipe()
+	defer peer.Close()
+
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.mu.Unlock()
+	ss.stats.Connected.Store(true)
+	ss.barrierSeq.Store(3)
+	ss.barrierAckSeq.Store(1)
+	ss.barrierWaitMu.Lock()
+	ss.barrierWaiters = map[uint64]chan struct{}{
+		2: make(chan struct{}),
+	}
+	ss.barrierWaitMu.Unlock()
+
+	ss.handleDisconnect(local)
+
+	if ss.barrierSeq.Load() != 0 {
+		t.Fatalf("barrierSeq = %d, want 0", ss.barrierSeq.Load())
+	}
+	if ss.barrierAckSeq.Load() != 0 {
+		t.Fatalf("barrierAckSeq = %d, want 0", ss.barrierAckSeq.Load())
+	}
+	if err := ss.WaitForPeerBarriersDrained(20 * time.Millisecond); err != nil {
+		t.Fatalf("WaitForPeerBarriersDrained() after disconnect = %v", err)
+	}
+	ss.barrierWaitMu.Lock()
+	defer ss.barrierWaitMu.Unlock()
+	if len(ss.barrierWaiters) != 0 {
+		t.Fatalf("barrier waiters not cleared: %d", len(ss.barrierWaiters))
 	}
 }
 

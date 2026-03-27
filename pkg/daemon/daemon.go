@@ -96,6 +96,7 @@ type Daemon struct {
 	cluster          *cluster.Manager
 	sessionSync      *cluster.SessionSync
 	syncBulkPrimed   atomic.Bool
+	syncPrimeRetryGen atomic.Uint64
 	syncReadyTimerMu sync.Mutex
 	syncReadyTimer   *time.Timer
 	syncReadyTimeout time.Duration
@@ -288,18 +289,22 @@ func (d *Daemon) armSyncReadyTimer() {
 }
 
 func (d *Daemon) onSessionSyncPeerConnected() {
-	if d.syncBulkPrimed.Load() {
-		if d.cluster != nil {
-			d.cluster.SetSyncReady(true)
-		}
-		d.stopSyncReadyTimer()
-		return
+	d.syncBulkPrimed.Store(false)
+	gen := d.syncPrimeRetryGen.Add(1)
+	slog.Info("cluster: session sync peer connected",
+		"retry_gen", gen,
+		"cluster_sync_ready", d.cluster != nil && d.cluster.IsSyncReady())
+	if d.cluster != nil {
+		d.cluster.SetSyncReady(false)
 	}
 	d.armSyncReadyTimer()
+	d.startSessionSyncPrimeRetry(gen)
 }
 
 func (d *Daemon) onSessionSyncBulkReceived() {
 	d.syncBulkPrimed.Store(true)
+	slog.Info("cluster: session sync bulk received",
+		"retry_gen", d.syncPrimeRetryGen.Load())
 	d.stopSyncReadyTimer()
 	if d.vrrpMgr != nil {
 		d.vrrpMgr.ReleaseSyncHold()
@@ -310,14 +315,80 @@ func (d *Daemon) onSessionSyncBulkReceived() {
 }
 
 func (d *Daemon) onSessionSyncPeerDisconnected() {
-	if d.syncBulkPrimed.Load() {
-		slog.Info("cluster: sync peer disconnected, preserving sync readiness after completed bulk sync")
-		return
-	}
+	d.syncBulkPrimed.Store(false)
+	gen := d.syncPrimeRetryGen.Add(1)
+	slog.Info("cluster: session sync peer disconnected",
+		"retry_gen", gen,
+		"cluster_sync_ready", d.cluster != nil && d.cluster.IsSyncReady())
 	if d.cluster != nil {
 		d.cluster.SetSyncReady(false)
 	}
 	d.armSyncReadyTimer()
+}
+
+func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
+	ss := d.sessionSync
+	if ss == nil || d.dp == nil {
+		return
+	}
+	go func() {
+		const (
+			maxAttempts = 6
+			interval    = 2 * time.Second
+		)
+		slog.Info("cluster: starting session sync bulk-prime retry loop",
+			"retry_gen", gen,
+			"max_attempts", maxAttempts,
+			"interval", interval.String())
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			time.Sleep(interval)
+			if d.syncPrimeRetryGen.Load() != gen {
+				slog.Info("cluster: stopping session sync bulk-prime retry loop",
+					"retry_gen", gen,
+					"attempt", attempt,
+					"reason", "generation advanced")
+				return
+			}
+			if d.syncBulkPrimed.Load() {
+				slog.Info("cluster: stopping session sync bulk-prime retry loop",
+					"retry_gen", gen,
+					"attempt", attempt,
+					"reason", "peer already bulk primed")
+				return
+			}
+			if d.sessionSync != ss || !ss.IsConnected() {
+				reason := "session sync replaced"
+				if d.sessionSync == ss && !ss.IsConnected() {
+					reason = "session sync disconnected"
+				}
+				slog.Info("cluster: stopping session sync bulk-prime retry loop",
+					"retry_gen", gen,
+					"attempt", attempt,
+					"reason", reason)
+				return
+			}
+			slog.Info("cluster: retrying session sync bulk prime",
+				"retry_gen", gen,
+				"attempt", attempt,
+				"connected", ss.IsConnected())
+			if err := ss.BulkSync(); err != nil {
+				slog.Warn("cluster: session sync bulk prime retry failed",
+					"retry_gen", gen,
+					"attempt", attempt,
+					"err", err)
+				continue
+			}
+			if d.syncBulkPrimed.Load() {
+				slog.Info("cluster: session sync bulk prime retry loop observed primed peer",
+					"retry_gen", gen,
+					"attempt", attempt)
+				return
+			}
+		}
+		slog.Warn("cluster: session sync bulk-prime retry loop exhausted",
+			"retry_gen", gen,
+			"attempts", maxAttempts)
+	}()
 }
 
 func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
@@ -3063,6 +3134,10 @@ type userspaceSessionDeltaDrainer interface {
 	DrainSessionDeltas(max uint32) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error)
 }
 
+type userspaceSessionExporter interface {
+	ExportOwnerRGSessions(rgIDs []int, max uint32) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error)
+}
+
 type userspaceRGDemotionPreparer interface {
 	PrepareRGDemotion(rgIDs []int) error
 }
@@ -3560,6 +3635,21 @@ func (d *Daemon) drainUserspaceSessionDeltasWithConfig(
 	return total, nil
 }
 
+func (d *Daemon) exportUserspaceOwnerRGSessionsWithConfig(
+	exporter userspaceSessionExporter,
+	cfg *config.Config,
+	rgIDs []int,
+) (int, error) {
+	if exporter == nil || cfg == nil || len(rgIDs) == 0 {
+		return 0, nil
+	}
+	deltas, _, err := exporter.ExportOwnerRGSessions(rgIDs, 0)
+	if err != nil {
+		return 0, err
+	}
+	return d.queueUserspaceSessionDeltas(buildZoneIDs(cfg), deltas), nil
+}
+
 func (d *Daemon) tryPrepareUserspaceRGDemotion(rgID int) {
 	if err := d.prepareUserspaceRGDemotionWithTimeout(rgID, 5*time.Second); err != nil {
 		slog.Warn("userspace: prepare rg demotion failed", "rg", rgID, "err", err)
@@ -3584,8 +3674,8 @@ func (d *Daemon) acquireUserspaceRGDemotionPrep(rgID int, hold time.Duration) bo
 // (e.g. manual failover admission) can re-attempt demotion prep immediately.
 func (d *Daemon) releaseUserspaceRGDemotionPrep(rgID int) {
 	d.userspaceDemotionPrepMu.Lock()
+	defer d.userspaceDemotionPrepMu.Unlock()
 	delete(d.userspaceDemotionPrepUntil, rgID)
-	d.userspaceDemotionPrepMu.Unlock()
 }
 
 func (d *Daemon) prepareUserspaceRGDemotion(rgID int) error {
@@ -3598,6 +3688,7 @@ func wrapUserspaceManualFailoverPrepareError(err error) error {
 	}
 	msg := err.Error()
 	if strings.Contains(msg, "previous demotion barrier still pending") ||
+		strings.Contains(msg, "session sync not ready before demotion") ||
 		strings.Contains(msg, "session sync peer not quiescent before demotion") ||
 		strings.Contains(msg, "demotion peer barrier failed") {
 		return &cluster.RetryablePreFailoverError{Err: err}
@@ -3616,22 +3707,26 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		slog.Info("userspace: skipping duplicate rg demotion prepare", "rg", rgID)
 		return nil
 	}
-	// On failure, clear the suppression window so retries can re-attempt.
-	var succeeded bool
+	success := false
 	defer func() {
-		if !succeeded {
+		if !success {
 			d.releaseUserspaceRGDemotionPrep(rgID)
 		}
 	}()
 	preparer, ok := d.dp.(userspaceRGDemotionPreparer)
 	if !ok {
+		success = true
 		return nil
 	}
 	if d.sessionSync == nil || !d.sessionSync.IsConnected() {
 		if err := preparer.PrepareRGDemotion([]int{rgID}); err != nil {
 			return err
 		}
+		success = true
 		return nil
+	}
+	if !d.syncBulkPrimed.Load() {
+		return fmt.Errorf("session sync not ready before demotion: peer bulk sync incomplete")
 	}
 	pendingBarrierTimeout := barrierTimeout / 2
 	if pendingBarrierTimeout > 10*time.Second {
@@ -3683,26 +3778,35 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	}
 	resume := d.beginUserspaceDemotionPrepSyncPause(rgID)
 	defer resume()
+	queued := 0
+	exporter, exportOK := d.dp.(userspaceSessionExporter)
+	drainer, ok := d.dp.(userspaceSessionDeltaDrainer)
+	cfg := d.store.ActiveConfig()
+	if cfg != nil {
+		if exportOK {
+			exported, err := d.exportUserspaceOwnerRGSessionsWithConfig(exporter, cfg, []int{rgID})
+			if err != nil {
+				return err
+			}
+			queued += exported
+		}
+		if ok {
+			d.userspaceDeltaSyncMu.Lock()
+			drained, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 8)
+			d.userspaceDeltaSyncMu.Unlock()
+			if err != nil {
+				return err
+			}
+			queued += drained
+		}
+		if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {
+			return fmt.Errorf("demotion peer barrier failed queued_deltas=%d: %w", queued, err)
+		}
+	}
 	if err := preparer.PrepareRGDemotion([]int{rgID}); err != nil {
 		return err
 	}
-	drainer, ok := d.dp.(userspaceSessionDeltaDrainer)
-	if !ok {
-		return nil
-	}
-	cfg := d.store.ActiveConfig()
-	if cfg == nil {
-		return nil
-	}
-	d.userspaceDeltaSyncMu.Lock()
-	defer d.userspaceDeltaSyncMu.Unlock()
-	queued, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 8)
-	if err != nil {
-		return err
-	}
-	if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {
-		return fmt.Errorf("demotion peer barrier failed queued_deltas=%d: %w", queued, err)
-	}
+	success = true
 	slog.Info("userspace: prepared rg demotion", "rg", rgID, "queued_deltas", queued)
 	succeeded = true
 	return nil

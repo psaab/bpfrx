@@ -579,6 +579,7 @@ pub struct Coordinator {
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
     demotion_prepare_seq: AtomicU64,
+    session_export_seq: AtomicU64,
     forwarding: ForwardingState,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
@@ -618,6 +619,7 @@ impl Coordinator {
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
             demotion_prepare_seq: AtomicU64::new(0),
+            session_export_seq: AtomicU64::new(0),
             forwarding: ForwardingState::default(),
             recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
             recent_session_deltas: Arc::new(Mutex::new(VecDeque::with_capacity(
@@ -1051,6 +1053,7 @@ impl Coordinator {
             let stop = Arc::new(AtomicBool::new(false));
             let heartbeat = Arc::new(AtomicU64::new(monotonic_nanos()));
             let demotion_prepare_ack = Arc::new(AtomicU64::new(0));
+            let session_export_ack = Arc::new(AtomicU64::new(0));
             let commands = worker_command_queues
                 .get(&worker_id)
                 .cloned()
@@ -1068,6 +1071,7 @@ impl Coordinator {
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
             let demotion_prepare_ack_clone = demotion_prepare_ack.clone();
+            let session_export_ack_clone = session_export_ack.clone();
             let commands_clone = commands.clone();
             let peer_commands_clone = worker_command_queues
                 .iter()
@@ -1101,6 +1105,7 @@ impl Coordinator {
                         stop_clone,
                         heartbeat_clone,
                         demotion_prepare_ack_clone,
+                        session_export_ack_clone,
                         worker_poll_mode,
                         dnat_fds,
                         shared_fabrics,
@@ -1119,6 +1124,7 @@ impl Coordinator {
                             heartbeat,
                             commands,
                             demotion_prepare_ack,
+                            session_export_ack,
                             join: Some(join),
                         },
                     );
@@ -1336,11 +1342,21 @@ impl Coordinator {
         let previous = self.ha_state.load();
         let mut state = BTreeMap::new();
         for group in groups {
+            let demoting = if group.active {
+                previous
+                    .as_ref()
+                    .get(&group.rg_id)
+                    .map(|runtime| runtime.demoting)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
             state.insert(
                 group.rg_id,
                 HAGroupRuntime {
                     active: group.active,
                     watchdog_timestamp: group.watchdog_timestamp,
+                    demoting,
                 },
             );
         }
@@ -1394,10 +1410,31 @@ impl Coordinator {
         }
     }
 
+    fn set_demoting_owner_rgs(&self, owner_rgs: &[i32], demoting: bool) {
+        if owner_rgs.is_empty() {
+            return;
+        }
+        let previous = self.ha_state.load();
+        let mut state = previous.as_ref().clone();
+        let mut changed = false;
+        for rg_id in owner_rgs {
+            if let Some(runtime) = state.get_mut(rg_id) {
+                if runtime.demoting != demoting {
+                    runtime.demoting = demoting && runtime.active;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.ha_state.store(Arc::new(state));
+        }
+    }
+
     pub fn prepare_ha_demotion(&self, owner_rgs: &[i32]) -> Result<(), String> {
         if owner_rgs.is_empty() {
             return Ok(());
         }
+        self.set_demoting_owner_rgs(owner_rgs, true);
         let sequence = self
             .demotion_prepare_seq
             .fetch_add(1, Ordering::Relaxed)
@@ -1422,12 +1459,65 @@ impl Coordinator {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
+                self.set_demoting_owner_rgs(owner_rgs, false);
                 return Err(format!(
                     "timed out waiting for demotion prepare ack seq={sequence}"
                 ));
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    pub fn export_owner_rg_sessions(
+        &self,
+        owner_rgs: &[i32],
+        max: usize,
+    ) -> Result<Vec<SessionDeltaInfo>, String> {
+        if owner_rgs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sequence = self
+            .session_export_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        for handle in self.workers.values() {
+            let mut pending = handle
+                .commands
+                .lock()
+                .map_err(|_| "worker command queue poisoned".to_string())?;
+            pending.push_back(WorkerCommand::ExportOwnerRGSessions {
+                sequence,
+                owner_rgs: owner_rgs.to_vec(),
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if self
+                .workers
+                .values()
+                .all(|handle| handle.session_export_ack.load(Ordering::Acquire) >= sequence)
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for session export ack seq={sequence}"
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut out = Vec::new();
+        let mut remaining = if max == 0 { usize::MAX } else { max.max(1) };
+        while remaining > 0 {
+            let batch_size = remaining.min(1024);
+            let drained = self.drain_session_deltas(batch_size);
+            if drained.is_empty() {
+                break;
+            }
+            remaining = remaining.saturating_sub(drained.len());
+            out.extend(drained);
+        }
+        Ok(out)
     }
 
     pub fn ha_groups(&self) -> Vec<HAGroupStatus> {
@@ -1846,6 +1936,7 @@ struct WorkerHandle {
     heartbeat: Arc<AtomicU64>,
     commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
     demotion_prepare_ack: Arc<AtomicU64>,
+    session_export_ack: Arc<AtomicU64>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -1933,6 +2024,7 @@ struct ForwardingState {
 struct HAGroupRuntime {
     active: bool,
     watchdog_timestamp: u64,
+    demoting: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2425,6 +2517,7 @@ enum WorkerCommand {
     UpsertSynced(SyncedSessionEntry),
     UpsertLocal(SyncedSessionEntry),
     DeleteSynced(SessionKey),
+    ExportOwnerRGSessions { sequence: u64, owner_rgs: Vec<i32> },
     PrepareDemoteOwnerRGs { sequence: u64, owner_rgs: Vec<i32> },
     DemoteOwnerRG(i32),
     RefreshOwnerRGs(Vec<i32>),
@@ -5879,6 +5972,7 @@ fn worker_loop(
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
     demotion_prepare_ack: Arc<AtomicU64>,
+    session_export_ack: Arc<AtomicU64>,
     poll_mode: crate::PollMode,
     dnat_fds: DnatTableFds,
     shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
@@ -6071,6 +6165,7 @@ fn worker_loop(
             WorkerCommandResults {
                 cancelled_keys: Vec::new(),
                 prepared_sequences: Vec::new(),
+                exported_sequences: Vec::new(),
             }
         };
         if !command_results.cancelled_keys.is_empty() {
@@ -6210,7 +6305,9 @@ fn worker_loop(
         if !bindings.is_empty() {
             poll_start = (poll_start + 1) % bindings.len();
         }
-        if !command_results.prepared_sequences.is_empty() {
+        if !command_results.prepared_sequences.is_empty()
+            || !command_results.exported_sequences.is_empty()
+        {
             while sessions.has_pending_deltas() {
                 let deltas = sessions.drain_deltas(256);
                 purge_queued_flows_for_closed_deltas(&mut bindings, &deltas);
@@ -6231,6 +6328,9 @@ fn worker_loop(
             }
             if let Some(sequence) = command_results.prepared_sequences.iter().copied().max() {
                 demotion_prepare_ack.store(sequence, Ordering::Release);
+            }
+            if let Some(sequence) = command_results.exported_sequences.iter().copied().max() {
+                session_export_ack.store(sequence, Ordering::Release);
             }
         } else if sessions.has_pending_deltas() {
             let deltas = sessions.drain_deltas(256);
@@ -8889,7 +8989,7 @@ fn enforce_ha_resolution_snapshot(
             ..resolution
         };
     };
-    if !group.active {
+    if !group.active || group.demoting {
         return ForwardingResolution {
             disposition: ForwardingDisposition::HAInactive,
             ..resolution
@@ -12208,6 +12308,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )])));
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -12242,6 +12343,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )])));
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -12520,6 +12622,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )])));
         let resolved = enforce_ha_resolution(
@@ -12538,6 +12641,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )])));
         let resolved = enforce_ha_resolution(
@@ -12552,6 +12656,25 @@ mod tests {
     }
 
     #[test]
+    fn ha_resolution_blocks_demoting_owner_rg() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                demoting: true,
+            },
+        )])));
+        let resolved = enforce_ha_resolution(
+            &state,
+            &ha_state,
+            lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        );
+        assert_eq!(resolved.disposition, ForwardingDisposition::HAInactive);
+    }
+
+    #[test]
     fn cached_flow_decision_invalidates_when_owner_rg_is_demoted() {
         let state = build_forwarding_state(&nat_snapshot());
         let active = BTreeMap::from([(
@@ -12559,6 +12682,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )]);
         let demoted = BTreeMap::from([(
@@ -12566,6 +12690,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )]);
         let resolution =
@@ -12588,6 +12713,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )])));
         let blocked = enforce_ha_resolution(
@@ -12629,6 +12755,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )])));
         let blocked = enforce_ha_resolution(
@@ -12812,6 +12939,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )])));
         let blocked = enforce_ha_resolution(
@@ -12841,6 +12969,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )]);
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -12879,6 +13008,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )]);
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -13200,6 +13330,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )]);
         let icmp_match = EmbeddedIcmpMatch {
@@ -13352,6 +13483,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         )]);
         let icmp_match = EmbeddedIcmpMatch {
@@ -14098,6 +14230,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 11,
+                demoting: false,
                 },
             ),
             (
@@ -14105,6 +14238,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 12,
+                demoting: false,
                 },
             ),
         ]);
@@ -14114,6 +14248,7 @@ mod tests {
                 HAGroupRuntime {
                     active: false,
                     watchdog_timestamp: 21,
+                demoting: false,
                 },
             ),
             (
@@ -14121,6 +14256,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 22,
+                demoting: false,
                 },
             ),
         ]);
@@ -14136,6 +14272,7 @@ mod tests {
                 HAGroupRuntime {
                     active: false,
                     watchdog_timestamp: 11,
+                demoting: false,
                 },
             ),
             (
@@ -14143,6 +14280,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 12,
+                demoting: false,
                 },
             ),
         ]);
@@ -14152,6 +14290,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 21,
+                demoting: false,
                 },
             ),
             (
@@ -14159,6 +14298,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 22,
+                demoting: false,
                 },
             ),
         ]);

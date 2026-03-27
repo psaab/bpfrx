@@ -140,6 +140,7 @@ pub(super) fn owner_rg_is_locally_active(
             ha_state.get(&owner_rg_id),
             Some(group)
                 if group.active
+                    && !group.demoting
                     && group.watchdog_timestamp != 0
                     && now_secs >= group.watchdog_timestamp
                     && now_secs.saturating_sub(group.watchdog_timestamp)
@@ -172,6 +173,7 @@ fn owner_rg_is_unseeded(
             None | Some(HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 0,
+                ..
             })
         )
 }
@@ -195,6 +197,32 @@ fn should_bypass_unseeded_tunnel_ha(
 pub(super) struct WorkerCommandResults {
     pub cancelled_keys: Vec<SessionKey>,
     pub prepared_sequences: Vec<u64>,
+    pub exported_sequences: Vec<u64>,
+}
+
+fn export_forward_sessions_for_owner_rgs(sessions: &mut SessionTable, owner_rgs: &[i32]) {
+    if owner_rgs.is_empty() {
+        return;
+    }
+    let mut export = Vec::new();
+    sessions.iter(|key, decision, metadata| {
+        if metadata.is_reverse || metadata.synced || metadata.fabric_ingress {
+            return;
+        }
+        if !owner_rgs.contains(&metadata.owner_rg_id) {
+            return;
+        }
+        if !matches!(
+            decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
+        ) {
+            return;
+        }
+        export.push((key.clone(), decision, metadata.clone()));
+    });
+    for (key, decision, metadata) in export {
+        sessions.emit_open_delta(key, decision, metadata, true);
+    }
 }
 
 pub(super) fn apply_worker_commands(
@@ -215,6 +243,7 @@ pub(super) fn apply_worker_commands(
                 return WorkerCommandResults {
                     cancelled_keys: Vec::new(),
                     prepared_sequences: Vec::new(),
+                    exported_sequences: Vec::new(),
                 };
             }
             core::mem::take(&mut *pending)
@@ -223,6 +252,7 @@ pub(super) fn apply_worker_commands(
             return WorkerCommandResults {
                 cancelled_keys: Vec::new(),
                 prepared_sequences: Vec::new(),
+                exported_sequences: Vec::new(),
             };
         }
     };
@@ -230,12 +260,26 @@ pub(super) fn apply_worker_commands(
     let now_secs = now_ns / 1_000_000_000;
     let mut cancelled_keys = Vec::new();
     let mut prepared_sequences = Vec::new();
+    let mut exported_sequences = Vec::new();
     for cmd in pending {
         match cmd {
+            WorkerCommand::ExportOwnerRGSessions {
+                sequence,
+                owner_rgs,
+            } => {
+                export_forward_sessions_for_owner_rgs(sessions, &owner_rgs);
+                exported_sequences.push(sequence);
+            }
             WorkerCommand::PrepareDemoteOwnerRGs {
                 sequence,
                 owner_rgs,
             } => {
+                for owner_rg_id in &owner_rgs {
+                    for flow_cache in flow_caches.iter_mut() {
+                        flow_cache.invalidate_owner_rg(*owner_rg_id);
+                    }
+                }
+                cancelled_keys.extend(sessions.session_keys_for_owner_rgs(&owner_rgs));
                 refresh_live_reverse_sessions_for_owner_rgs(
                     sessions,
                     session_map_fd,
@@ -342,6 +386,7 @@ pub(super) fn apply_worker_commands(
     WorkerCommandResults {
         cancelled_keys,
         prepared_sequences,
+        exported_sequences,
     }
 }
 
@@ -1884,6 +1929,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 0,
+            demoting: false,
             },
         );
         let forwarding = test_forwarding_state();
@@ -1948,6 +1994,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         );
         let forwarding = test_forwarding_state();
@@ -2162,6 +2209,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2230,6 +2278,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2309,6 +2358,79 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
+            },
+        );
+        let mut flow_cache = FlowCache::new();
+        let mut flow_caches = [&mut flow_cache];
+
+        let results = apply_worker_commands(
+            &commands,
+            &mut sessions,
+            &mut flow_caches,
+            -1,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+        );
+
+        assert_eq!(results.cancelled_keys, vec![key.clone()]);
+        assert_eq!(results.prepared_sequences, vec![7]);
+        let hit = sessions
+            .lookup(&key, 2_000_000, 0x10)
+            .expect("prepared forward hit");
+        assert!(!hit.metadata.synced);
+        assert_eq!(
+            hit.decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        let deltas = sessions.drain_deltas(16);
+        assert_eq!(deltas.len(), 1, "prepare should republish forward session");
+        assert_eq!(deltas[0].kind, SessionDeltaKind::Open);
+        assert!(deltas[0].fabric_redirect_sync);
+    }
+
+    #[test]
+    fn apply_worker_commands_exports_owner_rg_forward_sessions_without_teardown() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: test_decision().resolution,
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                ..NatDecision::default()
+            },
+        };
+        let metadata = SessionMetadata {
+            owner_rg_id: 1,
+            ..test_metadata()
+        };
+        assert!(sessions.install_with_protocol(
+            key.clone(),
+            decision,
+            metadata,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        assert_eq!(sessions.drain_deltas(16).len(), 1, "initial open delta");
+        commands
+            .lock()
+            .expect("commands lock")
+            .push_back(WorkerCommand::ExportOwnerRGSessions {
+                sequence: 9,
+                owner_rgs: vec![1],
+            });
+        let forwarding = test_forwarding_state_with_fabric();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                demoting: false,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2325,17 +2447,18 @@ mod tests {
         );
 
         assert!(results.cancelled_keys.is_empty());
-        assert_eq!(results.prepared_sequences, vec![7]);
+        assert!(results.prepared_sequences.is_empty());
+        assert_eq!(results.exported_sequences, vec![9]);
         let hit = sessions
             .lookup(&key, 2_000_000, 0x10)
-            .expect("prepared forward hit");
+            .expect("exported forward hit");
         assert!(!hit.metadata.synced);
         assert_eq!(
             hit.decision.resolution.disposition,
             ForwardingDisposition::ForwardCandidate
         );
         let deltas = sessions.drain_deltas(16);
-        assert_eq!(deltas.len(), 1, "prepare should republish forward session");
+        assert_eq!(deltas.len(), 1, "export should republish forward session");
         assert_eq!(deltas[0].kind, SessionDeltaKind::Open);
         assert!(deltas[0].fabric_redirect_sync);
     }
@@ -2395,6 +2518,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2476,6 +2600,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         );
         ha_state.insert(
@@ -2483,6 +2608,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2568,6 +2694,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            demoting: false,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2714,6 +2841,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
+            demoting: false,
             },
         );
 
@@ -2750,6 +2878,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
+            demoting: false,
             },
         );
         ha_state.insert(
@@ -2757,6 +2886,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 1,
+            demoting: false,
             },
         );
 
@@ -2816,6 +2946,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 1,
+            demoting: false,
             },
         )]);
         let resolved = enforce_session_ha_resolution(
@@ -2851,6 +2982,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 0,
+            demoting: false,
             },
         )]);
         let resolved = enforce_session_ha_resolution(
@@ -2887,6 +3019,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 0,
+            demoting: false,
             },
         )]);
         let reverse = build_reverse_session_from_forward_match(
@@ -2954,6 +3087,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
+            demoting: false,
             },
         );
         let entry = SyncedSessionEntry {
@@ -3013,6 +3147,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
+            demoting: false,
             },
         );
         let mut entry = SyncedSessionEntry {

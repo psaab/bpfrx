@@ -359,12 +359,30 @@ func (s *SessionSync) getActiveConn() net.Conn {
 	return s.activeConnLocked()
 }
 
+func connRemoteAddrString(conn net.Conn) (remote string) {
+	if conn == nil {
+		return "<nil>"
+	}
+	defer func() {
+		if recover() != nil {
+			remote = "<unavailable>"
+		}
+	}()
+	addr := conn.RemoteAddr()
+	if addr == nil {
+		return "<nil>"
+	}
+	return addr.String()
+}
+
 // handleNewConnection processes a newly established connection on the given fabric.
 // It sets the connection in the appropriate slot, starts the receive loop, exchanges
 // clocks, and triggers bulk sync if this is the first connection after a total disconnect.
 func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, conn net.Conn) {
 	s.mu.Lock()
 	wasDisconnected := s.conn0 == nil && s.conn1 == nil
+	hadConn0 := s.conn0 != nil
+	hadConn1 := s.conn1 != nil
 	switch fabricIdx {
 	case 0:
 		if s.conn0 != nil {
@@ -380,6 +398,13 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	s.stats.Connected.Store(true)
 	s.mu.Unlock()
 
+	slog.Info("cluster sync: handling new connection",
+		"fabric", fabricIdx,
+		"remote", connRemoteAddrString(conn),
+		"was_disconnected", wasDisconnected,
+		"had_conn0", hadConn0,
+		"had_conn1", hadConn1)
+
 	// Start receive loop for this connection.
 	s.wg.Add(1)
 	go func() {
@@ -393,13 +418,25 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	// Bulk sync, journal flush, and callbacks only on first connection
 	// after a total disconnect — not when adding a redundant fabric path.
 	if wasDisconnected {
+		slog.Info("cluster sync: first connection after disconnect",
+			"fabric", fabricIdx,
+			"remote", connRemoteAddrString(conn))
 		s.flushDeleteJournal()
 		if s.OnPeerConnected != nil {
+			slog.Info("cluster sync: scheduling OnPeerConnected callback",
+				"fabric", fabricIdx)
 			go s.OnPeerConnected()
 		}
+		slog.Info("cluster sync: starting bulk sync on new connection",
+			"fabric", fabricIdx,
+			"remote", connRemoteAddrString(conn))
 		if err := s.BulkSync(); err != nil {
 			slog.Warn("cluster sync: bulk sync failed", "err", err, "fabric", fabricIdx)
 		}
+	} else {
+		slog.Info("cluster sync: connection added without bulk sync",
+			"fabric", fabricIdx,
+			"remote", connRemoteAddrString(conn))
 	}
 }
 
@@ -904,15 +941,27 @@ func (s *SessionSync) BulkSync() error {
 	var epochBuf [8]byte
 	binary.LittleEndian.PutUint64(epochBuf[:], epoch)
 
+	stats := s.Stats()
+	slog.Info("cluster sync: bulk sync starting",
+		"epoch", epoch,
+		"remote", connRemoteAddrString(conn),
+		"sessions_sent", stats.SessionsSent,
+		"sessions_received", stats.SessionsReceived,
+		"sessions_installed", stats.SessionsInstalled,
+		"queue_len", len(s.sendCh),
+		"queue_cap", cap(s.sendCh))
+
 	// Send bulk start marker with epoch.
 	s.writeMu.Lock()
 	err := writeMsg(conn, syncMsgBulkStart, epochBuf[:])
 	s.writeMu.Unlock()
 	if err != nil {
+		s.handleDisconnect(conn)
 		return err
 	}
 
 	var count, skipped int
+	slog.Info("cluster sync: bulk sync iterating v4", "epoch", epoch)
 	// Send owned v4 forward sessions.
 	err = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
@@ -927,6 +976,7 @@ func (s *SessionSync) BulkSync() error {
 		err := writeMsg(conn, syncMsgSessionV4, msg)
 		s.writeMu.Unlock()
 		if err != nil {
+			s.handleDisconnect(conn)
 			slog.Warn("bulk sync v4 write error", "err", err)
 			return false
 		}
@@ -936,8 +986,13 @@ func (s *SessionSync) BulkSync() error {
 	if err != nil {
 		return fmt.Errorf("bulk sync v4 iterate: %w", err)
 	}
+	slog.Info("cluster sync: bulk sync iterated v4",
+		"epoch", epoch,
+		"sessions", count,
+		"skipped", skipped)
 
 	// Send owned v6 forward sessions.
+	slog.Info("cluster sync: bulk sync iterating v6", "epoch", epoch, "sessions", count, "skipped", skipped)
 	err = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
@@ -951,6 +1006,7 @@ func (s *SessionSync) BulkSync() error {
 		err := writeMsg(conn, syncMsgSessionV6, msg)
 		s.writeMu.Unlock()
 		if err != nil {
+			s.handleDisconnect(conn)
 			slog.Warn("bulk sync v6 write error", "err", err)
 			return false
 		}
@@ -960,12 +1016,18 @@ func (s *SessionSync) BulkSync() error {
 	if err != nil {
 		return fmt.Errorf("bulk sync v6 iterate: %w", err)
 	}
+	slog.Info("cluster sync: bulk sync iterated v6",
+		"epoch", epoch,
+		"sessions", count,
+		"skipped", skipped)
 
 	// Send bulk end marker with matching epoch.
+	slog.Info("cluster sync: bulk sync writing end marker", "epoch", epoch, "sessions", count, "skipped", skipped)
 	s.writeMu.Lock()
 	err = writeMsg(conn, syncMsgBulkEnd, epochBuf[:])
 	s.writeMu.Unlock()
 	if err != nil {
+		s.handleDisconnect(conn)
 		return err
 	}
 
@@ -984,6 +1046,7 @@ func (s *SessionSync) sendClockSync(conn net.Conn) {
 	err := writeMsg(conn, syncMsgClockSync, buf[:])
 	s.writeMu.Unlock()
 	if err != nil {
+		s.handleDisconnect(conn)
 		slog.Warn("cluster sync: failed to send clock sync", "err", err)
 	}
 }
@@ -1844,8 +1907,22 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 	connected := s.conn0 != nil || s.conn1 != nil
 	s.stats.Connected.Store(connected)
 	if !connected {
+		pendingBarriers := s.barrierSeq.Load()
+		ackedBarriers := s.barrierAckSeq.Load()
+		s.barrierSeq.Store(0)
+		s.barrierAckSeq.Store(0)
+		s.barrierWaitMu.Lock()
+		clearedWaiters := len(s.barrierWaiters)
+		s.barrierWaiters = nil
+		s.barrierWaitMu.Unlock()
 		s.clockSynced.Store(false)
 		slog.Info("cluster sync: peer disconnected (all fabrics down)")
+		if pendingBarriers != 0 || ackedBarriers != 0 || clearedWaiters != 0 {
+			slog.Info("cluster sync: reset barrier state after disconnect",
+				"pending_seq", pendingBarriers,
+				"acked_seq", ackedBarriers,
+				"cleared_waiters", clearedWaiters)
+		}
 		if s.OnPeerDisconnected != nil {
 			go s.OnPeerDisconnected()
 		}

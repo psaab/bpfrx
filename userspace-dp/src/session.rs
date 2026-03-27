@@ -515,6 +515,19 @@ impl SessionTable {
         demoted_keys
     }
 
+    pub fn session_keys_for_owner_rgs(&self, owner_rgs: &[i32]) -> Vec<crate::session::SessionKey> {
+        if owner_rgs.is_empty() {
+            return Vec::new();
+        }
+        let mut keys = Vec::new();
+        for (key, entry) in &self.sessions {
+            if owner_rgs.contains(&entry.metadata.owner_rg_id) {
+                keys.push(key.clone());
+            }
+        }
+        keys
+    }
+
     pub fn drain_deltas(&mut self, max: usize) -> Vec<SessionDelta> {
         let drain = max.max(1).min(self.deltas.len());
         let mut out = Vec::with_capacity(drain);

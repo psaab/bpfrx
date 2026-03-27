@@ -17,7 +17,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool, msg s
 	t.Fatal(msg)
 }
 
-func TestSessionSyncPeerDisconnected_PreservesReadinessAfterBulk(t *testing.T) {
+func TestSessionSyncPeerDisconnected_ClearsReadinessAndFallsBackToTimeout(t *testing.T) {
 	d := &Daemon{
 		cluster:          newClusterManager(false),
 		syncReadyTimeout: 20 * time.Millisecond,
@@ -29,9 +29,14 @@ func TestSessionSyncPeerDisconnected_PreservesReadinessAfterBulk(t *testing.T) {
 
 	d.onSessionSyncPeerDisconnected()
 
-	if !d.cluster.IsSyncReady() {
-		t.Fatal("completed bulk sync should preserve takeover readiness across disconnects")
+	if d.cluster.IsSyncReady() {
+		t.Fatal("disconnect should clear readiness for the current sync generation")
 	}
+	if d.syncBulkPrimed.Load() {
+		t.Fatal("disconnect should clear bulk priming state")
+	}
+	waitForCondition(t, 200*time.Millisecond, d.cluster.IsSyncReady,
+		"sync readiness timeout should release hold after disconnect")
 }
 
 func TestSessionSyncPeerDisconnected_UnprimedFallsBackToTimeout(t *testing.T) {
@@ -52,21 +57,26 @@ func TestSessionSyncPeerDisconnected_UnprimedFallsBackToTimeout(t *testing.T) {
 		"sync readiness timeout should release hold for an unprimed standby")
 }
 
-func TestSessionSyncPeerConnected_PrimedRestoresReadinessImmediately(t *testing.T) {
+func TestSessionSyncPeerConnected_ClearsReadinessThenFallsBackToTimeout(t *testing.T) {
 	d := &Daemon{
 		cluster:          newClusterManager(false),
 		syncReadyTimeout: 20 * time.Millisecond,
 	}
 	t.Cleanup(d.stopSyncReadyTimer)
 
-	d.cluster.SetSyncReady(false)
+	d.cluster.SetSyncReady(true)
 	d.syncBulkPrimed.Store(true)
 
 	d.onSessionSyncPeerConnected()
 
-	if !d.cluster.IsSyncReady() {
-		t.Fatal("primed reconnect should restore readiness immediately")
+	if d.cluster.IsSyncReady() {
+		t.Fatal("reconnect should hold readiness until the new bulk sync completes")
 	}
+	if d.syncBulkPrimed.Load() {
+		t.Fatal("reconnect should clear the previous bulk-primed state")
+	}
+	waitForCondition(t, 200*time.Millisecond, d.cluster.IsSyncReady,
+		"sync readiness timeout should release hold while reconnect bulk is pending")
 }
 
 func TestSessionSyncBulkReceived_PrimesReadiness(t *testing.T) {

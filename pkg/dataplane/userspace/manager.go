@@ -3323,6 +3323,33 @@ func (m *Manager) DrainSessionDeltas(max uint32) ([]SessionDeltaInfo, ProcessSta
 	return resp.SessionDeltas, status, nil
 }
 
+func (m *Manager) ExportOwnerRGSessions(rgIDs []int, max uint32) ([]SessionDeltaInfo, ProcessStatus, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.proc == nil {
+		return nil, ProcessStatus{}, errors.New("userspace dataplane helper not running")
+	}
+	resp, err := m.requestDetailedLocked(ControlRequest{
+		Type: "export_owner_rg_sessions",
+		SessionExport: &SessionExportRequest{
+			OwnerRGs: rgIDs,
+			Max:      max,
+		},
+	})
+	if err != nil {
+		return nil, ProcessStatus{}, err
+	}
+	var status ProcessStatus
+	if resp.Status != nil {
+		status = *resp.Status
+		if err := m.applyHelperStatusLocked(&status); err != nil {
+			return resp.SessionDeltas, status, err
+		}
+	}
+	return resp.SessionDeltas, status, nil
+}
+
 func (m *Manager) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) error {
 	if err := m.inner.SetSessionV4(key, val); err != nil {
 		return err

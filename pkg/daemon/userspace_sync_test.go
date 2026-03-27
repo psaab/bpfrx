@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/psaab/bpfrx/pkg/cluster"
 	"github.com/psaab/bpfrx/pkg/config"
@@ -24,6 +25,16 @@ func (f *fakeUserspaceDeltaDrainer) DrainSessionDeltas(max uint32) ([]dpuserspac
 	batch := f.batches[0]
 	f.batches = f.batches[1:]
 	return batch, dpuserspace.ProcessStatus{}, nil
+}
+
+type fakeUserspaceSessionExporter struct {
+	deltas []dpuserspace.SessionDeltaInfo
+	calls  int
+}
+
+func (f *fakeUserspaceSessionExporter) ExportOwnerRGSessions(rgIDs []int, max uint32) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error) {
+	f.calls++
+	return append([]dpuserspace.SessionDeltaInfo(nil), f.deltas...), dpuserspace.ProcessStatus{}, nil
 }
 
 func TestUserspaceSessionFromDeltaV4(t *testing.T) {
@@ -100,6 +111,16 @@ func TestWrapUserspaceManualFailoverPrepareErrorLeavesFatalErrors(t *testing.T) 
 	err := wrapUserspaceManualFailoverPrepareError(src)
 	if err != src {
 		t.Fatalf("expected original error to be preserved, got %v", err)
+	}
+}
+
+func TestWrapUserspaceManualFailoverPrepareErrorMarksRetryableBulkSyncNotReady(t *testing.T) {
+	err := wrapUserspaceManualFailoverPrepareError(
+		errors.New("session sync not ready before demotion: peer bulk sync incomplete"),
+	)
+	var retryable *cluster.RetryablePreFailoverError
+	if !errors.As(err, &retryable) {
+		t.Fatalf("expected retryable pre-failover error, got %T", err)
 	}
 }
 
@@ -491,5 +512,65 @@ func TestDrainUserspaceSessionDeltasWithConfigDrainsPreparedBatches(t *testing.T
 	}
 	if drainer.calls != 2 {
 		t.Fatalf("drain calls = %d, want 2", drainer.calls)
+	}
+}
+
+func TestExportUserspaceOwnerRGSessionsWithConfigQueuesForwardWireAlias(t *testing.T) {
+	exporter := &fakeUserspaceSessionExporter{
+		deltas: []dpuserspace.SessionDeltaInfo{{
+			Event:         "open",
+			AddrFamily:    dataplane.AFInet,
+			Protocol:      6,
+			SrcIP:         "10.0.61.102",
+			DstIP:         "172.16.80.200",
+			SrcPort:       39906,
+			DstPort:       5201,
+			IngressZone:   "lan",
+			EgressZone:    "wan",
+			OwnerRGID:     1,
+			EgressIfindex: 12,
+			TXIfindex:     11,
+			TXVLANID:      80,
+			NeighborMAC:   "aa:bb:cc:dd:ee:ff",
+			SrcMAC:        "02:bf:72:00:50:08",
+			NATSrcIP:      "172.16.80.8",
+			NATSrcPort:    39906,
+			FabricRedirect: true,
+		}},
+	}
+	d := &Daemon{
+		sessionSync: &cluster.SessionSync{
+			IsPrimaryFn:      func() bool { return true },
+			IsPrimaryForRGFn: func(rgID int) bool { return rgID == 1 },
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"lan": {Name: "lan"},
+		"wan": {Name: "wan"},
+	}
+
+	queued, err := d.exportUserspaceOwnerRGSessionsWithConfig(exporter, cfg, []int{1})
+	if err != nil {
+		t.Fatalf("exportUserspaceOwnerRGSessionsWithConfig() error = %v", err)
+	}
+	if queued != 2 {
+		t.Fatalf("queued = %d, want 2", queued)
+	}
+	if exporter.calls != 1 {
+		t.Fatalf("export calls = %d, want 1", exporter.calls)
+	}
+}
+
+func TestUserspaceRGDemotionPrepLeaseCanBeReleasedAfterFailure(t *testing.T) {
+	d := &Daemon{
+		userspaceDemotionPrepUntil: make(map[int]time.Time),
+	}
+	if !d.acquireUserspaceRGDemotionPrep(1, time.Second) {
+		t.Fatal("expected first lease acquisition")
+	}
+	d.releaseUserspaceRGDemotionPrep(1)
+	if !d.acquireUserspaceRGDemotionPrep(1, time.Second) {
+		t.Fatal("expected lease acquisition after release")
 	}
 }

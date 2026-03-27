@@ -531,6 +531,8 @@ struct ControlRequest {
     session_sync: Option<SessionSyncRequest>,
     #[serde(rename = "session_deltas", default)]
     session_deltas: Option<SessionDeltaDrainRequest>,
+    #[serde(rename = "session_export", default)]
+    session_export: Option<SessionExportRequest>,
     #[serde(default)]
     neighbors: Option<Vec<NeighborSnapshot>>,
     #[serde(rename = "neighbor_generation", default)]
@@ -1036,6 +1038,14 @@ struct SessionSyncRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 struct SessionDeltaDrainRequest {
+    #[serde(default)]
+    max: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct SessionExportRequest {
+    #[serde(rename = "owner_rgs", default)]
+    owner_rgs: Vec<i32>,
     #[serde(default)]
     max: u32,
 }
@@ -1611,6 +1621,23 @@ fn handle_stream(
                 response.session_deltas = guard.afxdp.drain_session_deltas(max);
                 refresh_status(&mut guard);
                 persist_state = true;
+            }
+            "export_owner_rg_sessions" => {
+                let export_req = request.session_export.unwrap_or_default();
+                match guard
+                    .afxdp
+                    .export_owner_rg_sessions(&export_req.owner_rgs, export_req.max as usize)
+                {
+                    Ok(deltas) => {
+                        response.session_deltas = deltas;
+                        refresh_status(&mut guard);
+                        persist_state = true;
+                    }
+                    Err(err) => {
+                        response.ok = false;
+                        response.error = err;
+                    }
+                }
             }
             "rebind" => {
                 // After a link DOWN/UP cycle (e.g. RETH MAC programming),

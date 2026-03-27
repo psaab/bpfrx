@@ -23,6 +23,7 @@ type ControlRequest struct {
 	Packet             *InjectPacketRequest      `json:"packet,omitempty"`
 	SessionSync        *SessionSyncRequest       `json:"session_sync,omitempty"`
 	SessionDeltas      *SessionDeltaDrainRequest `json:"session_deltas,omitempty"`
+	SessionExport      *SessionExportRequest     `json:"session_export,omitempty"`
 	Neighbors          []NeighborSnapshot        `json:"neighbors,omitempty"`
 	NeighborGeneration uint64                    `json:"neighbor_generation,omitempty"`
 	NeighborReplace    bool                      `json:"neighbor_replace,omitempty"`
@@ -534,6 +535,11 @@ type InjectPacketRequest struct {
 
 type SessionDeltaDrainRequest struct {
 	Max uint32 `json:"max,omitempty"`
+}
+
+type SessionExportRequest struct {
+	OwnerRGs []int  `json:"owner_rgs,omitempty"`
+	Max      uint32 `json:"max,omitempty"`
 }
 
 type SessionSyncRequest struct {
