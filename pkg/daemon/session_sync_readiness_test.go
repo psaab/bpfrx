@@ -3,6 +3,8 @@ package daemon
 import (
 	"testing"
 	"time"
+
+	"github.com/psaab/bpfrx/pkg/cluster"
 )
 
 func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool, msg string) {
@@ -94,5 +96,38 @@ func TestSessionSyncBulkReceived_PrimesReadiness(t *testing.T) {
 	}
 	if !d.cluster.IsSyncReady() {
 		t.Fatal("bulk sync callback should release takeover readiness")
+	}
+}
+
+func TestSyncPrimeProgressObservedDetectsInboundProgress(t *testing.T) {
+	baseline := cluster.SyncStatsSnapshot{
+		SessionsReceived:  10,
+		SessionsInstalled: 9,
+		DeletesReceived:   3,
+	}
+	current := baseline
+	current.SessionsReceived++
+	if !syncPrimeProgressObserved(current, baseline) {
+		t.Fatal("expected inbound sync progress to be detected")
+	}
+}
+
+func TestSyncPrimeProgressObservedFalseWithoutProgress(t *testing.T) {
+	baseline := cluster.SyncStatsSnapshot{
+		SessionsReceived:  10,
+		SessionsInstalled: 9,
+		DeletesReceived:   3,
+	}
+	if syncPrimeProgressObserved(baseline, baseline) {
+		t.Fatal("expected no progress when counters are unchanged")
+	}
+}
+
+func TestSessionSyncBulkAckReceivedMarksPeerPrimed(t *testing.T) {
+	d := &Daemon{}
+	d.syncPeerBulkPrimed.Store(false)
+	d.onSessionSyncBulkAckReceived()
+	if !d.syncPeerBulkPrimed.Load() {
+		t.Fatal("bulk ack callback should mark peer primed")
 	}
 }

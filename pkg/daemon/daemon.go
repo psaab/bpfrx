@@ -96,6 +96,7 @@ type Daemon struct {
 	cluster          *cluster.Manager
 	sessionSync      *cluster.SessionSync
 	syncBulkPrimed   atomic.Bool
+	syncPeerBulkPrimed atomic.Bool
 	syncPrimeRetryGen atomic.Uint64
 	syncReadyTimerMu sync.Mutex
 	syncReadyTimer   *time.Timer
@@ -290,6 +291,7 @@ func (d *Daemon) armSyncReadyTimer() {
 
 func (d *Daemon) onSessionSyncPeerConnected() {
 	d.syncBulkPrimed.Store(false)
+	d.syncPeerBulkPrimed.Store(false)
 	gen := d.syncPrimeRetryGen.Add(1)
 	slog.Info("cluster: session sync peer connected",
 		"retry_gen", gen,
@@ -314,8 +316,15 @@ func (d *Daemon) onSessionSyncBulkReceived() {
 	}
 }
 
+func (d *Daemon) onSessionSyncBulkAckReceived() {
+	d.syncPeerBulkPrimed.Store(true)
+	slog.Info("cluster: session sync bulk ack received",
+		"retry_gen", d.syncPrimeRetryGen.Load())
+}
+
 func (d *Daemon) onSessionSyncPeerDisconnected() {
 	d.syncBulkPrimed.Store(false)
+	d.syncPeerBulkPrimed.Store(false)
 	gen := d.syncPrimeRetryGen.Add(1)
 	slog.Info("cluster: session sync peer disconnected",
 		"retry_gen", gen,
@@ -326,22 +335,29 @@ func (d *Daemon) onSessionSyncPeerDisconnected() {
 	d.armSyncReadyTimer()
 }
 
+func syncPrimeProgressObserved(current, baseline cluster.SyncStatsSnapshot) bool {
+	return current.SessionsReceived > baseline.SessionsReceived ||
+		current.SessionsInstalled > baseline.SessionsInstalled ||
+		current.DeletesReceived > baseline.DeletesReceived
+}
+
 func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 	ss := d.sessionSync
 	if ss == nil || d.dp == nil {
 		return
 	}
 	go func() {
-		const (
-			maxAttempts = 6
-			interval    = 2 * time.Second
-		)
+		intervals := []time.Duration{10 * time.Second, 20 * time.Second, 40 * time.Second}
+		maxAttempts := len(intervals)
+		baseline := ss.Stats()
 		slog.Info("cluster: starting session sync bulk-prime retry loop",
 			"retry_gen", gen,
 			"max_attempts", maxAttempts,
-			"interval", interval.String())
+			"intervals", intervals)
 		for attempt := 1; attempt <= maxAttempts; attempt++ {
-			time.Sleep(interval)
+			if wait := intervals[attempt-1]; wait > 0 {
+				time.Sleep(wait)
+			}
 			if d.syncPrimeRetryGen.Load() != gen {
 				slog.Info("cluster: stopping session sync bulk-prime retry loop",
 					"retry_gen", gen,
@@ -349,11 +365,11 @@ func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 					"reason", "generation advanced")
 				return
 			}
-			if d.syncBulkPrimed.Load() {
+			if d.syncPeerBulkPrimed.Load() {
 				slog.Info("cluster: stopping session sync bulk-prime retry loop",
 					"retry_gen", gen,
 					"attempt", attempt,
-					"reason", "peer already bulk primed")
+					"reason", "peer bulk ack received")
 				return
 			}
 			if d.sessionSync != ss || !ss.IsConnected() {
@@ -367,10 +383,31 @@ func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 					"reason", reason)
 				return
 			}
+			current := ss.Stats()
+			if syncPrimeProgressObserved(current, baseline) {
+				slog.Info("cluster: deferring session sync bulk-prime retry",
+					"retry_gen", gen,
+					"attempt", attempt,
+					"reason", "peer sync progress observed",
+					"sessions_received", current.SessionsReceived,
+					"sessions_installed", current.SessionsInstalled,
+					"deletes_received", current.DeletesReceived,
+					"baseline_sessions_received", baseline.SessionsReceived,
+					"baseline_sessions_installed", baseline.SessionsInstalled,
+					"baseline_deletes_received", baseline.DeletesReceived)
+				baseline = current
+				continue
+			}
 			slog.Info("cluster: retrying session sync bulk prime",
 				"retry_gen", gen,
 				"attempt", attempt,
-				"connected", ss.IsConnected())
+				"connected", ss.IsConnected(),
+				"sessions_received", current.SessionsReceived,
+				"sessions_installed", current.SessionsInstalled,
+				"deletes_received", current.DeletesReceived,
+				"baseline_sessions_received", baseline.SessionsReceived,
+				"baseline_sessions_installed", baseline.SessionsInstalled,
+				"baseline_deletes_received", baseline.DeletesReceived)
 			if err := ss.BulkSync(); err != nil {
 				slog.Warn("cluster: session sync bulk prime retry failed",
 					"retry_gen", gen,
@@ -378,8 +415,8 @@ func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 					"err", err)
 				continue
 			}
-			if d.syncBulkPrimed.Load() {
-				slog.Info("cluster: session sync bulk prime retry loop observed primed peer",
+			if d.syncPeerBulkPrimed.Load() {
+				slog.Info("cluster: session sync bulk prime retry loop observed bulk ack",
 					"retry_gen", gen,
 					"attempt", attempt)
 				return
@@ -3725,7 +3762,7 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		success = true
 		return nil
 	}
-	if !d.syncBulkPrimed.Load() {
+	if !d.syncPeerBulkPrimed.Load() {
 		return fmt.Errorf("session sync not ready before demotion: peer bulk sync incomplete")
 	}
 	pendingBarrierTimeout := barrierTimeout / 2
@@ -5308,6 +5345,11 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				d.cluster.RecordEvent(cluster.EventColdSync, -1, "Bulk sync completed")
 				slog.Info("cluster: session sync complete, releasing VRRP hold")
 				d.onSessionSyncBulkReceived()
+			}
+
+			d.sessionSync.OnBulkSyncAckReceived = func() {
+				d.cluster.RecordEvent(cluster.EventColdSync, -1, "Bulk sync acknowledged by peer")
+				d.onSessionSyncBulkAckReceived()
 			}
 
 			d.sessionSync.OnPeerDisconnected = func() {

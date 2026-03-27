@@ -39,6 +39,7 @@ const (
 	syncMsgClockSync  = 12 // monotonic clock exchange for timestamp rebasing
 	syncMsgBarrier    = 13 // ordered marker for remote install barriers
 	syncMsgBarrierAck = 14
+	syncMsgBulkAck    = 15
 )
 
 // syncHeader is the wire header for each sync message.
@@ -152,6 +153,10 @@ type SessionSync struct {
 	// (syncMsgBulkEnd received). The secondary uses this to release VRRP
 	// sync hold after session state has been installed.
 	OnBulkSyncReceived func()
+
+	// OnBulkSyncAckReceived is called when the peer acknowledges that it
+	// has fully processed one of our bulk sync transfers.
+	OnBulkSyncAckReceived func()
 
 	// OnPeerConnected is called when a peer sync connection is established
 	// (either inbound accept or outbound connect). The primary uses this to
@@ -1459,8 +1464,27 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		s.stats.BulkSyncEndTime.Store(time.Now().UnixNano())
 		s.reconcileStaleSessions()
 		slog.Info("cluster sync: bulk transfer complete", "epoch", epoch)
+		s.sendBulkAck(conn, epoch)
 		if s.OnBulkSyncReceived != nil {
 			go s.OnBulkSyncReceived()
+		}
+
+	case syncMsgBulkAck:
+		if len(payload) < 8 {
+			slog.Warn("cluster sync: bulk ack message too short")
+			return
+		}
+		epoch := binary.LittleEndian.Uint64(payload[:8])
+		stats := s.Stats()
+		slog.Info("cluster sync: bulk ack received",
+			"epoch", epoch,
+			"sessions_sent", stats.SessionsSent,
+			"sessions_received", stats.SessionsReceived,
+			"sessions_installed", stats.SessionsInstalled,
+			"queue_len", len(s.sendCh),
+			"queue_cap", cap(s.sendCh))
+		if s.OnBulkSyncAckReceived != nil {
+			go s.OnBulkSyncAckReceived()
 		}
 
 	case syncMsgHeartbeat:
@@ -1592,6 +1616,23 @@ func (s *SessionSync) completeBarrierWait(seq uint64) {
 	if waiter != nil {
 		close(waiter)
 	}
+}
+
+func (s *SessionSync) sendBulkAck(conn net.Conn, epoch uint64) {
+	if conn == nil {
+		slog.Debug("cluster sync: skipping bulk ack on nil connection", "epoch", epoch)
+		return
+	}
+	var payload [8]byte
+	binary.LittleEndian.PutUint64(payload[:], epoch)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := writeMsg(conn, syncMsgBulkAck, payload[:]); err != nil {
+		s.stats.Errors.Add(1)
+		slog.Debug("cluster sync: failed to send bulk ack", "epoch", epoch, "err", err)
+		return
+	}
+	slog.Info("cluster sync: bulk ack sent", "epoch", epoch)
 }
 
 func (s *SessionSync) waitForSendQueueDrain(timeout time.Duration) error {
