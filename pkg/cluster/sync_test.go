@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -1632,6 +1633,23 @@ func TestWaitForPeerBarrierCompletesOnAck(t *testing.T) {
 	ss.mu.Lock()
 	ss.conn0 = local
 	ss.mu.Unlock()
+
+	// Start a goroutine to drain sendCh and write to the connection,
+	// simulating sendLoop (barrier is now enqueued via sendCh).
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg := <-ss.sendCh:
+				ss.writeMu.Lock()
+				_ = writeFull(local, msg)
+				ss.writeMu.Unlock()
+			}
+		}
+	}()
 
 	done := make(chan error, 1)
 	go func() {

@@ -1450,29 +1450,19 @@ func (s *SessionSync) WaitForPeerBarrier(timeout time.Duration) error {
 	var payload [8]byte
 	binary.LittleEndian.PutUint64(payload[:], seq)
 	slog.Info("cluster sync: queueing barrier", "seq", seq)
-	if err := s.waitForSendQueueDrain(timeout / 2); err != nil {
+	// Enqueue barrier onto sendCh rather than writing directly to the socket.
+	// Writing directly after waitForSendQueueDrain has a race: sendLoop may
+	// have dequeued a message but not yet acquired writeMu, so the barrier
+	// could overtake an in-flight message and break ordering guarantees.
+	// Using sendCh preserves strict FIFO order with all other messages.
+	msg := encodeRawMessage(syncMsgBarrier, payload[:])
+	select {
+	case s.sendCh <- msg:
+	default:
 		s.barrierWaitMu.Lock()
 		delete(s.barrierWaiters, seq)
 		s.barrierWaitMu.Unlock()
-		return err
-	}
-	conn := s.getActiveConn()
-	if conn == nil {
-		s.barrierWaitMu.Lock()
-		delete(s.barrierWaiters, seq)
-		s.barrierWaitMu.Unlock()
-		return fmt.Errorf("session sync not connected")
-	}
-	s.writeMu.Lock()
-	err := writeMsg(conn, syncMsgBarrier, payload[:])
-	s.writeMu.Unlock()
-	if err != nil {
-		s.barrierWaitMu.Lock()
-		delete(s.barrierWaiters, seq)
-		s.barrierWaitMu.Unlock()
-		s.stats.Errors.Add(1)
-		s.handleDisconnect(conn)
-		return fmt.Errorf("failed to send session sync barrier: %w", err)
+		return fmt.Errorf("session sync send queue full, cannot enqueue barrier")
 	}
 
 	timer := time.NewTimer(timeout)

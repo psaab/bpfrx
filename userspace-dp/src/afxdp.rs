@@ -6046,19 +6046,33 @@ fn worker_loop(
             sessions.set_timeouts(forwarding.session_timeouts);
         }
         let ha_runtime = ha_state.load();
-        let mut flow_caches = bindings
-            .iter_mut()
-            .map(|binding| &mut binding.flow_cache)
-            .collect::<Vec<_>>();
-        let command_results = apply_worker_commands(
-            &commands,
-            &mut sessions,
-            flow_caches.as_mut_slice(),
-            session_map_fd,
-            &forwarding,
-            ha_runtime.as_ref(),
-            &dynamic_neighbors,
-        );
+        // Only collect flow_cache borrows when commands are pending.
+        // This avoids a Vec heap allocation on every loop iteration
+        // in the common (empty-queue) case.
+        let has_commands = commands
+            .try_lock()
+            .map(|q| !q.is_empty())
+            .unwrap_or(false);
+        let command_results = if has_commands {
+            let mut flow_caches = bindings
+                .iter_mut()
+                .map(|binding| &mut binding.flow_cache)
+                .collect::<Vec<_>>();
+            apply_worker_commands(
+                &commands,
+                &mut sessions,
+                flow_caches.as_mut_slice(),
+                session_map_fd,
+                &forwarding,
+                ha_runtime.as_ref(),
+                &dynamic_neighbors,
+            )
+        } else {
+            WorkerCommandResults {
+                cancelled_keys: Vec::new(),
+                prepared_sequences: Vec::new(),
+            }
+        };
         if !command_results.cancelled_keys.is_empty() {
             for key in &command_results.cancelled_keys {
                 for binding in bindings.iter_mut() {
