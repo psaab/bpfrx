@@ -290,6 +290,28 @@ impl FlowCache {
             *entry = None;
         }
     }
+
+    fn invalidate_slot(&mut self, key: &crate::session::SessionKey, ingress_ifindex: i32) {
+        let idx = Self::slot(key, ingress_ifindex);
+        self.entries[idx] = None;
+    }
+
+    fn invalidate_owner_rg(&mut self, owner_rg_id: i32) {
+        if owner_rg_id <= 0 {
+            return;
+        }
+        for entry in &mut self.entries {
+            let Some(cached) = entry.as_ref() else {
+                continue;
+            };
+            if cached.metadata.owner_rg_id == owner_rg_id
+                || cached.descriptor.owner_rg_id == owner_rg_id
+            {
+                *entry = None;
+                self.evictions += 1;
+            }
+        }
+    }
 }
 /// Packet buffered while waiting for ARP/NDP neighbor resolution.
 struct PendingNeighPacket {
@@ -556,6 +578,7 @@ pub struct Coordinator {
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
+    demotion_prepare_seq: AtomicU64,
     forwarding: ForwardingState,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
@@ -594,6 +617,7 @@ impl Coordinator {
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
+            demotion_prepare_seq: AtomicU64::new(0),
             forwarding: ForwardingState::default(),
             recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
             recent_session_deltas: Arc::new(Mutex::new(VecDeque::with_capacity(
@@ -1026,6 +1050,7 @@ impl Coordinator {
             let plan_count = binding_plans.len();
             let stop = Arc::new(AtomicBool::new(false));
             let heartbeat = Arc::new(AtomicU64::new(monotonic_nanos()));
+            let demotion_prepare_ack = Arc::new(AtomicU64::new(0));
             let commands = worker_command_queues
                 .get(&worker_id)
                 .cloned()
@@ -1042,6 +1067,7 @@ impl Coordinator {
             let shared_forward_wire_sessions = self.shared_forward_wire_sessions.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
+            let demotion_prepare_ack_clone = demotion_prepare_ack.clone();
             let commands_clone = commands.clone();
             let peer_commands_clone = worker_command_queues
                 .iter()
@@ -1074,6 +1100,7 @@ impl Coordinator {
                         peer_commands_clone,
                         stop_clone,
                         heartbeat_clone,
+                        demotion_prepare_ack_clone,
                         worker_poll_mode,
                         dnat_fds,
                         shared_fabrics,
@@ -1091,6 +1118,7 @@ impl Coordinator {
                             stop,
                             heartbeat,
                             commands,
+                            demotion_prepare_ack,
                             join: Some(join),
                         },
                     );
@@ -1363,6 +1391,42 @@ impl Coordinator {
                     pending.push_back(WorkerCommand::RefreshOwnerRGs(activated_rgs.clone()));
                 }
             }
+        }
+    }
+
+    pub fn prepare_ha_demotion(&self, owner_rgs: &[i32]) -> Result<(), String> {
+        if owner_rgs.is_empty() {
+            return Ok(());
+        }
+        let sequence = self
+            .demotion_prepare_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        for handle in self.workers.values() {
+            let mut pending = handle
+                .commands
+                .lock()
+                .map_err(|_| "worker command queue poisoned".to_string())?;
+            pending.push_back(WorkerCommand::PrepareDemoteOwnerRGs {
+                sequence,
+                owner_rgs: owner_rgs.to_vec(),
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if self
+                .workers
+                .values()
+                .all(|handle| handle.demotion_prepare_ack.load(Ordering::Acquire) >= sequence)
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for demotion prepare ack seq={sequence}"
+                ));
+            }
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -1781,6 +1845,7 @@ struct WorkerHandle {
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
     commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
+    demotion_prepare_ack: Arc<AtomicU64>,
     join: Option<JoinHandle<()>>,
 }
 
@@ -2360,6 +2425,7 @@ enum WorkerCommand {
     UpsertSynced(SyncedSessionEntry),
     UpsertLocal(SyncedSessionEntry),
     DeleteSynced(SessionKey),
+    PrepareDemoteOwnerRGs { sequence: u64, owner_rgs: Vec<i32> },
     DemoteOwnerRG(i32),
     RefreshOwnerRGs(Vec<i32>),
 }
@@ -3305,6 +3371,18 @@ fn poll_binding(
                             validation.config_generation,
                             validation.fib_generation,
                         ) {
+                            if !cached_flow_decision_valid(
+                                forwarding,
+                                ha_state,
+                                now_secs,
+                                cached.decision.resolution,
+                            ) {
+                                binding.flow_cache.invalidate_slot(
+                                    &flow.forward_key,
+                                    meta.ingress_ifindex as i32,
+                                );
+                                continue;
+                            }
                             let cached_decision = cached.decision;
                             let cached_descriptor = cached.descriptor;
                             let cached_metadata = cached.metadata.clone();
@@ -4695,6 +4773,8 @@ fn poll_binding(
                                     .as_ref()
                                     .cloned()
                                     .unwrap_or_else(|| Arc::from(""));
+                                let cache_owner_rg_id =
+                                    owner_rg_for_resolution(forwarding, decision.resolution);
                                 binding.flow_cache.insert(FlowCacheEntry {
                                     key: flow.forward_key.clone(),
                                     ingress_ifindex: meta.ingress_ifindex as i32,
@@ -4718,7 +4798,7 @@ fn poll_binding(
                                         target_binding_index: None,
                                         config_generation: validation.config_generation,
                                         fib_generation: validation.fib_generation,
-                                        owner_rg_id: 0,
+                                        owner_rg_id: cache_owner_rg_id,
                                         nat64: false,
                                         nptv6: false,
                                         apply_nat_on_fabric,
@@ -4727,7 +4807,7 @@ fn poll_binding(
                                     metadata: SessionMetadata {
                                         ingress_zone,
                                         egress_zone: Arc::from(""),
-                                        owner_rg_id: 0,
+                                        owner_rg_id: cache_owner_rg_id,
                                         fabric_ingress: false,
                                         is_reverse: false,
                                         synced: false,
@@ -5502,6 +5582,8 @@ fn flush_session_deltas(
                 .unwrap_or_default(),
             nat_src_port: delta.decision.nat.rewrite_src_port.unwrap_or(0),
             nat_dst_port: delta.decision.nat.rewrite_dst_port.unwrap_or(0),
+            fabric_redirect: delta.fabric_redirect_sync
+                || delta.decision.resolution.disposition == ForwardingDisposition::FabricRedirect,
             fabric_ingress: delta.metadata.fabric_ingress,
         };
         live.push_session_delta(info.clone());
@@ -5796,6 +5878,7 @@ fn worker_loop(
     peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
+    demotion_prepare_ack: Arc<AtomicU64>,
     poll_mode: crate::PollMode,
     dnat_fds: DnatTableFds,
     shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
@@ -5963,14 +6046,26 @@ fn worker_loop(
             sessions.set_timeouts(forwarding.session_timeouts);
         }
         let ha_runtime = ha_state.load();
-        apply_worker_commands(
+        let mut flow_caches = bindings
+            .iter_mut()
+            .map(|binding| &mut binding.flow_cache)
+            .collect::<Vec<_>>();
+        let command_results = apply_worker_commands(
             &commands,
             &mut sessions,
+            flow_caches.as_mut_slice(),
             session_map_fd,
             &forwarding,
             ha_runtime.as_ref(),
             &dynamic_neighbors,
         );
+        if !command_results.cancelled_keys.is_empty() {
+            for key in &command_results.cancelled_keys {
+                for binding in bindings.iter_mut() {
+                    cancel_queued_flow_on_binding(binding, key, key);
+                }
+            }
+        }
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
         let expired_entries = sessions.expire_stale_entries(loop_now_ns);
         let expired = expired_entries.len() as u64;
@@ -6101,7 +6196,29 @@ fn worker_loop(
         if !bindings.is_empty() {
             poll_start = (poll_start + 1) % bindings.len();
         }
-        if sessions.has_pending_deltas() {
+        if !command_results.prepared_sequences.is_empty() {
+            while sessions.has_pending_deltas() {
+                let deltas = sessions.drain_deltas(256);
+                purge_queued_flows_for_closed_deltas(&mut bindings, &deltas);
+                if let Some(binding) = bindings.first() {
+                    let ident = binding.identity();
+                    flush_session_deltas(
+                        &ident,
+                        &binding.live,
+                        binding.session_map_fd,
+                        &deltas,
+                        &shared_sessions,
+                        &shared_nat_sessions,
+                        &shared_forward_wire_sessions,
+                        &recent_session_deltas,
+                        &peer_worker_commands,
+                    );
+                }
+            }
+            if let Some(sequence) = command_results.prepared_sequences.iter().copied().max() {
+                demotion_prepare_ack.store(sequence, Ordering::Release);
+            }
+        } else if sessions.has_pending_deltas() {
             let deltas = sessions.drain_deltas(256);
             purge_queued_flows_for_closed_deltas(&mut bindings, &deltas);
             if let Some(binding) = bindings.first() {
@@ -8774,6 +8891,15 @@ fn enforce_ha_resolution_snapshot(
         };
     }
     resolution
+}
+
+fn cached_flow_decision_valid(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    resolution: ForwardingResolution,
+) -> bool {
+    enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, resolution) == resolution
 }
 
 fn demoted_owner_rgs(
@@ -12409,6 +12535,35 @@ mod tests {
             resolved.disposition,
             ForwardingDisposition::ForwardCandidate
         );
+    }
+
+    #[test]
+    fn cached_flow_decision_invalidates_when_owner_rg_is_demoted() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let active = BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )]);
+        let demoted = BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+            },
+        )]);
+        let resolution =
+            lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+
+        assert!(cached_flow_decision_valid(
+            &state, &active, now_secs, resolution
+        ));
+        assert!(!cached_flow_decision_valid(
+            &state, &demoted, now_secs, resolution
+        ));
     }
 
     #[test]

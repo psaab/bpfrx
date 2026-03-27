@@ -5,9 +5,25 @@ import (
 	"testing"
 
 	"github.com/psaab/bpfrx/pkg/cluster"
+	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/dataplane"
 	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 )
+
+type fakeUserspaceDeltaDrainer struct {
+	batches [][]dpuserspace.SessionDeltaInfo
+	calls   int
+}
+
+func (f *fakeUserspaceDeltaDrainer) DrainSessionDeltas(max uint32) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error) {
+	f.calls++
+	if len(f.batches) == 0 {
+		return nil, dpuserspace.ProcessStatus{}, nil
+	}
+	batch := f.batches[0]
+	f.batches = f.batches[1:]
+	return batch, dpuserspace.ProcessStatus{}, nil
+}
 
 func TestUserspaceSessionFromDeltaV4(t *testing.T) {
 	zoneIDs := map[string]uint16{"lan": 1, "wan": 2}
@@ -104,6 +120,34 @@ func TestUserspaceSessionFromDeltaV4CarriesTunnelEndpointMetadata(t *testing.T) 
 	}
 }
 
+func TestUserspaceForwardWireAliasFromDeltaV4UsesNATTuple(t *testing.T) {
+	zoneIDs := map[string]uint16{"lan": 1, "wan": 2}
+	delta := dpuserspace.SessionDeltaInfo{
+		Event:       "open",
+		AddrFamily:  dataplane.AFInet,
+		Protocol:    6,
+		SrcIP:       "10.0.61.102",
+		DstIP:       "172.16.80.200",
+		SrcPort:     39906,
+		DstPort:     5201,
+		IngressZone: "lan",
+		EgressZone:  "wan",
+		NATSrcIP:    "172.16.80.8",
+		NATSrcPort:  39906,
+	}
+
+	key, _, ok := userspaceForwardWireAliasFromDeltaV4(delta, zoneIDs)
+	if !ok {
+		t.Fatal("expected v4 forward-wire alias")
+	}
+	if got := key.SrcIP; got != [4]byte{172, 16, 80, 8} {
+		t.Fatalf("unexpected forward-wire src ip: %v", got)
+	}
+	if got := userspaceNetworkToHost16(key.SrcPort); got != 39906 {
+		t.Fatalf("unexpected forward-wire src port: %d", got)
+	}
+}
+
 func TestUserspaceSessionFromDeltaV6(t *testing.T) {
 	zoneIDs := map[string]uint16{"lan": 1, "wan": 2}
 	delta := dpuserspace.SessionDeltaInfo{
@@ -196,6 +240,34 @@ func TestUserspaceSessionFromDeltaV6CarriesTunnelEndpointMetadata(t *testing.T) 
 	}
 	if val.LogFlags&dataplane.LogFlagUserspaceTunnelEndpoint == 0 {
 		t.Fatalf("expected tunnel endpoint marker in log flags: %#x", val.LogFlags)
+	}
+}
+
+func TestUserspaceForwardWireAliasFromDeltaV6UsesNATTuple(t *testing.T) {
+	zoneIDs := map[string]uint16{"lan": 1, "wan": 2}
+	delta := dpuserspace.SessionDeltaInfo{
+		Event:       "open",
+		AddrFamily:  dataplane.AFInet6,
+		Protocol:    6,
+		SrcIP:       "2001:559:8585:ef00::100",
+		DstIP:       "2001:559:8585:80::200",
+		SrcPort:     50952,
+		DstPort:     5201,
+		IngressZone: "lan",
+		EgressZone:  "wan",
+		NATSrcIP:    "2001:559:8585:80::8",
+		NATSrcPort:  50952,
+	}
+
+	key, _, ok := userspaceForwardWireAliasFromDeltaV6(delta, zoneIDs)
+	if !ok {
+		t.Fatal("expected v6 forward-wire alias")
+	}
+	if got := userspaceNetworkToHost16(key.SrcPort); got != 50952 {
+		t.Fatalf("unexpected forward-wire src port: %d", got)
+	}
+	if key.SrcIP == [16]byte{} {
+		t.Fatal("expected forward-wire src ip to be rewritten")
 	}
 }
 
@@ -305,5 +377,100 @@ func TestShouldSyncUserspaceDeltaFallsBackToZone(t *testing.T) {
 	ss.IsPrimaryForRGFn = func(rgID int) bool { return rgID == 1 }
 	if !d.shouldSyncUserspaceDelta(dpuserspace.SessionDeltaInfo{}, 1) {
 		t.Fatal("expected fallback zone sync to use ShouldSyncZone")
+	}
+}
+
+func TestShouldSyncUserspaceDeltaAllowsStaleOwnerFabricRedirect(t *testing.T) {
+	ss := &cluster.SessionSync{
+		IsPrimaryFn:      func() bool { return false },
+		IsPrimaryForRGFn: func(rgID int) bool { return false },
+	}
+	ss.SetZoneRGMap(map[uint16]int{1: 1})
+	d := &Daemon{sessionSync: ss}
+	delta := dpuserspace.SessionDeltaInfo{
+		OwnerRGID:      1,
+		FabricRedirect: true,
+		FabricIngress:  false,
+		IngressZone:    "lan",
+		EgressZone:     "wan",
+		EgressIfindex:  3,
+		TXIfindex:      3,
+		NeighborMAC:    "aa:bb:cc:dd:ee:ff",
+		SrcMAC:         "02:bf:72:aa:00:01",
+	}
+	if !d.shouldSyncUserspaceDelta(delta, 1) {
+		t.Fatal("expected stale-owner fabric redirect delta to be synced")
+	}
+}
+
+func TestShouldSyncUserspaceDeltaDoesNotBypassFabricIngress(t *testing.T) {
+	ss := &cluster.SessionSync{
+		IsPrimaryFn:      func() bool { return false },
+		IsPrimaryForRGFn: func(rgID int) bool { return false },
+	}
+	ss.SetZoneRGMap(map[uint16]int{1: 1})
+	d := &Daemon{sessionSync: ss}
+	delta := dpuserspace.SessionDeltaInfo{
+		OwnerRGID:      1,
+		FabricRedirect: true,
+		FabricIngress:  true,
+	}
+	if d.shouldSyncUserspaceDelta(delta, 1) {
+		t.Fatal("expected fabric-ingress delta to remain blocked on standby")
+	}
+}
+
+func TestDrainUserspaceSessionDeltasWithConfigDrainsPreparedBatches(t *testing.T) {
+	buildDelta := func(srcPort uint16) dpuserspace.SessionDeltaInfo {
+		return dpuserspace.SessionDeltaInfo{
+			Event:         "open",
+			AddrFamily:    dataplane.AFInet,
+			Protocol:      6,
+			SrcIP:         "10.0.61.102",
+			DstIP:         "172.16.80.200",
+			SrcPort:       srcPort,
+			DstPort:       5201,
+			IngressZone:   "lan",
+			EgressZone:    "wan",
+			OwnerRGID:     1,
+			EgressIfindex: 12,
+			TXIfindex:     11,
+			TXVLANID:      80,
+			NeighborMAC:   "aa:bb:cc:dd:ee:ff",
+			SrcMAC:        "02:bf:72:00:50:08",
+			NATSrcIP:      "172.16.80.8",
+			NATSrcPort:    40000 + srcPort,
+		}
+	}
+
+	firstBatch := make([]dpuserspace.SessionDeltaInfo, 256)
+	for i := range firstBatch {
+		firstBatch[i] = buildDelta(uint16(10000 + i))
+	}
+	secondBatch := []dpuserspace.SessionDeltaInfo{buildDelta(20001)}
+	drainer := &fakeUserspaceDeltaDrainer{
+		batches: [][]dpuserspace.SessionDeltaInfo{firstBatch, secondBatch},
+	}
+	d := &Daemon{
+		sessionSync: &cluster.SessionSync{
+			IsPrimaryFn:      func() bool { return true },
+			IsPrimaryForRGFn: func(rgID int) bool { return rgID == 1 },
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"lan": {Name: "lan"},
+		"wan": {Name: "wan"},
+	}
+
+	queued, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 8)
+	if err != nil {
+		t.Fatalf("drainUserspaceSessionDeltasWithConfig() error = %v", err)
+	}
+	if queued != 257 {
+		t.Fatalf("queued = %d, want 257", queued)
+	}
+	if drainer.calls != 2 {
+		t.Fatalf("drain calls = %d, want 2", drainer.calls)
 	}
 }

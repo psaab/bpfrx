@@ -16,6 +16,7 @@ type ControlRequest struct {
 	Snapshot           *ConfigSnapshot           `json:"snapshot,omitempty"`
 	Forwarding         *ForwardingControlRequest `json:"forwarding,omitempty"`
 	HAState            *HAStateUpdateRequest     `json:"ha_state,omitempty"`
+	HADemotionPrepare  *HADemotionPrepareRequest `json:"ha_demotion_prepare,omitempty"`
 	Queue              *QueueControlRequest      `json:"queue,omitempty"`
 	Binding            *BindingControlRequest    `json:"binding,omitempty"`
 	Packet             *InjectPacketRequest      `json:"packet,omitempty"`
@@ -355,6 +356,10 @@ type HAStateUpdateRequest struct {
 	Groups []HAGroupStatus `json:"groups,omitempty"`
 }
 
+type HADemotionPrepareRequest struct {
+	Groups []int `json:"groups,omitempty"`
+}
+
 type HAGroupStatus struct {
 	RGID              int    `json:"rg_id"`
 	Active            bool   `json:"active"`
@@ -576,5 +581,6 @@ type SessionDeltaInfo struct {
 	NATDstIP         string    `json:"nat_dst_ip,omitempty"`
 	NATSrcPort       uint16    `json:"nat_src_port,omitempty"`
 	NATDstPort       uint16    `json:"nat_dst_port,omitempty"`
+	FabricRedirect   bool      `json:"fabric_redirect,omitempty"`
 	FabricIngress    bool      `json:"fabric_ingress,omitempty"`
 }

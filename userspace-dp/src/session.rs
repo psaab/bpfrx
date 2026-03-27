@@ -134,6 +134,7 @@ pub(crate) struct SessionDelta {
     pub(crate) key: SessionKey,
     pub(crate) decision: SessionDecision,
     pub(crate) metadata: SessionMetadata,
+    pub(crate) fabric_redirect_sync: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,6 +238,7 @@ impl SessionTable {
                         key: key.clone(),
                         decision,
                         metadata: metadata.clone(),
+                        fabric_redirect_sync: false,
                     });
                 }
                 expired_entries.push(ExpiredSession {
@@ -362,6 +364,7 @@ impl SessionTable {
                 key,
                 decision,
                 metadata,
+                fabric_redirect_sync: false,
             });
         }
         true
@@ -427,6 +430,7 @@ impl SessionTable {
                 key: key.clone(),
                 decision,
                 metadata,
+                fabric_redirect_sync: false,
             });
         }
         true
@@ -455,6 +459,25 @@ impl SessionTable {
         self.sessions.insert(key.clone(), entry);
         self.index_forward_nat_key(key, decision, &metadata);
         true
+    }
+
+    pub fn emit_open_delta(
+        &mut self,
+        key: SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        fabric_redirect_sync: bool,
+    ) {
+        if metadata.is_reverse {
+            return;
+        }
+        self.push_delta(SessionDelta {
+            kind: SessionDeltaKind::Open,
+            key,
+            decision,
+            metadata,
+            fabric_redirect_sync,
+        });
     }
 
     pub fn delete(&mut self, key: &SessionKey) {
@@ -550,7 +573,8 @@ impl SessionTable {
         if metadata.is_reverse {
             let translated = translated_session_key(key, decision.nat);
             if translated != *key {
-                self.reverse_translated_index.insert(translated, key.clone());
+                self.reverse_translated_index
+                    .insert(translated, key.clone());
             }
             return;
         }
@@ -1498,7 +1522,11 @@ mod tests {
         assert_eq!(hit.metadata, reverse_metadata);
 
         table.delete(&reverse_wire);
-        assert!(table.lookup(&reverse_canonical, 1_002_000_000, 0x10).is_none());
+        assert!(
+            table
+                .lookup(&reverse_canonical, 1_002_000_000, 0x10)
+                .is_none()
+        );
     }
 
     #[test]

@@ -517,6 +517,8 @@ struct ControlRequest {
     forwarding: Option<ForwardingControlRequest>,
     #[serde(rename = "ha_state", default)]
     ha_state: Option<HAStateUpdateRequest>,
+    #[serde(rename = "ha_demotion_prepare", default)]
+    ha_demotion_prepare: Option<HADemotionPrepareRequest>,
     #[serde(default)]
     queue: Option<QueueControlRequest>,
     #[serde(default)]
@@ -712,6 +714,12 @@ struct ForwardingControlRequest {
 struct HAStateUpdateRequest {
     #[serde(default)]
     groups: Vec<HAGroupStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+struct HADemotionPrepareRequest {
+    #[serde(default)]
+    groups: Vec<i32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1085,6 +1093,8 @@ struct SessionDeltaInfo {
     nat_src_port: u16,
     #[serde(rename = "nat_dst_port", default)]
     nat_dst_port: u16,
+    #[serde(rename = "fabric_redirect", default)]
+    fabric_redirect: bool,
     #[serde(rename = "fabric_ingress", default)]
     fabric_ingress: bool,
 }
@@ -1380,7 +1390,9 @@ fn handle_stream(
                         );
                         guard.status.bindings = replanned;
                         if defer_workers {
-                            eprintln!("CTRL_REQ: apply_snapshot defer_workers=true — skipping worker spawn (RETH MAC pending)");
+                            eprintln!(
+                                "CTRL_REQ: apply_snapshot defer_workers=true — skipping worker spawn (RETH MAC pending)"
+                            );
                         } else {
                             reconcile_status_bindings(&mut guard);
                         }
@@ -1431,6 +1443,22 @@ fn handle_stream(
                 } else {
                     response.ok = false;
                     response.error = "missing HA state".to_string();
+                }
+            }
+            "prepare_ha_demotion" => {
+                if let Some(prepare_req) = request.ha_demotion_prepare {
+                    match guard.afxdp.prepare_ha_demotion(&prepare_req.groups) {
+                        Ok(()) => {
+                            refresh_status(&mut guard);
+                        }
+                        Err(err) => {
+                            response.ok = false;
+                            response.error = err;
+                        }
+                    }
+                } else {
+                    response.ok = false;
+                    response.error = "missing HA demotion prepare".to_string();
                 }
             }
             "update_fabrics" => {

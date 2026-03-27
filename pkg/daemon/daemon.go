@@ -71,39 +71,43 @@ const nodeIDFile = "/etc/bpfrx/node-id"
 
 // Daemon is the main bpfrx daemon.
 type Daemon struct {
-	opts          Options
-	store         *configstore.Store
-	dp            dataplane.DataPlane
-	networkd      *networkd.Manager
-	routing       *routing.Manager
-	frr           *frr.Manager
-	ipsec         *ipsec.Manager
-	ra            *ra.Manager
-	dhcp          *dhcp.Manager
-	dhcpServer    *dhcpserver.Manager
-	feeds         *feeds.Manager
-	rpm           *rpm.Manager
-	flowExporter  *flowexport.Exporter
-	flowCancel    context.CancelFunc
-	flowWg        sync.WaitGroup
-	ipfixExporter *flowexport.IPFIXExporter
-	ipfixCancel   context.CancelFunc
-	ipfixWg       sync.WaitGroup
-	dhcpRelay     *dhcprelay.Manager
-	snmpAgent     *snmp.Agent
-	lldpMgr       *lldp.Manager
-	scheduler     *scheduler.Scheduler
-	cluster       *cluster.Manager
-	sessionSync   *cluster.SessionSync
-	slogHandler   *logging.SyslogSlogHandler
-	traceWriter   *logging.TraceWriter
-	eventReader   *logging.EventReader
-	eventEngine   *eventengine.Engine
-	aggregator    *logging.SessionAggregator
-	aggCancel     context.CancelFunc
-	vrrpMgr       *vrrp.Manager
-	gc            *conntrack.GC
-	startTime     time.Time // daemon start time; used to suppress stale config sync
+	opts             Options
+	store            *configstore.Store
+	dp               dataplane.DataPlane
+	networkd         *networkd.Manager
+	routing          *routing.Manager
+	frr              *frr.Manager
+	ipsec            *ipsec.Manager
+	ra               *ra.Manager
+	dhcp             *dhcp.Manager
+	dhcpServer       *dhcpserver.Manager
+	feeds            *feeds.Manager
+	rpm              *rpm.Manager
+	flowExporter     *flowexport.Exporter
+	flowCancel       context.CancelFunc
+	flowWg           sync.WaitGroup
+	ipfixExporter    *flowexport.IPFIXExporter
+	ipfixCancel      context.CancelFunc
+	ipfixWg          sync.WaitGroup
+	dhcpRelay        *dhcprelay.Manager
+	snmpAgent        *snmp.Agent
+	lldpMgr          *lldp.Manager
+	scheduler        *scheduler.Scheduler
+	cluster          *cluster.Manager
+	sessionSync      *cluster.SessionSync
+	syncBulkPrimed   atomic.Bool
+	syncReadyTimerMu sync.Mutex
+	syncReadyTimer   *time.Timer
+	syncReadyTimeout time.Duration
+	slogHandler      *logging.SyslogSlogHandler
+	traceWriter      *logging.TraceWriter
+	eventReader      *logging.EventReader
+	eventEngine      *eventengine.Engine
+	aggregator       *logging.SessionAggregator
+	aggCancel        context.CancelFunc
+	vrrpMgr          *vrrp.Manager
+	gc               *conntrack.GC
+	startTime        time.Time // daemon start time; used to suppress stale config sync
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
@@ -196,6 +200,13 @@ type Daemon struct {
 	// learned from the userspace dataplane helper before they enter the
 	// existing HA/session-sync transport.
 	userspaceSessionIDs atomic.Uint64
+
+	// userspaceDeltaSyncMu serializes helper delta draining between the
+	// periodic background sync loop and the RG demotion prepare path.
+	// Demotion prepare must drain and barrier its continuity-critical
+	// republish deltas itself; otherwise the background loop can consume
+	// them first and let demotion proceed without peer ack.
+	userspaceDeltaSyncMu sync.Mutex
 }
 
 // New creates a new Daemon.
@@ -219,14 +230,75 @@ func New(opts Options) *Daemon {
 	}
 
 	return &Daemon{
-		opts:            opts,
-		startTime:       time.Now(),
-		store:           store,
-		rgStates:        make(map[int]*rgStateMachine),
-		blackholeRoutes: make(map[int][]netlink.Route),
-		reconcileNowCh:  make(chan struct{}, 1),
-		linkByNameFn:    netlink.LinkByName,
+		opts:             opts,
+		startTime:        time.Now(),
+		store:            store,
+		rgStates:         make(map[int]*rgStateMachine),
+		blackholeRoutes:  make(map[int][]netlink.Route),
+		reconcileNowCh:   make(chan struct{}, 1),
+		syncReadyTimeout: 5 * time.Second,
+		linkByNameFn:     netlink.LinkByName,
 	}
+}
+
+func (d *Daemon) stopSyncReadyTimer() {
+	d.syncReadyTimerMu.Lock()
+	defer d.syncReadyTimerMu.Unlock()
+	if d.syncReadyTimer != nil {
+		d.syncReadyTimer.Stop()
+		d.syncReadyTimer = nil
+	}
+}
+
+func (d *Daemon) armSyncReadyTimer() {
+	if d.cluster == nil || d.syncReadyTimeout <= 0 {
+		return
+	}
+	d.syncReadyTimerMu.Lock()
+	defer d.syncReadyTimerMu.Unlock()
+	if d.syncReadyTimer != nil {
+		d.syncReadyTimer.Stop()
+	}
+	timeout := d.syncReadyTimeout
+	d.syncReadyTimer = time.AfterFunc(timeout, func() {
+		if d.cluster != nil && !d.cluster.IsSyncReady() {
+			slog.Info("cluster: sync readiness timeout, releasing hold")
+			d.cluster.SetSyncReady(true)
+		}
+	})
+}
+
+func (d *Daemon) onSessionSyncPeerConnected() {
+	if d.syncBulkPrimed.Load() {
+		if d.cluster != nil {
+			d.cluster.SetSyncReady(true)
+		}
+		d.stopSyncReadyTimer()
+		return
+	}
+	d.armSyncReadyTimer()
+}
+
+func (d *Daemon) onSessionSyncBulkReceived() {
+	d.syncBulkPrimed.Store(true)
+	d.stopSyncReadyTimer()
+	if d.vrrpMgr != nil {
+		d.vrrpMgr.ReleaseSyncHold()
+	}
+	if d.cluster != nil {
+		d.cluster.SetSyncReady(true)
+	}
+}
+
+func (d *Daemon) onSessionSyncPeerDisconnected() {
+	if d.syncBulkPrimed.Load() {
+		slog.Info("cluster: sync peer disconnected, preserving sync readiness after completed bulk sync")
+		return
+	}
+	if d.cluster != nil {
+		d.cluster.SetSyncReady(false)
+	}
+	d.armSyncReadyTimer()
 }
 
 func collectAppliedTunnels(cfg *config.Config) []*config.TunnelConfig {
@@ -354,12 +426,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// Without this, standalone nodes or nodes with permanently-down
 		// peers would never become primary.
 		if cc.PrivateRGElection && cc.FabricInterface != "" && cc.FabricPeerAddress != "" {
-			time.AfterFunc(5*time.Second, func() {
-				if !d.cluster.IsSyncReady() {
-					slog.Info("cluster: sync readiness timeout, releasing hold")
-					d.cluster.SetSyncReady(true)
-				}
-			})
+			d.armSyncReadyTimer()
 		}
 	}
 
@@ -1049,6 +1116,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Stop session sync (5s timeout to avoid blocking teardown).
 	if d.sessionSync != nil {
+		d.stopSyncReadyTimer()
 		d.sessionSync.Stop()
 	}
 
@@ -2330,12 +2398,17 @@ func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
 	stateDir := filepath.Dir(d.opts.ConfigFile)
 
 	dm, err := dhcp.New(stateDir, func() {
-		slog.Info("DHCP address changed, recompiling dataplane")
 		// Full recompile is safe: heartbeat sockets survive VRF rebind
 		// (RestartHeartbeat), RETH MAC is set live (no XSK rebind), and
 		// BPF compile skips reconcile when the binding plan is unchanged.
 		if activeCfg := d.store.ActiveConfig(); activeCfg != nil {
-			d.applyConfig(activeCfg)
+			if d.dhcpLeaseChangeRequiresRecompile(activeCfg) {
+				slog.Info("DHCP address changed, recompiling dataplane")
+				d.applyConfig(activeCfg)
+			} else {
+				slog.Info("DHCP address changed on management-only interface, refreshing management routes")
+				d.applyMgmtVRFRoutes()
+			}
 		}
 	})
 	if err != nil {
@@ -2387,6 +2460,39 @@ func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
 			}
 		}
 	}
+}
+
+func (d *Daemon) dhcpLeaseChangeRequiresRecompile(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	// Prefix delegation can affect downstream addressing/RA and still needs
+	// a full re-apply.
+	if d.dhcp != nil && len(d.dhcp.DelegatedPrefixesForRA()) > 0 {
+		return true
+	}
+	// If management VRF bindings are unavailable, stay conservative.
+	if len(d.mgmtVRFInterfaces) == 0 {
+		return true
+	}
+	for ifName, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
+		for _, unit := range ifc.Units {
+			if unit == nil || (!unit.DHCP && !unit.DHCPv6) {
+				continue
+			}
+			dhcpIface := config.LinuxIfName(ifName)
+			if unit.VlanID > 0 {
+				dhcpIface = fmt.Sprintf("%s.%d", dhcpIface, unit.VlanID)
+			}
+			if !d.mgmtVRFInterfaces[dhcpIface] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // resolveJunosIfName converts a Junos-style interface name to its Linux
@@ -2933,6 +3039,10 @@ type userspaceSessionDeltaDrainer interface {
 	DrainSessionDeltas(max uint32) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error)
 }
 
+type userspaceRGDemotionPreparer interface {
+	PrepareRGDemotion(rgIDs []int) error
+}
+
 func daemonMonotonicSeconds() uint64 {
 	var ts unix.Timespec
 	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
@@ -2985,6 +3095,19 @@ func userspaceReverseKeyV4(key dataplane.SessionKey, delta dpuserspace.SessionDe
 		rev.DstPort = userspaceHostToNetwork16(delta.NATSrcPort)
 	}
 	return rev
+}
+
+func userspaceForwardWireKeyV4(key dataplane.SessionKey, delta dpuserspace.SessionDeltaInfo) dataplane.SessionKey {
+	wire := key
+	if ip := net.ParseIP(delta.NATSrcIP).To4(); ip != nil {
+		copy(wire.SrcIP[:], ip)
+		wire.SrcPort = userspaceHostToNetwork16(effectiveUserspaceNATSrcPort(delta))
+	}
+	if ip := net.ParseIP(delta.NATDstIP).To4(); ip != nil {
+		copy(wire.DstIP[:], ip)
+		wire.DstPort = userspaceHostToNetwork16(effectiveUserspaceNATDstPort(delta))
+	}
+	return wire
 }
 
 func effectiveUserspaceNATSrcPort(delta dpuserspace.SessionDeltaInfo) uint16 {
@@ -3100,6 +3223,18 @@ func userspaceSessionFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	return key, val, true
 }
 
+func userspaceForwardWireAliasFromDeltaV4(delta dpuserspace.SessionDeltaInfo, zoneIDs map[string]uint16) (dataplane.SessionKey, dataplane.SessionValue, bool) {
+	key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
+	if !ok {
+		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
+	}
+	wireKey := userspaceForwardWireKeyV4(key, delta)
+	if wireKey == key {
+		return dataplane.SessionKey{}, dataplane.SessionValue{}, false
+	}
+	return wireKey, val, true
+}
+
 func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map[string]uint16) (dataplane.SessionKeyV6, dataplane.SessionValueV6, bool) {
 	src := net.ParseIP(delta.SrcIP).To16()
 	dst := net.ParseIP(delta.DstIP).To16()
@@ -3157,7 +3292,35 @@ func userspaceSessionFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map
 	return key, val, true
 }
 
+func userspaceForwardWireKeyV6(key dataplane.SessionKeyV6, delta dpuserspace.SessionDeltaInfo) dataplane.SessionKeyV6 {
+	wire := key
+	if ip := net.ParseIP(delta.NATSrcIP).To16(); ip != nil {
+		copy(wire.SrcIP[:], ip)
+		wire.SrcPort = userspaceHostToNetwork16(effectiveUserspaceNATSrcPort(delta))
+	}
+	if ip := net.ParseIP(delta.NATDstIP).To16(); ip != nil {
+		copy(wire.DstIP[:], ip)
+		wire.DstPort = userspaceHostToNetwork16(effectiveUserspaceNATDstPort(delta))
+	}
+	return wire
+}
+
+func userspaceForwardWireAliasFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zoneIDs map[string]uint16) (dataplane.SessionKeyV6, dataplane.SessionValueV6, bool) {
+	key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
+	if !ok {
+		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false
+	}
+	wireKey := userspaceForwardWireKeyV6(key, delta)
+	if wireKey == key {
+		return dataplane.SessionKeyV6{}, dataplane.SessionValueV6{}, false
+	}
+	return wireKey, val, true
+}
+
 func (d *Daemon) shouldSyncUserspaceDelta(delta dpuserspace.SessionDeltaInfo, ingressZone uint16) bool {
+	if delta.FabricRedirect && !delta.FabricIngress {
+		return d.sessionSync != nil
+	}
 	if delta.OwnerRGID > 0 && d.sessionSync != nil && d.sessionSync.IsPrimaryForRGFn != nil {
 		return d.sessionSync.IsPrimaryForRGFn(delta.OwnerRGID)
 	}
@@ -3239,47 +3402,145 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 		if cfg == nil {
 			continue
 		}
-		zoneIDs := buildZoneIDs(cfg)
-
-		deltas, _, err := drainer.DrainSessionDeltas(256)
+		d.userspaceDeltaSyncMu.Lock()
+		_, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
+		d.userspaceDeltaSyncMu.Unlock()
 		if err != nil {
 			slog.Debug("userspace session delta drain failed", "err", err)
-			continue
 		}
+	}
+}
 
-		for _, delta := range deltas {
-			switch strings.ToLower(delta.Event) {
-			case "open":
-				switch delta.AddrFamily {
-				case dataplane.AFInet:
-					key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
-					if !ok || !d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
-						continue
-					}
-					d.sessionSync.QueueSessionV4(key, val)
-				case dataplane.AFInet6:
-					key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
-					if !ok || !d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
-						continue
-					}
-					d.sessionSync.QueueSessionV6(key, val)
+func (d *Daemon) queueUserspaceSessionDeltas(
+	zoneIDs map[string]uint16,
+	deltas []dpuserspace.SessionDeltaInfo,
+) int {
+	if d.sessionSync == nil {
+		return 0
+	}
+	queued := 0
+	for _, delta := range deltas {
+		switch strings.ToLower(delta.Event) {
+		case "open":
+			switch delta.AddrFamily {
+			case dataplane.AFInet:
+				key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
+				if !ok || !d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
+					continue
 				}
-			case "close":
-				switch delta.AddrFamily {
-				case dataplane.AFInet:
-					key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
-					if ok && d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
-						d.sessionSync.QueueDeleteV4(key)
+				d.sessionSync.QueueSessionV4(key, val)
+				queued++
+				if delta.FabricRedirect && !delta.FabricIngress {
+					if wireKey, wireVal, ok := userspaceForwardWireAliasFromDeltaV4(delta, zoneIDs); ok {
+						d.sessionSync.QueueSessionV4(wireKey, wireVal)
+						queued++
 					}
-				case dataplane.AFInet6:
-					key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
-					if ok && d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
-						d.sessionSync.QueueDeleteV6(key)
+				}
+			case dataplane.AFInet6:
+				key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
+				if !ok || !d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
+					continue
+				}
+				d.sessionSync.QueueSessionV6(key, val)
+				queued++
+				if delta.FabricRedirect && !delta.FabricIngress {
+					if wireKey, wireVal, ok := userspaceForwardWireAliasFromDeltaV6(delta, zoneIDs); ok {
+						d.sessionSync.QueueSessionV6(wireKey, wireVal)
+						queued++
+					}
+				}
+			}
+		case "close":
+			switch delta.AddrFamily {
+			case dataplane.AFInet:
+				key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
+				if ok && d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
+					d.sessionSync.QueueDeleteV4(key)
+					queued++
+					if delta.FabricRedirect && !delta.FabricIngress {
+						wireKey := userspaceForwardWireKeyV4(key, delta)
+						if wireKey != key {
+							d.sessionSync.QueueDeleteV4(wireKey)
+							queued++
+						}
+					}
+				}
+			case dataplane.AFInet6:
+				key, val, ok := userspaceSessionFromDeltaV6(delta, zoneIDs)
+				if ok && d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
+					d.sessionSync.QueueDeleteV6(key)
+					queued++
+					if delta.FabricRedirect && !delta.FabricIngress {
+						wireKey := userspaceForwardWireKeyV6(key, delta)
+						if wireKey != key {
+							d.sessionSync.QueueDeleteV6(wireKey)
+							queued++
+						}
 					}
 				}
 			}
 		}
 	}
+	return queued
+}
+
+func (d *Daemon) drainUserspaceSessionDeltasWithConfig(
+	drainer userspaceSessionDeltaDrainer,
+	cfg *config.Config,
+	maxBatches int,
+) (int, error) {
+	if drainer == nil || cfg == nil || maxBatches <= 0 {
+		return 0, nil
+	}
+	zoneIDs := buildZoneIDs(cfg)
+	total := 0
+	for batch := 0; batch < maxBatches; batch++ {
+		deltas, _, err := drainer.DrainSessionDeltas(256)
+		if err != nil {
+			return total, err
+		}
+		if len(deltas) == 0 {
+			break
+		}
+		total += d.queueUserspaceSessionDeltas(zoneIDs, deltas)
+		if len(deltas) < 256 {
+			break
+		}
+	}
+	return total, nil
+}
+
+func (d *Daemon) prepareUserspaceRGDemotion(rgID int) {
+	preparer, ok := d.dp.(userspaceRGDemotionPreparer)
+	if !ok {
+		return
+	}
+	if err := preparer.PrepareRGDemotion([]int{rgID}); err != nil {
+		slog.Warn("userspace: prepare rg demotion failed", "rg", rgID, "err", err)
+		return
+	}
+	if d.sessionSync == nil || !d.sessionSync.IsConnected() {
+		return
+	}
+	drainer, ok := d.dp.(userspaceSessionDeltaDrainer)
+	if !ok {
+		return
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	d.userspaceDeltaSyncMu.Lock()
+	defer d.userspaceDeltaSyncMu.Unlock()
+	queued, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 8)
+	if err != nil {
+		slog.Warn("userspace: drain prepared demotion deltas failed", "rg", rgID, "err", err)
+		return
+	}
+	if err := d.sessionSync.WaitForPeerBarrier(2 * time.Second); err != nil {
+		slog.Warn("userspace: demotion peer barrier failed", "rg", rgID, "queued_deltas", queued, "err", err)
+	}
+	slog.Info("userspace: prepared rg demotion", "rg", rgID, "queued_deltas", queued)
 }
 
 // parseAddrPair parses "ip:port" or "[ip]:port" into net.IPs and IPv6 flag.
@@ -4761,6 +5022,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// must NOT push stale config from disk.
 			d.sessionSync.OnPeerConnected = func() {
 				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer connected")
+				d.onSessionSyncPeerConnected()
 				if d.cluster == nil || !d.cluster.IsLocalPrimary(0) {
 					slog.Info("cluster: skipping config push (not RG0 primary)")
 					return
@@ -4776,14 +5038,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			d.sessionSync.OnBulkSyncReceived = func() {
 				d.cluster.RecordEvent(cluster.EventColdSync, -1, "Bulk sync completed")
 				slog.Info("cluster: session sync complete, releasing VRRP hold")
-				d.vrrpMgr.ReleaseSyncHold()
-				d.cluster.SetSyncReady(true)
+				d.onSessionSyncBulkReceived()
 			}
 
 			d.sessionSync.OnPeerDisconnected = func() {
 				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer disconnected (all fabrics)")
-				slog.Info("cluster: sync peer disconnected, resetting sync readiness")
-				d.cluster.SetSyncReady(false)
+				d.onSessionSyncPeerDisconnected()
 			}
 
 			// Wire remote failover: when peer requests us to give up primary.
@@ -4912,6 +5172,7 @@ func (d *Daemon) stopClusterComms() {
 		d.cluster.StopHeartbeat()
 	}
 	if d.sessionSync != nil {
+		d.stopSyncReadyTimer()
 		d.sessionSync.Stop()
 		d.sessionSync = nil
 	}
@@ -5856,6 +6117,9 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				// already superseded this transition.
 				if tr.Changed && d.dp != nil {
 					cur, _ := s.CurrentDesired()
+					if !cur {
+						d.prepareUserspaceRGDemotion(ev.GroupID)
+					}
 					if err := d.dp.UpdateRGActive(ev.GroupID, cur); err != nil {
 						slog.Warn("failed to update rg_active from cluster event",
 							"rg", ev.GroupID, "active", cur, "err", err)
@@ -5890,6 +6154,9 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				}
 				if tr.Changed && d.dp != nil {
 					cur, _ := s.CurrentDesired()
+					if !cur {
+						d.prepareUserspaceRGDemotion(ev.GroupID)
+					}
 					if err := d.dp.UpdateRGActive(ev.GroupID, cur); err != nil {
 						slog.Warn("failed to update rg_active from cluster event",
 							"rg", ev.GroupID, "active", cur, "err", err)
@@ -6048,6 +6315,9 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					d.injectBlackholeRoutes(rgID)
 					if d.dp != nil {
 						cur, _ := s.CurrentDesired()
+						if !cur {
+							d.prepareUserspaceRGDemotion(rgID)
+						}
 						if err := d.dp.UpdateRGActive(rgID, cur); err != nil {
 							slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
 						} else {
@@ -6229,6 +6499,7 @@ func (d *Daemon) reconcileRGState() {
 				// Deactivation ordering: blackholes FIRST, then
 				// clear rg_active.
 				d.injectBlackholeRoutes(rgID)
+				d.prepareUserspaceRGDemotion(rgID)
 				if err := d.dp.UpdateRGActive(rgID, false); err != nil {
 					slog.Warn("reconcile: failed to update rg_active",
 						"rg", rgID, "active", false, "err", err)

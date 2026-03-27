@@ -376,7 +376,7 @@ func TestPeerIPsecSAs(t *testing.T) {
 	}
 
 	// Simulate receiving IPsec SA list
-	ss.handleMessage(syncMsgIPsecSA, encodeIPsecSAPayload([]string{"vpn-a", "vpn-b"}))
+	ss.handleMessage(nil, syncMsgIPsecSA, encodeIPsecSAPayload([]string{"vpn-a", "vpn-b"}))
 
 	names := ss.PeerIPsecSAs()
 	if len(names) != 2 {
@@ -397,7 +397,7 @@ func TestSetDataPlane(t *testing.T) {
 	key := dataplane.SessionKey{Protocol: 6, SrcIP: [4]byte{1, 2, 3, 4}, DstIP: [4]byte{5, 6, 7, 8}}
 	val := dataplane.SessionValue{State: 1}
 	payload := encodeSessionV4Payload(key, val)
-	ss.handleMessage(syncMsgSessionV4, payload)
+	ss.handleMessage(nil, syncMsgSessionV4, payload)
 
 	if ss.stats.SessionsReceived.Load() != 1 {
 		t.Fatal("should count received")
@@ -412,7 +412,7 @@ func TestHandleMessageDeleteV4(t *testing.T) {
 	// Without dp, should not crash
 	key := dataplane.SessionKey{Protocol: 6}
 	msg := encodeDeleteV4(key)
-	ss.handleMessage(syncMsgDeleteV4, msg[syncHeaderSize:])
+	ss.handleMessage(nil, syncMsgDeleteV4, msg[syncHeaderSize:])
 	if ss.stats.DeletesReceived.Load() != 1 {
 		t.Fatal("should count delete received")
 	}
@@ -616,7 +616,7 @@ func TestBulkEndTriggersCallback(t *testing.T) {
 	}
 
 	// Simulate receiving BulkEnd message.
-	ss.handleMessage(syncMsgBulkEnd, nil)
+	ss.handleMessage(nil, syncMsgBulkEnd, nil)
 
 	select {
 	case <-called:
@@ -629,7 +629,7 @@ func TestBulkEndTriggersCallback(t *testing.T) {
 func TestBulkEndWithoutCallback(t *testing.T) {
 	ss := NewSessionSync(":4785", "10.0.0.2:4785", nil)
 	// Should not panic when callback is nil.
-	ss.handleMessage(syncMsgBulkEnd, nil)
+	ss.handleMessage(nil, syncMsgBulkEnd, nil)
 }
 
 func TestSyncSweepV6(t *testing.T) {
@@ -949,12 +949,12 @@ func TestBulkEpochMismatchIgnored(t *testing.T) {
 	// BulkStart with epoch 5
 	var startBuf [8]byte
 	binary.LittleEndian.PutUint64(startBuf[:], 5)
-	ss.handleMessage(syncMsgBulkStart, startBuf[:])
+	ss.handleMessage(nil, syncMsgBulkStart, startBuf[:])
 
 	// BulkEnd with epoch 99 (mismatch)
 	var endBuf [8]byte
 	binary.LittleEndian.PutUint64(endBuf[:], 99)
-	ss.handleMessage(syncMsgBulkEnd, endBuf[:])
+	ss.handleMessage(nil, syncMsgBulkEnd, endBuf[:])
 
 	// Callback should NOT have been invoked
 	time.Sleep(50 * time.Millisecond)
@@ -970,7 +970,7 @@ func TestBulkEpochMismatchIgnored(t *testing.T) {
 	// Now send matching BulkEnd — should trigger callback + reconciliation
 	var matchBuf [8]byte
 	binary.LittleEndian.PutUint64(matchBuf[:], 5)
-	ss.handleMessage(syncMsgBulkEnd, matchBuf[:])
+	ss.handleMessage(nil, syncMsgBulkEnd, matchBuf[:])
 
 	time.Sleep(50 * time.Millisecond)
 	if !called {
@@ -1010,17 +1010,17 @@ func TestReconcileUsesSnapshotNotLive(t *testing.T) {
 	ss.SetZoneRGMap(map[uint16]int{1: 1, 2: 2})
 
 	// BulkStart — snapshot sees us as secondary for RG 2
-	ss.handleMessage(syncMsgBulkStart, nil)
+	ss.handleMessage(nil, syncMsgBulkStart, nil)
 
 	// Peer sends freshKey
 	payload := encodeSessionV4Payload(freshKey, dataplane.SessionValue{IsReverse: 0, IngressZone: 2})
-	ss.handleMessage(syncMsgSessionV4, payload)
+	ss.handleMessage(nil, syncMsgSessionV4, payload)
 
 	// FLIP: we become primary for RG 2 mid-bulk
 	primaryForRG2 = true
 
 	// BulkEnd — reconciliation should use snapshot (secondary for RG 2)
-	ss.handleMessage(syncMsgBulkEnd, nil)
+	ss.handleMessage(nil, syncMsgBulkEnd, nil)
 
 	// freshKey should remain
 	if _, ok := dp.v4sessions[freshKey]; !ok {
@@ -1160,13 +1160,13 @@ func TestReconcileStaleSessions(t *testing.T) {
 	ss.SetZoneRGMap(map[uint16]int{1: 1, 2: 2})
 
 	// Simulate bulk receive: BulkStart → sessionA → BulkEnd.
-	ss.handleMessage(syncMsgBulkStart, nil)
+	ss.handleMessage(nil, syncMsgBulkStart, nil)
 
 	// Send freshKeyA as a session message.
 	payload := encodeSessionV4Payload(freshKeyA, dataplane.SessionValue{IsReverse: 0, IngressZone: 2})
-	ss.handleMessage(syncMsgSessionV4, payload)
+	ss.handleMessage(nil, syncMsgSessionV4, payload)
 
-	ss.handleMessage(syncMsgBulkEnd, nil)
+	ss.handleMessage(nil, syncMsgBulkEnd, nil)
 
 	// freshKeyA should remain.
 	if _, ok := dp.v4sessions[freshKeyA]; !ok {
@@ -1203,10 +1203,10 @@ func TestReconcileStaleSessionsV6(t *testing.T) {
 	ss.IsPrimaryForRGFn = func(rgID int) bool { return rgID == 1 }
 	ss.SetZoneRGMap(map[uint16]int{1: 1, 2: 2})
 
-	ss.handleMessage(syncMsgBulkStart, nil)
+	ss.handleMessage(nil, syncMsgBulkStart, nil)
 	payload := encodeSessionV6Payload(freshKey, dataplane.SessionValueV6{IsReverse: 0, IngressZone: 2})
-	ss.handleMessage(syncMsgSessionV6, payload)
-	ss.handleMessage(syncMsgBulkEnd, nil)
+	ss.handleMessage(nil, syncMsgSessionV6, payload)
+	ss.handleMessage(nil, syncMsgBulkEnd, nil)
 
 	if _, ok := dp.v6sessions[freshKey]; !ok {
 		t.Fatal("freshKey should remain")
@@ -1231,7 +1231,7 @@ func TestReconcileNoBulkInProgress(t *testing.T) {
 	ss.SetZoneRGMap(map[uint16]int{2: 2})
 
 	// Call BulkEnd WITHOUT BulkStart — reconciliation should not run.
-	ss.handleMessage(syncMsgBulkEnd, nil)
+	ss.handleMessage(nil, syncMsgBulkEnd, nil)
 
 	if _, ok := dp.v4sessions[key]; !ok {
 		t.Fatal("session should not be deleted when no bulk was in progress")
@@ -1614,6 +1614,50 @@ func TestSessionQueueDoesNotJournal(t *testing.T) {
 		t.Fatal("session updates should not be journaled")
 	}
 	ss.deleteJournalMu.Unlock()
+}
+
+func TestWaitForPeerBarrierRequiresConnection(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	if err := ss.WaitForPeerBarrier(10 * time.Millisecond); err == nil {
+		t.Fatal("expected barrier wait to fail while disconnected")
+	}
+}
+
+func TestWaitForPeerBarrierCompletesOnAck(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.stats.Connected.Store(true)
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		msg := make([]byte, syncHeaderSize+8)
+		if _, err := io.ReadFull(peer, msg); err != nil {
+			done <- fmt.Errorf("read barrier message: %w", err)
+			return
+		}
+		if len(msg) < syncHeaderSize+8 {
+			done <- fmt.Errorf("barrier message too short: %d", len(msg))
+			return
+		}
+		if msg[4] != syncMsgBarrier {
+			done <- fmt.Errorf("unexpected message type %d", msg[4])
+			return
+		}
+		ss.handleMessage(local, syncMsgBarrierAck, msg[syncHeaderSize:])
+		done <- nil
+	}()
+
+	if err := ss.WaitForPeerBarrier(100 * time.Millisecond); err != nil {
+		t.Fatalf("WaitForPeerBarrier returned error: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("barrier helper failed: %v", err)
+	}
 }
 
 type mockSweepProfilerDP struct {

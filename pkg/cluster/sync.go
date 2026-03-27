@@ -24,18 +24,20 @@ var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 
 // Sync message types.
 const (
-	syncMsgSessionV4 = 1
-	syncMsgSessionV6 = 2
-	syncMsgDeleteV4  = 3
-	syncMsgDeleteV6  = 4
-	syncMsgBulkStart = 5
-	syncMsgBulkEnd   = 6
-	syncMsgHeartbeat = 7
-	syncMsgConfig    = 8  // full config text sync from primary to secondary
-	syncMsgIPsecSA   = 9  // IPsec SA connection names sync
-	syncMsgFailover  = 10 // remote failover request (payload: 1 byte rgID)
-	syncMsgFence     = 11 // peer fencing: receiver should disable all RGs
-	syncMsgClockSync = 12 // monotonic clock exchange for timestamp rebasing
+	syncMsgSessionV4  = 1
+	syncMsgSessionV6  = 2
+	syncMsgDeleteV4   = 3
+	syncMsgDeleteV6   = 4
+	syncMsgBulkStart  = 5
+	syncMsgBulkEnd    = 6
+	syncMsgHeartbeat  = 7
+	syncMsgConfig     = 8  // full config text sync from primary to secondary
+	syncMsgIPsecSA    = 9  // IPsec SA connection names sync
+	syncMsgFailover   = 10 // remote failover request (payload: 1 byte rgID)
+	syncMsgFence      = 11 // peer fencing: receiver should disable all RGs
+	syncMsgClockSync  = 12 // monotonic clock exchange for timestamp rebasing
+	syncMsgBarrier    = 13 // ordered marker for remote install barriers
+	syncMsgBarrierAck = 14
 )
 
 // syncHeader is the wire header for each sync message.
@@ -198,6 +200,10 @@ type SessionSync struct {
 	bulkRecvV4       map[dataplane.SessionKey]struct{}
 	bulkRecvV6       map[dataplane.SessionKeyV6]struct{}
 	bulkZoneSnapshot map[uint16]bool // snapshot of ShouldSyncZone at BulkStart
+
+	barrierSeq     atomic.Uint64
+	barrierWaitMu  sync.Mutex
+	barrierWaiters map[uint64]chan struct{}
 }
 
 type sessionSyncSweepProfiler interface {
@@ -1055,11 +1061,11 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 			}
 		}
 
-		s.handleMessage(hdr.Type, payload)
+		s.handleMessage(conn, hdr.Type, payload)
 	}
 }
 
-func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
+func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte) {
 	switch msgType {
 	case syncMsgSessionV4:
 		s.stats.SessionsReceived.Add(1)
@@ -1371,6 +1377,114 @@ func (s *SessionSync) handleMessage(msgType uint8, payload []byte) {
 		s.clockSynced.Store(true)
 		slog.Info("cluster sync: clock synced with peer",
 			"peer_mono", peerMono, "local_mono", localMono, "offset", offset)
+	case syncMsgBarrier:
+		if len(payload) < 8 {
+			slog.Warn("cluster sync: barrier message too short")
+			return
+		}
+		seq := binary.LittleEndian.Uint64(payload[:8])
+		slog.Info("cluster sync: barrier received", "seq", seq)
+		s.sendBarrierAck(conn, seq)
+	case syncMsgBarrierAck:
+		if len(payload) < 8 {
+			slog.Warn("cluster sync: barrier ack message too short")
+			return
+		}
+		seq := binary.LittleEndian.Uint64(payload[:8])
+		slog.Info("cluster sync: barrier ack received", "seq", seq)
+		s.completeBarrierWait(seq)
+	}
+}
+
+func (s *SessionSync) sendBarrierAck(conn net.Conn, seq uint64) {
+	var payload [8]byte
+	binary.LittleEndian.PutUint64(payload[:], seq)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := writeMsg(conn, syncMsgBarrierAck, payload[:]); err != nil {
+		s.stats.Errors.Add(1)
+		slog.Debug("cluster sync: failed to send barrier ack", "seq", seq, "err", err)
+		return
+	}
+	slog.Info("cluster sync: barrier ack sent", "seq", seq)
+}
+
+func (s *SessionSync) completeBarrierWait(seq uint64) {
+	s.barrierWaitMu.Lock()
+	waiter := s.barrierWaiters[seq]
+	delete(s.barrierWaiters, seq)
+	s.barrierWaitMu.Unlock()
+	if waiter != nil {
+		close(waiter)
+	}
+}
+
+func (s *SessionSync) waitForSendQueueDrain(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if len(s.sendCh) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for session sync send queue drain")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// WaitForPeerBarrier queues an ordered marker on the session-sync stream and
+// waits until the peer acknowledges that it processed all earlier messages.
+func (s *SessionSync) WaitForPeerBarrier(timeout time.Duration) error {
+	if !s.stats.Connected.Load() {
+		return fmt.Errorf("session sync not connected")
+	}
+	seq := s.barrierSeq.Add(1)
+	waiter := make(chan struct{})
+	s.barrierWaitMu.Lock()
+	if s.barrierWaiters == nil {
+		s.barrierWaiters = make(map[uint64]chan struct{})
+	}
+	s.barrierWaiters[seq] = waiter
+	s.barrierWaitMu.Unlock()
+
+	var payload [8]byte
+	binary.LittleEndian.PutUint64(payload[:], seq)
+	slog.Info("cluster sync: queueing barrier", "seq", seq)
+	if err := s.waitForSendQueueDrain(timeout / 2); err != nil {
+		s.barrierWaitMu.Lock()
+		delete(s.barrierWaiters, seq)
+		s.barrierWaitMu.Unlock()
+		return err
+	}
+	conn := s.getActiveConn()
+	if conn == nil {
+		s.barrierWaitMu.Lock()
+		delete(s.barrierWaiters, seq)
+		s.barrierWaitMu.Unlock()
+		return fmt.Errorf("session sync not connected")
+	}
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgBarrier, payload[:])
+	s.writeMu.Unlock()
+	if err != nil {
+		s.barrierWaitMu.Lock()
+		delete(s.barrierWaiters, seq)
+		s.barrierWaitMu.Unlock()
+		s.stats.Errors.Add(1)
+		s.handleDisconnect(conn)
+		return fmt.Errorf("failed to send session sync barrier: %w", err)
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-waiter:
+		return nil
+	case <-timer.C:
+		s.barrierWaitMu.Lock()
+		delete(s.barrierWaiters, seq)
+		s.barrierWaitMu.Unlock()
+		return fmt.Errorf("timed out waiting for session sync barrier ack seq=%d", seq)
 	}
 }
 
@@ -1641,9 +1755,13 @@ func writeMsg(conn net.Conn, msgType uint8, payload []byte) error {
 
 func encodeSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) []byte {
 	payload := encodeSessionV4Payload(key, val)
+	return encodeRawMessage(syncMsgSessionV4, payload)
+}
+
+func encodeRawMessage(msgType uint8, payload []byte) []byte {
 	hdr := make([]byte, syncHeaderSize)
 	copy(hdr[:4], syncMagic[:])
-	hdr[4] = syncMsgSessionV4
+	hdr[4] = msgType
 	binary.LittleEndian.PutUint32(hdr[8:12], uint32(len(payload)))
 	return append(hdr, payload...)
 }

@@ -2360,6 +2360,27 @@ func (m *Manager) syncHAStateLocked() error {
 	return m.syncDesiredForwardingStateLocked()
 }
 
+func (m *Manager) PrepareRGDemotion(rgIDs []int) error {
+	if len(rgIDs) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.proc == nil || m.proc.Process == nil {
+		return nil
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{
+		Type: "prepare_ha_demotion",
+		HADemotionPrepare: &HADemotionPrepareRequest{
+			Groups: rgIDs,
+		},
+	}, &status); err != nil {
+		return err
+	}
+	return m.applyHelperStatusLocked(&status)
+}
+
 // SyncFabricState pushes current fabric snapshots (with fresh peer MACs)
 // to the Rust helper. Called from the daemon after refreshFabricFwd succeeds
 // so the helper has up-to-date fabric MAC info for cross-chassis redirect.
