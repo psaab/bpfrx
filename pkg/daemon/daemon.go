@@ -2331,6 +2331,9 @@ func (d *Daemon) startDHCPClients(ctx context.Context, cfg *config.Config) {
 
 	dm, err := dhcp.New(stateDir, func() {
 		slog.Info("DHCP address changed, recompiling dataplane")
+		// Full recompile is safe: heartbeat sockets survive VRF rebind
+		// (RestartHeartbeat), RETH MAC is set live (no XSK rebind), and
+		// BPF compile skips reconcile when the binding plan is unchanged.
 		if activeCfg := d.store.ActiveConfig(); activeCfg != nil {
 			d.applyConfig(activeCfg)
 		}
