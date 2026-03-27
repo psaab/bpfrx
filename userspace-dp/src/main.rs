@@ -511,6 +511,8 @@ struct UserspaceCapabilities {
 struct ControlRequest {
     #[serde(rename = "type")]
     request_type: String,
+    #[serde(rename = "suppress_status", default)]
+    suppress_status: bool,
     #[serde(default)]
     snapshot: Option<ConfigSnapshot>,
     #[serde(default)]
@@ -1574,8 +1576,6 @@ fn handle_stream(
                         "upsert" => match build_synced_session_entry(&sync_req) {
                             Ok(entry) => {
                                 guard.afxdp.upsert_synced_session(entry);
-                                refresh_status(&mut guard);
-                                persist_state = true;
                             }
                             Err(err) => {
                                 response.ok = false;
@@ -1585,8 +1585,6 @@ fn handle_stream(
                         "delete" => match build_synced_session_key(&sync_req) {
                             Ok(key) => {
                                 guard.afxdp.delete_synced_session(key);
-                                refresh_status(&mut guard);
-                                persist_state = true;
                             }
                             Err(err) => {
                                 response.ok = false;
@@ -1678,8 +1676,10 @@ fn handle_stream(
                 response.error = format!("unknown request type {other}");
             }
         }
-        refresh_status(&mut guard);
-        response.status = Some(guard.status.clone());
+        if !request.suppress_status {
+            refresh_status(&mut guard);
+            response.status = Some(guard.status.clone());
+        }
     }
 
     if persist_state {

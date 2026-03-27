@@ -298,6 +298,55 @@ func TestManualFailover(t *testing.T) {
 	}
 }
 
+func TestManualFailover_PreHookRunsBeforeResign(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	called := false
+	m.SetPreManualFailoverHook(func(rgID int) error {
+		called = true
+		if rgID != 0 {
+			t.Fatalf("hook rg=%d, want 0", rgID)
+		}
+		if !m.IsLocalPrimary(0) {
+			t.Fatal("manual failover hook ran after local node resigned")
+		}
+		return nil
+	})
+
+	if err := m.ManualFailover(0); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("expected pre-manual-failover hook to run")
+	}
+}
+
+func TestManualFailover_PreHookErrorPreventsResign(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	m.SetPreManualFailoverHook(func(rgID int) error {
+		return fmt.Errorf("boom")
+	})
+
+	if err := m.ManualFailover(0); err == nil {
+		t.Fatal("expected pre-manual-failover hook error")
+	}
+
+	states := m.GroupStates()
+	if states[0].State != StatePrimary {
+		t.Fatalf("state = %s, want primary after failed pre-hook", states[0].State)
+	}
+	if states[0].ManualFailover {
+		t.Fatal("manual failover should remain cleared on pre-hook failure")
+	}
+}
+
 func TestManualFailover_UnknownRG(t *testing.T) {
 	m := NewManager(0, 1)
 	if err := m.ManualFailover(99); err == nil {

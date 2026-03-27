@@ -45,16 +45,16 @@ func (s NodeState) String() string {
 
 // RedundancyGroupState holds the runtime state of a single redundancy group.
 type RedundancyGroupState struct {
-	GroupID        int
-	LocalPriority  int
-	PeerPriority   int
-	State          NodeState
-	Preempt        bool
+	GroupID          int
+	LocalPriority    int
+	PeerPriority     int
+	State            NodeState
+	Preempt          bool
 	ManualFailover   bool      // true if manually forced
 	ManualFailoverAt time.Time // when ManualFailover was set (for deadlock detection)
 	Weight           int       // current effective weight (255 - sum of down monitor weights)
-	FailoverCount  int
-	MonitorFails   []string // names of currently-failed monitors
+	FailoverCount    int
+	MonitorFails     []string // names of currently-failed monitors
 
 	// Readiness gate: blocks promotion to primary until interfaces + VRRP
 	// are confirmed ready and have been ready for at least TakeoverHoldTime.
@@ -125,6 +125,11 @@ type Manager struct {
 	// peerFenceFn sends a fence (disable-rg) message to the peer.
 	// Set by daemon after sessionSync creation.
 	peerFenceFn func() error
+
+	// preManualFailoverFn runs before the local node resigns an RG.
+	// The daemon uses this to pre-stage userspace continuity before
+	// weight/state changes let the peer take over.
+	preManualFailoverFn func(rgID int) error
 
 	// peerFencing holds the configured fencing action (e.g. "disable-rg").
 	peerFencing string
@@ -583,8 +588,23 @@ func (m *Manager) IsLocalPrimaryAny() bool {
 // ManualFailover forces a redundancy group to failover.
 func (m *Manager) ManualFailover(rgID int) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	rg, ok := m.groups[rgID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("redundancy group %d not found", rgID)
+	}
+	preHook := m.preManualFailoverFn
+	m.mu.Unlock()
+
+	if preHook != nil {
+		if err := preHook(rgID); err != nil {
+			return fmt.Errorf("pre-failover prepare for redundancy group %d: %w", rgID, err)
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rg, ok = m.groups[rgID]
 	if !ok {
 		return fmt.Errorf("redundancy group %d not found", rgID)
 	}
@@ -599,6 +619,14 @@ func (m *Manager) ManualFailover(rgID int) error {
 	}
 	slog.Info("cluster: manual failover", "rg", rgID)
 	return nil
+}
+
+// SetPreManualFailoverHook registers a callback that runs before ManualFailover
+// changes local RG ownership.
+func (m *Manager) SetPreManualFailoverHook(fn func(rgID int) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.preManualFailoverFn = fn
 }
 
 // SetPeerFailoverFunc sets the callback used to send remote failover requests
@@ -1610,9 +1638,9 @@ func (m *Manager) FormatIPMonitoringStatus() string {
 
 // InterfaceMonitorInfo holds per-interface monitor state for display.
 type InterfaceMonitorInfo struct {
-	Interface      string
-	Weight         int
-	Up             bool // physical link state
+	Interface       string
+	Weight          int
+	Up              bool // physical link state
 	RedundancyGroup int
 }
 

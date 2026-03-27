@@ -1654,6 +1654,52 @@ func (s *SessionSync) WaitForPeerBarriersDrained(timeout time.Duration) error {
 	}
 }
 
+// WaitForIdle waits for the outbound sync path to stop advancing for a short
+// stable window. This is used before graceful HA demotion so a barrier is not
+// injected while unrelated background sync traffic is still actively growing.
+func (s *SessionSync) WaitForIdle(timeout time.Duration, stableSamples int, sampleInterval time.Duration) error {
+	if stableSamples <= 0 {
+		stableSamples = 3
+	}
+	if sampleInterval <= 0 {
+		sampleInterval = 200 * time.Millisecond
+	}
+	deadline := time.Now().Add(timeout)
+	var lastSent uint64
+	var lastDeletes uint64
+	var lastQueue int
+	stable := 0
+	initialized := false
+	for {
+		stats := s.Stats()
+		queueLen := len(s.sendCh)
+		if initialized &&
+			stats.SessionsSent == lastSent &&
+			stats.DeletesSent == lastDeletes &&
+			queueLen == lastQueue {
+			stable++
+			if stable >= stableSamples {
+				return nil
+			}
+		} else {
+			stable = 0
+			lastSent = stats.SessionsSent
+			lastDeletes = stats.DeletesSent
+			lastQueue = queueLen
+			initialized = true
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf(
+				"timed out waiting for session sync idle sessions_sent=%d deletes_sent=%d queue_len=%d",
+				lastSent,
+				lastDeletes,
+				lastQueue,
+			)
+		}
+		time.Sleep(sampleInterval)
+	}
+}
+
 // snapshotZoneOwnership returns a map of zoneID→shouldSync for all zones
 // currently in the zone→RG mapping. Used to freeze ownership at BulkStart.
 func (s *SessionSync) snapshotZoneOwnership() map[uint16]bool {

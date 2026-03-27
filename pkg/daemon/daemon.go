@@ -207,6 +207,15 @@ type Daemon struct {
 	// republish deltas itself; otherwise the background loop can consume
 	// them first and let demotion proceed without peer ack.
 	userspaceDeltaSyncMu sync.Mutex
+	// userspaceDemotionPrepDepth pauses background incremental session-sync
+	// producers while demotion prep stages continuity-critical republish.
+	userspaceDemotionPrepDepth atomic.Int32
+	// userspaceDemotionPrepUntil suppresses duplicate demotion prep for the
+	// same RG during a single failover transition. Manual failover can now
+	// stage prep before ownership changes; the later cluster/VRRP edges must
+	// not rerun the same barrier sequence immediately afterward.
+	userspaceDemotionPrepMu    sync.Mutex
+	userspaceDemotionPrepUntil map[int]time.Time
 }
 
 // New creates a new Daemon.
@@ -230,14 +239,15 @@ func New(opts Options) *Daemon {
 	}
 
 	return &Daemon{
-		opts:             opts,
-		startTime:        time.Now(),
-		store:            store,
-		rgStates:         make(map[int]*rgStateMachine),
-		blackholeRoutes:  make(map[int][]netlink.Route),
-		reconcileNowCh:   make(chan struct{}, 1),
-		syncReadyTimeout: 5 * time.Second,
-		linkByNameFn:     netlink.LinkByName,
+		opts:                       opts,
+		startTime:                  time.Now(),
+		store:                      store,
+		rgStates:                   make(map[int]*rgStateMachine),
+		blackholeRoutes:            make(map[int][]netlink.Route),
+		reconcileNowCh:             make(chan struct{}, 1),
+		syncReadyTimeout:           5 * time.Second,
+		linkByNameFn:               netlink.LinkByName,
+		userspaceDemotionPrepUntil: make(map[int]time.Time),
 	}
 }
 
@@ -521,11 +531,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// Deletes are synced if this node is primary for any RG — the peer
 		// ignores deletes for sessions it doesn't have.
 		gc.OnDeleteV4 = func(key dataplane.SessionKey) {
+			if d.userspaceDemotionPrepActive() {
+				return
+			}
 			if d.cluster != nil && d.cluster.IsLocalPrimaryAny() && d.sessionSync != nil {
 				d.sessionSync.QueueDeleteV4(key)
 			}
 		}
 		gc.OnDeleteV6 = func(key dataplane.SessionKeyV6) {
+			if d.userspaceDemotionPrepActive() {
+				return
+			}
 			if d.cluster != nil && d.cluster.IsLocalPrimaryAny() && d.sessionSync != nil {
 				d.sessionSync.QueueDeleteV6(key)
 			}
@@ -554,6 +570,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if d.sessionSync != nil {
 				er.AddCallback(func(rec logging.EventRecord, raw []byte) {
 					if rec.Type != "SESSION_OPEN" {
+						return
+					}
+					if d.userspaceDemotionPrepActive() {
 						return
 					}
 					if d.cluster == nil || !d.cluster.IsLocalPrimaryAny() {
@@ -3397,6 +3416,9 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 		if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
 			continue
 		}
+		if d.userspaceDemotionPrepActive() {
+			continue
+		}
 
 		cfg := d.store.ActiveConfig()
 		if cfg == nil {
@@ -3408,6 +3430,29 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 		if err != nil {
 			slog.Debug("userspace session delta drain failed", "err", err)
 		}
+	}
+}
+
+func (d *Daemon) userspaceDemotionPrepActive() bool {
+	return d.userspaceDemotionPrepDepth.Load() > 0
+}
+
+func (d *Daemon) beginUserspaceDemotionPrepSyncPause(rgID int) func() {
+	depth := d.userspaceDemotionPrepDepth.Add(1)
+	if depth == 1 && d.sessionSync != nil {
+		d.sessionSync.PauseIncrementalSync(fmt.Sprintf("rg%d_demotion_prepare", rgID))
+	}
+	slog.Info("userspace: demotion sync pause entered", "rg", rgID, "depth", depth)
+	return func() {
+		depth := d.userspaceDemotionPrepDepth.Add(-1)
+		if depth < 0 {
+			d.userspaceDemotionPrepDepth.Store(0)
+			depth = 0
+		}
+		if depth == 0 && d.sessionSync != nil {
+			d.sessionSync.ResumeIncrementalSync(fmt.Sprintf("rg%d_demotion_prepare", rgID))
+		}
+		slog.Info("userspace: demotion sync pause exited", "rg", rgID, "depth", depth)
 	}
 }
 
@@ -3510,37 +3555,117 @@ func (d *Daemon) drainUserspaceSessionDeltasWithConfig(
 	return total, nil
 }
 
-func (d *Daemon) prepareUserspaceRGDemotion(rgID int) {
+func (d *Daemon) tryPrepareUserspaceRGDemotion(rgID int) {
+	if err := d.prepareUserspaceRGDemotionWithTimeout(rgID, 5*time.Second); err != nil {
+		slog.Warn("userspace: prepare rg demotion failed", "rg", rgID, "err", err)
+	}
+}
+
+func (d *Daemon) acquireUserspaceRGDemotionPrep(rgID int, hold time.Duration) bool {
+	d.userspaceDemotionPrepMu.Lock()
+	defer d.userspaceDemotionPrepMu.Unlock()
+	now := time.Now()
+	if until, ok := d.userspaceDemotionPrepUntil[rgID]; ok && now.Before(until) {
+		return false
+	}
+	if hold < 10*time.Second {
+		hold = 10 * time.Second
+	}
+	d.userspaceDemotionPrepUntil[rgID] = now.Add(hold)
+	return true
+}
+
+func (d *Daemon) prepareUserspaceRGDemotion(rgID int) error {
+	return d.prepareUserspaceRGDemotionWithTimeout(rgID, 30*time.Second)
+}
+
+func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout time.Duration) error {
+	if !d.acquireUserspaceRGDemotionPrep(rgID, barrierTimeout) {
+		slog.Info("userspace: skipping duplicate rg demotion prepare", "rg", rgID)
+		return nil
+	}
 	preparer, ok := d.dp.(userspaceRGDemotionPreparer)
 	if !ok {
-		return
-	}
-	if err := preparer.PrepareRGDemotion([]int{rgID}); err != nil {
-		slog.Warn("userspace: prepare rg demotion failed", "rg", rgID, "err", err)
-		return
+		return nil
 	}
 	if d.sessionSync == nil || !d.sessionSync.IsConnected() {
-		return
+		if err := preparer.PrepareRGDemotion([]int{rgID}); err != nil {
+			return err
+		}
+		return nil
+	}
+	pendingBarrierTimeout := barrierTimeout / 2
+	if pendingBarrierTimeout > 10*time.Second {
+		pendingBarrierTimeout = 10 * time.Second
+	}
+	if pendingBarrierTimeout < 2*time.Second {
+		pendingBarrierTimeout = 2 * time.Second
+	}
+	if err := d.sessionSync.WaitForPeerBarriersDrained(pendingBarrierTimeout); err != nil {
+		return fmt.Errorf("previous demotion barrier still pending: %w", err)
+	}
+	idleSlice := barrierTimeout / 2
+	if idleSlice > 5*time.Second {
+		idleSlice = 5 * time.Second
+	}
+	if idleSlice < 1*time.Second {
+		idleSlice = 1 * time.Second
+	}
+	quiesceDeadline := time.Now().Add(barrierTimeout)
+	var quiesceErr error
+	for attempts := 1; ; attempts++ {
+		remaining := time.Until(quiesceDeadline)
+		if remaining <= 0 {
+			if quiesceErr == nil {
+				quiesceErr = fmt.Errorf("deadline exceeded")
+			}
+			return fmt.Errorf("session sync peer not quiescent before demotion: %w", quiesceErr)
+		}
+		window := idleSlice
+		if remaining < window {
+			window = remaining
+		}
+		if err := d.sessionSync.WaitForIdle(window, 3, 200*time.Millisecond); err != nil {
+			quiesceErr = err
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		if err := d.sessionSync.WaitForPeerBarrier(window); err != nil {
+			quiesceErr = err
+			slog.Info("userspace: waiting for session sync quiescence before demotion",
+				"rg", rgID,
+				"attempt", attempts,
+				"remaining", time.Until(quiesceDeadline).String(),
+				"err", err)
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		break
+	}
+	resume := d.beginUserspaceDemotionPrepSyncPause(rgID)
+	defer resume()
+	if err := preparer.PrepareRGDemotion([]int{rgID}); err != nil {
+		return err
 	}
 	drainer, ok := d.dp.(userspaceSessionDeltaDrainer)
 	if !ok {
-		return
+		return nil
 	}
 	cfg := d.store.ActiveConfig()
 	if cfg == nil {
-		return
+		return nil
 	}
 	d.userspaceDeltaSyncMu.Lock()
 	defer d.userspaceDeltaSyncMu.Unlock()
 	queued, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 8)
 	if err != nil {
-		slog.Warn("userspace: drain prepared demotion deltas failed", "rg", rgID, "err", err)
-		return
+		return err
 	}
-	if err := d.sessionSync.WaitForPeerBarrier(2 * time.Second); err != nil {
-		slog.Warn("userspace: demotion peer barrier failed", "rg", rgID, "queued_deltas", queued, "err", err)
+	if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {
+		return fmt.Errorf("demotion peer barrier failed queued_deltas=%d: %w", queued, err)
 	}
 	slog.Info("userspace: prepared rg demotion", "rg", rgID, "queued_deltas", queued)
+	return nil
 }
 
 // parseAddrPair parses "ip:port" or "[ip]:port" into net.IPs and IPv6 flag.
@@ -5067,6 +5192,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// Wire peer failover sender so cluster Manager can send remote
 			// failover requests via the fabric sync connection.
 			d.cluster.SetPeerFailoverFunc(d.sessionSync.SendFailover)
+			d.cluster.SetPreManualFailoverHook(d.prepareUserspaceRGDemotion)
 
 			// Wire peer fencing: on heartbeat timeout, cluster sends
 			// fence via sync; on receive, disable all local RGs.
@@ -6108,6 +6234,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 			// - Activation: set rg_active FIRST, then remove blackholes
 			// - Deactivation: add blackholes FIRST, then clear rg_active
 			isPrimary := ev.NewState == cluster.StatePrimary
+			clusterDemotionEdge := ev.OldState == cluster.StatePrimary && !isPrimary
 			s := d.getOrCreateRGState(ev.GroupID)
 			tr := s.SetCluster(isPrimary)
 			if isPrimary {
@@ -6118,7 +6245,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				if tr.Changed && d.dp != nil {
 					cur, _ := s.CurrentDesired()
 					if !cur {
-						d.prepareUserspaceRGDemotion(ev.GroupID)
+						d.tryPrepareUserspaceRGDemotion(ev.GroupID)
 					}
 					if err := d.dp.UpdateRGActive(ev.GroupID, cur); err != nil {
 						slog.Warn("failed to update rg_active from cluster event",
@@ -6147,6 +6274,12 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 					go d.RefreshFabricFwd()
 				}
 			} else {
+				// Cluster-primary demotion is the continuity-critical edge
+				// for stale-owner forwarding. Stage session republish before
+				// rg_active waits for VRRP to follow this transition.
+				if clusterDemotionEdge && d.dp != nil {
+					d.tryPrepareUserspaceRGDemotion(ev.GroupID)
+				}
 				// Deactivation: blackhole routes first (if transitioning
 				// to inactive), then clear rg_active.
 				if tr.Changed && !tr.Active {
@@ -6154,8 +6287,8 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				}
 				if tr.Changed && d.dp != nil {
 					cur, _ := s.CurrentDesired()
-					if !cur {
-						d.prepareUserspaceRGDemotion(ev.GroupID)
+					if !cur && !clusterDemotionEdge {
+						d.tryPrepareUserspaceRGDemotion(ev.GroupID)
 					}
 					if err := d.dp.UpdateRGActive(ev.GroupID, cur); err != nil {
 						slog.Warn("failed to update rg_active from cluster event",
@@ -6316,7 +6449,7 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					if d.dp != nil {
 						cur, _ := s.CurrentDesired()
 						if !cur {
-							d.prepareUserspaceRGDemotion(rgID)
+							d.tryPrepareUserspaceRGDemotion(rgID)
 						}
 						if err := d.dp.UpdateRGActive(rgID, cur); err != nil {
 							slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
@@ -6499,7 +6632,7 @@ func (d *Daemon) reconcileRGState() {
 				// Deactivation ordering: blackholes FIRST, then
 				// clear rg_active.
 				d.injectBlackholeRoutes(rgID)
-				d.prepareUserspaceRGDemotion(rgID)
+				d.tryPrepareUserspaceRGDemotion(rgID)
 				if err := d.dp.UpdateRGActive(rgID, false); err != nil {
 					slog.Warn("reconcile: failed to update rg_active",
 						"rg", rgID, "active", false, "err", err)

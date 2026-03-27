@@ -1764,6 +1764,38 @@ func TestWaitForPeerBarrierCompletesOnAck(t *testing.T) {
 	}
 }
 
+func TestWaitForIdleCompletesWhenCountersStabilize(t *testing.T) {
+	s := NewSessionSync(":0", "127.0.0.1:1", nil)
+	s.sendCh = make(chan []byte, 16)
+	s.stats.SessionsSent.Store(10)
+	s.stats.DeletesSent.Store(2)
+	if err := s.WaitForIdle(500*time.Millisecond, 2, 10*time.Millisecond); err != nil {
+		t.Fatalf("WaitForIdle() error = %v", err)
+	}
+}
+
+func TestWaitForIdleTimesOutWhileQueueAdvances(t *testing.T) {
+	s := NewSessionSync(":0", "127.0.0.1:1", nil)
+	s.sendCh = make(chan []byte, 16)
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		defer close(done)
+		var sent uint64
+		for i := 0; i < 20; i++ {
+			<-ticker.C
+			sent++
+			s.stats.SessionsSent.Store(sent)
+		}
+	}()
+	err := s.WaitForIdle(60*time.Millisecond, 2, 5*time.Millisecond)
+	<-done
+	if err == nil {
+		t.Fatal("WaitForIdle() unexpectedly succeeded")
+	}
+}
+
 func TestWaitForPeerBarriersDrainedCompletesAfterAck(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 	ss.barrierSeq.Store(2)

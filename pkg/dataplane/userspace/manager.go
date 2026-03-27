@@ -3560,16 +3560,12 @@ func (m *Manager) sessionSyncTunnelEndpointLocked(id uint16) (TunnelEndpointSnap
 }
 
 func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
-	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{
-		Type:        "sync_session",
-		SessionSync: &req,
-	}, &status); err != nil {
+		Type:           "sync_session",
+		SuppressStatus: true,
+		SessionSync:    &req,
+	}, nil); err != nil {
 		slog.Warn("userspace session sync mirror failed", "operation", req.Operation, "err", err)
-		return err
-	}
-	if err := m.applyHelperStatusLocked(&status); err != nil {
-		slog.Warn("userspace session sync status apply failed", "operation", req.Operation, "err", err)
 		return err
 	}
 	return nil
