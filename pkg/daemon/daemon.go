@@ -191,6 +191,14 @@ type Daemon struct {
 	// where VIP ownership does not transition and the normal failover
 	// GARP/NA path would not fire.
 	startupActiveAnnounce map[int]bool
+	// directAnnounceSeq cancels and supersedes scheduled direct-mode
+	// post-failover re-announcement bursts per RG. A new schedule bumps
+	// the sequence; in-flight goroutines exit when their generation is
+	// no longer current or the RG is no longer active locally.
+	directAnnounceMu       sync.Mutex
+	directAnnounceSeq      map[int]uint64
+	directAnnounceSchedule []time.Duration
+	directSendGARPsFn      func(int)
 
 	// linkByNameFn resolves a network interface by name. Defaults to
 	// netlink.LinkByName; overridden in tests.
@@ -247,6 +255,7 @@ func New(opts Options) *Daemon {
 		reconcileNowCh:             make(chan struct{}, 1),
 		syncReadyTimeout:           5 * time.Second,
 		linkByNameFn:               netlink.LinkByName,
+		directAnnounceSchedule:     []time.Duration{0, 250 * time.Millisecond, 1 * time.Second, 2 * time.Second, 4 * time.Second, 6 * time.Second},
 		userspaceDemotionPrepUntil: make(map[int]time.Time),
 	}
 }
@@ -1952,7 +1961,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				if d.cluster.IsLocalPrimary(rg.ID) {
 					d.directAddVIPs(rg.ID)
 					d.addStableRethLinkLocal(rg.ID)
-					go d.directSendGARPs(rg.ID)
+					d.scheduleDirectAnnounce(rg.ID, "link-cycle-recovery")
 				}
 			}
 		}
@@ -6194,7 +6203,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 			// Dual-active winner reaffirm: no state change but send
 			// GARPs to refresh upstream ARP/NDP caches after split-brain.
 			if ev.DualActiveWin && noRethVRRP {
-				go d.directSendGARPs(ev.GroupID)
+				d.scheduleDirectAnnounce(ev.GroupID, "dual-active-win")
 				continue
 			}
 
@@ -6264,7 +6273,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				if noRethVRRP {
 					d.directAddVIPs(ev.GroupID)
 					d.addStableRethLinkLocal(ev.GroupID)
-					go d.directSendGARPs(ev.GroupID)
+					d.scheduleDirectAnnounce(ev.GroupID, "cluster-primary")
 					d.applyRethServicesForRG(ev.GroupID)
 					go func() {
 						if cfg := d.store.ActiveConfig(); cfg != nil {
@@ -6301,6 +6310,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				// no-reth-vrrp direct mode: remove VIPs + stop services
 				// on secondary transition.
 				if noRethVRRP && tr.Changed && !tr.Active {
+					d.cancelDirectAnnounce(ev.GroupID)
 					d.directRemoveVIPs(ev.GroupID)
 					d.removeStableRethLinkLocal(ev.GroupID)
 					d.clearRethServicesForRG(ev.GroupID)
@@ -6687,9 +6697,10 @@ func (d *Daemon) reconcileRGState() {
 		if noRethVRRP {
 			if tr.Active {
 				if added := d.directAddVIPs(rgID); added > 0 {
-					go d.directSendGARPs(rgID)
+					d.scheduleDirectAnnounce(rgID, "reconcile-vip-add")
 				}
 			} else if tr.Changed {
+				d.cancelDirectAnnounce(rgID)
 				d.directRemoveVIPs(rgID)
 			}
 		}
@@ -6704,7 +6715,7 @@ func (d *Daemon) reconcileRGState() {
 				d.startupActiveAnnounce = make(map[int]bool)
 			}
 			d.startupActiveAnnounce[rgID] = true
-			go d.directSendGARPs(rgID)
+			d.scheduleDirectAnnounce(rgID, "startup-active")
 			go func() {
 				if cfg := d.store.ActiveConfig(); cfg != nil {
 					d.resolveNeighbors(cfg)
@@ -7461,6 +7472,61 @@ func removeStableLLFromInterface(ifName string, ll net.IP) {
 	} else {
 		slog.Info("removed stable router link-local", "iface", ifName, "addr", ll)
 	}
+}
+
+func (d *Daemon) directAnnounceActive(rgID int, seq uint64) bool {
+	d.directAnnounceMu.Lock()
+	current := d.directAnnounceSeq[rgID]
+	d.directAnnounceMu.Unlock()
+	if current != seq {
+		return false
+	}
+	d.rgStatesMu.RLock()
+	s := d.rgStates[rgID]
+	d.rgStatesMu.RUnlock()
+	return s != nil && s.IsActive()
+}
+
+func (d *Daemon) cancelDirectAnnounce(rgID int) {
+	d.directAnnounceMu.Lock()
+	defer d.directAnnounceMu.Unlock()
+	if d.directAnnounceSeq == nil {
+		d.directAnnounceSeq = make(map[int]uint64)
+	}
+	d.directAnnounceSeq[rgID]++
+}
+
+func (d *Daemon) scheduleDirectAnnounce(rgID int, reason string) {
+	d.directAnnounceMu.Lock()
+	if d.directAnnounceSeq == nil {
+		d.directAnnounceSeq = make(map[int]uint64)
+	}
+	d.directAnnounceSeq[rgID]++
+	seq := d.directAnnounceSeq[rgID]
+	schedule := append([]time.Duration(nil), d.directAnnounceSchedule...)
+	sendFn := d.directSendGARPsFn
+	d.directAnnounceMu.Unlock()
+	if len(schedule) == 0 {
+		schedule = []time.Duration{0}
+	}
+	if sendFn == nil {
+		sendFn = d.directSendGARPs
+	}
+	slog.Info("direct-mode re-announce scheduled", "rg", rgID, "reason", reason, "bursts", len(schedule))
+	go func() {
+		start := time.Now()
+		for idx, at := range schedule {
+			if wait := time.Until(start.Add(at)); wait > 0 {
+				timer := time.NewTimer(wait)
+				<-timer.C
+			}
+			if !d.directAnnounceActive(rgID, seq) {
+				return
+			}
+			sendFn(rgID)
+			slog.Info("direct-mode re-announce sent", "rg", rgID, "reason", reason, "burst", idx+1, "total", len(schedule))
+		}
+	}()
 }
 
 // directSendGARPs sends gratuitous ARP/IPv6 NA bursts for all VIPs in the

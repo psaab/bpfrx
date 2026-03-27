@@ -50,6 +50,9 @@ POST_FAILOVER_OBSERVE="${POST_FAILOVER_OBSERVE:-10}"
 TRANSITION_SAMPLE_SECONDS="${TRANSITION_SAMPLE_SECONDS:-10}"
 MAX_TRANSITION_KERNEL_RX_DROPPED_DELTA="${MAX_TRANSITION_KERNEL_RX_DROPPED_DELTA:-512}"
 MAX_TRANSITION_DIRECT_TX_NOFRAME_DELTA="${MAX_TRANSITION_DIRECT_TX_NOFRAME_DELTA:-512}"
+TRANSITION_PATH_TRIGGER_PKTS="${TRANSITION_PATH_TRIGGER_PKTS:-1000}"
+MIN_TRANSITION_FABRIC_RX_DELTA="${MIN_TRANSITION_FABRIC_RX_DELTA:-32}"
+MIN_TRANSITION_WAN_TX_DELTA="${MIN_TRANSITION_WAN_TX_DELTA:-32}"
 RESTORE_SOURCE_NODE="${RESTORE_SOURCE_NODE:-1}"
 ALLOW_STALE_SESSIONS="${ALLOW_STALE_SESSIONS:-0}"
 IPERF_COMPLETION_GRACE_SEC="${IPERF_COMPLETION_GRACE_SEC:-2}"
@@ -92,6 +95,7 @@ REMOTE_IPERF_UNIT="userspace-ha-rg${RG}-iperf3.service"
 LOCAL_IPERF_LOG="${ARTIFACT_DIR}/iperf3.log"
 LOCAL_IPERF_METRICS="${ARTIFACT_DIR}/iperf3.metrics.json"
 FAILED=0
+IPERF_WAIT_TIMEOUT_HIT=0
 
 info() { printf '==> %s\n' "$*"; }
 pass() { printf 'PASS  %s\n' "$*"; }
@@ -292,6 +296,14 @@ transition_stats_path() {
 	printf '%s/cycle%s-%s-watch%02d-%s-dp-stats.txt\n' "${ARTIFACT_DIR}" "${cycle}" "${phase}" "${sample}" "$(vm_artifact_suffix "$vm")"
 }
 
+transition_interfaces_path() {
+	local cycle="$1"
+	local phase="$2"
+	local sample="$3"
+	local vm="$4"
+	printf '%s/cycle%s-%s-watch%02d-%s-dp-interfaces.txt\n' "${ARTIFACT_DIR}" "${cycle}" "${phase}" "${sample}" "$(vm_artifact_suffix "$vm")"
+}
+
 status_summary_value() {
 	local path="$1"
 	local label="$2"
@@ -463,6 +475,54 @@ print(total)
 PY
 }
 
+interface_packets_value() {
+	local path="$1"
+	local iface_regex="$2"
+	local direction="$3"
+	python3 - "$path" "$iface_regex" "$direction" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+iface_regex = re.compile(sys.argv[2])
+direction = sys.argv[3]
+idx = 10 if direction == "rx" else 11
+if not path.exists():
+    print("0")
+    raise SystemExit(0)
+
+in_bindings = False
+skip_header = False
+total = 0
+for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    stripped = raw_line.strip()
+    if stripped == "Userspace bindings:":
+        in_bindings = True
+        skip_header = True
+        continue
+    if in_bindings and not stripped:
+        break
+    if not in_bindings:
+        continue
+    if skip_header:
+        skip_header = False
+        continue
+    parts = stripped.split()
+    if len(parts) < 20:
+        continue
+    iface = parts[19]
+    if not iface_regex.fullmatch(iface):
+        continue
+    try:
+        total += int(parts[idx])
+    except ValueError:
+        pass
+
+print(total)
+PY
+}
+
 standby_userspace_ready_vm() {
 	local vm="$1"
 	local rg="$2"
@@ -579,7 +639,74 @@ capture_transition_window() {
 		fi
 		run_vm "$FW0" 'cli -c "show chassis cluster data-plane statistics"' >"$(transition_stats_path "$cycle" "$phase" "$sample" "$FW0")" 2>&1 || true
 		run_vm "$FW1" 'cli -c "show chassis cluster data-plane statistics"' >"$(transition_stats_path "$cycle" "$phase" "$sample" "$FW1")" 2>&1 || true
+		run_vm "$FW0" 'cli -c "show chassis cluster data-plane interfaces"' >"$(transition_interfaces_path "$cycle" "$phase" "$sample" "$FW0")" 2>&1 || true
+		run_vm "$FW1" 'cli -c "show chassis cluster data-plane interfaces"' >"$(transition_interfaces_path "$cycle" "$phase" "$sample" "$FW1")" 2>&1 || true
 	done
+}
+
+sample_window_interface_packets() {
+	local cycle="$1"
+	local phase="$2"
+	local seconds="$3"
+	local vm="$4"
+	local iface_regex="$5"
+	local direction="$6"
+	local agg="${7:-last}"
+	python3 - "$ARTIFACT_DIR" "$cycle" "$phase" "$seconds" "$(vm_artifact_suffix "$vm")" "$iface_regex" "$direction" "$agg" <<'PY'
+import pathlib
+import re
+import sys
+
+artifact_dir = pathlib.Path(sys.argv[1])
+cycle = sys.argv[2]
+phase = sys.argv[3]
+seconds = int(sys.argv[4])
+suffix = sys.argv[5]
+iface_regex = re.compile(sys.argv[6])
+direction = sys.argv[7]
+agg = sys.argv[8]
+idx = 10 if direction == "rx" else 11
+values = []
+
+for sample in range(1, seconds + 1):
+    path = artifact_dir / f"cycle{cycle}-{phase}-watch{sample:02d}-{suffix}-dp-interfaces.txt"
+    if not path.exists():
+        continue
+    total = 0
+    in_bindings = False
+    skip_header = False
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = raw_line.strip()
+        if stripped == "Userspace bindings:":
+            in_bindings = True
+            skip_header = True
+            continue
+        if in_bindings and not stripped:
+            break
+        if not in_bindings:
+            continue
+        if skip_header:
+            skip_header = False
+            continue
+        parts = stripped.split()
+        if len(parts) < 20:
+            continue
+        iface = parts[19]
+        if not iface_regex.fullmatch(iface):
+            continue
+        try:
+            total += int(parts[idx])
+        except ValueError:
+            pass
+    values.append(total)
+
+if not values:
+    print("0")
+elif agg == "max":
+    print(max(values))
+else:
+    print(values[-1])
+PY
 }
 
 sample_window_value() {
@@ -633,13 +760,18 @@ validate_transition_window() {
 	local to_name="$6"
 	local seconds="$7"
 	local from_pre to_pre
+	local from_if_pre to_if_pre
 	local to_kernel_rx_dropped_max from_no_frame_max
 	local to_kernel_rx_dropped_delta from_no_frame_delta
 	local from_pending_local_max to_pending_local_max
 	local from_outstanding_max to_outstanding_max
+	local from_lan_rx_max from_fabric_tx_max to_fabric_rx_max to_wan_tx_max
+	local from_lan_rx_delta from_fabric_tx_delta to_fabric_rx_delta to_wan_tx_delta
 
 	from_pre="$(cycle_stats_path "$cycle" "${phase}-pre" "$from_vm")"
 	to_pre="$(cycle_stats_path "$cycle" "${phase}-pre" "$to_vm")"
+	from_if_pre="$(cycle_interfaces_path "$cycle" "${phase}-pre" "$from_vm")"
+	to_if_pre="$(cycle_interfaces_path "$cycle" "${phase}-pre" "$to_vm")"
 
 	to_kernel_rx_dropped_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$to_vm" "Kernel RX dropped" max)"
 	from_no_frame_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$from_vm" "Direct TX no-frame fb" max)"
@@ -647,9 +779,17 @@ validate_transition_window() {
 	to_pending_local_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$to_vm" "Pending TX local" max)"
 	from_outstanding_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$from_vm" "Outstanding TX" max)"
 	to_outstanding_max="$(sample_window_value "$cycle" "$phase" "$seconds" "$to_vm" "Outstanding TX" max)"
+	from_lan_rx_max="$(sample_window_interface_packets "$cycle" "$phase" "$seconds" "$from_vm" 'ge-[0-9]+-0-1' rx max)"
+	from_fabric_tx_max="$(sample_window_interface_packets "$cycle" "$phase" "$seconds" "$from_vm" 'ge-[0-9]+-0-0' tx max)"
+	to_fabric_rx_max="$(sample_window_interface_packets "$cycle" "$phase" "$seconds" "$to_vm" 'ge-[0-9]+-0-0' rx max)"
+	to_wan_tx_max="$(sample_window_interface_packets "$cycle" "$phase" "$seconds" "$to_vm" 'ge-[0-9]+-0-2' tx max)"
 
 	to_kernel_rx_dropped_delta=$(( to_kernel_rx_dropped_max - $(status_summary_value "$to_pre" "Kernel RX dropped") ))
 	from_no_frame_delta=$(( from_no_frame_max - $(status_summary_value "$from_pre" "Direct TX no-frame fb") ))
+	from_lan_rx_delta=$(( from_lan_rx_max - $(interface_packets_value "$from_if_pre" 'ge-[0-9]+-0-1' rx) ))
+	from_fabric_tx_delta=$(( from_fabric_tx_max - $(interface_packets_value "$from_if_pre" 'ge-[0-9]+-0-0' tx) ))
+	to_fabric_rx_delta=$(( to_fabric_rx_max - $(interface_packets_value "$to_if_pre" 'ge-[0-9]+-0-0' rx) ))
+	to_wan_tx_delta=$(( to_wan_tx_max - $(interface_packets_value "$to_if_pre" 'ge-[0-9]+-0-2' tx) ))
 
 	if (( to_kernel_rx_dropped_delta <= MAX_TRANSITION_KERNEL_RX_DROPPED_DELTA )); then
 		pass "cycle ${cycle} ${phase}: ${to_name} transition kernel RX dropped delta ${to_kernel_rx_dropped_delta}"
@@ -661,6 +801,21 @@ validate_transition_window() {
 		pass "cycle ${cycle} ${phase}: ${from_name} transition direct no-frame delta ${from_no_frame_delta}"
 	else
 		fail "cycle ${cycle} ${phase}: ${from_name} transition direct no-frame delta ${from_no_frame_delta} exceeds ${MAX_TRANSITION_DIRECT_TX_NOFRAME_DELTA}"
+	fi
+
+	pass "cycle ${cycle} ${phase}: path old-owner lan-rx=${from_lan_rx_delta} fabric-tx=${from_fabric_tx_delta}; new-owner fabric-rx=${to_fabric_rx_delta} wan-tx=${to_wan_tx_delta}"
+	if (( from_lan_rx_delta >= TRANSITION_PATH_TRIGGER_PKTS )); then
+		if (( from_fabric_tx_delta < MIN_FABRIC_TX_DELTA )); then
+			fail "cycle ${cycle} ${phase}: stale-owner LAN RX delta ${from_lan_rx_delta} but old-owner fabric TX delta ${from_fabric_tx_delta} < ${MIN_FABRIC_TX_DELTA}"
+		fi
+		if (( to_fabric_rx_delta < MIN_TRANSITION_FABRIC_RX_DELTA )); then
+			fail "cycle ${cycle} ${phase}: stale-owner LAN RX delta ${from_lan_rx_delta} but new-owner fabric RX delta ${to_fabric_rx_delta} < ${MIN_TRANSITION_FABRIC_RX_DELTA}"
+		fi
+		if (( to_wan_tx_delta < MIN_TRANSITION_WAN_TX_DELTA )); then
+			fail "cycle ${cycle} ${phase}: stale-owner LAN RX delta ${from_lan_rx_delta} but new-owner WAN TX delta ${to_wan_tx_delta} < ${MIN_TRANSITION_WAN_TX_DELTA}"
+		fi
+	else
+		pass "cycle ${cycle} ${phase}: old-owner LAN RX delta ${from_lan_rx_delta} below stale-owner trigger ${TRANSITION_PATH_TRIGGER_PKTS}"
 	fi
 
 	pass "cycle ${cycle} ${phase}: ${from_name} max pending-local=${from_pending_local_max} outstanding-tx=${from_outstanding_max}; ${to_name} max pending-local=${to_pending_local_max} outstanding-tx=${to_outstanding_max}"
@@ -904,6 +1059,10 @@ wait_for_iperf_finish() {
 		sleep 1
 		tries=$((tries - 1))
 	done
+	IPERF_WAIT_TIMEOUT_HIT=1
+	run_host "pkill -TERM -x iperf3 2>/dev/null || true"
+	sleep 1
+	run_host "pkill -KILL -x iperf3 2>/dev/null || true"
 	return 1
 }
 
@@ -1249,6 +1408,10 @@ fi
 
 wait_for_iperf_finish || true
 copy_artifacts
+
+if (( IPERF_WAIT_TIMEOUT_HIT == 1 )); then
+	fail "iperf3 did not exit within ${IPERF_DURATION}s + 20s grace; terminated remote client"
+fi
 
 zero_intervals="$(count_zero_intervals)"
 if [[ "$zero_intervals" -le "$MAX_ZERO_INTERVALS" ]]; then
