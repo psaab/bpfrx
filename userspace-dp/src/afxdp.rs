@@ -147,8 +147,8 @@ const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
 const MAX_RECENT_EXCEPTIONS: usize = 32;
 const MAX_RECENT_SESSION_DELTAS: usize = 64;
 const MAX_PENDING_SESSION_DELTAS: usize = 4096;
-const BIND_RETRY_ATTEMPTS: usize = 10;
-const BIND_RETRY_DELAY: Duration = Duration::from_millis(50);
+const BIND_RETRY_ATTEMPTS: usize = 20;
+const BIND_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_SLOW_PATH_TUN: &str = "bpfrx-usp0";
 const LOCAL_TUNNEL_DELIVERY_QUEUE_DEPTH: usize = 4096;
 

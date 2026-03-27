@@ -61,6 +61,7 @@ type Manager struct {
 	lastNAPIBootstrap  time.Time
 	publishedSnapshot  uint64
 	publishedPlanKey   string
+	deferWorkers       bool // skip worker spawn until NotifyLinkCycle
 }
 
 func New() *Manager {
@@ -104,6 +105,16 @@ func (m *Manager) Teardown() error {
 	defer m.mu.Unlock()
 	m.stopLocked()
 	return m.inner.Teardown()
+}
+
+// SetDeferWorkers tells the manager to skip worker startup during the next
+// Compile(). Workers will be started on the first NotifyLinkCycle() instead.
+// Use this when RETH MAC programming will follow Compile() — avoids the
+// double-bind that causes EBUSY on mlx5 zero-copy queues.
+func (m *Manager) SetDeferWorkers(v bool) {
+	m.mu.Lock()
+	m.deferWorkers = v
+	m.mu.Unlock()
 }
 
 func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) {
@@ -208,6 +219,9 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	}
 	if err := m.ensureProcessLocked(ucfg); err != nil {
 		return result, err
+	}
+	if m.deferWorkers {
+		snap.DeferWorkers = true
 	}
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: snap}, &status); err != nil {
@@ -2806,7 +2820,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		}
 		xskReceiveLive := currentRX > m.lastXSKRX
 		m.lastXSKRX = currentRX
-		slog.Warn("userspace: ctrl gate check",
+		slog.Debug("userspace: ctrl gate check",
 			"probeBindingsReady", probeBindingsReady,
 			"allBindingsBound", allBindingsBound,
 			"neighborSyncReady", neighborSyncReady,
@@ -4607,8 +4621,11 @@ func (m *Manager) StartFIBSync(ctx context.Context) {
 // simultaneously (rx_xsk_congst_umr), causing UMEM pages to not be mapped
 // and packets to be silently dropped despite successful XDP_REDIRECT.
 func (m *Manager) NotifyLinkCycle() {
-	// Let the NIC reinitialize after link UP before recreating XSK sockets.
-	time.Sleep(200 * time.Millisecond)
+	// Let the NIC fully tear down XSK zero-copy contexts before recreating
+	// sockets. mlx5 releases zero-copy queue resources asynchronously after
+	// socket close — binding a new socket to the same queue before teardown
+	// completes returns EBUSY. 1s gives the driver ample time.
+	time.Sleep(1 * time.Second)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()

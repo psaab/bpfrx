@@ -204,6 +204,8 @@ struct ConfigSnapshot {
     userspace: serde_json::Value,
     #[serde(default)]
     config: serde_json::Value,
+    #[serde(rename = "defer_workers", default)]
+    defer_workers: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1369,6 +1371,7 @@ fn handle_stream(
                         refresh_status(&mut guard);
                         persist_state = true;
                     } else {
+                        let defer_workers = snapshot.defer_workers;
                         guard.snapshot = Some(snapshot);
                         let replanned = replan_queues(
                             guard.snapshot.as_ref(),
@@ -1376,7 +1379,11 @@ fn handle_stream(
                             &existing_bindings,
                         );
                         guard.status.bindings = replanned;
-                        reconcile_status_bindings(&mut guard);
+                        if defer_workers {
+                            eprintln!("CTRL_REQ: apply_snapshot defer_workers=true — skipping worker spawn (RETH MAC pending)");
+                        } else {
+                            reconcile_status_bindings(&mut guard);
+                        }
                         refresh_status(&mut guard);
                         persist_state = true;
                     }

@@ -62,6 +62,7 @@ type ConfigSnapshot struct {
 	FlowExport      *FlowExportSnapshot          `json:"flow_export,omitempty"`
 	Config          *config.Config               `json:"config,omitempty"`
 	Userspace       config.UserspaceConfig       `json:"userspace"`
+	DeferWorkers    bool                         `json:"defer_workers,omitempty"`
 }
 
 type FlowSnapshot struct {
