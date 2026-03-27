@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/psaab/bpfrx/pkg/config"
 )
@@ -344,6 +345,67 @@ func TestManualFailover_PreHookErrorPreventsResign(t *testing.T) {
 	}
 	if states[0].ManualFailover {
 		t.Fatal("manual failover should remain cleared on pre-hook failure")
+	}
+}
+
+func TestManualFailover_RetryablePreHookRetriesThenSucceeds(t *testing.T) {
+	m := NewManager(0, 1)
+	m.preManualFailoverRetryTimeout = 100 * time.Millisecond
+	m.preManualFailoverRetryInterval = 5 * time.Millisecond
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	attempts := 0
+	m.SetPreManualFailoverHook(func(rgID int) error {
+		attempts++
+		if attempts < 3 {
+			return &RetryablePreFailoverError{Err: fmt.Errorf("not yet")}
+		}
+		return nil
+	})
+
+	if err := m.ManualFailover(0); err != nil {
+		t.Fatalf("ManualFailover() error = %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+	states := m.GroupStates()
+	if states[0].State != StateSecondary {
+		t.Fatalf("state = %s, want secondary after manual failover", states[0].State)
+	}
+	if !states[0].ManualFailover {
+		t.Fatal("manual failover should be set after successful retry")
+	}
+}
+
+func TestManualFailover_RetryablePreHookTimeoutKeepsPrimary(t *testing.T) {
+	m := NewManager(0, 1)
+	m.preManualFailoverRetryTimeout = 30 * time.Millisecond
+	m.preManualFailoverRetryInterval = 5 * time.Millisecond
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	attempts := 0
+	m.SetPreManualFailoverHook(func(rgID int) error {
+		attempts++
+		return &RetryablePreFailoverError{Err: fmt.Errorf("still busy")}
+	})
+
+	if err := m.ManualFailover(0); err == nil {
+		t.Fatal("expected retryable pre-hook timeout error")
+	}
+	if attempts < 2 {
+		t.Fatalf("expected multiple retry attempts, got %d", attempts)
+	}
+	states := m.GroupStates()
+	if states[0].State != StatePrimary {
+		t.Fatalf("state = %s, want primary after failed retry window", states[0].State)
+	}
+	if states[0].ManualFailover {
+		t.Fatal("manual failover should remain cleared after retry timeout")
 	}
 }
 

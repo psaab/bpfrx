@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/psaab/bpfrx/pkg/cluster"
@@ -81,6 +82,24 @@ func TestUserspaceSessionFromDeltaV4(t *testing.T) {
 	}
 	if val.LogFlags&dataplane.LogFlagUserspaceFabricIngress == 0 {
 		t.Fatalf("expected fabric ingress marker in log flags: %#x", val.LogFlags)
+	}
+}
+
+func TestWrapUserspaceManualFailoverPrepareErrorMarksRetryableSyncErrors(t *testing.T) {
+	err := wrapUserspaceManualFailoverPrepareError(
+		errors.New("session sync peer not quiescent before demotion: timed out"),
+	)
+	var retryable *cluster.RetryablePreFailoverError
+	if !errors.As(err, &retryable) {
+		t.Fatalf("expected retryable pre-failover error, got %T", err)
+	}
+}
+
+func TestWrapUserspaceManualFailoverPrepareErrorLeavesFatalErrors(t *testing.T) {
+	src := errors.New("prepare failed")
+	err := wrapUserspaceManualFailoverPrepareError(src)
+	if err != src {
+		t.Fatalf("expected original error to be preserved, got %v", err)
 	}
 }
 

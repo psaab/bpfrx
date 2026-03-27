@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -78,6 +79,21 @@ type ClusterEvent struct {
 	DualActiveWin bool // true when dual-active resolved with local node as winner (no state change)
 }
 
+// RetryablePreFailoverError marks a pre-manual-failover hook error as
+// transient. ManualFailover retries these for a bounded window instead of
+// failing the operator request immediately.
+type RetryablePreFailoverError struct {
+	Err error
+}
+
+func (e *RetryablePreFailoverError) Error() string { return e.Err.Error() }
+func (e *RetryablePreFailoverError) Unwrap() error { return e.Err }
+
+func IsRetryablePreFailoverError(err error) bool {
+	var target *RetryablePreFailoverError
+	return errors.As(err, &target)
+}
+
 // monitorKey uniquely identifies a monitor within a redundancy group.
 type monitorKey struct {
 	rgID  int
@@ -130,6 +146,9 @@ type Manager struct {
 	// The daemon uses this to pre-stage userspace continuity before
 	// weight/state changes let the peer take over.
 	preManualFailoverFn func(rgID int) error
+	// Retry policy for transient pre-failover prepare failures.
+	preManualFailoverRetryTimeout  time.Duration
+	preManualFailoverRetryInterval time.Duration
 
 	// peerFencing holds the configured fencing action (e.g. "disable-rg").
 	peerFencing string
@@ -156,21 +175,25 @@ type Manager struct {
 // DefaultTakeoverHoldTime is the default duration an RG must be ready
 // before election promotes it to primary.
 const DefaultTakeoverHoldTime = 3 * time.Second
+const DefaultPreManualFailoverRetryTimeout = 45 * time.Second
+const DefaultPreManualFailoverRetryInterval = 500 * time.Millisecond
 
 // NewManager creates a new cluster manager.
 func NewManager(nodeID, clusterID int) *Manager {
 	return &Manager{
-		nodeID:           nodeID,
-		clusterID:        clusterID,
-		groups:           make(map[int]*RedundancyGroupState),
-		monitorWeights:   make(map[monitorKey]int),
-		eventCh:          make(chan ClusterEvent, 64),
-		garpCounts:       make(map[int]int),
-		peerGroups:       make(map[int]PeerGroupState),
-		hbInterval:       DefaultHeartbeatInterval,
-		hbThreshold:      DefaultHeartbeatThreshold,
-		history:          NewEventHistory(64),
-		takeoverHoldTime: DefaultTakeoverHoldTime,
+		nodeID:                         nodeID,
+		clusterID:                      clusterID,
+		groups:                         make(map[int]*RedundancyGroupState),
+		monitorWeights:                 make(map[monitorKey]int),
+		eventCh:                        make(chan ClusterEvent, 64),
+		garpCounts:                     make(map[int]int),
+		peerGroups:                     make(map[int]PeerGroupState),
+		hbInterval:                     DefaultHeartbeatInterval,
+		hbThreshold:                    DefaultHeartbeatThreshold,
+		history:                        NewEventHistory(64),
+		takeoverHoldTime:               DefaultTakeoverHoldTime,
+		preManualFailoverRetryTimeout:  DefaultPreManualFailoverRetryTimeout,
+		preManualFailoverRetryInterval: DefaultPreManualFailoverRetryInterval,
 	}
 }
 
@@ -594,11 +617,37 @@ func (m *Manager) ManualFailover(rgID int) error {
 		return fmt.Errorf("redundancy group %d not found", rgID)
 	}
 	preHook := m.preManualFailoverFn
+	retryTimeout := m.preManualFailoverRetryTimeout
+	retryInterval := m.preManualFailoverRetryInterval
 	m.mu.Unlock()
 
 	if preHook != nil {
-		if err := preHook(rgID); err != nil {
-			return fmt.Errorf("pre-failover prepare for redundancy group %d: %w", rgID, err)
+		deadline := time.Now().Add(retryTimeout)
+		for attempts := 1; ; attempts++ {
+			if err := preHook(rgID); err != nil {
+				if !IsRetryablePreFailoverError(err) {
+					return fmt.Errorf("pre-failover prepare for redundancy group %d: %w", rgID, err)
+				}
+				remaining := time.Until(deadline)
+				if remaining <= 0 {
+					return fmt.Errorf("pre-failover prepare for redundancy group %d: %w", rgID, err)
+				}
+				sleep := retryInterval
+				if sleep <= 0 {
+					sleep = DefaultPreManualFailoverRetryInterval
+				}
+				if sleep > remaining {
+					sleep = remaining
+				}
+				slog.Info("cluster: waiting to admit manual failover",
+					"rg", rgID,
+					"attempt", attempts,
+					"remaining", remaining.String(),
+					"err", err)
+				time.Sleep(sleep)
+				continue
+			}
+			break
 		}
 	}
 

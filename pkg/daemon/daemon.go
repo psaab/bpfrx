@@ -3588,6 +3588,25 @@ func (d *Daemon) prepareUserspaceRGDemotion(rgID int) error {
 	return d.prepareUserspaceRGDemotionWithTimeout(rgID, 30*time.Second)
 }
 
+func wrapUserspaceManualFailoverPrepareError(err error) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "previous demotion barrier still pending") ||
+		strings.Contains(msg, "session sync peer not quiescent before demotion") ||
+		strings.Contains(msg, "demotion peer barrier failed") {
+		return &cluster.RetryablePreFailoverError{Err: err}
+	}
+	return err
+}
+
+func (d *Daemon) prepareUserspaceManualFailover(rgID int) error {
+	return wrapUserspaceManualFailoverPrepareError(
+		d.prepareUserspaceRGDemotionWithTimeout(rgID, 5*time.Second),
+	)
+}
+
 func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout time.Duration) error {
 	if !d.acquireUserspaceRGDemotionPrep(rgID, barrierTimeout) {
 		slog.Info("userspace: skipping duplicate rg demotion prepare", "rg", rgID)
@@ -5201,7 +5220,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// Wire peer failover sender so cluster Manager can send remote
 			// failover requests via the fabric sync connection.
 			d.cluster.SetPeerFailoverFunc(d.sessionSync.SendFailover)
-			d.cluster.SetPreManualFailoverHook(d.prepareUserspaceRGDemotion)
+			d.cluster.SetPreManualFailoverHook(d.prepareUserspaceManualFailover)
 
 			// Wire peer fencing: on heartbeat timeout, cluster sends
 			// fence via sync; on receive, disable all local RGs.
