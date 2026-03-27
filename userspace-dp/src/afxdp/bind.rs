@@ -1,6 +1,6 @@
 use super::*;
-use std::path::Path;
 use crate::xsk_ffi::{self, DeviceQueue, IfInfo, RingRx, RingTx, SocketConfig};
+use std::path::Path;
 
 const AUTO_BIND_FLAGS: [u16; 1] = [0];
 const EXPLICIT_MODE_BIND_FLAGS: [u16; 2] = [XSK_BIND_FLAGS_ZEROCOPY, XSK_BIND_FLAGS_COPY];
@@ -83,7 +83,14 @@ pub(super) fn open_binding_worker_rings(
     let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
     for (strategy_idx, strategy) in strategies.iter().copied().enumerate() {
         for (flags_idx, flags) in bind_flag_candidates.iter().copied().enumerate() {
-            match try_open_bind(worker_umem, info, ring_entries, flags, poll_mode, pre_bind_fill_offsets) {
+            match try_open_bind(
+                worker_umem,
+                info,
+                ring_entries,
+                flags,
+                poll_mode,
+                pre_bind_fill_offsets,
+            ) {
                 Ok((user, rx, tx, bind_mode, device)) => {
                     return Ok((user, rx, tx, bind_mode, strategy, device));
                 }
@@ -143,7 +150,12 @@ pub(super) fn prime_fill_ring_offsets(
         fill.commit();
         inserted
     };
-    eprintln!("prime_fill_ring: inserted={}/{} fill_pending={}", inserted, offsets.len(), device.pending());
+    eprintln!(
+        "prime_fill_ring: inserted={}/{} fill_pending={}",
+        inserted,
+        offsets.len(),
+        device.pending()
+    );
     if inserted == 0 {
         return Err(format!("prefill fill ring inserted 0/{}", offsets.len()).into());
     }
@@ -171,8 +183,14 @@ pub(super) fn prime_fill_ring_offsets(
         };
         unsafe { libc::poll(&mut pfd, 1, 1) };
         unsafe {
-            libc::sendto(fd, core::ptr::null_mut(), 0, libc::MSG_DONTWAIT,
-                core::ptr::null_mut(), 0);
+            libc::sendto(
+                fd,
+                core::ptr::null_mut(),
+                0,
+                libc::MSG_DONTWAIT,
+                core::ptr::null_mut(),
+                0,
+            );
         }
         std::thread::yield_now();
     }
@@ -258,13 +276,7 @@ fn try_open_bind(
     poll_mode: crate::PollMode,
     pre_bind_fill_offsets: Option<&[u64]>,
 ) -> Result<
-    (
-        User,
-        RingRx,
-        RingTx,
-        XskBindMode,
-        DeviceQueue,
-    ),
+    (User, RingRx, RingTx, XskBindMode, DeviceQueue),
     Box<dyn std::error::Error + Send + Sync>,
 > {
     for attempt in 0..BIND_RETRY_ATTEMPTS {
@@ -279,8 +291,7 @@ fn try_open_bind(
                     prime_fill_ring_offsets(&mut device, offsets)?;
                 }
 
-                let bind_mode = query_bound_xsk_mode(user_fd)
-                    .unwrap_or(XskBindMode::Copy);
+                let bind_mode = query_bound_xsk_mode(user_fd).unwrap_or(XskBindMode::Copy);
                 set_busy_poll_opts(user_fd, poll_mode);
                 eprintln!(
                     "bpfrx-userspace-dp: libxdp bind(fd={}) OK on attempt {} mode={:?} flags=0x{:04x}",
@@ -298,14 +309,16 @@ fn try_open_bind(
                 return Err(format!(
                     "libxdp xsk_socket__create_shared(flags=0x{:04x}): {msg}",
                     bind_flags,
-                ).into());
+                )
+                .into());
             }
         }
     }
     Err(format!(
         "libxdp bind: exhausted {} retries with flags=0x{:04x}",
         BIND_RETRY_ATTEMPTS, bind_flags,
-    ).into())
+    )
+    .into())
 }
 
 fn query_bound_xsk_mode(fd: c_int) -> Option<XskBindMode> {
@@ -338,7 +351,11 @@ fn set_busy_poll_opts(fd: c_int, poll_mode: crate::PollMode) {
     // per poll() call, which posts fill ring WQEs. The 50us value caused
     // 15% CPU overhead from spin-waiting. 1us triggers NAPI and returns
     // immediately, bootstrapping the fill ring with negligible overhead.
-    let busy_poll_us: c_int = if poll_mode == crate::PollMode::Interrupt { 1 } else { 50 };
+    let busy_poll_us: c_int = if poll_mode == crate::PollMode::Interrupt {
+        1
+    } else {
+        50
+    };
     let prefer: c_int = 1;
     let budget: c_int = RX_BATCH_SIZE as c_int;
 

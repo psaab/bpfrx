@@ -114,8 +114,7 @@ pub(super) fn try_embedded_icmp_session_match_from_frame(
             }
             let emb_protocol = frame[embedded_ip_start + 6];
             let emb_src = IpAddr::V6(Ipv6Addr::from(
-                <[u8; 16]>::try_from(&frame[embedded_ip_start + 8..embedded_ip_start + 24])
-                    .ok()?,
+                <[u8; 16]>::try_from(&frame[embedded_ip_start + 8..embedded_ip_start + 24]).ok()?,
             ));
             let emb_dst = IpAddr::V6(Ipv6Addr::from(
                 <[u8; 16]>::try_from(&frame[embedded_ip_start + 24..embedded_ip_start + 40])
@@ -260,11 +259,9 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                 emb_src_port,
                 emb_dst_port,
             );
-            if let Some(fwd) = lookup_forward_nat_across_scopes(
-                sessions,
-                shared_nat_sessions,
-                &reverse_key,
-            ) {
+            if let Some(fwd) =
+                lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &reverse_key)
+            {
                 let nat = fwd.decision.nat;
                 let original_src = fwd.key.src_ip;
                 let original_src_port = fwd.key.src_port;
@@ -306,9 +303,9 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                     0,
                 )
             })
-                .map(|resolved| {
-                    let sl = resolved.lookup;
-                    let resolution = if sl.metadata.is_reverse {
+            .map(|resolved| {
+                let sl = resolved.lookup;
+                let resolution = if sl.metadata.is_reverse {
                     sl.decision.resolution
                 } else {
                     embedded_icmp_return_resolution(
@@ -339,8 +336,7 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
             }
             let emb_protocol = frame[embedded_ip_start + 6];
             let emb_src_wire = Ipv6Addr::from(
-                <[u8; 16]>::try_from(&frame[embedded_ip_start + 8..embedded_ip_start + 24])
-                    .ok()?,
+                <[u8; 16]>::try_from(&frame[embedded_ip_start + 8..embedded_ip_start + 24]).ok()?,
             );
             let emb_dst = IpAddr::V6(Ipv6Addr::from(
                 <[u8; 16]>::try_from(&frame[embedded_ip_start + 24..embedded_ip_start + 40])
@@ -378,11 +374,9 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                 emb_src_port,
                 emb_dst_port,
             );
-            if let Some(fwd) = lookup_forward_nat_across_scopes(
-                sessions,
-                shared_nat_sessions,
-                &reverse_key,
-            ) {
+            if let Some(fwd) =
+                lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &reverse_key)
+            {
                 let nat = fwd.decision.nat;
                 let original_src = fwd.key.src_ip;
                 let original_src_port = fwd.key.src_port;
@@ -415,26 +409,26 @@ pub(super) fn try_embedded_icmp_nat_match_from_frame(
                 0,
             )
             .or_else(|| {
-                    let shared_reverse_key = embedded_reply_key(
-                        libc::AF_INET6 as u8,
-                        emb_protocol,
-                        emb_src_lookup,
-                        emb_dst,
-                        emb_src_port,
-                        emb_dst_port,
-                    );
-                    lookup_session_across_scopes(
-                        sessions,
-                        shared_sessions,
-                        shared_forward_wire_sessions,
-                        &shared_reverse_key,
-                        now_ns,
-                        0,
-                    )
-                })
-                .map(|resolved| {
-                    let sl = resolved.lookup;
-                    let resolution = if sl.metadata.is_reverse {
+                let shared_reverse_key = embedded_reply_key(
+                    libc::AF_INET6 as u8,
+                    emb_protocol,
+                    emb_src_lookup,
+                    emb_dst,
+                    emb_src_port,
+                    emb_dst_port,
+                );
+                lookup_session_across_scopes(
+                    sessions,
+                    shared_sessions,
+                    shared_forward_wire_sessions,
+                    &shared_reverse_key,
+                    now_ns,
+                    0,
+                )
+            })
+            .map(|resolved| {
+                let sl = resolved.lookup;
+                let resolution = if sl.metadata.is_reverse {
                     sl.decision.resolution
                 } else {
                     embedded_icmp_return_resolution(
@@ -498,10 +492,12 @@ fn lookup_embedded_session(
         .lookup(embedded_key, now_ns, 0)
         .or_else(|| sessions.lookup(reverse_key, now_ns, 0))
         .or_else(|| {
-            sessions.find_forward_nat_match(reverse_key).map(|m| SessionLookup {
-                decision: m.decision,
-                metadata: m.metadata,
-            })
+            sessions
+                .find_forward_nat_match(reverse_key)
+                .map(|m| SessionLookup {
+                    decision: m.decision,
+                    metadata: m.metadata,
+                })
         })
 }
 
@@ -513,8 +509,7 @@ fn embedded_reply_key(
     src_port: u16,
     dst_port: u16,
 ) -> SessionKey {
-    let (reply_src_port, reply_dst_port) =
-        embedded_reply_ports(protocol, src_port, dst_port);
+    let (reply_src_port, reply_dst_port) = embedded_reply_ports(protocol, src_port, dst_port);
     SessionKey {
         addr_family,
         protocol,
@@ -572,7 +567,13 @@ pub(super) fn build_nat_reversed_icmp_error_v4(
 
     let out_eth_len = if vlan_id > 0 { 18 } else { 14 };
     let mut out = vec![0u8; out_eth_len + payload.len()];
-    write_eth_header_slice(out.get_mut(..out_eth_len)?, dst_mac, src_mac, vlan_id, 0x0800)?;
+    write_eth_header_slice(
+        out.get_mut(..out_eth_len)?,
+        dst_mac,
+        src_mac,
+        vlan_id,
+        0x0800,
+    )?;
     out.get_mut(out_eth_len..)?.copy_from_slice(payload);
 
     let pkt = &mut out[out_eth_len..];
@@ -675,7 +676,13 @@ pub(super) fn build_nat_reversed_icmp_error_v6(
 
     let out_eth_len = if vlan_id > 0 { 18 } else { 14 };
     let mut out = vec![0u8; out_eth_len + payload.len()];
-    write_eth_header_slice(out.get_mut(..out_eth_len)?, dst_mac, src_mac, vlan_id, 0x86dd)?;
+    write_eth_header_slice(
+        out.get_mut(..out_eth_len)?,
+        dst_mac,
+        src_mac,
+        vlan_id,
+        0x86dd,
+    )?;
     out.get_mut(out_eth_len..)?.copy_from_slice(payload);
 
     let pkt = &mut out[out_eth_len..];
@@ -743,9 +750,10 @@ pub(super) fn finalize_embedded_icmp_resolution(
                 | ForwardingDisposition::DiscardRoute
         )
     {
-        if let Some(redirect) =
-            resolve_zone_encoded_fabric_redirect(forwarding, icmp_match.metadata.ingress_zone.as_ref())
-        {
+        if let Some(redirect) = resolve_zone_encoded_fabric_redirect(
+            forwarding,
+            icmp_match.metadata.ingress_zone.as_ref(),
+        ) {
             return redirect;
         }
     }

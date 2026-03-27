@@ -88,28 +88,14 @@ unsafe extern "C" {
     fn bridge_xsk_socket_delete(xsk: *mut XskSocketOpaque);
     fn bridge_xsk_socket_fd(xsk: *const XskSocketOpaque) -> c_int;
 
-    fn bridge_xsk_ring_prod_reserve(
-        ring: *mut XskRingProd,
-        nb: u32,
-        idx_out: *mut u32,
-    ) -> u32;
+    fn bridge_xsk_ring_prod_reserve(ring: *mut XskRingProd, nb: u32, idx_out: *mut u32) -> u32;
     fn bridge_xsk_ring_prod_submit(ring: *mut XskRingProd, nb: u32);
     fn bridge_xsk_ring_prod_cancel(ring: *mut XskRingProd, nb: u32);
     fn bridge_xsk_ring_prod_needs_wakeup(ring: *const XskRingProd) -> c_int;
     fn bridge_xsk_fill_addr_set(fill: *mut XskRingProd, idx: u32, addr: u64);
-    fn bridge_xsk_tx_desc_set(
-        tx: *mut XskRingProd,
-        idx: u32,
-        addr: u64,
-        len: u32,
-        options: u32,
-    );
+    fn bridge_xsk_tx_desc_set(tx: *mut XskRingProd, idx: u32, addr: u64, len: u32, options: u32);
 
-    fn bridge_xsk_ring_cons_peek(
-        ring: *mut XskRingCons,
-        nb: u32,
-        idx_out: *mut u32,
-    ) -> u32;
+    fn bridge_xsk_ring_cons_peek(ring: *mut XskRingCons, nb: u32, idx_out: *mut u32) -> u32;
     fn bridge_xsk_ring_cons_release(ring: *mut XskRingCons, nb: u32);
     #[allow(dead_code)]
     fn bridge_xsk_ring_cons_cancel(ring: *mut XskRingCons, nb: u32);
@@ -361,8 +347,7 @@ impl Umem {
         if area_len.checked_sub(u64::from(pitch)) < Some(offset) {
             return None;
         }
-        let base =
-            unsafe { self.umem_area.cast::<u8>().as_ptr().offset(offset as isize) };
+        let base = unsafe { self.umem_area.cast::<u8>().as_ptr().offset(offset as isize) };
         let slice = core::ptr::slice_from_raw_parts_mut(base, pitch as usize);
         let addr = unsafe { NonNull::new_unchecked(slice) };
         Some(UmemChunk { addr, offset })
@@ -498,8 +483,7 @@ impl DeviceQueue {
     /// Reap completed TX buffers from the completion ring.
     pub fn complete(&mut self, n: u32) -> ReadComplete<'_> {
         let mut idx: u32 = 0;
-        let peeked =
-            unsafe { bridge_xsk_ring_cons_peek(&mut *self.comp, n, &mut idx) };
+        let peeked = unsafe { bridge_xsk_ring_cons_peek(&mut *self.comp, n, &mut idx) };
         ReadComplete {
             ring: &mut *self.comp,
             base_idx: idx,
@@ -601,8 +585,7 @@ impl RingRx {
     /// Peek and begin receiving up to `n` descriptors.
     pub fn receive(&mut self, n: u32) -> ReadRx<'_> {
         let mut idx: u32 = 0;
-        let peeked =
-            unsafe { bridge_xsk_ring_cons_peek(&mut *self.ring, n, &mut idx) };
+        let peeked = unsafe { bridge_xsk_ring_cons_peek(&mut *self.ring, n, &mut idx) };
         ReadRx {
             ring: &*self.ring,
             base_idx: idx,
@@ -769,9 +752,7 @@ impl WriteTx<'_> {
             }
             let idx = self.base_idx.wrapping_add(n);
             unsafe {
-                bridge_xsk_tx_desc_set(
-                    self.ring, idx, desc.addr, desc.len, desc.options,
-                );
+                bridge_xsk_tx_desc_set(self.ring, idx, desc.addr, desc.len, desc.options);
             }
             n += 1;
         }
@@ -976,15 +957,9 @@ pub fn create_xsk_binding(
 
     let user = User { fd };
 
-    let rx = RingRx {
-        ring: rx_ring,
-        fd,
-    };
+    let rx = RingRx { ring: rx_ring, fd };
 
-    let tx = RingTx {
-        ring: tx_ring,
-        fd,
-    };
+    let tx = RingTx { ring: tx_ring, fd };
 
     // Non-shared create uses the UMEM's fill/comp rings (not per-socket).
     // Take ownership from the umem to use in DeviceQueue.

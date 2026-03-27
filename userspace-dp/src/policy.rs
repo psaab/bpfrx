@@ -51,7 +51,10 @@ impl Default for PolicyRule {
             destination_v4: Vec::new(),
             destination_v6: Vec::new(),
             applications: Vec::new(),
-            compiled_apps: CompiledApplications { match_any: true, by_protocol: FxHashMap::default() },
+            compiled_apps: CompiledApplications {
+                match_any: true,
+                by_protocol: FxHashMap::default(),
+            },
             action: PolicyAction::Deny,
             hit_count: AtomicU64::new(0),
         }
@@ -125,10 +128,9 @@ impl CompiledApplications {
             {
                 entry.exact_dst_ports.insert(app.destination_ports[0].low);
             } else {
-                entry.range_terms.push((
-                    app.source_ports.clone(),
-                    app.destination_ports.clone(),
-                ));
+                entry
+                    .range_terms
+                    .push((app.source_ports.clone(), app.destination_ports.clone()));
             }
         }
         Self {
@@ -151,8 +153,7 @@ impl CompiledApplications {
         }
         // Slow path: check range terms.
         terms.range_terms.iter().any(|(src_ranges, dst_ranges)| {
-            port_ranges_match(src_ranges, src_port)
-                && port_ranges_match(dst_ranges, dst_port)
+            port_ranges_match(src_ranges, src_port) && port_ranges_match(dst_ranges, dst_port)
         })
     }
 }
@@ -249,14 +250,28 @@ pub(crate) fn evaluate_policy(
     };
     if let Some(indices) = state.zone_pair_index.get(&key) {
         for &idx in indices {
-            if let Some(action) = try_match_rule(&state.rules[idx], src_ip, dst_ip, protocol, src_port, dst_port) {
+            if let Some(action) = try_match_rule(
+                &state.rules[idx],
+                src_ip,
+                dst_ip,
+                protocol,
+                src_port,
+                dst_port,
+            ) {
                 return action;
             }
         }
     }
     // Global policies (junos-global) apply to any zone-pair.
     for &idx in &state.global_indices {
-        if let Some(action) = try_match_rule(&state.rules[idx], src_ip, dst_ip, protocol, src_port, dst_port) {
+        if let Some(action) = try_match_rule(
+            &state.rules[idx],
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+        ) {
             return action;
         }
     }
@@ -279,15 +294,13 @@ fn try_match_rule(
     }
     match (src_ip, dst_ip) {
         (IpAddr::V4(src), IpAddr::V4(dst))
-            if nets_match_v4(&rule.source_v4, src)
-                && nets_match_v4(&rule.destination_v4, dst) =>
+            if nets_match_v4(&rule.source_v4, src) && nets_match_v4(&rule.destination_v4, dst) =>
         {
             rule.hit_count.fetch_add(1, Ordering::Relaxed);
             Some(rule.action)
         }
         (IpAddr::V6(src), IpAddr::V6(dst))
-            if nets_match_v6(&rule.source_v6, src)
-                && nets_match_v6(&rule.destination_v6, dst) =>
+            if nets_match_v6(&rule.source_v6, src) && nets_match_v6(&rule.destination_v6, dst) =>
         {
             rule.hit_count.fetch_add(1, Ordering::Relaxed);
             Some(rule.action)

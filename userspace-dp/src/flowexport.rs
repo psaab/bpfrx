@@ -103,13 +103,11 @@ pub(crate) struct FlowExporter {
 
 impl FlowExporter {
     pub fn new(config: FlowExportConfig) -> Self {
-        let socket = UdpSocket::bind("0.0.0.0:0")
-            .ok()
-            .and_then(|s| {
-                s.set_nonblocking(true).ok()?;
-                s.connect(config.collector).ok()?;
-                Some(s)
-            });
+        let socket = UdpSocket::bind("0.0.0.0:0").ok().and_then(|s| {
+            s.set_nonblocking(true).ok()?;
+            s.connect(config.collector).ok()?;
+            Some(s)
+        });
         let template_interval_ns = config.active_timeout_secs.max(60) * 1_000_000_000;
         Self {
             config,
@@ -366,10 +364,10 @@ mod tests {
         // Sampling rate = 3: sample every 3rd session
         assert!(!exporter.should_sample()); // 1st
         assert!(!exporter.should_sample()); // 2nd
-        assert!(exporter.should_sample());  // 3rd
+        assert!(exporter.should_sample()); // 3rd
         assert!(!exporter.should_sample()); // 4th
         assert!(!exporter.should_sample()); // 5th
-        assert!(exporter.should_sample());  // 6th
+        assert!(exporter.should_sample()); // 6th
     }
 
     #[test]

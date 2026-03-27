@@ -295,10 +295,7 @@ fn translate_icmpv4_to_icmpv6(icmp: &mut [u8]) -> Option<()> {
 }
 
 /// Recompute L4 checksum after IPv6→IPv4 translation.
-fn recompute_l4_checksum_after_nat64_v6_to_v4(
-    packet: &mut [u8],
-    protocol: u8,
-) -> Option<()> {
+fn recompute_l4_checksum_after_nat64_v6_to_v4(packet: &mut [u8], protocol: u8) -> Option<()> {
     if packet.len() < 20 {
         return None;
     }
@@ -338,10 +335,7 @@ fn recompute_l4_checksum_after_nat64_v6_to_v4(
 }
 
 /// Recompute L4 checksum after IPv4→IPv6 translation.
-fn recompute_l4_checksum_after_nat64_v4_to_v6(
-    packet: &mut [u8],
-    next_header: u8,
-) -> Option<()> {
+fn recompute_l4_checksum_after_nat64_v4_to_v6(packet: &mut [u8], next_header: u8) -> Option<()> {
     let src = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(8..24)?).ok()?);
     let dst = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(24..40)?).ok()?);
     let l4 = &mut packet[40..];
@@ -398,12 +392,7 @@ fn checksum16(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-fn checksum16_ipv4_pseudo(
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
-    protocol: u8,
-    payload: &[u8],
-) -> u16 {
+fn checksum16_ipv4_pseudo(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, payload: &[u8]) -> u16 {
     let mut pseudo = Vec::with_capacity(12 + payload.len());
     pseudo.extend_from_slice(&src.octets());
     pseudo.extend_from_slice(&dst.octets());
@@ -414,12 +403,7 @@ fn checksum16_ipv4_pseudo(
     checksum16(&pseudo)
 }
 
-fn checksum16_ipv6_pseudo(
-    src: Ipv6Addr,
-    dst: Ipv6Addr,
-    next_header: u8,
-    payload: &[u8],
-) -> u16 {
+fn checksum16_ipv6_pseudo(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, payload: &[u8]) -> u16 {
     let mut pseudo = Vec::with_capacity(40 + payload.len());
     pseudo.extend_from_slice(&src.octets());
     pseudo.extend_from_slice(&dst.octets());
@@ -537,10 +521,7 @@ mod tests {
         NAT64RuleSnapshot {
             name: "nat64-wkp".to_string(),
             prefix: "64:ff9b::/96".to_string(),
-            pool_addresses: vec![
-                "198.51.100.1".to_string(),
-                "198.51.100.2".to_string(),
-            ],
+            pool_addresses: vec!["198.51.100.1".to_string(), "198.51.100.2".to_string()],
         }
     }
 
@@ -693,10 +674,7 @@ mod tests {
         assert_eq!(ipv4_pkt.len(), 45);
 
         // Verify TCP ports preserved.
-        assert_eq!(
-            u16::from_be_bytes([ipv4_pkt[20], ipv4_pkt[21]]),
-            12345
-        );
+        assert_eq!(u16::from_be_bytes([ipv4_pkt[20], ipv4_pkt[21]]), 12345);
         assert_eq!(u16::from_be_bytes([ipv4_pkt[22], ipv4_pkt[23]]), 80);
 
         // Verify IPv4 header checksum.
@@ -731,10 +709,7 @@ mod tests {
 
         // Verify TCP ports preserved.
         assert_eq!(u16::from_be_bytes([ipv6_pkt[40], ipv6_pkt[41]]), 80);
-        assert_eq!(
-            u16::from_be_bytes([ipv6_pkt[42], ipv6_pkt[43]]),
-            12345
-        );
+        assert_eq!(u16::from_be_bytes([ipv6_pkt[42], ipv6_pkt[43]]), 12345);
 
         // Verify TCP checksum.
         let src6 = Ipv6Addr::from(<[u8; 16]>::try_from(&ipv6_pkt[8..24]).unwrap());
@@ -867,19 +842,14 @@ mod tests {
 
     #[test]
     fn forward_decision_sets_nat64_flag() {
-        let d = Nat64State::forward_decision(
-            Ipv4Addr::new(198, 51, 100, 1),
-            Ipv4Addr::new(8, 8, 8, 8),
-        );
+        let d =
+            Nat64State::forward_decision(Ipv4Addr::new(198, 51, 100, 1), Ipv4Addr::new(8, 8, 8, 8));
         assert!(d.nat64);
         assert_eq!(
             d.rewrite_src,
             Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)))
         );
-        assert_eq!(
-            d.rewrite_dst,
-            Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)))
-        );
+        assert_eq!(d.rewrite_dst, Some(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
 
     #[test]
@@ -908,10 +878,7 @@ mod tests {
         // Should be 14 (eth) + 44 (20 ipv4 + 20 tcp + 4 payload)
         assert_eq!(result.len(), 14 + 44);
         // Check Ethernet type is IPv4.
-        assert_eq!(
-            u16::from_be_bytes([result[12], result[13]]),
-            0x0800
-        );
+        assert_eq!(u16::from_be_bytes([result[12], result[13]]), 0x0800);
     }
 
     #[test]
@@ -929,23 +896,13 @@ mod tests {
         let src_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
         let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
 
-        let result = build_nat64_v4_to_v6_frame(
-            &frame,
-            src_v6,
-            dst_v6,
-            [0x11; 6],
-            [0x22; 6],
-            0,
-        )
-        .expect("build");
+        let result = build_nat64_v4_to_v6_frame(&frame, src_v6, dst_v6, [0x11; 6], [0x22; 6], 0)
+            .expect("build");
 
         // Should be 14 (eth) + 64 (40 ipv6 + 20 tcp + 4 payload)
         assert_eq!(result.len(), 14 + 64);
         // Check Ethernet type is IPv6.
-        assert_eq!(
-            u16::from_be_bytes([result[12], result[13]]),
-            0x86dd
-        );
+        assert_eq!(u16::from_be_bytes([result[12], result[13]]), 0x86dd);
     }
 
     #[test]
@@ -956,12 +913,10 @@ mod tests {
         pkt[7] = 1; // hop limit = 1
         // Need to recompute TCP checksum after modifying hop limit
         // (hop limit isn't in pseudo-header so checksum is still valid).
-        assert!(translate_v6_to_v4(
-            &pkt,
-            Ipv4Addr::new(1, 2, 3, 4),
-            Ipv4Addr::new(5, 6, 7, 8),
-        )
-        .is_none());
+        assert!(
+            translate_v6_to_v4(&pkt, Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8),)
+                .is_none()
+        );
     }
 
     #[test]
@@ -989,13 +944,7 @@ mod tests {
         // 18 (eth+vlan) + 44 (20 ipv4 + 20 tcp + 4 payload)
         assert_eq!(result.len(), 18 + 44);
         // VLAN tag
-        assert_eq!(
-            u16::from_be_bytes([result[12], result[13]]),
-            0x8100
-        );
-        assert_eq!(
-            u16::from_be_bytes([result[16], result[17]]),
-            0x0800
-        );
+        assert_eq!(u16::from_be_bytes([result[12], result[13]]), 0x8100);
+        assert_eq!(u16::from_be_bytes([result[16], result[17]]), 0x0800);
     }
 }

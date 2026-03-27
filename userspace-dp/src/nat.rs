@@ -1,5 +1,5 @@
-use crate::{DestinationNATRuleSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot};
 use crate::prefix::{PrefixV4, PrefixV6};
+use crate::{DestinationNATRuleSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot};
 use ipnet::IpNet;
 use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -95,9 +95,7 @@ impl Default for PortAllocator {
 
 impl PortAllocator {
     pub(crate) fn new(num_addresses: usize, port_low: u16, port_high: u16) -> Self {
-        let counters = (0..num_addresses)
-            .map(|_| AtomicU32::new(0))
-            .collect();
+        let counters = (0..num_addresses).map(|_| AtomicU32::new(0)).collect();
         Self {
             counters,
             addr_counter: AtomicU32::new(0),
@@ -199,8 +197,16 @@ pub(crate) fn parse_source_nat_rules(snaps: &[SourceNATRuleSnapshot]) -> Vec<Sou
         }
         let total_pool = rule.pool_addresses_v4.len() + rule.pool_addresses_v6.len();
         if total_pool > 0 {
-            let port_low = if snap.port_low > 0 { snap.port_low } else { 1024 };
-            let port_high = if snap.port_high > 0 { snap.port_high } else { 65535 };
+            let port_low = if snap.port_low > 0 {
+                snap.port_low
+            } else {
+                1024
+            };
+            let port_high = if snap.port_high > 0 {
+                snap.port_high
+            } else {
+                65535
+            };
             rule.pool_allocator = PortAllocator::new(total_pool, port_low, port_high);
         }
         out.push(rule);
@@ -444,7 +450,12 @@ impl DnatTable {
     ///
     /// 1. Exact match: `(protocol, dst_ip, dst_port)`
     /// 2. Wildcard port fallback: `(protocol, dst_ip, 0)`
-    pub(crate) fn lookup(&self, protocol: u8, dst_ip: IpAddr, dst_port: u16) -> Option<NatDecision> {
+    pub(crate) fn lookup(
+        &self,
+        protocol: u8,
+        dst_ip: IpAddr,
+        dst_port: u16,
+    ) -> Option<NatDecision> {
         let value = self
             .entries
             .get(&DnatKey {
@@ -583,7 +594,8 @@ mod tests {
         let decision = NatDecision {
             rewrite_src: Some("172.16.80.8".parse().expect("snat")),
             rewrite_dst: None,
-         ..NatDecision::default() };
+            ..NatDecision::default()
+        };
         assert_eq!(
             decision.reverse(
                 "10.0.61.102".parse().expect("orig src"),
@@ -629,10 +641,11 @@ mod tests {
         let decision = table.match_snat("192.168.1.10".parse().expect("int"), "trust");
         assert_eq!(
             decision,
-            Some(NatDecision { 
+            Some(NatDecision {
                 rewrite_src: Some("203.0.113.10".parse().expect("ext")),
                 rewrite_dst: None,
-             ..NatDecision::default() })
+                ..NatDecision::default()
+            })
         );
     }
 
@@ -666,10 +679,11 @@ mod tests {
         let decision = table.match_snat("fd00::1".parse().expect("int"), "trust");
         assert_eq!(
             decision,
-            Some(NatDecision { 
+            Some(NatDecision {
                 rewrite_src: Some("2001:db8::1".parse().expect("ext")),
                 rewrite_dst: None,
-             ..NatDecision::default() })
+                ..NatDecision::default()
+            })
         );
     }
 
@@ -682,14 +696,18 @@ mod tests {
             internal_ip: "192.168.1.10".to_string(),
         }]);
         // DNAT from wrong zone should fail
-        assert!(table
-            .match_dnat("203.0.113.10".parse().expect("ext"), "trust")
-            .is_none());
+        assert!(
+            table
+                .match_dnat("203.0.113.10".parse().expect("ext"), "trust")
+                .is_none()
+        );
         // SNAT does not check from_zone -- internal IP match is sufficient.
         // Traffic from internal host gets SNAT regardless of ingress zone.
-        assert!(table
-            .match_snat("192.168.1.10".parse().expect("int"), "dmz")
-            .is_some());
+        assert!(
+            table
+                .match_snat("192.168.1.10".parse().expect("int"), "dmz")
+                .is_some()
+        );
     }
 
     #[test]
@@ -700,15 +718,21 @@ mod tests {
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
         }]);
-        assert!(table
-            .match_dnat("203.0.113.10".parse().expect("ext"), "untrust")
-            .is_some());
-        assert!(table
-            .match_dnat("203.0.113.10".parse().expect("ext"), "trust")
-            .is_some());
-        assert!(table
-            .match_snat("192.168.1.10".parse().expect("int"), "trust")
-            .is_some());
+        assert!(
+            table
+                .match_dnat("203.0.113.10".parse().expect("ext"), "untrust")
+                .is_some()
+        );
+        assert!(
+            table
+                .match_dnat("203.0.113.10".parse().expect("ext"), "trust")
+                .is_some()
+        );
+        assert!(
+            table
+                .match_snat("192.168.1.10".parse().expect("int"), "trust")
+                .is_some()
+        );
     }
 
     #[test]
@@ -756,12 +780,16 @@ mod tests {
             external_ip: "203.0.113.10".to_string(),
             internal_ip: "192.168.1.10".to_string(),
         }]);
-        assert!(table
-            .match_dnat("203.0.113.99".parse().expect("unknown"), "untrust")
-            .is_none());
-        assert!(table
-            .match_snat("192.168.1.99".parse().expect("unknown"), "trust")
-            .is_none());
+        assert!(
+            table
+                .match_dnat("203.0.113.99".parse().expect("unknown"), "untrust")
+                .is_none()
+        );
+        assert!(
+            table
+                .match_snat("192.168.1.99".parse().expect("unknown"), "trust")
+                .is_none()
+        );
     }
 
     #[test]
@@ -781,9 +809,11 @@ mod tests {
             },
         ]);
         // The bad entry should be skipped, the good one should work
-        assert!(table
-            .match_dnat("203.0.113.10".parse().expect("ext"), "any")
-            .is_some());
+        assert!(
+            table
+                .match_dnat("203.0.113.10".parse().expect("ext"), "any")
+                .is_some()
+        );
     }
 
     #[test]
@@ -866,12 +896,16 @@ mod tests {
             pool_port: 8080,
             ..DestinationNATRuleSnapshot::default()
         }]);
-        assert!(table
-            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80)
-            .is_some());
-        assert!(table
-            .lookup(PROTO_UDP, "203.0.113.10".parse().unwrap(), 80)
-            .is_none());
+        assert!(
+            table
+                .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80)
+                .is_some()
+        );
+        assert!(
+            table
+                .lookup(PROTO_UDP, "203.0.113.10".parse().unwrap(), 80)
+                .is_none()
+        );
     }
 
     #[test]
@@ -936,13 +970,17 @@ mod tests {
             ..DestinationNATRuleSnapshot::default()
         }]);
         // Different IP
-        assert!(table
-            .lookup(PROTO_TCP, "203.0.113.99".parse().unwrap(), 80)
-            .is_none());
+        assert!(
+            table
+                .lookup(PROTO_TCP, "203.0.113.99".parse().unwrap(), 80)
+                .is_none()
+        );
         // Different port (no wildcard entry)
-        assert!(table
-            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443)
-            .is_none());
+        assert!(
+            table
+                .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1009,12 +1047,16 @@ mod tests {
             ..DestinationNATRuleSnapshot::default()
         }]);
         // Both TCP and UDP should match
-        assert!(table
-            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 53)
-            .is_some());
-        assert!(table
-            .lookup(PROTO_UDP, "203.0.113.10".parse().unwrap(), 53)
-            .is_some());
+        assert!(
+            table
+                .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 53)
+                .is_some()
+        );
+        assert!(
+            table
+                .lookup(PROTO_UDP, "203.0.113.10".parse().unwrap(), 53)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1029,7 +1071,9 @@ mod tests {
             pool_port: 80,
             ..DestinationNATRuleSnapshot::default()
         }]);
-        let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80).unwrap();
+        let decision = table
+            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80)
+            .unwrap();
         assert_eq!(decision.rewrite_dst, Some("192.168.1.10".parse().unwrap()));
         // Same port: no rewrite needed
         assert_eq!(decision.rewrite_dst_port, None);
@@ -1087,11 +1131,15 @@ mod tests {
             },
         ]);
         // Exact match should win over wildcard
-        let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80).unwrap();
+        let decision = table
+            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80)
+            .unwrap();
         assert_eq!(decision.rewrite_dst, Some("192.168.1.10".parse().unwrap()));
         assert_eq!(decision.rewrite_dst_port, Some(8080));
         // Non-matching port should fall through to wildcard
-        let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443).unwrap();
+        let decision = table
+            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443)
+            .unwrap();
         assert_eq!(decision.rewrite_dst, Some("192.168.1.100".parse().unwrap()));
         assert_eq!(decision.rewrite_dst_port, None);
     }
@@ -1163,7 +1211,12 @@ mod tests {
             }
         }
         // After 6 allocations across 3 addresses, all should have been used.
-        assert_eq!(seen_addrs.len(), 3, "expected round-robin across all 3 addresses, got {:?}", seen_addrs);
+        assert_eq!(
+            seen_addrs.len(),
+            3,
+            "expected round-robin across all 3 addresses, got {:?}",
+            seen_addrs
+        );
     }
 
     #[test]
@@ -1312,15 +1365,18 @@ mod tests {
             port_high: 65535,
             ..SourceNATRuleSnapshot::default()
         }]);
-        assert!(match_source_nat(
-            &rules,
-            "dmz",  // wrong from_zone
-            "wan",
-            "10.0.1.100".parse().unwrap(),
-            "8.8.8.8".parse().unwrap(),
-            None,
-            None,
-        ).is_none());
+        assert!(
+            match_source_nat(
+                &rules,
+                "dmz", // wrong from_zone
+                "wan",
+                "10.0.1.100".parse().unwrap(),
+                "8.8.8.8".parse().unwrap(),
+                None,
+                None,
+            )
+            .is_none()
+        );
     }
 
     #[test]

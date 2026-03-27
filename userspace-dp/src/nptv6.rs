@@ -136,8 +136,7 @@ impl Nptv6State {
             if iwords != ewords {
                 continue;
             }
-            let adjustment =
-                compute_adjustment(&internal_prefix, &external_prefix, iwords);
+            let adjustment = compute_adjustment(&internal_prefix, &external_prefix, iwords);
 
             let rule = Nptv6Rule {
                 internal_prefix,
@@ -338,7 +337,10 @@ mod tests {
 
         // Inbound: external -> internal
         assert!(state.translate_inbound(&mut addr));
-        assert_eq!(addr, original, "round-trip should preserve original address");
+        assert_eq!(
+            addr, original,
+            "round-trip should preserve original address"
+        );
     }
 
     #[test]
@@ -360,7 +362,10 @@ mod tests {
         assert_eq!(words[3], 0x0002);
 
         assert!(state.translate_inbound(&mut addr));
-        assert_eq!(addr, original, "round-trip should preserve original address");
+        assert_eq!(
+            addr, original,
+            "round-trip should preserve original address"
+        );
     }
 
     #[test]
