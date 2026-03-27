@@ -7,195 +7,217 @@ Get userspace HA failover to a state where both of these are true:
 - manual redundancy-group moves preserve long-lived traffic without collapsing to sustained zero throughput
 - crash/rejoin of the active node fails over and the returning node rejoins without destabilizing the survivor
 
-The immediate remaining bug is the first one. Crash/rejoin is materially better on the current build, but manual `RG1 node0 -> node1` moves under established load still fail.
+The near-term work is now split into two gates:
 
-## What is already fixed
+1. failover admission must only proceed once the standby has a real current-generation session-sync baseline
+2. once admitted, the dataplane handoff must keep established traffic alive through the ownership move
 
-The current branch work materially improved control-plane admission and crash/rejoin behavior.
+## What is already improved
 
-Working now:
+The recent failover work materially improved safety and observability.
 
-- manual failover no longer fails immediately on the first transient sync-admission error
-- direct-mode failover uses repeated re-announcements after primary transition
-- crash/rejoin of the active node no longer reproduces the old "node returns and kills traffic again" behavior in the latest measured run
-- the userspace failover validator and monitor paths now expose the counters needed to debug stale-owner forwarding
+Working or materially better now:
 
-Validated artifacts:
+- manual failover no longer proceeds blindly on the first transient sync-admission failure
+- crash/rejoin is materially better on the current build than it was before the re-announce and gating work
+- direct-mode failover uses repeated post-transition GARP/NA re-announcements
+- the failover validator now treats hung remote `iperf3` as a hard failure
+- the monitor and failover tooling expose stale-owner LAN/fabric/WAN counters well enough to separate control-plane admission failures from dataplane continuity failures
+
+Validated artifacts from the earlier work:
 
 - crash/rejoin: `/tmp/sysrqb-rejoin-20260327-105330`
-- manual failover with interval stream: `/tmp/manual-rg1-jsonstream-20260327-105647`
-- manual failover with per-second interface snapshots: `/tmp/manual-rg1-deep-20260327-105921`
+- admitted manual failover collapse: `/tmp/manual-rg1-jsonstream-20260327-105647`
+- deep interface-window capture: `/tmp/manual-rg1-deep-20260327-105921`
+
+## What changed in the latest pass
+
+The newest work did not fix the dataplane yet. It tightened the admission contract so manual failover only proceeds when the peer has a current-generation bulk sync baseline.
+
+New behavior now:
+
+- manual failover requires current-generation bulk priming, not just timeout-based `syncReady`
+- reconnect/disconnect clears `syncBulkPrimed`
+- session-sync readiness for cluster election still uses the existing timeout path
+- manual failover admission now uses the stricter `syncBulkPrimed` signal
+- the daemon retries sender-side bulk priming after peer connection instead of sending one burst and assuming success
+
+This is the right safety model:
+
+- cluster bring-up can still elect with timeout-based readiness
+- manual demotion cannot proceed unless the current connection has actually completed peer bulk priming
 
 ## What is still broken
 
-Manual `RG1 node0 -> node1` failover under established `iperf3` load still blackholes the flow after admission.
+The next blocker is now narrower and more concrete than before:
 
-Measured in `/tmp/manual-rg1-jsonstream-20260327-105647`:
+- manual failover is correctly failing closed because current-generation peer bulk priming is incomplete
+- there is still asymmetric bulk-sync completion across the two peers
 
-- peak throughput before the move: `21.041 Gbps`
-- zero-throughput intervals after the move: `52`
-- tail median throughput: `0.0 Gbps`
-- retransmits: `8062`
+That means the remaining problem is no longer just "manual failover is flaky." It is:
 
-The control plane did what it was supposed to do in that run:
+- one side can repeatedly send bulk sync
+- the other side does not reliably send or complete the reverse-direction bulk prime on the current connection
+- so the demoting node never gets a valid current-generation sync baseline and correctly refuses to proceed
 
-- first pre-hook attempt was rejected as retryable because sync was not yet quiescent
-- a later retry admitted the failover
-- the CLI completed in `6.51s`
-- the new owner transitioned and sent the repeated re-announcements
+This is progress, not regression. The old path blackholed traffic. The current path blocks the unsafe move.
 
-So the remaining bug is not manual-failover admission. It is dataplane continuity after an admitted ownership move.
+## Latest evidence
 
-## What the latest deep capture proves
+Manual failover now fails with:
 
-The per-second interface snapshots in `/tmp/manual-rg1-deep-20260327-105921` narrow the remaining failure substantially.
+- `pre-failover prepare for redundancy group 1: session sync not ready before demotion: peer bulk sync incomplete`
 
-In the first sampled post-move window:
+Artifacts:
 
-- old-owner LAN ingress (`fw0 ge-0-0-1`) stayed high
-- old-owner WAN egress (`fw0 ge-0-0-2`) was still dominant
-- old-owner fabric transmit (`fw0 ge-0-0-0`) was only a small fraction of that traffic
-- new-owner fabric receive (`fw1 ge-7-0-0`) only saw that small redirected fraction
+- `/tmp/manual-rg1-deep-20260327-131700`
+- `/tmp/manual-rg1-deep-20260327-131855`
+- `/tmp/manual-rg1-probe-20260327-132319`
 
-This means the remaining manual-failover bug is:
+Important logs on `fw0`:
 
-- the old owner is still allowed to locally WAN-egress a demoting RG for too long
-- the current staged handoff primes state, but it does not yet force the old owner into a true pre-demotion drain state before the cluster flip completes
+- `cluster: waiting to admit manual failover ... err="session sync not ready before demotion: peer bulk sync incomplete"`
+- `cluster: retrying session sync bulk prime`
+- `cluster sync: bulk sync complete sessions=0 skipped=74 epoch=1`
+- later retries with:
+  - `cluster sync: bulk sync complete sessions=185 skipped=0 epoch=6`
+  - `cluster sync: bulk sync complete sessions=185 skipped=0 epoch=7`
 
-That is why the first bad interval is enough to collapse the TCP flow and it never recovers.
+Important logs on `fw1`:
 
-## Working hypothesis
+- `cluster sync: bulk transfer starting epoch=1`
+- in earlier runs also:
+  - `cluster sync: bulk transfer complete epoch=1`
+  - `cluster: session sync complete, releasing VRRP hold`
 
-The code currently stages demotion in terms of:
+What this proves:
 
-- session republish
-- reverse-session refresh
-- cache invalidation
-- barrier / sync admission
+- `fw0` is definitely sending bulk sync repeatedly on the current connection
+- `fw1` definitely receives at least some of that bulk transfer
+- the reverse-direction priming signal back to `fw0` is still not being completed reliably on the current connection
 
-But it does not stage demotion in terms of forwarding behavior.
+So the next bug is either:
 
-The old owner can still have one or more of these active while the RG move is being admitted or has just flipped:
+- the accepting peer is not reliably starting its own sender-side `BulkSync()`
+- or it starts it and stalls before completion
+- or the originator is not observing the completion path correctly
 
-- cached local forward decisions for the demoting owner RG
-- live local session entries that still resolve to local WAN egress
-- already-built `pending_tx_local` work targeting the old WAN binding
-- already-built `pending_tx_prepared` work targeting the old WAN binding
+## Current working hypothesis
 
-That matches the live capture: the old owner is still pushing a large amount of local WAN traffic in the first bad post-flip window.
+There are now two separate failover gates:
+
+1. admission safety
+2. post-admission dataplane continuity
+
+The current branch is still blocked on gate `1` for manual failover.
+
+The likely failure points are in the reverse-direction session-sync prime path:
+
+- `SessionSync.handleNewConnection()`
+- the accept-side decision to invoke `BulkSync()`
+- `BulkSync()` itself on the accepting peer
+- `IterateSessions` / `IterateSessionsV6` on the secondary while generating the bulk transfer
+- the bulk-complete observation path that should flip `syncBulkPrimed=true`
+
+Until that is fixed, further dataplane work is premature because manual failover is still being blocked before the handoff runs.
 
 ## Next code steps
 
-### 1. Add a true helper-side demotion-drain state
+### 1. Instrument sender-side `BulkSync()` on the accepting peer
 
-Add a helper-visible runtime state for "owner RG is demoting" that is distinct from the normal HA active/inactive state.
+Add explicit sender-side logs in `pkg/cluster/sync.go` for:
 
-Required behavior:
+- bulk sync start
+- before IPv4 iteration
+- after IPv4 iteration
+- before IPv6 iteration
+- after IPv6 iteration
+- before writing bulk-end marker
+- bulk sync complete
 
-- as soon as demotion prep starts, the demoting owner RG is treated as not locally forwardable for new local-WAN egress decisions
-- stale-owner traffic should resolve to fabric redirect during this state, not to local WAN
-- this state must be local and immediate; it cannot wait for the cluster state flip to propagate back through the normal HA snapshot path
+Goal:
 
-Likely files:
+- prove whether the accepting peer actually enters `BulkSync()`
+- if it does, prove exactly where it stalls
 
-- [userspace-dp/src/main.rs](../userspace-dp/src/main.rs)
-- [userspace-dp/src/afxdp.rs](../userspace-dp/src/afxdp.rs)
-- [userspace-dp/src/afxdp/session_glue.rs](../userspace-dp/src/afxdp/session_glue.rs)
+### 2. Trace the accept-side connection path
 
-### 2. Make HA resolution treat a demoting RG like an inactive RG for local forwarding
+Instrument the code around:
 
-Today `enforce_ha_resolution_snapshot(...)` only reasons about the HA runtime snapshot. It does not know that a local RG is in the middle of a manual demotion sequence.
+- `handleNewConnection()`
+- any `wasDisconnected` / reconnect path
+- the point where accept-side `BulkSync()` is triggered
 
-The next fix should teach the forwarding path to do this for a demoting owner RG:
+Goal:
 
-- disallow local WAN forwarding
-- prefer fabric redirect for forward candidates and missing-neighbor cases
-- invalidate or bypass cached decisions that still point to local WAN
+- prove whether the reverse-direction prime is being scheduled at all on the current connection
 
-This needs to apply to:
+### 3. If `BulkSync()` starts but does not complete, instrument session iteration
 
-- new flow lookups
-- flow-cache hits
-- established session lookups that re-resolve forwarding
+If the sender-side logs show entry into `BulkSync()` but no completion, instrument:
 
-### 3. Drain and cancel old-owner queued WAN work before completing demotion
+- `dp.IterateSessions`
+- `dp.IterateSessionsV6`
 
-The current cancellation logic is too late or too narrow for the bad first interval.
+Goal:
 
-The demotion-prep stage should explicitly flush or cancel queued old-owner WAN work for the demoting RG before the manager allows the resignation to complete.
+- determine whether the stall is in session enumeration, v4/v6 split, or bulk-end write/flush
 
-That means cancelling all matching work for the demoting RG across:
+### 4. Keep the stricter admission gate
 
-- `pending_tx_local`
-- `pending_tx_prepared`
-- shared pending TX queues
-- any still-live local session map entries that would drive local WAN transmit
+Do not relax the new manual-failover safety check.
 
-The important difference from the current design is timing:
+The current behavior is correct:
 
-- do not only republish state
-- also make the old owner prove that local-WAN transmit for that RG has been drained or cancelled before the move completes
+- a manual failover without current-generation peer bulk priming is unsafe
+- the correct response is to block the move, not to revert to the old blackhole behavior
 
-### 4. Add an explicit demotion-drain acknowledgement, not just a session prep ack
+### 5. Only return to dataplane handoff work after bidirectional priming is real
 
-The current prep ack tells the daemon that republish work ran. It does not prove that local forwarding for the demoting RG has stopped.
+Once manual failover is admitted with true current-generation bulk priming:
 
-Add a second acknowledgement with a stricter meaning:
+- rerun the exact manual `RG1 node0 -> node1` `iperf3` repro
+- compare it against:
+  - `/tmp/manual-rg1-jsonstream-20260327-105647`
+  - `/tmp/manual-rg1-deep-20260327-105921`
 
-- all workers have applied the demoting-RG forwarding state
-- all matching cached local-forward decisions are invalidated
-- all matching queued local/prepared TX requests are drained or cancelled
-- no worker still reports local-WAN-forwardable state for the demoting RG
+Then decide whether the next remaining bug is:
 
-Only after that acknowledgement should the manual failover pre-hook return success.
-
-### 5. Add targeted transport-quality instrumentation for the demotion window
-
-The current observability is good enough to prove the bug exists, but the next iteration should add counters that directly answer whether the old owner is still locally forwarding the demoting RG.
-
-Add per-binding or per-worker counters for:
-
-- demoting-RG local-forward attempts blocked
-- demoting-RG redirects forced to fabric
-- demoting-RG queued local TX cancels
-- demoting-RG prepared TX cancels
-- demotion-drain ack latency
-
-That keeps the next debugging pass from relying on raw cumulative packet deltas alone.
+- demotion drain behavior
+- stale-owner redirect continuity
+- post-transition fabric transport quality
 
 ## Recommended implementation order
 
-1. Introduce demoting-RG helper state and thread it through worker commands.
-2. Apply that state to HA resolution and flow-cache validation so new and cached traffic stop choosing local WAN.
-3. Add queued-WAN drain/cancel semantics and a stronger demotion-drain ack.
-4. Re-run the exact manual `RG1 node0 -> node1` json-stream repro.
-5. Only after the manual move is stable, re-run crash/rejoin to make sure the stricter demotion behavior did not regress that path.
+1. Add accept-side sender `BulkSync()` instrumentation.
+2. Add accept-path scheduling instrumentation.
+3. If needed, instrument `IterateSessions` / `IterateSessionsV6`.
+4. Fix current-generation reverse-direction bulk priming.
+5. Re-run manual `RG1` failover under load.
+6. Only then continue the dataplane continuity work.
 
 ## Acceptance criteria
 
-Manual `RG1 node0 -> node1` under established `iperf3 -P 4` load should meet all of these:
+Before continuing dataplane handoff work, manual failover admission should satisfy all of these:
 
-- no sustained zero-throughput tail
-- no collapse to permanent `0.0 Gbps`
-- first post-move disruption is bounded and recovers automatically
-- old-owner WAN transmit stops quickly after demotion prep begins
-- old-owner fabric transmit becomes the dominant stale-owner path during the handoff window
-- new-owner WAN transmit takes over and stays healthy
+- no `peer bulk sync incomplete` admission failure once the peer connection is settled
+- `syncBulkPrimed=true` on the demoting node for the current connection generation
+- both peers log sender-side bulk sync start and completion on the current connection
 
-Crash/rejoin should continue to meet all of these:
+After that, the dataplane continuity goal remains:
 
-- short takeover disruption is acceptable
-- traffic recovers without a second collapse when the rebooted node returns
-- final cluster state is stable
-- both nodes are takeover-ready after rejoin
+- no sustained zero-throughput tail under manual `RG1 node0 -> node1`
+- first disruption is bounded and self-recovers
+- no permanent hang of the remote `iperf3` client
+- crash/rejoin remains stable
 
-## What not to chase first
+## What not to do next
 
-These are not the first fixes to make for the current manual-failover bug:
+Do not spend the next cycle on these before fixing bidirectional bulk priming:
 
-- more re-announcement bursts
-- more sync-admission retries
-- more session-republish retries without changing forwarding behavior
-- generic fabric throughput tuning without first eliminating old-owner local WAN forwarding during demotion
+- more re-announcement tuning
+- more barrier retry logic
+- more fabric transport micro-optimizations
+- relaxing manual failover admission checks
 
-Those may still matter later, but the current evidence says the next important fix is a forwarding drain state, not another control-plane retry.
+Those are not the current blocker.
