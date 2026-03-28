@@ -232,6 +232,29 @@ Interpretation:
 - but the flow recovers and stays up after the rebooted node rejoins
 - the old "returning node destabilizes the survivor again" failure did not reproduce in that run
 
+Latest crash/rejoin validation on top of the fabric queue-selection fix:
+
+- artifact:
+  - `/tmp/sysrqb-rejoin-20260328-072503`
+
+Measured result:
+
+- `avg_gbps`: `12.713267304972149`
+- `peak_gbps`: `14.059293600012786`
+- `tail_median_gbps`: `13.514897783265418`
+- `tail_peak_ratio`: `0.9612785796900298`
+- `collapse_detected`: `false`
+- `retransmits`: `9709`
+- takeover: `ok`
+- rejoin: `ok`
+
+Interpretation:
+
+- the active-node hard crash still causes a short disruption window
+- the survivor takes over
+- the rebooted node rejoins as secondary with `Takeover ready: yes`
+- there is no second collapse after rejoin on this build
+
 ## Current working hypothesis
 
 The current branch is past the original sync-admission and bulk-priming bugs,
@@ -266,6 +289,16 @@ Acceptance:
 - no hung remote `iperf3`
 - no zero-throughput intervals
 - no interval collapse
+
+Current note:
+
+- the first attempted two-cycle rerun after the crash/rejoin pass did not reach
+  the failover phase because steady-state external IPv6 preflight failed in the
+  lab
+- artifact:
+  - `/tmp/userspace-ha-failover-rg1-20260328-072932`
+- that run does not change the current dataplane conclusion because it never
+  exercised the RG move
 
 ### 3. Reduce retransmits inside the now-passing failover window
 

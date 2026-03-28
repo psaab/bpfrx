@@ -340,6 +340,44 @@ Interpretation:
 - The remaining high-value failure is the manual failover dataplane collapse
   after an admitted RG move.
 
+Latest crash/rejoin result on top of the fabric queue-selection fix:
+
+- Artifact:
+  - `/tmp/sysrqb-rejoin-20260328-072503`
+- Repro:
+  - long `iperf3 -c 172.16.80.200 -P 4`
+  - `echo b > /proc/sysrq-trigger` on active `node0`
+- Observed:
+  - takeover: `ok`
+  - rejoin: `ok`
+  - short disruption during crash takeover:
+    - one interval `7.45 Gbps`
+    - then two `0.0 Gbps` intervals
+    - then one `1.33 Gbps` interval
+  - after that, traffic recovers to `~13-14 Gbps` and stays there
+  - no late collapse after the rebooted node returns
+  - end-of-run tail throughput stays healthy:
+    - tail median `13.51 Gbps`
+    - tail/peak ratio `0.96`
+  - final cluster state is stable:
+    - `node1` primary
+    - `node0` secondary
+    - both takeover-ready
+
+Interpretation:
+
+- the fabric queue-selection fix did not regress crash/rejoin
+- the survivor takeover and returning-node rejoin remain stable on the new build
+- the remaining open work stays concentrated in the manual RG-move path, not
+  hard-crash recovery
+
+Latest multi-cycle note:
+
+- the first attempted two-cycle rerun after the crash/rejoin pass stopped in
+  steady-state preflight because external IPv6 was unreachable in the lab:
+  - `/tmp/userspace-ha-failover-rg1-20260328-072932`
+- that artifact is a lab preflight failure, not a dataplane failover verdict
+
 ### 3. Warm standby is treated like a cold standby
 
 Repro:
