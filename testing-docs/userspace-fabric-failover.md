@@ -66,6 +66,12 @@ What it now checks:
    - policy denied packets
 7. post-run throughput, retransmits, and zero-throughput interval counts
 
+If steady-state preflight already shows the public targets are unreachable,
+isolate that outage before judging the failover path. The harness supports
+`CHECK_EXTERNAL_REACHABILITY=0` for those cases so you can still validate
+userspace RG-move continuity without masking the fact that internet coverage
+was not exercised.
+
 ## Why we hardened it this way
 
 The old validator proved only that a long-lived `iperf3` run did not fully die.
