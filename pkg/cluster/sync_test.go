@@ -1369,6 +1369,33 @@ func TestReconcileNoBulkInProgress(t *testing.T) {
 	}
 }
 
+func TestReconcileSkipsEmptyBulk(t *testing.T) {
+	peerOwnedKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 9, 1}, Protocol: 6, SrcPort: 1234, DstPort: 80}
+	localOwnedKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 9, 2}, Protocol: 6, SrcPort: 2345, DstPort: 443}
+
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			peerOwnedKey: {IsReverse: 0, IngressZone: 2},
+			localOwnedKey: {IsReverse: 0, IngressZone: 1},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return false }
+	ss.IsPrimaryForRGFn = func(rgID int) bool { return rgID == 1 }
+	ss.SetZoneRGMap(map[uint16]int{1: 1, 2: 2})
+
+	ss.handleMessage(nil, syncMsgBulkStart, nil)
+	ss.handleMessage(nil, syncMsgBulkEnd, nil)
+
+	if _, ok := dp.v4sessions[peerOwnedKey]; !ok {
+		t.Fatal("peer-owned session should not be deleted on empty bulk")
+	}
+	if _, ok := dp.v4sessions[localOwnedKey]; !ok {
+		t.Fatal("local-owned session should remain on empty bulk")
+	}
+}
+
 func TestHandleDisconnectStaleConn(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 

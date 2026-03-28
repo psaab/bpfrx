@@ -1894,6 +1894,10 @@ func (s *SessionSync) reconcileStaleSessions() {
 		"recv_v4", len(recvV4),
 		"recv_v6", len(recvV6),
 		"zones", len(zoneSnap))
+	if len(recvV4) == 0 && len(recvV6) == 0 {
+		slog.Info("cluster sync: reconcile stale sessions skipped (empty bulk)")
+		return
+	}
 
 	if s.dp == nil {
 		slog.Info("cluster sync: reconcile stale sessions skipped (no dataplane)")
