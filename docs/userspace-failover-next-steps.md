@@ -7,10 +7,10 @@ Get userspace HA failover to a state where both of these are true:
 - manual redundancy-group moves preserve long-lived traffic without collapsing to sustained zero throughput
 - crash/rejoin of the active node fails over and the returning node rejoins without destabilizing the survivor
 
-The near-term work is now split into two gates:
+The current work is now split into two validation buckets:
 
-1. failover admission must only proceed once the standby has a real current-generation session-sync baseline
-2. once admitted, the dataplane handoff must keep established traffic alive through the ownership move
+1. manual `RG1` moves must remain healthy in both directions under established `iperf3`
+2. crash/rejoin must fail over and stay stable after the rebooted node returns
 
 ## What is already improved
 
@@ -30,184 +30,154 @@ Validated artifacts from the earlier work:
 - admitted manual failover collapse: `/tmp/manual-rg1-jsonstream-20260327-105647`
 - deep interface-window capture: `/tmp/manual-rg1-deep-20260327-105921`
 
-## What changed in the latest pass
+## What changed in the latest passes
 
-The newest work still did not fix the dataplane, but it did move the
-admission logic onto the correct signal.
+The earlier session-sync admission work is now in place and no longer the
+active blocker for the manual repro.
 
-New behavior now:
+What landed:
 
-- manual failover no longer keys off the old inbound-bulk signal
-- reconnect/disconnect clears both:
-  - `syncBulkPrimed`
-  - `syncPeerBulkPrimed`
-- session-sync readiness for cluster election still uses the existing timeout path
-- manual failover admission now waits on sender-side peer acknowledgement of the current-generation bulk sync
-- the daemon retries sender-side bulk priming after peer connection instead of sending one burst and assuming success
-- the cluster transport now emits explicit bulk-complete acknowledgements:
-  - sender writes `BulkEnd`
-  - receiver responds with `BulkAck`
-  - originator marks the peer as actually primed only after that ack arrives
+- manual failover admission now waits on sender-side acknowledgement of the current-generation bulk sync
+- stacked retry bulks are suppressed while a previous bulk is still awaiting `BulkAck`
+- demotion barriers are no longer delayed behind stale retry bulk epochs
+- the helper-side failover handoff stays instrumented enough to separate:
+  - admission failures
+  - post-admission dataplane failures
 
-This is the right safety model:
+The newer dataplane fix addressed the remaining forward-direction collapse:
 
-- cluster bring-up can still elect with timeout-based readiness
-- manual demotion cannot proceed unless the current connection has actually completed peer bulk priming in the correct direction
+- transient TCP ACK misses to WAN interface-NAT addresses are no longer cached as helper-local `LocalDelivery` sessions
+- this prevents the new owner from poisoning the inherited WAN reply path during failover
+- the affected path was visible as:
+  - very low `session misses`
+  - but rapidly increasing `Slow path packets: local` on the new-owner WAN binding
 
 ## What is still broken
 
-The original one-directional bulk-completion bug is no longer the blocker.
+The specific `node0 -> node1` manual failover collapse that dominated the
+earlier investigation is now fixed on this branch.
 
-What is still broken now:
+What is still not fully proven:
 
-- manual failover is correctly failing closed because the demotion barrier does not clear inside the quiescence window
-- the barrier is not being lost
-- it is being delayed behind previously-sent retry bulk traffic on the same stream
-
-That means the remaining problem is no longer just "manual failover is flaky." It is:
-
-- current-generation bulk completion is now observed in both directions
-- but the retry loop can still send epoch `2` and `3` before epoch `1` is acked
-- those extra bulks inflate stream backlog
-- the demotion barrier then arrives far too late to satisfy the manual-failover admission timeout
-
-This is still progress. The unsafe move is blocked for the right reason, but the
-transport is too backlogged to admit the move in time.
+- the full hardened failover validator has not yet been rerun end-to-end on this exact build
+- reverse-direction manual failover should be rerun once on top of the new WAN local-session fix, even though it was already healthy before that change
+- crash/rejoin is materially better, but the stricter harness should still be rerun against the current build so the remaining failover budget is explicit
 
 ## Latest evidence
 
-Manual failover now fails with:
+Manual `RG1 node0 -> node1` is now healthy under the simplified long-lived
+repro.
 
-- `pre-failover prepare for redundancy group 1: session sync peer not quiescent before demotion: timed out waiting for session sync barrier ack ...`
+Validated forward-direction artifact:
 
-Artifacts:
+- `/tmp/manual-rg1-forward-simple7-20260327-230430`
 
-- `/tmp/failover-debug/manual-rg1-node0-to-node1-20260327-212324`
-- `/tmp/failover-debug/manual-rg1-node0-to-node1-20260327-212719`
-- `/tmp/failover-debug/manual-rg1-node0-to-node1-20260327-212958`
-- `/tmp/manual-rg1-deep-20260327-213949`
+Measured result:
 
-Important logs on `fw0`:
+- `avg_gbps`: `20.74487928558069`
+- `peak_gbps`: `21.113331112475258`
+- `tail_median_gbps`: `20.6870205970763`
+- `tail_peak_ratio`: `0.979808467307792`
+- `retransmits`: `0`
+- `collapse_detected`: `false`
+- `zero_intervals_total`: `0`
 
-- `cluster: session sync bulk ack received`
-- `cluster sync: barrier sent seq=...`
-- retry bulk epochs `2` and `3` were already written before the first ack arrived
+The matching new-owner WAN monitor in that run showed that the earlier failure
+signature was gone:
 
-Important logs on `fw1`:
+- `Slow path packets` stayed flat
+- there was no renewed `local` slow-path explosion on `ge-7/0/2`
 
-- `cluster sync: bulk ack sent epoch=...`
-- later:
-  - `cluster sync: barrier received seq=...`
-  - `cluster sync: barrier ack sent seq=...`
-- but the barrier receive time is tens of seconds after send time
+Crash/rejoin is also materially improved on the same branch.
 
-What this proves:
+Validated crash/rejoin artifact:
 
-- current-generation sender-side bulk priming is now real
-- barrier delivery works
-- barrier acknowledgement works
-- the remaining issue is transport latency caused by extra retry bulks already in front of the barrier
+- `/tmp/sysrqb-rejoin8-20260327-230527`
 
-Newest result:
+Measured result:
 
-- with one-outstanding-bulk retry suppression in place, manual failover is admitted
-- the same long-lived `iperf3` flow still collapses after the ownership move
-- so the next bug is post-admission dataplane continuity, not session-sync priming
+- `avg_gbps`: `16.000761979104734`
+- `peak_gbps`: `18.00647341194518`
+- `tail_median_gbps`: `17.208910818226855`
+- `tail_peak_ratio`: `0.955706896321562`
+- `collapse_detected`: `false`
+- `retransmits`: `4388`
+
+Interpretation:
+
+- crash takeover still has a short disruption window
+- but the flow recovers and stays up after the rebooted node rejoins
+- the old "returning node destabilizes the survivor again" failure did not reproduce in that run
 
 ## Current working hypothesis
 
-There are now two separate failover gates:
+The current branch is past the original sync-admission and forward-collapse
+bugs.
 
-1. admission safety
-2. post-admission dataplane continuity
+The remaining question is narrower:
 
-The current branch is still blocked on gate `1` for manual failover, but for a
-different reason now.
-
-The likely failure point is the outbound retry policy:
-
-- `BulkSync()` on reconnect sends epoch `1`
-- the retry loop later sends epoch `2` and `3` before epoch `1` is acked
-- those extra bulks are valid, but they occupy the same ordered stream
-- demotion barriers are injected behind stale bulk replay traffic
-
-Until that is fixed, further dataplane work is still premature because manual
-failover is being blocked before the handoff runs.
+- does the full hardened failover gate stay green on this build
+- and, if not, what residual transition weakness is left once the local-session
+  poisoning bug is removed
 
 ## Next code steps
 
-### 1. Keep only one outbound bulk outstanding at a time
+### 1. Rerun the hardened failover validator on this exact build
 
-The retry loop must not send epoch `2` or `3` while epoch `1` is still waiting
-for peer acknowledgement.
-
-Concrete change:
-
-- track the latest outbound bulk epoch awaiting `BulkAck`
-- defer retry while that ack is still pending inside a grace window
+Use the full userspace HA validation path, not only the simplified manual repro.
 
 Goal:
 
-- prevent later bulk replay traffic from sitting in front of the demotion barrier
+- confirm whether the current branch is actually good enough for the stronger gate
+- capture any remaining failures with the stricter artifacts already in the harness
 
-### 2. Keep the stricter admission gate
+### 2. Rerun reverse-direction manual failover once on top of the WAN local-session fix
 
-Do not relax the new manual-failover safety check.
+The reverse direction was already healthy before the latest fix.
+It still needs one confirming run on top of the current build so both RG1 move
+directions are explicitly proven.
 
-The current behavior is correct:
+Goal:
 
-- a manual failover without current-generation peer bulk priming is unsafe
-- the correct response is to block the move, not to revert to the old blackhole behavior
+- eliminate direction-specific uncertainty before changing more dataplane logic
 
-### 3. Only return to dataplane handoff work after retry suppression is in place
+### 3. Only add more dataplane changes if the hardened gate still fails
 
-Once manual failover is admitted with:
+If the gate still fails after the forward-fix branch, the next step should be
+driven by the new artifacts, not by re-opening the already-fixed sync-admission
+path.
 
-- current-generation peer bulk ack observed
-- no extra retry bulk epochs queued ahead of the barrier
+That means:
 
-- rerun the exact manual `RG1 node0 -> node1` `iperf3` repro
-- compare it against:
-  - `/tmp/manual-rg1-jsonstream-20260327-105647`
-  - `/tmp/manual-rg1-deep-20260327-105921`
-
-Then decide whether the next remaining bug is:
-
-- demotion drain behavior
-- stale-owner redirect continuity
-- post-transition fabric transport quality
+- preserve the stricter sync admission gate
+- preserve the WAN local-session caching fix
+- inspect the next remaining failure on its own merits
 
 ## Recommended implementation order
 
-1. Keep one outbound bulk outstanding at a time.
-2. Re-run manual `RG1` failover under load.
-3. Confirm that demotion barriers are now acknowledged inside the quiescence window.
-4. Only then continue the dataplane continuity work.
+1. Run the hardened failover validator on the current branch.
+2. Re-run reverse-direction manual `RG1` failover once.
+3. If both pass, stop changing the failover dataplane and move to cleanup / PR polish.
+4. If either fails, use the new artifacts to isolate the remaining transition bug before touching sync-admission logic again.
 
 ## Acceptance criteria
 
-Before continuing dataplane handoff work, manual failover admission should satisfy all of these:
+The current branch should not be considered done until all of these are true:
 
-- no `peer bulk sync incomplete` admission failure once the peer connection is settled
-- `syncPeerBulkPrimed=true` on the demoting node for the current connection generation
-- the originator logs `cluster: session sync bulk ack received` for the current connection generation
-- no extra retry bulk epochs are sent while the previous epoch is still awaiting ack
-- demotion barriers are acknowledged within the manual-failover quiescence window
-
-After that, the dataplane continuity goal remains:
-
-- no sustained zero-throughput tail under manual `RG1 node0 -> node1`
-- first disruption is bounded and self-recovers
-- no permanent hang of the remote `iperf3` client
-- crash/rejoin remains stable
+- manual `RG1 node0 -> node1` stays up under long-lived `iperf3`
+- manual `RG1 node1 -> node0` stays up under long-lived `iperf3`
+- the hardened failover validator stays green on this build
+- crash/rejoin still recovers and remains stable after the rebooted node returns
+- no regression reintroduces the new-owner WAN `local` slow-path explosion on transient reply misses
 
 ## What not to do next
 
-Do not spend the next cycle on these before fixing retry-induced stream backlog:
+Do not spend the next cycle re-opening the now-fixed blockers unless the stronger
+gate proves they have regressed:
 
-- more re-announcement tuning
-- more barrier retry logic
-- more fabric transport micro-optimizations
-- relaxing manual failover admission checks
+- removing the stricter sync admission gate
+- backing out the WAN local-session caching fix
+- rewriting the barrier path again
+- speculating about fabric throughput without first rerunning the current gate
 
-Those are not the current blocker.
+Those are not the current default blocker anymore.

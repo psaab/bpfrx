@@ -441,6 +441,36 @@ The failover problem is therefore split into two layers:
 1. control correctness: barrier, session handoff, peer install ordering
 2. post-handoff transport quality: stale-owner fabric throughput/drop behavior
 
+### Root cause G: transient WAN TCP ACK misses were being cached as helper-local sessions on the new owner
+
+What the direction-specific repros showed:
+
+- `node1 -> node0` failover was healthy
+- `node0 -> node1` failover collapsed
+- the failing direction did not show a large `session_miss` storm
+- instead, the new owner WAN binding showed:
+  - very small `session_miss` growth
+  - rapidly increasing `Slow path packets`
+  - almost all of that growth in `local`
+
+Interpretation:
+
+- transient post-failover reply misses to the interface-NAT external IP were
+  being resolved as `LocalDelivery`
+- the helper was then caching those TCP ACK misses as local sessions
+- once cached, later packets no longer showed up as repeated session misses;
+  they kept hitting the poisoned local session and returning to slow path as
+  helper-local delivery
+
+Status:
+
+- This root cause is now addressed on the current branch.
+- TCP ACK misses for interface-NAT-derived `LocalDelivery` are no longer cached
+  as helper-local sessions.
+- The validated `node0 -> node1` artifact
+  `/tmp/manual-rg1-forward-simple7-20260327-230430` stayed healthy at about
+  `20.7 Gbps` with `0` retransmits and no collapse.
+
 ## Plan
 
 ### Phase 1: stage demotion before redirect
@@ -521,8 +551,9 @@ Current status:
 - the one-outstanding-bulk change achieved this control-plane goal in the
   latest manual repro
 - manual `RG1 node0 -> node1` failover was admitted
-- the inherited `iperf3` flow still collapsed afterward
-- the next blocker is therefore post-admission dataplane continuity
+- the original admitted-collapse repro was then traced to poisoned WAN local
+  session caching on transient ACK misses
+- that forward-direction collapse is now fixed on the current branch
 
 ### Phase 5: harden validation
 
@@ -602,6 +633,10 @@ Expected result:
 9. After the handoff is proven correct, instrument the first 10 seconds of
    stale-owner fabric forwarding and address the remaining throughput collapse
    as a transport-quality problem.
+10. Preserve the WAN local-session caching fix and rerun the full hardened
+    failover gate on the repaired branch.
+11. Reconfirm reverse-direction manual failover and crash/rejoin on the same
+    build before declaring the failover path stable.
 
 ## Acceptance criteria
 
@@ -613,6 +648,8 @@ Expected result:
 - the post-transition stale-owner fabric path stays alive instead of collapsing
   a few seconds after primary transition
 - retransmits and fabric input drops stay within the failover budget
+- transient WAN reply misses do not poison the new owner into helper-local
+  session caching
 
 ### Crash/rejoin
 
@@ -622,3 +659,4 @@ Expected result:
 - no management-DHCP-triggered full dataplane recompile occurs for `fxp0`
 - a previously-synced standby does not become ineligible again just because the
   sync connection bounced
+- the returning node does not cause a second collapse after rejoin
