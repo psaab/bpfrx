@@ -1265,17 +1265,9 @@ pub(super) fn resolve_flow_session_decision(
                 ))
             });
         let keep_transient = poison_key.is_some_and(|(key, decision, metadata)| {
-            should_keep_synced_hit_transient(
-                forwarding,
-                ingress_ifindex,
-                key,
-                decision,
-                metadata,
-            )
+            should_keep_synced_hit_transient(forwarding, ingress_ifindex, key, decision, metadata)
         });
-        if keep_transient
-            && let Some((key, decision, metadata)) = poison_key
-        {
+        if keep_transient && let Some((key, decision, metadata)) = poison_key {
             purge_translated_synced_hit(
                 sessions,
                 session_map_fd,
