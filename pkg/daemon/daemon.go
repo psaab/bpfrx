@@ -329,10 +329,10 @@ func (d *Daemon) onSessionSyncPeerDisconnected() {
 	slog.Info("cluster: session sync peer disconnected",
 		"retry_gen", gen,
 		"cluster_sync_ready", d.cluster != nil && d.cluster.IsSyncReady())
+	d.stopSyncReadyTimer()
 	if d.cluster != nil {
 		d.cluster.SetSyncReady(false)
 	}
-	d.armSyncReadyTimer()
 }
 
 func (d *Daemon) shouldSuppressPeerHeartbeatTimeout() (bool, string) {

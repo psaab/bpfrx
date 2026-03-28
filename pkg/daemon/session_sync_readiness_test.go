@@ -19,7 +19,7 @@ func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool, msg s
 	t.Fatal(msg)
 }
 
-func TestSessionSyncPeerDisconnected_ClearsReadinessAndFallsBackToTimeout(t *testing.T) {
+func TestSessionSyncPeerDisconnected_ClearsReadinessWithoutTimeoutRelease(t *testing.T) {
 	d := &Daemon{
 		cluster:          newClusterManager(false),
 		syncReadyTimeout: 20 * time.Millisecond,
@@ -37,11 +37,13 @@ func TestSessionSyncPeerDisconnected_ClearsReadinessAndFallsBackToTimeout(t *tes
 	if d.syncBulkPrimed.Load() {
 		t.Fatal("disconnect should clear bulk priming state")
 	}
-	waitForCondition(t, 200*time.Millisecond, d.cluster.IsSyncReady,
-		"sync readiness timeout should release hold after disconnect")
+	time.Sleep(80 * time.Millisecond)
+	if d.cluster.IsSyncReady() {
+		t.Fatal("disconnect should not release readiness on timeout without a reconnect")
+	}
 }
 
-func TestSessionSyncPeerDisconnected_UnprimedFallsBackToTimeout(t *testing.T) {
+func TestSessionSyncPeerDisconnected_UnprimedStaysNotReady(t *testing.T) {
 	d := &Daemon{
 		cluster:          newClusterManager(false),
 		syncReadyTimeout: 20 * time.Millisecond,
@@ -55,8 +57,10 @@ func TestSessionSyncPeerDisconnected_UnprimedFallsBackToTimeout(t *testing.T) {
 	if d.cluster.IsSyncReady() {
 		t.Fatal("unprimed disconnect should clear readiness immediately")
 	}
-	waitForCondition(t, 200*time.Millisecond, d.cluster.IsSyncReady,
-		"sync readiness timeout should release hold for an unprimed standby")
+	time.Sleep(80 * time.Millisecond)
+	if d.cluster.IsSyncReady() {
+		t.Fatal("unprimed disconnect should remain not ready until sync reconnects")
+	}
 }
 
 func TestSessionSyncPeerConnected_ClearsReadinessThenFallsBackToTimeout(t *testing.T) {
