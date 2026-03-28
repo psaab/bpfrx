@@ -1735,6 +1735,11 @@ func (s *SessionSync) enqueueBarrierMessage(msg []byte, timeout time.Duration) e
 }
 
 func (s *SessionSync) writeBarrierMessage(payload []byte, timeout time.Duration) error {
+	// Serialize barrier injection with BulkSync() so a background bulk-prime
+	// retry cannot start writing a new bulk ahead of the demotion barrier after
+	// quiescence has already been observed.
+	s.bulkSendMu.Lock()
+	defer s.bulkSendMu.Unlock()
 	if err := s.waitForSendQueueDrain(timeout); err != nil {
 		return err
 	}
@@ -1749,6 +1754,11 @@ func (s *SessionSync) writeBarrierMessage(payload []byte, timeout time.Duration)
 		s.handleDisconnect(conn)
 		return err
 	}
+	seq := binary.LittleEndian.Uint64(payload)
+	slog.Info("cluster sync: barrier sent",
+		"seq", seq,
+		"local", connLocalAddrString(conn),
+		"remote", connRemoteAddrString(conn))
 	return nil
 }
 
