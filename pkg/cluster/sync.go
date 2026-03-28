@@ -1889,8 +1889,14 @@ func (s *SessionSync) reconcileStaleSessions() {
 	s.bulkRecvV6 = nil
 	s.bulkZoneSnapshot = nil
 	s.bulkMu.Unlock()
+	start := time.Now()
+	slog.Info("cluster sync: reconcile stale sessions starting",
+		"recv_v4", len(recvV4),
+		"recv_v6", len(recvV6),
+		"zones", len(zoneSnap))
 
 	if s.dp == nil {
+		slog.Info("cluster sync: reconcile stale sessions skipped (no dataplane)")
 		return
 	}
 
@@ -1910,6 +1916,7 @@ func (s *SessionSync) reconcileStaleSessions() {
 
 	// Collect stale v4 sessions for deletion (can't delete during iteration).
 	var staleV4 []dataplane.SessionKey
+	v4IterStart := time.Now()
 	s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
@@ -1923,7 +1930,11 @@ func (s *SessionSync) reconcileStaleSessions() {
 		}
 		return true
 	})
+	slog.Info("cluster sync: reconcile stale sessions iterated v4",
+		"stale", len(staleV4),
+		"elapsed", time.Since(v4IterStart))
 
+	v4DeleteStart := time.Now()
 	for _, key := range staleV4 {
 		// Look up to clean reverse entry and dnat_table.
 		if val, err := s.dp.GetSessionV4(key); err == nil {
@@ -1942,9 +1953,13 @@ func (s *SessionSync) reconcileStaleSessions() {
 		s.dp.DeleteSession(key)
 		deleted++
 	}
+	slog.Info("cluster sync: reconcile stale sessions deleted v4",
+		"deleted", len(staleV4),
+		"elapsed", time.Since(v4DeleteStart))
 
 	// Collect stale v6 sessions.
 	var staleV6 []dataplane.SessionKeyV6
+	v6IterStart := time.Now()
 	s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
@@ -1957,7 +1972,11 @@ func (s *SessionSync) reconcileStaleSessions() {
 		}
 		return true
 	})
+	slog.Info("cluster sync: reconcile stale sessions iterated v6",
+		"stale", len(staleV6),
+		"elapsed", time.Since(v6IterStart))
 
+	v6DeleteStart := time.Now()
 	for _, key := range staleV6 {
 		if val, err := s.dp.GetSessionV6(key); err == nil {
 			if val.ReverseKey.Protocol != 0 {
@@ -1975,10 +1994,16 @@ func (s *SessionSync) reconcileStaleSessions() {
 		s.dp.DeleteSessionV6(key)
 		deleted++
 	}
+	slog.Info("cluster sync: reconcile stale sessions deleted v6",
+		"deleted", len(staleV6),
+		"elapsed", time.Since(v6DeleteStart))
 
 	if deleted > 0 {
 		slog.Info("cluster sync: reconciled stale sessions", "deleted", deleted)
 	}
+	slog.Info("cluster sync: reconcile stale sessions complete",
+		"deleted", deleted,
+		"elapsed", time.Since(start))
 }
 
 func (s *SessionSync) handleDisconnect(conn net.Conn) {
