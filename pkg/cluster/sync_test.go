@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1862,6 +1863,80 @@ func TestWaitForPeerBarrierCompletesOnAck(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("barrier helper failed: %v", err)
+	}
+}
+
+func TestPendingBulkAckTracksNewestOutboundEpoch(t *testing.T) {
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2}, SrcPort: 1234, DstPort: 80, Protocol: 6}: {
+				IngressZone: 1,
+			},
+		},
+	}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return true }
+	localConn, peerConn := net.Pipe()
+	defer localConn.Close()
+	defer peerConn.Close()
+	ss.conn0 = localConn
+	ss.stats.Connected.Store(true)
+
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 8192)
+		for {
+			if _, err := peerConn.Read(buf); err != nil {
+				if err == io.EOF || strings.Contains(err.Error(), "closed pipe") {
+					readDone <- nil
+					return
+				}
+				readDone <- err
+				return
+			}
+		}
+	}()
+
+	if err := ss.BulkSync(); err != nil {
+		t.Fatalf("BulkSync() error = %v", err)
+	}
+	epoch, age, ok := ss.PendingBulkAck()
+	if !ok {
+		t.Fatal("expected pending bulk ack after BulkSync")
+	}
+	if epoch != 1 {
+		t.Fatalf("pending bulk epoch = %d, want 1", epoch)
+	}
+	if age < 0 {
+		t.Fatalf("pending bulk age = %v, want >= 0", age)
+	}
+	ss.handleMessage(nil, syncMsgBulkAck, func() []byte {
+		var payload [8]byte
+		binary.LittleEndian.PutUint64(payload[:], epoch)
+		return payload[:]
+	}())
+	if _, _, ok := ss.PendingBulkAck(); ok {
+		t.Fatal("expected pending bulk ack to clear after matching ack")
+	}
+	peerConn.Close()
+	if err := <-readDone; err != nil {
+		t.Fatalf("peer drain failed: %v", err)
+	}
+}
+
+func TestPendingBulkAckClearedOnDisconnect(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	localConn, peerConn := net.Pipe()
+	defer peerConn.Close()
+	ss.conn0 = localConn
+	ss.stats.Connected.Store(true)
+	ss.pendingBulkAckEpoch.Store(7)
+	ss.pendingBulkAckSince.Store(time.Now().UnixNano())
+
+	ss.handleDisconnect(localConn)
+
+	if _, _, ok := ss.PendingBulkAck(); ok {
+		t.Fatal("expected pending bulk ack to clear on disconnect")
 	}
 }
 

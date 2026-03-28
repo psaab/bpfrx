@@ -201,6 +201,10 @@ type SessionSync struct {
 	// callers (e.g. acceptLoop and connectLoop) cannot interleave.
 	bulkSendMu   sync.Mutex
 	bulkSendNext atomic.Uint64 // monotonic epoch counter for outgoing bulk syncs
+	// pendingBulkAckEpoch tracks the latest outbound bulk epoch that has been
+	// fully written but not yet acknowledged by the peer.
+	pendingBulkAckEpoch atomic.Uint64
+	pendingBulkAckSince atomic.Int64 // UnixNano
 
 	// Bulk receive tracking for stale-entry reconciliation.
 	// During bulk receive (BulkStart..BulkEnd), track all received
@@ -997,6 +1001,8 @@ func (s *SessionSync) BulkSync() error {
 	err := writeMsg(conn, syncMsgBulkStart, epochBuf[:])
 	s.writeMu.Unlock()
 	if err != nil {
+		s.pendingBulkAckEpoch.Store(0)
+		s.pendingBulkAckSince.Store(0)
 		s.handleDisconnect(conn)
 		return err
 	}
@@ -1025,6 +1031,8 @@ func (s *SessionSync) BulkSync() error {
 		return true
 	})
 	if err != nil {
+		s.pendingBulkAckEpoch.Store(0)
+		s.pendingBulkAckSince.Store(0)
 		return fmt.Errorf("bulk sync v4 iterate: %w", err)
 	}
 	slog.Info("cluster sync: bulk sync iterated v4",
@@ -1055,6 +1063,8 @@ func (s *SessionSync) BulkSync() error {
 		return true
 	})
 	if err != nil {
+		s.pendingBulkAckEpoch.Store(0)
+		s.pendingBulkAckSince.Store(0)
 		return fmt.Errorf("bulk sync v6 iterate: %w", err)
 	}
 	slog.Info("cluster sync: bulk sync iterated v6",
@@ -1068,13 +1078,35 @@ func (s *SessionSync) BulkSync() error {
 	err = writeMsg(conn, syncMsgBulkEnd, epochBuf[:])
 	s.writeMu.Unlock()
 	if err != nil {
+		s.pendingBulkAckEpoch.Store(0)
+		s.pendingBulkAckSince.Store(0)
 		s.handleDisconnect(conn)
 		return err
 	}
+	s.pendingBulkAckEpoch.Store(epoch)
+	s.pendingBulkAckSince.Store(time.Now().UnixNano())
 
 	s.stats.BulkSyncs.Add(1)
 	slog.Info("cluster sync: bulk sync complete", "sessions", count, "skipped", skipped, "epoch", epoch)
 	return nil
+}
+
+// PendingBulkAck reports the latest outbound bulk epoch that is still awaiting
+// peer acknowledgement, if any.
+func (s *SessionSync) PendingBulkAck() (epoch uint64, age time.Duration, ok bool) {
+	epoch = s.pendingBulkAckEpoch.Load()
+	if epoch == 0 {
+		return 0, 0, false
+	}
+	since := s.pendingBulkAckSince.Load()
+	if since == 0 {
+		return epoch, 0, true
+	}
+	age = time.Since(time.Unix(0, since))
+	if age < 0 {
+		age = 0
+	}
+	return epoch, age, true
 }
 
 // sendClockSync sends our monotonic clock to the peer so it can compute
@@ -1551,6 +1583,10 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			"sessions_installed", stats.SessionsInstalled,
 			"queue_len", len(s.sendCh),
 			"queue_cap", cap(s.sendCh))
+		if pending := s.pendingBulkAckEpoch.Load(); pending != 0 && epoch >= pending {
+			s.pendingBulkAckEpoch.Store(0)
+			s.pendingBulkAckSince.Store(0)
+		}
 		if s.OnBulkSyncAckReceived != nil {
 			go s.OnBulkSyncAckReceived()
 		}
@@ -2084,6 +2120,8 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		s.barrierWaiters = nil
 		s.barrierWaitMu.Unlock()
 		s.clockSynced.Store(false)
+		s.pendingBulkAckEpoch.Store(0)
+		s.pendingBulkAckSince.Store(0)
 		slog.Info("cluster sync: peer disconnected (all fabrics down)")
 		if pendingBarriers != 0 || ackedBarriers != 0 || clearedWaiters != 0 {
 			slog.Info("cluster sync: reset barrier state after disconnect",

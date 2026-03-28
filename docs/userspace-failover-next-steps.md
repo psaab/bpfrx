@@ -56,57 +56,63 @@ This is the right safety model:
 
 ## What is still broken
 
-The next blocker is now narrower and more concrete than before:
+The original one-directional bulk-completion bug is no longer the blocker.
 
-- manual failover is correctly failing closed because current-generation peer bulk priming is incomplete
-- there is still asymmetric bulk-sync completion across the two peers on the current connection generation
+What is still broken now:
+
+- manual failover is correctly failing closed because the demotion barrier does not clear inside the quiescence window
+- the barrier is not being lost
+- it is being delayed behind previously-sent retry bulk traffic on the same stream
 
 That means the remaining problem is no longer just "manual failover is flaky." It is:
 
-- `node1 -> node0` bulk completion is observed
-- `node0 -> node1` bulk completion is still not being observed reliably enough to admit failover
-- so the demoting node never gets a valid current-generation sync baseline and correctly refuses to proceed
+- current-generation bulk completion is now observed in both directions
+- but the retry loop can still send epoch `2` and `3` before epoch `1` is acked
+- those extra bulks inflate stream backlog
+- the demotion barrier then arrives far too late to satisfy the manual-failover admission timeout
 
-This is progress, not regression. The old path blackholed traffic. The current path blocks the unsafe move.
+This is still progress. The unsafe move is blocked for the right reason, but the
+transport is too backlogged to admit the move in time.
 
 ## Latest evidence
 
 Manual failover now fails with:
 
-- `pre-failover prepare for redundancy group 1: session sync not ready before demotion: peer bulk sync incomplete`
+- `pre-failover prepare for redundancy group 1: session sync peer not quiescent before demotion: timed out waiting for session sync barrier ack ...`
 
 Artifacts:
 
-- `/tmp/failover-debug/manual-rg1-20260327-133956`
-- `/tmp/failover-debug/manual-rg1-20260327-134724`
-- `/tmp/failover-debug/manual-rg1-20260327-135300`
+- `/tmp/failover-debug/manual-rg1-node0-to-node1-20260327-212324`
+- `/tmp/failover-debug/manual-rg1-node0-to-node1-20260327-212719`
+- `/tmp/failover-debug/manual-rg1-node0-to-node1-20260327-212958`
+- `/tmp/manual-rg1-deep-20260327-213949`
 
 Important logs on `fw0`:
 
-- `cluster: waiting to admit manual failover ... err="session sync not ready before demotion: peer bulk sync incomplete"`
-- `cluster sync: bulk ack sent epoch=2`
-- `cluster: session sync bulk received`
-- no corresponding:
-  - `cluster: session sync bulk ack received`
+- `cluster: session sync bulk ack received`
+- `cluster sync: barrier sent seq=...`
+- retry bulk epochs `2` and `3` were already written before the first ack arrived
 
 Important logs on `fw1`:
 
-- later prime retries occur
-- but the expected receive-side completion for `node0`'s current-generation bulk is still missing in the failing repro window
+- `cluster sync: bulk ack sent epoch=...`
+- later:
+  - `cluster sync: barrier received seq=...`
+  - `cluster sync: barrier ack sent seq=...`
+- but the barrier receive time is tens of seconds after send time
 
 What this proves:
 
-- `node1 -> node0` is good enough for `fw0` to send a bulk ack
-- the sender-side ack path itself is alive
-- the remaining missing edge is `node0 -> node1` completion on the current connection
-- the originator is now observing the right signal and refusing to proceed because it is absent
+- current-generation sender-side bulk priming is now real
+- barrier delivery works
+- barrier acknowledgement works
+- the remaining issue is transport latency caused by extra retry bulks already in front of the barrier
 
-So the next bug is one of:
+Newest result:
 
-- the accepting peer is not reliably starting its own sender-side `BulkSync()` in the `node0 -> node1` direction
-- or it starts it and stalls before completion
-- or `node1` receives the bulk but never reaches `BulkEnd`
-- or `node1` sends the ack but `node0` never observes it on the current connection generation
+- with one-outstanding-bulk retry suppression in place, manual failover is admitted
+- the same long-lived `iperf3` flow still collapses after the ownership move
+- so the next bug is post-admission dataplane continuity, not session-sync priming
 
 ## Current working hypothesis
 
@@ -115,73 +121,36 @@ There are now two separate failover gates:
 1. admission safety
 2. post-admission dataplane continuity
 
-The current branch is still blocked on gate `1` for manual failover.
+The current branch is still blocked on gate `1` for manual failover, but for a
+different reason now.
 
-The likely failure points are in the reverse-direction session-sync prime path:
+The likely failure point is the outbound retry policy:
 
-- `SessionSync.handleNewConnection()`
-- the accept-side decision to invoke `BulkSync()`
-- `BulkSync()` itself on the accepting peer
-- `IterateSessions` / `IterateSessionsV6` on the secondary while generating the bulk transfer
-- the `BulkEnd -> BulkAck -> syncPeerBulkPrimed=true` observation path on the current connection generation
+- `BulkSync()` on reconnect sends epoch `1`
+- the retry loop later sends epoch `2` and `3` before epoch `1` is acked
+- those extra bulks are valid, but they occupy the same ordered stream
+- demotion barriers are injected behind stale bulk replay traffic
 
-Until that is fixed, further dataplane work is premature because manual failover is still being blocked before the handoff runs.
+Until that is fixed, further dataplane work is still premature because manual
+failover is being blocked before the handoff runs.
 
 ## Next code steps
 
-### 1. Focus on the `node0 -> node1` bulk-completion direction
+### 1. Keep only one outbound bulk outstanding at a time
 
-The general sync instrumentation is already in place. The next debugging pass
-should narrow to the one direction that is still missing.
+The retry loop must not send epoch `2` or `3` while epoch `1` is still waiting
+for peer acknowledgement.
 
-Goal:
+Concrete change:
 
-- prove exactly where `node0 -> node1` stops on the current connection generation
-
-### 2. Instrument accept-side sender `BulkSync()` on `node1`
-
-Keep and extend the sender-side logs in `pkg/cluster/sync.go` so the
-accepting peer proves all of these edges:
-
-- `handleNewConnection()` schedules `BulkSync()`
-- `BulkSync()` starts
-- IPv4 iteration starts and completes
-- IPv6 iteration starts and completes
-- `BulkEnd` is written
-- `BulkAck` is sent back
+- track the latest outbound bulk epoch awaiting `BulkAck`
+- defer retry while that ack is still pending inside a grace window
 
 Goal:
 
-- prove whether `node1` is starting `BulkSync()` for `node0`'s current-generation connection
-- if it does, prove exactly where it stops
+- prevent later bulk replay traffic from sitting in front of the demotion barrier
 
-### 3. If `BulkSync()` starts but does not complete, instrument session iteration
-
-If the sender-side logs show entry into `BulkSync()` but no completion, instrument:
-
-- `dp.IterateSessions`
-- `dp.IterateSessionsV6`
-
-Goal:
-
-- determine whether the stall is in session enumeration, v4/v6 split, or bulk-end write/flush
-
-### 4. If `BulkEnd` is written but no ack arrives, instrument the receive edge
-
-If `node1` proves it wrote `BulkEnd` for `node0`'s bulk:
-
-- instrument `syncMsgBulkEnd` handling on `node1`
-- instrument `sendBulkAck(...)`
-- instrument `syncMsgBulkAck` receive on `node0`
-
-Goal:
-
-- distinguish:
-  - no `BulkEnd`
-  - no `BulkAck`
-  - ack sent but not observed on the originator
-
-### 5. Keep the stricter admission gate
+### 2. Keep the stricter admission gate
 
 Do not relax the new manual-failover safety check.
 
@@ -190,9 +159,12 @@ The current behavior is correct:
 - a manual failover without current-generation peer bulk priming is unsafe
 - the correct response is to block the move, not to revert to the old blackhole behavior
 
-### 6. Only return to dataplane handoff work after bidirectional priming is real
+### 3. Only return to dataplane handoff work after retry suppression is in place
 
-Once manual failover is admitted with true current-generation bulk priming:
+Once manual failover is admitted with:
+
+- current-generation peer bulk ack observed
+- no extra retry bulk epochs queued ahead of the barrier
 
 - rerun the exact manual `RG1 node0 -> node1` `iperf3` repro
 - compare it against:
@@ -207,13 +179,10 @@ Then decide whether the next remaining bug is:
 
 ## Recommended implementation order
 
-1. Prove the missing `node0 -> node1` edge on the current connection generation.
-2. Extend accept-side sender `BulkSync()` instrumentation on `node1`.
-3. If needed, instrument `IterateSessions` / `IterateSessionsV6`.
-4. If `BulkEnd` is reached, instrument `BulkAck` send/receive precisely.
-5. Fix current-generation reverse-direction bulk priming.
-6. Re-run manual `RG1` failover under load.
-7. Only then continue the dataplane continuity work.
+1. Keep one outbound bulk outstanding at a time.
+2. Re-run manual `RG1` failover under load.
+3. Confirm that demotion barriers are now acknowledged inside the quiescence window.
+4. Only then continue the dataplane continuity work.
 
 ## Acceptance criteria
 
@@ -221,8 +190,9 @@ Before continuing dataplane handoff work, manual failover admission should satis
 
 - no `peer bulk sync incomplete` admission failure once the peer connection is settled
 - `syncPeerBulkPrimed=true` on the demoting node for the current connection generation
-- both peers log sender-side bulk sync start and completion on the current connection
 - the originator logs `cluster: session sync bulk ack received` for the current connection generation
+- no extra retry bulk epochs are sent while the previous epoch is still awaiting ack
+- demotion barriers are acknowledged within the manual-failover quiescence window
 
 After that, the dataplane continuity goal remains:
 
@@ -233,7 +203,7 @@ After that, the dataplane continuity goal remains:
 
 ## What not to do next
 
-Do not spend the next cycle on these before fixing bidirectional bulk priming:
+Do not spend the next cycle on these before fixing retry-induced stream backlog:
 
 - more re-announcement tuning
 - more barrier retry logic

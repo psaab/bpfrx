@@ -347,14 +347,15 @@ Updated status:
 What is still broken:
 
 - the sender-side admission model is now correct
-- but current-generation `node0 -> node1` bulk completion is still not being
-  observed reliably enough to set `syncPeerBulkPrimed=true` before manual
-  failover admission times out
+- current-generation `node0 -> node1` bulk completion is now observed
+- but the retry loop can still send later bulk epochs before the first one is
+  acknowledged
 
 So the remaining bug is no longer "reconnect readiness is too coarse." It is:
 
-- the current connection generation still has one-directional bulk completion
-  failure or observation failure
+- later retry bulks occupy the same ordered stream as demotion barriers
+- the peer eventually receives and acknowledges the barriers
+- but not within the manual-failover quiescence window
 
 ### Root cause D: stale-owner fabric-redirect sessions are filtered out of userspace session sync
 
@@ -493,32 +494,35 @@ Expected result:
 - rebooted node returns without tearing down dataplane state a second time
 - cluster sync/heartbeat remains stable when the node rejoins
 
-### Phase 4: make current-generation sender-side priming reliable
+### Phase 4: keep current-generation sender-side priming from backlogging the stream
 
 1. Keep the split readiness model:
    - election/readiness may use timeout-backed inbound sync state
    - manual demotion must use sender-side peer acknowledgement
-2. Instrument the accept-side `BulkSync()` path on the peer until the exact
-   missing edge is proven:
-   - scheduling
-   - v4 iteration
-   - v6 iteration
-   - `BulkEnd`
-   - `BulkAck`
-3. If `BulkSync()` starts but does not complete, instrument
-   `IterateSessions` / `IterateSessionsV6`.
-4. If `BulkEnd` is written but no ack arrives, instrument:
-   - `syncMsgBulkEnd` handling
-   - `sendBulkAck(...)`
-   - `syncMsgBulkAck` receive on the originator
+2. Allow only one outbound bulk epoch to be outstanding at a time.
+3. Defer retry while the previous bulk is still awaiting `BulkAck` inside a
+   grace window.
+4. Keep the existing instrumentation so future regressions can still prove:
+   - bulk start
+   - bulk end
+   - bulk ack send
+   - bulk ack receive
 
 Expected result:
 
 - the demoting node observes `syncPeerBulkPrimed=true` on the current
   connection generation
-- manual failover admission stops failing with:
-  - `peer bulk sync incomplete`
+- demotion barriers are not queued behind stale retry bulks
+- manual failover admission stops failing with barrier/quiescence timeout
 - only after that should the work return to post-admission dataplane continuity
+
+Current status:
+
+- the one-outstanding-bulk change achieved this control-plane goal in the
+  latest manual repro
+- manual `RG1 node0 -> node1` failover was admitted
+- the inherited `iperf3` flow still collapsed afterward
+- the next blocker is therefore post-admission dataplane continuity
 
 ### Phase 5: harden validation
 

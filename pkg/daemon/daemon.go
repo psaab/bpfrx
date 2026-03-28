@@ -361,6 +361,7 @@ func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 	}
 	go func() {
 		intervals := []time.Duration{10 * time.Second, 20 * time.Second, 40 * time.Second}
+		const retryWhileAckPendingAfter = 35 * time.Second
 		maxAttempts := len(intervals)
 		baseline := ss.Stats()
 		slog.Info("cluster: starting session sync bulk-prime retry loop",
@@ -395,6 +396,16 @@ func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 					"attempt", attempt,
 					"reason", reason)
 				return
+			}
+			if pendingEpoch, pendingAge, ok := ss.PendingBulkAck(); ok && pendingAge < retryWhileAckPendingAfter {
+				slog.Info("cluster: deferring session sync bulk-prime retry",
+					"retry_gen", gen,
+					"attempt", attempt,
+					"reason", "outbound bulk still awaiting ack",
+					"pending_epoch", pendingEpoch,
+					"pending_age", pendingAge.Round(10*time.Millisecond),
+					"retry_after", retryWhileAckPendingAfter)
+				continue
 			}
 			current := ss.Stats()
 			if syncPrimeProgressObserved(current, baseline) {
