@@ -473,6 +473,11 @@ type BindingStatus struct {
 	DNATPackets                       uint64    `json:"dnat_packets,omitempty"`
 	SlowPathPackets                   uint64    `json:"slow_path_packets,omitempty"`
 	SlowPathBytes                     uint64    `json:"slow_path_bytes,omitempty"`
+	SlowPathLocalDeliveryPackets      uint64    `json:"slow_path_local_delivery_packets,omitempty"`
+	SlowPathMissingNeighborPackets    uint64    `json:"slow_path_missing_neighbor_packets,omitempty"`
+	SlowPathNoRoutePackets            uint64    `json:"slow_path_no_route_packets,omitempty"`
+	SlowPathNextTablePackets          uint64    `json:"slow_path_next_table_packets,omitempty"`
+	SlowPathForwardBuildPackets       uint64    `json:"slow_path_forward_build_packets,omitempty"`
 	SlowPathDrops                     uint64    `json:"slow_path_drops,omitempty"`
 	SlowPathRateLimited               uint64    `json:"slow_path_rate_limited,omitempty"`
 	KernelRXDropped                   uint64    `json:"kernel_rx_dropped,omitempty"`

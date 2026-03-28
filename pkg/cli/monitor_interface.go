@@ -82,6 +82,11 @@ type userspaceIfaceSnapshot struct {
 	policyDeniedPackets               uint64
 	exceptionPackets                  uint64
 	slowPathPackets                   uint64
+	slowPathLocalDeliveryPackets      uint64
+	slowPathMissingNeighborPackets    uint64
+	slowPathNoRoutePackets            uint64
+	slowPathNextTablePackets          uint64
+	slowPathForwardBuildPackets       uint64
 	lastErrors                        []string
 	recentExceptions                  []string
 }
@@ -137,6 +142,11 @@ func aggregateUserspaceIfaceSnapshot(kernelName string, status dpuserspace.Proce
 		snap.policyDeniedPackets += binding.PolicyDeniedPackets
 		snap.exceptionPackets += binding.ExceptionPackets
 		snap.slowPathPackets += binding.SlowPathPackets
+		snap.slowPathLocalDeliveryPackets += binding.SlowPathLocalDeliveryPackets
+		snap.slowPathMissingNeighborPackets += binding.SlowPathMissingNeighborPackets
+		snap.slowPathNoRoutePackets += binding.SlowPathNoRoutePackets
+		snap.slowPathNextTablePackets += binding.SlowPathNextTablePackets
+		snap.slowPathForwardBuildPackets += binding.SlowPathForwardBuildPackets
 		if binding.LastError != "" {
 			errorSet[binding.LastError] = struct{}{}
 		}
@@ -503,6 +513,9 @@ func renderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 			usOutstandingTXDelta, usInFlightRecycleDelta                       uint64
 			usSessionMissDelta, usNeighborMissDelta, usRouteMissDelta         uint64
 			usPolicyDeniedDelta, usExceptionDelta, usSlowPathDelta            uint64
+			usSlowPathLocalDelta, usSlowPathMissingNeighborDelta              uint64
+			usSlowPathNoRouteDelta, usSlowPathNextTableDelta                  uint64
+			usSlowPathForwardBuildDelta                                        uint64
 		)
 		if prev != nil && prev.userspace != nil {
 			dt := snap.ts.Sub(prev.ts).Seconds()
@@ -540,6 +553,11 @@ func renderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 			usPolicyDeniedDelta = snap.userspace.policyDeniedPackets - baseline.userspace.policyDeniedPackets
 			usExceptionDelta = snap.userspace.exceptionPackets - baseline.userspace.exceptionPackets
 			usSlowPathDelta = snap.userspace.slowPathPackets - baseline.userspace.slowPathPackets
+			usSlowPathLocalDelta = snap.userspace.slowPathLocalDeliveryPackets - baseline.userspace.slowPathLocalDeliveryPackets
+			usSlowPathMissingNeighborDelta = snap.userspace.slowPathMissingNeighborPackets - baseline.userspace.slowPathMissingNeighborPackets
+			usSlowPathNoRouteDelta = snap.userspace.slowPathNoRoutePackets - baseline.userspace.slowPathNoRoutePackets
+			usSlowPathNextTableDelta = snap.userspace.slowPathNextTablePackets - baseline.userspace.slowPathNextTablePackets
+			usSlowPathForwardBuildDelta = snap.userspace.slowPathForwardBuildPackets - baseline.userspace.slowPathForwardBuildPackets
 		}
 
 		fmt.Fprintf(w, "Userspace dataplane:\n")
@@ -576,6 +594,11 @@ func renderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 		fmt.Fprintf(w, "  Policy denied:        %20d          [%d]\n", snap.userspace.policyDeniedPackets, usPolicyDeniedDelta)
 		fmt.Fprintf(w, "  Exception packets:    %20d          [%d]\n", snap.userspace.exceptionPackets, usExceptionDelta)
 		fmt.Fprintf(w, "  Slow path packets:    %20d          [%d]\n", snap.userspace.slowPathPackets, usSlowPathDelta)
+		fmt.Fprintf(w, "  Slow path local:      %20d          [%d]\n", snap.userspace.slowPathLocalDeliveryPackets, usSlowPathLocalDelta)
+		fmt.Fprintf(w, "  Slow path neigh:      %20d          [%d]\n", snap.userspace.slowPathMissingNeighborPackets, usSlowPathMissingNeighborDelta)
+		fmt.Fprintf(w, "  Slow path no-route:   %20d          [%d]\n", snap.userspace.slowPathNoRoutePackets, usSlowPathNoRouteDelta)
+		fmt.Fprintf(w, "  Slow path next-table: %20d          [%d]\n", snap.userspace.slowPathNextTablePackets, usSlowPathNextTableDelta)
+		fmt.Fprintf(w, "  Slow path fwd-build:  %20d          [%d]\n", snap.userspace.slowPathForwardBuildPackets, usSlowPathForwardBuildDelta)
 		if len(snap.userspace.lastErrors) > 0 {
 			fmt.Fprintf(w, "  Binding errors:\n")
 			for _, msg := range snap.userspace.lastErrors {

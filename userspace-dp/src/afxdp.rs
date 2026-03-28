@@ -854,6 +854,11 @@ impl Coordinator {
             binding.dnat_packets = 0;
             binding.slow_path_packets = 0;
             binding.slow_path_bytes = 0;
+            binding.slow_path_local_delivery_packets = 0;
+            binding.slow_path_missing_neighbor_packets = 0;
+            binding.slow_path_no_route_packets = 0;
+            binding.slow_path_next_table_packets = 0;
+            binding.slow_path_forward_build_packets = 0;
             binding.slow_path_drops = 0;
             binding.slow_path_rate_limited = 0;
             binding.kernel_rx_dropped = 0;
@@ -1830,6 +1835,12 @@ impl Coordinator {
                 binding.dnat_packets = snap.dnat_packets;
                 binding.slow_path_packets = snap.slow_path_packets;
                 binding.slow_path_bytes = snap.slow_path_bytes;
+                binding.slow_path_local_delivery_packets = snap.slow_path_local_delivery_packets;
+                binding.slow_path_missing_neighbor_packets =
+                    snap.slow_path_missing_neighbor_packets;
+                binding.slow_path_no_route_packets = snap.slow_path_no_route_packets;
+                binding.slow_path_next_table_packets = snap.slow_path_next_table_packets;
+                binding.slow_path_forward_build_packets = snap.slow_path_forward_build_packets;
                 binding.slow_path_drops = snap.slow_path_drops;
                 binding.slow_path_rate_limited = snap.slow_path_rate_limited;
                 binding.kernel_rx_dropped = snap.kernel_rx_dropped;
@@ -1902,6 +1913,11 @@ impl Coordinator {
                 binding.dnat_packets = 0;
                 binding.slow_path_packets = 0;
                 binding.slow_path_bytes = 0;
+                binding.slow_path_local_delivery_packets = 0;
+                binding.slow_path_missing_neighbor_packets = 0;
+                binding.slow_path_no_route_packets = 0;
+                binding.slow_path_next_table_packets = 0;
+                binding.slow_path_forward_build_packets = 0;
                 binding.slow_path_drops = 0;
                 binding.slow_path_rate_limited = 0;
                 binding.kernel_rx_dropped = 0;
@@ -10705,6 +10721,11 @@ struct BindingLiveState {
     dnat_packets: AtomicU64,
     slow_path_packets: AtomicU64,
     slow_path_bytes: AtomicU64,
+    slow_path_local_delivery_packets: AtomicU64,
+    slow_path_missing_neighbor_packets: AtomicU64,
+    slow_path_no_route_packets: AtomicU64,
+    slow_path_next_table_packets: AtomicU64,
+    slow_path_forward_build_packets: AtomicU64,
     slow_path_drops: AtomicU64,
     slow_path_rate_limited: AtomicU64,
     kernel_rx_dropped: AtomicU64,
@@ -10778,6 +10799,11 @@ impl BindingLiveState {
             dnat_packets: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
             slow_path_bytes: AtomicU64::new(0),
+            slow_path_local_delivery_packets: AtomicU64::new(0),
+            slow_path_missing_neighbor_packets: AtomicU64::new(0),
+            slow_path_no_route_packets: AtomicU64::new(0),
+            slow_path_next_table_packets: AtomicU64::new(0),
+            slow_path_forward_build_packets: AtomicU64::new(0),
             slow_path_drops: AtomicU64::new(0),
             slow_path_rate_limited: AtomicU64::new(0),
             kernel_rx_dropped: AtomicU64::new(0),
@@ -10848,6 +10874,40 @@ impl BindingLiveState {
         }
     }
 
+    fn record_slow_path_accept(
+        &self,
+        disposition: ForwardingDisposition,
+        reason: &str,
+        packet_len: u64,
+    ) {
+        self.slow_path_packets.fetch_add(1, Ordering::Relaxed);
+        self.slow_path_bytes.fetch_add(packet_len, Ordering::Relaxed);
+        if reason == "forward_build_slow_path" {
+            self.slow_path_forward_build_packets
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        match disposition {
+            ForwardingDisposition::LocalDelivery => {
+                self.slow_path_local_delivery_packets
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ForwardingDisposition::MissingNeighbor => {
+                self.slow_path_missing_neighbor_packets
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ForwardingDisposition::NoRoute => {
+                self.slow_path_no_route_packets
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ForwardingDisposition::NextTableUnsupported => {
+                self.slow_path_next_table_packets
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
     fn snapshot(&self) -> BindingLiveSnapshot {
         let now_wall = Utc::now();
         let now_mono = monotonic_nanos();
@@ -10902,6 +10962,19 @@ impl BindingLiveState {
             dnat_packets: self.dnat_packets.load(Ordering::Relaxed),
             slow_path_packets: self.slow_path_packets.load(Ordering::Relaxed),
             slow_path_bytes: self.slow_path_bytes.load(Ordering::Relaxed),
+            slow_path_local_delivery_packets: self
+                .slow_path_local_delivery_packets
+                .load(Ordering::Relaxed),
+            slow_path_missing_neighbor_packets: self
+                .slow_path_missing_neighbor_packets
+                .load(Ordering::Relaxed),
+            slow_path_no_route_packets: self.slow_path_no_route_packets.load(Ordering::Relaxed),
+            slow_path_next_table_packets: self
+                .slow_path_next_table_packets
+                .load(Ordering::Relaxed),
+            slow_path_forward_build_packets: self
+                .slow_path_forward_build_packets
+                .load(Ordering::Relaxed),
             slow_path_drops: self.slow_path_drops.load(Ordering::Relaxed),
             slow_path_rate_limited: self.slow_path_rate_limited.load(Ordering::Relaxed),
             kernel_rx_dropped: self.kernel_rx_dropped.load(Ordering::Relaxed),
@@ -11164,6 +11237,11 @@ struct BindingLiveSnapshot {
     dnat_packets: u64,
     slow_path_packets: u64,
     slow_path_bytes: u64,
+    slow_path_local_delivery_packets: u64,
+    slow_path_missing_neighbor_packets: u64,
+    slow_path_no_route_packets: u64,
+    slow_path_next_table_packets: u64,
+    slow_path_forward_build_packets: u64,
     slow_path_drops: u64,
     slow_path_rate_limited: u64,
     kernel_rx_dropped: u64,
@@ -19712,5 +19790,25 @@ mod tests {
             .map(|entry| entry.reason.clone())
             .collect();
         assert_eq!(reasons, vec!["forward_build_failed"]);
+    }
+
+    #[test]
+    fn slow_path_accept_is_categorized_by_reason_and_disposition() {
+        let live = BindingLiveState::new();
+
+        live.record_slow_path_accept(ForwardingDisposition::MissingNeighbor, "slow_path", 128);
+        live.record_slow_path_accept(ForwardingDisposition::NoRoute, "forward_build_slow_path", 64);
+
+        assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 2);
+        assert_eq!(live.slow_path_bytes.load(Ordering::Relaxed), 192);
+        assert_eq!(
+            live.slow_path_missing_neighbor_packets.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(live.slow_path_no_route_packets.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            live.slow_path_forward_build_packets.load(Ordering::Relaxed),
+            1
+        );
     }
 }

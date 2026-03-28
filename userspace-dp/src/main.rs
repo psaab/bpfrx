@@ -870,6 +870,16 @@ struct BindingStatus {
     slow_path_packets: u64,
     #[serde(rename = "slow_path_bytes", default)]
     slow_path_bytes: u64,
+    #[serde(rename = "slow_path_local_delivery_packets", default)]
+    slow_path_local_delivery_packets: u64,
+    #[serde(rename = "slow_path_missing_neighbor_packets", default)]
+    slow_path_missing_neighbor_packets: u64,
+    #[serde(rename = "slow_path_no_route_packets", default)]
+    slow_path_no_route_packets: u64,
+    #[serde(rename = "slow_path_next_table_packets", default)]
+    slow_path_next_table_packets: u64,
+    #[serde(rename = "slow_path_forward_build_packets", default)]
+    slow_path_forward_build_packets: u64,
     #[serde(rename = "slow_path_drops", default)]
     slow_path_drops: u64,
     #[serde(rename = "slow_path_rate_limited", default)]

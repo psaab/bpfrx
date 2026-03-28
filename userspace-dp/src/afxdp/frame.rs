@@ -914,9 +914,7 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
     if let Some(delivery) = tunnel_delivery {
         match delivery.try_send(packet) {
             Ok(()) => {
-                live.slow_path_packets.fetch_add(1, Ordering::Relaxed);
-                live.slow_path_bytes
-                    .fetch_add(packet_len, Ordering::Relaxed);
+                live.record_slow_path_accept(decision.resolution.disposition, reason, packet_len);
             }
             Err(std::sync::mpsc::TrySendError::Full(_)) => {
                 live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
@@ -958,9 +956,7 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
     };
     match slow_path.enqueue(packet) {
         Ok(EnqueueOutcome::Accepted) => {
-            live.slow_path_packets.fetch_add(1, Ordering::Relaxed);
-            live.slow_path_bytes
-                .fetch_add(packet_len, Ordering::Relaxed);
+            live.record_slow_path_accept(decision.resolution.disposition, reason, packet_len);
         }
         Ok(EnqueueOutcome::RateLimited) => {
             live.slow_path_drops.fetch_add(1, Ordering::Relaxed);

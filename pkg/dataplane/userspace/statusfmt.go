@@ -64,6 +64,11 @@ func FormatStatusSummary(status ProcessStatus) string {
 	var debugOutstandingTX uint64
 	var debugInFlightRecycles uint64
 	var slowPathPackets uint64
+	var slowPathLocalDeliveryPackets uint64
+	var slowPathMissingNeighborPackets uint64
+	var slowPathNoRoutePackets uint64
+	var slowPathNextTablePackets uint64
+	var slowPathForwardBuildPackets uint64
 	var slowPathDrops uint64
 	for _, binding := range status.Bindings {
 		if binding.Ready {
@@ -121,6 +126,11 @@ func FormatStatusSummary(status ProcessStatus) string {
 		debugOutstandingTX += uint64(binding.DebugOutstandingTX)
 		debugInFlightRecycles += uint64(binding.DebugInFlightRecycles)
 		slowPathPackets += binding.SlowPathPackets
+		slowPathLocalDeliveryPackets += binding.SlowPathLocalDeliveryPackets
+		slowPathMissingNeighborPackets += binding.SlowPathMissingNeighborPackets
+		slowPathNoRoutePackets += binding.SlowPathNoRoutePackets
+		slowPathNextTablePackets += binding.SlowPathNextTablePackets
+		slowPathForwardBuildPackets += binding.SlowPathForwardBuildPackets
 		slowPathDrops += binding.SlowPathDrops
 	}
 
@@ -248,6 +258,11 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  Pending TX local:          %d\n", debugPendingTXLocal)
 	fmt.Fprintf(&b, "  Outstanding TX:            %d\n", debugOutstandingTX)
 	fmt.Fprintf(&b, "  In-flight recycles:        %d\n", debugInFlightRecycles)
+	fmt.Fprintf(&b, "  Slow path local-delivery:  %d\n", slowPathLocalDeliveryPackets)
+	fmt.Fprintf(&b, "  Slow path missing-neigh:   %d\n", slowPathMissingNeighborPackets)
+	fmt.Fprintf(&b, "  Slow path no-route:        %d\n", slowPathNoRoutePackets)
+	fmt.Fprintf(&b, "  Slow path next-table:      %d\n", slowPathNextTablePackets)
+	fmt.Fprintf(&b, "  Slow path forward-build:   %d\n", slowPathForwardBuildPackets)
 	fmt.Fprintf(&b, "  Slow path active:          %t\n", status.SlowPath.Active)
 	if status.SlowPath.DeviceName != "" {
 		fmt.Fprintf(&b, "  Slow path device:          %s\n", status.SlowPath.DeviceName)
