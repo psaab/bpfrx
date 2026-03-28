@@ -552,11 +552,21 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
             dst_ip: key.dst_ip,
             forward_key: key.clone(),
         };
+        let resolution_target = resolution_target_for_session(&flow, decision);
         let looked_up = lookup_forwarding_resolution_for_session(
             forwarding,
             dynamic_neighbors,
             &flow,
             decision,
+        );
+        let looked_up = super::prefer_local_forward_candidate_for_fabric_ingress(
+            forwarding,
+            ha_state,
+            dynamic_neighbors,
+            now_secs,
+            metadata.fabric_ingress,
+            resolution_target,
+            looked_up,
         );
         let refreshed_resolution =
             enforce_session_ha_resolution(forwarding, ha_state, now_secs, looked_up, 0, 0);
@@ -1179,8 +1189,18 @@ pub(super) fn resolve_flow_session_decision(
         let resolved = materialize_shared_session_hit(sessions, &mut hit, now_ns, tcp_flags);
         let resolved_key = hit.key.as_ref(&flow.forward_key);
         let mut decision = resolved.decision;
+        let resolution_target = resolution_target_for_session(flow, decision);
         let looked_up_resolution =
             lookup_forwarding_resolution_for_session(forwarding, dynamic_neighbors, flow, decision);
+        let looked_up_resolution = super::prefer_local_forward_candidate_for_fabric_ingress(
+            forwarding,
+            ha_state,
+            dynamic_neighbors,
+            now_secs,
+            ingress_is_fabric(forwarding, ingress_ifindex),
+            resolution_target,
+            looked_up_resolution,
+        );
         let enforced_resolution = enforce_session_ha_resolution(
             forwarding,
             ha_state,
@@ -1240,13 +1260,25 @@ pub(super) fn resolve_flow_session_decision(
     );
 
     let mut decision = resolved.decision;
+    let resolution_target = resolution_target_for_session(flow, decision);
+    let looked_up_resolution =
+        lookup_forwarding_resolution_for_session(forwarding, dynamic_neighbors, flow, decision);
+    let looked_up_resolution = super::prefer_local_forward_candidate_for_fabric_ingress(
+        forwarding,
+        ha_state,
+        dynamic_neighbors,
+        now_secs,
+        ingress_is_fabric(forwarding, ingress_ifindex),
+        resolution_target,
+        looked_up_resolution,
+    );
     decision.resolution = redirect_session_via_fabric_if_needed(
         forwarding,
         enforce_session_ha_resolution(
             forwarding,
             ha_state,
             now_secs,
-            lookup_forwarding_resolution_for_session(forwarding, dynamic_neighbors, flow, decision),
+            looked_up_resolution,
             ingress_ifindex,
             ha_startup_grace_until_secs,
         ),
@@ -1548,6 +1580,97 @@ mod tests {
 
         assert!(promoted.fabric_ingress);
         assert!(!promoted.synced);
+    }
+
+    #[test]
+    fn resolve_flow_session_decision_promotes_stale_fabric_shared_hit_to_local_owner_path() {
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let mut forwarding = test_forwarding_state_with_fabric();
+        forwarding.connected_v4.push(ConnectedRouteV4 {
+            prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
+            ifindex: 12,
+            tunnel_endpoint_id: 0,
+        });
+        forwarding.neighbors.insert(
+            (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+            NeighborEntry {
+                mac: [0xde, 0xad, 0xbe, 0xef, 0x80, 0x00],
+            },
+        );
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: 1,
+                demoting: false,
+            },
+        );
+
+        let shared_entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision: SessionDecision {
+                resolution: resolve_fabric_redirect(&forwarding).expect("fabric redirect"),
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                    rewrite_src_port: Some(key.src_port),
+                    ..NatDecision::default()
+                },
+            },
+            metadata: SessionMetadata {
+                synced: true,
+                fabric_ingress: true,
+                ..test_metadata()
+            },
+            protocol: PROTO_TCP,
+            tcp_flags: 0x18,
+        };
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_entry,
+        );
+
+        let wire_key = forward_wire_key(&key, shared_entry.decision.nat);
+        let flow = SessionFlow {
+            src_ip: wire_key.src_ip,
+            dst_ip: wire_key.dst_ip,
+            forward_key: wire_key,
+        };
+        let resolved = resolve_flow_session_decision(
+            &mut sessions,
+            -1,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &peer_worker_commands,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+            &flow,
+            1_000_000,
+            1,
+            PROTO_TCP,
+            0x18,
+            21,
+            0,
+        )
+        .expect("resolved");
+
+        assert_eq!(
+            resolved.decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(resolved.decision.resolution.egress_ifindex, 12);
+        assert_eq!(resolved.metadata.owner_rg_id, 1);
+        assert!(resolved.metadata.fabric_ingress);
     }
 
     #[test]
@@ -1929,7 +2052,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 0,
-            demoting: false,
+                demoting: false,
             },
         );
         let forwarding = test_forwarding_state();
@@ -1994,7 +2117,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         );
         let forwarding = test_forwarding_state();
@@ -2209,7 +2332,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2278,7 +2401,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2358,7 +2481,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2518,7 +2641,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2600,7 +2723,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         );
         ha_state.insert(
@@ -2608,7 +2731,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2694,7 +2817,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2841,7 +2964,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
-            demoting: false,
+                demoting: false,
             },
         );
 
@@ -2878,7 +3001,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
-            demoting: false,
+                demoting: false,
             },
         );
         ha_state.insert(
@@ -2886,7 +3009,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 1,
-            demoting: false,
+                demoting: false,
             },
         );
 
@@ -2946,7 +3069,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 1,
-            demoting: false,
+                demoting: false,
             },
         )]);
         let resolved = enforce_session_ha_resolution(
@@ -2982,7 +3105,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 0,
-            demoting: false,
+                demoting: false,
             },
         )]);
         let resolved = enforce_session_ha_resolution(
@@ -3019,7 +3142,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 0,
-            demoting: false,
+                demoting: false,
             },
         )]);
         let reverse = build_reverse_session_from_forward_match(
@@ -3087,7 +3210,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
-            demoting: false,
+                demoting: false,
             },
         );
         let entry = SyncedSessionEntry {
@@ -3147,7 +3270,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
-            demoting: false,
+                demoting: false,
             },
         );
         let mut entry = SyncedSessionEntry {

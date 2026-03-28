@@ -3825,6 +3825,17 @@ fn poll_binding(
                                     )
                                 })
                             };
+                            let fabric_ingress =
+                                ingress_is_fabric(forwarding, meta.ingress_ifindex as i32);
+                            let resolution = prefer_local_forward_candidate_for_fabric_ingress(
+                                forwarding,
+                                ha_state,
+                                dynamic_neighbors,
+                                now_secs,
+                                fabric_ingress,
+                                effective_resolution_target,
+                                resolution,
+                            );
                             let nptv6_nat = nptv6_inbound.map(|internal_dst| NatDecision {
                                 rewrite_src: None,
                                 rewrite_dst: Some(IpAddr::V6(internal_dst)),
@@ -4237,10 +4248,6 @@ fn poll_binding(
                                         let mut created = 0u64;
                                         let track_in_userspace = decision.resolution.disposition
                                             != ForwardingDisposition::LocalDelivery;
-                                        let fabric_ingress = ingress_is_fabric(
-                                            forwarding,
-                                            meta.ingress_ifindex as i32,
-                                        );
                                         let forward_metadata = SessionMetadata {
                                             ingress_zone: from_zone_arc.clone(),
                                             egress_zone: to_zone_arc.clone(),
@@ -6143,10 +6150,7 @@ fn worker_loop(
         // Only collect flow_cache borrows when commands are pending.
         // This avoids a Vec heap allocation on every loop iteration
         // in the common (empty-queue) case.
-        let has_commands = commands
-            .try_lock()
-            .map(|q| !q.is_empty())
-            .unwrap_or(false);
+        let has_commands = commands.try_lock().map(|q| !q.is_empty()).unwrap_or(false);
         let command_results = if has_commands {
             let mut flow_caches = bindings
                 .iter_mut()
@@ -8863,6 +8867,50 @@ fn redirect_via_fabric_if_needed(
         return resolution;
     }
     resolve_fabric_redirect(forwarding).unwrap_or(resolution)
+}
+
+fn prefer_local_forward_candidate_for_fabric_ingress(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    now_secs: u64,
+    fabric_ingress: bool,
+    target_ip: IpAddr,
+    resolution: ForwardingResolution,
+) -> ForwardingResolution {
+    if !fabric_ingress || matches!(resolution.disposition, ForwardingDisposition::LocalDelivery) {
+        return resolution;
+    }
+
+    let current_owner_rg = owner_rg_for_resolution(forwarding, resolution);
+    let current_egress_is_fabric =
+        resolution.egress_ifindex > 0 && ingress_is_fabric(forwarding, resolution.egress_ifindex);
+    if !current_egress_is_fabric
+        && current_owner_rg > 0
+        && resolution.disposition != ForwardingDisposition::FabricRedirect
+    {
+        return resolution;
+    }
+
+    let local_resolution = enforce_ha_resolution_snapshot(
+        forwarding,
+        ha_state,
+        now_secs,
+        lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip),
+    );
+    let local_owner_rg = owner_rg_for_resolution(forwarding, local_resolution);
+    let local_egress_is_fabric = local_resolution.egress_ifindex > 0
+        && ingress_is_fabric(forwarding, local_resolution.egress_ifindex);
+    if matches!(
+        local_resolution.disposition,
+        ForwardingDisposition::ForwardCandidate | ForwardingDisposition::MissingNeighbor
+    ) && local_owner_rg > 0
+        && !local_egress_is_fabric
+    {
+        return local_resolution;
+    }
+
+    resolution
 }
 
 fn cluster_peer_return_fast_path(
@@ -12308,7 +12356,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )])));
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -12343,7 +12391,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )])));
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -12622,7 +12670,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )])));
         let resolved = enforce_ha_resolution(
@@ -12641,7 +12689,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )])));
         let resolved = enforce_ha_resolution(
@@ -12682,7 +12730,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )]);
         let demoted = BTreeMap::from([(
@@ -12690,7 +12738,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )]);
         let resolution =
@@ -12713,7 +12761,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )])));
         let blocked = enforce_ha_resolution(
@@ -12755,7 +12803,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )])));
         let blocked = enforce_ha_resolution(
@@ -12775,6 +12823,36 @@ mod tests {
             redirected.next_hop,
             Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)))
         );
+    }
+
+    #[test]
+    fn fabric_ingress_prefers_local_active_owner_resolution_over_fabric_redirect() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let ha_state = BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: now_secs,
+                demoting: false,
+            },
+        )]);
+        let redirected = resolve_fabric_redirect(&state).expect("fabric redirect");
+        let preferred = prefer_local_forward_candidate_for_fabric_ingress(
+            &state,
+            &ha_state,
+            &Default::default(),
+            now_secs,
+            true,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            redirected,
+        );
+        assert_eq!(
+            preferred.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(preferred.egress_ifindex, 12);
+        assert_eq!(owner_rg_for_resolution(&state, preferred), 1);
     }
 
     #[test]
@@ -12939,7 +13017,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )])));
         let blocked = enforce_ha_resolution(
@@ -12969,7 +13047,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )]);
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -13008,7 +13086,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )]);
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -13330,7 +13408,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )]);
         let icmp_match = EmbeddedIcmpMatch {
@@ -13483,7 +13561,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-            demoting: false,
+                demoting: false,
             },
         )]);
         let icmp_match = EmbeddedIcmpMatch {
@@ -14230,7 +14308,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 11,
-                demoting: false,
+                    demoting: false,
                 },
             ),
             (
@@ -14238,7 +14316,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 12,
-                demoting: false,
+                    demoting: false,
                 },
             ),
         ]);
@@ -14248,7 +14326,7 @@ mod tests {
                 HAGroupRuntime {
                     active: false,
                     watchdog_timestamp: 21,
-                demoting: false,
+                    demoting: false,
                 },
             ),
             (
@@ -14256,7 +14334,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 22,
-                demoting: false,
+                    demoting: false,
                 },
             ),
         ]);
@@ -14272,7 +14350,7 @@ mod tests {
                 HAGroupRuntime {
                     active: false,
                     watchdog_timestamp: 11,
-                demoting: false,
+                    demoting: false,
                 },
             ),
             (
@@ -14280,7 +14358,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 12,
-                demoting: false,
+                    demoting: false,
                 },
             ),
         ]);
@@ -14290,7 +14368,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 21,
-                demoting: false,
+                    demoting: false,
                 },
             ),
             (
@@ -14298,7 +14376,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 22,
-                demoting: false,
+                    demoting: false,
                 },
             ),
         ]);
