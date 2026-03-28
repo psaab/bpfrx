@@ -325,22 +325,36 @@ It should not require:
 
 The current callback does a full recompile for any DHCP address change.
 
-### Root cause C: sync readiness is reset on reconnect even after a valid bulk sync
+### Root cause C: failover admission was using the wrong sync-direction signal
 
-Current behavior:
+Earlier behavior:
 
-- `OnBulkSyncReceived` sets `syncReady=true`
-- `OnPeerDisconnected` always sets `syncReady=false`
-- only initial daemon startup arms the timeout fallback that can release the hold
+- `OnBulkSyncReceived` set the coarse inbound `syncReady` signal
+- reconnect/disconnect churn could clear readiness without distinguishing:
+  - "I have received peer bulk"
+  - "the peer has ingested my bulk"
+- manual failover admission was therefore using the wrong proof for the
+  demoting node's safety check
 
-That means:
+Updated status:
 
-- a standby that already completed bulk sync is treated as cold again on every
-  disconnect/reconnect
-- reconnect failover waits for a brand new bulk sync even though the standby
-  still has a valid baseline session table
-- freshly booted standbys can also deadlock behind `session sync not ready`
-  after reconnect because the timeout fallback is not re-armed
+- current code now distinguishes:
+  - `syncBulkPrimed`: inbound peer bulk received
+  - `syncPeerBulkPrimed`: peer explicitly acknowledged my bulk via `BulkAck`
+- manual failover admission now correctly waits on sender-side peer ack
+- cluster election still uses the coarser timeout-backed readiness path
+
+What is still broken:
+
+- the sender-side admission model is now correct
+- but current-generation `node0 -> node1` bulk completion is still not being
+  observed reliably enough to set `syncPeerBulkPrimed=true` before manual
+  failover admission times out
+
+So the remaining bug is no longer "reconnect readiness is too coarse." It is:
+
+- the current connection generation still has one-directional bulk completion
+  failure or observation failure
 
 ### Root cause D: stale-owner fabric-redirect sessions are filtered out of userspace session sync
 
@@ -479,25 +493,32 @@ Expected result:
 - rebooted node returns without tearing down dataplane state a second time
 - cluster sync/heartbeat remains stable when the node rejoins
 
-### Phase 4: preserve warm-standby sync readiness across reconnects
+### Phase 4: make current-generation sender-side priming reliable
 
-1. Track whether the standby has ever completed a real bulk sync since local
-   startup/dataplane reset.
-2. On peer disconnect:
-   - preserve `syncReady` if a valid bulk baseline already exists
-   - otherwise clear it and re-arm the timeout fallback
-3. On peer reconnect:
-   - immediately restore `syncReady` for a warm standby
-   - re-arm the timeout fallback for a cold standby
-4. Keep `OnBulkSyncReceived` as the authoritative transition that marks the
-   standby as fully primed.
+1. Keep the split readiness model:
+   - election/readiness may use timeout-backed inbound sync state
+   - manual demotion must use sender-side peer acknowledgement
+2. Instrument the accept-side `BulkSync()` path on the peer until the exact
+   missing edge is proven:
+   - scheduling
+   - v4 iteration
+   - v6 iteration
+   - `BulkEnd`
+   - `BulkAck`
+3. If `BulkSync()` starts but does not complete, instrument
+   `IterateSessions` / `IterateSessionsV6`.
+4. If `BulkEnd` is written but no ack arrives, instrument:
+   - `syncMsgBulkEnd` handling
+   - `sendBulkAck(...)`
+   - `syncMsgBulkAck` receive on the originator
 
 Expected result:
 
-- crash/rejoin no longer makes a previously-synced standby ineligible again
-- manual failback does not wait for a brand new bulk transfer when a warm
-  standby already has usable session state
-- cold standbys still have a bounded timeout instead of an indefinite block
+- the demoting node observes `syncPeerBulkPrimed=true` on the current
+  connection generation
+- manual failover admission stops failing with:
+  - `peer bulk sync incomplete`
+- only after that should the work return to post-admission dataplane continuity
 
 ### Phase 5: harden validation
 

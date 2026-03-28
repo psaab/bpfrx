@@ -32,32 +32,39 @@ Validated artifacts from the earlier work:
 
 ## What changed in the latest pass
 
-The newest work did not fix the dataplane yet. It tightened the admission contract so manual failover only proceeds when the peer has a current-generation bulk sync baseline.
+The newest work still did not fix the dataplane, but it did move the
+admission logic onto the correct signal.
 
 New behavior now:
 
-- manual failover requires current-generation bulk priming, not just timeout-based `syncReady`
-- reconnect/disconnect clears `syncBulkPrimed`
+- manual failover no longer keys off the old inbound-bulk signal
+- reconnect/disconnect clears both:
+  - `syncBulkPrimed`
+  - `syncPeerBulkPrimed`
 - session-sync readiness for cluster election still uses the existing timeout path
-- manual failover admission now uses the stricter `syncBulkPrimed` signal
+- manual failover admission now waits on sender-side peer acknowledgement of the current-generation bulk sync
 - the daemon retries sender-side bulk priming after peer connection instead of sending one burst and assuming success
+- the cluster transport now emits explicit bulk-complete acknowledgements:
+  - sender writes `BulkEnd`
+  - receiver responds with `BulkAck`
+  - originator marks the peer as actually primed only after that ack arrives
 
 This is the right safety model:
 
 - cluster bring-up can still elect with timeout-based readiness
-- manual demotion cannot proceed unless the current connection has actually completed peer bulk priming
+- manual demotion cannot proceed unless the current connection has actually completed peer bulk priming in the correct direction
 
 ## What is still broken
 
 The next blocker is now narrower and more concrete than before:
 
 - manual failover is correctly failing closed because current-generation peer bulk priming is incomplete
-- there is still asymmetric bulk-sync completion across the two peers
+- there is still asymmetric bulk-sync completion across the two peers on the current connection generation
 
 That means the remaining problem is no longer just "manual failover is flaky." It is:
 
-- one side can repeatedly send bulk sync
-- the other side does not reliably send or complete the reverse-direction bulk prime on the current connection
+- `node1 -> node0` bulk completion is observed
+- `node0 -> node1` bulk completion is still not being observed reliably enough to admit failover
 - so the demoting node never gets a valid current-generation sync baseline and correctly refuses to proceed
 
 This is progress, not regression. The old path blackholed traffic. The current path blocks the unsafe move.
@@ -70,37 +77,36 @@ Manual failover now fails with:
 
 Artifacts:
 
-- `/tmp/manual-rg1-deep-20260327-131700`
-- `/tmp/manual-rg1-deep-20260327-131855`
-- `/tmp/manual-rg1-probe-20260327-132319`
+- `/tmp/failover-debug/manual-rg1-20260327-133956`
+- `/tmp/failover-debug/manual-rg1-20260327-134724`
+- `/tmp/failover-debug/manual-rg1-20260327-135300`
 
 Important logs on `fw0`:
 
 - `cluster: waiting to admit manual failover ... err="session sync not ready before demotion: peer bulk sync incomplete"`
-- `cluster: retrying session sync bulk prime`
-- `cluster sync: bulk sync complete sessions=0 skipped=74 epoch=1`
-- later retries with:
-  - `cluster sync: bulk sync complete sessions=185 skipped=0 epoch=6`
-  - `cluster sync: bulk sync complete sessions=185 skipped=0 epoch=7`
+- `cluster sync: bulk ack sent epoch=2`
+- `cluster: session sync bulk received`
+- no corresponding:
+  - `cluster: session sync bulk ack received`
 
 Important logs on `fw1`:
 
-- `cluster sync: bulk transfer starting epoch=1`
-- in earlier runs also:
-  - `cluster sync: bulk transfer complete epoch=1`
-  - `cluster: session sync complete, releasing VRRP hold`
+- later prime retries occur
+- but the expected receive-side completion for `node0`'s current-generation bulk is still missing in the failing repro window
 
 What this proves:
 
-- `fw0` is definitely sending bulk sync repeatedly on the current connection
-- `fw1` definitely receives at least some of that bulk transfer
-- the reverse-direction priming signal back to `fw0` is still not being completed reliably on the current connection
+- `node1 -> node0` is good enough for `fw0` to send a bulk ack
+- the sender-side ack path itself is alive
+- the remaining missing edge is `node0 -> node1` completion on the current connection
+- the originator is now observing the right signal and refusing to proceed because it is absent
 
-So the next bug is either:
+So the next bug is one of:
 
-- the accepting peer is not reliably starting its own sender-side `BulkSync()`
+- the accepting peer is not reliably starting its own sender-side `BulkSync()` in the `node0 -> node1` direction
 - or it starts it and stalls before completion
-- or the originator is not observing the completion path correctly
+- or `node1` receives the bulk but never reaches `BulkEnd`
+- or `node1` sends the ack but `node0` never observes it on the current connection generation
 
 ## Current working hypothesis
 
@@ -117,40 +123,37 @@ The likely failure points are in the reverse-direction session-sync prime path:
 - the accept-side decision to invoke `BulkSync()`
 - `BulkSync()` itself on the accepting peer
 - `IterateSessions` / `IterateSessionsV6` on the secondary while generating the bulk transfer
-- the bulk-complete observation path that should flip `syncBulkPrimed=true`
+- the `BulkEnd -> BulkAck -> syncPeerBulkPrimed=true` observation path on the current connection generation
 
 Until that is fixed, further dataplane work is premature because manual failover is still being blocked before the handoff runs.
 
 ## Next code steps
 
-### 1. Instrument sender-side `BulkSync()` on the accepting peer
+### 1. Focus on the `node0 -> node1` bulk-completion direction
 
-Add explicit sender-side logs in `pkg/cluster/sync.go` for:
-
-- bulk sync start
-- before IPv4 iteration
-- after IPv4 iteration
-- before IPv6 iteration
-- after IPv6 iteration
-- before writing bulk-end marker
-- bulk sync complete
+The general sync instrumentation is already in place. The next debugging pass
+should narrow to the one direction that is still missing.
 
 Goal:
 
-- prove whether the accepting peer actually enters `BulkSync()`
-- if it does, prove exactly where it stalls
+- prove exactly where `node0 -> node1` stops on the current connection generation
 
-### 2. Trace the accept-side connection path
+### 2. Instrument accept-side sender `BulkSync()` on `node1`
 
-Instrument the code around:
+Keep and extend the sender-side logs in `pkg/cluster/sync.go` so the
+accepting peer proves all of these edges:
 
-- `handleNewConnection()`
-- any `wasDisconnected` / reconnect path
-- the point where accept-side `BulkSync()` is triggered
+- `handleNewConnection()` schedules `BulkSync()`
+- `BulkSync()` starts
+- IPv4 iteration starts and completes
+- IPv6 iteration starts and completes
+- `BulkEnd` is written
+- `BulkAck` is sent back
 
 Goal:
 
-- prove whether the reverse-direction prime is being scheduled at all on the current connection
+- prove whether `node1` is starting `BulkSync()` for `node0`'s current-generation connection
+- if it does, prove exactly where it stops
 
 ### 3. If `BulkSync()` starts but does not complete, instrument session iteration
 
@@ -163,7 +166,22 @@ Goal:
 
 - determine whether the stall is in session enumeration, v4/v6 split, or bulk-end write/flush
 
-### 4. Keep the stricter admission gate
+### 4. If `BulkEnd` is written but no ack arrives, instrument the receive edge
+
+If `node1` proves it wrote `BulkEnd` for `node0`'s bulk:
+
+- instrument `syncMsgBulkEnd` handling on `node1`
+- instrument `sendBulkAck(...)`
+- instrument `syncMsgBulkAck` receive on `node0`
+
+Goal:
+
+- distinguish:
+  - no `BulkEnd`
+  - no `BulkAck`
+  - ack sent but not observed on the originator
+
+### 5. Keep the stricter admission gate
 
 Do not relax the new manual-failover safety check.
 
@@ -172,7 +190,7 @@ The current behavior is correct:
 - a manual failover without current-generation peer bulk priming is unsafe
 - the correct response is to block the move, not to revert to the old blackhole behavior
 
-### 5. Only return to dataplane handoff work after bidirectional priming is real
+### 6. Only return to dataplane handoff work after bidirectional priming is real
 
 Once manual failover is admitted with true current-generation bulk priming:
 
@@ -189,20 +207,22 @@ Then decide whether the next remaining bug is:
 
 ## Recommended implementation order
 
-1. Add accept-side sender `BulkSync()` instrumentation.
-2. Add accept-path scheduling instrumentation.
+1. Prove the missing `node0 -> node1` edge on the current connection generation.
+2. Extend accept-side sender `BulkSync()` instrumentation on `node1`.
 3. If needed, instrument `IterateSessions` / `IterateSessionsV6`.
-4. Fix current-generation reverse-direction bulk priming.
-5. Re-run manual `RG1` failover under load.
-6. Only then continue the dataplane continuity work.
+4. If `BulkEnd` is reached, instrument `BulkAck` send/receive precisely.
+5. Fix current-generation reverse-direction bulk priming.
+6. Re-run manual `RG1` failover under load.
+7. Only then continue the dataplane continuity work.
 
 ## Acceptance criteria
 
 Before continuing dataplane handoff work, manual failover admission should satisfy all of these:
 
 - no `peer bulk sync incomplete` admission failure once the peer connection is settled
-- `syncBulkPrimed=true` on the demoting node for the current connection generation
+- `syncPeerBulkPrimed=true` on the demoting node for the current connection generation
 - both peers log sender-side bulk sync start and completion on the current connection
+- the originator logs `cluster: session sync bulk ack received` for the current connection generation
 
 After that, the dataplane continuity goal remains:
 
