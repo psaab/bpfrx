@@ -1915,9 +1915,25 @@ func TestWaitForPeerBarriersDrainedTimesOutWhenUnacked(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 	ss.barrierSeq.Store(3)
 	ss.barrierAckSeq.Store(1)
+	ss.barrierWaitMu.Lock()
+	ss.barrierWaiters = map[uint64]chan struct{}{
+		3: make(chan struct{}),
+	}
+	ss.barrierWaitMu.Unlock()
 
 	if err := ss.WaitForPeerBarriersDrained(20 * time.Millisecond); err == nil {
 		t.Fatal("expected WaitForPeerBarriersDrained to time out")
+	}
+}
+
+func TestWaitForPeerBarriersDrainedIgnoresTimedOutBarrierSeqWithoutWaiter(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.barrierSeq.Store(3)
+	ss.barrierAckSeq.Store(0)
+	// Simulate an earlier timeout that removed the waiter but left the sequence
+	// counters behind. Retries should be allowed to queue a fresh barrier.
+	if err := ss.WaitForPeerBarriersDrained(20 * time.Millisecond); err != nil {
+		t.Fatalf("WaitForPeerBarriersDrained() with no active waiters = %v", err)
 	}
 }
 

@@ -1805,11 +1805,19 @@ func (s *SessionSync) WaitForPeerBarrier(timeout time.Duration) error {
 	}
 }
 
-// WaitForPeerBarriersDrained waits until all previously queued barriers have
-// been acknowledged by the peer. This avoids stacking a new demotion barrier
-// behind an older timed-out barrier that the peer is still draining.
+// WaitForPeerBarriersDrained waits until all still-pending barrier waiters have
+// been acknowledged by the peer. Timed-out barriers are not treated as
+// permanently blocking: a later barrier ack is cumulative, so retries should
+// not get stuck on stale sequence numbers after the original waiter was removed.
 func (s *SessionSync) WaitForPeerBarriersDrained(timeout time.Duration) error {
-	target := s.barrierSeq.Load()
+	s.barrierWaitMu.Lock()
+	target := uint64(0)
+	for seq := range s.barrierWaiters {
+		if seq > target {
+			target = seq
+		}
+	}
+	s.barrierWaitMu.Unlock()
 	if target == 0 || s.barrierAckSeq.Load() >= target {
 		return nil
 	}
