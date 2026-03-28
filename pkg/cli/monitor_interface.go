@@ -593,12 +593,22 @@ func renderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 		fmt.Fprintf(w, "  Route misses:         %20d          [%d]\n", snap.userspace.routeMissPackets, usRouteMissDelta)
 		fmt.Fprintf(w, "  Policy denied:        %20d          [%d]\n", snap.userspace.policyDeniedPackets, usPolicyDeniedDelta)
 		fmt.Fprintf(w, "  Exception packets:    %20d          [%d]\n", snap.userspace.exceptionPackets, usExceptionDelta)
-		fmt.Fprintf(w, "  Slow path packets:    %20d          [%d]\n", snap.userspace.slowPathPackets, usSlowPathDelta)
-		fmt.Fprintf(w, "  Slow path local:      %20d          [%d]\n", snap.userspace.slowPathLocalDeliveryPackets, usSlowPathLocalDelta)
-		fmt.Fprintf(w, "  Slow path neigh:      %20d          [%d]\n", snap.userspace.slowPathMissingNeighborPackets, usSlowPathMissingNeighborDelta)
-		fmt.Fprintf(w, "  Slow path no-route:   %20d          [%d]\n", snap.userspace.slowPathNoRoutePackets, usSlowPathNoRouteDelta)
-		fmt.Fprintf(w, "  Slow path next-table: %20d          [%d]\n", snap.userspace.slowPathNextTablePackets, usSlowPathNextTableDelta)
-		fmt.Fprintf(w, "  Slow path fwd-build:  %20d          [%d]\n", snap.userspace.slowPathForwardBuildPackets, usSlowPathForwardBuildDelta)
+		fmt.Fprintf(
+			w,
+			"  Slow path packets:    %20d          [%d]  local=%d[%d] neigh=%d[%d] route=%d[%d] next=%d[%d] build=%d[%d]\n",
+			snap.userspace.slowPathPackets,
+			usSlowPathDelta,
+			snap.userspace.slowPathLocalDeliveryPackets,
+			usSlowPathLocalDelta,
+			snap.userspace.slowPathMissingNeighborPackets,
+			usSlowPathMissingNeighborDelta,
+			snap.userspace.slowPathNoRoutePackets,
+			usSlowPathNoRouteDelta,
+			snap.userspace.slowPathNextTablePackets,
+			usSlowPathNextTableDelta,
+			snap.userspace.slowPathForwardBuildPackets,
+			usSlowPathForwardBuildDelta,
+		)
 		if len(snap.userspace.lastErrors) > 0 {
 			fmt.Fprintf(w, "  Binding errors:\n")
 			for _, msg := range snap.userspace.lastErrors {
