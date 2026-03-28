@@ -425,6 +425,12 @@ func connLocalAddrString(conn net.Conn) (local string) {
 func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, conn net.Conn) {
 	s.mu.Lock()
 	wasDisconnected := s.conn0 == nil && s.conn1 == nil
+	activeBefore := -1
+	if s.conn0 != nil {
+		activeBefore = 0
+	} else if s.conn1 != nil {
+		activeBefore = 1
+	}
 	hadConn0 := s.conn0 != nil
 	hadConn1 := s.conn1 != nil
 	switch fabricIdx {
@@ -439,13 +445,23 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 		}
 		s.conn1 = conn
 	}
+	activeAfter := -1
+	if s.conn0 != nil {
+		activeAfter = 0
+	} else if s.conn1 != nil {
+		activeAfter = 1
+	}
 	s.stats.Connected.Store(true)
 	s.mu.Unlock()
+	becameActive := activeAfter == fabricIdx
 
 	slog.Info("cluster sync: handling new connection",
 		"fabric", fabricIdx,
 		"remote", connRemoteAddrString(conn),
 		"was_disconnected", wasDisconnected,
+		"active_before", activeBefore,
+		"active_after", activeAfter,
+		"became_active", becameActive,
 		"had_conn0", hadConn0,
 		"had_conn1", hadConn1)
 
@@ -459,8 +475,10 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	// Exchange monotonic clocks on every new connection.
 	s.sendClockSync(conn)
 
-	// Bulk sync, journal flush, and callbacks only on first connection
-	// after a total disconnect — not when adding a redundant fabric path.
+	// A new connection that becomes the active transport also needs a fresh
+	// bulk sync. Otherwise one side can reconnect on the preferred fabric
+	// while the peer never sends its own current-generation bulk on that path,
+	// leaving reverse-direction sync admission permanently incomplete.
 	if wasDisconnected {
 		slog.Info("cluster sync: first connection after disconnect",
 			"fabric", fabricIdx,
@@ -476,6 +494,15 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 			"remote", connRemoteAddrString(conn))
 		if err := s.BulkSync(); err != nil {
 			slog.Warn("cluster sync: bulk sync failed", "err", err, "fabric", fabricIdx)
+		}
+	} else if becameActive {
+		slog.Info("cluster sync: starting bulk sync on newly active connection",
+			"fabric", fabricIdx,
+			"remote", connRemoteAddrString(conn),
+			"active_before", activeBefore,
+			"active_after", activeAfter)
+		if err := s.BulkSync(); err != nil {
+			slog.Warn("cluster sync: bulk sync on active connection failed", "err", err, "fabric", fabricIdx)
 		}
 	} else {
 		slog.Info("cluster sync: connection added without bulk sync",

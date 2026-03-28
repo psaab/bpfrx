@@ -1940,6 +1940,84 @@ func TestPendingBulkAckClearedOnDisconnect(t *testing.T) {
 	}
 }
 
+func TestHandleNewConnectionStartsBulkSyncWhenConnectionBecomesActive(t *testing.T) {
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2}, SrcPort: 1234, DstPort: 80, Protocol: 6}: {
+				IngressZone: 1,
+			},
+		},
+	}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return true }
+	oldLocal, oldPeer := net.Pipe()
+	newLocal, newPeer := net.Pipe()
+	defer oldPeer.Close()
+	defer newPeer.Close()
+	ss.conn1 = oldLocal
+	ss.stats.Connected.Store(true)
+
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 8192)
+		for {
+			if _, err := newPeer.Read(buf); err != nil {
+				if err == io.EOF || strings.Contains(err.Error(), "closed pipe") {
+					readDone <- nil
+					return
+				}
+				readDone <- err
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ss.handleNewConnection(ctx, 0, newLocal)
+	epoch, _, ok := ss.PendingBulkAck()
+	if !ok {
+		t.Fatal("expected pending bulk ack after active connection replacement")
+	}
+	if epoch != 1 {
+		t.Fatalf("pending bulk epoch = %d, want 1", epoch)
+	}
+
+	cancel()
+	newLocal.Close()
+	oldLocal.Close()
+	if err := <-readDone; err != nil {
+		t.Fatalf("peer drain failed: %v", err)
+	}
+}
+
+func TestHandleNewConnectionDoesNotBulkSyncForNonActiveRedundantPath(t *testing.T) {
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2}, SrcPort: 1234, DstPort: 80, Protocol: 6}: {
+				IngressZone: 1,
+			},
+		},
+	}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return true }
+	activeLocal, activePeer := net.Pipe()
+	redundantLocal, redundantPeer := net.Pipe()
+	defer activePeer.Close()
+	defer redundantPeer.Close()
+	ss.conn0 = activeLocal
+	ss.stats.Connected.Store(true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ss.handleNewConnection(ctx, 1, redundantLocal)
+	if _, _, ok := ss.PendingBulkAck(); ok {
+		t.Fatal("did not expect pending bulk ack when adding non-active redundant connection")
+	}
+
+	cancel()
+	redundantLocal.Close()
+	activeLocal.Close()
+}
+
 func TestWaitForIdleCompletesWhenCountersStabilize(t *testing.T) {
 	s := NewSessionSync(":0", "127.0.0.1:1", nil)
 	s.sendCh = make(chan []byte, 16)
