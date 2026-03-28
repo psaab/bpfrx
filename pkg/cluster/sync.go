@@ -419,10 +419,25 @@ func connLocalAddrString(conn net.Conn) (local string) {
 	return addr.String()
 }
 
+func configureSessionSyncConn(conn net.Conn) {
+	tcpConn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	if err := tcpConn.SetNoDelay(true); err != nil {
+		slog.Warn("cluster sync: failed to enable TCP_NODELAY",
+			"local", connLocalAddrString(conn),
+			"remote", connRemoteAddrString(conn),
+			"err", err)
+	}
+}
+
 // handleNewConnection processes a newly established connection on the given fabric.
 // It sets the connection in the appropriate slot, starts the receive loop, exchanges
 // clocks, and triggers bulk sync if this is the first connection after a total disconnect.
 func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, conn net.Conn) {
+	configureSessionSyncConn(conn)
+
 	s.mu.Lock()
 	wasDisconnected := s.conn0 == nil && s.conn1 == nil
 	activeBefore := -1
