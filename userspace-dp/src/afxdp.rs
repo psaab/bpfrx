@@ -3955,6 +3955,13 @@ fn poll_binding(
                             };
                             if resolution.disposition == ForwardingDisposition::LocalDelivery
                                 && !is_embedded_icmp_error
+                                && should_cache_local_delivery_session_on_miss(
+                                    forwarding,
+                                    effective_resolution_target,
+                                    resolution,
+                                    meta.protocol,
+                                    meta.tcp_flags,
+                                )
                             {
                                 let local_metadata = SessionMetadata {
                                     ingress_zone: from_zone_arc.clone(),
@@ -9499,6 +9506,33 @@ fn interface_nat_local_resolution_on_session_miss(
     interface_nat_local_resolution(state, dst)
 }
 
+fn should_cache_local_delivery_session_on_miss(
+    state: &ForwardingState,
+    resolution_target: IpAddr,
+    resolution: ForwardingResolution,
+    protocol: u8,
+    tcp_flags: u8,
+) -> bool {
+    if resolution.disposition != ForwardingDisposition::LocalDelivery {
+        return false;
+    }
+    if !matches!(protocol, PROTO_TCP) {
+        return true;
+    }
+    let Some(interface_nat_local) = interface_nat_local_resolution(state, resolution_target) else {
+        return true;
+    };
+    if interface_nat_local.local_ifindex != resolution.local_ifindex {
+        return true;
+    }
+    const TCP_SYN_FLAG: u8 = 0x02;
+    const TCP_ACK_FLAG: u8 = 0x10;
+    if (tcp_flags & TCP_ACK_FLAG) != 0 && (tcp_flags & TCP_SYN_FLAG) == 0 {
+        return false;
+    }
+    true
+}
+
 fn should_block_tunnel_interface_nat_session_miss(
     state: &ForwardingState,
     dst: IpAddr,
@@ -13864,6 +13898,42 @@ mod tests {
             ForwardingDisposition::LocalDelivery
         );
         assert_eq!(resolved_v6.local_ifindex, 12);
+    }
+
+    #[test]
+    fn tcp_ack_session_miss_does_not_cache_interface_nat_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let resolution = interface_nat_local_resolution_on_session_miss(
+            &state,
+            "172.16.80.8".parse().expect("v4"),
+            PROTO_TCP,
+        )
+        .expect("tcp nat local delivery");
+        assert!(!should_cache_local_delivery_session_on_miss(
+            &state,
+            "172.16.80.8".parse().expect("v4"),
+            resolution,
+            PROTO_TCP,
+            0x10,
+        ));
+    }
+
+    #[test]
+    fn tcp_syn_session_miss_still_caches_interface_nat_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let resolution = interface_nat_local_resolution_on_session_miss(
+            &state,
+            "172.16.80.8".parse().expect("v4"),
+            PROTO_TCP,
+        )
+        .expect("tcp nat local delivery");
+        assert!(should_cache_local_delivery_session_on_miss(
+            &state,
+            "172.16.80.8".parse().expect("v4"),
+            resolution,
+            PROTO_TCP,
+            0x02,
+        ));
     }
 
     #[test]
