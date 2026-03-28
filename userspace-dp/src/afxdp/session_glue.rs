@@ -1181,6 +1181,52 @@ fn maybe_promote_synced_session(
     promoted
 }
 
+fn is_translated_forward_session_key(
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+) -> bool {
+    if metadata.is_reverse {
+        return false;
+    }
+    decision.nat.rewrite_src == Some(key.src_ip) || decision.nat.rewrite_dst == Some(key.dst_ip)
+}
+
+fn should_keep_synced_hit_transient(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+) -> bool {
+    ingress_is_fabric(forwarding, ingress_ifindex)
+        && metadata.synced
+        && is_translated_forward_session_key(key, decision, metadata)
+}
+
+fn purge_translated_synced_hit(
+    sessions: &mut SessionTable,
+    session_map_fd: c_int,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+) {
+    if !metadata.synced || !is_translated_forward_session_key(key, decision, metadata) {
+        return;
+    }
+    remove_shared_session(
+        shared_sessions,
+        shared_nat_sessions,
+        shared_forward_wire_sessions,
+        key,
+    );
+    delete_session_map_entry_for_removed_session(session_map_fd, key, decision, metadata);
+    sessions.delete(key);
+}
+
 pub(super) fn resolve_flow_session_decision(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
@@ -1207,7 +1253,46 @@ pub(super) fn resolve_flow_session_decision(
         now_ns,
         tcp_flags,
     ) {
-        let resolved = materialize_shared_session_hit(sessions, &mut hit, now_ns, tcp_flags);
+        let poison_key = hit
+            .shared_entry
+            .as_ref()
+            .map(|entry| (&entry.key, entry.decision, &entry.metadata))
+            .or_else(|| {
+                Some((
+                    hit.key.as_ref(&flow.forward_key),
+                    hit.lookup.decision,
+                    &hit.lookup.metadata,
+                ))
+            });
+        let keep_transient = poison_key.is_some_and(|(key, decision, metadata)| {
+            should_keep_synced_hit_transient(
+                forwarding,
+                ingress_ifindex,
+                key,
+                decision,
+                metadata,
+            )
+        });
+        if keep_transient
+            && let Some((key, decision, metadata)) = poison_key
+        {
+            purge_translated_synced_hit(
+                sessions,
+                session_map_fd,
+                shared_sessions,
+                shared_nat_sessions,
+                shared_forward_wire_sessions,
+                key,
+                decision,
+                metadata,
+            );
+        }
+
+        let resolved = if keep_transient {
+            hit.lookup.clone()
+        } else {
+            materialize_shared_session_hit(sessions, &mut hit, now_ns, tcp_flags)
+        };
         let resolved_key = hit.key.as_ref(&flow.forward_key);
         let mut decision = resolved.decision;
         let resolution_target = resolution_target_for_session(flow, decision);
@@ -1236,22 +1321,26 @@ pub(super) fn resolve_flow_session_decision(
             ingress_ifindex,
             resolved.metadata.ingress_zone.as_ref(),
         );
-        let metadata = maybe_promote_synced_session(
-            sessions,
-            session_map_fd,
-            shared_sessions,
-            shared_nat_sessions,
-            shared_forward_wire_sessions,
-            peer_worker_commands,
-            forwarding,
-            resolved_key,
-            decision,
-            resolved.metadata,
-            ingress_ifindex,
-            now_ns,
-            protocol,
-            tcp_flags,
-        );
+        let metadata = if keep_transient {
+            resolved.metadata
+        } else {
+            maybe_promote_synced_session(
+                sessions,
+                session_map_fd,
+                shared_sessions,
+                shared_nat_sessions,
+                shared_forward_wire_sessions,
+                peer_worker_commands,
+                forwarding,
+                resolved_key,
+                decision,
+                resolved.metadata,
+                ingress_ifindex,
+                now_ns,
+                protocol,
+                tcp_flags,
+            )
+        };
         return Some(ResolvedFlowSessionDecision {
             decision,
             metadata,
@@ -2037,6 +2126,192 @@ mod tests {
             .expect("local canonical session should keep forward-wire alias");
         assert_eq!(local_hit.key, key);
         assert_eq!(resolved.decision.nat, decision.nat);
+    }
+
+    #[test]
+    fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_fabric_ingress() {
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: resolve_fabric_redirect(&test_forwarding_state_with_fabric())
+                .expect("fabric redirect"),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+        };
+        let translated_key = forward_wire_key(&key, decision.nat);
+        let entry = SyncedSessionEntry {
+            key: translated_key.clone(),
+            decision,
+            metadata: SessionMetadata {
+                synced: true,
+                ..test_metadata()
+            },
+            origin: SessionOrigin::SyncImport,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x18,
+        };
+        let mut forwarding = test_forwarding_state_with_fabric();
+        forwarding.connected_v4.push(ConnectedRouteV4 {
+            prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
+            ifindex: 12,
+            tunnel_endpoint_id: 0,
+        });
+        forwarding.neighbors.insert(
+            (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+            NeighborEntry {
+                mac: [0xde, 0xad, 0xbe, 0xef, 0x80, 0x00],
+            },
+        );
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &entry,
+        );
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let peer_worker_commands = Vec::new();
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: 1,
+                demoting: false,
+            },
+        );
+
+        let flow = SessionFlow {
+            src_ip: translated_key.src_ip,
+            dst_ip: translated_key.dst_ip,
+            forward_key: translated_key.clone(),
+        };
+        let resolved = resolve_flow_session_decision(
+            &mut sessions,
+            -1,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &peer_worker_commands,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+            &flow,
+            1_000_000,
+            1,
+            PROTO_TCP,
+            0x18,
+            21,
+            0,
+        )
+        .expect("translated shared hit should resolve");
+
+        assert_eq!(
+            resolved.decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(resolved.decision.resolution.egress_ifindex, 12);
+        assert!(resolved.metadata.synced);
+        assert!(sessions.lookup(&translated_key, 1_000_000, 0x18).is_none());
+        assert!(
+            shared_sessions
+                .lock()
+                .expect("shared lock")
+                .get(&translated_key)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_flow_session_decision_purges_local_synced_translated_hit_on_fabric_ingress() {
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: resolve_fabric_redirect(&test_forwarding_state_with_fabric())
+                .expect("fabric redirect"),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+        };
+        let translated_key = forward_wire_key(&key, decision.nat);
+        assert!(sessions.install_with_protocol_with_origin(
+            translated_key.clone(),
+            decision,
+            SessionMetadata {
+                synced: true,
+                ..test_metadata()
+            },
+            SessionOrigin::SyncImport,
+            1_000_000,
+            PROTO_TCP,
+            0x18,
+        ));
+        let mut forwarding = test_forwarding_state_with_fabric();
+        forwarding.connected_v4.push(ConnectedRouteV4 {
+            prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
+            ifindex: 12,
+            tunnel_endpoint_id: 0,
+        });
+        forwarding.neighbors.insert(
+            (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+            NeighborEntry {
+                mac: [0xde, 0xad, 0xbe, 0xef, 0x80, 0x00],
+            },
+        );
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let peer_worker_commands = Vec::new();
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: 1,
+                demoting: false,
+            },
+        );
+
+        let flow = SessionFlow {
+            src_ip: translated_key.src_ip,
+            dst_ip: translated_key.dst_ip,
+            forward_key: translated_key.clone(),
+        };
+        let resolved = resolve_flow_session_decision(
+            &mut sessions,
+            -1,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &peer_worker_commands,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+            &flow,
+            1_000_000,
+            1,
+            PROTO_TCP,
+            0x18,
+            21,
+            0,
+        )
+        .expect("translated local hit should resolve");
+
+        assert_eq!(
+            resolved.decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(resolved.decision.resolution.egress_ifindex, 12);
+        assert!(resolved.metadata.synced);
+        assert!(sessions.lookup(&translated_key, 1_000_000, 0x18).is_none());
     }
 
     #[test]
