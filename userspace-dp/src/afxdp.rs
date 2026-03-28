@@ -3525,18 +3525,27 @@ fn poll_binding(
                                         cached_decision.resolution.egress_ifindex,
                                     )
                                 };
-                                let target_bi = binding_lookup.target_index(
-                                    binding_index,
-                                    ident.ifindex,
-                                    ident.queue_id,
-                                    target_ifindex,
-                                );
+                                let expected_ports =
+                                    authoritative_forward_ports(packet_frame, meta, Some(flow));
+                                let target_bi = if cached_decision.resolution.disposition
+                                    == ForwardingDisposition::FabricRedirect
+                                {
+                                    binding_lookup.fabric_target_index(
+                                        target_ifindex,
+                                        fabric_queue_hash(Some(flow), expected_ports, meta),
+                                    )
+                                } else {
+                                    binding_lookup.target_index(
+                                        binding_index,
+                                        ident.ifindex,
+                                        ident.queue_id,
+                                        target_ifindex,
+                                    )
+                                };
                                 // Check if target is same binding (hairpin) or same-UMEM.
                                 // For simplicity, only do in-place fast path when target == self.
                                 let is_self_target = target_bi == Some(binding_index);
                                 if is_self_target && owned_packet_frame.is_none() {
-                                    let expected_ports =
-                                        authoritative_forward_ports(packet_frame, meta, Some(flow));
                                     let ingress_slot = binding.slot;
                                     let flow_key = flow.forward_key.clone();
                                     // Try descriptor-based straight-line rewrite first (no branches
