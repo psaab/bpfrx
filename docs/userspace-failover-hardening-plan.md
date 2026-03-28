@@ -20,6 +20,11 @@ cache and sync-readiness fixes:
 4. The new owner can still miss post-failover forward-wire sessions for flows
    first observed on the old owner after the RG move.
 
+There is now a fifth narrowing result from the traced `2026-03-28` artifact:
+
+5. The remaining bad `fw1` sessions are being materialized through
+   `shared_promote` on translated public-side tuples after failover.
+
 ## What we reproduced
 
 ### 1. Manual RG move under load
@@ -185,6 +190,34 @@ Interpretation:
 - Manual failover admission is no longer the blocker.
 - The remaining manual-failover bug is now clearly post-admission dataplane
   continuity, not control-plane quiescence gating.
+
+Latest traced failover result after session-origin instrumentation:
+
+- artifact:
+  - `/tmp/userspace-ha-failover-rg1-20260328-064556`
+- the bad `fw1` recent session deltas are:
+  - `origin=shared_promote`
+  - `172.16.80.8:37612 -> 172.16.80.200:5201`
+  - `172.16.80.8:37624 -> 172.16.80.200:5201`
+  - `172.16.80.8:37638 -> 172.16.80.200:5201`
+  - `172.16.80.8:37644 -> 172.16.80.200:5201`
+- the same artifact still shows:
+  - `Session misses: 13`
+  - `Neighbor misses: 0`
+  - `Route misses: 0`
+  - `Policy denied packets: 0`
+  - `Slow path local-delivery: 4196`
+
+Interpretation:
+
+- the remaining poison is no longer best explained by:
+  - ACK-miss local-delivery caching
+  - worker-local alias leakage
+  - daemon-side `local_delivery` sync
+- the next narrowing target is the translated-hit promotion path in
+  `userspace-dp/src/afxdp/session_glue.rs`
+- the next fix to test is keeping translated public-side shared hits transient
+  on fabric ingress instead of promoting and republishing them
 
 ### 2. Crash/rejoin of the active node
 

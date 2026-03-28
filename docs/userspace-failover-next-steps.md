@@ -60,6 +60,9 @@ What those fixes proved:
 - shared helper alias pollution was real
 - but neither of those changes removed the core hardened-harness collapse
 - the new owner still accumulates public-side `LocalDelivery` state during failover from some other path
+- the traced `2026-03-28` artifact narrows that remaining path to
+  `shared_promote` on the new owner, not `local_miss`, `sync_import`, or
+  `missing_neighbor_seed`
 
 ## What is still broken
 
@@ -132,6 +135,38 @@ Interpretation:
   - ACK-miss caching
   - shared worker alias publication
   - daemon-side session-sync replication
+
+Latest traced artifact:
+
+- `/tmp/userspace-ha-failover-rg1-20260328-064556`
+
+What it proves:
+
+- the bad `fw1` TCP sessions are created with:
+  - `origin=shared_promote`
+- the matching failing examples are:
+  - `172.16.80.8:37612 -> 172.16.80.200:5201`
+  - `172.16.80.8:37624 -> 172.16.80.200:5201`
+  - `172.16.80.8:37638 -> 172.16.80.200:5201`
+  - `172.16.80.8:37644 -> 172.16.80.200:5201`
+- those are the translated public-side tuples, not the canonical client-side
+  tuples
+- the same artifact still shows:
+  - `Session misses: 13`
+  - `Neighbor misses: 0`
+  - `Route misses: 0`
+  - `Policy denied packets: 0`
+  - `Slow path local-delivery: 4196`
+
+Interpretation:
+
+- sync admission is no longer the active blocker
+- the remaining poison is not being created by the old
+  `local_delivery` sync path
+- the next narrowing target is the `shared_promote` path in
+  `userspace-dp/src/afxdp/session_glue.rs`
+- the likely keep is to stop translated public-side shared hits on fabric
+  ingress from becoming durable local/shared session state
 
 Crash/rejoin is also materially improved on the same branch.
 
@@ -206,14 +241,20 @@ Instrument the creation/import path so the artifact answers:
   - daemon session sync
   - replay/export
 
+Status:
+
+- done for the current failing artifact
+- the remaining bad sessions are now known to come from `shared_promote`
+
 ### 3. Block public-side `LocalDelivery` materialization once the source is confirmed
 
 Once the remaining source is proven, cut it off narrowly.
 
-The next likely keep is:
+The next keep to test is:
 
-- reject or rewrite helper-local `LocalDelivery` installs for translated
-  public-side forward traffic on the new owner
+- keep translated public-side shared hits transient on fabric ingress
+- do not promote them into durable local session state
+- do not republish them back into shared worker/session maps
 
 Do not reopen the already-fixed paths unless the next artifact proves they
 regressed.
