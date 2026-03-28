@@ -3976,43 +3976,19 @@ fn poll_binding(
                                     synced: true,
                                     nat64_reverse: None,
                                 };
-                                if let Some(previous) =
-                                    sessions.take_synced_local(&flow.forward_key)
-                                {
-                                    delete_session_map_entry_for_removed_session(
-                                        binding.session_map_fd,
-                                        &flow.forward_key,
-                                        previous.decision,
-                                        &previous.metadata,
-                                    );
-                                }
-                                if sessions.install_with_protocol(
-                                    flow.forward_key.clone(),
+                                if install_helper_local_session_on_miss(
+                                    sessions,
+                                    binding.session_map_fd,
+                                    shared_sessions,
+                                    shared_nat_sessions,
+                                    shared_forward_wire_sessions,
+                                    &flow.forward_key,
                                     decision,
-                                    local_metadata.clone(),
+                                    local_metadata,
                                     now_ns,
                                     meta.protocol,
                                     meta.tcp_flags,
                                 ) {
-                                    let local_entry = SyncedSessionEntry {
-                                        key: flow.forward_key.clone(),
-                                        decision,
-                                        metadata: local_metadata,
-                                        protocol: meta.protocol,
-                                        tcp_flags: meta.tcp_flags,
-                                    };
-                                    publish_shared_session(
-                                        shared_sessions,
-                                        shared_nat_sessions,
-                                        shared_forward_wire_sessions,
-                                        &local_entry,
-                                    );
-                                    let _ = publish_session_map_entry_for_session(
-                                        binding.session_map_fd,
-                                        &flow.forward_key,
-                                        decision,
-                                        &local_entry.metadata,
-                                    );
                                     counters.session_creates += 1;
                                     dbg.session_create += 1;
                                 }
@@ -9529,6 +9505,59 @@ fn should_cache_local_delivery_session_on_miss(
     true
 }
 
+fn install_helper_local_session_on_miss(
+    sessions: &mut SessionTable,
+    session_map_fd: c_int,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: SessionMetadata,
+    now_ns: u64,
+    protocol: u8,
+    tcp_flags: u8,
+) -> bool {
+    if let Some(previous) = sessions.take_synced_local(key) {
+        remove_shared_session(
+            shared_sessions,
+            shared_nat_sessions,
+            shared_forward_wire_sessions,
+            key,
+        );
+        delete_session_map_entry_for_removed_session(
+            session_map_fd,
+            key,
+            previous.decision,
+            &previous.metadata,
+        );
+    }
+    if !sessions.install_with_protocol(
+        key.clone(),
+        decision,
+        metadata.clone(),
+        now_ns,
+        protocol,
+        tcp_flags,
+    ) {
+        return false;
+    }
+    let local_entry = SyncedSessionEntry {
+        key: key.clone(),
+        decision,
+        metadata,
+        protocol,
+        tcp_flags,
+    };
+    let _ = publish_session_map_entry_for_session(
+        session_map_fd,
+        key,
+        decision,
+        &local_entry.metadata,
+    );
+    true
+}
+
 fn should_block_tunnel_interface_nat_session_miss(
     state: &ForwardingState,
     dst: IpAddr,
@@ -14042,6 +14071,169 @@ mod tests {
             PROTO_TCP,
             0x02,
         ));
+    }
+
+    #[test]
+    fn helper_local_session_on_miss_stays_out_of_shared_alias_maps() {
+        let mut sessions = SessionTable::new();
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let state = build_forwarding_state(&nat_snapshot());
+        let key = SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: "172.16.80.8".parse().expect("src"),
+            dst_ip: "172.16.80.200".parse().expect("dst"),
+            src_port: 40278,
+            dst_port: 5201,
+        };
+        let decision = SessionDecision {
+            resolution: ingress_interface_local_resolution_on_session_miss(
+                &state,
+                11,
+                80,
+                key.src_ip,
+                PROTO_TCP,
+            )
+            .expect("tcp ingress local delivery"),
+            nat: NatDecision::default(),
+        };
+        let metadata = SessionMetadata {
+            ingress_zone: Arc::<str>::from("lan"),
+            egress_zone: Arc::<str>::from("wan"),
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            synced: true,
+            nat64_reverse: None,
+        };
+
+        assert!(install_helper_local_session_on_miss(
+            &mut sessions,
+            -1,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &key,
+            decision,
+            metadata,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        assert!(sessions.lookup(&key, 1_000_000, 0x10).is_some());
+        assert!(
+            shared_sessions
+                .lock()
+                .expect("shared lock")
+                .get(&key)
+                .is_none()
+        );
+        assert!(
+            shared_nat_sessions
+                .lock()
+                .expect("nat lock")
+                .is_empty()
+        );
+        assert!(
+            shared_forward_wire_sessions
+                .lock()
+                .expect("forward wire lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn helper_local_session_on_miss_clears_stale_shared_aliases() {
+        let mut sessions = SessionTable::new();
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let state = build_forwarding_state(&nat_snapshot());
+        let key = SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: "172.16.80.8".parse().expect("src"),
+            dst_ip: "172.16.80.200".parse().expect("dst"),
+            src_port: 40278,
+            dst_port: 5201,
+        };
+        let decision = SessionDecision {
+            resolution: ingress_interface_local_resolution_on_session_miss(
+                &state,
+                11,
+                80,
+                key.src_ip,
+                PROTO_TCP,
+            )
+            .expect("tcp ingress local delivery"),
+            nat: NatDecision::default(),
+        };
+        let metadata = SessionMetadata {
+            ingress_zone: Arc::<str>::from("lan"),
+            egress_zone: Arc::<str>::from("wan"),
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            synced: true,
+            nat64_reverse: None,
+        };
+        let entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision,
+            metadata: metadata.clone(),
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+        };
+
+        assert!(sessions.install_with_protocol(
+            key.clone(),
+            decision,
+            metadata,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &entry,
+        );
+
+        assert!(install_helper_local_session_on_miss(
+            &mut sessions,
+            -1,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &key,
+            decision,
+            entry.metadata.clone(),
+            2_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        assert!(
+            shared_sessions
+                .lock()
+                .expect("shared lock")
+                .get(&key)
+                .is_none()
+        );
+        assert!(
+            shared_nat_sessions
+                .lock()
+                .expect("nat lock")
+                .is_empty()
+        );
+        assert!(
+            shared_forward_wire_sessions
+                .lock()
+                .expect("forward wire lock")
+                .is_empty()
+        );
     }
 
     #[test]
