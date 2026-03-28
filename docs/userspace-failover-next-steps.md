@@ -23,6 +23,7 @@ Working or materially better now:
 - direct-mode failover uses repeated post-transition GARP/NA re-announcements
 - the failover validator now treats hung remote `iperf3` as a hard failure
 - the monitor and failover tooling expose stale-owner LAN/fabric/WAN counters well enough to separate control-plane admission failures from dataplane continuity failures
+- cached redirected failover traffic no longer pins itself to the ingress queue on the fabric fast path
 
 Validated artifacts from the earlier work:
 
@@ -53,6 +54,7 @@ What landed after that:
 - helper-local `LocalDelivery` sessions are no longer published into shared worker alias maps
 - userspace session-sync deltas now carry `disposition`
 - daemon-side HA session sync now refuses to mirror `local_delivery` deltas to the peer
+- cached `FabricRedirect` flow-cache hits now use the same per-flow fabric queue hash as the slow path instead of inheriting ingress queue affinity
 
 What those fixes proved:
 
@@ -64,19 +66,23 @@ What those fixes proved:
   `shared_promote` on the new owner, not `local_miss`, `sync_import`, or
   `missing_neighbor_seed`
 
+What the newest queue-selection fix proved:
+
+- the remaining failover collapse was not just session poisoning
+- established redirected traffic was still hitting the flow-cache fast path and selecting the fabric egress binding by ingress queue
+- under the failing artifact that pinned almost all redirected traffic to a single fabric worker
+- after switching cached `FabricRedirect` hits to the flow-hash queue selector, the same hardened one-cycle failover gate passed without collapse
+
 ## What is still broken
 
-The specific `node0 -> node1` manual failover collapse is still present under
-the hardened failover validator.
+The original `node0 -> node1` hardened one-cycle manual failover collapse is no
+longer reproducing on the latest branch build.
 
 What is still broken:
 
-- the exact strengthened RG1 failover harness still collapses after the move to `node1`
-- all four `iperf3` streams still hit `0.00 bits/sec`
-- the remote client still hangs until the harness kills it
-- the new owner still shows exploding `Slow path local-delivery` during the bad window
-- the new owner still ends up with public-side sessions like:
-  - `172.16.80.8:<port> -> 172.16.80.200:5201`
+- crash/rejoin still needs to be rerun on top of the latest fabric queue-selection fix
+- the strengthened failover gate still needs repeated multi-cycle validation, not just one passing cycle
+- retransmits are still higher than ideal during the passing failover window
 
 What is still improved:
 
@@ -168,6 +174,43 @@ Interpretation:
 - the likely keep is to stop translated public-side shared hits on fabric
   ingress from becoming durable local/shared session state
 
+Latest passing artifact after fixing cached fabric queue selection:
+
+- `/tmp/userspace-ha-failover-rg1-20260328-072043`
+
+Measured result:
+
+- `0` zero-throughput intervals
+- `0` per-stream zero-throughput intervals
+- sender throughput `8.673 Gbps`
+- sender retransmits `12771`
+- interval collapse detected: `false`
+
+What it proves:
+
+- the hardened RG1 failover gate now passes end-to-end on the current branch
+- the old redirected-flow single-queue concentration was real
+- after the fix, redirected traffic fans out across multiple fabric queues on the old owner and multiple fabric/WAN queues on the new owner
+- the failover no longer degrades into the earlier `7 Gbps then 0` shape
+
+Key queue-spread evidence from the artifact:
+
+- old owner `ge-0-0-0` TX is spread across:
+  - queue `0`: `1.14M`
+  - queue `1`: `1.18M`
+  - queue `2`: `2.67M`
+- new owner `ge-7-0-0` RX is spread across:
+  - queue `0`: `201k`
+  - queue `1`: `1.13M`
+  - queue `2`: `1.03M`
+  - queue `3`: `1.49M`
+  - queue `5`: `1.15M`
+- new owner `ge-7-0-2` TX is spread across:
+  - queue `1`: `7.16M`
+  - queue `3`: `12.08M`
+  - queue `4`: `10.23M`
+  - queue `5`: `7.18M`
+
 Crash/rejoin is also materially improved on the same branch.
 
 Validated crash/rejoin artifact:
@@ -191,33 +234,48 @@ Interpretation:
 
 ## Current working hypothesis
 
-The current branch is past the original sync-admission and bulk-priming bugs.
+The current branch is past the original sync-admission and bulk-priming bugs,
+and it is also past the worst redirected-flow single-queue collapse.
 
-The remaining question is narrower:
+The next question is now:
 
-- what path is still creating public-side `LocalDelivery` state on the new owner
-- and why does that state survive even after:
-  - ACK-miss caching suppression
-  - worker-local shared-alias suppression
-  - daemon-side `local_delivery` sync filtering
-
-The likely remaining class is:
-
-- session materialization on the new owner from a hit/import/replay path that
-  still carries `LocalDelivery` semantics for public-side translated traffic
+- whether crash/rejoin remains stable on top of the new fabric queue-selection fix
+- whether the one-cycle manual pass holds up under repeated cycles and longer runs
+- whether retransmit levels during the passing failover window can be reduced further
 
 ## Next code steps
 
-### 1. Tag the origin of helper-local sessions in status and delta logs
+### 1. Re-run crash/rejoin on the current queue-spread build
 
-The current artifacts prove that bad public-side sessions still appear on the
-new owner, but not where they were created.
+Use the exact same crash/rejoin gate that previously improved but was not yet
+validated on top of the queue-selection fix.
 
-Add enough visibility to distinguish:
+Acceptance:
 
-- miss-created helper-local sessions
-- synced/imported helper-local sessions
-- replayed helper-local sessions
+- active-node crash fails over cleanly
+- the returning node does not destabilize the survivor
+- no post-rejoin throughput collapse
+
+### 2. Run repeated multi-cycle RG1 moves on the current build
+
+The single-cycle pass is necessary but not sufficient.
+
+Acceptance:
+
+- repeated `RG1 node0 -> node1 -> node0` cycles stay green
+- no hung remote `iperf3`
+- no zero-throughput intervals
+- no interval collapse
+
+### 3. Reduce retransmits inside the now-passing failover window
+
+The current one-cycle run passes functionally, but retransmits are still high.
+
+Focus:
+
+- old-owner fabric TX queue balance
+- new-owner WAN queue balance
+- whether a smaller number of queues is still doing disproportionate work
 - promoted shared hits that retain `LocalDelivery`
 
 Goal:

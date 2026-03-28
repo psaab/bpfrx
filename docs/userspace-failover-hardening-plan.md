@@ -25,6 +25,13 @@ There is now a fifth narrowing result from the traced `2026-03-28` artifact:
 5. The remaining bad `fw1` sessions are being materialized through
    `shared_promote` on translated public-side tuples after failover.
 
+There is now a sixth confirmed dataplane result from the latest `2026-03-28`
+artifact:
+
+6. Established redirected packets that hit the flow-cache fast path were still
+   selecting the fabric egress binding by ingress queue instead of by per-flow
+   fabric hash, collapsing inherited failover traffic onto one worker.
+
 ## What we reproduced
 
 ### 1. Manual RG move under load
@@ -218,6 +225,53 @@ Interpretation:
   `userspace-dp/src/afxdp/session_glue.rs`
 - the next fix to test is keeping translated public-side shared hits transient
   on fabric ingress instead of promoting and republishing them
+
+Latest failover result after keeping translated shared hits transient and fixing
+cached fabric queue selection:
+
+- artifact:
+  - `/tmp/userspace-ha-failover-rg1-20260328-072043`
+- one-cycle hardened failover gate result:
+  - `0` zero-throughput intervals
+  - `0` per-stream zero-throughput intervals
+  - sender throughput `8.673 Gbps`
+  - sender retransmits `12771`
+  - no interval collapse
+
+What changed materially:
+
+- the failover no longer reproduces the old `~7 Gbps then 0` collapse
+- old-owner redirected fabric TX is spread across multiple queues instead of
+  concentrating on a single queue
+- new-owner fabric RX and WAN TX are also spread across multiple queues
+
+Queue evidence from the passing artifact:
+
+- old owner `ge-0-0-0` TX:
+  - queue `0`: `1.14M`
+  - queue `1`: `1.18M`
+  - queue `2`: `2.67M`
+- new owner `ge-7-0-0` RX:
+  - queue `0`: `201k`
+  - queue `1`: `1.13M`
+  - queue `2`: `1.03M`
+  - queue `3`: `1.49M`
+  - queue `5`: `1.15M`
+- new owner `ge-7-0-2` TX:
+  - queue `1`: `7.16M`
+  - queue `3`: `12.08M`
+  - queue `4`: `10.23M`
+  - queue `5`: `7.18M`
+
+Interpretation:
+
+- the failing single-queue redirected-flow concentration was real
+- the flow-cache fabric-queue selection bug was a real contributor to the
+  manual failover collapse
+- the next work should move away from session-origin tracing and toward:
+  - repeated failover-cycle validation
+  - crash/rejoin on the new build
+  - retransmit reduction inside the now-passing failover window
 
 ### 2. Crash/rejoin of the active node
 
