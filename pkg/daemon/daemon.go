@@ -3872,7 +3872,6 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	}
 	success = true
 	slog.Info("userspace: prepared rg demotion", "rg", rgID, "queued_deltas", queued)
-	succeeded = true
 	return nil
 }
 
