@@ -637,9 +637,10 @@ impl SessionTable {
         if owner_rgs.is_empty() {
             return Vec::new();
         }
+        let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
         let mut keys = Vec::new();
         for (key, entry) in &self.sessions {
-            if owner_rgs.contains(&entry.metadata.owner_rg_id) {
+            if owner_rg_set.contains(&entry.metadata.owner_rg_id) {
                 keys.push(key.clone());
             }
         }

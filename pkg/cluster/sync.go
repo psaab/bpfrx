@@ -2024,8 +2024,9 @@ func (s *SessionSync) reconcileStaleSessions() {
 		return
 	}
 
-	// shouldSyncAtBulkStart uses the frozen snapshot if available, falling
-	// back to live ShouldSyncZone when no snapshot exists (backward compat).
+	// shouldSyncAtBulkStart uses the frozen snapshot if available. Zones missing
+	// from that snapshot are treated as syncable to avoid deleting sessions
+	// before the current bulk stream has finished delivering them.
 	shouldSyncAtBulkStart := func(zoneID uint16) bool {
 		if v, ok := zoneSnap[zoneID]; ok {
 			return v

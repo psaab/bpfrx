@@ -204,12 +204,13 @@ fn export_forward_sessions_for_owner_rgs(sessions: &mut SessionTable, owner_rgs:
     if owner_rgs.is_empty() {
         return;
     }
+    let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
     let mut export = Vec::new();
     sessions.iter_with_origin(|key, decision, metadata, origin| {
         if metadata.is_reverse || metadata.synced || metadata.fabric_ingress {
             return;
         }
-        if !owner_rgs.contains(&metadata.owner_rg_id) {
+        if !owner_rg_set.contains(&metadata.owner_rg_id) {
             return;
         }
         if !matches!(
@@ -424,8 +425,9 @@ pub(super) fn demote_shared_owner_rgs(
     if owner_rgs.is_empty() {
         return;
     }
+    let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
     let should_demote =
-        |entry: &SyncedSessionEntry| owner_rgs.contains(&entry.metadata.owner_rg_id);
+        |entry: &SyncedSessionEntry| owner_rg_set.contains(&entry.metadata.owner_rg_id);
     if let Ok(mut sessions) = shared_sessions.lock() {
         for entry in sessions.values_mut() {
             if should_demote(entry) {
@@ -534,6 +536,7 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
     if owner_rgs.is_empty() {
         return;
     }
+    let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
     let candidates = {
         let mut out = Vec::new();
         sessions.iter_with_origin(|key, decision, metadata, origin| {
@@ -575,8 +578,8 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
         let refreshed_owner_rg = owner_rg_for_resolution(forwarding, refreshed_resolution);
         let refreshed_resolution =
             redirect_session_resolution_for_metadata(forwarding, refreshed_resolution, &metadata);
-        if !owner_rgs.contains(&refreshed_owner_rg)
-            && !owner_rgs.contains(&metadata.owner_rg_id)
+        if !owner_rg_set.contains(&refreshed_owner_rg)
+            && !owner_rg_set.contains(&metadata.owner_rg_id)
             && refreshed_resolution == decision.resolution
             && refreshed_owner_rg == metadata.owner_rg_id
         {
@@ -598,7 +601,7 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
             0,
         ) {
             if emit_forward_deltas
-                && owner_rgs.contains(&metadata.owner_rg_id)
+                && owner_rg_set.contains(&metadata.owner_rg_id)
                 && !metadata.is_reverse
             {
                 sessions.emit_open_delta_with_origin(
