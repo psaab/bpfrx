@@ -12,7 +12,8 @@ use crate::prefix::{PrefixV4, PrefixV6};
 use crate::screen::{ScreenProfile, ScreenState, ScreenVerdict, extract_screen_info};
 use crate::session::{
     ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionKey,
-    SessionLookup, SessionMetadata, SessionTable, forward_wire_key, reverse_canonical_key,
+    SessionLookup, SessionMetadata, SessionOrigin, SessionTable, forward_wire_key,
+    reverse_canonical_key,
 };
 use crate::slowpath::{EnqueueOutcome, SlowPathReinjector, SlowPathStatus, open_tun};
 use crate::xsk_ffi::xdp::XdpDesc;
@@ -2524,6 +2525,7 @@ pub(crate) struct SyncedSessionEntry {
     pub(crate) key: SessionKey,
     pub(crate) decision: SessionDecision,
     pub(crate) metadata: SessionMetadata,
+    pub(crate) origin: SessionOrigin,
     pub(crate) protocol: u8,
     pub(crate) tcp_flags: u8,
 }
@@ -3702,10 +3704,11 @@ fn poll_binding(
                                     false,
                                 ) {
                                     request.source_frame = owned_packet_frame.take();
-                                    if sessions.install_with_protocol(
+                                    if sessions.install_with_protocol_with_origin(
                                         flow.forward_key.clone(),
                                         fabric_return_decision,
                                         fabric_return_metadata,
+                                        SessionOrigin::ReverseFlow,
                                         now_ns,
                                         meta.protocol,
                                         meta.tcp_flags,
@@ -3914,15 +3917,15 @@ fn poll_binding(
                                         if dbg.session_miss <= 3 {
                                             let mut sess_dump = String::new();
                                             let mut count = 0;
-                                            sessions.iter(|key, decision, metadata| {
+                                            sessions.iter_with_origin(|key, decision, metadata, origin| {
                                                 if count < 30 {
                                                     use std::fmt::Write;
                                                     let _ = write!(sess_dump,
-                                                        "\n  LOCAL_SESS: af={} proto={} {}:{}->{}:{} nat=({:?},{:?}) rev={} synced={}",
+                                                        "\n  LOCAL_SESS: af={} proto={} {}:{}->{}:{} nat=({:?},{:?}) rev={} synced={} origin={}",
                                                         key.addr_family, key.protocol,
                                                         key.src_ip, key.src_port, key.dst_ip, key.dst_port,
                                                         decision.nat.rewrite_src, decision.nat.rewrite_dst,
-                                                        metadata.is_reverse, metadata.synced,
+                                                        metadata.is_reverse, metadata.synced, origin.as_str(),
                                                     );
                                                     count += 1;
                                                 }
@@ -3985,6 +3988,7 @@ fn poll_binding(
                                     &flow.forward_key,
                                     decision,
                                     local_metadata,
+                                    SessionOrigin::LocalMiss,
                                     now_ns,
                                     meta.protocol,
                                     meta.tcp_flags,
@@ -4257,10 +4261,11 @@ fn poll_binding(
                                             nat64_reverse: nat64_info,
                                         };
                                         if track_in_userspace
-                                            && sessions.install_with_protocol(
+                                            && sessions.install_with_protocol_with_origin(
                                                 flow.forward_key.clone(),
                                                 decision,
                                                 forward_metadata.clone(),
+                                                SessionOrigin::ForwardFlow,
                                                 now_ns,
                                                 meta.protocol,
                                                 meta.tcp_flags,
@@ -4271,6 +4276,7 @@ fn poll_binding(
                                                 key: flow.forward_key.clone(),
                                                 decision,
                                                 metadata: forward_metadata,
+                                                origin: SessionOrigin::ForwardFlow,
                                                 protocol: meta.protocol,
                                                 tcp_flags: meta.tcp_flags,
                                             };
@@ -4383,10 +4389,11 @@ fn poll_binding(
                                             nat64_reverse: nat64_info,
                                         };
                                         if track_in_userspace
-                                            && sessions.install_with_protocol(
+                                            && sessions.install_with_protocol_with_origin(
                                                 reverse_key.clone(),
                                                 reverse_decision,
                                                 reverse_metadata.clone(),
+                                                SessionOrigin::ReverseFlow,
                                                 now_ns,
                                                 meta.protocol,
                                                 meta.tcp_flags,
@@ -4473,6 +4480,7 @@ fn poll_binding(
                                                 key: reverse_key,
                                                 decision: reverse_decision,
                                                 metadata: reverse_metadata,
+                                                origin: SessionOrigin::ReverseFlow,
                                                 protocol: meta.protocol,
                                                 tcp_flags: meta.tcp_flags,
                                             };
@@ -5074,10 +5082,11 @@ fn poll_binding(
                                         meta.ingress_ifindex as i32,
                                         pending_decision,
                                     );
-                                    if sessions.install_with_protocol(
+                                    if sessions.install_with_protocol_with_origin(
                                         flow.forward_key.clone(),
                                         pending_decision,
                                         sess_meta.clone(),
+                                        SessionOrigin::MissingNeighborSeed,
                                         now_ns,
                                         meta.protocol,
                                         meta.tcp_flags,
@@ -5086,6 +5095,7 @@ fn poll_binding(
                                             key: flow.forward_key.clone(),
                                             decision: pending_decision,
                                             metadata: sess_meta,
+                                            origin: SessionOrigin::MissingNeighborSeed,
                                             protocol: meta.protocol,
                                             tcp_flags: meta.tcp_flags,
                                         };
@@ -5657,6 +5667,7 @@ fn flush_session_deltas(
                 ForwardingDisposition::NextTableUnsupported => "next_table_unsupported",
             }
             .to_string(),
+            origin: delta.origin.as_str().to_string(),
             egress_ifindex: delta.decision.resolution.egress_ifindex,
             tx_ifindex: delta.decision.resolution.tx_ifindex,
             tunnel_endpoint_id: delta.decision.resolution.tunnel_endpoint_id,
@@ -6694,12 +6705,12 @@ fn worker_loop(
                         // Dump all session keys for this worker
                         let mut sess_dump = String::new();
                         let mut count = 0;
-                        sessions.iter(|key, decision, metadata| {
+                        sessions.iter_with_origin(|key, decision, metadata, origin| {
                             if count < 20 {
                                 use std::fmt::Write;
                                 let _ = write!(
                                     sess_dump,
-                                    "\n  SESS: {}:{} -> {}:{} proto={} nat=({:?},{:?}) is_rev={}",
+                                    "\n  SESS: {}:{} -> {}:{} proto={} nat=({:?},{:?}) is_rev={} origin={}",
                                     key.src_ip,
                                     key.src_port,
                                     key.dst_ip,
@@ -6708,6 +6719,7 @@ fn worker_loop(
                                     decision.nat.rewrite_src,
                                     decision.nat.rewrite_dst,
                                     metadata.is_reverse,
+                                    origin.as_str(),
                                 );
                                 count += 1;
                             }
@@ -6991,6 +7003,7 @@ fn build_local_origin_tunnel_tx_request(
             synced: true,
             nat64_reverse: None,
         },
+        origin: SessionOrigin::SyncImport,
         protocol: meta.protocol,
         tcp_flags: if meta.protocol == PROTO_TCP {
             extract_tcp_flags_and_window(&inner_frame)
@@ -9526,6 +9539,7 @@ fn install_helper_local_session_on_miss(
     key: &SessionKey,
     decision: SessionDecision,
     metadata: SessionMetadata,
+    origin: SessionOrigin,
     now_ns: u64,
     protocol: u8,
     tcp_flags: u8,
@@ -9544,10 +9558,11 @@ fn install_helper_local_session_on_miss(
             &previous.metadata,
         );
     }
-    if !sessions.install_with_protocol(
+    if !sessions.install_with_protocol_with_origin(
         key.clone(),
         decision,
         metadata.clone(),
+        origin,
         now_ns,
         protocol,
         tcp_flags,
@@ -9558,15 +9573,12 @@ fn install_helper_local_session_on_miss(
         key: key.clone(),
         decision,
         metadata,
+        origin,
         protocol,
         tcp_flags,
     };
-    let _ = publish_session_map_entry_for_session(
-        session_map_fd,
-        key,
-        decision,
-        &local_entry.metadata,
-    );
+    let _ =
+        publish_session_map_entry_for_session(session_map_fd, key, decision, &local_entry.metadata);
     true
 }
 
@@ -10952,7 +10964,8 @@ impl BindingLiveState {
         packet_len: u64,
     ) {
         self.slow_path_packets.fetch_add(1, Ordering::Relaxed);
-        self.slow_path_bytes.fetch_add(packet_len, Ordering::Relaxed);
+        self.slow_path_bytes
+            .fetch_add(packet_len, Ordering::Relaxed);
         if reason == "forward_build_slow_path" {
             self.slow_path_forward_build_packets
                 .fetch_add(1, Ordering::Relaxed);
@@ -11040,9 +11053,7 @@ impl BindingLiveState {
                 .slow_path_missing_neighbor_packets
                 .load(Ordering::Relaxed),
             slow_path_no_route_packets: self.slow_path_no_route_packets.load(Ordering::Relaxed),
-            slow_path_next_table_packets: self
-                .slow_path_next_table_packets
-                .load(Ordering::Relaxed),
+            slow_path_next_table_packets: self.slow_path_next_table_packets.load(Ordering::Relaxed),
             slow_path_forward_build_packets: self
                 .slow_path_forward_build_packets
                 .load(Ordering::Relaxed),
@@ -14102,11 +14113,7 @@ mod tests {
         };
         let decision = SessionDecision {
             resolution: ingress_interface_local_resolution_on_session_miss(
-                &state,
-                11,
-                80,
-                key.src_ip,
-                PROTO_TCP,
+                &state, 11, 80, key.src_ip, PROTO_TCP,
             )
             .expect("tcp ingress local delivery"),
             nat: NatDecision::default(),
@@ -14130,6 +14137,7 @@ mod tests {
             &key,
             decision,
             metadata,
+            SessionOrigin::LocalMiss,
             1_000_000,
             PROTO_TCP,
             0x10,
@@ -14142,12 +14150,7 @@ mod tests {
                 .get(&key)
                 .is_none()
         );
-        assert!(
-            shared_nat_sessions
-                .lock()
-                .expect("nat lock")
-                .is_empty()
-        );
+        assert!(shared_nat_sessions.lock().expect("nat lock").is_empty());
         assert!(
             shared_forward_wire_sessions
                 .lock()
@@ -14173,11 +14176,7 @@ mod tests {
         };
         let decision = SessionDecision {
             resolution: ingress_interface_local_resolution_on_session_miss(
-                &state,
-                11,
-                80,
-                key.src_ip,
-                PROTO_TCP,
+                &state, 11, 80, key.src_ip, PROTO_TCP,
             )
             .expect("tcp ingress local delivery"),
             nat: NatDecision::default(),
@@ -14195,6 +14194,7 @@ mod tests {
             key: key.clone(),
             decision,
             metadata: metadata.clone(),
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
         };
@@ -14223,6 +14223,7 @@ mod tests {
             &key,
             decision,
             entry.metadata.clone(),
+            SessionOrigin::LocalMiss,
             2_000_000,
             PROTO_TCP,
             0x10,
@@ -14234,12 +14235,7 @@ mod tests {
                 .get(&key)
                 .is_none()
         );
-        assert!(
-            shared_nat_sessions
-                .lock()
-                .expect("nat lock")
-                .is_empty()
-        );
+        assert!(shared_nat_sessions.lock().expect("nat lock").is_empty());
         assert!(
             shared_forward_wire_sessions
                 .lock()
@@ -14571,6 +14567,7 @@ mod tests {
                 synced: false,
                 nat64_reverse: None,
             },
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
         };
@@ -14611,6 +14608,7 @@ mod tests {
                 synced: true,
                 nat64_reverse: None,
             },
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
         };
@@ -14663,6 +14661,7 @@ mod tests {
                 synced: true,
                 nat64_reverse: None,
             },
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
         };
@@ -19704,6 +19703,7 @@ mod tests {
                 synced: true,
                 nat64_reverse: None,
             },
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
         };
@@ -20107,12 +20107,17 @@ mod tests {
         let live = BindingLiveState::new();
 
         live.record_slow_path_accept(ForwardingDisposition::MissingNeighbor, "slow_path", 128);
-        live.record_slow_path_accept(ForwardingDisposition::NoRoute, "forward_build_slow_path", 64);
+        live.record_slow_path_accept(
+            ForwardingDisposition::NoRoute,
+            "forward_build_slow_path",
+            64,
+        );
 
         assert_eq!(live.slow_path_packets.load(Ordering::Relaxed), 2);
         assert_eq!(live.slow_path_bytes.load(Ordering::Relaxed), 192);
         assert_eq!(
-            live.slow_path_missing_neighbor_packets.load(Ordering::Relaxed),
+            live.slow_path_missing_neighbor_packets
+                .load(Ordering::Relaxed),
             1
         );
         assert_eq!(live.slow_path_no_route_packets.load(Ordering::Relaxed), 0);

@@ -369,8 +369,8 @@ func FormatBindings(status ProcessStatus) string {
 		fmt.Fprintln(&b)
 		fmt.Fprintln(&b, "Recent userspace session deltas:")
 		for _, delta := range status.RecentSessionDeltas {
-			fmt.Fprintf(&b, "  %s slot=%d queue=%d if=%s event=%s af=%d proto=%d flow=%s:%d->%s:%d zones=%s->%s owner-rg=%d egress-if=%d",
-				delta.Timestamp.Format(time.RFC3339), delta.Slot, delta.QueueID, delta.Interface, delta.Event, delta.AddrFamily, delta.Protocol, delta.SrcIP, delta.SrcPort, delta.DstIP, delta.DstPort, delta.IngressZone, delta.EgressZone, delta.OwnerRGID, delta.EgressIfindex)
+			fmt.Fprintf(&b, "  %s slot=%d queue=%d if=%s event=%s af=%d proto=%d flow=%s:%d->%s:%d zones=%s->%s owner-rg=%d disposition=%s origin=%s egress-if=%d",
+				delta.Timestamp.Format(time.RFC3339), delta.Slot, delta.QueueID, delta.Interface, delta.Event, delta.AddrFamily, delta.Protocol, delta.SrcIP, delta.SrcPort, delta.DstIP, delta.DstPort, delta.IngressZone, delta.EgressZone, delta.OwnerRGID, delta.Disposition, delta.Origin, delta.EgressIfindex)
 			if delta.NextHop != "" {
 				fmt.Fprintf(&b, " next-hop=%s", delta.NextHop)
 			}

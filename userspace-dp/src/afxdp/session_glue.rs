@@ -205,7 +205,7 @@ fn export_forward_sessions_for_owner_rgs(sessions: &mut SessionTable, owner_rgs:
         return;
     }
     let mut export = Vec::new();
-    sessions.iter(|key, decision, metadata| {
+    sessions.iter_with_origin(|key, decision, metadata, origin| {
         if metadata.is_reverse || metadata.synced || metadata.fabric_ingress {
             return;
         }
@@ -218,10 +218,10 @@ fn export_forward_sessions_for_owner_rgs(sessions: &mut SessionTable, owner_rgs:
         ) {
             return;
         }
-        export.push((key.clone(), decision, metadata.clone()));
+        export.push((key.clone(), decision, metadata.clone(), origin));
     });
-    for (key, decision, metadata) in export {
-        sessions.emit_open_delta(key, decision, metadata, true);
+    for (key, decision, metadata, origin) in export {
+        sessions.emit_open_delta_with_origin(key, decision, metadata, origin, true);
     }
 }
 
@@ -340,10 +340,11 @@ pub(super) fn apply_worker_commands(
                 let metadata = entry.metadata.clone();
                 let allow_replace_local =
                     !owner_rg_is_locally_active(ha_state, entry.metadata.owner_rg_id, now_secs);
-                if sessions.upsert_synced(
+                if sessions.upsert_synced_with_origin(
                     entry.key,
                     entry.decision,
                     entry.metadata,
+                    entry.origin,
                     now_ns,
                     entry.protocol,
                     entry.tcp_flags,
@@ -358,10 +359,11 @@ pub(super) fn apply_worker_commands(
                 }
             }
             WorkerCommand::UpsertLocal(entry) => {
-                sessions.install_with_protocol(
+                sessions.install_with_protocol_with_origin(
                     entry.key,
                     entry.decision,
                     entry.metadata,
+                    entry.origin,
                     now_ns,
                     entry.protocol,
                     entry.tcp_flags,
@@ -534,18 +536,18 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
     }
     let candidates = {
         let mut out = Vec::new();
-        sessions.iter(|key, decision, metadata| {
+        sessions.iter_with_origin(|key, decision, metadata, origin| {
             // Refresh all local sessions when an owner RG activates.
             // During takeover, a shared forward session can be promoted
             // locally with a FabricRedirect while the RG is still inactive.
             // Once the RG flips active, those already-promoted forward
             // sessions must be re-resolved to the local egress path instead
             // of staying pinned to the old owner forever.
-            out.push((key.clone(), decision, metadata.clone()));
+            out.push((key.clone(), decision, metadata.clone(), origin));
         });
         out
     };
-    for (key, decision, metadata) in candidates {
+    for (key, decision, metadata, origin) in candidates {
         let delta_metadata = metadata.clone();
         let flow = SessionFlow {
             src_ip: key.src_ip,
@@ -599,7 +601,13 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
                 && owner_rgs.contains(&metadata.owner_rg_id)
                 && !metadata.is_reverse
             {
-                sessions.emit_open_delta(key.clone(), decision, delta_metadata, true);
+                sessions.emit_open_delta_with_origin(
+                    key.clone(),
+                    decision,
+                    delta_metadata,
+                    origin,
+                    true,
+                );
             }
             let _ = publish_session_map_entry_for_session(
                 session_map_fd,
@@ -921,10 +929,11 @@ fn materialize_shared_session_hit(
 ) -> SessionLookup {
     if let Some(shared) = resolved.shared_entry.take() {
         let replica = synced_replica_entry(&shared);
-        sessions.upsert_synced(
+        sessions.upsert_synced_with_origin(
             replica.key.clone(),
             replica.decision,
             replica.metadata.clone(),
+            SessionOrigin::SharedMaterialize,
             now_ns,
             replica.protocol,
             tcp_flags,
@@ -1012,6 +1021,7 @@ pub(super) fn synthesized_synced_reverse_entry(
         key: reverse_key,
         decision: reverse.decision,
         metadata,
+        origin: SessionOrigin::SyncImport,
         protocol: entry.protocol,
         tcp_flags: entry.tcp_flags,
     })
@@ -1083,10 +1093,11 @@ fn install_reverse_session_from_forward_match(
         now_secs,
         ha_startup_grace_until_secs,
     );
-    if sessions.install_with_protocol(
+    if sessions.install_with_protocol_with_origin(
         reverse_key.clone(),
         reverse.decision,
         reverse.metadata.clone(),
+        SessionOrigin::ReverseFlow,
         now_ns,
         protocol,
         tcp_flags,
@@ -1096,6 +1107,7 @@ fn install_reverse_session_from_forward_match(
             key: reverse_key.clone(),
             decision: reverse.decision,
             metadata: reverse.metadata.clone(),
+            origin: SessionOrigin::ReverseFlow,
             protocol,
             tcp_flags,
         };
@@ -1140,12 +1152,21 @@ fn maybe_promote_synced_session(
     if ingress_is_fabric(forwarding, ingress_ifindex) {
         promoted.fabric_ingress = true;
     }
-    if sessions.promote_synced(key, decision, promoted.clone(), now_ns, protocol, tcp_flags) {
+    if sessions.promote_synced_with_origin(
+        key,
+        decision,
+        promoted.clone(),
+        SessionOrigin::SharedPromote,
+        now_ns,
+        protocol,
+        tcp_flags,
+    ) {
         let _ = publish_session_map_entry_for_session(session_map_fd, key, decision, &promoted);
         let promoted_entry = SyncedSessionEntry {
             key: key.clone(),
             decision,
             metadata: promoted.clone(),
+            origin: SessionOrigin::SharedPromote,
             protocol,
             tcp_flags,
         };
@@ -1628,6 +1649,7 @@ mod tests {
                 fabric_ingress: true,
                 ..test_metadata()
             },
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x18,
         };
@@ -1702,6 +1724,7 @@ mod tests {
                 synced: true,
                 ..test_metadata()
             },
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
         };
@@ -1746,6 +1769,7 @@ mod tests {
                 synced: true,
                 ..test_metadata()
             },
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
         };
@@ -1797,6 +1821,7 @@ mod tests {
             key: key.clone(),
             decision,
             metadata: test_metadata(),
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_ICMPV6,
             tcp_flags: 0,
         };
@@ -1833,6 +1858,7 @@ mod tests {
                 synced: true,
                 ..test_metadata()
             },
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
         };
@@ -1869,6 +1895,7 @@ mod tests {
             key: key.clone(),
             decision,
             metadata: test_metadata(),
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
         };
@@ -1915,6 +1942,7 @@ mod tests {
             key: key.clone(),
             decision,
             metadata: test_metadata(),
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
         };
@@ -1959,6 +1987,7 @@ mod tests {
                 synced: true,
                 ..test_metadata()
             },
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
         };
@@ -2043,6 +2072,7 @@ mod tests {
                 key: key.clone(),
                 decision: synced_decision,
                 metadata: synced_metadata.clone(),
+                origin: SessionOrigin::SyncImport,
                 protocol: PROTO_TCP,
                 tcp_flags: 0x10,
             }));
@@ -2108,6 +2138,7 @@ mod tests {
                     synced: true,
                     ..test_metadata()
                 },
+                origin: SessionOrigin::SyncImport,
                 protocol: PROTO_TCP,
                 tcp_flags: 0x10,
             }));
@@ -2854,6 +2885,7 @@ mod tests {
             key: test_key(),
             decision: test_decision(),
             metadata: test_metadata(),
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
         };
@@ -2864,6 +2896,7 @@ mod tests {
                 is_reverse: true,
                 ..test_metadata()
             },
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
         };
@@ -2920,6 +2953,7 @@ mod tests {
             key: test_key(),
             decision: test_decision(),
             metadata,
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
         };
@@ -2955,6 +2989,7 @@ mod tests {
             key: test_key(),
             decision: test_decision(),
             metadata,
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
         };
@@ -2992,6 +3027,7 @@ mod tests {
             key: test_key(),
             decision: test_decision(),
             metadata,
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
         };
@@ -3221,6 +3257,7 @@ mod tests {
                 fabric_ingress: true,
                 ..test_metadata()
             },
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
         };
@@ -3281,6 +3318,7 @@ mod tests {
                 fabric_ingress: true,
                 ..test_metadata()
             },
+            origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
         };

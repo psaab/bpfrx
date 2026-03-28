@@ -85,6 +85,7 @@ pub(crate) struct SessionKey {
 struct SessionEntry {
     decision: SessionDecision,
     metadata: SessionMetadata,
+    origin: SessionOrigin,
     last_seen_ns: u64,
     expires_after_ns: u64,
     closing: bool,
@@ -123,6 +124,33 @@ pub(crate) struct ForwardSessionMatch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionOrigin {
+    ForwardFlow,
+    ReverseFlow,
+    LocalMiss,
+    MissingNeighborSeed,
+    SyncImport,
+    SharedMaterialize,
+    SharedPromote,
+    WorkerLocalImport,
+}
+
+impl SessionOrigin {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ForwardFlow => "forward_flow",
+            Self::ReverseFlow => "reverse_flow",
+            Self::LocalMiss => "local_miss",
+            Self::MissingNeighborSeed => "missing_neighbor_seed",
+            Self::SyncImport => "sync_import",
+            Self::SharedMaterialize => "shared_materialize",
+            Self::SharedPromote => "shared_promote",
+            Self::WorkerLocalImport => "worker_local_import",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionDeltaKind {
     Open,
     Close,
@@ -134,6 +162,7 @@ pub(crate) struct SessionDelta {
     pub(crate) key: SessionKey,
     pub(crate) decision: SessionDecision,
     pub(crate) metadata: SessionMetadata,
+    pub(crate) origin: SessionOrigin,
     pub(crate) fabric_redirect_sync: bool,
 }
 
@@ -238,6 +267,7 @@ impl SessionTable {
                         key: key.clone(),
                         decision,
                         metadata: metadata.clone(),
+                        origin: entry.origin,
                         fabric_redirect_sync: false,
                     });
                 }
@@ -342,6 +372,27 @@ impl SessionTable {
         protocol: u8,
         tcp_flags: u8,
     ) -> bool {
+        self.install_with_protocol_with_origin(
+            key,
+            decision,
+            metadata,
+            SessionOrigin::ForwardFlow,
+            now_ns,
+            protocol,
+            tcp_flags,
+        )
+    }
+
+    pub fn install_with_protocol_with_origin(
+        &mut self,
+        key: SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        origin: SessionOrigin,
+        now_ns: u64,
+        protocol: u8,
+        tcp_flags: u8,
+    ) -> bool {
         if self.sessions.len() >= self.max_sessions {
             self.create_drops = self.create_drops.saturating_add(1);
             return false;
@@ -352,6 +403,7 @@ impl SessionTable {
             SessionEntry {
                 decision,
                 metadata: metadata.clone(),
+                origin,
                 last_seen_ns: now_ns,
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
@@ -364,6 +416,7 @@ impl SessionTable {
                 key,
                 decision,
                 metadata,
+                origin,
                 fabric_redirect_sync: false,
             });
         }
@@ -375,6 +428,29 @@ impl SessionTable {
         key: SessionKey,
         decision: SessionDecision,
         metadata: SessionMetadata,
+        now_ns: u64,
+        protocol: u8,
+        tcp_flags: u8,
+        allow_replace_local: bool,
+    ) -> bool {
+        self.upsert_synced_with_origin(
+            key,
+            decision,
+            metadata,
+            SessionOrigin::SyncImport,
+            now_ns,
+            protocol,
+            tcp_flags,
+            allow_replace_local,
+        )
+    }
+
+    pub fn upsert_synced_with_origin(
+        &mut self,
+        key: SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        origin: SessionOrigin,
         now_ns: u64,
         protocol: u8,
         tcp_flags: u8,
@@ -392,6 +468,7 @@ impl SessionTable {
             SessionEntry {
                 decision,
                 metadata: metadata.clone(),
+                origin,
                 last_seen_ns: now_ns,
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
@@ -410,6 +487,27 @@ impl SessionTable {
         protocol: u8,
         tcp_flags: u8,
     ) -> bool {
+        self.promote_synced_with_origin(
+            key,
+            decision,
+            metadata,
+            SessionOrigin::SharedPromote,
+            now_ns,
+            protocol,
+            tcp_flags,
+        )
+    }
+
+    pub fn promote_synced_with_origin(
+        &mut self,
+        key: &SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        origin: SessionOrigin,
+        now_ns: u64,
+        protocol: u8,
+        tcp_flags: u8,
+    ) -> bool {
         let Some(mut entry) = self.remove_entry(key) else {
             return false;
         };
@@ -419,6 +517,7 @@ impl SessionTable {
         }
         entry.decision = decision;
         entry.metadata = metadata.clone();
+        entry.origin = origin;
         entry.last_seen_ns = now_ns;
         entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &self.timeouts);
         entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
@@ -430,6 +529,7 @@ impl SessionTable {
                 key: key.clone(),
                 decision,
                 metadata,
+                origin,
                 fabric_redirect_sync: false,
             });
         }
@@ -468,6 +568,23 @@ impl SessionTable {
         metadata: SessionMetadata,
         fabric_redirect_sync: bool,
     ) {
+        self.emit_open_delta_with_origin(
+            key,
+            decision,
+            metadata,
+            SessionOrigin::ForwardFlow,
+            fabric_redirect_sync,
+        );
+    }
+
+    pub fn emit_open_delta_with_origin(
+        &mut self,
+        key: SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        origin: SessionOrigin,
+        fabric_redirect_sync: bool,
+    ) {
         if metadata.is_reverse {
             return;
         }
@@ -476,6 +593,7 @@ impl SessionTable {
             key,
             decision,
             metadata,
+            origin,
             fabric_redirect_sync,
         });
     }
@@ -546,8 +664,15 @@ impl SessionTable {
 
     /// Iterate over all session entries for diagnostic purposes.
     pub fn iter(&self, mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata)) {
+        self.iter_with_origin(|key, decision, metadata, _origin| f(key, decision, metadata));
+    }
+
+    pub fn iter_with_origin(
+        &self,
+        mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, SessionOrigin),
+    ) {
         for (key, entry) in &self.sessions {
-            f(key, entry.decision, &entry.metadata);
+            f(key, entry.decision, &entry.metadata, entry.origin);
         }
     }
 
@@ -557,9 +682,19 @@ impl SessionTable {
         now_ns: u64,
         mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, u64),
     ) {
+        self.iter_with_idle_and_origin(now_ns, |key, decision, metadata, _origin, idle_ns| {
+            f(key, decision, metadata, idle_ns)
+        });
+    }
+
+    pub fn iter_with_idle_and_origin(
+        &self,
+        now_ns: u64,
+        mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata, SessionOrigin, u64),
+    ) {
         for (key, entry) in &self.sessions {
             let idle_ns = now_ns.saturating_sub(entry.last_seen_ns);
-            f(key, entry.decision, &entry.metadata, idle_ns);
+            f(key, entry.decision, &entry.metadata, entry.origin, idle_ns);
         }
     }
 

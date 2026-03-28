@@ -1095,6 +1095,8 @@ struct SessionDeltaInfo {
     owner_rg_id: i32,
     #[serde(default)]
     disposition: String,
+    #[serde(default)]
+    origin: String,
     #[serde(rename = "egress_ifindex", default)]
     egress_ifindex: i32,
     #[serde(rename = "tx_ifindex", default)]
@@ -1907,6 +1909,7 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
             synced: true,
             nat64_reverse: None,
         },
+        origin: crate::session::SessionOrigin::SyncImport,
     })
 }
 
