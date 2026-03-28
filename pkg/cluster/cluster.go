@@ -142,6 +142,11 @@ type Manager struct {
 	// Set by daemon after sessionSync creation.
 	peerFenceFn func() error
 
+	// peerTimeoutGuardFn can suppress heartbeat-driven peer loss when an
+	// external signal proves the peer is still alive (for example, recent
+	// session-sync traffic on the control link).
+	peerTimeoutGuardFn func() (suppress bool, reason string)
+
 	// preManualFailoverFn runs before the local node resigns an RG.
 	// The daemon uses this to pre-stage userspace continuity before
 	// weight/state changes let the peer take over.
@@ -694,6 +699,14 @@ func (m *Manager) SetPeerFenceFunc(fn func() error) {
 	m.peerFenceFn = fn
 }
 
+// SetPeerTimeoutGuard sets a callback that can suppress heartbeat-driven
+// peer-loss if another control-plane signal proves the peer is still alive.
+func (m *Manager) SetPeerTimeoutGuard(fn func() (bool, string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peerTimeoutGuardFn = fn
+}
+
 // FenceStatus returns the configured fencing action and history of fence events.
 func (m *Manager) FenceStatus() (action string, events []HistoryEvent) {
 	m.mu.RLock()
@@ -1074,10 +1087,24 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 // handlePeerTimeout is called when the peer heartbeat timeout expires.
 func (m *Manager) handlePeerTimeout() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if !m.peerAlive {
+		m.mu.Unlock()
 		return // already marked lost
+	}
+	guard := m.peerTimeoutGuardFn
+	m.mu.Unlock()
+
+	if guard != nil {
+		if suppress, reason := guard(); suppress {
+			slog.Info("cluster: suppressing peer heartbeat timeout", "reason", reason)
+			return
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.peerAlive {
+		return // already marked lost while guard ran
 	}
 
 	m.peerAlive = false

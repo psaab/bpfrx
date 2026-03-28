@@ -335,6 +335,19 @@ func (d *Daemon) onSessionSyncPeerDisconnected() {
 	d.armSyncReadyTimer()
 }
 
+func (d *Daemon) shouldSuppressPeerHeartbeatTimeout() (bool, string) {
+	ss := d.sessionSync
+	if ss == nil || !ss.IsConnected() {
+		return false, ""
+	}
+	const maxPeerSyncSilence = 2 * time.Second
+	age, ok := ss.LastPeerReceiveAge()
+	if !ok || age > maxPeerSyncSilence {
+		return false, ""
+	}
+	return true, fmt.Sprintf("session sync connected with recent peer traffic age=%s", age.Truncate(10*time.Millisecond))
+}
+
 func syncPrimeProgressObserved(current, baseline cluster.SyncStatsSnapshot) bool {
 	return current.SessionsReceived > baseline.SessionsReceived ||
 		current.SessionsInstalled > baseline.SessionsInstalled ||
@@ -5379,6 +5392,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// failover requests via the fabric sync connection.
 			d.cluster.SetPeerFailoverFunc(d.sessionSync.SendFailover)
 			d.cluster.SetPreManualFailoverHook(d.prepareUserspaceManualFailover)
+			d.cluster.SetPeerTimeoutGuard(d.shouldSuppressPeerHeartbeatTimeout)
 
 			// Wire peer fencing: on heartbeat timeout, cluster sends
 			// fence via sync; on receive, disable all local RGs.

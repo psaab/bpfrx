@@ -195,6 +195,7 @@ type SessionSync struct {
 	deleteJournalMu  sync.Mutex
 	deleteJournal    [][]byte // ring buffer of encoded delete messages
 	deleteJournalCap int      // max entries (default 10000)
+	lastPeerRxUnix   atomic.Int64
 
 	// bulkSendMu serializes entire BulkSync() calls so two concurrent
 	// callers (e.g. acceptLoop and connectLoop) cannot interleave.
@@ -345,6 +346,24 @@ func (s *SessionSync) ActiveFabric() int {
 		return 1
 	}
 	return -1
+}
+
+// LastPeerReceiveAge returns how long it has been since the last inbound sync
+// message was received from the peer. The second return value is false if no
+// inbound sync traffic has ever been observed on the current process lifetime.
+func (s *SessionSync) LastPeerReceiveAge() (time.Duration, bool) {
+	last := s.lastPeerRxUnix.Load()
+	if last == 0 {
+		return 0, false
+	}
+	return time.Since(time.Unix(0, last)), true
+}
+
+// PeerRecentlyActive reports whether an inbound sync message has been observed
+// from the peer within maxAge.
+func (s *SessionSync) PeerRecentlyActive(maxAge time.Duration) bool {
+	age, ok := s.LastPeerReceiveAge()
+	return ok && age <= maxAge
 }
 
 // activeConnLocked returns the preferred active connection.
@@ -1223,6 +1242,7 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 			}
 		}
 
+		s.lastPeerRxUnix.Store(time.Now().UnixNano())
 		s.handleMessage(conn, hdr.Type, payload)
 	}
 }
@@ -1903,17 +1923,22 @@ func (s *SessionSync) reconcileStaleSessions() {
 		slog.Info("cluster sync: reconcile stale sessions skipped (no dataplane)")
 		return
 	}
+	if len(zoneSnap) == 0 {
+		slog.Info("cluster sync: reconcile stale sessions skipped (no zone snapshot)")
+		return
+	}
 
 	// shouldSyncAtBulkStart uses the frozen snapshot if available, falling
 	// back to live ShouldSyncZone when no snapshot exists (backward compat).
 	shouldSyncAtBulkStart := func(zoneID uint16) bool {
-		if zoneSnap != nil {
-			if v, ok := zoneSnap[zoneID]; ok {
-				return v
-			}
-			// Zone not in snapshot — fall back to live check.
+		if v, ok := zoneSnap[zoneID]; ok {
+			return v
 		}
-		return s.ShouldSyncZone(zoneID)
+		// Zone missing from the frozen snapshot means ownership was not known at
+		// BulkStart. Skip stale reconciliation for that zone rather than falling
+		// back to a later live view that can delete sessions we have not finished
+		// receiving from the peer yet.
+		return true
 	}
 
 	var deleted int

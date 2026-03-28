@@ -137,6 +137,21 @@ func TestEncodeSessionV6(t *testing.T) {
 	}
 }
 
+func TestPeerRecentlyActive(t *testing.T) {
+	s := &SessionSync{}
+	if s.PeerRecentlyActive(time.Second) {
+		t.Fatal("expected false without peer activity")
+	}
+
+	s.lastPeerRxUnix.Store(time.Now().Add(-500 * time.Millisecond).UnixNano())
+	if !s.PeerRecentlyActive(time.Second) {
+		t.Fatal("expected recent peer activity to be reported")
+	}
+	if s.PeerRecentlyActive(100 * time.Millisecond) {
+		t.Fatal("expected stale peer activity for tight window")
+	}
+}
+
 func TestSyncStatsInit(t *testing.T) {
 	ss := NewSessionSync(":4785", "10.0.0.2:4785", nil)
 	stats := ss.Stats()
@@ -1393,6 +1408,36 @@ func TestReconcileSkipsEmptyBulk(t *testing.T) {
 	}
 	if _, ok := dp.v4sessions[localOwnedKey]; !ok {
 		t.Fatal("local-owned session should remain on empty bulk")
+	}
+}
+
+func TestReconcileSkipsNonEmptyBulkWithoutZoneSnapshot(t *testing.T) {
+	freshKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 7, 1}, Protocol: 6, SrcPort: 1111, DstPort: 80}
+	stalePeerKey := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 7, 2}, Protocol: 6, SrcPort: 2222, DstPort: 443}
+
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			freshKey:     {IsReverse: 0, IngressZone: 2},
+			stalePeerKey: {IsReverse: 0, IngressZone: 2},
+		},
+	}
+
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return false }
+	ss.IsPrimaryForRGFn = func(rgID int) bool { return rgID == 1 }
+	// Intentionally do not install any zone->RG mapping. BulkStart will take an
+	// empty snapshot, which should suppress stale reconciliation for this bulk.
+
+	ss.handleMessage(nil, syncMsgBulkStart, nil)
+	payload := encodeSessionV4Payload(freshKey, dataplane.SessionValue{IsReverse: 0, IngressZone: 2})
+	ss.handleMessage(nil, syncMsgSessionV4, payload)
+	ss.handleMessage(nil, syncMsgBulkEnd, nil)
+
+	if _, ok := dp.v4sessions[freshKey]; !ok {
+		t.Fatal("freshKey should remain")
+	}
+	if _, ok := dp.v4sessions[stalePeerKey]; !ok {
+		t.Fatal("stalePeerKey should remain when zone snapshot is missing")
 	}
 }
 

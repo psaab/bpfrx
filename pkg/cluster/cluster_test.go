@@ -1054,6 +1054,41 @@ func TestHandlePeerTimeout_FencingDisabled(t *testing.T) {
 	}
 }
 
+func TestHandlePeerTimeout_SuppressedByGuard(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200, 1: 100}),
+	)
+	m.UpdateConfig(cfg)
+
+	m.mu.Lock()
+	m.peerAlive = true
+	m.peerEverSeen = true
+	m.peerNodeID = 1
+	m.peerGroups = map[int]PeerGroupState{
+		0: {GroupID: 0, Priority: 100, Weight: 255, State: StatePrimary},
+	}
+	m.mu.Unlock()
+
+	called := false
+	m.SetPeerTimeoutGuard(func() (bool, string) {
+		called = true
+		return true, "recent control-link sync activity"
+	})
+
+	m.handlePeerTimeout()
+
+	if !called {
+		t.Fatal("peer timeout guard was not called")
+	}
+	if !m.PeerAlive() {
+		t.Fatal("peer should remain alive when timeout is suppressed")
+	}
+	if got := len(m.PeerGroupStates()); got != 1 {
+		t.Fatalf("peer groups = %d, want 1 after suppressed timeout", got)
+	}
+}
+
 func TestHandlePeerTimeout_FencingNoSyncFunc(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(
