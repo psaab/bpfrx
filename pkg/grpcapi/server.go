@@ -8955,6 +8955,11 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 		policyDeniedPackets               uint64
 		exceptionPackets                  uint64
 		slowPathPackets                   uint64
+		slowPathLocalDeliveryPackets      uint64
+		slowPathMissingNeighborPackets    uint64
+		slowPathNoRoutePackets            uint64
+		slowPathNextTablePackets          uint64
+		slowPathForwardBuildPackets       uint64
 		lastErrors                        []string
 		recentExceptions                  []string
 	}
@@ -9034,6 +9039,11 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 			snap.policyDeniedPackets += binding.PolicyDeniedPackets
 			snap.exceptionPackets += binding.ExceptionPackets
 			snap.slowPathPackets += binding.SlowPathPackets
+			snap.slowPathLocalDeliveryPackets += binding.SlowPathLocalDeliveryPackets
+			snap.slowPathMissingNeighborPackets += binding.SlowPathMissingNeighborPackets
+			snap.slowPathNoRoutePackets += binding.SlowPathNoRoutePackets
+			snap.slowPathNextTablePackets += binding.SlowPathNextTablePackets
+			snap.slowPathForwardBuildPackets += binding.SlowPathForwardBuildPackets
 			if binding.LastError != "" {
 				errorSet[binding.LastError] = struct{}{}
 			}
@@ -9221,6 +9231,9 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 						usOutstandingTXDelta, usInFlightRecycleDelta                       uint64
 						usSessionMissDelta, usNeighborMissDelta, usRouteMissDelta         uint64
 						usPolicyDeniedDelta, usExceptionDelta, usSlowPathDelta            uint64
+						usSlowPathLocalDelta, usSlowPathMissingNeighborDelta              uint64
+						usSlowPathNoRouteDelta, usSlowPathNextTableDelta                  uint64
+						usSlowPathForwardBuildDelta                                        uint64
 					)
 					if prevSingle != nil && prevSingle.userspace != nil {
 						dt := snap.ts.Sub(prevSingle.ts).Seconds()
@@ -9258,6 +9271,11 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 						usPolicyDeniedDelta = snap.userspace.policyDeniedPackets - baselineSingle.userspace.policyDeniedPackets
 						usExceptionDelta = snap.userspace.exceptionPackets - baselineSingle.userspace.exceptionPackets
 						usSlowPathDelta = snap.userspace.slowPathPackets - baselineSingle.userspace.slowPathPackets
+						usSlowPathLocalDelta = snap.userspace.slowPathLocalDeliveryPackets - baselineSingle.userspace.slowPathLocalDeliveryPackets
+						usSlowPathMissingNeighborDelta = snap.userspace.slowPathMissingNeighborPackets - baselineSingle.userspace.slowPathMissingNeighborPackets
+						usSlowPathNoRouteDelta = snap.userspace.slowPathNoRoutePackets - baselineSingle.userspace.slowPathNoRoutePackets
+						usSlowPathNextTableDelta = snap.userspace.slowPathNextTablePackets - baselineSingle.userspace.slowPathNextTablePackets
+						usSlowPathForwardBuildDelta = snap.userspace.slowPathForwardBuildPackets - baselineSingle.userspace.slowPathForwardBuildPackets
 					}
 
 					fmt.Fprintf(&buf, "Userspace dataplane:\n")
@@ -9293,7 +9311,19 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 					fmt.Fprintf(&buf, "  Route misses:         %20d          [%d]\n", snap.userspace.routeMissPackets, usRouteMissDelta)
 					fmt.Fprintf(&buf, "  Policy denied:        %20d          [%d]\n", snap.userspace.policyDeniedPackets, usPolicyDeniedDelta)
 					fmt.Fprintf(&buf, "  Exception packets:    %20d          [%d]\n", snap.userspace.exceptionPackets, usExceptionDelta)
-					fmt.Fprintf(&buf, "  Slow path packets:    %20d          [%d]\n", snap.userspace.slowPathPackets, usSlowPathDelta)
+					fmt.Fprintf(&buf, "  Slow path packets:    %20d          [%d]  local=%d[%d] neigh=%d[%d] route=%d[%d] next=%d[%d] build=%d[%d]\n",
+						snap.userspace.slowPathPackets,
+						usSlowPathDelta,
+						snap.userspace.slowPathLocalDeliveryPackets,
+						usSlowPathLocalDelta,
+						snap.userspace.slowPathMissingNeighborPackets,
+						usSlowPathMissingNeighborDelta,
+						snap.userspace.slowPathNoRoutePackets,
+						usSlowPathNoRouteDelta,
+						snap.userspace.slowPathNextTablePackets,
+						usSlowPathNextTableDelta,
+						snap.userspace.slowPathForwardBuildPackets,
+						usSlowPathForwardBuildDelta)
 					if len(snap.userspace.lastErrors) > 0 {
 						fmt.Fprintf(&buf, "  Binding errors:\n")
 						for _, msg := range snap.userspace.lastErrors {
