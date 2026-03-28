@@ -44,29 +44,47 @@ What landed:
   - admission failures
   - post-admission dataplane failures
 
-The newer dataplane fix addressed the remaining forward-direction collapse:
+The later dataplane work narrowed, but did not eliminate, the post-failover
+poisoning path.
 
-- transient TCP ACK misses to WAN interface-NAT addresses are no longer cached as helper-local `LocalDelivery` sessions
-- this prevents the new owner from poisoning the inherited WAN reply path during failover
-- the affected path was visible as:
-  - very low `session misses`
-  - but rapidly increasing `Slow path packets: local` on the new-owner WAN binding
+What landed after that:
+
+- transient TCP ACK misses to WAN `LocalDelivery` targets are no longer cached as helper-local sessions
+- helper-local `LocalDelivery` sessions are no longer published into shared worker alias maps
+- userspace session-sync deltas now carry `disposition`
+- daemon-side HA session sync now refuses to mirror `local_delivery` deltas to the peer
+
+What those fixes proved:
+
+- the original ACK-miss caching bug was real
+- shared helper alias pollution was real
+- but neither of those changes removed the core hardened-harness collapse
+- the new owner still accumulates public-side `LocalDelivery` state during failover from some other path
 
 ## What is still broken
 
-The specific `node0 -> node1` manual failover collapse that dominated the
-earlier investigation is now fixed on this branch.
+The specific `node0 -> node1` manual failover collapse is still present under
+the hardened failover validator.
 
-What is still not fully proven:
+What is still broken:
 
-- the full hardened failover validator has not yet been rerun end-to-end on this exact build
-- reverse-direction manual failover should be rerun once on top of the new WAN local-session fix, even though it was already healthy before that change
-- crash/rejoin is materially better, but the stricter harness should still be rerun against the current build so the remaining failover budget is explicit
+- the exact strengthened RG1 failover harness still collapses after the move to `node1`
+- all four `iperf3` streams still hit `0.00 bits/sec`
+- the remote client still hangs until the harness kills it
+- the new owner still shows exploding `Slow path local-delivery` during the bad window
+- the new owner still ends up with public-side sessions like:
+  - `172.16.80.8:<port> -> 172.16.80.200:5201`
+
+What is still improved:
+
+- sync admission and bulk priming are no longer the blocker
+- target and external reachability stay up during the bad run
+- crash/rejoin is still materially better than the old baseline
 
 ## Latest evidence
 
-Manual `RG1 node0 -> node1` is now healthy under the simplified long-lived
-repro.
+The simplified manual repro improved, but the stronger failover gate still
+fails after each of the latest narrowing fixes.
 
 Validated forward-direction artifact:
 
@@ -87,6 +105,33 @@ signature was gone:
 
 - `Slow path packets` stayed flat
 - there was no renewed `local` slow-path explosion on `ge-7/0/2`
+
+That simplified pass was not sufficient.
+
+The hardened failover validator still failed repeatedly on later checkpoints:
+
+- `/tmp/userspace-ha-failover-rg1-20260327-232956`
+  - `4.530 Gbps`
+  - `25410` retransmits
+  - `fw1 Slow path local-delivery: 2 -> 1598 -> 4800`
+- `/tmp/userspace-ha-failover-rg1-20260327-234049`
+  - `4.959 Gbps`
+  - `14819` retransmits
+  - `fw1 Slow path local-delivery: 14 -> 1298 -> 3240`
+- `/tmp/userspace-ha-failover-rg1-20260327-235148`
+  - `4.119 Gbps`
+  - `12568` retransmits
+  - `fw1 Slow path local-delivery: 2 -> 4488 -> 6632`
+
+Interpretation:
+
+- the worker-local alias fix helped somewhat
+- the daemon-side `local_delivery` sync filter did not fix the collapse
+- the newest artifact still shows public-side sessions on `fw1` during the bad window
+- therefore the remaining poison is not explained only by:
+  - ACK-miss caching
+  - shared worker alias publication
+  - daemon-side session-sync replication
 
 Crash/rejoin is also materially improved on the same branch.
 
@@ -111,54 +156,74 @@ Interpretation:
 
 ## Current working hypothesis
 
-The current branch is past the original sync-admission and forward-collapse
-bugs.
+The current branch is past the original sync-admission and bulk-priming bugs.
 
 The remaining question is narrower:
 
-- does the full hardened failover gate stay green on this build
-- and, if not, what residual transition weakness is left once the local-session
-  poisoning bug is removed
+- what path is still creating public-side `LocalDelivery` state on the new owner
+- and why does that state survive even after:
+  - ACK-miss caching suppression
+  - worker-local shared-alias suppression
+  - daemon-side `local_delivery` sync filtering
+
+The likely remaining class is:
+
+- session materialization on the new owner from a hit/import/replay path that
+  still carries `LocalDelivery` semantics for public-side translated traffic
 
 ## Next code steps
 
-### 1. Rerun the hardened failover validator on this exact build
+### 1. Tag the origin of helper-local sessions in status and delta logs
 
-Use the full userspace HA validation path, not only the simplified manual repro.
+The current artifacts prove that bad public-side sessions still appear on the
+new owner, but not where they were created.
 
-Goal:
+Add enough visibility to distinguish:
 
-- confirm whether the current branch is actually good enough for the stronger gate
-- capture any remaining failures with the stricter artifacts already in the harness
-
-### 2. Rerun reverse-direction manual failover once on top of the WAN local-session fix
-
-The reverse direction was already healthy before the latest fix.
-It still needs one confirming run on top of the current build so both RG1 move
-directions are explicitly proven.
+- miss-created helper-local sessions
+- synced/imported helper-local sessions
+- replayed helper-local sessions
+- promoted shared hits that retain `LocalDelivery`
 
 Goal:
 
-- eliminate direction-specific uncertainty before changing more dataplane logic
+- make the next failing artifact say where the bad session came from
 
-### 3. Only add more dataplane changes if the hardened gate still fails
+### 2. Trace the new-owner public-side session creation path directly
 
-If the gate still fails after the forward-fix branch, the next step should be
-driven by the new artifacts, not by re-opening the already-fixed sync-admission
-path.
+Target the exact `fw1` sessions seen in the failing artifacts:
 
-That means:
+- `172.16.80.8:<port> -> 172.16.80.200:5201`
 
-- preserve the stricter sync admission gate
-- preserve the WAN local-session caching fix
-- inspect the next remaining failure on its own merits
+Instrument the creation/import path so the artifact answers:
+
+- which code path installed it
+- with which disposition
+- from which source object:
+  - local miss
+  - shared session
+  - shared forward-wire alias
+  - daemon session sync
+  - replay/export
+
+### 3. Block public-side `LocalDelivery` materialization once the source is confirmed
+
+Once the remaining source is proven, cut it off narrowly.
+
+The next likely keep is:
+
+- reject or rewrite helper-local `LocalDelivery` installs for translated
+  public-side forward traffic on the new owner
+
+Do not reopen the already-fixed paths unless the next artifact proves they
+regressed.
 
 ## Recommended implementation order
 
-1. Run the hardened failover validator on the current branch.
-2. Re-run reverse-direction manual `RG1` failover once.
-3. If both pass, stop changing the failover dataplane and move to cleanup / PR polish.
-4. If either fails, use the new artifacts to isolate the remaining transition bug before touching sync-admission logic again.
+1. Add origin tagging for helper-local session creation/import.
+2. Reproduce the same hardened RG1 failover and capture the first bad public-side session on `fw1`.
+3. Cut off that exact creation/import path.
+4. Rerun the same hardened validator before touching any unrelated failover logic.
 
 ## Acceptance criteria
 
@@ -168,15 +233,18 @@ The current branch should not be considered done until all of these are true:
 - manual `RG1 node1 -> node0` stays up under long-lived `iperf3`
 - the hardened failover validator stays green on this build
 - crash/rejoin still recovers and remains stable after the rebooted node returns
-- no regression reintroduces the new-owner WAN `local` slow-path explosion on transient reply misses
+- the new owner no longer accumulates public-side `LocalDelivery` sessions during the failover window
+- `fw1 Slow path local-delivery` stays flat enough that it is no longer the dominant counter in the bad interval
 
 ## What not to do next
 
-Do not spend the next cycle re-opening the now-fixed blockers unless the stronger
-gate proves they have regressed:
+Do not spend the next cycle re-opening the now-fixed blockers unless the next
+artifact proves they have regressed:
 
 - removing the stricter sync admission gate
 - backing out the WAN local-session caching fix
+- backing out the worker-local alias suppression
+- backing out the daemon-side `local_delivery` sync filter
 - rewriting the barrier path again
 - speculating about fabric throughput without first rerunning the current gate
 

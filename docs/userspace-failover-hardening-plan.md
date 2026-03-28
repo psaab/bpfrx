@@ -464,12 +464,57 @@ Interpretation:
 
 Status:
 
-- This root cause is now addressed on the current branch.
+- This root cause was real, but it was not sufficient.
 - TCP ACK misses for interface-NAT-derived `LocalDelivery` are no longer cached
   as helper-local sessions.
-- The validated `node0 -> node1` artifact
+- The simplified artifact
   `/tmp/manual-rg1-forward-simple7-20260327-230430` stayed healthy at about
   `20.7 Gbps` with `0` retransmits and no collapse.
+- But the stronger harness still failed later on:
+  - `/tmp/userspace-ha-failover-rg1-20260327-232956`
+  - `/tmp/userspace-ha-failover-rg1-20260327-234049`
+  - `/tmp/userspace-ha-failover-rg1-20260327-235148`
+
+### Root cause H: public-side `LocalDelivery` state is still being materialized on the new owner from a path other than ACK-miss caching
+
+What the later narrowing fixes tried:
+
+- helper-local `LocalDelivery` sessions were kept out of shared worker alias maps
+- daemon session-sync deltas were extended with explicit `disposition`
+- daemon-side HA session sync was changed to skip `local_delivery` deltas
+
+What the later artifacts showed anyway:
+
+- the new owner still accumulates large `Slow path local-delivery` counts in the
+  failover window:
+  - `/tmp/userspace-ha-failover-rg1-20260327-232956`
+    - `2 -> 1598 -> 4800`
+  - `/tmp/userspace-ha-failover-rg1-20260327-234049`
+    - `14 -> 1298 -> 3240`
+  - `/tmp/userspace-ha-failover-rg1-20260327-235148`
+    - `2 -> 4488 -> 6632`
+- the new owner still shows public-side sessions such as:
+  - `172.16.80.8:<port> -> 172.16.80.200:5201`
+  - `Out: 172.16.80.200/5201 -> 172.16.80.8:<port>; If: reth0.50`
+- session/neighbor/route miss growth stays low during the same runs
+
+Interpretation:
+
+- the remaining poison is not explained only by:
+  - transient TCP ACK miss caching
+  - shared worker alias publication
+  - daemon-side session-sync replication
+- the new owner is still materializing public-side `LocalDelivery` state from
+  some other path, most likely:
+  - helper import/replay of a session object
+  - shared-hit promotion that preserves `LocalDelivery`
+  - another helper-local install path that is not miss-driven
+
+Current status:
+
+- this is now the primary unresolved failover bug class
+- the next work should identify exactly which creation/import path is producing
+  the bad public-side sessions on `fw1`
 
 ## Plan
 
@@ -555,7 +600,28 @@ Current status:
   session caching on transient ACK misses
 - that forward-direction collapse is now fixed on the current branch
 
-### Phase 5: harden validation
+### Phase 5: trace and block remaining public-side `LocalDelivery` materialization
+
+1. Add origin tagging for helper-local session creation/import paths so status
+   and delta artifacts can distinguish:
+   - miss-created helper-local sessions
+   - replayed/imported helper-local sessions
+   - promoted shared hits
+2. Reproduce the exact hardened RG1 failover and capture the first bad
+   `172.16.80.8:<port> -> 172.16.80.200:5201` session on `fw1`.
+3. Cut off that exact path narrowly:
+   - either refuse the install
+   - or rewrite the resolution so public-side translated forward traffic cannot
+     become helper-local `LocalDelivery` on the new owner
+
+Expected result:
+
+- `fw1` no longer accumulates public-side `LocalDelivery` sessions during the
+  failover window
+- `Slow path local-delivery` stops dominating the bad interval
+- the next remaining failure, if any, is a pure redirected transport problem
+
+### Phase 6: harden validation
 
 Add explicit validation for both failure classes:
 
