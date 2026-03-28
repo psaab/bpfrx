@@ -9,28 +9,40 @@ The userspace HA failover path is still flaky in two distinct ways:
 
 These are not the same bug. They need separate fixes and separate validation.
 
-There is a third control-plane issue underneath both of them:
+There is now a third validation/environment constraint:
 
-3. Session-sync readiness is still treated as "a fresh bulk sync completed on
+3. The lab WAN50/public path was independently broken on March 28, 2026.
+   External internet checks must be isolated from userspace failover checks
+   during that outage.
+
+There is a fourth control-plane issue underneath both of them:
+
+4. Session-sync readiness is still treated as "a fresh bulk sync completed on
    this connection" instead of "this standby has a valid sync baseline."
 
-There is now a fourth dataplane-specific issue that shows up after the earlier
+There is now a fifth dataplane-specific issue that shows up after the earlier
 cache and sync-readiness fixes:
 
-4. The new owner can still miss post-failover forward-wire sessions for flows
+5. The new owner can still miss post-failover forward-wire sessions for flows
    first observed on the old owner after the RG move.
 
-There is now a fifth narrowing result from the traced `2026-03-28` artifact:
+There is now a sixth narrowing result from the traced `2026-03-28` artifact:
 
-5. The remaining bad `fw1` sessions are being materialized through
+6. The remaining bad `fw1` sessions are being materialized through
    `shared_promote` on translated public-side tuples after failover.
 
-There is now a sixth confirmed dataplane result from the latest `2026-03-28`
+There is now a seventh confirmed dataplane result from the latest `2026-03-28`
 artifact:
 
-6. Established redirected packets that hit the flow-cache fast path were still
+7. Established redirected packets that hit the flow-cache fast path were still
    selecting the fabric egress binding by ingress queue instead of by per-flow
    fabric hash, collapsing inherited failover traffic onto one worker.
+
+There is now an eighth post-merge finding from the March 28 reruns:
+
+8. After the queue-selection and sync-disconnect fixes, admitted failover
+   traffic can stay healthy through the ownership move, but the new owner VM
+   can reboot under load, causing the old owner to reclaim `RG1`.
 
 ## What we reproduced
 
@@ -811,6 +823,45 @@ Expected result:
 - the next code changes target the actual remaining bottleneck instead of
   reopening the now-working barrier path
 
+### Phase 8: harden sync-disconnect behavior and investigate new-owner reboot
+
+What changed on March 28, 2026:
+
+- `onSessionSyncPeerDisconnected()` was changed to stop clearing readiness via a
+  timeout fallback
+- this removed the earlier "peer disconnected, then both sides auto-release
+  hold and re-enter election" split-brain failure
+- the failover harness also gained `CHECK_EXTERNAL_REACHABILITY=0` so WAN-path
+  outages can be isolated instead of being misreported as dataplane failures
+
+What the rerun proved:
+
+- external preflight failure was real but environmental:
+  - `1.1.1.1` and `2606:4700:4700::1111` were unreachable
+  - local `.200` IPv4/IPv6 still worked
+  - active `fw0` could not reach `172.16.50.1` or `2001:559:8585:50::1`
+- with external checks disabled, the two-cycle gate reached the failover path
+  and the traffic itself stayed healthy through the move
+- the move still did not stick:
+  - `node1` later logged `clearing manual failover (peer lost)`
+  - `RG1` returned to `node1`
+  - `fw0` crossed a journal boot boundary around `2026-03-28 14:58:10 UTC`
+  - that proves the new owner VM rebooted after becoming primary
+
+Next actions:
+
+1. determine why `bpfrx-userspace-fw0` rebooted under admitted failover load
+2. separate:
+   - kernel panic / watchdog reset
+   - host-side VM reset
+   - explicit automation reboot
+3. rerun the same two-cycle gate only after that reboot cause is understood
+
+Expected result:
+
+- the failover result becomes stable enough to validate multi-cycle behavior
+- the remaining blocker is no longer hidden behind an uncontrolled VM reboot
+
 ## Execution order
 
 1. Implement staged demotion-prep and worker acking for RG handoff.
@@ -828,6 +879,8 @@ Expected result:
     failover gate on the repaired branch.
 11. Reconfirm reverse-direction manual failover and crash/rejoin on the same
     build before declaring the failover path stable.
+12. Investigate and eliminate the new-owner reboot observed after the admitted
+    March 28 failover rerun.
 
 ## Acceptance criteria
 
@@ -838,6 +891,8 @@ Expected result:
 - new owner actually carries the flow
 - the post-transition stale-owner fabric path stays alive instead of collapsing
   a few seconds after primary transition
+- the new owner stays up after primary transition; no unexpected VM reboot or
+  daemon restart occurs
 - retransmits and fabric input drops stay within the failover budget
 - transient WAN reply misses do not poison the new owner into helper-local
   session caching
