@@ -9519,17 +9519,13 @@ fn should_cache_local_delivery_session_on_miss(
     if !matches!(protocol, PROTO_TCP) {
         return true;
     }
-    let Some(interface_nat_local) = interface_nat_local_resolution(state, resolution_target) else {
-        return true;
-    };
-    if interface_nat_local.local_ifindex != resolution.local_ifindex {
-        return true;
-    }
     const TCP_SYN_FLAG: u8 = 0x02;
     const TCP_ACK_FLAG: u8 = 0x10;
     if (tcp_flags & TCP_ACK_FLAG) != 0 && (tcp_flags & TCP_SYN_FLAG) == 0 {
         return false;
     }
+    let _ = state;
+    let _ = resolution_target;
     true
 }
 
@@ -14006,6 +14002,46 @@ mod tests {
             ForwardingDisposition::LocalDelivery
         );
         assert_eq!(resolved_v6.local_ifindex, 12);
+    }
+
+    #[test]
+    fn tcp_ack_session_miss_does_not_cache_ingress_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let resolution = ingress_interface_local_resolution_on_session_miss(
+            &state,
+            11,
+            80,
+            "172.16.80.8".parse().expect("dst"),
+            PROTO_TCP,
+        )
+        .expect("tcp ingress local delivery");
+        assert!(!should_cache_local_delivery_session_on_miss(
+            &state,
+            "172.16.80.8".parse().expect("dst"),
+            resolution,
+            PROTO_TCP,
+            0x10,
+        ));
+    }
+
+    #[test]
+    fn tcp_syn_session_miss_still_caches_ingress_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let resolution = ingress_interface_local_resolution_on_session_miss(
+            &state,
+            11,
+            80,
+            "172.16.80.8".parse().expect("dst"),
+            PROTO_TCP,
+        )
+        .expect("tcp ingress local delivery");
+        assert!(should_cache_local_delivery_session_on_miss(
+            &state,
+            "172.16.80.8".parse().expect("dst"),
+            resolution,
+            PROTO_TCP,
+            0x02,
+        ));
     }
 
     #[test]
