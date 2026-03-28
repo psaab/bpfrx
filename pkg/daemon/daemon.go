@@ -3478,6 +3478,9 @@ func userspaceForwardWireAliasFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zo
 }
 
 func (d *Daemon) shouldSyncUserspaceDelta(delta dpuserspace.SessionDeltaInfo, ingressZone uint16) bool {
+	if strings.EqualFold(delta.Disposition, "local_delivery") {
+		return false
+	}
 	if delta.FabricRedirect && !delta.FabricIngress {
 		return d.sessionSync != nil
 	}

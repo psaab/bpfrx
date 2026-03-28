@@ -420,6 +420,18 @@ func TestShouldSyncUserspaceDeltaFallsBackToZone(t *testing.T) {
 	}
 }
 
+func TestShouldSyncUserspaceDeltaSkipsLocalDelivery(t *testing.T) {
+	d := &Daemon{
+		sessionSync: &cluster.SessionSync{
+			IsPrimaryFn:      func() bool { return true },
+			IsPrimaryForRGFn: func(rgID int) bool { return true },
+		},
+	}
+	if d.shouldSyncUserspaceDelta(dpuserspace.SessionDeltaInfo{Disposition: "local_delivery"}, 1) {
+		t.Fatal("expected helper local-delivery deltas to stay out of session sync")
+	}
+}
+
 func TestShouldSyncUserspaceDeltaAllowsStaleOwnerFabricRedirect(t *testing.T) {
 	ss := &cluster.SessionSync{
 		IsPrimaryFn:      func() bool { return false },

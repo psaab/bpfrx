@@ -590,6 +590,7 @@ type SessionDeltaInfo struct {
 	IngressZone      string    `json:"ingress_zone,omitempty"`
 	EgressZone       string    `json:"egress_zone,omitempty"`
 	OwnerRGID        int       `json:"owner_rg_id,omitempty"`
+	Disposition      string    `json:"disposition,omitempty"`
 	EgressIfindex    int       `json:"egress_ifindex,omitempty"`
 	TXIfindex        int       `json:"tx_ifindex,omitempty"`
 	TunnelEndpointID uint16    `json:"tunnel_endpoint_id,omitempty"`

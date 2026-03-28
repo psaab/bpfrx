@@ -5645,6 +5645,18 @@ fn flush_session_deltas(
             ingress_zone: delta.metadata.ingress_zone.to_string(),
             egress_zone: delta.metadata.egress_zone.to_string(),
             owner_rg_id: delta.metadata.owner_rg_id,
+            disposition: match delta.decision.resolution.disposition {
+                ForwardingDisposition::ForwardCandidate => "forward_candidate",
+                ForwardingDisposition::LocalDelivery => "local_delivery",
+                ForwardingDisposition::NoRoute => "no_route",
+                ForwardingDisposition::MissingNeighbor => "missing_neighbor",
+                ForwardingDisposition::PolicyDenied => "policy_denied",
+                ForwardingDisposition::FabricRedirect => "fabric_redirect",
+                ForwardingDisposition::HAInactive => "ha_inactive",
+                ForwardingDisposition::DiscardRoute => "discard_route",
+                ForwardingDisposition::NextTableUnsupported => "next_table_unsupported",
+            }
+            .to_string(),
             egress_ifindex: delta.decision.resolution.egress_ifindex,
             tx_ifindex: delta.decision.resolution.tx_ifindex,
             tunnel_endpoint_id: delta.decision.resolution.tunnel_endpoint_id,
