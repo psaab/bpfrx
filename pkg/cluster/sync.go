@@ -380,6 +380,22 @@ func connRemoteAddrString(conn net.Conn) (remote string) {
 	return addr.String()
 }
 
+func connLocalAddrString(conn net.Conn) (local string) {
+	if conn == nil {
+		return "<nil>"
+	}
+	defer func() {
+		if recover() != nil {
+			local = "<unavailable>"
+		}
+	}()
+	addr := conn.LocalAddr()
+	if addr == nil {
+		return "<nil>"
+	}
+	return addr.String()
+}
+
 // handleNewConnection processes a newly established connection on the given fabric.
 // It sets the connection in the appropriate slot, starts the receive loop, exchanges
 // clocks, and triggers bulk sync if this is the first connection after a total disconnect.
@@ -949,6 +965,7 @@ func (s *SessionSync) BulkSync() error {
 	stats := s.Stats()
 	slog.Info("cluster sync: bulk sync starting",
 		"epoch", epoch,
+		"local", connLocalAddrString(conn),
 		"remote", connRemoteAddrString(conn),
 		"sessions_sent", stats.SessionsSent,
 		"sessions_received", stats.SessionsReceived,
@@ -1215,7 +1232,18 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 	case syncMsgSessionV4:
 		s.stats.SessionsReceived.Add(1)
 		if s.stats.BulkSyncStartTime.Load() > 0 && s.stats.BulkSyncEndTime.Load() == 0 {
-			s.stats.BulkSyncSessions.Add(1)
+			count := s.stats.BulkSyncSessions.Add(1)
+			if count == 1 || count%64 == 0 {
+				s.bulkMu.Lock()
+				epoch := s.bulkRecvEpoch
+				s.bulkMu.Unlock()
+				slog.Info("cluster sync: bulk receive progress",
+					"epoch", epoch,
+					"sessions", count,
+					"type", "v4",
+					"local", connLocalAddrString(conn),
+					"remote", connRemoteAddrString(conn))
+			}
 		}
 		if s.dp != nil {
 			if key, val, ok := decodeSessionV4Payload(payload); ok {
@@ -1301,7 +1329,18 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 	case syncMsgSessionV6:
 		s.stats.SessionsReceived.Add(1)
 		if s.stats.BulkSyncStartTime.Load() > 0 && s.stats.BulkSyncEndTime.Load() == 0 {
-			s.stats.BulkSyncSessions.Add(1)
+			count := s.stats.BulkSyncSessions.Add(1)
+			if count == 1 || count%64 == 0 {
+				s.bulkMu.Lock()
+				epoch := s.bulkRecvEpoch
+				s.bulkMu.Unlock()
+				slog.Info("cluster sync: bulk receive progress",
+					"epoch", epoch,
+					"sessions", count,
+					"type", "v6",
+					"local", connLocalAddrString(conn),
+					"remote", connRemoteAddrString(conn))
+			}
 		}
 		if s.dp != nil {
 			if key, val, ok := decodeSessionV6Payload(payload); ok {
@@ -1446,7 +1485,10 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		s.bulkRecvV6 = make(map[dataplane.SessionKeyV6]struct{})
 		s.bulkZoneSnapshot = zoneSnap
 		s.bulkMu.Unlock()
-		slog.Info("cluster sync: bulk transfer starting", "epoch", epoch)
+		slog.Info("cluster sync: bulk transfer starting",
+			"epoch", epoch,
+			"local", connLocalAddrString(conn),
+			"remote", connRemoteAddrString(conn))
 
 	case syncMsgBulkEnd:
 		var epoch uint64
@@ -1463,7 +1505,11 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		s.bulkMu.Unlock()
 		s.stats.BulkSyncEndTime.Store(time.Now().UnixNano())
 		s.reconcileStaleSessions()
-		slog.Info("cluster sync: bulk transfer complete", "epoch", epoch)
+		slog.Info("cluster sync: bulk transfer complete",
+			"epoch", epoch,
+			"sessions", s.stats.BulkSyncSessions.Load(),
+			"local", connLocalAddrString(conn),
+			"remote", connRemoteAddrString(conn))
 		s.sendBulkAck(conn, epoch)
 		if s.OnBulkSyncReceived != nil {
 			go s.OnBulkSyncReceived()
@@ -1478,6 +1524,8 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		stats := s.Stats()
 		slog.Info("cluster sync: bulk ack received",
 			"epoch", epoch,
+			"local", connLocalAddrString(conn),
+			"remote", connRemoteAddrString(conn),
 			"sessions_sent", stats.SessionsSent,
 			"sessions_received", stats.SessionsReceived,
 			"sessions_installed", stats.SessionsInstalled,
@@ -1629,10 +1677,17 @@ func (s *SessionSync) sendBulkAck(conn net.Conn, epoch uint64) {
 	defer s.writeMu.Unlock()
 	if err := writeMsg(conn, syncMsgBulkAck, payload[:]); err != nil {
 		s.stats.Errors.Add(1)
-		slog.Debug("cluster sync: failed to send bulk ack", "epoch", epoch, "err", err)
+		slog.Debug("cluster sync: failed to send bulk ack",
+			"epoch", epoch,
+			"local", connLocalAddrString(conn),
+			"remote", connRemoteAddrString(conn),
+			"err", err)
 		return
 	}
-	slog.Info("cluster sync: bulk ack sent", "epoch", epoch)
+	slog.Info("cluster sync: bulk ack sent",
+		"epoch", epoch,
+		"local", connLocalAddrString(conn),
+		"remote", connRemoteAddrString(conn))
 }
 
 func (s *SessionSync) waitForSendQueueDrain(timeout time.Duration) error {
