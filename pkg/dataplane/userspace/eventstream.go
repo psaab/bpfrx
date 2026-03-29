@@ -310,6 +310,10 @@ func (es *EventStream) readLoop(ctx context.Context) {
 				es.onFullResync()
 			}
 
+		case EventTypeKeepalive:
+			// Idle heartbeat from helper — no action needed, just keeps
+			// the connection alive to prevent read-deadline disconnect.
+
 		default:
 			slog.Debug("event stream: unknown frame type", "type", typ)
 		}

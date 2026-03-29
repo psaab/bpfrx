@@ -624,7 +624,8 @@ const (
 	EventTypeResume          uint8 = 6 // daemon → helper
 	EventTypeDrainRequest    uint8 = 7 // daemon → helper (target seq in header)
 	EventTypeDrainComplete   uint8 = 8 // helper → daemon
-	EventTypeFullResync      uint8 = 9 // helper → daemon
+	EventTypeFullResync      uint8 = 9  // helper → daemon
+	EventTypeKeepalive       uint8 = 10 // helper → daemon (idle heartbeat)
 )
 
 // Session event flag bits in the Flags byte of SessionOpen/Update/Close payloads.

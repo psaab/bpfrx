@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Wire format constants
@@ -38,6 +38,10 @@ const MSG_RESUME: u8 = 6;
 const MSG_DRAIN_REQUEST: u8 = 7;
 const MSG_DRAIN_COMPLETE: u8 = 8;
 const MSG_FULL_RESYNC: u8 = 9;
+const MSG_KEEPALIVE: u8 = 10;
+
+/// Interval between keepalive frames to prevent idle disconnect.
+const KEEPALIVE_INTERVAL_NS: u64 = 10_000_000_000; // 10 seconds
 
 /// Maximum event frames buffered in the mpsc channel (shared across workers).
 const CHANNEL_CAPACITY: usize = 8192;
@@ -612,15 +616,19 @@ fn replay_buffered(
     acked_seq: u64,
     shared: &Arc<EventStreamShared>,
 ) -> io::Result<()> {
-    // Check if replay buffer covers what we need
+    // Check if replay buffer covers what we need.
+    // Only send FullResync if the daemon previously acked real events
+    // (acked_seq > 0) AND our replay buffer has a gap (can't replay
+    // from acked+1). On fresh start with no events, just start clean.
     let oldest_buffered = replay_buf.front().map(|f| f.seq).unwrap_or(0);
-    if acked_seq > 0 && (replay_buf.is_empty() || oldest_buffered > acked_seq + 1) {
-        // Gap: send FullResync
+    let has_gap = replay_buf.is_empty() || oldest_buffered > acked_seq + 1;
+    if acked_seq > 0 && has_gap {
         let seq = shared.next_seq.fetch_add(1, Ordering::Relaxed) + 1;
         let frame = EventFrame::encode_full_resync(seq);
         write_frame_blocking(stream, &frame)?;
         shared.frames_sent.fetch_add(1, Ordering::Relaxed);
-        eprintln!("bpfrx-event-stream: sent FullResync (buffer gap)");
+        eprintln!("bpfrx-event-stream: sent FullResync (buffer gap: acked={}, oldest_buffered={})",
+            acked_seq, oldest_buffered);
         replay_buf.clear();
         return Ok(());
     }
@@ -665,6 +673,7 @@ fn run_connected_loop(
     let mut write_buf: Vec<u8> = Vec::with_capacity(4096);
     let mut tmp_read = [0u8; 64];
     let mut idle_cycles = 0u32;
+    let mut last_write = Instant::now();
 
     loop {
         if stop.load(Ordering::Acquire) {
@@ -747,12 +756,22 @@ fn run_connected_loop(
             }
         }
 
-        // Idle backoff
+        // Idle backoff + keepalive
         if drained_any {
             idle_cycles = 0;
+            last_write = Instant::now();
         } else {
             idle_cycles = idle_cycles.saturating_add(1);
             if idle_cycles > 10 {
+                // Send keepalive to prevent idle disconnect on Go side
+                if last_write.elapsed().as_secs() >= 10 {
+                    let mut ka = [0u8; FRAME_HEADER_SIZE];
+                    ka[4] = MSG_KEEPALIVE;
+                    if let Err(_) = (&*stream).write_all(&ka) {
+                        return true; // disconnect
+                    }
+                    last_write = Instant::now();
+                }
                 thread::sleep(Duration::from_millis(1));
             }
         }
