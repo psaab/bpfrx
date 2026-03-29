@@ -2596,31 +2596,25 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 }
 
 func (m *Manager) UpdateRGActive(rgID int, active bool) error {
-	// When demoting an RG, flush the USERSPACE_SESSIONS BPF map BEFORE
-	// setting rg_active=0. Without this, the XDP shim finds stale entries
-	// and redirects to XSK, bypassing the eBPF pipeline's fabric redirect
-	// that handles cross-chassis forwarding for demoted RGs.
 	if !active {
-		if usMap := m.inner.Map("userspace_sessions"); usMap != nil {
-			var key, nextKey []byte
-			key = make([]byte, usMap.KeySize())
-			nextKey = make([]byte, usMap.KeySize())
-			deleted := 0
-			for {
-				if err := usMap.NextKey(key, nextKey); err != nil {
-					break
-				}
-				copy(key, nextKey)
-				if err := usMap.Delete(key); err != nil {
-					break
-				}
-				deleted++
-			}
-			if deleted > 0 {
-				slog.Info("userspace: flushed USERSPACE_SESSIONS before RG demotion",
-					"rg", rgID, "deleted", deleted)
-			}
+		// CRITICAL ORDERING for failover:
+		// 1. Disable ctrl → XDP shim stops redirecting to XSK
+		// 2. Set rg_active=0 → eBPF pipeline redirects to fabric
+		// 3. Sync HA state to helper → helper updates eventually
+		// 4. Helper re-enables ctrl after processing demotion
+		//
+		// This ensures ZERO gap: the eBPF pipeline handles the critical
+		// transition window with real-time rg_active checks and fabric
+		// redirect. The helper's async processing is no longer on the
+		// critical path for packet forwarding.
+		m.mu.Lock()
+		m.disableUserspaceCtrlLocked()
+		if m.inner.XDPEntryProg != "xdp_main_prog" {
+			_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
 		}
+		m.mu.Unlock()
+		slog.Info("userspace: disabled ctrl + swapped to eBPF pipeline for RG demotion",
+			"rg", rgID)
 	}
 	if err := m.inner.UpdateRGActive(rgID, active); err != nil {
 		return err
