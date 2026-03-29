@@ -350,11 +350,42 @@ pub(super) fn apply_worker_commands(
                     owner_rgs, pre_count, sessions.len()
                 );
             }
-            WorkerCommand::UpsertSynced(entry) => {
+            WorkerCommand::UpsertSynced(mut entry) => {
                 let key = entry.key.clone();
+                let locally_active =
+                    owner_rg_is_locally_active(ha_state, entry.metadata.owner_rg_id, now_secs);
+                let allow_replace_local = !locally_active;
+
+                // If the owner RG is locally active, re-resolve the session's
+                // egress using local forwarding state. Synced sessions arrive
+                // with the remote node's interface indices and MACs which don't
+                // work on this node.
+                if locally_active && !entry.metadata.is_reverse {
+                    let flow = SessionFlow {
+                        src_ip: key.src_ip,
+                        dst_ip: key.dst_ip,
+                        forward_key: key.clone(),
+                    };
+                    let resolution_target = resolution_target_for_session(&flow, entry.decision);
+                    let re_resolved = lookup_forwarding_resolution_for_session(
+                        forwarding,
+                        dynamic_neighbors,
+                        &flow,
+                        entry.decision,
+                    );
+                    let re_resolved = enforce_ha_resolution_snapshot(
+                        forwarding, ha_state, now_secs, re_resolved,
+                    );
+                    if re_resolved.disposition != ForwardingDisposition::HAInactive {
+                        entry.decision.resolution = re_resolved;
+                        let new_owner = owner_rg_for_resolution(forwarding, re_resolved);
+                        if new_owner > 0 {
+                            entry.metadata.owner_rg_id = new_owner;
+                        }
+                    }
+                }
+
                 let metadata = entry.metadata.clone();
-                let allow_replace_local =
-                    !owner_rg_is_locally_active(ha_state, entry.metadata.owner_rg_id, now_secs);
                 if sessions.upsert_synced_with_origin(
                     entry.key,
                     entry.decision,
