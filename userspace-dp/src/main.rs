@@ -1,4 +1,5 @@
 mod afxdp;
+mod event_stream;
 mod filter;
 mod flowexport;
 mod nat;
@@ -617,6 +618,16 @@ struct ProcessStatus {
     debug_reconcile_calls: u64,
     #[serde(rename = "debug_reconcile_stage", default)]
     debug_reconcile_stage: String,
+    #[serde(rename = "event_stream_connected", default)]
+    event_stream_connected: bool,
+    #[serde(rename = "event_stream_seq", default)]
+    event_stream_seq: u64,
+    #[serde(rename = "event_stream_acked", default)]
+    event_stream_acked: u64,
+    #[serde(rename = "event_stream_sent", default)]
+    event_stream_sent: u64,
+    #[serde(rename = "event_stream_dropped", default)]
+    event_stream_dropped: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1248,6 +1259,11 @@ fn run() -> Result<(), String> {
             debug_planned_bindings: 0,
             debug_reconcile_calls: 0,
             debug_reconcile_stage: String::new(),
+            event_stream_connected: false,
+            event_stream_seq: 0,
+            event_stream_acked: 0,
+            event_stream_sent: 0,
+            event_stream_dropped: 0,
         },
         snapshot: None,
         afxdp: {
@@ -1258,6 +1274,17 @@ fn run() -> Result<(), String> {
         state_writer: state_writer.clone(),
     }));
     eprintln!("bpfrx-userspace-dp: poll_mode={:?}", args.poll_mode);
+
+    // Start the event stream sender (connects to daemon's event listener socket).
+    {
+        let event_socket_path = derive_event_socket_path(&args.control_socket);
+        let mut guard = state.lock().expect("state poisoned");
+        guard.afxdp.start_event_stream(&event_socket_path);
+        eprintln!(
+            "bpfrx-userspace-dp: event stream targeting {}",
+            event_socket_path
+        );
+    }
 
     {
         let running = running.clone();
@@ -1282,13 +1309,22 @@ fn run() -> Result<(), String> {
     }
     {
         let mut guard = state.lock().expect("state poisoned");
-        guard.afxdp.stop();
+        guard.afxdp.stop_with_event_stream();
         refresh_status(&mut guard);
     }
     afxdp::remove_kernel_rst_suppression();
     write_state(&args.state_file, &state)?;
     let _ = fs::remove_file(&args.control_socket);
     Ok(())
+}
+
+/// Derive the event socket path from the control socket path.
+/// `/run/bpfrx/control.sock` -> `/run/bpfrx/userspace-dp-events.sock`
+fn derive_event_socket_path(control_socket: &str) -> String {
+    match control_socket.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/userspace-dp-events.sock"),
+        None => "userspace-dp-events.sock".to_string(),
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -1708,7 +1744,7 @@ fn handle_stream(
                 );
             }
             "shutdown" => {
-                guard.afxdp.stop();
+                guard.afxdp.stop_with_event_stream();
                 running.store(false, Ordering::SeqCst);
                 persist_state = true;
             }
@@ -1787,6 +1823,13 @@ fn refresh_status(state: &mut ServerState) {
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
     state.status.last_resolution = state.afxdp.last_resolution();
     state.status.slow_path = state.afxdp.slow_path_status().into();
+    if let Some(es_stats) = state.afxdp.event_stream_stats() {
+        state.status.event_stream_connected = es_stats.connected;
+        state.status.event_stream_seq = es_stats.seq;
+        state.status.event_stream_acked = es_stats.acked_seq;
+        state.status.event_stream_sent = es_stats.sent;
+        state.status.event_stream_dropped = es_stats.dropped;
+    }
 }
 
 fn forwarding_unsupported_error(cap: &UserspaceCapabilities) -> String {

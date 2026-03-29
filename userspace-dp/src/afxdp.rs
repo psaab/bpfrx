@@ -245,6 +245,7 @@ pub struct Coordinator {
     reconcile_calls: u64,
     last_reconcile_stage: String,
     pub poll_mode: crate::PollMode,
+    event_stream: Option<crate::event_stream::EventStreamSender>,
 }
 
 impl Coordinator {
@@ -287,11 +288,42 @@ impl Coordinator {
             reconcile_calls: 0,
             last_reconcile_stage: "idle".to_string(),
             poll_mode: crate::PollMode::BusyPoll,
+            event_stream: None,
         }
     }
 
     pub fn stop(&mut self) {
         self.stop_inner(true);
+        // NOTE: Do NOT tear down event_stream here. The event stream must
+        // survive across XSK bind/unbind cycles (e.g. when forwarding_armed
+        // is temporarily false during startup). Use stop_with_event_stream()
+        // for final process shutdown.
+    }
+
+    /// Full shutdown including the event stream. Called only on process exit.
+    pub fn stop_with_event_stream(&mut self) {
+        self.stop_inner(true);
+        if let Some(mut es) = self.event_stream.take() {
+            es.stop();
+        }
+    }
+
+    /// Start the event stream sender. The I/O thread connects to the daemon
+    /// listener at `socket_path` and pushes binary-framed session events.
+    pub fn start_event_stream(&mut self, socket_path: &str) {
+        self.event_stream = Some(crate::event_stream::EventStreamSender::new(socket_path));
+    }
+
+    /// Get a lightweight handle for worker threads to push events.
+    pub fn event_stream_worker_handle(
+        &self,
+    ) -> Option<crate::event_stream::EventStreamWorkerHandle> {
+        self.event_stream.as_ref().map(|es| es.worker_handle())
+    }
+
+    /// Event stream statistics for status reporting.
+    pub fn event_stream_stats(&self) -> Option<crate::event_stream::EventStreamStats> {
+        self.event_stream.as_ref().map(|es| es.stats())
     }
 
     pub fn dynamic_neighbors_ref(&self) -> &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>> {
@@ -742,6 +774,7 @@ impl Coordinator {
             let dynamic_neighbors = self.dynamic_neighbors.clone();
             let worker_poll_mode = self.poll_mode;
             let shared_fabrics = self.shared_fabrics.clone();
+            let event_stream_handle = self.event_stream_worker_handle();
             let join = thread::Builder::new()
                 .name(format!("bpfrx-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -769,6 +802,7 @@ impl Coordinator {
                         worker_poll_mode,
                         dnat_fds,
                         shared_fabrics,
+                        event_stream_handle,
                     );
                 });
             match join {
@@ -4728,6 +4762,8 @@ fn flush_session_deltas(
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    event_stream: &Option<crate::event_stream::EventStreamWorkerHandle>,
+    zone_name_to_id: &FastMap<String, u16>,
 ) {
     for delta in deltas {
         let info = SessionDeltaInfo {
@@ -4801,6 +4837,10 @@ fn flush_session_deltas(
             fabric_ingress: delta.metadata.fabric_ingress,
         };
         live.push_session_delta(info.clone());
+        // Push to event stream (new path) alongside existing RPC fallback.
+        if let Some(es) = event_stream {
+            es.push_delta(delta, zone_name_to_id);
+        }
         if let Ok(mut recent) = recent_session_deltas.lock() {
             push_recent_session_delta(&mut recent, info);
         }
@@ -5097,6 +5137,7 @@ fn worker_loop(
     poll_mode: crate::PollMode,
     dnat_fds: DnatTableFds,
     shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
+    event_stream: Option<crate::event_stream::EventStreamWorkerHandle>,
 ) {
     pin_current_thread(worker_id);
     let ha_startup_grace_until_secs =
@@ -5441,6 +5482,8 @@ fn worker_loop(
                         &shared_forward_wire_sessions,
                         &recent_session_deltas,
                         &peer_worker_commands,
+                        &event_stream,
+                        &forwarding.zone_name_to_id,
                     );
                 }
             }
@@ -5465,6 +5508,8 @@ fn worker_loop(
                     &shared_forward_wire_sessions,
                     &recent_session_deltas,
                     &peer_worker_commands,
+                    &event_stream,
+                    &forwarding.zone_name_to_id,
                 );
             }
         }
