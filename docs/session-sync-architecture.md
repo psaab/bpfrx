@@ -2,13 +2,26 @@
 
 ## Overview
 
-bpfrx HA clusters synchronize stateful firewall sessions between two nodes so that on failover, the new primary can continue forwarding established flows without requiring TCP re-establishment. Sessions are synced over TCP on the fabric link (fab0/fab1 IPVLAN overlays) using a custom binary protocol.
+bpfrx HA clusters synchronize stateful firewall sessions between two nodes so
+that a new primary can continue forwarding established flows after an RG move
+or peer loss. Session sync rides a custom TCP protocol over the fabric link
+(`fab0` / `fab1`).
 
-Three sync mechanisms operate concurrently:
+The current implementation has four distinct pieces:
 
-1. **Bulk sync** — cold transfer of the entire session table on startup/reconnect
-2. **Incremental sweep** — periodic scan for new/changed sessions during steady state
-3. **Userspace deltas** — low-latency session event drain from the Rust AF_XDP helper
+1. **Bulk sync** — cold transfer of the full owned session set on first
+   connection after disconnect and when a different fabric transport becomes
+   active.
+2. **Incremental sweep** — periodic scan of kernel session maps for new or
+   changed sessions.
+3. **Userspace deltas** — low-latency event drain from the AF_XDP helper for
+   userspace-managed sessions.
+4. **Demotion handoff** — an explicit quiesce / republish / barrier sequence
+   used before graceful failover, so demotion does not race the sync stream.
+
+The older mental model of "bulk once, then background sweep" is incomplete.
+Current failover safety depends on sender-side bulk acknowledgement,
+barrier-based demotion ordering, and filtered userspace delta replication.
 
 ## Session Representation
 
@@ -16,37 +29,55 @@ Three sync mechanisms operate concurrently:
 
 Sessions live in two BPF hash maps:
 
-- `sessions_v4` — IPv4 sessions (key: 16 bytes, value: 160+ bytes)
-- `sessions_v6` — IPv6 sessions (key: 40 bytes, value: 256+ bytes)
+- `sessions_v4` — IPv4 sessions
+- `sessions_v6` — IPv6 sessions
 
-Each logical session has **two entries**: a forward entry (`IsReverse=0`) and a reverse entry (`IsReverse=1`). The forward entry uses the original 5-tuple as its key; the reverse entry uses the swapped (reply-direction) 5-tuple with swapped zones. The forward entry stores a `ReverseKey` field that points to its paired reverse entry.
+Each logical session has two entries:
 
-### Session Key (IPv4, 16 bytes)
+- forward entry: `IsReverse = 0`
+- reverse entry: `IsReverse = 1`
 
-```
-SrcIP [4]byte, DstIP [4]byte, SrcPort uint16, DstPort uint16, Protocol uint8, Pad [3]byte
-```
+Only forward entries are sent on the wire. The receiver recreates the reverse
+entry locally.
 
-### Session Value (160+ bytes)
+### Session Value
 
-State, Flags, TCPState, IsReverse, SessionID, Created/LastSeen timestamps (monotonic), Timeout, PolicyID, IngressZone, EgressZone, NAT fields (SrcIP/DstIP/SrcPort/DstPort), packet/byte counters, ReverseKey, ALG/Log/App metadata, and a FIB cache (Ifindex, VlanID, Dmac, Smac, Generation).
+The session value includes state, policy, timestamps, counters, NAT fields,
+reverse key, and a cached forwarding result (`FibIfindex`, MACs, VLAN,
+generation).
 
 ### Userspace Mirror
 
-When the userspace dataplane is active, sessions are also mirrored to the Rust AF_XDP helper's in-process `SessionTable`. The Go daemon calls `SetClusterSyncedSessionV4()` which writes to both the BPF map and the userspace helper via a Unix socket RPC.
+When the userspace dataplane is active, cluster-synced forward sessions are
+installed into both places:
+
+- the kernel/BPF session maps
+- the Rust helper session table via the userspace manager RPC path
+
+`SetClusterSyncedSessionV4()` / `SetClusterSyncedSessionV6()` do both. Before
+install, they clear the cached FIB result so the receiving node recomputes
+node-local forwarding.
+
+That is only one direction of the userspace integration. Locally-created
+userspace sessions do **not** flow back through `SetClusterSyncedSession*`.
+They are exported through:
+
+- background `DrainSessionDeltas(...)`
+- explicit `ExportOwnerRGSessions(...)` during demotion prep
 
 ## Wire Protocol
 
 ### Transport
 
-TCP on the fabric link. Each node has one or two fabric interfaces:
+Session sync uses TCP over the fabric overlays:
 
-- **fab0** (primary fabric) — IPVLAN L2 overlay on ge-X-0-0
-- **fab1** (secondary fabric, optional) — IPVLAN L2 overlay on ge-X-0-0
+- `fab0` — primary fabric
+- `fab1` — optional secondary fabric
 
-Sockets are bound to `vrf-mgmt` via `SO_BINDTODEVICE`. One deterministic TCP initiator per fabric (lower IP address initiates). `TCP_NODELAY` is enabled for latency.
+Sockets are bound to `vrf-mgmt` with `SO_BINDTODEVICE`. One deterministic side
+initiates per fabric. `TCP_NODELAY` is enabled.
 
-### Header (12 bytes)
+### Header
 
 ```
 [0:4]   Magic "BPSY"
@@ -59,202 +90,300 @@ Sockets are bound to `vrf-mgmt` via `SO_BINDTODEVICE`. One deterministic TCP ini
 
 | Type | Name | Direction | Purpose |
 |------|------|-----------|---------|
-| 1 | SessionV4 | Primary → Secondary | Incremental IPv4 session add/update |
-| 2 | SessionV6 | Primary → Secondary | Incremental IPv6 session add/update |
-| 3 | DeleteV4 | Primary → Secondary | IPv4 session deletion |
-| 4 | DeleteV6 | Primary → Secondary | IPv6 session deletion |
-| 5 | BulkStart | Primary → Secondary | Marks start of bulk transfer (carries epoch) |
-| 6 | BulkEnd | Primary → Secondary | Marks end of bulk transfer (carries epoch) |
+| 1 | SessionV4 | Primary -> Secondary | Incremental IPv4 add/update |
+| 2 | SessionV6 | Primary -> Secondary | Incremental IPv6 add/update |
+| 3 | DeleteV4 | Primary -> Secondary | IPv4 delete |
+| 4 | DeleteV6 | Primary -> Secondary | IPv6 delete |
+| 5 | BulkStart | Primary -> Secondary | Start of bulk transfer |
+| 6 | BulkEnd | Primary -> Secondary | End of bulk transfer |
 | 7 | Heartbeat | Bidirectional | Keepalive |
-| 8 | Config | Primary → Secondary | Full configuration text |
-| 9 | IPsecSA | Primary → Secondary | IPsec connection names |
+| 8 | Config | Primary -> Secondary | Full config text |
+| 9 | IPsecSA | Primary -> Secondary | IPsec connection names |
 | 10 | Failover | Bidirectional | Remote failover request |
-| 11 | Fence | Bidirectional | Peer fencing (disable all RGs) |
+| 11 | Fence | Bidirectional | Peer fencing |
 | 12 | ClockSync | Bidirectional | Monotonic clock exchange |
-| 13 | Barrier | Primary → Secondary | Ordered sync marker (for demotion handoff) |
-| 14 | BarrierAck | Secondary → Primary | Barrier acknowledgement |
-| 15 | BulkAck | Secondary → Primary | Bulk transfer acknowledgement (carries epoch) |
+| 13 | Barrier | Primary -> Secondary | Ordered demotion marker |
+| 14 | BarrierAck | Secondary -> Primary | Barrier acknowledgement |
+| 15 | BulkAck | Secondary -> Primary | Bulk acknowledgement |
 
-### Session Encoding
-
-IPv4 sessions are serialized as 176 bytes (16 key + 160 value), IPv6 as ~512 bytes. All multi-byte fields are little-endian.
-
-## Bulk Sync (Cold Transfer)
+## Bulk Sync
 
 ### When It Triggers
 
-- First connection after a total disconnect (both fab0 and fab1 were down)
-- New active fabric transport connected
+Bulk sync is started when:
 
-### Send Side (`BulkSync()`)
+- the first session-sync connection appears after a total disconnect
+- a different fabric connection becomes the active transport
 
-1. Assign a monotonically increasing epoch number
-2. Send `BulkStart` marker with epoch
-3. Iterate all sessions in `sessions_v4` and `sessions_v6`:
-   - Skip reverse entries (`IsReverse != 0`)
-   - Skip sessions where this node is NOT primary for the ingress zone (`ShouldSyncZone()`)
-   - Encode and send each forward entry
-4. Send `BulkEnd` marker with matching epoch
-5. Track epoch as pending, await `BulkAck` from peer
+On first connection after disconnect, the transport setup order is:
 
-Only forward entries are sent. The receiver creates reverse entries locally.
+1. flush the delete journal
+2. fire `OnPeerConnected`
+3. start `BulkSync()`
+
+That order matters because reconnect readiness and retry state are reset before
+the new bulk is sent.
+
+### Send Side
+
+`BulkSync()`:
+
+1. allocates a new monotonically increasing epoch
+2. sends `BulkStart(epoch)`
+3. iterates `sessions_v4` / `sessions_v6`
+4. skips reverse entries
+5. skips sessions not owned by this node for the ingress zone
+6. sends forward entries only
+7. sends `BulkEnd(epoch)`
+8. records `pendingBulkAckEpoch` and waits for peer acknowledgement
+
+The sender now treats outbound bulk acknowledgement as first-class state. A
+bulk transfer is not considered fully primed until the peer returns `BulkAck`
+for the current epoch.
 
 ### Receive Side
 
-**On BulkStart**: Snapshot zone ownership (which zones this node is primary for), initialize tracking maps for received sessions, set `bulkInProgress = true`.
+On `BulkStart` the receiver:
 
-**Per session message**:
+- snapshots zone ownership for stale-session reconciliation
+- resets the per-bulk receive tracking maps
+- marks bulk in progress
 
-1. Decode payload into session key/value
-2. Track received key in `bulkRecvV4`/`bulkRecvV6` map
-3. Rebase timestamps to local monotonic clock domain
-4. **Clear FIB cache** — forces fresh `bpf_fib_lookup` on next packet (node-local forwarding paths differ)
-5. Install forward entry in BPF map via `SetClusterSyncedSessionV4()`
-6. Create and install reverse entry (copy forward, set `IsReverse=1`, swap zones)
-7. Create `dnat_table` entry for SNAT sessions (maps `(Protocol, NATSrcIP, NATSrcPort)` → `(OrigSrcIP, OrigSrcPort)`)
+For each received session it:
 
-**On BulkEnd**: Verify epoch, run stale session reconciliation, send `BulkAck`, trigger `OnBulkSyncReceived()` callback (releases VRRP sync hold on the secondary).
+1. decodes key/value
+2. tracks the forward key in the current bulk receive set
+3. rebases timestamps into local monotonic time
+4. clears cached FIB resolution
+5. installs the forward entry through `SetClusterSyncedSession*`
+6. creates and installs the reverse entry locally
+7. recreates any SNAT `dnat_table` entry locally
+
+On `BulkEnd` the receiver:
+
+1. verifies the epoch
+2. reconciles stale sessions using the frozen ownership snapshot
+3. sends `BulkAck(epoch)`
+4. fires `OnBulkSyncReceived`
 
 ### Stale Session Reconciliation
 
-After bulk transfer, the receiver deletes local sessions in peer-owned zones that were NOT refreshed during the bulk:
+After a bulk completes, the receiver deletes sessions that are still present
+locally but were not refreshed by the peer for zones that the frozen snapshot
+says are peer-owned.
 
-1. Use the frozen zone ownership snapshot from BulkStart time
-2. Iterate all local forward sessions
-3. For each session in a peer-owned zone: if the session key was NOT in the bulk receive set, delete it (forward + reverse + dnat_table)
-4. Zones missing from the snapshot are conservatively kept (not deleted)
+Important detail: zones missing from the frozen snapshot are conservatively kept
+instead of deleted.
 
-This prevents stale sessions from a previous primary from lingering on the new secondary.
+## Sync Readiness and Bulk Priming
 
-## Incremental Sweep (Steady State)
+This is the biggest place where older descriptions are wrong or incomplete.
+There are now two distinct readiness signals:
+
+- `syncBulkPrimed` — we received the peer's current-generation bulk
+- `syncPeerBulkPrimed` — the peer acknowledged our current-generation bulk with
+  `BulkAck`
+
+They are not the same thing.
+
+### Connection Lifecycle
+
+On peer connect:
+
+- `syncBulkPrimed = false`
+- `syncPeerBulkPrimed = false`
+- cluster sync readiness is forced false
+- a guarded readiness timeout is armed
+- a bulk-prime retry loop starts
+
+On bulk receive:
+
+- `syncBulkPrimed = true`
+- the readiness timeout is stopped
+- VRRP sync hold is released
+- cluster sync readiness becomes true
+
+On bulk ack receive:
+
+- `syncPeerBulkPrimed = true`
+
+On disconnect:
+
+- both primed flags are cleared
+- cluster sync readiness is forced false
+- the readiness timeout is invalidated with a generation guard so a stale timer
+  callback cannot flip readiness back to true after disconnect
+
+### Bulk-Prime Retry Loop
+
+After reconnect, the daemon retries `BulkSync()` if the peer never acknowledges
+our current-generation bulk.
+
+Important current behavior:
+
+- retries stop once `syncPeerBulkPrimed` becomes true
+- retries are deferred while the current bulk is still waiting for `BulkAck`
+- retries are also deferred while inbound sync progress is still advancing
+- retries stop if the connection is replaced or disconnected
+
+This exists because failover admission now depends on the standby having both
+sides of the current-generation baseline, not just having received one bulk.
+
+## Incremental Sweep and Delete Journal
 
 ### Background Sweep
 
-A background goroutine runs at configurable intervals:
+A background sweep periodically scans the kernel session maps for forward
+entries whose `Created` or `LastSeen` timestamps moved since the previous sweep.
+Only sessions owned by the local node for the ingress zone are sent.
 
-- **Active interval**: 1s (default), 15s (userspace DP override)
-- **Idle interval**: 10s (default), 60s (userspace DP override)
+The sweep is deliberately separate from userspace deltas. It is still the only
+way the kernel conntrack path exports incremental session creation.
 
-Each sweep:
+### Delete Journal
 
-1. Check if any sessions were created or closed since last sweep (compare global counters)
-2. If no changes, skip the scan entirely (fast path)
-3. Iterate session maps for entries where `Created >= lastSweepTime` or `LastSeen >= lastSweepTime`
-4. For each qualifying forward entry in a locally-primary zone, encode and queue via buffered channel
-5. If the send channel (4096 entries) is full, set a backfill flag to replay the window on next sweep
+Delete messages are queued immediately from conntrack GC callbacks. If the peer
+is disconnected, deletes are journaled in a bounded ring.
 
-### GC Delete Callbacks
+The journal is replayed when the next first-post-disconnect connection comes up,
+before `OnPeerConnected` and before the fresh bulk starts.
 
-When the conntrack garbage collector expires a session, it invokes a callback:
-
-```go
-gc.OnDeleteV4 = func(key dataplane.SessionKey) {
-    if d.cluster != nil && d.cluster.IsLocalPrimaryAny() && d.sessionSync != nil {
-        d.sessionSync.QueueDeleteV4(key)
-    }
-}
-```
-
-Delete messages are queued immediately. If the peer is disconnected, deletes go into a ring journal (10,000 entries, oldest evicted on overflow). On reconnect, the journal is replayed before normal sync resumes.
-
-### Send Queue
-
-All incremental messages (session adds, deletes) are enqueued onto a buffered channel (4096 entries). A dedicated `sendLoop` goroutine drains the channel and writes to the TCP connection under `writeMu` serialization.
-
-## Userspace Session Deltas
-
-When the userspace AF_XDP dataplane is active, sessions are managed by the Rust helper in addition to BPF maps. The helper maintains its own `SessionTable` and produces session events (opens/closes) as deltas.
+## Userspace Session Integration
 
 ### Delta Drain
 
-The Go daemon periodically calls `DrainSessionDeltas(max)` via Unix socket RPC to the Rust helper. This returns a batch of recent session events:
+The Go daemon periodically drains helper-originated session deltas via
+`DrainSessionDeltas(...)`.
 
-```go
-type SessionDeltaInfo struct {
-    Kind       string  // "open" or "close"
-    Protocol   uint8
-    SrcIP      string
-    DstIP      string
-    SrcPort    uint16
-    DstPort    uint16
-    // ... NAT, zone, resolution fields
-    FabricRedirect bool
-}
-```
+These deltas are **not** blindly mirrored. Current filtering is:
 
-These deltas are forwarded to the peer via the same sync TCP stream.
+- `local_delivery` is never synced to the peer
+- stale-owner `FabricRedirect` deltas from non-fabric ingress are allowed even
+  if the local node is no longer owner, because the peer still needs the
+  forward-wire alias to receive redirected traffic
+- if a delta carries `OwnerRGID`, ownership is checked with `IsPrimaryForRGFn`
+- otherwise the fallback is `ShouldSyncZone(ingressZone)`
 
-### Failover Export
+For stale-owner fabric redirects, the daemon also synthesizes forward-wire alias
+session keys on the sync stream so the new owner can materialize the translated
+forward tuple it will receive over the fabric.
 
-During demotion prep, `ExportOwnerRGSessions(rgIDs, max)` dumps all sessions owned by the demoting RGs. This allows the new primary to have complete session state before promotion, reducing the window where synced sessions might be stale.
+### Export During Demotion Prep
+
+`ExportOwnerRGSessions(rgIDs, 0)` is used during graceful demotion prep to dump
+all userspace sessions owned by the demoting RGs. This is not the same thing as
+the steady-state delta drain. It is an explicit republish step used to reduce
+handoff loss.
 
 ## Clock Synchronization
 
-At connection setup, both nodes exchange monotonic timestamps via `ClockSync` messages:
+At connection setup, both sides exchange monotonic timestamps with `ClockSync`.
+The receiver computes a local offset and rebases received session timestamps
+into the local monotonic clock domain before install.
 
-```
-Peer sends: its monotonic seconds
-Local computes: offset = local_mono - peer_mono
-```
-
-All received session timestamps (Created, LastSeen) are rebased: `local_ts = peer_ts + offset`. This ensures GC timeouts work correctly — a session created 30s ago on the peer should still have 30s of life remaining locally, regardless of when each node booted.
+That keeps session expiry behavior consistent across nodes even though the two
+systems have different boot times and independent monotonic clocks.
 
 ## Failover Session Handling
 
-### On Promotion (Secondary → Primary)
+### Promotion
 
-1. Zone ownership flips — zones previously synced to this node are now locally authoritative
-2. GC delete callbacks activate (`IsLocalPrimaryAny()` now returns true)
-3. Userspace exports all sessions in newly-owned RGs for sync to peer
-4. Synced sessions get their egress resolution refreshed (`refresh_live_reverse_sessions_for_owner_rgs`) since forwarding paths may differ
+When a node becomes primary for an RG:
 
-### On Demotion (Primary → Secondary)
+- synced sessions for newly-owned zones become locally authoritative
+- GC delete callbacks become active for those zones
+- userspace session state for the newly-owned RG is refreshed or promoted as
+  needed for local forwarding
+- direct-mode failover also relies on post-transition re-announcements to move
+  LAN-side ownership quickly
 
-Staged handoff with barrier:
+### Graceful Demotion
 
-1. **Pause** incremental sync (stop background sweeps)
-2. **Wait for quiescence** — ensure no active sync traffic in flight
-3. **Drain** remaining userspace session deltas
-4. **Barrier** — send ordered marker to peer, wait for acknowledgement
-5. **Resume** incremental sync after demotion complete
+Graceful demotion is now an explicit staged protocol, not just "send a barrier
+and hope the queue is empty".
 
-The barrier ensures the peer has processed all session updates before the demotion takes effect. Without this, the new primary could miss sessions that were in the send queue at demotion time.
+Current sequence:
+
+1. Require `syncPeerBulkPrimed` for the current connection
+2. Wait for any previous demotion barriers to be acknowledged
+3. Repeatedly wait for the sync stream to go idle (`WaitForIdle`) and then send
+   a probe barrier (`WaitForPeerBarrier`) until quiescence is proven or the
+   timeout expires
+4. Pause background incremental sync with `PauseIncrementalSync(...)`
+5. Export userspace sessions owned by the demoting RGs
+6. Drain recent userspace deltas while incremental sync is paused
+7. Send a final ordered barrier and wait for peer acknowledgement
+8. Call helper `PrepareRGDemotion(...)`
+9. Resume incremental sync
+
+Manual failover uses the same demotion-prep path, but wraps some failures as
+retryable admission errors instead of proceeding unsafely.
 
 ## Invariants
 
-1. **Forward entries only on wire** — only `IsReverse=0` sessions are synced. Reverse entries are created by the receiver.
-2. **Zone ownership filtering** — sessions are only synced by the node that is primary for the session's ingress zone.
-3. **FIB cache invalidation** — always cleared on reception. Each node has different interfaces, MACs, and ARP tables.
-4. **Clock domain translation** — all timestamps rebased to local monotonic clock for correct GC behavior.
-5. **Dual-entry deletion** — when deleting a synced session, both forward and reverse entries are removed, plus any dnat_table entry.
+1. Only forward entries are sent on the wire.
+2. Reverse entries are recreated locally by the receiver.
+3. Received sessions always have cached FIB resolution cleared before install.
+4. Timestamps are rebased into the receiver's monotonic clock domain.
+5. Session ownership filtering happens before incremental sync or userspace
+   delta replication.
+6. `local_delivery` sessions are helper-local and are not valid HA sync state.
+7. Graceful demotion is ordered against the session-sync stream with explicit
+   quiescence and barriers.
+
+## What Earlier Versions Missed
+
+The previous version of this document was materially incomplete in a few places:
+
+- it treated readiness as "bulk received" and omitted sender-side `BulkAck`
+  readiness
+- it did not describe the bulk-prime retry loop or pending-bulk-ack tracking
+- it simplified userspace delta sync as an unfiltered mirror of helper events
+- it did not explain the explicit demotion-prep pause / export / drain /
+  barrier protocol
+- it implied userspace mirroring happened only through `SetClusterSyncedSession*`
+  and omitted the helper-originated delta/export paths
 
 ## Known Limitations
 
 ### Sweep Latency
 
-The sweep-based incremental sync has inherent latency — up to 1s between session creation in BPF and sync to the peer. Short-lived sessions (DNS queries, ICMP pings) may complete and be GC'd before the sweep picks them up. The userspace delta path is lower latency (drained on demand via RPC) but only covers the userspace dataplane, not the eBPF conntrack.
+Kernel-originated session creation is still exported by periodic sweep, not by a
+real-time event stream. Short-lived sessions can be missed between sweeps.
 
-### No Real-Time Session Event Stream from BPF
+### No Real-Time BPF Session Event Stream
 
-BPF has no efficient mechanism to notify userspace of individual session creates in real time. The BPF ring buffer is used for logging events but not for session sync — the overhead of copying full session values through the ring buffer at high session rates would be prohibitive. The sweep approach trades latency for throughput.
+There is still no cheap real-time BPF event feed for full session state. The
+current design intentionally uses periodic sweep for kernel sessions and keeps
+the lower-latency userspace delta path scoped to the AF_XDP helper.
 
 ### Delete Journal Overflow
 
-The delete journal is bounded at 10,000 entries. During extended disconnects with high session churn, deletes can be lost. The next bulk sync reconciliation will clean up stale sessions, but there's a window where the peer retains expired sessions.
+The delete journal is bounded. Extended disconnects with high churn can evict
+old deletes. The next bulk reconciliation eventually cleans this up, but not
+immediately.
 
 ### Counter Divergence
 
-Packet/byte counters are synced during bulk but not during incremental updates (only timestamps and state are meaningful for failover). After failover, counter values reflect the primary's last bulk, not real-time counts.
+Counters are not kept perfectly current by incremental sync. Session state is
+more important than exact byte/packet counters for failover.
+
+### Failover Quality Still Depends on Dataplane Behavior
+
+Correct session-sync admission does not guarantee zero-loss failover. The recent
+userspace failover work showed that post-admission dataplane behavior can still
+collapse if redirected traffic, queue selection, or translated alias handling is
+wrong.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `pkg/cluster/sync.go` | Session sync protocol, bulk/incremental/barrier, wire encoding |
-| `pkg/cluster/sync_test.go` | Sync protocol tests |
-| `pkg/daemon/daemon.go` | Daemon integration: GC callbacks, sweep startup, sync readiness |
-| `pkg/conntrack/gc.go` | Session garbage collection with delete callbacks |
-| `pkg/dataplane/types.go` | SessionKey, SessionValue, BPF map structures |
-| `pkg/dataplane/userspace/manager.go` | Userspace DP session mirror, delta drain, export |
+| `pkg/cluster/sync.go` | Wire protocol, bulk sync, barriers, retry state |
+| `pkg/cluster/sync_test.go` | Session sync protocol tests |
+| `pkg/daemon/daemon.go` | Readiness, retry, userspace delta filtering, demotion prep |
+| `pkg/conntrack/gc.go` | GC delete callbacks |
+| `pkg/dataplane/types.go` | Session key/value definitions |
+| `pkg/dataplane/userspace/manager.go` | Userspace session install, helper RPCs |
 | `userspace-dp/src/session.rs` | Rust session table |
-| `userspace-dp/src/afxdp/session_glue.rs` | Rust session install/demotion/refresh |
+| `userspace-dp/src/afxdp/session_glue.rs` | Userspace session promotion / refresh / export |
