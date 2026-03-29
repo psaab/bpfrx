@@ -541,7 +541,7 @@ fn io_thread_main(
     socket_path: String,
 ) {
     let mut replay_buf: VecDeque<EventFrame> = VecDeque::with_capacity(REPLAY_BUFFER_CAPACITY);
-    let mut read_buf = [0u8; 64]; // control frames are max 16 bytes
+    let mut ctrl_read_buf: Vec<u8> = Vec::with_capacity(128);
 
     while !stop.load(Ordering::Acquire) {
         // ---- Connect phase ----
@@ -566,13 +566,14 @@ fn io_thread_main(
         }
 
         // ---- Steady-state loop ----
+        ctrl_read_buf.clear(); // discard stale data from previous connection
         let disconnect = run_connected_loop(
             &rx,
             &stream,
             &shared,
             &stop,
             &mut replay_buf,
-            &mut read_buf,
+            &mut ctrl_read_buf,
         );
 
         shared.connected.store(false, Ordering::Release);
@@ -657,11 +658,12 @@ fn run_connected_loop(
     shared: &Arc<EventStreamShared>,
     stop: &Arc<AtomicBool>,
     replay_buf: &mut VecDeque<EventFrame>,
-    read_buf: &mut [u8; 64],
+    ctrl_read_buf: &mut Vec<u8>,
 ) -> bool {
     use std::io::{Read, Write};
 
     let mut write_buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut tmp_read = [0u8; 64];
     let mut idle_cycles = 0u32;
 
     loop {
@@ -715,24 +717,33 @@ fn run_connected_loop(
             }
         }
 
-        // Read control frames from daemon (non-blocking)
-        match (&*stream).read(read_buf) {
+        // Read control frames from daemon (non-blocking), accumulating
+        // partial reads so that incomplete frames are not lost.
+        match (&*stream).read(&mut tmp_read) {
             Ok(0) => {
                 // EOF — peer closed
                 return true;
             }
             Ok(n) => {
-                if let Some(reconnect) =
-                    process_control_frames(&read_buf[..n], shared, rx, stream, replay_buf)
-                {
-                    return reconnect;
-                }
+                ctrl_read_buf.extend_from_slice(&tmp_read[..n]);
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // No data available — normal
             }
             Err(_) => {
                 return true;
+            }
+        }
+
+        // Process complete control frames from accumulated buffer
+        if !ctrl_read_buf.is_empty() {
+            let (action, consumed) =
+                process_control_frames(ctrl_read_buf, shared, rx, stream, replay_buf);
+            if consumed > 0 {
+                ctrl_read_buf.drain(..consumed);
+            }
+            if let Some(reconnect) = action {
+                return reconnect;
             }
         }
 
@@ -749,22 +760,28 @@ fn run_connected_loop(
 }
 
 /// Process control frames received from the daemon.
-/// Returns Some(true) to reconnect, Some(false) to stop, None to continue.
+/// Returns (action, bytes_consumed) where action is Some(true) to reconnect,
+/// Some(false) to stop, or None to continue. Only complete frames are consumed;
+/// any trailing partial frame is left for the next read cycle.
 fn process_control_frames(
     data: &[u8],
     shared: &Arc<EventStreamShared>,
     rx: &mpsc::Receiver<EventFrame>,
     stream: &UnixStream,
     replay_buf: &mut VecDeque<EventFrame>,
-) -> Option<bool> {
+) -> (Option<bool>, usize) {
     let mut offset = 0;
     while offset + FRAME_HEADER_SIZE <= data.len() {
-        let _payload_len = u32::from_le_bytes([
+        let payload_len = u32::from_le_bytes([
             data[offset],
             data[offset + 1],
             data[offset + 2],
             data[offset + 3],
         ]);
+        let frame_len = FRAME_HEADER_SIZE + payload_len as usize;
+        if offset + frame_len > data.len() {
+            break; // incomplete frame — wait for more data
+        }
         let msg_type = data[offset + 4];
         let seq = u64::from_le_bytes([
             data[offset + 8],
@@ -776,7 +793,7 @@ fn process_control_frames(
             data[offset + 14],
             data[offset + 15],
         ]);
-        offset += FRAME_HEADER_SIZE + _payload_len as usize;
+        offset += frame_len;
 
         match msg_type {
             MSG_ACK => {
@@ -813,7 +830,7 @@ fn process_control_frames(
             }
         }
     }
-    None
+    (None, offset)
 }
 
 /// Handle DrainRequest: drain channel, write all buffered events up to target
@@ -1183,5 +1200,123 @@ mod tests {
         assert_eq!(encode_disposition(ForwardingDisposition::HAInactive), 6);
         assert_eq!(encode_disposition(ForwardingDisposition::DiscardRoute), 7);
         assert_eq!(encode_disposition(ForwardingDisposition::NextTableUnsupported), 8);
+    }
+
+    /// Build a raw 16-byte ACK control frame with the given sequence number.
+    fn build_raw_ack_frame(seq: u64) -> [u8; FRAME_HEADER_SIZE] {
+        let mut buf = [0u8; FRAME_HEADER_SIZE];
+        // payload_len = 0 (header-only)
+        buf[0..4].copy_from_slice(&0u32.to_le_bytes());
+        buf[4] = MSG_ACK;
+        // reserved bytes 5..8 stay zero
+        buf[8..16].copy_from_slice(&seq.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn test_partial_read_accumulation() {
+        // Simulate a partial Unix stream read: first 8 bytes, then the
+        // remaining 8 bytes of a 16-byte ACK frame.
+        let shared = Arc::new(EventStreamShared::new());
+        let (_tx, rx) = mpsc::sync_channel::<EventFrame>(16);
+        let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+        // Seed replay buffer so we can observe the trim from the ACK.
+        for seq in 1..=5u64 {
+            replay_buf.push_back(EventFrame::encode_drain_complete(seq));
+        }
+
+        let raw = build_raw_ack_frame(3);
+        let mut ctrl_buf: Vec<u8> = Vec::new();
+
+        // We don't have a real stream for this unit test, so call
+        // process_control_frames directly with partial data.
+
+        // First "read": only the first 8 bytes arrive.
+        ctrl_buf.extend_from_slice(&raw[..8]);
+        let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (action, consumed) =
+            process_control_frames(&ctrl_buf, &shared, &rx, &sock_a, &mut replay_buf);
+        assert!(action.is_none());
+        assert_eq!(consumed, 0, "partial frame must not be consumed");
+        // Replay buffer untouched — no ACK processed yet
+        assert_eq!(replay_buf.len(), 5);
+
+        // Second "read": remaining 8 bytes arrive.
+        ctrl_buf.extend_from_slice(&raw[8..]);
+        let (action, consumed) =
+            process_control_frames(&ctrl_buf, &shared, &rx, &sock_a, &mut replay_buf);
+        assert!(action.is_none());
+        assert_eq!(consumed, FRAME_HEADER_SIZE);
+        // ACK seq=3 should have trimmed frames 1,2,3
+        assert_eq!(replay_buf.len(), 2);
+        assert_eq!(replay_buf.front().unwrap().seq, 4);
+        assert_eq!(shared.acked_seq.load(Ordering::Relaxed), 3);
+
+        // Drain consumed bytes as the real loop would.
+        ctrl_buf.drain(..consumed);
+        assert!(ctrl_buf.is_empty());
+    }
+
+    #[test]
+    fn test_two_frames_in_one_read() {
+        // Two complete ACK frames arrive in a single read.
+        let shared = Arc::new(EventStreamShared::new());
+        let (_tx, rx) = mpsc::sync_channel::<EventFrame>(16);
+        let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+        for seq in 1..=10u64 {
+            replay_buf.push_back(EventFrame::encode_drain_complete(seq));
+        }
+
+        let ack5 = build_raw_ack_frame(5);
+        let ack8 = build_raw_ack_frame(8);
+        let mut ctrl_buf: Vec<u8> = Vec::new();
+        ctrl_buf.extend_from_slice(&ack5);
+        ctrl_buf.extend_from_slice(&ack8);
+
+        let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (action, consumed) =
+            process_control_frames(&ctrl_buf, &shared, &rx, &sock_a, &mut replay_buf);
+        assert!(action.is_none());
+        assert_eq!(consumed, 2 * FRAME_HEADER_SIZE);
+        // ACK 5, then ACK 8 — replay should have frames 9,10
+        assert_eq!(replay_buf.len(), 2);
+        assert_eq!(shared.acked_seq.load(Ordering::Relaxed), 8);
+    }
+
+    #[test]
+    fn test_one_and_half_frames() {
+        // 1.5 frames: one complete ACK + first 4 bytes of next frame.
+        let shared = Arc::new(EventStreamShared::new());
+        let (_tx, rx) = mpsc::sync_channel::<EventFrame>(16);
+        let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+        for seq in 1..=5u64 {
+            replay_buf.push_back(EventFrame::encode_drain_complete(seq));
+        }
+
+        let ack2 = build_raw_ack_frame(2);
+        let ack4 = build_raw_ack_frame(4);
+        let mut ctrl_buf: Vec<u8> = Vec::new();
+        ctrl_buf.extend_from_slice(&ack2);
+        ctrl_buf.extend_from_slice(&ack4[..4]); // partial second frame
+
+        let (sock_a, _sock_b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (action, consumed) =
+            process_control_frames(&ctrl_buf, &shared, &rx, &sock_a, &mut replay_buf);
+        assert!(action.is_none());
+        assert_eq!(consumed, FRAME_HEADER_SIZE); // only first frame consumed
+        assert_eq!(shared.acked_seq.load(Ordering::Relaxed), 2);
+        assert_eq!(replay_buf.len(), 3); // frames 3,4,5 remain
+
+        // Drain consumed, then "read" remaining bytes of second frame.
+        ctrl_buf.drain(..consumed);
+        assert_eq!(ctrl_buf.len(), 4);
+        ctrl_buf.extend_from_slice(&ack4[4..]);
+
+        let (action, consumed) =
+            process_control_frames(&ctrl_buf, &shared, &rx, &sock_a, &mut replay_buf);
+        assert!(action.is_none());
+        assert_eq!(consumed, FRAME_HEADER_SIZE);
+        assert_eq!(shared.acked_seq.load(Ordering::Relaxed), 4);
+        assert_eq!(replay_buf.len(), 1); // only frame 5 remains
     }
 }
