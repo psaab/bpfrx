@@ -14,12 +14,13 @@ Split into focused modules with clear responsibilities, minimal cross-dependenci
 
 ```
 userspace-dp/src/
-  afxdp.rs              17,388 lines  ← still the monolith, but shrinking
+  afxdp.rs              14,794 lines  ← still the monolith, but production helpers are now split out
   afxdp/
     bind.rs                385 lines  (XSK socket binding strategies)
     bpf_map.rs             577 lines  (BPF map helpers)
     checksum.rs            156 lines  (checksum helpers + DNAT publish)
     frame.rs             4,209 lines  (packet frame building/parsing)
+    forwarding.rs        2,145 lines  (forwarding resolution + config compilation)
     gre.rs                 410 lines  (GRE encap/decap)
     icmp.rs                233 lines  (ICMP generation)
     icmp_embed.rs          761 lines  (embedded ICMP NAT reversal)
@@ -28,32 +29,20 @@ userspace-dp/src/
     session_glue.rs      3,632 lines  (session table + demotion prepare)
     tunnel.rs              360 lines  (local tunnel origination)
     tx.rs                  790 lines  (TX ring submission)
-    types.rs               180 lines  (shared aliases/metadata/cache types)
+    types.rs               650 lines  (shared dataplane types and forwarding structs)
     umem.rs                632 lines  (UMEM + binding live state)
 ```
 
 ### What's still in the monolith
 
-| Line Range | ~Lines | Section |
-|------------|--------|---------|
-| 1-557 | 557 | Imports, constants, FlowCache, RewriteDescriptor, PendingNeighPacket, checksum helpers, DNAT table helpers, `UserspaceDpMeta` |
-| 558-1950 | 1,393 | `pub struct Coordinator` + `impl Coordinator` — orchestrator lifecycle |
-| 1951-2879 | 929 | Shared worker/dataplane types: worker handles, forwarding state, binding identity/lookup, UMEM types, `SessionFlow`, `WorkerCommand`, `DebugPollCounters` |
-| 2880-5992 | 3,113 | `poll_binding()` — THE hot loop for RX/TX processing per worker |
-| 5993-6842 | 850 | `worker_loop()` — worker thread main entry point |
-| 6843-7221 | 379 | `local_tunnel_source_loop()` + tunnel helpers |
-| 7222-7844 | 623 | Neighbor/utility helpers: monotonic time, kernel ARP/NDP probes, VLAN insert, raw send, initial neighbor dump/monitor |
-| 7845-8288 | 444 | classify_metadata, build_screen_profiles, `build_forwarding_state()` |
-| 8289-8652 | 364 | RST suppression (nftables), NAT local exclusions |
-| 8653-10150 | 1,498 | Neighbor parse helpers, TCP MSS clamping, IcmpTeRateLimiter, forwarding resolution lookup functions |
-| 10151-10344 | 194 | BPF ring diagnostics, XSK/heartbeat helpers |
-| 10345-10715 | 371 | OwnedFd, session-map key helpers, session map operations (publish/delete/verify/dump), fallback stats |
-| 10716-11362 | 647 | MmapArea (mmap wrapper), BindingLiveState (60+ atomic counters) |
-| 11363-20138 | 8,775 | Tests |
+- `Coordinator` lifecycle and orchestration
+- `BindingWorker`, `poll_binding()`, `worker_loop()`, and the hot-path helper cluster that stays tightly coupled to packet processing
+- mixed frame/dataplane tests and shared test fixtures
+- a small number of packet-processing helpers that are still intentionally colocated with the hot loop
 
 ## Current Extraction Status
 
-Implemented and compile-checked so far:
+Implemented and compile-checked:
 
 - `checksum.rs`
 - `neighbor.rs`
@@ -61,40 +50,50 @@ Implemented and compile-checked so far:
 - `rst.rs`
 - `tunnel.rs`
 - `umem.rs`
-- `types.rs` first pass:
+- `types.rs`
   - `FastMap` / `FastSet`
   - `UserspaceDpMeta`
   - `XdpOptions`
   - `PendingNeighPacket`
   - `FlowCache`, `FlowCacheEntry`, `RewriteDescriptor`
   - `BindingIdentity`, `WorkerBindingLookup`
+  - `WorkerHandle`, `LocalTunnelSourceHandle`, `BindingPlan`
+  - `PacketDisposition`, `ValidationState`
   - `SessionFlow`, `ResolutionDebug`
   - `TxRequest`, `PendingForwardRequest`, `PreparedTxRequest`, `PreparedTxRecycle`
   - `LocalTunnelTxPlan`, `LearnedNeighborKey`
   - `WorkerCommand`, `DebugPollCounters`
-
-Still in `afxdp.rs` and still worth moving:
-
-- the remaining shared types originally planned for `types.rs`:
-  - `WorkerHandle`, `LocalTunnelSourceHandle`, `BindingPlan`
-  - `PacketDisposition`, `ValidationState`
   - `ForwardingState`, `ForwardingResolution`, `ForwardingDisposition`
   - `FabricLink`, `HAGroupRuntime`
-- all forwarding/config compilation logic into `forwarding.rs`
+- `forwarding.rs`
+  - `classify_metadata()`
+  - `build_screen_profiles()`
+  - `build_forwarding_state()`
+  - route/neighbor selection helpers
+  - HA enforcement helpers
+  - fabric redirect selection
+  - local-delivery/session-miss forwarding helpers
+  - forwarding lookup and tunnel-resolution helpers
+
+What the original plan missed:
+
+- the remaining shared worker/forwarding types were already good candidates for `types.rs` and are now moved
+- the production forwarding/config compilation code was the real remaining extraction
+- the forwarding-heavy test cluster still lives in `afxdp.rs`; that is now an optional follow-on, not a blocker for the helper-module split
 
 Current reduction:
 
-- `afxdp.rs`: `20,138 -> 17,143`
-- reduction so far: about `14.9%`
+- `afxdp.rs`: `20,138 -> 14,794`
+- reduction so far: about `26.5%`
 
 ## Proposed Module Structure
 
-### 8 new modules in `afxdp/`:
+### Implemented modules in `afxdp/`:
 
 | Module | ~Lines | Responsibility |
 |--------|--------|----------------|
-| **`types.rs`** | 1,200 | All shared structs, enums, constants. ForwardingState, ForwardingResolution, ForwardingDisposition, BindingWorker, WorkerUmem types, FlowCache, `UserspaceDpMeta`, worker handles/plan types, `WorkerBindingLookup`, `XskBindMode`, `DebugPollCounters`, SessionFlow, HAGroupRuntime, route/neighbor/egress types, protocol constants, FastMap/FastSet aliases. Foundation for everything else. |
-| **`forwarding.rs`** | 4,500 | Route resolution and config compilation. `build_forwarding_state()`, `build_screen_profiles()`, `classify_metadata()`, forwarding resolution lookup functions, connected route matching, tunnel resolution, fabric redirect logic. Includes ~3,000 lines of forwarding tests. |
+| **`types.rs`** | 650 | Shared structs, enums, aliases, and dataplane metadata. Includes forwarding/runtime structs that were still pending in the earlier draft. |
+| **`forwarding.rs`** | 2,145 | Route resolution and config compilation. `build_forwarding_state()`, `build_screen_profiles()`, `classify_metadata()`, forwarding lookup, tunnel resolution, HA enforcement, and fabric redirect logic. |
 | **`bpf_map.rs`** | 750 | BPF map CRUD operations. XSK slot register/delete, heartbeat touch/update helpers, `OwnedFd`, session-map key helpers, publish/delete/verify/dump, `read_fallback_stats()`, `diagnose_raw_ring_state()`. Standalone unsafe FFI — clear boundary. |
 | **`umem.rs`** | 700 | Memory management. `MmapArea` + Drop, `WorkerUmemInner`, `WorkerUmem`, `WorkerUmemPool`, `BindingLiveState` (60+ atomic counters for per-binding stats), `update_binding_debug_state()`. Leaf types with no internal dependencies. |
 | **`neighbor.rs`** | 950 | Neighbor discovery and monitoring. `neigh_monitor_thread()` (background netlink listener), initial neighbor dump/update helpers, kernel ARP/NDP probe helpers (`trigger_kernel_arp_probe`, `add_kernel_neighbor_probe`, `add_kernel_neighbor`), `parse_mac_str()`, `neighbor_state_usable_str()`, `send_raw_frame()`, `insert_vlan_tag()`, `monotonic_nanos()`, `monotonic_timestamp_to_datetime()`. Includes MAC parsing tests. |
@@ -102,16 +101,15 @@ Current reduction:
 | **`rst.rs`** | 850 | TCP RST suppression via nftables + NAT local exclusions. `install_kernel_rst_suppression()`, `remove_kernel_rst_suppression()` (pub(crate)), `nat_translated_local_exclusions()`. |
 | **`tunnel.rs`** | 380 | Local tunnel origination. `local_tunnel_source_loop()`, tunnel TX request building, local tunnel session enqueue/wait, TUN device helpers. |
 
-### What stays in `afxdp.rs` (~11,100 lines):
+### What stays in `afxdp.rs` now (~14,800 lines):
 
 - Module declarations + `use self::X::*` re-exports
-- `pub struct Coordinator` + `impl Coordinator` (~1,435 lines) — orchestrates everything
-- `poll_binding()` (~3,113 lines) — the hot loop, touches every module
-- `worker_loop()` (~850 lines) — thread entry point
-- TCP MSS clamping, IcmpTeRateLimiter (~175 lines)
-- ~5,500 lines of tests that exercise poll_binding/frame building
+- `pub struct Coordinator` + `impl Coordinator` — orchestrates everything
+- `BindingWorker` and the AF_XDP hot loop (`poll_binding()`)
+- `worker_loop()` and the tightly-coupled packet-processing helper cluster
+- the mixed test fixture and test body section
 
-**Result: 20,138 → ~11,100 lines (45% reduction)**
+The split plan is complete for helper/production code. The remaining bulk is hot-loop code and tests, not misplaced utility modules.
 
 ## Re-export Strategy
 
@@ -166,14 +164,20 @@ Each step is a single commit, independently compilable and testable with `cargo 
 
 | Step | Module | Risk | Rationale |
 |------|--------|------|-----------|
-| 1 | `types.rs` | Low | Mostly data types and constants, but it must be first because every later module depends on them. The extraction also has to include worker/forwarding helper types that the original plan omitted. A first pass is already implemented locally; the remaining shared worker/forwarding types should move next. |
-| 2 | `checksum.rs` | Zero | Pure functions plus the DNAT publish helper. Trivial extraction. |
-| 3 | `neighbor.rs` | Low | Self-contained netlink + MAC helpers, including the initial dump/update path. Clear boundary: Coordinator, worker_loop, and forwarding resolution call these. |
-| 4 | `bpf_map.rs` | Low | Standalone unsafe FFI for BPF map operations, including heartbeat/session-map helpers. Used by Coordinator, worker_loop, session_glue, and status/debug paths. |
-| 5 | `umem.rs` | Low | Leaf memory management. MmapArea is self-contained, BindingLiveState is atomic-only. This step is already implemented locally. |
-| 6 | `rst.rs` | Low | nftables + NAT exclusion code. Only called from build_forwarding_state (install) and main.rs (remove). |
-| 7 | `forwarding.rs` | Medium | Largest extraction (~4,500 lines with tests). Forwarding resolution functions form a cohesive unit consuming ForwardingState + route types. `build_forwarding_state()` naturally belongs here. |
-| 8 | `tunnel.rs` | Medium | Depends on forwarding + bpf_map functions (accessed via super::*). Must be done after steps 4, 6, 7. |
+| 1 | `types.rs` | Done | Shared worker/forwarding types landed here. |
+| 2 | `checksum.rs` | Done | DNAT/checksum helpers extracted. |
+| 3 | `neighbor.rs` | Done | Netlink dump/monitor/probe helpers extracted. |
+| 4 | `bpf_map.rs` | Done | BPF/session/heartbeat helpers extracted. |
+| 5 | `umem.rs` | Done | UMEM and binding live-state extracted. |
+| 6 | `rst.rs` | Done | RST suppression helpers extracted. |
+| 7 | `forwarding.rs` | Done | Forwarding/config compilation extracted. |
+| 8 | `tunnel.rs` | Done | Local tunnel origination extracted. |
+
+Optional follow-on, if we want to reduce `afxdp.rs` further:
+
+- split the forwarding-heavy tests and fixtures into `forwarding.rs`
+- split the mixed frame/rewrite tests into `frame.rs`
+- only after that consider whether `poll_binding()` itself should be carved up further
 
 ## Challenges and Solutions
 
@@ -193,7 +197,7 @@ The monolith has a few cohesive helper groups that should move with the leaf mod
 - `bpf_map.rs`
   - `update_heartbeat_slot()`, `delete_xsk_slot()`, `delete_heartbeat_slot()`, `maybe_touch_heartbeat()`, `touch_heartbeat()`, `heartbeat_fresh()`, `UserspaceSessionMapKey`, `session_map_key()`, `publish_session_map_key()`, `publish_live_session_key()`, `publish_kernel_local_session_key()`, `publish_live_session_entry()`, `verify_session_key_in_bpf()`, `count_bpf_session_entries()`, `dump_bpf_session_entries()`, `delete_live_session_key()`, `delete_live_session_entry()`
 
-If these stay in `afxdp.rs`, the file still carries most of the helper sprawl even after the main extractions. The current local split already moved the first `types.rs` slice (`FastMap`/`FastSet`, metadata, flow-cache types), but the larger worker/forwarding types are still pending.
+If these stay in `afxdp.rs`, the file still carries most of the helper sprawl even after the main extractions. That gap is now closed: the helper clusters above are moved, and what remains is the hot path plus tests.
 
 ### 3. `FastMap`/`FastSet` type aliases
 Used everywhere as `type FastMap<K,V> = FxHashMap<K,V>`. **Solution:** Move to `types.rs`.
@@ -208,10 +212,10 @@ Used everywhere as `type FastMap<K,V> = FxHashMap<K,V>`. **Solution:** Move to `
 
 ```
 userspace-dp/src/
-  afxdp.rs              ~17,388 lines now; target still ~11,100
+  afxdp.rs              14,794 lines
   afxdp/
-    types.rs               ~420 lines  ← NEW (first pass landed; more shared types still to move)
-    forwarding.rs        ~4,500 lines  ← NEW (incl. ~3K tests)
+    types.rs               650 lines
+    forwarding.rs        2,145 lines
     bpf_map.rs             ~577 lines  ← NEW
     umem.rs                ~632 lines  ← NEW
     neighbor.rs            ~651 lines  ← NEW
@@ -227,7 +231,7 @@ userspace-dp/src/
     tx.rs                    790 lines  (existing)
 ```
 
-Total: 16 submodule files + parent. No single file exceeds ~11K lines. The hot path (`poll_binding`) stays in one place for performance reasoning.
+Total: 16 submodule files + parent. The helper-module split is complete. The remaining large file is large because it still owns the hot path and the mixed test body, not because helper code is stranded there.
 
 ## Verification
 
