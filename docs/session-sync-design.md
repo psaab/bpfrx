@@ -12,6 +12,14 @@ Improve HA session sync so that it is:
 This document is a forward-looking design note. It complements the current-state
 writeup in [session-sync-architecture.md](./session-sync-architecture.md).
 
+**Current state baseline** (as of PR #265): the architecture doc covers bulk
+sync with sender-side ack, incremental sweep, depth-counted pause/resume,
+barrier-ordered demotion prep with retryable admission errors, userspace delta
+filtering by `FabricRedirect`/`FabricIngress`/`local_delivery`, and readiness
+generation guards. None of that has changed the fundamental producer model
+described below — the sweep is still the primary kernel producer and the
+userspace helper is still polled via RPC.
+
 ## Current State
 
 Today the architecture is split across:

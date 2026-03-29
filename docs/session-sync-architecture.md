@@ -256,18 +256,20 @@ before `OnPeerConnected` and before the fresh bulk starts.
 The Go daemon periodically drains helper-originated session deltas via
 `DrainSessionDeltas(...)`.
 
-These deltas are **not** blindly mirrored. Current filtering is:
+These deltas are **not** blindly mirrored. Filtering in
+`shouldSyncUserspaceDelta()`:
 
-- `local_delivery` is never synced to the peer
-- stale-owner `FabricRedirect` deltas from non-fabric ingress are allowed even
-  if the local node is no longer owner, because the peer still needs the
-  forward-wire alias to receive redirected traffic
-- if a delta carries `OwnerRGID`, ownership is checked with `IsPrimaryForRGFn`
+- `local_delivery` disposition is never synced to the peer
+- `FabricRedirect` with `!FabricIngress`: always synced even if the local node
+  is no longer owner, because the peer needs the forward-wire alias to receive
+  redirected traffic. The daemon also synthesizes forward-wire alias session
+  keys via `userspaceForwardWireAliasFromDeltaV4/V6` so the new owner can
+  materialize the translated forward tuple it will receive over the fabric.
+- if the delta carries `OwnerRGID`, ownership is checked with `IsPrimaryForRGFn`
 - otherwise the fallback is `ShouldSyncZone(ingressZone)`
 
-For stale-owner fabric redirects, the daemon also synthesizes forward-wire alias
-session keys on the sync stream so the new owner can materialize the translated
-forward tuple it will receive over the fabric.
+The filtering fields on `SessionDeltaInfo` are `FabricRedirect` and
+`FabricIngress` (boolean flags), not a single combined field.
 
 ### Export During Demotion Prep
 
@@ -303,22 +305,71 @@ When a node becomes primary for an RG:
 Graceful demotion is now an explicit staged protocol, not just "send a barrier
 and hope the queue is empty".
 
-Current sequence:
+Current sequence (`prepareUserspaceRGDemotionWithTimeout()`):
 
-1. Require `syncPeerBulkPrimed` for the current connection
-2. Wait for any previous demotion barriers to be acknowledged
-3. Repeatedly wait for the sync stream to go idle (`WaitForIdle`) and then send
+1. Acquire demotion prep gate (`acquireUserspaceRGDemotionPrep`) — prevents
+   duplicate concurrent preps for the same RG. On failure, the gate is released
+   via `releaseUserspaceRGDemotionPrep` so retries are not blocked.
+2. Require `syncPeerBulkPrimed` for the current connection
+3. Wait for any previous demotion barriers to be acknowledged
+   (`WaitForPeerBarriersDrained`)
+4. Repeatedly wait for the sync stream to go idle (`WaitForIdle`) and then send
    a probe barrier (`WaitForPeerBarrier`) until quiescence is proven or the
    timeout expires
-4. Pause background incremental sync with `PauseIncrementalSync(...)`
-5. Export userspace sessions owned by the demoting RGs
-6. Drain recent userspace deltas while incremental sync is paused
-7. Send a final ordered barrier and wait for peer acknowledgement
-8. Call helper `PrepareRGDemotion(...)`
-9. Resume incremental sync
+5. Pause background incremental sweep with `PauseIncrementalSync(...)` — this
+   is a depth-counted pause that only stops the periodic sweep goroutine. GC
+   delete callbacks continue to run and queue delete messages normally.
+6. Export userspace sessions owned by the demoting RGs
+   (`ExportOwnerRGSessions`)
+7. Drain recent userspace deltas while sweep is paused
+8. Send a final ordered barrier and wait for peer acknowledgement
+9. Call helper `PrepareRGDemotion(...)` which marks demoted sessions as synced
+   in the shared session maps
+10. Resume incremental sync
 
-Manual failover uses the same demotion-prep path, but wraps some failures as
-retryable admission errors instead of proceeding unsafely.
+Manual failover uses the same demotion-prep path via
+`prepareUserspaceManualFailover()`, but wraps failures as
+`RetryablePreFailoverError` for transient conditions (previous barrier pending,
+peer not quiescent, barrier ack timeout). The cluster state machine can retry
+admission on retryable errors instead of proceeding unsafely.
+
+## Implementation Details
+
+### Incremental Sync Pause/Resume
+
+`PauseIncrementalSync(reason)` / `ResumeIncrementalSync(reason)` provide a
+depth-counted pause mechanism. Multiple callers can pause independently; the
+sweep only resumes when all callers have resumed. This is used during demotion
+prep to stop the sweep without affecting GC delete callbacks or explicit sync
+producers.
+
+### Bulk-Prime Retry Loop
+
+After reconnect, `startSessionSyncPrimeRetry()` retries `BulkSync()` at
+increasing intervals (10s, 20s, 40s) if the peer never acknowledges our
+bulk with `BulkAck`. Retries are deferred while:
+
+- a pending bulk ack is still young (< 35s since BulkEnd was sent)
+- inbound sync progress is still advancing (`syncPrimeProgressObserved`)
+- the connection was replaced or disconnected
+
+Retries stop once `syncPeerBulkPrimed` becomes true.
+
+### Readiness Timeout Generation Guard
+
+`armSyncReadyTimer()` captures a generation counter when the timer is armed.
+The timeout callback checks that the generation is still current AND the sync
+transport is still connected before releasing readiness. `stopSyncReadyTimer()`
+increments the generation, invalidating any in-flight callback. This prevents
+a stale timer from flipping readiness back to true after a disconnect in a
+tight race.
+
+### Barrier Ordering
+
+`WaitForPeerBarrier()` enqueues the barrier message onto `sendCh` (the same
+buffered channel used by `sendLoop` for all sync messages) rather than writing
+directly to the socket. This preserves strict FIFO ordering — the barrier
+cannot overtake messages that `sendLoop` has dequeued but not yet written.
 
 ## Invariants
 
@@ -332,18 +383,19 @@ retryable admission errors instead of proceeding unsafely.
 7. Graceful demotion is ordered against the session-sync stream with explicit
    quiescence and barriers.
 
-## What Earlier Versions Missed
+## Revision History
 
-The previous version of this document was materially incomplete in a few places:
+This document has been corrected through multiple passes:
 
-- it treated readiness as "bulk received" and omitted sender-side `BulkAck`
-  readiness
-- it did not describe the bulk-prime retry loop or pending-bulk-ack tracking
-- it simplified userspace delta sync as an unfiltered mirror of helper events
-- it did not explain the explicit demotion-prep pause / export / drain /
-  barrier protocol
-- it implied userspace mirroring happened only through `SetClusterSyncedSession*`
-  and omitted the helper-originated delta/export paths
+- v1: Basic bulk + sweep description. Missing sender-side ack tracking,
+  demotion protocol, userspace delta filtering.
+- v2 (PR #264): Added two-readiness-signal model, bulk-prime retry loop,
+  explicit demotion-prep sequence, userspace delta filtering details.
+- v3 (current): Corrected delta filtering field names (`FabricRedirect` +
+  `FabricIngress`, not a combined field). Clarified that `PauseIncrementalSync`
+  only pauses the sweep — GC delete callbacks are never suppressed. Added
+  manual failover retry admission logic, depth-counted pause mechanism,
+  readiness generation guard, barrier ordering via sendCh.
 
 ## Known Limitations
 
