@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/dataplane"
 )
 
 func TestSessionDisplayVLANID(t *testing.T) {
@@ -78,4 +79,100 @@ func TestBuildSessionEgressIfaces_UsesUnitNumberWhenVlanIDUnset(t *testing.T) {
 	if !found80 {
 		t.Fatal("missing reth0.80 mapping")
 	}
+}
+
+func TestIfaceMatches(t *testing.T) {
+	f := &sessionFilter{iface: "ge-0/0/0"}
+	tests := []struct {
+		name   string
+		ifName string
+		want   bool
+	}{
+		{"exact match", "ge-0/0/0", true},
+		{"subinterface match", "ge-0/0/0.50", true},
+		{"different interface", "ge-0/0/1", false},
+		{"empty string", "", false},
+		{"partial name", "ge-0/0/0x", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := f.ifaceMatches(tt.ifName); got != tt.want {
+				t.Errorf("ifaceMatches(%q) = %v, want %v", tt.ifName, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatchesV4_InterfaceFilter(t *testing.T) {
+	// Zone 1 = trust (ge-0/0/0), Zone 2 = untrust (ge-0/0/1)
+	zoneIfaces := map[uint16]string{1: "ge-0/0/0", 2: "ge-0/0/1"}
+	egressIfaces := map[sessionIfaceKey]string{
+		{ifindex: 10, vlanID: 0}: "ge-0/0/1",
+		{ifindex: 20, vlanID: 0}: "ge-0/0/2",
+	}
+
+	t.Run("matches ingress interface", func(t *testing.T) {
+		f := &sessionFilter{
+			iface:           "ge-0/0/0",
+			zoneIfaces:      zoneIfaces,
+			egressIfacesMap: egressIfaces,
+		}
+		key := dataplane.SessionKey{Protocol: 6}
+		val := dataplane.SessionValue{IngressZone: 1, EgressZone: 2, FibIfindex: 10}
+		if !f.matchesV4(key, val) {
+			t.Error("expected match on ingress interface ge-0/0/0")
+		}
+	})
+
+	t.Run("matches egress interface", func(t *testing.T) {
+		f := &sessionFilter{
+			iface:           "ge-0/0/1",
+			zoneIfaces:      zoneIfaces,
+			egressIfacesMap: egressIfaces,
+		}
+		key := dataplane.SessionKey{Protocol: 6}
+		val := dataplane.SessionValue{IngressZone: 1, EgressZone: 2, FibIfindex: 10}
+		if !f.matchesV4(key, val) {
+			t.Error("expected match on egress interface ge-0/0/1")
+		}
+	})
+
+	t.Run("no match when interface differs", func(t *testing.T) {
+		f := &sessionFilter{
+			iface:           "ge-0/0/2",
+			zoneIfaces:      zoneIfaces,
+			egressIfacesMap: egressIfaces,
+		}
+		key := dataplane.SessionKey{Protocol: 6}
+		val := dataplane.SessionValue{IngressZone: 1, EgressZone: 2, FibIfindex: 10}
+		if f.matchesV4(key, val) {
+			t.Error("expected no match for ge-0/0/2")
+		}
+	})
+
+	t.Run("matches egress via FIB lookup", func(t *testing.T) {
+		f := &sessionFilter{
+			iface:           "ge-0/0/2",
+			zoneIfaces:      zoneIfaces,
+			egressIfacesMap: egressIfaces,
+		}
+		key := dataplane.SessionKey{Protocol: 6}
+		// FibIfindex 20 resolves to ge-0/0/2 via egressIfaces map
+		val := dataplane.SessionValue{IngressZone: 1, EgressZone: 2, FibIfindex: 20}
+		if !f.matchesV4(key, val) {
+			t.Error("expected match on egress interface ge-0/0/2 via FIB")
+		}
+	})
+
+	t.Run("no interface filter passes all", func(t *testing.T) {
+		f := &sessionFilter{
+			zoneIfaces:      zoneIfaces,
+			egressIfacesMap: egressIfaces,
+		}
+		key := dataplane.SessionKey{Protocol: 6}
+		val := dataplane.SessionValue{IngressZone: 1, EgressZone: 2, FibIfindex: 10}
+		if !f.matchesV4(key, val) {
+			t.Error("expected match when no interface filter set")
+		}
+	})
 }

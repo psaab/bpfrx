@@ -3047,13 +3047,17 @@ type sessionFilter struct {
 	srcPort  uint16         // 0 = any
 	dstPort  uint16         // 0 = any
 	natOnly  bool           // show only NAT sessions
-	iface    string         // ingress interface name filter
+	iface    string         // ingress/egress interface name filter
 	summary  bool           // only show count
 	brief    bool           // compact tabular view
 	appName  string         // application name filter
 	sortBy   string         // "bytes" or "packets" for top-talkers
 	cfg      *config.Config // for application resolution
 	appNames map[uint16]string
+
+	// Populated by showFlowSession before iteration for interface matching.
+	zoneIfaces      map[uint16]string           // zone ID → first interface name
+	egressIfacesMap map[sessionIfaceKey]string   // {ifindex,vlanID} → interface name
 }
 
 func (c *CLI) parseSessionFilter(args []string) sessionFilter {
@@ -3141,20 +3145,6 @@ func (c *CLI) parseSessionFilter(args []string) sessionFilter {
 			if i+1 < len(args) {
 				i++
 				f.iface = args[i]
-				// Resolve interface name to zone ID for session filtering.
-				if f.cfg != nil && c.dp != nil {
-					if cr := c.dp.LastCompileResult(); cr != nil {
-						for zname, zone := range f.cfg.Security.Zones {
-							for _, ifRef := range zone.Interfaces {
-								if ifRef == f.iface || strings.HasPrefix(ifRef, f.iface+".") {
-									if zid, ok := cr.ZoneIDs[zname]; ok && f.zoneID == 0 {
-										f.zoneID = zid
-									}
-								}
-							}
-						}
-					}
-				}
 			}
 		case "application":
 			if i+1 < len(args) {
@@ -3178,6 +3168,13 @@ func (c *CLI) parseSessionFilter(args []string) sessionFilter {
 func (f *sessionFilter) matchesV4(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 	if f.zoneID != 0 && val.IngressZone != f.zoneID && val.EgressZone != f.zoneID {
 		return false
+	}
+	if f.iface != "" {
+		inIf := f.zoneIfaces[val.IngressZone]
+		outIf := f.resolveEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone)
+		if !f.ifaceMatches(inIf) && !f.ifaceMatches(outIf) {
+			return false
+		}
 	}
 	if f.proto != 0 && key.Protocol != f.proto {
 		return false
@@ -3210,6 +3207,13 @@ func (f *sessionFilter) matchesV6(key dataplane.SessionKeyV6, val dataplane.Sess
 	if f.zoneID != 0 && val.IngressZone != f.zoneID && val.EgressZone != f.zoneID {
 		return false
 	}
+	if f.iface != "" {
+		inIf := f.zoneIfaces[val.IngressZone]
+		outIf := f.resolveEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone)
+		if !f.ifaceMatches(inIf) && !f.ifaceMatches(outIf) {
+			return false
+		}
+	}
 	if f.proto != 0 && key.Protocol != f.proto {
 		return false
 	}
@@ -3240,6 +3244,27 @@ func (f *sessionFilter) matchesV6(key dataplane.SessionKeyV6, val dataplane.Sess
 func (f *sessionFilter) hasFilter() bool {
 	return f.zoneID != 0 || f.proto != 0 || f.srcNet != nil || f.dstNet != nil ||
 		f.srcPort != 0 || f.dstPort != 0 || f.natOnly || f.iface != "" || f.appName != ""
+}
+
+// ifaceMatches checks whether ifName matches the filter's interface name.
+// It matches the exact name or the parent interface (e.g. filter "ge-0/0/0"
+// matches session interface "ge-0/0/0.50").
+func (f *sessionFilter) ifaceMatches(ifName string) bool {
+	if ifName == "" {
+		return false
+	}
+	return ifName == f.iface || strings.HasPrefix(ifName, f.iface+".")
+}
+
+// resolveEgressIface resolves a session's egress interface name from FIB
+// lookup result, falling back to the zone's first interface.
+func (f *sessionFilter) resolveEgressIface(fibIfindex uint32, fibVlanID uint16, egressZone uint16) string {
+	if fibIfindex != 0 {
+		if ifName, ok := f.egressIfacesMap[sessionIfaceKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
+			return ifName
+		}
+	}
+	return f.zoneIfaces[egressZone]
 }
 
 func (c *CLI) showFlowSession(args []string) error {
@@ -3308,6 +3333,11 @@ func (c *CLI) showFlowSession(args []string) error {
 		}
 	}
 	egressIfaces := buildSessionEgressIfaces(f.cfg)
+
+	// Populate filter maps for interface-level matching in matchesV4/V6.
+	f.zoneIfaces = zoneIfaces
+	f.egressIfacesMap = egressIfaces
+
 	sessionEgressIf := func(fibIfindex uint32, fibVlanID uint16, zoneID uint16, zoneName string) string {
 		if fibIfindex != 0 {
 			if ifName, ok := egressIfaces[sessionIfaceKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
@@ -3437,9 +3467,9 @@ func (c *CLI) showFlowSession(args []string) error {
 		if inIf == "" {
 			inIf = inZone
 		}
-		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Pkts: %d, Bytes: %d,\n",
+		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
 			srcIP, srcPort, dstIP, dstPort, protoName,
-			inIf, val.FwdPackets, val.FwdBytes)
+			inIf, inZone, val.FwdPackets, val.FwdBytes)
 
 		// Out line: reverse direction (with NAT translations applied)
 		outSrcIP := dstIP.String()
@@ -3459,9 +3489,9 @@ func (c *CLI) showFlowSession(args []string) error {
 			outSrcPort = natPort
 		}
 		outIf := sessionEgressIf(val.FibIfindex, val.FibVlanID, val.EgressZone, outZone)
-		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Pkts: %d, Bytes: %d,\n",
+		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
 			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
-			outIf, val.RevPackets, val.RevBytes)
+			outIf, outZone, val.RevPackets, val.RevBytes)
 		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, dstPort, val.AppID); appName != "" {
 			fmt.Printf("  Application: %s\n", appName)
 		}
@@ -3582,9 +3612,9 @@ func (c *CLI) showFlowSession(args []string) error {
 		if inIf == "" {
 			inIf = inZone
 		}
-		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Pkts: %d, Bytes: %d,\n",
+		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
 			srcIP, srcPort, dstIP, dstPort, protoName,
-			inIf, val.FwdPackets, val.FwdBytes)
+			inIf, inZone, val.FwdPackets, val.FwdBytes)
 
 		// Out line: reverse direction (with NAT translations applied)
 		outSrcIP := dstIP.String()
@@ -3604,9 +3634,9 @@ func (c *CLI) showFlowSession(args []string) error {
 			outSrcPort = natPort
 		}
 		outIf := sessionEgressIf(val.FibIfindex, val.FibVlanID, val.EgressZone, outZone)
-		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Pkts: %d, Bytes: %d,\n",
+		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
 			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
-			outIf, val.RevPackets, val.RevBytes)
+			outIf, outZone, val.RevPackets, val.RevBytes)
 		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, dstPort, val.AppID); appName != "" {
 			fmt.Printf("  Application: %s\n", appName)
 		}
@@ -3739,8 +3769,12 @@ func (c *CLI) showFlowSession(args []string) error {
 					if peerFullSID == 0 {
 						peerFullSID = uint64(i + 1)
 					}
-					fmt.Printf("Session ID: %d, Policy: %s, State: %s, Timeout: %ds, Age: %ds, Idle: %ds\n",
-						peerFullSID, polDisplay, se.State, se.TimeoutSeconds, se.AgeSeconds, se.IdleSeconds)
+					peerHAState := "Backup"
+					if se.HaActive {
+						peerHAState = "Active"
+					}
+					fmt.Printf("Session ID: %d, Policy name: %s/%d, HA State: %s, Timeout: %d, Session State: Valid\n",
+						peerFullSID, polDisplay, se.PolicyId, peerHAState, se.TimeoutSeconds)
 					inZone := se.IngressZoneName
 					if inZone == "" {
 						inZone = fmt.Sprintf("%d", se.IngressZone)
@@ -3749,17 +3783,37 @@ func (c *CLI) showFlowSession(args []string) error {
 					if outZone == "" {
 						outZone = fmt.Sprintf("%d", se.EgressZone)
 					}
-					fmt.Printf("  In: %s:%d --> %s:%d;%s, Zone: %s -> %s\n",
-						se.SrcAddr, se.SrcPort, se.DstAddr, se.DstPort,
-						se.Protocol, inZone, outZone)
-					if se.Nat != "" {
-						fmt.Printf("  NAT: %s\n", se.Nat)
+					inIf := se.IngressInterface
+					if inIf == "" {
+						inIf = inZone
 					}
+					outIf := se.EgressInterface
+					if outIf == "" {
+						outIf = outZone
+					}
+					fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
+						se.SrcAddr, se.SrcPort, se.DstAddr, se.DstPort,
+						se.Protocol, inIf, inZone, se.FwdPackets, se.FwdBytes)
+					// Out line: reverse direction with NAT applied
+					outSrcAddr := se.DstAddr
+					outSrcPort := se.DstPort
+					outDstAddr := se.SrcAddr
+					outDstPort := se.SrcPort
+					if se.NatSrcAddr != "" {
+						outDstAddr = se.NatSrcAddr
+						outDstPort = se.NatSrcPort
+					}
+					if se.NatDstAddr != "" {
+						outSrcAddr = se.NatDstAddr
+						outSrcPort = se.NatDstPort
+					}
+					fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
+						outSrcAddr, outSrcPort, outDstAddr, outDstPort,
+						se.Protocol, outIf, outZone, se.RevPackets, se.RevBytes)
 					if se.Application != "" {
 						fmt.Printf("  Application: %s\n", se.Application)
 					}
-					fmt.Printf("  Packets: %d/%d, Bytes: %d/%d\n",
-						se.FwdPackets, se.RevPackets, se.FwdBytes, se.RevBytes)
+					fmt.Println()
 				}
 			}
 			fmt.Printf("Total sessions: %d\n", peerResp.Total)
@@ -3801,6 +3855,9 @@ func (c *CLI) fetchPeerSessions(f sessionFilter) *pb.GetSessionsResponse {
 	}
 	if f.appName != "" {
 		req.Application = f.appName
+	}
+	if f.iface != "" {
+		req.InterfaceFilter = f.iface
 	}
 
 	resp, err := client.GetSessions(ctx, req)

@@ -246,6 +246,7 @@ message GetSessionsRequest {
   bool nat_only = 9;              // show only NAT sessions
   string application = 10;        // application name filter (e.g. "junos-http")
   bool include_peer = 11;         // fetch sessions from cluster peer too
+  string interface_filter = 12;   // filter by ingress/egress interface name
 }
 message GetSessionsResponse {
   int32 total = 1;

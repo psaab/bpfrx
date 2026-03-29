@@ -2205,9 +2205,10 @@ type GetSessionsRequest struct {
 	DestinationPrefix string                 `protobuf:"bytes,6,opt,name=destination_prefix,json=destinationPrefix,proto3" json:"destination_prefix,omitempty"` // CIDR prefix filter
 	SourcePort        uint32                 `protobuf:"varint,7,opt,name=source_port,json=sourcePort,proto3" json:"source_port,omitempty"`
 	DestinationPort   uint32                 `protobuf:"varint,8,opt,name=destination_port,json=destinationPort,proto3" json:"destination_port,omitempty"`
-	NatOnly           bool                   `protobuf:"varint,9,opt,name=nat_only,json=natOnly,proto3" json:"nat_only,omitempty"`              // show only NAT sessions
-	Application       string                 `protobuf:"bytes,10,opt,name=application,proto3" json:"application,omitempty"`                     // application name filter (e.g. "junos-http")
-	IncludePeer       bool                   `protobuf:"varint,11,opt,name=include_peer,json=includePeer,proto3" json:"include_peer,omitempty"` // fetch sessions from cluster peer too
+	NatOnly           bool                   `protobuf:"varint,9,opt,name=nat_only,json=natOnly,proto3" json:"nat_only,omitempty"`                         // show only NAT sessions
+	Application       string                 `protobuf:"bytes,10,opt,name=application,proto3" json:"application,omitempty"`                                // application name filter (e.g. "junos-http")
+	IncludePeer       bool                   `protobuf:"varint,11,opt,name=include_peer,json=includePeer,proto3" json:"include_peer,omitempty"`            // fetch sessions from cluster peer too
+	InterfaceFilter   string                 `protobuf:"bytes,12,opt,name=interface_filter,json=interfaceFilter,proto3" json:"interface_filter,omitempty"` // filter by ingress/egress interface name
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -2317,6 +2318,13 @@ func (x *GetSessionsRequest) GetIncludePeer() bool {
 		return x.IncludePeer
 	}
 	return false
+}
+
+func (x *GetSessionsRequest) GetInterfaceFilter() string {
+	if x != nil {
+		return x.InterfaceFilter
+	}
+	return ""
 }
 
 type GetSessionsResponse struct {
@@ -6921,7 +6929,7 @@ const file_bpfrx_proto_rawDesc = "" +
 	"hitPackets\x12\x1b\n" +
 	"\thit_bytes\x18\t \x01(\x04R\bhitBytes\x12 \n" +
 	"\vdescription\x18\n" +
-	" \x01(\tR\vdescription\"\xf2\x02\n" +
+	" \x01(\tR\vdescription\"\x9d\x03\n" +
 	"\x12GetSessionsRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x05R\x06offset\x12\x12\n" +
@@ -6935,7 +6943,8 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\bnat_only\x18\t \x01(\bR\anatOnly\x12 \n" +
 	"\vapplication\x18\n" +
 	" \x01(\tR\vapplication\x12!\n" +
-	"\finclude_peer\x18\v \x01(\bR\vincludePeer\"\xd9\x01\n" +
+	"\finclude_peer\x18\v \x01(\bR\vincludePeer\x12)\n" +
+	"\x10interface_filter\x18\f \x01(\tR\x0finterfaceFilter\"\xd9\x01\n" +
 	"\x13GetSessionsResponse\x12\x14\n" +
 	"\x05total\x18\x01 \x01(\x05R\x05total\x12\x14\n" +
 	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x16\n" +

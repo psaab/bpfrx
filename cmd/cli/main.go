@@ -1263,9 +1263,13 @@ func printSessionEntries(resp *pb.GetSessionsResponse, brief bool) {
 		if inIf == "" {
 			inIf = se.IngressZoneName
 		}
-		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Pkts: %d, Bytes: %d,\n",
+		inZone := se.IngressZoneName
+		if inZone == "" {
+			inZone = fmt.Sprintf("%d", se.IngressZone)
+		}
+		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
 			se.SrcAddr, se.SrcPort, se.DstAddr, se.DstPort,
-			se.Protocol, inIf, se.FwdPackets, se.FwdBytes)
+			se.Protocol, inIf, inZone, se.FwdPackets, se.FwdBytes)
 
 		// Out line: reverse direction (with NAT translations applied)
 		outSrcAddr := se.DstAddr
@@ -1284,9 +1288,13 @@ func printSessionEntries(resp *pb.GetSessionsResponse, brief bool) {
 		if outIf == "" {
 			outIf = se.EgressZoneName
 		}
-		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Pkts: %d, Bytes: %d,\n",
+		outZone := se.EgressZoneName
+		if outZone == "" {
+			outZone = fmt.Sprintf("%d", se.EgressZone)
+		}
+		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
 			outSrcAddr, outSrcPort, outDstAddr, outDstPort,
-			se.Protocol, outIf, se.RevPackets, se.RevBytes)
+			se.Protocol, outIf, outZone, se.RevPackets, se.RevBytes)
 		fmt.Println()
 	}
 	fmt.Printf("Total sessions: %d\n", resp.Total)

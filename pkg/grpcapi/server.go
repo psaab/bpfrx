@@ -809,6 +809,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 	dstPort := uint16(req.DestinationPort)
 	natOnly := req.NatOnly
 	appFilter := req.Application
+	ifaceFilter := req.InterfaceFilter
 	cfg := s.store.ActiveConfig()
 
 	// Parse CIDR prefix filters
@@ -923,6 +924,13 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 			key.Protocol, ntohs(key.DstPort), val.AppID) {
 			return true
 		}
+		if ifaceFilter != "" {
+			inIf := zoneIfaces[val.IngressZone]
+			outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, zoneIfaces, egressIfaces)
+			if !sessionIfaceMatches(ifaceFilter, inIf) && !sessionIfaceMatches(ifaceFilter, outIf) {
+				return true
+			}
+		}
 		if idx >= offset && len(all) < limit {
 			// Merge counters from reverse entry — return packets
 			// increment rev_packets on the reverse entry, not the
@@ -970,6 +978,13 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 		if appFilter != "" && !appid.SessionMatches(appFilter, appNames, cfg,
 			key.Protocol, ntohs(key.DstPort), val.AppID) {
 			return true
+		}
+		if ifaceFilter != "" {
+			inIf := zoneIfaces[val.IngressZone]
+			outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, zoneIfaces, egressIfaces)
+			if !sessionIfaceMatches(ifaceFilter, inIf) && !sessionIfaceMatches(ifaceFilter, outIf) {
+				return true
+			}
 		}
 		if idx >= offset && len(all) < limit {
 			if rev, err := s.dp.GetSessionV6(val.ReverseKey); err == nil {
@@ -1023,6 +1038,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 				DestinationPort:   req.DestinationPort,
 				NatOnly:           req.NatOnly,
 				Application:       req.Application,
+				InterfaceFilter:   req.InterfaceFilter,
 			}
 			peerResp, err := client.GetSessions(peerCtx, peerReq)
 			if err != nil {
@@ -3216,6 +3232,26 @@ func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, no
 		se.NatDstPort = uint32(ntohs(val.NATDstPort))
 	}
 	return se
+}
+
+// sessionIfaceMatches checks whether ifName matches a filter interface name,
+// including parent-to-subinterface matching (e.g. "ge-0/0/0" matches "ge-0/0/0.50").
+func sessionIfaceMatches(filter, ifName string) bool {
+	if ifName == "" {
+		return false
+	}
+	return ifName == filter || strings.HasPrefix(ifName, filter+".")
+}
+
+// resolveSessionEgressIface resolves a session's egress interface from FIB result,
+// falling back to the zone's first interface.
+func resolveSessionEgressIface(fibIfindex uint32, fibVlanID uint16, egressZone uint16, zoneIfaces map[uint16]string, egressIfaces map[sessionEgressKey]string) string {
+	if fibIfindex != 0 {
+		if ifName, ok := egressIfaces[sessionEgressKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
+			return ifName
+		}
+	}
+	return zoneIfaces[egressZone]
 }
 
 func monotonicSeconds() uint64 {
