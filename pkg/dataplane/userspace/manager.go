@@ -2616,6 +2616,19 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 		slog.Info("userspace: disabled ctrl + swapped to eBPF pipeline for RG demotion",
 			"rg", rgID)
 	}
+	// Temporarily switch to eBPF pipeline for ANY RG transition.
+	// Demotion: ensures fabric redirect for demoted-RG traffic (old owner).
+	// Activation: ensures synced sessions with stale remote resolution don't
+	// get served from the userspace flow cache before the helper re-resolves
+	// them (new owner). The helper's status loop re-enables ctrl when ready.
+	m.mu.Lock()
+	m.disableUserspaceCtrlLocked()
+	if m.inner.XDPEntryProg != "xdp_main_prog" {
+		_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
+	}
+	m.mu.Unlock()
+	slog.Info("userspace: switched to eBPF pipeline for RG transition",
+		"rg", rgID, "active", active)
 	if err := m.inner.UpdateRGActive(rgID, active); err != nil {
 		return err
 	}
