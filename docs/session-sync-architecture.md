@@ -74,8 +74,9 @@ Session sync uses TCP over the fabric overlays:
 - `fab0` — primary fabric
 - `fab1` — optional secondary fabric
 
-Sockets are bound to `vrf-mgmt` with `SO_BINDTODEVICE`. One deterministic side
-initiates per fabric. `TCP_NODELAY` is enabled.
+When a management VRF (`vrf-mgmt`) is configured, sockets are bound to it with
+`SO_BINDTODEVICE`; otherwise they use the default routing table. One
+deterministic side initiates per fabric. `TCP_NODELAY` is enabled.
 
 ### Header
 
