@@ -1058,6 +1058,32 @@ impl Coordinator {
         let activated_rgs = activated_owner_rgs(previous.as_ref(), &state);
         self.ha_state.store(Arc::new(state));
         if !demoted_rgs.is_empty() {
+            // CRITICAL: Delete sessions from USERSPACE_SESSIONS BPF map
+            // IMMEDIATELY, before workers process DemoteOwnerRG asynchronously.
+            // Without this, there's a window where rg_active=0 but the XDP shim
+            // still finds sessions in USERSPACE_SESSIONS and redirects to XSK,
+            // bypassing the eBPF pipeline's fabric redirect for demoted RGs.
+            if let Some(session_map_ref) = self.session_map_fd.as_ref() {
+                let rg_set: std::collections::BTreeSet<i32> =
+                    demoted_rgs.iter().copied().collect();
+                let mut deleted = 0u32;
+                // Delete from shared_sessions (covers synced + promoted sessions)
+                if let Ok(sessions) = self.shared_sessions.lock() {
+                    for (key, entry) in sessions.iter() {
+                        if rg_set.contains(&entry.metadata.owner_rg_id) {
+                            delete_live_session_key(session_map_ref.fd, key);
+                            deleted += 1;
+                        }
+                    }
+                }
+                if deleted > 0 {
+                    eprintln!(
+                        "bpfrx-ha: immediate USERSPACE_SESSIONS cleanup for demoted RGs {:?}: {} entries",
+                        demoted_rgs, deleted
+                    );
+                }
+            }
+
             demote_shared_owner_rgs(
                 &self.shared_sessions,
                 &self.shared_nat_sessions,
@@ -1073,12 +1099,19 @@ impl Coordinator {
             }
         }
         if !activated_rgs.is_empty() {
+            eprintln!(
+                "bpfrx-ha: RG activation detected: {:?}, workers={}, shared_sessions={}",
+                activated_rgs,
+                self.workers.len(),
+                self.shared_sessions.lock().map(|s| s.len()).unwrap_or(0),
+            );
             let worker_commands = self
                 .workers
                 .values()
                 .map(|handle| handle.commands.clone())
                 .collect::<Vec<_>>();
             let Some(session_map_ref) = self.session_map_fd.as_ref() else {
+                eprintln!("bpfrx-ha: no session_map_fd, skipping activation");
                 return;
             };
             let session_map_fd = session_map_ref.fd;
@@ -2735,7 +2768,7 @@ fn poll_binding(
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
                     let mut session_ingress_zone: Option<Arc<str>> = None;
                     let mut apply_nat_on_fabric = false;
-                    let decision = if let Some(flow) = flow.as_ref() {
+                    let mut decision = if let Some(flow) = flow.as_ref() {
                         if let Some(resolved) = resolve_flow_session_decision(
                             sessions,
                             binding.session_map_fd,
@@ -3694,6 +3727,18 @@ fn poll_binding(
                             nat: NatDecision::default(),
                         }
                     };
+                    // Convert HAInactive to FabricRedirect BEFORE the forward/drop
+                    // branch. When the owner RG is demoted, existing sessions resolve
+                    // as HAInactive. Instead of dropping, redirect to the fabric peer
+                    // that now owns the RG. This is the critical path for existing TCP
+                    // sessions surviving RG failover.
+                    if decision.resolution.disposition == ForwardingDisposition::HAInactive
+                        && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
+                    {
+                        if let Some(redirect) = resolve_fabric_redirect(forwarding) {
+                            decision.resolution = redirect;
+                        }
+                    }
                     if matches!(
                         decision.resolution.disposition,
                         ForwardingDisposition::ForwardCandidate

@@ -319,6 +319,7 @@ pub(super) fn apply_worker_commands(
                 cancelled_keys.extend(demoted);
             }
             WorkerCommand::RefreshOwnerRGs(owner_rgs) => {
+                let pre_count = sessions.len();
                 for owner_rg_id in &owner_rgs {
                     for flow_cache in flow_caches.iter_mut() {
                         flow_cache.invalidate_owner_rg(*owner_rg_id);
@@ -334,6 +335,10 @@ pub(super) fn apply_worker_commands(
                     now_ns,
                     now_secs,
                     false,
+                );
+                eprintln!(
+                    "bpfrx-ha: RefreshOwnerRGs {:?} worker sessions: before={} after={}",
+                    owner_rgs, pre_count, sessions.len()
                 );
             }
             WorkerCommand::UpsertSynced(entry) => {

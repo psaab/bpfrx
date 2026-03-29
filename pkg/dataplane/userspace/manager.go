@@ -2596,6 +2596,32 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 }
 
 func (m *Manager) UpdateRGActive(rgID int, active bool) error {
+	// When demoting an RG, flush the USERSPACE_SESSIONS BPF map BEFORE
+	// setting rg_active=0. Without this, the XDP shim finds stale entries
+	// and redirects to XSK, bypassing the eBPF pipeline's fabric redirect
+	// that handles cross-chassis forwarding for demoted RGs.
+	if !active {
+		if usMap := m.inner.Map("userspace_sessions"); usMap != nil {
+			var key, nextKey []byte
+			key = make([]byte, usMap.KeySize())
+			nextKey = make([]byte, usMap.KeySize())
+			deleted := 0
+			for {
+				if err := usMap.NextKey(key, nextKey); err != nil {
+					break
+				}
+				copy(key, nextKey)
+				if err := usMap.Delete(key); err != nil {
+					break
+				}
+				deleted++
+			}
+			if deleted > 0 {
+				slog.Info("userspace: flushed USERSPACE_SESSIONS before RG demotion",
+					"rg", rgID, "deleted", deleted)
+			}
+		}
+	}
 	if err := m.inner.UpdateRGActive(rgID, active); err != nil {
 		return err
 	}
