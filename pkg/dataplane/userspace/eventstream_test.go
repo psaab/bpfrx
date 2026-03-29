@@ -447,7 +447,10 @@ func TestEventStreamDrainRequestComplete(t *testing.T) {
 	sockPath := filepath.Join(dir, "test-events.sock")
 
 	es := NewEventStream(sockPath)
-	es.SetOnEvent(func(uint8, uint64, SessionDeltaInfo) {})
+	var applied atomic.Int32
+	es.SetOnEvent(func(uint8, uint64, SessionDeltaInfo) {
+		applied.Add(1)
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -470,6 +473,29 @@ func TestEventStreamDrainRequestComplete(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	// Send some events so lastAppliedSeq is non-zero before draining.
+	payload := buildSessionOpenV4Payload(
+		6, 1000, 80,
+		[4]byte{10, 0, 1, 1}, [4]byte{10, 0, 2, 1},
+		[4]byte{}, [4]byte{},
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+		[6]byte{}, [6]byte{}, [4]byte{},
+	)
+	for i := uint64(1); i <= 5; i++ {
+		if err := writeFrame(conn, EventTypeSessionOpen, i, payload); err != nil {
+			t.Fatalf("write event %d: %v", i, err)
+		}
+	}
+
+	// Wait for all events to be applied.
+	deadline = time.Now().Add(2 * time.Second)
+	for applied.Load() < 5 {
+		if time.Now().After(deadline) {
+			t.Fatalf("applied = %d, want 5", applied.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	// In background, the daemon sends DrainRequest. We respond with DrainComplete.
 	done := make(chan uint64, 1)
 	go func() {
@@ -485,15 +511,24 @@ func TestEventStreamDrainRequestComplete(t *testing.T) {
 
 	// Read the DrainRequest from the "helper" side.
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	// Skip any Ack frames.
+	var drainTargetSeq uint64
 	for {
-		typ, _, _, err := readFrame(conn)
+		typ, seq, _, err := readFrame(conn)
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
 		if typ == EventTypeDrainRequest {
+			drainTargetSeq = seq
 			break
 		}
+	}
+
+	// Issue #267: DrainRequest must carry the real lastAppliedSeq, not zero.
+	if drainTargetSeq == 0 {
+		t.Fatal("DrainRequest target seq = 0, want non-zero (lastAppliedSeq)")
+	}
+	if drainTargetSeq != 5 {
+		t.Fatalf("DrainRequest target seq = %d, want 5", drainTargetSeq)
 	}
 
 	// Respond with DrainComplete.

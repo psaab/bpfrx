@@ -30,9 +30,10 @@ type EventStream struct {
 	paused    atomic.Bool
 
 	// Sequence tracking.
-	lastRecvSeq atomic.Uint64
-	lastAckSeq  atomic.Uint64
-	ackBatch    atomic.Uint64 // events since last ack
+	lastRecvSeq    atomic.Uint64
+	lastAppliedSeq atomic.Uint64 // advanced only after onEvent() completes
+	lastAckSeq     atomic.Uint64
+	ackBatch       atomic.Uint64 // events since last ack
 
 	// Callbacks — set before Start(), called on the reader goroutine.
 	onEvent      func(eventType uint8, seq uint64, delta SessionDeltaInfo)
@@ -124,7 +125,10 @@ func (es *EventStream) SendDrainRequest(ctx context.Context) (uint64, error) {
 	}
 	es.drainCompleteMu.Unlock()
 
-	if err := es.writeFrame(EventTypeDrainRequest, 0, nil); err != nil {
+	// Fence to the last sequence whose callback has completed, so the
+	// helper knows exactly which events have been fully applied.
+	targetSeq := es.lastAppliedSeq.Load()
+	if err := es.writeFrame(EventTypeDrainRequest, targetSeq, nil); err != nil {
 		return 0, fmt.Errorf("write drain request: %w", err)
 	}
 
@@ -274,6 +278,7 @@ func (es *EventStream) readLoop(ctx context.Context) {
 			if es.onEvent != nil {
 				es.onEvent(typ, seq, delta)
 			}
+			es.lastAppliedSeq.Store(seq)
 
 		case EventTypeSessionClose:
 			delta, ok := decodeSessionCloseEvent(payload)
@@ -291,6 +296,7 @@ func (es *EventStream) readLoop(ctx context.Context) {
 			if es.onEvent != nil {
 				es.onEvent(typ, seq, delta)
 			}
+			es.lastAppliedSeq.Store(seq)
 
 		case EventTypeDrainComplete:
 			select {
@@ -328,16 +334,16 @@ func (es *EventStream) ackLoop(ctx context.Context) {
 
 // sendAckIfNeeded sends an Ack if new events have been received since the last ack.
 func (es *EventStream) sendAckIfNeeded() {
-	recv := es.lastRecvSeq.Load()
+	applied := es.lastAppliedSeq.Load()
 	acked := es.lastAckSeq.Load()
-	if recv <= acked {
+	if applied <= acked {
 		return
 	}
-	if err := es.writeFrame(EventTypeAck, recv, nil); err != nil {
+	if err := es.writeFrame(EventTypeAck, applied, nil); err != nil {
 		slog.Debug("event stream: ack write error", "err", err)
 		return
 	}
-	es.lastAckSeq.Store(recv)
+	es.lastAckSeq.Store(applied)
 	es.ackBatch.Store(0)
 }
 
