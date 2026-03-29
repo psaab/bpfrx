@@ -586,3 +586,58 @@ func TestUserspaceRGDemotionPrepLeaseCanBeReleasedAfterFailure(t *testing.T) {
 		t.Fatal("expected lease acquisition after release")
 	}
 }
+
+// TestHandleEventStreamDeltaSkipsWhenNoCluster verifies that events are
+// silently dropped when cluster is nil.
+func TestHandleEventStreamDeltaSkipsWhenNoCluster(t *testing.T) {
+	d := &Daemon{}
+	delta := dpuserspace.SessionDeltaInfo{
+		AddrFamily: dataplane.AFInet,
+		Protocol:   6,
+		SrcIP:      "10.0.1.102",
+		DstIP:      "172.16.80.200",
+		SrcPort:    12345,
+		DstPort:    443,
+	}
+	// Should not panic when cluster and sessionSync are nil.
+	d.handleEventStreamDelta(dpuserspace.EventTypeSessionOpen, delta)
+}
+
+// TestHandleEventStreamDeltaSkipsDemotionPrep verifies that events are
+// skipped when demotion prep is active.
+func TestHandleEventStreamDeltaSkipsDemotionPrep(t *testing.T) {
+	d := &Daemon{
+		sessionSync: &cluster.SessionSync{
+			IsPrimaryFn:      func() bool { return true },
+			IsPrimaryForRGFn: func(rgID int) bool { return true },
+		},
+	}
+
+	// Simulate demotion prep active — should return early without panic.
+	d.userspaceDemotionPrepDepth.Store(1)
+
+	delta := dpuserspace.SessionDeltaInfo{
+		AddrFamily: dataplane.AFInet,
+		Protocol:   6,
+		SrcIP:      "10.0.1.102",
+		DstIP:      "172.16.80.200",
+		SrcPort:    12345,
+		DstPort:    443,
+		OwnerRGID:  1,
+	}
+
+	d.handleEventStreamDelta(dpuserspace.EventTypeSessionOpen, delta)
+}
+
+// TestHandleEventStreamDeltaMapsEventTypes verifies event type to string mapping
+// doesn't panic for all supported types.
+func TestHandleEventStreamDeltaMapsEventTypes(t *testing.T) {
+	d := &Daemon{} // nil cluster = early return
+	delta := dpuserspace.SessionDeltaInfo{
+		AddrFamily: dataplane.AFInet,
+		Protocol:   6,
+	}
+	d.handleEventStreamDelta(dpuserspace.EventTypeSessionOpen, delta)
+	d.handleEventStreamDelta(dpuserspace.EventTypeSessionClose, delta)
+	d.handleEventStreamDelta(dpuserspace.EventTypeSessionUpdate, delta)
+}

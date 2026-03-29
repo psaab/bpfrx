@@ -606,3 +606,30 @@ type SessionDeltaInfo struct {
 	FabricRedirect   bool      `json:"fabric_redirect,omitempty"`
 	FabricIngress    bool      `json:"fabric_ingress,omitempty"`
 }
+
+// ---------------------------------------------------------------------------
+// Event stream wire format (binary framed, helper → daemon push stream).
+// ---------------------------------------------------------------------------
+
+// EventFrameHeaderSize is the byte length of every event stream frame header.
+const EventFrameHeaderSize = 16
+
+// Event stream message types.
+const (
+	EventTypeSessionOpen     uint8 = 1
+	EventTypeSessionClose    uint8 = 2
+	EventTypeSessionUpdate   uint8 = 3
+	EventTypeAck             uint8 = 4 // daemon → helper
+	EventTypePause           uint8 = 5 // daemon → helper
+	EventTypeResume          uint8 = 6 // daemon → helper
+	EventTypeDrainRequest    uint8 = 7 // daemon → helper (target seq in header)
+	EventTypeDrainComplete   uint8 = 8 // helper → daemon
+	EventTypeFullResync      uint8 = 9 // helper → daemon
+)
+
+// Session event flag bits in the Flags byte of SessionOpen/Update/Close payloads.
+const (
+	SessionEventFlagFabricRedirect uint8 = 1 << 0
+	SessionEventFlagFabricIngress  uint8 = 1 << 1
+	SessionEventFlagIsReverse      uint8 = 1 << 2
+)

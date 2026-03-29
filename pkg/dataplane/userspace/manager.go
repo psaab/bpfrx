@@ -62,6 +62,9 @@ type Manager struct {
 	publishedSnapshot  uint64
 	publishedPlanKey   string
 	deferWorkers       bool // skip worker spawn until NotifyLinkCycle
+
+	eventStream       *EventStream
+	eventStreamCancel context.CancelFunc
 }
 
 func New() *Manager {
@@ -72,6 +75,13 @@ func New() *Manager {
 		inner:     inner,
 		haGroups:  make(map[int]HAGroupStatus),
 	}
+}
+
+// EventStream returns the event stream instance, or nil if not available.
+func (m *Manager) EventStream() *EventStream {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.eventStream
 }
 
 func (m *Manager) SessionSyncSweepProfile() (bool, time.Duration, time.Duration) {
@@ -300,6 +310,9 @@ func deriveUserspaceConfig(cfg *config.Config) config.UserspaceConfig {
 	}
 	if out.StateFile == "" {
 		out.StateFile = filepath.Join(filepath.Dir(out.ControlSocket), "state.json")
+	}
+	if out.EventSocket == "" {
+		out.EventSocket = filepath.Join(filepath.Dir(out.ControlSocket), "userspace-dp-events.sock")
 	}
 	return out
 }
@@ -2141,6 +2154,18 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 		return fmt.Errorf("mkdir state dir: %w", err)
 	}
 	_ = os.Remove(cfg.ControlSocket)
+	// Start the event stream listener before spawning the helper so it
+	// can connect immediately.
+	evtPath := cfg.EventSocket
+	if evtPath == "" {
+		evtPath = filepath.Join(filepath.Dir(cfg.ControlSocket), "userspace-dp-events.sock")
+	}
+	_ = os.Remove(evtPath)
+	es := NewEventStream(evtPath)
+	esCtx, esCancel := context.WithCancel(context.Background())
+	es.Start(esCtx)
+	m.eventStream = es
+	m.eventStreamCancel = esCancel
 	// Clear stale XSKMAP entries from previous helper instance.
 	// Old entries point to dead socket fds; new helper will repopulate.
 	if xskMap := m.inner.Map("userspace_xsk_map"); xskMap != nil {
@@ -4189,6 +4214,14 @@ func (m *Manager) bootstrapNAPIQueuesAsyncLocked(reason string) {
 }
 
 func (m *Manager) stopLocked() {
+	if m.eventStreamCancel != nil {
+		m.eventStreamCancel()
+		m.eventStreamCancel = nil
+	}
+	if m.eventStream != nil {
+		m.eventStream.Close()
+		m.eventStream = nil
+	}
 	if m.syncCancel != nil {
 		m.syncCancel()
 		m.syncCancel = nil
@@ -4640,6 +4673,7 @@ func (m *Manager) PrepareLinkCycle() {
 func configEqual(a, b config.UserspaceConfig) bool {
 	return a.Binary == b.Binary &&
 		a.ControlSocket == b.ControlSocket &&
+		a.EventSocket == b.EventSocket &&
 		a.StateFile == b.StateFile &&
 		a.Workers == b.Workers &&
 		a.RingEntries == b.RingEntries

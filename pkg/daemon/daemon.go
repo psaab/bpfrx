@@ -3212,6 +3212,10 @@ type userspaceRGDemotionPreparer interface {
 	PrepareRGDemotion(rgIDs []int) error
 }
 
+type userspaceEventStreamProvider interface {
+	EventStream() *dpuserspace.EventStream
+}
+
 func daemonMonotonicSeconds() uint64 {
 	var ts unix.Timespec
 	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
@@ -3586,6 +3590,148 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 	}
 }
 
+// runUserspaceEventStream attempts to consume session events from the helper's
+// binary event stream. Falls back to the existing polling loop when the stream
+// is unavailable or disconnected.
+func (d *Daemon) runUserspaceEventStream(ctx context.Context) {
+	provider, ok := d.dp.(userspaceEventStreamProvider)
+	if !ok || d.cluster == nil || d.sessionSync == nil {
+		// Manager doesn't support event stream — fall back to polling.
+		d.syncUserspaceSessionDeltas(ctx)
+		return
+	}
+
+	// Wait for the event stream to become available (helper may not have started yet).
+	var es *dpuserspace.EventStream
+	for {
+		es = provider.EventStream()
+		if es != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+
+	// Wire callbacks.
+	es.SetOnEvent(func(eventType uint8, seq uint64, delta dpuserspace.SessionDeltaInfo) {
+		d.handleEventStreamDelta(eventType, delta)
+	})
+	es.SetOnFullResync(func() {
+		d.handleEventStreamFullResync()
+	})
+
+	slog.Info("userspace: event stream consumer started")
+
+	// Monitor connection. When the stream is disconnected, fall back to
+	// polling via the existing DrainSessionDeltas RPC.
+	d.eventStreamFallbackLoop(ctx, provider)
+}
+
+// handleEventStreamDelta processes a single session event from the event stream.
+func (d *Daemon) handleEventStreamDelta(eventType uint8, delta dpuserspace.SessionDeltaInfo) {
+	if d.cluster == nil || d.sessionSync == nil {
+		return
+	}
+	if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
+		return
+	}
+	if d.userspaceDemotionPrepActive() {
+		return
+	}
+
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	zoneIDs := buildZoneIDs(cfg)
+
+	// Map binary event type to the string event expected by queueUserspaceSessionDeltas.
+	switch eventType {
+	case dpuserspace.EventTypeSessionOpen, dpuserspace.EventTypeSessionUpdate:
+		delta.Event = "open"
+	case dpuserspace.EventTypeSessionClose:
+		delta.Event = "close"
+	}
+
+	d.queueUserspaceSessionDeltas(zoneIDs, []dpuserspace.SessionDeltaInfo{delta})
+}
+
+// handleEventStreamFullResync handles a FullResync frame from the helper.
+// This means the helper's replay buffer was trimmed past our last ack; we need
+// a one-shot bulk export to catch up.
+func (d *Daemon) handleEventStreamFullResync() {
+	slog.Warn("userspace event stream: full resync requested, triggering bulk export")
+	exporter, ok := d.dp.(userspaceSessionExporter)
+	if !ok {
+		return
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	// Export sessions for all RGs we're primary for.
+	var rgIDs []int
+	if d.cluster != nil {
+		for rgID := 0; rgID < 16; rgID++ {
+			if d.cluster.IsLocalPrimary(rgID) {
+				rgIDs = append(rgIDs, rgID)
+			}
+		}
+	}
+	if len(rgIDs) == 0 {
+		return
+	}
+	if _, err := d.exportUserspaceOwnerRGSessionsWithConfig(exporter, cfg, rgIDs); err != nil {
+		slog.Warn("userspace event stream: full resync export failed", "err", err)
+	}
+}
+
+// eventStreamFallbackLoop monitors the event stream connection and falls back
+// to polling via DrainSessionDeltas when the stream is disconnected.
+func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspaceEventStreamProvider) {
+	drainer, hasDrainer := d.dp.(userspaceSessionDeltaDrainer)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		es := provider.EventStream()
+		if es != nil && es.IsConnected() {
+			// Stream is live — events arrive via callback, nothing to do.
+			continue
+		}
+
+		// Stream disconnected — fall back to polling.
+		if !hasDrainer {
+			continue
+		}
+		if d.cluster == nil || d.sessionSync == nil {
+			return
+		}
+		if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
+			continue
+		}
+		if d.userspaceDemotionPrepActive() {
+			continue
+		}
+		cfg := d.store.ActiveConfig()
+		if cfg == nil {
+			continue
+		}
+		d.userspaceDeltaSyncMu.Lock()
+		_, _ = d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
+		d.userspaceDeltaSyncMu.Unlock()
+	}
+}
+
 func (d *Daemon) userspaceDemotionPrepActive() bool {
 	return d.userspaceDemotionPrepDepth.Load() > 0
 }
@@ -3852,29 +3998,57 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	resume := d.beginUserspaceDemotionPrepSyncPause(rgID)
 	defer resume()
 	queued := 0
-	exporter, exportOK := d.dp.(userspaceSessionExporter)
-	drainer, ok := d.dp.(userspaceSessionDeltaDrainer)
-	cfg := d.store.ActiveConfig()
-	if cfg != nil {
-		if exportOK {
-			exported, err := d.exportUserspaceOwnerRGSessionsWithConfig(exporter, cfg, []int{rgID})
-			if err != nil {
-				return err
+
+	// Try event-stream Pause+DrainRequest first, fall back to RPC drain.
+	var streamDrained bool
+	if provider, ok := d.dp.(userspaceEventStreamProvider); ok {
+		if es := provider.EventStream(); es != nil && es.IsConnected() {
+			if err := es.SendPause(); err != nil {
+				slog.Warn("event stream pause failed, falling back to RPC drain", "err", err)
+			} else {
+				drainCtx, drainCancel := context.WithTimeout(context.Background(), 3*time.Second)
+				drainSeq, err := es.SendDrainRequest(drainCtx)
+				drainCancel()
+				if err != nil {
+					slog.Warn("event stream drain failed, falling back to RPC export",
+						"rg", rgID, "err", err)
+				} else {
+					slog.Info("event stream drain complete", "rg", rgID, "seq", drainSeq)
+					streamDrained = true
+				}
+				// Resume the helper stream regardless.
+				_ = es.SendResume()
 			}
-			queued += exported
 		}
-		if ok {
-			d.userspaceDeltaSyncMu.Lock()
-			drained, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 8)
-			d.userspaceDeltaSyncMu.Unlock()
-			if err != nil {
-				return err
+	}
+
+	if !streamDrained {
+		// Fallback: RPC-based export + drain.
+		exporter, exportOK := d.dp.(userspaceSessionExporter)
+		drainer, drainOK := d.dp.(userspaceSessionDeltaDrainer)
+		cfg := d.store.ActiveConfig()
+		if cfg != nil {
+			if exportOK {
+				exported, err := d.exportUserspaceOwnerRGSessionsWithConfig(exporter, cfg, []int{rgID})
+				if err != nil {
+					return err
+				}
+				queued += exported
 			}
-			queued += drained
+			if drainOK {
+				d.userspaceDeltaSyncMu.Lock()
+				drained, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 8)
+				d.userspaceDeltaSyncMu.Unlock()
+				if err != nil {
+					return err
+				}
+				queued += drained
+			}
 		}
-		if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {
-			return fmt.Errorf("demotion peer barrier failed queued_deltas=%d: %w", queued, err)
-		}
+	}
+
+	if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {
+		return fmt.Errorf("demotion peer barrier failed queued_deltas=%d: %w", queued, err)
 	}
 	if err := preparer.PrepareRGDemotion([]int{rgID}); err != nil {
 		return err
@@ -5465,7 +5639,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 						return d.cluster != nil && d.cluster.IsLocalPrimary(rgID)
 					}
 					d.sessionSync.StartSyncSweep(commsCtx)
-					go d.syncUserspaceSessionDeltas(commsCtx)
+					go d.runUserspaceEventStream(commsCtx)
 				}
 
 				break
