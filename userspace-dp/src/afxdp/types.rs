@@ -179,6 +179,236 @@ pub(super) struct XdpOptions {
     pub(super) flags: u32,
 }
 
+pub(super) struct WorkerHandle {
+    pub(super) stop: Arc<AtomicBool>,
+    pub(super) heartbeat: Arc<AtomicU64>,
+    pub(super) commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
+    pub(super) demotion_prepare_ack: Arc<AtomicU64>,
+    pub(super) session_export_ack: Arc<AtomicU64>,
+    pub(super) join: Option<JoinHandle<()>>,
+}
+
+pub(super) struct LocalTunnelSourceHandle {
+    pub(super) stop: Arc<AtomicBool>,
+    pub(super) join: Option<JoinHandle<()>>,
+}
+
+pub(super) struct BindingPlan {
+    pub(super) status: BindingStatus,
+    pub(super) live: Arc<BindingLiveState>,
+    pub(super) xsk_map_fd: c_int,
+    pub(super) heartbeat_map_fd: c_int,
+    pub(super) session_map_fd: c_int,
+    pub(super) ring_entries: u32,
+    pub(super) bind_strategy: AfXdpBindStrategy,
+    pub(super) poll_mode: crate::PollMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ValidationState {
+    pub(super) snapshot_installed: bool,
+    pub(super) config_generation: u64,
+    pub(super) fib_generation: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PacketDisposition {
+    Valid,
+    NoSnapshot,
+    ConfigGenerationMismatch,
+    FibGenerationMismatch,
+    UnsupportedPacket,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ForwardingState {
+    pub(super) local_v4: FastSet<Ipv4Addr>,
+    pub(super) local_v6: FastSet<Ipv6Addr>,
+    pub(super) interface_nat_v4: FastMap<Ipv4Addr, i32>,
+    pub(super) interface_nat_v6: FastMap<Ipv6Addr, i32>,
+    pub(super) connected_v4: Vec<ConnectedRouteV4>,
+    pub(super) connected_v6: Vec<ConnectedRouteV6>,
+    pub(super) routes_v4: FastMap<String, Vec<RouteEntryV4>>,
+    pub(super) routes_v6: FastMap<String, Vec<RouteEntryV6>>,
+    pub(super) tunnel_endpoints: FastMap<u16, TunnelEndpoint>,
+    pub(super) tunnel_endpoint_by_ifindex: FastMap<i32, u16>,
+    pub(super) neighbors: FastMap<(i32, IpAddr), NeighborEntry>,
+    pub(super) ifindex_to_name: FastMap<i32, String>,
+    pub(super) ifindex_to_zone: FastMap<i32, String>,
+    pub(super) zone_name_to_id: FastMap<String, u16>,
+    pub(super) zone_id_to_name: FastMap<u16, String>,
+    pub(super) egress: FastMap<i32, EgressInterface>,
+    pub(super) fabrics: Vec<FabricLink>,
+    pub(super) allow_dns_reply: bool,
+    pub(super) allow_embedded_icmp: bool,
+    pub(super) session_timeouts: crate::session::SessionTimeouts,
+    pub(super) policy: PolicyState,
+    pub(super) source_nat_rules: Vec<SourceNatRule>,
+    pub(super) static_nat: StaticNatTable,
+    pub(super) dnat_table: DnatTable,
+    pub(super) nat64: Nat64State,
+    pub(super) nptv6: Nptv6State,
+    pub(super) screen_profiles: FastMap<String, ScreenProfile>,
+    pub(super) tunnel_interfaces: FastSet<i32>,
+    pub(super) filter_state: crate::filter::FilterState,
+    #[allow(dead_code)]
+    pub(super) gre_acceleration: bool,
+    pub(super) flow_export_config: Option<crate::flowexport::FlowExportConfig>,
+    pub(super) tcp_mss_all_tcp: u16,
+    pub(super) tcp_mss_ipsec_vpn: u16,
+    pub(super) tcp_mss_gre_in: u16,
+    pub(super) tcp_mss_gre_out: u16,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct HAGroupRuntime {
+    pub(super) active: bool,
+    pub(super) watchdog_timestamp: u64,
+    pub(super) demoting: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ConnectedRouteV4 {
+    pub(super) prefix: PrefixV4,
+    pub(super) ifindex: i32,
+    pub(super) tunnel_endpoint_id: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ConnectedRouteV6 {
+    pub(super) prefix: PrefixV6,
+    pub(super) ifindex: i32,
+    pub(super) tunnel_endpoint_id: u16,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct RouteEntryV4 {
+    pub(super) prefix: PrefixV4,
+    pub(super) ifindex: i32,
+    pub(super) tunnel_endpoint_id: u16,
+    pub(super) next_hop: Option<Ipv4Addr>,
+    pub(super) discard: bool,
+    pub(super) next_table: String,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct RouteEntryV6 {
+    pub(super) prefix: PrefixV6,
+    pub(super) ifindex: i32,
+    pub(super) tunnel_endpoint_id: u16,
+    pub(super) next_hop: Option<Ipv6Addr>,
+    pub(super) discard: bool,
+    pub(super) next_table: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub struct NeighborEntry {
+    pub mac: [u8; 6],
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct EgressInterface {
+    pub(super) bind_ifindex: i32,
+    pub(super) vlan_id: u16,
+    pub(super) mtu: usize,
+    pub(super) src_mac: [u8; 6],
+    pub(super) zone: String,
+    pub(super) redundancy_group: i32,
+    pub(super) primary_v4: Option<Ipv4Addr>,
+    pub(super) primary_v6: Option<Ipv6Addr>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(super) struct TunnelEndpoint {
+    pub(super) id: u16,
+    pub(super) logical_ifindex: i32,
+    pub(super) redundancy_group: i32,
+    pub(super) mode: String,
+    pub(super) outer_family: i32,
+    pub(super) source: IpAddr,
+    pub(super) destination: IpAddr,
+    pub(super) key: u32,
+    pub(super) ttl: u8,
+    pub(super) transport_table: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct FabricLink {
+    pub(super) parent_ifindex: i32,
+    pub(super) overlay_ifindex: i32,
+    pub(super) peer_addr: IpAddr,
+    pub(super) peer_mac: [u8; 6],
+    pub(super) local_mac: [u8; 6],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForwardingDisposition {
+    LocalDelivery,
+    ForwardCandidate,
+    FabricRedirect,
+    HAInactive,
+    PolicyDenied,
+    NoRoute,
+    MissingNeighbor,
+    DiscardRoute,
+    NextTableUnsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardingResolution {
+    pub(crate) disposition: ForwardingDisposition,
+    pub(crate) local_ifindex: i32,
+    pub(crate) egress_ifindex: i32,
+    pub(crate) tx_ifindex: i32,
+    pub(crate) tunnel_endpoint_id: u16,
+    pub(crate) next_hop: Option<IpAddr>,
+    pub(crate) neighbor_mac: Option<[u8; 6]>,
+    pub(crate) src_mac: Option<[u8; 6]>,
+    pub(crate) tx_vlan_id: u16,
+}
+
+impl ForwardingResolution {
+    pub(super) fn status(self, debug: Option<&ResolutionDebug>) -> PacketResolution {
+        PacketResolution {
+            disposition: match self.disposition {
+                ForwardingDisposition::LocalDelivery => "local_delivery",
+                ForwardingDisposition::ForwardCandidate => "forward_candidate",
+                ForwardingDisposition::FabricRedirect => "fabric_redirect",
+                ForwardingDisposition::HAInactive => "ha_inactive",
+                ForwardingDisposition::PolicyDenied => "policy_denied",
+                ForwardingDisposition::NoRoute => "no_route",
+                ForwardingDisposition::MissingNeighbor => "missing_neighbor",
+                ForwardingDisposition::DiscardRoute => "discard_route",
+                ForwardingDisposition::NextTableUnsupported => "next_table_unsupported",
+            }
+            .to_string(),
+            local_ifindex: self.local_ifindex,
+            egress_ifindex: self.egress_ifindex,
+            ingress_ifindex: debug.map(|d| d.ingress_ifindex).unwrap_or_default(),
+            next_hop: self.next_hop.map(|ip| ip.to_string()).unwrap_or_default(),
+            neighbor_mac: self.neighbor_mac.map(format_mac).unwrap_or_default(),
+            src_ip: debug
+                .and_then(|d| d.src_ip)
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            dst_ip: debug
+                .and_then(|d| d.dst_ip)
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
+            src_port: debug.map(|d| d.src_port).unwrap_or_default(),
+            dst_port: debug.map(|d| d.dst_port).unwrap_or_default(),
+            from_zone: debug
+                .and_then(|d| d.from_zone.as_ref().map(|zone| zone.to_string()))
+                .unwrap_or_default(),
+            to_zone: debug
+                .and_then(|d| d.to_zone.as_ref().map(|zone| zone.to_string()))
+                .unwrap_or_default(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct BindingIdentity {
     pub(super) slot: u32,
