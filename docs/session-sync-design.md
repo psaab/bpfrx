@@ -345,23 +345,16 @@ That is a net loss.
 
 ## Phased Plan
 
-### Phase 1: Replace helper polling with a local stream
+### Phase 1: Replace helper polling with a local stream — DONE
 
-Implement:
+Implemented in commits `a597d3c1` (Rust producer) and `a09b24f2` (Go consumer):
 
-- helper -> daemon ordered event stream
-- sequence / ack model
-- reconnect / replay for the local stream
-- demotion-prep integration so the daemon can explicitly pause or drain the
-  stream
-
-Keep:
-
-- existing peer TCP session-sync protocol
-- existing bulk sync and barriers
-- existing userspace export path as fallback
-
-This is the highest-value near-term change.
+- Binary-framed event stream over `/run/bpfrx/userspace-dp-events.sock`
+- 9 frame types: SessionOpen/Close/Update, Ack, Pause/Resume, DrainRequest/DrainComplete, FullResync
+- Sequence numbers + replay buffer for reconnect
+- Demotion-prep: Pause → DrainRequest → Barrier → Resume
+- Automatic fallback to RPC polling when stream disconnected
+- Validated: 3-cycle failover test, 0 drops, 14.5-16.4 Gbps
 
 ### Phase 2: Promote kernel event sync to primary path
 

@@ -251,10 +251,22 @@ before `OnPeerConnected` and before the fresh bulk starts.
 
 ## Userspace Session Integration
 
-### Delta Drain
+### Event Stream (Primary Path)
 
-The Go daemon periodically drains helper-originated session deltas via
-`DrainSessionDeltas(...)`.
+The Rust helper pushes session events over a persistent binary-framed Unix
+socket (`/run/bpfrx/userspace-dp-events.sock`). Events (SessionOpen,
+SessionClose, SessionUpdate) carry sequence numbers for reliable delivery.
+The daemon reads events, applies ownership filtering, and queues them to the
+peer sync stream. Ack frames flow back for replay buffer management. Pause,
+Resume, and DrainRequest frames support demotion-prep integration.
+
+When the event stream is disconnected (helper restart, startup race), the
+daemon automatically falls back to RPC polling.
+
+### Delta Drain (Fallback Path)
+
+The Go daemon can poll helper-originated session deltas via
+`DrainSessionDeltas(...)` as a fallback when the event stream is unavailable.
 
 These deltas are **not** blindly mirrored. Filtering in
 `shouldSyncUserspaceDelta()`:
