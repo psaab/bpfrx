@@ -439,3 +439,172 @@ The right redesign is:
 - move userspace session production to a local stream
 - move kernel session sync to an event-first model
 - keep sweep as reconciliation, not as the primary steady-state source
+
+---
+
+## Phase 1 Protocol Specification
+
+### Problem
+
+The Rust helper buffers session deltas in per-binding ring buffers
+(`pending_session_deltas`). The Go daemon polls these via single-use Unix
+socket RPC (`drain_session_deltas`). Each poll opens a new connection, sends
+JSON, reads JSON, closes. Latency = poll interval + round-trip. Deltas are
+dropped when the ring overflows.
+
+### Design: Second Unix Socket for Event Stream
+
+Add a dedicated **event stream socket** alongside the existing control socket.
+The control socket keeps its request/response RPC semantics. The event socket
+is a long-lived unidirectional stream: helper pushes, daemon reads.
+
+```
+Existing:   daemon --[control.sock]--> helper    (request/response, JSON lines)
+New:        helper --[events.sock]---> daemon    (push stream, binary framed)
+```
+
+### Transport
+
+- **Path**: `/run/bpfrx/userspace-dp-events.sock` (derived from control socket path)
+- **Direction**: Helper connects to daemon listener (daemon creates the socket
+  before spawning the helper, helper dials on startup)
+- **Lifetime**: Single persistent connection. Helper reconnects on disconnect.
+- **Protocol**: Length-prefixed binary frames (NOT JSON lines — too expensive at
+  high event rates)
+
+### Wire Format
+
+```
+Frame:
+  [0:4]   Length (uint32 little-endian, payload only)
+  [4:5]   Type (uint8)
+  [5:8]   Reserved
+  [8:16]  Sequence (uint64 little-endian, monotonically increasing)
+  [16..]  Payload (type-specific, binary)
+
+Types:
+  1 = SessionOpen
+  2 = SessionClose
+  3 = SessionUpdate
+  4 = Ack (daemon → helper)
+  5 = Pause (daemon → helper)
+  6 = Resume (daemon → helper)
+  7 = DrainRequest (daemon → helper, with target sequence)
+  8 = DrainComplete (helper → daemon, confirms all events up to seq flushed)
+```
+
+**Note**: The event socket is bidirectional for control (Ack/Pause/Resume flow
+from daemon to helper), but the primary data flow is helper → daemon.
+
+### Session Event Payload
+
+SessionOpen and SessionUpdate share the same payload:
+
+```
+  [0]     AddrFamily (4 or 6)
+  [1]     Protocol (TCP=6, UDP=17, ICMP=1, etc.)
+  [2:4]   SrcPort (uint16 LE)
+  [4:6]   DstPort (uint16 LE)
+  [6:8]   NATSrcPort (uint16 LE)
+  [8:10]  NATDstPort (uint16 LE)
+  [10:12] OwnerRGID (int16 LE)
+  [12:14] EgressIfindex (int16 LE)
+  [14:16] TXIfindex (int16 LE)
+  [16:18] TunnelEndpointID (uint16 LE)
+  [18:20] TXVLANID (uint16 LE)
+  [20]    Flags (bit0=FabricRedirect, bit1=FabricIngress, bit2=IsReverse)
+  [21]    IngressZoneID (uint8)
+  [22]    EgressZoneID (uint8)
+  [23]    Disposition (uint8: 0=Accept, 1=LocalDelivery, 2=Reject, ...)
+  [24:28] SrcIP (4 bytes for v4, first 4 of 16 for v6)
+  [28:32] DstIP
+  [32:36] NATSrcIP
+  [36:40] NATDstIP
+  For IPv6: addresses are 16 bytes each (payload is larger)
+  After addresses:
+  [N:N+6]  NeighborMAC (6 bytes, zero if unresolved)
+  [N+6:N+12] SrcMAC (6 bytes)
+  [N+12:N+16] NextHop (4 bytes v4 or 16 bytes v6, zero if direct)
+```
+
+SessionClose payload is minimal:
+
+```
+  [0]     AddrFamily (4 or 6)
+  [1]     Protocol
+  [2:4]   SrcPort
+  [4:6]   DstPort
+  [6:10]  SrcIP (4 or 16 bytes)
+  [10:14] DstIP (4 or 16 bytes)
+  [N:N+2] OwnerRGID (int16 LE)
+  [N+2]   Flags (bit0=FabricRedirect, bit1=FabricIngress)
+```
+
+### Flow Control
+
+**Ack**: Daemon sends Ack frames with the highest consumed sequence number.
+Helper can discard events up to that sequence from its replay buffer.
+
+**Backpressure**: Helper uses non-blocking writes. If the socket buffer is
+full, events are buffered in a bounded ring (reuse existing
+`MAX_PENDING_SESSION_DELTAS` = 4096 per binding). If the ring overflows,
+oldest events are dropped and a counter incremented. Daemon detects gaps via
+sequence numbers and can request a full reconciliation.
+
+**Pause/Resume**: Daemon sends Pause to stop event emission (used during
+demotion prep). Helper buffers events during pause. Daemon sends Resume to
+restart. Events accumulated during pause are flushed in order.
+
+**DrainRequest/DrainComplete**: Daemon sends DrainRequest with a target
+sequence. Helper flushes all buffered events up to that sequence and sends
+DrainComplete. This replaces `ExportOwnerRGSessions` RPC for demotion prep —
+the daemon drains the stream to current head instead of doing a separate RPC
+export.
+
+### Reconnect / Replay
+
+On disconnect, the helper retains its replay buffer (bounded, ~4096 events per
+binding). On reconnect, it replays from the last acked sequence. If the buffer
+has been trimmed past the last acked sequence (long disconnect), it sends a
+special `FullResync` frame (type 9) that tells the daemon to treat this as a
+fresh start and request a bulk export.
+
+### Integration with Existing Code
+
+**Rust side** (`userspace-dp/src/main.rs`):
+- Add `EventStreamSender` that manages the event socket connection
+- Worker threads push events to `EventStreamSender` instead of per-binding
+  `pending_session_deltas` ring buffers
+- Main loop calls `EventStreamSender::flush()` periodically to batch-write
+  buffered events to the socket
+- Pause/Resume/DrainRequest are read from the socket in the flush loop
+
+**Go side** (`pkg/dataplane/userspace/manager.go`):
+- Add `eventStreamListener` that creates the Unix socket and accepts the helper
+  connection
+- Add `eventStreamReader` goroutine that reads frames and dispatches to the
+  existing `queueUserspaceSessionDeltas` path
+- Replace the periodic `DrainSessionDeltas` poll loop with the stream reader
+- Ack frames sent back periodically (every N events or every 100ms)
+
+**Daemon side** (`pkg/daemon/daemon.go`):
+- `shouldSyncUserspaceDelta()` filtering applies to stream events exactly as it
+  does to polled deltas today
+- Demotion prep uses Pause + DrainRequest instead of
+  `PauseIncrementalSync` + `DrainSessionDeltas` RPC
+- `ExportOwnerRGSessions` RPC kept as fallback for cases where the stream is
+  disconnected during demotion prep
+
+### Migration Strategy
+
+1. Implement the event socket alongside the existing control socket
+2. Keep `DrainSessionDeltas` RPC working as fallback
+3. Daemon prefers event stream when connected, falls back to RPC polling
+4. Once validated, remove the polling path and simplify
+
+### Why Binary, Not JSON
+
+At 10K sessions/sec (achievable under load), JSON encoding/decoding adds
+measurable CPU overhead. A fixed binary layout avoids allocation, parsing, and
+string conversion for every event. The control socket stays JSON for human
+readability and debuggability.
