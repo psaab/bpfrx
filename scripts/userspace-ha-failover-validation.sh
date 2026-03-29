@@ -12,6 +12,7 @@ IPERF_TARGET="${IPERF_TARGET:-172.16.80.200}"
 EXTERNAL_V4_TARGET="${EXTERNAL_V4_TARGET:-1.1.1.1}"
 EXTERNAL_V6_TARGET="${EXTERNAL_V6_TARGET:-2606:4700:4700::1111}"
 EXTERNAL_PING_COUNT="${EXTERNAL_PING_COUNT:-4}"
+CHECK_EXTERNAL_REACHABILITY="${CHECK_EXTERNAL_REACHABILITY:-1}"
 TOTAL_CYCLES="${TOTAL_CYCLES:-1}"
 CYCLE_INTERVAL="${CYCLE_INTERVAL:-10}"
 SYNC_WAIT="${SYNC_WAIT:-5}"
@@ -903,6 +904,10 @@ check_external_ping() {
 
 validate_external_connectivity() {
 	local label="$1"
+	if [[ "${CHECK_EXTERNAL_REACHABILITY}" != "1" ]]; then
+		info "${label}: external reachability checks skipped (CHECK_EXTERNAL_REACHABILITY=${CHECK_EXTERNAL_REACHABILITY})"
+		return 0
+	fi
 	local ok=0
 	if check_external_ping "${label}-ipv4" 4 "${EXTERNAL_V4_TARGET}"; then
 		pass "${label}: external IPv4 reachable (${EXTERNAL_V4_TARGET})"

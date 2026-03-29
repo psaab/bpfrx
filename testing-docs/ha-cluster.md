@@ -158,6 +158,10 @@ For multi-cycle runs, prefer letting the script pick the duration from the
 cycle count. The hardened validator now rejects too-short runs up front instead
 of misreporting them as mid-cycle `iperf3` completion failures.
 
+If the lab's public/WAN path is already down before the test starts, isolate
+that first. Only then use `CHECK_EXTERNAL_REACHABILITY=0` to keep exercising
+the failover dataplane without falsely claiming internet reachability passed.
+
 ### Manual stale-owner fabric check
 
 When the user reports "traffic is still showing up on the standby WAN," do not

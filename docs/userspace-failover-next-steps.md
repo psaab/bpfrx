@@ -80,14 +80,18 @@ longer reproducing on the latest branch build.
 
 What is still broken:
 
-- crash/rejoin still needs to be rerun on top of the latest fabric queue-selection fix
 - the strengthened failover gate still needs repeated multi-cycle validation, not just one passing cycle
 - retransmits are still higher than ideal during the passing failover window
+- the public/WAN50 path in the lab was down on March 28, 2026, so external
+  internet reachability could not be used as a failover discriminator
+- after isolating that WAN outage and rerunning the gate without external
+  checks, the new owner did not lose dataplane continuity, but the move still
+  did not stick: the new owner VM rebooted and the old owner reclaimed `RG1`
 
 What is still improved:
 
 - sync admission and bulk priming are no longer the blocker
-- target and external reachability stay up during the bad run
+- target reachability stays up during the bad run
 - crash/rejoin is still materially better than the old baseline
 
 ## Latest evidence
@@ -192,6 +196,59 @@ What it proves:
 - the old redirected-flow single-queue concentration was real
 - after the fix, redirected traffic fans out across multiple fabric queues on the old owner and multiple fabric/WAN queues on the new owner
 - the failover no longer degrades into the earlier `7 Gbps then 0` shape
+
+Latest March 28 reruns on top of merged `master` changed the failure shape again.
+
+External preflight isolation:
+
+- from `cluster-userspace-host`, both `1.1.1.1` and
+  `2606:4700:4700::1111` were unreachable
+- local `.200` reachability still worked for both IPv4 and IPv6
+- the active router CLI on `fw0` could not reach:
+  - `172.16.50.1`
+  - `2001:559:8585:50::1`
+- that isolates the blocker to the lab WAN50/public path, not the local
+  userspace dataplane
+
+To keep validating failover continuity without pretending internet coverage
+passed, the harness now supports:
+
+- `CHECK_EXTERNAL_REACHABILITY=0`
+
+Latest two-cycle rerun with external checks disabled:
+
+- artifact:
+  - `/tmp/userspace-ha-failover-rg1-20260328-075648`
+- the failover itself admitted and traffic survived the move:
+  - `avg_gbps`: `10.381`
+  - `peak_gbps`: `22.579`
+  - `tail_median_gbps`: `21.655`
+  - `collapse_detected`: `false`
+- but the run still failed overall because the move did not stick:
+  - `node1` became secondary for `RG1` immediately after the move
+  - later `node1` logged `clearing manual failover (peer lost)` and reclaimed
+    `RG1`
+  - `fw0` crossed a journal boot boundary at about `2026-03-28 14:58:10 UTC`,
+    proving the whole VM rebooted after becoming primary
+
+What that proves:
+
+- the old dataplane collapse and the earlier split-brain timeout release are no
+  longer the active blocker on this rerun
+- the next blocker is node stability on the new owner after primary transition
+- the next debugging target is why `bpfrx-userspace-fw0` rebooted under the
+  admitted `RG1 node1 -> node0` failover load
+
+Immediate next code/debug steps:
+
+1. capture the previous-boot failure cause on `fw0`
+2. determine whether the reboot was:
+   - kernel panic
+   - watchdog reset
+   - OOM / systemd-triggered reboot
+   - explicit host-side reset
+3. only after that rerun the same two-cycle gate again; until then, the gate is
+   proving failover continuity better, but not full node survivability
 
 Key queue-spread evidence from the artifact:
 

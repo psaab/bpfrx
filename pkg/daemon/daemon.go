@@ -71,45 +71,47 @@ const nodeIDFile = "/etc/bpfrx/node-id"
 
 // Daemon is the main bpfrx daemon.
 type Daemon struct {
-	opts             Options
-	store            *configstore.Store
-	dp               dataplane.DataPlane
-	networkd         *networkd.Manager
-	routing          *routing.Manager
-	frr              *frr.Manager
-	ipsec            *ipsec.Manager
-	ra               *ra.Manager
-	dhcp             *dhcp.Manager
-	dhcpServer       *dhcpserver.Manager
-	feeds            *feeds.Manager
-	rpm              *rpm.Manager
-	flowExporter     *flowexport.Exporter
-	flowCancel       context.CancelFunc
-	flowWg           sync.WaitGroup
-	ipfixExporter    *flowexport.IPFIXExporter
-	ipfixCancel      context.CancelFunc
-	ipfixWg          sync.WaitGroup
-	dhcpRelay        *dhcprelay.Manager
-	snmpAgent        *snmp.Agent
-	lldpMgr          *lldp.Manager
-	scheduler        *scheduler.Scheduler
-	cluster          *cluster.Manager
-	sessionSync      *cluster.SessionSync
-	syncBulkPrimed   atomic.Bool
+	opts               Options
+	store              *configstore.Store
+	dp                 dataplane.DataPlane
+	networkd           *networkd.Manager
+	routing            *routing.Manager
+	frr                *frr.Manager
+	ipsec              *ipsec.Manager
+	ra                 *ra.Manager
+	dhcp               *dhcp.Manager
+	dhcpServer         *dhcpserver.Manager
+	feeds              *feeds.Manager
+	rpm                *rpm.Manager
+	flowExporter       *flowexport.Exporter
+	flowCancel         context.CancelFunc
+	flowWg             sync.WaitGroup
+	ipfixExporter      *flowexport.IPFIXExporter
+	ipfixCancel        context.CancelFunc
+	ipfixWg            sync.WaitGroup
+	dhcpRelay          *dhcprelay.Manager
+	snmpAgent          *snmp.Agent
+	lldpMgr            *lldp.Manager
+	scheduler          *scheduler.Scheduler
+	cluster            *cluster.Manager
+	sessionSync        *cluster.SessionSync
+	syncBulkPrimed     atomic.Bool
 	syncPeerBulkPrimed atomic.Bool
-	syncPrimeRetryGen atomic.Uint64
-	syncReadyTimerMu sync.Mutex
-	syncReadyTimer   *time.Timer
-	syncReadyTimeout time.Duration
-	slogHandler      *logging.SyslogSlogHandler
-	traceWriter      *logging.TraceWriter
-	eventReader      *logging.EventReader
-	eventEngine      *eventengine.Engine
-	aggregator       *logging.SessionAggregator
-	aggCancel        context.CancelFunc
-	vrrpMgr          *vrrp.Manager
-	gc               *conntrack.GC
-	startTime        time.Time // daemon start time; used to suppress stale config sync
+	syncPeerConnected  atomic.Bool
+	syncPrimeRetryGen  atomic.Uint64
+	syncReadyTimerGen  atomic.Uint64
+	syncReadyTimerMu   sync.Mutex
+	syncReadyTimer     *time.Timer
+	syncReadyTimeout   time.Duration
+	slogHandler        *logging.SyslogSlogHandler
+	traceWriter        *logging.TraceWriter
+	eventReader        *logging.EventReader
+	eventEngine        *eventengine.Engine
+	aggregator         *logging.SessionAggregator
+	aggCancel          context.CancelFunc
+	vrrpMgr            *vrrp.Manager
+	gc                 *conntrack.GC
+	startTime          time.Time // daemon start time; used to suppress stale config sync
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
@@ -265,6 +267,7 @@ func New(opts Options) *Daemon {
 func (d *Daemon) stopSyncReadyTimer() {
 	d.syncReadyTimerMu.Lock()
 	defer d.syncReadyTimerMu.Unlock()
+	d.syncReadyTimerGen.Add(1)
 	if d.syncReadyTimer != nil {
 		d.syncReadyTimer.Stop()
 		d.syncReadyTimer = nil
@@ -275,6 +278,7 @@ func (d *Daemon) armSyncReadyTimer() {
 	if d.cluster == nil || d.syncReadyTimeout <= 0 {
 		return
 	}
+	timerGen := d.syncReadyTimerGen.Add(1)
 	d.syncReadyTimerMu.Lock()
 	defer d.syncReadyTimerMu.Unlock()
 	if d.syncReadyTimer != nil {
@@ -282,6 +286,9 @@ func (d *Daemon) armSyncReadyTimer() {
 	}
 	timeout := d.syncReadyTimeout
 	d.syncReadyTimer = time.AfterFunc(timeout, func() {
+		if d.syncReadyTimerGen.Load() != timerGen || !d.syncPeerConnected.Load() {
+			return
+		}
 		if d.cluster != nil && !d.cluster.IsSyncReady() {
 			slog.Info("cluster: sync readiness timeout, releasing hold")
 			d.cluster.SetSyncReady(true)
@@ -292,6 +299,7 @@ func (d *Daemon) armSyncReadyTimer() {
 func (d *Daemon) onSessionSyncPeerConnected() {
 	d.syncBulkPrimed.Store(false)
 	d.syncPeerBulkPrimed.Store(false)
+	d.syncPeerConnected.Store(true)
 	gen := d.syncPrimeRetryGen.Add(1)
 	slog.Info("cluster: session sync peer connected",
 		"retry_gen", gen,
@@ -325,14 +333,15 @@ func (d *Daemon) onSessionSyncBulkAckReceived() {
 func (d *Daemon) onSessionSyncPeerDisconnected() {
 	d.syncBulkPrimed.Store(false)
 	d.syncPeerBulkPrimed.Store(false)
+	d.syncPeerConnected.Store(false)
 	gen := d.syncPrimeRetryGen.Add(1)
 	slog.Info("cluster: session sync peer disconnected",
 		"retry_gen", gen,
 		"cluster_sync_ready", d.cluster != nil && d.cluster.IsSyncReady())
+	d.stopSyncReadyTimer()
 	if d.cluster != nil {
 		d.cluster.SetSyncReady(false)
 	}
-	d.armSyncReadyTimer()
 }
 
 func (d *Daemon) shouldSuppressPeerHeartbeatTimeout() (bool, string) {
