@@ -110,9 +110,7 @@ impl MmapArea {
     }
 
     pub(super) fn as_nonnull_slice(&self) -> NonNull<[u8]> {
-        NonNull::from(unsafe {
-            &mut *std::ptr::slice_from_raw_parts_mut(self.ptr.as_ptr(), self.len)
-        })
+        NonNull::slice_from_raw_parts(self.ptr, self.len)
     }
 
     pub(super) fn slice(&self, offset: usize, len: usize) -> Option<&[u8]> {

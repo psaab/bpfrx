@@ -1,5 +1,9 @@
 use super::*;
 
+const LOCAL_TUNNEL_SESSION_PRUNE_INTERVAL_NS: u64 = 5_000_000_000;
+const LOCAL_TUNNEL_SESSION_STALE_NS: u64 = 30_000_000_000;
+const LOCAL_TUNNEL_SESSION_PRUNE_THRESHOLD: usize = 4096;
+
 pub(super) fn local_tunnel_source_loop(
     tunnel_name: String,
     tunnel_endpoint_id: u16,
@@ -31,6 +35,7 @@ pub(super) fn local_tunnel_source_loop(
     let mut packet = vec![0u8; 65_536];
     let mut next_slot = 0usize;
     let mut local_sessions = FastMap::<SessionKey, u64>::default();
+    let mut local_sessions_last_prune_ns = 0u64;
     while !stop.load(Ordering::Relaxed) {
         loop {
             match delivery_rx.try_recv() {
@@ -66,6 +71,7 @@ pub(super) fn local_tunnel_source_loop(
                             &shared_forward_wire_sessions,
                             &worker_commands,
                             &mut local_sessions,
+                            &mut local_sessions_last_prune_ns,
                             &plan,
                         );
                         if let Some(target_live) = select_live_binding_for_ifindex(
@@ -241,9 +247,11 @@ pub(super) fn maybe_enqueue_local_tunnel_session(
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     local_sessions: &mut FastMap<SessionKey, u64>,
+    local_sessions_last_prune_ns: &mut u64,
     plan: &LocalTunnelTxPlan,
 ) {
     let now_ns = monotonic_nanos();
+    prune_local_tunnel_sessions(local_sessions, local_sessions_last_prune_ns, now_ns);
     let entry = &plan.session_entry;
     let refresh_after_ns = if matches!(entry.protocol, PROTO_TCP) {
         5_000_000_000
@@ -282,6 +290,21 @@ pub(super) fn maybe_enqueue_local_tunnel_session(
     wait_for_local_tunnel_session_install(worker_commands, now_ns + 1_000_000);
 }
 
+fn prune_local_tunnel_sessions(
+    local_sessions: &mut FastMap<SessionKey, u64>,
+    last_prune_ns: &mut u64,
+    now_ns: u64,
+) {
+    if local_sessions.len() < LOCAL_TUNNEL_SESSION_PRUNE_THRESHOLD
+        || now_ns.saturating_sub(*last_prune_ns) < LOCAL_TUNNEL_SESSION_PRUNE_INTERVAL_NS
+    {
+        return;
+    }
+    let cutoff_ns = now_ns.saturating_sub(LOCAL_TUNNEL_SESSION_STALE_NS);
+    local_sessions.retain(|_, seen_ns| *seen_ns >= cutoff_ns);
+    *last_prune_ns = now_ns;
+}
+
 pub(super) fn wait_for_local_tunnel_session_install(
     worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     deadline_ns: u64,
@@ -307,20 +330,36 @@ pub(super) fn select_live_binding_for_ifindex(
     tx_ifindex: i32,
     next_slot: usize,
 ) -> Option<Arc<BindingLiveState>> {
-    let candidates = identities
-        .values()
-        .filter_map(|identity| {
-            if identity.ifindex != tx_ifindex {
-                return None;
+    let mut candidate_count = 0usize;
+    for identity in identities.values() {
+        if identity.ifindex != tx_ifindex {
+            continue;
+        }
+        if let Some(live_state) = live.get(&identity.slot) {
+            if live_state.bound.load(Ordering::Relaxed) {
+                candidate_count += 1;
             }
-            let live = live.get(&identity.slot)?;
-            live.bound.load(Ordering::Relaxed).then_some(live.clone())
-        })
-        .collect::<Vec<_>>();
-    if candidates.is_empty() {
+        }
+    }
+    if candidate_count == 0 {
         return None;
     }
-    Some(candidates[next_slot % candidates.len()].clone())
+    let target_index = next_slot % candidate_count;
+    let mut current_index = 0usize;
+    for identity in identities.values() {
+        if identity.ifindex != tx_ifindex {
+            continue;
+        }
+        if let Some(live_state) = live.get(&identity.slot) {
+            if live_state.bound.load(Ordering::Relaxed) {
+                if current_index == target_index {
+                    return Some(live_state.clone());
+                }
+                current_index += 1;
+            }
+        }
+    }
+    None
 }
 
 pub(super) fn set_fd_nonblocking(fd: c_int) -> Result<(), String> {
@@ -339,6 +378,100 @@ pub(super) fn set_fd_nonblocking(fd: c_int) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_session_key(id: u16) -> SessionKey {
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            src_port: id,
+            dst_port: 5201,
+        }
+    }
+
+    #[test]
+    fn prune_local_tunnel_sessions_drops_old_entries_when_threshold_exceeded() {
+        let now_ns = 100_000_000_000u64;
+        let mut sessions = FastMap::default();
+        let mut last_prune_ns = 0;
+        for idx in 0..LOCAL_TUNNEL_SESSION_PRUNE_THRESHOLD {
+            sessions.insert(
+                dummy_session_key(idx as u16),
+                now_ns.saturating_sub(LOCAL_TUNNEL_SESSION_STALE_NS + 1),
+            );
+        }
+        sessions.insert(dummy_session_key(60000), now_ns);
+
+        prune_local_tunnel_sessions(&mut sessions, &mut last_prune_ns, now_ns);
+
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key(&dummy_session_key(60000)));
+        assert_eq!(last_prune_ns, now_ns);
+    }
+
+    #[test]
+    fn select_live_binding_for_ifindex_round_robins_without_allocating_candidates() {
+        let live_a = Arc::new(BindingLiveState::new());
+        live_a.bound.store(true, Ordering::Relaxed);
+        let live_b = Arc::new(BindingLiveState::new());
+        live_b.bound.store(true, Ordering::Relaxed);
+        let live_other = Arc::new(BindingLiveState::new());
+        live_other.bound.store(true, Ordering::Relaxed);
+
+        let identities = BTreeMap::from([
+            (
+                1,
+                BindingIdentity {
+                    slot: 1,
+                    queue_id: 0,
+                    worker_id: 0,
+                    interface: Arc::<str>::from("ge-0-0-0"),
+                    ifindex: 10,
+                },
+            ),
+            (
+                2,
+                BindingIdentity {
+                    slot: 2,
+                    queue_id: 1,
+                    worker_id: 0,
+                    interface: Arc::<str>::from("ge-0-0-0"),
+                    ifindex: 10,
+                },
+            ),
+            (
+                3,
+                BindingIdentity {
+                    slot: 3,
+                    queue_id: 0,
+                    worker_id: 0,
+                    interface: Arc::<str>::from("ge-0-0-1"),
+                    ifindex: 11,
+                },
+            ),
+        ]);
+        let live = BTreeMap::from([(1, live_a.clone()), (2, live_b.clone()), (3, live_other)]);
+
+        assert!(Arc::ptr_eq(
+            &select_live_binding_for_ifindex(&identities, &live, 10, 0).expect("slot 0"),
+            &live_a
+        ));
+        assert!(Arc::ptr_eq(
+            &select_live_binding_for_ifindex(&identities, &live, 10, 1).expect("slot 1"),
+            &live_b
+        ));
+        assert!(Arc::ptr_eq(
+            &select_live_binding_for_ifindex(&identities, &live, 10, 2).expect("slot wrap"),
+            &live_a
+        ));
+        assert!(select_live_binding_for_ifindex(&identities, &live, 12, 0).is_none());
+    }
 }
 
 pub(super) fn record_local_tunnel_exception(

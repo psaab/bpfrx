@@ -1,5 +1,15 @@
 use super::*;
 
+fn uses_kernel_local_session_map_entry(
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+) -> bool {
+    metadata.synced
+        && !metadata.is_reverse
+        && decision.resolution.disposition == ForwardingDisposition::LocalDelivery
+        && decision.resolution.tunnel_endpoint_id == 0
+}
+
 pub(super) fn diagnose_raw_ring_state(
     sock_fd: c_int,
 ) -> Option<(u32, u32, u32, u32, u32, u32, u32, u32)> {
@@ -320,11 +330,7 @@ pub(super) fn publish_session_map_entry_for_session(
     decision: SessionDecision,
     metadata: &SessionMetadata,
 ) -> io::Result<()> {
-    if metadata.synced
-        && !metadata.is_reverse
-        && decision.resolution.disposition == ForwardingDisposition::LocalDelivery
-        && decision.resolution.tunnel_endpoint_id == 0
-    {
+    if uses_kernel_local_session_map_entry(decision, metadata) {
         return publish_kernel_local_session_key(map_fd, key);
     }
     publish_live_session_entry(map_fd, key, decision.nat, metadata.is_reverse)
@@ -566,12 +572,84 @@ pub(super) fn delete_session_map_entry_for_removed_session(
     decision: SessionDecision,
     metadata: &SessionMetadata,
 ) {
-    if metadata.synced
-        && !metadata.is_reverse
-        && decision.resolution.disposition == ForwardingDisposition::LocalDelivery
-    {
+    if uses_kernel_local_session_map_entry(decision, metadata) {
         delete_live_session_key(map_fd, key);
         return;
     }
     delete_live_session_entry(map_fd, key, decision.nat, metadata.is_reverse);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn local_delivery_decision(tunnel_endpoint_id: u16) -> SessionDecision {
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::LocalDelivery,
+                local_ifindex: 0,
+                egress_ifindex: 0,
+                tx_ifindex: 0,
+                tunnel_endpoint_id,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        }
+    }
+
+    fn synced_forward_metadata() -> SessionMetadata {
+        SessionMetadata {
+            ingress_zone: Arc::<str>::from("trust"),
+            egress_zone: Arc::<str>::from("trust"),
+            owner_rg_id: 1,
+            fabric_ingress: false,
+            is_reverse: false,
+            synced: true,
+            nat64_reverse: None,
+        }
+    }
+
+    #[test]
+    fn kernel_local_session_map_entry_requires_zero_tunnel_endpoint() {
+        let metadata = synced_forward_metadata();
+        assert!(uses_kernel_local_session_map_entry(
+            local_delivery_decision(0),
+            &metadata
+        ));
+        assert!(!uses_kernel_local_session_map_entry(
+            local_delivery_decision(7),
+            &metadata
+        ));
+    }
+
+    #[test]
+    fn kernel_local_session_map_entry_rejects_non_kernel_local_cases() {
+        let mut metadata = synced_forward_metadata();
+        assert!(!uses_kernel_local_session_map_entry(
+            SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::ForwardCandidate,
+                    ..local_delivery_decision(0).resolution
+                },
+                nat: NatDecision::default(),
+            },
+            &metadata
+        ));
+
+        metadata.synced = false;
+        assert!(!uses_kernel_local_session_map_entry(
+            local_delivery_decision(0),
+            &metadata
+        ));
+
+        metadata.synced = true;
+        metadata.is_reverse = true;
+        assert!(!uses_kernel_local_session_map_entry(
+            local_delivery_decision(0),
+            &metadata
+        ));
+    }
 }
