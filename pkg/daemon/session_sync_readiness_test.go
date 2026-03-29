@@ -19,6 +19,17 @@ func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool, msg s
 	t.Fatal(msg)
 }
 
+func requireConditionNever(t *testing.T, duration time.Duration, fn func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(duration)
+	for time.Now().Before(deadline) {
+		if fn() {
+			t.Fatal(msg)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestSessionSyncPeerDisconnected_ClearsReadinessWithoutTimeoutRelease(t *testing.T) {
 	d := &Daemon{
 		cluster:          newClusterManager(false),
@@ -27,6 +38,7 @@ func TestSessionSyncPeerDisconnected_ClearsReadinessWithoutTimeoutRelease(t *tes
 	t.Cleanup(d.stopSyncReadyTimer)
 
 	d.cluster.SetSyncReady(true)
+	d.onSessionSyncPeerConnected()
 	d.syncBulkPrimed.Store(true)
 
 	d.onSessionSyncPeerDisconnected()
@@ -37,10 +49,8 @@ func TestSessionSyncPeerDisconnected_ClearsReadinessWithoutTimeoutRelease(t *tes
 	if d.syncBulkPrimed.Load() {
 		t.Fatal("disconnect should clear bulk priming state")
 	}
-	time.Sleep(80 * time.Millisecond)
-	if d.cluster.IsSyncReady() {
-		t.Fatal("disconnect should not release readiness on timeout without a reconnect")
-	}
+	requireConditionNever(t, d.syncReadyTimeout*3, d.cluster.IsSyncReady,
+		"disconnect should not release readiness on timeout without a reconnect")
 }
 
 func TestSessionSyncPeerDisconnected_UnprimedStaysNotReady(t *testing.T) {
@@ -51,16 +61,15 @@ func TestSessionSyncPeerDisconnected_UnprimedStaysNotReady(t *testing.T) {
 	t.Cleanup(d.stopSyncReadyTimer)
 
 	d.cluster.SetSyncReady(true)
+	d.onSessionSyncPeerConnected()
 
 	d.onSessionSyncPeerDisconnected()
 
 	if d.cluster.IsSyncReady() {
 		t.Fatal("unprimed disconnect should clear readiness immediately")
 	}
-	time.Sleep(80 * time.Millisecond)
-	if d.cluster.IsSyncReady() {
-		t.Fatal("unprimed disconnect should remain not ready until sync reconnects")
-	}
+	requireConditionNever(t, d.syncReadyTimeout*3, d.cluster.IsSyncReady,
+		"unprimed disconnect should remain not ready until sync reconnects")
 }
 
 func TestSessionSyncPeerConnected_ClearsReadinessThenFallsBackToTimeout(t *testing.T) {
