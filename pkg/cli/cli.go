@@ -3352,14 +3352,101 @@ func (c *CLI) showFlowSession(args []string) error {
 
 	now := monotonicSeconds()
 
-	// Collect sessions for sorted display (deterministic order across cluster nodes).
-	type sessEntryV4 struct {
-		key dataplane.SessionKey
-		val dataplane.SessionValue
-	}
-	var v4Entries []sessEntryV4
+	// printV4 prints a single IPv4 session entry inline during iteration.
+	printV4 := func(idx int, key dataplane.SessionKey, val dataplane.SessionValue) {
+		srcIP := net.IP(key.SrcIP[:])
+		dstIP := net.IP(key.DstIP[:])
+		srcPort := ntohs(key.SrcPort)
+		dstPort := ntohs(key.DstPort)
+		protoName := protoNameFromNum(key.Protocol)
+		stateName := sessionStateName(val.State)
 
-	// IPv4 sessions
+		inZone := zoneNames[val.IngressZone]
+		outZone := zoneNames[val.EgressZone]
+		if inZone == "" {
+			inZone = fmt.Sprintf("%d", val.IngressZone)
+		}
+		if outZone == "" {
+			outZone = fmt.Sprintf("%d", val.EgressZone)
+		}
+
+		sid := val.SessionID
+		if sid == 0 {
+			sid = uint64(idx)
+		}
+
+		if f.brief {
+			natFlag := " "
+			if val.Flags&dataplane.SessFlagSNAT != 0 {
+				natFlag = "S"
+			}
+			if val.Flags&dataplane.SessFlagDNAT != 0 {
+				natFlag = "D"
+			}
+			if val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == (dataplane.SessFlagSNAT | dataplane.SessFlagDNAT) {
+				natFlag = "B"
+			}
+			var age uint64
+			if now > val.Created {
+				age = now - val.Created
+			}
+			fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
+				sid,
+				fmt.Sprintf("%s:%d", srcIP, srcPort),
+				fmt.Sprintf("%s:%d", dstIP, dstPort),
+				protoName, inZone+"->"+outZone, natFlag,
+				stateName[:min(5, len(stateName))], age,
+				val.FwdPackets, val.RevPackets)
+			return
+		}
+
+		polName := policyNames[val.PolicyID]
+		if polName == "" {
+			polName = fmt.Sprintf("%d", val.PolicyID)
+		}
+		if haState != "" {
+			fmt.Printf("Session ID: %d, Policy name: %s/%d, HA State: %s, Timeout: %d, Session State: Valid\n",
+				sid, polName, val.PolicyID, haState, val.Timeout)
+		} else {
+			fmt.Printf("Session ID: %d, Policy name: %s/%d, Timeout: %d, Session State: Valid\n",
+				sid, polName, val.PolicyID, val.Timeout)
+		}
+
+		inIf := zoneIfaces[val.IngressZone]
+		if inIf == "" {
+			inIf = inZone
+		}
+		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
+			srcIP, srcPort, dstIP, dstPort, protoName,
+			inIf, inZone, val.FwdPackets, val.FwdBytes)
+
+		outSrcIP := dstIP.String()
+		outSrcPort := dstPort
+		outDstIP := srcIP.String()
+		outDstPort := srcPort
+		if val.Flags&dataplane.SessFlagSNAT != 0 {
+			natIP := uint32ToIP(val.NATSrcIP)
+			natPort := ntohs(val.NATSrcPort)
+			outDstIP = natIP.String()
+			outDstPort = natPort
+		}
+		if val.Flags&dataplane.SessFlagDNAT != 0 {
+			natIP := uint32ToIP(val.NATDstIP)
+			natPort := ntohs(val.NATDstPort)
+			outSrcIP = natIP.String()
+			outSrcPort = natPort
+		}
+		outIf := sessionEgressIf(val.FibIfindex, val.FibVlanID, val.EgressZone, outZone)
+		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
+			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
+			outIf, outZone, val.RevPackets, val.RevBytes)
+		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, dstPort, val.AppID); appName != "" {
+			fmt.Printf("  Application: %s\n", appName)
+		}
+		fmt.Println()
+	}
+
+	// IPv4 sessions — stream directly, no collect/sort.
 	err := c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 		if val.IsReverse != 0 {
 			return true
@@ -3387,22 +3474,15 @@ func (c *CLI) showFlowSession(args []string) error {
 			return true
 		}
 
-		v4Entries = append(v4Entries, sessEntryV4{key, val})
+		printV4(count, key, val)
 		return true
 	})
 	if err != nil {
 		return fmt.Errorf("iterate sessions: %w", err)
 	}
 
-	// Sort by SessionID for deterministic display order across cluster nodes.
-	sort.Slice(v4Entries, func(i, j int) bool {
-		return v4Entries[i].val.SessionID < v4Entries[j].val.SessionID
-	})
-
-	for idx, entry := range v4Entries {
-		key := entry.key
-		val := entry.val
-
+	// printV6 prints a single IPv6 session entry inline during iteration.
+	printV6 := func(idx int, key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
 		srcIP := net.IP(key.SrcIP[:])
 		dstIP := net.IP(key.DstIP[:])
 		srcPort := ntohs(key.SrcPort)
@@ -3421,7 +3501,7 @@ func (c *CLI) showFlowSession(args []string) error {
 
 		sid := val.SessionID
 		if sid == 0 {
-			sid = uint64(idx + 1)
+			sid = uint64(idx)
 		}
 
 		if f.brief {
@@ -3441,19 +3521,18 @@ func (c *CLI) showFlowSession(args []string) error {
 			}
 			fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
 				sid,
-				fmt.Sprintf("%s:%d", srcIP, srcPort),
-				fmt.Sprintf("%s:%d", dstIP, dstPort),
+				fmt.Sprintf("[%s]:%d", srcIP, srcPort),
+				fmt.Sprintf("[%s]:%d", dstIP, dstPort),
 				protoName, inZone+"->"+outZone, natFlag,
 				stateName[:min(5, len(stateName))], age,
 				val.FwdPackets, val.RevPackets)
-			continue
+			return
 		}
 
 		polName := policyNames[val.PolicyID]
 		if polName == "" {
 			polName = fmt.Sprintf("%d", val.PolicyID)
 		}
-		// Junos format header
 		if haState != "" {
 			fmt.Printf("Session ID: %d, Policy name: %s/%d, HA State: %s, Timeout: %d, Session State: Valid\n",
 				sid, polName, val.PolicyID, haState, val.Timeout)
@@ -3462,7 +3541,6 @@ func (c *CLI) showFlowSession(args []string) error {
 				sid, polName, val.PolicyID, val.Timeout)
 		}
 
-		// In line: original direction
 		inIf := zoneIfaces[val.IngressZone]
 		if inIf == "" {
 			inIf = inZone
@@ -3471,19 +3549,18 @@ func (c *CLI) showFlowSession(args []string) error {
 			srcIP, srcPort, dstIP, dstPort, protoName,
 			inIf, inZone, val.FwdPackets, val.FwdBytes)
 
-		// Out line: reverse direction (with NAT translations applied)
 		outSrcIP := dstIP.String()
 		outSrcPort := dstPort
 		outDstIP := srcIP.String()
 		outDstPort := srcPort
 		if val.Flags&dataplane.SessFlagSNAT != 0 {
-			natIP := uint32ToIP(val.NATSrcIP)
+			natIP := net.IP(val.NATSrcIP[:])
 			natPort := ntohs(val.NATSrcPort)
 			outDstIP = natIP.String()
 			outDstPort = natPort
 		}
 		if val.Flags&dataplane.SessFlagDNAT != 0 {
-			natIP := uint32ToIP(val.NATDstIP)
+			natIP := net.IP(val.NATDstIP[:])
 			natPort := ntohs(val.NATDstPort)
 			outSrcIP = natIP.String()
 			outSrcPort = natPort
@@ -3498,13 +3575,7 @@ func (c *CLI) showFlowSession(args []string) error {
 		fmt.Println()
 	}
 
-	// IPv6 sessions
-	type sessEntryV6 struct {
-		key dataplane.SessionKeyV6
-		val dataplane.SessionValueV6
-	}
-	var v6Entries []sessEntryV6
-
+	// IPv6 sessions — stream directly, no collect/sort.
 	err = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 		if val.IsReverse != 0 {
 			return true
@@ -3532,115 +3603,11 @@ func (c *CLI) showFlowSession(args []string) error {
 			return true
 		}
 
-		v6Entries = append(v6Entries, sessEntryV6{key, val})
+		printV6(count, key, val)
 		return true
 	})
 	if err != nil {
 		return fmt.Errorf("iterate sessions_v6: %w", err)
-	}
-
-	// Sort by SessionID for deterministic display order across cluster nodes.
-	sort.Slice(v6Entries, func(i, j int) bool {
-		return v6Entries[i].val.SessionID < v6Entries[j].val.SessionID
-	})
-
-	for idx, entry := range v6Entries {
-		key := entry.key
-		val := entry.val
-
-		srcIP := net.IP(key.SrcIP[:])
-		dstIP := net.IP(key.DstIP[:])
-		srcPort := ntohs(key.SrcPort)
-		dstPort := ntohs(key.DstPort)
-		protoName := protoNameFromNum(key.Protocol)
-		stateName := sessionStateName(val.State)
-
-		inZone := zoneNames[val.IngressZone]
-		outZone := zoneNames[val.EgressZone]
-		if inZone == "" {
-			inZone = fmt.Sprintf("%d", val.IngressZone)
-		}
-		if outZone == "" {
-			outZone = fmt.Sprintf("%d", val.EgressZone)
-		}
-
-		sid6 := val.SessionID
-		if sid6 == 0 {
-			sid6 = uint64(idx + 1)
-		}
-
-		if f.brief {
-			natFlag := " "
-			if val.Flags&dataplane.SessFlagSNAT != 0 {
-				natFlag = "S"
-			}
-			if val.Flags&dataplane.SessFlagDNAT != 0 {
-				natFlag = "D"
-			}
-			if val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == (dataplane.SessFlagSNAT | dataplane.SessFlagDNAT) {
-				natFlag = "B"
-			}
-			var age uint64
-			if now > val.Created {
-				age = now - val.Created
-			}
-			fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
-				sid6,
-				fmt.Sprintf("[%s]:%d", srcIP, srcPort),
-				fmt.Sprintf("[%s]:%d", dstIP, dstPort),
-				protoName, inZone+"->"+outZone, natFlag,
-				stateName[:min(5, len(stateName))], age,
-				val.FwdPackets, val.RevPackets)
-			continue
-		}
-
-		polName := policyNames[val.PolicyID]
-		if polName == "" {
-			polName = fmt.Sprintf("%d", val.PolicyID)
-		}
-		// Junos format header
-		if haState != "" {
-			fmt.Printf("Session ID: %d, Policy name: %s/%d, HA State: %s, Timeout: %d, Session State: Valid\n",
-				sid6, polName, val.PolicyID, haState, val.Timeout)
-		} else {
-			fmt.Printf("Session ID: %d, Policy name: %s/%d, Timeout: %d, Session State: Valid\n",
-				sid6, polName, val.PolicyID, val.Timeout)
-		}
-
-		// In line: original direction
-		inIf := zoneIfaces[val.IngressZone]
-		if inIf == "" {
-			inIf = inZone
-		}
-		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
-			srcIP, srcPort, dstIP, dstPort, protoName,
-			inIf, inZone, val.FwdPackets, val.FwdBytes)
-
-		// Out line: reverse direction (with NAT translations applied)
-		outSrcIP := dstIP.String()
-		outSrcPort := dstPort
-		outDstIP := srcIP.String()
-		outDstPort := srcPort
-		if val.Flags&dataplane.SessFlagSNAT != 0 {
-			natIP := net.IP(val.NATSrcIP[:])
-			natPort := ntohs(val.NATSrcPort)
-			outDstIP = natIP.String()
-			outDstPort = natPort
-		}
-		if val.Flags&dataplane.SessFlagDNAT != 0 {
-			natIP := net.IP(val.NATDstIP[:])
-			natPort := ntohs(val.NATDstPort)
-			outSrcIP = natIP.String()
-			outSrcPort = natPort
-		}
-		outIf := sessionEgressIf(val.FibIfindex, val.FibVlanID, val.EgressZone, outZone)
-		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
-			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
-			outIf, outZone, val.RevPackets, val.RevBytes)
-		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, dstPort, val.AppID); appName != "" {
-			fmt.Printf("  Application: %s\n", appName)
-		}
-		fmt.Println()
 	}
 
 	if f.summary {

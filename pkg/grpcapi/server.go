@@ -838,7 +838,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 	}
 
 	now := monotonicSeconds()
-	var all []*pb.SessionEntry
+	all := make([]*pb.SessionEntry, 0, limit)
 	idx := 0
 
 	// Build reverse zone ID → name map, policy name map, and zone→interface map.
@@ -999,11 +999,6 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 		}
 		idx++
 		return true
-	})
-
-	// Sort by SessionID for deterministic order across cluster nodes.
-	sort.Slice(all, func(i, j int) bool {
-		return all[i].SessionId < all[j].SessionId
 	})
 
 	resp := &pb.GetSessionsResponse{
