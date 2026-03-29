@@ -93,7 +93,7 @@ producer side still behaves like a periodic best-effort replication loop.
 
 ## Options Considered
 
-## Option A: Keep Everything In `bpfrxd`
+### Option A: Keep Everything In `bpfrxd`
 
 That means:
 
@@ -102,13 +102,13 @@ That means:
 - keep helper polling through RPC
 - improve tuning around the edges
 
-### Pros
+#### Pros
 
 - minimal architectural change
 - no new cross-language streaming interface
 - easiest short-term implementation path
 
-### Cons
+#### Cons
 
 - preserves the wrong steady-state producer model
 - keeps helper-originated events behind polling latency
@@ -116,7 +116,7 @@ That means:
 
 This is not the right end state.
 
-## Option B: Move Session Sync Into Rust
+### Option B: Move Session Sync Into Rust
 
 That means:
 
@@ -124,12 +124,12 @@ That means:
 - Rust helper owns bulk sync, barriers, replay, and readiness
 - Go daemon becomes mostly a consumer of Rust sync state
 
-### Pros
+#### Pros
 
 - one runtime owns all userspace session production and transport
 - avoids helper-to-daemon polling for userspace sessions
 
-### Cons
+#### Cons
 
 - pushes HA/control-plane logic into the dataplane runtime
 - duplicates or fragments ownership logic that already lives in Go
@@ -140,12 +140,12 @@ That means:
 This is the wrong tradeoff. The session-sync transport is part of the HA
 control plane, not just the userspace dataplane.
 
-## Option C: Hybrid Event-First Design (Recommended)
+### Option C: Hybrid Event-First Design (Recommended)
 
 Keep the HA/session-sync control plane in Go, but replace broad polling with
 narrower event producers.
 
-### Core idea
+#### Core idea
 
 - `bpfrxd` remains the owner of:
   - peer transport
@@ -174,7 +174,7 @@ In concrete terms:
 
 ## Target Architecture
 
-## 1. `bpfrxd` remains the authoritative sync coordinator
+### 1. `bpfrxd` remains the authoritative sync coordinator
 
 The daemon should continue to own:
 
@@ -194,12 +194,12 @@ Reason:
 Moving this into Rust would not simplify the system. It would shift the wrong
 kind of responsibility into the dataplane helper.
 
-## 2. Replace helper polling with helper-to-daemon streaming
+### 2. Replace helper polling with helper-to-daemon streaming
 
 Instead of periodic `DrainSessionDeltas(...)`, use a long-lived local stream
 between the helper and `bpfrxd`.
 
-### Properties
+#### Properties
 
 - ordered delivery
 - monotonically increasing sequence number
@@ -209,14 +209,14 @@ between the helper and `bpfrxd`.
 - explicit snapshot/export remains available for reconnect recovery and
   demotion prep
 
-### Why this is better
+#### Why this is better
 
 - lower latency than polling
 - no need to wake a drain loop to discover nothing changed
 - simpler quiescence during demotion because the stream can be paused or
   checkpointed explicitly
 
-## 3. Make kernel sync event-first
+### 3. Make kernel sync event-first
 
 Kernel/BPF sessions should not depend primarily on a 1-second or 15-second map
 scan.
@@ -232,7 +232,7 @@ The design target should be:
 The ring-buffer callback already points in this direction. It should become a
 first-class producer instead of a small optimization in front of the sweep.
 
-## 4. Sweep becomes reconciliation, not primary replication
+### 4. Sweep becomes reconciliation, not primary replication
 
 The sweep should still exist, but with a different job:
 
@@ -246,7 +246,7 @@ It should run less frequently and carry less semantic weight.
 A reconciliation sweep is still valuable. A reconciliation sweep as the main
 steady-state sync producer is not.
 
-## 5. Sync only material changes
+### 5. Sync only material changes
 
 The current sweep logic keys off `Created` / `LastSeen` movement. That is too
 coarse.
@@ -265,9 +265,9 @@ reason to send another sync update.
 
 ## Detailed Proposal
 
-## Local producer model
+### Local producer model
 
-### Kernel producer
+#### Kernel producer
 
 A kernel-side producer emits:
 
@@ -286,7 +286,7 @@ The event contains:
 The daemon can fetch the full session value by key if needed before queueing it
 onto peer sync.
 
-### Userspace producer
+#### Userspace producer
 
 The Rust helper emits:
 
@@ -297,7 +297,7 @@ The Rust helper emits:
 
 These events flow over a local ordered stream rather than RPC polling.
 
-### Reconciliation producer
+#### Reconciliation producer
 
 A slower reconciliation pass periodically verifies:
 
@@ -306,7 +306,7 @@ A slower reconciliation pass periodically verifies:
 - no unacked backlog explosion
 - no missed deletes / stale peer-owned sessions
 
-## Sync coordinator behavior
+### Sync coordinator behavior
 
 The coordinator in `bpfrxd` should:
 
@@ -318,7 +318,7 @@ The coordinator in `bpfrxd` should:
 
 That gives one control-plane authority, not two.
 
-## Why Not Put Kernel Session Sync In Rust
+### Why Not Put Kernel Session Sync In Rust
 
 Because the kernel session tables are not Rust-owned.
 
@@ -337,7 +337,7 @@ That is a net loss.
 
 ## Phased Plan
 
-## Phase 1: Replace helper polling with a local stream
+### Phase 1: Replace helper polling with a local stream
 
 Implement:
 
@@ -355,7 +355,7 @@ Keep:
 
 This is the highest-value near-term change.
 
-## Phase 2: Promote kernel event sync to primary path
+### Phase 2: Promote kernel event sync to primary path
 
 Implement:
 
@@ -367,7 +367,7 @@ Reduce dependence on:
 
 - full map scans every active interval
 
-## Phase 3: Convert sweep into reconciliation
+### Phase 3: Convert sweep into reconciliation
 
 After Phase 2 is stable:
 
@@ -375,7 +375,7 @@ After Phase 2 is stable:
 - stop using sweep as the main fresh-session discovery mechanism
 - run sweep mainly for convergence repair and missed-event detection
 
-## Phase 4: Reduce update churn
+### Phase 4: Reduce update churn
 
 Add more selective update rules:
 
