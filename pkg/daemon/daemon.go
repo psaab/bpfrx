@@ -222,6 +222,12 @@ type Daemon struct {
 	// userspaceDemotionPrepDepth pauses background incremental session-sync
 	// producers while demotion prep stages continuity-critical republish.
 	userspaceDemotionPrepDepth atomic.Int32
+	// demotionKernelJournal buffers kernel SESSION_OPEN events that arrive
+	// during demotion prep. Instead of dropping them, they are flushed to
+	// the peer before the final barrier.
+	demotionKernelJournalMu sync.Mutex
+	demotionKernelJournalV4 []journaledSessionV4
+	demotionKernelJournalV6 []journaledSessionV6
 	// userspaceDemotionPrepUntil suppresses duplicate demotion prep for the
 	// same RG during a single failover transition. Manual failover can now
 	// stage prep before ownership changes; the later cluster/VRRP edges must
@@ -718,9 +724,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 					if rec.Type != "SESSION_OPEN" {
 						return
 					}
-					if d.userspaceDemotionPrepActive() {
-						return
-					}
 					if d.cluster == nil || !d.cluster.IsLocalPrimaryAny() {
 						return
 					}
@@ -732,6 +735,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 					}
 					proto := raw[53]
 					af := raw[55]
+					demotionActive := d.userspaceDemotionPrepActive()
 
 					if af == dataplane.AFInet6 {
 						var key dataplane.SessionKeyV6
@@ -742,7 +746,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.Protocol = proto
 						if val, err := d.dp.GetSessionV6(key); err == nil && val.IsReverse == 0 {
 							if d.sessionSync.ShouldSyncZone(val.IngressZone) {
-								d.sessionSync.QueueSessionV6(key, val)
+								if demotionActive {
+									d.journalKernelSessionV6(key, val)
+								} else {
+									d.sessionSync.QueueSessionV6(key, val)
+								}
 							}
 						}
 					} else {
@@ -754,7 +762,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.Protocol = proto
 						if val, err := d.dp.GetSessionV4(key); err == nil && val.IsReverse == 0 {
 							if d.sessionSync.ShouldSyncZone(val.IngressZone) {
-								d.sessionSync.QueueSessionV4(key, val)
+								if demotionActive {
+									d.journalKernelSessionV4(key, val)
+								} else {
+									d.sessionSync.QueueSessionV4(key, val)
+								}
 							}
 						}
 					}
@@ -3732,8 +3744,53 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 	}
 }
 
+type journaledSessionV4 struct {
+	Key dataplane.SessionKey
+	Val dataplane.SessionValue
+}
+type journaledSessionV6 struct {
+	Key dataplane.SessionKeyV6
+	Val dataplane.SessionValueV6
+}
+
 func (d *Daemon) userspaceDemotionPrepActive() bool {
 	return d.userspaceDemotionPrepDepth.Load() > 0
+}
+
+// journalKernelSessionV4 buffers a kernel session event during demotion prep.
+func (d *Daemon) journalKernelSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) {
+	d.demotionKernelJournalMu.Lock()
+	d.demotionKernelJournalV4 = append(d.demotionKernelJournalV4, journaledSessionV4{key, val})
+	d.demotionKernelJournalMu.Unlock()
+}
+
+func (d *Daemon) journalKernelSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
+	d.demotionKernelJournalMu.Lock()
+	d.demotionKernelJournalV6 = append(d.demotionKernelJournalV6, journaledSessionV6{key, val})
+	d.demotionKernelJournalMu.Unlock()
+}
+
+// flushDemotionKernelJournal syncs any kernel sessions buffered during demotion
+// prep to the peer, then clears the journal.
+func (d *Daemon) flushDemotionKernelJournal() int {
+	d.demotionKernelJournalMu.Lock()
+	v4 := d.demotionKernelJournalV4
+	v6 := d.demotionKernelJournalV6
+	d.demotionKernelJournalV4 = nil
+	d.demotionKernelJournalV6 = nil
+	d.demotionKernelJournalMu.Unlock()
+	count := 0
+	if d.sessionSync != nil {
+		for _, s := range v4 {
+			d.sessionSync.QueueSessionV4(s.Key, s.Val)
+			count++
+		}
+		for _, s := range v6 {
+			d.sessionSync.QueueSessionV6(s.Key, s.Val)
+			count++
+		}
+	}
+	return count
 }
 
 func (d *Daemon) beginUserspaceDemotionPrepSyncPause(rgID int) func() {
@@ -4045,6 +4102,16 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 				queued += drained
 			}
 		}
+	}
+
+	// Flush kernel SESSION_OPEN events that were journaled during demotion
+	// prep instead of being dropped. This ensures the peer has all sessions
+	// before the final barrier.
+	journaled := d.flushDemotionKernelJournal()
+	queued += journaled
+	if journaled > 0 {
+		slog.Info("userspace: flushed kernel session journal before barrier",
+			"rg", rgID, "journaled", journaled)
 	}
 
 	if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {

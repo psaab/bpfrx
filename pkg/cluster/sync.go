@@ -752,7 +752,11 @@ func (s *SessionSync) syncSweep() int {
 		if val.IsReverse != 0 {
 			return true
 		}
-		if (val.Created >= threshold || val.LastSeen >= threshold) && s.ShouldSyncZone(val.IngressZone) {
+		// Only sweep sessions created since last threshold. The ring event
+		// path handles near-real-time create delivery; sweep is reconciliation
+		// only. Established flows whose LastSeen moved but were created before
+		// the threshold do not need re-syncing — the peer already has them.
+		if val.Created >= threshold && s.ShouldSyncZone(val.IngressZone) {
 			msg := encodeSessionV4(key, val)
 			if s.queueMessage(msg, &s.stats.SessionsSent, "sweep_v4") {
 				count++
@@ -767,7 +771,7 @@ func (s *SessionSync) syncSweep() int {
 		if val.IsReverse != 0 {
 			return true
 		}
-		if (val.Created >= threshold || val.LastSeen >= threshold) && s.ShouldSyncZone(val.IngressZone) {
+		if val.Created >= threshold && s.ShouldSyncZone(val.IngressZone) {
 			msg := encodeSessionV6(key, val)
 			if s.queueMessage(msg, &s.stats.SessionsSent, "sweep_v6") {
 				count++
