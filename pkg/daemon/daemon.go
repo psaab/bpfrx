@@ -3974,7 +3974,7 @@ func wrapUserspaceManualFailoverPrepareError(err error) error {
 
 func (d *Daemon) prepareUserspaceManualFailover(rgID int) error {
 	return wrapUserspaceManualFailoverPrepareError(
-		d.prepareUserspaceRGDemotionWithTimeout(rgID, 5*time.Second),
+		d.prepareUserspaceRGDemotionWithTimeout(rgID, 15*time.Second),
 	)
 }
 

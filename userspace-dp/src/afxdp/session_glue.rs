@@ -295,6 +295,11 @@ pub(super) fn apply_worker_commands(
                 prepared_sequences.push(sequence);
             }
             WorkerCommand::DemoteOwnerRG(owner_rg_id) => {
+                eprintln!(
+                    "bpfrx-ha: DemoteOwnerRG {} worker sessions: total={}",
+                    owner_rg_id,
+                    sessions.len(),
+                );
                 refresh_live_reverse_sessions_for_owner_rgs(
                     sessions,
                     session_map_fd,
@@ -310,6 +315,10 @@ pub(super) fn apply_worker_commands(
                 // BPF map so the XDP shim falls through to the eBPF pipeline.
                 // The eBPF pipeline checks rg_active and redirects via fabric.
                 let demoted = sessions.demote_owner_rg(owner_rg_id);
+                eprintln!(
+                    "bpfrx-ha: DemoteOwnerRG {} demoted_sessions={} remaining={}",
+                    owner_rg_id, demoted.len(), sessions.len(),
+                );
                 for flow_cache in flow_caches.iter_mut() {
                     flow_cache.invalidate_owner_rg(owner_rg_id);
                 }
