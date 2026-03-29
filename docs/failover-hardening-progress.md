@@ -4,167 +4,112 @@
 
 Manual RG failover under sustained iperf3 -P 8 load (20+ Gbps) kills
 existing TCP sessions. Traffic drops to 0 and never recovers. This must work
-seamlessly — zero zero-throughput intervals, all streams surviving.
+seamlessly — zero zero-throughput intervals, all streams surviving, across
+repeated failover/failback cycles.
+
+## Test Matrix
+
+| Scenario | Status | Notes |
+|----------|--------|-------|
+| Both RGs to node1 (single cycle) | **PASS** | 0 zeros, 22→12 Gbps |
+| RG1-only to node1 (split-RG, single) | **FAIL** | Traffic dies permanently |
+| RG1 failover 10 cycles | **FAIL** | 120/132 zeros |
+| Crash recovery (sysrq-b) | **PASS** | 2s outage, sub-second with 100ms heartbeat |
+| Crash + rejoin | **PASS** | 0 drops during rejoin |
 
 ## Root Causes Found and Fixed
 
 ### 1. Event stream idle disconnect (FIXED, `19824440`)
 
-The Rust event stream I/O thread disconnected every 30s due to Go-side read
-deadline timeout. Added MSG_KEEPALIVE (type 10) sent every 10s from Rust.
-Go side handles keepalive as no-op.
+Rust event stream I/O thread disconnected every 30s from Go read deadline
+timeout. Added MSG_KEEPALIVE (type 10) every 10s. Go side ignores keepalive.
 
-### 2. Bulk sync priming never completing (FIXED, event stream keepalive)
+### 2. Bulk sync priming never completing (FIXED)
 
-`syncPeerBulkPrimed` was never becoming true because the event stream kept
-disconnecting and reconnecting, preventing bulk sync from completing. The
-keepalive fix stabilized the connection, allowing bulk ack to flow.
+`syncPeerBulkPrimed` never becoming true due to event stream disconnect cycle.
+Keepalive fix stabilized connection.
 
 ### 3. Manual failover demotion timeout too short (FIXED, `b2285a9c`)
 
-Demotion prep timeout was 5 seconds. The quiescence loop needs multiple
-barrier round-trips (~1-3s each) and was consistently timing out. Increased
-to 15 seconds.
+5s timeout → 15s. Quiescence loop needs multiple barrier round-trips.
 
 ### 4. HAInactive packets dropped as exceptions (FIXED, `96cca96d`)
 
-When a session's owner RG is demoted, `enforce_ha_resolution_snapshot`
-returns `HAInactive`. This was treated as an exception (recorded + dropped)
-instead of redirecting to fabric. Added HAInactive → FabricRedirect
-conversion before the forward/drop branch in `poll_binding()`.
+`enforce_ha_resolution_snapshot` returns `HAInactive` for demoted-RG sessions.
+Was treated as exception (dropped). Now converted to `FabricRedirect` before
+the forward/drop branch in `poll_binding()`.
 
 ### 5. Synced sessions not re-resolved on new owner (FIXED, `96cca96d`)
 
-Synced sessions arrive with the remote node's egress interface indices and
-MACs. When the owner RG activates locally, the `UpsertSynced` handler now
-re-resolves egress using local `ForwardingState` instead of keeping stale
-remote resolution.
+`UpsertSynced` handler re-resolves egress using local `ForwardingState` when
+the owner RG is locally active. Prevents using stale remote interface indices.
 
-### 6. USERSPACE_SESSIONS BPF map not flushed on demotion (FIXED, `b22152fa`)
+### 6. USERSPACE_SESSIONS BPF map stale on demotion (FIXED, `b22152fa`)
 
-The XDP shim finds sessions in `USERSPACE_SESSIONS` and redirects to XSK,
-bypassing the eBPF pipeline's `rg_active` check and fabric redirect. Added
-map flush before `rg_active=0` in the Go daemon's `UpdateRGActive()`. Also
-added immediate shared_sessions cleanup in the Rust coordinator.
+XDP shim found stale entries and redirected to XSK, bypassing eBPF fabric
+redirect. Added map flush before `rg_active=0`. Also immediate
+shared_sessions cleanup in Rust coordinator.
 
-### 7. Flow cache serves stale decisions during HA transition (ROOT CAUSE, `aeeccc7c`)
+### 7. Flow cache serves stale decisions during transition (ROOT CAUSE, `aeeccc7c`)
 
-**This was the critical bug.** The userspace flow cache serves cached
-`ForwardCandidate` decisions at line rate (~20 Gbps). After RG demotion, the
-flow cache should invalidate via `cached_flow_decision_valid()`. But:
+**The critical fix.** Userspace flow cache serves cached ForwardCandidate at
+line rate. HA state update goes through synchronous RPC (~100ms under load).
+During this window, millions of packets hit stale cache → TCP collapse.
 
-- The HA state update goes through a synchronous RPC (single-use Unix socket
-  JSON) to the Rust helper.
-- The helper's control socket uses nonblocking accept with 100ms poll.
-- Under 20+ Gbps load, the RPC takes ~100ms to be processed.
-- During this 100ms window, the flow cache serves millions of packets with
-  stale ForwardCandidate decisions (old egress, wrong node).
-- TCP suffers massive retransmits from these 100ms of misdirected packets.
-- TCP windows collapse to minimum (1.41 KB) and never recover.
+**Fix:** Disable ctrl + swap to `xdp_main_prog` BEFORE `rg_active=0`. The
+eBPF pipeline checks `rg_active` per-packet (nanoseconds) and fabric-
+redirects immediately. No flow cache, no RPC latency.
 
-**Fix:** Disable the userspace ctrl flag AND swap to `xdp_main_prog` (eBPF
-pipeline entry) BEFORE setting `rg_active=0`. The eBPF pipeline checks
-`rg_active` in real-time per-packet (single BPF map lookup, ~nanoseconds)
-and redirects to fabric immediately via `try_fabric_redirect()`. No flow
-cache, no RPC latency, no 100ms gap.
+### 8. Promoting node also needs ctrl disable (FIXED, `ff2bf120`)
 
-Sequence: `ctrl=0` → `SwapXDPEntryProg("xdp_main_prog")` → `rg_active=0` →
-sync to helper (eventually).
+The promoting node (new owner) also has stale synced sessions in its flow
+cache. Disabling ctrl on both nodes during ANY RG transition ensures the eBPF
+pipeline handles both sides of the transition.
 
-Result: Zero zero-throughput intervals. Sessions survive failover. Throughput
-drops from 22 Gbps (userspace) to 12 Gbps (eBPF pipeline) during transition,
-then should recover when userspace ctrl re-enables.
+## Remaining Failure: Split-RG Fabric Throughput Cliff
 
-## Current Test Results
+### Symptom
 
-### Single RG failover (both RGs to node1)
-```
-Seconds 1-11:  21-22 Gbits/sec (fw0, userspace DP)
-Second 12:     52 Mbits/sec    (transition dip)
-Second 13:     3.8 Gbits/sec   (recovery starting)
-Seconds 14-40: 11-12 Gbits/sec (fw1, eBPF pipeline)
-Zero intervals: 0
-```
+When only RG1 (WAN) moves to node1 while RG2 (LAN) stays on node0, existing
+8-stream TCP sessions at 22 Gbps die permanently. ALL 8 streams go to zero.
 
-### Known Remaining Issues
+### Root Cause
 
-1. **Throughput drops from 22 to 12 Gbps after failover** — The ctrl disable
-   + eBPF swap is not reversed after the helper processes demotion. The
-   helper's status loop should re-enable ctrl once XSK bindings are ready on
-   the new owner. Need to implement ctrl re-enable after demotion settles.
+The fabric link between nodes can carry ~3-4 Gbps. When 8 TCP streams at
+22 Gbps suddenly need to traverse the fabric (split-RG), the massive
+congestion causes:
 
-2. **Per-stream zero intervals** — Some individual streams may hit 0 while
-   others sustain multi-Gbps. The aggregate SUM may be non-zero but
-   per-stream health varies. Need per-stream analysis.
+1. Thousands of packet drops at the fabric bottleneck
+2. TCP retransmit timeouts on all 8 streams simultaneously
+3. TCP windows collapse to minimum (1.41 KB)
+4. TCP slow start from minimum window takes too long
+5. Streams never recover because the fabric can't sustain the aggregate demand
 
-3. **Multi-cycle failover** — Single failover passes but repeated
-   failover/failback cycles may accumulate state (stale sessions, flow cache
-   pollution, synced session conflicts). Need 10+ iteration stress test.
+### Why Same-Node Failover Works
 
-4. **Ctrl re-enable timing** — After disabling ctrl for the transition, when
-   should it re-enable? Too early = stale flow cache. Too late = permanent
-   eBPF pipeline (lower throughput). Need the helper to signal readiness.
+When BOTH RGs move together, traffic stays on one node (no fabric). The path
+is: host → fw1 (LAN) → fw1 (WAN) → server, all same-node. Throughput drops
+from 22 Gbps (userspace DP) to 12 Gbps (eBPF pipeline) but TCP survives.
 
-5. **Reverse path on new owner** — Server replies arrive at the new WAN owner
-   (fw1). fw1 needs synced reverse sessions to be correctly resolved for the
-   LAN path (back to fw0 via fabric if split-RG, or directly if both RGs on
-   fw1).
+### Possible Fixes
 
-## Architecture of the Fix
+1. **Always move both RGs together** — eliminates fabric path entirely. But
+   defeats the purpose of per-RG active-active.
 
-### Before (broken)
-```
-RG demotion sequence:
-1. Go daemon: rg_active[1] = 0         (BPF map, instant)
-2. Go daemon: syncHAStateLocked()      (RPC to helper, ~100ms under load)
-3. Helper: update_ha_state()           (stores HA state, sends worker commands)
-4. Workers: process DemoteOwnerRG      (invalidate flow cache, delete BPF entries)
+2. **Improve fabric throughput** — the fabric is a virtio/IPVLAN overlay.
+   Current limit is ~3-4 Gbps. Needs investigation into whether this is a
+   NIC ring size, NAPI budget, or IPVLAN overhead issue.
 
-During steps 2-4 (~100ms): flow cache serves stale ForwardCandidate → TCP collapse
-```
+3. **TCP-aware fabric congestion management** — instead of dropping packets at
+   the fabric bottleneck, queue them with ECN marking so TCP backs off
+   gracefully instead of collapsing.
 
-### After (working)
-```
-RG demotion sequence:
-1. Go daemon: ctrl = 0                 (BPF map, instant)
-2. Go daemon: SwapXDPEntryProg         (BPF prog swap, instant)
-   → ALL packets now go through eBPF pipeline
-3. Go daemon: rg_active[1] = 0         (BPF map, instant)
-   → eBPF pipeline checks rg_active per-packet → fabric redirect
-4. Go daemon: syncHAStateLocked()      (RPC to helper, can be slow)
-5. Helper: update_ha_state()           (eventual consistency)
-6. Workers: process DemoteOwnerRG      (cleanup, not time-critical)
+4. **Gradual traffic migration** — instead of instant RG move, gradually shift
+   traffic from one node to the other to prevent the congestion spike.
 
-During steps 4-6: eBPF pipeline handles all traffic correctly via rg_active + fabric redirect
-```
-
-## Files Modified
-
-### Go daemon (`pkg/daemon/daemon.go`)
-- `prepareUserspaceManualFailover`: increased timeout 5s → 15s
-- Kernel session journal during demotion prep (flush before barrier)
-
-### Go userspace manager (`pkg/dataplane/userspace/manager.go`)
-- `UpdateRGActive()`: disable ctrl + swap to eBPF before rg_active=0
-
-### Rust coordinator (`userspace-dp/src/afxdp.rs`)
-- `update_ha_state()`: immediate USERSPACE_SESSIONS cleanup for demoted RGs
-- HAInactive → FabricRedirect conversion before forward/drop branch
-- HA disposition tracing and logging
-
-### Rust session glue (`userspace-dp/src/afxdp/session_glue.rs`)
-- `UpsertSynced`: re-resolve egress for locally-active RGs
-- `DemoteOwnerRG`: logging for session counts and demoted counts
-
-### Rust event stream (`userspace-dp/src/event_stream.rs`)
-- MSG_KEEPALIVE (type 10) sent every 10s during idle
-- Improved FullResync logging
-
-### Go event stream (`pkg/dataplane/userspace/eventstream.go`)
-- Handle MSG_KEEPALIVE frames (no-op)
-
-### Go protocol (`pkg/dataplane/userspace/protocol.go`)
-- Added EventTypeKeepalive constant
+5. **Keep existing sessions on the old node during split-RG** — the old owner
+   continues forwarding existing sessions via its now-inactive RG while the
+   new owner handles new sessions. Sessions naturally drain as they expire.
 
 ## Commits
 
@@ -175,3 +120,61 @@ During steps 4-6: eBPF pipeline handles all traffic correctly via rg_active + fa
 | `b2285a9c` | Demotion timeout increase + HA tracing |
 | `96cca96d` | Synced session re-resolution + HAInactive fabric redirect |
 | `aeeccc7c` | **Breakthrough: disable ctrl + swap to eBPF before demotion** |
+| `ff2bf120` | Disable ctrl on BOTH nodes during RG transition |
+
+## Architecture
+
+### RG Transition Sequence (Current)
+
+```
+1. Go daemon: ctrl = 0 on BOTH nodes        (BPF map, instant)
+2. Go daemon: SwapXDPEntryProg(xdp_main)     (BPF prog swap, instant)
+   → ALL packets on BOTH nodes go through eBPF pipeline
+3. Go daemon: rg_active[RG] = 0/1            (BPF map, instant)
+   → eBPF pipeline checks rg_active → fabric redirect for inactive RGs
+4. Go daemon: syncHAStateLocked              (RPC, can be slow)
+5. Helper: update_ha_state                   (eventual)
+6. Helper status loop: re-enables ctrl       (when XSK ready)
+```
+
+### What Passes vs Fails
+
+| Test | ctrl disable | Both RGs | Split RG | Result |
+|------|-------------|----------|----------|--------|
+| Before all fixes | No | N/A | N/A | 28 zeros |
+| ctrl disable on demotion only | Demoting node | PASS (0 zeros) | FAIL (120 zeros) |
+| ctrl disable on both nodes | Both nodes | PASS (0 zeros) | FAIL (120 zeros) |
+
+The split-RG failure is NOT a ctrl/flow-cache issue — it's a fabric
+throughput constraint. The eBPF pipeline correctly redirects to fabric, but
+the fabric can't carry 22 Gbps.
+
+## Event Stream Status
+
+Phase 1 of the session sync redesign is complete:
+- Binary event stream over Unix socket (Rust → Go)
+- 10 frame types including keepalive
+- Sequence numbers + replay buffer
+- Ack/Pause/Resume/DrainRequest flow control
+- Integrated with demotion prep
+- Automatic fallback to RPC polling when disconnected
+
+The event stream is NOT used for HA state transitions — those still go through
+the JSON RPC control socket. Could be optimized to use the event stream for
+lower latency.
+
+## Files Modified (Full List)
+
+### Go
+- `pkg/daemon/daemon.go` — demotion timeout, kernel session journal, sync readiness
+- `pkg/dataplane/userspace/manager.go` — ctrl disable on RG transition, USERSPACE_SESSIONS flush
+- `pkg/dataplane/userspace/eventstream.go` — keepalive handling
+- `pkg/dataplane/userspace/protocol.go` — EventTypeKeepalive
+
+### Rust
+- `userspace-dp/src/afxdp.rs` — HAInactive→FabricRedirect, immediate shared_sessions cleanup, HA tracing
+- `userspace-dp/src/afxdp/session_glue.rs` — UpsertSynced re-resolution, DemoteOwnerRG logging
+- `userspace-dp/src/event_stream.rs` — MSG_KEEPALIVE, improved FullResync logging
+
+### Docs
+- `docs/failover-hardening-progress.md` — this document
