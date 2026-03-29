@@ -67,23 +67,25 @@ Implemented and compile-checked so far:
   - `XdpOptions`
   - `PendingNeighPacket`
   - `FlowCache`, `FlowCacheEntry`, `RewriteDescriptor`
+  - `BindingIdentity`, `WorkerBindingLookup`
+  - `SessionFlow`, `ResolutionDebug`
+  - `TxRequest`, `PendingForwardRequest`, `PreparedTxRequest`, `PreparedTxRecycle`
+  - `LocalTunnelTxPlan`, `LearnedNeighborKey`
+  - `WorkerCommand`, `DebugPollCounters`
 
 Still in `afxdp.rs` and still worth moving:
 
 - the remaining shared types originally planned for `types.rs`:
   - `WorkerHandle`, `LocalTunnelSourceHandle`, `BindingPlan`
   - `PacketDisposition`, `ValidationState`
-  - `BindingIdentity`, `WorkerBindingLookup`
-  - `SessionFlow`, `ResolutionDebug`
-  - `TxRequest`, `PendingForwardRequest`, `PreparedTxRequest`, `PreparedTxRecycle`
-  - `LocalTunnelTxPlan`, `LearnedNeighborKey`
-  - `WorkerCommand`, `DebugPollCounters`
+  - `ForwardingState`, `ForwardingResolution`, `ForwardingDisposition`
+  - `FabricLink`, `HAGroupRuntime`
 - all forwarding/config compilation logic into `forwarding.rs`
 
 Current reduction:
 
-- `afxdp.rs`: `20,138 -> 17,388`
-- reduction so far: about `13.7%`
+- `afxdp.rs`: `20,138 -> 17,143`
+- reduction so far: about `14.9%`
 
 ## Proposed Module Structure
 
@@ -208,7 +210,7 @@ Used everywhere as `type FastMap<K,V> = FxHashMap<K,V>`. **Solution:** Move to `
 userspace-dp/src/
   afxdp.rs              ~17,388 lines now; target still ~11,100
   afxdp/
-    types.rs               ~180 lines  ← NEW (first pass landed; more shared types still to move)
+    types.rs               ~420 lines  ← NEW (first pass landed; more shared types still to move)
     forwarding.rs        ~4,500 lines  ← NEW (incl. ~3K tests)
     bpf_map.rs             ~577 lines  ← NEW
     umem.rs                ~632 lines  ← NEW

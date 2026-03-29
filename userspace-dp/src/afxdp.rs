@@ -1958,70 +1958,6 @@ impl XskBindMode {
     }
 }
 
-#[derive(Clone, Debug)]
-struct BindingIdentity {
-    slot: u32,
-    queue_id: u32,
-    worker_id: u32,
-    interface: Arc<str>,
-    ifindex: i32,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(super) struct WorkerBindingLookup {
-    by_if_queue: FastMap<(i32, u32), usize>,
-    first_by_if: FastMap<i32, usize>,
-    all_by_if: FastMap<i32, Vec<usize>>,
-    by_slot: FastMap<u32, usize>,
-}
-
-impl WorkerBindingLookup {
-    fn from_bindings(bindings: &[BindingWorker]) -> Self {
-        let mut lookup = Self::default();
-        for (index, binding) in bindings.iter().enumerate() {
-            lookup
-                .by_if_queue
-                .insert((binding.ifindex, binding.queue_id), index);
-            lookup.first_by_if.entry(binding.ifindex).or_insert(index);
-            lookup
-                .all_by_if
-                .entry(binding.ifindex)
-                .or_default()
-                .push(index);
-            lookup.by_slot.insert(binding.slot, index);
-        }
-        lookup
-    }
-
-    fn target_index(
-        &self,
-        current_index: usize,
-        current_ifindex: i32,
-        ingress_queue_id: u32,
-        egress_ifindex: i32,
-    ) -> Option<usize> {
-        if current_ifindex == egress_ifindex {
-            return Some(current_index);
-        }
-        self.by_if_queue
-            .get(&(egress_ifindex, ingress_queue_id))
-            .copied()
-            .or_else(|| self.first_by_if.get(&egress_ifindex).copied())
-    }
-
-    fn slot_index(&self, slot: u32) -> Option<usize> {
-        self.by_slot.get(&slot).copied()
-    }
-
-    fn fabric_target_index(&self, egress_ifindex: i32, flow_hash: u64) -> Option<usize> {
-        let indices = self.all_by_if.get(&egress_ifindex)?;
-        if indices.is_empty() {
-            return None;
-        }
-        Some(indices[(flow_hash as usize) % indices.len()])
-    }
-}
-
 fn fabric_queue_hash(
     flow: Option<&SessionFlow>,
     expected_ports: Option<(u16, u16)>,
@@ -2062,111 +1998,6 @@ fn fabric_queue_hash(
     seed
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SessionFlow {
-    src_ip: IpAddr,
-    dst_ip: IpAddr,
-    forward_key: SessionKey,
-}
-
-impl SessionFlow {
-    fn reverse_key_with_nat(&self, nat: NatDecision) -> SessionKey {
-        reverse_session_key(&self.forward_key, nat)
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct ResolutionDebug {
-    ingress_ifindex: i32,
-    src_ip: Option<IpAddr>,
-    dst_ip: Option<IpAddr>,
-    src_port: u16,
-    dst_port: u16,
-    from_zone: Option<Arc<str>>,
-    to_zone: Option<Arc<str>>,
-}
-
-impl ResolutionDebug {
-    fn from_flow(ingress_ifindex: i32, flow: &SessionFlow) -> Self {
-        Self {
-            ingress_ifindex,
-            src_ip: Some(flow.src_ip),
-            dst_ip: Some(flow.dst_ip),
-            src_port: flow.forward_key.src_port,
-            dst_port: flow.forward_key.dst_port,
-            from_zone: None,
-            to_zone: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct TxRequest {
-    bytes: Vec<u8>,
-    #[allow(dead_code)]
-    expected_ports: Option<(u16, u16)>,
-    #[allow(dead_code)]
-    expected_addr_family: u8,
-    #[allow(dead_code)]
-    expected_protocol: u8,
-    flow_key: Option<SessionKey>,
-}
-
-struct PendingForwardRequest {
-    target_ifindex: i32,
-    target_binding_index: Option<usize>,
-    ingress_queue_id: u32,
-    source_offset: u64,
-    desc: XdpDesc,
-    source_frame: Option<Vec<u8>>,
-    meta: UserspaceDpMeta,
-    decision: SessionDecision,
-    apply_nat_on_fabric: bool,
-    expected_ports: Option<(u16, u16)>,
-    flow_key: Option<SessionKey>,
-    /// NAT64 reverse info for cross-AF translation (IPv4 reply → IPv6).
-    nat64_reverse: Option<Nat64ReverseInfo>,
-    /// Pre-built frame bytes that bypass normal frame building.
-    /// Used for ICMP error NAT reversal where the embedded packet
-    /// rewrites are already applied and the frame is ready for TX.
-    prebuilt_frame: Option<Vec<u8>>,
-}
-
-struct PreparedTxRequest {
-    offset: u64,
-    len: u32,
-    recycle: PreparedTxRecycle,
-    #[allow(dead_code)]
-    expected_ports: Option<(u16, u16)>,
-    #[allow(dead_code)]
-    expected_addr_family: u8,
-    #[allow(dead_code)]
-    expected_protocol: u8,
-    flow_key: Option<SessionKey>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PreparedTxRecycle {
-    FreeTxFrame,
-    FillOnSlot(u32),
-}
-
-#[derive(Debug)]
-struct LocalTunnelTxPlan {
-    tx_ifindex: i32,
-    tx_request: TxRequest,
-    session_entry: SyncedSessionEntry,
-    reverse_session_entry: Option<SyncedSessionEntry>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LearnedNeighborKey {
-    ingress_ifindex: i32,
-    ingress_vlan_id: u16,
-    src_ip: IpAddr,
-    src_mac: [u8; 6],
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct SyncedSessionEntry {
     pub(crate) key: SessionKey,
@@ -2175,17 +2006,6 @@ pub(crate) struct SyncedSessionEntry {
     pub(crate) origin: SessionOrigin,
     pub(crate) protocol: u8,
     pub(crate) tcp_flags: u8,
-}
-
-#[derive(Clone, Debug)]
-enum WorkerCommand {
-    UpsertSynced(SyncedSessionEntry),
-    UpsertLocal(SyncedSessionEntry),
-    DeleteSynced(SessionKey),
-    ExportOwnerRGSessions { sequence: u64, owner_rgs: Vec<i32> },
-    PrepareDemoteOwnerRGs { sequence: u64, owner_rgs: Vec<i32> },
-    DemoteOwnerRG(i32),
-    RefreshOwnerRGs(Vec<i32>),
 }
 
 impl BindingWorker {
@@ -2373,71 +2193,6 @@ impl BindingWorker {
             ifindex: self.ifindex,
         }
     }
-}
-
-#[derive(Default)]
-struct DebugPollCounters {
-    rx: u64,
-    #[allow(dead_code)]
-    tx: u64,
-    forward: u64,
-    #[allow(dead_code)]
-    local: u64,
-    #[allow(dead_code)]
-    session_hit: u64,
-    #[allow(dead_code)]
-    session_miss: u64,
-    #[allow(dead_code)]
-    session_create: u64,
-    #[allow(dead_code)]
-    no_route: u64,
-    #[allow(dead_code)]
-    missing_neigh: u64,
-    #[allow(dead_code)]
-    policy_deny: u64,
-    #[allow(dead_code)]
-    ha_inactive: u64,
-    #[allow(dead_code)]
-    no_egress_binding: u64,
-    #[allow(dead_code)]
-    build_fail: u64,
-    #[allow(dead_code)]
-    tx_err: u64,
-    #[allow(dead_code)]
-    metadata_err: u64,
-    disposition_other: u64,
-    enqueue_ok: u64,      // forwards successfully enqueued to target binding TX
-    enqueue_inplace: u64, // in-place TX rewrites (same UMEM)
-    enqueue_direct: u64,  // direct-to-UMEM TX (cross binding)
-    enqueue_copy: u64,    // Vec copy-path TX
-    // Direction-specific counters
-    rx_from_trust: u64,    // packets received from trust-side interfaces
-    rx_from_wan: u64,      // packets received from wan-side interfaces
-    fwd_trust_to_wan: u64, // forwards from trust to wan
-    fwd_wan_to_trust: u64, // forwards from wan to trust
-    nat_applied_snat: u64, // SNAT rewrites applied
-    nat_applied_dnat: u64, // DNAT (reverse-SNAT) rewrites applied
-    nat_applied_none: u64, // no NAT rewrite
-    #[allow(dead_code)]
-    frame_build_none: u64, // build_forwarded_frame returned None (why?)
-    rx_tcp_rst: u64,       // TCP RST flags seen in RX frames
-    #[allow(dead_code)]
-    tx_tcp_rst: u64, // TCP RST flags seen in TX frames (forwarded)
-    rx_bytes_total: u64,   // total RX bytes (for avg frame size calculation)
-    tx_bytes_total: u64,   // total TX bytes submitted to ring
-    rx_oversized: u64,     // RX frames where desc.len > 1514
-    rx_max_frame: u32,     // max desc.len seen in RX
-    tx_max_frame: u32,     // max frame len submitted to TX
-    seg_needed_but_none: u64, // oversized frames where segmentation returned None
-    wan_return_hits: u64,  // session hits for WAN return traffic (first N logged)
-    #[allow(dead_code)]
-    wan_return_misses: u64, // session misses for WAN return traffic
-    rx_tcp_fin: u64,       // TCP FIN flags seen in RX
-    rx_tcp_synack: u64,    // TCP SYN+ACK seen in RX
-    rx_tcp_zero_window: u64, // TCP zero-window seen in RX (forwarded frames)
-    fwd_tcp_fin: u64,      // TCP FIN in forwarded frames
-    fwd_tcp_rst: u64,      // TCP RST in forwarded frames
-    fwd_tcp_zero_window: u64, // zero-window in forwarded frames
 }
 
 fn poll_binding(
