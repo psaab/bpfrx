@@ -151,7 +151,11 @@ fn interface_uses_generic_xdp(ifindex: u32) -> bool {
     };
     let rc = unsafe { libbpf_sys::bpf_xdp_query(ifindex as c_int, 0, &mut opts) };
     if rc != 0 {
-        return false;
+        eprintln!(
+            "bpfrx-userspace-dp: bpf_xdp_query(ifindex={}) failed rc={} — assuming generic XDP",
+            ifindex, rc
+        );
+        return true;
     }
     opts.attach_mode == libbpf_sys::XDP_ATTACHED_SKB as u8
 }
