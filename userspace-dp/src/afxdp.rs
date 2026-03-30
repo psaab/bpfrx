@@ -3728,42 +3728,11 @@ fn poll_binding(
                             nat: NatDecision::default(),
                         }
                     };
-                    // HA failover disposition tracking
-                    {
-                        static DISP_LOG: std::sync::atomic::AtomicU64 =
-                            std::sync::atomic::AtomicU64::new(0);
-                        let n = DISP_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n == 0 || (n > 0 && n % 100000 == 0) {
-                            eprintln!(
-                                "bpfrx-ha: disposition sample #{}: {:?} egress_if={} proto={}",
-                                n,
-                                decision.resolution.disposition,
-                                decision.resolution.egress_ifindex,
-                                meta.protocol,
-                            );
-                        }
-                    }
-                    // Convert HAInactive to FabricRedirect BEFORE the forward/drop
-                    // branch. When the owner RG is demoted, existing sessions resolve
-                    // as HAInactive. Instead of dropping, redirect to the fabric peer
-                    // that now owns the RG. This is the critical path for existing TCP
-                    // sessions surviving RG failover.
-                    if decision.resolution.disposition == ForwardingDisposition::HAInactive
-                        && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
-                    {
-                        if let Some(redirect) = resolve_fabric_redirect(forwarding) {
-                            static HA_REDIRECT_LOG: std::sync::atomic::AtomicU64 =
-                                std::sync::atomic::AtomicU64::new(0);
-                            let n = HA_REDIRECT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if n < 5 || n % 10000 == 0 {
-                                eprintln!(
-                                    "bpfrx-ha: HAInactive->FabricRedirect #{} egress_if={} fabric_if={}",
-                                    n, decision.resolution.egress_ifindex, redirect.egress_ifindex,
-                                );
-                            }
-                            decision.resolution = redirect;
-                        }
-                    }
+                    // NOTE: HAInactive fabric redirect is handled by the eBPF pipeline
+                    // via rg_active checks + try_fabric_redirect(). The ctrl-disable
+                    // on demotion ensures the eBPF pipeline handles the transition.
+                    // Do NOT convert HAInactive→FabricRedirect here — it causes
+                    // false redirects during startup when HA watchdog hasn't started.
                     if matches!(
                         decision.resolution.disposition,
                         ForwardingDisposition::ForwardCandidate
