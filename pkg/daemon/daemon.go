@@ -4146,11 +4146,20 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 					slog.Info("event stream drain complete", "rg", rgID, "seq", drainSeq)
 					streamDrained = true
 				}
-				// Resume the helper stream regardless.
+			}
+		}
+	}
+	// Defer event stream resume until after the final barrier +
+	// PrepareRGDemotion to avoid reopening the event stream during
+	// the handoff window (#276).
+	deferredResume := func() {
+		if provider, ok := d.dp.(userspaceEventStreamProvider); ok {
+			if es := provider.EventStream(); es != nil && es.IsConnected() {
 				_ = es.SendResume()
 			}
 		}
 	}
+	defer deferredResume()
 
 	if !streamDrained {
 		// Fallback: RPC-based export + drain.

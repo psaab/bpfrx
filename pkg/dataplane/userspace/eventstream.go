@@ -169,6 +169,11 @@ func (es *EventStream) acceptLoop(ctx context.Context) {
 		es.conn = conn
 		es.connected.Store(true)
 		es.ackBatch.Store(0)
+		// Reset sequence tracking for the new connection so stale
+		// watermarks from a previous helper don't cause gaps (#280).
+		es.lastRecvSeq.Store(0)
+		es.lastAppliedSeq.Store(0)
+		es.lastAckSeq.Store(0)
 		es.mu.Unlock()
 
 		// Run the reader and ack loops for this connection.

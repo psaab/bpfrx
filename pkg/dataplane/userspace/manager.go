@@ -64,6 +64,8 @@ type Manager struct {
 	deferWorkers       bool // skip worker spawn until NotifyLinkCycle
 	xskBoundNotified   bool // OnXSKBound fired at most once
 
+	pendingRGTransition bool // set before syncHAStateLocked, cleared on success
+
 	eventStream       *EventStream
 	eventStreamCancel context.CancelFunc
 
@@ -2676,6 +2678,16 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	// dispositions during startup when the watchdog hasn't started yet,
 	// leading to FabricRedirect for sessions that should forward locally.
 	if err := m.inner.UpdateRGActive(rgID, active); err != nil {
+		if !active {
+			// Rollback: re-enable ctrl and restore XDP shim since the
+			// demotion failed (#278).
+			m.mu.Lock()
+			m.reEnableUserspaceCtrlLocked()
+			_ = m.inner.SwapXDPEntryProg("xdp_userspace_prog")
+			m.mu.Unlock()
+			slog.Warn("userspace: rolled back ctrl disable after UpdateRGActive failure",
+				"rg", rgID, "err", err)
+		}
 		return err
 	}
 	m.mu.Lock()
@@ -2704,7 +2716,12 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	// ctrl disable during RG transition doesn't create stale sessions.
 	slog.Info("userspace: reset ctrl liveness for post-RG-transition re-verification",
 		"rg", rgID, "active", active)
-	return m.syncHAStateLocked()
+	m.pendingRGTransition = true
+	if err := m.syncHAStateLocked(); err != nil {
+		return err
+	}
+	m.pendingRGTransition = false
+	return nil
 }
 
 func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error {
@@ -2894,7 +2911,12 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		FIBGeneration:      status.LastFIBGeneration,
 		HeartbeatTimeoutMS: 30000,
 	}
-	if status.Enabled {
+	if status.Enabled && m.pendingRGTransition {
+		// An RG transition is in progress and the helper hasn't acked the
+		// HA state update yet. Keep ctrl disabled until syncHAStateLocked
+		// succeeds to avoid re-enabling ctrl during the handoff (#279).
+		ctrl.Enabled = 0
+	} else if status.Enabled {
 		// Delay ctrl enable until AFTER VIPs are configured in HA mode.
 		// The VRRP election + VIP add takes ~10-14s after restart.
 		// If we enable ctrl before VIPs, the XSK path gets packets but
@@ -3061,9 +3083,6 @@ ctrlReady:
 				copy(key, nextKey)
 				_ = usMap.Delete(key)
 				deleted++
-				if deleted > 100000 {
-					break
-				}
 			}
 			if deleted > 0 {
 				slog.Info("userspace: flushed stale BPF session entries on ctrl enable",
@@ -3085,9 +3104,6 @@ ctrlReady:
 					copy(key, nextKey)
 					_ = ctMap.Delete(key)
 					deleted++
-					if deleted > 200000 {
-						break
-					}
 				}
 				if deleted > 0 {
 					slog.Info("userspace: flushed stale BPF conntrack on ctrl enable",
@@ -4753,6 +4769,23 @@ func (m *Manager) disableUserspaceCtrlLocked() {
 	ctrl.Enabled = 0
 	_ = ctrlMap.Update(zero, ctrl, ebpf.UpdateAny)
 	slog.Info("userspace: disabled ctrl (helper stopping)")
+}
+
+// reEnableUserspaceCtrlLocked sets ctrl.enabled=1 in the BPF map.
+// Used to rollback a ctrl disable when the subsequent operation fails.
+func (m *Manager) reEnableUserspaceCtrlLocked() {
+	ctrlMap := m.inner.Map("userspace_ctrl")
+	if ctrlMap == nil {
+		return
+	}
+	zero := uint32(0)
+	var ctrl userspaceCtrlValue
+	if err := ctrlMap.Lookup(zero, &ctrl); err != nil {
+		return
+	}
+	ctrl.Enabled = 1
+	_ = ctrlMap.Update(zero, ctrl, ebpf.UpdateAny)
+	slog.Info("userspace: re-enabled ctrl (rollback)")
 }
 
 // DisableAndStopHelper disables ctrl and swaps to the eBPF pipeline entry
