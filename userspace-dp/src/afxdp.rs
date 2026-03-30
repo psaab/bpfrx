@@ -49,6 +49,45 @@ macro_rules! debug_log {
     };
 }
 
+pub(super) fn wan80_debug_ip(ip: IpAddr) -> bool {
+    matches!(
+        ip,
+        IpAddr::V4(v4)
+            if v4 == Ipv4Addr::new(172, 16, 80, 200)
+                || v4 == Ipv4Addr::new(172, 16, 80, 8)
+                || v4 == Ipv4Addr::new(10, 0, 61, 102)
+    )
+}
+
+pub(super) fn wan80_debug_key(key: &SessionKey) -> bool {
+    key.protocol == PROTO_ICMP && (wan80_debug_ip(key.src_ip) || wan80_debug_ip(key.dst_ip))
+}
+
+fn wan80_debug_flow(flow: &SessionFlow) -> bool {
+    wan80_debug_key(&flow.forward_key)
+}
+
+pub(super) fn wan80_debug_frame(frame: &[u8]) -> bool {
+    let mut l3 = 14usize;
+    if frame.len() < l3 + 20 {
+        return false;
+    }
+    let mut ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    if ethertype == 0x8100 {
+        l3 = 18;
+        if frame.len() < l3 + 20 {
+            return false;
+        }
+        ethertype = u16::from_be_bytes([frame[16], frame[17]]);
+    }
+    if ethertype != 0x0800 {
+        return false;
+    }
+    let src = Ipv4Addr::new(frame[l3 + 12], frame[l3 + 13], frame[l3 + 14], frame[l3 + 15]);
+    let dst = Ipv4Addr::new(frame[l3 + 16], frame[l3 + 17], frame[l3 + 18], frame[l3 + 19]);
+    wan80_debug_ip(IpAddr::V4(src)) || wan80_debug_ip(IpAddr::V4(dst))
+}
+
 #[path = "afxdp/bind.rs"]
 mod bind;
 #[path = "afxdp/bpf_map.rs"]
@@ -3701,17 +3740,18 @@ fn poll_binding(
                             decision
                         }
                     } else {
+                        let raw_non_flow_resolution = resolve_forwarding(
+                            unsafe { &*area },
+                            desc,
+                            meta,
+                            forwarding,
+                            dynamic_neighbors,
+                        );
                         let non_flow_resolution = enforce_ha_resolution_snapshot(
                             forwarding,
                             ha_state,
                             now_secs,
-                            resolve_forwarding(
-                                unsafe { &*area },
-                                desc,
-                                meta,
-                                forwarding,
-                                dynamic_neighbors,
-                            ),
+                            raw_non_flow_resolution,
                         );
                         // For non-flow packets (no L4 ports), also attempt fabric
                         // redirect when the egress RG is inactive.
@@ -3728,6 +3768,31 @@ fn poll_binding(
                             nat: NatDecision::default(),
                         }
                     };
+                    if let Some(flow) = flow.as_ref()
+                        && wan80_debug_flow(flow)
+                    {
+                        let reason = match decision.resolution.disposition {
+                            ForwardingDisposition::ForwardCandidate => "wan80_decision_forward",
+                            ForwardingDisposition::FabricRedirect => "wan80_decision_fabric",
+                            ForwardingDisposition::HAInactive => "wan80_decision_hainactive",
+                            ForwardingDisposition::LocalDelivery => "wan80_decision_local",
+                            ForwardingDisposition::MissingNeighbor => "wan80_decision_missing_neighbor",
+                            ForwardingDisposition::NoRoute => "wan80_decision_no_route",
+                            ForwardingDisposition::NextTableUnsupported => {
+                                "wan80_decision_next_table"
+                            }
+                            ForwardingDisposition::PolicyDenied => "wan80_decision_policy",
+                            ForwardingDisposition::DiscardRoute => "wan80_decision_discard",
+                        };
+                        record_exception(
+                            recent_exceptions,
+                            &ident,
+                            reason,
+                            desc.len as u32,
+                            Some(meta),
+                            debug.as_ref(),
+                        );
+                    }
                     // NOTE: HAInactive fabric redirect is handled by the eBPF pipeline
                     // via rg_active checks + try_fabric_redirect(). The ctrl-disable
                     // on demotion ensures the eBPF pipeline handles the transition.

@@ -1380,6 +1380,24 @@ pub(super) fn resolve_flow_session_decision(
                 tcp_flags,
             )
         };
+        if wan80_debug_flow(flow) {
+            eprintln!(
+                "WAN80 SESSION_HIT ingress_if={} {}:{} -> {}:{} shared={} synced={} reverse={} created=false disposition={:?} egress_if={} tx_if={} nat_s={:?} nat_d={:?}",
+                ingress_ifindex,
+                flow.src_ip,
+                flow.forward_key.src_port,
+                flow.dst_ip,
+                flow.forward_key.dst_port,
+                hit.shared_entry.is_some(),
+                metadata.synced,
+                metadata.is_reverse,
+                decision.resolution.disposition,
+                decision.resolution.egress_ifindex,
+                decision.resolution.tx_ifindex,
+                decision.nat.rewrite_src,
+                decision.nat.rewrite_dst,
+            );
+        }
         return Some(ResolvedFlowSessionDecision {
             decision,
             metadata,
@@ -1387,8 +1405,35 @@ pub(super) fn resolve_flow_session_decision(
         });
     }
 
-    let forward_match =
-        lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &flow.forward_key)?;
+    let Some(forward_match) =
+        lookup_forward_nat_across_scopes(sessions, shared_nat_sessions, &flow.forward_key)
+    else {
+        if wan80_debug_flow(flow) {
+            eprintln!(
+                "WAN80 SESSION_MISS ingress_if={} {}:{} -> {}:{} no_forward_nat_match",
+                ingress_ifindex,
+                flow.src_ip,
+                flow.forward_key.src_port,
+                flow.dst_ip,
+                flow.forward_key.dst_port,
+            );
+        }
+        return None;
+    };
+    if wan80_debug_flow(flow) {
+        eprintln!(
+            "WAN80 NAT_REVERSE_MATCH ingress_if={} {}:{} -> {}:{} match_src={} match_dst={} nat_s={:?} nat_d={:?}",
+            ingress_ifindex,
+            flow.src_ip,
+            flow.forward_key.src_port,
+            flow.dst_ip,
+            flow.forward_key.dst_port,
+            forward_match.key.src_ip,
+            forward_match.key.dst_ip,
+            forward_match.decision.nat.rewrite_src,
+            forward_match.decision.nat.rewrite_dst,
+        );
+    }
     let resolved = install_reverse_session_from_forward_match(
         sessions,
         session_map_fd,
@@ -1450,6 +1495,23 @@ pub(super) fn resolve_flow_session_decision(
         protocol,
         tcp_flags,
     );
+    if wan80_debug_flow(flow) {
+        eprintln!(
+            "WAN80 SESSION_CREATE ingress_if={} {}:{} -> {}:{} synced={} reverse={} created=true disposition={:?} egress_if={} tx_if={} nat_s={:?} nat_d={:?}",
+            ingress_ifindex,
+            flow.src_ip,
+            flow.forward_key.src_port,
+            flow.dst_ip,
+            flow.forward_key.dst_port,
+            metadata.synced,
+            metadata.is_reverse,
+            decision.resolution.disposition,
+            decision.resolution.egress_ifindex,
+            decision.resolution.tx_ifindex,
+            decision.nat.rewrite_src,
+            decision.nat.rewrite_dst,
+        );
+    }
     Some(ResolvedFlowSessionDecision {
         decision,
         metadata,

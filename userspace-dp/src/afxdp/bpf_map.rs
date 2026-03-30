@@ -1,5 +1,19 @@
 use super::*;
 
+fn wan80_debug_ip(ip: &IpAddr) -> bool {
+    matches!(
+        ip,
+        IpAddr::V4(v4)
+            if *v4 == Ipv4Addr::new(172, 16, 80, 200)
+                || *v4 == Ipv4Addr::new(172, 16, 80, 8)
+                || *v4 == Ipv4Addr::new(10, 0, 61, 102)
+    )
+}
+
+fn wan80_debug_session_key(key: &SessionKey) -> bool {
+    wan80_debug_ip(&key.src_ip) || wan80_debug_ip(&key.dst_ip)
+}
+
 fn uses_kernel_local_session_map_entry(
     decision: SessionDecision,
     metadata: &SessionMetadata,
@@ -277,6 +291,17 @@ pub(super) fn publish_session_map_key(
     key: &SessionKey,
     value: u8,
 ) -> io::Result<()> {
+    if wan80_debug_session_key(key) {
+        eprintln!(
+            "WAN80 BPF_PUBLISH map_fd={} {}:{} -> {}:{} value={}",
+            map_fd,
+            key.src_ip,
+            key.src_port,
+            key.dst_ip,
+            key.dst_port,
+            value,
+        );
+    }
     let map_key = session_map_key(key);
     let rc = unsafe {
         libbpf_sys::bpf_map_update_elem(
@@ -534,6 +559,16 @@ pub(super) fn read_fallback_stats() -> Option<Vec<(String, u64)>> {
 }
 
 pub(super) fn delete_live_session_key(map_fd: c_int, key: &SessionKey) {
+    if wan80_debug_session_key(key) {
+        eprintln!(
+            "WAN80 BPF_DELETE map_fd={} {}:{} -> {}:{}",
+            map_fd,
+            key.src_ip,
+            key.src_port,
+            key.dst_ip,
+            key.dst_port,
+        );
+    }
     let map_key = session_map_key(key);
     let _ = unsafe {
         libbpf_sys::bpf_map_delete_elem(

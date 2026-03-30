@@ -1,5 +1,18 @@
 use super::*;
 
+fn wan80_flow_key(flow_key: &Option<SessionKey>) -> Option<&SessionKey> {
+    let key = flow_key.as_ref()?;
+    match (key.src_ip, key.dst_ip) {
+        (IpAddr::V4(src), IpAddr::V4(dst))
+            if src == Ipv4Addr::new(172, 16, 80, 200)
+                || dst == Ipv4Addr::new(172, 16, 80, 200) =>
+        {
+            Some(key)
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn reap_tx_completions(
     binding: &mut BindingWorker,
     shared_recycles: &mut Vec<(u32, u64)>,
@@ -30,6 +43,15 @@ pub(super) fn reap_tx_completions(
         .live
         .tx_completions
         .fetch_add(reaped as u64, Ordering::Relaxed);
+    if reaped > 0 && binding.identity().ifindex == 6 {
+        eprintln!(
+            "WAN80 TX_COMP if={} q={} reaped={} outstanding={}",
+            binding.identity().ifindex,
+            binding.identity().queue_id,
+            reaped,
+            binding.outstanding_tx
+        );
+    }
     update_binding_debug_state(binding);
     reaped
 }
@@ -469,10 +491,34 @@ pub(super) fn transmit_batch(
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
     let mut retry_tail = Vec::new();
+    let tx_ifindex = binding.identity().ifindex;
+    let tx_queue_id = binding.identity().queue_id;
     for (idx, (offset, req)) in binding.scratch_local_tx.drain(..).enumerate() {
         if idx < inserted as usize {
             sent_packets += 1;
             sent_bytes += req.bytes.len() as u64;
+            if let Some(flow_key) = wan80_flow_key(&req.flow_key) {
+                eprintln!(
+                    "WAN80 TX_LOCAL_SUBMIT if={} q={} len={} flow={}:{} -> {}:{} frame_match={}",
+                    tx_ifindex,
+                    tx_queue_id,
+                    req.bytes.len(),
+                    flow_key.src_ip,
+                    flow_key.src_port,
+                    flow_key.dst_ip,
+                    flow_key.dst_port,
+                    wan80_debug_frame(&req.bytes),
+                );
+            }
+            if wan80_debug_frame(&req.bytes) {
+                eprintln!(
+                    "WAN80 TX_LOCAL if={} q={} len={} {}",
+                    tx_ifindex,
+                    tx_queue_id,
+                    req.bytes.len(),
+                    decode_frame_summary(&req.bytes),
+                );
+            }
         } else {
             binding.free_tx_frames.push_front(offset);
             retry_tail.push(req);
@@ -605,11 +651,56 @@ pub(super) fn transmit_prepared_batch(
     let mut sent_packets = 0u64;
     let mut sent_bytes = 0u64;
     let mut retry_tail = Vec::new();
+    let tx_ifindex = binding.identity().ifindex;
+    let tx_queue_id = binding.identity().queue_id;
     for (idx, req) in binding.scratch_prepared_tx.drain(..).enumerate() {
         if idx < inserted as usize {
             remember_prepared_recycle(&mut binding.in_flight_prepared_recycles, &req);
             sent_packets += 1;
             sent_bytes += req.len as u64;
+            if let Some(flow_key) = wan80_flow_key(&req.flow_key) {
+                let frame_match = binding
+                    .umem
+                    .area()
+                    .slice(req.offset as usize, req.len as usize)
+                    .map(wan80_debug_frame)
+                    .unwrap_or(false);
+                eprintln!(
+                    "WAN80 TX_PREP_SUBMIT if={} q={} len={} flow={}:{} -> {}:{} frame_match={}",
+                    tx_ifindex,
+                    tx_queue_id,
+                    req.len,
+                    flow_key.src_ip,
+                    flow_key.src_port,
+                    flow_key.dst_ip,
+                    flow_key.dst_port,
+                    frame_match,
+                );
+            }
+            if let Some(frame_data) = binding
+                .umem
+                .area()
+                .slice(req.offset as usize, req.len as usize)
+                && wan80_debug_frame(frame_data)
+            {
+                let hex_len = (req.len as usize).min(frame_data.len()).min(80);
+                let hex: String = frame_data[..hex_len]
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!(
+                    "WAN80 TX_PREP if={} q={} len={} {}",
+                    tx_ifindex,
+                    tx_queue_id,
+                    req.len,
+                    decode_frame_summary(frame_data),
+                );
+                eprintln!(
+                    "WAN80 TX_HEX if={} q={} len={} {}",
+                    tx_ifindex, tx_queue_id, req.len, hex
+                );
+            }
         } else {
             retry_tail.push(req);
         }
@@ -625,8 +716,9 @@ pub(super) fn transmit_prepared_batch(
 
 pub(super) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, now_ns: u64) {
     let bind_mode = XskBindMode::from_u8(binding.live.bind_mode.load(Ordering::Relaxed));
+    let needs_wakeup = binding.tx.needs_wakeup();
     if !bind_mode.is_zerocopy()
-        || binding.tx.needs_wakeup()
+        || needs_wakeup
         || force
         || now_ns.saturating_sub(binding.last_tx_wake_ns) >= TX_WAKE_MIN_INTERVAL_NS
     {
@@ -643,6 +735,25 @@ pub(super) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, now_ns: u6
             )
         };
         binding.dbg_sendto_calls += 1;
+        if binding.ifindex == 6 {
+            let errno = if rc < 0 {
+                unsafe { *libc::__errno_location() }
+            } else {
+                0
+            };
+            eprintln!(
+                "WAN80 TX_KICK if={} q={} rc={} errno={} needs_wakeup={} force={} bind_mode={} outstanding_tx={} free_tx={}",
+                binding.ifindex,
+                binding.queue_id,
+                rc,
+                errno,
+                needs_wakeup,
+                force,
+                bind_mode.as_u8(),
+                binding.outstanding_tx,
+                binding.free_tx_frames.len(),
+            );
+        }
         if rc < 0 {
             let errno = unsafe { *libc::__errno_location() };
             // EAGAIN/EWOULDBLOCK is normal for MSG_DONTWAIT; ENOBUFS means kernel dropped.

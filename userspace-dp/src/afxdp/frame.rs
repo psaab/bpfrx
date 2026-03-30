@@ -779,6 +779,16 @@ pub(super) fn handle_forward_build_failure(
         None,
     );
     if fallback_to_slow_path {
+        if wan80_debug_frame(frame) {
+            record_exception(
+                recent_exceptions,
+                binding,
+                "wan80_build_fail",
+                packet_length,
+                Some(meta),
+                None,
+            );
+        }
         maybe_reinject_slow_path_from_frame(
             binding,
             live,
@@ -957,6 +967,16 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
     match slow_path.enqueue(packet) {
         Ok(EnqueueOutcome::Accepted) => {
             live.record_slow_path_accept(decision.resolution.disposition, reason, packet_len);
+            if wan80_debug_frame(frame) {
+                record_exception(
+                    recent_exceptions,
+                    binding,
+                    "wan80_slow_accept",
+                    frame.len() as u32,
+                    Some(meta),
+                    None,
+                );
+            }
         }
         Ok(EnqueueOutcome::RateLimited) => {
             live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
@@ -1248,7 +1268,28 @@ pub(super) fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
 
 /// Decode an Ethernet frame into a human-readable summary showing IP src/dst,
 /// TCP/UDP ports, TCP flags, and checksums. For debugging packet forwarding.
+fn format_mac(bytes: &[u8]) -> String {
+    bytes.iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 pub(super) fn decode_frame_summary(frame: &[u8]) -> String {
+    let l2_prefix = if frame.len() >= 14 {
+        let dst_mac = format_mac(&frame[0..6]);
+        let src_mac = format_mac(&frame[6..12]);
+        let eth_proto = u16::from_be_bytes([frame[12], frame[13]]);
+        if matches!(eth_proto, 0x8100 | 0x88a8) && frame.len() >= 18 {
+            let vlan_tci = u16::from_be_bytes([frame[14], frame[15]]);
+            let vlan_id = vlan_tci & 0x0fff;
+            format!("ETH {src_mac} -> {dst_mac} vlan={vlan_id} ")
+        } else {
+            format!("ETH {src_mac} -> {dst_mac} ")
+        }
+    } else {
+        String::new()
+    };
     let l3 = match frame_l3_offset(frame) {
         Some(off) => off,
         None => return String::new(),
@@ -1263,6 +1304,11 @@ pub(super) fn decode_frame_summary(frame: &[u8]) -> String {
         let total_len = u16::from_be_bytes([ip[2], ip[3]]);
         let protocol = ip[9];
         let ip_csum = u16::from_be_bytes([ip[10], ip[11]]);
+        let ip_csum_ok = ip
+            .get(..ihl)
+            .map(checksum16)
+            .map(|sum| sum == 0)
+            .unwrap_or(false);
         let src = format!("{}.{}.{}.{}", ip[12], ip[13], ip[14], ip[15]);
         let dst = format!("{}.{}.{}.{}", ip[16], ip[17], ip[18], ip[19]);
         let ttl = ip[8];
@@ -1277,25 +1323,37 @@ pub(super) fn decode_frame_summary(frame: &[u8]) -> String {
                 let tcp_csum = u16::from_be_bytes([l4[16], l4[17]]);
                 let flag_str = tcp_flags_str(flags);
                 format!(
-                    "IPv4 {}:{} -> {}:{} TCP [{flag_str}] seq={seq} ack={ack} ttl={ttl} ip_csum={ip_csum:#06x} tcp_csum={tcp_csum:#06x} ip_len={total_len}",
-                    src, sport, dst, dport,
+                    "{l2_prefix}IPv4 {}:{} -> {}:{} TCP [{flag_str}] seq={seq} ack={ack} ttl={ttl} ip_csum={ip_csum:#06x} ip_ok={} tcp_csum={tcp_csum:#06x} ip_len={total_len}",
+                    src, sport, dst, dport, ip_csum_ok,
                 )
             } else if protocol == PROTO_UDP {
                 let udp_csum = u16::from_be_bytes([l4[6], l4[7]]);
                 format!(
-                    "IPv4 {}:{} -> {}:{} UDP ttl={ttl} ip_csum={ip_csum:#06x} udp_csum={udp_csum:#06x} ip_len={total_len}",
-                    src, sport, dst, dport,
+                    "{l2_prefix}IPv4 {}:{} -> {}:{} UDP ttl={ttl} ip_csum={ip_csum:#06x} ip_ok={} udp_csum={udp_csum:#06x} ip_len={total_len}",
+                    src, sport, dst, dport, ip_csum_ok,
                 )
             } else {
                 format!(
-                    "IPv4 {} -> {} proto={protocol} ttl={ttl} ip_len={total_len}",
-                    src, dst
+                    "{l2_prefix}IPv4 {} -> {} proto={protocol} ttl={ttl} ip_ok={} ip_len={total_len}",
+                    src, dst, ip_csum_ok
                 )
             }
+        } else if protocol == PROTO_ICMP && ip.len() >= ihl + 8 {
+            let l4 = &ip[ihl..];
+            let icmp_type = l4[0];
+            let icmp_code = l4[1];
+            let icmp_csum = u16::from_be_bytes([l4[2], l4[3]]);
+            let icmp_csum_ok = checksum16(l4) == 0;
+            let ident = u16::from_be_bytes([l4[4], l4[5]]);
+            let seq = u16::from_be_bytes([l4[6], l4[7]]);
+            format!(
+                "{l2_prefix}IPv4 {} -> {} ICMP type={} code={} id={} seq={} ttl={} ip_csum={ip_csum:#06x} ip_ok={} icmp_csum={icmp_csum:#06x} icmp_ok={} ip_len={total_len}",
+                src, dst, icmp_type, icmp_code, ident, seq, ttl, ip_csum_ok, icmp_csum_ok,
+            )
         } else {
             format!(
-                "IPv4 {} -> {} proto={protocol} ttl={ttl} ip_len={total_len}",
-                src, dst
+                "{l2_prefix}IPv4 {} -> {} proto={protocol} ttl={ttl} ip_ok={} ip_len={total_len}",
+                src, dst, ip_csum_ok
             )
         }
     } else if version == 6 && ip.len() >= 40 {
@@ -1312,15 +1370,17 @@ pub(super) fn decode_frame_summary(frame: &[u8]) -> String {
                 let flags = l4[13];
                 let flag_str = tcp_flags_str(flags);
                 format!(
-                    "IPv6 [{src}]:{sport} -> [{dst}]:{dport} TCP [{flag_str}] hop={hop_limit} pl={payload_len}"
+                    "{l2_prefix}IPv6 [{src}]:{sport} -> [{dst}]:{dport} TCP [{flag_str}] hop={hop_limit} pl={payload_len}"
                 )
             } else {
                 format!(
-                    "IPv6 [{src}]:{sport} -> [{dst}]:{dport} proto={next_header} hop={hop_limit} pl={payload_len}"
+                    "{l2_prefix}IPv6 [{src}]:{sport} -> [{dst}]:{dport} proto={next_header} hop={hop_limit} pl={payload_len}"
                 )
             }
         } else {
-            format!("IPv6 [{src}] -> [{dst}] proto={next_header} hop={hop_limit} pl={payload_len}")
+            format!(
+                "{l2_prefix}IPv6 [{src}] -> [{dst}] proto={next_header} hop={hop_limit} pl={payload_len}"
+            )
         }
     } else {
         String::new()
@@ -3858,6 +3918,16 @@ pub(super) fn recompute_l4_checksum_ipv4(
                 .get_mut(ihl + 6..ihl + 8)?
                 .copy_from_slice(&sum.to_be_bytes());
         }
+        PROTO_ICMP => {
+            if segment.len() < 4 {
+                return None;
+            }
+            packet.get_mut(ihl + 2..ihl + 4)?.copy_from_slice(&[0, 0]);
+            let sum = checksum16(packet.get(ihl..)?);
+            packet
+                .get_mut(ihl + 2..ihl + 4)?
+                .copy_from_slice(&sum.to_be_bytes());
+        }
         _ => {}
     }
     Some(())
@@ -5089,6 +5159,34 @@ mod tests {
     }
 
     #[test]
+    fn apply_nat_ipv4_keeps_icmp_checksum_valid() {
+        let mut packet = vec![
+            0x45, 0x00, 0x00, 0x20, 0x12, 0x34, 0x00, 0x00, 64, PROTO_ICMP, 0x00, 0x00, 10, 0,
+            61, 102, 172, 16, 80, 200, 8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01, b't', b'e', b's',
+            b't',
+        ];
+        let ip_sum = checksum16(&packet[..20]);
+        packet[10] = (ip_sum >> 8) as u8;
+        packet[11] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut packet, 20, PROTO_ICMP, false).expect("initial icmp sum");
+        assert_eq!(checksum16(&packet[20..]), 0);
+
+        apply_nat_ipv4(
+            &mut packet,
+            PROTO_ICMP,
+            NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_dst: None,
+                ..NatDecision::default()
+            },
+        )
+        .expect("apply nat");
+
+        assert_eq!(&packet[12..16], &[172, 16, 80, 8]);
+        assert_eq!(checksum16(&packet[20..]), 0);
+    }
+
+    #[test]
     fn extract_l3_packet_with_nat_rewrites_reverse_snat_reply_v4() {
         let mut frame = Vec::new();
         write_eth_header(
@@ -5328,6 +5426,86 @@ mod tests {
             "2001:559:8585:80::8".parse::<Ipv6Addr>().unwrap()
         );
         assert!(icmpv6_checksum_ok(&out[18..]));
+    }
+
+    #[test]
+    fn build_forwarded_frame_into_keeps_icmpv4_checksum_valid_after_vlan_snat() {
+        let src_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let dst_ip = Ipv4Addr::new(172, 16, 80, 200);
+
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            0,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x20, 0x12, 0x34, 0x00, 0x00, 64, PROTO_ICMP, 0x00, 0x00,
+        ]);
+        frame.extend_from_slice(&src_ip.octets());
+        frame.extend_from_slice(&dst_ip.octets());
+        frame.extend_from_slice(&[8, 0, 0, 0, 0x12, 0x34, 0x00, 0x01, b't', b'e', b's', b't']);
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_ICMP, false).expect("icmp sum");
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            flow_src_port: 0x1234,
+            flow_dst_port: 0,
+            ..UserspaceDpMeta::default()
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(dst_ip)),
+                neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_dst: None,
+                ..NatDecision::default()
+            },
+        };
+        let mut out = [0u8; 256];
+        let frame_len = build_forwarded_frame_into(
+            &mut out,
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &decision,
+            &ForwardingState::default(),
+            None,
+        )
+        .expect("forwarded frame");
+
+        let out = &out[..frame_len];
+        assert_eq!(&out[30..34], &[172, 16, 80, 8]);
+        assert_eq!(out[26], 63);
+        assert_eq!(checksum16(&out[18 + 20..]), 0);
     }
 
     #[test]
