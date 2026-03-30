@@ -3,6 +3,7 @@ use crate::xsk_ffi::{self, DeviceQueue, IfInfo, RingRx, RingTx, SocketConfig};
 use std::path::Path;
 
 const AUTO_BIND_FLAGS: [u16; 1] = [0];
+const COPY_ONLY_BIND_FLAGS: [u16; 1] = [XSK_BIND_FLAGS_COPY];
 const EXPLICIT_MODE_BIND_FLAGS: [u16; 2] = [XSK_BIND_FLAGS_ZEROCOPY, XSK_BIND_FLAGS_COPY];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +76,7 @@ pub(super) fn open_binding_worker_rings(
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
-    let bind_flag_candidates = bind_flag_candidates_for_driver(driver_name);
+    let bind_flag_candidates = bind_flag_candidates_for_interface(info, driver_name);
     let mut strategies = vec![bind_strategy];
     if let Some(fallback_strategy) = alternate_bind_strategy(driver_name, bind_strategy) {
         strategies.push(fallback_strategy);
@@ -123,11 +124,36 @@ pub(super) fn open_binding_worker_rings(
     Err(last_err.unwrap_or_else(|| "AF_XDP bind: no attempts executed".into()))
 }
 
+pub(super) fn bind_flag_candidates_for_interface(
+    info: &IfInfo,
+    driver: Option<&str>,
+) -> &'static [u16] {
+    if interface_uses_generic_xdp(info.ifindex()) {
+        return match driver {
+            Some("virtio_net") => &AUTO_BIND_FLAGS,
+            _ => &COPY_ONLY_BIND_FLAGS,
+        };
+    }
+    bind_flag_candidates_for_driver(driver)
+}
+
 pub(super) fn bind_flag_candidates_for_driver(driver: Option<&str>) -> &'static [u16] {
     match driver {
         Some("virtio_net") => &AUTO_BIND_FLAGS,
         _ => &EXPLICIT_MODE_BIND_FLAGS,
     }
+}
+
+fn interface_uses_generic_xdp(ifindex: u32) -> bool {
+    let mut opts = libbpf_sys::bpf_xdp_query_opts {
+        sz: core::mem::size_of::<libbpf_sys::bpf_xdp_query_opts>() as _,
+        ..Default::default()
+    };
+    let rc = unsafe { libbpf_sys::bpf_xdp_query(ifindex as c_int, 0, &mut opts) };
+    if rc != 0 {
+        return false;
+    }
+    opts.attach_mode == libbpf_sys::XDP_ATTACHED_SKB as u8
 }
 
 fn describe_bind_flags(flags: u16) -> &'static str {
