@@ -62,9 +62,15 @@ type Manager struct {
 	publishedSnapshot  uint64
 	publishedPlanKey   string
 	deferWorkers       bool // skip worker spawn until NotifyLinkCycle
+	xskBoundNotified   bool // OnXSKBound fired at most once
 
 	eventStream       *EventStream
 	eventStreamCancel context.CancelFunc
+
+	// OnXSKBound is called once when all XSK bindings are bound.
+	// Used by the daemon to defer IPVLAN creation until after XSK
+	// binds in zerocopy mode on fabric parents.
+	OnXSKBound func()
 }
 
 func New() *Manager {
@@ -82,6 +88,15 @@ func (m *Manager) EventStream() *EventStream {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.eventStream
+}
+
+// XSKBoundNotified reports whether the OnXSKBound callback has already fired.
+// The daemon uses this to distinguish first applyConfig (defer IPVLAN) from
+// subsequent calls (reconcile normally).
+func (m *Manager) XSKBoundNotified() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.xskBoundNotified
 }
 
 func (m *Manager) SessionSyncSweepProfile() (bool, time.Duration, time.Duration) {
@@ -287,6 +302,33 @@ func (m *Manager) bumpGeneration() uint64 {
 	defer m.mu.Unlock()
 	m.generation++
 	return m.generation
+}
+
+// BumpFIBGeneration updates the BPF FIB generation counter AND rebuilds the
+// userspace snapshot with fresh routes/neighbors from the kernel.  The eBPF
+// pipeline reads FIB generation from the BPF map directly, but the userspace
+// worker receives route/neighbor data via snapshots — so we must republish.
+func (m *Manager) BumpFIBGeneration() {
+	m.inner.BumpFIBGeneration()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
+		return
+	}
+	if m.proc == nil || m.proc.Process == nil {
+		return
+	}
+
+	// Rebuild snapshot with fresh routes/neighbors from kernel tables.
+	m.generation++
+	snap := buildSnapshot(m.lastSnapshot.Config, m.cfg, m.generation, m.readFIBGeneration())
+	m.lastSnapshot = snap
+
+	if err := m.syncSnapshotLocked(); err != nil {
+		slog.Warn("userspace: failed to publish FIB refresh snapshot", "err", err)
+	}
 }
 
 func deriveUserspaceConfig(cfg *config.Config) config.UserspaceConfig {
@@ -2326,8 +2368,21 @@ func (m *Manager) syncSnapshotLocked() error {
 	// liveness outcome is known. HA startup can emit several snapshots in
 	// quick succession as VIPs and routes converge; pushing every one of
 	// them forces back-to-back full AF_XDP reconciles and self-collides.
+	//
+	// EXCEPTION: allow same-plan refreshes (FIB-only updates) through even
+	// during XSK startup. These don't trigger XSK rebinding — they only
+	// update routes and neighbors. Blocking them creates a deadlock: XSK
+	// liveness needs RX traffic, but transit traffic needs FIB data that
+	// hasn't been published yet.
 	if m.publishedSnapshot != 0 && !m.xskLivenessProven && !m.xskLivenessFailed {
-		return nil
+		samePlan := m.publishedPlanKey != "" && m.publishedPlanKey == planKey
+		if !samePlan {
+			return nil
+		}
+		slog.Info("userspace: publishing deferred same-plan snapshot during XSK startup",
+			"generation", m.lastSnapshot.Generation,
+			"fib_generation", m.lastSnapshot.FIBGeneration,
+			"published", m.publishedSnapshot)
 	}
 	if m.publishedSnapshot != 0 && m.publishedPlanKey != "" && m.publishedPlanKey != planKey {
 		slog.Info(
@@ -2642,6 +2697,20 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 		m.bootstrapNAPIQueuesAsyncLocked("ha-update-active")
 		m.proactiveNeighborResolveAsyncLocked()
 	}
+	// Reset ctrl liveness state so the status loop goes through a fresh
+	// readiness sequence before re-enabling ctrl. The eBPF pipeline handles
+	// traffic while the XSK liveness probe restarts and verifies RX. This
+	// gives the helper time to process the HA state update (DemoteOwnerRG /
+	// RefreshOwnerRGs), drain worker commands, and clean stale flow cache
+	// entries for the transitioned RG before userspace resumes forwarding.
+	m.neighborsPrewarmed = false
+	m.xskLivenessProven = false
+	m.xskLivenessFailed = false
+	m.xskProbeStart = time.Time{}
+	m.lastXSKRX = 0
+	m.ctrlWasEnabled = false // ensure stale BPF session flush on ctrl re-enable
+	slog.Info("userspace: reset ctrl liveness for post-RG-transition re-verification",
+		"rg", rgID, "active", active)
 	return m.syncHAStateLocked()
 }
 
@@ -2886,6 +2955,14 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 				allBindingsBound = false
 			}
 		}
+		// Fire OnXSKBound callback once when all bindings are bound.
+		// This lets the daemon create fabric IPVLAN overlays after XSK
+		// has bound in zerocopy mode on the parent interface.
+		if allBindingsBound && !m.xskBoundNotified && m.OnXSKBound != nil {
+			m.xskBoundNotified = true
+			go m.OnXSKBound()
+		}
+
 		neighborSyncReady := status.NeighborGeneration > 0
 
 		// XSK receive liveness: once bindings and neighbor state are ready,
@@ -2969,6 +3046,15 @@ ctrlReady:
 	// These poison the XDP shim after ctrl enables — it sees the stale
 	// entry and bypasses XSK, routing packets to the eBPF pipeline
 	// instead of the userspace helper.
+	//
+	// Also flush BPF conntrack sessions created by the eBPF pipeline
+	// during the ctrl-disabled window. These sessions interfere with
+	// the userspace pipeline via TC egress: when the Rust helper sends
+	// packets via XSK TX, TC egress finds the stale BPF conntrack
+	// entries and may apply conflicting NAT or update session state
+	// incorrectly. The userspace helper's own session table (Rust
+	// SessionTable + shared_sessions) holds the authoritative synced
+	// sessions — BPF conntrack must be empty when ctrl re-enables.
 	if ctrl.Enabled == 1 && !m.ctrlWasEnabled {
 		if usMap := m.inner.Map("userspace_sessions"); usMap != nil {
 			var key, nextKey []byte
@@ -2989,6 +3075,31 @@ ctrlReady:
 			if deleted > 0 {
 				slog.Info("userspace: flushed stale BPF session entries on ctrl enable",
 					"deleted", deleted)
+			}
+		}
+		// Flush BPF conntrack (v4 + v6) to remove sessions created by
+		// the eBPF pipeline during the ctrl-disabled transition window.
+		for _, mapName := range []string{"sessions", "sessions_v6"} {
+			if ctMap := m.inner.Map(mapName); ctMap != nil {
+				var key, nextKey []byte
+				key = make([]byte, ctMap.KeySize())
+				nextKey = make([]byte, ctMap.KeySize())
+				deleted := 0
+				for {
+					if err := ctMap.NextKey(key, nextKey); err != nil {
+						break
+					}
+					copy(key, nextKey)
+					_ = ctMap.Delete(key)
+					deleted++
+					if deleted > 200000 {
+						break
+					}
+				}
+				if deleted > 0 {
+					slog.Info("userspace: flushed stale BPF conntrack on ctrl enable",
+						"map", mapName, "deleted", deleted)
+				}
 			}
 		}
 	}

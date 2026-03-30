@@ -2642,6 +2642,7 @@ fn poll_binding(
                                     &flow.forward_key,
                                     meta.ingress_ifindex as i32,
                                 );
+                                binding.scratch_recycle.push(desc.addr);
                                 continue;
                             }
                             let cached_decision = cached.decision;

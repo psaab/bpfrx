@@ -461,7 +461,9 @@ func (m *Manager) electSingleNode() {
 		// Readiness gate: block new promotions in cluster mode until
 		// interfaces + VRRP are confirmed ready for holdTime.
 		// Does not gate standalone mode (no controlInterface).
-		if rg.State != StatePrimary && rg.Weight > 0 && m.controlInterface != "" {
+		// Bypass when peer is dead: sync readiness is impossible without
+		// a peer, and the surviving node must take over immediately.
+		if rg.State != StatePrimary && rg.Weight > 0 && m.controlInterface != "" && m.peerAlive {
 			if !rg.IsReadyForTakeover(m.takeoverHoldTime) {
 				continue
 			}

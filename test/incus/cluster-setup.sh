@@ -148,6 +148,10 @@ create_networks() {
 			ipv4.address="$subnet" \
 			ipv4.nat="$nat" \
 			ipv6.address=none
+		# Jumbo frames on fabric bridge for cross-chassis throughput.
+		if [[ "$name" == "$NET_FABRIC" ]]; then
+			incus network set "$(r "$name")" bridge.mtu=9000
+		fi
 		# Enable IPv6 on cluster LAN bridge so incus doesn't strip IPv6
 		# routes from containers. ra-param=*,0,0 suppresses default
 		# router advertisements so only the firewall's embedded RA sender is used.

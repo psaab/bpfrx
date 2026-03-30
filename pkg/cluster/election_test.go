@@ -627,6 +627,47 @@ func TestIsReadyForTakeover(t *testing.T) {
 	}
 }
 
+func TestElection_PeerLost_BypassesReadinessGate(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	cfg.ControlInterface = "em0" // enables cluster mode readiness gate
+	m.UpdateConfig(cfg)
+	// No initial event: controlInterface + non-preempt + !peerEverSeen
+	// blocks the initial single-node election (by design).
+
+	// Simulate peer arriving — this sets peerEverSeen=true and makes
+	// us secondary to the higher-priority peer.
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 250, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+	// Drain the secondary transition event.
+	drainEvents(m, 1)
+
+	// Confirm we're secondary.
+	if m.IsLocalPrimary(0) {
+		t.Fatal("should be secondary while peer is primary")
+	}
+
+	// Make the RG NOT ready (simulates sync disconnect setting Ready=false).
+	m.mu.Lock()
+	rg := m.groups[0]
+	rg.Ready = false
+	rg.ReadySince = time.Time{}
+	m.mu.Unlock()
+
+	// Peer timeout — despite readiness gate, we must take over.
+	m.handlePeerTimeout()
+
+	if !m.IsLocalPrimary(0) {
+		t.Error("should be primary after peer timeout even when readiness gate is not met")
+	}
+}
+
 func TestRGInterfaceReady(t *testing.T) {
 	m := NewManager(0, 1) // node 0
 	nlh := newMockNlHandle()

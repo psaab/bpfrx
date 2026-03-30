@@ -98,6 +98,7 @@ type Daemon struct {
 	syncBulkPrimed     atomic.Bool
 	syncPeerBulkPrimed atomic.Bool
 	syncPeerConnected  atomic.Bool
+	hbSuppressStart    atomic.Int64 // UnixNano of first heartbeat suppression; 0 = inactive
 	syncPrimeRetryGen  atomic.Uint64
 	syncReadyTimerGen  atomic.Uint64
 	syncReadyTimerMu   sync.Mutex
@@ -306,6 +307,7 @@ func (d *Daemon) onSessionSyncPeerConnected() {
 	d.syncBulkPrimed.Store(false)
 	d.syncPeerBulkPrimed.Store(false)
 	d.syncPeerConnected.Store(true)
+	d.hbSuppressStart.Store(0) // fresh connection → reset suppression cap
 	gen := d.syncPrimeRetryGen.Add(1)
 	slog.Info("cluster: session sync peer connected",
 		"retry_gen", gen,
@@ -353,13 +355,32 @@ func (d *Daemon) onSessionSyncPeerDisconnected() {
 func (d *Daemon) shouldSuppressPeerHeartbeatTimeout() (bool, string) {
 	ss := d.sessionSync
 	if ss == nil || !ss.IsConnected() {
+		d.hbSuppressStart.Store(0) // reset when sync disconnected
 		return false, ""
 	}
 	const maxPeerSyncSilence = 2 * time.Second
 	age, ok := ss.LastPeerReceiveAge()
 	if !ok || age > maxPeerSyncSilence {
+		d.hbSuppressStart.Store(0) // reset when sync goes quiet
 		return false, ""
 	}
+
+	// Cap total suppression duration. During graceful shutdown the peer
+	// may send a bulk sync that keeps LastPeerReceiveAge() fresh for tens
+	// of seconds while heartbeats have already stopped. After 5s of
+	// continuous suppression, stop suppressing so the heartbeat timeout
+	// can fire and trigger failover.
+	const maxSuppressDuration = 5 * time.Second
+	now := time.Now().UnixNano()
+	start := d.hbSuppressStart.Load()
+	if start == 0 {
+		d.hbSuppressStart.Store(now)
+		start = now
+	}
+	if time.Duration(now-start) > maxSuppressDuration {
+		return false, ""
+	}
+
 	return true, fmt.Sprintf("session sync connected with recent peer traffic age=%s", age.Truncate(10*time.Millisecond))
 }
 
@@ -1849,7 +1870,21 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// The physical member (ge-0-0-0) keeps its name; fab0 is IPVLAN L2
 	// on top for IP addressing. BPF attaches to the parent.
 	// Track which overlays are configured so stale ones can be cleaned up (#128).
+	//
+	// When the userspace dataplane is active, DEFER IPVLAN creation until
+	// after XSK binds complete. The kernel checks for upper devices (like
+	// IPVLAN) at XSK bind time — if an IPVLAN exists, zerocopy bind fails
+	// and falls back to copy mode (~3 Gbps). Deferring lets the fabric
+	// parent bind XSK in zerocopy first, then the IPVLAN is added for
+	// sync/heartbeat addressing.
 	activeFabricOverlays := make(map[string]bool)
+	type deferredIPVLAN struct {
+		parent string
+		name   string
+		addrs  []string
+	}
+	var deferredOverlays []deferredIPVLAN
+	_, isUserspaceDP := d.dp.(*dpuserspace.Manager)
 	for ifName, ifCfg := range cfg.Interfaces.Interfaces {
 		if ifCfg.LocalFabricMember == "" || !strings.HasPrefix(ifName, "fab") {
 			continue
@@ -1860,6 +1895,29 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		var addrs []string
 		if unit, ok := ifCfg.Units[0]; ok {
 			addrs = unit.Addresses
+		}
+		// When userspace DP is active, remove any existing IPVLAN and
+		// defer recreation until after XSK binds in zerocopy. The kernel
+		// checks for upper devices at bind time — IPVLAN blocks zerocopy.
+		// On subsequent applyConfig calls (config change), the IPVLAN
+		// already exists from the OnXSKBound callback and XSK is already
+		// bound, so the xskBoundNotified guard prevents re-deletion.
+		if isUserspaceDP {
+			if um, ok := d.dp.(*dpuserspace.Manager); ok && !um.XSKBoundNotified() {
+				// First applyConfig — remove stale IPVLAN so XSK can zerocopy.
+				if link, err := netlink.LinkByName(fabLinux); err == nil {
+					netlink.LinkDel(link)
+					slog.Info("removed fabric IPVLAN for deferred zerocopy XSK bind",
+						"name", fabLinux)
+				}
+				deferredOverlays = append(deferredOverlays, deferredIPVLAN{
+					parent: parentLinux, name: fabLinux, addrs: addrs,
+				})
+				slog.Info("deferring fabric IPVLAN creation until XSK binds complete",
+					"parent", parentLinux, "name", fabLinux)
+				continue
+			}
+			// XSK already bound — fall through to reconcile.
 		}
 		if err := ensureFabricIPVLAN(parentLinux, fabLinux, addrs); err != nil {
 			// Fabric overlay is critical for cluster heartbeat and VRRP.
@@ -1880,6 +1938,21 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 					"parent", parentLinux, "name", fabLinux, "err", retryErr)
 			}
 			continue
+		}
+	}
+	// Register deferred IPVLAN creation callback on the userspace manager.
+	if len(deferredOverlays) > 0 {
+		if um, ok := d.dp.(*dpuserspace.Manager); ok {
+			um.OnXSKBound = func() {
+				for _, ov := range deferredOverlays {
+					slog.Info("XSK bound — creating deferred fabric IPVLAN",
+						"parent", ov.parent, "name", ov.name)
+					if err := ensureFabricIPVLAN(ov.parent, ov.name, ov.addrs); err != nil {
+						slog.Error("deferred fabric IPVLAN creation failed",
+							"parent", ov.parent, "name", ov.name, "err", err)
+					}
+				}
+			}
 		}
 	}
 	// Clean up stale fabric IPVLAN overlays not in current config (#128).
@@ -5807,10 +5880,22 @@ func ensureFabricIPVLAN(parent, name string, addrs []string) error {
 	// Ensure parent is UP — IPVLAN inherits carrier from parent.
 	netlink.LinkSetUp(parentLink)
 
+	// Set jumbo MTU on parent for fabric throughput — IPVLAN inherits
+	// parent MTU as upper bound, so parent must be set first.
+	if parentLink.Attrs().MTU < 9000 {
+		if err := netlink.LinkSetMTU(parentLink, 9000); err != nil {
+			slog.Warn("fabric: failed to set parent MTU 9000",
+				"parent", parent, "err", err)
+		}
+	}
+
 	// Check if IPVLAN already exists on correct parent.
 	if existing, err := netlink.LinkByName(name); err == nil {
 		if existing.Attrs().ParentIndex == parentLink.Attrs().Index {
-			// Already correct — reconcile addresses and ensure UP (#127).
+			// Already correct — reconcile addresses, MTU, and ensure UP (#127).
+			if existing.Attrs().MTU < 9000 {
+				netlink.LinkSetMTU(existing, 9000)
+			}
 			reconcileIPVLANAddrs(existing, name, addrs)
 			netlink.LinkSetUp(existing)
 			return nil
@@ -5833,6 +5918,12 @@ func ensureFabricIPVLAN(parent, name string, addrs []string) error {
 	link, err := netlink.LinkByName(name)
 	if err != nil {
 		return fmt.Errorf("find created IPVLAN %s: %w", name, err)
+	}
+
+	// Set jumbo MTU on IPVLAN overlay (must not exceed parent MTU).
+	if err := netlink.LinkSetMTU(link, 9000); err != nil {
+		slog.Warn("fabric IPVLAN: failed to set MTU 9000",
+			"name", name, "err", err)
 	}
 
 	// Add configured addresses.
