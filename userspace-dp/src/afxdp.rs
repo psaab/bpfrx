@@ -1176,7 +1176,7 @@ impl Coordinator {
                 owner_rgs: owner_rgs.to_vec(),
             });
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             if self
                 .workers
@@ -1217,7 +1217,7 @@ impl Coordinator {
                 owner_rgs: owner_rgs.to_vec(),
             });
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         loop {
             if self
                 .workers

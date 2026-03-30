@@ -524,12 +524,17 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     // to local ForwardCandidate. Recompute all synced forward entries on RG
     // activation so stale reverse companions are refreshed against the new HA
     // snapshot instead of staying pinned to the earlier inactive result.
+    let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
     let forward_entries = shared_sessions
         .lock()
         .map(|sessions| {
             sessions
                 .values()
-                .filter(|entry| !entry.metadata.is_reverse && entry.metadata.synced)
+                .filter(|entry| {
+                    !entry.metadata.is_reverse
+                        && entry.metadata.synced
+                        && owner_rg_set.contains(&entry.metadata.owner_rg_id)
+                })
                 .cloned()
                 .collect::<Vec<_>>()
         })
@@ -585,12 +590,6 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
     let candidates = {
         let mut out = Vec::new();
         sessions.iter_with_origin(|key, decision, metadata, origin| {
-            // Refresh all local sessions when an owner RG activates.
-            // During takeover, a shared forward session can be promoted
-            // locally with a FabricRedirect while the RG is still inactive.
-            // Once the RG flips active, those already-promoted forward
-            // sessions must be re-resolved to the local egress path instead
-            // of staying pinned to the old owner forever.
             out.push((key.clone(), decision, metadata.clone(), origin));
         });
         out
@@ -621,15 +620,15 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
         let refreshed_resolution =
             enforce_session_ha_resolution(forwarding, ha_state, now_secs, looked_up, 0, 0);
         let refreshed_owner_rg = owner_rg_for_resolution(forwarding, refreshed_resolution);
-        let refreshed_resolution =
-            redirect_session_resolution_for_metadata(forwarding, refreshed_resolution, &metadata);
-        if !owner_rg_set.contains(&refreshed_owner_rg)
-            && !owner_rg_set.contains(&metadata.owner_rg_id)
-            && refreshed_resolution == decision.resolution
-            && refreshed_owner_rg == metadata.owner_rg_id
+        // Skip sessions where neither the original nor re-resolved owner RG
+        // is in the activated set — no work needed for unrelated RGs.
+        if !owner_rg_set.contains(&metadata.owner_rg_id)
+            && !owner_rg_set.contains(&refreshed_owner_rg)
         {
             continue;
         }
+        let refreshed_resolution =
+            redirect_session_resolution_for_metadata(forwarding, refreshed_resolution, &metadata);
         let refreshed_decision = SessionDecision {
             resolution: refreshed_resolution,
             ..decision
@@ -3015,7 +3014,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_worker_commands_refreshes_split_owner_reverse_sessions_to_fabric_redirect() {
+    fn apply_worker_commands_skips_split_owner_reverse_sessions_for_unrelated_rg() {
         let commands = Arc::new(Mutex::new(VecDeque::new()));
         let mut sessions = SessionTable::new();
         let key = SessionKey {
@@ -3057,6 +3056,8 @@ mod tests {
             PROTO_TCP,
             0x10,
         ));
+        // RefreshOwnerRGs([1]) should NOT touch sessions with owner_rg_id=2
+        // even if the re-resolved owner_rg remains 2.
         commands
             .lock()
             .expect("commands lock")
@@ -3095,15 +3096,12 @@ mod tests {
 
         let hit = sessions
             .lookup(&key, 2_000_000, 0x10)
-            .expect("refreshed reverse hit");
+            .expect("session should still exist");
+        // Session remains HAInactive — not refreshed because owner_rg_id=2
+        // is not in the activated owner_rgs set [1].
         assert_eq!(
             hit.decision.resolution.disposition,
-            ForwardingDisposition::FabricRedirect
-        );
-        assert_eq!(hit.decision.resolution.egress_ifindex, 21);
-        assert_eq!(
-            hit.decision.resolution.src_mac,
-            Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x03])
+            ForwardingDisposition::HAInactive
         );
         assert_eq!(hit.metadata.owner_rg_id, 2);
     }
@@ -3609,7 +3607,7 @@ mod tests {
     }
 
     #[test]
-    fn prewarm_reverse_synced_sessions_refreshes_reverse_for_other_activated_rg() {
+    fn prewarm_reverse_synced_sessions_skips_unrelated_owner_rg() {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -3645,6 +3643,8 @@ mod tests {
             &entry,
         );
 
+        // owner_rgs=[2] does not include the session's owner_rg_id=1, so
+        // no reverse companion should be synthesized.
         prewarm_reverse_synced_sessions_for_owner_rgs(
             &shared_sessions,
             &shared_nat_sessions,
@@ -3659,19 +3659,14 @@ mod tests {
         );
 
         let reverse_key = reverse_session_key(&entry.key, entry.decision.nat);
-        let reverse = shared_sessions
-            .lock()
-            .expect("shared sessions")
-            .get(&reverse_key)
-            .cloned()
-            .expect("reverse entry");
-        assert!(reverse.metadata.is_reverse);
-        assert!(reverse.metadata.synced);
-        assert_eq!(
-            reverse.decision.resolution.disposition,
-            ForwardingDisposition::ForwardCandidate
+        assert!(
+            shared_sessions
+                .lock()
+                .expect("shared sessions")
+                .get(&reverse_key)
+                .is_none(),
+            "reverse entry should not be created for unrelated owner RG"
         );
-        assert_eq!(reverse.decision.resolution.egress_ifindex, 6);
-        assert_eq!(reverse.metadata.owner_rg_id, 2);
+        assert_eq!(worker_commands[0].lock().expect("commands").len(), 0);
     }
 }
