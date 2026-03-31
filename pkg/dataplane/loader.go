@@ -259,6 +259,36 @@ func (m *Manager) clearNativeXDPFlags() {
 	}
 }
 
+// clearNativeXDPFlagsForIfindexes removes IfaceFlagNativeXDP from iface_zone_map
+// entries that belong to the specified physical interfaces.
+func (m *Manager) clearNativeXDPFlagsForIfindexes(ifindexes []int) {
+	zm, ok := m.maps["iface_zone_map"]
+	if !ok || len(ifindexes) == 0 {
+		return
+	}
+	targets := make(map[uint32]struct{}, len(ifindexes))
+	for _, ifindex := range ifindexes {
+		if ifindex > 0 {
+			targets[uint32(ifindex)] = struct{}{}
+		}
+	}
+	if len(targets) == 0 {
+		return
+	}
+	var key IfaceZoneKey
+	var val IfaceZoneValue
+	iter := zm.Iterate()
+	for iter.Next(&key, &val) {
+		if _, ok := targets[key.Ifindex]; !ok {
+			continue
+		}
+		if val.Flags&IfaceFlagNativeXDP != 0 {
+			val.Flags &^= IfaceFlagNativeXDP
+			zm.Update(key, val, ebpf.UpdateAny)
+		}
+	}
+}
+
 // ClearVlanIfaceMap deletes all vlan_iface_map entries.
 func (m *Manager) ClearVlanIfaceMap() error {
 	zm, ok := m.maps["vlan_iface_map"]

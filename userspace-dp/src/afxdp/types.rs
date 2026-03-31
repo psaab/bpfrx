@@ -265,6 +265,7 @@ pub(super) struct HAGroupRuntime {
     pub(super) active: bool,
     pub(super) watchdog_timestamp: u64,
     pub(super) demoting: bool,
+    pub(super) demoting_until_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug)]

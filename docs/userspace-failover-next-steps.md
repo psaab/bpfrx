@@ -94,6 +94,286 @@ What is still improved:
 - target reachability stays up during the bad run
 - crash/rejoin is still materially better than the old baseline
 
+## March 30, 2026 checkpoint
+
+The current failover baseline should now be treated as:
+
+- code baseline:
+  - `#295` helper bind mode follows actual XDP attach mode
+  - `#296` native-to-generic fallback is per-interface instead of global
+- operational baseline:
+  - steady-state forwarding to `172.16.80.200` works again
+  - cold-start first-probe loss still exists separately
+
+### What we validated on March 30
+
+Validated artifact for steady-state / XDP-mode correction:
+
+- the helper now binds copy mode on generic interfaces and zero-copy only on
+  native interfaces
+- the restored steady-state forwarding fix is documented in:
+  - [userspace-xdp-mode-and-cold-start-findings.md](userspace-xdp-mode-and-cold-start-findings.md)
+
+Validated artifact for manual RG failover under load:
+
+- `/tmp/userspace-ha-failover-rg1-20260330-092213`
+
+Measured result:
+
+- `1539` zero-throughput intervals
+- `1368` per-stream zero-throughput intervals across `8` streams
+- sender throughput `4.280 Gbps`
+- sender retransmits `115`
+
+Important counters from the first failover window:
+
+- old-owner LAN RX delta `5865927`
+- old-owner fabric TX delta `38353`
+- new-owner fabric RX delta `28494`
+- new-owner WAN TX delta `7`
+- session miss delta `28493`
+
+Interpretation:
+
+- the ownership move completes
+- the target stays reachable
+- but the inherited `iperf3 -P 8` flow set still collapses
+- the new owner receives redirected traffic but does not materialize enough
+  working forward state to carry it
+
+Validated artifact for all-RGs-on-primary crash/rejoin:
+
+- `/tmp/sysrqb-rgall-20260330-092844`
+
+Measured result:
+
+- `92` sampled intervals
+- `12` zero-throughput intervals
+- peak `23.500 Gbps`
+- tail median `23.450 Gbps`
+- sender `20.0 Gbits/sec`, `49614` retransmits
+
+Interpretation:
+
+- hard-crash takeover with all RGs on one node is materially better than the
+  manual RG failover path
+- traffic resumes and stays flat by the tail of the run
+
+Validated artifact for split-RG crash:
+
+- `/tmp/sysrqb-split-node0-actual-20260330-093636`
+
+Measured result:
+
+- `88` sampled intervals
+- `77` zero-throughput intervals
+- peak `4.110 Gbps`
+- tail median `0.000 Gbps`
+
+Precondition during that run:
+
+- `RG1=node1`
+- `RG2=node0`
+- `node1` stayed:
+  - `Takeover ready: no (session sync not ready)`
+
+Interpretation:
+
+- split active/active crash handling is still broken
+- split-RG session-sync readiness can remain stuck not-ready even after the
+  cluster reaches a stable ownership split
+- crashing the `RG2` owner from that split state still collapses the flow
+
+### Updated priority
+
+The highest-value next investigations are now:
+
+1. Why split ownership leaves `session sync not ready` stuck on the surviving
+   primary.
+2. Why the manual `RG1` move still collapses immediately after ownership moves
+   even after the large new-owner `session_miss` storm is removed.
+3. Only after those are fixed, continue with more crash/rejoin matrix work.
+
+## March 30, 2026 late checkpoint
+
+The latest narrowing pass changed the failure shape again.
+
+Code checkpoint:
+
+- `c84c35c7` `userspace: prewarm reverse sessions for activated RGs`
+
+Validated artifacts:
+
+- interrupted one-cycle harness:
+  - `/tmp/userspace-ha-failover-rg1-20260330-174231`
+- one-way failover observe run:
+  - `/tmp/manual-oneway-rg1-20260330-174744`
+
+What changed:
+
+- the new owner no longer shows the earlier `~28k` `session_miss` explosion on
+  first failover
+- the surviving `RG1` owner receives and installs the forwarded session set
+  (`Sessions installed: 151`, later `216`)
+- cluster ownership stays stable after the move:
+  - `node0` remains `RG1 secondary`
+  - `node1` remains `RG1 primary`
+
+What is still broken:
+
+- the inherited `iperf3 -P 8` flow set still collapses immediately after the
+  move
+- one-way failover `iperf3` stays near `20 Gbps` for the pre-failover window,
+  drops to `3.17 Gbps` in the first bad second, then goes to sustained `0`
+  starting in the next second
+- the one-way artifact summary is:
+  - `68` intervals
+  - `51` zero-throughput intervals
+  - peak `20.600 Gbps`
+  - tail median `0.000 Gbps`
+
+What the new counters prove:
+
+- the collapse is no longer explained by a new-owner install failure
+- during the bad window:
+  - `fw0 Session misses` stays flat at `29`
+  - `fw1 Session misses` stays flat at `27-28`
+  - `Neighbor misses` stay flat
+  - `Slow path local-delivery` on `fw1` grows only slightly (`22 -> 32`)
+- the first post-failover snapshot already shows:
+  - `fw0 rg1 active=false`
+  - `fw1 rg1 active=true`
+  - `fw1 Sessions installed=151`
+
+Interpretation:
+
+- the reverse-prewarm fix removed the original failover signature
+- the remaining collapse is now more likely in the stale-owner demotion /
+  redirected transport path than in the new-owner session install path
+- the next code target should be the demotion-side forwarding path, not more
+  session-sync bulk work
+
+## March 30, 2026 late-night checkpoint
+
+The latest live trace narrowed one more concrete bug in the demotion path.
+
+Artifact:
+
+- `/tmp/manual-oneway-rg1-20260330-180943`
+
+What happened:
+
+- the CLI failover did not complete
+- `failover.out` reported:
+  - `pre-failover prepare for redundancy group 1: read unix @->/run/bpfrx/userspace-dp.sock: i/o timeout`
+- cluster ownership never moved:
+  - `node0` stayed `RG1 primary`
+  - `node1` stayed `RG1 secondary`
+
+But the primary helper still changed behavior after the failed prepare.
+
+Trace on `fw0` showed:
+
+- the watched forward flow to `172.16.80.200` resolving as:
+  - `disposition=FabricRedirect`
+  - `owner_rg=1`
+- the reverse direction from `172.16.80.200` still resolving as:
+  - `disposition=ForwardCandidate`
+
+Interpretation:
+
+- the userspace demotion-prep request can time out at the manager/daemon layer
+  after the helper has already marked the RG as demoting
+- once that happens, the still-primary helper can continue treating local RG
+  traffic as stale-owner fabric traffic even though cluster ownership never
+  changed
+
+This changes the immediate priority order again.
+
+Updated priority:
+
+1. Make helper demotion-prep self-clearing if the prepare does not complete.
+2. Re-run the failed-prepare repro and prove the still-primary node stops
+   self-poisoning after the demotion-prep lease expires.
+3. Then re-run the real manual `RG1` move under inherited `iperf3 -P 8` load.
+4. Keep the split-RG readiness work after the demotion poison is fixed, because
+   the stuck not-ready state still matters for crash safety.
+
+## March 30, 2026 end-of-night checkpoint
+
+The remaining failure now looks like stale moved-RG session state, not failed
+admission.
+
+What changed after the latest helper fixes:
+
+- manual CLI `RG1` failover now admits again on the clean build
+- immediate and `t+6s` pings to `172.16.80.200` still fail after the move
+- the same split state recovers by about `t+30s`
+- once recovered, fresh TCP works again:
+  - `iperf3 -P 4 -t 5` was about `2.74 Gbps`
+
+Interpretation:
+
+- the demotion-prep timeout bug and the stuck-demoting poison bug were both
+  real and are now narrowed
+- the surviving outage window lines up much more closely with stale session
+  lifetime than with ownership or neighbor convergence
+- helper defaults still give:
+  - non-TCP / other session timeout `30s`
+  - established TCP timeout `300s`
+
+That is the current best explanation for the remaining behavior:
+
+- fresh ICMP comes back once stale non-TCP state ages out
+- established `iperf3` does not come back, because stale TCP session state
+  persists far longer
+
+Updated priority:
+
+1. Audit and narrow which moved-RG session aliases survive the ownership edge on
+   both nodes.
+2. Fix stale session cleanup surgically, not with the earlier naive
+   delete-everything demotion experiment that regressed new-owner install.
+3. Re-run manual `RG1` failover under established `iperf3 -P 8` after that
+   cleanup change.
+4. Keep split-RG readiness and crash/rejoin work after the moved-session stale
+   state is under control.
+
+## March 30, 2026 demotion-alias cleanup experiment
+
+One follow-up experiment was tried and rejected:
+
+- `b319046b` `userspace: delete demoted session aliases immediately`
+- reverted by:
+  - `1a2da473`
+
+What it changed:
+
+- the old owner's immediate demotion cleanup deleted the full
+  `USERSPACE_SESSIONS` entry set for shared demoted sessions, not just the
+  canonical key
+
+What live validation showed:
+
+- artifact:
+  - `/tmp/manual-oneway-rg1-20260330-175924`
+- result:
+  - `68` intervals
+  - `52` zero-throughput intervals
+  - peak `23.500 Gbps`
+  - tail median `0.000 Gbps`
+- failure signature regressed:
+  - `fw1 Session misses` jumped back to `28077 -> 28086`
+  - `fw1 Sessions installed` still reached `140 -> 203`
+  - `fw1 TX packets` stayed effectively flat (`0 -> 57`)
+
+Interpretation:
+
+- immediate full alias deletion on the demoting side is too aggressive
+- some of those aliases are still needed during the handoff window
+- the remaining fix must preserve continuity while still preventing stale-owner
+  ownership drift; a blind full alias purge is not safe
+
 ## Latest evidence
 
 The simplified manual repro improved, but the stronger failover gate still
@@ -407,12 +687,113 @@ The next keep to test is:
 Do not reopen the already-fixed paths unless the next artifact proves they
 regressed.
 
+## March 30-31, 2026 update
+
+The current failure shape is narrower than the older `LocalDelivery` poison
+artifacts.
+
+### Direct re-announce still does not fully move the host neighbor
+
+Artifacts:
+
+- `/tmp/rg1-neighbor-watch-20260330-200731`
+- `/tmp/rg1-neighbor-node1-20260330-200816`
+
+What happened on `RG1 node0 -> node1`:
+
+- `fw1` logged repeated direct-mode GARP/NA re-announcements
+- `cluster-userspace-host` kept `10.0.61.1` pinned to the old owner MAC
+- traffic later recovered while the host still used the old owner MAC
+
+Interpretation:
+
+- stale-owner redirect is still carrying part of the recovery
+- host neighbor convergence is still weak in the hard direction
+- but this is not the whole failover collapse, because redirected traffic still
+  reaches the new owner
+
+### Immediate full demotion alias deletion regressed the target
+
+Artifact:
+
+- `/tmp/userspace-ha-failover-rg1-20260330-201527`
+
+Rejected experiment:
+
+- delete the demoted owner's full alias set immediately at ownership loss
+
+Result:
+
+- target `Session misses`: `23323`
+- target `Neighbor misses`: `185`
+- target last resolution became:
+  - `missing_neighbor ... flow=172.16.80.8:58574->172.16.80.200:5201`
+
+Interpretation:
+
+- the handoff still needs some translated alias continuity
+- the remaining fix must be narrower than blind full alias deletion
+
+### Active-owner translated shared hits should not stay transient
+
+Local change:
+
+- keep translated synced forward hits transient on fabric ingress only while
+  the owner RG is still locally inactive
+- if the owner RG is already active on the receiving node, promote the hit
+  locally instead of purging it
+
+Validation artifact:
+
+- `/tmp/userspace-ha-failover-rg1-20260330-202612`
+
+Observed improvement:
+
+- target `Session misses`: `23323 -> 15424`
+- target `Neighbor misses`: `185 -> 0`
+- target helper made limited but real forward progress:
+  - `Session hits: 21`
+  - `Session creates: 2`
+  - `SNAT packets: 3`
+  - `DNAT packets: 3`
+  - `TX packets: 54`
+
+What is still broken:
+
+- the hardened failover validator still failed
+- sender throughput was `3.746 Gbps`
+- sender retransmits were `149568`
+- there were `189` zero-throughput intervals
+
+### Remaining mismatch
+
+In the same artifact:
+
+- `fw1` cluster status says `RG1 primary`
+- `fw1` helper HA runtime says `rg1 active=true`
+- but `fw1` helper still reports:
+  - `Last resolution: ha_inactive ... flow=172.16.80.8:51720->172.16.80.200:5201`
+- and `cycle1-failover-fw1-sessions.txt` still shows the inherited translated
+  `.200` tuples as `HA State: Backup`
+
+That is the next concrete target:
+
+- explain why the active new owner still treats inherited translated forward
+  tuples as inactive/backup
+- verify whether the remaining gap is:
+  - wrong synced owner-RG metadata
+  - wrong shared forward-wire publication
+  - incomplete promotion after materialization
+
 ## Recommended implementation order
 
-1. Add origin tagging for helper-local session creation/import.
-2. Reproduce the same hardened RG1 failover and capture the first bad public-side session on `fw1`.
-3. Cut off that exact creation/import path.
-4. Rerun the same hardened validator before touching any unrelated failover logic.
+1. Explain why an `RG1`-primary new owner still resolves inherited translated
+   `.200` tuples as `ha_inactive` / `Backup`.
+2. Verify whether the remaining gap is metadata, publication, or promotion.
+3. Reproduce the same hardened RG1 failover and capture the first translated
+   forward tuple that still stays inactive on `fw1`.
+4. Fix that exact active-owner mismatch before touching unrelated failover
+   logic.
 
 ## Acceptance criteria
 
@@ -422,8 +803,10 @@ The current branch should not be considered done until all of these are true:
 - manual `RG1 node1 -> node0` stays up under long-lived `iperf3`
 - the hardened failover validator stays green on this build
 - crash/rejoin still recovers and remains stable after the rebooted node returns
-- the new owner no longer accumulates public-side `LocalDelivery` sessions during the failover window
-- `fw1 Slow path local-delivery` stays flat enough that it is no longer the dominant counter in the bad interval
+- the new owner no longer leaves inherited translated `.200` tuples in
+  `HAInactive` / `Backup` state during the failover window
+- `fw1` session misses on inherited translated traffic stay low enough that the
+  flow remains flat through the move
 
 ## What not to do next
 

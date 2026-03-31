@@ -44,6 +44,24 @@ There is now an eighth post-merge finding from the March 28 reruns:
    traffic can stay healthy through the ownership move, but the new owner VM
    can reboot under load, causing the old owner to reclaim `RG1`.
 
+There is now a ninth checkpoint from the March 30 reruns on top of the
+`#295` + `#296` baseline:
+
+9. Fixing the XDP attach-mode / AF_XDP bind-mode mismatch restored steady-state
+   forwarding, but it did not fix the HA dataplane failures:
+   - manual `RG1` failover under `iperf3 -P 8` still collapses with a large
+     new-owner `session_miss` burst
+   - all-RGs-on-primary crash/rejoin is materially better
+   - split-RG crash still fails badly, and split ownership can leave
+     `session sync not ready` stuck on the survivor
+
+There is now a tenth checkpoint from the later March 30 reverse-prewarm pass:
+
+10. The latest reverse-session activation fix removes the large new-owner
+    `session_miss` burst on first failover, but the manual `RG1` failover still
+    collapses immediately after the move with stable ownership and low miss
+    counters.
+
 ## What we reproduced
 
 ### 1. Manual RG move under load
@@ -145,6 +163,87 @@ Interpretation:
 - it is a sustained post-transition transport failure on the redirected path
 - the failover harness must treat a hung remote `iperf3` client as a hard
   failover failure rather than letting the run hang indefinitely
+
+Latest March 30, 2026 rerun on the corrected XDP-mode baseline:
+
+- artifact:
+  - `/tmp/userspace-ha-failover-rg1-20260330-092213`
+- configuration:
+  - `#295` + `#296`
+  - `iperf3 -P 8`
+  - `3` failover cycles
+- result:
+  - `1539` zero-throughput intervals
+  - `1368` per-stream zero-throughput intervals
+  - sender throughput `4.280 Gbps`
+  - sender retransmits `115`
+
+Most important first-failover counters:
+
+- old-owner LAN RX delta `5865927`
+- old-owner fabric TX delta `38353`
+- new-owner fabric RX delta `28494`
+- new-owner WAN TX delta `7`
+- new-owner session miss delta `28489`
+
+Interpretation:
+
+- restoring correct AF_XDP bind mode fixed the unrelated steady-state
+  forwarding break
+- the surviving manual failover bug is still the inherited-flow ownership move
+- the first real failover still explodes `session_miss` on the new owner under
+  `-P 8`
+
+Latest March 30, 2026 rerun after reverse-session activation prewarm:
+
+- code checkpoint:
+  - `c84c35c7` `userspace: prewarm reverse sessions for activated RGs`
+- artifacts:
+  - `/tmp/userspace-ha-failover-rg1-20260330-174231`
+  - `/tmp/manual-oneway-rg1-20260330-174744`
+
+Observed result:
+
+- the first failover no longer shows the earlier large new-owner
+  `session_miss` burst
+- in the one-way failover run:
+  - `fw0 Session misses` stays flat at `29`
+  - `fw1 Session misses` stays flat at `27-28`
+  - `fw1 Sessions installed` starts at `151` and later reaches `216`
+  - cluster ownership remains stable with `node1` primary for `RG1`
+- despite that, `iperf3 -P 8` still collapses:
+  - pre-failover steady state holds near `20 Gbps`
+  - the first bad interval drops to `3.17 Gbps`
+  - the next interval is `0.00 bits/sec`
+  - tail median remains `0.000 Gbps`
+
+Interpretation:
+
+- the reverse-session activation fix is a keep; it materially narrowed the
+  problem
+- the remaining bug is no longer “new owner cannot install inherited state”
+- the next work needs to target stale-owner demotion / redirected transport
+  continuity after ownership moves
+
+Rejected follow-up experiment on March 30, 2026:
+
+- `b319046b` attempted to make demotion cleanup delete the full shared
+  session-map alias set immediately
+- that change regressed the failover signature back to a large new-owner
+  `session_miss` storm
+- artifact:
+  - `/tmp/manual-oneway-rg1-20260330-175924`
+- measured result:
+  - `fw1 Session misses: 28077 -> 28086`
+  - `fw1 Sessions installed: 140 -> 203`
+  - `fw1 TX packets: 0 -> 57`
+
+Interpretation:
+
+- the demotion alias set cannot be purged naïvely at the first ownership edge
+- some alias continuity is still required during the handoff window
+- the surviving bug remains in the demotion / redirected transport transition,
+  but the fix must be more selective than full immediate alias deletion
 
 Latest gated failover result after repeated direct-mode post-failover
 re-announcement bursts:

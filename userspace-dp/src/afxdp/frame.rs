@@ -4734,6 +4734,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )])));
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -4769,6 +4770,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )])));
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));

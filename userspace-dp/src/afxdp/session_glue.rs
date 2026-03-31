@@ -140,7 +140,7 @@ pub(super) fn owner_rg_is_locally_active(
             ha_state.get(&owner_rg_id),
             Some(group)
                 if group.active
-                    && !group.demoting
+                    && !super::ha_group_is_demoting(group, now_secs)
                     && group.watchdog_timestamp != 0
                     && now_secs >= group.watchdog_timestamp
                     && now_secs.saturating_sub(group.watchdog_timestamp)
@@ -317,7 +317,9 @@ pub(super) fn apply_worker_commands(
                 let demoted = sessions.demote_owner_rg(owner_rg_id);
                 eprintln!(
                     "bpfrx-ha: DemoteOwnerRG {} demoted_sessions={} remaining={}",
-                    owner_rg_id, demoted.len(), sessions.len(),
+                    owner_rg_id,
+                    demoted.len(),
+                    sessions.len(),
                 );
                 for flow_cache in flow_caches.iter_mut() {
                     flow_cache.invalidate_owner_rg(owner_rg_id);
@@ -347,7 +349,9 @@ pub(super) fn apply_worker_commands(
                 );
                 eprintln!(
                     "bpfrx-ha: RefreshOwnerRGs {:?} worker sessions: before={} after={}",
-                    owner_rgs, pre_count, sessions.len()
+                    owner_rgs,
+                    pre_count,
+                    sessions.len()
                 );
             }
             WorkerCommand::UpsertSynced(mut entry) => {
@@ -366,16 +370,14 @@ pub(super) fn apply_worker_commands(
                         dst_ip: key.dst_ip,
                         forward_key: key.clone(),
                     };
-                    let resolution_target = resolution_target_for_session(&flow, entry.decision);
                     let re_resolved = lookup_forwarding_resolution_for_session(
                         forwarding,
                         dynamic_neighbors,
                         &flow,
                         entry.decision,
                     );
-                    let re_resolved = enforce_ha_resolution_snapshot(
-                        forwarding, ha_state, now_secs, re_resolved,
-                    );
+                    let re_resolved =
+                        enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, re_resolved);
                     if re_resolved.disposition != ForwardingDisposition::HAInactive {
                         entry.decision.resolution = re_resolved;
                         let new_owner = owner_rg_for_resolution(forwarding, re_resolved);
@@ -517,6 +519,7 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     if owner_rgs.is_empty() {
         return;
     }
+    let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
     // Reverse companions depend on the current HA state of the client-side
     // egress RG, not only on the forward session's owner RG. When a second RG
     // becomes active during failback (for example, LAN after WAN/tunnel), a
@@ -524,34 +527,36 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     // to local ForwardCandidate. Recompute all synced forward entries on RG
     // activation so stale reverse companions are refreshed against the new HA
     // snapshot instead of staying pinned to the earlier inactive result.
-    let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
-    let forward_entries = shared_sessions
+    let reverse_entries = shared_sessions
         .lock()
         .map(|sessions| {
+            let mut reverse_entries = Vec::new();
             sessions
                 .values()
-                .filter(|entry| {
-                    !entry.metadata.is_reverse
-                        && entry.metadata.synced
-                        && owner_rg_set.contains(&entry.metadata.owner_rg_id)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
+                .filter(|entry| !entry.metadata.is_reverse && entry.metadata.synced)
+                .for_each(|entry| {
+                    let Some(reverse) = synthesized_synced_reverse_entry(
+                        forwarding,
+                        ha_state,
+                        dynamic_neighbors,
+                        entry,
+                        now_secs,
+                    ) else {
+                        return;
+                    };
+                    if owner_rg_set.contains(&entry.metadata.owner_rg_id)
+                        || owner_rg_set.contains(&reverse.metadata.owner_rg_id)
+                    {
+                        reverse_entries.push(reverse);
+                    }
+                });
+            reverse_entries
         })
         .unwrap_or_default();
-    if forward_entries.is_empty() {
+    if reverse_entries.is_empty() {
         return;
     }
-    for entry in forward_entries {
-        let Some(reverse) = synthesized_synced_reverse_entry(
-            forwarding,
-            ha_state,
-            dynamic_neighbors,
-            &entry,
-            now_secs,
-        ) else {
-            continue;
-        };
+    for reverse in reverse_entries {
         publish_shared_session(
             shared_sessions,
             shared_nat_sessions,
@@ -1095,6 +1100,7 @@ pub(super) fn reverse_resolution_for_session(
             ha_state.get(&owner_rg_for_resolution(forwarding, resolved)),
             Some(group)
                 if group.active
+                    && !super::ha_group_is_demoting(group, now_secs)
                     && group.watchdog_timestamp != 0
                     && now_secs >= group.watchdog_timestamp
                     && now_secs.saturating_sub(group.watchdog_timestamp)
@@ -1241,6 +1247,8 @@ fn is_translated_forward_session_key(
 
 fn should_keep_synced_hit_transient(
     forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
     ingress_ifindex: i32,
     key: &SessionKey,
     decision: SessionDecision,
@@ -1248,6 +1256,7 @@ fn should_keep_synced_hit_transient(
 ) -> bool {
     ingress_is_fabric(forwarding, ingress_ifindex)
         && metadata.synced
+        && !owner_rg_is_locally_active(ha_state, metadata.owner_rg_id, now_secs)
         && is_translated_forward_session_key(key, decision, metadata)
 }
 
@@ -1312,7 +1321,15 @@ pub(super) fn resolve_flow_session_decision(
                 ))
             });
         let keep_transient = poison_key.is_some_and(|(key, decision, metadata)| {
-            should_keep_synced_hit_transient(forwarding, ingress_ifindex, key, decision, metadata)
+            should_keep_synced_hit_transient(
+                forwarding,
+                ha_state,
+                now_secs,
+                ingress_ifindex,
+                key,
+                decision,
+                metadata,
+            )
         });
         if keep_transient && let Some((key, decision, metadata)) = poison_key {
             purge_translated_synced_hit(
@@ -1421,16 +1438,17 @@ pub(super) fn resolve_flow_session_decision(
         resolution_target,
         looked_up_resolution,
     );
+    let enforced_resolution = enforce_session_ha_resolution(
+        forwarding,
+        ha_state,
+        now_secs,
+        looked_up_resolution,
+        ingress_ifindex,
+        ha_startup_grace_until_secs,
+    );
     decision.resolution = redirect_session_via_fabric_if_needed(
         forwarding,
-        enforce_session_ha_resolution(
-            forwarding,
-            ha_state,
-            now_secs,
-            looked_up_resolution,
-            ingress_ifindex,
-            ha_startup_grace_until_secs,
-        ),
+        enforced_resolution,
         ingress_ifindex,
         resolved.metadata.ingress_zone.as_ref(),
     );
@@ -1759,6 +1777,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: 1,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
 
@@ -2168,7 +2187,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_fabric_ingress() {
+    fn resolve_flow_session_decision_promotes_translated_shared_hit_on_active_fabric_ingress() {
         let mut sessions = SessionTable::new();
         let key = test_key();
         let decision = SessionDecision {
@@ -2222,6 +2241,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: 1,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
 
@@ -2255,19 +2275,24 @@ mod tests {
             ForwardingDisposition::ForwardCandidate
         );
         assert_eq!(resolved.decision.resolution.egress_ifindex, 12);
-        assert!(resolved.metadata.synced);
-        assert!(sessions.lookup(&translated_key, 1_000_000, 0x18).is_none());
+        assert!(!resolved.metadata.synced);
+        let local_hit = sessions
+            .lookup(&translated_key, 1_000_000, 0x18)
+            .expect("promoted translated hit should stay local");
+        assert_eq!(local_hit.decision.nat, decision.nat);
+        assert!(!local_hit.metadata.synced);
         assert!(
             shared_sessions
                 .lock()
                 .expect("shared lock")
                 .get(&translated_key)
-                .is_none()
+                .is_some()
         );
     }
 
     #[test]
-    fn resolve_flow_session_decision_purges_local_synced_translated_hit_on_fabric_ingress() {
+    fn resolve_flow_session_decision_promotes_local_synced_translated_hit_on_active_fabric_ingress()
+    {
         let mut sessions = SessionTable::new();
         let key = test_key();
         let decision = SessionDecision {
@@ -2316,6 +2341,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: 1,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
 
@@ -2349,6 +2375,99 @@ mod tests {
             ForwardingDisposition::ForwardCandidate
         );
         assert_eq!(resolved.decision.resolution.egress_ifindex, 12);
+        assert!(!resolved.metadata.synced);
+        let local_hit = sessions
+            .lookup(&translated_key, 1_000_000, 0x18)
+            .expect("promoted translated local hit should stay local");
+        assert_eq!(local_hit.decision.nat, decision.nat);
+        assert!(!local_hit.metadata.synced);
+    }
+
+    #[test]
+    fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inactive_fabric_ingress()
+    {
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: resolve_fabric_redirect(&test_forwarding_state_with_fabric())
+                .expect("fabric redirect"),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+        };
+        let translated_key = forward_wire_key(&key, decision.nat);
+        let entry = SyncedSessionEntry {
+            key: translated_key.clone(),
+            decision,
+            metadata: SessionMetadata {
+                synced: true,
+                ..test_metadata()
+            },
+            origin: SessionOrigin::SyncImport,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x18,
+        };
+        let mut forwarding = test_forwarding_state_with_fabric();
+        forwarding.connected_v4.push(ConnectedRouteV4 {
+            prefix: PrefixV4::from_net(Ipv4Net::new(Ipv4Addr::new(172, 16, 80, 0), 24).unwrap()),
+            ifindex: 12,
+            tunnel_endpoint_id: 0,
+        });
+        forwarding.neighbors.insert(
+            (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+            NeighborEntry {
+                mac: [0xde, 0xad, 0xbe, 0xef, 0x80, 0x00],
+            },
+        );
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &entry,
+        );
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let peer_worker_commands = Vec::new();
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(
+            1,
+            HAGroupRuntime {
+                active: false,
+                watchdog_timestamp: 0,
+                demoting: false,
+                demoting_until_secs: 0,
+            },
+        );
+
+        let flow = SessionFlow {
+            src_ip: translated_key.src_ip,
+            dst_ip: translated_key.dst_ip,
+            forward_key: translated_key.clone(),
+        };
+        let resolved = resolve_flow_session_decision(
+            &mut sessions,
+            -1,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &peer_worker_commands,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+            &flow,
+            1_000_000,
+            1,
+            PROTO_TCP,
+            0x18,
+            21,
+            0,
+        )
+        .expect("translated shared hit should resolve");
+
         assert!(resolved.metadata.synced);
         assert!(sessions.lookup(&translated_key, 1_000_000, 0x18).is_none());
     }
@@ -2397,6 +2516,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: 0,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         let forwarding = test_forwarding_state();
@@ -2463,6 +2583,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         let forwarding = test_forwarding_state();
@@ -2678,6 +2799,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2747,6 +2869,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2827,6 +2950,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2899,6 +3023,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -2987,6 +3112,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -3071,6 +3197,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         ha_state.insert(
@@ -3079,6 +3206,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -3162,6 +3290,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         let mut flow_cache = FlowCache::new();
@@ -3313,6 +3442,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: 1,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
 
@@ -3351,6 +3481,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: 1,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         ha_state.insert(
@@ -3359,6 +3490,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: 1,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
 
@@ -3419,6 +3551,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: 1,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )]);
         let resolved = enforce_session_ha_resolution(
@@ -3455,6 +3588,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: 0,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )]);
         let resolved = enforce_session_ha_resolution(
@@ -3492,6 +3626,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: 0,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )]);
         let reverse = build_reverse_session_from_forward_match(
@@ -3560,6 +3695,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: 1,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         let entry = SyncedSessionEntry {
@@ -3607,7 +3743,7 @@ mod tests {
     }
 
     #[test]
-    fn prewarm_reverse_synced_sessions_skips_unrelated_owner_rg() {
+    fn prewarm_reverse_synced_sessions_recomputes_when_reverse_owner_rg_activates() {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -3621,6 +3757,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: 1,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         );
         let mut entry = SyncedSessionEntry {
@@ -3643,8 +3780,9 @@ mod tests {
             &entry,
         );
 
-        // owner_rgs=[2] does not include the session's owner_rg_id=1, so
-        // no reverse companion should be synthesized.
+        // owner_rgs=[2] does not include the forward session's owner_rg_id=1,
+        // but the synthesized reverse companion resolves to owner_rg_id=2 in
+        // the split-RG topology, so activation of RG2 must still prewarm it.
         prewarm_reverse_synced_sessions_for_owner_rgs(
             &shared_sessions,
             &shared_nat_sessions,
@@ -3659,14 +3797,14 @@ mod tests {
         );
 
         let reverse_key = reverse_session_key(&entry.key, entry.decision.nat);
-        assert!(
-            shared_sessions
-                .lock()
-                .expect("shared sessions")
-                .get(&reverse_key)
-                .is_none(),
-            "reverse entry should not be created for unrelated owner RG"
-        );
-        assert_eq!(worker_commands[0].lock().expect("commands").len(), 0);
+        let reverse = shared_sessions
+            .lock()
+            .expect("shared sessions")
+            .get(&reverse_key)
+            .cloned()
+            .expect("reverse entry");
+        assert!(reverse.metadata.is_reverse);
+        assert_eq!(reverse.metadata.owner_rg_id, 2);
+        assert_eq!(worker_commands[0].lock().expect("commands").len(), 1);
     }
 }

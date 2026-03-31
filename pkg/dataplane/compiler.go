@@ -304,9 +304,9 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 
 		// Try native XDP first on non-tunnel interfaces.
 		// Tunnel interfaces (GRE, ip6gre, XFRM) lack native XDP support
-		// and must always use generic mode — but they should NOT force
-		// all other interfaces into generic mode.
-		needGeneric := false
+		// and must always use generic mode. A native attach failure on one
+		// interface should not force unrelated interfaces into generic mode.
+		failedNativeXDP := make(map[int]bool)
 		for _, ifidx := range result.pendingXDP {
 			if result.tunnelIfindexes[ifidx] || result.genericXDPIfindexes[ifidx] {
 				continue // tunnels always get generic below
@@ -315,40 +315,48 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 				if strings.Contains(err.Error(), "already attached") {
 					continue
 				}
-				slog.Info("native XDP not supported, falling back ALL to generic",
+				slog.Info("native XDP not supported, falling back interface to generic",
 					"ifindex", ifidx, "err", err)
-				needGeneric = true
-				break
+				m.DetachXDP(ifidx)
+				failedNativeXDP[ifidx] = true
 			}
 		}
 
-		if needGeneric {
-			for _, ifidx := range result.pendingXDP {
-				m.DetachXDP(ifidx)
+		if len(failedNativeXDP) > 0 {
+			failed := make([]int, 0, len(failedNativeXDP))
+			for ifidx := range failedNativeXDP {
+				failed = append(failed, ifidx)
 			}
-			// Clear IFACE_FLAG_NATIVE_XDP from all iface_zone_map
-			// entries since everything runs in generic mode.
-			m.clearNativeXDPFlags()
+			// Clear IFACE_FLAG_NATIVE_XDP only for interfaces that actually
+			// fell back to generic mode.
+			m.clearNativeXDPFlagsForIfindexes(failed)
 		}
 		// Attach remaining interfaces: generic-only for tunnels,
-		// VLAN child subinterfaces, or all interfaces if needGeneric.
-		// Skip VLAN sub-interfaces when ALL interfaces run generic XDP —
-		// the parent's generic XDP sees VLAN-tagged frames before kernel
-		// VLAN demuxing (netif_receive_generic_xdp runs first in
-		// __netif_receive_skb_core). Attaching generic XDP to a VLAN
-		// sub-interface also creates a kernel-level conflict on the parent
-		// (EEXIST), preventing subsequent parent attachment.
+		// VLAN child subinterfaces, or interfaces whose native attach failed.
+		// Skip VLAN sub-interfaces when the userspace shim is active or when
+		// their parent physical interface already fell back to generic mode.
+		// In that case the parent's generic XDP sees VLAN-tagged frames before
+		// kernel VLAN demuxing (netif_receive_generic_xdp runs first in
+		// __netif_receive_skb_core), and attaching generic XDP to the child
+		// can create a kernel-level conflict on the parent (EEXIST).
 		// Also skip with the userspace XDP shim — XDP_PASS on generic mode
 		// doesn't properly deliver NDP to kernel on VLAN devices.
 		isUserspaceShim := m.XDPEntryProg == "xdp_userspace_prog"
 		for _, ifidx := range result.pendingXDP {
-			forceGeneric := needGeneric || result.tunnelIfindexes[ifidx] || result.genericXDPIfindexes[ifidx]
+			forceGeneric := failedNativeXDP[ifidx] || result.tunnelIfindexes[ifidx] || result.genericXDPIfindexes[ifidx]
 			if !forceGeneric {
 				continue // already attached native above
 			}
-			if result.genericXDPIfindexes[ifidx] && !result.tunnelIfindexes[ifidx] &&
-				(needGeneric || isUserspaceShim) {
-				continue // skip VLAN sub-interfaces — parent handles VLAN traffic
+			if result.genericXDPIfindexes[ifidx] && !result.tunnelIfindexes[ifidx] {
+				if isUserspaceShim {
+					continue // skip VLAN sub-interfaces — parent handles VLAN traffic
+				}
+				if link, err := result.cachedLinkByIndex(ifidx); err == nil {
+					parentIfindex := link.Attrs().ParentIndex
+					if parentIfindex > 0 && failedNativeXDP[parentIfindex] {
+						continue
+					}
+				}
 			}
 			if err := m.AttachXDP(ifidx, true); err != nil {
 				if !strings.Contains(err.Error(), "already attached") {

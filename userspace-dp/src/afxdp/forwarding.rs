@@ -1058,7 +1058,7 @@ pub(super) fn enforce_ha_resolution_snapshot(
             ..resolution
         };
     };
-    if !group.active || group.demoting {
+    if !group.active || ha_group_is_demoting(group, now_secs) {
         return ForwardingResolution {
             disposition: ForwardingDisposition::HAInactive,
             ..resolution
@@ -1074,6 +1074,10 @@ pub(super) fn enforce_ha_resolution_snapshot(
         };
     }
     resolution
+}
+
+pub(super) fn ha_group_is_demoting(group: &HAGroupRuntime, now_secs: u64) -> bool {
+    group.demoting && group.demoting_until_secs != 0 && now_secs <= group.demoting_until_secs
 }
 
 pub(super) fn cached_flow_decision_valid(
@@ -2207,6 +2211,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )])));
         let resolved = enforce_ha_resolution(
@@ -2226,6 +2231,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )])));
         let resolved = enforce_ha_resolution(
@@ -2242,12 +2248,14 @@ mod tests {
     #[test]
     fn ha_resolution_blocks_demoting_owner_rg() {
         let state = build_forwarding_state(&nat_snapshot());
+        let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
             HAGroupRuntime {
                 active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                watchdog_timestamp: now_secs,
                 demoting: true,
+                demoting_until_secs: now_secs + 5,
             },
         )])));
         let resolved = enforce_ha_resolution(
@@ -2267,6 +2275,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )]);
         let demoted = BTreeMap::from([(
@@ -2275,6 +2284,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )]);
         let resolution =
@@ -2298,6 +2308,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )])));
         let blocked = enforce_ha_resolution(
@@ -2340,6 +2351,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )])));
         let blocked = enforce_ha_resolution(
@@ -2371,6 +2383,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: now_secs,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )]);
         let redirected = resolve_fabric_redirect(&state).expect("fabric redirect");
@@ -2554,6 +2567,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )])));
         let blocked = enforce_ha_resolution(
@@ -2584,6 +2598,7 @@ mod tests {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )]);
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -2623,6 +2638,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )]);
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -2945,6 +2961,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )]);
         let icmp_match = EmbeddedIcmpMatch {
@@ -3098,6 +3115,7 @@ mod tests {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
+                demoting_until_secs: 0,
             },
         )]);
         let icmp_match = EmbeddedIcmpMatch {
