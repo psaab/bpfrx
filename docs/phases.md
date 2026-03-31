@@ -2906,169 +2906,20 @@ After the IPVLAN overlay refactor (CC-11/CC-12) and monitor fixes (CC-14), fabri
 - **BPF-native telemetry:** When XDP bypasses kernel networking, BPF maps are the only reliable counters. Per-link and per-zone granularity replaces what tcpdump would have provided
 - **Document limitations prominently:** When a tool (tcpdump) silently fails for a specific traffic path, the CLI should warn users proactively rather than letting them discover empty captures
 
----
+## 2026-03-31: Bulk Issue Resolution + Userspace HA Failover Fix
 
-## Sprint CC-16: Split-Brain Fix, Monitor Proxy, CLI History, Issue Triage (2026-03-06)
+### Issue Sweep (PR #299)
+Closed 21 of 22 open issues in a single session. 4 parallel teams:
+- **HA transition guards (#283, #284, #285):** `pendingRGTransitions` per-RG map with defer cleanup, promotion pre-switches to eBPF pipeline
+- **Demotion cleanup (#297, #298):** Synchronous alias map deletion from shared_nat/forward_wire sessions, `clear_ha_demotion` on PrepareRGDemotion failure
+- **Userspace fixes (#286, #288, #289, #290, #291):** Session refresh pre-filter (reverted in review — cross-RG re-resolution needs full table), static neighbor retry, SNAT ICMP reverse key, XDP shim interface-NAT redirect + counter
+- **API scalability (#275):** Cursor-based GetSessions pagination with page_token/page_size, no_enrich flag
+- **XDP shim stack fix (#290/#291):** Removed redundant `dst_v6` from `ParsedPacket` (-16 bytes) to fit interface-NAT changes within 512-byte BPF limit
 
-### Fix: XDP host-inbound-all drops unknown services → cluster split-brain (`b1e966b`)
-- **Problem:** `xdp_policy.c` host-inbound fallback checked individual service flags (SSH, ping, DHCP, etc.) but NOT `HOST_INBOUND_ALL`. Zones with `system-services { all; }` still dropped services not in the enumerated flag list (e.g., heartbeat UDP 4784). After `bpfrxd cleanup` during deploy, conntrack sessions wiped → new heartbeat packets hit xdp_policy as new flows → denied → split-brain
-- **Fix:** Added `zcfg->host_inbound_flags == HOST_INBOUND_ALL` short-circuit in xdp_policy.c before individual flag checks. When all services are allowed, skip individual flag matching entirely
-- **Key insight:** `HOST_INBOUND_ALL` is a bitmask with all flags set — but custom/unknown services have no flag bit. The `== HOST_INBOUND_ALL` check must be treated as "accept everything" rather than "check all known flags"
+### CC-20: Userspace ctrl enable flushes synced BPF conntrack (FIXED `1a2b0a25`)
+**The smoking gun for userspace HA failover session death.** When ctrl transitions disabled→enabled on the new owner, `applyHelperStatusLocked()` flushed ALL BPF conntrack entries including 382 synced sessions from the peer. Fix: track `ctrlDisabledAt` timestamp, only flush sessions created after that point.
 
-### Fix: Monitor interface peer proxy resolution (`2ca3841`)
-- **Problem:** `isPeerInterface()` only checked RG interface monitors, not FPC slot → node-id mapping. `ge-7/0/0` on node0 returned "not found" instead of proxying to peer
-- **Fix:** Check `InterfaceSlot()` + `SlotToNodeID()` first for FPC-based node resolution
-
-### CLI persistent history
-- Moved history files from `/tmp/` to `~/.bpfrx_history` (local CLI) and `~/.bpfrx_cli_history` (remote CLI)
-- History now persists across daemon restarts and reboots
-
-### Issues #145-#150 closed as N/A
-- #145 AppID: known future feature, no L7 classifier yet
-- #146 Pre-ID policy: depends on AppID
-- #147 License autoupdate: N/A for bpfrx (no license system)
-- #148 NTP threshold: delegated to chrony
-- #149 Power-mode-disable: N/A, vSRX hardware knob
-- #150 Policy-stats: already unconditionally enabled in BPF
-
-### Fix #140: RPM target url syntax
-- **Problem:** RPM probe `target url http://X.X.X.X` hierarchical syntax not parsed — `target` node had `url` child but compiler only read `nodeVal(target)`
-- **Fix:** Compiler checks `prop.FindChild("url")` first, falls back to `nodeVal(prop)` for plain `target 1.1.1.1` syntax
-- **AST:** Extended `test` schema node with `target { url }` children
-
-### Fix #141: RPM routing-instance wired to VRF
-- **Problem:** RPM probes ignored `routing-instance` config — all probes ran in default VRF
-- **Fix:** `vrfDialer()` in `pkg/rpm/rpm.go` binds probe sockets to VRF device via `SO_BINDTODEVICE` (`syscall.SO_BINDTODEVICE`). VRF device name derived from routing instance name (`vrf-` + instance name). Also supports `source-address` binding via `net.Dialer.LocalAddr`. All three probe types (ICMP, TCP, HTTP) updated to use `vrfDialer()` — HTTP uses custom `http.Transport` with `DialContext` set to the VRF-bound dialer
-
-### Fix #142: RPM probe-limit
-- **Problem:** No way to cap consecutive probe failures — probes ran indefinitely even when target is clearly down
-- **Fix:** Added `ProbeLimit int` field to `RPMTest` config type. Compiler parses `probe-limit` from both hierarchical and flat set syntax. AST schema extended with `probe-limit` under test node. In `runSingleTest()`, consecutive failure count checked against `probeLimit` — when reached, test cycle breaks early
-
-### Fix #143: Dynamic-address feed model extension
-- **Problem:** Feed-server only supported single URL per server. Junos supports `hostname` + per-feed `feed-name { path }` for multiple feeds from one server
-- **Fix:**
-  - New `FeedEntry` struct with `Name` + `Path` fields for per-feed path configuration
-  - `FeedServer` extended with `Hostname` (for base URL construction) and `FeedEntries []FeedEntry`
-  - `resolveBaseURL()` prefers explicit URL, falls back to `https://hostname`
-  - `AddressBinding` struct with `FeedNames` for `address-name { profile { feed-name } }` bindings
-  - `feedState` simplified: stores resolved `url` instead of `*FeedServer` pointer
-  - AST: `feed-server` schema expanded with `hostname`, `feed-name { path }`, and new `address-name { profile { feed-name } }` schema
-  - Backward compatible: single `feed-name` (no children) still works as before
-
-### Fix #144: Flow export extensions for NetFlow v9
-- **Problem:** NetFlow v9 templates had no way to specify export extensions (e.g., `app-id`, `flow-dir`), and template fields were hardcoded with fixed record sizes
-- **Fix:**
-  - Added `ExportExtensions []string` to `NetFlowV9Template` config type
-  - Compiler parses `export-extension` from `ipv4-template`/`ipv6-template` children in flow-monitoring config
-  - `V9TemplateOptions` struct with `IncludeFlowDir bool` controls optional fields
-  - Refactored template system from hardcoded `recordSizeV4`/`recordSizeV6` to dynamic `templateField` slices via `buildTemplateFieldsV4()`/`buildTemplateFieldsV6()` — record size computed from field list
-  - `encodeTemplateFlowSet()` and `encodeDataFlowSet()` now take options for conditional field inclusion
-  - `flow-dir` extension adds `fieldDirection` (IANA #61) to NetFlow v9 export templates
-
----
-
-## Sprint CC-17: Performance + VPN Correctness (#151-#153, 2026-03-06)
-
-### Perf: Cache fabric redirect state and fix CPU mask scaling (#151, `659143e`)
-- **Problem:** `try_fabric_redirect()` in xdp_zone.c performed `bpf_map_lookup_elem` on `fabric_fwd` map on every packet, even though fabric state changes infrequently. Additionally, CPU mask generation in `pkg/dataplane/cpumask.go` produced incorrect masks for CPU counts beyond a single 32-bit word (>32 CPUs)
-- **Fix (BPF):** Added `fabric_ingress_match()` and `fabric_main_fib_peer()` helper functions in `xdp_zone.c` that cache `fabric_fwd` map lookup results in local variables, avoiding redundant map lookups in the hot path
-- **Fix (Go):** Extracted CPU mask logic into `pkg/dataplane/cpumask.go` with proper multi-word mask generation. `allCPUMask(numCPU)` builds a bitmask spanning multiple 32-bit words, `singleCPUMask(cpu)` targets a specific CPU, and `formatCPUMask()` renders as comma-separated hex (kernel sysfs format). Comprehensive tests in `cpumask_test.go`
-
-### Perf: Reduce flow export allocations and preserve source-address collectors (#152, `3961a0d`)
-- **Problem:** NetFlow v9/IPFIX export path allocated fresh template metadata and packet buffers on every export cycle, causing GC pressure under high flow rates. Collector deduplication was also lost across config changes — reloading config could create duplicate collector goroutines for the same destination
-- **Fix:**
-  - Precomputed template metadata: template field lists and record sizes computed once at config compile time, reused across export cycles
-  - Single-buffer packet encoding: reuse a pre-allocated byte buffer for packet serialization instead of allocating per-export
-  - Source-address collector dedup: collectors keyed by `(collector-addr, source-addr)` tuple — existing collectors preserved across config reloads instead of being torn down and recreated
-
-### VPN: Fix IPsec xfrmi lifecycle and PFS handling (#153, `c592976` + `8001878`)
-- **Problem (stale xfrmi):** Removing VPN config from the firewall left stale XFRM tunnel interfaces and swanctl config files in the kernel/filesystem. No reconciliation ran on commit — only additive changes were applied
-- **Fix (xfrmi lifecycle):** Full reconciliation on every commit — daemon compares desired tunnel/xfrmi/IPsec state against kernel state and removes stale devices and swanctl configs that no longer appear in the active config
-- **Problem (xfrmi naming):** XFRM interface names were not deterministic and could collide between different secure-tunnel devices (e.g., `st0` and `st1`)
-- **Fix (xfrmi naming):** New `config.XFRMIfNameAndID()` function (`pkg/config/xfrmi.go`) generates unit-specific names and stable `if_id` values: `st0.0`→if_id 1, `st0.1`→if_id 2, `st1.0`→if_id 65537. The `if_id` encodes `(stIndex << 16) | (unit + 1)`, guaranteeing uniqueness across all st devices and units
-- **Problem (PFS groups):** IPsec policy `perfect-forward-secrecy keys` config was incorrectly emitted as `dpd_action` in swanctl ESP proposals instead of the DH group (e.g., `group14`). PFS was silently disabled
-- **Fix (PFS):** Compiler now correctly maps PFS group config to ESP proposal `dh_groups` field in swanctl output
-- **Problem (VLAN guard):** `st0.0` was misidentified as a VLAN sub-interface by the interface compiler, causing incorrect VLAN tagging config to be generated
-- **Fix (VLAN guard):** Added `isConfiguredVLANSubInterface()` guard that checks the interface is a known VLAN parent before treating `.N` suffixed names as VLAN sub-interfaces. Secure tunnel interfaces (`st0.X`) are excluded
-
----
-
-## Sprint CC-18: Junos IKE/IPsec Compatibility (#154-#159, 2026-03-06)
-
-### Fix #154: PrepareConfig deep copy for external-interface → local-address resolution
-- **Problem:** IPsec `external-interface` was not resolved to a concrete `local-address` before writing swanctl.conf. strongSwan requires `local_addrs` to be an IP address, not an interface name
-- **Fix:**
-  - New `ipsec.PrepareConfig(cfg)` function (`pkg/ipsec/prepare.go`) creates a deep copy of the IPsec config and resolves `external-interface` to `local-address` at runtime
-  - Resolution checks interface config for static addresses first, then falls back to kernel interface addresses
-  - Address family matching ensures IPv4/IPv6 gateway addresses pair with matching local addresses
-  - Used by both daemon apply path and CLI apply path — single source of truth for IPsec config preparation
-
-### Fix #155: Auth method selection and local certificate support
-- **Problem:** IKE authentication method was hardcoded to PSK (`psk`) in swanctl output. RSA/ECDSA signatures and local certificate configurations were ignored
-- **Fix:**
-  - IKE proposal `authentication-method` compiled to swanctl `auth` field: `pre-shared-keys` → `psk`, `rsa-signatures`/`ecdsa-signatures` → `pubkey`
-  - `local-certificate` gateway config generates swanctl `certs` field for certificate-based authentication
-  - New `authMethodToSwan()` helper in `pkg/ipsec/junos_secret.go`
-
-### Fix #156: IKE/ESP proposal lifetime support
-- **Problem:** `lifetime-seconds` on IKE and ESP proposals was not compiled to swanctl output, causing strongSwan to use its own defaults instead of configured values
-- **Fix:** `lifetime-seconds` maps to `rekey_time` in swanctl connection config, with `rand_time = 0s` for deterministic rekey behavior
-
-### Fix #157: DPD structured parsing with mode semantics
-- **Problem:** `dead-peer-detection` was parsed as a flat string, losing the `interval`, `threshold`, and mode (`optimized`/`always-send`/`probe-idle-tunnel`) children. swanctl DPD config was not generated
-- **Fix:**
-  - DPD now parsed as a structured node with children for mode, interval, and threshold
-  - Mode + establish-tunnels mapping to swanctl: `always-send` → `dpd_delay=interval`, `dpd_timeout=interval*threshold`; `optimized` → `dpd_action=trap`; `probe-idle-tunnel` → `dpd_action=trap` + `dpd_delay`
-  - Graceful defaults when interval/threshold not specified
-
-### Fix #158: Junos $9$ obfuscated PSK decoding
-- **Problem:** Junos configuration exports use `$9$...` obfuscated encoding for pre-shared keys. These were written verbatim to swanctl.conf, causing strongSwan to use the obfuscated string as the literal PSK — IKE authentication always failed
-- **Fix:**
-  - New `pkg/ipsec/junos_secret.go` implements the Junos `$9$` decoder (MIT-licensed adapter from github.com/nadddy/jcrypt)
-  - Decoder runs automatically before writing PSK to swanctl.conf
-  - Plaintext and `$9$`-encoded secrets both handled transparently
-
-### Fix #159: Traffic selector support for multi-child IPsec SAs
-- **Problem:** VPN `traffic-selector <name> { local-ip ...; remote-ip ...; }` config was not compiled. Only a single child SA per connection was generated, limiting IPsec tunnels to a single traffic pair
-- **Fix:**
-  - Traffic selectors create multiple named swanctl child SAs per connection
-  - `sanitizeChildName()` helper normalizes selector names for swanctl compatibility
-  - SA status parsing hardened to handle multi-child output from `swanctl --list-sas`
-
-### Deterministic config output and NAT-T display
-- VPN iteration sorted by name for reproducible swanctl.conf generation across commits
-- `nat-traversal force` mode displayed in `show security ike security-associations` CLI output
-
----
-
-## NTP Threshold Action (#162, 2026-03-06)
-
-- Wired `system ntp threshold <seconds> action accept|reject` to chrony runtime behavior
-- `accept` → chrony `logchange <threshold>` (log-only); `reject` → adds `maxchange <threshold> 1 -1` (rejects large post-startup corrections)
-- Managed drop-in at `/etc/chrony/conf.d/bpfrx-threshold.conf`; refactored `applySystemNTP()` into helpers (`renderChronySources`, `renderChronyThreshold`, `reconcileManagedFile`)
-- NTP threshold shown in `show ntp` and `show system services` CLI/gRPC output; unit tests in `pkg/daemon/ntp_test.go`
-
----
-
-## Sprint CC-19: AppID Runtime, Pre-ID Logging, Master-Password Encryption (#163, 2026-03-06)
-
-### AppID runtime wiring
-- **Problem:** AppID signatures were parsed and compiled to BPF maps, but no Go-side runtime existed to use them for session classification or CLI display
-- **Fix:**
-  - New `pkg/appid/runtime.go` with three entry points: `CatalogNames()` lists all known AppID signatures, `ResolveSessionName()` maps a session's app_id field to a human-readable name, `SessionMatches()` checks if a session matches a given application name
-  - CLI `show security flow session` now supports filtering by application name via `appid.ResolveSessionName()`
-  - DPDK mirror: `app_id` field wired through sessions, events, and shared memory structs
-
-### Pre-ID default policy logging
-- **Problem:** Sessions matching the default policy before AppID classification completes had no way to log session-init or session-close events. The BPF pipeline lacked per-flow AppID state flags
-- **Fix:**
-  - New BPF `app_flags` field in flow metadata with three flags: `FLOW_APPID_ENABLED` (AppID is active for this flow), `FLOW_PREID_LOG_SESSION_INIT` (log session creation before classification), `FLOW_PREID_LOG_SESSION_CLOSE` (log session teardown before classification)
-  - Flags are set by the policy compiler based on default-policy logging configuration
-  - BPF ring buffer events include pre-ID log state for userspace syslog emission
-
-### Master-password at-rest encryption
-- **Problem:** Config persistence stored sensitive data (PSKs, secrets) in plaintext on disk. No at-rest encryption mechanism existed
-- **Fix:**
-  - New `pkg/configstore/crypto.go` implements AES-256-GCM encryption with HKDF key derivation from a master password
-  - Config files encrypted transparently on write and decrypted on read when master-password is configured
-  - Feature gap status: master-password moved from Parse-Only to Done; AppID moved from Parse-Only to Partial
+**Remaining HA issues identified in investigation docs:**
+- (H) Public-side LocalDelivery materialization from shared_promote path
+- (F) Fabric transit throughput ceiling for redirected established flows
+- Split-RG crash leaves `session sync not ready` stuck

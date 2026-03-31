@@ -144,17 +144,6 @@
 - Sends host-bound packets through policy pipeline where deny-all drops them
 - **Fix:** xdp_policy checks `host_inbound_flag()` before denying, tail-calls to xdp_forward with fwd_ifindex=0
 
-### XDP host-inbound-all drops unknown services → cluster split-brain (FIXED `b1e966b`)
-- **Symptom:** After `bpfrxd cleanup` + redeploy, cluster heartbeat (UDP 4784) dropped by xdp_policy → nodes can't see each other → split-brain
-- **Root cause:** `xdp_policy.c` host-inbound fallback checked individual service flags but not `HOST_INBOUND_ALL`. Zones configured with `system-services { all; }` still dropped unknown/custom services (like heartbeat UDP 4784). After `bpfrxd cleanup` wipes conntrack, new heartbeat packets hit xdp_policy as new flows and got denied
-- **Fix:** Added `zcfg->host_inbound_flags == HOST_INBOUND_ALL` short-circuit in xdp_policy.c before individual service flag checks
-- **Key insight:** `host_inbound_flags == HOST_INBOUND_ALL` means accept ALL host-bound traffic, not just the union of known flags. Any service not explicitly enumerated (heartbeat, custom UDP) was silently dropped
-
-### Monitor interface peer proxy doesn't resolve FPC slot → node-id (FIXED `2ca3841`)
-- **Symptom:** `monitor interface ge-7/0/0` on node0 returned "interface not found" instead of proxying to peer node
-- **Root cause:** `isPeerInterface()` only checked RG interface monitors, not FPC slot → node-id mapping. ge-7/0/0 has FPC slot 7 which maps to node1, but this resolution was missing
-- **Fix:** Check `InterfaceSlot()` + `SlotToNodeID()` first before falling back to RG interface monitor checks
-
 ## Important Bugs
 
 ### tx_ports devmap value size
@@ -996,59 +985,17 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Root cause:** `try_fabric_redirect()` increments a single per-interface TX counter but has no per-link or per-zone accounting
 - **Fix:** Add BPF per-link redirect counters (fab0/fab1 differentiated, zone-encoded) and expose via CLI (`show chassis cluster statistics` or similar)
 
-## Sprint CC-17: Performance + VPN Correctness (#151-#153, 2026-03-06)
+### Generic XDP CHECKSUM_PARTIAL corruption — TCP/UDP broken after NAT (FIXED `dfd3ebc`)
+- **Symptom:** TCP connections through local cluster firewall fail silently. SYN reaches server but checksum is invalid → server drops it. ICMP (ping) works fine. Only affects generic XDP (SKB mode), not native/driver XDP
+- **Root cause:** `xdp_main.c` set `meta->native_xdp=1` for ALL interfaces in `redirect_capable` map (value!=0). In generic XDP, skb has `ip_summed=CHECKSUM_PARTIAL` — L4 checksum field contains only the pseudo-header complement. With `native_xdp=1`, `set_l4_csum_flags()` skips CHECKSUM_PARTIAL detection → `csum_partial=0` → NAT code does full incremental checksum updates (`csum_update_4` for IP, `csum_update_2` for port) on what's actually a partial seed → NIC/kernel adds L4 byte sum to corrupted value → invalid final checksum
+- **Fix:** Remove the `native_xdp` optimization entirely. Always run CHECKSUM_PARTIAL detection in `set_l4_csum_flags()` (~10-30 extra BPF insns, negligible). Correct for both native and generic XDP
+- **Why ICMP worked:** ICMP checksum covers only the ICMP header+payload (no pseudo-header), so SNAT source IP change doesn't affect it. ICMP has no ports to update
+- **Key insight:** `redirect_capable` map value 1 was set for ALL non-tunnel interfaces regardless of XDP mode. The `needGeneric` fallback in compiler.go re-ran the generic attach loop but never updated the map values. A second compile cycle (e.g., for fabric interfaces) could also reset values
 
-### CPU mask scaling incorrect for >32 CPUs (FIXED #151, `659143e`)
-- **Symptom:** On machines with more than 32 CPUs, the generated CPU mask for CPUMAP was truncated to a single 32-bit word, leaving higher-numbered CPUs out of XDP redirect distribution
-- **Root cause:** CPU mask generation used a single `uint32` instead of a multi-word slice. CPUs beyond index 31 were silently dropped
-- **Fix:** Extracted CPU mask logic into `pkg/dataplane/cpumask.go` with proper multi-word `[]uint32` slice generation and comma-separated hex formatting matching kernel sysfs format
-
-### IPsec PFS groups emitted as dpd_action instead of DH group (FIXED #153, `8001878`)
-- **Symptom:** IPsec tunnels configured with `perfect-forward-secrecy keys groupN` silently ran without PFS — ESP rekeys used no DH exchange
-- **Root cause:** Compiler mapped PFS group config to the `dpd_action` field in swanctl ESP proposals instead of `dh_groups`. The PFS value was written to the wrong config key
-- **Fix:** Compiler now correctly emits PFS group as `dh_groups` in swanctl ESP proposal output (e.g., `dh_groups = modp2048` for `group14`)
-
-### Stale xfrmi devices not cleaned up on VPN config removal (FIXED #153, `c592976`)
-- **Symptom:** After removing IPsec VPN config and committing, stale XFRM tunnel interfaces and swanctl config files remain in the kernel and filesystem. Re-adding the same tunnel could fail or produce unexpected behavior
-- **Root cause:** IPsec/xfrmi reconciliation was additive only — the daemon created new tunnels on commit but never compared against kernel state to remove stale ones
-- **Fix:** Full reconciliation on every commit compares desired state against kernel state. Stale XFRM interfaces are deleted and orphaned swanctl configs are removed
-
-### st0.X misidentified as VLAN sub-interface (FIXED #153, `c592976`)
-- **Symptom:** Secure tunnel interfaces like `st0.0` were treated as VLAN sub-interfaces by the interface compiler, generating incorrect 802.1Q VLAN tagging config
-- **Root cause:** The `.N` suffix parser did not distinguish between actual VLAN sub-interfaces (e.g., `ge-0-0-0.100`) and secure tunnel unit interfaces (`st0.0`)
-- **Fix:** Added `isConfiguredVLANSubInterface()` guard that verifies the parent interface is a known VLAN trunk before treating `.N` suffixed names as VLAN sub-interfaces
-
-## Sprint CC-18: Junos IKE/IPsec Compatibility (#154-#159, 2026-03-06)
-
-### external-interface not resolved to local-address in swanctl (FIXED #154)
-- **Symptom:** IPsec tunnels configured with `external-interface` instead of explicit `local-address` failed to establish — strongSwan received an interface name where it expected an IP address
-- **Root cause:** The IPsec compiler passed `external-interface` through to swanctl.conf without resolving it to a concrete IP address from the interface configuration or kernel
-- **Fix:** New `ipsec.PrepareConfig()` deep-copies IPsec config and resolves `external-interface` to `local-address` at runtime, checking static interface addresses first, then kernel addresses. Address family matching pairs IPv4/IPv6 gateways with correct local addresses
-
-### Junos $9$ obfuscated PSK written verbatim to swanctl (FIXED #158)
-- **Symptom:** IKE authentication failed when importing Junos config with `$9$...` encoded pre-shared keys. strongSwan used the obfuscated string as the literal PSK
-- **Root cause:** No decoder existed for the Junos `$9$` secret encoding format. The obfuscated string was passed through unchanged to swanctl.conf
-- **Fix:** New `pkg/ipsec/junos_secret.go` decodes `$9$` secrets before writing to swanctl.conf. MIT-licensed adapter from github.com/nadddy/jcrypt
-
-### DPD parsed as flat string — interval and threshold lost (FIXED #157)
-- **Symptom:** Dead peer detection config with `interval` and `threshold` children was silently ignored. swanctl had no DPD config, so strongSwan used defaults instead of configured timeouts
-- **Root cause:** `dead-peer-detection` was parsed as a flat string value, not as a structured node with children. The mode (`optimized`/`always-send`/`probe-idle-tunnel`), interval, and threshold were all discarded
-- **Fix:** DPD now parsed as a structured node. Mode, interval, and threshold map to swanctl `dpd_delay`, `dpd_timeout`, `dpd_action` based on DPD mode and establish-tunnels setting
-
-### Auth method hardcoded to PSK — pubkey/certificates ignored (FIXED #155)
-- **Symptom:** IPsec gateways configured with `rsa-signatures` or `ecdsa-signatures` authentication method still used PSK in swanctl output. Certificate-based VPNs could not be established
-- **Root cause:** The swanctl compiler hardcoded `auth = psk` regardless of the IKE proposal's `authentication-method` setting. `local-certificate` gateway config was also not compiled
-- **Fix:** `authMethodToSwan()` maps `pre-shared-keys` → `psk`, `rsa-signatures`/`ecdsa-signatures` → `pubkey`. `local-certificate` config generates swanctl `certs` field
-
-### No traffic selector support — single child SA per connection (FIXED #159)
-- **Symptom:** VPN tunnels with multiple `traffic-selector` entries only established a single SA. Only traffic matching the implicit default selector was encrypted
-- **Root cause:** `traffic-selector <name> { local-ip; remote-ip; }` config was not compiled. The swanctl generator always created exactly one unnamed child SA per connection
-- **Fix:** Traffic selectors compile to multiple named swanctl child SAs. `sanitizeChildName()` normalizes selector names. SA parsing handles multi-child `swanctl --list-sas` output
-
-## Sprint CC-19: AppID, Pre-ID Logging, Master-Password (#163, 2026-03-06)
-
-### Cluster heartbeat/sync bind fails when em0 is in vrf-mgmt (OPEN)
-- **Symptom:** Cluster heartbeat and session sync sockets fail to bind on startup with `listen udp4 10.99.0.1:4784: bind: cannot assign requested address`. Cluster nodes cannot form, VRRP never starts
-- **Root cause:** Race condition between VRF creation and cluster comms startup. `startClusterComms()` runs before `applyConfig` step 0.5 populates `mgmtVRFInterfaces`. When the control interface (em0) is in `vrf-mgmt`, the VRF device string is empty at bind time, so the socket binds without `SO_BINDTODEVICE` on the VRF — the kernel cannot route to the fabric/heartbeat address because it lives in a different routing table
-- **Workaround:** Restart bpfrxd after initial boot — second start finds the VRF already created by the previous run
-- **Fix needed:** Either defer `startClusterComms()` until after VRF creation completes, or add a retry/rebind loop that re-checks VRF membership after `applyConfig` step 0.5 finishes
+### Userspace ctrl enable flushes synced BPF conntrack — established sessions die on failover (FIXED `1a2b0a25`)
+- **Symptom:** After HA failover to fw1, established iperf3 flows immediately flatline to 0 Gbps and never recover. `show security flow session` on fw1 shows sessions with "HA State: Backup" despite fw1 being primary. Logs show `userspace: flushed stale BPF conntrack on ctrl enable: deleted=382`
+- **Root cause:** `applyHelperStatusLocked()` in `pkg/dataplane/userspace/manager.go:3106` flushes ALL entries from the BPF `sessions` and `sessions_v6` maps when ctrl transitions from disabled to enabled. The intent was to remove sessions created by the eBPF pipeline during the ctrl-disabled transition window (which could have conflicting NAT state). But it indiscriminately deleted synced sessions too — the 382 sessions installed by cluster session sync from fw0 were wiped out the instant the userspace dataplane activated on fw1
+- **Why sessions showed "HA State: Backup":** With BPF conntrack wiped, the eBPF pipeline couldn't find the sessions. New packets for existing flows hit policy evaluation as "new" connections but the TCP state (no SYN) caused them to be classified as backup/invalid
+- **Fix:** Track `ctrlDisabledAt` (CLOCK_BOOTTIME ns, matching BPF's `bpf_ktime_get_ns()`). On ctrl enable, read each session's `Created` timestamp (uint64 at byte offset 8 in the session value). Only flush sessions where `Created > ctrlDisabledAt` (created during the transition window). Sessions synced from the peer have earlier timestamps and survive
+- **Key pattern:** BPF session values have a `Created` field populated by `bpf_ktime_get_ns()` at session creation time. This serves as a reliable discriminator between pre-existing synced sessions and newly-created transition sessions
+- **Remaining work:** This fix preserves synced sessions but the investigation docs identify additional issues: (H) public-side LocalDelivery materialization from shared_promote path, (F) fabric transit throughput ceiling for redirected flows. These may cause partial throughput loss even with sessions preserved
