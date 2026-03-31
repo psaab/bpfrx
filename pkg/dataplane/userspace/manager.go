@@ -2736,6 +2736,24 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	// ctrl disable during RG transition doesn't create stale sessions.
 	slog.Info("userspace: reset ctrl liveness for post-RG-transition re-verification",
 		"rg", rgID, "active", active)
+	// Bump FIB generation to invalidate ALL userspace flow-cache entries.
+	// The flow cache validates entries against config+FIB generation; bumping
+	// FIB gen forces every cached ForwardCandidate to miss on the next lookup,
+	// preventing the old owner from continuing to forward locally via stale
+	// cached decisions after RG demotion.
+	// Cannot call m.BumpFIBGeneration() here (acquires mu, would deadlock).
+	// Instead bump the BPF counter + rebuild and push snapshot inline.
+	m.inner.BumpFIBGeneration()
+	if m.lastSnapshot != nil && m.lastSnapshot.Config != nil && m.proc != nil {
+		m.generation++
+		snap := buildSnapshot(m.lastSnapshot.Config, m.cfg, m.generation, m.readFIBGeneration())
+		m.lastSnapshot = snap
+		if err := m.syncSnapshotLocked(); err != nil {
+			slog.Warn("userspace: failed to push FIB refresh snapshot on HA transition", "err", err)
+		}
+	}
+	slog.Info("userspace: bumped FIB generation to invalidate flow caches on HA transition",
+		"rg", rgID, "active", active)
 	// Mark this specific RG as transitioning (#284). Use defer to guarantee
 	// cleanup even if syncHAStateLocked fails, preventing the flag from
 	// permanently suppressing ctrl (#283).

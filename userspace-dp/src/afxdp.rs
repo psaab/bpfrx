@@ -2700,9 +2700,13 @@ fn poll_binding(
                                     &flow.forward_key,
                                     meta.ingress_ifindex as i32,
                                 );
-                                binding.scratch_recycle.push(desc.addr);
-                                continue;
-                            }
+                                // Do NOT recycle/drop — fall through to the
+                                // slow path so the packet gets full session
+                                // lookup → HA resolution → fabric redirect.
+                                // Before this fix, packets were silently
+                                // dropped here, causing established flows to
+                                // flatline after HA failover.
+                            } else {
                             let cached_decision = cached.decision;
                             let cached_descriptor = cached.descriptor;
                             let cached_metadata = cached.metadata.clone();
@@ -2819,6 +2823,7 @@ fn poll_binding(
                                 binding.scratch_recycle.push(desc.addr);
                             }
                             continue;
+                            } // else: cached HA-valid — fast path above
                         }
                     }
                     // ── End flow cache fast path ─────────────────────────
