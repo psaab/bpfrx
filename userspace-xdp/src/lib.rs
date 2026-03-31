@@ -468,14 +468,6 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         );
         return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
-    // ICMPv6 NDP messages (NS/NA/RS/RA/Redirect, types 133-137) are
-    // link-local control plane — always pass to kernel so it can respond
-    // to neighbor probes and maintain the neighbor table. This is the
-    // IPv6 equivalent of the ARP XDP_PASS at line 331.
-    if parsed.protocol == PROTO_ICMPV6 && parsed.icmp_type >= 133 && parsed.icmp_type <= 137 {
-        return Ok(xdp_action::XDP_PASS);
-    }
-
     if !native_gre {
         match live_userspace_session_action(&parsed) {
             USERSPACE_SESSION_ACTION_REDIRECT => {
@@ -509,7 +501,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                     );
                     return Ok(cpumap_or_pass(ctrl));
                 }
-                if is_local_destination(&parsed) {
+                if is_local_destination(&parsed) || is_interface_nat_destination(&parsed) {
                     record_trace(
                         ctrl.flags,
                         ingress_ifindex,
@@ -521,17 +513,6 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                         &parsed,
                     );
                     return Ok(cpumap_or_pass(ctrl));
-                }
-                // Interface-NAT session miss: redirect to the helper (XSK)
-                // instead of passing to kernel. The helper's reverse-NAT
-                // repair path handles reply packets for SNATed flows whose
-                // reverse session key was not yet published to the BPF map.
-                // NOTE: no record_trace here — the fall-through keeps the
-                // stack frame alive and combining with the XSK redirect
-                // path pushes combined stack past the 512-byte BPF limit.
-                if is_interface_nat_destination(&parsed) {
-                    incr_fallback_stat(USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION);
-                    // Fall through to XSK redirect below.
                 }
                 // Let all session misses through to the userspace dataplane.
                 // The userspace DP will evaluate policy and either create a
