@@ -4,7 +4,9 @@ package grpcapi
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -795,25 +797,237 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
 	}
 
-	limit := int(req.Limit)
-	if limit <= 0 {
-		limit = 100
+	// Cursor-based pagination: when page_size > 0, use cursor path.
+	if req.PageSize > 0 {
+		return s.getSessionsCursor(ctx, req)
 	}
-	if limit > 10000 {
-		limit = 10000
-	}
-	offset := int(req.Offset)
-	zoneFilter := uint16(req.Zone)
-	protoFilter := req.Protocol
-	srcPort := uint16(req.SourcePort)
-	dstPort := uint16(req.DestinationPort)
-	natOnly := req.NatOnly
-	appFilter := req.Application
-	ifaceFilter := req.InterfaceFilter
-	cfg := s.store.ActiveConfig()
 
-	// Parse CIDR prefix filters
-	var srcNet, dstNet *net.IPNet
+	// Legacy limit/offset path (backward compatible).
+	return s.getSessionsLegacy(ctx, req)
+}
+
+// sessionIteratorFrom is implemented by dataplane.Manager to support
+// cursor-based BPF map iteration.
+type sessionIteratorFrom interface {
+	IterateSessionsFrom(cursor *dataplane.SessionKey, fn func(dataplane.SessionKey, dataplane.SessionValue) bool) error
+	IterateSessionsV6From(cursor *dataplane.SessionKeyV6, fn func(dataplane.SessionKeyV6, dataplane.SessionValueV6) bool) error
+}
+
+// getSessionsCursor implements cursor-based pagination.
+// It iterates only up to page_size matching entries, avoids full-table
+// scans for the total count (uses SessionCount instead), and skips
+// enrichment when no_enrich is set.
+func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
+	iterDP, ok := s.dp.(sessionIteratorFrom)
+	if !ok {
+		// Dataplane doesn't support cursor iteration; fall back to legacy.
+		return s.getSessionsLegacy(ctx, req)
+	}
+
+	pageSize := int(req.PageSize)
+	if pageSize > 10000 {
+		pageSize = 10000
+	}
+
+	filter := s.buildSessionFilter(req)
+	noEnrich := req.NoEnrich
+
+	now := monotonicSeconds()
+	all := make([]*pb.SessionEntry, 0, pageSize)
+
+	// Determine HA state for session display.
+	haActive := true
+	if s.cluster != nil {
+		haActive = s.cluster.IsLocalPrimary(0)
+	}
+
+	// Parse page_token to determine where to resume.
+	startV4 := true  // iterate v4 sessions
+	startV6 := false // iterate v6 after v4
+	var cursorV4 *dataplane.SessionKey
+	var cursorV6 *dataplane.SessionKeyV6
+
+	if req.PageToken != "" {
+		kind, keyBytes, err := parsePageToken(req.PageToken)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid page_token: %v", err)
+		}
+		switch kind {
+		case "v4":
+			k, err := decodeSessionKeyV4(keyBytes)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid v4 page_token: %v", err)
+			}
+			cursorV4 = &k
+		case "v6start":
+			startV4 = false
+			startV6 = true
+		case "v6":
+			startV4 = false
+			startV6 = true
+			k, err := decodeSessionKeyV6(keyBytes)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid v6 page_token: %v", err)
+			}
+			cursorV6 = &k
+		}
+	}
+
+	var lastV4Key dataplane.SessionKey
+	var lastV6Key dataplane.SessionKeyV6
+	v4Exhausted := !startV4
+	v6Exhausted := true // set to false when we start v6
+
+	// Phase 1: iterate v4 sessions from cursor.
+	if startV4 {
+		_ = iterDP.IterateSessionsFrom(cursorV4, func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if len(all) >= pageSize {
+				return false // page full
+			}
+			if !filter.matchV4(key, val) {
+				return true
+			}
+			if !noEnrich {
+				if rev, err := s.dp.GetSessionV4(val.ReverseKey); err == nil {
+					val.RevPackets += rev.RevPackets
+					val.RevBytes += rev.RevBytes
+					val.FwdPackets += rev.FwdPackets
+					val.FwdBytes += rev.FwdBytes
+				}
+			}
+			se := sessionEntryV4(key, val, now, filter.zoneNames, filter.policyNames, filter.zoneIfaces, filter.egressIfaces, haActive)
+			if !noEnrich {
+				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
+			}
+			all = append(all, se)
+			lastV4Key = key
+			return true
+		})
+		if len(all) >= pageSize {
+			// Page is full from v4; next page token resumes v4.
+			resp := &pb.GetSessionsResponse{
+				Sessions:      all,
+				NextPageToken: encodePageTokenV4(lastV4Key),
+			}
+			s.setSessionsTotal(resp, filter)
+			s.setSessionsNodeID(resp)
+			s.fetchPeerSessions(ctx, req, resp)
+			return resp, nil
+		}
+		v4Exhausted = true
+		startV6 = true
+	}
+
+	// Phase 2: iterate v6 sessions.
+	if startV6 {
+		v6Exhausted = false
+		_ = iterDP.IterateSessionsV6From(cursorV6, func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if len(all) >= pageSize {
+				return false
+			}
+			if !filter.matchV6(key, val) {
+				return true
+			}
+			if !noEnrich {
+				if rev, err := s.dp.GetSessionV6(val.ReverseKey); err == nil {
+					val.RevPackets += rev.RevPackets
+					val.RevBytes += rev.RevBytes
+					val.FwdPackets += rev.FwdPackets
+					val.FwdBytes += rev.FwdBytes
+				}
+			}
+			se := sessionEntryV6(key, val, now, filter.zoneNames, filter.policyNames, filter.zoneIfaces, filter.egressIfaces, haActive)
+			if !noEnrich {
+				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
+			}
+			all = append(all, se)
+			lastV6Key = key
+			return true
+		})
+		if len(all) >= pageSize {
+			resp := &pb.GetSessionsResponse{
+				Sessions:      all,
+				NextPageToken: encodePageTokenV6(lastV6Key),
+			}
+			s.setSessionsTotal(resp, filter)
+			s.setSessionsNodeID(resp)
+			s.fetchPeerSessions(ctx, req, resp)
+			return resp, nil
+		}
+		v6Exhausted = true
+	}
+
+	// Both v4 and v6 are exhausted — last page.
+	_ = v4Exhausted
+	_ = v6Exhausted
+	resp := &pb.GetSessionsResponse{
+		Sessions: all,
+		// NextPageToken is empty — no more data.
+	}
+	s.setSessionsTotal(resp, filter)
+	s.setSessionsNodeID(resp)
+	s.fetchPeerSessions(ctx, req, resp)
+	return resp, nil
+}
+
+// setSessionsTotal sets the Total field on the response.
+// When no filters are active, use the lightweight SessionCount() to avoid
+// a full-table enrichment scan.  With filters, total is set to -1
+// (unknown) since computing it would require a full scan.
+func (s *Server) setSessionsTotal(resp *pb.GetSessionsResponse, f *sessionFilter) {
+	if f.hasFilters {
+		resp.Total = -1 // filtered total is unknown without full scan
+		return
+	}
+	v4, v6 := s.dp.SessionCount()
+	resp.Total = int32(v4 + v6)
+}
+
+func (s *Server) setSessionsNodeID(resp *pb.GetSessionsResponse) {
+	if s.cluster != nil {
+		resp.NodeId = int32(s.cluster.NodeID())
+	}
+}
+
+// sessionFilter holds pre-computed filter state for session iteration.
+type sessionFilter struct {
+	zoneFilter   uint16
+	protoFilter  string
+	srcNet       *net.IPNet
+	dstNet       *net.IPNet
+	srcPort      uint16
+	dstPort      uint16
+	natOnly      bool
+	appFilter    string
+	ifaceFilter  string
+	cfg          *config.Config
+	zoneNames    map[uint16]string
+	zoneIfaces   map[uint16]string
+	egressIfaces map[sessionEgressKey]string
+	policyNames  map[uint32]string
+	appNames     map[uint16]string
+	hasFilters   bool // true if any filter narrows results
+}
+
+func (s *Server) buildSessionFilter(req *pb.GetSessionsRequest) *sessionFilter {
+	f := &sessionFilter{
+		zoneFilter:   uint16(req.Zone),
+		protoFilter:  req.Protocol,
+		srcPort:      uint16(req.SourcePort),
+		dstPort:      uint16(req.DestinationPort),
+		natOnly:      req.NatOnly,
+		appFilter:    req.Application,
+		ifaceFilter:  req.InterfaceFilter,
+		cfg:          s.store.ActiveConfig(),
+		zoneNames:    make(map[uint16]string),
+		zoneIfaces:   make(map[uint16]string),
+		egressIfaces: make(map[sessionEgressKey]string),
+	}
+	f.hasFilters = f.zoneFilter != 0 || f.protoFilter != "" || req.SourcePrefix != "" ||
+		req.DestinationPrefix != "" || f.srcPort != 0 || f.dstPort != 0 ||
+		f.natOnly || f.appFilter != "" || f.ifaceFilter != ""
+
+	// Parse CIDR prefix filters.
 	if req.SourcePrefix != "" {
 		cidr := req.SourcePrefix
 		if !strings.Contains(cidr, "/") {
@@ -823,7 +1037,7 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 				cidr += "/32"
 			}
 		}
-		_, srcNet, _ = net.ParseCIDR(cidr)
+		_, f.srcNet, _ = net.ParseCIDR(cidr)
 	}
 	if req.DestinationPrefix != "" {
 		cidr := req.DestinationPrefix
@@ -834,36 +1048,27 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 				cidr += "/32"
 			}
 		}
-		_, dstNet, _ = net.ParseCIDR(cidr)
+		_, f.dstNet, _ = net.ParseCIDR(cidr)
 	}
 
-	now := monotonicSeconds()
-	all := make([]*pb.SessionEntry, 0, limit)
-	idx := 0
-
-	// Build reverse zone ID → name map, policy name map, and zone→interface map.
-	zoneNames := make(map[uint16]string)
-	zoneIfaces := make(map[uint16]string) // zone ID → first interface name
-	egressIfaces := make(map[sessionEgressKey]string)
-	var policyNames map[uint32]string
-	var appNames map[uint16]string
+	// Build zone/policy/app name maps.
 	if cr := s.dp.LastCompileResult(); cr != nil {
 		for name, id := range cr.ZoneIDs {
-			zoneNames[id] = name
+			f.zoneNames[id] = name
 		}
-		policyNames = cr.PolicyNames
-		appNames = cr.AppNames
+		f.policyNames = cr.PolicyNames
+		f.appNames = cr.AppNames
 	}
-	if cfg != nil {
-		for zoneName, zone := range cfg.Security.Zones {
+	if f.cfg != nil {
+		for zoneName, zone := range f.cfg.Security.Zones {
 			if cr := s.dp.LastCompileResult(); cr != nil {
 				if zid, ok := cr.ZoneIDs[zoneName]; ok && len(zone.Interfaces) > 0 {
-					zoneIfaces[zid] = zone.Interfaces[0]
+					f.zoneIfaces[zid] = zone.Interfaces[0]
 				}
 			}
 		}
-		for ifName, ifc := range cfg.Interfaces.Interfaces {
-			resolvedParent := config.LinuxIfName(strings.SplitN(cfg.ResolveReth(ifName), ".", 2)[0])
+		for ifName, ifc := range f.cfg.Interfaces.Interfaces {
+			resolvedParent := config.LinuxIfName(strings.SplitN(f.cfg.ResolveReth(ifName), ".", 2)[0])
 			parentLink, err := net.InterfaceByName(resolvedParent)
 			if err != nil {
 				continue
@@ -881,12 +1086,148 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 					ifindex: uint32(parentLink.Index),
 					vlanID:  vlanID,
 				}
-				if _, exists := egressIfaces[key]; !exists {
-					egressIfaces[key] = displayName
+				if _, exists := f.egressIfaces[key]; !exists {
+					f.egressIfaces[key] = displayName
 				}
 			}
 		}
 	}
+	return f
+}
+
+func (f *sessionFilter) matchV4(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+	if val.IsReverse != 0 {
+		return false
+	}
+	if f.zoneFilter != 0 && val.IngressZone != f.zoneFilter && val.EgressZone != f.zoneFilter {
+		return false
+	}
+	if f.protoFilter != "" && !strings.EqualFold(protoName(key.Protocol), f.protoFilter) {
+		return false
+	}
+	if f.srcNet != nil && !f.srcNet.Contains(net.IP(key.SrcIP[:])) {
+		return false
+	}
+	if f.dstNet != nil && !f.dstNet.Contains(net.IP(key.DstIP[:])) {
+		return false
+	}
+	if f.srcPort != 0 && ntohs(key.SrcPort) != f.srcPort {
+		return false
+	}
+	if f.dstPort != 0 && ntohs(key.DstPort) != f.dstPort {
+		return false
+	}
+	if f.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
+		return false
+	}
+	if f.appFilter != "" && !appid.SessionMatches(f.appFilter, f.appNames, f.cfg,
+		key.Protocol, ntohs(key.DstPort), val.AppID) {
+		return false
+	}
+	if f.ifaceFilter != "" {
+		inIf := f.zoneIfaces[val.IngressZone]
+		outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, f.zoneIfaces, f.egressIfaces)
+		if !sessionIfaceMatches(f.ifaceFilter, inIf) && !sessionIfaceMatches(f.ifaceFilter, outIf) {
+			return false
+		}
+	}
+	return true
+}
+
+func (f *sessionFilter) matchV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+	if val.IsReverse != 0 {
+		return false
+	}
+	if f.zoneFilter != 0 && val.IngressZone != f.zoneFilter && val.EgressZone != f.zoneFilter {
+		return false
+	}
+	if f.protoFilter != "" && !strings.EqualFold(protoName(key.Protocol), f.protoFilter) {
+		return false
+	}
+	if f.srcNet != nil && !f.srcNet.Contains(net.IP(key.SrcIP[:])) {
+		return false
+	}
+	if f.dstNet != nil && !f.dstNet.Contains(net.IP(key.DstIP[:])) {
+		return false
+	}
+	if f.srcPort != 0 && ntohs(key.SrcPort) != f.srcPort {
+		return false
+	}
+	if f.dstPort != 0 && ntohs(key.DstPort) != f.dstPort {
+		return false
+	}
+	if f.natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
+		return false
+	}
+	if f.appFilter != "" && !appid.SessionMatches(f.appFilter, f.appNames, f.cfg,
+		key.Protocol, ntohs(key.DstPort), val.AppID) {
+		return false
+	}
+	if f.ifaceFilter != "" {
+		inIf := f.zoneIfaces[val.IngressZone]
+		outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, f.zoneIfaces, f.egressIfaces)
+		if !sessionIfaceMatches(f.ifaceFilter, inIf) && !sessionIfaceMatches(f.ifaceFilter, outIf) {
+			return false
+		}
+	}
+	return true
+}
+
+// fetchPeerSessions fetches sessions from the cluster peer if requested.
+func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsRequest, resp *pb.GetSessionsResponse) {
+	if !req.GetIncludePeer() || s.cluster == nil || !s.cluster.PeerAlive() {
+		return
+	}
+	conn, err := s.dialPeer()
+	if err != nil {
+		slog.Warn("failed to dial peer for sessions", "err", err)
+		return
+	}
+	defer conn.Close()
+	client := pb.NewBpfrxServiceClient(conn)
+	peerCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	// Forward all filters but NOT include_peer — prevents recursion.
+	peerReq := &pb.GetSessionsRequest{
+		Limit:             req.Limit,
+		Offset:            req.Offset,
+		Zone:              req.Zone,
+		Protocol:          req.Protocol,
+		SourcePrefix:      req.SourcePrefix,
+		DestinationPrefix: req.DestinationPrefix,
+		SourcePort:        req.SourcePort,
+		DestinationPort:   req.DestinationPort,
+		NatOnly:           req.NatOnly,
+		Application:       req.Application,
+		InterfaceFilter:   req.InterfaceFilter,
+		PageToken:         req.PageToken,
+		PageSize:          req.PageSize,
+		NoEnrich:          req.NoEnrich,
+	}
+	peerResp, err := client.GetSessions(peerCtx, peerReq)
+	if err != nil {
+		slog.Warn("failed to fetch peer sessions", "err", err)
+	} else {
+		resp.Peer = peerResp
+	}
+}
+
+// getSessionsLegacy is the original limit/offset iteration path.
+func (s *Server) getSessionsLegacy(ctx context.Context, req *pb.GetSessionsRequest) (*pb.GetSessionsResponse, error) {
+	limit := int(req.Limit)
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 10000 {
+		limit = 10000
+	}
+	offset := int(req.Offset)
+	noEnrich := req.NoEnrich
+
+	filter := s.buildSessionFilter(req)
+	now := monotonicSeconds()
+	all := make([]*pb.SessionEntry, 0, limit)
+	idx := 0
 
 	// Determine HA state for session display.
 	haActive := true // standalone default
@@ -895,54 +1236,23 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 	}
 
 	_ = s.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
-		if val.IsReverse != 0 {
+		if !filter.matchV4(key, val) {
 			return true
-		}
-		if zoneFilter != 0 && val.IngressZone != zoneFilter && val.EgressZone != zoneFilter {
-			return true
-		}
-		proto := protoName(key.Protocol)
-		if protoFilter != "" && !strings.EqualFold(proto, protoFilter) {
-			return true
-		}
-		if srcNet != nil && !srcNet.Contains(net.IP(key.SrcIP[:])) {
-			return true
-		}
-		if dstNet != nil && !dstNet.Contains(net.IP(key.DstIP[:])) {
-			return true
-		}
-		if srcPort != 0 && ntohs(key.SrcPort) != srcPort {
-			return true
-		}
-		if dstPort != 0 && ntohs(key.DstPort) != dstPort {
-			return true
-		}
-		if natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
-			return true
-		}
-		if appFilter != "" && !appid.SessionMatches(appFilter, appNames, cfg,
-			key.Protocol, ntohs(key.DstPort), val.AppID) {
-			return true
-		}
-		if ifaceFilter != "" {
-			inIf := zoneIfaces[val.IngressZone]
-			outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, zoneIfaces, egressIfaces)
-			if !sessionIfaceMatches(ifaceFilter, inIf) && !sessionIfaceMatches(ifaceFilter, outIf) {
-				return true
-			}
 		}
 		if idx >= offset && len(all) < limit {
-			// Merge counters from reverse entry — return packets
-			// increment rev_packets on the reverse entry, not the
-			// forward entry we're displaying.
-			if rev, err := s.dp.GetSessionV4(val.ReverseKey); err == nil {
-				val.RevPackets += rev.RevPackets
-				val.RevBytes += rev.RevBytes
-				val.FwdPackets += rev.FwdPackets
-				val.FwdBytes += rev.FwdBytes
+			if !noEnrich {
+				// Merge counters from reverse entry.
+				if rev, err := s.dp.GetSessionV4(val.ReverseKey); err == nil {
+					val.RevPackets += rev.RevPackets
+					val.RevBytes += rev.RevBytes
+					val.FwdPackets += rev.FwdPackets
+					val.FwdBytes += rev.FwdBytes
+				}
 			}
-			se := sessionEntryV4(key, val, now, zoneNames, policyNames, zoneIfaces, egressIfaces, haActive)
-			se.Application = appid.ResolveSessionName(appNames, cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
+			se := sessionEntryV4(key, val, now, filter.zoneNames, filter.policyNames, filter.zoneIfaces, filter.egressIfaces, haActive)
+			if !noEnrich {
+				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
+			}
 			all = append(all, se)
 		}
 		idx++
@@ -950,51 +1260,22 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 	})
 
 	_ = s.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
-		if val.IsReverse != 0 {
+		if !filter.matchV6(key, val) {
 			return true
-		}
-		if zoneFilter != 0 && val.IngressZone != zoneFilter && val.EgressZone != zoneFilter {
-			return true
-		}
-		proto := protoName(key.Protocol)
-		if protoFilter != "" && !strings.EqualFold(proto, protoFilter) {
-			return true
-		}
-		if srcNet != nil && !srcNet.Contains(net.IP(key.SrcIP[:])) {
-			return true
-		}
-		if dstNet != nil && !dstNet.Contains(net.IP(key.DstIP[:])) {
-			return true
-		}
-		if srcPort != 0 && ntohs(key.SrcPort) != srcPort {
-			return true
-		}
-		if dstPort != 0 && ntohs(key.DstPort) != dstPort {
-			return true
-		}
-		if natOnly && val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == 0 {
-			return true
-		}
-		if appFilter != "" && !appid.SessionMatches(appFilter, appNames, cfg,
-			key.Protocol, ntohs(key.DstPort), val.AppID) {
-			return true
-		}
-		if ifaceFilter != "" {
-			inIf := zoneIfaces[val.IngressZone]
-			outIf := resolveSessionEgressIface(val.FibIfindex, val.FibVlanID, val.EgressZone, zoneIfaces, egressIfaces)
-			if !sessionIfaceMatches(ifaceFilter, inIf) && !sessionIfaceMatches(ifaceFilter, outIf) {
-				return true
-			}
 		}
 		if idx >= offset && len(all) < limit {
-			if rev, err := s.dp.GetSessionV6(val.ReverseKey); err == nil {
-				val.RevPackets += rev.RevPackets
-				val.RevBytes += rev.RevBytes
-				val.FwdPackets += rev.FwdPackets
-				val.FwdBytes += rev.FwdBytes
+			if !noEnrich {
+				if rev, err := s.dp.GetSessionV6(val.ReverseKey); err == nil {
+					val.RevPackets += rev.RevPackets
+					val.RevBytes += rev.RevBytes
+					val.FwdPackets += rev.FwdPackets
+					val.FwdBytes += rev.FwdBytes
+				}
 			}
-			se := sessionEntryV6(key, val, now, zoneNames, policyNames, zoneIfaces, egressIfaces, haActive)
-			se.Application = appid.ResolveSessionName(appNames, cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
+			se := sessionEntryV6(key, val, now, filter.zoneNames, filter.policyNames, filter.zoneIfaces, filter.egressIfaces, haActive)
+			if !noEnrich {
+				se.Application = appid.ResolveSessionName(filter.appNames, filter.cfg, key.Protocol, ntohs(key.DstPort), val.AppID)
+			}
 			all = append(all, se)
 		}
 		idx++
@@ -1008,44 +1289,8 @@ func (s *Server) GetSessions(ctx context.Context, req *pb.GetSessionsRequest) (*
 		Sessions: all,
 	}
 
-	// Set node ID from cluster manager (0 if standalone).
-	if s.cluster != nil {
-		resp.NodeId = int32(s.cluster.NodeID())
-	}
-
-	// Fetch peer sessions if requested and in cluster mode.
-	if req.GetIncludePeer() && s.cluster != nil && s.cluster.PeerAlive() {
-		conn, err := s.dialPeer()
-		if err == nil {
-			defer conn.Close()
-			client := pb.NewBpfrxServiceClient(conn)
-			peerCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-			defer cancel()
-			// Forward all filters but NOT include_peer — prevents recursion.
-			peerReq := &pb.GetSessionsRequest{
-				Limit:             req.Limit,
-				Offset:            req.Offset,
-				Zone:              req.Zone,
-				Protocol:          req.Protocol,
-				SourcePrefix:      req.SourcePrefix,
-				DestinationPrefix: req.DestinationPrefix,
-				SourcePort:        req.SourcePort,
-				DestinationPort:   req.DestinationPort,
-				NatOnly:           req.NatOnly,
-				Application:       req.Application,
-				InterfaceFilter:   req.InterfaceFilter,
-			}
-			peerResp, err := client.GetSessions(peerCtx, peerReq)
-			if err != nil {
-				slog.Warn("failed to fetch peer sessions", "err", err)
-			} else {
-				resp.Peer = peerResp
-			}
-		} else {
-			slog.Warn("failed to dial peer for sessions", "err", err)
-		}
-	}
-
+	s.setSessionsNodeID(resp)
+	s.fetchPeerSessions(ctx, req, resp)
 	return resp, nil
 }
 
@@ -3253,6 +3498,92 @@ func monotonicSeconds() uint64 {
 	var ts unix.Timespec
 	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 	return uint64(ts.Sec)
+}
+
+// --- Cursor-based pagination helpers for GetSessions ---
+
+// Page token format: "v4:<hex-key>" | "v6:<hex-key>" | "v6start"
+// v4:<key> means "resume v4 iteration after this key, then v6"
+// v6:<key> means "v4 done, resume v6 iteration after this key"
+// v6start means "v4 done, start v6 from the beginning"
+
+func encodePageTokenV4(key dataplane.SessionKey) string {
+	b := make([]byte, binary.Size(key))
+	copy(b[0:4], key.SrcIP[:])
+	copy(b[4:8], key.DstIP[:])
+	binary.NativeEndian.PutUint16(b[8:10], key.SrcPort)
+	binary.NativeEndian.PutUint16(b[10:12], key.DstPort)
+	b[12] = key.Protocol
+	// pad bytes b[13:16]
+	return base64.RawURLEncoding.EncodeToString([]byte("v4:" + hex.EncodeToString(b)))
+}
+
+func encodePageTokenV6(key dataplane.SessionKeyV6) string {
+	b := make([]byte, binary.Size(key))
+	copy(b[0:16], key.SrcIP[:])
+	copy(b[16:32], key.DstIP[:])
+	binary.NativeEndian.PutUint16(b[32:34], key.SrcPort)
+	binary.NativeEndian.PutUint16(b[34:36], key.DstPort)
+	b[36] = key.Protocol
+	// pad bytes b[37:40]
+	return base64.RawURLEncoding.EncodeToString([]byte("v6:" + hex.EncodeToString(b)))
+}
+
+func encodePageTokenV6Start() string {
+	return base64.RawURLEncoding.EncodeToString([]byte("v6start"))
+}
+
+// parsePageToken returns kind ("v4", "v6", "v6start") and raw key bytes.
+func parsePageToken(token string) (kind string, keyBytes []byte, err error) {
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return "", nil, fmt.Errorf("invalid page_token encoding: %w", err)
+	}
+	s := string(raw)
+	if s == "v6start" {
+		return "v6start", nil, nil
+	}
+	if strings.HasPrefix(s, "v4:") {
+		b, err := hex.DecodeString(s[3:])
+		if err != nil {
+			return "", nil, fmt.Errorf("invalid v4 page_token hex: %w", err)
+		}
+		return "v4", b, nil
+	}
+	if strings.HasPrefix(s, "v6:") {
+		b, err := hex.DecodeString(s[3:])
+		if err != nil {
+			return "", nil, fmt.Errorf("invalid v6 page_token hex: %w", err)
+		}
+		return "v6", b, nil
+	}
+	return "", nil, fmt.Errorf("invalid page_token prefix")
+}
+
+func decodeSessionKeyV4(b []byte) (dataplane.SessionKey, error) {
+	var key dataplane.SessionKey
+	if len(b) < binary.Size(key) {
+		return key, fmt.Errorf("v4 key too short: %d", len(b))
+	}
+	copy(key.SrcIP[:], b[0:4])
+	copy(key.DstIP[:], b[4:8])
+	key.SrcPort = binary.NativeEndian.Uint16(b[8:10])
+	key.DstPort = binary.NativeEndian.Uint16(b[10:12])
+	key.Protocol = b[12]
+	return key, nil
+}
+
+func decodeSessionKeyV6(b []byte) (dataplane.SessionKeyV6, error) {
+	var key dataplane.SessionKeyV6
+	if len(b) < binary.Size(key) {
+		return key, fmt.Errorf("v6 key too short: %d", len(b))
+	}
+	copy(key.SrcIP[:], b[0:16])
+	copy(key.DstIP[:], b[16:32])
+	key.SrcPort = binary.NativeEndian.Uint16(b[32:34])
+	key.DstPort = binary.NativeEndian.Uint16(b[34:36])
+	key.Protocol = b[36]
+	return key, nil
 }
 
 type builtinApp struct {
