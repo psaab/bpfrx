@@ -754,6 +754,15 @@ func compileZones(dp DataPlane, cfg *config.Config, result *CompileResult) error
 				}
 				if ifCfg.RedundancyGroup > 0 {
 					rgID = uint8(ifCfg.RedundancyGroup)
+				} else if ifCfg.RedundantParent != "" {
+					// Physical RETH member: inherit RG from the RETH parent.
+					// Without this, check_egress_rg_active() in BPF returns
+					// rg_id=0 for RETH member VLAN sub-interfaces, bypassing
+					// the HA active/inactive check and preventing fabric
+					// redirect after RG failover.
+					if reth, ok := cfg.Interfaces.Interfaces[ifCfg.RedundantParent]; ok && reth.RedundancyGroup > 0 {
+						rgID = uint8(reth.RedundancyGroup)
+					}
 				}
 			}
 			if zone.ScreenProfile != "" {
