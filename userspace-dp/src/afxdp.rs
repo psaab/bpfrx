@@ -4516,12 +4516,21 @@ fn retry_pending_neigh(
                 binding.pending_fill_frames.push_back(addr);
                 continue;
             }
-            // Check if neighbor MAC is now in dynamic_neighbors
+            // Check if neighbor MAC is now available, mirroring the lookup
+            // order from lookup_neighbor_entry(): static/permanent neighbors
+            // first, then dynamic_neighbors.
             let mac = if let Some(hop) = pkt.decision.resolution.next_hop {
-                dynamic_neighbors.lock().ok().and_then(|n| {
-                    n.get(&(pkt.decision.resolution.egress_ifindex, hop))
-                        .map(|e| e.mac)
-                })
+                let neigh_key = (pkt.decision.resolution.egress_ifindex, hop);
+                forwarding
+                    .neighbors
+                    .get(&neigh_key)
+                    .map(|e| e.mac)
+                    .or_else(|| {
+                        dynamic_neighbors
+                            .lock()
+                            .ok()
+                            .and_then(|n| n.get(&neigh_key).map(|e| e.mac))
+                    })
             } else {
                 None
             };
