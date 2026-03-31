@@ -64,7 +64,7 @@ type Manager struct {
 	deferWorkers       bool // skip worker spawn until NotifyLinkCycle
 	xskBoundNotified   bool // OnXSKBound fired at most once
 
-	pendingRGTransition bool // set before syncHAStateLocked, cleared on success
+	pendingRGTransitions map[int]bool // per-RG: set before syncHAStateLocked, cleared on completion
 
 	eventStream       *EventStream
 	eventStreamCancel context.CancelFunc
@@ -79,9 +79,10 @@ func New() *Manager {
 	inner := dataplane.New()
 	inner.XDPEntryProg = "xdp_main_prog"
 	return &Manager{
-		DataPlane: inner,
-		inner:     inner,
-		haGroups:  make(map[int]HAGroupStatus),
+		DataPlane:            inner,
+		inner:                inner,
+		haGroups:             make(map[int]HAGroupStatus),
+		pendingRGTransitions: make(map[int]bool),
 	}
 }
 
@@ -2653,41 +2654,40 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 }
 
 func (m *Manager) UpdateRGActive(rgID int, active bool) error {
-	if !active {
-		// CRITICAL ORDERING for failover:
-		// 1. Disable ctrl → XDP shim stops redirecting to XSK
-		// 2. Set rg_active=0 → eBPF pipeline redirects to fabric
-		// 3. Sync HA state to helper → helper updates eventually
-		// 4. Helper re-enables ctrl after processing demotion
-		//
-		// This ensures ZERO gap: the eBPF pipeline handles the critical
-		// transition window with real-time rg_active checks and fabric
-		// redirect. The helper's async processing is no longer on the
-		// critical path for packet forwarding.
-		m.mu.Lock()
-		m.disableUserspaceCtrlLocked()
-		if m.inner.XDPEntryProg != "xdp_main_prog" {
-			_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
-		}
-		m.mu.Unlock()
+	// Both promotion and demotion temporarily disable ctrl and swap to the
+	// eBPF pipeline before updating the rg_active BPF map (#285).
+	//
+	// DEMOTION: ensures zero gap — eBPF handles the critical transition
+	// window with real-time rg_active checks and fabric redirect. The
+	// helper's async processing is no longer on the critical path.
+	//
+	// PROMOTION: prevents the userspace helper from serving packets with
+	// stale flow-cache state while the rg_active map is being updated.
+	// The brief window on the eBPF/kernel forwarding path avoids stale
+	// flow-cache hits. Ctrl is re-enabled after the transition completes
+	// and the helper processes the HA state update.
+	m.mu.Lock()
+	m.disableUserspaceCtrlLocked()
+	if m.inner.XDPEntryProg != "xdp_main_prog" {
+		_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
+	}
+	m.mu.Unlock()
+	if active {
+		slog.Info("userspace: disabled ctrl + swapped to eBPF pipeline for RG promotion",
+			"rg", rgID)
+	} else {
 		slog.Info("userspace: disabled ctrl + swapped to eBPF pipeline for RG demotion",
 			"rg", rgID)
 	}
-	// NOTE: ctrl disable + eBPF swap only on DEMOTION (above).
-	// Do NOT disable ctrl on activation — it causes false HAInactive
-	// dispositions during startup when the watchdog hasn't started yet,
-	// leading to FabricRedirect for sessions that should forward locally.
 	if err := m.inner.UpdateRGActive(rgID, active); err != nil {
-		if !active {
-			// Rollback: re-enable ctrl and restore XDP shim since the
-			// demotion failed (#278).
-			m.mu.Lock()
-			m.reEnableUserspaceCtrlLocked()
-			_ = m.inner.SwapXDPEntryProg("xdp_userspace_prog")
-			m.mu.Unlock()
-			slog.Warn("userspace: rolled back ctrl disable after UpdateRGActive failure",
-				"rg", rgID, "err", err)
-		}
+		// Rollback: re-enable ctrl and restore XDP shim since the
+		// BPF map update failed (#278).
+		m.mu.Lock()
+		m.reEnableUserspaceCtrlLocked()
+		_ = m.inner.SwapXDPEntryProg("xdp_userspace_prog")
+		m.mu.Unlock()
+		slog.Warn("userspace: rolled back ctrl disable after UpdateRGActive failure",
+			"rg", rgID, "err", err)
 		return err
 	}
 	m.mu.Lock()
@@ -2716,12 +2716,12 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	// ctrl disable during RG transition doesn't create stale sessions.
 	slog.Info("userspace: reset ctrl liveness for post-RG-transition re-verification",
 		"rg", rgID, "active", active)
-	m.pendingRGTransition = true
-	if err := m.syncHAStateLocked(); err != nil {
-		return err
-	}
-	m.pendingRGTransition = false
-	return nil
+	// Mark this specific RG as transitioning (#284). Use defer to guarantee
+	// cleanup even if syncHAStateLocked fails, preventing the flag from
+	// permanently suppressing ctrl (#283).
+	m.pendingRGTransitions[rgID] = true
+	defer delete(m.pendingRGTransitions, rgID)
+	return m.syncHAStateLocked()
 }
 
 func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error {
@@ -2911,10 +2911,11 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		FIBGeneration:      status.LastFIBGeneration,
 		HeartbeatTimeoutMS: 30000,
 	}
-	if status.Enabled && m.pendingRGTransition {
-		// An RG transition is in progress and the helper hasn't acked the
-		// HA state update yet. Keep ctrl disabled until syncHAStateLocked
-		// succeeds to avoid re-enabling ctrl during the handoff (#279).
+	if status.Enabled && len(m.pendingRGTransitions) > 0 {
+		// One or more RG transitions are in progress and the helper hasn't
+		// acked the HA state update yet. Keep ctrl disabled until
+		// syncHAStateLocked succeeds to avoid re-enabling ctrl during the
+		// handoff (#279, #284).
 		ctrl.Enabled = 0
 	} else if status.Enabled {
 		// Delay ctrl enable until AFTER VIPs are configured in HA mode.
