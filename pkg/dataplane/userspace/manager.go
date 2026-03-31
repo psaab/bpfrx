@@ -2459,6 +2459,17 @@ func (m *Manager) PrepareRGDemotion(rgIDs []int) error {
 			Groups: rgIDs,
 		},
 	}, &status); err != nil {
+		// The helper may have set the demoting mark before the request
+		// timed out. Send a clear request so the helper stops treating
+		// the still-primary RG as demoting. The auto-expiry lease will
+		// also clear it eventually, but immediate cleanup prevents
+		// self-poisoning traffic during the lease window.
+		_ = m.requestLocked(ControlRequest{
+			Type: "clear_ha_demotion",
+			HADemotionPrepare: &HADemotionPrepareRequest{
+				Groups: rgIDs,
+			},
+		}, nil)
 		return err
 	}
 	return m.applyHelperStatusLocked(&status)

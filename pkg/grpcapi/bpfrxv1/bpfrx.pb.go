@@ -2209,8 +2209,14 @@ type GetSessionsRequest struct {
 	Application       string                 `protobuf:"bytes,10,opt,name=application,proto3" json:"application,omitempty"`                                // application name filter (e.g. "junos-http")
 	IncludePeer       bool                   `protobuf:"varint,11,opt,name=include_peer,json=includePeer,proto3" json:"include_peer,omitempty"`            // fetch sessions from cluster peer too
 	InterfaceFilter   string                 `protobuf:"bytes,12,opt,name=interface_filter,json=interfaceFilter,proto3" json:"interface_filter,omitempty"` // filter by ingress/egress interface name
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Cursor-based pagination (preferred over limit/offset for large tables).
+	// page_token is an opaque string returned in the previous response's
+	// next_page_token.  When set, iteration resumes after that key.
+	PageToken     string `protobuf:"bytes,13,opt,name=page_token,json=pageToken,proto3" json:"page_token,omitempty"`
+	PageSize      int32  `protobuf:"varint,14,opt,name=page_size,json=pageSize,proto3" json:"page_size,omitempty"` // max entries per page; 0 = use limit/offset path
+	NoEnrich      bool   `protobuf:"varint,15,opt,name=no_enrich,json=noEnrich,proto3" json:"no_enrich,omitempty"` // skip reverse-entry merge & app name resolution
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetSessionsRequest) Reset() {
@@ -2327,14 +2333,36 @@ func (x *GetSessionsRequest) GetInterfaceFilter() string {
 	return ""
 }
 
+func (x *GetSessionsRequest) GetPageToken() string {
+	if x != nil {
+		return x.PageToken
+	}
+	return ""
+}
+
+func (x *GetSessionsRequest) GetPageSize() int32 {
+	if x != nil {
+		return x.PageSize
+	}
+	return 0
+}
+
+func (x *GetSessionsRequest) GetNoEnrich() bool {
+	if x != nil {
+		return x.NoEnrich
+	}
+	return false
+}
+
 type GetSessionsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Total         int32                  `protobuf:"varint,1,opt,name=total,proto3" json:"total,omitempty"`
 	Limit         int32                  `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
 	Offset        int32                  `protobuf:"varint,3,opt,name=offset,proto3" json:"offset,omitempty"`
 	Sessions      []*SessionEntry        `protobuf:"bytes,4,rep,name=sessions,proto3" json:"sessions,omitempty"`
-	NodeId        int32                  `protobuf:"varint,5,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"` // cluster node ID (0, 1, ...)
-	Peer          *GetSessionsResponse   `protobuf:"bytes,6,opt,name=peer,proto3" json:"peer,omitempty"`                    // peer node sessions (nil if standalone)
+	NodeId        int32                  `protobuf:"varint,5,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`                       // cluster node ID (0, 1, ...)
+	Peer          *GetSessionsResponse   `protobuf:"bytes,6,opt,name=peer,proto3" json:"peer,omitempty"`                                          // peer node sessions (nil if standalone)
+	NextPageToken string                 `protobuf:"bytes,7,opt,name=next_page_token,json=nextPageToken,proto3" json:"next_page_token,omitempty"` // opaque cursor for next page; empty = no more data
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2409,6 +2437,13 @@ func (x *GetSessionsResponse) GetPeer() *GetSessionsResponse {
 		return x.Peer
 	}
 	return nil
+}
+
+func (x *GetSessionsResponse) GetNextPageToken() string {
+	if x != nil {
+		return x.NextPageToken
+	}
+	return ""
 }
 
 type SessionEntry struct {
@@ -6929,7 +6964,7 @@ const file_bpfrx_proto_rawDesc = "" +
 	"hitPackets\x12\x1b\n" +
 	"\thit_bytes\x18\t \x01(\x04R\bhitBytes\x12 \n" +
 	"\vdescription\x18\n" +
-	" \x01(\tR\vdescription\"\x9d\x03\n" +
+	" \x01(\tR\vdescription\"\xf6\x03\n" +
 	"\x12GetSessionsRequest\x12\x14\n" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x05R\x06offset\x12\x12\n" +
@@ -6944,14 +6979,19 @@ const file_bpfrx_proto_rawDesc = "" +
 	"\vapplication\x18\n" +
 	" \x01(\tR\vapplication\x12!\n" +
 	"\finclude_peer\x18\v \x01(\bR\vincludePeer\x12)\n" +
-	"\x10interface_filter\x18\f \x01(\tR\x0finterfaceFilter\"\xd9\x01\n" +
+	"\x10interface_filter\x18\f \x01(\tR\x0finterfaceFilter\x12\x1d\n" +
+	"\n" +
+	"page_token\x18\r \x01(\tR\tpageToken\x12\x1b\n" +
+	"\tpage_size\x18\x0e \x01(\x05R\bpageSize\x12\x1b\n" +
+	"\tno_enrich\x18\x0f \x01(\bR\bnoEnrich\"\x81\x02\n" +
 	"\x13GetSessionsResponse\x12\x14\n" +
 	"\x05total\x18\x01 \x01(\x05R\x05total\x12\x14\n" +
 	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x16\n" +
 	"\x06offset\x18\x03 \x01(\x05R\x06offset\x122\n" +
 	"\bsessions\x18\x04 \x03(\v2\x16.bpfrx.v1.SessionEntryR\bsessions\x12\x17\n" +
 	"\anode_id\x18\x05 \x01(\x05R\x06nodeId\x121\n" +
-	"\x04peer\x18\x06 \x01(\v2\x1d.bpfrx.v1.GetSessionsResponseR\x04peer\"\xbd\a\n" +
+	"\x04peer\x18\x06 \x01(\v2\x1d.bpfrx.v1.GetSessionsResponseR\x04peer\x12&\n" +
+	"\x0fnext_page_token\x18\a \x01(\tR\rnextPageToken\"\xbd\a\n" +
 	"\fSessionEntry\x12\x19\n" +
 	"\bsrc_addr\x18\x01 \x01(\tR\asrcAddr\x12\x19\n" +
 	"\bdst_addr\x18\x02 \x01(\tR\adstAddr\x12\x19\n" +

@@ -376,6 +376,106 @@ func (m *Manager) IterateSessionsV6(fn func(SessionKeyV6, SessionValueV6) bool) 
 	return iter.Err()
 }
 
+// IterateSessionsFrom iterates v4 session entries starting after cursorKey.
+// If cursorKey is nil, iteration starts from the beginning.
+// fn returns false to stop iteration.
+func (m *Manager) IterateSessionsFrom(cursorKey *SessionKey, fn func(SessionKey, SessionValue) bool) error {
+	sm, ok := m.maps["sessions"]
+	if !ok {
+		return fmt.Errorf("sessions map not found")
+	}
+
+	var nextKey SessionKey
+	var startKey interface{} = cursorKey
+	if cursorKey == nil {
+		startKey = nil
+	}
+
+	// Get the first key to iterate from.
+	if err := sm.NextKey(startKey, &nextKey); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil // no entries or cursor at end
+		}
+		return fmt.Errorf("sessions NextKey: %w", err)
+	}
+
+	for {
+		var val SessionValue
+		if err := sm.Lookup(nextKey, &val); err != nil {
+			// Entry may have been deleted between NextKey and Lookup; skip.
+			var next SessionKey
+			if err := sm.NextKey(nextKey, &next); err != nil {
+				if errors.Is(err, ebpf.ErrKeyNotExist) {
+					return nil
+				}
+				return fmt.Errorf("sessions NextKey: %w", err)
+			}
+			nextKey = next
+			continue
+		}
+		if !fn(nextKey, val) {
+			return nil
+		}
+		var next SessionKey
+		if err := sm.NextKey(nextKey, &next); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				return nil // end of map
+			}
+			return fmt.Errorf("sessions NextKey: %w", err)
+		}
+		nextKey = next
+	}
+}
+
+// IterateSessionsV6From iterates v6 session entries starting after cursorKey.
+// If cursorKey is nil, iteration starts from the beginning.
+// fn returns false to stop iteration.
+func (m *Manager) IterateSessionsV6From(cursorKey *SessionKeyV6, fn func(SessionKeyV6, SessionValueV6) bool) error {
+	sm, ok := m.maps["sessions_v6"]
+	if !ok {
+		return fmt.Errorf("sessions_v6 map not found")
+	}
+
+	var nextKey SessionKeyV6
+	var startKey interface{} = cursorKey
+	if cursorKey == nil {
+		startKey = nil
+	}
+
+	if err := sm.NextKey(startKey, &nextKey); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil
+		}
+		return fmt.Errorf("sessions_v6 NextKey: %w", err)
+	}
+
+	for {
+		var val SessionValueV6
+		if err := sm.Lookup(nextKey, &val); err != nil {
+			var next SessionKeyV6
+			if err := sm.NextKey(nextKey, &next); err != nil {
+				if errors.Is(err, ebpf.ErrKeyNotExist) {
+					return nil
+				}
+				return fmt.Errorf("sessions_v6 NextKey: %w", err)
+			}
+			nextKey = next
+			continue
+		}
+		if !fn(nextKey, val) {
+			return nil
+		}
+		var next SessionKeyV6
+		if err := sm.NextKey(nextKey, &next); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				return nil
+			}
+			return fmt.Errorf("sessions_v6 NextKey: %w", err)
+		}
+		nextKey = next
+	}
+}
+
 // BatchIterateSessions iterates sessions using batch lookup for reduced
 // kernel lock contention.  Yields between batches so BPF datapath isn't
 // starved of hash-table bucket locks.

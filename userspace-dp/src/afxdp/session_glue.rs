@@ -595,6 +595,11 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
     let candidates = {
         let mut out = Vec::new();
         sessions.iter_with_origin(|key, decision, metadata, origin| {
+            // Collect ALL entries — the post-filter after HA re-resolution
+            // (line ~637) checks both original and refreshed owner_rg_id.
+            // Pre-filtering here would drop sessions currently owned by
+            // another RG that re-resolve into the activated set after
+            // split-RG failback (#286 review feedback).
             out.push((key.clone(), decision, metadata.clone(), origin));
         });
         out

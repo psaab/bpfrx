@@ -469,13 +469,12 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
     // ICMPv6 NDP messages (NS/NA/RS/RA/Redirect, types 133-137) are
-    // link-local control plane — always pass to kernel so it can respond
-    // to neighbor probes and maintain the neighbor table. This is the
-    // IPv6 equivalent of the ARP XDP_PASS at line 331.
+    // link-local control plane — always pass directly to kernel so it
+    // can maintain the neighbor table. This is the IPv6 equivalent of
+    // the ARP XDP_PASS at line 331.
     if parsed.protocol == PROTO_ICMPV6 && parsed.icmp_type >= 133 && parsed.icmp_type <= 137 {
         return Ok(xdp_action::XDP_PASS);
     }
-
     if !native_gre {
         match live_userspace_session_action(&parsed) {
             USERSPACE_SESSION_ACTION_REDIRECT => {

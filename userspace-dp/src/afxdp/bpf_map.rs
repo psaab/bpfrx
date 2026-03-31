@@ -331,7 +331,19 @@ pub(super) fn publish_session_map_entry_for_session(
     metadata: &SessionMetadata,
 ) -> io::Result<()> {
     if uses_kernel_local_session_map_entry(decision, metadata) {
-        return publish_kernel_local_session_key(map_fd, key);
+        publish_kernel_local_session_key(map_fd, key)?;
+        // For SNATed local-delivery sessions (e.g., ICMP to an interface-NAT
+        // address), the reply packet arrives with the SNAT address as
+        // destination. Publish the reverse session key so the XDP shim
+        // redirects reply packets to the helper for reverse-NAT processing
+        // instead of passing them to the kernel where no NAT reversal exists.
+        if decision.nat.rewrite_src.is_some() {
+            let reverse_wire = reverse_session_key(key, decision.nat);
+            if reverse_wire != *key {
+                publish_live_session_key(map_fd, &reverse_wire)?;
+            }
+        }
+        return Ok(());
     }
     publish_live_session_entry(map_fd, key, decision.nat, metadata.is_reverse)
 }
@@ -574,6 +586,14 @@ pub(super) fn delete_session_map_entry_for_removed_session(
 ) {
     if uses_kernel_local_session_map_entry(decision, metadata) {
         delete_live_session_key(map_fd, key);
+        // Also delete the reverse-wire alias published for SNATed
+        // kernel-local sessions (see publish_session_map_entry_for_session).
+        if decision.nat.rewrite_src.is_some() {
+            let reverse_wire = reverse_session_key(key, decision.nat);
+            if reverse_wire != *key {
+                delete_live_session_key(map_fd, &reverse_wire);
+            }
+        }
         return;
     }
     delete_live_session_entry(map_fd, key, decision.nat, metadata.is_reverse);

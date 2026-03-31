@@ -247,14 +247,21 @@ message GetSessionsRequest {
   string application = 10;        // application name filter (e.g. "junos-http")
   bool include_peer = 11;         // fetch sessions from cluster peer too
   string interface_filter = 12;   // filter by ingress/egress interface name
+  // Cursor-based pagination (preferred over limit/offset for large tables).
+  // page_token is an opaque string returned in the previous response's
+  // next_page_token.  When set, iteration resumes after that key.
+  string page_token = 13;
+  int32 page_size = 14;           // max entries per page; 0 = use limit/offset path
+  bool no_enrich = 15;            // skip reverse-entry merge & app name resolution
 }
 message GetSessionsResponse {
-  int32 total = 1;
+  int32 total = 1;                  // exact count when unfiltered; -1 when filters active (avoids full scan)
   int32 limit = 2;
   int32 offset = 3;
   repeated SessionEntry sessions = 4;
   int32 node_id = 5;              // cluster node ID (0, 1, ...)
   GetSessionsResponse peer = 6;   // peer node sessions (nil if standalone)
+  string next_page_token = 7;     // opaque cursor for next page; empty = no more data
 }
 message SessionEntry {
   string src_addr = 1;
