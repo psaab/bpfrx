@@ -336,6 +336,11 @@ pub(super) fn apply_worker_commands(
                         flow_cache.invalidate_owner_rg(*owner_rg_id);
                     }
                 }
+                // Re-resolve ALL sessions (forward + reverse) for the
+                // activated RGs. Synced forward sessions arrive with the
+                // peer's interface indices and MACs which don't work locally.
+                // Without this, SNAT isn't applied on the new owner because
+                // the session's egress_ifindex is wrong (peer's ifindex).
                 refresh_live_reverse_sessions_for_owner_rgs(
                     sessions,
                     session_map_fd,
@@ -347,11 +352,85 @@ pub(super) fn apply_worker_commands(
                     now_secs,
                     false,
                 );
+                // Also re-resolve forward sessions. The reverse refresh
+                // above only handles reverse entries. Forward synced sessions
+                // need local egress resolution for NAT to work.
+                let owner_rg_set: std::collections::BTreeSet<i32> =
+                    owner_rgs.iter().copied().collect();
+                let mut refreshed_fwd = 0u32;
+                // Collect forward session candidates for re-resolution.
+                let mut forward_candidates = Vec::new();
+                sessions.iter_with_origin(|key, decision, metadata, _origin| {
+                    if !metadata.is_reverse
+                        && (metadata.owner_rg_id == 0
+                            || owner_rg_set.contains(&metadata.owner_rg_id))
+                    {
+                        forward_candidates.push((
+                            key.clone(),
+                            decision,
+                            metadata.clone(),
+                        ));
+                    }
+                });
+                for (key, decision, metadata) in forward_candidates {
+                    let flow = SessionFlow {
+                        src_ip: key.src_ip,
+                        dst_ip: key.dst_ip,
+                        forward_key: key.clone(),
+                    };
+                    let re_resolved = lookup_forwarding_resolution_for_session(
+                        forwarding,
+                        dynamic_neighbors,
+                        &flow,
+                        decision,
+                    );
+                    let re_resolved = super::enforce_ha_resolution_snapshot(
+                        forwarding,
+                        ha_state,
+                        now_secs,
+                        re_resolved,
+                    );
+                    if re_resolved.disposition
+                        != super::ForwardingDisposition::HAInactive
+                        && re_resolved != decision.resolution
+                    {
+                        let new_decision = SessionDecision {
+                            resolution: re_resolved,
+                            ..decision
+                        };
+                        let new_owner =
+                            owner_rg_for_resolution(forwarding, re_resolved);
+                        let new_metadata = SessionMetadata {
+                            owner_rg_id: if new_owner > 0 {
+                                new_owner
+                            } else {
+                                metadata.owner_rg_id
+                            },
+                            ..metadata
+                        };
+                        sessions.refresh_local(
+                            &key,
+                            new_decision,
+                            new_metadata.clone(),
+                            now_ns,
+                            0,
+                        );
+                        publish_session_map_entry_for_session(
+                            session_map_fd,
+                            &key,
+                            new_decision,
+                            &new_metadata,
+                        )
+                        .ok();
+                        refreshed_fwd += 1;
+                    }
+                }
                 eprintln!(
-                    "bpfrx-ha: RefreshOwnerRGs {:?} worker sessions: before={} after={}",
+                    "bpfrx-ha: RefreshOwnerRGs {:?} worker sessions: before={} after={} refreshed_fwd={}",
                     owner_rgs,
                     pre_count,
-                    sessions.len()
+                    sessions.len(),
+                    refreshed_fwd,
                 );
             }
             WorkerCommand::FlushFlowCaches => {
