@@ -1182,6 +1182,13 @@ func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsReque
 	if !req.GetIncludePeer() || s.cluster == nil || !s.cluster.PeerAlive() {
 		return
 	}
+	// When paginating via page_token, suppress peer results — the caller
+	// is on a later local page but the peer would return its first page,
+	// producing misleading mixed-page responses. Peer sessions should
+	// only be fetched on the first page (no token).
+	if req.GetPageToken() != "" {
+		return
+	}
 	conn, err := s.dialPeer()
 	if err != nil {
 		slog.Warn("failed to dial peer for sessions", "err", err)
