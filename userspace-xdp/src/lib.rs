@@ -508,7 +508,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                     );
                     return Ok(cpumap_or_pass(ctrl));
                 }
-                if is_local_destination(&parsed) || is_interface_nat_destination(&parsed) {
+                if is_local_destination(&parsed) {
                     record_trace(
                         ctrl.flags,
                         ingress_ifindex,
@@ -520,6 +520,13 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                         &parsed,
                     );
                     return Ok(cpumap_or_pass(ctrl));
+                }
+                // Interface-NAT session miss: redirect to helper (XSK)
+                // so the helper's reverse-NAT repair path can handle
+                // reply packets for SNATed flows (#290).
+                if is_interface_nat_destination(&parsed) {
+                    incr_fallback_stat(USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION);
+                    // Fall through to XSK redirect below.
                 }
                 // Let all session misses through to the userspace dataplane.
                 // The userspace DP will evaluate policy and either create a
@@ -938,7 +945,6 @@ struct ParsedPacket {
     dscp: u8,
     src_addr: [u8; 16],
     dst_v4: u32,
-    dst_v6: [u8; 16],
     dst_addr: [u8; 16],
 }
 
@@ -994,7 +1000,6 @@ fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
         dscp: tos >> 2,
         src_addr,
         dst_v4: u32::from_be_bytes([dst_bytes[0], dst_bytes[1], dst_bytes[2], dst_bytes[3]]),
-        dst_v6: [0; 16],
         dst_addr,
     })
 }
@@ -1048,8 +1053,8 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
         parse_l4(data, data_end, offset, protocol)?;
     let mut src_addr = [0u8; 16];
     src_addr.copy_from_slice(read_bytes(data, data_end, l3_offset as usize + 8, 16)?);
-    let mut dst_v6 = [0u8; 16];
-    dst_v6.copy_from_slice(read_bytes(data, data_end, l3_offset as usize + 24, 16)?);
+    let mut dst_addr = [0u8; 16];
+    dst_addr.copy_from_slice(read_bytes(data, data_end, l3_offset as usize + 24, 16)?);
     Some(ParsedPacket {
         vlan_id,
         l3_offset,
@@ -1064,8 +1069,7 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
         dscp,
         src_addr,
         dst_v4: 0,
-        dst_v6,
-        dst_addr: dst_v6,
+        dst_addr,
     })
 }
 
@@ -1083,7 +1087,7 @@ fn should_fallback_early(pkt: &ParsedPacket) -> bool {
             false
         }
         AF_INET6 => {
-            if pkt.dst_v6[0] == 0xff || is_ipv6_link_local(pkt.dst_v6) {
+            if pkt.dst_addr[0] == 0xff || is_ipv6_link_local(pkt.dst_addr) {
                 return true;
             }
             false
@@ -1101,7 +1105,7 @@ fn is_local_destination(pkt: &ParsedPacket) -> bool {
             unsafe { USERSPACE_LOCAL_V4.get(&pkt.dst_v4) }.is_some()
         }
         AF_INET6 => {
-            let key = UserspaceLocalV6Key { addr: pkt.dst_v6 };
+            let key = UserspaceLocalV6Key { addr: pkt.dst_addr };
             if unsafe { USERSPACE_INTERFACE_NAT_V6.get(&key) }.is_some() {
                 return false;
             }
@@ -1123,7 +1127,7 @@ fn is_icmp_to_interface_nat_local(pkt: &ParsedPacket) -> bool {
             if pkt.protocol != PROTO_ICMPV6 || pkt.icmp_type != 128 {
                 return false;
             }
-            unsafe { USERSPACE_INTERFACE_NAT_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_v6 }) }
+            unsafe { USERSPACE_INTERFACE_NAT_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_addr }) }
                 .is_some()
         }
         _ => false,
@@ -1148,7 +1152,7 @@ fn is_interface_nat_destination(pkt: &ParsedPacket) -> bool {
     match pkt.addr_family {
         AF_INET => unsafe { USERSPACE_INTERFACE_NAT_V4.get(&pkt.dst_v4) }.is_some(),
         AF_INET6 => {
-            unsafe { USERSPACE_INTERFACE_NAT_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_v6 }) }
+            unsafe { USERSPACE_INTERFACE_NAT_V6.get(&UserspaceLocalV6Key { addr: pkt.dst_addr }) }
                 .is_some()
         }
         _ => false,
