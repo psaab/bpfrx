@@ -526,17 +526,10 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 // instead of passing to kernel. The helper's reverse-NAT
                 // repair path handles reply packets for SNATed flows whose
                 // reverse session key was not yet published to the BPF map.
+                // NOTE: no record_trace here — the fall-through keeps the
+                // stack frame alive and combining with the XSK redirect
+                // path pushes combined stack past the 512-byte BPF limit.
                 if is_interface_nat_destination(&parsed) {
-                    record_trace(
-                        ctrl.flags,
-                        ingress_ifindex,
-                        rx_queue_index,
-                        selected_queue,
-                        binding.slot,
-                        USERSPACE_TRACE_STAGE_INTERFACE_NAT_LOCAL,
-                        USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION,
-                        &parsed,
-                    );
                     incr_fallback_stat(USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION);
                     // Fall through to XSK redirect below.
                 }
