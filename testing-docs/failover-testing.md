@@ -326,6 +326,7 @@ Then validate:
 
 Then crash one node with:
 
+WARNING: The following command forces an immediate kernel reboot without syncing disks. It can corrupt filesystems and should only be run in lab/test environments, never on production systems.
 ```bash
 echo b > /proc/sysrq-trigger
 ```
