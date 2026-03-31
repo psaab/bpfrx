@@ -52,7 +52,7 @@ Validated result:
 
 Related doc:
 
-- [userspace-xdp-mode-and-cold-start-findings.md](/tmp/codex-bpfrx-master-9f6d/docs/userspace-xdp-mode-and-cold-start-findings.md)
+- [userspace-xdp-mode-and-cold-start-findings.md](userspace-xdp-mode-and-cold-start-findings.md)
 
 ### 2. Reverse-session activation prewarm
 
@@ -484,6 +484,6 @@ More specifically, the next failover step should be:
 
 ## Related docs
 
-- [userspace-xdp-mode-and-cold-start-findings.md](/tmp/codex-bpfrx-master-9f6d/docs/userspace-xdp-mode-and-cold-start-findings.md)
-- [userspace-failover-next-steps.md](/tmp/codex-bpfrx-master-9f6d/docs/userspace-failover-next-steps.md)
-- [userspace-failover-hardening-plan.md](/tmp/codex-bpfrx-master-9f6d/docs/userspace-failover-hardening-plan.md)
+- [userspace-xdp-mode-and-cold-start-findings.md](userspace-xdp-mode-and-cold-start-findings.md)
+- [userspace-failover-next-steps.md](userspace-failover-next-steps.md)
+- [userspace-failover-hardening-plan.md](userspace-failover-hardening-plan.md)

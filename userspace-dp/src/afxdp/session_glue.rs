@@ -519,6 +519,7 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     if owner_rgs.is_empty() {
         return;
     }
+    let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
     // Reverse companions depend on the current HA state of the client-side
     // egress RG, not only on the forward session's owner RG. When a second RG
     // becomes active during failback (for example, LAN after WAN/tunnel), a
@@ -526,35 +527,36 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     // to local ForwardCandidate. Recompute all synced forward entries on RG
     // activation so stale reverse companions are refreshed against the new HA
     // snapshot instead of staying pinned to the earlier inactive result.
-    let forward_entries = shared_sessions
+    let reverse_entries = shared_sessions
         .lock()
         .map(|sessions| {
+            let mut reverse_entries = Vec::new();
             sessions
                 .values()
                 .filter(|entry| !entry.metadata.is_reverse && entry.metadata.synced)
-                .cloned()
-                .collect::<Vec<_>>()
+                .for_each(|entry| {
+                    let Some(reverse) = synthesized_synced_reverse_entry(
+                        forwarding,
+                        ha_state,
+                        dynamic_neighbors,
+                        entry,
+                        now_secs,
+                    ) else {
+                        return;
+                    };
+                    if owner_rg_set.contains(&entry.metadata.owner_rg_id)
+                        || owner_rg_set.contains(&reverse.metadata.owner_rg_id)
+                    {
+                        reverse_entries.push(reverse);
+                    }
+                });
+            reverse_entries
         })
         .unwrap_or_default();
-    if forward_entries.is_empty() {
+    if reverse_entries.is_empty() {
         return;
     }
-    let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
-    for entry in forward_entries {
-        let Some(reverse) = synthesized_synced_reverse_entry(
-            forwarding,
-            ha_state,
-            dynamic_neighbors,
-            &entry,
-            now_secs,
-        ) else {
-            continue;
-        };
-        if !owner_rg_set.contains(&entry.metadata.owner_rg_id)
-            && !owner_rg_set.contains(&reverse.metadata.owner_rg_id)
-        {
-            continue;
-        }
+    for reverse in reverse_entries {
         publish_shared_session(
             shared_sessions,
             shared_nat_sessions,

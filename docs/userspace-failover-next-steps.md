@@ -112,7 +112,7 @@ Validated artifact for steady-state / XDP-mode correction:
 - the helper now binds copy mode on generic interfaces and zero-copy only on
   native interfaces
 - the restored steady-state forwarding fix is documented in:
-  - `/tmp/codex-bpfrx-master-9f6d/docs/userspace-xdp-mode-and-cold-start-findings.md`
+  - [userspace-xdp-mode-and-cold-start-findings.md](userspace-xdp-mode-and-cold-start-findings.md)
 
 Validated artifact for manual RG failover under load:
 

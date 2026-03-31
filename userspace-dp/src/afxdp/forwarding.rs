@@ -2248,13 +2248,14 @@ mod tests {
     #[test]
     fn ha_resolution_blocks_demoting_owner_rg() {
         let state = build_forwarding_state(&nat_snapshot());
+        let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
             HAGroupRuntime {
                 active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                watchdog_timestamp: now_secs,
                 demoting: true,
-                demoting_until_secs: 0,
+                demoting_until_secs: now_secs + 5,
             },
         )])));
         let resolved = enforce_ha_resolution(
