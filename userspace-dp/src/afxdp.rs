@@ -182,6 +182,7 @@ const BIND_RETRY_ATTEMPTS: usize = 20;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_SLOW_PATH_TUN: &str = "bpfrx-usp0";
 const LOCAL_TUNNEL_DELIVERY_QUEUE_DEPTH: usize = 4096;
+const HA_DEMOTION_PREP_LEASE_SECS: u64 = 5;
 
 const HA_WATCHDOG_STALE_AFTER_SECS: u64 = 2;
 const FABRIC_ZONE_MAC_MAGIC: u8 = 0xfe;
@@ -1034,16 +1035,29 @@ impl Coordinator {
 
     pub fn update_ha_state(&self, groups: &[HAGroupStatus]) {
         let previous = self.ha_state.load();
+        let now_secs = monotonic_nanos() / 1_000_000_000;
         let mut state = BTreeMap::new();
         for group in groups {
-            let demoting = if group.active {
+            let (demoting, demoting_until_secs) = if group.active {
                 previous
                     .as_ref()
                     .get(&group.rg_id)
-                    .map(|runtime| runtime.demoting)
-                    .unwrap_or(false)
+                    .map(|runtime| {
+                        let demoting = runtime.demoting
+                            && runtime.demoting_until_secs != 0
+                            && now_secs <= runtime.demoting_until_secs;
+                        (
+                            demoting,
+                            if demoting {
+                                runtime.demoting_until_secs
+                            } else {
+                                0
+                            },
+                        )
+                    })
+                    .unwrap_or((false, 0))
             } else {
-                false
+                (false, 0)
             };
             state.insert(
                 group.rg_id,
@@ -1051,6 +1065,7 @@ impl Coordinator {
                     active: group.active,
                     watchdog_timestamp: group.watchdog_timestamp,
                     demoting,
+                    demoting_until_secs,
                 },
             );
         }
@@ -1064,8 +1079,7 @@ impl Coordinator {
             // still finds sessions in USERSPACE_SESSIONS and redirects to XSK,
             // bypassing the eBPF pipeline's fabric redirect for demoted RGs.
             if let Some(session_map_ref) = self.session_map_fd.as_ref() {
-                let rg_set: std::collections::BTreeSet<i32> =
-                    demoted_rgs.iter().copied().collect();
+                let rg_set: std::collections::BTreeSet<i32> = demoted_rgs.iter().copied().collect();
                 let mut deleted = 0u32;
                 // Delete from shared_sessions (covers synced + promoted sessions)
                 if let Ok(sessions) = self.shared_sessions.lock() {
@@ -1144,10 +1158,19 @@ impl Coordinator {
         let previous = self.ha_state.load();
         let mut state = previous.as_ref().clone();
         let mut changed = false;
+        let now_secs = monotonic_nanos() / 1_000_000_000;
         for rg_id in owner_rgs {
             if let Some(runtime) = state.get_mut(rg_id) {
-                if runtime.demoting != demoting {
-                    runtime.demoting = demoting && runtime.active;
+                let next_demoting = demoting && runtime.active;
+                let next_deadline = if next_demoting {
+                    now_secs.saturating_add(HA_DEMOTION_PREP_LEASE_SECS)
+                } else {
+                    0
+                };
+                if runtime.demoting != next_demoting || runtime.demoting_until_secs != next_deadline
+                {
+                    runtime.demoting = next_demoting;
+                    runtime.demoting_until_secs = next_deadline;
                     changed = true;
                 }
             }
@@ -5503,6 +5526,11 @@ fn worker_loop(
         if !bindings.is_empty() {
             poll_start = (poll_start + 1) % bindings.len();
         }
+        if let Some(sequence) = command_results.prepared_sequences.iter().copied().max() {
+            // Demotion prepare only needs local worker state to be updated. Do
+            // not block the ack on unrelated steady-state delta churn.
+            demotion_prepare_ack.store(sequence, Ordering::Release);
+        }
         if !command_results.prepared_sequences.is_empty()
             || !command_results.exported_sequences.is_empty()
         {
@@ -5525,9 +5553,6 @@ fn worker_loop(
                         &forwarding.zone_name_to_id,
                     );
                 }
-            }
-            if let Some(sequence) = command_results.prepared_sequences.iter().copied().max() {
-                demotion_prepare_ack.store(sequence, Ordering::Release);
             }
             if let Some(sequence) = command_results.exported_sequences.iter().copied().max() {
                 session_export_ack.store(sequence, Ordering::Release);
@@ -6402,6 +6427,7 @@ mod tests {
                     active: true,
                     watchdog_timestamp: 11,
                     demoting: false,
+                    demoting_until_secs: 0,
                 },
             ),
             (
@@ -6410,6 +6436,7 @@ mod tests {
                     active: true,
                     watchdog_timestamp: 12,
                     demoting: false,
+                    demoting_until_secs: 0,
                 },
             ),
         ]);
@@ -6420,6 +6447,7 @@ mod tests {
                     active: false,
                     watchdog_timestamp: 21,
                     demoting: false,
+                    demoting_until_secs: 0,
                 },
             ),
             (
@@ -6428,6 +6456,7 @@ mod tests {
                     active: true,
                     watchdog_timestamp: 22,
                     demoting: false,
+                    demoting_until_secs: 0,
                 },
             ),
         ]);
@@ -6444,6 +6473,7 @@ mod tests {
                     active: false,
                     watchdog_timestamp: 11,
                     demoting: false,
+                    demoting_until_secs: 0,
                 },
             ),
             (
@@ -6452,6 +6482,7 @@ mod tests {
                     active: true,
                     watchdog_timestamp: 12,
                     demoting: false,
+                    demoting_until_secs: 0,
                 },
             ),
         ]);
@@ -6462,6 +6493,7 @@ mod tests {
                     active: true,
                     watchdog_timestamp: 21,
                     demoting: false,
+                    demoting_until_secs: 0,
                 },
             ),
             (
@@ -6470,11 +6502,70 @@ mod tests {
                     active: true,
                     watchdog_timestamp: 22,
                     demoting: false,
+                    demoting_until_secs: 0,
                 },
             ),
         ]);
 
         assert_eq!(activated_owner_rgs(&previous, &current), vec![1]);
+    }
+
+    #[test]
+    fn update_ha_state_clears_expired_demoting_lease_for_active_group() {
+        let coordinator = Coordinator::new();
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        coordinator.ha_state.store(Arc::new(BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: 11,
+                demoting: true,
+                demoting_until_secs: now_secs.saturating_sub(1),
+            },
+        )])));
+
+        coordinator.update_ha_state(&[HAGroupStatus {
+            rg_id: 1,
+            active: true,
+            watchdog_timestamp: 22,
+        }]);
+
+        let state = coordinator.ha_state.load();
+        let group = state.get(&1).expect("ha group");
+        assert!(group.active);
+        assert!(!group.demoting);
+        assert_eq!(group.demoting_until_secs, 0);
+        assert_eq!(group.watchdog_timestamp, 22);
+    }
+
+    #[test]
+    fn set_demoting_owner_rgs_sets_bounded_lease_for_active_group() {
+        let coordinator = Coordinator::new();
+        coordinator.ha_state.store(Arc::new(BTreeMap::from([(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: 11,
+                demoting: false,
+                demoting_until_secs: 0,
+            },
+        )])));
+
+        let before = monotonic_nanos() / 1_000_000_000;
+        coordinator.set_demoting_owner_rgs(&[1], true);
+        let after = monotonic_nanos() / 1_000_000_000;
+
+        let state = coordinator.ha_state.load();
+        let group = state.get(&1).expect("ha group");
+        assert!(group.demoting);
+        assert!(group.demoting_until_secs >= before + 1);
+        assert!(group.demoting_until_secs <= after + HA_DEMOTION_PREP_LEASE_SECS);
+
+        coordinator.set_demoting_owner_rgs(&[1], false);
+        let state = coordinator.ha_state.load();
+        let group = state.get(&1).expect("ha group");
+        assert!(!group.demoting);
+        assert_eq!(group.demoting_until_secs, 0);
     }
 
     #[test]
