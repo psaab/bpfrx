@@ -302,11 +302,17 @@ func (m *Manager) syncInterfaceAttachments(result *dataplane.CompileResult, snap
 	}
 }
 
-// hasRecentlyDemotedRGs returns true if any RG was demoted within the last 5
-// seconds. Used to keep ctrl disabled so the eBPF pipeline handles fabric
-// redirect while the userspace flow cache drains stale entries.
-func (m *Manager) hasRecentlyDemotedRGs() bool {
-	return !m.lastDemotionTime.IsZero() && time.Since(m.lastDemotionTime) < 5*time.Second
+// hasAnyInactiveRG returns true if any configured RG is currently inactive
+// on this node. Used to keep ctrl disabled so the eBPF pipeline handles
+// fabric redirect — the eBPF pipeline checks rg_active per-packet, while
+// the userspace flow cache does not and would forward stale traffic locally.
+func (m *Manager) hasAnyInactiveRG() bool {
+	for _, group := range m.haGroups {
+		if group.RGID > 0 && !group.Active {
+			return true
+		}
+	}
+	return false
 }
 
 // bpfKtimeNs returns the current CLOCK_BOOTTIME in nanoseconds, matching
@@ -2984,13 +2990,12 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// syncHAStateLocked succeeds to avoid re-enabling ctrl during the
 		// handoff (#279, #284).
 		ctrl.Enabled = 0
-	} else if status.Enabled && m.hasRecentlyDemotedRGs() {
-		// At least one RG was recently demoted. Keep ctrl disabled so the
-		// eBPF pipeline handles fabric redirect via rg_active checks.
-		// The userspace flow cache may still have stale ForwardCandidate
-		// entries; the eBPF pipeline doesn't have this problem. Ctrl will
-		// re-enable once the grace period expires (5s after last demotion).
-		slog.Info("userspace: suppressing ctrl enable (recently demoted RGs)",
+	} else if status.Enabled && len(m.pendingRGTransitions) == 0 && !m.lastDemotionTime.IsZero() && time.Since(m.lastDemotionTime) < 5*time.Second {
+		// Brief grace period after RG demotion. Keeps ctrl disabled so
+		// the eBPF pipeline (which checks rg_active per-packet) handles
+		// fabric redirect while the userspace flow cache processes
+		// FlushFlowCaches commands.
+		slog.Info("userspace: suppressing ctrl enable (demotion grace period)",
 			"since", time.Since(m.lastDemotionTime))
 		ctrl.Enabled = 0
 	} else if status.Enabled {

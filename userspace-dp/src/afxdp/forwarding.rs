@@ -1050,6 +1050,17 @@ pub(super) fn enforce_ha_resolution_snapshot(
     }
     let owner_rg_id = owner_rg_for_resolution(forwarding, resolution);
     if owner_rg_id <= 0 {
+        // In cluster mode, rg=0 on a ForwardCandidate to an egress interface
+        // means the forwarding snapshot predates the RETH RG propagation fix.
+        // Treat as invalid (force re-resolution through the slow path) rather
+        // than "always active" which would let stale cached entries bypass
+        // HA checks after RG failover.
+        if !ha_state.is_empty() && resolution.egress_ifindex > 0 {
+            return ForwardingResolution {
+                disposition: ForwardingDisposition::HAInactive,
+                ..resolution
+            };
+        }
         return resolution;
     }
     let Some(group) = ha_state.get(&owner_rg_id) else {
