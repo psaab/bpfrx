@@ -255,7 +255,7 @@ message GetSessionsRequest {
   bool no_enrich = 15;            // skip reverse-entry merge & app name resolution
 }
 message GetSessionsResponse {
-  int32 total = 1;
+  int32 total = 1;                  // exact count when unfiltered; -1 when filters active (avoids full scan)
   int32 limit = 2;
   int32 offset = 3;
   repeated SessionEntry sessions = 4;

@@ -393,7 +393,10 @@ func (m *Manager) IterateSessionsFrom(cursorKey *SessionKey, fn func(SessionKey,
 
 	// Get the first key to iterate from.
 	if err := sm.NextKey(startKey, &nextKey); err != nil {
-		return nil // no entries or cursor at end
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil // no entries or cursor at end
+		}
+		return fmt.Errorf("sessions NextKey: %w", err)
 	}
 
 	for {
@@ -402,7 +405,10 @@ func (m *Manager) IterateSessionsFrom(cursorKey *SessionKey, fn func(SessionKey,
 			// Entry may have been deleted between NextKey and Lookup; skip.
 			var next SessionKey
 			if err := sm.NextKey(nextKey, &next); err != nil {
-				return nil
+				if errors.Is(err, ebpf.ErrKeyNotExist) {
+					return nil
+				}
+				return fmt.Errorf("sessions NextKey: %w", err)
 			}
 			nextKey = next
 			continue
@@ -412,7 +418,10 @@ func (m *Manager) IterateSessionsFrom(cursorKey *SessionKey, fn func(SessionKey,
 		}
 		var next SessionKey
 		if err := sm.NextKey(nextKey, &next); err != nil {
-			return nil // end of map
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				return nil // end of map
+			}
+			return fmt.Errorf("sessions NextKey: %w", err)
 		}
 		nextKey = next
 	}
@@ -434,7 +443,10 @@ func (m *Manager) IterateSessionsV6From(cursorKey *SessionKeyV6, fn func(Session
 	}
 
 	if err := sm.NextKey(startKey, &nextKey); err != nil {
-		return nil
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return nil
+		}
+		return fmt.Errorf("sessions_v6 NextKey: %w", err)
 	}
 
 	for {
@@ -442,7 +454,10 @@ func (m *Manager) IterateSessionsV6From(cursorKey *SessionKeyV6, fn func(Session
 		if err := sm.Lookup(nextKey, &val); err != nil {
 			var next SessionKeyV6
 			if err := sm.NextKey(nextKey, &next); err != nil {
-				return nil
+				if errors.Is(err, ebpf.ErrKeyNotExist) {
+					return nil
+				}
+				return fmt.Errorf("sessions_v6 NextKey: %w", err)
 			}
 			nextKey = next
 			continue
@@ -452,7 +467,10 @@ func (m *Manager) IterateSessionsV6From(cursorKey *SessionKeyV6, fn func(Session
 		}
 		var next SessionKeyV6
 		if err := sm.NextKey(nextKey, &next); err != nil {
-			return nil
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				return nil
+			}
+			return fmt.Errorf("sessions_v6 NextKey: %w", err)
 		}
 		nextKey = next
 	}

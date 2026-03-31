@@ -880,7 +880,7 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 
 	// Phase 1: iterate v4 sessions from cursor.
 	if startV4 {
-		_ = iterDP.IterateSessionsFrom(cursorV4, func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if err := iterDP.IterateSessionsFrom(cursorV4, func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
 			if len(all) >= pageSize {
 				return false // page full
 			}
@@ -902,7 +902,9 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 			all = append(all, se)
 			lastV4Key = key
 			return true
-		})
+		}); err != nil {
+			return nil, status.Errorf(codes.Internal, "v4 session iteration: %v", err)
+		}
 		if len(all) >= pageSize {
 			// Page is full from v4; next page token resumes v4.
 			resp := &pb.GetSessionsResponse{
@@ -921,7 +923,7 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 	// Phase 2: iterate v6 sessions.
 	if startV6 {
 		v6Exhausted = false
-		_ = iterDP.IterateSessionsV6From(cursorV6, func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if err := iterDP.IterateSessionsV6From(cursorV6, func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 			if len(all) >= pageSize {
 				return false
 			}
@@ -943,7 +945,9 @@ func (s *Server) getSessionsCursor(ctx context.Context, req *pb.GetSessionsReque
 			all = append(all, se)
 			lastV6Key = key
 			return true
-		})
+		}); err != nil {
+			return nil, status.Errorf(codes.Internal, "v6 session iteration: %v", err)
+		}
 		if len(all) >= pageSize {
 			resp := &pb.GetSessionsResponse{
 				Sessions:      all,
@@ -1200,9 +1204,11 @@ func (s *Server) fetchPeerSessions(ctx context.Context, req *pb.GetSessionsReque
 		NatOnly:           req.NatOnly,
 		Application:       req.Application,
 		InterfaceFilter:   req.InterfaceFilter,
-		PageToken:         req.PageToken,
-		PageSize:          req.PageSize,
-		NoEnrich:          req.NoEnrich,
+		// Do NOT forward PageToken to peer — tokens encode local BPF map
+		// keys and are meaningless on a different node's keyspace. Peer
+		// always returns its full (first-page) result set.
+		PageSize: req.PageSize,
+		NoEnrich: req.NoEnrich,
 	}
 	peerResp, err := client.GetSessions(peerCtx, peerReq)
 	if err != nil {
