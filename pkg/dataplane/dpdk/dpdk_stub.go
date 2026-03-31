@@ -323,7 +323,7 @@ func (m *Manager) NewEventSource() (dataplane.EventSource, error) { return nil, 
 // --- FIB ---
 
 func (m *Manager) StartFIBSync(_ context.Context) {}
-func (m *Manager) BumpFIBGeneration()             {}
+func (m *Manager) BumpFIBGeneration() uint32       { return 0 }
 func (m *Manager) NotifyLinkCycle()               {}
 func (m *Manager) SyncFabricState()               {}
 

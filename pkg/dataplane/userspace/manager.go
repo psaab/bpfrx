@@ -334,27 +334,30 @@ func (m *Manager) bumpGeneration() uint64 {
 // userspace snapshot with fresh routes/neighbors from the kernel.  The eBPF
 // pipeline reads FIB generation from the BPF map directly, but the userspace
 // worker receives route/neighbor data via snapshots — so we must republish.
-func (m *Manager) BumpFIBGeneration() {
-	m.inner.BumpFIBGeneration()
+func (m *Manager) BumpFIBGeneration() uint32 {
+	newGen := m.inner.BumpFIBGeneration()
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
-		return
+		return newGen
 	}
 	if m.proc == nil || m.proc.Process == nil {
-		return
+		return newGen
 	}
 
-	// Rebuild snapshot with fresh routes/neighbors from kernel tables.
+	// Rebuild snapshot with the EXACT value BumpFIBGeneration wrote.
+	// Never re-read from BPF map — that introduces a race where the
+	// read returns a stale value.
 	m.generation++
-	snap := buildSnapshot(m.lastSnapshot.Config, m.cfg, m.generation, m.readFIBGeneration())
+	snap := buildSnapshot(m.lastSnapshot.Config, m.cfg, m.generation, newGen)
 	m.lastSnapshot = snap
 
 	if err := m.syncSnapshotLocked(); err != nil {
 		slog.Warn("userspace: failed to publish FIB refresh snapshot", "err", err)
 	}
+	return newGen
 }
 
 func deriveUserspaceConfig(cfg *config.Config) config.UserspaceConfig {
@@ -2778,10 +2781,9 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	// cached decisions after RG demotion.
 	// Cannot call m.BumpFIBGeneration() here (acquires mu, would deadlock).
 	// Instead bump the BPF counter + rebuild and push snapshot inline.
-	m.inner.BumpFIBGeneration()
-	// Read fib_gen_map AFTER bump. Use inner.Map directly to avoid any caching.
-	newFIBGen := m.readFIBGeneration()
-	slog.Info("userspace: FIB gen after bump", "rg", rgID, "active", active, "fib_gen", newFIBGen)
+	// Use the returned value from BumpFIBGeneration — never re-read from the
+	// BPF map, which can return a stale value due to kernel caching.
+	newFIBGen := m.inner.BumpFIBGeneration()
 	if m.lastSnapshot != nil && m.lastSnapshot.Config != nil && m.proc != nil {
 		m.generation++
 		snap := buildSnapshot(m.lastSnapshot.Config, m.cfg, m.generation, newFIBGen)

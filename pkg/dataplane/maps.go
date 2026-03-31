@@ -1966,11 +1966,11 @@ func (m *Manager) StartFIBSync(_ context.Context) {}
 func (m *Manager) NotifyLinkCycle() {} // no-op: eBPF programs survive link cycles
 func (m *Manager) SyncFabricState()  {} // no-op: eBPF uses fabric_fwd BPF map directly
 
-func (m *Manager) BumpFIBGeneration() {
+func (m *Manager) BumpFIBGeneration() uint32 {
 	zm, ok := m.maps["fib_gen_map"]
 	if !ok {
 		slog.Warn("fib_gen_map not found, cannot bump FIB generation")
-		return
+		return 0
 	}
 	var key uint32
 	var gen uint32
@@ -1980,9 +1980,10 @@ func (m *Manager) BumpFIBGeneration() {
 	gen++
 	if err := zm.Update(key, gen, ebpf.UpdateAny); err != nil {
 		slog.Warn("failed to bump FIB generation", "err", err)
-		return
+		return gen - 1
 	}
 	slog.Info("bumped FIB generation counter", "generation", gen)
+	return gen
 }
 
 // MapStats holds utilization info for a BPF map.

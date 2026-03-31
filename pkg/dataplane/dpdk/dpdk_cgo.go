@@ -1716,12 +1716,12 @@ func (m *Manager) ClearFIBRoutes() {
 func (m *Manager) NotifyLinkCycle() {} // no-op for DPDK
 func (m *Manager) SyncFabricState()  {} // no-op for DPDK
 
-func (m *Manager) BumpFIBGeneration() {
+func (m *Manager) BumpFIBGeneration() uint32 {
 	shm := m.platform.shm
 	if shm == nil {
-		return
+		return 0
 	}
-	atomic.AddUint32((*uint32)(unsafe.Pointer(shm.fib_gen)), 1)
+	return atomic.AddUint32((*uint32)(unsafe.Pointer(shm.fib_gen)), 1)
 }
 
 // --- Map statistics ---

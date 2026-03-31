@@ -242,7 +242,7 @@ type DataPlane interface {
 	ClearNATRuleCounters() error
 
 	// FIB
-	BumpFIBGeneration()
+	BumpFIBGeneration() uint32
 	StartFIBSync(ctx context.Context) // DPDK: background route sync; eBPF: no-op
 
 	// NotifyLinkCycle signals that data-plane interfaces were taken DOWN/UP
