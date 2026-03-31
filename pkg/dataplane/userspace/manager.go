@@ -2779,12 +2779,22 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	// Cannot call m.BumpFIBGeneration() here (acquires mu, would deadlock).
 	// Instead bump the BPF counter + rebuild and push snapshot inline.
 	m.inner.BumpFIBGeneration()
+	// Read fib_gen_map AFTER bump. Use inner.Map directly to avoid any caching.
+	newFIBGen := m.readFIBGeneration()
+	slog.Info("userspace: FIB gen after bump", "rg", rgID, "active", active, "fib_gen", newFIBGen)
 	if m.lastSnapshot != nil && m.lastSnapshot.Config != nil && m.proc != nil {
 		m.generation++
-		snap := buildSnapshot(m.lastSnapshot.Config, m.cfg, m.generation, m.readFIBGeneration())
+		snap := buildSnapshot(m.lastSnapshot.Config, m.cfg, m.generation, newFIBGen)
 		m.lastSnapshot = snap
+		slog.Info("userspace: pushing FIB refresh snapshot for HA transition",
+			"rg", rgID, "active", active,
+			"generation", m.generation, "fib_generation", newFIBGen,
+			"published", m.publishedSnapshot)
 		if err := m.syncSnapshotLocked(); err != nil {
 			slog.Warn("userspace: failed to push FIB refresh snapshot on HA transition", "err", err)
+		} else {
+			slog.Info("userspace: FIB refresh snapshot pushed successfully",
+				"generation", m.generation, "fib_generation", newFIBGen)
 		}
 	}
 	slog.Info("userspace: bumped FIB generation to invalidate flow caches on HA transition",
