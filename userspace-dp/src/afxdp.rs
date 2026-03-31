@@ -1908,7 +1908,7 @@ impl BindingWorker {
             initial_fill_frames.push(offset);
         }
         let info = ifinfo_from_binding(binding)?;
-        let (user, rx, tx, bind_mode, actual_bind_strategy, mut device) =
+        let (user, rx, tx, bind_mode, actual_bind_strategy, device) =
             open_binding_worker_rings(
                 &mut worker_umem,
                 &info,
@@ -2792,7 +2792,7 @@ fn poll_binding(
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
                     let mut session_ingress_zone: Option<Arc<str>> = None;
                     let mut apply_nat_on_fabric = false;
-                    let mut decision = if let Some(flow) = flow.as_ref() {
+                    let decision = if let Some(flow) = flow.as_ref() {
                         if let Some(resolved) = resolve_flow_session_decision(
                             sessions,
                             binding.session_map_fd,
@@ -4535,7 +4535,7 @@ fn retry_pending_neigh(
                 decision.resolution.disposition = ForwardingDisposition::ForwardCandidate;
                 let expected_ports = None;
                 if let Some(frame_len) = rewrite_forwarded_frame_in_place(
-                    unsafe { &*area },
+                    &*area,
                     pkt.desc,
                     pkt.meta,
                     &decision,
