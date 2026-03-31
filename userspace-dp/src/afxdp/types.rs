@@ -584,6 +584,7 @@ pub(super) enum WorkerCommand {
     PrepareDemoteOwnerRGs { sequence: u64, owner_rgs: Vec<i32> },
     DemoteOwnerRG(i32),
     RefreshOwnerRGs(Vec<i32>),
+    FlushFlowCaches,
 }
 
 #[derive(Default)]

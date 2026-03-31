@@ -1126,6 +1126,11 @@ impl Coordinator {
             );
             for handle in self.workers.values() {
                 if let Ok(mut pending) = handle.commands.lock() {
+                    // Flush ALL flow caches first — cached entries may have
+                    // owner_rg_id=0 (RETH members before RG propagation fix)
+                    // which bypasses per-RG invalidation. Nuclear flush
+                    // guarantees no stale ForwardCandidate entries survive.
+                    pending.push_back(WorkerCommand::FlushFlowCaches);
                     for rg_id in &demoted_rgs {
                         pending.push_back(WorkerCommand::DemoteOwnerRG(*rg_id));
                     }

@@ -354,6 +354,11 @@ pub(super) fn apply_worker_commands(
                     sessions.len()
                 );
             }
+            WorkerCommand::FlushFlowCaches => {
+                for flow_cache in flow_caches.iter_mut() {
+                    flow_cache.invalidate_all();
+                }
+            }
             WorkerCommand::UpsertSynced(mut entry) => {
                 let key = entry.key.clone();
                 let locally_active =

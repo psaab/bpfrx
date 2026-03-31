@@ -55,6 +55,7 @@ type Manager struct {
 	ctrlEnableAt       time.Time
 	ctrlWasEnabled     bool
 	ctrlDisabledAt     uint64 // monotonic ktime_ns when ctrl was last disabled
+	lastDemotionTime   time.Time // wall clock when last RG demotion occurred
 	xskLivenessFailed  bool
 	xskLivenessProven  bool
 	xskProbeStart      time.Time
@@ -299,6 +300,13 @@ func (m *Manager) syncInterfaceAttachments(result *dataplane.CompileResult, snap
 			slog.Warn("userspace: detach TC from non-data interface failed", "ifindex", ifindex, "err", err)
 		}
 	}
+}
+
+// hasRecentlyDemotedRGs returns true if any RG was demoted within the last 5
+// seconds. Used to keep ctrl disabled so the eBPF pipeline handles fabric
+// redirect while the userspace flow cache drains stale entries.
+func (m *Manager) hasRecentlyDemotedRGs() bool {
+	return !m.lastDemotionTime.IsZero() && time.Since(m.lastDemotionTime) < 5*time.Second
 }
 
 // bpfKtimeNs returns the current CLOCK_BOOTTIME in nanoseconds, matching
@@ -852,6 +860,19 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 		return nil
 	}
 	zoneByInterface := buildInterfaceZoneMap(cfg)
+	// Build RETH RG lookup: physical member → RETH's RedundancyGroup.
+	// Physical members have RedundantParent set but RedundancyGroup=0;
+	// the RG is on the RETH. Without this, flow cache HA checks on
+	// RETH member egress interfaces return owner_rg=0 and bypass
+	// HA active/inactive validation, causing stale forwarding after failover.
+	rethRG := make(map[string]int)
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc != nil && ifc.RedundantParent != "" {
+			if reth := cfg.Interfaces.Interfaces[ifc.RedundantParent]; reth != nil && reth.RedundancyGroup > 0 {
+				rethRG[ifc.Name] = reth.RedundancyGroup
+			}
+		}
+	}
 	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
 	for name := range cfg.Interfaces.Interfaces {
 		names = append(names, name)
@@ -865,6 +886,11 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 		}
 		linuxName := snapshotLinuxName(cfg, name, iface, nil)
 		ifindex, mtu, hardwareAddr, addresses := buildLinkSnapshot(linuxName)
+		// Use the interface's own RG, or inherit from RETH parent.
+		rg := iface.RedundancyGroup
+		if rg <= 0 {
+			rg = rethRG[name]
+		}
 		out = append(out, InterfaceSnapshot{
 			Name:            name,
 			Zone:            zoneByInterface[name],
@@ -875,7 +901,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			RXQueues:        userspaceRXQueueCount(linuxName),
 			VLANID:          0,
 			LocalFabric:     iface.LocalFabricMember,
-			RedundancyGroup: iface.RedundancyGroup,
+			RedundancyGroup: rg,
 			UnitCount:       len(iface.Units),
 			Tunnel:          iface.Tunnel != nil,
 			MTU:             mtu,
@@ -911,7 +937,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				RXQueues:        userspaceRXQueueCount(linuxUnit),
 				VLANID:          unit.VlanID,
 				LocalFabric:     iface.LocalFabricMember,
-				RedundancyGroup: iface.RedundancyGroup,
+				RedundancyGroup: rg, // inherit resolved RG (RETH parent or own)
 				UnitCount:       0,
 				Tunnel:          iface.Tunnel != nil || unit.Tunnel != nil,
 				MTU:             mtu,
@@ -2698,6 +2724,9 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	} else {
 		slog.Info("userspace: disabled ctrl + swapped to eBPF pipeline for RG demotion",
 			"rg", rgID)
+		m.mu.Lock()
+		m.lastDemotionTime = time.Now()
+		m.mu.Unlock()
 	}
 	if err := m.inner.UpdateRGActive(rgID, active); err != nil {
 		// Rollback: re-enable ctrl and restore XDP shim since the
@@ -2954,6 +2983,13 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// acked the HA state update yet. Keep ctrl disabled until
 		// syncHAStateLocked succeeds to avoid re-enabling ctrl during the
 		// handoff (#279, #284).
+		ctrl.Enabled = 0
+	} else if status.Enabled && m.hasRecentlyDemotedRGs() {
+		// At least one RG was recently demoted. Keep ctrl disabled so the
+		// eBPF pipeline handles fabric redirect via rg_active checks.
+		// The userspace flow cache may still have stale ForwardCandidate
+		// entries; the eBPF pipeline doesn't have this problem. Ctrl will
+		// re-enable once the grace period expires (5s after last demotion).
 		ctrl.Enabled = 0
 	} else if status.Enabled {
 		// Delay ctrl enable until AFTER VIPs are configured in HA mode.
