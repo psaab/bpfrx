@@ -1,5 +1,15 @@
 # bpfrx - eBPF Firewall with Junos Configuration Syntax
 
+## Working Style
+- Think before acting. Read existing files before writing code.
+- Be concise in output but thorough in reasoning.
+- Prefer editing over rewriting whole files.
+- Do not re-read files you have already read.
+- Test your code before declaring done.
+- No sycophantic openers or closing fluff.
+- Keep solutions simple and direct.
+- When working with many teams, don't let the context windows get too large.
+
 ## What This Is
 An eBPF-based firewall that clones Juniper vSRX capabilities using native Junos configuration syntax. Go userspace (cilium/ebpf) drives C eBPF programs attached at XDP (ingress) and TC (egress).
 
