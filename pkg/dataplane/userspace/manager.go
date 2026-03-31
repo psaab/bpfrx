@@ -2990,6 +2990,8 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// The userspace flow cache may still have stale ForwardCandidate
 		// entries; the eBPF pipeline doesn't have this problem. Ctrl will
 		// re-enable once the grace period expires (5s after last demotion).
+		slog.Info("userspace: suppressing ctrl enable (recently demoted RGs)",
+			"since", time.Since(m.lastDemotionTime))
 		ctrl.Enabled = 0
 	} else if status.Enabled {
 		// Delay ctrl enable until AFTER VIPs are configured in HA mode.
