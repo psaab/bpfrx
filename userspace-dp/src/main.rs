@@ -1523,6 +1523,15 @@ fn handle_stream(
                     response.error = "missing HA demotion prepare".to_string();
                 }
             }
+            "clear_ha_demotion" => {
+                if let Some(prepare_req) = request.ha_demotion_prepare {
+                    guard.afxdp.clear_ha_demotion(&prepare_req.groups);
+                    refresh_status(&mut guard);
+                } else {
+                    response.ok = false;
+                    response.error = "missing HA demotion prepare".to_string();
+                }
+            }
             "update_fabrics" => {
                 if let Some(fabrics) = request.fabrics.as_ref() {
                     guard.afxdp.refresh_fabric_links(fabrics);

@@ -1090,6 +1090,26 @@ impl Coordinator {
                         }
                     }
                 }
+                // Delete alias keys from shared_nat_sessions (reverse-wire +
+                // reverse-canonical aliases that are also in the BPF map).
+                if let Ok(sessions) = self.shared_nat_sessions.lock() {
+                    for (key, entry) in sessions.iter() {
+                        if rg_set.contains(&entry.metadata.owner_rg_id) {
+                            delete_live_session_key(session_map_ref.fd, key);
+                            deleted += 1;
+                        }
+                    }
+                }
+                // Delete alias keys from shared_forward_wire_sessions
+                // (translated forward-wire aliases that are also in the BPF map).
+                if let Ok(sessions) = self.shared_forward_wire_sessions.lock() {
+                    for (key, entry) in sessions.iter() {
+                        if rg_set.contains(&entry.metadata.owner_rg_id) {
+                            delete_live_session_key(session_map_ref.fd, key);
+                            deleted += 1;
+                        }
+                    }
+                }
                 if deleted > 0 {
                     eprintln!(
                         "bpfrx-ha: immediate USERSPACE_SESSIONS cleanup for demoted RGs {:?}: {} entries",
@@ -1216,6 +1236,21 @@ impl Coordinator {
             }
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Explicitly clear a stale demotion mark that was set by
+    /// `prepare_ha_demotion` but never completed (e.g. Go-side timeout).
+    /// The auto-expiry lease will eventually clear it, but this provides
+    /// immediate cleanup so the helper stops treating the RG as demoting.
+    pub fn clear_ha_demotion(&self, owner_rgs: &[i32]) {
+        if owner_rgs.is_empty() {
+            return;
+        }
+        self.set_demoting_owner_rgs(owner_rgs, false);
+        eprintln!(
+            "bpfrx-ha: cleared stale demotion mark for RGs {:?}",
+            owner_rgs
+        );
     }
 
     pub fn export_owner_rg_sessions(
