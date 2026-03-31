@@ -54,6 +54,7 @@ type Manager struct {
 	neighborsPrewarmed bool
 	ctrlEnableAt       time.Time
 	ctrlWasEnabled     bool
+	ctrlDisabledAt     uint64 // monotonic ktime_ns when ctrl was last disabled
 	xskLivenessFailed  bool
 	xskLivenessProven  bool
 	xskProbeStart      time.Time
@@ -298,6 +299,14 @@ func (m *Manager) syncInterfaceAttachments(result *dataplane.CompileResult, snap
 			slog.Warn("userspace: detach TC from non-data interface failed", "ifindex", ifindex, "err", err)
 		}
 	}
+}
+
+// bpfKtimeNs returns the current CLOCK_BOOTTIME in nanoseconds, matching
+// the clock used by BPF's bpf_ktime_get_ns() for session Created timestamps.
+func (m *Manager) bpfKtimeNs() uint64 {
+	var ts unix.Timespec
+	_ = unix.ClockGettime(unix.CLOCK_BOOTTIME, &ts)
+	return uint64(ts.Sec)*1_000_000_000 + uint64(ts.Nsec)
 }
 
 func (m *Manager) bumpGeneration() uint64 {
@@ -3101,28 +3110,49 @@ ctrlReady:
 					"deleted", deleted)
 			}
 		}
-		// Flush BPF conntrack (v4 + v6) to remove sessions created by
-		// the eBPF pipeline during the ctrl-disabled transition window.
+		// Flush BPF conntrack sessions created by the eBPF pipeline
+		// during the ctrl-disabled transition window. Only delete
+		// sessions whose Created timestamp is AFTER ctrlDisabledAt —
+		// synced sessions from the cluster peer have earlier timestamps
+		// and must survive for HA failover continuity.
+		cutoff := m.ctrlDisabledAt
 		for _, mapName := range []string{"sessions", "sessions_v6"} {
 			if ctMap := m.inner.Map(mapName); ctMap != nil {
+				keySize := ctMap.KeySize()
+				valSize := ctMap.ValueSize()
 				var key, nextKey []byte
-				key = make([]byte, ctMap.KeySize())
-				nextKey = make([]byte, ctMap.KeySize())
-				deleted := 0
+				key = make([]byte, keySize)
+				nextKey = make([]byte, keySize)
+				val := make([]byte, valSize)
+				deleted, kept := 0, 0
 				for {
 					if err := ctMap.NextKey(key, nextKey); err != nil {
 						break
 					}
 					copy(key, nextKey)
+					// Read session value to check Created timestamp.
+					// Created is at byte offset 8 (after State[1]+Flags[1]+TCPState[1]+IsReverse[1]+AppTimeout[4]).
+					if cutoff > 0 {
+						if err := ctMap.Lookup(key, val); err == nil && len(val) >= 16 {
+							created := binary.NativeEndian.Uint64(val[8:16])
+							if created > 0 && created < cutoff {
+								kept++
+								continue // synced session — keep it
+							}
+						}
+					}
 					_ = ctMap.Delete(key)
 					deleted++
 				}
-				if deleted > 0 {
+				if deleted > 0 || kept > 0 {
 					slog.Info("userspace: flushed stale BPF conntrack on ctrl enable",
-						"map", mapName, "deleted", deleted)
+						"map", mapName, "deleted", deleted, "kept_synced", kept)
 				}
 			}
 		}
+	}
+	if ctrl.Enabled == 0 && m.ctrlWasEnabled {
+		m.ctrlDisabledAt = m.bpfKtimeNs()
 	}
 	m.ctrlWasEnabled = ctrl.Enabled == 1
 	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
