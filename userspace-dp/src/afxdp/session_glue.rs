@@ -595,7 +595,14 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
     let candidates = {
         let mut out = Vec::new();
         sessions.iter_with_origin(|key, decision, metadata, origin| {
-            out.push((key.clone(), decision, metadata.clone(), origin));
+            // Pre-filter by owner RG during iteration to avoid cloning the
+            // entire session table. Only collect entries whose current
+            // owner_rg_id matches the target set, plus unassigned entries
+            // (owner_rg_id == 0) which may resolve into the target set
+            // after re-resolution.
+            if metadata.owner_rg_id == 0 || owner_rg_set.contains(&metadata.owner_rg_id) {
+                out.push((key.clone(), decision, metadata.clone(), origin));
+            }
         });
         out
     };

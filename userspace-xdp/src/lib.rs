@@ -509,7 +509,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                     );
                     return Ok(cpumap_or_pass(ctrl));
                 }
-                if is_local_destination(&parsed) || is_interface_nat_destination(&parsed) {
+                if is_local_destination(&parsed) {
                     record_trace(
                         ctrl.flags,
                         ingress_ifindex,
@@ -521,6 +521,24 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                         &parsed,
                     );
                     return Ok(cpumap_or_pass(ctrl));
+                }
+                // Interface-NAT session miss: redirect to the helper (XSK)
+                // instead of passing to kernel. The helper's reverse-NAT
+                // repair path handles reply packets for SNATed flows whose
+                // reverse session key was not yet published to the BPF map.
+                if is_interface_nat_destination(&parsed) {
+                    record_trace(
+                        ctrl.flags,
+                        ingress_ifindex,
+                        rx_queue_index,
+                        selected_queue,
+                        binding.slot,
+                        USERSPACE_TRACE_STAGE_INTERFACE_NAT_LOCAL,
+                        USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION,
+                        &parsed,
+                    );
+                    incr_fallback_stat(USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION);
+                    // Fall through to XSK redirect below.
                 }
                 // Let all session misses through to the userspace dataplane.
                 // The userspace DP will evaluate policy and either create a
