@@ -1927,9 +1927,15 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
         key,
         decision: crate::session::SessionDecision {
             resolution: afxdp::ForwardingResolution {
+                // Synced sessions with FIB cleared (egress=0) still need
+                // ForwardCandidate so the UpsertSynced handler re-resolves
+                // them locally. NoRoute would prevent re-resolution and
+                // leave the session dead (no SNAT applied).
                 disposition: if req.egress_ifindex > 0
                     || req.tx_ifindex > 0
                     || req.tunnel_endpoint_id != 0
+                    || !req.nat_src_ip.is_empty()
+                    || !req.nat_dst_ip.is_empty()
                 {
                     afxdp::ForwardingDisposition::ForwardCandidate
                 } else {

@@ -3669,9 +3669,14 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
 		return nil
 	}
+	// Send to helper with FIB CLEARED — same as BPF path. The helper
+	// resolves forwarding locally on first packet using its own routes
+	// and interfaces. Only NAT state + zones travel with the session.
+	// Previously we sent the peer's FIB info which doesn't match local
+	// interfaces, causing EgressIfindex=0 → NoRoute → SNAT not applied.
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_ = m.syncSessionV4Locked("upsert", key, &val)
+	_ = m.syncSessionV4Locked("upsert", key, &installVal)
 	return nil
 }
 
@@ -3701,9 +3706,10 @@ func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val data
 	if !shouldMirrorUserspaceSession(val.IsReverse) {
 		return nil
 	}
+	// FIB cleared — same rationale as V4.
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_ = m.syncSessionV6Locked("upsert", key, &val)
+	_ = m.syncSessionV6Locked("upsert", key, &installVal)
 	return nil
 }
 
