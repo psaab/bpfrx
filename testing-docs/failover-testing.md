@@ -263,6 +263,8 @@ Purpose:
 
 From the active primary:
 
+> **WARNING (lab/test environments only):** The following command forces an immediate kernel reboot without syncing disks. It can corrupt filesystems and should only be used in lab or test environments, never on production systems. Requires root. If filesystem safety matters, prefer `systemctl reboot --force` or `reboot -f` instead.
+
 ```bash
 echo b > /proc/sysrq-trigger
 ```
