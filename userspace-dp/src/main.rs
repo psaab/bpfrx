@@ -628,6 +628,9 @@ struct ProcessStatus {
     event_stream_sent: u64,
     #[serde(rename = "event_stream_dropped", default)]
     event_stream_dropped: u64,
+    /// Monotonic timestamp (secs) of the last HA flow cache flush (#312).
+    #[serde(rename = "last_cache_flush_at", default)]
+    last_cache_flush_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1264,6 +1267,7 @@ fn run() -> Result<(), String> {
             event_stream_acked: 0,
             event_stream_sent: 0,
             event_stream_dropped: 0,
+            last_cache_flush_at: 0,
         },
         snapshot: None,
         afxdp: {
@@ -1839,6 +1843,7 @@ fn refresh_status(state: &mut ServerState) {
         state.status.event_stream_sent = es_stats.sent;
         state.status.event_stream_dropped = es_stats.dropped;
     }
+    state.status.last_cache_flush_at = state.afxdp.last_cache_flush_at();
 }
 
 fn forwarding_unsupported_error(cap: &UserspaceCapabilities) -> String {

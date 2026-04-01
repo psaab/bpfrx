@@ -1500,6 +1500,19 @@ func (m *Manager) FormatInformation() string {
 	}
 	fmt.Fprintln(&b)
 
+	// Install fence (barrier-based cutover).
+	if syncStats != nil && syncStats.LastFenceSeq > 0 {
+		fmt.Fprintln(&b, "Install fence:")
+		fmt.Fprintf(&b, "  Last fence sequence: %d\n", syncStats.LastFenceSeq)
+		if syncStats.LastFenceAckAt > 0 {
+			ackTime := time.Unix(0, syncStats.LastFenceAckAt)
+			fmt.Fprintf(&b, "  Last fence ack:      %s\n", ackTime.Format("Jan 02 15:04:05.000"))
+		} else {
+			fmt.Fprintln(&b, "  Last fence ack:      pending")
+		}
+		fmt.Fprintln(&b)
+	}
+
 	// Interface monitoring events.
 	monEvents := m.history.Events(EventMonitor)
 	if len(monEvents) > 0 {
@@ -1580,6 +1593,10 @@ func (m *Manager) FormatStatistics() string {
 			"", syncStats.SessionsInstalled)
 		fmt.Fprintf(&b, "    %-32s %-12d %s\n", "Errors",
 			syncStats.Errors, "")
+		if syncStats.LastFenceSeq > 0 {
+			fmt.Fprintf(&b, "    %-32s %-12d %s\n", "Install fence seq",
+				syncStats.LastFenceSeq, "")
+		}
 	} else {
 		fmt.Fprintln(&b, "Session sync not configured")
 	}
@@ -1624,6 +1641,10 @@ func (m *Manager) FormatDataPlaneStatistics() string {
 		"", syncStats.SessionsInstalled)
 	fmt.Fprintf(&b, "    %-32s %-12d %s\n", "Errors",
 		syncStats.Errors, "")
+	if syncStats.LastFenceSeq > 0 {
+		fmt.Fprintf(&b, "    %-32s %-12d %s\n", "Install fence seq",
+			syncStats.LastFenceSeq, "")
+	}
 	return b.String()
 }
 

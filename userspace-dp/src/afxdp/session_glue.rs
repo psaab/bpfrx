@@ -341,6 +341,11 @@ pub(super) fn apply_worker_commands(
                 // peer's interface indices and MACs which don't work locally.
                 // Without this, SNAT isn't applied on the new owner because
                 // the session's egress_ifindex is wrong (peer's ifindex).
+                //
+                // NOTE (#310): Reverse companions are now pre-installed by the
+                // Go sync path (SetClusterSyncedSessionV4/V6), so this refresh
+                // only updates their resolution rather than synthesizing from
+                // scratch. This reduces activation-time work significantly.
                 refresh_live_reverse_sessions_for_owner_rgs(
                     sessions,
                     session_map_fd,
@@ -589,6 +594,12 @@ pub(super) fn synced_replica_entry(entry: &SyncedSessionEntry) -> SyncedSessionE
     replica
 }
 
+/// Pre-warm reverse companions in shared session maps at RG activation.
+///
+/// With deterministic reverse companions (#310), the Go sync path already
+/// pre-installs reverse entries via UpsertSynced. This function still runs
+/// at activation to re-resolve egress with local forwarding state (the
+/// pre-installed entries carry the peer's interface indices/MACs).
 pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,

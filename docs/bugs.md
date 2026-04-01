@@ -999,3 +999,24 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Fix:** Track `ctrlDisabledAt` (CLOCK_BOOTTIME ns, matching BPF's `bpf_ktime_get_ns()`). On ctrl enable, read each session's `Created` timestamp (uint64 at byte offset 8 in the session value). Only flush sessions where `Created > ctrlDisabledAt` (created during the transition window). Sessions synced from the peer have earlier timestamps and survive
 - **Key pattern:** BPF session values have a `Created` field populated by `bpf_ktime_get_ns()` at session creation time. This serves as a reliable discriminator between pre-existing synced sessions and newly-created transition sessions
 - **Remaining work:** This fix preserves synced sessions but the investigation docs identify additional issues: (H) public-side LocalDelivery materialization from shared_promote path, (F) fabric transit throughput ceiling for redirected flows. These may cause partial throughput loss even with sessions preserved
+
+## Userspace Forwarding & HA Gaps (PR #301, Issues #302-#312)
+
+Audit doc: `docs/userspace-forwarding-and-failover-gap-audit.md`
+
+### Hybrid userspace/eBPF forwarding model (OPEN #302-#307)
+- **Symptom:** In userspace dataplane mode, transit packets can silently fall back to the eBPF pipeline (via XDP_PASS or XSK socket failure) without any indication in counters or logs. The XDP shim program returns XDP_PASS for protocols it does not handle (GRE, ESP), for AF_XDP socket errors, and when PASS_TO_KERNEL is set — all of which bypass the userspace forwarding path entirely
+- **Root cause:** No strict enforcement of which packets must go through the userspace path vs the eBPF path. The current `userspace_compat` mode treats eBPF fallback as acceptable, but there is no `userspace_strict` mode that would fail-closed on unexpected fallback
+- **Impact:** Policy evaluation, NAT, and session accounting diverge between eBPF and userspace paths. In HA, synced sessions may reference NAT state that only exists in one dataplane, causing post-failover black holes
+- **Plan:** Define DataplaneMode enum (#303), ban transit fallback in strict mode (#304), scope PASS_TO_KERNEL to control-plane only (#305), XSK liveness fail-closed (#306), per-interface entry program + fallback counters (#307)
+
+### Silent transit fallback in userspace mode (OPEN #304)
+- **Symptom:** Packets matching protocols not handled by the XDP shim (GRE, ESP, or any future protocol) get XDP_PASS and are processed by the kernel/eBPF pipeline instead of the userspace dataplane. No counter tracks these events
+- **Root cause:** `xdp_xsk_shim.c` `fallback_to_main()` tail-calls into the eBPF main program for unhandled protocols. If the tail call fails (aya-ebpf limitation), it returns XDP_PASS. Neither path increments a fallback counter
+- **Impact:** Users cannot tell whether traffic is being processed by the intended dataplane. Debugging throughput or policy mismatches requires packet captures
+
+### Activation-time reverse companion repair (OPEN #310)
+- **Symptom:** After HA failover, the new primary's helper caches may be cold — reverse companion sessions, SNAT pool allocations, and per-interface NAT state may be absent even though forward sessions were synced
+- **Root cause:** Session sync transmits the forward session but reverse companion entries are reconstructed locally by `shared_promote`. If the helper caches are empty (daemon restart, ctrl re-enable), reconstruction may produce different NAT mappings or miss entries entirely
+- **Impact:** Established connections with SNAT can break if the reverse lookup fails, causing return traffic to miss conntrack and be treated as a new flow
+- **Plan:** Deterministic reverse companion generation from forward session state (#310), install fence during cutover (#311), reduce helper-local cache dependencies (#312)

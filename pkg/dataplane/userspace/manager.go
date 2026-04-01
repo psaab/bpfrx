@@ -30,6 +30,28 @@ import (
 
 var _ dataplane.DataPlane = (*Manager)(nil)
 
+// DataplaneMode describes which packet-processing pipeline is active.
+type DataplaneMode int
+
+const (
+	ModeEBPFOnly       DataplaneMode = iota // Pure eBPF pipeline, no userspace
+	ModeUserspaceCompat                      // Userspace preferred, eBPF/kernel fallback allowed
+	ModeUserspaceStrict                      // Strict userspace only, no transit fallback
+)
+
+func (m DataplaneMode) String() string {
+	switch m {
+	case ModeEBPFOnly:
+		return "ebpf_only"
+	case ModeUserspaceCompat:
+		return "userspace_compat"
+	case ModeUserspaceStrict:
+		return "userspace_strict"
+	default:
+		return "unknown"
+	}
+}
+
 func init() {
 	dataplane.RegisterBackend(dataplane.TypeUserspace, func() dataplane.DataPlane {
 		return New()
@@ -66,6 +88,9 @@ type Manager struct {
 	deferWorkers       bool // skip worker spawn until NotifyLinkCycle
 	xskBoundNotified   bool // OnXSKBound fired at most once
 
+	mode           DataplaneMode // current active runtime mode
+	configuredMode DataplaneMode // user-configured desired mode (from config)
+
 	pendingRGTransitions map[int]bool // per-RG: set before syncHAStateLocked, cleared on completion
 
 	eventStream       *EventStream
@@ -83,6 +108,7 @@ func New() *Manager {
 	return &Manager{
 		DataPlane:            inner,
 		inner:                inner,
+		configuredMode:       ModeUserspaceCompat,
 		haGroups:             make(map[int]HAGroupStatus),
 		pendingRGTransitions: make(map[int]bool),
 	}
@@ -102,6 +128,22 @@ func (m *Manager) XSKBoundNotified() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.xskBoundNotified
+}
+
+// Mode returns the current active dataplane runtime mode.
+func (m *Manager) Mode() DataplaneMode {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.mode
+}
+
+// SetConfiguredMode sets the user-configured desired dataplane mode.
+// The active mode is computed in applyHelperStatusLocked based on runtime
+// state and may differ from the configured mode.
+func (m *Manager) SetConfiguredMode(mode DataplaneMode) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.configuredMode = mode
 }
 
 func (m *Manager) SessionSyncSweepProfile() (bool, time.Duration, time.Duration) {
@@ -2859,6 +2901,7 @@ const userspaceMetadataVersion = 4
 const userspaceCtrlFlagCPUMap = 1
 const userspaceCtrlFlagTrace = 2
 const userspaceCtrlFlagNativeGRE = 4
+const userspaceCtrlFlagStrict = 8
 const bindingQueuesPerIface = 16 // must match BINDING_QUEUES_PER_IFACE in BPF
 
 func (m *Manager) programBootstrapMapsLocked(snapshot *ConfigSnapshot, cfg config.UserspaceConfig) error {
@@ -3098,7 +3141,11 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 			"xskLivenessFailed", m.xskLivenessFailed,
 			"xdpEntryProg", m.inner.XDPEntryProg)
 		if m.xskLivenessFailed {
-			// XSK proven broken — stay on eBPF pipeline, ctrl disabled.
+			// XSK proven broken — ctrl disabled.
+			// In compat mode, the entry program was already swapped to
+			// xdp_main_prog (eBPF pipeline). In strict mode the shim
+			// stays attached so packets drop rather than silently
+			// falling through to eBPF.
 			ctrl.Enabled = 0
 		} else if probeBindingsReady && neighborSyncReady {
 			ctrl.Enabled = 1
@@ -3135,9 +3182,19 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 					m.xskLivenessFailed = true
 					m.xskProbeStart = time.Time{}
 					ctrl.Enabled = 0
-					slog.Warn("userspace: XSK liveness probe failed, falling back to eBPF pipeline")
-					if err := m.inner.SwapXDPEntryProg("xdp_main_prog"); err != nil {
-						slog.Warn("userspace: failed to swap to eBPF pipeline after XSK liveness failure", "err", err)
+					if m.configuredMode == ModeUserspaceStrict {
+						// Strict mode: do NOT swap to xdp_main_prog.
+						// Keep the shim attached with ctrl=0 so packets
+						// hit the shim's ctrl-disabled fallback path and
+						// get counted, but never silently enter the eBPF
+						// pipeline. Log at error level — this is a
+						// degraded state that needs operator attention.
+						slog.Error("userspace: XSK liveness probe failed in strict mode — dataplane degraded, no eBPF fallback")
+					} else {
+						slog.Warn("userspace: XSK liveness probe failed, falling back to eBPF pipeline")
+						if err := m.inner.SwapXDPEntryProg("xdp_main_prog"); err != nil {
+							slog.Warn("userspace: failed to swap to eBPF pipeline after XSK liveness failure", "err", err)
+						}
 					}
 				}
 			}
@@ -3230,6 +3287,24 @@ ctrlReady:
 		m.ctrlDisabledAt = m.bpfKtimeNs()
 	}
 	m.ctrlWasEnabled = ctrl.Enabled == 1
+
+	// Compute active runtime mode from ctrl state and liveness.
+	switch {
+	case ctrl.Enabled == 0 || m.xskLivenessFailed:
+		m.mode = ModeEBPFOnly
+	case m.xskLivenessProven && m.configuredMode == ModeUserspaceStrict:
+		m.mode = ModeUserspaceStrict
+	case m.xskLivenessProven:
+		m.mode = ModeUserspaceCompat
+	default:
+		// ctrl enabled but liveness not yet proven — still probing.
+		m.mode = ModeUserspaceCompat
+	}
+	// Set strict flag in ctrl so the XDP shim knows not to fall back.
+	if m.configuredMode == ModeUserspaceStrict {
+		ctrl.Flags |= userspaceCtrlFlagStrict
+	}
+
 	if err := ctrlMap.Update(zero, ctrl, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("update userspace_ctrl from helper status: %w", err)
 	}
@@ -3309,8 +3384,76 @@ ctrlReady:
 	if err := m.syncInterfaceNATAddressMapsLocked(m.lastSnapshot); err != nil {
 		return err
 	}
+	// Populate runtime mode and observability fields in status.
+	status.DataplaneMode = m.mode.String()
+	status.ConfiguredMode = m.configuredMode.String()
+	status.EntryPrograms = m.entryProgramsLocked()
+	status.FallbackCounters = m.readFallbackStatsLocked()
+
 	m.lastStatus = *status
 	return nil
+}
+
+// fallbackReasonNames maps BPF array index to a human-readable name.
+// Must stay in sync with USERSPACE_FALLBACK_REASON_* in userspace-xdp/src/lib.rs.
+var fallbackReasonNames = [16]string{
+	0:  "ctrl_disabled",
+	1:  "parse_fail",
+	2:  "binding_missing",
+	3:  "binding_not_ready",
+	4:  "heartbeat_missing",
+	5:  "heartbeat_stale",
+	6:  "icmp",
+	7:  "early_filter",
+	8:  "adjust_meta",
+	9:  "meta_bounds",
+	10: "redirect_err",
+	11: "interface_nat_no_session",
+	12: "no_session",
+}
+
+// readFallbackStatsLocked reads the userspace_fallback_stats BPF array map
+// and returns a map of reason name -> cumulative count. Entries with zero
+// count are omitted.
+func (m *Manager) readFallbackStatsLocked() map[string]uint64 {
+	statsMap := m.inner.Map("userspace_fallback_stats")
+	if statsMap == nil {
+		return nil
+	}
+	result := make(map[string]uint64)
+	for i := uint32(0); i < uint32(len(fallbackReasonNames)); i++ {
+		var val uint64
+		if err := statsMap.Lookup(i, &val); err != nil {
+			continue
+		}
+		if val == 0 {
+			continue
+		}
+		name := fallbackReasonNames[i]
+		if name == "" {
+			name = fmt.Sprintf("reason_%d", i)
+		}
+		result[name] = val
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// entryProgramsLocked returns a map of ifindex -> attached XDP program name
+// by inspecting the inner dataplane manager's link state.
+func (m *Manager) entryProgramsLocked() map[int]string {
+	links := m.inner.XDPLinks()
+	if len(links) == 0 {
+		return nil
+	}
+	progName := m.inner.XDPEntryProg
+	result := make(map[int]string, len(links))
+	for ifindex := range links {
+		result[ifindex] = progName
+	}
+	return result
 }
 
 func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
@@ -3654,7 +3797,24 @@ func (m *Manager) SetSessionV4(key dataplane.SessionKey, val dataplane.SessionVa
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Send the forward session to the Rust worker.
 	_ = m.syncSessionV4Locked("upsert", key, &val)
+	// Pre-install the reverse companion so the Rust worker has it before
+	// RG activation, avoiding activation-time synthesis (#310).
+	if val.ReverseKey.Protocol != 0 {
+		revVal := val
+		revVal.IsReverse = 1
+		revVal.ReverseKey = key
+		revVal.IngressZone = val.EgressZone
+		revVal.EgressZone = val.IngressZone
+		// Clear FIB cache — reverse egress must be re-resolved locally.
+		revVal.FibIfindex = 0
+		revVal.FibVlanID = 0
+		revVal.FibDmac = [6]byte{}
+		revVal.FibSmac = [6]byte{}
+		revVal.FibGen = 0
+		_ = m.syncSessionV4Locked("upsert", val.ReverseKey, &revVal)
+	}
 	return nil
 }
 
@@ -3686,7 +3846,24 @@ func (m *Manager) SetSessionV6(key dataplane.SessionKeyV6, val dataplane.Session
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Send the forward session to the Rust worker.
 	_ = m.syncSessionV6Locked("upsert", key, &val)
+	// Pre-install the reverse companion so the Rust worker has it before
+	// RG activation, avoiding activation-time synthesis (#310).
+	if val.ReverseKey.Protocol != 0 {
+		revVal := val
+		revVal.IsReverse = 1
+		revVal.ReverseKey = key
+		revVal.IngressZone = val.EgressZone
+		revVal.EgressZone = val.IngressZone
+		// Clear FIB cache — reverse egress must be re-resolved locally.
+		revVal.FibIfindex = 0
+		revVal.FibVlanID = 0
+		revVal.FibDmac = [6]byte{}
+		revVal.FibSmac = [6]byte{}
+		revVal.FibGen = 0
+		_ = m.syncSessionV6Locked("upsert", val.ReverseKey, &revVal)
+	}
 	return nil
 }
 

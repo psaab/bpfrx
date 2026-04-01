@@ -352,6 +352,11 @@ type ProcessStatus struct {
 	RecentExceptions       []ExceptionStatus     `json:"recent_exceptions,omitempty"`
 	LastResolution         *PacketResolution     `json:"last_resolution,omitempty"`
 	SlowPath               SlowPathStatus        `json:"slow_path,omitempty"`
+	LastCacheFlushAt       uint64                `json:"last_cache_flush_at,omitempty"` // monotonic secs (#312)
+	DataplaneMode          string                `json:"dataplane_mode,omitempty"`           // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
+	ConfiguredMode         string                `json:"configured_mode,omitempty"`          // Desired mode from config
+	EntryPrograms          map[int]string        `json:"entry_programs,omitempty"`           // ifindex -> attached XDP program name
+	FallbackCounters       map[string]uint64     `json:"fallback_counters,omitempty"`        // reason_name -> count
 }
 
 type HAStateUpdateRequest struct {

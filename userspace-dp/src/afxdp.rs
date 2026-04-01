@@ -247,6 +247,8 @@ pub struct Coordinator {
     last_reconcile_stage: String,
     pub poll_mode: crate::PollMode,
     event_stream: Option<crate::event_stream::EventStreamSender>,
+    /// Monotonic timestamp (secs) of the last HA flow cache flush (#312).
+    last_cache_flush_at: Arc<AtomicU64>,
 }
 
 impl Coordinator {
@@ -290,6 +292,7 @@ impl Coordinator {
             last_reconcile_stage: "idle".to_string(),
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,
+            last_cache_flush_at: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1147,6 +1150,9 @@ impl Coordinator {
                     }
                 }
             }
+            // Record cache flush timestamp for observability (#312).
+            self.last_cache_flush_at
+                .store(now_secs, Ordering::Relaxed);
         }
         if !activated_rgs.is_empty() {
             eprintln!(
@@ -1331,6 +1337,11 @@ impl Coordinator {
                 watchdog_timestamp: runtime.watchdog_timestamp,
             })
             .collect()
+    }
+
+    /// Returns the monotonic timestamp (secs) of the last HA flow cache flush.
+    pub fn last_cache_flush_at(&self) -> u64 {
+        self.last_cache_flush_at.load(Ordering::Relaxed)
     }
 
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
