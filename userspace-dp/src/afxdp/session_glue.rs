@@ -417,7 +417,7 @@ pub(super) fn apply_worker_commands(
                             },
                             ..metadata
                         };
-                        sessions.refresh_local(
+                        sessions.refresh_for_ha_activation(
                             &key,
                             new_decision,
                             new_metadata.clone(),
@@ -756,7 +756,7 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
             owner_rg_id: refreshed_owner_rg,
             ..metadata
         };
-        if sessions.refresh_local(
+        if sessions.refresh_for_ha_activation(
             &key,
             refreshed_decision,
             refreshed_metadata.clone(),
@@ -3430,6 +3430,103 @@ mod tests {
         assert_eq!(hit.decision.resolution.egress_ifindex, 6);
         assert_eq!(hit.decision.resolution.tx_ifindex, 6);
         assert_eq!(hit.metadata.owner_rg_id, 1);
+    }
+
+    #[test]
+    fn apply_worker_commands_refreshes_synced_forward_sessions_for_activated_owner_rg() {
+        // Synced forward sessions (synced: true) must be re-resolved when
+        // the owner RG activates locally.  Before the fix, refresh_local()
+        // skipped synced entries, leaving them with the peer's stale
+        // resolution. This caused SNAT to not be applied after failover.
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sessions = SessionTable::new();
+        let key = SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            src_port: 5201,
+            dst_port: 42424,
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::FabricRedirect,
+                local_ifindex: 0,
+                egress_ifindex: 21,
+                tx_ifindex: 21,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
+                neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                src_mac: Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]),
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                ..NatDecision::default()
+            },
+        };
+        let metadata = SessionMetadata {
+            ingress_zone: Arc::<str>::from("wan"),
+            egress_zone: Arc::<str>::from("lan"),
+            owner_rg_id: 1,
+            fabric_ingress: false,
+            is_reverse: false,
+            synced: true,  // <-- synced from peer
+            nat64_reverse: None,
+        };
+        assert!(sessions.install_with_protocol(
+            key.clone(),
+            decision,
+            metadata,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        commands
+            .lock()
+            .expect("commands lock")
+            .push_back(WorkerCommand::RefreshOwnerRGs { owner_rgs: vec![1], sequence: 0 });
+        let forwarding = test_forwarding_state_with_fabric();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(
+            1,
+            HAGroupRuntime {
+                active: true,
+                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                demoting: false,
+                demoting_until_secs: 0,
+            },
+        );
+        let mut flow_cache = FlowCache::new();
+        let mut flow_caches = [&mut flow_cache];
+
+        apply_worker_commands(
+            &commands,
+            &mut sessions,
+            &mut flow_caches,
+            -1,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+        );
+
+        let hit = sessions
+            .lookup(&key, 2_000_000, 0x10)
+            .expect("refreshed synced forward hit");
+        // Resolution must be re-resolved to local ForwardCandidate
+        assert_eq!(
+            hit.decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate,
+            "synced forward session must be re-resolved to ForwardCandidate"
+        );
+        assert_eq!(hit.decision.resolution.egress_ifindex, 6);
+        // NAT must be preserved through the re-resolution
+        assert_eq!(
+            hit.decision.nat.rewrite_src,
+            Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+            "SNAT decision must survive RefreshOwnerRGs"
+        );
     }
 
     #[test]

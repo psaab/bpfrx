@@ -561,6 +561,33 @@ impl SessionTable {
         true
     }
 
+    /// Refresh a session's resolution and metadata during HA activation.
+    /// Unlike `refresh_local` (which skips synced sessions) and
+    /// `promote_synced` (which skips non-synced sessions), this method
+    /// updates the session regardless of `synced` status.  Used by
+    /// RefreshOwnerRGs to re-resolve both synced and locally-owned
+    /// sessions with local forwarding state after RG activation.
+    pub fn refresh_for_ha_activation(
+        &mut self,
+        key: &SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        now_ns: u64,
+        tcp_flags: u8,
+    ) -> bool {
+        let Some(mut entry) = self.remove_entry(key) else {
+            return false;
+        };
+        entry.decision = decision;
+        entry.metadata = metadata.clone();
+        entry.last_seen_ns = now_ns;
+        entry.expires_after_ns = session_timeout_ns(key.protocol, tcp_flags, &self.timeouts);
+        entry.closing = matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
+        self.sessions.insert(key.clone(), entry);
+        self.index_forward_nat_key(key, decision, &metadata);
+        true
+    }
+
     pub fn emit_open_delta(
         &mut self,
         key: SessionKey,
@@ -1951,5 +1978,73 @@ mod tests {
             }
         });
         assert_eq!(idle, 2_000_000_000, "idle should be 2s since last touch");
+    }
+
+    #[test]
+    fn refresh_local_skips_synced_entries() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let mut meta = metadata();
+        meta.synced = true;
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            meta,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        let new_decision = SessionDecision {
+            resolution: ForwardingResolution {
+                egress_ifindex: 99,
+                ..decision().resolution
+            },
+            ..decision()
+        };
+        // refresh_local should return false for synced sessions
+        assert!(!table.refresh_local(
+            &key,
+            new_decision,
+            metadata(),
+            2_000_000,
+            0x10,
+        ));
+        // session should still have original decision
+        let lookup = table.lookup(&key, 3_000_000, 0x10).expect("session");
+        assert_ne!(lookup.decision.resolution.egress_ifindex, 99);
+    }
+
+    #[test]
+    fn refresh_for_ha_activation_updates_synced_entries() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let mut meta = metadata();
+        meta.synced = true;
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            meta,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        let new_decision = SessionDecision {
+            resolution: ForwardingResolution {
+                egress_ifindex: 99,
+                ..decision().resolution
+            },
+            ..decision()
+        };
+        // refresh_for_ha_activation should succeed even for synced sessions
+        assert!(table.refresh_for_ha_activation(
+            &key,
+            new_decision,
+            metadata(),
+            2_000_000,
+            0x10,
+        ));
+        // session should now have updated decision
+        let lookup = table.lookup(&key, 3_000_000, 0x10).expect("session");
+        assert_eq!(lookup.decision.resolution.egress_ifindex, 99);
     }
 }
