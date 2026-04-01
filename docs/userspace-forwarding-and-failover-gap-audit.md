@@ -11,13 +11,14 @@ This document answers two design questions against the current codebase:
 
 The short answers are:
 
-- **No, we do not currently enforce a pure userspace-forwarding invariant.**
-  The code still allows `xdp_main_prog`, `XDP_PASS`, and kernel/BPF state to
-  participate while the userspace dataplane is active or partially active.
-- **No, current failover is not reducible to "move MACs and keep forwarding".**
-  Session sync is continuous, but it is not the full forwarding state. Several
-  forwarding-critical inputs are local, derived, filtered, or ordered
-  separately from the session stream.
+- **Yes, the eBPF dataplane can still be in use while the userspace dataplane
+  is considered active.** The code still allows `xdp_main_prog`, `XDP_PASS`,
+  and kernel/BPF state to participate while the userspace dataplane is active
+  or partially active.
+- **Because session sync is not the full forwarding state, current failover is
+  not reducible to "move MACs and keep forwarding".** Several forwarding-
+  critical inputs are local, derived, filtered, or ordered separately from the
+  session stream.
 
 This is an audit of the current implementation, not a statement of the desired
 end state.
