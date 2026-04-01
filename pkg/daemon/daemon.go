@@ -4095,8 +4095,18 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		success = true
 		return nil
 	}
+	// Instead of gating on bulk sync completion, verify the peer is caught
+	// up by sending a barrier. If the peer acks the barrier, its session
+	// table includes everything we've sent — whether via bulk or
+	// incremental real-time sync. This avoids blocking failover when bulk
+	// sync is slow but incremental sync has already delivered all sessions.
 	if !d.syncPeerBulkPrimed.Load() {
-		return fmt.Errorf("session sync not ready before demotion: peer bulk sync incomplete")
+		slog.Info("cluster: bulk sync not acked yet, verifying peer readiness via barrier",
+			"rg", rgID)
+		if err := d.sessionSync.WaitForPeerBarrier(5 * time.Second); err != nil {
+			return fmt.Errorf("session sync not ready before demotion: peer not responding to barrier: %w", err)
+		}
+		slog.Info("cluster: peer barrier succeeded without bulk ack — proceeding with demotion", "rg", rgID)
 	}
 	pendingBarrierTimeout := barrierTimeout / 2
 	if pendingBarrierTimeout > 10*time.Second {

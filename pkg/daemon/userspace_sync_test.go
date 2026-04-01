@@ -116,7 +116,7 @@ func TestWrapUserspaceManualFailoverPrepareErrorLeavesFatalErrors(t *testing.T) 
 
 func TestWrapUserspaceManualFailoverPrepareErrorMarksRetryableBulkSyncNotReady(t *testing.T) {
 	err := wrapUserspaceManualFailoverPrepareError(
-		errors.New("session sync not ready before demotion: peer bulk sync incomplete"),
+		errors.New("session sync not ready before demotion: peer not responding to barrier: timed out"),
 	)
 	var retryable *cluster.RetryablePreFailoverError
 	if !errors.As(err, &retryable) {
