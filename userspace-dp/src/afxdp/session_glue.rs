@@ -437,6 +437,7 @@ pub(super) fn apply_worker_commands(
                 for flow_cache in flow_caches.iter_mut() {
                     flow_cache.invalidate_all();
                 }
+                eprintln!("bpfrx-ha: FlushFlowCaches executed");
             }
             WorkerCommand::UpsertSynced(mut entry) => {
                 let key = entry.key.clone();
