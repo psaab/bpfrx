@@ -1785,23 +1785,29 @@ func (s *SessionSync) sendBulkAck(conn net.Conn, epoch uint64) {
 		slog.Debug("cluster sync: skipping bulk ack on nil connection", "epoch", epoch)
 		return
 	}
-	var payload [8]byte
-	binary.LittleEndian.PutUint64(payload[:], epoch)
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if err := writeMsg(conn, syncMsgBulkAck, payload[:]); err != nil {
-		s.stats.Errors.Add(1)
-		slog.Debug("cluster sync: failed to send bulk ack",
+	// Send bulk ack without blocking the receive goroutine.
+	// The writeMu may be held by the sendLoop writing outbound sessions;
+	// waiting here would delay the ack and cause the peer's retry loop
+	// to exhaust before the ack arrives.
+	go func() {
+		var payload [8]byte
+		binary.LittleEndian.PutUint64(payload[:], epoch)
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+		if err := writeMsg(conn, syncMsgBulkAck, payload[:]); err != nil {
+			s.stats.Errors.Add(1)
+			slog.Debug("cluster sync: failed to send bulk ack",
+				"epoch", epoch,
+				"local", connLocalAddrString(conn),
+				"remote", connRemoteAddrString(conn),
+				"err", err)
+			return
+		}
+		slog.Info("cluster sync: bulk ack sent",
 			"epoch", epoch,
 			"local", connLocalAddrString(conn),
-			"remote", connRemoteAddrString(conn),
-			"err", err)
-		return
-	}
-	slog.Info("cluster sync: bulk ack sent",
-		"epoch", epoch,
-		"local", connLocalAddrString(conn),
-		"remote", connRemoteAddrString(conn))
+			"remote", connRemoteAddrString(conn))
+	}()
 }
 
 func (s *SessionSync) waitForSendQueueDrain(timeout time.Duration) error {

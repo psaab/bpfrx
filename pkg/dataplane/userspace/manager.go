@@ -90,6 +90,7 @@ type Manager struct {
 
 	mode           DataplaneMode // current active runtime mode
 	configuredMode DataplaneMode // user-configured desired mode (from config)
+	lastHASyncTime time.Time    // throttle HA watchdog sync to avoid control socket contention
 
 	pendingRGTransitions map[int]bool // per-RG: set before syncHAStateLocked, cleared on completion
 
@@ -2527,7 +2528,7 @@ func (m *Manager) syncHAStateLocked() error {
 	// Log the HA state being sent to helper for debugging demotion detection.
 	for _, g := range groups {
 		if g.RGID > 0 && g.RGID <= 3 {
-			slog.Info("userspace: syncHAState sending", "rg", g.RGID, "active", g.Active, "watchdog", g.WatchdogTimestamp)
+			slog.Debug("userspace: syncHAState sending", "rg", g.RGID, "active", g.Active, "watchdog", g.WatchdogTimestamp)
 		}
 	}
 	var status ProcessStatus
@@ -2849,10 +2850,10 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 			Groups: groups,
 		},
 	}
-	// Log the HA state being sent to helper.
+	// Log the HA state being sent to helper (info level only for RG transitions).
 	for _, g := range groups {
 		if g.RGID >= 0 && g.RGID <= 3 {
-			slog.Info("userspace: syncHAState sending", "rg", g.RGID, "active", g.Active, "watchdog", g.WatchdogTimestamp)
+			slog.Debug("userspace: syncHAState sending", "rg", g.RGID, "active", g.Active, "watchdog", g.WatchdogTimestamp)
 		}
 	}
 	if err := m.requestLocked(req, &status); err != nil {
@@ -4640,8 +4641,13 @@ func (m *Manager) statusLoop(ctx context.Context) {
 					if helperActiveSig != newActiveSig || newActiveSig != prevActiveSig {
 						// Sync watchdog timestamps only (HA state update
 						// without active/inactive change detection).
-						if err := m.syncHAWatchdogOnlyLocked(); err != nil {
-							slog.Warn("userspace dataplane HA watchdog sync failed", "err", err)
+						// Throttle to every 5s to avoid control socket
+						// contention with session installs during bulk sync.
+						if time.Since(m.lastHASyncTime) >= 5*time.Second {
+							if err := m.syncHAWatchdogOnlyLocked(); err != nil {
+								slog.Warn("userspace dataplane HA watchdog sync failed", "err", err)
+							}
+							m.lastHASyncTime = time.Now()
 						}
 					}
 					if newActiveSig != prevActiveSig {

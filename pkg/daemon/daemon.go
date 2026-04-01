@@ -396,7 +396,7 @@ func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 		return
 	}
 	go func() {
-		intervals := []time.Duration{10 * time.Second, 20 * time.Second, 40 * time.Second}
+		intervals := []time.Duration{10 * time.Second, 20 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second, 30 * time.Second}
 		const retryWhileAckPendingAfter = 35 * time.Second
 		maxAttempts := len(intervals)
 		baseline := ss.Stats()
@@ -3577,15 +3577,24 @@ func userspaceForwardWireAliasFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zo
 
 func (d *Daemon) shouldSyncUserspaceDelta(delta dpuserspace.SessionDeltaInfo, ingressZone uint16) bool {
 	if strings.EqualFold(delta.Disposition, "local_delivery") {
+		slog.Debug("userspace delta: filtered (local_delivery)", "src", delta.SrcIP, "dst", delta.DstIP)
 		return false
 	}
 	if delta.FabricRedirect && !delta.FabricIngress {
 		return d.sessionSync != nil
 	}
 	if delta.OwnerRGID > 0 && d.sessionSync != nil && d.sessionSync.IsPrimaryForRGFn != nil {
-		return d.sessionSync.IsPrimaryForRGFn(delta.OwnerRGID)
+		ok := d.sessionSync.IsPrimaryForRGFn(delta.OwnerRGID)
+		if !ok {
+			slog.Debug("userspace delta: filtered (not primary for owner RG)", "rg", delta.OwnerRGID, "src", delta.SrcIP, "dst", delta.DstIP)
+		}
+		return ok
 	}
-	return d.sessionSync != nil && d.sessionSync.ShouldSyncZone(ingressZone)
+	ok := d.sessionSync != nil && d.sessionSync.ShouldSyncZone(ingressZone)
+	if !ok {
+		slog.Debug("userspace delta: filtered (zone not synced)", "zone", ingressZone, "src", delta.SrcIP, "dst", delta.DstIP)
+	}
+	return ok
 }
 
 // buildZoneRGMap builds a zone_id→RG mapping by looking up which interfaces
@@ -3718,12 +3727,19 @@ func (d *Daemon) runUserspaceEventStream(ctx context.Context) {
 // handleEventStreamDelta processes a single session event from the event stream.
 func (d *Daemon) handleEventStreamDelta(eventType uint8, delta dpuserspace.SessionDeltaInfo) {
 	if d.cluster == nil || d.sessionSync == nil {
+		slog.Debug("userspace delta: dropped (no cluster/sync)", "type", eventType)
 		return
 	}
-	if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
+	if !d.cluster.IsLocalPrimaryAny() {
+		slog.Debug("userspace delta: dropped (not primary for any RG)", "type", eventType)
+		return
+	}
+	if !d.sessionSync.IsConnected() {
+		slog.Debug("userspace delta: dropped (sync not connected)", "type", eventType)
 		return
 	}
 	if d.userspaceDemotionPrepActive() {
+		slog.Debug("userspace delta: dropped (demotion prep active)", "type", eventType)
 		return
 	}
 
@@ -3899,10 +3915,15 @@ func (d *Daemon) queueUserspaceSessionDeltas(
 			switch delta.AddrFamily {
 			case dataplane.AFInet:
 				key, val, ok := userspaceSessionFromDeltaV4(delta, zoneIDs)
-				if !ok || !d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
+				if !ok {
+					slog.Debug("userspace delta: V4 conversion failed", "src", delta.SrcIP, "dst", delta.DstIP, "disposition", delta.Disposition)
+					continue
+				}
+				if !d.shouldSyncUserspaceDelta(delta, val.IngressZone) {
 					continue
 				}
 				d.sessionSync.QueueSessionV4(key, val)
+				slog.Debug("userspace delta: queued V4", "src", delta.SrcIP, "dst", delta.DstIP, "ownerRG", delta.OwnerRGID)
 				queued++
 				if delta.FabricRedirect && !delta.FabricIngress {
 					if wireKey, wireVal, ok := userspaceForwardWireAliasFromDeltaV4(delta, zoneIDs); ok {
