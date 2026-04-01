@@ -51,10 +51,13 @@ const USERSPACE_FALLBACK_REASON_META_BOUNDS: u32 = 9;
 const USERSPACE_FALLBACK_REASON_REDIRECT_ERR: u32 = 10;
 const USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION: u32 = 11;
 const USERSPACE_FALLBACK_REASON_NO_SESSION: u32 = 12;
+const USERSPACE_FALLBACK_REASON_STRICT_DROP: u32 = 13;
+const USERSPACE_FALLBACK_REASON_STRICT_PASS_BLOCKED: u32 = 14;
 const USERSPACE_FALLBACK_REASON_MAX: u32 = 16;
 const USERSPACE_CTRL_FLAG_CPUMAP: u32 = 1;
 const USERSPACE_CTRL_FLAG_TRACE: u32 = 2;
 const USERSPACE_CTRL_FLAG_NATIVE_GRE: u32 = 4;
+const USERSPACE_CTRL_FLAG_STRICT: u32 = 8;
 const BINDING_QUEUES_PER_IFACE: u32 = 16;
 const BINDING_ARRAY_MAX_ENTRIES: u32 = 1024 * BINDING_QUEUES_PER_IFACE; // 16384
 const USERSPACE_TRACE_STAGE_RECEIVED: u32 = 1;
@@ -331,7 +334,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         _ => return Ok(xdp_action::XDP_PASS),
     };
     let Some(parsed) = parsed else {
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
+        return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_PARSE_FAIL);
     };
 
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
@@ -398,6 +401,11 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
         // XDP_PASS instead of DROP: this fires on VLAN sub-interfaces that
         // have the XDP shim attached but no XSK binding (XSK binds to the
         // parent HW interface only). Must pass to kernel for VLAN demux.
+        // In strict mode, drop transit packets that would escape to kernel.
+        if is_strict_mode(ctrl) {
+            incr_fallback_stat(USERSPACE_FALLBACK_REASON_STRICT_DROP);
+            return Ok(xdp_action::XDP_DROP);
+        }
         return Ok(xdp_action::XDP_PASS);
     }
     let last_heartbeat = USERSPACE_HEARTBEAT.get(binding.slot);
@@ -412,11 +420,11 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING,
             &parsed,
         );
-        incr_fallback_stat(USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING);
         // Fall back to eBPF pipeline instead of dropping. This lets
         // the kernel forward the packet AND generates a hardware RX
         // event that bootstraps the XSK fill ring for this queue.
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING);
+        // In strict mode, drop instead of escaping to eBPF/kernel.
+        return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_HEARTBEAT_MISSING);
     };
     let timeout_ms = if ctrl.heartbeat_timeout_ms == 0 {
         USERSPACE_DEFAULT_HEARTBEAT_TIMEOUT_MS
@@ -436,10 +444,10 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE,
             &parsed,
         );
-        incr_fallback_stat(USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
         // Fall back to eBPF pipeline instead of dropping — same rationale
         // as heartbeat-missing: let kernel forward + bootstrap fill ring.
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
+        // In strict mode, drop instead of escaping to eBPF/kernel.
+        return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_HEARTBEAT_STALE);
     }
 
     let packet_len = data_end.saturating_sub(data);
@@ -466,7 +474,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             USERSPACE_FALLBACK_REASON_EARLY_FILTER,
             &parsed,
         );
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
+        return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_EARLY_FILTER);
     }
     // ICMPv6 NDP messages (NS/NA/RS/RA/Redirect, types 133-137) are
     // link-local control plane — always pass directly to kernel so it
@@ -481,6 +489,9 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 // Session exists and stays on the userspace dataplane.
             }
             USERSPACE_SESSION_ACTION_PASS_TO_KERNEL => {
+                // LOCAL DELIVERY: this is for packets destined to the firewall
+                // itself (management SSH, control plane, etc.). NOT transit.
+                // Safe in strict mode — local delivery must always work.
                 record_trace(
                     ctrl.flags,
                     ingress_ifindex,
@@ -491,6 +502,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                     0,
                     &parsed,
                 );
+                incr_fallback_stat(USERSPACE_FALLBACK_REASON_STRICT_PASS_BLOCKED);
                 return Ok(cpumap_or_pass(ctrl));
             }
             _ => {
@@ -539,6 +551,8 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 // Transit GRE flow already belongs to the userspace dataplane.
             }
             USERSPACE_SESSION_ACTION_PASS_TO_KERNEL => {
+                // LOCAL DELIVERY (GRE inner): inner packet destined to a local
+                // address on the firewall. NOT transit — safe in strict mode.
                 record_trace(
                     ctrl.flags,
                     ingress_ifindex,
@@ -549,6 +563,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                     0,
                     &parsed,
                 );
+                incr_fallback_stat(USERSPACE_FALLBACK_REASON_STRICT_PASS_BLOCKED);
                 return Ok(cpumap_or_pass(ctrl));
             }
             _ => {}
@@ -557,12 +572,12 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let meta_len = mem::size_of::<UserspaceDpMeta>() as i32;
     let adjust_rc = unsafe { bpf_xdp_adjust_meta(ctx.ctx as *mut xdp_md, -meta_len) };
     if adjust_rc != 0 {
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_ADJUST_META);
+        return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_ADJUST_META);
     }
 
     let meta_ptr = ctx.metadata() as *mut UserspaceDpMeta;
     if (meta_ptr as usize).saturating_add(mem::size_of::<UserspaceDpMeta>()) > ctx.metadata_end() {
-        return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_META_BOUNDS);
+        return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_META_BOUNDS);
     }
 
     unsafe {
@@ -623,7 +638,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                 incr_fallback_stat(USERSPACE_FALLBACK_REASON_REDIRECT_ERR);
                 return Ok(xdp_action::XDP_DROP);
             }
-            fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_REDIRECT_ERR)
+            strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_REDIRECT_ERR)
         }
     }
 }
@@ -852,6 +867,25 @@ fn fallback_to_main(ctx: &XdpContext, ctrl: &UserspaceCtrl, reason: u32) -> Resu
     // safely handled: mlx5 copies the data to an SKB on XDP_PASS and
     // recycles the zero-copy buffer.
     Ok(xdp_action::XDP_PASS)
+}
+
+#[inline(always)]
+fn is_strict_mode(ctrl: &UserspaceCtrl) -> bool {
+    (ctrl.flags & USERSPACE_CTRL_FLAG_STRICT) != 0
+}
+
+/// In strict mode, drop transit packets that would otherwise escape to the
+/// eBPF pipeline or kernel forwarding path. Increments both the original
+/// reason counter and the STRICT_DROP counter for observability.
+/// In compat (non-strict) mode, falls back to the main eBPF pipeline.
+fn strict_drop_or_fallback(ctx: &XdpContext, ctrl: &UserspaceCtrl, reason: u32) -> Result<u32, i64> {
+    if is_strict_mode(ctrl) {
+        incr_fallback_stat(reason);
+        incr_fallback_stat(USERSPACE_FALLBACK_REASON_STRICT_DROP);
+        Ok(xdp_action::XDP_DROP)
+    } else {
+        fallback_to_main(ctx, ctrl, reason)
+    }
 }
 
 fn incr_fallback_stat(reason: u32) {

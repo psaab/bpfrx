@@ -79,6 +79,10 @@ type SyncStats struct {
 	// Config sync timing.
 	LastConfigSyncTime atomic.Int64  // UnixNano
 	LastConfigSyncSize atomic.Uint64 // bytes
+
+	// Install fence (#311): barrier-based cutover sequence tracking.
+	LastFenceSeq   atomic.Uint64 // last barrier sequence sent
+	LastFenceAckAt atomic.Int64  // UnixNano when last barrier ack was received
 }
 
 // SyncStatsSnapshot is a point-in-time copy of SyncStats with plain
@@ -107,6 +111,10 @@ type SyncStatsSnapshot struct {
 
 	LastConfigSyncTime int64
 	LastConfigSyncSize uint64
+
+	// Install fence (#311).
+	LastFenceSeq   uint64
+	LastFenceAckAt int64 // UnixNano (0 = never)
 }
 
 // SessionSync manages TCP-based session state replication between cluster peers.
@@ -331,6 +339,8 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		BulkSyncSessions:   s.stats.BulkSyncSessions.Load(),
 		LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(),
 		LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(),
+		LastFenceSeq:       s.stats.LastFenceSeq.Load(),
+		LastFenceAckAt:     s.stats.LastFenceAckAt.Load(),
 	}
 }
 
@@ -1733,6 +1743,8 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 				break
 			}
 		}
+		// Record fence ack timestamp for status observability (#311).
+		s.stats.LastFenceAckAt.Store(time.Now().UnixNano())
 		s.completeBarrierWait(seq)
 	}
 }
@@ -1875,6 +1887,8 @@ func (s *SessionSync) WaitForPeerBarrier(timeout time.Duration) error {
 		s.barrierWaitMu.Unlock()
 		return err
 	}
+	// Record the install fence sequence for status observability (#311).
+	s.stats.LastFenceSeq.Store(seq)
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -2189,6 +2203,12 @@ func (s *SessionSync) FormatStats() string {
 	if activeFabric >= 0 {
 		fabricStr = fmt.Sprintf("fab%d", activeFabric)
 	}
+	fenceSeq := s.stats.LastFenceSeq.Load()
+	fenceAckAt := s.stats.LastFenceAckAt.Load()
+	fenceAckStr := "never"
+	if fenceAckAt > 0 {
+		fenceAckStr = time.Unix(0, fenceAckAt).Format("Jan 02 15:04:05.000")
+	}
 	return fmt.Sprintf(
 		"Session sync statistics:\n"+
 			"  Connected:          %v\n"+
@@ -2205,6 +2225,8 @@ func (s *SessionSync) FormatStats() string {
 			"  IPsec SAs received: %d\n"+
 			"  Fences sent:        %d\n"+
 			"  Fences received:    %d\n"+
+			"  Install fence seq:  %d\n"+
+			"  Last fence ack:     %s\n"+
 			"  Errors:             %d\n",
 		s.stats.Connected.Load(),
 		fabricStr,
@@ -2220,6 +2242,8 @@ func (s *SessionSync) FormatStats() string {
 		s.stats.IPsecSAReceived.Load(),
 		s.stats.FencesSent.Load(),
 		s.stats.FencesReceived.Load(),
+		fenceSeq,
+		fenceAckStr,
 		s.stats.Errors.Load(),
 	)
 }
