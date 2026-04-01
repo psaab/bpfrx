@@ -308,7 +308,8 @@ func (m *Manager) ReadNATPortCounter(poolID uint32) (uint64, error) { return 0, 
 func (m *Manager) SeedNATPortCounters()                             {}
 func (m *Manager) SeedSessionIDCounter(_ int)                       {}
 
-func (m *Manager) ClearGlobalCounters() error    { return nil }
+func (m *Manager) IncrementGlobalCounter(_ uint32, _ uint64) error { return nil }
+func (m *Manager) ClearGlobalCounters() error                     { return nil }
 func (m *Manager) ClearInterfaceCounters() error { return nil }
 func (m *Manager) ClearZoneCounters() error      { return nil }
 func (m *Manager) ClearPolicyCounters() error    { return nil }

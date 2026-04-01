@@ -694,6 +694,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// GC entirely — sessions are managed in user-space. Without
 		// this, BatchLookup burns ~19% CPU scanning maps not used for
 		// forwarding decisions.
+		//
+		// The helper still mirrors sessions to BPF conntrack for display
+		// and periodically refreshes last_seen (~10s) so IterateSessions
+		// callers see accurate idle times.  See #333.
 		if _, ok := d.dp.(userspaceSessionDeltaDrainer); ok {
 			gc.SkipSweep = func() bool { return true }
 		}

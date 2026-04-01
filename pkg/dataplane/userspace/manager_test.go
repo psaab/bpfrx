@@ -1962,3 +1962,79 @@ func TestSnapshotHasNativeGRE(t *testing.T) {
 		t.Fatal("did not expect empty snapshot to enable native GRE")
 	}
 }
+
+func TestSumBindingCounters(t *testing.T) {
+	status := &ProcessStatus{
+		Bindings: []BindingStatus{
+			{
+				RXPackets:            100,
+				TXPackets:            80,
+				ForwardCandidatePkts: 70,
+				SessionCreates:       10,
+				SessionExpires:       5,
+				PolicyDeniedPackets:  3,
+				ScreenDrops:          2,
+				SNATPackets:          20,
+				DNATPackets:          15,
+			},
+			{
+				RXPackets:            200,
+				TXPackets:            160,
+				ForwardCandidatePkts: 140,
+				SessionCreates:       20,
+				SessionExpires:       10,
+				PolicyDeniedPackets:  7,
+				ScreenDrops:          4,
+				SNATPackets:          40,
+				DNATPackets:          30,
+			},
+		},
+	}
+	s := sumBindingCounters(status)
+	if s.rxPackets != 300 {
+		t.Fatalf("rxPackets = %d, want 300", s.rxPackets)
+	}
+	if s.txPackets != 240 {
+		t.Fatalf("txPackets = %d, want 240", s.txPackets)
+	}
+	if s.forwardPackets != 210 {
+		t.Fatalf("forwardPackets = %d, want 210", s.forwardPackets)
+	}
+	if s.sessionCreates != 30 {
+		t.Fatalf("sessionCreates = %d, want 30", s.sessionCreates)
+	}
+	if s.sessionExpires != 15 {
+		t.Fatalf("sessionExpires = %d, want 15", s.sessionExpires)
+	}
+	if s.policyDenied != 10 {
+		t.Fatalf("policyDenied = %d, want 10", s.policyDenied)
+	}
+	if s.screenDrops != 6 {
+		t.Fatalf("screenDrops = %d, want 6", s.screenDrops)
+	}
+	if s.snatPackets != 60 {
+		t.Fatalf("snatPackets = %d, want 60", s.snatPackets)
+	}
+	if s.dnatPackets != 45 {
+		t.Fatalf("dnatPackets = %d, want 45", s.dnatPackets)
+	}
+}
+
+func TestSafeDelta(t *testing.T) {
+	// Normal increment
+	if d := safeDelta(100, 50); d != 50 {
+		t.Fatalf("safeDelta(100, 50) = %d, want 50", d)
+	}
+	// No change
+	if d := safeDelta(50, 50); d != 0 {
+		t.Fatalf("safeDelta(50, 50) = %d, want 0", d)
+	}
+	// Counter reset (prev > cur) — clamp to zero
+	if d := safeDelta(10, 100); d != 0 {
+		t.Fatalf("safeDelta(10, 100) = %d, want 0", d)
+	}
+	// First poll (prev=0)
+	if d := safeDelta(42, 0); d != 42 {
+		t.Fatalf("safeDelta(42, 0) = %d, want 42", d)
+	}
+}
