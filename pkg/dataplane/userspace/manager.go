@@ -3291,7 +3291,13 @@ ctrlReady:
 	// Compute active runtime mode from ctrl state and liveness.
 	switch {
 	case ctrl.Enabled == 0 || m.xskLivenessFailed:
-		m.mode = ModeEBPFOnly
+		// In strict mode, a degraded userspace path still implies the strict
+		// shim is attached and fail-closed, not eBPF-only forwarding.
+		if m.configuredMode == ModeUserspaceStrict {
+			m.mode = ModeUserspaceStrict
+		} else {
+			m.mode = ModeEBPFOnly
+		}
 	case m.xskLivenessProven && m.configuredMode == ModeUserspaceStrict:
 		m.mode = ModeUserspaceStrict
 	case m.xskLivenessProven:
@@ -3410,6 +3416,8 @@ var fallbackReasonNames = [16]string{
 	10: "redirect_err",
 	11: "interface_nat_no_session",
 	12: "no_session",
+	13: "strict_drop",
+	14: "pass_to_kernel",
 }
 
 // readFallbackStatsLocked reads the userspace_fallback_stats BPF array map
@@ -3443,6 +3451,8 @@ func (m *Manager) readFallbackStatsLocked() map[string]uint64 {
 
 // entryProgramsLocked returns a map of ifindex -> attached XDP program name
 // by inspecting the inner dataplane manager's link state.
+// Note: VLAN sub-interfaces are skipped during SwapXDPEntryProg and may
+// retain the parent's program; they are excluded from this map.
 func (m *Manager) entryProgramsLocked() map[int]string {
 	links := m.inner.XDPLinks()
 	if len(links) == 0 {
@@ -3451,7 +3461,13 @@ func (m *Manager) entryProgramsLocked() map[int]string {
 	progName := m.inner.XDPEntryProg
 	result := make(map[int]string, len(links))
 	for ifindex := range links {
+		if m.inner.VlanSubInterfaces[ifindex] {
+			continue // VLAN sub-interfaces use parent's XDP program
+		}
 		result[ifindex] = progName
+	}
+	if len(result) == 0 {
+		return nil
 	}
 	return result
 }

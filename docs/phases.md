@@ -321,17 +321,17 @@
 Gap audit: `docs/userspace-forwarding-and-failover-gap-audit.md` (PR #301)
 
 ### Strict Userspace Invariant (#302)
-- [ ] Define DataplaneMode enum (ebpf_only, userspace_compat, userspace_strict) (#303)
-- [ ] Ban transit fallback in strict mode (#304)
-- [ ] Scope PASS_TO_KERNEL to control-plane only (#305)
-- [ ] XSK liveness fail-closed in strict mode (#306)
-- [ ] Per-interface entry program + fallback counters in status (#307)
+- [x] Define DataplaneMode enum (ebpf_only, userspace_compat, userspace_strict) (#303)
+- [x] Ban transit fallback in strict mode (#304)
+- [x] Scope PASS_TO_KERNEL to control-plane only (#305)
+- [x] XSK liveness fail-closed in strict mode (#306)
+- [x] Per-interface entry program + fallback counters in status (#307)
 
 ### MAC-Move-Only Failover (#308)
-- [ ] HA forwarding state inventory (#309)
-- [ ] Deterministic reverse companions (#310)
-- [ ] Install fence for HA cutover (#311)
-- [ ] Reduce helper-local cache dependencies (#312)
+- [x] HA forwarding state inventory (#309)
+- [x] Deterministic reverse companions (#310)
+- [x] Install fence for HA cutover (#311)
+- [x] Reduce helper-local cache dependencies (#312)
 
 ## Phase 50: vsrx.conf Feature Parity (in progress)
 **Baseline:** 8.47 Gbps (4×BBR trust→untrust), all connectivity tests pass

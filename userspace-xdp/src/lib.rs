@@ -52,7 +52,7 @@ const USERSPACE_FALLBACK_REASON_REDIRECT_ERR: u32 = 10;
 const USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION: u32 = 11;
 const USERSPACE_FALLBACK_REASON_NO_SESSION: u32 = 12;
 const USERSPACE_FALLBACK_REASON_STRICT_DROP: u32 = 13;
-const USERSPACE_FALLBACK_REASON_STRICT_PASS_BLOCKED: u32 = 14;
+const USERSPACE_FALLBACK_REASON_PASS_TO_KERNEL: u32 = 14;
 const USERSPACE_FALLBACK_REASON_MAX: u32 = 16;
 const USERSPACE_CTRL_FLAG_CPUMAP: u32 = 1;
 const USERSPACE_CTRL_FLAG_TRACE: u32 = 2;
@@ -314,6 +314,11 @@ pub fn xdp_userspace_prog(ctx: XdpContext) -> u32 {
 fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     let ctrl = USERSPACE_CTRL.get(0).ok_or(0i64)?;
     if ctrl.enabled == 0 || ctrl.metadata_version != USERSPACE_META_VERSION as u32 {
+        // In strict mode, drop transit even when ctrl is disabled (fail-closed).
+        // This prevents XSK liveness failure from silently routing through eBPF.
+        if is_strict_mode(ctrl) {
+            return strict_drop_or_fallback(ctx, ctrl, USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
+        }
         return fallback_to_main(ctx, ctrl, USERSPACE_FALLBACK_REASON_CTRL_DISABLED);
     }
 
@@ -502,7 +507,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                     0,
                     &parsed,
                 );
-                incr_fallback_stat(USERSPACE_FALLBACK_REASON_STRICT_PASS_BLOCKED);
+                incr_fallback_stat(USERSPACE_FALLBACK_REASON_PASS_TO_KERNEL);
                 return Ok(cpumap_or_pass(ctrl));
             }
             _ => {
@@ -563,7 +568,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
                     0,
                     &parsed,
                 );
-                incr_fallback_stat(USERSPACE_FALLBACK_REASON_STRICT_PASS_BLOCKED);
+                incr_fallback_stat(USERSPACE_FALLBACK_REASON_PASS_TO_KERNEL);
                 return Ok(cpumap_or_pass(ctrl));
             }
             _ => {}
