@@ -10,6 +10,12 @@
 - Keep solutions simple and direct.
 - When working with many teams, don't let the context windows get too large.
 
+## Logging Rules
+- **Go**: Use `slog.Debug` for high-frequency/diagnostic messages (HA watchdog sync, per-session traces). Use `slog.Info` only for state transitions and one-time events. HA watchdog sync was flooding at 15 req/s with `slog.Info` — caused 35K+ log lines per session and drowned real diagnostics.
+- **Rust helper**: `eprintln!("bpfrx-ha: ...")` goes to journald via stderr. Use sparingly — remove debug eprints before committing. Keep per-worker `RefreshOwnerRGs`/`FlushFlowCaches` logs (they fire rarely, only on RG transitions).
+- **Never** add `slog.Info` inside loops that run per-packet, per-session, or per-poll-tick. If you need per-tick logging, use `slog.Debug`.
+- **Control socket contention**: The userspace helper control socket is shared by status poll (1/s), HA sync, session installs, snapshot sync, and forwarding sync. High-frequency callers MUST be throttled. Adding a new control socket request at >1/s will starve session installs during bulk sync.
+
 ## What This Is
 An eBPF-based firewall that clones Juniper vSRX capabilities using native Junos configuration syntax. Go userspace (cilium/ebpf) drives C eBPF programs attached at XDP (ingress) and TC (egress).
 
