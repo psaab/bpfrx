@@ -2709,101 +2709,45 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 }
 
 func (m *Manager) UpdateRGActive(rgID int, active bool) error {
-	// Both promotion and demotion temporarily disable ctrl and swap to the
-	// eBPF pipeline before updating the rg_active BPF map (#285).
-	//
-	// DEMOTION: ensures zero gap — eBPF handles the critical transition
-	// window with real-time rg_active checks and fabric redirect. The
-	// helper's async processing is no longer on the critical path.
-	//
-	// PROMOTION: prevents the userspace helper from serving packets with
-	// stale flow-cache state while the rg_active map is being updated.
-	// The brief window on the eBPF/kernel forwarding path avoids stale
-	// flow-cache hits. Ctrl is re-enabled after the transition completes
-	// and the helper processes the HA state update.
-	m.mu.Lock()
-	m.disableUserspaceCtrlLocked()
-	if m.inner.XDPEntryProg != "xdp_main_prog" {
-		_ = m.inner.SwapXDPEntryProg("xdp_main_prog")
-	}
-	m.mu.Unlock()
-	if active {
-		slog.Info("userspace: disabled ctrl + swapped to eBPF pipeline for RG promotion",
-			"rg", rgID)
-	} else {
-		slog.Info("userspace: disabled ctrl + swapped to eBPF pipeline for RG demotion",
-			"rg", rgID)
-		m.mu.Lock()
-		m.lastDemotionTime = time.Now()
-		m.mu.Unlock()
-	}
+	// Update the BPF rg_active map. The eBPF pipeline uses this for its own
+	// rg_active checks, but when userspace ctrl is enabled the XDP shim
+	// redirects all traffic to the helper — so the helper is the authority.
 	if err := m.inner.UpdateRGActive(rgID, active); err != nil {
-		// Rollback: re-enable ctrl and restore XDP shim since the
-		// BPF map update failed (#278).
-		m.mu.Lock()
-		m.reEnableUserspaceCtrlLocked()
-		_ = m.inner.SwapXDPEntryProg("xdp_userspace_prog")
-		m.mu.Unlock()
-		slog.Warn("userspace: rolled back ctrl disable after UpdateRGActive failure",
-			"rg", rgID, "err", err)
 		return err
 	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
 	group := m.haGroups[rgID]
 	group.RGID = rgID
 	group.Active = active
 	m.haGroups[rgID] = group
+
+	slog.Info("userspace: RG state updated (helper stays in control)",
+		"rg", rgID, "active", active)
+
 	if active {
 		m.bootstrapNAPIQueuesAsyncLocked("ha-update-active")
 		m.proactiveNeighborResolveAsyncLocked()
 	}
-	// Reset ctrl liveness state so the status loop goes through a fresh
-	// readiness sequence before re-enabling ctrl. The eBPF pipeline handles
-	// traffic while the XSK liveness probe restarts and verifies RX. This
-	// gives the helper time to process the HA state update (DemoteOwnerRG /
-	// RefreshOwnerRGs), drain worker commands, and clean stale flow cache
-	// entries for the transitioned RG before userspace resumes forwarding.
-	m.neighborsPrewarmed = false
-	m.xskLivenessProven = false
-	m.xskLivenessFailed = false
-	m.xskProbeStart = time.Time{}
-	m.lastXSKRX = 0
-	// Do NOT reset ctrlWasEnabled — the BPF conntrack flush on ctrl
-	// re-enable deletes valid sessions and breaks forwarding. The brief
-	// ctrl disable during RG transition doesn't create stale sessions.
-	slog.Info("userspace: reset ctrl liveness for post-RG-transition re-verification",
-		"rg", rgID, "active", active)
-	// Bump FIB generation to invalidate ALL userspace flow-cache entries.
-	// The flow cache validates entries against config+FIB generation; bumping
-	// FIB gen forces every cached ForwardCandidate to miss on the next lookup,
-	// preventing the old owner from continuing to forward locally via stale
-	// cached decisions after RG demotion.
-	// Cannot call m.BumpFIBGeneration() here (acquires mu, would deadlock).
-	// Instead bump the BPF counter + rebuild and push snapshot inline.
-	// Use the returned value from BumpFIBGeneration — never re-read from the
-	// BPF map, which can return a stale value due to kernel caching.
+
+	// Bump FIB generation to invalidate flow-cache entries. The helper's
+	// flow cache checks fib_gen on every lookup — bumped entries miss and
+	// go through the slow path which re-evaluates HA state.
 	newFIBGen := m.inner.BumpFIBGeneration()
 	if m.lastSnapshot != nil && m.lastSnapshot.Config != nil && m.proc != nil {
 		m.generation++
 		snap := buildSnapshot(m.lastSnapshot.Config, m.cfg, m.generation, newFIBGen)
 		m.lastSnapshot = snap
-		slog.Info("userspace: pushing FIB refresh snapshot for HA transition",
-			"rg", rgID, "active", active,
-			"generation", m.generation, "fib_generation", newFIBGen,
-			"published", m.publishedSnapshot)
 		if err := m.syncSnapshotLocked(); err != nil {
-			slog.Warn("userspace: failed to push FIB refresh snapshot on HA transition", "err", err)
-		} else {
-			slog.Info("userspace: FIB refresh snapshot pushed successfully",
-				"generation", m.generation, "fib_generation", newFIBGen)
+			slog.Warn("userspace: failed to push snapshot on HA transition", "err", err)
 		}
 	}
-	slog.Info("userspace: bumped FIB generation to invalidate flow caches on HA transition",
-		"rg", rgID, "active", active)
-	// Mark this specific RG as transitioning (#284). Use defer to guarantee
-	// cleanup even if syncHAStateLocked fails, preventing the flag from
-	// permanently suppressing ctrl (#283).
+
+	// Sync HA state to the helper. This triggers update_ha_state on the
+	// coordinator which sends FlushFlowCaches + DemoteOwnerRG (demotion)
+	// or RefreshOwnerRGs (activation) to workers.
 	m.pendingRGTransitions[rgID] = true
 	defer delete(m.pendingRGTransitions, rgID)
 	return m.syncHAStateLocked()
@@ -3001,14 +2945,6 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		// acked the HA state update yet. Keep ctrl disabled until
 		// syncHAStateLocked succeeds to avoid re-enabling ctrl during the
 		// handoff (#279, #284).
-		ctrl.Enabled = 0
-	} else if status.Enabled && len(m.pendingRGTransitions) == 0 && !m.lastDemotionTime.IsZero() && time.Since(m.lastDemotionTime) < 5*time.Second {
-		// Brief grace period after RG demotion. Keeps ctrl disabled so
-		// the eBPF pipeline (which checks rg_active per-packet) handles
-		// fabric redirect while the userspace flow cache processes
-		// FlushFlowCaches commands.
-		slog.Info("userspace: suppressing ctrl enable (demotion grace period)",
-			"since", time.Since(m.lastDemotionTime))
 		ctrl.Enabled = 0
 	} else if status.Enabled {
 		// Delay ctrl enable until AFTER VIPs are configured in HA mode.
