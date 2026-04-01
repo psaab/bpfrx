@@ -2749,15 +2749,15 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 }
 
 func (m *Manager) UpdateRGActive(rgID int, active bool) error {
-	// Update the BPF rg_active map. The eBPF pipeline uses this for its own
-	// rg_active checks, but when userspace ctrl is enabled the XDP shim
-	// redirects all traffic to the helper — so the helper is the authority.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Update BPF rg_active UNDER the lock so the periodic poll can't
+	// read the new BPF value and sync to the helper before we do.
+	// This prevents the race where the poll eats the demotion delta.
 	if err := m.inner.UpdateRGActive(rgID, active); err != nil {
 		return err
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	group := m.haGroups[rgID]
 	group.RGID = rgID
