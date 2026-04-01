@@ -525,7 +525,7 @@ pub(super) fn publish_bpf_conntrack_entry(
                 session_id: 0,
                 created: now_secs,
                 last_seen: now_secs,
-                timeout: 1800, // default 30min; GC owns real expiry
+                timeout: 1800, // default 30min; Go GC is SkipSweep'd, helper owns lifetime (#333)
                 policy_id: 0,
                 ingress_zone: ingress_zone_id,
                 egress_zone: egress_zone_id,
@@ -548,7 +548,7 @@ pub(super) fn publish_bpf_conntrack_entry(
                 fib_gen: 0,
             };
 
-            let _ = unsafe {
+            let rc = unsafe {
                 libbpf_sys::bpf_map_update_elem(
                     conntrack_v4_fd,
                     (&bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
@@ -556,6 +556,12 @@ pub(super) fn publish_bpf_conntrack_entry(
                     libbpf_sys::BPF_ANY as u64,
                 )
             };
+            if rc < 0 {
+                eprintln!(
+                    "bpfrx-ha: conntrack v4 map update failed: {}",
+                    io::Error::last_os_error()
+                );
+            }
         }
         (libc::AF_INET6, IpAddr::V6(src), IpAddr::V6(dst)) if conntrack_v6_fd >= 0 => {
             let bpf_key = BpfSessionKeyV6 {
@@ -629,7 +635,7 @@ pub(super) fn publish_bpf_conntrack_entry(
                 fib_gen: 0,
             };
 
-            let _ = unsafe {
+            let rc = unsafe {
                 libbpf_sys::bpf_map_update_elem(
                     conntrack_v6_fd,
                     (&bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
@@ -637,6 +643,12 @@ pub(super) fn publish_bpf_conntrack_entry(
                     libbpf_sys::BPF_ANY as u64,
                 )
             };
+            if rc < 0 {
+                eprintln!(
+                    "bpfrx-ha: conntrack v6 map update failed: {}",
+                    io::Error::last_os_error()
+                );
+            }
         }
         _ => {}
     }
@@ -683,6 +695,95 @@ pub(super) fn delete_bpf_conntrack_entry(
         }
         _ => {}
     }
+}
+
+/// Update `last_seen` in BPF conntrack entries for active userspace sessions.
+///
+/// The userspace helper owns session lifetime in its own SessionTable, but
+/// `publish_bpf_conntrack_entry` only writes `last_seen` at creation time.
+/// Without periodic refresh, Go callers of `IterateSessions` (CLI session
+/// display, Prometheus metrics, ARP warmup, HA sync) see stale idle times.
+///
+/// The Go GC has `SkipSweep` set when the userspace DP is active, so stale
+/// `last_seen` will NOT cause premature expiry. This refresh is purely for
+/// diagnostic accuracy.
+///
+/// Called from the worker loop piggy-backing on the session GC interval (~1s).
+pub(super) fn refresh_bpf_conntrack_last_seen(
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
+    sessions: &crate::session::SessionTable,
+    now_ns: u64,
+) {
+    let now_secs = now_ns / 1_000_000_000;
+
+    sessions.iter_with_idle(now_ns, |key, _decision, metadata, _idle_ns| {
+        // Only refresh forward entries — reverse entries mirror the forward.
+        if metadata.is_reverse {
+            return;
+        }
+        match (key.addr_family as i32, &key.src_ip, &key.dst_ip) {
+            (libc::AF_INET, IpAddr::V4(src), IpAddr::V4(dst)) if conntrack_v4_fd >= 0 => {
+                let bpf_key = BpfSessionKeyV4 {
+                    src_ip: src.octets(),
+                    dst_ip: dst.octets(),
+                    src_port: key.src_port.to_be(),
+                    dst_port: key.dst_port.to_be(),
+                    protocol: key.protocol,
+                    pad: [0; 3],
+                };
+                let mut value: BpfSessionValueV4 = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libbpf_sys::bpf_map_lookup_elem(
+                        conntrack_v4_fd,
+                        (&bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
+                        (&mut value as *mut BpfSessionValueV4).cast::<c_void>(),
+                    )
+                };
+                if rc == 0 {
+                    value.last_seen = now_secs;
+                    let _ = unsafe {
+                        libbpf_sys::bpf_map_update_elem(
+                            conntrack_v4_fd,
+                            (&bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
+                            (&value as *const BpfSessionValueV4).cast::<c_void>(),
+                            0, // BPF_ANY
+                        )
+                    };
+                }
+            }
+            (libc::AF_INET6, IpAddr::V6(src), IpAddr::V6(dst)) if conntrack_v6_fd >= 0 => {
+                let bpf_key = BpfSessionKeyV6 {
+                    src_ip: src.octets(),
+                    dst_ip: dst.octets(),
+                    src_port: key.src_port.to_be(),
+                    dst_port: key.dst_port.to_be(),
+                    protocol: key.protocol,
+                    pad: [0; 3],
+                };
+                let mut value: BpfSessionValueV6 = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libbpf_sys::bpf_map_lookup_elem(
+                        conntrack_v6_fd,
+                        (&bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
+                        (&mut value as *mut BpfSessionValueV6).cast::<c_void>(),
+                    )
+                };
+                if rc == 0 {
+                    value.last_seen = now_secs;
+                    let _ = unsafe {
+                        libbpf_sys::bpf_map_update_elem(
+                            conntrack_v6_fd,
+                            (&bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
+                            (&value as *const BpfSessionValueV6).cast::<c_void>(),
+                            0, // BPF_ANY
+                        )
+                    };
+                }
+            }
+            _ => {}
+        }
+    });
 }
 
 pub(super) fn publish_session_map_entry_for_session(
@@ -1073,5 +1174,31 @@ mod tests {
         assert_eq!(core::mem::size_of::<BpfSessionValueV4>(), 128);
         assert_eq!(core::mem::size_of::<BpfSessionKeyV6>(), 40);
         assert_eq!(core::mem::size_of::<BpfSessionValueV6>(), 176);
+    }
+
+    #[test]
+    fn bpf_conntrack_key_port_byte_order() {
+        // BPF session_key uses __be16 ports (network byte order).
+        // SessionKey stores ports in host order (u16::from_be_bytes in parsing).
+        // publish_bpf_conntrack_entry must apply .to_be() to produce the correct
+        // big-endian byte pattern in the packed struct.
+        let port: u16 = 80;
+        let bpf_key = BpfSessionKeyV4 {
+            src_ip: [10, 0, 1, 102],
+            dst_ip: [10, 0, 2, 1],
+            src_port: port.to_be(),
+            dst_port: 443u16.to_be(),
+            protocol: 6,
+            pad: [0; 3],
+        };
+        // The packed struct bytes at the port offsets must be big-endian:
+        // port 80 = 0x0050 -> bytes [0x00, 0x50]
+        // port 443 = 0x01BB -> bytes [0x01, 0xBB]
+        let bytes: [u8; 16] =
+            unsafe { core::mem::transmute(bpf_key) };
+        assert_eq!(bytes[8], 0x00, "src_port high byte");
+        assert_eq!(bytes[9], 0x50, "src_port low byte");
+        assert_eq!(bytes[10], 0x01, "dst_port high byte");
+        assert_eq!(bytes[11], 0xBB, "dst_port low byte");
     }
 }

@@ -73,6 +73,12 @@ type GC struct {
 	// userspace dataplane manages sessions in its own hash table —
 	// the BPF map scan wastes ~19% CPU on maps that aren't used for
 	// active session tracking.
+	//
+	// When SkipSweep is active, the userspace helper still mirrors
+	// sessions to the BPF conntrack map (for CLI/gRPC display) and
+	// periodically refreshes last_seen so IterateSessions callers
+	// see accurate idle times.  The helper owns session lifetime;
+	// GC expiry is intentionally bypassed.  See #333.
 	SkipSweep func() bool
 }
 

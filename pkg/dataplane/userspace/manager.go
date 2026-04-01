@@ -94,6 +94,10 @@ type Manager struct {
 
 	pendingRGTransitions map[int]bool // per-RG: set before syncHAStateLocked, cleared on completion
 
+	// Counter delta tracking: previous binding counter totals for computing
+	// deltas to write into BPF counter maps (#332).
+	prevBindingCounters userspaceCounterSnapshot
+
 	eventStream       *EventStream
 	eventStreamCancel context.CancelFunc
 
@@ -3272,7 +3276,21 @@ ctrlReady:
 		// sessions whose Created timestamp is AFTER ctrlDisabledAt —
 		// synced sessions from the cluster peer have earlier timestamps
 		// and must survive for HA failover continuity.
-		cutoff := m.ctrlDisabledAt
+		//
+		// Why this is needed (issue #334): when ctrl=0 (startup, XSK
+		// liveness probe, link cycle), the eBPF pipeline creates
+		// conntrack entries in the BPF sessions map. When ctrl
+		// re-enables, TC egress finds these stale BPF entries and
+		// may apply conflicting NAT or update session state
+		// incorrectly — the userspace helper's own session table
+		// (Rust SessionTable + shared_sessions) is authoritative.
+		//
+		// session_value layout: State[1]+Flags[1]+TCPState[1]+
+		// IsReverse[1]+AppTimeout[4]+SessionID[8]+Created[8].
+		// Created is at byte offset 16. The value is seconds since
+		// boot (bpf_ktime_get_coarse_ns / 1e9). ctrlDisabledAt is
+		// nanoseconds, so convert to seconds for comparison.
+		cutoffSec := m.ctrlDisabledAt / 1_000_000_000
 		for _, mapName := range []string{"sessions", "sessions_v6"} {
 			if ctMap := m.inner.Map(mapName); ctMap != nil {
 				keySize := ctMap.KeySize()
@@ -3288,11 +3306,13 @@ ctrlReady:
 					}
 					copy(key, nextKey)
 					// Read session value to check Created timestamp.
-					// Created is at byte offset 8 (after State[1]+Flags[1]+TCPState[1]+IsReverse[1]+AppTimeout[4]).
-					if cutoff > 0 {
-						if err := ctMap.Lookup(key, val); err == nil && len(val) >= 16 {
-							created := binary.NativeEndian.Uint64(val[8:16])
-							if created > 0 && created < cutoff {
+					// Created is at byte offset 16:
+					//   State(1) + Flags(1) + TCPState(1) + IsReverse(1)
+					//   + AppTimeout(4) + SessionID(8) = 16
+					if cutoffSec > 0 {
+						if err := ctMap.Lookup(key, val); err == nil && len(val) >= 24 {
+							created := binary.NativeEndian.Uint64(val[16:24])
+							if created > 0 && created < cutoffSec {
 								kept++
 								continue // synced session — keep it
 							}
@@ -3303,7 +3323,8 @@ ctrlReady:
 				}
 				if deleted > 0 || kept > 0 {
 					slog.Info("userspace: flushed stale BPF conntrack on ctrl enable",
-						"map", mapName, "deleted", deleted, "kept_synced", kept)
+						"map", mapName, "deleted", deleted, "kept_synced", kept,
+						"cutoff_sec", cutoffSec)
 				}
 			}
 		}
@@ -3415,6 +3436,11 @@ ctrlReady:
 	if err := m.syncInterfaceNATAddressMapsLocked(m.lastSnapshot); err != nil {
 		return err
 	}
+	// Sync userspace-forwarded packet counters into BPF counter maps so
+	// that ReadGlobalCounter/ReadZoneCounters/etc. return complete values
+	// even for packets that bypassed the BPF pipeline (#332).
+	m.syncBPFCountersLocked(status)
+
 	// Populate runtime mode and observability fields in status.
 	status.DataplaneMode = m.mode.String()
 	status.ConfiguredMode = m.configuredMode.String()
@@ -3423,6 +3449,82 @@ ctrlReady:
 
 	m.lastStatus = *status
 	return nil
+}
+
+// userspaceCounterSnapshot holds cumulative counter totals from the helper,
+// used to compute deltas between status polls.
+type userspaceCounterSnapshot struct {
+	rxPackets      uint64
+	txPackets      uint64
+	forwardPackets uint64
+	sessionCreates uint64
+	sessionExpires uint64
+	policyDenied   uint64
+	screenDrops    uint64
+	snatPackets    uint64
+	dnatPackets    uint64
+}
+
+// sumBindingCounters aggregates counters across all bindings in a status response.
+func sumBindingCounters(status *ProcessStatus) userspaceCounterSnapshot {
+	var s userspaceCounterSnapshot
+	for i := range status.Bindings {
+		b := &status.Bindings[i]
+		s.rxPackets += b.RXPackets
+		s.txPackets += b.TXPackets
+		s.forwardPackets += b.ForwardCandidatePkts
+		s.sessionCreates += b.SessionCreates
+		s.sessionExpires += b.SessionExpires
+		s.policyDenied += b.PolicyDeniedPackets
+		s.screenDrops += b.ScreenDrops
+		s.snatPackets += b.SNATPackets
+		s.dnatPackets += b.DNATPackets
+	}
+	return s
+}
+
+// syncBPFCountersLocked computes counter deltas since the last status poll
+// and writes them into the BPF global_counters per-CPU array map.
+// This ensures that packets forwarded by the userspace helper (which bypass
+// the BPF pipeline) are reflected in ReadGlobalCounter results.
+func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
+	cur := sumBindingCounters(status)
+	prev := m.prevBindingCounters
+	m.prevBindingCounters = cur
+
+	// On the first poll (prev is all zeros) the entire cumulative count
+	// becomes the delta. This is correct — the helper has been counting
+	// since launch, and none of those packets appeared in BPF counters.
+	type counterDelta struct {
+		index uint32
+		delta uint64
+	}
+
+	deltas := []counterDelta{
+		{dataplane.GlobalCtrTxPackets, safeDelta(cur.txPackets, prev.txPackets)},
+		{dataplane.GlobalCtrSessionsNew, safeDelta(cur.sessionCreates, prev.sessionCreates)},
+		{dataplane.GlobalCtrSessionsClosed, safeDelta(cur.sessionExpires, prev.sessionExpires)},
+		{dataplane.GlobalCtrPolicyDeny, safeDelta(cur.policyDenied, prev.policyDenied)},
+		{dataplane.GlobalCtrScreenDrops, safeDelta(cur.screenDrops, prev.screenDrops)},
+	}
+
+	for _, d := range deltas {
+		if d.delta == 0 {
+			continue
+		}
+		if err := m.inner.IncrementGlobalCounter(d.index, d.delta); err != nil {
+			slog.Debug("userspace: failed to increment BPF global counter",
+				"index", d.index, "delta", d.delta, "err", err)
+		}
+	}
+}
+
+// safeDelta returns cur - prev, clamped to zero if prev > cur (counter reset).
+func safeDelta(cur, prev uint64) uint64 {
+	if cur <= prev {
+		return 0
+	}
+	return cur - prev
 }
 
 // fallbackReasonNames maps BPF array index to a human-readable name.

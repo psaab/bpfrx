@@ -5594,6 +5594,11 @@ fn worker_loop(
     let mut stall_prev_fwd = 0u64;
     let mut stall_reported = false;
     const DBG_REPORT_INTERVAL_NS: u64 = 1_000_000_000; // 1 second
+    // Throttle for BPF conntrack last_seen refresh (~10s).
+    // Keeps `show security flow session` idle times accurate without
+    // per-second syscall overhead per session.  See issue #333.
+    const CT_REFRESH_INTERVAL_NS: u64 = 10_000_000_000;
+    let mut last_ct_refresh_ns: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         let session_map_fd = bindings
             .first()
@@ -5667,6 +5672,18 @@ fn worker_loop(
                     .session_expires
                     .fetch_add(expired, Ordering::Relaxed);
             }
+        }
+        // Periodically refresh last_seen in BPF conntrack entries so Go-side
+        // callers of IterateSessions (CLI, gRPC, Prometheus) see accurate
+        // session idle times.  Issue #333.
+        if loop_now_ns.saturating_sub(last_ct_refresh_ns) >= CT_REFRESH_INTERVAL_NS {
+            last_ct_refresh_ns = loop_now_ns;
+            refresh_bpf_conntrack_last_seen(
+                conntrack_v4_fd,
+                conntrack_v6_fd,
+                &sessions,
+                loop_now_ns,
+            );
         }
         // Check if fabric links were updated by the coordinator (e.g. after
         // RG failover when peer MAC was resolved). If so, rebuild the

@@ -195,6 +195,12 @@ func (m *Manager) ClearAppRanges() error {
 
 // IterateSessions iterates all session entries, calling fn for each.
 // fn receives the key and value; return false to stop iteration.
+//
+// When the userspace dataplane is active, this map contains mirrored
+// sessions written by the Rust helper's publish_bpf_conntrack_entry.
+// The helper periodically refreshes LastSeen (~10s) so callers see
+// reasonably accurate idle times.  Session lifetime is owned by the
+// helper, not Go GC (GC.SkipSweep is set).  See #333.
 func (m *Manager) IterateSessions(fn func(SessionKey, SessionValue) bool) error {
 	sm, ok := m.maps["sessions"]
 	if !ok {
@@ -863,6 +869,31 @@ func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) {
 		total += v
 	}
 	return total, nil
+}
+
+// IncrementGlobalCounter adds delta to a per-CPU global counter (on CPU 0).
+// This is used by the userspace dataplane to account for packets forwarded
+// outside the BPF pipeline.
+func (m *Manager) IncrementGlobalCounter(index uint32, delta uint64) error {
+	if delta == 0 {
+		return nil
+	}
+	zm, ok := m.maps["global_counters"]
+	if !ok {
+		return fmt.Errorf("global_counters map not found")
+	}
+	var perCPU []uint64
+	if err := zm.Lookup(index, &perCPU); err != nil {
+		return fmt.Errorf("read global counter %d: %w", index, err)
+	}
+	if len(perCPU) == 0 {
+		return fmt.Errorf("empty per-CPU slice for global counter %d", index)
+	}
+	perCPU[0] += delta
+	if err := zm.Update(index, perCPU, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update global counter %d: %w", index, err)
+	}
+	return nil
 }
 
 // ReadFloodCounters reads the per-CPU flood state for a zone and sums them.

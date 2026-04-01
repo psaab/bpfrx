@@ -1506,6 +1506,11 @@ func (m *Manager) SeedSessionIDCounter(nodeID int) {
 	*m.platform.shm.session_id_gen = base
 }
 
+func (m *Manager) IncrementGlobalCounter(_ uint32, _ uint64) error {
+	// DPDK dataplane manages its own counters; no-op for BPF map increment.
+	return nil
+}
+
 func (m *Manager) ClearGlobalCounters() error {
 	if m.platform.shm == nil {
 		return fmt.Errorf("DPDK not initialized")
