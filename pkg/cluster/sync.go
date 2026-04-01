@@ -1750,30 +1750,25 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 }
 
 func (s *SessionSync) sendBarrierAck(conn net.Conn, seq uint64) {
-	// Send barrier ack without blocking the receive goroutine.
-	// Same rationale as sendBulkAck: writeMu contention from
-	// outbound session writes can delay the ack beyond the peer's
-	// barrier timeout.
-	go func() {
-		var payload [24]byte
-		binary.LittleEndian.PutUint64(payload[:], seq)
-		stats := s.Stats()
-		binary.LittleEndian.PutUint64(payload[8:16], stats.SessionsReceived)
-		binary.LittleEndian.PutUint64(payload[16:24], stats.SessionsInstalled)
-		s.writeMu.Lock()
-		defer s.writeMu.Unlock()
-		if err := writeMsg(conn, syncMsgBarrierAck, payload[:]); err != nil {
-			s.stats.Errors.Add(1)
-			slog.Debug("cluster sync: failed to send barrier ack", "seq", seq, "err", err)
-			return
-		}
-		slog.Info("cluster sync: barrier ack sent",
+	// Queue the barrier ack through sendCh so it goes through the
+	// sendLoop in order with session messages. Direct writeMu access
+	// from a goroutine starves when sendLoop holds the lock continuously
+	// during high-throughput traffic.
+	var payload [24]byte
+	binary.LittleEndian.PutUint64(payload[:], seq)
+	stats := s.Stats()
+	binary.LittleEndian.PutUint64(payload[8:16], stats.SessionsReceived)
+	binary.LittleEndian.PutUint64(payload[16:24], stats.SessionsInstalled)
+	msg := encodeRawMessage(syncMsgBarrierAck, payload[:])
+	select {
+	case s.sendCh <- msg:
+		slog.Info("cluster sync: barrier ack queued",
 			"seq", seq,
 			"sessions_received", stats.SessionsReceived,
-			"sessions_installed", stats.SessionsInstalled,
-			"queue_len", len(s.sendCh),
-			"queue_cap", cap(s.sendCh))
-	}()
+			"sessions_installed", stats.SessionsInstalled)
+	default:
+		slog.Warn("cluster sync: barrier ack dropped (queue full)", "seq", seq)
+	}
 }
 
 func (s *SessionSync) completeBarrierWait(seq uint64) {
@@ -1791,29 +1786,22 @@ func (s *SessionSync) sendBulkAck(conn net.Conn, epoch uint64) {
 		slog.Debug("cluster sync: skipping bulk ack on nil connection", "epoch", epoch)
 		return
 	}
-	// Send bulk ack without blocking the receive goroutine.
-	// The writeMu may be held by the sendLoop writing outbound sessions;
-	// waiting here would delay the ack and cause the peer's retry loop
-	// to exhaust before the ack arrives.
-	go func() {
-		var payload [8]byte
-		binary.LittleEndian.PutUint64(payload[:], epoch)
-		s.writeMu.Lock()
-		defer s.writeMu.Unlock()
-		if err := writeMsg(conn, syncMsgBulkAck, payload[:]); err != nil {
-			s.stats.Errors.Add(1)
-			slog.Debug("cluster sync: failed to send bulk ack",
-				"epoch", epoch,
-				"local", connLocalAddrString(conn),
-				"remote", connRemoteAddrString(conn),
-				"err", err)
-			return
-		}
-		slog.Info("cluster sync: bulk ack sent",
+	// Queue the bulk ack through sendCh so it goes through the sendLoop.
+	// Direct writeMu access starves when sendLoop holds the lock during
+	// high-throughput traffic.
+	var payload [8]byte
+	binary.LittleEndian.PutUint64(payload[:], epoch)
+	msg := encodeRawMessage(syncMsgBulkAck, payload[:])
+	select {
+	case s.sendCh <- msg:
+		slog.Info("cluster sync: bulk ack queued",
 			"epoch", epoch,
 			"local", connLocalAddrString(conn),
 			"remote", connRemoteAddrString(conn))
-	}()
+	default:
+		slog.Warn("cluster sync: bulk ack dropped (queue full)",
+			"epoch", epoch)
+	}
 }
 
 func (s *SessionSync) waitForSendQueueDrain(timeout time.Duration) error {
