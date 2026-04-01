@@ -235,6 +235,7 @@ pub struct Coordinator {
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
     demotion_prepare_seq: AtomicU64,
+    refresh_owner_rgs_seq: AtomicU64,
     session_export_seq: AtomicU64,
     forwarding: ForwardingState,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
@@ -278,6 +279,7 @@ impl Coordinator {
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
             demotion_prepare_seq: AtomicU64::new(0),
+            refresh_owner_rgs_seq: AtomicU64::new(0),
             session_export_seq: AtomicU64::new(0),
             forwarding: ForwardingState::default(),
             recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
@@ -749,6 +751,7 @@ impl Coordinator {
             let stop = Arc::new(AtomicBool::new(false));
             let heartbeat = Arc::new(AtomicU64::new(monotonic_nanos()));
             let demotion_prepare_ack = Arc::new(AtomicU64::new(0));
+            let refresh_owner_rgs_ack = Arc::new(AtomicU64::new(0));
             let session_export_ack = Arc::new(AtomicU64::new(0));
             let commands = worker_command_queues
                 .get(&worker_id)
@@ -767,6 +770,7 @@ impl Coordinator {
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
             let demotion_prepare_ack_clone = demotion_prepare_ack.clone();
+            let refresh_owner_rgs_ack_clone = refresh_owner_rgs_ack.clone();
             let session_export_ack_clone = session_export_ack.clone();
             let commands_clone = commands.clone();
             let peer_commands_clone = worker_command_queues
@@ -802,6 +806,7 @@ impl Coordinator {
                         stop_clone,
                         heartbeat_clone,
                         demotion_prepare_ack_clone,
+                        refresh_owner_rgs_ack_clone,
                         session_export_ack_clone,
                         worker_poll_mode,
                         dnat_fds,
@@ -822,6 +827,7 @@ impl Coordinator {
                             heartbeat,
                             commands,
                             demotion_prepare_ack,
+                            refresh_owner_rgs_ack,
                             session_export_ack,
                             join: Some(join),
                         },
@@ -1185,9 +1191,16 @@ impl Coordinator {
                 &activated_rgs,
                 now_secs,
             );
+            let sequence = self
+                .refresh_owner_rgs_seq
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
             for handle in self.workers.values() {
                 if let Ok(mut pending) = handle.commands.lock() {
-                    pending.push_back(WorkerCommand::RefreshOwnerRGs(activated_rgs.clone()));
+                    pending.push_back(WorkerCommand::RefreshOwnerRGs {
+                        owner_rgs: activated_rgs.clone(),
+                        sequence,
+                    });
                 }
             }
         }
@@ -1225,6 +1238,10 @@ impl Coordinator {
     /// Explicitly refresh sessions for activated RGs. Called from Go's
     /// UpdateRGActive to bypass delta detection which can miss activations
     /// when the periodic poll already updated the HA state.
+    ///
+    /// Blocks until all workers have finished processing the RefreshOwnerRGs
+    /// command (or a 2s timeout), so the caller knows sessions are ready
+    /// before traffic arrives on the new owner.
     pub fn refresh_owner_rgs(&self, owner_rgs: &[i32]) {
         if owner_rgs.is_empty() {
             return;
@@ -1252,11 +1269,42 @@ impl Coordinator {
                 now_secs,
             );
         }
+        let sequence = self
+            .refresh_owner_rgs_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         for handle in self.workers.values() {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::FlushFlowCaches);
-                pending.push_back(WorkerCommand::RefreshOwnerRGs(owner_rgs.to_vec()));
+                pending.push_back(WorkerCommand::RefreshOwnerRGs {
+                    owner_rgs: owner_rgs.to_vec(),
+                    sequence,
+                });
             }
+        }
+        // Wait for all workers to finish processing RefreshOwnerRGs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if self
+                .workers
+                .values()
+                .all(|handle| handle.refresh_owner_rgs_ack.load(Ordering::Acquire) >= sequence)
+            {
+                eprintln!(
+                    "bpfrx-ha: refresh_owner_rgs seq={} acked by all {} workers",
+                    sequence,
+                    self.workers.len(),
+                );
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "bpfrx-ha: refresh_owner_rgs seq={} timed out waiting for worker acks",
+                    sequence,
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -5309,6 +5357,7 @@ fn worker_loop(
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
     demotion_prepare_ack: Arc<AtomicU64>,
+    refresh_owner_rgs_ack: Arc<AtomicU64>,
     session_export_ack: Arc<AtomicU64>,
     poll_mode: crate::PollMode,
     dnat_fds: DnatTableFds,
@@ -5500,6 +5549,7 @@ fn worker_loop(
             WorkerCommandResults {
                 cancelled_keys: Vec::new(),
                 prepared_sequences: Vec::new(),
+                refreshed_sequences: Vec::new(),
                 exported_sequences: Vec::new(),
             }
         };
@@ -5644,6 +5694,9 @@ fn worker_loop(
             // Demotion prepare only needs local worker state to be updated. Do
             // not block the ack on unrelated steady-state delta churn.
             demotion_prepare_ack.store(sequence, Ordering::Release);
+        }
+        if let Some(sequence) = command_results.refreshed_sequences.iter().copied().max() {
+            refresh_owner_rgs_ack.store(sequence, Ordering::Release);
         }
         if !command_results.prepared_sequences.is_empty()
             || !command_results.exported_sequences.is_empty()

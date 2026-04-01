@@ -3576,6 +3576,18 @@ func userspaceForwardWireAliasFromDeltaV6(delta dpuserspace.SessionDeltaInfo, zo
 }
 
 func (d *Daemon) shouldSyncUserspaceDelta(delta dpuserspace.SessionDeltaInfo, ingressZone uint16) bool {
+	// Local-delivery sessions are traffic destined TO the firewall itself
+	// (management SSH, BGP peering, DHCP, NDP, ICMP echo, etc.).  These are
+	// intentionally excluded from HA session sync because:
+	//  1. Each cluster node handles its own host-bound traffic independently;
+	//     the peer's kernel stack processes its own local-delivery sessions
+	//     after failover with no need for synced state.
+	//  2. Local-delivery sessions reference node-local ifindexes and addresses
+	//     that are meaningless on the peer.
+	//  3. The userspace dataplane already sets track_in_userspace=false for
+	//     these (afxdp.rs), so they are not in the session sweep; this guard
+	//     covers the helper event-stream path.
+	// See #315 for discussion.
 	if strings.EqualFold(delta.Disposition, "local_delivery") {
 		slog.Debug("userspace delta: filtered (local_delivery)", "src", delta.SrcIP, "dst", delta.DstIP)
 		return false

@@ -11,6 +11,12 @@
 - When working with many teams, don't let the context windows get too large.
 
 ## Logging Rules
+- Maintain a log of all major actions in `_Log.md`.
+- Use YAML or Markdown bullet points for structure:
+    - **Timestamp**: [Time]
+    - **Action**: [Brief Description]
+    - **File(s)**: [Modified Files]
+- Log every `[Write|Edit]` action.
 - **Go**: Use `slog.Debug` for high-frequency/diagnostic messages (HA watchdog sync, per-session traces). Use `slog.Info` only for state transitions and one-time events. HA watchdog sync was flooding at 15 req/s with `slog.Info` — caused 35K+ log lines per session and drowned real diagnostics.
 - **Rust helper**: `eprintln!("bpfrx-ha: ...")` goes to journald via stderr. Use sparingly — remove debug eprints before committing. Keep per-worker `RefreshOwnerRGs`/`FlushFlowCaches` logs (they fire rarely, only on RG transitions).
 - **Never** add `slog.Info` inside loops that run per-packet, per-session, or per-poll-tick. If you need per-tick logging, use `slog.Debug`.

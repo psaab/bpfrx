@@ -197,6 +197,7 @@ fn should_bypass_unseeded_tunnel_ha(
 pub(super) struct WorkerCommandResults {
     pub cancelled_keys: Vec<SessionKey>,
     pub prepared_sequences: Vec<u64>,
+    pub refreshed_sequences: Vec<u64>,
     pub exported_sequences: Vec<u64>,
 }
 
@@ -244,6 +245,7 @@ pub(super) fn apply_worker_commands(
                 return WorkerCommandResults {
                     cancelled_keys: Vec::new(),
                     prepared_sequences: Vec::new(),
+                    refreshed_sequences: Vec::new(),
                     exported_sequences: Vec::new(),
                 };
             }
@@ -253,6 +255,7 @@ pub(super) fn apply_worker_commands(
             return WorkerCommandResults {
                 cancelled_keys: Vec::new(),
                 prepared_sequences: Vec::new(),
+                refreshed_sequences: Vec::new(),
                 exported_sequences: Vec::new(),
             };
         }
@@ -261,6 +264,7 @@ pub(super) fn apply_worker_commands(
     let now_secs = now_ns / 1_000_000_000;
     let mut cancelled_keys = Vec::new();
     let mut prepared_sequences = Vec::new();
+    let mut refreshed_sequences = Vec::new();
     let mut exported_sequences = Vec::new();
     for cmd in pending {
         match cmd {
@@ -329,7 +333,7 @@ pub(super) fn apply_worker_commands(
                 }
                 cancelled_keys.extend(demoted);
             }
-            WorkerCommand::RefreshOwnerRGs(owner_rgs) => {
+            WorkerCommand::RefreshOwnerRGs { owner_rgs, sequence } => {
                 let pre_count = sessions.len();
                 for owner_rg_id in &owner_rgs {
                     for flow_cache in flow_caches.iter_mut() {
@@ -431,12 +435,14 @@ pub(super) fn apply_worker_commands(
                     }
                 }
                 eprintln!(
-                    "bpfrx-ha: RefreshOwnerRGs {:?} worker sessions: before={} after={} refreshed_fwd={}",
+                    "bpfrx-ha: RefreshOwnerRGs {:?} seq={} worker sessions: before={} after={} refreshed_fwd={}",
                     owner_rgs,
+                    sequence,
                     pre_count,
                     sessions.len(),
                     refreshed_fwd,
                 );
+                refreshed_sequences.push(sequence);
             }
             WorkerCommand::FlushFlowCaches => {
                 for flow_cache in flow_caches.iter_mut() {
@@ -532,6 +538,7 @@ pub(super) fn apply_worker_commands(
     WorkerCommandResults {
         cancelled_keys,
         prepared_sequences,
+        refreshed_sequences,
         exported_sequences,
     }
 }
@@ -3209,7 +3216,7 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::RefreshOwnerRGs(vec![1]));
+            .push_back(WorkerCommand::RefreshOwnerRGs { owner_rgs: vec![1], sequence: 0 });
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
@@ -3294,7 +3301,7 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::RefreshOwnerRGs(vec![1]));
+            .push_back(WorkerCommand::RefreshOwnerRGs { owner_rgs: vec![1], sequence: 0 });
         let forwarding = test_forwarding_state_split_rgs();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
@@ -3387,7 +3394,7 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::RefreshOwnerRGs(vec![1]));
+            .push_back(WorkerCommand::RefreshOwnerRGs { owner_rgs: vec![1], sequence: 0 });
         let forwarding = test_forwarding_state_with_fabric();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
