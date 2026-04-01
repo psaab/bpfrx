@@ -231,6 +231,8 @@ pub(super) fn apply_worker_commands(
     commands: &Arc<Mutex<VecDeque<WorkerCommand>>>,
     sessions: &mut SessionTable,
     session_map_fd: c_int,
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
@@ -523,11 +525,13 @@ pub(super) fn apply_worker_commands(
                 let delete_alias = sessions.lookup(&key, now_ns, 0);
                 sessions.delete(&key);
                 if let Some(lookup) = delete_alias {
-                    delete_session_map_entry_for_removed_session(
+                    delete_session_map_entry_for_removed_session_with_conntrack(
                         session_map_fd,
                         &key,
                         lookup.decision,
                         &lookup.metadata,
+                        conntrack_v4_fd,
+                        conntrack_v6_fd,
                     );
                 } else {
                     delete_live_session_key(session_map_fd, &key);
@@ -1379,6 +1383,8 @@ fn should_keep_synced_hit_transient(
 fn purge_translated_synced_hit(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -1395,13 +1401,22 @@ fn purge_translated_synced_hit(
         shared_forward_wire_sessions,
         key,
     );
-    delete_session_map_entry_for_removed_session(session_map_fd, key, decision, metadata);
+    delete_session_map_entry_for_removed_session_with_conntrack(
+        session_map_fd,
+        key,
+        decision,
+        metadata,
+        conntrack_v4_fd,
+        conntrack_v6_fd,
+    );
     sessions.delete(key);
 }
 
 pub(super) fn resolve_flow_session_decision(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -1451,6 +1466,8 @@ pub(super) fn resolve_flow_session_decision(
             purge_translated_synced_hit(
                 sessions,
                 session_map_fd,
+                conntrack_v4_fd,
+                conntrack_v6_fd,
                 shared_sessions,
                 shared_nat_sessions,
                 shared_forward_wire_sessions,
@@ -1932,6 +1949,8 @@ mod tests {
         let resolved = resolve_flow_session_decision(
             &mut sessions,
             -1,
+            -1,
+            -1,
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
@@ -2275,6 +2294,8 @@ mod tests {
         let resolved = resolve_flow_session_decision(
             &mut sessions,
             -1,
+            -1,
+            -1,
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
@@ -2368,6 +2389,8 @@ mod tests {
         };
         let resolved = resolve_flow_session_decision(
             &mut sessions,
+            -1,
+            -1,
             -1,
             &shared_sessions,
             &shared_nat_sessions,
@@ -2469,6 +2492,8 @@ mod tests {
         let resolved = resolve_flow_session_decision(
             &mut sessions,
             -1,
+            -1,
+            -1,
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
@@ -2502,6 +2527,7 @@ mod tests {
     #[test]
     fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inactive_fabric_ingress()
     {
+        let _ = take_delete_bpf_conntrack_calls();
         let mut sessions = SessionTable::new();
         let key = test_key();
         let decision = SessionDecision {
@@ -2567,6 +2593,8 @@ mod tests {
         let resolved = resolve_flow_session_decision(
             &mut sessions,
             -1,
+            -1,
+            -1,
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
@@ -2586,6 +2614,55 @@ mod tests {
 
         assert!(resolved.metadata.synced);
         assert!(sessions.lookup(&translated_key, 1_000_000, 0x18).is_none());
+        assert!(
+            shared_sessions
+                .lock()
+                .expect("shared lock")
+                .get(&translated_key)
+                .is_none()
+        );
+        assert!(
+            lookup_shared_forward_wire_match(&shared_forward_wire_sessions, &translated_key).is_none()
+        );
+        assert_eq!(take_delete_bpf_conntrack_calls(), 1);
+    }
+
+    #[test]
+    fn apply_worker_commands_delete_synced_removes_session() {
+        let _ = take_delete_bpf_conntrack_calls();
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        assert!(sessions.install_with_protocol_with_origin(
+            key.clone(),
+            test_decision(),
+            SessionMetadata {
+                synced: true,
+                ..test_metadata()
+            },
+            SessionOrigin::SyncImport,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        commands
+            .lock()
+            .expect("commands lock")
+            .push_back(WorkerCommand::DeleteSynced(key.clone()));
+
+        apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &test_forwarding_state(),
+            &BTreeMap::new(),
+            &Arc::new(Mutex::new(FastMap::default())),
+        );
+
+        assert!(sessions.lookup(&key, 1_000_000, 0x10).is_none());
+        assert_eq!(take_delete_bpf_conntrack_calls(), 1);
     }
 
     #[test]
@@ -2640,6 +2717,8 @@ mod tests {
         apply_worker_commands(
             &commands,
             &mut sessions,
+            -1,
+            -1,
             -1,
             &forwarding,
             &ha_state,
@@ -2713,6 +2792,8 @@ mod tests {
             &commands,
             &mut sessions,
             -1,
+            -1,
+            -1,
             &forwarding,
             &ha_state,
             &dynamic_neighbors,
@@ -2750,6 +2831,8 @@ mod tests {
         let results = apply_worker_commands(
             &commands,
             &mut sessions,
+            -1,
+            -1,
             -1,
             &forwarding,
             &BTreeMap::new(),
@@ -2885,6 +2968,8 @@ mod tests {
             &commands,
             &mut sessions,
             -1,
+            -1,
+            -1,
             &forwarding,
             &BTreeMap::new(),
             &dynamic_neighbors,
@@ -2959,6 +3044,8 @@ mod tests {
             &commands,
             &mut sessions,
             -1,
+            -1,
+            -1,
             &forwarding,
             &ha_state,
             &dynamic_neighbors,
@@ -3024,6 +3111,8 @@ mod tests {
         apply_worker_commands(
             &commands,
             &mut sessions,
+            -1,
+            -1,
             -1,
             &forwarding,
             &ha_state,
@@ -3105,6 +3194,8 @@ mod tests {
             &commands,
             &mut sessions,
             -1,
+            -1,
+            -1,
             &forwarding,
             &ha_state,
             &dynamic_neighbors,
@@ -3176,6 +3267,8 @@ mod tests {
         let results = apply_worker_commands(
             &commands,
             &mut sessions,
+            -1,
+            -1,
             -1,
             &forwarding,
             &ha_state,
@@ -3261,6 +3354,8 @@ mod tests {
         apply_worker_commands(
             &commands,
             &mut sessions,
+            -1,
+            -1,
             -1,
             &forwarding,
             &ha_state,
@@ -3352,6 +3447,8 @@ mod tests {
             &commands,
             &mut sessions,
             -1,
+            -1,
+            -1,
             &forwarding,
             &ha_state,
             &dynamic_neighbors,
@@ -3431,6 +3528,8 @@ mod tests {
         apply_worker_commands(
             &commands,
             &mut sessions,
+            -1,
+            -1,
             -1,
             &forwarding,
             &ha_state,
@@ -3518,6 +3617,8 @@ mod tests {
         apply_worker_commands(
             &commands,
             &mut sessions,
+            -1,
+            -1,
             -1,
             &forwarding,
             &ha_state,

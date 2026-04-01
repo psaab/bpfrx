@@ -2997,6 +2997,8 @@ fn poll_binding(
                         if let Some(resolved) = resolve_flow_session_decision(
                             sessions,
                             binding.session_map_fd,
+                            conntrack_v4_fd,
+                            conntrack_v6_fd,
                             shared_sessions,
                             shared_nat_sessions,
                             shared_forward_wire_sessions,
@@ -5628,6 +5630,8 @@ fn worker_loop(
                 &commands,
                 &mut sessions,
                 session_map_fd,
+                conntrack_v4_fd,
+                conntrack_v6_fd,
                 &forwarding,
                 ha_runtime.as_ref(),
                 &dynamic_neighbors,

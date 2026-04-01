@@ -648,6 +648,8 @@ pub(super) fn delete_bpf_conntrack_entry(
     conntrack_v6_fd: c_int,
     key: &SessionKey,
 ) {
+    #[cfg(test)]
+    DELETE_BPF_CONNTRACK_CALLS.fetch_add(1, Ordering::Relaxed);
     match (key.addr_family as i32, &key.src_ip, &key.dst_ip) {
         (libc::AF_INET, IpAddr::V4(src), IpAddr::V4(dst)) if conntrack_v4_fd >= 0 => {
             let bpf_key = BpfSessionKeyV4 {
@@ -882,8 +884,15 @@ pub(super) fn dump_bpf_session_entries(map_fd: c_int, max_entries: u32) {
 pub(super) static SESSION_PUBLISH_VERIFY_OK: AtomicU64 = AtomicU64::new(0);
 pub(super) static SESSION_PUBLISH_VERIFY_FAIL: AtomicU64 = AtomicU64::new(0);
 pub(super) static SESSION_CREATIONS_LOGGED: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(super) static DELETE_BPF_CONNTRACK_CALLS: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "debug-log")]
 static ICMPV6_EMBED_LOGGED: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(test)]
+pub(super) fn take_delete_bpf_conntrack_calls() -> u64 {
+    DELETE_BPF_CONNTRACK_CALLS.swap(0, Ordering::Relaxed)
+}
 
 pub(super) const FALLBACK_STATS_PIN_PATH: &str = "/sys/fs/bpf/bpfrx/userspace_fallback_stats";
 pub(super) const FALLBACK_REASON_NAMES: &[&str] = &[
