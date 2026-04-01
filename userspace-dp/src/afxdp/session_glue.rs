@@ -458,13 +458,19 @@ pub(super) fn apply_worker_commands(
                 let key = entry.key.clone();
                 let locally_active =
                     owner_rg_is_locally_active(ha_state, entry.metadata.owner_rg_id, now_secs);
-                let allow_replace_local = !locally_active;
+                // When owner_rg_id is 0 (unknown — FIB was zeroed by sync),
+                // check if ANY RG is locally active. Synced sessions with
+                // rg=0 still need local egress re-resolution for SNAT to work.
+                let any_rg_active = entry.metadata.owner_rg_id == 0
+                    && ha_state.values().any(|g| g.active && g.watchdog_timestamp != 0);
+                let should_resolve = locally_active || any_rg_active;
+                let allow_replace_local = !should_resolve;
 
-                // If the owner RG is locally active, re-resolve the session's
+                // If any relevant RG is locally active, re-resolve the session's
                 // egress using local forwarding state. Synced sessions arrive
                 // with the remote node's interface indices and MACs which don't
                 // work on this node.
-                if locally_active && !entry.metadata.is_reverse {
+                if should_resolve && !entry.metadata.is_reverse {
                     let flow = SessionFlow {
                         src_ip: key.src_ip,
                         dst_ip: key.dst_ip,
