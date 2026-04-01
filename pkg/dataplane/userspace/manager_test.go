@@ -59,7 +59,7 @@ func TestSessionSyncEgressLockedDerivesOwnerAndTxPath(t *testing.T) {
 			},
 		},
 	}
-	egress, tx, owner := m.sessionSyncEgressLocked(6, 80)
+	egress, tx, owner := m.sessionSyncEgressLocked(6, 80, "")
 	if egress != 12 {
 		t.Fatalf("egress = %d, want 12", egress)
 	}
@@ -68,6 +68,48 @@ func TestSessionSyncEgressLockedDerivesOwnerAndTxPath(t *testing.T) {
 	}
 	if owner != 1 {
 		t.Fatalf("owner = %d, want 1", owner)
+	}
+}
+
+func TestSessionSyncEgressLockedResolvesOwnerRGFromZone(t *testing.T) {
+	m := &Manager{
+		lastSnapshot: &ConfigSnapshot{
+			Interfaces: []InterfaceSnapshot{
+				{
+					Name:            "reth0",
+					Zone:            "trust",
+					Ifindex:         10,
+					RedundancyGroup: 1,
+				},
+				{
+					Name:            "ge-0-0-1",
+					Zone:            "untrust",
+					Ifindex:         20,
+					RedundancyGroup: 0,
+				},
+			},
+		},
+	}
+	// FibIfindex=0: should resolve owner_rg_id from zone.
+	egress, tx, owner := m.sessionSyncEgressLocked(0, 0, "trust")
+	if egress != 0 {
+		t.Fatalf("egress = %d, want 0", egress)
+	}
+	if tx != 0 {
+		t.Fatalf("tx = %d, want 0", tx)
+	}
+	if owner != 1 {
+		t.Fatalf("owner = %d, want 1 (from trust zone)", owner)
+	}
+	// Zone with no RG: should return 0.
+	_, _, owner = m.sessionSyncEgressLocked(0, 0, "untrust")
+	if owner != 0 {
+		t.Fatalf("owner = %d, want 0 (untrust has no RG)", owner)
+	}
+	// Empty zone: should return 0.
+	_, _, owner = m.sessionSyncEgressLocked(0, 0, "")
+	if owner != 0 {
+		t.Fatalf("owner = %d, want 0 (empty zone)", owner)
 	}
 }
 

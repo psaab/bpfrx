@@ -250,6 +250,9 @@ pub struct Coordinator {
     event_stream: Option<crate::event_stream::EventStreamSender>,
     /// Monotonic timestamp (secs) of the last HA flow cache flush (#312).
     last_cache_flush_at: Arc<AtomicU64>,
+    /// Per-RG epoch counters for O(1) flow cache invalidation on demotion.
+    /// Shared with all worker threads; bumped atomically on demotion/activation.
+    rg_epochs: Arc<[AtomicU32; MAX_RG_EPOCHS]>,
 }
 
 impl Coordinator {
@@ -295,6 +298,7 @@ impl Coordinator {
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,
             last_cache_flush_at: Arc::new(AtomicU64::new(0)),
+            rg_epochs: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
         }
     }
 
@@ -782,6 +786,7 @@ impl Coordinator {
             let dynamic_neighbors = self.dynamic_neighbors.clone();
             let worker_poll_mode = self.poll_mode;
             let shared_fabrics = self.shared_fabrics.clone();
+            let rg_epochs = self.rg_epochs.clone();
             let event_stream_handle = self.event_stream_worker_handle();
             let join = thread::Builder::new()
                 .name(format!("bpfrx-userspace-worker-{worker_id}"))
@@ -812,6 +817,7 @@ impl Coordinator {
                         dnat_fds,
                         shared_fabrics,
                         event_stream_handle,
+                        rg_epochs,
                     );
                 });
             match join {
@@ -1144,13 +1150,16 @@ impl Coordinator {
                 &self.shared_forward_wire_sessions,
                 &demoted_rgs,
             );
+            // Bump RG epochs atomically — O(1) invalidation. Workers will
+            // treat flow cache entries with stale epochs as misses.
+            for rg_id in &demoted_rgs {
+                let idx = *rg_id as usize;
+                if idx > 0 && idx < MAX_RG_EPOCHS {
+                    self.rg_epochs[idx].fetch_add(1, Ordering::Release);
+                }
+            }
             for handle in self.workers.values() {
                 if let Ok(mut pending) = handle.commands.lock() {
-                    // Flush ALL flow caches first — cached entries may have
-                    // owner_rg_id=0 (RETH members before RG propagation fix)
-                    // which bypasses per-RG invalidation. Nuclear flush
-                    // guarantees no stale ForwardCandidate entries survive.
-                    pending.push_back(WorkerCommand::FlushFlowCaches);
                     for rg_id in &demoted_rgs {
                         pending.push_back(WorkerCommand::DemoteOwnerRG(*rg_id));
                     }
@@ -1273,9 +1282,15 @@ impl Coordinator {
             .refresh_owner_rgs_seq
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
+        // Bump RG epochs for activated RGs — O(1) flow cache invalidation.
+        for rg_id in owner_rgs {
+            let idx = *rg_id as usize;
+            if idx > 0 && idx < MAX_RG_EPOCHS {
+                self.rg_epochs[idx].fetch_add(1, Ordering::Release);
+            }
+        }
         for handle in self.workers.values() {
             if let Ok(mut pending) = handle.commands.lock() {
-                pending.push_back(WorkerCommand::FlushFlowCaches);
                 pending.push_back(WorkerCommand::RefreshOwnerRGs {
                     owner_rgs: owner_rgs.to_vec(),
                     sequence,
@@ -2223,6 +2238,7 @@ fn poll_binding(
     shared_recycles: &mut Vec<(u32, u64)>,
     dnat_fds: &DnatTableFds,
     dbg: &mut DebugPollCounters,
+    rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
 ) -> bool {
     #[derive(Default)]
     struct BatchCounters {
@@ -2802,6 +2818,7 @@ fn poll_binding(
                             meta.ingress_ifindex as i32,
                             validation.config_generation,
                             validation.fib_generation,
+                            &rg_epochs,
                         ) {
                             if !cached_flow_decision_valid(
                                 forwarding,
@@ -4261,6 +4278,10 @@ fn poll_binding(
                                         synced: false,
                                         nat64_reverse: None,
                                     },
+                                    rg_epoch: FlowCache::current_rg_epoch(
+                                        &rg_epochs,
+                                        cache_owner_rg_id,
+                                    ),
                                 });
                             }
                             // ── End flow cache population ────────────────
@@ -5363,6 +5384,7 @@ fn worker_loop(
     dnat_fds: DnatTableFds,
     shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
     event_stream: Option<crate::event_stream::EventStreamWorkerHandle>,
+    rg_epochs: Arc<[AtomicU32; MAX_RG_EPOCHS]>,
 ) {
     pin_current_thread(worker_id);
     let ha_startup_grace_until_secs =
@@ -5527,19 +5549,13 @@ fn worker_loop(
             sessions.set_timeouts(forwarding.session_timeouts);
         }
         let ha_runtime = ha_state.load();
-        // Only collect flow_cache borrows when commands are pending.
-        // This avoids a Vec heap allocation on every loop iteration
-        // in the common (empty-queue) case.
+        // Only apply commands when pending — avoids lock overhead on
+        // every loop iteration in the common (empty-queue) case.
         let has_commands = commands.try_lock().map(|q| !q.is_empty()).unwrap_or(false);
         let command_results = if has_commands {
-            let mut flow_caches = bindings
-                .iter_mut()
-                .map(|binding| &mut binding.flow_cache)
-                .collect::<Vec<_>>();
             apply_worker_commands(
                 &commands,
                 &mut sessions,
-                flow_caches.as_mut_slice(),
                 session_map_fd,
                 &forwarding,
                 ha_runtime.as_ref(),
@@ -5623,6 +5639,7 @@ fn worker_loop(
                 &mut shared_recycles,
                 &dnat_fds,
                 &mut dbg_poll,
+                &rg_epochs,
             ) {
                 did_work = true;
             }

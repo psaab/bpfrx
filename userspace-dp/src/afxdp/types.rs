@@ -1,10 +1,14 @@
 use super::*;
+use std::sync::atomic::AtomicU32;
 
 pub(super) type FastMap<K, V> = FxHashMap<K, V>;
 pub(super) type FastSet<T> = FxHashSet<T>;
 
 const FLOW_CACHE_SIZE: usize = 4096;
 const FLOW_CACHE_MASK: usize = FLOW_CACHE_SIZE - 1;
+
+/// Maximum number of redundancy groups for epoch-based cache invalidation.
+pub(super) const MAX_RG_EPOCHS: usize = 16;
 
 /// Precomputed rewrite descriptor for an established flow.
 /// All fields are constant for the lifetime of the session.
@@ -40,6 +44,9 @@ pub(super) struct FlowCacheEntry {
     pub(super) descriptor: RewriteDescriptor,
     pub(super) decision: SessionDecision,
     pub(super) metadata: SessionMetadata,
+    /// Epoch of the owner RG at insert time. Stale entries (epoch mismatch)
+    /// are treated as cache misses — O(1) invalidation on RG demotion.
+    pub(super) rg_epoch: u32,
 }
 
 /// Per-worker flow cache. Direct-mapped, indexed by hash of 5-tuple.
@@ -77,6 +84,7 @@ impl FlowCache {
         ingress_ifindex: i32,
         config_generation: u64,
         fib_generation: u32,
+        rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
     ) -> Option<&FlowCacheEntry> {
         let idx = Self::slot(key, ingress_ifindex);
         if let Some(entry) = &self.entries[idx] {
@@ -85,6 +93,20 @@ impl FlowCache {
                 && entry.descriptor.config_generation == config_generation
                 && entry.descriptor.fib_generation == fib_generation
             {
+                // Epoch-based RG invalidation: if the owner RG's epoch has
+                // advanced since this entry was inserted, treat as a miss.
+                let owner = entry.descriptor.owner_rg_id;
+                if owner > 0 && (owner as usize) < MAX_RG_EPOCHS {
+                    let current_epoch =
+                        rg_epochs[owner as usize].load(Ordering::Relaxed);
+                    if current_epoch != entry.rg_epoch {
+                        self.misses += 1;
+                        // Evict stale entry.
+                        self.entries[idx] = None;
+                        self.evictions += 1;
+                        return None;
+                    }
+                }
                 self.hits += 1;
                 return self.entries[idx].as_ref();
             }
@@ -101,6 +123,10 @@ impl FlowCache {
         self.entries[idx] = Some(entry);
     }
 
+    /// Nuclear invalidation — clears every entry. Reserved for rare events
+    /// like link-cycle or full config reload where epoch-based invalidation
+    /// is insufficient (e.g. routing table rebuild, interface renumbering).
+    #[allow(dead_code)]
     pub(super) fn invalidate_all(&mut self) {
         for entry in &mut self.entries {
             *entry = None;
@@ -116,20 +142,16 @@ impl FlowCache {
         self.entries[idx] = None;
     }
 
-    pub(super) fn invalidate_owner_rg(&mut self, owner_rg_id: i32) {
-        if owner_rg_id <= 0 {
-            return;
-        }
-        for entry in &mut self.entries {
-            let Some(cached) = entry.as_ref() else {
-                continue;
-            };
-            if cached.metadata.owner_rg_id == owner_rg_id
-                || cached.descriptor.owner_rg_id == owner_rg_id
-            {
-                *entry = None;
-                self.evictions += 1;
-            }
+    /// Read the current epoch for a given RG from the shared epoch array.
+    #[inline]
+    pub(super) fn current_rg_epoch(
+        rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
+        owner_rg_id: i32,
+    ) -> u32 {
+        if owner_rg_id > 0 && (owner_rg_id as usize) < MAX_RG_EPOCHS {
+            rg_epochs[owner_rg_id as usize].load(Ordering::Relaxed)
+        } else {
+            0
         }
     }
 }
@@ -585,7 +607,6 @@ pub(super) enum WorkerCommand {
     PrepareDemoteOwnerRGs { sequence: u64, owner_rgs: Vec<i32> },
     DemoteOwnerRG(i32),
     RefreshOwnerRGs { owner_rgs: Vec<i32>, sequence: u64 },
-    FlushFlowCaches,
 }
 
 #[derive(Default)]

@@ -3969,7 +3969,7 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 	if val != nil {
 		req.IngressZone = m.zoneNameByID(val.IngressZone)
 		req.EgressZone = m.zoneNameByID(val.EgressZone)
-		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID)
+		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID, req.EgressZone)
 		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
 		if val.LogFlags&dataplane.LogFlagUserspaceTunnelEndpoint != 0 && val.FibGen != 0 {
 			req.TunnelEndpointID = val.FibGen
@@ -4030,7 +4030,7 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 	if val != nil {
 		req.IngressZone = m.zoneNameByID(val.IngressZone)
 		req.EgressZone = m.zoneNameByID(val.EgressZone)
-		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID)
+		req.EgressIfindex, req.TXIfindex, req.OwnerRGID = m.sessionSyncEgressLocked(int(val.FibIfindex), val.FibVlanID, req.EgressZone)
 		req.TunnelEndpointID = m.sessionSyncTunnelEndpointIDLocked(req.EgressIfindex)
 		if val.LogFlags&dataplane.LogFlagUserspaceTunnelEndpoint != 0 && val.FibGen != 0 {
 			req.TunnelEndpointID = val.FibGen
@@ -4254,10 +4254,16 @@ func userspaceBootstrapProbeInterfaces(cfg *config.Config) []string {
 	return out
 }
 
-func (m *Manager) sessionSyncEgressLocked(fibIfindex int, fibVlanID uint16) (egressIfindex, txIfindex, ownerRGID int) {
+func (m *Manager) sessionSyncEgressLocked(fibIfindex int, fibVlanID uint16, egressZone string) (egressIfindex, txIfindex, ownerRGID int) {
 	snapshot := m.lastSnapshot
-	if snapshot == nil || fibIfindex <= 0 {
+	if snapshot == nil {
 		return fibIfindex, fibIfindex, 0
+	}
+	if fibIfindex <= 0 {
+		// FibIfindex is unresolved but we can still derive owner_rg_id
+		// from the session's egress zone so the sync peer doesn't have
+		// to fall back to the imprecise any_rg_active heuristic.
+		return fibIfindex, fibIfindex, resolveOwnerRGFromZone(snapshot, egressZone)
 	}
 	if iface, ok := findUserspaceEgressInterfaceSnapshot(snapshot, fibIfindex, fibVlanID); ok {
 		egress := iface.Ifindex
@@ -4271,6 +4277,21 @@ func (m *Manager) sessionSyncEgressLocked(fibIfindex int, fibVlanID uint16) (egr
 		return egress, tx, iface.RedundancyGroup
 	}
 	return fibIfindex, fibIfindex, 0
+}
+
+// resolveOwnerRGFromZone returns the RedundancyGroup for the first interface
+// in the given egress zone. This is used as a fallback when FibIfindex is 0
+// so the sync sender can still propagate a meaningful owner_rg_id to the peer.
+func resolveOwnerRGFromZone(snapshot *ConfigSnapshot, egressZone string) int {
+	if snapshot == nil || egressZone == "" {
+		return 0
+	}
+	for _, iface := range snapshot.Interfaces {
+		if iface.Zone == egressZone && iface.RedundancyGroup > 0 {
+			return iface.RedundancyGroup
+		}
+	}
+	return 0
 }
 
 func findUserspaceEgressInterfaceSnapshot(snapshot *ConfigSnapshot, fibIfindex int, fibVlanID uint16) (InterfaceSnapshot, bool) {

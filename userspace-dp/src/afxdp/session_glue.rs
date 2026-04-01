@@ -230,7 +230,6 @@ fn export_forward_sessions_for_owner_rgs(sessions: &mut SessionTable, owner_rgs:
 pub(super) fn apply_worker_commands(
     commands: &Arc<Mutex<VecDeque<WorkerCommand>>>,
     sessions: &mut SessionTable,
-    flow_caches: &mut [&mut FlowCache],
     session_map_fd: c_int,
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
@@ -279,11 +278,8 @@ pub(super) fn apply_worker_commands(
                 sequence,
                 owner_rgs,
             } => {
-                for owner_rg_id in &owner_rgs {
-                    for flow_cache in flow_caches.iter_mut() {
-                        flow_cache.invalidate_owner_rg(*owner_rg_id);
-                    }
-                }
+                // Flow cache invalidation is handled by epoch-based check in
+                // FlowCache::lookup() — no per-entry scan needed here.
                 cancelled_keys.extend(sessions.session_keys_for_owner_rgs(&owner_rgs));
                 refresh_live_reverse_sessions_for_owner_rgs(
                     sessions,
@@ -325,9 +321,8 @@ pub(super) fn apply_worker_commands(
                     demoted.len(),
                     sessions.len(),
                 );
-                for flow_cache in flow_caches.iter_mut() {
-                    flow_cache.invalidate_owner_rg(owner_rg_id);
-                }
+                // Flow cache invalidation is handled by epoch-based check
+                // in FlowCache::lookup() — no per-entry scan needed here.
                 for key in &demoted {
                     delete_live_session_key(session_map_fd, key);
                 }
@@ -335,11 +330,8 @@ pub(super) fn apply_worker_commands(
             }
             WorkerCommand::RefreshOwnerRGs { owner_rgs, sequence } => {
                 let pre_count = sessions.len();
-                for owner_rg_id in &owner_rgs {
-                    for flow_cache in flow_caches.iter_mut() {
-                        flow_cache.invalidate_owner_rg(*owner_rg_id);
-                    }
-                }
+                // Flow cache invalidation is handled by epoch-based check
+                // in FlowCache::lookup() — no per-entry scan needed here.
                 // Re-resolve ALL sessions (forward + reverse) for the
                 // activated RGs. Synced forward sessions arrive with the
                 // peer's interface indices and MACs which don't work locally.
@@ -444,12 +436,6 @@ pub(super) fn apply_worker_commands(
                 );
                 refreshed_sequences.push(sequence);
             }
-            WorkerCommand::FlushFlowCaches => {
-                for flow_cache in flow_caches.iter_mut() {
-                    flow_cache.invalidate_all();
-                }
-                eprintln!("bpfrx-ha: FlushFlowCaches executed");
-            }
             WorkerCommand::UpsertSynced(mut entry) => {
                 let key = entry.key.clone();
                 let locally_active =
@@ -459,14 +445,18 @@ pub(super) fn apply_worker_commands(
                 // rg=0 still need local egress re-resolution for SNAT to work.
                 let any_rg_active = entry.metadata.owner_rg_id == 0
                     && ha_state.values().any(|g| g.active && g.watchdog_timestamp != 0);
-                let should_resolve = locally_active || any_rg_active;
-                let allow_replace_local = !should_resolve;
+                let is_active = locally_active || any_rg_active;
+                let allow_replace_local = !is_active;
 
-                // If any relevant RG is locally active, re-resolve the session's
-                // egress using local forwarding state. Synced sessions arrive
-                // with the remote node's interface indices and MACs which don't
-                // work on this node.
-                if should_resolve && !entry.metadata.is_reverse {
+                // Always resolve synced forward sessions with local egress,
+                // regardless of HA state (#326). Synced sessions arrive with
+                // the remote node's interface indices and MACs which don't
+                // work on this node. By resolving on receipt (even on standby),
+                // sessions are immediately forwarding-ready at activation —
+                // RefreshOwnerRGs no longer needs to batch re-resolve.
+                // HA enforcement still happens at packet time via flow cache
+                // validation (enforce_ha_resolution_snapshot).
+                if !entry.metadata.is_reverse {
                     let flow = SessionFlow {
                         src_ip: key.src_ip,
                         dst_ip: key.dst_ip,
@@ -478,8 +468,18 @@ pub(super) fn apply_worker_commands(
                         &flow,
                         entry.decision,
                     );
-                    let re_resolved =
-                        enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, re_resolved);
+                    // On active node, enforce HA snapshot to filter out
+                    // sessions for inactive RGs. On standby, skip HA
+                    // enforcement — store the resolved ForwardCandidate so
+                    // the session is ready when activation happens. The
+                    // packet path enforces HA state via flow cache validation.
+                    let re_resolved = if is_active {
+                        enforce_ha_resolution_snapshot(
+                            forwarding, ha_state, now_secs, re_resolved,
+                        )
+                    } else {
+                        re_resolved
+                    };
                     if re_resolved.disposition != ForwardingDisposition::HAInactive {
                         entry.decision.resolution = re_resolved;
                         let new_owner = owner_rg_for_resolution(forwarding, re_resolved);
@@ -2635,13 +2635,9 @@ mod tests {
         );
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let mut flow_cache = FlowCache::new();
-        let mut flow_caches = [&mut flow_cache];
-
         apply_worker_commands(
             &commands,
             &mut sessions,
-            &mut flow_caches,
             -1,
             &forwarding,
             &ha_state,
@@ -2650,7 +2646,16 @@ mod tests {
 
         let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("synced hit");
         assert_eq!(hit.metadata, synced_metadata);
-        assert_eq!(hit.decision, synced_decision);
+        // With #326, synced sessions are always re-resolved with local egress
+        // info even on standby — so tx_vlan_id picks up the local egress VLAN.
+        let expected_decision = SessionDecision {
+            resolution: ForwardingResolution {
+                tx_vlan_id: 80,
+                ..synced_decision.resolution
+            },
+            ..synced_decision
+        };
+        assert_eq!(hit.decision, expected_decision);
     }
 
     #[test]
@@ -2702,13 +2707,9 @@ mod tests {
         );
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let mut flow_cache = FlowCache::new();
-        let mut flow_caches = [&mut flow_cache];
-
         apply_worker_commands(
             &commands,
             &mut sessions,
-            &mut flow_caches,
             -1,
             &forwarding,
             &ha_state,
@@ -2747,7 +2748,6 @@ mod tests {
         let results = apply_worker_commands(
             &commands,
             &mut sessions,
-            &mut flow_caches,
             -1,
             &forwarding,
             &BTreeMap::new(),
@@ -2760,9 +2760,59 @@ mod tests {
     }
 
     #[test]
-    fn apply_worker_commands_invalidates_flow_cache_for_demoted_owner_rg() {
-        let commands = Arc::new(Mutex::new(VecDeque::new()));
-        let mut sessions = SessionTable::new();
+    fn epoch_based_flow_cache_invalidation_for_demoted_owner_rg() {
+        let rg_epochs: [AtomicU32; MAX_RG_EPOCHS] =
+            std::array::from_fn(|_| AtomicU32::new(0));
+        let mut flow_cache = FlowCache::new();
+        let key = test_key();
+        let metadata = SessionMetadata {
+            owner_rg_id: 1,
+            ..test_metadata()
+        };
+        // Insert with current epoch (0).
+        flow_cache.insert(FlowCacheEntry {
+            key: key.clone(),
+            ingress_ifindex: 7,
+            descriptor: RewriteDescriptor {
+                dst_mac: [0; 6],
+                src_mac: [0; 6],
+                tx_vlan_id: 0,
+                ether_type: 0x0800,
+                rewrite_src_ip: None,
+                rewrite_dst_ip: None,
+                rewrite_src_port: None,
+                rewrite_dst_port: None,
+                ip_csum_delta: 0,
+                l4_csum_delta: 0,
+                egress_ifindex: 6,
+                tx_ifindex: 6,
+                target_binding_index: None,
+                config_generation: 1,
+                fib_generation: 1,
+                owner_rg_id: 1,
+                nat64: false,
+                nptv6: false,
+                apply_nat_on_fabric: false,
+            },
+            decision: test_decision(),
+            metadata,
+            rg_epoch: 0,
+        });
+
+        // Before epoch bump, lookup should hit.
+        assert!(flow_cache.lookup(&key, 7, 1, 1, &rg_epochs).is_some());
+
+        // Bump epoch for RG 1 (simulates demotion).
+        rg_epochs[1].fetch_add(1, Ordering::Relaxed);
+
+        // After epoch bump, lookup should miss (stale entry).
+        assert!(flow_cache.lookup(&key, 7, 1, 1, &rg_epochs).is_none());
+    }
+
+    #[test]
+    fn epoch_based_flow_cache_unrelated_rg_not_invalidated() {
+        let rg_epochs: [AtomicU32; MAX_RG_EPOCHS] =
+            std::array::from_fn(|_| AtomicU32::new(0));
         let mut flow_cache = FlowCache::new();
         let key = test_key();
         let metadata = SessionMetadata {
@@ -2795,23 +2845,14 @@ mod tests {
             },
             decision: test_decision(),
             metadata,
+            rg_epoch: 0,
         });
-        commands
-            .lock()
-            .expect("commands lock")
-            .push_back(WorkerCommand::DemoteOwnerRG(1));
 
-        apply_worker_commands(
-            &commands,
-            &mut sessions,
-            &mut [&mut flow_cache],
-            -1,
-            &test_forwarding_state(),
-            &BTreeMap::new(),
-            &Arc::new(Mutex::new(FastMap::default())),
-        );
+        // Bump epoch for RG 2 (unrelated).
+        rg_epochs[2].fetch_add(1, Ordering::Relaxed);
 
-        assert!(flow_cache.lookup(&key, 7, 1, 1).is_none());
+        // RG 1 entry should still hit — only RG 2 was bumped.
+        assert!(flow_cache.lookup(&key, 7, 1, 1, &rg_epochs).is_some());
     }
 
     #[test]
@@ -2838,13 +2879,9 @@ mod tests {
             .push_back(WorkerCommand::DemoteOwnerRG(1));
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let mut flow_cache = FlowCache::new();
-        let mut flow_caches = [&mut flow_cache];
-
         apply_worker_commands(
             &commands,
             &mut sessions,
-            &mut flow_caches,
             -1,
             &forwarding,
             &BTreeMap::new(),
@@ -2916,13 +2953,9 @@ mod tests {
                 demoting_until_secs: 0,
             },
         );
-        let mut flow_cache = FlowCache::new();
-        let mut flow_caches = [&mut flow_cache];
-
         apply_worker_commands(
             &commands,
             &mut sessions,
-            &mut flow_caches,
             -1,
             &forwarding,
             &ha_state,
@@ -2986,13 +3019,9 @@ mod tests {
                 demoting_until_secs: 0,
             },
         );
-        let mut flow_cache = FlowCache::new();
-        let mut flow_caches = [&mut flow_cache];
-
         apply_worker_commands(
             &commands,
             &mut sessions,
-            &mut flow_caches,
             -1,
             &forwarding,
             &ha_state,
@@ -3073,7 +3102,6 @@ mod tests {
         let results = apply_worker_commands(
             &commands,
             &mut sessions,
-            &mut flow_caches,
             -1,
             &forwarding,
             &ha_state,
@@ -3146,7 +3174,6 @@ mod tests {
         let results = apply_worker_commands(
             &commands,
             &mut sessions,
-            &mut flow_caches,
             -1,
             &forwarding,
             &ha_state,
@@ -3229,13 +3256,9 @@ mod tests {
                 demoting_until_secs: 0,
             },
         );
-        let mut flow_cache = FlowCache::new();
-        let mut flow_caches = [&mut flow_cache];
-
         apply_worker_commands(
             &commands,
             &mut sessions,
-            &mut flow_caches,
             -1,
             &forwarding,
             &ha_state,
@@ -3323,13 +3346,9 @@ mod tests {
                 demoting_until_secs: 0,
             },
         );
-        let mut flow_cache = FlowCache::new();
-        let mut flow_caches = [&mut flow_cache];
-
         apply_worker_commands(
             &commands,
             &mut sessions,
-            &mut flow_caches,
             -1,
             &forwarding,
             &ha_state,
@@ -3407,13 +3426,9 @@ mod tests {
                 demoting_until_secs: 0,
             },
         );
-        let mut flow_cache = FlowCache::new();
-        let mut flow_caches = [&mut flow_cache];
-
         apply_worker_commands(
             &commands,
             &mut sessions,
-            &mut flow_caches,
             -1,
             &forwarding,
             &ha_state,
@@ -3498,13 +3513,9 @@ mod tests {
                 demoting_until_secs: 0,
             },
         );
-        let mut flow_cache = FlowCache::new();
-        let mut flow_caches = [&mut flow_cache];
-
         apply_worker_commands(
             &commands,
             &mut sessions,
-            &mut flow_caches,
             -1,
             &forwarding,
             &ha_state,

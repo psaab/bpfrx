@@ -3871,47 +3871,6 @@ func (d *Daemon) journalKernelSessionV6(key dataplane.SessionKeyV6, val dataplan
 	d.demotionKernelJournalMu.Unlock()
 }
 
-// flushDemotionKernelJournal syncs any kernel sessions buffered during demotion
-// prep to the peer, then clears the journal.
-func (d *Daemon) flushDemotionKernelJournal() int {
-	d.demotionKernelJournalMu.Lock()
-	v4 := d.demotionKernelJournalV4
-	v6 := d.demotionKernelJournalV6
-	d.demotionKernelJournalV4 = nil
-	d.demotionKernelJournalV6 = nil
-	d.demotionKernelJournalMu.Unlock()
-	count := 0
-	if d.sessionSync != nil {
-		for _, s := range v4 {
-			d.sessionSync.QueueSessionV4(s.Key, s.Val)
-			count++
-		}
-		for _, s := range v6 {
-			d.sessionSync.QueueSessionV6(s.Key, s.Val)
-			count++
-		}
-	}
-	return count
-}
-
-func (d *Daemon) beginUserspaceDemotionPrepSyncPause(rgID int) func() {
-	depth := d.userspaceDemotionPrepDepth.Add(1)
-	if depth == 1 && d.sessionSync != nil {
-		d.sessionSync.PauseIncrementalSync(fmt.Sprintf("rg%d_demotion_prepare", rgID))
-	}
-	slog.Info("userspace: demotion sync pause entered", "rg", rgID, "depth", depth)
-	return func() {
-		depth := d.userspaceDemotionPrepDepth.Add(-1)
-		if depth < 0 {
-			d.userspaceDemotionPrepDepth.Store(0)
-			depth = 0
-		}
-		if depth == 0 && d.sessionSync != nil {
-			d.sessionSync.ResumeIncrementalSync(fmt.Sprintf("rg%d_demotion_prepare", rgID))
-		}
-		slog.Info("userspace: demotion sync pause exited", "rg", rgID, "depth", depth)
-	}
-}
 
 func (d *Daemon) queueUserspaceSessionDeltas(
 	zoneIDs map[string]uint16,
@@ -4107,11 +4066,11 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		success = true
 		return nil
 	}
-	// Instead of gating on bulk sync completion, verify the peer is caught
-	// up by sending a barrier. If the peer acks the barrier, its session
-	// table includes everything we've sent — whether via bulk or
-	// incremental real-time sync. This avoids blocking failover when bulk
-	// sync is slow but incremental sync has already delivered all sessions.
+
+	// Verify the peer is caught up by sending a barrier. Incremental sync
+	// delivers deltas in real-time, so one barrier ack proves the peer has
+	// every session we've sent — no quiescence loop, pause/resume, or
+	// event-stream drain needed.
 	if !d.syncPeerBulkPrimed.Load() {
 		slog.Info("cluster: bulk sync not acked yet, verifying peer readiness via barrier",
 			"rg", rgID)
@@ -4120,6 +4079,8 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		}
 		slog.Info("cluster: peer barrier succeeded without bulk ack — proceeding with demotion", "rg", rgID)
 	}
+
+	// Drain any in-flight barrier from a previous demotion attempt.
 	pendingBarrierTimeout := barrierTimeout / 2
 	if pendingBarrierTimeout > 10*time.Second {
 		pendingBarrierTimeout = 10 * time.Second
@@ -4130,123 +4091,16 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	if err := d.sessionSync.WaitForPeerBarriersDrained(pendingBarrierTimeout); err != nil {
 		return fmt.Errorf("previous demotion barrier still pending: %w", err)
 	}
-	idleSlice := barrierTimeout / 2
-	if idleSlice > 5*time.Second {
-		idleSlice = 5 * time.Second
-	}
-	if idleSlice < 1*time.Second {
-		idleSlice = 1 * time.Second
-	}
-	quiesceDeadline := time.Now().Add(barrierTimeout)
-	var quiesceErr error
-	for attempts := 1; ; attempts++ {
-		remaining := time.Until(quiesceDeadline)
-		if remaining <= 0 {
-			if quiesceErr == nil {
-				quiesceErr = fmt.Errorf("deadline exceeded")
-			}
-			return fmt.Errorf("session sync peer not quiescent before demotion: %w", quiesceErr)
-		}
-		window := idleSlice
-		if remaining < window {
-			window = remaining
-		}
-		if err := d.sessionSync.WaitForIdle(window, 3, 200*time.Millisecond); err != nil {
-			quiesceErr = err
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		if err := d.sessionSync.WaitForPeerBarrier(window); err != nil {
-			quiesceErr = err
-			slog.Info("userspace: waiting for session sync quiescence before demotion",
-				"rg", rgID,
-				"attempt", attempts,
-				"remaining", time.Until(quiesceDeadline).String(),
-				"err", err)
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		break
-	}
-	resume := d.beginUserspaceDemotionPrepSyncPause(rgID)
-	defer resume()
-	queued := 0
 
-	// Try event-stream Pause+DrainRequest first, fall back to RPC drain.
-	var streamDrained bool
-	if provider, ok := d.dp.(userspaceEventStreamProvider); ok {
-		if es := provider.EventStream(); es != nil && es.IsConnected() {
-			if err := es.SendPause(); err != nil {
-				slog.Warn("event stream pause failed, falling back to RPC drain", "err", err)
-			} else {
-				drainCtx, drainCancel := context.WithTimeout(context.Background(), 3*time.Second)
-				drainSeq, err := es.SendDrainRequest(drainCtx)
-				drainCancel()
-				if err != nil {
-					slog.Warn("event stream drain failed, falling back to RPC export",
-						"rg", rgID, "err", err)
-				} else {
-					slog.Info("event stream drain complete", "rg", rgID, "seq", drainSeq)
-					streamDrained = true
-				}
-			}
-		}
-	}
-	// Defer event stream resume until after the final barrier +
-	// PrepareRGDemotion to avoid reopening the event stream during
-	// the handoff window (#276).
-	deferredResume := func() {
-		if provider, ok := d.dp.(userspaceEventStreamProvider); ok {
-			if es := provider.EventStream(); es != nil && es.IsConnected() {
-				_ = es.SendResume()
-			}
-		}
-	}
-	defer deferredResume()
-
-	if !streamDrained {
-		// Fallback: RPC-based export + drain.
-		exporter, exportOK := d.dp.(userspaceSessionExporter)
-		drainer, drainOK := d.dp.(userspaceSessionDeltaDrainer)
-		cfg := d.store.ActiveConfig()
-		if cfg != nil {
-			if exportOK {
-				exported, err := d.exportUserspaceOwnerRGSessionsWithConfig(exporter, cfg, []int{rgID})
-				if err != nil {
-					return err
-				}
-				queued += exported
-			}
-			if drainOK {
-				d.userspaceDeltaSyncMu.Lock()
-				drained, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 8)
-				d.userspaceDeltaSyncMu.Unlock()
-				if err != nil {
-					return err
-				}
-				queued += drained
-			}
-		}
-	}
-
-	// Flush kernel SESSION_OPEN events that were journaled during demotion
-	// prep instead of being dropped. This ensures the peer has all sessions
-	// before the final barrier.
-	journaled := d.flushDemotionKernelJournal()
-	queued += journaled
-	if journaled > 0 {
-		slog.Info("userspace: flushed kernel session journal before barrier",
-			"rg", rgID, "journaled", journaled)
-	}
-
+	// Single barrier — peer ack means it has processed all queued deltas.
 	if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {
-		return fmt.Errorf("demotion peer barrier failed queued_deltas=%d: %w", queued, err)
+		return fmt.Errorf("demotion peer barrier failed: %w", err)
 	}
 	if err := preparer.PrepareRGDemotion([]int{rgID}); err != nil {
 		return err
 	}
 	success = true
-	slog.Info("userspace: prepared rg demotion", "rg", rgID, "queued_deltas", queued)
+	slog.Info("userspace: prepared rg demotion", "rg", rgID)
 	return nil
 }
 
