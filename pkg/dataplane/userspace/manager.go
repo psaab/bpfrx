@@ -2454,17 +2454,10 @@ func (m *Manager) syncSnapshotLocked() error {
 	}
 	return nil
 }
-// syncHAWatchdogOnlyLocked refreshes HA state from BPF maps (including
-// watchdog timestamps) and sends to the helper. This is safe for
-// periodic poll use because it only updates timestamps — the
-// active/inactive transitions are handled by UpdateRGActive.
+// syncHAWatchdogOnlyLocked syncs HA state to the helper from the periodic
+// poll. Uses syncHAStateLocked which only refreshes watchdog timestamps
+// (not Active state) to avoid racing with UpdateRGActive.
 func (m *Manager) syncHAWatchdogOnlyLocked() error {
-	if m.proc == nil || m.proc.Process == nil {
-		return nil
-	}
-	if err := m.refreshHAStateFromMapsLocked(); err != nil {
-		return err
-	}
 	return m.syncHAStateLocked()
 }
 
@@ -2472,13 +2465,13 @@ func (m *Manager) syncHAStateLocked() error {
 	if m.proc == nil || m.proc.Process == nil {
 		return nil
 	}
-	// NOTE: do NOT call refreshHAStateFromMapsLocked() here.
-	// The active/inactive state in m.haGroups is set by UpdateRGActive
-	// and must be the authoritative source. Re-reading from BPF maps
-	// races with the periodic status poll which also reads the maps —
-	// if both read the new state, the helper sees no delta and skips
-	// FlushFlowCaches + DemoteOwnerRG. Watchdog timestamps are refreshed
-	// separately by the periodic poll.
+	// Refresh watchdog timestamps from BPF but preserve the Active state
+	// set by UpdateRGActive. Re-reading Active from BPF maps races with
+	// the periodic status poll — if the poll syncs first, the helper sees
+	// no delta and skips FlushFlowCaches + DemoteOwnerRG.
+	if err := m.refreshHAWatchdogOnlyFromMapsLocked(); err != nil {
+		return err
+	}
 	if len(m.haGroups) == 0 {
 		return nil
 	}
@@ -2604,6 +2597,29 @@ func (m *Manager) seedHAGroupInventoryLocked(cfg *config.Config) {
 		seeded[rg.ID] = group
 	}
 	m.haGroups = seeded
+}
+
+// refreshHAWatchdogOnlyFromMapsLocked updates only the watchdog timestamps
+// in m.haGroups from BPF maps, preserving the Active state set by
+// UpdateRGActive. This avoids the race where re-reading Active from BPF
+// causes the helper to miss demotion deltas.
+func (m *Manager) refreshHAWatchdogOnlyFromMapsLocked() error {
+	wdMap := m.inner.Map("ha_watchdog")
+	if wdMap == nil {
+		return nil
+	}
+	var (
+		wdKey uint32
+		wdVal uint64
+	)
+	wdIter := wdMap.Iterate()
+	for wdIter.Next(&wdKey, &wdVal) {
+		if group, ok := m.haGroups[int(wdKey)]; ok {
+			group.WatchdogTimestamp = wdVal
+			m.haGroups[int(wdKey)] = group
+		}
+	}
+	return wdIter.Err()
 }
 
 func mergeHAStateFromMaps(rgMap, wdMap *ebpf.Map, existing map[int]HAGroupStatus) (map[int]HAGroupStatus, error) {
