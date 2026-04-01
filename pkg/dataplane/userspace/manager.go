@@ -2454,13 +2454,31 @@ func (m *Manager) syncSnapshotLocked() error {
 	}
 	return nil
 }
-func (m *Manager) syncHAStateLocked() error {
+// syncHAWatchdogOnlyLocked refreshes HA state from BPF maps (including
+// watchdog timestamps) and sends to the helper. This is safe for
+// periodic poll use because it only updates timestamps — the
+// active/inactive transitions are handled by UpdateRGActive.
+func (m *Manager) syncHAWatchdogOnlyLocked() error {
 	if m.proc == nil || m.proc.Process == nil {
 		return nil
 	}
 	if err := m.refreshHAStateFromMapsLocked(); err != nil {
 		return err
 	}
+	return m.syncHAStateLocked()
+}
+
+func (m *Manager) syncHAStateLocked() error {
+	if m.proc == nil || m.proc.Process == nil {
+		return nil
+	}
+	// NOTE: do NOT call refreshHAStateFromMapsLocked() here.
+	// The active/inactive state in m.haGroups is set by UpdateRGActive
+	// and must be the authoritative source. Re-reading from BPF maps
+	// races with the periodic status poll which also reads the maps —
+	// if both read the new state, the helper sees no delta and skips
+	// FlushFlowCaches + DemoteOwnerRG. Watchdog timestamps are refreshed
+	// separately by the periodic poll.
 	if len(m.haGroups) == 0 {
 		return nil
 	}
@@ -2471,6 +2489,12 @@ func (m *Manager) syncHAStateLocked() error {
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].RGID < groups[j].RGID
 	})
+	// Log the HA state being sent to helper for debugging demotion detection.
+	for _, g := range groups {
+		if g.RGID > 0 && g.RGID <= 3 {
+			slog.Info("userspace: syncHAState sending", "rg", g.RGID, "active", g.Active, "watchdog", g.WatchdogTimestamp)
+		}
+	}
 	var status ProcessStatus
 	req := ControlRequest{
 		Type: "update_ha_state",
@@ -2745,12 +2769,38 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 		}
 	}
 
-	// Sync HA state to the helper. This triggers update_ha_state on the
-	// coordinator which sends FlushFlowCaches + DemoteOwnerRG (demotion)
-	// or RefreshOwnerRGs (activation) to workers.
+	// Sync HA state DIRECTLY to helper without re-reading from BPF maps.
+	// The periodic status poll also reads rg_active and syncs to the helper,
+	// racing with us. If the poll syncs first, our syncHAStateLocked
+	// sends the same state → no delta detected → no FlushFlowCaches.
+	// By sending directly with the groups we already have, we guarantee
+	// the helper sees the transition.
 	m.pendingRGTransitions[rgID] = true
 	defer delete(m.pendingRGTransitions, rgID)
-	return m.syncHAStateLocked()
+	groups := make([]HAGroupStatus, 0, len(m.haGroups))
+	for _, g := range m.haGroups {
+		groups = append(groups, g)
+	}
+	sort.Slice(groups, func(i, j int) bool {
+		return groups[i].RGID < groups[j].RGID
+	})
+	var status ProcessStatus
+	req := ControlRequest{
+		Type: "update_ha_state",
+		HAState: &HAStateUpdateRequest{
+			Groups: groups,
+		},
+	}
+	// Log the HA state being sent to helper.
+	for _, g := range groups {
+		if g.RGID >= 0 && g.RGID <= 3 {
+			slog.Info("userspace: syncHAState sending", "rg", g.RGID, "active", g.Active, "watchdog", g.WatchdogTimestamp)
+		}
+	}
+	if err := m.requestLocked(req, &status); err != nil {
+		return err
+	}
+	return m.applyHelperStatusLocked(&status)
 }
 
 func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error {
@@ -4373,9 +4423,16 @@ func (m *Manager) statusLoop(ctx context.Context) {
 				}
 				newActiveSig := activeHAGroupSignature(m.haGroups)
 				if m.clusterHA && newActiveSig != "" {
+					// Only sync watchdog updates to the helper from the poll.
+					// Do NOT sync active/inactive transitions here — that's
+					// handled by UpdateRGActive which must be the sole source
+					// of demotion/activation deltas. If the poll syncs first,
+					// the helper sees no delta and skips FlushFlowCaches.
 					if helperActiveSig != newActiveSig || newActiveSig != prevActiveSig {
-						if err := m.syncHAStateLocked(); err != nil {
-							slog.Warn("userspace dataplane HA state sync failed", "err", err)
+						// Sync watchdog timestamps only (HA state update
+						// without active/inactive change detection).
+						if err := m.syncHAWatchdogOnlyLocked(); err != nil {
+							slog.Warn("userspace dataplane HA watchdog sync failed", "err", err)
 						}
 					}
 					if newActiveSig != prevActiveSig {

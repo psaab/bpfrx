@@ -1071,6 +1071,17 @@ impl Coordinator {
         }
         let demoted_rgs = demoted_owner_rgs(previous.as_ref(), &state);
         let activated_rgs = activated_owner_rgs(previous.as_ref(), &state);
+        // Debug: log state comparison for RGs 0-2
+        for rg_id in 0..=2i32 {
+            let prev_active = previous.get(&rg_id).map(|r| r.active);
+            let curr_active = state.get(&rg_id).map(|r| r.active);
+            if prev_active != curr_active {
+                eprintln!(
+                    "bpfrx-ha: RG{} state changed: {:?} -> {:?} (demoted={:?} activated={:?})",
+                    rg_id, prev_active, curr_active, demoted_rgs, activated_rgs
+                );
+            }
+        }
         self.ha_state.store(Arc::new(state));
         if !demoted_rgs.is_empty() {
             // CRITICAL: Delete sessions from USERSPACE_SESSIONS BPF map
