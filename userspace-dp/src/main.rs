@@ -492,6 +492,10 @@ struct MapPins {
     local_v6: String,
     #[serde(default)]
     sessions: String,
+    #[serde(rename = "conntrack_v4", default)]
+    conntrack_v4: String,
+    #[serde(rename = "conntrack_v6", default)]
+    conntrack_v6: String,
     #[serde(rename = "dnat_table", default)]
     dnat_table: String,
     #[serde(rename = "dnat_table_v6", default)]

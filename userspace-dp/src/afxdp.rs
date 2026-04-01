@@ -214,6 +214,8 @@ pub struct Coordinator {
     map_fd: Option<OwnedFd>,
     heartbeat_map_fd: Option<OwnedFd>,
     session_map_fd: Option<OwnedFd>,
+    conntrack_v4_fd: Option<OwnedFd>,
+    conntrack_v6_fd: Option<OwnedFd>,
     dnat_table_fd: Option<OwnedFd>,
     dnat_table_v6_fd: Option<OwnedFd>,
     slow_path: Option<Arc<SlowPathReinjector>>,
@@ -261,6 +263,8 @@ impl Coordinator {
             map_fd: None,
             heartbeat_map_fd: None,
             session_map_fd: None,
+            conntrack_v4_fd: None,
+            conntrack_v6_fd: None,
             dnat_table_fd: None,
             dnat_table_v6_fd: None,
             slow_path: None,
@@ -415,6 +419,8 @@ impl Coordinator {
         self.map_fd = None;
         self.heartbeat_map_fd = None;
         self.session_map_fd = None;
+        self.conntrack_v4_fd = None;
+        self.conntrack_v6_fd = None;
         self.dnat_table_fd = None;
         self.dnat_table_v6_fd = None;
         self.forwarding = ForwardingState::default();
@@ -661,6 +667,19 @@ impl Coordinator {
                 return;
             }
         };
+        // Open BPF conntrack maps (sessions, sessions_v6) so the helper can
+        // publish session entries that "show security flow session" reads.
+        // Non-fatal: if the maps don't exist, session display will lack zone/interface info.
+        let conntrack_v4_fd = if !snapshot.map_pins.conntrack_v4.is_empty() {
+            OwnedFd::open_bpf_map(&snapshot.map_pins.conntrack_v4).ok()
+        } else {
+            None
+        };
+        let conntrack_v6_fd = if !snapshot.map_pins.conntrack_v6.is_empty() {
+            OwnedFd::open_bpf_map(&snapshot.map_pins.conntrack_v6).ok()
+        } else {
+            None
+        };
         // Open dnat_table BPF map for embedded ICMP NAT reversal support.
         // Non-fatal: if the map doesn't exist, embedded ICMP won't work
         // but normal forwarding is unaffected.
@@ -704,6 +723,8 @@ impl Coordinator {
                     xsk_map_fd: map_fd.fd,
                     heartbeat_map_fd: heartbeat_map_fd.fd,
                     session_map_fd: session_map_fd.fd,
+                    conntrack_v4_fd: conntrack_v4_fd.as_ref().map(|f| f.fd).unwrap_or(-1),
+                    conntrack_v6_fd: conntrack_v6_fd.as_ref().map(|f| f.fd).unwrap_or(-1),
                     ring_entries,
                     bind_strategy: preferred_bind_strategy(binding),
                     poll_mode: self.poll_mode,
@@ -731,6 +752,8 @@ impl Coordinator {
         self.map_fd = Some(map_fd);
         self.heartbeat_map_fd = Some(heartbeat_map_fd);
         self.session_map_fd = Some(session_map_fd);
+        self.conntrack_v4_fd = conntrack_v4_fd;
+        self.conntrack_v6_fd = conntrack_v6_fd;
         self.dnat_table_fd = dnat_table_fd;
         self.dnat_table_v6_fd = dnat_table_v6_fd;
         let worker_command_queues: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = workers
@@ -1891,6 +1914,8 @@ struct BindingWorker {
     in_flight_prepared_recycles: FastMap<u64, PreparedTxRecycle>,
     heartbeat_map_fd: c_int,
     session_map_fd: c_int,
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
     last_heartbeat_update_ns: u64,
     debug_state_counter: u32,
     last_rx_wake_ns: u64,
@@ -2033,6 +2058,8 @@ impl BindingWorker {
         xsk_map_fd: c_int,
         heartbeat_map_fd: c_int,
         session_map_fd: c_int,
+        conntrack_v4_fd: c_int,
+        conntrack_v6_fd: c_int,
         live: Arc<BindingLiveState>,
         bind_strategy: AfXdpBindStrategy,
         poll_mode: crate::PollMode,
@@ -2150,6 +2177,8 @@ impl BindingWorker {
             in_flight_prepared_recycles: FastMap::default(),
             heartbeat_map_fd,
             session_map_fd,
+            conntrack_v4_fd,
+            conntrack_v6_fd,
             last_heartbeat_update_ns: init_now,
             debug_state_counter: 0,
             last_rx_wake_ns: init_now,
@@ -2237,6 +2266,8 @@ fn poll_binding(
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     shared_recycles: &mut Vec<(u32, u64)>,
     dnat_fds: &DnatTableFds,
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
     dbg: &mut DebugPollCounters,
     rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
 ) -> bool {
@@ -2986,6 +3017,16 @@ fn poll_binding(
                             if resolved.created {
                                 counters.session_creates += 1;
                                 dbg.session_create += 1;
+                                // Mirror new session to BPF conntrack map for
+                                // `show security flow session` zone/interface display.
+                                publish_bpf_conntrack_entry(
+                                    conntrack_v4_fd,
+                                    conntrack_v6_fd,
+                                    &flow.forward_key,
+                                    resolved.decision,
+                                    &resolved.metadata,
+                                    &forwarding.zone_name_to_id,
+                                );
                             }
                             // Log first N session hits from WAN (return path)
                             if cfg!(feature = "debug-log")
@@ -3340,7 +3381,7 @@ fn poll_binding(
                                     shared_forward_wire_sessions,
                                     &flow.forward_key,
                                     decision,
-                                    local_metadata,
+                                    local_metadata.clone(),
                                     SessionOrigin::LocalMiss,
                                     now_ns,
                                     meta.protocol,
@@ -3348,6 +3389,14 @@ fn poll_binding(
                                 ) {
                                     counters.session_creates += 1;
                                     dbg.session_create += 1;
+                                    publish_bpf_conntrack_entry(
+                                        conntrack_v4_fd,
+                                        conntrack_v6_fd,
+                                        &flow.forward_key,
+                                        decision,
+                                        &local_metadata,
+                                        &forwarding.zone_name_to_id,
+                                    );
                                 }
                             }
                             if is_embedded_icmp_error {
@@ -4473,6 +4522,14 @@ fn poll_binding(
                                             pending_decision,
                                             &entry.metadata,
                                         );
+                                        publish_bpf_conntrack_entry(
+                                            conntrack_v4_fd,
+                                            conntrack_v6_fd,
+                                            &flow.forward_key,
+                                            pending_decision,
+                                            &entry.metadata,
+                                            &forwarding.zone_name_to_id,
+                                        );
                                         publish_dnat_table_entry(
                                             &dnat_fds,
                                             &flow.forward_key,
@@ -5001,6 +5058,8 @@ fn flush_session_deltas(
     ident: &BindingIdentity,
     live: &BindingLiveState,
     session_map_fd: c_int,
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
     deltas: &[SessionDelta],
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -5109,6 +5168,7 @@ fn flush_session_deltas(
                 delta.decision.nat,
                 delta.metadata.is_reverse,
             );
+            delete_bpf_conntrack_entry(conntrack_v4_fd, conntrack_v6_fd, &delta.key);
             remove_shared_session(
                 shared_sessions,
                 shared_nat_sessions,
@@ -5117,6 +5177,7 @@ fn flush_session_deltas(
             );
             let reverse_key = reverse_session_key(&delta.key, delta.decision.nat);
             delete_live_session_entry(session_map_fd, &reverse_key, delta.decision.nat, true);
+            delete_bpf_conntrack_entry(conntrack_v4_fd, conntrack_v6_fd, &reverse_key);
             remove_shared_session(
                 shared_sessions,
                 shared_nat_sessions,
@@ -5412,6 +5473,8 @@ fn worker_loop(
                 plan.xsk_map_fd,
                 plan.heartbeat_map_fd,
                 plan.session_map_fd,
+                plan.conntrack_v4_fd,
+                plan.conntrack_v6_fd,
                 plan.live.clone(),
                 plan.bind_strategy,
                 plan.poll_mode,
@@ -5536,6 +5599,14 @@ fn worker_loop(
             .first()
             .map(|binding| binding.session_map_fd)
             .unwrap_or(-1);
+        let conntrack_v4_fd = bindings
+            .first()
+            .map(|binding| binding.conntrack_v4_fd)
+            .unwrap_or(-1);
+        let conntrack_v6_fd = bindings
+            .first()
+            .map(|binding| binding.conntrack_v6_fd)
+            .unwrap_or(-1);
         let loop_now_ns = monotonic_nanos();
         let loop_now_secs = loop_now_ns / 1_000_000_000;
         let live_validation = shared_validation.load();
@@ -5580,11 +5651,13 @@ fn worker_loop(
         let expired_entries = sessions.expire_stale_entries(loop_now_ns);
         let expired = expired_entries.len() as u64;
         for expired_entry in expired_entries {
-            delete_session_map_entry_for_removed_session(
+            delete_session_map_entry_for_removed_session_with_conntrack(
                 session_map_fd,
                 &expired_entry.key,
                 expired_entry.decision,
                 &expired_entry.metadata,
+                conntrack_v4_fd,
+                conntrack_v6_fd,
             );
         }
         if expired > 0 {
@@ -5638,6 +5711,8 @@ fn worker_loop(
                 &peer_worker_commands,
                 &mut shared_recycles,
                 &dnat_fds,
+                conntrack_v4_fd,
+                conntrack_v6_fd,
                 &mut dbg_poll,
                 &rg_epochs,
             ) {
@@ -5727,6 +5802,8 @@ fn worker_loop(
                         &ident,
                         &binding.live,
                         binding.session_map_fd,
+                        conntrack_v4_fd,
+                        conntrack_v6_fd,
                         &deltas,
                         &shared_sessions,
                         &shared_nat_sessions,
@@ -5750,6 +5827,8 @@ fn worker_loop(
                     &ident,
                     &binding.live,
                     binding.session_map_fd,
+                    conntrack_v4_fd,
+                    conntrack_v6_fd,
                     &deltas,
                     &shared_sessions,
                     &shared_nat_sessions,

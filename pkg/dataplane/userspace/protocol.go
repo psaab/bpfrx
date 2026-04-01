@@ -304,16 +304,18 @@ type NeighborSnapshot struct {
 }
 
 type UserspaceMapPins struct {
-	Ctrl        string `json:"ctrl,omitempty"`
-	Bindings    string `json:"bindings,omitempty"`
-	Heartbeat   string `json:"heartbeat,omitempty"`
-	XSK         string `json:"xsk,omitempty"`
-	LocalV4     string `json:"local_v4,omitempty"`
-	LocalV6     string `json:"local_v6,omitempty"`
-	Sessions    string `json:"sessions,omitempty"`
-	DnatTable   string `json:"dnat_table,omitempty"`
-	DnatTableV6 string `json:"dnat_table_v6,omitempty"`
-	Trace       string `json:"trace,omitempty"`
+	Ctrl         string `json:"ctrl,omitempty"`
+	Bindings     string `json:"bindings,omitempty"`
+	Heartbeat    string `json:"heartbeat,omitempty"`
+	XSK          string `json:"xsk,omitempty"`
+	LocalV4      string `json:"local_v4,omitempty"`
+	LocalV6      string `json:"local_v6,omitempty"`
+	Sessions     string `json:"sessions,omitempty"`
+	ConntrackV4  string `json:"conntrack_v4,omitempty"`
+	ConntrackV6  string `json:"conntrack_v6,omitempty"`
+	DnatTable    string `json:"dnat_table,omitempty"`
+	DnatTableV6  string `json:"dnat_table_v6,omitempty"`
+	Trace        string `json:"trace,omitempty"`
 }
 
 type UserspaceCapabilities struct {

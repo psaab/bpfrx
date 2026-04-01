@@ -324,11 +324,382 @@ pub(super) fn publish_live_session_entry(
     Ok(())
 }
 
+// ── BPF conntrack context ──
+
+/// Optional context for mirroring sessions into the BPF conntrack maps.
+/// When present, `publish_session_map_entry_for_session` and
+/// `delete_session_map_entry_for_removed_session` also write/delete from
+/// the kernel-visible `sessions`/`sessions_v6` maps so `show security
+/// flow session` displays correct zone and interface information.
+#[derive(Clone, Copy)]
+pub(super) struct ConntrackCtx<'a> {
+    pub(super) v4_fd: c_int,
+    pub(super) v6_fd: c_int,
+    pub(super) zone_name_to_id: &'a FastMap<String, u16>,
+}
+
+// ── BPF conntrack map structs (mirrors C struct session_key / session_value) ──
+
+/// Mirrors C `struct session_key` — 16 bytes, packed.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct BpfSessionKeyV4 {
+    src_ip: [u8; 4],   // __be32, network byte order
+    dst_ip: [u8; 4],   // __be32, network byte order
+    src_port: u16,      // __be16, network byte order
+    dst_port: u16,      // __be16, network byte order
+    protocol: u8,
+    pad: [u8; 3],
+}
+
+/// Mirrors C `struct session_value` — full connection state.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BpfSessionValueV4 {
+    state: u8,
+    flags: u8,
+    tcp_state: u8,
+    is_reverse: u8,
+    app_timeout: u32,
+    session_id: u64,
+    created: u64,
+    last_seen: u64,
+    timeout: u32,
+    policy_id: u32,
+    ingress_zone: u16,
+    egress_zone: u16,
+    nat_src_ip: u32,    // __be32, native endian for BPF
+    nat_dst_ip: u32,    // __be32, native endian for BPF
+    nat_src_port: u16,  // __be16, network byte order
+    nat_dst_port: u16,  // __be16, network byte order
+    fwd_packets: u64,
+    fwd_bytes: u64,
+    rev_packets: u64,
+    rev_bytes: u64,
+    reverse_key: BpfSessionKeyV4,
+    alg_type: u8,
+    log_flags: u8,
+    app_id: u16,
+    fib_ifindex: u32,
+    fib_vlan_id: u16,
+    fib_dmac: [u8; 6],
+    fib_smac: [u8; 6],
+    fib_gen: u16,
+}
+
+/// Mirrors C `struct session_key_v6` — 40 bytes, packed.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Default)]
+struct BpfSessionKeyV6 {
+    src_ip: [u8; 16],
+    dst_ip: [u8; 16],
+    src_port: u16,      // __be16, network byte order
+    dst_port: u16,      // __be16, network byte order
+    protocol: u8,
+    pad: [u8; 3],
+}
+
+/// Mirrors C `struct session_value_v6` — full connection state with 128-bit IPs.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BpfSessionValueV6 {
+    state: u8,
+    flags: u8,
+    tcp_state: u8,
+    is_reverse: u8,
+    app_timeout: u32,
+    session_id: u64,
+    created: u64,
+    last_seen: u64,
+    timeout: u32,
+    policy_id: u32,
+    ingress_zone: u16,
+    egress_zone: u16,
+    nat_src_ip: [u8; 16],
+    nat_dst_ip: [u8; 16],
+    nat_src_port: u16,  // __be16, network byte order
+    nat_dst_port: u16,  // __be16, network byte order
+    fwd_packets: u64,
+    fwd_bytes: u64,
+    rev_packets: u64,
+    rev_bytes: u64,
+    reverse_key: BpfSessionKeyV6,
+    alg_type: u8,
+    log_flags: u8,
+    app_id: u16,
+    fib_ifindex: u32,
+    fib_vlan_id: u16,
+    fib_dmac: [u8; 6],
+    fib_smac: [u8; 6],
+    fib_gen: u16,
+}
+
+/// Session flag constants matching C SESS_FLAG_* defines.
+const SESS_FLAG_SNAT: u8 = 1 << 0;
+const SESS_FLAG_DNAT: u8 = 1 << 1;
+/// Session state constants matching C SESS_STATE_* defines.
+const SESS_STATE_ESTABLISHED: u8 = 4;
+
+/// Write a session entry to the BPF conntrack map so `show security flow session`
+/// displays correct zone and interface information for helper-managed sessions.
+///
+/// `conntrack_v4_fd` / `conntrack_v6_fd`: FDs for the pinned `sessions` / `sessions_v6`
+/// BPF HASH maps. Pass -1 if unavailable (will be a no-op).
+pub(super) fn publish_bpf_conntrack_entry(
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    zone_name_to_id: &FastMap<String, u16>,
+) {
+    let ingress_zone_id = zone_name_to_id
+        .get(metadata.ingress_zone.as_ref())
+        .copied()
+        .unwrap_or(0);
+    let egress_zone_id = zone_name_to_id
+        .get(metadata.egress_zone.as_ref())
+        .copied()
+        .unwrap_or(0);
+
+    let now_secs = monotonic_nanos() / 1_000_000_000;
+
+    let mut flags: u8 = 0;
+    if decision.nat.rewrite_src.is_some() {
+        flags |= SESS_FLAG_SNAT;
+    }
+    if decision.nat.rewrite_dst.is_some() {
+        flags |= SESS_FLAG_DNAT;
+    }
+
+    match (key.addr_family as i32, &key.src_ip, &key.dst_ip) {
+        (libc::AF_INET, IpAddr::V4(src), IpAddr::V4(dst)) if conntrack_v4_fd >= 0 => {
+            let bpf_key = BpfSessionKeyV4 {
+                src_ip: src.octets(),
+                dst_ip: dst.octets(),
+                src_port: key.src_port.to_be(),
+                dst_port: key.dst_port.to_be(),
+                protocol: key.protocol,
+                pad: [0; 3],
+            };
+
+            // Build reverse key
+            let rev = reverse_session_key(key, decision.nat);
+            let rev_key = match rev.src_ip {
+                IpAddr::V4(rsrc) => {
+                    let rdst = match rev.dst_ip {
+                        IpAddr::V4(d) => d,
+                        _ => return,
+                    };
+                    BpfSessionKeyV4 {
+                        src_ip: rsrc.octets(),
+                        dst_ip: rdst.octets(),
+                        src_port: rev.src_port.to_be(),
+                        dst_port: rev.dst_port.to_be(),
+                        protocol: rev.protocol,
+                        pad: [0; 3],
+                    }
+                }
+                _ => return,
+            };
+
+            // NAT IPs: use native endian u32 (IP bytes already in network order,
+            // interpret as NativeEndian per CLAUDE.md)
+            let nat_src_ip = match decision.nat.rewrite_src {
+                Some(IpAddr::V4(ip)) => u32::from_ne_bytes(ip.octets()),
+                _ => 0,
+            };
+            let nat_dst_ip = match decision.nat.rewrite_dst {
+                Some(IpAddr::V4(ip)) => u32::from_ne_bytes(ip.octets()),
+                _ => 0,
+            };
+            let nat_src_port = decision.nat.rewrite_src_port.unwrap_or(0).to_be();
+            let nat_dst_port = decision.nat.rewrite_dst_port.unwrap_or(0).to_be();
+
+            let value = BpfSessionValueV4 {
+                state: SESS_STATE_ESTABLISHED,
+                flags,
+                tcp_state: 0,
+                is_reverse: if metadata.is_reverse { 1 } else { 0 },
+                app_timeout: 0,
+                session_id: 0,
+                created: now_secs,
+                last_seen: now_secs,
+                timeout: 1800, // default 30min; GC owns real expiry
+                policy_id: 0,
+                ingress_zone: ingress_zone_id,
+                egress_zone: egress_zone_id,
+                nat_src_ip,
+                nat_dst_ip,
+                nat_src_port,
+                nat_dst_port,
+                fwd_packets: 0,
+                fwd_bytes: 0,
+                rev_packets: 0,
+                rev_bytes: 0,
+                reverse_key: rev_key,
+                alg_type: 0,
+                log_flags: 0,
+                app_id: 0,
+                fib_ifindex: 0,
+                fib_vlan_id: 0,
+                fib_dmac: [0; 6],
+                fib_smac: [0; 6],
+                fib_gen: 0,
+            };
+
+            let _ = unsafe {
+                libbpf_sys::bpf_map_update_elem(
+                    conntrack_v4_fd,
+                    (&bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
+                    (&value as *const BpfSessionValueV4).cast::<c_void>(),
+                    libbpf_sys::BPF_NOEXIST as u64,
+                )
+            };
+        }
+        (libc::AF_INET6, IpAddr::V6(src), IpAddr::V6(dst)) if conntrack_v6_fd >= 0 => {
+            let bpf_key = BpfSessionKeyV6 {
+                src_ip: src.octets(),
+                dst_ip: dst.octets(),
+                src_port: key.src_port.to_be(),
+                dst_port: key.dst_port.to_be(),
+                protocol: key.protocol,
+                pad: [0; 3],
+            };
+
+            let rev = reverse_session_key(key, decision.nat);
+            let rev_key = match rev.src_ip {
+                IpAddr::V6(rsrc) => {
+                    let rdst = match rev.dst_ip {
+                        IpAddr::V6(d) => d,
+                        _ => return,
+                    };
+                    BpfSessionKeyV6 {
+                        src_ip: rsrc.octets(),
+                        dst_ip: rdst.octets(),
+                        src_port: rev.src_port.to_be(),
+                        dst_port: rev.dst_port.to_be(),
+                        protocol: rev.protocol,
+                        pad: [0; 3],
+                    }
+                }
+                _ => return,
+            };
+
+            let nat_src_ip = match decision.nat.rewrite_src {
+                Some(IpAddr::V6(ip)) => ip.octets(),
+                _ => [0; 16],
+            };
+            let nat_dst_ip = match decision.nat.rewrite_dst {
+                Some(IpAddr::V6(ip)) => ip.octets(),
+                _ => [0; 16],
+            };
+            let nat_src_port = decision.nat.rewrite_src_port.unwrap_or(0).to_be();
+            let nat_dst_port = decision.nat.rewrite_dst_port.unwrap_or(0).to_be();
+
+            let value = BpfSessionValueV6 {
+                state: SESS_STATE_ESTABLISHED,
+                flags,
+                tcp_state: 0,
+                is_reverse: if metadata.is_reverse { 1 } else { 0 },
+                app_timeout: 0,
+                session_id: 0,
+                created: now_secs,
+                last_seen: now_secs,
+                timeout: 1800,
+                policy_id: 0,
+                ingress_zone: ingress_zone_id,
+                egress_zone: egress_zone_id,
+                nat_src_ip,
+                nat_dst_ip,
+                nat_src_port,
+                nat_dst_port,
+                fwd_packets: 0,
+                fwd_bytes: 0,
+                rev_packets: 0,
+                rev_bytes: 0,
+                reverse_key: rev_key,
+                alg_type: 0,
+                log_flags: 0,
+                app_id: 0,
+                fib_ifindex: 0,
+                fib_vlan_id: 0,
+                fib_dmac: [0; 6],
+                fib_smac: [0; 6],
+                fib_gen: 0,
+            };
+
+            let _ = unsafe {
+                libbpf_sys::bpf_map_update_elem(
+                    conntrack_v6_fd,
+                    (&bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
+                    (&value as *const BpfSessionValueV6).cast::<c_void>(),
+                    libbpf_sys::BPF_NOEXIST as u64,
+                )
+            };
+        }
+        _ => {}
+    }
+}
+
+/// Delete a session entry from the BPF conntrack map.
+pub(super) fn delete_bpf_conntrack_entry(
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
+    key: &SessionKey,
+) {
+    match (key.addr_family as i32, &key.src_ip, &key.dst_ip) {
+        (libc::AF_INET, IpAddr::V4(src), IpAddr::V4(dst)) if conntrack_v4_fd >= 0 => {
+            let bpf_key = BpfSessionKeyV4 {
+                src_ip: src.octets(),
+                dst_ip: dst.octets(),
+                src_port: key.src_port.to_be(),
+                dst_port: key.dst_port.to_be(),
+                protocol: key.protocol,
+                pad: [0; 3],
+            };
+            let _ = unsafe {
+                libbpf_sys::bpf_map_delete_elem(
+                    conntrack_v4_fd,
+                    (&bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
+                )
+            };
+        }
+        (libc::AF_INET6, IpAddr::V6(src), IpAddr::V6(dst)) if conntrack_v6_fd >= 0 => {
+            let bpf_key = BpfSessionKeyV6 {
+                src_ip: src.octets(),
+                dst_ip: dst.octets(),
+                src_port: key.src_port.to_be(),
+                dst_port: key.dst_port.to_be(),
+                protocol: key.protocol,
+                pad: [0; 3],
+            };
+            let _ = unsafe {
+                libbpf_sys::bpf_map_delete_elem(
+                    conntrack_v6_fd,
+                    (&bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
+                )
+            };
+        }
+        _ => {}
+    }
+}
+
 pub(super) fn publish_session_map_entry_for_session(
     map_fd: c_int,
     key: &SessionKey,
     decision: SessionDecision,
     metadata: &SessionMetadata,
+) -> io::Result<()> {
+    publish_session_map_entry_for_session_with_conntrack(map_fd, key, decision, metadata, None)
+}
+
+pub(super) fn publish_session_map_entry_for_session_with_conntrack(
+    map_fd: c_int,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    ct: Option<ConntrackCtx<'_>>,
 ) -> io::Result<()> {
     if uses_kernel_local_session_map_entry(decision, metadata) {
         publish_kernel_local_session_key(map_fd, key)?;
@@ -343,9 +714,18 @@ pub(super) fn publish_session_map_entry_for_session(
                 publish_live_session_key(map_fd, &reverse_wire)?;
             }
         }
+        // Also mirror to conntrack for session display.
+        if let Some(ctx) = ct {
+            publish_bpf_conntrack_entry(ctx.v4_fd, ctx.v6_fd, key, decision, metadata, ctx.zone_name_to_id);
+        }
         return Ok(());
     }
-    publish_live_session_entry(map_fd, key, decision.nat, metadata.is_reverse)
+    let result = publish_live_session_entry(map_fd, key, decision.nat, metadata.is_reverse);
+    // Mirror to conntrack for session display.
+    if let Some(ctx) = ct {
+        publish_bpf_conntrack_entry(ctx.v4_fd, ctx.v6_fd, key, decision, metadata, ctx.zone_name_to_id);
+    }
+    result
 }
 
 /// Verify a session key exists in the BPF map (read-back after publish).
@@ -584,6 +964,17 @@ pub(super) fn delete_session_map_entry_for_removed_session(
     decision: SessionDecision,
     metadata: &SessionMetadata,
 ) {
+    delete_session_map_entry_for_removed_session_with_conntrack(map_fd, key, decision, metadata, -1, -1);
+}
+
+pub(super) fn delete_session_map_entry_for_removed_session_with_conntrack(
+    map_fd: c_int,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
+) {
     if uses_kernel_local_session_map_entry(decision, metadata) {
         delete_live_session_key(map_fd, key);
         // Also delete the reverse-wire alias published for SNATed
@@ -594,9 +985,11 @@ pub(super) fn delete_session_map_entry_for_removed_session(
                 delete_live_session_key(map_fd, &reverse_wire);
             }
         }
+        delete_bpf_conntrack_entry(conntrack_v4_fd, conntrack_v6_fd, key);
         return;
     }
     delete_live_session_entry(map_fd, key, decision.nat, metadata.is_reverse);
+    delete_bpf_conntrack_entry(conntrack_v4_fd, conntrack_v6_fd, key);
 }
 
 #[cfg(test)]
@@ -671,5 +1064,14 @@ mod tests {
             local_delivery_decision(0),
             &metadata
         ));
+    }
+
+    #[test]
+    fn bpf_conntrack_struct_sizes_match_c() {
+        // Must match C struct sizes from bpfrx_conntrack.h exactly.
+        assert_eq!(core::mem::size_of::<BpfSessionKeyV4>(), 16);
+        assert_eq!(core::mem::size_of::<BpfSessionValueV4>(), 128);
+        assert_eq!(core::mem::size_of::<BpfSessionKeyV6>(), 40);
+        assert_eq!(core::mem::size_of::<BpfSessionValueV6>(), 176);
     }
 }

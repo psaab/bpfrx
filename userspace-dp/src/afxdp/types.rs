@@ -222,6 +222,8 @@ pub(super) struct BindingPlan {
     pub(super) xsk_map_fd: c_int,
     pub(super) heartbeat_map_fd: c_int,
     pub(super) session_map_fd: c_int,
+    pub(super) conntrack_v4_fd: c_int,
+    pub(super) conntrack_v6_fd: c_int,
     pub(super) ring_entries: u32,
     pub(super) bind_strategy: AfXdpBindStrategy,
     pub(super) poll_mode: crate::PollMode,
