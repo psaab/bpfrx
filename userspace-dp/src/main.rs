@@ -1536,6 +1536,16 @@ fn handle_stream(
                     response.error = "missing HA demotion prepare".to_string();
                 }
             }
+            "refresh_owner_rgs" => {
+                if let Some(prepare_req) = request.ha_demotion_prepare {
+                    eprintln!("bpfrx-ha: explicit refresh_owner_rgs {:?}", prepare_req.groups);
+                    guard.afxdp.refresh_owner_rgs(&prepare_req.groups);
+                    refresh_status(&mut guard);
+                } else {
+                    response.ok = false;
+                    response.error = "missing groups for refresh_owner_rgs".to_string();
+                }
+            }
             "update_fabrics" => {
                 if let Some(fabrics) = request.fabrics.as_ref() {
                     guard.afxdp.refresh_fabric_links(fabrics);

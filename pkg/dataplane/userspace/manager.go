@@ -2859,7 +2859,29 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	if err := m.requestLocked(req, &status); err != nil {
 		return err
 	}
-	return m.applyHelperStatusLocked(&status)
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return err
+	}
+
+	// Explicitly refresh sessions for activated RGs. The delta detection
+	// in the helper's update_ha_state may miss the activation if the
+	// periodic poll already synced the new state. This direct call
+	// guarantees RefreshOwnerRGs runs, re-resolving synced sessions with
+	// local egress info so SNAT/forwarding works on the new owner.
+	if active && m.proc != nil {
+		slog.Info("userspace: explicit refresh_owner_rgs on activation", "rg", rgID)
+		var refreshStatus ProcessStatus
+		refreshReq := ControlRequest{
+			Type: "refresh_owner_rgs",
+			HADemotionPrepare: &HADemotionPrepareRequest{
+				Groups: []int{rgID},
+			},
+		}
+		if err := m.requestLocked(refreshReq, &refreshStatus); err != nil {
+			slog.Warn("userspace: refresh_owner_rgs failed", "rg", rgID, "err", err)
+		}
+	}
+	return nil
 }
 
 func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error {

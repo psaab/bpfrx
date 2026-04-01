@@ -1750,24 +1750,30 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 }
 
 func (s *SessionSync) sendBarrierAck(conn net.Conn, seq uint64) {
-	var payload [24]byte
-	binary.LittleEndian.PutUint64(payload[:], seq)
-	stats := s.Stats()
-	binary.LittleEndian.PutUint64(payload[8:16], stats.SessionsReceived)
-	binary.LittleEndian.PutUint64(payload[16:24], stats.SessionsInstalled)
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if err := writeMsg(conn, syncMsgBarrierAck, payload[:]); err != nil {
-		s.stats.Errors.Add(1)
-		slog.Debug("cluster sync: failed to send barrier ack", "seq", seq, "err", err)
-		return
-	}
-	slog.Info("cluster sync: barrier ack sent",
-		"seq", seq,
-		"sessions_received", stats.SessionsReceived,
-		"sessions_installed", stats.SessionsInstalled,
-		"queue_len", len(s.sendCh),
-		"queue_cap", cap(s.sendCh))
+	// Send barrier ack without blocking the receive goroutine.
+	// Same rationale as sendBulkAck: writeMu contention from
+	// outbound session writes can delay the ack beyond the peer's
+	// barrier timeout.
+	go func() {
+		var payload [24]byte
+		binary.LittleEndian.PutUint64(payload[:], seq)
+		stats := s.Stats()
+		binary.LittleEndian.PutUint64(payload[8:16], stats.SessionsReceived)
+		binary.LittleEndian.PutUint64(payload[16:24], stats.SessionsInstalled)
+		s.writeMu.Lock()
+		defer s.writeMu.Unlock()
+		if err := writeMsg(conn, syncMsgBarrierAck, payload[:]); err != nil {
+			s.stats.Errors.Add(1)
+			slog.Debug("cluster sync: failed to send barrier ack", "seq", seq, "err", err)
+			return
+		}
+		slog.Info("cluster sync: barrier ack sent",
+			"seq", seq,
+			"sessions_received", stats.SessionsReceived,
+			"sessions_installed", stats.SessionsInstalled,
+			"queue_len", len(s.sendCh),
+			"queue_cap", cap(s.sendCh))
+	}()
 }
 
 func (s *SessionSync) completeBarrierWait(seq uint64) {

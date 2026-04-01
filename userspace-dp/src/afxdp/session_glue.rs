@@ -395,6 +395,16 @@ pub(super) fn apply_worker_commands(
                         now_secs,
                         re_resolved,
                     );
+                    if refreshed_fwd < 3 {
+                        eprintln!(
+                            "bpfrx-ha: RefreshOwnerRGs re-resolve {} -> {} old_disp={:?} new_disp={:?} old_egress={} new_egress={} nat_src={:?} changed={}",
+                            key.src_ip, key.dst_ip,
+                            decision.resolution.disposition, re_resolved.disposition,
+                            decision.resolution.egress_ifindex, re_resolved.egress_ifindex,
+                            decision.nat.rewrite_src,
+                            re_resolved != decision.resolution,
+                        );
+                    }
                     if re_resolved.disposition
                         != super::ForwardingDisposition::HAInactive
                         && re_resolved != decision.resolution

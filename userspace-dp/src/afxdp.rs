@@ -1222,6 +1222,44 @@ impl Coordinator {
         }
     }
 
+    /// Explicitly refresh sessions for activated RGs. Called from Go's
+    /// UpdateRGActive to bypass delta detection which can miss activations
+    /// when the periodic poll already updated the HA state.
+    pub fn refresh_owner_rgs(&self, owner_rgs: &[i32]) {
+        if owner_rgs.is_empty() {
+            return;
+        }
+        // Prewarm reverse synced sessions.
+        let worker_command_vec: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = self
+            .workers
+            .values()
+            .map(|handle| handle.commands.clone())
+            .collect();
+        if let Some(session_map_ref) = self.session_map_fd.as_ref() {
+            let session_map_fd = session_map_ref.fd;
+            let now_secs = monotonic_nanos() / 1_000_000_000;
+            let current = self.ha_state.load();
+            prewarm_reverse_synced_sessions_for_owner_rgs(
+                &self.shared_sessions,
+                &self.shared_nat_sessions,
+                &self.shared_forward_wire_sessions,
+                &worker_command_vec,
+                session_map_fd,
+                &self.forwarding,
+                current.as_ref(),
+                &self.dynamic_neighbors,
+                owner_rgs,
+                now_secs,
+            );
+        }
+        for handle in self.workers.values() {
+            if let Ok(mut pending) = handle.commands.lock() {
+                pending.push_back(WorkerCommand::FlushFlowCaches);
+                pending.push_back(WorkerCommand::RefreshOwnerRGs(owner_rgs.to_vec()));
+            }
+        }
+    }
+
     pub fn prepare_ha_demotion(&self, owner_rgs: &[i32]) -> Result<(), String> {
         if owner_rgs.is_empty() {
             return Ok(());
