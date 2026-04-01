@@ -553,7 +553,7 @@ pub(super) fn publish_bpf_conntrack_entry(
                     conntrack_v4_fd,
                     (&bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
                     (&value as *const BpfSessionValueV4).cast::<c_void>(),
-                    libbpf_sys::BPF_NOEXIST as u64,
+                    libbpf_sys::BPF_ANY as u64,
                 )
             };
         }
@@ -634,7 +634,7 @@ pub(super) fn publish_bpf_conntrack_entry(
                     conntrack_v6_fd,
                     (&bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
                     (&value as *const BpfSessionValueV6).cast::<c_void>(),
-                    libbpf_sys::BPF_NOEXIST as u64,
+                    libbpf_sys::BPF_ANY as u64,
                 )
             };
         }
