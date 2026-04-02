@@ -1068,26 +1068,13 @@ pub(super) fn enforce_ha_resolution_snapshot(
             ..resolution
         };
     };
-    if !group.active || ha_group_is_demoting(group, now_secs) {
-        return ForwardingResolution {
-            disposition: ForwardingDisposition::HAInactive,
-            ..resolution
-        };
-    }
-    if group.watchdog_timestamp == 0
-        || now_secs < group.watchdog_timestamp
-        || now_secs.saturating_sub(group.watchdog_timestamp) > HA_WATCHDOG_STALE_AFTER_SECS
-    {
+    if !group.is_forwarding_active(now_secs) {
         return ForwardingResolution {
             disposition: ForwardingDisposition::HAInactive,
             ..resolution
         };
     }
     resolution
-}
-
-pub(super) fn ha_group_is_demoting(group: &HAGroupRuntime, now_secs: u64) -> bool {
-    group.demoting && group.demoting_until_secs != 0 && now_secs <= group.demoting_until_secs
 }
 
 pub(super) fn cached_flow_decision_valid(
@@ -2220,6 +2207,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2240,6 +2228,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2264,6 +2253,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: now_secs,
+                lease_timestamp: now_secs,
                 demoting: true,
                 demoting_until_secs: now_secs + 5,
             },
@@ -2284,6 +2274,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2293,6 +2284,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2317,6 +2309,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2360,6 +2353,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2392,6 +2386,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: now_secs,
+                lease_timestamp: now_secs,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2576,6 +2571,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2607,6 +2603,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2647,6 +2644,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2737,17 +2735,15 @@ mod tests {
             ..UserspaceDpMeta::default()
         };
 
-        assert!(
-            cluster_peer_return_fast_path(
-                &state,
-                &dynamic_neighbors,
-                &[],
-                meta,
-                Some("sfmix"),
-                IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            )
-            .is_none()
-        );
+        assert!(cluster_peer_return_fast_path(
+            &state,
+            &dynamic_neighbors,
+            &[],
+            meta,
+            Some("sfmix"),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        )
+        .is_none());
     }
 
     #[test]
@@ -2769,17 +2765,15 @@ mod tests {
         };
         let packet_frame = [8u8];
 
-        assert!(
-            cluster_peer_return_fast_path(
-                &state,
-                &dynamic_neighbors,
-                &packet_frame,
-                meta,
-                Some("lan"),
-                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-            )
-            .is_none()
-        );
+        assert!(cluster_peer_return_fast_path(
+            &state,
+            &dynamic_neighbors,
+            &packet_frame,
+            meta,
+            Some("lan"),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        )
+        .is_none());
     }
 
     #[test]
@@ -2801,17 +2795,15 @@ mod tests {
         };
         let packet_frame = [128u8];
 
-        assert!(
-            cluster_peer_return_fast_path(
-                &state,
-                &dynamic_neighbors,
-                &packet_frame,
-                meta,
-                Some("lan"),
-                IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
-            )
-            .is_none()
-        );
+        assert!(cluster_peer_return_fast_path(
+            &state,
+            &dynamic_neighbors,
+            &packet_frame,
+            meta,
+            Some("lan"),
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+        )
+        .is_none());
     }
 
     #[test]
@@ -2969,6 +2961,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3120,6 +3113,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3541,20 +3535,16 @@ mod tests {
             0x10,
         ));
         assert!(sessions.lookup(&key, 1_000_000, 0x10).is_some());
-        assert!(
-            shared_sessions
-                .lock()
-                .expect("shared lock")
-                .get(&key)
-                .is_none()
-        );
+        assert!(shared_sessions
+            .lock()
+            .expect("shared lock")
+            .get(&key)
+            .is_none());
         assert!(shared_nat_sessions.lock().expect("nat lock").is_empty());
-        assert!(
-            shared_forward_wire_sessions
-                .lock()
-                .expect("forward wire lock")
-                .is_empty()
-        );
+        assert!(shared_forward_wire_sessions
+            .lock()
+            .expect("forward wire lock")
+            .is_empty());
     }
 
     #[test]
@@ -3628,20 +3618,16 @@ mod tests {
             PROTO_TCP,
             0x10,
         ));
-        assert!(
-            shared_sessions
-                .lock()
-                .expect("shared lock")
-                .get(&key)
-                .is_none()
-        );
+        assert!(shared_sessions
+            .lock()
+            .expect("shared lock")
+            .get(&key)
+            .is_none());
         assert!(shared_nat_sessions.lock().expect("nat lock").is_empty());
-        assert!(
-            shared_forward_wire_sessions
-                .lock()
-                .expect("forward wire lock")
-                .is_empty()
-        );
+        assert!(shared_forward_wire_sessions
+            .lock()
+            .expect("forward wire lock")
+            .is_empty());
     }
 
     #[test]

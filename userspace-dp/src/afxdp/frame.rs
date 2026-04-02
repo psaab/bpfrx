@@ -4733,6 +4733,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -4769,6 +4770,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },

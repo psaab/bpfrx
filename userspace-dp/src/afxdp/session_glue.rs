@@ -136,16 +136,7 @@ pub(super) fn owner_rg_is_locally_active(
     now_secs: u64,
 ) -> bool {
     owner_rg_id > 0
-        && matches!(
-            ha_state.get(&owner_rg_id),
-            Some(group)
-                if group.active
-                    && !super::ha_group_is_demoting(group, now_secs)
-                    && group.watchdog_timestamp != 0
-                    && now_secs >= group.watchdog_timestamp
-                    && now_secs.saturating_sub(group.watchdog_timestamp)
-                        <= HA_WATCHDOG_STALE_AFTER_SECS
-        )
+        && matches!(ha_state.get(&owner_rg_id), Some(group) if group.is_forwarding_active(now_secs))
 }
 
 fn redirect_session_resolution_for_metadata(
@@ -454,9 +445,7 @@ pub(super) fn apply_worker_commands(
                 // check if ANY RG is locally active. Synced sessions with
                 // rg=0 still need local egress re-resolution for SNAT to work.
                 let any_rg_active = entry.metadata.owner_rg_id == 0
-                    && ha_state
-                        .values()
-                        .any(|g| g.active && g.watchdog_timestamp != 0);
+                    && ha_state.values().any(|g| g.is_forwarding_active(now_secs));
                 let is_active = locally_active || any_rg_active;
                 let allow_replace_local = !is_active;
 
@@ -1230,13 +1219,7 @@ pub(super) fn reverse_resolution_for_session(
         && owner_rg_for_resolution(forwarding, resolved) > 0
         && !matches!(
             ha_state.get(&owner_rg_for_resolution(forwarding, resolved)),
-            Some(group)
-                if group.active
-                    && !super::ha_group_is_demoting(group, now_secs)
-                    && group.watchdog_timestamp != 0
-                    && now_secs >= group.watchdog_timestamp
-                    && now_secs.saturating_sub(group.watchdog_timestamp)
-                        <= HA_WATCHDOG_STALE_AFTER_SECS
+            Some(group) if group.is_forwarding_active(now_secs)
         )
         && let Some(redirect) = resolve_zone_encoded_fabric_redirect(forwarding, ingress_zone)
     {
@@ -1921,6 +1904,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
+                lease_timestamp: 1,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2369,6 +2353,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
+                lease_timestamp: 1,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2466,6 +2451,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
+                lease_timestamp: 1,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2560,6 +2546,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 0,
+                lease_timestamp: 0,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2633,6 +2620,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 0,
+                lease_timestamp: 0,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2704,6 +2692,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -2993,6 +2982,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3061,6 +3051,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3139,6 +3130,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3213,6 +3205,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3305,6 +3298,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3390,6 +3384,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3399,6 +3394,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3483,6 +3479,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3576,6 +3573,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
+                lease_timestamp: monotonic_nanos() / 1_000_000_000,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3730,6 +3728,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
+                lease_timestamp: 1,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3768,6 +3767,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
+                lease_timestamp: 1,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3777,6 +3777,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 1,
+                lease_timestamp: 1,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3838,6 +3839,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 1,
+                lease_timestamp: 1,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3875,6 +3877,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 0,
+                lease_timestamp: 0,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3913,6 +3916,7 @@ mod tests {
             HAGroupRuntime {
                 active: false,
                 watchdog_timestamp: 0,
+                lease_timestamp: 0,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -3981,6 +3985,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
+                lease_timestamp: 1,
                 demoting: false,
                 demoting_until_secs: 0,
             },
@@ -4042,6 +4047,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 1,
+                lease_timestamp: 1,
                 demoting: false,
                 demoting_until_secs: 0,
             },

@@ -1076,6 +1076,15 @@ impl Coordinator {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let mut state = BTreeMap::new();
         for group in groups {
+            // Treat every active HA state update as a lease refresh. Watchdog-only
+            // updates renew the same lease model, and full active-state updates seed
+            // it immediately so packet-time HA checks do not depend on a second
+            // follow-up watchdog round-trip.
+            let lease_timestamp = if group.active {
+                group.watchdog_timestamp.max(now_secs)
+            } else {
+                0
+            };
             let (demoting, demoting_until_secs) = if group.active {
                 previous
                     .as_ref()
@@ -1102,6 +1111,7 @@ impl Coordinator {
                 HAGroupRuntime {
                     active: group.active,
                     watchdog_timestamp: group.watchdog_timestamp,
+                    lease_timestamp,
                     demoting,
                     demoting_until_secs,
                 },
@@ -6653,6 +6663,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 11,
+                    lease_timestamp: 11,
                     demoting: false,
                     demoting_until_secs: 0,
                 },
@@ -6662,6 +6673,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 12,
+                    lease_timestamp: 12,
                     demoting: false,
                     demoting_until_secs: 0,
                 },
@@ -6673,6 +6685,7 @@ mod tests {
                 HAGroupRuntime {
                     active: false,
                     watchdog_timestamp: 21,
+                    lease_timestamp: 21,
                     demoting: false,
                     demoting_until_secs: 0,
                 },
@@ -6682,6 +6695,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 22,
+                    lease_timestamp: 22,
                     demoting: false,
                     demoting_until_secs: 0,
                 },
@@ -6699,6 +6713,7 @@ mod tests {
                 HAGroupRuntime {
                     active: false,
                     watchdog_timestamp: 11,
+                    lease_timestamp: 11,
                     demoting: false,
                     demoting_until_secs: 0,
                 },
@@ -6708,6 +6723,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 12,
+                    lease_timestamp: 12,
                     demoting: false,
                     demoting_until_secs: 0,
                 },
@@ -6719,6 +6735,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 21,
+                    lease_timestamp: 21,
                     demoting: false,
                     demoting_until_secs: 0,
                 },
@@ -6728,6 +6745,7 @@ mod tests {
                 HAGroupRuntime {
                     active: true,
                     watchdog_timestamp: 22,
+                    lease_timestamp: 22,
                     demoting: false,
                     demoting_until_secs: 0,
                 },
@@ -6746,6 +6764,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 11,
+                lease_timestamp: 11,
                 demoting: true,
                 demoting_until_secs: now_secs.saturating_sub(1),
             },
@@ -6766,6 +6785,27 @@ mod tests {
     }
 
     #[test]
+    fn update_ha_state_seeds_lease_for_active_group_without_watchdog() {
+        let coordinator = Coordinator::new();
+        let before = monotonic_nanos() / 1_000_000_000;
+
+        coordinator.update_ha_state(&[HAGroupStatus {
+            rg_id: 1,
+            active: true,
+            watchdog_timestamp: 0,
+        }]);
+
+        let after = monotonic_nanos() / 1_000_000_000;
+        let state = coordinator.ha_state.load();
+        let group = state.get(&1).expect("ha group");
+        assert!(group.active);
+        assert_eq!(group.watchdog_timestamp, 0);
+        assert!(group.lease_timestamp >= before);
+        assert!(group.lease_timestamp <= after);
+        assert!(group.is_forwarding_active(after));
+    }
+
+    #[test]
     fn set_demoting_owner_rgs_sets_bounded_lease_for_active_group() {
         let coordinator = Coordinator::new();
         coordinator.ha_state.store(Arc::new(BTreeMap::from([(
@@ -6773,6 +6813,7 @@ mod tests {
             HAGroupRuntime {
                 active: true,
                 watchdog_timestamp: 11,
+                lease_timestamp: 11,
                 demoting: false,
                 demoting_until_secs: 0,
             },
