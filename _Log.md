@@ -76,6 +76,10 @@
 
 ## 2026-04-02
 
+- **Timestamp**: 2026-04-02T18:05:00Z
+  - **Action**: Start `#400` — separate transfer readiness from takeover readiness in cluster status and explicit peer-failover admission, with daemon wiring for session-sync transfer-readiness reasons
+  - **File(s)**: pkg/cluster/cluster.go, pkg/cluster/cluster_test.go, pkg/daemon/daemon_ha.go, pkg/daemon/userspace_sync_test.go
+
 - **Timestamp**: 2026-04-02T17:20:00Z
   - **Action**: Start `#398` fix — add explicit session-sync transfer-readiness snapshot and fast-fail manual failover demotion when bulk receive or pending bulk ack proves the sync path is not settled; filed `#400` for exposing transfer readiness separately from takeover readiness
   - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_bulk.go, pkg/cluster/sync_test.go, pkg/daemon/daemon_ha.go, pkg/daemon/userspace_sync_test.go

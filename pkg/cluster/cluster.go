@@ -63,6 +63,12 @@ type RedundancyGroupState struct {
 	ReadySince       time.Time   // when Ready transitioned to true (zero if not ready)
 	ReadinessReasons []string    // reasons why not ready (empty when ready)
 	holdTimer        *time.Timer // fires at ReadySince+holdTime to re-trigger election
+
+	// Transfer readiness is the stricter explicit-manual-failover readiness.
+	// It intentionally stays separate from takeover readiness so operators can
+	// distinguish election readiness from transfer protocol readiness.
+	TransferReady            bool
+	TransferReadinessReasons []string
 }
 
 // IsReadyForTakeover returns true if the RG has been ready for at least
@@ -159,6 +165,9 @@ type Manager struct {
 	// The daemon uses this to pre-stage userspace continuity before
 	// weight/state changes let the peer take over.
 	preManualFailoverFn func(rgID int) error
+	// transferReadinessFn reports whether explicit manual failover can be
+	// attempted for the local RG right now and, if not, why.
+	transferReadinessFn func(rgID int) (bool, []string)
 	// Retry policy for transient pre-failover prepare failures.
 	preManualFailoverRetryTimeout  time.Duration
 	preManualFailoverRetryInterval time.Duration
@@ -560,8 +569,6 @@ func (m *Manager) recalcWeight(rg *RedundancyGroupState) {
 // GroupStates returns a snapshot of all redundancy group states.
 func (m *Manager) GroupStates() []RedundancyGroupState {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	states := make([]RedundancyGroupState, 0, len(m.groups))
 	for _, rg := range m.groups {
 		cp := *rg
@@ -575,6 +582,23 @@ func (m *Manager) GroupStates() []RedundancyGroupState {
 		}
 		states = append(states, cp)
 	}
+	fn := m.transferReadinessFn
+	m.mu.RUnlock()
+
+	if fn != nil {
+		for i := range states {
+			ready, reasons := fn(states[i].GroupID)
+			states[i].TransferReady = ready
+			if len(reasons) > 0 {
+				states[i].TransferReadinessReasons = append([]string(nil), reasons...)
+			}
+		}
+	} else {
+		for i := range states {
+			states[i].TransferReady = true
+		}
+	}
+
 	sort.Slice(states, func(i, j int) bool {
 		return states[i].GroupID < states[j].GroupID
 	})
@@ -584,9 +608,9 @@ func (m *Manager) GroupStates() []RedundancyGroupState {
 // GroupState returns the state for a specific redundancy group, or nil if not found.
 func (m *Manager) GroupState(rgID int) *RedundancyGroupState {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
 	rg, ok := m.groups[rgID]
 	if !ok {
+		m.mu.RUnlock()
 		return nil
 	}
 	cp := *rg
@@ -597,6 +621,16 @@ func (m *Manager) GroupState(rgID int) *RedundancyGroupState {
 	if len(rg.ReadinessReasons) > 0 {
 		cp.ReadinessReasons = make([]string, len(rg.ReadinessReasons))
 		copy(cp.ReadinessReasons, rg.ReadinessReasons)
+	}
+	fn := m.transferReadinessFn
+	m.mu.RUnlock()
+	if fn != nil {
+		cp.TransferReady, cp.TransferReadinessReasons = fn(rgID)
+		if len(cp.TransferReadinessReasons) > 0 {
+			cp.TransferReadinessReasons = append([]string(nil), cp.TransferReadinessReasons...)
+		}
+	} else {
+		cp.TransferReady = true
 	}
 	return &cp
 }
@@ -695,6 +729,14 @@ func (m *Manager) SetPreManualFailoverHook(fn func(rgID int) error) {
 	m.preManualFailoverFn = fn
 }
 
+// SetTransferReadinessFunc sets the callback used to report whether a local
+// redundancy group is ready for explicit transfer-based manual failover.
+func (m *Manager) SetTransferReadinessFunc(fn func(rgID int) (bool, []string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.transferReadinessFn = fn
+}
+
 // SetPeerFailoverFunc sets the callback used to send remote failover requests
 // to the peer via the fabric sync connection.
 func (m *Manager) SetPeerFailoverFunc(fn func(rgID int) (uint64, error)) {
@@ -771,6 +813,7 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 	}
 	fn := m.peerFailoverFn
 	commitFn := m.peerFailoverCommitFn
+	transferReadyFn := m.transferReadinessFn
 
 	// Clear local ManualFailover and restore weight so election can
 	// promote us once the peer transfers out.
@@ -785,6 +828,16 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 	}
 	if commitFn == nil {
 		return fmt.Errorf("peer failover commit not available (sync not connected)")
+	}
+	if transferReadyFn != nil {
+		ready, reasons := transferReadyFn(rgID)
+		if !ready {
+			return fmt.Errorf(
+				"local redundancy group %d not transfer-ready for explicit failover reasons=%v",
+				rgID,
+				append([]string(nil), reasons...),
+			)
+		}
 	}
 	reqID, err := fn(rgID)
 	if err != nil {
@@ -1459,11 +1512,19 @@ func (m *Manager) FormatStatus() string {
 				readyStr = "no (" + strings.Join(rg.ReadinessReasons, ", ") + ")"
 			}
 		}
+		transferReadyStr := "yes"
+		if !rg.TransferReady {
+			transferReadyStr = "no"
+			if len(rg.TransferReadinessReasons) > 0 {
+				transferReadyStr = "no (" + strings.Join(rg.TransferReadinessReasons, ", ") + ")"
+			}
+		}
 		// Local node line.
 		fmt.Fprintf(&b, "%-6s %-8d %-14s %-8s %-8s %s\n",
 			fmt.Sprintf("node%d", m.nodeID),
 			rg.LocalPriority, rg.State, preempt, manual, monFails)
 		fmt.Fprintf(&b, "  Takeover ready: %s\n", readyStr)
+		fmt.Fprintf(&b, "  Transfer ready: %s\n", transferReadyStr)
 		// Peer node line (if alive).
 		if peerAlive {
 			if pg, ok := peerGroups[rg.GroupID]; ok {
@@ -1561,6 +1622,15 @@ func (m *Manager) FormatInformation() string {
 				reasons = strings.Join(rg.ReadinessReasons, ", ")
 			}
 			fmt.Fprintf(&b, "  Takeover ready: no (%s)\n", reasons)
+		}
+		if rg.TransferReady {
+			fmt.Fprintf(&b, "  Transfer ready: yes\n")
+		} else {
+			reasons := "none"
+			if len(rg.TransferReadinessReasons) > 0 {
+				reasons = strings.Join(rg.TransferReadinessReasons, ", ")
+			}
+			fmt.Fprintf(&b, "  Transfer ready: no (%s)\n", reasons)
 		}
 		if len(rg.MonitorFails) > 0 {
 			fmt.Fprintf(&b, "  Monitor failures: %s\n", strings.Join(rg.MonitorFails, ", "))

@@ -163,6 +163,17 @@ func TestUserspaceManualFailoverTransferReadinessErrorBulkReceive(t *testing.T) 
 	}
 }
 
+func TestUserspaceTransferReadinessDisconnected(t *testing.T) {
+	d := &Daemon{}
+	ready, reasons := d.userspaceTransferReadiness(0)
+	if ready {
+		t.Fatal("expected disconnected transfer readiness to be false")
+	}
+	if len(reasons) != 1 || reasons[0] != "session sync disconnected" {
+		t.Fatalf("unexpected reasons: %v", reasons)
+	}
+}
+
 func TestUserspaceSessionFromDeltaV4CarriesTunnelEndpointMetadata(t *testing.T) {
 	zoneIDs := map[string]uint16{"lan": 1, "sfmix": 2}
 	delta := dpuserspace.SessionDeltaInfo{

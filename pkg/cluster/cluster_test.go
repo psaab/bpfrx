@@ -505,6 +505,50 @@ func TestRequestPeerFailoverRequiresLocalReadiness(t *testing.T) {
 	}
 }
 
+func TestRequestPeerFailoverRequiresLocalTransferReadiness(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+	m.mu.Lock()
+	m.groups[0].Ready = true
+	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+	m.groups[0].ReadinessReasons = nil
+	m.mu.Unlock()
+
+	called := false
+	m.SetTransferReadinessFunc(func(rgID int) (bool, []string) {
+		return false, []string{"local bulk receive still in progress epoch=7 sessions=128"}
+	})
+	m.SetPeerFailoverFunc(func(rgID int) (uint64, error) {
+		called = true
+		return 0, nil
+	})
+	m.SetPeerFailoverCommitFunc(func(rgID int, reqID uint64) error { return nil })
+
+	err := m.RequestPeerFailover(0)
+	if err == nil {
+		t.Fatal("expected local transfer readiness error")
+	}
+	if !strings.Contains(err.Error(), "not transfer-ready for explicit failover") {
+		t.Fatalf("RequestPeerFailover() error = %v", err)
+	}
+	if !strings.Contains(err.Error(), "local bulk receive still in progress epoch=7 sessions=128") {
+		t.Fatalf("RequestPeerFailover() error = %v", err)
+	}
+	if called {
+		t.Fatal("peer failover request should not be sent while transfer readiness is false")
+	}
+}
+
 func TestFinalizePeerTransferOutClearsSecondaryHold(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
@@ -567,6 +611,36 @@ func TestPeerTransferOutOverrideSurvivesHeartbeatRefreshUntilCommit(t *testing.T
 	}
 	if peer := m.PeerGroupStates()[0]; peer.State != StateSecondaryHold {
 		t.Fatalf("peer state = %s, want secondary-hold while transfer commit in flight", peer.State)
+	}
+}
+
+func TestFormatStatusShowsSeparateTransferReadiness(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+	m.mu.Lock()
+	m.groups[0].Ready = true
+	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+	m.groups[0].ReadinessReasons = nil
+	m.mu.Unlock()
+	m.SetTransferReadinessFunc(func(rgID int) (bool, []string) {
+		return false, []string{"peer still receiving outbound bulk epoch=7 age=25.7s"}
+	})
+
+	out := m.FormatStatus()
+	if !strings.Contains(out, "Takeover ready: yes") {
+		t.Fatalf("status missing takeover readiness: %s", out)
+	}
+	if !strings.Contains(out, "Transfer ready: no (peer still receiving outbound bulk epoch=7 age=25.7s)") {
+		t.Fatalf("status missing transfer readiness: %s", out)
 	}
 }
 

@@ -1078,6 +1078,20 @@ func userspaceManualFailoverTransferReadinessError(state cluster.TransferReadine
 	return nil
 }
 
+func (d *Daemon) userspaceTransferReadiness(rgID int) (bool, []string) {
+	if d.sessionSync == nil || !d.sessionSync.IsConnected() || !d.syncPeerConnected.Load() {
+		return false, []string{"session sync disconnected"}
+	}
+	state := d.sessionSync.TransferReadiness()
+	if state.ReadyForManualFailover() {
+		return true, nil
+	}
+	if reason := state.Reason(); reason != "" {
+		return false, []string{reason}
+	}
+	return true, nil
+}
+
 func (d *Daemon) prepareUserspaceManualFailover(rgID int) error {
 	return wrapUserspaceManualFailoverPrepareError(
 		d.prepareUserspaceRGDemotionWithTimeout(rgID, 15*time.Second),
@@ -1479,6 +1493,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			d.cluster.SetPeerFailoverFunc(d.sessionSync.SendFailover)
 			d.cluster.SetPeerFailoverCommitFunc(d.sessionSync.SendFailoverCommit)
 			d.cluster.SetPreManualFailoverHook(d.prepareUserspaceManualFailover)
+			d.cluster.SetTransferReadinessFunc(d.userspaceTransferReadiness)
 			d.cluster.SetPeerTimeoutGuard(d.shouldSuppressPeerHeartbeatTimeout)
 
 			// Wire peer fencing: on heartbeat timeout, cluster sends
