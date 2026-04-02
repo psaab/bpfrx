@@ -187,7 +187,6 @@ fn should_bypass_unseeded_tunnel_ha(
 
 pub(super) struct WorkerCommandResults {
     pub cancelled_keys: Vec<SessionKey>,
-    pub prepared_sequences: Vec<u64>,
     pub applied_sequences: Vec<u64>,
     pub exported_sequences: Vec<u64>,
 }
@@ -222,8 +221,8 @@ pub(super) fn apply_worker_commands(
     commands: &Arc<Mutex<VecDeque<WorkerCommand>>>,
     sessions: &mut SessionTable,
     session_map_fd: c_int,
-    conntrack_v4_fd: c_int,
-    conntrack_v6_fd: c_int,
+    _conntrack_v4_fd: c_int,
+    _conntrack_v6_fd: c_int,
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
@@ -236,7 +235,6 @@ pub(super) fn apply_worker_commands(
             if pending.is_empty() {
                 return WorkerCommandResults {
                     cancelled_keys: Vec::new(),
-                    prepared_sequences: Vec::new(),
                     applied_sequences: Vec::new(),
                     exported_sequences: Vec::new(),
                 };
@@ -246,7 +244,6 @@ pub(super) fn apply_worker_commands(
         Err(_) => {
             return WorkerCommandResults {
                 cancelled_keys: Vec::new(),
-                prepared_sequences: Vec::new(),
                 applied_sequences: Vec::new(),
                 exported_sequences: Vec::new(),
             };
@@ -255,7 +252,6 @@ pub(super) fn apply_worker_commands(
     let now_ns = monotonic_nanos();
     let now_secs = now_ns / 1_000_000_000;
     let mut cancelled_keys = Vec::new();
-    let mut prepared_sequences = Vec::new();
     let mut applied_sequences = Vec::new();
     let mut exported_sequences = Vec::new();
     for cmd in pending {
@@ -267,61 +263,57 @@ pub(super) fn apply_worker_commands(
                 export_forward_sessions_for_owner_rgs(sessions, &owner_rgs);
                 exported_sequences.push(sequence);
             }
-            WorkerCommand::PrepareDemoteOwnerRGs {
+            WorkerCommand::ApplyHAState {
                 sequence,
-                owner_rgs,
+                republish_owner_rgs,
+                demote_owner_rgs,
             } => {
-                // Flow cache invalidation is handled by epoch-based check in
-                // FlowCache::lookup() — no per-entry scan needed here.
-                cancelled_keys.extend(sessions.session_keys_for_owner_rgs(&owner_rgs));
-                refresh_live_reverse_sessions_for_owner_rgs(
-                    sessions,
-                    session_map_fd,
-                    forwarding,
-                    ha_state,
-                    dynamic_neighbors,
-                    &owner_rgs,
-                    now_ns,
-                    now_secs,
-                    true,
-                );
-                prepared_sequences.push(sequence);
-            }
-            WorkerCommand::DemoteOwnerRG(owner_rg_id) => {
-                eprintln!(
-                    "bpfrx-ha: DemoteOwnerRG {} worker sessions: total={}",
-                    owner_rg_id,
-                    sessions.len(),
-                );
-                refresh_live_reverse_sessions_for_owner_rgs(
-                    sessions,
-                    session_map_fd,
-                    forwarding,
-                    ha_state,
-                    dynamic_neighbors,
-                    &[owner_rg_id],
-                    now_ns,
-                    now_secs,
-                    true,
-                );
-                // Mark sessions as synced AND remove from the USERSPACE_SESSIONS
-                // BPF map so the XDP shim falls through to the eBPF pipeline.
-                // The eBPF pipeline checks rg_active and redirects via fabric.
-                let demoted = sessions.demote_owner_rg(owner_rg_id);
-                eprintln!(
-                    "bpfrx-ha: DemoteOwnerRG {} demoted_sessions={} remaining={}",
-                    owner_rg_id,
-                    demoted.len(),
-                    sessions.len(),
-                );
-                // Flow cache invalidation is handled by epoch-based check
-                // in FlowCache::lookup() — no per-entry scan needed here.
-                for key in &demoted {
-                    delete_live_session_key(session_map_fd, key);
+                let mut affected_owner_rgs = republish_owner_rgs.clone();
+                for rg_id in &demote_owner_rgs {
+                    if !affected_owner_rgs.contains(rg_id) {
+                        affected_owner_rgs.push(*rg_id);
+                    }
                 }
-                cancelled_keys.extend(demoted);
-            }
-            WorkerCommand::ApplyHAState { sequence } => {
+                if !affected_owner_rgs.is_empty() {
+                    // Flow cache invalidation is handled by epoch-based check
+                    // in FlowCache::lookup() — no per-entry scan needed here.
+                    cancelled_keys.extend(sessions.session_keys_for_owner_rgs(&affected_owner_rgs));
+                }
+                if !republish_owner_rgs.is_empty() || !demote_owner_rgs.is_empty() {
+                    refresh_live_reverse_sessions_for_owner_rgs(
+                        sessions,
+                        session_map_fd,
+                        forwarding,
+                        ha_state,
+                        dynamic_neighbors,
+                        &affected_owner_rgs,
+                        now_ns,
+                        now_secs,
+                        true,
+                    );
+                }
+                for owner_rg_id in demote_owner_rgs {
+                    eprintln!(
+                        "bpfrx-ha: DemoteOwnerRG {} worker sessions: total={}",
+                        owner_rg_id,
+                        sessions.len(),
+                    );
+                    // Mark sessions as synced AND remove from the
+                    // USERSPACE_SESSIONS BPF map so the XDP shim falls through
+                    // to the eBPF pipeline. The eBPF pipeline checks
+                    // rg_active and redirects via fabric.
+                    let demoted = sessions.demote_owner_rg(owner_rg_id);
+                    eprintln!(
+                        "bpfrx-ha: DemoteOwnerRG {} demoted_sessions={} remaining={}",
+                        owner_rg_id,
+                        demoted.len(),
+                        sessions.len(),
+                    );
+                    for key in &demoted {
+                        delete_live_session_key(session_map_fd, key);
+                    }
+                    cancelled_keys.extend(demoted);
+                }
                 applied_sequences.push(sequence);
             }
             WorkerCommand::UpsertSynced(mut entry) => {
@@ -424,7 +416,6 @@ pub(super) fn apply_worker_commands(
     }
     WorkerCommandResults {
         cancelled_keys,
-        prepared_sequences,
         applied_sequences,
         exported_sequences,
     }
@@ -2621,12 +2612,13 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::DemoteOwnerRG(1));
+            .push_back(WorkerCommand::ApplyHAState {
+                sequence: 3,
+                republish_owner_rgs: Vec::new(),
+                demote_owner_rgs: vec![1],
+            });
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let mut flow_cache = FlowCache::new();
-        let mut flow_caches = [&mut flow_cache];
-
         let results = apply_worker_commands(
             &commands,
             &mut sessions,
@@ -2638,8 +2630,9 @@ mod tests {
             &dynamic_neighbors,
         );
         assert_eq!(results.cancelled_keys, vec![key.clone()]);
+        assert_eq!(results.applied_sequences, vec![3]);
 
-        let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("demoted hit");
+        let _hit = sessions.lookup(&key, 2_000_000, 0x10).expect("demoted hit");
     }
 
     #[test]
@@ -2797,7 +2790,11 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::DemoteOwnerRG(1));
+            .push_back(WorkerCommand::ApplyHAState {
+                sequence: 5,
+                republish_owner_rgs: Vec::new(),
+                demote_owner_rgs: vec![1],
+            });
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         apply_worker_commands(
@@ -2811,7 +2808,7 @@ mod tests {
             &dynamic_neighbors,
         );
 
-        let hit = sessions
+        let _hit = sessions
             .lookup(&key, 2_000_000, 0x10)
             .expect("demoted reverse hit");
     }
@@ -2861,7 +2858,11 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::DemoteOwnerRG(1));
+            .push_back(WorkerCommand::ApplyHAState {
+                sequence: 6,
+                republish_owner_rgs: Vec::new(),
+                demote_owner_rgs: vec![1],
+            });
         let forwarding = test_forwarding_state_with_fabric();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
@@ -2930,7 +2931,11 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::DemoteOwnerRG(1));
+            .push_back(WorkerCommand::ApplyHAState {
+                sequence: 7,
+                republish_owner_rgs: Vec::new(),
+                demote_owner_rgs: vec![1],
+            });
         let forwarding = test_forwarding_state_with_fabric();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
@@ -3006,9 +3011,10 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::PrepareDemoteOwnerRGs {
+            .push_back(WorkerCommand::ApplyHAState {
                 sequence: 7,
-                owner_rgs: vec![1],
+                republish_owner_rgs: vec![1],
+                demote_owner_rgs: Vec::new(),
             });
         let forwarding = test_forwarding_state_with_fabric();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -3023,9 +3029,6 @@ mod tests {
                 demoting_until_secs: 0,
             },
         );
-        let mut flow_cache = FlowCache::new();
-        let mut flow_caches = [&mut flow_cache];
-
         let results = apply_worker_commands(
             &commands,
             &mut sessions,
@@ -3038,7 +3041,7 @@ mod tests {
         );
 
         assert_eq!(results.cancelled_keys, vec![key.clone()]);
-        assert_eq!(results.prepared_sequences, vec![7]);
+        assert_eq!(results.applied_sequences, vec![7]);
         let hit = sessions
             .lookup(&key, 2_000_000, 0x10)
             .expect("prepared forward hit");
@@ -3098,9 +3101,6 @@ mod tests {
                 demoting_until_secs: 0,
             },
         );
-        let mut flow_cache = FlowCache::new();
-        let mut flow_caches = [&mut flow_cache];
-
         let results = apply_worker_commands(
             &commands,
             &mut sessions,
@@ -3113,7 +3113,6 @@ mod tests {
         );
 
         assert!(results.cancelled_keys.is_empty());
-        assert!(results.prepared_sequences.is_empty());
         assert_eq!(results.exported_sequences, vec![9]);
         let hit = sessions
             .lookup(&key, 2_000_000, 0x10)
@@ -3136,7 +3135,11 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::ApplyHAState { sequence: 7 });
+            .push_back(WorkerCommand::ApplyHAState {
+                sequence: 7,
+                republish_owner_rgs: Vec::new(),
+                demote_owner_rgs: Vec::new(),
+            });
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let ha_state = BTreeMap::new();
@@ -3153,7 +3156,6 @@ mod tests {
         );
 
         assert_eq!(results.applied_sequences, vec![7]);
-        assert!(results.prepared_sequences.is_empty());
         assert!(results.exported_sequences.is_empty());
     }
 

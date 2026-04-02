@@ -236,7 +236,6 @@ pub struct Coordinator {
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
-    demotion_prepare_seq: AtomicU64,
     ha_state_apply_seq: AtomicU64,
     session_export_seq: AtomicU64,
     forwarding: ForwardingState,
@@ -285,7 +284,6 @@ impl Coordinator {
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
-            demotion_prepare_seq: AtomicU64::new(0),
             ha_state_apply_seq: AtomicU64::new(0),
             session_export_seq: AtomicU64::new(0),
             forwarding: ForwardingState::default(),
@@ -777,7 +775,6 @@ impl Coordinator {
             let plan_count = binding_plans.len();
             let stop = Arc::new(AtomicBool::new(false));
             let heartbeat = Arc::new(AtomicU64::new(monotonic_nanos()));
-            let demotion_prepare_ack = Arc::new(AtomicU64::new(0));
             let ha_state_apply_ack = Arc::new(AtomicU64::new(0));
             let session_export_ack = Arc::new(AtomicU64::new(0));
             let commands = worker_command_queues
@@ -796,7 +793,6 @@ impl Coordinator {
             let shared_forward_wire_sessions = self.shared_forward_wire_sessions.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
-            let demotion_prepare_ack_clone = demotion_prepare_ack.clone();
             let ha_state_apply_ack_clone = ha_state_apply_ack.clone();
             let session_export_ack_clone = session_export_ack.clone();
             let commands_clone = commands.clone();
@@ -833,7 +829,6 @@ impl Coordinator {
                         peer_commands_clone,
                         stop_clone,
                         heartbeat_clone,
-                        demotion_prepare_ack_clone,
                         ha_state_apply_ack_clone,
                         session_export_ack_clone,
                         worker_poll_mode,
@@ -855,7 +850,6 @@ impl Coordinator {
                             stop,
                             heartbeat,
                             commands,
-                            demotion_prepare_ack,
                             ha_state_apply_ack,
                             session_export_ack,
                             join: Some(join),
@@ -1191,13 +1185,7 @@ impl Coordinator {
                     self.rg_epochs[idx].fetch_add(1, Ordering::Release);
                 }
             }
-            for handle in self.workers.values() {
-                if let Ok(mut pending) = handle.commands.lock() {
-                    for rg_id in &demoted_rgs {
-                        pending.push_back(WorkerCommand::DemoteOwnerRG(*rg_id));
-                    }
-                }
-            }
+            self.enqueue_apply_ha_state(&demoted_rgs, &demoted_rgs)?;
             // Record cache flush timestamp for observability (#312).
             self.last_cache_flush_at.store(now_secs, Ordering::Relaxed);
         }
@@ -1232,42 +1220,55 @@ impl Coordinator {
                 &activated_rgs,
                 now_secs,
             );
-            if !self.workers.is_empty() {
-                let sequence = self
-                    .ha_state_apply_seq
-                    .fetch_add(1, Ordering::Relaxed)
-                    .saturating_add(1);
-                for handle in self.workers.values() {
-                    let mut pending = handle
-                        .commands
-                        .lock()
-                        .map_err(|_| "worker command queue poisoned".to_string())?;
-                    // Queue the apply barrier after any reverse-prewarm upserts
-                    // pushed above. Acking this sequence means the worker has
-                    // applied the current HA generation and the activation-time
-                    // helper work for it.
-                    pending.push_back(WorkerCommand::ApplyHAState { sequence });
-                }
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
-                loop {
-                    if self
-                        .workers
-                        .values()
-                        .all(|handle| handle.ha_state_apply_ack.load(Ordering::Acquire) >= sequence)
-                    {
-                        break;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        return Err(format!(
-                            "ha state apply seq={} timed out waiting for worker acks",
-                            sequence
-                        ));
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
+            self.enqueue_apply_ha_state(&[], &[])?;
         }
         Ok(())
+    }
+
+    fn enqueue_apply_ha_state(
+        &self,
+        republish_owner_rgs: &[i32],
+        demote_owner_rgs: &[i32],
+    ) -> Result<(), String> {
+        if self.workers.is_empty() {
+            return Ok(());
+        }
+        let sequence = self
+            .ha_state_apply_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        for handle in self.workers.values() {
+            let mut pending = handle
+                .commands
+                .lock()
+                .map_err(|_| "worker command queue poisoned".to_string())?;
+            pending.push_back(WorkerCommand::ApplyHAState {
+                sequence,
+                republish_owner_rgs: republish_owner_rgs.to_vec(),
+                demote_owner_rgs: demote_owner_rgs.to_vec(),
+            });
+        }
+        self.wait_for_ha_state_apply(sequence, Duration::from_secs(2))
+    }
+
+    fn wait_for_ha_state_apply(&self, sequence: u64, timeout: Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self
+                .workers
+                .values()
+                .all(|handle| handle.ha_state_apply_ack.load(Ordering::Acquire) >= sequence)
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "ha state apply seq={} timed out waiting for worker acks",
+                    sequence
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn set_demoting_owner_rgs(&self, owner_rgs: &[i32], demoting: bool) {
@@ -1304,37 +1305,14 @@ impl Coordinator {
             return Ok(());
         }
         self.set_demoting_owner_rgs(owner_rgs, true);
-        let sequence = self
-            .demotion_prepare_seq
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        for handle in self.workers.values() {
-            let mut pending = handle
-                .commands
-                .lock()
-                .map_err(|_| "worker command queue poisoned".to_string())?;
-            pending.push_back(WorkerCommand::PrepareDemoteOwnerRGs {
-                sequence,
-                owner_rgs: owner_rgs.to_vec(),
-            });
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            if self
-                .workers
-                .values()
-                .all(|handle| handle.demotion_prepare_ack.load(Ordering::Acquire) >= sequence)
-            {
-                return Ok(());
+        if let Err(err) = self.enqueue_apply_ha_state(owner_rgs, &[]) {
+            self.set_demoting_owner_rgs(owner_rgs, false);
+            if err.contains("ha state apply seq=") {
+                return Err(err.replace("ha state apply", "demotion prepare"));
             }
-            if std::time::Instant::now() >= deadline {
-                self.set_demoting_owner_rgs(owner_rgs, false);
-                return Err(format!(
-                    "timed out waiting for demotion prepare ack seq={sequence}"
-                ));
-            }
-            thread::sleep(Duration::from_millis(5));
+            return Err(err);
         }
+        Ok(())
     }
 
     /// Explicitly clear a stale demotion mark that was set by
@@ -5347,7 +5325,6 @@ fn worker_loop(
     peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
-    demotion_prepare_ack: Arc<AtomicU64>,
     ha_state_apply_ack: Arc<AtomicU64>,
     session_export_ack: Arc<AtomicU64>,
     poll_mode: crate::PollMode,
@@ -5551,7 +5528,6 @@ fn worker_loop(
         } else {
             WorkerCommandResults {
                 cancelled_keys: Vec::new(),
-                prepared_sequences: Vec::new(),
                 applied_sequences: Vec::new(),
                 exported_sequences: Vec::new(),
             }
@@ -5711,15 +5687,10 @@ fn worker_loop(
         if !bindings.is_empty() {
             poll_start = (poll_start + 1) % bindings.len();
         }
-        if let Some(sequence) = command_results.prepared_sequences.iter().copied().max() {
-            // Demotion prepare only needs local worker state to be updated. Do
-            // not block the ack on unrelated steady-state delta churn.
-            demotion_prepare_ack.store(sequence, Ordering::Release);
-        }
         if let Some(sequence) = command_results.applied_sequences.iter().copied().max() {
             ha_state_apply_ack.store(sequence, Ordering::Release);
         }
-        if !command_results.prepared_sequences.is_empty()
+        if !command_results.applied_sequences.is_empty()
             || !command_results.exported_sequences.is_empty()
         {
             while sessions.has_pending_deltas() {
