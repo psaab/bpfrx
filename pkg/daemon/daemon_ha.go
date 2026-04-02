@@ -1439,22 +1439,23 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				d.onSessionSyncPeerDisconnected()
 			}
 
-			// Wire remote failover: when peer requests us to give up primary.
+			// Wire remote failover: when the peer requests us to transfer an RG
+			// out of primary and explicitly acknowledge the result.
 			// Guard: only honor the request if we are actually primary for
 			// this RG. Stale/delayed sync messages can arrive after we've
 			// already transitioned to secondary — blindly calling
 			// ManualFailover would cause dual-resign (both nodes secondary)
 			// and a 30-second traffic blackhole.
-			d.sessionSync.OnRemoteFailover = func(rgID int) {
+			d.sessionSync.OnRemoteFailover = func(rgID int) error {
 				if !d.cluster.IsLocalPrimary(rgID) {
-					slog.Warn("cluster: ignoring remote failover request (not primary)",
-						"rg", rgID)
-					return
+					return fmt.Errorf("not primary for redundancy group %d", rgID)
 				}
 				slog.Info("cluster: remote failover request from peer", "rg", rgID)
 				if err := d.cluster.ManualFailover(rgID); err != nil {
 					slog.Warn("cluster: remote failover failed", "rg", rgID, "err", err)
+					return err
 				}
+				return nil
 			}
 
 			// Wire peer failover sender so cluster Manager can send remote
