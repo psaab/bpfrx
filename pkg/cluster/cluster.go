@@ -154,6 +154,8 @@ type Manager struct {
 	// Retry policy for transient pre-failover prepare failures.
 	preManualFailoverRetryTimeout  time.Duration
 	preManualFailoverRetryInterval time.Duration
+	peerFailoverWaitTimeout        time.Duration
+	peerFailoverPollInterval       time.Duration
 
 	// peerFencing holds the configured fencing action (e.g. "disable-rg").
 	peerFencing string
@@ -182,6 +184,8 @@ type Manager struct {
 const DefaultTakeoverHoldTime = 3 * time.Second
 const DefaultPreManualFailoverRetryTimeout = 45 * time.Second
 const DefaultPreManualFailoverRetryInterval = 500 * time.Millisecond
+const DefaultPeerFailoverWaitTimeout = 10 * time.Second
+const DefaultPeerFailoverPollInterval = 50 * time.Millisecond
 
 // NewManager creates a new cluster manager.
 func NewManager(nodeID, clusterID int) *Manager {
@@ -199,6 +203,8 @@ func NewManager(nodeID, clusterID int) *Manager {
 		takeoverHoldTime:               DefaultTakeoverHoldTime,
 		preManualFailoverRetryTimeout:  DefaultPreManualFailoverRetryTimeout,
 		preManualFailoverRetryInterval: DefaultPreManualFailoverRetryInterval,
+		peerFailoverWaitTimeout:        DefaultPeerFailoverWaitTimeout,
+		peerFailoverPollInterval:       DefaultPeerFailoverPollInterval,
 	}
 }
 
@@ -739,19 +745,78 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 		return fmt.Errorf("peer not alive — cannot request failover")
 	}
 	fn := m.peerFailoverFn
+	waitTimeout := m.peerFailoverWaitTimeout
+	pollInterval := m.peerFailoverPollInterval
 
 	// Clear local ManualFailover and restore weight so election can
-	// promote us once the peer resigns.
+	// promote us once the peer transfers out.
 	if rg.ManualFailover {
 		rg.ManualFailover = false
-		m.recalcWeight(rg) // restores weight from 0, runs election
+		m.recalcWeight(rg)
 	}
 	m.mu.Unlock()
 
 	if fn == nil {
 		return fmt.Errorf("peer failover not available (sync not connected)")
 	}
-	return fn(rgID)
+	if err := fn(rgID); err != nil {
+		return err
+	}
+	if waitTimeout <= 0 {
+		waitTimeout = DefaultPeerFailoverWaitTimeout
+	}
+	if pollInterval <= 0 {
+		pollInterval = DefaultPeerFailoverPollInterval
+	}
+	return m.waitForPrimaryAfterPeerFailover(rgID, waitTimeout, pollInterval)
+}
+
+func (m *Manager) waitForPrimaryAfterPeerFailover(rgID int, timeout, pollInterval time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		m.mu.RLock()
+		rg, ok := m.groups[rgID]
+		peerGroup, peerSeen := m.peerGroups[rgID]
+		peerAlive := m.peerAlive
+		var localState NodeState
+		var ready bool
+		var readySince time.Time
+		var reasons []string
+		if ok {
+			localState = rg.State
+			ready = rg.Ready
+			readySince = rg.ReadySince
+			reasons = append([]string(nil), rg.ReadinessReasons...)
+		}
+		m.mu.RUnlock()
+
+		if !ok {
+			return fmt.Errorf("redundancy group %d not found", rgID)
+		}
+		if localState == StatePrimary {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			peerState := "<unknown>"
+			if peerSeen {
+				peerState = peerGroup.State.String()
+			}
+			return fmt.Errorf(
+				"timed out waiting for redundancy group %d to become primary local_state=%s peer_alive=%t peer_state=%s ready=%t ready_since=%s reasons=%v",
+				rgID,
+				localState,
+				peerAlive,
+				peerState,
+				ready,
+				readySince.Format(time.RFC3339Nano),
+				reasons,
+			)
+		}
+		<-ticker.C
+	}
 }
 
 // ForceSecondary sets weight to 0 for all redundancy groups, forcing this node

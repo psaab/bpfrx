@@ -418,6 +418,75 @@ func TestManualFailover_UnknownRG(t *testing.T) {
 	}
 }
 
+func TestRequestPeerFailoverWaitsForLocalPrimary(t *testing.T) {
+	m := NewManager(0, 1)
+	m.peerFailoverWaitTimeout = 200 * time.Millisecond
+	m.peerFailoverPollInterval = 5 * time.Millisecond
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+
+	if m.IsLocalPrimary(0) {
+		t.Fatal("test setup error: should be secondary before peer failover")
+	}
+
+	m.SetPeerFailoverFunc(func(rgID int) error {
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			m.handlePeerHeartbeat(&HeartbeatPacket{
+				NodeID:    1,
+				ClusterID: 1,
+				Groups: []HeartbeatGroup{
+					{GroupID: uint8(rgID), Priority: 200, Weight: 255, State: uint8(StateSecondaryHold)},
+				},
+			})
+		}()
+		return nil
+	})
+
+	if err := m.RequestPeerFailover(0); err != nil {
+		t.Fatalf("RequestPeerFailover() error = %v", err)
+	}
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("should be primary after peer transfer-out is observed")
+	}
+}
+
+func TestRequestPeerFailoverTimesOutWithoutPromotion(t *testing.T) {
+	m := NewManager(0, 1)
+	m.peerFailoverWaitTimeout = 30 * time.Millisecond
+	m.peerFailoverPollInterval = 5 * time.Millisecond
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+
+	m.SetPeerFailoverFunc(func(rgID int) error { return nil })
+
+	err := m.RequestPeerFailover(0)
+	if err == nil {
+		t.Fatal("expected timeout waiting for local primary")
+	}
+	if !strings.Contains(err.Error(), "timed out waiting for redundancy group 0 to become primary") {
+		t.Fatalf("RequestPeerFailover() error = %v", err)
+	}
+}
+
 func TestResetFailover(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
