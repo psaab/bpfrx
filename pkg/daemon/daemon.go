@@ -4125,6 +4125,9 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		}
 	}()
 	if d.sessionSync == nil || !d.sessionSync.IsConnected() {
+		// Release suppression window so a reconnect + retry can re-run
+		// the barrier check before the actual demotion proceeds.
+		d.releaseUserspaceRGDemotionPrep(rgID)
 		success = true
 		return nil
 	}
@@ -4160,7 +4163,7 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		return fmt.Errorf("demotion peer barrier failed: %w", err)
 	}
 	success = true
-	slog.Info("userspace: prepared rg demotion", "rg", rgID)
+	slog.Info("userspace: peer barrier ready for rg demotion", "rg", rgID)
 	return nil
 }
 
