@@ -418,7 +418,7 @@ pub(super) fn apply_worker_commands(
     }
     // Deduplicate: refresh and demote paths may both collect the same key.
     {
-        let mut seen = std::collections::HashSet::with_capacity(cancelled_keys.len());
+        let mut seen = super::FastSet::with_capacity_and_hasher(cancelled_keys.len(), Default::default());
         cancelled_keys.retain(|k| seen.insert(k.clone()));
     }
     WorkerCommandResults {
