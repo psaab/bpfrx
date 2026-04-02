@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -43,7 +44,9 @@ type Manager struct {
 	PersistentNAT      *PersistentNATTable
 	EnableCPUMap       bool // Enable cpumap multi-CPU distribution (adds startup overhead)
 	XDPEntryProg       string
-	VlanSubInterfaces  map[int]bool // VLAN sub-interface ifindexes (skip XDP swap for these)
+	VlanSubInterfaces      map[int]bool       // VLAN sub-interface ifindexes (skip XDP swap for these)
+	mu                     sync.Mutex         // protects userspaceCounterOffsets
+	userspaceCounterOffsets map[uint32]uint64  // userspace counter deltas merged in ReadGlobalCounter
 }
 
 // New creates a new dataplane Manager.

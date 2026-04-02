@@ -868,6 +868,10 @@ func (m *Manager) ReadGlobalCounter(index uint32) (uint64, error) {
 	for _, v := range perCPU {
 		total += v
 	}
+	// Add userspace counter offsets (stored separately to avoid per-CPU race).
+	m.mu.Lock()
+	total += m.userspaceCounterOffsets[index]
+	m.mu.Unlock()
 	return total, nil
 }
 
@@ -878,21 +882,15 @@ func (m *Manager) IncrementGlobalCounter(index uint32, delta uint64) error {
 	if delta == 0 {
 		return nil
 	}
-	zm, ok := m.maps["global_counters"]
-	if !ok {
-		return fmt.Errorf("global_counters map not found")
+	// Store delta in the userspace counter offset map instead of writing
+	// directly to the per-CPU BPF array. ReadGlobalCounter merges both.
+	// This avoids the read-modify-write race with concurrent eBPF increments.
+	m.mu.Lock()
+	if m.userspaceCounterOffsets == nil {
+		m.userspaceCounterOffsets = make(map[uint32]uint64)
 	}
-	var perCPU []uint64
-	if err := zm.Lookup(index, &perCPU); err != nil {
-		return fmt.Errorf("read global counter %d: %w", index, err)
-	}
-	if len(perCPU) == 0 {
-		return fmt.Errorf("empty per-CPU slice for global counter %d", index)
-	}
-	perCPU[0] += delta
-	if err := zm.Update(index, perCPU, ebpf.UpdateAny); err != nil {
-		return fmt.Errorf("update global counter %d: %w", index, err)
-	}
+	m.userspaceCounterOffsets[index] += delta
+	m.mu.Unlock()
 	return nil
 }
 

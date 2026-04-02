@@ -717,7 +717,7 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
 ) {
     let now_secs = now_ns / 1_000_000_000;
 
-    sessions.iter_with_idle(now_ns, |key, _decision, metadata, _idle_ns| {
+    sessions.iter_with_idle(now_ns, |key, _decision, metadata, idle_ns| {
         // Only refresh forward entries — reverse entries mirror the forward.
         if metadata.is_reverse {
             return;
@@ -741,13 +741,15 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
                     )
                 };
                 if rc == 0 {
-                    value.last_seen = now_secs;
+                    // Compute last_seen from session's actual idle, not now.
+                    let actual_last_seen = now_secs.saturating_sub(idle_ns / 1_000_000_000);
+                    value.last_seen = actual_last_seen;
                     let _ = unsafe {
                         libbpf_sys::bpf_map_update_elem(
                             conntrack_v4_fd,
                             (&bpf_key as *const BpfSessionKeyV4).cast::<c_void>(),
                             (&value as *const BpfSessionValueV4).cast::<c_void>(),
-                            0, // BPF_ANY
+                            libbpf_sys::BPF_EXIST as u64, // avoid recreating deleted entries
                         )
                     };
                 }
@@ -770,13 +772,14 @@ pub(super) fn refresh_bpf_conntrack_last_seen(
                     )
                 };
                 if rc == 0 {
-                    value.last_seen = now_secs;
+                    let actual_last_seen = now_secs.saturating_sub(idle_ns / 1_000_000_000);
+                    value.last_seen = actual_last_seen;
                     let _ = unsafe {
                         libbpf_sys::bpf_map_update_elem(
                             conntrack_v6_fd,
                             (&bpf_key as *const BpfSessionKeyV6).cast::<c_void>(),
                             (&value as *const BpfSessionValueV6).cast::<c_void>(),
-                            0, // BPF_ANY
+                            libbpf_sys::BPF_EXIST as u64,
                         )
                     };
                 }

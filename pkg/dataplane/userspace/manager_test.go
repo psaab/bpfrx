@@ -2029,9 +2029,9 @@ func TestSafeDelta(t *testing.T) {
 	if d := safeDelta(50, 50); d != 0 {
 		t.Fatalf("safeDelta(50, 50) = %d, want 0", d)
 	}
-	// Counter reset (prev > cur) — clamp to zero
-	if d := safeDelta(10, 100); d != 0 {
-		t.Fatalf("safeDelta(10, 100) = %d, want 0", d)
+	// Counter reset (prev > cur) — return cur as delta
+	if d := safeDelta(10, 100); d != 10 {
+		t.Fatalf("safeDelta(10, 100) = %d, want 10 (counter reset)", d)
 	}
 	// First poll (prev=0)
 	if d := safeDelta(42, 0); d != 42 {

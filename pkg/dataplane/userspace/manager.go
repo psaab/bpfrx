@@ -3312,7 +3312,7 @@ ctrlReady:
 					if cutoffSec > 0 {
 						if err := ctMap.Lookup(key, val); err == nil && len(val) >= 24 {
 							created := binary.NativeEndian.Uint64(val[16:24])
-							if created > 0 && created < cutoffSec {
+							if created > 0 && created <= cutoffSec {
 								kept++
 								continue // synced session — keep it
 							}
@@ -3501,6 +3501,7 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 	}
 
 	deltas := []counterDelta{
+		{dataplane.GlobalCtrRxPackets, safeDelta(cur.rxPackets, prev.rxPackets)},
 		{dataplane.GlobalCtrTxPackets, safeDelta(cur.txPackets, prev.txPackets)},
 		{dataplane.GlobalCtrSessionsNew, safeDelta(cur.sessionCreates, prev.sessionCreates)},
 		{dataplane.GlobalCtrSessionsClosed, safeDelta(cur.sessionExpires, prev.sessionExpires)},
@@ -3519,10 +3520,11 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 	}
 }
 
-// safeDelta returns cur - prev, clamped to zero if prev > cur (counter reset).
+// safeDelta returns cur - prev. On counter reset (prev > cur), returns cur
+// as the delta so counters don't undercount after helper restarts.
 func safeDelta(cur, prev uint64) uint64 {
-	if cur <= prev {
-		return 0
+	if cur < prev {
+		return cur // counter reset: treat current cumulative as delta
 	}
 	return cur - prev
 }
