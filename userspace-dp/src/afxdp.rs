@@ -182,8 +182,6 @@ const BIND_RETRY_ATTEMPTS: usize = 20;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_SLOW_PATH_TUN: &str = "bpfrx-usp0";
 const LOCAL_TUNNEL_DELIVERY_QUEUE_DEPTH: usize = 4096;
-const HA_DEMOTION_PREP_LEASE_SECS: u64 = 5;
-
 const HA_WATCHDOG_STALE_AFTER_SECS: u64 = 10;
 const FABRIC_ZONE_MAC_MAGIC: u8 = 0xfe;
 const PROTO_TCP: u8 = 6;
@@ -1071,14 +1069,10 @@ impl Coordinator {
         let mut state = BTreeMap::new();
         for group in groups {
             // Treat every active HA state update as a lease refresh. Packet-time
-            // HA now consults a single applied lease state: active-until,
-            // suppressed-until, or inactive.
+            // HA now consults a single applied lease state: active-until
+            // or inactive.
             let lease = if group.active {
-                match previous.as_ref().get(&group.rg_id).map(|runtime| runtime.lease) {
-                    Some(HAForwardingLease::SuppressedUntil(until))
-                        if until != 0 && now_secs <= until => HAForwardingLease::SuppressedUntil(until),
-                    _ => HAGroupRuntime::active_lease_until(group.watchdog_timestamp, now_secs),
-                }
+                HAGroupRuntime::active_lease_until(group.watchdog_timestamp, now_secs)
             } else {
                 HAForwardingLease::Inactive
             };
@@ -1251,64 +1245,6 @@ impl Coordinator {
         }
     }
 
-    fn set_demoting_owner_rgs(&self, owner_rgs: &[i32], demoting: bool) {
-        if owner_rgs.is_empty() {
-            return;
-        }
-        let previous = self.ha_state.load();
-        let mut state = previous.as_ref().clone();
-        let mut changed = false;
-        let now_secs = monotonic_nanos() / 1_000_000_000;
-        for rg_id in owner_rgs {
-            if let Some(runtime) = state.get_mut(rg_id) {
-                let next_lease = if !runtime.active {
-                    HAForwardingLease::Inactive
-                } else if demoting {
-                    HAForwardingLease::SuppressedUntil(now_secs.saturating_add(HA_DEMOTION_PREP_LEASE_SECS))
-                } else {
-                    HAGroupRuntime::active_lease_until(runtime.watchdog_timestamp, now_secs)
-                };
-                if runtime.lease != next_lease {
-                    runtime.lease = next_lease;
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            self.ha_state.store(Arc::new(state));
-        }
-    }
-
-    pub fn prepare_ha_demotion(&self, owner_rgs: &[i32]) -> Result<(), String> {
-        if owner_rgs.is_empty() {
-            return Ok(());
-        }
-        self.set_demoting_owner_rgs(owner_rgs, true);
-        if let Err(err) = self.enqueue_apply_ha_state(owner_rgs, &[]) {
-            self.set_demoting_owner_rgs(owner_rgs, false);
-            if err.contains("ha state apply seq=") {
-                return Err(err.replace("ha state apply", "demotion prepare"));
-            }
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    /// Explicitly clear a stale demotion mark that was set by
-    /// `prepare_ha_demotion` but never completed (e.g. Go-side timeout).
-    /// The auto-expiry lease will eventually clear it, but this provides
-    /// immediate cleanup so the helper stops treating the RG as demoting.
-    pub fn clear_ha_demotion(&self, owner_rgs: &[i32]) {
-        if owner_rgs.is_empty() {
-            return;
-        }
-        self.set_demoting_owner_rgs(owner_rgs, false);
-        eprintln!(
-            "bpfrx-ha: cleared stale demotion mark for RGs {:?}",
-            owner_rgs
-        );
-    }
-
     pub fn export_owner_rg_sessions(
         &self,
         owner_rgs: &[i32],
@@ -1370,9 +1306,6 @@ impl Coordinator {
                 let (lease_state, lease_until) = match runtime.lease {
                     HAForwardingLease::Inactive => ("inactive".to_string(), 0),
                     HAForwardingLease::ActiveUntil(until) => ("active".to_string(), until),
-                    HAForwardingLease::SuppressedUntil(until) => {
-                        ("suppressed".to_string(), until)
-                    }
                 };
                 HAGroupStatus {
                     rg_id: *rg_id,
@@ -6304,14 +6237,6 @@ mod tests {
         }
     }
 
-    fn suppressed_ha_runtime(watchdog_timestamp: u64, until_secs: u64) -> HAGroupRuntime {
-        HAGroupRuntime {
-            active: true,
-            watchdog_timestamp,
-            lease: HAForwardingLease::SuppressedUntil(until_secs),
-        }
-    }
-
     #[test]
     fn mlx5_keeps_umem_owner_bind_strategy() {
         assert_eq!(
@@ -6647,31 +6572,6 @@ mod tests {
     }
 
     #[test]
-    fn update_ha_state_clears_expired_demoting_lease_for_active_group() {
-        let coordinator = Coordinator::new();
-        let now_secs = monotonic_nanos() / 1_000_000_000;
-        coordinator.ha_state.store(Arc::new(BTreeMap::from([(
-            1,
-            suppressed_ha_runtime(11, now_secs.saturating_sub(1)),
-        )])));
-
-        coordinator
-            .update_ha_state(&[HAGroupStatus {
-                rg_id: 1,
-                active: true,
-                watchdog_timestamp: 22,
-                ..HAGroupStatus::default()
-            }])
-            .expect("update ha state");
-
-        let state = coordinator.ha_state.load();
-        let group = state.get(&1).expect("ha group");
-        assert!(group.active);
-        assert_eq!(group.watchdog_timestamp, 22);
-        assert!(matches!(group.lease, HAForwardingLease::ActiveUntil(until) if until >= 24));
-    }
-
-    #[test]
     fn update_ha_state_seeds_lease_for_active_group_without_watchdog() {
         let coordinator = Coordinator::new();
         let before = monotonic_nanos() / 1_000_000_000;
@@ -6699,36 +6599,12 @@ mod tests {
     }
 
     #[test]
-    fn set_demoting_owner_rgs_sets_bounded_lease_for_active_group() {
-        let coordinator = Coordinator::new();
-        coordinator.ha_state.store(Arc::new(BTreeMap::from([(
-            1,
-            active_ha_runtime(11),
-        )])));
-
-        let before = monotonic_nanos() / 1_000_000_000;
-        coordinator.set_demoting_owner_rgs(&[1], true);
-        let after = monotonic_nanos() / 1_000_000_000;
-
-        let state = coordinator.ha_state.load();
-        let group = state.get(&1).expect("ha group");
-        assert!(matches!(group.lease, HAForwardingLease::SuppressedUntil(until)
-            if until >= before + 1 && until <= after + HA_DEMOTION_PREP_LEASE_SECS));
-
-        coordinator.set_demoting_owner_rgs(&[1], false);
-        let state = coordinator.ha_state.load();
-        let group = state.get(&1).expect("ha group");
-        assert!(matches!(group.lease, HAForwardingLease::ActiveUntil(_)));
-    }
-
-    #[test]
     fn ha_groups_reports_forwarding_lease_status() {
         let coordinator = Coordinator::new();
         let now_secs = monotonic_nanos() / 1_000_000_000;
         coordinator.ha_state.store(Arc::new(BTreeMap::from([
             (1, active_ha_runtime(now_secs)),
-            (2, suppressed_ha_runtime(now_secs, now_secs + 5)),
-            (3, inactive_ha_runtime(0)),
+            (2, inactive_ha_runtime(0)),
         ])));
 
         let groups = coordinator.ha_groups();
@@ -6742,13 +6618,6 @@ mod tests {
         }));
         assert!(groups.iter().any(|group| {
             group.rg_id == 2
-                && group.active
-                && !group.forwarding_active
-                && group.lease_state == "suppressed"
-                && group.lease_until >= now_secs + 1
-        }));
-        assert!(groups.iter().any(|group| {
-            group.rg_id == 3
                 && !group.active
                 && !group.forwarding_active
                 && group.lease_state == "inactive"
