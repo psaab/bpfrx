@@ -217,6 +217,46 @@ func (m *Manager) desiredForwardingArmedLocked() bool {
 	return false
 }
 
+// TakeoverReady reports whether the userspace dataplane is already in a state
+// where an HA ownership move can rely on it for forwarding immediately.
+// This intentionally rejects "startup-like" states so HA cutover does not
+// begin queue bring-up work during UpdateRGActive().
+func (m *Manager) TakeoverReady() (bool, []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.takeoverReadyLocked()
+}
+
+func (m *Manager) takeoverReadyLocked() (bool, []string) {
+	var reasons []string
+	if m.proc == nil || m.proc.Process == nil {
+		reasons = append(reasons, "userspace helper not running")
+	}
+	if !m.lastStatus.Enabled {
+		reasons = append(reasons, "userspace helper not enabled")
+	}
+	if !m.lastStatus.Capabilities.ForwardingSupported {
+		if len(m.lastStatus.Capabilities.UnsupportedReasons) > 0 {
+			reasons = append(reasons, m.lastStatus.Capabilities.UnsupportedReasons...)
+		} else {
+			reasons = append(reasons, "userspace forwarding unsupported")
+		}
+	}
+	if !m.lastStatus.ForwardingArmed {
+		reasons = append(reasons, "userspace forwarding not armed")
+	}
+	if m.mode == ModeEBPFOnly {
+		reasons = append(reasons, "userspace dataplane not active")
+	}
+	if m.xskLivenessFailed {
+		reasons = append(reasons, "userspace XSK liveness failed")
+	}
+	if !m.xskLivenessProven {
+		reasons = append(reasons, "userspace XSK liveness not proven")
+	}
+	return len(reasons) == 0, reasons
+}
+
 func (m *Manager) hasActiveDataRGLocked() bool {
 	for _, group := range m.haGroups {
 		if group.RGID > 0 && group.Active {

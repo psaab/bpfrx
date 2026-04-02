@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/psaab/bpfrx/pkg/dataplane"
 	"github.com/vishvananda/netlink"
 
 	"github.com/psaab/bpfrx/pkg/config"
@@ -212,5 +213,41 @@ func TestCheckVIPReadiness_InterfaceUpViaFlags(t *testing.T) {
 	ready, reasons := checkVIPReadinessForConfig(cfg, 0, mockLinkByName(links))
 	if !ready {
 		t.Errorf("should be ready with FlagUp, got reasons: %v", reasons)
+	}
+}
+
+func TestUserspaceRGConfigured(t *testing.T) {
+	cfg := &config.Config{
+		System: config.SystemConfig{
+			DataplaneType: dataplane.TypeUserspace,
+		},
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {
+					Name:            "reth0",
+					RedundancyGroup: 1,
+				},
+				"reth1": {
+					Name:            "reth1",
+					RedundancyGroup: 2,
+				},
+			},
+		},
+	}
+
+	if !userspaceRGConfigured(cfg, 1) {
+		t.Fatal("expected RG 1 configured")
+	}
+	if !userspaceRGConfigured(cfg, 2) {
+		t.Fatal("expected RG 2 configured")
+	}
+	if userspaceRGConfigured(cfg, 3) {
+		t.Fatal("expected RG 3 not configured")
+	}
+	if userspaceRGConfigured(cfg, 0) {
+		t.Fatal("expected RG 0 not configured")
+	}
+	if userspaceRGConfigured(nil, 1) {
+		t.Fatal("expected nil config not configured")
 	}
 }
