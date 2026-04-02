@@ -28,12 +28,56 @@ pub(super) struct RewriteDescriptor {
     pub(super) egress_ifindex: i32,
     pub(super) tx_ifindex: i32,
     pub(super) target_binding_index: Option<usize>,
-    pub(super) config_generation: u64,
-    pub(super) fib_generation: u32,
-    pub(super) owner_rg_id: i32,
     pub(super) nat64: bool,
     pub(super) nptv6: bool,
     pub(super) apply_nat_on_fabric: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FlowCacheStamp {
+    pub(super) config_generation: u64,
+    pub(super) fib_generation: u32,
+    pub(super) owner_rg_id: i32,
+    pub(super) owner_rg_epoch: u32,
+}
+
+impl FlowCacheStamp {
+    #[inline]
+    pub(super) fn capture(
+        config_generation: u64,
+        fib_generation: u32,
+        owner_rg_id: i32,
+        rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
+    ) -> Self {
+        Self {
+            config_generation,
+            fib_generation,
+            owner_rg_id,
+            owner_rg_epoch: if owner_rg_id > 0 && (owner_rg_id as usize) < MAX_RG_EPOCHS {
+                rg_epochs[owner_rg_id as usize].load(Ordering::Relaxed)
+            } else {
+                0
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FlowCacheLookup {
+    pub(super) ingress_ifindex: i32,
+    pub(super) config_generation: u64,
+    pub(super) fib_generation: u32,
+}
+
+impl FlowCacheLookup {
+    #[inline]
+    pub(super) fn for_packet(meta: UserspaceDpMeta, validation: ValidationState) -> Self {
+        Self {
+            ingress_ifindex: meta.ingress_ifindex as i32,
+            config_generation: validation.config_generation,
+            fib_generation: validation.fib_generation,
+        }
+    }
 }
 
 /// Per-flow cache entry with key validation.
@@ -44,9 +88,82 @@ pub(super) struct FlowCacheEntry {
     pub(super) descriptor: RewriteDescriptor,
     pub(super) decision: SessionDecision,
     pub(super) metadata: SessionMetadata,
-    /// Epoch of the owner RG at insert time. Stale entries (epoch mismatch)
-    /// are treated as cache misses — O(1) invalidation on RG demotion.
-    pub(super) rg_epoch: u32,
+    /// Validation stamp captured at insert time. Stale entries are treated as
+    /// misses without requiring per-entry scans at RG transition.
+    pub(super) stamp: FlowCacheStamp,
+}
+
+impl FlowCacheEntry {
+    #[inline]
+    pub(super) fn packet_eligible(meta: UserspaceDpMeta) -> bool {
+        (meta.protocol == PROTO_TCP && (meta.tcp_flags & 0x17) == 0x10)
+            || meta.protocol == PROTO_UDP
+    }
+
+    #[inline]
+    pub(super) fn should_cache(meta: UserspaceDpMeta, decision: SessionDecision) -> bool {
+        matches!(meta.protocol, PROTO_TCP | PROTO_UDP)
+            && !decision.nat.nat64
+            && !decision.nat.nptv6
+            && decision.resolution.disposition == ForwardingDisposition::ForwardCandidate
+    }
+
+    pub(super) fn from_forward_decision(
+        flow: &SessionFlow,
+        meta: UserspaceDpMeta,
+        validation: ValidationState,
+        decision: SessionDecision,
+        ingress_zone: Option<Arc<str>>,
+        forwarding: &ForwardingState,
+        apply_nat_on_fabric: bool,
+        rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
+    ) -> Option<Self> {
+        if !Self::should_cache(meta, decision) {
+            return None;
+        }
+        let owner_rg_id = owner_rg_for_resolution(forwarding, decision.resolution);
+        Some(Self {
+            key: flow.forward_key.clone(),
+            ingress_ifindex: meta.ingress_ifindex as i32,
+            descriptor: RewriteDescriptor {
+                dst_mac: decision.resolution.neighbor_mac.unwrap_or([0; 6]),
+                src_mac: decision.resolution.src_mac.unwrap_or([0; 6]),
+                tx_vlan_id: decision.resolution.tx_vlan_id,
+                ether_type: if meta.addr_family as i32 == libc::AF_INET {
+                    0x0800
+                } else {
+                    0x86dd
+                },
+                rewrite_src_ip: decision.nat.rewrite_src,
+                rewrite_dst_ip: decision.nat.rewrite_dst,
+                rewrite_src_port: decision.nat.rewrite_src_port,
+                rewrite_dst_port: decision.nat.rewrite_dst_port,
+                ip_csum_delta: compute_ip_csum_delta(flow, &decision.nat),
+                l4_csum_delta: compute_l4_csum_delta(flow, &decision.nat),
+                egress_ifindex: decision.resolution.egress_ifindex,
+                tx_ifindex: decision.resolution.tx_ifindex,
+                target_binding_index: None,
+                nat64: false,
+                nptv6: false,
+                apply_nat_on_fabric,
+            },
+            decision,
+            metadata: SessionMetadata {
+                ingress_zone: ingress_zone.unwrap_or_else(|| Arc::from("")),
+                egress_zone: Arc::from(""),
+                owner_rg_id,
+                fabric_ingress: false,
+                is_reverse: false,
+                nat64_reverse: None,
+            },
+            stamp: FlowCacheStamp::capture(
+                validation.config_generation,
+                validation.fib_generation,
+                owner_rg_id,
+                rg_epochs,
+            ),
+        })
+    }
 }
 
 /// Per-worker flow cache. Direct-mapped, indexed by hash of 5-tuple.
@@ -81,25 +198,22 @@ impl FlowCache {
     pub(super) fn lookup(
         &mut self,
         key: &crate::session::SessionKey,
-        ingress_ifindex: i32,
-        config_generation: u64,
-        fib_generation: u32,
+        lookup: FlowCacheLookup,
         rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
     ) -> Option<&FlowCacheEntry> {
-        let idx = Self::slot(key, ingress_ifindex);
+        let idx = Self::slot(key, lookup.ingress_ifindex);
         if let Some(entry) = &self.entries[idx] {
             if entry.key == *key
-                && entry.ingress_ifindex == ingress_ifindex
-                && entry.descriptor.config_generation == config_generation
-                && entry.descriptor.fib_generation == fib_generation
+                && entry.ingress_ifindex == lookup.ingress_ifindex
+                && entry.stamp.config_generation == lookup.config_generation
+                && entry.stamp.fib_generation == lookup.fib_generation
             {
                 // Epoch-based RG invalidation: if the owner RG's epoch has
                 // advanced since this entry was inserted, treat as a miss.
-                let owner = entry.descriptor.owner_rg_id;
+                let owner = entry.stamp.owner_rg_id;
                 if owner > 0 && (owner as usize) < MAX_RG_EPOCHS {
-                    let current_epoch =
-                        rg_epochs[owner as usize].load(Ordering::Relaxed);
-                    if current_epoch != entry.rg_epoch {
+                    let current_epoch = rg_epochs[owner as usize].load(Ordering::Relaxed);
+                    if current_epoch != entry.stamp.owner_rg_epoch {
                         self.misses += 1;
                         // Evict stale entry.
                         self.entries[idx] = None;
@@ -140,19 +254,6 @@ impl FlowCache {
     ) {
         let idx = Self::slot(key, ingress_ifindex);
         self.entries[idx] = None;
-    }
-
-    /// Read the current epoch for a given RG from the shared epoch array.
-    #[inline]
-    pub(super) fn current_rg_epoch(
-        rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
-        owner_rg_id: i32,
-    ) -> u32 {
-        if owner_rg_id > 0 && (owner_rg_id as usize) < MAX_RG_EPOCHS {
-            rg_epochs[owner_rg_id as usize].load(Ordering::Relaxed)
-        } else {
-            0
-        }
     }
 }
 

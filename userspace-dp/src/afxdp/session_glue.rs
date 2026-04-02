@@ -330,7 +330,10 @@ pub(super) fn apply_worker_commands(
                 }
                 cancelled_keys.extend(demoted);
             }
-            WorkerCommand::RefreshOwnerRGs { owner_rgs, sequence } => {
+            WorkerCommand::RefreshOwnerRGs {
+                owner_rgs,
+                sequence,
+            } => {
                 let pre_count = sessions.len();
                 // Flow cache invalidation is handled by epoch-based check
                 // in FlowCache::lookup() — no per-entry scan needed here.
@@ -368,11 +371,7 @@ pub(super) fn apply_worker_commands(
                         && (metadata.owner_rg_id == 0
                             || owner_rg_set.contains(&metadata.owner_rg_id))
                     {
-                        forward_candidates.push((
-                            key.clone(),
-                            decision,
-                            metadata.clone(),
-                        ));
+                        forward_candidates.push((key.clone(), decision, metadata.clone()));
                     }
                 });
                 for (key, decision, metadata) in forward_candidates {
@@ -404,16 +403,14 @@ pub(super) fn apply_worker_commands(
                         now_secs,
                         re_resolved,
                     );
-                    if re_resolved.disposition
-                        != super::ForwardingDisposition::HAInactive
+                    if re_resolved.disposition != super::ForwardingDisposition::HAInactive
                         && re_resolved != decision.resolution
                     {
                         let new_decision = SessionDecision {
                             resolution: re_resolved,
                             ..decision
                         };
-                        let new_owner =
-                            owner_rg_for_resolution(forwarding, re_resolved);
+                        let new_owner = owner_rg_for_resolution(forwarding, re_resolved);
                         let new_metadata = SessionMetadata {
                             owner_rg_id: if new_owner > 0 {
                                 new_owner
@@ -457,7 +454,9 @@ pub(super) fn apply_worker_commands(
                 // check if ANY RG is locally active. Synced sessions with
                 // rg=0 still need local egress re-resolution for SNAT to work.
                 let any_rg_active = entry.metadata.owner_rg_id == 0
-                    && ha_state.values().any(|g| g.active && g.watchdog_timestamp != 0);
+                    && ha_state
+                        .values()
+                        .any(|g| g.active && g.watchdog_timestamp != 0);
                 let is_active = locally_active || any_rg_active;
                 let allow_replace_local = !is_active;
 
@@ -487,9 +486,7 @@ pub(super) fn apply_worker_commands(
                     // the session is ready when activation happens. The
                     // packet path enforces HA state via flow cache validation.
                     let re_resolved = if is_active {
-                        enforce_ha_resolution_snapshot(
-                            forwarding, ha_state, now_secs, re_resolved,
-                        )
+                        enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, re_resolved)
                     } else {
                         re_resolved
                     };
@@ -831,8 +828,16 @@ pub(super) fn teardown_tcp_rst_flow(
     sessions.delete(&reverse_key);
     delete_live_session_entry(current.session_map_fd, forward_key, nat, false);
     delete_live_session_entry(current.session_map_fd, &reverse_key, nat, true);
-    delete_bpf_conntrack_entry(current.conntrack_v4_fd, current.conntrack_v6_fd, forward_key);
-    delete_bpf_conntrack_entry(current.conntrack_v4_fd, current.conntrack_v6_fd, &reverse_key);
+    delete_bpf_conntrack_entry(
+        current.conntrack_v4_fd,
+        current.conntrack_v6_fd,
+        forward_key,
+    );
+    delete_bpf_conntrack_entry(
+        current.conntrack_v4_fd,
+        current.conntrack_v6_fd,
+        &reverse_key,
+    );
     remove_shared_session(
         shared_sessions,
         shared_nat_sessions,
@@ -2006,9 +2011,7 @@ mod tests {
         let entry = SyncedSessionEntry {
             key: key.clone(),
             decision: test_decision(),
-            metadata: SessionMetadata {
-                ..test_metadata()
-            },
+            metadata: SessionMetadata { ..test_metadata() },
             origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
@@ -2050,9 +2053,7 @@ mod tests {
         let entry = SyncedSessionEntry {
             key: key.clone(),
             decision,
-            metadata: SessionMetadata {
-                ..test_metadata()
-            },
+            metadata: SessionMetadata { ..test_metadata() },
             origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
@@ -2138,9 +2139,7 @@ mod tests {
         let entry = SyncedSessionEntry {
             key: key.clone(),
             decision,
-            metadata: SessionMetadata {
-                ..test_metadata()
-            },
+            metadata: SessionMetadata { ..test_metadata() },
             origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
@@ -2266,9 +2265,7 @@ mod tests {
         let entry = SyncedSessionEntry {
             key: key.clone(),
             decision,
-            metadata: SessionMetadata {
-                ..test_metadata()
-            },
+            metadata: SessionMetadata { ..test_metadata() },
             origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0,
@@ -2338,9 +2335,7 @@ mod tests {
         let entry = SyncedSessionEntry {
             key: translated_key.clone(),
             decision,
-            metadata: SessionMetadata {
-                ..test_metadata()
-            },
+            metadata: SessionMetadata { ..test_metadata() },
             origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x18,
@@ -2442,9 +2437,7 @@ mod tests {
         assert!(sessions.install_with_protocol_with_origin(
             translated_key.clone(),
             decision,
-            SessionMetadata {
-                ..test_metadata()
-            },
+            SessionMetadata { ..test_metadata() },
             SessionOrigin::SyncImport,
             1_000_000,
             PROTO_TCP,
@@ -2513,12 +2506,11 @@ mod tests {
             .lookup(&translated_key, 1_000_000, 0x18)
             .expect("promoted translated local hit should stay local");
         assert_eq!(local_hit.decision.nat, decision.nat);
-
     }
 
     #[test]
     fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inactive_fabric_ingress()
-    {
+     {
         let mut sessions = SessionTable::new();
         let key = test_key();
         let decision = SessionDecision {
@@ -2534,9 +2526,7 @@ mod tests {
         let entry = SyncedSessionEntry {
             key: translated_key.clone(),
             decision,
-            metadata: SessionMetadata {
-                ..test_metadata()
-            },
+            metadata: SessionMetadata { ..test_metadata() },
             origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x18,
@@ -2600,7 +2590,6 @@ mod tests {
         )
         .expect("translated shared hit should resolve");
 
-
         assert!(sessions.lookup(&translated_key, 1_000_000, 0x18).is_none());
     }
 
@@ -2618,9 +2607,7 @@ mod tests {
             PROTO_TCP,
             0x10,
         ));
-        let synced_metadata = SessionMetadata {
-            ..test_metadata()
-        };
+        let synced_metadata = SessionMetadata { ..test_metadata() };
         let synced_decision = SessionDecision {
             nat: NatDecision {
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -2706,9 +2693,7 @@ mod tests {
             .push_back(WorkerCommand::UpsertSynced(SyncedSessionEntry {
                 key: key.clone(),
                 decision: synced_decision,
-                metadata: SessionMetadata {
-                    ..test_metadata()
-                },
+                metadata: SessionMetadata { ..test_metadata() },
                 origin: SessionOrigin::SyncImport,
                 protocol: PROTO_TCP,
                 tcp_flags: 0x10,
@@ -2778,13 +2763,11 @@ mod tests {
         assert_eq!(results.cancelled_keys, vec![key.clone()]);
 
         let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("demoted hit");
-
     }
 
     #[test]
     fn epoch_based_flow_cache_invalidation_for_demoted_owner_rg() {
-        let rg_epochs: [AtomicU32; MAX_RG_EPOCHS] =
-            std::array::from_fn(|_| AtomicU32::new(0));
+        let rg_epochs: [AtomicU32; MAX_RG_EPOCHS] = std::array::from_fn(|_| AtomicU32::new(0));
         let mut flow_cache = FlowCache::new();
         let key = test_key();
         let metadata = SessionMetadata {
@@ -2809,32 +2792,57 @@ mod tests {
                 egress_ifindex: 6,
                 tx_ifindex: 6,
                 target_binding_index: None,
-                config_generation: 1,
-                fib_generation: 1,
-                owner_rg_id: 1,
                 nat64: false,
                 nptv6: false,
                 apply_nat_on_fabric: false,
             },
             decision: test_decision(),
             metadata,
-            rg_epoch: 0,
+            stamp: FlowCacheStamp {
+                config_generation: 1,
+                fib_generation: 1,
+                owner_rg_id: 1,
+                owner_rg_epoch: 0,
+            },
         });
 
         // Before epoch bump, lookup should hit.
-        assert!(flow_cache.lookup(&key, 7, 1, 1, &rg_epochs).is_some());
+        assert!(
+            flow_cache
+                .lookup(
+                    &key,
+                    FlowCacheLookup {
+                        ingress_ifindex: 7,
+                        config_generation: 1,
+                        fib_generation: 1,
+                    },
+                    &rg_epochs,
+                )
+                .is_some()
+        );
 
         // Bump epoch for RG 1 (simulates demotion).
         rg_epochs[1].fetch_add(1, Ordering::Relaxed);
 
         // After epoch bump, lookup should miss (stale entry).
-        assert!(flow_cache.lookup(&key, 7, 1, 1, &rg_epochs).is_none());
+        assert!(
+            flow_cache
+                .lookup(
+                    &key,
+                    FlowCacheLookup {
+                        ingress_ifindex: 7,
+                        config_generation: 1,
+                        fib_generation: 1,
+                    },
+                    &rg_epochs,
+                )
+                .is_none()
+        );
     }
 
     #[test]
     fn epoch_based_flow_cache_unrelated_rg_not_invalidated() {
-        let rg_epochs: [AtomicU32; MAX_RG_EPOCHS] =
-            std::array::from_fn(|_| AtomicU32::new(0));
+        let rg_epochs: [AtomicU32; MAX_RG_EPOCHS] = std::array::from_fn(|_| AtomicU32::new(0));
         let mut flow_cache = FlowCache::new();
         let key = test_key();
         let metadata = SessionMetadata {
@@ -2858,23 +2866,37 @@ mod tests {
                 egress_ifindex: 6,
                 tx_ifindex: 6,
                 target_binding_index: None,
-                config_generation: 1,
-                fib_generation: 1,
-                owner_rg_id: 1,
                 nat64: false,
                 nptv6: false,
                 apply_nat_on_fabric: false,
             },
             decision: test_decision(),
             metadata,
-            rg_epoch: 0,
+            stamp: FlowCacheStamp {
+                config_generation: 1,
+                fib_generation: 1,
+                owner_rg_id: 1,
+                owner_rg_epoch: 0,
+            },
         });
 
         // Bump epoch for RG 2 (unrelated).
         rg_epochs[2].fetch_add(1, Ordering::Relaxed);
 
         // RG 1 entry should still hit — only RG 2 was bumped.
-        assert!(flow_cache.lookup(&key, 7, 1, 1, &rg_epochs).is_some());
+        assert!(
+            flow_cache
+                .lookup(
+                    &key,
+                    FlowCacheLookup {
+                        ingress_ifindex: 7,
+                        config_generation: 1,
+                        fib_generation: 1,
+                    },
+                    &rg_epochs,
+                )
+                .is_some()
+        );
     }
 
     #[test]
@@ -2915,7 +2937,6 @@ mod tests {
         let hit = sessions
             .lookup(&key, 2_000_000, 0x10)
             .expect("demoted reverse hit");
-
     }
 
     #[test]
@@ -3076,7 +3097,6 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)))
         );
         assert!(deltas[0].fabric_redirect_sync);
-
     }
 
     #[test]
@@ -3273,7 +3293,10 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::RefreshOwnerRGs { owner_rgs: vec![1], sequence: 0 });
+            .push_back(WorkerCommand::RefreshOwnerRGs {
+                owner_rgs: vec![1],
+                sequence: 0,
+            });
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
@@ -3355,7 +3378,10 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::RefreshOwnerRGs { owner_rgs: vec![1], sequence: 0 });
+            .push_back(WorkerCommand::RefreshOwnerRGs {
+                owner_rgs: vec![1],
+                sequence: 0,
+            });
         let forwarding = test_forwarding_state_split_rgs();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
@@ -3445,7 +3471,10 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::RefreshOwnerRGs { owner_rgs: vec![1], sequence: 0 });
+            .push_back(WorkerCommand::RefreshOwnerRGs {
+                owner_rgs: vec![1],
+                sequence: 0,
+            });
         let forwarding = test_forwarding_state_with_fabric();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
@@ -3535,7 +3564,10 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::RefreshOwnerRGs { owner_rgs: vec![1], sequence: 0 });
+            .push_back(WorkerCommand::RefreshOwnerRGs {
+                owner_rgs: vec![1],
+                sequence: 0,
+            });
         let forwarding = test_forwarding_state_with_fabric();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
