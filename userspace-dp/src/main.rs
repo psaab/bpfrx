@@ -1542,7 +1542,6 @@ fn handle_stream(
             }
             "refresh_owner_rgs" => {
                 if let Some(prepare_req) = request.ha_demotion_prepare {
-                    eprintln!("bpfrx-ha: explicit refresh_owner_rgs {:?}", prepare_req.groups);
                     guard.afxdp.refresh_owner_rgs(&prepare_req.groups);
                     refresh_status(&mut guard);
                 } else {

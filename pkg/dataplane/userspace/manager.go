@@ -4045,22 +4045,38 @@ func shouldMirrorUserspaceSession(isReverse uint8) bool {
 }
 
 func (m *Manager) DeleteSession(key dataplane.SessionKey) error {
+	// Look up the session value BEFORE deleting from the BPF map so we
+	// can retrieve the ReverseKey for the pre-installed companion (#351).
+	val, valErr := m.inner.GetSessionV4(key)
+
 	if err := m.inner.DeleteSession(key); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	_ = m.syncSessionV4Locked("delete", key, nil)
+	// Also delete the reverse companion that SetSessionV4 pre-installed.
+	if valErr == nil && val.ReverseKey.Protocol != 0 {
+		_ = m.syncSessionV4Locked("delete", val.ReverseKey, nil)
+	}
 	return nil
 }
 
 func (m *Manager) DeleteSessionV6(key dataplane.SessionKeyV6) error {
+	// Look up the session value BEFORE deleting from the BPF map so we
+	// can retrieve the ReverseKey for the pre-installed companion (#351).
+	val, valErr := m.inner.GetSessionV6(key)
+
 	if err := m.inner.DeleteSessionV6(key); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	_ = m.syncSessionV6Locked("delete", key, nil)
+	// Also delete the reverse companion that SetSessionV6 pre-installed.
+	if valErr == nil && val.ReverseKey.Protocol != 0 {
+		_ = m.syncSessionV6Locked("delete", val.ReverseKey, nil)
+	}
 	return nil
 }
 
