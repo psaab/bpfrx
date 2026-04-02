@@ -75,6 +75,8 @@ mod neighbor;
 mod rst;
 #[path = "afxdp/session_glue.rs"]
 mod session_glue;
+#[path = "afxdp/shared_ops.rs"]
+mod shared_ops;
 #[cfg(test)]
 #[path = "afxdp/test_fixtures.rs"]
 mod test_fixtures;
@@ -129,6 +131,7 @@ pub use self::neighbor::{neighbor_state_usable_str, parse_mac_str};
 pub(crate) use self::rst::remove_kernel_rst_suppression;
 use self::rst::*;
 use self::session_glue::*;
+use self::shared_ops::*;
 use self::tunnel::*;
 use self::tx::*;
 use self::types::*;
