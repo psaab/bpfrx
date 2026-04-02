@@ -1189,8 +1189,7 @@ impl Coordinator {
                 }
             }
             // Record cache flush timestamp for observability (#312).
-            self.last_cache_flush_at
-                .store(now_secs, Ordering::Relaxed);
+            self.last_cache_flush_at.store(now_secs, Ordering::Relaxed);
         }
         if !activated_rgs.is_empty() {
             eprintln!(
@@ -2098,17 +2097,16 @@ impl BindingWorker {
             initial_fill_frames.push(offset);
         }
         let info = ifinfo_from_binding(binding)?;
-        let (user, rx, tx, bind_mode, actual_bind_strategy, device) =
-            open_binding_worker_rings(
-                &mut worker_umem,
-                &info,
-                ring_entries,
-                bind_strategy,
-                driver_name.as_deref(),
-                poll_mode,
-                Some(&initial_fill_frames),
-            )
-            .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
+        let (user, rx, tx, bind_mode, actual_bind_strategy, device) = open_binding_worker_rings(
+            &mut worker_umem,
+            &info,
+            ring_entries,
+            bind_strategy,
+            driver_name.as_deref(),
+            poll_mode,
+            Some(&initial_fill_frames),
+        )
+        .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
 
         let user_fd = user.as_raw_fd();
         live.set_bound(user_fd);
@@ -2846,9 +2844,11 @@ fn poll_binding(
                     {
                         if let Some(cached) = binding.flow_cache.lookup(
                             &flow.forward_key,
-                            meta.ingress_ifindex as i32,
-                            validation.config_generation,
-                            validation.fib_generation,
+                            FlowCacheLookup {
+                                ingress_ifindex: meta.ingress_ifindex as i32,
+                                config_generation: validation.config_generation,
+                                fib_generation: validation.fib_generation,
+                            },
                             &rg_epochs,
                         ) {
                             if !cached_flow_decision_valid(
@@ -2868,122 +2868,129 @@ fn poll_binding(
                                 // dropped here, causing established flows to
                                 // flatline after HA failover.
                             } else {
-                            let cached_decision = cached.decision;
-                            let cached_descriptor = cached.descriptor;
-                            let cached_metadata = cached.metadata.clone();
-                            // Amortize session timestamp touch — every 64 cache hits.
-                            binding.flow_cache_session_touch += 1;
-                            if binding.flow_cache_session_touch & 63 == 0 {
-                                sessions.touch(&flow.forward_key, now_ns);
-                            }
-                            if matches!(
-                                cached_decision.resolution.disposition,
-                                ForwardingDisposition::ForwardCandidate
-                                    | ForwardingDisposition::FabricRedirect
-                            ) {
-                                counters.forward_candidate_packets += 1;
-                                if cached_decision.nat.rewrite_src.is_some() {
-                                    counters.snat_packets += 1;
+                                let cached_decision = cached.decision;
+                                let cached_descriptor = cached.descriptor;
+                                let cached_metadata = cached.metadata.clone();
+                                // Amortize session timestamp touch — every 64 cache hits.
+                                binding.flow_cache_session_touch += 1;
+                                if binding.flow_cache_session_touch & 63 == 0 {
+                                    sessions.touch(&flow.forward_key, now_ns);
                                 }
-                                if cached_decision.nat.rewrite_dst.is_some() {
-                                    counters.dnat_packets += 1;
-                                }
-                                // ── Inline in-place rewrite fast path ──
-                                // Skip PendingForwardRequest + enqueue_pending_forwards entirely.
-                                // Resolve target binding, rewrite frame in UMEM, push PreparedTxRequest.
-                                let target_ifindex = if cached_decision.resolution.tx_ifindex > 0 {
-                                    cached_decision.resolution.tx_ifindex
-                                } else {
-                                    resolve_tx_binding_ifindex(
-                                        forwarding,
-                                        cached_decision.resolution.egress_ifindex,
-                                    )
-                                };
-                                let expected_ports =
-                                    authoritative_forward_ports(packet_frame, meta, Some(flow));
-                                let target_bi = if cached_decision.resolution.disposition
-                                    == ForwardingDisposition::FabricRedirect
-                                {
-                                    binding_lookup.fabric_target_index(
-                                        target_ifindex,
-                                        fabric_queue_hash(Some(flow), expected_ports, meta),
-                                    )
-                                } else {
-                                    binding_lookup.target_index(
-                                        binding_index,
-                                        ident.ifindex,
-                                        ident.queue_id,
-                                        target_ifindex,
-                                    )
-                                };
-                                // Check if target is same binding (hairpin) or same-UMEM.
-                                // For simplicity, only do in-place fast path when target == self.
-                                let is_self_target = target_bi == Some(binding_index);
-                                if is_self_target && owned_packet_frame.is_none() {
-                                    let ingress_slot = binding.slot;
-                                    let flow_key = flow.forward_key.clone();
-                                    // Try descriptor-based straight-line rewrite first (no branches
-                                    // for AF, NAT type, or checksum recomputation).  Falls back to
-                                    // generic rewrite on port mismatch, NAT64, or NPTv6.
-                                    let frame_len = apply_rewrite_descriptor(
-                                        unsafe { &*area },
-                                        desc,
-                                        meta,
-                                        &cached_descriptor,
-                                        expected_ports,
-                                    )
-                                    .or_else(|| {
-                                        rewrite_forwarded_frame_in_place(
+                                if matches!(
+                                    cached_decision.resolution.disposition,
+                                    ForwardingDisposition::ForwardCandidate
+                                        | ForwardingDisposition::FabricRedirect
+                                ) {
+                                    counters.forward_candidate_packets += 1;
+                                    if cached_decision.nat.rewrite_src.is_some() {
+                                        counters.snat_packets += 1;
+                                    }
+                                    if cached_decision.nat.rewrite_dst.is_some() {
+                                        counters.dnat_packets += 1;
+                                    }
+                                    // ── Inline in-place rewrite fast path ──
+                                    // Skip PendingForwardRequest + enqueue_pending_forwards entirely.
+                                    // Resolve target binding, rewrite frame in UMEM, push PreparedTxRequest.
+                                    let target_ifindex =
+                                        if cached_decision.resolution.tx_ifindex > 0 {
+                                            cached_decision.resolution.tx_ifindex
+                                        } else {
+                                            resolve_tx_binding_ifindex(
+                                                forwarding,
+                                                cached_decision.resolution.egress_ifindex,
+                                            )
+                                        };
+                                    let expected_ports =
+                                        authoritative_forward_ports(packet_frame, meta, Some(flow));
+                                    let target_bi = if cached_decision.resolution.disposition
+                                        == ForwardingDisposition::FabricRedirect
+                                    {
+                                        binding_lookup.fabric_target_index(
+                                            target_ifindex,
+                                            fabric_queue_hash(Some(flow), expected_ports, meta),
+                                        )
+                                    } else {
+                                        binding_lookup.target_index(
+                                            binding_index,
+                                            ident.ifindex,
+                                            ident.queue_id,
+                                            target_ifindex,
+                                        )
+                                    };
+                                    // Check if target is same binding (hairpin) or same-UMEM.
+                                    // For simplicity, only do in-place fast path when target == self.
+                                    let is_self_target = target_bi == Some(binding_index);
+                                    if is_self_target && owned_packet_frame.is_none() {
+                                        let ingress_slot = binding.slot;
+                                        let flow_key = flow.forward_key.clone();
+                                        // Try descriptor-based straight-line rewrite first (no branches
+                                        // for AF, NAT type, or checksum recomputation).  Falls back to
+                                        // generic rewrite on port mismatch, NAT64, or NPTv6.
+                                        let frame_len = apply_rewrite_descriptor(
                                             unsafe { &*area },
                                             desc,
                                             meta,
-                                            &cached_decision,
+                                            &cached_descriptor,
                                             expected_ports,
                                         )
-                                    });
-                                    if let Some(frame_len) = frame_len {
-                                        binding.pending_tx_prepared.push_back(PreparedTxRequest {
-                                            offset: desc.addr,
-                                            len: frame_len,
-                                            recycle: PreparedTxRecycle::FillOnSlot(ingress_slot),
-                                            expected_ports,
-                                            expected_addr_family: meta.addr_family,
-                                            expected_protocol: meta.protocol,
-                                            flow_key: Some(flow_key),
+                                        .or_else(|| {
+                                            rewrite_forwarded_frame_in_place(
+                                                unsafe { &*area },
+                                                desc,
+                                                meta,
+                                                &cached_decision,
+                                                expected_ports,
+                                            )
                                         });
-                                        binding.pending_in_place_tx_packets += 1;
-                                        dbg.forward += 1;
-                                        dbg.tx += 1;
-                                        recycle_now = false;
+                                        if let Some(frame_len) = frame_len {
+                                            binding.pending_tx_prepared.push_back(
+                                                PreparedTxRequest {
+                                                    offset: desc.addr,
+                                                    len: frame_len,
+                                                    recycle: PreparedTxRecycle::FillOnSlot(
+                                                        ingress_slot,
+                                                    ),
+                                                    expected_ports,
+                                                    expected_addr_family: meta.addr_family,
+                                                    expected_protocol: meta.protocol,
+                                                    flow_key: Some(flow_key),
+                                                },
+                                            );
+                                            binding.pending_in_place_tx_packets += 1;
+                                            dbg.forward += 1;
+                                            dbg.tx += 1;
+                                            recycle_now = false;
+                                        }
+                                    }
+                                    // Fallback: use PendingForwardRequest path for cross-binding or failure.
+                                    if recycle_now {
+                                        if let Some(mut request) =
+                                            build_live_forward_request_from_frame(
+                                                binding_lookup,
+                                                binding_index,
+                                                ident,
+                                                desc,
+                                                packet_frame,
+                                                meta,
+                                                &cached_decision,
+                                                forwarding,
+                                                Some(flow),
+                                                Some(&cached_metadata.ingress_zone),
+                                                true,
+                                            )
+                                        {
+                                            request.source_frame = owned_packet_frame.take();
+                                            dbg.forward += 1;
+                                            dbg.tx += 1;
+                                            binding.scratch_forwards.push(request);
+                                            recycle_now = false;
+                                        }
                                     }
                                 }
-                                // Fallback: use PendingForwardRequest path for cross-binding or failure.
                                 if recycle_now {
-                                    if let Some(mut request) = build_live_forward_request_from_frame(
-                                        binding_lookup,
-                                        binding_index,
-                                        ident,
-                                        desc,
-                                        packet_frame,
-                                        meta,
-                                        &cached_decision,
-                                        forwarding,
-                                        Some(flow),
-                                        Some(&cached_metadata.ingress_zone),
-                                        true,
-                                    ) {
-                                        request.source_frame = owned_packet_frame.take();
-                                        dbg.forward += 1;
-                                        dbg.tx += 1;
-                                        binding.scratch_forwards.push(request);
-                                        recycle_now = false;
-                                    }
+                                    binding.scratch_recycle.push(desc.addr);
                                 }
-                            }
-                            if recycle_now {
-                                binding.scratch_recycle.push(desc.addr);
-                            }
-                            continue;
+                                continue;
                             } // else: cached HA-valid — fast path above
                         }
                     }
@@ -4307,9 +4314,6 @@ fn poll_binding(
                                         egress_ifindex: decision.resolution.egress_ifindex,
                                         tx_ifindex: decision.resolution.tx_ifindex,
                                         target_binding_index: None,
-                                        config_generation: validation.config_generation,
-                                        fib_generation: validation.fib_generation,
-                                        owner_rg_id: cache_owner_rg_id,
                                         nat64: false,
                                         nptv6: false,
                                         apply_nat_on_fabric,
@@ -4323,9 +4327,11 @@ fn poll_binding(
                                         is_reverse: false,
                                         nat64_reverse: None,
                                     },
-                                    rg_epoch: FlowCache::current_rg_epoch(
-                                        &rg_epochs,
+                                    stamp: FlowCacheStamp::capture(
+                                        validation.config_generation,
+                                        validation.fib_generation,
                                         cache_owner_rg_id,
+                                        &rg_epochs,
                                     ),
                                 });
                             }

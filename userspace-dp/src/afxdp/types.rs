@@ -28,12 +28,45 @@ pub(super) struct RewriteDescriptor {
     pub(super) egress_ifindex: i32,
     pub(super) tx_ifindex: i32,
     pub(super) target_binding_index: Option<usize>,
-    pub(super) config_generation: u64,
-    pub(super) fib_generation: u32,
-    pub(super) owner_rg_id: i32,
     pub(super) nat64: bool,
     pub(super) nptv6: bool,
     pub(super) apply_nat_on_fabric: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct FlowCacheStamp {
+    pub(super) config_generation: u64,
+    pub(super) fib_generation: u32,
+    pub(super) owner_rg_id: i32,
+    pub(super) owner_rg_epoch: u32,
+}
+
+impl FlowCacheStamp {
+    #[inline]
+    pub(super) fn capture(
+        config_generation: u64,
+        fib_generation: u32,
+        owner_rg_id: i32,
+        rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
+    ) -> Self {
+        Self {
+            config_generation,
+            fib_generation,
+            owner_rg_id,
+            owner_rg_epoch: if owner_rg_id > 0 && (owner_rg_id as usize) < MAX_RG_EPOCHS {
+                rg_epochs[owner_rg_id as usize].load(Ordering::Relaxed)
+            } else {
+                0
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct FlowCacheLookup {
+    pub(super) ingress_ifindex: i32,
+    pub(super) config_generation: u64,
+    pub(super) fib_generation: u32,
 }
 
 /// Per-flow cache entry with key validation.
@@ -44,9 +77,9 @@ pub(super) struct FlowCacheEntry {
     pub(super) descriptor: RewriteDescriptor,
     pub(super) decision: SessionDecision,
     pub(super) metadata: SessionMetadata,
-    /// Epoch of the owner RG at insert time. Stale entries (epoch mismatch)
-    /// are treated as cache misses — O(1) invalidation on RG demotion.
-    pub(super) rg_epoch: u32,
+    /// Validation stamp captured at insert time. Stale entries are treated as
+    /// misses without requiring per-entry scans at RG transition.
+    pub(super) stamp: FlowCacheStamp,
 }
 
 /// Per-worker flow cache. Direct-mapped, indexed by hash of 5-tuple.
@@ -81,25 +114,22 @@ impl FlowCache {
     pub(super) fn lookup(
         &mut self,
         key: &crate::session::SessionKey,
-        ingress_ifindex: i32,
-        config_generation: u64,
-        fib_generation: u32,
+        lookup: FlowCacheLookup,
         rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
     ) -> Option<&FlowCacheEntry> {
-        let idx = Self::slot(key, ingress_ifindex);
+        let idx = Self::slot(key, lookup.ingress_ifindex);
         if let Some(entry) = &self.entries[idx] {
             if entry.key == *key
-                && entry.ingress_ifindex == ingress_ifindex
-                && entry.descriptor.config_generation == config_generation
-                && entry.descriptor.fib_generation == fib_generation
+                && entry.ingress_ifindex == lookup.ingress_ifindex
+                && entry.stamp.config_generation == lookup.config_generation
+                && entry.stamp.fib_generation == lookup.fib_generation
             {
                 // Epoch-based RG invalidation: if the owner RG's epoch has
                 // advanced since this entry was inserted, treat as a miss.
-                let owner = entry.descriptor.owner_rg_id;
+                let owner = entry.stamp.owner_rg_id;
                 if owner > 0 && (owner as usize) < MAX_RG_EPOCHS {
-                    let current_epoch =
-                        rg_epochs[owner as usize].load(Ordering::Relaxed);
-                    if current_epoch != entry.rg_epoch {
+                    let current_epoch = rg_epochs[owner as usize].load(Ordering::Relaxed);
+                    if current_epoch != entry.stamp.owner_rg_epoch {
                         self.misses += 1;
                         // Evict stale entry.
                         self.entries[idx] = None;
@@ -140,19 +170,6 @@ impl FlowCache {
     ) {
         let idx = Self::slot(key, ingress_ifindex);
         self.entries[idx] = None;
-    }
-
-    /// Read the current epoch for a given RG from the shared epoch array.
-    #[inline]
-    pub(super) fn current_rg_epoch(
-        rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
-        owner_rg_id: i32,
-    ) -> u32 {
-        if owner_rg_id > 0 && (owner_rg_id as usize) < MAX_RG_EPOCHS {
-            rg_epochs[owner_rg_id as usize].load(Ordering::Relaxed)
-        } else {
-            0
-        }
     }
 }
 
