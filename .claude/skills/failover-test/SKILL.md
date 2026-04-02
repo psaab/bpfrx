@@ -84,3 +84,39 @@ All incus commands: `sg incus-admin -c "incus exec ..."`.
 
 - PASS: zero intervals at 0, all intervals 3-25 Gbps
 - FAIL: any interval at 0 (critical), any below 3 (warning)
+
+## Additional Tests
+
+### Hard crash failover (`/failover-test crash`)
+
+Start iperf3, then force-reboot the primary:
+```bash
+sg incus-admin -c "incus exec loss:bpfrx-userspace-fw0 -- bash -c 'echo b > /proc/sysrq-trigger'"
+```
+Wait 30s, verify secondary took over, traffic recovers. Wait 90s for rejoin.
+
+### Manual CLI RG move (`/failover-test manual`)
+
+Start iperf3 60s, move RG mid-stream:
+```bash
+sg incus-admin -c "incus exec loss:bpfrx-userspace-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 1'"
+```
+Check SNAT packets > 0 on new owner. Move back. All 4 streams must survive.
+
+## Diagnostics
+
+When a test fails, capture from both nodes:
+```bash
+for node in bpfrx-userspace-fw0 bpfrx-userspace-fw1; do
+    echo "=== $node ==="
+    sg incus-admin -c "incus exec loss:$node -- cli -c 'show chassis cluster status'"
+    sg incus-admin -c "incus exec loss:$node -- cli -c 'show chassis cluster data-plane statistics'" | grep -E 'SNAT|Session|Forward|flow cache|installed'
+    sg incus-admin -c "incus exec loss:$node -- cli -c 'show security flow session destination-prefix 172.16.80.200/32'" | head -10
+done
+```
+
+## Known Issues
+
+- iperf3 server must be running on the host (`iperf3 -s -D`) — restart if stale
+- After hard crash, wait 60-90s for rebooted node to fully rejoin
+- If `Takeover ready: no (session sync not ready)` persists > 60s, restart both daemons
