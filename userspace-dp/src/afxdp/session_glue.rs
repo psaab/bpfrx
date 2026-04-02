@@ -2498,8 +2498,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inactive_fabric_ingress(
-    ) {
+    fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inactive_fabric_ingress()
+     {
         let mut sessions = SessionTable::new();
         let key = test_key();
         let decision = SessionDecision {

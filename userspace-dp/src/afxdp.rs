@@ -2838,17 +2838,12 @@ fn poll_binding(
                     // binding flow cache before the expensive session lookup
                     // + policy + NAT + FIB path. TCP SYN/FIN/RST skip the
                     // cache to ensure proper session lifecycle handling.
-                    if ((meta.protocol == PROTO_TCP && (meta.tcp_flags & 0x17) == 0x10)
-                        || meta.protocol == PROTO_UDP)
+                    if FlowCacheEntry::packet_eligible(meta)
                         && let Some(flow) = flow.as_ref()
                     {
                         if let Some(cached) = binding.flow_cache.lookup(
                             &flow.forward_key,
-                            FlowCacheLookup {
-                                ingress_ifindex: meta.ingress_ifindex as i32,
-                                config_generation: validation.config_generation,
-                                fib_generation: validation.fib_generation,
-                            },
+                            FlowCacheLookup::for_packet(meta, validation),
                             &rg_epochs,
                         ) {
                             if !cached_flow_decision_valid(
@@ -4280,60 +4275,19 @@ fn poll_binding(
                             // ── Flow cache population ────────────────────
                             // Cache ForwardCandidate decisions for established
                             // TCP/UDP flows. Skip NAT64/NPTv6 (non-cacheable).
-                            if (meta.protocol == PROTO_TCP || meta.protocol == PROTO_UDP)
-                                && !decision.nat.nat64
-                                && !decision.nat.nptv6
-                                && decision.resolution.disposition
-                                    == ForwardingDisposition::ForwardCandidate
-                                && let Some(flow) = flow.as_ref()
-                            {
-                                let ingress_zone = session_ingress_zone
-                                    .as_ref()
-                                    .cloned()
-                                    .unwrap_or_else(|| Arc::from(""));
-                                let cache_owner_rg_id =
-                                    owner_rg_for_resolution(forwarding, decision.resolution);
-                                binding.flow_cache.insert(FlowCacheEntry {
-                                    key: flow.forward_key.clone(),
-                                    ingress_ifindex: meta.ingress_ifindex as i32,
-                                    descriptor: RewriteDescriptor {
-                                        dst_mac: decision.resolution.neighbor_mac.unwrap_or([0; 6]),
-                                        src_mac: decision.resolution.src_mac.unwrap_or([0; 6]),
-                                        tx_vlan_id: decision.resolution.tx_vlan_id,
-                                        ether_type: if meta.addr_family as i32 == libc::AF_INET {
-                                            0x0800
-                                        } else {
-                                            0x86dd
-                                        },
-                                        rewrite_src_ip: decision.nat.rewrite_src,
-                                        rewrite_dst_ip: decision.nat.rewrite_dst,
-                                        rewrite_src_port: decision.nat.rewrite_src_port,
-                                        rewrite_dst_port: decision.nat.rewrite_dst_port,
-                                        ip_csum_delta: compute_ip_csum_delta(flow, &decision.nat),
-                                        l4_csum_delta: compute_l4_csum_delta(flow, &decision.nat),
-                                        egress_ifindex: decision.resolution.egress_ifindex,
-                                        tx_ifindex: decision.resolution.tx_ifindex,
-                                        target_binding_index: None,
-                                        nat64: false,
-                                        nptv6: false,
-                                        apply_nat_on_fabric,
-                                    },
+                            if let Some(flow) = flow.as_ref()
+                                && let Some(entry) = FlowCacheEntry::from_forward_decision(
+                                    flow,
+                                    meta,
+                                    validation,
                                     decision,
-                                    metadata: SessionMetadata {
-                                        ingress_zone,
-                                        egress_zone: Arc::from(""),
-                                        owner_rg_id: cache_owner_rg_id,
-                                        fabric_ingress: false,
-                                        is_reverse: false,
-                                        nat64_reverse: None,
-                                    },
-                                    stamp: FlowCacheStamp::capture(
-                                        validation.config_generation,
-                                        validation.fib_generation,
-                                        cache_owner_rg_id,
-                                        &rg_epochs,
-                                    ),
-                                });
+                                    session_ingress_zone.as_ref().cloned(),
+                                    forwarding,
+                                    apply_nat_on_fabric,
+                                    &rg_epochs,
+                                )
+                            {
+                                binding.flow_cache.insert(entry);
                             }
                             // ── End flow cache population ────────────────
                         } else {

@@ -69,6 +69,17 @@ pub(super) struct FlowCacheLookup {
     pub(super) fib_generation: u32,
 }
 
+impl FlowCacheLookup {
+    #[inline]
+    pub(super) fn for_packet(meta: UserspaceDpMeta, validation: ValidationState) -> Self {
+        Self {
+            ingress_ifindex: meta.ingress_ifindex as i32,
+            config_generation: validation.config_generation,
+            fib_generation: validation.fib_generation,
+        }
+    }
+}
+
 /// Per-flow cache entry with key validation.
 #[derive(Clone)]
 pub(super) struct FlowCacheEntry {
@@ -80,6 +91,79 @@ pub(super) struct FlowCacheEntry {
     /// Validation stamp captured at insert time. Stale entries are treated as
     /// misses without requiring per-entry scans at RG transition.
     pub(super) stamp: FlowCacheStamp,
+}
+
+impl FlowCacheEntry {
+    #[inline]
+    pub(super) fn packet_eligible(meta: UserspaceDpMeta) -> bool {
+        (meta.protocol == PROTO_TCP && (meta.tcp_flags & 0x17) == 0x10)
+            || meta.protocol == PROTO_UDP
+    }
+
+    #[inline]
+    pub(super) fn should_cache(meta: UserspaceDpMeta, decision: SessionDecision) -> bool {
+        matches!(meta.protocol, PROTO_TCP | PROTO_UDP)
+            && !decision.nat.nat64
+            && !decision.nat.nptv6
+            && decision.resolution.disposition == ForwardingDisposition::ForwardCandidate
+    }
+
+    pub(super) fn from_forward_decision(
+        flow: &SessionFlow,
+        meta: UserspaceDpMeta,
+        validation: ValidationState,
+        decision: SessionDecision,
+        ingress_zone: Option<Arc<str>>,
+        forwarding: &ForwardingState,
+        apply_nat_on_fabric: bool,
+        rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
+    ) -> Option<Self> {
+        if !Self::should_cache(meta, decision) {
+            return None;
+        }
+        let owner_rg_id = owner_rg_for_resolution(forwarding, decision.resolution);
+        Some(Self {
+            key: flow.forward_key.clone(),
+            ingress_ifindex: meta.ingress_ifindex as i32,
+            descriptor: RewriteDescriptor {
+                dst_mac: decision.resolution.neighbor_mac.unwrap_or([0; 6]),
+                src_mac: decision.resolution.src_mac.unwrap_or([0; 6]),
+                tx_vlan_id: decision.resolution.tx_vlan_id,
+                ether_type: if meta.addr_family as i32 == libc::AF_INET {
+                    0x0800
+                } else {
+                    0x86dd
+                },
+                rewrite_src_ip: decision.nat.rewrite_src,
+                rewrite_dst_ip: decision.nat.rewrite_dst,
+                rewrite_src_port: decision.nat.rewrite_src_port,
+                rewrite_dst_port: decision.nat.rewrite_dst_port,
+                ip_csum_delta: compute_ip_csum_delta(flow, &decision.nat),
+                l4_csum_delta: compute_l4_csum_delta(flow, &decision.nat),
+                egress_ifindex: decision.resolution.egress_ifindex,
+                tx_ifindex: decision.resolution.tx_ifindex,
+                target_binding_index: None,
+                nat64: false,
+                nptv6: false,
+                apply_nat_on_fabric,
+            },
+            decision,
+            metadata: SessionMetadata {
+                ingress_zone: ingress_zone.unwrap_or_else(|| Arc::from("")),
+                egress_zone: Arc::from(""),
+                owner_rg_id,
+                fabric_ingress: false,
+                is_reverse: false,
+                nat64_reverse: None,
+            },
+            stamp: FlowCacheStamp::capture(
+                validation.config_generation,
+                validation.fib_generation,
+                owner_rg_id,
+                rg_epochs,
+            ),
+        })
+    }
 }
 
 /// Per-worker flow cache. Direct-mapped, indexed by hash of 5-tuple.
