@@ -2167,14 +2167,6 @@ mod tests {
         }
     }
 
-    fn suppressed_ha_runtime(watchdog_timestamp: u64, until_secs: u64) -> HAGroupRuntime {
-        HAGroupRuntime {
-            active: true,
-            watchdog_timestamp,
-            lease: HAForwardingLease::SuppressedUntil(until_secs),
-        }
-    }
-
     #[test]
     fn metadata_classification_accepts_matching_generations() {
         let validation = ValidationState {
@@ -2255,22 +2247,6 @@ mod tests {
             resolved.disposition,
             ForwardingDisposition::ForwardCandidate
         );
-    }
-
-    #[test]
-    fn ha_resolution_blocks_demoting_owner_rg() {
-        let state = build_forwarding_state(&nat_snapshot());
-        let now_secs = monotonic_nanos() / 1_000_000_000;
-        let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
-            1,
-            suppressed_ha_runtime(now_secs, now_secs + 5),
-        )])));
-        let resolved = enforce_ha_resolution(
-            &state,
-            &ha_state,
-            lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
-        );
-        assert_eq!(resolved.disposition, ForwardingDisposition::HAInactive);
     }
 
     #[test]

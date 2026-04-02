@@ -17,7 +17,6 @@ type ControlRequest struct {
 	Snapshot           *ConfigSnapshot           `json:"snapshot,omitempty"`
 	Forwarding         *ForwardingControlRequest `json:"forwarding,omitempty"`
 	HAState            *HAStateUpdateRequest     `json:"ha_state,omitempty"`
-	HADemotionPrepare  *HADemotionPrepareRequest `json:"ha_demotion_prepare,omitempty"`
 	Queue              *QueueControlRequest      `json:"queue,omitempty"`
 	Binding            *BindingControlRequest    `json:"binding,omitempty"`
 	Packet             *InjectPacketRequest      `json:"packet,omitempty"`
@@ -363,10 +362,6 @@ type ProcessStatus struct {
 
 type HAStateUpdateRequest struct {
 	Groups []HAGroupStatus `json:"groups,omitempty"`
-}
-
-type HADemotionPrepareRequest struct {
-	Groups []int `json:"groups,omitempty"`
 }
 
 type HAGroupStatus struct {

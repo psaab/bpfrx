@@ -524,8 +524,6 @@ struct ControlRequest {
     forwarding: Option<ForwardingControlRequest>,
     #[serde(rename = "ha_state", default)]
     ha_state: Option<HAStateUpdateRequest>,
-    #[serde(rename = "ha_demotion_prepare", default)]
-    ha_demotion_prepare: Option<HADemotionPrepareRequest>,
     #[serde(default)]
     queue: Option<QueueControlRequest>,
     #[serde(default)]
@@ -736,12 +734,6 @@ struct ForwardingControlRequest {
 struct HAStateUpdateRequest {
     #[serde(default)]
     groups: Vec<HAGroupStatus>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-struct HADemotionPrepareRequest {
-    #[serde(default)]
-    groups: Vec<i32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1530,31 +1522,6 @@ fn handle_stream(
                 } else {
                     response.ok = false;
                     response.error = "missing HA state".to_string();
-                }
-            }
-            "prepare_ha_demotion" => {
-                if let Some(prepare_req) = request.ha_demotion_prepare {
-                    match guard.afxdp.prepare_ha_demotion(&prepare_req.groups) {
-                        Ok(()) => {
-                            refresh_status(&mut guard);
-                        }
-                        Err(err) => {
-                            response.ok = false;
-                            response.error = err;
-                        }
-                    }
-                } else {
-                    response.ok = false;
-                    response.error = "missing HA demotion prepare".to_string();
-                }
-            }
-            "clear_ha_demotion" => {
-                if let Some(prepare_req) = request.ha_demotion_prepare {
-                    guard.afxdp.clear_ha_demotion(&prepare_req.groups);
-                    refresh_status(&mut guard);
-                } else {
-                    response.ok = false;
-                    response.error = "missing HA demotion prepare".to_string();
                 }
             }
             "update_fabrics" => {

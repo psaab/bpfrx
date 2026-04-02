@@ -390,7 +390,6 @@ pub(super) enum HAForwardingLease {
     #[default]
     Inactive,
     ActiveUntil(u64),
-    SuppressedUntil(u64),
 }
 
 impl HAForwardingLease {

@@ -3302,10 +3302,6 @@ type userspaceSessionExporter interface {
 	ExportOwnerRGSessions(rgIDs []int, max uint32) ([]dpuserspace.SessionDeltaInfo, dpuserspace.ProcessStatus, error)
 }
 
-type userspaceRGDemotionPreparer interface {
-	PrepareRGDemotion(rgIDs []int) error
-}
-
 type userspaceEventStreamProvider interface {
 	EventStream() *dpuserspace.EventStream
 }
@@ -4128,15 +4124,10 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 			d.releaseUserspaceRGDemotionPrep(rgID)
 		}
 	}()
-	preparer, ok := d.dp.(userspaceRGDemotionPreparer)
-	if !ok {
-		success = true
-		return nil
-	}
 	if d.sessionSync == nil || !d.sessionSync.IsConnected() {
-		if err := preparer.PrepareRGDemotion([]int{rgID}); err != nil {
-			return err
-		}
+		// Release suppression window so a reconnect + retry can re-run
+		// the barrier check before the actual demotion proceeds.
+		d.releaseUserspaceRGDemotionPrep(rgID)
 		success = true
 		return nil
 	}
@@ -4167,14 +4158,12 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	}
 
 	// Single barrier — peer ack means it has processed all queued deltas.
+	// The actual demotion happens atomically in UpdateRGActive(false).
 	if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {
 		return fmt.Errorf("demotion peer barrier failed: %w", err)
 	}
-	if err := preparer.PrepareRGDemotion([]int{rgID}); err != nil {
-		return err
-	}
 	success = true
-	slog.Info("userspace: prepared rg demotion", "rg", rgID)
+	slog.Info("userspace: peer barrier ready for rg demotion", "rg", rgID)
 	return nil
 }
 

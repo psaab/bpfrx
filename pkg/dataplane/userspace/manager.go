@@ -2542,38 +2542,6 @@ func (m *Manager) syncHAStateLocked() error {
 	return m.syncDesiredForwardingStateLocked()
 }
 
-func (m *Manager) PrepareRGDemotion(rgIDs []int) error {
-	if len(rgIDs) == 0 {
-		return nil
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.proc == nil || m.proc.Process == nil {
-		return nil
-	}
-	var status ProcessStatus
-	if err := m.requestLocked(ControlRequest{
-		Type: "prepare_ha_demotion",
-		HADemotionPrepare: &HADemotionPrepareRequest{
-			Groups: rgIDs,
-		},
-	}, &status); err != nil {
-		// The helper may have set the demoting mark before the request
-		// timed out. Send a clear request so the helper stops treating
-		// the still-primary RG as demoting. The auto-expiry lease will
-		// also clear it eventually, but immediate cleanup prevents
-		// self-poisoning traffic during the lease window.
-		_ = m.requestLocked(ControlRequest{
-			Type: "clear_ha_demotion",
-			HADemotionPrepare: &HADemotionPrepareRequest{
-				Groups: rgIDs,
-			},
-		}, nil)
-		return err
-	}
-	return m.applyHelperStatusLocked(&status)
-}
-
 // SyncFabricState pushes current fabric snapshots (with fresh peer MACs)
 // to the Rust helper. Called from the daemon after refreshFabricFwd succeeds
 // so the helper has up-to-date fabric MAC info for cross-chassis redirect.
