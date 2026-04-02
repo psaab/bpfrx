@@ -785,7 +785,7 @@ func TestElection_NonPreemptDualActive_LowerPriorityYields(t *testing.T) {
 func TestElection_NonPreemptDualActive_TieBreakNodeID(t *testing.T) {
 	// Both primary, same priority, non-preempt.
 	// Higher node ID must yield.
-	m := NewManager(1, 1)                                    // We are node 1 (higher)
+	m := NewManager(1, 1) // We are node 1 (higher)
 	cfg := makeConfig(makeRG(0, false, map[int]int{1: 200})) // non-preempt
 	m.UpdateConfig(cfg)
 	<-m.Events()
@@ -843,7 +843,7 @@ func TestElection_NonPreemptDualActive_WinnerStays(t *testing.T) {
 func TestElection_NonPreemptDualActive_PreemptSelfResolves(t *testing.T) {
 	// Regression guard: preempt mode already handles dual-active via
 	// priority comparison — ensure it still works.
-	m := NewManager(1, 1)                                   // We are node 1 (higher)
+	m := NewManager(1, 1) // We are node 1 (higher)
 	cfg := makeConfig(makeRG(0, true, map[int]int{1: 100})) // preempt enabled
 	m.UpdateConfig(cfg)
 	<-m.Events()

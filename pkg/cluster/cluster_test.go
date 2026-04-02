@@ -283,10 +283,11 @@ func TestManualFailover(t *testing.T) {
 	if states[0].FailoverCount != 1 {
 		t.Errorf("failover count = %d, want 1", states[0].FailoverCount)
 	}
-	// Weight stays monitor-derived; the peer now sees an explicit
-	// transfer-out state instead of relying on weight=0.
+	// Weight stays monitor-derived (255 = full weight, no monitors down).
+	// The peer now sees an explicit transfer-out state instead of
+	// relying on weight=0 to signal demotion.
 	if states[0].Weight != 255 {
-		t.Errorf("weight = %d, want 255 after manual failover", states[0].Weight)
+		t.Errorf("weight = %d, want 255 after manual failover (preserved, not zeroed)", states[0].Weight)
 	}
 
 	// Failover event should be emitted.
