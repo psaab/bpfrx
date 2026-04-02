@@ -18,6 +18,36 @@ Run the full HA failover test matrix from `testing-docs/failover-testing.md` aga
 
 ## Instructions
 
+ALWAYS build and deploy before running tests. Stale binaries are the #1 source of false failures.
+
+### Step 0: Build and Deploy
+
+```bash
+# Build everything
+make build
+cd userspace-dp && cargo build --release && cd ..
+cp userspace-dp/target/release/bpfrx-userspace-dp .
+
+# Deploy to both firewalls
+ENV_FILE=test/incus/loss-userspace-cluster.env sg incus-admin -c "./test/incus/cluster-setup.sh deploy all"
+
+# Verify checksums match
+for node in bpfrx-userspace-fw0 bpfrx-userspace-fw1; do
+    sg incus-admin -c "incus exec loss:$node -- md5sum /usr/local/sbin/bpfrxd /usr/local/sbin/bpfrx-userspace-dp"
+done
+md5sum bpfrxd bpfrx-userspace-dp
+
+# Wait for both nodes takeover ready (up to 60s)
+for i in $(seq 1 12); do
+    fw0=$(sg incus-admin -c "incus exec loss:bpfrx-userspace-fw0 -- cli -c 'show chassis cluster status'" 2>&1 | grep -c "Takeover ready: yes")
+    fw1=$(sg incus-admin -c "incus exec loss:bpfrx-userspace-fw1 -- cli -c 'show chassis cluster status'" 2>&1 | grep -c "Takeover ready: yes")
+    [ "$fw0" -ge 3 ] && [ "$fw1" -ge 3 ] && echo "BOTH READY" && break
+    sleep 5
+done
+```
+
+If checksums don't match, force-push: stop service, pkill helper, push binaries, restart.
+
 Run the test matrix IN ORDER. A broken earlier phase invalidates later ones. For each phase, report PASS/FAIL with key metrics.
 
 ### Preflight
