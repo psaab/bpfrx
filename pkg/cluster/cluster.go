@@ -134,9 +134,13 @@ type Manager struct {
 	// Sync stats provider (set by daemon after sessionSync creation).
 	syncStats SyncStatsProvider
 
-	// peerFailoverFn sends a remote failover request to the peer.
-	// Set by daemon after sessionSync creation.
-	peerFailoverFn func(rgID int) error
+	// peerFailoverFn sends a remote failover request to the peer and returns
+	// the acknowledged request ID for the transfer.
+	peerFailoverFn func(rgID int) (uint64, error)
+
+	// peerFailoverCommitFn sends the transfer-commit message after the local
+	// node has explicitly assumed primary ownership.
+	peerFailoverCommitFn func(rgID int, reqID uint64) error
 
 	// peerFenceFn sends a fence (disable-rg) message to the peer.
 	// Set by daemon after sessionSync creation.
@@ -154,9 +158,6 @@ type Manager struct {
 	// Retry policy for transient pre-failover prepare failures.
 	preManualFailoverRetryTimeout  time.Duration
 	preManualFailoverRetryInterval time.Duration
-	peerFailoverWaitTimeout        time.Duration
-	peerFailoverPollInterval       time.Duration
-
 	// peerFencing holds the configured fencing action (e.g. "disable-rg").
 	peerFencing string
 
@@ -184,8 +185,6 @@ type Manager struct {
 const DefaultTakeoverHoldTime = 3 * time.Second
 const DefaultPreManualFailoverRetryTimeout = 45 * time.Second
 const DefaultPreManualFailoverRetryInterval = 500 * time.Millisecond
-const DefaultPeerFailoverWaitTimeout = 10 * time.Second
-const DefaultPeerFailoverPollInterval = 50 * time.Millisecond
 
 // NewManager creates a new cluster manager.
 func NewManager(nodeID, clusterID int) *Manager {
@@ -203,8 +202,6 @@ func NewManager(nodeID, clusterID int) *Manager {
 		takeoverHoldTime:               DefaultTakeoverHoldTime,
 		preManualFailoverRetryTimeout:  DefaultPreManualFailoverRetryTimeout,
 		preManualFailoverRetryInterval: DefaultPreManualFailoverRetryInterval,
-		peerFailoverWaitTimeout:        DefaultPeerFailoverWaitTimeout,
-		peerFailoverPollInterval:       DefaultPeerFailoverPollInterval,
 	}
 }
 
@@ -695,10 +692,18 @@ func (m *Manager) SetPreManualFailoverHook(fn func(rgID int) error) {
 
 // SetPeerFailoverFunc sets the callback used to send remote failover requests
 // to the peer via the fabric sync connection.
-func (m *Manager) SetPeerFailoverFunc(fn func(rgID int) error) {
+func (m *Manager) SetPeerFailoverFunc(fn func(rgID int) (uint64, error)) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.peerFailoverFn = fn
+}
+
+// SetPeerFailoverCommitFunc sets the callback used to send remote
+// transfer-commit messages via the fabric sync connection.
+func (m *Manager) SetPeerFailoverCommitFunc(fn func(rgID int, reqID uint64) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peerFailoverCommitFn = fn
 }
 
 // SetPeerFenceFunc sets the callback used to send a fence message to the
@@ -744,9 +749,23 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 		m.mu.Unlock()
 		return fmt.Errorf("peer not alive — cannot request failover")
 	}
+	if !rg.IsReadyForTakeover(m.takeoverHoldTime) {
+		readySince := "<zero>"
+		if !rg.ReadySince.IsZero() {
+			readySince = rg.ReadySince.Format(time.RFC3339Nano)
+		}
+		reasons := append([]string(nil), rg.ReadinessReasons...)
+		m.mu.Unlock()
+		return fmt.Errorf(
+			"local redundancy group %d not ready for explicit failover ready=%t ready_since=%s reasons=%v",
+			rgID,
+			rg.Ready,
+			readySince,
+			reasons,
+		)
+	}
 	fn := m.peerFailoverFn
-	waitTimeout := m.peerFailoverWaitTimeout
-	pollInterval := m.peerFailoverPollInterval
+	commitFn := m.peerFailoverCommitFn
 
 	// Clear local ManualFailover and restore weight so election can
 	// promote us once the peer transfers out.
@@ -759,64 +778,102 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 	if fn == nil {
 		return fmt.Errorf("peer failover not available (sync not connected)")
 	}
-	if err := fn(rgID); err != nil {
+	if commitFn == nil {
+		return fmt.Errorf("peer failover commit not available (sync not connected)")
+	}
+	reqID, err := fn(rgID)
+	if err != nil {
 		return err
 	}
-	if waitTimeout <= 0 {
-		waitTimeout = DefaultPeerFailoverWaitTimeout
+	if err := m.commitRequestedPeerFailover(rgID); err != nil {
+		return err
 	}
-	if pollInterval <= 0 {
-		pollInterval = DefaultPeerFailoverPollInterval
+	if err := commitFn(rgID, reqID); err != nil {
+		return err
 	}
-	return m.waitForPrimaryAfterPeerFailover(rgID, waitTimeout, pollInterval)
+	m.notePeerTransferCommitted(rgID)
+	return nil
 }
 
-func (m *Manager) waitForPrimaryAfterPeerFailover(rgID int, timeout, pollInterval time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
+func (m *Manager) commitRequestedPeerFailover(rgID int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	for {
-		m.mu.RLock()
-		rg, ok := m.groups[rgID]
-		peerGroup, peerSeen := m.peerGroups[rgID]
-		peerAlive := m.peerAlive
-		var localState NodeState
-		var ready bool
-		var readySince time.Time
-		var reasons []string
-		if ok {
-			localState = rg.State
-			ready = rg.Ready
-			readySince = rg.ReadySince
-			reasons = append([]string(nil), rg.ReadinessReasons...)
-		}
-		m.mu.RUnlock()
-
-		if !ok {
-			return fmt.Errorf("redundancy group %d not found", rgID)
-		}
-		if localState == StatePrimary {
-			return nil
-		}
-		if time.Now().After(deadline) {
-			peerState := "<unknown>"
-			if peerSeen {
-				peerState = peerGroup.State.String()
-			}
-			return fmt.Errorf(
-				"timed out waiting for redundancy group %d to become primary local_state=%s peer_alive=%t peer_state=%s ready=%t ready_since=%s reasons=%v",
-				rgID,
-				localState,
-				peerAlive,
-				peerState,
-				ready,
-				readySince.Format(time.RFC3339Nano),
-				reasons,
-			)
-		}
-		<-ticker.C
+	rg, ok := m.groups[rgID]
+	if !ok {
+		return fmt.Errorf("redundancy group %d not found", rgID)
 	}
+	if !rg.IsReadyForTakeover(m.takeoverHoldTime) {
+		readySince := "<zero>"
+		if !rg.ReadySince.IsZero() {
+			readySince = rg.ReadySince.Format(time.RFC3339Nano)
+		}
+		return fmt.Errorf(
+			"redundancy group %d lost takeover readiness before transfer commit ready=%t ready_since=%s reasons=%v",
+			rgID,
+			rg.Ready,
+			readySince,
+			append([]string(nil), rg.ReadinessReasons...),
+		)
+	}
+
+	peerGroup := m.peerGroups[rgID]
+	peerGroup.GroupID = rgID
+	peerGroup.State = StateSecondaryHold
+	m.peerGroups[rgID] = peerGroup
+	rg.PeerPriority = peerGroup.Priority
+
+	m.runElection()
+	if rg.State != StatePrimary {
+		return fmt.Errorf(
+			"failed to commit redundancy group %d primary ownership local_state=%s peer_state=%s ready=%t reasons=%v",
+			rgID,
+			rg.State,
+			peerGroup.State,
+			rg.Ready,
+			append([]string(nil), rg.ReadinessReasons...),
+		)
+	}
+	return nil
+}
+
+func (m *Manager) notePeerTransferCommitted(rgID int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	peerGroup, ok := m.peerGroups[rgID]
+	if !ok {
+		return
+	}
+	peerGroup.State = StateSecondary
+	m.peerGroups[rgID] = peerGroup
+}
+
+// FinalizePeerTransferOut completes a previously acknowledged transfer-out
+// after the peer commits ownership on the sync channel.
+func (m *Manager) FinalizePeerTransferOut(rgID int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	rg, ok := m.groups[rgID]
+	if !ok {
+		return fmt.Errorf("redundancy group %d not found", rgID)
+	}
+	if rg.State == StatePrimary {
+		return fmt.Errorf("%w: redundancy group %d still primary locally", ErrRemoteFailoverRejected, rgID)
+	}
+	if rg.State == StateSecondary && !rg.ManualFailover {
+		return nil
+	}
+
+	oldState := rg.State
+	rg.ManualFailover = false
+	rg.ManualFailoverAt = time.Time{}
+	rg.State = StateSecondary
+	if oldState != rg.State {
+		m.sendEvent(rg.GroupID, oldState, rg.State, "Peer transfer committed")
+	}
+	return nil
 }
 
 // ForceSecondary sets weight to 0 for all redundancy groups, forcing this node

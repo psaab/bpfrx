@@ -2173,9 +2173,14 @@ func TestSendFailoverWaitsForAck(t *testing.T) {
 	ss.stats.Connected.Store(true)
 	ss.mu.Unlock()
 
-	done := make(chan error, 1)
+	type failoverResult struct {
+		reqID uint64
+		err   error
+	}
+	done := make(chan failoverResult, 1)
 	go func() {
-		done <- ss.SendFailover(7)
+		reqID, err := ss.SendFailover(7)
+		done <- failoverResult{reqID: reqID, err: err}
 	}()
 
 	var hdrBuf [syncHeaderSize]byte
@@ -2202,9 +2207,12 @@ func TestSendFailoverWaitsForAck(t *testing.T) {
 	ss.handleMessage(local, syncMsgFailoverAck, ack)
 
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("SendFailover() error = %v", err)
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("SendFailover() error = %v", result.err)
+		}
+		if result.reqID != reqID {
+			t.Fatalf("SendFailover() reqID = %d, want %d", result.reqID, reqID)
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("SendFailover did not complete after ack")
@@ -2224,7 +2232,8 @@ func TestSendFailoverPropagatesPeerRejection(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- ss.SendFailover(3)
+		_, err := ss.SendFailover(3)
+		done <- err
 	}()
 
 	var hdrBuf [syncHeaderSize]byte
@@ -2274,7 +2283,8 @@ func TestSendFailoverDisconnectReleasesWaiter(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- ss.SendFailover(4)
+		_, err := ss.SendFailover(4)
+		done <- err
 	}()
 
 	var hdrBuf [syncHeaderSize]byte
@@ -2306,7 +2316,7 @@ func TestSendFailoverDisconnectReleasesWaiter(t *testing.T) {
 
 func TestSendFailoverRejectsOutOfRangeRGID(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
-	if err := ss.SendFailover(256); err == nil {
+	if _, err := ss.SendFailover(256); err == nil {
 		t.Fatal("expected out-of-range RG error")
 	}
 }
@@ -2324,7 +2334,8 @@ func TestSendFailoverIgnoresStaleAckForEarlierRequest(t *testing.T) {
 
 	done1 := make(chan error, 1)
 	go func() {
-		done1 <- ss.SendFailover(9)
+		_, err := ss.SendFailover(9)
+		done1 <- err
 	}()
 
 	var hdrBuf [syncHeaderSize]byte
@@ -2344,7 +2355,8 @@ func TestSendFailoverIgnoresStaleAckForEarlierRequest(t *testing.T) {
 
 	done2 := make(chan error, 1)
 	go func() {
-		done2 <- ss.SendFailover(9)
+		_, err := ss.SendFailover(9)
+		done2 <- err
 	}()
 
 	if _, err := io.ReadFull(peer, hdrBuf[:]); err != nil {
@@ -2385,6 +2397,80 @@ func TestSendFailoverIgnoresStaleAckForEarlierRequest(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("second SendFailover did not complete after fresh ack")
+	}
+}
+
+func TestSendFailoverCommitWaitsForAck(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ss.SendFailoverCommit(7, 41)
+	}()
+
+	var hdrBuf [syncHeaderSize]byte
+	if _, err := io.ReadFull(peer, hdrBuf[:]); err != nil {
+		t.Fatalf("read failover commit header: %v", err)
+	}
+	if hdrBuf[4] != syncMsgFailoverCommit {
+		t.Fatalf("msg type = %d, want %d", hdrBuf[4], syncMsgFailoverCommit)
+	}
+	payloadLen := binary.LittleEndian.Uint32(hdrBuf[8:12])
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(peer, payload); err != nil {
+		t.Fatalf("read failover commit payload: %v", err)
+	}
+	if len(payload) != 9 || payload[0] != 7 {
+		t.Fatalf("payload = %v, want rg=7 with req_id", payload)
+	}
+	if gotReqID := binary.LittleEndian.Uint64(payload[1:9]); gotReqID != 41 {
+		t.Fatalf("reqID = %d, want 41", gotReqID)
+	}
+
+	ack := make([]byte, 10)
+	ack[0] = 7
+	ack[1] = failoverAckApplied
+	binary.LittleEndian.PutUint64(ack[2:10], 41)
+	ss.handleMessage(local, syncMsgFailoverCommitAck, ack)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SendFailoverCommit() error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SendFailoverCommit did not complete after ack")
+	}
+}
+
+func TestHandleRemoteFailoverCommitInvokesCallback(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	done := make(chan int, 1)
+	ss.OnRemoteFailoverCommit = func(rgID int) error {
+		done <- rgID
+		return nil
+	}
+
+	payload := make([]byte, 9)
+	payload[0] = 5
+	binary.LittleEndian.PutUint64(payload[1:9], 99)
+	ss.handleMessage(nil, syncMsgFailoverCommit, payload)
+
+	select {
+	case rgID := <-done:
+		if rgID != 5 {
+			t.Fatalf("callback rgID = %d, want 5", rgID)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("remote failover commit callback did not run")
 	}
 }
 

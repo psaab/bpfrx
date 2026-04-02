@@ -418,10 +418,8 @@ func TestManualFailover_UnknownRG(t *testing.T) {
 	}
 }
 
-func TestRequestPeerFailoverWaitsForLocalPrimary(t *testing.T) {
+func TestRequestPeerFailoverCommitsLocalPrimaryWithoutHeartbeatObservation(t *testing.T) {
 	m := NewManager(0, 1)
-	m.peerFailoverWaitTimeout = 200 * time.Millisecond
-	m.peerFailoverPollInterval = 5 * time.Millisecond
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
 	m.UpdateConfig(cfg)
 	<-m.Events()
@@ -433,22 +431,24 @@ func TestRequestPeerFailoverWaitsForLocalPrimary(t *testing.T) {
 			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
 		},
 	})
+	m.mu.Lock()
+	m.groups[0].Ready = true
+	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+	m.groups[0].ReadinessReasons = nil
+	m.mu.Unlock()
 
 	if m.IsLocalPrimary(0) {
 		t.Fatal("test setup error: should be secondary before peer failover")
 	}
 
-	m.SetPeerFailoverFunc(func(rgID int) error {
-		go func() {
-			time.Sleep(10 * time.Millisecond)
-			m.handlePeerHeartbeat(&HeartbeatPacket{
-				NodeID:    1,
-				ClusterID: 1,
-				Groups: []HeartbeatGroup{
-					{GroupID: uint8(rgID), Priority: 200, Weight: 255, State: uint8(StateSecondaryHold)},
-				},
-			})
-		}()
+	var committedRG int
+	var committedReqID uint64
+	m.SetPeerFailoverFunc(func(rgID int) (uint64, error) {
+		return 77, nil
+	})
+	m.SetPeerFailoverCommitFunc(func(rgID int, reqID uint64) error {
+		committedRG = rgID
+		committedReqID = reqID
 		return nil
 	})
 
@@ -456,17 +456,27 @@ func TestRequestPeerFailoverWaitsForLocalPrimary(t *testing.T) {
 		t.Fatalf("RequestPeerFailover() error = %v", err)
 	}
 	if !m.IsLocalPrimary(0) {
-		t.Fatal("should be primary after peer transfer-out is observed")
+		t.Fatal("should be primary after explicit transfer commit")
+	}
+	if committedRG != 0 || committedReqID != 77 {
+		t.Fatalf("commit = rg %d req %d, want rg 0 req 77", committedRG, committedReqID)
+	}
+	if peer := m.PeerGroupStates()[0]; peer.State != StateSecondary {
+		t.Fatalf("peer state = %s, want secondary after commit", peer.State)
 	}
 }
 
-func TestRequestPeerFailoverTimesOutWithoutPromotion(t *testing.T) {
+func TestRequestPeerFailoverRequiresLocalReadiness(t *testing.T) {
 	m := NewManager(0, 1)
-	m.peerFailoverWaitTimeout = 30 * time.Millisecond
-	m.peerFailoverPollInterval = 5 * time.Millisecond
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
 	m.UpdateConfig(cfg)
 	<-m.Events()
+	m.mu.Lock()
+	rg := m.groups[0]
+	rg.Ready = false
+	rg.ReadySince = time.Time{}
+	rg.ReadinessReasons = []string{"userspace not ready"}
+	m.mu.Unlock()
 
 	m.handlePeerHeartbeat(&HeartbeatPacket{
 		NodeID:    1,
@@ -476,14 +486,45 @@ func TestRequestPeerFailoverTimesOutWithoutPromotion(t *testing.T) {
 		},
 	})
 
-	m.SetPeerFailoverFunc(func(rgID int) error { return nil })
+	called := false
+	m.SetPeerFailoverFunc(func(rgID int) (uint64, error) {
+		called = true
+		return 0, nil
+	})
+	m.SetPeerFailoverCommitFunc(func(rgID int, reqID uint64) error { return nil })
 
 	err := m.RequestPeerFailover(0)
 	if err == nil {
-		t.Fatal("expected timeout waiting for local primary")
+		t.Fatal("expected local readiness error")
 	}
-	if !strings.Contains(err.Error(), "timed out waiting for redundancy group 0 to become primary") {
+	if !strings.Contains(err.Error(), "not ready for explicit failover") {
 		t.Fatalf("RequestPeerFailover() error = %v", err)
+	}
+	if called {
+		t.Fatal("peer failover request should not be sent while local node is not ready")
+	}
+}
+
+func TestFinalizePeerTransferOutClearsSecondaryHold(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	if err := m.ManualFailover(0); err != nil {
+		t.Fatalf("ManualFailover() error = %v", err)
+	}
+	<-m.Events()
+
+	if err := m.FinalizePeerTransferOut(0); err != nil {
+		t.Fatalf("FinalizePeerTransferOut() error = %v", err)
+	}
+	state := m.GroupState(0)
+	if state.State != StateSecondary {
+		t.Fatalf("state = %s, want secondary", state.State)
+	}
+	if state.ManualFailover {
+		t.Fatal("ManualFailover should be cleared after peer commit")
 	}
 }
 

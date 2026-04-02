@@ -4451,7 +4451,7 @@ func (c *CLI) handleRequestChassisClusterFailover(args []string) error {
 				if err := c.cluster.RequestPeerFailover(rgID); err != nil {
 					return err
 				}
-				fmt.Printf("Manual failover completed for redundancy group %d (peer transfer-out observed)\n", rgID)
+				fmt.Printf("Manual failover completed for redundancy group %d (transfer committed)\n", rgID)
 				return nil
 			}
 		}

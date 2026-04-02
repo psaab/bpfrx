@@ -1457,10 +1457,14 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				}
 				return nil
 			}
+			d.sessionSync.OnRemoteFailoverCommit = func(rgID int) error {
+				return d.cluster.FinalizePeerTransferOut(rgID)
+			}
 
 			// Wire peer failover sender so cluster Manager can send remote
 			// failover requests via the fabric sync connection.
 			d.cluster.SetPeerFailoverFunc(d.sessionSync.SendFailover)
+			d.cluster.SetPeerFailoverCommitFunc(d.sessionSync.SendFailoverCommit)
 			d.cluster.SetPreManualFailoverHook(d.prepareUserspaceManualFailover)
 			d.cluster.SetPeerTimeoutGuard(d.shouldSuppressPeerHeartbeatTimeout)
 

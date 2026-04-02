@@ -7477,7 +7477,7 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 						return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 					}
 					return &pb.SystemActionResponse{
-						Message: fmt.Sprintf("Manual failover completed for redundancy group %d (peer transfer-out observed)", rgID),
+						Message: fmt.Sprintf("Manual failover completed for redundancy group %d (transfer committed)", rgID),
 					}, nil
 				}
 				// Target is peer → local failover (fall through)
