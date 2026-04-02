@@ -11,6 +11,7 @@ dataplane and the userspace AF_XDP dataplane.
 | [standalone-vm.md](standalone-vm.md) | Single-VM forwarding, NAT, policy | `make test-deploy` |
 | [ha-cluster.md](ha-cluster.md) | HA failover, crash recovery, session sync | `make test-failover` |
 | [failover-testing.md](failover-testing.md) | End-to-end failover-only runbook across userspace and eBPF HA clusters | Manual + scripts |
+| [manual-failover-transfer-commit-validation.md](manual-failover-transfer-commit-validation.md) | Live validation of sync-channel manual failover completion after `#397` | Manual |
 | [userspace-fabric-failover.md](userspace-fabric-failover.md) | Userspace RG move across fabric, failover hardening, artifact interpretation | `scripts/userspace-ha-failover-validation.sh` |
 | [userspace-dataplane.md](userspace-dataplane.md) | AF_XDP forwarding, cold start, neighbor resolution | Manual + scripts |
 | [native-gre.md](native-gre.md) | Native GRE transit, failover, host-origin validation | `scripts/userspace-native-gre-validation.sh` |

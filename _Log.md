@@ -76,6 +76,10 @@
 
 ## 2026-04-02
 
+- **Timestamp**: 2026-04-02T16:45:00Z
+  - **Action**: Validate `#397` on `loss-userspace-cluster` — settled RG0 manual failover now completes on explicit failover ack + commit ack instead of heartbeat observation; filed residual issue `#398` for failover admission while requester is still in bulk receive
+  - **File(s)**: testing-docs/manual-failover-transfer-commit-validation.md, testing-docs/README.md
+
 - **Timestamp**: 2026-04-02T13:15:00Z
   - **Action**: Second #390 slice — add explicit sync-channel failover ack handshake so manual RG transfer returns applied/rejected instead of inferring success from send-only behavior
   - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_test.go, pkg/cluster/cluster.go, pkg/daemon/daemon_ha.go, pkg/cli/cli.go
