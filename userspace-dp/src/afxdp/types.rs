@@ -105,7 +105,7 @@ impl FlowCacheEntry {
         matches!(meta.protocol, PROTO_TCP | PROTO_UDP)
             && !decision.nat.nat64
             && !decision.nat.nptv6
-            && decision.resolution.disposition == ForwardingDisposition::ForwardCandidate
+            && decision.resolution.disposition.is_cacheable()
     }
 
     pub(super) fn from_forward_decision(
@@ -483,6 +483,39 @@ pub(crate) enum ForwardingDisposition {
     NextTableUnsupported,
 }
 
+impl ForwardingDisposition {
+    /// Whether this disposition produces a stable forwarding decision that can
+    /// be stored in the per-worker flow cache.
+    ///
+    /// Cacheable:
+    ///   - `ForwardCandidate`: Normal forwarded traffic with a resolved
+    ///     neighbor and egress interface. The common fast path.
+    ///
+    /// Not cacheable:
+    ///   - `FabricRedirect`: Targets a fabric overlay binding that differs
+    ///     from the normal egress binding. Fabric target selection depends on
+    ///     per-packet queue hashing and binding availability, which the cache
+    ///     entry cannot capture. Also, fabric sessions may flip back to
+    ///     ForwardCandidate after failback, making cached fabric entries stale.
+    ///   - `LocalDelivery`: Delivered to the kernel stack, not forwarded
+    ///     through XSK bindings. No rewrite descriptor to cache.
+    ///   - `HAInactive`: The owning RG is not active on this node. Transient
+    ///     state that changes on failover — must never be cached.
+    ///   - `PolicyDenied`: Packet was denied by policy. Drop decisions are
+    ///     not cached to allow policy changes to take effect immediately.
+    ///   - `NoRoute`: No route to destination. Transient — may resolve when
+    ///     FIB is updated.
+    ///   - `MissingNeighbor`: Route exists but ARP/NDP is unresolved.
+    ///     Transient — resolves when the neighbor entry appears.
+    ///   - `DiscardRoute`: Matched a discard/reject route. Not cacheable for
+    ///     the same reason as PolicyDenied.
+    ///   - `NextTableUnsupported`: Inter-VRF route leaking hit an
+    ///     unsupported next-table. Permanent miss, not worth caching.
+    pub(super) fn is_cacheable(self) -> bool {
+        matches!(self, ForwardingDisposition::ForwardCandidate)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForwardingResolution {
     pub(crate) disposition: ForwardingDisposition,
@@ -774,4 +807,465 @@ pub(super) struct DebugPollCounters {
     pub(super) fwd_tcp_fin: u64,
     pub(super) fwd_tcp_rst: u64,
     pub(super) fwd_tcp_zero_window: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::atomic::AtomicU32;
+
+    const PROTO_TCP: u8 = 6;
+    const PROTO_UDP: u8 = 17;
+
+    fn make_key() -> crate::session::SessionKey {
+        crate::session::SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 1, 100)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 50, 200)),
+            src_port: 45678,
+            dst_port: 443,
+        }
+    }
+
+    fn make_descriptor() -> RewriteDescriptor {
+        RewriteDescriptor {
+            dst_mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x01, 0x01],
+            tx_vlan_id: 0,
+            ether_type: 0x0800,
+            rewrite_src_ip: None,
+            rewrite_dst_ip: None,
+            rewrite_src_port: None,
+            rewrite_dst_port: None,
+            ip_csum_delta: 0,
+            l4_csum_delta: 0,
+            egress_ifindex: 6,
+            tx_ifindex: 6,
+            target_binding_index: None,
+            nat64: false,
+            nptv6: false,
+            apply_nat_on_fabric: false,
+        }
+    }
+
+    fn make_resolution(disposition: ForwardingDisposition) -> ForwardingResolution {
+        ForwardingResolution {
+            disposition,
+            local_ifindex: 0,
+            egress_ifindex: 6,
+            tx_ifindex: 6,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
+            neighbor_mac: Some([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x01, 0x01]),
+            tx_vlan_id: 0,
+        }
+    }
+
+    fn make_decision(disposition: ForwardingDisposition) -> SessionDecision {
+        SessionDecision {
+            resolution: make_resolution(disposition),
+            nat: NatDecision::default(),
+        }
+    }
+
+    fn make_metadata(owner_rg_id: i32) -> SessionMetadata {
+        SessionMetadata {
+            ingress_zone: Arc::<str>::from("trust"),
+            egress_zone: Arc::<str>::from("untrust"),
+            owner_rg_id,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+        }
+    }
+
+    fn make_meta(protocol: u8) -> UserspaceDpMeta {
+        UserspaceDpMeta {
+            protocol,
+            addr_family: libc::AF_INET as u8,
+            ingress_ifindex: 7,
+            tcp_flags: 0x10, // ACK only
+            ..Default::default()
+        }
+    }
+
+    fn make_entry(
+        key: crate::session::SessionKey,
+        stamp: FlowCacheStamp,
+        owner_rg_id: i32,
+    ) -> FlowCacheEntry {
+        FlowCacheEntry {
+            key,
+            ingress_ifindex: 7,
+            descriptor: make_descriptor(),
+            decision: make_decision(ForwardingDisposition::ForwardCandidate),
+            metadata: make_metadata(owner_rg_id),
+            stamp,
+        }
+    }
+
+    fn default_rg_epochs() -> [AtomicU32; MAX_RG_EPOCHS] {
+        std::array::from_fn(|_| AtomicU32::new(0))
+    }
+
+    // ----------------------------------------------------------------
+    // (a) Cache hit — same binding, matching stamp
+    // ----------------------------------------------------------------
+    #[test]
+    fn cache_hit_with_matching_stamp() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let key = make_key();
+        let stamp = FlowCacheStamp {
+            config_generation: 5,
+            fib_generation: 3,
+            owner_rg_id: 1,
+            owner_rg_epoch: 0,
+        };
+        cache.insert(make_entry(key.clone(), stamp, 1));
+
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 5,
+            fib_generation: 3,
+        };
+        let hit = cache.lookup(&key, lookup, &rg_epochs);
+        assert!(hit.is_some(), "expected cache hit with matching stamp");
+        assert_eq!(cache.hits, 1);
+        assert_eq!(cache.misses, 0);
+    }
+
+    // ----------------------------------------------------------------
+    // (b) Stale config generation → miss
+    // ----------------------------------------------------------------
+    #[test]
+    fn stale_config_generation_causes_miss() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let key = make_key();
+        let stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 1,
+            owner_rg_id: 0,
+            owner_rg_epoch: 0,
+        };
+        cache.insert(make_entry(key.clone(), stamp, 0));
+
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 2, // newer than entry's 1
+            fib_generation: 1,
+        };
+        let hit = cache.lookup(&key, lookup, &rg_epochs);
+        assert!(hit.is_none(), "expected miss on stale config_generation");
+        assert_eq!(cache.misses, 1);
+    }
+
+    // ----------------------------------------------------------------
+    // (c) Stale FIB generation → miss
+    // ----------------------------------------------------------------
+    #[test]
+    fn stale_fib_generation_causes_miss() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let key = make_key();
+        let stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 5,
+            owner_rg_id: 0,
+            owner_rg_epoch: 0,
+        };
+        cache.insert(make_entry(key.clone(), stamp, 0));
+
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 1,
+            fib_generation: 6, // newer than entry's 5
+        };
+        let hit = cache.lookup(&key, lookup, &rg_epochs);
+        assert!(hit.is_none(), "expected miss on stale fib_generation");
+        assert_eq!(cache.misses, 1);
+    }
+
+    // ----------------------------------------------------------------
+    // (d) Stale RG epoch → miss
+    // ----------------------------------------------------------------
+    #[test]
+    fn stale_rg_epoch_causes_miss() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let key = make_key();
+        let stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 1,
+            owner_rg_id: 1,
+            owner_rg_epoch: 3,
+        };
+        // Set current epoch to match so the insert is "valid" at that moment.
+        rg_epochs[1].store(3, Ordering::Relaxed);
+        cache.insert(make_entry(key.clone(), stamp, 1));
+
+        // Bump RG 1 epoch to 4 — simulates failover/demotion.
+        rg_epochs[1].store(4, Ordering::Relaxed);
+
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 1,
+            fib_generation: 1,
+        };
+        let hit = cache.lookup(&key, lookup, &rg_epochs);
+        assert!(hit.is_none(), "expected miss on stale RG epoch");
+        assert_eq!(cache.misses, 1);
+        // Stale RG epoch also triggers eviction of the entry.
+        assert_eq!(cache.evictions, 1);
+    }
+
+    // ----------------------------------------------------------------
+    // (e) Unrelated RG epoch bump does not cause miss
+    // ----------------------------------------------------------------
+    #[test]
+    fn unrelated_rg_epoch_bump_still_hits() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let key = make_key();
+        let stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 1,
+            owner_rg_id: 1,
+            owner_rg_epoch: 0,
+        };
+        cache.insert(make_entry(key.clone(), stamp, 1));
+
+        // Bump RG 2 — unrelated to the entry's owner RG 1.
+        rg_epochs[2].store(99, Ordering::Relaxed);
+
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 1,
+            fib_generation: 1,
+        };
+        let hit = cache.lookup(&key, lookup, &rg_epochs);
+        assert!(hit.is_some(), "expected hit — only unrelated RG was bumped");
+        assert_eq!(cache.hits, 1);
+        assert_eq!(cache.misses, 0);
+    }
+
+    // ----------------------------------------------------------------
+    // (f) Non-cacheable dispositions rejected by should_cache
+    // ----------------------------------------------------------------
+    #[test]
+    fn non_cacheable_dispositions_rejected() {
+        let meta = make_meta(PROTO_TCP);
+        let non_cacheable = [
+            ForwardingDisposition::NoRoute,
+            ForwardingDisposition::MissingNeighbor,
+            ForwardingDisposition::HAInactive,
+            ForwardingDisposition::PolicyDenied,
+            ForwardingDisposition::LocalDelivery,
+        ];
+        for disposition in non_cacheable {
+            let decision = make_decision(disposition);
+            assert!(
+                !FlowCacheEntry::should_cache(meta, decision),
+                "expected should_cache=false for {:?}",
+                disposition,
+            );
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // (g) ForwardCandidate is cacheable
+    // ----------------------------------------------------------------
+    #[test]
+    fn forward_candidate_is_cacheable() {
+        let meta_tcp = make_meta(PROTO_TCP);
+        let meta_udp = make_meta(PROTO_UDP);
+        let decision = make_decision(ForwardingDisposition::ForwardCandidate);
+
+        assert!(
+            FlowCacheEntry::should_cache(meta_tcp, decision),
+            "TCP ForwardCandidate should be cacheable",
+        );
+        assert!(
+            FlowCacheEntry::should_cache(meta_udp, decision),
+            "UDP ForwardCandidate should be cacheable",
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // (g-extra) NAT64 and NPTv6 decisions are not cacheable
+    // ----------------------------------------------------------------
+    #[test]
+    fn nat64_and_nptv6_not_cacheable() {
+        let meta = make_meta(PROTO_TCP);
+
+        let mut nat64_decision = make_decision(ForwardingDisposition::ForwardCandidate);
+        nat64_decision.nat.nat64 = true;
+        assert!(
+            !FlowCacheEntry::should_cache(meta, nat64_decision),
+            "NAT64 should not be cacheable",
+        );
+
+        let mut nptv6_decision = make_decision(ForwardingDisposition::ForwardCandidate);
+        nptv6_decision.nat.nptv6 = true;
+        assert!(
+            !FlowCacheEntry::should_cache(meta, nptv6_decision),
+            "NPTv6 should not be cacheable",
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // (h) from_forward_decision round-trip
+    // ----------------------------------------------------------------
+    #[test]
+    fn from_forward_decision_round_trip() {
+        let rg_epochs = default_rg_epochs();
+        let key = make_key();
+        let flow = SessionFlow {
+            src_ip: key.src_ip,
+            dst_ip: key.dst_ip,
+            forward_key: key.clone(),
+        };
+        let meta = UserspaceDpMeta {
+            protocol: PROTO_TCP,
+            addr_family: libc::AF_INET as u8,
+            ingress_ifindex: 7,
+            tcp_flags: 0x10,
+            config_generation: 10,
+            fib_generation: 3,
+            ..Default::default()
+        };
+        let validation = ValidationState {
+            snapshot_installed: true,
+            config_generation: 10,
+            fib_generation: 3,
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 6,
+                tx_ifindex: 6,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1))),
+                neighbor_mac: Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x01, 0x01]),
+                tx_vlan_id: 50,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 8))),
+                rewrite_dst: None,
+                rewrite_src_port: Some(1024),
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        };
+        let ingress_zone = Some(Arc::<str>::from("trust"));
+
+        // ForwardingState needs egress entry so owner_rg_for_resolution can
+        // look up the redundancy_group for egress_ifindex=6.
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            6,
+            EgressInterface {
+                bind_ifindex: 6,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x01, 0x01],
+                zone: "trust".to_string(),
+                redundancy_group: 1,
+                primary_v4: Some(Ipv4Addr::new(10, 0, 1, 1)),
+                primary_v6: None,
+            },
+        );
+
+        let entry = FlowCacheEntry::from_forward_decision(
+            &flow,
+            meta,
+            validation,
+            decision,
+            ingress_zone.clone(),
+            &forwarding,
+            false,
+            &rg_epochs,
+        );
+        let entry = entry.expect("should produce a cache entry for ForwardCandidate");
+
+        // Key and ingress match input.
+        assert_eq!(entry.key, key);
+        assert_eq!(entry.ingress_ifindex, 7);
+
+        // Decision round-trips exactly.
+        assert_eq!(entry.decision, decision);
+
+        // Descriptor carries the resolution's MAC/VLAN/ifindex data.
+        assert_eq!(entry.descriptor.dst_mac, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert_eq!(entry.descriptor.src_mac, [0x02, 0xbf, 0x72, 0x00, 0x01, 0x01]);
+        assert_eq!(entry.descriptor.tx_vlan_id, 50);
+        assert_eq!(entry.descriptor.egress_ifindex, 6);
+        assert_eq!(entry.descriptor.tx_ifindex, 6);
+        assert_eq!(entry.descriptor.ether_type, 0x0800);
+
+        // NAT rewrite fields propagated.
+        assert_eq!(
+            entry.descriptor.rewrite_src_ip,
+            Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 8))),
+        );
+        assert_eq!(entry.descriptor.rewrite_dst_ip, None);
+        assert_eq!(entry.descriptor.rewrite_src_port, Some(1024));
+        assert_eq!(entry.descriptor.rewrite_dst_port, None);
+        assert!(!entry.descriptor.nat64);
+        assert!(!entry.descriptor.nptv6);
+        assert!(!entry.descriptor.apply_nat_on_fabric);
+
+        // Stamp matches validation + RG epoch.
+        assert_eq!(entry.stamp.config_generation, 10);
+        assert_eq!(entry.stamp.fib_generation, 3);
+        assert_eq!(entry.stamp.owner_rg_id, 1); // from egress RG
+        assert_eq!(entry.stamp.owner_rg_epoch, 0); // rg_epochs all start at 0
+
+        // Metadata carries ingress zone and owner RG.
+        assert_eq!(&*entry.metadata.ingress_zone, "trust");
+        assert_eq!(entry.metadata.owner_rg_id, 1);
+        assert!(!entry.metadata.fabric_ingress);
+    }
+
+    // ----------------------------------------------------------------
+    // (h-extra) from_forward_decision returns None for non-cacheable
+    // ----------------------------------------------------------------
+    #[test]
+    fn from_forward_decision_returns_none_for_non_cacheable() {
+        let rg_epochs = default_rg_epochs();
+        let key = make_key();
+        let flow = SessionFlow {
+            src_ip: key.src_ip,
+            dst_ip: key.dst_ip,
+            forward_key: key,
+        };
+        let meta = make_meta(PROTO_TCP);
+        let validation = ValidationState {
+            snapshot_installed: true,
+            config_generation: 1,
+            fib_generation: 1,
+        };
+        // NoRoute is not cacheable.
+        let decision = make_decision(ForwardingDisposition::NoRoute);
+        let forwarding = ForwardingState::default();
+
+        let entry = FlowCacheEntry::from_forward_decision(
+            &flow,
+            meta,
+            validation,
+            decision,
+            None,
+            &forwarding,
+            false,
+            &rg_epochs,
+        );
+        assert!(entry.is_none(), "NoRoute should not produce a cache entry");
+    }
 }
