@@ -3319,7 +3319,7 @@ fn poll_binding(
                                                         key.addr_family, key.protocol,
                                                         key.src_ip, key.src_port, key.dst_ip, key.dst_port,
                                                         decision.nat.rewrite_src, decision.nat.rewrite_dst,
-                                                        metadata.is_reverse, metadata.synced, origin.as_str(),
+                                                        metadata.is_reverse, origin.is_peer_synced(), origin.as_str(),
                                                     );
                                                     count += 1;
                                                 }
@@ -3370,7 +3370,6 @@ fn poll_binding(
                                     // state. Publish only the exact observed key back into the
                                     // BPF session map so subsequent established packets bypass
                                     // userspace and return directly to the kernel.
-                                    synced: true,
                                     nat64_reverse: None,
                                 };
                                 if install_helper_local_session_on_miss(
@@ -3659,7 +3658,6 @@ fn poll_binding(
                                             owner_rg_id,
                                             fabric_ingress,
                                             is_reverse: false,
-                                            synced: false,
                                             nat64_reverse: nat64_info,
                                         };
                                         if track_in_userspace
@@ -3787,7 +3785,6 @@ fn poll_binding(
                                             owner_rg_id,
                                             fabric_ingress,
                                             is_reverse: true,
-                                            synced: false,
                                             nat64_reverse: nat64_info,
                                         };
                                         if track_in_userspace
@@ -4324,7 +4321,6 @@ fn poll_binding(
                                         owner_rg_id: cache_owner_rg_id,
                                         fabric_ingress: false,
                                         is_reverse: false,
-                                        synced: false,
                                         nat64_reverse: None,
                                     },
                                     rg_epoch: FlowCache::current_rg_epoch(
@@ -5003,7 +4999,6 @@ fn build_missing_neighbor_session_metadata(
         owner_rg_id: owner_rg_for_resolution(forwarding, decision.resolution),
         fabric_ingress: ingress_is_fabric(forwarding, ingress_ifindex),
         is_reverse: false,
-        synced: true,
         nat64_reverse: None,
     }
 }
@@ -5658,11 +5653,12 @@ fn worker_loop(
         let expired_entries = sessions.expire_stale_entries(loop_now_ns);
         let expired = expired_entries.len() as u64;
         for expired_entry in expired_entries {
-            delete_session_map_entry_for_removed_session_with_conntrack(
+            delete_session_map_entry_for_removed_session_with_origin(
                 session_map_fd,
                 &expired_entry.key,
                 expired_entry.decision,
                 &expired_entry.metadata,
+                expired_entry.origin,
                 conntrack_v4_fd,
                 conntrack_v6_fd,
             );
@@ -6577,7 +6573,6 @@ mod tests {
                 owner_rg_id: 1,
                 fabric_ingress: false,
                 is_reverse: false,
-                synced: false,
                 nat64_reverse: None,
             },
             origin: SessionOrigin::SyncImport,
@@ -6585,7 +6580,7 @@ mod tests {
             tcp_flags: 0,
         };
         let replica = synced_replica_entry(&entry);
-        assert!(replica.metadata.synced);
+        assert!(replica.origin.is_peer_synced());
         assert_eq!(replica.key, entry.key);
         assert_eq!(replica.decision, entry.decision);
     }
@@ -6618,7 +6613,6 @@ mod tests {
                 owner_rg_id: 1,
                 fabric_ingress: false,
                 is_reverse: false,
-                synced: true,
                 nat64_reverse: None,
             },
             origin: SessionOrigin::SyncImport,
@@ -6671,7 +6665,6 @@ mod tests {
                 owner_rg_id: 1,
                 fabric_ingress: false,
                 is_reverse: false,
-                synced: true,
                 nat64_reverse: None,
             },
             origin: SessionOrigin::SyncImport,
@@ -6693,7 +6686,7 @@ mod tests {
             match pending.front().expect("queued command") {
                 WorkerCommand::UpsertSynced(replayed_entry) => {
                     assert_eq!(replayed_entry.key, entry.key);
-                    assert!(replayed_entry.metadata.synced);
+                    assert!(replayed_entry.origin.is_peer_synced());
                 }
                 other => panic!("unexpected command queued during replay: {other:?}"),
             }
@@ -7682,7 +7675,6 @@ mod tests {
                 owner_rg_id: 0,
                 fabric_ingress: false,
                 is_reverse: false,
-                synced: false,
                 nat64_reverse: None,
             },
         };
@@ -7805,7 +7797,6 @@ mod tests {
                 owner_rg_id: 0,
                 fabric_ingress: false,
                 is_reverse: false,
-                synced: false,
                 nat64_reverse: None,
             },
         };
@@ -7921,7 +7912,6 @@ mod tests {
                 owner_rg_id: 0,
                 fabric_ingress: false,
                 is_reverse: false,
-                synced: false,
                 nat64_reverse: None,
             },
         };
@@ -8054,7 +8044,6 @@ mod tests {
                 owner_rg_id: 0,
                 fabric_ingress: false,
                 is_reverse: false,
-                synced: false,
                 nat64_reverse: None,
             },
         };
@@ -8186,7 +8175,6 @@ mod tests {
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
-            synced: false,
             nat64_reverse: None,
         };
         let mut sessions = SessionTable::new();
@@ -8303,7 +8291,6 @@ mod tests {
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
-            synced: false,
             nat64_reverse: None,
         };
 
@@ -8334,7 +8321,6 @@ mod tests {
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: true,
-            synced: false,
             nat64_reverse: None,
         };
 
@@ -8487,7 +8473,6 @@ mod tests {
                 owner_rg_id: 0,
                 fabric_ingress: false,
                 is_reverse: false,
-                synced: true,
                 nat64_reverse: None,
             },
             origin: SessionOrigin::SyncImport,

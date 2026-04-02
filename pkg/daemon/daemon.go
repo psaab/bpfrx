@@ -214,6 +214,11 @@ type Daemon struct {
 	// existing HA/session-sync transport.
 	userspaceSessionIDs atomic.Uint64
 
+	// eventStreamConnected is set when the helper's binary event stream
+	// is live. The polling fallback loop uses this to decide its cadence:
+	// 5s reconciliation when connected, 100ms fast-poll when disconnected.
+	eventStreamConnected atomic.Bool
+
 	// userspaceDeltaSyncMu serializes helper delta draining between the
 	// periodic background sync loop and the RG demotion prepare path.
 	// Demotion prepare must drain and barrier its continuity-critical
@@ -1919,7 +1924,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 				})
 				slog.Info("deferring fabric IPVLAN creation until XSK binds complete",
 					"parent", parentLinux, "name", fabLinux)
-				continue
+				// continue // DISABLED: deferred IPVLAN broke forwarding
 			}
 			// XSK already bound — fall through to reconcile.
 		}
@@ -3667,14 +3672,30 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 		return
 	}
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	const (
+		fastInterval          = 100 * time.Millisecond // event stream disconnected
+		reconcileInterval     = 5 * time.Second        // event stream connected
+	)
+	ticker := time.NewTicker(fastInterval)
 	defer ticker.Stop()
+	wasConnected := false
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+
+		// Adjust cadence based on event stream state.
+		connected := d.eventStreamConnected.Load()
+		if connected != wasConnected {
+			wasConnected = connected
+			if connected {
+				ticker.Reset(reconcileInterval)
+			} else {
+				ticker.Reset(fastInterval)
+			}
 		}
 
 		if d.cluster == nil || d.sessionSync == nil {
@@ -3733,10 +3754,11 @@ func (d *Daemon) runUserspaceEventStream(ctx context.Context) {
 		d.handleEventStreamFullResync()
 	})
 
-	slog.Info("userspace: event stream consumer started")
+	slog.Info("userspace: event stream consumer started, polling is primary until stream connects")
 
-	// Monitor connection. When the stream is disconnected, fall back to
-	// polling via the existing DrainSessionDeltas RPC.
+	// Monitor connection. When the stream is connected, events arrive via
+	// callback and polling drops to 5s reconciliation. When disconnected,
+	// polling resumes at 100ms.
 	d.eventStreamFallbackLoop(ctx, provider)
 }
 
@@ -3808,10 +3830,20 @@ func (d *Daemon) handleEventStreamFullResync() {
 
 // eventStreamFallbackLoop monitors the event stream connection and falls back
 // to polling via DrainSessionDeltas when the stream is disconnected.
+// When the event stream is live, polling slows to 5s reconciliation;
+// when disconnected, it runs at 100ms to compensate for the lost stream.
 func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspaceEventStreamProvider) {
 	drainer, hasDrainer := d.dp.(userspaceSessionDeltaDrainer)
-	ticker := time.NewTicker(500 * time.Millisecond)
+
+	const (
+		fastInterval      = 100 * time.Millisecond // event stream disconnected
+		reconcileInterval = 5 * time.Second         // event stream connected
+	)
+	ticker := time.NewTicker(fastInterval)
 	defer ticker.Stop()
+	wasConnected := false
+
+	defer d.eventStreamConnected.Store(false)
 
 	for {
 		select {
@@ -3821,12 +3853,50 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 		}
 
 		es := provider.EventStream()
-		if es != nil && es.IsConnected() {
-			// Stream is live — events arrive via callback, nothing to do.
+		connected := es != nil && es.IsConnected()
+
+		// Track transitions and adjust cadence.
+		if connected != wasConnected {
+			wasConnected = connected
+			d.eventStreamConnected.Store(connected)
+			if connected {
+				ticker.Reset(reconcileInterval)
+				slog.Info("userspace: event stream connected, polling reduced to reconciliation (5s)")
+			} else {
+				ticker.Reset(fastInterval)
+				slog.Info("userspace: event stream disconnected, polling resumed at 100ms")
+			}
+		}
+
+		if connected {
+			// Stream is live — run reconciliation drain to catch any
+			// missed events, but at the slow 5s cadence.
+			if !hasDrainer {
+				continue
+			}
+			if d.cluster == nil || d.sessionSync == nil {
+				return
+			}
+			if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
+				continue
+			}
+			if d.userspaceDemotionPrepActive() {
+				continue
+			}
+			cfg := d.store.ActiveConfig()
+			if cfg == nil {
+				continue
+			}
+			d.userspaceDeltaSyncMu.Lock()
+			n, _ := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
+			d.userspaceDeltaSyncMu.Unlock()
+			if n > 0 {
+				slog.Info("userspace: reconciliation drain caught missed deltas", "count", n)
+			}
 			continue
 		}
 
-		// Stream disconnected — fall back to polling.
+		// Stream disconnected — fall back to fast polling.
 		if !hasDrainer {
 			continue
 		}

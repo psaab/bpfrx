@@ -1977,7 +1977,6 @@ fn build_synced_session_entry(req: &SessionSyncRequest) -> Result<SyncedSessionE
             owner_rg_id: req.owner_rg_id,
             fabric_ingress: req.fabric_ingress,
             is_reverse: req.is_reverse,
-            synced: true,
             nat64_reverse: None,
         },
         origin: crate::session::SessionOrigin::SyncImport,
@@ -2538,7 +2537,7 @@ mod tests {
 
         let entry = build_synced_session_entry(&req).expect("synced session entry");
         assert!(entry.metadata.fabric_ingress);
-        assert!(entry.metadata.synced);
+        assert!(entry.origin.is_peer_synced());
         assert_eq!(entry.metadata.owner_rg_id, 1);
     }
 

@@ -208,7 +208,7 @@ fn export_forward_sessions_for_owner_rgs(sessions: &mut SessionTable, owner_rgs:
     let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
     let mut export = Vec::new();
     sessions.iter_with_origin(|key, decision, metadata, origin| {
-        if metadata.is_reverse || metadata.synced || metadata.fabric_ingress {
+        if metadata.is_reverse || origin.is_peer_synced() || metadata.fabric_ingress {
             return;
         }
         if !owner_rg_set.contains(&metadata.owner_rg_id) {
@@ -583,21 +583,21 @@ pub(super) fn demote_shared_owner_rgs(
     if let Ok(mut sessions) = shared_sessions.lock() {
         for entry in sessions.values_mut() {
             if should_demote(entry) {
-                entry.metadata.synced = true;
+                entry.origin = SessionOrigin::SyncImport;
             }
         }
     }
     if let Ok(mut sessions) = shared_nat_sessions.lock() {
         for entry in sessions.values_mut() {
             if should_demote(entry) {
-                entry.metadata.synced = true;
+                entry.origin = SessionOrigin::SyncImport;
             }
         }
     }
     if let Ok(mut sessions) = shared_forward_wire_sessions.lock() {
         for entry in sessions.values_mut() {
             if should_demote(entry) {
-                entry.metadata.synced = true;
+                entry.origin = SessionOrigin::SyncImport;
             }
         }
     }
@@ -605,7 +605,7 @@ pub(super) fn demote_shared_owner_rgs(
 
 pub(super) fn synced_replica_entry(entry: &SyncedSessionEntry) -> SyncedSessionEntry {
     let mut replica = entry.clone();
-    replica.metadata.synced = true;
+    replica.origin = SessionOrigin::SyncImport;
     replica
 }
 
@@ -644,7 +644,7 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
             let mut reverse_entries = Vec::new();
             sessions
                 .values()
-                .filter(|entry| !entry.metadata.is_reverse && entry.metadata.synced)
+                .filter(|entry| !entry.metadata.is_reverse && entry.origin.is_peer_synced())
                 .for_each(|entry| {
                     let Some(reverse) = synthesized_synced_reverse_entry(
                         forwarding,
@@ -1147,7 +1147,6 @@ fn build_reverse_session_from_forward_match(
         owner_rg_id: owner_rg_for_resolution(forwarding, resolution),
         fabric_ingress: forward_match.metadata.fabric_ingress,
         is_reverse: true,
-        synced: false,
         nat64_reverse: None,
     };
     let decision = SessionDecision {
@@ -1185,8 +1184,7 @@ pub(super) fn synthesized_synced_reverse_entry(
         now_secs,
         0,
     );
-    let mut metadata = reverse.metadata;
-    metadata.synced = true;
+    let metadata = reverse.metadata;
     Some(SyncedSessionEntry {
         key: reverse_key,
         decision: reverse.decision,
@@ -1304,19 +1302,19 @@ fn maybe_promote_synced_session(
     key: &SessionKey,
     decision: SessionDecision,
     metadata: SessionMetadata,
+    origin: SessionOrigin,
     ingress_ifindex: i32,
     now_ns: u64,
     protocol: u8,
     tcp_flags: u8,
 ) -> SessionMetadata {
-    if !metadata.synced
+    if !origin.is_peer_synced()
         || decision.resolution.disposition != ForwardingDisposition::ForwardCandidate
     {
         return metadata;
     }
 
     let mut promoted = metadata;
-    promoted.synced = false;
     if promoted.owner_rg_id <= 0 {
         promoted.owner_rg_id = owner_rg_for_resolution(forwarding, decision.resolution);
     }
@@ -1371,9 +1369,10 @@ fn should_keep_synced_hit_transient(
     key: &SessionKey,
     decision: SessionDecision,
     metadata: &SessionMetadata,
+    origin: SessionOrigin,
 ) -> bool {
     ingress_is_fabric(forwarding, ingress_ifindex)
-        && metadata.synced
+        && origin.is_peer_synced()
         && !owner_rg_is_locally_active(ha_state, metadata.owner_rg_id, now_secs)
         && is_translated_forward_session_key(key, decision, metadata)
 }
@@ -1387,8 +1386,9 @@ fn purge_translated_synced_hit(
     key: &SessionKey,
     decision: SessionDecision,
     metadata: &SessionMetadata,
+    origin: SessionOrigin,
 ) {
-    if !metadata.synced || !is_translated_forward_session_key(key, decision, metadata) {
+    if !origin.is_peer_synced() || !is_translated_forward_session_key(key, decision, metadata) {
         return;
     }
     remove_shared_session(
@@ -1427,18 +1427,24 @@ pub(super) fn resolve_flow_session_decision(
         now_ns,
         tcp_flags,
     ) {
+        let hit_origin = if hit.shared_entry.is_some() {
+            SessionOrigin::SharedMaterialize
+        } else {
+            SessionOrigin::ForwardFlow
+        };
         let poison_key = hit
             .shared_entry
             .as_ref()
-            .map(|entry| (&entry.key, entry.decision, &entry.metadata))
+            .map(|entry| (&entry.key, entry.decision, &entry.metadata, entry.origin))
             .or_else(|| {
                 Some((
                     hit.key.as_ref(&flow.forward_key),
                     hit.lookup.decision,
                     &hit.lookup.metadata,
+                    hit_origin,
                 ))
             });
-        let keep_transient = poison_key.is_some_and(|(key, decision, metadata)| {
+        let keep_transient = poison_key.is_some_and(|(key, decision, metadata, origin)| {
             should_keep_synced_hit_transient(
                 forwarding,
                 ha_state,
@@ -1447,9 +1453,10 @@ pub(super) fn resolve_flow_session_decision(
                 key,
                 decision,
                 metadata,
+                origin,
             )
         });
-        if keep_transient && let Some((key, decision, metadata)) = poison_key {
+        if keep_transient && let Some((key, decision, metadata, origin)) = poison_key {
             purge_translated_synced_hit(
                 sessions,
                 session_map_fd,
@@ -1459,9 +1466,9 @@ pub(super) fn resolve_flow_session_decision(
                 key,
                 decision,
                 metadata,
+                origin,
             );
         }
-
         let resolved = if keep_transient {
             hit.lookup.clone()
         } else {
@@ -1509,6 +1516,7 @@ pub(super) fn resolve_flow_session_decision(
                 resolved_key,
                 decision,
                 resolved.metadata,
+                hit_origin,
                 ingress_ifindex,
                 now_ns,
                 protocol,
@@ -1570,6 +1578,8 @@ pub(super) fn resolve_flow_session_decision(
         ingress_ifindex,
         resolved.metadata.ingress_zone.as_ref(),
     );
+    // Reverse sessions created from forward NAT matches are locally
+    // created (ReverseFlow), not peer-synced, so they won't be promoted.
     let metadata = maybe_promote_synced_session(
         sessions,
         session_map_fd,
@@ -1581,6 +1591,7 @@ pub(super) fn resolve_flow_session_decision(
         &flow.forward_key,
         decision,
         resolved.metadata,
+        SessionOrigin::ReverseFlow,
         ingress_ifindex,
         now_ns,
         protocol,
@@ -1720,7 +1731,6 @@ mod tests {
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
-            synced: false,
             nat64_reverse: None,
         }
     }
@@ -1829,12 +1839,13 @@ mod tests {
         let mut sessions = SessionTable::new();
         let key = test_key();
         let decision = test_decision();
-        let mut metadata = test_metadata();
-        metadata.synced = true;
-        assert!(sessions.install_with_protocol(
+        let metadata = test_metadata();
+        // Install with SyncImport origin to mark as peer-synced
+        assert!(sessions.install_with_protocol_with_origin(
             key.clone(),
             decision,
             metadata.clone(),
+            SessionOrigin::SyncImport,
             1_000_000,
             PROTO_TCP,
             0x10,
@@ -1857,6 +1868,7 @@ mod tests {
             &key,
             decision,
             metadata,
+            SessionOrigin::SyncImport,
             21,
             2_000_000,
             PROTO_TCP,
@@ -1864,7 +1876,6 @@ mod tests {
         );
 
         assert!(promoted.fabric_ingress);
-        assert!(!promoted.synced);
     }
 
     #[test]
@@ -1910,7 +1921,6 @@ mod tests {
                 },
             },
             metadata: SessionMetadata {
-                synced: true,
                 fabric_ingress: true,
                 ..test_metadata()
             },
@@ -1986,7 +1996,6 @@ mod tests {
             key: key.clone(),
             decision: test_decision(),
             metadata: SessionMetadata {
-                synced: true,
                 ..test_metadata()
             },
             origin: SessionOrigin::SyncImport,
@@ -2031,7 +2040,6 @@ mod tests {
             key: key.clone(),
             decision,
             metadata: SessionMetadata {
-                synced: true,
                 ..test_metadata()
             },
             origin: SessionOrigin::SyncImport,
@@ -2120,7 +2128,6 @@ mod tests {
             key: key.clone(),
             decision,
             metadata: SessionMetadata {
-                synced: true,
                 ..test_metadata()
             },
             origin: SessionOrigin::SyncImport,
@@ -2249,7 +2256,6 @@ mod tests {
             key: key.clone(),
             decision,
             metadata: SessionMetadata {
-                synced: true,
                 ..test_metadata()
             },
             origin: SessionOrigin::SyncImport,
@@ -2295,7 +2301,7 @@ mod tests {
         .expect("translated forward hit should resolve");
 
         assert!(!resolved.created);
-        assert!(!resolved.metadata.synced);
+
         assert!(sessions.lookup(&translated_key, 1_000_000, 0x10).is_none());
         let local_hit = sessions
             .find_forward_wire_match(&translated_key)
@@ -2322,7 +2328,6 @@ mod tests {
             key: translated_key.clone(),
             decision,
             metadata: SessionMetadata {
-                synced: true,
                 ..test_metadata()
             },
             origin: SessionOrigin::SyncImport,
@@ -2393,12 +2398,12 @@ mod tests {
             ForwardingDisposition::ForwardCandidate
         );
         assert_eq!(resolved.decision.resolution.egress_ifindex, 12);
-        assert!(!resolved.metadata.synced);
+
         let local_hit = sessions
             .lookup(&translated_key, 1_000_000, 0x18)
             .expect("promoted translated hit should stay local");
         assert_eq!(local_hit.decision.nat, decision.nat);
-        assert!(!local_hit.metadata.synced);
+
         assert!(
             shared_sessions
                 .lock()
@@ -2427,7 +2432,6 @@ mod tests {
             translated_key.clone(),
             decision,
             SessionMetadata {
-                synced: true,
                 ..test_metadata()
             },
             SessionOrigin::SyncImport,
@@ -2493,12 +2497,12 @@ mod tests {
             ForwardingDisposition::ForwardCandidate
         );
         assert_eq!(resolved.decision.resolution.egress_ifindex, 12);
-        assert!(!resolved.metadata.synced);
+
         let local_hit = sessions
             .lookup(&translated_key, 1_000_000, 0x18)
             .expect("promoted translated local hit should stay local");
         assert_eq!(local_hit.decision.nat, decision.nat);
-        assert!(!local_hit.metadata.synced);
+
     }
 
     #[test]
@@ -2520,7 +2524,6 @@ mod tests {
             key: translated_key.clone(),
             decision,
             metadata: SessionMetadata {
-                synced: true,
                 ..test_metadata()
             },
             origin: SessionOrigin::SyncImport,
@@ -2586,7 +2589,7 @@ mod tests {
         )
         .expect("translated shared hit should resolve");
 
-        assert!(resolved.metadata.synced);
+
         assert!(sessions.lookup(&translated_key, 1_000_000, 0x18).is_none());
     }
 
@@ -2605,7 +2608,6 @@ mod tests {
             0x10,
         ));
         let synced_metadata = SessionMetadata {
-            synced: true,
             ..test_metadata()
         };
         let synced_decision = SessionDecision {
@@ -2694,7 +2696,6 @@ mod tests {
                 key: key.clone(),
                 decision: synced_decision,
                 metadata: SessionMetadata {
-                    synced: true,
                     ..test_metadata()
                 },
                 origin: SessionOrigin::SyncImport,
@@ -2766,7 +2767,7 @@ mod tests {
         assert_eq!(results.cancelled_keys, vec![key.clone()]);
 
         let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("demoted hit");
-        assert!(hit.metadata.synced);
+
     }
 
     #[test]
@@ -2903,7 +2904,7 @@ mod tests {
         let hit = sessions
             .lookup(&key, 2_000_000, 0x10)
             .expect("demoted reverse hit");
-        assert!(hit.metadata.synced);
+
     }
 
     #[test]
@@ -2938,7 +2939,6 @@ mod tests {
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: true,
-            synced: false,
             nat64_reverse: None,
         };
         assert!(sessions.install_with_protocol(
@@ -2979,7 +2979,7 @@ mod tests {
         let hit = sessions
             .lookup(&key, 2_000_000, 0x10)
             .expect("demoted reverse hit");
-        assert!(hit.metadata.synced);
+
         assert_eq!(hit.metadata.owner_rg_id, 1);
         assert_eq!(
             hit.decision.resolution.disposition,
@@ -3047,7 +3047,7 @@ mod tests {
         let hit = sessions
             .lookup(&key, 2_000_000, 0x10)
             .expect("demoted forward hit");
-        assert!(hit.metadata.synced);
+
         assert_eq!(
             hit.decision.resolution.disposition,
             ForwardingDisposition::FabricRedirect
@@ -3065,7 +3065,7 @@ mod tests {
             Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)))
         );
         assert!(deltas[0].fabric_redirect_sync);
-        assert!(!deltas[0].metadata.synced);
+
     }
 
     #[test]
@@ -3131,7 +3131,7 @@ mod tests {
         let hit = sessions
             .lookup(&key, 2_000_000, 0x10)
             .expect("prepared forward hit");
-        assert!(!hit.metadata.synced);
+
         assert_eq!(
             hit.decision.resolution.disposition,
             ForwardingDisposition::ForwardCandidate
@@ -3206,7 +3206,7 @@ mod tests {
         let hit = sessions
             .lookup(&key, 2_000_000, 0x10)
             .expect("exported forward hit");
-        assert!(!hit.metadata.synced);
+
         assert_eq!(
             hit.decision.resolution.disposition,
             ForwardingDisposition::ForwardCandidate
@@ -3249,7 +3249,6 @@ mod tests {
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: true,
-            synced: false,
             nat64_reverse: None,
         };
         assert!(sessions.install_with_protocol(
@@ -3330,7 +3329,6 @@ mod tests {
             owner_rg_id: 2,
             fabric_ingress: false,
             is_reverse: true,
-            synced: false,
             nat64_reverse: None,
         };
         assert!(sessions.install_with_protocol(
@@ -3423,7 +3421,6 @@ mod tests {
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
-            synced: false,
             nat64_reverse: None,
         };
         assert!(sessions.install_with_protocol(
@@ -3475,7 +3472,7 @@ mod tests {
 
     #[test]
     fn apply_worker_commands_refreshes_synced_forward_sessions_for_activated_owner_rg() {
-        // Synced forward sessions (synced: true) must be re-resolved when
+        // Peer-synced forward sessions (origin.is_peer_synced()) must be re-resolved when
         // the owner RG activates locally.  Before the fix, refresh_local()
         // skipped synced entries, leaving them with the peer's stale
         // resolution. This caused SNAT to not be applied after failover.
@@ -3512,13 +3509,14 @@ mod tests {
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
-            synced: true,  // <-- synced from peer
             nat64_reverse: None,
         };
-        assert!(sessions.install_with_protocol(
+        // Install with SyncImport origin to represent peer-synced session
+        assert!(sessions.install_with_protocol_with_origin(
             key.clone(),
             decision,
             metadata,
+            SessionOrigin::SyncImport,
             1_000_000,
             PROTO_TCP,
             0x10,
@@ -3616,14 +3614,14 @@ mod tests {
             .get(&forward.key)
             .cloned()
             .expect("forward entry");
-        assert!(shared_forward.metadata.synced);
+        assert!(shared_forward.origin.is_peer_synced());
         let shared_reverse = shared_sessions
             .lock()
             .expect("shared sessions")
             .get(&reverse.key)
             .cloned()
             .expect("reverse entry");
-        assert!(shared_reverse.metadata.synced);
+        assert!(shared_reverse.origin.is_peer_synced());
         let reverse_alias = reverse_session_key(&forward.key, forward.decision.nat);
         let nat_alias = shared_nat_sessions
             .lock()
@@ -3631,7 +3629,7 @@ mod tests {
             .get(&reverse_alias)
             .cloned()
             .expect("nat alias");
-        assert!(nat_alias.metadata.synced);
+        assert!(nat_alias.origin.is_peer_synced());
     }
 
     #[test]
@@ -3640,7 +3638,6 @@ mod tests {
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut metadata = test_metadata();
         metadata.fabric_ingress = true;
-        metadata.synced = true;
         let entry = SyncedSessionEntry {
             key: test_key(),
             decision: test_decision(),
@@ -3660,7 +3657,7 @@ mod tests {
         .expect("reverse companion");
 
         assert!(reverse.metadata.is_reverse);
-        assert!(reverse.metadata.synced);
+        assert!(reverse.origin.is_peer_synced());
         assert!(reverse.metadata.fabric_ingress);
         assert_eq!(reverse.metadata.ingress_zone.as_ref(), "wan");
         assert_eq!(reverse.metadata.egress_zone.as_ref(), "lan");
@@ -3676,7 +3673,6 @@ mod tests {
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut metadata = test_metadata();
         metadata.fabric_ingress = true;
-        metadata.synced = true;
         let entry = SyncedSessionEntry {
             key: test_key(),
             decision: test_decision(),
@@ -3715,7 +3711,6 @@ mod tests {
         metadata.ingress_zone = Arc::<str>::from("lan");
         metadata.egress_zone = Arc::<str>::from("wan");
         metadata.fabric_ingress = false;
-        metadata.synced = true;
         let entry = SyncedSessionEntry {
             key: test_key(),
             decision: test_decision(),
@@ -3915,7 +3910,6 @@ mod tests {
                     owner_rg_id: 2,
                     fabric_ingress: false,
                     is_reverse: false,
-                    synced: false,
                     nat64_reverse: None,
                 },
             },
@@ -3952,7 +3946,6 @@ mod tests {
             key: test_key(),
             decision: test_decision(),
             metadata: SessionMetadata {
-                synced: true,
                 fabric_ingress: true,
                 ..test_metadata()
             },
@@ -3988,7 +3981,7 @@ mod tests {
             .cloned()
             .expect("reverse entry");
         assert!(reverse.metadata.is_reverse);
-        assert!(reverse.metadata.synced);
+        assert!(reverse.origin.is_peer_synced());
         assert_eq!(worker_commands[0].lock().expect("commands").len(), 1);
     }
 
@@ -4014,7 +4007,6 @@ mod tests {
             key: test_key(),
             decision: test_decision(),
             metadata: SessionMetadata {
-                synced: true,
                 fabric_ingress: true,
                 ..test_metadata()
             },

@@ -86,6 +86,7 @@ struct SessionEntry {
     decision: SessionDecision,
     metadata: SessionMetadata,
     origin: SessionOrigin,
+    install_epoch: u64,
     last_seen_ns: u64,
     expires_after_ns: u64,
     closing: bool,
@@ -104,7 +105,6 @@ pub(crate) struct SessionMetadata {
     pub(crate) owner_rg_id: i32,
     pub(crate) fabric_ingress: bool,
     pub(crate) is_reverse: bool,
-    pub(crate) synced: bool,
     /// For NAT64 sessions: stores original IPv6 addresses so reverse IPv4
     /// replies can be translated back.
     pub(crate) nat64_reverse: Option<Nat64ReverseInfo>,
@@ -148,6 +148,16 @@ impl SessionOrigin {
             Self::WorkerLocalImport => "worker_local_import",
         }
     }
+
+    /// Returns true for origins that represent peer-synced sessions.
+    /// These are sessions that arrived from the HA peer rather than
+    /// being created by local traffic.
+    pub(crate) fn is_peer_synced(self) -> bool {
+        matches!(
+            self,
+            Self::SyncImport | Self::SharedMaterialize | Self::WorkerLocalImport
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +181,7 @@ pub(crate) struct ExpiredSession {
     pub(crate) key: SessionKey,
     pub(crate) decision: SessionDecision,
     pub(crate) metadata: SessionMetadata,
+    pub(crate) origin: SessionOrigin,
 }
 
 pub(crate) struct SessionTable {
@@ -182,6 +193,7 @@ pub(crate) struct SessionTable {
     last_gc_ns: u64,
     max_sessions: usize,
     timeouts: SessionTimeouts,
+    epoch_counter: u64,
     expired: u64,
     create_drops: u64,
     delta_drops: u64,
@@ -199,11 +211,17 @@ impl SessionTable {
             last_gc_ns: 0,
             max_sessions: DEFAULT_MAX_SESSIONS,
             timeouts: SessionTimeouts::default(),
+            epoch_counter: 0,
             expired: 0,
             create_drops: 0,
             delta_drops: 0,
             delta_drained: 0,
         }
+    }
+
+    fn next_epoch(&mut self) -> u64 {
+        self.epoch_counter += 1;
+        self.epoch_counter
     }
 
     /// Update the configurable session timeouts.
@@ -247,7 +265,7 @@ impl SessionTable {
                 let metadata = entry.metadata;
                 if key.protocol == PROTO_TCP {
                     debug_log!(
-                        "SESS_EXPIRE: proto=TCP {}:{} -> {}:{} closing={} age_ns={} timeout_ns={} rev={} synced={} nat=({:?},{:?})",
+                        "SESS_EXPIRE: proto=TCP {}:{} -> {}:{} closing={} age_ns={} timeout_ns={} rev={} origin={} nat=({:?},{:?})",
                         key.src_ip,
                         key.src_port,
                         key.dst_ip,
@@ -256,12 +274,12 @@ impl SessionTable {
                         now_ns.saturating_sub(entry.last_seen_ns),
                         entry.expires_after_ns,
                         metadata.is_reverse,
-                        metadata.synced,
+                        entry.origin.as_str(),
                         decision.nat.rewrite_src,
                         decision.nat.rewrite_dst,
                     );
                 }
-                if !metadata.is_reverse && !metadata.synced {
+                if !metadata.is_reverse && !entry.origin.is_peer_synced() {
                     self.push_delta(SessionDelta {
                         kind: SessionDeltaKind::Close,
                         key: key.clone(),
@@ -275,6 +293,7 @@ impl SessionTable {
                     key: key.clone(),
                     decision,
                     metadata,
+                    origin: entry.origin,
                 });
             }
         }
@@ -398,19 +417,21 @@ impl SessionTable {
             return false;
         }
         self.remove_entry(&key);
+        let epoch = self.next_epoch();
         self.sessions.insert(
             key.clone(),
             SessionEntry {
                 decision,
                 metadata: metadata.clone(),
                 origin,
+                install_epoch: epoch,
                 last_seen_ns: now_ns,
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
             },
         );
         self.index_forward_nat_key(&key, decision, &metadata);
-        if !metadata.is_reverse && !metadata.synced {
+        if !metadata.is_reverse && !origin.is_peer_synced() {
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
                 key,
@@ -456,12 +477,15 @@ impl SessionTable {
         tcp_flags: u8,
         allow_replace_local: bool,
     ) -> bool {
-        if matches!(self.sessions.get(&key), Some(existing) if !existing.metadata.synced)
+        // Reject peer data that would clobber a locally-owned session
+        // unless explicitly allowed (e.g. during HA activation).
+        if matches!(self.sessions.get(&key), Some(existing) if !existing.origin.is_peer_synced())
             && !allow_replace_local
         {
             return false;
         }
         self.remove_entry(&key);
+        let epoch = self.next_epoch();
         let index_key = key.clone();
         self.sessions.insert(
             key,
@@ -469,6 +493,7 @@ impl SessionTable {
                 decision,
                 metadata: metadata.clone(),
                 origin,
+                install_epoch: epoch,
                 last_seen_ns: now_ns,
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
@@ -478,27 +503,16 @@ impl SessionTable {
         true
     }
 
-    pub fn promote_synced(
-        &mut self,
-        key: &SessionKey,
-        decision: SessionDecision,
-        metadata: SessionMetadata,
-        now_ns: u64,
-        protocol: u8,
-        tcp_flags: u8,
-    ) -> bool {
-        self.promote_synced_with_origin(
-            key,
-            decision,
-            metadata,
-            SessionOrigin::SharedPromote,
-            now_ns,
-            protocol,
-            tcp_flags,
-        )
-    }
-
-    pub fn promote_synced_with_origin(
+    /// Unified session update function replacing promote_synced,
+    /// refresh_local, and refresh_for_ha_activation.
+    ///
+    /// Collision rules:
+    /// - `ha_activation=true`: always updates (highest priority, used by
+    ///   RefreshOwnerRGs to re-resolve all sessions with local state)
+    /// - Peer-synced entries (origin.is_peer_synced()): local traffic can
+    ///   promote them (sets new origin + emits delta)
+    /// - Local entries (!origin.is_peer_synced()): rejects older peer data
+    pub fn update_session(
         &mut self,
         key: &SessionKey,
         decision: SessionDecision,
@@ -507,23 +521,37 @@ impl SessionTable {
         now_ns: u64,
         protocol: u8,
         tcp_flags: u8,
+        ha_activation: bool,
     ) -> bool {
         let Some(mut entry) = self.remove_entry(key) else {
             return false;
         };
-        if !entry.metadata.synced {
-            self.sessions.insert(key.clone(), entry);
-            return false;
+        if !ha_activation {
+            if entry.origin.is_peer_synced() && !origin.is_peer_synced() {
+                // Peer-synced entry being promoted by local traffic — allow
+            } else if entry.origin.is_peer_synced() && origin.is_peer_synced() {
+                // Both peer-synced: reject (refresh_local on synced entry)
+                self.sessions.insert(key.clone(), entry);
+                return false;
+            } else if !entry.origin.is_peer_synced() && origin.is_peer_synced() {
+                // Local entry: reject peer data trying to overwrite
+                self.sessions.insert(key.clone(), entry);
+                return false;
+            }
+            // Both local: allow (local refresh of local entry)
         }
+        let was_peer_synced = entry.origin.is_peer_synced();
         entry.decision = decision;
         entry.metadata = metadata.clone();
         entry.origin = origin;
+        entry.install_epoch = self.next_epoch();
         entry.last_seen_ns = now_ns;
         entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &self.timeouts);
         entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
         self.sessions.insert(key.clone(), entry);
         self.index_forward_nat_key(key, decision, &metadata);
-        if !metadata.is_reverse {
+        // Emit open delta when promoting a peer-synced entry to local
+        if was_peer_synced && !origin.is_peer_synced() && !metadata.is_reverse {
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
                 key: key.clone(),
@@ -536,6 +564,8 @@ impl SessionTable {
         true
     }
 
+    /// Thin wrapper for local-only refresh (non-HA-activation path).
+    /// Keeps the existing origin; skips peer-synced entries.
     pub fn refresh_local(
         &mut self,
         key: &SessionKey,
@@ -544,29 +574,25 @@ impl SessionTable {
         now_ns: u64,
         tcp_flags: u8,
     ) -> bool {
-        let Some(mut entry) = self.remove_entry(key) else {
-            return false;
-        };
-        if entry.metadata.synced {
-            self.sessions.insert(key.clone(), entry);
-            return false;
-        }
-        entry.decision = decision;
-        entry.metadata = metadata.clone();
-        entry.last_seen_ns = now_ns;
-        entry.expires_after_ns = session_timeout_ns(key.protocol, tcp_flags, &self.timeouts);
-        entry.closing = matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
-        self.sessions.insert(key.clone(), entry);
-        self.index_forward_nat_key(key, decision, &metadata);
-        true
+        let origin = self
+            .sessions
+            .get(key)
+            .map(|e| e.origin)
+            .unwrap_or(SessionOrigin::ForwardFlow);
+        self.update_session(
+            key,
+            decision,
+            metadata,
+            origin,
+            now_ns,
+            key.protocol,
+            tcp_flags,
+            false,
+        )
     }
 
-    /// Refresh a session's resolution and metadata during HA activation.
-    /// Unlike `refresh_local` (which skips synced sessions) and
-    /// `promote_synced` (which skips non-synced sessions), this method
-    /// updates the session regardless of `synced` status.  Used by
-    /// RefreshOwnerRGs to re-resolve both synced and locally-owned
-    /// sessions with local forwarding state after RG activation.
+    /// Convenience: refresh for HA activation (always updates regardless
+    /// of origin). Preserves existing origin.
     pub fn refresh_for_ha_activation(
         &mut self,
         key: &SessionKey,
@@ -575,17 +601,45 @@ impl SessionTable {
         now_ns: u64,
         tcp_flags: u8,
     ) -> bool {
-        let Some(mut entry) = self.remove_entry(key) else {
-            return false;
-        };
-        entry.decision = decision;
-        entry.metadata = metadata.clone();
-        entry.last_seen_ns = now_ns;
-        entry.expires_after_ns = session_timeout_ns(key.protocol, tcp_flags, &self.timeouts);
-        entry.closing = matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
-        self.sessions.insert(key.clone(), entry);
-        self.index_forward_nat_key(key, decision, &metadata);
-        true
+        let origin = self
+            .sessions
+            .get(key)
+            .map(|e| e.origin)
+            .unwrap_or(SessionOrigin::ForwardFlow);
+        self.update_session(
+            key,
+            decision,
+            metadata,
+            origin,
+            now_ns,
+            key.protocol,
+            tcp_flags,
+            true,
+        )
+    }
+
+    /// Promote a peer-synced session to local ownership.
+    /// Convenience wrapper around update_session.
+    pub fn promote_synced_with_origin(
+        &mut self,
+        key: &SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        origin: SessionOrigin,
+        now_ns: u64,
+        protocol: u8,
+        tcp_flags: u8,
+    ) -> bool {
+        self.update_session(
+            key,
+            decision,
+            metadata,
+            origin,
+            now_ns,
+            protocol,
+            tcp_flags,
+            false,
+        )
     }
 
     pub fn emit_open_delta(
@@ -633,7 +687,7 @@ impl SessionTable {
         let Some(entry) = self.sessions.get(key) else {
             return None;
         };
-        if !entry.metadata.synced
+        if !entry.origin.is_peer_synced()
             || entry.metadata.is_reverse
             || entry.decision.resolution.disposition != ForwardingDisposition::LocalDelivery
         {
@@ -651,10 +705,10 @@ impl SessionTable {
         }
         let mut demoted_keys = Vec::new();
         for (key, entry) in self.sessions.iter_mut() {
-            if entry.metadata.owner_rg_id != owner_rg_id || entry.metadata.synced {
+            if entry.metadata.owner_rg_id != owner_rg_id || entry.origin.is_peer_synced() {
                 continue;
             }
-            entry.metadata.synced = true;
+            entry.origin = SessionOrigin::SyncImport;
             demoted_keys.push(key.clone());
         }
         demoted_keys
@@ -990,7 +1044,6 @@ mod tests {
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
-            synced: false,
             nat64_reverse: None,
         }
     }
@@ -1051,10 +1104,7 @@ mod tests {
         let mut table = SessionTable::new();
         let key = key_v4();
         let then = 1_000_000_000u64;
-        let local_metadata = SessionMetadata {
-            synced: true,
-            ..metadata()
-        };
+        let local_metadata = metadata();
         let local_decision = SessionDecision {
             resolution: ForwardingResolution {
                 disposition: ForwardingDisposition::LocalDelivery,
@@ -1062,10 +1112,12 @@ mod tests {
             },
             nat: NatDecision::default(),
         };
-        assert!(table.install_with_protocol(
+        // Install with SyncImport origin to mark as peer-synced
+        assert!(table.install_with_protocol_with_origin(
             key.clone(),
             local_decision,
             local_metadata.clone(),
+            SessionOrigin::SyncImport,
             then,
             PROTO_TCP,
             0x10,
@@ -1084,10 +1136,7 @@ mod tests {
         let mut table = SessionTable::new();
         let key = key_v4();
         let now = 1_000_000_000u64;
-        let local_metadata = SessionMetadata {
-            synced: true,
-            ..metadata()
-        };
+        let local_metadata = metadata();
         let local_decision = SessionDecision {
             resolution: ForwardingResolution {
                 disposition: ForwardingDisposition::LocalDelivery,
@@ -1095,10 +1144,12 @@ mod tests {
             },
             nat: NatDecision::default(),
         };
-        assert!(table.install_with_protocol(
+        // Install with SyncImport origin so it's considered peer-synced
+        assert!(table.install_with_protocol_with_origin(
             key.clone(),
             local_decision,
             local_metadata.clone(),
+            SessionOrigin::SyncImport,
             now,
             PROTO_TCP,
             0x10,
@@ -1164,12 +1215,11 @@ mod tests {
         let mut table = SessionTable::new();
         let key = key_v4();
         let now = 1_000_000_000u64;
-        let mut synced = metadata();
-        synced.synced = true;
+        let synced_meta = metadata();
         table.upsert_synced(
             key.clone(),
             decision(),
-            synced.clone(),
+            synced_meta.clone(),
             now,
             PROTO_TCP,
             0x10,
@@ -1180,7 +1230,7 @@ mod tests {
             hit,
             Some(SessionLookup {
                 decision: decision(),
-                metadata: synced,
+                metadata: synced_meta,
             })
         );
         assert!(table.drain_deltas(8).is_empty());
@@ -1203,8 +1253,7 @@ mod tests {
             PROTO_TCP,
             0x10,
         ));
-        let mut synced = metadata();
-        synced.synced = true;
+        let synced_meta = metadata();
         table.upsert_synced(
             key.clone(),
             SessionDecision {
@@ -1214,7 +1263,7 @@ mod tests {
                 },
                 ..decision()
             },
-            synced,
+            synced_meta,
             now + 1_000_000,
             PROTO_TCP,
             0x10,
@@ -1234,8 +1283,7 @@ mod tests {
         let now = 1_000_000_000u64;
         let live = metadata();
         assert!(table.install_with_protocol(key.clone(), decision(), live, now, PROTO_TCP, 0x10,));
-        let mut synced = metadata();
-        synced.synced = true;
+        let synced_meta = metadata();
         let synced_decision = SessionDecision {
             nat: NatDecision {
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -1246,7 +1294,7 @@ mod tests {
         assert!(table.upsert_synced(
             key.clone(),
             synced_decision,
-            synced.clone(),
+            synced_meta.clone(),
             now + 1_000_000,
             PROTO_TCP,
             0x10,
@@ -1255,7 +1303,7 @@ mod tests {
         let hit = table
             .lookup(&key, now + 2_000_000, 0x10)
             .expect("synced session");
-        assert_eq!(hit.metadata, synced);
+        assert_eq!(hit.metadata, synced_meta);
         assert_eq!(hit.decision, synced_decision);
     }
 
@@ -1264,15 +1312,14 @@ mod tests {
         let mut table = SessionTable::new();
         let key = key_v4();
         let now = 1_000_000_000u64;
-        let mut synced = metadata();
-        synced.synced = true;
-        table.upsert_synced(key.clone(), decision(), synced, now, PROTO_TCP, 0x10, false);
-        let mut promoted = metadata();
-        promoted.synced = false;
-        assert!(table.promote_synced(
+        let synced_meta = metadata();
+        table.upsert_synced(key.clone(), decision(), synced_meta, now, PROTO_TCP, 0x10, false);
+        let promoted = metadata();
+        assert!(table.promote_synced_with_origin(
             &key,
             decision(),
             promoted.clone(),
+            SessionOrigin::SharedPromote,
             now + 1_000_000,
             PROTO_TCP,
             0x10,
@@ -1297,17 +1344,16 @@ mod tests {
         let mut table = SessionTable::new();
         let key = key_v4();
         let now = 1_000_000_000u64;
-        let mut synced = metadata();
-        synced.synced = true;
-        synced.is_reverse = true;
-        table.upsert_synced(key.clone(), decision(), synced, now, PROTO_TCP, 0x10, false);
+        let mut synced_meta = metadata();
+        synced_meta.is_reverse = true;
+        table.upsert_synced(key.clone(), decision(), synced_meta, now, PROTO_TCP, 0x10, false);
         let mut promoted = metadata();
-        promoted.synced = false;
         promoted.is_reverse = true;
-        assert!(table.promote_synced(
+        assert!(table.promote_synced_with_origin(
             &key,
             decision(),
             promoted.clone(),
+            SessionOrigin::SharedPromote,
             now + 1_000_000,
             PROTO_TCP,
             0x10,
@@ -1370,19 +1416,24 @@ mod tests {
 
         assert_eq!(table.demote_owner_rg(1).len(), 2);
 
+        // Verify demoted sessions have peer-synced origin
+        let mut a_origin = None;
+        let mut b_origin = None;
+        let mut other_origin = None;
+        table.iter_with_origin(|key, _decision, _metadata, origin| {
+            if key == &key_a {
+                a_origin = Some(origin);
+            } else if key == &key_b {
+                b_origin = Some(origin);
+            } else if key == &key_other {
+                other_origin = Some(origin);
+            }
+        });
+        assert!(a_origin.expect("key_a exists").is_peer_synced());
+        assert!(b_origin.expect("key_b exists").is_peer_synced());
         assert!(
-            table
-                .lookup(&key_a, now + 1_000_000, 0x10)
-                .expect("demoted key_a")
-                .metadata
-                .synced
-        );
-        assert!(
-            table
-                .lookup(&key_b, now + 1_000_000, 0x10)
-                .expect("demoted reverse key")
-                .metadata
-                .synced
+            !other_origin.expect("key_other exists").is_peer_synced(),
+            "other RG should remain local"
         );
         assert_eq!(
             table
@@ -1981,15 +2032,15 @@ mod tests {
     }
 
     #[test]
-    fn refresh_local_skips_synced_entries() {
+    fn refresh_local_skips_peer_synced_entries() {
         let mut table = SessionTable::new();
         let key = key_v4();
-        let mut meta = metadata();
-        meta.synced = true;
-        assert!(table.install_with_protocol(
+        // Install with SyncImport origin (peer-synced)
+        assert!(table.install_with_protocol_with_origin(
             key.clone(),
             decision(),
-            meta,
+            metadata(),
+            SessionOrigin::SyncImport,
             1_000_000,
             PROTO_TCP,
             0x10,
@@ -2001,7 +2052,7 @@ mod tests {
             },
             ..decision()
         };
-        // refresh_local should return false for synced sessions
+        // refresh_local should return false for peer-synced sessions
         assert!(!table.refresh_local(
             &key,
             new_decision,
@@ -2015,15 +2066,15 @@ mod tests {
     }
 
     #[test]
-    fn refresh_for_ha_activation_updates_synced_entries() {
+    fn refresh_for_ha_activation_updates_peer_synced_entries() {
         let mut table = SessionTable::new();
         let key = key_v4();
-        let mut meta = metadata();
-        meta.synced = true;
-        assert!(table.install_with_protocol(
+        // Install with SyncImport origin (peer-synced)
+        assert!(table.install_with_protocol_with_origin(
             key.clone(),
             decision(),
-            meta,
+            metadata(),
+            SessionOrigin::SyncImport,
             1_000_000,
             PROTO_TCP,
             0x10,
@@ -2035,7 +2086,7 @@ mod tests {
             },
             ..decision()
         };
-        // refresh_for_ha_activation should succeed even for synced sessions
+        // refresh_for_ha_activation should succeed even for peer-synced sessions
         assert!(table.refresh_for_ha_activation(
             &key,
             new_decision,

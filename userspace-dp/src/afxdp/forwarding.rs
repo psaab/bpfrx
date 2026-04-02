@@ -971,7 +971,6 @@ pub(super) fn cluster_peer_return_fast_path(
         owner_rg_id: owner_rg_for_resolution(forwarding, fabric_return_resolution),
         fabric_ingress: true,
         is_reverse: true,
-        synced: false,
         nat64_reverse: None,
     };
     Some((
@@ -2855,7 +2854,6 @@ mod tests {
         assert_eq!(metadata.ingress_zone.as_ref(), "lan");
         assert_eq!(metadata.egress_zone.as_ref(), "wan");
         assert!(metadata.fabric_ingress);
-        assert!(metadata.synced);
         assert!(!metadata.is_reverse);
     }
 
@@ -3000,7 +2998,6 @@ mod tests {
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: false,
-                synced: false,
                 nat64_reverse: None,
             },
         };
@@ -3050,7 +3047,6 @@ mod tests {
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: false,
-                synced: false,
                 nat64_reverse: None,
             },
         };
@@ -3100,7 +3096,6 @@ mod tests {
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: false,
-                synced: false,
                 nat64_reverse: None,
             },
         };
@@ -3154,7 +3149,6 @@ mod tests {
                 owner_rg_id: 2,
                 fabric_ingress: false,
                 is_reverse: false,
-                synced: false,
                 nat64_reverse: None,
             },
         };
@@ -3529,7 +3523,6 @@ mod tests {
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
-            synced: true,
             nat64_reverse: None,
         };
 
@@ -3592,7 +3585,6 @@ mod tests {
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
-            synced: true,
             nat64_reverse: None,
         };
         let entry = SyncedSessionEntry {
@@ -3604,10 +3596,13 @@ mod tests {
             tcp_flags: 0x10,
         };
 
-        assert!(sessions.install_with_protocol(
+        // Install with SyncImport origin so take_synced_local recognizes
+        // this as a peer-synced session.
+        assert!(sessions.install_with_protocol_with_origin(
             key.clone(),
             decision,
             metadata,
+            SessionOrigin::SyncImport,
             1_000_000,
             PROTO_TCP,
             0x10,

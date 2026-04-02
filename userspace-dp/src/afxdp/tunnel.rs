@@ -175,7 +175,6 @@ pub(super) fn build_local_origin_tunnel_tx_request(
             owner_rg_id: owner_rg_for_resolution(forwarding, decision.resolution),
             fabric_ingress: false,
             is_reverse: false,
-            synced: true,
             nat64_reverse: None,
         },
         origin: SessionOrigin::SyncImport,

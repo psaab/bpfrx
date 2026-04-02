@@ -3,8 +3,9 @@ use super::*;
 fn uses_kernel_local_session_map_entry(
     decision: SessionDecision,
     metadata: &SessionMetadata,
+    origin: SessionOrigin,
 ) -> bool {
-    metadata.synced
+    origin.is_peer_synced()
         && !metadata.is_reverse
         && decision.resolution.disposition == ForwardingDisposition::LocalDelivery
         && decision.resolution.tunnel_endpoint_id == 0
@@ -795,7 +796,23 @@ pub(super) fn publish_session_map_entry_for_session(
     decision: SessionDecision,
     metadata: &SessionMetadata,
 ) -> io::Result<()> {
-    publish_session_map_entry_for_session_with_conntrack(map_fd, key, decision, metadata, None)
+    publish_session_map_entry_for_session_with_origin(
+        map_fd,
+        key,
+        decision,
+        metadata,
+        SessionOrigin::ForwardFlow,
+    )
+}
+
+pub(super) fn publish_session_map_entry_for_session_with_origin(
+    map_fd: c_int,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    origin: SessionOrigin,
+) -> io::Result<()> {
+    publish_session_map_entry_for_session_with_conntrack(map_fd, key, decision, metadata, origin, None)
 }
 
 pub(super) fn publish_session_map_entry_for_session_with_conntrack(
@@ -803,9 +820,10 @@ pub(super) fn publish_session_map_entry_for_session_with_conntrack(
     key: &SessionKey,
     decision: SessionDecision,
     metadata: &SessionMetadata,
+    origin: SessionOrigin,
     ct: Option<ConntrackCtx<'_>>,
 ) -> io::Result<()> {
-    if uses_kernel_local_session_map_entry(decision, metadata) {
+    if uses_kernel_local_session_map_entry(decision, metadata, origin) {
         publish_kernel_local_session_key(map_fd, key)?;
         // For SNATed local-delivery sessions (e.g., ICMP to an interface-NAT
         // address), the reply packet arrives with the SNAT address as
@@ -1068,18 +1086,23 @@ pub(super) fn delete_session_map_entry_for_removed_session(
     decision: SessionDecision,
     metadata: &SessionMetadata,
 ) {
-    delete_session_map_entry_for_removed_session_with_conntrack(map_fd, key, decision, metadata, -1, -1);
+    // Default to SyncImport for backwards-compatible callers where
+    // the session being deleted is always from a sync path.
+    delete_session_map_entry_for_removed_session_with_origin(
+        map_fd, key, decision, metadata, SessionOrigin::SyncImport, -1, -1,
+    );
 }
 
-pub(super) fn delete_session_map_entry_for_removed_session_with_conntrack(
+pub(super) fn delete_session_map_entry_for_removed_session_with_origin(
     map_fd: c_int,
     key: &SessionKey,
     decision: SessionDecision,
     metadata: &SessionMetadata,
+    origin: SessionOrigin,
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
 ) {
-    if uses_kernel_local_session_map_entry(decision, metadata) {
+    if uses_kernel_local_session_map_entry(decision, metadata, origin) {
         delete_live_session_key(map_fd, key);
         // Also delete the reverse-wire alias published for SNATed
         // kernel-local sessions (see publish_session_map_entry_for_session).
@@ -1124,7 +1147,6 @@ mod tests {
             owner_rg_id: 1,
             fabric_ingress: false,
             is_reverse: false,
-            synced: true,
             nat64_reverse: None,
         }
     }
@@ -1134,17 +1156,20 @@ mod tests {
         let metadata = synced_forward_metadata();
         assert!(uses_kernel_local_session_map_entry(
             local_delivery_decision(0),
-            &metadata
+            &metadata,
+            SessionOrigin::SyncImport,
         ));
         assert!(!uses_kernel_local_session_map_entry(
             local_delivery_decision(7),
-            &metadata
+            &metadata,
+            SessionOrigin::SyncImport,
         ));
     }
 
     #[test]
     fn kernel_local_session_map_entry_rejects_non_kernel_local_cases() {
-        let mut metadata = synced_forward_metadata();
+        let metadata = synced_forward_metadata();
+        // Not local delivery → rejected
         assert!(!uses_kernel_local_session_map_entry(
             SessionDecision {
                 resolution: ForwardingResolution {
@@ -1153,20 +1178,24 @@ mod tests {
                 },
                 nat: NatDecision::default(),
             },
-            &metadata
+            &metadata,
+            SessionOrigin::SyncImport,
         ));
 
-        metadata.synced = false;
+        // Non-peer-synced origin → rejected
         assert!(!uses_kernel_local_session_map_entry(
             local_delivery_decision(0),
-            &metadata
+            &metadata,
+            SessionOrigin::ForwardFlow,
         ));
 
-        metadata.synced = true;
-        metadata.is_reverse = true;
+        // Reverse session → rejected
+        let mut reverse_metadata = synced_forward_metadata();
+        reverse_metadata.is_reverse = true;
         assert!(!uses_kernel_local_session_map_entry(
             local_delivery_decision(0),
-            &metadata
+            &reverse_metadata,
+            SessionOrigin::SyncImport,
         ));
     }
 

@@ -1011,7 +1011,6 @@ mod tests {
             owner_rg_id: 0,
             fabric_ingress: false,
             is_reverse: false,
-            synced: false,
             nat64_reverse: None,
         }
     }
@@ -1178,7 +1177,6 @@ mod tests {
                 owner_rg_id: 0,
                 fabric_ingress: true,
                 is_reverse: false,
-                synced: false,
                 nat64_reverse: None,
             },
             origin: crate::session::SessionOrigin::ForwardFlow,
