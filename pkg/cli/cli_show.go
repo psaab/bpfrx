@@ -1,0 +1,7887 @@
+package cli
+
+import (
+	"encoding/binary"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/psaab/bpfrx/pkg/appid"
+	"github.com/psaab/bpfrx/pkg/cmdtree"
+	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/dataplane"
+	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
+	"github.com/psaab/bpfrx/pkg/dhcp"
+	"github.com/psaab/bpfrx/pkg/dhcpserver"
+	"github.com/psaab/bpfrx/pkg/feeds"
+	"github.com/psaab/bpfrx/pkg/frr"
+	"github.com/psaab/bpfrx/pkg/logging"
+	"github.com/psaab/bpfrx/pkg/routing"
+	"github.com/psaab/bpfrx/pkg/vrrp"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
+)
+
+func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) error {
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("dataplane not loaded")
+		return nil
+	}
+
+	fmt.Println("Logical system: root-logical-system")
+	fmt.Printf("%-8s%-17s%-18s%-24s%-14s%s\n",
+		"Index", "From zone", "To zone", "Name", "Policy count", "Action")
+
+	index := uint32(1)
+	policySetID := uint32(0)
+	for _, zpp := range cfg.Security.Policies {
+		if fromZone != "" && zpp.FromZone != fromZone {
+			policySetID++
+			continue
+		}
+		if toZone != "" && zpp.ToZone != toZone {
+			policySetID++
+			continue
+		}
+		for i, pol := range zpp.Policies {
+			action := "Permit"
+			switch pol.Action {
+			case 1:
+				action = "Deny"
+			case 2:
+				action = "Reject"
+			}
+			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+			var count uint64
+			if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
+				count = counters.Packets
+			}
+			fmt.Printf("%-8d%-17s%-18s%-24s%-14d%s\n",
+				index, zpp.FromZone, zpp.ToZone, pol.Name, count, action)
+			index++
+		}
+		policySetID++
+	}
+	// Global policies
+	if len(cfg.Security.GlobalPolicies) > 0 && fromZone == "" && toZone == "" {
+		for i, pol := range cfg.Security.GlobalPolicies {
+			action := "Permit"
+			switch pol.Action {
+			case 1:
+				action = "Deny"
+			case 2:
+				action = "Reject"
+			}
+			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+			var count uint64
+			if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
+				count = counters.Packets
+			}
+			fmt.Printf("%-8d%-17s%-18s%-24s%-14d%s\n",
+				index, "junos-global", "junos-global", pol.Name, count, action)
+			index++
+		}
+	}
+	return nil
+}
+
+// showPoliciesDetail displays an expanded Junos-style detail view of security policies.
+
+func (c *CLI) showPoliciesDetail(cfg *config.Config, fromZone, toZone string) error {
+	policySetID := uint32(0)
+	seqNum := 1
+	for _, zpp := range cfg.Security.Policies {
+		if fromZone != "" && zpp.FromZone != fromZone {
+			policySetID++
+			continue
+		}
+		if toZone != "" && zpp.ToZone != toZone {
+			policySetID++
+			continue
+		}
+		for i, pol := range zpp.Policies {
+			action := "permit"
+			switch pol.Action {
+			case 1:
+				action = "deny"
+			case 2:
+				action = "reject"
+			}
+			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+			fmt.Printf("Policy: %s, action-type: %s, State: enabled, Index: %d, Scope Policy: 0\n",
+				pol.Name, action, ruleID)
+			fmt.Printf("  Policy Type: Configured\n")
+			fmt.Printf("  Sequence number: %d\n", seqNum)
+			fmt.Printf("  From zone: %s, To zone: %s\n", zpp.FromZone, zpp.ToZone)
+			if pol.Description != "" {
+				fmt.Printf("  Description: %s\n", pol.Description)
+			}
+			fmt.Printf("  Source addresses:\n")
+			for _, addr := range pol.Match.SourceAddresses {
+				if addr == "any" {
+					fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
+					fmt.Printf("    any-ipv6(global): ::/0\n")
+				} else {
+					resolved := resolveAddressDetail(cfg, addr)
+					fmt.Printf("    %s(global): %s\n", addr, resolved)
+				}
+			}
+			fmt.Printf("  Destination addresses:\n")
+			for _, addr := range pol.Match.DestinationAddresses {
+				if addr == "any" {
+					fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
+					fmt.Printf("    any-ipv6(global): ::/0\n")
+				} else {
+					resolved := resolveAddressDetail(cfg, addr)
+					fmt.Printf("    %s(global): %s\n", addr, resolved)
+				}
+			}
+			for _, app := range pol.Match.Applications {
+				fmt.Printf("  Application: %s\n", app)
+				c.printAppDetail(cfg, app)
+			}
+			if pol.Log != nil {
+				parts := []string{}
+				if pol.Log.SessionInit {
+					parts = append(parts, "at-create")
+				}
+				if pol.Log.SessionClose {
+					parts = append(parts, "at-close")
+				}
+				if len(parts) > 0 {
+					fmt.Printf("  Session log: %s\n", strings.Join(parts, ", "))
+				}
+			}
+			seqNum++
+
+			_ = ruleID // available for future counter display
+		}
+		policySetID++
+		fmt.Println()
+	}
+
+	// Global policies
+	if len(cfg.Security.GlobalPolicies) > 0 && fromZone == "" && toZone == "" {
+		for i, pol := range cfg.Security.GlobalPolicies {
+			action := "permit"
+			switch pol.Action {
+			case 1:
+				action = "deny"
+			case 2:
+				action = "reject"
+			}
+			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
+			fmt.Printf("Policy: %s, action-type: %s, State: enabled, Index: %d, Scope Policy: 0\n",
+				pol.Name, action, ruleID)
+			fmt.Printf("  Policy Type: Configured\n")
+			fmt.Printf("  Sequence number: %d\n", seqNum)
+			fmt.Printf("  From zone: junos-global, To zone: junos-global\n")
+			if pol.Description != "" {
+				fmt.Printf("  Description: %s\n", pol.Description)
+			}
+			fmt.Printf("  Source addresses:\n")
+			for _, addr := range pol.Match.SourceAddresses {
+				if addr == "any" {
+					fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
+					fmt.Printf("    any-ipv6(global): ::/0\n")
+				} else {
+					resolved := resolveAddressDetail(cfg, addr)
+					fmt.Printf("    %s(global): %s\n", addr, resolved)
+				}
+			}
+			fmt.Printf("  Destination addresses:\n")
+			for _, addr := range pol.Match.DestinationAddresses {
+				if addr == "any" {
+					fmt.Printf("    any-ipv4(global): 0.0.0.0/0\n")
+					fmt.Printf("    any-ipv6(global): ::/0\n")
+				} else {
+					resolved := resolveAddressDetail(cfg, addr)
+					fmt.Printf("    %s(global): %s\n", addr, resolved)
+				}
+			}
+			for _, app := range pol.Match.Applications {
+				fmt.Printf("  Application: %s\n", app)
+				c.printAppDetail(cfg, app)
+			}
+			if pol.Log != nil {
+				parts := []string{}
+				if pol.Log.SessionInit {
+					parts = append(parts, "at-create")
+				}
+				if pol.Log.SessionClose {
+					parts = append(parts, "at-close")
+				}
+				if len(parts) > 0 {
+					fmt.Printf("  Session log: %s\n", strings.Join(parts, ", "))
+				}
+			}
+			seqNum++
+
+			_ = ruleID
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+// resolveAddressDetail returns the CIDR for an address name, or the name itself if not found.
+
+func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone string) error {
+	// Sort zone names for stable output
+	zoneNames := make([]string, 0, len(cfg.Security.Zones))
+	for name := range cfg.Security.Zones {
+		zoneNames = append(zoneNames, name)
+	}
+	sort.Strings(zoneNames)
+
+	for _, name := range zoneNames {
+		if filterZone != "" && name != filterZone {
+			continue
+		}
+		zone := cfg.Security.Zones[name]
+
+		// Resolve zone ID for counter lookup
+		var zoneID uint16
+		if c.dp != nil {
+			if cr := c.dp.LastCompileResult(); cr != nil {
+				zoneID = cr.ZoneIDs[name]
+			}
+		}
+
+		// Junos format: "Security zone: <name>"
+		fmt.Printf("Security zone: %s\n", name)
+		if zoneID > 0 {
+			fmt.Printf("  Zone ID: %d\n", zoneID)
+		}
+		if zone.Description != "" {
+			fmt.Printf("  Description: %s\n", zone.Description)
+		}
+		tcpRstStr := "Off"
+		if zone.TCPRst {
+			tcpRstStr = "On"
+		}
+		fmt.Printf("  Send reset for non-SYN session TCP packets: %s\n", tcpRstStr)
+		fmt.Printf("  Policy configurable: Yes\n")
+		if zone.ScreenProfile != "" {
+			fmt.Printf("  Screen: %s\n", zone.ScreenProfile)
+		}
+		fmt.Printf("  Interfaces bound: %d\n", len(zone.Interfaces))
+		fmt.Printf("  Interfaces:\n")
+		for _, ifName := range zone.Interfaces {
+			fmt.Printf("    %s\n", ifName)
+		}
+		if zone.HostInboundTraffic != nil {
+			if len(zone.HostInboundTraffic.SystemServices) > 0 {
+				fmt.Printf("  Allowed host-inbound traffic: %s\n",
+					strings.Join(zone.HostInboundTraffic.SystemServices, " "))
+			}
+			if len(zone.HostInboundTraffic.Protocols) > 0 {
+				fmt.Printf("  Allowed host-inbound protocols: %s\n",
+					strings.Join(zone.HostInboundTraffic.Protocols, " "))
+			}
+		}
+
+		// Per-zone traffic counters (bpfrx extension, not in Junos)
+		if c.dp != nil && c.dp.IsLoaded() && zoneID > 0 {
+			ingress, errIn := c.dp.ReadZoneCounters(zoneID, 0)
+			egress, errOut := c.dp.ReadZoneCounters(zoneID, 1)
+			if errIn == nil && errOut == nil {
+				fmt.Println("  Traffic statistics:")
+				fmt.Printf("    Input:  %d packets, %d bytes\n",
+					ingress.Packets, ingress.Bytes)
+				fmt.Printf("    Output: %d packets, %d bytes\n",
+					egress.Packets, egress.Bytes)
+			}
+		}
+
+		// Detail mode: per-interface breakdown, per-policy details, screen profile summary
+		if detail {
+			// Per-interface detail
+			if len(zone.Interfaces) > 0 {
+				fmt.Println("  Interface details:")
+				for _, ifName := range zone.Interfaces {
+					fmt.Printf("    %s:\n", ifName)
+					if ifc, ok := cfg.Interfaces.Interfaces[ifName]; ok {
+						for _, unit := range ifc.Units {
+							for _, addr := range unit.Addresses {
+								fmt.Printf("      Address: %s\n", addr)
+							}
+							if unit.DHCP {
+								fmt.Printf("      DHCPv4: enabled\n")
+							}
+							if unit.DHCPv6 {
+								fmt.Printf("      DHCPv6: enabled\n")
+							}
+						}
+					}
+				}
+			}
+
+			// Screen profile details
+			if zone.ScreenProfile != "" {
+				if profile, ok := cfg.Security.Screen[zone.ScreenProfile]; ok {
+					fmt.Printf("  Screen profile details (%s):\n", zone.ScreenProfile)
+					var checks []string
+					if profile.TCP.Land {
+						checks = append(checks, "land")
+					}
+					if profile.TCP.SynFin {
+						checks = append(checks, "syn-fin")
+					}
+					if profile.TCP.NoFlag {
+						checks = append(checks, "no-flag")
+					}
+					if profile.TCP.FinNoAck {
+						checks = append(checks, "fin-no-ack")
+					}
+					if profile.TCP.WinNuke {
+						checks = append(checks, "winnuke")
+					}
+					if profile.TCP.SynFrag {
+						checks = append(checks, "syn-frag")
+					}
+					if profile.TCP.SynFlood != nil {
+						checks = append(checks, fmt.Sprintf("syn-flood(threshold:%d)", profile.TCP.SynFlood.AttackThreshold))
+					}
+					if profile.ICMP.PingDeath {
+						checks = append(checks, "ping-death")
+					}
+					if profile.ICMP.FloodThreshold > 0 {
+						checks = append(checks, fmt.Sprintf("icmp-flood(threshold:%d)", profile.ICMP.FloodThreshold))
+					}
+					if profile.IP.SourceRouteOption {
+						checks = append(checks, "source-route-option")
+					}
+					if profile.IP.TearDrop {
+						checks = append(checks, "teardrop")
+					}
+					if profile.UDP.FloodThreshold > 0 {
+						checks = append(checks, fmt.Sprintf("udp-flood(threshold:%d)", profile.UDP.FloodThreshold))
+					}
+					if len(checks) > 0 {
+						fmt.Printf("    Enabled checks: %s\n", strings.Join(checks, ", "))
+					} else {
+						fmt.Printf("    Enabled checks: (none)\n")
+					}
+				}
+			}
+
+			// Policy detail breakdown
+			fmt.Println("  Policy summary:")
+			totalPolicies := 0
+			for _, zpp := range cfg.Security.Policies {
+				if zpp.FromZone == name || zpp.ToZone == name {
+					for _, pol := range zpp.Policies {
+						action := "permit"
+						switch pol.Action {
+						case 1:
+							action = "deny"
+						case 2:
+							action = "reject"
+						}
+						fmt.Printf("    %s -> %s: %s (%s)\n",
+							zpp.FromZone, zpp.ToZone, pol.Name, action)
+						totalPolicies++
+					}
+				}
+			}
+			if totalPolicies == 0 {
+				fmt.Println("    (no policies)")
+			}
+		}
+
+		fmt.Println()
+	}
+	if filterZone != "" {
+		if _, ok := cfg.Security.Zones[filterZone]; !ok {
+			fmt.Printf("Zone '%s' not found\n", filterZone)
+		}
+	}
+	return nil
+}
+
+func (c *CLI) showScreen() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+
+	if len(cfg.Security.Screen) == 0 {
+		fmt.Println("No screen profiles configured")
+		return nil
+	}
+
+	// Build reverse map: profile name -> zones using it
+	zonesByProfile := make(map[string][]string)
+	for name, zone := range cfg.Security.Zones {
+		if zone.ScreenProfile != "" {
+			zonesByProfile[zone.ScreenProfile] = append(
+				zonesByProfile[zone.ScreenProfile], name)
+		}
+	}
+
+	for name, profile := range cfg.Security.Screen {
+		fmt.Printf("Screen profile: %s\n", name)
+
+		// TCP checks
+		if profile.TCP.Land {
+			fmt.Println("  TCP LAND attack detection: enabled")
+		}
+		if profile.TCP.SynFin {
+			fmt.Println("  TCP SYN+FIN detection: enabled")
+		}
+		if profile.TCP.NoFlag {
+			fmt.Println("  TCP no-flag detection: enabled")
+		}
+		if profile.TCP.FinNoAck {
+			fmt.Println("  TCP FIN-no-ACK detection: enabled")
+		}
+		if profile.TCP.WinNuke {
+			fmt.Println("  TCP WinNuke detection: enabled")
+		}
+		if profile.TCP.SynFrag {
+			fmt.Println("  TCP SYN fragment detection: enabled")
+		}
+		if profile.TCP.SynFlood != nil {
+			fmt.Printf("  TCP SYN flood protection: attack-threshold %d\n",
+				profile.TCP.SynFlood.AttackThreshold)
+		}
+
+		// ICMP checks
+		if profile.ICMP.PingDeath {
+			fmt.Println("  ICMP ping-of-death detection: enabled")
+		}
+		if profile.ICMP.FloodThreshold > 0 {
+			fmt.Printf("  ICMP flood protection: threshold %d\n",
+				profile.ICMP.FloodThreshold)
+		}
+
+		// IP checks
+		if profile.IP.SourceRouteOption {
+			fmt.Println("  IP source-route option detection: enabled")
+		}
+
+		// UDP checks
+		if profile.UDP.FloodThreshold > 0 {
+			fmt.Printf("  UDP flood protection: threshold %d\n",
+				profile.UDP.FloodThreshold)
+		}
+
+		// Zones using this profile
+		if zones, ok := zonesByProfile[name]; ok {
+			fmt.Printf("  Applied to zones: %s\n", strings.Join(zones, ", "))
+		} else {
+			fmt.Println("  Applied to zones: (none)")
+		}
+
+		fmt.Println()
+	}
+
+	// Show screen drop counters (total + per-type)
+	if c.dp != nil && c.dp.IsLoaded() {
+		readCtr := func(idx uint32) uint64 {
+			v, _ := c.dp.ReadGlobalCounter(idx)
+			return v
+		}
+
+		totalDrops := readCtr(dataplane.GlobalCtrScreenDrops)
+		fmt.Printf("Total screen drops: %d\n", totalDrops)
+
+		if totalDrops > 0 {
+			screenCounters := []struct {
+				idx  uint32
+				name string
+			}{
+				{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
+				{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
+				{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
+				{dataplane.GlobalCtrScreenLandAttack, "LAND attack"},
+				{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
+				{dataplane.GlobalCtrScreenTearDrop, "Teardrop"},
+				{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
+				{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no flag"},
+				{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN no ACK"},
+				{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
+				{dataplane.GlobalCtrScreenIPSrcRoute, "IP source route"},
+				{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
+			}
+			for _, sc := range screenCounters {
+				v := readCtr(sc.idx)
+				if v > 0 {
+					fmt.Printf("  %-25s %d\n", sc.name+":", v)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *CLI) showScreenIdsOption(name string) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+	profile, ok := cfg.Security.Screen[name]
+	if !ok {
+		fmt.Printf("Screen profile '%s' not found\n", name)
+		return nil
+	}
+
+	fmt.Printf("Screen object status:\n\n")
+	fmt.Printf("  %-45s %s\n", "Name", "Value")
+	if profile.TCP.Land {
+		fmt.Printf("  %-45s %s\n", "TCP land attack", "enabled")
+	}
+	if profile.TCP.SynFin {
+		fmt.Printf("  %-45s %s\n", "TCP SYN+FIN", "enabled")
+	}
+	if profile.TCP.NoFlag {
+		fmt.Printf("  %-45s %s\n", "TCP no-flag", "enabled")
+	}
+	if profile.TCP.FinNoAck {
+		fmt.Printf("  %-45s %s\n", "TCP FIN-no-ACK", "enabled")
+	}
+	if profile.TCP.WinNuke {
+		fmt.Printf("  %-45s %s\n", "TCP WinNuke", "enabled")
+	}
+	if profile.TCP.SynFrag {
+		fmt.Printf("  %-45s %s\n", "TCP SYN fragment", "enabled")
+	}
+	if profile.TCP.SynFlood != nil {
+		fmt.Printf("  %-45s %d\n", "TCP SYN flood attack threshold", profile.TCP.SynFlood.AttackThreshold)
+		if profile.TCP.SynFlood.SourceThreshold > 0 {
+			fmt.Printf("  %-45s %d\n", "TCP SYN flood source threshold", profile.TCP.SynFlood.SourceThreshold)
+		}
+		if profile.TCP.SynFlood.DestinationThreshold > 0 {
+			fmt.Printf("  %-45s %d\n", "TCP SYN flood destination threshold", profile.TCP.SynFlood.DestinationThreshold)
+		}
+		if profile.TCP.SynFlood.Timeout > 0 {
+			fmt.Printf("  %-45s %d\n", "TCP SYN flood timeout", profile.TCP.SynFlood.Timeout)
+		}
+	}
+	if profile.ICMP.PingDeath {
+		fmt.Printf("  %-45s %s\n", "ICMP ping of death", "enabled")
+	}
+	if profile.ICMP.FloodThreshold > 0 {
+		fmt.Printf("  %-45s %d\n", "ICMP flood threshold", profile.ICMP.FloodThreshold)
+	}
+	if profile.IP.SourceRouteOption {
+		fmt.Printf("  %-45s %s\n", "IP source route option", "enabled")
+	}
+	if profile.UDP.FloodThreshold > 0 {
+		fmt.Printf("  %-45s %d\n", "UDP flood threshold", profile.UDP.FloodThreshold)
+	}
+
+	// Show zones using this profile
+	var zones []string
+	for zname, zone := range cfg.Security.Zones {
+		if zone.ScreenProfile == name {
+			zones = append(zones, zname)
+		}
+	}
+	if len(zones) > 0 {
+		sort.Strings(zones)
+		fmt.Printf("\n  Bound to zones: %s\n", strings.Join(zones, ", "))
+	}
+	return nil
+}
+
+func (c *CLI) showScreenIdsOptionDetail(name string) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+	profile, ok := cfg.Security.Screen[name]
+	if !ok {
+		fmt.Printf("Screen profile '%s' not found\n", name)
+		return nil
+	}
+
+	fmt.Printf("Screen object status (detail):\n\n")
+	fmt.Printf("  %-45s %-12s %s\n", "Name", "Value", "Default")
+
+	// TCP checks
+	fmt.Printf("  %-45s %-12s %s\n", "TCP land attack",
+		enabledStr(profile.TCP.Land), "disabled")
+	fmt.Printf("  %-45s %-12s %s\n", "TCP SYN+FIN",
+		enabledStr(profile.TCP.SynFin), "disabled")
+	fmt.Printf("  %-45s %-12s %s\n", "TCP no-flag",
+		enabledStr(profile.TCP.NoFlag), "disabled")
+	fmt.Printf("  %-45s %-12s %s\n", "TCP FIN-no-ACK",
+		enabledStr(profile.TCP.FinNoAck), "disabled")
+	fmt.Printf("  %-45s %-12s %s\n", "TCP WinNuke",
+		enabledStr(profile.TCP.WinNuke), "disabled")
+	fmt.Printf("  %-45s %-12s %s\n", "TCP SYN fragment",
+		enabledStr(profile.TCP.SynFrag), "disabled")
+
+	if profile.TCP.SynFlood != nil {
+		fmt.Printf("  %-45s %-12s %s\n", "TCP SYN flood protection", "enabled", "disabled")
+		fmt.Printf("  %-45s %-12d %s\n", "  Attack threshold",
+			profile.TCP.SynFlood.AttackThreshold, "200")
+		if profile.TCP.SynFlood.AlarmThreshold > 0 {
+			fmt.Printf("  %-45s %-12d %s\n", "  Alarm threshold",
+				profile.TCP.SynFlood.AlarmThreshold, "512")
+		} else {
+			fmt.Printf("  %-45s %-12s %s\n", "  Alarm threshold", "(default)", "512")
+		}
+		if profile.TCP.SynFlood.SourceThreshold > 0 {
+			fmt.Printf("  %-45s %-12d %s\n", "  Source threshold",
+				profile.TCP.SynFlood.SourceThreshold, "4000")
+		} else {
+			fmt.Printf("  %-45s %-12s %s\n", "  Source threshold", "(default)", "4000")
+		}
+		if profile.TCP.SynFlood.DestinationThreshold > 0 {
+			fmt.Printf("  %-45s %-12d %s\n", "  Destination threshold",
+				profile.TCP.SynFlood.DestinationThreshold, "4000")
+		} else {
+			fmt.Printf("  %-45s %-12s %s\n", "  Destination threshold", "(default)", "4000")
+		}
+		if profile.TCP.SynFlood.Timeout > 0 {
+			fmt.Printf("  %-45s %-12d %s\n", "  Timeout (seconds)",
+				profile.TCP.SynFlood.Timeout, "20")
+		} else {
+			fmt.Printf("  %-45s %-12s %s\n", "  Timeout (seconds)", "(default)", "20")
+		}
+	} else {
+		fmt.Printf("  %-45s %-12s %s\n", "TCP SYN flood protection", "disabled", "disabled")
+	}
+
+	// ICMP checks
+	fmt.Printf("  %-45s %-12s %s\n", "ICMP ping of death",
+		enabledStr(profile.ICMP.PingDeath), "disabled")
+	if profile.ICMP.FloodThreshold > 0 {
+		fmt.Printf("  %-45s %-12d %s\n", "ICMP flood threshold",
+			profile.ICMP.FloodThreshold, "1000")
+	} else {
+		fmt.Printf("  %-45s %-12s %s\n", "ICMP flood threshold", "disabled", "disabled")
+	}
+
+	// IP checks
+	fmt.Printf("  %-45s %-12s %s\n", "IP source route option",
+		enabledStr(profile.IP.SourceRouteOption), "disabled")
+	fmt.Printf("  %-45s %-12s %s\n", "IP teardrop",
+		enabledStr(profile.IP.TearDrop), "disabled")
+
+	// UDP checks
+	if profile.UDP.FloodThreshold > 0 {
+		fmt.Printf("  %-45s %-12d %s\n", "UDP flood threshold",
+			profile.UDP.FloodThreshold, "1000")
+	} else {
+		fmt.Printf("  %-45s %-12s %s\n", "UDP flood threshold", "disabled", "disabled")
+	}
+
+	// Zones using this profile
+	var zones []string
+	for zname, zone := range cfg.Security.Zones {
+		if zone.ScreenProfile == name {
+			zones = append(zones, zname)
+		}
+	}
+	if len(zones) > 0 {
+		sort.Strings(zones)
+		fmt.Printf("\n  Bound to zones: %s\n", strings.Join(zones, ", "))
+	} else {
+		fmt.Printf("\n  Bound to zones: (none)\n")
+	}
+	return nil
+}
+
+func (c *CLI) showScreenStatistics(zoneName string) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("dataplane not loaded")
+		return nil
+	}
+	cr := c.dp.LastCompileResult()
+	if cr == nil {
+		fmt.Println("no compile result available")
+		return nil
+	}
+	zoneID, ok := cr.ZoneIDs[zoneName]
+	if !ok {
+		fmt.Printf("Zone '%s' not found\n", zoneName)
+		return nil
+	}
+	fs, err := c.dp.ReadFloodCounters(zoneID)
+	if err != nil {
+		fmt.Printf("Error reading flood counters: %v\n", err)
+		return nil
+	}
+	totalSyn, totalICMP, totalUDP := fs.SynCount, fs.ICMPCount, fs.UDPCount
+	screenProfile := ""
+	if z, ok := cfg.Security.Zones[zoneName]; ok {
+		screenProfile = z.ScreenProfile
+	}
+	fmt.Printf("Screen statistics for zone '%s':\n", zoneName)
+	if screenProfile != "" {
+		fmt.Printf("  Screen profile: %s\n", screenProfile)
+	}
+	fmt.Printf("  %-30s %s\n", "Counter", "Value")
+	fmt.Printf("  %-30s %d\n", "SYN flood events", totalSyn)
+	fmt.Printf("  %-30s %d\n", "ICMP flood events", totalICMP)
+	fmt.Printf("  %-30s %d\n", "UDP flood events", totalUDP)
+	return nil
+}
+
+func (c *CLI) showScreenStatisticsAll() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("dataplane not loaded")
+		return nil
+	}
+	cr := c.dp.LastCompileResult()
+	if cr == nil {
+		fmt.Println("no compile result available")
+		return nil
+	}
+	// Collect zone names and sort for deterministic output
+	var zones []string
+	for name := range cr.ZoneIDs {
+		zones = append(zones, name)
+	}
+	sort.Strings(zones)
+
+	for _, zoneName := range zones {
+		zoneID := cr.ZoneIDs[zoneName]
+		fs, err := c.dp.ReadFloodCounters(zoneID)
+		if err != nil {
+			continue
+		}
+		screenProfile := ""
+		if z, ok := cfg.Security.Zones[zoneName]; ok {
+			screenProfile = z.ScreenProfile
+		}
+		fmt.Printf("Screen statistics for zone '%s':\n", zoneName)
+		if screenProfile != "" {
+			fmt.Printf("  Screen profile: %s\n", screenProfile)
+		}
+		fmt.Printf("  %-30s %s\n", "Counter", "Value")
+		fmt.Printf("  %-30s %d\n", "SYN flood events", fs.SynCount)
+		fmt.Printf("  %-30s %d\n", "ICMP flood events", fs.ICMPCount)
+		fmt.Printf("  %-30s %d\n", "UDP flood events", fs.UDPCount)
+		fmt.Println()
+	}
+	return nil
+}
+
+func (c *CLI) showStatistics(detail bool) error {
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("Statistics: dataplane not loaded")
+		return nil
+	}
+
+	readCounter := func(idx uint32) uint64 {
+		v, _ := c.dp.ReadGlobalCounter(idx)
+		return v
+	}
+
+	names := []struct {
+		idx  uint32
+		name string
+	}{
+		{dataplane.GlobalCtrRxPackets, "RX packets"},
+		{dataplane.GlobalCtrTxPackets, "TX packets"},
+		{dataplane.GlobalCtrDrops, "Drops"},
+		{dataplane.GlobalCtrSessionsNew, "Sessions created"},
+		{dataplane.GlobalCtrSessionsClosed, "Sessions closed"},
+		{dataplane.GlobalCtrScreenDrops, "Screen drops"},
+		{dataplane.GlobalCtrPolicyDeny, "Policy denies"},
+		{dataplane.GlobalCtrNATAllocFail, "NAT alloc failures"},
+		{dataplane.GlobalCtrHostInboundDeny, "Host-inbound denies"},
+		{dataplane.GlobalCtrHostInbound, "Host-inbound allowed"},
+		{dataplane.GlobalCtrTCEgressPackets, "TC egress packets"},
+		{dataplane.GlobalCtrNAT64Xlate, "NAT64 translations"},
+	}
+
+	fmt.Println("Global statistics:")
+	for _, n := range names {
+		fmt.Printf("  %-25s %d\n", n.name+":", readCounter(n.idx))
+	}
+
+	if !detail {
+		return nil
+	}
+
+	// Active session counts
+	v4, v6 := c.dp.SessionCount()
+	fmt.Printf("\nActive sessions:\n")
+	fmt.Printf("  %-25s %d\n", "IPv4 sessions:", v4)
+	fmt.Printf("  %-25s %d\n", "IPv6 sessions:", v6)
+	fmt.Printf("  %-25s %d\n", "Total:", v4+v6)
+
+	// Screen drops breakdown
+	screenDrops := readCounter(dataplane.GlobalCtrScreenDrops)
+	if screenDrops > 0 {
+		fmt.Printf("\nScreen drop details:\n")
+		screenCounters := []struct {
+			idx  uint32
+			name string
+		}{
+			{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
+			{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
+			{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
+			{dataplane.GlobalCtrScreenPortScan, "Port scan"},
+			{dataplane.GlobalCtrScreenIPSweep, "IP sweep"},
+			{dataplane.GlobalCtrScreenLandAttack, "Land attack"},
+			{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
+			{dataplane.GlobalCtrScreenTearDrop, "Teardrop"},
+			{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
+			{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no flag"},
+			{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN no ACK"},
+			{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
+			{dataplane.GlobalCtrScreenIPSrcRoute, "IP source route"},
+			{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
+		}
+		for _, sc := range screenCounters {
+			v := readCounter(sc.idx)
+			if v > 0 {
+				fmt.Printf("  %-25s %d\n", sc.name+":", v)
+			}
+		}
+	}
+
+	// Map utilization summary for key maps
+	fmt.Printf("\nKey map utilization:\n")
+	stats := c.dp.GetMapStats()
+	for _, s := range stats {
+		if s.MaxEntries > 0 && s.Type != "Array" && s.Type != "PerCPUArray" {
+			pct := float64(s.UsedCount) / float64(s.MaxEntries) * 100
+			flag := ""
+			if pct >= 80 {
+				flag = " !"
+			}
+			fmt.Printf("  %-24s %d/%d (%.1f%%)%s\n", s.Name+":", s.UsedCount, s.MaxEntries, pct, flag)
+		}
+	}
+
+	return nil
+}
+
+func (c *CLI) showFlowSession(args []string) error {
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("Session table: dataplane not loaded")
+		return nil
+	}
+
+	f := c.parseSessionFilter(args)
+
+	// Top-talkers mode: collect, sort, display top 20
+	if f.sortBy == "bytes" || f.sortBy == "packets" {
+		return c.showTopTalkers(f)
+	}
+
+	count := 0
+
+	// In cluster mode, print node header before local sessions.
+	clusterMode := c.cluster != nil
+	if clusterMode && !f.summary {
+		fmt.Printf("node%d:\n", c.cluster.NodeID())
+		fmt.Println("--------------------------------------------------------------------------")
+	}
+
+	// Determine HA state string for session display.
+	haState := ""
+	if clusterMode {
+		if c.cluster.IsLocalPrimary(0) {
+			haState = "Active"
+		} else {
+			haState = "Backup"
+		}
+	}
+
+	// Summary counters for protocol/zone/NAT breakdown
+	var byProto map[uint8]int
+	var byZonePair map[string]int
+	var v4Count, v6Count, natCount int
+	if f.summary {
+		byProto = make(map[uint8]int)
+		byZonePair = make(map[string]int)
+	}
+
+	if f.brief {
+		fmt.Printf("%-5s %-22s %-22s %-5s %-20s %-3s %-5s %5s %s\n",
+			"ID", "Source", "Destination", "Proto", "Zone", "NAT", "State", "Age", "Pkts(f/r)")
+	}
+
+	// Build reverse zone ID → name map, policy name map, and zone→interface map
+	zoneNames := make(map[uint16]string)
+	zoneIfaces := make(map[uint16]string) // zone ID → first interface name
+	var policyNames map[uint32]string
+	if cr := c.dp.LastCompileResult(); cr != nil {
+		for name, id := range cr.ZoneIDs {
+			zoneNames[id] = name
+		}
+		policyNames = cr.PolicyNames
+	}
+	if f.cfg != nil {
+		for zoneName, zone := range f.cfg.Security.Zones {
+			if cr := c.dp.LastCompileResult(); cr != nil {
+				if zid, ok := cr.ZoneIDs[zoneName]; ok && len(zone.Interfaces) > 0 {
+					zoneIfaces[zid] = zone.Interfaces[0]
+				}
+			}
+		}
+	}
+	egressIfaces := buildSessionEgressIfaces(f.cfg)
+
+	// Populate filter maps for interface-level matching in matchesV4/V6.
+	f.zoneIfaces = zoneIfaces
+	f.egressIfacesMap = egressIfaces
+
+	sessionEgressIf := func(fibIfindex uint32, fibVlanID uint16, zoneID uint16, zoneName string) string {
+		if fibIfindex != 0 {
+			if ifName, ok := egressIfaces[sessionIfaceKey{ifindex: fibIfindex, vlanID: fibVlanID}]; ok && ifName != "" {
+				return ifName
+			}
+		}
+		if ifName := zoneIfaces[zoneID]; ifName != "" {
+			return ifName
+		}
+		return zoneName
+	}
+
+	now := monotonicSeconds()
+
+	// printV4 prints a single IPv4 session entry inline during iteration.
+	printV4 := func(idx int, key dataplane.SessionKey, val dataplane.SessionValue) {
+		srcIP := net.IP(key.SrcIP[:])
+		dstIP := net.IP(key.DstIP[:])
+		srcPort := ntohs(key.SrcPort)
+		dstPort := ntohs(key.DstPort)
+		protoName := protoNameFromNum(key.Protocol)
+		stateName := sessionStateName(val.State)
+
+		inZone := zoneNames[val.IngressZone]
+		outZone := zoneNames[val.EgressZone]
+		if inZone == "" {
+			inZone = fmt.Sprintf("%d", val.IngressZone)
+		}
+		if outZone == "" {
+			outZone = fmt.Sprintf("%d", val.EgressZone)
+		}
+
+		sid := val.SessionID
+		if sid == 0 {
+			sid = uint64(idx)
+		}
+
+		if f.brief {
+			natFlag := " "
+			if val.Flags&dataplane.SessFlagSNAT != 0 {
+				natFlag = "S"
+			}
+			if val.Flags&dataplane.SessFlagDNAT != 0 {
+				natFlag = "D"
+			}
+			if val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == (dataplane.SessFlagSNAT | dataplane.SessFlagDNAT) {
+				natFlag = "B"
+			}
+			var age uint64
+			if now > val.Created {
+				age = now - val.Created
+			}
+			fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
+				sid,
+				fmt.Sprintf("%s:%d", srcIP, srcPort),
+				fmt.Sprintf("%s:%d", dstIP, dstPort),
+				protoName, inZone+"->"+outZone, natFlag,
+				stateName[:min(5, len(stateName))], age,
+				val.FwdPackets, val.RevPackets)
+			return
+		}
+
+		polName := policyNames[val.PolicyID]
+		if polName == "" {
+			polName = fmt.Sprintf("%d", val.PolicyID)
+		}
+		if haState != "" {
+			fmt.Printf("Session ID: %d, Policy name: %s/%d, HA State: %s, Timeout: %d, Session State: Valid\n",
+				sid, polName, val.PolicyID, haState, val.Timeout)
+		} else {
+			fmt.Printf("Session ID: %d, Policy name: %s/%d, Timeout: %d, Session State: Valid\n",
+				sid, polName, val.PolicyID, val.Timeout)
+		}
+
+		inIf := zoneIfaces[val.IngressZone]
+		if inIf == "" {
+			inIf = inZone
+		}
+		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
+			srcIP, srcPort, dstIP, dstPort, protoName,
+			inIf, inZone, val.FwdPackets, val.FwdBytes)
+
+		outSrcIP := dstIP.String()
+		outSrcPort := dstPort
+		outDstIP := srcIP.String()
+		outDstPort := srcPort
+		if val.Flags&dataplane.SessFlagSNAT != 0 {
+			natIP := uint32ToIP(val.NATSrcIP)
+			natPort := ntohs(val.NATSrcPort)
+			outDstIP = natIP.String()
+			outDstPort = natPort
+		}
+		if val.Flags&dataplane.SessFlagDNAT != 0 {
+			natIP := uint32ToIP(val.NATDstIP)
+			natPort := ntohs(val.NATDstPort)
+			outSrcIP = natIP.String()
+			outSrcPort = natPort
+		}
+		outIf := sessionEgressIf(val.FibIfindex, val.FibVlanID, val.EgressZone, outZone)
+		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
+			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
+			outIf, outZone, val.RevPackets, val.RevBytes)
+		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, dstPort, val.AppID); appName != "" {
+			fmt.Printf("  Application: %s\n", appName)
+		}
+		fmt.Println()
+	}
+
+	// IPv4 sessions — stream directly, no collect/sort.
+	err := c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if f.hasFilter() && !f.matchesV4(key, val) {
+			return true
+		}
+		count++
+
+		if f.summary {
+			v4Count++
+			byProto[key.Protocol]++
+			inZ := zoneNames[val.IngressZone]
+			outZ := zoneNames[val.EgressZone]
+			if inZ == "" {
+				inZ = fmt.Sprintf("zone-%d", val.IngressZone)
+			}
+			if outZ == "" {
+				outZ = fmt.Sprintf("zone-%d", val.EgressZone)
+			}
+			byZonePair[inZ+"->"+outZ]++
+			if val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) != 0 {
+				natCount++
+			}
+			return true
+		}
+
+		printV4(count, key, val)
+		return true
+	})
+	if err != nil {
+		return fmt.Errorf("iterate sessions: %w", err)
+	}
+
+	// printV6 prints a single IPv6 session entry inline during iteration.
+	printV6 := func(idx int, key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
+		srcIP := net.IP(key.SrcIP[:])
+		dstIP := net.IP(key.DstIP[:])
+		srcPort := ntohs(key.SrcPort)
+		dstPort := ntohs(key.DstPort)
+		protoName := protoNameFromNum(key.Protocol)
+		stateName := sessionStateName(val.State)
+
+		inZone := zoneNames[val.IngressZone]
+		outZone := zoneNames[val.EgressZone]
+		if inZone == "" {
+			inZone = fmt.Sprintf("%d", val.IngressZone)
+		}
+		if outZone == "" {
+			outZone = fmt.Sprintf("%d", val.EgressZone)
+		}
+
+		sid := val.SessionID
+		if sid == 0 {
+			sid = uint64(idx)
+		}
+
+		if f.brief {
+			natFlag := " "
+			if val.Flags&dataplane.SessFlagSNAT != 0 {
+				natFlag = "S"
+			}
+			if val.Flags&dataplane.SessFlagDNAT != 0 {
+				natFlag = "D"
+			}
+			if val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) == (dataplane.SessFlagSNAT | dataplane.SessFlagDNAT) {
+				natFlag = "B"
+			}
+			var age uint64
+			if now > val.Created {
+				age = now - val.Created
+			}
+			fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
+				sid,
+				fmt.Sprintf("[%s]:%d", srcIP, srcPort),
+				fmt.Sprintf("[%s]:%d", dstIP, dstPort),
+				protoName, inZone+"->"+outZone, natFlag,
+				stateName[:min(5, len(stateName))], age,
+				val.FwdPackets, val.RevPackets)
+			return
+		}
+
+		polName := policyNames[val.PolicyID]
+		if polName == "" {
+			polName = fmt.Sprintf("%d", val.PolicyID)
+		}
+		if haState != "" {
+			fmt.Printf("Session ID: %d, Policy name: %s/%d, HA State: %s, Timeout: %d, Session State: Valid\n",
+				sid, polName, val.PolicyID, haState, val.Timeout)
+		} else {
+			fmt.Printf("Session ID: %d, Policy name: %s/%d, Timeout: %d, Session State: Valid\n",
+				sid, polName, val.PolicyID, val.Timeout)
+		}
+
+		inIf := zoneIfaces[val.IngressZone]
+		if inIf == "" {
+			inIf = inZone
+		}
+		fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
+			srcIP, srcPort, dstIP, dstPort, protoName,
+			inIf, inZone, val.FwdPackets, val.FwdBytes)
+
+		outSrcIP := dstIP.String()
+		outSrcPort := dstPort
+		outDstIP := srcIP.String()
+		outDstPort := srcPort
+		if val.Flags&dataplane.SessFlagSNAT != 0 {
+			natIP := net.IP(val.NATSrcIP[:])
+			natPort := ntohs(val.NATSrcPort)
+			outDstIP = natIP.String()
+			outDstPort = natPort
+		}
+		if val.Flags&dataplane.SessFlagDNAT != 0 {
+			natIP := net.IP(val.NATDstIP[:])
+			natPort := ntohs(val.NATDstPort)
+			outSrcIP = natIP.String()
+			outSrcPort = natPort
+		}
+		outIf := sessionEgressIf(val.FibIfindex, val.FibVlanID, val.EgressZone, outZone)
+		fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
+			outSrcIP, outSrcPort, outDstIP, outDstPort, protoName,
+			outIf, outZone, val.RevPackets, val.RevBytes)
+		if appName := appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, dstPort, val.AppID); appName != "" {
+			fmt.Printf("  Application: %s\n", appName)
+		}
+		fmt.Println()
+	}
+
+	// IPv6 sessions — stream directly, no collect/sort.
+	err = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if f.hasFilter() && !f.matchesV6(key, val) {
+			return true
+		}
+		count++
+
+		if f.summary {
+			v6Count++
+			byProto[key.Protocol]++
+			inZ := zoneNames[val.IngressZone]
+			outZ := zoneNames[val.EgressZone]
+			if inZ == "" {
+				inZ = fmt.Sprintf("zone-%d", val.IngressZone)
+			}
+			if outZ == "" {
+				outZ = fmt.Sprintf("zone-%d", val.EgressZone)
+			}
+			byZonePair[inZ+"->"+outZ]++
+			if val.Flags&(dataplane.SessFlagSNAT|dataplane.SessFlagDNAT) != 0 {
+				natCount++
+			}
+			return true
+		}
+
+		printV6(count, key, val)
+		return true
+	})
+	if err != nil {
+		return fmt.Errorf("iterate sessions_v6: %w", err)
+	}
+
+	if f.summary {
+		// In cluster mode, print dual-node Junos-style output.
+		if c.cluster != nil {
+			fmt.Printf("node%d:\n", c.cluster.NodeID())
+			fmt.Println("--------------------------------------------------------------------------")
+		}
+		// Junos-style session summary format
+		fmt.Printf("Unicast-sessions: %d\n", count)
+		fmt.Printf("Multicast-sessions: 0\n")
+		fmt.Printf("Services-offload-sessions: 0\n")
+		fmt.Printf("Failed-sessions: 0\n")
+		fmt.Printf("Sessions-in-drop-flow: 0\n")
+		fmt.Printf("Sessions-in-use: %d\n", count)
+		fmt.Printf("  Valid sessions: %d\n", count)
+		fmt.Printf("  Pending sessions: 0\n")
+		fmt.Printf("  Invalidated sessions: 0\n")
+		fmt.Printf("  Sessions in other states: 0\n")
+		fmt.Printf("Maximum-sessions: 10000000\n")
+
+		if count > 0 {
+			fmt.Printf("\nSession distribution:\n")
+			fmt.Printf("  IPv4 sessions: %d\n", v4Count)
+			fmt.Printf("  IPv6 sessions: %d\n", v6Count)
+			fmt.Printf("  NAT sessions:  %d\n\n", natCount)
+
+			fmt.Printf("  By protocol:\n")
+			protoKeys := make([]uint8, 0, len(byProto))
+			for k := range byProto {
+				protoKeys = append(protoKeys, k)
+			}
+			sort.Slice(protoKeys, func(i, j int) bool { return protoKeys[i] < protoKeys[j] })
+			for _, p := range protoKeys {
+				fmt.Printf("    %-8s %d\n", protoNameFromNum(p), byProto[p])
+			}
+
+			fmt.Printf("\n  By zone pair:\n")
+			zpKeys := make([]string, 0, len(byZonePair))
+			for k := range byZonePair {
+				zpKeys = append(zpKeys, k)
+			}
+			sort.Strings(zpKeys)
+			for _, zp := range zpKeys {
+				fmt.Printf("    %-30s %d\n", zp, byZonePair[zp])
+			}
+		}
+
+		// Fetch and display peer node summary in cluster mode.
+		if c.cluster != nil && c.cluster.PeerAlive() {
+			if peerResp := c.fetchPeerSessionSummary(); peerResp != nil {
+				fmt.Println()
+				fmt.Printf("node%d:\n", peerResp.NodeId)
+				fmt.Println("--------------------------------------------------------------------------")
+				fmt.Printf("Unicast-sessions: %d\n", peerResp.ForwardOnly)
+				fmt.Printf("Multicast-sessions: 0\n")
+				fmt.Printf("Services-offload-sessions: 0\n")
+				fmt.Printf("Failed-sessions: 0\n")
+				fmt.Printf("Sessions-in-drop-flow: 0\n")
+				fmt.Printf("Sessions-in-use: %d\n", peerResp.ForwardOnly)
+				fmt.Printf("  Valid sessions: %d\n", peerResp.ForwardOnly)
+				fmt.Printf("  Pending sessions: 0\n")
+				fmt.Printf("  Invalidated sessions: 0\n")
+				fmt.Printf("  Sessions in other states: 0\n")
+				fmt.Printf("Maximum-sessions: 10000000\n")
+			}
+		}
+		return nil
+	}
+	fmt.Printf("Total sessions: %d\n", count)
+
+	// Fetch and display peer node sessions in cluster mode.
+	if clusterMode && c.cluster.PeerAlive() {
+		if peerResp := c.fetchPeerSessions(f); peerResp != nil {
+			// Sort peer sessions by SessionID for deterministic order.
+			sort.Slice(peerResp.Sessions, func(i, j int) bool {
+				return peerResp.Sessions[i].SessionId < peerResp.Sessions[j].SessionId
+			})
+			fmt.Println()
+			fmt.Printf("node%d:\n", peerResp.NodeId)
+			fmt.Println("--------------------------------------------------------------------------")
+			if f.brief {
+				fmt.Printf("%-5s %-22s %-22s %-5s %-20s %-3s %-5s %5s %s\n",
+					"ID", "Source", "Destination", "Proto", "Zone", "NAT", "State", "Age", "Pkts(f/r)")
+				for i, se := range peerResp.Sessions {
+					inZone := se.IngressZoneName
+					if inZone == "" {
+						inZone = fmt.Sprintf("%d", se.IngressZone)
+					}
+					outZone := se.EgressZoneName
+					if outZone == "" {
+						outZone = fmt.Sprintf("%d", se.EgressZone)
+					}
+					natFlag := " "
+					if se.Nat != "" {
+						if strings.Contains(se.Nat, "SNAT") {
+							natFlag = "S"
+						}
+						if strings.Contains(se.Nat, "DNAT") || strings.HasPrefix(se.Nat, "dst") {
+							natFlag = "D"
+						}
+					}
+					st := se.State
+					if len(st) > 5 {
+						st = st[:5]
+					}
+					peerSID := se.SessionId
+					if peerSID == 0 {
+						peerSID = uint64(i + 1)
+					}
+					fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
+						peerSID,
+						fmt.Sprintf("%s:%d", se.SrcAddr, se.SrcPort),
+						fmt.Sprintf("%s:%d", se.DstAddr, se.DstPort),
+						se.Protocol, inZone+"->"+outZone, natFlag,
+						st, se.AgeSeconds,
+						se.FwdPackets, se.RevPackets)
+				}
+			} else {
+				for i, se := range peerResp.Sessions {
+					polDisplay := se.PolicyName
+					if polDisplay == "" {
+						polDisplay = fmt.Sprintf("%d", se.PolicyId)
+					}
+					peerFullSID := se.SessionId
+					if peerFullSID == 0 {
+						peerFullSID = uint64(i + 1)
+					}
+					peerHAState := "Backup"
+					if se.HaActive {
+						peerHAState = "Active"
+					}
+					fmt.Printf("Session ID: %d, Policy name: %s/%d, HA State: %s, Timeout: %d, Session State: Valid\n",
+						peerFullSID, polDisplay, se.PolicyId, peerHAState, se.TimeoutSeconds)
+					inZone := se.IngressZoneName
+					if inZone == "" {
+						inZone = fmt.Sprintf("%d", se.IngressZone)
+					}
+					outZone := se.EgressZoneName
+					if outZone == "" {
+						outZone = fmt.Sprintf("%d", se.EgressZone)
+					}
+					inIf := se.IngressInterface
+					if inIf == "" {
+						inIf = inZone
+					}
+					outIf := se.EgressInterface
+					if outIf == "" {
+						outIf = outZone
+					}
+					fmt.Printf("  In: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
+						se.SrcAddr, se.SrcPort, se.DstAddr, se.DstPort,
+						se.Protocol, inIf, inZone, se.FwdPackets, se.FwdBytes)
+					// Out line: reverse direction with NAT applied
+					outSrcAddr := se.DstAddr
+					outSrcPort := se.DstPort
+					outDstAddr := se.SrcAddr
+					outDstPort := se.SrcPort
+					if se.NatSrcAddr != "" {
+						outDstAddr = se.NatSrcAddr
+						outDstPort = se.NatSrcPort
+					}
+					if se.NatDstAddr != "" {
+						outSrcAddr = se.NatDstAddr
+						outSrcPort = se.NatDstPort
+					}
+					fmt.Printf("  Out: %s/%d --> %s/%d;%s, Conn Tag: 0x0, If: %s, Zone: %s, Pkts: %d, Bytes: %d,\n",
+						outSrcAddr, outSrcPort, outDstAddr, outDstPort,
+						se.Protocol, outIf, outZone, se.RevPackets, se.RevBytes)
+					if se.Application != "" {
+						fmt.Printf("  Application: %s\n", se.Application)
+					}
+					fmt.Println()
+				}
+			}
+			fmt.Printf("Total sessions: %d\n", peerResp.Total)
+		}
+	}
+	return nil
+}
+
+// fetchPeerSessions dials the cluster peer's gRPC and returns its full session list.
+
+func (c *CLI) showTopTalkers(f sessionFilter) error {
+	zoneNames := make(map[uint16]string)
+	if cr := c.dp.LastCompileResult(); cr != nil {
+		for name, id := range cr.ZoneIDs {
+			zoneNames[id] = name
+		}
+	}
+	now := monotonicSeconds()
+	var entries []topTalkerEntry
+
+	_ = c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if f.hasFilter() && !f.matchesV4(key, val) {
+			return true
+		}
+		srcIP := net.IP(key.SrcIP[:])
+		dstIP := net.IP(key.DstIP[:])
+		inZone := zoneNames[val.IngressZone]
+		outZone := zoneNames[val.EgressZone]
+		if inZone == "" {
+			inZone = fmt.Sprintf("%d", val.IngressZone)
+		}
+		if outZone == "" {
+			outZone = fmt.Sprintf("%d", val.EgressZone)
+		}
+		var age uint64
+		if now > val.Created {
+			age = now - val.Created
+		}
+		entries = append(entries, topTalkerEntry{
+			src:      fmt.Sprintf("%s:%d", srcIP, ntohs(key.SrcPort)),
+			dst:      fmt.Sprintf("%s:%d", dstIP, ntohs(key.DstPort)),
+			proto:    protoNameFromNum(key.Protocol),
+			zone:     inZone + "->" + outZone,
+			state:    sessionStateName(val.State),
+			app:      appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, ntohs(key.DstPort), val.AppID),
+			fwdPkts:  val.FwdPackets,
+			revPkts:  val.RevPackets,
+			fwdBytes: val.FwdBytes,
+			revBytes: val.RevBytes,
+			age:      age,
+		})
+		return true
+	})
+
+	_ = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if f.hasFilter() && !f.matchesV6(key, val) {
+			return true
+		}
+		srcIP := net.IP(key.SrcIP[:])
+		dstIP := net.IP(key.DstIP[:])
+		inZone := zoneNames[val.IngressZone]
+		outZone := zoneNames[val.EgressZone]
+		if inZone == "" {
+			inZone = fmt.Sprintf("%d", val.IngressZone)
+		}
+		if outZone == "" {
+			outZone = fmt.Sprintf("%d", val.EgressZone)
+		}
+		var age uint64
+		if now > val.Created {
+			age = now - val.Created
+		}
+		entries = append(entries, topTalkerEntry{
+			src:      fmt.Sprintf("[%s]:%d", srcIP, ntohs(key.SrcPort)),
+			dst:      fmt.Sprintf("[%s]:%d", dstIP, ntohs(key.DstPort)),
+			proto:    protoNameFromNum(key.Protocol),
+			zone:     inZone + "->" + outZone,
+			state:    sessionStateName(val.State),
+			app:      appid.ResolveSessionName(f.appNames, f.cfg, key.Protocol, ntohs(key.DstPort), val.AppID),
+			fwdPkts:  val.FwdPackets,
+			revPkts:  val.RevPackets,
+			fwdBytes: val.FwdBytes,
+			revBytes: val.RevBytes,
+			age:      age,
+		})
+		return true
+	})
+
+	if f.sortBy == "bytes" {
+		sort.Slice(entries, func(i, j int) bool {
+			return (entries[i].fwdBytes + entries[i].revBytes) > (entries[j].fwdBytes + entries[j].revBytes)
+		})
+	} else {
+		sort.Slice(entries, func(i, j int) bool {
+			return (entries[i].fwdPkts + entries[i].revPkts) > (entries[j].fwdPkts + entries[j].revPkts)
+		})
+	}
+
+	limit := 20
+	if limit > len(entries) {
+		limit = len(entries)
+	}
+
+	fmt.Printf("Top %d sessions by %s (of %d total):\n", limit, f.sortBy, len(entries))
+	fmt.Printf("%-5s %-22s %-22s %-5s %-20s %12s %12s %5s %s\n",
+		"#", "Source", "Destination", "Proto", "Zone", "Bytes(f/r)", "Pkts(f/r)", "Age", "App")
+	for i := 0; i < limit; i++ {
+		e := entries[i]
+		fmt.Printf("%-5d %-22s %-22s %-5s %-20s %5d/%-6d %5d/%-6d %5d %s\n",
+			i+1, e.src, e.dst, e.proto, e.zone,
+			e.fwdBytes, e.revBytes, e.fwdPkts, e.revPkts, e.age, e.app)
+	}
+	return nil
+}
+
+func (c *CLI) showFlowTimeouts() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+
+	flow := &cfg.Security.Flow
+
+	fmt.Println("Flow session timeouts:")
+
+	// TCP
+	if flow.TCPSession != nil {
+		tcp := flow.TCPSession
+		printTimeout := func(name string, val, def int) {
+			if val > 0 {
+				fmt.Printf("  %-30s %ds\n", name+":", val)
+			} else {
+				fmt.Printf("  %-30s %ds (default)\n", name+":", def)
+			}
+		}
+		printTimeout("TCP established timeout", tcp.EstablishedTimeout, 1800)
+		printTimeout("TCP initial timeout", tcp.InitialTimeout, 30)
+		printTimeout("TCP closing timeout", tcp.ClosingTimeout, 30)
+		printTimeout("TCP time-wait timeout", tcp.TimeWaitTimeout, 120)
+	} else {
+		fmt.Println("  TCP established timeout:       1800s (default)")
+		fmt.Println("  TCP initial timeout:           30s (default)")
+		fmt.Println("  TCP closing timeout:           30s (default)")
+		fmt.Println("  TCP time-wait timeout:         120s (default)")
+	}
+
+	// UDP
+	if flow.UDPSessionTimeout > 0 {
+		fmt.Printf("  %-30s %ds\n", "UDP session timeout:", flow.UDPSessionTimeout)
+	} else {
+		fmt.Println("  UDP session timeout:           60s (default)")
+	}
+
+	// ICMP
+	if flow.ICMPSessionTimeout > 0 {
+		fmt.Printf("  %-30s %ds\n", "ICMP session timeout:", flow.ICMPSessionTimeout)
+	} else {
+		fmt.Println("  ICMP session timeout:          30s (default)")
+	}
+
+	// TCP MSS clamping
+	if flow.TCPMSSIPsecVPN > 0 || flow.TCPMSSGreIn > 0 || flow.TCPMSSGreOut > 0 {
+		fmt.Println()
+		fmt.Println("TCP MSS clamping:")
+		if flow.TCPMSSIPsecVPN > 0 {
+			fmt.Printf("  %-30s %d\n", "IPsec VPN MSS:", flow.TCPMSSIPsecVPN)
+		}
+		if flow.TCPMSSGreIn > 0 {
+			fmt.Printf("  %-30s %d\n", "GRE ingress MSS:", flow.TCPMSSGreIn)
+		}
+		if flow.TCPMSSGreOut > 0 {
+			fmt.Printf("  %-30s %d\n", "GRE egress MSS:", flow.TCPMSSGreOut)
+		}
+	}
+
+	// Flow options
+	if flow.AllowDNSReply || flow.AllowEmbeddedICMP || flow.GREPerformanceAcceleration || flow.PowerModeDisable {
+		fmt.Println()
+		fmt.Println("Flow options:")
+		if flow.AllowDNSReply {
+			fmt.Println("  allow-dns-reply:               enabled")
+		}
+		if flow.AllowEmbeddedICMP {
+			fmt.Println("  allow-embedded-icmp:           enabled")
+		}
+		if flow.GREPerformanceAcceleration {
+			fmt.Println("  gre-performance-acceleration:  enabled")
+		}
+		if flow.PowerModeDisable {
+			fmt.Println("  power-mode-disable:            yes")
+		}
+	}
+
+	return nil
+}
+
+// showFlowStatistics displays flow statistics from BPF global counters.
+
+func (c *CLI) showFlowStatistics() error {
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("Flow statistics: dataplane not loaded")
+		return nil
+	}
+
+	readCounter := func(idx uint32) uint64 {
+		v, _ := c.dp.ReadGlobalCounter(idx)
+		return v
+	}
+
+	rxPkts := readCounter(dataplane.GlobalCtrRxPackets)
+	txPkts := readCounter(dataplane.GlobalCtrTxPackets)
+	drops := readCounter(dataplane.GlobalCtrDrops)
+	sessNew := readCounter(dataplane.GlobalCtrSessionsNew)
+	sessClosed := readCounter(dataplane.GlobalCtrSessionsClosed)
+	screenDrops := readCounter(dataplane.GlobalCtrScreenDrops)
+	policyDeny := readCounter(dataplane.GlobalCtrPolicyDeny)
+	natFail := readCounter(dataplane.GlobalCtrNATAllocFail)
+	hostDeny := readCounter(dataplane.GlobalCtrHostInboundDeny)
+	hostAllow := readCounter(dataplane.GlobalCtrHostInbound)
+	tcEgress := readCounter(dataplane.GlobalCtrTCEgressPackets)
+	nat64 := readCounter(dataplane.GlobalCtrNAT64Xlate)
+	fabricRedir := readCounter(dataplane.GlobalCtrFabricRedirect)
+	cacheHit := readCounter(dataplane.GlobalCtrFlowCacheHit)
+	cacheMiss := readCounter(dataplane.GlobalCtrFlowCacheMiss)
+	cacheFlush := readCounter(dataplane.GlobalCtrFlowCacheFlush)
+	cacheInval := readCounter(dataplane.GlobalCtrFlowCacheInvalidate)
+
+	fmt.Println("Flow statistics:")
+	fmt.Printf("  %-30s %d\n", "Current sessions:", sessNew-sessClosed)
+	fmt.Printf("  %-30s %d\n", "Sessions created:", sessNew)
+	fmt.Printf("  %-30s %d\n", "Sessions closed:", sessClosed)
+	fmt.Println()
+	fmt.Printf("  %-30s %d\n", "Packets received:", rxPkts)
+	fmt.Printf("  %-30s %d\n", "Packets transmitted:", txPkts)
+	fmt.Printf("  %-30s %d\n", "Packets dropped:", drops)
+	fmt.Printf("  %-30s %d\n", "TC egress packets:", tcEgress)
+	fmt.Println()
+	fmt.Printf("  %-30s %d\n", "Policy deny:", policyDeny)
+	fmt.Printf("  %-30s %d\n", "NAT allocation failures:", natFail)
+	fmt.Printf("  %-30s %d\n", "NAT64 translations:", nat64)
+	fmt.Printf("  %-30s %d\n", "Fabric redirects:", fabricRedir)
+	fmt.Println()
+	fmt.Printf("  %-30s %d\n", "Host-inbound allowed:", hostAllow)
+	fmt.Printf("  %-30s %d\n", "Host-inbound denied:", hostDeny)
+
+	// Flow cache (IPv4 + IPv6)
+	if cacheHit > 0 || cacheMiss > 0 {
+		fmt.Println()
+		fmt.Printf("  %-30s %d\n", "Flow cache hits:", cacheHit)
+		fmt.Printf("  %-30s %d\n", "Flow cache misses:", cacheMiss)
+		fmt.Printf("  %-30s %d\n", "Flow cache flushes:", cacheFlush)
+		fmt.Printf("  %-30s %d\n", "Flow cache invalidations:", cacheInval)
+		if cacheHit+cacheMiss > 0 {
+			hitRate := float64(cacheHit) / float64(cacheHit+cacheMiss) * 100
+			fmt.Printf("  %-30s %.1f%%\n", "Flow cache hit rate:", hitRate)
+		}
+	}
+
+	// Screen drops breakdown
+	if screenDrops > 0 {
+		fmt.Println()
+		fmt.Printf("  %-30s %d\n", "Screen drops (total):", screenDrops)
+
+		screenCounters := []struct {
+			idx  uint32
+			name string
+		}{
+			{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
+			{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
+			{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
+			{dataplane.GlobalCtrScreenPortScan, "Port scan"},
+			{dataplane.GlobalCtrScreenIPSweep, "IP sweep"},
+			{dataplane.GlobalCtrScreenLandAttack, "Land attack"},
+			{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
+			{dataplane.GlobalCtrScreenTearDrop, "Tear drop"},
+			{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN-FIN"},
+			{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no flag"},
+			{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN no ACK"},
+			{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
+			{dataplane.GlobalCtrScreenIPSrcRoute, "IP source route"},
+			{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
+		}
+		for _, sc := range screenCounters {
+			v := readCounter(sc.idx)
+			if v > 0 {
+				fmt.Printf("    %-28s %d\n", sc.name+":", v)
+			}
+		}
+	}
+
+	return nil
+}
+
+// showFlowTraceoptions displays flow traceoptions config.
+
+func (c *CLI) showFlowTraceoptions() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+
+	opts := cfg.Security.Flow.Traceoptions
+	if opts == nil || opts.File == "" {
+		fmt.Println("Flow traceoptions: not configured")
+		return nil
+	}
+
+	fmt.Println("Flow traceoptions:")
+	fmt.Printf("  File:           %s\n", opts.File)
+	if opts.FileSize > 0 {
+		fmt.Printf("  Max size:       %d bytes\n", opts.FileSize)
+	}
+	if opts.FileCount > 0 {
+		fmt.Printf("  File count:     %d\n", opts.FileCount)
+	}
+	if len(opts.Flags) > 0 {
+		fmt.Printf("  Flags:          %s\n", strings.Join(opts.Flags, ", "))
+	}
+	if len(opts.PacketFilters) > 0 {
+		fmt.Println("  Packet filters:")
+		for _, pf := range opts.PacketFilters {
+			fmt.Printf("    %s:", pf.Name)
+			if pf.SourcePrefix != "" {
+				fmt.Printf(" src=%s", pf.SourcePrefix)
+			}
+			if pf.DestinationPrefix != "" {
+				fmt.Printf(" dst=%s", pf.DestinationPrefix)
+			}
+			fmt.Println()
+		}
+	}
+
+	return nil
+}
+
+func (c *CLI) showNATSource(cfg *config.Config, args []string) error {
+	// Sub-command dispatch: summary, pool <name>, rule-set <name>, rule all
+	if len(args) > 0 {
+		switch args[0] {
+		case "summary":
+			return c.showNATSourceSummary(cfg)
+		case "pool":
+			poolName := ""
+			if len(args) > 1 {
+				poolName = args[1]
+			}
+			return c.showNATSourcePool(cfg, poolName)
+		case "rule":
+			if len(args) > 1 && args[1] == "detail" {
+				return c.showNATSourceRuleDetail(cfg)
+			}
+			return c.showNATSourceRuleAll(cfg)
+		case "rule-set":
+			if len(args) > 1 {
+				return c.showNATSourceRuleSet(cfg, args[1])
+			}
+			return fmt.Errorf("usage: show security nat source rule-set <name>")
+		}
+	}
+
+	// Default: show all pools, rules, and summary
+	if cfg != nil && cfg.Security.NAT.AddressPersistent {
+		fmt.Println("Address-persistent: enabled")
+		fmt.Println()
+	}
+	// Show configured source NAT pools
+	if cfg != nil && len(cfg.Security.NAT.SourcePools) > 0 {
+		fmt.Println("Source NAT pools:")
+		for name, pool := range cfg.Security.NAT.SourcePools {
+			fmt.Printf("  Pool: %s\n", name)
+			for _, addr := range pool.Addresses {
+				fmt.Printf("    Address: %s\n", addr)
+			}
+			portLow, portHigh := pool.PortLow, pool.PortHigh
+			if portLow == 0 {
+				portLow = 1024
+			}
+			if portHigh == 0 {
+				portHigh = 65535
+			}
+			fmt.Printf("    Port range: %d-%d\n", portLow, portHigh)
+		}
+		fmt.Println()
+	}
+
+	// Show configured source NAT rules
+	if cfg != nil {
+		for _, rs := range cfg.Security.NAT.Source {
+			fmt.Printf("Source NAT rule-set: %s\n", rs.Name)
+			fmt.Printf("  From zone: %s, To zone: %s\n", rs.FromZone, rs.ToZone)
+			for _, rule := range rs.Rules {
+				action := "interface"
+				if rule.Then.PoolName != "" {
+					action = "pool " + rule.Then.PoolName
+				}
+				fmt.Printf("  Rule: %s -> %s\n", rule.Name, action)
+				if rule.Match.SourceAddress != "" {
+					fmt.Printf("    Match source-address: %s\n", rule.Match.SourceAddress)
+				}
+			}
+			fmt.Println()
+		}
+	}
+
+	// Show summary of active SNAT sessions
+	if c.dp == nil || !c.dp.IsLoaded() {
+		return nil
+	}
+
+	snatCount := 0
+	_ = c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if val.Flags&dataplane.SessFlagSNAT != 0 {
+			snatCount++
+		}
+		return true
+	})
+	_ = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+		if val.IsReverse != 0 {
+			return true
+		}
+		if val.Flags&dataplane.SessFlagSNAT != 0 {
+			snatCount++
+		}
+		return true
+	})
+	fmt.Printf("Active SNAT sessions: %d\n", snatCount)
+
+	// Show NAT alloc fail counter
+	if allocFails, err := c.dp.ReadGlobalCounter(dataplane.GlobalCtrNATAllocFail); err == nil {
+		fmt.Printf("NAT allocation failures: %d\n", allocFails)
+	}
+
+	return nil
+}
+
+// showNATSourceSummary displays a Junos-style summary of all source NAT pools.
+
+func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
+	if cfg == nil {
+		fmt.Println("No source NAT configured")
+		return nil
+	}
+
+	// Count pools: named pools + interface-mode rules
+	type poolInfo struct {
+		name    string
+		address string
+		total   int // total ports (0 = N/A for interface)
+		used    int
+		isIface bool
+	}
+	var pools []poolInfo
+
+	// Named pools
+	for name, pool := range cfg.Security.NAT.SourcePools {
+		portLow, portHigh := pool.PortLow, pool.PortHigh
+		if portLow == 0 {
+			portLow = 1024
+		}
+		if portHigh == 0 {
+			portHigh = 65535
+		}
+		totalPorts := (portHigh - portLow + 1) * len(pool.Addresses)
+		addr := strings.Join(pool.Addresses, ",")
+		pools = append(pools, poolInfo{name: name, address: addr, total: totalPorts})
+	}
+
+	// Interface-mode pools (count from rules)
+	for _, rs := range cfg.Security.NAT.Source {
+		for _, rule := range rs.Rules {
+			if rule.Then.Interface {
+				pools = append(pools, poolInfo{
+					name:    fmt.Sprintf("%s/%s (interface)", rs.FromZone, rs.ToZone),
+					address: "interface", isIface: true,
+				})
+			}
+		}
+	}
+
+	// Count active SNAT translations and per-rule-set sessions
+	totalSNAT := 0
+	type ruleSetKey struct{ from, to string }
+	rsSessionsV4 := make(map[ruleSetKey]int)
+	if c.dp != nil && c.dp.IsLoaded() {
+		cr := c.dp.LastCompileResult()
+		// Build reverse zone ID map
+		var zoneByID map[uint16]string
+		if cr != nil {
+			zoneByID = make(map[uint16]string, len(cr.ZoneIDs))
+			for name, id := range cr.ZoneIDs {
+				zoneByID[id] = name
+			}
+			for i := range pools {
+				if pools[i].isIface {
+					continue
+				}
+				if id, ok := cr.PoolIDs[pools[i].name]; ok {
+					cnt, err := c.dp.ReadNATPortCounter(uint32(id))
+					if err == nil {
+						pools[i].used = int(cnt)
+					}
+				}
+			}
+		}
+		// Count SNAT sessions per zone pair
+		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				totalSNAT++
+				if zoneByID != nil {
+					rsSessionsV4[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+				}
+			}
+			return true
+		})
+		// Count IPv6 SNAT sessions
+		_ = c.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				totalSNAT++
+				if zoneByID != nil {
+					rsSessionsV4[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+				}
+			}
+			return true
+		})
+		for i := range pools {
+			if pools[i].isIface {
+				pools[i].used = totalSNAT // interface NAT counts all SNAT sessions
+			}
+		}
+	}
+
+	fmt.Printf("Total active translations: %d\n", totalSNAT)
+	fmt.Printf("Total pools: %d\n", len(pools))
+	fmt.Println()
+	fmt.Printf("%-20s %-20s %-8s %-8s %-12s %-12s\n",
+		"Pool", "Address", "Ports", "Used", "Available", "Utilization")
+	for _, p := range pools {
+		ports := "N/A"
+		avail := "N/A"
+		util := "N/A"
+		if p.total > 0 {
+			ports = fmt.Sprintf("%d", p.total)
+			a := p.total - p.used
+			if a < 0 {
+				a = 0
+			}
+			avail = fmt.Sprintf("%d", a)
+			util = fmt.Sprintf("%.1f%%", float64(p.used)/float64(p.total)*100)
+		}
+		fmt.Printf("%-20s %-20s %-8s %-8d %-12s %-12s\n",
+			p.name, p.address, ports, p.used, avail, util)
+	}
+
+	// Per-rule-set session counts
+	if len(rsSessionsV4) > 0 {
+		fmt.Println()
+		fmt.Printf("%-30s %-12s\n", "Rule-set (from -> to)", "Sessions")
+		for _, rs := range cfg.Security.NAT.Source {
+			key := ruleSetKey{rs.FromZone, rs.ToZone}
+			if cnt, ok := rsSessionsV4[key]; ok {
+				fmt.Printf("%-30s %-12d\n",
+					fmt.Sprintf("%s -> %s", rs.FromZone, rs.ToZone), cnt)
+			}
+		}
+	}
+	return nil
+}
+
+// showNATSourcePool displays detailed information about a specific NAT pool.
+
+func (c *CLI) showNATSourcePool(cfg *config.Config, poolName string) error {
+	if cfg == nil {
+		fmt.Println("No source NAT configured")
+		return nil
+	}
+
+	// If poolName is empty or "all", show all pools
+	showAll := poolName == "" || poolName == "all"
+
+	for name, pool := range cfg.Security.NAT.SourcePools {
+		if !showAll && name != poolName {
+			continue
+		}
+
+		portLow, portHigh := pool.PortLow, pool.PortHigh
+		if portLow == 0 {
+			portLow = 1024
+		}
+		if portHigh == 0 {
+			portHigh = 65535
+		}
+		totalPorts := (portHigh - portLow + 1) * len(pool.Addresses)
+
+		fmt.Printf("Pool name: %s\n", name)
+		for _, addr := range pool.Addresses {
+			fmt.Printf("  Address: %s\n", addr)
+		}
+		fmt.Printf("  Port range: %d-%d\n", portLow, portHigh)
+
+		if c.dp != nil && c.dp.IsLoaded() {
+			if cr := c.dp.LastCompileResult(); cr != nil {
+				if id, ok := cr.PoolIDs[name]; ok {
+					cnt, err := c.dp.ReadNATPortCounter(uint32(id))
+					if err == nil {
+						avail := totalPorts - int(cnt)
+						if avail < 0 {
+							avail = 0
+						}
+						fmt.Printf("  Ports allocated: %d\n", cnt)
+						fmt.Printf("  Ports available: %d\n", avail)
+						if totalPorts > 0 {
+							fmt.Printf("  Utilization: %.1f%%\n",
+								float64(cnt)/float64(totalPorts)*100)
+						}
+					}
+				}
+			}
+		}
+		fmt.Println()
+	}
+
+	if !showAll {
+		if _, ok := cfg.Security.NAT.SourcePools[poolName]; !ok {
+			fmt.Printf("Pool %q not found\n", poolName)
+		}
+	}
+	return nil
+}
+
+// showNATSourceRuleSet displays a specific source NAT rule-set with hit counters.
+
+func (c *CLI) showNATSourceRuleSet(cfg *config.Config, rsName string) error {
+	if cfg == nil {
+		fmt.Println("No source NAT configured")
+		return nil
+	}
+
+	for _, rs := range cfg.Security.NAT.Source {
+		if rs.Name != rsName {
+			continue
+		}
+		fmt.Printf("Rule-set: %s\n", rs.Name)
+		fmt.Printf("  From zone: %s  To zone: %s\n", rs.FromZone, rs.ToZone)
+		for _, rule := range rs.Rules {
+			action := "interface"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			}
+			fmt.Printf("  Rule: %s\n", rule.Name)
+			srcMatch := "0.0.0.0/0"
+			if rule.Match.SourceAddress != "" {
+				srcMatch = rule.Match.SourceAddress
+			}
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+			fmt.Printf("    Match: source %s destination %s\n", srcMatch, dstMatch)
+			fmt.Printf("    Action: %s\n", action)
+
+			// Show hit counters if dataplane is loaded
+			if c.dp != nil && c.dp.LastCompileResult() != nil {
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := c.dp.LastCompileResult().NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						fmt.Printf("    Translation hits: %d packets  %d bytes\n",
+							cnt.Packets, cnt.Bytes)
+					}
+				}
+			}
+		}
+		fmt.Println()
+		return nil
+	}
+	fmt.Printf("Rule-set %q not found\n", rsName)
+	return nil
+}
+
+// showNATSourceRuleAll displays all source NAT rules across all rule-sets with hit counters.
+
+func (c *CLI) showNATSourceRuleAll(cfg *config.Config) error {
+	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
+		fmt.Println("No source NAT rules configured")
+		return nil
+	}
+
+	totalRules := 0
+	for _, rs := range cfg.Security.NAT.Source {
+		for _, rule := range rs.Rules {
+			totalRules++
+			action := "interface"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			}
+			srcMatch := "0.0.0.0/0"
+			if rule.Match.SourceAddress != "" {
+				srcMatch = rule.Match.SourceAddress
+			}
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+
+			fmt.Printf("Rule-set: %-20s Rule: %-12s %s -> %s  Action: %s\n",
+				rs.Name, rule.Name, rs.FromZone, rs.ToZone, action)
+			fmt.Printf("  Match: source %s destination %s\n", srcMatch, dstMatch)
+
+			if c.dp != nil && c.dp.LastCompileResult() != nil {
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := c.dp.LastCompileResult().NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						fmt.Printf("  Translation hits: %d packets  %d bytes\n",
+							cnt.Packets, cnt.Bytes)
+					}
+				}
+			}
+		}
+	}
+	fmt.Printf("\nTotal source NAT rules: %d\n", totalRules)
+	return nil
+}
+
+// showNATSourceRuleDetail displays Junos-style detailed source NAT rules.
+
+func (c *CLI) showNATSourceRuleDetail(cfg *config.Config) error {
+	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
+		fmt.Println("No source NAT rules configured")
+		return nil
+	}
+
+	// Count active SNAT sessions per rule-set
+	type ruleSetKey struct{ from, to string }
+	rsSessions := make(map[ruleSetKey]int)
+	if c.dp != nil && c.dp.IsLoaded() && c.dp.LastCompileResult() != nil {
+		cr := c.dp.LastCompileResult()
+		zoneByID := make(map[uint16]string, len(cr.ZoneIDs))
+		for name, id := range cr.ZoneIDs {
+			zoneByID[id] = name
+		}
+		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+			}
+			return true
+		})
+	}
+
+	ruleIdx := 0
+	for _, rs := range cfg.Security.NAT.Source {
+		for _, rule := range rs.Rules {
+			ruleIdx++
+			action := "interface"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			} else if rule.Then.Off {
+				action = "off"
+			}
+			srcMatch := "0.0.0.0/0"
+			if rule.Match.SourceAddress != "" {
+				srcMatch = rule.Match.SourceAddress
+			}
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+
+			fmt.Printf("source NAT rule: %s\n", rule.Name)
+			fmt.Printf("  Rule-set: %s                        ID: %d\n", rs.Name, ruleIdx)
+			fmt.Printf("    From zone: %s    To zone: %s\n", rs.FromZone, rs.ToZone)
+			fmt.Printf("    Match:\n")
+			fmt.Printf("      Source addresses:      %s\n", srcMatch)
+			fmt.Printf("      Destination addresses: %s\n", dstMatch)
+			if rule.Match.Protocol != "" {
+				fmt.Printf("      IP protocol:           %s\n", rule.Match.Protocol)
+			}
+			fmt.Printf("    Action:                  %s\n", action)
+
+			if rule.Then.PoolName != "" && cfg.Security.NAT.SourcePools != nil {
+				if pool, ok := cfg.Security.NAT.SourcePools[rule.Then.PoolName]; ok {
+					if pool.PersistentNAT != nil {
+						fmt.Printf("    Persistent NAT:          enabled\n")
+					}
+					if len(pool.Addresses) > 0 {
+						fmt.Printf("    Pool addresses:          %s\n", strings.Join(pool.Addresses, ", "))
+					}
+					portLow, portHigh := pool.PortLow, pool.PortHigh
+					if portLow == 0 {
+						portLow = 1024
+					}
+					if portHigh == 0 {
+						portHigh = 65535
+					}
+					fmt.Printf("    Port range:              %d-%d\n", portLow, portHigh)
+				}
+			}
+
+			if c.dp != nil && c.dp.LastCompileResult() != nil {
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := c.dp.LastCompileResult().NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						fmt.Printf("    Translation hits:        %d packets  %d bytes\n",
+							cnt.Packets, cnt.Bytes)
+					}
+				}
+			}
+
+			sessions := rsSessions[ruleSetKey{rs.FromZone, rs.ToZone}]
+			fmt.Printf("    Number of sessions:      %d\n", sessions)
+			fmt.Println()
+		}
+	}
+	return nil
+}
+
+func (c *CLI) showNATDestination(cfg *config.Config, args []string) error {
+	if cfg == nil || cfg.Security.NAT.Destination == nil {
+		fmt.Println("No destination NAT rules configured.")
+		return nil
+	}
+
+	// Sub-command dispatch: summary, pool <name>, rule-set <name>, rule all
+	if len(args) > 0 {
+		switch args[0] {
+		case "summary":
+			return c.showNATDestinationSummary(cfg)
+		case "pool":
+			poolName := ""
+			if len(args) > 1 {
+				poolName = args[1]
+			}
+			return c.showNATDestinationPool(cfg, poolName)
+		case "rule":
+			if len(args) > 1 && args[1] == "detail" {
+				return c.showNATDestinationRuleDetail(cfg)
+			}
+			return c.showNATDestinationRuleAll(cfg)
+		case "rule-set":
+			if len(args) > 1 {
+				return c.showNATDestinationRuleSet(cfg, args[1])
+			}
+			return fmt.Errorf("usage: show security nat destination rule-set <name>")
+		}
+	}
+
+	dnat := cfg.Security.NAT.Destination
+
+	// Show destination NAT pools
+	if len(dnat.Pools) > 0 {
+		fmt.Println("Destination NAT pools:")
+		for name, pool := range dnat.Pools {
+			fmt.Printf("  Pool: %s\n", name)
+			fmt.Printf("    Address: %s\n", pool.Address)
+			if pool.Port != 0 {
+				fmt.Printf("    Port: %d\n", pool.Port)
+			}
+		}
+		fmt.Println()
+	}
+
+	// Show destination NAT rule sets
+	for _, rs := range dnat.RuleSets {
+		fmt.Printf("Destination NAT rule-set: %s\n", rs.Name)
+		fmt.Printf("  From zone: %s, To zone: %s\n", rs.FromZone, rs.ToZone)
+		for _, rule := range rs.Rules {
+			fmt.Printf("  Rule: %s\n", rule.Name)
+			if rule.Match.DestinationAddress != "" {
+				fmt.Printf("    Match destination-address: %s\n", rule.Match.DestinationAddress)
+			}
+			if rule.Match.DestinationPort != 0 {
+				fmt.Printf("    Match destination-port: %d\n", rule.Match.DestinationPort)
+			}
+			if rule.Then.PoolName != "" {
+				fmt.Printf("    Then pool: %s\n", rule.Then.PoolName)
+			}
+
+			// Show hit counters if dataplane is loaded
+			if c.dp != nil && c.dp.LastCompileResult() != nil {
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := c.dp.LastCompileResult().NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						fmt.Printf("    Translation hits: %d packets  %d bytes\n",
+							cnt.Packets, cnt.Bytes)
+					}
+				}
+			}
+		}
+		fmt.Println()
+	}
+
+	// Show summary of active DNAT sessions
+	if c.dp != nil && c.dp.IsLoaded() {
+		dnatCount := 0
+		_ = c.dp.IterateSessions(func(key dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse != 0 {
+				return true
+			}
+			if val.Flags&dataplane.SessFlagDNAT != 0 {
+				dnatCount++
+			}
+			return true
+		})
+		_ = c.dp.IterateSessionsV6(func(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse != 0 {
+				return true
+			}
+			if val.Flags&dataplane.SessFlagDNAT != 0 {
+				dnatCount++
+			}
+			return true
+		})
+		fmt.Printf("Active DNAT sessions: %d\n", dnatCount)
+	}
+
+	return nil
+}
+
+// showNATDestinationSummary displays a summary of all destination NAT pools.
+
+func (c *CLI) showNATDestinationSummary(cfg *config.Config) error {
+	dnat := cfg.Security.NAT.Destination
+	if dnat == nil || len(dnat.Pools) == 0 {
+		fmt.Println("No destination NAT pools configured")
+		return nil
+	}
+
+	// Count active DNAT sessions per pool and per rule-set
+	poolHits := make(map[string]int)
+	totalDNAT := 0
+	type ruleSetKey struct{ from, to string }
+	rsSessions := make(map[ruleSetKey]int)
+
+	if c.dp != nil && c.dp.IsLoaded() && c.dp.LastCompileResult() != nil {
+		cr := c.dp.LastCompileResult()
+		for _, rs := range dnat.RuleSets {
+			for _, rule := range rs.Rules {
+				if rule.Then.PoolName == "" {
+					continue
+				}
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						poolHits[rule.Then.PoolName] += int(cnt.Packets)
+					}
+				}
+			}
+		}
+
+		// Count active DNAT sessions by iterating sessions
+		zoneByID := make(map[uint16]string, len(cr.ZoneIDs))
+		for name, id := range cr.ZoneIDs {
+			zoneByID[id] = name
+		}
+		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
+				totalDNAT++
+				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+			}
+			return true
+		})
+		_ = c.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
+				totalDNAT++
+				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+			}
+			return true
+		})
+	}
+
+	fmt.Printf("Total active translations: %d\n", totalDNAT)
+	fmt.Printf("Total pools: %d\n", len(dnat.Pools))
+	fmt.Println()
+	fmt.Printf("%-20s %-20s %-8s %-12s\n",
+		"Pool", "Address", "Port", "Hits")
+	for name, pool := range dnat.Pools {
+		portStr := "-"
+		if pool.Port != 0 {
+			portStr = fmt.Sprintf("%d", pool.Port)
+		}
+		hits := poolHits[name]
+		fmt.Printf("%-20s %-20s %-8s %-12d\n",
+			name, pool.Address, portStr, hits)
+	}
+
+	// Per-rule-set session counts
+	if len(rsSessions) > 0 {
+		fmt.Println()
+		fmt.Printf("%-30s %-12s\n", "Rule-set (from -> to)", "Sessions")
+		for _, rs := range dnat.RuleSets {
+			key := ruleSetKey{rs.FromZone, rs.ToZone}
+			if cnt, ok := rsSessions[key]; ok {
+				fmt.Printf("%-30s %-12d\n",
+					fmt.Sprintf("%s -> %s", rs.FromZone, rs.ToZone), cnt)
+			}
+		}
+	}
+	return nil
+}
+
+// showNATDestinationPool displays detailed information about a specific DNAT pool.
+
+func (c *CLI) showNATDestinationPool(cfg *config.Config, poolName string) error {
+	dnat := cfg.Security.NAT.Destination
+	if dnat == nil || len(dnat.Pools) == 0 {
+		fmt.Println("No destination NAT pools configured")
+		return nil
+	}
+
+	showAll := poolName == "" || poolName == "all"
+
+	for name, pool := range dnat.Pools {
+		if !showAll && name != poolName {
+			continue
+		}
+		fmt.Printf("Pool name: %s\n", name)
+		fmt.Printf("  Address: %s\n", pool.Address)
+		if pool.Port != 0 {
+			fmt.Printf("  Port: %d\n", pool.Port)
+		}
+
+		// Show which rule-sets reference this pool
+		for _, rs := range dnat.RuleSets {
+			for _, rule := range rs.Rules {
+				if rule.Then.PoolName == name {
+					fmt.Printf("  Referenced by: %s/%s (from %s)\n",
+						rs.Name, rule.Name, rs.FromZone)
+				}
+			}
+		}
+
+		// Show hit counters from all rules referencing this pool
+		if c.dp != nil && c.dp.LastCompileResult() != nil {
+			cr := c.dp.LastCompileResult()
+			var totalPkts, totalBytes uint64
+			for _, rs := range dnat.RuleSets {
+				for _, rule := range rs.Rules {
+					if rule.Then.PoolName != name {
+						continue
+					}
+					ruleKey := rs.Name + "/" + rule.Name
+					if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
+						cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+						if err == nil {
+							totalPkts += cnt.Packets
+							totalBytes += cnt.Bytes
+						}
+					}
+				}
+			}
+			fmt.Printf("  Total hits: %d packets  %d bytes\n", totalPkts, totalBytes)
+		}
+		fmt.Println()
+	}
+
+	if !showAll {
+		if _, ok := dnat.Pools[poolName]; !ok {
+			fmt.Printf("Pool %q not found\n", poolName)
+		}
+	}
+	return nil
+}
+
+// showNATDestinationRuleSet displays a specific destination NAT rule-set with hit counters.
+
+func (c *CLI) showNATDestinationRuleSet(cfg *config.Config, rsName string) error {
+	dnat := cfg.Security.NAT.Destination
+	if dnat == nil {
+		fmt.Println("No destination NAT configured")
+		return nil
+	}
+
+	for _, rs := range dnat.RuleSets {
+		if rs.Name != rsName {
+			continue
+		}
+		fmt.Printf("Rule-set: %s\n", rs.Name)
+		fmt.Printf("  From zone: %s  To zone: %s\n", rs.FromZone, rs.ToZone)
+		for _, rule := range rs.Rules {
+			fmt.Printf("  Rule: %s\n", rule.Name)
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+			fmt.Printf("    Match destination-address: %s\n", dstMatch)
+			if rule.Match.DestinationPort != 0 {
+				fmt.Printf("    Match destination-port: %d\n", rule.Match.DestinationPort)
+			}
+			action := "off"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			}
+			fmt.Printf("    Action: %s\n", action)
+
+			// Show hit counters if dataplane is loaded
+			if c.dp != nil && c.dp.LastCompileResult() != nil {
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := c.dp.LastCompileResult().NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						fmt.Printf("    Translation hits: %d packets  %d bytes\n",
+							cnt.Packets, cnt.Bytes)
+					}
+				}
+			}
+		}
+		fmt.Println()
+		return nil
+	}
+	fmt.Printf("Rule-set %q not found\n", rsName)
+	return nil
+}
+
+// showNATDestinationRuleAll displays all destination NAT rules with hit counters.
+
+func (c *CLI) showNATDestinationRuleAll(cfg *config.Config) error {
+	dnat := cfg.Security.NAT.Destination
+	if dnat == nil || len(dnat.RuleSets) == 0 {
+		fmt.Println("No destination NAT rules configured")
+		return nil
+	}
+
+	totalRules := 0
+	for _, rs := range dnat.RuleSets {
+		for _, rule := range rs.Rules {
+			totalRules++
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+			if rule.Match.DestinationPort != 0 {
+				dstMatch += fmt.Sprintf(":%d", rule.Match.DestinationPort)
+			}
+			action := "off"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			}
+
+			fmt.Printf("Rule-set: %-20s Rule: %-12s from %s  Action: %s\n",
+				rs.Name, rule.Name, rs.FromZone, action)
+			fmt.Printf("  Match: destination %s\n", dstMatch)
+
+			if c.dp != nil && c.dp.LastCompileResult() != nil {
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := c.dp.LastCompileResult().NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						fmt.Printf("  Translation hits: %d packets  %d bytes\n",
+							cnt.Packets, cnt.Bytes)
+					}
+				}
+			}
+		}
+	}
+	fmt.Printf("\nTotal destination NAT rules: %d\n", totalRules)
+	return nil
+}
+
+// showNATDestinationRuleDetail displays Junos-style detailed destination NAT rules.
+
+func (c *CLI) showNATDestinationRuleDetail(cfg *config.Config) error {
+	dnat := cfg.Security.NAT.Destination
+	if dnat == nil || len(dnat.RuleSets) == 0 {
+		fmt.Println("No destination NAT rules configured")
+		return nil
+	}
+
+	// Count active DNAT sessions per rule-set
+	type ruleSetKey struct{ from, to string }
+	rsSessions := make(map[ruleSetKey]int)
+	if c.dp != nil && c.dp.IsLoaded() && c.dp.LastCompileResult() != nil {
+		cr := c.dp.LastCompileResult()
+		zoneByID := make(map[uint16]string, len(cr.ZoneIDs))
+		for name, id := range cr.ZoneIDs {
+			zoneByID[id] = name
+		}
+		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
+				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+			}
+			return true
+		})
+	}
+
+	ruleIdx := 0
+	for _, rs := range dnat.RuleSets {
+		for _, rule := range rs.Rules {
+			ruleIdx++
+			action := "off"
+			if rule.Then.PoolName != "" {
+				action = "pool " + rule.Then.PoolName
+			}
+			dstMatch := "0.0.0.0/0"
+			if rule.Match.DestinationAddress != "" {
+				dstMatch = rule.Match.DestinationAddress
+			}
+
+			fmt.Printf("destination NAT rule: %s\n", rule.Name)
+			fmt.Printf("  Rule-set: %s                        ID: %d\n", rs.Name, ruleIdx)
+			fmt.Printf("    From zone: %s    To zone: %s\n", rs.FromZone, rs.ToZone)
+			fmt.Printf("    Match:\n")
+			fmt.Printf("      Destination addresses: %s\n", dstMatch)
+			if rule.Match.DestinationPort != 0 {
+				fmt.Printf("      Destination port:      %d\n", rule.Match.DestinationPort)
+			}
+			if rule.Match.Protocol != "" {
+				fmt.Printf("      IP protocol:           %s\n", rule.Match.Protocol)
+			}
+			if rule.Match.Application != "" {
+				fmt.Printf("      Application:           %s\n", rule.Match.Application)
+			}
+			fmt.Printf("    Action:                  %s\n", action)
+
+			if rule.Then.PoolName != "" && dnat.Pools != nil {
+				if pool, ok := dnat.Pools[rule.Then.PoolName]; ok {
+					fmt.Printf("    Pool address:            %s\n", pool.Address)
+					if pool.Port != 0 {
+						fmt.Printf("    Pool port:               %d\n", pool.Port)
+					}
+				}
+			}
+
+			if c.dp != nil && c.dp.LastCompileResult() != nil {
+				ruleKey := rs.Name + "/" + rule.Name
+				if cid, ok := c.dp.LastCompileResult().NATCounterIDs[ruleKey]; ok {
+					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
+					if err == nil {
+						fmt.Printf("    Translation hits:        %d packets  %d bytes\n",
+							cnt.Packets, cnt.Bytes)
+					}
+				}
+			}
+
+			sessions := rsSessions[ruleSetKey{rs.FromZone, rs.ToZone}]
+			fmt.Printf("    Number of sessions:      %d\n", sessions)
+			fmt.Println()
+		}
+	}
+	return nil
+}
+
+func (c *CLI) showNATStatic(cfg *config.Config) error {
+	if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
+		fmt.Println("No static NAT rules configured.")
+		return nil
+	}
+
+	for _, rs := range cfg.Security.NAT.Static {
+		fmt.Printf("Static NAT rule-set: %s\n", rs.Name)
+		fmt.Printf("  From zone: %s\n", rs.FromZone)
+		for _, rule := range rs.Rules {
+			fmt.Printf("  Rule: %s\n", rule.Name)
+			fmt.Printf("    Match destination-address: %s\n", rule.Match)
+			if rule.IsNPTv6 {
+				fmt.Printf("    Then nptv6-prefix:         %s\n", rule.Then)
+			} else {
+				fmt.Printf("    Then static-nat prefix:    %s\n", rule.Then)
+			}
+		}
+		fmt.Println()
+	}
+
+	return nil
+}
+
+func (c *CLI) showNAT64(cfg *config.Config) error {
+	if cfg == nil || len(cfg.Security.NAT.NAT64) == 0 {
+		fmt.Println("No NAT64 rule-sets configured.")
+		return nil
+	}
+
+	for _, rs := range cfg.Security.NAT.NAT64 {
+		fmt.Printf("NAT64 rule-set: %s\n", rs.Name)
+		if rs.Prefix != "" {
+			fmt.Printf("  Prefix:      %s\n", rs.Prefix)
+		}
+		if rs.SourcePool != "" {
+			fmt.Printf("  Source pool:  %s\n", rs.SourcePool)
+		}
+		fmt.Println()
+	}
+
+	return nil
+}
+
+func (c *CLI) showNPTv6(cfg *config.Config) error {
+	if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
+		fmt.Println("No NPTv6 rules configured.")
+		return nil
+	}
+
+	found := false
+	for _, rs := range cfg.Security.NAT.Static {
+		for _, rule := range rs.Rules {
+			if !rule.IsNPTv6 {
+				continue
+			}
+			if !found {
+				fmt.Printf("%-20s %-20s %-50s %-50s\n",
+					"Rule-set", "Rule", "External prefix", "Internal prefix")
+				found = true
+			}
+			fmt.Printf("%-20s %-20s %-50s %-50s\n",
+				rs.Name, rule.Name, rule.Match, rule.Then)
+		}
+	}
+	if !found {
+		fmt.Println("No NPTv6 rules configured.")
+	}
+	return nil
+}
+
+func (c *CLI) showAddressBook(args []string) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.Security.AddressBook == nil {
+		fmt.Println("No address book configured")
+		return nil
+	}
+	ab := cfg.Security.AddressBook
+
+	// Optional filter by name
+	filterName := ""
+	if len(args) > 0 {
+		filterName = args[0]
+	}
+
+	if len(ab.Addresses) > 0 {
+		if filterName == "" {
+			fmt.Println("Addresses:")
+		}
+		for _, addr := range ab.Addresses {
+			if filterName != "" && addr.Name != filterName {
+				continue
+			}
+			fmt.Printf("  %-24s %s\n", addr.Name, addr.Value)
+		}
+	}
+
+	if len(ab.AddressSets) > 0 {
+		if filterName == "" {
+			fmt.Println("Address sets:")
+		}
+		for _, as := range ab.AddressSets {
+			if filterName != "" && as.Name != filterName {
+				continue
+			}
+			var parts []string
+			for _, a := range as.Addresses {
+				parts = append(parts, a)
+			}
+			for _, s := range as.AddressSets {
+				parts = append(parts, "set:"+s)
+			}
+			fmt.Printf("  %-24s members: %s\n", as.Name, strings.Join(parts, ", "))
+			// If filtering by name, show member details
+			if filterName != "" {
+				for _, a := range as.Addresses {
+					for _, addr := range ab.Addresses {
+						if addr.Name == a {
+							fmt.Printf("    %-22s %s\n", addr.Name, addr.Value)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if filterName == "" && len(ab.Addresses) == 0 && len(ab.AddressSets) == 0 {
+		fmt.Println("Address book is empty")
+	}
+
+	return nil
+}
+
+func (c *CLI) showApplications(args []string) error {
+	cfg := c.store.ActiveConfig()
+
+	// Parse sub-commands: detail, <name>
+	detail := false
+	filterName := ""
+	for _, a := range args {
+		switch a {
+		case "detail":
+			detail = true
+		default:
+			filterName = a
+		}
+	}
+
+	// Helper to print application detail
+	printApp := func(app *config.Application, indent string) {
+		if detail || filterName != "" {
+			fmt.Printf("%sApplication: %s\n", indent, app.Name)
+			if app.Description != "" {
+				fmt.Printf("%s  Description: %s\n", indent, app.Description)
+			}
+			if app.Protocol != "" {
+				fmt.Printf("%s  IP protocol: %s\n", indent, app.Protocol)
+			}
+			if app.DestinationPort != "" {
+				fmt.Printf("%s  Destination port: %s\n", indent, app.DestinationPort)
+			}
+			if app.SourcePort != "" {
+				fmt.Printf("%s  Source port: %s\n", indent, app.SourcePort)
+			}
+			if app.InactivityTimeout > 0 {
+				fmt.Printf("%s  Inactivity timeout: %ds\n", indent, app.InactivityTimeout)
+			}
+			if app.ALG != "" {
+				fmt.Printf("%s  ALG: %s\n", indent, app.ALG)
+			}
+		} else {
+			port := app.DestinationPort
+			if port == "" {
+				port = "-"
+			}
+			fmt.Printf("%s%-24s protocol: %-6s port: %s\n", indent, app.Name, app.Protocol, port)
+		}
+	}
+
+	// User-defined applications
+	if cfg != nil && len(cfg.Applications.Applications) > 0 {
+		if filterName == "" {
+			fmt.Println("User-defined applications:")
+		}
+		names := make([]string, 0, len(cfg.Applications.Applications))
+		for name := range cfg.Applications.Applications {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			app := cfg.Applications.Applications[name]
+			if filterName != "" && app.Name != filterName {
+				continue
+			}
+			printApp(app, "  ")
+		}
+		if filterName == "" {
+			fmt.Println()
+		}
+	}
+
+	// User-defined application-sets
+	if cfg != nil && len(cfg.Applications.ApplicationSets) > 0 {
+		names := make([]string, 0, len(cfg.Applications.ApplicationSets))
+		for name := range cfg.Applications.ApplicationSets {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		if filterName == "" {
+			fmt.Println("Application sets:")
+		}
+		for _, name := range names {
+			as := cfg.Applications.ApplicationSets[name]
+			if filterName != "" && as.Name != filterName {
+				continue
+			}
+			if detail || filterName != "" {
+				fmt.Printf("  Application set: %s\n", as.Name)
+				fmt.Printf("    Members:\n")
+				for _, member := range as.Applications {
+					fmt.Printf("      %s\n", member)
+					// Show member details if filtering by set name
+					if filterName != "" {
+						if cfg != nil {
+							if app, ok := cfg.Applications.Applications[member]; ok {
+								printApp(app, "        ")
+							}
+						}
+					}
+				}
+			} else {
+				fmt.Printf("  %-24s members: %s\n", as.Name, strings.Join(as.Applications, ", "))
+			}
+		}
+		if filterName == "" {
+			fmt.Println()
+		}
+	}
+
+	// Show matching predefined application if filtering by name
+	if filterName != "" {
+		for _, app := range config.PredefinedApplications {
+			if app.Name == filterName {
+				fmt.Println("Predefined application:")
+				printApp(app, "  ")
+				return nil
+			}
+		}
+		return nil
+	}
+
+	// Predefined applications (only in list mode)
+	fmt.Println("Predefined applications:")
+	for _, app := range config.PredefinedApplications {
+		printApp(app, "  ")
+	}
+
+	return nil
+}
+
+func (c *CLI) showRoutes() error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+
+	cfg := c.store.ActiveConfig()
+	var instances []*config.RoutingInstanceConfig
+	if cfg != nil {
+		instances = cfg.RoutingInstances
+	}
+
+	allTables, err := c.routing.GetAllTableRoutes(instances)
+	if err != nil {
+		return fmt.Errorf("get routes: %w", err)
+	}
+
+	fmt.Print(routing.FormatAllRoutes(allTables))
+	return nil
+}
+
+func (c *CLI) showRouteTerse() error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+	entries, err := c.routing.GetRoutes()
+	if err != nil {
+		return fmt.Errorf("get routes: %w", err)
+	}
+	fmt.Print(routing.FormatRouteTerse(entries))
+	return nil
+}
+
+func (c *CLI) showRoutesForInstance(instanceName string) error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	var tableID int
+	found := false
+	for _, ri := range cfg.RoutingInstances {
+		if ri.Name == instanceName {
+			tableID = ri.TableID
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("routing instance %q not found", instanceName)
+	}
+
+	entries, err := c.routing.GetRoutesForTable(tableID)
+	if err != nil {
+		return fmt.Errorf("get routes for instance %s: %w", instanceName, err)
+	}
+
+	fmt.Printf("Routing table for instance %s (table %d):\n", instanceName, tableID)
+	fmt.Printf("  %-24s %-20s %-14s %-12s %s\n",
+		"Destination", "Next-hop", "Interface", "Proto", "Pref")
+	for _, e := range entries {
+		fmt.Printf("  %-24s %-20s %-14s %-12s %d\n",
+			e.Destination, e.NextHop, e.Interface, e.Protocol, e.Preference)
+	}
+	return nil
+}
+
+func (c *CLI) showRoutesForVRF(tableName string) error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+
+	entries, err := c.routing.GetTableRoutes(tableName)
+	if err != nil {
+		return fmt.Errorf("get table routes: %w", err)
+	}
+
+	if len(entries) == 0 {
+		fmt.Printf("No routes in table %s\n", tableName)
+		return nil
+	}
+
+	fmt.Print(routing.FormatAllRoutes([]routing.TableRoutes{{Name: tableName, Entries: entries}}))
+	return nil
+}
+
+func (c *CLI) showRoutesForProtocol(proto string) error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+
+	entries, err := c.routing.GetRoutes()
+	if err != nil {
+		return fmt.Errorf("get routes: %w", err)
+	}
+
+	proto = strings.ToLower(proto)
+	fmt.Printf("Routes matching protocol: %s\n", proto)
+	fmt.Printf("  %-24s %-20s %-14s %-12s %s\n",
+		"Destination", "Next-hop", "Interface", "Proto", "Pref")
+	count := 0
+	for _, e := range entries {
+		if strings.ToLower(e.Protocol) == proto {
+			fmt.Printf("  %-24s %-20s %-14s %-12s %d\n",
+				e.Destination, e.NextHop, e.Interface, e.Protocol, e.Preference)
+			count++
+		}
+	}
+	if count == 0 {
+		fmt.Printf("  (no routes)\n")
+	}
+	return nil
+}
+
+func (c *CLI) showRoutesForPrefix(prefix, modifier string) error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+
+	cfg := c.store.ActiveConfig()
+	var instances []*config.RoutingInstanceConfig
+	if cfg != nil {
+		instances = cfg.RoutingInstances
+	}
+
+	allTables, err := c.routing.GetAllTableRoutes(instances)
+	if err != nil {
+		return fmt.Errorf("get routes: %w", err)
+	}
+
+	fmt.Print(routing.FormatRouteDestination(allTables, prefix, modifier))
+	return nil
+}
+
+func (c *CLI) showRouteSummary() error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+
+	cfg := c.store.ActiveConfig()
+	var instances []*config.RoutingInstanceConfig
+	if cfg != nil {
+		instances = cfg.RoutingInstances
+	}
+	allTables, err := c.routing.GetAllTableRoutes(instances)
+	if err != nil {
+		return fmt.Errorf("get routes: %w", err)
+	}
+
+	routerID := ""
+	if cfg != nil {
+		if cfg.Protocols.OSPF != nil && cfg.Protocols.OSPF.RouterID != "" {
+			routerID = cfg.Protocols.OSPF.RouterID
+		} else if cfg.Protocols.BGP != nil && cfg.Protocols.BGP.RouterID != "" {
+			routerID = cfg.Protocols.BGP.RouterID
+		}
+	}
+
+	fmt.Print(routing.FormatRouteSummary(allTables, routerID))
+	return nil
+}
+
+func (c *CLI) showRouteDetail() error {
+	if c.frr == nil {
+		fmt.Println("FRR manager not available")
+		return nil
+	}
+
+	routes, err := c.frr.GetRouteDetailJSON()
+	if err != nil {
+		return fmt.Errorf("get route detail: %w", err)
+	}
+
+	if len(routes) == 0 {
+		fmt.Println("No routes")
+		return nil
+	}
+
+	fmt.Print(frr.FormatRouteDetail(routes))
+	return nil
+}
+
+func (c *CLI) showOSPF(args []string) error {
+	if c.frr == nil {
+		fmt.Println("FRR manager not available")
+		return nil
+	}
+
+	if len(args) == 0 {
+		cmdtree.PrintTreeHelp("show protocols ospf:", operationalTree, "show", "protocols", "ospf")
+		return nil
+	}
+
+	switch args[0] {
+	case "neighbor":
+		if len(args) >= 2 && args[1] == "detail" {
+			output, err := c.frr.GetOSPFNeighborDetail()
+			if err != nil {
+				return fmt.Errorf("OSPF neighbor detail: %w", err)
+			}
+			fmt.Print(output)
+			return nil
+		}
+		neighbors, err := c.frr.GetOSPFNeighbors()
+		if err != nil {
+			return fmt.Errorf("OSPF neighbors: %w", err)
+		}
+		if len(neighbors) == 0 {
+			fmt.Println("No OSPF neighbors")
+			return nil
+		}
+		fmt.Printf("  %-18s %-10s %-16s %-18s %s\n",
+			"Neighbor ID", "Priority", "State", "Address", "Interface")
+		for _, n := range neighbors {
+			fmt.Printf("  %-18s %-10s %-16s %-18s %s\n",
+				n.NeighborID, n.Priority, n.State, n.Address, n.Interface)
+		}
+		return nil
+
+	case "database":
+		output, err := c.frr.GetOSPFDatabase()
+		if err != nil {
+			return fmt.Errorf("OSPF database: %w", err)
+		}
+		fmt.Print(output)
+		return nil
+
+	case "interface":
+		output, err := c.frr.GetOSPFInterface()
+		if err != nil {
+			return fmt.Errorf("OSPF interface: %w", err)
+		}
+		fmt.Print(output)
+		return nil
+
+	case "routes":
+		output, err := c.frr.GetOSPFRoutes()
+		if err != nil {
+			return fmt.Errorf("OSPF routes: %w", err)
+		}
+		fmt.Print(output)
+		return nil
+
+	default:
+		return fmt.Errorf("unknown show protocols ospf target: %s", args[0])
+	}
+}
+
+func (c *CLI) showBGP(args []string) error {
+	if c.frr == nil {
+		fmt.Println("FRR manager not available")
+		return nil
+	}
+
+	if len(args) == 0 {
+		cmdtree.PrintTreeHelp("show protocols bgp:", operationalTree, "show", "protocols", "bgp")
+		return nil
+	}
+
+	switch args[0] {
+	case "summary":
+		peers, err := c.frr.GetBGPSummary()
+		if err != nil {
+			return fmt.Errorf("BGP summary: %w", err)
+		}
+		if len(peers) == 0 {
+			fmt.Println("No BGP peers")
+			return nil
+		}
+		fmt.Printf("  %-20s %-8s %-10s %-10s %-12s %s\n",
+			"Neighbor", "AS", "MsgRcvd", "MsgSent", "Up/Down", "State")
+		for _, p := range peers {
+			fmt.Printf("  %-20s %-8s %-10s %-10s %-12s %s\n",
+				p.Neighbor, p.AS, p.MsgRcvd, p.MsgSent, p.UpDown, p.State)
+		}
+		return nil
+
+	case "routes":
+		routes, err := c.frr.GetBGPRoutes()
+		if err != nil {
+			return fmt.Errorf("BGP routes: %w", err)
+		}
+		if len(routes) == 0 {
+			fmt.Println("No BGP routes")
+			return nil
+		}
+		fmt.Printf("  %-24s %-20s %s\n", "Network", "Next-hop", "Path")
+		for _, r := range routes {
+			fmt.Printf("  %-24s %-20s %s\n", r.Network, r.NextHop, r.Path)
+		}
+		return nil
+
+	case "neighbor":
+		ip := ""
+		if len(args) >= 2 {
+			ip = args[1]
+		}
+		// Check for sub-commands: received-routes, advertised-routes
+		if len(args) >= 3 {
+			switch args[2] {
+			case "received-routes":
+				output, err := c.frr.GetBGPNeighborReceivedRoutes(ip)
+				if err != nil {
+					return fmt.Errorf("BGP received routes: %w", err)
+				}
+				fmt.Print(output)
+				return nil
+			case "advertised-routes":
+				output, err := c.frr.GetBGPNeighborAdvertisedRoutes(ip)
+				if err != nil {
+					return fmt.Errorf("BGP advertised routes: %w", err)
+				}
+				fmt.Print(output)
+				return nil
+			}
+		}
+		output, err := c.frr.GetBGPNeighborDetail(ip)
+		if err != nil {
+			return fmt.Errorf("BGP neighbor: %w", err)
+		}
+		fmt.Print(output)
+		return nil
+
+	default:
+		return fmt.Errorf("unknown show protocols bgp target: %s", args[0])
+	}
+}
+
+func (c *CLI) showIPsec(args []string) error {
+	if c.ipsec == nil {
+		fmt.Println("IPsec manager not available")
+		return nil
+	}
+
+	if len(args) > 0 && args[0] == "security-associations" {
+		detail := len(args) >= 2 && args[1] == "detail"
+		sas, err := c.ipsec.GetSAStatus()
+		if err != nil {
+			return fmt.Errorf("IPsec SA status: %w", err)
+		}
+		if len(sas) == 0 {
+			fmt.Println("No IPsec security associations")
+			return nil
+		}
+		for _, sa := range sas {
+			fmt.Printf("SA: %s\n", sa.Name)
+			fmt.Printf("  State: %s\n", sa.State)
+			if sa.LocalAddr != "" {
+				fmt.Printf("  Local: %s\n", sa.LocalAddr)
+			}
+			if sa.RemoteAddr != "" {
+				fmt.Printf("  Remote: %s\n", sa.RemoteAddr)
+			}
+			if sa.LocalTS != "" {
+				fmt.Printf("  Local TS: %s\n", sa.LocalTS)
+			}
+			if sa.RemoteTS != "" {
+				fmt.Printf("  Remote TS: %s\n", sa.RemoteTS)
+			}
+			if detail {
+				inBytes := sa.InBytes
+				if inBytes == "" {
+					inBytes = "0"
+				}
+				outBytes := sa.OutBytes
+				if outBytes == "" {
+					outBytes = "0"
+				}
+				fmt.Printf("  Bytes transferred In/Out: %s/%s\n", inBytes, outBytes)
+			}
+			fmt.Println()
+		}
+		return nil
+	}
+
+	if len(args) > 0 && args[0] == "statistics" {
+		return c.showIPsecStatistics()
+	}
+
+	// Default: show configured VPNs
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+
+	if len(cfg.Security.IPsec.VPNs) == 0 {
+		fmt.Println("No IPsec VPNs configured")
+		return nil
+	}
+
+	for name, vpn := range cfg.Security.IPsec.VPNs {
+		fmt.Printf("VPN: %s\n", name)
+		fmt.Printf("  Gateway: %s\n", vpn.Gateway)
+		if vpn.LocalAddr != "" {
+			fmt.Printf("  Local address: %s\n", vpn.LocalAddr)
+		}
+		if vpn.IPsecPolicy != "" {
+			fmt.Printf("  IPsec policy: %s\n", vpn.IPsecPolicy)
+		}
+		if vpn.BindInterface != "" {
+			fmt.Printf("  Bind interface: %s\n", vpn.BindInterface)
+		}
+		if vpn.LocalID != "" {
+			fmt.Printf("  Local identity: %s\n", vpn.LocalID)
+		}
+		if vpn.RemoteID != "" {
+			fmt.Printf("  Remote identity: %s\n", vpn.RemoteID)
+		}
+		if len(vpn.TrafficSelectors) > 0 {
+			names := make([]string, 0, len(vpn.TrafficSelectors))
+			for tsName := range vpn.TrafficSelectors {
+				names = append(names, tsName)
+			}
+			sort.Strings(names)
+			for _, tsName := range names {
+				ts := vpn.TrafficSelectors[tsName]
+				fmt.Printf("  Traffic selector %s: %s -> %s\n", tsName, ts.LocalIP, ts.RemoteIP)
+			}
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func (c *CLI) showIPsecStatistics() error {
+	if c.ipsec == nil {
+		fmt.Println("IPsec manager not available")
+		return nil
+	}
+	sas, err := c.ipsec.GetSAStatus()
+	if err != nil {
+		return fmt.Errorf("IPsec statistics: %w", err)
+	}
+
+	activeTunnels := 0
+	for _, sa := range sas {
+		if sa.State == "ESTABLISHED" || sa.State == "INSTALLED" {
+			activeTunnels++
+		}
+	}
+
+	fmt.Println("IPsec statistics:")
+	fmt.Printf("  Active tunnels: %d\n", activeTunnels)
+	fmt.Printf("  Total SAs:      %d\n", len(sas))
+	fmt.Println()
+
+	if len(sas) > 0 {
+		fmt.Printf("  %-20s %-14s %-12s %-12s\n", "Name", "State", "Bytes In", "Bytes Out")
+		for _, sa := range sas {
+			inBytes := sa.InBytes
+			if inBytes == "" {
+				inBytes = "-"
+			}
+			outBytes := sa.OutBytes
+			if outBytes == "" {
+				outBytes = "-"
+			}
+			fmt.Printf("  %-20s %-14s %-12s %-12s\n", sa.Name, sa.State, inBytes, outBytes)
+		}
+	}
+
+	// Show configured VPN count
+	cfg := c.store.ActiveConfig()
+	if cfg != nil && len(cfg.Security.IPsec.VPNs) > 0 {
+		fmt.Printf("\n  Configured VPNs: %d\n", len(cfg.Security.IPsec.VPNs))
+	}
+
+	return nil
+}
+
+func (c *CLI) showIKE(args []string) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+
+	if len(args) > 0 && args[0] == "security-associations" {
+		// Show IKE SA status from strongSwan
+		if c.ipsec != nil {
+			sas, err := c.ipsec.GetSAStatus()
+			if err != nil {
+				return fmt.Errorf("IKE SA status: %w", err)
+			}
+			if len(sas) == 0 {
+				fmt.Println("No IKE security associations")
+				return nil
+			}
+			for _, sa := range sas {
+				fmt.Printf("IKE SA: %s  State: %s\n", sa.Name, sa.State)
+				if sa.LocalAddr != "" {
+					fmt.Printf("  Local:  %s\n", sa.LocalAddr)
+				}
+				if sa.RemoteAddr != "" {
+					fmt.Printf("  Remote: %s\n", sa.RemoteAddr)
+				}
+				fmt.Println()
+			}
+			return nil
+		}
+		fmt.Println("IPsec manager not available")
+		return nil
+	}
+
+	// Show configured IKE gateways
+	gateways := cfg.Security.IPsec.Gateways
+	if len(gateways) == 0 {
+		fmt.Println("No IKE gateways configured")
+		return nil
+	}
+
+	names := make([]string, 0, len(gateways))
+	for name := range gateways {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		gw := gateways[name]
+		fmt.Printf("IKE gateway: %s\n", name)
+		if gw.Address != "" {
+			fmt.Printf("  Remote address:     %s\n", gw.Address)
+		}
+		if gw.DynamicHostname != "" {
+			fmt.Printf("  Dynamic hostname:   %s\n", gw.DynamicHostname)
+		}
+		if gw.LocalAddress != "" {
+			fmt.Printf("  Local address:      %s\n", gw.LocalAddress)
+		}
+		if gw.ExternalIface != "" {
+			fmt.Printf("  External interface: %s\n", gw.ExternalIface)
+		}
+		if gw.LocalCertificate != "" {
+			fmt.Printf("  Local certificate:  %s\n", gw.LocalCertificate)
+		}
+		if gw.IKEPolicy != "" {
+			fmt.Printf("  IKE policy:         %s\n", gw.IKEPolicy)
+			if pol, ok := cfg.Security.IPsec.IKEPolicies[gw.IKEPolicy]; ok {
+				fmt.Printf("    Mode:     %s\n", pol.Mode)
+				fmt.Printf("    Proposal: %s\n", pol.Proposals)
+			}
+		}
+		ver := gw.Version
+		if ver == "" {
+			ver = "v1+v2"
+		}
+		fmt.Printf("  IKE version:        %s\n", ver)
+		if gw.DeadPeerDetect != "" {
+			fmt.Printf("  DPD:                %s\n", gw.DeadPeerDetect)
+			if gw.DPDInterval > 0 {
+				fmt.Printf("  DPD interval:       %ds\n", gw.DPDInterval)
+			}
+			if gw.DPDThreshold > 0 {
+				fmt.Printf("  DPD threshold:      %d\n", gw.DPDThreshold)
+			}
+		}
+		if gw.NoNATTraversal {
+			fmt.Printf("  NAT-T:              disabled\n")
+		} else if gw.NATTraversal == "force" {
+			fmt.Printf("  NAT-T:              force\n")
+		} else if gw.NATTraversal == "enable" {
+			fmt.Printf("  NAT-T:              enabled\n")
+		}
+		if gw.LocalIDValue != "" {
+			fmt.Printf("  Local identity:     %s %s\n", gw.LocalIDType, gw.LocalIDValue)
+		}
+		if gw.RemoteIDValue != "" {
+			fmt.Printf("  Remote identity:    %s %s\n", gw.RemoteIDType, gw.RemoteIDValue)
+		}
+		fmt.Println()
+	}
+
+	// Show IKE proposals
+	proposals := cfg.Security.IPsec.IKEProposals
+	if len(proposals) > 0 {
+		pNames := make([]string, 0, len(proposals))
+		for name := range proposals {
+			pNames = append(pNames, name)
+		}
+		sort.Strings(pNames)
+		fmt.Println("IKE proposals:")
+		for _, name := range pNames {
+			p := proposals[name]
+			fmt.Printf("  %s: auth=%s enc=%s dh=group%d", name, p.AuthMethod, p.EncryptionAlg, p.DHGroup)
+			if p.LifetimeSeconds > 0 {
+				fmt.Printf(" lifetime=%ds", p.LifetimeSeconds)
+			}
+			fmt.Println()
+		}
+	}
+	return nil
+}
+
+func (c *CLI) showTunnelInterfaces() error {
+	if c.routing == nil {
+		fmt.Println("Routing manager not available")
+		return nil
+	}
+
+	tunnels, err := c.routing.GetTunnelStatus()
+	if err != nil {
+		return fmt.Errorf("tunnel status: %w", err)
+	}
+
+	if len(tunnels) == 0 {
+		fmt.Println("No tunnel interfaces")
+		return nil
+	}
+
+	for _, t := range tunnels {
+		fmt.Printf("Tunnel interface: %s\n", t.Name)
+		fmt.Printf("  State: %s\n", t.State)
+		if t.Source != "" {
+			fmt.Printf("  Source: %s\n", t.Source)
+		}
+		if t.Destination != "" {
+			fmt.Printf("  Destination: %s\n", t.Destination)
+		}
+		for _, addr := range t.Addresses {
+			fmt.Printf("  Address: %s\n", addr)
+		}
+		if t.KeepaliveInfo != "" {
+			fmt.Printf("  Keepalive: %s\n", t.KeepaliveInfo)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func (c *CLI) showSecurityLog(args []string) error {
+	if c.eventBuf == nil {
+		fmt.Println("no events (event buffer not initialized)")
+		return nil
+	}
+
+	n := 50
+	var filter logging.EventFilter
+
+	// Parse arguments: [N] [zone <name>] [protocol <proto>] [action <act>]
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "zone":
+			if i+1 < len(args) {
+				i++
+				zoneName := args[i]
+				if c.dp != nil {
+					if cr := c.dp.LastCompileResult(); cr != nil {
+						if zid, ok := cr.ZoneIDs[zoneName]; ok {
+							filter.Zone = zid
+						} else {
+							return fmt.Errorf("zone %q not found", zoneName)
+						}
+					}
+				}
+			}
+		case "protocol":
+			if i+1 < len(args) {
+				i++
+				filter.Protocol = args[i]
+			}
+		case "action":
+			if i+1 < len(args) {
+				i++
+				filter.Action = args[i]
+			}
+		default:
+			// Try parsing as count.
+			if v, err := strconv.Atoi(args[i]); err == nil {
+				n = v
+			}
+		}
+	}
+
+	var events []logging.EventRecord
+	if !filter.IsEmpty() {
+		events = c.eventBuf.LatestFiltered(n, filter)
+	} else {
+		events = c.eventBuf.Latest(n)
+	}
+	if len(events) == 0 {
+		fmt.Println("no events recorded")
+		return nil
+	}
+
+	// Build reverse zone ID → name map for event display
+	evZoneNames := make(map[uint16]string)
+	if c.dp != nil {
+		if cr := c.dp.LastCompileResult(); cr != nil {
+			for name, id := range cr.ZoneIDs {
+				evZoneNames[id] = name
+			}
+		}
+	}
+	zoneName := func(id uint16) string {
+		if n, ok := evZoneNames[id]; ok {
+			return n
+		}
+		return fmt.Sprintf("%d", id)
+	}
+
+	policyName := func(e logging.EventRecord) string {
+		if e.PolicyName != "" {
+			return e.PolicyName
+		}
+		return fmt.Sprintf("%d", e.PolicyID)
+	}
+
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "bpfrx"
+	}
+
+	for _, e := range events {
+		ts := e.Time.Format("2006-01-02T15:04:05")
+
+		// Parse source/destination address:port
+		srcAddr, srcPort := splitAddrPort(e.SrcAddr)
+		dstAddr, dstPort := splitAddrPort(e.DstAddr)
+		natSrcAddr, natSrcPort := splitAddrPort(e.NATSrcAddr)
+		natDstAddr, natDstPort := splitAddrPort(e.NATDstAddr)
+		if natSrcAddr == "" {
+			natSrcAddr = srcAddr
+			natSrcPort = srcPort
+		}
+		if natDstAddr == "" {
+			natDstAddr = dstAddr
+			natDstPort = dstPort
+		}
+
+		inIface := e.IngressIface
+		if inIface == "" {
+			inIface = zoneName(e.InZone)
+		}
+		appName := e.AppName
+		if appName == "" {
+			appName = "UNKNOWN"
+		}
+
+		switch e.Type {
+		case "SESSION_OPEN":
+			fmt.Printf("%s %s RT_FLOW - RT_FLOW_SESSION_CREATE [source-address=\"%s\" source-port=\"%s\" destination-address=\"%s\" destination-port=\"%s\" nat-source-address=\"%s\" nat-source-port=\"%s\" nat-destination-address=\"%s\" nat-destination-port=\"%s\" protocol-id=\"%s\" policy-name=\"%s\" source-zone-name=\"%s\" destination-zone-name=\"%s\" session-id-32=\"%d\" application=\"%s\" packet-incoming-interface=\"%s\"]\n",
+				ts, hostname, srcAddr, srcPort, dstAddr, dstPort,
+				natSrcAddr, natSrcPort, natDstAddr, natDstPort,
+				protoNameToID(e.Protocol), policyName(e),
+				zoneName(e.InZone), zoneName(e.OutZone),
+				e.SessionID, appName, inIface)
+
+		case "SESSION_CLOSE":
+			reason := e.CloseReason
+			if reason == "" {
+				reason = "N/A"
+			}
+			fmt.Printf("%s %s RT_FLOW - RT_FLOW_SESSION_CLOSE [reason=\"%s\" source-address=\"%s\" source-port=\"%s\" destination-address=\"%s\" destination-port=\"%s\" nat-source-address=\"%s\" nat-source-port=\"%s\" nat-destination-address=\"%s\" nat-destination-port=\"%s\" protocol-id=\"%s\" policy-name=\"%s\" source-zone-name=\"%s\" destination-zone-name=\"%s\" session-id-32=\"%d\" packets-from-client=\"%d\" bytes-from-client=\"%d\" packets-from-server=\"%d\" bytes-from-server=\"%d\" elapsed-time=\"%d\" application=\"%s\" packet-incoming-interface=\"%s\"]\n",
+				ts, hostname, reason, srcAddr, srcPort, dstAddr, dstPort,
+				natSrcAddr, natSrcPort, natDstAddr, natDstPort,
+				protoNameToID(e.Protocol), policyName(e),
+				zoneName(e.InZone), zoneName(e.OutZone),
+				e.SessionID, e.SessionPkts, e.SessionBytes,
+				e.RevSessionPkts, e.RevSessionBytes, e.ElapsedTime,
+				appName, inIface)
+
+		case "POLICY_DENY", "POLICY_REJECT":
+			fmt.Printf("%s %s RT_FLOW - RT_FLOW_SESSION_DENY [source-address=\"%s\" source-port=\"%s\" destination-address=\"%s\" destination-port=\"%s\" protocol-id=\"%s\" policy-name=\"%s\" source-zone-name=\"%s\" destination-zone-name=\"%s\" application=\"%s\" packet-incoming-interface=\"%s\"]\n",
+				ts, hostname, srcAddr, srcPort, dstAddr, dstPort,
+				protoNameToID(e.Protocol), policyName(e),
+				zoneName(e.InZone), zoneName(e.OutZone),
+				appName, inIface)
+
+		case "SCREEN_DROP":
+			fmt.Printf("%s %s RT_IDS - RT_SCREEN_DROP [attack-name=\"%s\" source-address=\"%s\" destination-address=\"%s\" protocol-id=\"%s\" source-zone-name=\"%s\" action=\"%s\"]\n",
+				ts, hostname, e.ScreenCheck, srcAddr, dstAddr,
+				protoNameToID(e.Protocol), zoneName(e.InZone), e.Action)
+
+		default:
+			// Fallback for other event types
+			fmt.Printf("%s %s RT_FLOW - %s [source-address=\"%s\" source-port=\"%s\" destination-address=\"%s\" destination-port=\"%s\" protocol-id=\"%s\" policy-name=\"%s\" source-zone-name=\"%s\" destination-zone-name=\"%s\" application=\"%s\" packet-incoming-interface=\"%s\"]\n",
+				ts, hostname, e.Type, srcAddr, srcPort, dstAddr, dstPort,
+				protoNameToID(e.Protocol), policyName(e),
+				zoneName(e.InZone), zoneName(e.OutZone),
+				appName, inIface)
+		}
+	}
+	fmt.Printf("(%d events shown)\n", len(events))
+	return nil
+}
+
+func (c *CLI) showInterfaces(args []string) error {
+	// Handle "show interfaces tunnel" sub-command
+	if len(args) > 0 && args[0] == "tunnel" {
+		return c.showTunnelInterfaces()
+	}
+
+	// Handle "show interfaces terse" sub-command
+	if len(args) > 0 && args[0] == "terse" {
+		return c.showInterfacesTerse()
+	}
+	// Handle "show interfaces detail" sub-command
+	if len(args) > 0 && args[0] == "detail" {
+		return c.showInterfacesDetail("")
+	}
+	// Handle "show interfaces extensive" sub-command
+	if len(args) > 0 && args[0] == "extensive" {
+		return c.showInterfacesExtensive()
+	}
+	// Handle "show interfaces statistics" sub-command
+	if len(args) > 0 && args[0] == "statistics" {
+		return c.showInterfacesStatistics()
+	}
+
+	// Handle "show interfaces <name> detail"
+	if len(args) >= 2 && args[len(args)-1] == "detail" {
+		return c.showInterfacesDetail(args[0])
+	}
+	// Handle "show interfaces <name> extensive"
+	if len(args) >= 2 && args[len(args)-1] == "extensive" {
+		return c.showInterfacesExtensiveFiltered(args[0])
+	}
+
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+
+	// Optional filter by interface name
+	var filterName string
+	if len(args) > 0 {
+		filterName = args[0]
+	}
+
+	// Build interface -> zone mapping
+	ifaceZone := make(map[string]*config.ZoneConfig)
+	ifaceZoneName := make(map[string]string)
+	for name, zone := range cfg.Security.Zones {
+		for _, ifaceName := range zone.Interfaces {
+			ifaceZone[ifaceName] = zone
+			ifaceZoneName[ifaceName] = name
+		}
+	}
+
+	// Collect logical interfaces
+	type logicalIface struct {
+		zoneName string
+		zone     *config.ZoneConfig
+		physName string
+		unitNum  int
+		vlanID   int
+	}
+	var logicals []logicalIface
+
+	for ifaceName, zone := range ifaceZone {
+		if filterName != "" && !strings.HasPrefix(ifaceName, filterName) {
+			continue
+		}
+		parts := strings.SplitN(ifaceName, ".", 2)
+		physName := parts[0]
+		unitNum := 0
+		if len(parts) == 2 {
+			unitNum, _ = strconv.Atoi(parts[1])
+		}
+		vlanID := 0
+		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+			if unit, ok := ifCfg.Units[unitNum]; ok {
+				vlanID = unit.VlanID
+			}
+		}
+		logicals = append(logicals, logicalIface{
+			zoneName: ifaceZoneName[ifaceName],
+			zone:     zone,
+			physName: physName,
+			unitNum:  unitNum,
+			vlanID:   vlanID,
+		})
+	}
+
+	if len(logicals) == 0 && filterName != "" {
+		return fmt.Errorf("interface %s not found in configuration", filterName)
+	}
+
+	// Group by physical interface
+	physGroups := make(map[string][]logicalIface)
+	var physOrder []string
+	for _, li := range logicals {
+		if _, seen := physGroups[li.physName]; !seen {
+			physOrder = append(physOrder, li.physName)
+		}
+		physGroups[li.physName] = append(physGroups[li.physName], li)
+	}
+	sort.Strings(physOrder)
+
+	for _, physName := range physOrder {
+		group := physGroups[physName]
+
+		// Get netlink link for richer info
+		link, nlErr := netlink.LinkByName(physName)
+
+		// Fallback to net.InterfaceByName if netlink fails
+		iface, stdErr := net.InterfaceByName(physName)
+		if stdErr != nil && nlErr != nil {
+			fmt.Printf("Physical interface: %s, Not present\n\n", physName)
+			continue
+		}
+
+		// Determine link state
+		linkUp := "Down"
+		enabled := "Enabled"
+		if nlErr == nil {
+			attrs := link.Attrs()
+			if attrs.OperState == netlink.OperUp {
+				linkUp = "Up"
+			}
+			if attrs.Flags&net.FlagUp == 0 {
+				enabled = "Disabled"
+			}
+		} else if iface != nil {
+			if iface.Flags&net.FlagUp != 0 {
+				linkUp = "Up"
+			}
+		}
+
+		fmt.Printf("Physical interface: %s, %s, Physical link is %s\n",
+			physName, enabled, linkUp)
+		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg.Description != "" {
+			fmt.Printf("  Description: %s\n", ifCfg.Description)
+		}
+
+		// Link-level details
+		mtu := 0
+		var hwAddr net.HardwareAddr
+		if nlErr == nil {
+			attrs := link.Attrs()
+			mtu = attrs.MTU
+			hwAddr = attrs.HardwareAddr
+		} else if iface != nil {
+			mtu = iface.MTU
+			hwAddr = iface.HardwareAddr
+		}
+
+		linkType := "Ethernet"
+		var linkDetails []string
+		if speed := readLinkSpeed(physName); speed > 0 {
+			linkDetails = append(linkDetails, "Speed: "+formatSpeed(speed))
+		}
+		if duplex := readLinkDuplex(physName); duplex != "" {
+			linkDetails = append(linkDetails, "Link-mode: "+formatDuplex(duplex))
+		}
+		extra := ""
+		if len(linkDetails) > 0 {
+			extra = ", " + strings.Join(linkDetails, ", ")
+		}
+
+		fmt.Printf("  Link-level type: %s, MTU: %d%s\n", linkType, mtu, extra)
+
+		if len(hwAddr) > 0 {
+			fmt.Printf("  Current address: %s, Hardware address: %s\n", hwAddr, hwAddr)
+		}
+
+		// Device flags
+		if nlErr == nil {
+			attrs := link.Attrs()
+			var flags []string
+			flags = append(flags, "Present")
+			if attrs.OperState == netlink.OperUp {
+				flags = append(flags, "Running")
+			}
+			if linkUp == "Down" {
+				flags = append(flags, "Down")
+			}
+			fmt.Printf("  Device flags   : %s\n", strings.Join(flags, " "))
+		}
+
+		// VLAN tagging
+		if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok && ifCfg.VlanTagging {
+			fmt.Println("  VLAN tagging: Enabled")
+		}
+
+		// Kernel link statistics
+		if nlErr == nil {
+			attrs := link.Attrs()
+			if s := attrs.Statistics; s != nil {
+				fmt.Printf("  Input rate     : %d packets, %d bytes\n",
+					s.RxPackets, s.RxBytes)
+				fmt.Printf("  Output rate    : %d packets, %d bytes\n",
+					s.TxPackets, s.TxBytes)
+				if s.RxErrors > 0 || s.TxErrors > 0 {
+					fmt.Printf("  Errors         : %d input, %d output\n",
+						s.RxErrors, s.TxErrors)
+				}
+				if s.RxDropped > 0 || s.TxDropped > 0 {
+					fmt.Printf("  Drops          : %d input, %d output\n",
+						s.RxDropped, s.TxDropped)
+				}
+			}
+		}
+
+		// BPF traffic counters (XDP/TC level)
+		if c.dp != nil && c.dp.IsLoaded() && iface != nil {
+			counters, err := c.dp.ReadInterfaceCounters(iface.Index)
+			if err == nil && (counters.RxPackets > 0 || counters.TxPackets > 0) {
+				fmt.Println("  BPF statistics:")
+				fmt.Printf("    Input:  %d packets, %d bytes\n",
+					counters.RxPackets, counters.RxBytes)
+				fmt.Printf("    Output: %d packets, %d bytes\n",
+					counters.TxPackets, counters.TxBytes)
+			}
+		}
+
+		// Show each logical unit
+		for _, li := range group {
+			lookupName := physName
+			if li.vlanID > 0 {
+				lookupName = fmt.Sprintf("%s.%d", physName, li.vlanID)
+			}
+
+			fmt.Printf("\n  Logical interface %s.%d", physName, li.unitNum)
+			if li.vlanID > 0 {
+				fmt.Printf(" VLAN-Tag [ 0x8100.%d ]", li.vlanID)
+			}
+			fmt.Println()
+
+			fmt.Printf("    Security: Zone: %s\n", li.zoneName)
+
+			// Host-inbound traffic services
+			if li.zone != nil && li.zone.HostInboundTraffic != nil {
+				hit := li.zone.HostInboundTraffic
+				if len(hit.SystemServices) > 0 {
+					fmt.Printf("    Allowed host-inbound traffic : %s\n",
+						strings.Join(hit.SystemServices, " "))
+				}
+				if len(hit.Protocols) > 0 {
+					fmt.Printf("    Allowed host-inbound protocols: %s\n",
+						strings.Join(hit.Protocols, " "))
+				}
+			}
+
+			// DHCP annotations
+			var unit *config.InterfaceUnit
+			if ifCfg, ok := cfg.Interfaces.Interfaces[physName]; ok {
+				if u, ok := ifCfg.Units[li.unitNum]; ok {
+					unit = u
+				}
+			}
+			if unit != nil {
+				if unit.DHCP {
+					fmt.Println("    DHCPv4: enabled")
+					if lease := c.dhcpLease(physName, dhcp.AFInet); lease != nil {
+						fmt.Printf("      Address: %s, Gateway: %s\n",
+							lease.Address, lease.Gateway)
+					}
+				}
+				if unit.DHCPv6 {
+					duidInfo := ""
+					if unit.DHCPv6Client != nil && unit.DHCPv6Client.DUIDType != "" {
+						duidInfo = fmt.Sprintf(" (DUID type: %s)", unit.DHCPv6Client.DUIDType)
+					}
+					fmt.Printf("    DHCPv6: enabled%s\n", duidInfo)
+					if lease := c.dhcpLease(physName, dhcp.AFInet6); lease != nil {
+						fmt.Printf("      Address: %s, Gateway: %s\n",
+							lease.Address, lease.Gateway)
+					}
+				}
+			}
+
+			// Addresses grouped by protocol
+			liface, err := net.InterfaceByName(lookupName)
+			if err != nil && iface != nil {
+				liface = iface
+			}
+			if liface != nil {
+				addrs, err := liface.Addrs()
+				if err == nil && len(addrs) > 0 {
+					var v4Addrs, v6Addrs []string
+					for _, addr := range addrs {
+						ipNet, ok := addr.(*net.IPNet)
+						if !ok {
+							continue
+						}
+						ones, _ := ipNet.Mask.Size()
+						if ipNet.IP.To4() != nil {
+							v4Addrs = append(v4Addrs, fmt.Sprintf("%s/%d", ipNet.IP, ones))
+						} else {
+							v6Addrs = append(v6Addrs, fmt.Sprintf("%s/%d", ipNet.IP, ones))
+						}
+					}
+					if len(v4Addrs) > 0 {
+						fmt.Printf("    Protocol inet, MTU: %d\n", mtu)
+						for _, a := range v4Addrs {
+							fmt.Printf("      Addresses, Flags: Is-Preferred Is-Primary\n")
+							fmt.Printf("        Local: %s\n", a)
+						}
+					}
+					if len(v6Addrs) > 0 {
+						fmt.Printf("    Protocol inet6, MTU: %d\n", mtu)
+						for _, a := range v6Addrs {
+							flags := "Is-Preferred Is-Primary"
+							if strings.HasPrefix(a, "fe80:") {
+								flags = "Is-Preferred"
+							}
+							fmt.Printf("      Addresses, Flags: %s\n", flags)
+							fmt.Printf("        Local: %s\n", a)
+						}
+					}
+				}
+			}
+		}
+
+		fmt.Println()
+	}
+
+	return nil
+}
+
+// dhcpLease returns the DHCP lease for an interface/family, or nil.
+
+func (c *CLI) showInterfacesDetail(filterName string) error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("listing interfaces: %w", err)
+	}
+
+	sort.Slice(links, func(i, j int) bool {
+		return links[i].Attrs().Name < links[j].Attrs().Name
+	})
+
+	// Build zone + description lookup from active config
+	ifZoneMap := make(map[string]string)
+	ifDescMap := make(map[string]string)
+	if activeCfg := c.store.ActiveConfig(); activeCfg != nil {
+		for _, z := range activeCfg.Security.Zones {
+			for _, ifName := range z.Interfaces {
+				ifZoneMap[ifName] = z.Name
+			}
+		}
+		for _, ifc := range activeCfg.Interfaces.Interfaces {
+			if ifc.Description != "" {
+				ifDescMap[ifc.Name] = ifc.Description
+			}
+		}
+	}
+
+	found := false
+	for _, link := range links {
+		attrs := link.Attrs()
+		if attrs.Name == "lo" {
+			continue
+		}
+		if filterName != "" && attrs.Name != filterName {
+			continue
+		}
+		found = true
+
+		adminUp := attrs.Flags&net.FlagUp != 0
+		operUp := attrs.OperState == netlink.OperUp
+		adminStr := "Disabled"
+		if adminUp {
+			adminStr = "Enabled"
+		}
+		linkStr := "Down"
+		if operUp {
+			linkStr = "Up"
+		}
+		fmt.Printf("Physical interface: %s, %s, Physical link is %s\n", attrs.Name, adminStr, linkStr)
+		if desc, ok := ifDescMap[attrs.Name]; ok {
+			fmt.Printf("  Description: %s\n", desc)
+		}
+		fmt.Printf("  Interface index: %d, SNMP ifIndex: %d\n", attrs.Index, attrs.Index)
+
+		// Link type, MTU, speed, duplex
+		linkType := "Ethernet"
+		if attrs.EncapType != "" {
+			linkType = attrs.EncapType
+		}
+		speedStr := ""
+		if speed := readLinkSpeed(attrs.Name); speed > 0 {
+			speedStr = ", Speed: " + formatSpeed(speed)
+		}
+		duplexStr := ""
+		if d := readLinkDuplex(attrs.Name); d != "" {
+			duplexStr = ", Duplex: " + formatDuplex(d)
+		}
+		fmt.Printf("  Link-level type: %s, MTU: %d%s%s\n", linkType, attrs.MTU, speedStr, duplexStr)
+
+		if len(attrs.HardwareAddr) > 0 {
+			fmt.Printf("  Current address: %s\n", attrs.HardwareAddr)
+		}
+		if zone, ok := ifZoneMap[attrs.Name]; ok {
+			fmt.Printf("  Security zone: %s\n", zone)
+		}
+
+		// Logical interface with flags and addresses
+		var flags []string
+		if adminUp {
+			flags = append(flags, "Up")
+		}
+		if attrs.RawFlags&0x2 != 0 { // IFF_BROADCAST
+			flags = append(flags, "BROADCAST")
+		}
+		if attrs.OperState == netlink.OperUp {
+			flags = append(flags, "RUNNING")
+		}
+		if attrs.RawFlags&0x1000 != 0 { // IFF_MULTICAST
+			flags = append(flags, "MULTICAST")
+		}
+		fmt.Printf("  Logical interface %s.0\n", attrs.Name)
+		if len(flags) > 0 {
+			fmt.Printf("    Flags: %s\n", strings.Join(flags, " "))
+		}
+
+		addrs, _ := netlink.AddrList(link, netlink.FAMILY_ALL)
+		if len(addrs) > 0 {
+			fmt.Println("    Addresses:")
+			for _, a := range addrs {
+				fmt.Printf("      %s\n", a.IPNet)
+			}
+		}
+
+		// Traffic statistics
+		if s := attrs.Statistics; s != nil {
+			fmt.Println("  Traffic statistics:")
+			fmt.Printf("    Input  packets:             %12d\n", s.RxPackets)
+			fmt.Printf("    Output packets:             %12d\n", s.TxPackets)
+			fmt.Printf("    Input  bytes:               %12d\n", s.RxBytes)
+			fmt.Printf("    Output bytes:               %12d\n", s.TxBytes)
+			fmt.Printf("    Input  errors:              %12d\n", s.RxErrors)
+			fmt.Printf("    Output errors:              %12d\n", s.TxErrors)
+		}
+		fmt.Println()
+	}
+	if filterName != "" && !found {
+		fmt.Printf("Interface %s not found\n", filterName)
+	}
+	return nil
+}
+
+func (c *CLI) showInterfacesTerse() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("no active configuration")
+		return nil
+	}
+
+	// Build RETH mappings
+	physToReth := make(map[string]string) // physical member → reth parent
+	rethToPhys := cfg.RethToPhysical()    // reth → physical member
+	for _, ifCfg := range cfg.Interfaces.Interfaces {
+		if ifCfg.RedundantParent != "" {
+			physToReth[ifCfg.Name] = ifCfg.RedundantParent
+		}
+	}
+
+	type ifUnit struct {
+		physName string
+		unitNum  int
+		vlanID   int
+	}
+	var units []ifUnit
+
+	for physName, ifCfg := range cfg.Interfaces.Interfaces {
+		if rethName, ok := physToReth[physName]; ok {
+			// Physical RETH member: inherit units from RETH parent
+			if rethCfg, ok := cfg.Interfaces.Interfaces[rethName]; ok {
+				for unitNum, unit := range rethCfg.Units {
+					units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
+				}
+			}
+		} else {
+			for unitNum, unit := range ifCfg.Units {
+				units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
+			}
+		}
+	}
+
+	// Add peer node interfaces (cluster mode).
+	peerIfaces := make(map[string]bool)
+	peerLinkUp := make(map[string]bool)
+	if c.cluster != nil {
+		peerNodeID := -1
+		if c.cluster.PeerAlive() {
+			peerNodeID = c.cluster.PeerNodeID()
+		} else if cfg.Chassis.Cluster != nil {
+			localID := c.cluster.NodeID()
+			for _, rg := range cfg.Chassis.Cluster.RedundancyGroups {
+				for nid := range rg.NodePriorities {
+					if nid != localID {
+						peerNodeID = nid
+						break
+					}
+				}
+				if peerNodeID >= 0 {
+					break
+				}
+			}
+		}
+		if peerNodeID >= 0 {
+			if peerMons := c.cluster.PeerMonitorStatuses(); peerMons != nil {
+				for _, pm := range peerMons {
+					peerLinkUp[pm.Interface] = pm.Up
+				}
+			}
+			tree := c.store.ActiveTree()
+			if tree != nil {
+				peerCfg, err := config.CompileConfigForNode(tree, peerNodeID)
+				if err == nil {
+					for physName, ifCfg := range peerCfg.Interfaces.Interfaces {
+						if _, isLocal := cfg.Interfaces.Interfaces[physName]; isLocal {
+							continue
+						}
+						peerIfaces[physName] = true
+						if ifCfg.RedundantParent != "" {
+							physToReth[physName] = ifCfg.RedundantParent
+							if rethCfg, ok := peerCfg.Interfaces.Interfaces[ifCfg.RedundantParent]; ok {
+								for unitNum, unit := range rethCfg.Units {
+									units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
+								}
+							}
+						} else {
+							for unitNum, unit := range ifCfg.Units {
+								units = append(units, ifUnit{physName: physName, unitNum: unitNum, vlanID: unit.VlanID})
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	sort.Slice(units, func(i, j int) bool {
+		if units[i].physName != units[j].physName {
+			return units[i].physName < units[j].physName
+		}
+		return units[i].unitNum < units[j].unitNum
+	})
+
+	fmt.Printf("%-24s%-6s%-6s%-9s%-22s\n", "Interface", "Admin", "Link", "Proto", "Local")
+
+	printedPhys := make(map[string]bool)
+
+	for _, u := range units {
+		isPeer := peerIfaces[u.physName]
+
+		if !printedPhys[u.physName] {
+			printedPhys[u.physName] = true
+			admin := "up"
+			link := "up"
+			if isPeer {
+				// Peer interface: use heartbeat monitor data.
+				if up, ok := peerLinkUp[u.physName]; ok {
+					if !up {
+						link = "down"
+					}
+				} else if c.cluster != nil && !c.cluster.PeerAlive() {
+					link = "down"
+				}
+			} else {
+				// Local interface: query kernel.
+				// Check config-level disable flag
+				if ifCfg, ok := cfg.Interfaces.Interfaces[u.physName]; ok && ifCfg.Disable {
+					admin = "down"
+				}
+				// For RETH interfaces, get status from physical member
+				statusIf := u.physName
+				if phys, ok := rethToPhys[u.physName]; ok {
+					statusIf = phys
+				}
+				kernelIf := config.LinuxIfName(statusIf)
+				iface, err := net.InterfaceByName(kernelIf)
+				if err != nil {
+					link = "down"
+				} else {
+					if iface.Flags&net.FlagUp == 0 {
+						if admin == "up" {
+							admin = "down" // kernel says down
+						}
+					}
+					data, err := os.ReadFile("/sys/class/net/" + kernelIf + "/operstate")
+					if err == nil && strings.TrimSpace(string(data)) != "up" {
+						link = "down"
+					}
+				}
+			}
+			fmt.Printf("%-24s%-6s%-6s\n", u.physName, admin, link)
+		}
+
+		logicalName := fmt.Sprintf("%s.%d", u.physName, u.unitNum)
+
+		// Physical RETH member: show aenet --> rethN.M
+		if rethName, ok := physToReth[u.physName]; ok {
+			admin := "up"
+			link := "up"
+			if isPeer {
+				if up, ok := peerLinkUp[u.physName]; ok {
+					if !up {
+						link = "down"
+					}
+				} else if c.cluster != nil && !c.cluster.PeerAlive() {
+					link = "down"
+				}
+			} else {
+				kernelIf := config.LinuxIfName(u.physName)
+				iface, err := net.InterfaceByName(kernelIf)
+				if err != nil {
+					link = "down"
+				} else {
+					if iface.Flags&net.FlagUp == 0 {
+						admin = "down"
+					}
+					data, err := os.ReadFile("/sys/class/net/" + kernelIf + "/operstate")
+					if err == nil && strings.TrimSpace(string(data)) != "up" {
+						link = "down"
+					}
+				}
+			}
+			rethLogical := fmt.Sprintf("%s.%d", rethName, u.unitNum)
+			fmt.Printf("%-24s%-6s%-6s%-9s%s\n", logicalName, admin, link, "aenet", "--> "+rethLogical)
+			continue
+		}
+
+		// RETH interface: get addresses from config, status from physical member
+		if physMember, ok := rethToPhys[u.physName]; ok {
+			var v4Addrs, v6Addrs []string
+			if ifCfg, ok := cfg.Interfaces.Interfaces[u.physName]; ok {
+				if unit, ok := ifCfg.Units[u.unitNum]; ok {
+					for _, addr := range unit.Addresses {
+						ip, _, err := net.ParseCIDR(addr)
+						if err != nil {
+							continue
+						}
+						if ip.To4() != nil {
+							v4Addrs = append(v4Addrs, addr)
+						} else {
+							v6Addrs = append(v6Addrs, addr)
+						}
+					}
+				}
+			}
+			admin := "up"
+			link := "up"
+			kernelPhys := config.LinuxIfName(physMember)
+			iface, err := net.InterfaceByName(kernelPhys)
+			if err != nil {
+				link = "down"
+			} else {
+				if iface.Flags&net.FlagUp == 0 {
+					admin = "down"
+				}
+				data, err := os.ReadFile("/sys/class/net/" + kernelPhys + "/operstate")
+				if err == nil && strings.TrimSpace(string(data)) != "up" {
+					link = "down"
+				}
+			}
+			firstProto := ""
+			firstAddr := ""
+			if len(v4Addrs) > 0 {
+				firstProto = "inet"
+				firstAddr = v4Addrs[0]
+			} else if len(v6Addrs) > 0 {
+				firstProto = "inet6"
+				firstAddr = v6Addrs[0]
+			}
+			fmt.Printf("%-24s%-6s%-6s%-9s%-22s\n", logicalName, admin, link, firstProto, firstAddr)
+			for i := 1; i < len(v4Addrs); i++ {
+				fmt.Printf("%-36s%-9s%-22s\n", "", "inet", v4Addrs[i])
+			}
+			startIdx := 0
+			if firstProto == "inet6" {
+				startIdx = 1
+			}
+			for i := startIdx; i < len(v6Addrs); i++ {
+				fmt.Printf("%-36s%-9s%-22s\n", "", "inet6", v6Addrs[i])
+			}
+			continue
+		}
+
+		// Normal interface: get addresses from kernel
+		lookupName := config.LinuxIfName(u.physName)
+		if u.vlanID > 0 {
+			lookupName = fmt.Sprintf("%s.%d", config.LinuxIfName(u.physName), u.vlanID)
+		}
+
+		var v4Addrs, v6Addrs []string
+		liface, err := net.InterfaceByName(lookupName)
+		if err != nil {
+			liface, err = net.InterfaceByName(config.LinuxIfName(u.physName))
+		}
+		if err == nil {
+			addrs, _ := liface.Addrs()
+			for _, addr := range addrs {
+				ipNet, ok := addr.(*net.IPNet)
+				if !ok {
+					continue
+				}
+				ones, _ := ipNet.Mask.Size()
+				addrStr := fmt.Sprintf("%s/%d", ipNet.IP, ones)
+				if ipNet.IP.To4() != nil {
+					v4Addrs = append(v4Addrs, addrStr)
+				} else {
+					v6Addrs = append(v6Addrs, addrStr)
+				}
+			}
+		}
+
+		admin := "up"
+		link := "up"
+		if liface == nil {
+			link = "down"
+		} else if liface.Flags&net.FlagUp == 0 {
+			admin = "down"
+		}
+
+		firstProto := ""
+		firstAddr := ""
+		if len(v4Addrs) > 0 {
+			firstProto = "inet"
+			firstAddr = v4Addrs[0]
+		} else if len(v6Addrs) > 0 {
+			firstProto = "inet6"
+			firstAddr = v6Addrs[0]
+		}
+
+		fmt.Printf("%-24s%-6s%-6s%-9s%-22s\n", logicalName, admin, link, firstProto, firstAddr)
+
+		for i := 1; i < len(v4Addrs); i++ {
+			fmt.Printf("%-36s%-9s%-22s\n", "", "inet", v4Addrs[i])
+		}
+		startIdx := 0
+		if firstProto == "inet6" {
+			startIdx = 1
+		}
+		for i := startIdx; i < len(v6Addrs); i++ {
+			fmt.Printf("%-36s%-9s%-22s\n", "", "inet6", v6Addrs[i])
+		}
+	}
+
+	return nil
+}
+
+// showInterfacesExtensive shows detailed per-interface statistics including
+// all error counters, queue depths, and ethtool-style information.
+
+func (c *CLI) showInterfacesExtensive() error {
+	return c.showInterfacesExtensiveFiltered("")
+}
+
+func (c *CLI) showInterfacesExtensiveFiltered(filterName string) error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("listing interfaces: %w", err)
+	}
+
+	sort.Slice(links, func(i, j int) bool {
+		return links[i].Attrs().Name < links[j].Attrs().Name
+	})
+
+	// Build zone lookup from active config
+	ifZoneMap := make(map[string]string)
+	ifDescMap := make(map[string]string)
+	ifCfgMap := make(map[string]*config.InterfaceConfig)
+	if activeCfg := c.store.ActiveConfig(); activeCfg != nil {
+		for _, z := range activeCfg.Security.Zones {
+			for _, ifName := range z.Interfaces {
+				ifZoneMap[ifName] = z.Name
+			}
+		}
+		for _, ifc := range activeCfg.Interfaces.Interfaces {
+			ifCfgMap[ifc.Name] = ifc
+			if ifc.Description != "" {
+				ifDescMap[ifc.Name] = ifc.Description
+			}
+		}
+	}
+
+	for _, link := range links {
+		attrs := link.Attrs()
+		if attrs.Name == "lo" {
+			continue
+		}
+		if filterName != "" && attrs.Name != filterName {
+			continue
+		}
+
+		// State
+		adminUp := attrs.Flags&net.FlagUp != 0
+		operUp := attrs.OperState == netlink.OperUp
+		adminStr := "Disabled"
+		if adminUp {
+			adminStr = "Enabled"
+		}
+		linkStr := "Down"
+		if operUp {
+			linkStr = "Up"
+		}
+		fmt.Printf("Physical interface: %s, %s, Physical link is %s\n", attrs.Name, adminStr, linkStr)
+		if desc, ok := ifDescMap[attrs.Name]; ok {
+			fmt.Printf("  Description: %s\n", desc)
+		}
+		if zone, ok := ifZoneMap[attrs.Name]; ok {
+			fmt.Printf("  Security zone: %s\n", zone)
+		}
+		if ifCfg, ok := ifCfgMap[attrs.Name]; ok {
+			if ifCfg.Speed != "" {
+				fmt.Printf("  Configured speed: %s\n", ifCfg.Speed)
+			}
+			if ifCfg.Duplex != "" {
+				fmt.Printf("  Configured duplex: %s\n", ifCfg.Duplex)
+			}
+		}
+
+		// Type + speed + MTU
+		linkType := "Ethernet"
+		if attrs.EncapType != "" {
+			linkType = attrs.EncapType
+		}
+		var linkExtras []string
+		if speed := readLinkSpeed(attrs.Name); speed > 0 {
+			linkExtras = append(linkExtras, "Speed: "+formatSpeed(speed))
+		}
+		duplexStr := "Full-duplex"
+		if duplex := readLinkDuplex(attrs.Name); duplex != "" {
+			duplexStr = formatDuplex(duplex)
+		}
+		linkExtras = append(linkExtras, "Link-mode: "+duplexStr)
+		fmt.Printf("  Link-level type: %s, MTU: %d, %s\n",
+			linkType, attrs.MTU, strings.Join(linkExtras, ", "))
+
+		// MAC
+		if len(attrs.HardwareAddr) > 0 {
+			fmt.Printf("  Current address: %s, Hardware address: %s\n",
+				attrs.HardwareAddr, attrs.HardwareAddr)
+		}
+
+		// Device flags
+		var flags []string
+		flags = append(flags, "Present")
+		if operUp {
+			flags = append(flags, "Running")
+		}
+		if !adminUp {
+			flags = append(flags, "Down")
+		}
+		fmt.Printf("  Device flags   : %s\n", strings.Join(flags, " "))
+		fmt.Printf("  Interface index: %d, SNMP ifIndex: %d\n", attrs.Index, attrs.Index)
+
+		if attrs.TxQLen > 0 {
+			fmt.Printf("  Link type      : %s, TxQueueLen: %d\n", attrs.EncapType, attrs.TxQLen)
+		}
+
+		// Detailed statistics
+		if s := attrs.Statistics; s != nil {
+			fmt.Println("  Traffic statistics:")
+			fmt.Printf("    Input:  %d bytes, %d packets\n", s.RxBytes, s.RxPackets)
+			fmt.Printf("    Output: %d bytes, %d packets\n", s.TxBytes, s.TxPackets)
+			fmt.Println("  Input errors:")
+			fmt.Printf("    Errors: %d, Drops: %d, Overruns: %d, Frame: %d\n",
+				s.RxErrors, s.RxDropped, s.RxOverErrors, s.RxFrameErrors)
+			fmt.Printf("    FIFO errors: %d, Missed: %d, Compressed: %d\n",
+				s.RxFifoErrors, s.RxMissedErrors, s.RxCompressed)
+			fmt.Println("  Output errors:")
+			fmt.Printf("    Errors: %d, Drops: %d, Carrier: %d, Collisions: %d\n",
+				s.TxErrors, s.TxDropped, s.TxCarrierErrors, s.Collisions)
+			fmt.Printf("    FIFO errors: %d, Heartbeat: %d, Compressed: %d\n",
+				s.TxFifoErrors, s.TxHeartbeatErrors, s.TxCompressed)
+			if s.Multicast > 0 {
+				fmt.Printf("    Multicast: %d\n", s.Multicast)
+			}
+		}
+
+		// BPF traffic counters (XDP/TC level)
+		if c.dp != nil && c.dp.IsLoaded() {
+			if ctrs, err := c.dp.ReadInterfaceCounters(attrs.Index); err == nil && (ctrs.RxPackets > 0 || ctrs.TxPackets > 0) {
+				fmt.Println("  BPF statistics:")
+				fmt.Printf("    Input:  %d packets, %d bytes\n", ctrs.RxPackets, ctrs.RxBytes)
+				fmt.Printf("    Output: %d packets, %d bytes\n", ctrs.TxPackets, ctrs.TxBytes)
+			}
+		}
+
+		// Addresses
+		addrs, _ := netlink.AddrList(link, netlink.FAMILY_ALL)
+		if len(addrs) > 0 {
+			var v4, v6 []string
+			for _, a := range addrs {
+				if a.IP.To4() != nil {
+					v4 = append(v4, a.IPNet.String())
+				} else {
+					v6 = append(v6, a.IPNet.String())
+				}
+			}
+			if len(v4) > 0 {
+				fmt.Printf("  Protocol inet, MTU: %d\n", attrs.MTU)
+				for _, a := range v4 {
+					fmt.Printf("    Local: %s\n", a)
+				}
+			}
+			if len(v6) > 0 {
+				fmt.Printf("  Protocol inet6, MTU: %d\n", attrs.MTU)
+				for _, a := range v6 {
+					flags := "Is-Preferred Is-Primary"
+					if strings.HasPrefix(a, "fe80:") {
+						flags = "Is-Preferred"
+					}
+					fmt.Printf("    Local: %s, Flags: %s\n", a, flags)
+				}
+			}
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func (c *CLI) showInterfacesStatistics() error {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return fmt.Errorf("listing links: %w", err)
+	}
+
+	sort.Slice(links, func(i, j int) bool {
+		return links[i].Attrs().Name < links[j].Attrs().Name
+	})
+
+	fmt.Printf("%-16s %15s %15s %15s %15s %10s %10s\n",
+		"Interface", "Input packets", "Input bytes", "Output packets", "Output bytes", "In errors", "Out errors")
+
+	for _, l := range links {
+		name := l.Attrs().Name
+		if name == "lo" || strings.HasPrefix(name, "vrf-") ||
+			strings.HasPrefix(name, "xfrm") || strings.HasPrefix(name, "gre-") {
+			continue
+		}
+		stats := l.Attrs().Statistics
+		if stats == nil {
+			continue
+		}
+		fmt.Printf("%-16s %15d %15d %15d %15d %10d %10d\n",
+			name, stats.RxPackets, stats.RxBytes, stats.TxPackets, stats.TxBytes,
+			stats.RxErrors, stats.TxErrors)
+	}
+	return nil
+}
+
+// readLinkSpeed reads the link speed in Mbps from sysfs. Returns 0 on error.
+
+func (c *CLI) showSystemBuffers() error {
+	if c.dp == nil {
+		fmt.Println("Dataplane not loaded")
+		return nil
+	}
+	stats := c.dp.GetMapStats()
+	if len(stats) == 0 {
+		fmt.Println("No BPF maps available")
+		return nil
+	}
+	fmt.Printf("%-24s %-14s %10s %10s %8s %s\n", "Map", "Type", "Max", "Used", "Usage%", "Status")
+	fmt.Println(strings.Repeat("-", 78))
+	var warnings int
+	for _, s := range stats {
+		usage := ""
+		status := ""
+		if s.MaxEntries > 0 && s.Type != "Array" && s.Type != "PerCPUArray" {
+			pct := float64(s.UsedCount) / float64(s.MaxEntries) * 100
+			usage = fmt.Sprintf("%.1f%%", pct)
+			if pct >= 90 {
+				status = "CRITICAL"
+				warnings++
+			} else if pct >= 80 {
+				status = "WARNING"
+				warnings++
+			}
+		} else {
+			usage = "-"
+		}
+		used := fmt.Sprintf("%d", s.UsedCount)
+		if s.Type == "Array" || s.Type == "PerCPUArray" {
+			used = "-"
+		}
+		fmt.Printf("%-24s %-14s %10d %10s %8s %s\n", s.Name, s.Type, s.MaxEntries, used, usage, status)
+	}
+	if warnings > 0 {
+		fmt.Printf("\n%d map(s) at high utilization — consider increasing max_entries\n", warnings)
+	}
+
+	// Session counts
+	v4, v6 := c.dp.SessionCount()
+	if v4 > 0 || v6 > 0 {
+		fmt.Printf("\nActive sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
+	}
+	return nil
+}
+
+func (c *CLI) showSystemBuffersDetail() error {
+	if c.dp == nil {
+		fmt.Println("Dataplane not loaded")
+		return nil
+	}
+	stats := c.dp.GetMapStats()
+	if len(stats) == 0 {
+		fmt.Println("No BPF maps available")
+		return nil
+	}
+
+	// Filter out Array/PerCPUArray types (always "full") and compute usage
+	type mapDetail struct {
+		name       string
+		mapType    string
+		maxEntries uint32
+		usedCount  uint32
+		keySize    uint32
+		valueSize  uint32
+		pct        float64
+	}
+	var details []mapDetail
+	for _, s := range stats {
+		if s.Type == "Array" || s.Type == "PerCPUArray" {
+			continue
+		}
+		pct := float64(0)
+		if s.MaxEntries > 0 {
+			pct = float64(s.UsedCount) / float64(s.MaxEntries) * 100
+		}
+		details = append(details, mapDetail{
+			name:       s.Name,
+			mapType:    s.Type,
+			maxEntries: s.MaxEntries,
+			usedCount:  s.UsedCount,
+			keySize:    s.KeySize,
+			valueSize:  s.ValueSize,
+			pct:        pct,
+		})
+	}
+
+	// Sort by usage percentage descending
+	sort.Slice(details, func(i, j int) bool {
+		return details[i].pct > details[j].pct
+	})
+
+	fmt.Printf("BPF Map Details (sorted by utilization):\n\n")
+	for _, d := range details {
+		status := "OK"
+		if d.pct >= 90 {
+			status = "CRITICAL"
+		} else if d.pct >= 80 {
+			status = "WARNING"
+		}
+		fmt.Printf("Map: %s\n", d.name)
+		fmt.Printf("  Type: %s, Max: %d, Used: %d, Usage: %.1f%%\n", d.mapType, d.maxEntries, d.usedCount, d.pct)
+		fmt.Printf("  Key size: %d bytes, Value size: %d bytes\n", d.keySize, d.valueSize)
+		fmt.Printf("  Status: %s\n\n", status)
+	}
+
+	// Session counts
+	v4, v6 := c.dp.SessionCount()
+	if v4 > 0 || v6 > 0 {
+		fmt.Printf("Active sessions: %d IPv4, %d IPv6, %d total\n", v4, v6, v4+v6)
+	}
+	return nil
+}
+
+func (c *CLI) showCoreDumps() error {
+	dirs := []string{"/var/crash", "/var/lib/systemd/coredump"}
+	var found bool
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			if !found {
+				fmt.Printf("%-40s %-20s %10s\n", "Name", "Date", "Size")
+				found = true
+			}
+			fmt.Printf("%-40s %-20s %10d\n", e.Name(), info.ModTime().Format("2006-01-02 15:04:05"), info.Size())
+		}
+	}
+	if !found {
+		fmt.Println("No core dumps found")
+	}
+	return nil
+}
+
+func (c *CLI) showTask() error {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	uptime := time.Since(c.startTime).Truncate(time.Second)
+	fmt.Println("Task: bpfrxd daemon")
+	fmt.Printf("  Goroutines: %d\n", runtime.NumGoroutine())
+	fmt.Printf("  Memory allocated: %.1f MB\n", float64(m.Alloc)/1024/1024)
+	fmt.Printf("  System memory: %.1f MB\n", float64(m.Sys)/1024/1024)
+	fmt.Printf("  GC cycles: %d\n", m.NumGC)
+	fmt.Printf("  Uptime: %s\n", uptime)
+	return nil
+}
+
+func (c *CLI) showBackupRouter() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+	if cfg.System.BackupRouter == "" {
+		fmt.Println("No backup router configured")
+		return nil
+	}
+	fmt.Printf("Backup router: %s\n", cfg.System.BackupRouter)
+	if cfg.System.BackupRouterDst != "" {
+		fmt.Printf("  Destination: %s\n", cfg.System.BackupRouterDst)
+	} else {
+		fmt.Println("  Destination: 0.0.0.0/0 (default)")
+	}
+	return nil
+}
+
+func (c *CLI) showSystemNTP() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	if len(cfg.System.NTPServers) == 0 {
+		fmt.Println("No NTP servers configured")
+		return nil
+	}
+
+	fmt.Println("NTP servers:")
+	for _, server := range cfg.System.NTPServers {
+		fmt.Printf("  %s\n", server)
+	}
+	if cfg.System.NTPThreshold > 0 && cfg.System.NTPThresholdAction != "" {
+		fmt.Printf("  Threshold: %d seconds (%s)\n", cfg.System.NTPThreshold, cfg.System.NTPThresholdAction)
+	}
+
+	// Try chronyc tracking for detailed sync status
+	if out, err := exec.Command("chronyc", "tracking").CombinedOutput(); err == nil {
+		fmt.Println()
+		printChronyTracking(string(out))
+		// Also show source list
+		if src, err := exec.Command("chronyc", "-n", "sources").CombinedOutput(); err == nil {
+			fmt.Printf("\nNTP sources:\n%s", string(src))
+		}
+	} else if out, err := exec.Command("ntpq", "-pn").CombinedOutput(); err == nil {
+		fmt.Printf("\nNTP peers:\n%s\n", string(out))
+	} else if out, err := exec.Command("timedatectl", "show", "--property=NTPSynchronized", "--value").CombinedOutput(); err == nil {
+		synced := strings.TrimSpace(string(out))
+		fmt.Printf("\nNTP synchronized: %s\n", synced)
+	}
+
+	return nil
+}
+
+// printChronyTracking parses chronyc tracking output and prints key fields.
+
+func (c *CLI) showSystemServices() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	fmt.Println("System services:")
+
+	// gRPC
+	fmt.Println("  gRPC:           127.0.0.1:50051 (always on)")
+	// HTTP REST
+	fmt.Println("  HTTP REST:      127.0.0.1:8080 (always on)")
+
+	// SSH
+	if cfg.System.Services != nil && cfg.System.Services.SSH != nil {
+		if cfg.System.Services.SSH.RootLogin == "allow" {
+			fmt.Println("  SSH root login: enabled")
+		}
+	}
+
+	// SNMP
+	if cfg.System.SNMP != nil {
+		fmt.Println("  SNMP:           enabled")
+		if cfg.System.SNMP.Description != "" {
+			fmt.Printf("    Description:  %s\n", cfg.System.SNMP.Description)
+		}
+		if cfg.System.SNMP.Location != "" {
+			fmt.Printf("    Location:     %s\n", cfg.System.SNMP.Location)
+		}
+		for name, comm := range cfg.System.SNMP.Communities {
+			fmt.Printf("    Community:    %s (%s)\n", name, comm.Authorization)
+		}
+	}
+
+	// Web management / API auth
+	if cfg.System.Services != nil && cfg.System.Services.WebManagement != nil {
+		wm := cfg.System.Services.WebManagement
+		if wm.APIAuth != nil && (len(wm.APIAuth.Users) > 0 || len(wm.APIAuth.APIKeys) > 0) {
+			fmt.Printf("  API auth:       %d user(s), %d API key(s)\n", len(wm.APIAuth.Users), len(wm.APIAuth.APIKeys))
+		}
+	}
+
+	// DHCP server
+	if cfg.System.DHCPServer.DHCPLocalServer != nil && len(cfg.System.DHCPServer.DHCPLocalServer.Groups) > 0 {
+		fmt.Printf("  DHCP server:    %d group(s)\n", len(cfg.System.DHCPServer.DHCPLocalServer.Groups))
+	}
+	if cfg.System.DHCPServer.DHCPv6LocalServer != nil && len(cfg.System.DHCPServer.DHCPv6LocalServer.Groups) > 0 {
+		fmt.Printf("  DHCPv6 server:  %d group(s)\n", len(cfg.System.DHCPServer.DHCPv6LocalServer.Groups))
+	}
+
+	// DNS
+	if len(cfg.System.NameServers) > 0 {
+		fmt.Printf("  DNS servers:    %s\n", strings.Join(cfg.System.NameServers, ", "))
+	}
+
+	// NTP
+	if len(cfg.System.NTPServers) > 0 {
+		fmt.Printf("  NTP servers:    %s\n", strings.Join(cfg.System.NTPServers, ", "))
+		if cfg.System.NTPThreshold > 0 && cfg.System.NTPThresholdAction != "" {
+			fmt.Printf("  NTP threshold:  %d seconds (%s)\n", cfg.System.NTPThreshold, cfg.System.NTPThresholdAction)
+		}
+	}
+
+	// Syslog
+	if len(cfg.Security.Log.Streams) > 0 {
+		fmt.Printf("  Syslog:         %d stream(s)\n", len(cfg.Security.Log.Streams))
+		for _, stream := range cfg.Security.Log.Streams {
+			sev := "all"
+			if stream.Severity != "" {
+				sev = stream.Severity + "+"
+			}
+			cat := "all"
+			if stream.Category != "" && stream.Category != "all" {
+				cat = stream.Category
+			}
+			fmt.Printf("    %-16s %s:%d (severity=%s, category=%s)\n", stream.Name, stream.Host, stream.Port, sev, cat)
+		}
+	}
+
+	// Flow monitoring / NetFlow
+	if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.Version9 != nil {
+		fmt.Printf("  NetFlow v9:     %d template(s)\n", len(cfg.Services.FlowMonitoring.Version9.Templates))
+	}
+	if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.VersionIPFIX != nil {
+		fmt.Printf("  IPFIX:          %d template(s)\n", len(cfg.Services.FlowMonitoring.VersionIPFIX.Templates))
+	}
+
+	// Application identification
+	if cfg.Services.ApplicationIdentification {
+		fmt.Println("  AppID:          enabled")
+	}
+
+	// RPM probes
+	if cfg.Services.RPM != nil && len(cfg.Services.RPM.Probes) > 0 {
+		total := 0
+		for _, probe := range cfg.Services.RPM.Probes {
+			total += len(probe.Tests)
+		}
+		fmt.Printf("  RPM probes:     %d probe(s), %d test(s)\n", len(cfg.Services.RPM.Probes), total)
+	}
+
+	return nil
+}
+
+// showSystemSyslog displays system syslog configuration.
+
+func (c *CLI) showSystemSyslog() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	if cfg.System.Syslog == nil {
+		fmt.Println("No system syslog configuration")
+		return nil
+	}
+
+	sys := cfg.System.Syslog
+
+	if len(sys.Hosts) > 0 {
+		fmt.Println("Syslog hosts:")
+		for _, h := range sys.Hosts {
+			fmt.Printf("  %-20s", h.Address)
+			if h.AllowDuplicates {
+				fmt.Print(" allow-duplicates")
+			}
+			fmt.Println()
+			for _, f := range h.Facilities {
+				fmt.Printf("    %-20s %s\n", f.Facility, f.Severity)
+			}
+		}
+	}
+
+	if len(sys.Files) > 0 {
+		fmt.Println("Syslog files:")
+		for _, f := range sys.Files {
+			fmt.Printf("  %-20s %s %s\n", f.Name, f.Facility, f.Severity)
+		}
+	}
+
+	if len(sys.Users) > 0 {
+		fmt.Println("Syslog users:")
+		for _, u := range sys.Users {
+			fmt.Printf("  %-20s %s %s\n", u.User, u.Facility, u.Severity)
+		}
+	}
+
+	return nil
+}
+
+func (c *CLI) showOperationalHelp() {
+	cmdtree.WriteHelp(os.Stdout, cmdtree.HelpCandidates(operationalTree))
+	fmt.Println()
+	fmt.Println("  <command> | match/grep <pattern>    Filter output by pattern")
+	fmt.Println("  <command> | except <pattern>        Exclude lines matching pattern")
+	fmt.Println("  <command> | find <pattern>          Show from first match to end")
+	fmt.Println("  <command> | count                   Count output lines")
+	fmt.Println("  <command> | last [N]                Show last N lines (default 10)")
+	fmt.Println("  <command> | no-more                 Disable paging")
+	fmt.Println("  Use <TAB> for command completion, ? for context help")
+}
+
+func (c *CLI) showDHCPLeases() error {
+	if c.dhcp == nil {
+		fmt.Println("No DHCP clients running")
+		return nil
+	}
+
+	leases := c.dhcp.Leases()
+	if len(leases) == 0 {
+		fmt.Println("No active DHCP leases")
+		return nil
+	}
+
+	fmt.Println("DHCP leases:")
+	for _, l := range leases {
+		family := "inet"
+		if l.Family == dhcp.AFInet6 {
+			family = "inet6"
+		}
+		elapsed := time.Since(l.Obtained).Round(time.Second)
+		remaining := l.LeaseTime - elapsed
+		if remaining < 0 {
+			remaining = 0
+		}
+		fmt.Printf("  Interface: %s, Family: %s\n", l.Interface, family)
+		fmt.Printf("    Address:   %s\n", l.Address)
+		if l.Gateway.IsValid() {
+			fmt.Printf("    Gateway:   %s\n", l.Gateway)
+		}
+		if len(l.DNS) > 0 {
+			dnsStrs := make([]string, len(l.DNS))
+			for i, d := range l.DNS {
+				dnsStrs[i] = d.String()
+			}
+			fmt.Printf("    DNS:       %s\n", strings.Join(dnsStrs, ", "))
+		}
+		fmt.Printf("    Lease:     %s (remaining: %s)\n", l.LeaseTime.Round(time.Second), remaining.Round(time.Second))
+		fmt.Printf("    Obtained:  %s\n", l.Obtained.Format("2006-01-02 15:04:05"))
+		fmt.Println()
+	}
+
+	// Show delegated prefixes
+	pds := c.dhcp.DelegatedPrefixes()
+	if len(pds) > 0 {
+		fmt.Println("Delegated prefixes (DHCPv6 PD):")
+		for _, dp := range pds {
+			elapsed := time.Since(dp.Obtained).Round(time.Second)
+			remaining := dp.ValidLifetime - elapsed
+			if remaining < 0 {
+				remaining = 0
+			}
+			fmt.Printf("  Interface: %s\n", dp.Interface)
+			fmt.Printf("    Prefix:    %s\n", dp.Prefix)
+			fmt.Printf("    Preferred: %s\n", dp.PreferredLifetime.Round(time.Second))
+			fmt.Printf("    Valid:     %s (remaining: %s)\n", dp.ValidLifetime.Round(time.Second), remaining.Round(time.Second))
+			fmt.Printf("    Obtained:  %s\n", dp.Obtained.Format("2006-01-02 15:04:05"))
+			fmt.Println()
+		}
+	}
+
+	return nil
+}
+
+func (c *CLI) showDHCPClientIdentifier() error {
+	if c.dhcp == nil {
+		fmt.Println("No DHCP clients running")
+		return nil
+	}
+
+	duids := c.dhcp.DUIDs()
+	if len(duids) == 0 {
+		fmt.Println("No DHCPv6 DUIDs configured")
+		return nil
+	}
+
+	fmt.Println("DHCPv6 client identifiers:")
+	for _, d := range duids {
+		fmt.Printf("  Interface: %s\n", d.Interface)
+		fmt.Printf("    Type:    %s\n", d.Type)
+		fmt.Printf("    DUID:    %s\n", d.Display)
+		fmt.Printf("    Hex:     %s\n", d.HexBytes)
+		fmt.Println()
+	}
+	return nil
+}
+
+func (c *CLI) showConfigHelp() {
+	cmdtree.WriteHelp(os.Stdout, cmdtree.HelpCandidates(configTopLevel))
+	fmt.Println()
+	fmt.Println("  Use <TAB> for command completion, ? for context help")
+}
+
+func (c *CLI) showFirewallFilters() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	if len(cfg.Firewall.FiltersInet) == 0 && len(cfg.Firewall.FiltersInet6) == 0 {
+		fmt.Println("No firewall filters configured")
+		return nil
+	}
+
+	// Look up filter IDs from compile result for counter display
+	var filterIDs map[string]uint32
+	if c.dp != nil && c.dp.IsLoaded() {
+		if cr := c.dp.LastCompileResult(); cr != nil {
+			filterIDs = cr.FilterIDs
+		}
+	}
+
+	showFilters := func(family string, filters map[string]*config.FirewallFilter, names []string) {
+		for _, name := range names {
+			f := filters[name]
+			fmt.Printf("Filter: %s (family %s)\n", name, family)
+
+			// Get filter config for counter lookup
+			var ruleStart uint32
+			var hasCounters bool
+			if filterIDs != nil {
+				if fid, ok := filterIDs[family+":"+name]; ok {
+					if fcfg, err := c.dp.ReadFilterConfig(fid); err == nil {
+						ruleStart = fcfg.RuleStart
+						hasCounters = true
+					}
+				}
+			}
+
+			ruleOffset := ruleStart
+			for _, term := range f.Terms {
+				fmt.Printf("  Term: %s\n", term.Name)
+				if term.DSCP != "" {
+					fmt.Printf("    from dscp %s\n", term.DSCP)
+				}
+				if term.Protocol != "" {
+					fmt.Printf("    from protocol %s\n", term.Protocol)
+				}
+				for _, addr := range term.SourceAddresses {
+					fmt.Printf("    from source-address %s\n", addr)
+				}
+				for _, addr := range term.DestAddresses {
+					fmt.Printf("    from destination-address %s\n", addr)
+				}
+				for _, port := range term.DestinationPorts {
+					fmt.Printf("    from destination-port %s\n", port)
+				}
+				for _, port := range term.SourcePorts {
+					fmt.Printf("    from source-port %s\n", port)
+				}
+				for _, ref := range term.SourcePrefixLists {
+					mod := ""
+					if ref.Except {
+						mod = " except"
+					}
+					fmt.Printf("    from source-prefix-list %s%s\n", ref.Name, mod)
+				}
+				for _, ref := range term.DestPrefixLists {
+					mod := ""
+					if ref.Except {
+						mod = " except"
+					}
+					fmt.Printf("    from destination-prefix-list %s%s\n", ref.Name, mod)
+				}
+				if term.ICMPType >= 0 {
+					fmt.Printf("    from icmp-type %d\n", term.ICMPType)
+				}
+				if term.ICMPCode >= 0 {
+					fmt.Printf("    from icmp-code %d\n", term.ICMPCode)
+				}
+				action := term.Action
+				if action == "" {
+					action = "accept"
+				}
+				if term.RoutingInstance != "" {
+					fmt.Printf("    then routing-instance %s\n", term.RoutingInstance)
+				}
+				if term.ForwardingClass != "" {
+					fmt.Printf("    then forwarding-class %s\n", term.ForwardingClass)
+				}
+				if term.LossPriority != "" {
+					fmt.Printf("    then loss-priority %s\n", term.LossPriority)
+				}
+				if term.DSCPRewrite != "" {
+					fmt.Printf("    then dscp %s\n", term.DSCPRewrite)
+				}
+				if term.Log {
+					fmt.Printf("    then log\n")
+				}
+				if term.Count != "" {
+					fmt.Printf("    then count %s\n", term.Count)
+				}
+				fmt.Printf("    then %s\n", action)
+
+				// Sum counters across all expanded BPF rules for this term.
+				// Must match the cross-product in expandFilterTerm:
+				// nSrc * nDst * nDstPorts * nSrcPorts
+				if hasCounters {
+					nSrc := len(term.SourceAddresses)
+					for _, ref := range term.SourcePrefixLists {
+						if !ref.Except {
+							if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+								nSrc += len(pl.Prefixes)
+							}
+						}
+					}
+					if nSrc == 0 {
+						nSrc = 1
+					}
+					nDst := len(term.DestAddresses)
+					for _, ref := range term.DestPrefixLists {
+						if !ref.Except {
+							if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+								nDst += len(pl.Prefixes)
+							}
+						}
+					}
+					if nDst == 0 {
+						nDst = 1
+					}
+					nDstPorts := len(term.DestinationPorts)
+					if nDstPorts == 0 {
+						nDstPorts = 1
+					}
+					nSrcPorts := len(term.SourcePorts)
+					if nSrcPorts == 0 {
+						nSrcPorts = 1
+					}
+					numRules := uint32(nSrc * nDst * nDstPorts * nSrcPorts)
+					var totalPkts, totalBytes uint64
+					for i := uint32(0); i < numRules; i++ {
+						if ctrs, err := c.dp.ReadFilterCounters(ruleOffset + i); err == nil {
+							totalPkts += ctrs.Packets
+							totalBytes += ctrs.Bytes
+						}
+					}
+					fmt.Printf("    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
+					ruleOffset += numRules
+				}
+			}
+			fmt.Println()
+		}
+	}
+
+	// Sort filter names for deterministic output (matches compiler order)
+	inetNames := make([]string, 0, len(cfg.Firewall.FiltersInet))
+	for name := range cfg.Firewall.FiltersInet {
+		inetNames = append(inetNames, name)
+	}
+	sort.Strings(inetNames)
+
+	inet6Names := make([]string, 0, len(cfg.Firewall.FiltersInet6))
+	for name := range cfg.Firewall.FiltersInet6 {
+		inet6Names = append(inet6Names, name)
+	}
+	sort.Strings(inet6Names)
+
+	showFilters("inet", cfg.Firewall.FiltersInet, inetNames)
+	showFilters("inet6", cfg.Firewall.FiltersInet6, inet6Names)
+	return nil
+}
+
+func (c *CLI) showFirewallFilter(name string) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	// Find filter by name in both families
+	var filter *config.FirewallFilter
+	var family string
+	if f, ok := cfg.Firewall.FiltersInet[name]; ok {
+		filter = f
+		family = "inet"
+	} else if f, ok := cfg.Firewall.FiltersInet6[name]; ok {
+		filter = f
+		family = "inet6"
+	}
+	if filter == nil {
+		fmt.Printf("Filter not found: %s\n", name)
+		return nil
+	}
+
+	// Resolve filter IDs for counter display
+	var ruleStart uint32
+	var hasCounters bool
+	if c.dp != nil && c.dp.IsLoaded() {
+		if cr := c.dp.LastCompileResult(); cr != nil {
+			if fid, ok := cr.FilterIDs[family+":"+name]; ok {
+				if fcfg, err := c.dp.ReadFilterConfig(fid); err == nil {
+					ruleStart = fcfg.RuleStart
+					hasCounters = true
+				}
+			}
+		}
+	}
+
+	fmt.Printf("Filter: %s (family %s)\n", name, family)
+
+	ruleOffset := ruleStart
+	for _, term := range filter.Terms {
+		fmt.Printf("\n  Term: %s\n", term.Name)
+		if term.DSCP != "" {
+			fmt.Printf("    from dscp %s\n", term.DSCP)
+		}
+		if term.Protocol != "" {
+			fmt.Printf("    from protocol %s\n", term.Protocol)
+		}
+		for _, addr := range term.SourceAddresses {
+			fmt.Printf("    from source-address %s\n", addr)
+		}
+		for _, ref := range term.SourcePrefixLists {
+			mod := ""
+			if ref.Except {
+				mod = " except"
+			}
+			fmt.Printf("    from source-prefix-list %s%s\n", ref.Name, mod)
+		}
+		for _, addr := range term.DestAddresses {
+			fmt.Printf("    from destination-address %s\n", addr)
+		}
+		for _, ref := range term.DestPrefixLists {
+			mod := ""
+			if ref.Except {
+				mod = " except"
+			}
+			fmt.Printf("    from destination-prefix-list %s%s\n", ref.Name, mod)
+		}
+		if len(term.SourcePorts) > 0 {
+			fmt.Printf("    from source-port %s\n", strings.Join(term.SourcePorts, ", "))
+		}
+		if len(term.DestinationPorts) > 0 {
+			fmt.Printf("    from destination-port %s\n", strings.Join(term.DestinationPorts, ", "))
+		}
+		if term.ICMPType >= 0 {
+			fmt.Printf("    from icmp-type %d\n", term.ICMPType)
+		}
+		if term.ICMPCode >= 0 {
+			fmt.Printf("    from icmp-code %d\n", term.ICMPCode)
+		}
+		if term.RoutingInstance != "" {
+			fmt.Printf("    then routing-instance %s\n", term.RoutingInstance)
+		}
+		if term.ForwardingClass != "" {
+			fmt.Printf("    then forwarding-class %s\n", term.ForwardingClass)
+		}
+		if term.LossPriority != "" {
+			fmt.Printf("    then loss-priority %s\n", term.LossPriority)
+		}
+		if term.DSCPRewrite != "" {
+			fmt.Printf("    then dscp %s\n", term.DSCPRewrite)
+		}
+		if term.Log {
+			fmt.Printf("    then log\n")
+		}
+		if term.Count != "" {
+			fmt.Printf("    then count %s\n", term.Count)
+		}
+		action := term.Action
+		if action == "" {
+			action = "accept"
+		}
+		fmt.Printf("    then %s\n", action)
+
+		// Sum counters across all expanded BPF rules for this term
+		if hasCounters {
+			nSrc := len(term.SourceAddresses)
+			for _, ref := range term.SourcePrefixLists {
+				if !ref.Except {
+					if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+						nSrc += len(pl.Prefixes)
+					}
+				}
+			}
+			if nSrc == 0 {
+				nSrc = 1
+			}
+			nDst := len(term.DestAddresses)
+			for _, ref := range term.DestPrefixLists {
+				if !ref.Except {
+					if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+						nDst += len(pl.Prefixes)
+					}
+				}
+			}
+			if nDst == 0 {
+				nDst = 1
+			}
+			nDstPorts := len(term.DestinationPorts)
+			if nDstPorts == 0 {
+				nDstPorts = 1
+			}
+			nSrcPorts := len(term.SourcePorts)
+			if nSrcPorts == 0 {
+				nSrcPorts = 1
+			}
+			numRules := uint32(nSrc * nDst * nDstPorts * nSrcPorts)
+			var totalPkts, totalBytes uint64
+			for i := uint32(0); i < numRules; i++ {
+				if ctrs, err := c.dp.ReadFilterCounters(ruleOffset + i); err == nil {
+					totalPkts += ctrs.Packets
+					totalBytes += ctrs.Bytes
+				}
+			}
+			fmt.Printf("    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
+			ruleOffset += numRules
+		}
+	}
+	fmt.Println()
+	return nil
+}
+
+func (c *CLI) showClassOfServiceInterface() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	// Collect interfaces with filter bindings
+	type ifBinding struct {
+		name     string
+		inputV4  string
+		outputV4 string
+		inputV6  string
+		outputV6 string
+	}
+	var bindings []ifBinding
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		for _, unit := range ifc.Units {
+			b := ifBinding{name: ifc.Name}
+			b.inputV4 = unit.FilterInputV4
+			b.outputV4 = unit.FilterOutputV4
+			b.inputV6 = unit.FilterInputV6
+			b.outputV6 = unit.FilterOutputV6
+			if b.inputV4 != "" || b.outputV4 != "" || b.inputV6 != "" || b.outputV6 != "" {
+				bindings = append(bindings, b)
+			}
+		}
+	}
+
+	if len(bindings) == 0 {
+		fmt.Println("No interfaces with class-of-service configuration")
+		return nil
+	}
+
+	sort.Slice(bindings, func(i, j int) bool { return bindings[i].name < bindings[j].name })
+
+	for _, b := range bindings {
+		fmt.Printf("Interface: %s\n", b.name)
+		printFilterBinding := func(dir, family, filterName string) {
+			filters := cfg.Firewall.FiltersInet
+			if family == "inet6" {
+				filters = cfg.Firewall.FiltersInet6
+			}
+			f, ok := filters[filterName]
+			if !ok {
+				fmt.Printf("  %s filter (%s): %s (not found)\n", dir, family, filterName)
+				return
+			}
+			fmt.Printf("  %s filter (%s): %s\n", dir, family, filterName)
+			for _, term := range f.Terms {
+				var matchParts []string
+				if term.DSCP != "" {
+					matchParts = append(matchParts, "dscp "+term.DSCP)
+				}
+				if term.Protocol != "" {
+					matchParts = append(matchParts, "protocol "+term.Protocol)
+				}
+				if len(term.DestinationPorts) > 0 {
+					matchParts = append(matchParts, "port "+strings.Join(term.DestinationPorts, ","))
+				}
+				if term.ICMPType >= 0 {
+					matchParts = append(matchParts, fmt.Sprintf("icmp-type %d", term.ICMPType))
+				}
+				if term.ICMPCode >= 0 {
+					matchParts = append(matchParts, fmt.Sprintf("icmp-code %d", term.ICMPCode))
+				}
+				matchStr := "any"
+				if len(matchParts) > 0 {
+					matchStr = strings.Join(matchParts, " ")
+				}
+				action := term.Action
+				if action == "" {
+					action = "accept"
+				}
+				extras := ""
+				if term.ForwardingClass != "" {
+					extras += " forwarding-class " + term.ForwardingClass
+				}
+				if term.DSCPRewrite != "" {
+					extras += " dscp " + term.DSCPRewrite
+				}
+				if term.Log {
+					extras += " log"
+				}
+				fmt.Printf("    Term %s: match %s -> %s%s\n", term.Name, matchStr, action, extras)
+			}
+		}
+		if b.inputV4 != "" {
+			printFilterBinding("Input", "inet", b.inputV4)
+		}
+		if b.outputV4 != "" {
+			printFilterBinding("Output", "inet", b.outputV4)
+		}
+		if b.inputV6 != "" {
+			printFilterBinding("Input", "inet6", b.inputV6)
+		}
+		if b.outputV6 != "" {
+			printFilterBinding("Output", "inet6", b.outputV6)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func (c *CLI) showFlowMonitoring() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	hasConfig := false
+
+	if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.Version9 != nil {
+		v9 := cfg.Services.FlowMonitoring.Version9
+		if len(v9.Templates) > 0 {
+			hasConfig = true
+			fmt.Println("Flow Monitoring Version 9 Templates:")
+			for name, tmpl := range v9.Templates {
+				activeTimeout := tmpl.FlowActiveTimeout
+				if activeTimeout == 0 {
+					activeTimeout = 60
+				}
+				inactiveTimeout := tmpl.FlowInactiveTimeout
+				if inactiveTimeout == 0 {
+					inactiveTimeout = 15
+				}
+				refreshRate := tmpl.TemplateRefreshRate
+				if refreshRate == 0 {
+					refreshRate = 60
+				}
+				fmt.Printf("  Template: %s\n", name)
+				fmt.Printf("    Flow active timeout:   %d seconds\n", activeTimeout)
+				fmt.Printf("    Flow inactive timeout: %d seconds\n", inactiveTimeout)
+				fmt.Printf("    Template refresh rate: %d seconds\n", refreshRate)
+				if len(tmpl.ExportExtensions) > 0 {
+					fmt.Printf("    Export extensions:     %s\n", strings.Join(tmpl.ExportExtensions, ", "))
+				}
+			}
+			fmt.Println()
+		}
+	}
+
+	if cfg.Services.FlowMonitoring != nil && cfg.Services.FlowMonitoring.VersionIPFIX != nil {
+		ipfix := cfg.Services.FlowMonitoring.VersionIPFIX
+		if len(ipfix.Templates) > 0 {
+			hasConfig = true
+			fmt.Println("Flow Monitoring IPFIX Templates:")
+			for name, tmpl := range ipfix.Templates {
+				activeTimeout := tmpl.FlowActiveTimeout
+				if activeTimeout == 0 {
+					activeTimeout = 60
+				}
+				inactiveTimeout := tmpl.FlowInactiveTimeout
+				if inactiveTimeout == 0 {
+					inactiveTimeout = 15
+				}
+				refreshRate := tmpl.TemplateRefreshRate
+				if refreshRate == 0 {
+					refreshRate = 60
+				}
+				fmt.Printf("  Template: %s\n", name)
+				fmt.Printf("    Flow active timeout:   %d seconds\n", activeTimeout)
+				fmt.Printf("    Flow inactive timeout: %d seconds\n", inactiveTimeout)
+				fmt.Printf("    Template refresh rate: %d seconds\n", refreshRate)
+				if len(tmpl.ExportExtensions) > 0 {
+					fmt.Printf("    Export extensions:     %s\n", strings.Join(tmpl.ExportExtensions, ", "))
+				}
+			}
+			fmt.Println()
+		}
+	}
+
+	if cfg.ForwardingOptions.Sampling != nil {
+		for name, inst := range cfg.ForwardingOptions.Sampling.Instances {
+			hasConfig = true
+			fmt.Printf("Sampling Instance: %s\n", name)
+			if inst.InputRate > 0 {
+				fmt.Printf("  Input rate: 1/%d\n", inst.InputRate)
+			}
+			showSamplingFamily := func(af string, fam *config.SamplingFamily) {
+				if fam == nil {
+					return
+				}
+				fmt.Printf("  Family %s:\n", af)
+				if fam.InlineJflow {
+					fmt.Printf("    Inline jflow: enabled\n")
+				}
+				if fam.SourceAddress != "" {
+					fmt.Printf("    Source address: %s\n", fam.SourceAddress)
+				}
+				for _, fs := range fam.FlowServers {
+					portStr := ""
+					if fs.Port > 0 {
+						portStr = fmt.Sprintf(":%d", fs.Port)
+					}
+					tmplStr := ""
+					if fs.Version9Template != "" {
+						tmplStr = fmt.Sprintf(" (template: %s)", fs.Version9Template)
+					}
+					fmt.Printf("    Collector: %s%s%s\n", fs.Address, portStr, tmplStr)
+				}
+			}
+			showSamplingFamily("inet", inst.FamilyInet)
+			showSamplingFamily("inet6", inst.FamilyInet6)
+			fmt.Println()
+		}
+	}
+
+	if !hasConfig {
+		fmt.Println("No flow monitoring configured")
+	}
+
+	return nil
+}
+
+// showDaemonLog displays recent daemon log entries from journald,
+// or if a filename argument is given, reads from /var/log/<filename>.
+
+func (c *CLI) showDaemonLog(args []string) error {
+	// If first arg is not a number, treat it as a syslog file name
+	if len(args) > 0 {
+		if _, err := strconv.Atoi(args[0]); err != nil {
+			// Argument is a filename like "messages"
+			filename := args[0]
+			n := 50
+			if len(args) > 1 {
+				if v, err := strconv.Atoi(args[1]); err == nil && v > 0 {
+					n = v
+				}
+			}
+			logPath := filepath.Join("/var/log", filepath.Base(filename))
+			out, err := exec.Command("tail", "-n", strconv.Itoa(n), logPath).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("read %s: %w", logPath, err)
+			}
+			fmt.Print(string(out))
+			return nil
+		}
+	}
+
+	n := 50
+	if len(args) > 0 {
+		if v, err := strconv.Atoi(args[0]); err == nil && v > 0 {
+			n = v
+		}
+	}
+
+	out, err := exec.Command("journalctl", "-u", "bpfrxd", "-n", strconv.Itoa(n), "--no-pager").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("journalctl: %w", err)
+	}
+	fmt.Print(string(out))
+	return nil
+}
+
+func (c *CLI) showDynamicAddress() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	if len(cfg.Security.DynamicAddress.FeedServers) == 0 {
+		fmt.Println("No dynamic address feeds configured")
+		return nil
+	}
+
+	// Get runtime feed status if available.
+	var runtimeFeeds map[string]feeds.FeedInfo
+	if c.feedsFn != nil {
+		runtimeFeeds = c.feedsFn()
+	}
+
+	fmt.Println("Dynamic Address Feed Servers:")
+	for name, fs := range cfg.Security.DynamicAddress.FeedServers {
+		updateInt := fs.UpdateInterval
+		if updateInt == 0 {
+			updateInt = 3600
+		}
+		holdInt := fs.HoldInterval
+		if holdInt == 0 {
+			holdInt = 7200
+		}
+		fmt.Printf("  Feed Server: %s\n", name)
+		if fs.URL != "" {
+			fmt.Printf("    URL: %s\n", fs.URL)
+		}
+		if fs.FeedName != "" {
+			fmt.Printf("    Feed name: %s\n", fs.FeedName)
+		}
+		fmt.Printf("    Update interval: %d seconds\n", updateInt)
+		fmt.Printf("    Hold interval:   %d seconds\n", holdInt)
+
+		if fi, ok := runtimeFeeds[name]; ok {
+			fmt.Printf("    Prefixes: %d\n", fi.Prefixes)
+			if !fi.LastFetch.IsZero() {
+				age := time.Since(fi.LastFetch).Truncate(time.Second)
+				fmt.Printf("    Last fetch: %s (%s ago)\n", fi.LastFetch.Format("2006-01-02 15:04:05"), age)
+			} else {
+				fmt.Printf("    Last fetch: never\n")
+			}
+		}
+	}
+
+	return nil
+}
+
+func (c *CLI) showSecurityAlarms(args []string) error {
+	detail := len(args) >= 1 && args[0] == "detail"
+
+	cfg := c.store.ActiveConfig()
+	var alarmCount int
+
+	// Config validation warnings
+	if cfg != nil {
+		warnings := config.ValidateConfig(cfg)
+		for _, w := range warnings {
+			alarmCount++
+			if detail {
+				fmt.Printf("Alarm %d:\n  Class: Configuration\n  Severity: Warning\n  Description: %s\n\n", alarmCount, w)
+			}
+		}
+	}
+
+	// Screen drop alarms — any non-zero screen counter indicates detected attacks
+	if c.dp != nil && c.dp.IsLoaded() {
+		readCtr := func(idx uint32) uint64 {
+			v, _ := c.dp.ReadGlobalCounter(idx)
+			return v
+		}
+		screenNames := []struct {
+			idx  uint32
+			name string
+		}{
+			{dataplane.GlobalCtrScreenSynFlood, "SYN flood"},
+			{dataplane.GlobalCtrScreenICMPFlood, "ICMP flood"},
+			{dataplane.GlobalCtrScreenUDPFlood, "UDP flood"},
+			{dataplane.GlobalCtrScreenLandAttack, "LAND attack"},
+			{dataplane.GlobalCtrScreenPingOfDeath, "Ping of death"},
+			{dataplane.GlobalCtrScreenTearDrop, "Tear-drop"},
+			{dataplane.GlobalCtrScreenTCPSynFin, "TCP SYN+FIN"},
+			{dataplane.GlobalCtrScreenTCPNoFlag, "TCP no-flag"},
+			{dataplane.GlobalCtrScreenTCPFinNoAck, "TCP FIN-no-ACK"},
+			{dataplane.GlobalCtrScreenWinNuke, "WinNuke"},
+			{dataplane.GlobalCtrScreenIPSrcRoute, "IP source-route"},
+			{dataplane.GlobalCtrScreenSynFrag, "SYN fragment"},
+		}
+		for _, s := range screenNames {
+			val := readCtr(s.idx)
+			if val > 0 {
+				alarmCount++
+				if detail {
+					fmt.Printf("Alarm %d:\n  Class: IDS\n  Severity: Major\n  Description: %s attack detected (%d drops)\n\n", alarmCount, s.name, val)
+				}
+			}
+		}
+	}
+
+	if alarmCount == 0 {
+		fmt.Println("No security alarms currently active")
+	} else if !detail {
+		fmt.Printf("%d security alarm(s) currently active\n", alarmCount)
+		fmt.Println("  run 'show security alarms detail' for details")
+	}
+
+	return nil
+}
+
+func (c *CLI) showALG() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	alg := &cfg.Security.ALG
+	fmt.Println("ALG Status:")
+
+	printALG := func(name string, disabled bool) {
+		status := "Enabled"
+		if disabled {
+			status = "Disabled"
+		}
+		fmt.Printf("  %-9s: %s\n", name, status)
+	}
+
+	printALG("DNS", alg.DNSDisable)
+	printALG("FTP", alg.FTPDisable)
+	printALG("H323", false)
+	printALG("MGCP", false)
+	printALG("MSRPC", false)
+	printALG("PPTP", false)
+	printALG("RSH", true)
+	printALG("RTSP", false)
+	printALG("SCCP", false)
+	printALG("SIP", alg.SIPDisable)
+	printALG("SQL", true)
+	printALG("SUNRPC", false)
+	printALG("TALK", false)
+	printALG("TFTP", alg.TFTPDisable)
+	printALG("IKE-ESP", true)
+	printALG("TWAMP", true)
+
+	return nil
+}
+
+func (c *CLI) showRPMProbeResults() error {
+	// Show live results if RPM manager is available
+	if c.rpmResultsFn != nil {
+		results := c.rpmResultsFn()
+		if len(results) == 0 {
+			fmt.Println("No RPM probes configured")
+			return nil
+		}
+		fmt.Println("RPM Probe Results:")
+		for _, r := range results {
+			fmt.Printf("  Probe: %s, Test: %s\n", r.ProbeName, r.TestName)
+			fmt.Printf("    Type: %s, Target: %s\n", r.ProbeType, r.Target)
+			fmt.Printf("    Status: %s", r.LastStatus)
+			if r.LastRTT > 0 {
+				fmt.Printf(", RTT: %s", r.LastRTT)
+			}
+			fmt.Println()
+			if r.MinRTT > 0 {
+				fmt.Printf("    RTT: min %s, max %s, avg %s, jitter %s\n",
+					r.MinRTT, r.MaxRTT, r.AvgRTT, r.Jitter)
+			}
+			fmt.Printf("    Sent: %d, Received: %d", r.TotalSent, r.TotalRecv)
+			if r.TotalSent > 0 {
+				loss := float64(r.TotalSent-r.TotalRecv) / float64(r.TotalSent) * 100
+				fmt.Printf(", Loss: %.1f%%", loss)
+			}
+			fmt.Println()
+			if !r.LastProbeAt.IsZero() {
+				fmt.Printf("    Last probe: %s\n", r.LastProbeAt.Format("2006-01-02 15:04:05"))
+			}
+		}
+		return nil
+	}
+
+	// Fallback: show config only
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.Services.RPM == nil || len(cfg.Services.RPM.Probes) == 0 {
+		fmt.Println("No RPM probes configured")
+		return nil
+	}
+
+	fmt.Println("RPM Probe Configuration:")
+	for probeName, probe := range cfg.Services.RPM.Probes {
+		for testName, test := range probe.Tests {
+			fmt.Printf("  Probe: %s, Test: %s\n", probeName, testName)
+			fmt.Printf("    Type: %s, Target: %s\n", test.ProbeType, test.Target)
+			if test.SourceAddress != "" {
+				fmt.Printf("    Source: %s\n", test.SourceAddress)
+			}
+			if test.RoutingInstance != "" {
+				fmt.Printf("    Routing instance: %s\n", test.RoutingInstance)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *CLI) showRIP() error {
+	if c.frr == nil {
+		fmt.Println("FRR manager not available")
+		return nil
+	}
+
+	routes, err := c.frr.GetRIPRoutes()
+	if err != nil {
+		return fmt.Errorf("RIP routes: %w", err)
+	}
+	if len(routes) == 0 {
+		fmt.Println("No RIP routes")
+		return nil
+	}
+	fmt.Printf("  %-20s %-18s %-8s %s\n", "Network", "Next Hop", "Metric", "Interface")
+	for _, r := range routes {
+		fmt.Printf("  %-20s %-18s %-8s %s\n", r.Network, r.NextHop, r.Metric, r.Interface)
+	}
+	return nil
+}
+
+func (c *CLI) showISIS(args []string) error {
+	if c.frr == nil {
+		fmt.Println("FRR manager not available")
+		return nil
+	}
+
+	if len(args) == 0 {
+		cmdtree.PrintTreeHelp("show protocols isis:", operationalTree, "show", "protocols", "isis")
+		return nil
+	}
+
+	switch args[0] {
+	case "adjacency":
+		if len(args) >= 2 && args[1] == "detail" {
+			output, err := c.frr.GetISISAdjacencyDetail()
+			if err != nil {
+				return fmt.Errorf("IS-IS adjacency detail: %w", err)
+			}
+			fmt.Print(output)
+			return nil
+		}
+		adjs, err := c.frr.GetISISAdjacency()
+		if err != nil {
+			return fmt.Errorf("IS-IS adjacency: %w", err)
+		}
+		if len(adjs) == 0 {
+			fmt.Println("No IS-IS adjacencies")
+			return nil
+		}
+		fmt.Printf("  %-20s %-14s %-10s %-10s %s\n",
+			"System ID", "Interface", "Level", "State", "Hold Time")
+		for _, a := range adjs {
+			fmt.Printf("  %-20s %-14s %-10s %-10s %s\n",
+				a.SystemID, a.Interface, a.Level, a.State, a.HoldTime)
+		}
+		return nil
+
+	case "database":
+		output, err := c.frr.GetISISDatabase()
+		if err != nil {
+			return fmt.Errorf("IS-IS database: %w", err)
+		}
+		fmt.Print(output)
+		return nil
+
+	case "routes":
+		output, err := c.frr.GetISISRoutes()
+		if err != nil {
+			return fmt.Errorf("IS-IS routes: %w", err)
+		}
+		fmt.Print(output)
+		return nil
+
+	default:
+		return fmt.Errorf("unknown show protocols isis target: %s", args[0])
+	}
+}
+
+func (c *CLI) showBFD(args []string) error {
+	if c.frr == nil {
+		fmt.Println("FRR manager not available")
+		return nil
+	}
+	if len(args) == 0 {
+		cmdtree.PrintTreeHelp("show protocols bfd:", operationalTree, "show", "protocols", "bfd")
+		return nil
+	}
+	if args[0] == "peers" {
+		output, err := c.frr.GetBFDPeers()
+		if err != nil {
+			return fmt.Errorf("BFD peers: %w", err)
+		}
+		if output == "" {
+			fmt.Println("No BFD peers")
+			return nil
+		}
+		fmt.Print(output)
+		return nil
+	}
+	return fmt.Errorf("unknown show protocols bfd target: %s", args[0])
+}
+
+func (c *CLI) showSchedulers() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || len(cfg.Schedulers) == 0 {
+		fmt.Println("No schedulers configured")
+		return nil
+	}
+
+	for name, sched := range cfg.Schedulers {
+		fmt.Printf("Scheduler: %s\n", name)
+		if sched.StartTime != "" {
+			fmt.Printf("  Start time: %s\n", sched.StartTime)
+		}
+		if sched.StopTime != "" {
+			fmt.Printf("  Stop time:  %s\n", sched.StopTime)
+		}
+		if sched.StartDate != "" {
+			fmt.Printf("  Start date: %s\n", sched.StartDate)
+		}
+		if sched.StopDate != "" {
+			fmt.Printf("  Stop date:  %s\n", sched.StopDate)
+		}
+		if sched.Daily {
+			fmt.Println("  Recurrence: daily")
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func (c *CLI) showDHCPRelay() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.ForwardingOptions.DHCPRelay == nil {
+		fmt.Println("No DHCP relay configured")
+		return nil
+	}
+	relay := cfg.ForwardingOptions.DHCPRelay
+
+	if len(relay.ServerGroups) > 0 {
+		fmt.Println("Server groups:")
+		for name, sg := range relay.ServerGroups {
+			fmt.Printf("  %s: %s\n", name, strings.Join(sg.Servers, ", "))
+		}
+	}
+
+	if len(relay.Groups) > 0 {
+		fmt.Println("Relay groups:")
+		for name, g := range relay.Groups {
+			fmt.Printf("  %s:\n", name)
+			fmt.Printf("    Interfaces: %s\n", strings.Join(g.Interfaces, ", "))
+			fmt.Printf("    Active server group: %s\n", g.ActiveServerGroup)
+		}
+	}
+
+	// Runtime statistics
+	if c.dhcpRelay != nil {
+		stats := c.dhcpRelay.Stats()
+		if len(stats) > 0 {
+			fmt.Println("\nRelay statistics:")
+			fmt.Printf("  %-16s %-20s %s\n", "Interface", "Requests relayed", "Replies forwarded")
+			for _, s := range stats {
+				fmt.Printf("  %-16s %-20d %d\n", s.Interface, s.RequestsRelayed, s.RepliesForwarded)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *CLI) showDHCPServer(detail bool) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || (cfg.System.DHCPServer.DHCPLocalServer == nil && cfg.System.DHCPServer.DHCPv6LocalServer == nil) {
+		fmt.Println("No DHCP server configured")
+		return nil
+	}
+
+	// In detail mode, show pool configuration first
+	if detail {
+		if srv := cfg.System.DHCPServer.DHCPLocalServer; srv != nil && len(srv.Groups) > 0 {
+			fmt.Println("DHCPv4 Server Configuration:")
+			for name, group := range srv.Groups {
+				fmt.Printf("  Group: %s\n", name)
+				if len(group.Interfaces) > 0 {
+					fmt.Printf("    Interfaces: %s\n", strings.Join(group.Interfaces, ", "))
+				}
+				for _, pool := range group.Pools {
+					fmt.Printf("    Pool: %s\n", pool.Name)
+					if pool.Subnet != "" {
+						fmt.Printf("      Subnet: %s\n", pool.Subnet)
+					}
+					if pool.RangeLow != "" {
+						fmt.Printf("      Range: %s - %s\n", pool.RangeLow, pool.RangeHigh)
+					}
+					if pool.Router != "" {
+						fmt.Printf("      Router: %s\n", pool.Router)
+					}
+					if len(pool.DNSServers) > 0 {
+						fmt.Printf("      DNS: %s\n", strings.Join(pool.DNSServers, ", "))
+					}
+					if pool.LeaseTime > 0 {
+						fmt.Printf("      Lease time: %ds\n", pool.LeaseTime)
+					}
+				}
+			}
+			fmt.Println()
+		}
+		if srv := cfg.System.DHCPServer.DHCPv6LocalServer; srv != nil && len(srv.Groups) > 0 {
+			fmt.Println("DHCPv6 Server Configuration:")
+			for name, group := range srv.Groups {
+				fmt.Printf("  Group: %s\n", name)
+				if len(group.Interfaces) > 0 {
+					fmt.Printf("    Interfaces: %s\n", strings.Join(group.Interfaces, ", "))
+				}
+				for _, pool := range group.Pools {
+					fmt.Printf("    Pool: %s\n", pool.Name)
+					if pool.Subnet != "" {
+						fmt.Printf("      Subnet: %s\n", pool.Subnet)
+					}
+					if pool.RangeLow != "" {
+						fmt.Printf("      Range: %s - %s\n", pool.RangeLow, pool.RangeHigh)
+					}
+				}
+			}
+			fmt.Println()
+		}
+	}
+
+	// Read Kea lease files directly
+	leases4, _ := dhcpserver.New().GetLeases4()
+	leases6, _ := dhcpserver.New().GetLeases6()
+
+	if len(leases4) == 0 && len(leases6) == 0 {
+		if !detail {
+			fmt.Println("No active leases")
+		} else {
+			fmt.Println("Active leases: none")
+		}
+		return nil
+	}
+
+	if len(leases4) > 0 {
+		fmt.Printf("DHCPv4 Leases (%d active):\n", len(leases4))
+		if detail {
+			fmt.Printf("  %-18s %-20s %-15s %-10s %-12s %s\n", "Address", "MAC", "Hostname", "Subnet", "Lifetime", "Expires")
+			for _, l := range leases4 {
+				fmt.Printf("  %-18s %-20s %-15s %-10s %-12s %s\n",
+					l.Address, l.HWAddress, l.Hostname, l.SubnetID, l.ValidLife, l.ExpireTime)
+			}
+		} else {
+			fmt.Printf("  %-18s %-20s %-15s %-12s %s\n", "Address", "MAC", "Hostname", "Lifetime", "Expires")
+			for _, l := range leases4 {
+				fmt.Printf("  %-18s %-20s %-15s %-12s %s\n",
+					l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+			}
+		}
+	}
+	if len(leases6) > 0 {
+		fmt.Printf("DHCPv6 Leases (%d active):\n", len(leases6))
+		if detail {
+			fmt.Printf("  %-40s %-20s %-15s %-10s %-12s %s\n", "Address", "DUID", "Hostname", "Subnet", "Lifetime", "Expires")
+			for _, l := range leases6 {
+				fmt.Printf("  %-40s %-20s %-15s %-10s %-12s %s\n",
+					l.Address, l.HWAddress, l.Hostname, l.SubnetID, l.ValidLife, l.ExpireTime)
+			}
+		} else {
+			fmt.Printf("  %-40s %-20s %-15s %-12s %s\n", "Address", "DUID", "Hostname", "Lifetime", "Expires")
+			for _, l := range leases6 {
+				fmt.Printf("  %-40s %-20s %-15s %-12s %s\n",
+					l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *CLI) showSNMP() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.System.SNMP == nil {
+		fmt.Println("No SNMP configured")
+		return nil
+	}
+	snmpCfg := cfg.System.SNMP
+
+	if snmpCfg.Location != "" {
+		fmt.Printf("Location:    %s\n", snmpCfg.Location)
+	}
+	if snmpCfg.Contact != "" {
+		fmt.Printf("Contact:     %s\n", snmpCfg.Contact)
+	}
+	if snmpCfg.Description != "" {
+		fmt.Printf("Description: %s\n", snmpCfg.Description)
+	}
+
+	if len(snmpCfg.Communities) > 0 {
+		fmt.Println("Communities:")
+		for name, comm := range snmpCfg.Communities {
+			fmt.Printf("  %s: %s\n", name, comm.Authorization)
+		}
+	}
+
+	if len(snmpCfg.TrapGroups) > 0 {
+		fmt.Println("Trap groups:")
+		for name, tg := range snmpCfg.TrapGroups {
+			fmt.Printf("  %s: %s\n", name, strings.Join(tg.Targets, ", "))
+		}
+	}
+
+	if len(snmpCfg.V3Users) > 0 {
+		fmt.Println("SNMPv3 USM users:")
+		for name, u := range snmpCfg.V3Users {
+			auth := u.AuthProtocol
+			if auth == "" {
+				auth = "none"
+			}
+			priv := u.PrivProtocol
+			if priv == "" {
+				priv = "none"
+			}
+			fmt.Printf("  %s: auth=%s priv=%s\n", name, auth, priv)
+		}
+	}
+	return nil
+}
+
+func (c *CLI) showSNMPv3() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.System.SNMP == nil || len(cfg.System.SNMP.V3Users) == 0 {
+		fmt.Println("No SNMPv3 users configured")
+		return nil
+	}
+	fmt.Println("SNMPv3 USM Users:")
+	fmt.Printf("  %-20s %-12s %-12s\n", "User", "Auth", "Privacy")
+	for _, u := range cfg.System.SNMP.V3Users {
+		auth := u.AuthProtocol
+		if auth == "" {
+			auth = "none"
+		}
+		priv := u.PrivProtocol
+		if priv == "" {
+			priv = "none"
+		}
+		fmt.Printf("  %-20s %-12s %-12s\n", u.Name, auth, priv)
+	}
+	return nil
+}
+
+func (c *CLI) showLLDP() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.Protocols.LLDP == nil {
+		fmt.Println("LLDP not configured")
+		return nil
+	}
+	lldpCfg := cfg.Protocols.LLDP
+	if lldpCfg.Disable {
+		fmt.Println("LLDP: disabled")
+		return nil
+	}
+	fmt.Println("LLDP:")
+	interval := lldpCfg.Interval
+	if interval <= 0 {
+		interval = 30
+	}
+	holdMult := lldpCfg.HoldMultiplier
+	if holdMult <= 0 {
+		holdMult = 4
+	}
+	fmt.Printf("  Transmit interval: %ds\n", interval)
+	fmt.Printf("  Hold multiplier:   %d\n", holdMult)
+	fmt.Printf("  Hold time:         %ds\n", interval*holdMult)
+	if len(lldpCfg.Interfaces) > 0 {
+		var ifNames []string
+		for _, iface := range lldpCfg.Interfaces {
+			if iface.Disable {
+				ifNames = append(ifNames, iface.Name+" (disabled)")
+			} else {
+				ifNames = append(ifNames, iface.Name)
+			}
+		}
+		fmt.Printf("  Interfaces:        %s\n", strings.Join(ifNames, ", "))
+	}
+	if c.lldpNeighborsFn != nil {
+		neighbors := c.lldpNeighborsFn()
+		fmt.Printf("  Neighbors:         %d\n", len(neighbors))
+	}
+	return nil
+}
+
+func (c *CLI) showLLDPNeighbors() error {
+	if c.lldpNeighborsFn == nil {
+		fmt.Println("LLDP not running")
+		return nil
+	}
+	neighbors := c.lldpNeighborsFn()
+	if len(neighbors) == 0 {
+		fmt.Println("No LLDP neighbors discovered")
+		return nil
+	}
+	fmt.Printf("%-12s %-20s %-16s %-20s %-6s %s\n",
+		"Interface", "Chassis ID", "Port ID", "System Name", "TTL", "Age")
+	for _, n := range neighbors {
+		age := time.Since(n.LastSeen).Truncate(time.Second)
+		fmt.Printf("%-12s %-20s %-16s %-20s %-6d %s\n",
+			n.Interface, n.ChassisID, n.PortID, n.SystemName, n.TTL, age)
+	}
+	return nil
+}
+
+func (c *CLI) showPersistentNAT() error {
+	if c.dp == nil || c.dp.GetPersistentNAT() == nil {
+		fmt.Println("Persistent NAT table not available")
+		return nil
+	}
+	bindings := c.dp.GetPersistentNAT().All()
+	if len(bindings) == 0 {
+		fmt.Println("No persistent NAT bindings")
+		return nil
+	}
+	fmt.Printf("Total persistent NAT bindings: %d\n\n", len(bindings))
+	fmt.Printf("%-20s %-8s %-20s %-8s %-15s %-10s\n",
+		"Source IP", "SrcPort", "NAT IP", "NATPort", "Pool", "Timeout")
+	for _, b := range bindings {
+		remaining := time.Until(b.LastSeen.Add(b.Timeout))
+		if remaining < 0 {
+			remaining = 0
+		}
+		fmt.Printf("%-20s %-8d %-20s %-8d %-15s %-10s\n",
+			b.SrcIP, b.SrcPort, b.NatIP, b.NatPort, b.PoolName,
+			remaining.Truncate(time.Second))
+	}
+	return nil
+}
+
+// showPersistentNATDetail displays detailed persistent NAT bindings with session counts and age.
+
+func (c *CLI) showPersistentNATDetail() error {
+	if c.dp == nil || c.dp.GetPersistentNAT() == nil {
+		fmt.Println("Persistent NAT table not available")
+		return nil
+	}
+	bindings := c.dp.GetPersistentNAT().All()
+	if len(bindings) == 0 {
+		fmt.Println("No persistent NAT bindings")
+		return nil
+	}
+
+	// Count sessions per NAT IP:port pair
+	type natKey struct {
+		ip   uint32
+		port uint16
+	}
+	sessionCounts := make(map[natKey]int)
+	if c.dp.IsLoaded() {
+		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				sessionCounts[natKey{val.NATSrcIP, val.NATSrcPort}]++
+			}
+			return true
+		})
+	}
+
+	fmt.Printf("Total persistent NAT bindings: %d\n\n", len(bindings))
+	for i, b := range bindings {
+		if i > 0 {
+			fmt.Println()
+		}
+		remaining := time.Until(b.LastSeen.Add(b.Timeout))
+		if remaining < 0 {
+			remaining = 0
+		}
+
+		// Match sessions by NAT IP — use NativeEndian for BPF uint32
+		natIP := b.NatIP.As4()
+		nk := natKey{
+			ip:   binary.NativeEndian.Uint32(natIP[:]),
+			port: b.NatPort,
+		}
+		sessions := sessionCounts[nk]
+
+		fmt.Printf("Persistent NAT binding:\n")
+		fmt.Printf("  Internal IP:        %s\n", b.SrcIP)
+		fmt.Printf("  Internal port:      %d\n", b.SrcPort)
+		fmt.Printf("  Reflexive IP:       %s\n", b.NatIP)
+		fmt.Printf("  Reflexive port:     %d\n", b.NatPort)
+		fmt.Printf("  Pool:               %s\n", b.PoolName)
+		if b.PermitAnyRemoteHost {
+			fmt.Printf("  Any remote host:    yes\n")
+		}
+		fmt.Printf("  Current sessions:   %d\n", sessions)
+		fmt.Printf("  Left time:          %s\n", remaining.Truncate(time.Second))
+		fmt.Printf("  Configured timeout: %ds\n", int(b.Timeout.Seconds()))
+	}
+	return nil
+}
+
+func (c *CLI) showVRRP() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	instances := vrrp.CollectInstances(cfg)
+	if len(instances) == 0 {
+		fmt.Println("No VRRP groups configured")
+		return nil
+	}
+
+	// Get runtime states from VRRP manager.
+	var states map[string]string
+	if c.vrrpMgr != nil {
+		states = c.vrrpMgr.States()
+		fmt.Println(c.vrrpMgr.Status())
+	}
+
+	fmt.Printf("%-14s %-6s %-8s %-10s %-16s %-8s\n",
+		"Interface", "Group", "State", "Priority", "VIP", "Preempt")
+	for _, inst := range instances {
+		key := fmt.Sprintf("VI_%s_%d", inst.Interface, inst.GroupID)
+		state := "INIT"
+		if s, ok := states[key]; ok {
+			state = s
+		}
+		preempt := "no"
+		if inst.Preempt {
+			preempt = "yes"
+		}
+		vip := strings.Join(inst.VirtualAddresses, ",")
+		fmt.Printf("%-14s %-6d %-8s %-10d %-16s %-8s\n",
+			inst.Interface, inst.GroupID, state, inst.Priority, vip, preempt)
+	}
+	return nil
+}
+
+// showMatchPolicies performs a 5-tuple policy lookup and shows matching rules.
+
+func (c *CLI) showMatchPolicies(cfg *config.Config, args []string) error {
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	// Parse arguments: from-zone <z> to-zone <z> source-ip <ip> destination-ip <ip>
+	//                   destination-port <p> protocol <proto>
+	var fromZone, toZone, srcIP, dstIP, proto string
+	var dstPort int
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "from-zone":
+			if i+1 < len(args) {
+				i++
+				fromZone = args[i]
+			}
+		case "to-zone":
+			if i+1 < len(args) {
+				i++
+				toZone = args[i]
+			}
+		case "source-ip":
+			if i+1 < len(args) {
+				i++
+				srcIP = args[i]
+			}
+		case "destination-ip":
+			if i+1 < len(args) {
+				i++
+				dstIP = args[i]
+			}
+		case "destination-port":
+			if i+1 < len(args) {
+				i++
+				dstPort, _ = strconv.Atoi(args[i])
+			}
+		case "protocol":
+			if i+1 < len(args) {
+				i++
+				proto = args[i]
+			}
+		}
+	}
+
+	if fromZone == "" || toZone == "" {
+		fmt.Println("usage: show security match-policies from-zone <zone> to-zone <zone>")
+		fmt.Println("       source-ip <ip> destination-ip <ip> destination-port <port> protocol <tcp|udp>")
+		return nil
+	}
+
+	parsedSrc := net.ParseIP(srcIP)
+	parsedDst := net.ParseIP(dstIP)
+
+	// Find the zone-pair policy
+	for _, zpp := range cfg.Security.Policies {
+		if zpp.FromZone != fromZone || zpp.ToZone != toZone {
+			continue
+		}
+
+		for _, pol := range zpp.Policies {
+			// Check source address match
+			if !matchPolicyAddr(pol.Match.SourceAddresses, parsedSrc, cfg) {
+				continue
+			}
+			// Check destination address match
+			if !matchPolicyAddr(pol.Match.DestinationAddresses, parsedDst, cfg) {
+				continue
+			}
+			// Check application match
+			if !matchPolicyApp(pol.Match.Applications, proto, dstPort, cfg) {
+				continue
+			}
+
+			// Found a match
+			action := "permit"
+			switch pol.Action {
+			case 1:
+				action = "deny"
+			case 2:
+				action = "reject"
+			}
+			fmt.Printf("Matching policy:\n")
+			fmt.Printf("  From zone: %s, To zone: %s\n", fromZone, toZone)
+			fmt.Printf("  Policy: %s\n", pol.Name)
+			if pol.Description != "" {
+				fmt.Printf("    Description: %s\n", pol.Description)
+			}
+			fmt.Printf("    Source addresses: %v\n", pol.Match.SourceAddresses)
+			fmt.Printf("    Destination addresses: %v\n", pol.Match.DestinationAddresses)
+			fmt.Printf("    Applications: %v\n", pol.Match.Applications)
+			fmt.Printf("    Action: %s\n", action)
+			return nil
+		}
+	}
+
+	fmt.Printf("No matching policy found for %s -> %s (default deny)\n", fromZone, toZone)
+	return nil
+}
+
+// matchPolicyAddr checks if an IP matches a list of address-book references.
+
+func (c *CLI) showSystemUptime() error {
+	// Read /proc/uptime
+	data, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return fmt.Errorf("reading uptime: %w", err)
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 1 {
+		return fmt.Errorf("unexpected /proc/uptime format")
+	}
+	var upSec float64
+	fmt.Sscanf(fields[0], "%f", &upSec)
+
+	days := int(upSec) / 86400
+	hours := (int(upSec) % 86400) / 3600
+	mins := (int(upSec) % 3600) / 60
+	secs := int(upSec) % 60
+
+	now := time.Now()
+	fmt.Printf("Current time: %s\n", now.Format("2006-01-02 15:04:05 MST"))
+	fmt.Printf("System booted: %s\n", now.Add(-time.Duration(upSec)*time.Second).Format("2006-01-02 15:04:05 MST"))
+	fmt.Printf("Daemon uptime: %s\n", time.Since(c.startTime).Truncate(time.Second))
+	if days > 0 {
+		fmt.Printf("System uptime: %d days, %d hours, %d minutes, %d seconds\n", days, hours, mins, secs)
+	} else {
+		fmt.Printf("System uptime: %d hours, %d minutes, %d seconds\n", hours, mins, secs)
+	}
+	return nil
+}
+
+// showSystemBootMessages shows recent boot messages via journalctl.
+
+func (c *CLI) showSystemBootMessages() error {
+	cmd := exec.Command("journalctl", "--boot", "-n", "100", "--no-pager")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// showSystemMemory shows memory usage (like Junos "show system memory").
+
+func (c *CLI) showSystemMemory() error {
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return fmt.Errorf("reading meminfo: %w", err)
+	}
+
+	info := make(map[string]uint64)
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			key := strings.TrimSuffix(parts[0], ":")
+			val, _ := strconv.ParseUint(parts[1], 10, 64)
+			info[key] = val
+		}
+	}
+
+	total := info["MemTotal"]
+	free := info["MemFree"]
+	buffers := info["Buffers"]
+	cached := info["Cached"]
+	available := info["MemAvailable"]
+	used := total - free - buffers - cached
+
+	fmt.Printf("%-20s %10s\n", "Type", "kB")
+	fmt.Printf("%-20s %10d\n", "Total memory", total)
+	fmt.Printf("%-20s %10d\n", "Used memory", used)
+	fmt.Printf("%-20s %10d\n", "Free memory", free)
+	fmt.Printf("%-20s %10d\n", "Buffers", buffers)
+	fmt.Printf("%-20s %10d\n", "Cached", cached)
+	fmt.Printf("%-20s %10d\n", "Available", available)
+	if total > 0 {
+		fmt.Printf("Utilization: %.1f%%\n", float64(used)/float64(total)*100)
+	}
+	return nil
+}
+
+// showSystemProcesses shows top resource consumers.
+// When summary=true, shows a top-like summary (Junos "show system processes summary" format).
+
+func (c *CLI) showSystemProcesses(summary bool) error {
+	if !summary {
+		cmd := exec.Command("ps", "aux", "--sort=-rss")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return cmd.Run()
+	}
+
+	// Read load average
+	loadAvg := "0.00, 0.00, 0.00"
+	if data, err := os.ReadFile("/proc/loadavg"); err == nil {
+		fields := strings.Fields(string(data))
+		if len(fields) >= 3 {
+			loadAvg = fmt.Sprintf("%s, %s, %s", fields[0], fields[1], fields[2])
+		}
+	}
+
+	// Read uptime
+	uptimeStr := ""
+	if data, err := os.ReadFile("/proc/uptime"); err == nil {
+		fields := strings.Fields(string(data))
+		if len(fields) >= 1 {
+			if secs, err := strconv.ParseFloat(fields[0], 64); err == nil {
+				days := int(secs) / 86400
+				hours := (int(secs) % 86400) / 3600
+				mins := (int(secs) % 3600) / 60
+				if days > 0 {
+					uptimeStr = fmt.Sprintf("up %d+%02d:%02d", days, hours, mins)
+				} else {
+					uptimeStr = fmt.Sprintf("up %02d:%02d", hours, mins)
+				}
+			}
+		}
+	}
+
+	// Read meminfo
+	var memTotal, memFree, memAvailable, memBuffers, memCached, swapTotal, swapFree uint64
+	if data, err := os.ReadFile("/proc/meminfo"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			val, _ := strconv.ParseUint(fields[1], 10, 64)
+			val *= 1024 // convert kB to bytes
+			switch strings.TrimSuffix(fields[0], ":") {
+			case "MemTotal":
+				memTotal = val
+			case "MemFree":
+				memFree = val
+			case "MemAvailable":
+				memAvailable = val
+			case "Buffers":
+				memBuffers = val
+			case "Cached":
+				memCached = val
+			case "SwapTotal":
+				swapTotal = val
+			case "SwapFree":
+				swapFree = val
+			}
+		}
+	}
+	memUsed := memTotal - memFree - memBuffers - memCached
+	if memTotal < memFree+memBuffers+memCached {
+		memUsed = memTotal - memAvailable
+	}
+
+	// Read CPU stats from /proc/stat
+	var userPct, sysPct, idlePct float64
+	if data, err := os.ReadFile("/proc/stat"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "cpu ") {
+				fields := strings.Fields(line)
+				if len(fields) >= 5 {
+					user, _ := strconv.ParseFloat(fields[1], 64)
+					nice, _ := strconv.ParseFloat(fields[2], 64)
+					system, _ := strconv.ParseFloat(fields[3], 64)
+					idle, _ := strconv.ParseFloat(fields[4], 64)
+					total := user + nice + system + idle
+					if len(fields) >= 8 {
+						iowait, _ := strconv.ParseFloat(fields[5], 64)
+						irq, _ := strconv.ParseFloat(fields[6], 64)
+						softirq, _ := strconv.ParseFloat(fields[7], 64)
+						total += iowait + irq + softirq
+					}
+					if total > 0 {
+						userPct = (user + nice) / total * 100
+						sysPct = system / total * 100
+						idlePct = idle / total * 100
+					}
+				}
+				break
+			}
+		}
+	}
+
+	// Count threads by state
+	var running, sleeping, stopped, zombie int
+	if entries, err := os.ReadDir("/proc"); err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			if _, err := strconv.Atoi(e.Name()); err != nil {
+				continue
+			}
+			statPath := "/proc/" + e.Name() + "/stat"
+			if data, err := os.ReadFile(statPath); err == nil {
+				// state is after the comm field (in parens)
+				line := string(data)
+				idx := strings.LastIndex(line, ") ")
+				if idx >= 0 && idx+2 < len(line) {
+					state := line[idx+2 : idx+3]
+					switch state {
+					case "R":
+						running++
+					case "S", "D", "I":
+						sleeping++
+					case "T", "t":
+						stopped++
+					case "Z":
+						zombie++
+					}
+				}
+			}
+		}
+	}
+	totalTasks := running + sleeping + stopped + zombie
+
+	now := time.Now().Format("15:04:05")
+	fmt.Printf("load averages: %s  %s    %s\n", loadAvg, uptimeStr, now)
+	fmt.Printf("%d processes: %d running, %d sleeping, %d stopped, %d zombie\n",
+		totalTasks, running, sleeping, stopped, zombie)
+	fmt.Printf("CPU: %.1f%% user, %.1f%% system, %.1f%% idle\n",
+		userPct, sysPct, idlePct)
+	fmt.Printf("Mem: %s Active, %s Buf, %s Cached, %s Free\n",
+		fmtBytes(memUsed), fmtBytes(memBuffers), fmtBytes(memCached), fmtBytes(memFree))
+	fmt.Printf("Swap: %s Total, %s Free\n",
+		fmtBytes(swapTotal), fmtBytes(swapFree))
+	fmt.Println()
+
+	// Top processes by CPU/RSS
+	cmd := exec.Command("ps", "-eo", "pid,user,pri,ni,vsz,rss,stat,time,pcpu,comm", "--sort=-pcpu")
+	out, err := cmd.Output()
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	fmt.Printf("  PID USERNAME    PRI NICE   SIZE    RES STATE   TIME    WCPU COMMAND\n")
+	limit := 20
+	if len(lines)-1 < limit {
+		limit = len(lines) - 1
+	}
+	for i := 1; i <= limit; i++ {
+		fields := strings.Fields(lines[i])
+		if len(fields) < 10 {
+			continue
+		}
+		pid := fields[0]
+		user := fields[1]
+		pri := fields[2]
+		nice := fields[3]
+		vsz, _ := strconv.ParseUint(fields[4], 10, 64)
+		rss, _ := strconv.ParseUint(fields[5], 10, 64)
+		state := fields[6]
+		timeStr := fields[7]
+		cpu := fields[8]
+		comm := fields[9]
+		fmt.Printf("%5s %-11s %4s %4s %7s %7s %-7s %8s %6s%% %s\n",
+			pid, user, pri, nice,
+			fmtBytes(vsz*1024), fmtBytes(rss*1024),
+			state, timeStr, cpu, comm)
+	}
+	return nil
+}
+
+// showSystemStorage shows filesystem usage (like Junos "show system storage").
+
+func (c *CLI) showSystemStorage() error {
+	var stat unix.Statfs_t
+	mounts := []struct {
+		path string
+		name string
+	}{
+		{"/", "Root (/)"},
+		{"/var", "/var"},
+		{"/tmp", "/tmp"},
+	}
+
+	fmt.Printf("%-20s %12s %12s %12s %6s\n", "Filesystem", "Size", "Used", "Avail", "Use%")
+	for _, m := range mounts {
+		if err := unix.Statfs(m.path, &stat); err != nil {
+			continue
+		}
+		total := stat.Blocks * uint64(stat.Bsize)
+		free := stat.Bavail * uint64(stat.Bsize)
+		used := total - (stat.Bfree * uint64(stat.Bsize))
+		pct := float64(0)
+		if total > 0 {
+			pct = float64(used) / float64(total) * 100
+		}
+		fmt.Printf("%-20s %12s %12s %12s %5.0f%%\n",
+			m.name, fmtBytes(total), fmtBytes(used), fmtBytes(free), pct)
+	}
+	return nil
+}
+
+// fmtBytes formats bytes as human-readable (K/M/G).
+
+func (c *CLI) showARP(args []string) error {
+	// Accept and validate "no-resolve" argument (Junos syntax)
+	for _, arg := range args {
+		if arg != "no-resolve" {
+			return fmt.Errorf("unknown option: %s (try: show arp no-resolve)", arg)
+		}
+	}
+
+	neighbors, err := netlink.NeighList(0, netlink.FAMILY_V4)
+	if err != nil {
+		return fmt.Errorf("listing ARP entries: %w", err)
+	}
+
+	// Junos format: MAC Address, Address, Name, Interface, Flags
+	fmt.Printf("%-18s%-16s%-25s%s\n", "MAC Address", "Address", "Interface", "Flags")
+	var total int
+	for _, n := range neighbors {
+		if n.IP == nil || n.HardwareAddr == nil {
+			continue
+		}
+		total++
+		ifName := ""
+		if link, err := netlink.LinkByIndex(n.LinkIndex); err == nil {
+			ifName = link.Attrs().Name
+		}
+		flags := "none"
+		if n.State == netlink.NUD_PERMANENT {
+			flags = "permanent"
+		}
+		fmt.Printf("%-18s%-16s%-25s%s\n",
+			n.HardwareAddr, n.IP, ifName, flags)
+	}
+	fmt.Printf("Total entries: %d\n", total)
+	return nil
+}
+
+// handleShowIPv6 dispatches show ipv6 sub-commands.
+
+func (c *CLI) showIPv6Neighbors() error {
+	neighbors, err := netlink.NeighList(0, netlink.FAMILY_V6)
+	if err != nil {
+		return fmt.Errorf("listing IPv6 neighbors: %w", err)
+	}
+
+	// Count entries by state and interface
+	var total int
+	stateCounts := make(map[string]int)
+	ifaceCounts := make(map[string]int)
+	for _, n := range neighbors {
+		if n.IP == nil || n.HardwareAddr == nil {
+			continue
+		}
+		total++
+		stateCounts[neighState(n.State)]++
+		if link, err := netlink.LinkByIndex(n.LinkIndex); err == nil {
+			ifaceCounts[link.Attrs().Name]++
+		}
+	}
+
+	// Summary
+	fmt.Printf("Total entries: %d", total)
+	if total > 0 {
+		var parts []string
+		for _, s := range []string{"reachable", "stale", "permanent", "delay", "probe", "failed", "incomplete"} {
+			if cnt := stateCounts[s]; cnt > 0 {
+				parts = append(parts, fmt.Sprintf("%s: %d", s, cnt))
+			}
+		}
+		if len(parts) > 0 {
+			fmt.Printf(" (%s)", strings.Join(parts, ", "))
+		}
+	}
+	fmt.Println()
+	if len(ifaceCounts) > 1 {
+		var ifNames []string
+		for name := range ifaceCounts {
+			ifNames = append(ifNames, name)
+		}
+		sort.Strings(ifNames)
+		for _, name := range ifNames {
+			fmt.Printf("  %-12s %d entries\n", name, ifaceCounts[name])
+		}
+	}
+	fmt.Println()
+
+	fmt.Printf("%-18s %-40s %-12s %-10s\n", "MAC Address", "IPv6 Address", "Interface", "State")
+	for _, n := range neighbors {
+		if n.IP == nil {
+			continue
+		}
+		// Skip link-local multicast and unresolved entries without MACs
+		if n.HardwareAddr == nil {
+			continue
+		}
+		ifName := ""
+		if link, err := netlink.LinkByIndex(n.LinkIndex); err == nil {
+			ifName = link.Attrs().Name
+		}
+		state := neighState(n.State)
+		fmt.Printf("%-18s %-40s %-12s %-10s\n",
+			n.HardwareAddr, n.IP, ifName, state)
+	}
+	return nil
+}
+
+// neighState converts a kernel neighbor state to a human-readable string.
+
+func (c *CLI) showIPv6RouterAdvertisement() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || len(cfg.Protocols.RouterAdvertisement) == 0 {
+		fmt.Println("Router Advertisements: not configured")
+		return nil
+	}
+
+	fmt.Printf("Router Advertisement: %d interface(s) configured\n\n", len(cfg.Protocols.RouterAdvertisement))
+
+	for _, ra := range cfg.Protocols.RouterAdvertisement {
+		fmt.Printf("Interface: %s\n", ra.Interface)
+
+		lifetime := ra.DefaultLifetime
+		if lifetime <= 0 {
+			lifetime = 1800
+		}
+		fmt.Printf("  Router lifetime:    %ds\n", lifetime)
+
+		pref := ra.Preference
+		if pref == "" {
+			pref = "medium"
+		}
+		fmt.Printf("  Preference:         %s\n", pref)
+
+		maxAdv := ra.MaxAdvInterval
+		if maxAdv <= 0 {
+			maxAdv = 600
+		}
+		minAdv := ra.MinAdvInterval
+		if minAdv <= 0 {
+			minAdv = maxAdv / 3
+		}
+		fmt.Printf("  Max RA interval:    %ds\n", maxAdv)
+		fmt.Printf("  Min RA interval:    %ds\n", minAdv)
+
+		if ra.ManagedConfig {
+			fmt.Println("  Managed flag:       on")
+		}
+		if ra.OtherStateful {
+			fmt.Println("  Other config flag:  on")
+		}
+		if ra.LinkMTU > 0 {
+			fmt.Printf("  Link MTU:           %d\n", ra.LinkMTU)
+		}
+
+		for _, pfx := range ra.Prefixes {
+			fmt.Printf("  Prefix: %s\n", pfx.Prefix)
+			fmt.Printf("    On-link:          %t\n", pfx.OnLink)
+			fmt.Printf("    Autonomous:       %t\n", pfx.Autonomous)
+			if pfx.ValidLifetime > 0 {
+				fmt.Printf("    Valid lifetime:   %ds\n", pfx.ValidLifetime)
+			}
+			if pfx.PreferredLife > 0 {
+				fmt.Printf("    Preferred life:   %ds\n", pfx.PreferredLife)
+			}
+		}
+
+		if len(ra.DNSServers) > 0 {
+			fmt.Printf("  DNS servers:        %s\n", strings.Join(ra.DNSServers, ", "))
+		}
+		if ra.NAT64Prefix != "" {
+			fmt.Printf("  PREF64:             %s\n", ra.NAT64Prefix)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+// showSystemUsers shows configured login users from the active config.
+
+func (c *CLI) showSystemUsers() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.System.Login == nil || len(cfg.System.Login.Users) == 0 {
+		fmt.Println("No login users configured")
+		return nil
+	}
+
+	fmt.Printf("%-20s %-8s %-20s %s\n", "Username", "UID", "Class", "SSH Keys")
+	for _, u := range cfg.System.Login.Users {
+		uid := "-"
+		if u.UID > 0 {
+			uid = strconv.Itoa(u.UID)
+		}
+		class := u.Class
+		if class == "" {
+			class = "-"
+		}
+		keys := strconv.Itoa(len(u.SSHKeys))
+		fmt.Printf("%-20s %-8s %-20s %s\n", u.Name, uid, class, keys)
+	}
+	return nil
+}
+
+// showSystemConnections shows active TCP connections.
+
+func (c *CLI) showSystemConnections() error {
+	cmd := exec.Command("ss", "-tnp")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// showVersion displays software version information.
+
+func (c *CLI) showVersion() error {
+	ver := c.version
+	if ver == "" {
+		ver = "dev"
+	}
+	fmt.Printf("bpfrx eBPF firewall %s\n", ver)
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err == nil {
+		sysname := strings.TrimRight(string(uts.Sysname[:]), "\x00")
+		release := strings.TrimRight(string(uts.Release[:]), "\x00")
+		machine := strings.TrimRight(string(uts.Machine[:]), "\x00")
+		nodename := strings.TrimRight(string(uts.Nodename[:]), "\x00")
+		fmt.Printf("Hostname: %s\n", nodename)
+		fmt.Printf("Kernel: %s %s (%s)\n", sysname, release, machine)
+	}
+	return nil
+}
+
+// showChassis shows hardware information (like Junos "show chassis hardware").
+
+func (c *CLI) showChassis(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "hardware":
+			return c.showChassisHardware()
+		case "cluster":
+			return c.showChassisCluster(args[1:])
+		case "environment":
+			return c.showChassisEnvironment()
+		}
+	}
+	cmdtree.PrintTreeHelp("show chassis:", operationalTree, "show", "chassis")
+	return nil
+}
+
+// showChassisCluster shows cluster/HA configuration and status.
+
+func (c *CLI) showChassisCluster(args []string) error {
+	if len(args) > 0 {
+		switch args[0] {
+		case "status":
+			return c.showChassisClusterStatus()
+		case "interfaces":
+			return c.showChassisClusterInterfaces()
+		case "information":
+			return c.showChassisClusterInformation()
+		case "statistics":
+			return c.showChassisClusterStatistics()
+		case "fabric":
+			if len(args) > 1 && args[1] == "statistics" {
+				return c.showChassisClusterFabricStatistics()
+			}
+			cmdtree.PrintTreeHelp("show chassis cluster fabric:", operationalTree, "show", "chassis", "cluster", "fabric")
+			return nil
+		case "control-plane":
+			if len(args) > 1 && args[1] == "statistics" {
+				return c.showChassisClusterControlPlaneStats()
+			}
+			cmdtree.PrintTreeHelp("show chassis cluster control-plane:", operationalTree, "show", "chassis", "cluster", "control-plane")
+			return nil
+		case "data-plane":
+			if len(args) > 1 {
+				switch args[1] {
+				case "statistics":
+					return c.showChassisClusterDataPlaneStats()
+				case "interfaces":
+					return c.showChassisClusterDataPlaneInterfaces()
+				}
+			}
+			cmdtree.PrintTreeHelp("show chassis cluster data-plane:", operationalTree, "show", "chassis", "cluster", "data-plane")
+			return nil
+		case "ip-monitoring":
+			if len(args) > 1 && args[1] == "status" {
+				return c.showChassisClusterIPMonitoringStatus()
+			}
+			cmdtree.PrintTreeHelp("show chassis cluster ip-monitoring:", operationalTree, "show", "chassis", "cluster", "ip-monitoring")
+			return nil
+		}
+	}
+	// Default: show status
+	return c.showChassisClusterStatus()
+}
+
+func (c *CLI) showChassisClusterStatus() error {
+	if c.cluster != nil {
+		fmt.Print(c.cluster.FormatStatus())
+	} else {
+		fmt.Println("Cluster not configured")
+	}
+
+	// Show VRRP status if any
+	cfg := c.store.ActiveConfig()
+	if cfg != nil && cfg.Security.Zones != nil {
+		for _, zone := range cfg.Security.Zones {
+			for _, iface := range zone.Interfaces {
+				ifCfg, ok := cfg.Interfaces.Interfaces[iface]
+				if !ok {
+					continue
+				}
+				for _, unit := range ifCfg.Units {
+					for addr, vg := range unit.VRRPGroups {
+						fmt.Printf("VRRP on %s.%d: group %d, priority %d, VIP %s, address %s\n",
+							iface, unit.Number, vg.ID, vg.Priority,
+							strings.Join(vg.VirtualAddresses, ","), addr)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (c *CLI) showChassisClusterInterfaces() error {
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	input := c.buildInterfacesInput()
+	fmt.Print(c.cluster.FormatInterfaces(input))
+	return nil
+}
+
+func (c *CLI) showChassisClusterInformation() error {
+	if c.cluster != nil {
+		fmt.Print(c.cluster.FormatInformation())
+		return nil
+	}
+	cfg := c.store.ActiveConfig()
+	if cfg == nil || cfg.Chassis.Cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	cc := cfg.Chassis.Cluster
+	hbInterval := cc.HeartbeatInterval
+	if hbInterval == 0 {
+		hbInterval = 1000
+	}
+	hbThreshold := cc.HeartbeatThreshold
+	if hbThreshold == 0 {
+		hbThreshold = 3
+	}
+	fmt.Printf("Cluster ID: %d\n", cc.ClusterID)
+	fmt.Printf("Node ID: %d\n", cc.NodeID)
+	fmt.Printf("RETH count: %d\n", cc.RethCount)
+	fmt.Printf("Heartbeat interval: %d ms\n", hbInterval)
+	fmt.Printf("Heartbeat threshold: %d\n", hbThreshold)
+	fmt.Printf("Redundancy groups: %d\n", len(cc.RedundancyGroups))
+	return nil
+}
+
+func (c *CLI) showChassisClusterStatistics() error {
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	fmt.Print(c.cluster.FormatStatistics())
+	return nil
+}
+
+func (c *CLI) showChassisClusterFabricStatistics() error {
+	if c.dp == nil || !c.dp.IsLoaded() {
+		fmt.Println("Dataplane not loaded")
+		return nil
+	}
+	total, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirect)
+	fab0, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectFab0)
+	fab1, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectFab1)
+	zone, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricRedirectZone)
+	drops, _ := c.dp.ReadGlobalCounter(dataplane.GlobalCtrFabricFwdDrop)
+
+	fmt.Println("Fabric redirect statistics:")
+	fmt.Printf("    Total redirects:          %d\n", total)
+	fmt.Printf("    fab0 redirects:           %d\n", fab0)
+	fmt.Printf("    fab1 redirects:           %d\n", fab1)
+	fmt.Printf("    Zone-encoded redirects:   %d\n", zone)
+	fmt.Printf("    Redirect drops:           %d\n", drops)
+	fmt.Println()
+	fmt.Println("Note: XDP-redirected packets bypass AF_PACKET (tcpdump).")
+	fmt.Println("Use these counters or 'monitor interface <fab>' for fabric telemetry.")
+	return nil
+}
+
+func (c *CLI) showChassisClusterControlPlaneStats() error {
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	fmt.Print(c.cluster.FormatControlPlaneStatistics())
+	return nil
+}
+
+func (c *CLI) showChassisClusterDataPlaneStats() error {
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	fmt.Print(c.cluster.FormatDataPlaneStatistics())
+	if status, err := c.userspaceDataplaneStatus(); err == nil {
+		fmt.Println()
+		fmt.Print(dpuserspace.FormatStatusSummary(status))
+	}
+	return nil
+}
+
+func (c *CLI) showChassisClusterDataPlaneInterfaces() error {
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	fmt.Print(c.cluster.FormatDataPlaneInterfaces())
+	if status, err := c.userspaceDataplaneStatus(); err == nil {
+		fmt.Println()
+		fmt.Print(dpuserspace.FormatBindings(status))
+	}
+	return nil
+}
+
+func (c *CLI) showChassisClusterIPMonitoringStatus() error {
+	if c.cluster == nil {
+		fmt.Println("Cluster not configured")
+		return nil
+	}
+	fmt.Print(c.cluster.FormatIPMonitoringStatus())
+	return nil
+}
+
+// showChassisEnvironment shows system temperature and power info.
+
+func (c *CLI) showChassisEnvironment() error {
+	// Thermal zones
+	thermalZones, _ := filepath.Glob("/sys/class/thermal/thermal_zone*/temp")
+	if len(thermalZones) > 0 {
+		fmt.Println("Temperature:")
+		for _, tz := range thermalZones {
+			data, err := os.ReadFile(tz)
+			if err != nil {
+				continue
+			}
+			millideg, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+			if err != nil {
+				continue
+			}
+			// Read type for zone name
+			typeFile := filepath.Join(filepath.Dir(tz), "type")
+			name := filepath.Base(filepath.Dir(tz))
+			if typeData, err := os.ReadFile(typeFile); err == nil {
+				name = strings.TrimSpace(string(typeData))
+			}
+			fmt.Printf("  %-30s %d.%d C\n", name, millideg/1000, (millideg%1000)/100)
+		}
+		fmt.Println()
+	}
+
+	// Power supply
+	powerFiles, _ := filepath.Glob("/sys/class/power_supply/*/status")
+	if len(powerFiles) > 0 {
+		fmt.Println("Power supplies:")
+		for _, pf := range powerFiles {
+			name := filepath.Base(filepath.Dir(pf))
+			status, err := os.ReadFile(pf)
+			if err != nil {
+				continue
+			}
+			fmt.Printf("  %-20s %s\n", name, strings.TrimSpace(string(status)))
+		}
+		fmt.Println()
+	}
+
+	// System uptime and load
+	var sysinfo unix.Sysinfo_t
+	if err := unix.Sysinfo(&sysinfo); err == nil {
+		days := sysinfo.Uptime / 86400
+		hours := (sysinfo.Uptime % 86400) / 3600
+		mins := (sysinfo.Uptime % 3600) / 60
+		fmt.Printf("System uptime: %d days, %d:%02d\n", days, hours, mins)
+		fmt.Printf("Load average: %.2f %.2f %.2f\n",
+			float64(sysinfo.Loads[0])/65536.0,
+			float64(sysinfo.Loads[1])/65536.0,
+			float64(sysinfo.Loads[2])/65536.0)
+		fmt.Printf("Total RAM: %s, Free: %s\n",
+			fmtBytes(sysinfo.Totalram), fmtBytes(sysinfo.Freeram))
+	}
+
+	return nil
+}
+
+// showChassisHardware shows CPU, memory, and NIC information.
+
+func (c *CLI) showChassisHardware() error {
+	// CPU info
+	cpuData, err := os.ReadFile("/proc/cpuinfo")
+	if err == nil {
+		cpuModel := ""
+		cpuCount := 0
+		for _, line := range strings.Split(string(cpuData), "\n") {
+			if strings.HasPrefix(line, "model name") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					cpuModel = strings.TrimSpace(parts[1])
+				}
+				cpuCount++
+			}
+		}
+		if cpuModel != "" {
+			fmt.Printf("CPU: %s (%d cores)\n", cpuModel, cpuCount)
+		}
+	}
+
+	// Memory
+	memData, err := os.ReadFile("/proc/meminfo")
+	if err == nil {
+		for _, line := range strings.Split(string(memData), "\n") {
+			if strings.HasPrefix(line, "MemTotal:") {
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					if kb, err := strconv.ParseUint(parts[1], 10, 64); err == nil {
+						fmt.Printf("Memory: %s total\n", fmtBytes(kb*1024))
+					}
+				}
+				break
+			}
+		}
+	}
+
+	// Kernel version
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err == nil {
+		release := strings.TrimRight(string(uts.Release[:]), "\x00")
+		machine := strings.TrimRight(string(uts.Machine[:]), "\x00")
+		fmt.Printf("Kernel: %s (%s)\n", release, machine)
+	}
+
+	// Network interfaces
+	fmt.Println("\nNetwork interfaces:")
+	links, err := netlink.LinkList()
+	if err == nil {
+		for _, link := range links {
+			attrs := link.Attrs()
+			if attrs.Name == "lo" {
+				continue
+			}
+			state := "down"
+			if attrs.OperState == netlink.OperUp {
+				state = "up"
+			}
+			driver := link.Type()
+			fmt.Printf("  %-16s %-8s %-10s %s\n", attrs.Name, state, driver, attrs.HardwareAddr)
+		}
+	}
+	return nil
+}
+
+// showRouteMap displays FRR route-map information via vtysh.
+
+func (c *CLI) showRouteMap() error {
+	if c.frr == nil {
+		fmt.Println("FRR manager not available")
+		return nil
+	}
+	output, err := c.frr.GetRouteMapList()
+	if err != nil {
+		return fmt.Errorf("get route-map: %w", err)
+	}
+	if output == "" {
+		fmt.Println("No route-maps configured")
+		return nil
+	}
+	fmt.Print(output)
+	return nil
+}
+
+// showPolicyOptions displays prefix-lists and policy-statements.
+
+func (c *CLI) showPolicyOptions() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+	po := &cfg.PolicyOptions
+
+	if len(po.PrefixLists) > 0 {
+		fmt.Println("Prefix lists:")
+		for name, pl := range po.PrefixLists {
+			fmt.Printf("  %-30s %d prefixes\n", name, len(pl.Prefixes))
+			for _, p := range pl.Prefixes {
+				fmt.Printf("    %s\n", p)
+			}
+		}
+	}
+
+	if len(po.PolicyStatements) > 0 {
+		if len(po.PrefixLists) > 0 {
+			fmt.Println()
+		}
+		fmt.Println("Policy statements:")
+		for name, ps := range po.PolicyStatements {
+			fmt.Printf("  %s", name)
+			if ps.DefaultAction != "" {
+				fmt.Printf(" (default: %s)", ps.DefaultAction)
+			}
+			fmt.Println()
+			for _, t := range ps.Terms {
+				fmt.Printf("    term %s:\n", t.Name)
+				if t.FromProtocol != "" {
+					fmt.Printf("      from protocol %s\n", t.FromProtocol)
+				}
+				if t.PrefixList != "" {
+					fmt.Printf("      from prefix-list %s\n", t.PrefixList)
+				}
+				for _, rf := range t.RouteFilters {
+					match := rf.MatchType
+					if rf.MatchType == "upto" && rf.UptoLen > 0 {
+						match = fmt.Sprintf("upto /%d", rf.UptoLen)
+					}
+					fmt.Printf("      from route-filter %s %s\n", rf.Prefix, match)
+				}
+				if t.Action != "" {
+					fmt.Printf("      then %s\n", t.Action)
+				}
+				if t.NextHop != "" {
+					fmt.Printf("      then next-hop %s\n", t.NextHop)
+				}
+				if t.LoadBalance != "" {
+					fmt.Printf("      then load-balance %s\n", t.LoadBalance)
+				}
+			}
+		}
+	}
+
+	if len(po.PrefixLists) == 0 && len(po.PolicyStatements) == 0 {
+		fmt.Println("No policy-options configured")
+	}
+	return nil
+}
+
+// showEventOptions displays event-driven policies.
+
+func (c *CLI) showEventOptions() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+	if len(cfg.EventOptions) == 0 {
+		fmt.Println("No event-options configured")
+		return nil
+	}
+
+	for _, ep := range cfg.EventOptions {
+		fmt.Printf("Policy: %s\n", ep.Name)
+		if len(ep.Events) > 0 {
+			fmt.Printf("  Events: %s\n", strings.Join(ep.Events, ", "))
+		}
+		for _, w := range ep.WithinClauses {
+			fmt.Printf("  Within: %d seconds", w.Seconds)
+			if w.TriggerOn > 0 {
+				fmt.Printf(", trigger on %d", w.TriggerOn)
+			}
+			if w.TriggerUntil > 0 {
+				fmt.Printf(", trigger until %d", w.TriggerUntil)
+			}
+			fmt.Println()
+		}
+		if len(ep.AttributesMatch) > 0 {
+			fmt.Println("  Attributes match:")
+			for _, am := range ep.AttributesMatch {
+				fmt.Printf("    %s\n", am)
+			}
+		}
+		if len(ep.ThenCommands) > 0 {
+			fmt.Println("  Then commands:")
+			for _, cmd := range ep.ThenCommands {
+				fmt.Printf("    %s\n", cmd)
+			}
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+// showRoutingOptions displays static routes and routing config.
+
+func (c *CLI) showRoutingOptions() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+	ro := &cfg.RoutingOptions
+	hasContent := false
+
+	if ro.AutonomousSystem > 0 {
+		fmt.Printf("Autonomous system: %d\n\n", ro.AutonomousSystem)
+		hasContent = true
+	}
+
+	if ro.ForwardingTableExport != "" {
+		fmt.Printf("Forwarding-table export: %s\n\n", ro.ForwardingTableExport)
+		hasContent = true
+	}
+
+	if len(ro.StaticRoutes) > 0 {
+		fmt.Println("Static routes (inet.0):")
+		fmt.Printf("  %-24s %-20s %-6s %s\n", "Destination", "Next-Hop", "Pref", "Flags")
+		for _, sr := range ro.StaticRoutes {
+			if sr.Discard {
+				fmt.Printf("  %-24s %-20s %-6s %s\n", sr.Destination, "discard", fmtPref(sr.Preference), "")
+				continue
+			}
+			if sr.NextTable != "" {
+				fmt.Printf("  %-24s %-20s %-6s %s\n", sr.Destination, "next-table "+sr.NextTable, fmtPref(sr.Preference), "")
+				continue
+			}
+			for i, nh := range sr.NextHops {
+				dest := sr.Destination
+				if i > 0 {
+					dest = "" // don't repeat destination for ECMP entries
+				}
+				nhStr := nh.Address
+				if nh.Interface != "" {
+					nhStr += " via " + nh.Interface
+				}
+				fmt.Printf("  %-24s %-20s %-6s %s\n", dest, nhStr, fmtPref(sr.Preference), "")
+			}
+		}
+		fmt.Println()
+		hasContent = true
+	}
+
+	if len(ro.Inet6StaticRoutes) > 0 {
+		fmt.Println("Static routes (inet6.0):")
+		fmt.Printf("  %-40s %-30s %-6s\n", "Destination", "Next-Hop", "Pref")
+		for _, sr := range ro.Inet6StaticRoutes {
+			if sr.Discard {
+				fmt.Printf("  %-40s %-30s %-6s\n", sr.Destination, "discard", fmtPref(sr.Preference))
+				continue
+			}
+			if sr.NextTable != "" {
+				fmt.Printf("  %-40s %-30s %-6s\n", sr.Destination, "next-table "+sr.NextTable, fmtPref(sr.Preference))
+				continue
+			}
+			for i, nh := range sr.NextHops {
+				dest := sr.Destination
+				if i > 0 {
+					dest = ""
+				}
+				nhStr := nh.Address
+				if nh.Interface != "" {
+					nhStr += " via " + nh.Interface
+				}
+				fmt.Printf("  %-40s %-30s %-6s\n", dest, nhStr, fmtPref(sr.Preference))
+			}
+		}
+		fmt.Println()
+		hasContent = true
+	}
+
+	if len(ro.RibGroups) > 0 {
+		fmt.Println("RIB groups:")
+		for name, rg := range ro.RibGroups {
+			fmt.Printf("  %-20s import-rib: %s\n", name, strings.Join(rg.ImportRibs, ", "))
+		}
+		fmt.Println()
+		hasContent = true
+	}
+
+	if !hasContent {
+		fmt.Println("No routing-options configured")
+	}
+	return nil
+}
+
+func (c *CLI) showRoutingInstances(detail bool) error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+	if len(cfg.RoutingInstances) == 0 {
+		fmt.Println("No routing instances configured")
+		return nil
+	}
+
+	if !detail {
+		fmt.Printf("%-20s %-16s %-6s %s\n", "Instance", "Type", "Table", "Interfaces")
+		for _, ri := range cfg.RoutingInstances {
+			tableID := "-"
+			if ri.TableID > 0 {
+				tableID = fmt.Sprintf("%d", ri.TableID)
+			}
+			ifaces := "-"
+			if len(ri.Interfaces) > 0 {
+				ifaces = strings.Join(ri.Interfaces, ", ")
+			}
+			fmt.Printf("%-20s %-16s %-6s %s\n", ri.Name, ri.InstanceType, tableID, ifaces)
+			if ri.Description != "" {
+				fmt.Printf("  Description: %s\n", ri.Description)
+			}
+		}
+		return nil
+	}
+
+	for _, ri := range cfg.RoutingInstances {
+		fmt.Printf("Instance: %s\n", ri.Name)
+		if ri.Description != "" {
+			fmt.Printf("  Description: %s\n", ri.Description)
+		}
+		fmt.Printf("  Type: %s\n", ri.InstanceType)
+		if ri.TableID > 0 {
+			fmt.Printf("  Table ID: %d\n", ri.TableID)
+		}
+		if len(ri.Interfaces) > 0 {
+			fmt.Printf("  Interfaces: %s\n", strings.Join(ri.Interfaces, ", "))
+		}
+		if ri.TableID > 0 && c.routing != nil {
+			if routes, err := c.routing.GetRoutesForTable(ri.TableID); err == nil {
+				fmt.Printf("  Route count: %d\n", len(routes))
+			}
+		}
+		var protos []string
+		if ri.OSPF != nil {
+			protos = append(protos, "OSPF")
+		}
+		if ri.BGP != nil {
+			protos = append(protos, "BGP")
+		}
+		if ri.RIP != nil {
+			protos = append(protos, "RIP")
+		}
+		if ri.ISIS != nil {
+			protos = append(protos, "IS-IS")
+		}
+		if len(protos) > 0 {
+			fmt.Printf("  Protocols: %s\n", strings.Join(protos, ", "))
+		}
+		if len(ri.StaticRoutes) > 0 {
+			fmt.Printf("  Static routes: %d\n", len(ri.StaticRoutes))
+			for _, sr := range ri.StaticRoutes {
+				if sr.Discard {
+					fmt.Printf("    %s -> discard\n", sr.Destination)
+					continue
+				}
+				for _, nh := range sr.NextHops {
+					nhStr := nh.Address
+					if nh.Interface != "" {
+						nhStr += " via " + nh.Interface
+					}
+					fmt.Printf("    %s -> %s\n", sr.Destination, nhStr)
+				}
+			}
+		}
+		if ri.InterfaceRoutesRibGroup != "" {
+			fmt.Printf("  Interface routes rib-group: %s\n", ri.InterfaceRoutesRibGroup)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func (c *CLI) showForwardingOptions() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+	fo := &cfg.ForwardingOptions
+	hasContent := false
+
+	if fo.FamilyInet6Mode != "" {
+		fmt.Printf("Family inet6 mode: %s\n", fo.FamilyInet6Mode)
+		hasContent = true
+	}
+
+	if fo.Sampling != nil && len(fo.Sampling.Instances) > 0 {
+		fmt.Println("Sampling:")
+		for name, inst := range fo.Sampling.Instances {
+			fmt.Printf("  Instance: %s\n", name)
+			if inst.InputRate > 0 {
+				fmt.Printf("    Input rate: 1/%d\n", inst.InputRate)
+			}
+			for _, fam := range []*config.SamplingFamily{inst.FamilyInet, inst.FamilyInet6} {
+				if fam == nil {
+					continue
+				}
+				for _, fs := range fam.FlowServers {
+					fmt.Printf("    Flow server: %s:%d\n", fs.Address, fs.Port)
+					if fs.Version9Template != "" {
+						fmt.Printf("      Version 9 template: %s\n", fs.Version9Template)
+					}
+				}
+				if fam.SourceAddress != "" {
+					fmt.Printf("    Source address: %s\n", fam.SourceAddress)
+				}
+				if fam.InlineJflow {
+					fmt.Printf("    Inline jflow: enabled\n")
+				}
+				if fam.InlineJflowSourceAddress != "" {
+					fmt.Printf("    Inline jflow source: %s\n", fam.InlineJflowSourceAddress)
+				}
+			}
+		}
+		hasContent = true
+	}
+
+	if fo.DHCPRelay != nil {
+		fmt.Println("DHCP relay: (see 'show dhcp-relay' for details)")
+		hasContent = true
+	}
+
+	if fo.PortMirroring != nil && len(fo.PortMirroring.Instances) > 0 {
+		fmt.Println("Port mirroring:")
+		for name, inst := range fo.PortMirroring.Instances {
+			fmt.Printf("  Instance: %s\n", name)
+			if inst.InputRate > 0 {
+				fmt.Printf("    Sampling rate: 1/%d\n", inst.InputRate)
+			}
+			if len(inst.Input) > 0 {
+				fmt.Printf("    Input interfaces:  %s\n", strings.Join(inst.Input, ", "))
+			}
+			if inst.Output != "" {
+				fmt.Printf("    Output interface:  %s\n", inst.Output)
+			}
+		}
+		hasContent = true
+	}
+
+	if !hasContent {
+		fmt.Println("No forwarding-options configured")
+	}
+	return nil
+}
+
+// showPortMirroring displays port mirroring (SPAN) configuration.
+
+func (c *CLI) showPortMirroring() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	pm := cfg.ForwardingOptions.PortMirroring
+	if pm == nil || len(pm.Instances) == 0 {
+		fmt.Println("No port-mirroring instances configured")
+		return nil
+	}
+
+	for name, inst := range pm.Instances {
+		fmt.Printf("Instance: %s\n", name)
+		if inst.InputRate > 0 {
+			fmt.Printf("  Input rate: 1/%d\n", inst.InputRate)
+		} else {
+			fmt.Printf("  Input rate: all packets\n")
+		}
+		if len(inst.Input) > 0 {
+			fmt.Printf("  Input interfaces: %s\n", strings.Join(inst.Input, ", "))
+		}
+		if inst.Output != "" {
+			fmt.Printf("  Output interface: %s\n", inst.Output)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+// showVlans displays VLAN assignments per interface (like Junos "show vlans").
+
+func (c *CLI) showVlans() error {
+	cfg := c.store.ActiveConfig()
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+
+	// Build zone lookup: interface name → zone name
+	ifZone := make(map[string]string)
+	for zoneName, zone := range cfg.Security.Zones {
+		for _, iface := range zone.Interfaces {
+			ifZone[iface] = zoneName
+		}
+	}
+
+	// Collect VLAN entries
+	type vlanEntry struct {
+		iface  string
+		unit   int
+		vlanID int
+		zone   string
+		trunk  bool
+	}
+	var entries []vlanEntry
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		for unitNum, unit := range ifc.Units {
+			if unit.VlanID > 0 || ifc.VlanTagging {
+				zone := ifZone[ifc.Name]
+				entries = append(entries, vlanEntry{
+					iface:  ifc.Name,
+					unit:   unitNum,
+					vlanID: unit.VlanID,
+					zone:   zone,
+					trunk:  ifc.VlanTagging,
+				})
+			}
+		}
+	}
+
+	if len(entries) == 0 {
+		fmt.Println("No VLANs configured")
+		return nil
+	}
+
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].iface != entries[j].iface {
+			return entries[i].iface < entries[j].iface
+		}
+		return entries[i].unit < entries[j].unit
+	})
+
+	fmt.Printf("%-16s %-6s %-8s %-12s %s\n", "Interface", "Unit", "VLAN ID", "Zone", "Mode")
+	for _, e := range entries {
+		mode := "access"
+		if e.trunk {
+			mode = "trunk"
+		}
+		vid := fmt.Sprintf("%d", e.vlanID)
+		if e.vlanID == 0 {
+			vid = "native"
+		}
+		fmt.Printf("%-16s %-6d %-8s %-12s %s\n", e.iface, e.unit, vid, e.zone, mode)
+	}
+	return nil
+}
+
+// handleRequest dispatches request sub-commands (like Junos operational mode).
