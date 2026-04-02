@@ -5633,6 +5633,8 @@ fn worker_loop(
                 &commands,
                 &mut sessions,
                 session_map_fd,
+                conntrack_v4_fd,
+                conntrack_v6_fd,
                 &forwarding,
                 ha_runtime.as_ref(),
                 &dynamic_neighbors,
