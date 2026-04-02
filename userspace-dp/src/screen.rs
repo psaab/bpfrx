@@ -130,12 +130,14 @@ impl SessionLimitTracker {
     }
 
     /// Called when a new session is created (after the check passes).
+    #[cfg_attr(not(test), allow(dead_code))]
     fn session_created(&mut self, src_ip: IpAddr, dst_ip: IpAddr) {
         *self.src_counts.entry(src_ip).or_insert(0) += 1;
         *self.dst_counts.entry(dst_ip).or_insert(0) += 1;
     }
 
     /// Called when a session expires.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn session_expired(&mut self, src_ip: IpAddr, dst_ip: IpAddr) {
         if let Some(c) = self.src_counts.get_mut(&src_ip) {
             *c = c.saturating_sub(1);
@@ -453,12 +455,14 @@ impl ScreenState {
 
     /// Notify the screen state that a new session was created. This increments
     /// per-IP session counters for session limiting.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn session_created(&mut self, src_ip: IpAddr, dst_ip: IpAddr) {
         self.session_limits.session_created(src_ip, dst_ip);
     }
 
     /// Notify the screen state that a session has expired. This decrements
     /// per-IP session counters for session limiting.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn session_expired(&mut self, src_ip: IpAddr, dst_ip: IpAddr) {
         self.session_limits.session_expired(src_ip, dst_ip);
     }

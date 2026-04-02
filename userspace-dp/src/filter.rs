@@ -108,6 +108,7 @@ impl PolicerState {
 
     /// Refill tokens based on elapsed time and try to consume `packet_bytes`.
     /// Returns true if the packet is within the rate limit (conforming).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn consume(&mut self, now_ns: u64, packet_bytes: u64) -> bool {
         if !self.initialized {
             self.initialized = true;
@@ -203,6 +204,7 @@ pub(crate) fn evaluate_filter(
 }
 
 /// Evaluate the lo0 (host-bound) filter for a given address family.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn evaluate_lo0_filter(
     state: &FilterState,
     is_v6: bool,

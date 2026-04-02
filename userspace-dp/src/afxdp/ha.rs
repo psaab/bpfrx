@@ -348,7 +348,6 @@ impl super::Coordinator {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_fixtures::*;
     use super::*;
 
     fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {

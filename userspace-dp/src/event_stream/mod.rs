@@ -28,6 +28,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// Interval between keepalive frames to prevent idle disconnect.
+#[allow(dead_code)] // reserved for event stream keepalive logic
 const KEEPALIVE_INTERVAL_NS: u64 = 10_000_000_000; // 10 seconds
 
 /// Maximum event frames buffered in the mpsc channel (shared across workers).
@@ -47,6 +48,7 @@ pub(crate) struct EventStreamStats {
     pub(crate) acked_seq: u64,
     pub(crate) sent: u64,
     pub(crate) dropped: u64,
+    #[allow(dead_code)] // stats field for future reporting
     pub(crate) replayed: u64,
 }
 

@@ -132,6 +132,7 @@ pub(crate) enum SessionOrigin {
     SyncImport,
     SharedMaterialize,
     SharedPromote,
+    #[allow(dead_code)] // enum variant for completeness
     WorkerLocalImport,
 }
 
@@ -302,6 +303,7 @@ impl SessionTable {
         expired_entries
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn expire_stale(&mut self, now_ns: u64) -> u64 {
         self.expire_stale_entries(now_ns).len() as u64
     }
@@ -382,6 +384,7 @@ impl SessionTable {
         })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn install_with_protocol(
         &mut self,
         key: SessionKey,
@@ -444,6 +447,7 @@ impl SessionTable {
         true
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn upsert_synced(
         &mut self,
         key: SessionKey,
@@ -566,6 +570,7 @@ impl SessionTable {
 
     /// Thin wrapper for local-only refresh (non-HA-activation path).
     /// Keeps the existing origin; skips peer-synced entries.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn refresh_local(
         &mut self,
         key: &SessionKey,
@@ -642,22 +647,6 @@ impl SessionTable {
         )
     }
 
-    pub fn emit_open_delta(
-        &mut self,
-        key: SessionKey,
-        decision: SessionDecision,
-        metadata: SessionMetadata,
-        fabric_redirect_sync: bool,
-    ) {
-        self.emit_open_delta_with_origin(
-            key,
-            decision,
-            metadata,
-            SessionOrigin::ForwardFlow,
-            fabric_redirect_sync,
-        );
-    }
-
     pub fn emit_open_delta_with_origin(
         &mut self,
         key: SessionKey,
@@ -714,20 +703,6 @@ impl SessionTable {
         demoted_keys
     }
 
-    pub fn session_keys_for_owner_rgs(&self, owner_rgs: &[i32]) -> Vec<crate::session::SessionKey> {
-        if owner_rgs.is_empty() {
-            return Vec::new();
-        }
-        let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
-        let mut keys = Vec::new();
-        for (key, entry) in &self.sessions {
-            if owner_rg_set.contains(&entry.metadata.owner_rg_id) {
-                keys.push(key.clone());
-            }
-        }
-        keys
-    }
-
     pub fn drain_deltas(&mut self, max: usize) -> Vec<SessionDelta> {
         let drain = max.max(1).min(self.deltas.len());
         let mut out = Vec::with_capacity(drain);
@@ -742,11 +717,6 @@ impl SessionTable {
 
     pub fn has_pending_deltas(&self) -> bool {
         !self.deltas.is_empty()
-    }
-
-    /// Iterate over all session entries for diagnostic purposes.
-    pub fn iter(&self, mut f: impl FnMut(&SessionKey, SessionDecision, &SessionMetadata)) {
-        self.iter_with_origin(|key, decision, metadata, _origin| f(key, decision, metadata));
     }
 
     pub fn iter_with_origin(

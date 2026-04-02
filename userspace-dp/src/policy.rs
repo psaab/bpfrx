@@ -413,26 +413,6 @@ fn parse_port_spec(spec: &str) -> Option<Vec<PortRange>> {
     }])
 }
 
-fn applications_match(
-    applications: &[ApplicationMatch],
-    protocol: u8,
-    src_port: u16,
-    dst_port: u16,
-) -> bool {
-    applications.is_empty()
-        || applications
-            .iter()
-            .any(|app| application_match(app, protocol, src_port, dst_port))
-}
-
-fn application_match(app: &ApplicationMatch, protocol: u8, src_port: u16, dst_port: u16) -> bool {
-    if app.protocol != protocol {
-        return false;
-    }
-    port_ranges_match(&app.source_ports, src_port)
-        && port_ranges_match(&app.destination_ports, dst_port)
-}
-
 fn port_ranges_match(ranges: &[PortRange], port: u16) -> bool {
     ranges.is_empty()
         || ranges

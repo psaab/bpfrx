@@ -274,13 +274,10 @@ pub(super) fn apply_worker_commands(
                         affected_owner_rgs.push(*rg_id);
                     }
                 }
-                if !affected_owner_rgs.is_empty() {
-                    // Flow cache invalidation is handled by epoch-based check
-                    // in FlowCache::lookup() — no per-entry scan needed here.
-                    cancelled_keys.extend(sessions.session_keys_for_owner_rgs(&affected_owner_rgs));
-                }
+                // Flow cache invalidation is handled by epoch-based check
+                // in FlowCache::lookup() — no per-entry scan needed here.
                 if !republish_owner_rgs.is_empty() || !demote_owner_rgs.is_empty() {
-                    refresh_live_reverse_sessions_for_owner_rgs(
+                    let refreshed = refresh_live_reverse_sessions_for_owner_rgs(
                         sessions,
                         session_map_fd,
                         forwarding,
@@ -291,6 +288,11 @@ pub(super) fn apply_worker_commands(
                         now_secs,
                         true,
                     );
+                    // Collect refreshed keys as cancelled so queued TX
+                    // packets with stale resolution get dropped. Keys from
+                    // demoted RGs are added by the demote loop below, so
+                    // deduplicate to avoid double-cancel.
+                    cancelled_keys.extend(refreshed);
                 }
                 for owner_rg_id in demote_owner_rgs {
                     eprintln!(
@@ -414,6 +416,11 @@ pub(super) fn apply_worker_commands(
             }
         }
     }
+    // Deduplicate: refresh and demote paths may both collect the same key.
+    {
+        let mut seen = super::FastSet::with_capacity_and_hasher(cancelled_keys.len(), Default::default());
+        cancelled_keys.retain(|k| seen.insert(k.clone()));
+    }
     WorkerCommandResults {
         cancelled_keys,
         applied_sequences,
@@ -454,11 +461,12 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
     now_ns: u64,
     now_secs: u64,
     emit_forward_deltas: bool,
-) {
+) -> Vec<SessionKey> {
     if owner_rgs.is_empty() {
-        return;
+        return Vec::new();
     }
     let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
+    let mut refreshed_keys = Vec::new();
     let candidates = {
         let mut out = Vec::new();
         sessions.iter_with_origin(|key, decision, metadata, origin| {
@@ -521,6 +529,7 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
             now_ns,
             0,
         ) {
+            refreshed_keys.push(key.clone());
             if emit_forward_deltas
                 && owner_rg_set.contains(&metadata.owner_rg_id)
                 && !metadata.is_reverse
@@ -541,6 +550,7 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
             );
         }
     }
+    refreshed_keys
 }
 
 pub(super) fn should_teardown_tcp_rst(_meta: UserspaceDpMeta, _flow: Option<&SessionFlow>) -> bool {
@@ -1952,7 +1962,7 @@ mod tests {
             dst_ip: translated_key.dst_ip,
             forward_key: translated_key.clone(),
         };
-        let resolved = resolve_flow_session_decision(
+        let _resolved = resolve_flow_session_decision(
             &mut sessions,
             -1,
             &shared_sessions,

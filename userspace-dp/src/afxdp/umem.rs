@@ -57,6 +57,7 @@ impl WorkerUmem {
         self.inner.total_frames
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn shares_allocation_with(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.inner, &other.inner)
     }
@@ -121,6 +122,7 @@ impl MmapArea {
         Some(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) })
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn slice_mut(&mut self, offset: usize, len: usize) -> Option<&mut [u8]> {
         unsafe { self.slice_mut_unchecked(offset, len) }
     }

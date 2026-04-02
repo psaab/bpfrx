@@ -27,10 +27,10 @@ impl AfXdpBindStrategy {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AfXdpBinder {
     Umem,
-    #[allow(dead_code)]
     DeviceQueue,
 }
 
@@ -233,6 +233,7 @@ pub(super) fn bind_strategy_for_driver(driver: Option<&str>) -> AfXdpBindStrateg
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn binder_for_strategy(strategy: AfXdpBindStrategy) -> AfXdpBinder {
     if strategy.uses_umem_owner_socket() {
         AfXdpBinder::Umem

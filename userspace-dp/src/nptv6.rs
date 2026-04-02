@@ -197,6 +197,7 @@ impl Nptv6State {
     }
 
     /// Returns true if there are any NPTv6 rules configured.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn is_empty(&self) -> bool {
         self.inbound.is_empty()
     }
