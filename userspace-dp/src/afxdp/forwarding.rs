@@ -1068,26 +1068,13 @@ pub(super) fn enforce_ha_resolution_snapshot(
             ..resolution
         };
     };
-    if !group.active || ha_group_is_demoting(group, now_secs) {
-        return ForwardingResolution {
-            disposition: ForwardingDisposition::HAInactive,
-            ..resolution
-        };
-    }
-    if group.watchdog_timestamp == 0
-        || now_secs < group.watchdog_timestamp
-        || now_secs.saturating_sub(group.watchdog_timestamp) > HA_WATCHDOG_STALE_AFTER_SECS
-    {
+    if !group.is_forwarding_active(now_secs) {
         return ForwardingResolution {
             disposition: ForwardingDisposition::HAInactive,
             ..resolution
         };
     }
     resolution
-}
-
-pub(super) fn ha_group_is_demoting(group: &HAGroupRuntime, now_secs: u64) -> bool {
-    group.demoting && group.demoting_until_secs != 0 && now_secs <= group.demoting_until_secs
 }
 
 pub(super) fn cached_flow_decision_valid(
@@ -2163,6 +2150,31 @@ mod tests {
     use super::super::test_fixtures::*;
     use super::*;
     use crate::{FabricSnapshot, SourceNATRuleSnapshot};
+
+    fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
+        HAGroupRuntime {
+            active: true,
+            watchdog_timestamp: now_secs,
+            lease: HAGroupRuntime::active_lease_until(now_secs, now_secs),
+        }
+    }
+
+    fn inactive_ha_runtime(watchdog_timestamp: u64) -> HAGroupRuntime {
+        HAGroupRuntime {
+            active: false,
+            watchdog_timestamp,
+            lease: HAForwardingLease::Inactive,
+        }
+    }
+
+    fn suppressed_ha_runtime(watchdog_timestamp: u64, until_secs: u64) -> HAGroupRuntime {
+        HAGroupRuntime {
+            active: true,
+            watchdog_timestamp,
+            lease: HAForwardingLease::SuppressedUntil(until_secs),
+        }
+    }
+
     #[test]
     fn metadata_classification_accepts_matching_generations() {
         let validation = ValidationState {
@@ -2217,12 +2229,7 @@ mod tests {
         let state = build_forwarding_state(&nat_snapshot());
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
         )])));
         let resolved = enforce_ha_resolution(
             &state,
@@ -2237,12 +2244,7 @@ mod tests {
         let state = build_forwarding_state(&nat_snapshot());
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(monotonic_nanos() / 1_000_000_000),
         )])));
         let resolved = enforce_ha_resolution(
             &state,
@@ -2261,12 +2263,7 @@ mod tests {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: now_secs,
-                demoting: true,
-                demoting_until_secs: now_secs + 5,
-            },
+            suppressed_ha_runtime(now_secs, now_secs + 5),
         )])));
         let resolved = enforce_ha_resolution(
             &state,
@@ -2279,24 +2276,8 @@ mod tests {
     #[test]
     fn cached_flow_decision_invalidates_when_owner_rg_is_demoted() {
         let state = build_forwarding_state(&nat_snapshot());
-        let active = BTreeMap::from([(
-            1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
-        )]);
-        let demoted = BTreeMap::from([(
-            1,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
-        )]);
+        let active = BTreeMap::from([(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
+        let demoted = BTreeMap::from([(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
         let resolution =
             lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         let now_secs = monotonic_nanos() / 1_000_000_000;
@@ -2314,12 +2295,7 @@ mod tests {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
         )])));
         let blocked = enforce_ha_resolution(
             &state,
@@ -2357,12 +2333,7 @@ mod tests {
         let state = build_forwarding_state(&snapshot);
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
         )])));
         let blocked = enforce_ha_resolution(
             &state,
@@ -2387,15 +2358,7 @@ mod tests {
     fn fabric_ingress_prefers_local_active_owner_resolution_over_fabric_redirect() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let now_secs = monotonic_nanos() / 1_000_000_000;
-        let ha_state = BTreeMap::from([(
-            1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: now_secs,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
-        )]);
+        let ha_state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
         let redirected = resolve_fabric_redirect(&state).expect("fabric redirect");
         let preferred = prefer_local_forward_candidate_for_fabric_ingress(
             &state,
@@ -2573,12 +2536,7 @@ mod tests {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
         )])));
         let blocked = enforce_ha_resolution(
             &state,
@@ -2602,15 +2560,7 @@ mod tests {
     #[test]
     fn fabric_originated_reverse_session_prefers_local_client_delivery_when_rg_active() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
-        let ha_state = BTreeMap::from([(
-            2,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
-        )]);
+        let ha_state = BTreeMap::from([(2, active_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         dynamic_neighbors.lock().expect("neighbors").insert(
             (24, IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
@@ -2642,15 +2592,8 @@ mod tests {
     fn fabric_originated_reverse_session_uses_zone_encoded_fabric_redirect_when_client_rg_inactive()
     {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
-        let ha_state = BTreeMap::from([(
-            2,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
-        )]);
+        let ha_state =
+            BTreeMap::from([(2, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
 
         let resolved = reverse_resolution_for_session(
@@ -2737,17 +2680,15 @@ mod tests {
             ..UserspaceDpMeta::default()
         };
 
-        assert!(
-            cluster_peer_return_fast_path(
-                &state,
-                &dynamic_neighbors,
-                &[],
-                meta,
-                Some("sfmix"),
-                IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            )
-            .is_none()
-        );
+        assert!(cluster_peer_return_fast_path(
+            &state,
+            &dynamic_neighbors,
+            &[],
+            meta,
+            Some("sfmix"),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+        )
+        .is_none());
     }
 
     #[test]
@@ -2769,17 +2710,15 @@ mod tests {
         };
         let packet_frame = [8u8];
 
-        assert!(
-            cluster_peer_return_fast_path(
-                &state,
-                &dynamic_neighbors,
-                &packet_frame,
-                meta,
-                Some("lan"),
-                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-            )
-            .is_none()
-        );
+        assert!(cluster_peer_return_fast_path(
+            &state,
+            &dynamic_neighbors,
+            &packet_frame,
+            meta,
+            Some("lan"),
+            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+        )
+        .is_none());
     }
 
     #[test]
@@ -2801,17 +2740,15 @@ mod tests {
         };
         let packet_frame = [128u8];
 
-        assert!(
-            cluster_peer_return_fast_path(
-                &state,
-                &dynamic_neighbors,
-                &packet_frame,
-                meta,
-                Some("lan"),
-                IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
-            )
-            .is_none()
-        );
+        assert!(cluster_peer_return_fast_path(
+            &state,
+            &dynamic_neighbors,
+            &packet_frame,
+            meta,
+            Some("lan"),
+            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+        )
+        .is_none());
     }
 
     #[test]
@@ -2964,15 +2901,8 @@ mod tests {
     #[test]
     fn embedded_icmp_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
-        let ha_state = BTreeMap::from([(
-            2,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
-        )]);
+        let ha_state =
+            BTreeMap::from([(2, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
         let icmp_match = EmbeddedIcmpMatch {
             nat: NatDecision {
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -3115,15 +3045,8 @@ mod tests {
     #[test]
     fn embedded_icmp_from_fabric_does_not_redirect_back_to_fabric() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
-        let ha_state = BTreeMap::from([(
-            2,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
-        )]);
+        let ha_state =
+            BTreeMap::from([(2, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
         let icmp_match = EmbeddedIcmpMatch {
             nat: NatDecision {
                 rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
@@ -3541,20 +3464,16 @@ mod tests {
             0x10,
         ));
         assert!(sessions.lookup(&key, 1_000_000, 0x10).is_some());
-        assert!(
-            shared_sessions
-                .lock()
-                .expect("shared lock")
-                .get(&key)
-                .is_none()
-        );
+        assert!(shared_sessions
+            .lock()
+            .expect("shared lock")
+            .get(&key)
+            .is_none());
         assert!(shared_nat_sessions.lock().expect("nat lock").is_empty());
-        assert!(
-            shared_forward_wire_sessions
-                .lock()
-                .expect("forward wire lock")
-                .is_empty()
-        );
+        assert!(shared_forward_wire_sessions
+            .lock()
+            .expect("forward wire lock")
+            .is_empty());
     }
 
     #[test]
@@ -3628,20 +3547,16 @@ mod tests {
             PROTO_TCP,
             0x10,
         ));
-        assert!(
-            shared_sessions
-                .lock()
-                .expect("shared lock")
-                .get(&key)
-                .is_none()
-        );
+        assert!(shared_sessions
+            .lock()
+            .expect("shared lock")
+            .get(&key)
+            .is_none());
         assert!(shared_nat_sessions.lock().expect("nat lock").is_empty());
-        assert!(
-            shared_forward_wire_sessions
-                .lock()
-                .expect("forward wire lock")
-                .is_empty()
-        );
+        assert!(shared_forward_wire_sessions
+            .lock()
+            .expect("forward wire lock")
+            .is_empty());
     }
 
     #[test]

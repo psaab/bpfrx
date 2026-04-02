@@ -4213,6 +4213,22 @@ mod tests {
     use super::super::test_fixtures::*;
     use super::*;
 
+    fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
+        HAGroupRuntime {
+            active: true,
+            watchdog_timestamp: now_secs,
+            lease: HAGroupRuntime::active_lease_until(now_secs, now_secs),
+        }
+    }
+
+    fn inactive_ha_runtime(watchdog_timestamp: u64) -> HAGroupRuntime {
+        HAGroupRuntime {
+            active: false,
+            watchdog_timestamp,
+            lease: HAForwardingLease::Inactive,
+        }
+    }
+
     fn build_icmp_echo_frame_v4(src: Ipv4Addr, dst: Ipv4Addr, ttl: u8) -> Vec<u8> {
         let mut frame = Vec::new();
         write_eth_header(
@@ -4730,12 +4746,7 @@ mod tests {
         let state = build_forwarding_state(&native_gre_snapshot(true));
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(monotonic_nanos() / 1_000_000_000),
         )])));
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let packet = build_icmp_echo_frame_v4(
@@ -4766,12 +4777,7 @@ mod tests {
         let state = build_forwarding_state(&native_gre_snapshot(true));
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
             1,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
         )])));
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let packet = build_icmp_echo_frame_v4(

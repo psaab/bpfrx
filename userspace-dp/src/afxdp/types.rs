@@ -306,8 +306,7 @@ pub(super) struct WorkerHandle {
     pub(super) stop: Arc<AtomicBool>,
     pub(super) heartbeat: Arc<AtomicU64>,
     pub(super) commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
-    pub(super) demotion_prepare_ack: Arc<AtomicU64>,
-    pub(super) refresh_owner_rgs_ack: Arc<AtomicU64>,
+    pub(super) ha_state_apply_ack: Arc<AtomicU64>,
     pub(super) session_export_ack: Arc<AtomicU64>,
     pub(super) join: Option<JoinHandle<()>>,
 }
@@ -386,12 +385,39 @@ pub(super) struct ForwardingState {
     pub(super) tcp_mss_gre_out: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(super) enum HAForwardingLease {
+    #[default]
+    Inactive,
+    ActiveUntil(u64),
+    SuppressedUntil(u64),
+}
+
+impl HAForwardingLease {
+    pub(super) fn active(self, now_secs: u64) -> bool {
+        matches!(self, Self::ActiveUntil(until) if until != 0 && now_secs <= until)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct HAGroupRuntime {
     pub(super) active: bool,
     pub(super) watchdog_timestamp: u64,
-    pub(super) demoting: bool,
-    pub(super) demoting_until_secs: u64,
+    pub(super) lease: HAForwardingLease,
+}
+
+impl HAGroupRuntime {
+    pub(super) fn active_lease_until(watchdog_timestamp: u64, now_secs: u64) -> HAForwardingLease {
+        HAForwardingLease::ActiveUntil(
+            watchdog_timestamp
+                .max(now_secs)
+                .saturating_add(super::HA_WATCHDOG_STALE_AFTER_SECS),
+        )
+    }
+
+    pub(super) fn is_forwarding_active(self, now_secs: u64) -> bool {
+        self.active && self.lease.active(now_secs)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -739,10 +765,15 @@ pub(super) enum WorkerCommand {
     UpsertSynced(SyncedSessionEntry),
     UpsertLocal(SyncedSessionEntry),
     DeleteSynced(SessionKey),
-    ExportOwnerRGSessions { sequence: u64, owner_rgs: Vec<i32> },
-    PrepareDemoteOwnerRGs { sequence: u64, owner_rgs: Vec<i32> },
-    DemoteOwnerRG(i32),
-    RefreshOwnerRGs { owner_rgs: Vec<i32>, sequence: u64 },
+    ExportOwnerRGSessions {
+        sequence: u64,
+        owner_rgs: Vec<i32>,
+    },
+    ApplyHAState {
+        sequence: u64,
+        republish_owner_rgs: Vec<i32>,
+        demote_owner_rgs: Vec<i32>,
+    },
 }
 
 #[derive(Default)]

@@ -236,8 +236,7 @@ pub struct Coordinator {
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
-    demotion_prepare_seq: AtomicU64,
-    refresh_owner_rgs_seq: AtomicU64,
+    ha_state_apply_seq: AtomicU64,
     session_export_seq: AtomicU64,
     forwarding: ForwardingState,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
@@ -285,8 +284,7 @@ impl Coordinator {
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
-            demotion_prepare_seq: AtomicU64::new(0),
-            refresh_owner_rgs_seq: AtomicU64::new(0),
+            ha_state_apply_seq: AtomicU64::new(0),
             session_export_seq: AtomicU64::new(0),
             forwarding: ForwardingState::default(),
             recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
@@ -777,8 +775,7 @@ impl Coordinator {
             let plan_count = binding_plans.len();
             let stop = Arc::new(AtomicBool::new(false));
             let heartbeat = Arc::new(AtomicU64::new(monotonic_nanos()));
-            let demotion_prepare_ack = Arc::new(AtomicU64::new(0));
-            let refresh_owner_rgs_ack = Arc::new(AtomicU64::new(0));
+            let ha_state_apply_ack = Arc::new(AtomicU64::new(0));
             let session_export_ack = Arc::new(AtomicU64::new(0));
             let commands = worker_command_queues
                 .get(&worker_id)
@@ -796,8 +793,7 @@ impl Coordinator {
             let shared_forward_wire_sessions = self.shared_forward_wire_sessions.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
-            let demotion_prepare_ack_clone = demotion_prepare_ack.clone();
-            let refresh_owner_rgs_ack_clone = refresh_owner_rgs_ack.clone();
+            let ha_state_apply_ack_clone = ha_state_apply_ack.clone();
             let session_export_ack_clone = session_export_ack.clone();
             let commands_clone = commands.clone();
             let peer_commands_clone = worker_command_queues
@@ -833,8 +829,7 @@ impl Coordinator {
                         peer_commands_clone,
                         stop_clone,
                         heartbeat_clone,
-                        demotion_prepare_ack_clone,
-                        refresh_owner_rgs_ack_clone,
+                        ha_state_apply_ack_clone,
                         session_export_ack_clone,
                         worker_poll_mode,
                         dnat_fds,
@@ -855,8 +850,7 @@ impl Coordinator {
                             stop,
                             heartbeat,
                             commands,
-                            demotion_prepare_ack,
-                            refresh_owner_rgs_ack,
+                            ha_state_apply_ack,
                             session_export_ack,
                             join: Some(join),
                         },
@@ -1071,39 +1065,29 @@ impl Coordinator {
             .store(Arc::new(self.forwarding.fabrics.clone()));
     }
 
-    pub fn update_ha_state(&self, groups: &[HAGroupStatus]) {
+    pub fn update_ha_state(&self, groups: &[HAGroupStatus]) -> Result<(), String> {
         let previous = self.ha_state.load();
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let mut state = BTreeMap::new();
         for group in groups {
-            let (demoting, demoting_until_secs) = if group.active {
-                previous
-                    .as_ref()
-                    .get(&group.rg_id)
-                    .map(|runtime| {
-                        let demoting = runtime.demoting
-                            && runtime.demoting_until_secs != 0
-                            && now_secs <= runtime.demoting_until_secs;
-                        (
-                            demoting,
-                            if demoting {
-                                runtime.demoting_until_secs
-                            } else {
-                                0
-                            },
-                        )
-                    })
-                    .unwrap_or((false, 0))
+            // Treat every active HA state update as a lease refresh. Packet-time
+            // HA now consults a single applied lease state: active-until,
+            // suppressed-until, or inactive.
+            let lease = if group.active {
+                match previous.as_ref().get(&group.rg_id).map(|runtime| runtime.lease) {
+                    Some(HAForwardingLease::SuppressedUntil(until))
+                        if until != 0 && now_secs <= until => HAForwardingLease::SuppressedUntil(until),
+                    _ => HAGroupRuntime::active_lease_until(group.watchdog_timestamp, now_secs),
+                }
             } else {
-                (false, 0)
+                HAForwardingLease::Inactive
             };
             state.insert(
                 group.rg_id,
                 HAGroupRuntime {
                     active: group.active,
                     watchdog_timestamp: group.watchdog_timestamp,
-                    demoting,
-                    demoting_until_secs,
+                    lease,
                 },
             );
         }
@@ -1181,13 +1165,7 @@ impl Coordinator {
                     self.rg_epochs[idx].fetch_add(1, Ordering::Release);
                 }
             }
-            for handle in self.workers.values() {
-                if let Ok(mut pending) = handle.commands.lock() {
-                    for rg_id in &demoted_rgs {
-                        pending.push_back(WorkerCommand::DemoteOwnerRG(*rg_id));
-                    }
-                }
-            }
+            self.enqueue_apply_ha_state(&demoted_rgs, &demoted_rgs)?;
             // Record cache flush timestamp for observability (#312).
             self.last_cache_flush_at.store(now_secs, Ordering::Relaxed);
         }
@@ -1205,7 +1183,7 @@ impl Coordinator {
                 .collect::<Vec<_>>();
             let Some(session_map_ref) = self.session_map_fd.as_ref() else {
                 eprintln!("bpfrx-ha: no session_map_fd, skipping activation");
-                return;
+                return Ok(());
             };
             let session_map_fd = session_map_ref.fd;
             let now_secs = monotonic_nanos() / 1_000_000_000;
@@ -1222,10 +1200,54 @@ impl Coordinator {
                 &activated_rgs,
                 now_secs,
             );
-            // RefreshOwnerRGs is NOT queued here — the explicit
-            // refresh_owner_rgs RPC from Go's UpdateRGActive() is
-            // sufficient and has worker-completion ack (#314).
-            // Removed duplicate per #342.
+            self.enqueue_apply_ha_state(&[], &[])?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_apply_ha_state(
+        &self,
+        republish_owner_rgs: &[i32],
+        demote_owner_rgs: &[i32],
+    ) -> Result<(), String> {
+        if self.workers.is_empty() {
+            return Ok(());
+        }
+        let sequence = self
+            .ha_state_apply_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        for handle in self.workers.values() {
+            let mut pending = handle
+                .commands
+                .lock()
+                .map_err(|_| "worker command queue poisoned".to_string())?;
+            pending.push_back(WorkerCommand::ApplyHAState {
+                sequence,
+                republish_owner_rgs: republish_owner_rgs.to_vec(),
+                demote_owner_rgs: demote_owner_rgs.to_vec(),
+            });
+        }
+        self.wait_for_ha_state_apply(sequence, Duration::from_secs(2))
+    }
+
+    fn wait_for_ha_state_apply(&self, sequence: u64, timeout: Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self
+                .workers
+                .values()
+                .all(|handle| handle.ha_state_apply_ack.load(Ordering::Acquire) >= sequence)
+            {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "ha state apply seq={} timed out waiting for worker acks",
+                    sequence
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -1239,16 +1261,15 @@ impl Coordinator {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         for rg_id in owner_rgs {
             if let Some(runtime) = state.get_mut(rg_id) {
-                let next_demoting = demoting && runtime.active;
-                let next_deadline = if next_demoting {
-                    now_secs.saturating_add(HA_DEMOTION_PREP_LEASE_SECS)
+                let next_lease = if !runtime.active {
+                    HAForwardingLease::Inactive
+                } else if demoting {
+                    HAForwardingLease::SuppressedUntil(now_secs.saturating_add(HA_DEMOTION_PREP_LEASE_SECS))
                 } else {
-                    0
+                    HAGroupRuntime::active_lease_until(runtime.watchdog_timestamp, now_secs)
                 };
-                if runtime.demoting != next_demoting || runtime.demoting_until_secs != next_deadline
-                {
-                    runtime.demoting = next_demoting;
-                    runtime.demoting_until_secs = next_deadline;
+                if runtime.lease != next_lease {
+                    runtime.lease = next_lease;
                     changed = true;
                 }
             }
@@ -1258,121 +1279,19 @@ impl Coordinator {
         }
     }
 
-    /// Explicitly refresh sessions for activated RGs. Called from Go's
-    /// UpdateRGActive to bypass delta detection which can miss activations
-    /// when the periodic poll already updated the HA state.
-    ///
-    /// Blocks until all workers have finished processing the RefreshOwnerRGs
-    /// command (or a 2s timeout), so the caller knows sessions are ready
-    /// before traffic arrives on the new owner.
-    pub fn refresh_owner_rgs(&self, owner_rgs: &[i32]) {
-        if owner_rgs.is_empty() {
-            return;
-        }
-        // Prewarm reverse synced sessions.
-        let worker_command_vec: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = self
-            .workers
-            .values()
-            .map(|handle| handle.commands.clone())
-            .collect();
-        if let Some(session_map_ref) = self.session_map_fd.as_ref() {
-            let session_map_fd = session_map_ref.fd;
-            let now_secs = monotonic_nanos() / 1_000_000_000;
-            let current = self.ha_state.load();
-            prewarm_reverse_synced_sessions_for_owner_rgs(
-                &self.shared_sessions,
-                &self.shared_nat_sessions,
-                &self.shared_forward_wire_sessions,
-                &worker_command_vec,
-                session_map_fd,
-                &self.forwarding,
-                current.as_ref(),
-                &self.dynamic_neighbors,
-                owner_rgs,
-                now_secs,
-            );
-        }
-        let sequence = self
-            .refresh_owner_rgs_seq
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        // Bump RG epochs for activated RGs — O(1) flow cache invalidation.
-        for rg_id in owner_rgs {
-            let idx = *rg_id as usize;
-            if idx > 0 && idx < MAX_RG_EPOCHS {
-                self.rg_epochs[idx].fetch_add(1, Ordering::Release);
-            }
-        }
-        for handle in self.workers.values() {
-            if let Ok(mut pending) = handle.commands.lock() {
-                pending.push_back(WorkerCommand::RefreshOwnerRGs {
-                    owner_rgs: owner_rgs.to_vec(),
-                    sequence,
-                });
-            }
-        }
-        // Wait for all workers to finish processing RefreshOwnerRGs.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if self
-                .workers
-                .values()
-                .all(|handle| handle.refresh_owner_rgs_ack.load(Ordering::Acquire) >= sequence)
-            {
-                eprintln!(
-                    "bpfrx-ha: refresh_owner_rgs seq={} acked by all {} workers",
-                    sequence,
-                    self.workers.len(),
-                );
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                eprintln!(
-                    "bpfrx-ha: refresh_owner_rgs seq={} timed out waiting for worker acks",
-                    sequence,
-                );
-                return;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-    }
-
     pub fn prepare_ha_demotion(&self, owner_rgs: &[i32]) -> Result<(), String> {
         if owner_rgs.is_empty() {
             return Ok(());
         }
         self.set_demoting_owner_rgs(owner_rgs, true);
-        let sequence = self
-            .demotion_prepare_seq
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        for handle in self.workers.values() {
-            let mut pending = handle
-                .commands
-                .lock()
-                .map_err(|_| "worker command queue poisoned".to_string())?;
-            pending.push_back(WorkerCommand::PrepareDemoteOwnerRGs {
-                sequence,
-                owner_rgs: owner_rgs.to_vec(),
-            });
-        }
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        loop {
-            if self
-                .workers
-                .values()
-                .all(|handle| handle.demotion_prepare_ack.load(Ordering::Acquire) >= sequence)
-            {
-                return Ok(());
+        if let Err(err) = self.enqueue_apply_ha_state(owner_rgs, &[]) {
+            self.set_demoting_owner_rgs(owner_rgs, false);
+            if err.contains("ha state apply seq=") {
+                return Err(err.replace("ha state apply", "demotion prepare"));
             }
-            if std::time::Instant::now() >= deadline {
-                self.set_demoting_owner_rgs(owner_rgs, false);
-                return Err(format!(
-                    "timed out waiting for demotion prepare ack seq={sequence}"
-                ));
-            }
-            thread::sleep(Duration::from_millis(5));
+            return Err(err);
         }
+        Ok(())
     }
 
     /// Explicitly clear a stale demotion mark that was set by
@@ -1443,13 +1362,26 @@ impl Coordinator {
     }
 
     pub fn ha_groups(&self) -> Vec<HAGroupStatus> {
+        let now_secs = monotonic_nanos() / 1_000_000_000;
         self.ha_state
             .load()
             .iter()
-            .map(|(rg_id, runtime)| HAGroupStatus {
-                rg_id: *rg_id,
-                active: runtime.active,
-                watchdog_timestamp: runtime.watchdog_timestamp,
+            .map(|(rg_id, runtime)| {
+                let (lease_state, lease_until) = match runtime.lease {
+                    HAForwardingLease::Inactive => ("inactive".to_string(), 0),
+                    HAForwardingLease::ActiveUntil(until) => ("active".to_string(), until),
+                    HAForwardingLease::SuppressedUntil(until) => {
+                        ("suppressed".to_string(), until)
+                    }
+                };
+                HAGroupStatus {
+                    rg_id: *rg_id,
+                    active: runtime.active,
+                    watchdog_timestamp: runtime.watchdog_timestamp,
+                    forwarding_active: runtime.is_forwarding_active(now_secs),
+                    lease_state,
+                    lease_until,
+                }
             })
             .collect()
     }
@@ -5385,8 +5317,7 @@ fn worker_loop(
     peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
-    demotion_prepare_ack: Arc<AtomicU64>,
-    refresh_owner_rgs_ack: Arc<AtomicU64>,
+    ha_state_apply_ack: Arc<AtomicU64>,
     session_export_ack: Arc<AtomicU64>,
     poll_mode: crate::PollMode,
     dnat_fds: DnatTableFds,
@@ -5589,8 +5520,7 @@ fn worker_loop(
         } else {
             WorkerCommandResults {
                 cancelled_keys: Vec::new(),
-                prepared_sequences: Vec::new(),
-                refreshed_sequences: Vec::new(),
+                applied_sequences: Vec::new(),
                 exported_sequences: Vec::new(),
             }
         };
@@ -5749,15 +5679,10 @@ fn worker_loop(
         if !bindings.is_empty() {
             poll_start = (poll_start + 1) % bindings.len();
         }
-        if let Some(sequence) = command_results.prepared_sequences.iter().copied().max() {
-            // Demotion prepare only needs local worker state to be updated. Do
-            // not block the ack on unrelated steady-state delta churn.
-            demotion_prepare_ack.store(sequence, Ordering::Release);
+        if let Some(sequence) = command_results.applied_sequences.iter().copied().max() {
+            ha_state_apply_ack.store(sequence, Ordering::Release);
         }
-        if let Some(sequence) = command_results.refreshed_sequences.iter().copied().max() {
-            refresh_owner_rgs_ack.store(sequence, Ordering::Release);
-        }
-        if !command_results.prepared_sequences.is_empty()
+        if !command_results.applied_sequences.is_empty()
             || !command_results.exported_sequences.is_empty()
         {
             while sessions.has_pending_deltas() {
@@ -6363,6 +6288,30 @@ mod tests {
     use super::*;
     use crate::{InterfaceAddressSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot};
 
+    fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
+        HAGroupRuntime {
+            active: true,
+            watchdog_timestamp: now_secs,
+            lease: HAGroupRuntime::active_lease_until(now_secs, now_secs),
+        }
+    }
+
+    fn inactive_ha_runtime(watchdog_timestamp: u64) -> HAGroupRuntime {
+        HAGroupRuntime {
+            active: false,
+            watchdog_timestamp,
+            lease: HAForwardingLease::Inactive,
+        }
+    }
+
+    fn suppressed_ha_runtime(watchdog_timestamp: u64, until_secs: u64) -> HAGroupRuntime {
+        HAGroupRuntime {
+            active: true,
+            watchdog_timestamp,
+            lease: HAForwardingLease::SuppressedUntil(until_secs),
+        }
+    }
+
     #[test]
     fn mlx5_keeps_umem_owner_bind_strategy() {
         assert_eq!(
@@ -6650,41 +6599,21 @@ mod tests {
         let previous = BTreeMap::from([
             (
                 1,
-                HAGroupRuntime {
-                    active: true,
-                    watchdog_timestamp: 11,
-                    demoting: false,
-                    demoting_until_secs: 0,
-                },
+                active_ha_runtime(11),
             ),
             (
                 2,
-                HAGroupRuntime {
-                    active: true,
-                    watchdog_timestamp: 12,
-                    demoting: false,
-                    demoting_until_secs: 0,
-                },
+                active_ha_runtime(12),
             ),
         ]);
         let current = BTreeMap::from([
             (
                 1,
-                HAGroupRuntime {
-                    active: false,
-                    watchdog_timestamp: 21,
-                    demoting: false,
-                    demoting_until_secs: 0,
-                },
+                inactive_ha_runtime(21),
             ),
             (
                 2,
-                HAGroupRuntime {
-                    active: true,
-                    watchdog_timestamp: 22,
-                    demoting: false,
-                    demoting_until_secs: 0,
-                },
+                active_ha_runtime(22),
             ),
         ]);
 
@@ -6696,41 +6625,21 @@ mod tests {
         let previous = BTreeMap::from([
             (
                 1,
-                HAGroupRuntime {
-                    active: false,
-                    watchdog_timestamp: 11,
-                    demoting: false,
-                    demoting_until_secs: 0,
-                },
+                inactive_ha_runtime(11),
             ),
             (
                 2,
-                HAGroupRuntime {
-                    active: true,
-                    watchdog_timestamp: 12,
-                    demoting: false,
-                    demoting_until_secs: 0,
-                },
+                active_ha_runtime(12),
             ),
         ]);
         let current = BTreeMap::from([
             (
                 1,
-                HAGroupRuntime {
-                    active: true,
-                    watchdog_timestamp: 21,
-                    demoting: false,
-                    demoting_until_secs: 0,
-                },
+                active_ha_runtime(21),
             ),
             (
                 2,
-                HAGroupRuntime {
-                    active: true,
-                    watchdog_timestamp: 22,
-                    demoting: false,
-                    demoting_until_secs: 0,
-                },
+                active_ha_runtime(22),
             ),
         ]);
 
@@ -6743,26 +6652,50 @@ mod tests {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         coordinator.ha_state.store(Arc::new(BTreeMap::from([(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: 11,
-                demoting: true,
-                demoting_until_secs: now_secs.saturating_sub(1),
-            },
+            suppressed_ha_runtime(11, now_secs.saturating_sub(1)),
         )])));
 
-        coordinator.update_ha_state(&[HAGroupStatus {
-            rg_id: 1,
-            active: true,
-            watchdog_timestamp: 22,
-        }]);
+        coordinator
+            .update_ha_state(&[HAGroupStatus {
+                rg_id: 1,
+                active: true,
+                watchdog_timestamp: 22,
+                ..HAGroupStatus::default()
+            }])
+            .expect("update ha state");
 
         let state = coordinator.ha_state.load();
         let group = state.get(&1).expect("ha group");
         assert!(group.active);
-        assert!(!group.demoting);
-        assert_eq!(group.demoting_until_secs, 0);
         assert_eq!(group.watchdog_timestamp, 22);
+        assert!(matches!(group.lease, HAForwardingLease::ActiveUntil(until) if until >= 24));
+    }
+
+    #[test]
+    fn update_ha_state_seeds_lease_for_active_group_without_watchdog() {
+        let coordinator = Coordinator::new();
+        let before = monotonic_nanos() / 1_000_000_000;
+
+        coordinator
+            .update_ha_state(&[HAGroupStatus {
+                rg_id: 1,
+                active: true,
+                watchdog_timestamp: 0,
+                ..HAGroupStatus::default()
+            }])
+            .expect("update ha state");
+
+        let after = monotonic_nanos() / 1_000_000_000;
+        let state = coordinator.ha_state.load();
+        let group = state.get(&1).expect("ha group");
+        assert!(group.active);
+        assert_eq!(group.watchdog_timestamp, 0);
+        assert!(
+            matches!(group.lease, HAForwardingLease::ActiveUntil(until)
+                if until >= before + HA_WATCHDOG_STALE_AFTER_SECS
+                    && until <= after + HA_WATCHDOG_STALE_AFTER_SECS)
+        );
+        assert!(group.is_forwarding_active(after));
     }
 
     #[test]
@@ -6770,12 +6703,7 @@ mod tests {
         let coordinator = Coordinator::new();
         coordinator.ha_state.store(Arc::new(BTreeMap::from([(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: 11,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(11),
         )])));
 
         let before = monotonic_nanos() / 1_000_000_000;
@@ -6784,15 +6712,48 @@ mod tests {
 
         let state = coordinator.ha_state.load();
         let group = state.get(&1).expect("ha group");
-        assert!(group.demoting);
-        assert!(group.demoting_until_secs >= before + 1);
-        assert!(group.demoting_until_secs <= after + HA_DEMOTION_PREP_LEASE_SECS);
+        assert!(matches!(group.lease, HAForwardingLease::SuppressedUntil(until)
+            if until >= before + 1 && until <= after + HA_DEMOTION_PREP_LEASE_SECS));
 
         coordinator.set_demoting_owner_rgs(&[1], false);
         let state = coordinator.ha_state.load();
         let group = state.get(&1).expect("ha group");
-        assert!(!group.demoting);
-        assert_eq!(group.demoting_until_secs, 0);
+        assert!(matches!(group.lease, HAForwardingLease::ActiveUntil(_)));
+    }
+
+    #[test]
+    fn ha_groups_reports_forwarding_lease_status() {
+        let coordinator = Coordinator::new();
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        coordinator.ha_state.store(Arc::new(BTreeMap::from([
+            (1, active_ha_runtime(now_secs)),
+            (2, suppressed_ha_runtime(now_secs, now_secs + 5)),
+            (3, inactive_ha_runtime(0)),
+        ])));
+
+        let groups = coordinator.ha_groups();
+
+        assert!(groups.iter().any(|group| {
+            group.rg_id == 1
+                && group.active
+                && group.forwarding_active
+                && group.lease_state == "active"
+                && group.lease_until >= now_secs
+        }));
+        assert!(groups.iter().any(|group| {
+            group.rg_id == 2
+                && group.active
+                && !group.forwarding_active
+                && group.lease_state == "suppressed"
+                && group.lease_until >= now_secs + 1
+        }));
+        assert!(groups.iter().any(|group| {
+            group.rg_id == 3
+                && !group.active
+                && !group.forwarding_active
+                && group.lease_state == "inactive"
+                && group.lease_until == 0
+        }));
     }
 
     #[test]
