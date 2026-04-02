@@ -16,6 +16,7 @@ Files reviewed:
 Related prior design and audit docs:
 
 - [ha-simple-failover-design.md](ha-simple-failover-design.md)
+- [ha-failover-implementation-plan.md](ha-failover-implementation-plan.md)
 - [session-sync-architecture.md](session-sync-architecture.md)
 - [userspace-forwarding-and-failover-gap-audit.md](userspace-forwarding-and-failover-gap-audit.md)
 - [flow-cache-simplification.md](flow-cache-simplification.md)
