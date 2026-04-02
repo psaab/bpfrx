@@ -528,6 +528,48 @@ func TestFinalizePeerTransferOutClearsSecondaryHold(t *testing.T) {
 	}
 }
 
+func TestPeerTransferOutOverrideSurvivesHeartbeatRefreshUntilCommit(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+	m.mu.Lock()
+	m.groups[0].Ready = true
+	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+	m.groups[0].ReadinessReasons = nil
+	m.mu.Unlock()
+
+	if err := m.commitRequestedPeerFailover(0, 77); err != nil {
+		t.Fatalf("commitRequestedPeerFailover() error = %v", err)
+	}
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("should be primary after local transfer commit")
+	}
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("heartbeat refresh should not clobber in-flight transfer-out override")
+	}
+	if peer := m.PeerGroupStates()[0]; peer.State != StateSecondaryHold {
+		t.Fatalf("peer state = %s, want secondary-hold while transfer commit in flight", peer.State)
+	}
+}
+
 func TestResetFailover(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))

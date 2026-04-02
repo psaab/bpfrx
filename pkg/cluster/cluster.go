@@ -117,7 +117,11 @@ type Manager struct {
 	peerEverSeen bool // true once first heartbeat received; distinguishes "never heard" from "lost"
 	peerNodeID   int
 	peerGroups   map[int]PeerGroupState
-	peerMonitors []InterfaceMonitorInfo
+	// peerTransferOutOverride preserves an explicitly acknowledged peer
+	// transfer-out across heartbeat refreshes until the transfer is either
+	// committed or aborted locally.
+	peerTransferOutOverride map[int]uint64
+	peerMonitors            []InterfaceMonitorInfo
 
 	// Heartbeat goroutines (nil when not started).
 	hbSender   *heartbeatSender
@@ -196,6 +200,7 @@ func NewManager(nodeID, clusterID int) *Manager {
 		eventCh:                        make(chan ClusterEvent, 64),
 		garpCounts:                     make(map[int]int),
 		peerGroups:                     make(map[int]PeerGroupState),
+		peerTransferOutOverride:        make(map[int]uint64),
 		hbInterval:                     DefaultHeartbeatInterval,
 		hbThreshold:                    DefaultHeartbeatThreshold,
 		history:                        NewEventHistory(64),
@@ -785,17 +790,18 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 	if err != nil {
 		return err
 	}
-	if err := m.commitRequestedPeerFailover(rgID); err != nil {
+	if err := m.commitRequestedPeerFailover(rgID, reqID); err != nil {
 		return err
 	}
 	if err := commitFn(rgID, reqID); err != nil {
+		m.abortRequestedPeerFailover(rgID, reqID)
 		return err
 	}
 	m.notePeerTransferCommitted(rgID)
 	return nil
 }
 
-func (m *Manager) commitRequestedPeerFailover(rgID int) error {
+func (m *Manager) commitRequestedPeerFailover(rgID int, reqID uint64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -817,6 +823,7 @@ func (m *Manager) commitRequestedPeerFailover(rgID int) error {
 		)
 	}
 
+	m.peerTransferOutOverride[rgID] = reqID
 	peerGroup := m.peerGroups[rgID]
 	peerGroup.GroupID = rgID
 	peerGroup.State = StateSecondaryHold
@@ -837,10 +844,22 @@ func (m *Manager) commitRequestedPeerFailover(rgID int) error {
 	return nil
 }
 
+func (m *Manager) abortRequestedPeerFailover(rgID int, reqID uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if currentReqID, ok := m.peerTransferOutOverride[rgID]; !ok || currentReqID != reqID {
+		return
+	}
+	delete(m.peerTransferOutOverride, rgID)
+	m.runElection()
+}
+
 func (m *Manager) notePeerTransferCommitted(rgID int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	delete(m.peerTransferOutOverride, rgID)
 	peerGroup, ok := m.peerGroups[rgID]
 	if !ok {
 		return
@@ -1175,6 +1194,12 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 			Weight:   int(g.Weight),
 			State:    NodeState(g.State),
 		}
+	}
+	for rgID := range m.peerTransferOutOverride {
+		peerGroup := newPeerGroups[rgID]
+		peerGroup.GroupID = rgID
+		peerGroup.State = StateSecondaryHold
+		newPeerGroups[rgID] = peerGroup
 	}
 	m.peerGroups = newPeerGroups
 
