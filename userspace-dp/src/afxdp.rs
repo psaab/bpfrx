@@ -82,6 +82,8 @@ mod tunnel;
 mod tx;
 #[path = "afxdp/types.rs"]
 mod types;
+#[path = "afxdp/flow_cache.rs"]
+mod flow_cache;
 #[path = "afxdp/ha.rs"]
 mod ha;
 #[path = "afxdp/umem.rs"]
@@ -127,6 +129,7 @@ use self::session_glue::*;
 use self::tunnel::*;
 use self::tx::*;
 use self::types::*;
+use self::flow_cache::*;
 pub(crate) use self::types::{ForwardingDisposition, ForwardingResolution, NeighborEntry};
 use self::umem::*;
 
