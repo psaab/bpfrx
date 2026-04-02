@@ -45,9 +45,9 @@ The current cache is still:
 
 Relevant code:
 
-- [userspace-dp/src/afxdp/types.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/types.rs)
-- [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
-- [userspace-dp/src/afxdp/session_glue.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/session_glue.rs)
+- [userspace-dp/src/afxdp/types.rs](../userspace-dp/src/afxdp/types.rs)
+- [userspace-dp/src/afxdp.rs](../userspace-dp/src/afxdp.rs)
+- [userspace-dp/src/afxdp/session_glue.rs](../userspace-dp/src/afxdp/session_glue.rs)
 
 This is the right general direction. The problem was that validation and cache
 construction logic were spread through the hot packet loop.
@@ -120,7 +120,7 @@ The biggest remaining complexity is in cached-hit execution:
 - same-binding vs cross-binding behavior
 
 That code still lives inline in the packet loop in
-[userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs).
+[userspace-dp/src/afxdp.rs](../userspace-dp/src/afxdp.rs).
 
 This is still harder than it should be for HA work because the control flow of
 "cache hit -> how do we transmit this?" is mixed into the control flow of
@@ -241,8 +241,8 @@ It does **not**:
 
 Those broader problems are covered in:
 
-- [ha-simple-failover-design.md](/home/ps/git/codex-bpfrx/docs/ha-simple-failover-design.md)
-- [userspace-forwarding-and-failover-gap-audit.md](/home/ps/git/codex-bpfrx/docs/userspace-forwarding-and-failover-gap-audit.md)
+- [ha-simple-failover-design.md](./ha-simple-failover-design.md)
+- [userspace-forwarding-and-failover-gap-audit.md](./userspace-forwarding-and-failover-gap-audit.md)
 
 This document is narrower: make the flow cache easier to reason about so it
 stops amplifying HA complexity.
