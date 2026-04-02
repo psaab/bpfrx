@@ -57,6 +57,8 @@ mod bpf_map;
 mod checksum;
 #[path = "afxdp/forwarding.rs"]
 mod forwarding;
+#[path = "afxdp/forwarding_build.rs"]
+mod forwarding_build;
 #[path = "afxdp/frame.rs"]
 mod frame;
 #[path = "afxdp/frame_tx.rs"]
@@ -104,6 +106,7 @@ use self::bind::{
 use self::bpf_map::*;
 use self::checksum::*;
 use self::forwarding::*;
+use self::forwarding_build::*;
 use self::frame::*;
 use self::frame_tx::*;
 use self::gre::{encapsulate_native_gre_frame, try_native_gre_decap_from_frame};
