@@ -346,7 +346,7 @@ Acceptance:
 ### Phase 3: Canonical helper store plus derived indexes
 
 Issue:
-- #320
+- #322
 
 Change:
 - collapse shared session clones into one canonical helper store
@@ -384,7 +384,7 @@ Acceptance:
 
 Issues:
 - #314
-- #322
+- #323
 
 Change:
 - assign a monotonically increasing sequence to canonical session updates
@@ -403,7 +403,7 @@ Acceptance:
 ### Phase 6: Event-first producers, reconciliation-only sweep
 
 Issue:
-- #323
+- #320
 
 Change:
 - helper event stream becomes the steady-state userspace producer
