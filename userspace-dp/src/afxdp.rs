@@ -59,6 +59,8 @@ mod checksum;
 mod forwarding;
 #[path = "afxdp/frame.rs"]
 mod frame;
+#[path = "afxdp/frame_tx.rs"]
+mod frame_tx;
 #[path = "afxdp/gre.rs"]
 mod gre;
 #[path = "afxdp/icmp.rs"]
@@ -101,6 +103,7 @@ use self::bpf_map::*;
 use self::checksum::*;
 use self::forwarding::*;
 use self::frame::*;
+use self::frame_tx::*;
 use self::gre::{encapsulate_native_gre_frame, try_native_gre_decap_from_frame};
 use self::icmp::{build_local_time_exceeded_request, is_icmp_error};
 #[cfg(test)]
