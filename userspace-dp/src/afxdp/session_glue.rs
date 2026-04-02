@@ -376,6 +376,17 @@ pub(super) fn apply_worker_commands(
                     }
                 });
                 for (key, decision, metadata) in forward_candidates {
+                    // Skip sessions already resolved with valid local egress
+                    // (#345). Since #326 resolves sessions on receipt via
+                    // UpsertSynced, most forward sessions already have a
+                    // ForwardCandidate disposition with correct egress. Only
+                    // re-resolve sessions with NoRoute or stale egress.
+                    if decision.resolution.disposition
+                        == super::ForwardingDisposition::ForwardCandidate
+                        && decision.resolution.egress_ifindex > 0
+                    {
+                        continue;
+                    }
                     let flow = SessionFlow {
                         src_ip: key.src_ip,
                         dst_ip: key.dst_ip,

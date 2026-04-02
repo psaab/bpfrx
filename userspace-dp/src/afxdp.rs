@@ -1223,18 +1223,10 @@ impl Coordinator {
                 &activated_rgs,
                 now_secs,
             );
-            let sequence = self
-                .refresh_owner_rgs_seq
-                .fetch_add(1, Ordering::Relaxed)
-                .saturating_add(1);
-            for handle in self.workers.values() {
-                if let Ok(mut pending) = handle.commands.lock() {
-                    pending.push_back(WorkerCommand::RefreshOwnerRGs {
-                        owner_rgs: activated_rgs.clone(),
-                        sequence,
-                    });
-                }
-            }
+            // RefreshOwnerRGs is NOT queued here — the explicit
+            // refresh_owner_rgs RPC from Go's UpdateRGActive() is
+            // sufficient and has worker-completion ack (#314).
+            // Removed duplicate per #342.
         }
     }
 

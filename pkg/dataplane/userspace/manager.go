@@ -2885,6 +2885,12 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 		}
 		if err := m.requestLocked(refreshReq, &refreshStatus); err != nil {
 			slog.Warn("userspace: refresh_owner_rgs failed", "rg", rgID, "err", err)
+			// Don't return error — RG activation (rg_active=true in BPF)
+			// already succeeded above. The refresh is a best-effort
+			// optimization to re-resolve synced sessions with local egress
+			// info. Returning an error here would cause the caller to
+			// think the RG isn't active. The periodic poll will re-resolve
+			// sessions on the next cycle.
 		}
 	}
 	return nil
@@ -3979,7 +3985,9 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 	// as separate calls — so we must not filter them out here (#316).
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_ = m.syncSessionV4Locked("upsert", key, &val)
+	if err := m.syncSessionV4Locked("upsert", key, &val); err != nil {
+		slog.Debug("userspace: session mirror failed", "err", err)
+	}
 	return nil
 }
 
@@ -4026,7 +4034,9 @@ func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val data
 	// Mirror both forward AND reverse — see SetClusterSyncedSessionV4 (#316).
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	_ = m.syncSessionV6Locked("upsert", key, &val)
+	if err := m.syncSessionV6Locked("upsert", key, &val); err != nil {
+		slog.Debug("userspace: session mirror failed", "err", err)
+	}
 	return nil
 }
 
