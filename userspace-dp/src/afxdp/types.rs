@@ -385,28 +385,38 @@ pub(super) struct ForwardingState {
     pub(super) tcp_mss_gre_out: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(super) enum HAForwardingLease {
+    #[default]
+    Inactive,
+    ActiveUntil(u64),
+    SuppressedUntil(u64),
+}
+
+impl HAForwardingLease {
+    pub(super) fn active(self, now_secs: u64) -> bool {
+        matches!(self, Self::ActiveUntil(until) if until != 0 && now_secs <= until)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct HAGroupRuntime {
     pub(super) active: bool,
     pub(super) watchdog_timestamp: u64,
-    pub(super) lease_timestamp: u64,
-    pub(super) demoting: bool,
-    pub(super) demoting_until_secs: u64,
+    pub(super) lease: HAForwardingLease,
 }
 
 impl HAGroupRuntime {
-    pub(super) fn has_valid_lease(self, now_secs: u64) -> bool {
-        self.lease_timestamp != 0
-            && now_secs >= self.lease_timestamp
-            && now_secs.saturating_sub(self.lease_timestamp) <= super::HA_WATCHDOG_STALE_AFTER_SECS
-    }
-
-    pub(super) fn is_demoting(self, now_secs: u64) -> bool {
-        self.demoting && self.demoting_until_secs != 0 && now_secs <= self.demoting_until_secs
+    pub(super) fn active_lease_until(watchdog_timestamp: u64, now_secs: u64) -> HAForwardingLease {
+        HAForwardingLease::ActiveUntil(
+            watchdog_timestamp
+                .max(now_secs)
+                .saturating_add(super::HA_WATCHDOG_STALE_AFTER_SECS),
+        )
     }
 
     pub(super) fn is_forwarding_active(self, now_secs: u64) -> bool {
-        self.active && !self.is_demoting(now_secs) && self.has_valid_lease(now_secs)
+        self.active && self.lease.active(now_secs)
     }
 }
 

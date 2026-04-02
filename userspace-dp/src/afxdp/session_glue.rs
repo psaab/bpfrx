@@ -1588,6 +1588,22 @@ mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
 
+    fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
+        HAGroupRuntime {
+            active: true,
+            watchdog_timestamp: now_secs,
+            lease: HAGroupRuntime::active_lease_until(now_secs, now_secs),
+        }
+    }
+
+    fn inactive_ha_runtime(watchdog_timestamp: u64) -> HAGroupRuntime {
+        HAGroupRuntime {
+            active: false,
+            watchdog_timestamp,
+            lease: HAForwardingLease::Inactive,
+        }
+    }
+
     fn test_resolution() -> ForwardingResolution {
         ForwardingResolution {
             disposition: ForwardingDisposition::ForwardCandidate,
@@ -1780,13 +1796,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: 1,
-                lease_timestamp: 1,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(1),
         );
 
         let shared_entry = SyncedSessionEntry {
@@ -2229,13 +2239,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: 1,
-                lease_timestamp: 1,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(1),
         );
 
         let flow = SessionFlow {
@@ -2327,13 +2331,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: 1,
-                lease_timestamp: 1,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(1),
         );
 
         let flow = SessionFlow {
@@ -2422,13 +2420,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: 0,
-                lease_timestamp: 0,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(0),
         );
 
         let flow = SessionFlow {
@@ -2496,13 +2488,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: 0,
-                lease_timestamp: 0,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(0),
         );
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -2568,13 +2554,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                lease_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(monotonic_nanos() / 1_000_000_000),
         );
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
@@ -2868,13 +2848,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                lease_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
         );
         apply_worker_commands(
             &commands,
@@ -2941,13 +2915,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                lease_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
         );
         apply_worker_commands(
             &commands,
@@ -3021,13 +2989,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                lease_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(monotonic_nanos() / 1_000_000_000),
         );
         let results = apply_worker_commands(
             &commands,
@@ -3093,13 +3055,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                lease_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(monotonic_nanos() / 1_000_000_000),
         );
         let results = apply_worker_commands(
             &commands,
@@ -3277,13 +3233,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: 1,
-                lease_timestamp: 1,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(1),
         );
 
         let reverse =
@@ -3316,23 +3266,11 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: 1,
-                lease_timestamp: 1,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(1),
         );
         ha_state.insert(
             2,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: 1,
-                lease_timestamp: 1,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(1),
         );
 
         let reverse =
@@ -3388,13 +3326,7 @@ mod tests {
         let forwarding = test_forwarding_state_with_fabric();
         let ha_state = BTreeMap::from([(
             1,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: 1,
-                lease_timestamp: 1,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(1),
         )]);
         let resolved = enforce_session_ha_resolution(
             &forwarding,
@@ -3426,13 +3358,7 @@ mod tests {
         let forwarding = test_forwarding_state_split_rgs_with_tunnel();
         let ha_state = BTreeMap::from([(
             2,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: 0,
-                lease_timestamp: 0,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(0),
         )]);
         let resolved = enforce_session_ha_resolution(
             &forwarding,
@@ -3465,13 +3391,7 @@ mod tests {
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let ha_state = BTreeMap::from([(
             2,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: 0,
-                lease_timestamp: 0,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            inactive_ha_runtime(0),
         )]);
         let reverse = build_reverse_session_from_forward_match(
             &forwarding,
@@ -3534,13 +3454,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: 1,
-                lease_timestamp: 1,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(1),
         );
         let entry = SyncedSessionEntry {
             key: test_key(),
@@ -3596,13 +3510,7 @@ mod tests {
         let mut ha_state = BTreeMap::new();
         ha_state.insert(
             2,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: 1,
-                lease_timestamp: 1,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
+            active_ha_runtime(1),
         );
         let mut entry = SyncedSessionEntry {
             key: test_key(),
