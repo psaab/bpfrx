@@ -124,6 +124,45 @@ func TestWrapUserspaceManualFailoverPrepareErrorMarksRetryableBulkSyncNotReady(t
 	}
 }
 
+func TestWrapUserspaceManualFailoverPrepareErrorLeavesTransferNotReadyFatal(t *testing.T) {
+	src := errors.New("session sync transfer not ready before demotion: peer still receiving outbound bulk epoch=4 age=3s")
+	err := wrapUserspaceManualFailoverPrepareError(
+		src,
+	)
+	if err != src {
+		t.Fatalf("expected original fatal error to be preserved, got %v", err)
+	}
+}
+
+func TestUserspaceManualFailoverTransferReadinessErrorPendingBulkAck(t *testing.T) {
+	err := userspaceManualFailoverTransferReadinessError(cluster.TransferReadinessSnapshot{
+		Connected:           true,
+		PendingBulkAckEpoch: 4,
+		PendingBulkAckAge:   3 * time.Second,
+	})
+	if err == nil {
+		t.Fatal("expected transfer readiness error")
+	}
+	if got := err.Error(); got != "session sync transfer not ready before demotion: peer still receiving outbound bulk epoch=4 age=3s" {
+		t.Fatalf("unexpected error: %q", got)
+	}
+}
+
+func TestUserspaceManualFailoverTransferReadinessErrorBulkReceive(t *testing.T) {
+	err := userspaceManualFailoverTransferReadinessError(cluster.TransferReadinessSnapshot{
+		Connected:             true,
+		BulkReceiveInProgress: true,
+		BulkReceiveEpoch:      7,
+		BulkReceiveSessions:   128,
+	})
+	if err == nil {
+		t.Fatal("expected transfer readiness error")
+	}
+	if got := err.Error(); got != "session sync transfer not ready before demotion: local bulk receive still in progress epoch=7 sessions=128" {
+		t.Fatalf("unexpected error: %q", got)
+	}
+}
+
 func TestUserspaceSessionFromDeltaV4CarriesTunnelEndpointMetadata(t *testing.T) {
 	zoneIDs := map[string]uint16{"lan": 1, "sfmix": 2}
 	delta := dpuserspace.SessionDeltaInfo{
@@ -530,23 +569,23 @@ func TestDrainUserspaceSessionDeltasWithConfigDrainsPreparedBatches(t *testing.T
 func TestExportUserspaceOwnerRGSessionsWithConfigQueuesForwardWireAlias(t *testing.T) {
 	exporter := &fakeUserspaceSessionExporter{
 		deltas: []dpuserspace.SessionDeltaInfo{{
-			Event:         "open",
-			AddrFamily:    dataplane.AFInet,
-			Protocol:      6,
-			SrcIP:         "10.0.61.102",
-			DstIP:         "172.16.80.200",
-			SrcPort:       39906,
-			DstPort:       5201,
-			IngressZone:   "lan",
-			EgressZone:    "wan",
-			OwnerRGID:     1,
-			EgressIfindex: 12,
-			TXIfindex:     11,
-			TXVLANID:      80,
-			NeighborMAC:   "aa:bb:cc:dd:ee:ff",
-			SrcMAC:        "02:bf:72:00:50:08",
-			NATSrcIP:      "172.16.80.8",
-			NATSrcPort:    39906,
+			Event:          "open",
+			AddrFamily:     dataplane.AFInet,
+			Protocol:       6,
+			SrcIP:          "10.0.61.102",
+			DstIP:          "172.16.80.200",
+			SrcPort:        39906,
+			DstPort:        5201,
+			IngressZone:    "lan",
+			EgressZone:     "wan",
+			OwnerRGID:      1,
+			EgressIfindex:  12,
+			TXIfindex:      11,
+			TXVLANID:       80,
+			NeighborMAC:    "aa:bb:cc:dd:ee:ff",
+			SrcMAC:         "02:bf:72:00:50:08",
+			NATSrcIP:       "172.16.80.8",
+			NATSrcPort:     39906,
 			FabricRedirect: true,
 		}},
 	}

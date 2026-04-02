@@ -1068,6 +1068,16 @@ func wrapUserspaceManualFailoverPrepareError(err error) error {
 	return err
 }
 
+func userspaceManualFailoverTransferReadinessError(state cluster.TransferReadinessSnapshot) error {
+	if state.ReadyForManualFailover() {
+		return nil
+	}
+	if reason := state.Reason(); reason != "" {
+		return fmt.Errorf("session sync transfer not ready before demotion: %s", reason)
+	}
+	return nil
+}
+
 func (d *Daemon) prepareUserspaceManualFailover(rgID int) error {
 	return wrapUserspaceManualFailoverPrepareError(
 		d.prepareUserspaceRGDemotionWithTimeout(rgID, 15*time.Second),
@@ -1091,6 +1101,9 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		d.releaseUserspaceRGDemotionPrep(rgID)
 		success = true
 		return nil
+	}
+	if err := userspaceManualFailoverTransferReadinessError(d.sessionSync.TransferReadiness()); err != nil {
+		return err
 	}
 
 	// Verify the peer is caught up by sending a barrier. Incremental sync

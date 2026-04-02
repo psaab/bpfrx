@@ -152,6 +152,24 @@ func (s *SessionSync) PendingBulkAck() (epoch uint64, age time.Duration, ok bool
 	return epoch, age, true
 }
 
+// TransferReadiness snapshots the sync state that makes manual failover
+// timing-sensitive: an unacked outbound bulk or an in-progress inbound bulk.
+func (s *SessionSync) TransferReadiness() TransferReadinessSnapshot {
+	snap := TransferReadinessSnapshot{
+		Connected: s.stats.Connected.Load(),
+	}
+	if epoch, age, ok := s.PendingBulkAck(); ok {
+		snap.PendingBulkAckEpoch = epoch
+		snap.PendingBulkAckAge = age
+	}
+	s.bulkMu.Lock()
+	snap.BulkReceiveInProgress = s.bulkInProgress
+	snap.BulkReceiveEpoch = s.bulkRecvEpoch
+	snap.BulkReceiveSessions = len(s.bulkRecvV4) + len(s.bulkRecvV6)
+	s.bulkMu.Unlock()
+	return snap
+}
+
 func (s *SessionSync) sendBarrierAck(conn net.Conn, seq uint64) {
 	// Queue the barrier ack through sendCh so it goes through the
 	// sendLoop in order with session messages. Direct writeMu access

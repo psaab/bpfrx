@@ -122,6 +122,47 @@ type SyncStatsSnapshot struct {
 	LastFenceAckAt int64 // UnixNano (0 = never)
 }
 
+// TransferReadinessSnapshot captures session-sync state that determines
+// whether manual failover can proceed without depending on bootstrap timing.
+type TransferReadinessSnapshot struct {
+	Connected             bool
+	PendingBulkAckEpoch   uint64
+	PendingBulkAckAge     time.Duration
+	BulkReceiveInProgress bool
+	BulkReceiveEpoch      uint64
+	BulkReceiveSessions   int
+}
+
+// ReadyForManualFailover reports whether the sync path is settled enough to
+// use as a manual-failover transport without waiting for bootstrap work.
+func (s TransferReadinessSnapshot) ReadyForManualFailover() bool {
+	return s.PendingBulkAckEpoch == 0 && !s.BulkReceiveInProgress
+}
+
+// Reason explains the current transfer-readiness blocker, if any.
+func (s TransferReadinessSnapshot) Reason() string {
+	switch {
+	case s.PendingBulkAckEpoch != 0:
+		age := s.PendingBulkAckAge
+		if age < 0 {
+			age = 0
+		}
+		return fmt.Sprintf(
+			"peer still receiving outbound bulk epoch=%d age=%s",
+			s.PendingBulkAckEpoch,
+			age.Round(100*time.Millisecond),
+		)
+	case s.BulkReceiveInProgress:
+		return fmt.Sprintf(
+			"local bulk receive still in progress epoch=%d sessions=%d",
+			s.BulkReceiveEpoch,
+			s.BulkReceiveSessions,
+		)
+	default:
+		return ""
+	}
+}
+
 // SessionSync manages TCP-based session state replication between cluster peers.
 type SessionSync struct {
 	localAddr  string // local listen address (e.g. ":4785")

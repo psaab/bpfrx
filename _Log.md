@@ -76,6 +76,10 @@
 
 ## 2026-04-02
 
+- **Timestamp**: 2026-04-02T17:20:00Z
+  - **Action**: Start `#398` fix — add explicit session-sync transfer-readiness snapshot and fast-fail manual failover demotion when bulk receive or pending bulk ack proves the sync path is not settled; filed `#400` for exposing transfer readiness separately from takeover readiness
+  - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_bulk.go, pkg/cluster/sync_test.go, pkg/daemon/daemon_ha.go, pkg/daemon/userspace_sync_test.go
+
 - **Timestamp**: 2026-04-02T16:45:00Z
   - **Action**: Validate `#397` on `loss-userspace-cluster` — settled RG0 manual failover now completes on explicit failover ack + commit ack instead of heartbeat observation; filed residual issue `#398` for failover admission while requester is still in bulk receive
   - **File(s)**: testing-docs/manual-failover-transfer-commit-validation.md, testing-docs/README.md

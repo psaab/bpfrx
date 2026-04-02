@@ -1940,6 +1940,49 @@ func TestPendingBulkAckClearedOnDisconnect(t *testing.T) {
 	}
 }
 
+func TestTransferReadinessReportsPendingBulkAckAndBulkReceive(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.stats.Connected.Store(true)
+	ss.pendingBulkAckEpoch.Store(9)
+	ss.pendingBulkAckSince.Store(time.Now().Add(-1500 * time.Millisecond).UnixNano())
+	ss.bulkMu.Lock()
+	ss.bulkInProgress = true
+	ss.bulkRecvEpoch = 4
+	ss.bulkRecvV4 = map[dataplane.SessionKey]struct{}{
+		{}: {},
+	}
+	ss.bulkRecvV6 = map[dataplane.SessionKeyV6]struct{}{
+		{}: {},
+	}
+	ss.bulkMu.Unlock()
+
+	state := ss.TransferReadiness()
+	if !state.Connected {
+		t.Fatal("expected connected transfer state")
+	}
+	if state.PendingBulkAckEpoch != 9 {
+		t.Fatalf("pending bulk ack epoch = %d, want 9", state.PendingBulkAckEpoch)
+	}
+	if state.PendingBulkAckAge <= 0 {
+		t.Fatalf("pending bulk ack age = %v, want > 0", state.PendingBulkAckAge)
+	}
+	if !state.BulkReceiveInProgress {
+		t.Fatal("expected bulk receive in progress")
+	}
+	if state.BulkReceiveEpoch != 4 {
+		t.Fatalf("bulk receive epoch = %d, want 4", state.BulkReceiveEpoch)
+	}
+	if state.BulkReceiveSessions != 2 {
+		t.Fatalf("bulk receive sessions = %d, want 2", state.BulkReceiveSessions)
+	}
+	if state.ReadyForManualFailover() {
+		t.Fatal("expected transfer state to block manual failover")
+	}
+	if got := state.Reason(); !strings.Contains(got, "peer still receiving outbound bulk epoch=9") {
+		t.Fatalf("unexpected reason: %q", got)
+	}
+}
+
 func TestHandleNewConnectionStartsBulkSyncWhenConnectionBecomesActive(t *testing.T) {
 	dp := &mockSweepDP{
 		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
