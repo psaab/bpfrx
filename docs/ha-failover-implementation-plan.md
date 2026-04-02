@@ -12,29 +12,29 @@ Related docs:
 
 Related issues:
 
-- `#314`
-- `#315`
-- `#316`
-- `#317`
-- `#319`
-- `#321`
-- `#323`
-- `#338`
-- `#339`
-- `#340`
-- `#341`
-- `#342`
-- `#344`
-- `#345`
-- `#347`
-- `#348`
-- `#349`
-- `#358`
-- `#359`
-- `#360`
-- `#389`
-- `#390`
-- `#391`
+- #314
+- #315
+- #316
+- #317
+- #319
+- #321
+- #323
+- #338
+- #339
+- #340
+- #341
+- #342
+- #344
+- #345
+- #347
+- #348
+- #349
+- #358
+- #359
+- #360
+- #389
+- #390
+- #391
 
 ## Goal
 
@@ -91,7 +91,7 @@ avoid dual-secondary and self-repromotion behavior.
 
 Issue:
 
-- `#389` Replace weight-zero manual failover with an explicit RG transfer protocol
+- #389 Replace weight-zero manual failover with an explicit RG transfer protocol
 
 ### 2. Activation still starts dataplane work
 
@@ -112,9 +112,9 @@ cutover.
 
 Issues:
 
-- `#344`
-- `#347`
-- `#391`
+- #344
+- #347
+- #391
 
 ### 3. Helper HA apply still repairs state at cutover
 
@@ -128,9 +128,9 @@ That means cutover is still a "repair then forward" model.
 
 Issues:
 
-- `#358`
-- `#359`
-- `#390`
+- #358
+- #359
+- #390
 
 ### 4. Session sync is continuous, but forwarding readiness is not
 
@@ -143,12 +143,12 @@ Current sync still leaves gaps that must be repaired or reconstructed:
 
 Issues:
 
-- `#315`
-- `#316`
-- `#317`
-- `#319`
-- `#345`
-- `#348`
+- #315
+- #316
+- #317
+- #319
+- #345
+- #348
 
 ### 5. Cutover still depends on transport choreography
 
@@ -166,12 +166,12 @@ Files:
 
 Issues:
 
-- `#323`
-- `#338`
-- `#339`
-- `#340`
-- `#341`
-- `#342`
+- #323
+- #338
+- #339
+- #340
+- #341
+- #342
 
 ## Simpler Architecture
 
@@ -243,12 +243,12 @@ Deliverables:
 
 Primary issues:
 
-- `#323`
-- `#338`
-- `#339`
-- `#340`
-- `#341`
-- `#342`
+- #323
+- #338
+- #339
+- #340
+- #341
+- #342
 
 Dependency:
 
@@ -273,7 +273,7 @@ Deliverables:
 
 Primary issue:
 
-- `#389`
+- #389
 
 Dependencies:
 
@@ -298,11 +298,11 @@ Deliverables:
 
 Primary issues:
 
-- `#315`
-- `#316`
-- `#317`
-- `#319`
-- `#345`
+- #315
+- #316
+- #317
+- #319
+- #345
 
 Dependencies:
 
@@ -326,11 +326,11 @@ Deliverables:
 
 Primary issue:
 
-- `#390`
+- #390
 
 Secondary issue:
 
-- `#321`
+- #321
 
 Dependencies:
 
@@ -354,11 +354,11 @@ Deliverables:
 
 Primary issues:
 
-- `#344`
-- `#347`
-- `#348`
-- `#349`
-- `#391`
+- #344
+- #347
+- #348
+- #349
+- #391
 
 Dependencies:
 
@@ -382,9 +382,9 @@ Deliverables:
 
 Primary issues:
 
-- `#358`
-- `#359`
-- `#360`
+- #358
+- #359
+- #360
 
 Dependencies:
 
