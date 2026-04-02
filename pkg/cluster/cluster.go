@@ -720,10 +720,9 @@ func (m *Manager) FenceStatus() (action string, events []HistoryEvent) {
 	return
 }
 
-// RequestPeerFailover asks the peer to give up primary for the given RG,
-// making the local node primary. Used when "request chassis cluster failover
-// redundancy-group N node <local>" is run — the local node wants to become
-// primary, so the peer must resign.
+// RequestPeerFailover asks the peer to transfer the given RG out of primary,
+// making the local node eligible to become primary. Used when
+// "request chassis cluster failover redundancy-group N node <local>" is run.
 func (m *Manager) RequestPeerFailover(rgID int) error {
 	m.mu.Lock()
 	rg, ok := m.groups[rgID]

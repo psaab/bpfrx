@@ -25,21 +25,22 @@ var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 
 // Sync message types.
 const (
-	syncMsgSessionV4  = 1
-	syncMsgSessionV6  = 2
-	syncMsgDeleteV4   = 3
-	syncMsgDeleteV6   = 4
-	syncMsgBulkStart  = 5
-	syncMsgBulkEnd    = 6
-	syncMsgHeartbeat  = 7
-	syncMsgConfig     = 8  // full config text sync from primary to secondary
-	syncMsgIPsecSA    = 9  // IPsec SA connection names sync
-	syncMsgFailover   = 10 // remote failover request (payload: 1 byte rgID)
-	syncMsgFence      = 11 // peer fencing: receiver should disable all RGs
-	syncMsgClockSync  = 12 // monotonic clock exchange for timestamp rebasing
-	syncMsgBarrier    = 13 // ordered marker for remote install barriers
-	syncMsgBarrierAck = 14
-	syncMsgBulkAck    = 15
+	syncMsgSessionV4   = 1
+	syncMsgSessionV6   = 2
+	syncMsgDeleteV4    = 3
+	syncMsgDeleteV6    = 4
+	syncMsgBulkStart   = 5
+	syncMsgBulkEnd     = 6
+	syncMsgHeartbeat   = 7
+	syncMsgConfig      = 8  // full config text sync from primary to secondary
+	syncMsgIPsecSA     = 9  // IPsec SA connection names sync
+	syncMsgFailover    = 10 // remote failover request (payload: 1 byte rgID)
+	syncMsgFence       = 11 // peer fencing: receiver should disable all RGs
+	syncMsgClockSync   = 12 // monotonic clock exchange for timestamp rebasing
+	syncMsgBarrier     = 13 // ordered marker for remote install barriers
+	syncMsgBarrierAck  = 14
+	syncMsgBulkAck     = 15
+	syncMsgFailoverAck = 16 // failover request result (payload: rgID, status, detail)
 )
 
 // syncHeader is the wire header for each sync message.
@@ -52,6 +53,7 @@ type syncHeader struct {
 
 const syncHeaderSize = 12
 const syncWriteDeadline = 2 * time.Second
+const failoverAckTimeout = 20 * time.Second
 
 // SyncStats tracks session synchronization statistics.
 type SyncStats struct {
@@ -148,10 +150,10 @@ type SessionSync struct {
 	OnIPsecSAReceived func(connectionNames []string)
 
 	// OnRemoteFailover is called when the peer requests us to transfer an RG
-	// out of primary. The callback receives the redundancy group ID. The
-	// receiver should call ManualFailover(rgID) to advertise secondary-hold
-	// for that RG and let the peer claim ownership.
-	OnRemoteFailover func(rgID int)
+	// out of primary. The callback receives the redundancy group ID and
+	// should return whether the transfer-out was applied or rejected so the
+	// requester can treat manual failover as an explicit handshake.
+	OnRemoteFailover func(rgID int) error
 
 	// OnFenceReceived is called when the peer sends a fence message, requesting
 	// this node to disable all RGs (set rg_active=false). The receiver should
@@ -230,7 +232,22 @@ type SessionSync struct {
 	barrierAckSeq  atomic.Uint64
 	barrierWaitMu  sync.Mutex
 	barrierWaiters map[uint64]chan struct{}
+
+	failoverWaitMu  sync.Mutex
+	failoverWaiters map[int]chan failoverAck
 }
+
+type failoverAck struct {
+	status uint8
+	detail string
+}
+
+const (
+	failoverAckApplied uint8 = iota
+	failoverAckRejected
+	failoverAckFailed
+	failoverAckDisconnected
+)
 
 type sessionSyncSweepProfiler interface {
 	SessionSyncSweepProfile() (enabled bool, activeInterval, idleInterval time.Duration)
@@ -252,6 +269,7 @@ func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *Session
 		dp:               dp,
 		sendCh:           make(chan []byte, 4096),
 		deleteJournalCap: deleteJournalDefaultCap,
+		failoverWaiters:  make(map[int]chan failoverAck),
 	}
 }
 
@@ -266,6 +284,7 @@ func NewDualSessionSync(local, peer, local1, peer1 string, dp dataplane.DataPlan
 		dp:               dp,
 		sendCh:           make(chan []byte, 4096),
 		deleteJournalCap: deleteJournalDefaultCap,
+		failoverWaiters:  make(map[int]chan failoverAck),
 	}
 }
 
@@ -978,26 +997,67 @@ func (s *SessionSync) QueueConfig(configText string) {
 	slog.Info("cluster sync: config sent to peer", "size", len(payload))
 }
 
-// SendFailover sends a remote failover request to the peer, asking it to
-// give up primary for the specified redundancy group.
+// SendFailover sends a remote failover request to the peer and waits for
+// an explicit applied/rejected acknowledgement.
 func (s *SessionSync) SendFailover(rgID int) error {
 	conn := s.getActiveConn()
 	if conn == nil {
 		return fmt.Errorf("peer not connected")
 	}
 
+	waitCh := make(chan failoverAck, 1)
+	s.failoverWaitMu.Lock()
+	if _, exists := s.failoverWaiters[rgID]; exists {
+		s.failoverWaitMu.Unlock()
+		return fmt.Errorf("failover request already in flight for redundancy group %d", rgID)
+	}
+	s.failoverWaiters[rgID] = waitCh
+	s.failoverWaitMu.Unlock()
+
 	payload := []byte{byte(rgID)}
 	s.writeMu.Lock()
 	err := writeMsg(conn, syncMsgFailover, payload)
 	s.writeMu.Unlock()
 	if err != nil {
+		s.completeFailoverWait(rgID, failoverAck{
+			status: failoverAckDisconnected,
+			detail: "send failed",
+		})
 		slog.Warn("cluster sync: failover send error", "err", err, "rg", rgID)
 		s.stats.Errors.Add(1)
 		s.handleDisconnect(conn)
 		return fmt.Errorf("failed to send failover request: %w", err)
 	}
 	slog.Info("cluster sync: failover request sent to peer", "rg", rgID)
-	return nil
+	select {
+	case ack := <-waitCh:
+		switch ack.status {
+		case failoverAckApplied:
+			return nil
+		case failoverAckRejected:
+			if ack.detail != "" {
+				return fmt.Errorf("peer rejected failover request for redundancy group %d: %s", rgID, ack.detail)
+			}
+			return fmt.Errorf("peer rejected failover request for redundancy group %d", rgID)
+		case failoverAckFailed:
+			if ack.detail != "" {
+				return fmt.Errorf("peer failed failover request for redundancy group %d: %s", rgID, ack.detail)
+			}
+			return fmt.Errorf("peer failed failover request for redundancy group %d", rgID)
+		default:
+			if ack.detail != "" {
+				return fmt.Errorf("failover request for redundancy group %d aborted: %s", rgID, ack.detail)
+			}
+			return fmt.Errorf("failover request for redundancy group %d aborted", rgID)
+		}
+	case <-time.After(failoverAckTimeout):
+		s.failoverWaitMu.Lock()
+		if current, ok := s.failoverWaiters[rgID]; ok && current == waitCh {
+			delete(s.failoverWaiters, rgID)
+		}
+		s.failoverWaitMu.Unlock()
+		return fmt.Errorf("timed out waiting for peer failover ack for redundancy group %d", rgID)
+	}
 }
 
 // SendFence sends a fence message to the peer, requesting it to disable all
@@ -1535,9 +1595,21 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		}
 		rgID := int(payload[0])
 		slog.Info("cluster sync: remote failover request received", "rg", rgID)
-		if s.OnRemoteFailover != nil {
-			go s.OnRemoteFailover(rgID)
+		go s.handleRemoteFailover(conn, rgID)
+
+	case syncMsgFailoverAck:
+		if len(payload) < 2 {
+			slog.Warn("cluster sync: failover ack message too short")
+			return
 		}
+		rgID := int(payload[0])
+		status := payload[1]
+		detail := string(payload[2:])
+		slog.Info("cluster sync: failover ack received",
+			"rg", rgID,
+			"status", status,
+			"detail", detail)
+		s.completeFailoverWait(rgID, failoverAck{status: status, detail: detail})
 
 	case syncMsgFence:
 		s.stats.FencesReceived.Add(1)
@@ -1603,6 +1675,56 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		// Record fence ack timestamp for status observability (#311).
 		s.stats.LastFenceAckAt.Store(time.Now().UnixNano())
 		s.completeBarrierWait(seq)
+	}
+}
+
+func (s *SessionSync) handleRemoteFailover(conn net.Conn, rgID int) {
+	if s.OnRemoteFailover == nil {
+		s.sendFailoverAck(conn, rgID, failoverAckFailed, "no remote failover handler")
+		return
+	}
+	if err := s.OnRemoteFailover(rgID); err != nil {
+		status := failoverAckFailed
+		if strings.Contains(err.Error(), "not primary") {
+			status = failoverAckRejected
+		}
+		s.sendFailoverAck(conn, rgID, status, err.Error())
+		return
+	}
+	s.sendFailoverAck(conn, rgID, failoverAckApplied, "")
+}
+
+func (s *SessionSync) sendFailoverAck(conn net.Conn, rgID int, status uint8, detail string) {
+	if conn == nil {
+		return
+	}
+	payload := make([]byte, 2+len(detail))
+	payload[0] = byte(rgID)
+	payload[1] = status
+	copy(payload[2:], detail)
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgFailoverAck, payload)
+	s.writeMu.Unlock()
+	if err != nil {
+		slog.Warn("cluster sync: failover ack send error", "err", err, "rg", rgID, "status", status)
+		s.stats.Errors.Add(1)
+		s.handleDisconnect(conn)
+		return
+	}
+	slog.Info("cluster sync: failover ack sent", "rg", rgID, "status", status, "detail", detail)
+}
+
+func (s *SessionSync) completeFailoverWait(rgID int, ack failoverAck) {
+	s.failoverWaitMu.Lock()
+	waiter := s.failoverWaiters[rgID]
+	delete(s.failoverWaiters, rgID)
+	s.failoverWaitMu.Unlock()
+	if waiter == nil {
+		return
+	}
+	select {
+	case waiter <- ack:
+	default:
 	}
 }
 
@@ -1836,15 +1958,28 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		clearedWaiters := len(s.barrierWaiters)
 		s.barrierWaiters = nil
 		s.barrierWaitMu.Unlock()
+		s.failoverWaitMu.Lock()
+		failoverWaiters := s.failoverWaiters
+		clearedFailoverWaiters := len(failoverWaiters)
+		s.failoverWaiters = make(map[int]chan failoverAck)
+		s.failoverWaitMu.Unlock()
+		for _, waiter := range failoverWaiters {
+			select {
+			case waiter <- failoverAck{status: failoverAckDisconnected, detail: "peer disconnected"}:
+			default:
+			}
+			close(waiter)
+		}
 		s.clockSynced.Store(false)
 		s.pendingBulkAckEpoch.Store(0)
 		s.pendingBulkAckSince.Store(0)
 		slog.Info("cluster sync: peer disconnected (all fabrics down)")
-		if pendingBarriers != 0 || ackedBarriers != 0 || clearedWaiters != 0 {
+		if pendingBarriers != 0 || ackedBarriers != 0 || clearedWaiters != 0 || clearedFailoverWaiters != 0 {
 			slog.Info("cluster sync: reset barrier state after disconnect",
 				"pending_seq", pendingBarriers,
 				"acked_seq", ackedBarriers,
-				"cleared_waiters", clearedWaiters)
+				"cleared_waiters", clearedWaiters,
+				"cleared_failover_waiters", clearedFailoverWaiters)
 		}
 		if s.OnPeerDisconnected != nil {
 			go s.OnPeerDisconnected()

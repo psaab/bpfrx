@@ -1391,7 +1391,7 @@ func TestReconcileSkipsEmptyBulk(t *testing.T) {
 
 	dp := &mockSweepDP{
 		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
-			peerOwnedKey: {IsReverse: 0, IngressZone: 2},
+			peerOwnedKey:  {IsReverse: 0, IngressZone: 2},
 			localOwnedKey: {IsReverse: 0, IngressZone: 1},
 		},
 	}
@@ -2129,9 +2129,10 @@ func TestHandleMessageFailoverDoesNotBlockReceiveLoop(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 	started := make(chan int, 1)
 	release := make(chan struct{})
-	ss.OnRemoteFailover = func(rgID int) {
+	ss.OnRemoteFailover = func(rgID int) error {
 		started <- rgID
 		<-release
+		return nil
 	}
 
 	done := make(chan struct{})
@@ -2156,6 +2157,132 @@ func TestHandleMessageFailoverDoesNotBlockReceiveLoop(t *testing.T) {
 	}
 
 	close(release)
+}
+
+func TestSendFailoverWaitsForAck(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ss.SendFailover(7)
+	}()
+
+	var hdrBuf [syncHeaderSize]byte
+	if _, err := io.ReadFull(peer, hdrBuf[:]); err != nil {
+		t.Fatalf("read failover header: %v", err)
+	}
+	if hdrBuf[4] != syncMsgFailover {
+		t.Fatalf("msg type = %d, want %d", hdrBuf[4], syncMsgFailover)
+	}
+	payloadLen := binary.LittleEndian.Uint32(hdrBuf[8:12])
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(peer, payload); err != nil {
+		t.Fatalf("read failover payload: %v", err)
+	}
+	if len(payload) != 1 || payload[0] != 7 {
+		t.Fatalf("payload = %v, want [7]", payload)
+	}
+
+	ss.handleMessage(local, syncMsgFailoverAck, []byte{7, failoverAckApplied})
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SendFailover() error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SendFailover did not complete after ack")
+	}
+}
+
+func TestSendFailoverPropagatesPeerRejection(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ss.SendFailover(3)
+	}()
+
+	var hdrBuf [syncHeaderSize]byte
+	if _, err := io.ReadFull(peer, hdrBuf[:]); err != nil {
+		t.Fatalf("read failover header: %v", err)
+	}
+	payloadLen := binary.LittleEndian.Uint32(hdrBuf[8:12])
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(peer, payload); err != nil {
+		t.Fatalf("read failover payload: %v", err)
+	}
+
+	reason := "not primary for redundancy group 3"
+	ack := append([]byte{3, failoverAckRejected}, []byte(reason)...)
+	ss.handleMessage(local, syncMsgFailoverAck, ack)
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected SendFailover() error")
+		}
+		if !strings.Contains(err.Error(), reason) {
+			t.Fatalf("SendFailover() error = %v, want contains %q", err, reason)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SendFailover did not complete after rejection")
+	}
+}
+
+func TestSendFailoverDisconnectReleasesWaiter(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	local, peer := net.Pipe()
+	defer peer.Close()
+
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ss.SendFailover(4)
+	}()
+
+	var hdrBuf [syncHeaderSize]byte
+	if _, err := io.ReadFull(peer, hdrBuf[:]); err != nil {
+		t.Fatalf("read failover header: %v", err)
+	}
+	payloadLen := binary.LittleEndian.Uint32(hdrBuf[8:12])
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(peer, payload); err != nil {
+		t.Fatalf("read failover payload: %v", err)
+	}
+	go ss.handleDisconnect(local)
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected SendFailover() disconnect error")
+		}
+		if !strings.Contains(err.Error(), "peer disconnected") && !strings.Contains(err.Error(), "aborted") {
+			t.Fatalf("SendFailover() error = %v, want disconnect-style error", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SendFailover did not complete after disconnect")
+	}
 }
 
 func TestSendLoopRetainsQueuedMessageUntilConnectionAvailable(t *testing.T) {
