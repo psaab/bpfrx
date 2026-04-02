@@ -3,6 +3,8 @@ package userspace
 import (
 	"encoding/binary"
 	"net"
+	"os"
+	"os/exec"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -223,6 +225,68 @@ func TestBuildSessionSyncRequestV4PreservesTunnelEndpointIdentity(t *testing.T) 
 	}
 	if req.NeighborMAC != "" || req.SrcMAC != "" {
 		t.Fatalf("unexpected tunnel L2 metadata: %+v", req)
+	}
+}
+
+func TestTakeoverReadyRequiresProvenUserspacePath(t *testing.T) {
+	m := &Manager{
+		proc: &exec.Cmd{Process: &os.Process{Pid: 1}},
+		lastStatus: ProcessStatus{
+			Enabled:         true,
+			ForwardingArmed: true,
+			Capabilities: UserspaceCapabilities{
+				ForwardingSupported: true,
+			},
+		},
+		mode: ModeUserspaceCompat,
+	}
+
+	ready, reasons := m.TakeoverReady()
+	if ready {
+		t.Fatal("TakeoverReady() = true, want false without XSK liveness proof")
+	}
+	if len(reasons) != 1 || reasons[0] != "userspace XSK liveness not proven" {
+		t.Fatalf("unexpected reasons: %v", reasons)
+	}
+
+	m.xskLivenessProven = true
+	ready, reasons = m.TakeoverReady()
+	if !ready {
+		t.Fatalf("TakeoverReady() = false, want true; reasons=%v", reasons)
+	}
+	if len(reasons) != 0 {
+		t.Fatalf("unexpected ready reasons: %v", reasons)
+	}
+}
+
+func TestTakeoverReadyRejectsEBPFOnlyAndFailedLiveness(t *testing.T) {
+	m := &Manager{
+		proc: &exec.Cmd{Process: &os.Process{Pid: 1}},
+		lastStatus: ProcessStatus{
+			Enabled:         true,
+			ForwardingArmed: true,
+			Capabilities: UserspaceCapabilities{
+				ForwardingSupported: true,
+			},
+		},
+		mode:              ModeEBPFOnly,
+		xskLivenessFailed: true,
+	}
+
+	ready, reasons := m.TakeoverReady()
+	if ready {
+		t.Fatal("TakeoverReady() = true, want false")
+	}
+	want := map[string]bool{
+		"userspace dataplane not active":    true,
+		"userspace XSK liveness failed":     true,
+		"userspace XSK liveness not proven": true,
+	}
+	for _, reason := range reasons {
+		delete(want, reason)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing expected reasons, remaining=%v got=%v", want, reasons)
 	}
 }
 

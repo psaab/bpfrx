@@ -2870,13 +2870,15 @@ func (d *Daemon) reconcileRGState() {
 			} else {
 				vrrpReady = true // no VRRP = always ready
 			}
-			ready := ifReady && vrrpReady && fabricReady
+			userspaceReady, userspaceReasons := d.checkUserspaceTakeoverReadiness(rgID)
+			ready := ifReady && vrrpReady && fabricReady && userspaceReady
 			var reasons []string
 			reasons = append(reasons, ifReasons...)
 			reasons = append(reasons, vrrpReasons...)
 			if !fabricReady {
 				reasons = append(reasons, "fabric forwarding path not ready")
 			}
+			reasons = append(reasons, userspaceReasons...)
 			d.cluster.SetRGReady(rgID, ready, reasons)
 		}
 	}
@@ -3556,6 +3558,30 @@ func checkVIPReadinessForConfig(cfg *config.Config, rgID int, linkByName func(st
 		}
 	}
 	return len(reasons) == 0, reasons
+}
+
+func userspaceRGConfigured(cfg *config.Config, rgID int) bool {
+	if cfg == nil || cfg.System.DataplaneType != dataplane.TypeUserspace || rgID <= 0 {
+		return false
+	}
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc != nil && ifc.RedundancyGroup == rgID {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *Daemon) checkUserspaceTakeoverReadiness(rgID int) (bool, []string) {
+	cfg := d.store.ActiveConfig()
+	if !userspaceRGConfigured(cfg, rgID) {
+		return true, nil
+	}
+	um, ok := d.dp.(*dpuserspace.Manager)
+	if !ok {
+		return true, nil
+	}
+	return um.TakeoverReady()
 }
 
 // isNoRethVRRP returns true when no-reth-vrrp is explicitly configured,

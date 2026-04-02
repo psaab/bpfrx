@@ -214,3 +214,38 @@ func TestCheckVIPReadiness_InterfaceUpViaFlags(t *testing.T) {
 		t.Errorf("should be ready with FlagUp, got reasons: %v", reasons)
 	}
 }
+
+func TestUserspaceRGConfigured(t *testing.T) {
+	cfg := &config.Config{
+		System: config.SystemConfig{
+			DataplaneType: "userspace",
+		},
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {
+					Name:            "reth0",
+					RedundancyGroup: 1,
+				},
+				"reth1": {
+					Name:            "reth1",
+					RedundancyGroup: 2,
+				},
+			},
+		},
+	}
+
+	if !userspaceRGConfigured(cfg, 1) {
+		t.Fatal("userspaceRGConfigured(cfg, 1) = false, want true")
+	}
+	if userspaceRGConfigured(cfg, 0) {
+		t.Fatal("userspaceRGConfigured(cfg, 0) = true, want false for RG0")
+	}
+	if userspaceRGConfigured(cfg, 3) {
+		t.Fatal("userspaceRGConfigured(cfg, 3) = true, want false for missing RG")
+	}
+
+	cfg.System.DataplaneType = ""
+	if userspaceRGConfigured(cfg, 1) {
+		t.Fatal("userspaceRGConfigured(non-userspace, 1) = true, want false")
+	}
+}

@@ -95,3 +95,7 @@
 - **Timestamp**: 2026-04-02T06:00:00Z
   - **Action**: Merged PR #357 (flow cache simplification refactors). Implemented phases 3+4 from docs/flow-cache-simplification.md — explicit is_cacheable() + 10 unit tests (624a1f83)
   - **File(s)**: userspace-dp/src/afxdp/types.rs, docs/flow-cache-simplification.md
+
+- **Timestamp**: 2026-04-02T12:30:00Z
+  - **Action**: Gate HA takeover on proven userspace dataplane readiness and remove activation-time NAPI bootstrap from `UpdateRGActive()` (#391)
+  - **File(s)**: pkg/dataplane/userspace/manager_ha.go, pkg/dataplane/userspace/manager_test.go, pkg/daemon/daemon_ha.go, pkg/daemon/vip_readiness_test.go
