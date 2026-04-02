@@ -127,8 +127,8 @@ func TestUpdateConfig_PreservesState(t *testing.T) {
 	if !states[0].ManualFailover {
 		t.Error("RG 0 manual failover should be preserved")
 	}
-	if states[0].State != StateSecondary {
-		t.Errorf("RG 0 state = %s, want secondary (manual failover)", states[0].State)
+	if states[0].State != StateSecondaryHold {
+		t.Errorf("RG 0 state = %s, want secondary-hold (manual failover)", states[0].State)
 	}
 	if !states[0].Preempt {
 		t.Error("RG 0 preempt should be updated to true")
@@ -274,8 +274,8 @@ func TestManualFailover(t *testing.T) {
 	}
 
 	states := m.GroupStates()
-	if states[0].State != StateSecondary {
-		t.Errorf("state = %s, want secondary after failover", states[0].State)
+	if states[0].State != StateSecondaryHold {
+		t.Errorf("state = %s, want secondary-hold after failover", states[0].State)
 	}
 	if !states[0].ManualFailover {
 		t.Error("ManualFailover should be true")
@@ -283,16 +283,17 @@ func TestManualFailover(t *testing.T) {
 	if states[0].FailoverCount != 1 {
 		t.Errorf("failover count = %d, want 1", states[0].FailoverCount)
 	}
-	// Weight must be 0 so peer election sees "Peer weight 0" and elects itself primary.
-	if states[0].Weight != 0 {
-		t.Errorf("weight = %d, want 0 after manual failover", states[0].Weight)
+	// Weight stays monitor-derived; the peer now sees an explicit
+	// transfer-out state instead of relying on weight=0.
+	if states[0].Weight != 255 {
+		t.Errorf("weight = %d, want 255 after manual failover", states[0].Weight)
 	}
 
 	// Failover event should be emitted.
 	select {
 	case ev := <-m.Events():
-		if ev.OldState != StatePrimary || ev.NewState != StateSecondary {
-			t.Errorf("event = %v->%v, want primary->secondary", ev.OldState, ev.NewState)
+		if ev.OldState != StatePrimary || ev.NewState != StateSecondaryHold {
+			t.Errorf("event = %v->%v, want primary->secondary-hold", ev.OldState, ev.NewState)
 		}
 	default:
 		t.Error("expected failover event")
@@ -372,8 +373,8 @@ func TestManualFailover_RetryablePreHookRetriesThenSucceeds(t *testing.T) {
 		t.Fatalf("attempts = %d, want 3", attempts)
 	}
 	states := m.GroupStates()
-	if states[0].State != StateSecondary {
-		t.Fatalf("state = %s, want secondary after manual failover", states[0].State)
+	if states[0].State != StateSecondaryHold {
+		t.Fatalf("state = %s, want secondary-hold after manual failover", states[0].State)
 	}
 	if !states[0].ManualFailover {
 		t.Fatal("manual failover should be set after successful retry")

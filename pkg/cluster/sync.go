@@ -147,9 +147,10 @@ type SessionSync struct {
 	// On failover, the new primary calls swanctl --initiate for each connection name.
 	OnIPsecSAReceived func(connectionNames []string)
 
-	// OnRemoteFailover is called when the peer requests us to failover an RG.
-	// The callback receives the redundancy group ID. The receiver should call
-	// ManualFailover(rgID) to give up primary for that RG.
+	// OnRemoteFailover is called when the peer requests us to transfer an RG
+	// out of primary. The callback receives the redundancy group ID. The
+	// receiver should call ManualFailover(rgID) to advertise secondary-hold
+	// for that RG and let the peer claim ownership.
 	OnRemoteFailover func(rgID int)
 
 	// OnFenceReceived is called when the peer sends a fence message, requesting
@@ -1604,7 +1605,6 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		s.completeBarrierWait(seq)
 	}
 }
-
 
 func (s *SessionSync) WaitForIdle(timeout time.Duration, stableSamples int, sampleInterval time.Duration) error {
 	if stableSamples <= 0 {

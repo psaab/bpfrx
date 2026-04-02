@@ -76,6 +76,10 @@
 
 ## 2026-04-02
 
+- **Timestamp**: 2026-04-02T12:30:00Z
+  - **Action**: First #390 slice — replace weight-zero manual failover with explicit secondary-hold transfer-out state, keep ForceSecondary on zero-weight drain semantics, and teach election to promote on peer transfer-out without mutating monitor weight
+  - **File(s)**: pkg/cluster/cluster.go, pkg/cluster/election.go, pkg/cluster/cluster_test.go, pkg/cluster/election_test.go, pkg/cluster/sync.go
+
 - **Timestamp**: 2026-04-02T01:30:00Z
   - **Action**: Merged PR #337 (HA simple failover design doc). Fixed copilot review — issue reference swap in phases 3/5/6.
   - **File(s)**: docs/ha-simple-failover-design.md

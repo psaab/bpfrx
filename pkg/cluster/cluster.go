@@ -615,7 +615,10 @@ func (m *Manager) IsLocalPrimaryAny() bool {
 	return false
 }
 
-// ManualFailover forces a redundancy group to failover.
+// ManualFailover forces a redundancy group to transfer out of primary.
+// Unlike ForceSecondary, this preserves the group's monitor-derived weight
+// and advertises an explicit transfer-out state so the peer can claim
+// primary without relying on weight-zero election semantics.
 func (m *Manager) ManualFailover(rgID int) error {
 	m.mu.Lock()
 	rg, ok := m.groups[rgID]
@@ -667,8 +670,7 @@ func (m *Manager) ManualFailover(rgID int) error {
 	oldState := rg.State
 	rg.ManualFailover = true
 	rg.ManualFailoverAt = time.Now()
-	rg.Weight = 0 // zero weight so peer election sees "Peer weight 0" → becomes primary
-	rg.State = StateSecondary
+	rg.State = StateSecondaryHold
 	rg.FailoverCount++
 	if oldState != rg.State {
 		m.sendEvent(rg.GroupID, oldState, rg.State, "Manual failover")
@@ -1117,8 +1119,8 @@ func (m *Manager) handlePeerTimeout() {
 
 	// Clear ManualFailover on all RGs: the peer is dead, so the surviving
 	// node MUST be able to take over. Without this, a previous manual
-	// failover (which set Weight=0) prevents electSingleNode from
-	// promoting this node to primary.
+	// transfer-out would keep the local node parked in secondary-hold even
+	// though there is no longer a peer to hand ownership to.
 	for _, rg := range m.groups {
 		if rg.ManualFailover {
 			slog.Info("cluster: clearing manual failover (peer lost)", "rg", rg.GroupID)

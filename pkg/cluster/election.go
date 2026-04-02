@@ -20,7 +20,7 @@ func EffectivePriority(basePriority, weight int) int {
 type electionResult int
 
 const (
-	electLocalPrimary  electionResult = iota // local node should be primary
+	electLocalPrimary   electionResult = iota // local node should be primary
 	electLocalSecondary                       // local node should be secondary
 	electNoChange                             // no state change needed
 )
@@ -38,29 +38,33 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 		return electNoChange, ""
 	}
 
-	// ManualFailover normally blocks election (stays secondary until reset).
-	// Exception: if the peer has also resigned (weight 0), both nodes are
-	// secondary and neither can serve traffic. Clear ManualFailover and
-	// restore weight to allow election, avoiding a dual-secondary deadlock
-	// during rapid failover cycles where one node resigns before the
-	// previous cycle's ManualFailover flag is cleared.
+	clearedManualFailover := false
+
+	// ManualFailover normally blocks election (stays secondary-hold until
+	// reset). Exception: if the peer has also explicitly transferred out or
+	// already resigned with weight 0, both nodes can end up parked as
+	// non-owners. Clear ManualFailover and restore normal election after a
+	// short guard window so one node can reclaim primary.
 	//
 	// Time guard: only clear after 2s to prevent re-promoting a node that
-	// JUST resigned. Without this, the resigned node sees stale peer
-	// weight=0 (from a previous cycle) and immediately re-elects itself
-	// as primary, defeating the resignation.
+	// JUST transferred out. Without this, the resigned node sees stale peer
+	// transfer-out or weight=0 state and immediately re-elects itself as
+	// primary, defeating the handoff.
 	if rg.ManualFailover {
-		if peerGroup == nil || peerGroup.Weight > 0 {
+		peerResigned := peerGroup != nil && peerGroup.Weight <= 0
+		peerTransferOut := peerGroup != nil && peerGroup.State == StateSecondaryHold
+		if !peerResigned && !peerTransferOut {
 			return electNoChange, ""
 		}
 		if time.Since(rg.ManualFailoverAt) < 2*time.Second {
 			return electNoChange, ""
 		}
-		// Peer weight 0 for >2s — both nodes resigned. Clear
-		// ManualFailover and restore weight so election can promote
-		// one of them.
-		slog.Info("cluster: clearing manual failover (peer also resigned)",
-			"rg", rg.GroupID)
+		// The peer has also yielded for >2s. Clear manual failover and
+		// restore weight so normal election can promote one node.
+		slog.Info("cluster: clearing manual failover (peer also yielded)",
+			"rg", rg.GroupID,
+			"peer_state", peerGroup.State.String(),
+			"peer_weight", peerGroup.Weight)
 		rg.ManualFailover = false
 		rg.ManualFailoverAt = time.Time{}
 		// Recalculate weight inline (recalcWeight calls runElection
@@ -74,6 +78,7 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 		if rg.Weight < 0 {
 			rg.Weight = 0
 		}
+		clearedManualFailover = true
 	}
 
 	localWeight := rg.Weight
@@ -122,6 +127,18 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 	if peerWeight <= 0 {
 		if rg.State != StatePrimary {
 			return electLocalPrimary, "Peer weight 0"
+		}
+		return electNoChange, ""
+	}
+
+	// An explicit peer transfer-out should hand ownership to us without
+	// mutating the peer's monitor-derived weight. If both sides had been in
+	// manual transfer-out and we just cleared our own guard, fall through to
+	// normal priority/tie-break election instead of unconditionally claiming
+	// primary on both nodes.
+	if peerGroup.State == StateSecondaryHold && !clearedManualFailover {
+		if rg.State != StatePrimary {
+			return electLocalPrimary, "Peer transfer out"
 		}
 		return electNoChange, ""
 	}

@@ -12,13 +12,13 @@ func TestEffectivePriority(t *testing.T) {
 	tests := []struct {
 		base, weight, want int
 	}{
-		{200, 255, 200},   // full weight
-		{200, 0, 0},       // zero weight
-		{200, 128, 100},   // half weight (200*128/255 = 100)
-		{100, 255, 100},   // full weight, lower priority
-		{255, 255, 255},   // max everything
-		{0, 255, 0},       // zero priority
-		{200, -1, 0},      // negative weight → 0
+		{200, 255, 200}, // full weight
+		{200, 0, 0},     // zero weight
+		{200, 128, 100}, // half weight (200*128/255 = 100)
+		{100, 255, 100}, // full weight, lower priority
+		{255, 255, 255}, // max everything
+		{0, 255, 0},     // zero priority
+		{200, -1, 0},    // negative weight → 0
 	}
 	for _, tt := range tests {
 		got := EffectivePriority(tt.base, tt.weight)
@@ -240,29 +240,54 @@ func TestElection_ManualFailover_Preserved(t *testing.T) {
 	}
 }
 
+func TestElection_PeerSecondaryHold_BecomesPrimary(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	m.mu.Lock()
+	m.groups[0].State = StateSecondary
+	m.mu.Unlock()
+
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StateSecondaryHold)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+
+	if !m.IsLocalPrimary(0) {
+		t.Error("should become primary when peer explicitly transfers out")
+	}
+}
+
 func TestElection_DualResign_TimeGuard(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
 	m.UpdateConfig(cfg)
 	<-m.Events()
 
-	// Manual failover — just set, should NOT clear even if peer weight=0.
+	// Manual failover — just set, should NOT clear even if peer is also in
+	// transfer-out state.
 	m.ManualFailover(0)
 	drainEvents(m, 1)
 
-	// Peer also resigned (weight 0).
+	// Peer also transferred out.
 	pkt := &HeartbeatPacket{
 		NodeID:    1,
 		ClusterID: 1,
 		Groups: []HeartbeatGroup{
-			{GroupID: 0, Priority: 100, Weight: 0, State: uint8(StateSecondary)},
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StateSecondaryHold)},
 		},
 	}
 	m.handlePeerHeartbeat(pkt)
 
 	// Within 2s time guard — should stay secondary.
 	if m.IsLocalPrimary(0) {
-		t.Error("should stay secondary within time guard (just resigned)")
+		t.Error("should stay secondary within time guard (just transferred out)")
 	}
 
 	// Backdate the ManualFailoverAt to simulate >2s elapsed.
@@ -273,9 +298,10 @@ func TestElection_DualResign_TimeGuard(t *testing.T) {
 	// Now re-trigger election via heartbeat.
 	m.handlePeerHeartbeat(pkt)
 
-	// After time guard, dual-resign should clear ManualFailover → primary.
+	// After time guard, dual transfer-out should clear ManualFailover and
+	// fall back to normal election.
 	if !m.IsLocalPrimary(0) {
-		t.Error("should become primary after time guard expires (dual-resign deadlock recovery)")
+		t.Error("should become primary after time guard expires (dual transfer-out recovery)")
 	}
 }
 
@@ -678,8 +704,8 @@ func TestRGInterfaceReady(t *testing.T) {
 		{
 			ID: 0,
 			InterfaceMonitors: []*config.InterfaceMonitor{
-				{Interface: "ge-0/0/0", Weight: 255},  // local (slot 0 → node 0)
-				{Interface: "ge-7/0/0", Weight: 128},  // peer  (slot 7 → node 1)
+				{Interface: "ge-0/0/0", Weight: 255}, // local (slot 0 → node 0)
+				{Interface: "ge-7/0/0", Weight: 128}, // peer  (slot 7 → node 1)
 			},
 		},
 	}
@@ -759,7 +785,7 @@ func TestElection_NonPreemptDualActive_LowerPriorityYields(t *testing.T) {
 func TestElection_NonPreemptDualActive_TieBreakNodeID(t *testing.T) {
 	// Both primary, same priority, non-preempt.
 	// Higher node ID must yield.
-	m := NewManager(1, 1) // We are node 1 (higher)
+	m := NewManager(1, 1)                                    // We are node 1 (higher)
 	cfg := makeConfig(makeRG(0, false, map[int]int{1: 200})) // non-preempt
 	m.UpdateConfig(cfg)
 	<-m.Events()
@@ -817,7 +843,7 @@ func TestElection_NonPreemptDualActive_WinnerStays(t *testing.T) {
 func TestElection_NonPreemptDualActive_PreemptSelfResolves(t *testing.T) {
 	// Regression guard: preempt mode already handles dual-active via
 	// priority comparison — ensure it still works.
-	m := NewManager(1, 1) // We are node 1 (higher)
+	m := NewManager(1, 1)                                   // We are node 1 (higher)
 	cfg := makeConfig(makeRG(0, true, map[int]int{1: 100})) // preempt enabled
 	m.UpdateConfig(cfg)
 	<-m.Events()
