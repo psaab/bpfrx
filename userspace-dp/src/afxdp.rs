@@ -1362,13 +1362,26 @@ impl Coordinator {
     }
 
     pub fn ha_groups(&self) -> Vec<HAGroupStatus> {
+        let now_secs = monotonic_nanos() / 1_000_000_000;
         self.ha_state
             .load()
             .iter()
-            .map(|(rg_id, runtime)| HAGroupStatus {
-                rg_id: *rg_id,
-                active: runtime.active,
-                watchdog_timestamp: runtime.watchdog_timestamp,
+            .map(|(rg_id, runtime)| {
+                let (lease_state, lease_until) = match runtime.lease {
+                    HAForwardingLease::Inactive => ("inactive".to_string(), 0),
+                    HAForwardingLease::ActiveUntil(until) => ("active".to_string(), until),
+                    HAForwardingLease::SuppressedUntil(until) => {
+                        ("suppressed".to_string(), until)
+                    }
+                };
+                HAGroupStatus {
+                    rg_id: *rg_id,
+                    active: runtime.active,
+                    watchdog_timestamp: runtime.watchdog_timestamp,
+                    forwarding_active: runtime.is_forwarding_active(now_secs),
+                    lease_state,
+                    lease_until,
+                }
             })
             .collect()
     }
@@ -6647,6 +6660,7 @@ mod tests {
                 rg_id: 1,
                 active: true,
                 watchdog_timestamp: 22,
+                ..HAGroupStatus::default()
             }])
             .expect("update ha state");
 
@@ -6667,6 +6681,7 @@ mod tests {
                 rg_id: 1,
                 active: true,
                 watchdog_timestamp: 0,
+                ..HAGroupStatus::default()
             }])
             .expect("update ha state");
 
@@ -6704,6 +6719,41 @@ mod tests {
         let state = coordinator.ha_state.load();
         let group = state.get(&1).expect("ha group");
         assert!(matches!(group.lease, HAForwardingLease::ActiveUntil(_)));
+    }
+
+    #[test]
+    fn ha_groups_reports_forwarding_lease_status() {
+        let coordinator = Coordinator::new();
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        coordinator.ha_state.store(Arc::new(BTreeMap::from([
+            (1, active_ha_runtime(now_secs)),
+            (2, suppressed_ha_runtime(now_secs, now_secs + 5)),
+            (3, inactive_ha_runtime(0)),
+        ])));
+
+        let groups = coordinator.ha_groups();
+
+        assert!(groups.iter().any(|group| {
+            group.rg_id == 1
+                && group.active
+                && group.forwarding_active
+                && group.lease_state == "active"
+                && group.lease_until >= now_secs
+        }));
+        assert!(groups.iter().any(|group| {
+            group.rg_id == 2
+                && group.active
+                && !group.forwarding_active
+                && group.lease_state == "suppressed"
+                && group.lease_until >= now_secs + 1
+        }));
+        assert!(groups.iter().any(|group| {
+            group.rg_id == 3
+                && !group.active
+                && !group.forwarding_active
+                && group.lease_state == "inactive"
+                && group.lease_until == 0
+        }));
     }
 
     #[test]

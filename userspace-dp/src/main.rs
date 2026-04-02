@@ -752,6 +752,16 @@ struct HAGroupStatus {
     active: bool,
     #[serde(rename = "watchdog_timestamp", default)]
     watchdog_timestamp: u64,
+    #[serde(rename = "forwarding_active", default)]
+    forwarding_active: bool,
+    #[serde(rename = "lease_state", default, skip_serializing_if = "String::is_empty")]
+    lease_state: String,
+    #[serde(rename = "lease_until", default, skip_serializing_if = "u64_is_zero")]
+    lease_until: u64,
+}
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
