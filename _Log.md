@@ -73,3 +73,21 @@
 - **Timestamp**: 2026-04-01T23:30:00Z
   - **Action**: Unify synced flag + adaptive event-first session sync (#328, #320) (dcc59c67)
   - **File(s)**: pkg/daemon/daemon.go, userspace-dp/src/afxdp.rs, userspace-dp/src/afxdp/bpf_map.rs, userspace-dp/src/afxdp/forwarding.rs, userspace-dp/src/afxdp/session_glue.rs, userspace-dp/src/afxdp/tunnel.rs, userspace-dp/src/event_stream.rs, userspace-dp/src/main.rs, userspace-dp/src/session.rs
+
+## 2026-04-02
+
+- **Timestamp**: 2026-04-02T01:30:00Z
+  - **Action**: Merged PR #337 (HA simple failover design doc). Fixed copilot review — issue reference swap in phases 3/5/6.
+  - **File(s)**: docs/ha-simple-failover-design.md
+
+- **Timestamp**: 2026-04-02T02:00:00Z
+  - **Action**: Fix HA activation cleanup — deduplicate refresh, skip resolved, log mirror errors (#341, #342, #345, #346) (31b600d5)
+  - **File(s)**: pkg/dataplane/userspace/manager.go, userspace-dp/src/afxdp.rs, userspace-dp/src/afxdp/session_glue.rs
+
+- **Timestamp**: 2026-04-02T02:30:00Z
+  - **Action**: Fix watchdog threshold (2→10s), reverse companion leak on delete, remove debug eprintln (#349, #351, #352) (52254b7e)
+  - **File(s)**: pkg/dataplane/userspace/manager.go, userspace-dp/src/afxdp.rs, userspace-dp/src/main.rs
+
+- **Timestamp**: 2026-04-02T03:30:00Z
+  - **Action**: Simplify HA — remove refresh RPC, skip blackhole routes, dead code cleanup, throttle post-transition sync (#353, #354, #355, #356) (5ac423a3)
+  - **File(s)**: pkg/dataplane/userspace/manager.go, pkg/daemon/daemon.go
