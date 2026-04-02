@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -90,9 +91,10 @@ type Manager struct {
 
 	mode           DataplaneMode // current active runtime mode
 	configuredMode DataplaneMode // user-configured desired mode (from config)
-	lastHASyncTime time.Time    // throttle HA watchdog sync to avoid control socket contention
+	lastHASyncTime      time.Time // throttle HA watchdog sync to avoid control socket contention
+	lastRGActivateTime  time.Time // wall clock of last update_ha_state; statusLoop skips HA sync for 2s
 
-	pendingRGTransitions map[int]bool // per-RG: set before syncHAStateLocked, cleared on completion
+	rgTransitionInFlight atomic.Bool // set before syncHAStateLocked, cleared on completion
 
 	// Counter delta tracking: previous binding counter totals for computing
 	// deltas to write into BPF counter maps (#332).
@@ -113,9 +115,8 @@ func New() *Manager {
 	return &Manager{
 		DataPlane:            inner,
 		inner:                inner,
-		configuredMode:       ModeUserspaceCompat,
-		haGroups:             make(map[int]HAGroupStatus),
-		pendingRGTransitions: make(map[int]bool),
+		configuredMode: ModeUserspaceCompat,
+		haGroups:       make(map[int]HAGroupStatus),
 	}
 }
 
@@ -349,18 +350,6 @@ func (m *Manager) syncInterfaceAttachments(result *dataplane.CompileResult, snap
 	}
 }
 
-// hasAnyInactiveRG returns true if any configured RG is currently inactive
-// on this node. Used to keep ctrl disabled so the eBPF pipeline handles
-// fabric redirect — the eBPF pipeline checks rg_active per-packet, while
-// the userspace flow cache does not and would forward stale traffic locally.
-func (m *Manager) hasAnyInactiveRG() bool {
-	for _, group := range m.haGroups {
-		if group.RGID > 0 && !group.Active {
-			return true
-		}
-	}
-	return false
-}
 
 // bpfKtimeNs returns the current CLOCK_BOOTTIME in nanoseconds, matching
 // the clock used by BPF's bpf_ktime_get_ns() for session Created timestamps.
@@ -2840,8 +2829,8 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	// sends the same state → no delta detected → no FlushFlowCaches.
 	// By sending directly with the groups we already have, we guarantee
 	// the helper sees the transition.
-	m.pendingRGTransitions[rgID] = true
-	defer delete(m.pendingRGTransitions, rgID)
+	m.rgTransitionInFlight.Store(true)
+	defer m.rgTransitionInFlight.Store(false)
 	groups := make([]HAGroupStatus, 0, len(m.haGroups))
 	for _, g := range m.haGroups {
 		groups = append(groups, g)
@@ -2865,34 +2854,11 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	if err := m.requestLocked(req, &status); err != nil {
 		return err
 	}
+	m.lastRGActivateTime = time.Now()
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return err
 	}
 
-	// Explicitly refresh sessions for activated RGs. The delta detection
-	// in the helper's update_ha_state may miss the activation if the
-	// periodic poll already synced the new state. This direct call
-	// guarantees RefreshOwnerRGs runs, re-resolving synced sessions with
-	// local egress info so SNAT/forwarding works on the new owner.
-	if active && m.proc != nil {
-		slog.Info("userspace: explicit refresh_owner_rgs on activation", "rg", rgID)
-		var refreshStatus ProcessStatus
-		refreshReq := ControlRequest{
-			Type: "refresh_owner_rgs",
-			HADemotionPrepare: &HADemotionPrepareRequest{
-				Groups: []int{rgID},
-			},
-		}
-		if err := m.requestLocked(refreshReq, &refreshStatus); err != nil {
-			slog.Warn("userspace: refresh_owner_rgs failed", "rg", rgID, "err", err)
-			// Don't return error — RG activation (rg_active=true in BPF)
-			// already succeeded above. The refresh is a best-effort
-			// optimization to re-resolve synced sessions with local egress
-			// info. Returning an error here would cause the caller to
-			// think the RG isn't active. The periodic poll will re-resolve
-			// sessions on the next cycle.
-		}
-	}
 	return nil
 }
 
@@ -3084,7 +3050,7 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 		FIBGeneration:      status.LastFIBGeneration,
 		HeartbeatTimeoutMS: 30000,
 	}
-	if status.Enabled && len(m.pendingRGTransitions) > 0 {
+	if status.Enabled && m.rgTransitionInFlight.Load() {
 		// One or more RG transitions are in progress and the helper hasn't
 		// acked the HA state update yet. Keep ctrl disabled until
 		// syncHAStateLocked succeeds to avoid re-enabling ctrl during the
@@ -4798,20 +4764,24 @@ func (m *Manager) statusLoop(ctx context.Context) {
 				if err := m.applyHelperStatusLocked(&status); err != nil {
 					slog.Warn("userspace dataplane status sync failed", "err", err)
 				}
-				if err := m.syncSnapshotLocked(); err != nil {
-					slog.Warn("userspace dataplane snapshot sync failed", "err", err)
+				if m.lastSnapshot != nil && m.publishedSnapshot < m.lastSnapshot.Generation {
+					if err := m.syncSnapshotLocked(); err != nil {
+						slog.Warn("userspace dataplane snapshot sync failed", "err", err)
+					}
 				}
 				helperActiveSig := activeHAGroupSignatureSlice(status.HAGroups)
 				if m.clusterHA {
 					_ = m.refreshHAStateFromMapsLocked()
 				}
 				newActiveSig := activeHAGroupSignature(m.haGroups)
-				if m.clusterHA && newActiveSig != "" {
+				if m.clusterHA && newActiveSig != "" && time.Since(m.lastRGActivateTime) >= 2*time.Second {
 					// Only sync watchdog updates to the helper from the poll.
 					// Do NOT sync active/inactive transitions here — that's
 					// handled by UpdateRGActive which must be the sole source
 					// of demotion/activation deltas. If the poll syncs first,
 					// the helper sees no delta and skips FlushFlowCaches.
+					// Skip entirely for 2s after UpdateRGActive to avoid
+					// control socket contention during post-transition work.
 					if helperActiveSig != newActiveSig || newActiveSig != prevActiveSig {
 						// Sync watchdog timestamps only (HA state update
 						// without active/inactive change detection).

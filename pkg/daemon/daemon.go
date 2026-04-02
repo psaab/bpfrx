@@ -6778,9 +6778,6 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				// already superseded this transition.
 				if tr.Changed && d.dp != nil {
 					cur, _ := s.CurrentDesired()
-					if !cur {
-						d.tryPrepareUserspaceRGDemotion(ev.GroupID)
-					}
 					if err := d.dp.UpdateRGActive(ev.GroupID, cur); err != nil {
 						slog.Warn("failed to update rg_active from cluster event",
 							"rg", ev.GroupID, "active", cur, "err", err)
@@ -7324,11 +7321,25 @@ func rethInterfacesForRG(cfg *config.Config, rgID int) []string {
 	return names
 }
 
+// userspaceDataplaneActive returns true when the userspace dataplane is
+// running in a mode that handles forwarding (not eBPF-only). Callers use
+// this to skip eBPF-specific workarounds (blackhole routes) that the
+// userspace pipeline doesn't need.
+func (d *Daemon) userspaceDataplaneActive() bool {
+	if um, ok := d.dp.(*dpuserspace.Manager); ok {
+		return um.Mode() != dpuserspace.ModeEBPFOnly
+	}
+	return false
+}
+
 // injectBlackholeRoutes adds blackhole routes for RETH subnets of the given
 // RG. Called on VRRP BACKUP transition — prevents bpf_fib_lookup from routing
 // return traffic via the default route (which would escape via WAN). Instead,
 // FIB returns BLACKHOLE and the BPF failure handler triggers fabric redirect.
 func (d *Daemon) injectBlackholeRoutes(rgID int) {
+	if d.userspaceDataplaneActive() {
+		return
+	}
 	d.blackholeMu.Lock()
 	defer d.blackholeMu.Unlock()
 
@@ -7382,6 +7393,9 @@ func (d *Daemon) injectBlackholeRoutes(rgID int) {
 // given RG. Called on VRRP MASTER transition — the connected route returns
 // naturally when the VIP is added back.
 func (d *Daemon) removeBlackholeRoutes(rgID int) {
+	if d.userspaceDataplaneActive() {
+		return
+	}
 	d.blackholeMu.Lock()
 	defer d.blackholeMu.Unlock()
 
