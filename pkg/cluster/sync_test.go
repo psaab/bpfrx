@@ -2137,7 +2137,10 @@ func TestHandleMessageFailoverDoesNotBlockReceiveLoop(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		ss.handleMessage(nil, syncMsgFailover, []byte{7})
+		payload := make([]byte, 9)
+		payload[0] = 7
+		binary.LittleEndian.PutUint64(payload[1:9], 11)
+		ss.handleMessage(nil, syncMsgFailover, payload)
 		close(done)
 	}()
 
@@ -2187,11 +2190,16 @@ func TestSendFailoverWaitsForAck(t *testing.T) {
 	if _, err := io.ReadFull(peer, payload); err != nil {
 		t.Fatalf("read failover payload: %v", err)
 	}
-	if len(payload) != 1 || payload[0] != 7 {
-		t.Fatalf("payload = %v, want [7]", payload)
+	if len(payload) != 9 || payload[0] != 7 {
+		t.Fatalf("payload = %v, want rg=7 with req_id", payload)
 	}
+	reqID := binary.LittleEndian.Uint64(payload[1:9])
 
-	ss.handleMessage(local, syncMsgFailoverAck, []byte{7, failoverAckApplied})
+	ack := make([]byte, 10)
+	ack[0] = 7
+	ack[1] = failoverAckApplied
+	binary.LittleEndian.PutUint64(ack[2:10], reqID)
+	ss.handleMessage(local, syncMsgFailoverAck, ack)
 
 	select {
 	case err := <-done:
@@ -2228,9 +2236,17 @@ func TestSendFailoverPropagatesPeerRejection(t *testing.T) {
 	if _, err := io.ReadFull(peer, payload); err != nil {
 		t.Fatalf("read failover payload: %v", err)
 	}
+	if len(payload) != 9 || payload[0] != 3 {
+		t.Fatalf("payload = %v, want rg=3 with req_id", payload)
+	}
+	reqID := binary.LittleEndian.Uint64(payload[1:9])
 
-	reason := "not primary for redundancy group 3"
-	ack := append([]byte{3, failoverAckRejected}, []byte(reason)...)
+	reason := "remote failover rejected: redundancy group 3"
+	ack := make([]byte, 10+len(reason))
+	ack[0] = 3
+	ack[1] = failoverAckRejected
+	binary.LittleEndian.PutUint64(ack[2:10], reqID)
+	copy(ack[10:], reason)
 	ss.handleMessage(local, syncMsgFailoverAck, ack)
 
 	select {
@@ -2270,6 +2286,9 @@ func TestSendFailoverDisconnectReleasesWaiter(t *testing.T) {
 	if _, err := io.ReadFull(peer, payload); err != nil {
 		t.Fatalf("read failover payload: %v", err)
 	}
+	if len(payload) != 9 || payload[0] != 4 {
+		t.Fatalf("payload = %v, want rg=4 with req_id", payload)
+	}
 	go ss.handleDisconnect(local)
 
 	select {
@@ -2282,6 +2301,90 @@ func TestSendFailoverDisconnectReleasesWaiter(t *testing.T) {
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("SendFailover did not complete after disconnect")
+	}
+}
+
+func TestSendFailoverRejectsOutOfRangeRGID(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	if err := ss.SendFailover(256); err == nil {
+		t.Fatal("expected out-of-range RG error")
+	}
+}
+
+func TestSendFailoverIgnoresStaleAckForEarlierRequest(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	done1 := make(chan error, 1)
+	go func() {
+		done1 <- ss.SendFailover(9)
+	}()
+
+	var hdrBuf [syncHeaderSize]byte
+	if _, err := io.ReadFull(peer, hdrBuf[:]); err != nil {
+		t.Fatalf("read first failover header: %v", err)
+	}
+	payloadLen := binary.LittleEndian.Uint32(hdrBuf[8:12])
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(peer, payload); err != nil {
+		t.Fatalf("read first failover payload: %v", err)
+	}
+	firstReqID := binary.LittleEndian.Uint64(payload[1:9])
+
+	ss.failoverWaitMu.Lock()
+	delete(ss.failoverWaiters, 9)
+	ss.failoverWaitMu.Unlock()
+
+	done2 := make(chan error, 1)
+	go func() {
+		done2 <- ss.SendFailover(9)
+	}()
+
+	if _, err := io.ReadFull(peer, hdrBuf[:]); err != nil {
+		t.Fatalf("read second failover header: %v", err)
+	}
+	payloadLen = binary.LittleEndian.Uint32(hdrBuf[8:12])
+	payload = make([]byte, payloadLen)
+	if _, err := io.ReadFull(peer, payload); err != nil {
+		t.Fatalf("read second failover payload: %v", err)
+	}
+	secondReqID := binary.LittleEndian.Uint64(payload[1:9])
+	if secondReqID == firstReqID {
+		t.Fatalf("second reqID = %d, want different from first reqID %d", secondReqID, firstReqID)
+	}
+
+	staleAck := make([]byte, 10)
+	staleAck[0] = 9
+	staleAck[1] = failoverAckApplied
+	binary.LittleEndian.PutUint64(staleAck[2:10], firstReqID)
+	ss.handleMessage(local, syncMsgFailoverAck, staleAck)
+
+	select {
+	case err := <-done2:
+		t.Fatalf("second SendFailover() completed early from stale ack: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	freshAck := make([]byte, 10)
+	freshAck[0] = 9
+	freshAck[1] = failoverAckApplied
+	binary.LittleEndian.PutUint64(freshAck[2:10], secondReqID)
+	ss.handleMessage(local, syncMsgFailoverAck, freshAck)
+
+	select {
+	case err := <-done2:
+		if err != nil {
+			t.Fatalf("second SendFailover() error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("second SendFailover did not complete after fresh ack")
 	}
 }
 

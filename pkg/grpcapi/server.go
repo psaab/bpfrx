@@ -99,7 +99,6 @@ type Server struct {
 	fabricVRFDevice  string
 }
 
-
 func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
 	provider, ok := s.dp.(interface {
 		Status() (dpuserspace.ProcessStatus, error)
@@ -784,7 +783,6 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 
 	return resp, nil
 }
-
 
 func (s *Server) GetNATSource(_ context.Context, _ *pb.GetNATSourceRequest) (*pb.GetNATSourceResponse, error) {
 	cfg := s.store.ActiveConfig()
@@ -2118,7 +2116,6 @@ func streamDiagCmd(ctx context.Context, cmd []string, sendFn func(string) error)
 
 // --- Mutation RPCs ---
 
-
 func (s *Server) ClearCounters(_ context.Context, _ *pb.ClearCountersRequest) (*pb.ClearCountersResponse, error) {
 	if s.dp == nil || !s.dp.IsLoaded() {
 		return nil, status.Error(codes.Unavailable, "dataplane not loaded")
@@ -2525,7 +2522,6 @@ func protoName(p uint8) string {
 	}
 }
 
-
 func ntohs(v uint16) uint16 {
 	var b [2]byte
 	binary.BigEndian.PutUint16(b[:], v)
@@ -2537,7 +2533,6 @@ func uint32ToIP(v uint32) net.IP {
 	binary.NativeEndian.PutUint32(ip, v)
 	return ip
 }
-
 
 type builtinApp struct {
 	proto uint8
@@ -7477,12 +7472,12 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 							Message: fmt.Sprintf("Redundancy group %d is already primary on node %d", rgID, targetNode),
 						}, nil
 					}
-					// Ask peer to resign so we can take primary.
+					// Ask peer to transfer out so we can take primary.
 					if err := s.cluster.RequestPeerFailover(rgID); err != nil {
 						return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
 					}
 					return &pb.SystemActionResponse{
-						Message: fmt.Sprintf("Manual failover triggered for redundancy group %d (requesting peer to resign)", rgID),
+						Message: fmt.Sprintf("Manual failover completed for redundancy group %d (peer transfer-out observed)", rgID),
 					}, nil
 				}
 				// Target is peer → local failover (fall through)
@@ -8536,19 +8531,19 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 
 				if snap.userspace != nil {
 					var (
-						usRxBps, usTxBps, usRxPps, usTxPps                                uint64
-						usRxBytesDelta, usTxBytesDelta, usRxPktsDelta, usTxPktsDelta      uint64
-						usDirectDelta, usCopyDelta, usInPlaceDelta                        uint64
-						usDirectNoFrameDelta, usDirectBuildDelta, usDirectDisallowedDelta uint64
+						usRxBps, usTxBps, usRxPps, usTxPps                                   uint64
+						usRxBytesDelta, usTxBytesDelta, usRxPktsDelta, usTxPktsDelta         uint64
+						usDirectDelta, usCopyDelta, usInPlaceDelta                           uint64
+						usDirectNoFrameDelta, usDirectBuildDelta, usDirectDisallowedDelta    uint64
 						usTxCompletionsDelta, usKernelRXDroppedDelta, usKernelRXInvalidDelta uint64
-						usPendingFillDelta, usSpareFillDelta, usFreeTXDelta                uint64
-						usPendingPreparedDelta, usPendingLocalDelta                        uint64
-						usOutstandingTXDelta, usInFlightRecycleDelta                       uint64
-						usSessionMissDelta, usNeighborMissDelta, usRouteMissDelta         uint64
-						usPolicyDeniedDelta, usExceptionDelta, usSlowPathDelta            uint64
-						usSlowPathLocalDelta, usSlowPathMissingNeighborDelta              uint64
-						usSlowPathNoRouteDelta, usSlowPathNextTableDelta                  uint64
-						usSlowPathForwardBuildDelta                                        uint64
+						usPendingFillDelta, usSpareFillDelta, usFreeTXDelta                  uint64
+						usPendingPreparedDelta, usPendingLocalDelta                          uint64
+						usOutstandingTXDelta, usInFlightRecycleDelta                         uint64
+						usSessionMissDelta, usNeighborMissDelta, usRouteMissDelta            uint64
+						usPolicyDeniedDelta, usExceptionDelta, usSlowPathDelta               uint64
+						usSlowPathLocalDelta, usSlowPathMissingNeighborDelta                 uint64
+						usSlowPathNoRouteDelta, usSlowPathNextTableDelta                     uint64
+						usSlowPathForwardBuildDelta                                          uint64
 					)
 					if prevSingle != nil && prevSingle.userspace != nil {
 						dt := snap.ts.Sub(prevSingle.ts).Seconds()

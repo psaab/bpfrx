@@ -1448,7 +1448,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// and a 30-second traffic blackhole.
 			d.sessionSync.OnRemoteFailover = func(rgID int) error {
 				if !d.cluster.IsLocalPrimary(rgID) {
-					return fmt.Errorf("not primary for redundancy group %d", rgID)
+					return fmt.Errorf("%w: redundancy group %d", cluster.ErrRemoteFailoverRejected, rgID)
 				}
 				slog.Info("cluster: remote failover request from peer", "rg", rgID)
 				if err := d.cluster.ManualFailover(rgID); err != nil {

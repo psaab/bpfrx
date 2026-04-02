@@ -84,6 +84,10 @@
   - **Action**: Third #390 slice — wait for actual local RG promotion after peer transfer-out ack so CLI/local control returns on observed ownership, not just request delivery
   - **File(s)**: pkg/cluster/cluster.go, pkg/cluster/cluster_test.go, pkg/cli/cli.go
 
+- **Timestamp**: 2026-04-02T14:15:00Z
+  - **Action**: Address PR #396 copilot review — typed remote-failover rejection, failover request IDs, out-of-range RG guard, timeout race guard, active-conn ack routing, and consistent gRPC wording
+  - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_test.go, pkg/daemon/daemon_ha.go, pkg/grpcapi/server.go
+
 - **Timestamp**: 2026-04-02T12:30:00Z
   - **Action**: First #390 slice — replace weight-zero manual failover with explicit secondary-hold transfer-out state, keep ForceSecondary on zero-weight drain semantics, and teach election to promote on peer transfer-out without mutating monitor weight
   - **File(s)**: pkg/cluster/cluster.go, pkg/cluster/election.go, pkg/cluster/cluster_test.go, pkg/cluster/election_test.go, pkg/cluster/sync.go
