@@ -91,3 +91,7 @@
 - **Timestamp**: 2026-04-02T03:30:00Z
   - **Action**: Simplify HA — remove refresh RPC, skip blackhole routes, dead code cleanup, throttle post-transition sync (#353, #354, #355, #356) (5ac423a3)
   - **File(s)**: pkg/dataplane/userspace/manager.go, pkg/daemon/daemon.go
+
+- **Timestamp**: 2026-04-02T06:00:00Z
+  - **Action**: Merged PR #357 (flow cache simplification refactors). Implemented phases 3+4 from docs/flow-cache-simplification.md — explicit is_cacheable() + 10 unit tests (624a1f83)
+  - **File(s)**: userspace-dp/src/afxdp/types.rs, docs/flow-cache-simplification.md
