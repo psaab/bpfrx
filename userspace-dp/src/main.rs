@@ -1507,9 +1507,16 @@ fn handle_stream(
                         guard.status.forwarding_armed
                     );
                     guard.status.ha_groups = ha_req.groups.clone();
-                    guard.afxdp.update_ha_state(&ha_req.groups);
-                    refresh_status(&mut guard);
-                    persist_state = true;
+                    match guard.afxdp.update_ha_state(&ha_req.groups) {
+                        Ok(()) => {
+                            refresh_status(&mut guard);
+                            persist_state = true;
+                        }
+                        Err(err) => {
+                            response.ok = false;
+                            response.error = err;
+                        }
+                    }
                 } else {
                     response.ok = false;
                     response.error = "missing HA state".to_string();
@@ -1538,15 +1545,6 @@ fn handle_stream(
                 } else {
                     response.ok = false;
                     response.error = "missing HA demotion prepare".to_string();
-                }
-            }
-            "refresh_owner_rgs" => {
-                if let Some(prepare_req) = request.ha_demotion_prepare {
-                    guard.afxdp.refresh_owner_rgs(&prepare_req.groups);
-                    refresh_status(&mut guard);
-                } else {
-                    response.ok = false;
-                    response.error = "missing groups for refresh_owner_rgs".to_string();
                 }
             }
             "update_fabrics" => {

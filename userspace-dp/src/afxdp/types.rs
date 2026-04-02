@@ -307,7 +307,7 @@ pub(super) struct WorkerHandle {
     pub(super) heartbeat: Arc<AtomicU64>,
     pub(super) commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
     pub(super) demotion_prepare_ack: Arc<AtomicU64>,
-    pub(super) refresh_owner_rgs_ack: Arc<AtomicU64>,
+    pub(super) ha_state_apply_ack: Arc<AtomicU64>,
     pub(super) session_export_ack: Arc<AtomicU64>,
     pub(super) join: Option<JoinHandle<()>>,
 }
@@ -759,7 +759,7 @@ pub(super) enum WorkerCommand {
     ExportOwnerRGSessions { sequence: u64, owner_rgs: Vec<i32> },
     PrepareDemoteOwnerRGs { sequence: u64, owner_rgs: Vec<i32> },
     DemoteOwnerRG(i32),
-    RefreshOwnerRGs { owner_rgs: Vec<i32>, sequence: u64 },
+    ApplyHAState { sequence: u64 },
 }
 
 #[derive(Default)]

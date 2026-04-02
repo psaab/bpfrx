@@ -188,7 +188,7 @@ fn should_bypass_unseeded_tunnel_ha(
 pub(super) struct WorkerCommandResults {
     pub cancelled_keys: Vec<SessionKey>,
     pub prepared_sequences: Vec<u64>,
-    pub refreshed_sequences: Vec<u64>,
+    pub applied_sequences: Vec<u64>,
     pub exported_sequences: Vec<u64>,
 }
 
@@ -237,7 +237,7 @@ pub(super) fn apply_worker_commands(
                 return WorkerCommandResults {
                     cancelled_keys: Vec::new(),
                     prepared_sequences: Vec::new(),
-                    refreshed_sequences: Vec::new(),
+                    applied_sequences: Vec::new(),
                     exported_sequences: Vec::new(),
                 };
             }
@@ -247,7 +247,7 @@ pub(super) fn apply_worker_commands(
             return WorkerCommandResults {
                 cancelled_keys: Vec::new(),
                 prepared_sequences: Vec::new(),
-                refreshed_sequences: Vec::new(),
+                applied_sequences: Vec::new(),
                 exported_sequences: Vec::new(),
             };
         }
@@ -256,7 +256,7 @@ pub(super) fn apply_worker_commands(
     let now_secs = now_ns / 1_000_000_000;
     let mut cancelled_keys = Vec::new();
     let mut prepared_sequences = Vec::new();
-    let mut refreshed_sequences = Vec::new();
+    let mut applied_sequences = Vec::new();
     let mut exported_sequences = Vec::new();
     for cmd in pending {
         match cmd {
@@ -321,121 +321,8 @@ pub(super) fn apply_worker_commands(
                 }
                 cancelled_keys.extend(demoted);
             }
-            WorkerCommand::RefreshOwnerRGs {
-                owner_rgs,
-                sequence,
-            } => {
-                let pre_count = sessions.len();
-                // Flow cache invalidation is handled by epoch-based check
-                // in FlowCache::lookup() — no per-entry scan needed here.
-                // Re-resolve ALL sessions (forward + reverse) for the
-                // activated RGs. Synced forward sessions arrive with the
-                // peer's interface indices and MACs which don't work locally.
-                // Without this, SNAT isn't applied on the new owner because
-                // the session's egress_ifindex is wrong (peer's ifindex).
-                //
-                // NOTE (#310): Reverse companions are now pre-installed by the
-                // Go sync path (SetClusterSyncedSessionV4/V6), so this refresh
-                // only updates their resolution rather than synthesizing from
-                // scratch. This reduces activation-time work significantly.
-                refresh_live_reverse_sessions_for_owner_rgs(
-                    sessions,
-                    session_map_fd,
-                    forwarding,
-                    ha_state,
-                    dynamic_neighbors,
-                    &owner_rgs,
-                    now_ns,
-                    now_secs,
-                    false,
-                );
-                // Also re-resolve forward sessions. The reverse refresh
-                // above only handles reverse entries. Forward synced sessions
-                // need local egress resolution for NAT to work.
-                let owner_rg_set: std::collections::BTreeSet<i32> =
-                    owner_rgs.iter().copied().collect();
-                let mut refreshed_fwd = 0u32;
-                // Collect forward session candidates for re-resolution.
-                let mut forward_candidates = Vec::new();
-                sessions.iter_with_origin(|key, decision, metadata, _origin| {
-                    if !metadata.is_reverse
-                        && (metadata.owner_rg_id == 0
-                            || owner_rg_set.contains(&metadata.owner_rg_id))
-                    {
-                        forward_candidates.push((key.clone(), decision, metadata.clone()));
-                    }
-                });
-                for (key, decision, metadata) in forward_candidates {
-                    // Skip sessions already resolved with valid local egress
-                    // (#345). Since #326 resolves sessions on receipt via
-                    // UpsertSynced, most forward sessions already have a
-                    // ForwardCandidate disposition with correct egress. Only
-                    // re-resolve sessions with NoRoute or stale egress.
-                    if decision.resolution.disposition
-                        == super::ForwardingDisposition::ForwardCandidate
-                        && decision.resolution.egress_ifindex > 0
-                    {
-                        continue;
-                    }
-                    let flow = SessionFlow {
-                        src_ip: key.src_ip,
-                        dst_ip: key.dst_ip,
-                        forward_key: key.clone(),
-                    };
-                    let re_resolved = lookup_forwarding_resolution_for_session(
-                        forwarding,
-                        dynamic_neighbors,
-                        &flow,
-                        decision,
-                    );
-                    let re_resolved = super::enforce_ha_resolution_snapshot(
-                        forwarding,
-                        ha_state,
-                        now_secs,
-                        re_resolved,
-                    );
-                    if re_resolved.disposition != super::ForwardingDisposition::HAInactive
-                        && re_resolved != decision.resolution
-                    {
-                        let new_decision = SessionDecision {
-                            resolution: re_resolved,
-                            ..decision
-                        };
-                        let new_owner = owner_rg_for_resolution(forwarding, re_resolved);
-                        let new_metadata = SessionMetadata {
-                            owner_rg_id: if new_owner > 0 {
-                                new_owner
-                            } else {
-                                metadata.owner_rg_id
-                            },
-                            ..metadata
-                        };
-                        sessions.refresh_for_ha_activation(
-                            &key,
-                            new_decision,
-                            new_metadata.clone(),
-                            now_ns,
-                            0,
-                        );
-                        publish_session_map_entry_for_session(
-                            session_map_fd,
-                            &key,
-                            new_decision,
-                            &new_metadata,
-                        )
-                        .ok();
-                        refreshed_fwd += 1;
-                    }
-                }
-                eprintln!(
-                    "bpfrx-ha: RefreshOwnerRGs {:?} seq={} worker sessions: before={} after={} refreshed_fwd={}",
-                    owner_rgs,
-                    sequence,
-                    pre_count,
-                    sessions.len(),
-                    refreshed_fwd,
-                );
-                refreshed_sequences.push(sequence);
+            WorkerCommand::ApplyHAState { sequence } => {
+                applied_sequences.push(sequence);
             }
             WorkerCommand::UpsertSynced(mut entry) => {
                 let key = entry.key.clone();
@@ -454,7 +341,8 @@ pub(super) fn apply_worker_commands(
                 // the remote node's interface indices and MACs which don't
                 // work on this node. By resolving on receipt (even on standby),
                 // sessions are immediately forwarding-ready at activation —
-                // RefreshOwnerRGs no longer needs to batch re-resolve.
+                // the helper no longer needs a second activation-time forward
+                // scan to fix them up.
                 // HA enforcement still happens at packet time via flow cache
                 // validation (enforce_ha_resolution_snapshot).
                 if !entry.metadata.is_reverse {
@@ -537,7 +425,7 @@ pub(super) fn apply_worker_commands(
     WorkerCommandResults {
         cancelled_keys,
         prepared_sequences,
-        refreshed_sequences,
+        applied_sequences,
         exported_sequences,
     }
 }
@@ -3242,68 +3130,18 @@ mod tests {
     }
 
     #[test]
-    fn apply_worker_commands_refreshes_live_reverse_sessions_for_activated_owner_rg() {
+    fn apply_worker_commands_records_apply_ha_state_sequence() {
         let commands = Arc::new(Mutex::new(VecDeque::new()));
         let mut sessions = SessionTable::new();
-        let key = SessionKey {
-            addr_family: libc::AF_INET as u8,
-            protocol: PROTO_TCP,
-            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
-            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            src_port: 5201,
-            dst_port: 42424,
-        };
-        let decision = SessionDecision {
-            resolution: ForwardingResolution {
-                disposition: ForwardingDisposition::HAInactive,
-                local_ifindex: 0,
-                egress_ifindex: 6,
-                tx_ifindex: 6,
-                tunnel_endpoint_id: 0,
-                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
-                neighbor_mac: Some([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]),
-                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]),
-                tx_vlan_id: 0,
-            },
-            nat: NatDecision::default(),
-        };
-        let metadata = SessionMetadata {
-            ingress_zone: Arc::<str>::from("wan"),
-            egress_zone: Arc::<str>::from("lan"),
-            owner_rg_id: 0,
-            fabric_ingress: false,
-            is_reverse: true,
-            nat64_reverse: None,
-        };
-        assert!(sessions.install_with_protocol(
-            key.clone(),
-            decision,
-            metadata,
-            1_000_000,
-            PROTO_TCP,
-            0x10,
-        ));
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::RefreshOwnerRGs {
-                owner_rgs: vec![1],
-                sequence: 0,
-            });
+            .push_back(WorkerCommand::ApplyHAState { sequence: 7 });
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                lease_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
-        );
-        apply_worker_commands(
+        let ha_state = BTreeMap::new();
+
+        let results = apply_worker_commands(
             &commands,
             &mut sessions,
             -1,
@@ -3314,297 +3152,9 @@ mod tests {
             &dynamic_neighbors,
         );
 
-        let hit = sessions
-            .lookup(&key, 2_000_000, 0x10)
-            .expect("refreshed reverse hit");
-        assert_eq!(
-            hit.decision.resolution.disposition,
-            ForwardingDisposition::ForwardCandidate
-        );
-        assert_eq!(hit.decision.resolution.egress_ifindex, 6);
-        assert_eq!(hit.metadata.owner_rg_id, 1);
-    }
-
-    #[test]
-    fn apply_worker_commands_skips_split_owner_reverse_sessions_for_unrelated_rg() {
-        let commands = Arc::new(Mutex::new(VecDeque::new()));
-        let mut sessions = SessionTable::new();
-        let key = SessionKey {
-            addr_family: libc::AF_INET as u8,
-            protocol: PROTO_TCP,
-            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
-            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            src_port: 5201,
-            dst_port: 42424,
-        };
-        let decision = SessionDecision {
-            resolution: ForwardingResolution {
-                disposition: ForwardingDisposition::HAInactive,
-                local_ifindex: 0,
-                egress_ifindex: 6,
-                tx_ifindex: 6,
-                tunnel_endpoint_id: 0,
-                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
-                neighbor_mac: Some([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]),
-                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]),
-                tx_vlan_id: 0,
-            },
-            nat: NatDecision::default(),
-        };
-        let metadata = SessionMetadata {
-            ingress_zone: Arc::<str>::from("wan"),
-            egress_zone: Arc::<str>::from("lan"),
-            owner_rg_id: 2,
-            fabric_ingress: false,
-            is_reverse: true,
-            nat64_reverse: None,
-        };
-        assert!(sessions.install_with_protocol(
-            key.clone(),
-            decision,
-            metadata,
-            1_000_000,
-            PROTO_TCP,
-            0x10,
-        ));
-        // RefreshOwnerRGs([1]) should NOT touch sessions with owner_rg_id=2
-        // even if the re-resolved owner_rg remains 2.
-        commands
-            .lock()
-            .expect("commands lock")
-            .push_back(WorkerCommand::RefreshOwnerRGs {
-                owner_rgs: vec![1],
-                sequence: 0,
-            });
-        let forwarding = test_forwarding_state_split_rgs();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                lease_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
-        );
-        ha_state.insert(
-            2,
-            HAGroupRuntime {
-                active: false,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                lease_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
-        );
-        apply_worker_commands(
-            &commands,
-            &mut sessions,
-            -1,
-            -1,
-            -1,
-            &forwarding,
-            &ha_state,
-            &dynamic_neighbors,
-        );
-
-        let hit = sessions
-            .lookup(&key, 2_000_000, 0x10)
-            .expect("session should still exist");
-        // Session remains HAInactive — not refreshed because owner_rg_id=2
-        // is not in the activated owner_rgs set [1].
-        assert_eq!(
-            hit.decision.resolution.disposition,
-            ForwardingDisposition::HAInactive
-        );
-        assert_eq!(hit.metadata.owner_rg_id, 2);
-    }
-
-    #[test]
-    fn apply_worker_commands_refreshes_local_forward_sessions_for_activated_owner_rg() {
-        let commands = Arc::new(Mutex::new(VecDeque::new()));
-        let mut sessions = SessionTable::new();
-        let key = SessionKey {
-            addr_family: libc::AF_INET as u8,
-            protocol: PROTO_TCP,
-            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
-            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            src_port: 5201,
-            dst_port: 42424,
-        };
-        let decision = SessionDecision {
-            resolution: ForwardingResolution {
-                disposition: ForwardingDisposition::FabricRedirect,
-                local_ifindex: 0,
-                egress_ifindex: 21,
-                tx_ifindex: 21,
-                tunnel_endpoint_id: 0,
-                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
-                neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
-                src_mac: Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]),
-                tx_vlan_id: 0,
-            },
-            nat: NatDecision::default(),
-        };
-        let metadata = SessionMetadata {
-            ingress_zone: Arc::<str>::from("wan"),
-            egress_zone: Arc::<str>::from("lan"),
-            owner_rg_id: 1,
-            fabric_ingress: false,
-            is_reverse: false,
-            nat64_reverse: None,
-        };
-        assert!(sessions.install_with_protocol(
-            key.clone(),
-            decision,
-            metadata,
-            1_000_000,
-            PROTO_TCP,
-            0x10,
-        ));
-        commands
-            .lock()
-            .expect("commands lock")
-            .push_back(WorkerCommand::RefreshOwnerRGs {
-                owner_rgs: vec![1],
-                sequence: 0,
-            });
-        let forwarding = test_forwarding_state_with_fabric();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                lease_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
-        );
-        apply_worker_commands(
-            &commands,
-            &mut sessions,
-            -1,
-            -1,
-            -1,
-            &forwarding,
-            &ha_state,
-            &dynamic_neighbors,
-        );
-
-        let hit = sessions
-            .lookup(&key, 2_000_000, 0x10)
-            .expect("refreshed forward hit");
-        assert_eq!(
-            hit.decision.resolution.disposition,
-            ForwardingDisposition::ForwardCandidate
-        );
-        assert_eq!(hit.decision.resolution.egress_ifindex, 6);
-        assert_eq!(hit.decision.resolution.tx_ifindex, 6);
-        assert_eq!(hit.metadata.owner_rg_id, 1);
-    }
-
-    #[test]
-    fn apply_worker_commands_refreshes_synced_forward_sessions_for_activated_owner_rg() {
-        // Peer-synced forward sessions (origin.is_peer_synced()) must be re-resolved when
-        // the owner RG activates locally.  Before the fix, refresh_local()
-        // skipped synced entries, leaving them with the peer's stale
-        // resolution. This caused SNAT to not be applied after failover.
-        let commands = Arc::new(Mutex::new(VecDeque::new()));
-        let mut sessions = SessionTable::new();
-        let key = SessionKey {
-            addr_family: libc::AF_INET as u8,
-            protocol: PROTO_TCP,
-            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
-            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            src_port: 5201,
-            dst_port: 42424,
-        };
-        let decision = SessionDecision {
-            resolution: ForwardingResolution {
-                disposition: ForwardingDisposition::FabricRedirect,
-                local_ifindex: 0,
-                egress_ifindex: 21,
-                tx_ifindex: 21,
-                tunnel_endpoint_id: 0,
-                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
-                neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
-                src_mac: Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]),
-                tx_vlan_id: 0,
-            },
-            nat: NatDecision {
-                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
-                ..NatDecision::default()
-            },
-        };
-        let metadata = SessionMetadata {
-            ingress_zone: Arc::<str>::from("wan"),
-            egress_zone: Arc::<str>::from("lan"),
-            owner_rg_id: 1,
-            fabric_ingress: false,
-            is_reverse: false,
-            nat64_reverse: None,
-        };
-        // Install with SyncImport origin to represent peer-synced session
-        assert!(sessions.install_with_protocol_with_origin(
-            key.clone(),
-            decision,
-            metadata,
-            SessionOrigin::SyncImport,
-            1_000_000,
-            PROTO_TCP,
-            0x10,
-        ));
-        commands
-            .lock()
-            .expect("commands lock")
-            .push_back(WorkerCommand::RefreshOwnerRGs {
-                owner_rgs: vec![1],
-                sequence: 0,
-            });
-        let forwarding = test_forwarding_state_with_fabric();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            HAGroupRuntime {
-                active: true,
-                watchdog_timestamp: monotonic_nanos() / 1_000_000_000,
-                lease_timestamp: monotonic_nanos() / 1_000_000_000,
-                demoting: false,
-                demoting_until_secs: 0,
-            },
-        );
-        apply_worker_commands(
-            &commands,
-            &mut sessions,
-            -1,
-            -1,
-            -1,
-            &forwarding,
-            &ha_state,
-            &dynamic_neighbors,
-        );
-
-        let hit = sessions
-            .lookup(&key, 2_000_000, 0x10)
-            .expect("refreshed synced forward hit");
-        // Resolution must be re-resolved to local ForwardCandidate
-        assert_eq!(
-            hit.decision.resolution.disposition,
-            ForwardingDisposition::ForwardCandidate,
-            "synced forward session must be re-resolved to ForwardCandidate"
-        );
-        assert_eq!(hit.decision.resolution.egress_ifindex, 6);
-        // NAT must be preserved through the re-resolution
-        assert_eq!(
-            hit.decision.nat.rewrite_src,
-            Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
-            "SNAT decision must survive RefreshOwnerRGs"
-        );
+        assert_eq!(results.applied_sequences, vec![7]);
+        assert!(results.prepared_sequences.is_empty());
+        assert!(results.exported_sequences.is_empty());
     }
 
     #[test]
