@@ -122,6 +122,7 @@ pub(super) fn match_source_nat_for_flow(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn zone_pair_for_flow(
     forwarding: &ForwardingState,
     ingress_ifindex: i32,
@@ -224,15 +225,6 @@ pub(super) fn resolve_fabric_redirect(
     forwarding: &ForwardingState,
 ) -> Option<ForwardingResolution> {
     resolve_fabric_redirect_from_list(&forwarding.fabrics)
-}
-
-pub(super) fn resolve_fabric_redirect_from_shared(
-    forwarding: &ForwardingState,
-    shared_fabrics: &ArcSwap<Vec<FabricLink>>,
-) -> Option<ForwardingResolution> {
-    // Try static forwarding state first, then shared (dynamically updated) fabrics.
-    resolve_fabric_redirect_from_list(&forwarding.fabrics)
-        .or_else(|| resolve_fabric_redirect_from_list(&shared_fabrics.load()))
 }
 
 pub(super) fn resolve_fabric_redirect_from_list(
@@ -1422,6 +1414,7 @@ pub(super) fn lookup_neighbor_entry(
     None
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn parse_neighbor_entries(output: &str) -> Vec<(IpAddr, NeighborEntry)> {
     let mut out = Vec::new();
     for line in output.lines() {

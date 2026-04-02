@@ -48,12 +48,15 @@ const TEMPLATE_ID: u16 = 256;
 const TEMPLATE_FIELD_COUNT: u16 = 9;
 
 /// Default flush interval in seconds.
+#[allow(dead_code)]
 const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 5;
 
 /// Default active timeout in seconds (when the Go side sends 0).
+#[allow(dead_code)]
 const DEFAULT_ACTIVE_TIMEOUT_SECS: u64 = 60;
 
 /// Default inactive timeout in seconds (when the Go side sends 0).
+#[allow(dead_code)]
 const DEFAULT_INACTIVE_TIMEOUT_SECS: u64 = 15;
 
 /// Maximum buffered records before force-flush.
@@ -75,15 +78,16 @@ pub(crate) struct FlowRecord {
 
 /// Configuration for the flow exporter.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct FlowExportConfig {
     pub collector: SocketAddr,
     pub sampling_rate: u32,
     pub active_timeout_secs: u64,
-    #[allow(dead_code)]
     pub inactive_timeout_secs: u64,
 }
 
 /// NetFlow v9 flow exporter. Buffers records and periodically flushes via UDP.
+#[allow(dead_code)]
 pub(crate) struct FlowExporter {
     config: FlowExportConfig,
     socket: Option<UdpSocket>,
@@ -92,15 +96,13 @@ pub(crate) struct FlowExporter {
     session_counter: u64,
     boot_instant: Instant,
     last_flush_ns: u64,
-    #[allow(dead_code)]
     last_template_ns: u64,
     source_id: u32,
-    #[allow(dead_code)]
     flush_interval_ns: u64,
-    #[allow(dead_code)]
     template_interval_ns: u64,
 }
 
+#[allow(dead_code)]
 impl FlowExporter {
     pub fn new(config: FlowExportConfig) -> Self {
         let socket = UdpSocket::bind("0.0.0.0:0").ok().and_then(|s| {

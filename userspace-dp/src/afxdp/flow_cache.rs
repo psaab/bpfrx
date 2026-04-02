@@ -22,11 +22,15 @@ pub(super) struct RewriteDescriptor {
     pub(super) rewrite_dst_port: Option<u16>,
     pub(super) ip_csum_delta: u16,
     pub(super) l4_csum_delta: u16,
+    #[allow(dead_code)] // populated for future flow-cache fast-path TX
     pub(super) egress_ifindex: i32,
+    #[allow(dead_code)] // populated for future flow-cache fast-path TX
     pub(super) tx_ifindex: i32,
+    #[allow(dead_code)] // populated for future flow-cache fast-path TX
     pub(super) target_binding_index: Option<usize>,
     pub(super) nat64: bool,
     pub(super) nptv6: bool,
+    #[allow(dead_code)] // populated for future flow-cache fast-path TX
     pub(super) apply_nat_on_fabric: bool,
 }
 

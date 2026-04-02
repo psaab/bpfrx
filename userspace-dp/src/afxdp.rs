@@ -186,6 +186,7 @@ const HEARTBEAT_UPDATE_INTERVAL_NS: u64 = 250_000_000;
 /// this period, heartbeat is written and the XDP shim redirects to XSK.
 /// Must exceed the Go-side ctrl enable delay (3s) plus time for
 /// NAPI to bootstrap the XSK RQ from the fill ring (~2-3 seconds).
+#[allow(dead_code)] // reserved for heartbeat gating logic
 const HEARTBEAT_GRACE_PERIOD_NS: u64 = 6_000_000_000; // 6 seconds
 const TX_WAKE_MIN_INTERVAL_NS: u64 = 50_000;
 const HEARTBEAT_STALE_AFTER: Duration = Duration::from_secs(5);
@@ -350,6 +351,7 @@ impl Coordinator {
         self.event_stream.as_ref().map(|es| es.stats())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn dynamic_neighbors_ref(&self) -> &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>> {
         &self.dynamic_neighbors
     }
@@ -1435,6 +1437,7 @@ struct BindingWorker {
     /// Flow cache fast-path: cross-binding in-place rewrites deferred
     /// until after the RX batch (borrow checker prevents mutable access
     /// to two bindings simultaneously inside the RX loop).
+    #[allow(dead_code)] // reserved for cross-binding fast-path
     scratch_cross_binding_tx: Vec<(usize, PreparedTxRequest)>,
     scratch_rst_teardowns: Vec<(SessionKey, NatDecision)>,
     in_flight_prepared_recycles: FastMap<u64, PreparedTxRecycle>,
@@ -1482,8 +1485,10 @@ struct BindingWorker {
     flow_cache: FlowCache,
     flow_cache_session_touch: u64,
     /// Timestamp when this binding was created.
+    #[allow(dead_code)] // reserved for heartbeat gating logic
     bind_time_ns: u64,
     /// Zero-copy vs copy mode (affects heartbeat gating).
+    #[allow(dead_code)] // reserved for heartbeat gating logic
     bind_mode: XskBindMode,
     /// Set true once the XSK RX ring has delivered at least one packet,
     /// proving the NIC's XSK receive queue is active for this binding.
@@ -4307,6 +4312,7 @@ fn retry_pending_neigh(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_live_forward_request(
     area: &MmapArea,
     binding_lookup: &WorkerBindingLookup,
