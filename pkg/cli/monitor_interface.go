@@ -117,6 +117,24 @@ func (c *CLI) sortedMonitorInterfaces() []string {
 	return c.sortedConfiguredInterfaces()
 }
 
+func (c *CLI) summaryInterfaces() ([]string, map[string]string) {
+	names, err := monitoriface.ListTrafficInterfaces()
+	if err == nil && len(names) > 0 {
+		kernelNames := make(map[string]string, len(names))
+		for _, name := range names {
+			kernelNames[name] = name
+		}
+		return names, kernelNames
+	}
+
+	names = c.sortedConfiguredInterfaces()
+	kernelNames := make(map[string]string, len(names))
+	for _, name := range names {
+		kernelNames[name] = monitoriface.ResolvePhysicalParent(c.resolveToKernel(name))
+	}
+	return names, kernelNames
+}
+
 // resolveToKernel converts a config-level name (ge-0/0/0, reth0) to kernel name.
 func (c *CLI) resolveToKernel(cfgName string) string {
 	cfg := c.store.ActiveConfig()
@@ -255,13 +273,10 @@ func (c *CLI) monitorInterfaceTraffic(mode monitoriface.SummaryMode) error {
 	prevSnaps := make(map[string]*monitoriface.Snapshot)
 
 	renderNow := func() {
-		names := c.sortedMonitorInterfaces()
+		names, kernelNames := c.summaryInterfaces()
 		snaps := make(map[string]*monitoriface.Snapshot, len(names))
-		kernelNames := make(map[string]string, len(names))
 		for _, name := range names {
-			kn := name
-			kernelNames[name] = kn
-			snap, err := c.readMonitorSnapshot(kn)
+			snap, err := c.readMonitorSnapshot(kernelNames[name])
 			if err != nil {
 				continue
 			}

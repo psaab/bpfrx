@@ -514,21 +514,21 @@ func RenderTrafficSummary(w io.Writer, hostname string, names []string, kernelNa
 	case SummaryModeBytes:
 		fmt.Fprintf(w, "  %-16s %20s %20s %20s\n", "iface", "Rx", "Tx", "Total")
 		fmt.Fprintf(w, "  %s\n", strings.Repeat("=", 82))
-		var totalRxBps, totalTxBps uint64
+		var totalRxBytesPerSec, totalTxBytesPerSec uint64
 		for _, name := range names {
 			snap := snaps[name]
 			if snap == nil {
 				continue
 			}
-			_, _, rxBps, txBps := snapshotRates(snap, prevSnaps[name])
-			totalRxBps += rxBps
-			totalTxBps += txBps
+			_, _, rxBytesPerSec, txBytesPerSec := snapshotRates(snap, prevSnaps[name])
+			totalRxBytesPerSec += rxBytesPerSec
+			totalTxBytesPerSec += txBytesPerSec
 			fmt.Fprintf(w, "  %-16s %20s %20s %20s\n",
-				name+":", formatBytesRate(rxBps), formatBytesRate(txBps), formatBytesRate(rxBps+txBps))
+				name+":", formatBytesRate(rxBytesPerSec), formatBytesRate(txBytesPerSec), formatBytesRate(rxBytesPerSec+txBytesPerSec))
 		}
 		fmt.Fprintf(w, "  %s\n", strings.Repeat("-", 82))
 		fmt.Fprintf(w, "  %-16s %20s %20s %20s\n",
-			"total:", formatBytesRate(totalRxBps), formatBytesRate(totalTxBps), formatBytesRate(totalRxBps+totalTxBps))
+			"total:", formatBytesRate(totalRxBytesPerSec), formatBytesRate(totalTxBytesPerSec), formatBytesRate(totalRxBytesPerSec+totalTxBytesPerSec))
 	case SummaryModeDelta:
 		fmt.Fprintf(w, "  %-16s %16s %16s %16s\n", "iface", "Rx delta", "Tx delta", "Total")
 		fmt.Fprintf(w, "  %s\n", strings.Repeat("=", 70))
@@ -554,22 +554,24 @@ func RenderTrafficSummary(w io.Writer, hostname string, names []string, kernelNa
 	case SummaryModeRate:
 		fmt.Fprintf(w, "  %-16s %16s %16s %16s %12s %12s %12s\n", "iface", "Rx b/s", "Tx b/s", "Total b/s", "Rx pps", "Tx pps", "Total")
 		fmt.Fprintf(w, "  %s\n", strings.Repeat("=", 106))
-		var totalRxPps, totalTxPps, totalRxBps, totalTxBps uint64
+		var totalRxPps, totalTxPps, totalRxBitsPerSec, totalTxBitsPerSec uint64
 		for _, name := range names {
 			snap := snaps[name]
 			if snap == nil {
 				continue
 			}
-			rxPps, txPps, rxBps, txBps := snapshotRates(snap, prevSnaps[name])
+			rxPps, txPps, rxBytesPerSec, txBytesPerSec := snapshotRates(snap, prevSnaps[name])
+			rxBitsPerSec := rxBytesPerSec * 8
+			txBitsPerSec := txBytesPerSec * 8
 			totalRxPps += rxPps
 			totalTxPps += txPps
-			totalRxBps += rxBps
-			totalTxBps += txBps
+			totalRxBitsPerSec += rxBitsPerSec
+			totalTxBitsPerSec += txBitsPerSec
 			fmt.Fprintf(w, "  %-16s %16s %16s %16s %12s %12s %12s\n",
 				name+":",
-				formatBitsRate(rxBps),
-				formatBitsRate(txBps),
-				formatBitsRate(rxBps+txBps),
+				formatBitsRate(rxBitsPerSec),
+				formatBitsRate(txBitsPerSec),
+				formatBitsRate(rxBitsPerSec+txBitsPerSec),
 				formatPacketRate(rxPps),
 				formatPacketRate(txPps),
 				formatPacketRate(rxPps+txPps))
@@ -577,31 +579,31 @@ func RenderTrafficSummary(w io.Writer, hostname string, names []string, kernelNa
 		fmt.Fprintf(w, "  %s\n", strings.Repeat("-", 106))
 		fmt.Fprintf(w, "  %-16s %16s %16s %16s %12s %12s %12s\n",
 			"total:",
-			formatBitsRate(totalRxBps),
-			formatBitsRate(totalTxBps),
-			formatBitsRate(totalRxBps+totalTxBps),
+			formatBitsRate(totalRxBitsPerSec),
+			formatBitsRate(totalTxBitsPerSec),
+			formatBitsRate(totalRxBitsPerSec+totalTxBitsPerSec),
 			formatPacketRate(totalRxPps),
 			formatPacketRate(totalTxPps),
 			formatPacketRate(totalRxPps+totalTxPps))
 	default:
 		fmt.Fprintf(w, "  %-16s %20s %20s %20s %12s %12s %12s\n", "iface", "Rx", "Tx", "Total", "Rx pps", "Tx pps", "Total")
 		fmt.Fprintf(w, "  %s\n", strings.Repeat("=", 108))
-		var totalRxPps, totalTxPps, totalRxBps, totalTxBps uint64
+		var totalRxPps, totalTxPps, totalRxBytesPerSec, totalTxBytesPerSec uint64
 		for _, name := range names {
 			snap := snaps[name]
 			if snap == nil {
 				continue
 			}
-			rxPps, txPps, rxBps, txBps := snapshotRates(snap, prevSnaps[name])
+			rxPps, txPps, rxBytesPerSec, txBytesPerSec := snapshotRates(snap, prevSnaps[name])
 			totalRxPps += rxPps
 			totalTxPps += txPps
-			totalRxBps += rxBps
-			totalTxBps += txBps
+			totalRxBytesPerSec += rxBytesPerSec
+			totalTxBytesPerSec += txBytesPerSec
 			fmt.Fprintf(w, "  %-16s %20s %20s %20s %12s %12s %12s\n",
 				name+":",
-				formatBytesRate(rxBps),
-				formatBytesRate(txBps),
-				formatBytesRate(rxBps+txBps),
+				formatBytesRate(rxBytesPerSec),
+				formatBytesRate(txBytesPerSec),
+				formatBytesRate(rxBytesPerSec+txBytesPerSec),
 				formatPacketRate(rxPps),
 				formatPacketRate(txPps),
 				formatPacketRate(rxPps+txPps))
@@ -609,9 +611,9 @@ func RenderTrafficSummary(w io.Writer, hostname string, names []string, kernelNa
 		fmt.Fprintf(w, "  %s\n", strings.Repeat("-", 108))
 		fmt.Fprintf(w, "  %-16s %20s %20s %20s %12s %12s %12s\n",
 			"total:",
-			formatBytesRate(totalRxBps),
-			formatBytesRate(totalTxBps),
-			formatBytesRate(totalRxBps+totalTxBps),
+			formatBytesRate(totalRxBytesPerSec),
+			formatBytesRate(totalTxBytesPerSec),
+			formatBytesRate(totalRxBytesPerSec+totalTxBytesPerSec),
 			formatPacketRate(totalRxPps),
 			formatPacketRate(totalTxPps),
 			formatPacketRate(totalRxPps+totalTxPps))
@@ -620,7 +622,7 @@ func RenderTrafficSummary(w io.Writer, hostname string, names []string, kernelNa
 	fmt.Fprintf(w, "\nKeys: q=quit  c=combined  p=packets  b=bytes  d=delta  r=rate\n")
 }
 
-func snapshotRates(curr, prev *Snapshot) (rxPps, txPps, rxBps, txBps uint64) {
+func snapshotRates(curr, prev *Snapshot) (rxPps, txPps, rxBytesPerSec, txBytesPerSec uint64) {
 	if curr == nil || prev == nil {
 		return 0, 0, 0, 0
 	}
@@ -630,8 +632,8 @@ func snapshotRates(curr, prev *Snapshot) (rxPps, txPps, rxBps, txBps uint64) {
 	}
 	return uint64(float64(deltaU64(curr.RxPkts, prev.RxPkts)) / dt),
 		uint64(float64(deltaU64(curr.TxPkts, prev.TxPkts)) / dt),
-		uint64(float64(deltaU64(curr.RxBytes, prev.RxBytes)) * 8 / dt),
-		uint64(float64(deltaU64(curr.TxBytes, prev.TxBytes)) * 8 / dt)
+		uint64(float64(deltaU64(curr.RxBytes, prev.RxBytes)) / dt),
+		uint64(float64(deltaU64(curr.TxBytes, prev.TxBytes)) / dt)
 }
 
 func deltaU64(curr, prev uint64) uint64 {
