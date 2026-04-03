@@ -1083,11 +1083,19 @@ impl Coordinator {
         // Preserve existing fabric links — they are resolved separately
         // via refresh_fabric_links (SyncFabricState) and the snapshot
         // may not include them if the peer MAC wasn't resolved at
-        // snapshot build time.
+        // snapshot build time. Always keep the better-resolved set.
         let preserved_fabrics = self.forwarding.fabrics.clone();
         self.forwarding = build_forwarding_state(snapshot);
         if self.forwarding.fabrics.is_empty() && !preserved_fabrics.is_empty() {
             self.forwarding.fabrics = preserved_fabrics;
+        } else if !preserved_fabrics.is_empty() {
+            // Merge: for each preserved fabric, if the new snapshot
+            // doesn't have a matching parent_ifindex, keep the old one.
+            for old in &preserved_fabrics {
+                if !self.forwarding.fabrics.iter().any(|f| f.parent_ifindex == old.parent_ifindex) {
+                    self.forwarding.fabrics.push(*old);
+                }
+            }
         }
         self.shared_validation.store(Arc::new(self.validation));
         self.shared_forwarding
