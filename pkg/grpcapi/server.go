@@ -8254,14 +8254,14 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 
 	startTime := time.Now()
 	ctx := stream.Context()
-	ticker := time.NewTicker(time.Second)
+	trafficView := monitorTrafficViewFromProto(req)
+	ticker := time.NewTicker(trafficView.Refresh)
 	defer ticker.Stop()
-	summaryMode := monitorSummaryModeFromProto(req.GetSummaryMode())
 
 	// Previous snapshots for rate calculation.
 	var prevSingle *monitoriface.Snapshot
 	var baselineSingle *monitoriface.Snapshot
-	prevAll := make(map[string]*monitoriface.Snapshot)
+	trafficTracker := monitoriface.NewTrafficTracker(startTime)
 
 	readSnap := func(name string) *monitoriface.Snapshot {
 		snap, err := monitoriface.ReadSnapshot(s.dp, s.userspaceDataplaneStatus, name)
@@ -8288,17 +8288,15 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 		} else {
 			names, kernelNames := summaryInterfaces()
 			snaps := make(map[string]*monitoriface.Snapshot, len(names))
-			newPrev := make(map[string]*monitoriface.Snapshot, len(names))
 			for _, name := range names {
 				snap := readSnap(kernelNames[name])
 				if snap == nil {
 					continue
 				}
-				newPrev[name] = snap
 				snaps[name] = snap
 			}
-			monitoriface.RenderTrafficSummary(&buf, hostname, names, kernelNames, snaps, prevAll, summaryMode, startTime)
-			prevAll = newPrev
+			trafficTracker.Update(snaps)
+			trafficTracker.Render(&buf, hostname, names, snaps, trafficView)
 		}
 
 		if err := stream.Send(&pb.MonitorInterfaceResponse{Frame: buf.String()}); err != nil {
@@ -8313,17 +8311,47 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 	}
 }
 
-func monitorSummaryModeFromProto(mode pb.MonitorInterfaceSummaryMode) monitoriface.SummaryMode {
-	switch mode {
+func monitorTrafficViewFromProto(req *pb.MonitorInterfaceRequest) monitoriface.TrafficViewState {
+	view := monitoriface.DefaultTrafficViewState()
+	switch req.GetSummaryMode() {
 	case pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_PACKETS:
-		return monitoriface.SummaryModePackets
+		view.Unit = monitoriface.TrafficUnitPackets
+		view.Type = monitoriface.TrafficTypeRate
 	case pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_BYTES:
-		return monitoriface.SummaryModeBytes
+		view.Unit = monitoriface.TrafficUnitBytes
+		view.Type = monitoriface.TrafficTypeRate
 	case pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_DELTA:
-		return monitoriface.SummaryModeDelta
+		view.Unit = monitoriface.TrafficUnitPackets
+		view.Type = monitoriface.TrafficTypeSum
 	case pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_RATE:
-		return monitoriface.SummaryModeRate
-	default:
-		return monitoriface.SummaryModeCombined
+		view.Unit = monitoriface.TrafficUnitBits
+		view.Type = monitoriface.TrafficTypeRate
 	}
+	switch req.GetSummaryUnit() {
+	case pb.MonitorInterfaceSummaryUnit_MONITOR_INTERFACE_SUMMARY_UNIT_BYTES:
+		view.Unit = monitoriface.TrafficUnitBytes
+	case pb.MonitorInterfaceSummaryUnit_MONITOR_INTERFACE_SUMMARY_UNIT_BITS:
+		view.Unit = monitoriface.TrafficUnitBits
+	case pb.MonitorInterfaceSummaryUnit_MONITOR_INTERFACE_SUMMARY_UNIT_PACKETS:
+		view.Unit = monitoriface.TrafficUnitPackets
+	case pb.MonitorInterfaceSummaryUnit_MONITOR_INTERFACE_SUMMARY_UNIT_ERRORS:
+		view.Unit = monitoriface.TrafficUnitErrors
+	}
+	switch req.GetSummaryType() {
+	case pb.MonitorInterfaceSummaryType_MONITOR_INTERFACE_SUMMARY_TYPE_RATE:
+		view.Type = monitoriface.TrafficTypeRate
+	case pb.MonitorInterfaceSummaryType_MONITOR_INTERFACE_SUMMARY_TYPE_MAX:
+		view.Type = monitoriface.TrafficTypeMax
+	case pb.MonitorInterfaceSummaryType_MONITOR_INTERFACE_SUMMARY_TYPE_SUM:
+		view.Type = monitoriface.TrafficTypeSum
+	case pb.MonitorInterfaceSummaryType_MONITOR_INTERFACE_SUMMARY_TYPE_AVG:
+		view.Type = monitoriface.TrafficTypeAverage
+	}
+	if req.GetRefreshIntervalMs() > 0 {
+		view.Refresh = time.Duration(req.GetRefreshIntervalMs()) * time.Millisecond
+		if view.Refresh < 100*time.Millisecond {
+			view.Refresh = 100 * time.Millisecond
+		}
+	}
+	return view
 }
