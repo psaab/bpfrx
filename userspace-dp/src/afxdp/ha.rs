@@ -145,13 +145,15 @@ impl super::Coordinator {
             .ha_state_apply_seq
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        for handle in self.workers.values() {
+        for (worker_id, handle) in &self.workers {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::ApplyHAState {
                     sequence,
                     republish_owner_rgs: republish_owner_rgs.to_vec(),
                     demote_owner_rgs: demote_owner_rgs.to_vec(),
                 });
+            } else {
+                eprintln!("bpfrx-ha: worker-{} command mutex poisoned during HA state apply", worker_id);
             }
         }
         // Fire-and-forget: BPF session map is already updated synchronously
