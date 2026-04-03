@@ -342,14 +342,14 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 		m.proactiveNeighborResolveAsyncLocked()
 	}
 
-	// Sync HA state FIRST, then bump FIB generation. This order is
-	// critical: if fib_gen bumps before HA state changes, workers can
-	// create flow cache entries with the NEW fib_gen but the OLD HA
-	// state (RG still active). Those entries survive the demotion
-	// because their fib_gen matches the current gen. By syncing HA
-	// state first, workers see the demotion before the fib_gen bump,
-	// so any new flow cache entries correctly reflect HAInactive.
-	//
+	// Bump FIB generation BEFORE HA state to invalidate all existing
+	// flow cache entries. Then sync HA state. Then bump AGAIN to catch
+	// any entries created during the transition window between the first
+	// bump and the HA state change. This double-bump guarantees no stale
+	// flow cache entries survive demotion, even when owner_rg_id=0
+	// (physical interfaces without direct RG mapping).
+	m.inner.BumpFIBGeneration()
+
 	// Sync HA state DIRECTLY to helper without re-reading from BPF maps.
 	// The periodic status poll also reads rg_active and syncs to the helper,
 	// racing with us. If the poll syncs first, our syncHAStateLocked
