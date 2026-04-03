@@ -691,3 +691,28 @@ func TestHandleEventStreamDeltaMapsEventTypes(t *testing.T) {
 	d.handleEventStreamDelta(dpuserspace.EventTypeSessionClose, delta)
 	d.handleEventStreamDelta(dpuserspace.EventTypeSessionUpdate, delta)
 }
+
+// TestUserspaceManagerImplementsEventStreamExporter verifies that the userspace
+// Manager satisfies the userspaceEventStreamExporter interface used by
+// bulkSyncViaEventStreamOrFallback.
+func TestUserspaceManagerImplementsEventStreamExporter(t *testing.T) {
+	var mgr interface{} = &dpuserspace.Manager{}
+	if _, ok := mgr.(userspaceEventStreamExporter); !ok {
+		t.Fatal("userspace.Manager does not implement userspaceEventStreamExporter")
+	}
+}
+
+// TestBulkSyncFallbackWhenDPIsNil verifies that bulkSyncViaEventStreamOrFallback
+// falls through to BulkSync when the dataplane is nil (no event stream support).
+func TestBulkSyncFallbackWhenDPIsNil(t *testing.T) {
+	d := &Daemon{}
+	// dp is nil — type assertion to userspaceEventStreamExporter will fail,
+	// so it falls through to BulkSync. BulkSync on nil SessionSync panics,
+	// so we just verify the path selection logic doesn't crash before that.
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic from nil SessionSync BulkSync call")
+		}
+	}()
+	_ = d.bulkSyncViaEventStreamOrFallback(nil)
+}

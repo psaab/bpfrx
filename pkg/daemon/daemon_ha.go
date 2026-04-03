@@ -221,7 +221,7 @@ func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 				"baseline_sessions_received", baseline.SessionsReceived,
 				"baseline_sessions_installed", baseline.SessionsInstalled,
 				"baseline_deletes_received", baseline.DeletesReceived)
-			if err := ss.BulkSync(); err != nil {
+			if err := d.bulkSyncViaEventStreamOrFallback(ss); err != nil {
 				slog.Warn("cluster: session sync bulk prime retry failed",
 					"retry_gen", gen,
 					"attempt", attempt,
@@ -239,6 +239,22 @@ func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 			"retry_gen", gen,
 			"attempts", maxAttempts)
 	}()
+}
+
+// bulkSyncViaEventStreamOrFallback attempts to export all sessions via the
+// event stream (fast path — sessions flow through the existing event stream
+// callback into QueueSessionV4/V6). Falls back to the old BulkSync path
+// (iterating BPF maps from Go) when the event stream isn't available.
+func (d *Daemon) bulkSyncViaEventStreamOrFallback(ss *cluster.SessionSync) error {
+	if exporter, ok := d.dp.(userspaceEventStreamExporter); ok {
+		if err := exporter.ExportAllSessionsViaEventStream(); err != nil {
+			slog.Warn("cluster: event stream bulk export failed, falling back to BulkSync", "err", err)
+		} else {
+			slog.Info("cluster: exported sessions via event stream for bulk sync")
+			return nil
+		}
+	}
+	return ss.BulkSync()
 }
 
 // buildZoneIDs replicates the deterministic zone ID assignment from the
@@ -266,6 +282,10 @@ type userspaceSessionExporter interface {
 
 type userspaceEventStreamProvider interface {
 	EventStream() *dpuserspace.EventStream
+}
+
+type userspaceEventStreamExporter interface {
+	ExportAllSessionsViaEventStream() error
 }
 
 func daemonMonotonicSeconds() uint64 {
