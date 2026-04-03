@@ -368,7 +368,7 @@ impl super::Coordinator {
             .map_err(|_| "shared sessions lock poisoned".to_string())?;
 
         let ha_state = self.ha_state.load();
-        let mut count = 0usize;
+        let mut deltas = Vec::new();
         for entry in sessions.values() {
             // Only forward (non-reverse), locally-originated sessions.
             if entry.metadata.is_reverse {
@@ -398,18 +398,21 @@ impl super::Coordinator {
                 continue;
             }
 
-            let delta = crate::session::SessionDelta {
+            deltas.push(crate::session::SessionDelta {
                 kind: crate::session::SessionDeltaKind::Open,
                 key: entry.key.clone(),
                 decision: entry.decision,
                 metadata: entry.metadata.clone(),
                 origin: entry.origin,
                 fabric_redirect_sync: true,
-            };
-            handle.push_delta_lossless(&delta, zone_name_to_id)?;
-            count += 1;
+            });
         }
-        drop(sessions); // release lock before logging
+        drop(sessions);
+
+        let count = deltas.len();
+        for delta in &deltas {
+            handle.push_delta_lossless(delta, zone_name_to_id)?;
+        }
         eprintln!(
             "bpfrx-ha: exported {} sessions to event stream for bulk sync",
             count

@@ -11,7 +11,7 @@
 
 pub(crate) mod codec;
 
-pub(crate) use codec::{EventFrame, close_flags};
+pub(crate) use codec::{close_flags, EventFrame};
 
 use crate::session::{SessionDelta, SessionDeltaKind};
 use codec::{FRAME_HEADER_SIZE, MSG_ACK, MSG_DRAIN_REQUEST, MSG_KEEPALIVE, MSG_PAUSE, MSG_RESUME};
@@ -19,9 +19,9 @@ use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::io;
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -225,14 +225,13 @@ impl EventStreamWorkerHandle {
         }
     }
 
-    /// Encode and send a session delta as an event frame.
-    pub(crate) fn push_delta(
+    fn encode_delta_frame(
         &self,
         delta: &SessionDelta,
         zone_name_to_id: &FxHashMap<String, u16>,
-    ) {
+    ) -> EventFrame {
         let seq = self.next_seq();
-        let frame = match delta.kind {
+        match delta.kind {
             SessionDeltaKind::Open => EventFrame::encode_session_open(
                 seq,
                 &delta.key,
@@ -247,7 +246,16 @@ impl EventStreamWorkerHandle {
                 delta.metadata.owner_rg_id,
                 close_flags(delta),
             ),
-        };
+        }
+    }
+
+    /// Encode and send a session delta as an event frame.
+    pub(crate) fn push_delta(
+        &self,
+        delta: &SessionDelta,
+        zone_name_to_id: &FxHashMap<String, u16>,
+    ) {
+        let frame = self.encode_delta_frame(delta, zone_name_to_id);
         self.try_send(frame);
     }
 
@@ -258,23 +266,7 @@ impl EventStreamWorkerHandle {
         delta: &SessionDelta,
         zone_name_to_id: &FxHashMap<String, u16>,
     ) -> Result<(), String> {
-        let seq = self.next_seq();
-        let frame = match delta.kind {
-            SessionDeltaKind::Open => EventFrame::encode_session_open(
-                seq,
-                &delta.key,
-                &delta.decision,
-                &delta.metadata,
-                zone_name_to_id,
-                delta.fabric_redirect_sync,
-            ),
-            SessionDeltaKind::Close => EventFrame::encode_session_close(
-                seq,
-                &delta.key,
-                delta.metadata.owner_rg_id,
-                close_flags(delta),
-            ),
-        };
+        let frame = self.encode_delta_frame(delta, zone_name_to_id);
         self.send_frame_lossless(frame)
     }
 }
@@ -787,16 +779,47 @@ mod tests {
 
         assert!(handle.try_send(EventFrame::encode_drain_complete(1)));
 
-        let join = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(0);
+        let (attempt_tx, attempt_rx) = mpsc::sync_channel::<()>(0);
+        let (done_tx, done_rx) = mpsc::sync_channel::<Result<(), String>>(0);
+        let (hold_tx, hold_rx) = mpsc::sync_channel::<()>(0);
+
+        let consumer_join = thread::spawn(move || {
+            release_rx.recv().expect("release consumer");
             rx.recv().expect("drain queued frame");
-            thread::sleep(Duration::from_millis(20));
+            hold_rx
+                .recv()
+                .expect("hold consumer open until sender finishes");
         });
 
-        handle
-            .send_frame_lossless(EventFrame::encode_drain_complete(2))
+        let sender_handle = handle.clone();
+        let sender_join = thread::spawn(move || {
+            attempt_tx
+                .send(())
+                .expect("notify that lossless send is about to start");
+            let result = sender_handle.send_frame_lossless(EventFrame::encode_drain_complete(2));
+            done_tx.send(result).expect("send lossless result");
+        });
+
+        attempt_rx
+            .recv()
+            .expect("wait for sender thread to begin lossless send");
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "lossless send should still be waiting while the channel remains full"
+        );
+
+        release_tx.send(()).expect("allow consumer to drain");
+
+        done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("lossless send should finish once capacity is available")
             .expect("lossless send should wait for capacity");
-        join.join().expect("consumer thread");
+
+        hold_tx.send(()).expect("release consumer thread");
+        sender_join.join().expect("sender thread");
+        consumer_join.join().expect("consumer thread");
         assert_eq!(shared.frames_dropped.load(Ordering::Relaxed), 0);
     }
 
