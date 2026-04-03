@@ -89,7 +89,6 @@ pub(super) struct WorkerHandle {
     pub(super) stop: Arc<AtomicBool>,
     pub(super) heartbeat: Arc<AtomicU64>,
     pub(super) commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
-    pub(super) ha_state_apply_ack: Arc<AtomicU64>,
     pub(super) session_export_ack: Arc<AtomicU64>,
     pub(super) join: Option<JoinHandle<()>>,
 }

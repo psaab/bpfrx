@@ -92,7 +92,7 @@ impl super::Coordinator {
                     self.rg_epochs[idx].fetch_add(1, Ordering::Release);
                 }
             }
-            self.enqueue_apply_ha_state(&demoted_rgs, &demoted_rgs)?;
+            self.enqueue_apply_ha_state(&demoted_rgs, &demoted_rgs);
             // Record cache flush timestamp for observability (#312).
             self.last_cache_flush_at.store(now_secs, Ordering::Relaxed);
         }
@@ -128,7 +128,7 @@ impl super::Coordinator {
                 &activated_rgs,
                 now_secs,
             );
-            self.enqueue_apply_ha_state(&[], &[])?;
+            self.enqueue_apply_ha_state(&[], &[]);
         }
         Ok(())
     }
@@ -137,46 +137,28 @@ impl super::Coordinator {
         &self,
         republish_owner_rgs: &[i32],
         demote_owner_rgs: &[i32],
-    ) -> Result<(), String> {
+    ) {
         if self.workers.is_empty() {
-            return Ok(());
+            return;
         }
         let sequence = self
             .ha_state_apply_seq
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        for handle in self.workers.values() {
-            let mut pending = handle
-                .commands
-                .lock()
-                .map_err(|_| "worker command queue poisoned".to_string())?;
-            pending.push_back(WorkerCommand::ApplyHAState {
-                sequence,
-                republish_owner_rgs: republish_owner_rgs.to_vec(),
-                demote_owner_rgs: demote_owner_rgs.to_vec(),
-            });
-        }
-        self.wait_for_ha_state_apply(sequence, Duration::from_secs(2))
-    }
-
-    fn wait_for_ha_state_apply(&self, sequence: u64, timeout: Duration) -> Result<(), String> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if self
-                .workers
-                .values()
-                .all(|handle| handle.ha_state_apply_ack.load(Ordering::Acquire) >= sequence)
-            {
-                return Ok(());
+        for (worker_id, handle) in &self.workers {
+            if let Ok(mut pending) = handle.commands.lock() {
+                pending.push_back(WorkerCommand::ApplyHAState {
+                    sequence,
+                    republish_owner_rgs: republish_owner_rgs.to_vec(),
+                    demote_owner_rgs: demote_owner_rgs.to_vec(),
+                });
+            } else {
+                eprintln!("bpfrx-ha: worker-{} command mutex poisoned during HA state apply", worker_id);
             }
-            if std::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "ha state apply seq={} timed out waiting for worker acks",
-                    sequence
-                ));
-            }
-            thread::sleep(Duration::from_millis(1));
         }
+        // Fire-and-forget: BPF session map is already updated synchronously
+        // and flow cache uses epoch-based invalidation. No need to wait for
+        // worker acks.
     }
 
     pub fn export_owner_rg_sessions(

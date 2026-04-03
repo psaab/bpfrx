@@ -792,7 +792,6 @@ impl Coordinator {
             let plan_count = binding_plans.len();
             let stop = Arc::new(AtomicBool::new(false));
             let heartbeat = Arc::new(AtomicU64::new(monotonic_nanos()));
-            let ha_state_apply_ack = Arc::new(AtomicU64::new(0));
             let session_export_ack = Arc::new(AtomicU64::new(0));
             let commands = worker_command_queues
                 .get(&worker_id)
@@ -811,7 +810,6 @@ impl Coordinator {
             let shared_owner_rg_indexes = self.shared_owner_rg_indexes.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
-            let ha_state_apply_ack_clone = ha_state_apply_ack.clone();
             let session_export_ack_clone = session_export_ack.clone();
             let commands_clone = commands.clone();
             let peer_commands_clone = worker_command_queues
@@ -848,7 +846,6 @@ impl Coordinator {
                         peer_commands_clone,
                         stop_clone,
                         heartbeat_clone,
-                        ha_state_apply_ack_clone,
                         session_export_ack_clone,
                         worker_poll_mode,
                         dnat_fds,
@@ -869,7 +866,6 @@ impl Coordinator {
                             stop,
                             heartbeat,
                             commands,
-                            ha_state_apply_ack,
                             session_export_ack,
                             join: Some(join),
                         },
@@ -4970,7 +4966,6 @@ fn worker_loop(
     peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
-    ha_state_apply_ack: Arc<AtomicU64>,
     session_export_ack: Arc<AtomicU64>,
     poll_mode: crate::PollMode,
     dnat_fds: DnatTableFds,
@@ -5332,9 +5327,6 @@ fn worker_loop(
         }
         if !bindings.is_empty() {
             poll_start = (poll_start + 1) % bindings.len();
-        }
-        if let Some(sequence) = command_results.applied_sequences.iter().copied().max() {
-            ha_state_apply_ack.store(sequence, Ordering::Release);
         }
         if !command_results.applied_sequences.is_empty()
             || !command_results.exported_sequences.is_empty()
