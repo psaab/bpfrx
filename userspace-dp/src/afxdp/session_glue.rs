@@ -195,23 +195,22 @@ fn export_forward_sessions_for_owner_rgs(sessions: &mut SessionTable, owner_rgs:
     if owner_rgs.is_empty() {
         return;
     }
-    let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
     let mut export = Vec::new();
-    sessions.iter_with_origin(|key, decision, metadata, origin| {
+    for key in sessions.owner_rg_session_keys(owner_rgs) {
+        let Some((decision, metadata, origin)) = sessions.entry_with_origin(&key) else {
+            continue;
+        };
         if metadata.is_reverse || origin.is_peer_synced() || metadata.fabric_ingress {
-            return;
-        }
-        if !owner_rg_set.contains(&metadata.owner_rg_id) {
-            return;
+            continue;
         }
         if !matches!(
             decision.resolution.disposition,
             ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
         ) {
-            return;
+            continue;
         }
-        export.push((key.clone(), decision, metadata.clone(), origin));
-    });
+        export.push((key, decision, metadata, origin));
+    }
     for (key, decision, metadata, origin) in export {
         sessions.emit_open_delta_with_origin(key, decision, metadata, origin, true);
     }
@@ -468,19 +467,14 @@ pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
     }
     let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
     let mut refreshed_keys = Vec::new();
-    let candidates = {
-        let mut out = Vec::new();
-        sessions.iter_with_origin(|key, decision, metadata, origin| {
-            // Collect ALL entries — the post-filter after HA re-resolution
-            // (line ~637) checks both original and refreshed owner_rg_id.
-            // Pre-filtering here would drop sessions currently owned by
-            // another RG that re-resolve into the activated set after
-            // split-RG failback (#286 review feedback).
-            out.push((key.clone(), decision, metadata.clone(), origin));
-        });
-        out
-    };
-    for (key, decision, metadata, origin) in candidates {
+    // Shared-state reverse prewarm already handles the split-RG case where a
+    // forward session's synthesized reverse companion belongs to a different
+    // RG (#405). The live worker table only needs to touch sessions that are
+    // currently indexed to the affected owner RGs.
+    for key in sessions.owner_rg_session_keys(owner_rgs) {
+        let Some((decision, metadata, origin)) = sessions.entry_with_origin(&key) else {
+            continue;
+        };
         let delta_metadata = metadata.clone();
         let flow = SessionFlow {
             src_ip: key.src_ip,
