@@ -389,12 +389,10 @@ pub(super) fn apply_worker_commands(
                 }
             }
             WorkerCommand::UpsertLocal(entry) => {
-                let key = entry.key.clone();
-                let metadata = entry.metadata.clone();
                 sessions.install_with_protocol_with_origin(
-                    key.clone(),
+                    entry.key,
                     entry.decision,
-                    metadata.clone(),
+                    entry.metadata,
                     entry.origin,
                     now_ns,
                     entry.protocol,

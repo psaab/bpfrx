@@ -537,11 +537,11 @@ impl SessionTable {
                 // Peer-synced entry being promoted by local traffic — allow
             } else if entry.origin.is_peer_synced() && origin.is_peer_synced() {
                 // Both peer-synced: reject (refresh_local on synced entry)
-                self.sessions.insert(key.clone(), entry);
+                self.restore_entry(key.clone(), entry);
                 return false;
             } else if !entry.origin.is_peer_synced() && origin.is_peer_synced() {
                 // Local entry: reject peer data trying to overwrite
-                self.sessions.insert(key.clone(), entry);
+                self.restore_entry(key.clone(), entry);
                 return false;
             }
             // Both local: allow (local refresh of local entry)
@@ -554,8 +554,7 @@ impl SessionTable {
         entry.last_seen_ns = now_ns;
         entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &self.timeouts);
         entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
-        self.sessions.insert(key.clone(), entry);
-        self.index_forward_nat_key(key, decision, &metadata);
+        self.restore_entry(key.clone(), entry);
         // Emit open delta when promoting a peer-synced entry to local
         if was_peer_synced && !origin.is_peer_synced() && !metadata.is_reverse {
             self.push_delta(SessionDelta {
@@ -781,6 +780,11 @@ impl SessionTable {
         self.remove_forward_nat_index(key, entry.decision, &entry.metadata);
         remove_owner_rg_index_entry(&mut self.owner_rg_sessions, entry.metadata.owner_rg_id, key);
         Some(entry)
+    }
+
+    fn restore_entry(&mut self, key: SessionKey, entry: SessionEntry) -> Option<SessionEntry> {
+        self.index_forward_nat_key(&key, entry.decision, &entry.metadata);
+        self.sessions.insert(key, entry)
     }
 
     fn index_forward_nat_key(
@@ -2118,6 +2122,7 @@ mod tests {
             2_000_000,
             0x10,
         ));
+        assert_eq!(table.owner_rg_session_keys(&[1]), vec![key.clone()]);
         // session should still have original decision
         let lookup = table.lookup(&key, 3_000_000, 0x10).expect("session");
         assert_ne!(lookup.decision.resolution.egress_ifindex, 99);

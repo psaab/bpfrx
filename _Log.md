@@ -151,3 +151,7 @@
 - **Timestamp**: 2026-04-03T01:01:45Z
   - **Action**: Final #389 slice — index worker-local sessions by owner RG and use those indexes for export, demotion, and activation refresh so helper HA apply no longer scans the full live session table
   - **File(s)**: userspace-dp/src/session.rs, userspace-dp/src/afxdp/session_glue.rs, _Log.md
+
+- **Timestamp**: 2026-04-03T03:00:15Z
+  - **Action**: Applied Copilot review fixes for stacked #389 PRs — make reverse-prewarm owner-RG index updates lock once per refresh, restore derived indexes on rejected session updates, and remove unnecessary hot-path clones
+  - **File(s)**: userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/session.rs, userspace-dp/src/afxdp/session_glue.rs, userspace-dp/src/afxdp.rs, _Log.md
