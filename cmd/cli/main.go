@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -3075,19 +3076,25 @@ func (c *ctl) handleMonitor(args []string) error {
 }
 
 func (c *ctl) handleMonitorInterface(args []string) error {
-	req := &pb.MonitorInterfaceRequest{}
 	if len(args) > 0 {
-		if args[0] == "traffic" {
-			mode, err := remoteMonitorSummaryMode(args[1:])
-			if err != nil {
-				return err
-			}
-			req.SummaryMode = mode
-		} else {
-			req.InterfaceName = args[0]
+		if args[0] != "traffic" {
+			return c.remoteMonitorInterfaceSingle(args[0])
 		}
+		view, err := monitoriface.ParseTrafficViewArgs(args[1:])
+		if err != nil {
+			return err
+		}
+		return c.remoteMonitorInterfaceTraffic(view)
 	}
-	// "traffic" or no args → summary mode (empty interface_name).
+	view, err := monitoriface.ParseTrafficViewArgs(nil)
+	if err != nil {
+		return err
+	}
+	return c.remoteMonitorInterfaceTraffic(view)
+}
+
+func (c *ctl) remoteMonitorInterfaceSingle(name string) error {
+	req := &pb.MonitorInterfaceRequest{InterfaceName: name}
 
 	ctx, cancel := context.WithCancel(c.ctx())
 	defer cancel()
@@ -3109,33 +3116,161 @@ func (c *ctl) handleMonitorInterface(args []string) error {
 			return fmt.Errorf("%v", err)
 		}
 		// Clear screen and print the frame.
-		fmt.Print("\x1b[2J\x1b[H")
+		fmt.Print(monitoriface.ClearAndHome)
 		fmt.Print(resp.Frame)
 	}
 	return nil
 }
 
-func remoteMonitorSummaryMode(args []string) (pb.MonitorInterfaceSummaryMode, error) {
-	if len(args) == 0 {
-		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_COMBINED, nil
+func (c *ctl) remoteMonitorInterfaceTraffic(view monitoriface.TrafficViewState) error {
+	fd := int(os.Stdin.Fd())
+	old, err := monitoriface.SetRawMode(fd)
+	if err != nil {
+		return fmt.Errorf("failed to set raw mode: %w", err)
 	}
-	mode, ok := monitoriface.ParseSummaryMode(args[0])
-	if !ok {
-		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_COMBINED,
-			fmt.Errorf("unknown monitor interface traffic mode: %s", args[0])
+	defer monitoriface.RestoreTermMode(fd, old)
+
+	fmt.Print(monitoriface.EnterAltScreen + monitoriface.HideCursor)
+	defer fmt.Print(monitoriface.ShowCursor + monitoriface.ExitAltScreen)
+
+	keyCh := make(chan byte, 8)
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if err != nil || n == 0 {
+				return
+			}
+			keyCh <- buf[0]
+		}
+	}()
+
+	type frameMsg struct {
+		gen   int
+		frame string
 	}
-	switch mode {
-	case monitoriface.SummaryModePackets:
-		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_PACKETS, nil
-	case monitoriface.SummaryModeBytes:
-		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_BYTES, nil
-	case monitoriface.SummaryModeDelta:
-		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_DELTA, nil
-	case monitoriface.SummaryModeRate:
-		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_RATE, nil
+	type errMsg struct {
+		gen int
+		err error
+	}
+
+	frames := make(chan frameMsg, 16)
+	errs := make(chan errMsg, 4)
+	var currentFrame string
+	showHelp := false
+	generation := 0
+	var cancel context.CancelFunc
+
+	startStream := func() error {
+		generation++
+		gen := generation
+		if cancel != nil {
+			cancel()
+		}
+		ctx, streamCancel := context.WithCancel(c.ctx())
+		cancel = streamCancel
+		stream, err := c.client.MonitorInterface(ctx, buildRemoteMonitorTrafficRequest(view))
+		if err != nil {
+			cancel = nil
+			return err
+		}
+		go func(gen int) {
+			for {
+				resp, err := stream.Recv()
+				if err != nil {
+					errs <- errMsg{gen: gen, err: err}
+					return
+				}
+				frames <- frameMsg{gen: gen, frame: resp.Frame}
+			}
+		}(gen)
+		return nil
+	}
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+	}()
+
+	render := func() {
+		fmt.Print(monitoriface.ClearAndHome)
+		if showHelp {
+			monitoriface.RenderTrafficHelp(os.Stdout, view)
+			return
+		}
+		fmt.Print(currentFrame)
+	}
+
+	if err := startStream(); err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	render()
+
+	for {
+		select {
+		case msg := <-frames:
+			if msg.gen != generation {
+				continue
+			}
+			currentFrame = msg.frame
+			if !showHelp {
+				render()
+			}
+		case msg := <-errs:
+			if msg.gen != generation {
+				continue
+			}
+			if msg.err == io.EOF || errors.Is(msg.err, context.Canceled) {
+				continue
+			}
+			return fmt.Errorf("%v", msg.err)
+		case key := <-keyCh:
+			if showHelp {
+				showHelp = false
+				render()
+				continue
+			}
+			switch view.HandleKey(key) {
+			case monitoriface.TrafficKeyQuit:
+				return nil
+			case monitoriface.TrafficKeyShowHelp:
+				showHelp = true
+				render()
+			case monitoriface.TrafficKeyChanged:
+				if err := startStream(); err != nil {
+					return fmt.Errorf("%v", err)
+				}
+				render()
+			}
+		}
+	}
+}
+
+func buildRemoteMonitorTrafficRequest(view monitoriface.TrafficViewState) *pb.MonitorInterfaceRequest {
+	req := &pb.MonitorInterfaceRequest{
+		RefreshIntervalMs: uint32(view.Refresh / time.Millisecond),
+	}
+	switch view.Unit {
+	case monitoriface.TrafficUnitBits:
+		req.SummaryUnit = pb.MonitorInterfaceSummaryUnit_MONITOR_INTERFACE_SUMMARY_UNIT_BITS
+	case monitoriface.TrafficUnitPackets:
+		req.SummaryUnit = pb.MonitorInterfaceSummaryUnit_MONITOR_INTERFACE_SUMMARY_UNIT_PACKETS
+	case monitoriface.TrafficUnitErrors:
+		req.SummaryUnit = pb.MonitorInterfaceSummaryUnit_MONITOR_INTERFACE_SUMMARY_UNIT_ERRORS
 	default:
-		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_COMBINED, nil
+		req.SummaryUnit = pb.MonitorInterfaceSummaryUnit_MONITOR_INTERFACE_SUMMARY_UNIT_BYTES
 	}
+	switch view.Type {
+	case monitoriface.TrafficTypeMax:
+		req.SummaryType = pb.MonitorInterfaceSummaryType_MONITOR_INTERFACE_SUMMARY_TYPE_MAX
+	case monitoriface.TrafficTypeSum:
+		req.SummaryType = pb.MonitorInterfaceSummaryType_MONITOR_INTERFACE_SUMMARY_TYPE_SUM
+	case monitoriface.TrafficTypeAverage:
+		req.SummaryType = pb.MonitorInterfaceSummaryType_MONITOR_INTERFACE_SUMMARY_TYPE_AVG
+	default:
+		req.SummaryType = pb.MonitorInterfaceSummaryType_MONITOR_INTERFACE_SUMMARY_TYPE_RATE
+	}
+	return req
 }
 
 func (c *ctl) handleMonitorSecurity(args []string) error {

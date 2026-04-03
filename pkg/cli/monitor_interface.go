@@ -10,39 +10,10 @@ import (
 	"github.com/psaab/bpfrx/pkg/config"
 	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 	"github.com/psaab/bpfrx/pkg/monitoriface"
-	"golang.org/x/sys/unix"
 )
 
 type ifaceSnapshot = monitoriface.Snapshot
 type userspaceIfaceSnapshot = monitoriface.UserspaceSnapshot
-
-// setRawMode puts the terminal into raw mode for single-character reads.
-func setRawMode(fd int) (*unix.Termios, error) {
-	old, err := unix.IoctlGetTermios(fd, unix.TCGETS)
-	if err != nil {
-		return nil, err
-	}
-	raw := *old
-	raw.Lflag &^= unix.ECHO | unix.ICANON | unix.ISIG
-	raw.Cc[unix.VMIN] = 1
-	raw.Cc[unix.VTIME] = 0
-	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &raw); err != nil {
-		return nil, err
-	}
-	return old, nil
-}
-
-func restoreTermMode(fd int, old *unix.Termios) {
-	_ = unix.IoctlSetTermios(fd, unix.TCSETS, old)
-}
-
-const (
-	enterAltScreen = "\x1b[?1049h"
-	exitAltScreen  = "\x1b[?1049l"
-	clearAndHome   = "\x1b[2J\x1b[H"
-	hideCursor     = "\x1b[?25l"
-	showCursor     = "\x1b[?25h"
-)
 
 func resolveFabricParent(name string) string {
 	return monitoriface.ResolvePhysicalParent(name)
@@ -74,25 +45,18 @@ func (c *CLI) handleMonitorInterface(args []string) error {
 	}
 
 	if args[0] == "traffic" {
-		mode, err := parseMonitorSummaryMode(args[1:])
+		view, err := parseMonitorTrafficView(args[1:])
 		if err != nil {
 			return err
 		}
-		return c.monitorInterfaceTraffic(mode)
+		return c.monitorInterfaceTraffic(view)
 	}
 
 	return c.monitorInterfaceSingle(args[0])
 }
 
-func parseMonitorSummaryMode(args []string) (monitoriface.SummaryMode, error) {
-	if len(args) == 0 {
-		return monitoriface.SummaryModeCombined, nil
-	}
-	mode, ok := monitoriface.ParseSummaryMode(args[0])
-	if !ok {
-		return monitoriface.SummaryModeCombined, fmt.Errorf("unknown monitor interface traffic mode: %s", args[0])
-	}
-	return mode, nil
+func parseMonitorTrafficView(args []string) (monitoriface.TrafficViewState, error) {
+	return monitoriface.ParseTrafficViewArgs(args)
 }
 
 // sortedConfiguredInterfaces returns sorted interface names from active config.
@@ -157,14 +121,14 @@ func (c *CLI) monitorInterfaceSingle(ifaceName string) error {
 	}
 
 	fd := int(os.Stdin.Fd())
-	old, err := setRawMode(fd)
+	old, err := monitoriface.SetRawMode(fd)
 	if err != nil {
 		return fmt.Errorf("failed to set raw mode: %w", err)
 	}
-	defer restoreTermMode(fd, old)
+	defer monitoriface.RestoreTermMode(fd, old)
 
-	fmt.Print(enterAltScreen + hideCursor)
-	defer fmt.Print(showCursor + exitAltScreen)
+	fmt.Print(monitoriface.EnterAltScreen + monitoriface.HideCursor)
+	defer fmt.Print(monitoriface.ShowCursor + monitoriface.ExitAltScreen)
 
 	keyCh := make(chan byte, 8)
 	go func() {
@@ -197,7 +161,7 @@ func (c *CLI) monitorInterfaceSingle(ifaceName string) error {
 			snapCopy := snap
 			baseline = &snapCopy
 		}
-		fmt.Print(clearAndHome)
+		fmt.Print(monitoriface.ClearAndHome)
 		monitoriface.RenderSingleInterface(os.Stdout, c.hostname, displayName, kn, &snap, prev, baseline, startTime)
 		snapCopy := snap
 		prev = &snapCopy
@@ -243,16 +207,16 @@ func (c *CLI) monitorInterfaceSingle(ifaceName string) error {
 }
 
 // monitorInterfaceTraffic shows a full-screen all-interfaces summary table.
-func (c *CLI) monitorInterfaceTraffic(mode monitoriface.SummaryMode) error {
+func (c *CLI) monitorInterfaceTraffic(view monitoriface.TrafficViewState) error {
 	fd := int(os.Stdin.Fd())
-	old, err := setRawMode(fd)
+	old, err := monitoriface.SetRawMode(fd)
 	if err != nil {
 		return fmt.Errorf("failed to set raw mode: %w", err)
 	}
-	defer restoreTermMode(fd, old)
+	defer monitoriface.RestoreTermMode(fd, old)
 
-	fmt.Print(enterAltScreen + hideCursor)
-	defer fmt.Print(showCursor + exitAltScreen)
+	fmt.Print(monitoriface.EnterAltScreen + monitoriface.HideCursor)
+	defer fmt.Print(monitoriface.ShowCursor + monitoriface.ExitAltScreen)
 
 	keyCh := make(chan byte, 8)
 	go func() {
@@ -266,13 +230,19 @@ func (c *CLI) monitorInterfaceTraffic(mode monitoriface.SummaryMode) error {
 		}
 	}()
 
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(view.Refresh)
 	defer ticker.Stop()
 
 	startTime := time.Now()
-	prevSnaps := make(map[string]*monitoriface.Snapshot)
+	tracker := monitoriface.NewTrafficTracker(startTime)
+	showHelp := false
 
 	renderNow := func() {
+		fmt.Print(monitoriface.ClearAndHome)
+		if showHelp {
+			monitoriface.RenderTrafficHelp(os.Stdout, view)
+			return
+		}
 		names, kernelNames := c.summaryInterfaces()
 		snaps := make(map[string]*monitoriface.Snapshot, len(names))
 		for _, name := range names {
@@ -283,34 +253,31 @@ func (c *CLI) monitorInterfaceTraffic(mode monitoriface.SummaryMode) error {
 			snapCopy := snap
 			snaps[name] = &snapCopy
 		}
-		fmt.Print(clearAndHome)
-		monitoriface.RenderTrafficSummary(os.Stdout, c.hostname, names, kernelNames, snaps, prevSnaps, mode, startTime)
-		prevSnaps = snaps
+		tracker.Update(snaps)
+		tracker.Render(os.Stdout, c.hostname, names, snaps, view)
 	}
 	renderNow()
 
 	for {
 		select {
 		case <-ticker.C:
-			renderNow()
+			if !showHelp {
+				renderNow()
+			}
 		case key := <-keyCh:
-			switch key {
-			case 'q', 'Q', 0x1b, 0x03:
+			if showHelp {
+				showHelp = false
+				renderNow()
+				continue
+			}
+			switch view.HandleKey(key) {
+			case monitoriface.TrafficKeyQuit:
 				return nil
-			case 'c', 'C':
-				mode = monitoriface.SummaryModeCombined
+			case monitoriface.TrafficKeyShowHelp:
+				showHelp = true
 				renderNow()
-			case 'p', 'P':
-				mode = monitoriface.SummaryModePackets
-				renderNow()
-			case 'b', 'B':
-				mode = monitoriface.SummaryModeBytes
-				renderNow()
-			case 'd', 'D':
-				mode = monitoriface.SummaryModeDelta
-				renderNow()
-			case 'r', 'R':
-				mode = monitoriface.SummaryModeRate
+			case monitoriface.TrafficKeyChanged:
+				ticker.Reset(view.Refresh)
 				renderNow()
 			}
 		}

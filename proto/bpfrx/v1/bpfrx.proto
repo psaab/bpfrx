@@ -144,6 +144,22 @@ enum MonitorInterfaceSummaryMode {
   MONITOR_INTERFACE_SUMMARY_MODE_RATE = 4;
 }
 
+enum MonitorInterfaceSummaryUnit {
+  MONITOR_INTERFACE_SUMMARY_UNIT_UNSPECIFIED = 0;
+  MONITOR_INTERFACE_SUMMARY_UNIT_BYTES = 1;
+  MONITOR_INTERFACE_SUMMARY_UNIT_BITS = 2;
+  MONITOR_INTERFACE_SUMMARY_UNIT_PACKETS = 3;
+  MONITOR_INTERFACE_SUMMARY_UNIT_ERRORS = 4;
+}
+
+enum MonitorInterfaceSummaryType {
+  MONITOR_INTERFACE_SUMMARY_TYPE_UNSPECIFIED = 0;
+  MONITOR_INTERFACE_SUMMARY_TYPE_RATE = 1;
+  MONITOR_INTERFACE_SUMMARY_TYPE_MAX = 2;
+  MONITOR_INTERFACE_SUMMARY_TYPE_SUM = 3;
+  MONITOR_INTERFACE_SUMMARY_TYPE_AVG = 4;
+}
+
 message ShowConfigRequest {
   ConfigFormat format = 1;
   ConfigTarget target = 2;
@@ -642,6 +658,9 @@ message MonitorPacketDropResponse { string line = 1; }
 message MonitorInterfaceRequest {
   string interface_name = 1;  // empty = traffic summary mode
   MonitorInterfaceSummaryMode summary_mode = 2;
+  MonitorInterfaceSummaryUnit summary_unit = 3;
+  MonitorInterfaceSummaryType summary_type = 4;
+  uint32 refresh_interval_ms = 5;
 }
 message MonitorInterfaceResponse {
   string frame = 1;  // pre-formatted text frame
