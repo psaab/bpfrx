@@ -2612,9 +2612,6 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 					d.clearRethServicesForRG(ev.GroupID)
 				}
 			}
-			if d.dp != nil {
-				d.dp.BumpFIBGeneration()
-			}
 
 			// Strict VIP ownership: suppress GARP on secondary, allow on primary.
 			// Not applicable with no-reth-vrrp (no VRRP instances).
@@ -2724,7 +2721,6 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					} else {
 						s.ApplyIfCurrent(tr)
 					}
-					d.dp.BumpFIBGeneration()
 					go d.warmNeighborCache()
 					go func() {
 						// Resolve config-based next-hops (static routes,
@@ -2762,7 +2758,6 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 						} else {
 							s.ApplyIfCurrent(tr)
 						}
-						d.dp.BumpFIBGeneration()
 						go d.RefreshFabricFwd()
 					}
 					d.removeStableRethLinkLocal(rgID)
@@ -2935,7 +2930,6 @@ func (d *Daemon) reconcileRGState() {
 				} else {
 					s.MarkApplied(true)
 				}
-				d.dp.BumpFIBGeneration()
 			} else {
 				// Deactivation ordering: blackholes FIRST, then
 				// clear rg_active.
@@ -2947,7 +2941,6 @@ func (d *Daemon) reconcileRGState() {
 				} else {
 					s.MarkApplied(false)
 				}
-				d.dp.BumpFIBGeneration()
 			}
 		}
 

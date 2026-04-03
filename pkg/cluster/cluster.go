@@ -196,7 +196,7 @@ type Manager struct {
 // DefaultTakeoverHoldTime is the default duration an RG must be ready
 // before election promotes it to primary.
 const DefaultTakeoverHoldTime = 3 * time.Second
-const DefaultPreManualFailoverRetryTimeout = 45 * time.Second
+const DefaultPreManualFailoverRetryTimeout = 5 * time.Second
 const DefaultPreManualFailoverRetryInterval = 500 * time.Millisecond
 
 // NewManager creates a new cluster manager.
