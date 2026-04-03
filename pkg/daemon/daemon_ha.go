@@ -1147,6 +1147,15 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	// sessions. Planned failover should not depend on bulk sync state —
 	// both nodes have full session state from continuous real-time sync.
 
+	// Stop the bulk sync retry loop — it floods the sync TCP connection
+	// with session data, delaying the barrier write/ack by 30+ seconds.
+	// Advancing the retry generation causes the goroutine to exit.
+	d.syncPrimeRetryGen.Add(1)
+
+	// Drain queued session messages so the barrier isn't delayed by
+	// hundreds of session writes already in the TCP send buffer.
+	d.sessionSync.DrainSendQueue()
+
 	// Drain any in-flight barrier from a previous demotion attempt.
 	pendingBarrierTimeout := barrierTimeout / 2
 	if pendingBarrierTimeout > 10*time.Second {

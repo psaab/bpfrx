@@ -319,7 +319,10 @@ impl ForwardingDisposition {
     ///   - `NextTableUnsupported`: Inter-VRF route leaking hit an
     ///     unsupported next-table. Permanent miss, not worth caching.
     pub(super) fn is_cacheable(self) -> bool {
-        matches!(self, ForwardingDisposition::ForwardCandidate)
+        matches!(
+            self,
+            ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
+        )
     }
 }
 

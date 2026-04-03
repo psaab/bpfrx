@@ -336,6 +336,23 @@ func (s *SessionSync) writeBarrierMessage(payload []byte, timeout time.Duration)
 	return nil
 }
 
+// DrainSendQueue discards all pending messages in sendCh so the TCP
+// send buffer isn't clogged when a barrier needs prompt delivery.
+func (s *SessionSync) DrainSendQueue() int {
+	drained := 0
+	for {
+		select {
+		case <-s.sendCh:
+			drained++
+		default:
+			if drained > 0 {
+				slog.Info("cluster sync: drained send queue", "messages", drained)
+			}
+			return drained
+		}
+	}
+}
+
 // WaitForPeerBarrier queues an ordered marker on the session-sync stream and
 // waits until the peer acknowledges that it processed all earlier messages.
 func (s *SessionSync) WaitForPeerBarrier(timeout time.Duration) error {
