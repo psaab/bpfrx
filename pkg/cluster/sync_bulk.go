@@ -314,21 +314,22 @@ func (s *SessionSync) writeBarrierMessage(payload []byte, timeout time.Duration)
 	if conn == nil {
 		return fmt.Errorf("session sync not connected")
 	}
-	// Barrier requests go through sendCh (NOT barrierCh) to preserve
-	// ordering with session messages. The barrier must be written AFTER
-	// all previously queued session data so the peer's ack proves it
-	// processed those sessions. Only barrier/bulk ACKS use barrierCh
-	// since they're responses that don't need ordering.
+	// Write barrier directly under writeMu — same approach as barrier
+	// ACKs. This ensures the barrier is sent promptly regardless of how
+	// many session messages are queued in sendCh. The ordering guarantee
+	// (barrier proves peer processed prior sessions) is relaxed for
+	// planned failovers where both nodes already have synced sessions
+	// via the event stream. The peer barrier ack includes its session
+	// counts so the caller can verify convergence independently.
 	msg := encodeRawMessage(syncMsgBarrier, payload)
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case s.sendCh <- msg:
-	case <-timer.C:
-		return fmt.Errorf("timed out queueing session sync barrier")
-	}
 	seq := binary.LittleEndian.Uint64(payload)
-	slog.Info("cluster sync: barrier queued (priority)",
+	s.writeMu.Lock()
+	err := writeFull(conn, msg)
+	s.writeMu.Unlock()
+	if err != nil {
+		return fmt.Errorf("barrier write failed: %w", err)
+	}
+	slog.Info("cluster sync: barrier sent (direct)",
 		"seq", seq,
 		"local", connLocalAddrString(conn),
 		"remote", connRemoteAddrString(conn))
