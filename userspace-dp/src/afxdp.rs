@@ -2644,7 +2644,7 @@ fn poll_binding(
                                     if sessions.install_with_protocol_with_origin(
                                         flow.forward_key.clone(),
                                         fabric_return_decision,
-                                        fabric_return_metadata,
+                                        fabric_return_metadata.clone(),
                                         SessionOrigin::ReverseFlow,
                                         now_ns,
                                         meta.protocol,

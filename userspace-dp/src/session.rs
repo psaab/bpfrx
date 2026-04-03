@@ -1,7 +1,7 @@
 use crate::afxdp::{ForwardingDisposition, ForwardingResolution};
 use crate::nat::NatDecision;
 use crate::nat64::Nat64ReverseInfo;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -190,6 +190,7 @@ pub(crate) struct SessionTable {
     nat_reverse_index: FxHashMap<SessionKey, SessionKey>,
     forward_wire_index: FxHashMap<SessionKey, SessionKey>,
     reverse_translated_index: FxHashMap<SessionKey, SessionKey>,
+    owner_rg_sessions: FxHashMap<i32, FxHashSet<SessionKey>>,
     deltas: VecDeque<SessionDelta>,
     last_gc_ns: u64,
     max_sessions: usize,
@@ -208,6 +209,7 @@ impl SessionTable {
             nat_reverse_index: FxHashMap::default(),
             forward_wire_index: FxHashMap::default(),
             reverse_translated_index: FxHashMap::default(),
+            owner_rg_sessions: FxHashMap::default(),
             deltas: VecDeque::with_capacity(MAX_SESSION_DELTAS.min(256)),
             last_gc_ns: 0,
             max_sessions: DEFAULT_MAX_SESSIONS,
@@ -672,6 +674,19 @@ impl SessionTable {
         self.remove_entry(key);
     }
 
+    pub fn entry_with_origin(
+        &self,
+        key: &SessionKey,
+    ) -> Option<(SessionDecision, SessionMetadata, SessionOrigin)> {
+        self.sessions
+            .get(key)
+            .map(|entry| (entry.decision, entry.metadata.clone(), entry.origin))
+    }
+
+    pub fn owner_rg_session_keys(&self, owner_rgs: &[i32]) -> Vec<SessionKey> {
+        owner_rg_session_keys_from_index(&self.owner_rg_sessions, owner_rgs)
+    }
+
     pub fn take_synced_local(&mut self, key: &SessionKey) -> Option<SessionLookup> {
         let Some(entry) = self.sessions.get(key) else {
             return None;
@@ -693,12 +708,15 @@ impl SessionTable {
             return Vec::new();
         }
         let mut demoted_keys = Vec::new();
-        for (key, entry) in self.sessions.iter_mut() {
-            if entry.metadata.owner_rg_id != owner_rg_id || entry.origin.is_peer_synced() {
+        for key in self.owner_rg_session_keys(&[owner_rg_id]) {
+            let Some(entry) = self.sessions.get_mut(&key) else {
+                continue;
+            };
+            if entry.origin.is_peer_synced() {
                 continue;
             }
             entry.origin = SessionOrigin::SyncImport;
-            demoted_keys.push(key.clone());
+            demoted_keys.push(key);
         }
         demoted_keys
     }
@@ -761,6 +779,7 @@ impl SessionTable {
     fn remove_entry(&mut self, key: &SessionKey) -> Option<SessionEntry> {
         let entry = self.sessions.remove(key)?;
         self.remove_forward_nat_index(key, entry.decision, &entry.metadata);
+        remove_owner_rg_index_entry(&mut self.owner_rg_sessions, entry.metadata.owner_rg_id, key);
         Some(entry)
     }
 
@@ -776,18 +795,24 @@ impl SessionTable {
                 self.reverse_translated_index
                     .insert(translated, key.clone());
             }
-            return;
-        }
-        self.nat_reverse_index
-            .insert(reverse_wire_key(key, decision.nat), key.clone());
-        let reverse_canonical = reverse_canonical_key(key, decision.nat);
-        if reverse_canonical != *key {
+        } else {
             self.nat_reverse_index
-                .insert(reverse_canonical, key.clone());
+                .insert(reverse_wire_key(key, decision.nat), key.clone());
+            let reverse_canonical = reverse_canonical_key(key, decision.nat);
+            if reverse_canonical != *key {
+                self.nat_reverse_index
+                    .insert(reverse_canonical, key.clone());
+            }
+            let forward_wire = forward_wire_key(key, decision.nat);
+            if forward_wire != *key {
+                self.forward_wire_index.insert(forward_wire, key.clone());
+            }
         }
-        let forward_wire = forward_wire_key(key, decision.nat);
-        if forward_wire != *key {
-            self.forward_wire_index.insert(forward_wire, key.clone());
+        if metadata.owner_rg_id > 0 {
+            self.owner_rg_sessions
+                .entry(metadata.owner_rg_id)
+                .or_default()
+                .insert(key.clone());
         }
     }
 
@@ -819,6 +844,35 @@ impl SessionTable {
         let forward_wire = forward_wire_key(key, decision.nat);
         if matches!(self.forward_wire_index.get(&forward_wire), Some(existing) if existing == key) {
             self.forward_wire_index.remove(&forward_wire);
+        }
+    }
+}
+
+fn owner_rg_session_keys_from_index(
+    index: &FxHashMap<i32, FxHashSet<SessionKey>>,
+    owner_rgs: &[i32],
+) -> Vec<SessionKey> {
+    let mut keys = FxHashSet::default();
+    for owner_rg_id in owner_rgs {
+        if let Some(entries) = index.get(owner_rg_id) {
+            keys.extend(entries.iter().cloned());
+        }
+    }
+    keys.into_iter().collect()
+}
+
+fn remove_owner_rg_index_entry(
+    index: &mut FxHashMap<i32, FxHashSet<SessionKey>>,
+    owner_rg_id: i32,
+    key: &SessionKey,
+) {
+    if owner_rg_id <= 0 {
+        return;
+    }
+    if let Some(entries) = index.get_mut(&owner_rg_id) {
+        entries.remove(key);
+        if entries.is_empty() {
+            index.remove(&owner_rg_id);
         }
     }
 }
@@ -1412,6 +1466,40 @@ mod tests {
                 .metadata,
             metadata_other
         );
+    }
+
+    #[test]
+    fn owner_rg_session_keys_track_insert_update_and_delete() {
+        let mut table = SessionTable::new();
+        let now = 1_000_000_000u64;
+        let key = key_v4();
+        let mut metadata_rg1 = metadata();
+        metadata_rg1.owner_rg_id = 1;
+        let mut metadata_rg2 = metadata();
+        metadata_rg2.owner_rg_id = 2;
+
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata_rg1.clone(),
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+        assert_eq!(table.owner_rg_session_keys(&[1]), vec![key.clone()]);
+
+        assert!(table.refresh_for_ha_activation(
+            &key,
+            decision(),
+            metadata_rg2.clone(),
+            now + 1_000_000,
+            0x10,
+        ));
+        assert!(table.owner_rg_session_keys(&[1]).is_empty());
+        assert_eq!(table.owner_rg_session_keys(&[2]), vec![key.clone()]);
+
+        table.delete(&key);
+        assert!(table.owner_rg_session_keys(&[2]).is_empty());
     }
 
     #[test]
