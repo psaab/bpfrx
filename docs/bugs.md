@@ -1002,7 +1002,7 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 
 ## Userspace Forwarding & HA Gaps (PR #301, Issues #302-#312)
 
-Audit doc: `docs/userspace-forwarding-and-failover-gap-audit.md`
+Audit doc: `docs/archived/userspace-forwarding-and-failover-gap-audit.md`
 
 ### Hybrid userspace/eBPF forwarding model (OPEN #302-#307)
 - **Symptom:** In userspace dataplane mode, transit packets can silently fall back to the eBPF pipeline (via XDP_PASS or XSK socket failure) without any indication in counters or logs. The XDP shim program returns XDP_PASS for protocols it does not handle (GRE, ESP), for AF_XDP socket errors, and when PASS_TO_KERNEL is set — all of which bypass the userspace forwarding path entirely

@@ -232,12 +232,12 @@ cli -c "show chassis cluster data-plane statistics" | grep SNAT
 These docs contain historical investigation detail but should not be
 read as current truth. This document supersedes all of them:
 
-- `docs/userspace-failover-hardening-plan.md`
-- `docs/userspace-failover-next-steps.md`
-- `docs/userspace-ha-failover-parity-plan.md`
-- `docs/failover-hardening-progress.md`
-- `docs/ha-failover-simplification-audit.md`
-- `docs/ha-simple-failover-design.md`
-- `docs/ha-failover-implementation-plan.md`
-- `docs/ha-forwarding-state-inventory.md`
-- `docs/userspace-forwarding-and-failover-gap-audit.md`
+- `docs/archived/userspace-failover-hardening-plan.md`
+- `docs/archived/userspace-failover-next-steps.md`
+- `docs/archived/userspace-ha-failover-parity-plan.md`
+- `docs/archived/failover-hardening-progress.md`
+- `docs/archived/ha-failover-simplification-audit.md`
+- `docs/archived/ha-simple-failover-design.md`
+- `docs/archived/ha-failover-implementation-plan.md`
+- `docs/archived/ha-forwarding-state-inventory.md`
+- `docs/archived/userspace-forwarding-and-failover-gap-audit.md`

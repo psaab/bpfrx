@@ -318,7 +318,7 @@
 
 ## Phase 61: Strict Userspace Forwarding & Minimal Failover (Issues #302-#312)
 
-Gap audit: `docs/userspace-forwarding-and-failover-gap-audit.md` (PR #301)
+Gap audit: `docs/archived/userspace-forwarding-and-failover-gap-audit.md` (PR #301)
 
 ### Strict Userspace Invariant (#302)
 - [x] Define DataplaneMode enum (ebpf_only, userspace_compat, userspace_strict) (#303)
