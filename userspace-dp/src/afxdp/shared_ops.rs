@@ -572,23 +572,25 @@ pub(super) fn refresh_reverse_prewarm_owner_rg_indexes(
     previous_entry: Option<&SyncedSessionEntry>,
     next_entry: Option<&SyncedSessionEntry>,
 ) {
+    let previous_owner_rgs = previous_entry.map(|entry| {
+        reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, entry)
+    });
+    let next_owner_rgs =
+        next_entry.map(|entry| reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, entry));
+    let Ok(mut index) = index.lock() else {
+        return;
+    };
     if let Some(previous_entry) = previous_entry {
-        for owner_rg_id in
-            reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, previous_entry)
-        {
-            remove_owner_rg_index_entry(index, owner_rg_id, &previous_entry.key);
+        for owner_rg_id in previous_owner_rgs.unwrap_or_default() {
+            remove_owner_rg_index_entry_locked(&mut index, owner_rg_id, &previous_entry.key);
         }
     }
     if let Some(next_entry) = next_entry {
-        for owner_rg_id in
-            reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, next_entry)
-        {
-            if let Ok(mut index) = index.lock() {
-                index
-                    .entry(owner_rg_id)
-                    .or_insert_with(FastSet::default)
-                    .insert(next_entry.key.clone());
-            }
+        for owner_rg_id in next_owner_rgs.unwrap_or_default() {
+            index
+                .entry(owner_rg_id)
+                .or_insert_with(FastSet::default)
+                .insert(next_entry.key.clone());
         }
     }
 }
@@ -651,11 +653,19 @@ fn remove_owner_rg_index_entry(
         return;
     }
     if let Ok(mut index) = index.lock() {
-        if let Some(keys) = index.get_mut(&owner_rg_id) {
-            keys.remove(key);
-            if keys.is_empty() {
-                index.remove(&owner_rg_id);
-            }
+        remove_owner_rg_index_entry_locked(&mut index, owner_rg_id, key);
+    }
+}
+
+fn remove_owner_rg_index_entry_locked(
+    index: &mut OwnerRgSessionIndex,
+    owner_rg_id: i32,
+    key: &SessionKey,
+) {
+    if let Some(keys) = index.get_mut(&owner_rg_id) {
+        keys.remove(key);
+        if keys.is_empty() {
+            index.remove(&owner_rg_id);
         }
     }
 }
