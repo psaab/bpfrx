@@ -342,19 +342,14 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 		m.proactiveNeighborResolveAsyncLocked()
 	}
 
-	// Bump FIB generation to invalidate flow-cache entries. The helper's
-	// flow cache checks fib_gen on every lookup — bumped entries miss and
-	// go through the slow path which re-evaluates HA state.
-	newFIBGen := m.inner.BumpFIBGeneration()
-	if m.lastSnapshot != nil && m.lastSnapshot.Config != nil && m.proc != nil {
-		m.generation++
-		snap := buildSnapshot(m.lastSnapshot.Config, m.cfg, m.generation, newFIBGen)
-		m.lastSnapshot = snap
-		if err := m.syncSnapshotLocked(); err != nil {
-			slog.Warn("userspace: failed to push snapshot on HA transition", "err", err)
-		}
-	}
-
+	// Sync HA state FIRST, then bump FIB generation. This order is
+	// critical: if fib_gen bumps before HA state changes, workers can
+	// create flow cache entries with the NEW fib_gen but the OLD HA
+	// state (RG still active). Those entries survive the demotion
+	// because their fib_gen matches the current gen. By syncing HA
+	// state first, workers see the demotion before the fib_gen bump,
+	// so any new flow cache entries correctly reflect HAInactive.
+	//
 	// Sync HA state DIRECTLY to helper without re-reading from BPF maps.
 	// The periodic status poll also reads rg_active and syncs to the helper,
 	// racing with us. If the poll syncs first, our syncHAStateLocked
@@ -389,6 +384,20 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	m.lastRGActivateTime = time.Now()
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return err
+	}
+
+	// Bump FIB generation AFTER HA state is applied. This ensures any
+	// flow cache entries created during the transition window reflect the
+	// new HA state (HAInactive for demoted RGs). The bump invalidates
+	// all entries from before the HA state change.
+	newFIBGen := m.inner.BumpFIBGeneration()
+	if m.lastSnapshot != nil && m.lastSnapshot.Config != nil && m.proc != nil {
+		m.generation++
+		snap := buildSnapshot(m.lastSnapshot.Config, m.cfg, m.generation, newFIBGen)
+		m.lastSnapshot = snap
+		if err := m.syncSnapshotLocked(); err != nil {
+			slog.Warn("userspace: failed to push snapshot after HA transition", "err", err)
+		}
 	}
 
 	return nil
