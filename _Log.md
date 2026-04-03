@@ -139,3 +139,7 @@
 - **Timestamp**: 2026-04-03T00:16:04Z
   - **Action**: First #389 slice — add derived owner-RG indexes for helper shared session stores and use them for demotion-time BPF cleanup and shared-session demotion without whole-table scans
   - **File(s)**: userspace-dp/src/afxdp.rs, userspace-dp/src/afxdp/types.rs, userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/afxdp/session_glue.rs, userspace-dp/src/afxdp/forwarding.rs, userspace-dp/src/afxdp/tunnel.rs
+
+- **Timestamp**: 2026-04-03T00:34:06Z
+  - **Action**: Address PR #404 Copilot review — make owner-RG index updates heal missing same-owner entries and serialize demotion-time key collection against in-flight shared-session publishes
+  - **File(s)**: userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/session_glue.rs

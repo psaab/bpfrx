@@ -1829,6 +1829,53 @@ mod tests {
     }
 
     #[test]
+    fn publish_shared_session_heals_missing_owner_rg_index_on_same_owner_update() {
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let entry = SyncedSessionEntry {
+            key: test_key(),
+            decision: test_decision(),
+            metadata: test_metadata(),
+            origin: SessionOrigin::SyncImport,
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &entry,
+        );
+
+        shared_owner_rg_indexes
+            .sessions
+            .lock()
+            .expect("sessions index")
+            .clear();
+
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &entry,
+        );
+
+        assert!(
+            shared_owner_rg_indexes
+                .sessions
+                .lock()
+                .expect("sessions index")
+                .get(&entry.metadata.owner_rg_id)
+                .is_some_and(|keys| keys.contains(&entry.key))
+        );
+    }
+
+    #[test]
     fn resolve_flow_session_decision_uses_canonical_key_for_translated_forward_hit() {
         let mut sessions = SessionTable::new();
         let key = test_key();

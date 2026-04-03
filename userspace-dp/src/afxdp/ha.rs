@@ -45,19 +45,24 @@ impl super::Coordinator {
             // bypassing the eBPF pipeline's fabric redirect for demoted RGs.
             if let Some(session_map_ref) = self.session_map_fd.as_ref() {
                 let mut deleted = 0u32;
-                for key in
-                    owner_rg_session_keys(&self.shared_owner_rg_indexes.sessions, &demoted_rgs)
-                {
+                for key in owner_rg_session_keys_serialized(
+                    &self.shared_sessions,
+                    &self.shared_owner_rg_indexes.sessions,
+                    &demoted_rgs,
+                ) {
                     delete_live_session_key(session_map_ref.fd, &key);
                     deleted += 1;
                 }
-                for key in
-                    owner_rg_session_keys(&self.shared_owner_rg_indexes.nat_sessions, &demoted_rgs)
-                {
+                for key in owner_rg_session_keys_serialized(
+                    &self.shared_nat_sessions,
+                    &self.shared_owner_rg_indexes.nat_sessions,
+                    &demoted_rgs,
+                ) {
                     delete_live_session_key(session_map_ref.fd, &key);
                     deleted += 1;
                 }
-                for key in owner_rg_session_keys(
+                for key in owner_rg_session_keys_serialized(
+                    &self.shared_forward_wire_sessions,
                     &self.shared_owner_rg_indexes.forward_wire_sessions,
                     &demoted_rgs,
                 ) {

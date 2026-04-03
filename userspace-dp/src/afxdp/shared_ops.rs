@@ -553,16 +553,26 @@ pub(super) fn owner_rg_session_keys(
     keys.into_iter().collect()
 }
 
+pub(super) fn owner_rg_session_keys_serialized(
+    sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    index: &Arc<Mutex<OwnerRgSessionIndex>>,
+    owner_rgs: &[i32],
+) -> Vec<SessionKey> {
+    let Ok(_sessions) = sessions.lock() else {
+        return Vec::new();
+    };
+    owner_rg_session_keys(index, owner_rgs)
+}
+
 fn update_owner_rg_index(
     index: &Arc<Mutex<OwnerRgSessionIndex>>,
     key: &SessionKey,
     previous_owner_rg: Option<i32>,
     owner_rg_id: i32,
 ) {
-    if previous_owner_rg == Some(owner_rg_id) {
-        return;
-    }
-    if let Some(previous_owner_rg) = previous_owner_rg {
+    if let Some(previous_owner_rg) = previous_owner_rg
+        && previous_owner_rg != owner_rg_id
+    {
         remove_owner_rg_index_entry(index, previous_owner_rg, key);
     }
     if owner_rg_id <= 0 {
