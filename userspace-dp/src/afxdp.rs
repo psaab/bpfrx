@@ -3520,7 +3520,12 @@ fn poll_binding(
                     // through with HAInactive when the inner conversion found
                     // no fabric link at the time. Anti-loop: never redirect
                     // packets that arrived on the fabric interface itself.
+                    // Only redirect when the egress maps to a known RG.
+                    // HAInactive with unknown ownership (rg=0) means unresolved
+                    // — those should NOT be fabric-redirected.
+                    let egress_rg = owner_rg_for_resolution(forwarding, decision.resolution);
                     if decision.resolution.disposition == ForwardingDisposition::HAInactive
+                        && egress_rg > 0
                         && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
                     {
                         let zone_name = session_ingress_zone
