@@ -578,6 +578,17 @@ fn handle_stream(
                     }
                 }
             }
+            "export_all_sessions" => {
+                match guard.afxdp.export_all_sessions_to_event_stream() {
+                    Ok(_count) => {
+                        refresh_status(&mut guard);
+                    }
+                    Err(err) => {
+                        response.ok = false;
+                        response.error = err;
+                    }
+                }
+            }
             "rebind" => {
                 // After a link DOWN/UP cycle (e.g. RETH MAC programming),
                 // the kernel destroys the XSK receive queue.  Stop all

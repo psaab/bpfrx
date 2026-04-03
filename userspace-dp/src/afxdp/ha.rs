@@ -345,6 +345,78 @@ impl super::Coordinator {
             }
         }
     }
+
+    /// Export all locally-owned forward sessions through the event stream.
+    ///
+    /// Called on peer connect instead of the old BulkSync path. Iterates the
+    /// shared session table and pushes each qualifying session as an Open event
+    /// through the event stream, where the Go daemon's handleEventStreamDelta
+    /// callback will queue it to the peer via QueueSessionV4/V6.
+    ///
+    /// Returns the number of sessions exported.
+    pub fn export_all_sessions_to_event_stream(&self) -> Result<usize, String> {
+        let es = self
+            .event_stream
+            .as_ref()
+            .ok_or_else(|| "event stream not started".to_string())?;
+        let handle = es.worker_handle();
+
+        let zone_name_to_id = &self.forwarding.zone_name_to_id;
+
+        let sessions = self
+            .shared_sessions
+            .lock()
+            .map_err(|_| "shared sessions lock poisoned".to_string())?;
+
+        let ha_state = self.ha_state.load();
+        let mut count = 0usize;
+        for entry in sessions.values() {
+            // Only forward (non-reverse), locally-originated sessions.
+            if entry.metadata.is_reverse {
+                continue;
+            }
+            if entry.origin.is_peer_synced() {
+                continue;
+            }
+            // Skip fabric-ingress sessions (same exclusion as export_forward_sessions_for_owner_rgs).
+            if entry.metadata.fabric_ingress {
+                continue;
+            }
+            // Only export for active RGs. Missing HA state entry = inactive.
+            let rg_active = entry.metadata.owner_rg_id > 0
+                && ha_state
+                    .get(&entry.metadata.owner_rg_id)
+                    .map(|r| r.active)
+                    .unwrap_or(false);
+            if !rg_active && entry.metadata.owner_rg_id > 0 {
+                continue;
+            }
+            // Only exportable dispositions.
+            if !matches!(
+                entry.decision.resolution.disposition,
+                ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
+            ) {
+                continue;
+            }
+
+            let delta = crate::session::SessionDelta {
+                kind: crate::session::SessionDeltaKind::Open,
+                key: entry.key.clone(),
+                decision: entry.decision,
+                metadata: entry.metadata.clone(),
+                origin: entry.origin,
+                fabric_redirect_sync: true,
+            };
+            handle.push_delta(&delta, zone_name_to_id);
+            count += 1;
+        }
+        drop(sessions); // release lock before logging
+        eprintln!(
+            "bpfrx-ha: exported {} sessions to event stream for bulk sync",
+            count
+        );
+        Ok(count)
+    }
 }
 
 #[cfg(test)]

@@ -89,6 +89,23 @@ func (m *Manager) SyncFabricState() {
 	}
 }
 
+// ExportAllSessionsViaEventStream tells the Rust helper to push all current
+// sessions through the event stream as Open events. The Go daemon receives
+// them via handleEventStreamDelta and queues them to the peer automatically.
+// This replaces the old BulkSync path that iterated BPF maps from Go.
+func (m *Manager) ExportAllSessionsViaEventStream() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.proc == nil || m.proc.Process == nil {
+		return errors.New("userspace dataplane helper not running")
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{Type: "export_all_sessions"}, &status); err != nil {
+		return err
+	}
+	return m.applyHelperStatusLocked(&status)
+}
+
 func (m *Manager) refreshHAStateFromMapsLocked() error {
 	rgMap := m.inner.Map("rg_active")
 	if rgMap == nil {
