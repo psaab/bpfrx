@@ -3194,6 +3194,13 @@ mod tests {
             &shared_owner_rg_indexes,
             &entry,
         );
+        refresh_reverse_prewarm_owner_rg_indexes(
+            &shared_owner_rg_indexes.reverse_prewarm_sessions,
+            &forwarding,
+            &dynamic_neighbors,
+            None,
+            Some(&entry),
+        );
 
         prewarm_reverse_synced_sessions_for_owner_rgs(
             &shared_sessions,
@@ -3251,6 +3258,13 @@ mod tests {
             &shared_owner_rg_indexes,
             &entry,
         );
+        refresh_reverse_prewarm_owner_rg_indexes(
+            &shared_owner_rg_indexes.reverse_prewarm_sessions,
+            &forwarding,
+            &dynamic_neighbors,
+            None,
+            Some(&entry),
+        );
 
         // owner_rgs=[2] does not include the forward session's owner_rg_id=1,
         // but the synthesized reverse companion resolves to owner_rg_id=2 in
@@ -3279,5 +3293,39 @@ mod tests {
         assert!(reverse.metadata.is_reverse);
         assert_eq!(reverse.metadata.owner_rg_id, 2);
         assert_eq!(worker_commands[0].lock().expect("commands").len(), 1);
+    }
+
+    #[test]
+    fn reverse_prewarm_index_tracks_split_reverse_owner_rg_candidate() {
+        let forwarding = test_forwarding_state_split_rgs();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let mut entry = SyncedSessionEntry {
+            key: test_key(),
+            decision: test_decision(),
+            metadata: SessionMetadata {
+                fabric_ingress: true,
+                ..test_metadata()
+            },
+            origin: SessionOrigin::SyncImport,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+        };
+        entry.metadata.owner_rg_id = 1;
+
+        refresh_reverse_prewarm_owner_rg_indexes(
+            &shared_owner_rg_indexes.reverse_prewarm_sessions,
+            &forwarding,
+            &dynamic_neighbors,
+            None,
+            Some(&entry),
+        );
+
+        let index = shared_owner_rg_indexes
+            .reverse_prewarm_sessions
+            .lock()
+            .expect("prewarm index");
+        assert!(index.get(&1).is_some_and(|keys| keys.contains(&entry.key)));
+        assert!(index.get(&2).is_some_and(|keys| keys.contains(&entry.key)));
     }
 }

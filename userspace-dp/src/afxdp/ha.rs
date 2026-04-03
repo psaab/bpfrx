@@ -261,6 +261,11 @@ impl super::Coordinator {
     pub fn upsert_synced_session(&self, entry: SyncedSessionEntry) {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let ha_state = self.ha_state.load();
+        let previous_entry = self
+            .shared_sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(&entry.key).cloned());
         let reverse_entry = if !entry.metadata.is_reverse {
             synthesized_synced_reverse_entry(
                 &self.forwarding,
@@ -278,6 +283,13 @@ impl super::Coordinator {
             &self.shared_forward_wire_sessions,
             &self.shared_owner_rg_indexes,
             &entry,
+        );
+        refresh_reverse_prewarm_owner_rg_indexes(
+            &self.shared_owner_rg_indexes.reverse_prewarm_sessions,
+            &self.forwarding,
+            &self.dynamic_neighbors,
+            previous_entry.as_ref(),
+            Some(&entry),
         );
         if let Some(reverse) = &reverse_entry {
             publish_shared_session(
@@ -307,24 +319,31 @@ impl super::Coordinator {
     }
 
     pub fn delete_synced_session(&self, key: SessionKey) {
-        let reverse_key = self
+        let removed_entry = self
             .shared_sessions
             .lock()
             .ok()
-            .and_then(|sessions| sessions.get(&key).cloned())
-            .and_then(|entry| {
-                if entry.metadata.is_reverse {
-                    None
-                } else {
-                    Some(reverse_session_key(&entry.key, entry.decision.nat))
-                }
-            });
+            .and_then(|sessions| sessions.get(&key).cloned());
+        let reverse_key = removed_entry.as_ref().and_then(|entry| {
+            if entry.metadata.is_reverse {
+                None
+            } else {
+                Some(reverse_session_key(&entry.key, entry.decision.nat))
+            }
+        });
         remove_shared_session(
             &self.shared_sessions,
             &self.shared_nat_sessions,
             &self.shared_forward_wire_sessions,
             &self.shared_owner_rg_indexes,
             &key,
+        );
+        refresh_reverse_prewarm_owner_rg_indexes(
+            &self.shared_owner_rg_indexes.reverse_prewarm_sessions,
+            &self.forwarding,
+            &self.dynamic_neighbors,
+            removed_entry.as_ref(),
+            None,
         );
         if let Some(reverse_key) = &reverse_key {
             remove_shared_session(

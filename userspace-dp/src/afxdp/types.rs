@@ -9,6 +9,7 @@ pub(super) struct SharedSessionOwnerRgIndexes {
     pub(super) sessions: Arc<Mutex<OwnerRgSessionIndex>>,
     pub(super) nat_sessions: Arc<Mutex<OwnerRgSessionIndex>>,
     pub(super) forward_wire_sessions: Arc<Mutex<OwnerRgSessionIndex>>,
+    pub(super) reverse_prewarm_sessions: Arc<Mutex<OwnerRgSessionIndex>>,
 }
 
 impl Default for SharedSessionOwnerRgIndexes {
@@ -17,6 +18,7 @@ impl Default for SharedSessionOwnerRgIndexes {
             sessions: Arc::new(Mutex::new(FastMap::default())),
             nat_sessions: Arc::new(Mutex::new(FastMap::default())),
             forward_wire_sessions: Arc::new(Mutex::new(FastMap::default())),
+            reverse_prewarm_sessions: Arc::new(Mutex::new(FastMap::default())),
         }
     }
 }
@@ -30,6 +32,9 @@ impl SharedSessionOwnerRgIndexes {
             index.clear();
         }
         if let Ok(mut index) = self.forward_wire_sessions.lock() {
+            index.clear();
+        }
+        if let Ok(mut index) = self.reverse_prewarm_sessions.lock() {
             index.clear();
         }
     }

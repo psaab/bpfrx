@@ -63,36 +63,37 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
         return;
     }
     let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
-    // Reverse companions depend on the current HA state of the client-side
-    // egress RG, not only on the forward session's owner RG. When a second RG
-    // becomes active during failback (for example, LAN after WAN/tunnel), a
-    // previously synthesized reverse session can flip from FabricRedirect back
-    // to local ForwardCandidate. Recompute all synced forward entries on RG
-    // activation so stale reverse companions are refreshed against the new HA
-    // snapshot instead of staying pinned to the earlier inactive result.
+    let candidate_keys = owner_rg_session_keys_serialized(
+        shared_sessions,
+        &shared_owner_rg_indexes.reverse_prewarm_sessions,
+        owner_rgs,
+    );
     let reverse_entries = shared_sessions
         .lock()
         .map(|sessions| {
             let mut reverse_entries = Vec::new();
-            sessions
-                .values()
-                .filter(|entry| !entry.metadata.is_reverse && entry.origin.is_peer_synced())
-                .for_each(|entry| {
-                    let Some(reverse) = synthesized_synced_reverse_entry(
-                        forwarding,
-                        ha_state,
-                        dynamic_neighbors,
-                        entry,
-                        now_secs,
-                    ) else {
-                        return;
-                    };
-                    if owner_rg_set.contains(&entry.metadata.owner_rg_id)
-                        || owner_rg_set.contains(&reverse.metadata.owner_rg_id)
-                    {
-                        reverse_entries.push(reverse);
-                    }
-                });
+            for key in candidate_keys {
+                let Some(entry) = sessions.get(&key) else {
+                    continue;
+                };
+                if entry.metadata.is_reverse || !entry.origin.is_peer_synced() {
+                    continue;
+                }
+                let Some(reverse) = synthesized_synced_reverse_entry(
+                    forwarding,
+                    ha_state,
+                    dynamic_neighbors,
+                    entry,
+                    now_secs,
+                ) else {
+                    continue;
+                };
+                if owner_rg_set.contains(&entry.metadata.owner_rg_id)
+                    || owner_rg_set.contains(&reverse.metadata.owner_rg_id)
+                {
+                    reverse_entries.push(reverse);
+                }
+            }
             reverse_entries
         })
         .unwrap_or_default();
@@ -562,6 +563,61 @@ pub(super) fn owner_rg_session_keys_serialized(
         return Vec::new();
     };
     owner_rg_session_keys(index, owner_rgs)
+}
+
+pub(super) fn refresh_reverse_prewarm_owner_rg_indexes(
+    index: &Arc<Mutex<OwnerRgSessionIndex>>,
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    previous_entry: Option<&SyncedSessionEntry>,
+    next_entry: Option<&SyncedSessionEntry>,
+) {
+    if let Some(previous_entry) = previous_entry {
+        for owner_rg_id in
+            reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, previous_entry)
+        {
+            remove_owner_rg_index_entry(index, owner_rg_id, &previous_entry.key);
+        }
+    }
+    if let Some(next_entry) = next_entry {
+        for owner_rg_id in
+            reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, next_entry)
+        {
+            if let Ok(mut index) = index.lock() {
+                index
+                    .entry(owner_rg_id)
+                    .or_insert_with(FastSet::default)
+                    .insert(next_entry.key.clone());
+            }
+        }
+    }
+}
+
+fn reverse_prewarm_owner_rg_candidates(
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    entry: &SyncedSessionEntry,
+) -> FastSet<i32> {
+    let mut owner_rgs = FastSet::default();
+    if entry.metadata.is_reverse || !entry.origin.is_peer_synced() {
+        return owner_rgs;
+    }
+    if entry.metadata.owner_rg_id > 0 {
+        owner_rgs.insert(entry.metadata.owner_rg_id);
+    }
+    let reverse_resolution = super::interface_nat_local_resolution(forwarding, entry.key.src_ip)
+        .unwrap_or_else(|| {
+            lookup_forwarding_resolution_with_dynamic(
+                forwarding,
+                dynamic_neighbors,
+                entry.key.src_ip,
+            )
+        });
+    let reverse_owner_rg_id = owner_rg_for_resolution(forwarding, reverse_resolution);
+    if reverse_owner_rg_id > 0 {
+        owner_rgs.insert(reverse_owner_rg_id);
+    }
+    owner_rgs
 }
 
 fn update_owner_rg_index(
