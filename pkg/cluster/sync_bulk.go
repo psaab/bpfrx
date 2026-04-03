@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime"
 	"time"
 
 	"github.com/psaab/bpfrx/pkg/dataplane"
@@ -71,6 +72,13 @@ func (s *SessionSync) BulkSync() error {
 			return false
 		}
 		count++
+		// Yield briefly every 64 sessions to let barrier/bulk ack
+		// writers acquire writeMu. Go's mutex is not fair — a tight
+		// lock/unlock loop can starve other goroutines waiting on
+		// the same mutex.
+		if count%64 == 0 {
+			runtime.Gosched()
+		}
 		return true
 	})
 	if err != nil {
@@ -103,6 +111,9 @@ func (s *SessionSync) BulkSync() error {
 			return false
 		}
 		count++
+		if count%64 == 0 {
+			runtime.Gosched()
+		}
 		return true
 	})
 	if err != nil {
