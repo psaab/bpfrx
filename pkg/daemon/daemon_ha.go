@@ -1094,7 +1094,7 @@ func (d *Daemon) userspaceTransferReadiness(rgID int) (bool, []string) {
 
 func (d *Daemon) prepareUserspaceManualFailover(rgID int) error {
 	return wrapUserspaceManualFailoverPrepareError(
-		d.prepareUserspaceRGDemotionWithTimeout(rgID, 15*time.Second),
+		d.prepareUserspaceRGDemotionWithTimeout(rgID, 5*time.Second),
 	)
 }
 
@@ -1116,22 +1116,10 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		success = true
 		return nil
 	}
-	if err := userspaceManualFailoverTransferReadinessError(d.sessionSync.TransferReadiness()); err != nil {
-		return err
-	}
-
-	// Verify the peer is caught up by sending a barrier. Incremental sync
-	// delivers deltas in real-time, so one barrier ack proves the peer has
-	// every session we've sent — no quiescence loop, pause/resume, or
-	// event-stream drain needed.
-	if !d.syncPeerBulkPrimed.Load() {
-		slog.Info("cluster: bulk sync not acked yet, verifying peer readiness via barrier",
-			"rg", rgID)
-		if err := d.sessionSync.WaitForPeerBarrier(5 * time.Second); err != nil {
-			return fmt.Errorf("session sync not ready before demotion: peer not responding to barrier: %w", err)
-		}
-		slog.Info("cluster: peer barrier succeeded without bulk ack — proceeding with demotion", "rg", rgID)
-	}
+	// Transfer readiness (bulk sync state) is NOT checked here.
+	// The barrier at the end of this function proves the peer has all
+	// sessions. Planned failover should not depend on bulk sync state —
+	// both nodes have full session state from continuous real-time sync.
 
 	// Drain any in-flight barrier from a previous demotion attempt.
 	pendingBarrierTimeout := barrierTimeout / 2
