@@ -1065,6 +1065,12 @@ impl Coordinator {
         if !new_fabrics.is_empty() {
             self.forwarding.fabrics = new_fabrics.clone();
             self.shared_fabrics.store(Arc::new(new_fabrics));
+            // Also update shared_forwarding so workers see the new fabric
+            // links for fabric redirect resolution. Without this, workers
+            // use the snapshot's forwarding state which may have empty fabrics
+            // if the peer MAC wasn't resolved at snapshot time.
+            self.shared_forwarding
+                .store(Arc::new(self.forwarding.clone()));
         }
     }
 
@@ -1074,7 +1080,15 @@ impl Coordinator {
             config_generation: snapshot.generation,
             fib_generation: snapshot.fib_generation,
         };
+        // Preserve existing fabric links — they are resolved separately
+        // via refresh_fabric_links (SyncFabricState) and the snapshot
+        // may not include them if the peer MAC wasn't resolved at
+        // snapshot build time.
+        let preserved_fabrics = self.forwarding.fabrics.clone();
         self.forwarding = build_forwarding_state(snapshot);
+        if self.forwarding.fabrics.is_empty() && !preserved_fabrics.is_empty() {
+            self.forwarding.fabrics = preserved_fabrics;
+        }
         self.shared_validation.store(Arc::new(self.validation));
         self.shared_forwarding
             .store(Arc::new(self.forwarding.clone()));
