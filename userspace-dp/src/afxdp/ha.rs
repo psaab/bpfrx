@@ -44,36 +44,30 @@ impl super::Coordinator {
             // still finds sessions in USERSPACE_SESSIONS and redirects to XSK,
             // bypassing the eBPF pipeline's fabric redirect for demoted RGs.
             if let Some(session_map_ref) = self.session_map_fd.as_ref() {
-                let rg_set: std::collections::BTreeSet<i32> = demoted_rgs.iter().copied().collect();
                 let mut deleted = 0u32;
-                // Delete from shared_sessions (covers synced + promoted sessions)
-                if let Ok(sessions) = self.shared_sessions.lock() {
-                    for (key, entry) in sessions.iter() {
-                        if rg_set.contains(&entry.metadata.owner_rg_id) {
-                            delete_live_session_key(session_map_ref.fd, key);
-                            deleted += 1;
-                        }
-                    }
+                for key in owner_rg_session_keys_serialized(
+                    &self.shared_sessions,
+                    &self.shared_owner_rg_indexes.sessions,
+                    &demoted_rgs,
+                ) {
+                    delete_live_session_key(session_map_ref.fd, &key);
+                    deleted += 1;
                 }
-                // Delete alias keys from shared_nat_sessions (reverse-wire +
-                // reverse-canonical aliases that are also in the BPF map).
-                if let Ok(sessions) = self.shared_nat_sessions.lock() {
-                    for (key, entry) in sessions.iter() {
-                        if rg_set.contains(&entry.metadata.owner_rg_id) {
-                            delete_live_session_key(session_map_ref.fd, key);
-                            deleted += 1;
-                        }
-                    }
+                for key in owner_rg_session_keys_serialized(
+                    &self.shared_nat_sessions,
+                    &self.shared_owner_rg_indexes.nat_sessions,
+                    &demoted_rgs,
+                ) {
+                    delete_live_session_key(session_map_ref.fd, &key);
+                    deleted += 1;
                 }
-                // Delete alias keys from shared_forward_wire_sessions
-                // (translated forward-wire aliases that are also in the BPF map).
-                if let Ok(sessions) = self.shared_forward_wire_sessions.lock() {
-                    for (key, entry) in sessions.iter() {
-                        if rg_set.contains(&entry.metadata.owner_rg_id) {
-                            delete_live_session_key(session_map_ref.fd, key);
-                            deleted += 1;
-                        }
-                    }
+                for key in owner_rg_session_keys_serialized(
+                    &self.shared_forward_wire_sessions,
+                    &self.shared_owner_rg_indexes.forward_wire_sessions,
+                    &demoted_rgs,
+                ) {
+                    delete_live_session_key(session_map_ref.fd, &key);
+                    deleted += 1;
                 }
                 if deleted > 0 {
                     eprintln!(
@@ -87,6 +81,7 @@ impl super::Coordinator {
                 &self.shared_sessions,
                 &self.shared_nat_sessions,
                 &self.shared_forward_wire_sessions,
+                &self.shared_owner_rg_indexes,
                 &demoted_rgs,
             );
             // Bump RG epochs atomically — O(1) invalidation. Workers will
@@ -124,6 +119,7 @@ impl super::Coordinator {
                 &self.shared_sessions,
                 &self.shared_nat_sessions,
                 &self.shared_forward_wire_sessions,
+                &self.shared_owner_rg_indexes,
                 &worker_commands,
                 session_map_fd,
                 &self.forwarding,
@@ -280,6 +276,7 @@ impl super::Coordinator {
             &self.shared_sessions,
             &self.shared_nat_sessions,
             &self.shared_forward_wire_sessions,
+            &self.shared_owner_rg_indexes,
             &entry,
         );
         if let Some(reverse) = &reverse_entry {
@@ -287,6 +284,7 @@ impl super::Coordinator {
                 &self.shared_sessions,
                 &self.shared_nat_sessions,
                 &self.shared_forward_wire_sessions,
+                &self.shared_owner_rg_indexes,
                 reverse,
             );
             if let Some(session_map_fd) = self.session_map_fd.as_ref() {
@@ -325,6 +323,7 @@ impl super::Coordinator {
             &self.shared_sessions,
             &self.shared_nat_sessions,
             &self.shared_forward_wire_sessions,
+            &self.shared_owner_rg_indexes,
             &key,
         );
         if let Some(reverse_key) = &reverse_key {
@@ -332,6 +331,7 @@ impl super::Coordinator {
                 &self.shared_sessions,
                 &self.shared_nat_sessions,
                 &self.shared_forward_wire_sessions,
+                &self.shared_owner_rg_indexes,
                 reverse_key,
             );
         }
@@ -368,52 +368,16 @@ mod tests {
 
     #[test]
     fn demoted_owner_rgs_detects_active_to_inactive_transitions() {
-        let previous = BTreeMap::from([
-            (
-                1,
-                active_ha_runtime(11),
-            ),
-            (
-                2,
-                active_ha_runtime(12),
-            ),
-        ]);
-        let current = BTreeMap::from([
-            (
-                1,
-                inactive_ha_runtime(21),
-            ),
-            (
-                2,
-                active_ha_runtime(22),
-            ),
-        ]);
+        let previous = BTreeMap::from([(1, active_ha_runtime(11)), (2, active_ha_runtime(12))]);
+        let current = BTreeMap::from([(1, inactive_ha_runtime(21)), (2, active_ha_runtime(22))]);
 
         assert_eq!(demoted_owner_rgs(&previous, &current), vec![1]);
     }
 
     #[test]
     fn activated_owner_rgs_detects_inactive_to_active_transitions() {
-        let previous = BTreeMap::from([
-            (
-                1,
-                inactive_ha_runtime(11),
-            ),
-            (
-                2,
-                active_ha_runtime(12),
-            ),
-        ]);
-        let current = BTreeMap::from([
-            (
-                1,
-                active_ha_runtime(21),
-            ),
-            (
-                2,
-                active_ha_runtime(22),
-            ),
-        ]);
+        let previous = BTreeMap::from([(1, inactive_ha_runtime(11)), (2, active_ha_runtime(12))]);
+        let current = BTreeMap::from([(1, active_ha_runtime(21)), (2, active_ha_runtime(22))]);
 
         assert_eq!(activated_owner_rgs(&previous, &current), vec![1]);
     }
@@ -437,11 +401,9 @@ mod tests {
         let group = state.get(&1).expect("ha group");
         assert!(group.active);
         assert_eq!(group.watchdog_timestamp, 0);
-        assert!(
-            matches!(group.lease, HAForwardingLease::ActiveUntil(until)
+        assert!(matches!(group.lease, HAForwardingLease::ActiveUntil(until)
                 if until >= before + HA_WATCHDOG_STALE_AFTER_SECS
-                    && until <= after + HA_WATCHDOG_STALE_AFTER_SECS)
-        );
+                    && until <= after + HA_WATCHDOG_STALE_AFTER_SECS));
         assert!(group.is_forwarding_active(after));
     }
 

@@ -55,6 +55,8 @@ mod bind;
 mod bpf_map;
 #[path = "afxdp/checksum.rs"]
 mod checksum;
+#[path = "afxdp/flow_cache.rs"]
+mod flow_cache;
 #[path = "afxdp/forwarding.rs"]
 mod forwarding;
 #[path = "afxdp/forwarding_build.rs"]
@@ -65,6 +67,8 @@ mod frame;
 mod frame_tx;
 #[path = "afxdp/gre.rs"]
 mod gre;
+#[path = "afxdp/ha.rs"]
+mod ha;
 #[path = "afxdp/icmp.rs"]
 mod icmp;
 #[path = "afxdp/icmp_embed.rs"]
@@ -86,10 +90,6 @@ mod tunnel;
 mod tx;
 #[path = "afxdp/types.rs"]
 mod types;
-#[path = "afxdp/flow_cache.rs"]
-mod flow_cache;
-#[path = "afxdp/ha.rs"]
-mod ha;
 #[path = "afxdp/umem.rs"]
 mod umem;
 
@@ -107,6 +107,7 @@ use self::bind::{
 };
 use self::bpf_map::*;
 use self::checksum::*;
+use self::flow_cache::*;
 use self::forwarding::*;
 use self::forwarding_build::*;
 use self::frame::*;
@@ -135,7 +136,6 @@ use self::shared_ops::*;
 use self::tunnel::*;
 use self::tx::*;
 use self::types::*;
-use self::flow_cache::*;
 pub(crate) use self::types::{ForwardingDisposition, ForwardingResolution, NeighborEntry};
 use self::umem::*;
 
@@ -246,6 +246,7 @@ pub struct Coordinator {
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: SharedSessionOwnerRgIndexes,
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
@@ -294,6 +295,7 @@ impl Coordinator {
             shared_sessions: Arc::new(Mutex::new(FastMap::default())),
             shared_nat_sessions: Arc::new(Mutex::new(FastMap::default())),
             shared_forward_wire_sessions: Arc::new(Mutex::new(FastMap::default())),
+            shared_owner_rg_indexes: SharedSessionOwnerRgIndexes::default(),
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
@@ -458,6 +460,7 @@ impl Coordinator {
             if let Ok(mut forward_wire_sessions) = self.shared_forward_wire_sessions.lock() {
                 forward_wire_sessions.clear();
             }
+            self.shared_owner_rg_indexes.clear();
         }
         if let Ok(mut recent) = self.recent_exceptions.lock() {
             recent.clear();
@@ -805,6 +808,7 @@ impl Coordinator {
             let shared_sessions = self.shared_sessions.clone();
             let shared_nat_sessions = self.shared_nat_sessions.clone();
             let shared_forward_wire_sessions = self.shared_forward_wire_sessions.clone();
+            let shared_owner_rg_indexes = self.shared_owner_rg_indexes.clone();
             let stop_clone = stop.clone();
             let heartbeat_clone = heartbeat.clone();
             let ha_state_apply_ack_clone = ha_state_apply_ack.clone();
@@ -834,6 +838,7 @@ impl Coordinator {
                         shared_sessions,
                         shared_nat_sessions,
                         shared_forward_wire_sessions,
+                        shared_owner_rg_indexes,
                         slow_path,
                         local_tunnel_deliveries,
                         recent_exceptions,
@@ -939,6 +944,7 @@ impl Coordinator {
             let shared_sessions = self.shared_sessions.clone();
             let shared_nat_sessions = self.shared_nat_sessions.clone();
             let shared_forward_wire_sessions = self.shared_forward_wire_sessions.clone();
+            let shared_owner_rg_indexes = self.shared_owner_rg_indexes.clone();
             let worker_commands = self
                 .workers
                 .values()
@@ -963,6 +969,7 @@ impl Coordinator {
                         shared_sessions,
                         shared_nat_sessions,
                         shared_forward_wire_sessions,
+                        shared_owner_rg_indexes,
                         worker_commands,
                         delivery_rx,
                         recent_exceptions,
@@ -1788,6 +1795,7 @@ fn poll_binding(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     slow_path: Option<&Arc<SlowPathReinjector>>,
     local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
@@ -2534,6 +2542,7 @@ fn poll_binding(
                             shared_sessions,
                             shared_nat_sessions,
                             shared_forward_wire_sessions,
+                            &shared_owner_rg_indexes,
                             peer_worker_commands,
                             forwarding,
                             ha_state,
@@ -2912,6 +2921,7 @@ fn poll_binding(
                                     shared_sessions,
                                     shared_nat_sessions,
                                     shared_forward_wire_sessions,
+                                    &shared_owner_rg_indexes,
                                     &flow.forward_key,
                                     decision,
                                     local_metadata.clone(),
@@ -3224,6 +3234,7 @@ fn poll_binding(
                                                 shared_sessions,
                                                 shared_nat_sessions,
                                                 shared_forward_wire_sessions,
+                                                &shared_owner_rg_indexes,
                                                 &forward_entry,
                                             );
                                             // Populate BPF dnat_table for embedded ICMP NAT reversal.
@@ -3421,6 +3432,7 @@ fn poll_binding(
                                                 shared_sessions,
                                                 shared_nat_sessions,
                                                 shared_forward_wire_sessions,
+                                                &shared_owner_rg_indexes,
                                                 &reverse_entry,
                                             );
                                             replicate_session_upsert(
@@ -4002,6 +4014,7 @@ fn poll_binding(
                                             shared_sessions,
                                             shared_nat_sessions,
                                             shared_forward_wire_sessions,
+                                            &shared_owner_rg_indexes,
                                             &entry,
                                         );
                                         let _ = publish_session_map_entry_for_session(
@@ -4133,6 +4146,7 @@ fn poll_binding(
                 shared_sessions,
                 shared_nat_sessions,
                 shared_forward_wire_sessions,
+                &shared_owner_rg_indexes,
                 peer_worker_commands,
                 &forward_key,
                 nat,
@@ -4552,6 +4566,7 @@ fn flush_session_deltas(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     event_stream: &Option<crate::event_stream::EventStreamWorkerHandle>,
@@ -4661,6 +4676,7 @@ fn flush_session_deltas(
                 shared_sessions,
                 shared_nat_sessions,
                 shared_forward_wire_sessions,
+                &shared_owner_rg_indexes,
                 &delta.key,
             );
             let reverse_key = reverse_session_key(&delta.key, delta.decision.nat);
@@ -4670,6 +4686,7 @@ fn flush_session_deltas(
                 shared_sessions,
                 shared_nat_sessions,
                 shared_forward_wire_sessions,
+                &shared_owner_rg_indexes,
                 &reverse_key,
             );
             replicate_session_delete(peer_worker_commands, &delta.key);
@@ -4917,6 +4934,7 @@ fn worker_loop(
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: SharedSessionOwnerRgIndexes,
     slow_path: Option<Arc<SlowPathReinjector>>,
     local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
@@ -5209,6 +5227,7 @@ fn worker_loop(
                 &shared_sessions,
                 &shared_nat_sessions,
                 &shared_forward_wire_sessions,
+                &shared_owner_rg_indexes,
                 slow_path.as_ref(),
                 &local_tunnel_deliveries,
                 &recent_exceptions,
@@ -5309,6 +5328,7 @@ fn worker_loop(
                         &shared_sessions,
                         &shared_nat_sessions,
                         &shared_forward_wire_sessions,
+                        &shared_owner_rg_indexes,
                         &recent_session_deltas,
                         &peer_worker_commands,
                         &event_stream,
@@ -5334,6 +5354,7 @@ fn worker_loop(
                     &shared_sessions,
                     &shared_nat_sessions,
                     &shared_forward_wire_sessions,
+                    &shared_owner_rg_indexes,
                     &recent_session_deltas,
                     &peer_worker_commands,
                     &event_stream,
@@ -6109,6 +6130,7 @@ mod tests {
             &coordinator.shared_sessions,
             &coordinator.shared_nat_sessions,
             &coordinator.shared_forward_wire_sessions,
+            &coordinator.shared_owner_rg_indexes,
             &entry,
         );
 
@@ -7816,10 +7838,12 @@ mod tests {
             tcp_flags: 0,
         };
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         publish_shared_session(
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &entry,
         );
 

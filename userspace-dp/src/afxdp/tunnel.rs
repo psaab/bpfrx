@@ -15,6 +15,7 @@ pub(super) fn local_tunnel_source_loop(
     shared_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: SharedSessionOwnerRgIndexes,
     worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
     delivery_rx: Receiver<Vec<u8>>,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
@@ -69,6 +70,7 @@ pub(super) fn local_tunnel_source_loop(
                             &shared_sessions,
                             &shared_nat_sessions,
                             &shared_forward_wire_sessions,
+                            &shared_owner_rg_indexes,
                             &worker_commands,
                             &mut local_sessions,
                             &mut local_sessions_last_prune_ns,
@@ -244,6 +246,7 @@ pub(super) fn maybe_enqueue_local_tunnel_session(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     local_sessions: &mut FastMap<SessionKey, u64>,
     local_sessions_last_prune_ns: &mut u64,
@@ -268,6 +271,7 @@ pub(super) fn maybe_enqueue_local_tunnel_session(
         shared_sessions,
         shared_nat_sessions,
         shared_forward_wire_sessions,
+        shared_owner_rg_indexes,
         entry,
     );
     if let Some(reverse) = &plan.reverse_session_entry {
@@ -275,6 +279,7 @@ pub(super) fn maybe_enqueue_local_tunnel_session(
             shared_sessions,
             shared_nat_sessions,
             shared_forward_wire_sessions,
+            shared_owner_rg_indexes,
             reverse,
         );
     }

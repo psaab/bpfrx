@@ -2,6 +2,38 @@ use super::*;
 
 pub(super) type FastMap<K, V> = FxHashMap<K, V>;
 pub(super) type FastSet<T> = FxHashSet<T>;
+pub(super) type OwnerRgSessionIndex = FastMap<i32, FastSet<SessionKey>>;
+
+#[derive(Clone)]
+pub(super) struct SharedSessionOwnerRgIndexes {
+    pub(super) sessions: Arc<Mutex<OwnerRgSessionIndex>>,
+    pub(super) nat_sessions: Arc<Mutex<OwnerRgSessionIndex>>,
+    pub(super) forward_wire_sessions: Arc<Mutex<OwnerRgSessionIndex>>,
+}
+
+impl Default for SharedSessionOwnerRgIndexes {
+    fn default() -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(FastMap::default())),
+            nat_sessions: Arc::new(Mutex::new(FastMap::default())),
+            forward_wire_sessions: Arc::new(Mutex::new(FastMap::default())),
+        }
+    }
+}
+
+impl SharedSessionOwnerRgIndexes {
+    pub(super) fn clear(&self) {
+        if let Ok(mut index) = self.sessions.lock() {
+            index.clear();
+        }
+        if let Ok(mut index) = self.nat_sessions.lock() {
+            index.clear();
+        }
+        if let Ok(mut index) = self.forward_wire_sessions.lock() {
+            index.clear();
+        }
+    }
+}
 
 /// Packet buffered while waiting for ARP/NDP neighbor resolution.
 pub(super) struct PendingNeighPacket {

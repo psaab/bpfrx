@@ -418,7 +418,8 @@ pub(super) fn apply_worker_commands(
     }
     // Deduplicate: refresh and demote paths may both collect the same key.
     {
-        let mut seen = super::FastSet::with_capacity_and_hasher(cancelled_keys.len(), Default::default());
+        let mut seen =
+            super::FastSet::with_capacity_and_hasher(cancelled_keys.len(), Default::default());
         cancelled_keys.retain(|k| seen.insert(k.clone()));
     }
     WorkerCommandResults {
@@ -576,6 +577,7 @@ pub(super) fn teardown_tcp_rst_flow(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forward_key: &SessionKey,
     nat: NatDecision,
@@ -600,12 +602,14 @@ pub(super) fn teardown_tcp_rst_flow(
         shared_sessions,
         shared_nat_sessions,
         shared_forward_wire_sessions,
+        shared_owner_rg_indexes,
         forward_key,
     );
     remove_shared_session(
         shared_sessions,
         shared_nat_sessions,
         shared_forward_wire_sessions,
+        shared_owner_rg_indexes,
         &reverse_key,
     );
     replicate_session_delete(peer_worker_commands, forward_key);
@@ -764,6 +768,7 @@ fn maybe_promote_synced_session(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
     key: &SessionKey,
@@ -810,6 +815,7 @@ fn maybe_promote_synced_session(
             shared_sessions,
             shared_nat_sessions,
             shared_forward_wire_sessions,
+            shared_owner_rg_indexes,
             &promoted_entry,
         );
         replicate_session_upsert(peer_worker_commands, &promoted_entry);
@@ -850,6 +856,7 @@ fn purge_translated_synced_hit(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     key: &SessionKey,
     decision: SessionDecision,
     metadata: &SessionMetadata,
@@ -862,6 +869,7 @@ fn purge_translated_synced_hit(
         shared_sessions,
         shared_nat_sessions,
         shared_forward_wire_sessions,
+        shared_owner_rg_indexes,
         key,
     );
     delete_session_map_entry_for_removed_session(session_map_fd, key, decision, metadata);
@@ -874,6 +882,7 @@ pub(super) fn resolve_flow_session_decision(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
@@ -930,6 +939,7 @@ pub(super) fn resolve_flow_session_decision(
                 shared_sessions,
                 shared_nat_sessions,
                 shared_forward_wire_sessions,
+                shared_owner_rg_indexes,
                 key,
                 decision,
                 metadata,
@@ -978,6 +988,7 @@ pub(super) fn resolve_flow_session_decision(
                 shared_sessions,
                 shared_nat_sessions,
                 shared_forward_wire_sessions,
+                shared_owner_rg_indexes,
                 peer_worker_commands,
                 forwarding,
                 resolved_key,
@@ -1005,6 +1016,7 @@ pub(super) fn resolve_flow_session_decision(
         shared_sessions,
         shared_nat_sessions,
         shared_forward_wire_sessions,
+        shared_owner_rg_indexes,
         peer_worker_commands,
         forwarding,
         ha_state,
@@ -1053,6 +1065,7 @@ pub(super) fn resolve_flow_session_decision(
         shared_sessions,
         shared_nat_sessions,
         shared_forward_wire_sessions,
+        shared_owner_rg_indexes,
         peer_worker_commands,
         forwarding,
         &flow.forward_key,
@@ -1282,6 +1295,7 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
         let forwarding = test_forwarding_state_with_fabric();
 
@@ -1291,6 +1305,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &peer_worker_commands,
             &forwarding,
             &key,
@@ -1325,13 +1340,11 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            active_ha_runtime(1),
-        );
+        ha_state.insert(1, active_ha_runtime(1));
 
         let shared_entry = SyncedSessionEntry {
             key: key.clone(),
@@ -1355,6 +1368,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &shared_entry,
         );
 
@@ -1370,6 +1384,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &peer_worker_commands,
             &forwarding,
             &ha_state,
@@ -1571,6 +1586,7 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let key = test_key();
         let decision = SessionDecision {
             resolution: test_resolution(),
@@ -1594,6 +1610,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &entry,
         );
         let alias_hit =
@@ -1605,6 +1622,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &entry.key,
         );
         assert!(
@@ -1618,6 +1636,7 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let key = test_key();
         let decision = SessionDecision {
             resolution: test_resolution(),
@@ -1641,6 +1660,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &entry,
         );
         let alias_hit = lookup_shared_forward_nat_match(&shared_nat_sessions, &canonical_reply)
@@ -1651,9 +1671,208 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &entry.key,
         );
         assert!(lookup_shared_forward_nat_match(&shared_nat_sessions, &canonical_reply).is_none());
+    }
+
+    #[test]
+    fn publish_and_remove_shared_session_tracks_owner_rg_indexes() {
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+        };
+        let entry = SyncedSessionEntry {
+            key: key.clone(),
+            decision,
+            metadata: test_metadata(),
+            origin: SessionOrigin::SyncImport,
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let forward_wire = forward_wire_key(&key, decision.nat);
+        let reverse_wire = reverse_session_key(&key, decision.nat);
+        let reverse_canonical = reverse_canonical_key(&key, decision.nat);
+
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &entry,
+        );
+
+        let sessions_index = shared_owner_rg_indexes
+            .sessions
+            .lock()
+            .expect("sessions index");
+        assert!(
+            sessions_index
+                .get(&entry.metadata.owner_rg_id)
+                .is_some_and(|keys| keys.contains(&key))
+        );
+        drop(sessions_index);
+
+        let nat_index = shared_owner_rg_indexes
+            .nat_sessions
+            .lock()
+            .expect("nat index");
+        assert!(
+            nat_index
+                .get(&entry.metadata.owner_rg_id)
+                .is_some_and(
+                    |keys| keys.contains(&reverse_wire) && keys.contains(&reverse_canonical)
+                )
+        );
+        drop(nat_index);
+
+        let forward_wire_index = shared_owner_rg_indexes
+            .forward_wire_sessions
+            .lock()
+            .expect("forward-wire index");
+        assert!(
+            forward_wire_index
+                .get(&entry.metadata.owner_rg_id)
+                .is_some_and(|keys| keys.contains(&forward_wire))
+        );
+        drop(forward_wire_index);
+
+        remove_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &entry.key,
+        );
+
+        assert!(
+            shared_owner_rg_indexes
+                .sessions
+                .lock()
+                .expect("sessions index")
+                .is_empty()
+        );
+        assert!(
+            shared_owner_rg_indexes
+                .nat_sessions
+                .lock()
+                .expect("nat index")
+                .is_empty()
+        );
+        assert!(
+            shared_owner_rg_indexes
+                .forward_wire_sessions
+                .lock()
+                .expect("forward-wire index")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn publish_shared_session_reindexes_owner_rg_on_replace() {
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let mut entry = SyncedSessionEntry {
+            key: test_key(),
+            decision: test_decision(),
+            metadata: test_metadata(),
+            origin: SessionOrigin::SyncImport,
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &entry,
+        );
+
+        entry.metadata.owner_rg_id = 2;
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &entry,
+        );
+
+        assert!(
+            shared_owner_rg_indexes
+                .sessions
+                .lock()
+                .expect("sessions index")
+                .get(&1)
+                .is_none()
+        );
+        assert!(
+            shared_owner_rg_indexes
+                .sessions
+                .lock()
+                .expect("sessions index")
+                .get(&2)
+                .is_some_and(|keys| keys.contains(&entry.key))
+        );
+    }
+
+    #[test]
+    fn publish_shared_session_heals_missing_owner_rg_index_on_same_owner_update() {
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let entry = SyncedSessionEntry {
+            key: test_key(),
+            decision: test_decision(),
+            metadata: test_metadata(),
+            origin: SessionOrigin::SyncImport,
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &entry,
+        );
+
+        shared_owner_rg_indexes
+            .sessions
+            .lock()
+            .expect("sessions index")
+            .clear();
+
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &entry,
+        );
+
+        assert!(
+            shared_owner_rg_indexes
+                .sessions
+                .lock()
+                .expect("sessions index")
+                .get(&entry.metadata.owner_rg_id)
+                .is_some_and(|keys| keys.contains(&entry.key))
+        );
     }
 
     #[test]
@@ -1680,10 +1899,12 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         publish_shared_session(
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &entry,
         );
 
@@ -1701,6 +1922,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &peer_worker_commands,
             &forwarding,
             &BTreeMap::new(),
@@ -1762,19 +1984,18 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         publish_shared_session(
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &entry,
         );
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let peer_worker_commands = Vec::new();
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            active_ha_runtime(1),
-        );
+        ha_state.insert(1, active_ha_runtime(1));
 
         let flow = SessionFlow {
             src_ip: translated_key.src_ip,
@@ -1787,6 +2008,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &peer_worker_commands,
             &forwarding,
             &ha_state,
@@ -1860,13 +2082,11 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let peer_worker_commands = Vec::new();
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            active_ha_runtime(1),
-        );
+        ha_state.insert(1, active_ha_runtime(1));
 
         let flow = SessionFlow {
             src_ip: translated_key.src_ip,
@@ -1879,6 +2099,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &peer_worker_commands,
             &forwarding,
             &ha_state,
@@ -1943,19 +2164,18 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         publish_shared_session(
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &entry,
         );
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let peer_worker_commands = Vec::new();
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            inactive_ha_runtime(0),
-        );
+        ha_state.insert(1, inactive_ha_runtime(0));
 
         let flow = SessionFlow {
             src_ip: translated_key.src_ip,
@@ -1968,6 +2188,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &peer_worker_commands,
             &forwarding,
             &ha_state,
@@ -2020,10 +2241,7 @@ mod tests {
                 tcp_flags: 0x10,
             }));
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            inactive_ha_runtime(0),
-        );
+        ha_state.insert(1, inactive_ha_runtime(0));
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         apply_worker_commands(
@@ -2086,10 +2304,7 @@ mod tests {
                 tcp_flags: 0x10,
             }));
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            active_ha_runtime(monotonic_nanos() / 1_000_000_000),
-        );
+        ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         apply_worker_commands(
@@ -2380,10 +2595,7 @@ mod tests {
         let forwarding = test_forwarding_state_with_fabric();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
-        );
+        ha_state.insert(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000));
         apply_worker_commands(
             &commands,
             &mut sessions,
@@ -2447,10 +2659,7 @@ mod tests {
         let forwarding = test_forwarding_state_with_fabric();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
-        );
+        ha_state.insert(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000));
         apply_worker_commands(
             &commands,
             &mut sessions,
@@ -2521,10 +2730,7 @@ mod tests {
         let forwarding = test_forwarding_state_with_fabric();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            active_ha_runtime(monotonic_nanos() / 1_000_000_000),
-        );
+        ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
         let results = apply_worker_commands(
             &commands,
             &mut sessions,
@@ -2587,10 +2793,7 @@ mod tests {
         let forwarding = test_forwarding_state_with_fabric();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            active_ha_runtime(monotonic_nanos() / 1_000_000_000),
-        );
+        ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
         let results = apply_worker_commands(
             &commands,
             &mut sessions,
@@ -2654,6 +2857,7 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let forward = SyncedSessionEntry {
             key: test_key(),
             decision: test_decision(),
@@ -2677,6 +2881,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &forward,
         );
         shared_sessions
@@ -2688,6 +2893,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &[1],
         );
 
@@ -2765,10 +2971,7 @@ mod tests {
             tcp_flags: 0x10,
         };
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            active_ha_runtime(1),
-        );
+        ha_state.insert(1, active_ha_runtime(1));
 
         let reverse =
             synthesized_synced_reverse_entry(&forwarding, &ha_state, &dynamic_neighbors, &entry, 1)
@@ -2798,14 +3001,8 @@ mod tests {
             tcp_flags: 0x10,
         };
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            active_ha_runtime(1),
-        );
-        ha_state.insert(
-            2,
-            inactive_ha_runtime(1),
-        );
+        ha_state.insert(1, active_ha_runtime(1));
+        ha_state.insert(2, inactive_ha_runtime(1));
 
         let reverse =
             synthesized_synced_reverse_entry(&forwarding, &ha_state, &dynamic_neighbors, &entry, 1)
@@ -2858,10 +3055,7 @@ mod tests {
     #[test]
     fn fabric_ingress_session_hit_bypasses_ha_inactive_gate() {
         let forwarding = test_forwarding_state_with_fabric();
-        let ha_state = BTreeMap::from([(
-            1,
-            inactive_ha_runtime(1),
-        )]);
+        let ha_state = BTreeMap::from([(1, inactive_ha_runtime(1))]);
         let resolved = enforce_session_ha_resolution(
             &forwarding,
             &ha_state,
@@ -2890,10 +3084,7 @@ mod tests {
     #[test]
     fn tunnel_ingress_session_hit_bypasses_unseeded_ha_during_startup_grace() {
         let forwarding = test_forwarding_state_split_rgs_with_tunnel();
-        let ha_state = BTreeMap::from([(
-            2,
-            inactive_ha_runtime(0),
-        )]);
+        let ha_state = BTreeMap::from([(2, inactive_ha_runtime(0))]);
         let resolved = enforce_session_ha_resolution(
             &forwarding,
             &ha_state,
@@ -2923,10 +3114,7 @@ mod tests {
     fn reverse_session_from_tunnel_forward_bypasses_unseeded_ha_during_startup_grace() {
         let forwarding = test_forwarding_state_split_rgs_with_tunnel();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let ha_state = BTreeMap::from([(
-            2,
-            inactive_ha_runtime(0),
-        )]);
+        let ha_state = BTreeMap::from([(2, inactive_ha_runtime(0))]);
         let reverse = build_reverse_session_from_forward_match(
             &forwarding,
             &ha_state,
@@ -2982,14 +3170,12 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let worker_commands = vec![Arc::new(Mutex::new(VecDeque::new()))];
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            1,
-            active_ha_runtime(1),
-        );
+        ha_state.insert(1, active_ha_runtime(1));
         let entry = SyncedSessionEntry {
             key: test_key(),
             decision: test_decision(),
@@ -3005,6 +3191,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &entry,
         );
 
@@ -3012,6 +3199,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &worker_commands,
             -1,
             &forwarding,
@@ -3038,14 +3226,12 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let worker_commands = vec![Arc::new(Mutex::new(VecDeque::new()))];
         let forwarding = test_forwarding_state_split_rgs();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
-        ha_state.insert(
-            2,
-            active_ha_runtime(1),
-        );
+        ha_state.insert(2, active_ha_runtime(1));
         let mut entry = SyncedSessionEntry {
             key: test_key(),
             decision: test_decision(),
@@ -3062,6 +3248,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &entry,
         );
 
@@ -3072,6 +3259,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &worker_commands,
             -1,
             &forwarding,
