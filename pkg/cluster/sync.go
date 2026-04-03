@@ -180,6 +180,7 @@ type SessionSync struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	sendCh     chan []byte // buffered channel for outgoing messages
+	barrierCh  chan []byte // priority channel for barrier/ack messages (bypasses bulk backlog)
 	// incrementalPauseDepth temporarily pauses background incremental
 	// producers (periodic sweeps) during HA demotion handoff so ordered
 	// demotion barriers are not queued behind unrelated backlog.
@@ -326,6 +327,7 @@ func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *Session
 		peerAddr:              peerAddr,
 		dp:                    dp,
 		sendCh:                make(chan []byte, 4096),
+		barrierCh:             make(chan []byte, 64),
 		deleteJournalCap:      deleteJournalDefaultCap,
 		failoverWaiters:       make(map[int]failoverWaiter),
 		failoverCommitWaiters: make(map[int]failoverWaiter),
@@ -342,6 +344,7 @@ func NewDualSessionSync(local, peer, local1, peer1 string, dp dataplane.DataPlan
 		peerAddr1:             peer1,
 		dp:                    dp,
 		sendCh:                make(chan []byte, 4096),
+		barrierCh:             make(chan []byte, 64),
 		deleteJournalCap:      deleteJournalDefaultCap,
 		failoverWaiters:       make(map[int]failoverWaiter),
 		failoverCommitWaiters: make(map[int]failoverWaiter),
@@ -1331,34 +1334,50 @@ func (s *SessionSync) fabricConnectLoop(ctx context.Context, fabricIdx int, peer
 }
 
 func (s *SessionSync) sendLoop(ctx context.Context) {
+	// sendOne writes a single message to the active connection, retrying
+	// on transient errors until success or context cancellation.
+	sendOne := func(msg []byte) {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			conn := s.getActiveConn()
+			if conn == nil {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			s.writeMu.Lock()
+			err := writeFull(conn, msg)
+			s.writeMu.Unlock()
+			if err != nil {
+				slog.Debug("cluster sync: send error", "err", err)
+				s.stats.Errors.Add(1)
+				s.handleDisconnect(conn)
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			return
+		}
+	}
+
 	for {
+		// Priority: drain all pending barriers before any bulk/session data.
+		select {
+		case msg := <-s.barrierCh:
+			sendOne(msg)
+			continue
+		default:
+		}
+		// No barrier pending — wait for either channel.
 		select {
 		case <-ctx.Done():
 			return
+		case msg := <-s.barrierCh:
+			sendOne(msg)
 		case msg := <-s.sendCh:
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				conn := s.getActiveConn()
-				if conn == nil {
-					time.Sleep(10 * time.Millisecond)
-					continue
-				}
-				s.writeMu.Lock()
-				err := writeFull(conn, msg)
-				s.writeMu.Unlock()
-				if err != nil {
-					slog.Debug("cluster sync: send error", "err", err)
-					s.stats.Errors.Add(1)
-					s.handleDisconnect(conn)
-					time.Sleep(10 * time.Millisecond)
-					continue
-				}
-				break
-			}
+			sendOne(msg)
 		}
 	}
 }

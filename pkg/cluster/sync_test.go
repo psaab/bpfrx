@@ -1835,6 +1835,12 @@ func TestWaitForPeerBarrierCompletesOnAck(t *testing.T) {
 	ss.conn0 = localConn
 	ss.stats.Connected.Store(true)
 
+	// Start sendLoop so barrier messages queued to barrierCh are written
+	// to the connection.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go ss.sendLoop(ctx)
+
 	done := make(chan error, 1)
 	go func() {
 		msg := make([]byte, syncHeaderSize+8)
@@ -1858,7 +1864,7 @@ func TestWaitForPeerBarrierCompletesOnAck(t *testing.T) {
 		done <- nil
 	}()
 
-	if err := ss.WaitForPeerBarrier(100 * time.Millisecond); err != nil {
+	if err := ss.WaitForPeerBarrier(2 * time.Second); err != nil {
 		t.Fatalf("WaitForPeerBarrier returned error: %v", err)
 	}
 	if err := <-done; err != nil {

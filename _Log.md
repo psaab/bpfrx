@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-04-02
+
+- **Timestamp**: 2026-04-02T20:34:00Z
+  - **Action**: Issue #403 — Planned failover must not depend on bulk sync. Added priority barrierCh channel to SessionSync so barriers/acks bypass bulk data in sendLoop. Removed syncPeerBulkPrimed gate from demotion prep. Reduced manual failover barrier timeout to 5s.
+  - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_bulk.go, pkg/daemon/daemon_ha.go, pkg/cluster/sync_test.go
+
 ## 2026-04-01
 
 - **Timestamp**: 2026-04-01T05:30:00Z
