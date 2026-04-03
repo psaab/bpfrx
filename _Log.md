@@ -135,3 +135,7 @@
 - **Timestamp**: 2026-04-02T11:45:00Z
   - **Action**: Added HA failover implementation plan tying current simplification audit to executable phases and issue dependencies (49eaf9d6)
   - **File(s)**: docs/ha-failover-implementation-plan.md, docs/ha-failover-simplification-audit.md
+
+- **Timestamp**: 2026-04-03T00:16:04Z
+  - **Action**: First #389 slice — add derived owner-RG indexes for helper shared session stores and use them for demotion-time BPF cleanup and shared-session demotion without whole-table scans
+  - **File(s)**: userspace-dp/src/afxdp.rs, userspace-dp/src/afxdp/types.rs, userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/afxdp/session_glue.rs, userspace-dp/src/afxdp/forwarding.rs, userspace-dp/src/afxdp/tunnel.rs

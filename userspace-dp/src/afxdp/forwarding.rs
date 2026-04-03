@@ -927,6 +927,7 @@ pub(super) fn install_helper_local_session_on_miss(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     key: &SessionKey,
     decision: SessionDecision,
     metadata: SessionMetadata,
@@ -940,6 +941,7 @@ pub(super) fn install_helper_local_session_on_miss(
             shared_sessions,
             shared_nat_sessions,
             shared_forward_wire_sessions,
+            shared_owner_rg_indexes,
             key,
         );
         delete_session_map_entry_for_removed_session(
@@ -2042,15 +2044,17 @@ mod tests {
             ..UserspaceDpMeta::default()
         };
 
-        assert!(cluster_peer_return_fast_path(
-            &state,
-            &dynamic_neighbors,
-            &[],
-            meta,
-            Some("sfmix"),
-            IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-        )
-        .is_none());
+        assert!(
+            cluster_peer_return_fast_path(
+                &state,
+                &dynamic_neighbors,
+                &[],
+                meta,
+                Some("sfmix"),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2072,15 +2076,17 @@ mod tests {
         };
         let packet_frame = [8u8];
 
-        assert!(cluster_peer_return_fast_path(
-            &state,
-            &dynamic_neighbors,
-            &packet_frame,
-            meta,
-            Some("lan"),
-            IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-        )
-        .is_none());
+        assert!(
+            cluster_peer_return_fast_path(
+                &state,
+                &dynamic_neighbors,
+                &packet_frame,
+                meta,
+                Some("lan"),
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2102,15 +2108,17 @@ mod tests {
         };
         let packet_frame = [128u8];
 
-        assert!(cluster_peer_return_fast_path(
-            &state,
-            &dynamic_neighbors,
-            &packet_frame,
-            meta,
-            Some("lan"),
-            IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
-        )
-        .is_none());
+        assert!(
+            cluster_peer_return_fast_path(
+                &state,
+                &dynamic_neighbors,
+                &packet_frame,
+                meta,
+                Some("lan"),
+                IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -2786,6 +2794,7 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let state = build_forwarding_state(&nat_snapshot());
         let key = SessionKey {
             addr_family: libc::AF_INET as u8,
@@ -2817,6 +2826,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &key,
             decision,
             metadata,
@@ -2826,16 +2836,20 @@ mod tests {
             0x10,
         ));
         assert!(sessions.lookup(&key, 1_000_000, 0x10).is_some());
-        assert!(shared_sessions
-            .lock()
-            .expect("shared lock")
-            .get(&key)
-            .is_none());
+        assert!(
+            shared_sessions
+                .lock()
+                .expect("shared lock")
+                .get(&key)
+                .is_none()
+        );
         assert!(shared_nat_sessions.lock().expect("nat lock").is_empty());
-        assert!(shared_forward_wire_sessions
-            .lock()
-            .expect("forward wire lock")
-            .is_empty());
+        assert!(
+            shared_forward_wire_sessions
+                .lock()
+                .expect("forward wire lock")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2844,6 +2858,7 @@ mod tests {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
         let state = build_forwarding_state(&nat_snapshot());
         let key = SessionKey {
             addr_family: libc::AF_INET as u8,
@@ -2892,6 +2907,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &entry,
         );
 
@@ -2901,6 +2917,7 @@ mod tests {
             &shared_sessions,
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
             &key,
             decision,
             entry.metadata.clone(),
@@ -2909,16 +2926,20 @@ mod tests {
             PROTO_TCP,
             0x10,
         ));
-        assert!(shared_sessions
-            .lock()
-            .expect("shared lock")
-            .get(&key)
-            .is_none());
+        assert!(
+            shared_sessions
+                .lock()
+                .expect("shared lock")
+                .get(&key)
+                .is_none()
+        );
         assert!(shared_nat_sessions.lock().expect("nat lock").is_empty());
-        assert!(shared_forward_wire_sessions
-            .lock()
-            .expect("forward wire lock")
-            .is_empty());
+        assert!(
+            shared_forward_wire_sessions
+                .lock()
+                .expect("forward wire lock")
+                .is_empty()
+        );
     }
 
     #[test]

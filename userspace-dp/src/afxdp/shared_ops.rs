@@ -4,31 +4,30 @@ pub(super) fn demote_shared_owner_rgs(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     owner_rgs: &[i32],
 ) {
     if owner_rgs.is_empty() {
         return;
     }
-    let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
-    let should_demote =
-        |entry: &SyncedSessionEntry| owner_rg_set.contains(&entry.metadata.owner_rg_id);
     if let Ok(mut sessions) = shared_sessions.lock() {
-        for entry in sessions.values_mut() {
-            if should_demote(entry) {
+        for key in owner_rg_session_keys(&shared_owner_rg_indexes.sessions, owner_rgs) {
+            if let Some(entry) = sessions.get_mut(&key) {
                 entry.origin = SessionOrigin::SyncImport;
             }
         }
     }
     if let Ok(mut sessions) = shared_nat_sessions.lock() {
-        for entry in sessions.values_mut() {
-            if should_demote(entry) {
+        for key in owner_rg_session_keys(&shared_owner_rg_indexes.nat_sessions, owner_rgs) {
+            if let Some(entry) = sessions.get_mut(&key) {
                 entry.origin = SessionOrigin::SyncImport;
             }
         }
     }
     if let Ok(mut sessions) = shared_forward_wire_sessions.lock() {
-        for entry in sessions.values_mut() {
-            if should_demote(entry) {
+        for key in owner_rg_session_keys(&shared_owner_rg_indexes.forward_wire_sessions, owner_rgs)
+        {
+            if let Some(entry) = sessions.get_mut(&key) {
                 entry.origin = SessionOrigin::SyncImport;
             }
         }
@@ -51,6 +50,7 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     session_map_fd: c_int,
     forwarding: &ForwardingState,
@@ -104,6 +104,7 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
             shared_sessions,
             shared_nat_sessions,
             shared_forward_wire_sessions,
+            shared_owner_rg_indexes,
             &reverse,
         );
         let _ = publish_session_map_entry_for_session(
@@ -372,6 +373,7 @@ pub(super) fn install_reverse_session_from_forward_match(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
@@ -414,6 +416,7 @@ pub(super) fn install_reverse_session_from_forward_match(
             shared_sessions,
             shared_nat_sessions,
             shared_forward_wire_sessions,
+            shared_owner_rg_indexes,
             &reverse_entry,
         );
         replicate_session_upsert(peer_worker_commands, &reverse_entry);
@@ -425,19 +428,44 @@ pub(super) fn publish_shared_session(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     entry: &SyncedSessionEntry,
 ) {
     if let Ok(mut sessions) = shared_sessions.lock() {
-        sessions.insert(entry.key.clone(), entry.clone());
+        let previous_owner_rg = sessions
+            .insert(entry.key.clone(), entry.clone())
+            .map(|existing| existing.metadata.owner_rg_id);
+        update_owner_rg_index(
+            &shared_owner_rg_indexes.sessions,
+            &entry.key,
+            previous_owner_rg,
+            entry.metadata.owner_rg_id,
+        );
     }
     if !entry.metadata.is_reverse
         && let Ok(mut sessions) = shared_nat_sessions.lock()
     {
         let reverse_wire = reverse_session_key(&entry.key, entry.decision.nat);
-        sessions.insert(reverse_wire.clone(), entry.clone());
+        let previous_owner_rg = sessions
+            .insert(reverse_wire.clone(), entry.clone())
+            .map(|existing| existing.metadata.owner_rg_id);
+        update_owner_rg_index(
+            &shared_owner_rg_indexes.nat_sessions,
+            &reverse_wire,
+            previous_owner_rg,
+            entry.metadata.owner_rg_id,
+        );
         let reverse_canonical = reverse_canonical_key(&entry.key, entry.decision.nat);
         if reverse_canonical != reverse_wire {
-            sessions.insert(reverse_canonical, entry.clone());
+            let previous_owner_rg = sessions
+                .insert(reverse_canonical.clone(), entry.clone())
+                .map(|existing| existing.metadata.owner_rg_id);
+            update_owner_rg_index(
+                &shared_owner_rg_indexes.nat_sessions,
+                &reverse_canonical,
+                previous_owner_rg,
+                entry.metadata.owner_rg_id,
+            );
         }
     }
     if !entry.metadata.is_reverse
@@ -445,7 +473,15 @@ pub(super) fn publish_shared_session(
     {
         let wire_key = forward_wire_key(&entry.key, entry.decision.nat);
         if wire_key != entry.key {
-            sessions.insert(wire_key, entry.clone());
+            let previous_owner_rg = sessions
+                .insert(wire_key.clone(), entry.clone())
+                .map(|existing| existing.metadata.owner_rg_id);
+            update_owner_rg_index(
+                &shared_owner_rg_indexes.forward_wire_sessions,
+                &wire_key,
+                previous_owner_rg,
+                entry.metadata.owner_rg_id,
+            );
         }
     }
 }
@@ -454,23 +490,105 @@ pub(super) fn remove_shared_session(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     key: &SessionKey,
 ) {
     if let Ok(mut sessions) = shared_sessions.lock()
         && let Some(entry) = sessions.remove(key)
-        && !entry.metadata.is_reverse
-        && let Ok(mut nat_sessions) = shared_nat_sessions.lock()
     {
-        let reverse_wire = reverse_session_key(&entry.key, entry.decision.nat);
-        nat_sessions.remove(&reverse_wire);
-        let reverse_canonical = reverse_canonical_key(&entry.key, entry.decision.nat);
-        if reverse_canonical != reverse_wire {
-            nat_sessions.remove(&reverse_canonical);
+        remove_owner_rg_index_entry(
+            &shared_owner_rg_indexes.sessions,
+            entry.metadata.owner_rg_id,
+            key,
+        );
+        if !entry.metadata.is_reverse
+            && let Ok(mut nat_sessions) = shared_nat_sessions.lock()
+        {
+            let reverse_wire = reverse_session_key(&entry.key, entry.decision.nat);
+            if let Some(removed) = nat_sessions.remove(&reverse_wire) {
+                remove_owner_rg_index_entry(
+                    &shared_owner_rg_indexes.nat_sessions,
+                    removed.metadata.owner_rg_id,
+                    &reverse_wire,
+                );
+            }
+            let reverse_canonical = reverse_canonical_key(&entry.key, entry.decision.nat);
+            if reverse_canonical != reverse_wire
+                && let Some(removed) = nat_sessions.remove(&reverse_canonical)
+            {
+                remove_owner_rg_index_entry(
+                    &shared_owner_rg_indexes.nat_sessions,
+                    removed.metadata.owner_rg_id,
+                    &reverse_canonical,
+                );
+            }
+            if let Ok(mut forward_wire_sessions) = shared_forward_wire_sessions.lock() {
+                let wire_key = forward_wire_key(&entry.key, entry.decision.nat);
+                if wire_key != entry.key
+                    && let Some(removed) = forward_wire_sessions.remove(&wire_key)
+                {
+                    remove_owner_rg_index_entry(
+                        &shared_owner_rg_indexes.forward_wire_sessions,
+                        removed.metadata.owner_rg_id,
+                        &wire_key,
+                    );
+                }
+            }
         }
-        if let Ok(mut forward_wire_sessions) = shared_forward_wire_sessions.lock() {
-            let wire_key = forward_wire_key(&entry.key, entry.decision.nat);
-            if wire_key != entry.key {
-                forward_wire_sessions.remove(&wire_key);
+    }
+}
+
+pub(super) fn owner_rg_session_keys(
+    index: &Arc<Mutex<OwnerRgSessionIndex>>,
+    owner_rgs: &[i32],
+) -> Vec<SessionKey> {
+    let mut keys = FastSet::default();
+    if let Ok(index) = index.lock() {
+        for owner_rg_id in owner_rgs {
+            if let Some(entries) = index.get(owner_rg_id) {
+                keys.extend(entries.iter().cloned());
+            }
+        }
+    }
+    keys.into_iter().collect()
+}
+
+fn update_owner_rg_index(
+    index: &Arc<Mutex<OwnerRgSessionIndex>>,
+    key: &SessionKey,
+    previous_owner_rg: Option<i32>,
+    owner_rg_id: i32,
+) {
+    if previous_owner_rg == Some(owner_rg_id) {
+        return;
+    }
+    if let Some(previous_owner_rg) = previous_owner_rg {
+        remove_owner_rg_index_entry(index, previous_owner_rg, key);
+    }
+    if owner_rg_id <= 0 {
+        return;
+    }
+    if let Ok(mut index) = index.lock() {
+        index
+            .entry(owner_rg_id)
+            .or_insert_with(FastSet::default)
+            .insert(key.clone());
+    }
+}
+
+fn remove_owner_rg_index_entry(
+    index: &Arc<Mutex<OwnerRgSessionIndex>>,
+    owner_rg_id: i32,
+    key: &SessionKey,
+) {
+    if owner_rg_id <= 0 {
+        return;
+    }
+    if let Ok(mut index) = index.lock() {
+        if let Some(keys) = index.get_mut(&owner_rg_id) {
+            keys.remove(key);
+            if keys.is_empty() {
+                index.remove(&owner_rg_id);
             }
         }
     }
