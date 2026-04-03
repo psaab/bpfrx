@@ -133,11 +133,7 @@ impl super::Coordinator {
         Ok(())
     }
 
-    fn enqueue_apply_ha_state(
-        &self,
-        republish_owner_rgs: &[i32],
-        demote_owner_rgs: &[i32],
-    ) {
+    fn enqueue_apply_ha_state(&self, republish_owner_rgs: &[i32], demote_owner_rgs: &[i32]) {
         if self.workers.is_empty() {
             return;
         }
@@ -153,7 +149,10 @@ impl super::Coordinator {
                     demote_owner_rgs: demote_owner_rgs.to_vec(),
                 });
             } else {
-                eprintln!("bpfrx-ha: worker-{} command mutex poisoned during HA state apply", worker_id);
+                eprintln!(
+                    "bpfrx-ha: worker-{} command mutex poisoned during HA state apply",
+                    worker_id
+                );
             }
         }
         // Fire-and-forget: BPF session map is already updated synchronously
@@ -407,7 +406,7 @@ impl super::Coordinator {
                 origin: entry.origin,
                 fabric_redirect_sync: true,
             };
-            handle.push_delta(&delta, zone_name_to_id);
+            handle.push_delta_lossless(&delta, zone_name_to_id)?;
             count += 1;
         }
         drop(sessions); // release lock before logging

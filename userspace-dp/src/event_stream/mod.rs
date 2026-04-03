@@ -11,19 +11,17 @@
 
 pub(crate) mod codec;
 
-pub(crate) use codec::{close_flags, EventFrame};
+pub(crate) use codec::{EventFrame, close_flags};
 
-use codec::{
-    FRAME_HEADER_SIZE, MSG_ACK, MSG_DRAIN_REQUEST, MSG_KEEPALIVE, MSG_PAUSE, MSG_RESUME,
-};
 use crate::session::{SessionDelta, SessionDeltaKind};
+use codec::{FRAME_HEADER_SIZE, MSG_ACK, MSG_DRAIN_REQUEST, MSG_KEEPALIVE, MSG_PAUSE, MSG_RESUME};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::io;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -36,6 +34,12 @@ const CHANNEL_CAPACITY: usize = 8192;
 
 /// Maximum frames retained for replay after disconnect.
 const REPLAY_BUFFER_CAPACITY: usize = 4096;
+
+/// Upper bound for explicit lossless queueing operations such as full
+/// session export on connect. Normal packet-path delta export remains
+/// non-blocking via `try_send`.
+const LOSSLESS_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+const LOSSLESS_QUEUE_RETRY_DELAY: Duration = Duration::from_micros(50);
 
 // ---------------------------------------------------------------------------
 // Shared state between I/O thread and workers
@@ -187,6 +191,40 @@ impl EventStreamWorkerHandle {
         }
     }
 
+    fn send_frame_lossless(&self, mut frame: EventFrame) -> Result<(), String> {
+        if !self.shared.connected.load(Ordering::Acquire) {
+            return Err("event stream not connected".to_string());
+        }
+        let deadline = Instant::now() + LOSSLESS_QUEUE_TIMEOUT;
+        loop {
+            match self.tx.try_send(frame) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Full(returned)) => {
+                    frame = returned;
+                    if !self.shared.connected.load(Ordering::Acquire) {
+                        return Err(format!(
+                            "event stream disconnected while queuing seq {}",
+                            frame.seq
+                        ));
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(format!(
+                            "timed out queuing event stream frame seq {}",
+                            frame.seq
+                        ));
+                    }
+                    thread::sleep(LOSSLESS_QUEUE_RETRY_DELAY);
+                }
+                Err(mpsc::TrySendError::Disconnected(returned)) => {
+                    return Err(format!(
+                        "event stream channel disconnected while queuing seq {}",
+                        returned.seq
+                    ));
+                }
+            }
+        }
+    }
+
     /// Encode and send a session delta as an event frame.
     pub(crate) fn push_delta(
         &self,
@@ -212,6 +250,33 @@ impl EventStreamWorkerHandle {
         };
         self.try_send(frame);
     }
+
+    /// Lossless variant used for explicit bootstrap/replay exports. This path
+    /// may wait briefly for queue capacity, but it never silently drops.
+    pub(crate) fn push_delta_lossless(
+        &self,
+        delta: &SessionDelta,
+        zone_name_to_id: &FxHashMap<String, u16>,
+    ) -> Result<(), String> {
+        let seq = self.next_seq();
+        let frame = match delta.kind {
+            SessionDeltaKind::Open => EventFrame::encode_session_open(
+                seq,
+                &delta.key,
+                &delta.decision,
+                &delta.metadata,
+                zone_name_to_id,
+                delta.fabric_redirect_sync,
+            ),
+            SessionDeltaKind::Close => EventFrame::encode_session_close(
+                seq,
+                &delta.key,
+                delta.metadata.owner_rg_id,
+                close_flags(delta),
+            ),
+        };
+        self.send_frame_lossless(frame)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,10 +300,7 @@ fn io_thread_main(
         };
         stream.set_nonblocking(true).ok();
         shared.connected.store(true, Ordering::Release);
-        eprintln!(
-            "bpfrx-event-stream: connected to {}",
-            socket_path
-        );
+        eprintln!("bpfrx-event-stream: connected to {}", socket_path);
 
         // Replay buffered events from last acked seq
         let acked = shared.acked_seq.load(Ordering::Acquire);
@@ -307,8 +369,10 @@ fn replay_buffered(
         let frame = EventFrame::encode_full_resync(seq);
         write_frame_blocking(stream, &frame)?;
         shared.frames_sent.fetch_add(1, Ordering::Relaxed);
-        eprintln!("bpfrx-event-stream: sent FullResync (buffer gap: acked={}, oldest_buffered={})",
-            acked_seq, oldest_buffered);
+        eprintln!(
+            "bpfrx-event-stream: sent FullResync (buffer gap: acked={}, oldest_buffered={})",
+            acked_seq, oldest_buffered
+        );
         replay_buf.clear();
         return Ok(());
     }
@@ -322,7 +386,9 @@ fn replay_buffered(
         }
     }
     if replayed > 0 {
-        shared.frames_replayed.fetch_add(replayed, Ordering::Relaxed);
+        shared
+            .frames_replayed
+            .fetch_add(replayed, Ordering::Relaxed);
         shared.frames_sent.fetch_add(replayed, Ordering::Relaxed);
         eprintln!("bpfrx-event-stream: replayed {replayed} events");
     }
@@ -562,7 +628,11 @@ fn handle_drain_request(
             }
             Err(TryRecvError::Empty) => {
                 // Check if we already have the target in replay buf
-                if replay_buf.back().map(|f| f.seq >= target_seq).unwrap_or(false) {
+                if replay_buf
+                    .back()
+                    .map(|f| f.seq >= target_seq)
+                    .unwrap_or(false)
+                {
                     break;
                 }
                 if Instant::now() >= deadline {
@@ -602,10 +672,7 @@ fn handle_drain_request(
         shared.paused.store(true, Ordering::Release);
     }
 
-    eprintln!(
-        "bpfrx-event-stream: drain complete up to seq {}",
-        drain_seq
-    );
+    eprintln!("bpfrx-event-stream: drain complete up to seq {}", drain_seq);
 }
 
 /// Drain remaining events from the channel on shutdown.
@@ -706,6 +773,43 @@ mod tests {
         // Third send should fail (channel full)
         assert!(!handle.try_send(frame));
         assert_eq!(shared.frames_dropped.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_lossless_send_waits_for_capacity() {
+        let (tx, rx) = mpsc::sync_channel::<EventFrame>(1);
+        let shared = Arc::new(EventStreamShared::new());
+        shared.connected.store(true, Ordering::Release);
+        let handle = EventStreamWorkerHandle {
+            tx,
+            shared: shared.clone(),
+        };
+
+        assert!(handle.try_send(EventFrame::encode_drain_complete(1)));
+
+        let join = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            rx.recv().expect("drain queued frame");
+            thread::sleep(Duration::from_millis(20));
+        });
+
+        handle
+            .send_frame_lossless(EventFrame::encode_drain_complete(2))
+            .expect("lossless send should wait for capacity");
+        join.join().expect("consumer thread");
+        assert_eq!(shared.frames_dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_lossless_send_fails_when_not_connected() {
+        let (tx, _rx) = mpsc::sync_channel::<EventFrame>(1);
+        let shared = Arc::new(EventStreamShared::new());
+        let handle = EventStreamWorkerHandle { tx, shared };
+
+        let err = handle
+            .send_frame_lossless(EventFrame::encode_drain_complete(1))
+            .expect_err("lossless send should fail when disconnected");
+        assert!(err.contains("not connected"));
     }
 
     #[test]
