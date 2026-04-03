@@ -171,26 +171,33 @@ func (s *SessionSync) TransferReadiness() TransferReadinessSnapshot {
 }
 
 func (s *SessionSync) sendBarrierAck(conn net.Conn, seq uint64) {
-	// Queue the barrier ack through barrierCh (priority channel) so it
-	// is sent ahead of bulk/session data. This ensures the requesting
-	// peer gets the ack promptly even during high-throughput sync.
+	if conn == nil {
+		return
+	}
+	// Write barrier ack directly under writeMu instead of going through
+	// barrierCh → sendLoop. The sendLoop may be blocked on writeMu
+	// (held by BulkSync writing session data), so routing through
+	// barrierCh doesn't help — the ack sits in the channel while
+	// sendLoop is stuck. Direct write with writeMu guarantees the ack
+	// is sent as soon as the current BulkSync per-session write releases
+	// the lock (each session write is <1ms).
 	var payload [24]byte
 	binary.LittleEndian.PutUint64(payload[:], seq)
 	stats := s.Stats()
 	binary.LittleEndian.PutUint64(payload[8:16], stats.SessionsReceived)
 	binary.LittleEndian.PutUint64(payload[16:24], stats.SessionsInstalled)
-	msg := encodeRawMessage(syncMsgBarrierAck, payload[:])
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	select {
-	case s.barrierCh <- msg:
-		slog.Info("cluster sync: barrier ack queued (priority)",
-			"seq", seq,
-			"sessions_received", stats.SessionsReceived,
-			"sessions_installed", stats.SessionsInstalled)
-	case <-timer.C:
-		slog.Warn("cluster sync: barrier ack send timed out", "seq", seq)
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgBarrierAck, payload[:])
+	s.writeMu.Unlock()
+	if err != nil {
+		s.stats.Errors.Add(1)
+		slog.Warn("cluster sync: barrier ack write failed", "seq", seq, "err", err)
+		return
 	}
+	slog.Info("cluster sync: barrier ack sent",
+		"seq", seq,
+		"sessions_received", stats.SessionsReceived,
+		"sessions_installed", stats.SessionsInstalled)
 }
 
 func (s *SessionSync) completeBarrierWait(seq uint64) {
@@ -208,23 +215,23 @@ func (s *SessionSync) sendBulkAck(conn net.Conn, epoch uint64) {
 		slog.Debug("cluster sync: skipping bulk ack on nil connection", "epoch", epoch)
 		return
 	}
-	// Queue the bulk ack through barrierCh (priority channel) so it is
-	// sent ahead of session data. The peer may be gating on this ack.
+	// Write bulk ack directly under writeMu — same rationale as
+	// sendBarrierAck: the sendLoop may be blocked on writeMu during
+	// BulkSync writes, so routing through barrierCh doesn't help.
 	var payload [8]byte
 	binary.LittleEndian.PutUint64(payload[:], epoch)
-	msg := encodeRawMessage(syncMsgBulkAck, payload[:])
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
-	select {
-	case s.barrierCh <- msg:
-		slog.Info("cluster sync: bulk ack queued (priority)",
-			"epoch", epoch,
-			"local", connLocalAddrString(conn),
-			"remote", connRemoteAddrString(conn))
-	case <-timer.C:
-		slog.Warn("cluster sync: bulk ack send timed out",
-			"epoch", epoch)
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgBulkAck, payload[:])
+	s.writeMu.Unlock()
+	if err != nil {
+		s.stats.Errors.Add(1)
+		slog.Warn("cluster sync: bulk ack write failed", "epoch", epoch, "err", err)
+		return
 	}
+	slog.Info("cluster sync: bulk ack sent",
+		"epoch", epoch,
+		"local", connLocalAddrString(conn),
+		"remote", connRemoteAddrString(conn))
 }
 
 func (s *SessionSync) writeBarrierMessage(payload []byte, timeout time.Duration) error {
