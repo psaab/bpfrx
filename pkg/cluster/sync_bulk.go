@@ -12,6 +12,70 @@ import (
 )
 
 // BulkSync sends all locally-owned forward sessions to the peer.
+// doBulkSync runs BulkSyncOverride if set, otherwise falls back to BulkSync.
+// When the override is used, sessions are delivered as incremental updates
+// (via event stream), but we still send BulkStart/BulkEnd markers so the
+// peer completes the bulk receive handshake (releasing sync hold, etc.).
+// The peer sees an empty bulk and skips stale reconciliation.
+func (s *SessionSync) doBulkSync() error {
+	if s.BulkSyncOverride != nil {
+		slog.Info("cluster sync: using bulk sync override (event stream)")
+		if err := s.BulkSyncOverride(); err != nil {
+			slog.Warn("cluster sync: bulk sync override failed, falling back", "err", err)
+			return s.BulkSync()
+		}
+		// Send empty BulkStart/BulkEnd so the peer completes the
+		// bulk receive handshake. Sessions were already delivered as
+		// incremental updates via the event stream.
+		return s.sendBulkMarkers()
+	}
+	return s.BulkSync()
+}
+
+// sendBulkMarkers sends a BulkStart/BulkEnd pair with no session data.
+// Used after event stream export to signal the peer that a complete
+// bulk transfer happened (the sessions were delivered incrementally).
+func (s *SessionSync) sendBulkMarkers() error {
+	s.bulkSendMu.Lock()
+	defer s.bulkSendMu.Unlock()
+
+	conn := s.getActiveConn()
+	if conn == nil {
+		return fmt.Errorf("no peer connection")
+	}
+
+	epoch := s.bulkSendNext.Add(1)
+	var epochBuf [8]byte
+	binary.LittleEndian.PutUint64(epochBuf[:], epoch)
+
+	slog.Info("cluster sync: sending bulk markers after event stream export",
+		"epoch", epoch,
+		"local", connLocalAddrString(conn),
+		"remote", connRemoteAddrString(conn))
+
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgBulkStart, epochBuf[:])
+	s.writeMu.Unlock()
+	if err != nil {
+		s.handleDisconnect(conn)
+		return err
+	}
+
+	s.writeMu.Lock()
+	err = writeMsg(conn, syncMsgBulkEnd, epochBuf[:])
+	s.writeMu.Unlock()
+	if err != nil {
+		s.handleDisconnect(conn)
+		return err
+	}
+
+	s.pendingBulkAckEpoch.Store(epoch)
+	s.pendingBulkAckSince.Store(time.Now().UnixNano())
+	s.stats.BulkSyncs.Add(1)
+	slog.Info("cluster sync: bulk markers sent", "epoch", epoch)
+	return nil
+}
+
 func (s *SessionSync) BulkSync() error {
 	s.bulkSendMu.Lock()
 	defer s.bulkSendMu.Unlock()

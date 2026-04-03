@@ -3219,7 +3219,8 @@ mod tests {
             .expect("reverse entry");
         assert!(reverse.metadata.is_reverse);
         assert!(reverse.origin.is_peer_synced());
-        assert_eq!(worker_commands[0].lock().expect("commands").len(), 1);
+        // 2 commands: forward entry + reverse entry (both pushed to workers)
+        assert_eq!(worker_commands[0].lock().expect("commands").len(), 2);
     }
 
     #[test]
@@ -3286,7 +3287,8 @@ mod tests {
             .expect("reverse entry");
         assert!(reverse.metadata.is_reverse);
         assert_eq!(reverse.metadata.owner_rg_id, 2);
-        assert_eq!(worker_commands[0].lock().expect("commands").len(), 1);
+        // 2 commands: forward entry + reverse entry (both pushed to workers)
+        assert_eq!(worker_commands[0].lock().expect("commands").len(), 2);
     }
 
     #[test]

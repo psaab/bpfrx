@@ -68,9 +68,10 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
         &shared_owner_rg_indexes.reverse_prewarm_sessions,
         owner_rgs,
     );
-    let reverse_entries = shared_sessions
+    let (forward_entries, reverse_entries) = shared_sessions
         .lock()
         .map(|sessions| {
+            let mut forward_entries = Vec::new();
             let mut reverse_entries = Vec::new();
             for key in candidate_keys {
                 let Some(entry) = sessions.get(&key) else {
@@ -86,19 +87,36 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
                     entry,
                     now_secs,
                 ) else {
+                    // Collect forward entry even if reverse can't be synthesized,
+                    // as long as the forward session belongs to an activated RG.
+                    if owner_rg_set.contains(&entry.metadata.owner_rg_id) {
+                        forward_entries.push(entry.clone());
+                    }
                     continue;
                 };
                 if owner_rg_set.contains(&entry.metadata.owner_rg_id)
                     || owner_rg_set.contains(&reverse.metadata.owner_rg_id)
                 {
+                    forward_entries.push(entry.clone());
                     reverse_entries.push(reverse);
                 }
             }
-            reverse_entries
+            (forward_entries, reverse_entries)
         })
         .unwrap_or_default();
-    if reverse_entries.is_empty() {
+    if forward_entries.is_empty() && reverse_entries.is_empty() {
         return;
+    }
+    // Push forward entries to workers so their local SessionTables have
+    // the promoted sessions. Without this, workers only have reverse
+    // sessions and incoming traffic on existing flows misses the forward
+    // session lookup.
+    for forward in &forward_entries {
+        for commands in worker_commands {
+            if let Ok(mut pending) = commands.lock() {
+                pending.push_back(WorkerCommand::UpsertSynced(forward.clone()));
+            }
+        }
     }
     for reverse in reverse_entries {
         publish_shared_session(

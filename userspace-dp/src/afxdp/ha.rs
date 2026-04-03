@@ -128,7 +128,18 @@ impl super::Coordinator {
                 &activated_rgs,
                 now_secs,
             );
-            self.enqueue_apply_ha_state(&[], &[]);
+            // Bump RG epochs for activated RGs so flow cache entries with
+            // stale HA state are invalidated.
+            for rg_id in &activated_rgs {
+                let idx = *rg_id as usize;
+                if idx > 0 && idx < MAX_RG_EPOCHS {
+                    self.rg_epochs[idx].fetch_add(1, Ordering::Release);
+                }
+            }
+            // Pass activated_rgs as republish_owner_rgs so workers
+            // refresh their local session tables — re-resolving SNAT
+            // IPs, egress MACs, and HA state for promoted sessions.
+            self.enqueue_apply_ha_state(&activated_rgs, &[]);
         }
         Ok(())
     }

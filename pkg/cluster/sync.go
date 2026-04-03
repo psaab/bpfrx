@@ -215,6 +215,11 @@ type SessionSync struct {
 	// sync hold after session state has been installed.
 	OnBulkSyncReceived func()
 
+	// BulkSyncOverride, if set, is called instead of BulkSync() when the
+	// outbound bulk transfer needs to run. The daemon sets this to route
+	// through the event stream export path for userspace dataplanes.
+	BulkSyncOverride func() error
+
 	// OnBulkSyncAckReceived is called when the peer acknowledges that it
 	// has fully processed one of our bulk sync transfers.
 	OnBulkSyncAckReceived func()
@@ -600,7 +605,7 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 		slog.Info("cluster sync: starting bulk sync on new connection",
 			"fabric", fabricIdx,
 			"remote", connRemoteAddrString(conn))
-		if err := s.BulkSync(); err != nil {
+		if err := s.doBulkSync(); err != nil {
 			slog.Warn("cluster sync: bulk sync failed", "err", err, "fabric", fabricIdx)
 		}
 	} else if becameActive {
@@ -609,7 +614,7 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 			"remote", connRemoteAddrString(conn),
 			"active_before", activeBefore,
 			"active_after", activeAfter)
-		if err := s.BulkSync(); err != nil {
+		if err := s.doBulkSync(); err != nil {
 			slog.Warn("cluster sync: bulk sync on active connection failed", "err", err, "fabric", fabricIdx)
 		}
 	} else {
@@ -2248,6 +2253,19 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		s.clockSynced.Store(false)
 		s.pendingBulkAckEpoch.Store(0)
 		s.pendingBulkAckSince.Store(0)
+		// Reset any in-progress bulk receive — the connection that started
+		// it is gone, so the BulkEnd will never arrive.
+		s.bulkMu.Lock()
+		hadBulkInProgress := s.bulkInProgress
+		s.bulkInProgress = false
+		s.bulkRecvEpoch = 0
+		s.bulkRecvV4 = nil
+		s.bulkRecvV6 = nil
+		s.bulkZoneSnapshot = nil
+		s.bulkMu.Unlock()
+		if hadBulkInProgress {
+			slog.Info("cluster sync: reset in-progress bulk receive on disconnect")
+		}
 		slog.Info("cluster sync: peer disconnected (all fabrics down)")
 		if pendingBarriers != 0 || ackedBarriers != 0 || clearedWaiters != 0 || clearedFailoverWaiters != 0 || clearedFailoverCommitWaiters != 0 {
 			slog.Info("cluster sync: reset barrier state after disconnect",
