@@ -136,6 +136,14 @@ enum ConfigTarget {
   ACTIVE = 1;
 }
 
+enum MonitorInterfaceSummaryMode {
+  MONITOR_INTERFACE_SUMMARY_MODE_COMBINED = 0;
+  MONITOR_INTERFACE_SUMMARY_MODE_PACKETS = 1;
+  MONITOR_INTERFACE_SUMMARY_MODE_BYTES = 2;
+  MONITOR_INTERFACE_SUMMARY_MODE_DELTA = 3;
+  MONITOR_INTERFACE_SUMMARY_MODE_RATE = 4;
+}
+
 message ShowConfigRequest {
   ConfigFormat format = 1;
   ConfigTarget target = 2;
@@ -633,6 +641,7 @@ message MonitorPacketDropResponse { string line = 1; }
 
 message MonitorInterfaceRequest {
   string interface_name = 1;  // empty = traffic summary mode
+  MonitorInterfaceSummaryMode summary_mode = 2;
 }
 message MonitorInterfaceResponse {
   string frame = 1;  // pre-formatted text frame

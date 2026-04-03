@@ -25,6 +25,7 @@ import (
 
 	"github.com/psaab/bpfrx/pkg/cmdtree"
 	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
+	"github.com/psaab/bpfrx/pkg/monitoriface"
 )
 
 func main() {
@@ -3075,8 +3076,16 @@ func (c *ctl) handleMonitor(args []string) error {
 
 func (c *ctl) handleMonitorInterface(args []string) error {
 	req := &pb.MonitorInterfaceRequest{}
-	if len(args) > 0 && args[0] != "traffic" {
-		req.InterfaceName = args[0]
+	if len(args) > 0 {
+		if args[0] == "traffic" {
+			mode, err := remoteMonitorSummaryMode(args[1:])
+			if err != nil {
+				return err
+			}
+			req.SummaryMode = mode
+		} else {
+			req.InterfaceName = args[0]
+		}
 	}
 	// "traffic" or no args → summary mode (empty interface_name).
 
@@ -3104,6 +3113,29 @@ func (c *ctl) handleMonitorInterface(args []string) error {
 		fmt.Print(resp.Frame)
 	}
 	return nil
+}
+
+func remoteMonitorSummaryMode(args []string) (pb.MonitorInterfaceSummaryMode, error) {
+	if len(args) == 0 {
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_COMBINED, nil
+	}
+	mode, ok := monitoriface.ParseSummaryMode(args[0])
+	if !ok {
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_COMBINED,
+			fmt.Errorf("unknown monitor interface traffic mode: %s", args[0])
+	}
+	switch mode {
+	case monitoriface.SummaryModePackets:
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_PACKETS, nil
+	case monitoriface.SummaryModeBytes:
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_BYTES, nil
+	case monitoriface.SummaryModeDelta:
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_DELTA, nil
+	case monitoriface.SummaryModeRate:
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_RATE, nil
+	default:
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_COMBINED, nil
+	}
 }
 
 func (c *ctl) handleMonitorSecurity(args []string) error {

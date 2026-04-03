@@ -305,109 +305,109 @@ func TestAggregateUserspaceIfaceSnapshot(t *testing.T) {
 	if snap == nil {
 		t.Fatal("expected userspace snapshot")
 	}
-	if !snap.helperEnabled || !snap.forwardingArmed {
+	if !snap.HelperEnabled || !snap.ForwardingArmed {
 		t.Fatal("expected helper enabled and armed")
 	}
-	if snap.bindings != 2 || snap.readyBindings != 2 || snap.boundBindings != 2 {
+	if snap.Bindings != 2 || snap.ReadyBindings != 2 || snap.BoundBindings != 2 {
 		t.Fatalf("unexpected binding counts: %+v", snap)
 	}
-	if snap.xskRegistered != 2 || snap.zeroCopyBindings != 1 {
+	if snap.XSKRegistered != 2 || snap.ZeroCopyBindings != 1 {
 		t.Fatalf("unexpected xsk/zc counts: %+v", snap)
 	}
-	if snap.rxPackets != 30 || snap.txPackets != 28 {
-		t.Fatalf("unexpected packet totals: rx=%d tx=%d", snap.rxPackets, snap.txPackets)
+	if snap.RxPackets != 30 || snap.TxPackets != 28 {
+		t.Fatalf("unexpected packet totals: rx=%d tx=%d", snap.RxPackets, snap.TxPackets)
 	}
-	if snap.directTXPackets != 26 || snap.copyTXPackets != 3 || snap.inPlaceTXPackets != 5 {
-		t.Fatalf("unexpected tx mode totals: direct=%d copy=%d inplace=%d", snap.directTXPackets, snap.copyTXPackets, snap.inPlaceTXPackets)
+	if snap.DirectTXPackets != 26 || snap.CopyTXPackets != 3 || snap.InPlaceTXPackets != 5 {
+		t.Fatalf("unexpected tx mode totals: direct=%d copy=%d inplace=%d", snap.DirectTXPackets, snap.CopyTXPackets, snap.InPlaceTXPackets)
 	}
-	if snap.sessionMisses != 4 || snap.neighborMissPackets != 6 || snap.routeMissPackets != 8 {
-		t.Fatalf("unexpected miss totals: session=%d neigh=%d route=%d", snap.sessionMisses, snap.neighborMissPackets, snap.routeMissPackets)
+	if snap.SessionMisses != 4 || snap.NeighborMissPackets != 6 || snap.RouteMissPackets != 8 {
+		t.Fatalf("unexpected miss totals: session=%d neigh=%d route=%d", snap.SessionMisses, snap.NeighborMissPackets, snap.RouteMissPackets)
 	}
-	if len(snap.lastErrors) != 1 || snap.lastErrors[0] != "bind failed" {
-		t.Fatalf("unexpected last errors: %#v", snap.lastErrors)
+	if len(snap.LastErrors) != 1 || snap.LastErrors[0] != "bind failed" {
+		t.Fatalf("unexpected last errors: %#v", snap.LastErrors)
 	}
-	if len(snap.recentExceptions) != 1 || !strings.Contains(snap.recentExceptions[0], "ha_inactive") {
-		t.Fatalf("unexpected exceptions: %#v", snap.recentExceptions)
+	if len(snap.RecentExceptions) != 1 || !strings.Contains(snap.RecentExceptions[0], "ha_inactive") {
+		t.Fatalf("unexpected exceptions: %#v", snap.RecentExceptions)
 	}
 }
 
 func TestRenderSingleInterfaceIncludesUserspaceSection(t *testing.T) {
 	now := time.Now()
 	baseline := &ifaceSnapshot{
-		rxBytes: 1000,
-		txBytes: 2000,
-		rxPkts:  10,
-		txPkts:  20,
-		ts:      now.Add(-time.Second),
-		userspace: &userspaceIfaceSnapshot{
-			rxBytes:             100,
-			txBytes:             200,
-			rxPackets:           10,
-			txPackets:           20,
-			directTXPackets:     5,
-			copyTXPackets:       1,
-			inPlaceTXPackets:    2,
-			sessionMisses:       1,
-			neighborMissPackets: 2,
-			routeMissPackets:    3,
-			policyDeniedPackets: 4,
-			exceptionPackets:    5,
-			slowPathPackets:     6,
+		RxBytes:   1000,
+		TxBytes:   2000,
+		RxPkts:    10,
+		TxPkts:    20,
+		Timestamp: now.Add(-time.Second),
+		Userspace: &userspaceIfaceSnapshot{
+			RxBytes:             100,
+			TxBytes:             200,
+			RxPackets:           10,
+			TxPackets:           20,
+			DirectTXPackets:     5,
+			CopyTXPackets:       1,
+			InPlaceTXPackets:    2,
+			SessionMisses:       1,
+			NeighborMissPackets: 2,
+			RouteMissPackets:    3,
+			PolicyDeniedPackets: 4,
+			ExceptionPackets:    5,
+			SlowPathPackets:     6,
 		},
 	}
 	prev := &ifaceSnapshot{
-		ts: now.Add(-time.Second),
-		userspace: &userspaceIfaceSnapshot{
-			rxBytes:   100,
-			txBytes:   200,
-			rxPackets: 10,
-			txPackets: 20,
+		Timestamp: now.Add(-time.Second),
+		Userspace: &userspaceIfaceSnapshot{
+			RxBytes:   100,
+			TxBytes:   200,
+			RxPackets: 10,
+			TxPackets: 20,
 		},
 	}
 	snap := &ifaceSnapshot{
-		rxBytes: 2000,
-		txBytes: 4000,
-		rxPkts:  20,
-		txPkts:  40,
-		ts:      now,
-		userspace: &userspaceIfaceSnapshot{
-			helperEnabled:                     true,
-			forwardingArmed:                   true,
-			neighborGeneration:                7,
-			lastSnapshotGen:                   8,
-			bindings:                          2,
-			readyBindings:                     2,
-			boundBindings:                     2,
-			xskRegistered:                     2,
-			zeroCopyBindings:                  1,
-			rxBytes:                           300,
-			txBytes:                           500,
-			rxPackets:                         30,
-			txPackets:                         50,
-			directTXPackets:                   15,
-			copyTXPackets:                     2,
-			inPlaceTXPackets:                  3,
-			txCompletions:                     17,
-			kernelRXDropped:                   18,
-			kernelRXInvalidDescs:              19,
-			directTXNoFrameFallbackPackets:    4,
-			directTXBuildFallbackPackets:      5,
-			directTXDisallowedFallbackPackets: 6,
-			debugPendingFillFrames:            21,
-			debugSpareFillFrames:              22,
-			debugFreeTXFrames:                 23,
-			debugPendingTXPrepared:            24,
-			debugPendingTXLocal:               25,
-			debugOutstandingTX:                26,
-			debugInFlightRecycles:             27,
-			sessionMisses:                     4,
-			neighborMissPackets:               5,
-			routeMissPackets:                  6,
-			policyDeniedPackets:               7,
-			exceptionPackets:                  8,
-			slowPathPackets:                   9,
-			lastErrors:                        []string{"bind failed"},
-			recentExceptions:                  []string{"ha_inactive | 10.0.0.1 -> 1.1.1.1"},
+		RxBytes:   2000,
+		TxBytes:   4000,
+		RxPkts:    20,
+		TxPkts:    40,
+		Timestamp: now,
+		Userspace: &userspaceIfaceSnapshot{
+			HelperEnabled:                     true,
+			ForwardingArmed:                   true,
+			NeighborGeneration:                7,
+			LastSnapshotGen:                   8,
+			Bindings:                          2,
+			ReadyBindings:                     2,
+			BoundBindings:                     2,
+			XSKRegistered:                     2,
+			ZeroCopyBindings:                  1,
+			RxBytes:                           300,
+			TxBytes:                           500,
+			RxPackets:                         30,
+			TxPackets:                         50,
+			DirectTXPackets:                   15,
+			CopyTXPackets:                     2,
+			InPlaceTXPackets:                  3,
+			TxCompletions:                     17,
+			KernelRXDropped:                   18,
+			KernelRXInvalidDescs:              19,
+			DirectTXNoFrameFallbackPackets:    4,
+			DirectTXBuildFallbackPackets:      5,
+			DirectTXDisallowedFallbackPackets: 6,
+			DebugPendingFillFrames:            21,
+			DebugSpareFillFrames:              22,
+			DebugFreeTXFrames:                 23,
+			DebugPendingTXPrepared:            24,
+			DebugPendingTXLocal:               25,
+			DebugOutstandingTX:                26,
+			DebugInFlightRecycles:             27,
+			SessionMisses:                     4,
+			NeighborMissPackets:               5,
+			RouteMissPackets:                  6,
+			PolicyDeniedPackets:               7,
+			ExceptionPackets:                  8,
+			SlowPathPackets:                   9,
+			LastErrors:                        []string{"bind failed"},
+			RecentExceptions:                  []string{"ha_inactive | 10.0.0.1 -> 1.1.1.1"},
 		},
 	}
 
