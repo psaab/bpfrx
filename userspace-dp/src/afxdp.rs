@@ -2535,7 +2535,7 @@ fn poll_binding(
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
                     let mut session_ingress_zone: Option<Arc<str>> = None;
                     let mut apply_nat_on_fabric = false;
-                    let decision = if let Some(flow) = flow.as_ref() {
+                    let mut decision = if let Some(flow) = flow.as_ref() {
                         if let Some(resolved) = resolve_flow_session_decision(
                             sessions,
                             binding.session_map_fd,
@@ -3513,11 +3513,37 @@ fn poll_binding(
                             nat: NatDecision::default(),
                         }
                     };
-                    // NOTE: HAInactive fabric redirect is handled by the eBPF pipeline
-                    // via rg_active checks + try_fabric_redirect(). The ctrl-disable
-                    // on demotion ensures the eBPF pipeline handles the transition.
-                    // Do NOT convert HAInactive→FabricRedirect here — it causes
-                    // false redirects during startup when HA watchdog hasn't started.
+                    // Safety net: convert any remaining HAInactive to fabric
+                    // redirect. Session-hit and new-flow paths each attempt
+                    // fabric redirect internally, but demoted sessions that
+                    // arrive via DNAT/interface-NAT XDP shim paths can slip
+                    // through with HAInactive when the inner conversion found
+                    // no fabric link at the time. Anti-loop: never redirect
+                    // packets that arrived on the fabric interface itself.
+                    // Only redirect when the egress maps to a known RG.
+                    // HAInactive with unknown ownership (rg=0) means unresolved
+                    // — those should NOT be fabric-redirected.
+                    let egress_rg = owner_rg_for_resolution(forwarding, decision.resolution);
+                    if decision.resolution.disposition == ForwardingDisposition::HAInactive
+                        && egress_rg > 0
+                        && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
+                    {
+                        let zone_name = session_ingress_zone
+                            .as_deref()
+                            .or_else(|| {
+                                forwarding
+                                    .ifindex_to_zone
+                                    .get(&(meta.ingress_ifindex as i32))
+                                    .map(|s| s.as_str())
+                            })
+                            .unwrap_or("");
+                        if let Some(redirect) =
+                            resolve_zone_encoded_fabric_redirect(forwarding, zone_name)
+                                .or_else(|| resolve_fabric_redirect(forwarding))
+                        {
+                            decision.resolution = redirect;
+                        }
+                    }
                     if matches!(
                         decision.resolution.disposition,
                         ForwardingDisposition::ForwardCandidate
