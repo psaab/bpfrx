@@ -247,6 +247,7 @@ func (d *Daemon) startSessionSyncPrimeRetry(gen uint64) {
 // (iterating BPF maps from Go) when the event stream isn't available.
 func (d *Daemon) bulkSyncViaEventStreamOrFallback(ss *cluster.SessionSync) error {
 	if exporter, ok := d.dp.(userspaceEventStreamExporter); ok {
+		slog.Info("cluster: using event stream export for bulk sync")
 		if err := exporter.ExportAllSessionsViaEventStream(); err != nil {
 			slog.Warn("cluster: event stream bulk export failed, falling back to BulkSync", "err", err)
 		} else {
@@ -254,6 +255,8 @@ func (d *Daemon) bulkSyncViaEventStreamOrFallback(ss *cluster.SessionSync) error
 			return nil
 		}
 	}
+	slog.Info("cluster: event stream export not available, falling back to BulkSync",
+		"dp_type", fmt.Sprintf("%T", d.dp))
 	if ss == nil {
 		return fmt.Errorf("session sync not initialized")
 	}
@@ -1470,6 +1473,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			d.sessionSync.OnBulkSyncAckReceived = func() {
 				d.cluster.RecordEvent(cluster.EventColdSync, -1, "Bulk sync acknowledged by peer")
 				d.onSessionSyncBulkAckReceived()
+			}
+
+			// Wire bulk sync override: use event stream export (fast path)
+			// instead of BPF map iteration for initial bulk sync on connect.
+			d.sessionSync.BulkSyncOverride = func() error {
+				return d.bulkSyncViaEventStreamOrFallback(d.sessionSync)
 			}
 
 			d.sessionSync.OnPeerDisconnected = func() {
