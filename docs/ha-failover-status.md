@@ -1,6 +1,6 @@
 # HA Failover Status
 
-Date: 2026-04-02
+Date: 2026-04-03 (updated)
 
 This is the single authoritative document for userspace dataplane HA failover.
 It replaces the fragmented state across a dozen prior docs. Read this first;
@@ -31,7 +31,7 @@ yet. Here is what is true today:
   two-phase prepare + demote
 - Activation is a single `update_ha_state(active=true)` call (#358) — no
   explicit refresh RPC
-- Manual failover uses request/ack/commit protocol (PRs #396-#397) — not
+- Manual failover uses request/ack/commit protocol (PRs #395-#397) — not
   weight-zero heuristics
 - Takeover readiness gates on proven userspace dataplane health (#391)
 - Blackhole routes skipped in userspace mode (#354)
@@ -39,6 +39,13 @@ yet. Here is what is true today:
 - Reverse companions pre-installed via sync path (#310)
 - BPF conntrack entries written for zone/interface display (fab9230c)
 - Userspace counters aggregated into BPF global counters (#332)
+- Shared sessions indexed by owner RG for O(1) demotion/activation (PRs
+  #404-#406) — no full-table scans during failover
+- Priority barrier channel for acks (PR #407) — barrier/bulk acks bypass
+  session data in send queue
+- Planned failover decoupled from bulk sync (PR #407) — barrier ack
+  proves peer is current, no bulk-sync gate
+- Transfer readiness surfaced separately from takeover readiness (PR #402)
 
 ## What Works
 
@@ -56,74 +63,57 @@ The key fixes that made this work:
 | 71b80b3d | refresh_for_ha_activation bypasses synced guard — SNAT works |
 | a21018f3 | Epoch flow cache, resolve on receipt, owner_rg_id at sender |
 | dcc59c67 | Unified synced flag → origin-based collision detection |
+| PRs #395-397 | Explicit RG transfer protocol (request/ack/commit) |
+| PRs #404-406 | Owner RG indexes — O(1) demotion/activation |
+| PR #407 | Priority barrier channel + decouple failover from bulk sync |
 
-## What Does Not Work Yet
+## What Was Fixed Recently
 
-### P0: Barrier delivery during bulk sync
+### P0: Barrier delivery during bulk sync — FIXED (PR #407)
 
-The barrier message that fences demotion gets stuck behind bulk session data
-in the TCP stream. When the peer is receiving hundreds of sessions via bulk
-sync, the barrier waits 60-80 seconds to be delivered. The demotion prep
-times out.
+Barrier acks and bulk acks now route through a dedicated priority channel
+(`barrierCh`). The `sendLoop` drains `barrierCh` before `sendCh`, so acks
+are never stuck behind bulk session data. Barrier requests still go through
+`sendCh` to preserve ordering (the barrier must be after all queued sessions
+so the ack proves the peer processed them).
 
-**Root cause:** `writeBarrierMessage` used to call `waitForSendQueueDrain`
-which blocks until `sendCh` empties. Even after removing the drain wait, the
-barrier is written via `writeMu` which the `sendLoop` holds continuously
-during bulk writes. The barrier ack from the peer also goes through `sendCh`
-on the receiver side, competing with outbound messages.
+### P2: Manual failover rejected during bulk sync — FIXED (PR #407)
 
-**Impact:** Manual failover fails with "demotion peer barrier failed:
-timed out" when bulk sync is in progress.
+Removed `syncPeerBulkPrimed` and `TransferReadiness` bulk-state checks from
+the planned failover path. The barrier ack alone proves the peer is current.
+Bulk sync is a startup concern, not a failover concern.
 
-**Fix needed:** Either (a) send barriers on a separate TCP connection,
-(b) give barriers priority in the write path via a priority channel, or
-(c) write barriers directly via the connection with a short deadline
-bypassing the sendLoop entirely.
+### P3: Split-RG readiness stuck — LIKELY FIXED
 
-### P1: Inherited translated tuples resolve as HA-inactive
+Root cause was barrier/bulk ack delivery stuck behind bulk data (P0). With
+priority ack channel, acks should deliver promptly. Needs live validation
+on split-RG cluster.
+
+## What Still Needs Work
+
+### Inherited translated tuples resolve as HA-inactive (was P1)
 
 After failover, some inherited forward-wire tuples (translated 5-tuples
-from SNAT) resolve as `HAInactive` on the new owner even though the RG is
-locally active. This causes the new owner to fabric-redirect traffic back
-to the old owner instead of forwarding it locally.
+from SNAT) may resolve as `HAInactive` on the new owner. PRs #404-406
+added owner RG indexes to shared session stores, which should improve
+the lookup path. Needs live validation to confirm the fix.
 
-**Root cause:** The shared session store has forward-wire entries keyed by
-the post-NAT 5-tuple. When the new owner activates, these entries' owner
-RG resolution may not match because the egress interface mapping differs.
+**Status:** Likely improved, needs testing.
 
-**Fix needed:** Ensure forward-wire alias entries are re-resolved alongside
-the primary forward session during standby materialization.
+### Live validation of all fixes
 
-### P2: Manual failover rejected during bulk sync
+The recent changes (priority barrier channel, owner RG indexes, planned
+failover decoupled from bulk sync) have not been validated together with
+a live `/failover-test` run. The individual pieces are tested but the
+end-to-end flow needs validation.
 
-The transfer-readiness check (`userspaceManualFailoverTransferReadinessError`)
-rejects failover when the requester is in active bulk receive or has a
-pending outbound bulk ack. This is correct for safety but means failover
-is unavailable during the 30-120 second bulk sync window after a
-reconnect/restart.
-
-**Fix needed:** Either make bulk sync faster (batch session installs to
-reduce control socket contention) or allow failover to proceed with a
-degraded guarantee (some sessions may not be on the peer yet).
-
-### P3: Split-RG session-sync readiness stuck
-
-In split-RG configurations (RG1 on node0, RG2 on node1), session-sync
-readiness can get stuck as "not ready" even after cluster ownership
-converges. The bulk sync retry loop exhausts without the peer acking.
-
-**Fix needed:** Investigate why bulk ack delivery fails in split-RG
-configurations. May be related to P0 (barrier delivery).
-
-### P4: Throughput parity on fabric redirect path
+### Throughput parity on fabric redirect path
 
 When traffic is fabric-redirected (old owner → new owner via fabric link),
-throughput is ~7 Gbps vs 15-17 Gbps for direct forwarding. This is because
-fabric redirect adds an extra hop through the virtio fabric interface.
-
-**Fix needed:** This is a hardware/topology limitation, not a software bug.
-Fabric redirect is a transient state during failover — traffic should
-quickly converge to direct forwarding on the new owner.
+throughput is ~7 Gbps vs 15-17 Gbps for direct forwarding. This is a
+hardware/topology limitation — fabric redirect adds an extra hop through
+the virtio fabric interface. Traffic should converge to direct forwarding
+on the new owner quickly.
 
 ## Architecture
 
@@ -157,11 +147,10 @@ Standby node:
 
 ### Failover Flow (Current)
 
-Steps 1-6 above, PLUS:
-- Barrier delivery may take 60-80s if bulk sync is in progress (P0)
-- Some translated tuples may resolve as HAInactive (P1)
-- NAPI bootstrap removed from activation (#391) but neighbor warmup
-  still runs async (harmless — just ARP/NDP for next-hops)
+Steps 1-6 above are now the actual flow. Remaining differences from target:
+- Some translated tuples may still resolve as HAInactive (needs validation)
+- Neighbor warmup still runs async after activation (harmless — ARP/NDP
+  for next-hops, not blocking the forwarding path)
 
 ## What Was Eliminated
 
@@ -182,6 +171,10 @@ removed or bypassed:
 | Blackhole routes (userspace mode) | 5ac423a3 | XDP shim + rg_active handles this |
 | Weight=0 manual failover | PR #395 | Replaced by explicit transfer state |
 | `synced: bool` field | dcc59c67 | Replaced by origin-based collision |
+| `syncPeerBulkPrimed` failover gate | PR #407 | Barrier ack proves peer is current |
+| `TransferReadiness` bulk-state check | PR #407 | Planned failover doesn't depend on bulk |
+| Full-table scans on demotion/activation | PRs #404-406 | Owner RG indexes for O(1) lookups |
+| `waitForSendQueueDrain` in barrier path | PR #407 | Priority channel for acks |
 
 ## Testing
 
@@ -218,14 +211,13 @@ cli -c "show chassis cluster data-plane statistics" | grep SNAT
 
 ## Remaining Work (Priority Order)
 
-1. **Fix barrier delivery during bulk sync** (P0) — unblocks reliable
-   manual failover in all cluster states
-2. **Fix inherited translated tuple HA-inactive** (P1) — ensures all
-   session types are forwarded correctly after failover
-3. **Allow failover during bulk sync** (P2) — removes the 30-120s
-   unavailability window after reconnect
-4. **Fix split-RG readiness** (P3) — enables active/active testing
-5. **Throughput parity** (P4) — hardware/topology, not a software fix
+1. **Live validation** — run `/failover-test` with all recent fixes deployed
+   to confirm end-to-end failover works with zero stream loss
+2. **Validate translated tuple fix** — confirm PRs #404-406 resolved the
+   HAInactive resolution for inherited forward-wire entries
+3. **Validate split-RG** — confirm priority ack channel fixed split-RG
+   readiness convergence
+4. **Throughput parity** — hardware/topology limitation, not a software fix
 
 ## Superseded Documents
 
