@@ -179,8 +179,10 @@ type SessionSync struct {
 	listener1  net.Listener // secondary fabric listener
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
-	sendCh     chan []byte // buffered channel for outgoing messages
-	barrierCh  chan []byte // priority channel for barrier/ack messages (bypasses bulk backlog)
+	sendCh      chan []byte // buffered channel for outgoing messages
+	barrierCh   chan []byte // priority channel for barrier/ack messages (bypasses bulk backlog)
+	sendPauseCh chan struct{} // closed to pause sendLoop, re-created on resume
+	sendPauseMu sync.Mutex
 	// incrementalPauseDepth temporarily pauses background incremental
 	// producers (periodic sweeps) during HA demotion handoff so ordered
 	// demotion barriers are not queued behind unrelated backlog.
@@ -1338,6 +1340,73 @@ func (s *SessionSync) fabricConnectLoop(ctx context.Context, fabricIdx int, peer
 	}
 }
 
+// PauseSendLoop stops the sendLoop from pulling new messages off sendCh.
+// The current in-flight write (if any) finishes, then the loop blocks
+// until ResumeSendLoop is called. This lets the barrier writer acquire
+// writeMu without competing with bulk session data.
+func (s *SessionSync) PauseSendLoop() {
+	s.sendPauseMu.Lock()
+	defer s.sendPauseMu.Unlock()
+	if s.sendPauseCh == nil {
+		s.sendPauseCh = make(chan struct{})
+	}
+	select {
+	case <-s.sendPauseCh:
+		// Already paused — make a fresh channel.
+		s.sendPauseCh = make(chan struct{})
+	default:
+		// Not paused yet — close to signal pause.
+	}
+	close(s.sendPauseCh)
+}
+
+// ResumeSendLoop unblocks the sendLoop after PauseSendLoop.
+func (s *SessionSync) ResumeSendLoop() {
+	s.sendPauseMu.Lock()
+	defer s.sendPauseMu.Unlock()
+	// Replace with a new open channel so sendLoop stops blocking.
+	s.sendPauseCh = nil
+}
+
+func (s *SessionSync) sendPaused() bool {
+	s.sendPauseMu.Lock()
+	ch := s.sendPauseCh
+	s.sendPauseMu.Unlock()
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *SessionSync) waitForSendResume(ctx context.Context) {
+	s.sendPauseMu.Lock()
+	ch := s.sendPauseCh
+	s.sendPauseMu.Unlock()
+	if ch == nil {
+		return
+	}
+	// Wait until ch is replaced (resume) or ctx is cancelled.
+	// PauseSendLoop closes ch; ResumeSendLoop sets it to nil.
+	// We need to wait until sendPauseCh != ch (meaning resume happened).
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !s.sendPaused() {
+				return
+			}
+		}
+	}
+}
+
 func (s *SessionSync) sendLoop(ctx context.Context) {
 	// sendOne writes a single message to the active connection, retrying
 	// on transient errors until success or context cancellation.
@@ -1368,6 +1437,10 @@ func (s *SessionSync) sendLoop(ctx context.Context) {
 	}
 
 	for {
+		// If paused, wait for resume before pulling more messages.
+		if s.sendPaused() {
+			s.waitForSendResume(ctx)
+		}
 		// Priority: drain all pending barriers before any bulk/session data.
 		select {
 		case msg := <-s.barrierCh:
