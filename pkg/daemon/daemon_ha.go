@@ -1116,9 +1116,10 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		success = true
 		return nil
 	}
-	if err := userspaceManualFailoverTransferReadinessError(d.sessionSync.TransferReadiness()); err != nil {
-		return err
-	}
+	// Transfer readiness (bulk sync state) is NOT checked here.
+	// The barrier at the end of this function proves the peer has all
+	// sessions. Planned failover should not depend on bulk sync state —
+	// both nodes have full session state from continuous real-time sync.
 
 	// Drain any in-flight barrier from a previous demotion attempt.
 	pendingBarrierTimeout := barrierTimeout / 2

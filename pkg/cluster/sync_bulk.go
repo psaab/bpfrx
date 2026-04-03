@@ -180,14 +180,16 @@ func (s *SessionSync) sendBarrierAck(conn net.Conn, seq uint64) {
 	binary.LittleEndian.PutUint64(payload[8:16], stats.SessionsReceived)
 	binary.LittleEndian.PutUint64(payload[16:24], stats.SessionsInstalled)
 	msg := encodeRawMessage(syncMsgBarrierAck, payload[:])
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
 	select {
 	case s.barrierCh <- msg:
 		slog.Info("cluster sync: barrier ack queued (priority)",
 			"seq", seq,
 			"sessions_received", stats.SessionsReceived,
 			"sessions_installed", stats.SessionsInstalled)
-	default:
-		slog.Warn("cluster sync: barrier ack dropped (priority queue full)", "seq", seq)
+	case <-timer.C:
+		slog.Warn("cluster sync: barrier ack send timed out", "seq", seq)
 	}
 }
 
@@ -211,14 +213,16 @@ func (s *SessionSync) sendBulkAck(conn net.Conn, epoch uint64) {
 	var payload [8]byte
 	binary.LittleEndian.PutUint64(payload[:], epoch)
 	msg := encodeRawMessage(syncMsgBulkAck, payload[:])
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
 	select {
 	case s.barrierCh <- msg:
 		slog.Info("cluster sync: bulk ack queued (priority)",
 			"epoch", epoch,
 			"local", connLocalAddrString(conn),
 			"remote", connRemoteAddrString(conn))
-	default:
-		slog.Warn("cluster sync: bulk ack dropped (priority queue full)",
+	case <-timer.C:
+		slog.Warn("cluster sync: bulk ack send timed out",
 			"epoch", epoch)
 	}
 }
@@ -228,16 +232,18 @@ func (s *SessionSync) writeBarrierMessage(payload []byte, timeout time.Duration)
 	if conn == nil {
 		return fmt.Errorf("session sync not connected")
 	}
-	// Encode and queue via the priority barrierCh so sendLoop writes it
-	// ahead of any bulk/session data — no need to wait for sendCh drain
-	// or compete with BulkSync for writeMu.
+	// Barrier requests go through sendCh (NOT barrierCh) to preserve
+	// ordering with session messages. The barrier must be written AFTER
+	// all previously queued session data so the peer's ack proves it
+	// processed those sessions. Only barrier/bulk ACKS use barrierCh
+	// since they're responses that don't need ordering.
 	msg := encodeRawMessage(syncMsgBarrier, payload)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case s.barrierCh <- msg:
+	case s.sendCh <- msg:
 	case <-timer.C:
-		return fmt.Errorf("timed out queueing session sync barrier on priority channel")
+		return fmt.Errorf("timed out queueing session sync barrier")
 	}
 	seq := binary.LittleEndian.Uint64(payload)
 	slog.Info("cluster sync: barrier queued (priority)",

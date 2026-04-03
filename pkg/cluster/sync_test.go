@@ -1832,7 +1832,9 @@ func TestWaitForPeerBarrierCompletesOnAck(t *testing.T) {
 	localConn, peerConn := net.Pipe()
 	defer localConn.Close()
 	defer peerConn.Close()
+	ss.mu.Lock()
 	ss.conn0 = localConn
+	ss.mu.Unlock()
 	ss.stats.Connected.Store(true)
 
 	// Start sendLoop so barrier messages queued to barrierCh are written
