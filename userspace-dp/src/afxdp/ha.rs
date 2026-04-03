@@ -378,13 +378,20 @@ impl super::Coordinator {
             if entry.origin.is_peer_synced() {
                 continue;
             }
-            // Only export for active RGs.
-            if let Some(runtime) = ha_state.get(&entry.metadata.owner_rg_id) {
-                if !runtime.active {
-                    continue;
-                }
+            // Skip fabric-ingress sessions (same exclusion as export_forward_sessions_for_owner_rgs).
+            if entry.metadata.fabric_ingress {
+                continue;
             }
-            // Only exportable dispositions (same filter as export_forward_sessions_for_owner_rgs).
+            // Only export for active RGs. Missing HA state entry = inactive.
+            let rg_active = entry.metadata.owner_rg_id > 0
+                && ha_state
+                    .get(&entry.metadata.owner_rg_id)
+                    .map(|r| r.active)
+                    .unwrap_or(false);
+            if !rg_active && entry.metadata.owner_rg_id > 0 {
+                continue;
+            }
+            // Only exportable dispositions.
             if !matches!(
                 entry.decision.resolution.disposition,
                 ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect

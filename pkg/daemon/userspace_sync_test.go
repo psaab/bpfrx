@@ -703,16 +703,12 @@ func TestUserspaceManagerImplementsEventStreamExporter(t *testing.T) {
 }
 
 // TestBulkSyncFallbackWhenDPIsNil verifies that bulkSyncViaEventStreamOrFallback
-// falls through to BulkSync when the dataplane is nil (no event stream support).
+// returns an error when the dataplane is nil (no event stream support) and
+// session sync is also nil.
 func TestBulkSyncFallbackWhenDPIsNil(t *testing.T) {
 	d := &Daemon{}
-	// dp is nil — type assertion to userspaceEventStreamExporter will fail,
-	// so it falls through to BulkSync. BulkSync on nil SessionSync panics,
-	// so we just verify the path selection logic doesn't crash before that.
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("expected panic from nil SessionSync BulkSync call")
-		}
-	}()
-	_ = d.bulkSyncViaEventStreamOrFallback(nil)
+	err := d.bulkSyncViaEventStreamOrFallback(nil)
+	if err == nil {
+		t.Fatal("expected error from nil session sync fallback")
+	}
 }

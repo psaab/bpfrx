@@ -254,6 +254,9 @@ func (d *Daemon) bulkSyncViaEventStreamOrFallback(ss *cluster.SessionSync) error
 			return nil
 		}
 	}
+	if ss == nil {
+		return fmt.Errorf("session sync not initialized")
+	}
 	return ss.BulkSync()
 }
 
