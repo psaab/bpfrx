@@ -111,21 +111,32 @@ If these fail before the failover event, stop and isolate steady-state first.
 
 ### Local firewall connectivity
 
-From the primary firewall itself, verify that locally-originated traffic works.
-This validates that the XDP shim correctly passes ICMP echo replies for
-interface-NAT addresses back to the kernel (see `is_icmp_to_interface_nat_local`
-in `userspace-xdp/src/lib.rs`).
+From the primary firewall itself, verify that locally-originated traffic works
+across all protocols. This validates two things:
+
+1. The XDP shim passes ICMP echo replies for interface-NAT addresses to the
+   kernel (`is_icmp_to_interface_nat_local` in `userspace-xdp/src/lib.rs`).
+2. The slow-path TUN (`bpfrx-usp0`) has `rp_filter=0` so the kernel accepts
+   TCP/UDP replies whose reverse route points at the real egress interface, not
+   the TUN. `networkctl reload` resets this sysctl; the Go daemon must re-apply
+   it after every reload (`restoreSlowPathRPFilter` in `pkg/networkd/networkd.go`).
 
 ```bash
 # On the primary node (whichever owns reth0).
 # Use any known-reachable external IP; these are examples for labs with
 # Internet egress. In isolated environments, substitute a routable target.
+
+# ICMP — passes through XDP shim fast-path
 ping -c 3 1.1.1.1
 ping6 -c 3 2001:4860:4860::8888
+
+# TCP — passes through userspace helper → slow-path TUN → kernel
+timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/80; echo -e "GET / HTTP/1.0\r\nHost: 1.1.1.1\r\n\r\n" >&3; head -1 <&3; exec 3>&-'
 ```
 
-If these fail, the XDP shim may not be recognizing echo replies destined for
-interface-NAT addresses as local-delivery packets.
+If ICMP fails, the XDP shim is not recognizing echo replies for interface-NAT
+addresses. If TCP fails but ICMP works, check `rp_filter` on `bpfrx-usp0`
+(`sysctl net.ipv4.conf.bpfrx-usp0.rp_filter` — must be 0).
 
 ### Lab hygiene
 

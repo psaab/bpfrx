@@ -174,9 +174,24 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 			args := append([]string{"reconfigure"}, reconf...)
 			_ = exec.Command("networkctl", args...).Run()
 		}
+		restoreSlowPathRPFilter()
 	}
 
 	return nil
+}
+
+// restoreSlowPathRPFilter re-disables rp_filter on the userspace dataplane's
+// slow-path TUN device after a networkctl reload. networkd resets sysctls to
+// defaults (rp_filter=2) on all interfaces during reload, which breaks
+// locally-originated traffic delivery via the TUN (the kernel drops packets
+// whose source route doesn't point at the TUN interface).
+func restoreSlowPathRPFilter() {
+	const tunName = "bpfrx-usp0"
+	path := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/rp_filter", tunName)
+	if err := os.WriteFile(path, []byte("0"), 0644); err != nil {
+		// TUN may not exist (userspace DP not active) — not an error.
+		return
+	}
 }
 
 // Clear removes all bpfrx-managed networkd files and reloads.
