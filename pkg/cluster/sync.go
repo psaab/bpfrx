@@ -1286,6 +1286,11 @@ func (s *SessionSync) acceptLoop(ctx context.Context, ln net.Listener, fabricIdx
 				continue
 			}
 		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+			_ = tc.SetWriteBuffer(256 * 1024)
+			_ = tc.SetReadBuffer(256 * 1024)
+		}
 		slog.Info("cluster sync: peer connected", "remote", conn.RemoteAddr(), "fabric", fabricIdx)
 		s.handleNewConnection(ctx, fabricIdx, conn)
 	}
@@ -1328,6 +1333,14 @@ func (s *SessionSync) fabricConnectLoop(ctx context.Context, fabricIdx int, peer
 		conn, err := dialer.DialContext(ctx, "tcp", peerAddr)
 		if err != nil {
 			continue
+		}
+		// TCP_NODELAY: disable Nagle's algorithm so small control messages
+		// (barriers, heartbeats) are sent immediately without waiting up
+		// to 200ms for coalescing. Critical for barrier latency.
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+			_ = tc.SetWriteBuffer(256 * 1024)
+			_ = tc.SetReadBuffer(256 * 1024)
 		}
 
 		slog.Info("cluster sync: connected to peer", "addr", peerAddr, "fabric", fabricIdx)
