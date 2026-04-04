@@ -376,10 +376,11 @@ func (m *Manager) bumpGeneration() uint64 {
 	return m.generation
 }
 
-// BumpFIBGeneration updates the BPF FIB generation counter AND rebuilds the
-// userspace snapshot with fresh routes/neighbors from the kernel.  The eBPF
-// pipeline reads FIB generation from the BPF map directly, but the userspace
-// worker receives route/neighbor data via snapshots — so we must republish.
+// BumpFIBGeneration updates the BPF FIB generation counter and sends a
+// lightweight FIB generation bump to the userspace helper. If kernel neighbors
+// changed since the last publish, an incremental neighbor update is sent first.
+// This avoids the full buildSnapshot() + apply_snapshot round-trip that was the
+// primary source of control socket contention during route convergence.
 func (m *Manager) BumpFIBGeneration() uint32 {
 	newGen := m.inner.BumpFIBGeneration()
 
@@ -393,15 +394,37 @@ func (m *Manager) BumpFIBGeneration() uint32 {
 		return newGen
 	}
 
-	// Rebuild snapshot with the EXACT value BumpFIBGeneration wrote.
-	// Never re-read from BPF map — that introduces a race where the
-	// read returns a stale value.
+	// Update the cached snapshot's FIB generation without rebuilding.
+	m.lastSnapshot.FIBGeneration = newGen
 	m.generation++
-	snap := buildSnapshot(m.lastSnapshot.Config, m.cfg, m.generation, newGen)
-	m.lastSnapshot = snap
+	m.lastSnapshot.Generation = m.generation
 
-	if err := m.syncSnapshotLocked(); err != nil {
-		slog.Warn("userspace: failed to publish FIB refresh snapshot", "err", err)
+	// Check if kernel neighbors changed — if so, push an incremental update.
+	newNeighbors := buildNeighborSnapshots(m.lastSnapshot.Config)
+	if !neighborsEqual(m.lastSnapshot.Neighbors, newNeighbors) {
+		var status ProcessStatus
+		if err := m.requestLocked(ControlRequest{
+			Type:            "update_neighbors",
+			Neighbors:       newNeighbors,
+			NeighborReplace: true,
+		}, &status); err != nil {
+			slog.Warn("userspace: failed to publish neighbor update", "err", err)
+		} else {
+			// Only update cached neighbors after successful publish so
+			// a transient failure doesn't suppress future retries.
+			m.lastSnapshot.Neighbors = newNeighbors
+		}
+	}
+
+	// Send lightweight FIB generation bump — no full snapshot rebuild.
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{
+		Type: "bump_fib_generation",
+		Snapshot: &ConfigSnapshot{
+			FIBGeneration: newGen,
+		},
+	}, &status); err != nil {
+		slog.Warn("userspace: failed to bump FIB generation", "err", err)
 	}
 	return newGen
 }
@@ -796,6 +819,19 @@ func snapshotContentHash(snap *ConfigSnapshot) ([32]byte, bool) {
 		return [32]byte{}, false
 	}
 	return sha256.Sum256(data), true
+}
+
+// neighborsEqual returns true if two neighbor snapshot slices have identical content.
+func neighborsEqual(a, b []NeighborSnapshot) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
