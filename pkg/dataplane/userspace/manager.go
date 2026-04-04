@@ -402,7 +402,6 @@ func (m *Manager) BumpFIBGeneration() uint32 {
 	// Check if kernel neighbors changed — if so, push an incremental update.
 	newNeighbors := buildNeighborSnapshots(m.lastSnapshot.Config)
 	if !neighborsEqual(m.lastSnapshot.Neighbors, newNeighbors) {
-		m.lastSnapshot.Neighbors = newNeighbors
 		var status ProcessStatus
 		if err := m.requestLocked(ControlRequest{
 			Type:            "update_neighbors",
@@ -410,6 +409,10 @@ func (m *Manager) BumpFIBGeneration() uint32 {
 			NeighborReplace: true,
 		}, &status); err != nil {
 			slog.Warn("userspace: failed to publish neighbor update", "err", err)
+		} else {
+			// Only update cached neighbors after successful publish so
+			// a transient failure doesn't suppress future retries.
+			m.lastSnapshot.Neighbors = newNeighbors
 		}
 	}
 

@@ -453,6 +453,9 @@ fn handle_stream(
                     }
                     guard.afxdp.bump_fib_generation(snapshot.fib_generation);
                     refresh_status(&mut guard);
+                } else {
+                    response.ok = false;
+                    response.error = "missing snapshot".to_string();
                 }
             }
             "set_queue_state" => {
