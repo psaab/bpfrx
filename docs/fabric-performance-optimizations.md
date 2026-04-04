@@ -1,114 +1,53 @@
 # Fabric Forwarding Performance Optimizations
 
-## Current State (2026-04-04)
+## Current State (2026-04-03)
 
 | Path | -P1 | -P8 |
 |------|-----|-----|
 | Direct (all RGs same node) | 7.8 Gbps | 23.0 Gbps |
 | Fabric (split-RG) | 2.0 Gbps | 3.5 Gbps |
 
-## Architecture: How Fabric Redirect Actually Works
+## Architecture: How Fabric Redirect Works Today
 
-The userspace dataplane and eBPF pipeline cooperate for fabric redirect:
+In strict userspace mode, steady-state fabric transit stays on the AF_XDP
+dataplane. It does not rely on `PASS_TO_KERNEL` to bounce transit packets back
+into the eBPF forwarding pipeline.
 
-1. **Session demotion**: When an RG is demoted on a node, the Rust helper writes
-   `PASS_TO_KERNEL` entries in the `USERSPACE_SESSIONS` BPF map for those sessions.
+1. The XDP shim classifies packets and redirects transit session hits and
+   misses to AF_XDP/userspace.
+2. `PASS_TO_KERNEL` is reserved for local-delivery or explicit fallback cases:
+   peer-synced local-delivery sessions, ESP, non-native GRE, NDP, and similar
+   control-plane traffic.
+3. The userspace helper resolves policy, NAT, routing, and HA ownership. If the
+   result is `FabricRedirect`, the helper builds the fabric frame itself and
+   transmits it through AF_XDP TX.
+4. `publish_live_session_entry()` keeps subsequent transit packets on the
+   userspace dataplane, so the hot path is flow cache plus `RewriteDescriptor`,
+   not `PASS_TO_KERNEL`.
+5. `apply_nat_on_fabric` decides whether the userspace helper should NAT the
+   packet before fabric TX or preserve the original tuple for later handling on
+   the owner side.
 
-2. **XDP shim fallback**: On the next packet for that session, the XDP shim
-   (`xdp_userspace_prog`) finds the `PASS_TO_KERNEL` entry and calls
-   `fallback_to_main()` — a BPF tail call into the eBPF pipeline's `xdp_main_prog`.
+### Key implications
 
-3. **eBPF pipeline processing**: The full eBPF pipeline runs:
-   `xdp_main → xdp_zone → xdp_conntrack → xdp_nat → xdp_forward`
+- Fabric NAT performance is still a userspace dataplane problem.
+- The generic builders and segmentation path still pay real checksum work when
+  the descriptor fast path cannot be used.
+- Plans that assume "write `PASS_TO_KERNEL` earlier" are solving the wrong path
+  for strict userspace fabric transit.
 
-4. **Fabric redirect in xdp_zone**: `try_fabric_redirect()` rewrites Ethernet
-   MACs and calls `bpf_redirect_map(&tx_ports, fabric_ifindex, 0)` — zero-copy
-   XDP redirect to the fabric parent interface.
+## Where the NAT Cost Still Lives
 
-5. **NAT in xdp_nat**: The eBPF pipeline applies NAT using **incremental checksum
-   updates** (`csum_update` BPF helpers), NOT full L4 recompute. This is O(1).
-
-### Key insight
-
-The fabric path is already zero-copy XDP redirect with incremental NAT checksums.
-The userspace DP's `recompute_l4_checksum_ipv4` (3.6% in the profile) only applies
-to the DIRECT forwarding path (all RGs same node), NOT the fabric path. Fabric
-packets never enter userspace — they go through the eBPF pipeline via tail call.
-
-## Fabric NAT Flow (via eBPF Pipeline)
-
-### Outbound: Client → Server (split-RG: fw0=LAN, fw1=WAN)
-
-```
-Client 10.0.61.102:43446 → 172.16.80.200:5201
-
-1. Arrives on ge-0-0-1 (fw0, LAN)
-2. XDP shim → PASS_TO_KERNEL (RG1 demoted)
-3. Tail call → eBPF xdp_main
-4. xdp_zone: try_fabric_redirect → rewrite MACs → bpf_redirect_map(ge-0-0-0)
-   NOTE: NAT is NOT applied here — the packet crosses fabric with original IPs.
-   xdp_zone sends to fabric BEFORE xdp_nat runs (fabric redirect short-circuits).
-5. Arrives at fw1 ge-7-0-0 (fabric parent)
-6. XDP shim → PASS_TO_KERNEL or XSK redirect
-7. fw1 processes → conntrack finds synced session → xdp_nat applies SNAT
-8. Forwards out ge-7-0-2 (WAN) with src=172.16.80.8:43446
-```
-
-### Return: Server → Client
-
-```
-Server 172.16.80.200:5201 → 172.16.80.8:43446
-
-1. Arrives on ge-7-0-2 (fw1, WAN)
-2. fw1 conntrack → reverse session → xdp_nat applies un-SNAT (dst→10.0.61.102)
-3. xdp_zone: egress is reth1 (RG2 on fw0) → try_fabric_redirect
-4. bpf_redirect_map(ge-7-0-0) → zero-copy to fw0
-5. Arrives at fw0 ge-0-0-0 (fabric parent)
-6. fw0 eBPF pipeline → conntrack → forwards to ge-0-0-1 (LAN)
-7. Client receives dst=10.0.61.102:43446
-```
-
-### NAT is applied by the eBPF pipeline, NOT the userspace DP
-
-- **Outbound**: NAT happens on fw1 (the WAN owner) after receiving from fabric
-- **Return**: NAT happens on fw1 before fabric redirect to fw0
-- Incremental checksum updates — O(1) per packet
-- No `recompute_l4_checksum_ipv4` involved for fabric traffic
-
-## Why apply_nat_on_fabric Exists (and When It Matters)
-
-The `apply_nat_on_fabric` flag in the userspace DP only matters for packets that
-go through the XSK path (NOT `PASS_TO_KERNEL`). This happens when:
-
-- A NEW session is created that resolves to `FabricRedirect` (before the
-  `PASS_TO_KERNEL` BPF map entry is written)
-- The XDP shim redirects to XSK (no BPF map entry yet)
-- The Rust helper processes the packet and routes it via fabric XSK TX
-
-In this transient case, the userspace DP applies NAT before fabric TX and
-uses full L4 checksum recompute. But this only affects the first few packets
-of a new session — once the `PASS_TO_KERNEL` entry is written, subsequent
-packets go through the eBPF pipeline.
-
-## Actual Bottleneck: Virtio Bridge Throughput
-
-The fabric path runs at 3.5 Gbps with CPUs mostly idle (~2% peak in profiles).
-This is NOT a CPU bottleneck — it's the virtio-net bridge throughput between VMs.
-
-### Contributing factors
-
-1. **Generic XDP on virtio**: The fabric parent uses generic XDP (no driver-mode
-   support). `bpf_redirect_map` on generic XDP still creates an sk_buff and copies
-   data — it's NOT true zero-copy like native/driver XDP redirect.
-
-2. **Virtio TX ring size**: Limited to 256 entries (TX max on QEMU). At high pps,
-   the ring fills and the VM must wait for completions before sending more.
-
-3. **Bridge forwarding overhead**: The local bridge between VMs adds per-packet
-   overhead for MAC learning, flooding, and sk_buff management.
-
-4. **VM configuration**: vhost-net, NUMA pinning, multiqueue alignment, and CPU
-   model settings affect VM-to-VM throughput.
+- `build_forwarded_frame_into_from_frame()` still falls back to
+  `recompute_l4_checksum_ipv4` for IPv4 NAT plus port-enforcement cases on the
+  generic path.
+- `segment_forwarded_tcp_frames_from_frame()` has to rebuild TCP checksums per
+  segment.
+- Cache hits still do a per-packet HA validation after `FlowCache::lookup()`
+  has already checked config generation, FIB generation, RG epoch, and RG lease
+  expiry.
+- Cache hits still recompute the fabric target binding lookup even though the
+  descriptor structure already has space to cache it.
 
 ## Optimization Plan
 
@@ -116,64 +55,55 @@ This is NOT a CPU bottleneck — it's the virtio-net bridge throughput between V
 
 These are configuration changes, no code required:
 
-1. **Verify vhost-net is active** on the host for both VMs
-2. **Pin both VMs to same NUMA node** (`numactl` or libvirt/incus XML)
-3. **Set CPU model to `host`** to expose AVX/AES-NI instructions
-4. **Increase virtio TX ring** if QEMU supports it (currently 256 max)
-5. **Test with MTU 9000** on the bridge itself (not just the VM interfaces)
-6. **Disable GSO/LRO inside guest** on the fabric parent (can cause overhead
-   in pure-virtual paths)
+1. Verify `vhost-net` is active on the host for both VMs.
+2. Pin both VMs to the same NUMA node.
+3. Set CPU model to `host` to expose AVX/AES-NI instructions.
+4. Increase the virtio TX ring if QEMU supports it.
+5. Test MTU 9000 on the bridge itself, not just on the VM interfaces.
+6. Disable GSO/LRO inside the guest on the fabric parent if they are adding
+   overhead in the pure-virtual path.
 
-Expected improvement: 2-3x if the current limit is configuration, not hardware.
+Expected improvement: 2-3x if the current ceiling is configuration, not
+hardware.
 
-### Phase 2: Reduce Transient XSK Path Overhead [MEDIUM effort]
+### Phase 2: Tighten the Userspace Fabric/NAT Fast Path [MEDIUM effort]
 
-For the first few packets of new fabric-redirect sessions that go through XSK
-before the `PASS_TO_KERNEL` entry is written:
+1. Honor cached `apply_nat_on_fabric` decisions on `FabricRedirect` hits.
+   Cached self-target and cross-binding hits must reuse the stored decision
+   instead of forcing NAT back on.
+2. Replace the generic IPv4 full recompute path with a combined incremental
+   NAT plus expected-port checksum update in
+   `build_forwarded_frame_into_from_frame()`.
+3. Populate `RewriteDescriptor.target_binding_index` for cacheable fabric flows
+   so hot hits can skip `fabric_target_index()` while config and FIB generation
+   still match.
+4. Measure how often `apply_rewrite_descriptor()` falls back to the generic
+   builder because of port repair or cross-binding conditions, then widen
+   descriptor coverage only where that fallback rate justifies the added code.
 
-1. **Write `PASS_TO_KERNEL` entry immediately** when a session resolves to
-   `FabricRedirect` — don't wait for the next control socket sync. This
-   minimizes the window where packets go through the slow XSK path.
+### Phase 3: Reduce Duplicate HA Validation on Cache Hits [MEDIUM effort]
 
-2. **Incremental L4 checksum in `build_forwarded_frame_into_from_frame`** —
-   replace `recompute_l4_checksum_ipv4` with incremental adjustment for
-   the transient XSK packets. Implementation challenge: `enforce_expected_ports`
-   also modifies checksums, so all adjustments must be done in a single pass:
-   - Capture pre-NAT IPs and ports
-   - Apply NAT (`apply_nat_ipv4`)
-   - Apply port enforcement (`enforce_expected_ports`)
-   - Compute combined incremental delta for IPs + ports
-   - Write final checksum once
+1. `FlowCache::lookup()` already rejects stale entries using config generation,
+   FIB generation, RG epoch, and RG lease-until. The remaining
+   `cached_flow_decision_valid()` call is a second HA walk on every hit.
+2. Prove which resolution fields can still change outside the lookup stamp. If
+   none of them matter on a cache hit, make the lookup stamp authoritative and
+   remove the extra HA check.
+3. If full removal is not safe, flatten the hot
+   `enforce_ha_resolution_snapshot()` path and carry owner-RG lookup data
+   alongside the descriptor.
 
-### Phase 3: Reduce `cached_flow_decision_valid` Overhead [MEDIUM effort]
+### Phase 4: Re-profile After Fast-Path Cleanup [LOW effort]
 
-The per-packet HA check on flow cache hits costs 1.3% CPU on the direct path.
-Can't remove it (breaks fabric redirect), but can optimize:
-
-1. **Epoch-based short-circuit**: Track a `last_ha_transition_epoch` counter that
-   increments on every RG demotion/activation. Workers cache this locally. If the
-   cached epoch matches the global one, skip the full BTreeMap HA check — the state
-   hasn't changed since the cache entry was created.
-
-2. **Inline the hot path**: The common case is `owner_rg_id > 0`, RG found in
-   ha_state, `is_forwarding_active` returns true. Profile the branch prediction
-   and ensure the happy path has no function call overhead.
-
-### Phase 4: Reduce eBPF Pipeline NAT Overhead [LOW effort]
-
-The eBPF pipeline's NAT already uses incremental checksums, but can be profiled
-for micro-optimizations:
-
-1. **Profile `xdp_nat.c`** during fabric -P8 to find hot spots
-2. **Reduce map lookups**: Cache `fabric_fwd_info` in per-CPU scratch to avoid
-   repeated `bpf_map_lookup_elem` calls (already partially implemented via
-   `fabric_ingress_match` caching)
-3. **Skip conntrack for fabric-ingress**: Packets arriving from fabric were
-   already conntrack'd by the sender — the receiver could skip re-lookup
+1. Re-run split-RG perf after the Phase 2 and 3 userspace fixes.
+2. Determine whether the remaining ceiling is virtio bridge throughput, TX
+   completion pressure, binding lookup, or segmentation.
+3. Only then decide whether more eBPF-side or VM-side work is worth it.
 
 ## Profile Data (Split-RG -P8)
 
 ### System-wide (mostly idle)
+
 ```
 2.0%  pv_native_safe_halt       — CPU idle
 1.7%  __irqentry_text_start     — interrupt handling
@@ -181,20 +111,22 @@ for micro-optimizations:
 1.2%  __raw_callee_save_spin    — kernel spinlock
 1.2%  worker_loop               — Rust worker (mostly idle)
 1.2%  mlx5e_napi_poll           — NIC polling
-1.1%  mlx5e_poll_xdpsq_cq      — XDP TX completion
+1.1%  mlx5e_poll_xdpsq_cq       — XDP TX completion
 ```
 
-The CPU is ~95% idle during fabric forwarding at 3.5 Gbps. The bottleneck is
-the virtio bridge path (TX ring, generic XDP overhead), not CPU processing.
+The split-RG ceiling still looks dominated by virtualization and queueing, not
+raw CPU exhaustion. That said, the userspace path still has real NAT and
+cache-hit overhead worth removing before treating the VM ceiling as final.
 
 ### Direct Path -P8 (23 Gbps, for comparison)
+
 ```
 15.9%  poll_binding              — packet processing
-10.3%  enqueue_pending_forwards   — frame build + segmentation
- 2.0%  parse_session_flow         — packet parsing
- 1.5%  drain_pending_tx           — TX completions
+10.3%  enqueue_pending_forwards  — frame build + segmentation
+ 2.0%  parse_session_flow        — packet parsing
+ 1.5%  drain_pending_tx          — TX completions
  1.3%  cached_flow_decision_valid — HA check (per-packet)
- 1.2%  target_index               — binding lookup
+ 1.2%  target_index              — binding lookup
 ```
 
 ## Completed Optimizations
@@ -202,6 +134,7 @@ the virtio bridge path (TX ring, generic XDP overhead), not CPU processing.
 - [x] Virtio RX ring 256→1024 (`raw.qemu rx_queue_size=1024`)
 - [x] FabricRedirect flow cache cacheable
 - [x] Cache BPF map FDs outside worker loop
-- [x] Barrier pause/drain for prompt failover
+- [x] Flow-cache stamp invalidation via config generation, FIB generation, RG
+  epoch, and RG lease
 - [x] Forward session push to workers on RG activation
 - [x] Fabric link preservation in shared_forwarding across snapshots
