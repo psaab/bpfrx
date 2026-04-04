@@ -1409,6 +1409,7 @@ pub(super) fn rewrite_forwarded_frame_in_place(
     desc: XdpDesc,
     meta: UserspaceDpMeta,
     decision: &SessionDecision,
+    apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<u32> {
     let dst_mac = decision.resolution.neighbor_mac?;
@@ -1445,7 +1446,7 @@ pub(super) fn rewrite_forwarded_frame_in_place(
             (
                 decision.resolution.src_mac?,
                 decision.resolution.tx_vlan_id,
-                false,
+                apply_nat_on_fabric,
             )
         } else {
             (
@@ -4009,6 +4010,7 @@ mod tests {
             },
             meta,
             &decision,
+            false,
             None,
         )
         .expect("in-place v6 forward");
@@ -4112,6 +4114,7 @@ mod tests {
             },
             meta,
             &decision,
+            false,
             None,
         )
         .expect("in-place v6 echo forward");
@@ -4282,6 +4285,7 @@ mod tests {
             },
             meta,
             &decision,
+            false,
             Some((54688, 5201)),
         )
         .expect("rewrite in place");
@@ -6273,6 +6277,7 @@ mod tests {
                     ..NatDecision::default()
                 },
             },
+            false,
             None,
         )
         .expect("rewrite in place");
@@ -6347,6 +6352,7 @@ mod tests {
                     ..NatDecision::default()
                 },
             },
+            false,
             None,
         )
         .expect("rewrite in place");
@@ -6354,6 +6360,74 @@ mod tests {
         let out = area.slice(0, frame_len as usize).expect("rewritten frame");
         assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x0800);
         assert_eq!(&out[30..34], &[10, 0, 61, 102]);
+        assert_eq!(out[22], 63);
+        assert!(tcp_checksum_ok_ipv4(&out[14..]));
+    }
+
+    #[test]
+    fn rewrite_forwarded_frame_in_place_applies_nat_for_fabric_redirect_when_enabled() {
+        let mut frame = Vec::new();
+        write_eth_header(&mut frame, [0xaa; 6], [0xbb; 6], 0, 0x0800);
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
+            102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
+            b'd', b'a', b't', b'a',
+        ]);
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+        assert!(tcp_checksum_ok_ipv4(&frame[14..]));
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .expect("slice")
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            ..UserspaceDpMeta::default()
+        };
+        let frame_len = rewrite_forwarded_frame_in_place(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::FabricRedirect,
+                    local_ifindex: 0,
+                    egress_ifindex: 21,
+                    tx_ifindex: 21,
+                    tunnel_endpoint_id: 0,
+                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
+                    neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                    src_mac: Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]),
+                    tx_vlan_id: 0,
+                },
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                    ..NatDecision::default()
+                },
+            },
+            true,
+            None,
+        )
+        .expect("rewrite in place");
+
+        let out = area.slice(0, frame_len as usize).expect("rewritten frame");
+        assert_eq!(&out[0..6], &[0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
+        assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
+        assert_eq!(&out[26..30], &[172, 16, 80, 8]);
+        assert_eq!(&out[30..34], &[172, 16, 80, 200]);
         assert_eq!(out[22], 63);
         assert!(tcp_checksum_ok_ipv4(&out[14..]));
     }

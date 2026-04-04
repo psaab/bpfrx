@@ -753,6 +753,10 @@ mod tests {
         assert_eq!(entry.descriptor.egress_ifindex, 6);
         assert_eq!(entry.descriptor.tx_ifindex, 6);
         assert_eq!(entry.descriptor.ether_type, 0x0800);
+        assert_eq!(
+            entry.descriptor.fabric_redirect,
+            decision.resolution.disposition == ForwardingDisposition::FabricRedirect
+        );
 
         // NAT rewrite fields propagated.
         assert_eq!(

@@ -2489,6 +2489,7 @@ fn poll_binding(
                                                 desc,
                                                 meta,
                                                 &cached_decision,
+                                                cached_descriptor.apply_nat_on_fabric,
                                                 expected_ports,
                                             )
                                         });
@@ -4323,6 +4324,7 @@ fn retry_pending_neigh(
                     pkt.desc,
                     pkt.meta,
                     &decision,
+                    false,
                     expected_ports,
                 ) {
                     let target_ifindex = if decision.resolution.tx_ifindex > 0 {
@@ -6436,6 +6438,7 @@ mod tests {
                 resolution,
                 nat: NatDecision::default(),
             },
+            false,
             None,
         )
         .expect("in-place forward");

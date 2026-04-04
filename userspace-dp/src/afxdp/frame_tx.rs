@@ -272,6 +272,7 @@ pub(super) fn enqueue_pending_forwards(
                         request.desc,
                         request.meta,
                         &request.decision,
+                        request.apply_nat_on_fabric,
                         expected_ports,
                     ) {
                         Some(frame_len) => {
