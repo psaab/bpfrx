@@ -40,6 +40,7 @@ pub(super) struct FlowCacheStamp {
     pub(super) fib_generation: u32,
     pub(super) owner_rg_id: i32,
     pub(super) owner_rg_epoch: u32,
+    pub(super) owner_rg_lease_until: u64,
 }
 
 impl FlowCacheStamp {
@@ -48,6 +49,7 @@ impl FlowCacheStamp {
         config_generation: u64,
         fib_generation: u32,
         owner_rg_id: i32,
+        ha_state: &BTreeMap<i32, HAGroupRuntime>,
         rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
     ) -> Self {
         Self {
@@ -59,6 +61,13 @@ impl FlowCacheStamp {
             } else {
                 0
             },
+            owner_rg_lease_until: ha_state
+                .get(&owner_rg_id)
+                .map(|group| match group.lease {
+                    HAForwardingLease::ActiveUntil(until) if group.active => until,
+                    _ => 0,
+                })
+                .unwrap_or(0),
         }
     }
 }
@@ -116,6 +125,7 @@ impl FlowCacheEntry {
         decision: SessionDecision,
         ingress_zone: Option<Arc<str>>,
         forwarding: &ForwardingState,
+        ha_state: &BTreeMap<i32, HAGroupRuntime>,
         apply_nat_on_fabric: bool,
         rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
     ) -> Option<Self> {
@@ -161,6 +171,7 @@ impl FlowCacheEntry {
                 validation.config_generation,
                 validation.fib_generation,
                 owner_rg_id,
+                ha_state,
                 rg_epochs,
             ),
         })
@@ -200,6 +211,7 @@ impl FlowCache {
         &mut self,
         key: &crate::session::SessionKey,
         lookup: FlowCacheLookup,
+        now_secs: u64,
         rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
     ) -> Option<&FlowCacheEntry> {
         let idx = Self::slot(key, lookup.ingress_ifindex);
@@ -221,6 +233,14 @@ impl FlowCache {
                         self.evictions += 1;
                         return None;
                     }
+                }
+                if entry.stamp.owner_rg_lease_until != 0
+                    && now_secs > entry.stamp.owner_rg_lease_until
+                {
+                    self.misses += 1;
+                    self.entries[idx] = None;
+                    self.evictions += 1;
+                    return None;
                 }
                 self.hits += 1;
                 return self.entries[idx].as_ref();
@@ -373,6 +393,7 @@ mod tests {
             fib_generation: 3,
             owner_rg_id: 1,
             owner_rg_epoch: 0,
+            owner_rg_lease_until: 0,
         };
         cache.insert(make_entry(key.clone(), stamp, 1));
 
@@ -381,7 +402,7 @@ mod tests {
             config_generation: 5,
             fib_generation: 3,
         };
-        let hit = cache.lookup(&key, lookup, &rg_epochs);
+        let hit = cache.lookup(&key, lookup, 0, &rg_epochs);
         assert!(hit.is_some(), "expected cache hit with matching stamp");
         assert_eq!(cache.hits, 1);
         assert_eq!(cache.misses, 0);
@@ -400,6 +421,7 @@ mod tests {
             fib_generation: 1,
             owner_rg_id: 0,
             owner_rg_epoch: 0,
+            owner_rg_lease_until: 0,
         };
         cache.insert(make_entry(key.clone(), stamp, 0));
 
@@ -408,7 +430,7 @@ mod tests {
             config_generation: 2, // newer than entry's 1
             fib_generation: 1,
         };
-        let hit = cache.lookup(&key, lookup, &rg_epochs);
+        let hit = cache.lookup(&key, lookup, 0, &rg_epochs);
         assert!(hit.is_none(), "expected miss on stale config_generation");
         assert_eq!(cache.misses, 1);
     }
@@ -426,6 +448,7 @@ mod tests {
             fib_generation: 5,
             owner_rg_id: 0,
             owner_rg_epoch: 0,
+            owner_rg_lease_until: 0,
         };
         cache.insert(make_entry(key.clone(), stamp, 0));
 
@@ -434,7 +457,7 @@ mod tests {
             config_generation: 1,
             fib_generation: 6, // newer than entry's 5
         };
-        let hit = cache.lookup(&key, lookup, &rg_epochs);
+        let hit = cache.lookup(&key, lookup, 0, &rg_epochs);
         assert!(hit.is_none(), "expected miss on stale fib_generation");
         assert_eq!(cache.misses, 1);
     }
@@ -452,6 +475,7 @@ mod tests {
             fib_generation: 1,
             owner_rg_id: 1,
             owner_rg_epoch: 3,
+            owner_rg_lease_until: 0,
         };
         // Set current epoch to match so the insert is "valid" at that moment.
         rg_epochs[1].store(3, Ordering::Relaxed);
@@ -465,7 +489,7 @@ mod tests {
             config_generation: 1,
             fib_generation: 1,
         };
-        let hit = cache.lookup(&key, lookup, &rg_epochs);
+        let hit = cache.lookup(&key, lookup, 0, &rg_epochs);
         assert!(hit.is_none(), "expected miss on stale RG epoch");
         assert_eq!(cache.misses, 1);
         // Stale RG epoch also triggers eviction of the entry.
@@ -485,6 +509,7 @@ mod tests {
             fib_generation: 1,
             owner_rg_id: 1,
             owner_rg_epoch: 0,
+            owner_rg_lease_until: 0,
         };
         cache.insert(make_entry(key.clone(), stamp, 1));
 
@@ -496,10 +521,62 @@ mod tests {
             config_generation: 1,
             fib_generation: 1,
         };
-        let hit = cache.lookup(&key, lookup, &rg_epochs);
+        let hit = cache.lookup(&key, lookup, 0, &rg_epochs);
         assert!(hit.is_some(), "expected hit — only unrelated RG was bumped");
         assert_eq!(cache.hits, 1);
         assert_eq!(cache.misses, 0);
+    }
+
+    #[test]
+    fn expired_owner_rg_lease_causes_miss_without_epoch_bump() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let key = make_key();
+        let stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 1,
+            owner_rg_id: 1,
+            owner_rg_epoch: 7,
+            owner_rg_lease_until: 50,
+        };
+        rg_epochs[1].store(7, Ordering::Relaxed);
+        cache.insert(make_entry(key.clone(), stamp, 1));
+
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 1,
+            fib_generation: 1,
+        };
+        let hit = cache.lookup(&key, lookup, 51, &rg_epochs);
+        assert!(hit.is_none(), "expected miss after HA lease expiry");
+        assert_eq!(cache.evictions, 1);
+    }
+
+    #[test]
+    fn expired_owner_rg_lease_causes_miss_for_out_of_range_rg() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let key = make_key();
+        let stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 1,
+            owner_rg_id: MAX_RG_EPOCHS as i32 + 4,
+            owner_rg_epoch: 0,
+            owner_rg_lease_until: 50,
+        };
+        cache.insert(make_entry(key.clone(), stamp, stamp.owner_rg_id));
+
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 1,
+            fib_generation: 1,
+        };
+        let hit = cache.lookup(&key, lookup, 51, &rg_epochs);
+        assert!(
+            hit.is_none(),
+            "expected miss after HA lease expiry even for out-of-range owner RG"
+        );
+        assert_eq!(cache.evictions, 1);
     }
 
     // ----------------------------------------------------------------
@@ -639,6 +716,14 @@ mod tests {
             decision,
             ingress_zone.clone(),
             &forwarding,
+            &BTreeMap::from([(
+                1,
+                HAGroupRuntime {
+                    active: true,
+                    watchdog_timestamp: 95,
+                    lease: HAForwardingLease::ActiveUntil(100),
+                },
+            )]),
             false,
             &rg_epochs,
         );
@@ -676,6 +761,7 @@ mod tests {
         assert_eq!(entry.stamp.fib_generation, 3);
         assert_eq!(entry.stamp.owner_rg_id, 1); // from egress RG
         assert_eq!(entry.stamp.owner_rg_epoch, 0); // rg_epochs all start at 0
+        assert_eq!(entry.stamp.owner_rg_lease_until, 100);
 
         // Metadata carries ingress zone and owner RG.
         assert_eq!(&*entry.metadata.ingress_zone, "trust");
@@ -712,6 +798,7 @@ mod tests {
             decision,
             None,
             &forwarding,
+            &BTreeMap::new(),
             false,
             &rg_epochs,
         );
