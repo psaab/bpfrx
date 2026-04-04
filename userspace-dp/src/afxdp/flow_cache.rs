@@ -248,7 +248,6 @@ impl FlowCache {
         }
     }
 
-    #[allow(dead_code)]
     pub(super) fn invalidate_slot(
         &mut self,
         key: &crate::session::SessionKey,

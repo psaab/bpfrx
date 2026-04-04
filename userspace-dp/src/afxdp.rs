@@ -2404,13 +2404,19 @@ fn poll_binding(
                             FlowCacheLookup::for_packet(meta, validation),
                             &rg_epochs,
                         ) {
-                            // The flow cache lookup already performs epoch-based
-                            // HA invalidation: entries stamped with a stale
-                            // owner_rg_epoch are evicted on lookup. This replaces
-                            // the previous per-packet cached_flow_decision_valid()
-                            // call which ran enforce_ha_resolution_snapshot() on
-                            // every cache hit (~1.3% CPU at 22 Gbps).
-                            {
+                            if !cached_flow_decision_valid(
+                                forwarding,
+                                ha_state,
+                                now_secs,
+                                cached.decision.resolution,
+                            ) {
+                                binding.flow_cache.invalidate_slot(
+                                    &flow.forward_key,
+                                    meta.ingress_ifindex as i32,
+                                );
+                                // Fall through to slow path for full
+                                // HA resolution → fabric redirect.
+                            } else {
                                 let cached_decision = cached.decision;
                                 let cached_descriptor = cached.descriptor;
                                 let cached_metadata = cached.metadata.clone();
@@ -5149,7 +5155,6 @@ fn worker_loop(
         .first()
         .map(|binding| binding.conntrack_v6_fd)
         .unwrap_or(-1);
-    let mut last_ct_refresh_ns: u64 = 0;
     let mut last_ct_refresh_ns: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         let loop_now_ns = monotonic_nanos();
