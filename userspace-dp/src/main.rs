@@ -441,6 +441,20 @@ fn handle_stream(
                     refresh_status(&mut guard);
                 }
             }
+            "bump_fib_generation" => {
+                // Lightweight FIB generation bump without a full snapshot.
+                // Updates the generation counter so workers invalidate stale
+                // flow cache entries, without the cost of rebuilding and
+                // transmitting the entire config snapshot.
+                if let Some(snapshot) = request.snapshot.as_ref() {
+                    guard.status.last_fib_generation = snapshot.fib_generation;
+                    if let Some(ref mut snap) = guard.snapshot {
+                        snap.fib_generation = snapshot.fib_generation;
+                    }
+                    guard.afxdp.bump_fib_generation(snapshot.fib_generation);
+                    refresh_status(&mut guard);
+                }
+            }
             "set_queue_state" => {
                 if let Some(queue_req) = request.queue {
                     let mut found = false;

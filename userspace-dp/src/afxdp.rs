@@ -1104,6 +1104,13 @@ impl Coordinator {
             .store(Arc::new(self.forwarding.fabrics.clone()));
     }
 
+    /// Bump just the FIB generation counter without a full snapshot rebuild.
+    /// Workers will invalidate flow cache entries with stale FIB generations.
+    pub fn bump_fib_generation(&mut self, fib_generation: u32) {
+        self.validation.fib_generation = fib_generation;
+        self.shared_validation.store(Arc::new(self.validation));
+    }
+
     pub fn worker_heartbeats(&self) -> Vec<chrono::DateTime<Utc>> {
         let now_wall = Utc::now();
         let now_mono = monotonic_nanos();
