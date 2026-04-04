@@ -3,6 +3,7 @@ package userspace
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -78,6 +79,7 @@ type Manager struct {
 	lastIngressIfaces  []uint32
 	lastRSTv4          []netip.Addr
 	lastRSTv6          []netip.Addr
+	lastSnapshotHash   [32]byte // content hash of last published snapshot (excludes volatile fields)
 	lastBindingIndices []uint32
 	neighborsPrewarmed bool
 	ctrlEnableAt       time.Time
@@ -312,6 +314,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	}
 	m.publishedSnapshot = snap.Generation
 	m.publishedPlanKey = newPlanKey
+	m.lastSnapshotHash = snapshotContentHash(snap)
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return result, fmt.Errorf("sync helper status: %w", err)
 	}
@@ -771,6 +774,25 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 			HAEnabled:      cfg.Chassis.Cluster != nil,
 		},
 	}
+}
+
+// snapshotContentHash computes a SHA-256 hash over the stable content of a
+// snapshot, excluding volatile fields (Generation, FIBGeneration, GeneratedAt)
+// that change on every build even when the forwarding-relevant content is
+// identical. Used to skip redundant control-socket publishes.
+func snapshotContentHash(snap *ConfigSnapshot) [32]byte {
+	// Create a shallow copy with volatile fields zeroed, then JSON-encode.
+	// This is cheaper than a custom hasher and reuses the existing JSON tags.
+	tmp := *snap
+	tmp.Generation = 0
+	tmp.FIBGeneration = 0
+	tmp.GeneratedAt = time.Time{}
+	tmp.Config = nil // raw config object — not sent to helper
+	data, err := json.Marshal(&tmp)
+	if err != nil {
+		return [32]byte{}
+	}
+	return sha256.Sum256(data)
 }
 
 func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
@@ -2486,12 +2508,23 @@ func (m *Manager) syncSnapshotLocked() error {
 			return fmt.Errorf("restart userspace helper for binding plan change: %w", err)
 		}
 	}
+	// Content-hash dedup: skip the control socket publish if the snapshot's
+	// forwarding-relevant content hasn't changed since the last publish.
+	// This eliminates redundant publishes during route convergence where
+	// BumpFIBGeneration fires repeatedly but routes/neighbors are unchanged.
+	hash := snapshotContentHash(m.lastSnapshot)
+	if hash == m.lastSnapshotHash && m.publishedSnapshot != 0 {
+		// Still update the published generation so subsequent checks pass.
+		m.publishedSnapshot = m.lastSnapshot.Generation
+		return nil
+	}
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: m.lastSnapshot}, &status); err != nil {
 		return fmt.Errorf("publish userspace snapshot: %w", err)
 	}
 	m.publishedSnapshot = m.lastSnapshot.Generation
 	m.publishedPlanKey = planKey
+	m.lastSnapshotHash = hash
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return fmt.Errorf("sync helper status: %w", err)
 	}
