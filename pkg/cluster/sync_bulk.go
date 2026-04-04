@@ -314,13 +314,13 @@ func (s *SessionSync) writeBarrierMessage(payload []byte, timeout time.Duration)
 	if conn == nil {
 		return fmt.Errorf("session sync not connected")
 	}
-	// Write barrier directly under writeMu — same approach as barrier
-	// ACKs. This ensures the barrier is sent promptly regardless of how
-	// many session messages are queued in sendCh. The ordering guarantee
-	// (barrier proves peer processed prior sessions) is relaxed for
-	// planned failovers where both nodes already have synced sessions
-	// via the event stream. The peer barrier ack includes its session
-	// counts so the caller can verify convergence independently.
+	// Pause the sendLoop so it stops writing session data to the TCP
+	// connection. After the pause, the sendLoop's current write (if any)
+	// finishes and writeMu becomes available. Locking writeMu immediately
+	// ensures the barrier is the next thing written to the TCP stream.
+	s.PauseSendLoop()
+	defer s.ResumeSendLoop()
+
 	msg := encodeRawMessage(syncMsgBarrier, payload)
 	seq := binary.LittleEndian.Uint64(payload)
 	s.writeMu.Lock()
