@@ -4,13 +4,14 @@
 
 The userspace dataplane control socket is a serialized bottleneck. Every
 operation — snapshot publish, session install, status poll, HA state sync,
-forwarding state sync — goes through a single Unix socket with a 3-second
-deadline (`requestDetailedLocked()` in `pkg/dataplane/userspace/manager.go:2418`).
+forwarding state sync — goes through a single Unix socket using a 2-second
+dial timeout and a 3-second post-connect I/O deadline in
+`requestDetailedLocked()` (`pkg/dataplane/userspace/manager.go:2418`).
 
 Observed symptoms during OSPF/BGP convergence on an HA cluster:
 
 - **5,213 RST suppression reinstalls** during a single boot — each triggered by
-  a snapshot publish that calls `applyHelperStatusLocked()` (line 3285)
+  a snapshot publish that calls `applyHelperStatusLocked()`
 - **42-second barrier ack delays** during manual failover — peer barrier in
   `prepareUserspaceRGDemotionWithTimeout()` (`pkg/daemon/daemon_ha.go:1169`)
   waits for all queued session deltas to drain, but session installs from
@@ -31,14 +32,14 @@ mutex and blocking HA session installs.
 
 | Trigger | Call site | Frequency |
 |---------|-----------|-----------|
-| Config commit | `daemon.go:1797` `d.dp.Compile(cfg)` | On commit only |
-| RETH MAC deferred re-compile | `daemon.go:2009` | Once per MAC set |
-| HA RG activation/demotion | `manager_ha.go:410` `BumpFIBGeneration()` | Per RG transition |
-| FIB generation bump | `manager.go:378` `BumpFIBGeneration()` | Per route change |
-| Recompile (eBPF inner) | `compiler.go:252` `BumpFIBGeneration()` | Per compile |
-| DHCP lease change | `daemon.go:2447` `d.applyConfig()` | Per lease |
-| Config sync from peer | `daemon_ha.go:1230` `d.applyConfig()` | Per peer push |
-| Status poll catch-up | `manager.go:3821` `syncSnapshotLocked()` | 1/s poll |
+| Config commit | `pkg/daemon/daemon.go` `d.dp.Compile(cfg)` | On commit only |
+| RETH MAC deferred re-compile | `pkg/daemon/daemon.go` | Once per MAC set |
+| HA RG activation/demotion | `pkg/dataplane/userspace/manager_ha.go` `BumpFIBGeneration()` | Per RG transition |
+| FIB generation bump | `pkg/dataplane/userspace/manager.go` `BumpFIBGeneration()` | Per route change |
+| Recompile (eBPF inner) | `pkg/dataplane/compiler.go` `BumpFIBGeneration()` | Per compile |
+| DHCP lease change | `pkg/daemon/daemon.go` `d.applyConfig()` | Per lease |
+| Config sync from peer | `pkg/daemon/daemon_ha.go` `d.applyConfig()` | Per peer push |
+| Status poll catch-up | `pkg/dataplane/userspace/manager.go` `syncSnapshotLocked()` | 1/s poll |
 
 ### What a snapshot contains
 
@@ -143,6 +144,13 @@ m.lastRoutes = currentRoutes
 The Rust helper maintains its own route table and applies deltas
 incrementally. No JSON serialization of the full config on every route change.
 
+**FIB generation propagation**: The `fib_delta` message must include the new
+`fib_generation` value. The Rust helper updates `last_fib_generation` on each
+delta batch, and workers refresh `validation.fib_generation` from it. This is
+critical: flow-cache validation depends on FIB generation to invalidate stale
+entries after route and HA changes. Without advancing the generation on deltas,
+pre-transition cache entries survive route changes.
+
 ### HA config sync (unchanged)
 
 Config sync is already commit-time only (`pushConfigToPeer()`). No changes
@@ -167,8 +175,17 @@ Add a second Unix socket (`control-sessions.sock`) dedicated to session
 install/delete operations. The Rust helper listens on both sockets. Session
 operations never compete with snapshot publishes.
 
+**Go-side locking change required**: `SetClusterSyncedSessionV4()` and
+snapshot publish are both serialized under `Manager.mu` before either
+request reaches the Unix socket. Moving only the transport to a second
+socket doesn't help if the Go lock still serializes both. The session
+install path must use a separate mutex (e.g., `sessionMu`) that does not
+contend with the snapshot publish path's `mu`. The BPF map update
+(`m.inner.SetSessionV4`) can stay under `mu`; only the Rust helper
+control socket call needs the split.
+
 Requires: Rust helper changes to accept a second listener, Go side to
-maintain two connections.
+maintain two connections and split the locking model.
 
 ### Option C: Async snapshot publish
 
@@ -186,12 +203,18 @@ improvement.
 
 Scope: `pkg/dataplane/userspace/manager.go`
 
-- Hash the serialized snapshot before `requestLocked()` in
-  `syncSnapshotLocked()` (line 2490)
-- Store the hash; skip publish if unchanged
+- Hash the **stable content** of the snapshot (routes, neighbors, interface
+  state) *before* `buildSnapshot()` stamps generation/timestamp fields.
+  `buildSnapshot()` sets `Generation` and `GeneratedAt` on every call, making
+  the full serialized payload unique even when nothing meaningful changed.
+  The hash must cover only the fields that affect forwarding behavior:
+  route set, neighbor set, interface config, NAT rules.
+- Store the hash; skip `buildSnapshot()` + publish entirely if unchanged.
+  Increment `FIBGeneration` in the BPF map (the eBPF pipeline needs it)
+  but do NOT rebuild or publish the userspace snapshot.
 - Covers the common case where `BumpFIBGeneration()` fires repeatedly
-  during convergence but the route table hasn't changed yet
-- No protocol changes, no Rust changes
+  during convergence but the route table hasn't changed yet.
+- No protocol changes, no Rust changes.
 
 Expected: eliminates 80%+ of redundant publishes during convergence.
 
