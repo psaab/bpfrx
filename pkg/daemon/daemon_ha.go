@@ -1120,7 +1120,7 @@ func (d *Daemon) userspaceTransferReadiness(rgID int) (bool, []string) {
 
 func (d *Daemon) prepareUserspaceManualFailover(rgID int) error {
 	return wrapUserspaceManualFailoverPrepareError(
-		d.prepareUserspaceRGDemotionWithTimeout(rgID, 30*time.Second),
+		d.prepareUserspaceRGDemotionWithTimeout(rgID, 60*time.Second),
 	)
 }
 
