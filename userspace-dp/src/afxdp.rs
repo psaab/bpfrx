@@ -2402,6 +2402,7 @@ fn poll_binding(
                         if let Some(cached) = binding.flow_cache.lookup(
                             &flow.forward_key,
                             FlowCacheLookup::for_packet(meta, validation),
+                            now_secs,
                             &rg_epochs,
                         ) {
                             // The flow cache lookup already performs epoch-based
@@ -3861,6 +3862,7 @@ fn poll_binding(
                                     decision,
                                     session_ingress_zone.as_ref().cloned(),
                                     forwarding,
+                                    ha_state,
                                     apply_nat_on_fabric,
                                     &rg_epochs,
                                 )

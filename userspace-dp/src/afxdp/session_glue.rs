@@ -2396,6 +2396,7 @@ mod tests {
                 fib_generation: 1,
                 owner_rg_id: 1,
                 owner_rg_epoch: 0,
+                owner_rg_lease_until: 0,
             },
         });
 
@@ -2409,6 +2410,7 @@ mod tests {
                         config_generation: 1,
                         fib_generation: 1,
                     },
+                    0,
                     &rg_epochs,
                 )
                 .is_some()
@@ -2427,6 +2429,7 @@ mod tests {
                         config_generation: 1,
                         fib_generation: 1,
                     },
+                    0,
                     &rg_epochs,
                 )
                 .is_none()
@@ -2470,6 +2473,7 @@ mod tests {
                 fib_generation: 1,
                 owner_rg_id: 1,
                 owner_rg_epoch: 0,
+                owner_rg_lease_until: 0,
             },
         });
 
@@ -2486,6 +2490,7 @@ mod tests {
                         config_generation: 1,
                         fib_generation: 1,
                     },
+                    0,
                     &rg_epochs,
                 )
                 .is_some()
