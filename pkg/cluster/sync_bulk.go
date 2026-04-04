@@ -249,13 +249,10 @@ func (s *SessionSync) sendBarrierAck(conn net.Conn, seq uint64) {
 	if conn == nil {
 		return
 	}
-	// Write barrier ack directly under writeMu instead of going through
-	// barrierCh → sendLoop. The sendLoop may be blocked on writeMu
-	// (held by BulkSync writing session data), so routing through
-	// barrierCh doesn't help — the ack sits in the channel while
-	// sendLoop is stuck. Direct write with writeMu guarantees the ack
-	// is sent as soon as the current BulkSync per-session write releases
-	// the lock (each session write is <1ms).
+	// Write barrier ack directly under writeMu. If the send loop is
+	// blocked behind bulk/session writes, routing the ack through sendCh
+	// would delay the response behind traffic that doesn't need FIFO
+	// ordering with the ack itself.
 	var payload [24]byte
 	binary.LittleEndian.PutUint64(payload[:], seq)
 	stats := s.Stats()
@@ -291,8 +288,7 @@ func (s *SessionSync) sendBulkAck(conn net.Conn, epoch uint64) {
 		return
 	}
 	// Write bulk ack directly under writeMu — same rationale as
-	// sendBarrierAck: the sendLoop may be blocked on writeMu during
-	// BulkSync writes, so routing through barrierCh doesn't help.
+	// sendBarrierAck.
 	var payload [8]byte
 	binary.LittleEndian.PutUint64(payload[:], epoch)
 	s.writeMu.Lock()
@@ -314,43 +310,23 @@ func (s *SessionSync) writeBarrierMessage(payload []byte, timeout time.Duration)
 	if conn == nil {
 		return fmt.Errorf("session sync not connected")
 	}
-	// Pause the sendLoop so it stops writing session data to the TCP
-	// connection. After the pause, the sendLoop's current write (if any)
-	// finishes and writeMu becomes available. Locking writeMu immediately
-	// ensures the barrier is the next thing written to the TCP stream.
-	s.PauseSendLoop()
-	defer s.ResumeSendLoop()
-
+	// Barrier requests go through sendCh to preserve ordering with
+	// already-queued session messages. The peer's ack must prove it
+	// processed every earlier delta, not just the barrier itself.
 	msg := encodeRawMessage(syncMsgBarrier, payload)
-	seq := binary.LittleEndian.Uint64(payload)
-	s.writeMu.Lock()
-	err := writeFull(conn, msg)
-	s.writeMu.Unlock()
-	if err != nil {
-		return fmt.Errorf("barrier write failed: %w", err)
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case s.sendCh <- msg:
+	case <-timer.C:
+		return fmt.Errorf("timed out queueing session sync barrier")
 	}
-	slog.Info("cluster sync: barrier sent (direct)",
+	seq := binary.LittleEndian.Uint64(payload)
+	slog.Info("cluster sync: barrier queued (ordered)",
 		"seq", seq,
 		"local", connLocalAddrString(conn),
 		"remote", connRemoteAddrString(conn))
 	return nil
-}
-
-// DrainSendQueue discards all pending messages in sendCh so the TCP
-// send buffer isn't clogged when a barrier needs prompt delivery.
-func (s *SessionSync) DrainSendQueue() int {
-	drained := 0
-	for {
-		select {
-		case <-s.sendCh:
-			drained++
-		default:
-			if drained > 0 {
-				slog.Info("cluster sync: drained send queue", "messages", drained)
-			}
-			return drained
-		}
-	}
 }
 
 // WaitForPeerBarrier queues an ordered marker on the session-sync stream and
