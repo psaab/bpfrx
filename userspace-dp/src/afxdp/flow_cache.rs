@@ -14,6 +14,7 @@ pub(super) const MAX_RG_EPOCHS: usize = 16;
 pub(super) struct RewriteDescriptor {
     pub(super) dst_mac: [u8; 6],
     pub(super) src_mac: [u8; 6],
+    pub(super) fabric_redirect: bool,
     pub(super) tx_vlan_id: u16,
     pub(super) ether_type: u16,
     pub(super) rewrite_src_ip: Option<std::net::IpAddr>,
@@ -139,6 +140,8 @@ impl FlowCacheEntry {
             descriptor: RewriteDescriptor {
                 dst_mac: decision.resolution.neighbor_mac.unwrap_or([0; 6]),
                 src_mac: decision.resolution.src_mac.unwrap_or([0; 6]),
+                fabric_redirect: decision.resolution.disposition
+                    == ForwardingDisposition::FabricRedirect,
                 tx_vlan_id: decision.resolution.tx_vlan_id,
                 ether_type: if meta.addr_family as i32 == libc::AF_INET {
                     0x0800
@@ -302,6 +305,7 @@ mod tests {
         RewriteDescriptor {
             dst_mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
             src_mac: [0x02, 0xbf, 0x72, 0x00, 0x01, 0x01],
+            fabric_redirect: false,
             tx_vlan_id: 0,
             ether_type: 0x0800,
             rewrite_src_ip: None,
@@ -737,8 +741,14 @@ mod tests {
         assert_eq!(entry.decision, decision);
 
         // Descriptor carries the resolution's MAC/VLAN/ifindex data.
-        assert_eq!(entry.descriptor.dst_mac, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
-        assert_eq!(entry.descriptor.src_mac, [0x02, 0xbf, 0x72, 0x00, 0x01, 0x01]);
+        assert_eq!(
+            entry.descriptor.dst_mac,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]
+        );
+        assert_eq!(
+            entry.descriptor.src_mac,
+            [0x02, 0xbf, 0x72, 0x00, 0x01, 0x01]
+        );
         assert_eq!(entry.descriptor.tx_vlan_id, 50);
         assert_eq!(entry.descriptor.egress_ifindex, 6);
         assert_eq!(entry.descriptor.tx_ifindex, 6);

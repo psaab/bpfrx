@@ -1672,6 +1672,7 @@ pub(super) fn apply_rewrite_descriptor(
     let packet = &mut frame[..frame_len];
     let ip = eth_len;
     let skip_ttl = (meta.meta_flags & 0x80) != 0;
+    let apply_nat = !rd.fabric_redirect || rd.apply_nat_on_fabric;
 
     match rd.ether_type {
         0x0800 => {
@@ -1701,22 +1702,26 @@ pub(super) fn apply_rewrite_descriptor(
             }
 
             // NAT: direct byte writes for IP addresses.
-            if let Some(IpAddr::V4(new_src)) = rd.rewrite_src_ip {
-                packet[ip + 12..ip + 16].copy_from_slice(&new_src.octets());
-            }
-            if let Some(IpAddr::V4(new_dst)) = rd.rewrite_dst_ip {
-                packet[ip + 16..ip + 20].copy_from_slice(&new_dst.octets());
+            if apply_nat {
+                if let Some(IpAddr::V4(new_src)) = rd.rewrite_src_ip {
+                    packet[ip + 12..ip + 16].copy_from_slice(&new_src.octets());
+                }
+                if let Some(IpAddr::V4(new_dst)) = rd.rewrite_dst_ip {
+                    packet[ip + 16..ip + 20].copy_from_slice(&new_dst.octets());
+                }
             }
 
             // NAT: direct byte writes for L4 ports.
-            if let Some(new_sport) = rd.rewrite_src_port {
-                if packet.len() >= l4 + 2 {
-                    packet[l4..l4 + 2].copy_from_slice(&new_sport.to_be_bytes());
+            if apply_nat {
+                if let Some(new_sport) = rd.rewrite_src_port {
+                    if packet.len() >= l4 + 2 {
+                        packet[l4..l4 + 2].copy_from_slice(&new_sport.to_be_bytes());
+                    }
                 }
-            }
-            if let Some(new_dport) = rd.rewrite_dst_port {
-                if packet.len() >= l4 + 4 {
-                    packet[l4 + 2..l4 + 4].copy_from_slice(&new_dport.to_be_bytes());
+                if let Some(new_dport) = rd.rewrite_dst_port {
+                    if packet.len() >= l4 + 4 {
+                        packet[l4 + 2..l4 + 4].copy_from_slice(&new_dport.to_be_bytes());
+                    }
                 }
             }
 
@@ -1728,7 +1733,9 @@ pub(super) fn apply_rewrite_descriptor(
             // IP header checksum: precomputed NAT delta + TTL-1 delta.
             let old_csum = u16::from_be_bytes([packet[ip + 10], packet[ip + 11]]);
             let mut sum = (!old_csum as u32) & 0xffff;
-            sum += rd.ip_csum_delta as u32;
+            if apply_nat {
+                sum += rd.ip_csum_delta as u32;
+            }
             if !skip_ttl {
                 // TTL-1 delta is always 0xFEFF in one's complement arithmetic
                 sum += 0xFEFF;
@@ -1740,7 +1747,7 @@ pub(super) fn apply_rewrite_descriptor(
             packet[ip + 10..ip + 12].copy_from_slice(&new_csum.to_be_bytes());
 
             // L4 checksum: precomputed delta covers IP + port changes.
-            if rd.l4_csum_delta != 0 {
+            if apply_nat && rd.l4_csum_delta != 0 {
                 let l4_csum_off = match meta.protocol {
                     PROTO_TCP => l4 + 16,
                     PROTO_UDP => l4 + 6,
@@ -1800,22 +1807,26 @@ pub(super) fn apply_rewrite_descriptor(
             }
 
             // NAT: direct byte writes for IPv6 addresses.
-            if let Some(IpAddr::V6(new_src)) = rd.rewrite_src_ip {
-                packet[ip + 8..ip + 24].copy_from_slice(&new_src.octets());
-            }
-            if let Some(IpAddr::V6(new_dst)) = rd.rewrite_dst_ip {
-                packet[ip + 24..ip + 40].copy_from_slice(&new_dst.octets());
+            if apply_nat {
+                if let Some(IpAddr::V6(new_src)) = rd.rewrite_src_ip {
+                    packet[ip + 8..ip + 24].copy_from_slice(&new_src.octets());
+                }
+                if let Some(IpAddr::V6(new_dst)) = rd.rewrite_dst_ip {
+                    packet[ip + 24..ip + 40].copy_from_slice(&new_dst.octets());
+                }
             }
 
             // NAT: direct byte writes for L4 ports.
-            if let Some(new_sport) = rd.rewrite_src_port {
-                if packet.len() >= l4 + 2 {
-                    packet[l4..l4 + 2].copy_from_slice(&new_sport.to_be_bytes());
+            if apply_nat {
+                if let Some(new_sport) = rd.rewrite_src_port {
+                    if packet.len() >= l4 + 2 {
+                        packet[l4..l4 + 2].copy_from_slice(&new_sport.to_be_bytes());
+                    }
                 }
-            }
-            if let Some(new_dport) = rd.rewrite_dst_port {
-                if packet.len() >= l4 + 4 {
-                    packet[l4 + 2..l4 + 4].copy_from_slice(&new_dport.to_be_bytes());
+                if let Some(new_dport) = rd.rewrite_dst_port {
+                    if packet.len() >= l4 + 4 {
+                        packet[l4 + 2..l4 + 4].copy_from_slice(&new_dport.to_be_bytes());
+                    }
                 }
             }
 
@@ -1825,7 +1836,7 @@ pub(super) fn apply_rewrite_descriptor(
             }
 
             // L4 checksum: precomputed delta covers IPv6 address + port changes.
-            if rd.l4_csum_delta != 0 {
+            if apply_nat && rd.l4_csum_delta != 0 {
                 let l4_csum_off = match meta.protocol {
                     PROTO_TCP => l4 + 16,
                     PROTO_UDP => l4 + 6,
@@ -6359,6 +6370,8 @@ mod tests {
         RewriteDescriptor {
             dst_mac: decision.resolution.neighbor_mac.unwrap_or([0; 6]),
             src_mac: decision.resolution.src_mac.unwrap_or([0; 6]),
+            fabric_redirect: decision.resolution.disposition
+                == ForwardingDisposition::FabricRedirect,
             tx_vlan_id: vlan_id,
             ether_type,
             rewrite_src_ip: decision.nat.rewrite_src,
@@ -6558,6 +6571,90 @@ mod tests {
         assert_eq!(checksum16(&out[18..38]), 0);
         // TCP checksum valid
         assert!(tcp_checksum_ok_ipv4(&out[18..]));
+    }
+
+    #[test]
+    fn apply_descriptor_fabric_redirect_skips_nat_when_flag_is_false() {
+        let mut frame = Vec::new();
+        write_eth_header(&mut frame, [0xaa; 6], [0xbb; 6], 0, 0x0800);
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
+            102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
+            b'd', b'a', b't', b'a',
+        ]);
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("tcp sum");
+        assert!(tcp_checksum_ok_ipv4(&frame[14..]));
+
+        let flow = SessionFlow {
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 40000,
+                dst_port: 5201,
+            },
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::FabricRedirect,
+                egress_ifindex: 21,
+                tx_ifindex: 21,
+                neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]),
+                tx_vlan_id: 0,
+                local_ifindex: 0,
+                tunnel_endpoint_id: 0,
+                next_hop: None,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                ..NatDecision::default()
+            },
+        };
+        let mut rd = test_descriptor(&flow, &decision, 0, 0x0800);
+        rd.apply_nat_on_fabric = false;
+
+        let mut area = MmapArea::new(4096).expect("mmap");
+        area.slice_mut(0, frame.len())
+            .unwrap()
+            .copy_from_slice(&frame);
+        let meta = UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            l3_offset: 14,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            ..UserspaceDpMeta::default()
+        };
+        let frame_len = apply_rewrite_descriptor(
+            &area,
+            XdpDesc {
+                addr: 0,
+                len: frame.len() as u32,
+                options: 0,
+            },
+            meta,
+            &rd,
+            None,
+        )
+        .expect("descriptor fabric rewrite");
+
+        let out = area.slice(0, frame_len as usize).expect("out");
+        assert_eq!(&out[0..6], &[0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
+        assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
+        assert_eq!(&out[26..30], &[10, 0, 61, 102]);
+        assert_eq!(&out[30..34], &[172, 16, 80, 200]);
+        assert_eq!(out[22], 63);
+        assert_eq!(checksum16(&out[14..34]), 0);
+        assert!(tcp_checksum_ok_ipv4(&out[14..]));
     }
 
     #[test]
@@ -6818,6 +6915,7 @@ mod tests {
         let rd = RewriteDescriptor {
             dst_mac: [0; 6],
             src_mac: [0; 6],
+            fabric_redirect: false,
             tx_vlan_id: 0,
             ether_type: 0x0800,
             rewrite_src_ip: None,

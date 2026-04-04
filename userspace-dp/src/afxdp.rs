@@ -2526,7 +2526,7 @@ fn poll_binding(
                                                 forwarding,
                                                 Some(flow),
                                                 Some(&cached_metadata.ingress_zone),
-                                                true,
+                                                cached_descriptor.apply_nat_on_fabric,
                                             )
                                         {
                                             request.source_frame = owned_packet_frame.take();
