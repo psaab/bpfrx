@@ -117,7 +117,9 @@ interface-NAT addresses back to the kernel (see `is_icmp_to_interface_nat_local`
 in `userspace-xdp/src/lib.rs`).
 
 ```bash
-# On the primary node (whichever owns reth0)
+# On the primary node (whichever owns reth0).
+# Use any known-reachable external IP; these are examples for labs with
+# Internet egress. In isolated environments, substitute a routable target.
 ping -c 3 1.1.1.1
 ping6 -c 3 2001:4860:4860::8888
 ```

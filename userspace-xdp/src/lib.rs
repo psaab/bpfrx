@@ -1157,9 +1157,10 @@ fn is_local_destination(pkt: &ParsedPacket) -> bool {
 fn is_icmp_to_interface_nat_local(pkt: &ParsedPacket) -> bool {
     match pkt.addr_family {
         AF_INET => {
-            // Echo request (8) and echo reply (0): both need kernel delivery
-            // for locally-originated pings. The kernel's own conntrack matches
-            // echo replies to the ping process.
+            // Echo reply (0) must reach the kernel for locally-originated
+            // pings, since the kernel matches replies to the ping process.
+            // Echo request (8) is also allowed here so inbound requests to
+            // interface-local/NAT destinations are delivered to the kernel.
             if pkt.protocol != PROTO_ICMP || (pkt.icmp_type != 8 && pkt.icmp_type != 0) {
                 return false;
             }
