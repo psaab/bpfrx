@@ -179,10 +179,8 @@ type SessionSync struct {
 	listener1  net.Listener // secondary fabric listener
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
-	sendCh      chan []byte    // buffered channel for outgoing messages
-	barrierCh   chan []byte    // priority channel for barrier/ack messages (bypasses bulk backlog)
-	sendPauseCh chan struct{}  // closed to signal pause; nil means not paused
-	sendPauseMu sync.Mutex
+	sendCh     chan []byte // buffered channel for outgoing messages
+	barrierCh  chan []byte // priority channel for barrier/ack messages (bypasses bulk backlog)
 	// incrementalPauseDepth temporarily pauses background incremental
 	// producers (periodic sweeps) during HA demotion handoff so ordered
 	// demotion barriers are not queued behind unrelated backlog.
@@ -1340,37 +1338,6 @@ func (s *SessionSync) fabricConnectLoop(ctx context.Context, fabricIdx int, peer
 	}
 }
 
-// PauseSendLoop stops the sendLoop from pulling new messages off sendCh.
-// The current in-flight write (if any) finishes, then the loop blocks
-// until ResumeSendLoop is called. This lets the barrier writer acquire
-// writeMu without competing with bulk session data.
-func (s *SessionSync) PauseSendLoop() {
-	s.sendPauseMu.Lock()
-	defer s.sendPauseMu.Unlock()
-	if s.sendPauseCh != nil {
-		return // already paused
-	}
-	ch := make(chan struct{})
-	close(ch) // closed channel = paused signal
-	s.sendPauseCh = ch
-}
-
-// ResumeSendLoop unblocks the sendLoop after PauseSendLoop.
-func (s *SessionSync) ResumeSendLoop() {
-	s.sendPauseMu.Lock()
-	defer s.sendPauseMu.Unlock()
-	s.sendPauseCh = nil
-}
-
-// sendPauseSignal returns a channel that is readable (closed) when the
-// sendLoop should pause. Returns nil when not paused.
-func (s *SessionSync) sendPauseSignal() <-chan struct{} {
-	s.sendPauseMu.Lock()
-	ch := s.sendPauseCh
-	s.sendPauseMu.Unlock()
-	return ch
-}
-
 func (s *SessionSync) sendLoop(ctx context.Context) {
 	// sendOne writes a single message to the active connection, retrying
 	// on transient errors until success or context cancellation.
@@ -1408,29 +1375,7 @@ func (s *SessionSync) sendLoop(ctx context.Context) {
 			continue
 		default:
 		}
-		// Include pause signal in the select so the loop notices the
-		// pause even when blocked waiting for messages.
-		pauseCh := s.sendPauseSignal()
-		if pauseCh != nil {
-			// Paused — wait for resume (sendPauseCh set to nil) or ctx cancel.
-			// Poll periodically since there's no explicit resume channel.
-			ticker := time.NewTicker(5 * time.Millisecond)
-		waitResume:
-			for {
-				select {
-				case <-ctx.Done():
-					ticker.Stop()
-					return
-				case <-ticker.C:
-					if s.sendPauseSignal() == nil {
-						break waitResume
-					}
-				}
-			}
-			ticker.Stop()
-			continue
-		}
-		// No barrier pending, not paused — wait for either channel.
+		// No barrier pending — wait for either channel.
 		select {
 		case <-ctx.Done():
 			return

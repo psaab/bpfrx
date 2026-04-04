@@ -14,6 +14,21 @@ import (
 	"github.com/psaab/bpfrx/pkg/dataplane"
 )
 
+func readSyncMessage(t *testing.T, conn net.Conn) (uint8, []byte) {
+	t.Helper()
+
+	var hdr [syncHeaderSize]byte
+	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
+		t.Fatalf("read sync header: %v", err)
+	}
+	payloadLen := binary.LittleEndian.Uint32(hdr[8:12])
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(conn, payload); err != nil {
+		t.Fatalf("read sync payload: %v", err)
+	}
+	return hdr[4], payload
+}
+
 func TestSyncHeaderEncoding(t *testing.T) {
 	// Test that writeMsg produces valid headers
 	key := dataplane.SessionKey{
@@ -1871,6 +1886,68 @@ func TestWaitForPeerBarrierCompletesOnAck(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatalf("barrier helper failed: %v", err)
+	}
+}
+
+func TestWaitForPeerBarrierPreservesQueuedSessionOrdering(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	localConn, peerConn := net.Pipe()
+	defer localConn.Close()
+	defer peerConn.Close()
+	ss.mu.Lock()
+	ss.conn0 = localConn
+	ss.mu.Unlock()
+	ss.stats.Connected.Store(true)
+
+	key := dataplane.SessionKey{
+		SrcIP:    [4]byte{10, 0, 0, 1},
+		DstIP:    [4]byte{10, 0, 0, 2},
+		SrcPort:  1234,
+		DstPort:  80,
+		Protocol: 6,
+	}
+	val := dataplane.SessionValue{State: dataplane.SessStateEstablished}
+	ss.sendCh <- encodeSessionV4(key, val)
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- ss.WaitForPeerBarrier(2 * time.Second)
+	}()
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for len(ss.sendCh) != 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected queued session + barrier, sendCh len=%d", len(ss.sendCh))
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go ss.sendLoop(ctx)
+
+	msgType, _ := readSyncMessage(t, peerConn)
+	if msgType != syncMsgSessionV4 {
+		t.Fatalf("first message type = %d, want %d", msgType, syncMsgSessionV4)
+	}
+
+	msgType, payload := readSyncMessage(t, peerConn)
+	if msgType != syncMsgBarrier {
+		t.Fatalf("second message type = %d, want %d", msgType, syncMsgBarrier)
+	}
+	var ack [24]byte
+	copy(ack[:8], payload[:8])
+	binary.LittleEndian.PutUint64(ack[8:16], 1)
+	binary.LittleEndian.PutUint64(ack[16:24], 1)
+	ss.handleMessage(nil, syncMsgBarrierAck, ack[:])
+
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("WaitForPeerBarrier returned error: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("WaitForPeerBarrier did not complete")
 	}
 }
 
