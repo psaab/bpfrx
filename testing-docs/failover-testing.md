@@ -109,6 +109,22 @@ ping6 -c 3 2001:559:8585:80::200
 
 If these fail before the failover event, stop and isolate steady-state first.
 
+### Local firewall connectivity
+
+From the primary firewall itself, verify that locally-originated traffic works.
+This validates that the XDP shim correctly passes ICMP echo replies for
+interface-NAT addresses back to the kernel (see `is_icmp_to_interface_nat_local`
+in `userspace-xdp/src/lib.rs`).
+
+```bash
+# On the primary node (whichever owns reth0)
+ping -c 3 1.1.1.1
+ping6 -c 3 2001:4860:4860::8888
+```
+
+If these fail, the XDP shim may not be recognizing echo replies destined for
+interface-NAT addresses as local-delivery packets.
+
 ### Lab hygiene
 
 On userspace `loss` after a remote host reboot:
