@@ -2374,6 +2374,7 @@ mod tests {
             descriptor: RewriteDescriptor {
                 dst_mac: [0; 6],
                 src_mac: [0; 6],
+                fabric_redirect: false,
                 tx_vlan_id: 0,
                 ether_type: 0x0800,
                 rewrite_src_ip: None,
@@ -2451,6 +2452,7 @@ mod tests {
             descriptor: RewriteDescriptor {
                 dst_mac: [0; 6],
                 src_mac: [0; 6],
+                fabric_redirect: false,
                 tx_vlan_id: 0,
                 ether_type: 0x0800,
                 rewrite_src_ip: None,
