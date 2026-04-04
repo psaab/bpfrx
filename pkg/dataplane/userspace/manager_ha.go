@@ -799,23 +799,20 @@ func (m *Manager) sessionSyncTunnelEndpointLocked(id uint16) (TunnelEndpointSnap
 }
 
 func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
-	// Use the dedicated session socket (Phase 3) so session installs
-	// never queue behind snapshot publishes on the main control socket.
-	// Falls back to the main socket if the session socket is unavailable.
+	// Build the control request under mu (for data access), then release mu
+	// before the socket I/O so snapshot publishes aren't blocked.
 	ctrlReq := ControlRequest{
 		Type:           "sync_session",
 		SuppressStatus: true,
 		SessionSync:    &req,
 	}
-	if err := m.requestSessionSync(ctrlReq); err != nil {
-		// Fall back to main socket — session socket may not exist yet
-		// during startup or if the Rust helper is an older version.
-		if err2 := m.requestLocked(ctrlReq, nil); err2 != nil {
-			slog.Warn("userspace session sync mirror failed", "operation", req.Operation, "err", err2)
-			return err2
-		}
+	m.mu.Unlock()
+	err := m.requestSessionSync(ctrlReq)
+	m.mu.Lock()
+	if err != nil {
+		slog.Debug("userspace session sync mirror failed", "operation", req.Operation, "err", err)
 	}
-	return nil
+	return err
 }
 
 func (m *Manager) zoneNameByID(zoneID uint16) string {
