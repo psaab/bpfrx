@@ -519,10 +519,23 @@ func configureSessionSyncConn(conn net.Conn) {
 	if !ok {
 		return
 	}
+	// TCP_NODELAY disables Nagle's algorithm so small control messages
+	// (barriers, heartbeats) are not held waiting for outstanding data
+	// to be ACKed before sending. Important for barrier latency.
 	if err := tcpConn.SetNoDelay(true); err != nil {
 		slog.Warn("cluster sync: failed to enable TCP_NODELAY",
 			"local", connLocalAddrString(conn),
 			"remote", connRemoteAddrString(conn),
+			"err", err)
+	}
+	if err := tcpConn.SetWriteBuffer(256 * 1024); err != nil {
+		slog.Warn("cluster sync: failed to set write buffer",
+			"local", connLocalAddrString(conn),
+			"err", err)
+	}
+	if err := tcpConn.SetReadBuffer(256 * 1024); err != nil {
+		slog.Warn("cluster sync: failed to set read buffer",
+			"local", connLocalAddrString(conn),
 			"err", err)
 	}
 }
@@ -1329,7 +1342,6 @@ func (s *SessionSync) fabricConnectLoop(ctx context.Context, fabricIdx int, peer
 		if err != nil {
 			continue
 		}
-
 		slog.Info("cluster sync: connected to peer", "addr", peerAddr, "fabric", fabricIdx)
 		s.handleNewConnection(ctx, fabricIdx, conn)
 	}
