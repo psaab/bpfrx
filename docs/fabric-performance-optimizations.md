@@ -1,6 +1,6 @@
 # Fabric Forwarding Performance Optimizations
 
-## Current State (2026-04-03)
+## Current State (2026-04-04)
 
 | Path | -P1 | -P8 |
 |------|-----|-----|
