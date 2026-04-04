@@ -2404,23 +2404,13 @@ fn poll_binding(
                             FlowCacheLookup::for_packet(meta, validation),
                             &rg_epochs,
                         ) {
-                            if !cached_flow_decision_valid(
-                                forwarding,
-                                ha_state,
-                                now_secs,
-                                cached.decision.resolution,
-                            ) {
-                                binding.flow_cache.invalidate_slot(
-                                    &flow.forward_key,
-                                    meta.ingress_ifindex as i32,
-                                );
-                                // Do NOT recycle/drop — fall through to the
-                                // slow path so the packet gets full session
-                                // lookup → HA resolution → fabric redirect.
-                                // Before this fix, packets were silently
-                                // dropped here, causing established flows to
-                                // flatline after HA failover.
-                            } else {
+                            // The flow cache lookup already performs epoch-based
+                            // HA invalidation: entries stamped with a stale
+                            // owner_rg_epoch are evicted on lookup. This replaces
+                            // the previous per-packet cached_flow_decision_valid()
+                            // call which ran enforce_ha_resolution_snapshot() on
+                            // every cache hit (~1.3% CPU at 22 Gbps).
+                            {
                                 let cached_decision = cached.decision;
                                 let cached_descriptor = cached.descriptor;
                                 let cached_metadata = cached.metadata.clone();
@@ -5146,20 +5136,22 @@ fn worker_loop(
     // Keeps `show security flow session` idle times accurate without
     // per-second syscall overhead per session.  See issue #333.
     const CT_REFRESH_INTERVAL_NS: u64 = 10_000_000_000;
+    // Cache BPF map FDs — they don't change during the worker's lifetime.
+    let session_map_fd = bindings
+        .first()
+        .map(|binding| binding.session_map_fd)
+        .unwrap_or(-1);
+    let conntrack_v4_fd = bindings
+        .first()
+        .map(|binding| binding.conntrack_v4_fd)
+        .unwrap_or(-1);
+    let conntrack_v6_fd = bindings
+        .first()
+        .map(|binding| binding.conntrack_v6_fd)
+        .unwrap_or(-1);
+    let mut last_ct_refresh_ns: u64 = 0;
     let mut last_ct_refresh_ns: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
-        let session_map_fd = bindings
-            .first()
-            .map(|binding| binding.session_map_fd)
-            .unwrap_or(-1);
-        let conntrack_v4_fd = bindings
-            .first()
-            .map(|binding| binding.conntrack_v4_fd)
-            .unwrap_or(-1);
-        let conntrack_v6_fd = bindings
-            .first()
-            .map(|binding| binding.conntrack_v6_fd)
-            .unwrap_or(-1);
         let loop_now_ns = monotonic_nanos();
         let loop_now_secs = loop_now_ns / 1_000_000_000;
         let live_validation = shared_validation.load();

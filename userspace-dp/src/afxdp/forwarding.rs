@@ -461,6 +461,7 @@ pub(super) fn enforce_ha_resolution_snapshot(
     resolution
 }
 
+#[allow(dead_code)]
 pub(super) fn cached_flow_decision_valid(
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
