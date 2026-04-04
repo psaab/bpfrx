@@ -23,8 +23,11 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"net/netip"
+
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/dataplane"
+	bpfrxnft "github.com/psaab/bpfrx/pkg/nftables"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -73,6 +76,8 @@ type Manager struct {
 	lastSnapshot       *ConfigSnapshot
 	haGroups           map[int]HAGroupStatus
 	lastIngressIfaces  []uint32
+	lastRSTv4          []netip.Addr
+	lastRSTv6          []netip.Addr
 	lastBindingIndices []uint32
 	neighborsPrewarmed bool
 	ctrlEnableAt       time.Time
@@ -3258,16 +3263,29 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 		}
 	}
 
+	var rstV4 []netip.Addr
+	var rstV6 []netip.Addr
 	for _, entry := range buildInterfaceNATAddressEntries(snapshot) {
 		if entry.v4 {
 			if err := natV4Map.Update(entry.v4Key, uint8(1), ebpf.UpdateAny); err != nil {
 				return fmt.Errorf("update userspace_interface_nat_v4 %08x: %w", entry.v4Key, err)
 			}
+			var b [4]byte
+			binary.BigEndian.PutUint32(b[:], entry.v4Key)
+			rstV4 = append(rstV4, netip.AddrFrom4(b))
 			continue
 		}
 		if err := natV6Map.Update(entry.v6Key, uint8(1), ebpf.UpdateAny); err != nil {
 			return fmt.Errorf("update userspace_interface_nat_v6 %+v: %w", entry.v6Key, err)
 		}
+		rstV6 = append(rstV6, netip.AddrFrom16(entry.v6Key.Addr))
+	}
+	if !slices.Equal(rstV4, m.lastRSTv4) || !slices.Equal(rstV6, m.lastRSTv6) {
+		if err := bpfrxnft.InstallRSTSuppression(rstV4, rstV6); err != nil {
+			slog.Warn("userspace: failed to install RST suppression via netlink", "err", err)
+		}
+		m.lastRSTv4 = rstV4
+		m.lastRSTv6 = rstV6
 	}
 	return nil
 }
