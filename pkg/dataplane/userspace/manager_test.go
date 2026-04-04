@@ -2038,3 +2038,45 @@ func TestSafeDelta(t *testing.T) {
 		t.Fatalf("safeDelta(42, 0) = %d, want 42", d)
 	}
 }
+
+func TestSnapshotContentHashIgnoresVolatileFields(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust"},
+	}
+	snap1 := buildSnapshot(cfg, config.UserspaceConfig{Workers: 1}, 1, 10)
+	snap2 := buildSnapshot(cfg, config.UserspaceConfig{Workers: 1}, 99, 50)
+
+	h1, ok1 := snapshotContentHash(snap1)
+	h2, ok2 := snapshotContentHash(snap2)
+	if !ok1 || !ok2 {
+		t.Fatal("hash failed")
+	}
+	if h1 != h2 {
+		t.Fatal("hashes differ despite identical stable content (only Generation/FIBGeneration changed)")
+	}
+}
+
+func TestSnapshotContentHashDiffersOnForwardingChange(t *testing.T) {
+	cfg1 := &config.Config{}
+	cfg1.Security.Zones = map[string]*config.ZoneConfig{
+		"trust": {Name: "trust"},
+	}
+	cfg2 := &config.Config{}
+	cfg2.Security.Zones = map[string]*config.ZoneConfig{
+		"trust":   {Name: "trust"},
+		"untrust": {Name: "untrust"},
+	}
+
+	snap1 := buildSnapshot(cfg1, config.UserspaceConfig{Workers: 1}, 1, 1)
+	snap2 := buildSnapshot(cfg2, config.UserspaceConfig{Workers: 1}, 1, 1)
+
+	h1, ok1 := snapshotContentHash(snap1)
+	h2, ok2 := snapshotContentHash(snap2)
+	if !ok1 || !ok2 {
+		t.Fatal("hash failed")
+	}
+	if h1 == h2 {
+		t.Fatal("hashes match despite different zone config")
+	}
+}

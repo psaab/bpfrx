@@ -314,7 +314,9 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	}
 	m.publishedSnapshot = snap.Generation
 	m.publishedPlanKey = newPlanKey
-	m.lastSnapshotHash = snapshotContentHash(snap)
+	if h, ok := snapshotContentHash(snap); ok {
+		m.lastSnapshotHash = h
+	}
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return result, fmt.Errorf("sync helper status: %w", err)
 	}
@@ -780,19 +782,20 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 // snapshot, excluding volatile fields (Generation, FIBGeneration, GeneratedAt)
 // that change on every build even when the forwarding-relevant content is
 // identical. Used to skip redundant control-socket publishes.
-func snapshotContentHash(snap *ConfigSnapshot) [32]byte {
+func snapshotContentHash(snap *ConfigSnapshot) ([32]byte, bool) {
 	// Create a shallow copy with volatile fields zeroed, then JSON-encode.
 	// This is cheaper than a custom hasher and reuses the existing JSON tags.
 	tmp := *snap
 	tmp.Generation = 0
 	tmp.FIBGeneration = 0
 	tmp.GeneratedAt = time.Time{}
-	tmp.Config = nil // raw config object — not sent to helper
+	tmp.Config = nil // exclude raw config from content hash to avoid churn from non-forwarding metadata
 	data, err := json.Marshal(&tmp)
 	if err != nil {
-		return [32]byte{}
+		slog.Warn("snapshotContentHash: marshal failed, skipping dedup", "err", err)
+		return [32]byte{}, false
 	}
-	return sha256.Sum256(data)
+	return sha256.Sum256(data), true
 }
 
 func buildZoneSnapshots(cfg *config.Config) []ZoneSnapshot {
@@ -2512,8 +2515,8 @@ func (m *Manager) syncSnapshotLocked() error {
 	// forwarding-relevant content hasn't changed since the last publish.
 	// This eliminates redundant publishes during route convergence where
 	// BumpFIBGeneration fires repeatedly but routes/neighbors are unchanged.
-	hash := snapshotContentHash(m.lastSnapshot)
-	if hash == m.lastSnapshotHash && m.publishedSnapshot != 0 {
+	hash, hashOK := snapshotContentHash(m.lastSnapshot)
+	if hashOK && hash == m.lastSnapshotHash && m.publishedSnapshot != 0 {
 		// Still update the published generation so subsequent checks pass.
 		m.publishedSnapshot = m.lastSnapshot.Generation
 		return nil
@@ -2524,7 +2527,9 @@ func (m *Manager) syncSnapshotLocked() error {
 	}
 	m.publishedSnapshot = m.lastSnapshot.Generation
 	m.publishedPlanKey = planKey
-	m.lastSnapshotHash = hash
+	if hashOK {
+		m.lastSnapshotHash = hash
+	}
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return fmt.Errorf("sync helper status: %w", err)
 	}
