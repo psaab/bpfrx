@@ -19,7 +19,8 @@ Observed symptoms during OSPF/BGP convergence on an HA cluster:
   are starved by continuous snapshot publishes
 - **Dozens of full snapshot rebuilds per second** during FRR route convergence —
   each `BumpFIBGeneration()` (`manager.go:378`) calls `buildSnapshot()` which
-  reads all kernel routes/neighbors and serializes the entire config
+  derives route snapshots from config/static routes and connected prefixes,
+  reads kernel ARP/NDP neighbors, and serializes the entire config
 
 Root cause: every `Compile()` call triggers `BumpFIBGeneration()` which rebuilds
 and publishes a complete snapshot (config + route snapshots from config + kernel
