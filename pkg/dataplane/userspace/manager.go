@@ -3280,6 +3280,8 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 		}
 		rstV6 = append(rstV6, netip.AddrFrom16(entry.v6Key.Addr))
 	}
+	slices.SortFunc(rstV4, netip.Addr.Compare)
+	slices.SortFunc(rstV6, netip.Addr.Compare)
 	if !slices.Equal(rstV4, m.lastRSTv4) || !slices.Equal(rstV6, m.lastRSTv6) {
 		if err := bpfrxnft.InstallRSTSuppression(rstV4, rstV6); err != nil {
 			slog.Warn("userspace: failed to install RST suppression via netlink", "err", err)
