@@ -11,7 +11,7 @@ dial timeout and a 3-second post-connect I/O deadline in
 Observed symptoms during OSPF/BGP convergence on an HA cluster:
 
 - **5,213 RST suppression reinstalls** during a single boot — each triggered by
-  a snapshot publish that calls `applyHelperStatusLocked()`
+  `syncInterfaceNATAddressMapsLocked()` which runs on every `Compile()` path
 - **42-second barrier ack delays** during manual failover — peer barrier in
   `prepareUserspaceRGDemotionWithTimeout()` (`pkg/daemon/daemon_ha.go:1169`)
   waits for all queued session deltas to drain, but session installs from
@@ -21,10 +21,11 @@ Observed symptoms during OSPF/BGP convergence on an HA cluster:
   each `BumpFIBGeneration()` (`manager.go:378`) calls `buildSnapshot()` which
   reads all kernel routes/neighbors and serializes the entire config
 
-Root cause: `BumpFIBGeneration()` rebuilds and publishes a complete snapshot
-(config + FIB + neighbors + policies + NAT rules) on every route add/delete.
-During OSPF convergence, this fires continuously, holding the control socket
-mutex and blocking HA session installs.
+Root cause: every `Compile()` call triggers `BumpFIBGeneration()` which rebuilds
+and publishes a complete snapshot (config + route snapshots from config + kernel
+neighbors + policies + NAT rules). During OSPF convergence, `applyConfig()`
+fires continuously (route changes → FRR reload → recompile), holding the control
+socket mutex and blocking HA session installs.
 
 ## 2. Current Architecture
 
@@ -35,8 +36,7 @@ mutex and blocking HA session installs.
 | Config commit | `pkg/daemon/daemon.go` `d.dp.Compile(cfg)` | On commit only |
 | RETH MAC deferred re-compile | `pkg/daemon/daemon.go` | Once per MAC set |
 | HA RG activation/demotion | `pkg/dataplane/userspace/manager_ha.go` `BumpFIBGeneration()` | Per RG transition |
-| FIB generation bump | `pkg/dataplane/userspace/manager.go` `BumpFIBGeneration()` | Per route change |
-| Recompile (eBPF inner) | `pkg/dataplane/compiler.go` `BumpFIBGeneration()` | Per compile |
+| Compile tail (eBPF inner) | `pkg/dataplane/compiler.go` `BumpFIBGeneration()` | Every Compile() |
 | DHCP lease change | `pkg/daemon/daemon.go` `d.applyConfig()` | Per lease |
 | Config sync from peer | `pkg/daemon/daemon_ha.go` `d.applyConfig()` | Per peer push |
 | Status poll catch-up | `pkg/dataplane/userspace/manager.go` `syncSnapshotLocked()` | 1/s poll |
@@ -47,8 +47,10 @@ mutex and blocking HA session installs.
 
 - **Config state**: zones, policies, NAT rules, screens, filters, policers,
   flow export, address books — changes only on commit
-- **FIB state**: `buildRouteSnapshots()` reads kernel routing tables,
-  `buildNeighborSnapshots()` reads ARP/NDP — changes on every route event
+- **FIB state**: `buildRouteSnapshots()` derives routes from config static routes
+  and connected interface prefixes (NOT kernel routing tables);
+  `buildNeighborSnapshots()` reads kernel ARP/NDP via `netlink.NeighList` —
+  changes on every route event / neighbor state change
 - **Interface state**: ifindex mappings, fabric config, tunnel endpoints
 - **HA state**: redundancy group inventory
 
