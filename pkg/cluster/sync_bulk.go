@@ -315,15 +315,11 @@ func (s *SessionSync) writeBarrierMessage(payload []byte, timeout time.Duration)
 		return fmt.Errorf("session sync not connected")
 	}
 	// Pause the sendLoop so it stops writing session data to the TCP
-	// connection. This ensures the barrier isn't queued behind hundreds
-	// of session messages in the kernel TCP send buffer. After the
-	// pause, the sendLoop's current write finishes and writeMu becomes
-	// available for the barrier write.
+	// connection. After the pause, the sendLoop's current write (if any)
+	// finishes and writeMu becomes available. Locking writeMu immediately
+	// ensures the barrier is the next thing written to the TCP stream.
 	s.PauseSendLoop()
 	defer s.ResumeSendLoop()
-	// Brief yield to let sendLoop finish its current write and release writeMu.
-	runtime.Gosched()
-	time.Sleep(2 * time.Millisecond)
 
 	msg := encodeRawMessage(syncMsgBarrier, payload)
 	seq := binary.LittleEndian.Uint64(payload)
