@@ -799,15 +799,20 @@ func (m *Manager) sessionSyncTunnelEndpointLocked(id uint16) (TunnelEndpointSnap
 }
 
 func (m *Manager) syncSessionRequestLocked(req SessionSyncRequest) error {
-	if err := m.requestLocked(ControlRequest{
+	// Build the control request under mu (for data access), then release mu
+	// before the socket I/O so snapshot publishes aren't blocked.
+	ctrlReq := ControlRequest{
 		Type:           "sync_session",
 		SuppressStatus: true,
 		SessionSync:    &req,
-	}, nil); err != nil {
-		slog.Warn("userspace session sync mirror failed", "operation", req.Operation, "err", err)
-		return err
 	}
-	return nil
+	m.mu.Unlock()
+	err := m.requestSessionSync(ctrlReq)
+	m.mu.Lock()
+	if err != nil {
+		slog.Debug("userspace session sync mirror failed", "operation", req.Operation, "err", err)
+	}
+	return err
 }
 
 func (m *Manager) zoneNameByID(zoneID uint16) string {

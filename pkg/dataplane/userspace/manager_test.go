@@ -2080,3 +2080,21 @@ func TestSnapshotContentHashDiffersOnForwardingChange(t *testing.T) {
 		t.Fatal("hashes match despite different zone config")
 	}
 }
+
+func TestSessionSocketPathDerivation(t *testing.T) {
+	m := &Manager{}
+	m.cfg.ControlSocket = "/run/bpfrx/userspace-dp.sock"
+	got := m.sessionSocketPath()
+	want := "/run/bpfrx/userspace-dp-sessions.sock"
+	if got != want {
+		t.Fatalf("sessionSocketPath() = %q, want %q", got, want)
+	}
+}
+
+func TestSessionSocketPathEmpty(t *testing.T) {
+	m := &Manager{}
+	m.cfg.ControlSocket = ""
+	if got := m.sessionSocketPath(); got != "" {
+		t.Fatalf("sessionSocketPath() = %q, want empty", got)
+	}
+}

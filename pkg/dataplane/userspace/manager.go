@@ -68,6 +68,7 @@ type Manager struct {
 	inner *dataplane.Manager
 
 	mu                 sync.Mutex
+	sessionMu          sync.Mutex // separate lock for session sync requests (Phase 3)
 	proc               *exec.Cmd
 	cfg                config.UserspaceConfig
 	clusterHA          bool
@@ -2500,6 +2501,47 @@ func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, er
 		return ControlResponse{}, errors.New(resp.Error)
 	}
 	return resp, nil
+}
+
+// sessionSocketPath returns the path to the dedicated session sync socket.
+func (m *Manager) sessionSocketPath() string {
+	if m.cfg.ControlSocket == "" {
+		return ""
+	}
+	dir := filepath.Dir(m.cfg.ControlSocket)
+	return filepath.Join(dir, "userspace-dp-sessions.sock")
+}
+
+// requestSessionSync sends a session sync request via the dedicated session
+// socket, using sessionMu instead of mu. This ensures session installs from
+// HA sync never block behind snapshot publishes on the main control socket.
+func (m *Manager) requestSessionSync(req ControlRequest) error {
+	sockPath := m.sessionSocketPath()
+	if sockPath == "" {
+		return errors.New("session socket not configured")
+	}
+	m.sessionMu.Lock()
+	defer m.sessionMu.Unlock()
+	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := json.NewEncoder(conn).Encode(&req); err != nil {
+		return err
+	}
+	var resp ControlResponse
+	if err := json.NewDecoder(bufio.NewReader(conn)).Decode(&resp); err != nil {
+		return err
+	}
+	if !resp.OK {
+		if resp.Error == "" {
+			resp.Error = "unknown helper error"
+		}
+		return errors.New(resp.Error)
+	}
+	return nil
 }
 
 func (m *Manager) syncSnapshotLocked() error {

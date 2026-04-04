@@ -108,12 +108,21 @@ fn run() -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| format!("create state dir: {e}"))?;
     }
     let _ = fs::remove_file(&args.control_socket);
+    let session_socket = derive_session_socket_path(&args.control_socket);
+    let _ = fs::remove_file(&session_socket);
 
     let listener = UnixListener::bind(&args.control_socket)
         .map_err(|e| format!("listen {}: {e}", args.control_socket))?;
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("set nonblocking listener: {e}"))?;
+
+    let session_listener = UnixListener::bind(&session_socket)
+        .map_err(|e| format!("listen session {}: {e}", session_socket))?;
+    session_listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("set nonblocking session listener: {e}"))?;
+    eprintln!("bpfrx-userspace-dp: session socket at {}", session_socket);
 
     let state_writer = Arc::new(StateWriter::new());
     let running = Arc::new(AtomicBool::new(true));
@@ -195,14 +204,27 @@ fn run() -> Result<(), String> {
     write_state(&args.state_file, &state)?;
 
     while running.load(Ordering::SeqCst) {
+        let mut handled = false;
         match listener.accept() {
             Ok((stream, _)) => {
                 let _ = handle_stream(stream, &args.state_file, state.clone(), running.clone());
+                handled = true;
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(100));
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(err) => return Err(format!("accept: {err}")),
+        }
+        // Session socket: dedicated channel for sync_session requests so
+        // they never queue behind snapshot publishes on the main socket.
+        match session_listener.accept() {
+            Ok((stream, _)) => {
+                let _ = handle_stream(stream, &args.state_file, state.clone(), running.clone());
+                handled = true;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => return Err(format!("accept session: {err}")),
+        }
+        if !handled {
+            thread::sleep(Duration::from_millis(50));
         }
     }
     {
@@ -213,7 +235,17 @@ fn run() -> Result<(), String> {
     afxdp::remove_kernel_rst_suppression();
     write_state(&args.state_file, &state)?;
     let _ = fs::remove_file(&args.control_socket);
+    let _ = fs::remove_file(&session_socket);
     Ok(())
+}
+
+/// Derive the session socket path from the control socket path.
+/// `/run/bpfrx/userspace-dp.sock` -> `/run/bpfrx/userspace-dp-sessions.sock`
+fn derive_session_socket_path(control_socket: &str) -> String {
+    match control_socket.rsplit_once('/') {
+        Some((dir, _)) => format!("{}/userspace-dp-sessions.sock", dir),
+        None => "userspace-dp-sessions.sock".to_string(),
+    }
 }
 
 /// Derive the event socket path from the control socket path.
