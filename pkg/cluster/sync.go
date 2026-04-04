@@ -180,7 +180,6 @@ type SessionSync struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	sendCh     chan []byte // buffered channel for outgoing messages
-	barrierCh  chan []byte // priority channel for barrier/ack messages (bypasses bulk backlog)
 	// incrementalPauseDepth temporarily pauses background incremental
 	// producers (periodic sweeps) during HA demotion handoff so ordered
 	// demotion barriers are not queued behind unrelated backlog.
@@ -332,7 +331,6 @@ func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *Session
 		peerAddr:              peerAddr,
 		dp:                    dp,
 		sendCh:                make(chan []byte, 4096),
-		barrierCh:             make(chan []byte, 64),
 		deleteJournalCap:      deleteJournalDefaultCap,
 		failoverWaiters:       make(map[int]failoverWaiter),
 		failoverCommitWaiters: make(map[int]failoverWaiter),
@@ -349,7 +347,6 @@ func NewDualSessionSync(local, peer, local1, peer1 string, dp dataplane.DataPlan
 		peerAddr1:             peer1,
 		dp:                    dp,
 		sendCh:                make(chan []byte, 4096),
-		barrierCh:             make(chan []byte, 64),
 		deleteJournalCap:      deleteJournalDefaultCap,
 		failoverWaiters:       make(map[int]failoverWaiter),
 		failoverCommitWaiters: make(map[int]failoverWaiter),
@@ -1368,19 +1365,9 @@ func (s *SessionSync) sendLoop(ctx context.Context) {
 	}
 
 	for {
-		// Priority: drain all pending barriers before any bulk/session data.
-		select {
-		case msg := <-s.barrierCh:
-			sendOne(msg)
-			continue
-		default:
-		}
-		// No barrier pending — wait for either channel.
 		select {
 		case <-ctx.Done():
 			return
-		case msg := <-s.barrierCh:
-			sendOne(msg)
 		case msg := <-s.sendCh:
 			sendOne(msg)
 		}

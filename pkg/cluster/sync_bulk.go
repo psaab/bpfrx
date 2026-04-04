@@ -249,13 +249,10 @@ func (s *SessionSync) sendBarrierAck(conn net.Conn, seq uint64) {
 	if conn == nil {
 		return
 	}
-	// Write barrier ack directly under writeMu instead of going through
-	// barrierCh → sendLoop. The sendLoop may be blocked on writeMu
-	// (held by BulkSync writing session data), so routing through
-	// barrierCh doesn't help — the ack sits in the channel while
-	// sendLoop is stuck. Direct write with writeMu guarantees the ack
-	// is sent as soon as the current BulkSync per-session write releases
-	// the lock (each session write is <1ms).
+	// Write barrier ack directly under writeMu. If the send loop is
+	// blocked behind bulk/session writes, routing the ack through sendCh
+	// would delay the response behind traffic that doesn't need FIFO
+	// ordering with the ack itself.
 	var payload [24]byte
 	binary.LittleEndian.PutUint64(payload[:], seq)
 	stats := s.Stats()
@@ -291,8 +288,7 @@ func (s *SessionSync) sendBulkAck(conn net.Conn, epoch uint64) {
 		return
 	}
 	// Write bulk ack directly under writeMu — same rationale as
-	// sendBarrierAck: the sendLoop may be blocked on writeMu during
-	// BulkSync writes, so routing through barrierCh doesn't help.
+	// sendBarrierAck.
 	var payload [8]byte
 	binary.LittleEndian.PutUint64(payload[:], epoch)
 	s.writeMu.Lock()
@@ -314,9 +310,9 @@ func (s *SessionSync) writeBarrierMessage(payload []byte, timeout time.Duration)
 	if conn == nil {
 		return fmt.Errorf("session sync not connected")
 	}
-	// Barrier requests go through sendCh (not barrierCh) to preserve
-	// ordering with already-queued session messages. The peer's ack must
-	// prove it processed every earlier delta, not just the barrier itself.
+	// Barrier requests go through sendCh to preserve ordering with
+	// already-queued session messages. The peer's ack must prove it
+	// processed every earlier delta, not just the barrier itself.
 	msg := encodeRawMessage(syncMsgBarrier, payload)
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()

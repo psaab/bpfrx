@@ -18,10 +18,19 @@ func readSyncMessage(t *testing.T, conn net.Conn) (uint8, []byte) {
 	t.Helper()
 
 	var hdr [syncHeaderSize]byte
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
 	if _, err := io.ReadFull(conn, hdr[:]); err != nil {
 		t.Fatalf("read sync header: %v", err)
 	}
+	if string(hdr[0:4]) != "BPSY" {
+		t.Fatalf("bad sync magic: %q", hdr[0:4])
+	}
 	payloadLen := binary.LittleEndian.Uint32(hdr[8:12])
+	if payloadLen > 1<<20 {
+		t.Fatalf("unexpected sync payload length: %d", payloadLen)
+	}
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(conn, payload); err != nil {
 		t.Fatalf("read sync payload: %v", err)
@@ -1852,8 +1861,8 @@ func TestWaitForPeerBarrierCompletesOnAck(t *testing.T) {
 	ss.mu.Unlock()
 	ss.stats.Connected.Store(true)
 
-	// Start sendLoop so barrier messages queued to barrierCh are written
-	// to the connection.
+	// Start sendLoop so barrier messages queued to sendCh are written to
+	// the connection.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go ss.sendLoop(ctx)
@@ -1909,22 +1918,14 @@ func TestWaitForPeerBarrierPreservesQueuedSessionOrdering(t *testing.T) {
 	val := dataplane.SessionValue{State: dataplane.SessStateEstablished}
 	ss.sendCh <- encodeSessionV4(key, val)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go ss.sendLoop(ctx)
+
 	waitDone := make(chan error, 1)
 	go func() {
 		waitDone <- ss.WaitForPeerBarrier(2 * time.Second)
 	}()
-
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for len(ss.sendCh) != 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("expected queued session + barrier, sendCh len=%d", len(ss.sendCh))
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go ss.sendLoop(ctx)
 
 	msgType, _ := readSyncMessage(t, peerConn)
 	if msgType != syncMsgSessionV4 {
