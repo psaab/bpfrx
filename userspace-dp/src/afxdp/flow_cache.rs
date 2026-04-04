@@ -233,14 +233,14 @@ impl FlowCache {
                         self.evictions += 1;
                         return None;
                     }
-                    if entry.stamp.owner_rg_lease_until != 0
-                        && now_secs > entry.stamp.owner_rg_lease_until
-                    {
-                        self.misses += 1;
-                        self.entries[idx] = None;
-                        self.evictions += 1;
-                        return None;
-                    }
+                }
+                if entry.stamp.owner_rg_lease_until != 0
+                    && now_secs > entry.stamp.owner_rg_lease_until
+                {
+                    self.misses += 1;
+                    self.entries[idx] = None;
+                    self.evictions += 1;
+                    return None;
                 }
                 self.hits += 1;
                 return self.entries[idx].as_ref();
@@ -550,6 +550,33 @@ mod tests {
         };
         let hit = cache.lookup(&key, lookup, 51, &rg_epochs);
         assert!(hit.is_none(), "expected miss after HA lease expiry");
+        assert_eq!(cache.evictions, 1);
+    }
+
+    #[test]
+    fn expired_owner_rg_lease_causes_miss_for_out_of_range_rg() {
+        let rg_epochs = default_rg_epochs();
+        let mut cache = FlowCache::new();
+        let key = make_key();
+        let stamp = FlowCacheStamp {
+            config_generation: 1,
+            fib_generation: 1,
+            owner_rg_id: MAX_RG_EPOCHS as i32 + 4,
+            owner_rg_epoch: 0,
+            owner_rg_lease_until: 50,
+        };
+        cache.insert(make_entry(key.clone(), stamp, stamp.owner_rg_id));
+
+        let lookup = FlowCacheLookup {
+            ingress_ifindex: 7,
+            config_generation: 1,
+            fib_generation: 1,
+        };
+        let hit = cache.lookup(&key, lookup, 51, &rg_epochs);
+        assert!(
+            hit.is_none(),
+            "expected miss after HA lease expiry even for out-of-range owner RG"
+        );
         assert_eq!(cache.evictions, 1);
     }
 
