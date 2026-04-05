@@ -2552,6 +2552,65 @@ func stripCIDR(s string) string {
 	return ip.String()
 }
 
+// preinstallSnapshotNeighbors reads neighbor entries from the active config's
+// last snapshot and pre-installs them into the kernel ARP/NDP table using
+// netlink. This is instant (no ARP round-trip) and ensures the first
+// forwarded packet after failback has a resolved next-hop MAC.
+func (d *Daemon) preinstallSnapshotNeighbors() {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	var installed int
+	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
+		for _, unit := range ifc.Units {
+			if unit == nil {
+				continue
+			}
+			linuxName := config.LinuxIfName(name)
+			if unit.Number != 0 {
+				linuxName = fmt.Sprintf("%s.%d", linuxName, unit.Number)
+			}
+			link, err := netlink.LinkByName(linuxName)
+			if err != nil || link == nil {
+				continue
+			}
+			for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+				neighs, err := netlink.NeighList(link.Attrs().Index, family)
+				if err != nil {
+					continue
+				}
+				for _, neigh := range neighs {
+					if neigh.HardwareAddr == nil || len(neigh.HardwareAddr) == 0 {
+						continue
+					}
+					if neigh.State == netlink.NUD_FAILED || neigh.State == netlink.NUD_NOARP {
+						continue
+					}
+					// Re-install with NUD_REACHABLE to refresh the entry.
+					entry := netlink.Neigh{
+						LinkIndex:    link.Attrs().Index,
+						Family:       family,
+						State:        netlink.NUD_REACHABLE,
+						IP:           neigh.IP,
+						HardwareAddr: neigh.HardwareAddr,
+					}
+					if err := netlink.NeighSet(&entry); err == nil {
+						installed++
+					}
+				}
+			}
+		}
+	}
+	if installed > 0 {
+		slog.Info("preinstalled kernel neighbor entries from snapshot",
+			"count", installed)
+	}
+}
+
 // resolveNeighborsImmediate sends ARP/NDP probes for config-based next-hops
 // without the follow-up sleep. Used during failover activation where the
 // probes must go out immediately but we cannot block the event handler for

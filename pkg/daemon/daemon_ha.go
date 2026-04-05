@@ -2653,13 +2653,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				// Then remove blackhole routes — FIB lookups must
 				// succeed for synced sessions.
 				d.removeBlackholeRoutes(ev.GroupID)
-				// Resolve config-based next-hops synchronously so
-				// ARP probes go out before the event loop continues.
-				// Safe before VIP installation: targets are gateway
-				// next-hops and DNAT/static-NAT hosts resolved via
-				// RouteGet on already-configured interfaces — no
-				// dependency on RETH VIPs (added later by VRRP MASTER
-				// or directAddVIPs).
+				d.preinstallSnapshotNeighbors()
 				if cfg := d.store.ActiveConfig(); cfg != nil {
 					d.resolveNeighborsImmediate(cfg)
 				}
@@ -2817,10 +2811,12 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					} else {
 						s.ApplyIfCurrent(tr)
 					}
-					// Resolve config-based next-hops synchronously so
-					// ARP probes go out before the event loop continues.
-					// VIPs are already installed by VRRP becomeMaster().
-					// Uses the no-wait variant to avoid blocking 500ms.
+					// Pre-install kernel neighbor entries from the snapshot
+					// so the first forwarded packet has a resolved next-hop.
+					// This is instant (netlink syscall, no ARP round-trip)
+					// and eliminates the ~33 neighbor misses that kill TCP
+					// streams during failback (#475).
+					d.preinstallSnapshotNeighbors()
 					if cfg := d.store.ActiveConfig(); cfg != nil {
 						d.resolveNeighborsImmediate(cfg)
 					}
