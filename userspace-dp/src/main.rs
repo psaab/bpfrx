@@ -225,7 +225,7 @@ fn run() -> Result<(), String> {
                         }
                         Err(err) => {
                             eprintln!("bpfrx-userspace-dp: accept session: {err}");
-                            break;
+                            continue;
                         }
                     }
                 }
@@ -246,7 +246,9 @@ fn run() -> Result<(), String> {
     }
 
     // Wait for the session thread to finish.
-    let _ = session_thread.join();
+    if let Err(panic) = session_thread.join() {
+        eprintln!("bpfrx-userspace-dp: session thread panicked: {panic:?}");
+    }
     {
         let mut guard = state.lock().expect("state poisoned");
         guard.afxdp.stop_with_event_stream();
