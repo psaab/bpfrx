@@ -398,6 +398,11 @@ impl Coordinator {
             self.forwarding.neighbors.insert((*ifindex, *ip), *entry);
         }
         if replace || !neighbors.is_empty() {
+            // Clone the full ForwardingState to publish neighbor changes.
+            // This copies routes/policies too, but update_neighbors fires
+            // infrequently (only when kernel ARP/NDP changes, gated by
+            // neighborsEqual in the Go manager). The clone cost is
+            // negligible vs packet processing.
             self.shared_forwarding
                 .store(Arc::new(self.forwarding.clone()));
         }
@@ -1104,6 +1109,7 @@ impl Coordinator {
                 if neigh.ifindex <= 0
                     || !neighbor_state_usable_str(&neigh.state)
                     || neigh.mac.is_empty()
+                    || parse_mac_str(&neigh.mac).is_none()
                 {
                     return None;
                 }
