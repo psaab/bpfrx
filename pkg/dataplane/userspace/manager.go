@@ -3599,6 +3599,112 @@ type userspaceBindingValue struct {
 	Flags uint32
 }
 
+// verifyBindingsMapLocked reads the BPF userspace_bindings map and compares
+// each entry against the helper's last reported binding status. If the helper
+// reports a binding as Registered+Armed (meaning the XSK socket exists and the
+// queue is armed for redirect) but the BPF map entry is all zeros (no slot,
+// no flags), the BPF map is stale — the XDP shim has nothing to redirect to
+// and all transit traffic silently drops.
+//
+// This can happen after a peer crash+reconnect when Compile() calls
+// programBootstrapMapsLocked() which zeros the bindings map, and then either:
+//   - applyHelperStatusLocked didn't run (error path)
+//   - another Compile() ran concurrently and re-zeroed the map
+//   - the inner eBPF compile recreated the map from a fresh pin
+//
+// When a mismatch is detected, this method rewrites the BPF map entries from
+// the helper's reported state — the same logic as applyHelperStatusLocked but
+// targeted to only the stale entries. This is cheaper than a full rebind.
+//
+// Returns true if any stale entries were repaired.
+func (m *Manager) verifyBindingsMapLocked() bool {
+	if m.proc == nil || m.proc.Process == nil {
+		return false
+	}
+	// Only check when ctrl is enabled and bindings should be active.
+	// During startup (ctrl=0), the map is expected to be empty.
+	if !m.ctrlWasEnabled {
+		return false
+	}
+	bindings := m.lastStatus.Bindings
+	if len(bindings) == 0 {
+		return false
+	}
+	bindingsMap := m.inner.Map("userspace_bindings")
+	if bindingsMap == nil {
+		return false
+	}
+
+	repaired := 0
+	for _, binding := range bindings {
+		if binding.Ifindex <= 0 {
+			continue
+		}
+		if !binding.Registered || !binding.Armed {
+			continue
+		}
+		idx := uint32(binding.Ifindex)*bindingQueuesPerIface + binding.QueueID
+		var val userspaceBindingValue
+		if err := bindingsMap.Lookup(idx, &val); err != nil {
+			continue
+		}
+		if val.Flags != 0 || val.Slot != 0 {
+			// BPF map entry is populated — no mismatch.
+			continue
+		}
+		// BPF map entry is all zeros but the helper says the queue is
+		// registered and armed. Rewrite the entry.
+		flags := uint32(userspaceBindingReady)
+		newVal := userspaceBindingValue{
+			Slot:  binding.Slot,
+			Flags: flags,
+		}
+		if err := bindingsMap.Update(idx, newVal, ebpf.UpdateAny); err != nil {
+			slog.Warn("userspace: bindings watchdog failed to repair entry",
+				"ifindex", binding.Ifindex, "queue", binding.QueueID,
+				"slot", binding.Slot, "err", err)
+			continue
+		}
+		repaired++
+	}
+
+	// Also repair aliased bindings (VLAN children inheriting parent's XSK).
+	if m.lastSnapshot != nil {
+		for childIfindex, parentIfindex := range buildUserspaceIngressBindingAliases(m.lastSnapshot) {
+			for _, binding := range bindings {
+				if binding.Ifindex != int(parentIfindex) {
+					continue
+				}
+				if !binding.Registered || !binding.Armed || !binding.Bound {
+					continue
+				}
+				idx := childIfindex*bindingQueuesPerIface + binding.QueueID
+				var val userspaceBindingValue
+				if err := bindingsMap.Lookup(idx, &val); err != nil {
+					continue
+				}
+				if val.Flags != 0 || val.Slot != 0 {
+					continue
+				}
+				newVal := userspaceBindingValue{
+					Slot:  binding.Slot,
+					Flags: userspaceBindingReady,
+				}
+				if err := bindingsMap.Update(idx, newVal, ebpf.UpdateAny); err != nil {
+					continue
+				}
+				repaired++
+			}
+		}
+	}
+
+	if repaired > 0 {
+		slog.Warn("userspace: bindings watchdog repaired stale BPF map entries",
+			"repaired", repaired, "total_bindings", len(bindings))
+	}
+	return repaired > 0
+}
+
 type userspaceLocalV6Key struct {
 	Addr [16]byte
 }
@@ -3935,6 +4041,11 @@ func (m *Manager) statusLoop(ctx context.Context) {
 				if err := m.applyHelperStatusLocked(&status); err != nil {
 					slog.Warn("userspace dataplane status sync failed", "err", err)
 				}
+				// Bindings watchdog (#473): verify the BPF map matches
+				// the helper's reported state. If a Compile() or HA
+				// transition zeroed the map without repopulating it,
+				// the XDP shim silently drops all transit traffic.
+				m.verifyBindingsMapLocked()
 				if m.lastSnapshot != nil && m.publishedSnapshot < m.lastSnapshot.Generation {
 					if err := m.syncSnapshotLocked(); err != nil {
 						slog.Warn("userspace dataplane snapshot sync failed", "err", err)

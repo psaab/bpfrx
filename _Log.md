@@ -2,6 +2,10 @@
 
 ## 2026-04-05
 
+- **Timestamp**: 2026-04-05T08:00:00Z
+  - **Action**: Issue #473 — Fix XSK bindings BPF map going stale after peer crash+reconnect. Added `verifyBindingsMapLocked()` watchdog to the 1s status poll loop. After `applyHelperStatusLocked` runs, the watchdog reads each BPF `userspace_bindings` entry and compares it against the helper's reported binding state. If a queue is Registered+Armed in the helper but the BPF map entry is all zeros, the watchdog rewrites the entry. Also repairs aliased bindings (VLAN children). This prevents silent transit traffic drops when a Compile() or HA transition zeroes the bindings map without repopulating it.
+  - **File(s)**: pkg/dataplane/userspace/manager.go
+
 - **Timestamp**: 2026-04-05T06:55:00Z
   - **Action**: Issue #466 — Fix bulk sync triggering on every reconnect/fabric-flip. Added `bulkEverCompleted` atomic flag to SessionSync that tracks whether a full bulk exchange has ever completed during the daemon's lifetime. `handleNewConnection` now only triggers `doBulkSync` on true cold start (flag is false). Active-fabric changes no longer trigger bulk at all. Daemon's `onSessionSyncPeerConnected`/`onSessionSyncPeerDisconnected` preserve primed state and sync readiness when `bulkEverCompleted` is true.
   - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_test.go, pkg/daemon/daemon_ha.go, pkg/daemon/session_sync_readiness_test.go
