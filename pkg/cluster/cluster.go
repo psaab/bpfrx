@@ -191,6 +191,13 @@ type Manager struct {
 	// syncTransport records whether session sync uses "fabric" or
 	// "control-link" transport. Displayed in CLI status.
 	syncTransport string
+
+	// failoverInProgress tracks per-RG failover serialization. When a
+	// ManualFailover is in progress for an RG (including the preHook
+	// barrier wait), a second request for the same RG is rejected
+	// immediately. This prevents back-to-back failover/failback from
+	// racing and hitting "session sync disconnected during barrier wait".
+	failoverInProgress map[int]bool
 }
 
 // DefaultTakeoverHoldTime is the default duration an RG must be ready
@@ -216,6 +223,7 @@ func NewManager(nodeID, clusterID int) *Manager {
 		takeoverHoldTime:               DefaultTakeoverHoldTime,
 		preManualFailoverRetryTimeout:  DefaultPreManualFailoverRetryTimeout,
 		preManualFailoverRetryInterval: DefaultPreManualFailoverRetryInterval,
+		failoverInProgress:             make(map[int]bool),
 	}
 }
 
@@ -668,21 +676,29 @@ func (m *Manager) ManualFailover(rgID int) error {
 		m.mu.Unlock()
 		return fmt.Errorf("redundancy group %d not found", rgID)
 	}
+	if m.failoverInProgress[rgID] {
+		m.mu.Unlock()
+		return fmt.Errorf("failover already in progress for redundancy group %d, please wait", rgID)
+	}
+	m.failoverInProgress[rgID] = true
 	preHook := m.preManualFailoverFn
 	retryTimeout := m.preManualFailoverRetryTimeout
 	retryInterval := m.preManualFailoverRetryInterval
 	m.mu.Unlock()
 
+	var preHookErr error
 	if preHook != nil {
 		deadline := time.Now().Add(retryTimeout)
 		for attempts := 1; ; attempts++ {
 			if err := preHook(rgID); err != nil {
 				if !IsRetryablePreFailoverError(err) {
-					return fmt.Errorf("pre-failover prepare for redundancy group %d: %w", rgID, err)
+					preHookErr = fmt.Errorf("pre-failover prepare for redundancy group %d: %w", rgID, err)
+					break
 				}
 				remaining := time.Until(deadline)
 				if remaining <= 0 {
-					return fmt.Errorf("pre-failover prepare for redundancy group %d: %w", rgID, err)
+					preHookErr = fmt.Errorf("pre-failover prepare for redundancy group %d: %w", rgID, err)
+					break
 				}
 				sleep := retryInterval
 				if sleep <= 0 {
@@ -705,6 +721,16 @@ func (m *Manager) ManualFailover(rgID int) error {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Always clear the in-progress flag under the same lock acquisition
+	// that performs the state change, so there is no window where another
+	// caller can slip in between flag-clear and state-commit.
+	defer delete(m.failoverInProgress, rgID)
+
+	if preHookErr != nil {
+		return preHookErr
+	}
+
 	rg, ok = m.groups[rgID]
 	if !ok {
 		return fmt.Errorf("redundancy group %d not found", rgID)

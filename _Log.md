@@ -2,6 +2,10 @@
 
 ## 2026-04-05
 
+- **Timestamp**: 2026-04-05T15:00:00Z
+  - **Action**: Issue #481 — Serialize per-RG ManualFailover to prevent back-to-back failover/failback from racing. Added `failoverInProgress` map to cluster Manager; ManualFailover rejects a second request for the same RG while one is in progress (including during the preHook barrier wait). The flag is cleared atomically under the same lock as the state change, whether the failover succeeds or fails. Different RGs can still failover concurrently.
+  - **File(s)**: pkg/cluster/cluster.go, pkg/cluster/cluster_test.go
+
 - **Timestamp**: 2026-04-05T12:00:00Z
   - **Action**: Fix TCP stream death on failback due to cold ARP cache on standby node. Root cause: `resolveNeighborsInner()` used `netlink.RouteGet()` to find the outgoing interface for static route next-hops, but on standby nodes the kernel route doesn't exist (FRR only installs it on the active). Added `addByIPOrConfig()` fallback that resolves the outgoing interface from config by matching the next-hop IP against configured interface subnets when the kernel FIB lookup fails.
   - **File(s)**: pkg/daemon/daemon.go
