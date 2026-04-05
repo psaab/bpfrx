@@ -1,5 +1,15 @@
 # Action Log
 
+## 2026-04-03
+
+- **Timestamp**: 2026-04-03
+  - **Action**: Fix #452 — move session socket accept loop to a dedicated thread so session installs (HA sync) are not blocked by main socket operations (status polls, snapshot publishes). Reduces barrier ack latency from 46s+ to concurrent.
+  - **File(s)**: userspace-dp/src/main.rs
+
+- **Timestamp**: 2026-04-03
+  - **Action**: Created design document for snapshot publish redesign — separating config state from FIB state, FIB deltas instead of full rebuilds, content-hash deduplication, separate session channel. Addresses 42s barrier ack delays and control socket contention during route convergence.
+  - **File(s)**: docs/snapshot-publish-redesign.md
+
 ## 2026-04-02
 
 - **Timestamp**: 2026-04-02T20:34:00Z

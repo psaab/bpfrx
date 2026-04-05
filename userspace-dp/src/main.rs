@@ -203,30 +203,50 @@ fn run() -> Result<(), String> {
 
     write_state(&args.state_file, &state)?;
 
+    // Spawn a dedicated thread for the session socket so session installs
+    // (HA sync path) proceed concurrently with main socket operations
+    // (status polls, snapshot publishes). The shared `state` mutex already
+    // protects concurrent access. Fixes #452.
+    let session_thread = {
+        let state = state.clone();
+        let running = running.clone();
+        let state_file = args.state_file.clone();
+        thread::Builder::new()
+            .name("session-socket".to_string())
+            .spawn(move || {
+                while running.load(Ordering::SeqCst) {
+                    match session_listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ =
+                                handle_stream(stream, &state_file, state.clone(), running.clone());
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(err) => {
+                            eprintln!("bpfrx-userspace-dp: accept session: {err}");
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| format!("spawn session thread: {e}"))?
+    };
+
     while running.load(Ordering::SeqCst) {
-        let mut handled = false;
         match listener.accept() {
             Ok((stream, _)) => {
                 let _ = handle_stream(stream, &args.state_file, state.clone(), running.clone());
-                handled = true;
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+            }
             Err(err) => return Err(format!("accept: {err}")),
         }
-        // Session socket: dedicated channel for sync_session requests so
-        // they never queue behind snapshot publishes on the main socket.
-        match session_listener.accept() {
-            Ok((stream, _)) => {
-                let _ = handle_stream(stream, &args.state_file, state.clone(), running.clone());
-                handled = true;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => return Err(format!("accept session: {err}")),
-        }
-        if !handled {
-            thread::sleep(Duration::from_millis(50));
-        }
     }
+
+    // Wait for the session thread to finish.
+    let _ = session_thread.join();
     {
         let mut guard = state.lock().expect("state poisoned");
         guard.afxdp.stop_with_event_stream();
