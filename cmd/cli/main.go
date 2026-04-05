@@ -43,6 +43,9 @@ type remoteMonitorFrame struct {
 	err   error
 }
 
+// TODO: setMonitorRawMode, restoreMonitorTermMode, and monitorInputIsTTY
+// duplicate helpers in pkg/cli/monitor_interface.go. Extract to a shared
+// package (e.g. pkg/termutil) when the remote CLI gains more terminal ops.
 func setMonitorRawMode(fd int) (*unix.Termios, error) {
 	old, err := unix.IoctlGetTermios(fd, unix.TCGETS)
 	if err != nil {
@@ -3170,6 +3173,8 @@ func (c *ctl) handleInteractiveMonitorInterfaceSummary(req *pb.MonitorInterfaceR
 	defer fmt.Print(monitorShowCursor + monitorExitAltScreen)
 
 	keyCh := make(chan byte, 8)
+	doneCh := make(chan struct{})
+	defer close(doneCh)
 	go func() {
 		buf := make([]byte, 1)
 		for {
@@ -3177,7 +3182,11 @@ func (c *ctl) handleInteractiveMonitorInterfaceSummary(req *pb.MonitorInterfaceR
 			if err != nil || n == 0 {
 				return
 			}
-			keyCh <- buf[0]
+			select {
+			case keyCh <- buf[0]:
+			case <-doneCh:
+				return
+			}
 		}
 	}()
 
@@ -3194,12 +3203,11 @@ func (c *ctl) handleInteractiveMonitorInterfaceSummary(req *pb.MonitorInterfaceR
 			streamCancel()
 		}
 		streamGen++
-		reqCopy := &pb.MonitorInterfaceRequest{
-			SummaryMode: mode,
-		}
+		reqCopy := *req
+		reqCopy.SummaryMode = mode
 		gen := streamGen
 		streamCtx, cancelStream := context.WithCancel(ctx)
-		stream, err := c.client.MonitorInterface(streamCtx, reqCopy)
+		stream, err := c.client.MonitorInterface(streamCtx, &reqCopy)
 		if err != nil {
 			cancelStream()
 			return err
