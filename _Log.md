@@ -2,6 +2,10 @@
 
 ## 2026-04-05
 
+- **Timestamp**: 2026-04-05T12:00:00Z
+  - **Action**: Fix TCP stream death on failback due to cold ARP cache on standby node. Root cause: `resolveNeighborsInner()` used `netlink.RouteGet()` to find the outgoing interface for static route next-hops, but on standby nodes the kernel route doesn't exist (FRR only installs it on the active). Added `addByIPOrConfig()` fallback that resolves the outgoing interface from config by matching the next-hop IP against configured interface subnets when the kernel FIB lookup fails.
+  - **File(s)**: pkg/daemon/daemon.go
+
 - **Timestamp**: 2026-04-05T10:00:00Z
   - **Action**: Issue #475 — Fix 0 throughput on pre-existing TCP streams after failover+failback. Root cause: `prewarm_reverse_synced_sessions_for_owner_rgs` published USERSPACE_SESSIONS BPF map entries for reverse sessions but not forward sessions during RG activation. Forward sessions relied on async worker processing, creating a window where the XDP shim had no REDIRECT entry. Added synchronous BPF map publishing for forward sessions in prewarm, plus a comprehensive `republish_bpf_session_entries_for_owner_rgs` that iterates ALL sessions in the `sessions` owner-RG index (not just the `reverse_prewarm` subset) to ensure no session is missed.
   - **File(s)**: userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/session_glue.rs

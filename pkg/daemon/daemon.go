@@ -2629,7 +2629,53 @@ func (d *Daemon) resolveNeighborsInner(cfg *config.Config, waitForReplies bool) 
 		addByLink(ip, link.Attrs().Index)
 	}
 
-	// 1. Static route next-hops (resolve interface via FIB if not specified)
+	// addByIPOrConfig first tries the kernel FIB (addByIP). If the kernel
+	// has no route (e.g. standby node where FRR hasn't installed the route),
+	// fall back to finding the outgoing interface from the config by matching
+	// the next-hop IP against configured interface subnets. This keeps ARP
+	// warm on standby nodes so failback doesn't lose packets to ARP delay.
+	addByIPOrConfig := func(ipStr string) {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			return
+		}
+		// Try kernel FIB first — this is the fast/common path on active nodes.
+		routes, err := netlink.RouteGet(ip)
+		if err == nil && len(routes) > 0 {
+			neighborIP := ip
+			if gw := routes[0].Gw; gw != nil && !gw.IsUnspecified() {
+				neighborIP = gw
+			}
+			addByLink(neighborIP, routes[0].LinkIndex)
+			return
+		}
+		// Kernel has no route — find the interface from config by subnet match.
+		for _, ifc := range cfg.Interfaces.Interfaces {
+			for _, unit := range ifc.Units {
+				for _, addrStr := range unit.Addresses {
+					_, ipNet, err := net.ParseCIDR(addrStr)
+					if err != nil {
+						continue
+					}
+					if ipNet.Contains(ip) {
+						linuxName := resolveJunosIfName(cfg, ifc.Name)
+						link, err := netlink.LinkByName(linuxName)
+						if err != nil {
+							continue
+						}
+						slog.Debug("neighbor warmup: resolved next-hop via config subnet",
+							"nexthop", ipStr, "iface", linuxName, "subnet", addrStr)
+						addByLink(ip, link.Attrs().Index)
+						return
+					}
+				}
+			}
+		}
+	}
+
+	// 1. Static route next-hops (resolve interface via FIB if not specified).
+	// Uses addByIPOrConfig so standby nodes without the kernel route still
+	// resolve next-hops via config subnet matching (keeps ARP cache warm).
 	allStaticRoutes := append(cfg.RoutingOptions.StaticRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
 	for _, sr := range allStaticRoutes {
 		if sr.Discard {
@@ -2642,12 +2688,12 @@ func (d *Daemon) resolveNeighborsInner(cfg *config.Config, waitForReplies bool) 
 			if nh.Interface != "" {
 				addByName(nh.Address, nh.Interface)
 			} else {
-				addByIP(nh.Address)
+				addByIPOrConfig(nh.Address)
 			}
 		}
 	}
 	for _, ri := range cfg.RoutingInstances {
-		for _, sr := range ri.StaticRoutes {
+		for _, sr := range append(ri.StaticRoutes, ri.Inet6StaticRoutes...) {
 			if sr.Discard {
 				continue
 			}
@@ -2658,7 +2704,7 @@ func (d *Daemon) resolveNeighborsInner(cfg *config.Config, waitForReplies bool) 
 				if nh.Interface != "" {
 					addByName(nh.Address, nh.Interface)
 				} else {
-					addByIP(nh.Address)
+					addByIPOrConfig(nh.Address)
 				}
 			}
 		}
