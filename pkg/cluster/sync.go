@@ -44,6 +44,7 @@ const (
 	syncMsgFailoverAck       = 16 // failover request result (payload: rgID, status, detail)
 	syncMsgFailoverCommit    = 17 // failover ownership commit (payload: rgID, reqID)
 	syncMsgFailoverCommitAck = 18 // failover commit result (payload: rgID, status, detail)
+	syncMsgPrepareActivation = 19 // hint: demoting node tells peer to pre-warm neighbors (payload: 1 byte rgID)
 )
 
 // syncHeader is the wire header for each sync message.
@@ -208,6 +209,12 @@ type SessionSync struct {
 	// this node to disable all RGs (set rg_active=false). The receiver should
 	// call dp.UpdateRGActive(rgID, false) for every RG.
 	OnFenceReceived func()
+
+	// OnPrepareActivation is called when the demoting peer has completed its
+	// preflight and is about to resign VRRP. The activating node should
+	// pre-install neighbor entries and warm the ARP/NDP cache so that
+	// bpf_fib_lookup succeeds for the first packet after VRRP MASTER (#485).
+	OnPrepareActivation func(rgID int)
 
 	// OnBulkSyncReceived is called when a bulk sync transfer completes
 	// (syncMsgBulkEnd received). The secondary uses this to release VRRP
@@ -1291,6 +1298,33 @@ func (s *SessionSync) SendFence() error {
 	return nil
 }
 
+// SendPrepareActivation tells the peer to pre-install neighbor entries
+// and warm its ARP/NDP cache for the given RG. Sent by the demoting node
+// after its preflight completes, just before VRRP resign. Best-effort:
+// if the send fails, the activation path still works (slightly slower
+// neighbor resolution via warmNeighborCache).
+func (s *SessionSync) SendPrepareActivation(rgID int) {
+	if rgID < 0 || rgID > 255 {
+		slog.Warn("cluster sync: prepare_activation rgID out of range", "rg", rgID)
+		return
+	}
+	conn := s.getActiveConn()
+	if conn == nil {
+		return
+	}
+	payload := []byte{byte(rgID)}
+	s.writeMu.Lock()
+	err := writeMsg(conn, syncMsgPrepareActivation, payload)
+	s.writeMu.Unlock()
+	if err != nil {
+		slog.Debug("cluster sync: prepare_activation send error", "rg", rgID, "err", err)
+		s.stats.Errors.Add(1)
+		s.handleDisconnect(conn)
+		return
+	}
+	slog.Info("cluster sync: prepare_activation sent to peer", "rg", rgID)
+}
+
 // BulkSync sends the entire session table to the connected peer.
 // Serialized by bulkSendMu so concurrent callers cannot interleave.
 func (s *SessionSync) sendClockSync(conn net.Conn) {
@@ -1874,6 +1908,18 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		s.clockSynced.Store(true)
 		slog.Info("cluster sync: clock synced with peer",
 			"peer_mono", peerMono, "local_mono", localMono, "offset", offset)
+
+	case syncMsgPrepareActivation:
+		if len(payload) < 1 {
+			slog.Warn("cluster sync: prepare_activation message too short")
+			return
+		}
+		rgID := int(payload[0])
+		slog.Info("cluster sync: prepare_activation received from demoting peer", "rg", rgID)
+		if s.OnPrepareActivation != nil {
+			go s.OnPrepareActivation(rgID)
+		}
+
 	case syncMsgBarrier:
 		if len(payload) < 8 {
 			slog.Warn("cluster sync: barrier message too short")
