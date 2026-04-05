@@ -2,6 +2,10 @@
 
 ## 2026-04-05
 
+- **Timestamp**: 2026-04-05T10:00:00Z
+  - **Action**: Issue #475 — Fix 0 throughput on pre-existing TCP streams after failover+failback. Root cause: `prewarm_reverse_synced_sessions_for_owner_rgs` published USERSPACE_SESSIONS BPF map entries for reverse sessions but not forward sessions during RG activation. Forward sessions relied on async worker processing, creating a window where the XDP shim had no REDIRECT entry. Added synchronous BPF map publishing for forward sessions in prewarm, plus a comprehensive `republish_bpf_session_entries_for_owner_rgs` that iterates ALL sessions in the `sessions` owner-RG index (not just the `reverse_prewarm` subset) to ensure no session is missed.
+  - **File(s)**: userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/session_glue.rs
+
 - **Timestamp**: 2026-04-05T08:00:00Z
   - **Action**: Issue #473 — Fix XSK bindings BPF map going stale after peer crash+reconnect. Added `verifyBindingsMapLocked()` watchdog to the 1s status poll loop. After `applyHelperStatusLocked` runs, the watchdog reads each BPF `userspace_bindings` entry and compares it against the helper's reported binding state. If a queue is Registered+Armed in the helper but the BPF map entry is all zeros, the watchdog rewrites the entry. Also repairs aliased bindings (VLAN children). This prevents silent transit traffic drops when a Compile() or HA transition zeroes the bindings map without repopulating it.
   - **File(s)**: pkg/dataplane/userspace/manager.go

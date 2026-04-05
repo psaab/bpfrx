@@ -128,6 +128,26 @@ impl super::Coordinator {
                 &activated_rgs,
                 now_secs,
             );
+            // Republish USERSPACE_SESSIONS BPF map entries for ALL shared
+            // sessions belonging to the activated RGs (#475). The prewarm
+            // above covers the reverse_prewarm index subset; this catch-all
+            // ensures sessions that were only in the sessions index (e.g.
+            // locally originated then demoted) also get their BPF entries
+            // restored. Without this, the XDP shim has no REDIRECT entry
+            // and packets arrive as session misses until the worker
+            // asynchronously processes ApplyHAState.
+            let republished = republish_bpf_session_entries_for_owner_rgs(
+                &self.shared_sessions,
+                &self.shared_owner_rg_indexes,
+                session_map_fd,
+                &activated_rgs,
+            );
+            if republished > 0 {
+                eprintln!(
+                    "bpfrx-ha: republished {} USERSPACE_SESSIONS entries for activated RGs {:?}",
+                    republished, activated_rgs
+                );
+            }
             // Bump RG epochs for activated RGs so flow cache entries with
             // stale HA state are invalidated.
             for rg_id in &activated_rgs {
