@@ -2,6 +2,10 @@
 
 ## 2026-04-03
 
+- **Timestamp**: 2026-04-03T18:00:00Z
+  - **Action**: Issue #457 — Fix standby losing userspace readiness after partial RG demotion. The rgTransitionInFlight flag in UpdateRGActive was unconditionally set for both activation and demotion. During demotion, this caused ctrl.Enabled=0 in the BPF map globally, disrupting forwarding for other active RGs. Now only set rgTransitionInFlight during activation transitions; demotion leaves ctrl enabled so other RGs continue forwarding.
+  - **File(s)**: pkg/dataplane/userspace/manager_ha.go, pkg/dataplane/userspace/manager_test.go
+
 - **Timestamp**: 2026-04-03T12:00:00Z
   - **Action**: Issue #451 — Fix neighbor miss spike after RG failover. Part 1: resolve config-based next-hops synchronously during RG activation (VRRP MASTER and cluster-primary paths) using new `resolveNeighborsImmediate` variant that sends ARP probes without blocking for replies. Part 2: increase failover test neighbor miss threshold from 20 to 60 to accommodate observed spikes of 25-52.
   - **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha.go, scripts/userspace-ha-failover-validation.sh

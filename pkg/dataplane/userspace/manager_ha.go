@@ -373,8 +373,16 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	// sends the same state → no delta detected → no FlushFlowCaches.
 	// By sending directly with the groups we already have, we guarantee
 	// the helper sees the transition.
-	m.rgTransitionInFlight.Store(true)
-	defer m.rgTransitionInFlight.Store(false)
+	//
+	// Only suppress ctrl during ACTIVATION transitions. During demotion,
+	// ctrl can stay enabled — the demoted RG's sessions are cleaned up by
+	// the helper, and rg_active in BPF is already 0. Disabling ctrl
+	// globally during demotion disrupts forwarding for other active RGs
+	// and causes the standby to lose userspace readiness (#457).
+	if active {
+		m.rgTransitionInFlight.Store(true)
+		defer m.rgTransitionInFlight.Store(false)
+	}
 	groups := make([]HAGroupStatus, 0, len(m.haGroups))
 	for _, g := range m.haGroups {
 		groups = append(groups, g)
