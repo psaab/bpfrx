@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -546,6 +547,101 @@ func TestRequestPeerFailoverRequiresLocalTransferReadiness(t *testing.T) {
 	}
 	if called {
 		t.Fatal("peer failover request should not be sent while transfer readiness is false")
+	}
+}
+
+func TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+	if err := m.ManualFailover(0); err != nil {
+		t.Fatalf("ManualFailover() error = %v", err)
+	}
+	<-m.Events()
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+	m.mu.Lock()
+	m.groups[0].Ready = true
+	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+	m.groups[0].ReadinessReasons = nil
+	m.mu.Unlock()
+
+	m.SetTransferReadinessFunc(func(rgID int) (bool, []string) {
+		return false, []string{"session sync disconnected"}
+	})
+	m.SetPeerFailoverFunc(func(rgID int) (uint64, error) {
+		t.Fatal("peer failover request should not be sent while transfer readiness is false")
+		return 0, nil
+	})
+	m.SetPeerFailoverCommitFunc(func(rgID int, reqID uint64) error {
+		t.Fatal("peer failover commit should not run while transfer readiness is false")
+		return nil
+	})
+
+	err := m.RequestPeerFailover(0)
+	if err == nil {
+		t.Fatal("expected local transfer readiness error")
+	}
+	state := m.GroupState(0)
+	if !state.ManualFailover {
+		t.Fatal("manual failover should remain set after transfer readiness rejection")
+	}
+	if state.State != StateSecondaryHold {
+		t.Fatalf("state = %s, want secondary-hold", state.State)
+	}
+}
+
+func TestRequestPeerFailoverPeerSendFailurePreservesManualFailover(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+	if err := m.ManualFailover(0); err != nil {
+		t.Fatalf("ManualFailover() error = %v", err)
+	}
+	<-m.Events()
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+	m.mu.Lock()
+	m.groups[0].Ready = true
+	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+	m.groups[0].ReadinessReasons = nil
+	m.mu.Unlock()
+
+	m.SetTransferReadinessFunc(func(rgID int) (bool, []string) {
+		return true, nil
+	})
+	m.SetPeerFailoverFunc(func(rgID int) (uint64, error) {
+		return 0, errors.New("peer sync write failed")
+	})
+	m.SetPeerFailoverCommitFunc(func(rgID int, reqID uint64) error {
+		t.Fatal("peer failover commit should not run when the request send fails")
+		return nil
+	})
+
+	err := m.RequestPeerFailover(0)
+	if err == nil {
+		t.Fatal("expected peer failover send error")
+	}
+	state := m.GroupState(0)
+	if !state.ManualFailover {
+		t.Fatal("manual failover should remain set after peer request send failure")
+	}
+	if state.State != StateSecondaryHold {
+		t.Fatalf("state = %s, want secondary-hold", state.State)
 	}
 }
 
