@@ -1537,7 +1537,7 @@ mod tests {
     use super::super::forwarding_build::*;
     use super::super::test_fixtures::*;
     use super::*;
-    use crate::{FabricSnapshot, SourceNATRuleSnapshot};
+    use crate::{FabricSnapshot, NeighborSnapshot, SourceNATRuleSnapshot};
 
     fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
         HAGroupRuntime {
@@ -1851,7 +1851,7 @@ mod tests {
 
     #[test]
     fn manager_neighbor_replace_preserves_packet_learned_entries() {
-        let coordinator = Coordinator::new();
+        let mut coordinator = Coordinator::new();
         {
             let mut neighbors = coordinator
                 .dynamic_neighbors_ref()
@@ -1893,6 +1893,123 @@ mod tests {
             ))
         )));
         assert!(neighbors.contains_key(&(13, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)))));
+    }
+
+    #[test]
+    fn manager_neighbor_replace_overrides_snapshot_neighbor_entry() {
+        let mut coordinator = Coordinator::new();
+        let target = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+        coordinator.refresh_runtime_snapshot(&ConfigSnapshot {
+            neighbors: vec![NeighborSnapshot {
+                ifindex: 13,
+                family: "inet".to_string(),
+                ip: target.to_string(),
+                mac: "00:11:22:33:44:55".to_string(),
+                state: "reachable".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let before = lookup_neighbor_entry(
+            &coordinator.forwarding,
+            Some(coordinator.dynamic_neighbors_ref()),
+            13,
+            target,
+        )
+        .expect("snapshot neighbor");
+        assert_eq!(before.mac, [0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+
+        coordinator.apply_manager_neighbors(
+            true,
+            &[(
+                13,
+                target,
+                NeighborEntry {
+                    mac: [0x56, 0x4a, 0xe8, 0x1e, 0xa8, 0x32],
+                },
+            )],
+        );
+
+        let after = lookup_neighbor_entry(
+            &coordinator.forwarding,
+            Some(coordinator.dynamic_neighbors_ref()),
+            13,
+            target,
+        )
+        .expect("updated manager neighbor");
+        assert_eq!(after.mac, [0x56, 0x4a, 0xe8, 0x1e, 0xa8, 0x32]);
+    }
+
+    #[test]
+    fn manager_neighbor_replace_removes_snapshot_seeded_neighbor_entry() {
+        let mut coordinator = Coordinator::new();
+        let target = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+        coordinator.refresh_runtime_snapshot(&ConfigSnapshot {
+            neighbors: vec![NeighborSnapshot {
+                ifindex: 13,
+                family: "inet".to_string(),
+                ip: target.to_string(),
+                mac: "00:11:22:33:44:55".to_string(),
+                state: "reachable".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        coordinator.apply_manager_neighbors(true, &[]);
+
+        assert!(
+            lookup_neighbor_entry(
+                &coordinator.forwarding,
+                Some(coordinator.dynamic_neighbors_ref()),
+                13,
+                target,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn refresh_runtime_snapshot_clears_old_manager_neighbor_cache_entries() {
+        let mut coordinator = Coordinator::new();
+        let target = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
+        coordinator.apply_manager_neighbors(
+            true,
+            &[(
+                13,
+                target,
+                NeighborEntry {
+                    mac: [0x56, 0x4a, 0xe8, 0x1e, 0xa8, 0x32],
+                },
+            )],
+        );
+        assert!(
+            coordinator
+                .dynamic_neighbors_ref()
+                .lock()
+                .expect("neighbors")
+                .contains_key(&(13, target))
+        );
+
+        coordinator.refresh_runtime_snapshot(&ConfigSnapshot::default());
+
+        assert!(
+            !coordinator
+                .dynamic_neighbors_ref()
+                .lock()
+                .expect("neighbors")
+                .contains_key(&(13, target))
+        );
+        assert!(
+            lookup_neighbor_entry(
+                &coordinator.forwarding,
+                Some(coordinator.dynamic_neighbors_ref()),
+                13,
+                target,
+            )
+            .is_none()
+        );
     }
 
     #[test]

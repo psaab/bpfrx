@@ -359,25 +359,52 @@ impl Coordinator {
     }
 
     pub fn apply_manager_neighbors(
-        &self,
+        &mut self,
         replace: bool,
         neighbors: &[(i32, IpAddr, NeighborEntry)],
     ) {
-        let Ok(mut cache) = self.dynamic_neighbors.lock() else {
-            return;
+        let old_manager_keys = if replace {
+            self.manager_neighbor_keys
+                .lock()
+                .map(|manager_keys| manager_keys.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         };
-        let Ok(mut manager_keys) = self.manager_neighbor_keys.lock() else {
-            return;
-        };
+        if let Ok(mut manager_keys) = self.manager_neighbor_keys.lock() {
+            if replace {
+                manager_keys.clear();
+            }
+            for (ifindex, ip, _) in neighbors {
+                manager_keys.insert((*ifindex, *ip));
+            }
+        }
+        if let Ok(mut cache) = self.dynamic_neighbors.lock() {
+            if replace {
+                for key in &old_manager_keys {
+                    cache.remove(key);
+                }
+            }
+            for (ifindex, ip, entry) in neighbors {
+                cache.insert((*ifindex, *ip), *entry);
+            }
+        }
         if replace {
-            for key in manager_keys.drain() {
-                cache.remove(&key);
+            for key in &old_manager_keys {
+                self.forwarding.neighbors.remove(key);
             }
         }
         for (ifindex, ip, entry) in neighbors {
-            let key = (*ifindex, *ip);
-            cache.insert(key, *entry);
-            manager_keys.insert(key);
+            self.forwarding.neighbors.insert((*ifindex, *ip), *entry);
+        }
+        if replace || !neighbors.is_empty() {
+            // Clone the full ForwardingState to publish neighbor changes.
+            // This copies routes/policies too, but update_neighbors fires
+            // infrequently (only when kernel ARP/NDP changes, gated by
+            // neighborsEqual in the Go manager). The clone cost is
+            // negligible vs packet processing.
+            self.shared_forwarding
+                .store(Arc::new(self.forwarding.clone()));
         }
         self.neighbor_generation.fetch_add(1, Ordering::Relaxed);
     }
@@ -1075,6 +1102,36 @@ impl Coordinator {
     }
 
     pub fn refresh_runtime_snapshot(&mut self, snapshot: &crate::ConfigSnapshot) {
+        let next_manager_keys = snapshot
+            .neighbors
+            .iter()
+            .filter_map(|neigh| {
+                if neigh.ifindex <= 0
+                    || !neighbor_state_usable_str(&neigh.state)
+                    || neigh.mac.is_empty()
+                    || parse_mac_str(&neigh.mac).is_none()
+                {
+                    return None;
+                }
+                neigh
+                    .ip
+                    .parse::<IpAddr>()
+                    .ok()
+                    .map(|ip| (neigh.ifindex, ip))
+            })
+            .collect::<FastSet<_>>();
+        let old_manager_keys = if let Ok(mut manager_keys) = self.manager_neighbor_keys.lock() {
+            let old = manager_keys.iter().copied().collect::<Vec<_>>();
+            *manager_keys = next_manager_keys;
+            old
+        } else {
+            Vec::new()
+        };
+        if let Ok(mut cache) = self.dynamic_neighbors.lock() {
+            for key in &old_manager_keys {
+                cache.remove(key);
+            }
+        }
         self.validation = ValidationState {
             snapshot_installed: true,
             config_generation: snapshot.generation,
@@ -1092,7 +1149,12 @@ impl Coordinator {
             // Merge: for each preserved fabric, if the new snapshot
             // doesn't have a matching parent_ifindex, keep the old one.
             for old in &preserved_fabrics {
-                if !self.forwarding.fabrics.iter().any(|f| f.parent_ifindex == old.parent_ifindex) {
+                if !self
+                    .forwarding
+                    .fabrics
+                    .iter()
+                    .any(|f| f.parent_ifindex == old.parent_ifindex)
+                {
                     self.forwarding.fabrics.push(*old);
                 }
             }
