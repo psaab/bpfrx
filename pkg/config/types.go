@@ -89,6 +89,26 @@ func (c *Config) ResolveReth(ref string) string {
 	return ref
 }
 
+// ResolveFab resolves "fab0" or "fab0.0" to the backing physical member
+// interface using LocalFabricMember. Returns input unchanged if not a fab name
+// or the interface has no LocalFabricMember set.
+func (c *Config) ResolveFab(ref string) string {
+	parts := strings.SplitN(ref, ".", 2)
+	base := parts[0]
+	if c.Interfaces.Interfaces == nil {
+		return ref
+	}
+	ifc, ok := c.Interfaces.Interfaces[base]
+	if !ok || ifc.LocalFabricMember == "" {
+		return ref
+	}
+	resolved := ifc.LocalFabricMember
+	if len(parts) == 2 {
+		return resolved + "." + parts[1]
+	}
+	return resolved
+}
+
 // Config is the top-level typed configuration, compiled from the AST.
 type Config struct {
 	Security          SecurityConfig

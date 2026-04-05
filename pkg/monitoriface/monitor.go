@@ -252,10 +252,19 @@ func resolveConfiguredTrafficKernel(cfg *config.Config, name string, canonicaliz
 	if canonicalize == nil {
 		canonicalize = func(value string) string { return value }
 	}
-	base := strings.SplitN(name, ".", 2)[0]
+	parts := strings.SplitN(name, ".", 2)
+	base := parts[0]
+	suffix := ""
+	if len(parts) == 2 {
+		suffix = "." + parts[1]
+	}
 	if cfg != nil && cfg.Interfaces.Interfaces != nil {
 		if ifc, ok := cfg.Interfaces.Interfaces[base]; ok && ifc.LocalFabricMember != "" {
-			return canonicalize(config.LinuxIfName(ifc.LocalFabricMember))
+			resolved := ifc.LocalFabricMember
+			if suffix != "" && !strings.Contains(resolved, ".") {
+				resolved += suffix
+			}
+			return canonicalize(config.LinuxIfName(resolved))
 		}
 	}
 	resolved := name

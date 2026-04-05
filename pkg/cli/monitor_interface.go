@@ -130,11 +130,12 @@ func (c *CLI) summaryInterfaces() ([]string, map[string]string) {
 	return names, kernelNames
 }
 
-// resolveToKernel converts a config-level name (ge-0/0/0, reth0) to kernel name.
+// resolveToKernel converts a config-level name (ge-0/0/0, reth0, fab0) to kernel name.
 func (c *CLI) resolveToKernel(cfgName string) string {
 	cfg := c.store.ActiveConfig()
 	if cfg != nil {
 		cfgName = cfg.ResolveReth(cfgName)
+		cfgName = cfg.ResolveFab(cfgName)
 	}
 	return config.LinuxIfName(cfgName)
 }
