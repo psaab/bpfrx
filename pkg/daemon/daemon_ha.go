@@ -1150,7 +1150,29 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	// Stop the bulk sync retry loop — it floods the sync TCP connection
 	// with session data, delaying the barrier write/ack by 30+ seconds.
 	// Advancing the retry generation causes the goroutine to exit.
-	d.syncPrimeRetryGen.Add(1)
+	retryGen := d.syncPrimeRetryGen.Add(1)
+
+	// If the barrier fails, restart the retry loop so the peer can still
+	// receive its cold-start bootstrap. Only suppress the restart when
+	// the barrier succeeds and the demotion completes (success=true).
+	defer func() {
+		if success {
+			return
+		}
+		if d.syncPeerBulkPrimed.Load() {
+			return // peer already primed, no retry needed
+		}
+		ss := d.sessionSync
+		if ss == nil || !ss.IsConnected() {
+			return // peer disconnected, retry would be pointless
+		}
+		if d.syncPrimeRetryGen.Load() != retryGen {
+			return // a newer retry generation is already active
+		}
+		slog.Info("cluster: restarting bulk-prime retry loop after failed demotion prep",
+			"retry_gen", retryGen, "rg", rgID)
+		d.startSessionSyncPrimeRetry(retryGen)
+	}()
 
 	// Drain any in-flight barrier from a previous demotion attempt.
 	pendingBarrierTimeout := barrierTimeout / 2

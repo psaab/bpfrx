@@ -2,6 +2,10 @@
 
 ## 2026-04-04
 
+- **Timestamp**: 2026-04-04T21:30:00Z
+  - **Action**: Issue #467 — Fix bulk-prime retry loop not restarting after failed demotion barrier. `prepareUserspaceRGDemotionWithTimeout` stopped the retry loop by advancing `syncPrimeRetryGen` before waiting on barriers, but on barrier failure returned without restarting the loop, stranding the peer in an unprimed state. Added a defer that restarts `startSessionSyncPrimeRetry` on failure when peer is still connected and not yet primed.
+  - **File(s)**: pkg/daemon/daemon_ha.go
+
 - **Timestamp**: 2026-04-04T20:50:00Z
   - **Action**: Issue #458 — Fix session sync barrier timeout on second failover cycle. Root cause: `handleDisconnect` reset `barrierSeq` to 0, causing sequence collisions between stale goroutines and new barriers. Also closed waiter channels on disconnect to prevent goroutine leaks. Added `barrierAckSeq` check in `WaitForPeerBarrier` to distinguish disconnect from ack.
   - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_bulk.go, pkg/cluster/sync_test.go
