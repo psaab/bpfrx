@@ -40,7 +40,9 @@ func InstallRSTSuppression(v4Addrs []netip.Addr, v6Addrs []netip.Addr) error {
 
 	if len(v4Addrs) == 0 && len(v6Addrs) == 0 {
 		// Flush the delete only — no rules needed.
-		_ = c.Flush()
+		if err := c.Flush(); err != nil {
+			return fmt.Errorf("nftables flush (delete-only): %w", err)
+		}
 		return nil
 	}
 
