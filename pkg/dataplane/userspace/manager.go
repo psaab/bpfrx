@@ -3405,9 +3405,69 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 	if err := bpfrxnft.InstallRSTSuppression(rstV4, rstV6); err != nil {
 		slog.Warn("userspace: failed to install RST suppression via netlink", "err", err)
 	}
+	// Defense-in-depth (#456): populate TC egress BPF maps alongside
+	// the nftables rules. TC egress checks these synchronously in the
+	// packet path — no timing gap possible.
+	m.syncRSTSuppressBPFMaps(rstV4, rstV6)
 	m.lastRSTv4 = rstV4
 	m.lastRSTv6 = rstV6
 	return nil
+}
+
+// syncRSTSuppressBPFMaps populates the TC egress rst_suppress_v4/v6 hash
+// maps with the same interface-NAT addresses used by the nftables rules.
+// This provides defense-in-depth (#456): TC egress drops locally-originated
+// TCP RSTs from SNAT addresses even if nftables rules have a timing gap.
+func (m *Manager) syncRSTSuppressBPFMaps(v4Addrs []netip.Addr, v6Addrs []netip.Addr) {
+	rstV4Map := m.inner.Map("rst_suppress_v4")
+	rstV6Map := m.inner.Map("rst_suppress_v6")
+	if rstV4Map == nil || rstV6Map == nil {
+		// Maps not loaded (older BPF programs). Skip silently.
+		return
+	}
+
+	// Clear existing entries.
+	var k4 uint32
+	var v4 uint8
+	iter4 := rstV4Map.Iterate()
+	var staleV4 []uint32
+	for iter4.Next(&k4, &v4) {
+		staleV4 = append(staleV4, k4)
+	}
+	for _, key := range staleV4 {
+		_ = rstV4Map.Delete(key)
+	}
+
+	type v6Key struct {
+		Addr [16]byte
+	}
+	var k6 v6Key
+	var v6 uint8
+	iter6 := rstV6Map.Iterate()
+	var staleV6 []v6Key
+	for iter6.Next(&k6, &v6) {
+		staleV6 = append(staleV6, k6)
+	}
+	for _, key := range staleV6 {
+		_ = rstV6Map.Delete(key)
+	}
+
+	// Populate with current addresses.
+	for _, addr := range v4Addrs {
+		b := addr.As4()
+		key := binary.BigEndian.Uint32(b[:])
+		if err := rstV4Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
+			slog.Debug("rst_suppress_v4 update failed", "addr", addr, "err", err)
+		}
+	}
+	for _, addr := range v6Addrs {
+		key := v6Key{Addr: addr.As16()}
+		if err := rstV6Map.Update(key, uint8(1), ebpf.UpdateAny); err != nil {
+			slog.Debug("rst_suppress_v6 update failed", "addr", addr, "err", err)
+		}
+	}
+
+	slog.Debug("TC RST suppression maps synced", "v4", len(v4Addrs), "v6", len(v6Addrs))
 }
 
 func (m *Manager) Status() (ProcessStatus, error) {

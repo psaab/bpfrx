@@ -82,6 +82,7 @@ func (s *Server) globalStatsHandler(w http.ResponseWriter, _ *http.Request) {
 		FlowCacheMisses:      readCounter(dataplane.GlobalCtrFlowCacheMiss),
 		FlowCacheFlushes:     readCounter(dataplane.GlobalCtrFlowCacheFlush),
 		FlowCacheInvalidates: readCounter(dataplane.GlobalCtrFlowCacheInvalidate),
+		TCRSTSuppressed:      readCounter(dataplane.GlobalCtrTCRSTSuppress),
 	}
 	writeOK(w, stats)
 }

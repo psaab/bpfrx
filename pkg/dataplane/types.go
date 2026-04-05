@@ -260,7 +260,8 @@ const (
 	GlobalCtrFlowCacheMiss       = 37
 	GlobalCtrFlowCacheFlush      = 38
 	GlobalCtrFlowCacheInvalidate = 39
-	GlobalCtrMax                 = 40
+	GlobalCtrTCRSTSuppress       = 40
+	GlobalCtrMax                 = 41
 )
 
 // Host-inbound-traffic service flags (bitmap in zone_config.host_inbound_flags).

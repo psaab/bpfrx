@@ -4533,6 +4533,9 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			fmt.Fprintf(&buf, "  %-30s %d\n", "Host-inbound denies:", readCtr(dataplane.GlobalCtrHostInboundDeny))
 			fmt.Fprintf(&buf, "  %-30s %d\n", "Host-inbound allowed:", readCtr(dataplane.GlobalCtrHostInbound))
 			fmt.Fprintf(&buf, "  %-30s %d\n", "NAT64 translations:", readCtr(dataplane.GlobalCtrNAT64Xlate))
+			if tcRST := readCtr(dataplane.GlobalCtrTCRSTSuppress); tcRST > 0 {
+				fmt.Fprintf(&buf, "  %-30s %d\n", "TC RST suppressed:", tcRST)
+			}
 			cacheHit := readCtr(dataplane.GlobalCtrFlowCacheHit)
 			cacheMiss := readCtr(dataplane.GlobalCtrFlowCacheMiss)
 			if cacheHit > 0 || cacheMiss > 0 {

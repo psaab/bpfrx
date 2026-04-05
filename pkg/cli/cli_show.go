@@ -1642,6 +1642,13 @@ func (c *CLI) showFlowStatistics() error {
 	fmt.Printf("  %-30s %d\n", "Host-inbound allowed:", hostAllow)
 	fmt.Printf("  %-30s %d\n", "Host-inbound denied:", hostDeny)
 
+	// TC RST suppression (#456)
+	tcRSTSuppressed := readCounter(dataplane.GlobalCtrTCRSTSuppress)
+	if tcRSTSuppressed > 0 {
+		fmt.Println()
+		fmt.Printf("  %-30s %d\n", "TC RST suppressed:", tcRSTSuppressed)
+	}
+
 	// Flow cache (IPv4 + IPv6)
 	if cacheHit > 0 || cacheMiss > 0 {
 		fmt.Println()

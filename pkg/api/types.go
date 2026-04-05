@@ -35,6 +35,7 @@ type GlobalStats struct {
 	FlowCacheMisses      uint64 `json:"flow_cache_misses"`
 	FlowCacheFlushes     uint64 `json:"flow_cache_flushes"`
 	FlowCacheInvalidates uint64 `json:"flow_cache_invalidations"`
+	TCRSTSuppressed      uint64 `json:"tc_rst_suppressed"`
 }
 
 // InterfaceStats holds per-interface counter values.

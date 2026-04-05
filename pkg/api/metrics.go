@@ -32,6 +32,7 @@ type bpfrxCollector struct {
 	tcEgressPacketsTotal *prometheus.Desc
 	syncookieTotal       *prometheus.Desc
 	flowCacheTotal       *prometheus.Desc
+	tcRSTSuppressTotal   *prometheus.Desc
 
 	// Interface counters
 	ifacePacketsTotal *prometheus.Desc
@@ -131,6 +132,11 @@ func newCollector(srv *Server) *bpfrxCollector {
 			"bpfrx_flow_cache_total",
 			"Flow cache counters by type (IPv4 + IPv6).",
 			[]string{"type"}, nil,
+		),
+		tcRSTSuppressTotal: prometheus.NewDesc(
+			"bpfrx_tc_rst_suppress_total",
+			"TCP RSTs suppressed at TC egress (interface-NAT addresses).",
+			nil, nil,
 		),
 		ifacePacketsTotal: prometheus.NewDesc(
 			"bpfrx_interface_packets_total",
@@ -263,6 +269,7 @@ func (c *bpfrxCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.tcEgressPacketsTotal
 	ch <- c.syncookieTotal
 	ch <- c.flowCacheTotal
+	ch <- c.tcRSTSuppressTotal
 	ch <- c.ifacePacketsTotal
 	ch <- c.ifaceBytesTotal
 	ch <- c.zonePacketsTotal
@@ -351,6 +358,10 @@ func (c *bpfrxCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp d
 		readCounter(dataplane.GlobalCtrFlowCacheFlush), "flush")
 	ch <- prometheus.MustNewConstMetric(c.flowCacheTotal, prometheus.CounterValue,
 		readCounter(dataplane.GlobalCtrFlowCacheInvalidate), "invalidate")
+
+	// TC egress RST suppression (#456)
+	ch <- prometheus.MustNewConstMetric(c.tcRSTSuppressTotal, prometheus.CounterValue,
+		readCounter(dataplane.GlobalCtrTCRSTSuppress))
 }
 
 func (c *bpfrxCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {

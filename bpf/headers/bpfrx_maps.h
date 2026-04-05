@@ -877,4 +877,39 @@ struct {
 	__type(value, struct session_count_value);
 } session_count_dst SEC(".maps");
 
+/* ============================================================
+ * TC egress RST suppression (#456)
+ *
+ * Defense-in-depth: drop locally-originated TCP RSTs whose source
+ * IP is an interface-NAT (SNAT) address. The kernel has no sockets
+ * for these addresses; any RST it generates is spurious and kills
+ * the real HA-synced TCP session on the peer.
+ *
+ * Populated by Go alongside the nftables OUTPUT rules. Both layers
+ * use the same address set — nftables catches RSTs at L3 OUTPUT,
+ * this map catches any that survive to L2 TC egress.
+ * ============================================================ */
+
+#define MAX_RST_SUPPRESS_ENTRIES 256
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_RST_SUPPRESS_ENTRIES);
+	__type(key, __be32);     /* IPv4 address in network order */
+	__type(value, __u8);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} rst_suppress_v4 SEC(".maps");
+
+struct rst_suppress_v6_key {
+	__u8 addr[16];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, MAX_RST_SUPPRESS_ENTRIES);
+	__type(key, struct rst_suppress_v6_key);
+	__type(value, __u8);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
+} rst_suppress_v6 SEC(".maps");
+
 #endif /* __BPFRX_MAPS_H__ */

@@ -278,7 +278,8 @@ struct icmp6hdr {
 #define GLOBAL_CTR_FLOW_CACHE_MISS       37
 #define GLOBAL_CTR_FLOW_CACHE_FLUSH      38
 #define GLOBAL_CTR_FLOW_CACHE_INVALIDATE 39
-#define GLOBAL_CTR_MAX                   40
+#define GLOBAL_CTR_TC_RST_SUPPRESS       40
+#define GLOBAL_CTR_MAX                   41
 
 /* Flow timeout indices for flow_timeouts ARRAY map */
 #define FLOW_TIMEOUT_TCP_ESTABLISHED   0

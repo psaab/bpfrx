@@ -2,6 +2,10 @@
 
 ## 2026-04-03
 
+- **Timestamp**: 2026-04-03T16:00:00Z
+  - **Action**: Issue #456 — TC egress RST suppression for HA failover stream death. Added rst_suppress_v4/v6 BPF hash maps to TC egress path as defense-in-depth alongside existing nftables OUTPUT rules. TC conntrack drops locally-originated TCP RSTs from interface-NAT addresses before they exit the wire. Added GLOBAL_CTR_TC_RST_SUPPRESS counter, Prometheus metric, CLI/gRPC display. Added RSTSuppressionCounters() API to read nftables rule counters for diagnostics.
+  - **File(s)**: bpf/headers/bpfrx_common.h, bpf/headers/bpfrx_maps.h, bpf/tc/tc_conntrack.c, pkg/nftables/rst_suppress.go, pkg/dataplane/userspace/manager.go, pkg/dataplane/types.go, pkg/api/types.go, pkg/api/handlers.go, pkg/api/metrics.go, pkg/cli/cli_show.go, pkg/grpcapi/server.go
+
 - **Timestamp**: 2026-04-03T12:00:00Z
   - **Action**: Issue #451 — Fix neighbor miss spike after RG failover. Part 1: resolve config-based next-hops synchronously during RG activation (VRRP MASTER and cluster-primary paths) using new `resolveNeighborsImmediate` variant that sends ARP probes without blocking for replies. Part 2: increase failover test neighbor miss threshold from 20 to 60 to accommodate observed spikes of 25-52.
   - **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha.go, scripts/userspace-ha-failover-validation.sh

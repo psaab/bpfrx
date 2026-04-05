@@ -409,6 +409,11 @@ type bpfrxTcMainPolicySet struct {
 	DefaultAction uint16
 }
 
+type bpfrxTcMainRstSuppressV6Key struct {
+	_    structs.HostLayout
+	Addr [16]uint8
+}
+
 type bpfrxTcMainScanTrackKey struct {
 	_      structs.HostLayout
 	SrcIp  uint32
@@ -706,6 +711,8 @@ type bpfrxTcMainMapSpecs struct {
 	PortScanTrack     *ebpf.MapSpec `ebpf:"port_scan_track"`
 	RedirectCapable   *ebpf.MapSpec `ebpf:"redirect_capable"`
 	RgActive          *ebpf.MapSpec `ebpf:"rg_active"`
+	RstSuppressV4     *ebpf.MapSpec `ebpf:"rst_suppress_v4"`
+	RstSuppressV6     *ebpf.MapSpec `ebpf:"rst_suppress_v6"`
 	ScreenConfigs     *ebpf.MapSpec `ebpf:"screen_configs"`
 	SessionCountDst   *ebpf.MapSpec `ebpf:"session_count_dst"`
 	SessionCountSrc   *ebpf.MapSpec `ebpf:"session_count_src"`
@@ -796,6 +803,8 @@ type bpfrxTcMainMaps struct {
 	PortScanTrack     *ebpf.Map `ebpf:"port_scan_track"`
 	RedirectCapable   *ebpf.Map `ebpf:"redirect_capable"`
 	RgActive          *ebpf.Map `ebpf:"rg_active"`
+	RstSuppressV4     *ebpf.Map `ebpf:"rst_suppress_v4"`
+	RstSuppressV6     *ebpf.Map `ebpf:"rst_suppress_v6"`
 	ScreenConfigs     *ebpf.Map `ebpf:"screen_configs"`
 	SessionCountDst   *ebpf.Map `ebpf:"session_count_dst"`
 	SessionCountSrc   *ebpf.Map `ebpf:"session_count_src"`
@@ -862,6 +871,8 @@ func (m *bpfrxTcMainMaps) Close() error {
 		m.PortScanTrack,
 		m.RedirectCapable,
 		m.RgActive,
+		m.RstSuppressV4,
+		m.RstSuppressV6,
 		m.ScreenConfigs,
 		m.SessionCountDst,
 		m.SessionCountSrc,

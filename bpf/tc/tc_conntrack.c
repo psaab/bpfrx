@@ -420,6 +420,34 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 
+	/* RST suppression (#456): drop locally-originated TCP RSTs whose
+	 * source IP is an interface-NAT (SNAT) address. The kernel has
+	 * no sockets for these addresses; any RST it emits is spurious
+	 * and would kill the real HA-synced session on the peer.
+	 *
+	 * Defense-in-depth: nftables OUTPUT chain also catches these,
+	 * but this BPF check is synchronous with the packet path and
+	 * cannot be bypassed by nftables timing gaps. */
+	if (meta->protocol == PROTO_TCP && (meta->tcp_flags & 0x04)) {
+		if (meta->addr_family == AF_INET) {
+			__u8 *v = bpf_map_lookup_elem(&rst_suppress_v4,
+						      &meta->src_ip.v4);
+			if (v) {
+				inc_counter(GLOBAL_CTR_TC_RST_SUPPRESS);
+				return TC_ACT_SHOT;
+			}
+		} else {
+			struct rst_suppress_v6_key k6;
+			__builtin_memcpy(k6.addr, meta->src_ip.v6, 16);
+			__u8 *v = bpf_map_lookup_elem(&rst_suppress_v6,
+						      &k6);
+			if (v) {
+				inc_counter(GLOBAL_CTR_TC_RST_SUPPRESS);
+				return TC_ACT_SHOT;
+			}
+		}
+	}
+
 	/* Locally-originated traffic — create session for return matching */
 	if (meta->addr_family == AF_INET)
 		tc_create_session_v4(meta);

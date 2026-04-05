@@ -86,6 +86,33 @@ func RemoveRSTSuppression() {
 	_ = c.Flush()
 }
 
+// RSTSuppressionCounters reads the nftables counter values from the RST
+// suppression rules. Returns total packets and bytes dropped across all
+// rules. This is useful for diagnosing whether kernel RSTs are being
+// caught during HA failover (#456).
+func RSTSuppressionCounters() (packets uint64, bytes uint64, err error) {
+	c, err := nftables.New()
+	if err != nil {
+		return 0, 0, fmt.Errorf("nftables conn: %w", err)
+	}
+	rules, err := c.GetRules(&nftables.Table{
+		Family: nftables.TableFamilyINet,
+		Name:   rstTableName,
+	}, &nftables.Chain{Name: "output"})
+	if err != nil {
+		return 0, 0, fmt.Errorf("get rules: %w", err)
+	}
+	for _, rule := range rules {
+		for _, e := range rule.Exprs {
+			if counter, ok := e.(*expr.Counter); ok {
+				packets += counter.Packets
+				bytes += counter.Bytes
+			}
+		}
+	}
+	return packets, bytes, nil
+}
+
 func removeRSTTable(c *nftables.Conn) {
 	c.DelTable(&nftables.Table{
 		Family: nftables.TableFamilyINet,
