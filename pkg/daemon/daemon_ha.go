@@ -1166,6 +1166,9 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		if ss == nil || !ss.IsConnected() {
 			return // peer disconnected, retry would be pointless
 		}
+		if d.syncPrimeRetryGen.Load() != retryGen {
+			return // a newer retry generation is already active
+		}
 		slog.Info("cluster: restarting bulk-prime retry loop after failed demotion prep",
 			"retry_gen", retryGen, "rg", rgID)
 		d.startSessionSyncPrimeRetry(retryGen)
