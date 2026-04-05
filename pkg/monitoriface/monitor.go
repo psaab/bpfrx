@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/dataplane"
 	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 	"github.com/vishvananda/netlink"
@@ -122,6 +123,158 @@ func ListTrafficInterfaces() ([]string, error) {
 	}
 	sort.Strings(names)
 	return names, nil
+}
+
+type summaryDisplayChoice struct {
+	name     string
+	priority int
+}
+
+// TrafficSummaryInterfaces returns the display names and backing kernel
+// interfaces for summary-mode monitoring. It prefers configured names such as
+// fab*/reth* when they resolve to a live physical counter source, while still
+// falling back to raw kernel links when no config alias exists.
+func TrafficSummaryInterfaces(cfg *config.Config) ([]string, map[string]string) {
+	if liveNames, err := ListTrafficInterfaces(); err == nil && len(liveNames) > 0 {
+		if names, kernelNames := buildTrafficSummaryInterfaces(cfg, liveNames, ResolvePhysicalParent); len(names) > 0 {
+			return names, kernelNames
+		}
+	}
+	return configuredTrafficSummaryInterfaces(cfg, ResolvePhysicalParent)
+}
+
+func buildTrafficSummaryInterfaces(cfg *config.Config, liveNames []string, canonicalize func(string) string) ([]string, map[string]string) {
+	liveKernels := canonicalTrafficKernels(liveNames, canonicalize)
+	if len(liveKernels) == 0 {
+		return configuredTrafficSummaryInterfaces(cfg, canonicalize)
+	}
+	choices := make(map[string]summaryDisplayChoice, len(liveKernels))
+	for _, kernel := range liveKernels {
+		choices[kernel] = summaryDisplayChoice{name: kernel}
+	}
+	applyConfiguredSummaryChoices(cfg, liveKernels, choices, canonicalize)
+	return finalizeTrafficSummaryInterfaces(liveKernels, choices)
+}
+
+func configuredTrafficSummaryInterfaces(cfg *config.Config, canonicalize func(string) string) ([]string, map[string]string) {
+	if cfg == nil || cfg.Interfaces.Interfaces == nil {
+		return nil, nil
+	}
+	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	displayNames := make([]string, 0, len(names))
+	kernelNames := make(map[string]string, len(names))
+	for _, name := range names {
+		kernelName := resolveConfiguredTrafficKernel(cfg, name, canonicalize)
+		if kernelName == "" {
+			continue
+		}
+		displayNames = append(displayNames, name)
+		kernelNames[name] = kernelName
+	}
+	return displayNames, kernelNames
+}
+
+func canonicalTrafficKernels(liveNames []string, canonicalize func(string) string) []string {
+	if canonicalize == nil {
+		canonicalize = func(name string) string { return name }
+	}
+	kernels := make([]string, 0, len(liveNames))
+	seen := make(map[string]struct{}, len(liveNames))
+	for _, name := range liveNames {
+		kernelName := canonicalize(name)
+		if kernelName == "" {
+			continue
+		}
+		if _, ok := seen[kernelName]; ok {
+			continue
+		}
+		seen[kernelName] = struct{}{}
+		kernels = append(kernels, kernelName)
+	}
+	sort.Strings(kernels)
+	return kernels
+}
+
+func applyConfiguredSummaryChoices(cfg *config.Config, liveKernels []string, choices map[string]summaryDisplayChoice, canonicalize func(string) string) {
+	if cfg == nil || cfg.Interfaces.Interfaces == nil {
+		return
+	}
+	liveSet := make(map[string]struct{}, len(liveKernels))
+	for _, kernelName := range liveKernels {
+		liveSet[kernelName] = struct{}{}
+	}
+	names := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for name := range cfg.Interfaces.Interfaces {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		kernelName := resolveConfiguredTrafficKernel(cfg, name, canonicalize)
+		if kernelName == "" {
+			continue
+		}
+		if _, ok := liveSet[kernelName]; !ok {
+			continue
+		}
+		current := choices[kernelName]
+		priority := summaryDisplayPriority(name)
+		if priority > current.priority || (priority == current.priority && name < current.name) {
+			choices[kernelName] = summaryDisplayChoice{name: name, priority: priority}
+		}
+	}
+}
+
+func finalizeTrafficSummaryInterfaces(liveKernels []string, choices map[string]summaryDisplayChoice) ([]string, map[string]string) {
+	names := make([]string, 0, len(liveKernels))
+	kernelNames := make(map[string]string, len(liveKernels))
+	usedDisplayNames := make(map[string]struct{}, len(liveKernels))
+	for _, kernelName := range liveKernels {
+		displayName := choices[kernelName].name
+		if displayName == "" {
+			displayName = kernelName
+		}
+		if _, ok := usedDisplayNames[displayName]; ok {
+			displayName = kernelName
+		}
+		usedDisplayNames[displayName] = struct{}{}
+		names = append(names, displayName)
+		kernelNames[displayName] = kernelName
+	}
+	sort.Strings(names)
+	return names, kernelNames
+}
+
+func resolveConfiguredTrafficKernel(cfg *config.Config, name string, canonicalize func(string) string) string {
+	if canonicalize == nil {
+		canonicalize = func(value string) string { return value }
+	}
+	base := strings.SplitN(name, ".", 2)[0]
+	if cfg != nil && cfg.Interfaces.Interfaces != nil {
+		if ifc, ok := cfg.Interfaces.Interfaces[base]; ok && ifc.LocalFabricMember != "" {
+			return canonicalize(config.LinuxIfName(ifc.LocalFabricMember))
+		}
+	}
+	resolved := name
+	if cfg != nil {
+		resolved = cfg.ResolveReth(name)
+	}
+	return canonicalize(config.LinuxIfName(resolved))
+}
+
+func summaryDisplayPriority(name string) int {
+	base := strings.SplitN(name, ".", 2)[0]
+	switch {
+	case strings.HasPrefix(base, "fab"):
+		return 30
+	case strings.HasPrefix(base, "reth"):
+		return 20
+	default:
+		return 10
+	}
 }
 
 func ParseSummaryMode(value string) (SummaryMode, bool) {

@@ -8226,15 +8226,8 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 		}
 	}
 
-	// Summary mode should answer "what is moving right now?" across the box,
-	// so prefer the live kernel link list and only fall back to configured
-	// interface names if link enumeration fails.
 	summaryInterfaces := func() ([]string, map[string]string) {
-		if names, err := monitoriface.ListTrafficInterfaces(); err == nil && len(names) > 0 {
-			kernelNames := make(map[string]string, len(names))
-			for _, name := range names {
-				kernelNames[name] = name
-			}
+		if names, kernelNames := monitoriface.TrafficSummaryInterfaces(cfg); len(names) > 0 {
 			return names, kernelNames
 		}
 
