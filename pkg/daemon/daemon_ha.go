@@ -57,19 +57,36 @@ func (d *Daemon) armSyncReadyTimer() {
 }
 
 func (d *Daemon) onSessionSyncPeerConnected() {
-	d.syncBulkPrimed.Store(false)
-	d.syncPeerBulkPrimed.Store(false)
 	d.syncPeerConnected.Store(true)
 	d.hbSuppressStart.Store(0) // fresh connection → reset suppression cap
+
+	// Determine whether this is a true cold start or a routine reconnect.
+	// A cold start means no bulk sync has ever completed during this
+	// daemon's lifetime — the peer (or we) genuinely started from scratch.
+	// On a routine reconnect after a brief network blip, the sessions are
+	// already synced; preserve the primed state and sync readiness (#466).
+	coldStart := d.sessionSync == nil || !d.sessionSync.BulkEverCompleted()
+
+	if coldStart {
+		d.syncBulkPrimed.Store(false)
+		d.syncPeerBulkPrimed.Store(false)
+	}
+
 	gen := d.syncPrimeRetryGen.Add(1)
 	slog.Info("cluster: session sync peer connected",
 		"retry_gen", gen,
+		"cold_start", coldStart,
+		"bulk_primed", d.syncBulkPrimed.Load(),
+		"peer_bulk_primed", d.syncPeerBulkPrimed.Load(),
 		"cluster_sync_ready", d.cluster != nil && d.cluster.IsSyncReady())
-	if d.cluster != nil {
-		d.cluster.SetSyncReady(false)
+
+	if coldStart {
+		if d.cluster != nil {
+			d.cluster.SetSyncReady(false)
+		}
+		d.armSyncReadyTimer()
+		d.startSessionSyncPrimeRetry(gen)
 	}
-	d.armSyncReadyTimer()
-	d.startSessionSyncPrimeRetry(gen)
 }
 
 func (d *Daemon) onSessionSyncBulkReceived() {
@@ -92,16 +109,31 @@ func (d *Daemon) onSessionSyncBulkAckReceived() {
 }
 
 func (d *Daemon) onSessionSyncPeerDisconnected() {
-	d.syncBulkPrimed.Store(false)
-	d.syncPeerBulkPrimed.Store(false)
 	d.syncPeerConnected.Store(false)
 	gen := d.syncPrimeRetryGen.Add(1)
+
+	// On disconnect after a completed bulk exchange, preserve primed state
+	// and sync readiness. The sessions are still in the BPF maps — a
+	// subsequent reconnect will resume incremental sync without needing a
+	// full bulk transfer (#466).
+	wasEverPrimed := d.sessionSync != nil && d.sessionSync.BulkEverCompleted()
+	if !wasEverPrimed {
+		d.syncBulkPrimed.Store(false)
+		d.syncPeerBulkPrimed.Store(false)
+	}
+
 	slog.Info("cluster: session sync peer disconnected",
 		"retry_gen", gen,
+		"was_ever_primed", wasEverPrimed,
+		"bulk_primed", d.syncBulkPrimed.Load(),
+		"peer_bulk_primed", d.syncPeerBulkPrimed.Load(),
 		"cluster_sync_ready", d.cluster != nil && d.cluster.IsSyncReady())
 	d.stopSyncReadyTimer()
-	if d.cluster != nil {
-		d.cluster.SetSyncReady(false)
+
+	if !wasEverPrimed {
+		if d.cluster != nil {
+			d.cluster.SetSyncReady(false)
+		}
 	}
 }
 

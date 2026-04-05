@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-04-05
+
+- **Timestamp**: 2026-04-05T06:55:00Z
+  - **Action**: Issue #466 — Fix bulk sync triggering on every reconnect/fabric-flip. Added `bulkEverCompleted` atomic flag to SessionSync that tracks whether a full bulk exchange has ever completed during the daemon's lifetime. `handleNewConnection` now only triggers `doBulkSync` on true cold start (flag is false). Active-fabric changes no longer trigger bulk at all. Daemon's `onSessionSyncPeerConnected`/`onSessionSyncPeerDisconnected` preserve primed state and sync readiness when `bulkEverCompleted` is true.
+  - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_test.go, pkg/daemon/daemon_ha.go, pkg/daemon/session_sync_readiness_test.go
+
 ## 2026-04-04
 
 - **Timestamp**: 2026-04-04T21:30:00Z
