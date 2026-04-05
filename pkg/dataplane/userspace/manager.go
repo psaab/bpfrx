@@ -3646,6 +3646,8 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 		idx := uint32(binding.Ifindex)*bindingQueuesPerIface + binding.QueueID
 		var val userspaceBindingValue
 		if err := bindingsMap.Lookup(idx, &val); err != nil {
+			slog.Debug("userspace: bindings watchdog lookup failed",
+				"ifindex", binding.Ifindex, "queue", binding.QueueID, "err", err)
 			continue
 		}
 		if val.Flags != 0 || val.Slot != 0 {
@@ -3681,6 +3683,8 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 				idx := childIfindex*bindingQueuesPerIface + binding.QueueID
 				var val userspaceBindingValue
 				if err := bindingsMap.Lookup(idx, &val); err != nil {
+					slog.Debug("userspace: bindings watchdog alias lookup failed",
+						"child", childIfindex, "parent", parentIfindex, "queue", binding.QueueID, "err", err)
 					continue
 				}
 				if val.Flags != 0 || val.Slot != 0 {
@@ -3691,6 +3695,9 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 					Flags: userspaceBindingReady,
 				}
 				if err := bindingsMap.Update(idx, newVal, ebpf.UpdateAny); err != nil {
+					slog.Warn("userspace: bindings watchdog failed to repair alias entry",
+						"child", childIfindex, "parent", parentIfindex,
+						"queue", binding.QueueID, "slot", binding.Slot, "err", err)
 					continue
 				}
 				repaired++
@@ -4040,12 +4047,13 @@ func (m *Manager) statusLoop(ctx context.Context) {
 			if err := m.requestLocked(ControlRequest{Type: "status"}, &status); err == nil {
 				if err := m.applyHelperStatusLocked(&status); err != nil {
 					slog.Warn("userspace dataplane status sync failed", "err", err)
+				} else {
+					// Bindings watchdog (#473): verify the BPF map matches
+					// the helper's reported state. Only run after a successful
+					// status update — stale m.lastStatus could cause incorrect
+					// repairs.
+					m.verifyBindingsMapLocked()
 				}
-				// Bindings watchdog (#473): verify the BPF map matches
-				// the helper's reported state. If a Compile() or HA
-				// transition zeroed the map without repopulating it,
-				// the XDP shim silently drops all transit traffic.
-				m.verifyBindingsMapLocked()
 				if m.lastSnapshot != nil && m.publishedSnapshot < m.lastSnapshot.Generation {
 					if err := m.syncSnapshotLocked(); err != nil {
 						slog.Warn("userspace dataplane snapshot sync failed", "err", err)
