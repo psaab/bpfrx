@@ -19,17 +19,30 @@ const rstTableName = "bpfrx_dp_rst"
 // from interface-NAT (SNAT) addresses. These addresses are owned by the
 // userspace dataplane; the kernel has no sockets for them and should never
 // emit RSTs.
+//
+// The delete + create is performed in a single atomic netlink batch to
+// eliminate the race window where no rules exist between the old table
+// deletion and new table creation. This is critical for HA failover:
+// during the microseconds of RG demotion, the kernel may generate RSTs
+// for connections it doesn't own (#450).
 func InstallRSTSuppression(v4Addrs []netip.Addr, v6Addrs []netip.Addr) error {
 	c, err := nftables.New()
 	if err != nil {
 		return fmt.Errorf("nftables conn: %w", err)
 	}
 
-	// Delete any existing table first (idempotent).
+	// Delete + create in a single atomic flush. The kernel applies the
+	// entire netlink batch atomically, so the RST suppression rules are
+	// never absent — the old table is replaced by the new one in one shot.
+	// On fresh boot the table doesn't exist yet; the kernel silently
+	// ignores the delete for non-existent tables in a batch.
 	removeRSTTable(c)
-	_ = c.Flush()
 
 	if len(v4Addrs) == 0 && len(v6Addrs) == 0 {
+		// Flush the delete only — no rules needed.
+		if err := c.Flush(); err != nil {
+			return fmt.Errorf("nftables flush (delete-only): %w", err)
+		}
 		return nil
 	}
 

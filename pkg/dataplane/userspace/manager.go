@@ -3398,13 +3398,15 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 	}
 	slices.SortFunc(rstV4, netip.Addr.Compare)
 	slices.SortFunc(rstV6, netip.Addr.Compare)
-	if !slices.Equal(rstV4, m.lastRSTv4) || !slices.Equal(rstV6, m.lastRSTv6) {
-		if err := bpfrxnft.InstallRSTSuppression(rstV4, rstV6); err != nil {
-			slog.Warn("userspace: failed to install RST suppression via netlink", "err", err)
-		}
-		m.lastRSTv4 = rstV4
-		m.lastRSTv6 = rstV6
+	// Always install RST suppression rules — no dedup skip. The nftables
+	// install is atomic (single netlink batch) so there is no race window.
+	// Re-installing on every compile ensures both HA nodes always have the
+	// rules, even after daemon restart where lastRSTv4/v6 are nil (#450).
+	if err := bpfrxnft.InstallRSTSuppression(rstV4, rstV6); err != nil {
+		slog.Warn("userspace: failed to install RST suppression via netlink", "err", err)
 	}
+	m.lastRSTv4 = rstV4
+	m.lastRSTv6 = rstV6
 	return nil
 }
 
