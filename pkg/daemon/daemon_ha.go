@@ -2599,6 +2599,16 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				// Then remove blackhole routes — FIB lookups must
 				// succeed for synced sessions.
 				d.removeBlackholeRoutes(ev.GroupID)
+				// Resolve config-based next-hops synchronously so
+				// ARP probes go out before the event loop continues.
+				// Safe before VIP installation: targets are gateway
+				// next-hops and DNAT/static-NAT hosts resolved via
+				// RouteGet on already-configured interfaces — no
+				// dependency on RETH VIPs (added later by VRRP MASTER
+				// or directAddVIPs).
+				if cfg := d.store.ActiveConfig(); cfg != nil {
+					d.resolveNeighborsImmediate(cfg)
+				}
 				go d.warmNeighborCache()
 
 				// no-reth-vrrp direct mode: add VIPs + send GARPs +
@@ -2608,11 +2618,6 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 					d.addStableRethLinkLocal(ev.GroupID)
 					d.scheduleDirectAnnounce(ev.GroupID, "cluster-primary")
 					d.applyRethServicesForRG(ev.GroupID)
-					go func() {
-						if cfg := d.store.ActiveConfig(); cfg != nil {
-							d.resolveNeighbors(cfg)
-						}
-					}()
 					go d.RefreshFabricFwd()
 				}
 			} else {
@@ -2758,15 +2763,14 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					} else {
 						s.ApplyIfCurrent(tr)
 					}
+					// Resolve config-based next-hops synchronously so
+					// ARP probes go out before the event loop continues.
+					// VIPs are already installed by VRRP becomeMaster().
+					// Uses the no-wait variant to avoid blocking 500ms.
+					if cfg := d.store.ActiveConfig(); cfg != nil {
+						d.resolveNeighborsImmediate(cfg)
+					}
 					go d.warmNeighborCache()
-					go func() {
-						// Resolve config-based next-hops (static routes,
-						// DHCP gateways) now that RETH VIPs are installed
-						// and routes are reachable.
-						if cfg := d.store.ActiveConfig(); cfg != nil {
-							d.resolveNeighbors(cfg)
-						}
-					}()
 					go d.RefreshFabricFwd()
 				}
 				// Only remove blackholes and apply services when ALL
