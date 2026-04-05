@@ -2230,16 +2230,19 @@ func TestHandleDisconnectResetsBarrierStateAfterTotalDisconnect(t *testing.T) {
 	ss.stats.Connected.Store(true)
 	ss.barrierSeq.Store(3)
 	ss.barrierAckSeq.Store(1)
+	waiterCh := make(chan struct{})
 	ss.barrierWaitMu.Lock()
 	ss.barrierWaiters = map[uint64]chan struct{}{
-		2: make(chan struct{}),
+		2: waiterCh,
 	}
 	ss.barrierWaitMu.Unlock()
 
 	ss.handleDisconnect(local)
 
-	if ss.barrierSeq.Load() != 0 {
-		t.Fatalf("barrierSeq = %d, want 0", ss.barrierSeq.Load())
+	// barrierSeq must NOT reset — monotonic counter prevents seq
+	// collisions between stale goroutines and new barriers (#458).
+	if ss.barrierSeq.Load() != 3 {
+		t.Fatalf("barrierSeq = %d, want 3 (must not reset)", ss.barrierSeq.Load())
 	}
 	if ss.barrierAckSeq.Load() != 0 {
 		t.Fatalf("barrierAckSeq = %d, want 0", ss.barrierAckSeq.Load())
@@ -2248,9 +2251,125 @@ func TestHandleDisconnectResetsBarrierStateAfterTotalDisconnect(t *testing.T) {
 		t.Fatalf("WaitForPeerBarriersDrained() after disconnect = %v", err)
 	}
 	ss.barrierWaitMu.Lock()
-	defer ss.barrierWaitMu.Unlock()
 	if len(ss.barrierWaiters) != 0 {
+		ss.barrierWaitMu.Unlock()
 		t.Fatalf("barrier waiters not cleared: %d", len(ss.barrierWaiters))
+	}
+	ss.barrierWaitMu.Unlock()
+
+	// Verify the waiter channel was closed so blocked goroutines wake up.
+	select {
+	case <-waiterCh:
+		// ok — channel was closed
+	default:
+		t.Fatal("waiter channel not closed on disconnect")
+	}
+}
+
+// TestBarrierSeqNoCollisionAcrossReconnect verifies that a stale
+// WaitForPeerBarrier goroutine from connection cycle 1 cannot corrupt
+// the barrier waiter map used by connection cycle 2 (#458).
+func TestBarrierSeqNoCollisionAcrossReconnect(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+
+	// Simulate cycle 1: barrier seq=1 is pending.
+	local1, peer1 := net.Pipe()
+	defer peer1.Close()
+	ss.mu.Lock()
+	ss.conn0 = local1
+	ss.mu.Unlock()
+	ss.stats.Connected.Store(true)
+
+	cycle1Waiter := make(chan struct{})
+	ss.barrierWaitMu.Lock()
+	ss.barrierWaiters = map[uint64]chan struct{}{1: cycle1Waiter}
+	ss.barrierWaitMu.Unlock()
+	ss.barrierSeq.Store(1)
+
+	// Disconnect — simulates failback.
+	ss.handleDisconnect(local1)
+
+	// Cycle 1 waiter channel must be closed.
+	select {
+	case <-cycle1Waiter:
+	default:
+		t.Fatal("cycle 1 waiter not closed on disconnect")
+	}
+
+	// barrierSeq must NOT have been reset, so next seq is 2, not 1.
+	nextSeq := ss.barrierSeq.Load()
+	if nextSeq != 1 {
+		t.Fatalf("barrierSeq after disconnect = %d, want 1", nextSeq)
+	}
+
+	// Reconnect — cycle 2 barrier gets seq=2 (barrierSeq.Add(1)).
+	local2, peer2 := net.Pipe()
+	defer peer2.Close()
+	ss.mu.Lock()
+	ss.conn0 = local2
+	ss.mu.Unlock()
+	ss.stats.Connected.Store(true)
+
+	cycle2Waiter := make(chan struct{})
+	seq2 := ss.barrierSeq.Add(1) // seq=2
+	ss.barrierWaitMu.Lock()
+	ss.barrierWaiters = map[uint64]chan struct{}{seq2: cycle2Waiter}
+	ss.barrierWaitMu.Unlock()
+
+	// Verify no collision: seq2 must be 2, not 1.
+	if seq2 == 1 {
+		t.Fatal("seq collision: cycle 2 reused seq=1 from cycle 1")
+	}
+
+	// Simulate ack for seq=2.
+	ss.barrierAckSeq.Store(seq2)
+	ss.completeBarrierWait(seq2)
+
+	select {
+	case <-cycle2Waiter:
+		// ok
+	default:
+		t.Fatal("cycle 2 waiter not completed")
+	}
+}
+
+// TestWaitForPeerBarrierReturnsErrorOnDisconnect verifies that
+// WaitForPeerBarrier returns an error (not nil) when the connection
+// drops while waiting for the barrier ack.
+func TestWaitForPeerBarrierReturnsErrorOnDisconnect(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	local, peer := net.Pipe()
+	defer peer.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.mu.Unlock()
+	ss.stats.Connected.Store(true)
+
+	// Start sendLoop so the barrier message can be consumed from sendCh.
+	go ss.sendLoop(ctx)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ss.WaitForPeerBarrier(5 * time.Second)
+	}()
+
+	// Give WaitForPeerBarrier time to queue the barrier.
+	time.Sleep(50 * time.Millisecond)
+
+	// Disconnect — closes the waiter channel.
+	ss.handleDisconnect(local)
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("WaitForPeerBarrier returned nil after disconnect, want error")
+		}
+		t.Logf("got expected error: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("WaitForPeerBarrier did not return after disconnect")
 	}
 }
 
