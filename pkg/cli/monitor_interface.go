@@ -110,36 +110,32 @@ func (c *CLI) sortedConfiguredInterfaces() []string {
 }
 
 func (c *CLI) sortedMonitorInterfaces() []string {
-	names, err := monitoriface.ListTrafficInterfaces()
-	if err == nil && len(names) > 0 {
+	names, _ := monitoriface.TrafficSummaryInterfaces(c.store.ActiveConfig())
+	if len(names) > 0 {
 		return names
 	}
 	return c.sortedConfiguredInterfaces()
 }
 
 func (c *CLI) summaryInterfaces() ([]string, map[string]string) {
-	names, err := monitoriface.ListTrafficInterfaces()
-	if err == nil && len(names) > 0 {
-		kernelNames := make(map[string]string, len(names))
-		for _, name := range names {
-			kernelNames[name] = name
-		}
+	names, kernelNames := monitoriface.TrafficSummaryInterfaces(c.store.ActiveConfig())
+	if len(names) > 0 {
 		return names, kernelNames
 	}
-
 	names = c.sortedConfiguredInterfaces()
-	kernelNames := make(map[string]string, len(names))
+	kernelNames = make(map[string]string, len(names))
 	for _, name := range names {
 		kernelNames[name] = monitoriface.ResolvePhysicalParent(c.resolveToKernel(name))
 	}
 	return names, kernelNames
 }
 
-// resolveToKernel converts a config-level name (ge-0/0/0, reth0) to kernel name.
+// resolveToKernel converts a config-level name (ge-0/0/0, reth0, fab0) to kernel name.
 func (c *CLI) resolveToKernel(cfgName string) string {
 	cfg := c.store.ActiveConfig()
 	if cfg != nil {
 		cfgName = cfg.ResolveReth(cfgName)
+		cfgName = cfg.ResolveFab(cfgName)
 	}
 	return config.LinuxIfName(cfgName)
 }
