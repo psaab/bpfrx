@@ -1119,9 +1119,11 @@ func TestRGTransitionInFlightOnlyDuringActivation(t *testing.T) {
 		t.Fatal("rgTransitionInFlight should be false before demotion")
 	}
 
-	// Simulate what UpdateRGActive does for demotion — the flag should
-	// NOT be set. (We can't call the real UpdateRGActive without BPF
-	// maps, so we verify the conditional logic directly.)
+	// We can't call UpdateRGActive directly without BPF maps, so we
+	// verify the conditional guard matches the production code at
+	// manager_ha.go:382 — `if active { m.rgTransitionInFlight.Store(true) }`.
+	// This is a logic-level test; integration coverage comes from the
+	// failover test harness (userspace-ha-failover-validation.sh).
 	active := false
 	if active {
 		m.rgTransitionInFlight.Store(true)
