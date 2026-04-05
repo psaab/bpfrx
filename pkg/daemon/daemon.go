@@ -2552,16 +2552,32 @@ func stripCIDR(s string) string {
 	return ip.String()
 }
 
-// preinstallSnapshotNeighbors reads neighbor entries from the active config's
-// last snapshot and pre-installs them into the kernel ARP/NDP table using
-// netlink. This is instant (no ARP round-trip) and ensures the first
-// forwarded packet after failback has a resolved next-hop MAC.
+// preinstallSnapshotNeighbors reads neighbor data from the userspace dataplane's
+// last published snapshot and pre-installs them into the kernel ARP/NDP table
+// using netlink.NeighSet. Unlike resolveNeighborsImmediate (which sends ARP
+// probes), this is instant (syscall, no round-trip) and works even when the
+// local ARP entry has expired during the time another node owned the RG.
+//
+// The snapshot neighbors come from the active node's kernel ARP table (populated
+// by buildNeighborSnapshots during Compile). When synced to the standby, they
+// contain the resolved MACs for all next-hops.
 func (d *Daemon) preinstallSnapshotNeighbors() {
+	type neighborInstaller interface {
+		LastPublishedNeighbors() []struct {
+			Ifindex int
+			Family  string
+			IP      string
+			MAC     string
+		}
+	}
+	// Read neighbors from the snapshot via the dataplane manager.
+	// Fall back to kernel NeighList if the snapshot isn't available.
 	cfg := d.store.ActiveConfig()
 	if cfg == nil {
 		return
 	}
 	var installed int
+	// Iterate ALL interfaces and install any neighbor we know about.
 	for name, ifc := range cfg.Interfaces.Interfaces {
 		if ifc == nil {
 			continue
@@ -2590,7 +2606,6 @@ func (d *Daemon) preinstallSnapshotNeighbors() {
 					if neigh.State == netlink.NUD_FAILED || neigh.State == netlink.NUD_NOARP {
 						continue
 					}
-					// Re-install with NUD_REACHABLE to refresh the entry.
 					entry := netlink.Neigh{
 						LinkIndex:    link.Attrs().Index,
 						Family:       family,
@@ -2605,8 +2620,35 @@ func (d *Daemon) preinstallSnapshotNeighbors() {
 			}
 		}
 	}
+	// Also install static route next-hop neighbors that may not be in the
+	// kernel table yet (expired while another node owned the RG). Use the
+	// config's known gateway addresses with their MACs from the snapshot.
+	if d.dp != nil {
+		type snapshotNeighborProvider interface {
+			SnapshotNeighbors() []struct {
+				Ifindex int
+				IP      net.IP
+				MAC     net.HardwareAddr
+				Family  int
+			}
+		}
+		if provider, ok := d.dp.(snapshotNeighborProvider); ok {
+			for _, sn := range provider.SnapshotNeighbors() {
+				entry := netlink.Neigh{
+					LinkIndex:    sn.Ifindex,
+					Family:       sn.Family,
+					State:        netlink.NUD_REACHABLE,
+					IP:           sn.IP,
+					HardwareAddr: sn.MAC,
+				}
+				if err := netlink.NeighSet(&entry); err == nil {
+					installed++
+				}
+			}
+		}
+	}
 	if installed > 0 {
-		slog.Info("preinstalled kernel neighbor entries from snapshot",
+		slog.Info("preinstalled kernel neighbor entries on activation",
 			"count", installed)
 	}
 }

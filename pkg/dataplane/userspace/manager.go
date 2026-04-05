@@ -3410,6 +3410,57 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 	return nil
 }
 
+// SnapshotNeighbors returns the neighbor entries from the last published
+// snapshot. Used by the daemon to pre-install kernel ARP entries on RG
+// activation so failback doesn't drop packets during ARP resolution.
+func (m *Manager) SnapshotNeighbors() []struct {
+	Ifindex int
+	IP      net.IP
+	MAC     net.HardwareAddr
+	Family  int
+} {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.lastSnapshot == nil {
+		return nil
+	}
+	var result []struct {
+		Ifindex int
+		IP      net.IP
+		MAC     net.HardwareAddr
+		Family  int
+	}
+	for _, n := range m.lastSnapshot.Neighbors {
+		if n.Ifindex <= 0 || n.MAC == "" || n.IP == "" {
+			continue
+		}
+		mac, err := net.ParseMAC(n.MAC)
+		if err != nil {
+			continue
+		}
+		ip := net.ParseIP(n.IP)
+		if ip == nil {
+			continue
+		}
+		family := netlink.FAMILY_V4
+		if ip.To4() == nil {
+			family = netlink.FAMILY_V6
+		}
+		result = append(result, struct {
+			Ifindex int
+			IP      net.IP
+			MAC     net.HardwareAddr
+			Family  int
+		}{
+			Ifindex: n.Ifindex,
+			IP:      ip,
+			MAC:     mac,
+			Family:  family,
+		})
+	}
+	return result
+}
+
 func (m *Manager) Status() (ProcessStatus, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
