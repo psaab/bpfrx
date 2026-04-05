@@ -2219,7 +2219,7 @@ func TestWaitForPeerBarriersDrainedIgnoresTimedOutBarrierSeqWithoutWaiter(t *tes
 	}
 }
 
-func TestHandleDisconnectResetsBarrierStateAfterTotalDisconnect(t *testing.T) {
+func TestHandleDisconnectClearsBarrierWaitersWithoutResettingBarrierCounters(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 	local, peer := net.Pipe()
 	defer peer.Close()
@@ -2244,8 +2244,11 @@ func TestHandleDisconnectResetsBarrierStateAfterTotalDisconnect(t *testing.T) {
 	if ss.barrierSeq.Load() != 3 {
 		t.Fatalf("barrierSeq = %d, want 3 (must not reset)", ss.barrierSeq.Load())
 	}
-	if ss.barrierAckSeq.Load() != 0 {
-		t.Fatalf("barrierAckSeq = %d, want 0", ss.barrierAckSeq.Load())
+	// barrierAckSeq must remain monotonic too. Resetting it to 0 can cause a
+	// just-completed barrier to be misclassified as a disconnect if a waiter
+	// checks after handleDisconnect runs.
+	if ss.barrierAckSeq.Load() != 1 {
+		t.Fatalf("barrierAckSeq = %d, want 1 (must not reset)", ss.barrierAckSeq.Load())
 	}
 	if err := ss.WaitForPeerBarriersDrained(20 * time.Millisecond); err != nil {
 		t.Fatalf("WaitForPeerBarriersDrained() after disconnect = %v", err)

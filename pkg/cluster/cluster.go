@@ -814,13 +814,6 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 	fn := m.peerFailoverFn
 	commitFn := m.peerFailoverCommitFn
 	transferReadyFn := m.transferReadinessFn
-
-	// Clear local ManualFailover and restore weight so election can
-	// promote us once the peer transfers out.
-	if rg.ManualFailover {
-		rg.ManualFailover = false
-		m.recalcWeight(rg)
-	}
 	m.mu.Unlock()
 
 	if fn == nil {
@@ -843,6 +836,21 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 	if err != nil {
 		return err
 	}
+	m.mu.Lock()
+	rg, ok = m.groups[rgID]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("redundancy group %d not found", rgID)
+	}
+	// Preserve a local manual-failover hold until the peer has explicitly
+	// acknowledged the transfer-out request. Preflight rejection or request-send
+	// failure must not silently release the existing transfer-out state.
+	if rg.ManualFailover {
+		rg.ManualFailover = false
+		rg.ManualFailoverAt = time.Time{}
+		m.recalcWeight(rg)
+	}
+	m.mu.Unlock()
 	if err := m.commitRequestedPeerFailover(rgID, reqID); err != nil {
 		return err
 	}
