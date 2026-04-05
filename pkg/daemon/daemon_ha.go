@@ -1252,6 +1252,15 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	// kills TCP streams during failover.
 	d.preflightDemoteRG(rgID)
 
+	// Notify the peer to pre-install neighbor entries before VRRP
+	// transitions (#485). The activating node needs ARP/NDP entries
+	// ready so bpf_fib_lookup succeeds for the first packet after it
+	// becomes MASTER. Best-effort: if the send fails, the peer's
+	// watchClusterEvents handler still installs neighbors (slightly later).
+	if d.sessionSync != nil {
+		d.sessionSync.SendPrepareActivation(rgID)
+	}
+
 	success = true
 	slog.Info("userspace: peer barrier ready for rg demotion", "rg", rgID)
 	return nil
@@ -1607,6 +1616,18 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// Wire peer fencing: on heartbeat timeout, cluster sends
 			// fence via sync; on receive, disable all local RGs.
 			d.cluster.SetPeerFenceFunc(d.sessionSync.SendFence)
+			// Wire prepare_activation: when the demoting peer sends
+			// this hint, pre-install neighbors immediately so the
+			// first packet after VRRP MASTER has a resolved next-hop.
+			d.sessionSync.OnPrepareActivation = func(rgID int) {
+				slog.Info("cluster: prepare_activation from demoting peer — pre-installing neighbors", "rg", rgID)
+				d.preinstallSnapshotNeighbors()
+				if activeCfg := d.store.ActiveConfig(); activeCfg != nil {
+					d.resolveNeighborsImmediate(activeCfg)
+				}
+				go d.warmNeighborCache()
+			}
+
 			d.sessionSync.OnFenceReceived = func() {
 				slog.Warn("cluster: fence received from peer, disabling all RGs")
 				if cfg.Chassis.Cluster != nil {
@@ -2626,30 +2647,6 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				continue
 			}
 
-			// Immediate VRRP priority + resign on state transitions.
-			// ResignRG sets priority=0 to prevent re-election race.
-			// On Primary transition, restore priority=200 immediately
-			// so the instance can accept the peer's resignation and
-			// send adverts at the correct priority.
-			if !noRethVRRP {
-				if ev.OldState == cluster.StatePrimary &&
-					(ev.NewState == cluster.StateSecondary || ev.NewState == cluster.StateSecondaryHold) {
-					d.vrrpMgr.ResignRG(ev.GroupID)
-				}
-				if ev.NewState == cluster.StatePrimary {
-					d.vrrpMgr.UpdateRGPriority(ev.GroupID, 200)
-					// With preempt=false, VRRP won't self-elect even at
-					// higher priority. Force MASTER since cluster state
-					// is authoritative (e.g. after failover reset).
-					// Only do this for intentional promotions (Secondary →
-					// Primary), NOT on initial boot (SecondaryHold → Primary)
-					// where VRRP should follow its own election timer.
-					if ev.OldState == cluster.StateSecondary {
-						d.vrrpMgr.ForceRGMaster(ev.GroupID)
-					}
-				}
-			}
-
 			// Update rg_active through unified state machine.
 			//
 			// Both cluster and VRRP events funnel through rgStateMachine
@@ -2659,8 +2656,10 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 			// between the two independent goroutine writers.
 			//
 			// Transition ordering safety:
-			// - Activation: set rg_active FIRST, then remove blackholes
-			// - Deactivation: add blackholes FIRST, then clear rg_active
+			// - Activation: set rg_active FIRST, then remove blackholes,
+			//   pre-install neighbors, THEN trigger VRRP MASTER (#485)
+			// - Deactivation: run preflight FIRST, then resign VRRP,
+			//   add blackholes, then clear rg_active (#485)
 			isPrimary := ev.NewState == cluster.StatePrimary
 			clusterDemotionEdge := ev.OldState == cluster.StatePrimary && !isPrimary
 			s := d.getOrCreateRGState(ev.GroupID)
@@ -2688,6 +2687,23 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				}
 				go d.warmNeighborCache()
 
+				// VRRP priority + ForceRGMaster AFTER rg_active and
+				// neighbor pre-install (#485). This ensures BPF can
+				// forward the first packet that arrives after VRRP
+				// installs VIPs and sends GARPs.
+				if !noRethVRRP {
+					d.vrrpMgr.UpdateRGPriority(ev.GroupID, 200)
+					// With preempt=false, VRRP won't self-elect even at
+					// higher priority. Force MASTER since cluster state
+					// is authoritative (e.g. after failover reset).
+					// Only do this for intentional promotions (Secondary →
+					// Primary), NOT on initial boot (SecondaryHold → Primary)
+					// where VRRP should follow its own election timer.
+					if ev.OldState == cluster.StateSecondary {
+						d.vrrpMgr.ForceRGMaster(ev.GroupID)
+					}
+				}
+
 				// no-reth-vrrp direct mode: add VIPs + send GARPs +
 				// start per-RG services on primary transition.
 				if noRethVRRP {
@@ -2698,11 +2714,21 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 					go d.RefreshFabricFwd()
 				}
 			} else {
-				// Cluster-primary demotion is the continuity-critical edge
-				// for stale-owner forwarding. Stage session republish before
-				// rg_active waits for VRRP to follow this transition.
+				// Demotion: run preflight and resign VRRP BEFORE
+				// clearing rg_active (#485). The preflight shifts
+				// userspace flow cache entries to FabricRedirect so
+				// the demoting node forwards via fabric during the
+				// transition window. ResignRG must follow preflight
+				// so traffic is already on the fabric path before
+				// the VRRP BACKUP transition removes VIPs.
 				if clusterDemotionEdge && d.dp != nil {
 					d.tryPrepareUserspaceRGDemotion(ev.GroupID)
+				}
+				if !noRethVRRP {
+					if ev.OldState == cluster.StatePrimary &&
+						(ev.NewState == cluster.StateSecondary || ev.NewState == cluster.StateSecondaryHold) {
+						d.vrrpMgr.ResignRG(ev.GroupID)
+					}
 				}
 				// Deactivation: blackhole routes first (if transitioning
 				// to inactive), then clear rg_active.

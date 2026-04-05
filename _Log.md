@@ -2,9 +2,9 @@
 
 ## 2026-04-05
 
-- **Timestamp**: 2026-04-05T15:00:00Z
-  - **Action**: Issue #481 — Serialize per-RG ManualFailover to prevent back-to-back failover/failback from racing. Added `failoverInProgress` map to cluster Manager; ManualFailover rejects a second request for the same RG while one is in progress (including during the preHook barrier wait). The flag is cleared atomically under the same lock as the state change, whether the failover succeeds or fails. Different RGs can still failover concurrently.
-  - **File(s)**: pkg/cluster/cluster.go, pkg/cluster/cluster_test.go
+- **Timestamp**: 2026-04-05T22:00:00Z
+  - **Action**: Issue #485 — Fix TCP stream death on failback (node1→node0). Three fixes: (1) Reorder cluster Primary handler: set rg_active + pre-install neighbors BEFORE ForceRGMaster so BPF can forward the first packet arriving after VRRP installs VIPs. (2) Reorder cluster Secondary handler: run preflight (flow cache flush to FabricRedirect) BEFORE ResignRG so traffic shifts to fabric before VRRP removes VIPs. (3) Add syncMsgPrepareActivation message: demoting node notifies peer to pre-warm neighbor cache after preflight completes, giving the activating node a head start on ARP/NDP resolution.
+  - **File(s)**: pkg/daemon/daemon_ha.go, pkg/cluster/sync.go
 
 - **Timestamp**: 2026-04-05T12:00:00Z
   - **Action**: Fix TCP stream death on failback due to cold ARP cache on standby node. Root cause: `resolveNeighborsInner()` used `netlink.RouteGet()` to find the outgoing interface for static route next-hops, but on standby nodes the kernel route doesn't exist (FRR only installs it on the active). Added `addByIPOrConfig()` fallback that resolves the outgoing interface from config by matching the next-hop IP against configured interface subnets when the kernel FIB lookup fails.
