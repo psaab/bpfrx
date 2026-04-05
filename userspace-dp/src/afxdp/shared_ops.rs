@@ -111,7 +111,20 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     // the promoted sessions. Without this, workers only have reverse
     // sessions and incoming traffic on existing flows misses the forward
     // session lookup.
+    //
+    // Also publish forward sessions to the USERSPACE_SESSIONS BPF map
+    // synchronously (#475). Without this, there is a window between RG
+    // activation and the workers processing UpsertSynced where the XDP
+    // shim has no REDIRECT entry for forward flows. Packets arrive as
+    // session misses and can resolve to HAInactive if the worker hasn't
+    // yet applied the HA state update.
     for forward in &forward_entries {
+        let _ = publish_session_map_entry_for_session(
+            session_map_fd,
+            &forward.key,
+            forward.decision,
+            &forward.metadata,
+        );
         for commands in worker_commands {
             if let Ok(mut pending) = commands.lock() {
                 pending.push_back(WorkerCommand::UpsertSynced(forward.clone()));
@@ -138,6 +151,50 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
             }
         }
     }
+}
+
+/// Republish USERSPACE_SESSIONS BPF map entries for ALL shared sessions
+/// belonging to the given owner RGs.
+///
+/// Called during RG activation (#475) to close the gap where sessions
+/// exist in the shared table (received via sync) but their BPF map entries
+/// were deleted during the previous demotion cycle. The `reverse_prewarm`
+/// index only covers sessions added via `upsert_synced_session` — locally
+/// originated sessions that were demoted then re-synced may not appear
+/// there. This function uses the comprehensive `sessions` owner-RG index
+/// to ensure no session is missed.
+pub(super) fn republish_bpf_session_entries_for_owner_rgs(
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
+    session_map_fd: c_int,
+    owner_rgs: &[i32],
+) -> u32 {
+    if owner_rgs.is_empty() {
+        return 0;
+    }
+    let keys = owner_rg_session_keys_serialized(
+        shared_sessions,
+        &shared_owner_rg_indexes.sessions,
+        owner_rgs,
+    );
+    let sessions = match shared_sessions.lock() {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let mut published = 0u32;
+    for key in keys {
+        let Some(entry) = sessions.get(&key) else {
+            continue;
+        };
+        let _ = publish_session_map_entry_for_session(
+            session_map_fd,
+            &entry.key,
+            entry.decision,
+            &entry.metadata,
+        );
+        published += 1;
+    }
+    published
 }
 
 pub(super) fn lookup_shared_session(

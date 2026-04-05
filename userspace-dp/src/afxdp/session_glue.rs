@@ -3331,4 +3331,72 @@ mod tests {
         assert!(index.get(&1).is_some_and(|keys| keys.contains(&entry.key)));
         assert!(index.get(&2).is_some_and(|keys| keys.contains(&entry.key)));
     }
+
+    #[test]
+    fn republish_bpf_session_entries_covers_all_sessions_in_owner_rg_index() {
+        // Simulate the failover+failback scenario (#475):
+        // A session is in the shared sessions table and the `sessions`
+        // owner-RG index but NOT in the `reverse_prewarm_sessions` index
+        // (e.g., locally originated then demoted). The comprehensive
+        // republish function must find and attempt to publish it.
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+
+        let entry = SyncedSessionEntry {
+            key: test_key(),
+            decision: test_decision(),
+            metadata: SessionMetadata {
+                owner_rg_id: 1,
+                ..test_metadata()
+            },
+            origin: SessionOrigin::SyncImport,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+        };
+        // Publish to shared table + sessions index (but NOT reverse_prewarm).
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &entry,
+        );
+
+        // Verify the session is in the sessions index but not reverse_prewarm.
+        let sessions_index = shared_owner_rg_indexes
+            .sessions
+            .lock()
+            .expect("sessions index");
+        assert!(sessions_index.get(&1).is_some_and(|keys| keys.contains(&entry.key)));
+        drop(sessions_index);
+
+        let prewarm_index = shared_owner_rg_indexes
+            .reverse_prewarm_sessions
+            .lock()
+            .expect("prewarm index");
+        assert!(prewarm_index.get(&1).is_none() || prewarm_index.get(&1).unwrap().is_empty());
+        drop(prewarm_index);
+
+        // Call republish — it should find the session via the sessions index.
+        // Use fd=-1 (the BPF syscall will fail, but we verify the function
+        // iterates the right sessions and returns the count).
+        let count = republish_bpf_session_entries_for_owner_rgs(
+            &shared_sessions,
+            &shared_owner_rg_indexes,
+            -1,
+            &[1],
+        );
+        assert_eq!(count, 1, "should find 1 session for RG1");
+
+        // Unrelated RG should return 0.
+        let count = republish_bpf_session_entries_for_owner_rgs(
+            &shared_sessions,
+            &shared_owner_rg_indexes,
+            -1,
+            &[2],
+        );
+        assert_eq!(count, 0, "should find 0 sessions for RG2");
+    }
 }
