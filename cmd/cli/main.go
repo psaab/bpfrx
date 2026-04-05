@@ -20,6 +20,7 @@ import (
 
 	"github.com/chzyer/readline"
 	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -27,6 +28,44 @@ import (
 	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
 	"github.com/psaab/bpfrx/pkg/monitoriface"
 )
+
+const (
+	monitorEnterAltScreen = "\x1b[?1049h"
+	monitorExitAltScreen  = "\x1b[?1049l"
+	monitorClearAndHome   = "\x1b[2J\x1b[H"
+	monitorHideCursor     = "\x1b[?25l"
+	monitorShowCursor     = "\x1b[?25h"
+)
+
+type remoteMonitorFrame struct {
+	gen   uint64
+	frame string
+	err   error
+}
+
+func setMonitorRawMode(fd int) (*unix.Termios, error) {
+	old, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if err != nil {
+		return nil, err
+	}
+	raw := *old
+	raw.Lflag &^= unix.ECHO | unix.ICANON | unix.ISIG
+	raw.Cc[unix.VMIN] = 1
+	raw.Cc[unix.VTIME] = 0
+	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &raw); err != nil {
+		return nil, err
+	}
+	return old, nil
+}
+
+func restoreMonitorTermMode(fd int, old *unix.Termios) {
+	_ = unix.IoctlSetTermios(fd, unix.TCSETS, old)
+}
+
+func monitorInputIsTTY(fd int) bool {
+	_, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	return err == nil
+}
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:50051", "bpfrxd gRPC address")
@@ -3089,6 +3128,10 @@ func (c *ctl) handleMonitorInterface(args []string) error {
 	}
 	// "traffic" or no args → summary mode (empty interface_name).
 
+	if req.InterfaceName == "" && monitorInputIsTTY(int(os.Stdin.Fd())) {
+		return c.handleInteractiveMonitorInterfaceSummary(req)
+	}
+
 	ctx, cancel := context.WithCancel(c.ctx())
 	defer cancel()
 	stream, err := c.client.MonitorInterface(ctx, req)
@@ -3097,8 +3140,8 @@ func (c *ctl) handleMonitorInterface(args []string) error {
 	}
 
 	// Enter alternate screen buffer for full-screen display.
-	fmt.Print("\x1b[?1049h\x1b[?25l")
-	defer fmt.Print("\x1b[?25h\x1b[?1049l")
+	fmt.Print(monitorEnterAltScreen + monitorHideCursor)
+	defer fmt.Print(monitorShowCursor + monitorExitAltScreen)
 
 	for {
 		resp, err := stream.Recv()
@@ -3109,10 +3152,117 @@ func (c *ctl) handleMonitorInterface(args []string) error {
 			return fmt.Errorf("%v", err)
 		}
 		// Clear screen and print the frame.
-		fmt.Print("\x1b[2J\x1b[H")
+		fmt.Print(monitorClearAndHome)
 		fmt.Print(resp.Frame)
 	}
 	return nil
+}
+
+func (c *ctl) handleInteractiveMonitorInterfaceSummary(req *pb.MonitorInterfaceRequest) error {
+	fd := int(os.Stdin.Fd())
+	old, err := setMonitorRawMode(fd)
+	if err != nil {
+		return fmt.Errorf("failed to set raw mode: %w", err)
+	}
+	defer restoreMonitorTermMode(fd, old)
+
+	fmt.Print(monitorEnterAltScreen + monitorHideCursor)
+	defer fmt.Print(monitorShowCursor + monitorExitAltScreen)
+
+	keyCh := make(chan byte, 8)
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if err != nil || n == 0 {
+				return
+			}
+			keyCh <- buf[0]
+		}
+	}()
+
+	frameCh := make(chan remoteMonitorFrame, 16)
+	ctx, cancel := context.WithCancel(c.ctx())
+	defer cancel()
+
+	var (
+		streamCancel context.CancelFunc
+		streamGen    uint64
+	)
+	startStream := func(mode pb.MonitorInterfaceSummaryMode) error {
+		if streamCancel != nil {
+			streamCancel()
+		}
+		streamGen++
+		reqCopy := &pb.MonitorInterfaceRequest{
+			SummaryMode: mode,
+		}
+		gen := streamGen
+		streamCtx, cancelStream := context.WithCancel(ctx)
+		stream, err := c.client.MonitorInterface(streamCtx, reqCopy)
+		if err != nil {
+			cancelStream()
+			return err
+		}
+		streamCancel = cancelStream
+		go func() {
+			for {
+				resp, err := stream.Recv()
+				if err != nil {
+					select {
+					case frameCh <- remoteMonitorFrame{gen: gen, err: err}:
+					case <-ctx.Done():
+					}
+					return
+				}
+				select {
+				case frameCh <- remoteMonitorFrame{gen: gen, frame: resp.Frame}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+		return nil
+	}
+
+	mode := req.GetSummaryMode()
+	if err := startStream(mode); err != nil {
+		return fmt.Errorf("%v", err)
+	}
+	defer func() {
+		if streamCancel != nil {
+			streamCancel()
+		}
+	}()
+
+	for {
+		select {
+		case frame := <-frameCh:
+			if frame.gen != streamGen {
+				continue
+			}
+			if frame.err != nil {
+				if frame.err == io.EOF {
+					return nil
+				}
+				return fmt.Errorf("%v", frame.err)
+			}
+			fmt.Print(monitorClearAndHome)
+			fmt.Print(frame.frame)
+		case key := <-keyCh:
+			if isMonitorQuitKey(key) {
+				return nil
+			}
+			nextMode, ok := remoteMonitorSummaryModeFromKey(key)
+			if !ok || nextMode == mode {
+				continue
+			}
+			mode = nextMode
+			if err := startStream(mode); err != nil {
+				return fmt.Errorf("%v", err)
+			}
+		}
+	}
 }
 
 func remoteMonitorSummaryMode(args []string) (pb.MonitorInterfaceSummaryMode, error) {
@@ -3135,6 +3285,32 @@ func remoteMonitorSummaryMode(args []string) (pb.MonitorInterfaceSummaryMode, er
 		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_RATE, nil
 	default:
 		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_COMBINED, nil
+	}
+}
+
+func remoteMonitorSummaryModeFromKey(key byte) (pb.MonitorInterfaceSummaryMode, bool) {
+	switch key {
+	case 'c', 'C':
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_COMBINED, true
+	case 'p', 'P':
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_PACKETS, true
+	case 'b', 'B':
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_BYTES, true
+	case 'd', 'D':
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_DELTA, true
+	case 'r', 'R':
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_RATE, true
+	default:
+		return pb.MonitorInterfaceSummaryMode_MONITOR_INTERFACE_SUMMARY_MODE_COMBINED, false
+	}
+}
+
+func isMonitorQuitKey(key byte) bool {
+	switch key {
+	case 'q', 'Q', 0x1b, 0x03:
+		return true
+	default:
+		return false
 	}
 }
 
