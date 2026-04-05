@@ -1304,6 +1304,10 @@ func (s *SessionSync) SendFence() error {
 // if the send fails, the activation path still works (slightly slower
 // neighbor resolution via warmNeighborCache).
 func (s *SessionSync) SendPrepareActivation(rgID int) {
+	if rgID < 0 || rgID > 255 {
+		slog.Warn("cluster sync: prepare_activation rgID out of range", "rg", rgID)
+		return
+	}
 	conn := s.getActiveConn()
 	if conn == nil {
 		return
