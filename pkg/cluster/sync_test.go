@@ -2296,10 +2296,12 @@ func TestBarrierSeqNoCollisionAcrossReconnect(t *testing.T) {
 		t.Fatal("cycle 1 waiter not closed on disconnect")
 	}
 
-	// barrierSeq must NOT have been reset, so next seq is 2, not 1.
-	nextSeq := ss.barrierSeq.Load()
-	if nextSeq != 1 {
-		t.Fatalf("barrierSeq after disconnect = %d, want 1", nextSeq)
+	// barrierSeq must NOT have been reset: the current counter value
+	// remains 1, so the next sequence allocated by barrierSeq.Add(1)
+	// will be 2, not 1 (which would collide with cycle 1).
+	currentSeq := ss.barrierSeq.Load()
+	if currentSeq != 1 {
+		t.Fatalf("barrierSeq after disconnect = %d, want 1", currentSeq)
 	}
 
 	// Reconnect — cycle 2 barrier gets seq=2 (barrierSeq.Add(1)).

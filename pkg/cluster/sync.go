@@ -2227,7 +2227,9 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		// connection holds seq=N, and after reset the next barrier reuses
 		// seq=N. When the stale goroutine's timer fires it deletes the
 		// new waiter, causing the new barrier to time out (#458).
-		s.barrierAckSeq.Store(0)
+		// Keep barrierAckSeq monotonic too — resetting to 0 can cause a
+		// completed barrier to be misclassified as a disconnect if the
+		// waiter goroutine checks after handleDisconnect runs.
 		s.barrierWaitMu.Lock()
 		clearedWaiters := len(s.barrierWaiters)
 		staleWaiters := s.barrierWaiters
