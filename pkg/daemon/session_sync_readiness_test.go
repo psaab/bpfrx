@@ -182,16 +182,14 @@ func TestReconnectAfterBulkPreservesPrimedState(t *testing.T) {
 	// bulkEverCompleted flag which is set in the receiveLoop.
 	// For this unit test, just verify the cold-start vs warm-start paths.
 
-	// Simulate disconnect then reconnect (cold start because
-	// BulkEverCompleted is false — the BulkEnd was handled by daemon
-	// callback but we can't set the internal flag from daemon tests).
+	// Simulate disconnect then reconnect. Since we can't set the cluster
+	// package's bulkEverCompleted flag from daemon-layer tests, this is
+	// treated as a cold start. The warm-reconnect path (where primed state
+	// is preserved) is covered by cluster-level tests in sync_test.go:
+	// TestReconnectAfterBulkSkipsBulkSync and TestBulkEverCompletedSurvivesDisconnect.
+	// This test verifies the daemon callbacks don't panic on the cycle.
 	d.onSessionSyncPeerDisconnected()
 	d.onSessionSyncPeerConnected()
-
-	// Since BulkEverCompleted is false (we can't set it from outside the
-	// cluster package in a white-box way), this will be treated as a cold
-	// start. The cluster-level tests cover the warm reconnect path.
-	// This test verifies the daemon callback doesn't panic.
 }
 
 // TestColdStartResetsReadiness verifies that a true cold start (no prior
