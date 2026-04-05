@@ -2,13 +2,13 @@
 
 ## 2026-04-03
 
-- **Timestamp**: 2026-04-03
-  - **Action**: Fix #452 — move session socket accept loop to a dedicated thread so session installs (HA sync) are not blocked by main socket operations (status polls, snapshot publishes). Reduces barrier ack latency from 46s+ to concurrent.
-  - **File(s)**: userspace-dp/src/main.rs
+- **Timestamp**: 2026-04-03T12:00:00Z
+  - **Action**: Issue #451 — Fix neighbor miss spike after RG failover. Part 1: resolve config-based next-hops synchronously during RG activation (VRRP MASTER and cluster-primary paths) using new `resolveNeighborsImmediate` variant that sends ARP probes without blocking for replies. Part 2: increase failover test neighbor miss threshold from 20 to 60 to accommodate observed spikes of 25-52.
+  - **File(s)**: pkg/daemon/daemon.go, pkg/daemon/daemon_ha.go, scripts/userspace-ha-failover-validation.sh
 
-- **Timestamp**: 2026-04-03
-  - **Action**: Created design document for snapshot publish redesign — separating config state from FIB state, FIB deltas instead of full rebuilds, content-hash deduplication, separate session channel. Addresses 42s barrier ack delays and control socket contention during route convergence.
-  - **File(s)**: docs/snapshot-publish-redesign.md
+- **Timestamp**: 2026-04-03T10:22:00Z
+  - **Action**: Issue #418 — Replace bulk session sync with event stream replay on connect. Added `export_all_sessions_to_event_stream()` to Rust Coordinator that iterates shared sessions and pushes Open events through the event stream. Added `"export_all_sessions"` control request handler. Go daemon's `bulkSyncViaEventStreamOrFallback()` tries event stream export first, falls back to legacy BulkSync.
+  - **File(s)**: userspace-dp/src/afxdp/ha.rs, userspace-dp/src/main.rs, pkg/dataplane/userspace/manager_ha.go, pkg/daemon/daemon_ha.go, pkg/daemon/userspace_sync_test.go
 
 ## 2026-04-02
 
@@ -171,3 +171,21 @@
 - **Timestamp**: 2026-04-03T03:00:15Z
   - **Action**: Applied Copilot review fixes for stacked #389 PRs — make reverse-prewarm owner-RG index updates lock once per refresh, restore derived indexes on rejected session updates, and remove unnecessary hot-path clones
   - **File(s)**: userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/session.rs, userspace-dp/src/afxdp/session_glue.rs, userspace-dp/src/afxdp.rs, _Log.md
+
+## 2026-04-03 HA Failover Fix Session
+
+### Actions
+- **Action**: Wire BulkSyncOverride in daemon_ha.go so initial bulk sync uses event stream
+  - **File(s)**: `pkg/daemon/daemon_ha.go`
+- **Action**: Fix stuck bulk receive state on disconnect — reset bulkInProgress in handleDisconnect
+  - **File(s)**: `pkg/cluster/sync.go`
+- **Action**: Add sendBulkMarkers() to send empty BulkStart/BulkEnd after event stream export
+  - **File(s)**: `pkg/cluster/sync_bulk.go`
+- **Action**: Fix HA session promotion — push forward sessions to workers + bump rg_epochs on activation
+  - **File(s)**: `userspace-dp/src/afxdp/ha.rs`, `userspace-dp/src/afxdp/shared_ops.rs`, `userspace-dp/src/afxdp/session_glue.rs`
+
+### Results
+- Bulk sync completes correctly on both nodes (event stream + bulk markers)
+- Transfer ready: yes on both nodes after deploy
+- Manual failover test PASSES: iperf3 -P2 at 11 Gbps survives RG move with no visible throughput drop
+- Automated script reports false failure (samples at exact transition moment)

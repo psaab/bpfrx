@@ -2552,11 +2552,24 @@ func stripCIDR(s string) string {
 	return ip.String()
 }
 
+// resolveNeighborsImmediate sends ARP/NDP probes for config-based next-hops
+// without the follow-up sleep. Used during failover activation where the
+// probes must go out immediately but we cannot block the event handler for
+// 500ms waiting for replies. Probes resolve in the background; the periodic
+// resolution loop picks up any stragglers within 15 seconds.
+func (d *Daemon) resolveNeighborsImmediate(cfg *config.Config) {
+	d.resolveNeighborsInner(cfg, false)
+}
+
 // resolveNeighbors proactively triggers ARP/NDP resolution for all known
 // next-hops, gateways, NAT destinations, and address-book host entries.
 // This ensures bpf_fib_lookup returns SUCCESS (with valid MAC addresses)
 // instead of NO_NEIGH for the first packet.
 func (d *Daemon) resolveNeighbors(cfg *config.Config) {
+	d.resolveNeighborsInner(cfg, true)
+}
+
+func (d *Daemon) resolveNeighborsInner(cfg *config.Config, waitForReplies bool) {
 	type target struct {
 		neighborIP net.IP
 		linkIndex  int
@@ -2731,8 +2744,10 @@ func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 
 	if resolved > 0 {
 		slog.Info("proactive neighbor resolution", "resolving", resolved, "total_targets", len(targets))
-		// Brief pause to allow ARP responses
-		time.Sleep(500 * time.Millisecond)
+		if waitForReplies {
+			// Brief pause to allow ARP responses
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 }
 
