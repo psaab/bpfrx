@@ -367,7 +367,13 @@ func (s *SessionSync) WaitForPeerBarrier(timeout time.Duration) error {
 	defer timer.Stop()
 	select {
 	case <-waiter:
-		return nil
+		// The waiter channel can be closed by either completeBarrierWait
+		// (barrier acked) or handleDisconnect (connection lost). Check
+		// whether the barrier was actually acknowledged.
+		if s.barrierAckSeq.Load() >= seq {
+			return nil
+		}
+		return fmt.Errorf("session sync disconnected during barrier wait seq=%d", seq)
 	case <-timer.C:
 		s.barrierWaitMu.Lock()
 		delete(s.barrierWaiters, seq)

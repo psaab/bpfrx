@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-04-04
+
+- **Timestamp**: 2026-04-04T20:50:00Z
+  - **Action**: Issue #458 — Fix session sync barrier timeout on second failover cycle. Root cause: `handleDisconnect` reset `barrierSeq` to 0, causing sequence collisions between stale goroutines and new barriers. Also closed waiter channels on disconnect to prevent goroutine leaks. Added `barrierAckSeq` check in `WaitForPeerBarrier` to distinguish disconnect from ack.
+  - **File(s)**: pkg/cluster/sync.go, pkg/cluster/sync_bulk.go, pkg/cluster/sync_test.go
+
 ## 2026-04-03
 
 - **Timestamp**: 2026-04-03T12:00:00Z

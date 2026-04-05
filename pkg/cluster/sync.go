@@ -2221,12 +2221,25 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 	if !connected {
 		pendingBarriers := s.barrierSeq.Load()
 		ackedBarriers := s.barrierAckSeq.Load()
-		s.barrierSeq.Store(0)
-		s.barrierAckSeq.Store(0)
+		// Do NOT reset barrierSeq — the monotonic counter must keep
+		// incrementing across reconnects. Resetting to 0 causes sequence
+		// collisions: a stale WaitForPeerBarrier goroutine from the old
+		// connection holds seq=N, and after reset the next barrier reuses
+		// seq=N. When the stale goroutine's timer fires it deletes the
+		// new waiter, causing the new barrier to time out (#458).
+		// Keep barrierAckSeq monotonic too — resetting to 0 can cause a
+		// completed barrier to be misclassified as a disconnect if the
+		// waiter goroutine checks after handleDisconnect runs.
 		s.barrierWaitMu.Lock()
 		clearedWaiters := len(s.barrierWaiters)
+		staleWaiters := s.barrierWaiters
 		s.barrierWaiters = nil
 		s.barrierWaitMu.Unlock()
+		// Close stale waiter channels so any blocked WaitForPeerBarrier
+		// goroutine wakes up immediately instead of leaking until timeout.
+		for _, ch := range staleWaiters {
+			close(ch)
+		}
 		s.failoverWaitMu.Lock()
 		failoverWaiters := s.failoverWaiters
 		failoverCommitWaiters := s.failoverCommitWaiters
