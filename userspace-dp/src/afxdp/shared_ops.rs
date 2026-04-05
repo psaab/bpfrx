@@ -118,18 +118,27 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     // shim has no REDIRECT entry for forward flows. Packets arrive as
     // session misses and can resolve to HAInactive if the worker hasn't
     // yet applied the HA state update.
+    let mut fwd_publish_errors = 0u32;
     for forward in &forward_entries {
-        let _ = publish_session_map_entry_for_session(
+        if publish_session_map_entry_for_session(
             session_map_fd,
             &forward.key,
             forward.decision,
             &forward.metadata,
-        );
+        ).is_err() {
+            fwd_publish_errors += 1;
+        }
         for commands in worker_commands {
             if let Ok(mut pending) = commands.lock() {
                 pending.push_back(WorkerCommand::UpsertSynced(forward.clone()));
             }
         }
+    }
+    if fwd_publish_errors > 0 {
+        eprintln!(
+            "bpfrx-ha: prewarm forward BPF publish: {} errors out of {} entries",
+            fwd_publish_errors, forward_entries.len()
+        );
     }
     for reverse in reverse_entries {
         publish_shared_session(
@@ -177,22 +186,36 @@ pub(super) fn republish_bpf_session_entries_for_owner_rgs(
         &shared_owner_rg_indexes.sessions,
         owner_rgs,
     );
-    let sessions = match shared_sessions.lock() {
-        Ok(s) => s,
-        Err(_) => return 0,
+    // Collect entries under the lock, then release before BPF syscalls
+    // to avoid blocking concurrent session insert/remove/lookup.
+    let entries: Vec<_> = {
+        let sessions = match shared_sessions.lock() {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        keys.iter()
+            .filter_map(|key| sessions.get(key).map(|e| (e.key.clone(), e.decision, e.metadata.clone())))
+            .collect()
     };
     let mut published = 0u32;
-    for key in keys {
-        let Some(entry) = sessions.get(&key) else {
-            continue;
-        };
-        let _ = publish_session_map_entry_for_session(
+    let mut errors = 0u32;
+    for (key, decision, metadata) in &entries {
+        if publish_session_map_entry_for_session(
             session_map_fd,
-            &entry.key,
-            entry.decision,
-            &entry.metadata,
+            key,
+            *decision,
+            metadata,
+        ).is_ok() {
+            published += 1;
+        } else {
+            errors += 1;
+        }
+    }
+    if errors > 0 {
+        eprintln!(
+            "bpfrx-ha: republish_bpf_session_entries: {} errors out of {} attempted",
+            errors, published + errors
         );
-        published += 1;
     }
     published
 }

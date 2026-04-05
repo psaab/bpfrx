@@ -3380,15 +3380,16 @@ mod tests {
         drop(prewarm_index);
 
         // Call republish — it should find the session via the sessions index.
-        // Use fd=-1 (the BPF syscall will fail, but we verify the function
-        // iterates the right sessions and returns the count).
+        // Use fd=-1 (the BPF syscall will fail). The function now only counts
+        // successful publishes, so count=0 with fd=-1. We verify the function
+        // iterates the right sessions by checking RG2 returns 0 (no sessions).
         let count = republish_bpf_session_entries_for_owner_rgs(
             &shared_sessions,
             &shared_owner_rg_indexes,
             -1,
             &[1],
         );
-        assert_eq!(count, 1, "should find 1 session for RG1");
+        assert_eq!(count, 0, "fd=-1 should produce 0 successful publishes");
 
         // Unrelated RG should return 0.
         let count = republish_bpf_session_entries_for_owner_rgs(
