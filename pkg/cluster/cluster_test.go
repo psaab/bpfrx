@@ -419,6 +419,115 @@ func TestManualFailover_UnknownRG(t *testing.T) {
 	}
 }
 
+func TestManualFailover_RejectsBackToBack(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	// Pre-hook blocks until released, simulating a long barrier wait.
+	hookStarted := make(chan struct{})
+	hookRelease := make(chan struct{})
+	m.SetPreManualFailoverHook(func(rgID int) error {
+		close(hookStarted)
+		<-hookRelease
+		return nil
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- m.ManualFailover(0)
+	}()
+
+	// Wait for the first failover to enter the pre-hook.
+	<-hookStarted
+
+	// Second failover for the same RG should be rejected immediately.
+	err := m.ManualFailover(0)
+	if err == nil {
+		t.Fatal("expected error for back-to-back failover on same RG")
+	}
+	if !strings.Contains(err.Error(), "failover already in progress") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Release the first failover and verify it completes.
+	close(hookRelease)
+	if err := <-errCh; err != nil {
+		t.Fatalf("first failover should succeed: %v", err)
+	}
+
+	states := m.GroupStates()
+	if states[0].State != StateSecondaryHold {
+		t.Fatalf("state = %s, want secondary-hold", states[0].State)
+	}
+}
+
+func TestManualFailover_DifferentRGsAllowed(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200}),
+		makeRG(1, false, map[int]int{0: 200}),
+	)
+	m.UpdateConfig(cfg)
+	// Drain both RG events.
+	<-m.Events()
+	<-m.Events()
+
+	// Pre-hook blocks for RG 0 but not RG 1.
+	hookStarted := make(chan struct{})
+	hookRelease := make(chan struct{})
+	m.SetPreManualFailoverHook(func(rgID int) error {
+		if rgID == 0 {
+			close(hookStarted)
+			<-hookRelease
+		}
+		return nil
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- m.ManualFailover(0)
+	}()
+
+	<-hookStarted
+
+	// RG 1 failover should succeed even though RG 0 is in progress.
+	if err := m.ManualFailover(1); err != nil {
+		t.Fatalf("failover for different RG should succeed: %v", err)
+	}
+
+	close(hookRelease)
+	if err := <-errCh; err != nil {
+		t.Fatalf("RG 0 failover should succeed: %v", err)
+	}
+}
+
+func TestManualFailover_InProgressClearedOnPreHookError(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	m.SetPreManualFailoverHook(func(rgID int) error {
+		return fmt.Errorf("fatal hook error")
+	})
+
+	// First attempt fails.
+	if err := m.ManualFailover(0); err == nil {
+		t.Fatal("expected pre-hook error")
+	}
+
+	// Second attempt should NOT be rejected as "in progress" — the flag
+	// must have been cleared by the failed first attempt.
+	m.SetPreManualFailoverHook(func(rgID int) error {
+		return nil
+	})
+	if err := m.ManualFailover(0); err != nil {
+		t.Fatalf("retry after failed failover should succeed: %v", err)
+	}
+}
+
 func TestRequestPeerFailoverCommitsLocalPrimaryWithoutHeartbeatObservation(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
