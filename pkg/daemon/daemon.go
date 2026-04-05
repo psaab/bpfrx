@@ -2557,6 +2557,10 @@ func stripCIDR(s string) string {
 // probes must go out immediately but we cannot block the event handler for
 // 500ms waiting for replies. Probes resolve in the background; the periodic
 // resolution loop picks up any stragglers within 15 seconds.
+//
+// Runtime without the sleep: collects targets via netlink RouteGet +
+// NeighList (~1-2ms each) then fires ICMP/NS probes as goroutines.
+// For a typical config with 2-5 next-hops the blocking phase is <10ms.
 func (d *Daemon) resolveNeighborsImmediate(cfg *config.Config) {
 	d.resolveNeighborsInner(cfg, false)
 }
@@ -2565,6 +2569,12 @@ func (d *Daemon) resolveNeighborsImmediate(cfg *config.Config) {
 // next-hops, gateways, NAT destinations, and address-book host entries.
 // This ensures bpf_fib_lookup returns SUCCESS (with valid MAC addresses)
 // instead of NO_NEIGH for the first packet.
+//
+// Runtime: the synchronous portion collects targets via netlink RouteGet +
+// NeighList (~1-2ms each), then fires ICMP/NS probes as goroutines. For a
+// typical config with 2-5 next-hops, the blocking phase completes in <10ms.
+// The 500ms sleep at the end waits for ARP replies; callers that cannot
+// afford the sleep should invoke this from a goroutine.
 func (d *Daemon) resolveNeighbors(cfg *config.Config) {
 	d.resolveNeighborsInner(cfg, true)
 }

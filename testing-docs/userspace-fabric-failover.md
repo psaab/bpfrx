@@ -370,14 +370,14 @@ nodes for:
 Default thresholds:
 
 - `MAX_FAILOVER_SESSION_MISS_DELTA=64`
-- `MAX_FAILOVER_NEIGHBOR_MISS_DELTA=20`
+- `MAX_FAILOVER_NEIGHBOR_MISS_DELTA=60`
 - `MAX_FAILOVER_ROUTE_MISS_DELTA=32`
 - `MAX_FAILOVER_POLICY_DENIED_DELTA=0`
 
 These values were tuned from live `loss` userspace-cluster artifacts:
 
 - clean failover phases stayed around session-miss deltas of `10-28`
-- clean failover phases stayed around neighbor-miss deltas of `0-16`
+- clean failover phases stayed around neighbor-miss deltas of `0-52`
 - route-miss and policy-deny deltas stayed at `0`
 
 This catches:

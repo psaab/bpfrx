@@ -2601,6 +2601,11 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				d.removeBlackholeRoutes(ev.GroupID)
 				// Resolve config-based next-hops synchronously so
 				// ARP probes go out before the event loop continues.
+				// Safe before VIP installation: targets are gateway
+				// next-hops and DNAT/static-NAT hosts resolved via
+				// RouteGet on already-configured interfaces — no
+				// dependency on RETH VIPs (added later by VRRP MASTER
+				// or directAddVIPs).
 				if cfg := d.store.ActiveConfig(); cfg != nil {
 					d.resolveNeighborsImmediate(cfg)
 				}
