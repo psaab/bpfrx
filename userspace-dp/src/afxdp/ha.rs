@@ -325,17 +325,17 @@ impl super::Coordinator {
             &self.shared_owner_rg_indexes,
             &entry,
         );
-        // Publish the forward session to the userspace_sessions BPF map
-        // IMMEDIATELY so the XDP shim can redirect matching packets to XSK.
-        // Previously this was deferred to async worker processing, creating
-        // a window where the XDP shim couldn't see synced forward sessions
-        // and packets bypassed the userspace dataplane.
+        // Publish the session to the userspace_sessions BPF map IMMEDIATELY
+        // so the XDP shim can redirect matching packets to XSK. Previously
+        // forward sessions were deferred to async worker processing, creating
+        // a window where the XDP shim couldn't see synced sessions and packets
+        // bypassed the userspace dataplane.
         if let Some(session_map_fd) = self.session_map_fd.as_ref() {
             let _ = publish_live_session_entry(
                 session_map_fd.fd,
                 &entry.key,
                 entry.decision.nat,
-                true,
+                entry.metadata.is_reverse,
             );
         }
         refresh_reverse_prewarm_owner_rg_indexes(
