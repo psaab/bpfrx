@@ -271,6 +271,13 @@ type SessionSync struct {
 	pendingBulkAckEpoch atomic.Uint64
 	pendingBulkAckSince atomic.Int64 // UnixNano
 
+	// bulkEverCompleted tracks whether at least one full bulk sync exchange
+	// has completed during this daemon instance's lifetime. Once true it
+	// survives reconnects; only a daemon restart resets it. Used to
+	// distinguish a true cold start (needs bulk) from a routine reconnect
+	// or fabric flip (incremental sync is sufficient).
+	bulkEverCompleted atomic.Bool
+
 	// Bulk receive tracking for stale-entry reconciliation.
 	// During bulk receive (BulkStart..BulkEnd), track all received
 	// forward session keys. On BulkEnd, delete local sessions in
@@ -432,6 +439,12 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 // IsConnected returns true if the peer connection is established.
 func (s *SessionSync) IsConnected() bool {
 	return s.stats.Connected.Load()
+}
+
+// BulkEverCompleted reports whether at least one full bulk sync exchange
+// has completed during this daemon instance's lifetime.
+func (s *SessionSync) BulkEverCompleted() bool {
+	return s.bulkEverCompleted.Load()
 }
 
 // ActiveFabric returns which fabric carries sync traffic: 0, 1, or -1 if disconnected.
@@ -598,35 +611,41 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	// Exchange monotonic clocks on every new connection.
 	s.sendClockSync(conn)
 
-	// A new connection that becomes the active transport also needs a fresh
-	// bulk sync. Otherwise one side can reconnect on the preferred fabric
-	// while the peer never sends its own current-generation bulk on that path,
-	// leaving reverse-direction sync admission permanently incomplete.
+	// Only trigger bulk sync on a true cold start — when we have never
+	// completed a bulk exchange during this daemon instance's lifetime.
+	// Routine reconnects (brief network blip) and active-fabric flips
+	// already have synced sessions; they resume incremental sync
+	// immediately without the overhead of a full bulk transfer (#466).
+	coldStart := !s.bulkEverCompleted.Load()
 	if wasDisconnected {
 		slog.Info("cluster sync: first connection after disconnect",
 			"fabric", fabricIdx,
-			"remote", connRemoteAddrString(conn))
+			"remote", connRemoteAddrString(conn),
+			"cold_start", coldStart)
 		s.flushDeleteJournal()
 		if s.OnPeerConnected != nil {
 			slog.Info("cluster sync: scheduling OnPeerConnected callback",
 				"fabric", fabricIdx)
 			go s.OnPeerConnected()
 		}
-		slog.Info("cluster sync: starting bulk sync on new connection",
-			"fabric", fabricIdx,
-			"remote", connRemoteAddrString(conn))
-		if err := s.doBulkSync(); err != nil {
-			slog.Warn("cluster sync: bulk sync failed", "err", err, "fabric", fabricIdx)
+		if coldStart {
+			slog.Info("cluster sync: starting bulk sync on cold start",
+				"fabric", fabricIdx,
+				"remote", connRemoteAddrString(conn))
+			if err := s.doBulkSync(); err != nil {
+				slog.Warn("cluster sync: bulk sync failed", "err", err, "fabric", fabricIdx)
+			}
+		} else {
+			slog.Info("cluster sync: skipping bulk sync on reconnect (already primed)",
+				"fabric", fabricIdx,
+				"remote", connRemoteAddrString(conn))
 		}
 	} else if becameActive {
-		slog.Info("cluster sync: starting bulk sync on newly active connection",
+		slog.Info("cluster sync: active fabric changed, resuming incremental sync",
 			"fabric", fabricIdx,
 			"remote", connRemoteAddrString(conn),
 			"active_before", activeBefore,
 			"active_after", activeAfter)
-		if err := s.doBulkSync(); err != nil {
-			slog.Warn("cluster sync: bulk sync on active connection failed", "err", err, "fabric", fabricIdx)
-		}
 	} else {
 		slog.Info("cluster sync: connection added without bulk sync",
 			"fabric", fabricIdx,
@@ -1730,6 +1749,7 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			"local", connLocalAddrString(conn),
 			"remote", connRemoteAddrString(conn))
 		s.sendBulkAck(conn, epoch)
+		s.bulkEverCompleted.Store(true)
 		if s.OnBulkSyncReceived != nil {
 			go s.OnBulkSyncReceived()
 		}
@@ -1754,6 +1774,7 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			s.pendingBulkAckEpoch.Store(0)
 			s.pendingBulkAckSince.Store(0)
 		}
+		s.bulkEverCompleted.Store(true)
 		if s.OnBulkSyncAckReceived != nil {
 			go s.OnBulkSyncAckReceived()
 		}

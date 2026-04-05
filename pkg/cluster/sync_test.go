@@ -2069,7 +2069,10 @@ func TestTransferReadinessReportsPendingBulkAckAndBulkReceive(t *testing.T) {
 	}
 }
 
-func TestHandleNewConnectionStartsBulkSyncWhenConnectionBecomesActive(t *testing.T) {
+// TestHandleNewConnectionSkipsBulkSyncOnActiveFabricChange verifies that an
+// active-fabric flip does NOT trigger a bulk sync (#466). Sessions are already
+// synced; incremental sync resumes on the new transport.
+func TestHandleNewConnectionSkipsBulkSyncOnActiveFabricChange(t *testing.T) {
 	dp := &mockSweepDP{
 		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
 			{SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2}, SrcPort: 1234, DstPort: 80, Protocol: 6}: {
@@ -2103,12 +2106,11 @@ func TestHandleNewConnectionStartsBulkSyncWhenConnectionBecomesActive(t *testing
 
 	ctx, cancel := context.WithCancel(context.Background())
 	ss.handleNewConnection(ctx, 0, newLocal)
-	epoch, _, ok := ss.PendingBulkAck()
-	if !ok {
-		t.Fatal("expected pending bulk ack after active connection replacement")
-	}
-	if epoch != 1 {
-		t.Fatalf("pending bulk epoch = %d, want 1", epoch)
+
+	// Active fabric changed from 1→0 but this should NOT trigger bulk sync.
+	_, _, ok := ss.PendingBulkAck()
+	if ok {
+		t.Fatal("active fabric change should NOT trigger bulk sync (#466)")
 	}
 
 	cancel()
@@ -2816,5 +2818,137 @@ func TestSweepIntervalsClampIdleToActive(t *testing.T) {
 	}
 	if idle != 20*time.Second {
 		t.Fatalf("idle interval = %v, want %v", idle, 20*time.Second)
+	}
+}
+
+// TestHandleNewConnectionColdStartTriggersBulkSync verifies that the first
+// connection on a fresh daemon start triggers a bulk sync (#466).
+func TestHandleNewConnectionColdStartTriggersBulkSync(t *testing.T) {
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2}, SrcPort: 1234, DstPort: 80, Protocol: 6}: {
+				IngressZone: 1,
+			},
+		},
+	}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return true }
+
+	if ss.BulkEverCompleted() {
+		t.Fatal("fresh SessionSync should not be bulk-ever-completed")
+	}
+
+	local, peer := net.Pipe()
+	defer peer.Close()
+
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 8192)
+		for {
+			if _, err := peer.Read(buf); err != nil {
+				if err == io.EOF || strings.Contains(err.Error(), "closed pipe") {
+					readDone <- nil
+					return
+				}
+				readDone <- err
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ss.handleNewConnection(ctx, 0, local)
+
+	// Cold start: bulkEverCompleted is false, so bulk should fire.
+	epoch, _, ok := ss.PendingBulkAck()
+	if !ok {
+		t.Fatal("expected bulk sync on cold start connection")
+	}
+	if epoch != 1 {
+		t.Fatalf("pending bulk epoch = %d, want 1", epoch)
+	}
+
+	cancel()
+	local.Close()
+	if err := <-readDone; err != nil {
+		t.Fatalf("peer drain failed: %v", err)
+	}
+}
+
+// TestHandleNewConnectionReconnectSkipsBulkSync verifies that a reconnect
+// after a prior bulk exchange does NOT trigger bulk sync (#466).
+func TestHandleNewConnectionReconnectSkipsBulkSync(t *testing.T) {
+	dp := &mockSweepDP{
+		v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{
+			{SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2}, SrcPort: 1234, DstPort: 80, Protocol: 6}: {
+				IngressZone: 1,
+			},
+		},
+	}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.IsPrimaryFn = func() bool { return true }
+
+	// Simulate a prior bulk exchange completing.
+	ss.bulkEverCompleted.Store(true)
+
+	local, peer := net.Pipe()
+	defer peer.Close()
+
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 8192)
+		for {
+			if _, err := peer.Read(buf); err != nil {
+				if err == io.EOF || strings.Contains(err.Error(), "closed pipe") {
+					readDone <- nil
+					return
+				}
+				readDone <- err
+				return
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// wasDisconnected=true (no existing connections), but bulkEverCompleted
+	// is true so bulk should be skipped.
+	ss.handleNewConnection(ctx, 0, local)
+
+	_, _, ok := ss.PendingBulkAck()
+	if ok {
+		t.Fatal("reconnect after prior bulk exchange should NOT trigger bulk sync (#466)")
+	}
+
+	cancel()
+	local.Close()
+	if err := <-readDone; err != nil {
+		t.Fatalf("peer drain failed: %v", err)
+	}
+}
+
+// TestBulkEverCompletedDefaultsFalse verifies that a fresh SessionSync
+// has bulkEverCompleted=false.
+func TestBulkEverCompletedDefaultsFalse(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	if ss.BulkEverCompleted() {
+		t.Fatal("bulkEverCompleted should start false on a new SessionSync")
+	}
+}
+
+// TestBulkEverCompletedSurvivesDisconnect verifies that bulkEverCompleted
+// persists across disconnect/reconnect cycles.
+func TestBulkEverCompletedSurvivesDisconnect(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.bulkEverCompleted.Store(true)
+
+	// Simulate a disconnect.
+	local, peer := net.Pipe()
+	defer peer.Close()
+	ss.conn0 = local
+	ss.stats.Connected.Store(true)
+	ss.handleDisconnect(local)
+
+	if !ss.BulkEverCompleted() {
+		t.Fatal("bulkEverCompleted should survive disconnect")
 	}
 }
