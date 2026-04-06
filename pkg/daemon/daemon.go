@@ -218,20 +218,8 @@ type Daemon struct {
 	eventStreamConnected atomic.Bool
 
 	// userspaceDeltaSyncMu serializes helper delta draining between the
-	// periodic background sync loop and the RG demotion prepare path.
-	// Demotion prepare must drain and barrier its continuity-critical
-	// republish deltas itself; otherwise the background loop can consume
-	// them first and let demotion proceed without peer ack.
+	// event-stream fallback loop and the background polling loop.
 	userspaceDeltaSyncMu sync.Mutex
-	// userspaceDemotionPrepDepth pauses background incremental session-sync
-	// producers while demotion prep stages continuity-critical republish.
-	userspaceDemotionPrepDepth atomic.Int32
-	// demotionKernelJournal buffers kernel SESSION_OPEN events that arrive
-	// during demotion prep. Instead of dropping them, they are flushed to
-	// the peer before the final barrier.
-	demotionKernelJournalMu sync.Mutex
-	demotionKernelJournalV4 []journaledSessionV4
-	demotionKernelJournalV6 []journaledSessionV6
 	// userspaceDemotionPrepUntil suppresses duplicate demotion prep for the
 	// same RG during a single failover transition. Manual failover can now
 	// stage prep before ownership changes; the later cluster/VRRP edges must
@@ -498,8 +486,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// Deletes are synced if this node is primary for any RG — the peer
 		// ignores deletes for sessions it doesn't have.
 		gc.OnDeleteV4 = func(key dataplane.SessionKey) {
-			// Always sync deletes, even during demotion prep. Dropping
-			// deletes leaves stale sessions on the peer indefinitely.
+			// Always sync deletes. Dropping deletes leaves stale sessions
+			// on the peer indefinitely.
 			if d.cluster != nil && d.cluster.IsLocalPrimaryAny() && d.sessionSync != nil {
 				d.sessionSync.QueueDeleteV4(key)
 			}
@@ -546,8 +534,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 					}
 					proto := raw[53]
 					af := raw[55]
-					demotionActive := d.userspaceDemotionPrepActive()
-
 					if af == dataplane.AFInet6 {
 						var key dataplane.SessionKeyV6
 						copy(key.SrcIP[:], raw[8:24])
@@ -557,11 +543,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.Protocol = proto
 						if val, err := d.dp.GetSessionV6(key); err == nil && val.IsReverse == 0 {
 							if d.sessionSync.ShouldSyncZone(val.IngressZone) {
-								if demotionActive {
-									d.journalKernelSessionV6(key, val)
-								} else {
-									d.sessionSync.QueueSessionV6(key, val)
-								}
+								d.sessionSync.QueueSessionV6(key, val)
 							}
 						}
 					} else {
@@ -573,11 +555,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 						key.Protocol = proto
 						if val, err := d.dp.GetSessionV4(key); err == nil && val.IsReverse == 0 {
 							if d.sessionSync.ShouldSyncZone(val.IngressZone) {
-								if demotionActive {
-									d.journalKernelSessionV4(key, val)
-								} else {
-									d.sessionSync.QueueSessionV4(key, val)
-								}
+								d.sessionSync.QueueSessionV4(key, val)
 							}
 						}
 					}

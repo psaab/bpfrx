@@ -720,10 +720,6 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 		if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
 			continue
 		}
-		if d.userspaceDemotionPrepActive() {
-			continue
-		}
-
 		cfg := d.store.ActiveConfig()
 		if cfg == nil {
 			continue
@@ -792,11 +788,6 @@ func (d *Daemon) handleEventStreamDelta(eventType uint8, delta dpuserspace.Sessi
 		slog.Debug("userspace delta: dropped (sync not connected)", "type", eventType)
 		return
 	}
-	if d.userspaceDemotionPrepActive() {
-		slog.Debug("userspace delta: dropped (demotion prep active)", "type", eventType)
-		return
-	}
-
 	cfg := d.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -896,9 +887,6 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 			if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
 				continue
 			}
-			if d.userspaceDemotionPrepActive() {
-				continue
-			}
 			cfg := d.store.ActiveConfig()
 			if cfg == nil {
 				continue
@@ -922,9 +910,6 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 		if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
 			continue
 		}
-		if d.userspaceDemotionPrepActive() {
-			continue
-		}
 		cfg := d.store.ActiveConfig()
 		if cfg == nil {
 			continue
@@ -933,32 +918,6 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 		_, _ = d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
 		d.userspaceDeltaSyncMu.Unlock()
 	}
-}
-
-type journaledSessionV4 struct {
-	Key dataplane.SessionKey
-	Val dataplane.SessionValue
-}
-type journaledSessionV6 struct {
-	Key dataplane.SessionKeyV6
-	Val dataplane.SessionValueV6
-}
-
-func (d *Daemon) userspaceDemotionPrepActive() bool {
-	return d.userspaceDemotionPrepDepth.Load() > 0
-}
-
-// journalKernelSessionV4 buffers a kernel session event during demotion prep.
-func (d *Daemon) journalKernelSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) {
-	d.demotionKernelJournalMu.Lock()
-	d.demotionKernelJournalV4 = append(d.demotionKernelJournalV4, journaledSessionV4{key, val})
-	d.demotionKernelJournalMu.Unlock()
-}
-
-func (d *Daemon) journalKernelSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
-	d.demotionKernelJournalMu.Lock()
-	d.demotionKernelJournalV6 = append(d.demotionKernelJournalV6, journaledSessionV6{key, val})
-	d.demotionKernelJournalMu.Unlock()
 }
 
 func (d *Daemon) queueUserspaceSessionDeltas(
