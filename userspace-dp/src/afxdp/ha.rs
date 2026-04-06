@@ -343,24 +343,20 @@ impl super::Coordinator {
             &self.shared_owner_rg_indexes,
             &entry,
         );
-        // Only publish immediately when the worker path would also accept the
-        // synced entry immediately. On an active RG, worker upsert still
-        // protects live local sessions from being clobbered; publishing here
-        // would bypass that guard and can strand redirect keys that no worker
-        // actually installed.
-        if can_immediately_program_synced_bpf_entry(
-            ha_state.as_ref(),
-            entry.metadata.owner_rg_id,
-            now_secs,
-        ) {
-            if let Some(session_map_fd) = self.session_map_fd.as_ref() {
-                let _ = publish_live_session_entry(
-                    session_map_fd.fd,
-                    &entry.key,
-                    entry.decision.nat,
-                    entry.metadata.is_reverse,
-                );
-            }
+        // Always publish synced sessions to the BPF map immediately so the
+        // XDP shim can redirect matching packets to XSK. The worker path
+        // handles flow cache population and FIB resolution asynchronously,
+        // but the shim needs the entry NOW for failover continuity (#488).
+        // The worker's own upsert guard prevents clobbering live local
+        // sessions in the flow cache — the BPF map is safe to write because
+        // it only controls XSK redirect, not forwarding decisions.
+        if let Some(session_map_fd) = self.session_map_fd.as_ref() {
+            let _ = publish_live_session_entry(
+                session_map_fd.fd,
+                &entry.key,
+                entry.decision.nat,
+                entry.metadata.is_reverse,
+            );
         }
         refresh_reverse_prewarm_owner_rg_indexes(
             &self.shared_owner_rg_indexes.reverse_prewarm_sessions,
@@ -412,19 +408,13 @@ impl super::Coordinator {
             }
         });
         if let Some(entry) = removed_entry.as_ref() {
-            if can_immediately_program_synced_bpf_entry(
-                ha_state.as_ref(),
-                entry.metadata.owner_rg_id,
-                now_secs,
-            ) {
-                if let Some(session_map_fd) = self.session_map_fd.as_ref() {
-                    delete_session_map_entry_for_removed_session(
-                        session_map_fd.fd,
-                        &entry.key,
-                        entry.decision,
-                        &entry.metadata,
-                    );
-                }
+            if let Some(session_map_fd) = self.session_map_fd.as_ref() {
+                delete_session_map_entry_for_removed_session(
+                    session_map_fd.fd,
+                    &entry.key,
+                    entry.decision,
+                    &entry.metadata,
+                );
             }
         }
         remove_shared_session(
