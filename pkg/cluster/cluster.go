@@ -179,7 +179,8 @@ type Manager struct {
 	onEventDrop func()
 
 	// takeoverHoldTime is the minimum duration an RG must be ready before
-	// election will promote it to primary. Default: 3s.
+	// election will promote it to primary. Zero means immediate takeover
+	// once readiness is established.
 	takeoverHoldTime time.Duration
 
 	// syncReady is true once bulk session sync has been received (or timed
@@ -443,9 +444,16 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 	// Update peer fencing config.
 	m.peerFencing = cfg.PeerFencing
 
-	// Update takeover hold time.
+	// Update takeover hold time. Zero or negative resets to the default
+	// immediate-takeover behavior.
+	if cfg.TakeoverHoldTime < 0 {
+		slog.Warn("cluster: invalid negative takeover hold time, using default immediate takeover",
+			"takeover_hold_time_ms", cfg.TakeoverHoldTime)
+	}
 	if cfg.TakeoverHoldTime > 0 {
 		m.takeoverHoldTime = time.Duration(cfg.TakeoverHoldTime) * time.Millisecond
+	} else {
+		m.takeoverHoldTime = DefaultTakeoverHoldTime
 	}
 
 	// Store GARP counts and update monitor groups.
