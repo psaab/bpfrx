@@ -55,6 +55,7 @@ impl super::Coordinator {
             }
         }
         self.ha_state.store(Arc::new(state));
+        let mut ha_state_changed = false;
         if !demoted_rgs.is_empty() {
             demote_shared_owner_rgs(
                 &self.shared_sessions,
@@ -71,7 +72,7 @@ impl super::Coordinator {
                     self.rg_epochs[idx].fetch_add(1, Ordering::Release);
                 }
             }
-            self.enqueue_apply_ha_state(&[], &demoted_rgs);
+            ha_state_changed = true;
             // Record cache flush timestamp for observability (#312).
             self.last_cache_flush_at.store(now_secs, Ordering::Relaxed);
         }
@@ -90,11 +91,10 @@ impl super::Coordinator {
                     self.rg_epochs[idx].fetch_add(1, Ordering::Release);
                 }
             }
-            // Standby workers already keep session redirect keys programmed.
-            // Activation only needs an in-place refresh of the local session
-            // tables so previously demoted fabric redirects resolve back to
-            // local forwarding.
-            self.enqueue_apply_ha_state(&activated_rgs, &[]);
+            ha_state_changed = true;
+        }
+        if ha_state_changed {
+            self.enqueue_apply_ha_state();
         }
         Ok(())
     }
@@ -128,7 +128,7 @@ impl super::Coordinator {
         self.ha_state.store(Arc::new(state));
     }
 
-    fn enqueue_apply_ha_state(&self, refresh_owner_rgs: &[i32], demote_owner_rgs: &[i32]) {
+    fn enqueue_apply_ha_state(&self) {
         if self.workers.is_empty() {
             return;
         }
@@ -138,11 +138,7 @@ impl super::Coordinator {
             .saturating_add(1);
         for (worker_id, handle) in &self.workers {
             if let Ok(mut pending) = handle.commands.lock() {
-                pending.push_back(WorkerCommand::ApplyHAState {
-                    sequence,
-                    refresh_owner_rgs: refresh_owner_rgs.to_vec(),
-                    demote_owner_rgs: demote_owner_rgs.to_vec(),
-                });
+                pending.push_back(WorkerCommand::ApplyHAState { sequence });
             } else {
                 eprintln!(
                     "bpfrx-ha: worker-{} command mutex poisoned during HA state apply",
