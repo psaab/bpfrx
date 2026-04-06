@@ -349,7 +349,7 @@ func TestRGStateMachine_CurrentDesired(t *testing.T) {
 	}
 
 	// Interleaved: VRRP goes MASTER then BACKUP while we hold stale active=true.
-	s.SetVRRP("reth0", true) // epoch 2
+	s.SetVRRP("reth0", true)  // epoch 2
 	s.SetVRRP("reth0", false) // epoch 3, still active via cluster
 
 	active, epoch = s.CurrentDesired()
@@ -768,6 +768,30 @@ func TestStrictVIPOwnershipDualInactiveWindowPrevention(t *testing.T) {
 	tr = s.SetVRRP("reth0", false)
 	if !tr.Changed || tr.Active {
 		t.Error("strict: should deactivate when VRRP goes BACKUP")
+	}
+}
+
+func TestShouldRemoveBlackholesOnClusterPrimary_DefaultMode(t *testing.T) {
+	s := newRGStateMachine()
+	s.SetCluster(true)
+
+	if !shouldRemoveBlackholesOnClusterPrimary(s) {
+		t.Fatal("default mode should remove blackholes once cluster primary activates the RG")
+	}
+}
+
+func TestShouldRemoveBlackholesOnClusterPrimary_StrictVIPOwnership(t *testing.T) {
+	s := newRGStateMachine()
+	s.SetStrictVIPOwnership(true)
+	s.SetCluster(true)
+
+	if shouldRemoveBlackholesOnClusterPrimary(s) {
+		t.Fatal("strict VIP ownership should keep blackholes until VRRP ownership is active")
+	}
+
+	s.SetVRRP("reth0", true)
+	if !shouldRemoveBlackholesOnClusterPrimary(s) {
+		t.Fatal("strict VIP ownership should remove blackholes after VRRP ownership activates the RG")
 	}
 }
 
