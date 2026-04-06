@@ -625,6 +625,25 @@ func TestSetRGReady_TransitionsAndTimer(t *testing.T) {
 	}
 }
 
+func TestNewManager_DefaultTakeoverHoldTimeIsImmediate(t *testing.T) {
+	m := NewManager(0, 1)
+	if m.takeoverHoldTime != 0 {
+		t.Fatalf("takeoverHoldTime = %v, want 0", m.takeoverHoldTime)
+	}
+
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	m.SetRGReady(0, true, nil)
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if got := m.groups[0].holdTimer; got != nil {
+		t.Fatal("holdTimer should stay nil when takeover hold defaults to immediate")
+	}
+}
+
 func TestIsReadyForTakeover(t *testing.T) {
 	rg := &RedundancyGroupState{GroupID: 0}
 

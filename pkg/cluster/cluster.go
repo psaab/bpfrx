@@ -58,7 +58,7 @@ type RedundancyGroupState struct {
 	MonitorFails     []string // names of currently-failed monitors
 
 	// Readiness gate: blocks promotion to primary until interfaces + VRRP
-	// are confirmed ready and have been ready for at least TakeoverHoldTime.
+	// are confirmed ready. TakeoverHoldTime is an optional extra delay.
 	Ready            bool        // true if all local prerequisites are satisfied
 	ReadySince       time.Time   // when Ready transitioned to true (zero if not ready)
 	ReadinessReasons []string    // reasons why not ready (empty when ready)
@@ -200,9 +200,10 @@ type Manager struct {
 	failoverInProgress map[int]bool
 }
 
-// DefaultTakeoverHoldTime is the default duration an RG must be ready
-// before election promotes it to primary.
-const DefaultTakeoverHoldTime = 3 * time.Second
+// DefaultTakeoverHoldTime is the default additional delay after an RG becomes
+// ready before election promotes it to primary. Zero means promote as soon as
+// readiness is established.
+const DefaultTakeoverHoldTime = 0
 const DefaultPreManualFailoverRetryTimeout = 5 * time.Second
 const DefaultPreManualFailoverRetryInterval = 500 * time.Millisecond
 
