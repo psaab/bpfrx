@@ -139,6 +139,24 @@ pub(super) fn owner_rg_is_locally_active(
         && matches!(ha_state.get(&owner_rg_id), Some(group) if group.is_forwarding_active(now_secs))
 }
 
+pub(super) fn synced_entry_allows_local_replace(
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    owner_rg_id: i32,
+    now_secs: u64,
+) -> bool {
+    if owner_rg_is_locally_active(ha_state, owner_rg_id, now_secs) {
+        return false;
+    }
+    if owner_rg_id == 0
+        && ha_state
+            .values()
+            .any(|group| group.is_forwarding_active(now_secs))
+    {
+        return false;
+    }
+    true
+}
+
 pub(super) fn redirect_session_resolution_for_metadata(
     forwarding: &ForwardingState,
     resolution: ForwardingResolution,
@@ -316,15 +334,12 @@ pub(super) fn apply_worker_commands(
             }
             WorkerCommand::UpsertSynced(mut entry) => {
                 let key = entry.key.clone();
-                let locally_active =
-                    owner_rg_is_locally_active(ha_state, entry.metadata.owner_rg_id, now_secs);
-                // When owner_rg_id is 0 (unknown — FIB was zeroed by sync),
-                // check if ANY RG is locally active. Synced sessions with
-                // rg=0 still need local egress re-resolution for SNAT to work.
-                let any_rg_active = entry.metadata.owner_rg_id == 0
-                    && ha_state.values().any(|g| g.is_forwarding_active(now_secs));
-                let is_active = locally_active || any_rg_active;
-                let allow_replace_local = !is_active;
+                let allow_replace_local = synced_entry_allows_local_replace(
+                    ha_state,
+                    entry.metadata.owner_rg_id,
+                    now_secs,
+                );
+                let is_active = !allow_replace_local;
 
                 // Always resolve synced forward sessions with local egress,
                 // regardless of HA state (#326). Synced sessions arrive with

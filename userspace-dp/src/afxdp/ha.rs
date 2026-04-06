@@ -1,23 +1,5 @@
 use super::*;
 
-fn can_immediately_program_synced_bpf_entry(
-    ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    owner_rg_id: i32,
-    now_secs: u64,
-) -> bool {
-    if owner_rg_is_locally_active(ha_state, owner_rg_id, now_secs) {
-        return false;
-    }
-    if owner_rg_id == 0
-        && ha_state
-            .values()
-            .any(|group| group.is_forwarding_active(now_secs))
-    {
-        return false;
-    }
-    true
-}
-
 impl super::Coordinator {
     pub fn update_ha_state(&self, groups: &[HAGroupStatus]) -> Result<(), String> {
         let previous = self.ha_state.load();
@@ -263,7 +245,7 @@ impl super::Coordinator {
         // Keep the immediate BPF publish aligned with the worker-side
         // ownership guard so XSK redirect state cannot get ahead of what
         // the local SessionTable would actually accept.
-        if can_immediately_program_synced_bpf_entry(
+        if synced_entry_allows_local_replace(
             ha_state.as_ref(),
             entry.metadata.owner_rg_id,
             now_secs,
@@ -291,7 +273,7 @@ impl super::Coordinator {
                 &self.shared_owner_rg_indexes,
                 reverse,
             );
-            if can_immediately_program_synced_bpf_entry(
+            if synced_entry_allows_local_replace(
                 ha_state.as_ref(),
                 reverse.metadata.owner_rg_id,
                 now_secs,
@@ -540,7 +522,7 @@ mod tests {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
 
-        assert!(!can_immediately_program_synced_bpf_entry(
+        assert!(!synced_entry_allows_local_replace(
             &state, 1, now_secs
         ));
     }
@@ -550,7 +532,7 @@ mod tests {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
 
-        assert!(!can_immediately_program_synced_bpf_entry(
+        assert!(!synced_entry_allows_local_replace(
             &state, 0, now_secs
         ));
     }
@@ -560,7 +542,7 @@ mod tests {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
 
-        assert!(can_immediately_program_synced_bpf_entry(
+        assert!(synced_entry_allows_local_replace(
             &state, 1, now_secs
         ));
     }
