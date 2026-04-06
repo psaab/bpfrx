@@ -58,7 +58,7 @@ type RedundancyGroupState struct {
 	MonitorFails     []string // names of currently-failed monitors
 
 	// Readiness gate: blocks promotion to primary until interfaces + VRRP
-	// are confirmed ready and have been ready for at least TakeoverHoldTime.
+	// are confirmed ready. TakeoverHoldTime is an optional extra delay.
 	Ready            bool        // true if all local prerequisites are satisfied
 	ReadySince       time.Time   // when Ready transitioned to true (zero if not ready)
 	ReadinessReasons []string    // reasons why not ready (empty when ready)
@@ -179,7 +179,8 @@ type Manager struct {
 	onEventDrop func()
 
 	// takeoverHoldTime is the minimum duration an RG must be ready before
-	// election will promote it to primary. Default: 3s.
+	// election will promote it to primary. Zero means immediate takeover
+	// once readiness is established.
 	takeoverHoldTime time.Duration
 
 	// syncReady is true once bulk session sync has been received (or timed
@@ -200,9 +201,10 @@ type Manager struct {
 	failoverInProgress map[int]bool
 }
 
-// DefaultTakeoverHoldTime is the default duration an RG must be ready
-// before election promotes it to primary.
-const DefaultTakeoverHoldTime = 3 * time.Second
+// DefaultTakeoverHoldTime is the default additional delay after an RG becomes
+// ready before election promotes it to primary. Zero means promote as soon as
+// readiness is established.
+const DefaultTakeoverHoldTime = 0
 const DefaultPreManualFailoverRetryTimeout = 5 * time.Second
 const DefaultPreManualFailoverRetryInterval = 500 * time.Millisecond
 
@@ -442,9 +444,16 @@ func (m *Manager) UpdateConfig(cfg *config.ClusterConfig) {
 	// Update peer fencing config.
 	m.peerFencing = cfg.PeerFencing
 
-	// Update takeover hold time.
+	// Update takeover hold time. Zero or negative resets to the default
+	// immediate-takeover behavior.
+	if cfg.TakeoverHoldTime < 0 {
+		slog.Warn("cluster: invalid negative takeover hold time, using default immediate takeover",
+			"takeover_hold_time_ms", cfg.TakeoverHoldTime)
+	}
 	if cfg.TakeoverHoldTime > 0 {
 		m.takeoverHoldTime = time.Duration(cfg.TakeoverHoldTime) * time.Millisecond
+	} else {
+		m.takeoverHoldTime = DefaultTakeoverHoldTime
 	}
 
 	// Store GARP counts and update monitor groups.
