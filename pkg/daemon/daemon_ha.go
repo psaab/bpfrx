@@ -1333,15 +1333,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 		slog.Info("HA watchdog heartbeat started", "rgs", len(cc.RedundancyGroups))
 	}
 
-	// Propagate strict-vip-ownership mode to RG state machines.
-	for _, rg := range cc.RedundancyGroups {
-		if rg.StrictVIPOwnership {
-			s := d.getOrCreateRGState(rg.ID)
-			s.SetStrictVIPOwnership(true)
-			slog.Info("cluster: strict-vip-ownership enabled for RG",
-				"rg", rg.ID)
-		}
-	}
+	// In VRRP mode, make strict VIP ownership the runtime default so
+	// rg_active follows VIP/MAC ownership rather than cluster-primary
+	// intent. Direct/no-reth-vrrp mode and private-rg-election mode
+	// still use cluster state because there are no VRRP instances to
+	// gate on.
+	d.syncRGStrictVIPOwnershipMode(cc)
 
 	// Start heartbeat if control-interface and peer-address are configured.
 	// Retry on bind failure: the control interface address and VRF device
@@ -2533,6 +2530,17 @@ func (d *Daemon) getOrCreateRGState(rgID int) *rgStateMachine {
 	s = newRGStateMachine()
 	d.rgStates[rgID] = s
 	return s
+}
+
+func (d *Daemon) syncRGStrictVIPOwnershipMode(cc *config.ClusterConfig) {
+	if cc == nil {
+		return
+	}
+	strictByDefault := !(cc.NoRethVRRP || cc.PrivateRGElection)
+	for _, rg := range cc.RedundancyGroups {
+		s := d.getOrCreateRGState(rg.ID)
+		s.SetStrictVIPOwnership(strictByDefault)
+	}
 }
 
 // isRethMasterState returns true when ALL VRRP instances for rgID are MASTER.
