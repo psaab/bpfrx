@@ -264,10 +264,10 @@ pub(super) fn apply_worker_commands(
             }
             WorkerCommand::ApplyHAState {
                 sequence,
-                republish_owner_rgs,
+                refresh_owner_rgs,
                 demote_owner_rgs,
             } => {
-                let mut affected_owner_rgs = republish_owner_rgs.clone();
+                let mut affected_owner_rgs = refresh_owner_rgs.clone();
                 for rg_id in &demote_owner_rgs {
                     if !affected_owner_rgs.contains(rg_id) {
                         affected_owner_rgs.push(*rg_id);
@@ -275,7 +275,7 @@ pub(super) fn apply_worker_commands(
                 }
                 // Flow cache invalidation is handled by epoch-based check
                 // in FlowCache::lookup() — no per-entry scan needed here.
-                if !republish_owner_rgs.is_empty() || !demote_owner_rgs.is_empty() {
+                if !refresh_owner_rgs.is_empty() || !demote_owner_rgs.is_empty() {
                     let refreshed = refresh_live_reverse_sessions_for_owner_rgs(
                         sessions,
                         session_map_fd,
@@ -285,7 +285,7 @@ pub(super) fn apply_worker_commands(
                         &affected_owner_rgs,
                         now_ns,
                         now_secs,
-                        true,
+                        !demote_owner_rgs.is_empty(),
                     );
                     // Collect refreshed keys as cancelled so queued TX
                     // packets with stale resolution get dropped. Keys from
@@ -299,10 +299,10 @@ pub(super) fn apply_worker_commands(
                         owner_rg_id,
                         sessions.len(),
                     );
-                    // Mark sessions as synced AND remove from the
-                    // USERSPACE_SESSIONS BPF map so the XDP shim falls through
-                    // to the eBPF pipeline. The eBPF pipeline checks
-                    // rg_active and redirects via fabric.
+                    // Mark sessions as synced in-place. Their decisions were
+                    // already refreshed above, so demoted flows stay redirect-
+                    // ready on the standby without tearing down the live BPF
+                    // keys that activation would otherwise need to rebuild.
                     let demoted = sessions.demote_owner_rg(owner_rg_id);
                     eprintln!(
                         "bpfrx-ha: DemoteOwnerRG {} demoted_sessions={} remaining={}",
@@ -310,9 +310,6 @@ pub(super) fn apply_worker_commands(
                         demoted.len(),
                         sessions.len(),
                     );
-                    for key in &demoted {
-                        delete_live_session_key(session_map_fd, key);
-                    }
                     cancelled_keys.extend(demoted);
                 }
                 applied_sequences.push(sequence);
@@ -2337,7 +2334,7 @@ mod tests {
             .expect("commands lock")
             .push_back(WorkerCommand::ApplyHAState {
                 sequence: 3,
-                republish_owner_rgs: Vec::new(),
+                refresh_owner_rgs: Vec::new(),
                 demote_owner_rgs: vec![1],
             });
         let forwarding = test_forwarding_state();
@@ -2522,7 +2519,7 @@ mod tests {
             .expect("commands lock")
             .push_back(WorkerCommand::ApplyHAState {
                 sequence: 5,
-                republish_owner_rgs: Vec::new(),
+                refresh_owner_rgs: Vec::new(),
                 demote_owner_rgs: vec![1],
             });
         let forwarding = test_forwarding_state();
@@ -2590,7 +2587,7 @@ mod tests {
             .expect("commands lock")
             .push_back(WorkerCommand::ApplyHAState {
                 sequence: 6,
-                republish_owner_rgs: Vec::new(),
+                refresh_owner_rgs: Vec::new(),
                 demote_owner_rgs: vec![1],
             });
         let forwarding = test_forwarding_state_with_fabric();
@@ -2654,7 +2651,7 @@ mod tests {
             .expect("commands lock")
             .push_back(WorkerCommand::ApplyHAState {
                 sequence: 7,
-                republish_owner_rgs: Vec::new(),
+                refresh_owner_rgs: Vec::new(),
                 demote_owner_rgs: vec![1],
             });
         let forwarding = test_forwarding_state_with_fabric();
@@ -2696,7 +2693,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_worker_commands_prepare_demoted_owner_rg_republishes_without_teardown() {
+    fn apply_worker_commands_refreshes_activated_owner_rg_without_republish() {
         let commands = Arc::new(Mutex::new(VecDeque::new()));
         let mut sessions = SessionTable::new();
         let key = test_key();
@@ -2725,7 +2722,7 @@ mod tests {
             .expect("commands lock")
             .push_back(WorkerCommand::ApplyHAState {
                 sequence: 7,
-                republish_owner_rgs: vec![1],
+                refresh_owner_rgs: vec![1],
                 demote_owner_rgs: Vec::new(),
             });
         let forwarding = test_forwarding_state_with_fabric();
@@ -2754,9 +2751,10 @@ mod tests {
             ForwardingDisposition::ForwardCandidate
         );
         let deltas = sessions.drain_deltas(16);
-        assert_eq!(deltas.len(), 1, "prepare should republish forward session");
-        assert_eq!(deltas[0].kind, SessionDeltaKind::Open);
-        assert!(deltas[0].fabric_redirect_sync);
+        assert!(
+            deltas.is_empty(),
+            "activation refresh should not republish forward sessions"
+        );
     }
 
     #[test]
@@ -2831,7 +2829,7 @@ mod tests {
             .expect("commands lock")
             .push_back(WorkerCommand::ApplyHAState {
                 sequence: 7,
-                republish_owner_rgs: Vec::new(),
+                refresh_owner_rgs: Vec::new(),
                 demote_owner_rgs: Vec::new(),
             });
         let forwarding = test_forwarding_state();
@@ -3369,7 +3367,11 @@ mod tests {
             .sessions
             .lock()
             .expect("sessions index");
-        assert!(sessions_index.get(&1).is_some_and(|keys| keys.contains(&entry.key)));
+        assert!(
+            sessions_index
+                .get(&1)
+                .is_some_and(|keys| keys.contains(&entry.key))
+        );
         drop(sessions_index);
 
         let prewarm_index = shared_owner_rg_indexes

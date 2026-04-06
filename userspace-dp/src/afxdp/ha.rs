@@ -56,45 +56,6 @@ impl super::Coordinator {
         }
         self.ha_state.store(Arc::new(state));
         if !demoted_rgs.is_empty() {
-            // CRITICAL: Delete sessions from USERSPACE_SESSIONS BPF map
-            // IMMEDIATELY, before workers process DemoteOwnerRG asynchronously.
-            // Without this, there's a window where rg_active=0 but the XDP shim
-            // still finds sessions in USERSPACE_SESSIONS and redirects to XSK,
-            // bypassing the eBPF pipeline's fabric redirect for demoted RGs.
-            if let Some(session_map_ref) = self.session_map_fd.as_ref() {
-                let mut deleted = 0u32;
-                for key in owner_rg_session_keys_serialized(
-                    &self.shared_sessions,
-                    &self.shared_owner_rg_indexes.sessions,
-                    &demoted_rgs,
-                ) {
-                    delete_live_session_key(session_map_ref.fd, &key);
-                    deleted += 1;
-                }
-                for key in owner_rg_session_keys_serialized(
-                    &self.shared_nat_sessions,
-                    &self.shared_owner_rg_indexes.nat_sessions,
-                    &demoted_rgs,
-                ) {
-                    delete_live_session_key(session_map_ref.fd, &key);
-                    deleted += 1;
-                }
-                for key in owner_rg_session_keys_serialized(
-                    &self.shared_forward_wire_sessions,
-                    &self.shared_owner_rg_indexes.forward_wire_sessions,
-                    &demoted_rgs,
-                ) {
-                    delete_live_session_key(session_map_ref.fd, &key);
-                    deleted += 1;
-                }
-                if deleted > 0 {
-                    eprintln!(
-                        "bpfrx-ha: immediate USERSPACE_SESSIONS cleanup for demoted RGs {:?}: {} entries",
-                        demoted_rgs, deleted
-                    );
-                }
-            }
-
             demote_shared_owner_rgs(
                 &self.shared_sessions,
                 &self.shared_nat_sessions,
@@ -110,7 +71,7 @@ impl super::Coordinator {
                     self.rg_epochs[idx].fetch_add(1, Ordering::Release);
                 }
             }
-            self.enqueue_apply_ha_state(&demoted_rgs, &demoted_rgs);
+            self.enqueue_apply_ha_state(&[], &demoted_rgs);
             // Record cache flush timestamp for observability (#312).
             self.last_cache_flush_at.store(now_secs, Ordering::Relaxed);
         }
@@ -121,51 +82,6 @@ impl super::Coordinator {
                 self.workers.len(),
                 self.shared_sessions.lock().map(|s| s.len()).unwrap_or(0),
             );
-            let worker_commands = self
-                .workers
-                .values()
-                .map(|handle| handle.commands.clone())
-                .collect::<Vec<_>>();
-            let Some(session_map_ref) = self.session_map_fd.as_ref() else {
-                eprintln!("bpfrx-ha: no session_map_fd, skipping activation");
-                return Ok(());
-            };
-            let session_map_fd = session_map_ref.fd;
-            let now_secs = monotonic_nanos() / 1_000_000_000;
-            let current = self.ha_state.load();
-            prewarm_reverse_synced_sessions_for_owner_rgs(
-                &self.shared_sessions,
-                &self.shared_nat_sessions,
-                &self.shared_forward_wire_sessions,
-                &self.shared_owner_rg_indexes,
-                &worker_commands,
-                session_map_fd,
-                &self.forwarding,
-                current.as_ref(),
-                &self.dynamic_neighbors,
-                &activated_rgs,
-                now_secs,
-            );
-            // Republish USERSPACE_SESSIONS BPF map entries for ALL shared
-            // sessions belonging to the activated RGs (#475). The prewarm
-            // above covers the reverse_prewarm index subset; this catch-all
-            // ensures sessions that were only in the sessions index (e.g.
-            // locally originated then demoted) also get their BPF entries
-            // restored. Without this, the XDP shim has no REDIRECT entry
-            // and packets arrive as session misses until the worker
-            // asynchronously processes ApplyHAState.
-            let republished = republish_bpf_session_entries_for_owner_rgs(
-                &self.shared_sessions,
-                &self.shared_owner_rg_indexes,
-                session_map_fd,
-                &activated_rgs,
-            );
-            if republished > 0 {
-                eprintln!(
-                    "bpfrx-ha: republished {} USERSPACE_SESSIONS entries for activated RGs {:?}",
-                    republished, activated_rgs
-                );
-            }
             // Bump RG epochs for activated RGs so flow cache entries with
             // stale HA state are invalidated.
             for rg_id in &activated_rgs {
@@ -174,9 +90,10 @@ impl super::Coordinator {
                     self.rg_epochs[idx].fetch_add(1, Ordering::Release);
                 }
             }
-            // Pass activated_rgs as republish_owner_rgs so workers
-            // refresh their local session tables — re-resolving SNAT
-            // IPs, egress MACs, and HA state for promoted sessions.
+            // Standby workers already keep session redirect keys programmed.
+            // Activation only needs an in-place refresh of the local session
+            // tables so previously demoted fabric redirects resolve back to
+            // local forwarding.
             self.enqueue_apply_ha_state(&activated_rgs, &[]);
         }
         Ok(())
@@ -211,7 +128,7 @@ impl super::Coordinator {
         self.ha_state.store(Arc::new(state));
     }
 
-    fn enqueue_apply_ha_state(&self, republish_owner_rgs: &[i32], demote_owner_rgs: &[i32]) {
+    fn enqueue_apply_ha_state(&self, refresh_owner_rgs: &[i32], demote_owner_rgs: &[i32]) {
         if self.workers.is_empty() {
             return;
         }
@@ -223,7 +140,7 @@ impl super::Coordinator {
             if let Ok(mut pending) = handle.commands.lock() {
                 pending.push_back(WorkerCommand::ApplyHAState {
                     sequence,
-                    republish_owner_rgs: republish_owner_rgs.to_vec(),
+                    refresh_owner_rgs: refresh_owner_rgs.to_vec(),
                     demote_owner_rgs: demote_owner_rgs.to_vec(),
                 });
             } else {
@@ -233,9 +150,9 @@ impl super::Coordinator {
                 );
             }
         }
-        // Fire-and-forget: BPF session map is already updated synchronously
-        // and flow cache uses epoch-based invalidation. No need to wait for
-        // worker acks.
+        // Fire-and-forget: standby session redirect keys stay programmed and
+        // flow cache uses epoch-based invalidation. No need to wait for worker
+        // acks here.
     }
 
     pub fn export_owner_rg_sessions(

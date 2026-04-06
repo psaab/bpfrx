@@ -555,7 +555,7 @@ pub(super) enum WorkerCommand {
     },
     ApplyHAState {
         sequence: u64,
-        republish_owner_rgs: Vec<i32>,
+        refresh_owner_rgs: Vec<i32>,
         demote_owner_rgs: Vec<i32>,
     },
 }
