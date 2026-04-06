@@ -2554,9 +2554,9 @@ func stripCIDR(s string) string {
 
 // preinstallSnapshotNeighbors reads neighbor data from the userspace dataplane's
 // last published snapshot and pre-installs them into the kernel ARP/NDP table
-// using netlink.NeighSet. Unlike resolveNeighborsImmediate (which sends ARP
-// probes), this is instant (syscall, no round-trip) and works even when the
-// local ARP entry has expired during the time another node owned the RG.
+// using netlink.NeighSet. The periodic neighbor-maintenance loop uses this to
+// keep the standby's kernel neighbor table hot so failover does not depend on
+// activation-time priming.
 //
 // The snapshot neighbors come from the active node's kernel ARP table (populated
 // by buildNeighborSnapshots during Compile). When synced to the standby, they
@@ -2648,16 +2648,14 @@ func (d *Daemon) preinstallSnapshotNeighbors() {
 		}
 	}
 	if installed > 0 {
-		slog.Info("preinstalled kernel neighbor entries on activation",
-			"count", installed)
+		slog.Info("preinstalled kernel neighbor entries from snapshot", "count", installed)
 	}
 }
 
 // resolveNeighborsImmediate sends ARP/NDP probes for config-based next-hops
-// without the follow-up sleep. Used during failover activation where the
-// probes must go out immediately but we cannot block the event handler for
-// 500ms waiting for replies. Probes resolve in the background; the periodic
-// resolution loop picks up any stragglers within 15 seconds.
+// without the follow-up sleep. This is retained for ad hoc callers that need
+// fire-and-forget probes; steady-state HA readiness comes from the periodic
+// resolution loop instead of activation-time use.
 //
 // Runtime without the sleep: collects targets via netlink RouteGet +
 // NeighList (~1-2ms each) then fires ICMP/NS probes as goroutines.
@@ -2964,11 +2962,14 @@ func (d *Daemon) cleanFailedNeighbors() int {
 	return cleaned
 }
 
-// runPeriodicNeighborResolution manages two periodic tasks:
+// runPeriodicNeighborResolution manages periodic neighbor upkeep:
 //   - Every 5 seconds: clean NUD_FAILED neighbor entries so the kernel
 //     retries ARP/NDP on the next forwarded packet (fast recovery).
 //   - Every 15 seconds: proactively resolve known forwarding targets
 //     (gateways, DNAT pools, etc.) to keep ARP/NDP entries warm.
+//   - In cluster mode: continuously refresh snapshot-learned neighbors and
+//     session-derived neighbor cache entries so standby forwarding stays ready
+//     without activation-time warmup.
 //
 // Runs once immediately at start to avoid a blind spot.
 // Fetches fresh active config on each tick so config changes take effect.
@@ -2976,6 +2977,7 @@ func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 	// Immediate first run — don't wait for first tick.
 	if cfg := d.store.ActiveConfig(); cfg != nil {
 		d.resolveNeighbors(cfg)
+		d.maintainClusterNeighborReadiness()
 	}
 	d.cleanFailedNeighbors()
 
@@ -2996,9 +2998,18 @@ func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 		case <-resolveTicker.C:
 			if cfg := d.store.ActiveConfig(); cfg != nil {
 				d.resolveNeighbors(cfg)
+				d.maintainClusterNeighborReadiness()
 			}
 		}
 	}
+}
+
+func (d *Daemon) maintainClusterNeighborReadiness() {
+	if d.cluster == nil {
+		return
+	}
+	d.preinstallSnapshotNeighbors()
+	go d.warmNeighborCache()
 }
 
 // collectDHCPRoutes builds FRR DHCPRoute entries from active DHCP leases.
