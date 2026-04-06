@@ -2962,7 +2962,11 @@ ctrlReady:
 	// incorrectly. The userspace helper's own session table (Rust
 	// SessionTable + shared_sessions) holds the authoritative synced
 	// sessions — BPF conntrack must be empty when ctrl re-enables.
-	if ctrl.Enabled == 1 && !m.ctrlWasEnabled {
+	// Only flush stale BPF sessions on the very first ctrl enable after
+	// daemon startup. During HA transitions, ctrl may briefly disable and
+	// re-enable (rgTransitionInFlight); flushing then destroys synced
+	// sessions that the peer just published, killing TCP streams (#475).
+	if ctrl.Enabled == 1 && !m.ctrlWasEnabled && m.publishedSnapshot <= 1 {
 		if usMap := m.inner.Map("userspace_sessions"); usMap != nil {
 			var key, nextKey []byte
 			key = make([]byte, usMap.KeySize())
@@ -2977,7 +2981,7 @@ ctrlReady:
 				deleted++
 			}
 			if deleted > 0 {
-				slog.Info("userspace: flushed stale BPF session entries on ctrl enable",
+				slog.Info("userspace: flushed stale BPF session entries on initial ctrl enable",
 					"deleted", deleted)
 			}
 		}
