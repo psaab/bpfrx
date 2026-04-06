@@ -1,5 +1,23 @@
 use super::*;
 
+fn can_immediately_program_synced_bpf_entry(
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    owner_rg_id: i32,
+    now_secs: u64,
+) -> bool {
+    if owner_rg_is_locally_active(ha_state, owner_rg_id, now_secs) {
+        return false;
+    }
+    if owner_rg_id == 0
+        && ha_state
+            .values()
+            .any(|group| group.is_forwarding_active(now_secs))
+    {
+        return false;
+    }
+    true
+}
+
 impl super::Coordinator {
     pub fn update_ha_state(&self, groups: &[HAGroupStatus]) -> Result<(), String> {
         let previous = self.ha_state.load();
@@ -325,18 +343,24 @@ impl super::Coordinator {
             &self.shared_owner_rg_indexes,
             &entry,
         );
-        // Publish the session to the userspace_sessions BPF map IMMEDIATELY
-        // so the XDP shim can redirect matching packets to XSK. Previously
-        // forward sessions were deferred to async worker processing, creating
-        // a window where the XDP shim couldn't see synced sessions and packets
-        // bypassed the userspace dataplane.
-        if let Some(session_map_fd) = self.session_map_fd.as_ref() {
-            let _ = publish_live_session_entry(
-                session_map_fd.fd,
-                &entry.key,
-                entry.decision.nat,
-                entry.metadata.is_reverse,
-            );
+        // Only publish immediately when the worker path would also accept the
+        // synced entry immediately. On an active RG, worker upsert still
+        // protects live local sessions from being clobbered; publishing here
+        // would bypass that guard and can strand redirect keys that no worker
+        // actually installed.
+        if can_immediately_program_synced_bpf_entry(
+            ha_state.as_ref(),
+            entry.metadata.owner_rg_id,
+            now_secs,
+        ) {
+            if let Some(session_map_fd) = self.session_map_fd.as_ref() {
+                let _ = publish_live_session_entry(
+                    session_map_fd.fd,
+                    &entry.key,
+                    entry.decision.nat,
+                    entry.metadata.is_reverse,
+                );
+            }
         }
         refresh_reverse_prewarm_owner_rg_indexes(
             &self.shared_owner_rg_indexes.reverse_prewarm_sessions,
@@ -373,6 +397,8 @@ impl super::Coordinator {
     }
 
     pub fn delete_synced_session(&self, key: SessionKey) {
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let ha_state = self.ha_state.load();
         let removed_entry = self
             .shared_sessions
             .lock()
@@ -385,6 +411,22 @@ impl super::Coordinator {
                 Some(reverse_session_key(&entry.key, entry.decision.nat))
             }
         });
+        if let Some(entry) = removed_entry.as_ref() {
+            if can_immediately_program_synced_bpf_entry(
+                ha_state.as_ref(),
+                entry.metadata.owner_rg_id,
+                now_secs,
+            ) {
+                if let Some(session_map_fd) = self.session_map_fd.as_ref() {
+                    delete_session_map_entry_for_removed_session(
+                        session_map_fd.fd,
+                        &entry.key,
+                        entry.decision,
+                        &entry.metadata,
+                    );
+                }
+            }
+        }
         remove_shared_session(
             &self.shared_sessions,
             &self.shared_nat_sessions,
@@ -580,5 +622,35 @@ mod tests {
                 && group.lease_state == "inactive"
                 && group.lease_until == 0
         }));
+    }
+
+    #[test]
+    fn immediate_synced_bpf_programming_skips_locally_active_owner_rg() {
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
+
+        assert!(!can_immediately_program_synced_bpf_entry(
+            &state, 1, now_secs
+        ));
+    }
+
+    #[test]
+    fn immediate_synced_bpf_programming_skips_unknown_owner_when_any_rg_is_active() {
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
+
+        assert!(!can_immediately_program_synced_bpf_entry(
+            &state, 0, now_secs
+        ));
+    }
+
+    #[test]
+    fn immediate_synced_bpf_programming_allows_inactive_owner_rg() {
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
+
+        assert!(can_immediately_program_synced_bpf_entry(
+            &state, 1, now_secs
+        ));
     }
 }
