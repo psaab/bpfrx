@@ -335,25 +335,6 @@ func (m *Manager) syncDesiredForwardingStateLocked() error {
 	return m.applyHelperStatusLocked(&status)
 }
 
-// PreflightDemoteRG sends a preflight_demote_rg command to the Rust helper,
-// marking the RG as inactive in the flow cache without full demotion cleanup.
-// This causes flow cache entries to re-resolve to FabricRedirect before VRRP
-// actually demotes, eliminating the forwarding gap.
-func (m *Manager) PreflightDemoteRG(rgID int) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.proc == nil {
-		return nil
-	}
-	req := ControlRequest{
-		Type: "preflight_demote_rg",
-		HAState: &HAStateUpdateRequest{
-			Groups: []HAGroupStatus{{RGID: rgID, Active: false}},
-		},
-	}
-	return m.requestLocked(req, nil)
-}
-
 func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
