@@ -2148,7 +2148,7 @@ mod tests {
             ..decision()
         };
         // refresh_local should return false for peer-synced sessions
-        assert!(!table.refresh_local(&key, new_decision, metadata(), 2_000_000, 0x10,));
+        assert!(!table.refresh_local(&key, new_decision, metadata(), 2_000_000, 0x10));
         assert_eq!(table.owner_rg_session_keys(&[1]), vec![key.clone()]);
         // session should still have original decision
         let lookup = table.lookup(&key, 3_000_000, 0x10).expect("session");
@@ -2177,7 +2177,7 @@ mod tests {
             ..decision()
         };
         // refresh_for_ha_activation should succeed even for peer-synced sessions
-        assert!(table.refresh_for_ha_activation(&key, new_decision, metadata(), 2_000_000, 0x10,));
+        assert!(table.refresh_for_ha_activation(&key, new_decision, metadata(), 2_000_000, 0x10));
         // session should now have updated decision
         let lookup = table.lookup(&key, 3_000_000, 0x10).expect("session");
         assert_eq!(lookup.decision.resolution.egress_ifindex, 99);
