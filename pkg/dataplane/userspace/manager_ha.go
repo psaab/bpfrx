@@ -359,14 +359,6 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 		m.proactiveNeighborResolveAsyncLocked()
 	}
 
-	// Bump FIB generation BEFORE HA state to invalidate all existing
-	// flow cache entries. Then sync HA state. Then bump AGAIN to catch
-	// any entries created during the transition window between the first
-	// bump and the HA state change. This double-bump guarantees no stale
-	// flow cache entries survive demotion, even when owner_rg_id=0
-	// (physical interfaces without direct RG mapping).
-	m.inner.BumpFIBGeneration()
-
 	// Sync HA state DIRECTLY to helper without re-reading from BPF maps.
 	// The periodic status poll also reads rg_active and syncs to the helper,
 	// racing with us. If the poll syncs first, our syncHAStateLocked
@@ -410,20 +402,6 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	m.lastRGActivateTime = time.Now()
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return err
-	}
-
-	// Bump FIB generation AFTER HA state is applied. This ensures any
-	// flow cache entries created during the transition window reflect the
-	// new HA state (HAInactive for demoted RGs). The bump invalidates
-	// all entries from before the HA state change.
-	newFIBGen := m.inner.BumpFIBGeneration()
-	if m.lastSnapshot != nil && m.lastSnapshot.Config != nil && m.proc != nil {
-		m.generation++
-		snap := buildSnapshot(m.lastSnapshot.Config, m.cfg, m.generation, newFIBGen)
-		m.lastSnapshot = snap
-		if err := m.syncSnapshotLocked(); err != nil {
-			slog.Warn("userspace: failed to push snapshot after HA transition", "err", err)
-		}
 	}
 
 	return nil
