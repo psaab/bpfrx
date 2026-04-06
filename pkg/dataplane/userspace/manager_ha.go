@@ -354,10 +354,10 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	slog.Info("userspace: RG state updated (helper stays in control)",
 		"rg", rgID, "active", active)
 
-	if active {
-		m.bootstrapNAPIQueuesAsyncLocked("ha-update-active")
-		m.proactiveNeighborResolveAsyncLocked()
-	}
+	// HA ownership moves must not start queue bootstrap or neighbor repair
+	// work here. TakeoverReady() already requires the helper to be armed and
+	// XSK liveness to be proven before cutover begins, so activation must be
+	// a narrow ownership-state update rather than a second startup path.
 
 	// Bump FIB generation BEFORE HA state to invalidate all existing
 	// flow cache entries. Then sync HA state. Then bump AGAIN to catch

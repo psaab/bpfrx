@@ -39,7 +39,7 @@ var _ dataplane.DataPlane = (*Manager)(nil)
 type DataplaneMode int
 
 const (
-	ModeEBPFOnly       DataplaneMode = iota // Pure eBPF pipeline, no userspace
+	ModeEBPFOnly        DataplaneMode = iota // Pure eBPF pipeline, no userspace
 	ModeUserspaceCompat                      // Userspace preferred, eBPF/kernel fallback allowed
 	ModeUserspaceStrict                      // Strict userspace only, no transit fallback
 )
@@ -85,7 +85,7 @@ type Manager struct {
 	neighborsPrewarmed bool
 	ctrlEnableAt       time.Time
 	ctrlWasEnabled     bool
-	ctrlDisabledAt     uint64 // monotonic ktime_ns when ctrl was last disabled
+	ctrlDisabledAt     uint64    // monotonic ktime_ns when ctrl was last disabled
 	lastDemotionTime   time.Time // wall clock when last RG demotion occurred
 	xskLivenessFailed  bool
 	xskLivenessProven  bool
@@ -97,10 +97,10 @@ type Manager struct {
 	deferWorkers       bool // skip worker spawn until NotifyLinkCycle
 	xskBoundNotified   bool // OnXSKBound fired at most once
 
-	mode           DataplaneMode // current active runtime mode
-	configuredMode DataplaneMode // user-configured desired mode (from config)
-	lastHASyncTime      time.Time // throttle HA watchdog sync to avoid control socket contention
-	lastRGActivateTime  time.Time // wall clock of last update_ha_state; statusLoop skips HA sync for 2s
+	mode               DataplaneMode // current active runtime mode
+	configuredMode     DataplaneMode // user-configured desired mode (from config)
+	lastHASyncTime     time.Time     // throttle HA watchdog sync to avoid control socket contention
+	lastRGActivateTime time.Time     // wall clock of last update_ha_state; statusLoop skips HA sync for 2s
 
 	rgTransitionInFlight atomic.Bool // set before syncHAStateLocked, cleared on completion
 
@@ -121,8 +121,8 @@ func New() *Manager {
 	inner := dataplane.New()
 	inner.XDPEntryProg = "xdp_main_prog"
 	return &Manager{
-		DataPlane:            inner,
-		inner:                inner,
+		DataPlane:      inner,
+		inner:          inner,
 		configuredMode: ModeUserspaceCompat,
 		haGroups:       make(map[int]HAGroupStatus),
 	}
@@ -360,7 +360,6 @@ func (m *Manager) syncInterfaceAttachments(result *dataplane.CompileResult, snap
 		}
 	}
 }
-
 
 // bpfKtimeNs returns the current CLOCK_BOOTTIME in nanoseconds, matching
 // the clock used by BPF's bpf_ktime_get_ns() for session Created timestamps.
@@ -3641,7 +3640,6 @@ func (m *Manager) ExportOwnerRGSessions(rgIDs []int, max uint32) ([]SessionDelta
 	return resp.SessionDeltas, status, nil
 }
 
-
 const userspaceBindingReady = 1
 
 type userspaceBindingKey struct {
@@ -4139,10 +4137,10 @@ func (m *Manager) statusLoop(ctx context.Context) {
 							m.lastHASyncTime = time.Now()
 						}
 					}
-					if newActiveSig != prevActiveSig {
-						m.bootstrapNAPIQueuesAsyncLocked("ha-active-change")
-						m.proactiveNeighborResolveAsyncLocked()
-					}
+					// Do not bootstrap NAPI queues or kick neighbor repair on
+					// HA ownership changes. By the time UpdateRGActive runs, the
+					// standby must already be forwarding-ready; otherwise
+					// TakeoverReady() should have blocked the handoff earlier.
 				}
 				if err := m.syncDesiredForwardingStateLocked(); err != nil {
 					slog.Warn("userspace dataplane forwarding sync failed", "err", err)
