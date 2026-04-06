@@ -1138,10 +1138,10 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	// sessions. Planned failover should not depend on bulk sync state —
 	// both nodes have full session state from continuous real-time sync.
 
-		// Stop the bulk sync retry loop — it floods the sync TCP connection
-		// with session data, delaying the barrier write/ack by 30+ seconds.
-		// Advancing the retry generation causes the goroutine to exit.
-		retryGen := d.syncPrimeRetryGen.Add(1)
+	// Stop the bulk sync retry loop — it floods the sync TCP connection
+	// with session data, delaying the barrier write/ack by 30+ seconds.
+	// Advancing the retry generation causes the goroutine to exit.
+	retryGen := d.syncPrimeRetryGen.Add(1)
 
 	// If the barrier fails, restart the retry loop so the peer can still
 	// receive its cold-start bootstrap. Only suppress the restart when
@@ -1165,14 +1165,14 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		d.startSessionSyncPrimeRetry(retryGen)
 	}()
 
-		// Single barrier — peer ack means it has processed all queued deltas.
-		// The actual demotion happens atomically in UpdateRGActive(false).
-		if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {
-			return fmt.Errorf("demotion peer barrier failed: %w", err)
-		}
+	// Single barrier — peer ack means it has processed all queued deltas.
+	// The actual demotion happens atomically in UpdateRGActive(false).
+	if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {
+		return fmt.Errorf("demotion peer barrier failed: %w", err)
+	}
 
-		success = true
-		slog.Info("userspace: peer barrier ready for rg demotion", "rg", rgID)
+	success = true
+	slog.Info("userspace: peer barrier ready for rg demotion", "rg", rgID)
 	return nil
 }
 
