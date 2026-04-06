@@ -2942,38 +2942,7 @@ func (d *Daemon) reconcileRGState() {
 	if mon := d.cluster.Monitor(); mon != nil {
 		for _, rgID := range rgIDs {
 			ifReady, ifReasons := mon.RGInterfaceReady(rgID)
-			var vrrpReady bool
-			var vrrpReasons []string
-			if noRethVRRP {
-				// No RETH VRRP instances — check sync readiness instead.
-				// Blocks promotion until bulk session sync completes (or
-				// times out), equivalent to VRRP sync-hold in RETH mode.
-				vrrpReady = d.cluster.IsSyncReady()
-				if !vrrpReady {
-					vrrpReasons = append(vrrpReasons, "session sync not ready")
-				}
-				// Also verify VIP ownership can be established: RETH
-				// interfaces must exist and be UP before we allow promotion.
-				vipOK, vipReasons := d.checkVIPReadiness(rgID)
-				if !vipOK {
-					vrrpReady = false
-					vrrpReasons = append(vrrpReasons, vipReasons...)
-				}
-			} else if d.vrrpMgr != nil {
-				hasRETH := rgHasRETH(d.store.ActiveConfig(), rgID)
-				vrrpReady, vrrpReasons = d.vrrpMgr.RGVRRPReady(rgID, hasRETH)
-			} else {
-				vrrpReady = true // no VRRP = always ready
-			}
-			userspaceReady, userspaceReasons := d.checkUserspaceTakeoverReadiness(rgID)
-			ready := ifReady && vrrpReady && fabricReady && userspaceReady
-			var reasons []string
-			reasons = append(reasons, ifReasons...)
-			reasons = append(reasons, vrrpReasons...)
-			if !fabricReady {
-				reasons = append(reasons, "fabric forwarding path not ready")
-			}
-			reasons = append(reasons, userspaceReasons...)
+			ready, reasons := d.takeoverReadinessForRG(rgID, ifReady, ifReasons, fabricReady, noRethVRRP)
 			d.cluster.SetRGReady(rgID, ready, reasons)
 		}
 	}
@@ -3628,6 +3597,37 @@ func (d *Daemon) checkVIPReadiness(rgID int) (bool, []string) {
 		linkByName = netlink.LinkByName
 	}
 	return checkVIPReadinessForConfig(cfg, rgID, linkByName)
+}
+
+func (d *Daemon) checkNoRethTakeoverReadiness(rgID int) (bool, []string) {
+	return d.checkVIPReadiness(rgID)
+}
+
+func (d *Daemon) takeoverReadinessForRG(rgID int, ifReady bool, ifReasons []string, fabricReady, noRethVRRP bool) (bool, []string) {
+	var takeoverGateReady bool
+	var takeoverGateReasons []string
+	if noRethVRRP {
+		// This reduces the no-RETH VRRP/takeover gate component to
+		// whether VIP ownership can be established on the local node.
+		takeoverGateReady, takeoverGateReasons = d.checkNoRethTakeoverReadiness(rgID)
+	} else if d.vrrpMgr != nil {
+		hasRETH := rgHasRETH(d.store.ActiveConfig(), rgID)
+		takeoverGateReady, takeoverGateReasons = d.vrrpMgr.RGVRRPReady(rgID, hasRETH)
+	} else {
+		takeoverGateReady = true // no VRRP = always ready
+	}
+
+	userspaceReady, userspaceReasons := d.checkUserspaceTakeoverReadiness(rgID)
+	ready := ifReady && takeoverGateReady && fabricReady && userspaceReady
+
+	var reasons []string
+	reasons = append(reasons, ifReasons...)
+	reasons = append(reasons, takeoverGateReasons...)
+	if !fabricReady {
+		reasons = append(reasons, "fabric forwarding path not ready")
+	}
+	reasons = append(reasons, userspaceReasons...)
+	return ready, reasons
 }
 
 // checkVIPReadinessForConfig verifies that RETH interfaces for the given RG
