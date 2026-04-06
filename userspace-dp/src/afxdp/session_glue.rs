@@ -749,11 +749,7 @@ pub(super) fn resolve_flow_session_decision(
         now_ns,
         tcp_flags,
     ) {
-        let hit_origin = if hit.shared_entry.is_some() {
-            SessionOrigin::SharedMaterialize
-        } else {
-            SessionOrigin::ForwardFlow
-        };
+        let hit_origin = hit.origin;
         let poison_key = hit
             .shared_entry
             .as_ref()
@@ -1304,6 +1300,37 @@ mod tests {
         assert_eq!(resolved.key.as_ref(&key), &key);
         assert_eq!(resolved.lookup.decision, entry.decision);
         assert_eq!(resolved.lookup.metadata, entry.metadata);
+        assert_eq!(resolved.origin, SessionOrigin::SyncImport);
+    }
+
+    #[test]
+    fn lookup_session_across_scopes_preserves_local_synced_origin() {
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        assert!(sessions.install_with_protocol_with_origin(
+            key.clone(),
+            test_decision(),
+            test_metadata(),
+            SessionOrigin::SyncImport,
+            1,
+            PROTO_TCP,
+            0,
+        ));
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+
+        let resolved = lookup_session_across_scopes(
+            &mut sessions,
+            &shared_sessions,
+            &shared_forward_wire_sessions,
+            &key,
+            2,
+            0,
+        )
+        .expect("local synced hit");
+        assert!(resolved.shared_entry.is_none());
+        assert_eq!(resolved.key.as_ref(&key), &key);
+        assert_eq!(resolved.origin, SessionOrigin::SyncImport);
     }
 
     #[test]
@@ -1347,6 +1374,46 @@ mod tests {
         assert_eq!(resolved.key.as_ref(&translated_key), &key);
         assert_eq!(resolved.lookup.decision, entry.decision);
         assert_eq!(resolved.lookup.metadata, entry.metadata);
+        assert_eq!(resolved.origin, SessionOrigin::SyncImport);
+    }
+
+    #[test]
+    fn lookup_session_across_scopes_preserves_local_forward_wire_synced_origin() {
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let decision = SessionDecision {
+            resolution: test_resolution(),
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_src_port: Some(key.src_port),
+                ..NatDecision::default()
+            },
+        };
+        assert!(sessions.install_with_protocol_with_origin(
+            key.clone(),
+            decision,
+            test_metadata(),
+            SessionOrigin::SyncImport,
+            1,
+            PROTO_TCP,
+            0,
+        ));
+        let translated_key = forward_wire_key(&key, decision.nat);
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+
+        let resolved = lookup_session_across_scopes(
+            &mut sessions,
+            &shared_sessions,
+            &shared_forward_wire_sessions,
+            &translated_key,
+            2,
+            0,
+        )
+        .expect("local forward-wire synced hit");
+        assert!(resolved.shared_entry.is_none());
+        assert_eq!(resolved.key.as_ref(&translated_key), &key);
+        assert_eq!(resolved.origin, SessionOrigin::SyncImport);
     }
 
     #[test]
