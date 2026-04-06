@@ -1385,8 +1385,9 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 
 	// In VRRP mode, make strict VIP ownership the runtime default so
 	// rg_active follows VIP/MAC ownership rather than cluster-primary
-	// intent. Direct/no-reth-vrrp mode still uses cluster state because
-	// there are no VRRP instances to gate on.
+	// intent. Direct/no-reth-vrrp mode and private-rg-election mode
+	// still use cluster state because there are no VRRP instances to
+	// gate on.
 	d.syncRGStrictVIPOwnershipMode(cc)
 
 	// Start heartbeat if control-interface and peer-address are configured.

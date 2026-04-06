@@ -133,6 +133,20 @@ func TestSyncRGStrictVIPOwnershipMode_DisabledInNoRethVRRPMode(t *testing.T) {
 	}
 }
 
+func TestSyncRGStrictVIPOwnershipMode_DisabledInPrivateRGElectionMode(t *testing.T) {
+	d := newTestDaemon()
+	cc := &config.ClusterConfig{
+		PrivateRGElection: true,
+		RedundancyGroups:  []*config.RedundancyGroup{{ID: 1}},
+	}
+
+	d.syncRGStrictVIPOwnershipMode(cc)
+
+	if d.getOrCreateRGState(1).IsStrictVIPOwnership() {
+		t.Fatal("expected strict VIP ownership to stay off in private-rg-election mode")
+	}
+}
+
 func TestSnapshotRethMasterState(t *testing.T) {
 	d := newTestDaemon()
 
