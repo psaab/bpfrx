@@ -316,6 +316,16 @@ impl SessionTable {
         now_ns: u64,
         tcp_flags: u8,
     ) -> Option<SessionLookup> {
+        self.lookup_with_origin(key, now_ns, tcp_flags)
+            .map(|(lookup, _origin)| lookup)
+    }
+
+    pub fn lookup_with_origin(
+        &mut self,
+        key: &SessionKey,
+        now_ns: u64,
+        tcp_flags: u8,
+    ) -> Option<(SessionLookup, SessionOrigin)> {
         let actual_key = if self.sessions.contains_key(key) {
             key.clone()
         } else if let Some(alias) = self.reverse_translated_index.get(key) {
@@ -349,10 +359,13 @@ impl SessionTable {
             } else {
                 session_timeout_ns(key.protocol, tcp_flags, &self.timeouts)
             };
-            SessionLookup {
-                decision: entry.decision,
-                metadata: entry.metadata.clone(),
-            }
+            (
+                SessionLookup {
+                    decision: entry.decision,
+                    metadata: entry.metadata.clone(),
+                },
+                entry.origin,
+            )
         })
     }
 
@@ -372,6 +385,14 @@ impl SessionTable {
     }
 
     pub fn find_forward_wire_match(&self, wire_key: &SessionKey) -> Option<ForwardSessionMatch> {
+        self.find_forward_wire_match_with_origin(wire_key)
+            .map(|(matched, _origin)| matched)
+    }
+
+    pub fn find_forward_wire_match_with_origin(
+        &self,
+        wire_key: &SessionKey,
+    ) -> Option<(ForwardSessionMatch, SessionOrigin)> {
         let forward_key = self.forward_wire_index.get(wire_key)?;
         let entry = self.sessions.get(forward_key)?;
         if entry.metadata.is_reverse
@@ -379,11 +400,14 @@ impl SessionTable {
         {
             return None;
         }
-        Some(ForwardSessionMatch {
-            key: forward_key.clone(),
-            decision: entry.decision,
-            metadata: entry.metadata.clone(),
-        })
+        Some((
+            ForwardSessionMatch {
+                key: forward_key.clone(),
+                decision: entry.decision,
+                metadata: entry.metadata.clone(),
+            },
+            entry.origin,
+        ))
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -637,14 +661,7 @@ impl SessionTable {
         tcp_flags: u8,
     ) -> bool {
         self.update_session(
-            key,
-            decision,
-            metadata,
-            origin,
-            now_ns,
-            protocol,
-            tcp_flags,
-            false,
+            key, decision, metadata, origin, now_ns, protocol, tcp_flags, false,
         )
     }
 
@@ -1341,7 +1358,15 @@ mod tests {
         let key = key_v4();
         let now = 1_000_000_000u64;
         let synced_meta = metadata();
-        table.upsert_synced(key.clone(), decision(), synced_meta, now, PROTO_TCP, 0x10, false);
+        table.upsert_synced(
+            key.clone(),
+            decision(),
+            synced_meta,
+            now,
+            PROTO_TCP,
+            0x10,
+            false,
+        );
         let promoted = metadata();
         assert!(table.promote_synced_with_origin(
             &key,
@@ -1374,7 +1399,15 @@ mod tests {
         let now = 1_000_000_000u64;
         let mut synced_meta = metadata();
         synced_meta.is_reverse = true;
-        table.upsert_synced(key.clone(), decision(), synced_meta, now, PROTO_TCP, 0x10, false);
+        table.upsert_synced(
+            key.clone(),
+            decision(),
+            synced_meta,
+            now,
+            PROTO_TCP,
+            0x10,
+            false,
+        );
         let mut promoted = metadata();
         promoted.is_reverse = true;
         assert!(table.promote_synced_with_origin(
@@ -2115,13 +2148,7 @@ mod tests {
             ..decision()
         };
         // refresh_local should return false for peer-synced sessions
-        assert!(!table.refresh_local(
-            &key,
-            new_decision,
-            metadata(),
-            2_000_000,
-            0x10,
-        ));
+        assert!(!table.refresh_local(&key, new_decision, metadata(), 2_000_000, 0x10));
         assert_eq!(table.owner_rg_session_keys(&[1]), vec![key.clone()]);
         // session should still have original decision
         let lookup = table.lookup(&key, 3_000_000, 0x10).expect("session");
@@ -2150,13 +2177,7 @@ mod tests {
             ..decision()
         };
         // refresh_for_ha_activation should succeed even for peer-synced sessions
-        assert!(table.refresh_for_ha_activation(
-            &key,
-            new_decision,
-            metadata(),
-            2_000_000,
-            0x10,
-        ));
+        assert!(table.refresh_for_ha_activation(&key, new_decision, metadata(), 2_000_000, 0x10));
         // session should now have updated decision
         let lookup = table.lookup(&key, 3_000_000, 0x10).expect("session");
         assert_eq!(lookup.decision.resolution.egress_ifindex, 99);

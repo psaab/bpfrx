@@ -125,7 +125,9 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
             &forward.key,
             forward.decision,
             &forward.metadata,
-        ).is_err() {
+        )
+        .is_err()
+        {
             fwd_publish_errors += 1;
         }
         for commands in worker_commands {
@@ -137,7 +139,8 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     if fwd_publish_errors > 0 {
         eprintln!(
             "bpfrx-ha: prewarm forward BPF publish: {} errors out of {} entries",
-            fwd_publish_errors, forward_entries.len()
+            fwd_publish_errors,
+            forward_entries.len()
         );
     }
     for reverse in reverse_entries {
@@ -194,18 +197,17 @@ pub(super) fn republish_bpf_session_entries_for_owner_rgs(
             Err(_) => return 0,
         };
         keys.iter()
-            .filter_map(|key| sessions.get(key).map(|e| (e.key.clone(), e.decision, e.metadata.clone())))
+            .filter_map(|key| {
+                sessions
+                    .get(key)
+                    .map(|e| (e.key.clone(), e.decision, e.metadata.clone()))
+            })
             .collect()
     };
     let mut published = 0u32;
     let mut errors = 0u32;
     for (key, decision, metadata) in &entries {
-        if publish_session_map_entry_for_session(
-            session_map_fd,
-            key,
-            *decision,
-            metadata,
-        ).is_ok() {
+        if publish_session_map_entry_for_session(session_map_fd, key, *decision, metadata).is_ok() {
             published += 1;
         } else {
             errors += 1;
@@ -214,7 +216,8 @@ pub(super) fn republish_bpf_session_entries_for_owner_rgs(
     if errors > 0 {
         eprintln!(
             "bpfrx-ha: republish_bpf_session_entries: {} errors out of {} attempted",
-            errors, published + errors
+            errors,
+            published + errors
         );
     }
     published
@@ -270,26 +273,30 @@ pub(super) struct ResolvedSessionLookup {
     pub(super) key: ResolvedSessionKey,
     pub(super) lookup: SessionLookup,
     pub(super) shared_entry: Option<SyncedSessionEntry>,
+    pub(super) origin: SessionOrigin,
 }
 
 impl ResolvedSessionLookup {
-    pub(super) fn local_query(lookup: SessionLookup) -> Self {
+    pub(super) fn local_query(lookup: SessionLookup, origin: SessionOrigin) -> Self {
         Self {
             key: ResolvedSessionKey::QueryKey,
             lookup,
             shared_entry: None,
+            origin,
         }
     }
 
-    pub(super) fn local(key: SessionKey, lookup: SessionLookup) -> Self {
+    pub(super) fn local(key: SessionKey, lookup: SessionLookup, origin: SessionOrigin) -> Self {
         Self {
             key: ResolvedSessionKey::Canonical(key),
             lookup,
             shared_entry: None,
+            origin,
         }
     }
 
     pub(super) fn shared(entry: SyncedSessionEntry) -> Self {
+        let origin = entry.origin;
         Self {
             key: ResolvedSessionKey::Canonical(entry.key.clone()),
             lookup: SessionLookup {
@@ -297,6 +304,7 @@ impl ResolvedSessionLookup {
                 metadata: entry.metadata.clone(),
             },
             shared_entry: Some(entry),
+            origin,
         }
     }
 }
@@ -317,18 +325,21 @@ pub(super) fn lookup_session_across_scopes(
     tcp_flags: u8,
 ) -> Option<ResolvedSessionLookup> {
     sessions
-        .lookup(key, now_ns, tcp_flags)
-        .map(ResolvedSessionLookup::local_query)
+        .lookup_with_origin(key, now_ns, tcp_flags)
+        .map(|(lookup, origin)| ResolvedSessionLookup::local_query(lookup, origin))
         .or_else(|| {
-            sessions.find_forward_wire_match(key).map(|matched| {
-                ResolvedSessionLookup::local(
-                    matched.key,
-                    SessionLookup {
-                        decision: matched.decision,
-                        metadata: matched.metadata,
-                    },
-                )
-            })
+            sessions
+                .find_forward_wire_match_with_origin(key)
+                .map(|(matched, origin)| {
+                    ResolvedSessionLookup::local(
+                        matched.key,
+                        SessionLookup {
+                            decision: matched.decision,
+                            metadata: matched.metadata,
+                        },
+                        origin,
+                    )
+                })
         })
         .or_else(|| lookup_shared_session(shared_sessions, key).map(ResolvedSessionLookup::shared))
         .or_else(|| {
@@ -670,11 +681,10 @@ pub(super) fn refresh_reverse_prewarm_owner_rg_indexes(
     previous_entry: Option<&SyncedSessionEntry>,
     next_entry: Option<&SyncedSessionEntry>,
 ) {
-    let previous_owner_rgs = previous_entry.map(|entry| {
-        reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, entry)
-    });
-    let next_owner_rgs =
-        next_entry.map(|entry| reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, entry));
+    let previous_owner_rgs = previous_entry
+        .map(|entry| reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, entry));
+    let next_owner_rgs = next_entry
+        .map(|entry| reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, entry));
     let Ok(mut index) = index.lock() else {
         return;
     };
