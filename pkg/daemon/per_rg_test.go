@@ -130,7 +130,7 @@ func TestStrictVIPOwnershipByDefault_DisabledInUserspaceVRRPMode(t *testing.T) {
 	}
 }
 
-func TestSyncRGStrictVIPOwnershipMode_DisabledInNoRethVRRPMode(t *testing.T) {
+func TestStrictVIPOwnershipByDefault_DisabledInNoRethVRRPMode(t *testing.T) {
 	cc := &config.ClusterConfig{
 		NoRethVRRP:       true,
 		RedundancyGroups: []*config.RedundancyGroup{{ID: 1}},
@@ -142,7 +142,7 @@ func TestSyncRGStrictVIPOwnershipMode_DisabledInNoRethVRRPMode(t *testing.T) {
 	}
 }
 
-func TestSyncRGStrictVIPOwnershipMode_DisabledInPrivateRGElectionMode(t *testing.T) {
+func TestStrictVIPOwnershipByDefault_DisabledInPrivateRGElectionMode(t *testing.T) {
 	cc := &config.ClusterConfig{
 		PrivateRGElection: true,
 		RedundancyGroups:  []*config.RedundancyGroup{{ID: 1}},
