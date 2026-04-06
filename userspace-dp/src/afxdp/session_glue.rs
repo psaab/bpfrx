@@ -268,7 +268,7 @@ pub(super) fn apply_worker_commands(
     };
     let now_ns = monotonic_nanos();
     let now_secs = now_ns / 1_000_000_000;
-    let mut cancelled_keys = Vec::new();
+    let cancelled_keys: Vec<SessionKey> = Vec::new();
     let mut applied_sequences = Vec::new();
     let mut exported_sequences = Vec::new();
     for cmd in pending {
@@ -280,56 +280,10 @@ pub(super) fn apply_worker_commands(
                 export_forward_sessions_for_owner_rgs(sessions, &owner_rgs);
                 exported_sequences.push(sequence);
             }
-            WorkerCommand::ApplyHAState {
-                sequence,
-                refresh_owner_rgs,
-                demote_owner_rgs,
-            } => {
-                let mut affected_owner_rgs = refresh_owner_rgs.clone();
-                for rg_id in &demote_owner_rgs {
-                    if !affected_owner_rgs.contains(rg_id) {
-                        affected_owner_rgs.push(*rg_id);
-                    }
-                }
-                // Flow cache invalidation is handled by epoch-based check
-                // in FlowCache::lookup() — no per-entry scan needed here.
-                if !refresh_owner_rgs.is_empty() || !demote_owner_rgs.is_empty() {
-                    let refreshed = refresh_live_reverse_sessions_for_owner_rgs(
-                        sessions,
-                        session_map_fd,
-                        forwarding,
-                        ha_state,
-                        dynamic_neighbors,
-                        &affected_owner_rgs,
-                        now_ns,
-                        now_secs,
-                        !demote_owner_rgs.is_empty(),
-                    );
-                    // Collect refreshed keys as cancelled so queued TX
-                    // packets with stale resolution get dropped. Keys from
-                    // demoted RGs are added by the demote loop below, so
-                    // deduplicate to avoid double-cancel.
-                    cancelled_keys.extend(refreshed);
-                }
-                for owner_rg_id in demote_owner_rgs {
-                    eprintln!(
-                        "bpfrx-ha: DemoteOwnerRG {} worker sessions: total={}",
-                        owner_rg_id,
-                        sessions.len(),
-                    );
-                    // Mark sessions as synced in-place. Their decisions were
-                    // already refreshed above, so demoted flows stay redirect-
-                    // ready on the standby without tearing down the live BPF
-                    // keys that activation would otherwise need to rebuild.
-                    let demoted = sessions.demote_owner_rg(owner_rg_id);
-                    eprintln!(
-                        "bpfrx-ha: DemoteOwnerRG {} demoted_sessions={} remaining={}",
-                        owner_rg_id,
-                        demoted.len(),
-                        sessions.len(),
-                    );
-                    cancelled_keys.extend(demoted);
-                }
+            WorkerCommand::ApplyHAState { sequence } => {
+                // Worker-local session repair is no longer part of the HA
+                // transition path. Flow cache epoch invalidation and shared
+                // session lookup handle continuity without an owner-RG walk.
                 applied_sequences.push(sequence);
             }
             WorkerCommand::UpsertSynced(mut entry) => {
@@ -427,12 +381,6 @@ pub(super) fn apply_worker_commands(
             }
         }
     }
-    // Deduplicate: refresh and demote paths may both collect the same key.
-    {
-        let mut seen =
-            super::FastSet::with_capacity_and_hasher(cancelled_keys.len(), Default::default());
-        cancelled_keys.retain(|k| seen.insert(k.clone()));
-    }
     WorkerCommandResults {
         cancelled_keys,
         applied_sequences,
@@ -463,6 +411,7 @@ pub(super) fn replicate_session_delete(
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
     sessions: &mut SessionTable,
     session_map_fd: c_int,
@@ -2330,7 +2279,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_worker_commands_demotes_local_sessions_for_owner_rg() {
+    fn apply_worker_commands_records_demotion_sequence_without_mutating_local_sessions() {
         let commands = Arc::new(Mutex::new(VecDeque::new()));
         let mut sessions = SessionTable::new();
         let key = test_key();
@@ -2347,11 +2296,7 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::ApplyHAState {
-                sequence: 3,
-                refresh_owner_rgs: Vec::new(),
-                demote_owner_rgs: vec![1],
-            });
+            .push_back(WorkerCommand::ApplyHAState { sequence: 3 });
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let results = apply_worker_commands(
@@ -2364,10 +2309,18 @@ mod tests {
             &BTreeMap::new(),
             &dynamic_neighbors,
         );
-        assert_eq!(results.cancelled_keys, vec![key.clone()]);
+        assert!(results.cancelled_keys.is_empty());
         assert_eq!(results.applied_sequences, vec![3]);
 
-        let _hit = sessions.lookup(&key, 2_000_000, 0x10).expect("demoted hit");
+        let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("local hit");
+        assert_eq!(
+            hit.decision.resolution.disposition,
+            test_decision().resolution.disposition
+        );
+        let (_, _, origin) = sessions
+            .entry_with_origin(&key)
+            .expect("local session origin");
+        assert_eq!(origin, SessionOrigin::ForwardFlow);
     }
 
     #[test]
@@ -2512,7 +2465,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_worker_commands_marks_reverse_local_sessions_synced_for_owner_rg() {
+    fn apply_worker_commands_leaves_reverse_local_sessions_unchanged() {
         let commands = Arc::new(Mutex::new(VecDeque::new()));
         let mut sessions = SessionTable::new();
         let mut key = test_key();
@@ -2532,11 +2485,7 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::ApplyHAState {
-                sequence: 5,
-                refresh_owner_rgs: Vec::new(),
-                demote_owner_rgs: vec![1],
-            });
+            .push_back(WorkerCommand::ApplyHAState { sequence: 5 });
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         apply_worker_commands(
@@ -2550,94 +2499,21 @@ mod tests {
             &dynamic_neighbors,
         );
 
-        let _hit = sessions
-            .lookup(&key, 2_000_000, 0x10)
-            .expect("demoted reverse hit");
-    }
-
-    #[test]
-    fn apply_worker_commands_demoted_owner_rg_refreshes_reverse_sessions_to_fabric_redirect() {
-        let commands = Arc::new(Mutex::new(VecDeque::new()));
-        let mut sessions = SessionTable::new();
-        let key = SessionKey {
-            addr_family: libc::AF_INET as u8,
-            protocol: PROTO_TCP,
-            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
-            dst_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
-            src_port: 5201,
-            dst_port: 42424,
-        };
-        let decision = SessionDecision {
-            resolution: ForwardingResolution {
-                disposition: ForwardingDisposition::ForwardCandidate,
-                local_ifindex: 0,
-                egress_ifindex: 6,
-                tx_ifindex: 6,
-                tunnel_endpoint_id: 0,
-                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
-                neighbor_mac: Some([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]),
-                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]),
-                tx_vlan_id: 0,
-            },
-            nat: NatDecision::default(),
-        };
-        let metadata = SessionMetadata {
-            ingress_zone: Arc::<str>::from("wan"),
-            egress_zone: Arc::<str>::from("lan"),
-            owner_rg_id: 1,
-            fabric_ingress: false,
-            is_reverse: true,
-            nat64_reverse: None,
-        };
-        assert!(sessions.install_with_protocol(
-            key.clone(),
-            decision,
-            metadata,
-            1_000_000,
-            PROTO_TCP,
-            0x10,
-        ));
-        commands
-            .lock()
-            .expect("commands lock")
-            .push_back(WorkerCommand::ApplyHAState {
-                sequence: 6,
-                refresh_owner_rgs: Vec::new(),
-                demote_owner_rgs: vec![1],
-            });
-        let forwarding = test_forwarding_state_with_fabric();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let mut ha_state = BTreeMap::new();
-        ha_state.insert(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000));
-        apply_worker_commands(
-            &commands,
-            &mut sessions,
-            -1,
-            -1,
-            -1,
-            &forwarding,
-            &ha_state,
-            &dynamic_neighbors,
-        );
-
         let hit = sessions
             .lookup(&key, 2_000_000, 0x10)
-            .expect("demoted reverse hit");
-
-        assert_eq!(hit.metadata.owner_rg_id, 1);
+            .expect("reverse hit");
         assert_eq!(
             hit.decision.resolution.disposition,
-            ForwardingDisposition::FabricRedirect
+            test_decision().resolution.disposition
         );
-        assert_eq!(hit.decision.resolution.egress_ifindex, 21);
-        assert_eq!(
-            hit.decision.resolution.src_mac,
-            Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x03])
-        );
+        let (_, _, origin) = sessions
+            .entry_with_origin(&key)
+            .expect("reverse session origin");
+        assert_eq!(origin, SessionOrigin::ForwardFlow);
     }
 
     #[test]
-    fn apply_worker_commands_demoted_owner_rg_republishes_forward_sessions() {
+    fn apply_worker_commands_demotion_no_longer_republishes_forward_sessions() {
         let commands = Arc::new(Mutex::new(VecDeque::new()));
         let mut sessions = SessionTable::new();
         let key = test_key();
@@ -2664,16 +2540,12 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::ApplyHAState {
-                sequence: 7,
-                refresh_owner_rgs: Vec::new(),
-                demote_owner_rgs: vec![1],
-            });
+            .push_back(WorkerCommand::ApplyHAState { sequence: 7 });
         let forwarding = test_forwarding_state_with_fabric();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
         ha_state.insert(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000));
-        apply_worker_commands(
+        let results = apply_worker_commands(
             &commands,
             &mut sessions,
             -1,
@@ -2684,31 +2556,25 @@ mod tests {
             &dynamic_neighbors,
         );
 
+        assert_eq!(results.cancelled_keys, Vec::<SessionKey>::new());
+        assert_eq!(results.applied_sequences, vec![7]);
         let hit = sessions
             .lookup(&key, 2_000_000, 0x10)
-            .expect("demoted forward hit");
+            .expect("forward hit");
 
         assert_eq!(
             hit.decision.resolution.disposition,
-            ForwardingDisposition::FabricRedirect
-        );
-        let deltas = sessions.drain_deltas(16);
-        assert_eq!(deltas.len(), 1, "demotion should republish forward session");
-        assert_eq!(deltas[0].kind, SessionDeltaKind::Open);
-        assert_eq!(deltas[0].key, key);
-        assert_eq!(
-            deltas[0].decision.resolution.disposition,
             ForwardingDisposition::ForwardCandidate
         );
-        assert_eq!(
-            deltas[0].decision.nat.rewrite_src,
-            Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)))
+        let deltas = sessions.drain_deltas(16);
+        assert!(
+            deltas.is_empty(),
+            "demotion sequencing should not republish forward sessions"
         );
-        assert!(deltas[0].fabric_redirect_sync);
     }
 
     #[test]
-    fn apply_worker_commands_refreshes_activated_owner_rg_without_republish() {
+    fn apply_worker_commands_activation_no_longer_refreshes_local_sessions() {
         let commands = Arc::new(Mutex::new(VecDeque::new()));
         let mut sessions = SessionTable::new();
         let key = test_key();
@@ -2735,11 +2601,7 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::ApplyHAState {
-                sequence: 7,
-                refresh_owner_rgs: vec![1],
-                demote_owner_rgs: Vec::new(),
-            });
+            .push_back(WorkerCommand::ApplyHAState { sequence: 7 });
         let forwarding = test_forwarding_state_with_fabric();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let mut ha_state = BTreeMap::new();
@@ -2755,11 +2617,9 @@ mod tests {
             &dynamic_neighbors,
         );
 
-        assert_eq!(results.cancelled_keys, vec![key.clone()]);
+        assert!(results.cancelled_keys.is_empty());
         assert_eq!(results.applied_sequences, vec![7]);
-        let hit = sessions
-            .lookup(&key, 2_000_000, 0x10)
-            .expect("prepared forward hit");
+        let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("forward hit");
 
         assert_eq!(
             hit.decision.resolution.disposition,
@@ -2842,11 +2702,7 @@ mod tests {
         commands
             .lock()
             .expect("commands lock")
-            .push_back(WorkerCommand::ApplyHAState {
-                sequence: 7,
-                refresh_owner_rgs: Vec::new(),
-                demote_owner_rgs: Vec::new(),
-            });
+            .push_back(WorkerCommand::ApplyHAState { sequence: 7 });
         let forwarding = test_forwarding_state();
         let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
         let ha_state = BTreeMap::new();
