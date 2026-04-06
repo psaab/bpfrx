@@ -2,8 +2,14 @@ package userspace
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"net"
+	"os/exec"
+	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -16,6 +22,16 @@ func hostToNetwork16(v uint16) uint16 {
 	var raw [2]byte
 	binary.BigEndian.PutUint16(raw[:], v)
 	return binary.NativeEndian.Uint16(raw[:])
+}
+
+func injectInnerMap(t *testing.T, inner *dataplane.Manager, name string, m *ebpf.Map) {
+	t.Helper()
+	rv := reflect.ValueOf(inner).Elem().FieldByName("maps")
+	rm := reflect.NewAt(rv.Type(), unsafe.Pointer(rv.UnsafeAddr())).Elem()
+	if rm.IsNil() {
+		rm.Set(reflect.MakeMap(rv.Type()))
+	}
+	rm.SetMapIndex(reflect.ValueOf(name), reflect.ValueOf(m))
 }
 
 func TestFindUserspaceEgressInterfaceSnapshotPrefersVLANUnit(t *testing.T) {
@@ -327,6 +343,77 @@ func TestShouldMirrorUserspaceSessionSkipsReverseEntries(t *testing.T) {
 	}
 	if shouldMirrorUserspaceSession(1) {
 		t.Fatal("expected reverse sessions to be skipped")
+	}
+}
+
+func TestSetClusterSyncedSessionV4SkipsReverseHelperMirror(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	dir := t.TempDir()
+	controlSock := filepath.Join(dir, "control.sock")
+	sessionSock := filepath.Join(dir, "userspace-dp-sessions.sock")
+	ln, err := net.Listen("unix", sessionSock)
+	if err != nil {
+		t.Fatalf("listen session socket: %v", err)
+	}
+	defer ln.Close()
+
+	gotReq := make(chan ControlRequest, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var req ControlRequest
+		if err := json.NewDecoder(conn).Decode(&req); err == nil {
+			gotReq <- req
+		}
+		_ = json.NewEncoder(conn).Encode(ControlResponse{OK: true})
+	}()
+
+	m := New()
+	m.proc = &exec.Cmd{}
+	m.cfg.ControlSocket = controlSock
+	sessionsMap, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKey{})),
+		ValueSize:  uint32(unsafe.Sizeof(dataplane.SessionValue{})),
+		MaxEntries: 1024,
+	})
+	if err != nil {
+		t.Fatalf("new sessions map: %v", err)
+	}
+	defer sessionsMap.Close()
+	injectInnerMap(t, m.inner, "sessions", sessionsMap)
+
+	key := dataplane.SessionKey{
+		SrcIP:    [4]byte{172, 16, 80, 200},
+		DstIP:    [4]byte{172, 16, 80, 8},
+		SrcPort:  hostToNetwork16(5201),
+		DstPort:  hostToNetwork16(55340),
+		Protocol: 6,
+	}
+	val := dataplane.SessionValue{
+		IsReverse:   1,
+		IngressZone: 2,
+		EgressZone:  1,
+		Flags:       dataplane.SessFlagSNAT,
+		FibIfindex:  6,
+		FibVlanID:   80,
+		NATSrcIP:    binary.NativeEndian.Uint32([]byte{172, 16, 80, 8}),
+		NATSrcPort:  hostToNetwork16(55340),
+	}
+
+	if err := m.SetClusterSyncedSessionV4(key, val); err != nil {
+		t.Fatalf("SetClusterSyncedSessionV4: %v", err)
+	}
+
+	select {
+	case req := <-gotReq:
+		t.Fatalf("unexpected helper mirror request for reverse cluster session: %+v", req)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
