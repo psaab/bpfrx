@@ -1306,10 +1306,10 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 	if cc.ControlInterface != "" && cc.PeerAddress != "" {
 		go func() {
 			for i := 0; i < 30; i++ {
-				localIP := resolveInterfaceAddr(cc.ControlInterface, "")
+				localIP := resolveClusterInterfaceAddr(cc.ControlInterface, cc.PeerAddress, "")
 				if localIP == "" {
 					if i == 0 {
-						slog.Info("cluster: control interface has no IPv4 address yet, waiting",
+						slog.Info("cluster: control interface has no usable address yet, waiting",
 							"interface", cc.ControlInterface)
 					}
 					time.Sleep(2 * time.Second)
@@ -1348,12 +1348,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 		go func() {
 			var syncIP string
 			for i := 0; i < 30; i++ {
-				syncIP = resolveInterfaceAddr(syncIface, "")
+				syncIP = resolveClusterInterfaceAddr(syncIface, syncPeerAddr, "")
 				if syncIP != "" {
 					break
 				}
 				if i == 0 {
-					slog.Info("cluster: sync interface has no IPv4 address yet, waiting",
+					slog.Info("cluster: sync interface has no usable address yet, waiting",
 						"interface", syncIface, "transport", syncTransport)
 				}
 				select {
@@ -1368,8 +1368,8 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				return
 			}
 
-			syncLocal := fmt.Sprintf("%s:4785", syncIP)
-			syncPeer := fmt.Sprintf("%s:4785", syncPeerAddr)
+			syncLocal := net.JoinHostPort(syncIP, "4785")
+			syncPeer := net.JoinHostPort(syncPeerAddr, "4785")
 			slog.Info("cluster: session sync transport", "mode", syncTransport,
 				"local", syncLocal, "peer", syncPeer)
 
@@ -1379,12 +1379,12 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			if syncTransport == "fabric" && cc.Fabric1Interface != "" && cc.Fabric1PeerAddress != "" {
 				var fab1IP string
 				for i := 0; i < 15; i++ {
-					fab1IP = resolveInterfaceAddr(cc.Fabric1Interface, "")
+					fab1IP = resolveClusterInterfaceAddr(cc.Fabric1Interface, cc.Fabric1PeerAddress, "")
 					if fab1IP != "" {
 						break
 					}
 					if i == 0 {
-						slog.Info("cluster: fabric1 interface has no IPv4 address yet, waiting",
+						slog.Info("cluster: fabric1 interface has no usable address yet, waiting",
 							"interface", cc.Fabric1Interface)
 					}
 					select {
@@ -1394,8 +1394,8 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 					}
 				}
 				if fab1IP != "" {
-					syncLocal1 = fmt.Sprintf("%s:4785", fab1IP)
-					syncPeer1 = fmt.Sprintf("%s:4785", cc.Fabric1PeerAddress)
+					syncLocal1 = net.JoinHostPort(fab1IP, "4785")
+					syncPeer1 = net.JoinHostPort(cc.Fabric1PeerAddress, "4785")
 					slog.Info("cluster: dual fabric transport configured",
 						"fab0_local", syncLocal, "fab1_local", syncLocal1)
 				} else {
