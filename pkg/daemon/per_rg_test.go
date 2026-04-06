@@ -106,6 +106,33 @@ func TestRethMasterState_MultiRG(t *testing.T) {
 	}
 }
 
+func TestSyncRGStrictVIPOwnershipMode_DefaultsToStrictInVRRPMode(t *testing.T) {
+	d := newTestDaemon()
+	cc := &config.ClusterConfig{
+		RedundancyGroups: []*config.RedundancyGroup{{ID: 1}},
+	}
+
+	d.syncRGStrictVIPOwnershipMode(cc)
+
+	if !d.getOrCreateRGState(1).IsStrictVIPOwnership() {
+		t.Fatal("expected strict VIP ownership to default on in VRRP mode")
+	}
+}
+
+func TestSyncRGStrictVIPOwnershipMode_DisabledInNoRethVRRPMode(t *testing.T) {
+	d := newTestDaemon()
+	cc := &config.ClusterConfig{
+		NoRethVRRP:       true,
+		RedundancyGroups: []*config.RedundancyGroup{{ID: 1}},
+	}
+
+	d.syncRGStrictVIPOwnershipMode(cc)
+
+	if d.getOrCreateRGState(1).IsStrictVIPOwnership() {
+		t.Fatal("expected strict VIP ownership to stay off in no-reth-vrrp mode")
+	}
+}
+
 func TestSnapshotRethMasterState(t *testing.T) {
 	d := newTestDaemon()
 
@@ -173,13 +200,13 @@ func TestIsRethVRID(t *testing.T) {
 		vrid int
 		want bool
 	}{
-		{0, false},   // standalone
-		{1, false},   // standalone
-		{50, false},  // standalone
-		{99, false},  // standalone
-		{100, true},  // RETH RG 0
-		{101, true},  // RETH RG 1
-		{200, true},  // RETH RG 100
+		{0, false},  // standalone
+		{1, false},  // standalone
+		{50, false}, // standalone
+		{99, false}, // standalone
+		{100, true}, // RETH RG 0
+		{101, true}, // RETH RG 1
+		{200, true}, // RETH RG 100
 	}
 	for _, tt := range tests {
 		got := isRethVRID(tt.vrid)
