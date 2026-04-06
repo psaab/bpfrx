@@ -536,13 +536,16 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 	if err := m.inner.SetSessionV4(key, installVal); err != nil {
 		return err
 	}
-	// Mirror both forward AND reverse cluster-synced sessions to the Rust
-	// helper. Unlike SetSessionV4 (which synthesizes reverse companions
-	// internally), cluster sync relies on the caller to send reverse entries
-	// as separate calls — so we must not filter them out here (#316).
+	// The helper already synthesizes the correct reverse companion from the
+	// forward cluster-synced entry using local forwarding and HA state. An
+	// explicit reverse cluster update can overwrite that locally-derived
+	// companion with peer NAT/FIB metadata, so only mirror forward entries.
+	if !shouldMirrorUserspaceSession(val.IsReverse) {
+		return nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.syncSessionV4Locked("upsert", key, &val); err != nil {
+	if err := m.syncSessionV4Locked("upsert", key, &installVal); err != nil {
 		slog.Debug("userspace: session mirror failed", "err", err)
 	}
 	return nil
@@ -588,10 +591,12 @@ func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val data
 	if err := m.inner.SetSessionV6(key, installVal); err != nil {
 		return err
 	}
-	// Mirror both forward AND reverse — see SetClusterSyncedSessionV4 (#316).
+	if !shouldMirrorUserspaceSession(val.IsReverse) {
+		return nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.syncSessionV6Locked("upsert", key, &val); err != nil {
+	if err := m.syncSessionV6Locked("upsert", key, &installVal); err != nil {
 		slog.Debug("userspace: session mirror failed", "err", err)
 	}
 	return nil

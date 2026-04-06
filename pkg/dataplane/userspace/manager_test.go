@@ -2,8 +2,15 @@ package userspace
 
 import (
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
 	"net"
+	"os/exec"
+	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
+	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
@@ -16,6 +23,44 @@ func hostToNetwork16(v uint16) uint16 {
 	var raw [2]byte
 	binary.BigEndian.PutUint16(raw[:], v)
 	return binary.NativeEndian.Uint16(raw[:])
+}
+
+func injectInnerMap(t *testing.T, inner *dataplane.Manager, name string, m *ebpf.Map) {
+	t.Helper()
+	if inner == nil {
+		t.Fatal("injectInnerMap: inner manager is nil")
+	}
+	managerValue := reflect.ValueOf(inner)
+	if managerValue.Kind() != reflect.Ptr || managerValue.IsNil() {
+		t.Fatalf("injectInnerMap: expected non-nil pointer to dataplane.Manager, got %T", inner)
+	}
+	managerElem := managerValue.Elem()
+	if !managerElem.IsValid() || managerElem.Kind() != reflect.Struct {
+		t.Fatalf("injectInnerMap: expected dataplane.Manager struct, got kind %s", managerElem.Kind())
+	}
+	rv := managerElem.FieldByName("maps")
+	if !rv.IsValid() {
+		t.Fatal("injectInnerMap: dataplane.Manager has no field named \"maps\"")
+	}
+	if !rv.CanAddr() {
+		t.Fatal("injectInnerMap: dataplane.Manager.maps is not addressable")
+	}
+	if rv.Kind() != reflect.Map {
+		t.Fatalf("injectInnerMap: dataplane.Manager.maps has kind %s, want map", rv.Kind())
+	}
+	rm := reflect.NewAt(rv.Type(), unsafe.Pointer(rv.UnsafeAddr())).Elem()
+	if rm.IsNil() {
+		rm.Set(reflect.MakeMap(rv.Type()))
+	}
+	key := reflect.ValueOf(name)
+	value := reflect.ValueOf(m)
+	if !key.Type().AssignableTo(rv.Type().Key()) {
+		t.Fatalf("injectInnerMap: cannot use key type %s for map key type %s", key.Type(), rv.Type().Key())
+	}
+	if !value.Type().AssignableTo(rv.Type().Elem()) {
+		t.Fatalf("injectInnerMap: cannot use value type %s for map element type %s", value.Type(), rv.Type().Elem())
+	}
+	rm.SetMapIndex(key, value)
 }
 
 func TestFindUserspaceEgressInterfaceSnapshotPrefersVLANUnit(t *testing.T) {
@@ -327,6 +372,131 @@ func TestShouldMirrorUserspaceSessionSkipsReverseEntries(t *testing.T) {
 	}
 	if shouldMirrorUserspaceSession(1) {
 		t.Fatal("expected reverse sessions to be skipped")
+	}
+}
+
+func TestSetClusterSyncedSessionV4SkipsReverseHelperMirror(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	dir := t.TempDir()
+	controlSock := filepath.Join(dir, "control.sock")
+	sessionSock := filepath.Join(dir, "userspace-dp-sessions.sock")
+	ln, err := net.Listen("unix", sessionSock)
+	if err != nil {
+		t.Fatalf("listen session socket: %v", err)
+	}
+	defer ln.Close()
+
+	unexpectedConn := make(chan string, 4)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			select {
+			case unexpectedConn <- "unexpected helper session socket connection for reverse cluster session":
+			default:
+			}
+			go func() {
+				defer conn.Close()
+				var req ControlRequest
+				if err := json.NewDecoder(conn).Decode(&req); err == nil {
+					select {
+					case unexpectedConn <- fmt.Sprintf("unexpected helper mirror request for reverse cluster session: %+v", req):
+					default:
+					}
+				}
+				_ = json.NewEncoder(conn).Encode(ControlResponse{OK: true})
+			}()
+		}
+	}()
+
+	m := New()
+	m.proc = &exec.Cmd{}
+	m.cfg.ControlSocket = controlSock
+	sessionsMap, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKey{})),
+		ValueSize:  uint32(unsafe.Sizeof(dataplane.SessionValue{})),
+		MaxEntries: 1024,
+	})
+	if err != nil {
+		t.Fatalf("new sessions map: %v", err)
+	}
+	defer sessionsMap.Close()
+	injectInnerMap(t, m.inner, "sessions", sessionsMap)
+	sessionsMapV6, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKeyV6{})),
+		ValueSize:  uint32(unsafe.Sizeof(dataplane.SessionValueV6{})),
+		MaxEntries: 1024,
+	})
+	if err != nil {
+		t.Fatalf("new sessions_v6 map: %v", err)
+	}
+	defer sessionsMapV6.Close()
+	injectInnerMap(t, m.inner, "sessions_v6", sessionsMapV6)
+
+	key := dataplane.SessionKey{
+		SrcIP:    [4]byte{172, 16, 80, 200},
+		DstIP:    [4]byte{172, 16, 80, 8},
+		SrcPort:  hostToNetwork16(5201),
+		DstPort:  hostToNetwork16(55340),
+		Protocol: 6,
+	}
+	val := dataplane.SessionValue{
+		IsReverse:   1,
+		IngressZone: 2,
+		EgressZone:  1,
+		Flags:       dataplane.SessFlagSNAT,
+		FibIfindex:  6,
+		FibVlanID:   80,
+		NATSrcIP:    binary.NativeEndian.Uint32([]byte{172, 16, 80, 8}),
+		NATSrcPort:  hostToNetwork16(55340),
+	}
+
+	if err := m.SetClusterSyncedSessionV4(key, val); err != nil {
+		t.Fatalf("SetClusterSyncedSessionV4: %v", err)
+	}
+
+	select {
+	case msg := <-unexpectedConn:
+		t.Fatal(msg)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	var srcIPv6, dstIPv6, natSrcIPv6 [16]byte
+	copy(srcIPv6[:], net.ParseIP("2001:db8:1::200").To16())
+	copy(dstIPv6[:], net.ParseIP("2001:db8:2::8").To16())
+	copy(natSrcIPv6[:], net.ParseIP("2001:db8:2::8").To16())
+	keyV6 := dataplane.SessionKeyV6{
+		SrcIP:    srcIPv6,
+		DstIP:    dstIPv6,
+		SrcPort:  hostToNetwork16(5201),
+		DstPort:  hostToNetwork16(55340),
+		Protocol: 6,
+	}
+	valV6 := dataplane.SessionValueV6{
+		IsReverse:   1,
+		IngressZone: 2,
+		EgressZone:  1,
+		Flags:       dataplane.SessFlagSNAT,
+		FibIfindex:  6,
+		FibVlanID:   80,
+		NATSrcIP:    natSrcIPv6,
+		NATSrcPort:  hostToNetwork16(55340),
+	}
+
+	if err := m.SetClusterSyncedSessionV6(keyV6, valV6); err != nil {
+		t.Fatalf("SetClusterSyncedSessionV6: %v", err)
+	}
+
+	select {
+	case msg := <-unexpectedConn:
+		t.Fatal(msg)
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
