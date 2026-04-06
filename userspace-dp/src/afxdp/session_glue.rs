@@ -205,7 +205,6 @@ fn should_bypass_unseeded_tunnel_ha(
 
 pub(super) struct WorkerCommandResults {
     pub cancelled_keys: Vec<SessionKey>,
-    pub applied_sequences: Vec<u64>,
     pub exported_sequences: Vec<u64>,
 }
 
@@ -252,7 +251,6 @@ pub(super) fn apply_worker_commands(
             if pending.is_empty() {
                 return WorkerCommandResults {
                     cancelled_keys: Vec::new(),
-                    applied_sequences: Vec::new(),
                     exported_sequences: Vec::new(),
                 };
             }
@@ -261,7 +259,6 @@ pub(super) fn apply_worker_commands(
         Err(_) => {
             return WorkerCommandResults {
                 cancelled_keys: Vec::new(),
-                applied_sequences: Vec::new(),
                 exported_sequences: Vec::new(),
             };
         }
@@ -269,7 +266,6 @@ pub(super) fn apply_worker_commands(
     let now_ns = monotonic_nanos();
     let now_secs = now_ns / 1_000_000_000;
     let cancelled_keys: Vec<SessionKey> = Vec::new();
-    let mut applied_sequences = Vec::new();
     let mut exported_sequences = Vec::new();
     for cmd in pending {
         match cmd {
@@ -279,12 +275,6 @@ pub(super) fn apply_worker_commands(
             } => {
                 export_forward_sessions_for_owner_rgs(sessions, &owner_rgs);
                 exported_sequences.push(sequence);
-            }
-            WorkerCommand::ApplyHAState { sequence } => {
-                // Worker-local session repair is no longer part of the HA
-                // transition path. Flow cache epoch invalidation and shared
-                // session lookup handle continuity without an owner-RG walk.
-                applied_sequences.push(sequence);
             }
             WorkerCommand::UpsertSynced(mut entry) => {
                 let key = entry.key.clone();
@@ -383,7 +373,6 @@ pub(super) fn apply_worker_commands(
     }
     WorkerCommandResults {
         cancelled_keys,
-        applied_sequences,
         exported_sequences,
     }
 }
@@ -409,104 +398,6 @@ pub(super) fn replicate_session_delete(
             pending.push_back(WorkerCommand::DeleteSynced(key.clone()));
         }
     }
-}
-
-#[allow(dead_code)]
-pub(super) fn refresh_live_reverse_sessions_for_owner_rgs(
-    sessions: &mut SessionTable,
-    session_map_fd: c_int,
-    forwarding: &ForwardingState,
-    ha_state: &BTreeMap<i32, HAGroupRuntime>,
-    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
-    owner_rgs: &[i32],
-    now_ns: u64,
-    now_secs: u64,
-    emit_forward_deltas: bool,
-) -> Vec<SessionKey> {
-    if owner_rgs.is_empty() {
-        return Vec::new();
-    }
-    let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
-    let mut refreshed_keys = Vec::new();
-    // Shared-state reverse prewarm already handles the split-RG case where a
-    // forward session's synthesized reverse companion belongs to a different
-    // RG (#405). The live worker table only needs to touch sessions that are
-    // currently indexed to the affected owner RGs.
-    for key in sessions.owner_rg_session_keys(owner_rgs) {
-        let Some((decision, metadata, origin)) = sessions.entry_with_origin(&key) else {
-            continue;
-        };
-        let delta_metadata = metadata.clone();
-        let flow = SessionFlow {
-            src_ip: key.src_ip,
-            dst_ip: key.dst_ip,
-            forward_key: key.clone(),
-        };
-        let resolution_target = resolution_target_for_session(&flow, decision);
-        let looked_up = lookup_forwarding_resolution_for_session(
-            forwarding,
-            dynamic_neighbors,
-            &flow,
-            decision,
-        );
-        let looked_up = super::prefer_local_forward_candidate_for_fabric_ingress(
-            forwarding,
-            ha_state,
-            dynamic_neighbors,
-            now_secs,
-            metadata.fabric_ingress,
-            resolution_target,
-            looked_up,
-        );
-        let refreshed_resolution =
-            enforce_session_ha_resolution(forwarding, ha_state, now_secs, looked_up, 0, 0);
-        let refreshed_owner_rg = owner_rg_for_resolution(forwarding, refreshed_resolution);
-        // Skip sessions where neither the original nor re-resolved owner RG
-        // is in the activated set — no work needed for unrelated RGs.
-        if !owner_rg_set.contains(&metadata.owner_rg_id)
-            && !owner_rg_set.contains(&refreshed_owner_rg)
-        {
-            continue;
-        }
-        let refreshed_resolution =
-            redirect_session_resolution_for_metadata(forwarding, refreshed_resolution, &metadata);
-        let refreshed_decision = SessionDecision {
-            resolution: refreshed_resolution,
-            ..decision
-        };
-        let refreshed_metadata = SessionMetadata {
-            owner_rg_id: refreshed_owner_rg,
-            ..metadata
-        };
-        if sessions.refresh_for_ha_activation(
-            &key,
-            refreshed_decision,
-            refreshed_metadata.clone(),
-            now_ns,
-            0,
-        ) {
-            refreshed_keys.push(key.clone());
-            if emit_forward_deltas
-                && owner_rg_set.contains(&metadata.owner_rg_id)
-                && !metadata.is_reverse
-            {
-                sessions.emit_open_delta_with_origin(
-                    key.clone(),
-                    decision,
-                    delta_metadata,
-                    origin,
-                    true,
-                );
-            }
-            let _ = publish_session_map_entry_for_session(
-                session_map_fd,
-                &key,
-                refreshed_decision,
-                &refreshed_metadata,
-            );
-        }
-    }
-    refreshed_keys
 }
 
 pub(super) fn should_teardown_tcp_rst(_meta: UserspaceDpMeta, _flow: Option<&SessionFlow>) -> bool {
@@ -2279,51 +2170,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_worker_commands_records_demotion_sequence_without_mutating_local_sessions() {
-        let commands = Arc::new(Mutex::new(VecDeque::new()));
-        let mut sessions = SessionTable::new();
-        let key = test_key();
-        let mut live_metadata = test_metadata();
-        live_metadata.owner_rg_id = 1;
-        assert!(sessions.install_with_protocol(
-            key.clone(),
-            test_decision(),
-            live_metadata,
-            1_000_000,
-            PROTO_TCP,
-            0x10,
-        ));
-        commands
-            .lock()
-            .expect("commands lock")
-            .push_back(WorkerCommand::ApplyHAState { sequence: 3 });
-        let forwarding = test_forwarding_state();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let results = apply_worker_commands(
-            &commands,
-            &mut sessions,
-            -1,
-            -1,
-            -1,
-            &forwarding,
-            &BTreeMap::new(),
-            &dynamic_neighbors,
-        );
-        assert!(results.cancelled_keys.is_empty());
-        assert_eq!(results.applied_sequences, vec![3]);
-
-        let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("local hit");
-        assert_eq!(
-            hit.decision.resolution.disposition,
-            test_decision().resolution.disposition
-        );
-        let (_, _, origin) = sessions
-            .entry_with_origin(&key)
-            .expect("local session origin");
-        assert_eq!(origin, SessionOrigin::ForwardFlow);
-    }
-
-    #[test]
     fn epoch_based_flow_cache_invalidation_for_demoted_owner_rg() {
         let rg_epochs: [AtomicU32; MAX_RG_EPOCHS] = std::array::from_fn(|_| AtomicU32::new(0));
         let mut flow_cache = FlowCache::new();
@@ -2465,174 +2311,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_worker_commands_leaves_reverse_local_sessions_unchanged() {
-        let commands = Arc::new(Mutex::new(VecDeque::new()));
-        let mut sessions = SessionTable::new();
-        let mut key = test_key();
-        key.src_ip = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200));
-        key.dst_ip = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8));
-        let mut reverse_metadata = test_metadata();
-        reverse_metadata.owner_rg_id = 1;
-        reverse_metadata.is_reverse = true;
-        assert!(sessions.install_with_protocol(
-            key.clone(),
-            test_decision(),
-            reverse_metadata,
-            1_000_000,
-            PROTO_TCP,
-            0x10,
-        ));
-        commands
-            .lock()
-            .expect("commands lock")
-            .push_back(WorkerCommand::ApplyHAState { sequence: 5 });
-        let forwarding = test_forwarding_state();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        apply_worker_commands(
-            &commands,
-            &mut sessions,
-            -1,
-            -1,
-            -1,
-            &forwarding,
-            &BTreeMap::new(),
-            &dynamic_neighbors,
-        );
-
-        let hit = sessions
-            .lookup(&key, 2_000_000, 0x10)
-            .expect("reverse hit");
-        assert_eq!(
-            hit.decision.resolution.disposition,
-            test_decision().resolution.disposition
-        );
-        let (_, _, origin) = sessions
-            .entry_with_origin(&key)
-            .expect("reverse session origin");
-        assert_eq!(origin, SessionOrigin::ForwardFlow);
-    }
-
-    #[test]
-    fn apply_worker_commands_demotion_no_longer_republishes_forward_sessions() {
-        let commands = Arc::new(Mutex::new(VecDeque::new()));
-        let mut sessions = SessionTable::new();
-        let key = test_key();
-        let decision = SessionDecision {
-            resolution: test_decision().resolution,
-            nat: NatDecision {
-                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
-                ..NatDecision::default()
-            },
-        };
-        let metadata = SessionMetadata {
-            owner_rg_id: 1,
-            ..test_metadata()
-        };
-        assert!(sessions.install_with_protocol(
-            key.clone(),
-            decision,
-            metadata,
-            1_000_000,
-            PROTO_TCP,
-            0x10,
-        ));
-        assert_eq!(sessions.drain_deltas(16).len(), 1, "initial open delta");
-        commands
-            .lock()
-            .expect("commands lock")
-            .push_back(WorkerCommand::ApplyHAState { sequence: 7 });
-        let forwarding = test_forwarding_state_with_fabric();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let mut ha_state = BTreeMap::new();
-        ha_state.insert(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000));
-        let results = apply_worker_commands(
-            &commands,
-            &mut sessions,
-            -1,
-            -1,
-            -1,
-            &forwarding,
-            &ha_state,
-            &dynamic_neighbors,
-        );
-
-        assert_eq!(results.cancelled_keys, Vec::<SessionKey>::new());
-        assert_eq!(results.applied_sequences, vec![7]);
-        let hit = sessions
-            .lookup(&key, 2_000_000, 0x10)
-            .expect("forward hit");
-
-        assert_eq!(
-            hit.decision.resolution.disposition,
-            ForwardingDisposition::ForwardCandidate
-        );
-        let deltas = sessions.drain_deltas(16);
-        assert!(
-            deltas.is_empty(),
-            "demotion sequencing should not republish forward sessions"
-        );
-    }
-
-    #[test]
-    fn apply_worker_commands_activation_no_longer_refreshes_local_sessions() {
-        let commands = Arc::new(Mutex::new(VecDeque::new()));
-        let mut sessions = SessionTable::new();
-        let key = test_key();
-        let decision = SessionDecision {
-            resolution: test_decision().resolution,
-            nat: NatDecision {
-                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
-                ..NatDecision::default()
-            },
-        };
-        let metadata = SessionMetadata {
-            owner_rg_id: 1,
-            ..test_metadata()
-        };
-        assert!(sessions.install_with_protocol(
-            key.clone(),
-            decision,
-            metadata,
-            1_000_000,
-            PROTO_TCP,
-            0x10,
-        ));
-        assert_eq!(sessions.drain_deltas(16).len(), 1, "initial open delta");
-        commands
-            .lock()
-            .expect("commands lock")
-            .push_back(WorkerCommand::ApplyHAState { sequence: 7 });
-        let forwarding = test_forwarding_state_with_fabric();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let mut ha_state = BTreeMap::new();
-        ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
-        let results = apply_worker_commands(
-            &commands,
-            &mut sessions,
-            -1,
-            -1,
-            -1,
-            &forwarding,
-            &ha_state,
-            &dynamic_neighbors,
-        );
-
-        assert!(results.cancelled_keys.is_empty());
-        assert_eq!(results.applied_sequences, vec![7]);
-        let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("forward hit");
-
-        assert_eq!(
-            hit.decision.resolution.disposition,
-            ForwardingDisposition::ForwardCandidate
-        );
-        let deltas = sessions.drain_deltas(16);
-        assert!(
-            deltas.is_empty(),
-            "activation refresh should not republish forward sessions"
-        );
-    }
-
-    #[test]
     fn apply_worker_commands_exports_owner_rg_forward_sessions_without_teardown() {
         let commands = Arc::new(Mutex::new(VecDeque::new()));
         let mut sessions = SessionTable::new();
@@ -2693,33 +2371,6 @@ mod tests {
         assert_eq!(deltas.len(), 1, "export should republish forward session");
         assert_eq!(deltas[0].kind, SessionDeltaKind::Open);
         assert!(deltas[0].fabric_redirect_sync);
-    }
-
-    #[test]
-    fn apply_worker_commands_records_apply_ha_state_sequence() {
-        let commands = Arc::new(Mutex::new(VecDeque::new()));
-        let mut sessions = SessionTable::new();
-        commands
-            .lock()
-            .expect("commands lock")
-            .push_back(WorkerCommand::ApplyHAState { sequence: 7 });
-        let forwarding = test_forwarding_state();
-        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
-        let ha_state = BTreeMap::new();
-
-        let results = apply_worker_commands(
-            &commands,
-            &mut sessions,
-            -1,
-            -1,
-            -1,
-            &forwarding,
-            &ha_state,
-            &dynamic_neighbors,
-        );
-
-        assert_eq!(results.applied_sequences, vec![7]);
-        assert!(results.exported_sequences.is_empty());
     }
 
     #[test]

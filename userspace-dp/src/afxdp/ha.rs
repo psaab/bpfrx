@@ -37,7 +37,6 @@ impl super::Coordinator {
             }
         }
         self.ha_state.store(Arc::new(state));
-        let mut ha_state_changed = false;
         if !demoted_rgs.is_empty() {
             demote_shared_owner_rgs(
                 &self.shared_sessions,
@@ -54,7 +53,6 @@ impl super::Coordinator {
                     self.rg_epochs[idx].fetch_add(1, Ordering::Release);
                 }
             }
-            ha_state_changed = true;
             // Record cache flush timestamp for observability (#312).
             self.last_cache_flush_at.store(now_secs, Ordering::Relaxed);
         }
@@ -73,35 +71,8 @@ impl super::Coordinator {
                     self.rg_epochs[idx].fetch_add(1, Ordering::Release);
                 }
             }
-            ha_state_changed = true;
-        }
-        if ha_state_changed {
-            self.enqueue_apply_ha_state();
         }
         Ok(())
-    }
-
-    fn enqueue_apply_ha_state(&self) {
-        if self.workers.is_empty() {
-            return;
-        }
-        let sequence = self
-            .ha_state_apply_seq
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1);
-        for (worker_id, handle) in &self.workers {
-            if let Ok(mut pending) = handle.commands.lock() {
-                pending.push_back(WorkerCommand::ApplyHAState { sequence });
-            } else {
-                eprintln!(
-                    "bpfrx-ha: worker-{} command mutex poisoned during HA state apply",
-                    worker_id
-                );
-            }
-        }
-        // Fire-and-forget: standby session redirect keys stay programmed and
-        // flow cache uses epoch-based invalidation. No need to wait for worker
-        // acks here.
     }
 
     pub fn export_owner_rg_sessions(
@@ -489,9 +460,7 @@ mod tests {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
 
-        assert!(!synced_entry_allows_local_replace(
-            &state, 1, now_secs
-        ));
+        assert!(!synced_entry_allows_local_replace(&state, 1, now_secs));
     }
 
     #[test]
@@ -499,9 +468,7 @@ mod tests {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
 
-        assert!(!synced_entry_allows_local_replace(
-            &state, 0, now_secs
-        ));
+        assert!(!synced_entry_allows_local_replace(&state, 0, now_secs));
     }
 
     #[test]
@@ -509,8 +476,6 @@ mod tests {
         let now_secs = monotonic_nanos() / 1_000_000_000;
         let state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
 
-        assert!(synced_entry_allows_local_replace(
-            &state, 1, now_secs
-        ));
+        assert!(synced_entry_allows_local_replace(&state, 1, now_secs));
     }
 }
