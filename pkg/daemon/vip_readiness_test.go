@@ -216,6 +216,38 @@ func TestCheckVIPReadiness_InterfaceUpViaFlags(t *testing.T) {
 	}
 }
 
+func TestCheckNoRethTakeoverReadiness_UsesVIPReadinessOnly(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {
+					Name:            "reth0",
+					RedundancyGroup: 0,
+					Units: map[int]*config.InterfaceUnit{
+						0: {Addresses: []string{"10.0.1.1/24"}},
+					},
+				},
+				"ge-0/0/0": {
+					Name:            "ge-0/0/0",
+					RedundantParent: "reth0",
+				},
+			},
+		},
+	}
+
+	links := map[string]*testLink{
+		"ge-0-0-0": newTestLink("ge-0-0-0", true),
+	}
+
+	ready, reasons := checkNoRethTakeoverReadinessForConfig(cfg, 0, mockLinkByName(links))
+	if !ready {
+		t.Fatalf("should be ready, got reasons: %v", reasons)
+	}
+	if len(reasons) != 0 {
+		t.Fatalf("unexpected reasons: %v", reasons)
+	}
+}
+
 func TestUserspaceRGConfigured(t *testing.T) {
 	cfg := &config.Config{
 		System: config.SystemConfig{

@@ -2944,24 +2944,14 @@ func (d *Daemon) reconcileRGState() {
 			ifReady, ifReasons := mon.RGInterfaceReady(rgID)
 			var vrrpReady bool
 			var vrrpReasons []string
-			if noRethVRRP {
-				// No RETH VRRP instances — check sync readiness instead.
-				// Blocks promotion until bulk session sync completes (or
-				// times out), equivalent to VRRP sync-hold in RETH mode.
-				vrrpReady = d.cluster.IsSyncReady()
-				if !vrrpReady {
-					vrrpReasons = append(vrrpReasons, "session sync not ready")
-				}
-				// Also verify VIP ownership can be established: RETH
-				// interfaces must exist and be UP before we allow promotion.
-				vipOK, vipReasons := d.checkVIPReadiness(rgID)
-				if !vipOK {
-					vrrpReady = false
-					vrrpReasons = append(vrrpReasons, vipReasons...)
-				}
-			} else if d.vrrpMgr != nil {
-				hasRETH := rgHasRETH(d.store.ActiveConfig(), rgID)
-				vrrpReady, vrrpReasons = d.vrrpMgr.RGVRRPReady(rgID, hasRETH)
+				if noRethVRRP {
+					// In direct/no-RETH mode there is no VRRP preemption gate.
+					// Promotion readiness is just whether VIP ownership can be
+					// established on the local node.
+					vrrpReady, vrrpReasons = d.checkNoRethTakeoverReadiness(rgID)
+				} else if d.vrrpMgr != nil {
+					hasRETH := rgHasRETH(d.store.ActiveConfig(), rgID)
+					vrrpReady, vrrpReasons = d.vrrpMgr.RGVRRPReady(rgID, hasRETH)
 			} else {
 				vrrpReady = true // no VRRP = always ready
 			}
@@ -3630,6 +3620,18 @@ func (d *Daemon) checkVIPReadiness(rgID int) (bool, []string) {
 	return checkVIPReadinessForConfig(cfg, rgID, linkByName)
 }
 
+func (d *Daemon) checkNoRethTakeoverReadiness(rgID int) (bool, []string) {
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return true, nil
+	}
+	linkByName := d.linkByNameFn
+	if linkByName == nil {
+		linkByName = netlink.LinkByName
+	}
+	return checkNoRethTakeoverReadinessForConfig(cfg, rgID, linkByName)
+}
+
 // checkVIPReadinessForConfig verifies that RETH interfaces for the given RG
 // exist and are operationally UP. Pure function for testability.
 func checkVIPReadinessForConfig(cfg *config.Config, rgID int, linkByName func(string) (netlink.Link, error)) (bool, []string) {
@@ -3651,6 +3653,10 @@ func checkVIPReadinessForConfig(cfg *config.Config, rgID int, linkByName func(st
 		}
 	}
 	return len(reasons) == 0, reasons
+}
+
+func checkNoRethTakeoverReadinessForConfig(cfg *config.Config, rgID int, linkByName func(string) (netlink.Link, error)) (bool, []string) {
+	return checkVIPReadinessForConfig(cfg, rgID, linkByName)
 }
 
 func userspaceRGConfigured(cfg *config.Config, rgID int) bool {
