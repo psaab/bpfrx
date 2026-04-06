@@ -545,7 +545,7 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.syncSessionV4Locked("upsert", key, &val); err != nil {
+	if err := m.syncSessionV4Locked("upsert", key, &installVal); err != nil {
 		slog.Debug("userspace: session mirror failed", "err", err)
 	}
 	return nil
@@ -596,7 +596,7 @@ func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val data
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.syncSessionV6Locked("upsert", key, &val); err != nil {
+	if err := m.syncSessionV6Locked("upsert", key, &installVal); err != nil {
 		slog.Debug("userspace: session mirror failed", "err", err)
 	}
 	return nil
