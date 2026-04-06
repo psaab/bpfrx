@@ -1252,15 +1252,6 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	// kills TCP streams during failover.
 	d.preflightDemoteRG(rgID)
 
-	// Notify the peer to pre-install neighbor entries before VRRP
-	// transitions (#485). The activating node needs ARP/NDP entries
-	// ready so bpf_fib_lookup succeeds for the first packet after it
-	// becomes MASTER. Best-effort: if the send fails, the peer's
-	// watchClusterEvents handler still installs neighbors (slightly later).
-	if d.sessionSync != nil {
-		d.sessionSync.SendPrepareActivation(rgID)
-	}
-
 	success = true
 	slog.Info("userspace: peer barrier ready for rg demotion", "rg", rgID)
 	return nil
@@ -2805,8 +2796,9 @@ func rgIDFromVRID(vrid int) int {
 }
 
 // watchVRRPEvents monitors VRRP state changes and logs transitions.
-// On MASTER transition, triggers ARP/ND warmup for synced session
-// next-hops so that bpf_fib_lookup finds neighbor entries immediately.
+// On MASTER transition, updates rg_active, removes blackhole routes, and
+// refreshes fabric forwarding. Neighbor readiness is maintained in the
+// background by runPeriodicNeighborResolution / maintainClusterNeighborReadiness.
 // Also starts/stops RA senders and Kea DHCP server per-RG — in
 // active/active mode, a BACKUP event for RG1 must not clear services
 // started for RG0.
