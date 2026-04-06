@@ -2585,11 +2585,13 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 						s.ApplyIfCurrent(tr)
 					}
 				}
-				// Then remove blackhole routes — steady-state neighbor
-				// maintenance keeps next-hop resolution warm in the
-				// background, so activation no longer depends on a
-				// one-shot neighbor warmup here.
-				d.removeBlackholeRoutes(ev.GroupID)
+				// Only remove blackholes once this node's desired state is
+				// actually active. In strict VIP ownership mode, a cluster
+				// primary event alone does not activate the RG until VRRP
+				// ownership has moved as well.
+				if shouldRemoveBlackholesOnClusterPrimary(s) {
+					d.removeBlackholeRoutes(ev.GroupID)
+				}
 
 				// VRRP priority + ForceRGMaster AFTER rg_active and
 				// blackhole removal (#485).
@@ -2839,6 +2841,11 @@ func (d *Daemon) triggerReconcile() {
 	case d.reconcileNowCh <- struct{}{}:
 	default:
 	}
+}
+
+func shouldRemoveBlackholesOnClusterPrimary(s *rgStateMachine) bool {
+	active, _ := s.CurrentDesired()
+	return active
 }
 
 func (d *Daemon) reconcileRGState() {
