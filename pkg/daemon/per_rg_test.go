@@ -5,6 +5,7 @@ import (
 
 	"github.com/psaab/bpfrx/pkg/cluster"
 	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/dataplane"
 	"github.com/psaab/bpfrx/pkg/vrrp"
 )
 
@@ -106,43 +107,49 @@ func TestRethMasterState_MultiRG(t *testing.T) {
 	}
 }
 
-func TestSyncRGStrictVIPOwnershipMode_DefaultsToStrictInVRRPMode(t *testing.T) {
-	d := newTestDaemon()
+func TestStrictVIPOwnershipByDefault_DefaultsToStrictInVRRPMode(t *testing.T) {
 	cc := &config.ClusterConfig{
 		RedundancyGroups: []*config.RedundancyGroup{{ID: 1}},
 	}
+	cfg := &config.Config{}
 
-	d.syncRGStrictVIPOwnershipMode(cc)
-
-	if !d.getOrCreateRGState(1).IsStrictVIPOwnership() {
+	if !strictVIPOwnershipByDefault(cc, cfg) {
 		t.Fatal("expected strict VIP ownership to default on in VRRP mode")
 	}
 }
 
-func TestSyncRGStrictVIPOwnershipMode_DisabledInNoRethVRRPMode(t *testing.T) {
-	d := newTestDaemon()
+func TestStrictVIPOwnershipByDefault_DisabledInUserspaceVRRPMode(t *testing.T) {
+	cc := &config.ClusterConfig{
+		RedundancyGroups: []*config.RedundancyGroup{{ID: 1}},
+	}
+	cfg := &config.Config{}
+	cfg.System.DataplaneType = dataplane.TypeUserspace
+
+	if strictVIPOwnershipByDefault(cc, cfg) {
+		t.Fatal("expected strict VIP ownership to stay off in userspace VRRP mode")
+	}
+}
+
+func TestStrictVIPOwnershipByDefault_DisabledInNoRethVRRPMode(t *testing.T) {
 	cc := &config.ClusterConfig{
 		NoRethVRRP:       true,
 		RedundancyGroups: []*config.RedundancyGroup{{ID: 1}},
 	}
+	cfg := &config.Config{}
 
-	d.syncRGStrictVIPOwnershipMode(cc)
-
-	if d.getOrCreateRGState(1).IsStrictVIPOwnership() {
+	if strictVIPOwnershipByDefault(cc, cfg) {
 		t.Fatal("expected strict VIP ownership to stay off in no-reth-vrrp mode")
 	}
 }
 
-func TestSyncRGStrictVIPOwnershipMode_DisabledInPrivateRGElectionMode(t *testing.T) {
-	d := newTestDaemon()
+func TestStrictVIPOwnershipByDefault_DisabledInPrivateRGElectionMode(t *testing.T) {
 	cc := &config.ClusterConfig{
 		PrivateRGElection: true,
 		RedundancyGroups:  []*config.RedundancyGroup{{ID: 1}},
 	}
+	cfg := &config.Config{}
 
-	d.syncRGStrictVIPOwnershipMode(cc)
-
-	if d.getOrCreateRGState(1).IsStrictVIPOwnership() {
+	if strictVIPOwnershipByDefault(cc, cfg) {
 		t.Fatal("expected strict VIP ownership to stay off in private-rg-election mode")
 	}
 }

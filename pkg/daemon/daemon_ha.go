@@ -2496,11 +2496,29 @@ func (d *Daemon) syncRGStrictVIPOwnershipMode(cc *config.ClusterConfig) {
 	if cc == nil {
 		return
 	}
-	strictByDefault := !(cc.NoRethVRRP || cc.PrivateRGElection)
+	var cfg *config.Config
+	if d.store != nil {
+		cfg = d.store.ActiveConfig()
+	}
+	strictByDefault := strictVIPOwnershipByDefault(cc, cfg)
 	for _, rg := range cc.RedundancyGroups {
 		s := d.getOrCreateRGState(rg.ID)
 		s.SetStrictVIPOwnership(strictByDefault)
 	}
+}
+
+func strictVIPOwnershipByDefault(cc *config.ClusterConfig, cfg *config.Config) bool {
+	if cc == nil {
+		return false
+	}
+	if cc.NoRethVRRP || cc.PrivateRGElection {
+		return false
+	}
+	// In the userspace dataplane, hot standby depends on the future owner
+	// already being forwarding-ready before VIP/MAC ownership moves. Waiting
+	// for the VRRP MASTER event to derive rg_active leaves a cutover window
+	// where reply packets can hit the promoted node before userspace is active.
+	return cfg == nil || cfg.System.DataplaneType != dataplane.TypeUserspace
 }
 
 // isRethMasterState returns true when ALL VRRP instances for rgID are MASTER.
