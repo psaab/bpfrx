@@ -1115,26 +1115,6 @@ func (d *Daemon) prepareUserspaceManualFailover(rgID int) error {
 	)
 }
 
-// preflightDemoteRG sends a preflight_demote_rg command to the Rust helper,
-// marking the RG as inactive and bumping its flow cache epoch. This shifts
-// traffic to the fabric path before VRRP demotes, eliminating the forwarding
-// gap during failover.
-func (d *Daemon) preflightDemoteRG(rgID int) {
-	type preflightDemoter interface {
-		PreflightDemoteRG(rgID int) error
-	}
-	if pd, ok := d.dp.(preflightDemoter); ok {
-		if err := pd.PreflightDemoteRG(rgID); err != nil {
-			slog.Warn("userspace: preflight demote failed", "rg", rgID, "err", err)
-		} else {
-			slog.Info("userspace: preflight demote sent — traffic shifting to fabric", "rg", rgID)
-			// Brief pause to let workers re-resolve flow cache entries
-			// on the new (inactive) HA state before VRRP demotes.
-			time.Sleep(50 * time.Millisecond)
-		}
-	}
-}
-
 func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout time.Duration) error {
 	if !d.acquireUserspaceRGDemotionPrep(rgID, barrierTimeout) {
 		slog.Info("userspace: skipping duplicate rg demotion prepare", "rg", rgID)
@@ -1158,10 +1138,10 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	// sessions. Planned failover should not depend on bulk sync state —
 	// both nodes have full session state from continuous real-time sync.
 
-	// Stop the bulk sync retry loop — it floods the sync TCP connection
-	// with session data, delaying the barrier write/ack by 30+ seconds.
-	// Advancing the retry generation causes the goroutine to exit.
-	retryGen := d.syncPrimeRetryGen.Add(1)
+		// Stop the bulk sync retry loop — it floods the sync TCP connection
+		// with session data, delaying the barrier write/ack by 30+ seconds.
+		// Advancing the retry generation causes the goroutine to exit.
+		retryGen := d.syncPrimeRetryGen.Add(1)
 
 	// If the barrier fails, restart the retry loop so the peer can still
 	// receive its cold-start bootstrap. Only suppress the restart when
@@ -1185,34 +1165,14 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 		d.startSessionSyncPrimeRetry(retryGen)
 	}()
 
-	// Drain any in-flight barrier from a previous demotion attempt.
-	pendingBarrierTimeout := barrierTimeout / 2
-	if pendingBarrierTimeout > 10*time.Second {
-		pendingBarrierTimeout = 10 * time.Second
-	}
-	if pendingBarrierTimeout < 2*time.Second {
-		pendingBarrierTimeout = 2 * time.Second
-	}
-	if err := d.sessionSync.WaitForPeerBarriersDrained(pendingBarrierTimeout); err != nil {
-		return fmt.Errorf("previous demotion barrier still pending: %w", err)
-	}
+		// Single barrier — peer ack means it has processed all queued deltas.
+		// The actual demotion happens atomically in UpdateRGActive(false).
+		if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {
+			return fmt.Errorf("demotion peer barrier failed: %w", err)
+		}
 
-	// Single barrier — peer ack means it has processed all queued deltas.
-	// The actual demotion happens atomically in UpdateRGActive(false).
-	if err := d.sessionSync.WaitForPeerBarrier(barrierTimeout); err != nil {
-		return fmt.Errorf("demotion peer barrier failed: %w", err)
-	}
-
-	// Proactive flow cache flush: tell the Rust helper to mark the RG as
-	// inactive and bump its epoch BEFORE VRRP demotes. This causes flow
-	// cache entries to re-resolve from ForwardCandidate (direct forward)
-	// to FabricRedirect (fabric path), shifting traffic to the fabric
-	// link before the VIP moves. Eliminates the forwarding gap that
-	// kills TCP streams during failover.
-	d.preflightDemoteRG(rgID)
-
-	success = true
-	slog.Info("userspace: peer barrier ready for rg demotion", "rg", rgID)
+		success = true
+		slog.Info("userspace: peer barrier ready for rg demotion", "rg", rgID)
 	return nil
 }
 

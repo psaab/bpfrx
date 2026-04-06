@@ -99,35 +99,6 @@ impl super::Coordinator {
         Ok(())
     }
 
-    /// Pre-demotion flow cache flush: mark the RG as inactive and bump its
-    /// epoch so flow cache entries re-resolve to FabricRedirect. This shifts
-    /// traffic to the fabric path BEFORE the VRRP VIP moves, eliminating the
-    /// forwarding gap that kills TCP streams during failover.
-    ///
-    /// Unlike full demotion (update_ha_state), this does NOT:
-    /// - Clean up USERSPACE_SESSIONS BPF map entries
-    /// - Demote shared session owner-RG indexes
-    /// - Send worker demotion commands
-    /// It only flips the HA lease to Inactive and bumps the epoch.
-    pub fn preflight_demote_rg(&self, rg_id: i32) {
-        let previous = self.ha_state.load();
-        let mut state = (**previous).clone();
-        if let Some(runtime) = state.get_mut(&rg_id) {
-            runtime.active = false;
-            runtime.lease = HAForwardingLease::Inactive;
-        }
-        eprintln!(
-            "bpfrx-ha: preflight demote RG{}: marking inactive + epoch bump (flow cache flush)",
-            rg_id
-        );
-        // Bump RG epoch — invalidates all flow cache entries for this RG.
-        let idx = rg_id as usize;
-        if idx > 0 && idx < MAX_RG_EPOCHS {
-            self.rg_epochs[idx].fetch_add(1, Ordering::Release);
-        }
-        self.ha_state.store(Arc::new(state));
-    }
-
     fn enqueue_apply_ha_state(&self, refresh_owner_rgs: &[i32], demote_owner_rgs: &[i32]) {
         if self.workers.is_empty() {
             return;
@@ -310,8 +281,6 @@ impl super::Coordinator {
     }
 
     pub fn delete_synced_session(&self, key: SessionKey) {
-        let now_secs = monotonic_nanos() / 1_000_000_000;
-        let ha_state = self.ha_state.load();
         let removed_entry = self
             .shared_sessions
             .lock()

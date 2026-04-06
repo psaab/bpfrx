@@ -442,20 +442,6 @@ fn handle_stream(
                     response.error = "missing forwarding state".to_string();
                 }
             }
-            "preflight_demote_rg" => {
-                // Pre-demotion flow cache flush: mark RG inactive + bump epoch
-                // so sessions re-resolve to FabricRedirect BEFORE VRRP demotes.
-                // This eliminates the forwarding gap during failover.
-                if let Some(ha_req) = request.ha_state.as_ref() {
-                    if let Some(group) = ha_req.groups.first() {
-                        guard.afxdp.preflight_demote_rg(group.rg_id);
-                        refresh_status(&mut guard);
-                    }
-                } else {
-                    response.ok = false;
-                    response.error = "missing ha_state".to_string();
-                }
-            }
             "update_ha_state" => {
                 if let Some(ha_req) = request.ha_state {
                     #[cfg(feature = "debug-log")]
