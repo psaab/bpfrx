@@ -260,14 +260,15 @@ impl super::Coordinator {
             &self.shared_owner_rg_indexes,
             &entry,
         );
-        // Always publish synced sessions to the BPF map immediately so the
-        // XDP shim can redirect matching packets to XSK. The worker path
-        // handles flow cache population and FIB resolution asynchronously,
-        // but the shim needs the entry NOW for failover continuity (#488).
-        // The worker's own upsert guard prevents clobbering live local
-        // sessions in the flow cache — the BPF map is safe to write because
-        // it only controls XSK redirect, not forwarding decisions.
-        if let Some(session_map_fd) = self.session_map_fd.as_ref() {
+        // Keep the immediate BPF publish aligned with the worker-side
+        // ownership guard so XSK redirect state cannot get ahead of what
+        // the local SessionTable would actually accept.
+        if can_immediately_program_synced_bpf_entry(
+            ha_state.as_ref(),
+            entry.metadata.owner_rg_id,
+            now_secs,
+        ) && let Some(session_map_fd) = self.session_map_fd.as_ref()
+        {
             let _ = publish_live_session_entry(
                 session_map_fd.fd,
                 &entry.key,
@@ -290,7 +291,12 @@ impl super::Coordinator {
                 &self.shared_owner_rg_indexes,
                 reverse,
             );
-            if let Some(session_map_fd) = self.session_map_fd.as_ref() {
+            if can_immediately_program_synced_bpf_entry(
+                ha_state.as_ref(),
+                reverse.metadata.owner_rg_id,
+                now_secs,
+            ) && let Some(session_map_fd) = self.session_map_fd.as_ref()
+            {
                 let _ = publish_live_session_entry(
                     session_map_fd.fd,
                     &reverse.key,
@@ -310,8 +316,6 @@ impl super::Coordinator {
     }
 
     pub fn delete_synced_session(&self, key: SessionKey) {
-        let now_secs = monotonic_nanos() / 1_000_000_000;
-        let ha_state = self.ha_state.load();
         let removed_entry = self
             .shared_sessions
             .lock()
