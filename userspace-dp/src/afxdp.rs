@@ -250,7 +250,6 @@ pub struct Coordinator {
     live: BTreeMap<u32, Arc<BindingLiveState>>,
     identities: BTreeMap<u32, BindingIdentity>,
     workers: BTreeMap<u32, WorkerHandle>,
-    ha_state_apply_seq: AtomicU64,
     session_export_seq: AtomicU64,
     forwarding: ForwardingState,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
@@ -299,7 +298,6 @@ impl Coordinator {
             live: BTreeMap::new(),
             identities: BTreeMap::new(),
             workers: BTreeMap::new(),
-            ha_state_apply_seq: AtomicU64::new(0),
             session_export_seq: AtomicU64::new(0),
             forwarding: ForwardingState::default(),
             recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
@@ -5260,7 +5258,6 @@ fn worker_loop(
         } else {
             WorkerCommandResults {
                 cancelled_keys: Vec::new(),
-                applied_sequences: Vec::new(),
                 exported_sequences: Vec::new(),
             }
         };
@@ -5420,9 +5417,7 @@ fn worker_loop(
         if !bindings.is_empty() {
             poll_start = (poll_start + 1) % bindings.len();
         }
-        if !command_results.applied_sequences.is_empty()
-            || !command_results.exported_sequences.is_empty()
-        {
+        if !command_results.exported_sequences.is_empty() {
             while sessions.has_pending_deltas() {
                 let deltas = sessions.drain_deltas(256);
                 purge_queued_flows_for_closed_deltas(&mut bindings, &deltas);
