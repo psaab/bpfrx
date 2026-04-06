@@ -1211,15 +1211,6 @@ func (d *Daemon) prepareUserspaceRGDemotionWithTimeout(rgID int, barrierTimeout 
 	// kills TCP streams during failover.
 	d.preflightDemoteRG(rgID)
 
-	// Notify the peer to pre-install neighbor entries before VRRP
-	// transitions (#485). The activating node needs ARP/NDP entries
-	// ready so bpf_fib_lookup succeeds for the first packet after it
-	// becomes MASTER. Best-effort: if the send fails, the peer's
-	// watchClusterEvents handler still installs neighbors (slightly later).
-	if d.sessionSync != nil {
-		d.sessionSync.SendPrepareActivation(rgID)
-	}
-
 	success = true
 	slog.Info("userspace: peer barrier ready for rg demotion", "rg", rgID)
 	return nil
@@ -1575,18 +1566,6 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// Wire peer fencing: on heartbeat timeout, cluster sends
 			// fence via sync; on receive, disable all local RGs.
 			d.cluster.SetPeerFenceFunc(d.sessionSync.SendFence)
-			// Wire prepare_activation: when the demoting peer sends
-			// this hint, pre-install neighbors immediately so the
-			// first packet after VRRP MASTER has a resolved next-hop.
-			d.sessionSync.OnPrepareActivation = func(rgID int) {
-				slog.Info("cluster: prepare_activation from demoting peer — pre-installing neighbors", "rg", rgID)
-				d.preinstallSnapshotNeighbors()
-				if activeCfg := d.store.ActiveConfig(); activeCfg != nil {
-					d.resolveNeighborsImmediate(activeCfg)
-				}
-				go d.warmNeighborCache()
-			}
-
 			d.sessionSync.OnFenceReceived = func() {
 				slog.Warn("cluster: fence received from peer, disabling all RGs")
 				if cfg.Chassis.Cluster != nil {
@@ -2616,7 +2595,8 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 			//
 			// Transition ordering safety:
 			// - Activation: set rg_active FIRST, then remove blackholes,
-			//   pre-install neighbors, THEN trigger VRRP MASTER (#485)
+			//   then trigger VRRP MASTER (#485). Neighbor readiness is
+			//   maintained continuously in the background.
 			// - Deactivation: run preflight FIRST, then resign VRRP,
 			//   add blackholes, then clear rg_active (#485)
 			isPrimary := ev.NewState == cluster.StatePrimary
@@ -2637,19 +2617,14 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 						s.ApplyIfCurrent(tr)
 					}
 				}
-				// Then remove blackhole routes — FIB lookups must
-				// succeed for synced sessions.
+				// Then remove blackhole routes — steady-state neighbor
+				// maintenance keeps next-hop resolution warm in the
+				// background, so activation no longer depends on a
+				// one-shot neighbor warmup here.
 				d.removeBlackholeRoutes(ev.GroupID)
-				d.preinstallSnapshotNeighbors()
-				if cfg := d.store.ActiveConfig(); cfg != nil {
-					d.resolveNeighborsImmediate(cfg)
-				}
-				go d.warmNeighborCache()
 
 				// VRRP priority + ForceRGMaster AFTER rg_active and
-				// neighbor pre-install (#485). This ensures BPF can
-				// forward the first packet that arrives after VRRP
-				// installs VIPs and sends GARPs.
+				// blackhole removal (#485).
 				if !noRethVRRP {
 					d.vrrpMgr.UpdateRGPriority(ev.GroupID, 200)
 					// With preempt=false, VRRP won't self-elect even at
@@ -2780,8 +2755,9 @@ func rgIDFromVRID(vrid int) int {
 }
 
 // watchVRRPEvents monitors VRRP state changes and logs transitions.
-// On MASTER transition, triggers ARP/ND warmup for synced session
-// next-hops so that bpf_fib_lookup finds neighbor entries immediately.
+// On MASTER transition, updates rg_active, removes blackhole routes, and
+// refreshes fabric forwarding. Neighbor readiness is maintained in the
+// background by runPeriodicNeighborResolution / maintainClusterNeighborReadiness.
 // Also starts/stops RA senders and Kea DHCP server per-RG — in
 // active/active mode, a BACKUP event for RG1 must not clear services
 // started for RG0.
@@ -2825,16 +2801,6 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					} else {
 						s.ApplyIfCurrent(tr)
 					}
-					// Pre-install kernel neighbor entries from the snapshot
-					// so the first forwarded packet has a resolved next-hop.
-					// This is instant (netlink syscall, no ARP round-trip)
-					// and eliminates the ~33 neighbor misses that kill TCP
-					// streams during failback (#475).
-					d.preinstallSnapshotNeighbors()
-					if cfg := d.store.ActiveConfig(); cfg != nil {
-						d.resolveNeighborsImmediate(cfg)
-					}
-					go d.warmNeighborCache()
 					go d.RefreshFabricFwd()
 				}
 				// Only remove blackholes and apply services when ALL

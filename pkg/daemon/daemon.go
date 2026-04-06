@@ -2530,15 +2530,14 @@ func stripCIDR(s string) string {
 	return ip.String()
 }
 
-// preinstallSnapshotNeighbors reads neighbor data from the userspace dataplane's
-// last published snapshot and pre-installs them into the kernel ARP/NDP table
-// using netlink.NeighSet. Unlike resolveNeighborsImmediate (which sends ARP
-// probes), this is instant (syscall, no round-trip) and works even when the
-// local ARP entry has expired during the time another node owned the RG.
-//
-// The snapshot neighbors come from the active node's kernel ARP table (populated
-// by buildNeighborSnapshots during Compile). When synced to the standby, they
-// contain the resolved MACs for all next-hops.
+// preinstallSnapshotNeighbors refreshes the kernel ARP/NDP table from two
+// sources: (1) iterates each configured interface's kernel NeighList and
+// re-installs valid entries as NUD_REACHABLE via netlink.NeighSet, and
+// (2) installs snapshot-learned neighbors from the dataplane provider
+// (populated by buildNeighborSnapshots during Compile and synced from the
+// active node). The periodic neighbor-maintenance loop calls this to keep
+// the standby's neighbor table hot so failover does not depend on
+// activation-time priming.
 func (d *Daemon) preinstallSnapshotNeighbors() {
 	type neighborInstaller interface {
 		LastPublishedNeighbors() []struct {
@@ -2626,22 +2625,8 @@ func (d *Daemon) preinstallSnapshotNeighbors() {
 		}
 	}
 	if installed > 0 {
-		slog.Info("preinstalled kernel neighbor entries on activation",
-			"count", installed)
+		slog.Info("preinstalled kernel neighbor entries from snapshot", "count", installed)
 	}
-}
-
-// resolveNeighborsImmediate sends ARP/NDP probes for config-based next-hops
-// without the follow-up sleep. Used during failover activation where the
-// probes must go out immediately but we cannot block the event handler for
-// 500ms waiting for replies. Probes resolve in the background; the periodic
-// resolution loop picks up any stragglers within 15 seconds.
-//
-// Runtime without the sleep: collects targets via netlink RouteGet +
-// NeighList (~1-2ms each) then fires ICMP/NS probes as goroutines.
-// For a typical config with 2-5 next-hops the blocking phase is <10ms.
-func (d *Daemon) resolveNeighborsImmediate(cfg *config.Config) {
-	d.resolveNeighborsInner(cfg, false)
 }
 
 // resolveNeighbors proactively triggers ARP/NDP resolution for all known
@@ -2942,11 +2927,14 @@ func (d *Daemon) cleanFailedNeighbors() int {
 	return cleaned
 }
 
-// runPeriodicNeighborResolution manages two periodic tasks:
+// runPeriodicNeighborResolution manages periodic neighbor upkeep:
 //   - Every 5 seconds: clean NUD_FAILED neighbor entries so the kernel
 //     retries ARP/NDP on the next forwarded packet (fast recovery).
 //   - Every 15 seconds: proactively resolve known forwarding targets
 //     (gateways, DNAT pools, etc.) to keep ARP/NDP entries warm.
+//   - In cluster mode: continuously refresh snapshot-learned neighbors and
+//     session-derived neighbor cache entries so standby forwarding stays ready
+//     without activation-time warmup.
 //
 // Runs once immediately at start to avoid a blind spot.
 // Fetches fresh active config on each tick so config changes take effect.
@@ -2954,6 +2942,7 @@ func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 	// Immediate first run — don't wait for first tick.
 	if cfg := d.store.ActiveConfig(); cfg != nil {
 		d.resolveNeighbors(cfg)
+		d.maintainClusterNeighborReadiness()
 	}
 	d.cleanFailedNeighbors()
 
@@ -2974,9 +2963,24 @@ func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
 		case <-resolveTicker.C:
 			if cfg := d.store.ActiveConfig(); cfg != nil {
 				d.resolveNeighbors(cfg)
+				d.maintainClusterNeighborReadiness()
 			}
 		}
 	}
+}
+
+// maintainClusterNeighborReadiness runs every 15 seconds (via the resolve
+// ticker in runPeriodicNeighborResolution) when HA is active. It refreshes
+// kernel neighbor entries and spawns warmNeighborCache which iterates the
+// full session table and sends one UDP probe per unique src/dst IP. The
+// session walk can be large; an atomic guard prevents overlapping runs if
+// a single pass exceeds one tick interval.
+func (d *Daemon) maintainClusterNeighborReadiness() {
+	if d.cluster == nil {
+		return
+	}
+	d.preinstallSnapshotNeighbors()
+	go d.warmNeighborCache()
 }
 
 // collectDHCPRoutes builds FRR DHCPRoute entries from active DHCP leases.
