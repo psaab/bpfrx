@@ -361,7 +361,7 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 
 	// Sync HA state DIRECTLY to helper without re-reading from BPF maps.
 	// The periodic status poll also reads rg_active and syncs to the helper,
-	// racing with us. If the poll syncs first, our syncHAStateLocked
+	// racing with us. If the poll syncs first, our direct update_ha_state
 	// sends the same state → no delta detected → no new RG-epoch bump or
 	// helper-side HA transition handling.
 	// By sending directly with the groups we already have, we guarantee
