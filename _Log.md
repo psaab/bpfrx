@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-04-06
+
+- **Timestamp**: 2026-04-06T23:15:00Z
+  - **Action**: Issue #527 — Fix two HA cluster bugs. Bug A: In no-reth-vrrp direct mode, use `applyDirectVIPOwnership(want=false)` on demotion edge instead of `reconcileDirectVIPOwnership()` to guarantee synchronous VIP removal without re-querying cluster state. Bug B: In election, when peer heartbeat confirms peer is primary for an RG in local secondary-hold with ManualFailover, clear the manual hold and settle to ordinary secondary instead of staying parked in secondary-hold indefinitely.
+  - **File(s)**: pkg/daemon/daemon_ha.go, pkg/cluster/election.go, pkg/daemon/direct_vip_ownership_test.go, pkg/cluster/election_test.go, pkg/cluster/cluster_test.go
+
 ## 2026-04-05
 
 - **Timestamp**: 2026-04-05T22:00:00Z

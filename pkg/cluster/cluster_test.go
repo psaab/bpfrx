@@ -716,6 +716,12 @@ func TestRequestPeerFailoverRequiresLocalTransferReadiness(t *testing.T) {
 	}
 }
 
+// TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover
+// verifies that when RequestPeerFailover fails due to transfer readiness,
+// state remains clean (secondary, no manual-failover flag). After #527,
+// the prior ManualFailover hold is cleared when the peer's heartbeat
+// confirms it took primary, so the node is already in ordinary secondary
+// before the RequestPeerFailover attempt.
 func TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
@@ -724,7 +730,7 @@ func TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover(t *t
 	if err := m.ManualFailover(0); err != nil {
 		t.Fatalf("ManualFailover() error = %v", err)
 	}
-	<-m.Events()
+	drainEvents(m, 2)
 
 	m.handlePeerHeartbeat(&HeartbeatPacket{
 		NodeID:    1,
@@ -733,13 +739,23 @@ func TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover(t *t
 			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
 		},
 	})
+	drainEvents(m, 2)
+
+	// After heartbeat: ManualFailover should be cleared (#527).
+	state := m.GroupState(0)
+	if state.ManualFailover {
+		t.Fatal("ManualFailover should be cleared after peer confirmed primary (#527)")
+	}
+	if state.State != StateSecondary {
+		t.Fatalf("state = %s, want secondary after peer confirmed primary", state.State)
+	}
+
 	m.mu.Lock()
 	m.groups[0].Ready = true
 	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
 	m.groups[0].ReadinessReasons = nil
 	m.mu.Unlock()
 
-	state := m.GroupState(0)
 	m.SetTransferReadinessFunc(func(rgID int) (bool, []string) {
 		return false, []string{"session sync disconnected"}
 	})
@@ -757,14 +773,18 @@ func TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover(t *t
 		t.Fatal("expected local transfer readiness error")
 	}
 	state = m.GroupState(0)
-	if !state.ManualFailover {
-		t.Fatal("manual failover should remain set after transfer readiness rejection")
+	if state.ManualFailover {
+		t.Fatal("ManualFailover should remain false after transfer readiness rejection")
 	}
-	if state.State != StateSecondaryHold {
-		t.Fatalf("state = %s, want secondary-hold", state.State)
+	if state.State != StateSecondary {
+		t.Fatalf("state = %s, want secondary", state.State)
 	}
 }
 
+// TestRequestPeerFailoverPeerSendFailurePreservesManualFailover verifies
+// that when RequestPeerFailover fails because the peer send fails, state
+// remains clean. After #527, the prior ManualFailover hold is already
+// cleared by the time peer confirms primary.
 func TestRequestPeerFailoverPeerSendFailurePreservesManualFailover(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
@@ -773,7 +793,7 @@ func TestRequestPeerFailoverPeerSendFailurePreservesManualFailover(t *testing.T)
 	if err := m.ManualFailover(0); err != nil {
 		t.Fatalf("ManualFailover() error = %v", err)
 	}
-	<-m.Events()
+	drainEvents(m, 2)
 
 	m.handlePeerHeartbeat(&HeartbeatPacket{
 		NodeID:    1,
@@ -782,13 +802,20 @@ func TestRequestPeerFailoverPeerSendFailurePreservesManualFailover(t *testing.T)
 			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
 		},
 	})
+	drainEvents(m, 2)
+
+	// After heartbeat: ManualFailover should be cleared (#527).
+	state := m.GroupState(0)
+	if state.ManualFailover {
+		t.Fatal("ManualFailover should be cleared after peer confirmed primary (#527)")
+	}
+
 	m.mu.Lock()
 	m.groups[0].Ready = true
 	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
 	m.groups[0].ReadinessReasons = nil
 	m.mu.Unlock()
 
-	state := m.GroupState(0)
 	m.SetTransferReadinessFunc(func(rgID int) (bool, []string) {
 		return true, nil
 	})
@@ -805,11 +832,11 @@ func TestRequestPeerFailoverPeerSendFailurePreservesManualFailover(t *testing.T)
 		t.Fatal("expected peer failover send error")
 	}
 	state = m.GroupState(0)
-	if !state.ManualFailover {
-		t.Fatal("manual failover should remain set after peer request send failure")
+	if state.ManualFailover {
+		t.Fatal("ManualFailover should remain false after peer request send failure")
 	}
-	if state.State != StateSecondaryHold {
-		t.Fatalf("state = %s, want secondary-hold", state.State)
+	if state.State != StateSecondary {
+		t.Fatalf("state = %s, want secondary", state.State)
 	}
 }
 

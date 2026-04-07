@@ -44,6 +44,34 @@ func TestDirectVIPOwnershipDesired(t *testing.T) {
 	}
 }
 
+// TestApplyDirectVIPOwnershipForcesRemovalOnDemotion verifies that a demotion
+// edge uses applyDirectVIPOwnership(want=false) directly, bypassing
+// shouldOwnDirectVIPs and guaranteeing synchronous removal (#527 Bug A).
+func TestApplyDirectVIPOwnershipForcesRemovalOnDemotion(t *testing.T) {
+	var removeCalls int
+	d := &Daemon{
+		directVIPOwned: map[int]bool{0: true}, // previously owned
+		directRemoveVIPsFn: func(rgID int) int {
+			if rgID != 0 {
+				t.Fatalf("unexpected rgID %d", rgID)
+			}
+			removeCalls++
+			return 1
+		},
+		directRemoveStableLLFn: func(rgID int) {},
+	}
+
+	// Simulate demotion: force want=false regardless of cluster state.
+	d.applyDirectVIPOwnership(0, false, "cluster-demotion")
+
+	if removeCalls != 1 {
+		t.Fatalf("expected 1 VIP removal call on demotion, got %d", removeCalls)
+	}
+	if d.directVIPOwnershipApplied(0) {
+		t.Fatal("VIP ownership should be false after demotion")
+	}
+}
+
 func TestApplyDirectVIPOwnershipRemovesStaleVIPsWithoutEdge(t *testing.T) {
 	var removeCalls int
 	d := &Daemon{

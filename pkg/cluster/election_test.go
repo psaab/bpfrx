@@ -224,7 +224,7 @@ func TestElection_ManualFailover_Preserved(t *testing.T) {
 	m.ManualFailover(0)
 	drainEvents(m, 1)
 
-	// Peer heartbeat arrives.
+	// Peer heartbeat arrives showing peer is primary.
 	pkt := &HeartbeatPacket{
 		NodeID:    1,
 		ClusterID: 1,
@@ -237,6 +237,56 @@ func TestElection_ManualFailover_Preserved(t *testing.T) {
 	// Manual failover should keep us secondary even with higher priority.
 	if m.IsLocalPrimary(0) {
 		t.Error("manual failover should keep us secondary")
+	}
+}
+
+// TestElection_ManualFailover_ClearedOnPeerPrimary verifies that once the peer
+// confirms primary after a manual failover, the local node clears
+// secondary-hold and settles to ordinary secondary (#527 Bug B).
+func TestElection_ManualFailover_ClearedOnPeerPrimary(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	// Manual failover: Primary -> SecondaryHold with ManualFailover=true.
+	m.ManualFailover(0)
+	drainEvents(m, 1)
+
+	m.mu.RLock()
+	rg := m.groups[0]
+	if rg.State != StateSecondaryHold {
+		t.Fatalf("state after ManualFailover = %s, want secondary-hold", rg.State)
+	}
+	if !rg.ManualFailover {
+		t.Fatal("ManualFailover should be true after ManualFailover()")
+	}
+	m.mu.RUnlock()
+
+	// Peer heartbeat: peer has taken primary.
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+	drainEvents(m, 2)
+
+	// ManualFailover flag should be cleared, state should be ordinary secondary.
+	m.mu.RLock()
+	rg = m.groups[0]
+	if rg.ManualFailover {
+		t.Error("ManualFailover should be cleared once peer is primary")
+	}
+	if rg.State != StateSecondary {
+		t.Errorf("state = %s, want secondary (not secondary-hold)", rg.State)
+	}
+	m.mu.RUnlock()
+
+	if m.IsLocalPrimary(0) {
+		t.Error("should remain secondary")
 	}
 }
 

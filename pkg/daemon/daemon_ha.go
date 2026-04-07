@@ -2687,12 +2687,19 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 					}
 				}
 
-				// no-reth-vrrp direct mode: always reconcile actual VIP
-				// ownership on non-primary transitions. Removal must not
-				// depend on a fresh rg_active edge because stale VIPs can
-				// survive a failback if the state machine already drifted.
+				// no-reth-vrrp direct mode: remove VIPs synchronously
+				// during the demotion event handler. On a demotion edge,
+				// call applyDirectVIPOwnership(want=false) directly to
+				// guarantee immediate removal without re-querying cluster
+				// state — prevents stale VIPs surviving a dropped event
+				// or state-machine timing gap (#527). For non-demotion
+				// secondary transitions, reconcile from actual state.
 				if noRethVRRP {
-					d.reconcileDirectVIPOwnership(ev.GroupID, "cluster-secondary")
+					if clusterDemotionEdge {
+						d.applyDirectVIPOwnership(ev.GroupID, false, "cluster-demotion")
+					} else {
+						d.reconcileDirectVIPOwnership(ev.GroupID, "cluster-secondary")
+					}
 				}
 			}
 

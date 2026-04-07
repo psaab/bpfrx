@@ -51,6 +51,16 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 	// transfer-out or weight=0 state and immediately re-elects itself as
 	// primary, defeating the handoff.
 	if rg.ManualFailover {
+		// Peer confirmed primary: the manual failover has succeeded.
+		// Clear the hold and settle to ordinary secondary (#527).
+		// runElection will apply the state change via the result.
+		if peerGroup != nil && peerGroup.State == StatePrimary {
+			slog.Info("cluster: clearing manual failover (peer confirmed primary)",
+				"rg", rg.GroupID)
+			rg.ManualFailover = false
+			rg.ManualFailoverAt = time.Time{}
+			return electLocalSecondary, "Peer confirmed primary after manual failover"
+		}
 		peerResigned := peerGroup != nil && peerGroup.Weight <= 0
 		peerTransferOut := peerGroup != nil && peerGroup.State == StateSecondaryHold
 		if !peerResigned && !peerTransferOut {
