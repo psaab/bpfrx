@@ -24,7 +24,7 @@ func TestInferIPv6StaticNextHopInterfaces(t *testing.T) {
 			},
 		},
 		RoutingOptions: config.RoutingOptionsConfig{
-			Inet6StaticRoutes: []*config.StaticRoute{
+			StaticRoutes: []*config.StaticRoute{
 				{
 					Destination: "::/0",
 					NextHops: []config.NextHopEntry{
@@ -38,6 +38,14 @@ func TestInferIPv6StaticNextHopInterfaces(t *testing.T) {
 					},
 				},
 			},
+			Inet6StaticRoutes: []*config.StaticRoute{
+				{
+					Destination: "2001:db8:ffff::/48",
+					NextHops: []config.NextHopEntry{
+						{Address: "2001:559:8585:ef00::2"},
+					},
+				},
+			},
 		},
 	}
 
@@ -47,5 +55,8 @@ func TestInferIPv6StaticNextHopInterfaces(t *testing.T) {
 	}
 	if got["2001:559:8585:80::1"] != "reth0.80" {
 		t.Fatalf("gre route next-hop interface = %q, want reth0.80", got["2001:559:8585:80::1"])
+	}
+	if got["2001:559:8585:ef00::2"] != "reth1" {
+		t.Fatalf("inet6 static route next-hop interface = %q, want reth1", got["2001:559:8585:ef00::2"])
 	}
 }

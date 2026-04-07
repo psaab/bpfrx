@@ -1205,8 +1205,10 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]string {
 		}
 	}
 
+	addRoutes(cfg.RoutingOptions.StaticRoutes)
 	addRoutes(cfg.RoutingOptions.Inet6StaticRoutes)
 	for _, ri := range cfg.RoutingInstances {
+		addRoutes(ri.StaticRoutes)
 		addRoutes(ri.Inet6StaticRoutes)
 	}
 	return resolved
