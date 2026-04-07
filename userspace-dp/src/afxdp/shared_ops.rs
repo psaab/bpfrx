@@ -62,6 +62,7 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     if owner_rgs.is_empty() {
         return;
     }
+    let publish_session_map = session_map_fd >= 0;
     let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
     let candidate_keys = owner_rg_session_keys_serialized(
         shared_sessions,
@@ -120,13 +121,14 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     // yet applied the HA state update.
     let mut fwd_publish_errors = 0u32;
     for forward in &forward_entries {
-        if publish_session_map_entry_for_session(
-            session_map_fd,
-            &forward.key,
-            forward.decision,
-            &forward.metadata,
-        )
-        .is_err()
+        if publish_session_map
+            && publish_session_map_entry_for_session(
+                session_map_fd,
+                &forward.key,
+                forward.decision,
+                &forward.metadata,
+            )
+            .is_err()
         {
             fwd_publish_errors += 1;
         }
@@ -151,12 +153,14 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
             shared_owner_rg_indexes,
             &reverse,
         );
-        let _ = publish_session_map_entry_for_session(
-            session_map_fd,
-            &reverse.key,
-            reverse.decision,
-            &reverse.metadata,
-        );
+        if publish_session_map {
+            let _ = publish_session_map_entry_for_session(
+                session_map_fd,
+                &reverse.key,
+                reverse.decision,
+                &reverse.metadata,
+            );
+        }
         for commands in worker_commands {
             if let Ok(mut pending) = commands.lock() {
                 pending.push_back(WorkerCommand::UpsertSynced(reverse.clone()));
