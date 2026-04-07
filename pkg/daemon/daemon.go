@@ -244,7 +244,10 @@ type Daemon struct {
 const standbyNeighborRefreshMinInterval = time.Second
 
 func (d *Daemon) shouldScheduleStandbyNeighborRefresh(now time.Time) bool {
-	elapsed := now.Sub(d.startTime).Nanoseconds()
+	elapsed := now.Sub(d.startTime).Nanoseconds() + 1
+	if elapsed < 1 {
+		elapsed = 1
+	}
 	last := d.lastStandbyNeighborRefresh.Load()
 	if last != 0 && elapsed >= last && elapsed-last < int64(standbyNeighborRefreshMinInterval) {
 		return false

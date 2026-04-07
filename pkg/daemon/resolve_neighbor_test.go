@@ -47,6 +47,14 @@ func TestResolveJunosIfName(t *testing.T) {
 func TestShouldScheduleStandbyNeighborRefresh(t *testing.T) {
 	base := time.Unix(100, 0)
 	d := Daemon{startTime: base}
+	if !d.shouldScheduleStandbyNeighborRefresh(base) {
+		t.Fatal("first refresh at daemon start should schedule")
+	}
+	if d.shouldScheduleStandbyNeighborRefresh(base) {
+		t.Fatal("second refresh at daemon start should be debounced")
+	}
+
+	d = Daemon{startTime: base}
 	first := base.Add(10 * time.Second)
 	if !d.shouldScheduleStandbyNeighborRefresh(first) {
 		t.Fatal("first standby neighbor refresh should schedule")
