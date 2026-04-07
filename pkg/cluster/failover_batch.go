@@ -266,14 +266,7 @@ func (m *Manager) commitRequestedPeerFailoverBatch(rgIDs []int, reqID uint64) er
 	}
 
 	for _, rgID := range rgIDs {
-		m.peerTransferOutOverride[rgID] = reqID
-		peerGroup := m.peerGroups[rgID]
-		peerGroup.GroupID = rgID
-		peerGroup.State = StateSecondaryHold
-		m.peerGroups[rgID] = peerGroup
-		if rg := m.groups[rgID]; rg != nil {
-			rg.PeerPriority = peerGroup.Priority
-		}
+		m.applyPeerTransferOutOverrideLocked(rgID, reqID)
 	}
 
 	m.runElection()
@@ -301,9 +294,7 @@ func (m *Manager) abortRequestedPeerFailoverBatch(rgIDs []int, reqID uint64) {
 	defer m.mu.Unlock()
 
 	for _, rgID := range rgIDs {
-		if currentReqID, ok := m.peerTransferOutOverride[rgID]; ok && currentReqID == reqID {
-			delete(m.peerTransferOutOverride, rgID)
-		}
+		m.restorePeerTransferOutOverrideLocked(rgID, reqID)
 	}
 	m.runElection()
 }
@@ -313,7 +304,7 @@ func (m *Manager) notePeerTransferCommittedBatch(rgIDs []int) {
 	defer m.mu.Unlock()
 
 	for _, rgID := range rgIDs {
-		delete(m.peerTransferOutOverride, rgID)
+		m.clearPeerTransferOutOverrideLocked(rgID)
 		peerGroup, ok := m.peerGroups[rgID]
 		if !ok {
 			continue

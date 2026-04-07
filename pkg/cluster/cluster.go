@@ -127,6 +127,7 @@ type Manager struct {
 	// transfer-out across heartbeat refreshes until the transfer is either
 	// committed or aborted locally.
 	peerTransferOutOverride map[int]uint64
+	peerTransferOutPrevious map[int]peerGroupSnapshot
 	peerMonitors            []InterfaceMonitorInfo
 
 	// Heartbeat goroutines (nil when not started).
@@ -215,6 +216,11 @@ type Manager struct {
 	failoverInProgress map[int]bool
 }
 
+type peerGroupSnapshot struct {
+	state   PeerGroupState
+	present bool
+}
+
 // DefaultTakeoverHoldTime is the default additional delay after an RG becomes
 // ready before election promotes it to primary. Zero means promote as soon as
 // readiness is established.
@@ -233,6 +239,7 @@ func NewManager(nodeID, clusterID int) *Manager {
 		garpCounts:                     make(map[int]int),
 		peerGroups:                     make(map[int]PeerGroupState),
 		peerTransferOutOverride:        make(map[int]uint64),
+		peerTransferOutPrevious:        make(map[int]peerGroupSnapshot),
 		hbInterval:                     DefaultHeartbeatInterval,
 		hbThreshold:                    DefaultHeartbeatThreshold,
 		history:                        NewEventHistory(64),
@@ -241,6 +248,50 @@ func NewManager(nodeID, clusterID int) *Manager {
 		preManualFailoverRetryInterval: DefaultPreManualFailoverRetryInterval,
 		failoverInProgress:             make(map[int]bool),
 	}
+}
+
+func (m *Manager) applyPeerTransferOutOverrideLocked(rgID int, reqID uint64) {
+	previous, ok := m.peerGroups[rgID]
+	m.peerTransferOutOverride[rgID] = reqID
+	m.peerTransferOutPrevious[rgID] = peerGroupSnapshot{
+		state:   previous,
+		present: ok,
+	}
+	peerGroup := previous
+	peerGroup.GroupID = rgID
+	peerGroup.State = StateSecondaryHold
+	m.peerGroups[rgID] = peerGroup
+	if rg := m.groups[rgID]; rg != nil {
+		rg.PeerPriority = peerGroup.Priority
+	}
+}
+
+func (m *Manager) clearPeerTransferOutOverrideLocked(rgID int) {
+	delete(m.peerTransferOutOverride, rgID)
+	delete(m.peerTransferOutPrevious, rgID)
+}
+
+func (m *Manager) restorePeerTransferOutOverrideLocked(rgID int, reqID uint64) bool {
+	currentReqID, ok := m.peerTransferOutOverride[rgID]
+	if !ok || currentReqID != reqID {
+		return false
+	}
+	delete(m.peerTransferOutOverride, rgID)
+	snapshot, hadSnapshot := m.peerTransferOutPrevious[rgID]
+	delete(m.peerTransferOutPrevious, rgID)
+	if hadSnapshot && snapshot.present {
+		m.peerGroups[rgID] = snapshot.state
+	} else {
+		delete(m.peerGroups, rgID)
+	}
+	if rg := m.groups[rgID]; rg != nil {
+		if snapshot.present {
+			rg.PeerPriority = snapshot.state.Priority
+		} else {
+			rg.PeerPriority = 0
+		}
+	}
+	return true
 }
 
 // NodeID returns the local node ID.
@@ -981,12 +1032,8 @@ func (m *Manager) commitRequestedPeerFailover(rgID int, reqID uint64) error {
 		)
 	}
 
-	m.peerTransferOutOverride[rgID] = reqID
+	m.applyPeerTransferOutOverrideLocked(rgID, reqID)
 	peerGroup := m.peerGroups[rgID]
-	peerGroup.GroupID = rgID
-	peerGroup.State = StateSecondaryHold
-	m.peerGroups[rgID] = peerGroup
-	rg.PeerPriority = peerGroup.Priority
 
 	m.runElection()
 	if rg.State != StatePrimary {
@@ -1006,10 +1053,9 @@ func (m *Manager) abortRequestedPeerFailover(rgID int, reqID uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if currentReqID, ok := m.peerTransferOutOverride[rgID]; !ok || currentReqID != reqID {
+	if !m.restorePeerTransferOutOverrideLocked(rgID, reqID) {
 		return
 	}
-	delete(m.peerTransferOutOverride, rgID)
 	m.runElection()
 }
 
@@ -1017,7 +1063,7 @@ func (m *Manager) notePeerTransferCommitted(rgID int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	delete(m.peerTransferOutOverride, rgID)
+	m.clearPeerTransferOutOverrideLocked(rgID)
 	peerGroup, ok := m.peerGroups[rgID]
 	if !ok {
 		return

@@ -679,6 +679,51 @@ func TestRequestPeerFailoverWaitsForLocalCommitReadyHookBeforePeerCommit(t *test
 	}
 }
 
+func TestRequestPeerFailoverAbortsToPriorPeerStateWhenLocalCommitReadyHookFails(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+	m.mu.Lock()
+	m.groups[0].Ready = true
+	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+	m.groups[0].ReadinessReasons = nil
+	m.mu.Unlock()
+
+	m.SetPeerFailoverFunc(func(rgID int) (uint64, error) {
+		return 77, nil
+	})
+	m.SetLocalTransferCommitReadyHook(func(rgIDs []int) error {
+		return fmt.Errorf("local activation not settled")
+	})
+	m.SetPeerFailoverCommitFunc(func(rgID int, reqID uint64) error {
+		t.Fatal("peer failover commit should not run when local commit ready hook fails")
+		return nil
+	})
+
+	err := m.RequestPeerFailover(0)
+	if err == nil {
+		t.Fatal("expected local commit ready error")
+	}
+	if !strings.Contains(err.Error(), "local activation not settled") {
+		t.Fatalf("RequestPeerFailover() error = %v", err)
+	}
+	if m.IsLocalPrimary(0) {
+		t.Fatal("local node should not remain primary after abort")
+	}
+	if peer := m.PeerGroupStates()[0]; peer.State != StatePrimary {
+		t.Fatalf("peer state = %s, want primary after abort", peer.State)
+	}
+}
+
 func TestRequestPeerFailoverBatchAbortsWhenLocalCommitReadyHookFails(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(
@@ -724,8 +769,11 @@ func TestRequestPeerFailoverBatchAbortsWhenLocalCommitReadyHookFails(t *testing.
 		t.Fatalf("RequestPeerFailoverBatch() error = %v", err)
 	}
 	for _, rgID := range []int{1, 2} {
-		if peer := m.PeerGroupStates()[rgID]; peer.State != StateSecondaryHold {
-			t.Fatalf("peer state for rg %d = %s, want secondary-hold after local commit ready abort", rgID, peer.State)
+		if m.IsLocalPrimary(rgID) {
+			t.Fatalf("local node should not remain primary for rg %d after abort", rgID)
+		}
+		if peer := m.PeerGroupStates()[rgID]; peer.State != StatePrimary {
+			t.Fatalf("peer state for rg %d = %s, want primary after local commit ready abort", rgID, peer.State)
 		}
 	}
 }
