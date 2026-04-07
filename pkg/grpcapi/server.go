@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
@@ -77,27 +78,28 @@ type Config struct {
 // Server implements the BpfrxService gRPC service.
 type Server struct {
 	pb.UnimplementedBpfrxServiceServer
-	store            *configstore.Store
-	dp               dataplane.DataPlane
-	eventBuf         *logging.EventBuffer
-	gc               *conntrack.GC
-	routing          *routing.Manager
-	frr              *frr.Manager
-	ipsec            *ipsec.Manager
-	cluster          *cluster.Manager
-	dhcp             *dhcp.Manager
-	dhcpServer       *dhcpserver.Manager
-	rpmResultsFn     func() []*rpm.ProbeResult
-	feedsFn          func() map[string]feeds.FeedInfo
-	lldpNeighborsFn  func() []*lldp.Neighbor
-	applyFn          func(*config.Config)
-	vrrpMgr          *vrrp.Manager
-	raMgr            *ra.Manager
-	startTime        time.Time
-	addr             string
-	version          string
-	fabricPeerAddrFn func() []string
-	fabricVRFDevice  string
+	store              *configstore.Store
+	dp                 dataplane.DataPlane
+	eventBuf           *logging.EventBuffer
+	gc                 *conntrack.GC
+	routing            *routing.Manager
+	frr                *frr.Manager
+	ipsec              *ipsec.Manager
+	cluster            *cluster.Manager
+	dhcp               *dhcp.Manager
+	dhcpServer         *dhcpserver.Manager
+	rpmResultsFn       func() []*rpm.ProbeResult
+	feedsFn            func() map[string]feeds.FeedInfo
+	lldpNeighborsFn    func() []*lldp.Neighbor
+	applyFn            func(*config.Config)
+	vrrpMgr            *vrrp.Manager
+	raMgr              *ra.Manager
+	startTime          time.Time
+	addr               string
+	version            string
+	fabricPeerAddrFn   func() []string
+	fabricVRFDevice    string
+	peerSystemActionFn func(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error)
 }
 
 func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
@@ -7253,7 +7255,30 @@ func writeNeighSummary(buf *strings.Builder, neighbors []netlink.Neigh, stateFn 
 
 // --- SystemAction RPC ---
 
-func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error) {
+func peerForwardedFromContext(ctx context.Context) bool {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return false
+	}
+	return len(md.Get("x-peer-forwarded")) > 0
+}
+
+func (s *Server) proxyPeerSystemAction(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error) {
+	peerCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	peerCtx = metadata.AppendToOutgoingContext(peerCtx, "x-peer-forwarded", "1")
+	if s.peerSystemActionFn != nil {
+		return s.peerSystemActionFn(peerCtx, req)
+	}
+	conn, err := s.dialPeer()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	return pb.NewBpfrxServiceClient(conn).SystemAction(peerCtx, req)
+}
+
+func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error) {
 	switch req.Action {
 	case "reboot":
 		slog.Warn("system reboot requested via gRPC")
@@ -7466,22 +7491,32 @@ func (s *Server) SystemAction(_ context.Context, req *pb.SystemActionRequest) (*
 				if err != nil {
 					return nil, status.Errorf(codes.InvalidArgument, "invalid node ID: %s", nodeStr)
 				}
-				if targetNode == s.cluster.NodeID() {
-					// Target is local — make us primary.
-					if s.cluster.IsLocalPrimary(rgID) {
-						return &pb.SystemActionResponse{
-							Message: fmt.Sprintf("Redundancy group %d is already primary on node %d", rgID, targetNode),
-						}, nil
+				if targetNode != s.cluster.NodeID() {
+					if peerForwardedFromContext(ctx) {
+						return nil, status.Errorf(codes.FailedPrecondition, "forwarded cluster failover target node %d is not local", targetNode)
 					}
-					// Ask peer to transfer out so we can take primary.
-					if err := s.cluster.RequestPeerFailover(rgID); err != nil {
-						return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+					resp, err := s.proxyPeerSystemAction(ctx, req)
+					if err != nil {
+						if st, ok := status.FromError(err); ok {
+							return nil, st.Err()
+						}
+						return nil, status.Errorf(codes.Unavailable, "peer cluster failover proxy failed: %v", err)
 					}
+					return resp, nil
+				}
+				// Target is local — make us primary.
+				if s.cluster.IsLocalPrimary(rgID) {
 					return &pb.SystemActionResponse{
-						Message: fmt.Sprintf("Manual failover completed for redundancy group %d (transfer committed)", rgID),
+						Message: fmt.Sprintf("Redundancy group %d is already primary on node %d", rgID, targetNode),
 					}, nil
 				}
-				// Target is peer → local failover (fall through)
+				// Ask peer to transfer out so we can take primary.
+				if err := s.cluster.RequestPeerFailover(rgID); err != nil {
+					return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+				}
+				return &pb.SystemActionResponse{
+					Message: fmt.Sprintf("Manual failover completed for redundancy group %d (transfer committed)", rgID),
+				}, nil
 			}
 
 			if err := s.cluster.ManualFailover(rgID); err != nil {

@@ -659,7 +659,7 @@ func TestRequestPeerFailoverRequiresLocalTransferReadiness(t *testing.T) {
 	}
 }
 
-func TestRequestPeerFailoverTransferReadinessFailureAfterPeerPrimaryConfirmationPreservesSettledManualFailover(t *testing.T) {
+func TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
 	m.UpdateConfig(cfg)
@@ -683,13 +683,6 @@ func TestRequestPeerFailoverTransferReadinessFailureAfterPeerPrimaryConfirmation
 	m.mu.Unlock()
 
 	state := m.GroupState(0)
-	if !state.ManualFailover {
-		t.Fatal("manual failover should remain set after peer primary confirmation")
-	}
-	if state.State != StateSecondary {
-		t.Fatalf("state = %s, want secondary after peer primary confirmation", state.State)
-	}
-
 	m.SetTransferReadinessFunc(func(rgID int) (bool, []string) {
 		return false, []string{"session sync disconnected"}
 	})
@@ -710,12 +703,12 @@ func TestRequestPeerFailoverTransferReadinessFailureAfterPeerPrimaryConfirmation
 	if !state.ManualFailover {
 		t.Fatal("manual failover should remain set after transfer readiness rejection")
 	}
-	if state.State != StateSecondary {
-		t.Fatalf("state = %s, want secondary", state.State)
+	if state.State != StateSecondaryHold {
+		t.Fatalf("state = %s, want secondary-hold", state.State)
 	}
 }
 
-func TestRequestPeerFailoverPeerSendFailureAfterPeerPrimaryConfirmationPreservesSettledManualFailover(t *testing.T) {
+func TestRequestPeerFailoverPeerSendFailurePreservesManualFailover(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
 	m.UpdateConfig(cfg)
@@ -739,13 +732,6 @@ func TestRequestPeerFailoverPeerSendFailureAfterPeerPrimaryConfirmationPreserves
 	m.mu.Unlock()
 
 	state := m.GroupState(0)
-	if !state.ManualFailover {
-		t.Fatal("manual failover should remain set after peer primary confirmation")
-	}
-	if state.State != StateSecondary {
-		t.Fatalf("state = %s, want secondary after peer primary confirmation", state.State)
-	}
-
 	m.SetTransferReadinessFunc(func(rgID int) (bool, []string) {
 		return true, nil
 	})
@@ -765,8 +751,8 @@ func TestRequestPeerFailoverPeerSendFailureAfterPeerPrimaryConfirmationPreserves
 	if !state.ManualFailover {
 		t.Fatal("manual failover should remain set after peer request send failure")
 	}
-	if state.State != StateSecondary {
-		t.Fatalf("state = %s, want secondary", state.State)
+	if state.State != StateSecondaryHold {
+		t.Fatalf("state = %s, want secondary-hold", state.State)
 	}
 }
 

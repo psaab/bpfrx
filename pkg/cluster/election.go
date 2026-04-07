@@ -51,43 +51,34 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 	// transfer-out or weight=0 state and immediately re-elects itself as
 	// primary, defeating the handoff.
 	if rg.ManualFailover {
-		peerPrimary := peerGroup != nil && peerGroup.State == StatePrimary
-		if peerPrimary {
-			if rg.State != StateSecondary {
-				return electLocalSecondary, "Peer primary confirmed"
-			}
-			return electNoChange, ""
-		}
 		peerResigned := peerGroup != nil && peerGroup.Weight <= 0
 		peerTransferOut := peerGroup != nil && peerGroup.State == StateSecondaryHold
-		if !clearedManualFailover && !peerResigned && !peerTransferOut {
+		if !peerResigned && !peerTransferOut {
 			return electNoChange, ""
 		}
-		if !clearedManualFailover && time.Since(rg.ManualFailoverAt) < 2*time.Second {
+		if time.Since(rg.ManualFailoverAt) < 2*time.Second {
 			return electNoChange, ""
 		}
-		if !clearedManualFailover {
-			// The peer has also yielded for >2s. Clear manual failover and
-			// restore weight so normal election can promote one node.
-			slog.Info("cluster: clearing manual failover (peer also yielded)",
-				"rg", rg.GroupID,
-				"peer_state", peerGroup.State.String(),
-				"peer_weight", peerGroup.Weight)
-			rg.ManualFailover = false
-			rg.ManualFailoverAt = time.Time{}
-			// Recalculate weight inline (recalcWeight calls runElection
-			// which would recurse back to electRG).
-			totalLost := 0
-			for _, iface := range rg.MonitorFails {
-				key := monitorKey{rgID: rg.GroupID, iface: iface}
-				totalLost += m.monitorWeights[key]
-			}
-			rg.Weight = 255 - totalLost
-			if rg.Weight < 0 {
-				rg.Weight = 0
-			}
-			clearedManualFailover = true
+		// The peer has also yielded for >2s. Clear manual failover and
+		// restore weight so normal election can promote one node.
+		slog.Info("cluster: clearing manual failover (peer also yielded)",
+			"rg", rg.GroupID,
+			"peer_state", peerGroup.State.String(),
+			"peer_weight", peerGroup.Weight)
+		rg.ManualFailover = false
+		rg.ManualFailoverAt = time.Time{}
+		// Recalculate weight inline (recalcWeight calls runElection
+		// which would recurse back to electRG).
+		totalLost := 0
+		for _, iface := range rg.MonitorFails {
+			key := monitorKey{rgID: rg.GroupID, iface: iface}
+			totalLost += m.monitorWeights[key]
 		}
+		rg.Weight = 255 - totalLost
+		if rg.Weight < 0 {
+			rg.Weight = 0
+		}
+		clearedManualFailover = true
 	}
 
 	localWeight := rg.Weight
