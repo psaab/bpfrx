@@ -90,12 +90,12 @@ type FullConfig struct {
 	// Used to translate RETH interface names in static routes to kernel names.
 	RethMap map[string]string
 
-	// IPv6NextHopInterfaces maps IPv6 next-hops used by global and per-instance
-	// static routes to the interface to use when the route omits an explicit
-	// interface. Values may still be logical interface names (for example,
-	// "reth0.50"); any later translation to kernel/physical names is handled
-	// separately via RethMap.
-	IPv6NextHopInterfaces map[string]string
+	// IPv6NextHopInterfaces maps VRF name -> IPv6 next-hop -> interface for
+	// global and per-instance static routes that omit an explicit interface.
+	// Values may still be logical interface names (for example, "reth0.50");
+	// any later translation to kernel/physical names is handled separately via
+	// RethMap. The global table uses the empty-string VRF key.
+	IPv6NextHopInterfaces map[string]map[string]string
 
 	// ConsistentHash is set when the forwarding-table export policy uses
 	// "load-balance consistent-hash". The daemon should set
@@ -476,7 +476,7 @@ func (m *Manager) generateInterfaceSettings(fc *FullConfig) string {
 // generateStaticRoute produces FRR static route commands.
 // Multiple next-hops produce one line each (FRR creates ECMP).
 // Routes with NextTable are handled via ip rule (policy routing), not FRR.
-func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string, rethMap map[string]string, ipv6NextHopInterfaces map[string]string) string {
+func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string, rethMap map[string]string, ipv6NextHopInterfaces map[string]map[string]string) string {
 	if sr.NextTable != "" {
 		return "" // handled via ip rule in routing package
 	}
@@ -508,7 +508,7 @@ func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string, re
 		// interface names and must NOT be stripped.
 		ifName := nh.Interface
 		if isV6 && ifName == "" && nh.Address != "" {
-			ifName = ipv6NextHopInterfaces[nh.Address]
+			ifName = ipv6NextHopInterfaces[vrfName][nh.Address]
 		}
 		if strings.HasSuffix(ifName, ".0") {
 			ifName = ifName[:len(ifName)-2]
