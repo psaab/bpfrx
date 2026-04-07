@@ -202,6 +202,17 @@ type Daemon struct {
 	directAnnounceSeq      map[int]uint64
 	directAnnounceSchedule []time.Duration
 	directSendGARPsFn      func(int)
+	// directVIPOwned tracks the last direct-mode ownership state applied
+	// for each RG so reconciliation can trigger one-shot side effects
+	// (service start/stop, announce bursts) while still reasserting
+	// VIP presence/removal idempotently every pass.
+	directVIPMu    sync.Mutex
+	directVIPOwned map[int]bool
+	// Test hooks for direct-mode VIP ownership reconciliation.
+	directAddVIPsFn        func(int) int
+	directRemoveVIPsFn     func(int) int
+	directAddStableLLFn    func(int)
+	directRemoveStableLLFn func(int)
 
 	// linkByNameFn resolves a network interface by name. Defaults to
 	// netlink.LinkByName; overridden in tests.
@@ -258,6 +269,7 @@ func New(opts Options) *Daemon {
 		syncReadyTimeout:           5 * time.Second,
 		linkByNameFn:               netlink.LinkByName,
 		directAnnounceSchedule:     []time.Duration{0, 250 * time.Millisecond, 1 * time.Second, 2 * time.Second, 4 * time.Second, 6 * time.Second},
+		directVIPOwned:             make(map[int]bool),
 		userspaceDemotionPrepUntil: make(map[int]time.Time),
 	}
 }
