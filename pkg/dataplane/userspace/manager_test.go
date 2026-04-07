@@ -632,6 +632,59 @@ func TestTakeoverReadyReportsSessionMirrorFailure(t *testing.T) {
 	}
 }
 
+func testStandbyNeighborPrewarmManager() *Manager {
+	return &Manager{
+		proc:      &exec.Cmd{Process: &os.Process{Pid: 1}},
+		clusterHA: true,
+		lastStatus: ProcessStatus{
+			Enabled:         true,
+			ForwardingArmed: true,
+			Capabilities: UserspaceCapabilities{
+				ForwardingSupported: true,
+			},
+		},
+		lastSnapshot: &ConfigSnapshot{
+			Config: &config.Config{
+				Chassis: config.ChassisConfig{
+					Cluster: &config.ClusterConfig{
+						RedundancyGroups: []*config.RedundancyGroup{
+							{ID: 0},
+							{ID: 1},
+						},
+					},
+				},
+			},
+		},
+		haGroups: map[int]HAGroupStatus{
+			1: {RGID: 1, Active: false},
+		},
+	}
+}
+
+func TestShouldStandbyNeighborPrewarmLocked(t *testing.T) {
+	m := testStandbyNeighborPrewarmManager()
+	if !m.shouldStandbyNeighborPrewarmLocked(time.Now()) {
+		t.Fatal("shouldStandbyNeighborPrewarmLocked() = false, want true")
+	}
+}
+
+func TestShouldStandbyNeighborPrewarmLockedRejectsActiveOwner(t *testing.T) {
+	m := testStandbyNeighborPrewarmManager()
+	m.haGroups[1] = HAGroupStatus{RGID: 1, Active: true}
+	if m.shouldStandbyNeighborPrewarmLocked(time.Now()) {
+		t.Fatal("shouldStandbyNeighborPrewarmLocked() = true, want false for active owner")
+	}
+}
+
+func TestShouldStandbyNeighborPrewarmLockedThrottlesRecentRun(t *testing.T) {
+	m := testStandbyNeighborPrewarmManager()
+	now := time.Now()
+	m.lastStandbyNeighResolve = now.Add(-5 * time.Second)
+	if m.shouldStandbyNeighborPrewarmLocked(now) {
+		t.Fatal("shouldStandbyNeighborPrewarmLocked() = true, want false during throttle window")
+	}
+}
+
 func TestMergeHAStateFromMaps(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Skipf("RemoveMemlock: %v", err)
