@@ -1470,15 +1470,39 @@ func TestShouldExtendXSKLivenessIdleLocked(t *testing.T) {
 	if !m.shouldExtendXSKLivenessIdleLocked(0, false) {
 		t.Fatal("shouldExtendXSKLivenessIdleLocked(0) = false, want true with no active data RG")
 	}
-	m.haGroups[1] = HAGroupStatus{RGID: 1, Active: true}
-	if !m.shouldExtendXSKLivenessIdleLocked(0, true) {
-		t.Fatal("shouldExtendXSKLivenessIdleLocked(0, true) = false, want true when all bindings are bound")
+	if m.shouldExtendXSKLivenessIdleLocked(0, true) {
+		t.Fatal("shouldExtendXSKLivenessIdleLocked(0, true) = true, want false when idle standby should auto-prove")
 	}
+	m.haGroups[1] = HAGroupStatus{RGID: 1, Active: true}
 	if m.shouldExtendXSKLivenessIdleLocked(0, false) {
 		t.Fatal("shouldExtendXSKLivenessIdleLocked(0) = true, want false with active data RG")
 	}
+	if !m.shouldExtendXSKLivenessIdleLocked(0, true) {
+		t.Fatal("shouldExtendXSKLivenessIdleLocked(0, true) = false, want true when active dataplane is fully bound but still idle")
+	}
 	if m.shouldExtendXSKLivenessIdleLocked(42, true) {
 		t.Fatal("shouldExtendXSKLivenessIdleLocked(42) = true, want false when RX is already live")
+	}
+}
+
+func TestShouldAutoProveIdleStandbyXSKLocked(t *testing.T) {
+	m := &Manager{
+		haGroups: map[int]HAGroupStatus{
+			0: {RGID: 0, Active: true},
+		},
+	}
+	if !m.shouldAutoProveIdleStandbyXSKLocked(0, true) {
+		t.Fatal("shouldAutoProveIdleStandbyXSKLocked(0, true) = false, want true on fully bound idle standby")
+	}
+	if m.shouldAutoProveIdleStandbyXSKLocked(0, false) {
+		t.Fatal("shouldAutoProveIdleStandbyXSKLocked(0, false) = true, want false when bindings are not fully bound")
+	}
+	m.haGroups[1] = HAGroupStatus{RGID: 1, Active: true}
+	if m.shouldAutoProveIdleStandbyXSKLocked(0, true) {
+		t.Fatal("shouldAutoProveIdleStandbyXSKLocked(0, true) = true, want false when a data RG is active")
+	}
+	if m.shouldAutoProveIdleStandbyXSKLocked(42, true) {
+		t.Fatal("shouldAutoProveIdleStandbyXSKLocked(42, true) = true, want false when RX is already live")
 	}
 }
 
