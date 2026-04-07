@@ -70,8 +70,9 @@ type CLI struct {
 	vrrpMgr *vrrp.Manager
 
 	// Fabric peer dialing for cluster-wide queries (fab0 + optional fab1).
-	fabricPeerAddrFn func() []string
-	fabricVRFDevice  string
+	fabricPeerAddrFn   func() []string
+	fabricVRFDevice    string
+	peerSystemActionFn func(ctx context.Context, action string) (string, error)
 
 	// Monitor security flow state (per-CLI-session).
 	monitorFlow *monitorFlowState
@@ -200,6 +201,26 @@ func (c *CLI) dialPeer() *grpc.ClientConn {
 	}
 	slog.Warn("failed to dial peer on any fabric address")
 	return nil
+}
+
+func (c *CLI) requestPeerSystemAction(ctx context.Context, action string) (string, error) {
+	ctx = metadata.AppendToOutgoingContext(ctx, "x-peer-forwarded", "1")
+	if c.peerSystemActionFn != nil {
+		return c.peerSystemActionFn(ctx, action)
+	}
+	conn := c.dialPeer()
+	if conn == nil {
+		return "", fmt.Errorf("cluster peer not reachable")
+	}
+	defer conn.Close()
+
+	peerCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	resp, err := pb.NewBpfrxServiceClient(conn).SystemAction(peerCtx, &pb.SystemActionRequest{Action: action})
+	if err != nil {
+		return "", err
+	}
+	return resp.Message, nil
 }
 
 // checkPermission verifies the current user's login class permits the given action.
@@ -4454,6 +4475,15 @@ func (c *CLI) handleRequestChassisClusterFailover(args []string) error {
 				fmt.Printf("Manual failover completed for redundancy group %d (transfer committed)\n", rgID)
 				return nil
 			}
+			message, err := c.requestPeerSystemAction(
+				context.Background(),
+				fmt.Sprintf("cluster-failover:%d:node%d", rgID, targetNode),
+			)
+			if err != nil {
+				return err
+			}
+			fmt.Println(message)
+			return nil
 		}
 
 		if err := c.cluster.ManualFailover(rgID); err != nil {

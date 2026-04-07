@@ -682,6 +682,7 @@ func TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover(t *t
 	m.groups[0].ReadinessReasons = nil
 	m.mu.Unlock()
 
+	state := m.GroupState(0)
 	m.SetTransferReadinessFunc(func(rgID int) (bool, []string) {
 		return false, []string{"session sync disconnected"}
 	})
@@ -698,7 +699,7 @@ func TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover(t *t
 	if err == nil {
 		t.Fatal("expected local transfer readiness error")
 	}
-	state := m.GroupState(0)
+	state = m.GroupState(0)
 	if !state.ManualFailover {
 		t.Fatal("manual failover should remain set after transfer readiness rejection")
 	}
@@ -730,6 +731,7 @@ func TestRequestPeerFailoverPeerSendFailurePreservesManualFailover(t *testing.T)
 	m.groups[0].ReadinessReasons = nil
 	m.mu.Unlock()
 
+	state := m.GroupState(0)
 	m.SetTransferReadinessFunc(func(rgID int) (bool, []string) {
 		return true, nil
 	})
@@ -745,7 +747,7 @@ func TestRequestPeerFailoverPeerSendFailurePreservesManualFailover(t *testing.T)
 	if err == nil {
 		t.Fatal("expected peer failover send error")
 	}
-	state := m.GroupState(0)
+	state = m.GroupState(0)
 	if !state.ManualFailover {
 		t.Fatal("manual failover should remain set after peer request send failure")
 	}
