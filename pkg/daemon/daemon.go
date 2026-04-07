@@ -2812,6 +2812,37 @@ func resolveJunosIfName(cfg *config.Config, ifName string) string {
 	return config.LinuxIfName(cfg.ResolveReth(ifName))
 }
 
+func resolveConfigSubnetLinuxName(cfg *config.Config, ip net.IP) (string, string, bool) {
+	if cfg == nil || ip == nil {
+		return "", "", false
+	}
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
+		for unitNum, unit := range ifc.Units {
+			if unit == nil {
+				continue
+			}
+			for _, addrStr := range unit.Addresses {
+				_, ipNet, err := net.ParseCIDR(addrStr)
+				if err != nil {
+					continue
+				}
+				if !ipNet.Contains(ip) {
+					continue
+				}
+				ifName := ifc.Name
+				if unitNum != 0 {
+					ifName = fmt.Sprintf("%s.%d", ifc.Name, unitNum)
+				}
+				return resolveJunosIfName(cfg, ifName), addrStr, true
+			}
+		}
+	}
+	return "", "", false
+}
+
 // stripCIDR removes the /prefix from a CIDR string, returning just the IP.
 func stripCIDR(s string) string {
 	ip, _, err := net.ParseCIDR(s)
@@ -3005,26 +3036,15 @@ func (d *Daemon) resolveNeighborsInner(cfg *config.Config, waitForReplies bool) 
 			return
 		}
 		// Kernel has no route — find the interface from config by subnet match.
-		for _, ifc := range cfg.Interfaces.Interfaces {
-			for _, unit := range ifc.Units {
-				for _, addrStr := range unit.Addresses {
-					_, ipNet, err := net.ParseCIDR(addrStr)
-					if err != nil {
-						continue
-					}
-					if ipNet.Contains(ip) {
-						linuxName := resolveJunosIfName(cfg, ifc.Name)
-						link, err := netlink.LinkByName(linuxName)
-						if err != nil {
-							continue
-						}
-						slog.Debug("neighbor warmup: resolved next-hop via config subnet",
-							"nexthop", ipStr, "iface", linuxName, "subnet", addrStr)
-						addByLink(ip, link.Attrs().Index)
-						return
-					}
-				}
+		linuxName, subnet, ok := resolveConfigSubnetLinuxName(cfg, ip)
+		if ok {
+			link, err := netlink.LinkByName(linuxName)
+			if err != nil {
+				return
 			}
+			slog.Debug("neighbor warmup: resolved next-hop via config subnet",
+				"nexthop", ipStr, "iface", linuxName, "subnet", subnet)
+			addByLink(ip, link.Attrs().Index)
 		}
 	}
 
