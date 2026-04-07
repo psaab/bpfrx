@@ -159,6 +159,10 @@ impl SessionOrigin {
             Self::SyncImport | Self::SharedMaterialize | Self::WorkerLocalImport
         )
     }
+
+    pub(crate) fn is_transient_local_seed(self) -> bool {
+        matches!(self, Self::MissingNeighborSeed)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -460,7 +464,7 @@ impl SessionTable {
             },
         );
         self.index_forward_nat_key(&key, decision, &metadata);
-        if !metadata.is_reverse && !origin.is_peer_synced() {
+        if !metadata.is_reverse && !origin.is_peer_synced() && !origin.is_transient_local_seed() {
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
                 key,
@@ -1118,6 +1122,25 @@ mod tests {
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].kind, SessionDeltaKind::Open);
         assert_eq!(deltas[0].key, key);
+    }
+
+    #[test]
+    fn missing_neighbor_seed_install_stays_out_of_delta_stream() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        assert!(table.install_with_protocol_with_origin(
+            key,
+            decision(),
+            metadata(),
+            SessionOrigin::MissingNeighborSeed,
+            1_000_000_000,
+            PROTO_TCP,
+            0x10
+        ));
+        assert!(
+            table.drain_deltas(8).is_empty(),
+            "transient missing-neighbor seeds must stay local"
+        );
     }
 
     #[test]

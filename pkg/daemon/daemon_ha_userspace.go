@@ -18,7 +18,6 @@ import (
 	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
 )
 
-
 // buildZoneIDs replicates the deterministic zone ID assignment from the
 // dataplane compiler (sorted zone names, 1-based sequential IDs).
 func buildZoneIDs(cfg *config.Config) map[string]uint16 {
@@ -339,6 +338,10 @@ func (d *Daemon) shouldSyncUserspaceDelta(delta dpuserspace.SessionDeltaInfo, in
 	// See #315 for discussion.
 	if strings.EqualFold(delta.Disposition, "local_delivery") {
 		slog.Debug("userspace delta: filtered (local_delivery)", "src", delta.SrcIP, "dst", delta.DstIP)
+		return false
+	}
+	if strings.EqualFold(delta.Origin, "missing_neighbor_seed") {
+		slog.Debug("userspace delta: filtered (missing_neighbor_seed)", "src", delta.SrcIP, "dst", delta.DstIP)
 		return false
 	}
 	if delta.FabricRedirect && !delta.FabricIngress {
