@@ -67,37 +67,38 @@ type Manager struct {
 	dataplane.DataPlane
 	inner *dataplane.Manager
 
-	mu                  sync.Mutex
-	sessionMu           sync.Mutex // separate lock for session sync requests (Phase 3)
-	proc                *exec.Cmd
-	cfg                 config.UserspaceConfig
-	clusterHA           bool
-	generation          uint64
-	syncCancel          context.CancelFunc
-	lastStatus          ProcessStatus
-	lastSnapshot        *ConfigSnapshot
-	haGroups            map[int]HAGroupStatus
-	lastIngressIfaces   []uint32
-	lastRSTv4           []netip.Addr
-	lastRSTv6           []netip.Addr
-	lastSnapshotHash    [32]byte // content hash of last published snapshot (excludes volatile fields)
-	lastBindingIndices  []uint32
-	neighborsPrewarmed  bool
-	ctrlEnableAt        time.Time
-	ctrlWasEnabled      bool
-	ctrlDisabledAt      uint64    // monotonic ktime_ns when ctrl was last disabled
-	lastDemotionTime    time.Time // wall clock when last RG demotion occurred
-	xskLivenessFailed   bool
-	xskLivenessProven   bool
-	xskProbeStart       time.Time
-	lastXSKRX           uint64
-	lastNAPIBootstrap   time.Time
-	publishedSnapshot   uint64
-	publishedPlanKey    string
-	sessionMirrorFailed bool
-	sessionMirrorErr    string
-	deferWorkers        bool // skip worker spawn until NotifyLinkCycle
-	xskBoundNotified    bool // OnXSKBound fired at most once
+	mu                      sync.Mutex
+	sessionMu               sync.Mutex // separate lock for session sync requests (Phase 3)
+	proc                    *exec.Cmd
+	cfg                     config.UserspaceConfig
+	clusterHA               bool
+	generation              uint64
+	syncCancel              context.CancelFunc
+	lastStatus              ProcessStatus
+	lastSnapshot            *ConfigSnapshot
+	haGroups                map[int]HAGroupStatus
+	lastIngressIfaces       []uint32
+	lastRSTv4               []netip.Addr
+	lastRSTv6               []netip.Addr
+	lastSnapshotHash        [32]byte // content hash of last published snapshot (excludes volatile fields)
+	lastBindingIndices      []uint32
+	neighborsPrewarmed      bool
+	ctrlEnableAt            time.Time
+	ctrlWasEnabled          bool
+	ctrlDisabledAt          uint64    // monotonic ktime_ns when ctrl was last disabled
+	lastDemotionTime        time.Time // wall clock when last RG demotion occurred
+	xskLivenessFailed       bool
+	xskLivenessProven       bool
+	xskProbeStart           time.Time
+	lastXSKRX               uint64
+	lastNAPIBootstrap       time.Time
+	lastStandbyNeighResolve time.Time
+	publishedSnapshot       uint64
+	publishedPlanKey        string
+	sessionMirrorFailed     bool
+	sessionMirrorErr        string
+	deferWorkers            bool // skip worker spawn until NotifyLinkCycle
+	xskBoundNotified        bool // OnXSKBound fired at most once
 
 	mode               DataplaneMode // current active runtime mode
 	configuredMode     DataplaneMode // user-configured desired mode (from config)
@@ -4154,15 +4155,39 @@ func (m *Manager) statusLoop(ctx context.Context) {
 			} else {
 				slog.Warn("userspace dataplane status poll failed", "err", err)
 			}
-			// Keep the targeted kernel prewarm during initial startup, but
-			// let the helper own neighbor-table sync via its own dump+subscribe
-			// netlink path instead of pushing periodic manager snapshots.
-			if time.Since(startTime) < 60*time.Second && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
+			// Keep the targeted kernel prewarm during initial startup. After
+			// startup, continue a throttled standby-only neighbor prewarm so HA
+			// standby nodes already have WAN next-hop resolution before the
+			// first redirected packets arrive.
+			now := time.Now()
+			if now.Sub(startTime) < 60*time.Second && m.lastSnapshot != nil && m.lastSnapshot.Config != nil {
+				m.proactiveNeighborResolveAsyncLocked()
+			} else if m.shouldStandbyNeighborPrewarmLocked(now) {
+				m.lastStandbyNeighResolve = now
 				m.proactiveNeighborResolveAsyncLocked()
 			}
 			m.mu.Unlock()
 		}
 	}
+}
+
+func (m *Manager) shouldStandbyNeighborPrewarmLocked(now time.Time) bool {
+	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
+		return false
+	}
+	if !m.clusterHA || !m.configHasDataRGLocked() || m.hasActiveDataRGLocked() {
+		return false
+	}
+	if m.proc == nil || m.proc.Process == nil {
+		return false
+	}
+	if !m.lastStatus.Enabled || !m.lastStatus.ForwardingArmed || !m.lastStatus.Capabilities.ForwardingSupported {
+		return false
+	}
+	if !m.lastStandbyNeighResolve.IsZero() && now.Sub(m.lastStandbyNeighResolve) < 10*time.Second {
+		return false
+	}
+	return true
 }
 
 func (m *Manager) bootstrapNAPIQueuesAsyncLocked(reason string) {
