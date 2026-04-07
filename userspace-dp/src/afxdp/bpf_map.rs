@@ -1080,6 +1080,51 @@ pub(super) fn delete_live_session_entry(
     }
 }
 
+fn session_map_redirect_keys_for_session(
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    origin: SessionOrigin,
+) -> Vec<SessionKey> {
+    let mut keys = vec![key.clone()];
+    if uses_kernel_local_session_map_entry(decision, metadata, origin) {
+        if decision.nat.rewrite_src.is_some() {
+            let reverse_wire = reverse_session_key(key, decision.nat);
+            if reverse_wire != *key {
+                keys.push(reverse_wire);
+            }
+        }
+        return keys;
+    }
+    if !metadata.is_reverse {
+        let wire_key = forward_wire_key(key, decision.nat);
+        if wire_key != *key {
+            keys.push(wire_key);
+        }
+        let reverse_wire = reverse_session_key(key, decision.nat);
+        if reverse_wire != *key {
+            keys.push(reverse_wire.clone());
+        }
+        let reverse_canonical = reverse_canonical_key(key, decision.nat);
+        if reverse_canonical != *key && reverse_canonical != reverse_wire {
+            keys.push(reverse_canonical);
+        }
+    }
+    keys
+}
+
+pub(super) fn delete_session_map_redirect_for_session(
+    map_fd: c_int,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    origin: SessionOrigin,
+) {
+    for redirect_key in session_map_redirect_keys_for_session(key, decision, metadata, origin) {
+        delete_live_session_key(map_fd, &redirect_key);
+    }
+}
+
 pub(super) fn delete_session_map_entry_for_removed_session(
     map_fd: c_int,
     key: &SessionKey,
@@ -1102,20 +1147,11 @@ pub(super) fn delete_session_map_entry_for_removed_session_with_origin(
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
 ) {
+    delete_session_map_redirect_for_session(map_fd, key, decision, metadata, origin);
     if uses_kernel_local_session_map_entry(decision, metadata, origin) {
-        delete_live_session_key(map_fd, key);
-        // Also delete the reverse-wire alias published for SNATed
-        // kernel-local sessions (see publish_session_map_entry_for_session).
-        if decision.nat.rewrite_src.is_some() {
-            let reverse_wire = reverse_session_key(key, decision.nat);
-            if reverse_wire != *key {
-                delete_live_session_key(map_fd, &reverse_wire);
-            }
-        }
         delete_bpf_conntrack_entry(conntrack_v4_fd, conntrack_v6_fd, key);
         return;
     }
-    delete_live_session_entry(map_fd, key, decision.nat, metadata.is_reverse);
     delete_bpf_conntrack_entry(conntrack_v4_fd, conntrack_v6_fd, key);
 }
 
@@ -1206,6 +1242,96 @@ mod tests {
         assert_eq!(core::mem::size_of::<BpfSessionValueV4>(), 128);
         assert_eq!(core::mem::size_of::<BpfSessionKeyV6>(), 40);
         assert_eq!(core::mem::size_of::<BpfSessionValueV6>(), 176);
+    }
+
+    #[test]
+    fn session_map_redirect_keys_for_forward_session_include_nat_aliases() {
+        let key = SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 41086,
+            dst_port: 5201,
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 14,
+                tx_ifindex: 14,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                ..NatDecision::default()
+            },
+        };
+        let metadata = SessionMetadata {
+            ingress_zone: Arc::<str>::from("lan"),
+            egress_zone: Arc::<str>::from("wan"),
+            owner_rg_id: 1,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+        };
+
+        let keys = session_map_redirect_keys_for_session(
+            &key,
+            decision,
+            &metadata,
+            SessionOrigin::SharedPromote,
+        );
+
+        assert!(keys.contains(&key));
+        assert!(keys.contains(&forward_wire_key(&key, decision.nat)));
+        assert!(keys.contains(&reverse_session_key(&key, decision.nat)));
+        assert!(keys.contains(&reverse_canonical_key(&key, decision.nat)));
+    }
+
+    #[test]
+    fn session_map_redirect_keys_for_kernel_local_synced_session_skip_forward_aliases() {
+        let key = SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: 1,
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            src_port: 0,
+            dst_port: 0,
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::LocalDelivery,
+                local_ifindex: 14,
+                egress_ifindex: 14,
+                tx_ifindex: 14,
+                tunnel_endpoint_id: 0,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                ..NatDecision::default()
+            },
+        };
+        let metadata = synced_forward_metadata();
+
+        let keys = session_map_redirect_keys_for_session(
+            &key,
+            decision,
+            &metadata,
+            SessionOrigin::SyncImport,
+        );
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&key));
+        assert!(keys.contains(&reverse_session_key(&key, decision.nat)));
     }
 
     #[test]
