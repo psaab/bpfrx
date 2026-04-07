@@ -301,10 +301,17 @@ func (m *Manager) shouldExtendXSKLivenessIdleLocked(currentRX uint64, allBinding
 	if currentRX != 0 {
 		return false
 	}
+	if m.shouldAutoProveIdleStandbyXSKLocked(currentRX, allBindingsBound) {
+		return false
+	}
 	if allBindingsBound {
 		return true
 	}
 	return !m.hasActiveDataRGLocked()
+}
+
+func (m *Manager) shouldAutoProveIdleStandbyXSKLocked(currentRX uint64, allBindingsBound bool) bool {
+	return currentRX == 0 && allBindingsBound && !m.hasActiveDataRGLocked()
 }
 
 func (m *Manager) configHasDataRGLocked() bool {

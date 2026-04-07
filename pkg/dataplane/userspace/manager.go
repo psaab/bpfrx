@@ -2915,7 +2915,17 @@ func (m *Manager) applyHelperStatusLocked(status *ProcessStatus) error {
 					m.xskProbeStart = time.Now()
 					slog.Info("userspace: starting XSK liveness probe")
 				} else if time.Now().After(m.xskProbeStart.Add(10 * time.Second)) {
-					if m.shouldExtendXSKLivenessIdleLocked(currentRX, allBindingsBound) {
+					if m.shouldAutoProveIdleStandbyXSKLocked(currentRX, allBindingsBound) {
+						m.xskLivenessProven = true
+						m.xskProbeStart = time.Time{}
+						if m.inner.XDPEntryProg != "xdp_userspace_prog" {
+							if err := m.inner.SwapXDPEntryProg("xdp_userspace_prog"); err != nil {
+								slog.Warn("userspace: failed to restore XDP shim after idle standby liveness success", "err", err)
+							}
+						}
+						slog.Info("userspace: XSK liveness proven on idle standby")
+						goto ctrlReady
+					} else if m.shouldExtendXSKLivenessIdleLocked(currentRX, allBindingsBound) {
 						m.xskProbeStart = time.Now()
 						slog.Info("userspace: extending XSK liveness probe while idle")
 						goto ctrlReady
