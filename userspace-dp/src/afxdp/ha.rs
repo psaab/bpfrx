@@ -38,6 +38,13 @@ impl super::Coordinator {
         }
         self.ha_state.store(Arc::new(state));
         if !demoted_rgs.is_empty() {
+            for handle in self.workers.values() {
+                if let Ok(mut pending) = handle.commands.lock() {
+                    pending.push_back(WorkerCommand::DemoteOwnerRGS {
+                        owner_rgs: demoted_rgs.clone(),
+                    });
+                }
+            }
             demote_shared_owner_rgs(
                 &self.shared_sessions,
                 &self.shared_nat_sessions,
