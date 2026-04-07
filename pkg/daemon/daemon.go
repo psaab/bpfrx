@@ -69,48 +69,49 @@ const nodeIDFile = "/etc/bpfrx/node-id"
 
 // Daemon is the main bpfrx daemon.
 type Daemon struct {
-	opts               Options
-	store              *configstore.Store
-	dp                 dataplane.DataPlane
-	networkd           *networkd.Manager
-	routing            *routing.Manager
-	frr                *frr.Manager
-	ipsec              *ipsec.Manager
-	ra                 *ra.Manager
-	dhcp               *dhcp.Manager
-	dhcpServer         *dhcpserver.Manager
-	feeds              *feeds.Manager
-	rpm                *rpm.Manager
-	flowExporter       *flowexport.Exporter
-	flowCancel         context.CancelFunc
-	flowWg             sync.WaitGroup
-	ipfixExporter      *flowexport.IPFIXExporter
-	ipfixCancel        context.CancelFunc
-	ipfixWg            sync.WaitGroup
-	dhcpRelay          *dhcprelay.Manager
-	snmpAgent          *snmp.Agent
-	lldpMgr            *lldp.Manager
-	scheduler          *scheduler.Scheduler
-	cluster            *cluster.Manager
-	sessionSync        *cluster.SessionSync
-	syncBulkPrimed     atomic.Bool
-	syncPeerBulkPrimed atomic.Bool
-	syncPeerConnected  atomic.Bool
-	hbSuppressStart    atomic.Int64 // UnixNano of first heartbeat suppression; 0 = inactive
-	syncPrimeRetryGen  atomic.Uint64
-	syncReadyTimerGen  atomic.Uint64
-	syncReadyTimerMu   sync.Mutex
-	syncReadyTimer     *time.Timer
-	syncReadyTimeout   time.Duration
-	slogHandler        *logging.SyslogSlogHandler
-	traceWriter        *logging.TraceWriter
-	eventReader        *logging.EventReader
-	eventEngine        *eventengine.Engine
-	aggregator         *logging.SessionAggregator
-	aggCancel          context.CancelFunc
-	vrrpMgr            *vrrp.Manager
-	gc                 *conntrack.GC
-	startTime          time.Time // daemon start time; used to suppress stale config sync
+	opts                       Options
+	store                      *configstore.Store
+	dp                         dataplane.DataPlane
+	networkd                   *networkd.Manager
+	routing                    *routing.Manager
+	frr                        *frr.Manager
+	ipsec                      *ipsec.Manager
+	ra                         *ra.Manager
+	dhcp                       *dhcp.Manager
+	dhcpServer                 *dhcpserver.Manager
+	feeds                      *feeds.Manager
+	rpm                        *rpm.Manager
+	flowExporter               *flowexport.Exporter
+	flowCancel                 context.CancelFunc
+	flowWg                     sync.WaitGroup
+	ipfixExporter              *flowexport.IPFIXExporter
+	ipfixCancel                context.CancelFunc
+	ipfixWg                    sync.WaitGroup
+	dhcpRelay                  *dhcprelay.Manager
+	snmpAgent                  *snmp.Agent
+	lldpMgr                    *lldp.Manager
+	scheduler                  *scheduler.Scheduler
+	cluster                    *cluster.Manager
+	sessionSync                *cluster.SessionSync
+	syncBulkPrimed             atomic.Bool
+	syncPeerBulkPrimed         atomic.Bool
+	syncPeerConnected          atomic.Bool
+	lastStandbyNeighborRefresh atomic.Int64
+	hbSuppressStart            atomic.Int64 // UnixNano of first heartbeat suppression; 0 = inactive
+	syncPrimeRetryGen          atomic.Uint64
+	syncReadyTimerGen          atomic.Uint64
+	syncReadyTimerMu           sync.Mutex
+	syncReadyTimer             *time.Timer
+	syncReadyTimeout           time.Duration
+	slogHandler                *logging.SyslogSlogHandler
+	traceWriter                *logging.TraceWriter
+	eventReader                *logging.EventReader
+	eventEngine                *eventengine.Engine
+	aggregator                 *logging.SessionAggregator
+	aggCancel                  context.CancelFunc
+	vrrpMgr                    *vrrp.Manager
+	gc                         *conntrack.GC
+	startTime                  time.Time // daemon start time; used to suppress stale config sync
 
 	// mgmtVRFInterfaces tracks interfaces bound to the management VRF (vrf-mgmt).
 	// Used by collectDHCPRoutes to exclude management routes from FRR.
@@ -237,6 +238,34 @@ type Daemon struct {
 	// not rerun the same barrier sequence immediately afterward.
 	userspaceDemotionPrepMu    sync.Mutex
 	userspaceDemotionPrepUntil map[int]time.Time
+}
+
+const standbyNeighborRefreshMinInterval = time.Second
+
+func (d *Daemon) shouldScheduleStandbyNeighborRefresh(now time.Time) bool {
+	nowUnix := now.UnixNano()
+	last := d.lastStandbyNeighborRefresh.Load()
+	if last != 0 && nowUnix-last < int64(standbyNeighborRefreshMinInterval) {
+		return false
+	}
+	return d.lastStandbyNeighborRefresh.CompareAndSwap(last, nowUnix)
+}
+
+func (d *Daemon) scheduleStandbyNeighborRefresh() {
+	if d.cluster == nil || d.dp == nil {
+		return
+	}
+	if !d.shouldScheduleStandbyNeighborRefresh(time.Now()) {
+		return
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	go func(cfg *config.Config) {
+		d.resolveNeighborsInner(cfg, false)
+		d.maintainClusterNeighborReadiness()
+	}(cfg)
 }
 
 // New creates a new Daemon.

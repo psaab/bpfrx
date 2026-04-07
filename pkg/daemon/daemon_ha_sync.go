@@ -13,7 +13,6 @@ import (
 	"github.com/psaab/bpfrx/pkg/config"
 )
 
-
 func (d *Daemon) stopSyncReadyTimer() {
 	d.syncReadyTimerMu.Lock()
 	defer d.syncReadyTimerMu.Unlock()
@@ -586,6 +585,10 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			d.sessionSync.OnBulkSyncAckReceived = func() {
 				d.cluster.RecordEvent(cluster.EventColdSync, -1, "Bulk sync acknowledged by peer")
 				d.onSessionSyncBulkAckReceived()
+			}
+
+			d.sessionSync.OnForwardSessionInstalled = func() {
+				d.scheduleStandbyNeighborRefresh()
 			}
 
 			// Wire bulk sync override: use event stream export (fast path)
