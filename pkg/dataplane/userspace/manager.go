@@ -93,6 +93,8 @@ type Manager struct {
 	lastXSKRX               uint64
 	lastNAPIBootstrap       time.Time
 	lastStandbyNeighResolve time.Time
+	bindingsBusySince       time.Time
+	lastBindingsAutoRebind  time.Time
 	publishedSnapshot       uint64
 	publishedPlanKey        string
 	sessionMirrorFailed     bool
@@ -3782,6 +3784,83 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 	return repaired > 0
 }
 
+func (m *Manager) hasBusyBindingsWedgeLocked(repaired bool) bool {
+	if m.proc == nil || m.proc.Process == nil {
+		return false
+	}
+	if !m.lastStatus.ForwardingArmed || m.deferWorkers {
+		return false
+	}
+	if m.xskLivenessProven || m.xskLivenessFailed {
+		return false
+	}
+	bindings := m.lastStatus.Bindings
+	if len(bindings) == 0 {
+		return false
+	}
+	registeredArmed := 0
+	bound := 0
+	ready := 0
+	busyErr := false
+	for _, binding := range bindings {
+		if binding.Registered && binding.Armed {
+			registeredArmed++
+		}
+		if binding.Bound {
+			bound++
+		}
+		if binding.Ready {
+			ready++
+		}
+		if strings.Contains(strings.ToLower(binding.LastError), "resource busy") {
+			busyErr = true
+		}
+	}
+	return registeredArmed > 0 && bound == 0 && ready == 0 && (busyErr || repaired)
+}
+
+func (m *Manager) shouldAutoRebindBusyBindingsLocked(now time.Time, repaired bool) bool {
+	if !m.hasBusyBindingsWedgeLocked(repaired) {
+		m.bindingsBusySince = time.Time{}
+		return false
+	}
+	if m.bindingsBusySince.IsZero() {
+		m.bindingsBusySince = now
+		return false
+	}
+	if now.Sub(m.bindingsBusySince) < 5*time.Second {
+		return false
+	}
+	if !m.lastBindingsAutoRebind.IsZero() && now.Sub(m.lastBindingsAutoRebind) < 15*time.Second {
+		return false
+	}
+	m.lastBindingsAutoRebind = now
+	return true
+}
+
+func (m *Manager) maybeAutoRebindBusyBindingsLocked(now time.Time, repaired bool) {
+	if !m.shouldAutoRebindBusyBindingsLocked(now, repaired) {
+		return
+	}
+	var status ProcessStatus
+	m.neighborsPrewarmed = false
+	m.xskLivenessProven = false
+	m.xskLivenessFailed = false
+	m.xskProbeStart = time.Time{}
+	m.lastXSKRX = 0
+	if err := m.requestLocked(ControlRequest{Type: "rebind"}, &status); err != nil {
+		slog.Warn("userspace: auto-rebind for stuck XSK bindings failed", "err", err)
+		return
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		slog.Warn("userspace: auto-rebind status sync failed", "err", err)
+	}
+	slog.Warn("userspace: auto-rebind initiated for stuck XSK bindings",
+		"bindings", len(status.Bindings),
+		"forwarding_armed", status.ForwardingArmed)
+	m.bootstrapNAPIQueuesAsyncLocked("busy-xsk-wedge")
+}
+
 type userspaceLocalV6Key struct {
 	Addr [16]byte
 }
@@ -4122,7 +4201,8 @@ func (m *Manager) statusLoop(ctx context.Context) {
 					// the helper's reported state. Only run after a successful
 					// status update — stale m.lastStatus could cause incorrect
 					// repairs.
-					m.verifyBindingsMapLocked()
+					repaired := m.verifyBindingsMapLocked()
+					m.maybeAutoRebindBusyBindingsLocked(time.Now(), repaired)
 				}
 				if m.lastSnapshot != nil && m.publishedSnapshot < m.lastSnapshot.Generation {
 					if err := m.syncSnapshotLocked(); err != nil {

@@ -1646,6 +1646,64 @@ func TestShouldAutoProveIdleStandbyXSKLocked(t *testing.T) {
 	}
 }
 
+func TestHasBusyBindingsWedgeLocked(t *testing.T) {
+	m := &Manager{
+		proc: &exec.Cmd{Process: &os.Process{Pid: 1}},
+		lastStatus: ProcessStatus{
+			ForwardingArmed: true,
+			Bindings: []BindingStatus{
+				{
+					Registered: true,
+					Armed:      true,
+					Ready:      false,
+					Bound:      false,
+					LastError:  "libxdp xsk_socket__create_shared: Device or resource busy",
+				},
+			},
+		},
+	}
+	if !m.hasBusyBindingsWedgeLocked(false) {
+		t.Fatal("hasBusyBindingsWedgeLocked(false) = false, want true for busy unbound wedge")
+	}
+	m.lastStatus.Bindings[0].Bound = true
+	if m.hasBusyBindingsWedgeLocked(false) {
+		t.Fatal("hasBusyBindingsWedgeLocked(false) = true, want false once any binding is bound")
+	}
+}
+
+func TestShouldAutoRebindBusyBindingsLockedDebounces(t *testing.T) {
+	now := time.Now()
+	m := &Manager{
+		proc: &exec.Cmd{Process: &os.Process{Pid: 1}},
+		lastStatus: ProcessStatus{
+			ForwardingArmed: true,
+			Bindings: []BindingStatus{
+				{
+					Registered: true,
+					Armed:      true,
+					LastError:  "Device or resource busy",
+				},
+			},
+		},
+	}
+	if m.shouldAutoRebindBusyBindingsLocked(now, false) {
+		t.Fatal("first shouldAutoRebindBusyBindingsLocked() = true, want false while starting debounce")
+	}
+	if m.shouldAutoRebindBusyBindingsLocked(now.Add(4*time.Second), false) {
+		t.Fatal("shouldAutoRebindBusyBindingsLocked() = true before busy debounce window elapsed")
+	}
+	if !m.shouldAutoRebindBusyBindingsLocked(now.Add(6*time.Second), false) {
+		t.Fatal("shouldAutoRebindBusyBindingsLocked() = false, want true after busy debounce window")
+	}
+	if m.shouldAutoRebindBusyBindingsLocked(now.Add(10*time.Second), false) {
+		t.Fatal("shouldAutoRebindBusyBindingsLocked() = true, want false during rebind throttle")
+	}
+	m.lastStatus.Bindings[0].Bound = true
+	if m.shouldAutoRebindBusyBindingsLocked(now.Add(30*time.Second), false) {
+		t.Fatal("shouldAutoRebindBusyBindingsLocked() = true, want false once wedge clears")
+	}
+}
+
 func TestDesiredForwardingArmedDefaultsOnStandalone(t *testing.T) {
 	m := &Manager{
 		clusterHA: false,
