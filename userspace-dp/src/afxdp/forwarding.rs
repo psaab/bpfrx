@@ -470,6 +470,30 @@ pub(super) fn cached_flow_decision_valid(
     enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, resolution) == resolution
 }
 
+pub(super) fn finalize_new_flow_ha_resolution(
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    now_secs: u64,
+    resolution: ForwardingResolution,
+    ingress_ifindex: i32,
+    ingress_zone: &str,
+    ha_startup_grace_until_secs: u64,
+) -> ForwardingResolution {
+    super::session_glue::redirect_session_via_fabric_if_needed(
+        forwarding,
+        super::session_glue::enforce_session_ha_resolution(
+            forwarding,
+            ha_state,
+            now_secs,
+            resolution,
+            ingress_ifindex,
+            ha_startup_grace_until_secs,
+        ),
+        ingress_ifindex,
+        ingress_zone,
+    )
+}
+
 pub(super) fn demoted_owner_rgs(
     previous: &BTreeMap<i32, HAGroupRuntime>,
     current: &BTreeMap<i32, HAGroupRuntime>,
@@ -2015,19 +2039,19 @@ mod tests {
     #[test]
     fn new_flow_to_inactive_owner_rg_uses_zone_encoded_fabric_redirect() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
-        let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
-            1,
-            inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
-        )])));
-        let blocked = enforce_ha_resolution(
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
+        let routed = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        let (from_zone, _) = zone_pair_for_flow(&state, 24, routed.egress_ifindex);
+        let redirected = finalize_new_flow_ha_resolution(
             &state,
             &ha_state,
-            lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            now_secs,
+            routed,
+            24,
+            &from_zone,
+            0,
         );
-        assert_eq!(blocked.disposition, ForwardingDisposition::HAInactive);
-        let (from_zone, _) = zone_pair_for_flow(&state, 24, blocked.egress_ifindex);
-        let redirected =
-            resolve_zone_encoded_fabric_redirect(&state, &from_zone).expect("fabric redirect");
         assert_eq!(
             redirected.disposition,
             ForwardingDisposition::FabricRedirect
@@ -2036,6 +2060,28 @@ mod tests {
             redirected.src_mac,
             Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01])
         );
+    }
+
+    #[test]
+    fn new_flow_from_fabric_keeps_forward_candidate_when_owner_rg_inactive() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
+        let routed = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        let resolved = finalize_new_flow_ha_resolution(
+            &state,
+            &ha_state,
+            now_secs,
+            routed,
+            21,
+            "lan",
+            0,
+        );
+        assert_eq!(
+            resolved.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(resolved.egress_ifindex, routed.egress_ifindex);
     }
 
     #[test]

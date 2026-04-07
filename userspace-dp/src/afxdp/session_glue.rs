@@ -926,7 +926,7 @@ pub(super) fn resolve_flow_session_decision(
     })
 }
 
-fn redirect_session_via_fabric_if_needed(
+pub(super) fn redirect_session_via_fabric_if_needed(
     forwarding: &ForwardingState,
     resolution: ForwardingResolution,
     ingress_ifindex: i32,
@@ -943,7 +943,7 @@ fn redirect_session_via_fabric_if_needed(
         .unwrap_or(resolution)
 }
 
-fn enforce_session_ha_resolution(
+pub(super) fn enforce_session_ha_resolution(
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     now_secs: u64,

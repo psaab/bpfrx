@@ -2952,6 +2952,15 @@ fn poll_binding(
                             );
                             let from_zone_arc = Arc::<str>::from(from_zone.as_str());
                             let to_zone_arc = Arc::<str>::from(to_zone.as_str());
+                            decision.resolution = finalize_new_flow_ha_resolution(
+                                forwarding,
+                                ha_state,
+                                now_secs,
+                                decision.resolution,
+                                meta.ingress_ifindex as i32,
+                                from_zone_arc.as_ref(),
+                                ha_startup_grace_until_secs,
+                            );
                             // Always log trust/lan traffic (iperf3) regardless of throttle
                             let is_trust_flow = meta.ingress_ifindex == 5
                                 || from_zone == "lan"
@@ -3221,10 +3230,11 @@ fn poll_binding(
                                 // Permit without policy check or session install.
                                 // If NAT reversal was applied, the prebuilt frame
                                 // is already queued. If not, fall through to slow-path.
-                            } else if resolution.disposition
+                            } else if decision.resolution.disposition
                                 == ForwardingDisposition::ForwardCandidate
                             {
-                                let owner_rg_id = owner_rg_for_resolution(forwarding, resolution);
+                                let owner_rg_id =
+                                    owner_rg_for_resolution(forwarding, decision.resolution);
                                 if allow_unsolicited_dns_reply(forwarding, flow) {
                                     // Match the XDP fast path: unsolicited DNS replies bypass
                                     // policy/session install when the flow knob is enabled.
@@ -3292,10 +3302,10 @@ fn poll_binding(
                                                         forwarding,
                                                         &from_zone,
                                                         &to_zone,
-                                                        resolution.egress_ifindex,
-                                                        flow,
-                                                    )
-                                                })
+                                                    decision.resolution.egress_ifindex,
+                                                    flow,
+                                                )
+                                            })
                                                 .unwrap_or_default();
                                         } else {
                                             let snat_decision = forwarding
@@ -3306,7 +3316,7 @@ fn poll_binding(
                                                         forwarding,
                                                         &from_zone,
                                                         &to_zone,
-                                                        resolution.egress_ifindex,
+                                                        decision.resolution.egress_ifindex,
                                                         flow,
                                                     )
                                                 })
@@ -3608,7 +3618,8 @@ fn poll_binding(
                                     decision.resolution.disposition =
                                         ForwardingDisposition::PolicyDenied;
                                 }
-                            } else if resolution.disposition == ForwardingDisposition::HAInactive
+                            } else if decision.resolution.disposition
+                                == ForwardingDisposition::HAInactive
                                 && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
                             {
                                 // New flow to inactive RG: fabric-redirect to the peer
