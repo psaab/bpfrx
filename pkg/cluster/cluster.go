@@ -176,6 +176,12 @@ type Manager struct {
 	// transferReadinessFn reports whether explicit manual failover can be
 	// attempted for the local RG right now and, if not, why.
 	transferReadinessFn func(rgID int) (bool, []string)
+	// localTransferCommitReadyFn runs on the requesting node after local
+	// ownership has been committed but before the final peer-demotion
+	// commit is sent. The daemon uses this to ensure the target node has
+	// actually applied its local failover side effects before the old
+	// owner is told to stand down.
+	localTransferCommitReadyFn func(rgIDs []int) error
 	// Retry policy for transient pre-failover prepare failures.
 	preManualFailoverRetryTimeout  time.Duration
 	preManualFailoverRetryInterval time.Duration
@@ -796,6 +802,15 @@ func (m *Manager) SetTransferReadinessFunc(fn func(rgID int) (bool, []string)) {
 	m.transferReadinessFn = fn
 }
 
+// SetLocalTransferCommitReadyHook registers a callback that runs on the
+// requesting node after local ownership is committed and before the final
+// peer-demotion commit is sent.
+func (m *Manager) SetLocalTransferCommitReadyHook(fn func(rgIDs []int) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.localTransferCommitReadyFn = fn
+}
+
 // SetPeerFailoverFunc sets the callback used to send remote failover requests
 // to the peer via the fabric sync connection.
 func (m *Manager) SetPeerFailoverFunc(fn func(rgID int) (uint64, error)) {
@@ -889,6 +904,7 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 	fn := m.peerFailoverFn
 	commitFn := m.peerFailoverCommitFn
 	transferReadyFn := m.transferReadinessFn
+	localCommitReadyFn := m.localTransferCommitReadyFn
 	m.mu.Unlock()
 
 	if fn == nil {
@@ -928,6 +944,12 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 	m.mu.Unlock()
 	if err := m.commitRequestedPeerFailover(rgID, reqID); err != nil {
 		return err
+	}
+	if localCommitReadyFn != nil {
+		if err := localCommitReadyFn([]int{rgID}); err != nil {
+			m.abortRequestedPeerFailover(rgID, reqID)
+			return err
+		}
 	}
 	if err := commitFn(rgID, reqID); err != nil {
 		m.abortRequestedPeerFailover(rgID, reqID)

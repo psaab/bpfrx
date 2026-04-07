@@ -427,8 +427,13 @@ pub(super) fn enforce_ha_resolution_snapshot(
 ) -> ForwardingResolution {
     if !matches!(
         resolution.disposition,
-        ForwardingDisposition::ForwardCandidate | ForwardingDisposition::MissingNeighbor
+        ForwardingDisposition::ForwardCandidate
+            | ForwardingDisposition::MissingNeighbor
+            | ForwardingDisposition::LocalDelivery
     ) {
+        return resolution;
+    }
+    if resolution.disposition == ForwardingDisposition::LocalDelivery && ha_state.is_empty() {
         return resolution;
     }
     let owner_rg_id = owner_rg_for_resolution(forwarding, resolution);
@@ -438,7 +443,10 @@ pub(super) fn enforce_ha_resolution_snapshot(
         // Treat as invalid (force re-resolution through the slow path) rather
         // than "always active" which would let stale cached entries bypass
         // HA checks after RG failover.
-        if !ha_state.is_empty() && resolution.egress_ifindex > 0 {
+        if resolution.disposition != ForwardingDisposition::LocalDelivery
+            && !ha_state.is_empty()
+            && resolution.egress_ifindex > 0
+        {
             return ForwardingResolution {
                 disposition: ForwardingDisposition::HAInactive,
                 ..resolution
@@ -1655,6 +1663,23 @@ mod tests {
     }
 
     #[test]
+    fn cached_local_delivery_decision_invalidates_when_owner_rg_is_demoted() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let active = BTreeMap::from([(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
+        let demoted = BTreeMap::from([(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
+        let resolution = interface_nat_local_resolution(&state, "172.16.80.8".parse().expect("v4"))
+            .expect("interface nat local delivery");
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+
+        assert!(cached_flow_decision_valid(
+            &state, &active, now_secs, resolution
+        ));
+        assert!(!cached_flow_decision_valid(
+            &state, &demoted, now_secs, resolution
+        ));
+    }
+
+    #[test]
     fn inactive_owner_rg_redirects_established_session_to_fabric() {
         let state = build_forwarding_state(&nat_snapshot_with_fabric());
         let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
@@ -2305,6 +2330,29 @@ mod tests {
     }
 
     #[test]
+    fn reverse_session_blocks_inactive_interface_snat_ipv4_local_delivery() {
+        let state = build_forwarding_state(&nat_snapshot());
+        let ha_state =
+            BTreeMap::from([(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+
+        let resolved = reverse_resolution_for_session(
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            "wan",
+            false,
+            monotonic_nanos() / 1_000_000_000,
+            false,
+        );
+
+        assert_eq!(resolved.disposition, ForwardingDisposition::HAInactive);
+        assert_eq!(resolved.local_ifindex, 12);
+        assert_eq!(resolved.egress_ifindex, 12);
+    }
+
+    #[test]
     fn reverse_session_prefers_interface_snat_ipv6_local_delivery() {
         let state = build_forwarding_state(&nat_snapshot());
         let ha_state = BTreeMap::new();
@@ -2354,6 +2402,45 @@ mod tests {
 
         assert_eq!(resolved.disposition, ForwardingDisposition::LocalDelivery);
         assert_eq!(resolved.local_ifindex, 12);
+    }
+
+    #[test]
+    fn inactive_interface_snat_session_hit_redirects_to_fabric() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let ha_state = Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
+            1,
+            inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
+        )])));
+        let flow = SessionFlow {
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+                src_port: 5201,
+                dst_port: 43600,
+            },
+        };
+        let decision = SessionDecision {
+            resolution: interface_nat_local_resolution(&state, flow.dst_ip)
+                .expect("interface nat local delivery"),
+            nat: NatDecision::default(),
+        };
+
+        let looked_up =
+            lookup_forwarding_resolution_for_session(&state, &dynamic_neighbors, &flow, decision);
+        let blocked = enforce_ha_resolution(&state, &ha_state, looked_up);
+        let redirected = redirect_via_fabric_if_needed(&state, blocked, 12);
+
+        assert_eq!(
+            redirected.disposition,
+            ForwardingDisposition::FabricRedirect
+        );
+        assert_eq!(redirected.egress_ifindex, 21);
+        assert_eq!(redirected.tx_ifindex, 21);
     }
 
     #[test]

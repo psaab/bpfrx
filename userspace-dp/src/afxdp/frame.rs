@@ -1103,10 +1103,8 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
                             _ => 0,
                         };
                         if csum_off > 0 && packet.len() > csum_off + 1 {
-                            let current = u16::from_be_bytes([
-                                packet[csum_off],
-                                packet[csum_off + 1],
-                            ]);
+                            let current =
+                                u16::from_be_bytes([packet[csum_off], packet[csum_off + 1]]);
                             let mut updated = checksum16_adjust(
                                 current,
                                 &ipv4_words(Ipv4Addr::from(pre_src_ip)),
@@ -1118,18 +1116,12 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
                                 &ipv4_words(Ipv4Addr::from(post_dst_ip)),
                             );
                             if pre_src_port != post_src_port {
-                                updated = checksum16_adjust(
-                                    updated,
-                                    &[pre_src_port],
-                                    &[post_src_port],
-                                );
+                                updated =
+                                    checksum16_adjust(updated, &[pre_src_port], &[post_src_port]);
                             }
                             if pre_dst_port != post_dst_port {
-                                updated = checksum16_adjust(
-                                    updated,
-                                    &[pre_dst_port],
-                                    &[post_dst_port],
-                                );
+                                updated =
+                                    checksum16_adjust(updated, &[pre_dst_port], &[post_dst_port]);
                             }
                             if matches!(meta.protocol, PROTO_UDP) && updated == 0 {
                                 updated = 0xffff;
@@ -1142,12 +1134,7 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
                 } else {
                     // Full L4 checksum recompute when enforce_expected_ports
                     // may have modified ports and adjusted the checksum.
-                    recompute_l4_checksum_ipv4(
-                        packet,
-                        ip_header_len,
-                        meta.protocol,
-                        false,
-                    )?;
+                    recompute_l4_checksum_ipv4(packet, ip_header_len, meta.protocol, false)?;
                 }
             }
             libc::AF_INET6 => {

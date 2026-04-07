@@ -456,15 +456,15 @@ pub(super) fn reverse_resolution_for_session(
     now_secs: u64,
     allow_unseeded_tunnel_local: bool,
 ) -> ForwardingResolution {
-    if let Some(local) = super::interface_nat_local_resolution(forwarding, target_ip) {
-        return local;
-    }
     let resolved =
-        lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip);
+        super::interface_nat_local_resolution(forwarding, target_ip).unwrap_or_else(|| {
+            lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip)
+        });
+    let owner_rg_id = owner_rg_for_resolution(forwarding, resolved);
     if fabric_ingress
-        && owner_rg_for_resolution(forwarding, resolved) > 0
+        && owner_rg_id > 0
         && !matches!(
-            ha_state.get(&owner_rg_for_resolution(forwarding, resolved)),
+            ha_state.get(&owner_rg_id),
             Some(group) if group.is_forwarding_active(now_secs)
         )
         && let Some(redirect) = resolve_zone_encoded_fabric_redirect(forwarding, ingress_zone)

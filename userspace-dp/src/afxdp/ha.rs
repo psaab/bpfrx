@@ -55,6 +55,13 @@ impl super::Coordinator {
             }
             // Record cache flush timestamp for observability (#312).
             self.last_cache_flush_at.store(now_secs, Ordering::Relaxed);
+            for handle in self.workers.values() {
+                if let Ok(mut pending) = handle.commands.lock() {
+                    pending.push_back(WorkerCommand::DemoteOwnerRGSessions {
+                        owner_rgs: demoted_rgs.clone(),
+                    });
+                }
+            }
         }
         if !activated_rgs.is_empty() {
             eprintln!(

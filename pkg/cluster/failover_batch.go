@@ -185,6 +185,7 @@ func (m *Manager) RequestPeerFailoverBatch(rgIDs []int) error {
 	fn := m.peerFailoverBatchFn
 	commitFn := m.peerFailoverCommitBatchFn
 	transferReadyFn := m.transferReadinessFn
+	localCommitReadyFn := m.localTransferCommitReadyFn
 	m.mu.Unlock()
 
 	if fn == nil {
@@ -225,6 +226,12 @@ func (m *Manager) RequestPeerFailoverBatch(rgIDs []int) error {
 	if err := m.commitRequestedPeerFailoverBatch(ids, reqID); err != nil {
 		m.abortRequestedPeerFailoverBatch(ids, reqID)
 		return err
+	}
+	if localCommitReadyFn != nil {
+		if err := localCommitReadyFn(ids); err != nil {
+			m.abortRequestedPeerFailoverBatch(ids, reqID)
+			return err
+		}
 	}
 	if err := commitFn(ids, reqID); err != nil {
 		m.abortRequestedPeerFailoverBatch(ids, reqID)

@@ -11,7 +11,7 @@
 
 pub(crate) mod codec;
 
-pub(crate) use codec::{close_flags, EventFrame};
+pub(crate) use codec::{EventFrame, close_flags};
 
 use crate::session::{SessionDelta, SessionDeltaKind};
 use codec::{FRAME_HEADER_SIZE, MSG_ACK, MSG_DRAIN_REQUEST, MSG_KEEPALIVE, MSG_PAUSE, MSG_RESUME};
@@ -19,9 +19,9 @@ use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::io;
 use std::os::unix::net::UnixStream;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 

@@ -633,6 +633,103 @@ func TestRequestPeerFailoverBatchCommitsLocalPrimaryTogether(t *testing.T) {
 	}
 }
 
+func TestRequestPeerFailoverWaitsForLocalCommitReadyHookBeforePeerCommit(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+	m.mu.Lock()
+	m.groups[0].Ready = true
+	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+	m.groups[0].ReadinessReasons = nil
+	m.mu.Unlock()
+
+	var order []string
+	m.SetPeerFailoverFunc(func(rgID int) (uint64, error) {
+		return 77, nil
+	})
+	m.SetLocalTransferCommitReadyHook(func(rgIDs []int) error {
+		order = append(order, "ready")
+		if len(rgIDs) != 1 || rgIDs[0] != 0 {
+			t.Fatalf("local commit ready rgIDs = %v, want [0]", rgIDs)
+		}
+		if !m.IsLocalPrimary(0) {
+			t.Fatal("local node should already be primary before local commit ready hook runs")
+		}
+		return nil
+	})
+	m.SetPeerFailoverCommitFunc(func(rgID int, reqID uint64) error {
+		order = append(order, "commit")
+		return nil
+	})
+
+	if err := m.RequestPeerFailover(0); err != nil {
+		t.Fatalf("RequestPeerFailover() error = %v", err)
+	}
+	if len(order) != 2 || order[0] != "ready" || order[1] != "commit" {
+		t.Fatalf("call order = %v, want [ready commit]", order)
+	}
+}
+
+func TestRequestPeerFailoverBatchAbortsWhenLocalCommitReadyHookFails(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(1, true, map[int]int{0: 100}),
+		makeRG(2, true, map[int]int{0: 100}),
+	)
+	m.UpdateConfig(cfg)
+	<-m.Events()
+	<-m.Events()
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 1, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+			{GroupID: 2, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+	m.mu.Lock()
+	for _, rgID := range []int{1, 2} {
+		m.groups[rgID].Ready = true
+		m.groups[rgID].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+		m.groups[rgID].ReadinessReasons = nil
+	}
+	m.mu.Unlock()
+
+	m.SetPeerFailoverBatchFunc(func(rgIDs []int) (uint64, error) {
+		return 88, nil
+	})
+	m.SetLocalTransferCommitReadyHook(func(rgIDs []int) error {
+		return fmt.Errorf("local activation not settled")
+	})
+	m.SetPeerFailoverCommitBatchFunc(func(rgIDs []int, reqID uint64) error {
+		t.Fatal("peer failover batch commit should not run when local commit ready hook fails")
+		return nil
+	})
+
+	err := m.RequestPeerFailoverBatch([]int{1, 2})
+	if err == nil {
+		t.Fatal("expected local commit ready error")
+	}
+	if !strings.Contains(err.Error(), "local activation not settled") {
+		t.Fatalf("RequestPeerFailoverBatch() error = %v", err)
+	}
+	for _, rgID := range []int{1, 2} {
+		if peer := m.PeerGroupStates()[rgID]; peer.State != StateSecondaryHold {
+			t.Fatalf("peer state for rg %d = %s, want secondary-hold after local commit ready abort", rgID, peer.State)
+		}
+	}
+}
+
 func TestRequestPeerFailoverRequiresLocalReadiness(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))

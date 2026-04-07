@@ -56,6 +56,61 @@ func (d *Daemon) armSyncReadyTimer() {
 	})
 }
 
+func (d *Daemon) setLocalFailoverCommitReady(rgID int, ready bool) {
+	d.localFailoverCommitMu.Lock()
+	defer d.localFailoverCommitMu.Unlock()
+	if d.localFailoverCommitReady == nil {
+		d.localFailoverCommitReady = make(map[int]bool)
+	}
+	d.localFailoverCommitReady[rgID] = ready
+}
+
+func (d *Daemon) localFailoverCommitIsReady(rgID int) bool {
+	d.localFailoverCommitMu.Lock()
+	defer d.localFailoverCommitMu.Unlock()
+	if d.localFailoverCommitReady == nil {
+		return false
+	}
+	return d.localFailoverCommitReady[rgID]
+}
+
+func (d *Daemon) waitLocalFailoverCommitReady(rgIDs []int) error {
+	if len(rgIDs) == 0 {
+		return nil
+	}
+	timeout := d.localFailoverCommitTimeout
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	delay := d.localFailoverCommitDelay
+	deadline := time.Now().Add(timeout)
+	dwelled := false
+	for {
+		ready := true
+		for _, rgID := range rgIDs {
+			if d.cluster != nil && !d.cluster.IsLocalPrimary(rgID) {
+				return fmt.Errorf("local redundancy group %d lost primary before peer demotion commit", rgID)
+			}
+			if !d.localFailoverCommitIsReady(rgID) {
+				ready = false
+				break
+			}
+		}
+		if ready {
+			if !dwelled && delay > 0 {
+				dwelled = true
+				time.Sleep(delay)
+				continue
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for local failover activation settle for redundancy groups %v", rgIDs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func (d *Daemon) onSessionSyncPeerConnected() {
 	d.syncPeerConnected.Store(true)
 	d.hbSuppressStart.Store(0) // fresh connection → reset suppression cap
@@ -1536,6 +1591,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			d.cluster.SetPeerFailoverCommitBatchFunc(d.sessionSync.SendFailoverCommitBatch)
 			d.cluster.SetPreManualFailoverHook(d.prepareUserspaceManualFailover)
 			d.cluster.SetTransferReadinessFunc(d.userspaceTransferReadiness)
+			d.cluster.SetLocalTransferCommitReadyHook(d.waitLocalFailoverCommitReady)
 			d.cluster.SetPeerTimeoutGuard(d.shouldSuppressPeerHeartbeatTimeout)
 
 			// Wire peer fencing: on heartbeat timeout, cluster sends
@@ -2605,6 +2661,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 			//   add blackholes, then clear rg_active (#485)
 			isPrimary := ev.NewState == cluster.StatePrimary
 			clusterDemotionEdge := ev.OldState == cluster.StatePrimary && !isPrimary
+			d.setLocalFailoverCommitReady(ev.GroupID, false)
 			s := d.getOrCreateRGState(ev.GroupID)
 			tr := s.SetCluster(isPrimary)
 			if isPrimary {
@@ -2651,6 +2708,9 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				if noRethVRRP {
 					d.reconcileDirectVIPOwnership(ev.GroupID, "cluster-primary")
 					go d.RefreshFabricFwd()
+				}
+				if noRethVRRP && (d.dp == nil || !s.NeedsApply()) {
+					d.setLocalFailoverCommitReady(ev.GroupID, true)
 				}
 			} else {
 				// Demotion: run preflight and resign VRRP BEFORE
@@ -2814,10 +2874,16 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					d.addStableRethLinkLocal(rgID)
 					d.applyRethServicesForRG(rgID)
 				}
+				if d.cluster != nil && d.cluster.IsLocalPrimary(rgID) && s.AllVRRPMaster() {
+					d.setLocalFailoverCommitReady(rgID, true)
+				}
 			}
 			if ev.State == vrrp.StateBackup {
 				s := d.getOrCreateRGState(rgID)
 				tr := s.SetVRRP(ev.Interface, false)
+				if !s.AllVRRPMaster() {
+					d.setLocalFailoverCommitReady(rgID, false)
+				}
 				if tr.Changed && !tr.Active {
 					// Deactivation order: inject blackhole routes FIRST,
 					// then clear rg_active. Re-read desired state to
@@ -4014,8 +4080,20 @@ func (d *Daemon) scheduleDirectAnnounce(rgID int, reason string) {
 		sendFn = d.directSendGARPs
 	}
 	slog.Info("direct-mode re-announce scheduled", "rg", rgID, "reason", reason, "bursts", len(schedule))
+	start := time.Now()
+	burstOffset := 0
+	if len(schedule) > 0 && schedule[0] == 0 {
+		if d.directAnnounceActive(rgID, seq) {
+			sendFn(rgID)
+			slog.Info("direct-mode re-announce sent", "rg", rgID, "reason", reason, "burst", 1, "total", len(schedule))
+		}
+		schedule = schedule[1:]
+		burstOffset = 1
+	}
+	if len(schedule) == 0 {
+		return
+	}
 	go func() {
-		start := time.Now()
 		for idx, at := range schedule {
 			if wait := time.Until(start.Add(at)); wait > 0 {
 				timer := time.NewTimer(wait)
@@ -4025,7 +4103,7 @@ func (d *Daemon) scheduleDirectAnnounce(rgID int, reason string) {
 				return
 			}
 			sendFn(rgID)
-			slog.Info("direct-mode re-announce sent", "rg", rgID, "reason", reason, "burst", idx+1, "total", len(schedule))
+			slog.Info("direct-mode re-announce sent", "rg", rgID, "reason", reason, "burst", idx+1+burstOffset, "total", len(schedule)+burstOffset)
 		}
 	}()
 }

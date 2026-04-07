@@ -4,7 +4,7 @@
 //! happens on a stack-allocated `[u8; 256]` buffer.
 
 use crate::afxdp::ForwardingDisposition;
-use crate::session::{SessionDelta, SessionDecision, SessionKey, SessionMetadata};
+use crate::session::{SessionDecision, SessionDelta, SessionKey, SessionMetadata};
 use rustc_hash::FxHashMap;
 use std::net::IpAddr;
 
@@ -86,18 +86,15 @@ impl EventFrame {
 
         // [6:8] NATSrcPort LE
         let nat = &decision.nat;
-        buf[pos..pos + 2]
-            .copy_from_slice(&nat.rewrite_src_port.unwrap_or(0).to_le_bytes());
+        buf[pos..pos + 2].copy_from_slice(&nat.rewrite_src_port.unwrap_or(0).to_le_bytes());
         pos += 2;
 
         // [8:10] NATDstPort LE
-        buf[pos..pos + 2]
-            .copy_from_slice(&nat.rewrite_dst_port.unwrap_or(0).to_le_bytes());
+        buf[pos..pos + 2].copy_from_slice(&nat.rewrite_dst_port.unwrap_or(0).to_le_bytes());
         pos += 2;
 
         // [10:12] OwnerRGID i16 LE
-        buf[pos..pos + 2]
-            .copy_from_slice(&(metadata.owner_rg_id as i16).to_le_bytes());
+        buf[pos..pos + 2].copy_from_slice(&(metadata.owner_rg_id as i16).to_le_bytes());
         pos += 2;
 
         // [12:14] EgressIfindex i16 LE
@@ -106,18 +103,15 @@ impl EventFrame {
         pos += 2;
 
         // [14:16] TXIfindex i16 LE
-        buf[pos..pos + 2]
-            .copy_from_slice(&(decision.resolution.tx_ifindex as i16).to_le_bytes());
+        buf[pos..pos + 2].copy_from_slice(&(decision.resolution.tx_ifindex as i16).to_le_bytes());
         pos += 2;
 
         // [16:18] TunnelEndpointID u16 LE
-        buf[pos..pos + 2]
-            .copy_from_slice(&decision.resolution.tunnel_endpoint_id.to_le_bytes());
+        buf[pos..pos + 2].copy_from_slice(&decision.resolution.tunnel_endpoint_id.to_le_bytes());
         pos += 2;
 
         // [18:20] TXVLANID u16 LE
-        buf[pos..pos + 2]
-            .copy_from_slice(&decision.resolution.tx_vlan_id.to_le_bytes());
+        buf[pos..pos + 2].copy_from_slice(&decision.resolution.tx_vlan_id.to_le_bytes());
         pos += 2;
 
         // [20] Flags
@@ -533,14 +527,23 @@ mod tests {
 
     #[test]
     fn test_disposition_encoding() {
-        assert_eq!(encode_disposition(ForwardingDisposition::ForwardCandidate), 0);
+        assert_eq!(
+            encode_disposition(ForwardingDisposition::ForwardCandidate),
+            0
+        );
         assert_eq!(encode_disposition(ForwardingDisposition::LocalDelivery), 1);
         assert_eq!(encode_disposition(ForwardingDisposition::FabricRedirect), 2);
         assert_eq!(encode_disposition(ForwardingDisposition::PolicyDenied), 3);
         assert_eq!(encode_disposition(ForwardingDisposition::NoRoute), 4);
-        assert_eq!(encode_disposition(ForwardingDisposition::MissingNeighbor), 5);
+        assert_eq!(
+            encode_disposition(ForwardingDisposition::MissingNeighbor),
+            5
+        );
         assert_eq!(encode_disposition(ForwardingDisposition::HAInactive), 6);
         assert_eq!(encode_disposition(ForwardingDisposition::DiscardRoute), 7);
-        assert_eq!(encode_disposition(ForwardingDisposition::NextTableUnsupported), 8);
+        assert_eq!(
+            encode_disposition(ForwardingDisposition::NextTableUnsupported),
+            8
+        );
     }
 }

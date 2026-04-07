@@ -549,6 +549,7 @@ pub(super) enum WorkerCommand {
     UpsertSynced(SyncedSessionEntry),
     UpsertLocal(SyncedSessionEntry),
     DeleteSynced(SessionKey),
+    DemoteOwnerRGSessions { owner_rgs: Vec<i32> },
     ExportOwnerRGSessions { sequence: u64, owner_rgs: Vec<i32> },
 }
 

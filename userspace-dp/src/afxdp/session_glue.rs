@@ -208,6 +208,38 @@ pub(super) struct WorkerCommandResults {
     pub exported_sequences: Vec<u64>,
 }
 
+fn force_live_redirect_for_worker_synced_entry(
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    origin: SessionOrigin,
+    standby_owner: bool,
+) -> bool {
+    standby_owner
+        && origin.is_peer_synced()
+        && !metadata.is_reverse
+        && decision.resolution.disposition == ForwardingDisposition::LocalDelivery
+        && decision.resolution.tunnel_endpoint_id == 0
+}
+
+fn publish_worker_session_map_entry(
+    session_map_fd: c_int,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    origin: SessionOrigin,
+    standby_owner: bool,
+) {
+    if session_map_fd < 0 {
+        return;
+    }
+    let _ =
+        if force_live_redirect_for_worker_synced_entry(decision, metadata, origin, standby_owner) {
+            publish_live_session_entry(session_map_fd, key, decision.nat, metadata.is_reverse)
+        } else {
+            publish_session_map_entry_for_session(session_map_fd, key, decision, metadata)
+        };
+}
+
 fn export_forward_sessions_for_owner_rgs(sessions: &mut SessionTable, owner_rgs: &[i32]) {
     if owner_rgs.is_empty() {
         return;
@@ -269,6 +301,28 @@ pub(super) fn apply_worker_commands(
     let mut exported_sequences = Vec::new();
     for cmd in pending {
         match cmd {
+            WorkerCommand::DemoteOwnerRGSessions { owner_rgs } => {
+                for owner_rg in owner_rgs {
+                    for key in sessions.demote_owner_rg(owner_rg) {
+                        let Some((decision, metadata, origin)) = sessions.entry_with_origin(&key)
+                        else {
+                            continue;
+                        };
+                        publish_worker_session_map_entry(
+                            session_map_fd,
+                            &key,
+                            decision,
+                            &metadata,
+                            origin,
+                            synced_entry_allows_local_replace(
+                                ha_state,
+                                metadata.owner_rg_id,
+                                now_secs,
+                            ),
+                        );
+                    }
+                }
+            }
             WorkerCommand::ExportOwnerRGSessions {
                 sequence,
                 owner_rgs,
@@ -336,11 +390,13 @@ pub(super) fn apply_worker_commands(
                     entry.tcp_flags,
                     allow_replace_local,
                 ) {
-                    let _ = publish_session_map_entry_for_session(
+                    publish_worker_session_map_entry(
                         session_map_fd,
                         &key,
                         entry.decision,
                         &metadata,
+                        entry.origin,
+                        allow_replace_local,
                     );
                 }
             }
@@ -1021,6 +1077,23 @@ mod tests {
     fn test_decision() -> SessionDecision {
         SessionDecision {
             resolution: test_resolution(),
+            nat: NatDecision::default(),
+        }
+    }
+
+    fn test_local_delivery_decision() -> SessionDecision {
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::LocalDelivery,
+                local_ifindex: 12,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
             nat: NatDecision::default(),
         }
     }
@@ -2183,6 +2256,26 @@ mod tests {
     }
 
     #[test]
+    fn worker_synced_local_delivery_forces_live_redirect_on_standby() {
+        assert!(force_live_redirect_for_worker_synced_entry(
+            test_local_delivery_decision(),
+            &test_metadata(),
+            SessionOrigin::SyncImport,
+            true,
+        ));
+    }
+
+    #[test]
+    fn worker_synced_local_delivery_keeps_default_publish_on_active_owner() {
+        assert!(!force_live_redirect_for_worker_synced_entry(
+            test_local_delivery_decision(),
+            &test_metadata(),
+            SessionOrigin::SyncImport,
+            false,
+        ));
+    }
+
+    #[test]
     fn apply_worker_commands_preserves_local_session_for_active_owner_rg() {
         let commands = Arc::new(Mutex::new(VecDeque::new()));
         let mut sessions = SessionTable::new();
@@ -2234,6 +2327,118 @@ mod tests {
         let hit = sessions.lookup(&key, 2_000_000, 0x10).expect("live hit");
         assert_eq!(hit.metadata, live_metadata);
         assert_eq!(hit.decision, live_decision);
+    }
+
+    #[test]
+    fn apply_worker_commands_demotes_local_owner_rg_sessions_to_sync_import() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        assert!(sessions.install_with_protocol(
+            key.clone(),
+            test_decision(),
+            test_metadata(),
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        commands
+            .lock()
+            .expect("commands lock")
+            .push_back(WorkerCommand::DemoteOwnerRGSessions { owner_rgs: vec![1] });
+        let forwarding = test_forwarding_state();
+        let ha_state = BTreeMap::from([(1, inactive_ha_runtime(0))]);
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+
+        apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+        );
+
+        let Some((_decision, _metadata, origin)) = sessions.entry_with_origin(&key) else {
+            panic!("demoted session missing");
+        };
+        assert_eq!(origin, SessionOrigin::SyncImport);
+    }
+
+    #[test]
+    fn demoted_local_session_promotes_as_synced_on_failback_lookup() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let decision = test_decision();
+        let metadata = test_metadata();
+        assert!(sessions.install_with_protocol(
+            key.clone(),
+            decision,
+            metadata.clone(),
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        commands
+            .lock()
+            .expect("commands lock")
+            .push_back(WorkerCommand::DemoteOwnerRGSessions { owner_rgs: vec![1] });
+        let forwarding = test_forwarding_state();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let inactive_state = BTreeMap::from([(1, inactive_ha_runtime(0))]);
+
+        apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &forwarding,
+            &inactive_state,
+            &dynamic_neighbors,
+        );
+
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = Vec::new();
+        let active_state = BTreeMap::from([(1, active_ha_runtime(1))]);
+        let flow = SessionFlow {
+            src_ip: key.src_ip,
+            dst_ip: key.dst_ip,
+            forward_key: key.clone(),
+        };
+
+        let resolved = resolve_flow_session_decision(
+            &mut sessions,
+            -1,
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &peer_worker_commands,
+            &forwarding,
+            &active_state,
+            &dynamic_neighbors,
+            &flow,
+            2_000_000,
+            2,
+            PROTO_TCP,
+            0x10,
+            6,
+            0,
+        )
+        .expect("resolved demoted session");
+
+        assert!(!resolved.created);
+        let Some((_decision, _metadata, origin)) = sessions.entry_with_origin(&key) else {
+            panic!("promoted session missing");
+        };
+        assert_eq!(origin, SessionOrigin::SharedPromote);
     }
 
     #[test]
