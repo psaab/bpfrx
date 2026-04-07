@@ -26,7 +26,6 @@ var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 
 // Sync message types.
 const (
-const (
 	syncMsgSessionV4              = 1
 	syncMsgSessionV6              = 2
 	syncMsgDeleteV4               = 3
@@ -51,7 +50,6 @@ const (
 	syncMsgFailoverBatchCommit    = 22 // multi-RG failover ownership commit
 	syncMsgFailoverBatchCommitAck = 23 // multi-RG failover commit result
 	syncMsgHeartbeatAck           = 24
-
 )
 
 // syncHeader is the wire header for each sync message.
