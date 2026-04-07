@@ -178,19 +178,22 @@ func (m *Manager) RequestPeerFailoverBatch(rgIDs []int) error {
 			)
 		}
 	}
-	if !m.peerAlive {
-		m.mu.Unlock()
-		return fmt.Errorf("peer not alive — cannot request failover")
-	}
 	fn := m.peerFailoverBatchFn
 	commitFn := m.peerFailoverCommitBatchFn
 	transferReadyFn := m.transferReadinessFn
+	peerAlive := m.peerAlive
 	m.mu.Unlock()
 
 	if fn == nil {
+		if !peerAlive {
+			return fmt.Errorf("peer not alive — cannot request failover")
+		}
 		return fmt.Errorf("peer batch failover not available (sync not connected)")
 	}
 	if commitFn == nil {
+		if !peerAlive {
+			return fmt.Errorf("peer not alive — cannot request failover")
+		}
 		return fmt.Errorf("peer batch failover commit not available (sync not connected)")
 	}
 	if transferReadyFn != nil {
