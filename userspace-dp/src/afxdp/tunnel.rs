@@ -4,6 +4,18 @@ const LOCAL_TUNNEL_SESSION_PRUNE_INTERVAL_NS: u64 = 5_000_000_000;
 const LOCAL_TUNNEL_SESSION_STALE_NS: u64 = 30_000_000_000;
 const LOCAL_TUNNEL_SESSION_PRUNE_THRESHOLD: usize = 4096;
 
+fn local_tunnel_io_error_is_fatal(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(code)
+            if code == libc::EINVAL
+                || code == libc::EBADF
+                || code == libc::EBADFD
+                || code == libc::ENODEV
+                || code == libc::ENXIO
+    )
+}
+
 pub(super) fn local_tunnel_source_loop(
     tunnel_name: String,
     tunnel_endpoint_id: u16,
@@ -47,6 +59,9 @@ pub(super) fn local_tunnel_source_loop(
                             &tunnel_name,
                             format!("write_local_tunnel_delivery:{err}"),
                         );
+                        if local_tunnel_io_error_is_fatal(&err) {
+                            return;
+                        }
                         break;
                     }
                 }
@@ -119,6 +134,9 @@ pub(super) fn local_tunnel_source_loop(
                     &tunnel_name,
                     format!("read_local_tunnel:{err}"),
                 );
+                if local_tunnel_io_error_is_fatal(&err) {
+                    return;
+                }
                 thread::sleep(Duration::from_millis(50));
             }
         }
@@ -417,6 +435,38 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert!(sessions.contains_key(&dummy_session_key(60000)));
         assert_eq!(last_prune_ns, now_ns);
+    }
+
+    #[test]
+    fn local_tunnel_io_error_is_fatal_for_permanent_tunnel_fd_errors() {
+        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
+            libc::EINVAL,
+        )));
+        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
+            libc::EBADF,
+        )));
+        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
+            libc::EBADFD,
+        )));
+        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
+            libc::ENODEV,
+        )));
+        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
+            libc::ENXIO,
+        )));
+    }
+
+    #[test]
+    fn local_tunnel_io_error_is_not_fatal_for_retryable_io() {
+        assert!(!local_tunnel_io_error_is_fatal(
+            &io::Error::from(io::ErrorKind::WouldBlock),
+        ));
+        assert!(!local_tunnel_io_error_is_fatal(
+            &io::Error::from(io::ErrorKind::Interrupted),
+        ));
+        assert!(!local_tunnel_io_error_is_fatal(
+            &io::Error::from_raw_os_error(libc::ETIMEDOUT),
+        ));
     }
 
     #[test]
