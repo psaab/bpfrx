@@ -1,6 +1,6 @@
 use super::*;
 
-fn uses_kernel_local_session_map_entry(
+pub(super) fn uses_kernel_local_session_map_entry(
     decision: SessionDecision,
     metadata: &SessionMetadata,
     origin: SessionOrigin,
