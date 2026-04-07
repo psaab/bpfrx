@@ -1145,6 +1145,75 @@ func enableForwarding() {
 	slog.Info("IP forwarding enabled, RA acceptance disabled")
 }
 
+func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]string {
+	type connectedPrefix struct {
+		net    *net.IPNet
+		ifName string
+		bits   int
+	}
+
+	var connected []connectedPrefix
+	for ifName, ifc := range cfg.Interfaces.Interfaces {
+		base := config.LinuxIfName(ifName)
+		for unitNum, unit := range ifc.Units {
+			logical := base
+			if unitNum != 0 {
+				logical = fmt.Sprintf("%s.%d", base, unitNum)
+			}
+			for _, addr := range unit.Addresses {
+				ip, ipNet, err := net.ParseCIDR(addr)
+				if err != nil || ip == nil || ip.To4() != nil {
+					continue
+				}
+				bits, _ := ipNet.Mask.Size()
+				connected = append(connected, connectedPrefix{
+					net:    ipNet,
+					ifName: logical,
+					bits:   bits,
+				})
+			}
+		}
+	}
+
+	resolve := func(addr string) string {
+		ip := net.ParseIP(addr)
+		if ip == nil || ip.To4() != nil {
+			return ""
+		}
+		bestIf := ""
+		bestBits := -1
+		for _, candidate := range connected {
+			if candidate.net.Contains(ip) && candidate.bits > bestBits {
+				bestIf = candidate.ifName
+				bestBits = candidate.bits
+			}
+		}
+		return bestIf
+	}
+
+	resolved := make(map[string]string)
+	addRoutes := func(routes []*config.StaticRoute) {
+		for _, sr := range routes {
+			for _, nh := range sr.NextHops {
+				if nh.Interface != "" || nh.Address == "" || !strings.Contains(nh.Address, ":") {
+					continue
+				}
+				if ifName := resolve(nh.Address); ifName != "" {
+					resolved[nh.Address] = ifName
+				}
+			}
+		}
+	}
+
+	addRoutes(cfg.RoutingOptions.StaticRoutes)
+	addRoutes(cfg.RoutingOptions.Inet6StaticRoutes)
+	for _, ri := range cfg.RoutingInstances {
+		addRoutes(ri.StaticRoutes)
+		addRoutes(ri.Inet6StaticRoutes)
+	}
+	return resolved
+}
+
 // fixRethLinkFile rewrites the .link file for a RETH member to use
 // OriginalName= (the kernel name) instead of MACAddress= for matching.
 // This ensures the .link works on reboot when the MAC reverts to physical.
@@ -2176,6 +2245,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			InterfaceBandwidths:   ifaceBandwidths,
 			InterfacePointToPoint: ifaceP2P,
 			RethMap:               cfg.RethToPhysical(),
+			IPv6NextHopInterfaces: inferIPv6StaticNextHopInterfaces(cfg),
 			ClusterMode:           d.cluster != nil,
 		}
 		for _, ri := range cfg.RoutingInstances {
