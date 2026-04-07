@@ -52,7 +52,9 @@ func TestResolveConfigSubnetLinuxNameUsesUnitInterface(t *testing.T) {
 				"reth0": {
 					Name:            "reth0",
 					RedundancyGroup: 1,
-					Units:           map[int]*config.InterfaceUnit{80: {Number: 80, Addresses: []string{"172.16.80.8/24"}}},
+					Units: map[int]*config.InterfaceUnit{
+						80: {Number: 80, VlanID: 180, Addresses: []string{"172.16.80.8/24"}},
+					},
 				},
 				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
 			},
@@ -63,8 +65,8 @@ func TestResolveConfigSubnetLinuxNameUsesUnitInterface(t *testing.T) {
 	if !ok {
 		t.Fatal("resolveConfigSubnetLinuxName() = !ok, want ok")
 	}
-	if got != "ge-0-0-0.80" {
-		t.Fatalf("resolveConfigSubnetLinuxName() linuxName = %q, want %q", got, "ge-0-0-0.80")
+	if got != "ge-0-0-0.180" {
+		t.Fatalf("resolveConfigSubnetLinuxName() linuxName = %q, want %q", got, "ge-0-0-0.180")
 	}
 	if subnet != "172.16.80.8/24" {
 		t.Fatalf("resolveConfigSubnetLinuxName() subnet = %q, want %q", subnet, "172.16.80.8/24")
