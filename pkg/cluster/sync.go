@@ -1537,6 +1537,10 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 				if installer, ok := s.dp.(clusterSyncedSessionInstaller); ok {
 					if err := installer.SetClusterSyncedSessionV4(key, val); err == nil {
 						s.stats.SessionsInstalled.Add(1)
+					} else {
+						s.stats.Errors.Add(1)
+						slog.Warn("cluster sync: failed to mirror synced v4 session into dataplane helper",
+							"err", err)
 					}
 				} else {
 					// Invalidate FIB cache — peer's cached ifindex/MAC/gen
@@ -1633,6 +1637,10 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 				if installer, ok := s.dp.(clusterSyncedSessionInstaller); ok {
 					if err := installer.SetClusterSyncedSessionV6(key, val); err == nil {
 						s.stats.SessionsInstalled.Add(1)
+					} else {
+						s.stats.Errors.Add(1)
+						slog.Warn("cluster sync: failed to mirror synced v6 session into dataplane helper",
+							"err", err)
 					}
 				} else {
 					// Invalidate FIB cache (same as V4 above).
