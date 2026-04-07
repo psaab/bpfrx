@@ -717,19 +717,24 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 		if d.cluster == nil || d.sessionSync == nil {
 			return
 		}
-		if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
-			continue
-		}
+		isPrimary := d.cluster.IsLocalPrimaryAny()
+		syncConnected := d.sessionSync.IsConnected()
 		cfg := d.store.ActiveConfig()
 		if cfg == nil {
 			continue
 		}
 		d.userspaceDeltaSyncMu.Lock()
-		_, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
-		d.userspaceDeltaSyncMu.Unlock()
-		if err != nil {
-			slog.Debug("userspace session delta drain failed", "err", err)
+		if isPrimary && syncConnected {
+			_, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
+			if err != nil {
+				slog.Debug("userspace session delta drain failed", "err", err)
+			}
+		} else {
+			// Standby or sync disconnected: drain deltas to advance the
+			// helper counter but discard them (don't queue for sync).
+			d.discardUserspaceSessionDeltas(drainer)
 		}
+		d.userspaceDeltaSyncMu.Unlock()
 	}
 }
 
@@ -875,47 +880,46 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 			}
 		}
 
-		if connected {
-			// Stream is live — run reconciliation drain to catch any
-			// missed events, but at the slow 5s cadence.
-			if !hasDrainer {
-				continue
-			}
-			if d.cluster == nil || d.sessionSync == nil {
-				return
-			}
-			if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
-				continue
-			}
-			cfg := d.store.ActiveConfig()
-			if cfg == nil {
-				continue
-			}
-			d.userspaceDeltaSyncMu.Lock()
-			n, _ := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
-			d.userspaceDeltaSyncMu.Unlock()
-			if n > 0 {
-				slog.Info("userspace: reconciliation drain caught missed deltas", "count", n)
-			}
-			continue
-		}
-
-		// Stream disconnected — fall back to fast polling.
 		if !hasDrainer {
 			continue
 		}
 		if d.cluster == nil || d.sessionSync == nil {
 			return
 		}
-		if !d.cluster.IsLocalPrimaryAny() || !d.sessionSync.IsConnected() {
+		isPrimary := d.cluster.IsLocalPrimaryAny()
+		syncConnected := d.sessionSync.IsConnected()
+
+		if connected {
+			// Stream is live — run reconciliation drain to catch any
+			// missed events, but at the slow 5s cadence.
+			cfg := d.store.ActiveConfig()
+			if cfg == nil {
+				continue
+			}
+			d.userspaceDeltaSyncMu.Lock()
+			if isPrimary && syncConnected {
+				n, _ := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
+				if n > 0 {
+					slog.Info("userspace: reconciliation drain caught missed deltas", "count", n)
+				}
+			} else {
+				d.discardUserspaceSessionDeltas(drainer)
+			}
+			d.userspaceDeltaSyncMu.Unlock()
 			continue
 		}
+
+		// Stream disconnected — fall back to fast polling.
 		cfg := d.store.ActiveConfig()
 		if cfg == nil {
 			continue
 		}
 		d.userspaceDeltaSyncMu.Lock()
-		_, _ = d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
+		if isPrimary && syncConnected {
+			_, _ = d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
+		} else {
+			d.discardUserspaceSessionDeltas(drainer)
+		}
 		d.userspaceDeltaSyncMu.Unlock()
 	}
 }
@@ -1022,6 +1026,25 @@ func (d *Daemon) drainUserspaceSessionDeltasWithConfig(
 		}
 	}
 	return total, nil
+}
+
+// discardUserspaceSessionDeltas drains pending deltas from the Rust helper
+// without queuing them for sync. This advances the helper's "session delta
+// drained" counter on the standby node where deltas are generated (by
+// incoming session sync installs) but must not be sent back to the primary.
+func (d *Daemon) discardUserspaceSessionDeltas(drainer userspaceSessionDeltaDrainer) {
+	if drainer == nil {
+		return
+	}
+	for {
+		deltas, _, err := drainer.DrainSessionDeltas(256)
+		if err != nil || len(deltas) == 0 {
+			return
+		}
+		if len(deltas) < 256 {
+			return
+		}
+	}
 }
 
 func (d *Daemon) exportUserspaceOwnerRGSessionsWithConfig(

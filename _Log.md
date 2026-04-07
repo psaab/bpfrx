@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-04-07
+
+- **Timestamp**: 2026-04-07T06:10:00Z
+  - **Action**: Issue #533 — Fix failover validator idle gate blocked by "Session delta drained" staying at 0 on standby. Root cause: `eventStreamFallbackLoop` and `syncUserspaceSessionDeltas` both gated `DrainSessionDeltas` calls behind `IsLocalPrimaryAny()`, so the standby never drained deltas from the Rust helper. Added `discardUserspaceSessionDeltas()` that drains without queuing for sync, called on standby/disconnected nodes. Added unit test.
+  - **File(s)**: pkg/daemon/daemon_ha.go, pkg/daemon/userspace_sync_test.go
+
 ## 2026-04-05
 
 - **Timestamp**: 2026-04-05T22:00:00Z

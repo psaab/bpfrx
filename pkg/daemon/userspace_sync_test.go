@@ -577,6 +577,46 @@ func TestDrainUserspaceSessionDeltasWithConfigDrainsPreparedBatches(t *testing.T
 	}
 }
 
+func TestDiscardUserspaceSessionDeltasDrainsWithoutQueuing(t *testing.T) {
+	firstBatch := make([]dpuserspace.SessionDeltaInfo, 256)
+	for i := range firstBatch {
+		firstBatch[i] = dpuserspace.SessionDeltaInfo{
+			Event:      "open",
+			AddrFamily: dataplane.AFInet,
+			Protocol:   6,
+			SrcIP:      "10.0.1.1",
+			DstIP:      "10.0.2.1",
+			SrcPort:    uint16(10000 + i),
+			DstPort:    80,
+		}
+	}
+	secondBatch := []dpuserspace.SessionDeltaInfo{{
+		Event:      "open",
+		AddrFamily: dataplane.AFInet,
+		Protocol:   6,
+		SrcIP:      "10.0.1.1",
+		DstIP:      "10.0.2.1",
+		SrcPort:    20001,
+		DstPort:    80,
+	}}
+	drainer := &fakeUserspaceDeltaDrainer{
+		batches: [][]dpuserspace.SessionDeltaInfo{firstBatch, secondBatch},
+	}
+	d := &Daemon{}
+
+	d.discardUserspaceSessionDeltas(drainer)
+
+	// Should have drained both batches (first was full 256, so loop continued;
+	// second was <256, so loop stopped).
+	if drainer.calls != 2 {
+		t.Fatalf("drain calls = %d, want 2", drainer.calls)
+	}
+	// No batches left.
+	if len(drainer.batches) != 0 {
+		t.Fatalf("remaining batches = %d, want 0", len(drainer.batches))
+	}
+}
+
 func TestExportUserspaceOwnerRGSessionsWithConfigQueuesForwardWireAlias(t *testing.T) {
 	exporter := &fakeUserspaceSessionExporter{
 		deltas: []dpuserspace.SessionDeltaInfo{{
