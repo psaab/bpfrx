@@ -685,6 +685,93 @@ func TestShouldStandbyNeighborPrewarmLockedThrottlesRecentRun(t *testing.T) {
 	}
 }
 
+func TestTakeoverReadyAllowsStandbyWithReadyBindingsWithoutLivenessProof(t *testing.T) {
+	m := &Manager{
+		proc: &exec.Cmd{Process: &os.Process{Pid: 1}},
+		lastStatus: ProcessStatus{
+			Enabled:         true,
+			ForwardingArmed: true,
+			Capabilities: UserspaceCapabilities{
+				ForwardingSupported: true,
+			},
+			Queues: []QueueStatus{
+				{QueueID: 0, WorkerID: 0, Registered: true, Armed: true, Ready: true},
+			},
+			Bindings: []BindingStatus{
+				{
+					Slot:          0,
+					QueueID:       0,
+					WorkerID:      0,
+					Ifindex:       5,
+					Registered:    true,
+					Armed:         true,
+					Ready:         true,
+					Bound:         true,
+					XSKRegistered: true,
+				},
+			},
+		},
+		mode: ModeUserspaceCompat,
+		haGroups: map[int]HAGroupStatus{
+			1: {RGID: 1, Active: false},
+			2: {RGID: 2, Active: false},
+		},
+	}
+
+	ready, reasons := m.TakeoverReady()
+	if !ready {
+		t.Fatalf("TakeoverReady() = false, want true, reasons=%v", reasons)
+	}
+}
+
+func TestTakeoverReadyRequiresLivenessProofOnActiveNode(t *testing.T) {
+	m := &Manager{
+		proc: &exec.Cmd{Process: &os.Process{Pid: 1}},
+		lastStatus: ProcessStatus{
+			Enabled:         true,
+			ForwardingArmed: true,
+			Capabilities: UserspaceCapabilities{
+				ForwardingSupported: true,
+			},
+			Queues: []QueueStatus{
+				{QueueID: 0, WorkerID: 0, Registered: true, Armed: true, Ready: true},
+			},
+			Bindings: []BindingStatus{
+				{
+					Slot:          0,
+					QueueID:       0,
+					WorkerID:      0,
+					Ifindex:       5,
+					Registered:    true,
+					Armed:         true,
+					Ready:         true,
+					Bound:         true,
+					XSKRegistered: true,
+				},
+			},
+		},
+		mode: ModeUserspaceCompat,
+		haGroups: map[int]HAGroupStatus{
+			1: {RGID: 1, Active: true},
+		},
+	}
+
+	ready, reasons := m.TakeoverReady()
+	if ready {
+		t.Fatal("TakeoverReady() = true, want false without active-node liveness proof")
+	}
+	found := false
+	for _, reason := range reasons {
+		if reason == "userspace XSK liveness not proven" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected XSK liveness reason, got %v", reasons)
+	}
+}
+
 func TestMergeHAStateFromMaps(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Skipf("RemoveMemlock: %v", err)
