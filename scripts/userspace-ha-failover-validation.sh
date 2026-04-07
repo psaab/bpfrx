@@ -389,21 +389,22 @@ wait_for_session_sync_idle() {
 	local stable_needed="$SESSION_SYNC_IDLE_STABLE_SAMPLES"
 	local stable=0
 	local tries="$SESSION_SYNC_IDLE_TIMEOUT"
-	local prev_source_sent="" prev_target_recv="" prev_target_installed=""
+	local prev_source_sent="" prev_target_recv="" prev_target_pending="" prev_target_drained=""
 	while (( tries > 0 )); do
 		capture_sync_snapshot "$SOURCE_VM" "${label}-source"
 		capture_sync_snapshot "$TARGET_VM" "${label}-target"
 		local source_path target_path
 		source_path="$(sync_snapshot_path "${label}-source" "$SOURCE_VM")"
 		target_path="$(sync_snapshot_path "${label}-target" "$TARGET_VM")"
-		local source_sent target_recv target_installed
+		local source_sent target_recv target_pending target_drained
 		source_sent="$(sync_stats_value "$source_path" "Session create" sent)"
 		target_recv="$(sync_stats_value "$target_path" "Session create" received)"
-		target_installed="$(status_summary_value "$target_path" "Session delta drained")"
-		if [[ -n "$prev_source_sent" && "$source_sent" == "$prev_source_sent" && "$target_recv" == "$prev_target_recv" && "$target_installed" == "$prev_target_installed" ]]; then
+		target_pending="$(status_summary_value "$target_path" "Session delta pending")"
+		target_drained="$(status_summary_value "$target_path" "Session delta drained")"
+		if [[ "$source_sent" == "$target_recv" && "$target_pending" == "0" ]]; then
 			stable=$((stable + 1))
 			if (( stable >= stable_needed )); then
-				pass "${label}: session sync idle (source_sent=${source_sent} target_recv=${target_recv} target_delta_drained=${target_installed})"
+				pass "${label}: session sync idle (source_sent=${source_sent} target_recv=${target_recv} target_delta_pending=${target_pending} target_delta_drained=${target_drained})"
 				return 0
 			fi
 		else
@@ -411,11 +412,12 @@ wait_for_session_sync_idle() {
 		fi
 		prev_source_sent="$source_sent"
 		prev_target_recv="$target_recv"
-		prev_target_installed="$target_installed"
+		prev_target_pending="$target_pending"
+		prev_target_drained="$target_drained"
 		sleep 1
 		tries=$((tries - 1))
 	done
-	fail "${label}: session sync did not become idle before timeout (source_sent=${prev_source_sent:-0} target_recv=${prev_target_recv:-0} target_delta_drained=${prev_target_installed:-0})"
+	fail "${label}: session sync did not become idle before timeout (source_sent=${prev_source_sent:-0} target_recv=${prev_target_recv:-0} target_delta_pending=${prev_target_pending:-0} target_delta_drained=${prev_target_drained:-0})"
 	return 1
 }
 
