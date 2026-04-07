@@ -26,25 +26,30 @@ var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 
 // Sync message types.
 const (
-	syncMsgSessionV4         = 1
-	syncMsgSessionV6         = 2
-	syncMsgDeleteV4          = 3
-	syncMsgDeleteV6          = 4
-	syncMsgBulkStart         = 5
-	syncMsgBulkEnd           = 6
-	syncMsgHeartbeat         = 7
-	syncMsgConfig            = 8  // full config text sync from primary to secondary
-	syncMsgIPsecSA           = 9  // IPsec SA connection names sync
-	syncMsgFailover          = 10 // remote failover request (payload: 1 byte rgID)
-	syncMsgFence             = 11 // peer fencing: receiver should disable all RGs
-	syncMsgClockSync         = 12 // monotonic clock exchange for timestamp rebasing
-	syncMsgBarrier           = 13 // ordered marker for remote install barriers
-	syncMsgBarrierAck        = 14
-	syncMsgBulkAck           = 15
-	syncMsgFailoverAck       = 16 // failover request result (payload: rgID, status, detail)
-	syncMsgFailoverCommit    = 17 // failover ownership commit (payload: rgID, reqID)
-	syncMsgFailoverCommitAck = 18 // failover commit result (payload: rgID, status, detail)
-	syncMsgPrepareActivation = 19 // hint: demoting node tells peer to pre-warm neighbors (payload: 1 byte rgID)
+	syncMsgSessionV4              = 1
+	syncMsgSessionV6              = 2
+	syncMsgDeleteV4               = 3
+	syncMsgDeleteV6               = 4
+	syncMsgBulkStart              = 5
+	syncMsgBulkEnd                = 6
+	syncMsgHeartbeat              = 7
+	syncMsgConfig                 = 8  // full config text sync from primary to secondary
+	syncMsgIPsecSA                = 9  // IPsec SA connection names sync
+	syncMsgFailover               = 10 // remote failover request (payload: 1 byte rgID)
+	syncMsgFence                  = 11 // peer fencing: receiver should disable all RGs
+	syncMsgClockSync              = 12 // monotonic clock exchange for timestamp rebasing
+	syncMsgBarrier                = 13 // ordered marker for remote install barriers
+	syncMsgBarrierAck             = 14
+	syncMsgBulkAck                = 15
+	syncMsgFailoverAck            = 16 // failover request result (payload: rgID, status, detail)
+	syncMsgFailoverCommit         = 17 // failover ownership commit (payload: rgID, reqID)
+	syncMsgFailoverCommitAck      = 18 // failover commit result (payload: rgID, status, detail)
+	syncMsgPrepareActivation      = 19 // hint: demoting node tells peer to pre-warm neighbors (payload: 1 byte rgID)
+	syncMsgFailoverBatch          = 20 // remote failover request for multiple RGs
+	syncMsgFailoverBatchAck       = 21 // multi-RG failover request result
+	syncMsgFailoverBatchCommit    = 22 // multi-RG failover ownership commit
+	syncMsgFailoverBatchCommitAck = 23 // multi-RG failover commit result
+	syncMsgHeartbeatAck           = 24
 )
 
 // syncHeader is the wire header for each sync message.
@@ -58,6 +63,8 @@ type syncHeader struct {
 const syncHeaderSize = 12
 const syncWriteDeadline = 2 * time.Second
 const failoverAckTimeout = 20 * time.Second
+const syncReadDeadline = 10 * time.Second
+const syncPeerSilenceTimeout = 30 * time.Second
 
 // SyncStats tracks session synchronization statistics.
 type SyncStats struct {
@@ -268,6 +275,8 @@ type SessionSync struct {
 	deleteJournal    [][]byte // ring buffer of encoded delete messages
 	deleteJournalCap int      // max entries (default 10000)
 	lastPeerRxUnix   atomic.Int64
+	readDeadline     time.Duration
+	peerSilenceLimit time.Duration
 
 	// bulkSendMu serializes entire BulkSync() calls so two concurrent
 	// callers (e.g. acceptLoop and connectLoop) cannot interleave.
@@ -498,11 +507,31 @@ func (s *SessionSync) LastPeerReceiveAge() (time.Duration, bool) {
 	return time.Since(time.Unix(0, last)), true
 }
 
+func (s *SessionSync) readDeadlineDuration() time.Duration {
+	if s.readDeadline > 0 {
+		return s.readDeadline
+	}
+	return syncReadDeadline
+}
+
+func (s *SessionSync) peerSilenceDuration() time.Duration {
+	if s.peerSilenceLimit > 0 {
+		return s.peerSilenceLimit
+	}
+	return syncPeerSilenceTimeout
+}
+
 // PeerRecentlyActive reports whether an inbound sync message has been observed
 // from the peer within maxAge.
 func (s *SessionSync) PeerRecentlyActive(maxAge time.Duration) bool {
 	age, ok := s.LastPeerReceiveAge()
 	return ok && age <= maxAge
+}
+
+// PeerHealthy reports whether the sync connection is established and the peer
+// has been observed on the protocol within the expected silence window.
+func (s *SessionSync) PeerHealthy() bool {
+	return s.stats.Connected.Load() && s.PeerRecentlyActive(s.peerSilenceDuration())
 }
 
 // activeConnLocked returns the preferred active connection.
@@ -615,6 +644,7 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 		activeAfter = 1
 	}
 	s.stats.Connected.Store(true)
+	s.lastPeerRxUnix.Store(time.Now().UnixNano())
 	s.mu.Unlock()
 	becameActive := activeAfter == fabricIdx
 
@@ -1465,6 +1495,8 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 	}()
 
 	hdrBuf := make([]byte, syncHeaderSize)
+	readDeadline := s.readDeadlineDuration()
+	missedHeartbeats := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -1472,13 +1504,22 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 		default:
 		}
 
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(readDeadline))
 		if _, err := io.ReadFull(conn, hdrBuf); err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// Send keepalive.
+				missedHeartbeats++
+				if missedHeartbeats >= 2 {
+					slog.Warn("cluster sync: heartbeat ack timeout, closing stale connection",
+						"local", connLocalAddrString(conn),
+						"remote", connRemoteAddrString(conn),
+						"missed_heartbeats", missedHeartbeats)
+					return
+				}
+				// Request an explicit heartbeat ack so one-way steady-state
+				// traffic still proves the reverse direction is alive.
 				s.writeMu.Lock()
 				err := writeMsg(conn, syncMsgHeartbeat, nil)
 				s.writeMu.Unlock()
@@ -1514,6 +1555,7 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 			}
 		}
 
+		missedHeartbeats = 0
 		s.lastPeerRxUnix.Store(time.Now().UnixNano())
 		s.handleMessage(conn, hdr.Type, payload)
 	}
@@ -1840,7 +1882,20 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		}
 
 	case syncMsgHeartbeat:
-		// keepalive, no action needed
+		if conn == nil {
+			return
+		}
+		s.writeMu.Lock()
+		err := writeMsg(conn, syncMsgHeartbeatAck, nil)
+		s.writeMu.Unlock()
+		if err != nil {
+			slog.Debug("cluster sync: heartbeat ack send error", "err", err)
+			s.stats.Errors.Add(1)
+			s.handleDisconnect(conn)
+		}
+
+	case syncMsgHeartbeatAck:
+		// keepalive reply, no action needed
 
 	case syncMsgConfig:
 		s.stats.ConfigsReceived.Add(1)
