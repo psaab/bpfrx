@@ -194,13 +194,12 @@ ensure_preferred_active_node() {
 wait_for_active_supported_runtime() {
 	local tries=30
 	while (( tries > 0 )); do
-		local vm
-		for vm in "$FW0" "$FW1"; do
-			if enabled_userspace_vm "$vm" >/dev/null 2>&1; then
-				printf '%s\n' "$vm"
-				return 0
-			fi
-		done
+		local owner
+		owner="$(active_owner_vm || true)"
+		if [[ -n "$owner" ]] && enabled_userspace_vm "$owner" >/dev/null 2>&1; then
+			printf '%s\n' "$owner"
+			return 0
+		fi
 		sleep 1
 		tries=$((tries - 1))
 	done
