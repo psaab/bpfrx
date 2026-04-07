@@ -7474,6 +7474,9 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 			if err != nil {
 				return nil, status.Errorf(codes.InvalidArgument, "invalid node ID: %s", nodeStr)
 			}
+			if !cluster.IsSupportedClusterNodeID(targetNode) {
+				return nil, status.Errorf(codes.InvalidArgument, "unsupported cluster failover target node %d", targetNode)
+			}
 			if targetNode != s.cluster.NodeID() {
 				if peerForwardedFromContext(ctx) {
 					return nil, status.Errorf(codes.FailedPrecondition, "forwarded cluster failover target node %d is not local", targetNode)

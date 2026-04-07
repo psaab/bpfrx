@@ -344,6 +344,15 @@ const (
 
 var ErrRemoteFailoverRejected = errors.New("remote failover rejected")
 
+const maxFailoverBatchRGCount = 255
+
+func validateFailoverBatchRGCount(rgIDs []int) error {
+	if len(rgIDs) > maxFailoverBatchRGCount {
+		return fmt.Errorf("too many redundancy groups in failover batch: %d > %d", len(rgIDs), maxFailoverBatchRGCount)
+	}
+	return nil
+}
+
 func encodeFailoverBatchRequestPayload(rgIDs []int, reqID uint64) []byte {
 	payload := make([]byte, 1+len(rgIDs)+8)
 	payload[0] = byte(len(rgIDs))
@@ -1339,6 +1348,9 @@ func (s *SessionSync) SendFailoverBatch(rgIDs []int) (uint64, error) {
 	if err := validateFailoverProtocolRGIDs(ids); err != nil {
 		return 0, err
 	}
+	if err := validateFailoverBatchRGCount(ids); err != nil {
+		return 0, err
+	}
 	conn := s.getActiveConn()
 	if conn == nil {
 		return 0, fmt.Errorf("peer not connected")
@@ -1494,6 +1506,9 @@ func (s *SessionSync) SendFailoverCommitBatch(rgIDs []int, reqID uint64) error {
 		return s.SendFailoverCommit(ids[0], reqID)
 	}
 	if err := validateFailoverProtocolRGIDs(ids); err != nil {
+		return err
+	}
+	if err := validateFailoverBatchRGCount(ids); err != nil {
 		return err
 	}
 	conn := s.getActiveConn()
@@ -2463,6 +2478,15 @@ func (s *SessionSync) completeFailoverBatchWait(key string, reqID uint64, ack fa
 }
 
 func (s *SessionSync) sendFailoverBatchResult(conn net.Conn, msgType uint8, rgIDs []int, reqID uint64, status uint8, detail string) {
+	if err := validateFailoverBatchRGCount(rgIDs); err != nil {
+		slog.Warn("cluster sync: refusing to send oversized batch failover result",
+			"err", err,
+			"msg_type", msgType,
+			"rgs", rgIDs,
+			"req_id", reqID,
+			"status", status)
+		return
+	}
 	ackConn := s.getActiveConn()
 	if ackConn == nil {
 		ackConn = conn

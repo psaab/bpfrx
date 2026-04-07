@@ -210,6 +210,18 @@ func TestFormatStats(t *testing.T) {
 	}
 }
 
+func TestValidateFailoverBatchRGCount(t *testing.T) {
+	okRGs := make([]int, maxFailoverBatchRGCount)
+	if err := validateFailoverBatchRGCount(okRGs); err != nil {
+		t.Fatalf("validateFailoverBatchRGCount(%d) error = %v", len(okRGs), err)
+	}
+
+	tooManyRGs := make([]int, maxFailoverBatchRGCount+1)
+	if err := validateFailoverBatchRGCount(tooManyRGs); err == nil {
+		t.Fatalf("validateFailoverBatchRGCount(%d) unexpectedly succeeded", len(tooManyRGs))
+	}
+}
+
 func TestDecodeSessionV4RoundTrip(t *testing.T) {
 	key := dataplane.SessionKey{
 		SrcIP:    [4]byte{192, 168, 1, 1},

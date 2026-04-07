@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+// Cluster failover targets are currently limited to the two chassis nodes.
+func IsSupportedClusterNodeID(nodeID int) bool {
+	return nodeID == 0 || nodeID == 1
+}
+
 func normalizeFailoverRGIDs(rgIDs []int) ([]int, error) {
 	if len(rgIDs) == 0 {
 		return nil, fmt.Errorf("no redundancy groups specified")

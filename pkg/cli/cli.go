@@ -4460,6 +4460,9 @@ func (c *CLI) handleRequestChassisClusterFailover(args []string) error {
 		if err != nil {
 			return fmt.Errorf("invalid node ID: %s", args[2])
 		}
+		if !cluster.IsSupportedClusterNodeID(targetNode) {
+			return fmt.Errorf("unsupported cluster failover target node %d", targetNode)
+		}
 		localNode := c.cluster.NodeID()
 		if targetNode != localNode {
 			message, err := c.requestPeerSystemAction(

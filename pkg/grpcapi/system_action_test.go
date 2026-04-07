@@ -84,3 +84,12 @@ func TestSystemActionClusterFailoverDataRejectsForwardLoop(t *testing.T) {
 		t.Fatalf("status code = %s, want %s (err=%v)", status.Code(err), codes.FailedPrecondition, err)
 	}
 }
+
+func TestSystemActionClusterFailoverDataRejectsUnsupportedTargetNode(t *testing.T) {
+	s := NewServer("", Config{Cluster: cluster.NewManager(0, 1)})
+
+	_, err := s.SystemAction(context.Background(), &pb.SystemActionRequest{Action: "cluster-failover-data:node2"})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("status code = %s, want %s (err=%v)", status.Code(err), codes.InvalidArgument, err)
+	}
+}
