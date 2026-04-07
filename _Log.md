@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-04-03
+
+- **Timestamp**: 2026-04-03T00:00:00Z
+  - **Action**: Issue #546 — Split daemon_ha.go (4194 lines, 125 functions) into 5 domain files. Mechanical move only, no logic changes. daemon_ha_sync.go (16 funcs), daemon_ha_userspace.go (39 funcs), daemon_ha_fabric.go (18 funcs), daemon_ha_vip.go (24 funcs), daemon_ha.go remains at 28 funcs.
+  - **File(s)**: pkg/daemon/daemon_ha.go, pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_ha_userspace.go, pkg/daemon/daemon_ha_fabric.go, pkg/daemon/daemon_ha_vip.go
+
 ## 2026-04-07
 
 - **Timestamp**: 2026-04-07T00:00:00Z
