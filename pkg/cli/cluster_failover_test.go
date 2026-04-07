@@ -58,3 +58,43 @@ func TestHandleRequestChassisClusterFailoverProxiesPeerTarget(t *testing.T) {
 		t.Fatalf("stdout = %q, want proxied response", out)
 	}
 }
+
+func TestHandleRequestChassisClusterFailoverDataProxiesPeerTarget(t *testing.T) {
+	c := &CLI{cluster: cluster.NewManager(0, 1)}
+
+	var gotAction string
+	c.peerSystemActionFn = func(ctx context.Context, action string) (string, error) {
+		gotAction = action
+		return "proxied data failover", nil
+	}
+
+	var callErr error
+	out := captureStdout(t, func() {
+		callErr = c.handleRequestChassisClusterFailover([]string{"data", "node", "1"})
+	})
+	if callErr != nil {
+		t.Fatalf("handleRequestChassisClusterFailover() error = %v", callErr)
+	}
+	if gotAction != "cluster-failover-data:node1" {
+		t.Fatalf("peer action = %q, want %q", gotAction, "cluster-failover-data:node1")
+	}
+	if strings.TrimSpace(out) != "proxied data failover" {
+		t.Fatalf("stdout = %q, want proxied response", out)
+	}
+}
+
+func TestHandleRequestChassisClusterFailoverDataRejectsUnsupportedTargetNode(t *testing.T) {
+	c := &CLI{cluster: cluster.NewManager(0, 1)}
+	c.peerSystemActionFn = func(ctx context.Context, action string) (string, error) {
+		t.Fatalf("unexpected peer proxy for action %q", action)
+		return "", nil
+	}
+
+	err := c.handleRequestChassisClusterFailover([]string{"data", "node", "2"})
+	if err == nil {
+		t.Fatal("expected error for unsupported target node")
+	}
+	if got, want := err.Error(), "unsupported cluster failover target node 2"; got != want {
+		t.Fatalf("error = %q, want %q", got, want)
+	}
+}
