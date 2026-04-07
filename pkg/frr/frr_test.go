@@ -884,11 +884,11 @@ func TestGenerateStaticRoute_InferredIPv6NextHopInterfaceByVRF(t *testing.T) {
 			{Address: "2001:db8:1::100"},
 		},
 	}
-	got := m.generateStaticRoute(sr, "BLUE", rethMap, map[string]map[string]string{
-		"":     {"2001:db8:1::100": "reth0.10"},
-		"BLUE": {"2001:db8:1::100": "reth1.20"},
+	got := m.generateStaticRoute(sr, "vrf-BLUE", rethMap, map[string]map[string]string{
+		"":         {"2001:db8:1::100": "reth0.10"},
+		"vrf-BLUE": {"2001:db8:1::100": "reth1.20"},
 	})
-	want := "ipv6 route 2001:db8:ffff::/48 2001:db8:1::100 ge-0-0-3.20 vrf BLUE\n"
+	want := "ipv6 route 2001:db8:ffff::/48 2001:db8:1::100 ge-0-0-3.20 vrf vrf-BLUE\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}

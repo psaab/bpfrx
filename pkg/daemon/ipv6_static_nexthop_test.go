@@ -89,6 +89,7 @@ func TestInferIPv6StaticNextHopInterfaces_ByVRFAndDeterministicTieBreak(t *testi
 			{
 				Name:         "BLUE",
 				InstanceType: "vrf",
+				Interfaces:   []string{"reth1.10"},
 				Inet6StaticRoutes: []*config.StaticRoute{
 					{
 						Destination: "2001:db8:ffff::/48",
@@ -103,7 +104,7 @@ func TestInferIPv6StaticNextHopInterfaces_ByVRFAndDeterministicTieBreak(t *testi
 	if got[""]["2001:db8:1::100"] != "reth0.10" {
 		t.Fatalf("global tie-break interface = %q, want reth0.10", got[""]["2001:db8:1::100"])
 	}
-	if got["vrf-BLUE"]["2001:db8:1::100"] != "reth0.10" {
-		t.Fatalf("vrf tie-break interface = %q, want reth0.10", got["vrf-BLUE"]["2001:db8:1::100"])
+	if got["vrf-BLUE"]["2001:db8:1::100"] != "reth1.10" {
+		t.Fatalf("vrf-scoped interface = %q, want reth1.10", got["vrf-BLUE"]["2001:db8:1::100"])
 	}
 }

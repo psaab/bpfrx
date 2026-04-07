@@ -1182,6 +1182,7 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 	}
 
 	var connected []connectedPrefix
+	connectedByLogical := make(map[string][]connectedPrefix)
 	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
 	for ifName := range cfg.Interfaces.Interfaces {
 		ifNames = append(ifNames, ifName)
@@ -1207,23 +1208,25 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 					continue
 				}
 				bits, _ := ipNet.Mask.Size()
-				connected = append(connected, connectedPrefix{
+				prefix := connectedPrefix{
 					net:    ipNet,
 					ifName: logical,
 					bits:   bits,
-				})
+				}
+				connected = append(connected, prefix)
+				connectedByLogical[logical] = append(connectedByLogical[logical], prefix)
 			}
 		}
 	}
 
-	resolve := func(addr string) string {
+	resolve := func(candidates []connectedPrefix, addr string) string {
 		ip := net.ParseIP(addr)
 		if ip == nil || ip.To4() != nil {
 			return ""
 		}
 		bestIf := ""
 		bestBits := -1
-		for _, candidate := range connected {
+		for _, candidate := range candidates {
 			if !candidate.net.Contains(ip) {
 				continue
 			}
@@ -1235,7 +1238,31 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 		return bestIf
 	}
 
+	collectPrefixesForInterface := func(ifName string) []connectedPrefix {
+		normalized := config.LinuxIfName(ifName)
+		var prefixes []connectedPrefix
+		if entries, ok := connectedByLogical[normalized]; ok {
+			prefixes = append(prefixes, entries...)
+		}
+		if !strings.Contains(normalized, ".") {
+			prefixNames := make([]string, 0, len(connectedByLogical))
+			for logical := range connectedByLogical {
+				if strings.HasPrefix(logical, normalized+".") {
+					prefixNames = append(prefixNames, logical)
+				}
+			}
+			sort.Strings(prefixNames)
+			for _, logical := range prefixNames {
+				prefixes = append(prefixes, connectedByLogical[logical]...)
+			}
+		}
+		return prefixes
+	}
+
 	resolved := make(map[string]map[string]string)
+	connectedByVRF := map[string][]connectedPrefix{
+		"": append([]connectedPrefix(nil), connected...),
+	}
 	setResolved := func(vrfName, nextHop, ifName string) {
 		if ifName == "" {
 			return
@@ -1250,14 +1277,51 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 		}
 	}
 	addRoutes := func(vrfName string, routes []*config.StaticRoute) {
+		candidates := connectedByVRF[vrfName]
 		for _, sr := range routes {
 			for _, nh := range sr.NextHops {
 				if nh.Interface != "" || nh.Address == "" || !strings.Contains(nh.Address, ":") {
 					continue
 				}
-				setResolved(vrfName, nh.Address, resolve(nh.Address))
+				setResolved(vrfName, nh.Address, resolve(candidates, nh.Address))
 			}
 		}
+	}
+
+	claimedByVRF := make(map[string]struct{})
+	for _, ri := range cfg.RoutingInstances {
+		vrfName := "vrf-" + ri.Name
+		if ri.InstanceType == "forwarding" {
+			vrfName = ""
+		}
+		for _, ifName := range ri.Interfaces {
+			prefixes := collectPrefixesForInterface(ifName)
+			if len(prefixes) == 0 {
+				continue
+			}
+			connectedByVRF[vrfName] = append(connectedByVRF[vrfName], prefixes...)
+			if vrfName != "" {
+				normalized := config.LinuxIfName(ifName)
+				claimedByVRF[normalized] = struct{}{}
+			}
+		}
+	}
+	if len(claimedByVRF) > 0 {
+		filtered := connectedByVRF[""][:0]
+		for _, prefix := range connectedByVRF[""] {
+			base := prefix.ifName
+			if idx := strings.IndexByte(base, '.'); idx >= 0 {
+				base = base[:idx]
+			}
+			if _, claimed := claimedByVRF[prefix.ifName]; claimed {
+				continue
+			}
+			if _, claimed := claimedByVRF[base]; claimed {
+				continue
+			}
+			filtered = append(filtered, prefix)
+		}
+		connectedByVRF[""] = filtered
 	}
 
 	addRoutes("", cfg.RoutingOptions.StaticRoutes)
