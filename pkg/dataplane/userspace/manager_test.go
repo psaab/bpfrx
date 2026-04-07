@@ -1653,6 +1653,8 @@ func TestHasBusyBindingsWedgeLocked(t *testing.T) {
 			ForwardingArmed: true,
 			Bindings: []BindingStatus{
 				{
+					Ifindex:    6,
+					QueueID:    0,
 					Registered: true,
 					Armed:      true,
 					Ready:      false,
@@ -1679,6 +1681,8 @@ func TestShouldAutoRebindBusyBindingsLockedDebounces(t *testing.T) {
 			ForwardingArmed: true,
 			Bindings: []BindingStatus{
 				{
+					Ifindex:    6,
+					QueueID:    0,
 					Registered: true,
 					Armed:      true,
 					LastError:  "Device or resource busy",
@@ -1701,6 +1705,22 @@ func TestShouldAutoRebindBusyBindingsLockedDebounces(t *testing.T) {
 	m.lastStatus.Bindings[0].Bound = true
 	if m.shouldAutoRebindBusyBindingsLocked(now.Add(30*time.Second), false) {
 		t.Fatal("shouldAutoRebindBusyBindingsLocked() = true, want false once wedge clears")
+	}
+}
+
+func TestStopLockedResetsBusyBindingsAutoRebindState(t *testing.T) {
+	m := &Manager{
+		bindingsBusySince:      time.Now().Add(-30 * time.Second),
+		lastBindingsAutoRebind: time.Now().Add(-10 * time.Second),
+	}
+
+	m.stopLocked()
+
+	if !m.bindingsBusySince.IsZero() {
+		t.Fatal("bindingsBusySince not reset by stopLocked()")
+	}
+	if !m.lastBindingsAutoRebind.IsZero() {
+		t.Fatal("lastBindingsAutoRebind not reset by stopLocked()")
 	}
 }
 

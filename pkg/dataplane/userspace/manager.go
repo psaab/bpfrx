@@ -3803,6 +3803,9 @@ func (m *Manager) hasBusyBindingsWedgeLocked(repaired bool) bool {
 	ready := 0
 	busyErr := false
 	for _, binding := range bindings {
+		if binding.Ifindex <= 0 {
+			continue
+		}
 		if binding.Registered && binding.Armed {
 			registeredArmed++
 		}
@@ -4312,6 +4315,8 @@ func (m *Manager) stopLocked() {
 	}
 	if m.proc == nil {
 		m.lastStatus = ProcessStatus{}
+		m.bindingsBusySince = time.Time{}
+		m.lastBindingsAutoRebind = time.Time{}
 		m.sessionMirrorFailed = false
 		m.sessionMirrorErr = ""
 		return
@@ -4352,6 +4357,8 @@ func (m *Manager) stopLocked() {
 	m.lastXSKRX = 0
 	m.lastNAPIBootstrap = time.Time{}
 	m.lastStandbyNeighResolve = time.Time{}
+	m.bindingsBusySince = time.Time{}
+	m.lastBindingsAutoRebind = time.Time{}
 	m.publishedSnapshot = 0
 	m.publishedPlanKey = ""
 	m.sessionMirrorFailed = false
