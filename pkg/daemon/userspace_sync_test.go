@@ -565,7 +565,7 @@ func TestDrainUserspaceSessionDeltasWithConfigDrainsPreparedBatches(t *testing.T
 		"wan": {Name: "wan"},
 	}
 
-	queued, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 8)
+	queued, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 8, userspaceSessionDeltaBatchSize)
 	if err != nil {
 		t.Fatalf("drainUserspaceSessionDeltasWithConfig() error = %v", err)
 	}
@@ -604,7 +604,7 @@ func TestDiscardUserspaceSessionDeltasDrainsWithoutQueuing(t *testing.T) {
 	}
 	d := &Daemon{}
 
-	d.discardUserspaceSessionDeltas(drainer)
+	d.discardUserspaceSessionDeltas(drainer, userspaceSessionDeltaBatchSize, userspaceDiscardSessionBatches)
 
 	// Should have drained both batches (first was full 256, so loop continued;
 	// second was <256, so loop stopped).
@@ -614,6 +614,36 @@ func TestDiscardUserspaceSessionDeltasDrainsWithoutQueuing(t *testing.T) {
 	// No batches left.
 	if len(drainer.batches) != 0 {
 		t.Fatalf("remaining batches = %d, want 0", len(drainer.batches))
+	}
+}
+
+func TestDiscardUserspaceSessionDeltasStopsAtBatchBudget(t *testing.T) {
+	fullBatch := make([]dpuserspace.SessionDeltaInfo, userspaceSessionDeltaBatchSize)
+	for i := range fullBatch {
+		fullBatch[i] = dpuserspace.SessionDeltaInfo{
+			Event:      "open",
+			AddrFamily: dataplane.AFInet,
+			Protocol:   6,
+			SrcIP:      "10.0.1.1",
+			DstIP:      "10.0.2.1",
+			SrcPort:    uint16(10000 + i),
+			DstPort:    80,
+		}
+	}
+	batches := make([][]dpuserspace.SessionDeltaInfo, userspaceDiscardSessionBatches+2)
+	for i := range batches {
+		batches[i] = append([]dpuserspace.SessionDeltaInfo(nil), fullBatch...)
+	}
+	drainer := &fakeUserspaceDeltaDrainer{batches: batches}
+	d := &Daemon{}
+
+	d.discardUserspaceSessionDeltas(drainer, userspaceSessionDeltaBatchSize, userspaceDiscardSessionBatches)
+
+	if drainer.calls != userspaceDiscardSessionBatches {
+		t.Fatalf("drain calls = %d, want %d", drainer.calls, userspaceDiscardSessionBatches)
+	}
+	if want := 2; len(drainer.batches) != want {
+		t.Fatalf("remaining batches = %d, want %d", len(drainer.batches), want)
 	}
 }
 

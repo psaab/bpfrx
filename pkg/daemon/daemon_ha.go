@@ -24,6 +24,11 @@ import (
 	"github.com/psaab/bpfrx/pkg/vrrp"
 )
 
+const (
+	userspaceSessionDeltaBatchSize = 256
+	userspaceDiscardSessionBatches = 16
+)
+
 func (d *Daemon) stopSyncReadyTimer() {
 	d.syncReadyTimerMu.Lock()
 	defer d.syncReadyTimerMu.Unlock()
@@ -719,22 +724,24 @@ func (d *Daemon) syncUserspaceSessionDeltas(ctx context.Context) {
 		}
 		isPrimary := d.cluster.IsLocalPrimaryAny()
 		syncConnected := d.sessionSync.IsConnected()
-		cfg := d.store.ActiveConfig()
-		if cfg == nil {
-			continue
-		}
-		d.userspaceDeltaSyncMu.Lock()
 		if isPrimary && syncConnected {
-			_, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
+			cfg := d.store.ActiveConfig()
+			if cfg == nil {
+				continue
+			}
+			d.userspaceDeltaSyncMu.Lock()
+			_, err := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1, userspaceSessionDeltaBatchSize)
+			d.userspaceDeltaSyncMu.Unlock()
 			if err != nil {
 				slog.Debug("userspace session delta drain failed", "err", err)
 			}
 		} else {
 			// Standby or sync disconnected: drain deltas to advance the
 			// helper counter but discard them (don't queue for sync).
-			d.discardUserspaceSessionDeltas(drainer)
+			d.userspaceDeltaSyncMu.Lock()
+			d.discardUserspaceSessionDeltas(drainer, userspaceSessionDeltaBatchSize, userspaceDiscardSessionBatches)
+			d.userspaceDeltaSyncMu.Unlock()
 		}
-		d.userspaceDeltaSyncMu.Unlock()
 	}
 }
 
@@ -892,35 +899,39 @@ func (d *Daemon) eventStreamFallbackLoop(ctx context.Context, provider userspace
 		if connected {
 			// Stream is live — run reconciliation drain to catch any
 			// missed events, but at the slow 5s cadence.
+			if isPrimary && syncConnected {
+				cfg := d.store.ActiveConfig()
+				if cfg == nil {
+					continue
+				}
+				d.userspaceDeltaSyncMu.Lock()
+				n, _ := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1, userspaceSessionDeltaBatchSize)
+				d.userspaceDeltaSyncMu.Unlock()
+				if n > 0 {
+					slog.Info("userspace: reconciliation drain caught missed deltas", "count", n)
+				}
+			} else {
+				d.userspaceDeltaSyncMu.Lock()
+				d.discardUserspaceSessionDeltas(drainer, userspaceSessionDeltaBatchSize, userspaceDiscardSessionBatches)
+				d.userspaceDeltaSyncMu.Unlock()
+			}
+			continue
+		}
+
+		// Stream disconnected — fall back to fast polling.
+		if isPrimary && syncConnected {
 			cfg := d.store.ActiveConfig()
 			if cfg == nil {
 				continue
 			}
 			d.userspaceDeltaSyncMu.Lock()
-			if isPrimary && syncConnected {
-				n, _ := d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
-				if n > 0 {
-					slog.Info("userspace: reconciliation drain caught missed deltas", "count", n)
-				}
-			} else {
-				d.discardUserspaceSessionDeltas(drainer)
-			}
+			_, _ = d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1, userspaceSessionDeltaBatchSize)
 			d.userspaceDeltaSyncMu.Unlock()
-			continue
-		}
-
-		// Stream disconnected — fall back to fast polling.
-		cfg := d.store.ActiveConfig()
-		if cfg == nil {
-			continue
-		}
-		d.userspaceDeltaSyncMu.Lock()
-		if isPrimary && syncConnected {
-			_, _ = d.drainUserspaceSessionDeltasWithConfig(drainer, cfg, 1)
 		} else {
-			d.discardUserspaceSessionDeltas(drainer)
+			d.userspaceDeltaSyncMu.Lock()
+			d.discardUserspaceSessionDeltas(drainer, userspaceSessionDeltaBatchSize, userspaceDiscardSessionBatches)
+			d.userspaceDeltaSyncMu.Unlock()
 		}
-		d.userspaceDeltaSyncMu.Unlock()
 	}
 }
 
@@ -1006,14 +1017,15 @@ func (d *Daemon) drainUserspaceSessionDeltasWithConfig(
 	drainer userspaceSessionDeltaDrainer,
 	cfg *config.Config,
 	maxBatches int,
+	batchSize uint32,
 ) (int, error) {
-	if drainer == nil || cfg == nil || maxBatches <= 0 {
+	if drainer == nil || cfg == nil || maxBatches <= 0 || batchSize == 0 {
 		return 0, nil
 	}
 	zoneIDs := buildZoneIDs(cfg)
 	total := 0
 	for batch := 0; batch < maxBatches; batch++ {
-		deltas, _, err := drainer.DrainSessionDeltas(256)
+		deltas, _, err := drainer.DrainSessionDeltas(batchSize)
 		if err != nil {
 			return total, err
 		}
@@ -1021,7 +1033,7 @@ func (d *Daemon) drainUserspaceSessionDeltasWithConfig(
 			break
 		}
 		total += d.queueUserspaceSessionDeltas(zoneIDs, deltas)
-		if len(deltas) < 256 {
+		if len(deltas) < int(batchSize) {
 			break
 		}
 	}
@@ -1032,16 +1044,20 @@ func (d *Daemon) drainUserspaceSessionDeltasWithConfig(
 // without queuing them for sync. This advances the helper's "session delta
 // drained" counter on the standby node where deltas are generated (by
 // incoming session sync installs) but must not be sent back to the primary.
-func (d *Daemon) discardUserspaceSessionDeltas(drainer userspaceSessionDeltaDrainer) {
-	if drainer == nil {
+func (d *Daemon) discardUserspaceSessionDeltas(
+	drainer userspaceSessionDeltaDrainer,
+	batchSize uint32,
+	maxBatches int,
+) {
+	if drainer == nil || batchSize == 0 || maxBatches <= 0 {
 		return
 	}
-	for {
-		deltas, _, err := drainer.DrainSessionDeltas(256)
+	for batch := 0; batch < maxBatches; batch++ {
+		deltas, _, err := drainer.DrainSessionDeltas(batchSize)
 		if err != nil || len(deltas) == 0 {
 			return
 		}
-		if len(deltas) < 256 {
+		if len(deltas) < int(batchSize) {
 			return
 		}
 	}
