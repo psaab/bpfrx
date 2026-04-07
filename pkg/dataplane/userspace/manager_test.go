@@ -561,6 +561,42 @@ func TestSetClusterSyncedSessionV4MirrorFailureMarksHelperUnhealthy(t *testing.T
 	}
 }
 
+func TestSetClusterSyncedSessionV6MirrorFailureMarksHelperUnhealthy(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	dir := t.TempDir()
+	m := New()
+	m.proc = &exec.Cmd{}
+	m.cfg.ControlSocket = filepath.Join(dir, "control.sock")
+	injectSessionMaps(t, m)
+
+	var srcIPv6, dstIPv6 [16]byte
+	copy(srcIPv6[:], net.ParseIP("2001:db8:61::102").To16())
+	copy(dstIPv6[:], net.ParseIP("2001:db8:80::200").To16())
+	key := dataplane.SessionKeyV6{
+		SrcIP:    srcIPv6,
+		DstIP:    dstIPv6,
+		SrcPort:  hostToNetwork16(5201),
+		DstPort:  hostToNetwork16(55340),
+		Protocol: 6,
+	}
+	val := dataplane.SessionValueV6{
+		IsReverse: 0,
+	}
+
+	err := m.SetClusterSyncedSessionV6(key, val)
+	if err == nil {
+		t.Fatal("SetClusterSyncedSessionV6() = nil, want mirror failure")
+	}
+	if !m.sessionMirrorFailed {
+		t.Fatal("sessionMirrorFailed = false, want true")
+	}
+	if m.sessionMirrorErr == "" {
+		t.Fatal("sessionMirrorErr is empty")
+	}
+}
+
 func TestTakeoverReadyReportsSessionMirrorFailure(t *testing.T) {
 	m := &Manager{
 		proc: &exec.Cmd{Process: &os.Process{Pid: 1}},
