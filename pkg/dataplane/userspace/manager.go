@@ -67,35 +67,37 @@ type Manager struct {
 	dataplane.DataPlane
 	inner *dataplane.Manager
 
-	mu                 sync.Mutex
-	sessionMu          sync.Mutex // separate lock for session sync requests (Phase 3)
-	proc               *exec.Cmd
-	cfg                config.UserspaceConfig
-	clusterHA          bool
-	generation         uint64
-	syncCancel         context.CancelFunc
-	lastStatus         ProcessStatus
-	lastSnapshot       *ConfigSnapshot
-	haGroups           map[int]HAGroupStatus
-	lastIngressIfaces  []uint32
-	lastRSTv4          []netip.Addr
-	lastRSTv6          []netip.Addr
-	lastSnapshotHash   [32]byte // content hash of last published snapshot (excludes volatile fields)
-	lastBindingIndices []uint32
-	neighborsPrewarmed bool
-	ctrlEnableAt       time.Time
-	ctrlWasEnabled     bool
-	ctrlDisabledAt     uint64    // monotonic ktime_ns when ctrl was last disabled
-	lastDemotionTime   time.Time // wall clock when last RG demotion occurred
-	xskLivenessFailed  bool
-	xskLivenessProven  bool
-	xskProbeStart      time.Time
-	lastXSKRX          uint64
-	lastNAPIBootstrap  time.Time
-	publishedSnapshot  uint64
-	publishedPlanKey   string
-	deferWorkers       bool // skip worker spawn until NotifyLinkCycle
-	xskBoundNotified   bool // OnXSKBound fired at most once
+	mu                  sync.Mutex
+	sessionMu           sync.Mutex // separate lock for session sync requests (Phase 3)
+	proc                *exec.Cmd
+	cfg                 config.UserspaceConfig
+	clusterHA           bool
+	generation          uint64
+	syncCancel          context.CancelFunc
+	lastStatus          ProcessStatus
+	lastSnapshot        *ConfigSnapshot
+	haGroups            map[int]HAGroupStatus
+	lastIngressIfaces   []uint32
+	lastRSTv4           []netip.Addr
+	lastRSTv6           []netip.Addr
+	lastSnapshotHash    [32]byte // content hash of last published snapshot (excludes volatile fields)
+	lastBindingIndices  []uint32
+	neighborsPrewarmed  bool
+	ctrlEnableAt        time.Time
+	ctrlWasEnabled      bool
+	ctrlDisabledAt      uint64    // monotonic ktime_ns when ctrl was last disabled
+	lastDemotionTime    time.Time // wall clock when last RG demotion occurred
+	xskLivenessFailed   bool
+	xskLivenessProven   bool
+	xskProbeStart       time.Time
+	lastXSKRX           uint64
+	lastNAPIBootstrap   time.Time
+	publishedSnapshot   uint64
+	publishedPlanKey    string
+	sessionMirrorFailed bool
+	sessionMirrorErr    string
+	deferWorkers        bool // skip worker spawn until NotifyLinkCycle
+	xskBoundNotified    bool // OnXSKBound fired at most once
 
 	mode               DataplaneMode // current active runtime mode
 	configuredMode     DataplaneMode // user-configured desired mode (from config)
@@ -4195,6 +4197,8 @@ func (m *Manager) stopLocked() {
 	}
 	if m.proc == nil {
 		m.lastStatus = ProcessStatus{}
+		m.sessionMirrorFailed = false
+		m.sessionMirrorErr = ""
 		return
 	}
 	// Disable userspace forwarding BEFORE stopping the helper.
@@ -4234,6 +4238,8 @@ func (m *Manager) stopLocked() {
 	m.lastNAPIBootstrap = time.Time{}
 	m.publishedSnapshot = 0
 	m.publishedPlanKey = ""
+	m.sessionMirrorFailed = false
+	m.sessionMirrorErr = ""
 }
 
 // bootstrapNAPIQueuesLocked sends UDP probe packets to each managed

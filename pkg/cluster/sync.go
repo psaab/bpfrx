@@ -305,6 +305,9 @@ type SessionSync struct {
 	failoverWaiters       map[int]failoverWaiter
 	failoverCommitWaiters map[int]failoverWaiter
 	failoverSeq           atomic.Uint64
+
+	sessionMirrorWarnedV4 atomic.Bool
+	sessionMirrorWarnedV6 atomic.Bool
 }
 
 type failoverAck struct {
@@ -365,6 +368,23 @@ func NewDualSessionSync(local, peer, local1, peer1 string, dp dataplane.DataPlan
 		failoverWaiters:       make(map[int]failoverWaiter),
 		failoverCommitWaiters: make(map[int]failoverWaiter),
 	}
+}
+
+func (s *SessionSync) noteHelperMirrorResult(af string, warned *atomic.Bool, err error) {
+	if err == nil {
+		warned.Store(false)
+		return
+	}
+	s.stats.Errors.Add(1)
+	if warned.CompareAndSwap(false, true) {
+		slog.Warn("cluster sync: failed to mirror synced session into dataplane helper",
+			"af", af,
+			"err", err)
+		return
+	}
+	slog.Debug("cluster sync: repeated synced-session helper mirror failure",
+		"af", af,
+		"err", err)
 }
 
 func shouldInitiateFabricDial(localAddr, peerAddr string) bool {
@@ -1537,6 +1557,9 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 				if installer, ok := s.dp.(clusterSyncedSessionInstaller); ok {
 					if err := installer.SetClusterSyncedSessionV4(key, val); err == nil {
 						s.stats.SessionsInstalled.Add(1)
+						s.noteHelperMirrorResult("v4", &s.sessionMirrorWarnedV4, nil)
+					} else {
+						s.noteHelperMirrorResult("v4", &s.sessionMirrorWarnedV4, err)
 					}
 				} else {
 					// Invalidate FIB cache — peer's cached ifindex/MAC/gen
@@ -1633,6 +1656,9 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 				if installer, ok := s.dp.(clusterSyncedSessionInstaller); ok {
 					if err := installer.SetClusterSyncedSessionV6(key, val); err == nil {
 						s.stats.SessionsInstalled.Add(1)
+						s.noteHelperMirrorResult("v6", &s.sessionMirrorWarnedV6, nil)
+					} else {
+						s.noteHelperMirrorResult("v6", &s.sessionMirrorWarnedV6, err)
 					}
 				} else {
 					// Invalidate FIB cache (same as V4 above).

@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -61,6 +63,32 @@ func injectInnerMap(t *testing.T, inner *dataplane.Manager, name string, m *ebpf
 		t.Fatalf("injectInnerMap: cannot use value type %s for map element type %s", value.Type(), rv.Type().Elem())
 	}
 	rm.SetMapIndex(key, value)
+}
+
+func injectSessionMaps(t *testing.T, m *Manager) {
+	t.Helper()
+	sessionsMap, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKey{})),
+		ValueSize:  uint32(unsafe.Sizeof(dataplane.SessionValue{})),
+		MaxEntries: 1024,
+	})
+	if err != nil {
+		t.Fatalf("new sessions map: %v", err)
+	}
+	t.Cleanup(func() { sessionsMap.Close() })
+	injectInnerMap(t, m.inner, "sessions", sessionsMap)
+	sessionsMapV6, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKeyV6{})),
+		ValueSize:  uint32(unsafe.Sizeof(dataplane.SessionValueV6{})),
+		MaxEntries: 1024,
+	})
+	if err != nil {
+		t.Fatalf("new sessions_v6 map: %v", err)
+	}
+	t.Cleanup(func() { sessionsMapV6.Close() })
+	injectInnerMap(t, m.inner, "sessions_v6", sessionsMapV6)
 }
 
 func TestFindUserspaceEgressInterfaceSnapshotPrefersVLANUnit(t *testing.T) {
@@ -497,6 +525,110 @@ func TestSetClusterSyncedSessionV4SkipsReverseHelperMirror(t *testing.T) {
 	case msg := <-unexpectedConn:
 		t.Fatal(msg)
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestSetClusterSyncedSessionV4MirrorFailureMarksHelperUnhealthy(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	dir := t.TempDir()
+	m := New()
+	m.proc = &exec.Cmd{}
+	m.cfg.ControlSocket = filepath.Join(dir, "control.sock")
+	injectSessionMaps(t, m)
+
+	key := dataplane.SessionKey{
+		SrcIP:    [4]byte{10, 0, 61, 102},
+		DstIP:    [4]byte{172, 16, 80, 200},
+		SrcPort:  hostToNetwork16(5201),
+		DstPort:  hostToNetwork16(55340),
+		Protocol: 6,
+	}
+	val := dataplane.SessionValue{
+		IsReverse: 0,
+	}
+
+	err := m.SetClusterSyncedSessionV4(key, val)
+	if err == nil {
+		t.Fatal("SetClusterSyncedSessionV4() = nil, want mirror failure")
+	}
+	if !m.sessionMirrorFailed {
+		t.Fatal("sessionMirrorFailed = false, want true")
+	}
+	if m.sessionMirrorErr == "" {
+		t.Fatal("sessionMirrorErr is empty")
+	}
+}
+
+func TestSetClusterSyncedSessionV6MirrorFailureMarksHelperUnhealthy(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	dir := t.TempDir()
+	m := New()
+	m.proc = &exec.Cmd{}
+	m.cfg.ControlSocket = filepath.Join(dir, "control.sock")
+	injectSessionMaps(t, m)
+
+	var srcIPv6, dstIPv6 [16]byte
+	copy(srcIPv6[:], net.ParseIP("2001:db8:61::102").To16())
+	copy(dstIPv6[:], net.ParseIP("2001:db8:80::200").To16())
+	key := dataplane.SessionKeyV6{
+		SrcIP:    srcIPv6,
+		DstIP:    dstIPv6,
+		SrcPort:  hostToNetwork16(5201),
+		DstPort:  hostToNetwork16(55340),
+		Protocol: 6,
+	}
+	val := dataplane.SessionValueV6{
+		IsReverse: 0,
+	}
+
+	err := m.SetClusterSyncedSessionV6(key, val)
+	if err == nil {
+		t.Fatal("SetClusterSyncedSessionV6() = nil, want mirror failure")
+	}
+	if !m.sessionMirrorFailed {
+		t.Fatal("sessionMirrorFailed = false, want true")
+	}
+	if m.sessionMirrorErr == "" {
+		t.Fatal("sessionMirrorErr is empty")
+	}
+}
+
+func TestTakeoverReadyReportsSessionMirrorFailure(t *testing.T) {
+	m := &Manager{
+		proc: &exec.Cmd{Process: &os.Process{Pid: 1}},
+		lastStatus: ProcessStatus{
+			Enabled:         true,
+			ForwardingArmed: true,
+			Capabilities: UserspaceCapabilities{
+				ForwardingSupported: true,
+			},
+		},
+		mode:                ModeUserspaceCompat,
+		xskLivenessProven:   true,
+		sessionMirrorFailed: true,
+		sessionMirrorErr:    "dial unix /tmp/userspace-dp-sessions.sock: connect: no such file or directory",
+	}
+
+	ready, reasons := m.TakeoverReady()
+	if ready {
+		t.Fatal("TakeoverReady() = true, want false")
+	}
+	if len(reasons) == 0 {
+		t.Fatal("TakeoverReady() returned no reasons")
+	}
+	found := false
+	for _, reason := range reasons {
+		if strings.Contains(reason, "userspace session mirror unhealthy") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected session mirror failure reason, got %v", reasons)
 	}
 }
 
@@ -1370,6 +1502,8 @@ func TestStopLockedClearsLastStatus(t *testing.T) {
 			ForwardingArmed: true,
 			Capabilities:    UserspaceCapabilities{ForwardingSupported: true},
 		},
+		sessionMirrorFailed: true,
+		sessionMirrorErr:    "boom",
 	}
 
 	m.stopLocked()
@@ -1385,6 +1519,12 @@ func TestStopLockedClearsLastStatus(t *testing.T) {
 	}
 	if m.lastStatus.Capabilities.ForwardingSupported {
 		t.Fatal("lastStatus.Capabilities.ForwardingSupported = true, want false")
+	}
+	if m.sessionMirrorFailed {
+		t.Fatal("sessionMirrorFailed = true, want false")
+	}
+	if m.sessionMirrorErr != "" {
+		t.Fatalf("sessionMirrorErr = %q, want empty", m.sessionMirrorErr)
 	}
 }
 

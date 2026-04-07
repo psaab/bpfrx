@@ -271,7 +271,21 @@ func (m *Manager) takeoverReadyLocked() (bool, []string) {
 	if !m.xskLivenessProven {
 		reasons = append(reasons, "userspace XSK liveness not proven")
 	}
+	if m.sessionMirrorFailed {
+		reason := "userspace session mirror unhealthy"
+		if m.sessionMirrorErr != "" {
+			reason += ": " + m.sessionMirrorErr
+		}
+		reasons = append(reasons, reason)
+	}
 	return len(reasons) == 0, reasons
+}
+
+func (m *Manager) recordSessionMirrorFailureLocked(err error) {
+	m.sessionMirrorFailed = true
+	if err != nil {
+		m.sessionMirrorErr = err.Error()
+	}
 }
 
 func (m *Manager) hasActiveDataRGLocked() bool {
@@ -546,7 +560,9 @@ func (m *Manager) SetClusterSyncedSessionV4(key dataplane.SessionKey, val datapl
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.syncSessionV4Locked("upsert", key, &installVal); err != nil {
+		m.recordSessionMirrorFailureLocked(err)
 		slog.Debug("userspace: session mirror failed", "err", err)
+		return fmt.Errorf("mirror synced v4 session to userspace helper: %w", err)
 	}
 	return nil
 }
@@ -597,7 +613,9 @@ func (m *Manager) SetClusterSyncedSessionV6(key dataplane.SessionKeyV6, val data
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := m.syncSessionV6Locked("upsert", key, &installVal); err != nil {
+		m.recordSessionMirrorFailureLocked(err)
 		slog.Debug("userspace: session mirror failed", "err", err)
+		return fmt.Errorf("mirror synced v6 session to userspace helper: %w", err)
 	}
 	return nil
 }
