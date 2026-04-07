@@ -576,6 +576,63 @@ func TestRequestPeerFailoverCommitsLocalPrimaryWithoutHeartbeatObservation(t *te
 	}
 }
 
+func TestRequestPeerFailoverBatchCommitsLocalPrimaryTogether(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(1, true, map[int]int{0: 100}),
+		makeRG(2, true, map[int]int{0: 100}),
+	)
+	m.UpdateConfig(cfg)
+	<-m.Events()
+	<-m.Events()
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 1, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+			{GroupID: 2, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+	m.mu.Lock()
+	for _, rgID := range []int{1, 2} {
+		m.groups[rgID].Ready = true
+		m.groups[rgID].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+		m.groups[rgID].ReadinessReasons = nil
+	}
+	m.mu.Unlock()
+
+	var committedRGs []int
+	var committedReqID uint64
+	m.SetPeerFailoverBatchFunc(func(rgIDs []int) (uint64, error) {
+		committedRGs = append([]int(nil), rgIDs...)
+		return 88, nil
+	})
+	m.SetPeerFailoverCommitBatchFunc(func(rgIDs []int, reqID uint64) error {
+		committedRGs = append([]int(nil), rgIDs...)
+		committedReqID = reqID
+		return nil
+	})
+
+	if err := m.RequestPeerFailoverBatch([]int{2, 1}); err != nil {
+		t.Fatalf("RequestPeerFailoverBatch() error = %v", err)
+	}
+	if !m.IsLocalPrimary(1) || !m.IsLocalPrimary(2) {
+		t.Fatal("both redundancy groups should be primary after explicit batch transfer commit")
+	}
+	if committedReqID != 88 {
+		t.Fatalf("commit reqID = %d, want 88", committedReqID)
+	}
+	if len(committedRGs) != 2 || committedRGs[0] != 1 || committedRGs[1] != 2 {
+		t.Fatalf("committed rgs = %v, want [1 2]", committedRGs)
+	}
+	for _, rgID := range []int{1, 2} {
+		if peer := m.PeerGroupStates()[rgID]; peer.State != StateSecondary {
+			t.Fatalf("peer state for rg %d = %s, want secondary after commit", rgID, peer.State)
+		}
+	}
+}
+
 func TestRequestPeerFailoverRequiresLocalReadiness(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
@@ -776,6 +833,36 @@ func TestFinalizePeerTransferOutClearsSecondaryHold(t *testing.T) {
 	}
 	if state.ManualFailover {
 		t.Fatal("ManualFailover should be cleared after peer commit")
+	}
+}
+
+func TestFinalizePeerTransferOutBatchClearsSecondaryHold(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(1, true, map[int]int{0: 100}),
+		makeRG(2, true, map[int]int{0: 100}),
+	)
+	m.UpdateConfig(cfg)
+	<-m.Events()
+	<-m.Events()
+
+	if err := m.ManualFailoverBatch([]int{1, 2}); err != nil {
+		t.Fatalf("ManualFailoverBatch() error = %v", err)
+	}
+	<-m.Events()
+	<-m.Events()
+
+	if err := m.FinalizePeerTransferOutBatch([]int{2, 1}); err != nil {
+		t.Fatalf("FinalizePeerTransferOutBatch() error = %v", err)
+	}
+	for _, rgID := range []int{1, 2} {
+		state := m.GroupState(rgID)
+		if state.State != StateSecondary {
+			t.Fatalf("rg %d state = %s, want secondary", rgID, state.State)
+		}
+		if state.ManualFailover {
+			t.Fatalf("rg %d ManualFailover should be cleared after peer batch commit", rgID)
+		}
 	}
 }
 

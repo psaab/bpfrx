@@ -152,6 +152,14 @@ type Manager struct {
 	// node has explicitly assumed primary ownership.
 	peerFailoverCommitFn func(rgID int, reqID uint64) error
 
+	// peerFailoverBatchFn sends an explicit transfer-out request for multiple
+	// redundancy groups that must move together in one handoff unit.
+	peerFailoverBatchFn func(rgIDs []int) (uint64, error)
+
+	// peerFailoverCommitBatchFn sends the ownership-commit message for a
+	// previously acknowledged multi-RG transfer.
+	peerFailoverCommitBatchFn func(rgIDs []int, reqID uint64) error
+
 	// peerFenceFn sends a fence (disable-rg) message to the peer.
 	// Set by daemon after sessionSync creation.
 	peerFenceFn func() error
@@ -622,6 +630,22 @@ func (m *Manager) GroupStates() []RedundancyGroupState {
 	return states
 }
 
+// DataGroupIDs returns the configured non-control redundancy groups in
+// ascending order. RG0 is reserved for control-plane ownership and is omitted.
+func (m *Manager) DataGroupIDs() []int {
+	m.mu.RLock()
+	ids := make([]int, 0, len(m.groups))
+	for rgID := range m.groups {
+		if rgID == 0 {
+			continue
+		}
+		ids = append(ids, rgID)
+	}
+	m.mu.RUnlock()
+	sort.Ints(ids)
+	return ids
+}
+
 // GroupState returns the state for a specific redundancy group, or nil if not found.
 func (m *Manager) GroupState(rgID int) *RedundancyGroupState {
 	m.mu.RLock()
@@ -786,6 +810,22 @@ func (m *Manager) SetPeerFailoverCommitFunc(fn func(rgID int, reqID uint64) erro
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.peerFailoverCommitFn = fn
+}
+
+// SetPeerFailoverBatchFunc sets the callback used to send remote multi-RG
+// failover requests to the peer via the fabric sync connection.
+func (m *Manager) SetPeerFailoverBatchFunc(fn func(rgIDs []int) (uint64, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peerFailoverBatchFn = fn
+}
+
+// SetPeerFailoverCommitBatchFunc sets the callback used to send the final
+// multi-RG transfer-commit message via the fabric sync connection.
+func (m *Manager) SetPeerFailoverCommitBatchFunc(fn func(rgIDs []int, reqID uint64) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.peerFailoverCommitBatchFn = fn
 }
 
 // SetPeerFenceFunc sets the callback used to send a fence message to the

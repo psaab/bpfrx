@@ -26,25 +26,29 @@ var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 
 // Sync message types.
 const (
-	syncMsgSessionV4         = 1
-	syncMsgSessionV6         = 2
-	syncMsgDeleteV4          = 3
-	syncMsgDeleteV6          = 4
-	syncMsgBulkStart         = 5
-	syncMsgBulkEnd           = 6
-	syncMsgHeartbeat         = 7
-	syncMsgConfig            = 8  // full config text sync from primary to secondary
-	syncMsgIPsecSA           = 9  // IPsec SA connection names sync
-	syncMsgFailover          = 10 // remote failover request (payload: 1 byte rgID)
-	syncMsgFence             = 11 // peer fencing: receiver should disable all RGs
-	syncMsgClockSync         = 12 // monotonic clock exchange for timestamp rebasing
-	syncMsgBarrier           = 13 // ordered marker for remote install barriers
-	syncMsgBarrierAck        = 14
-	syncMsgBulkAck           = 15
-	syncMsgFailoverAck       = 16 // failover request result (payload: rgID, status, detail)
-	syncMsgFailoverCommit    = 17 // failover ownership commit (payload: rgID, reqID)
-	syncMsgFailoverCommitAck = 18 // failover commit result (payload: rgID, status, detail)
-	syncMsgPrepareActivation = 19 // hint: demoting node tells peer to pre-warm neighbors (payload: 1 byte rgID)
+	syncMsgSessionV4              = 1
+	syncMsgSessionV6              = 2
+	syncMsgDeleteV4               = 3
+	syncMsgDeleteV6               = 4
+	syncMsgBulkStart              = 5
+	syncMsgBulkEnd                = 6
+	syncMsgHeartbeat              = 7
+	syncMsgConfig                 = 8  // full config text sync from primary to secondary
+	syncMsgIPsecSA                = 9  // IPsec SA connection names sync
+	syncMsgFailover               = 10 // remote failover request (payload: 1 byte rgID)
+	syncMsgFence                  = 11 // peer fencing: receiver should disable all RGs
+	syncMsgClockSync              = 12 // monotonic clock exchange for timestamp rebasing
+	syncMsgBarrier                = 13 // ordered marker for remote install barriers
+	syncMsgBarrierAck             = 14
+	syncMsgBulkAck                = 15
+	syncMsgFailoverAck            = 16 // failover request result (payload: rgID, status, detail)
+	syncMsgFailoverCommit         = 17 // failover ownership commit (payload: rgID, reqID)
+	syncMsgFailoverCommitAck      = 18 // failover commit result (payload: rgID, status, detail)
+	syncMsgPrepareActivation      = 19 // hint: demoting node tells peer to pre-warm neighbors (payload: 1 byte rgID)
+	syncMsgFailoverBatch          = 20 // remote failover request for multiple RGs
+	syncMsgFailoverBatchAck       = 21 // multi-RG failover request result
+	syncMsgFailoverBatchCommit    = 22 // multi-RG failover ownership commit
+	syncMsgFailoverBatchCommitAck = 23 // multi-RG failover commit result
 )
 
 // syncHeader is the wire header for each sync message.
@@ -205,6 +209,14 @@ type SessionSync struct {
 	// the demoted side of the handoff.
 	OnRemoteFailoverCommit func(rgID int) error
 
+	// OnRemoteFailoverBatch is called when the peer requests us to transfer
+	// multiple RGs out of primary in one explicit handoff transaction.
+	OnRemoteFailoverBatch func(rgIDs []int) error
+
+	// OnRemoteFailoverCommitBatch finalizes the demoted side of a previously
+	// acknowledged multi-RG handoff after the peer commits ownership.
+	OnRemoteFailoverCommitBatch func(rgIDs []int) error
+
 	// OnFenceReceived is called when the peer sends a fence message, requesting
 	// this node to disable all RGs (set rg_active=false). The receiver should
 	// call dp.UpdateRGActive(rgID, false) for every RG.
@@ -301,10 +313,12 @@ type SessionSync struct {
 	barrierWaitMu  sync.Mutex
 	barrierWaiters map[uint64]chan struct{}
 
-	failoverWaitMu        sync.Mutex
-	failoverWaiters       map[int]failoverWaiter
-	failoverCommitWaiters map[int]failoverWaiter
-	failoverSeq           atomic.Uint64
+	failoverWaitMu             sync.Mutex
+	failoverWaiters            map[int]failoverWaiter
+	failoverCommitWaiters      map[int]failoverWaiter
+	failoverBatchWaiters       map[string]failoverWaiter
+	failoverBatchCommitWaiters map[string]failoverWaiter
+	failoverSeq                atomic.Uint64
 
 	sessionMirrorWarnedV4 atomic.Bool
 	sessionMirrorWarnedV6 atomic.Bool
@@ -318,6 +332,7 @@ type failoverAck struct {
 type failoverWaiter struct {
 	reqID uint64
 	ch    chan failoverAck
+	rgIDs []int
 }
 
 const (
@@ -328,6 +343,100 @@ const (
 )
 
 var ErrRemoteFailoverRejected = errors.New("remote failover rejected")
+
+const maxFailoverBatchRGCount = 255
+
+func validateFailoverBatchRGCount(rgIDs []int) error {
+	if len(rgIDs) > maxFailoverBatchRGCount {
+		return fmt.Errorf("too many redundancy groups in failover batch: %d > %d", len(rgIDs), maxFailoverBatchRGCount)
+	}
+	return nil
+}
+
+func encodeFailoverBatchRequestPayload(rgIDs []int, reqID uint64) []byte {
+	payload := make([]byte, 1+len(rgIDs)+8)
+	payload[0] = byte(len(rgIDs))
+	for i, rgID := range rgIDs {
+		payload[1+i] = byte(rgID)
+	}
+	binary.LittleEndian.PutUint64(payload[1+len(rgIDs):], reqID)
+	return payload
+}
+
+func decodeFailoverBatchRequestPayload(payload []byte) ([]int, uint64, error) {
+	if len(payload) < 1 {
+		return nil, 0, fmt.Errorf("message too short")
+	}
+	count := int(payload[0])
+	if count == 0 {
+		return nil, 0, fmt.Errorf("batch has no redundancy groups")
+	}
+	if len(payload) < 1+count+8 {
+		return nil, 0, fmt.Errorf("message too short")
+	}
+	rgIDs := make([]int, 0, count)
+	for _, rgID := range payload[1 : 1+count] {
+		rgIDs = append(rgIDs, int(rgID))
+	}
+	ids, err := normalizeFailoverRGIDs(rgIDs)
+	if err != nil {
+		return nil, 0, err
+	}
+	return ids, binary.LittleEndian.Uint64(payload[1+count : 1+count+8]), nil
+}
+
+func encodeFailoverBatchAckPayload(rgIDs []int, status uint8, reqID uint64, detail string) []byte {
+	payload := make([]byte, 1+len(rgIDs)+1+8+len(detail))
+	payload[0] = byte(len(rgIDs))
+	for i, rgID := range rgIDs {
+		payload[1+i] = byte(rgID)
+	}
+	payload[1+len(rgIDs)] = status
+	binary.LittleEndian.PutUint64(payload[1+len(rgIDs)+1:], reqID)
+	copy(payload[1+len(rgIDs)+1+8:], detail)
+	return payload
+}
+
+func decodeFailoverBatchAckPayload(payload []byte) ([]int, uint8, uint64, string, error) {
+	if len(payload) < 1 {
+		return nil, 0, 0, "", fmt.Errorf("message too short")
+	}
+	count := int(payload[0])
+	if count == 0 {
+		return nil, 0, 0, "", fmt.Errorf("batch has no redundancy groups")
+	}
+	if len(payload) < 1+count+1+8 {
+		return nil, 0, 0, "", fmt.Errorf("message too short")
+	}
+	rgIDs := make([]int, 0, count)
+	for _, rgID := range payload[1 : 1+count] {
+		rgIDs = append(rgIDs, int(rgID))
+	}
+	ids, err := normalizeFailoverRGIDs(rgIDs)
+	if err != nil {
+		return nil, 0, 0, "", err
+	}
+	status := payload[1+count]
+	reqID := binary.LittleEndian.Uint64(payload[1+count+1 : 1+count+1+8])
+	detail := string(payload[1+count+1+8:])
+	return ids, status, reqID, detail, nil
+}
+
+func rgSetOverlap(a, b []int) bool {
+	if len(a) == 0 || len(b) == 0 {
+		return false
+	}
+	set := make(map[int]struct{}, len(a))
+	for _, rgID := range a {
+		set[rgID] = struct{}{}
+	}
+	for _, rgID := range b {
+		if _, ok := set[rgID]; ok {
+			return true
+		}
+	}
+	return false
+}
 
 type sessionSyncSweepProfiler interface {
 	SessionSyncSweepProfile() (enabled bool, activeInterval, idleInterval time.Duration)
@@ -344,13 +453,15 @@ const deleteJournalDefaultCap = 10000
 // NewSessionSync creates a new session synchronization manager.
 func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *SessionSync {
 	return &SessionSync{
-		localAddr:             localAddr,
-		peerAddr:              peerAddr,
-		dp:                    dp,
-		sendCh:                make(chan []byte, 4096),
-		deleteJournalCap:      deleteJournalDefaultCap,
-		failoverWaiters:       make(map[int]failoverWaiter),
-		failoverCommitWaiters: make(map[int]failoverWaiter),
+		localAddr:                  localAddr,
+		peerAddr:                   peerAddr,
+		dp:                         dp,
+		sendCh:                     make(chan []byte, 4096),
+		deleteJournalCap:           deleteJournalDefaultCap,
+		failoverWaiters:            make(map[int]failoverWaiter),
+		failoverCommitWaiters:      make(map[int]failoverWaiter),
+		failoverBatchWaiters:       make(map[string]failoverWaiter),
+		failoverBatchCommitWaiters: make(map[string]failoverWaiter),
 	}
 }
 
@@ -358,15 +469,17 @@ func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *Session
 // If local1/peer1 are empty, falls back to single-fabric behavior.
 func NewDualSessionSync(local, peer, local1, peer1 string, dp dataplane.DataPlane) *SessionSync {
 	return &SessionSync{
-		localAddr:             local,
-		peerAddr:              peer,
-		localAddr1:            local1,
-		peerAddr1:             peer1,
-		dp:                    dp,
-		sendCh:                make(chan []byte, 4096),
-		deleteJournalCap:      deleteJournalDefaultCap,
-		failoverWaiters:       make(map[int]failoverWaiter),
-		failoverCommitWaiters: make(map[int]failoverWaiter),
+		localAddr:                  local,
+		peerAddr:                   peer,
+		localAddr1:                 local1,
+		peerAddr1:                  peer1,
+		dp:                         dp,
+		sendCh:                     make(chan []byte, 4096),
+		deleteJournalCap:           deleteJournalDefaultCap,
+		failoverWaiters:            make(map[int]failoverWaiter),
+		failoverCommitWaiters:      make(map[int]failoverWaiter),
+		failoverBatchWaiters:       make(map[string]failoverWaiter),
+		failoverBatchCommitWaiters: make(map[string]failoverWaiter),
 	}
 }
 
@@ -1121,12 +1234,50 @@ func (s *SessionSync) QueueConfig(configText string) {
 	slog.Info("cluster sync: config sent to peer", "size", len(payload))
 }
 
+func validateFailoverProtocolRGID(rgID int) error {
+	if rgID < 0 || rgID > 255 {
+		return fmt.Errorf("redundancy group %d out of failover protocol range 0..255", rgID)
+	}
+	return nil
+}
+
+func validateFailoverProtocolRGIDs(rgIDs []int) error {
+	for _, rgID := range rgIDs {
+		if err := validateFailoverProtocolRGID(rgID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *SessionSync) failoverRGInUseLocked(rgIDs []int) bool {
+	for _, rgID := range rgIDs {
+		if _, exists := s.failoverWaiters[rgID]; exists {
+			return true
+		}
+		if _, exists := s.failoverCommitWaiters[rgID]; exists {
+			return true
+		}
+	}
+	for _, waiter := range s.failoverBatchWaiters {
+		if rgSetOverlap(waiter.rgIDs, rgIDs) {
+			return true
+		}
+	}
+	for _, waiter := range s.failoverBatchCommitWaiters {
+		if rgSetOverlap(waiter.rgIDs, rgIDs) {
+			return true
+		}
+	}
+	return false
+}
+
 // SendFailover sends a remote failover request to the peer and waits for
 // an explicit applied/rejected acknowledgement. On success it returns the
 // acknowledged request ID for the later transfer-commit step.
 func (s *SessionSync) SendFailover(rgID int) (uint64, error) {
-	if rgID < 0 || rgID > 255 {
-		return 0, fmt.Errorf("redundancy group %d out of failover protocol range 0..255", rgID)
+	if err := validateFailoverProtocolRGID(rgID); err != nil {
+		return 0, err
 	}
 	conn := s.getActiveConn()
 	if conn == nil {
@@ -1140,7 +1291,11 @@ func (s *SessionSync) SendFailover(rgID int) (uint64, error) {
 		s.failoverWaitMu.Unlock()
 		return 0, fmt.Errorf("failover request already in flight for redundancy group %d", rgID)
 	}
-	s.failoverWaiters[rgID] = failoverWaiter{reqID: reqID, ch: waitCh}
+	if s.failoverRGInUseLocked([]int{rgID}) {
+		s.failoverWaitMu.Unlock()
+		return 0, fmt.Errorf("failover request already in flight for redundancy group %d", rgID)
+	}
+	s.failoverWaiters[rgID] = failoverWaiter{reqID: reqID, ch: waitCh, rgIDs: []int{rgID}}
 	s.failoverWaitMu.Unlock()
 
 	payload := make([]byte, 9)
@@ -1164,47 +1319,11 @@ func (s *SessionSync) SendFailover(rgID int) (uint64, error) {
 	defer timer.Stop()
 	select {
 	case ack := <-waitCh:
-		switch ack.status {
-		case failoverAckApplied:
-			return reqID, nil
-		case failoverAckRejected:
-			if ack.detail != "" {
-				return 0, fmt.Errorf("peer rejected failover request for redundancy group %d: %s", rgID, ack.detail)
-			}
-			return 0, fmt.Errorf("peer rejected failover request for redundancy group %d", rgID)
-		case failoverAckFailed:
-			if ack.detail != "" {
-				return 0, fmt.Errorf("peer failed failover request for redundancy group %d: %s", rgID, ack.detail)
-			}
-			return 0, fmt.Errorf("peer failed failover request for redundancy group %d", rgID)
-		default:
-			if ack.detail != "" {
-				return 0, fmt.Errorf("failover request for redundancy group %d aborted: %s", rgID, ack.detail)
-			}
-			return 0, fmt.Errorf("failover request for redundancy group %d aborted", rgID)
-		}
+		return reqID, failoverAckError([]int{rgID}, ack)
 	case <-timer.C:
 		select {
 		case ack := <-waitCh:
-			switch ack.status {
-			case failoverAckApplied:
-				return reqID, nil
-			case failoverAckRejected:
-				if ack.detail != "" {
-					return 0, fmt.Errorf("peer rejected failover request for redundancy group %d: %s", rgID, ack.detail)
-				}
-				return 0, fmt.Errorf("peer rejected failover request for redundancy group %d", rgID)
-			case failoverAckFailed:
-				if ack.detail != "" {
-					return 0, fmt.Errorf("peer failed failover request for redundancy group %d: %s", rgID, ack.detail)
-				}
-				return 0, fmt.Errorf("peer failed failover request for redundancy group %d", rgID)
-			default:
-				if ack.detail != "" {
-					return 0, fmt.Errorf("failover request for redundancy group %d aborted: %s", rgID, ack.detail)
-				}
-				return 0, fmt.Errorf("failover request for redundancy group %d aborted", rgID)
-			}
+			return reqID, failoverAckError([]int{rgID}, ack)
 		default:
 		}
 		s.failoverWaitMu.Lock()
@@ -1216,11 +1335,110 @@ func (s *SessionSync) SendFailover(rgID int) (uint64, error) {
 	}
 }
 
+// SendFailoverBatch sends a remote failover request for multiple RGs and waits
+// for an explicit applied/rejected acknowledgement.
+func (s *SessionSync) SendFailoverBatch(rgIDs []int) (uint64, error) {
+	ids, err := normalizeFailoverRGIDs(rgIDs)
+	if err != nil {
+		return 0, err
+	}
+	if len(ids) == 1 {
+		return s.SendFailover(ids[0])
+	}
+	if err := validateFailoverProtocolRGIDs(ids); err != nil {
+		return 0, err
+	}
+	if err := validateFailoverBatchRGCount(ids); err != nil {
+		return 0, err
+	}
+	conn := s.getActiveConn()
+	if conn == nil {
+		return 0, fmt.Errorf("peer not connected")
+	}
+
+	waitCh := make(chan failoverAck, 1)
+	reqID := s.failoverSeq.Add(1)
+	key := failoverBatchKey(ids)
+	s.failoverWaitMu.Lock()
+	if _, exists := s.failoverBatchWaiters[key]; exists || s.failoverRGInUseLocked(ids) {
+		s.failoverWaitMu.Unlock()
+		return 0, fmt.Errorf("failover request already in flight for redundancy groups %v", ids)
+	}
+	s.failoverBatchWaiters[key] = failoverWaiter{reqID: reqID, ch: waitCh, rgIDs: append([]int(nil), ids...)}
+	s.failoverWaitMu.Unlock()
+
+	payload := encodeFailoverBatchRequestPayload(ids, reqID)
+	s.writeMu.Lock()
+	err = writeMsg(conn, syncMsgFailoverBatch, payload)
+	s.writeMu.Unlock()
+	if err != nil {
+		s.completeFailoverBatchWait(key, reqID, failoverAck{
+			status: failoverAckDisconnected,
+			detail: "send failed",
+		})
+		slog.Warn("cluster sync: batch failover send error", "err", err, "rgs", ids)
+		s.stats.Errors.Add(1)
+		s.handleDisconnect(conn)
+		return 0, fmt.Errorf("failed to send batch failover request: %w", err)
+	}
+	slog.Info("cluster sync: batch failover request sent to peer", "rgs", ids)
+	timer := time.NewTimer(failoverAckTimeout)
+	defer timer.Stop()
+	select {
+	case ack := <-waitCh:
+		if err := failoverAckError(ids, ack); err != nil {
+			return 0, err
+		}
+		return reqID, nil
+	case <-timer.C:
+		select {
+		case ack := <-waitCh:
+			if err := failoverAckError(ids, ack); err != nil {
+				return 0, err
+			}
+			return reqID, nil
+		default:
+		}
+		s.failoverWaitMu.Lock()
+		if current, ok := s.failoverBatchWaiters[key]; ok && current.reqID == reqID && current.ch == waitCh {
+			delete(s.failoverBatchWaiters, key)
+		}
+		s.failoverWaitMu.Unlock()
+		return 0, fmt.Errorf("timed out waiting for peer failover ack for redundancy groups %v", ids)
+	}
+}
+
+func failoverAckError(rgIDs []int, ack failoverAck) error {
+	label := fmt.Sprintf("redundancy groups %v", rgIDs)
+	if len(rgIDs) == 1 {
+		label = fmt.Sprintf("redundancy group %d", rgIDs[0])
+	}
+	switch ack.status {
+	case failoverAckApplied:
+		return nil
+	case failoverAckRejected:
+		if ack.detail != "" {
+			return fmt.Errorf("peer rejected failover request for %s: %s", label, ack.detail)
+		}
+		return fmt.Errorf("peer rejected failover request for %s", label)
+	case failoverAckFailed:
+		if ack.detail != "" {
+			return fmt.Errorf("peer failed failover request for %s: %s", label, ack.detail)
+		}
+		return fmt.Errorf("peer failed failover request for %s", label)
+	default:
+		if ack.detail != "" {
+			return fmt.Errorf("failover request for %s aborted: %s", label, ack.detail)
+		}
+		return fmt.Errorf("failover request for %s aborted", label)
+	}
+}
+
 // SendFailoverCommit sends the final ownership-commit step for a previously
 // acknowledged failover request and waits for the peer to finalize transfer-out.
 func (s *SessionSync) SendFailoverCommit(rgID int, reqID uint64) error {
-	if rgID < 0 || rgID > 255 {
-		return fmt.Errorf("redundancy group %d out of failover protocol range 0..255", rgID)
+	if err := validateFailoverProtocolRGID(rgID); err != nil {
+		return err
 	}
 	conn := s.getActiveConn()
 	if conn == nil {
@@ -1233,7 +1451,11 @@ func (s *SessionSync) SendFailoverCommit(rgID int, reqID uint64) error {
 		s.failoverWaitMu.Unlock()
 		return fmt.Errorf("failover commit already in flight for redundancy group %d", rgID)
 	}
-	s.failoverCommitWaiters[rgID] = failoverWaiter{reqID: reqID, ch: waitCh}
+	if s.failoverRGInUseLocked([]int{rgID}) {
+		s.failoverWaitMu.Unlock()
+		return fmt.Errorf("failover commit already in flight for redundancy group %d", rgID)
+	}
+	s.failoverCommitWaiters[rgID] = failoverWaiter{reqID: reqID, ch: waitCh, rgIDs: []int{rgID}}
 	s.failoverWaitMu.Unlock()
 
 	payload := make([]byte, 9)
@@ -1270,6 +1492,95 @@ func (s *SessionSync) SendFailoverCommit(rgID int, reqID uint64) error {
 		}
 		s.failoverWaitMu.Unlock()
 		return fmt.Errorf("timed out waiting for peer failover commit ack for redundancy group %d", rgID)
+	}
+}
+
+// SendFailoverCommitBatch sends the final ownership-commit step for a
+// previously acknowledged multi-RG failover request.
+func (s *SessionSync) SendFailoverCommitBatch(rgIDs []int, reqID uint64) error {
+	ids, err := normalizeFailoverRGIDs(rgIDs)
+	if err != nil {
+		return err
+	}
+	if len(ids) == 1 {
+		return s.SendFailoverCommit(ids[0], reqID)
+	}
+	if err := validateFailoverProtocolRGIDs(ids); err != nil {
+		return err
+	}
+	if err := validateFailoverBatchRGCount(ids); err != nil {
+		return err
+	}
+	conn := s.getActiveConn()
+	if conn == nil {
+		return fmt.Errorf("peer not connected")
+	}
+
+	waitCh := make(chan failoverAck, 1)
+	key := failoverBatchKey(ids)
+	s.failoverWaitMu.Lock()
+	if _, exists := s.failoverBatchCommitWaiters[key]; exists || s.failoverRGInUseLocked(ids) {
+		s.failoverWaitMu.Unlock()
+		return fmt.Errorf("failover commit already in flight for redundancy groups %v", ids)
+	}
+	s.failoverBatchCommitWaiters[key] = failoverWaiter{reqID: reqID, ch: waitCh, rgIDs: append([]int(nil), ids...)}
+	s.failoverWaitMu.Unlock()
+
+	payload := encodeFailoverBatchRequestPayload(ids, reqID)
+	s.writeMu.Lock()
+	err = writeMsg(conn, syncMsgFailoverBatchCommit, payload)
+	s.writeMu.Unlock()
+	if err != nil {
+		s.completeFailoverBatchCommitWait(key, reqID, failoverAck{
+			status: failoverAckDisconnected,
+			detail: "send failed",
+		})
+		slog.Warn("cluster sync: batch failover commit send error", "err", err, "rgs", ids, "req_id", reqID)
+		s.stats.Errors.Add(1)
+		s.handleDisconnect(conn)
+		return fmt.Errorf("failed to send batch failover commit: %w", err)
+	}
+	slog.Info("cluster sync: batch failover commit sent to peer", "rgs", ids, "req_id", reqID)
+	timer := time.NewTimer(failoverAckTimeout)
+	defer timer.Stop()
+	select {
+	case ack := <-waitCh:
+		return failoverCommitAckBatchError(ids, ack)
+	case <-timer.C:
+		select {
+		case ack := <-waitCh:
+			return failoverCommitAckBatchError(ids, ack)
+		default:
+		}
+		s.failoverWaitMu.Lock()
+		if current, ok := s.failoverBatchCommitWaiters[key]; ok && current.reqID == reqID && current.ch == waitCh {
+			delete(s.failoverBatchCommitWaiters, key)
+		}
+		s.failoverWaitMu.Unlock()
+		return fmt.Errorf("timed out waiting for peer failover commit ack for redundancy groups %v", ids)
+	}
+}
+
+func failoverCommitAckBatchError(rgIDs []int, ack failoverAck) error {
+	label := fmt.Sprintf("redundancy groups %v", rgIDs)
+	switch ack.status {
+	case failoverAckApplied:
+		return nil
+	case failoverAckRejected:
+		if ack.detail != "" {
+			return fmt.Errorf("peer rejected failover commit for %s: %s", label, ack.detail)
+		}
+		return fmt.Errorf("peer rejected failover commit for %s", label)
+	case failoverAckFailed:
+		if ack.detail != "" {
+			return fmt.Errorf("peer failed failover commit for %s: %s", label, ack.detail)
+		}
+		return fmt.Errorf("peer failed failover commit for %s", label)
+	default:
+		if ack.detail != "" {
+			return fmt.Errorf("failover commit for %s aborted: %s", label, ack.detail)
+		}
+		return fmt.Errorf("failover commit for %s aborted", label)
 	}
 }
 
@@ -1915,6 +2226,50 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			"detail", detail)
 		s.completeFailoverCommitWait(rgID, reqID, failoverAck{status: status, detail: detail})
 
+	case syncMsgFailoverBatch:
+		rgIDs, reqID, err := decodeFailoverBatchRequestPayload(payload)
+		if err != nil {
+			slog.Warn("cluster sync: batch failover message decode failed", "err", err)
+			return
+		}
+		slog.Info("cluster sync: remote batch failover request received", "rgs", rgIDs, "req_id", reqID)
+		go s.handleRemoteFailoverBatch(conn, rgIDs, reqID)
+
+	case syncMsgFailoverBatchAck:
+		rgIDs, status, reqID, detail, err := decodeFailoverBatchAckPayload(payload)
+		if err != nil {
+			slog.Warn("cluster sync: batch failover ack decode failed", "err", err)
+			return
+		}
+		slog.Info("cluster sync: batch failover ack received",
+			"rgs", rgIDs,
+			"req_id", reqID,
+			"status", status,
+			"detail", detail)
+		s.completeFailoverBatchWait(failoverBatchKey(rgIDs), reqID, failoverAck{status: status, detail: detail})
+
+	case syncMsgFailoverBatchCommit:
+		rgIDs, reqID, err := decodeFailoverBatchRequestPayload(payload)
+		if err != nil {
+			slog.Warn("cluster sync: batch failover commit message decode failed", "err", err)
+			return
+		}
+		slog.Info("cluster sync: remote batch failover commit received", "rgs", rgIDs, "req_id", reqID)
+		go s.handleRemoteFailoverCommitBatch(conn, rgIDs, reqID)
+
+	case syncMsgFailoverBatchCommitAck:
+		rgIDs, status, reqID, detail, err := decodeFailoverBatchAckPayload(payload)
+		if err != nil {
+			slog.Warn("cluster sync: batch failover commit ack decode failed", "err", err)
+			return
+		}
+		slog.Info("cluster sync: batch failover commit ack received",
+			"rgs", rgIDs,
+			"req_id", reqID,
+			"status", status,
+			"detail", detail)
+		s.completeFailoverBatchCommitWait(failoverBatchKey(rgIDs), reqID, failoverAck{status: status, detail: detail})
+
 	case syncMsgFence:
 		s.stats.FencesReceived.Add(1)
 		slog.Warn("cluster sync: fence received from peer — disabling all RGs")
@@ -2010,6 +2365,22 @@ func (s *SessionSync) handleRemoteFailover(conn net.Conn, rgID int, reqID uint64
 	s.sendFailoverResult(conn, syncMsgFailoverAck, rgID, reqID, failoverAckApplied, "")
 }
 
+func (s *SessionSync) handleRemoteFailoverBatch(conn net.Conn, rgIDs []int, reqID uint64) {
+	if s.OnRemoteFailoverBatch == nil {
+		s.sendFailoverBatchResult(conn, syncMsgFailoverBatchAck, rgIDs, reqID, failoverAckFailed, "no remote batch failover handler")
+		return
+	}
+	if err := s.OnRemoteFailoverBatch(rgIDs); err != nil {
+		status := failoverAckFailed
+		if errors.Is(err, ErrRemoteFailoverRejected) {
+			status = failoverAckRejected
+		}
+		s.sendFailoverBatchResult(conn, syncMsgFailoverBatchAck, rgIDs, reqID, status, err.Error())
+		return
+	}
+	s.sendFailoverBatchResult(conn, syncMsgFailoverBatchAck, rgIDs, reqID, failoverAckApplied, "")
+}
+
 func (s *SessionSync) handleRemoteFailoverCommit(conn net.Conn, rgID int, reqID uint64) {
 	if s.OnRemoteFailoverCommit == nil {
 		s.sendFailoverResult(conn, syncMsgFailoverCommitAck, rgID, reqID, failoverAckFailed, "no remote failover commit handler")
@@ -2024,6 +2395,22 @@ func (s *SessionSync) handleRemoteFailoverCommit(conn net.Conn, rgID int, reqID 
 		return
 	}
 	s.sendFailoverResult(conn, syncMsgFailoverCommitAck, rgID, reqID, failoverAckApplied, "")
+}
+
+func (s *SessionSync) handleRemoteFailoverCommitBatch(conn net.Conn, rgIDs []int, reqID uint64) {
+	if s.OnRemoteFailoverCommitBatch == nil {
+		s.sendFailoverBatchResult(conn, syncMsgFailoverBatchCommitAck, rgIDs, reqID, failoverAckFailed, "no remote batch failover commit handler")
+		return
+	}
+	if err := s.OnRemoteFailoverCommitBatch(rgIDs); err != nil {
+		status := failoverAckFailed
+		if errors.Is(err, ErrRemoteFailoverRejected) {
+			status = failoverAckRejected
+		}
+		s.sendFailoverBatchResult(conn, syncMsgFailoverBatchCommitAck, rgIDs, reqID, status, err.Error())
+		return
+	}
+	s.sendFailoverBatchResult(conn, syncMsgFailoverBatchCommitAck, rgIDs, reqID, failoverAckApplied, "")
 }
 
 func (s *SessionSync) sendFailoverResult(conn net.Conn, msgType uint8, rgID int, reqID uint64, status uint8, detail string) {
@@ -2074,6 +2461,72 @@ func (s *SessionSync) completeFailoverWait(rgID int, reqID uint64, ack failoverA
 	}
 }
 
+func (s *SessionSync) completeFailoverBatchWait(key string, reqID uint64, ack failoverAck) {
+	s.failoverWaitMu.Lock()
+	waiter, ok := s.failoverBatchWaiters[key]
+	if ok && waiter.reqID == reqID {
+		delete(s.failoverBatchWaiters, key)
+	}
+	s.failoverWaitMu.Unlock()
+	if !ok || waiter.ch == nil || waiter.reqID != reqID {
+		return
+	}
+	select {
+	case waiter.ch <- ack:
+	default:
+	}
+}
+
+func (s *SessionSync) sendFailoverBatchResult(conn net.Conn, msgType uint8, rgIDs []int, reqID uint64, status uint8, detail string) {
+	if err := validateFailoverBatchRGCount(rgIDs); err != nil {
+		slog.Warn("cluster sync: refusing to send oversized batch failover result",
+			"err", err,
+			"msg_type", msgType,
+			"rgs", rgIDs,
+			"req_id", reqID,
+			"status", status)
+		return
+	}
+	ackConn := s.getActiveConn()
+	if ackConn == nil {
+		ackConn = conn
+	}
+	if ackConn == nil {
+		return
+	}
+	payload := encodeFailoverBatchAckPayload(rgIDs, status, reqID, detail)
+	s.writeMu.Lock()
+	err := writeMsg(ackConn, msgType, payload)
+	firstErr := err
+	if err != nil && conn != nil && ackConn != conn {
+		err = writeMsg(conn, msgType, payload)
+	}
+	s.writeMu.Unlock()
+	if err != nil {
+		if firstErr != nil && conn != nil && ackConn != conn {
+			slog.Warn("cluster sync: batch failover result send error on active conn",
+				"err", firstErr,
+				"msg_type", msgType,
+				"rgs", rgIDs,
+				"req_id", reqID,
+				"status", status)
+		}
+		slog.Warn("cluster sync: batch failover result send error",
+			"err", err,
+			"msg_type", msgType,
+			"rgs", rgIDs,
+			"req_id", reqID,
+			"status", status)
+		s.stats.Errors.Add(1)
+		if ackConn != nil {
+			s.handleDisconnect(ackConn)
+		} else if conn != nil {
+			s.handleDisconnect(conn)
+		}
+		return
+	}
+}
+
 func (s *SessionSync) completeFailoverCommitWait(rgID int, reqID uint64, ack failoverAck) {
 	s.failoverWaitMu.Lock()
 	waiter := s.failoverCommitWaiters[rgID]
@@ -2082,6 +2535,22 @@ func (s *SessionSync) completeFailoverCommitWait(rgID int, reqID uint64, ack fai
 	}
 	s.failoverWaitMu.Unlock()
 	if waiter.ch == nil || waiter.reqID != reqID {
+		return
+	}
+	select {
+	case waiter.ch <- ack:
+	default:
+	}
+}
+
+func (s *SessionSync) completeFailoverBatchCommitWait(key string, reqID uint64, ack failoverAck) {
+	s.failoverWaitMu.Lock()
+	waiter, ok := s.failoverBatchCommitWaiters[key]
+	if ok && waiter.reqID == reqID {
+		delete(s.failoverBatchCommitWaiters, key)
+	}
+	s.failoverWaitMu.Unlock()
+	if !ok || waiter.ch == nil || waiter.reqID != reqID {
 		return
 	}
 	select {
@@ -2336,10 +2805,16 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 		s.failoverWaitMu.Lock()
 		failoverWaiters := s.failoverWaiters
 		failoverCommitWaiters := s.failoverCommitWaiters
+		failoverBatchWaiters := s.failoverBatchWaiters
+		failoverBatchCommitWaiters := s.failoverBatchCommitWaiters
 		clearedFailoverWaiters := len(failoverWaiters)
 		clearedFailoverCommitWaiters := len(failoverCommitWaiters)
+		clearedFailoverBatchWaiters := len(failoverBatchWaiters)
+		clearedFailoverBatchCommitWaiters := len(failoverBatchCommitWaiters)
 		s.failoverWaiters = make(map[int]failoverWaiter)
 		s.failoverCommitWaiters = make(map[int]failoverWaiter)
+		s.failoverBatchWaiters = make(map[string]failoverWaiter)
+		s.failoverBatchCommitWaiters = make(map[string]failoverWaiter)
 		s.failoverWaitMu.Unlock()
 		for _, waiter := range failoverWaiters {
 			select {
@@ -2349,6 +2824,20 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 			close(waiter.ch)
 		}
 		for _, waiter := range failoverCommitWaiters {
+			select {
+			case waiter.ch <- failoverAck{status: failoverAckDisconnected, detail: "peer disconnected"}:
+			default:
+			}
+			close(waiter.ch)
+		}
+		for _, waiter := range failoverBatchWaiters {
+			select {
+			case waiter.ch <- failoverAck{status: failoverAckDisconnected, detail: "peer disconnected"}:
+			default:
+			}
+			close(waiter.ch)
+		}
+		for _, waiter := range failoverBatchCommitWaiters {
 			select {
 			case waiter.ch <- failoverAck{status: failoverAckDisconnected, detail: "peer disconnected"}:
 			default:
@@ -2372,13 +2861,15 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 			slog.Info("cluster sync: reset in-progress bulk receive on disconnect")
 		}
 		slog.Info("cluster sync: peer disconnected (all fabrics down)")
-		if pendingBarriers != 0 || ackedBarriers != 0 || clearedWaiters != 0 || clearedFailoverWaiters != 0 || clearedFailoverCommitWaiters != 0 {
+		if pendingBarriers != 0 || ackedBarriers != 0 || clearedWaiters != 0 || clearedFailoverWaiters != 0 || clearedFailoverCommitWaiters != 0 || clearedFailoverBatchWaiters != 0 || clearedFailoverBatchCommitWaiters != 0 {
 			slog.Info("cluster sync: reset barrier state after disconnect",
 				"pending_seq", pendingBarriers,
 				"acked_seq", ackedBarriers,
 				"cleared_waiters", clearedWaiters,
 				"cleared_failover_waiters", clearedFailoverWaiters,
-				"cleared_failover_commit_waiters", clearedFailoverCommitWaiters)
+				"cleared_failover_commit_waiters", clearedFailoverCommitWaiters,
+				"cleared_failover_batch_waiters", clearedFailoverBatchWaiters,
+				"cleared_failover_batch_commit_waiters", clearedFailoverBatchCommitWaiters)
 		}
 		if s.OnPeerDisconnected != nil {
 			go s.OnPeerDisconnected()

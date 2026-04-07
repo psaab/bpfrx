@@ -1508,14 +1508,32 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 				}
 				return nil
 			}
+			d.sessionSync.OnRemoteFailoverBatch = func(rgIDs []int) error {
+				for _, rgID := range rgIDs {
+					if !d.cluster.IsLocalPrimary(rgID) {
+						return fmt.Errorf("%w: redundancy group %d", cluster.ErrRemoteFailoverRejected, rgID)
+					}
+				}
+				slog.Info("cluster: remote batch failover request from peer", "rgs", rgIDs)
+				if err := d.cluster.ManualFailoverBatch(rgIDs); err != nil {
+					slog.Warn("cluster: remote batch failover failed", "rgs", rgIDs, "err", err)
+					return err
+				}
+				return nil
+			}
 			d.sessionSync.OnRemoteFailoverCommit = func(rgID int) error {
 				return d.cluster.FinalizePeerTransferOut(rgID)
+			}
+			d.sessionSync.OnRemoteFailoverCommitBatch = func(rgIDs []int) error {
+				return d.cluster.FinalizePeerTransferOutBatch(rgIDs)
 			}
 
 			// Wire peer failover sender so cluster Manager can send remote
 			// failover requests via the fabric sync connection.
 			d.cluster.SetPeerFailoverFunc(d.sessionSync.SendFailover)
 			d.cluster.SetPeerFailoverCommitFunc(d.sessionSync.SendFailoverCommit)
+			d.cluster.SetPeerFailoverBatchFunc(d.sessionSync.SendFailoverBatch)
+			d.cluster.SetPeerFailoverCommitBatchFunc(d.sessionSync.SendFailoverCommitBatch)
 			d.cluster.SetPreManualFailoverHook(d.prepareUserspaceManualFailover)
 			d.cluster.SetTransferReadinessFunc(d.userspaceTransferReadiness)
 			d.cluster.SetPeerTimeoutGuard(d.shouldSuppressPeerHeartbeatTimeout)

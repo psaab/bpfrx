@@ -569,8 +569,8 @@ var OperationalTree = map[string]*Node{
 		}},
 	}},
 	"clear": {Desc: "Clear statistics and protocol information", Children: map[string]*Node{
-		"arp":           {Desc: "Clear ARP table"},
-		"system":        {Desc: "Clear system information", Children: map[string]*Node{
+		"arp": {Desc: "Clear ARP table"},
+		"system": {Desc: "Clear system information", Children: map[string]*Node{
 			"config-lock": {Desc: "Force clear stale configuration lock"},
 		}},
 		"interfaces": {Desc: "Clear interface information", Children: map[string]*Node{
@@ -633,6 +633,11 @@ var OperationalTree = map[string]*Node{
 		"chassis": {Desc: "Perform chassis-specific operations", Children: map[string]*Node{
 			"cluster": {Desc: "Cluster operations", Children: map[string]*Node{
 				"failover": {Desc: "Trigger cluster failover", Children: map[string]*Node{
+					"data": {Desc: "Fail over all data redundancy groups together", Children: map[string]*Node{
+						"node": {Desc: "Target node ID (local or peer)", DynamicFn: func(cfg *config.Config) []string {
+							return []string{"0", "1"}
+						}},
+					}},
 					"redundancy-group": {Desc: "Failover a specific redundancy group", DynamicFn: func(cfg *config.Config) []string {
 						if cfg == nil || cfg.Chassis.Cluster == nil {
 							return nil

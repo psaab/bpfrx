@@ -2746,6 +2746,19 @@ func (c *ctl) handleRequestChassisClusterFailover(args []string) error {
 		return nil
 	}
 
+	// "request chassis cluster failover data node <N>"
+	if len(args) >= 3 && args[0] == "data" && args[1] == "node" {
+		action := "cluster-failover-data:node" + args[2]
+		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
+			Action: action,
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Message)
+		return nil
+	}
+
 	// "request chassis cluster failover redundancy-group <N> [node <N>]"
 	if len(args) >= 2 && args[0] == "redundancy-group" {
 		actionSuffix := args[1]
@@ -2763,7 +2776,7 @@ func (c *ctl) handleRequestChassisClusterFailover(args []string) error {
 		return nil
 	}
 
-	return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N> [node <N>]")
+	return fmt.Errorf("usage: request chassis cluster failover {redundancy-group <N> [node <N>] | data node <N>}")
 }
 
 func (c *ctl) handleRequestChassisClusterDataPlane(args []string) error {
