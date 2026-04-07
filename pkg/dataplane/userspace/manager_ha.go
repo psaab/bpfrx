@@ -268,7 +268,7 @@ func (m *Manager) takeoverReadyLocked() (bool, []string) {
 	if m.xskLivenessFailed {
 		reasons = append(reasons, "userspace XSK liveness failed")
 	}
-	if !m.xskLivenessProven {
+	if !m.xskLivenessProven && !m.standbyBindingsReadyLocked() {
 		reasons = append(reasons, "userspace XSK liveness not proven")
 	}
 	if m.sessionMirrorFailed {
@@ -279,6 +279,26 @@ func (m *Manager) takeoverReadyLocked() (bool, []string) {
 		reasons = append(reasons, reason)
 	}
 	return len(reasons) == 0, reasons
+}
+
+func (m *Manager) standbyBindingsReadyLocked() bool {
+	if m.hasActiveDataRGLocked() {
+		return false
+	}
+	if len(m.lastStatus.Bindings) == 0 || len(m.lastStatus.Queues) == 0 {
+		return false
+	}
+	for _, q := range m.lastStatus.Queues {
+		if !q.Armed || !q.Ready {
+			return false
+		}
+	}
+	for _, b := range m.lastStatus.Bindings {
+		if !b.Armed || !b.Ready {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Manager) recordSessionMirrorFailureLocked(err error) {
