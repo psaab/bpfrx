@@ -240,6 +240,34 @@ func TestElection_ManualFailover_Preserved(t *testing.T) {
 	}
 }
 
+func TestElection_ManualFailoverSettlesSecondaryWhenPeerPrimaryConfirmed(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 200}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	if err := m.ManualFailover(0); err != nil {
+		t.Fatalf("ManualFailover() error = %v", err)
+	}
+	drainEvents(m, 1)
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+
+	state := m.GroupState(0)
+	if state.State != StateSecondary {
+		t.Fatalf("state = %s, want secondary after peer primary confirmation", state.State)
+	}
+	if !state.ManualFailover {
+		t.Fatal("manual failover should remain set to suppress immediate preempt back")
+	}
+}
+
 func TestElection_PeerSecondaryHold_BecomesPrimary(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))
