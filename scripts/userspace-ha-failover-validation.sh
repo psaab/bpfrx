@@ -316,8 +316,8 @@ import sys
 path = pathlib.Path(sys.argv[1])
 label = sys.argv[2]
 if not path.exists():
-    print(f"WARN: status_summary_value: '{path}' missing, defaulting to 0", file=sys.stderr)
-    print("0")
+    print(f"WARN: status_summary_value: '{path}' missing", file=sys.stderr)
+    print("__ERR__")
     raise SystemExit(0)
 
 pattern = f"  {label}:"
@@ -329,11 +329,11 @@ for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         print(match.group(1))
     else:
         print(f"WARN: status_summary_value: unparseable value for '{label}' in '{path}'", file=sys.stderr)
-        print("0")
+        print("__ERR__")
     break
 else:
     print(f"WARN: status_summary_value: label '{label}' not found in '{path}'", file=sys.stderr)
-    print("0")
+    print("__ERR__")
 PY
 }
 
@@ -350,14 +350,16 @@ path = pathlib.Path(sys.argv[1])
 service = sys.argv[2]
 column = sys.argv[3]
 if not path.exists():
-    print("0")
+    print("__ERR__")
     raise SystemExit(0)
 
 lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
 capture = False
+found_section = False
 for line in lines:
     if line.strip() == "Services Synchronized:":
         capture = True
+        found_section = True
         continue
     if capture and not line.strip():
         break
@@ -367,14 +369,17 @@ for line in lines:
         continue
     nums = re.findall(r"\d+", line)
     if column == "sent":
-        print(nums[0] if len(nums) >= 1 else "0")
+        print(nums[0] if len(nums) >= 1 else "__ERR__")
     elif column == "received":
-        print(nums[1] if len(nums) >= 2 else "0")
+        print(nums[1] if len(nums) >= 2 else "__ERR__")
     else:
         raise SystemExit(f"unsupported sync stats column: {column}")
     break
 else:
-    print("0")
+    if not found_section:
+        print("__ERR__")
+    else:
+        print("__ERR__")
 PY
 }
 
@@ -389,21 +394,22 @@ wait_for_session_sync_idle() {
 	local stable_needed="$SESSION_SYNC_IDLE_STABLE_SAMPLES"
 	local stable=0
 	local tries="$SESSION_SYNC_IDLE_TIMEOUT"
-	local prev_source_sent="" prev_target_recv="" prev_target_installed=""
+	local prev_source_sent="" prev_target_recv="" prev_target_pending="" prev_target_drained=""
 	while (( tries > 0 )); do
 		capture_sync_snapshot "$SOURCE_VM" "${label}-source"
 		capture_sync_snapshot "$TARGET_VM" "${label}-target"
 		local source_path target_path
 		source_path="$(sync_snapshot_path "${label}-source" "$SOURCE_VM")"
 		target_path="$(sync_snapshot_path "${label}-target" "$TARGET_VM")"
-		local source_sent target_recv target_installed
+		local source_sent target_recv target_pending target_drained
 		source_sent="$(sync_stats_value "$source_path" "Session create" sent)"
 		target_recv="$(sync_stats_value "$target_path" "Session create" received)"
-		target_installed="$(status_summary_value "$target_path" "Session delta drained")"
-		if [[ -n "$prev_source_sent" && "$source_sent" == "$prev_source_sent" && "$target_recv" == "$prev_target_recv" && "$target_installed" == "$prev_target_installed" ]]; then
+		target_pending="$(status_summary_value "$target_path" "Session delta pending")"
+		target_drained="$(status_summary_value "$target_path" "Session delta drained")"
+		if [[ "$source_sent" != "__ERR__" && "$target_recv" != "__ERR__" && "$target_pending" != "__ERR__" && "$target_drained" != "__ERR__" && "$source_sent" == "$target_recv" && "$target_pending" == "0" ]]; then
 			stable=$((stable + 1))
 			if (( stable >= stable_needed )); then
-				pass "${label}: session sync idle (source_sent=${source_sent} target_recv=${target_recv} target_delta_drained=${target_installed})"
+				pass "${label}: session sync idle (source_sent=${source_sent} target_recv=${target_recv} target_delta_pending=${target_pending} target_delta_drained=${target_drained})"
 				return 0
 			fi
 		else
@@ -411,11 +417,12 @@ wait_for_session_sync_idle() {
 		fi
 		prev_source_sent="$source_sent"
 		prev_target_recv="$target_recv"
-		prev_target_installed="$target_installed"
+		prev_target_pending="$target_pending"
+		prev_target_drained="$target_drained"
 		sleep 1
 		tries=$((tries - 1))
 	done
-	fail "${label}: session sync did not become idle before timeout (source_sent=${prev_source_sent:-0} target_recv=${prev_target_recv:-0} target_delta_drained=${prev_target_installed:-0})"
+	fail "${label}: session sync did not become idle before timeout (source_sent=${prev_source_sent:-0} target_recv=${prev_target_recv:-0} target_delta_pending=${prev_target_pending:-0} target_delta_drained=${prev_target_drained:-0})"
 	return 1
 }
 
