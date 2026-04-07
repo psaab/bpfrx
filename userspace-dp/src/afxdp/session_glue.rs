@@ -270,8 +270,16 @@ pub(super) fn apply_worker_commands(
     for cmd in pending {
         match cmd {
             WorkerCommand::DemoteOwnerRGS { owner_rgs } => {
+                let mut seen_owner_rgs = std::collections::BTreeSet::new();
                 for owner_rg_id in owner_rgs {
-                    cancelled_keys.extend(sessions.demote_owner_rg(owner_rg_id));
+                    if !seen_owner_rgs.insert(owner_rg_id) {
+                        continue;
+                    }
+                    for demoted_key in sessions.demote_owner_rg(owner_rg_id) {
+                        if !cancelled_keys.iter().any(|key| key == &demoted_key) {
+                            cancelled_keys.push(demoted_key);
+                        }
+                    }
                 }
             }
             WorkerCommand::ExportOwnerRGSessions {
