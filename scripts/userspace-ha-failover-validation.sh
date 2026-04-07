@@ -316,8 +316,8 @@ import sys
 path = pathlib.Path(sys.argv[1])
 label = sys.argv[2]
 if not path.exists():
-    print(f"WARN: status_summary_value: '{path}' missing, defaulting to 0", file=sys.stderr)
-    print("0")
+    print(f"WARN: status_summary_value: '{path}' missing", file=sys.stderr)
+    print("__ERR__")
     raise SystemExit(0)
 
 pattern = f"  {label}:"
@@ -329,11 +329,11 @@ for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         print(match.group(1))
     else:
         print(f"WARN: status_summary_value: unparseable value for '{label}' in '{path}'", file=sys.stderr)
-        print("0")
+        print("__ERR__")
     break
 else:
     print(f"WARN: status_summary_value: label '{label}' not found in '{path}'", file=sys.stderr)
-    print("0")
+    print("__ERR__")
 PY
 }
 
@@ -350,14 +350,16 @@ path = pathlib.Path(sys.argv[1])
 service = sys.argv[2]
 column = sys.argv[3]
 if not path.exists():
-    print("0")
+    print("__ERR__")
     raise SystemExit(0)
 
 lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
 capture = False
+found_section = False
 for line in lines:
     if line.strip() == "Services Synchronized:":
         capture = True
+        found_section = True
         continue
     if capture and not line.strip():
         break
@@ -367,14 +369,17 @@ for line in lines:
         continue
     nums = re.findall(r"\d+", line)
     if column == "sent":
-        print(nums[0] if len(nums) >= 1 else "0")
+        print(nums[0] if len(nums) >= 1 else "__ERR__")
     elif column == "received":
-        print(nums[1] if len(nums) >= 2 else "0")
+        print(nums[1] if len(nums) >= 2 else "__ERR__")
     else:
         raise SystemExit(f"unsupported sync stats column: {column}")
     break
 else:
-    print("0")
+    if not found_section:
+        print("__ERR__")
+    else:
+        print("__ERR__")
 PY
 }
 
@@ -401,7 +406,7 @@ wait_for_session_sync_idle() {
 		target_recv="$(sync_stats_value "$target_path" "Session create" received)"
 		target_pending="$(status_summary_value "$target_path" "Session delta pending")"
 		target_drained="$(status_summary_value "$target_path" "Session delta drained")"
-		if [[ "$source_sent" == "$target_recv" && "$target_pending" == "0" ]]; then
+		if [[ "$source_sent" != "__ERR__" && "$target_recv" != "__ERR__" && "$target_pending" != "__ERR__" && "$target_drained" != "__ERR__" && "$source_sent" == "$target_recv" && "$target_pending" == "0" ]]; then
 			stable=$((stable + 1))
 			if (( stable >= stable_needed )); then
 				pass "${label}: session sync idle (source_sent=${source_sent} target_recv=${target_recv} target_delta_pending=${target_pending} target_delta_drained=${target_drained})"
