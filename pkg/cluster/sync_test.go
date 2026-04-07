@@ -178,7 +178,7 @@ func TestPeerRecentlyActive(t *testing.T) {
 	}
 }
 
-func TestPeerHealthyRequiresRecentInboundAfterHeartbeatAck(t *testing.T) {
+func TestPeerHealthyRequiresRecentInboundAfterHeartbeatAckCapability(t *testing.T) {
 	s := &SessionSync{}
 	if s.PeerHealthy() {
 		t.Fatal("expected disconnected session sync to be unhealthy")
@@ -189,7 +189,7 @@ func TestPeerHealthyRequiresRecentInboundAfterHeartbeatAck(t *testing.T) {
 		t.Fatal("expected connected pre-capability session sync to be healthy")
 	}
 
-	s.peerHeartbeatAck.Store(true)
+	s.peerHeartbeatAckEver.Store(true)
 	s.lastPeerRxUnix.Store(time.Now().UnixNano())
 	if !s.PeerHealthy() {
 		t.Fatal("expected recent peer activity to be healthy")
@@ -3355,6 +3355,121 @@ func TestReceiveLoopKeepsConnectionAliveWithoutHeartbeatAckSupport(t *testing.T)
 
 	cancel()
 	serverConn.Close()
+	select {
+	case err := <-serverDone:
+		if err != nil && !errors.Is(err, net.ErrClosed) && !strings.Contains(err.Error(), "use of closed network connection") && !strings.Contains(err.Error(), "EOF") {
+			t.Fatalf("server loop failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server loop to exit")
+	}
+}
+
+func TestReceiveLoopDisconnectsSilentConnectionAfterAckCapableReconnect(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	serverConnCh := make(chan net.Conn, 1)
+	serverErrCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		serverConnCh <- conn
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	var serverConn net.Conn
+	select {
+	case err := <-serverErrCh:
+		t.Fatalf("accept: %v", err)
+	case serverConn = <-serverConnCh:
+	}
+	defer serverConn.Close()
+
+	heartbeatSeen := make(chan struct{}, 1)
+	serverDone := make(chan error, 1)
+	go func() {
+		for {
+			var hdr [syncHeaderSize]byte
+			if err := serverConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+				serverDone <- err
+				return
+			}
+			if _, err := io.ReadFull(serverConn, hdr[:]); err != nil {
+				serverDone <- err
+				return
+			}
+			if string(hdr[0:4]) != "BPSY" {
+				serverDone <- fmt.Errorf("bad sync magic: %q", hdr[0:4])
+				return
+			}
+			payloadLen := binary.LittleEndian.Uint32(hdr[8:12])
+			if payloadLen > 0 {
+				payload := make([]byte, payloadLen)
+				if _, err := io.ReadFull(serverConn, payload); err != nil {
+					serverDone <- err
+					return
+				}
+			}
+			if hdr[4] == syncMsgHeartbeat {
+				select {
+				case heartbeatSeen <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+
+	ss := NewSessionSync(":0", ln.Addr().String(), nil)
+	ss.bulkEverCompleted.Store(true)
+	ss.readDeadline = 100 * time.Millisecond
+	ss.peerSilenceLimit = 300 * time.Millisecond
+	ss.peerHeartbeatAckEver.Store(true)
+
+	disconnected := make(chan struct{}, 1)
+	ss.OnPeerDisconnected = func() {
+		select {
+		case disconnected <- struct{}{}:
+		default:
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ss.handleNewConnection(ctx, 0, clientConn)
+
+	select {
+	case <-heartbeatSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for heartbeat request")
+	}
+
+	select {
+	case <-disconnected:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for silent reconnect disconnect")
+	}
+
+	if ss.IsConnected() {
+		t.Fatal("expected ack-capable silent reconnect to be marked disconnected")
+	}
+	if ss.PeerHealthy() {
+		t.Fatal("expected peer health to be false after silent reconnect disconnect")
+	}
+	if got := ss.getActiveConn(); got != nil {
+		t.Fatalf("expected active conn to be cleared, got %v", got)
+	}
 	if err := <-serverDone; err != nil && !errors.Is(err, net.ErrClosed) && !strings.Contains(err.Error(), "use of closed network connection") && !strings.Contains(err.Error(), "EOF") {
 		t.Fatalf("server loop failed: %v", err)
 	}
