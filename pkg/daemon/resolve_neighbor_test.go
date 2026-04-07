@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"testing"
+	"time"
 
 	"github.com/psaab/bpfrx/pkg/config"
 )
@@ -40,5 +41,19 @@ func TestResolveJunosIfName(t *testing.T) {
 				t.Errorf("resolveJunosIfName(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestShouldScheduleStandbyNeighborRefresh(t *testing.T) {
+	var d Daemon
+	base := time.Unix(100, 0)
+	if !d.shouldScheduleStandbyNeighborRefresh(base) {
+		t.Fatal("first standby neighbor refresh should schedule")
+	}
+	if d.shouldScheduleStandbyNeighborRefresh(base.Add(500 * time.Millisecond)) {
+		t.Fatal("refresh inside debounce interval should not schedule")
+	}
+	if !d.shouldScheduleStandbyNeighborRefresh(base.Add(standbyNeighborRefreshMinInterval + time.Millisecond)) {
+		t.Fatal("refresh after debounce interval should schedule")
 	}
 }

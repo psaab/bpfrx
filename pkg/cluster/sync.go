@@ -231,6 +231,12 @@ type SessionSync struct {
 	// bpf_fib_lookup succeeds for the first packet after VRRP MASTER (#485).
 	OnPrepareActivation func(rgID int)
 
+	// OnForwardSessionInstalled is called when a forward cluster-synced
+	// session has been successfully installed into the local dataplane.
+	// The daemon uses this as a low-latency signal to refresh standby
+	// neighbor state without waiting for the periodic sweep interval.
+	OnForwardSessionInstalled func()
+
 	// OnBulkSyncReceived is called when a bulk sync transfer completes
 	// (syncMsgBulkEnd received). The secondary uses this to release VRRP
 	// sync hold after session state has been installed.
@@ -1921,6 +1927,9 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 					if err := installer.SetClusterSyncedSessionV4(key, val); err == nil {
 						s.stats.SessionsInstalled.Add(1)
 						s.noteHelperMirrorResult("v4", &s.sessionMirrorWarnedV4, nil)
+						if val.IsReverse == 0 && s.OnForwardSessionInstalled != nil {
+							s.OnForwardSessionInstalled()
+						}
 					} else {
 						s.noteHelperMirrorResult("v4", &s.sessionMirrorWarnedV4, err)
 					}
@@ -1935,6 +1944,9 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 					val.FibGen = 0
 					if err := s.dp.SetSessionV4(key, val); err == nil {
 						s.stats.SessionsInstalled.Add(1)
+						if val.IsReverse == 0 && s.OnForwardSessionInstalled != nil {
+							s.OnForwardSessionInstalled()
+						}
 					}
 				}
 				// Create reverse session entry from forward entries so return
@@ -2020,6 +2032,9 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 					if err := installer.SetClusterSyncedSessionV6(key, val); err == nil {
 						s.stats.SessionsInstalled.Add(1)
 						s.noteHelperMirrorResult("v6", &s.sessionMirrorWarnedV6, nil)
+						if val.IsReverse == 0 && s.OnForwardSessionInstalled != nil {
+							s.OnForwardSessionInstalled()
+						}
 					} else {
 						s.noteHelperMirrorResult("v6", &s.sessionMirrorWarnedV6, err)
 					}
@@ -2032,6 +2047,9 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 					val.FibGen = 0
 					if err := s.dp.SetSessionV6(key, val); err == nil {
 						s.stats.SessionsInstalled.Add(1)
+						if val.IsReverse == 0 && s.OnForwardSessionInstalled != nil {
+							s.OnForwardSessionInstalled()
+						}
 					}
 				}
 				if val.IsReverse == 0 && val.ReverseKey.Protocol != 0 {

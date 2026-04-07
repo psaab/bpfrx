@@ -201,6 +201,39 @@ func TestPeerHealthyRequiresRecentInboundAfterHeartbeatAck(t *testing.T) {
 	}
 }
 
+func TestForwardSessionInstalledCallbackFiresOnlyForForwardSessions(t *testing.T) {
+	dp := &mockSweepDP{}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	calls := 0
+	ss.OnForwardSessionInstalled = func() {
+		calls++
+	}
+
+	key := dataplane.SessionKey{
+		SrcIP:    [4]byte{10, 0, 0, 1},
+		DstIP:    [4]byte{172, 16, 80, 200},
+		SrcPort:  12345,
+		DstPort:  5201,
+		Protocol: 6,
+	}
+	val := dataplane.SessionValue{
+		State:       dataplane.SessStateEstablished,
+		IngressZone: 1,
+		EgressZone:  2,
+	}
+
+	ss.handleMessage(nil, syncMsgSessionV4, encodeSessionV4(key, val)[syncHeaderSize:])
+	if got := calls; got != 1 {
+		t.Fatalf("forward callback calls = %d, want 1", got)
+	}
+
+	val.IsReverse = 1
+	ss.handleMessage(nil, syncMsgSessionV4, encodeSessionV4(key, val)[syncHeaderSize:])
+	if got := calls; got != 1 {
+		t.Fatalf("reverse callback calls = %d, want 1", got)
+	}
+}
+
 func TestSyncStatsInit(t *testing.T) {
 	ss := NewSessionSync(":4785", "10.0.0.2:4785", nil)
 	stats := ss.Stats()
