@@ -285,13 +285,14 @@ type SessionSync struct {
 	// Delete journal: bounded ring buffer for delete messages during disconnect.
 	// Deletes are journaled when queueMessage fails (disconnect), then flushed
 	// on reconnect before normal sync resumes.
-	deleteJournalMu  sync.Mutex
-	deleteJournal    [][]byte // ring buffer of encoded delete messages
-	deleteJournalCap int      // max entries (default 10000)
-	lastPeerRxUnix   atomic.Int64
-	peerHeartbeatAck atomic.Bool
-	readDeadline     time.Duration
-	peerSilenceLimit time.Duration
+	deleteJournalMu      sync.Mutex
+	deleteJournal        [][]byte // ring buffer of encoded delete messages
+	deleteJournalCap     int      // max entries (default 10000)
+	lastPeerRxUnix       atomic.Int64
+	peerHeartbeatAck     atomic.Bool
+	peerHeartbeatAckEver atomic.Bool
+	readDeadline         time.Duration
+	peerSilenceLimit     time.Duration
 
 	// bulkSendMu serializes entire BulkSync() calls so two concurrent
 	// callers (e.g. acceptLoop and connectLoop) cannot interleave.
@@ -645,14 +646,15 @@ func (s *SessionSync) PeerRecentlyActive(maxAge time.Duration) bool {
 }
 
 // PeerHealthy reports whether the sync connection is established and, once the
-// peer proves heartbeat-ack support, has been observed on the protocol within
-// the expected silence window. Before that capability is observed we fall back
-// to plain connection state so rolling upgrades do not flap readiness.
+// peer has ever proved heartbeat-ack support, has been observed on the
+// protocol within the expected silence window. Before that capability is ever
+// observed we fall back to plain connection state so rolling upgrades do not
+// flap readiness.
 func (s *SessionSync) PeerHealthy() bool {
 	if !s.stats.Connected.Load() {
 		return false
 	}
-	if !s.peerHeartbeatAck.Load() {
+	if !s.peerHeartbeatAckEver.Load() {
 		return true
 	}
 	return s.PeerRecentlyActive(s.peerSilenceDuration())
@@ -1835,7 +1837,7 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 				return
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				if s.peerHeartbeatAck.Load() {
+				if s.peerHeartbeatAckEver.Load() {
 					missedHeartbeats++
 				}
 				if missedHeartbeats >= 2 {
@@ -2235,6 +2237,7 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 
 	case syncMsgHeartbeatAck:
 		s.peerHeartbeatAck.Store(true)
+		s.peerHeartbeatAckEver.Store(true)
 
 	case syncMsgConfig:
 		s.stats.ConfigsReceived.Add(1)
