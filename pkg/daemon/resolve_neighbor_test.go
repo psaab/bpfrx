@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -41,6 +42,34 @@ func TestResolveJunosIfName(t *testing.T) {
 				t.Errorf("resolveJunosIfName(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolveConfigSubnetLinuxNameUsesUnitInterface(t *testing.T) {
+	cfg := &config.Config{
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {
+					Name:            "reth0",
+					RedundancyGroup: 1,
+					Units: map[int]*config.InterfaceUnit{
+						80: {Number: 80, VlanID: 180, Addresses: []string{"172.16.80.8/24"}},
+					},
+				},
+				"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
+			},
+		},
+	}
+
+	got, subnet, ok := resolveConfigSubnetLinuxName(cfg, net.ParseIP("172.16.80.200"))
+	if !ok {
+		t.Fatal("resolveConfigSubnetLinuxName() = !ok, want ok")
+	}
+	if got != "ge-0-0-0.180" {
+		t.Fatalf("resolveConfigSubnetLinuxName() linuxName = %q, want %q", got, "ge-0-0-0.180")
+	}
+	if subnet != "172.16.80.8/24" {
+		t.Fatalf("resolveConfigSubnetLinuxName() subnet = %q, want %q", subnet, "172.16.80.8/24")
 	}
 }
 

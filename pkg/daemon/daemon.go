@@ -2812,6 +2812,39 @@ func resolveJunosIfName(cfg *config.Config, ifName string) string {
 	return config.LinuxIfName(cfg.ResolveReth(ifName))
 }
 
+func resolveConfigSubnetLinuxName(cfg *config.Config, ip net.IP) (string, string, bool) {
+	if cfg == nil || ip == nil {
+		return "", "", false
+	}
+	for _, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
+		for unitNum, unit := range ifc.Units {
+			if unit == nil {
+				continue
+			}
+			for _, addrStr := range unit.Addresses {
+				_, ipNet, err := net.ParseCIDR(addrStr)
+				if err != nil {
+					continue
+				}
+				if !ipNet.Contains(ip) {
+					continue
+				}
+				ifName := resolveJunosIfName(cfg, ifc.Name)
+				if unit.VlanID > 0 {
+					ifName = fmt.Sprintf("%s.%d", ifName, unit.VlanID)
+				} else if unitNum != 0 {
+					ifName = fmt.Sprintf("%s.%d", ifName, unitNum)
+				}
+				return ifName, addrStr, true
+			}
+		}
+	}
+	return "", "", false
+}
+
 // stripCIDR removes the /prefix from a CIDR string, returning just the IP.
 func stripCIDR(s string) string {
 	ip, _, err := net.ParseCIDR(s)
@@ -3005,24 +3038,35 @@ func (d *Daemon) resolveNeighborsInner(cfg *config.Config, waitForReplies bool) 
 			return
 		}
 		// Kernel has no route — find the interface from config by subnet match.
-		for _, ifc := range cfg.Interfaces.Interfaces {
-			for _, unit := range ifc.Units {
+		for name, ifc := range cfg.Interfaces.Interfaces {
+			if ifc == nil {
+				continue
+			}
+			for unitNum, unit := range ifc.Units {
+				if unit == nil {
+					continue
+				}
 				for _, addrStr := range unit.Addresses {
 					_, ipNet, err := net.ParseCIDR(addrStr)
-					if err != nil {
+					if err != nil || !ipNet.Contains(ip) {
 						continue
 					}
-					if ipNet.Contains(ip) {
-						linuxName := resolveJunosIfName(cfg, ifc.Name)
-						link, err := netlink.LinkByName(linuxName)
-						if err != nil {
-							continue
-						}
-						slog.Debug("neighbor warmup: resolved next-hop via config subnet",
-							"nexthop", ipStr, "iface", linuxName, "subnet", addrStr)
-						addByLink(ip, link.Attrs().Index)
-						return
+					linuxName := resolveJunosIfName(cfg, name)
+					if unit.VlanID > 0 {
+						linuxName = fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
+					} else if unitNum != 0 {
+						linuxName = fmt.Sprintf("%s.%d", linuxName, unitNum)
 					}
+					link, err := netlink.LinkByName(linuxName)
+					if err != nil {
+						slog.Debug("neighbor warmup: config subnet match could not be resolved to a linux link",
+							"nexthop", ipStr, "iface", linuxName, "subnet", addrStr, "err", err)
+						continue
+					}
+					slog.Debug("neighbor warmup: resolved next-hop via config subnet",
+						"nexthop", ipStr, "iface", linuxName, "subnet", addrStr)
+					addByLink(ip, link.Attrs().Index)
+					return
 				}
 			}
 		}
