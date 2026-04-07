@@ -6935,6 +6935,146 @@ mod tests {
     }
 
     #[test]
+    fn build_local_time_exceeded_request_returns_prebuilt_forward_for_ttl_expiry() {
+        let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
+        let frame = build_icmp_echo_frame_v4(client_ip, dst_ip, 1);
+        let meta = UserspaceDpMeta {
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            ..UserspaceDpMeta::default()
+        };
+        let desc = XdpDesc {
+            addr: 4096,
+            len: frame.len() as u32,
+            options: 0,
+        };
+        let ingress_ident = BindingIdentity {
+            slot: 0,
+            queue_id: 7,
+            worker_id: 0,
+            interface: Arc::<str>::from("ge-0-0-1"),
+            ifindex: 5,
+        };
+        let flow = SessionFlow {
+            src_ip: IpAddr::V4(client_ip),
+            dst_ip: IpAddr::V4(dst_ip),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_ICMP,
+                src_ip: IpAddr::V4(client_ip),
+                dst_ip: IpAddr::V4(dst_ip),
+                src_port: 0x1234,
+                dst_port: 1,
+            },
+        };
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            5,
+            EgressInterface {
+                bind_ifindex: 5,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x61, 0x01],
+                zone: "lan".to_string(),
+                redundancy_group: 1,
+                primary_v4: Some(Ipv4Addr::new(10, 0, 61, 1)),
+                primary_v6: None,
+            },
+        );
+
+        let request = build_local_time_exceeded_request(
+            &frame,
+            desc,
+            meta,
+            &ingress_ident,
+            &flow,
+            &forwarding,
+            &Arc::new(Mutex::new(FastMap::default())),
+            &BTreeMap::new(),
+            0,
+        )
+        .expect("ttl-expiring session/flow-cache hit should enqueue local TE");
+
+        assert_eq!(request.target_ifindex, 5);
+        assert_eq!(request.ingress_queue_id, ingress_ident.queue_id);
+        assert_eq!(request.source_offset, desc.addr);
+        assert!(request.prebuilt_frame.is_some());
+    }
+
+    #[test]
+    fn build_local_time_exceeded_request_skips_fabric_ingress_packets() {
+        let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+        let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
+        let frame = build_icmp_echo_frame_v4(client_ip, dst_ip, 1);
+        let meta = UserspaceDpMeta {
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            meta_flags: 0x80,
+            ..UserspaceDpMeta::default()
+        };
+        let desc = XdpDesc {
+            addr: 8192,
+            len: frame.len() as u32,
+            options: 0,
+        };
+        let ingress_ident = BindingIdentity {
+            slot: 0,
+            queue_id: 7,
+            worker_id: 0,
+            interface: Arc::<str>::from("fab0"),
+            ifindex: 5,
+        };
+        let flow = SessionFlow {
+            src_ip: IpAddr::V4(client_ip),
+            dst_ip: IpAddr::V4(dst_ip),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_ICMP,
+                src_ip: IpAddr::V4(client_ip),
+                dst_ip: IpAddr::V4(dst_ip),
+                src_port: 0x1234,
+                dst_port: 1,
+            },
+        };
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            5,
+            EgressInterface {
+                bind_ifindex: 5,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x61, 0x01],
+                zone: "fabric".to_string(),
+                redundancy_group: 1,
+                primary_v4: Some(Ipv4Addr::new(10, 0, 61, 1)),
+                primary_v6: None,
+            },
+        );
+
+        let request = build_local_time_exceeded_request(
+            &frame,
+            desc,
+            meta,
+            &ingress_ident,
+            &flow,
+            &forwarding,
+            &Arc::new(Mutex::new(FastMap::default())),
+            &BTreeMap::new(),
+            0,
+        );
+
+        assert!(
+            request.is_none(),
+            "fabric-ingress packets should not enqueue local Time Exceeded"
+        );
+    }
+
+    #[test]
     fn build_local_time_exceeded_v4_quotes_original_packet() {
         let client_ip = Ipv4Addr::new(10, 0, 61, 102);
         let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
