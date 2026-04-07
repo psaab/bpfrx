@@ -681,7 +681,6 @@ fn is_translated_forward_session_key(
 }
 
 fn should_keep_synced_hit_transient(
-    _forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     now_secs: u64,
     key: &SessionKey,
@@ -761,15 +760,7 @@ pub(super) fn resolve_flow_session_decision(
                 ))
             });
         let keep_transient = poison_key.is_some_and(|(key, decision, metadata, origin)| {
-            should_keep_synced_hit_transient(
-                forwarding,
-                ha_state,
-                now_secs,
-                key,
-                decision,
-                metadata,
-                origin,
-            )
+            should_keep_synced_hit_transient(ha_state, now_secs, key, decision, metadata, origin)
         });
         if keep_transient && let Some((key, decision, metadata, origin)) = poison_key {
             purge_translated_synced_hit(
@@ -2117,8 +2108,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inactive_non_fabric_ingress(
-    ) {
+    fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inactive_non_fabric_ingress()
+     {
         let mut sessions = SessionTable::new();
         let key = test_key();
         let decision = SessionDecision {
@@ -2197,8 +2188,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_flow_session_decision_keeps_local_synced_translated_hit_transient_on_inactive_non_fabric_ingress(
-    ) {
+    fn resolve_flow_session_decision_keeps_local_synced_translated_hit_transient_on_inactive_non_fabric_ingress()
+     {
         let mut sessions = SessionTable::new();
         let key = test_key();
         let decision = SessionDecision {
