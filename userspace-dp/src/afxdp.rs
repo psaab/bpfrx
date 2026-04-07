@@ -2498,6 +2498,31 @@ fn poll_binding(
                                     ForwardingDisposition::ForwardCandidate
                                         | ForwardingDisposition::FabricRedirect
                                 ) {
+                                    // TTL/hop-limit check on flow cache hit path:
+                                    // generate ICMP Time Exceeded for packets that
+                                    // would expire after decrement.
+                                    let local_icmp_te = unsafe { &*area }
+                                        .slice(desc.addr as usize, desc.len as usize)
+                                        .and_then(|frame| {
+                                            build_local_time_exceeded_request(
+                                                frame,
+                                                desc,
+                                                meta,
+                                                &ident,
+                                                flow,
+                                                forwarding,
+                                                dynamic_neighbors,
+                                                ha_state,
+                                                now_secs,
+                                            )
+                                        });
+                                    if let Some(request) = local_icmp_te {
+                                        binding.scratch_forwards.push(request);
+                                        // Don't recycle here — enqueue_pending_forwards
+                                        // returns the frame via pending_fill_frames
+                                        // when processing the prebuilt TE response.
+                                        continue;
+                                    }
                                     counters.forward_candidate_packets += 1;
                                     if cached_decision.nat.rewrite_src.is_some() {
                                         counters.snat_packets += 1;
@@ -2680,6 +2705,39 @@ fn poll_binding(
                             }
                             session_ingress_zone = Some(resolved.metadata.ingress_zone.clone());
                             apply_nat_on_fabric = true;
+                            // TTL/hop-limit check on session-hit path: generate
+                            // ICMP Time Exceeded for packets that would expire
+                            // after decrement. The session-miss path handles this
+                            // in build_local_time_exceeded_request(); the session-
+                            // hit path previously silently dropped these packets
+                            // (the rewrite functions return None for TTL<=1).
+                            if matches!(
+                                resolved.decision.resolution.disposition,
+                                ForwardingDisposition::ForwardCandidate
+                            ) {
+                                let local_icmp_te = unsafe { &*area }
+                                    .slice(desc.addr as usize, desc.len as usize)
+                                    .and_then(|frame| {
+                                        build_local_time_exceeded_request(
+                                            frame,
+                                            desc,
+                                            meta,
+                                            &ident,
+                                            flow,
+                                            forwarding,
+                                            dynamic_neighbors,
+                                            ha_state,
+                                            now_secs,
+                                        )
+                                    });
+                                if let Some(request) = local_icmp_te {
+                                    binding.scratch_forwards.push(request);
+                                    // Don't recycle: the TE response references
+                                    // the original frame via desc in its source_offset.
+                                    // The continue skips recycle_now handling.
+                                    continue;
+                                }
+                            }
                             resolved.decision
                         } else {
                             counters.session_misses += 1;

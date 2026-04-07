@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-04-07
+
+- **Timestamp**: 2026-04-07T00:00:00Z
+  - **Action**: Issue #532 — Fix IPv6 TTL-expired (hop limit exceeded) probe responses not being returned in userspace dataplane. Added TTL/hop-limit check with ICMP Time Exceeded generation to both session-hit and flow-cache-hit paths. Previously only the session-miss path generated TE responses; subsequent packets hitting an existing session or flow cache were silently dropped when TTL<=1 because the rewrite functions returned None without generating a response.
+  - **File(s)**: userspace-dp/src/afxdp.rs
+
 ## 2026-04-05
 
 - **Timestamp**: 2026-04-05T22:00:00Z
