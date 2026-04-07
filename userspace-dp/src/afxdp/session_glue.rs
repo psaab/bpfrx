@@ -269,10 +269,23 @@ pub(super) fn apply_worker_commands(
     };
     let now_ns = monotonic_nanos();
     let now_secs = now_ns / 1_000_000_000;
-    let cancelled_keys: Vec<SessionKey> = Vec::new();
+    let mut cancelled_keys: Vec<SessionKey> = Vec::new();
     let mut exported_sequences = Vec::new();
     for cmd in pending {
         match cmd {
+            WorkerCommand::DemoteOwnerRGS { owner_rgs } => {
+                let mut seen_owner_rgs = std::collections::BTreeSet::new();
+                for owner_rg_id in owner_rgs {
+                    if !seen_owner_rgs.insert(owner_rg_id) {
+                        continue;
+                    }
+                    for demoted_key in sessions.demote_owner_rg(owner_rg_id) {
+                        if !cancelled_keys.iter().any(|key| key == &demoted_key) {
+                            cancelled_keys.push(demoted_key);
+                        }
+                    }
+                }
+            }
             WorkerCommand::ExportOwnerRGSessions {
                 sequence,
                 owner_rgs,
@@ -2563,6 +2576,89 @@ mod tests {
             .cloned()
             .expect("nat alias");
         assert!(nat_alias.origin.is_peer_synced());
+    }
+
+    #[test]
+    fn apply_worker_commands_demotes_local_owner_rg_sessions_and_cancels_keys() {
+        let commands = Arc::new(Mutex::new(VecDeque::from([
+            WorkerCommand::DemoteOwnerRGS { owner_rgs: vec![1] },
+        ])));
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let decision = test_decision();
+        let metadata = test_metadata();
+        let now_ns = monotonic_nanos();
+
+        assert!(sessions.install_with_protocol_with_origin(
+            key.clone(),
+            decision,
+            metadata,
+            SessionOrigin::ForwardFlow,
+            now_ns,
+            PROTO_TCP,
+            0x10,
+        ));
+
+        let results = apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &test_forwarding_state_with_fabric(),
+            &BTreeMap::new(),
+            &Arc::new(Mutex::new(FastMap::default())),
+        );
+
+        assert_eq!(results.cancelled_keys, vec![key.clone()]);
+        let (_, origin) = sessions
+            .lookup_with_origin(&key, now_ns, 0x10)
+            .expect("demoted session");
+        assert!(origin.is_peer_synced());
+    }
+
+    #[test]
+    fn export_owner_rg_sessions_skips_locally_demoted_entries() {
+        let commands = Arc::new(Mutex::new(VecDeque::from([
+            WorkerCommand::DemoteOwnerRGS { owner_rgs: vec![1] },
+            WorkerCommand::ExportOwnerRGSessions {
+                sequence: 11,
+                owner_rgs: vec![1],
+            },
+        ])));
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let decision = test_decision();
+        let metadata = test_metadata();
+        let now_ns = monotonic_nanos();
+
+        assert!(sessions.install_with_protocol_with_origin(
+            key,
+            decision,
+            metadata,
+            SessionOrigin::ForwardFlow,
+            now_ns,
+            PROTO_TCP,
+            0x10,
+        ));
+        assert_eq!(sessions.drain_deltas(16).len(), 1);
+
+        let results = apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &test_forwarding_state_with_fabric(),
+            &BTreeMap::new(),
+            &Arc::new(Mutex::new(FastMap::default())),
+        );
+
+        assert_eq!(results.exported_sequences, vec![11]);
+        assert!(
+            sessions.drain_deltas(16).is_empty(),
+            "demoted local owner sessions must not be re-exported as fresh HA deltas"
+        );
     }
 
     #[test]
