@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-04-03
+
+- **Timestamp**: 2026-04-03
+  - **Action**: Issue #547 — Split pkg/grpcapi/server.go (8411 lines) into 8 domain files. Mechanical move of functions, no logic changes. server.go reduced to 241 lines (types + server lifecycle).
+  - **File(s)**: pkg/grpcapi/server.go, server_config.go, server_show.go, server_nat.go, server_routing.go, server_diag.go, server_helpers.go, server_dhcp.go, server_cluster.go
+
 ## 2026-04-07
 
 - **Timestamp**: 2026-04-07T00:00:00Z
