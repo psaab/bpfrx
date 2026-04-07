@@ -3,10 +3,12 @@
 package nftables
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
@@ -15,56 +17,34 @@ import (
 
 const rstTableName = "bpfrx_dp_rst"
 
+type rstSuppressionPlan struct {
+	deleteTable bool
+	v4Addrs     []netip.Addr
+	v6Addrs     []netip.Addr
+}
+
 // InstallRSTSuppression creates nftables rules to DROP outgoing TCP RSTs
 // from interface-NAT (SNAT) addresses. These addresses are owned by the
 // userspace dataplane; the kernel has no sockets for them and should never
 // emit RSTs.
 //
-// The delete + create is performed in a single atomic netlink batch to
-// eliminate the race window where no rules exist between the old table
-// deletion and new table creation. This is critical for HA failover:
-// during the microseconds of RG demotion, the kernel may generate RSTs
-// for connections it doesn't own (#450).
+// When the table already exists, delete + create is performed in a single
+// atomic netlink batch to eliminate the race window where no rules exist
+// between the old table deletion and new table creation. This is critical
+// for HA failover: during the microseconds of RG demotion, the kernel may
+// generate RSTs for connections it doesn't own (#450).
 func InstallRSTSuppression(v4Addrs []netip.Addr, v6Addrs []netip.Addr) error {
 	c, err := nftables.New()
 	if err != nil {
 		return fmt.Errorf("nftables conn: %w", err)
 	}
-
-	// Delete + create in a single atomic flush. The kernel applies the
-	// entire netlink batch atomically, so the RST suppression rules are
-	// never absent — the old table is replaced by the new one in one shot.
-	// On fresh boot the table doesn't exist yet; the kernel silently
-	// ignores the delete for non-existent tables in a batch.
-	removeRSTTable(c)
-
-	if len(v4Addrs) == 0 && len(v6Addrs) == 0 {
-		// Flush the delete only — no rules needed.
-		if err := c.Flush(); err != nil {
-			return fmt.Errorf("nftables flush (delete-only): %w", err)
-		}
+	tableExists, err := rstTableExists(c)
+	if err != nil {
+		return err
+	}
+	plan := buildRSTSuppressionPlan(tableExists, v4Addrs, v6Addrs)
+	if !queueRSTSuppression(c, plan) {
 		return nil
-	}
-
-	table := c.AddTable(&nftables.Table{
-		Family: nftables.TableFamilyINet,
-		Name:   rstTableName,
-	})
-
-	chain := c.AddChain(&nftables.Chain{
-		Name:     "output",
-		Table:    table,
-		Type:     nftables.ChainTypeFilter,
-		Hooknum:  nftables.ChainHookOutput,
-		Priority: nftables.ChainPriorityFilter,
-		Policy:   ptrPolicy(nftables.ChainPolicyAccept),
-	})
-
-	for _, addr := range v4Addrs {
-		addRSTDropRuleV4(c, table, chain, addr.As4())
-	}
-	for _, addr := range v6Addrs {
-		addRSTDropRuleV6(c, table, chain, addr.As16())
 	}
 
 	if err := c.Flush(); err != nil {
@@ -82,6 +62,10 @@ func RemoveRSTSuppression() {
 	if err != nil {
 		return
 	}
+	tableExists, err := rstTableExists(c)
+	if err != nil || !tableExists {
+		return
+	}
 	removeRSTTable(c)
 	_ = c.Flush()
 }
@@ -91,6 +75,61 @@ func removeRSTTable(c *nftables.Conn) {
 		Family: nftables.TableFamilyINet,
 		Name:   rstTableName,
 	})
+}
+
+func rstTableExists(c *nftables.Conn) (bool, error) {
+	tables, err := c.ListTablesOfFamily(nftables.TableFamilyINet)
+	if err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return false, nil
+		}
+		return false, fmt.Errorf("nftables list tables: %w", err)
+	}
+	for _, table := range tables {
+		if table != nil && table.Name == rstTableName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func buildRSTSuppressionPlan(tableExists bool, v4Addrs []netip.Addr, v6Addrs []netip.Addr) rstSuppressionPlan {
+	return rstSuppressionPlan{
+		deleteTable: tableExists,
+		v4Addrs:     slices.Clone(v4Addrs),
+		v6Addrs:     slices.Clone(v6Addrs),
+	}
+}
+
+func queueRSTSuppression(c *nftables.Conn, plan rstSuppressionPlan) bool {
+	if plan.deleteTable {
+		removeRSTTable(c)
+	}
+	if len(plan.v4Addrs) == 0 && len(plan.v6Addrs) == 0 {
+		return plan.deleteTable
+	}
+
+	table := c.AddTable(&nftables.Table{
+		Family: nftables.TableFamilyINet,
+		Name:   rstTableName,
+	})
+
+	chain := c.AddChain(&nftables.Chain{
+		Name:     "output",
+		Table:    table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookOutput,
+		Priority: nftables.ChainPriorityFilter,
+		Policy:   ptrPolicy(nftables.ChainPolicyAccept),
+	})
+
+	for _, addr := range plan.v4Addrs {
+		addRSTDropRuleV4(c, table, chain, addr.As4())
+	}
+	for _, addr := range plan.v6Addrs {
+		addRSTDropRuleV6(c, table, chain, addr.As16())
+	}
+	return true
 }
 
 func addRSTDropRuleV4(c *nftables.Conn, table *nftables.Table, chain *nftables.Chain, addr [4]byte) {
