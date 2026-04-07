@@ -482,6 +482,18 @@ func TestShouldSyncUserspaceDeltaSkipsLocalDelivery(t *testing.T) {
 	}
 }
 
+func TestShouldSyncUserspaceDeltaSkipsMissingNeighborSeed(t *testing.T) {
+	d := &Daemon{
+		sessionSync: &cluster.SessionSync{
+			IsPrimaryFn:      func() bool { return true },
+			IsPrimaryForRGFn: func(rgID int) bool { return true },
+		},
+	}
+	if d.shouldSyncUserspaceDelta(dpuserspace.SessionDeltaInfo{Origin: "missing_neighbor_seed"}, 1) {
+		t.Fatal("expected transient missing-neighbor seed deltas to stay out of session sync")
+	}
+}
+
 func TestShouldSyncUserspaceDeltaAllowsStaleOwnerFabricRedirect(t *testing.T) {
 	ss := &cluster.SessionSync{
 		IsPrimaryFn:      func() bool { return false },

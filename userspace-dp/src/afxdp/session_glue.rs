@@ -217,7 +217,11 @@ fn export_forward_sessions_for_owner_rgs(sessions: &mut SessionTable, owner_rgs:
         let Some((decision, metadata, origin)) = sessions.entry_with_origin(&key) else {
             continue;
         };
-        if metadata.is_reverse || origin.is_peer_synced() || metadata.fabric_ingress {
+        if metadata.is_reverse
+            || origin.is_peer_synced()
+            || origin.is_transient_local_seed()
+            || metadata.fabric_ingress
+        {
             continue;
         }
         if !matches!(
@@ -2438,6 +2442,58 @@ mod tests {
         assert_eq!(deltas.len(), 1, "export should republish forward session");
         assert_eq!(deltas[0].kind, SessionDeltaKind::Open);
         assert!(deltas[0].fabric_redirect_sync);
+    }
+
+    #[test]
+    fn apply_worker_commands_does_not_export_missing_neighbor_seed_sessions() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let metadata = SessionMetadata {
+            owner_rg_id: 1,
+            ..test_metadata()
+        };
+        assert!(sessions.install_with_protocol_with_origin(
+            key,
+            test_decision(),
+            metadata,
+            SessionOrigin::MissingNeighborSeed,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        assert!(
+            sessions.drain_deltas(16).is_empty(),
+            "missing-neighbor seed install should not emit open deltas"
+        );
+        commands
+            .lock()
+            .expect("commands lock")
+            .push_back(WorkerCommand::ExportOwnerRGSessions {
+                sequence: 10,
+                owner_rgs: vec![1],
+            });
+        let forwarding = test_forwarding_state_with_fabric();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
+        let results = apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+        );
+
+        assert!(results.cancelled_keys.is_empty());
+        assert_eq!(results.exported_sequences, vec![10]);
+        assert!(
+            sessions.drain_deltas(16).is_empty(),
+            "missing-neighbor seed sessions must not be exported as HA deltas"
+        );
     }
 
     #[test]
