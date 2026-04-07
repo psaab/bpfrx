@@ -3,6 +3,7 @@ package cluster
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -576,6 +577,52 @@ func TestRequestPeerFailoverCommitsLocalPrimaryWithoutHeartbeatObservation(t *te
 	}
 }
 
+func TestRequestPeerFailoverAllowsTransferWithSyncWhenHeartbeatLost(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	m.mu.Lock()
+	m.peerEverSeen = true
+	m.peerAlive = false
+	m.peerGroups[0] = PeerGroupState{
+		GroupID:  0,
+		Priority: 200,
+		Weight:   255,
+		State:    StatePrimary,
+	}
+	m.groups[0].State = StateSecondary
+	m.groups[0].Ready = true
+	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+	m.groups[0].ReadinessReasons = nil
+	m.mu.Unlock()
+
+	var committedRG int
+	var committedReqID uint64
+	m.SetPeerFailoverFunc(func(rgID int) (uint64, error) {
+		return 91, nil
+	})
+	m.SetPeerFailoverCommitFunc(func(rgID int, reqID uint64) error {
+		committedRG = rgID
+		committedReqID = reqID
+		return nil
+	})
+
+	if err := m.RequestPeerFailover(0); err != nil {
+		t.Fatalf("RequestPeerFailover() error = %v", err)
+	}
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("should be primary after explicit transfer commit with sync-connected peer")
+	}
+	if committedRG != 0 || committedReqID != 91 {
+		t.Fatalf("commit = rg %d req %d, want rg 0 req 91", committedRG, committedReqID)
+	}
+	if peer := m.PeerGroupStates()[0]; peer.State != StateSecondary {
+		t.Fatalf("peer state = %s, want secondary after commit", peer.State)
+	}
+}
+
 func TestRequestPeerFailoverBatchCommitsLocalPrimaryTogether(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(
@@ -627,6 +674,63 @@ func TestRequestPeerFailoverBatchCommitsLocalPrimaryTogether(t *testing.T) {
 		t.Fatalf("committed rgs = %v, want [1 2]", committedRGs)
 	}
 	for _, rgID := range []int{1, 2} {
+		if peer := m.PeerGroupStates()[rgID]; peer.State != StateSecondary {
+			t.Fatalf("peer state for rg %d = %s, want secondary after commit", rgID, peer.State)
+		}
+	}
+}
+
+func TestRequestPeerFailoverBatchAllowsTransferWithSyncWhenHeartbeatLost(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(1, true, map[int]int{0: 100}),
+		makeRG(2, true, map[int]int{0: 100}),
+	)
+	m.UpdateConfig(cfg)
+	<-m.Events()
+	<-m.Events()
+
+	m.mu.Lock()
+	m.peerEverSeen = true
+	m.peerAlive = false
+	for _, rgID := range []int{1, 2} {
+		m.peerGroups[rgID] = PeerGroupState{
+			GroupID:  rgID,
+			Priority: 200,
+			Weight:   255,
+			State:    StatePrimary,
+		}
+		m.groups[rgID].State = StateSecondary
+		m.groups[rgID].Ready = true
+		m.groups[rgID].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+		m.groups[rgID].ReadinessReasons = nil
+	}
+	m.mu.Unlock()
+
+	var committedRGs []int
+	var committedReqID uint64
+	m.SetPeerFailoverBatchFunc(func(rgIDs []int) (uint64, error) {
+		committedRGs = append([]int(nil), rgIDs...)
+		return 92, nil
+	})
+	m.SetPeerFailoverCommitBatchFunc(func(rgIDs []int, reqID uint64) error {
+		committedReqID = reqID
+		return nil
+	})
+
+	if err := m.RequestPeerFailoverBatch([]int{2, 1}); err != nil {
+		t.Fatalf("RequestPeerFailoverBatch() error = %v", err)
+	}
+	if committedReqID != 92 {
+		t.Fatalf("commit req id = %d, want 92", committedReqID)
+	}
+	if !reflect.DeepEqual(committedRGs, []int{1, 2}) {
+		t.Fatalf("requested rg IDs = %v, want [1 2]", committedRGs)
+	}
+	for _, rgID := range []int{1, 2} {
+		if !m.IsLocalPrimary(rgID) {
+			t.Fatalf("rg %d should be primary after explicit batch transfer commit", rgID)
+		}
 		if peer := m.PeerGroupStates()[rgID]; peer.State != StateSecondary {
 			t.Fatalf("peer state for rg %d = %s, want secondary after commit", rgID, peer.State)
 		}

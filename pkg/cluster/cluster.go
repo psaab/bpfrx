@@ -867,10 +867,6 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 		m.mu.Unlock()
 		return fmt.Errorf("node is already primary for redundancy group %d", rgID)
 	}
-	if !m.peerAlive {
-		m.mu.Unlock()
-		return fmt.Errorf("peer not alive — cannot request failover")
-	}
 	if !rg.IsReadyForTakeover(m.takeoverHoldTime) {
 		readySince := "<zero>"
 		if !rg.ReadySince.IsZero() {
@@ -889,12 +885,19 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 	fn := m.peerFailoverFn
 	commitFn := m.peerFailoverCommitFn
 	transferReadyFn := m.transferReadinessFn
+	peerAlive := m.peerAlive
 	m.mu.Unlock()
 
 	if fn == nil {
+		if !peerAlive {
+			return fmt.Errorf("peer not alive — cannot request failover")
+		}
 		return fmt.Errorf("peer failover not available (sync not connected)")
 	}
 	if commitFn == nil {
+		if !peerAlive {
+			return fmt.Errorf("peer not alive — cannot request failover")
+		}
 		return fmt.Errorf("peer failover commit not available (sync not connected)")
 	}
 	if transferReadyFn != nil {
