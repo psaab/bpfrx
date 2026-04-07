@@ -45,15 +45,19 @@ func TestResolveJunosIfName(t *testing.T) {
 }
 
 func TestShouldScheduleStandbyNeighborRefresh(t *testing.T) {
-	var d Daemon
 	base := time.Unix(100, 0)
-	if !d.shouldScheduleStandbyNeighborRefresh(base) {
+	d := Daemon{startTime: base}
+	first := base.Add(10 * time.Second)
+	if !d.shouldScheduleStandbyNeighborRefresh(first) {
 		t.Fatal("first standby neighbor refresh should schedule")
 	}
-	if d.shouldScheduleStandbyNeighborRefresh(base.Add(500 * time.Millisecond)) {
+	if d.shouldScheduleStandbyNeighborRefresh(first.Add(500 * time.Millisecond)) {
 		t.Fatal("refresh inside debounce interval should not schedule")
 	}
-	if !d.shouldScheduleStandbyNeighborRefresh(base.Add(standbyNeighborRefreshMinInterval + time.Millisecond)) {
+	if !d.shouldScheduleStandbyNeighborRefresh(first.Add(standbyNeighborRefreshMinInterval + time.Millisecond)) {
 		t.Fatal("refresh after debounce interval should schedule")
+	}
+	if !d.shouldScheduleStandbyNeighborRefresh(first.Add(-time.Second)) {
+		t.Fatal("clock step backwards should not suppress refresh scheduling")
 	}
 }
