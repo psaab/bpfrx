@@ -2652,6 +2652,48 @@ mod tests {
     }
 
     #[test]
+    fn apply_worker_commands_demote_owner_rg_returns_cancelled_keys() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        assert!(sessions.install_with_protocol_with_origin(
+            key.clone(),
+            test_decision(),
+            test_metadata(),
+            SessionOrigin::ForwardFlow,
+            1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+        commands
+            .lock()
+            .expect("commands lock")
+            .push_back(WorkerCommand::DemoteOwnerRGS {
+                owner_rgs: vec![1, 1],
+            });
+
+        let forwarding = test_forwarding_state_with_fabric();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000));
+
+        let results = apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+        );
+
+        assert_eq!(results.exported_sequences, Vec::<u64>::new());
+        assert_eq!(results.cancelled_keys.len(), 1);
+        assert!(results.cancelled_keys.iter().any(|k| k == &key));
+    }
+
+    #[test]
     fn demote_shared_owner_rgs_preserves_reverse_entries_and_marks_all_synced() {
         let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
         let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
