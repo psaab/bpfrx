@@ -286,7 +286,10 @@ impl SessionTable {
                         decision.nat.rewrite_dst,
                     );
                 }
-                if !metadata.is_reverse && !entry.origin.is_peer_synced() {
+                if !metadata.is_reverse
+                    && !entry.origin.is_peer_synced()
+                    && !entry.origin.is_transient_local_seed()
+                {
                     self.push_delta(SessionDelta {
                         kind: SessionDeltaKind::Close,
                         key: key.clone(),
@@ -1141,6 +1144,28 @@ mod tests {
             table.drain_deltas(8).is_empty(),
             "transient missing-neighbor seeds must stay local"
         );
+    }
+
+    #[test]
+    fn missing_neighbor_seed_expire_stays_out_of_delta_stream() {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let then = 1_000_000_000u64;
+        assert!(table.install_with_protocol_with_origin(
+            key.clone(),
+            decision(),
+            metadata(),
+            SessionOrigin::MissingNeighborSeed,
+            then,
+            PROTO_TCP,
+            0x10
+        ));
+        assert!(table.drain_deltas(8).is_empty());
+        table.last_gc_ns = then + 301_000_000_000;
+        let expired = table.expire_stale_entries(then + 302_000_000_000);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].key, key);
+        assert!(table.drain_deltas(8).is_empty());
     }
 
     #[test]
