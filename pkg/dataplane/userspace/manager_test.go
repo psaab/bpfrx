@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,27 @@ import (
 	"github.com/psaab/bpfrx/pkg/dataplane"
 	"github.com/vishvananda/netlink"
 )
+
+func TestShouldAttemptRSTSuppression(t *testing.T) {
+	now := time.Unix(100, 0)
+	addrV4 := []netip.Addr{netip.MustParseAddr("172.16.80.8")}
+
+	if !shouldAttemptRSTSuppression(now, addrV4, nil, nil, nil, time.Time{}, false) {
+		t.Fatal("shouldAttemptRSTSuppression() = false on first attempt, want true")
+	}
+	if shouldAttemptRSTSuppression(now, addrV4, nil, addrV4, nil, now, true) {
+		t.Fatal("shouldAttemptRSTSuppression() = true for unchanged successful install, want false")
+	}
+	if !shouldAttemptRSTSuppression(now, addrV4, nil, nil, nil, now, true) {
+		t.Fatal("shouldAttemptRSTSuppression() = false for address change, want true")
+	}
+	if shouldAttemptRSTSuppression(now, addrV4, nil, addrV4, nil, now.Add(-rstSuppressionRetryBackoff+time.Second), false) {
+		t.Fatal("shouldAttemptRSTSuppression() = true before failure retry backoff, want false")
+	}
+	if !shouldAttemptRSTSuppression(now, addrV4, nil, addrV4, nil, now.Add(-rstSuppressionRetryBackoff), false) {
+		t.Fatal("shouldAttemptRSTSuppression() = false at failure retry backoff, want true")
+	}
+}
 
 func hostToNetwork16(v uint16) uint16 {
 	var raw [2]byte

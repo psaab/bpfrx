@@ -80,6 +80,8 @@ type Manager struct {
 	lastIngressIfaces       []uint32
 	lastRSTv4               []netip.Addr
 	lastRSTv6               []netip.Addr
+	lastRSTAttempt          time.Time
+	lastRSTInstallOK        bool
 	lastSnapshotHash        [32]byte // content hash of last published snapshot (excludes volatile fields)
 	lastBindingIndices      []uint32
 	neighborsPrewarmed      bool
@@ -120,6 +122,29 @@ type Manager struct {
 	// Used by the daemon to defer IPVLAN creation until after XSK
 	// binds in zerocopy mode on fabric parents.
 	OnXSKBound func()
+}
+
+const rstSuppressionRetryBackoff = 5 * time.Second
+
+func shouldAttemptRSTSuppression(
+	now time.Time,
+	desiredV4 []netip.Addr,
+	desiredV6 []netip.Addr,
+	appliedV4 []netip.Addr,
+	appliedV6 []netip.Addr,
+	lastAttempt time.Time,
+	lastInstallOK bool,
+) bool {
+	if lastAttempt.IsZero() {
+		return true
+	}
+	if !slices.Equal(desiredV4, appliedV4) || !slices.Equal(desiredV6, appliedV6) {
+		return true
+	}
+	if lastInstallOK {
+		return false
+	}
+	return now.Sub(lastAttempt) >= rstSuppressionRetryBackoff
 }
 
 func New() *Manager {
@@ -3416,18 +3441,28 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 	}
 	slices.SortFunc(rstV4, netip.Addr.Compare)
 	slices.SortFunc(rstV6, netip.Addr.Compare)
-	// Install RST suppression rules. Skip if addresses haven't changed
-	// (dedup) to avoid hammering a broken nftables subsystem on every
-	// compile cycle. On first call (lastRSTv4 nil) always try.
-	if m.lastRSTv4 == nil || !slices.Equal(rstV4, m.lastRSTv4) || !slices.Equal(rstV6, m.lastRSTv6) {
+	// Install RST suppression rules. Retry immediately on address changes,
+	// and periodically retry unchanged failed installs so a transient
+	// startup failure does not leave the node permanently unprotected.
+	now := time.Now()
+	if shouldAttemptRSTSuppression(
+		now,
+		rstV4,
+		rstV6,
+		m.lastRSTv4,
+		m.lastRSTv6,
+		m.lastRSTAttempt,
+		m.lastRSTInstallOK,
+	) {
 		if err := bpfrxnft.InstallRSTSuppression(rstV4, rstV6); err != nil {
-			// Log once, don't retry until addresses change.
-			if m.lastRSTv4 == nil {
-				slog.Warn("userspace: RST suppression unavailable (nftables error, non-fatal)", "err", err)
-			}
+			slog.Warn("userspace: RST suppression unavailable (nftables error, non-fatal)", "err", err)
+			m.lastRSTInstallOK = false
+		} else {
+			m.lastRSTInstallOK = true
 		}
-		m.lastRSTv4 = rstV4
-		m.lastRSTv6 = rstV6
+		m.lastRSTAttempt = now
+		m.lastRSTv4 = slices.Clone(rstV4)
+		m.lastRSTv6 = slices.Clone(rstV6)
 	}
 	return nil
 }
