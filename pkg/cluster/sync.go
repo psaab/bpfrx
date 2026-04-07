@@ -26,30 +26,26 @@ var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 
 // Sync message types.
 const (
-	syncMsgSessionV4              = 1
-	syncMsgSessionV6              = 2
-	syncMsgDeleteV4               = 3
-	syncMsgDeleteV6               = 4
-	syncMsgBulkStart              = 5
-	syncMsgBulkEnd                = 6
-	syncMsgHeartbeat              = 7
-	syncMsgConfig                 = 8  // full config text sync from primary to secondary
-	syncMsgIPsecSA                = 9  // IPsec SA connection names sync
-	syncMsgFailover               = 10 // remote failover request (payload: 1 byte rgID)
-	syncMsgFence                  = 11 // peer fencing: receiver should disable all RGs
-	syncMsgClockSync              = 12 // monotonic clock exchange for timestamp rebasing
-	syncMsgBarrier                = 13 // ordered marker for remote install barriers
-	syncMsgBarrierAck             = 14
-	syncMsgBulkAck                = 15
-	syncMsgFailoverAck            = 16 // failover request result (payload: rgID, status, detail)
-	syncMsgFailoverCommit         = 17 // failover ownership commit (payload: rgID, reqID)
-	syncMsgFailoverCommitAck      = 18 // failover commit result (payload: rgID, status, detail)
-	syncMsgPrepareActivation      = 19 // hint: demoting node tells peer to pre-warm neighbors (payload: 1 byte rgID)
-	syncMsgFailoverBatch          = 20 // remote failover request for multiple RGs
-	syncMsgFailoverBatchAck       = 21 // multi-RG failover request result
-	syncMsgFailoverBatchCommit    = 22 // multi-RG failover ownership commit
-	syncMsgFailoverBatchCommitAck = 23 // multi-RG failover commit result
-	syncMsgHeartbeatAck           = 24
+	syncMsgSessionV4         = 1
+	syncMsgSessionV6         = 2
+	syncMsgDeleteV4          = 3
+	syncMsgDeleteV6          = 4
+	syncMsgBulkStart         = 5
+	syncMsgBulkEnd           = 6
+	syncMsgHeartbeat         = 7
+	syncMsgConfig            = 8  // full config text sync from primary to secondary
+	syncMsgIPsecSA           = 9  // IPsec SA connection names sync
+	syncMsgFailover          = 10 // remote failover request (payload: 1 byte rgID)
+	syncMsgFence             = 11 // peer fencing: receiver should disable all RGs
+	syncMsgClockSync         = 12 // monotonic clock exchange for timestamp rebasing
+	syncMsgBarrier           = 13 // ordered marker for remote install barriers
+	syncMsgBarrierAck        = 14
+	syncMsgBulkAck           = 15
+	syncMsgFailoverAck       = 16 // failover request result (payload: rgID, status, detail)
+	syncMsgFailoverCommit    = 17 // failover ownership commit (payload: rgID, reqID)
+	syncMsgFailoverCommitAck = 18 // failover commit result (payload: rgID, status, detail)
+	syncMsgPrepareActivation = 19 // hint: demoting node tells peer to pre-warm neighbors (payload: 1 byte rgID)
+	syncMsgHeartbeatAck      = 20
 )
 
 // syncHeader is the wire header for each sync message.
@@ -275,6 +271,7 @@ type SessionSync struct {
 	deleteJournal    [][]byte // ring buffer of encoded delete messages
 	deleteJournalCap int      // max entries (default 10000)
 	lastPeerRxUnix   atomic.Int64
+	peerHeartbeatAck atomic.Bool
 	readDeadline     time.Duration
 	peerSilenceLimit time.Duration
 
@@ -528,10 +525,18 @@ func (s *SessionSync) PeerRecentlyActive(maxAge time.Duration) bool {
 	return ok && age <= maxAge
 }
 
-// PeerHealthy reports whether the sync connection is established and the peer
-// has been observed on the protocol within the expected silence window.
+// PeerHealthy reports whether the sync connection is established and, once the
+// peer proves heartbeat-ack support, has been observed on the protocol within
+// the expected silence window. Before that capability is observed we fall back
+// to plain connection state so rolling upgrades do not flap readiness.
 func (s *SessionSync) PeerHealthy() bool {
-	return s.stats.Connected.Load() && s.PeerRecentlyActive(s.peerSilenceDuration())
+	if !s.stats.Connected.Load() {
+		return false
+	}
+	if !s.peerHeartbeatAck.Load() {
+		return true
+	}
+	return s.PeerRecentlyActive(s.peerSilenceDuration())
 }
 
 // activeConnLocked returns the preferred active connection.
@@ -645,6 +650,9 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	}
 	s.stats.Connected.Store(true)
 	s.lastPeerRxUnix.Store(time.Now().UnixNano())
+	if wasDisconnected {
+		s.peerHeartbeatAck.Store(false)
+	}
 	s.mu.Unlock()
 	becameActive := activeAfter == fabricIdx
 
@@ -1510,7 +1518,9 @@ func (s *SessionSync) receiveLoop(ctx context.Context, conn net.Conn) {
 				return
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				missedHeartbeats++
+				if s.peerHeartbeatAck.Load() {
+					missedHeartbeats++
+				}
 				if missedHeartbeats >= 2 {
 					slog.Warn("cluster sync: heartbeat ack timeout, closing stale connection",
 						"local", connLocalAddrString(conn),
@@ -1895,7 +1905,7 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		}
 
 	case syncMsgHeartbeatAck:
-		// keepalive reply, no action needed
+		s.peerHeartbeatAck.Store(true)
 
 	case syncMsgConfig:
 		s.stats.ConfigsReceived.Add(1)
@@ -2367,6 +2377,7 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 	connected := s.conn0 != nil || s.conn1 != nil
 	s.stats.Connected.Store(connected)
 	if !connected {
+		s.peerHeartbeatAck.Store(false)
 		pendingBarriers := s.barrierSeq.Load()
 		ackedBarriers := s.barrierAckSeq.Load()
 		// Do NOT reset barrierSeq — the monotonic counter must keep

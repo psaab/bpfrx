@@ -178,17 +178,18 @@ func TestPeerRecentlyActive(t *testing.T) {
 	}
 }
 
-func TestPeerHealthyRequiresRecentInbound(t *testing.T) {
+func TestPeerHealthyRequiresRecentInboundAfterHeartbeatAck(t *testing.T) {
 	s := &SessionSync{}
 	if s.PeerHealthy() {
 		t.Fatal("expected disconnected session sync to be unhealthy")
 	}
 
 	s.stats.Connected.Store(true)
-	if s.PeerHealthy() {
-		t.Fatal("expected missing peer activity to be unhealthy")
+	if !s.PeerHealthy() {
+		t.Fatal("expected connected pre-capability session sync to be healthy")
 	}
 
+	s.peerHeartbeatAck.Store(true)
 	s.lastPeerRxUnix.Store(time.Now().UnixNano())
 	if !s.PeerHealthy() {
 		t.Fatal("expected recent peer activity to be healthy")
@@ -3008,9 +3009,49 @@ func TestReceiveLoopClosesSilentConnection(t *testing.T) {
 	}
 	defer serverConn.Close()
 
+	heartbeatAcked := make(chan struct{}, 1)
+	serverDone := make(chan error, 1)
+	go func() {
+		defer close(serverDone)
+		for {
+			var hdr [syncHeaderSize]byte
+			if err := serverConn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				serverDone <- err
+				return
+			}
+			if _, err := io.ReadFull(serverConn, hdr[:]); err != nil {
+				serverDone <- err
+				return
+			}
+			if string(hdr[0:4]) != "BPSY" {
+				serverDone <- fmt.Errorf("bad sync magic: %q", hdr[0:4])
+				return
+			}
+			payloadLen := binary.LittleEndian.Uint32(hdr[8:12])
+			if payloadLen > 0 {
+				payload := make([]byte, payloadLen)
+				if _, err := io.ReadFull(serverConn, payload); err != nil {
+					serverDone <- err
+					return
+				}
+			}
+			if hdr[4] != syncMsgHeartbeat {
+				continue
+			}
+			if err := writeMsg(serverConn, syncMsgHeartbeatAck, nil); err != nil {
+				serverDone <- err
+				return
+			}
+			heartbeatAcked <- struct{}{}
+			<-time.After(time.Second)
+			return
+		}
+	}()
+
 	ss := NewSessionSync(":0", ln.Addr().String(), nil)
-	ss.readDeadline = 15 * time.Millisecond
-	ss.peerSilenceLimit = 45 * time.Millisecond
+	ss.bulkEverCompleted.Store(true)
+	ss.readDeadline = 100 * time.Millisecond
+	ss.peerSilenceLimit = 300 * time.Millisecond
 
 	disconnected := make(chan struct{}, 1)
 	ss.OnPeerDisconnected = func() {
@@ -3025,8 +3066,14 @@ func TestReceiveLoopClosesSilentConnection(t *testing.T) {
 	ss.handleNewConnection(ctx, 0, clientConn)
 
 	select {
+	case <-heartbeatAcked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for heartbeat ack exchange")
+	}
+
+	select {
 	case <-disconnected:
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for silent connection disconnect")
 	}
 
@@ -3038,6 +3085,109 @@ func TestReceiveLoopClosesSilentConnection(t *testing.T) {
 	}
 	if got := ss.getActiveConn(); got != nil {
 		t.Fatalf("expected active conn to be cleared, got %v", got)
+	}
+	if err := <-serverDone; err != nil && !errors.Is(err, net.ErrClosed) && !strings.Contains(err.Error(), "use of closed network connection") {
+		t.Fatalf("server loop failed: %v", err)
+	}
+}
+
+func TestReceiveLoopKeepsConnectionAliveWithoutHeartbeatAckSupport(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	serverConnCh := make(chan net.Conn, 1)
+	serverErrCh := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			serverErrCh <- err
+			return
+		}
+		serverConnCh <- conn
+	}()
+
+	clientConn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer clientConn.Close()
+
+	var serverConn net.Conn
+	select {
+	case err := <-serverErrCh:
+		t.Fatalf("accept: %v", err)
+	case serverConn = <-serverConnCh:
+	}
+	defer serverConn.Close()
+
+	heartbeatSeen := make(chan struct{}, 1)
+	serverDone := make(chan error, 1)
+	go func() {
+		for {
+			var hdr [syncHeaderSize]byte
+			if err := serverConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond)); err != nil {
+				serverDone <- err
+				return
+			}
+			if _, err := io.ReadFull(serverConn, hdr[:]); err != nil {
+				serverDone <- err
+				return
+			}
+			if string(hdr[0:4]) != "BPSY" {
+				serverDone <- fmt.Errorf("bad sync magic: %q", hdr[0:4])
+				return
+			}
+			payloadLen := binary.LittleEndian.Uint32(hdr[8:12])
+			if payloadLen > 0 {
+				payload := make([]byte, payloadLen)
+				if _, err := io.ReadFull(serverConn, payload); err != nil {
+					serverDone <- err
+					return
+				}
+			}
+			if hdr[4] == syncMsgHeartbeat {
+				select {
+				case heartbeatSeen <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+
+	ss := NewSessionSync(":0", ln.Addr().String(), nil)
+	ss.bulkEverCompleted.Store(true)
+	ss.readDeadline = 100 * time.Millisecond
+	ss.peerSilenceLimit = 300 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ss.handleNewConnection(ctx, 0, clientConn)
+
+	select {
+	case <-heartbeatSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for legacy heartbeat request")
+	}
+
+	time.Sleep(350 * time.Millisecond)
+
+	if !ss.IsConnected() {
+		t.Fatal("expected legacy peer without heartbeat ack to remain connected")
+	}
+	if !ss.PeerHealthy() {
+		t.Fatal("expected legacy peer without heartbeat ack to remain healthy")
+	}
+	if got := ss.getActiveConn(); got == nil {
+		t.Fatal("expected active conn to remain installed")
+	}
+
+	cancel()
+	serverConn.Close()
+	if err := <-serverDone; err != nil && !errors.Is(err, net.ErrClosed) && !strings.Contains(err.Error(), "use of closed network connection") && !strings.Contains(err.Error(), "EOF") {
+		t.Fatalf("server loop failed: %v", err)
 	}
 }
 
@@ -3073,6 +3223,7 @@ func TestReceiveLoopKeepsConnectionAliveWithHeartbeatAck(t *testing.T) {
 	}
 	defer serverConn.Close()
 
+	heartbeatSeen := make(chan struct{}, 1)
 	serverDone := make(chan error, 1)
 	go func() {
 		for {
@@ -3099,6 +3250,10 @@ func TestReceiveLoopKeepsConnectionAliveWithHeartbeatAck(t *testing.T) {
 				}
 			}
 			if msgType == syncMsgHeartbeat {
+				select {
+				case heartbeatSeen <- struct{}{}:
+				default:
+				}
 				if err := writeMsg(serverConn, syncMsgHeartbeatAck, nil); err != nil {
 					serverDone <- err
 					return
@@ -3108,14 +3263,21 @@ func TestReceiveLoopKeepsConnectionAliveWithHeartbeatAck(t *testing.T) {
 	}()
 
 	ss := NewSessionSync(":0", ln.Addr().String(), nil)
-	ss.readDeadline = 15 * time.Millisecond
-	ss.peerSilenceLimit = 45 * time.Millisecond
+	ss.bulkEverCompleted.Store(true)
+	ss.readDeadline = 100 * time.Millisecond
+	ss.peerSilenceLimit = 300 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ss.handleNewConnection(ctx, 0, clientConn)
 
-	time.Sleep(80 * time.Millisecond)
+	select {
+	case <-heartbeatSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for heartbeat request")
+	}
+
+	time.Sleep(100 * time.Millisecond)
 
 	if !ss.IsConnected() {
 		t.Fatal("expected heartbeat ack to keep sync connected")
