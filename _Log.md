@@ -2,11 +2,15 @@
 
 ## 2026-04-03
 
-- **Timestamp**: 2026-04-03T00:00:00Z
-  - **Action**: Issue #546 — Split daemon_ha.go (4194 lines, 125 functions) into 5 domain files. Mechanical move only, no logic changes. daemon_ha_sync.go (16 funcs), daemon_ha_userspace.go (39 funcs), daemon_ha_fabric.go (18 funcs), daemon_ha_vip.go (24 funcs), daemon_ha.go remains at 28 funcs.
-  - **File(s)**: pkg/daemon/daemon_ha.go, pkg/daemon/daemon_ha_sync.go, pkg/daemon/daemon_ha_userspace.go, pkg/daemon/daemon_ha_fabric.go, pkg/daemon/daemon_ha_vip.go
+- **Timestamp**: 2026-04-03
+  - **Action**: Issue #547 — Split pkg/grpcapi/server.go (8411 lines) into 8 domain files. Mechanical move of functions, no logic changes. server.go reduced to 241 lines (types + server lifecycle).
+  - **File(s)**: pkg/grpcapi/server.go, server_config.go, server_show.go, server_nat.go, server_routing.go, server_diag.go, server_helpers.go, server_dhcp.go, server_cluster.go
 
 ## 2026-04-07
+
+- **Timestamp**: 2026-04-07T00:00:00Z
+  - **Action**: Issue #545 — Split `pkg/config/compiler.go` (5878 lines) into 8 domain-specific files. Mechanical refactor, no logic changes. Functions moved to: compiler_security.go, compiler_interfaces.go, compiler_protocols.go, compiler_ipsec.go, compiler_routing.go, compiler_firewall.go, compiler_system.go, compiler_services.go. compiler.go retains top-level dispatch + applications + validators (793 lines).
+  - **File(s)**: pkg/config/compiler.go, pkg/config/compiler_security.go, pkg/config/compiler_interfaces.go, pkg/config/compiler_protocols.go, pkg/config/compiler_ipsec.go, pkg/config/compiler_routing.go, pkg/config/compiler_firewall.go, pkg/config/compiler_system.go, pkg/config/compiler_services.go
 
 - **Timestamp**: 2026-04-07T00:00:00Z
   - **Action**: Issue #532 — Fix IPv6 TTL-expired (hop limit exceeded) probe responses not being returned in userspace dataplane. Added TTL/hop-limit check with ICMP Time Exceeded generation to both session-hit and flow-cache-hit paths. Previously only the session-miss path generated TE responses; subsequent packets hitting an existing session or flow cache were silently dropped when TTL<=1 because the rewrite functions returned None without generating a response.
