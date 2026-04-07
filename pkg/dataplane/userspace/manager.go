@@ -4261,6 +4261,7 @@ func (m *Manager) stopLocked() {
 	m.xskProbeStart = time.Time{}
 	m.lastXSKRX = 0
 	m.lastNAPIBootstrap = time.Time{}
+	m.lastStandbyNeighResolve = time.Time{}
 	m.publishedSnapshot = 0
 	m.publishedPlanKey = ""
 	m.sessionMirrorFailed = false
@@ -4517,10 +4518,20 @@ func (m *Manager) proactiveNeighborResolveAsyncLocked() {
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
 		return
 	}
+	cfg := m.lastSnapshot.Config
+	go proactiveNeighborResolveAsync(cfg)
+}
+
+type neighborProbeTarget struct {
+	iface string
+	ip    string
+}
+
+func proactiveNeighborResolveAsync(cfg *config.Config) {
 	seen := make(map[string]bool)
 	targetSet := make(map[string]struct{})
-	var targets []struct{ iface, ip string }
-	for ifName, ifc := range m.lastSnapshot.Config.Interfaces.Interfaces {
+	var targets []neighborProbeTarget
+	for ifName, ifc := range cfg.Interfaces.Interfaces {
 		base := config.LinuxIfName(ifName)
 		seen[base] = true // include base interface for route-GW probing
 		for _, unit := range ifc.Units {
@@ -4549,7 +4560,7 @@ func (m *Manager) proactiveNeighborResolveAsyncLocked() {
 							continue
 						}
 						targetSet[key] = struct{}{}
-						targets = append(targets, struct{ iface, ip string }{linuxName, n.IP.String()})
+						targets = append(targets, neighborProbeTarget{iface: linuxName, ip: n.IP.String()})
 					}
 				}
 			}
@@ -4585,7 +4596,7 @@ func (m *Manager) proactiveNeighborResolveAsyncLocked() {
 			continue
 		}
 		targetSet[key] = struct{}{}
-		targets = append(targets, struct{ iface, ip string }{ifName, r.Gw.String()})
+		targets = append(targets, neighborProbeTarget{iface: ifName, ip: r.Gw.String()})
 	}
 	for _, t := range targets {
 		go func(iface, ip string) {
