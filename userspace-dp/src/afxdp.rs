@@ -3302,10 +3302,10 @@ fn poll_binding(
                                                         forwarding,
                                                         &from_zone,
                                                         &to_zone,
-                                                    decision.resolution.egress_ifindex,
-                                                    flow,
-                                                )
-                                            })
+                                                        decision.resolution.egress_ifindex,
+                                                        flow,
+                                                    )
+                                                })
                                                 .unwrap_or_default();
                                         } else {
                                             let snat_decision = forwarding
