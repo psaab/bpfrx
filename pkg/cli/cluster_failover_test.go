@@ -58,3 +58,27 @@ func TestHandleRequestChassisClusterFailoverProxiesPeerTarget(t *testing.T) {
 		t.Fatalf("stdout = %q, want proxied response", out)
 	}
 }
+
+func TestHandleRequestChassisClusterFailoverDataProxiesPeerTarget(t *testing.T) {
+	c := &CLI{cluster: cluster.NewManager(0, 1)}
+
+	var gotAction string
+	c.peerSystemActionFn = func(ctx context.Context, action string) (string, error) {
+		gotAction = action
+		return "proxied data failover", nil
+	}
+
+	var callErr error
+	out := captureStdout(t, func() {
+		callErr = c.handleRequestChassisClusterFailover([]string{"data", "node", "1"})
+	})
+	if callErr != nil {
+		t.Fatalf("handleRequestChassisClusterFailover() error = %v", callErr)
+	}
+	if gotAction != "cluster-failover-data:node1" {
+		t.Fatalf("peer action = %q, want %q", gotAction, "cluster-failover-data:node1")
+	}
+	if strings.TrimSpace(out) != "proxied data failover" {
+		t.Fatalf("stdout = %q, want proxied response", out)
+	}
+}
