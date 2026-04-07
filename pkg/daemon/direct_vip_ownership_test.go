@@ -8,12 +8,9 @@ import (
 
 func TestDirectVIPOwnershipDesired(t *testing.T) {
 	tests := []struct {
-		name           string
-		localState     cluster.NodeState
-		peerAlive      bool
-		peerState      cluster.NodeState
-		peerStateKnown bool
-		want           bool
+		name       string
+		localState cluster.NodeState
+		want       bool
 	}{
 		{
 			name:       "local secondary never owns VIPs",
@@ -23,39 +20,25 @@ func TestDirectVIPOwnershipDesired(t *testing.T) {
 		{
 			name:       "peer lost lets local primary own VIPs",
 			localState: cluster.StatePrimary,
-			peerAlive:  false,
 			want:       true,
 		},
 		{
-			name:           "peer primary blocks ownership",
-			localState:     cluster.StatePrimary,
-			peerAlive:      true,
-			peerState:      cluster.StatePrimary,
-			peerStateKnown: true,
-			want:           false,
+			name:       "local primary still owns VIPs during dual-active resolution",
+			localState: cluster.StatePrimary,
+			want:       true,
 		},
 		{
-			name:           "peer transfer out allows ownership",
-			localState:     cluster.StatePrimary,
-			peerAlive:      true,
-			peerState:      cluster.StateSecondaryHold,
-			peerStateKnown: true,
-			want:           true,
-		},
-		{
-			name:           "missing peer RG info does not block ownership",
-			localState:     cluster.StatePrimary,
-			peerAlive:      true,
-			peerStateKnown: false,
-			want:           true,
+			name:       "local secondary hold does not own VIPs",
+			localState: cluster.StateSecondaryHold,
+			want:       false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := directVIPOwnershipDesired(tt.localState, tt.peerAlive, tt.peerState, tt.peerStateKnown); got != tt.want {
-				t.Fatalf("directVIPOwnershipDesired(%s, peerAlive=%v, peerState=%s, known=%v) = %v, want %v",
-					tt.localState, tt.peerAlive, tt.peerState, tt.peerStateKnown, got, tt.want)
+			if got := directVIPOwnershipDesired(tt.localState); got != tt.want {
+				t.Fatalf("directVIPOwnershipDesired(%s) = %v, want %v",
+					tt.localState, got, tt.want)
 			}
 		})
 	}

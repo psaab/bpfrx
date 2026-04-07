@@ -3033,12 +3033,14 @@ func (d *Daemon) reconcileRGState() {
 		// Stable link-local: ensure correct on EVERY reconcile tick.
 		// The kernel preserves NODAD addresses across daemon restarts,
 		// so stale addresses can exist without a state transition.
-		// Primary: add (idempotent — AddrAdd returns EEXIST if present).
-		// Secondary: remove (idempotent — AddrDel returns ENOENT if absent).
-		if tr.Active {
-			d.addStableRethLinkLocal(rgID)
-		} else {
-			d.removeStableRethLinkLocal(rgID)
+		// Direct mode owns this inside reconcileDirectVIPOwnership();
+		// VRRP mode keeps the legacy per-tick add/remove behavior here.
+		if !noRethVRRP {
+			if tr.Active {
+				d.addStableRethLinkLocal(rgID)
+			} else {
+				d.removeStableRethLinkLocal(rgID)
+			}
 		}
 
 		// Startup goodbye RA: when an RG is inactive on the first
@@ -3650,17 +3652,8 @@ func (d *Daemon) isNoRethVRRP() bool {
 	return cc != nil && (cc.NoRethVRRP || cc.PrivateRGElection)
 }
 
-func directVIPOwnershipDesired(localState cluster.NodeState, peerAlive bool, peerState cluster.NodeState, peerStateKnown bool) bool {
-	if localState != cluster.StatePrimary {
-		return false
-	}
-	if !peerAlive {
-		return true
-	}
-	if peerStateKnown && peerState == cluster.StatePrimary {
-		return false
-	}
-	return true
+func directVIPOwnershipDesired(localState cluster.NodeState) bool {
+	return localState == cluster.StatePrimary
 }
 
 func (d *Daemon) shouldOwnDirectVIPs(rgID int) bool {
@@ -3671,15 +3664,7 @@ func (d *Daemon) shouldOwnDirectVIPs(rgID int) bool {
 	if local == nil {
 		return false
 	}
-	peerAlive := d.cluster.PeerAlive()
-	peerState, peerKnown := cluster.StateSecondary, false
-	if peerAlive {
-		if peer, ok := d.cluster.PeerGroupStates()[rgID]; ok {
-			peerState = peer.State
-			peerKnown = true
-		}
-	}
-	return directVIPOwnershipDesired(local.State, peerAlive, peerState, peerKnown)
+	return directVIPOwnershipDesired(local.State)
 }
 
 func (d *Daemon) directVIPOwnershipApplied(rgID int) bool {
@@ -3689,17 +3674,6 @@ func (d *Daemon) directVIPOwnershipApplied(rgID int) bool {
 		d.directVIPOwned = make(map[int]bool)
 	}
 	return d.directVIPOwned[rgID]
-}
-
-func (d *Daemon) setDirectVIPOwnershipApplied(rgID int, owned bool) bool {
-	d.directVIPMu.Lock()
-	defer d.directVIPMu.Unlock()
-	if d.directVIPOwned == nil {
-		d.directVIPOwned = make(map[int]bool)
-	}
-	prev := d.directVIPOwned[rgID]
-	d.directVIPOwned[rgID] = owned
-	return prev
 }
 
 func (d *Daemon) addDirectVIPs(rgID int) int {
@@ -3737,17 +3711,24 @@ func (d *Daemon) reconcileDirectVIPOwnership(rgID int, reason string) {
 }
 
 func (d *Daemon) applyDirectVIPOwnership(rgID int, want bool, reason string) {
-	prev := d.directVIPOwnershipApplied(rgID)
+	d.directVIPMu.Lock()
+	if d.directVIPOwned == nil {
+		d.directVIPOwned = make(map[int]bool)
+	}
+	prev := d.directVIPOwned[rgID]
 	if want {
 		added := d.addDirectVIPs(rgID)
 		d.addDirectStableLinkLocal(rgID)
 		if !prev {
 			d.applyRethServicesForRG(rgID)
 		}
-		d.setDirectVIPOwnershipApplied(rgID, true)
-		if !prev || added > 0 {
+		d.directVIPOwned[rgID] = true
+		announce := !prev || added > 0
+		cfg := d.store.ActiveConfig()
+		d.directVIPMu.Unlock()
+		if announce {
 			d.scheduleDirectAnnounce(rgID, reason)
-			if cfg := d.store.ActiveConfig(); cfg != nil {
+			if cfg != nil {
 				go d.resolveNeighbors(cfg)
 			}
 		}
@@ -3757,10 +3738,11 @@ func (d *Daemon) applyDirectVIPOwnership(rgID int, want bool, reason string) {
 	d.cancelDirectAnnounce(rgID)
 	removed := d.removeDirectVIPs(rgID)
 	d.removeDirectStableLinkLocal(rgID)
+	d.directVIPOwned[rgID] = false
+	d.directVIPMu.Unlock()
 	if prev || removed > 0 {
 		d.clearRethServicesForRG(rgID)
 	}
-	d.setDirectVIPOwnershipApplied(rgID, false)
 }
 
 // directAddVIPs adds VIPs for RETH interfaces in the given RG using netlink.
