@@ -90,8 +90,11 @@ type FullConfig struct {
 	// Used to translate RETH interface names in static routes to kernel names.
 	RethMap map[string]string
 
-	// IPv6NextHopInterfaces resolves global IPv6 next-hops to their on-link
-	// kernel interface name when the config omits an explicit interface.
+	// IPv6NextHopInterfaces maps IPv6 next-hops used by global and per-instance
+	// static routes to the interface to use when the route omits an explicit
+	// interface. Values may still be logical interface names (for example,
+	// "reth0.50"); any later translation to kernel/physical names is handled
+	// separately via RethMap.
 	IPv6NextHopInterfaces map[string]string
 
 	// ConsistentHash is set when the forwarding-table export policy uses
