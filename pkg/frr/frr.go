@@ -58,11 +58,11 @@ type DHCPRoute struct {
 
 // FullConfig holds the complete routing config for a single FRR apply.
 type FullConfig struct {
-	OSPF          *config.OSPFConfig
-	OSPFv3        *config.OSPFv3Config
-	BGP           *config.BGPConfig
-	RIP           *config.RIPConfig
-	ISIS          *config.ISISConfig
+	OSPF              *config.OSPFConfig
+	OSPFv3            *config.OSPFv3Config
+	BGP               *config.BGPConfig
+	RIP               *config.RIPConfig
+	ISIS              *config.ISISConfig
 	StaticRoutes      []*config.StaticRoute
 	Inet6StaticRoutes []*config.StaticRoute // rib inet6.0 static routes
 	GenerateRoutes    []*config.GenerateRoute
@@ -89,6 +89,10 @@ type FullConfig struct {
 	// RethMap maps reth name → physical member name (e.g. "reth0" → "ge-0-0-1").
 	// Used to translate RETH interface names in static routes to kernel names.
 	RethMap map[string]string
+
+	// IPv6NextHopInterfaces resolves global IPv6 next-hops to their on-link
+	// kernel interface name when the config omits an explicit interface.
+	IPv6NextHopInterfaces map[string]string
 
 	// ConsistentHash is set when the forwarding-table export policy uses
 	// "load-balance consistent-hash". The daemon should set
@@ -124,9 +128,9 @@ func (m *Manager) ApplyWithInstances(ospf *config.OSPFConfig, bgp *config.BGPCon
 
 // RIPRouteEntry represents a RIP route.
 type RIPRouteEntry struct {
-	Network  string
-	NextHop  string
-	Metric   string
+	Network   string
+	NextHop   string
+	Metric    string
 	Interface string
 }
 
@@ -248,7 +252,7 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	// Global static routes
 	if len(fc.StaticRoutes) > 0 {
 		for _, sr := range fc.StaticRoutes {
-			b.WriteString(m.generateStaticRoute(sr, "", fc.RethMap))
+			b.WriteString(m.generateStaticRoute(sr, "", fc.RethMap, fc.IPv6NextHopInterfaces))
 		}
 		b.WriteString("!\n")
 	}
@@ -268,7 +272,7 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	// IPv6 RIB static routes (rib inet6.0)
 	if len(fc.Inet6StaticRoutes) > 0 {
 		for _, sr := range fc.Inet6StaticRoutes {
-			b.WriteString(m.generateStaticRoute(sr, "", fc.RethMap))
+			b.WriteString(m.generateStaticRoute(sr, "", fc.RethMap, fc.IPv6NextHopInterfaces))
 		}
 		b.WriteString("!\n")
 	}
@@ -344,10 +348,10 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	for _, inst := range fc.Instances {
 		if len(inst.StaticRoutes) > 0 || len(inst.Inet6StaticRoutes) > 0 {
 			for _, sr := range inst.StaticRoutes {
-				b.WriteString(m.generateStaticRoute(sr, inst.VRFName, fc.RethMap))
+				b.WriteString(m.generateStaticRoute(sr, inst.VRFName, fc.RethMap, fc.IPv6NextHopInterfaces))
 			}
 			for _, sr := range inst.Inet6StaticRoutes {
-				b.WriteString(m.generateStaticRoute(sr, inst.VRFName, fc.RethMap))
+				b.WriteString(m.generateStaticRoute(sr, inst.VRFName, fc.RethMap, fc.IPv6NextHopInterfaces))
 			}
 			b.WriteString("!\n")
 		}
@@ -469,7 +473,7 @@ func (m *Manager) generateInterfaceSettings(fc *FullConfig) string {
 // generateStaticRoute produces FRR static route commands.
 // Multiple next-hops produce one line each (FRR creates ECMP).
 // Routes with NextTable are handled via ip rule (policy routing), not FRR.
-func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string, rethMap map[string]string) string {
+func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string, rethMap map[string]string, ipv6NextHopInterfaces map[string]string) string {
 	if sr.NextTable != "" {
 		return "" // handled via ip rule in routing package
 	}
@@ -500,6 +504,9 @@ func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string, re
 		// kernel names. VLAN suffixes like ".50" in "wan0.50" are real kernel
 		// interface names and must NOT be stripped.
 		ifName := nh.Interface
+		if isV6 && ifName == "" && nh.Address != "" {
+			ifName = ipv6NextHopInterfaces[nh.Address]
+		}
 		if strings.HasSuffix(ifName, ".0") {
 			ifName = ifName[:len(ifName)-2]
 		}
@@ -1441,24 +1448,24 @@ type FRRRouteDetail struct {
 
 // FRRNextHop holds next-hop detail from FRR JSON.
 type FRRNextHop struct {
-	IP               string
-	Interface        string
+	IP                string
+	Interface         string
 	DirectlyConnected bool
-	Active           bool
-	FIB              bool
-	Recursive        bool
+	Active            bool
+	FIB               bool
+	Recursive         bool
 }
 
 // frrRouteJSON maps the JSON output of "show ip route json".
 type frrRouteJSON struct {
-	Prefix    string          `json:"prefix"`
-	Protocol  string          `json:"protocol"`
-	Selected  bool            `json:"selected"`
-	Installed bool            `json:"installed"`
-	Distance  int             `json:"distance"`
-	Metric    int             `json:"metric"`
-	Uptime    string          `json:"uptime"`
-	Table     int             `json:"table"`
+	Prefix    string           `json:"prefix"`
+	Protocol  string           `json:"protocol"`
+	Selected  bool             `json:"selected"`
+	Installed bool             `json:"installed"`
+	Distance  int              `json:"distance"`
+	Metric    int              `json:"metric"`
+	Uptime    string           `json:"uptime"`
+	Table     int              `json:"table"`
 	NextHops  []frrNextHopJSON `json:"nexthops"`
 }
 

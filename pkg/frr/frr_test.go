@@ -15,7 +15,7 @@ func TestGenerateStaticRoute_SingleNextHop(t *testing.T) {
 		Destination: "10.0.0.0/8",
 		NextHops:    []config.NextHopEntry{{Address: "192.168.1.1"}},
 	}
-	got := m.generateStaticRoute(sr, "", nil)
+	got := m.generateStaticRoute(sr, "", nil, nil)
 	want := "ip route 10.0.0.0/8 192.168.1.1\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -31,7 +31,7 @@ func TestGenerateStaticRoute_ECMP(t *testing.T) {
 			{Address: "192.168.2.1"},
 		},
 	}
-	got := m.generateStaticRoute(sr, "", nil)
+	got := m.generateStaticRoute(sr, "", nil, nil)
 	if !strings.Contains(got, "ip route 10.0.0.0/8 192.168.1.1\n") {
 		t.Errorf("missing first next-hop: %q", got)
 	}
@@ -46,7 +46,7 @@ func TestGenerateStaticRoute_Discard(t *testing.T) {
 		Destination: "10.0.99.0/24",
 		Discard:     true,
 	}
-	got := m.generateStaticRoute(sr, "", nil)
+	got := m.generateStaticRoute(sr, "", nil, nil)
 	want := "ip route 10.0.99.0/24 Null0\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -60,7 +60,7 @@ func TestGenerateStaticRoute_Preference(t *testing.T) {
 		NextHops:    []config.NextHopEntry{{Address: "192.168.1.1"}},
 		Preference:  100,
 	}
-	got := m.generateStaticRoute(sr, "", nil)
+	got := m.generateStaticRoute(sr, "", nil, nil)
 	want := "ip route 10.0.0.0/8 192.168.1.1 100\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -73,7 +73,7 @@ func TestGenerateStaticRoute_VRF(t *testing.T) {
 		Destination: "172.16.0.0/12",
 		NextHops:    []config.NextHopEntry{{Address: "10.0.1.1"}},
 	}
-	got := m.generateStaticRoute(sr, "customer-a", nil)
+	got := m.generateStaticRoute(sr, "customer-a", nil, nil)
 	want := "ip route 172.16.0.0/12 10.0.1.1 vrf customer-a\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -86,7 +86,7 @@ func TestGenerateStaticRoute_IPv6(t *testing.T) {
 		Destination: "2001:db8::/32",
 		NextHops:    []config.NextHopEntry{{Address: "fe80::1", Interface: "trust0"}},
 	}
-	got := m.generateStaticRoute(sr, "", nil)
+	got := m.generateStaticRoute(sr, "", nil, nil)
 	want := "ipv6 route 2001:db8::/32 fe80::1 trust0\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -99,7 +99,7 @@ func TestGenerateStaticRoute_InterfaceOnly(t *testing.T) {
 		Destination: "10.0.0.0/8",
 		NextHops:    []config.NextHopEntry{{Interface: "tunnel0"}},
 	}
-	got := m.generateStaticRoute(sr, "", nil)
+	got := m.generateStaticRoute(sr, "", nil, nil)
 	want := "ip route 10.0.0.0/8 tunnel0\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -112,7 +112,7 @@ func TestGenerateStaticRoute_NextTable(t *testing.T) {
 		Destination: "0.0.0.0/0",
 		NextTable:   "Comcast-GigabitPro",
 	}
-	got := m.generateStaticRoute(sr, "", nil)
+	got := m.generateStaticRoute(sr, "", nil, nil)
 	if got != "" {
 		t.Errorf("next-table route should produce empty FRR output, got %q", got)
 	}
@@ -504,7 +504,7 @@ func TestBGPAddressFamily(t *testing.T) {
 				PeerAS:      65909,
 				FamilyInet:  true,
 				FamilyInet6: true,
-				Export:       []string{"to_BV-FIREHOUSE"},
+				Export:      []string{"to_BV-FIREHOUSE"},
 			},
 			{
 				Address:    "10.0.0.2",
@@ -652,13 +652,13 @@ func TestFRRMultiVRF(t *testing.T) {
 	var b strings.Builder
 	b.WriteString("! bpfrx managed config - do not edit\n!\n")
 	for _, sr := range fc.StaticRoutes {
-		b.WriteString(m.generateStaticRoute(sr, "", nil))
+		b.WriteString(m.generateStaticRoute(sr, "", nil, nil))
 	}
 	b.WriteString("!\n")
 	for _, inst := range fc.Instances {
 		if len(inst.StaticRoutes) > 0 {
 			for _, sr := range inst.StaticRoutes {
-				b.WriteString(m.generateStaticRoute(sr, inst.VRFName, nil))
+				b.WriteString(m.generateStaticRoute(sr, inst.VRFName, nil, nil))
 			}
 			b.WriteString("!\n")
 		}
@@ -722,7 +722,7 @@ func TestFRRForwardingInstance(t *testing.T) {
 	var b strings.Builder
 	for _, inst := range fc.Instances {
 		for _, sr := range inst.StaticRoutes {
-			b.WriteString(m.generateStaticRoute(sr, inst.VRFName, nil))
+			b.WriteString(m.generateStaticRoute(sr, inst.VRFName, nil, nil))
 		}
 	}
 	got := b.String()
@@ -771,7 +771,7 @@ func TestGenerateStaticRoute_QualifiedNextHopLinkLocal(t *testing.T) {
 			{Address: "fe80::2d0:f6ff:feda:c180", Interface: "wan0.0"},
 		},
 	}
-	got := m.generateStaticRoute(sr, "ATT", nil)
+	got := m.generateStaticRoute(sr, "ATT", nil, nil)
 	want := "ipv6 route ::/0 fe80::2d0:f6ff:feda:c180 wan0 vrf ATT\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -784,7 +784,7 @@ func TestGenerateStaticRoute_UnitSuffixStripped(t *testing.T) {
 		Destination: "10.0.0.0/8",
 		NextHops:    []config.NextHopEntry{{Interface: "tunnel0.0"}},
 	}
-	got := m.generateStaticRoute(sr, "", nil)
+	got := m.generateStaticRoute(sr, "", nil, nil)
 	want := "ip route 10.0.0.0/8 tunnel0\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -797,7 +797,7 @@ func TestGenerateStaticRoute_NoUnitNoStrip(t *testing.T) {
 		Destination: "2001:db8::/32",
 		NextHops:    []config.NextHopEntry{{Address: "fe80::1", Interface: "trust0"}},
 	}
-	got := m.generateStaticRoute(sr, "", nil)
+	got := m.generateStaticRoute(sr, "", nil, nil)
 	want := "ipv6 route 2001:db8::/32 fe80::1 trust0\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -810,7 +810,7 @@ func TestGenerateStaticRoute_VLANSuffixNotStripped(t *testing.T) {
 		Destination: "::/0",
 		NextHops:    []config.NextHopEntry{{Address: "fe80::50", Interface: "wan0.50"}},
 	}
-	got := m.generateStaticRoute(sr, "", nil)
+	got := m.generateStaticRoute(sr, "", nil, nil)
 	// VLAN sub-interface "wan0.50" must NOT be stripped — it's a real kernel name
 	want := "ipv6 route ::/0 fe80::50 wan0.50\n"
 	if got != want {
@@ -828,7 +828,7 @@ func TestGenerateStaticRoute_RethResolution(t *testing.T) {
 		Destination: "::/0",
 		NextHops:    []config.NextHopEntry{{Address: "fe80::50", Interface: "reth0.50"}},
 	}
-	got := m.generateStaticRoute(sr, "", rethMap)
+	got := m.generateStaticRoute(sr, "", rethMap, nil)
 	want := "ipv6 route ::/0 fe80::50 ge-0-0-1.50\n"
 	if got != want {
 		t.Errorf("reth VLAN: got %q, want %q", got, want)
@@ -839,7 +839,7 @@ func TestGenerateStaticRoute_RethResolution(t *testing.T) {
 		Destination: "10.0.0.0/8",
 		NextHops:    []config.NextHopEntry{{Interface: "reth0"}},
 	}
-	got2 := m.generateStaticRoute(sr2, "", rethMap)
+	got2 := m.generateStaticRoute(sr2, "", rethMap, nil)
 	want2 := "ip route 10.0.0.0/8 ge-0-0-1\n"
 	if got2 != want2 {
 		t.Errorf("reth bare: got %q, want %q", got2, want2)
@@ -850,10 +850,28 @@ func TestGenerateStaticRoute_RethResolution(t *testing.T) {
 		Destination: "10.0.0.0/8",
 		NextHops:    []config.NextHopEntry{{Interface: "trust0"}},
 	}
-	got3 := m.generateStaticRoute(sr3, "", rethMap)
+	got3 := m.generateStaticRoute(sr3, "", rethMap, nil)
 	want3 := "ip route 10.0.0.0/8 trust0\n"
 	if got3 != want3 {
 		t.Errorf("non-reth: got %q, want %q", got3, want3)
+	}
+}
+
+func TestGenerateStaticRoute_InferredIPv6NextHopInterface(t *testing.T) {
+	m := New()
+	rethMap := map[string]string{"reth0": "ge-0/0/2"}
+	sr := &config.StaticRoute{
+		Destination: "::/0",
+		NextHops: []config.NextHopEntry{
+			{Address: "2001:559:8585:50::1"},
+		},
+	}
+	got := m.generateStaticRoute(sr, "", rethMap, map[string]string{
+		"2001:559:8585:50::1": "reth0.50",
+	})
+	want := "ipv6 route ::/0 2001:559:8585:50::1 ge-0-0-2.50\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
@@ -1952,9 +1970,9 @@ func TestGenerateProtocols_OSPFVirtualLinkCustomTransitArea(t *testing.T) {
 func TestNextHopPeerAddress(t *testing.T) {
 	m := New()
 	po := &config.PolicyOptionsConfig{
-		PrefixLists:      make(map[string]*config.PrefixList),
-		Communities:      make(map[string]*config.CommunityDef),
-		ASPaths:          make(map[string]*config.ASPathDef),
+		PrefixLists: make(map[string]*config.PrefixList),
+		Communities: make(map[string]*config.CommunityDef),
+		ASPaths:     make(map[string]*config.ASPathDef),
 		PolicyStatements: map[string]*config.PolicyStatement{
 			"to-vpn-mesh": {
 				Name: "to-vpn-mesh",
@@ -1995,9 +2013,9 @@ func TestNextHopPeerAddress(t *testing.T) {
 
 	// Verify "next-hop self" does NOT generate "set ip next-hop peer-address"
 	po2 := &config.PolicyOptionsConfig{
-		PrefixLists:      make(map[string]*config.PrefixList),
-		Communities:      make(map[string]*config.CommunityDef),
-		ASPaths:          make(map[string]*config.ASPathDef),
+		PrefixLists: make(map[string]*config.PrefixList),
+		Communities: make(map[string]*config.CommunityDef),
+		ASPaths:     make(map[string]*config.ASPathDef),
 		PolicyStatements: map[string]*config.PolicyStatement{
 			"self-policy": {
 				Name: "self-policy",
@@ -2020,9 +2038,9 @@ func TestNextHopPeerAddress(t *testing.T) {
 func TestRouteFilterExactFRR(t *testing.T) {
 	m := New()
 	po := &config.PolicyOptionsConfig{
-		PrefixLists:      make(map[string]*config.PrefixList),
-		Communities:      make(map[string]*config.CommunityDef),
-		ASPaths:          make(map[string]*config.ASPathDef),
+		PrefixLists: make(map[string]*config.PrefixList),
+		Communities: make(map[string]*config.CommunityDef),
+		ASPaths:     make(map[string]*config.ASPathDef),
 		PolicyStatements: map[string]*config.PolicyStatement{
 			"to-firewall": {
 				Name: "to-firewall",
@@ -2233,7 +2251,7 @@ func TestDHCPRoutesIPv6SuppressedByStaticDefault(t *testing.T) {
 			{Destination: "::/0", NextHops: []config.NextHopEntry{{Address: "fe80::1", Interface: "wan0"}}},
 		},
 		DHCPRoutes: []DHCPRoute{
-			{Gateway: "10.0.100.1"},                              // IPv4 — should remain
+			{Gateway: "10.0.100.1"},                                // IPv4 — should remain
 			{Gateway: "fe80::gw", Interface: "eth0", IsIPv6: true}, // IPv6 — should be suppressed
 		},
 	}
