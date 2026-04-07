@@ -113,7 +113,7 @@ use self::forwarding_build::*;
 use self::frame::*;
 use self::frame_tx::*;
 use self::gre::{encapsulate_native_gre_frame, try_native_gre_decap_from_frame};
-use self::icmp::{build_local_time_exceeded_request, is_icmp_error};
+use self::icmp::{FABRIC_INGRESS_FLAG, build_local_time_exceeded_request, is_icmp_error};
 #[cfg(test)]
 use self::icmp::{
     build_local_time_exceeded_v4, build_local_time_exceeded_v6, packet_ttl_would_expire,
@@ -2383,7 +2383,7 @@ fn poll_binding(
                     if ingress_zone_override.is_some()
                         || ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
                     {
-                        meta.meta_flags |= 0x80; // FABRIC_INGRESS_FLAG
+                        meta.meta_flags |= FABRIC_INGRESS_FLAG;
                     }
                     // Screen/IDS check — runs BEFORE session lookup.
                     // Resolve ingress zone name for screen profile lookup.
@@ -7014,7 +7014,7 @@ mod tests {
             l4_offset: 34,
             addr_family: libc::AF_INET as u8,
             protocol: PROTO_ICMP,
-            meta_flags: 0x80,
+            meta_flags: FABRIC_INGRESS_FLAG,
             ..UserspaceDpMeta::default()
         };
         let desc = XdpDesc {

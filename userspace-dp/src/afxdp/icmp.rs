@@ -1,7 +1,9 @@
 use super::*;
 
+pub(super) const FABRIC_INGRESS_FLAG: u8 = 0x80;
+
 pub(super) fn packet_ttl_would_expire(frame: &[u8], meta: UserspaceDpMeta) -> Option<bool> {
-    if (meta.meta_flags & 0x80) != 0 {
+    if (meta.meta_flags & FABRIC_INGRESS_FLAG) != 0 {
         return Some(false);
     }
     let l3 = match meta.l3_offset {
