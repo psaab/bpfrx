@@ -44,10 +44,10 @@ func TestDirectVIPOwnershipDesired(t *testing.T) {
 	}
 }
 
-// TestApplyDirectVIPOwnershipForcesRemovalOnDemotion verifies that a demotion
-// edge uses applyDirectVIPOwnership(want=false) directly, bypassing
-// shouldOwnDirectVIPs and guaranteeing synchronous removal (#527 Bug A).
-func TestApplyDirectVIPOwnershipForcesRemovalOnDemotion(t *testing.T) {
+// TestApplyDirectVIPOwnershipForcesRemoval verifies that forcing
+// applyDirectVIPOwnership(want=false) bypasses shouldOwnDirectVIPs and
+// guarantees synchronous VIP removal.
+func TestApplyDirectVIPOwnershipForcesRemoval(t *testing.T) {
 	var removeCalls int
 	d := &Daemon{
 		directVIPOwned: map[int]bool{0: true}, // previously owned

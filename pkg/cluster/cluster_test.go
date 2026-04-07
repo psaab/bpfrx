@@ -716,13 +716,13 @@ func TestRequestPeerFailoverRequiresLocalTransferReadiness(t *testing.T) {
 	}
 }
 
-// TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover
+// TestRequestPeerFailoverTransferReadinessFailureKeepsStateClean
 // verifies that when RequestPeerFailover fails due to transfer readiness,
 // state remains clean (secondary, no manual-failover flag). After #527,
 // the prior ManualFailover hold is cleared when the peer's heartbeat
 // confirms it took primary, so the node is already in ordinary secondary
 // before the RequestPeerFailover attempt.
-func TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover(t *testing.T) {
+func TestRequestPeerFailoverTransferReadinessFailureKeepsStateClean(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
 	m.UpdateConfig(cfg)
@@ -781,11 +781,11 @@ func TestRequestPeerFailoverTransferReadinessFailurePreservesManualFailover(t *t
 	}
 }
 
-// TestRequestPeerFailoverPeerSendFailurePreservesManualFailover verifies
+// TestRequestPeerFailoverPeerSendFailureKeepsStateClean verifies
 // that when RequestPeerFailover fails because the peer send fails, state
 // remains clean. After #527, the prior ManualFailover hold is already
 // cleared by the time peer confirms primary.
-func TestRequestPeerFailoverPeerSendFailurePreservesManualFailover(t *testing.T) {
+func TestRequestPeerFailoverPeerSendFailureKeepsStateClean(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
 	m.UpdateConfig(cfg)

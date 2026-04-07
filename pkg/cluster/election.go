@@ -41,10 +41,11 @@ func (m *Manager) electRG(rg *RedundancyGroupState, peerGroup *PeerGroupState) (
 	clearedManualFailover := false
 
 	// ManualFailover normally blocks election (stays secondary-hold until
-	// reset). Exception: if the peer has also explicitly transferred out or
-	// already resigned with weight 0, both nodes can end up parked as
-	// non-owners. Clear ManualFailover and restore normal election after a
-	// short guard window so one node can reclaim primary.
+	// reset). Exceptions: if the peer explicitly confirms it is primary, or if
+	// the peer has also explicitly transferred out / already resigned with
+	// weight 0, both nodes can end up parked as non-owners. Clear
+	// ManualFailover and restore normal election after a short guard window so
+	// one node can reclaim primary.
 	//
 	// Time guard: only clear after 2s to prevent re-promoting a node that
 	// JUST transferred out. Without this, the resigned node sees stale peer
