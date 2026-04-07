@@ -3355,8 +3355,13 @@ func TestReceiveLoopKeepsConnectionAliveWithoutHeartbeatAckSupport(t *testing.T)
 
 	cancel()
 	serverConn.Close()
-	if err := <-serverDone; err != nil && !errors.Is(err, net.ErrClosed) && !strings.Contains(err.Error(), "use of closed network connection") && !strings.Contains(err.Error(), "EOF") {
-		t.Fatalf("server loop failed: %v", err)
+	select {
+	case err := <-serverDone:
+		if err != nil && !errors.Is(err, net.ErrClosed) && !strings.Contains(err.Error(), "use of closed network connection") && !strings.Contains(err.Error(), "EOF") {
+			t.Fatalf("server loop failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for server loop to exit")
 	}
 }
 

@@ -289,7 +289,6 @@ type SessionSync struct {
 	deleteJournal        [][]byte // ring buffer of encoded delete messages
 	deleteJournalCap     int      // max entries (default 10000)
 	lastPeerRxUnix       atomic.Int64
-	peerHeartbeatAck     atomic.Bool
 	peerHeartbeatAckEver atomic.Bool
 	readDeadline         time.Duration
 	peerSilenceLimit     time.Duration
@@ -771,9 +770,6 @@ func (s *SessionSync) handleNewConnection(ctx context.Context, fabricIdx int, co
 	}
 	s.stats.Connected.Store(true)
 	s.lastPeerRxUnix.Store(time.Now().UnixNano())
-	if wasDisconnected {
-		s.peerHeartbeatAck.Store(false)
-	}
 	s.mu.Unlock()
 	becameActive := activeAfter == fabricIdx
 
@@ -2236,7 +2232,6 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		}
 
 	case syncMsgHeartbeatAck:
-		s.peerHeartbeatAck.Store(true)
 		s.peerHeartbeatAckEver.Store(true)
 
 	case syncMsgConfig:
@@ -2867,7 +2862,6 @@ func (s *SessionSync) handleDisconnect(conn net.Conn) {
 	connected := s.conn0 != nil || s.conn1 != nil
 	s.stats.Connected.Store(connected)
 	if !connected {
-		s.peerHeartbeatAck.Store(false)
 		pendingBarriers := s.barrierSeq.Load()
 		ackedBarriers := s.barrierAckSeq.Load()
 		// Do NOT reset barrierSeq — the monotonic counter must keep
