@@ -97,6 +97,7 @@ type Daemon struct {
 	syncPeerBulkPrimed         atomic.Bool
 	syncPeerConnected          atomic.Bool
 	lastStandbyNeighborRefresh atomic.Int64
+	neighborWarmupInFlight     atomic.Bool
 	hbSuppressStart            atomic.Int64 // UnixNano of first heartbeat suppression; 0 = inactive
 	syncPrimeRetryGen          atomic.Uint64
 	syncReadyTimerGen          atomic.Uint64
@@ -243,23 +244,26 @@ type Daemon struct {
 const standbyNeighborRefreshMinInterval = time.Second
 
 func (d *Daemon) shouldScheduleStandbyNeighborRefresh(now time.Time) bool {
-	nowUnix := now.UnixNano()
+	elapsed := now.Sub(d.startTime).Nanoseconds() + 1
+	if elapsed < 1 {
+		elapsed = 1
+	}
 	last := d.lastStandbyNeighborRefresh.Load()
-	if last != 0 && nowUnix-last < int64(standbyNeighborRefreshMinInterval) {
+	if last != 0 && elapsed >= last && elapsed-last < int64(standbyNeighborRefreshMinInterval) {
 		return false
 	}
-	return d.lastStandbyNeighborRefresh.CompareAndSwap(last, nowUnix)
+	return d.lastStandbyNeighborRefresh.CompareAndSwap(last, elapsed)
 }
 
 func (d *Daemon) scheduleStandbyNeighborRefresh() {
 	if d.cluster == nil || d.dp == nil {
 		return
 	}
-	if !d.shouldScheduleStandbyNeighborRefresh(time.Now()) {
-		return
-	}
 	cfg := d.store.ActiveConfig()
 	if cfg == nil {
+		return
+	}
+	if !d.shouldScheduleStandbyNeighborRefresh(time.Now()) {
 		return
 	}
 	go func(cfg *config.Config) {
@@ -3267,7 +3271,13 @@ func (d *Daemon) maintainClusterNeighborReadiness() {
 		return
 	}
 	d.preinstallSnapshotNeighbors()
-	go d.warmNeighborCache()
+	if !d.neighborWarmupInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer d.neighborWarmupInFlight.Store(false)
+		d.warmNeighborCache()
+	}()
 }
 
 // collectDHCPRoutes builds FRR DHCPRoute entries from active DHCP leases.
