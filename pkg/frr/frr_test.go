@@ -866,10 +866,29 @@ func TestGenerateStaticRoute_InferredIPv6NextHopInterface(t *testing.T) {
 			{Address: "2001:559:8585:50::1"},
 		},
 	}
-	got := m.generateStaticRoute(sr, "", rethMap, map[string]string{
-		"2001:559:8585:50::1": "reth0.50",
+	got := m.generateStaticRoute(sr, "", rethMap, map[string]map[string]string{
+		"": {"2001:559:8585:50::1": "reth0.50"},
 	})
 	want := "ipv6 route ::/0 2001:559:8585:50::1 ge-0-0-2.50\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestGenerateStaticRoute_InferredIPv6NextHopInterfaceByVRF(t *testing.T) {
+	m := New()
+	rethMap := map[string]string{"reth0": "ge-0/0/2", "reth1": "ge-0/0/3"}
+	sr := &config.StaticRoute{
+		Destination: "2001:db8:ffff::/48",
+		NextHops: []config.NextHopEntry{
+			{Address: "2001:db8:1::100"},
+		},
+	}
+	got := m.generateStaticRoute(sr, "BLUE", rethMap, map[string]map[string]string{
+		"":     {"2001:db8:1::100": "reth0.10"},
+		"BLUE": {"2001:db8:1::100": "reth1.20"},
+	})
+	want := "ipv6 route 2001:db8:ffff::/48 2001:db8:1::100 ge-0-0-3.20 vrf BLUE\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}

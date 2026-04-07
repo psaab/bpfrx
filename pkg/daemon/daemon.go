@@ -1174,7 +1174,7 @@ func enableForwarding() {
 	slog.Info("IP forwarding enabled, RA acceptance disabled")
 }
 
-func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]string {
+func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]string {
 	type connectedPrefix struct {
 		net    *net.IPNet
 		ifName string
@@ -1182,9 +1182,21 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]string {
 	}
 
 	var connected []connectedPrefix
-	for ifName, ifc := range cfg.Interfaces.Interfaces {
+	ifNames := make([]string, 0, len(cfg.Interfaces.Interfaces))
+	for ifName := range cfg.Interfaces.Interfaces {
+		ifNames = append(ifNames, ifName)
+	}
+	sort.Strings(ifNames)
+	for _, ifName := range ifNames {
+		ifc := cfg.Interfaces.Interfaces[ifName]
 		base := config.LinuxIfName(ifName)
-		for unitNum, unit := range ifc.Units {
+		unitNums := make([]int, 0, len(ifc.Units))
+		for unitNum := range ifc.Units {
+			unitNums = append(unitNums, unitNum)
+		}
+		sort.Ints(unitNums)
+		for _, unitNum := range unitNums {
+			unit := ifc.Units[unitNum]
 			logical := base
 			if unitNum != 0 {
 				logical = fmt.Sprintf("%s.%d", base, unitNum)
@@ -1212,7 +1224,10 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]string {
 		bestIf := ""
 		bestBits := -1
 		for _, candidate := range connected {
-			if candidate.net.Contains(ip) && candidate.bits > bestBits {
+			if !candidate.net.Contains(ip) {
+				continue
+			}
+			if candidate.bits > bestBits || (candidate.bits == bestBits && (bestIf == "" || candidate.ifName < bestIf)) {
 				bestIf = candidate.ifName
 				bestBits = candidate.bits
 			}
@@ -1220,25 +1235,40 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]string {
 		return bestIf
 	}
 
-	resolved := make(map[string]string)
-	addRoutes := func(routes []*config.StaticRoute) {
+	resolved := make(map[string]map[string]string)
+	setResolved := func(vrfName, nextHop, ifName string) {
+		if ifName == "" {
+			return
+		}
+		vrfMap, ok := resolved[vrfName]
+		if !ok {
+			vrfMap = make(map[string]string)
+			resolved[vrfName] = vrfMap
+		}
+		if existing, ok := vrfMap[nextHop]; !ok || ifName < existing {
+			vrfMap[nextHop] = ifName
+		}
+	}
+	addRoutes := func(vrfName string, routes []*config.StaticRoute) {
 		for _, sr := range routes {
 			for _, nh := range sr.NextHops {
 				if nh.Interface != "" || nh.Address == "" || !strings.Contains(nh.Address, ":") {
 					continue
 				}
-				if ifName := resolve(nh.Address); ifName != "" {
-					resolved[nh.Address] = ifName
-				}
+				setResolved(vrfName, nh.Address, resolve(nh.Address))
 			}
 		}
 	}
 
-	addRoutes(cfg.RoutingOptions.StaticRoutes)
-	addRoutes(cfg.RoutingOptions.Inet6StaticRoutes)
+	addRoutes("", cfg.RoutingOptions.StaticRoutes)
+	addRoutes("", cfg.RoutingOptions.Inet6StaticRoutes)
 	for _, ri := range cfg.RoutingInstances {
-		addRoutes(ri.StaticRoutes)
-		addRoutes(ri.Inet6StaticRoutes)
+		vrfName := "vrf-" + ri.Name
+		if ri.InstanceType == "forwarding" {
+			vrfName = ""
+		}
+		addRoutes(vrfName, ri.StaticRoutes)
+		addRoutes(vrfName, ri.Inet6StaticRoutes)
 	}
 	return resolved
 }
