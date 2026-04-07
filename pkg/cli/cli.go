@@ -4454,6 +4454,55 @@ func (c *CLI) handleRequestChassisClusterFailover(args []string) error {
 		return nil
 	}
 
+	// "request chassis cluster failover data node <N>"
+	if len(args) >= 3 && args[0] == "data" && args[1] == "node" {
+		targetNode, err := strconv.Atoi(args[2])
+		if err != nil {
+			return fmt.Errorf("invalid node ID: %s", args[2])
+		}
+		if !cluster.IsSupportedClusterNodeID(targetNode) {
+			return fmt.Errorf("unsupported cluster failover target node %d", targetNode)
+		}
+		localNode := c.cluster.NodeID()
+		if targetNode != localNode {
+			message, err := c.requestPeerSystemAction(
+				context.Background(),
+				fmt.Sprintf("cluster-failover-data:node%d", targetNode),
+			)
+			if err != nil {
+				return err
+			}
+			fmt.Println(message)
+			return nil
+		}
+
+		dataRGs := c.cluster.DataGroupIDs()
+		if len(dataRGs) == 0 {
+			return fmt.Errorf("no data redundancy groups configured")
+		}
+		moveRGs := make([]int, 0, len(dataRGs))
+		for _, rgID := range dataRGs {
+			if !c.cluster.IsLocalPrimary(rgID) {
+				moveRGs = append(moveRGs, rgID)
+			}
+		}
+		if len(moveRGs) == 0 {
+			fmt.Printf("All data redundancy groups are already primary on node %d\n", targetNode)
+			return nil
+		}
+		if len(moveRGs) == 1 {
+			if err := c.cluster.RequestPeerFailover(moveRGs[0]); err != nil {
+				return err
+			}
+		} else {
+			if err := c.cluster.RequestPeerFailoverBatch(moveRGs); err != nil {
+				return err
+			}
+		}
+		fmt.Printf("Manual failover completed for data redundancy groups %v (transfer committed)\n", moveRGs)
+		return nil
+	}
+
 	// "request chassis cluster failover redundancy-group <N> [node <N>]"
 	if len(args) >= 2 && args[0] == "redundancy-group" {
 		rgID, err := strconv.Atoi(args[1])
@@ -4493,7 +4542,7 @@ func (c *CLI) handleRequestChassisClusterFailover(args []string) error {
 		return nil
 	}
 
-	return fmt.Errorf("usage: request chassis cluster failover redundancy-group <N> [node <N>]")
+	return fmt.Errorf("usage: request chassis cluster failover {redundancy-group <N> [node <N>] | data node <N>}")
 }
 
 func (c *CLI) handleRequestChassisClusterDataPlane(args []string) error {

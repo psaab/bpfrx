@@ -234,6 +234,18 @@ func TestFormatStats(t *testing.T) {
 	}
 }
 
+func TestValidateFailoverBatchRGCount(t *testing.T) {
+	okRGs := make([]int, maxFailoverBatchRGCount)
+	if err := validateFailoverBatchRGCount(okRGs); err != nil {
+		t.Fatalf("validateFailoverBatchRGCount(%d) error = %v", len(okRGs), err)
+	}
+
+	tooManyRGs := make([]int, maxFailoverBatchRGCount+1)
+	if err := validateFailoverBatchRGCount(tooManyRGs); err == nil {
+		t.Fatalf("validateFailoverBatchRGCount(%d) unexpectedly succeeded", len(tooManyRGs))
+	}
+}
+
 func TestDecodeSessionV4RoundTrip(t *testing.T) {
 	key := dataplane.SessionKey{
 		SrcIP:    [4]byte{192, 168, 1, 1},
@@ -2498,6 +2510,62 @@ func TestSendFailoverWaitsForAck(t *testing.T) {
 	}
 }
 
+func TestSendFailoverBatchWaitsForAck(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	type failoverResult struct {
+		reqID uint64
+		err   error
+	}
+	done := make(chan failoverResult, 1)
+	go func() {
+		reqID, err := ss.SendFailoverBatch([]int{2, 1})
+		done <- failoverResult{reqID: reqID, err: err}
+	}()
+
+	var hdrBuf [syncHeaderSize]byte
+	if _, err := io.ReadFull(peer, hdrBuf[:]); err != nil {
+		t.Fatalf("read batch failover header: %v", err)
+	}
+	if hdrBuf[4] != syncMsgFailoverBatch {
+		t.Fatalf("msg type = %d, want %d", hdrBuf[4], syncMsgFailoverBatch)
+	}
+	payloadLen := binary.LittleEndian.Uint32(hdrBuf[8:12])
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(peer, payload); err != nil {
+		t.Fatalf("read batch failover payload: %v", err)
+	}
+	rgIDs, reqID, err := decodeFailoverBatchRequestPayload(payload)
+	if err != nil {
+		t.Fatalf("decodeFailoverBatchRequestPayload() error = %v", err)
+	}
+	if len(rgIDs) != 2 || rgIDs[0] != 1 || rgIDs[1] != 2 {
+		t.Fatalf("rgIDs = %v, want [1 2]", rgIDs)
+	}
+
+	ss.handleMessage(local, syncMsgFailoverBatchAck, encodeFailoverBatchAckPayload(rgIDs, failoverAckApplied, reqID, ""))
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("SendFailoverBatch() error = %v", result.err)
+		}
+		if result.reqID != reqID {
+			t.Fatalf("SendFailoverBatch() reqID = %d, want %d", result.reqID, reqID)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SendFailoverBatch did not complete after ack")
+	}
+}
+
 func TestSendFailoverPropagatesPeerRejection(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 	local, peer := net.Pipe()
@@ -2750,6 +2818,74 @@ func TestHandleRemoteFailoverCommitInvokesCallback(t *testing.T) {
 		}
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("remote failover commit callback did not run")
+	}
+}
+
+func TestHandleRemoteFailoverBatchInvokesCallback(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	done := make(chan []int, 1)
+	ss.OnRemoteFailoverBatch = func(rgIDs []int) error {
+		done <- append([]int(nil), rgIDs...)
+		return nil
+	}
+
+	ss.handleMessage(nil, syncMsgFailoverBatch, encodeFailoverBatchRequestPayload([]int{2, 1}, 99))
+
+	select {
+	case rgIDs := <-done:
+		if len(rgIDs) != 2 || rgIDs[0] != 1 || rgIDs[1] != 2 {
+			t.Fatalf("callback rgIDs = %v, want [1 2]", rgIDs)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("remote batch failover callback did not run")
+	}
+}
+
+func TestSendFailoverCommitBatchWaitsForAck(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	local, peer := net.Pipe()
+	defer local.Close()
+	defer peer.Close()
+
+	ss.mu.Lock()
+	ss.conn0 = local
+	ss.stats.Connected.Store(true)
+	ss.mu.Unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ss.SendFailoverCommitBatch([]int{2, 1}, 41)
+	}()
+
+	var hdrBuf [syncHeaderSize]byte
+	if _, err := io.ReadFull(peer, hdrBuf[:]); err != nil {
+		t.Fatalf("read batch failover commit header: %v", err)
+	}
+	if hdrBuf[4] != syncMsgFailoverBatchCommit {
+		t.Fatalf("msg type = %d, want %d", hdrBuf[4], syncMsgFailoverBatchCommit)
+	}
+	payloadLen := binary.LittleEndian.Uint32(hdrBuf[8:12])
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(peer, payload); err != nil {
+		t.Fatalf("read batch failover commit payload: %v", err)
+	}
+	rgIDs, reqID, err := decodeFailoverBatchRequestPayload(payload)
+	if err != nil {
+		t.Fatalf("decodeFailoverBatchRequestPayload() error = %v", err)
+	}
+	if reqID != 41 {
+		t.Fatalf("reqID = %d, want 41", reqID)
+	}
+
+	ss.handleMessage(local, syncMsgFailoverBatchCommitAck, encodeFailoverBatchAckPayload(rgIDs, failoverAckApplied, reqID, ""))
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SendFailoverCommitBatch() error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SendFailoverCommitBatch did not complete after ack")
 	}
 }
 

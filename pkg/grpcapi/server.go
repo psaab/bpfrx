@@ -7465,6 +7465,60 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 				Message: fmt.Sprintf("Failover reset for redundancy group %d", rgID),
 			}, nil
 		}
+		if strings.HasPrefix(req.Action, "cluster-failover-data:node") {
+			if s.cluster == nil {
+				return nil, status.Error(codes.Unavailable, "cluster not configured")
+			}
+			nodeStr := strings.TrimPrefix(req.Action, "cluster-failover-data:node")
+			targetNode, err := strconv.Atoi(nodeStr)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid node ID: %s", nodeStr)
+			}
+			if !cluster.IsSupportedClusterNodeID(targetNode) {
+				return nil, status.Errorf(codes.InvalidArgument, "unsupported cluster failover target node %d", targetNode)
+			}
+			if targetNode != s.cluster.NodeID() {
+				if peerForwardedFromContext(ctx) {
+					return nil, status.Errorf(codes.FailedPrecondition, "forwarded cluster failover target node %d is not local", targetNode)
+				}
+				resp, err := s.proxyPeerSystemAction(ctx, req)
+				if err != nil {
+					if st, ok := status.FromError(err); ok {
+						return nil, st.Err()
+					}
+					return nil, status.Errorf(codes.Unavailable, "peer cluster failover proxy failed: %v", err)
+				}
+				return resp, nil
+			}
+
+			dataRGs := s.cluster.DataGroupIDs()
+			if len(dataRGs) == 0 {
+				return nil, status.Error(codes.FailedPrecondition, "no data redundancy groups configured")
+			}
+			moveRGs := make([]int, 0, len(dataRGs))
+			for _, rgID := range dataRGs {
+				if !s.cluster.IsLocalPrimary(rgID) {
+					moveRGs = append(moveRGs, rgID)
+				}
+			}
+			if len(moveRGs) == 0 {
+				return &pb.SystemActionResponse{
+					Message: fmt.Sprintf("All data redundancy groups are already primary on node %d", targetNode),
+				}, nil
+			}
+			if len(moveRGs) == 1 {
+				if err := s.cluster.RequestPeerFailover(moveRGs[0]); err != nil {
+					return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+				}
+			} else {
+				if err := s.cluster.RequestPeerFailoverBatch(moveRGs); err != nil {
+					return nil, status.Errorf(codes.FailedPrecondition, "%v", err)
+				}
+			}
+			return &pb.SystemActionResponse{
+				Message: fmt.Sprintf("Manual failover completed for data redundancy groups %v (transfer committed)", moveRGs),
+			}, nil
+		}
 		if strings.HasPrefix(req.Action, "cluster-failover:") {
 			if s.cluster == nil {
 				return nil, status.Error(codes.Unavailable, "cluster not configured")
