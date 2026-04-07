@@ -1096,7 +1096,7 @@ func userspaceManualFailoverTransferReadinessError(state cluster.TransferReadine
 }
 
 func (d *Daemon) userspaceTransferReadiness(rgID int) (bool, []string) {
-	if d.sessionSync == nil || !d.sessionSync.IsConnected() || !d.syncPeerConnected.Load() {
+	if d.sessionSync == nil || !d.sessionSync.IsConnected() || !d.sessionSync.PeerHealthy() || !d.syncPeerConnected.Load() {
 		return false, []string{"session sync disconnected"}
 	}
 	state := d.sessionSync.TransferReadiness()
