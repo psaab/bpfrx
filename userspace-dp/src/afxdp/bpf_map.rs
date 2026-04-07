@@ -345,10 +345,10 @@ pub(super) struct ConntrackCtx<'a> {
 #[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
 struct BpfSessionKeyV4 {
-    src_ip: [u8; 4],   // __be32, network byte order
-    dst_ip: [u8; 4],   // __be32, network byte order
-    src_port: u16,      // __be16, network byte order
-    dst_port: u16,      // __be16, network byte order
+    src_ip: [u8; 4], // __be32, network byte order
+    dst_ip: [u8; 4], // __be32, network byte order
+    src_port: u16,   // __be16, network byte order
+    dst_port: u16,   // __be16, network byte order
     protocol: u8,
     pad: [u8; 3],
 }
@@ -369,10 +369,10 @@ struct BpfSessionValueV4 {
     policy_id: u32,
     ingress_zone: u16,
     egress_zone: u16,
-    nat_src_ip: u32,    // __be32, native endian for BPF
-    nat_dst_ip: u32,    // __be32, native endian for BPF
-    nat_src_port: u16,  // __be16, network byte order
-    nat_dst_port: u16,  // __be16, network byte order
+    nat_src_ip: u32,   // __be32, native endian for BPF
+    nat_dst_ip: u32,   // __be32, native endian for BPF
+    nat_src_port: u16, // __be16, network byte order
+    nat_dst_port: u16, // __be16, network byte order
     fwd_packets: u64,
     fwd_bytes: u64,
     rev_packets: u64,
@@ -394,8 +394,8 @@ struct BpfSessionValueV4 {
 struct BpfSessionKeyV6 {
     src_ip: [u8; 16],
     dst_ip: [u8; 16],
-    src_port: u16,      // __be16, network byte order
-    dst_port: u16,      // __be16, network byte order
+    src_port: u16, // __be16, network byte order
+    dst_port: u16, // __be16, network byte order
     protocol: u8,
     pad: [u8; 3],
 }
@@ -418,8 +418,8 @@ struct BpfSessionValueV6 {
     egress_zone: u16,
     nat_src_ip: [u8; 16],
     nat_dst_ip: [u8; 16],
-    nat_src_port: u16,  // __be16, network byte order
-    nat_dst_port: u16,  // __be16, network byte order
+    nat_src_port: u16, // __be16, network byte order
+    nat_dst_port: u16, // __be16, network byte order
     fwd_packets: u64,
     fwd_bytes: u64,
     rev_packets: u64,
@@ -812,7 +812,9 @@ pub(super) fn publish_session_map_entry_for_session_with_origin(
     metadata: &SessionMetadata,
     origin: SessionOrigin,
 ) -> io::Result<()> {
-    publish_session_map_entry_for_session_with_conntrack(map_fd, key, decision, metadata, origin, None)
+    publish_session_map_entry_for_session_with_conntrack(
+        map_fd, key, decision, metadata, origin, None,
+    )
 }
 
 pub(super) fn publish_session_map_entry_for_session_with_conntrack(
@@ -838,14 +840,28 @@ pub(super) fn publish_session_map_entry_for_session_with_conntrack(
         }
         // Also mirror to conntrack for session display.
         if let Some(ctx) = ct {
-            publish_bpf_conntrack_entry(ctx.v4_fd, ctx.v6_fd, key, decision, metadata, ctx.zone_name_to_id);
+            publish_bpf_conntrack_entry(
+                ctx.v4_fd,
+                ctx.v6_fd,
+                key,
+                decision,
+                metadata,
+                ctx.zone_name_to_id,
+            );
         }
         return Ok(());
     }
     let result = publish_live_session_entry(map_fd, key, decision.nat, metadata.is_reverse);
     // Mirror to conntrack for session display.
     if let Some(ctx) = ct {
-        publish_bpf_conntrack_entry(ctx.v4_fd, ctx.v6_fd, key, decision, metadata, ctx.zone_name_to_id);
+        publish_bpf_conntrack_entry(
+            ctx.v4_fd,
+            ctx.v6_fd,
+            key,
+            decision,
+            metadata,
+            ctx.zone_name_to_id,
+        );
     }
     result
 }
@@ -1080,6 +1096,58 @@ pub(super) fn delete_live_session_entry(
     }
 }
 
+fn for_each_session_map_redirect_key<F>(
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    _origin: SessionOrigin,
+    mut f: F,
+) where
+    F: FnMut(SessionKey),
+{
+    f(key.clone());
+    if !metadata.is_reverse {
+        let wire_key = forward_wire_key(key, decision.nat);
+        if wire_key != *key {
+            f(wire_key);
+        }
+        let reverse_wire = reverse_session_key(key, decision.nat);
+        if reverse_wire != *key {
+            f(reverse_wire.clone());
+        }
+        let reverse_canonical = reverse_canonical_key(key, decision.nat);
+        if reverse_canonical != *key && reverse_canonical != reverse_wire {
+            f(reverse_canonical);
+        }
+    }
+}
+
+#[cfg(test)]
+fn session_map_redirect_keys_for_session(
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    origin: SessionOrigin,
+) -> Vec<SessionKey> {
+    let mut keys = Vec::with_capacity(4);
+    for_each_session_map_redirect_key(key, decision, metadata, origin, |redirect_key| {
+        keys.push(redirect_key);
+    });
+    keys
+}
+
+pub(super) fn delete_session_map_redirect_for_session(
+    map_fd: c_int,
+    key: &SessionKey,
+    decision: SessionDecision,
+    metadata: &SessionMetadata,
+    origin: SessionOrigin,
+) {
+    for_each_session_map_redirect_key(key, decision, metadata, origin, |redirect_key| {
+        delete_live_session_key(map_fd, &redirect_key);
+    });
+}
+
 pub(super) fn delete_session_map_entry_for_removed_session(
     map_fd: c_int,
     key: &SessionKey,
@@ -1089,7 +1157,13 @@ pub(super) fn delete_session_map_entry_for_removed_session(
     // Default to SyncImport for backwards-compatible callers where
     // the session being deleted is always from a sync path.
     delete_session_map_entry_for_removed_session_with_origin(
-        map_fd, key, decision, metadata, SessionOrigin::SyncImport, -1, -1,
+        map_fd,
+        key,
+        decision,
+        metadata,
+        SessionOrigin::SyncImport,
+        -1,
+        -1,
     );
 }
 
@@ -1102,20 +1176,11 @@ pub(super) fn delete_session_map_entry_for_removed_session_with_origin(
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
 ) {
+    delete_session_map_redirect_for_session(map_fd, key, decision, metadata, origin);
     if uses_kernel_local_session_map_entry(decision, metadata, origin) {
-        delete_live_session_key(map_fd, key);
-        // Also delete the reverse-wire alias published for SNATed
-        // kernel-local sessions (see publish_session_map_entry_for_session).
-        if decision.nat.rewrite_src.is_some() {
-            let reverse_wire = reverse_session_key(key, decision.nat);
-            if reverse_wire != *key {
-                delete_live_session_key(map_fd, &reverse_wire);
-            }
-        }
         delete_bpf_conntrack_entry(conntrack_v4_fd, conntrack_v6_fd, key);
         return;
     }
-    delete_live_session_entry(map_fd, key, decision.nat, metadata.is_reverse);
     delete_bpf_conntrack_entry(conntrack_v4_fd, conntrack_v6_fd, key);
 }
 
@@ -1209,6 +1274,98 @@ mod tests {
     }
 
     #[test]
+    fn session_map_redirect_keys_for_forward_session_include_nat_aliases() {
+        let key = SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 41086,
+            dst_port: 5201,
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 14,
+                tx_ifindex: 14,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                ..NatDecision::default()
+            },
+        };
+        let metadata = SessionMetadata {
+            ingress_zone: Arc::<str>::from("lan"),
+            egress_zone: Arc::<str>::from("wan"),
+            owner_rg_id: 1,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+        };
+
+        let keys = session_map_redirect_keys_for_session(
+            &key,
+            decision,
+            &metadata,
+            SessionOrigin::SharedPromote,
+        );
+
+        assert!(keys.contains(&key));
+        assert!(keys.contains(&forward_wire_key(&key, decision.nat)));
+        assert!(keys.contains(&reverse_session_key(&key, decision.nat)));
+        assert!(keys.contains(&reverse_canonical_key(&key, decision.nat)));
+    }
+
+    #[test]
+    fn session_map_redirect_keys_for_kernel_local_synced_session_delete_superset() {
+        let key = SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: 1,
+            src_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            src_port: 0,
+            dst_port: 0,
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::LocalDelivery,
+                local_ifindex: 14,
+                egress_ifindex: 14,
+                tx_ifindex: 14,
+                tunnel_endpoint_id: 0,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                ..NatDecision::default()
+            },
+        };
+        let metadata = synced_forward_metadata();
+
+        let keys = session_map_redirect_keys_for_session(
+            &key,
+            decision,
+            &metadata,
+            SessionOrigin::SyncImport,
+        );
+
+        assert_eq!(keys.len(), 4);
+        assert!(keys.contains(&key));
+        assert!(keys.contains(&forward_wire_key(&key, decision.nat)));
+        assert!(keys.contains(&reverse_session_key(&key, decision.nat)));
+        assert!(keys.contains(&reverse_canonical_key(&key, decision.nat)));
+    }
+
+    #[test]
     fn bpf_conntrack_key_port_byte_order() {
         // BPF session_key uses __be16 ports (network byte order).
         // SessionKey stores ports in host order (u16::from_be_bytes in parsing).
@@ -1226,8 +1383,7 @@ mod tests {
         // The packed struct bytes at the port offsets must be big-endian:
         // port 80 = 0x0050 -> bytes [0x00, 0x50]
         // port 443 = 0x01BB -> bytes [0x01, 0xBB]
-        let bytes: [u8; 16] =
-            unsafe { core::mem::transmute(bpf_key) };
+        let bytes: [u8; 16] = unsafe { core::mem::transmute(bpf_key) };
         assert_eq!(bytes[8], 0x00, "src_port high byte");
         assert_eq!(bytes[9], 0x50, "src_port low byte");
         assert_eq!(bytes[10], 0x01, "dst_port high byte");

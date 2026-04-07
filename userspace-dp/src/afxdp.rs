@@ -5335,6 +5335,19 @@ fn worker_loop(
                 for binding in bindings.iter_mut() {
                     cancel_queued_flow_on_binding(binding, key, key);
                 }
+                if let Some((decision, metadata, origin)) = sessions.entry_with_origin(key) {
+                    // Demotion keeps the session in the standby table, but the
+                    // stale owner must stop advertising local XSK redirect
+                    // aliases immediately or XDP will keep steering packets to
+                    // the old node after RG handoff.
+                    delete_session_map_redirect_for_session(
+                        session_map_fd,
+                        key,
+                        decision,
+                        &metadata,
+                        origin,
+                    );
+                }
             }
         }
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
