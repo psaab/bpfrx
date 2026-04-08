@@ -322,6 +322,58 @@ pub(super) fn apply_worker_commands(
                         continue;
                     }
                     for demoted_key in sessions.demote_owner_rg(owner_rg_id) {
+                        let Some((decision, metadata, _origin)) =
+                            sessions.entry_with_origin(&demoted_key)
+                        else {
+                            continue;
+                        };
+                        let flow = SessionFlow {
+                            src_ip: demoted_key.src_ip,
+                            dst_ip: demoted_key.dst_ip,
+                            forward_key: demoted_key.clone(),
+                        };
+                        let resolution_target = resolution_target_for_session(&flow, decision);
+                        let looked_up_resolution = lookup_forwarding_resolution_for_session(
+                            forwarding,
+                            dynamic_neighbors,
+                            &flow,
+                            decision,
+                        );
+                        let looked_up_resolution =
+                            super::prefer_local_forward_candidate_for_fabric_ingress(
+                                forwarding,
+                                ha_state,
+                                dynamic_neighbors,
+                                now_secs,
+                                metadata.fabric_ingress,
+                                resolution_target,
+                                looked_up_resolution,
+                            );
+                        let enforced_resolution = enforce_ha_resolution_snapshot(
+                            forwarding,
+                            ha_state,
+                            now_secs,
+                            looked_up_resolution,
+                        );
+                        let refreshed_decision = SessionDecision {
+                            resolution: redirect_session_via_fabric_if_needed(
+                                forwarding,
+                                enforced_resolution,
+                                metadata.fabric_ingress,
+                                metadata.ingress_zone.as_ref(),
+                            ),
+                            ..decision
+                        };
+                        if refreshed_decision.resolution.disposition
+                            != ForwardingDisposition::HAInactive
+                        {
+                            let _ = sessions.refresh_for_ha_transition(
+                                &demoted_key,
+                                refreshed_decision,
+                                metadata.clone(),
+                                now_ns,
+                            );
+                        }
                         let Some((decision, metadata, origin)) =
                             sessions.entry_with_origin(&demoted_key)
                         else {
@@ -2999,6 +3051,8 @@ mod tests {
             &shared_nat_sessions,
             &shared_forward_wire_sessions,
             &shared_owner_rg_indexes,
+            &test_forwarding_state_with_fabric(),
+            &Arc::new(Mutex::new(FastMap::default())),
             &[1],
         );
 
@@ -3024,6 +3078,120 @@ mod tests {
             .cloned()
             .expect("nat alias");
         assert!(nat_alias.origin.is_peer_synced());
+    }
+
+    #[test]
+    fn demoted_shared_local_forward_session_enters_reverse_prewarm_index() {
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let forwarding = test_forwarding_state_split_rgs();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let mut entry = SyncedSessionEntry {
+            key: test_key(),
+            decision: test_decision(),
+            metadata: SessionMetadata {
+                fabric_ingress: true,
+                ..test_metadata()
+            },
+            origin: SessionOrigin::ForwardFlow,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+        };
+        entry.metadata.owner_rg_id = 1;
+
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &entry,
+        );
+
+        demote_shared_owner_rgs(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &forwarding,
+            &dynamic_neighbors,
+            &[1],
+        );
+
+        let index = shared_owner_rg_indexes
+            .reverse_prewarm_sessions
+            .lock()
+            .expect("prewarm index");
+        assert!(index.get(&1).is_some_and(|keys| keys.contains(&entry.key)));
+        assert!(index.get(&2).is_some_and(|keys| keys.contains(&entry.key)));
+    }
+
+    #[test]
+    fn prewarm_reverse_synced_sessions_after_demotion_recomputes_split_owner_reverse() {
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let worker_commands = vec![Arc::new(Mutex::new(VecDeque::new()))];
+        let forwarding = test_forwarding_state_split_rgs();
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let mut ha_state = BTreeMap::new();
+        ha_state.insert(2, active_ha_runtime(1));
+        let mut entry = SyncedSessionEntry {
+            key: test_key(),
+            decision: test_decision(),
+            metadata: SessionMetadata {
+                fabric_ingress: true,
+                ..test_metadata()
+            },
+            origin: SessionOrigin::ForwardFlow,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+        };
+        entry.metadata.owner_rg_id = 1;
+
+        publish_shared_session(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &entry,
+        );
+        demote_shared_owner_rgs(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &forwarding,
+            &dynamic_neighbors,
+            &[1],
+        );
+
+        prewarm_reverse_synced_sessions_for_owner_rgs(
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &worker_commands,
+            -1,
+            &forwarding,
+            &ha_state,
+            &dynamic_neighbors,
+            &[2],
+            1,
+        );
+
+        let reverse_key = reverse_session_key(&entry.key, entry.decision.nat);
+        let reverse = shared_sessions
+            .lock()
+            .expect("shared sessions")
+            .get(&reverse_key)
+            .cloned()
+            .expect("reverse entry");
+        assert!(reverse.metadata.is_reverse);
+        assert_eq!(reverse.metadata.owner_rg_id, 2);
+        assert_eq!(worker_commands[0].lock().expect("commands").len(), 2);
     }
 
     #[test]
@@ -3063,6 +3231,51 @@ mod tests {
             .lookup_with_origin(&key, now_ns, 0x10)
             .expect("demoted session");
         assert!(origin.is_peer_synced());
+    }
+
+    #[test]
+    fn apply_worker_commands_demote_owner_rg_rewrites_resolution_to_fabric_redirect() {
+        let commands = Arc::new(Mutex::new(VecDeque::from([
+            WorkerCommand::DemoteOwnerRGS { owner_rgs: vec![1] },
+        ])));
+        let mut sessions = SessionTable::new();
+        let key = test_key();
+        let decision = test_decision();
+        let metadata = test_metadata();
+        let now_ns = monotonic_nanos();
+
+        assert!(sessions.install_with_protocol_with_origin(
+            key.clone(),
+            decision,
+            metadata,
+            SessionOrigin::ForwardFlow,
+            now_ns,
+            PROTO_TCP,
+            0x10,
+        ));
+
+        let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_ns / 1_000_000_000))]);
+        let results = apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &test_forwarding_state_with_fabric(),
+            &ha_state,
+            &Arc::new(Mutex::new(FastMap::default())),
+        );
+
+        assert_eq!(results.cancelled_keys, vec![key.clone()]);
+        let (lookup, origin) = sessions
+            .lookup_with_origin(&key, now_ns, 0x10)
+            .expect("demoted session");
+        assert!(origin.is_peer_synced());
+        assert_eq!(
+            lookup.decision.resolution.disposition,
+            ForwardingDisposition::FabricRedirect
+        );
+        assert_eq!(lookup.decision.resolution.egress_ifindex, 21);
     }
 
     #[test]

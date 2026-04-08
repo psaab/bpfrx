@@ -2475,7 +2475,10 @@ fn poll_binding(
                             if !cached_flow_decision_valid(
                                 forwarding,
                                 ha_state,
+                                dynamic_neighbors,
                                 now_secs,
+                                packet_fabric_ingress,
+                                resolution_target_for_session(flow, cached.decision),
                                 cached.decision.resolution,
                             ) {
                                 binding.flow_cache.invalidate_slot(
@@ -2642,6 +2645,7 @@ fn poll_binding(
                         .as_ref()
                         .map(|flow| ResolutionDebug::from_flow(meta.ingress_ifindex as i32, flow));
                     let mut session_ingress_zone: Option<Arc<str>> = None;
+                    let mut flow_cache_owner_rg_id = 0i32;
                     let mut apply_nat_on_fabric = false;
                     let mut decision = if let Some(flow) = flow.as_ref() {
                         if let Some(resolved) = resolve_flow_session_decision(
@@ -2705,6 +2709,7 @@ fn poll_binding(
                                 debug.to_zone = Some(resolved.metadata.egress_zone.clone());
                             }
                             session_ingress_zone = Some(resolved.metadata.ingress_zone.clone());
+                            flow_cache_owner_rg_id = resolved.metadata.owner_rg_id;
                             apply_nat_on_fabric = true;
                             // TTL/hop-limit check on session-hit path: generate
                             // ICMP Time Exceeded for packets that would expire
@@ -3236,6 +3241,7 @@ fn poll_binding(
                             {
                                 let owner_rg_id =
                                     owner_rg_for_resolution(forwarding, decision.resolution);
+                                flow_cache_owner_rg_id = owner_rg_id;
                                 if allow_unsolicited_dns_reply(forwarding, flow) {
                                     // Match the XDP fast path: unsolicited DNS replies bypass
                                     // policy/session install when the flow knob is enabled.
@@ -3623,6 +3629,11 @@ fn poll_binding(
                                 == ForwardingDisposition::HAInactive
                                 && !packet_fabric_ingress
                             {
+                                let owner_rg_id =
+                                    owner_rg_for_resolution(forwarding, decision.resolution);
+                                if owner_rg_id > 0 {
+                                    flow_cache_owner_rg_id = owner_rg_id;
+                                }
                                 // New flow to inactive RG: fabric-redirect to the peer
                                 // that owns the egress RG.  Use from_zone_arc directly
                                 // (always in scope) rather than going through the debug
@@ -3681,6 +3692,9 @@ fn poll_binding(
                         && egress_rg > 0
                         && !packet_fabric_ingress
                     {
+                        if flow_cache_owner_rg_id <= 0 {
+                            flow_cache_owner_rg_id = egress_rg;
+                        }
                         let zone_name = session_ingress_zone
                             .as_deref()
                             .or_else(|| {
@@ -4004,6 +4018,7 @@ fn poll_binding(
                                     meta,
                                     validation,
                                     decision,
+                                    flow_cache_owner_rg_id,
                                     session_ingress_zone.as_ref().cloned(),
                                     forwarding,
                                     ha_state,

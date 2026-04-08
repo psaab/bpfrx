@@ -124,6 +124,7 @@ impl FlowCacheEntry {
         meta: UserspaceDpMeta,
         validation: ValidationState,
         decision: SessionDecision,
+        flow_owner_rg_id: i32,
         ingress_zone: Option<Arc<str>>,
         forwarding: &ForwardingState,
         ha_state: &BTreeMap<i32, HAGroupRuntime>,
@@ -133,7 +134,15 @@ impl FlowCacheEntry {
         if !Self::should_cache(meta, decision) {
             return None;
         }
-        let owner_rg_id = owner_rg_for_resolution(forwarding, decision.resolution);
+        // Keep cache invalidation tied to the flow owner RG, not the current
+        // fabric parent ifindex. During split-RG operation a live flow can
+        // temporarily resolve to FabricRedirect, but failback must still evict
+        // that cached redirect as soon as the owning RG flips locally.
+        let owner_rg_id = if flow_owner_rg_id > 0 {
+            flow_owner_rg_id
+        } else {
+            owner_rg_for_resolution(forwarding, decision.resolution)
+        };
         Some(Self {
             key: flow.forward_key.clone(),
             ingress_ifindex: meta.ingress_ifindex as i32,
@@ -718,6 +727,7 @@ mod tests {
             meta,
             validation,
             decision,
+            1,
             ingress_zone.clone(),
             &forwarding,
             &BTreeMap::from([(
@@ -810,6 +820,7 @@ mod tests {
             meta,
             validation,
             decision,
+            0,
             None,
             &forwarding,
             &BTreeMap::new(),
@@ -817,5 +828,82 @@ mod tests {
             &rg_epochs,
         );
         assert!(entry.is_none(), "NoRoute should not produce a cache entry");
+    }
+
+    #[test]
+    fn fabric_redirect_cache_entry_uses_flow_owner_rg_for_epoch_invalidation() {
+        let rg_epochs = default_rg_epochs();
+        let key = make_key();
+        let flow = SessionFlow {
+            src_ip: key.src_ip,
+            dst_ip: key.dst_ip,
+            forward_key: key.clone(),
+        };
+        let meta = make_meta(PROTO_TCP);
+        let validation = ValidationState {
+            snapshot_installed: true,
+            config_generation: 1,
+            fib_generation: 1,
+        };
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::FabricRedirect,
+                local_ifindex: 0,
+                egress_ifindex: 21,
+                tx_ifindex: 21,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
+                neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                src_mac: Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]),
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision::default(),
+        };
+        let mut forwarding = ForwardingState::default();
+        forwarding.fabrics.push(FabricLink {
+            parent_ifindex: 21,
+            overlay_ifindex: 101,
+            peer_addr: IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2)),
+            peer_mac: [0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee],
+            local_mac: [0x02, 0xbf, 0x72, 0xff, 0x00, 0x01],
+        });
+        forwarding.egress.insert(
+            6,
+            EgressInterface {
+                bind_ifindex: 6,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x61, 0x01],
+                zone: "trust".to_string(),
+                redundancy_group: 2,
+                primary_v4: Some(Ipv4Addr::new(10, 0, 61, 1)),
+                primary_v6: None,
+            },
+        );
+
+        let entry = FlowCacheEntry::from_forward_decision(
+            &flow,
+            meta,
+            validation,
+            decision,
+            2,
+            Some(Arc::<str>::from("trust")),
+            &forwarding,
+            &BTreeMap::from([(
+                2,
+                HAGroupRuntime {
+                    active: true,
+                    watchdog_timestamp: 10,
+                    lease: HAForwardingLease::ActiveUntil(20),
+                },
+            )]),
+            true,
+            &rg_epochs,
+        )
+        .expect("fabric redirect entry");
+
+        assert_eq!(entry.stamp.owner_rg_id, 2);
+        assert_eq!(entry.metadata.owner_rg_id, 2);
+        assert!(entry.descriptor.fabric_redirect);
     }
 }

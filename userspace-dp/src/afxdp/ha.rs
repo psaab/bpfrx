@@ -54,6 +54,8 @@ impl super::Coordinator {
                 &self.shared_nat_sessions,
                 &self.shared_forward_wire_sessions,
                 &self.shared_owner_rg_indexes,
+                &self.forwarding,
+                &self.dynamic_neighbors,
                 &demoted_rgs,
             );
             // Bump RG epochs atomically — O(1) invalidation. Workers will

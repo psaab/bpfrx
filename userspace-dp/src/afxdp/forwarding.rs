@@ -474,10 +474,48 @@ pub(super) fn enforce_ha_resolution_snapshot(
 pub(super) fn cached_flow_decision_valid(
     forwarding: &ForwardingState,
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     now_secs: u64,
+    fabric_ingress: bool,
+    target_ip: IpAddr,
     resolution: ForwardingResolution,
 ) -> bool {
-    enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, resolution) == resolution
+    if enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, resolution) != resolution {
+        return false;
+    }
+    if resolution.disposition == ForwardingDisposition::FabricRedirect {
+        let local_resolution = enforce_ha_resolution_snapshot(
+            forwarding,
+            ha_state,
+            now_secs,
+            lookup_forwarding_resolution_with_dynamic(forwarding, dynamic_neighbors, target_ip),
+        );
+        let local_owner_rg = owner_rg_for_resolution(forwarding, local_resolution);
+        let local_egress_is_fabric = local_resolution.egress_ifindex > 0
+            && ingress_is_fabric(forwarding, local_resolution.egress_ifindex);
+        if matches!(
+            local_resolution.disposition,
+            ForwardingDisposition::ForwardCandidate | ForwardingDisposition::MissingNeighbor
+        ) && local_owner_rg > 0
+            && !local_egress_is_fabric
+        {
+            return false;
+        }
+    }
+    if fabric_ingress
+        && prefer_local_forward_candidate_for_fabric_ingress(
+            forwarding,
+            ha_state,
+            dynamic_neighbors,
+            now_secs,
+            true,
+            target_ip,
+            resolution,
+        ) != resolution
+    {
+        return false;
+    }
+    true
 }
 
 pub(super) fn finalize_new_flow_ha_resolution(
@@ -1684,12 +1722,104 @@ mod tests {
         let resolution =
             lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         let now_secs = monotonic_nanos() / 1_000_000_000;
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
 
         assert!(cached_flow_decision_valid(
-            &state, &active, now_secs, resolution
+            &state,
+            &active,
+            &dynamic_neighbors,
+            now_secs,
+            false,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            resolution
         ));
         assert!(!cached_flow_decision_valid(
-            &state, &demoted, now_secs, resolution
+            &state,
+            &demoted,
+            &dynamic_neighbors,
+            now_secs,
+            false,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            resolution
+        ));
+    }
+
+    #[test]
+    fn cached_flow_decision_invalidates_fabric_redirect_on_fabric_ingress_when_local_owner_active()
+    {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let ha_state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let resolution = resolve_fabric_redirect(&state).expect("fabric redirect");
+
+        assert!(!cached_flow_decision_valid(
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+            now_secs,
+            true,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            resolution
+        ));
+    }
+
+    #[test]
+    fn cached_flow_decision_invalidates_fabric_redirect_on_non_fabric_ingress_when_local_owner_active()
+     {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let ha_state = BTreeMap::from([(1, active_ha_runtime(now_secs))]);
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let resolution = resolve_fabric_redirect(&state).expect("fabric redirect");
+
+        assert!(!cached_flow_decision_valid(
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+            now_secs,
+            false,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            resolution
+        ));
+    }
+
+    #[test]
+    fn cached_flow_decision_keeps_fabric_redirect_on_fabric_ingress_when_local_owner_inactive() {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let resolution = resolve_fabric_redirect(&state).expect("fabric redirect");
+
+        assert!(cached_flow_decision_valid(
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+            now_secs,
+            true,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            resolution
+        ));
+    }
+
+    #[test]
+    fn cached_flow_decision_keeps_fabric_redirect_on_non_fabric_ingress_when_local_owner_inactive()
+    {
+        let state = build_forwarding_state(&nat_snapshot_with_fabric());
+        let now_secs = monotonic_nanos() / 1_000_000_000;
+        let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
+        let dynamic_neighbors = Arc::new(Mutex::new(FastMap::default()));
+        let resolution = resolve_fabric_redirect(&state).expect("fabric redirect");
+
+        assert!(cached_flow_decision_valid(
+            &state,
+            &ha_state,
+            &dynamic_neighbors,
+            now_secs,
+            false,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+            resolution
         ));
     }
 
