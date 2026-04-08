@@ -675,6 +675,26 @@ impl SessionTable {
         )
     }
 
+    /// Refresh an existing session for an HA path transition while
+    /// preserving its origin and current liveness state.
+    pub fn refresh_for_ha_transition(
+        &mut self,
+        key: &SessionKey,
+        decision: SessionDecision,
+        metadata: SessionMetadata,
+        now_ns: u64,
+    ) -> bool {
+        let Some(mut entry) = self.remove_entry(key) else {
+            return false;
+        };
+        entry.decision = decision;
+        entry.metadata = metadata;
+        entry.install_epoch = self.next_epoch();
+        entry.last_seen_ns = now_ns;
+        self.restore_entry(key.clone(), entry);
+        true
+    }
+
     /// Promote a peer-synced session to local ownership.
     /// Convenience wrapper around update_session.
     pub fn promote_synced_with_origin(

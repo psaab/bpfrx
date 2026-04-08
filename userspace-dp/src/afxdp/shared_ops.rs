@@ -5,17 +5,31 @@ pub(super) fn demote_shared_owner_rgs(
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
+    forwarding: &ForwardingState,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     owner_rgs: &[i32],
 ) {
     if owner_rgs.is_empty() {
         return;
     }
+    let mut demoted_entries = Vec::new();
     if let Ok(mut sessions) = shared_sessions.lock() {
         for key in owner_rg_session_keys(&shared_owner_rg_indexes.sessions, owner_rgs) {
             if let Some(entry) = sessions.get_mut(&key) {
+                let previous = entry.clone();
                 entry.origin = SessionOrigin::SyncImport;
+                demoted_entries.push((previous, entry.clone()));
             }
         }
+    }
+    for (previous, entry) in demoted_entries {
+        refresh_reverse_prewarm_owner_rg_indexes(
+            &shared_owner_rg_indexes.reverse_prewarm_sessions,
+            forwarding,
+            dynamic_neighbors,
+            Some(&previous),
+            Some(&entry),
+        );
     }
     if let Ok(mut sessions) = shared_nat_sessions.lock() {
         for key in owner_rg_session_keys(&shared_owner_rg_indexes.nat_sessions, owner_rgs) {
