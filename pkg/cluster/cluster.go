@@ -130,7 +130,15 @@ type Manager struct {
 	// transfer-out across heartbeat refreshes until the transfer is either
 	// committed or aborted locally.
 	peerTransferOutOverride map[int]uint64
-	peerMonitors            []InterfaceMonitorInfo
+	// peerTransferCommitGraceUntil keeps the peer in secondary-hold for a
+	// short window after a transfer commit so a transient stale heartbeat
+	// cannot immediately steal the RG back from the new primary.
+	peerTransferCommitGraceUntil map[int]time.Time
+	// localTransferOutHoldUntil keeps a just-demoted local RG parked in
+	// secondary during the same window so a transient heartbeat gap cannot
+	// immediately re-promote the old primary.
+	localTransferOutHoldUntil map[int]time.Time
+	peerMonitors              []InterfaceMonitorInfo
 
 	// Heartbeat goroutines (nil when not started).
 	hbSender   *heartbeatSender
@@ -218,6 +226,8 @@ type Manager struct {
 const DefaultTakeoverHoldTime = 0
 const DefaultPreManualFailoverRetryTimeout = 5 * time.Second
 const DefaultPreManualFailoverRetryInterval = 500 * time.Millisecond
+const minTransferCommitGracePeriod = 10 * time.Second
+const transferCommitHeartbeatSlack = 5 * time.Second
 
 // NewManager creates a new cluster manager.
 func NewManager(nodeID, clusterID int) *Manager {
@@ -230,6 +240,8 @@ func NewManager(nodeID, clusterID int) *Manager {
 		garpCounts:                     make(map[int]int),
 		peerGroups:                     make(map[int]PeerGroupState),
 		peerTransferOutOverride:        make(map[int]uint64),
+		peerTransferCommitGraceUntil:   make(map[int]time.Time),
+		localTransferOutHoldUntil:      make(map[int]time.Time),
 		hbInterval:                     DefaultHeartbeatInterval,
 		hbThreshold:                    DefaultHeartbeatThreshold,
 		history:                        NewEventHistory(64),
@@ -874,6 +886,30 @@ func (m *Manager) SetPeerTimeoutGuard(fn func() (bool, string)) {
 	m.peerTimeoutGuardFn = fn
 }
 
+func (m *Manager) transferCommitGracePeriodLocked() time.Duration {
+	grace := 2*time.Duration(m.hbThreshold)*m.hbInterval + transferCommitHeartbeatSlack
+	if grace < minTransferCommitGracePeriod {
+		grace = minTransferCommitGracePeriod
+	}
+	return grace
+}
+
+func (m *Manager) suppressPeerTimeoutForTransferCommitLocked(now time.Time) (bool, string) {
+	activeRGs := make([]int, 0, len(m.localTransferOutHoldUntil))
+	for rgID, until := range m.localTransferOutHoldUntil {
+		if now.Before(until) {
+			activeRGs = append(activeRGs, rgID)
+			continue
+		}
+		delete(m.localTransferOutHoldUntil, rgID)
+	}
+	if len(activeRGs) == 0 {
+		return false, ""
+	}
+	sort.Ints(activeRGs)
+	return true, fmt.Sprintf("recent transfer commit grace active rgs=%v", activeRGs)
+}
+
 // FenceStatus returns the configured fencing action and history of fence events.
 func (m *Manager) FenceStatus() (action string, events []HistoryEvent) {
 	m.mu.RLock()
@@ -993,6 +1029,8 @@ func (m *Manager) commitRequestedPeerFailover(rgID int, reqID uint64) error {
 	}
 
 	m.peerTransferOutOverride[rgID] = reqID
+	delete(m.peerTransferCommitGraceUntil, rgID)
+	delete(m.localTransferOutHoldUntil, rgID)
 	peerGroup := m.peerGroups[rgID]
 	peerGroup.GroupID = rgID
 	peerGroup.State = StateSecondaryHold
@@ -1021,6 +1059,7 @@ func (m *Manager) abortRequestedPeerFailover(rgID int, reqID uint64) {
 		return
 	}
 	delete(m.peerTransferOutOverride, rgID)
+	delete(m.peerTransferCommitGraceUntil, rgID)
 	m.runElection()
 }
 
@@ -1029,11 +1068,12 @@ func (m *Manager) notePeerTransferCommitted(rgID int) {
 	defer m.mu.Unlock()
 
 	delete(m.peerTransferOutOverride, rgID)
+	m.peerTransferCommitGraceUntil[rgID] = time.Now().Add(m.transferCommitGracePeriodLocked())
 	peerGroup, ok := m.peerGroups[rgID]
 	if !ok {
 		return
 	}
-	peerGroup.State = StateSecondary
+	peerGroup.State = StateSecondaryHold
 	m.peerGroups[rgID] = peerGroup
 }
 
@@ -1058,6 +1098,13 @@ func (m *Manager) FinalizePeerTransferOut(rgID int) error {
 	rg.ManualFailover = false
 	rg.ManualFailoverAt = time.Time{}
 	rg.State = StateSecondary
+	// A completed transfer-out invalidates any stale inbound-transfer view
+	// from the previous owner direction. If we keep forcing the peer into
+	// secondary-hold here, the next heartbeat can immediately re-elect the
+	// old owner during rapid failback/failover sequences.
+	delete(m.peerTransferOutOverride, rgID)
+	delete(m.peerTransferCommitGraceUntil, rgID)
+	m.localTransferOutHoldUntil[rgID] = time.Now().Add(m.transferCommitGracePeriodLocked())
 	if oldState != rg.State {
 		m.sendEvent(rg.GroupID, oldState, rg.State, "Peer transfer committed")
 	}
@@ -1348,6 +1395,7 @@ func (m *Manager) buildHeartbeat() *HeartbeatPacket {
 func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := time.Now()
 
 	wasAlive := m.peerAlive
 	m.peerAlive = true
@@ -1367,10 +1415,31 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 		}
 	}
 	for rgID := range m.peerTransferOutOverride {
-		peerGroup := newPeerGroups[rgID]
+		peerGroup, ok := newPeerGroups[rgID]
+		if !ok {
+			continue
+		}
 		peerGroup.GroupID = rgID
 		peerGroup.State = StateSecondaryHold
 		newPeerGroups[rgID] = peerGroup
+	}
+	for rgID, until := range m.peerTransferCommitGraceUntil {
+		if !now.Before(until) {
+			delete(m.peerTransferCommitGraceUntil, rgID)
+			continue
+		}
+		peerGroup, ok := newPeerGroups[rgID]
+		if !ok {
+			continue
+		}
+		peerGroup.GroupID = rgID
+		peerGroup.State = StateSecondaryHold
+		newPeerGroups[rgID] = peerGroup
+	}
+	for rgID, until := range m.localTransferOutHoldUntil {
+		if !now.Before(until) {
+			delete(m.localTransferOutHoldUntil, rgID)
+		}
 	}
 	m.peerGroups = newPeerGroups
 
@@ -1412,12 +1481,17 @@ func (m *Manager) handlePeerTimeout() {
 		m.mu.Unlock()
 		return // already marked lost
 	}
+	if suppress, reason := m.suppressPeerTimeoutForTransferCommitLocked(time.Now()); suppress {
+		m.mu.Unlock()
+		slog.Debug("cluster: suppressing peer heartbeat timeout", "reason", reason)
+		return
+	}
 	guard := m.peerTimeoutGuardFn
 	m.mu.Unlock()
 
 	if guard != nil {
 		if suppress, reason := guard(); suppress {
-			slog.Info("cluster: suppressing peer heartbeat timeout", "reason", reason)
+			slog.Debug("cluster: suppressing peer heartbeat timeout", "reason", reason)
 			return
 		}
 	}
@@ -1426,6 +1500,10 @@ func (m *Manager) handlePeerTimeout() {
 	defer m.mu.Unlock()
 	if !m.peerAlive {
 		return // already marked lost while guard ran
+	}
+	if suppress, reason := m.suppressPeerTimeoutForTransferCommitLocked(time.Now()); suppress {
+		slog.Debug("cluster: suppressing peer heartbeat timeout", "reason", reason)
+		return
 	}
 
 	m.peerAlive = false

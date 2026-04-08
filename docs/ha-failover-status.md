@@ -190,10 +190,16 @@ TOTAL_CYCLES=12 CYCLE_INTERVAL=5 \
 scripts/userspace-ha-failover-validation.sh --duration 600 --parallel 8
 ```
 
+```bash
+# Reverse-path coverage is also required. The validator currently exercises the
+# source-sending path, so run a matching reverse iperf after the forward pass.
+iperf3 -c 172.16.80.200 -P 8 -t 600 -R
+```
+
 ### Manual CLI test
 
 ```bash
-# Start long-running traffic and keep all per-stream lines visible.
+# Start long-running forward traffic and keep all per-stream lines visible.
 iperf3 -c 172.16.80.200 -P 8 -t 600
 
 # Rapidly move RG1 between fw0 and fw1 while traffic is active.
@@ -210,12 +216,26 @@ cli -c "request chassis cluster failover redundancy-group 1 node 0"
 cli -c "show chassis cluster data-plane statistics" | grep SNAT
 ```
 
+```bash
+# Repeat the same RG movement under reverse traffic. This exercises the return
+# path ownership and catches failovers that only work when the host is sending.
+iperf3 -c 172.16.80.200 -P 8 -t 600 -R
+
+cli -c "request chassis cluster failover redundancy-group 1 node 1"
+sleep 5
+cli -c "request chassis cluster failover redundancy-group 1 node 0"
+sleep 5
+cli -c "request chassis cluster failover redundancy-group 1 node 1"
+sleep 5
+cli -c "request chassis cluster failover redundancy-group 1 node 0"
+```
+
 ### Pass criteria
 
-- All 8 iperf3 streams survive every RG move
-- Zero per-stream zero-throughput intervals
-- Zero aggregate zero-throughput intervals
-- No permanently wedged stream after failback
+- All 8 iperf3 streams survive every RG move in both forward and reverse runs
+- Zero per-stream zero-throughput intervals in both directions
+- Zero aggregate zero-throughput intervals in both directions
+- No permanently wedged stream after failback in either direction
 - SNAT packets > 0 on new owner
 - Session misses < 1000 on new owner
 - RG moves to the requested node
