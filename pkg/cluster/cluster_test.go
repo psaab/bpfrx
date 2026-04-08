@@ -572,8 +572,8 @@ func TestRequestPeerFailoverCommitsLocalPrimaryWithoutHeartbeatObservation(t *te
 	if committedRG != 0 || committedReqID != 77 {
 		t.Fatalf("commit = rg %d req %d, want rg 0 req 77", committedRG, committedReqID)
 	}
-	if peer := m.PeerGroupStates()[0]; peer.State != StateSecondary {
-		t.Fatalf("peer state = %s, want secondary after commit", peer.State)
+	if peer := m.PeerGroupStates()[0]; peer.State != StateSecondaryHold {
+		t.Fatalf("peer state = %s, want secondary-hold during post-commit grace", peer.State)
 	}
 }
 
@@ -618,8 +618,8 @@ func TestRequestPeerFailoverAllowsTransferWithSyncWhenHeartbeatLost(t *testing.T
 	if committedRG != 0 || committedReqID != 91 {
 		t.Fatalf("commit = rg %d req %d, want rg 0 req 91", committedRG, committedReqID)
 	}
-	if peer := m.PeerGroupStates()[0]; peer.State != StateSecondary {
-		t.Fatalf("peer state = %s, want secondary after commit", peer.State)
+	if peer := m.PeerGroupStates()[0]; peer.State != StateSecondaryHold {
+		t.Fatalf("peer state = %s, want secondary-hold during post-commit grace", peer.State)
 	}
 }
 
@@ -674,8 +674,8 @@ func TestRequestPeerFailoverBatchCommitsLocalPrimaryTogether(t *testing.T) {
 		t.Fatalf("committed rgs = %v, want [1 2]", committedRGs)
 	}
 	for _, rgID := range []int{1, 2} {
-		if peer := m.PeerGroupStates()[rgID]; peer.State != StateSecondary {
-			t.Fatalf("peer state for rg %d = %s, want secondary after commit", rgID, peer.State)
+		if peer := m.PeerGroupStates()[rgID]; peer.State != StateSecondaryHold {
+			t.Fatalf("peer state for rg %d = %s, want secondary-hold during post-commit grace", rgID, peer.State)
 		}
 	}
 }
@@ -731,8 +731,8 @@ func TestRequestPeerFailoverBatchAllowsTransferWithSyncWhenHeartbeatLost(t *test
 		if !m.IsLocalPrimary(rgID) {
 			t.Fatalf("rg %d should be primary after explicit batch transfer commit", rgID)
 		}
-		if peer := m.PeerGroupStates()[rgID]; peer.State != StateSecondary {
-			t.Fatalf("peer state for rg %d = %s, want secondary after commit", rgID, peer.State)
+		if peer := m.PeerGroupStates()[rgID]; peer.State != StateSecondaryHold {
+			t.Fatalf("peer state for rg %d = %s, want secondary-hold during post-commit grace", rgID, peer.State)
 		}
 	}
 }
@@ -1009,6 +1009,101 @@ func TestPeerTransferOutOverrideSurvivesHeartbeatRefreshUntilCommit(t *testing.T
 	}
 	if peer := m.PeerGroupStates()[0]; peer.State != StateSecondaryHold {
 		t.Fatalf("peer state = %s, want secondary-hold while transfer commit in flight", peer.State)
+	}
+}
+
+func TestNotePeerTransferCommittedPreservesPeerTransferOutDuringGrace(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+	m.mu.Lock()
+	m.groups[0].Ready = true
+	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+	m.groups[0].ReadinessReasons = nil
+	m.mu.Unlock()
+
+	if err := m.commitRequestedPeerFailover(0, 77); err != nil {
+		t.Fatalf("commitRequestedPeerFailover() error = %v", err)
+	}
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("should be primary after local transfer commit")
+	}
+
+	m.notePeerTransferCommitted(0)
+	if peer := m.PeerGroupStates()[0]; peer.State != StateSecondaryHold {
+		t.Fatalf("peer state = %s, want secondary-hold during post-commit grace", peer.State)
+	}
+
+	m.handlePeerHeartbeat(pkt)
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("stale peer-primary heartbeat should not clobber committed ownership during grace")
+	}
+	if peer := m.PeerGroupStates()[0]; peer.State != StateSecondaryHold {
+		t.Fatalf("peer state = %s, want secondary-hold during post-commit grace", peer.State)
+	}
+
+	m.mu.Lock()
+	m.peerTransferCommitGraceUntil[0] = time.Now().Add(-time.Second)
+	m.mu.Unlock()
+
+	m.handlePeerHeartbeat(pkt)
+	if m.IsLocalPrimary(0) {
+		t.Fatal("should yield after post-commit grace expires and peer still advertises primary")
+	}
+}
+
+func TestHandlePeerTimeoutSuppressedDuringRecentTransferCommitGrace(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200, 1: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	if err := m.ManualFailover(0); err != nil {
+		t.Fatalf("ManualFailover() error = %v", err)
+	}
+	m.mu.Lock()
+	m.peerAlive = true
+	m.peerEverSeen = true
+	m.peerNodeID = 1
+	m.peerGroups = map[int]PeerGroupState{
+		0: {GroupID: 0, Priority: 100, Weight: 255, State: StateSecondaryHold},
+	}
+	m.mu.Unlock()
+	if err := m.FinalizePeerTransferOut(0); err != nil {
+		t.Fatalf("FinalizePeerTransferOut() error = %v", err)
+	}
+	if m.IsLocalPrimary(0) {
+		t.Fatal("should remain secondary immediately after peer transfer commit")
+	}
+
+	m.handlePeerTimeout()
+	if !m.PeerAlive() {
+		t.Fatal("peer should remain alive while recent transfer-commit grace is active")
+	}
+	if m.IsLocalPrimary(0) {
+		t.Fatal("old primary should stay secondary while transfer-commit grace is active")
+	}
+
+	m.mu.Lock()
+	m.localTransferOutHoldUntil[0] = time.Now().Add(-time.Second)
+	m.mu.Unlock()
+
+	m.handlePeerTimeout()
+	if m.PeerAlive() {
+		t.Fatal("peer should be marked lost after transfer-commit grace expires")
+	}
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("old primary should reclaim ownership after grace expires and peer times out")
 	}
 }
 

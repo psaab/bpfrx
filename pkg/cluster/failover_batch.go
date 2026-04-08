@@ -263,6 +263,8 @@ func (m *Manager) commitRequestedPeerFailoverBatch(rgIDs []int, reqID uint64) er
 
 	for _, rgID := range rgIDs {
 		m.peerTransferOutOverride[rgID] = reqID
+		delete(m.peerTransferCommitGraceUntil, rgID)
+		delete(m.localTransferOutHoldUntil, rgID)
 		peerGroup := m.peerGroups[rgID]
 		peerGroup.GroupID = rgID
 		peerGroup.State = StateSecondaryHold
@@ -300,6 +302,7 @@ func (m *Manager) abortRequestedPeerFailoverBatch(rgIDs []int, reqID uint64) {
 		if currentReqID, ok := m.peerTransferOutOverride[rgID]; ok && currentReqID == reqID {
 			delete(m.peerTransferOutOverride, rgID)
 		}
+		delete(m.peerTransferCommitGraceUntil, rgID)
 	}
 	m.runElection()
 }
@@ -310,11 +313,12 @@ func (m *Manager) notePeerTransferCommittedBatch(rgIDs []int) {
 
 	for _, rgID := range rgIDs {
 		delete(m.peerTransferOutOverride, rgID)
+		m.peerTransferCommitGraceUntil[rgID] = time.Now().Add(m.transferCommitGracePeriodLocked())
 		peerGroup, ok := m.peerGroups[rgID]
 		if !ok {
 			continue
 		}
-		peerGroup.State = StateSecondary
+		peerGroup.State = StateSecondaryHold
 		m.peerGroups[rgID] = peerGroup
 	}
 }
@@ -352,6 +356,7 @@ func (m *Manager) FinalizePeerTransferOutBatch(rgIDs []int) error {
 		rg.ManualFailover = false
 		rg.ManualFailoverAt = time.Time{}
 		rg.State = StateSecondary
+		m.localTransferOutHoldUntil[rgID] = time.Now().Add(m.transferCommitGracePeriodLocked())
 		if oldState != rg.State {
 			m.sendEvent(rg.GroupID, oldState, rg.State, "Peer transfer committed batch")
 		}

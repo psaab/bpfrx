@@ -156,6 +156,7 @@ For standard HA failover stress on `loss`, use:
 - `CYCLE_INTERVAL=5`
 - `--duration 600`
 - `--parallel 8`
+- one forward run and one reverse `iperf3 -R` run
 
 That is the preferred repro shape for the remaining "first failover degrades,
 failback wedges one stream" class because it exercises:
@@ -163,6 +164,7 @@ failback wedges one stream" class because it exercises:
 - longer-lived inherited flows
 - repeated ownership changes in both directions
 - per-stream survival, not just aggregate throughput
+- both traffic ownership directions, not only the host-sending path
 
 This matters because a split-RG fabric-path bug can kill streams before the
 first failover. That must fail as a fabric regression, not be misclassified as
@@ -201,8 +203,13 @@ Gbps. A run that peaks high and then drops near zero is a failure even if the sh
 overall average still looks superficially acceptable.
 
 For the dedicated failover workflow, the operator should watch all eight stream
-lines, not only the `[SUM]` line. A run is still a failure if aggregate traffic
-recovers but one stream remains pinned at `0.00 bits/sec` after failback.
+lines, not only the `[SUM]` line, for both:
+
+- forward `iperf3 -c ...`
+- reverse `iperf3 -c ... -R`
+
+A run is still a failure if aggregate traffic recovers but one stream remains
+pinned at `0.00 bits/sec` after failback, or if only one direction recovers.
 
 The validator also treats traceroute visibility as a standard correctness gate.
 It does not require every internet hop to answer. It does require:

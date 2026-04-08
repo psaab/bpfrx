@@ -215,6 +215,15 @@ TOTAL_CYCLES=3 CYCLE_INTERVAL=10 \
 scripts/userspace-ha-failover-validation.sh --duration 90 --parallel 4
 ```
 
+Reverse-path follow-up:
+
+```bash
+# The validator currently exercises the source-sending path. Run a matching
+# reverse iperf after the forward pass so failover is validated in both
+# ownership directions.
+iperf3 -c 172.16.80.200 -P 4 -t 90 -R
+```
+
 Useful knobs:
 
 - `SOURCE_NODE`
@@ -233,6 +242,7 @@ Pass:
 - RG ownership moves to the requested node
 - immediate target reachability returns quickly after each phase
 - no sustained zero-throughput collapse
+- both forward and reverse traffic recover after each move
 - retransmits stay bounded
 - old-owner fabric TX proves stale-owner redirect actually happened
 - standby WAN TX stays flat while redirect is expected
@@ -257,6 +267,12 @@ Start traffic from the host:
 iperf3 -c 172.16.80.200 -P 8 -t 120
 ```
 
+Then repeat the same test in reverse mode:
+
+```bash
+iperf3 -c 172.16.80.200 -P 8 -t 120 -R
+```
+
 Move the RG from the current primary:
 
 ```bash
@@ -271,8 +287,9 @@ cli -c "request chassis cluster failover redundancy-group 1 node 0"
 
 Pass:
 
-- throughput may dip, but recovers quickly and stays relatively flat
+- throughput may dip, but recovers quickly and stays relatively flat in both directions
 - new connections succeed immediately after the move
+- reverse `iperf3 -R` does not wedge at `0.00 bits/sec`
 - the moved RG remains on the requested node
 
 Required live checks during manual RG move:
@@ -322,13 +339,14 @@ Purpose:
 
 After the crashed node rejoins:
 
-1. start a fresh `iperf3 -P 8`
-2. move the RG again with CLI failover
-3. verify flows still recover and stay flat
+1. start a fresh forward `iperf3 -P 8`
+2. start a fresh reverse `iperf3 -P 8 -R`
+3. move the RG again with CLI failover
+4. verify flows still recover and stay flat in both directions
 
 Pass:
 
-- no new collapse introduced by the rejoined node
+- no new collapse introduced by the rejoined node in either direction
 - takeover readiness returns on both nodes
 
 ### 6. Split-RG active/active validation
@@ -512,13 +530,14 @@ Use this order when validating HA/failover for a serious userspace change.
 
 1. `scripts/userspace-ha-validation.sh`
 2. one-cycle `scripts/userspace-ha-failover-validation.sh`
-3. manual CLI RG move under `iperf3 -P 8`
-4. hard crash of the active primary with traffic running
-5. rebooted-node rejoin validation
-6. another manual RG move after rejoin
-7. split-RG placement validation
-8. split-RG crash in both directions
-9. multi-cycle failover stress
+3. manual CLI RG move under forward `iperf3 -P 8`
+4. manual CLI RG move under reverse `iperf3 -P 8 -R`
+5. hard crash of the active primary with traffic running
+6. rebooted-node rejoin validation
+7. another manual RG move after rejoin
+8. split-RG placement validation
+9. split-RG crash in both directions
+10. multi-cycle failover stress
 
 If any earlier phase fails, stop and fix that first. Later failover tests are
 not trustworthy on top of a broken baseline.
