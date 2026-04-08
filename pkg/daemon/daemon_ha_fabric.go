@@ -15,7 +15,6 @@ import (
 	"github.com/psaab/bpfrx/pkg/dataplane"
 )
 
-
 // ensureFabricIPVLAN creates an IPVLAN L2 interface on top of parent for
 // fabric IP addressing. The parent keeps its ge-X-0-Y name (XDP/TC attaches
 // there); the IPVLAN carries the fabric IP used for session sync.
@@ -348,6 +347,45 @@ func (d *Daemon) logFabricRefreshFailure(slot int, msg string, args ...any) {
 	slog.Info(msg, args...)
 }
 
+func (d *Daemon) fabricEntryPopulated(slot int) bool {
+	d.fabricMu.RLock()
+	defer d.fabricMu.RUnlock()
+	if slot == 1 {
+		return d.fabric1Populated
+	}
+	return d.fabricPopulated
+}
+
+func (d *Daemon) retainFabricFwdOnNeighborMiss(slot int, peerIP net.IP, overlay string, logWaiting bool) bool {
+	if !d.fabricEntryPopulated(slot) {
+		if logWaiting {
+			if slot == 1 {
+				slog.Info("cluster: waiting for fabric1 peer neighbor entry",
+					"peer", peerIP, "overlay", overlay)
+			} else {
+				slog.Info("cluster: waiting for fabric peer neighbor entry",
+					"peer", peerIP, "overlay", overlay)
+			}
+		} else if slot == 1 {
+			d.logFabricRefreshFailure(1, "cluster: fabric1 refresh failed (missing peer neighbor)",
+				"peer", peerIP, "overlay", overlay)
+		} else {
+			d.logFabricRefreshFailure(0, "cluster: fabric refresh failed (missing peer neighbor)",
+				"peer", peerIP, "overlay", overlay)
+		}
+		return false
+	}
+
+	if slot == 1 {
+		d.logFabricRefreshFailure(1, "cluster: retaining fabric1_fwd despite missing peer neighbor",
+			"peer", peerIP, "overlay", overlay)
+	} else {
+		d.logFabricRefreshFailure(0, "cluster: retaining fabric_fwd despite missing peer neighbor",
+			"peer", peerIP, "overlay", overlay)
+	}
+	return true
+}
+
 // refreshFabricFwd resolves fabric link/neighbor state and updates the
 // fabric_fwd BPF map. Returns true on success. Called during initial
 // population and periodic drift correction.
@@ -460,12 +498,8 @@ func (d *Daemon) refreshFabricFwd(fabIface, overlay string, peerIP net.IP, logWa
 	}
 
 	if peerMAC == nil {
-		if logWaiting {
-			slog.Info("cluster: waiting for fabric peer neighbor entry",
-				"peer", peerIP, "overlay", overlay)
-		} else {
-			d.logFabricRefreshFailure(0, "cluster: fabric refresh failed (missing peer neighbor)",
-				"peer", peerIP, "overlay", overlay)
+		if d.retainFabricFwdOnNeighborMiss(0, peerIP, overlay, logWaiting) {
+			return true
 		}
 		d.clearFabricFwd0()
 		return false
@@ -656,12 +690,8 @@ func (d *Daemon) refreshFabricFwd1(fabIface, overlay string, peerIP net.IP, logW
 		}
 	}
 	if peerMAC == nil {
-		if logWaiting {
-			slog.Info("cluster: waiting for fabric1 peer neighbor entry",
-				"peer", peerIP, "overlay", overlay)
-		} else {
-			d.logFabricRefreshFailure(1, "cluster: fabric1 refresh failed (missing peer neighbor)",
-				"peer", peerIP, "overlay", overlay)
+		if d.retainFabricFwdOnNeighborMiss(1, peerIP, overlay, logWaiting) {
+			return true
 		}
 		d.clearFabricFwd1()
 		return false

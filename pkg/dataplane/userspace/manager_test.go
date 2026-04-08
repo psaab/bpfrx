@@ -3,6 +3,7 @@ package userspace
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -111,6 +112,50 @@ func injectSessionMaps(t *testing.T, m *Manager) {
 	}
 	t.Cleanup(func() { sessionsMapV6.Close() })
 	injectInnerMap(t, m.inner, "sessions_v6", sessionsMapV6)
+}
+
+func injectCtrlAndBindingMaps(t *testing.T, m *Manager) (*ebpf.Map, *ebpf.Map) {
+	t.Helper()
+	ctrlMap, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  uint32(unsafe.Sizeof(userspaceCtrlValue{})),
+		MaxEntries: 16,
+	})
+	if err != nil {
+		t.Fatalf("new userspace_ctrl map: %v", err)
+	}
+	t.Cleanup(func() { ctrlMap.Close() })
+	injectInnerMap(t, m.inner, "userspace_ctrl", ctrlMap)
+
+	bindingsMap, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  uint32(unsafe.Sizeof(userspaceBindingValue{})),
+		MaxEntries: 256,
+	})
+	if err != nil {
+		t.Fatalf("new userspace_bindings map: %v", err)
+	}
+	t.Cleanup(func() { bindingsMap.Close() })
+	injectInnerMap(t, m.inner, "userspace_bindings", bindingsMap)
+	return ctrlMap, bindingsMap
+}
+
+func injectUserspaceSessionMap(t *testing.T, m *Manager) *ebpf.Map {
+	t.Helper()
+	usMap, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  8,
+		MaxEntries: 256,
+	})
+	if err != nil {
+		t.Fatalf("new userspace_sessions map: %v", err)
+	}
+	t.Cleanup(func() { usMap.Close() })
+	injectInnerMap(t, m.inner, "userspace_sessions", usMap)
+	return usMap
 }
 
 func TestFindUserspaceEgressInterfaceSnapshotPrefersVLANUnit(t *testing.T) {
@@ -791,6 +836,166 @@ func TestTakeoverReadyRequiresLivenessProofOnActiveNode(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected XSK liveness reason, got %v", reasons)
+	}
+}
+
+func TestApplyHelperStatusInitialCtrlCleanupRunsOnlyOnce(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	m := New()
+	m.inner.XDPEntryProg = "xdp_userspace_prog"
+	injectCtrlAndBindingMaps(t, m)
+	usMap := injectUserspaceSessionMap(t, m)
+	m.neighborsPrewarmed = true
+	m.xskLivenessProven = true
+	m.publishedSnapshot = 1
+
+	status := ProcessStatus{
+		Enabled:                true,
+		Workers:                1,
+		LastSnapshotGeneration: 1,
+		NeighborGeneration:     1,
+		Capabilities: UserspaceCapabilities{
+			ForwardingSupported: true,
+		},
+		Bindings: []BindingStatus{{
+			Slot:       1,
+			QueueID:    0,
+			Ifindex:    5,
+			Registered: true,
+			Armed:      true,
+			Bound:      true,
+		}},
+	}
+
+	key := uint32(1)
+	value := uint64(1)
+	if err := usMap.Update(key, value, ebpf.UpdateAny); err != nil {
+		t.Fatalf("seed userspace_sessions: %v", err)
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		t.Fatalf("first applyHelperStatusLocked: %v", err)
+	}
+	if !m.initialCtrlCleanupDone {
+		t.Fatal("initialCtrlCleanupDone = false, want true after first ctrl enable")
+	}
+	var got uint64
+	if err := usMap.Lookup(key, &got); !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Fatalf("userspace_sessions entry survived first ctrl enable cleanup: err=%v got=%d", err, got)
+	}
+
+	if err := usMap.Update(key, value, ebpf.UpdateAny); err != nil {
+		t.Fatalf("reseed userspace_sessions: %v", err)
+	}
+	m.ctrlWasEnabled = false
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		t.Fatalf("second applyHelperStatusLocked: %v", err)
+	}
+	if err := usMap.Lookup(key, &got); err != nil {
+		t.Fatalf("later ctrl re-enable reran startup cleanup: %v", err)
+	}
+}
+
+func TestUpdateRGActiveActivationKeepsCtrlEnabledAfterAckedStatus(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Skipf("RemoveMemlock: %v", err)
+	}
+	dir := t.TempDir()
+	controlSock := filepath.Join(dir, "control.sock")
+	ln, err := net.Listen("unix", controlSock)
+	if err != nil {
+		t.Fatalf("listen control socket: %v", err)
+	}
+	defer ln.Close()
+
+	status := ProcessStatus{
+		Enabled:                true,
+		Workers:                1,
+		LastSnapshotGeneration: 2,
+		NeighborGeneration:     1,
+		Capabilities: UserspaceCapabilities{
+			ForwardingSupported: true,
+		},
+		Bindings: []BindingStatus{{
+			Slot:       1,
+			QueueID:    0,
+			Ifindex:    5,
+			Registered: true,
+			Armed:      true,
+			Bound:      true,
+		}},
+	}
+	reqDone := make(chan struct{}, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		var req ControlRequest
+		if err := json.NewDecoder(conn).Decode(&req); err != nil {
+			return
+		}
+		if req.Type != "update_ha_state" {
+			return
+		}
+		_ = json.NewEncoder(conn).Encode(ControlResponse{
+			OK:     true,
+			Status: &status,
+		})
+		reqDone <- struct{}{}
+	}()
+
+	m := New()
+	m.proc = &exec.Cmd{Process: &os.Process{Pid: 1}}
+	m.cfg.ControlSocket = controlSock
+	m.clusterHA = true
+	m.inner.XDPEntryProg = "xdp_userspace_prog"
+	m.neighborsPrewarmed = true
+	m.xskLivenessProven = true
+	m.ctrlWasEnabled = true
+	m.haGroups = map[int]HAGroupStatus{
+		0: {RGID: 0, Active: true},
+		1: {RGID: 1, Active: false},
+		2: {RGID: 2, Active: true},
+	}
+
+	ctrlMap, _ := injectCtrlAndBindingMaps(t, m)
+	rgMap, err := ebpf.NewMap(&ebpf.MapSpec{
+		Type:       ebpf.Hash,
+		KeySize:    4,
+		ValueSize:  1,
+		MaxEntries: 16,
+	})
+	if err != nil {
+		t.Fatalf("new rg_active map: %v", err)
+	}
+	t.Cleanup(func() { rgMap.Close() })
+	injectInnerMap(t, m.inner, "rg_active", rgMap)
+
+	if err := m.UpdateRGActive(1, true); err != nil {
+		t.Fatalf("UpdateRGActive: %v", err)
+	}
+	select {
+	case <-reqDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for update_ha_state request")
+	}
+
+	var zero uint32
+	var ctrl userspaceCtrlValue
+	if err := ctrlMap.Lookup(zero, &ctrl); err != nil {
+		t.Fatalf("lookup userspace_ctrl: %v", err)
+	}
+	if ctrl.Enabled != 1 {
+		t.Fatalf("userspace_ctrl.Enabled = %d, want 1 after acked activation", ctrl.Enabled)
+	}
+	if m.mode != ModeUserspaceCompat {
+		t.Fatalf("mode = %s, want %s", m.mode, ModeUserspaceCompat)
+	}
+	if m.rgTransitionInFlight.Load() {
+		t.Fatal("rgTransitionInFlight = true after UpdateRGActive")
 	}
 }
 

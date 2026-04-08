@@ -2377,12 +2377,12 @@ fn poll_binding(
                         meta,
                         forwarding,
                     );
+                    let packet_fabric_ingress = ingress_zone_override.is_some()
+                        || ingress_is_fabric_overlay(forwarding, meta.ingress_ifindex as i32);
                     // Flag fabric-ingress packets so rewrite functions skip TTL
                     // decrement. The sending peer already decremented TTL when
                     // it forwarded the packet across the fabric link.
-                    if ingress_zone_override.is_some()
-                        || ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
-                    {
+                    if packet_fabric_ingress {
                         meta.meta_flags |= FABRIC_INGRESS_FLAG;
                     }
                     // Screen/IDS check — runs BEFORE session lookup.
@@ -2661,6 +2661,7 @@ fn poll_binding(
                             meta.protocol,
                             meta.tcp_flags,
                             meta.ingress_ifindex as i32,
+                            packet_fabric_ingress,
                             ha_startup_grace_until_secs,
                         ) {
                             counters.session_hits += 1;
@@ -2922,8 +2923,7 @@ fn poll_binding(
                                     )
                                 })
                             };
-                            let fabric_ingress =
-                                ingress_is_fabric(forwarding, meta.ingress_ifindex as i32);
+                            let fabric_ingress = packet_fabric_ingress;
                             let resolution = prefer_local_forward_candidate_for_fabric_ingress(
                                 forwarding,
                                 ha_state,
@@ -2957,6 +2957,7 @@ fn poll_binding(
                                 ha_state,
                                 now_secs,
                                 decision.resolution,
+                                packet_fabric_ingress,
                                 meta.ingress_ifindex as i32,
                                 from_zone_arc.as_ref(),
                                 ha_startup_grace_until_secs,
@@ -3620,7 +3621,7 @@ fn poll_binding(
                                 }
                             } else if decision.resolution.disposition
                                 == ForwardingDisposition::HAInactive
-                                && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
+                                && !packet_fabric_ingress
                             {
                                 // New flow to inactive RG: fabric-redirect to the peer
                                 // that owns the egress RG.  Use from_zone_arc directly
@@ -3654,7 +3655,7 @@ fn poll_binding(
                         // redirect when the egress RG is inactive.
                         let final_resolution = if non_flow_resolution.disposition
                             == ForwardingDisposition::HAInactive
-                            && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
+                            && !packet_fabric_ingress
                         {
                             resolve_fabric_redirect(forwarding).unwrap_or(non_flow_resolution)
                         } else {
@@ -3678,7 +3679,7 @@ fn poll_binding(
                     let egress_rg = owner_rg_for_resolution(forwarding, decision.resolution);
                     if decision.resolution.disposition == ForwardingDisposition::HAInactive
                         && egress_rg > 0
-                        && !ingress_is_fabric(forwarding, meta.ingress_ifindex as i32)
+                        && !packet_fabric_ingress
                     {
                         let zone_name = session_ingress_zone
                             .as_deref()
@@ -4169,7 +4170,7 @@ fn poll_binding(
                                         forwarding,
                                         &from_zone_arc,
                                         &to_zone_arc,
-                                        meta.ingress_ifindex as i32,
+                                        packet_fabric_ingress,
                                         pending_decision,
                                     );
                                     if sessions.install_with_protocol_with_origin(
@@ -4677,14 +4678,14 @@ fn build_missing_neighbor_session_metadata(
     forwarding: &ForwardingState,
     ingress_zone: &Arc<str>,
     egress_zone: &Arc<str>,
-    ingress_ifindex: i32,
+    fabric_ingress: bool,
     decision: SessionDecision,
 ) -> SessionMetadata {
     SessionMetadata {
         ingress_zone: ingress_zone.clone(),
         egress_zone: egress_zone.clone(),
         owner_rg_id: owner_rg_for_resolution(forwarding, decision.resolution),
-        fabric_ingress: ingress_is_fabric(forwarding, ingress_ifindex),
+        fabric_ingress,
         is_reverse: false,
         nat64_reverse: None,
     }
@@ -6241,7 +6242,7 @@ mod tests {
     }
 
     #[test]
-    fn synced_replica_entry_marks_replica_synced() {
+    fn synced_replica_entry_keeps_peer_synced_entries_promotable() {
         let entry = SyncedSessionEntry {
             key: SessionKey {
                 addr_family: libc::AF_INET as u8,
@@ -6275,6 +6276,48 @@ mod tests {
         };
         let replica = synced_replica_entry(&entry);
         assert!(replica.origin.is_peer_synced());
+        assert!(replica.origin.is_promotable_synced());
+        assert_eq!(replica.key, entry.key);
+        assert_eq!(replica.decision, entry.decision);
+    }
+
+    #[test]
+    fn synced_replica_entry_marks_local_entries_worker_local() {
+        let entry = SyncedSessionEntry {
+            key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 5201,
+            },
+            decision: SessionDecision {
+                resolution: lookup_forwarding_resolution(
+                    &build_forwarding_state(&nat_snapshot()),
+                    IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                ),
+                nat: NatDecision {
+                    rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                    ..NatDecision::default()
+                },
+            },
+            metadata: SessionMetadata {
+                ingress_zone: Arc::<str>::from("lan"),
+                egress_zone: Arc::<str>::from("wan"),
+                owner_rg_id: 1,
+                fabric_ingress: false,
+                is_reverse: false,
+                nat64_reverse: None,
+            },
+            origin: SessionOrigin::ForwardFlow,
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+        };
+        let replica = synced_replica_entry(&entry);
+        assert_eq!(replica.origin, SessionOrigin::WorkerLocalImport);
+        assert!(replica.origin.is_peer_synced());
+        assert!(!replica.origin.is_promotable_synced());
         assert_eq!(replica.key, entry.key);
         assert_eq!(replica.decision, entry.decision);
     }

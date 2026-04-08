@@ -439,31 +439,31 @@ mod tests {
 
     #[test]
     fn local_tunnel_io_error_is_fatal_for_permanent_tunnel_fd_errors() {
-        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
-            libc::EINVAL,
-        )));
-        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
-            libc::EBADF,
-        )));
-        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
-            libc::EBADFD,
-        )));
-        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
-            libc::ENODEV,
-        )));
-        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
-            libc::ENXIO,
-        )));
+        assert!(local_tunnel_io_error_is_fatal(
+            &io::Error::from_raw_os_error(libc::EINVAL,)
+        ));
+        assert!(local_tunnel_io_error_is_fatal(
+            &io::Error::from_raw_os_error(libc::EBADF,)
+        ));
+        assert!(local_tunnel_io_error_is_fatal(
+            &io::Error::from_raw_os_error(libc::EBADFD,)
+        ));
+        assert!(local_tunnel_io_error_is_fatal(
+            &io::Error::from_raw_os_error(libc::ENODEV,)
+        ));
+        assert!(local_tunnel_io_error_is_fatal(
+            &io::Error::from_raw_os_error(libc::ENXIO,)
+        ));
     }
 
     #[test]
     fn local_tunnel_io_error_is_not_fatal_for_retryable_io() {
-        assert!(!local_tunnel_io_error_is_fatal(
-            &io::Error::from(io::ErrorKind::WouldBlock),
-        ));
-        assert!(!local_tunnel_io_error_is_fatal(
-            &io::Error::from(io::ErrorKind::Interrupted),
-        ));
+        assert!(!local_tunnel_io_error_is_fatal(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        ),));
+        assert!(!local_tunnel_io_error_is_fatal(&io::Error::from(
+            io::ErrorKind::Interrupted
+        ),));
         assert!(!local_tunnel_io_error_is_fatal(
             &io::Error::from_raw_os_error(libc::ETIMEDOUT),
         ));

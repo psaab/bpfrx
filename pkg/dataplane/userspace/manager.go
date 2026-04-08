@@ -87,6 +87,7 @@ type Manager struct {
 	neighborsPrewarmed      bool
 	ctrlEnableAt            time.Time
 	ctrlWasEnabled          bool
+	initialCtrlCleanupDone  bool
 	ctrlDisabledAt          uint64    // monotonic ktime_ns when ctrl was last disabled
 	lastDemotionTime        time.Time // wall clock when last RG demotion occurred
 	xskLivenessFailed       bool
@@ -3003,10 +3004,11 @@ ctrlReady:
 	// SessionTable + shared_sessions) holds the authoritative synced
 	// sessions — BPF conntrack must be empty when ctrl re-enables.
 	// Only flush stale BPF sessions on the very first ctrl enable after
-	// daemon startup. During HA transitions, ctrl may briefly disable and
-	// re-enable (rgTransitionInFlight); flushing then destroys synced
-	// sessions that the peer just published, killing TCP streams (#475).
-	if ctrl.Enabled == 1 && !m.ctrlWasEnabled && m.publishedSnapshot <= 1 {
+	// daemon startup. Snapshot generation is not a reliable proxy for
+	// "startup" on long-lived HA nodes because a steady appliance can stay
+	// at generation 1 indefinitely; later ctrl re-enables during RG moves
+	// would then retrigger the startup flush and destroy synced sessions.
+	if ctrl.Enabled == 1 && !m.ctrlWasEnabled && !m.initialCtrlCleanupDone {
 		if usMap := m.inner.Map("userspace_sessions"); usMap != nil {
 			var key, nextKey []byte
 			key = make([]byte, usMap.KeySize())
@@ -3082,6 +3084,7 @@ ctrlReady:
 				}
 			}
 		}
+		m.initialCtrlCleanupDone = true
 	}
 	if ctrl.Enabled == 0 && m.ctrlWasEnabled {
 		m.ctrlDisabledAt = m.bpfKtimeNs()
@@ -4388,6 +4391,7 @@ func (m *Manager) stopLocked() {
 	m.ctrlEnableAt = time.Time{}
 	m.xskLivenessProven = false
 	m.xskLivenessFailed = false
+	m.initialCtrlCleanupDone = false
 	m.xskProbeStart = time.Time{}
 	m.lastXSKRX = 0
 	m.lastNAPIBootstrap = time.Time{}

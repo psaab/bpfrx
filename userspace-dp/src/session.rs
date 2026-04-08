@@ -160,6 +160,26 @@ impl SessionOrigin {
         )
     }
 
+    pub(crate) fn is_promotable_synced(self) -> bool {
+        matches!(self, Self::SyncImport | Self::SharedMaterialize)
+    }
+
+    pub(crate) fn worker_replica_origin(self) -> Self {
+        if self.is_promotable_synced() {
+            Self::SyncImport
+        } else {
+            Self::WorkerLocalImport
+        }
+    }
+
+    pub(crate) fn materialized_shared_hit_origin(self) -> Self {
+        if self.is_promotable_synced() {
+            Self::SharedMaterialize
+        } else {
+            Self::WorkerLocalImport
+        }
+    }
+
     pub(crate) fn is_transient_local_seed(self) -> bool {
         matches!(self, Self::MissingNeighborSeed)
     }

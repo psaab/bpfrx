@@ -440,6 +440,12 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	if err := m.requestLocked(req, &status); err != nil {
 		return err
 	}
+	if active {
+		// The helper has already acknowledged the RG activation update.
+		// Clear the transition guard before applying the returned status so
+		// the acked activation does not force one global ctrl-disabled cycle.
+		m.rgTransitionInFlight.Store(false)
+	}
 	m.lastRGActivateTime = time.Now()
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return err
