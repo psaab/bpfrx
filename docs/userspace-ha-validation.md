@@ -61,7 +61,8 @@ Perf-only compare workflow:
 Dedicated RG failover survivability workflow:
 
 ```bash
-./scripts/userspace-ha-failover-validation.sh
+TOTAL_CYCLES=12 CYCLE_INTERVAL=5 \
+./scripts/userspace-ha-failover-validation.sh --duration 600 --parallel 8
 ```
 
 Dedicated steady-state split-RG fabric workflow:
@@ -89,6 +90,14 @@ This is the required sequence after each userspace dataplane phase:
 For failover-specific HA/session work, also run the dedicated RG failover
 validator. The steady-state validator is not enough to prove that an existing
 TCP flow survives a manual RG ownership move.
+
+The standard failover stress shape is now:
+
+- a long-lived `iperf3` run, not a short smoke pass
+- `-P 8` so all stream lines stay visible during the move
+- rapid RG1 movement between `fw0` and `fw1` with `CYCLE_INTERVAL=5`
+- enough total cycles and duration to catch late failback wedges, not just the
+  first transition
 
 For fabric-path performance and stream-stability work, also run the failover
 validator in `--steady-only` mode with RG1 pinned to the peer owner. That
@@ -141,6 +150,20 @@ The dedicated RG failover validator now adds two stricter HA gates:
    - aggregate `[SUM]` output
    - individual `iperf3` streams
 
+For standard HA failover stress on `loss`, use:
+
+- `TOTAL_CYCLES=12`
+- `CYCLE_INTERVAL=5`
+- `--duration 600`
+- `--parallel 8`
+
+That is the preferred repro shape for the remaining "first failover degrades,
+failback wedges one stream" class because it exercises:
+
+- longer-lived inherited flows
+- repeated ownership changes in both directions
+- per-stream survival, not just aggregate throughput
+
 This matters because a split-RG fabric-path bug can kill streams before the
 first failover. That must fail as a fabric regression, not be misclassified as
 a failover-survivability regression.
@@ -176,6 +199,10 @@ tree state.
 The validator now treats interval collapse as a separate failure mode from average
 Gbps. A run that peaks high and then drops near zero is a failure even if the short
 overall average still looks superficially acceptable.
+
+For the dedicated failover workflow, the operator should watch all eight stream
+lines, not only the `[SUM]` line. A run is still a failure if aggregate traffic
+recovers but one stream remains pinned at `0.00 bits/sec` after failback.
 
 The validator also treats traceroute visibility as a standard correctness gate.
 It does not require every internet hop to answer. It does require:
