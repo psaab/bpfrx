@@ -775,10 +775,9 @@ impl SessionTable {
             let Some(entry) = self.sessions.get_mut(&key) else {
                 continue;
             };
-            if entry.origin.is_peer_synced() {
-                continue;
+            if !entry.origin.is_peer_synced() {
+                entry.origin = SessionOrigin::SyncImport;
             }
-            entry.origin = SessionOrigin::SyncImport;
             demoted_keys.push(key);
         }
         demoted_keys
@@ -1591,6 +1590,30 @@ mod tests {
                 .metadata,
             metadata_other
         );
+    }
+
+    #[test]
+    fn demote_owner_rg_returns_synced_entries_for_transition_refresh() {
+        let mut table = SessionTable::new();
+        let now = 1_000_000_000u64;
+        let key = key_v4();
+        let mut metadata = metadata();
+        metadata.owner_rg_id = 2;
+        assert!(table.install_with_protocol_with_origin(
+            key.clone(),
+            decision(),
+            metadata.clone(),
+            SessionOrigin::SyncImport,
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+
+        let demoted = table.demote_owner_rg(2);
+        assert_eq!(demoted, vec![key.clone()]);
+
+        let (_, _, origin) = table.entry_with_origin(&key).expect("session exists");
+        assert_eq!(origin, SessionOrigin::SyncImport);
     }
 
     #[test]

@@ -3284,6 +3284,77 @@ mod tests {
     }
 
     #[test]
+    fn apply_worker_commands_demote_split_reverse_owner_rg_rewrites_to_fabric_redirect() {
+        let commands = Arc::new(Mutex::new(VecDeque::from([
+            WorkerCommand::DemoteOwnerRGS { owner_rgs: vec![2] },
+        ])));
+        let mut sessions = SessionTable::new();
+        let forward_key = test_key();
+        let reverse_key = reverse_session_key(&forward_key, test_decision().nat);
+        let now_ns = monotonic_nanos();
+
+        assert!(sessions.install_with_protocol_with_origin(
+            reverse_key.clone(),
+            SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::ForwardCandidate,
+                    local_ifindex: 0,
+                    egress_ifindex: 6,
+                    tx_ifindex: 6,
+                    tunnel_endpoint_id: 0,
+                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                    neighbor_mac: Some([0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]),
+                    src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x61, 0x01]),
+                    tx_vlan_id: 0,
+                },
+                nat: test_decision().nat.reverse(
+                    forward_key.src_ip,
+                    forward_key.dst_ip,
+                    forward_key.src_port,
+                    forward_key.dst_port,
+                ),
+            },
+            SessionMetadata {
+                ingress_zone: Arc::<str>::from("wan"),
+                egress_zone: Arc::<str>::from("lan"),
+                owner_rg_id: 2,
+                fabric_ingress: false,
+                is_reverse: true,
+                nat64_reverse: None,
+            },
+            SessionOrigin::SyncImport,
+            now_ns,
+            PROTO_TCP,
+            0x10,
+        ));
+
+        let ha_state = BTreeMap::from([(2, inactive_ha_runtime(now_ns / 1_000_000_000))]);
+        let results = apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &test_forwarding_state_split_rgs(),
+            &ha_state,
+            &Arc::new(Mutex::new(FastMap::default())),
+        );
+
+        assert_eq!(results.cancelled_keys, vec![reverse_key.clone()]);
+        let (lookup, origin) = sessions
+            .lookup_with_origin(&reverse_key, now_ns, 0x10)
+            .expect("demoted reverse session");
+        assert!(origin.is_peer_synced());
+        assert_eq!(
+            lookup.decision.resolution.disposition,
+            ForwardingDisposition::FabricRedirect
+        );
+        assert_eq!(lookup.decision.resolution.egress_ifindex, 21);
+        assert_eq!(lookup.metadata.owner_rg_id, 2);
+        assert!(lookup.metadata.is_reverse);
+    }
+
+    #[test]
     fn export_owner_rg_sessions_skips_locally_demoted_entries() {
         let commands = Arc::new(Mutex::new(VecDeque::from([
             WorkerCommand::DemoteOwnerRGS { owner_rgs: vec![1] },
