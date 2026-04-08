@@ -36,7 +36,7 @@ pub(super) fn demote_shared_owner_rgs(
 
 pub(super) fn synced_replica_entry(entry: &SyncedSessionEntry) -> SyncedSessionEntry {
     let mut replica = entry.clone();
-    replica.origin = SessionOrigin::SyncImport;
+    replica.origin = entry.origin.worker_replica_origin();
     replica
 }
 

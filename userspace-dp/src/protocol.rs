@@ -731,7 +731,11 @@ pub(crate) struct HAGroupStatus {
     pub watchdog_timestamp: u64,
     #[serde(rename = "forwarding_active", default)]
     pub forwarding_active: bool,
-    #[serde(rename = "lease_state", default, skip_serializing_if = "String::is_empty")]
+    #[serde(
+        rename = "lease_state",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
     pub lease_state: String,
     #[serde(rename = "lease_until", default, skip_serializing_if = "u64_is_zero")]
     pub lease_until: u64,

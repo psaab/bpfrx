@@ -186,6 +186,16 @@ pub(super) fn ingress_is_fabric(forwarding: &ForwardingState, ingress_ifindex: i
     })
 }
 
+pub(super) fn ingress_is_fabric_overlay(
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+) -> bool {
+    forwarding
+        .fabrics
+        .iter()
+        .any(|fabric| fabric.overlay_ifindex == ingress_ifindex)
+}
+
 pub(super) fn resolve_fabric_links_from_snapshots(
     snapshots: &[crate::FabricSnapshot],
     egress: &FastMap<i32, EgressInterface>,
@@ -475,21 +485,26 @@ pub(super) fn finalize_new_flow_ha_resolution(
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     now_secs: u64,
     resolution: ForwardingResolution,
+    fabric_ingress: bool,
     ingress_ifindex: i32,
     ingress_zone: &str,
     ha_startup_grace_until_secs: u64,
 ) -> ForwardingResolution {
+    let enforced = super::session_glue::enforce_session_ha_resolution(
+        forwarding,
+        ha_state,
+        now_secs,
+        resolution,
+        ingress_ifindex,
+        ha_startup_grace_until_secs,
+    );
+    if fabric_ingress && enforced.disposition == ForwardingDisposition::HAInactive {
+        return resolution;
+    }
     super::session_glue::redirect_session_via_fabric_if_needed(
         forwarding,
-        super::session_glue::enforce_session_ha_resolution(
-            forwarding,
-            ha_state,
-            now_secs,
-            resolution,
-            ingress_ifindex,
-            ha_startup_grace_until_secs,
-        ),
-        ingress_ifindex,
+        enforced,
+        fabric_ingress,
         ingress_zone,
     )
 }
@@ -2044,13 +2059,7 @@ mod tests {
         let routed = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         let (from_zone, _) = zone_pair_for_flow(&state, 24, routed.egress_ifindex);
         let redirected = finalize_new_flow_ha_resolution(
-            &state,
-            &ha_state,
-            now_secs,
-            routed,
-            24,
-            &from_zone,
-            0,
+            &state, &ha_state, now_secs, routed, false, 24, &from_zone, 0,
         );
         assert_eq!(
             redirected.disposition,
@@ -2069,13 +2078,7 @@ mod tests {
         let ha_state = BTreeMap::from([(1, inactive_ha_runtime(now_secs))]);
         let routed = lookup_forwarding_resolution(&state, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
         let resolved = finalize_new_flow_ha_resolution(
-            &state,
-            &ha_state,
-            now_secs,
-            routed,
-            21,
-            "lan",
-            0,
+            &state, &ha_state, now_secs, routed, true, 21, "lan", 0,
         );
         assert_eq!(
             resolved.disposition,
@@ -2317,7 +2320,7 @@ mod tests {
             &state,
             &ingress_zone,
             &egress_zone,
-            4,
+            true,
             decision,
         );
 
