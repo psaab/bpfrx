@@ -7,8 +7,9 @@ import (
 
 func TestMarshalUnmarshalHeartbeat(t *testing.T) {
 	pkt := &HeartbeatPacket{
-		NodeID:    1,
-		ClusterID: 42,
+		NodeID:          1,
+		ClusterID:       42,
+		SoftwareVersion: "bpfrx-test-1",
 		Groups: []HeartbeatGroup{
 			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
 			{GroupID: 1, Priority: 150, Weight: 100, State: uint8(StateSecondary)},
@@ -41,6 +42,9 @@ func TestMarshalUnmarshalHeartbeat(t *testing.T) {
 	}
 	if got.Groups[1].State != uint8(StateSecondary) {
 		t.Errorf("group 1 state = %d, want %d", got.Groups[1].State, StateSecondary)
+	}
+	if got.SoftwareVersion != "bpfrx-test-1" {
+		t.Errorf("software version = %q, want bpfrx-test-1", got.SoftwareVersion)
 	}
 }
 
@@ -120,6 +124,7 @@ func TestMarshalHeartbeat_Size(t *testing.T) {
 
 func TestHandlePeerHeartbeat(t *testing.T) {
 	m := NewManager(0, 1)
+	m.SetSoftwareVersion("local-test")
 	cfg := makeConfig(
 		makeRG(0, true, map[int]int{0: 200, 1: 100}),
 	)
@@ -129,8 +134,9 @@ func TestHandlePeerHeartbeat(t *testing.T) {
 
 	// Simulate peer heartbeat.
 	pkt := &HeartbeatPacket{
-		NodeID:    1,
-		ClusterID: 1,
+		NodeID:          1,
+		ClusterID:       1,
+		SoftwareVersion: "peer-test",
 		Groups: []HeartbeatGroup{
 			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StateSecondary)},
 		},
@@ -149,6 +155,9 @@ func TestHandlePeerHeartbeat(t *testing.T) {
 		t.Error("peer group 0 not found")
 	} else if pg.Priority != 100 {
 		t.Errorf("peer group 0 priority = %d, want 100", pg.Priority)
+	}
+	if mismatch, local, peer := m.SoftwareVersionMismatch(); !mismatch || local != "local-test" || peer != "peer-test" {
+		t.Fatalf("software mismatch = %v local=%q peer=%q, want true/local-test/peer-test", mismatch, local, peer)
 	}
 }
 
@@ -261,6 +270,9 @@ func TestMarshalUnmarshalHeartbeat_NoMonitors_BackwardsCompat(t *testing.T) {
 	}
 	if len(got2.Groups) != 1 {
 		t.Errorf("groups from old format = %d, want 1", len(got2.Groups))
+	}
+	if got2.SoftwareVersion != "" {
+		t.Errorf("software version from old format = %q, want empty", got2.SoftwareVersion)
 	}
 }
 

@@ -53,10 +53,11 @@ const (
 //	    [3] NameLen
 //	    [4..4+NameLen] Interface name
 type HeartbeatPacket struct {
-	NodeID    uint8
-	ClusterID uint16
-	Groups    []HeartbeatGroup
-	Monitors  []HeartbeatMonitor
+	NodeID          uint8
+	ClusterID       uint16
+	Groups          []HeartbeatGroup
+	Monitors        []HeartbeatMonitor
+	SoftwareVersion string
 }
 
 // HeartbeatGroup is a per-RG entry in the heartbeat.
@@ -80,6 +81,8 @@ const heartbeatHeaderSize = 9
 
 // heartbeatGroupSize is GroupID(1) + Priority(2) + Weight(1) + State(1).
 const heartbeatGroupSize = 5
+
+const maxHeartbeatSoftwareVersionSize = 255
 
 // MarshalHeartbeat encodes a heartbeat packet to wire format.
 // The output is capped at maxHeartbeatSize. RG group entries are always
@@ -128,6 +131,18 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 		numMon++
 	}
 	buf[monCountOff] = uint8(numMon)
+	if pkt.SoftwareVersion != "" {
+		version := []byte(pkt.SoftwareVersion)
+		if len(version) > maxHeartbeatSoftwareVersionSize {
+			version = version[:maxHeartbeatSoftwareVersionSize]
+		}
+		if off+1+len(version) <= maxHeartbeatSize {
+			buf[off] = uint8(len(version))
+			off++
+			copy(buf[off:off+len(version)], version)
+			off += len(version)
+		}
+	}
 	return buf[:off]
 }
 
@@ -194,6 +209,13 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 				Up:        up,
 				Interface: name,
 			})
+		}
+	}
+	if off < len(data) {
+		versionLen := int(data[off])
+		off++
+		if off+versionLen <= len(data) {
+			pkt.SoftwareVersion = string(data[off : off+versionLen])
 		}
 	}
 

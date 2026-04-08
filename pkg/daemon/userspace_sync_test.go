@@ -174,6 +174,27 @@ func TestUserspaceTransferReadinessDisconnected(t *testing.T) {
 	}
 }
 
+type fakeUserspaceSoftwareVersionMismatchProvider struct {
+	mismatch bool
+	local    string
+	peer     string
+}
+
+func (f fakeUserspaceSoftwareVersionMismatchProvider) SoftwareVersionMismatch() (bool, string, string) {
+	return f.mismatch, f.local, f.peer
+}
+
+func TestUserspaceSoftwareVersionMismatchReason(t *testing.T) {
+	reasons := userspaceSoftwareVersionMismatchReason(fakeUserspaceSoftwareVersionMismatchProvider{
+		mismatch: true,
+		local:    "local-build",
+		peer:     "peer-build",
+	})
+	if len(reasons) != 1 || reasons[0] != "software version mismatch local=local-build peer=peer-build" {
+		t.Fatalf("unexpected reasons: %v", reasons)
+	}
+}
+
 func TestUserspaceSessionFromDeltaV4CarriesTunnelEndpointMetadata(t *testing.T) {
 	zoneIDs := map[string]uint16{"lan": 1, "sfmix": 2}
 	delta := dpuserspace.SessionDeltaInfo{

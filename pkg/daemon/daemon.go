@@ -394,6 +394,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
 		cc := cfg.Chassis.Cluster
 		d.cluster = cluster.NewManager(cc.NodeID, cc.ClusterID)
+		d.cluster.SetSoftwareVersion(d.opts.Version)
 		d.cluster.UpdateConfig(cc)
 		d.cluster.Start(ctx)
 		// Wire event-drop callback: on dropped cluster events, trigger
