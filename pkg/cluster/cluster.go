@@ -1098,6 +1098,12 @@ func (m *Manager) FinalizePeerTransferOut(rgID int) error {
 	rg.ManualFailover = false
 	rg.ManualFailoverAt = time.Time{}
 	rg.State = StateSecondary
+	// A completed transfer-out invalidates any stale inbound-transfer view
+	// from the previous owner direction. If we keep forcing the peer into
+	// secondary-hold here, the next heartbeat can immediately re-elect the
+	// old owner during rapid failback/failover sequences.
+	delete(m.peerTransferOutOverride, rgID)
+	delete(m.peerTransferCommitGraceUntil, rgID)
 	m.localTransferOutHoldUntil[rgID] = time.Now().Add(m.transferCommitGracePeriodLocked())
 	if oldState != rg.State {
 		m.sendEvent(rg.GroupID, oldState, rg.State, "Peer transfer committed")

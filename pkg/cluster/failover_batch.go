@@ -356,6 +356,12 @@ func (m *Manager) FinalizePeerTransferOutBatch(rgIDs []int) error {
 		rg.ManualFailover = false
 		rg.ManualFailoverAt = time.Time{}
 		rg.State = StateSecondary
+		// Clear stale inbound-transfer markers from the previous direction
+		// before we park this node as the old owner. Otherwise the next peer
+		// heartbeat can still force the peer into secondary-hold and snap the
+		// RG back during rapid alternating moves.
+		delete(m.peerTransferOutOverride, rgID)
+		delete(m.peerTransferCommitGraceUntil, rgID)
 		m.localTransferOutHoldUntil[rgID] = time.Now().Add(m.transferCommitGracePeriodLocked())
 		if oldState != rg.State {
 			m.sendEvent(rg.GroupID, oldState, rg.State, "Peer transfer committed batch")

@@ -1107,6 +1107,109 @@ func TestHandlePeerTimeoutSuppressedDuringRecentTransferCommitGrace(t *testing.T
 	}
 }
 
+func TestFinalizePeerTransferOutClearsStaleInboundTransferGrace(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+	m.mu.Lock()
+	m.groups[0].Ready = true
+	m.groups[0].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+	m.groups[0].ReadinessReasons = nil
+	m.mu.Unlock()
+
+	if err := m.commitRequestedPeerFailover(0, 77); err != nil {
+		t.Fatalf("commitRequestedPeerFailover() error = %v", err)
+	}
+	m.notePeerTransferCommitted(0)
+	if !m.IsLocalPrimary(0) {
+		t.Fatal("should be primary after local transfer commit")
+	}
+
+	if err := m.ManualFailover(0); err != nil {
+		t.Fatalf("ManualFailover() error = %v", err)
+	}
+	if err := m.FinalizePeerTransferOut(0); err != nil {
+		t.Fatalf("FinalizePeerTransferOut() error = %v", err)
+	}
+	if m.IsLocalPrimary(0) {
+		t.Fatal("should be secondary after peer transfer commit")
+	}
+
+	m.handlePeerHeartbeat(pkt)
+	if m.IsLocalPrimary(0) {
+		t.Fatal("stale inbound transfer grace should not re-promote the old primary after direction change")
+	}
+	if peer := m.PeerGroupStates()[0]; peer.State != StatePrimary {
+		t.Fatalf("peer state = %s, want primary after direction change heartbeat", peer.State)
+	}
+}
+
+func TestFinalizePeerTransferOutBatchClearsStaleInboundTransferGrace(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(1, true, map[int]int{0: 100}),
+		makeRG(2, true, map[int]int{0: 100}),
+	)
+	m.UpdateConfig(cfg)
+	<-m.Events()
+	<-m.Events()
+
+	pkt := &HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 1, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+			{GroupID: 2, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	}
+	m.handlePeerHeartbeat(pkt)
+	m.mu.Lock()
+	for _, rgID := range []int{1, 2} {
+		m.groups[rgID].Ready = true
+		m.groups[rgID].ReadySince = time.Now().Add(-m.takeoverHoldTime - time.Second)
+		m.groups[rgID].ReadinessReasons = nil
+	}
+	m.mu.Unlock()
+
+	if err := m.commitRequestedPeerFailoverBatch([]int{1, 2}, 88); err != nil {
+		t.Fatalf("commitRequestedPeerFailoverBatch() error = %v", err)
+	}
+	m.notePeerTransferCommittedBatch([]int{1, 2})
+	if !m.IsLocalPrimary(1) || !m.IsLocalPrimary(2) {
+		t.Fatal("both redundancy groups should be primary after local batch transfer commit")
+	}
+
+	if err := m.ManualFailoverBatch([]int{1, 2}); err != nil {
+		t.Fatalf("ManualFailoverBatch() error = %v", err)
+	}
+	if err := m.FinalizePeerTransferOutBatch([]int{1, 2}); err != nil {
+		t.Fatalf("FinalizePeerTransferOutBatch() error = %v", err)
+	}
+	if m.IsLocalPrimary(1) || m.IsLocalPrimary(2) {
+		t.Fatal("both redundancy groups should be secondary after peer batch transfer commit")
+	}
+
+	m.handlePeerHeartbeat(pkt)
+	if m.IsLocalPrimary(1) || m.IsLocalPrimary(2) {
+		t.Fatal("stale inbound batch transfer grace should not re-promote the old primary after direction change")
+	}
+	for _, rgID := range []int{1, 2} {
+		if peer := m.PeerGroupStates()[rgID]; peer.State != StatePrimary {
+			t.Fatalf("peer state for rg %d = %s, want primary after direction change heartbeat", rgID, peer.State)
+		}
+	}
+}
+
 func TestFormatStatusShowsSeparateTransferReadiness(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
