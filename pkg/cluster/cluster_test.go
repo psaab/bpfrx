@@ -1066,6 +1066,26 @@ func TestFormatStatusShowsSoftwareVersions(t *testing.T) {
 	}
 }
 
+func TestFormatInformationShowsUnknownPeerSoftwareVersion(t *testing.T) {
+	m := NewManager(0, 1)
+	m.SetSoftwareVersion("local-build")
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+
+	out := m.FormatInformation()
+	if !strings.Contains(out, "Peer software version: unknown") {
+		t.Fatalf("information missing unknown peer software version: %s", out)
+	}
+}
+
 func TestResetFailover(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200}))

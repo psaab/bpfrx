@@ -1718,7 +1718,10 @@ func (m *Manager) FormatInformation() string {
 	if localVersion != "" {
 		fmt.Fprintf(&b, "  Software version: %s\n", localVersion)
 	}
-	if peerAlive && peerVersion != "" {
+	if peerAlive {
+		if peerVersion == "" {
+			peerVersion = "unknown"
+		}
 		fmt.Fprintf(&b, "  Peer software version: %s\n", peerVersion)
 	}
 	fmt.Fprintf(&b, "  Sync transport: %s\n", m.SyncTransport())

@@ -831,7 +831,7 @@ func userspaceSoftwareVersionMismatchReason(provider userspaceSoftwareVersionMis
 		return nil
 	}
 	if mismatch, local, peer := provider.SoftwareVersionMismatch(); mismatch {
-		return []string{fmt.Sprintf("software version mismatch local=%s peer=%s", local, peer)}
+		return []string{fmt.Sprintf("software version mismatch local=%q peer=%q", local, peer)}
 	}
 	return nil
 }

@@ -187,10 +187,10 @@ func (f fakeUserspaceSoftwareVersionMismatchProvider) SoftwareVersionMismatch() 
 func TestUserspaceSoftwareVersionMismatchReason(t *testing.T) {
 	reasons := userspaceSoftwareVersionMismatchReason(fakeUserspaceSoftwareVersionMismatchProvider{
 		mismatch: true,
-		local:    "local-build",
-		peer:     "peer-build",
+		local:    "local build",
+		peer:     "peer build",
 	})
-	if len(reasons) != 1 || reasons[0] != "software version mismatch local=local-build peer=peer-build" {
+	if len(reasons) != 1 || reasons[0] != `software version mismatch local="local build" peer="peer build"` {
 		t.Fatalf("unexpected reasons: %v", reasons)
 	}
 }

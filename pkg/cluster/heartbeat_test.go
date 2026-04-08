@@ -278,8 +278,9 @@ func TestMarshalUnmarshalHeartbeat_NoMonitors_BackwardsCompat(t *testing.T) {
 
 func TestUnmarshalHeartbeat_TruncatedMonitor(t *testing.T) {
 	pkt := &HeartbeatPacket{
-		NodeID:    0,
-		ClusterID: 1,
+		NodeID:          0,
+		ClusterID:       1,
+		SoftwareVersion: "peer-build",
 		Groups: []HeartbeatGroup{
 			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
 		},
@@ -311,6 +312,9 @@ func TestUnmarshalHeartbeat_TruncatedMonitor(t *testing.T) {
 	if len(got.Monitors) > 0 && got.Monitors[0].Interface != "ge-0/0/0" {
 		t.Errorf("monitor 0 interface = %q, want ge-0/0/0", got.Monitors[0].Interface)
 	}
+	if got.SoftwareVersion != "" {
+		t.Errorf("software version = %q, want empty after truncated monitor section", got.SoftwareVersion)
+	}
 }
 
 func TestUnmarshalHeartbeat_TruncatedMonitorName(t *testing.T) {
@@ -337,8 +341,9 @@ func TestMarshalHeartbeat_LargeMonitorPayload_RGPreserved(t *testing.T) {
 	// Build a packet with many monitors that would exceed the old 512-byte
 	// limit. RG group state must always be preserved.
 	pkt := &HeartbeatPacket{
-		NodeID:    0,
-		ClusterID: 1,
+		NodeID:          0,
+		ClusterID:       1,
+		SoftwareVersion: "peer-build",
 		Groups: []HeartbeatGroup{
 			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
 			{GroupID: 1, Priority: 150, Weight: 100, State: uint8(StateSecondary)},
@@ -358,10 +363,12 @@ func TestMarshalHeartbeat_LargeMonitorPayload_RGPreserved(t *testing.T) {
 	if len(data) > maxHeartbeatSize {
 		t.Fatalf("marshal produced %d bytes, exceeds maxHeartbeatSize %d", len(data), maxHeartbeatSize)
 	}
-
 	got, err := UnmarshalHeartbeat(data)
 	if err != nil {
 		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.SoftwareVersion != "peer-build" {
+		t.Fatalf("software version = %q, want peer-build", got.SoftwareVersion)
 	}
 
 	// RG groups must be intact.
