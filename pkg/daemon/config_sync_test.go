@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/psaab/bpfrx/pkg/cluster"
 	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/bpfrx/pkg/configstore"
 )
 
 // newClusterManager creates a cluster.Manager where node 0 is primary or
@@ -70,6 +72,34 @@ func TestHandleConfigSync_AcceptsWhenNoCluster(t *testing.T) {
 		}
 	}()
 	d.handleConfigSync("set system host-name standalone")
+}
+
+func TestHandleConfigSync_SkipsWhenConfigAlreadyMatchesActive(t *testing.T) {
+	store := configstore.New(filepath.Join(t.TempDir(), "config"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	if err := store.SetFromInput("system host-name sync-test"); err != nil {
+		t.Fatalf("SetFromInput: %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	active := store.ShowActive()
+
+	d := &Daemon{
+		cluster: newClusterManager(false),
+		store:   store,
+	}
+
+	d.handleConfigSync(active + "\n")
+
+	if got := store.ShowActive(); got != active {
+		t.Fatalf("active config changed on identical sync:\nwant:\n%s\n\ngot:\n%s", active, got)
+	}
+	if got := store.ActiveConfig(); got == nil || got.System.HostName != "sync-test" {
+		t.Fatalf("expected unchanged compiled config, got %#v", got)
+	}
 }
 
 // TestOnPeerConnected_PrimaryPushesConfig verifies that an RG0 primary with

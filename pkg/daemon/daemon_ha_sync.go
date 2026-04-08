@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -326,6 +327,15 @@ func (d *Daemon) handleConfigSync(configText string) {
 	if d.cluster != nil && d.cluster.IsLocalPrimary(0) {
 		slog.Warn("cluster: rejecting config sync (this node is RG0 primary)")
 		return
+	}
+	if d.store != nil {
+		activeText := strings.TrimSpace(d.store.ShowActive())
+		incomingText := strings.TrimSpace(configText)
+		if activeText == incomingText {
+			slog.Info("cluster: skipping config sync apply (config already matches active)",
+				"size", len(configText))
+			return
+		}
 	}
 	slog.Info("cluster: accepting config sync from peer", "size", len(configText))
 
