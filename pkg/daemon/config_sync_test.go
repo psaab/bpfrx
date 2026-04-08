@@ -86,6 +86,7 @@ func TestHandleConfigSync_SkipsWhenConfigAlreadyMatchesActive(t *testing.T) {
 		t.Fatalf("Commit: %v", err)
 	}
 	active := store.ShowActive()
+	historyLen := len(store.ListHistory())
 
 	d := &Daemon{
 		cluster: newClusterManager(false),
@@ -99,6 +100,9 @@ func TestHandleConfigSync_SkipsWhenConfigAlreadyMatchesActive(t *testing.T) {
 	}
 	if got := store.ActiveConfig(); got == nil || got.System.HostName != "sync-test" {
 		t.Fatalf("expected unchanged compiled config, got %#v", got)
+	}
+	if got := len(store.ListHistory()); got != historyLen {
+		t.Fatalf("expected identical config sync to skip history mutation, want %d entries got %d", historyLen, got)
 	}
 }
 
