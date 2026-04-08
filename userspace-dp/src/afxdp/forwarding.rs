@@ -476,11 +476,24 @@ pub(super) fn cached_flow_decision_valid(
     ha_state: &BTreeMap<i32, HAGroupRuntime>,
     dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     now_secs: u64,
+    cached_owner_rg_id: i32,
     fabric_ingress: bool,
     target_ip: IpAddr,
     resolution: ForwardingResolution,
 ) -> bool {
     if enforce_ha_resolution_snapshot(forwarding, ha_state, now_secs, resolution) != resolution {
+        return false;
+    }
+    // RG-stamped redirect hits are the common split-RG cache case. Once the
+    // cached owner RG becomes locally active again, invalidate immediately and
+    // let the slow path recompute the current local/fabric decision instead of
+    // taking a neighbor-map lock on every cache hit.
+    if cached_owner_rg_id > 0
+        && ha_state
+            .get(&cached_owner_rg_id)
+            .is_some_and(|group| group.is_forwarding_active(now_secs))
+        && (resolution.disposition == ForwardingDisposition::FabricRedirect || fabric_ingress)
+    {
         return false;
     }
     if resolution.disposition == ForwardingDisposition::FabricRedirect {
@@ -1729,6 +1742,7 @@ mod tests {
             &active,
             &dynamic_neighbors,
             now_secs,
+            1,
             false,
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             resolution
@@ -1738,6 +1752,7 @@ mod tests {
             &demoted,
             &dynamic_neighbors,
             now_secs,
+            1,
             false,
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             resolution
@@ -1758,6 +1773,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             now_secs,
+            1,
             true,
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             resolution
@@ -1778,6 +1794,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             now_secs,
+            1,
             false,
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             resolution
@@ -1797,6 +1814,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             now_secs,
+            1,
             true,
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             resolution
@@ -1817,6 +1835,7 @@ mod tests {
             &ha_state,
             &dynamic_neighbors,
             now_secs,
+            1,
             false,
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             resolution

@@ -364,32 +364,37 @@ pub(super) fn apply_worker_commands(
                             ),
                             ..decision
                         };
-                        if refreshed_decision.resolution.disposition
+                        let rewrote_session = refreshed_decision.resolution.disposition
                             != ForwardingDisposition::HAInactive
-                        {
-                            let _ = sessions.refresh_for_ha_transition(
+                            && sessions.refresh_for_ha_transition(
                                 &demoted_key,
                                 refreshed_decision,
                                 metadata.clone(),
                                 now_ns,
                             );
-                        }
                         let Some((decision, metadata, origin)) =
                             sessions.entry_with_origin(&demoted_key)
                         else {
                             continue;
                         };
+                        let owner_rg_id = metadata.owner_rg_id;
+                        let publish_decision = if rewrote_session {
+                            decision
+                        } else {
+                            refreshed_decision
+                        };
+                        let publish_metadata = if rewrote_session {
+                            metadata
+                        } else {
+                            metadata.clone()
+                        };
                         publish_worker_session_map_entry(
                             session_map_fd,
                             &demoted_key,
-                            decision,
-                            &metadata,
+                            publish_decision,
+                            &publish_metadata,
                             origin,
-                            synced_entry_allows_local_replace(
-                                ha_state,
-                                metadata.owner_rg_id,
-                                now_secs,
-                            ),
+                            synced_entry_allows_local_replace(ha_state, owner_rg_id, now_secs),
                         );
                         if !cancelled_keys.iter().any(|key| key == &demoted_key) {
                             cancelled_keys.push(demoted_key);

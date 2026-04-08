@@ -2477,6 +2477,7 @@ fn poll_binding(
                                 ha_state,
                                 dynamic_neighbors,
                                 now_secs,
+                                cached.stamp.owner_rg_id,
                                 packet_fabric_ingress,
                                 resolution_target_for_session(flow, cached.decision),
                                 cached.decision.resolution,
