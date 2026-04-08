@@ -822,7 +822,26 @@ func userspaceManualFailoverTransferReadinessError(state cluster.TransferReadine
 	return nil
 }
 
+type userspaceSoftwareVersionMismatchProvider interface {
+	SoftwareVersionMismatch() (bool, string, string)
+}
+
+func userspaceSoftwareVersionMismatchReason(provider userspaceSoftwareVersionMismatchProvider) []string {
+	if provider == nil {
+		return nil
+	}
+	if mismatch, local, peer := provider.SoftwareVersionMismatch(); mismatch {
+		return []string{fmt.Sprintf("software version mismatch local=%q peer=%q", local, peer)}
+	}
+	return nil
+}
+
 func (d *Daemon) userspaceTransferReadiness(rgID int) (bool, []string) {
+	if d.cluster != nil {
+		if reasons := userspaceSoftwareVersionMismatchReason(d.cluster); len(reasons) > 0 {
+			return false, reasons
+		}
+	}
 	if d.sessionSync == nil || !d.sessionSync.IsConnected() || !d.sessionSync.PeerHealthy() || !d.syncPeerConnected.Load() {
 		return false, []string{"session sync disconnected"}
 	}

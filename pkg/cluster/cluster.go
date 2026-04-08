@@ -123,6 +123,9 @@ type Manager struct {
 	peerEverSeen bool // true once first heartbeat received; distinguishes "never heard" from "lost"
 	peerNodeID   int
 	peerGroups   map[int]PeerGroupState
+	// Optional software version metadata advertised via heartbeat.
+	localSoftwareVersion string
+	peerSoftwareVersion  string
 	// peerTransferOutOverride preserves an explicitly acknowledged peer
 	// transfer-out across heartbeat refreshes until the transfer is either
 	// committed or aborted locally.
@@ -380,6 +383,33 @@ func (m *Manager) PeerGroupStates() map[int]PeerGroupState {
 		cp[k] = v
 	}
 	return cp
+}
+
+// SetSoftwareVersion records the local software version advertised to the peer.
+func (m *Manager) SetSoftwareVersion(version string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(version) > maxHeartbeatSoftwareVersionSize {
+		version = version[:maxHeartbeatSoftwareVersionSize]
+	}
+	m.localSoftwareVersion = version
+}
+
+// SoftwareVersions returns the currently known local and peer software versions.
+func (m *Manager) SoftwareVersions() (local, peer string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.localSoftwareVersion, m.peerSoftwareVersion
+}
+
+// SoftwareVersionMismatch reports whether both sides advertised different versions.
+func (m *Manager) SoftwareVersionMismatch() (bool, string, string) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.localSoftwareVersion == "" || m.peerSoftwareVersion == "" {
+		return false, m.localSoftwareVersion, m.peerSoftwareVersion
+	}
+	return m.localSoftwareVersion != m.peerSoftwareVersion, m.localSoftwareVersion, m.peerSoftwareVersion
 }
 
 // PeerMonitorStatuses returns the peer's interface monitor states from heartbeat.
@@ -1289,8 +1319,9 @@ func (m *Manager) buildHeartbeat() *HeartbeatPacket {
 	defer m.mu.RUnlock()
 
 	pkt := &HeartbeatPacket{
-		NodeID:    uint8(m.nodeID),
-		ClusterID: uint16(m.clusterID),
+		NodeID:          uint8(m.nodeID),
+		ClusterID:       uint16(m.clusterID),
+		SoftwareVersion: m.localSoftwareVersion,
 	}
 	for _, rg := range m.groups {
 		pkt.Groups = append(pkt.Groups, HeartbeatGroup{
@@ -1322,6 +1353,7 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 	m.peerAlive = true
 	m.peerEverSeen = true
 	m.peerNodeID = int(pkt.NodeID)
+	m.peerSoftwareVersion = pkt.SoftwareVersion
 
 	// Rebuild peer group states from scratch — prunes stale RGs that
 	// the peer no longer reports (fix #92).
@@ -1399,6 +1431,7 @@ func (m *Manager) handlePeerTimeout() {
 	m.peerAlive = false
 	m.peerGroups = make(map[int]PeerGroupState)
 	m.peerMonitors = nil
+	m.peerSoftwareVersion = ""
 	slog.Warn("cluster: peer heartbeat timeout, marking peer lost")
 	m.history.Record(EventHeartbeat, -1, "Peer heartbeat timeout")
 
@@ -1558,6 +1591,8 @@ func (m *Manager) FormatStatus() string {
 	m.mu.RLock()
 	peerAlive := m.peerAlive
 	peerNodeID := m.peerNodeID
+	localVersion := m.localSoftwareVersion
+	peerVersion := m.peerSoftwareVersion
 	peerGroups := make(map[int]PeerGroupState, len(m.peerGroups))
 	for k, v := range m.peerGroups {
 		peerGroups[k] = v
@@ -1572,6 +1607,18 @@ func (m *Manager) FormatStatus() string {
 	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "Cluster ID: %d\n", m.clusterID)
 	fmt.Fprintf(&b, "Node name: node%d\n\n", m.nodeID)
+	if localVersion != "" {
+		fmt.Fprintf(&b, "Software version: %s\n", localVersion)
+	}
+	if peerAlive {
+		if peerVersion == "" {
+			peerVersion = "unknown"
+		}
+		fmt.Fprintf(&b, "Peer software version: %s\n", peerVersion)
+	}
+	if localVersion != "" || peerAlive {
+		fmt.Fprintln(&b)
+	}
 	fmt.Fprintf(&b, "%-6s %-8s %-14s %-8s %-8s %s\n",
 		"Node", "Priority", "Status", "Preempt", "Manual", "Monitor-failures")
 	fmt.Fprintln(&b)
@@ -1629,6 +1676,8 @@ func (m *Manager) FormatInformation() string {
 	m.mu.RLock()
 	peerAlive := m.peerAlive
 	peerNodeID := m.peerNodeID
+	localVersion := m.localSoftwareVersion
+	peerVersion := m.peerSoftwareVersion
 	interval := m.hbInterval
 	threshold := m.hbThreshold
 	controlIface := m.controlInterface
@@ -1665,6 +1714,15 @@ func (m *Manager) FormatInformation() string {
 	fmt.Fprintf(&b, "  Heartbeat threshold: %d\n", threshold)
 	if controlIface != "" {
 		fmt.Fprintf(&b, "  Control interface: %s\n", controlIface)
+	}
+	if localVersion != "" {
+		fmt.Fprintf(&b, "  Software version: %s\n", localVersion)
+	}
+	if peerAlive {
+		if peerVersion == "" {
+			peerVersion = "unknown"
+		}
+		fmt.Fprintf(&b, "  Peer software version: %s\n", peerVersion)
 	}
 	fmt.Fprintf(&b, "  Sync transport: %s\n", m.SyncTransport())
 	fmt.Fprintln(&b)

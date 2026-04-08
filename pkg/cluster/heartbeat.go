@@ -52,11 +52,19 @@ const (
 //	    [2] Weight
 //	    [3] NameLen
 //	    [4..4+NameLen] Interface name
+//	After monitors:
+//	  Optional SoftwareVersion:
+//	    [0] VersionLen
+//	    [1..1+VersionLen] Version bytes
+//
+// The trailing software-version field is optional; packets may end after the
+// monitor section, or may include the length-prefixed version bytes.
 type HeartbeatPacket struct {
-	NodeID    uint8
-	ClusterID uint16
-	Groups    []HeartbeatGroup
-	Monitors  []HeartbeatMonitor
+	NodeID          uint8
+	ClusterID       uint16
+	Groups          []HeartbeatGroup
+	Monitors        []HeartbeatMonitor
+	SoftwareVersion string
 }
 
 // HeartbeatGroup is a per-RG entry in the heartbeat.
@@ -81,11 +89,14 @@ const heartbeatHeaderSize = 9
 // heartbeatGroupSize is GroupID(1) + Priority(2) + Weight(1) + State(1).
 const heartbeatGroupSize = 5
 
+const maxHeartbeatSoftwareVersionSize = 255
+
 // MarshalHeartbeat encodes a heartbeat packet to wire format.
 // The output is capped at maxHeartbeatSize. RG group entries are always
-// included (they are critical for election). If monitors would cause the
-// packet to exceed the limit, the monitor section is truncated — as many
-// monitors as fit are included.
+// included (they are critical for election). When SoftwareVersion is present,
+// space for it is reserved first so monitor truncation never drops version
+// metadata. If monitors would cause the packet to exceed the limit, the monitor
+// section is truncated and the version field is preserved.
 func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 	buf := make([]byte, maxHeartbeatSize)
 	copy(buf[0:4], heartbeatMagic)
@@ -103,6 +114,20 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 		off += heartbeatGroupSize
 	}
 
+	var version []byte
+	versionReserve := 0
+	if pkt.SoftwareVersion != "" {
+		version = []byte(pkt.SoftwareVersion)
+		if len(version) > maxHeartbeatSoftwareVersionSize {
+			version = version[:maxHeartbeatSoftwareVersionSize]
+		}
+		if off+1+len(version) <= maxHeartbeatSize {
+			versionReserve = 1 + len(version)
+		} else {
+			version = nil
+		}
+	}
+
 	// Append monitor section, fitting as many monitors as possible.
 	monCountOff := off // remember offset of NumMonitors byte
 	buf[off] = 0       // NumMonitors — updated below
@@ -111,7 +136,7 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 	for _, mon := range pkt.Monitors {
 		nameBytes := []byte(mon.Interface)
 		entrySize := 4 + len(nameBytes) // RGID + Flags + Weight + NameLen + name
-		if off+entrySize > maxHeartbeatSize {
+		if off+entrySize > maxHeartbeatSize-versionReserve {
 			break
 		}
 		buf[off] = mon.RGID
@@ -128,6 +153,12 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 		numMon++
 	}
 	buf[monCountOff] = uint8(numMon)
+	if len(version) > 0 {
+		buf[off] = uint8(len(version))
+		off++
+		copy(buf[off:off+len(version)], version)
+		off += len(version)
+	}
 	return buf[:off]
 }
 
@@ -171,11 +202,13 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 	// is truncated (sender capped at maxHeartbeatSize), return whatever
 	// monitors were successfully parsed rather than erroring — RG state
 	// (already parsed above) is the critical data.
+	monitorSectionComplete := true
 	if off < len(data) {
 		numMonitors := int(data[off])
 		off++
 		for i := 0; i < numMonitors; i++ {
 			if off+4 > len(data) {
+				monitorSectionComplete = false
 				break // truncated — return what we have
 			}
 			rgID := data[off]
@@ -184,6 +217,7 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 			nameLen := int(data[off+3])
 			off += 4
 			if off+nameLen > len(data) {
+				monitorSectionComplete = false
 				break // truncated name — return what we have
 			}
 			name := string(data[off : off+nameLen])
@@ -194,6 +228,13 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 				Up:        up,
 				Interface: name,
 			})
+		}
+	}
+	if monitorSectionComplete && off < len(data) {
+		versionLen := int(data[off])
+		off++
+		if off+versionLen <= len(data) {
+			pkt.SoftwareVersion = string(data[off : off+versionLen])
 		}
 	}
 

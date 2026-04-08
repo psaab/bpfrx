@@ -7,8 +7,9 @@ import (
 
 func TestMarshalUnmarshalHeartbeat(t *testing.T) {
 	pkt := &HeartbeatPacket{
-		NodeID:    1,
-		ClusterID: 42,
+		NodeID:          1,
+		ClusterID:       42,
+		SoftwareVersion: "bpfrx-test-1",
 		Groups: []HeartbeatGroup{
 			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
 			{GroupID: 1, Priority: 150, Weight: 100, State: uint8(StateSecondary)},
@@ -41,6 +42,9 @@ func TestMarshalUnmarshalHeartbeat(t *testing.T) {
 	}
 	if got.Groups[1].State != uint8(StateSecondary) {
 		t.Errorf("group 1 state = %d, want %d", got.Groups[1].State, StateSecondary)
+	}
+	if got.SoftwareVersion != "bpfrx-test-1" {
+		t.Errorf("software version = %q, want bpfrx-test-1", got.SoftwareVersion)
 	}
 }
 
@@ -120,6 +124,7 @@ func TestMarshalHeartbeat_Size(t *testing.T) {
 
 func TestHandlePeerHeartbeat(t *testing.T) {
 	m := NewManager(0, 1)
+	m.SetSoftwareVersion("local-test")
 	cfg := makeConfig(
 		makeRG(0, true, map[int]int{0: 200, 1: 100}),
 	)
@@ -129,8 +134,9 @@ func TestHandlePeerHeartbeat(t *testing.T) {
 
 	// Simulate peer heartbeat.
 	pkt := &HeartbeatPacket{
-		NodeID:    1,
-		ClusterID: 1,
+		NodeID:          1,
+		ClusterID:       1,
+		SoftwareVersion: "peer-test",
 		Groups: []HeartbeatGroup{
 			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StateSecondary)},
 		},
@@ -149,6 +155,9 @@ func TestHandlePeerHeartbeat(t *testing.T) {
 		t.Error("peer group 0 not found")
 	} else if pg.Priority != 100 {
 		t.Errorf("peer group 0 priority = %d, want 100", pg.Priority)
+	}
+	if mismatch, local, peer := m.SoftwareVersionMismatch(); !mismatch || local != "local-test" || peer != "peer-test" {
+		t.Fatalf("software mismatch = %v local=%q peer=%q, want true/local-test/peer-test", mismatch, local, peer)
 	}
 }
 
@@ -262,12 +271,16 @@ func TestMarshalUnmarshalHeartbeat_NoMonitors_BackwardsCompat(t *testing.T) {
 	if len(got2.Groups) != 1 {
 		t.Errorf("groups from old format = %d, want 1", len(got2.Groups))
 	}
+	if got2.SoftwareVersion != "" {
+		t.Errorf("software version from old format = %q, want empty", got2.SoftwareVersion)
+	}
 }
 
 func TestUnmarshalHeartbeat_TruncatedMonitor(t *testing.T) {
 	pkt := &HeartbeatPacket{
-		NodeID:    0,
-		ClusterID: 1,
+		NodeID:          0,
+		ClusterID:       1,
+		SoftwareVersion: "peer-build",
 		Groups: []HeartbeatGroup{
 			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
 		},
@@ -299,6 +312,9 @@ func TestUnmarshalHeartbeat_TruncatedMonitor(t *testing.T) {
 	if len(got.Monitors) > 0 && got.Monitors[0].Interface != "ge-0/0/0" {
 		t.Errorf("monitor 0 interface = %q, want ge-0/0/0", got.Monitors[0].Interface)
 	}
+	if got.SoftwareVersion != "" {
+		t.Errorf("software version = %q, want empty after truncated monitor section", got.SoftwareVersion)
+	}
 }
 
 func TestUnmarshalHeartbeat_TruncatedMonitorName(t *testing.T) {
@@ -325,8 +341,9 @@ func TestMarshalHeartbeat_LargeMonitorPayload_RGPreserved(t *testing.T) {
 	// Build a packet with many monitors that would exceed the old 512-byte
 	// limit. RG group state must always be preserved.
 	pkt := &HeartbeatPacket{
-		NodeID:    0,
-		ClusterID: 1,
+		NodeID:          0,
+		ClusterID:       1,
+		SoftwareVersion: "peer-build",
 		Groups: []HeartbeatGroup{
 			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
 			{GroupID: 1, Priority: 150, Weight: 100, State: uint8(StateSecondary)},
@@ -346,10 +363,12 @@ func TestMarshalHeartbeat_LargeMonitorPayload_RGPreserved(t *testing.T) {
 	if len(data) > maxHeartbeatSize {
 		t.Fatalf("marshal produced %d bytes, exceeds maxHeartbeatSize %d", len(data), maxHeartbeatSize)
 	}
-
 	got, err := UnmarshalHeartbeat(data)
 	if err != nil {
 		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.SoftwareVersion != "peer-build" {
+		t.Fatalf("software version = %q, want peer-build", got.SoftwareVersion)
 	}
 
 	// RG groups must be intact.
