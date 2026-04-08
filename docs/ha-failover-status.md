@@ -181,30 +181,41 @@ removed or bypassed:
 ### Automated
 
 ```bash
-# Hardened RG move under load (the primary validator)
+# Hardened RG move under load (the primary validator).
+# Keep the run long enough to expose late collapses, move RG1 quickly in both
+# directions, and keep all eight stream lines visible during the run.
 BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
 IPERF_TARGET=172.16.80.200 \
-TOTAL_CYCLES=3 CYCLE_INTERVAL=10 \
-scripts/userspace-ha-failover-validation.sh --duration 240 --parallel 4
+TOTAL_CYCLES=12 CYCLE_INTERVAL=5 \
+scripts/userspace-ha-failover-validation.sh --duration 600 --parallel 8
 ```
 
 ### Manual CLI test
 
 ```bash
-# Start traffic
-iperf3 -c 172.16.80.200 -P 4 -t 60
+# Start long-running traffic and keep all per-stream lines visible.
+iperf3 -c 172.16.80.200 -P 8 -t 600
 
-# Move RG
+# Rapidly move RG1 between fw0 and fw1 while traffic is active.
 cli -c "request chassis cluster failover redundancy-group 1 node 1"
+sleep 5
+cli -c "request chassis cluster failover redundancy-group 1 node 0"
+sleep 5
+cli -c "request chassis cluster failover redundancy-group 1 node 1"
+sleep 5
+cli -c "request chassis cluster failover redundancy-group 1 node 0"
 
-# Verify: SNAT > 0 on new owner, all streams alive
+# Verify: SNAT > 0 on the new owner, no stream wedges at 0, and the run
+# recovers back to full throughput after each move.
 cli -c "show chassis cluster data-plane statistics" | grep SNAT
 ```
 
 ### Pass criteria
 
-- All 4 iperf3 streams survive failover
-- Zero zero-throughput intervals
+- All 8 iperf3 streams survive every RG move
+- Zero per-stream zero-throughput intervals
+- Zero aggregate zero-throughput intervals
+- No permanently wedged stream after failback
 - SNAT packets > 0 on new owner
 - Session misses < 1000 on new owner
 - RG moves to the requested node
