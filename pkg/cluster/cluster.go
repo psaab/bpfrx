@@ -1415,7 +1415,10 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 		}
 	}
 	for rgID := range m.peerTransferOutOverride {
-		peerGroup := newPeerGroups[rgID]
+		peerGroup, ok := newPeerGroups[rgID]
+		if !ok {
+			continue
+		}
 		peerGroup.GroupID = rgID
 		peerGroup.State = StateSecondaryHold
 		newPeerGroups[rgID] = peerGroup
@@ -1425,7 +1428,10 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 			delete(m.peerTransferCommitGraceUntil, rgID)
 			continue
 		}
-		peerGroup := newPeerGroups[rgID]
+		peerGroup, ok := newPeerGroups[rgID]
+		if !ok {
+			continue
+		}
 		peerGroup.GroupID = rgID
 		peerGroup.State = StateSecondaryHold
 		newPeerGroups[rgID] = peerGroup
@@ -1477,7 +1483,7 @@ func (m *Manager) handlePeerTimeout() {
 	}
 	if suppress, reason := m.suppressPeerTimeoutForTransferCommitLocked(time.Now()); suppress {
 		m.mu.Unlock()
-		slog.Info("cluster: suppressing peer heartbeat timeout", "reason", reason)
+		slog.Debug("cluster: suppressing peer heartbeat timeout", "reason", reason)
 		return
 	}
 	guard := m.peerTimeoutGuardFn
@@ -1485,7 +1491,7 @@ func (m *Manager) handlePeerTimeout() {
 
 	if guard != nil {
 		if suppress, reason := guard(); suppress {
-			slog.Info("cluster: suppressing peer heartbeat timeout", "reason", reason)
+			slog.Debug("cluster: suppressing peer heartbeat timeout", "reason", reason)
 			return
 		}
 	}
@@ -1496,7 +1502,7 @@ func (m *Manager) handlePeerTimeout() {
 		return // already marked lost while guard ran
 	}
 	if suppress, reason := m.suppressPeerTimeoutForTransferCommitLocked(time.Now()); suppress {
-		slog.Info("cluster: suppressing peer heartbeat timeout", "reason", reason)
+		slog.Debug("cluster: suppressing peer heartbeat timeout", "reason", reason)
 		return
 	}
 

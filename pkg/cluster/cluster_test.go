@@ -1062,6 +1062,28 @@ func TestNotePeerTransferCommittedPreservesPeerTransferOutDuringGrace(t *testing
 	}
 }
 
+func TestHandlePeerHeartbeatSkipsTransferOverridesForAbsentRG(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	m.mu.Lock()
+	m.peerTransferOutOverride[0] = 77
+	m.peerTransferCommitGraceUntil[0] = time.Now().Add(time.Second)
+	m.mu.Unlock()
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups:    nil,
+	})
+
+	if got := len(m.PeerGroupStates()); got != 0 {
+		t.Fatalf("peer groups = %d, want 0 when heartbeat omits overridden RG", got)
+	}
+}
+
 func TestHandlePeerTimeoutSuppressedDuringRecentTransferCommitGrace(t *testing.T) {
 	m := NewManager(0, 1)
 	cfg := makeConfig(makeRG(0, false, map[int]int{0: 200, 1: 100}))
