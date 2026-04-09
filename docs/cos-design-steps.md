@@ -8,14 +8,14 @@ The design was developed iteratively in scratch review documents before the conc
 
 It is based on these archived working artifacts:
 
-- [`docs/cos/review.md`](cos/review.md)
-- [`docs/cos/cos.md`](cos/cos.md)
-- [`docs/cos/cos2.md`](cos/cos2.md)
-- [`docs/cos/cos3.md`](cos/cos3.md)
-- [`docs/cos/cos4.md`](cos/cos4.md)
-- [`docs/cos/cos5.md`](cos/cos5.md)
-- [`docs/cos/cos6.md`](cos/cos6.md)
-- [`docs/cos/cos7.md`](cos/cos7.md)
+- [`docs/cos/hierarchical-policer-review.md`](cos/hierarchical-policer-review.md)
+- [`docs/cos/cos-traffic-shaping-review-v1.md`](cos/cos-traffic-shaping-review-v1.md)
+- [`docs/cos/cos-traffic-shaping-review-v2-adversarial-goals.md`](cos/cos-traffic-shaping-review-v2-adversarial-goals.md)
+- [`docs/cos/cos-traffic-shaping-review-v3-admission-and-accounting.md`](cos/cos-traffic-shaping-review-v3-admission-and-accounting.md)
+- [`docs/cos/cos-traffic-shaping-review-v4-many-core.md`](cos/cos-traffic-shaping-review-v4-many-core.md)
+- [`docs/cos/cos-traffic-shaping-many-core-alternative.md`](cos/cos-traffic-shaping-many-core-alternative.md)
+- [`docs/cos/cos-traffic-shaping-hierarchy-reset-plan.md`](cos/cos-traffic-shaping-hierarchy-reset-plan.md)
+- [`docs/cos/cos-traffic-shaping-replacement-section.md`](cos/cos-traffic-shaping-replacement-section.md)
 - the prompt history that produced those files
 
 ## About the Archived Working Files
@@ -30,19 +30,19 @@ They matter because several important ideas were introduced, rejected, or correc
 
 The role of each archived file was:
 
-- [`docs/cos/review.md`](cos/review.md): review of the original `hierarchical-policer.md` design
-- [`docs/cos/cos.md`](cos/cos.md): first extensive review of `cos-traffic-shaping.md` after the shift from policing to shaping
-- [`docs/cos/cos2.md`](cos/cos2.md): second review, focusing more explicitly on adversarial-flow behavior, queue skew, and protocol-oblivious constraints
-- [`docs/cos/cos3.md`](cos/cos3.md): reused path; first it held a concrete architecture draft, then later it was overwritten with a newer review of a revised CoS draft
-- [`docs/cos/cos4.md`](cos/cos4.md): many-core-focused review, especially around fairness semantics under RSS spread
-- [`docs/cos/cos5.md`](cos/cos5.md): concrete many-core alternative centered on fairness-key ownership and hierarchical leasing
-- [`docs/cos/cos6.md`](cos/cos6.md): reset plan after the design drifted away from hierarchy and toward a CIR shortcut model
-- [`docs/cos/cos7.md`](cos/cos7.md): cleaned-up replacement section that became the immediate source material for rewriting `docs/cos-traffic-shaping.md`
+- [`docs/cos/hierarchical-policer-review.md`](cos/hierarchical-policer-review.md): review of the original `hierarchical-policer.md` design
+- [`docs/cos/cos-traffic-shaping-review-v1.md`](cos/cos-traffic-shaping-review-v1.md): first extensive review of `cos-traffic-shaping.md` after the shift from policing to shaping
+- [`docs/cos/cos-traffic-shaping-review-v2-adversarial-goals.md`](cos/cos-traffic-shaping-review-v2-adversarial-goals.md): second review, focusing more explicitly on adversarial-flow behavior, queue skew, and protocol-oblivious constraints
+- [`docs/cos/cos-traffic-shaping-review-v3-admission-and-accounting.md`](cos/cos-traffic-shaping-review-v3-admission-and-accounting.md): surviving archive of the later review written to the reused `cos3.md` temp path
+- [`docs/cos/cos-traffic-shaping-review-v4-many-core.md`](cos/cos-traffic-shaping-review-v4-many-core.md): many-core-focused review, especially around fairness semantics under RSS spread
+- [`docs/cos/cos-traffic-shaping-many-core-alternative.md`](cos/cos-traffic-shaping-many-core-alternative.md): concrete many-core alternative centered on fairness-key ownership and hierarchical leasing
+- [`docs/cos/cos-traffic-shaping-hierarchy-reset-plan.md`](cos/cos-traffic-shaping-hierarchy-reset-plan.md): reset plan after the design drifted away from hierarchy and toward a CIR shortcut model
+- [`docs/cos/cos-traffic-shaping-replacement-section.md`](cos/cos-traffic-shaping-replacement-section.md): cleaned-up replacement section that became the immediate source material for rewriting `docs/cos-traffic-shaping.md`
 
 Two important caveats:
 
 - the quoted `/tmp` paths below are historical prompt destinations, not dependencies of the final doc
-- because `cos3.md` was reused, the archived file [`docs/cos/cos3.md`](cos/cos3.md) does not preserve the first version that was written there
+- because `cos3.md` was reused, the archived file [`docs/cos/cos-traffic-shaping-review-v3-admission-and-accounting.md`](cos/cos-traffic-shaping-review-v3-admission-and-accounting.md) does not preserve the first version that was written there
 
 This summary keeps the original `/tmp` destinations inside prompt quotes because they record what was actually requested at the time. For readability, some checkout-specific source paths are normalized, and obvious typos in quoted prompts are marked with `[sic]`. Outside those quotes, the summary points to the archived repository copies.
 
@@ -82,11 +82,11 @@ Prompt used (normalized for repo-doc clarity):
 
 Artifact:
 
-- [`docs/cos/review.md`](cos/review.md)
+- [`docs/cos/hierarchical-policer-review.md`](cos/hierarchical-policer-review.md)
 
 Historical note:
 
-- that earlier `hierarchical-policer.md` draft is not present in the current repository; the surviving review is archived in [`docs/cos/review.md`](cos/review.md)
+- that earlier `hierarchical-policer.md` draft is not present in the current repository; the surviving review is archived in [`docs/cos/hierarchical-policer-review.md`](cos/hierarchical-policer-review.md)
 
 Main findings:
 
@@ -118,7 +118,7 @@ Prompt used:
 
 Artifact:
 
-- [`docs/cos/cos.md`](cos/cos.md)
+- [`docs/cos/cos-traffic-shaping-review-v1.md`](cos/cos-traffic-shaping-review-v1.md)
 
 Main findings:
 
@@ -150,7 +150,7 @@ Prompt used:
 
 Artifact:
 
-- [`docs/cos/cos2.md`](cos/cos2.md)
+- [`docs/cos/cos-traffic-shaping-review-v2-adversarial-goals.md`](cos/cos-traffic-shaping-review-v2-adversarial-goals.md)
 
 Main findings:
 
@@ -179,7 +179,7 @@ Artifact at the time:
 Important note:
 
 - that earlier draft was later overwritten by a newer review request that reused the same path
-- the archived file [`docs/cos/cos3.md`](cos/cos3.md) contains the later review, not that original architecture draft
+- the archived file [`docs/cos/cos-traffic-shaping-review-v3-admission-and-accounting.md`](cos/cos-traffic-shaping-review-v3-admission-and-accounting.md) contains the later review, not that original architecture draft
 
 Design impact:
 
@@ -199,7 +199,7 @@ Prompt used:
 
 Artifact:
 
-- [`docs/cos/cos3.md`](cos/cos3.md) (the surviving archived copy)
+- [`docs/cos/cos-traffic-shaping-review-v3-admission-and-accounting.md`](cos/cos-traffic-shaping-review-v3-admission-and-accounting.md) (the surviving archived copy)
 
 Main findings:
 
@@ -229,7 +229,7 @@ Prompt used:
 
 Artifact:
 
-- [`docs/cos/cos4.md`](cos/cos4.md)
+- [`docs/cos/cos-traffic-shaping-review-v4-many-core.md`](cos/cos-traffic-shaping-review-v4-many-core.md)
 
 Main findings:
 
@@ -251,7 +251,7 @@ Prompt used:
 
 Artifact:
 
-- [`docs/cos/cos5.md`](cos/cos5.md)
+- [`docs/cos/cos-traffic-shaping-many-core-alternative.md`](cos/cos-traffic-shaping-many-core-alternative.md)
 
 Main proposal:
 
@@ -272,7 +272,7 @@ Prompt used:
 
 Artifact:
 
-- [`docs/cos/cos6.md`](cos/cos6.md)
+- [`docs/cos/cos-traffic-shaping-hierarchy-reset-plan.md`](cos/cos-traffic-shaping-hierarchy-reset-plan.md)
 
 Main reset principles:
 
@@ -297,7 +297,7 @@ Prompt used:
 
 Artifact:
 
-- [`docs/cos/cos7.md`](cos/cos7.md)
+- [`docs/cos/cos-traffic-shaping-replacement-section.md`](cos/cos-traffic-shaping-replacement-section.md)
 
 Main output:
 
@@ -353,7 +353,7 @@ Design impact:
 
 ## What Each Artifact Contributed
 
-### [`docs/cos/review.md`](cos/review.md)
+### [`docs/cos/hierarchical-policer-review.md`](cos/hierarchical-policer-review.md)
 
 Contribution:
 
@@ -365,7 +365,7 @@ Why it mattered:
 - it was the first point where the design direction changed rather than merely being tuned
 - it made clear that “work-conserving with hierarchical borrowing” needed a cleaner service model than the original draft provided
 
-### [`docs/cos/cos.md`](cos/cos.md)
+### [`docs/cos/cos-traffic-shaping-review-v1.md`](cos/cos-traffic-shaping-review-v1.md)
 
 Contribution:
 
@@ -377,7 +377,7 @@ Why it mattered:
 - it established that the next design needed to be an explicit shaper, not just a renamed policer
 - it surfaced internal contradictions early enough that later reviews could focus on fairness and scale instead of terminology alone
 
-### [`docs/cos/cos2.md`](cos/cos2.md)
+### [`docs/cos/cos-traffic-shaping-review-v2-adversarial-goals.md`](cos/cos-traffic-shaping-review-v2-adversarial-goals.md)
 
 Contribution:
 
@@ -388,7 +388,7 @@ Why it mattered:
 - it sharpened the distinction between dequeue fairness and overload fairness
 - it made “protect mice before the queue is already full” part of the design target
 
-### [`docs/cos/cos3.md`](cos/cos3.md)
+### [`docs/cos/cos-traffic-shaping-review-v3-admission-and-accounting.md`](cos/cos-traffic-shaping-review-v3-admission-and-accounting.md)
 
 Contribution:
 
@@ -401,9 +401,9 @@ Why it mattered:
 
 Historical note:
 
-- [`docs/cos/cos3.md`](cos/cos3.md) is the one archived artifact whose path is misleading if read literally because the first document written there was later replaced by a newer review
+- [`docs/cos/cos-traffic-shaping-review-v3-admission-and-accounting.md`](cos/cos-traffic-shaping-review-v3-admission-and-accounting.md) is the archived artifact whose content comes from the later document written to the reused `cos3.md` temp path
 
-### [`docs/cos/cos4.md`](cos/cos4.md)
+### [`docs/cos/cos-traffic-shaping-review-v4-many-core.md`](cos/cos-traffic-shaping-review-v4-many-core.md)
 
 Contribution:
 
@@ -414,7 +414,7 @@ Why it mattered:
 - it exposed that “global class fairness” was not enough if hosts could multiply their share across workers
 - it turned many-core behavior into a first-order architecture concern
 
-### [`docs/cos/cos5.md`](cos/cos5.md)
+### [`docs/cos/cos-traffic-shaping-many-core-alternative.md`](cos/cos-traffic-shaping-many-core-alternative.md)
 
 Contribution:
 
@@ -425,7 +425,7 @@ Why it mattered:
 - it was useful as an exploration of the scale problem
 - it also triggered the later reset because it showed the design was starting to solve scale by introducing special structure instead of preserving the core hierarchy
 
-### [`docs/cos/cos6.md`](cos/cos6.md)
+### [`docs/cos/cos-traffic-shaping-hierarchy-reset-plan.md`](cos/cos-traffic-shaping-hierarchy-reset-plan.md)
 
 Contribution:
 
@@ -436,7 +436,7 @@ Why it mattered:
 - this was the clearest corrective instruction in the entire sequence
 - it explicitly rejected both hierarchy drift and a CIR “fast path” interpretation
 
-### [`docs/cos/cos7.md`](cos/cos7.md)
+### [`docs/cos/cos-traffic-shaping-replacement-section.md`](cos/cos-traffic-shaping-replacement-section.md)
 
 Contribution:
 
@@ -483,4 +483,4 @@ The overall design was corrected in these ways:
 - then reset again when the design drifted away from a true hierarchy
 - finally rewrite the doc around the restored hierarchical model
 
-The key turning point was the user correction captured in [`docs/cos/cos6.md`](cos/cos6.md): the design had drifted away from hierarchy and was starting to treat CIR like a fast path. The final doc rewrite exists primarily to correct that drift while keeping the original performance, fairness, and protocol-oblivious goals intact.
+The key turning point was the user correction captured in [`docs/cos/cos-traffic-shaping-hierarchy-reset-plan.md`](cos/cos-traffic-shaping-hierarchy-reset-plan.md): the design had drifted away from hierarchy and was starting to treat CIR like a fast path. The final doc rewrite exists primarily to correct that drift while keeping the original performance, fairness, and protocol-oblivious goals intact.
