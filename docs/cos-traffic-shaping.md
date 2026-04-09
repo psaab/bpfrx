@@ -84,20 +84,25 @@ what can be **starved**. The implementation must match these semantics exactly.
 ### Component Chain
 
 ```
-Firewall filter / DSCP classifier → Forwarding class → Class queue
-                                                            │
-                                                  Admission control
-                                                  (per-host soft/hard cap,
-                                                   over-cap-first reclaim,
-                                                   admission headroom)
-                                                            │
-                                                    Scheduler
-                                                    (guarantee pass + priority surplus)
-                                                            │
-                                                    Aggregate shaping-rate
-                                                    (shared token bucket)
-                                                            │
-                                                    TX ring submission
+RX worker
+  → parse / classify / derive fairness key + queue
+
+  Local class (FIFO, latency-sensitive):
+    → enqueue locally → scheduler → TX ring
+
+  Fairness-owned class (BE/bulk):
+    → compute owner = jump_hash(iface, class, key)
+    → if owner == self: enqueue locally
+      else: copy packet to owner's ingress ring
+    → owner drains ingress → admission control → HostDrr → scheduler → TX ring
+
+Admission control (on owner only):
+  per-host soft/hard cap, over-cap-first reclaim, admission headroom
+
+Scheduler (per worker):
+  phase 1 (guarantee) + phase 2 (priority surplus)
+  → aggregate shaping-rate (hierarchical token lease)
+  → TX ring submission
 ```
 
 ### Two-Phase Scheduling
@@ -339,64 +344,151 @@ where inter-service delay is simply queue depth / rate.
 ### Global vs Per-Worker Fairness
 
 **Class fairness is global.** CIR, PIR, and aggregate token pools are shared
-`AtomicI64` across all workers. A class guarantee is honored regardless of
-which workers process that class's traffic.
+across all workers. A class guarantee is honored regardless of which workers
+process that class's traffic.
 
-**Host fairness uses global admission caps + local DRR service.**
+**Host fairness uses fairness-key ownership.** Each fairness key is assigned
+to exactly one **owner worker**. All packets for that key are enqueued and
+scheduled only on the owner. This gives true global per-host fairness
+without shared mutable host state.
 
 The problem: if host fairness were purely per-worker, an elephant spreading
 flows across N workers would get N× the DRR quantum, N× the soft cap, and
-N× the queue share — defeating fairness entirely. This is the core many-core
-version of the flow-splitting problem.
+N× the queue share. This is the core many-core flow-multiplication problem.
 
-The solution: **shared host accounting**. Per-host `queued_bytes` and
-`queued_frames` are tracked globally across all workers via a sharded
-shared structure. Admission caps (soft/hard) check these global counters.
-Local DRR still runs per-worker for dequeue scheduling, but the admission
-gate is global.
+Three options were evaluated:
+
+1. **Shared global host state** (locks/atomics on every enqueue/dequeue):
+   Correct but heavy. Shared mutable host maps, deficits, byte counters,
+   and reclaim state across all workers creates cache-line bouncing and
+   scaling issues on many-core systems. Wrong performance tradeoff for
+   AF_XDP userspace.
+
+2. **Fairness-key ownership** (chosen): Each fairness key has one owner
+   worker. All packets for that key route to the owner. One host = one DRR
+   entry, one admission cap, one overflow position. No shared mutable host
+   state. Many independent hosts scale across many workers naturally.
+
+3. **Accept per-worker host fairness**: Would require substantially weakened
+   adversarial claims. Does not meet the original requirements.
+
+#### Class Modes
+
+Not every class uses ownership. Classes are split by scheduling policy:
+
+- **Local classes** (`network-control`, `expedited-forwarding`): Latency-
+  sensitive FIFO. Scheduled locally on the current worker. No host DRR.
+  No ownership overhead.
+
+- **Fairness-owned classes** (`best-effort`, `bulk-data`): Host fairness
+  enabled. Fairness-key ownership applies. Packets may be forwarded to
+  their owner worker before enqueue.
+
+- **Optionally owned** (`assured-forwarding`): Local FIFO by default.
+  Operators can enable fairness ownership if needed.
+
+#### Owner Selection
 
 ```
-Global (shared across workers):
-  SharedHostAccounting
-    ├── shard[0]: AHashMap<FairnessKey, HostGlobalCounters>
-    ├── shard[1]: ...
-    └── shard[63]: ...   (64 shards, Mutex per shard)
-
-  Each HostGlobalCounters:
-    queued_bytes: AtomicU64    // total across all workers
-    queued_frames: AtomicU32
-
-Per-worker (local):
-  HostDrr
-    ├── local DRR active list, deficit counters
-    └── local per-host VecDeque<QueuedFrame>
+owner_worker = jump_consistent_hash(
+    hash(interface_id, queue_id, fairness_key),
+    num_fairness_workers
+)
 ```
 
-On enqueue: atomically increment the host's global `queued_bytes`. Check
-global soft/hard cap. Then enqueue locally.
+Jump consistent hash (not plain modulo) so worker-set changes move
+minimal keys. Ownership is stable and rebalance is less disruptive.
 
-On dequeue: atomically decrement.
+When a worker is added or removed, only `~1/N` of keys remap. The remap
+is versioned alongside the existing config epoch — stale `owner_worker`
+values in the flow cache are invalidated on epoch bump.
 
-**Why sharded**: 64 shards (keyed by fairness-key hash) minimize lock
-contention. Workers processing different hosts rarely contend. Workers
-processing the same host (the adversarial case) contend on the same
-shard — which is exactly what we want: that contention serializes their
-admission checks against a single shared cap.
+#### Remote Enqueue
 
-**Cost**: One atomic increment per enqueue, one per dequeue, same shard.
-Under non-adversarial load (hosts don't overlap across workers), different
-hosts land in different shards — no contention. Under adversarial load
-(one host on many workers), the contention is on that host's shard —
-bounded by shard mutex, O(1) per operation.
+When a packet arrives on a non-owner worker for a fairness-owned class:
 
-**What this means for the elephant scenarios**:
-- One elephant across 32 workers: global `queued_bytes` reaches soft cap
-  after `soft_cap` total bytes regardless of worker spread. The elephant
-  cannot multiply its share by spreading.
-- One elephant on one worker: same behavior as before — local admission
-  check against global counters.
-- Mice on any number of workers: each mouse has low global `queued_bytes`,
-  always below soft cap, always admitted.
+```
+RX worker (non-owner):
+  1. Parse, classify, derive fairness_key
+  2. Compute owner = jump_hash(interface, class, key)
+  3. Copy packet data + metadata into owner's ingress ring
+  4. Recycle local UMEM frame immediately
+
+Owner worker:
+  1. Drain remote ingress rings (bounded per cycle)
+  2. Allocate local UMEM frame, copy packet in
+  3. Apply admission control (host caps, headroom)
+  4. Enqueue into local HostDrr
+  5. Schedule and submit to TX ring
+```
+
+**UMEM constraint**: Each worker has its own UMEM (per-worker `Rc<MmapArea>`,
+not shared across threads). Frame references cannot be transferred between
+workers. Remote enqueue requires a **packet copy** — the arrival worker
+copies packet bytes into a cross-worker ring, and the owner allocates a
+local UMEM frame and copies in. This is the same pattern as the existing
+`TxRequest { bytes: Vec<u8> }` path for locally-generated packets.
+
+**Ring structure**: Each worker maintains one SPSC ring per peer worker for
+each fairness-owned class. Ring elements carry:
+
+```rust
+struct RemoteEnqueueEntry {
+    packet_data: [u8; MAX_FRAME_SIZE],  // or heap-allocated Vec<u8>
+    len: u32,
+    queue_id: u8,
+    fairness_key: FairnessKey,
+    enqueue_ns: u64,
+    // TX metadata:
+    expected_ports: Option<(u16, u16)>,
+    expected_addr_family: u8,
+    expected_protocol: u8,
+    flow_key: Option<SessionKey>,
+}
+```
+
+**Backpressure**: If the owner's ingress ring is full, the sending worker
+applies admission drop at the sender side. This is equivalent to queue-full
+tail-drop but happens earlier.
+
+**Cost**: The packet copy adds ~100-300ns per packet (depending on size).
+This only applies to fairness-owned classes where the packet lands on a
+non-owner worker. With good RSS distribution, most packets land on or near
+their owner. The copy cost is acceptable because fairness-owned classes
+(BE/bulk) are not latency-sensitive — the entire point is that they trade
+latency for fairness.
+
+#### What This Means for Adversarial Scenarios
+
+- **One elephant across 32 workers**: All packets hash to one owner.
+  Elephant gets one DRR entry, one soft cap, one overflow slot. It cannot
+  multiply its share by spreading flows. Non-owner workers just forward
+  to the owner.
+
+- **100 elephants vs 100 mice across 32 workers**: Each fairness key is
+  independently owned. Load spreads naturally across workers by key.
+  Each host has exactly one fairness state globally.
+
+- **Hot elephant on one owner**: The elephant's owner worker may become
+  CPU-bound. This is intentional — concentrating one host on one owner
+  is the mechanism that prevents share multiplication. The elephant cannot
+  exceed its share even if it becomes the owner's bottleneck.
+
+#### Memory Scaling Under Ownership
+
+With per-worker host fairness, memory scales as `workers × queues × slots`.
+With ownership, each fairness key exists on exactly one worker:
+
+```
+Owned:   fairness_queues × total_active_keys × slot_size
+Per-worker: workers × fairness_queues × duplicated_keys × slot_size
+```
+
+On a 32-worker system with 10,000 active hosts and 2 fairness queues:
+- Owned: 2 × 10,000 × 128B = ~2.5 MB
+- Per-worker: 32 × 2 × 10,000 × 128B = ~80 MB
+
+Ownership reduces host-state memory by the worker count factor.
 
 ### Admission Control — Two-Tier Per-Host Caps
 
@@ -654,14 +746,15 @@ Unshaped interface (unchanged):
 **Every packet that egresses a shaped interface goes through CoS queuing.**
 This includes:
 
-- Forwarded traffic (session hit and miss)
+- Forwarded traffic (session hit and miss): classified, then enqueued
+  locally (local class) or forwarded to owner (fairness-owned class)
 - Locally generated packets (TCP RST, ICMP errors): enqueued into the
-  network-control queue (queue 3, strict-high priority, small buffer)
-- Cross-binding forwards: enqueued into the target binding's CoS queues
-  based on their forwarding-class assignment
+  network-control queue (queue 3, local FIFO, strict-high priority)
+- Cross-binding forwards: classified and routed to the appropriate
+  owner worker if fairness-owned, otherwise enqueued locally
 
 No traffic bypasses the shaper on a shaped interface. The aggregate token
-bucket accounts for all egress bytes.
+bucket accounts for all egress bytes, including remote-enqueued packets.
 
 **TX ring full**: If the TX ring cannot accept all dequeued frames, the
 excess frames are returned to the **front** of their respective class queues
@@ -772,51 +865,62 @@ pub(crate) enum FairnessMode {
 }
 ```
 
-### Shared Token Pools (Atomic, Cross-Worker)
+### Hierarchical Token Pools
 
-Each token pool is padded to its own cache line to prevent false sharing.
-On many-core systems, adjacent atomics in packed arrays cause cache-line
-ping-pong even when workers access different queues.
+On many-core systems, all workers hitting the same global atomics causes
+cache-line ping-pong. A three-level hierarchy reduces cross-socket
+coherence traffic while keeping rate correctness global:
+
+```
+GlobalTokenPool (authoritative, per interface/class)
+  → SocketLeasePool[NUMA node]    (per-socket intermediate)
+    → WorkerLocalLease             (per-worker cache)
+```
+
+Rules:
+1. Global pool refills by elapsed time and configured rate.
+2. Socket pool leases chunks from the global pool.
+3. Worker local cache leases smaller chunks from the socket pool.
+4. Idle worker returns local lease to socket pool.
+5. Idle socket pool returns unused credit to global pool.
+
+Workers on the same socket contend on local socket cache lines. Cross-socket
+traffic is reduced to socket-pool ↔ global-pool leasing, which happens
+infrequently.
+
+Each pool level is cache-line padded:
 
 ```rust
 /// One token pool: tokens + refill timestamp on the same cache line.
-/// Workers touching queue 0's CIR never invalidate queue 1's cache line.
 #[repr(align(128))]  // 2× cache line to avoid adjacent-sector prefetch
 pub(crate) struct AlignedTokenPool {
     pub tokens: AtomicI64,
     pub last_refill_ns: AtomicU64,
-    _pad: [u8; 112],  // fill to 128 bytes
+    _pad: [u8; 112],
 }
 
-pub(crate) struct SharedTokenPools {
+/// Global authoritative token pools for one shaped interface.
+pub(crate) struct GlobalTokenPools {
+    pub aggregate: AlignedTokenPool,
+    pub queue_cir: [AlignedTokenPool; 8],
+    pub queue_pir: [AlignedTokenPool; 8],
+}
+
+/// Per-NUMA-socket intermediate lease pool.
+/// Workers on this socket lease from here, not directly from global.
+pub(crate) struct SocketLeasePool {
     pub aggregate: AlignedTokenPool,
     pub queue_cir: [AlignedTokenPool; 8],
     pub queue_pir: [AlignedTokenPool; 8],
 }
 ```
 
-Total size: 17 pools × 128 bytes = 2,176 bytes per interface. Negligible
-memory cost for eliminating cross-queue false sharing.
+On a 2-socket system with 16 cores per socket: each socket pool handles
+up to 16 workers locally. Global pool is touched only when a socket pool
+runs dry (~once per `socket_lease_size / socket_aggregate_rate`).
 
-### Shared Host Accounting (Global Admission Caps)
-
-```rust
-/// Global per-host byte/frame counters, shared across all workers.
-/// Sharded by fairness-key hash for reduced lock contention.
-pub(crate) struct SharedHostAccounting {
-    shards: [Mutex<AHashMap<FairnessKey, HostGlobalCounters>>; 64],
-}
-
-pub(crate) struct HostGlobalCounters {
-    pub queued_bytes: AtomicU64,
-    pub queued_frames: AtomicU32,
-}
-```
-
-Workers increment/decrement counters atomically on enqueue/dequeue.
-Admission checks (soft/hard cap) read the global counter. The shard mutex
-is held only for map lookup/insert — the atomic counter updates themselves
-are lock-free after the initial lookup.
+On single-socket systems, the socket layer is a no-op passthrough — workers
+lease directly from global.
 
 ### Per-Worker Mutable State
 
@@ -826,14 +930,23 @@ pub(crate) struct CosState {
     agg_cache: LocalBatchCache,
     queue_cir_cache: [LocalBatchCache; 8],
     queue_pir_cache: [LocalBatchCache; 8],
-    shared_pools: Arc<SharedTokenPools>,
-    shared_hosts: Arc<SharedHostAccounting>,
+    global_pools: Arc<GlobalTokenPools>,
+    socket_pool: Arc<SocketLeasePool>,
     surplus_deficit: [i64; 8],
     /// Rotating start index for Phase 1 guarantee fairness.
     phase1_start: u8,
     total_queued_bytes: u64,
     total_queued_frames: u32,
     umem_budget_frames: u32,
+    /// Remote ingress rings for fairness-owned classes.
+    /// Packets from non-owner workers arrive here.
+    remote_ingress: Vec<spsc::Consumer<RemoteEnqueueEntry>>,
+    /// Outbound rings to other workers (for packets we don't own).
+    remote_egress: Vec<spsc::Producer<RemoteEnqueueEntry>>,
+    /// This worker's ID (for owner calculation).
+    worker_id: u32,
+    /// Number of fairness workers for this interface.
+    num_fairness_workers: u32,
 }
 
 struct ClassQueue {
@@ -1014,39 +1127,38 @@ remains acceptable under adversarial churn rates.
 
 ## Per-Interface Memory Budget
 
-Host fairness state scales with `workers × fairness_queues × max_host_slots`.
-This must be budgeted explicitly to prevent surprise memory growth on
-many-core systems.
+With fairness-key ownership, host state scales with
+`fairness_queues × total_active_keys` (not multiplied by worker count).
+Each fairness key exists on exactly one worker.
 
 **Per-host slot size** (approximate): 96-128 bytes (key, counters, linked-list
 pointers, VecDeque header — excluding queued packet buffers).
 
-| Workers | Fairness queues | max_host_slots | Total slots | Slot memory |
-|---------|----------------|----------------|-------------|-------------|
-| 4       | 2              | 4096           | 32,768      | ~4 MB       |
-| 16      | 2              | 4096           | 131,072     | ~16 MB      |
-| 32      | 2              | 4096           | 262,144     | ~32 MB      |
-| 32      | 2              | 1024           | 65,536      | ~8 MB       |
+| Active keys | Fairness queues | Total slots | Slot memory |
+|-------------|----------------|-------------|-------------|
+| 1,000       | 2              | 2,000       | ~256 KB     |
+| 10,000      | 2              | 20,000      | ~2.5 MB     |
+| 100,000     | 2              | 200,000     | ~25 MB      |
 
-Plus shared host accounting: 64 shards × AHashMap overhead ≈ ~2 MB for
-up to 100K unique keys.
+Plus per-worker: remote ingress/egress rings ≈ 64 KB per peer per class.
+With 32 workers and 2 fairness classes: 32 × 2 × 64 KB = ~4 MB per worker.
 
-Plus shared token pools: 17 × 128 bytes = ~2 KB per interface.
+Plus hierarchical token pools: ~17 × 128 bytes per level per interface.
 
 **Recommendation**: Enable host fairness on **at most 2 queues** (typically
 `best-effort` and one bulk/custom queue). Do not enable on all 8 queues.
-For many-core systems (>16 workers), consider reducing `max_host_slots`
-to 1024 or 2048.
+The `max_host_slots` limit is per-queue across the entire interface (not
+per worker), so 4096 slots means 4096 unique fairness keys globally.
 
 The coordinator validates at config time:
 
 ```
-total_host_memory = num_workers * fairness_queues * max_host_slots * ~128
+total_host_memory = fairness_queues * max_host_slots * ~128
+total_ring_memory = num_workers * (num_workers - 1) * fairness_queues * ring_size
 ```
 
-If this exceeds a configurable per-interface memory budget (default: 64 MB),
-the commit is rejected with a warning suggesting reduced `max_host_slots`
-or fewer fairness-enabled queues.
+If the sum exceeds a configurable per-interface memory budget (default:
+64 MB), the commit is rejected with a warning.
 
 ## Buffer Management and UMEM Pressure
 
@@ -1334,69 +1446,82 @@ bpfrx_cos_max_observed_host_round_us{iface,queue}
 
 ## Implementation Plan
 
-### Phase 1: Queue Buffers + Aggregate Shaping
+### Phase 1: Queue Buffers + Aggregate Shaping (Local Classes Only)
 
 - `CosInterfaceConfig`, `CosState`, `ClassQueue` structures
-- `SharedTokenPools` with aggregate-only (no per-queue CIR/PIR yet)
-- `enqueue_frame()` with byte-based limits
+- `GlobalTokenPools` with aggregate-only (no per-queue CIR/PIR yet)
+- `enqueue_frame()` with byte+frame limits (dual accounting)
 - `drain_shaped_tx()` → direct TX ring submission
 - All packets on shaped interfaces go through CoS (including locally generated)
 - Wire `forwarding-class` from `FilterResult` into queue selection
 - Flow cache `queue_id` caching with epoch invalidation
-- Dynamic batch size for `LocalBatchCache`
-- Token return on idle / quiesce / config change
+- Dynamic lease size for `LocalBatchCache`
+- Lease return on idle / quiesce / config change
 - Tests: single queue, aggregate rate cap, UMEM budget, drain timeout
 
 ### Phase 2: Per-Queue CIR/PIR + Two-Phase Scheduling
 
-- Shared per-queue CIR and PIR token pools (atomic)
-- Phase 1 with rotating start index + Phase 2 with DWRR deficit carry
+- Shared per-queue CIR and PIR token pools (cache-line-aligned)
+- Phase 1 with CIR quantum round-robin + Phase 2 with DWRR deficit carry
 - `transmit-rate exact` enforcement
 - Tests: multi-queue guarantee, priority preemption, borrowing, exact mode,
   queue-index fairness (all 8 queues backlogged)
 
-### Phase 3: Per-Host Fair Queuing (Dequeue Fairness)
+### Phase 3: Fairness-Key Ownership + Remote Enqueue
 
-- `HostDrr` with AHashMap + per-host owned VecDeques
+- Owner selection via `jump_consistent_hash(iface, class, key)`
+- SPSC cross-worker ingress rings for remote enqueue
+- Packet copy path (arrival UMEM → ring → owner UMEM)
+- Owner drains ingress rings bounded per cycle
+- Backpressure: admission drop at sender when ring full
+- Epoch-based owner invalidation on worker set change
+- Tests: remote enqueue latency, ring saturation, owner remap
+
+### Phase 4: Per-Host Fair Queuing (Dequeue Fairness on Owner)
+
+- `HostDrr` with AHashMap + per-host owned VecDeques (on owner only)
 - `FairnessKey` type (`source-address` mode first)
 - Dynamic quantum (target 250µs round / active hosts)
 - Elephant detection (EWMA, reduced quantum)
-- Bounded host table with `max_host_slots`
+- Bounded host table with `max_host_slots` (global, not per-worker)
 - Overflow bucket for excess fairness keys
 - Host idle timeout + LRU eviction
-- Tests: DRR round-robin fairness, elephant detection, slab exhaustion,
-  overflow bucket service
+- Tests: DRR fairness, elephant detection, slab exhaustion, overflow service
 
-### Phase 4: Admission Control (Enqueue Fairness)
+### Phase 5: Admission Control (Enqueue Fairness on Owner)
 
-- Two-tier per-host caps (soft cap + hard cap)
+- Two-tier per-host caps (soft cap + hard cap) — global by construction
 - Over-cap reclaim list (O(1) reclaim candidate on queue-full)
-- Fairness-aware UMEM reclamation (over-cap hosts in lowest-priority queue)
-- Per-host admission policy (rules 1-5 from admission control section)
-- Tests: 1e/100m, 100e/1m, flow splitting, mixed MTU, queue-full-then-mice,
-  host churn, per-host cap enforcement, over-cap reclaim targeting
+- Fairness-aware UMEM reclamation
+- Per-host admission policy (rules 1-5)
+- Tests: 1e/100m, 100e/1m, 1 elephant across 32 workers, flow splitting,
+  mixed MTU, queue-full-then-mice, host churn, over-cap reclaim
 
-### Phase 5: Classification
+### Phase 6: Hierarchical Token Leasing
+
+- `SocketLeasePool` per NUMA node
+- Workers lease from socket pool, socket leases from global
+- Total lease credit bounds
+- Cache-line-padded `AlignedTokenPool` structs
+- Tests: same-class 16/32-worker contention, cross-socket NUMA, lease
+  credit bounds
+
+### Phase 7: Classification + Observability
 
 - DSCP-based BA classifier (64-entry table)
 - Egress DSCP rewrite rules
 - Traffic control profiles
-- Tests: DSCP→queue mapping, rewrite marking
-
-### Phase 6: Observability
-
 - `show class-of-service interface` CLI
-- Queue detail + host detail commands
-- Prometheus metrics (per-queue, per-host, aggregate, reclaim, overflow)
-- Sojourn time tracking (enqueue timestamp → dequeue delta)
-- Token lease return stats
-- Over-cap host counts, reclaim events
+- Queue detail + host detail + remote enqueue stats
+- Prometheus metrics (per-queue, per-host, aggregate, reclaim, overflow,
+  remote enqueue, lease returns)
 
-### Phase 7: Advanced (Future)
+### Phase 8: Advanced (Future)
 
 - RED/WRED drop profiles
 - Additional fairness modes (`destination-address`, `source-prefix`, `5-tuple`)
 - Per-subscriber fairness
+- Shared UMEM pool for zero-copy remote enqueue
 - Dynamic buffer pool sharing across queues
 
 ## Benchmark Plan
@@ -1468,20 +1593,25 @@ specific costs. The following benchmarks define what "fast enough" means:
 35. New-host admission under full queue: repeated first-packet arrivals from
     new hosts — verify headroom allows admission.
 
-**Many-core contention:**
+**Many-core and ownership:**
 
-36. One elephant spread across N workers: 1 host with 1000 flows hashing
-    to different workers. Verify global soft cap limits total queued bytes
-    across all workers (not soft_cap × N).
-37. Same-class hot on 16/32 workers: all workers pushing the same class at
-    line rate. Measure atomic contention on class CIR pool. Verify throughput
-    doesn't collapse from cache-line bouncing.
-38. Cross-socket NUMA contention: workers on socket 0 and socket 1 sharing
-    aggregate token pool. Measure latency of atomic operations.
-39. Global host-cap across workers: one host on 4 workers, each worker
-    holds host_bytes < per-worker soft_cap but total > global soft_cap.
-    Verify admission rejects based on global counters.
-40. Total leased credit: 32 workers each holding maximum lease. Verify
-    total outstanding credit stays within `burst / 4` bound.
-41. Host-state memory at scale: 32 workers × 2 fairness queues × 4096 slots.
-    Measure actual memory consumption. Verify within configured budget.
+36. One elephant across 16/32 workers: 1 host with 1000 flows hashing to
+    different RX workers. Verify all packets route to one owner, elephant
+    gets one fairness share (not one per worker).
+37. 100 elephants vs 100 mice across 16/32 workers: verify fairness is
+    key-based, not worker-based. Each host gets one share regardless of
+    which workers receive its traffic.
+38. Same-class hot on 16/32 workers: all workers pushing same class at line
+    rate. Verify socket-level lease pools reduce global atomic contention.
+39. Cross-socket NUMA: workers on socket 0 and socket 1. Verify
+    hierarchical leasing reduces cross-socket cache-line traffic.
+40. Remote ingress ring saturation: owner's ring is full. Verify bounded
+    drops at sender side, no deadlock, no data corruption.
+41. Hot elephant on one owner: one host becomes owner-hotspot-bound. Verify
+    it does not exceed its configured share even under CPU pressure.
+42. Total leased credit: 32 workers each holding maximum lease. Verify
+    total outstanding stays within bound.
+43. Host-state memory at scale: 2 fairness queues × 4096 global slots.
+    Verify ownership eliminates worker-count memory multiplication.
+44. Owner remap on worker add/remove: verify jump-hash moves ~1/N keys,
+    queued packets for remapped keys are drained or safely discarded.
