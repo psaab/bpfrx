@@ -4,47 +4,47 @@
 
 This document summarizes the prompt sequence, review steps, and design pivots that led from the original hierarchical policer idea to the current `docs/cos-traffic-shaping.md`.
 
-The summary refers to several `/tmp/*.md` files because the design was developed iteratively in scratch review documents before the conclusions were folded back into the repo doc. Those files were not intended as final repo artifacts; they were working notes created during the design loop.
+The design was developed iteratively in scratch review documents before the conclusions were folded back into the repo doc. The original prompts wrote those working notes into `/tmp/*.md`. The surviving copies have now been archived under `docs/cos/` so the history can be referenced directly from the repository.
 
-It is based on these temporary artifacts:
+It is based on these archived working artifacts:
 
-- `/tmp/review.md`
-- `/tmp/cos.md`
-- `/tmp/cos2.md`
-- `/tmp/cos3.md`
-- `/tmp/cos4.md`
-- `/tmp/cos5.md`
-- `/tmp/cos6.md`
-- `/tmp/cos7.md`
+- [`docs/cos/review.md`](cos/review.md)
+- [`docs/cos/cos.md`](cos/cos.md)
+- [`docs/cos/cos2.md`](cos/cos2.md)
+- [`docs/cos/cos3.md`](cos/cos3.md)
+- [`docs/cos/cos4.md`](cos/cos4.md)
+- [`docs/cos/cos5.md`](cos/cos5.md)
+- [`docs/cos/cos6.md`](cos/cos6.md)
+- [`docs/cos/cos7.md`](cos/cos7.md)
 - the prompt history that produced those files
 
-## About the Temporary Files
+## About the Archived Working Files
 
-The `/tmp` files were used as design checkpoints. Each one captured either:
+The original `/tmp` files were used as design checkpoints. Each one captured either:
 
 - a critique of the current draft
 - a concrete replacement proposal
 - a reset plan after the design drifted
 
-They matter because several important ideas were introduced, rejected, or corrected there before the final repo doc was rewritten.
+They matter because several important ideas were introduced, rejected, or corrected there before the final repo doc was rewritten. The repository copies under `docs/cos/` preserve that surviving design trail.
 
-The role of each temp file was:
+The role of each archived file was:
 
-- `/tmp/review.md`: review of the original `hierarchical-policer.md` design
-- `/tmp/cos.md`: first extensive review of `cos-traffic-shaping.md` after the shift from policing to shaping
-- `/tmp/cos2.md`: second review, focusing more explicitly on adversarial-flow behavior, queue skew, and protocol-oblivious constraints
-- `/tmp/cos3.md`: reused path; first it held a concrete architecture draft, then later it was overwritten with a newer review of a revised CoS draft
-- `/tmp/cos4.md`: many-core-focused review, especially around fairness semantics under RSS spread
-- `/tmp/cos5.md`: concrete many-core alternative centered on fairness-key ownership and hierarchical leasing
-- `/tmp/cos6.md`: reset plan after the design drifted away from hierarchy and toward a CIR shortcut model
-- `/tmp/cos7.md`: cleaned-up replacement section that became the immediate source material for rewriting `docs/cos-traffic-shaping.md`
+- [`docs/cos/review.md`](cos/review.md): review of the original `hierarchical-policer.md` design
+- [`docs/cos/cos.md`](cos/cos.md): first extensive review of `cos-traffic-shaping.md` after the shift from policing to shaping
+- [`docs/cos/cos2.md`](cos/cos2.md): second review, focusing more explicitly on adversarial-flow behavior, queue skew, and protocol-oblivious constraints
+- [`docs/cos/cos3.md`](cos/cos3.md): reused path; first it held a concrete architecture draft, then later it was overwritten with a newer review of a revised CoS draft
+- [`docs/cos/cos4.md`](cos/cos4.md): many-core-focused review, especially around fairness semantics under RSS spread
+- [`docs/cos/cos5.md`](cos/cos5.md): concrete many-core alternative centered on fairness-key ownership and hierarchical leasing
+- [`docs/cos/cos6.md`](cos/cos6.md): reset plan after the design drifted away from hierarchy and toward a CIR shortcut model
+- [`docs/cos/cos7.md`](cos/cos7.md): cleaned-up replacement section that became the immediate source material for rewriting `docs/cos-traffic-shaping.md`
 
 Two important caveats:
 
-- the `/tmp` paths are historical references, not dependencies of the final doc
-- because `/tmp/cos3.md` was reused, the current on-disk file does not preserve the first version that was written there
+- the quoted `/tmp` paths below are historical prompt destinations, not dependencies of the final doc
+- because `cos3.md` was reused, the archived file [`docs/cos/cos3.md`](cos/cos3.md) does not preserve the first version that was written there
 
-This summary keeps those references anyway because they explain the evolution of the design, especially the points where ideas were abandoned rather than merged.
+This summary keeps the original `/tmp` destinations inside prompt quotes because they record what was actually requested at the time. For readability, some checkout-specific source paths are normalized, and obvious typos in quoted prompts are marked with `[sic]`. Outside those quotes, the summary points to the archived repository copies.
 
 ## High-Level Trajectory
 
@@ -61,8 +61,8 @@ The work moved through six stages:
 
 The original user intent was:
 
-> Implement a work-conserving rate limiter, with hierarhical borrowing.  
-> The system should perform well with many competing, adverserial flows while being performant, and maintain tail latency and throughput with minimal CPU cost  
+> Implement a work-conserving rate limiter, with hierarhical [sic] borrowing.  
+> The system should perform well with many competing, adverserial [sic] flows while being performant, and maintain tail latency and throughput with minimal CPU cost  
 > Where you have flows that unevenly hash to queues and such  
 > think one elephant, versus a hundred mice or a hundred elephants vs. one mouse  
 > or 100 elephants vs. 100 mice
@@ -76,13 +76,17 @@ Those goals stayed constant throughout the later CoS/shaping work, with two addi
 
 ### 1. Review the hierarchical policer design
 
-Prompt used:
+Prompt used (normalized for repo-doc clarity):
 
-> can you read `../bpfrx/docs/hierarchical-policer.md` and review and make suggestions in `/tmp//review.md`
+> can you read the earlier hierarchical policer design draft and review and make suggestions in `/tmp/review.md`
 
 Artifact:
 
-- `/tmp/review.md`
+- [`docs/cos/review.md`](cos/review.md)
+
+Historical note:
+
+- that earlier `hierarchical-policer.md` draft is not present in the current repository; the surviving review is archived in [`docs/cos/review.md`](cos/review.md)
 
 Main findings:
 
@@ -114,7 +118,7 @@ Prompt used:
 
 Artifact:
 
-- `/tmp/cos.md`
+- [`docs/cos/cos.md`](cos/cos.md)
 
 Main findings:
 
@@ -134,9 +138,9 @@ Design impact:
 Prompt used:
 
 > can you read `../bpfrx/docs/cos-traffic-shaping.md` again  
-> review it for errors, enhancemenents and scale and keep in mind the original design goals are
+> review it for errors, enhancemenents [sic] and scale and keep in mind the original design goals are
 >
-> The system should perform well with many competing, adverserial flows while being performant, and maintain tail latency and throughput with minimal CPU cost  
+> The system should perform well with many competing, adverserial [sic] flows while being performant, and maintain tail latency and throughput with minimal CPU cost  
 > Where you have flows that unevenly hash to queues and such  
 > think one elephant, versus a hundred mice or a hundred elephants vs. one mouse  
 > or 100 elephants vs. 100 mice  
@@ -146,7 +150,7 @@ Prompt used:
 
 Artifact:
 
-- `/tmp/cos2.md`
+- [`docs/cos/cos2.md`](cos/cos2.md)
 
 Main findings:
 
@@ -175,7 +179,7 @@ Artifact at the time:
 Important note:
 
 - that earlier draft was later overwritten by a newer review request that reused the same path
-- the current on-disk `/tmp/cos3.md` is not that original architecture draft
+- the archived file [`docs/cos/cos3.md`](cos/cos3.md) contains the later review, not that original architecture draft
 
 Design impact:
 
@@ -187,7 +191,7 @@ Design impact:
 Prompt used:
 
 > can you read `../bpfrx/docs/cos-traffic-shaping.md` again  
-> review it for errors, enhancemenents and scale and keep in mind the original design goals are
+> review it for errors, enhancemenents [sic] and scale and keep in mind the original design goals are
 >
 > ...same adversarial / protocol-oblivious goals...
 >
@@ -195,7 +199,7 @@ Prompt used:
 
 Artifact:
 
-- `/tmp/cos3.md` (current file on disk)
+- [`docs/cos/cos3.md`](cos/cos3.md) (the surviving archived copy)
 
 Main findings:
 
@@ -225,7 +229,7 @@ Prompt used:
 
 Artifact:
 
-- `/tmp/cos4.md`
+- [`docs/cos/cos4.md`](cos/cos4.md)
 
 Main findings:
 
@@ -247,7 +251,7 @@ Prompt used:
 
 Artifact:
 
-- `/tmp/cos5.md`
+- [`docs/cos/cos5.md`](cos/cos5.md)
 
 Main proposal:
 
@@ -264,11 +268,11 @@ Design impact:
 
 Prompt used:
 
-> It seems youe have lost the plot on hierarchical and it seems you are taking a fast path with the CIR feature, write your plan to `/tmp/cos6.md`
+> It seems youe [sic] have lost the plot on hierarchical and it seems you are taking a fast path with the CIR feature, write your plan to `/tmp/cos6.md`
 
 Artifact:
 
-- `/tmp/cos6.md`
+- [`docs/cos/cos6.md`](cos/cos6.md)
 
 Main reset principles:
 
@@ -293,7 +297,7 @@ Prompt used:
 
 Artifact:
 
-- `/tmp/cos7.md`
+- [`docs/cos/cos7.md`](cos/cos7.md)
 
 Main output:
 
@@ -349,7 +353,7 @@ Design impact:
 
 ## What Each Artifact Contributed
 
-### `/tmp/review.md`
+### [`docs/cos/review.md`](cos/review.md)
 
 Contribution:
 
@@ -361,7 +365,7 @@ Why it mattered:
 - it was the first point where the design direction changed rather than merely being tuned
 - it made clear that “work-conserving with hierarchical borrowing” needed a cleaner service model than the original draft provided
 
-### `/tmp/cos.md`
+### [`docs/cos/cos.md`](cos/cos.md)
 
 Contribution:
 
@@ -373,7 +377,7 @@ Why it mattered:
 - it established that the next design needed to be an explicit shaper, not just a renamed policer
 - it surfaced internal contradictions early enough that later reviews could focus on fairness and scale instead of terminology alone
 
-### `/tmp/cos2.md`
+### [`docs/cos/cos2.md`](cos/cos2.md)
 
 Contribution:
 
@@ -384,7 +388,7 @@ Why it mattered:
 - it sharpened the distinction between dequeue fairness and overload fairness
 - it made “protect mice before the queue is already full” part of the design target
 
-### `/tmp/cos3.md`
+### [`docs/cos/cos3.md`](cos/cos3.md)
 
 Contribution:
 
@@ -397,9 +401,9 @@ Why it mattered:
 
 Historical note:
 
-- `/tmp/cos3.md` is the one artifact whose path is misleading if read literally because the first document written there was later replaced by a newer review
+- [`docs/cos/cos3.md`](cos/cos3.md) is the one archived artifact whose path is misleading if read literally because the first document written there was later replaced by a newer review
 
-### `/tmp/cos4.md`
+### [`docs/cos/cos4.md`](cos/cos4.md)
 
 Contribution:
 
@@ -410,7 +414,7 @@ Why it mattered:
 - it exposed that “global class fairness” was not enough if hosts could multiply their share across workers
 - it turned many-core behavior into a first-order architecture concern
 
-### `/tmp/cos5.md`
+### [`docs/cos/cos5.md`](cos/cos5.md)
 
 Contribution:
 
@@ -421,7 +425,7 @@ Why it mattered:
 - it was useful as an exploration of the scale problem
 - it also triggered the later reset because it showed the design was starting to solve scale by introducing special structure instead of preserving the core hierarchy
 
-### `/tmp/cos6.md`
+### [`docs/cos/cos6.md`](cos/cos6.md)
 
 Contribution:
 
@@ -432,7 +436,7 @@ Why it mattered:
 - this was the clearest corrective instruction in the entire sequence
 - it explicitly rejected both hierarchy drift and a CIR “fast path” interpretation
 
-### `/tmp/cos7.md`
+### [`docs/cos/cos7.md`](cos/cos7.md)
 
 Contribution:
 
@@ -479,4 +483,4 @@ The overall design was corrected in these ways:
 - then reset again when the design drifted away from a true hierarchy
 - finally rewrite the doc around the restored hierarchical model
 
-The key turning point was the user correction captured in `/tmp/cos6.md`: the design had drifted away from hierarchy and was starting to treat CIR like a fast path. The final doc rewrite exists primarily to correct that drift while keeping the original performance, fairness, and protocol-oblivious goals intact.
+The key turning point was the user correction captured in [`docs/cos/cos6.md`](cos/cos6.md): the design had drifted away from hierarchy and was starting to treat CIR like a fast path. The final doc rewrite exists primarily to correct that drift while keeping the original performance, fairness, and protocol-oblivious goals intact.
