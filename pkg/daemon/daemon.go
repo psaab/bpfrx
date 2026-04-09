@@ -218,6 +218,9 @@ type Daemon struct {
 	localFailoverCommitMu      sync.Mutex
 	localFailoverCommitReady   map[int]bool
 	localFailoverCommitTimeout time.Duration
+	// localFailoverCommitDelay adds one short post-ready dwell after the
+	// readiness bit flips so the VRRP/direct-ownership side effects that set
+	// the bit have a chance to propagate before the peer finalizes demotion.
 	localFailoverCommitDelay   time.Duration
 	// Test hooks for direct-mode VIP ownership reconciliation.
 	directAddVIPsFn        func(int) int

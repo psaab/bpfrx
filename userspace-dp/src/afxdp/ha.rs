@@ -100,11 +100,19 @@ impl super::Coordinator {
             .map(|handle| handle.commands.clone())
             .collect::<Vec<_>>();
         for commands in &worker_commands {
-            if let Ok(mut pending) = commands.lock() {
-                pending.push_back(WorkerCommand::RefreshOwnerRGS {
-                    owner_rgs: activated_rgs.to_vec(),
-                });
-            }
+            let mut pending = match commands.lock() {
+                Ok(pending) => pending,
+                Err(poisoned) => {
+                    eprintln!(
+                        "bpfrx-ha: worker command queue lock poisoned while refreshing activated RGs {:?}; recovering inner queue",
+                        activated_rgs
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            pending.push_back(WorkerCommand::RefreshOwnerRGS {
+                owner_rgs: activated_rgs.to_vec(),
+            });
         }
         let current = self.ha_state.load();
         let session_map_fd = self.session_map_fd.as_ref().map(|fd| fd.fd).unwrap_or(-1);

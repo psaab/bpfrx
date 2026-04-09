@@ -403,9 +403,22 @@ pub(super) fn apply_worker_commands(
                 }
             }
             WorkerCommand::RefreshOwnerRGS { owner_rgs } => {
-                if owner_rgs.is_empty() {
+                let activated_owner_rgs: std::collections::BTreeSet<_> = owner_rgs
+                    .into_iter()
+                    .filter(|owner_rg_id| *owner_rg_id > 0)
+                    .collect();
+                if activated_owner_rgs.is_empty() {
                     continue;
                 }
+                let locally_relevant_owner_rgs: std::collections::BTreeSet<_> = ha_state
+                    .iter()
+                    .filter_map(|(owner_rg_id, runtime)| {
+                        runtime
+                            .is_forwarding_active(now_secs)
+                            .then_some(*owner_rg_id)
+                    })
+                    .chain(activated_owner_rgs.iter().copied())
+                    .collect();
 
                 // Activation must re-evaluate all HA-managed worker sessions,
                 // not just those currently indexed under the activated RG.
@@ -413,7 +426,9 @@ pub(super) fn apply_worker_commands(
                 // move of RG1 changes whether they should locally forward or
                 // fabric-redirect. Activation is infrequent, so do the wider
                 // worker scan here instead of trusting potentially stale RG
-                // ownership buckets.
+                // ownership buckets. Still skip sessions whose current and
+                // recomputed owners are both purely remote, since a local RG
+                // move cannot affect them.
                 let mut refresh = Vec::new();
                 sessions.iter_with_origin(|key, decision, metadata, origin| {
                     if metadata.owner_rg_id <= 0 && !metadata.fabric_ingress {
@@ -461,6 +476,12 @@ pub(super) fn apply_worker_commands(
                         owner_rg_for_resolution(forwarding, refreshed_decision.resolution);
                     if refreshed_owner_rg > 0 {
                         refreshed_metadata.owner_rg_id = refreshed_owner_rg;
+                    }
+                    if !metadata.fabric_ingress
+                        && !locally_relevant_owner_rgs.contains(&metadata.owner_rg_id)
+                        && !locally_relevant_owner_rgs.contains(&refreshed_metadata.owner_rg_id)
+                    {
+                        return;
                     }
                     refresh.push((key.clone(), refreshed_decision, refreshed_metadata, origin));
                 });

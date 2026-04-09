@@ -295,6 +295,9 @@ func (m *Manager) restorePeerTransferOutOverrideLocked(rgID int, reqID uint64) b
 	snapshot, hadSnapshot := m.peerTransferOutPrevious[rgID]
 	delete(m.peerTransferOutPrevious, rgID)
 	if hadSnapshot && snapshot.present {
+		// A fresh heartbeat can race this restore and overwrite peerGroups
+		// with newer live state. If that happens we may briefly put the older
+		// snapshot back here, but the next heartbeat corrects it again.
 		m.peerGroups[rgID] = snapshot.state
 	} else {
 		delete(m.peerGroups, rgID)
