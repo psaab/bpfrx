@@ -313,7 +313,7 @@ func New(opts Options) *Daemon {
 		directAnnounceSchedule:     []time.Duration{0, 250 * time.Millisecond, 1 * time.Second, 2 * time.Second, 4 * time.Second, 6 * time.Second},
 		directVIPOwned:             make(map[int]bool),
 		localFailoverCommitReady:   make(map[int]bool),
-		localFailoverCommitTimeout: time.Second,
+		localFailoverCommitTimeout: 3 * time.Second,
 		localFailoverCommitDelay:   200 * time.Millisecond,
 		userspaceDemotionPrepUntil: make(map[int]time.Time),
 	}
