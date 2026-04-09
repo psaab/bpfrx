@@ -38,22 +38,22 @@ What improved
 
 Compared to the earlier version, these are real improvements:
 
-- The scope/non-goals section at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L5) is clearer and more honest.
-- The service model at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L41) is much better defined.
-- Shared class/aggregate buckets at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L139) now match the stated RSS-skew goal.
-- The queue ownership fix at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L220) removes the old impossible "host ranges into parent VecDeque" design.
-- Direct TX ownership at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L248) is the right call.
-- The benchmark section at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1331) is much better than pretending exact hot-path costs are already known.
+- The scope/non-goals section at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L5) is clearer and more honest.
+- The service model at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L41) is much better defined.
+- Shared class/aggregate buckets at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L139) now match the stated RSS-skew goal.
+- The queue ownership fix at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L220) removes the old impossible "host ranges into parent VecDeque" design.
+- Direct TX ownership at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L248) is the right call.
+- The benchmark section at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1331) is much better than pretending exact hot-path costs are already known.
 
 Critical findings
 
 1. Queue-level tail drop means mice are not actually protected under overload.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L787)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L823)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1183)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1211)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L787)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L823)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1183)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1211)
 
 The doc claims outcomes like:
 
@@ -80,10 +80,10 @@ Without one of those, the dequeue scheduler is too late to protect mice.
 2. The DRR round length explodes with active host count and directly conflicts with the tail-latency goal.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1191)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1218)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1307)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1396)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1191)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1218)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1307)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1396)
 
 The document itself computes a 50 ms round in the `100 elephants vs 1 mouse` example. That is already a warning sign.
 
@@ -112,9 +112,9 @@ I would recommend:
 3. Phase 1 CIR guarantees are not actually guaranteed by the current loop structure.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L86)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L102)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L487)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L86)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L102)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L487)
 
 The prose says all backlogged queues are served up to CIR before priority applies to surplus.
 
@@ -143,10 +143,10 @@ As written, the semantics are stronger than the algorithm.
 4. Shared token caches will strand tokens and distort both fairness and low-rate shaping.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L139)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L425)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L687)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1358)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L139)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L425)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L687)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1358)
 
 The fully shared buckets are conceptually right, but the local caching story is still too optimistic.
 
@@ -190,9 +190,9 @@ not a single hard-coded number for all rates and queues.
 5. The CPU cost model is still too optimistic for the actual scale target.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L169)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L351)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1307)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L169)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L351)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1307)
 
 The document correctly moved away from fake nanosecond tables, but the narrative is still a little too optimistic.
 
@@ -220,8 +220,8 @@ Asymptotic `O(1)` is fine, but the doc should stop short of implying that means 
 6. `FxHashMap` is a poor default if "adversarial" is part of the requirement.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L448)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1328)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L448)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1328)
 
 If the requirement explicitly includes adversarial flows, then using `FxHashMap` for public traffic keys needs stronger justification.
 
@@ -236,9 +236,9 @@ At minimum the doc should justify the choice. More likely, it should use:
 7. The design still has a bypass inconsistency for locally generated and cross-binding traffic.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L248)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L263)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1158)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L248)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L263)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1158)
 
 The doc says:
 
@@ -261,8 +261,8 @@ Right now the two sections do not fully agree.
 8. The TX-ring backpressure story is missing essential requeue metadata.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L274)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L663)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L274)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L663)
 
 The design says frames that could not be inserted are returned to the front of their class queues, which is correct in principle.
 
@@ -282,8 +282,8 @@ The doc should include the actual required metadata rather than hand-waving this
 9. The runtime UMEM reclaim policy does not match the fairness goal.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L812)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L852)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L812)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L852)
 
 The current reclaim policy is:
 
@@ -308,10 +308,10 @@ not just whichever packet `dequeue()` happens to return.
 10. The doc mentions host-state eviction in the service model, but the actual design never defines it.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L67)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L446)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1350)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1396)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L67)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L446)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1350)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1396)
 
 The service model says extreme host count may evict cold fairness state. But the actual structure only exposes:
 
@@ -332,9 +332,9 @@ For adversarial churn, this is a major omission. The implementation needs an exp
 11. The design is mostly protocol oblivious, but it is not actually protocol agnostic in the broad sense.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1135)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1143)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L995)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1135)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1143)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L995)
 
 The good news:
 
@@ -357,9 +357,9 @@ A better phrasing would be:
 12. Queue classification caching needs an invalidation story.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1165)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1172)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L914)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1165)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1172)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L914)
 
 Caching `queue_id` in the flow cache is fine as an optimization. It is not a shaper bypass.
 
@@ -374,7 +374,7 @@ Given the requirement that the design should not depend on fragile fast-path tri
 13. Worker skew is solved for tokens, not for CPU.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1262)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1262)
 
 The doc says a hot worker can claim the full configured rate under skew because token pools are shared.
 
@@ -395,9 +395,9 @@ That distinction matters because the original goal includes uneven hash distribu
 14. The config-change and HA-drain failure-mode timing is too optimistic.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L912)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L921)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L929)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L912)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L921)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L929)
 
 The doc says queued frames are drained before:
 
@@ -435,7 +435,7 @@ The same applies to config reload.
 15. The benchmark plan is good, but it is still missing the admission-fairness cases that matter most.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1331)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1331)
 
 The benchmark plan focuses mostly on dequeue correctness. It needs explicit overload-admission tests too:
 
@@ -542,11 +542,11 @@ Potential doc errors or places to tighten wording
 
 1. `show class-of-service ... queue 0 hosts` still uses the label `Host` and IP examples even though the fairness key is configurable. That is fine for `source-address`, but the CLI design probably needs a generic label when fairness mode is not host IP.
 
-2. The statement at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L899) that backpressure impact is "bounded by one poll cycle" is too strong if the TX ring stays full across multiple cycles.
+2. The statement at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L899) that backpressure impact is "bounded by one poll cycle" is too strong if the TX ring stays full across multiple cycles.
 
-3. The statement at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L907) that "no special handling needed" for worker skew is too strong because it ignores CPU saturation on the hot worker.
+3. The statement at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L907) that "no special handling needed" for worker skew is too strong because it ignores CPU saturation on the hot worker.
 
-4. The phrase "mouse is NEVER dropped" at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1223) is not justified unless admission fairness exists.
+4. The phrase "mouse is NEVER dropped" at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1223) is not justified unless admission fairness exists.
 
 Recommended additional tests
 

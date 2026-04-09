@@ -27,27 +27,27 @@ That means the document is improved, but it still does not fully satisfy the sta
 
 What is good in the current draft
 
-1. Shared budgets across workers at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L164) are the right correction for RSS skew. This fixes the old conceptual error where guarantees were implicitly partitioned per worker.
+1. Shared budgets across workers at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L164) are the right correction for RSS skew. This fixes the old conceptual error where guarantees were implicitly partitioned per worker.
 
-2. The explicit “no bypass on shaped interfaces” rule at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L480) is correct and necessary. That is aligned with the requirement that this cannot depend on fast-path shortcuts.
+2. The explicit “no bypass on shaped interfaces” rule at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L480) is correct and necessary. That is aligned with the requirement that this cannot depend on fast-path shortcuts.
 
-3. Admission control at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L304) is the right direction. This is the first version that acknowledges DRR alone is too late under overload.
+3. Admission control at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L304) is the right direction. This is the first version that acknowledges DRR alone is too late under overload.
 
-4. The direct-TX ownership model at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L480) is much better than staging into a FIFO after the scheduler.
+4. The direct-TX ownership model at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L480) is much better than staging into a FIFO after the scheduler.
 
-5. Bounding host state with `max_host_slots` and an overflow bucket at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L761) is the right kind of scaling valve.
+5. Bounding host state with `max_host_slots` and an overflow bucket at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L761) is the right kind of scaling valve.
 
-6. The benchmark plan at [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1125) is much more credible than the older fake-nanosecond cost tables.
+6. The benchmark plan at [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1125) is much more credible than the older fake-nanosecond cost tables.
 
 Critical findings
 
 1. The current admission-control design still fails the “many elephants then one mouse” case.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L318)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L336)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L393)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1146)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L318)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L336)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L393)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1146)
 
 The soft-cap design only helps if at least one host is already over soft cap.
 
@@ -83,10 +83,10 @@ Without one of those, the design still fails under many-elephant equilibrium loa
 2. Queue occupancy is measured in payload bytes, but actual UMEM consumption is frame-based, and the fairness path does not enforce the queue frame cap.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L579)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L792)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L382)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L800)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L579)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L792)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L382)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L800)
 
 This is a real correctness and scale problem in an AF_XDP system.
 
@@ -115,8 +115,8 @@ The fix should be:
 3. The dynamic token-lease formula breaks down below MTU-sized leases.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L187)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L203)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L187)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L203)
 
 The document gives this table:
 
@@ -140,10 +140,10 @@ Right now the doc claims correctness here, but it has not actually closed the lo
 4. The document still oversells the admission-control policy as “heaviest-host-first drop”, but that is not what the mechanism actually does.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L89)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L351)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L863)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L872)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L89)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L351)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L863)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L872)
 
 The actual mechanism is:
 
@@ -167,8 +167,8 @@ As written, the prose is stronger than the algorithm.
 5. There is a factual error in the hash-table discussion.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L693)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L754)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L693)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L754)
 
 The document says:
 
@@ -192,9 +192,9 @@ This is a real documentation error, not just a style issue.
 6. The latency story is still not tied tightly enough to the configured buffer sizes.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L246)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L889)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L921)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L246)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L889)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L921)
 
 The document correctly warns against enabling host DRR on latency-sensitive queues, but it still allows very large buffers without a latency-derived validation rule.
 
@@ -216,10 +216,10 @@ Without that, operators can configure a “correct” shape with unacceptable la
 7. The target round units are inconsistent across the document.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L281)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L586)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L939)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1019)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L281)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L586)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L939)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1019)
 
 The main text recommends:
 
@@ -244,9 +244,9 @@ This needs to be normalized. Right now the doc is internally inconsistent.
 8. The overflow-bucket story is practical, but the fairness and benchmark claims do not fully account for it.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L458)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L775)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1162)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L458)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L775)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1162)
 
 The design says:
 
@@ -270,8 +270,8 @@ Right now the overflow path is introduced as a safety valve, but its fairness co
 9. Phase 1 is much better than before, but the “proportional to CIR” wording is still too loose.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L106)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L121)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L106)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L121)
 
 The doc says:
 
@@ -294,9 +294,9 @@ This is not a blocker, but the wording should be tightened.
 10. The doc now handles CPU correctness better, but it still understates the throughput cost of hostile host churn.
 
 Relevant lines:
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L696)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L761)
-- [cos-traffic-shaping.md](/home/ps/git/bpfrx/docs/cos-traffic-shaping.md#L1164)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L696)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L761)
+- [cos-traffic-shaping.md](../cos-traffic-shaping.md#L1164)
 
 The design is careful about bounded memory, but not yet explicit enough about the CPU cost of:
 
