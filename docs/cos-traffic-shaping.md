@@ -234,6 +234,29 @@ This prevents stranding tokens on idle workers. A worker that claims
 aggregate tokens then goes idle returns them within 100µs, making them
 available to the actually-busy worker.
 
+**Total lease credit bound**: The maximum total leased-but-unspent tokens
+across all workers is bounded per bucket:
+
+```
+max_total_leased = min(bucket_burst / 4, lease_per_worker * max_active_workers)
+```
+
+When claiming, if the shared pool's tokens minus `max_total_leased` would
+go negative, the worker receives a smaller lease (only what's available).
+This prevents N workers from collectively draining the pool far beyond
+what's immediately needed.
+
+| Workers | Aggregate lease | Total leased | At 10 Gbps | At 1 Gbps |
+|---------|----------------|--------------|------------|-----------|
+| 4       | 31 KB          | 124 KB       | ~0.1 ms    | ~1 ms     |
+| 16      | 31 KB          | 496 KB       | ~0.4 ms    | ~4 ms     |
+| 32      | 31 KB          | 992 KB       | ~0.8 ms    | ~8 ms     |
+
+At 32 workers and 1 Gbps, ~8ms of outstanding credit. This is bounded by
+`burst / 4`, so a 125 MB burst cap limits total leased to ~31 MB regardless
+of worker count. At high worker counts, per-worker lease size should be
+reduced: `lease_per_worker = min(computed_lease, max_total_leased / active_workers)`.
+
 ### CIR and PIR Bucket Semantics
 
 Each queue has two independent token buckets:
@@ -312,6 +335,68 @@ At 1000 hosts on a 10 Gbps queue: worst-case inter-service delay is
 DRR is recommended **only** for `low` and `best-effort` queues. Latency-
 sensitive queues (`strict-high`, `high`) should use FIFO with small buffers
 where inter-service delay is simply queue depth / rate.
+
+### Global vs Per-Worker Fairness
+
+**Class fairness is global.** CIR, PIR, and aggregate token pools are shared
+`AtomicI64` across all workers. A class guarantee is honored regardless of
+which workers process that class's traffic.
+
+**Host fairness uses global admission caps + local DRR service.**
+
+The problem: if host fairness were purely per-worker, an elephant spreading
+flows across N workers would get N× the DRR quantum, N× the soft cap, and
+N× the queue share — defeating fairness entirely. This is the core many-core
+version of the flow-splitting problem.
+
+The solution: **shared host accounting**. Per-host `queued_bytes` and
+`queued_frames` are tracked globally across all workers via a sharded
+shared structure. Admission caps (soft/hard) check these global counters.
+Local DRR still runs per-worker for dequeue scheduling, but the admission
+gate is global.
+
+```
+Global (shared across workers):
+  SharedHostAccounting
+    ├── shard[0]: AHashMap<FairnessKey, HostGlobalCounters>
+    ├── shard[1]: ...
+    └── shard[63]: ...   (64 shards, Mutex per shard)
+
+  Each HostGlobalCounters:
+    queued_bytes: AtomicU64    // total across all workers
+    queued_frames: AtomicU32
+
+Per-worker (local):
+  HostDrr
+    ├── local DRR active list, deficit counters
+    └── local per-host VecDeque<QueuedFrame>
+```
+
+On enqueue: atomically increment the host's global `queued_bytes`. Check
+global soft/hard cap. Then enqueue locally.
+
+On dequeue: atomically decrement.
+
+**Why sharded**: 64 shards (keyed by fairness-key hash) minimize lock
+contention. Workers processing different hosts rarely contend. Workers
+processing the same host (the adversarial case) contend on the same
+shard — which is exactly what we want: that contention serializes their
+admission checks against a single shared cap.
+
+**Cost**: One atomic increment per enqueue, one per dequeue, same shard.
+Under non-adversarial load (hosts don't overlap across workers), different
+hosts land in different shards — no contention. Under adversarial load
+(one host on many workers), the contention is on that host's shard —
+bounded by shard mutex, O(1) per operation.
+
+**What this means for the elephant scenarios**:
+- One elephant across 32 workers: global `queued_bytes` reaches soft cap
+  after `soft_cap` total bytes regardless of worker spread. The elephant
+  cannot multiply its share by spreading.
+- One elephant on one worker: same behavior as before — local admission
+  check against global counters.
+- Mice on any number of workers: each mouse has low global `queued_bytes`,
+  always below soft cap, always admitted.
 
 ### Admission Control — Two-Tier Per-Host Caps
 
@@ -402,9 +487,17 @@ for O(1) reclaim candidate selection:
 full (all hosts at or below soft cap), maintain a `deepest_host_idx` that
 tracks the host with the most queued bytes. Updated on every enqueue (if
 the enqueuing host's `queued_bytes` exceeds the current max, update the
-tracker). On reclaim-list-empty, reclaim from `deepest_host_idx`. This is
-O(1) for the common case; the tracker may be stale after dequeue, but it
-is refreshed on the next enqueue or on a fallback miss.
+tracker). On reclaim-list-empty, reclaim from `deepest_host_idx`.
+
+This is a **heuristic, not an exact max-tracker**. The tracker is O(1)
+optimistic: updated on enqueue, but may be stale after dequeue (the deepest
+host may have drained). On a stale miss (tracked host is now empty or below
+threshold), the fallback does one O(N_active) scan to find the true deepest
+host and refreshes the tracker. Under steady-state, stale misses are rare
+because the deepest host typically stays deep. Under adversarial churn, the
+occasional O(N) scan is acceptable because it only fires when the reclaim
+list is empty — which itself means no host is over soft cap, a scenario
+that's bounded by the admission headroom mechanism.
 
 ```rust
 fn enqueue_frame(
@@ -681,16 +774,49 @@ pub(crate) enum FairnessMode {
 
 ### Shared Token Pools (Atomic, Cross-Worker)
 
+Each token pool is padded to its own cache line to prevent false sharing.
+On many-core systems, adjacent atomics in packed arrays cause cache-line
+ping-pong even when workers access different queues.
+
 ```rust
+/// One token pool: tokens + refill timestamp on the same cache line.
+/// Workers touching queue 0's CIR never invalidate queue 1's cache line.
+#[repr(align(128))]  // 2× cache line to avoid adjacent-sector prefetch
+pub(crate) struct AlignedTokenPool {
+    pub tokens: AtomicI64,
+    pub last_refill_ns: AtomicU64,
+    _pad: [u8; 112],  // fill to 128 bytes
+}
+
 pub(crate) struct SharedTokenPools {
-    pub aggregate: AtomicI64,
-    pub aggregate_last_refill_ns: AtomicU64,
-    pub queue_cir: [AtomicI64; 8],
-    pub queue_cir_last_refill_ns: [AtomicU64; 8],
-    pub queue_pir: [AtomicI64; 8],
-    pub queue_pir_last_refill_ns: [AtomicU64; 8],
+    pub aggregate: AlignedTokenPool,
+    pub queue_cir: [AlignedTokenPool; 8],
+    pub queue_pir: [AlignedTokenPool; 8],
 }
 ```
+
+Total size: 17 pools × 128 bytes = 2,176 bytes per interface. Negligible
+memory cost for eliminating cross-queue false sharing.
+
+### Shared Host Accounting (Global Admission Caps)
+
+```rust
+/// Global per-host byte/frame counters, shared across all workers.
+/// Sharded by fairness-key hash for reduced lock contention.
+pub(crate) struct SharedHostAccounting {
+    shards: [Mutex<AHashMap<FairnessKey, HostGlobalCounters>>; 64],
+}
+
+pub(crate) struct HostGlobalCounters {
+    pub queued_bytes: AtomicU64,
+    pub queued_frames: AtomicU32,
+}
+```
+
+Workers increment/decrement counters atomically on enqueue/dequeue.
+Admission checks (soft/hard cap) read the global counter. The shard mutex
+is held only for map lookup/insert — the atomic counter updates themselves
+are lock-free after the initial lookup.
 
 ### Per-Worker Mutable State
 
@@ -700,7 +826,8 @@ pub(crate) struct CosState {
     agg_cache: LocalBatchCache,
     queue_cir_cache: [LocalBatchCache; 8],
     queue_pir_cache: [LocalBatchCache; 8],
-    shared: Arc<SharedTokenPools>,
+    shared_pools: Arc<SharedTokenPools>,
+    shared_hosts: Arc<SharedHostAccounting>,
     surplus_deficit: [i64; 8],
     /// Rotating start index for Phase 1 guarantee fairness.
     phase1_start: u8,
@@ -850,16 +977,20 @@ scheduling cycle. This prevents dead hosts from consuming slab slots.
 from keys that can't get a host slot are enqueued here.
 
 Overflow service contract:
-- The scheduler serves **1 overflow packet per DRR round** (interleaved
-  after completing the active host list). This gives overflow traffic
-  approximately `1 / (active_hosts + 1)` of the queue's service — degraded
-  but nonzero.
+- The scheduler reserves a **minimum overflow byte budget per scheduling
+  cycle**: `overflow_budget = max(mtu, queue_cir_bytes_per_cycle * 0.05)`.
+  This is 5% of the queue's per-cycle CIR service, with a floor of one MTU.
+  The overflow budget is served after the DRR round completes but before
+  moving to the next priority level.
 - Overflow packets are subject to the same queue byte/frame caps as
   regular traffic. They can be reclaimed under UMEM pressure (lowest
   priority for reclaim, after over-cap hosts).
-- Overflow can be starved if the DRR round itself consumes the entire
-  queue budget. In practice this only happens when active hosts saturate
-  the queue's CIR, which means the queue is already under heavy load.
+- Under extreme load where DRR active hosts consume the entire queue budget,
+  the 5% overflow reservation is deducted from the DRR round, not added on
+  top. This means DRR hosts collectively lose 5% to guarantee overflow
+  service — a small cost for preventing overflow starvation.
+- Overflow byte cap: `buffer_bytes / 8`. Overflow frame cap: `buffer_frames / 8`.
+  Packets exceeding these are dropped with `overflow_drops` stat.
 
 This ensures:
 - Memory stays bounded (`max_host_slots` is a hard cap)
@@ -880,6 +1011,42 @@ adversarial churn (e.g., spoofed source IPs), the overflow bucket absorbs
 the churn without per-key slab allocation. The benchmark plan includes a
 dedicated host-churn test (benchmark #18) to validate that throughput
 remains acceptable under adversarial churn rates.
+
+## Per-Interface Memory Budget
+
+Host fairness state scales with `workers × fairness_queues × max_host_slots`.
+This must be budgeted explicitly to prevent surprise memory growth on
+many-core systems.
+
+**Per-host slot size** (approximate): 96-128 bytes (key, counters, linked-list
+pointers, VecDeque header — excluding queued packet buffers).
+
+| Workers | Fairness queues | max_host_slots | Total slots | Slot memory |
+|---------|----------------|----------------|-------------|-------------|
+| 4       | 2              | 4096           | 32,768      | ~4 MB       |
+| 16      | 2              | 4096           | 131,072     | ~16 MB      |
+| 32      | 2              | 4096           | 262,144     | ~32 MB      |
+| 32      | 2              | 1024           | 65,536      | ~8 MB       |
+
+Plus shared host accounting: 64 shards × AHashMap overhead ≈ ~2 MB for
+up to 100K unique keys.
+
+Plus shared token pools: 17 × 128 bytes = ~2 KB per interface.
+
+**Recommendation**: Enable host fairness on **at most 2 queues** (typically
+`best-effort` and one bulk/custom queue). Do not enable on all 8 queues.
+For many-core systems (>16 workers), consider reducing `max_host_slots`
+to 1024 or 2048.
+
+The coordinator validates at config time:
+
+```
+total_host_memory = num_workers * fairness_queues * max_host_slots * ~128
+```
+
+If this exceeds a configurable per-interface memory budget (default: 64 MB),
+the commit is rejected with a warning suggesting reduced `max_host_slots`
+or fewer fairness-enabled queues.
 
 ## Buffer Management and UMEM Pressure
 
@@ -1300,3 +1467,21 @@ specific costs. The following benchmarks define what "fast enough" means:
     inter-service delay matches design math within 2×.
 35. New-host admission under full queue: repeated first-packet arrivals from
     new hosts — verify headroom allows admission.
+
+**Many-core contention:**
+
+36. One elephant spread across N workers: 1 host with 1000 flows hashing
+    to different workers. Verify global soft cap limits total queued bytes
+    across all workers (not soft_cap × N).
+37. Same-class hot on 16/32 workers: all workers pushing the same class at
+    line rate. Measure atomic contention on class CIR pool. Verify throughput
+    doesn't collapse from cache-line bouncing.
+38. Cross-socket NUMA contention: workers on socket 0 and socket 1 sharing
+    aggregate token pool. Measure latency of atomic operations.
+39. Global host-cap across workers: one host on 4 workers, each worker
+    holds host_bytes < per-worker soft_cap but total > global soft_cap.
+    Verify admission rejects based on global counters.
+40. Total leased credit: 32 workers each holding maximum lease. Verify
+    total outstanding credit stays within `burst / 4` bound.
+41. Host-state memory at scale: 32 workers × 2 fairness queues × 4096 slots.
+    Measure actual memory consumption. Verify within configured budget.
