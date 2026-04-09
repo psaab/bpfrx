@@ -822,6 +822,12 @@ func userspaceManualFailoverTransferReadinessError(state cluster.TransferReadine
 	return nil
 }
 
+type userspaceTransferReadinessProvider interface {
+	IsConnected() bool
+	PeerHealthy() bool
+	TransferReadiness() cluster.TransferReadinessSnapshot
+}
+
 type userspaceSoftwareVersionMismatchProvider interface {
 	SoftwareVersionMismatch() (bool, string, string)
 }
@@ -836,16 +842,11 @@ func userspaceSoftwareVersionMismatchReason(provider userspaceSoftwareVersionMis
 	return nil
 }
 
-func (d *Daemon) userspaceTransferReadiness(rgID int) (bool, []string) {
-	if d.cluster != nil {
-		if reasons := userspaceSoftwareVersionMismatchReason(d.cluster); len(reasons) > 0 {
-			return false, reasons
-		}
-	}
-	if d.sessionSync == nil || !d.sessionSync.IsConnected() || !d.sessionSync.PeerHealthy() || !d.syncPeerConnected.Load() {
+func computeUserspaceTransferReadiness(sync userspaceTransferReadinessProvider, syncPeerConnected bool) (bool, []string) {
+	if !sync.IsConnected() || !sync.PeerHealthy() || !syncPeerConnected {
 		return false, []string{"session sync disconnected"}
 	}
-	state := d.sessionSync.TransferReadiness()
+	state := sync.TransferReadiness()
 	if state.ReadyForManualFailover() {
 		return true, nil
 	}
@@ -853,6 +854,18 @@ func (d *Daemon) userspaceTransferReadiness(rgID int) (bool, []string) {
 		return false, []string{reason}
 	}
 	return true, nil
+}
+
+func (d *Daemon) userspaceTransferReadiness(rgID int) (bool, []string) {
+	if d.cluster != nil {
+		if reasons := userspaceSoftwareVersionMismatchReason(d.cluster); len(reasons) > 0 {
+			return false, reasons
+		}
+	}
+	if d.sessionSync == nil {
+		return false, []string{"session sync disconnected"}
+	}
+	return computeUserspaceTransferReadiness(d.sessionSync, d.syncPeerConnected.Load())
 }
 
 func (d *Daemon) prepareUserspaceManualFailover(rgID int) error {

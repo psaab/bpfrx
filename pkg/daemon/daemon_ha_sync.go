@@ -657,6 +657,7 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			d.cluster.SetPeerFailoverBatchFunc(d.sessionSync.SendFailoverBatch)
 			d.cluster.SetPeerFailoverCommitBatchFunc(d.sessionSync.SendFailoverCommitBatch)
 			d.cluster.SetPreManualFailoverHook(d.prepareUserspaceManualFailover)
+			d.cluster.SetLocalTransferCommitReadyHook(d.waitLocalFailoverCommitReady)
 			d.cluster.SetTransferReadinessFunc(d.userspaceTransferReadiness)
 			d.cluster.SetPeerTimeoutGuard(d.shouldSuppressPeerHeartbeatTimeout)
 

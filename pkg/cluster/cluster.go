@@ -138,7 +138,8 @@ type Manager struct {
 	// secondary during the same window so a transient heartbeat gap cannot
 	// immediately re-promote the old primary.
 	localTransferOutHoldUntil map[int]time.Time
-	peerMonitors              []InterfaceMonitorInfo
+	peerTransferOutPrevious map[int]peerGroupSnapshot
+	peerMonitors            []InterfaceMonitorInfo
 
 	// Heartbeat goroutines (nil when not started).
 	hbSender   *heartbeatSender
@@ -187,6 +188,12 @@ type Manager struct {
 	// transferReadinessFn reports whether explicit manual failover can be
 	// attempted for the local RG right now and, if not, why.
 	transferReadinessFn func(rgID int) (bool, []string)
+	// localTransferCommitReadyFn runs on the requesting node after local
+	// ownership has been committed but before the final peer-demotion
+	// commit is sent. The daemon uses this to ensure the target node has
+	// actually applied its local failover side effects before the old
+	// owner is told to stand down.
+	localTransferCommitReadyFn func(rgIDs []int) error
 	// Retry policy for transient pre-failover prepare failures.
 	preManualFailoverRetryTimeout  time.Duration
 	preManualFailoverRetryInterval time.Duration
@@ -220,6 +227,11 @@ type Manager struct {
 	failoverInProgress map[int]bool
 }
 
+type peerGroupSnapshot struct {
+	state   PeerGroupState
+	present bool
+}
+
 // DefaultTakeoverHoldTime is the default additional delay after an RG becomes
 // ready before election promotes it to primary. Zero means promote as soon as
 // readiness is established.
@@ -242,6 +254,7 @@ func NewManager(nodeID, clusterID int) *Manager {
 		peerTransferOutOverride:        make(map[int]uint64),
 		peerTransferCommitGraceUntil:   make(map[int]time.Time),
 		localTransferOutHoldUntil:      make(map[int]time.Time),
+		peerTransferOutPrevious:        make(map[int]peerGroupSnapshot),
 		hbInterval:                     DefaultHeartbeatInterval,
 		hbThreshold:                    DefaultHeartbeatThreshold,
 		history:                        NewEventHistory(64),
@@ -250,6 +263,50 @@ func NewManager(nodeID, clusterID int) *Manager {
 		preManualFailoverRetryInterval: DefaultPreManualFailoverRetryInterval,
 		failoverInProgress:             make(map[int]bool),
 	}
+}
+
+func (m *Manager) applyPeerTransferOutOverrideLocked(rgID int, reqID uint64) {
+	previous, ok := m.peerGroups[rgID]
+	m.peerTransferOutOverride[rgID] = reqID
+	m.peerTransferOutPrevious[rgID] = peerGroupSnapshot{
+		state:   previous,
+		present: ok,
+	}
+	peerGroup := previous
+	peerGroup.GroupID = rgID
+	peerGroup.State = StateSecondaryHold
+	m.peerGroups[rgID] = peerGroup
+	if rg := m.groups[rgID]; rg != nil {
+		rg.PeerPriority = peerGroup.Priority
+	}
+}
+
+func (m *Manager) clearPeerTransferOutOverrideLocked(rgID int) {
+	delete(m.peerTransferOutOverride, rgID)
+	delete(m.peerTransferOutPrevious, rgID)
+}
+
+func (m *Manager) restorePeerTransferOutOverrideLocked(rgID int, reqID uint64) bool {
+	currentReqID, ok := m.peerTransferOutOverride[rgID]
+	if !ok || currentReqID != reqID {
+		return false
+	}
+	delete(m.peerTransferOutOverride, rgID)
+	snapshot, hadSnapshot := m.peerTransferOutPrevious[rgID]
+	delete(m.peerTransferOutPrevious, rgID)
+	if hadSnapshot && snapshot.present {
+		m.peerGroups[rgID] = snapshot.state
+	} else {
+		delete(m.peerGroups, rgID)
+	}
+	if rg := m.groups[rgID]; rg != nil {
+		if snapshot.present {
+			rg.PeerPriority = snapshot.state.Priority
+		} else {
+			rg.PeerPriority = 0
+		}
+	}
+	return true
 }
 
 // NodeID returns the local node ID.
@@ -838,6 +895,15 @@ func (m *Manager) SetTransferReadinessFunc(fn func(rgID int) (bool, []string)) {
 	m.transferReadinessFn = fn
 }
 
+// SetLocalTransferCommitReadyHook registers a callback that runs on the
+// requesting node after local ownership is committed and before the final
+// peer-demotion commit is sent.
+func (m *Manager) SetLocalTransferCommitReadyHook(fn func(rgIDs []int) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.localTransferCommitReadyFn = fn
+}
+
 // SetPeerFailoverFunc sets the callback used to send remote failover requests
 // to the peer via the fabric sync connection.
 func (m *Manager) SetPeerFailoverFunc(fn func(rgID int) (uint64, error)) {
@@ -952,6 +1018,7 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 	commitFn := m.peerFailoverCommitFn
 	transferReadyFn := m.transferReadinessFn
 	peerAlive := m.peerAlive
+	localCommitReadyFn := m.localTransferCommitReadyFn
 	m.mu.Unlock()
 
 	if fn == nil {
@@ -998,6 +1065,12 @@ func (m *Manager) RequestPeerFailover(rgID int) error {
 	if err := m.commitRequestedPeerFailover(rgID, reqID); err != nil {
 		return err
 	}
+	if localCommitReadyFn != nil {
+		if err := localCommitReadyFn([]int{rgID}); err != nil {
+			m.abortRequestedPeerFailover(rgID, reqID)
+			return err
+		}
+	}
 	if err := commitFn(rgID, reqID); err != nil {
 		m.abortRequestedPeerFailover(rgID, reqID)
 		return err
@@ -1028,14 +1101,10 @@ func (m *Manager) commitRequestedPeerFailover(rgID int, reqID uint64) error {
 		)
 	}
 
-	m.peerTransferOutOverride[rgID] = reqID
+	m.applyPeerTransferOutOverrideLocked(rgID, reqID)
 	delete(m.peerTransferCommitGraceUntil, rgID)
 	delete(m.localTransferOutHoldUntil, rgID)
 	peerGroup := m.peerGroups[rgID]
-	peerGroup.GroupID = rgID
-	peerGroup.State = StateSecondaryHold
-	m.peerGroups[rgID] = peerGroup
-	rg.PeerPriority = peerGroup.Priority
 
 	m.runElection()
 	if rg.State != StatePrimary {
@@ -1055,10 +1124,9 @@ func (m *Manager) abortRequestedPeerFailover(rgID int, reqID uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if currentReqID, ok := m.peerTransferOutOverride[rgID]; !ok || currentReqID != reqID {
+	if !m.restorePeerTransferOutOverrideLocked(rgID, reqID) {
 		return
 	}
-	delete(m.peerTransferOutOverride, rgID)
 	delete(m.peerTransferCommitGraceUntil, rgID)
 	m.runElection()
 }
@@ -1067,7 +1135,7 @@ func (m *Manager) notePeerTransferCommitted(rgID int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	delete(m.peerTransferOutOverride, rgID)
+	m.clearPeerTransferOutOverrideLocked(rgID)
 	m.peerTransferCommitGraceUntil[rgID] = time.Now().Add(m.transferCommitGracePeriodLocked())
 	peerGroup, ok := m.peerGroups[rgID]
 	if !ok {

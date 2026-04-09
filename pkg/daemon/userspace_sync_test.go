@@ -174,6 +174,56 @@ func TestUserspaceTransferReadinessDisconnected(t *testing.T) {
 	}
 }
 
+type fakeUserspaceTransferReadinessProvider struct {
+	connected bool
+	healthy   bool
+	state     cluster.TransferReadinessSnapshot
+}
+
+func (f fakeUserspaceTransferReadinessProvider) IsConnected() bool {
+	return f.connected
+}
+
+func (f fakeUserspaceTransferReadinessProvider) PeerHealthy() bool {
+	return f.healthy
+}
+
+func (f fakeUserspaceTransferReadinessProvider) TransferReadiness() cluster.TransferReadinessSnapshot {
+	return f.state
+}
+
+func TestComputeUserspaceTransferReadinessRequiresHealthyPeer(t *testing.T) {
+	ready, reasons := computeUserspaceTransferReadiness(fakeUserspaceTransferReadinessProvider{
+		connected: true,
+		healthy:   false,
+		state: cluster.TransferReadinessSnapshot{
+			Connected: true,
+		},
+	}, true)
+	if ready {
+		t.Fatal("expected unhealthy peer transfer readiness to be false")
+	}
+	if len(reasons) != 1 || reasons[0] != "session sync disconnected" {
+		t.Fatalf("unexpected reasons: %v", reasons)
+	}
+}
+
+func TestComputeUserspaceTransferReadinessReady(t *testing.T) {
+	ready, reasons := computeUserspaceTransferReadiness(fakeUserspaceTransferReadinessProvider{
+		connected: true,
+		healthy:   true,
+		state: cluster.TransferReadinessSnapshot{
+			Connected: true,
+		},
+	}, true)
+	if !ready {
+		t.Fatalf("expected ready transfer readiness, got reasons=%v", reasons)
+	}
+	if reasons != nil {
+		t.Fatalf("expected nil reasons, got %v", reasons)
+	}
+}
+
 type fakeUserspaceSoftwareVersionMismatchProvider struct {
 	mismatch bool
 	local    string

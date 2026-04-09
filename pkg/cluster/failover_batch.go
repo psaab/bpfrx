@@ -182,6 +182,7 @@ func (m *Manager) RequestPeerFailoverBatch(rgIDs []int) error {
 	commitFn := m.peerFailoverCommitBatchFn
 	transferReadyFn := m.transferReadinessFn
 	peerAlive := m.peerAlive
+	localCommitReadyFn := m.localTransferCommitReadyFn
 	m.mu.Unlock()
 
 	if fn == nil {
@@ -229,6 +230,12 @@ func (m *Manager) RequestPeerFailoverBatch(rgIDs []int) error {
 		m.abortRequestedPeerFailoverBatch(ids, reqID)
 		return err
 	}
+	if localCommitReadyFn != nil {
+		if err := localCommitReadyFn(ids); err != nil {
+			m.abortRequestedPeerFailoverBatch(ids, reqID)
+			return err
+		}
+	}
 	if err := commitFn(ids, reqID); err != nil {
 		m.abortRequestedPeerFailoverBatch(ids, reqID)
 		return err
@@ -262,16 +269,9 @@ func (m *Manager) commitRequestedPeerFailoverBatch(rgIDs []int, reqID uint64) er
 	}
 
 	for _, rgID := range rgIDs {
-		m.peerTransferOutOverride[rgID] = reqID
+		m.applyPeerTransferOutOverrideLocked(rgID, reqID)
 		delete(m.peerTransferCommitGraceUntil, rgID)
 		delete(m.localTransferOutHoldUntil, rgID)
-		peerGroup := m.peerGroups[rgID]
-		peerGroup.GroupID = rgID
-		peerGroup.State = StateSecondaryHold
-		m.peerGroups[rgID] = peerGroup
-		if rg := m.groups[rgID]; rg != nil {
-			rg.PeerPriority = peerGroup.Priority
-		}
 	}
 
 	m.runElection()
@@ -299,10 +299,8 @@ func (m *Manager) abortRequestedPeerFailoverBatch(rgIDs []int, reqID uint64) {
 	defer m.mu.Unlock()
 
 	for _, rgID := range rgIDs {
-		if currentReqID, ok := m.peerTransferOutOverride[rgID]; ok && currentReqID == reqID {
-			delete(m.peerTransferOutOverride, rgID)
-		}
 		delete(m.peerTransferCommitGraceUntil, rgID)
+		m.restorePeerTransferOutOverrideLocked(rgID, reqID)
 	}
 	m.runElection()
 }
@@ -312,7 +310,7 @@ func (m *Manager) notePeerTransferCommittedBatch(rgIDs []int) {
 	defer m.mu.Unlock()
 
 	for _, rgID := range rgIDs {
-		delete(m.peerTransferOutOverride, rgID)
+		m.clearPeerTransferOutOverrideLocked(rgID)
 		m.peerTransferCommitGraceUntil[rgID] = time.Now().Add(m.transferCommitGracePeriodLocked())
 		peerGroup, ok := m.peerGroups[rgID]
 		if !ok {

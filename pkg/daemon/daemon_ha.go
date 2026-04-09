@@ -19,7 +19,6 @@ import (
 	"github.com/psaab/bpfrx/pkg/vrrp"
 )
 
-
 // getOrCreateRGState returns the rgStateMachine for the given RG, creating
 // one if it doesn't exist yet.
 func (d *Daemon) getOrCreateRGState(rgID int) *rgStateMachine {
@@ -67,6 +66,61 @@ func strictVIPOwnershipByDefault(cc *config.ClusterConfig, cfg *config.Config) b
 	// for the VRRP MASTER event to derive rg_active leaves a cutover window
 	// where reply packets can hit the promoted node before userspace is active.
 	return cfg == nil || cfg.System.DataplaneType != dataplane.TypeUserspace
+}
+
+func (d *Daemon) setLocalFailoverCommitReady(rgID int, ready bool) {
+	d.localFailoverCommitMu.Lock()
+	defer d.localFailoverCommitMu.Unlock()
+	if d.localFailoverCommitReady == nil {
+		d.localFailoverCommitReady = make(map[int]bool)
+	}
+	d.localFailoverCommitReady[rgID] = ready
+}
+
+func (d *Daemon) localFailoverCommitIsReady(rgID int) bool {
+	d.localFailoverCommitMu.Lock()
+	defer d.localFailoverCommitMu.Unlock()
+	if d.localFailoverCommitReady == nil {
+		return false
+	}
+	return d.localFailoverCommitReady[rgID]
+}
+
+func (d *Daemon) waitLocalFailoverCommitReady(rgIDs []int) error {
+	if len(rgIDs) == 0 {
+		return nil
+	}
+	timeout := d.localFailoverCommitTimeout
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	delay := d.localFailoverCommitDelay
+	deadline := time.Now().Add(timeout)
+	dwelled := false
+	for {
+		ready := true
+		for _, rgID := range rgIDs {
+			if d.cluster != nil && !d.cluster.IsLocalPrimary(rgID) {
+				return fmt.Errorf("local redundancy group %d lost primary before peer demotion commit", rgID)
+			}
+			if !d.localFailoverCommitIsReady(rgID) {
+				ready = false
+				break
+			}
+		}
+		if ready {
+			if !dwelled && delay > 0 {
+				dwelled = true
+				time.Sleep(delay)
+				continue
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out waiting for local failover activation settle for redundancy groups %v", rgIDs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // isRethMasterState returns true when ALL VRRP instances for rgID are MASTER.
@@ -135,6 +189,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 			//   add blackholes, then clear rg_active (#485)
 			isPrimary := ev.NewState == cluster.StatePrimary
 			clusterDemotionEdge := ev.OldState == cluster.StatePrimary && !isPrimary
+			d.setLocalFailoverCommitReady(ev.GroupID, false)
 			s := d.getOrCreateRGState(ev.GroupID)
 			tr := s.SetCluster(isPrimary)
 			if isPrimary {
@@ -181,6 +236,9 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 				if noRethVRRP {
 					d.reconcileDirectVIPOwnership(ev.GroupID, "cluster-primary")
 					go d.RefreshFabricFwd()
+				}
+				if noRethVRRP && (d.dp == nil || !s.NeedsApply()) {
+					d.setLocalFailoverCommitReady(ev.GroupID, true)
 				}
 			} else {
 				// Demotion: run preflight and resign VRRP BEFORE
@@ -344,10 +402,16 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					d.addStableRethLinkLocal(rgID)
 					d.applyRethServicesForRG(rgID)
 				}
+				if d.cluster != nil && d.cluster.IsLocalPrimary(rgID) && s.AllVRRPMaster() {
+					d.setLocalFailoverCommitReady(rgID, true)
+				}
 			}
 			if ev.State == vrrp.StateBackup {
 				s := d.getOrCreateRGState(rgID)
 				tr := s.SetVRRP(ev.Interface, false)
+				if !s.AllVRRPMaster() {
+					d.setLocalFailoverCommitReady(rgID, false)
+				}
 				if tr.Changed && !tr.Active {
 					// Deactivation order: inject blackhole routes FIRST,
 					// then clear rg_active. Re-read desired state to
@@ -1143,4 +1207,3 @@ func resolveDHCPRethInterfaces(dhcpCfg *config.DHCPServerConfig, cfg *config.Con
 		resolve(dhcpCfg.DHCPv6LocalServer.Groups)
 	}
 }
-
