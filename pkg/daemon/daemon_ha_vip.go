@@ -17,7 +17,6 @@ import (
 	"github.com/psaab/bpfrx/pkg/vrrp"
 )
 
-
 // checkVIPReadiness verifies that RETH interfaces for the given RG exist and
 // are operationally UP, so that VIPs can actually be added. Used in
 // private-rg-election mode where there are no VRRP instances to gate readiness.
@@ -439,8 +438,20 @@ func (d *Daemon) scheduleDirectAnnounce(rgID int, reason string) {
 		sendFn = d.directSendGARPs
 	}
 	slog.Info("direct-mode re-announce scheduled", "rg", rgID, "reason", reason, "bursts", len(schedule))
+	start := time.Now()
+	burstOffset := 0
+	if len(schedule) > 0 && schedule[0] == 0 {
+		if d.directAnnounceActive(rgID, seq) {
+			sendFn(rgID)
+			slog.Info("direct-mode re-announce sent", "rg", rgID, "reason", reason, "burst", 1, "total", len(schedule))
+		}
+		schedule = schedule[1:]
+		burstOffset = 1
+	}
+	if len(schedule) == 0 {
+		return
+	}
 	go func() {
-		start := time.Now()
 		for idx, at := range schedule {
 			if wait := time.Until(start.Add(at)); wait > 0 {
 				timer := time.NewTimer(wait)
@@ -450,7 +461,7 @@ func (d *Daemon) scheduleDirectAnnounce(rgID int, reason string) {
 				return
 			}
 			sendFn(rgID)
-			slog.Info("direct-mode re-announce sent", "rg", rgID, "reason", reason, "burst", idx+1, "total", len(schedule))
+			slog.Info("direct-mode re-announce sent", "rg", rgID, "reason", reason, "burst", idx+1+burstOffset, "total", len(schedule)+burstOffset)
 		}
 	}()
 }

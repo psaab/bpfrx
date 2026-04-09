@@ -402,6 +402,108 @@ pub(super) fn apply_worker_commands(
                     }
                 }
             }
+            WorkerCommand::RefreshOwnerRGS { owner_rgs } => {
+                let activated_owner_rgs: std::collections::BTreeSet<_> = owner_rgs
+                    .into_iter()
+                    .filter(|owner_rg_id| *owner_rg_id > 0)
+                    .collect();
+                if activated_owner_rgs.is_empty() {
+                    continue;
+                }
+                let locally_relevant_owner_rgs: std::collections::BTreeSet<_> = ha_state
+                    .iter()
+                    .filter_map(|(owner_rg_id, runtime)| {
+                        runtime
+                            .is_forwarding_active(now_secs)
+                            .then_some(*owner_rg_id)
+                    })
+                    .chain(activated_owner_rgs.iter().copied())
+                    .collect();
+
+                // Activation must re-evaluate all HA-managed worker sessions,
+                // not just those currently indexed under the activated RG.
+                // Split-RG reverse companions can remain owned by RG2 while a
+                // move of RG1 changes whether they should locally forward or
+                // fabric-redirect. Activation is infrequent, so do the wider
+                // worker scan here instead of trusting potentially stale RG
+                // ownership buckets. Still skip sessions whose current and
+                // recomputed owners are both purely remote, since a local RG
+                // move cannot affect them.
+                let mut refresh = Vec::new();
+                sessions.iter_with_origin(|key, decision, metadata, origin| {
+                    if metadata.owner_rg_id <= 0 && !metadata.fabric_ingress {
+                        return;
+                    }
+                    let flow = SessionFlow {
+                        src_ip: key.src_ip,
+                        dst_ip: key.dst_ip,
+                        forward_key: key.clone(),
+                    };
+                    let resolution_target = resolution_target_for_session(&flow, decision);
+                    let looked_up_resolution = lookup_forwarding_resolution_for_session(
+                        forwarding,
+                        dynamic_neighbors,
+                        &flow,
+                        decision,
+                    );
+                    let looked_up_resolution =
+                        super::prefer_local_forward_candidate_for_fabric_ingress(
+                            forwarding,
+                            ha_state,
+                            dynamic_neighbors,
+                            now_secs,
+                            metadata.fabric_ingress,
+                            resolution_target,
+                            looked_up_resolution,
+                        );
+                    let enforced_resolution = enforce_ha_resolution_snapshot(
+                        forwarding,
+                        ha_state,
+                        now_secs,
+                        looked_up_resolution,
+                    );
+                    let refreshed_decision = SessionDecision {
+                        resolution: redirect_session_via_fabric_if_needed(
+                            forwarding,
+                            enforced_resolution,
+                            metadata.fabric_ingress,
+                            metadata.ingress_zone.as_ref(),
+                        ),
+                        ..decision
+                    };
+                    let mut refreshed_metadata = metadata.clone();
+                    let refreshed_owner_rg =
+                        owner_rg_for_resolution(forwarding, refreshed_decision.resolution);
+                    if refreshed_owner_rg > 0 {
+                        refreshed_metadata.owner_rg_id = refreshed_owner_rg;
+                    }
+                    if !metadata.fabric_ingress
+                        && !locally_relevant_owner_rgs.contains(&metadata.owner_rg_id)
+                        && !locally_relevant_owner_rgs.contains(&refreshed_metadata.owner_rg_id)
+                    {
+                        return;
+                    }
+                    refresh.push((key.clone(), refreshed_decision, refreshed_metadata, origin));
+                });
+
+                for (key, refreshed_decision, refreshed_metadata, origin) in refresh {
+                    if sessions.refresh_for_ha_transition(
+                        &key,
+                        refreshed_decision,
+                        refreshed_metadata.clone(),
+                        now_ns,
+                    ) {
+                        publish_worker_session_map_entry(
+                            session_map_fd,
+                            &key,
+                            refreshed_decision,
+                            &refreshed_metadata,
+                            origin,
+                            false,
+                        );
+                    }
+                }
+            }
             WorkerCommand::ExportOwnerRGSessions {
                 sequence,
                 owner_rgs,
@@ -3350,6 +3452,240 @@ mod tests {
             ForwardingDisposition::FabricRedirect
         );
         assert_eq!(lookup.decision.resolution.egress_ifindex, 21);
+        assert_eq!(lookup.metadata.owner_rg_id, 2);
+        assert!(lookup.metadata.is_reverse);
+    }
+
+    #[test]
+    fn apply_worker_commands_refresh_split_reverse_owner_rg_rewrites_to_forward_candidate() {
+        let commands = Arc::new(Mutex::new(VecDeque::from([
+            WorkerCommand::RefreshOwnerRGS { owner_rgs: vec![2] },
+        ])));
+        let mut sessions = SessionTable::new();
+        let forward_key = test_key();
+        let reverse_key = reverse_session_key(&forward_key, test_decision().nat);
+        let now_ns = monotonic_nanos();
+
+        assert!(sessions.install_with_protocol_with_origin(
+            reverse_key.clone(),
+            SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::FabricRedirect,
+                    local_ifindex: 0,
+                    egress_ifindex: 21,
+                    tx_ifindex: 21,
+                    tunnel_endpoint_id: 0,
+                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
+                    neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                    src_mac: Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]),
+                    tx_vlan_id: 0,
+                },
+                nat: test_decision().nat.reverse(
+                    forward_key.src_ip,
+                    forward_key.dst_ip,
+                    forward_key.src_port,
+                    forward_key.dst_port,
+                ),
+            },
+            SessionMetadata {
+                ingress_zone: Arc::<str>::from("wan"),
+                egress_zone: Arc::<str>::from("lan"),
+                owner_rg_id: 2,
+                fabric_ingress: false,
+                is_reverse: true,
+                nat64_reverse: None,
+            },
+            SessionOrigin::SyncImport,
+            now_ns,
+            PROTO_TCP,
+            0x10,
+        ));
+
+        let ha_state = BTreeMap::from([(2, active_ha_runtime(now_ns / 1_000_000_000))]);
+        let results = apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &test_forwarding_state_split_rgs(),
+            &ha_state,
+            &Arc::new(Mutex::new(FastMap::default())),
+        );
+
+        assert!(results.cancelled_keys.is_empty());
+        let (lookup, origin) = sessions
+            .lookup_with_origin(&reverse_key, now_ns, 0x10)
+            .expect("refreshed reverse session");
+        assert!(origin.is_peer_synced());
+        assert_eq!(
+            lookup.decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(lookup.decision.resolution.egress_ifindex, 6);
+        assert_eq!(lookup.decision.resolution.tx_ifindex, 6);
+        assert_eq!(
+            lookup.decision.resolution.next_hop,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)))
+        );
+        assert_eq!(lookup.metadata.owner_rg_id, 2);
+        assert!(lookup.metadata.is_reverse);
+    }
+
+    #[test]
+    fn apply_worker_commands_refresh_split_reverse_owner_rg_updates_stale_indexed_session() {
+        let commands = Arc::new(Mutex::new(VecDeque::from([
+            WorkerCommand::RefreshOwnerRGS { owner_rgs: vec![2] },
+        ])));
+        let mut sessions = SessionTable::new();
+        let forward_key = test_key();
+        let reverse_key = reverse_session_key(&forward_key, test_decision().nat);
+        let now_ns = monotonic_nanos();
+
+        assert!(sessions.install_with_protocol_with_origin(
+            reverse_key.clone(),
+            SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::FabricRedirect,
+                    local_ifindex: 0,
+                    egress_ifindex: 21,
+                    tx_ifindex: 21,
+                    tunnel_endpoint_id: 0,
+                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
+                    neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                    src_mac: Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]),
+                    tx_vlan_id: 0,
+                },
+                nat: test_decision().nat.reverse(
+                    forward_key.src_ip,
+                    forward_key.dst_ip,
+                    forward_key.src_port,
+                    forward_key.dst_port,
+                ),
+            },
+            SessionMetadata {
+                ingress_zone: Arc::<str>::from("wan"),
+                egress_zone: Arc::<str>::from("lan"),
+                owner_rg_id: 1,
+                fabric_ingress: false,
+                is_reverse: true,
+                nat64_reverse: None,
+            },
+            SessionOrigin::SyncImport,
+            now_ns,
+            PROTO_TCP,
+            0x10,
+        ));
+
+        let ha_state = BTreeMap::from([
+            (1, inactive_ha_runtime(now_ns / 1_000_000_000)),
+            (2, active_ha_runtime(now_ns / 1_000_000_000)),
+        ]);
+        let results = apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &test_forwarding_state_split_rgs(),
+            &ha_state,
+            &Arc::new(Mutex::new(FastMap::default())),
+        );
+
+        assert!(results.cancelled_keys.is_empty());
+        let (lookup, origin) = sessions
+            .lookup_with_origin(&reverse_key, now_ns, 0x10)
+            .expect("refreshed reverse session");
+        assert!(origin.is_peer_synced());
+        assert_eq!(
+            lookup.decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(lookup.decision.resolution.egress_ifindex, 6);
+        assert_eq!(lookup.decision.resolution.tx_ifindex, 6);
+        assert_eq!(
+            lookup.decision.resolution.next_hop,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)))
+        );
+        assert_eq!(lookup.metadata.owner_rg_id, 2);
+        assert!(lookup.metadata.is_reverse);
+    }
+
+    #[test]
+    fn apply_worker_commands_refresh_owner_rg_updates_reverse_session_owned_by_other_rg() {
+        let commands = Arc::new(Mutex::new(VecDeque::from([
+            WorkerCommand::RefreshOwnerRGS { owner_rgs: vec![1] },
+        ])));
+        let mut sessions = SessionTable::new();
+        let forward_key = test_key();
+        let reverse_key = reverse_session_key(&forward_key, test_decision().nat);
+        let now_ns = monotonic_nanos();
+
+        assert!(sessions.install_with_protocol_with_origin(
+            reverse_key.clone(),
+            SessionDecision {
+                resolution: ForwardingResolution {
+                    disposition: ForwardingDisposition::FabricRedirect,
+                    local_ifindex: 0,
+                    egress_ifindex: 21,
+                    tx_ifindex: 21,
+                    tunnel_endpoint_id: 0,
+                    next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
+                    neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                    src_mac: Some([0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]),
+                    tx_vlan_id: 0,
+                },
+                nat: test_decision().nat.reverse(
+                    forward_key.src_ip,
+                    forward_key.dst_ip,
+                    forward_key.src_port,
+                    forward_key.dst_port,
+                ),
+            },
+            SessionMetadata {
+                ingress_zone: Arc::<str>::from("wan"),
+                egress_zone: Arc::<str>::from("lan"),
+                owner_rg_id: 2,
+                fabric_ingress: false,
+                is_reverse: true,
+                nat64_reverse: None,
+            },
+            SessionOrigin::SharedPromote,
+            now_ns,
+            PROTO_TCP,
+            0x10,
+        ));
+
+        let ha_state = BTreeMap::from([
+            (1, active_ha_runtime(now_ns / 1_000_000_000)),
+            (2, active_ha_runtime(now_ns / 1_000_000_000)),
+        ]);
+        let results = apply_worker_commands(
+            &commands,
+            &mut sessions,
+            -1,
+            -1,
+            -1,
+            &test_forwarding_state_split_rgs(),
+            &ha_state,
+            &Arc::new(Mutex::new(FastMap::default())),
+        );
+
+        assert!(results.cancelled_keys.is_empty());
+        let (lookup, origin) = sessions
+            .lookup_with_origin(&reverse_key, now_ns, 0x10)
+            .expect("refreshed reverse session");
+        assert_eq!(origin, SessionOrigin::SharedPromote);
+        assert_eq!(
+            lookup.decision.resolution.disposition,
+            ForwardingDisposition::ForwardCandidate
+        );
+        assert_eq!(lookup.decision.resolution.egress_ifindex, 6);
+        assert_eq!(lookup.decision.resolution.tx_ifindex, 6);
+        assert_eq!(
+            lookup.decision.resolution.next_hop,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)))
+        );
         assert_eq!(lookup.metadata.owner_rg_id, 2);
         assert!(lookup.metadata.is_reverse);
     }

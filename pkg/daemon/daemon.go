@@ -210,6 +210,18 @@ type Daemon struct {
 	// VIP presence/removal idempotently every pass.
 	directVIPMu    sync.Mutex
 	directVIPOwned map[int]bool
+	// localFailoverCommitReady tracks whether this node has already
+	// applied the local side of a freshly committed transfer request for
+	// each RG. The cluster manager waits on this before telling the peer
+	// to finalize demotion, so the old owner does not stand down before
+	// the target daemon has processed the promotion edge.
+	localFailoverCommitMu      sync.Mutex
+	localFailoverCommitReady   map[int]bool
+	localFailoverCommitTimeout time.Duration
+	// localFailoverCommitDelay adds one short post-ready dwell after the
+	// readiness bit flips so the VRRP/direct-ownership side effects that set
+	// the bit have a chance to propagate before the peer finalizes demotion.
+	localFailoverCommitDelay   time.Duration
 	// Test hooks for direct-mode VIP ownership reconciliation.
 	directAddVIPsFn        func(int) int
 	directRemoveVIPsFn     func(int) int
@@ -303,6 +315,9 @@ func New(opts Options) *Daemon {
 		linkByNameFn:               netlink.LinkByName,
 		directAnnounceSchedule:     []time.Duration{0, 250 * time.Millisecond, 1 * time.Second, 2 * time.Second, 4 * time.Second, 6 * time.Second},
 		directVIPOwned:             make(map[int]bool),
+		localFailoverCommitReady:   make(map[int]bool),
+		localFailoverCommitTimeout: 3 * time.Second,
+		localFailoverCommitDelay:   200 * time.Millisecond,
 		userspaceDemotionPrepUntil: make(map[int]time.Time),
 	}
 }

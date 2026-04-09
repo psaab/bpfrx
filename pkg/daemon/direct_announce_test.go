@@ -35,6 +35,31 @@ func TestScheduleDirectAnnounceRepeatsWhileRGActive(t *testing.T) {
 	}
 }
 
+func TestScheduleDirectAnnounceSendsImmediateBurstInline(t *testing.T) {
+	state := newRGStateMachine()
+	state.SetCluster(true)
+	d := &Daemon{
+		rgStates:               map[int]*rgStateMachine{1: state},
+		directAnnounceSchedule: []time.Duration{0, 25 * time.Millisecond},
+	}
+
+	calls := make(chan int, 4)
+	d.directSendGARPsFn = func(rgID int) {
+		calls <- rgID
+	}
+
+	d.scheduleDirectAnnounce(1, "test")
+
+	select {
+	case rgID := <-calls:
+		if rgID != 1 {
+			t.Fatalf("unexpected rg id: %d", rgID)
+		}
+	default:
+		t.Fatal("expected immediate announce burst before scheduleDirectAnnounce returns")
+	}
+}
+
 func TestCancelDirectAnnounceStopsFutureBursts(t *testing.T) {
 	state := newRGStateMachine()
 	state.SetCluster(true)
