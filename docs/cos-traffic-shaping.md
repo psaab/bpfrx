@@ -9,7 +9,7 @@ Userspace-only implementation in the Rust AF_XDP forwarding plane.
 - egress-only
 - a hierarchical shaper with the service tree `root(interface) -> reservation -> container`
 - protocol oblivious at the scheduling layer
-- work-conserving across classes
+- work-conserving across reservations
 - designed to support many cores without introducing a shaping bypass
 - average-rate shaping with bounded bursts, not wire-level pacing
 
@@ -18,7 +18,7 @@ Userspace-only implementation in the Rust AF_XDP forwarding plane.
 - perfect packet pacing
 - a full Junos CoS implementation
 - per-flow fair queueing in the first pass
-- a cure for a single hot class saturating the CPU of its owning scheduler
+- a cure for a single hot reservation saturating the CPU of its owning scheduler
 
 ## Problem Statement
 
@@ -34,7 +34,7 @@ What we need instead is a real egress shaper that:
 - buffers packets
 - transmits under hierarchical budgets
 - remains protocol oblivious
-- shares unused bandwidth across classes
+- shares unused bandwidth across configured classes through their reservations
 - scales across many cores without multiplying guarantees by worker count
 
 The motivating cases remain:
@@ -50,8 +50,8 @@ Important first-pass constraint:
 - weighted scheduling happens among reservations
 - it does **not** attempt micro-flow fairness inside a container
 
-That means the first pass protects classes from each other much better than it
-protects individual flows that share the same class/container.
+That means the first pass protects configured classes from each other much
+better than it protects individual flows that share the same container.
 
 ## Design Goals
 
@@ -69,8 +69,8 @@ protects individual flows that share the same class/container.
    follows the same logical path:
    `classify -> enqueue -> admit -> schedule -> transmit`
 
-5. **Adversarial resilience at class granularity**: elephants in one class
-   should not destroy latency and throughput for other classes.
+5. **Adversarial resilience at class granularity**: elephants in one configured
+   class should not destroy latency and throughput for other classes.
 
 6. **Many-core support**: guarantees must remain correct across workers, and
    the behavior of a reservation must not silently multiply with worker count.
@@ -137,9 +137,15 @@ In the first pass, a container is intentionally simple:
 - no micro-flow DRR
 - no flow-key-based fairness accounting
 
-A reservation may initially have exactly one container. The tree still uses the
-`reservation -> container` split because it keeps the service model clear and
-leaves room for future refinement without changing the parent semantics.
+In the first pass, each reservation has exactly one container:
+
+```text
+containers_per_reservation = 1
+```
+
+So the `reservation -> container` split is structural and future-proofing, not
+an immediate claim that one reservation already contains multiple independently
+scheduled queues.
 
 ### Invariants
 
@@ -282,6 +288,15 @@ Rules:
 
 Strict priority applies only to surplus service.
 
+The ceiling should be modeled as a reservation-level token bucket distinct from
+the guarantee bucket. In other words:
+
+- the guarantee phase spends the reservation's CIR bucket
+- the surplus phase spends a separate ceiling/PIR bucket
+
+That keeps "exact" and ceiling semantics explicit instead of treating surplus as
+an unbounded borrow from the root.
+
 ### Same-Priority Weighted DWRR Across Reservations
 
 Each reservation at a priority level has a persistent `surplus_deficit`.
@@ -297,8 +312,8 @@ for each active reservation at this priority:
     charge root + reservation surplus budget
 ```
 
-This gives stable weighted sharing among classes without implying any
-micro-flow logic inside a class.
+This gives stable weighted sharing among reservations without implying any
+micro-flow logic inside a container.
 
 ## Container Scheduling
 
@@ -378,6 +393,13 @@ should be:
 - a shard does **not** create independent rates
 
 ### Concrete Example
+
+Phase 1 does not require multiple shards. The simplest valid implementation is
+one scheduler owner per shaped interface, with every reservation on that one
+owner.
+
+The example below is intentionally a later many-core example for Phase 3, where
+several scheduler shards exist for one interface.
 
 Suppose interface `ge-0-0-1` has four scheduler shards:
 
@@ -565,6 +587,11 @@ Internal mapping:
 - the interface shaping-rate becomes the **root**
 - the scheduler attached to a forwarding class becomes the **reservation**
 - the actual queue instance on that interface becomes the **container**
+
+Future knobs for finer-grained fairness, such as something like
+`host-fairness source-address`, are intentionally out of scope for Phase 1 and
+should be treated as reserved future extensions rather than active baseline
+behavior.
 
 ### Example
 
