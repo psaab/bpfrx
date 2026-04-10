@@ -48,7 +48,7 @@ This summary keeps the original `/tmp` destinations inside prompt quotes because
 
 ## High-Level Trajectory
 
-The work moved through six stages:
+The work moved through seven stages:
 
 1. Start with a hierarchical policer / rate limiter concept.
 2. Reject that framing after finding correctness and work-conserving problems.
@@ -56,6 +56,7 @@ The work moved through six stages:
 4. Iterate on fairness, enqueue control, tail latency, and scale under adversarial traffic.
 5. Notice the many-core and hierarchy drift problems.
 6. Reset the design around a true hierarchy and rewrite `docs/cos-traffic-shaping.md` accordingly.
+7. Simplify the rewritten doc into the current `root(interface) -> reservation -> container` model, make Phase 1 explicitly FIFO-per-container, and explain many-core sharding more concretely.
 
 ## Original Design Intent
 
@@ -276,7 +277,7 @@ Artifact:
 
 Main reset principles:
 
-- restore a real hierarchy: `root -> class -> leaf`
+- restore a real hierarchy: `root -> reservation -> container`
 - use one unified packet path
 - make CIR a scheduler budget, not a shortcut
 - keep the design protocol oblivious
@@ -303,7 +304,7 @@ Main output:
 
 - a replacement section for `docs/cos-traffic-shaping.md`
 - the replacement centered the document on:
-  - `root -> class -> leaf`
+  - `root -> reservation -> container`
   - a unified scheduler
   - guarantee and surplus phases
   - no fast-path bypass
@@ -326,17 +327,54 @@ Action taken:
 What was changed in the doc:
 
 - restored the explicit hierarchy
+- mapped that hierarchy to CoS terms as `root(interface) -> reservation -> container`
 - removed the drift toward ownership-specific or shortcut semantics
 - made CIR part of the normal hierarchy scheduler instead of a special path
 - described the scheduler in guarantee and surplus terms
 - stated clearly that shaped interfaces use one unified packet path
+- made the first pass explicitly FIFO per container with weighted scheduling among reservations
+- clarified that the simplest valid many-core rollout is one scheduler owner per interface before multi-shard refinement
 - preserved the core constraints:
   - protocol oblivious
   - adversarial-flow aware
   - no fast-path escape hatch
   - many-core capable
 
-### 11. Prepare the commit message
+### 11. Simplify the hierarchy and Phase 1 model further
+
+Prompt used:
+
+> go back to the cos-traffic-shaping.md
+>
+> 1. The hierarchy should be something like: root (interface) -> reservation (intermediate) -> container (leaf).
+> 2. I don't understand this sharding model. Can you ask it to explain better
+>
+> At first pass, I’d probably skip fine-grained fair-queueing at per-flow level. That’s usually hard to implement efficiently. Keeping single per-class FIFO queue is already a good start (class based queueing) and then implementing fair queueing (weighted) among the classes (but not micro-flows)
+
+Action taken:
+
+- `docs/cos-traffic-shaping.md` was revised again to reflect that clarification directly
+
+Main impact:
+
+- the hierarchy language was made concrete as `root(interface) -> reservation -> container`
+- the first pass stopped pretending per-flow fairness existed
+- Phase 1 became explicitly FIFO per container
+- weighted scheduling remained at the reservation level
+- the many-core section was rewritten to explain shard ownership as a phased deployment model rather than an abstract scaling claim
+
+### 12. Review, repush, and merge the simplified CoS doc
+
+Action taken:
+
+- the simplified CoS rewrite was reviewed, adjusted, and merged as PR `#620`
+
+Design impact:
+
+- this is the form that the current `docs/cos-traffic-shaping.md` now reflects
+- it is simpler than the earlier replacement text, but more honest about what Phase 1 does and does not solve
+
+### 13. Prepare the commit message
 
 Prompt used:
 
@@ -445,16 +483,36 @@ Contribution:
 Why it mattered:
 
 - it translated the reset principles into concrete replacement text
-- it was the last temporary design artifact before the repo doc itself was rewritten
+- it was the last temporary design artifact before the repo doc itself was rewritten and later simplified into the current reservation/container wording
+
+## Later Simplification That Shaped the Current Doc
+
+After the hierarchy reset and replacement-section rewrite, the document still
+needed one more pass to become the current version.
+
+That later pass did three important things:
+
+- renamed the hierarchy from the more abstract `class -> leaf` language to the
+  more concrete CoS-facing `reservation -> container`
+- made Phase 1 explicitly one FIFO container per reservation, with no claim of
+  per-flow fair queueing
+- rewrote the many-core section to explain shard ownership and rollout in
+  practical terms instead of leaving it as an abstract sharding concept
+
+That later simplification is why the current document is both narrower and
+clearer than the earlier replacement section archived under
+[`docs/cos/cos-traffic-shaping-replacement-section.md`](cos/cos-traffic-shaping-replacement-section.md).
 
 ## Design Principles That Survived Into the Current Doc
 
 The current `docs/cos-traffic-shaping.md` is the result of filtering all prior critique through the final hierarchy reset. The main principles that survived are:
 
 - the design is a shaper, not a policer
-- the scheduler is explicitly hierarchical: `root -> class -> leaf`
+- the scheduler is explicitly hierarchical: `root(interface) -> reservation -> container`
 - CIR is guaranteed service budget within the same scheduler, not a side channel
 - excess capacity is distributed in a surplus phase after guarantees
+- the first pass uses FIFO per container rather than per-flow fair queueing
+- weighted arbitration happens among reservations, not micro-flows
 - fairness cannot rely only on dequeue order; admission and queue occupancy matter too
 - the design must be protocol oblivious
 - there can be no fast-path bypass for shaped traffic
@@ -472,6 +530,8 @@ The overall design was corrected in these ways:
 - from vague scale claims to explicit many-core concerns
 - from ownership-heavy special cases back to one unified packet path
 - from CIR as a shortcut back to CIR as scheduler budget
+- from abstract `class -> leaf` wording to the clearer `reservation -> container` CoS mapping
+- from implied micro-flow fairness to an explicit FIFO-per-container Phase 1
 
 ## Bottom Line
 
@@ -481,6 +541,15 @@ The overall design was corrected in these ways:
 - then reframe as CoS shaping
 - then harden the design against adversarial flows, queue skew, and many-core RSS
 - then reset again when the design drifted away from a true hierarchy
-- finally rewrite the doc around the restored hierarchical model
+- then rewrite the doc around the restored hierarchical model
+- then simplify the rewrite into the current reservation/container, FIFO-first version
 
 The key turning point was the user correction captured in [`docs/cos/cos-traffic-shaping-hierarchy-reset-plan.md`](cos/cos-traffic-shaping-hierarchy-reset-plan.md): the design had drifted away from hierarchy and was starting to treat CIR like a fast path. The final doc rewrite exists primarily to correct that drift while keeping the original performance, fairness, and protocol-oblivious goals intact.
+
+The later simplification pass mattered too: it turned the restored hierarchy
+into the current CoS-specific language and made the Phase 1 scope honest. The
+current document is therefore the combination of both corrections:
+
+- restore hierarchy and remove CIR-fast-path drift
+- then simplify the design into `root(interface) -> reservation -> container`
+  with FIFO-per-container Phase 1 behavior
