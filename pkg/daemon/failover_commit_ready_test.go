@@ -85,3 +85,25 @@ func TestRecordRGActiveAppliedIfCurrentOrStableRejectsChangedDesiredState(t *tes
 		t.Fatal("expected apply pending to remain set after rejected stale apply")
 	}
 }
+
+func TestRecordRGActiveAppliedIfCurrentOrStableClearsSameDesiredStaleDemotion(t *testing.T) {
+	s := newRGStateMachine()
+	s.SetCluster(true)
+	s.MarkApplied(true)
+
+	tr := s.SetCluster(false)
+	if !s.NeedsApply() {
+		t.Fatal("expected apply to be pending after cluster demotion")
+	}
+
+	// Simulate another goroutine advancing the epoch while keeping the same
+	// desired inactive state.
+	s.Reconcile(false, nil)
+
+	if !recordRGActiveAppliedIfCurrentOrStable(s, tr, false) {
+		t.Fatal("expected same-desired stale demotion to be accepted")
+	}
+	if s.NeedsApply() {
+		t.Fatal("expected apply pending to clear after same-desired stale demotion")
+	}
+}

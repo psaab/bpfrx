@@ -283,7 +283,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 						slog.Warn("failed to update rg_active from cluster event",
 							"rg", ev.GroupID, "active", cur, "err", err)
 					} else {
-						s.ApplyIfCurrent(tr)
+						recordRGActiveAppliedIfCurrentOrStable(s, tr, cur)
 					}
 				}
 

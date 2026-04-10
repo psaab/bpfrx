@@ -357,11 +357,18 @@ pub(super) struct ResolvedFlowSessionDecision {
     pub(super) created: bool,
 }
 
-fn is_fabric_wire_placeholder(lookup: &SessionLookup) -> bool {
-    lookup.metadata.fabric_ingress
-        && !lookup.metadata.is_reverse
-        && lookup.decision.nat.rewrite_src.is_some()
-        && lookup.decision.nat.rewrite_dst.is_none()
+// Fabric-ingress SNAT-only forward entries are standby-side wire placeholders
+// in the split-RG topology: they should not win lookups over the real shared
+// session and should not synthesize a competing local reverse session.
+pub(super) fn is_fabric_wire_placeholder(
+    fabric_ingress: bool,
+    is_reverse: bool,
+    decision: SessionDecision,
+) -> bool {
+    fabric_ingress
+        && !is_reverse
+        && decision.nat.rewrite_src.is_some()
+        && decision.nat.rewrite_dst.is_none()
 }
 
 pub(super) fn lookup_session_across_scopes(
@@ -373,9 +380,12 @@ pub(super) fn lookup_session_across_scopes(
     tcp_flags: u8,
 ) -> Option<ResolvedSessionLookup> {
     if let Some((lookup, origin)) = sessions.lookup_with_origin(key, now_ns, tcp_flags) {
-        if is_fabric_wire_placeholder(&lookup)
-            && let Some(shared) =
-                lookup_shared_forward_wire_match(shared_forward_wire_sessions, key)
+        if is_fabric_wire_placeholder(
+            lookup.metadata.fabric_ingress,
+            lookup.metadata.is_reverse,
+            lookup.decision,
+        ) && let Some(shared) =
+            lookup_shared_forward_wire_match(shared_forward_wire_sessions, key)
         {
             return Some(ResolvedSessionLookup::shared(shared));
         }
@@ -386,9 +396,12 @@ pub(super) fn lookup_session_across_scopes(
             decision: matched.decision,
             metadata: matched.metadata,
         };
-        if is_fabric_wire_placeholder(&lookup)
-            && let Some(shared) =
-                lookup_shared_forward_wire_match(shared_forward_wire_sessions, key)
+        if is_fabric_wire_placeholder(
+            lookup.metadata.fabric_ingress,
+            lookup.metadata.is_reverse,
+            lookup.decision,
+        ) && let Some(shared) =
+            lookup_shared_forward_wire_match(shared_forward_wire_sessions, key)
         {
             return Some(ResolvedSessionLookup::shared(shared));
         }
@@ -408,10 +421,11 @@ pub(super) fn lookup_forward_nat_across_scopes(
     reply_key: &SessionKey,
 ) -> Option<ForwardSessionMatch> {
     if let Some(local) = sessions.find_forward_nat_match(reply_key) {
-        if is_fabric_wire_placeholder(&SessionLookup {
-            decision: local.decision,
-            metadata: local.metadata.clone(),
-        }) {
+        if is_fabric_wire_placeholder(
+            local.metadata.fabric_ingress,
+            local.metadata.is_reverse,
+            local.decision,
+        ) {
             return lookup_shared_forward_nat_match(shared_nat_sessions, reply_key).map(|entry| {
                 ForwardSessionMatch {
                     key: entry.key,

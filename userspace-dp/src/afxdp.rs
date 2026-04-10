@@ -1866,7 +1866,7 @@ impl BindingWorker {
 
 fn should_install_local_reverse_session(decision: SessionDecision, fabric_ingress: bool) -> bool {
     let fabric_wire_placeholder =
-        fabric_ingress && decision.nat.rewrite_src.is_some() && decision.nat.rewrite_dst.is_none();
+        shared_ops::is_fabric_wire_placeholder(fabric_ingress, false, decision);
     decision.resolution.disposition != ForwardingDisposition::FabricRedirect
         || (fabric_ingress && !fabric_wire_placeholder)
 }

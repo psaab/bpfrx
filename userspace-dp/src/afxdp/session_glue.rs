@@ -436,11 +436,7 @@ pub(super) fn apply_worker_commands(
                 }
             }
             WorkerCommand::RefreshOwnerRGS { owner_rgs } => {
-                let activated_owner_rgs: std::collections::BTreeSet<_> = owner_rgs
-                    .into_iter()
-                    .filter(|owner_rg_id| *owner_rg_id > 0)
-                    .collect();
-                if activated_owner_rgs.is_empty() {
+                if !owner_rgs.iter().any(|owner_rg_id| *owner_rg_id > 0) {
                     continue;
                 }
 
