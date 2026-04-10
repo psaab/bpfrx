@@ -48,7 +48,7 @@ This summary keeps the original `/tmp` destinations inside prompt quotes because
 
 ## High-Level Trajectory
 
-The work moved through six stages:
+The work moved through seven stages:
 
 1. Start with a hierarchical policer / rate limiter concept.
 2. Reject that framing after finding correctness and work-conserving problems.
