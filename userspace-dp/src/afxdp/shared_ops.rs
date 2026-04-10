@@ -60,6 +60,15 @@ pub(super) fn synced_replica_entry(entry: &SyncedSessionEntry) -> SyncedSessionE
 /// pre-installs reverse entries via UpsertSynced. This function still runs
 /// at activation to re-resolve egress with local forwarding state (the
 /// pre-installed entries carry the peer's interface indices/MACs).
+///
+/// Use the union of the shared owner-RG session index and the narrower
+/// reverse-prewarm index here. Activation is infrequent, and locally promoted
+/// sessions can exist in the shared table without appearing in the
+/// reverse-prewarm subset, while split-RG reverse companions can still resolve
+/// to an activated RG even when the forward entry's current owner RG is
+/// different. Both cases need their forward entries restored to worker
+/// SessionTables and, when applicable, their reverse companions synthesized
+/// again on activation.
 pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -78,11 +87,21 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     }
     let publish_session_map = session_map_fd >= 0;
     let owner_rg_set: std::collections::BTreeSet<i32> = owner_rgs.iter().copied().collect();
-    let candidate_keys = owner_rg_session_keys_serialized(
+    let mut candidate_keys = owner_rg_session_keys_serialized(
+        shared_sessions,
+        &shared_owner_rg_indexes.sessions,
+        owner_rgs,
+    );
+    let reverse_candidate_keys = owner_rg_session_keys_serialized(
         shared_sessions,
         &shared_owner_rg_indexes.reverse_prewarm_sessions,
         owner_rgs,
     );
+    for key in reverse_candidate_keys {
+        if !candidate_keys.contains(&key) {
+            candidate_keys.push(key);
+        }
+    }
     let (forward_entries, reverse_entries) = shared_sessions
         .lock()
         .map(|sessions| {
@@ -92,9 +111,11 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
                 let Some(entry) = sessions.get(&key) else {
                     continue;
                 };
-                if entry.metadata.is_reverse || !entry.origin.is_peer_synced() {
+                if entry.metadata.is_reverse {
                     continue;
                 }
+                let allow_reverse_prewarm = entry.origin.is_peer_synced()
+                    || matches!(entry.origin, SessionOrigin::SharedPromote);
                 let Some(reverse) = synthesized_synced_reverse_entry(
                     forwarding,
                     ha_state,
@@ -113,7 +134,9 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
                     || owner_rg_set.contains(&reverse.metadata.owner_rg_id)
                 {
                     forward_entries.push(entry.clone());
-                    reverse_entries.push(reverse);
+                    if allow_reverse_prewarm {
+                        reverse_entries.push(reverse);
+                    }
                 }
             }
             (forward_entries, reverse_entries)
@@ -334,6 +357,13 @@ pub(super) struct ResolvedFlowSessionDecision {
     pub(super) created: bool,
 }
 
+fn is_fabric_wire_placeholder(lookup: &SessionLookup) -> bool {
+    lookup.metadata.fabric_ingress
+        && !lookup.metadata.is_reverse
+        && lookup.decision.nat.rewrite_src.is_some()
+        && lookup.decision.nat.rewrite_dst.is_none()
+}
+
 pub(super) fn lookup_session_across_scopes(
     sessions: &mut SessionTable,
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
@@ -342,24 +372,30 @@ pub(super) fn lookup_session_across_scopes(
     now_ns: u64,
     tcp_flags: u8,
 ) -> Option<ResolvedSessionLookup> {
-    sessions
-        .lookup_with_origin(key, now_ns, tcp_flags)
-        .map(|(lookup, origin)| ResolvedSessionLookup::local_query(lookup, origin))
-        .or_else(|| {
-            sessions
-                .find_forward_wire_match_with_origin(key)
-                .map(|(matched, origin)| {
-                    ResolvedSessionLookup::local(
-                        matched.key,
-                        SessionLookup {
-                            decision: matched.decision,
-                            metadata: matched.metadata,
-                        },
-                        origin,
-                    )
-                })
-        })
-        .or_else(|| lookup_shared_session(shared_sessions, key).map(ResolvedSessionLookup::shared))
+    if let Some((lookup, origin)) = sessions.lookup_with_origin(key, now_ns, tcp_flags) {
+        if is_fabric_wire_placeholder(&lookup)
+            && let Some(shared) =
+                lookup_shared_forward_wire_match(shared_forward_wire_sessions, key)
+        {
+            return Some(ResolvedSessionLookup::shared(shared));
+        }
+        return Some(ResolvedSessionLookup::local_query(lookup, origin));
+    }
+    if let Some((matched, origin)) = sessions.find_forward_wire_match_with_origin(key) {
+        let lookup = SessionLookup {
+            decision: matched.decision,
+            metadata: matched.metadata,
+        };
+        if is_fabric_wire_placeholder(&lookup)
+            && let Some(shared) =
+                lookup_shared_forward_wire_match(shared_forward_wire_sessions, key)
+        {
+            return Some(ResolvedSessionLookup::shared(shared));
+        }
+        return Some(ResolvedSessionLookup::local(matched.key, lookup, origin));
+    }
+    lookup_shared_session(shared_sessions, key)
+        .map(ResolvedSessionLookup::shared)
         .or_else(|| {
             lookup_shared_forward_wire_match(shared_forward_wire_sessions, key)
                 .map(ResolvedSessionLookup::shared)
@@ -371,14 +407,27 @@ pub(super) fn lookup_forward_nat_across_scopes(
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     reply_key: &SessionKey,
 ) -> Option<ForwardSessionMatch> {
-    sessions.find_forward_nat_match(reply_key).or_else(|| {
-        lookup_shared_forward_nat_match(shared_nat_sessions, reply_key).map(|entry| {
-            ForwardSessionMatch {
-                key: entry.key,
-                decision: entry.decision,
-                metadata: entry.metadata,
-            }
-        })
+    if let Some(local) = sessions.find_forward_nat_match(reply_key) {
+        if is_fabric_wire_placeholder(&SessionLookup {
+            decision: local.decision,
+            metadata: local.metadata.clone(),
+        }) {
+            return lookup_shared_forward_nat_match(shared_nat_sessions, reply_key).map(|entry| {
+                ForwardSessionMatch {
+                    key: entry.key,
+                    decision: entry.decision,
+                    metadata: entry.metadata,
+                }
+            });
+        }
+        return Some(local);
+    }
+    lookup_shared_forward_nat_match(shared_nat_sessions, reply_key).map(|entry| {
+        ForwardSessionMatch {
+            key: entry.key,
+            decision: entry.decision,
+            metadata: entry.metadata,
+        }
     })
 }
 
@@ -390,13 +439,15 @@ pub(super) fn build_reverse_session_from_forward_match(
     now_secs: u64,
     ha_startup_grace_until_secs: u64,
 ) -> SessionLookup {
+    let requires_fabric_return = forward_match.metadata.fabric_ingress
+        || forward_match.decision.resolution.disposition == ForwardingDisposition::FabricRedirect;
     let resolution = reverse_resolution_for_session(
         forwarding,
         ha_state,
         dynamic_neighbors,
         forward_match.key.src_ip,
         forward_match.metadata.ingress_zone.as_ref(),
-        forward_match.metadata.fabric_ingress,
+        requires_fabric_return,
         now_secs,
         forward_match.decision.resolution.tunnel_endpoint_id != 0
             && now_secs <= ha_startup_grace_until_secs,
