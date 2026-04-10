@@ -5,77 +5,91 @@ Userspace-only implementation in the Rust AF_XDP forwarding plane.
 ## Scope and Non-Goals
 
 **This is:**
-- Userspace-only (Rust AF_XDP workers)
-- Egress-only (shapes outbound traffic per interface)
-- A hierarchical shaper: `interface -> class -> optional fairness leaf`
-- Protocol-oblivious at the scheduling layer
-- Designed to scale across many workers/cores without bypassing shaping
-- Average-rate shaping with bounded burst release, not wire-level pacing
+- userspace-only
+- egress-only
+- a hierarchical shaper with the service tree `root(interface) -> reservation -> container`
+- protocol oblivious at the scheduling layer
+- work-conserving across classes
+- designed to support many cores without introducing a shaping bypass
+- average-rate shaping with bounded bursts, not wire-level pacing
 
 **This is not:**
-- A replacement for ingress policers
-- Perfect packet pacing
-- A full Junos CoS implementation
-- A cure for single-worker CPU saturation under pathological RSS skew
+- an ingress policer
+- perfect packet pacing
+- a full Junos CoS implementation
+- per-flow fair queueing in the first pass
+- a cure for a single hot class saturating the CPU of its owning scheduler
 
 ## Problem Statement
 
-The current flat policer drops excess traffic on arrival. It provides:
+The current flat policer drops excess traffic on arrival. It does not provide:
 
-- no egress queueing
-- no work-conserving surplus sharing
-- no protection for low-rate flows against elephants
-- no robust behavior under uneven RSS placement
+- egress queueing
+- work-conserving surplus sharing
+- class-level isolation under overload
+- robust behavior when traffic lands unevenly across workers
 
 What we need instead is a real egress shaper that:
 
 - buffers packets
 - transmits under hierarchical budgets
 - remains protocol oblivious
-- preserves fairness under adversarial flow patterns
-- scales across many workers without introducing a shaping bypass
+- shares unused bandwidth across classes
+- scales across many cores without multiplying guarantees by worker count
 
-The motivating cases are:
+The motivating cases remain:
 
 - one elephant versus one hundred mice
 - one hundred elephants versus one mouse
 - one hundred elephants versus one hundred mice
 - all of the above with uneven hashing across workers
 
+Important first-pass constraint:
+
+- the first implementation should use a single FIFO queue per container
+- weighted scheduling happens among reservations
+- it does **not** attempt micro-flow fairness inside a container
+
+That means the first pass protects classes from each other much better than it
+protects individual flows that share the same class/container.
+
 ## Design Goals
 
 1. **Hierarchical**: every transmitted byte is accounted against:
-   - interface aggregate budget
-   - class budget
-   - optional fairness leaf state
+   - the interface root
+   - one reservation node
+   - one container node
 
-2. **Work-conserving**: idle classes do not waste interface bandwidth.
+2. **Work-conserving**: idle reservations do not waste interface bandwidth.
 
 3. **Protocol-oblivious**: scheduling decisions depend on queue assignment,
-   fairness key, packet size, and queue state; not on TCP/UDP/ESP/GRE/ICMP
-   semantics.
+   packet size, and queue state, not on TCP/UDP/ESP/GRE/ICMP semantics.
 
 4. **No fast-path bypass**: every packet that egresses a shaped interface
    follows the same logical path:
    `classify -> enqueue -> admit -> schedule -> transmit`
 
-5. **Adversarial resilience**: fairness must hold even when a sender opens
-   many flows or lands traffic unevenly across workers.
+5. **Adversarial resilience at class granularity**: elephants in one class
+   should not destroy latency and throughput for other classes.
 
-6. **Many-core support**: class guarantees must remain correct across workers,
-   and fairness behavior must not silently multiply with worker count.
+6. **Many-core support**: guarantees must remain correct across workers, and
+   the behavior of a reservation must not silently multiply with worker count.
 
-7. **Low CPU cost**: the hot path must stay O(1) expected per packet with
-   bounded constant factors and bounded shared-memory contention.
+7. **Low CPU cost**: the hot path should remain O(1) expected per packet with
+   bounded contention on shared state.
+
+8. **Incremental complexity**: the baseline design should be implementable
+   without per-flow fair queueing. Finer-grained fairness can be a later
+   extension if class-level FIFO proves insufficient.
 
 ## Hierarchical Service Model
 
-The shaper is a tree:
+The service tree is:
 
-```
+```text
 Interface root
-  -> forwarding class
-    -> optional fairness leaf
+  -> reservation
+    -> container
 ```
 
 ### Root Node
@@ -84,92 +98,120 @@ The root node represents the shaped interface.
 
 Responsibilities:
 
-- enforce interface shaping-rate and burst
+- enforce the interface shaping-rate and burst
 - cap aggregate transmitted bytes
 - track total queued bytes and frames
 - enforce interface-level UMEM budget
 
-### Class Node
+### Reservation Node
 
-A class node represents a forwarding class / queue.
+A reservation node is the intermediate scheduling object.
+
+Conceptually, this is where the service guarantee lives.
 
 Responsibilities:
 
-- guarantee service up to CIR
-- receive surplus service under PIR / ceiling rules
-- define surplus priority
-- define class buffer budget
-- optionally enable fairness leaves
+- own the class reservation (`transmit-rate`, optional ceiling, priority, weight)
+- participate in the scheduler's guarantee and surplus phases
+- own reservation-level buffer limits and admission policy
+- define how much service the attached containers may consume
 
-### Leaf Node
+In a Junos-like model, this is closest to the scheduler attached to a
+forwarding class on a shaped interface.
 
-A leaf node is:
+### Container Node
 
-- a fairness bucket when fairness is enabled, or
-- the implicit FIFO leaf when fairness is disabled
+A container node is the leaf queue that actually holds packets.
 
-Leaf responsibilities:
+First-pass responsibilities:
 
 - hold queued packets
-- enforce per-leaf admission caps
-- participate in per-class dequeue fairness
-- provide reclaim candidates under overload
+- preserve FIFO ordering
+- enforce container byte/frame limits
+- provide the packet dequeued when its reservation is selected
+
+In the first pass, a container is intentionally simple:
+
+- one FIFO queue
+- no per-flow buckets
+- no micro-flow DRR
+- no flow-key-based fairness accounting
+
+A reservation may initially have exactly one container. The tree still uses the
+`reservation -> container` split because it keeps the service model clear and
+leaves room for future refinement without changing the parent semantics.
 
 ### Invariants
 
 These invariants define the design:
 
 1. Every packet on a shaped interface follows one logical path:
-   `classify -> enqueue -> admit -> schedule -> transmit`
+   `classify -> map to reservation/container -> enqueue -> admit -> schedule -> transmit`
 
 2. `CIR` is not a fast path or a separate queue. It is only the guaranteed
-   service budget of a class node inside the same scheduler.
+   service budget of a reservation node inside the same scheduler.
 
 3. A packet may transmit only if:
    - the root has budget
-   - the selected class has budget for the active phase
-   - the selected leaf has a dequeuable packet
+   - the selected reservation has budget for the active phase
+   - the selected container has a dequeuable packet
 
-4. Multi-core scaling may shard the hierarchy, but it may not bypass it.
+4. A container belongs to exactly one scheduler owner at a time.
 
 5. Session hits, generated traffic, and cross-binding forwards do not bypass
    shaping on a shaped interface.
 
+6. In the first pass, fairness stops at the container boundary. Packets within
+   one container are FIFO, not micro-flow scheduled.
+
 ## Service Semantics
 
-### Guaranteed
+### Guaranteed Service
 
-- A backlogged class receives service up to its configured `transmit-rate`
-  over windows larger than one scheduling cycle plus burst horizon.
-- Class guarantees hold regardless of RSS placement because class budgets are
-  shared across workers.
+- A backlogged reservation receives service up to its configured
+  `transmit-rate` over windows larger than one scheduling cycle plus burst
+  horizon.
+- Reservation guarantees hold regardless of RSS placement because the
+  reservation budget is shared and authoritative.
 
-### Opportunistic
+### Opportunistic Service
 
-- Surplus bandwidth above active class CIR is distributed by class priority
-  and same-priority DWRR.
-- `transmit-rate exact` classes never receive surplus.
+- Surplus bandwidth above active reservation guarantees is distributed by
+  reservation priority and same-priority weighted DWRR.
+- `transmit-rate exact` reservations never receive surplus.
 
-### Can Be Starved
+### First-Pass Fairness Boundary
 
-- Surplus service for a lower-priority class can be zero if higher-priority
-  classes consume all available surplus.
-- Fairness leaves can be dropped under finite-buffer overload; the goal is
-  not literal zero drop under infinite overload, but robust protection of
-  under-cap leaves against dominant senders.
+This design is intentionally honest about what it does and does not solve.
+
+It does help with:
+
+- one elephant in `best-effort` versus mice in `expedited-forwarding`
+- multiple busy low-priority classes contending for surplus
+- uneven worker placement that would otherwise multiply class behavior
+
+It does **not** fully solve:
+
+- one elephant versus one hundred mice if they all land in the **same**
+  container
+- one sender opening many micro-flows inside one FIFO container
+
+That is accepted in the first pass. The design should say so explicitly rather
+than pretending class FIFO somehow gives micro-flow fairness.
 
 ## Unified Packet Path
 
 Every packet that egresses a shaped interface follows:
 
-```
+```text
 RX
   -> parse / route / session / NAT
   -> classify to forwarding class
-  -> derive fairness key if class uses fairness
-  -> place packet into the correct scheduler shard
-  -> class/leaf admission control
-  -> class/leaf scheduling
+  -> map class to reservation and container
+  -> enqueue on the reservation/container owner
+  -> reservation/container admission control
+  -> reservation scheduling
+  -> transmit from selected container
   -> TX ring submission
 ```
 
@@ -185,31 +227,31 @@ admission or scheduling.
 
 ## Scheduler
 
-There is one scheduler with two service phases.
+There is one scheduler with two service phases. Both operate on
+**reservations**, not on micro-flows.
 
 ### Phase 1: Guarantee Service
 
 Purpose:
 
-- satisfy class CIR guarantees
-- ensure every backlogged class with available CIR makes forward progress
+- satisfy reservation guarantees
+- ensure every backlogged reservation with available guarantee budget makes
+  forward progress
 
 Rules:
 
-1. Walk active classes in rotating round-robin order.
-2. Give each class a bounded `cir_quantum` per visit.
-3. Inside the selected class:
-   - FIFO classes dequeue FIFO
-   - fairness-enabled classes dequeue from their leaf DRR
+1. Walk active reservations in rotating round-robin order.
+2. Give each reservation a bounded `cir_quantum` per visit.
+3. Within the selected reservation, dequeue from its container FIFO.
 4. Charge:
    - root aggregate budget
-   - class CIR budget
+   - reservation CIR budget
 
 Recommended per-visit quantum:
 
-```
+```text
 cir_quantum_bytes = clamp(
-    class_cir_bytes_per_us * 100,
+    reservation_cir_bytes_per_us * 100,
     mtu_bytes,
     32 * 1024
 )
@@ -217,309 +259,201 @@ cir_quantum_bytes = clamp(
 
 This keeps:
 
-- low-rate classes from being permanently postponed
-- high-rate classes from consuming the entire cycle
-- queue-index order from biasing service
+- low-rate reservations from being permanently postponed
+- high-rate reservations from consuming the entire cycle
+- queue-order bias from dominating service
 
 ### Phase 2: Surplus Service
 
 Purpose:
 
-- distribute bandwidth above active CIR
+- distribute bandwidth above active guarantees
 
 Rules:
 
-1. Scan classes by priority.
+1. Scan reservations by priority.
 2. The first priority level with eligible surplus demand wins the cycle's
    surplus service.
-3. Within that level, use DWRR across classes.
-4. Inside the selected class:
-   - FIFO classes dequeue FIFO
-   - fairness-enabled classes dequeue from their leaf DRR
+3. Within that level, use weighted DWRR across reservations.
+4. Within the selected reservation, dequeue from its container FIFO.
 5. Charge:
    - root aggregate budget
-   - class PIR budget
+   - reservation surplus budget / ceiling
 
 Strict priority applies only to surplus service.
 
-### Same-Priority DWRR Across Classes
+### Same-Priority Weighted DWRR Across Reservations
 
-Each class at a priority level has a persistent `surplus_deficit`.
+Each reservation at a priority level has a persistent `surplus_deficit`.
 
 Per DWRR round:
 
-```
-for each active class at this priority:
-  class.surplus_deficit += class.weight * round_quantum
-  while class.surplus_deficit >= next_pkt_len and budget remains:
-    dequeue packet from class leaf
-    class.surplus_deficit -= pkt_len
-    charge root + class PIR
-```
-
-This provides stable same-priority surplus sharing without queue-order bias.
-
-## Leaf Scheduling
-
-Within a fairness-enabled class, leaves are served with DRR.
-
-### Fairness Modes
-
-Supported policy modes:
-
-- `source-address`
-- `destination-address`
-- `source-prefix`
-- `5-tuple`
-- disabled
-
-The scheduler remains protocol oblivious because fairness depends only on the
-configured key and packet size, not protocol behavior.
-
-### Dynamic Leaf Quantum
-
-Leaf DRR quantum should adapt to:
-
-- class rate
-- active leaf count
-- latency target
-
-Recommended formula:
-
-```
-leaf_quantum_bytes = clamp(
-    class_rate_bytes_per_us * target_leaf_round_us / max(active_leaves, 1),
-    2 * mtu_bytes,
-    32 * 1024
-)
+```text
+for each active reservation at this priority:
+  reservation.surplus_deficit += reservation.weight * round_quantum
+  while reservation.surplus_deficit >= next_pkt_len and budget remains:
+    dequeue packet from reservation.container
+    reservation.surplus_deficit -= pkt_len
+    charge root + reservation surplus budget
 ```
 
-Reasonable defaults:
+This gives stable weighted sharing among classes without implying any
+micro-flow logic inside a class.
 
-- `target_leaf_round_us = 250`
-- `min_quantum = 2 * MTU`
-- `max_quantum = 32 KB`
+## Container Scheduling
 
-### Queue Policy by Class
+The first pass should stay simple:
 
-Recommended policy split:
+- one FIFO queue per container
+- one active dequeue head per container
+- no fairness key derivation
+- no per-flow DRR
+- no host buckets
 
-- `network-control`, `expedited-forwarding`:
-  local FIFO, small buffers, no leaf DRR
+If a reservation later needs multiple containers, container selection inside
+that reservation can still remain simple, for example:
 
-- `assured-forwarding`:
-  FIFO by default, fairness optional
+- fixed-priority among containers, or
+- round-robin among containers
 
-- `best-effort`, `bulk-data`:
-  fairness enabled by default
-
-This is deliberate:
-
-- FIFO high-priority classes optimize latency
-- fairness-enabled low-priority classes optimize starvation resistance
+But that is a later extension. The current baseline should not be written as
+if per-flow fair queueing already exists.
 
 ## Admission Control
 
 Admission control belongs inside the hierarchy.
 
-### Class-Level Admission
+### Root-Level Admission
 
-Each class enforces:
+The root enforces:
+
+- interface-level byte limit
+- interface-level frame limit
+- interface-level UMEM budget
+
+### Reservation-Level Admission
+
+Each reservation enforces:
 
 - byte limit
 - frame limit
-- incumbents budget
-- reserved headroom
+- optional reserved headroom
 
-Headroom prevents incumbents from completely occupying the class buffer and
-blocking all new arrivals.
+Reservation headroom prevents one reservation from consuming all of the shared
+buffering and making the interface unusable for every other reservation.
 
-### Leaf-Level Admission
+### Container-Level Admission
 
-Each fairness leaf enforces:
+Each container enforces:
 
-- soft cap
-- hard cap
-- reclaim eligibility
+- FIFO byte limit
+- FIFO frame limit
 
-Recommended caps:
+First-pass overflow policy:
 
-```
-soft_cap_bytes = clamp(
-    class_buffer_bytes / max(active_leaves, 1),
-    min_leaf_cap_bytes,
-    max_leaf_cap_bytes
-)
-hard_cap_bytes = 2 * soft_cap_bytes
-```
+- tail-drop within the same container
 
-Use `cap_factor = 1`, not `2`. With `cap_factor = 2`, all incumbents can
-fill the class while remaining under soft cap, leaving no reclaim candidate.
+This is intentionally simpler than reclaim lists or dominant-flow scavenging.
+Those mechanisms are only worth introducing after the basic class-based shaper
+works and we have evidence they are needed.
 
-### Admission Headroom
+### Memory Accounting
 
-Reserve a fraction of class buffer for new or under-cap leaves:
+Track queue occupancy in two dimensions:
 
-```
-incumbents_cap_bytes = class_buffer_bytes * (1 - headroom_pct)
-headroom_bytes       = class_buffer_bytes * headroom_pct
-```
+- **payload bytes** for shaping and scheduling logic
+- **UMEM frames** for actual memory safety
 
-Recommended:
+Both must be enforced even in FIFO-only mode.
 
-- `headroom_pct = 0.10`
+## Many-Core Scaling
 
-### Admission Policy
+The previous draft used the word "sharding" too abstractly. The concrete model
+should be:
 
-For a fairness-enabled class:
+- a **shard** is just a scheduler owner for some reservations/containers on
+  one shaped interface
+- a shard is **not** a second policy layer
+- a shard is **not** a fast path
+- a shard does **not** create independent rates
 
-1. If the incoming leaf is below soft cap and the class is below the
-   incumbents budget:
-   admit
+### Concrete Example
 
-2. If the incoming leaf exceeds hard cap:
-   drop
+Suppose interface `ge-0-0-1` has four scheduler shards:
 
-3. If the class is above incumbents budget and the incoming leaf is already
-   reclaimable:
-   reclaim from that leaf
+- shard 0 owns `network-control`
+- shard 1 owns `expedited-forwarding`
+- shard 2 owns `assured-forwarding`
+- shard 3 owns `best-effort`
 
-4. If the incoming leaf is under cap and the class is full:
-   reclaim from another reclaimable leaf
+Any worker that classifies a packet into `best-effort` does this:
 
-5. If no reclaimable leaf exists:
-   reclaim from the deepest leaf in the same class
+1. map packet to the `best-effort` reservation/container
+2. enqueue it to shard 3, because shard 3 owns that queue
+3. shard 3 runs FIFO queueing for that container
+4. when shard 3 dequeues, it spends:
+   - root lease from the shared interface bucket
+   - reservation lease from the shared `best-effort` bucket
 
-6. If reclaim still fails:
-   class tail-drop
+So the queue is local to one shard, but the budget authority is still global.
 
-This keeps the fairness decision inside the class. Leaves compete within the
-class; classes compete only through the root/class scheduler.
+### Ownership Rules
 
-### Reclaim Structures
+To keep semantics correct:
 
-Maintain:
+1. A container belongs to exactly one shard at a time.
+2. All packets for that container enqueue to that shard.
+3. The root and reservation budgets remain shared and authoritative.
+4. A reservation must not silently exist as independent schedulers on several
+   workers, because that would multiply its effective share.
 
-- a reclaim list for over-cap leaves
-- a deepest-leaf tracker as fallback
+### Why This Supports Many Cores
 
-The reclaim list should be O(1) in the common case. The deepest-leaf fallback
-may be O(1) optimistic with occasional repair scans.
+This model still uses many cores:
 
-### Finite-Buffer Realism
+- parse, route, NAT, and classification can run on all workers
+- different reservations can be owned by different scheduler shards
+- shared budgets are touched through leases rather than on every packet
+- semantics do not change when the number of arrival workers changes
 
-The goal is not “mice can never be dropped under infinite overload”.
+### What It Does Not Solve
 
-The goal is:
+This first-pass many-core model is intentionally coarse-grained.
 
-- mice retain admission and low drop probability
-- dominant leaves absorb reclaim pressure first
-- fairness survives adversarial overload substantially better than plain
-  class tail-drop
+If one reservation is extremely hot:
 
-## Many-Core Scaling Without Breaking Hierarchy
+- its owner shard can become CPU-bound
+- throughput for that reservation can be bounded by that shard
+- correctness is still preserved
+- class behavior does not multiply across workers
 
-The right multi-core model is **hierarchy sharding**, not a CIR fast path.
+That is acceptable for the first implementation. It is much easier to reason
+about than splitting one reservation across many workers before the core
+algorithm is stable.
 
-### Scheduler Shards
+### Recommended Rollout
 
-Each shaped interface is implemented as a set of scheduler shards.
+The implementation plan should be explicit:
 
-Each shard owns:
+1. **Simplest valid version**: one scheduler owner per shaped interface
+2. **Next step**: multiple scheduler shards with static reservation/container
+   ownership
+3. **Later only if needed**: more sophisticated ownership or sub-queue models
 
-- shard-local class queues
-- shard-local leaf queues
-- shard-local DRR state
-- shard-local scheduler cursors
-- shard-local leased budgets
-
-Shared parent budgets remain authoritative:
-
-- interface aggregate budget
-- class CIR budgets
-- class PIR budgets
-
-So the service hierarchy is:
-
-```
-shared root/class budgets
-  -> shard-local class/leaf state
-```
-
-### Why This Preserves Hierarchy
-
-Shards do not own independent rates. They only hold temporary leases from
-shared parent budgets. Packets still flow through:
-
-- class node
-- leaf node
-- root/class accounting
-
-### Shard Placement
-
-For fairness-enabled traffic, place packets into shards by:
-
-```
-shard = hash(interface_id, class_id, fairness_key)
-```
-
-This is hierarchy sharding, not a separate fast path. The packet still enters
-the same class and leaf semantics; it is simply routed to the shard that owns
-that portion of the queue tree.
-
-For FIFO-only latency-sensitive classes, packets may remain on the local shard
-if that preserves the same class/root accounting and avoids unnecessary
-cross-shard movement.
-
-### Cross-Shard Enqueue
-
-If a packet arrives on a worker that is not the correct shard for its
-fairness-enabled class:
-
-- the packet is internally forwarded to the correct shard before enqueue
-- admission control happens on that shard
-- scheduling happens on that shard
-
-This is not a shaping bypass. It is only internal placement before the packet
-enters the same hierarchical queueing logic.
-
-### What This Solves
-
-This prevents the many-core fairness multiplication problem:
-
-- one fairness key maps to one shard
-- therefore one fairness key has one leaf state
-- therefore one sender does not get one DRR share per worker
-
-That is essential for:
-
-- one elephant vs one hundred mice
-- one hundred elephants vs one mouse
-- many-flow adversaries under RSS skew
-
-### What This Does Not Solve
-
-If one fairness key is extremely hot, the shard that owns it can still become
-CPU-bound. That is acceptable and expected:
-
-- class correctness remains intact
-- fairness remains intact
-- but throughput may still be bounded by the hot shard's CPU
-
-This is better than allowing one sender to multiply its share across all
-workers.
+Do not start with per-flow shard placement.
 
 ## Shared Budget Leasing
 
-Shared parent budgets should not be touched directly on every packet.
+Shared root and reservation budgets should not be touched directly on every
+packet.
 
 ### Lease Hierarchy
 
 Recommended implementation:
 
-```
-global token pool
-  -> optional socket-local lease pool
+```text
+shared root/reservation buckets
+  -> optional socket-local lease cache
     -> shard-local lease
 ```
 
@@ -533,7 +467,7 @@ This gives:
 
 Shard-local lease size should be dynamic:
 
-```
+```text
 lease_bytes = clamp(
     rate_bytes_per_us * target_lease_us,
     mtu_bytes,
@@ -545,18 +479,17 @@ Recommended defaults:
 
 - `target_lease_us = 25`
 - `min_lease_bytes = MTU`
-- `max_lease_bytes = 64 KB` for aggregate
-- `max_lease_bytes = 16 KB` for class pools
+- `max_lease_bytes = 64 KB` for root aggregate
+- `max_lease_bytes = 16 KB` for reservation pools
 
-At very low rates, a shard may bypass local caching and charge directly
-against the shared pool, because packet rate is low enough that per-packet
-shared charging is acceptable.
+At very low rates, direct charging against the shared bucket may be acceptable
+because packet rate is already low.
 
 ### Lease Return
 
-Unused local leases must be returned when:
+Unused leases must be returned when:
 
-- the class/leaf queue goes idle
+- the reservation/container goes idle
 - the shard goes quiescent
 - lease age exceeds a threshold
 - config reload or HA transition occurs
@@ -565,66 +498,35 @@ Unused local leases must be returned when:
 
 Total leased-but-unspent credit per shared bucket must be bounded:
 
-```
+```text
 max_total_leased = min(bucket_burst / 4, lease_per_shard * active_shards)
 ```
 
-This prevents many shards from hoarding too much shared budget at once.
+This prevents many shards from hoarding too much shared credit at once.
 
 ### Cache-Line Isolation
 
-All shared buckets must be padded and isolated per cache line.
+All shared buckets should be padded and isolated per cache line.
 
-Requirements:
-
-- one hot bucket per cache line
-- no packed arrays of hot atomics
-- timestamps isolated with their bucket if always touched together
-
-Without this, many-core coherence traffic will dominate the hot path.
-
-## Memory Model
-
-Track queue occupancy in two dimensions:
-
-- **payload bytes** for fairness and rate logic
-- **UMEM frames** for actual memory safety
-
-Both must be enforced in both FIFO and fairness-enabled classes.
-
-This matters because:
-
-- `64B` packets and `1500B` packets both consume one UMEM frame
-- payload-byte fairness and UMEM consumption are not the same resource
+Without that, coherence traffic will dominate the hot path on many-core boxes.
 
 ## Failure Modes
 
 ### Queue Overflow
 
-For fairness-enabled classes:
+First-pass policy:
 
-- reclaim from dominant or reclaimable leaves first
-- fall back to class tail-drop only if necessary
-
-For FIFO classes:
-
-- class tail-drop
-
-### UMEM Exhaustion
-
-Under interface-level UMEM pressure:
-
-1. reclaim from the lowest-priority fairness-enabled class
-2. within that class, reclaim from reclaimable leaves first
-3. then deepest-leaf fallback
-4. then FIFO fallback
+- container tail-drop on container overflow
+- reservation admission failure if reservation-level caps are exceeded
+- root/interface admission failure if interface-level UMEM or queue caps are
+  exceeded
 
 ### TX Ring Backpressure
 
 If TX ring submission is partial:
 
-- return unsent packets to the front of the same shard/class/leaf
-- preserve class and leaf ordering
+- return unsent packets to the front of the same shard/reservation/container
+- preserve FIFO ordering
 
 ### Config Reload
 
@@ -658,9 +560,15 @@ The configuration remains Junos-inspired:
 - interface shaping-rate
 - optional classifier bindings
 
+Internal mapping:
+
+- the interface shaping-rate becomes the **root**
+- the scheduler attached to a forwarding class becomes the **reservation**
+- the actual queue instance on that interface becomes the **container**
+
 ### Example
 
-```
+```text
 set class-of-service forwarding-classes queue 0 best-effort
 set class-of-service forwarding-classes queue 1 expedited-forwarding
 set class-of-service forwarding-classes queue 2 assured-forwarding
@@ -673,7 +581,6 @@ set class-of-service schedulers ef-sched buffer-size 4m
 set class-of-service schedulers be-sched transmit-rate 3g
 set class-of-service schedulers be-sched priority low
 set class-of-service schedulers be-sched buffer-size 16m
-set class-of-service schedulers be-sched host-fairness source-address
 
 set class-of-service scheduler-maps my-map forwarding-class best-effort scheduler be-sched
 set class-of-service scheduler-maps my-map forwarding-class expedited-forwarding scheduler ef-sched
@@ -685,23 +592,23 @@ set class-of-service interfaces ge-0-0-1 unit 0 scheduler-map my-map
 
 ## Observability
 
-Observability must reflect the hierarchy.
+Observability should reflect the actual hierarchy.
 
 ### CLI
 
 Required views:
 
 - interface/root state
-- class state
-- fairness leaf state for fairness-enabled classes
+- reservation state
+- container state
 - shard state for many-core debugging
 
 Examples:
 
-```
+```text
 show class-of-service interface ge-0-0-1
-show class-of-service interface ge-0-0-1 queue 0 detail
-show class-of-service interface ge-0-0-1 queue 0 leaves
+show class-of-service interface ge-0-0-1 reservation best-effort detail
+show class-of-service interface ge-0-0-1 container best-effort
 show class-of-service interface ge-0-0-1 shards
 ```
 
@@ -710,102 +617,114 @@ show class-of-service interface ge-0-0-1 shards
 At minimum:
 
 - root aggregate tokens
-- class CIR/PIR served bytes
-- class queue depth bytes/frames
-- leaf active count
-- reclaim counts
-- tail drops
-- UMEM pressure drops/reclaims
+- reservation CIR/PIR served bytes
+- reservation queue depth bytes/frames
+- container queue depth bytes/frames
+- container tail drops
+- UMEM pressure drops
 - lease returns and lease expirations
 - shard-local backlog and service
 
 ## Implementation Plan
 
-### Phase 1: Root + FIFO Classes
+### Phase 1: Root + Reservation + Container FIFO
 
 - root aggregate shaping
-- class FIFO queues
-- direct scheduler ownership of TX ordering
+- one reservation per class
+- one FIFO container per reservation
 - no bypass for generated packets on shaped interfaces
+- valid implementation may use one scheduler owner per interface
 
-### Phase 2: Class CIR/PIR Scheduling
+### Phase 2: Reservation Guarantees and Surplus
 
-- phase 1 guarantee service
-- phase 2 surplus service
-- shared class/root budgets
-- dynamic shard-local leases
+- guarantee service phase
+- surplus service phase
+- strict priority between reservation levels
+- weighted DWRR within the same priority
+- shared root/reservation budgets
 
-### Phase 3: Fairness Leaves
+### Phase 3: Many-Core Ownership and Leasing
 
-- fairness key derivation
-- leaf DRR
-- soft/hard caps
-- reclaim list and deepest-leaf fallback
-
-### Phase 4: Hierarchy Sharding
-
-- shard placement for fairness-enabled classes
-- internal cross-shard enqueue
-- shared parent budgets + leases
+- static reservation/container ownership by scheduler shard
+- internal enqueue to the owning shard
+- shared parent budgets plus shard-local leases
 - cache-line isolation for shared pools
 
-### Phase 5: Observability and Tuning
+### Phase 4: Observability and Tuning
 
+- root/reservation/container CLI
 - shard metrics
-- queue/leaf CLI
 - lease tuning
-- latency/fairness benchmark tuning
+- latency and throughput tuning
+
+### Future Extension, Not Phase 1
+
+If class-level FIFO proves insufficient, later work can add:
+
+- multiple containers per reservation
+- more advanced admission/reclaim
+- finer-grained fairness below the container level
+
+But that should be justified by evidence, not assumed into the baseline design.
 
 ## Validation Plan
 
-The design is only correct if all of these pass:
+The design is only correct if all of these pass.
 
 ### Throughput and Accuracy
 
-1. Single shard, single class, line-rate shaping
+1. Single interface, single reservation, line-rate shaping
 2. Low-rate shaping accuracy at `10/50/100 Mbps`
-3. Same-class multi-shard contention on shared budgets
+3. Multi-reservation contention on shared root budget
 
 ### Scheduling Correctness
 
-4. Phase 1 queue-index fairness across all classes
-5. Same-priority DWRR surplus split
-6. `transmit-rate exact` never exceeds CIR
+4. Guarantee phase gives every backlogged reservation forward progress
+5. Same-priority weighted DWRR surplus split matches configured weights
+6. `transmit-rate exact` never exceeds its guarantee
 
-### Adversarial Fairness
+### Adversarial Class Behavior
 
-7. One elephant vs one hundred mice
-8. One hundred elephants vs one mouse
-9. One hundred elephants vs one hundred mice
-10. Flow splitting: one sender opens many connections
+7. One elephant in low priority does not destroy a small high-priority class
+8. One hundred elephants across several low-priority reservations still allow
+   high-priority reservations to meet guarantees
+9. Uneven RSS placement does not multiply reservation guarantees
 
 ### Many-Core Behavior
 
-11. One fairness key spread across many arrival workers still gets one leaf
-12. Many fairness keys spread across many workers scale across shards
-13. Shared-budget leasing does not collapse under many-core contention
-14. No long-lived stranded lease credit
+10. Packets from many arrival workers still enqueue to the correct owning
+    shard for their reservation/container
+11. Shared-budget leasing remains stable under many-core contention
+12. No long-lived stranded lease credit
 
 ### Infrastructure
 
-15. No-bypass validation for session hits and generated packets
-16. TX ring backpressure preserves class/leaf ordering
-17. Config reload and HA transition honor bounded drain behavior
-18. UMEM pressure reclaim targets dominant leaves first
+13. No-bypass validation for session hits and generated packets
+14. TX ring backpressure preserves FIFO ordering
+15. Config reload and HA transition honor bounded drain behavior
+16. UMEM accounting remains correct under mixed packet sizes
+
+### Known First-Pass Limitation to Measure Explicitly
+
+17. Elephant-versus-mice within the **same** container should be benchmarked
+    and documented as FIFO behavior, not misrepresented as solved fairness
 
 ## Summary
 
-The correct model is:
+The first-pass design should be framed as:
 
 - a hierarchical shaper
 - one unified packet path
-- one scheduler with two phases
+- one service tree: `root(interface) -> reservation -> container`
+- FIFO queueing inside containers
+- weighted scheduling among reservations
 - no CIR fast path
-- many-core support via hierarchy sharding plus shared parent leases
+- many-core support through queue ownership and shared-budget leasing
+- no claim of micro-flow fairness in phase 1
 
-That keeps the design aligned with the actual goals:
+That keeps the document aligned with the actual intent:
 
 - protocol oblivious
-- adversarially robust
-- many-core capable
-- no shaping bypass
+- class-oriented and work-conserving
+- understandable on many-core systems
+- implementable without jumping straight into expensive per-flow machinery
