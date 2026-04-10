@@ -6,6 +6,21 @@ import (
 	"time"
 )
 
+func localHAForwardingRole(status ProcessStatus) string {
+	if len(status.HAGroups) == 0 {
+		return ""
+	}
+	for _, group := range status.HAGroups {
+		if group.Active {
+			return "active"
+		}
+	}
+	if status.ForwardingArmed {
+		return "standby (armed for failover)"
+	}
+	return "standby"
+}
+
 func FormatStatusSummary(status ProcessStatus) string {
 	var b strings.Builder
 	now := time.Now()
@@ -162,6 +177,7 @@ func FormatStatusSummary(status ProcessStatus) string {
 	fmt.Fprintf(&b, "  Neighbor generation:       %d\n", status.NeighborGeneration)
 	fmt.Fprintf(&b, "  Route entries:             %d\n", status.RouteEntries)
 	if len(status.HAGroups) > 0 {
+		fmt.Fprintf(&b, "  Local HA forwarding role:  %s\n", localHAForwardingRole(status))
 		parts := make([]string, 0, len(status.HAGroups))
 		for _, group := range status.HAGroups {
 			parts = append(parts, fmt.Sprintf("rg%d active=%t watchdog=%d", group.RGID, group.Active, group.WatchdogTimestamp))

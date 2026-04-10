@@ -20,6 +20,11 @@ func TestFormatStatusSummary(t *testing.T) {
 		InterfaceAddresses:     6,
 		NeighborEntries:        9,
 		RouteEntries:           4,
+		HAGroups: []HAGroupStatus{
+			{RGID: 0, Active: true, WatchdogTimestamp: 100},
+			{RGID: 1, Active: false, WatchdogTimestamp: 0},
+			{RGID: 2, Active: false, WatchdogTimestamp: 0},
+		},
 		Fabrics: []FabricSnapshot{
 			{Name: "fab0", ParentLinuxName: "ge-0-0-0", ParentIfindex: 7, OverlayLinux: "fab0", OverlayIfindex: 17, RXQueues: 4, PeerAddress: "10.99.1.2"},
 		},
@@ -52,6 +57,8 @@ func TestFormatStatusSummary(t *testing.T) {
 		"Interface addresses:       6",
 		"Neighbor entries:          9",
 		"Route entries:             4",
+		"Local HA forwarding role:  active",
+		"HA groups:                 rg0 active=true watchdog=100; rg1 active=false watchdog=0; rg2 active=false watchdog=0",
 		"Fabric links:              fab0 parent=ge-0-0-0 peer=10.99.1.2",
 		"Last resolution:           forward_candidate egress-ifindex=11 next-hop=172.16.50.1 mac=00:10:db:ff:10:01",
 		"Bound bindings:            2/2",
@@ -89,6 +96,22 @@ func TestFormatStatusSummary(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("summary missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestFormatStatusSummaryReportsStandbyArmedRole(t *testing.T) {
+	status := ProcessStatus{
+		ForwardingArmed: true,
+		HAGroups: []HAGroupStatus{
+			{RGID: 0, Active: false, WatchdogTimestamp: 100},
+			{RGID: 1, Active: false, WatchdogTimestamp: 0},
+			{RGID: 2, Active: false, WatchdogTimestamp: 0},
+		},
+	}
+
+	out := FormatStatusSummary(status)
+	if !strings.Contains(out, "Local HA forwarding role:  standby (armed for failover)") {
+		t.Fatalf("summary missing standby armed role:\n%s", out)
 	}
 }
 
