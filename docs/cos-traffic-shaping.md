@@ -298,7 +298,6 @@ That keeps "exact" and ceiling semantics explicit instead of treating surplus as
 an unbounded borrow from the root.
 
 ### Same-Priority Weighted DWRR Across Reservations
-
 Each reservation at a priority level has a persistent `surplus_deficit`.
 
 Per DWRR round:
@@ -461,7 +460,6 @@ The implementation plan should be explicit:
 2. **Next step**: multiple scheduler shards with static reservation/container
    ownership
 3. **Later only if needed**: more sophisticated ownership or sub-queue models
-
 Do not start with per-flow shard placement.
 
 ## Shared Budget Leasing
@@ -592,7 +590,6 @@ Future knobs for finer-grained fairness, such as something like
 `host-fairness source-address`, are intentionally out of scope for Phase 1 and
 should be treated as reserved future extensions rather than active baseline
 behavior.
-
 ### Example
 
 ```text
