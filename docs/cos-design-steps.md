@@ -48,7 +48,7 @@ This summary keeps the original `/tmp` destinations inside prompt quotes because
 
 ## High-Level Trajectory
 
-The work moved through seven stages:
+The work moved through eight stages:
 
 1. Start with a hierarchical policer / rate limiter concept.
 2. Reject that framing after finding correctness and work-conserving problems.
@@ -57,6 +57,7 @@ The work moved through seven stages:
 5. Notice the many-core and hierarchy drift problems.
 6. Reset the design around a true hierarchy and rewrite `docs/cos-traffic-shaping.md` accordingly.
 7. Simplify the rewritten doc into the current `root(interface) -> reservation -> container` model, make Phase 1 explicitly FIFO-per-container, and explain many-core sharding more concretely.
+8. Add a timer-wheel-based deferred-eligibility plan so the shaper can sleep backlogged-but-ineligible reservations without turning shaping into per-packet pacing.
 
 ## Original Design Intent
 
@@ -389,6 +390,24 @@ Design impact:
 - none on the design itself
 - this was the final packaging step after the rewrite
 
+### 14. Add timer-wheel-based deferred eligibility to the plan
+
+Prompt used:
+
+> for COS, I was told we need a timer wheel. Can you take that into account and add it to the plan accordingly. I would like to see what that would look like
+
+Action taken:
+
+- `docs/cos-traffic-shaping.md` was amended to describe a per-shard timer wheel for sleeping reservations
+- the implementation plan was updated so timer-wheel support appears explicitly before the many-core phase
+- the validation plan was updated to require wakeup accuracy and no busy rescans across unrelated shards
+
+Main impact:
+
+- clarified that the timer wheel is for **reservation wakeups**, not per-packet pacing
+- made the low-CPU story more concrete by replacing implicit rescans with deferred eligibility
+- preserved the hierarchy: `root` and `reservation` budgets still decide eligibility, while the wheel only decides when to retry a backlogged reservation
+
 ## What Each Artifact Contributed
 
 ### [`docs/cos/hierarchical-policer-review.md`](cos/hierarchical-policer-review.md)
@@ -498,6 +517,9 @@ That later pass did three important things:
   per-flow fair queueing
 - rewrote the many-core section to explain shard ownership and rollout in
   practical terms instead of leaving it as an abstract sharding concept
+- added a timer-wheel section so the scheduler can park sleeping reservations
+  and wake them when root or reservation budget should have refilled enough to
+  send again
 
 That later simplification is why the current document is both narrower and
 clearer than the earlier replacement section archived under
@@ -514,6 +536,8 @@ The current `docs/cos-traffic-shaping.md` is the result of filtering all prior c
 - the first pass uses FIFO per container rather than per-flow fair queueing
 - weighted arbitration happens among reservations, not micro-flows
 - fairness cannot rely only on dequeue order; admission and queue occupancy matter too
+- sleeping reservations should be parked on a per-shard timer wheel rather than
+  repeatedly rescanned
 - the design must be protocol oblivious
 - there can be no fast-path bypass for shaped traffic
 - many-core support must come from hierarchy sharding and shared-budget leasing, not shortcut mechanisms
