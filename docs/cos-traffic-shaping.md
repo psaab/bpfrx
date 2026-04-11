@@ -357,6 +357,8 @@ reservation_runtime {
   queued_bytes
   queued_frames
   next_wakeup_tick
+  wheel_level
+  wheel_slot
   wake_reason
   cir_deficit
   surplus_deficit
@@ -378,6 +380,11 @@ The first pass only needs a few wake reasons:
 That is enough to keep the scheduler from spinning on reservations that cannot
 possibly send yet.
 
+With shared parent budgets, wakeup time is only an estimate. A shard can wake
+because the root budget should have refilled enough for one MTU, then lose the
+actual lease race to another shard. That is acceptable as long as the wake path
+rechecks eligibility and re-arms cheaply.
+
 ### Timer Wheel Shape
 
 This should be a **per-shard** structure, not a global wheel shared by all
@@ -395,6 +402,16 @@ requiring a heap on the hot path. Longer deadlines such as HA/config drain
 timeouts can stay on a separate coarse timer path if needed.
 
 The wheel tick should match shaping granularity, not attempt packet pacing.
+
+### Tick Advance
+
+The wheel should advance at the start of each scheduler poll cycle using a
+monotonic clock.
+
+In practice, that means `drain_shaped_tx()` or the equivalent shard-local
+scheduler loop advances the wheel before it services runnable reservations.
+Tick resolution is therefore bounded by scheduler poll frequency, not by a
+dedicated timer interrupt.
 
 ### Enqueue and Rearm Rules
 
@@ -421,6 +438,11 @@ On timer-wheel advance:
 
 The important point is that the wheel schedules **reservation retries**, not
 packet transmit timestamps.
+
+Re-arm on dequeue must stay O(1). Each reservation runtime record stores its
+current wheel location, and each wheel slot holds a linked list of parked
+reservations. Re-arming a reservation is therefore an unlink from the old slot
+plus a link into the new slot, not a heap operation or slot scan.
 
 ### Why This Fits the Hierarchy
 
@@ -784,6 +806,8 @@ At minimum:
 - no bypass for generated packets on shaped interfaces
 - valid implementation may use one scheduler owner per interface
 - runnable reservation lists only
+- acceptable without a timer wheel because the reservation count per interface
+  is still small enough to scan directly in the baseline implementation
 
 ### Phase 2: Timer Wheel and Deferred Eligibility
 
@@ -844,8 +868,8 @@ The design is only correct if all of these pass.
 4. Guarantee phase gives every backlogged reservation forward progress
 5. Same-priority weighted DWRR surplus split matches configured weights
 6. `transmit-rate exact` never exceeds its guarantee
-7. Backlogged reservations wake from the timer wheel within one tick plus one
-   scheduler cycle of becoming eligible
+7. In single-shard or uncontended cases, backlogged reservations wake from the
+   timer wheel within one tick plus one scheduler cycle of becoming eligible
 
 ### Adversarial Class Behavior
 
@@ -862,17 +886,19 @@ The design is only correct if all of these pass.
 13. No long-lived stranded lease credit
 14. Sleeping reservations on one shard do not require rescans on unrelated
     shards
+15. Under contended shared-root leasing, wake-and-rearm retries remain bounded
+    and do not devolve into busy rescans
 
 ### Infrastructure
 
-15. No-bypass validation for session hits and generated packets
-16. TX ring backpressure preserves FIFO ordering
-17. Config reload and HA transition honor bounded drain behavior
-18. UMEM accounting remains correct under mixed packet sizes
+16. No-bypass validation for session hits and generated packets
+17. TX ring backpressure preserves FIFO ordering
+18. Config reload and HA transition honor bounded drain behavior
+19. UMEM accounting remains correct under mixed packet sizes
 
 ### Known First-Pass Limitation to Measure Explicitly
 
-19. Elephant-versus-mice within the **same** container should be benchmarked
+20. Elephant-versus-mice within the **same** container should be benchmarked
     and documented as FIFO behavior, not misrepresented as solved fairness
 
 ## Summary
