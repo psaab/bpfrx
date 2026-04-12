@@ -138,18 +138,18 @@ func (c *ctl) dispatchWithPipe(cmd, pipeType, pipeArg string) error {
 	}
 	os.Stdout = w
 
-	var cmdErr error
-	done := make(chan struct{})
+	outputCh := make(chan []byte, 1)
 	go func() {
-		defer close(done)
-		cmdErr = c.dispatch(cmd)
+		output, _ := io.ReadAll(r)
+		r.Close()
+		outputCh <- output
 	}()
-	<-done
+
+	cmdErr := c.dispatch(cmd)
 	w.Close()
 	os.Stdout = origStdout
 
-	output, _ := io.ReadAll(r)
-	r.Close()
+	output := <-outputCh
 
 	lines := strings.Split(string(output), "\n")
 	if len(lines) > 0 && lines[len(lines)-1] == "" {

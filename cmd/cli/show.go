@@ -581,7 +581,7 @@ func printSessionEntries(resp *pb.GetSessionsResponse, brief bool) {
 	if brief {
 		fmt.Printf("%-5s %-22s %-22s %-5s %-20s %-3s %-5s %5s %s\n",
 			"ID", "Source", "Destination", "Proto", "Zone", "NAT", "State", "Age", "Pkts(f/r)")
-		for _, se := range resp.Sessions {
+		for i, se := range resp.Sessions {
 			inZone := se.IngressZoneName
 			if inZone == "" {
 				inZone = fmt.Sprintf("%d", se.IngressZone)
@@ -605,7 +605,7 @@ func printSessionEntries(resp *pb.GetSessionsResponse, brief bool) {
 			}
 			sid := se.SessionId
 			if sid == 0 {
-				sid = uint64(resp.Offset) + 1
+				sid = uint64(resp.Offset) + uint64(i) + 1
 			}
 			fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
 				sid,
@@ -619,14 +619,14 @@ func printSessionEntries(resp *pb.GetSessionsResponse, brief bool) {
 		return
 	}
 
-	for _, se := range resp.Sessions {
+	for i, se := range resp.Sessions {
 		polDisplay := se.PolicyName
 		if polDisplay == "" {
 			polDisplay = fmt.Sprintf("%d", se.PolicyId)
 		}
 		sid := se.SessionId
 		if sid == 0 {
-			sid = uint64(resp.Offset) + 1
+			sid = uint64(resp.Offset) + uint64(i) + 1
 		}
 
 		haStr := ""
