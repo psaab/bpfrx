@@ -54,9 +54,8 @@ func formatNodesInheritance(b *strings.Builder, nodes []*Node, indent int) {
 			fmt.Fprintf(b, "%s/* %s */\n", prefix, n.Annotation)
 		}
 		if n.InheritedFrom != "" {
-			// Determine the display name for the annotation.
-			// Junos uses the last key for leaf values ("## 'any' was inherited")
-			// and the first non-keyword key for containers ("## 'default-deny' was inherited").
+			// Use the last key in the node's key path for inherited-node annotations
+			// (for example, "## 'any' was inherited").
 			displayKey := n.Keys[len(n.Keys)-1]
 			fmt.Fprintf(b, "%s##\n%s## '%s' was inherited from group '%s'\n%s##\n",
 				prefix, prefix, displayKey, n.InheritedFrom, prefix)

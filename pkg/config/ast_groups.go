@@ -87,9 +87,9 @@ func tagNodesInherited(nodes []*Node, groupName string) {
 	}
 }
 
-// stripApplyGroups recursively removes apply-groups nodes and returns error
-// if they reference undefined groups. vars is used to resolve ${var}
-// placeholders in group names for error messages.
+// stripApplyGroups walks the tree after group expansion and returns an error
+// if any apply-groups node still references an undefined group. vars is used
+// to resolve ${var} placeholders in group names for error messages.
 func (t *ConfigTree) stripApplyGroups(vars map[string]string) error {
 	return stripApplyGroupsInNodes(t.Children, vars)
 }
