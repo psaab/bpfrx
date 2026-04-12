@@ -1864,6 +1864,13 @@ impl BindingWorker {
     }
 }
 
+fn should_install_local_reverse_session(decision: SessionDecision, fabric_ingress: bool) -> bool {
+    let fabric_wire_placeholder =
+        shared_ops::is_fabric_wire_placeholder(fabric_ingress, false, decision);
+    decision.resolution.disposition != ForwardingDisposition::FabricRedirect
+        || (fabric_ingress && !fabric_wire_placeholder)
+}
+
 fn poll_binding(
     binding_index: usize,
     bindings: &mut [BindingWorker],
@@ -3355,6 +3362,11 @@ fn poll_binding(
                                         let mut created = 0u64;
                                         let track_in_userspace = decision.resolution.disposition
                                             != ForwardingDisposition::LocalDelivery;
+                                        let install_local_reverse =
+                                            should_install_local_reverse_session(
+                                                decision,
+                                                fabric_ingress,
+                                            );
                                         let forward_metadata = SessionMetadata {
                                             ingress_zone: from_zone_arc.clone(),
                                             egress_zone: to_zone_arc.clone(),
@@ -3492,6 +3504,7 @@ fn poll_binding(
                                             nat64_reverse: nat64_info,
                                         };
                                         if track_in_userspace
+                                            && install_local_reverse
                                             && sessions.install_with_protocol_with_origin(
                                                 reverse_key.clone(),
                                                 reverse_decision,
@@ -6175,6 +6188,55 @@ mod tests {
             shared_umem_group_key_for_device(Some("mlx5_core"), None),
             None
         );
+    }
+
+    #[test]
+    fn split_owner_fabric_redirect_skips_local_reverse_placeholder() {
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::FabricRedirect,
+                local_ifindex: 0,
+                egress_ifindex: 21,
+                tx_ifindex: 21,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
+                neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                src_mac: Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]),
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                ..NatDecision::default()
+            },
+        };
+
+        assert!(!should_install_local_reverse_session(decision, true));
+        assert!(!should_install_local_reverse_session(decision, false));
+    }
+
+    #[test]
+    fn fabric_redirect_reply_from_real_fabric_ingress_keeps_local_reverse() {
+        let decision = SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::FabricRedirect,
+                local_ifindex: 0,
+                egress_ifindex: 21,
+                tx_ifindex: 21,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(10, 99, 13, 2))),
+                neighbor_mac: Some([0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee]),
+                src_mac: Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, 0x01]),
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_dst: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102))),
+                ..NatDecision::default()
+            },
+        };
+
+        assert!(should_install_local_reverse_session(decision, true));
+        assert!(!should_install_local_reverse_session(decision, false));
     }
 
     #[test]

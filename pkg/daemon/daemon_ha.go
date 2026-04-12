@@ -86,6 +86,18 @@ func (d *Daemon) localFailoverCommitIsReady(rgID int) bool {
 	return d.localFailoverCommitReady[rgID]
 }
 
+func recordRGActiveAppliedIfCurrentOrStable(s *rgStateMachine, tr rgTransition, active bool) bool {
+	if s.ApplyIfCurrent(tr) {
+		return true
+	}
+	current, _ := s.CurrentDesired()
+	if current != active {
+		return false
+	}
+	s.MarkApplied(active)
+	return true
+}
+
 func (d *Daemon) waitLocalFailoverCommitReady(rgIDs []int) error {
 	if len(rgIDs) == 0 {
 		return nil
@@ -203,7 +215,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 						slog.Warn("failed to update rg_active from cluster event",
 							"rg", ev.GroupID, "active", cur, "err", err)
 					} else {
-						s.ApplyIfCurrent(tr)
+						recordRGActiveAppliedIfCurrentOrStable(s, tr, cur)
 					}
 				}
 				// Only remove blackholes once this node's desired state is
@@ -237,7 +249,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 					d.reconcileDirectVIPOwnership(ev.GroupID, "cluster-primary")
 					go d.RefreshFabricFwd()
 				}
-				if noRethVRRP && (d.dp == nil || !s.NeedsApply()) {
+				if noRethVRRP && d.cluster != nil && d.cluster.IsLocalPrimary(ev.GroupID) && (d.dp == nil || !s.NeedsApply()) {
 					d.setLocalFailoverCommitReady(ev.GroupID, true)
 				}
 			} else {
@@ -271,7 +283,7 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 						slog.Warn("failed to update rg_active from cluster event",
 							"rg", ev.GroupID, "active", cur, "err", err)
 					} else {
-						s.ApplyIfCurrent(tr)
+						recordRGActiveAppliedIfCurrentOrStable(s, tr, cur)
 					}
 				}
 
@@ -391,7 +403,7 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 					if err := d.dp.UpdateRGActive(rgID, cur); err != nil {
 						slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
 					} else {
-						s.ApplyIfCurrent(tr)
+						recordRGActiveAppliedIfCurrentOrStable(s, tr, cur)
 					}
 					go d.RefreshFabricFwd()
 				}
@@ -425,7 +437,7 @@ func (d *Daemon) watchVRRPEvents(ctx context.Context) {
 						if err := d.dp.UpdateRGActive(rgID, cur); err != nil {
 							slog.Warn("failed to update rg_active", "rg", rgID, "err", err)
 						} else {
-							s.ApplyIfCurrent(tr)
+							recordRGActiveAppliedIfCurrentOrStable(s, tr, cur)
 						}
 						go d.RefreshFabricFwd()
 					}
@@ -572,6 +584,9 @@ func (d *Daemon) reconcileRGState() {
 						"rg", rgID, "active", true, "err", err)
 				} else {
 					s.MarkApplied(true)
+					if noRethVRRP && clusterPri && !s.NeedsApply() {
+						d.setLocalFailoverCommitReady(rgID, true)
+					}
 				}
 			} else {
 				// Deactivation ordering: blackholes FIRST, then
@@ -583,6 +598,7 @@ func (d *Daemon) reconcileRGState() {
 						"rg", rgID, "active", false, "err", err)
 				} else {
 					s.MarkApplied(false)
+					d.setLocalFailoverCommitReady(rgID, false)
 				}
 			}
 		}
