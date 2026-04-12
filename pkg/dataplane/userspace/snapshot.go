@@ -225,21 +225,6 @@ func userspaceMapPins() UserspaceMapPins {
 	}
 }
 
-func (m *Manager) readFIBGeneration() uint32 {
-	fibGenMap := m.inner.Map("fib_gen_map")
-	if fibGenMap == nil {
-		return 0
-	}
-	var (
-		key uint32
-		gen uint32
-	)
-	if err := fibGenMap.Lookup(key, &gen); err != nil {
-		return 0
-	}
-	return gen
-}
-
 func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 	if cfg == nil || len(cfg.Interfaces.Interfaces) == 0 {
 		return nil

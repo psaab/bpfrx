@@ -390,6 +390,21 @@ func (m *Manager) syncInterfaceAttachments(result *dataplane.CompileResult, snap
 	}
 }
 
+func (m *Manager) readFIBGeneration() uint32 {
+	fibGenMap := m.inner.Map("fib_gen_map")
+	if fibGenMap == nil {
+		return 0
+	}
+	var (
+		key uint32
+		gen uint32
+	)
+	if err := fibGenMap.Lookup(key, &gen); err != nil {
+		return 0
+	}
+	return gen
+}
+
 // bpfKtimeNs returns the current CLOCK_BOOTTIME in nanoseconds, matching
 // the clock used by BPF's bpf_ktime_get_ns() for session Created timestamps.
 func (m *Manager) bpfKtimeNs() uint64 {
