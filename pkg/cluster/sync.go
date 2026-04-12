@@ -14,6 +14,7 @@ import (
 	"github.com/psaab/bpfrx/pkg/dataplane"
 )
 
+// syncMagic identifies cluster session-sync protocol packets.
 var syncMagic = [4]byte{'B', 'P', 'S', 'Y'}
 
 const (
@@ -43,6 +44,7 @@ const (
 	syncMsgHeartbeatAck           = 24
 )
 
+// syncHeader is the wire header for each sync message.
 type syncHeader struct {
 	Magic  [4]byte
 	Type   uint8
@@ -56,6 +58,7 @@ const failoverAckTimeout = 20 * time.Second
 const syncReadDeadline = 10 * time.Second
 const syncPeerSilenceTimeout = 30 * time.Second
 
+// SyncStats tracks session synchronization statistics.
 type SyncStats struct {
 	SessionsSent       atomic.Uint64
 	SessionsReceived   atomic.Uint64
@@ -81,6 +84,8 @@ type SyncStats struct {
 	LastFenceAckAt     atomic.Int64
 }
 
+// SyncStatsSnapshot is a point-in-time copy of SyncStats with plain
+// non-atomic fields, safe to copy by value and pass across API boundaries.
 type SyncStatsSnapshot struct {
 	SessionsSent       uint64
 	SessionsReceived   uint64
@@ -107,6 +112,8 @@ type SyncStatsSnapshot struct {
 	LastFenceAckAt     int64
 }
 
+// TransferReadinessSnapshot captures session-sync state that determines whether
+// manual failover can proceed without depending on bootstrap timing.
 type TransferReadinessSnapshot struct {
 	Connected             bool
 	PendingBulkAckEpoch   uint64
@@ -116,10 +123,13 @@ type TransferReadinessSnapshot struct {
 	BulkReceiveSessions   int
 }
 
+// ReadyForManualFailover reports whether the sync path is settled enough to
+// use as a manual-failover transport without waiting for bootstrap work.
 func (s TransferReadinessSnapshot) ReadyForManualFailover() bool {
 	return s.PendingBulkAckEpoch == 0 && !s.BulkReceiveInProgress
 }
 
+// Reason explains the current transfer-readiness blocker, if any.
 func (s TransferReadinessSnapshot) Reason() string {
 	switch {
 	case s.PendingBulkAckEpoch != 0:
@@ -135,6 +145,8 @@ func (s TransferReadinessSnapshot) Reason() string {
 	}
 }
 
+// SessionSync manages TCP-based session state replication between cluster
+// peers for stateful failover.
 type SessionSync struct {
 	localAddr  string
 	peerAddr   string
@@ -150,412 +162,86 @@ type SessionSync struct {
 	listener1  net.Listener
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
-	sendCh     chan []byte // Package cluster session synchronization (RTO - Real-Time Objects).
-	// Replicates session state between cluster nodes for stateful failover.
-	// syncMagic identifies RTO protocol packets.
-	// Sync message types.
-	// full config text sync from primary to secondary
-	// IPsec SA connection names sync
-	// remote failover request (payload: 1 byte rgID)
-	// peer fencing: receiver should disable all RGs
-	// monotonic clock exchange for timestamp rebasing
-	// ordered marker for remote install barriers
-	// failover request result (payload: rgID, status, detail)
-	// failover ownership commit (payload: rgID, reqID)
-	// failover commit result (payload: rgID, status, detail)
-	// hint: demoting node tells peer to pre-warm neighbors (payload: 1 byte rgID)
-	// remote failover request for multiple RGs
-	// multi-RG failover request result
-	// multi-RG failover ownership commit
-	// multi-RG failover commit result
-	// syncHeader is the wire header for each sync message.
-	// payload length after header
-	// SyncStats tracks session synchronization statistics.
-	// deletes lost when journal is full
-	// Cold sync timing.
-	// UnixNano (0 = never)
-	// UnixNano (0 = in progress or never)
-	// sessions in current/last bulk
-	// Config sync timing.
-	// UnixNano
-	// bytes
-	// Install fence (#311): barrier-based cutover sequence tracking.
-	// last barrier sequence sent
-	// UnixNano when last barrier ack was received
-	// SyncStatsSnapshot is a point-in-time copy of SyncStats with plain
-	// (non-atomic) fields, safe to copy by value and pass across API boundaries.
-	// 0=fab0, 1=fab1, -1=disconnected
-	// Install fence (#311).
-	// UnixNano (0 = never)
-	// TransferReadinessSnapshot captures session-sync state that determines
-	// whether manual failover can proceed without depending on bootstrap timing.
-	// ReadyForManualFailover reports whether the sync path is settled enough to
-	// use as a manual-failover transport without waiting for bootstrap work.
-	// Reason explains the current transfer-readiness blocker, if any.
-	// SessionSync manages TCP-based session state replication between cluster peers.
-	// local listen address (e.g. ":4785")
-	// peer connect address (e.g. "10.0.0.2:4785")
-	// fab0 connection (preferred)
-	// fab1 connection (fallback)
-	// serializes all conn.Write calls (sendLoop + writeMsg)
-	// secondary fabric listen address ("" = single-fabric)
-	// secondary fabric peer address
-	// secondary fabric listener
-	// buffered channel for outgoing messages
-	// incrementalPauseDepth temporarily pauses background incremental
-	// producers (periodic sweeps) during HA demotion handoff so ordered
-	// demotion barriers are not queued behind unrelated backlog.
-	// OnConfigReceived is called when a config sync message arrives from peer.
-	// The callback receives the full config text. Set by the daemon before Start().
-	// OnIPsecSAReceived is called when an IPsec SA list arrives from the peer.
-	// On failover, the new primary calls swanctl --initiate for each connection name.
-	// OnRemoteFailover is called when the peer requests us to transfer an RG
-	// out of primary. The callback receives the redundancy group ID and
-	// should return whether the transfer-out was applied or rejected so the
-	// requester can treat manual failover as an explicit handshake.
-	// OnRemoteFailoverCommit is called when the peer has committed local
-	// ownership after an acknowledged transfer-out and asks us to finalize
-	// the demoted side of the handoff.
-	// OnRemoteFailoverBatch is called when the peer requests us to transfer
-	// multiple RGs out of primary in one explicit handoff transaction.
-	// OnRemoteFailoverCommitBatch finalizes the demoted side of a previously
-	// acknowledged multi-RG handoff after the peer commits ownership.
-	// OnFenceReceived is called when the peer sends a fence message, requesting
-	// this node to disable all RGs (set rg_active=false). The receiver should
-	// call dp.UpdateRGActive(rgID, false) for every RG.
-	// OnPrepareActivation is called when the demoting peer has completed its
-	// preflight and is about to resign VRRP. The activating node should
-	// pre-install neighbor entries and warm the ARP/NDP cache so that
-	// bpf_fib_lookup succeeds for the first packet after VRRP MASTER (#485).
-	// OnForwardSessionInstalled is called when a forward cluster-synced
-	// session has been successfully installed into the local dataplane.
-	// The daemon uses this as a low-latency signal to refresh standby
-	// neighbor state without waiting for the periodic sweep interval.
-	// OnBulkSyncReceived is called when a bulk sync transfer completes
-	// (syncMsgBulkEnd received). The secondary uses this to release VRRP
-	// sync hold after session state has been installed.
-	// BulkSyncOverride, if set, is called instead of BulkSync() when the
-	// outbound bulk transfer needs to run. The daemon sets this to route
-	// through the event stream export path for userspace dataplanes.
-	// OnBulkSyncAckReceived is called when the peer acknowledges that it
-	// has fully processed one of our bulk sync transfers.
-	// OnPeerConnected is called when a peer sync connection is established
-	// (either inbound accept or outbound connect). The primary uses this to
-	// push config to a returning secondary.
-	// OnPeerDisconnected is called when all fabric connections are lost
-	// (total disconnect). Used to reset sync readiness so that a fresh
-	// bulk sync is required before the node can promote to primary.
-	// peerIPsecSAs holds the latest IPsec connection names received from the peer.
-	// returns true if local node is primary for RG 0
-	// returns true if local is primary for given RG
-	// monotonic seconds of last sync sweep
-	// replay sweep window on send queue overflow
-	// last seen GLOBAL_CTR_SESSIONS_NEW
-	// last seen GLOBAL_CTR_SESSIONS_CLOSED
-	// previous sweep found 0 sessions to sync
-	// VRF device for SO_BINDTODEVICE (empty = default VRF)
-	// Peer clock offset: localMono - peerMono.  Added to incoming
-	// session timestamps so Created/LastSeen are in our clock domain.
-	// zone_id -> RG_id (for per-RG session sync)
-	// Delete journal: bounded ring buffer for delete messages during disconnect.
-	// Deletes are journaled when queueMessage fails (disconnect), then flushed
-	// on reconnect before normal sync resumes.
-	// ring buffer of encoded delete messages
-	// max entries (default 10000)
-	// bulkSendMu serializes entire BulkSync() calls so two concurrent
-	// callers (e.g. acceptLoop and connectLoop) cannot interleave.
-	// monotonic epoch counter for outgoing bulk syncs
-	// pendingBulkAckEpoch tracks the latest outbound bulk epoch that has been
-	// fully written but not yet acknowledged by the peer.
-	// UnixNano
-	// bulkEverCompleted tracks whether at least one full bulk sync exchange
-	// has completed during this daemon instance's lifetime. Once true it
-	// survives reconnects; only a daemon restart resets it. Used to
-	// distinguish a true cold start (needs bulk) from a routine reconnect
-	// or fabric flip (incremental sync is sufficient).
-	// Bulk receive tracking for stale-entry reconciliation.
-	// During bulk receive (BulkStart..BulkEnd), track all received
-	// forward session keys. On BulkEnd, delete local sessions in
-	// peer-owned zones that were not refreshed.
-	// epoch of current in-progress bulk receive
-	// snapshot of ShouldSyncZone at BulkStart
-	// deleteJournalDefaultCap is the default max entries in the delete journal.
-	// NewSessionSync creates a new session synchronization manager.
-	// NewDualSessionSync creates a session sync manager with dual fabric transport.
-	// If local1/peer1 are empty, falls back to single-fabric behavior.
-	// SetVRFDevice sets the VRF device for SO_BINDTODEVICE on sync sockets.
-	// SetZoneRGMap sets the zone ID → redundancy group mapping for per-RG
-	// session sync. Sessions are synced only when the local node is primary
-	// for the RG that owns the session's ingress zone.
-	// SetDataPlane sets the dataplane used for installing received sessions.
-	// Called by the daemon after the dataplane is loaded (which happens after sync init).
-	// Stats returns a point-in-time snapshot of sync statistics.
-	// The snapshot uses plain fields (no atomics) so it is safe to copy by value.
-	// IsConnected returns true if the peer connection is established.
-	// BulkEverCompleted reports whether at least one full bulk sync exchange
-	// has completed during this daemon instance's lifetime.
-	// ActiveFabric returns which fabric carries sync traffic: 0, 1, or -1 if disconnected.
-	// LastPeerReceiveAge returns how long it has been since the last inbound sync
-	// message was received from the peer. The second return value is false if no
-	// inbound sync traffic has ever been observed on the current process lifetime.
-	// PeerRecentlyActive reports whether an inbound sync message has been observed
-	// from the peer within maxAge.
-	// PeerHealthy reports whether the sync connection is established and, once the
-	// peer has ever proved heartbeat-ack support, has been observed on the
-	// protocol within the expected silence window. Before that capability is ever
-	// observed we fall back to plain connection state so rolling upgrades do not
-	// flap readiness.
-	// activeConnLocked returns the preferred active connection.
-	// fab0 is preferred; fab1 is used only when fab0 is down.
-	// Caller must hold s.mu.
-	// getActiveConn returns the active connection, taking the lock.
-	// TCP_NODELAY disables Nagle's algorithm so small control messages
-	// (barriers, heartbeats) are not held waiting for outstanding data
-	// to be ACKed before sending. Important for barrier latency.
-	// handleNewConnection processes a newly established connection on the given fabric.
-	// It sets the connection in the appropriate slot, starts the receive loop, exchanges
-	// clocks, and triggers bulk sync if this is the first connection after a total disconnect.
-	// Start receive loop for this connection.
-	// Exchange monotonic clocks on every new connection.
-	// Only trigger bulk sync on a true cold start — when we have never
-	// completed a bulk exchange during this daemon instance's lifetime.
-	// Routine reconnects (brief network blip) and active-fabric flips
-	// already have synced sessions; they resume incremental sync
-	// immediately without the overhead of a full bulk transfer (#466).
-	// Start begins the sync protocol (listener + connector).
-	// Start listener for incoming peer connections.
-	// Accept incoming connections on primary fabric.
-	// Start secondary fabric listener if configured.
-	// Use one deterministic TCP initiator per fabric. Dual dialers create
-	// duplicate sync streams, mid-bulk connection replacement, and lost
-	// failover-handoff messages during reconnect windows.
-	// Connect to peer on secondary fabric if configured.
-	// Sender goroutine.
-	// Stop gracefully shuts down session sync.  If goroutines do not exit
-	// within 5 seconds the method returns anyway so the daemon can proceed
-	// with HA teardown (clearing rg_active, removing BPF state).
-	// Clean exit.
-	// StartSyncSweep starts a goroutine that periodically syncs sessions to the peer.
-	// Sessions with Created >= lastSweepTime (new) or LastSeen >= lastSweepTime
-	// (recently active) are queued for sync, ensuring established flows get their
-	// updated TCP state, timeouts, and last-seen timestamps replicated to standby.
-	// Back off when nothing to sync so the authoritative dataplane
-	// is not batch-walked unnecessarily. Userspace forwarding can
-	// override these intervals because it already streams create/close
-	// deltas out of band and only needs periodic refreshes.
-	// ShouldSyncZone returns true if the local node should sync sessions for
-	// the given zone. When IsPrimaryForRGFn is set and a zone→RG mapping
-	// exists, only sessions whose ingress zone belongs to a locally-primary
-	// RG are synced. Falls back to the global IsPrimaryFn otherwise.
-	// Fallback: use global primary check (backward compat, or zone not
-	// mapped to an RG — e.g. non-RETH interfaces always use RG 0).
-	// At least one primary check must be wired.
-	// Fast path: skip expensive BatchIterate when no sessions have changed.
-	// Reading two per-CPU counters is O(1) vs BatchIterate which is O(buckets)
-	// even for an empty 10M-entry hash map.
-	// Batch iteration reduces kernel lock contention with BPF datapath
-	// Only sweep sessions created since last threshold. The ring event
-	// path handles near-real-time create delivery; sweep is reconciliation
-	// only. Established flows whose LastSeen moved but were created before
-	// the threshold do not need re-syncing — the peer already has them.
-	// Keep lastSweepTime unchanged so the next sweep retries this
-	// same window, preventing permanent sync gaps on queue pressure.
-	// Snapshot counters so next sweep can skip if nothing changed.
-	// PauseIncrementalSync temporarily disables background sweep-driven session
-	// replication. Explicit sync producers (for example demotion-prep republish)
-	// are unaffected and may continue queueing messages.
-	// ResumeIncrementalSync releases a previous PauseIncrementalSync call.
-	// QueueSessionV4 queues a v4 session for sync to peer.
-	// QueueSessionV6 queues a v6 session for sync to peer.
-	// QueueDeleteV4 queues a v4 session deletion for sync.
-	// If the peer is disconnected, the delete is journaled for replay on reconnect.
-	// QueueDeleteV6 queues a v6 session deletion for sync.
-	// If the peer is disconnected, the delete is journaled for replay on reconnect.
-	// journalDelete stores a delete message in the bounded ring buffer
-	// for replay on reconnect. If the journal is full, the oldest entry
-	// is evicted and DeletesDropped is incremented.
-	// Evict oldest entry (ring buffer behavior).
-	// flushDeleteJournal replays all journaled delete messages through the
-	// send channel. Called on reconnect before normal sync resumes.
-	// QueueConfig sends the full config text to the peer for config synchronization.
-	// Called by the primary node after a successful commit.
-	// SendFailover sends a remote failover request to the peer and waits for
-	// an explicit applied/rejected acknowledgement. On success it returns the
-	// acknowledged request ID for the later transfer-commit step.
-	// SendFailoverBatch sends a remote failover request for multiple RGs and waits
-	// for an explicit applied/rejected acknowledgement.
-	// SendFailoverCommit sends the final ownership-commit step for a previously
-	// acknowledged failover request and waits for the peer to finalize transfer-out.
-	// SendFailoverCommitBatch sends the final ownership-commit step for a
-	// previously acknowledged multi-RG failover request.
-	// SendFence sends a fence message to the peer, requesting it to disable all
-	// RGs (set rg_active=false). This is a best-effort operation — if the sync
-	// connection is down (likely during a real failure), the call returns an error.
-	// SendPrepareActivation tells the peer to pre-install neighbor entries
-	// and warm its ARP/NDP cache for the given RG. Sent by the demoting node
-	// after its preflight completes, just before VRRP resign. Best-effort:
-	// if the send fails, the activation path still works (slightly slower
-	// neighbor resolution via warmNeighborCache).
-	// BulkSync sends the entire session table to the connected peer.
-	// Serialized by bulkSendMu so concurrent callers cannot interleave.
-	// fabricConnectLoop retries outbound connection on a single fabric link.
-	// Each fabric gets its own loop so fab0 reconnects independently of fab1.
-	// Skip if this fabric is already connected.
-	// sendOne writes a single message to the active connection, retrying
-	// on transient errors until success or context cancellation.
-	// Request an explicit heartbeat ack so one-way steady-state
-	// traffic still proves the reverse direction is alive.
-	// 16MB sanity limit (config can be large)
-	// Track forward keys during bulk receive for stale reconciliation.
-	// Rebase timestamps to local monotonic clock using
-	// the clock offset exchanged at connection setup.
-	// Invalidate FIB cache — peer's cached ifindex/MAC/gen
-	// are meaningless on this node. Forces a fresh
-	// bpf_fib_lookup so hairpin and RG-active checks work.
-	// Create reverse session entry from forward entries so return
-	// traffic matches conntrack on the takeover node.
-	// Swap zones: reverse traffic enters on egress zone
-	// and exits on ingress zone.
-	// Create dnat_table entry for SNAT reverse pre-routing.
-	// xdp_zone uses dnat_table to rewrite dst back to the real
-	// client before conntrack lookup on return traffic.
-	// Track forward keys during bulk receive for stale reconciliation.
-	// Rebase timestamps using clock offset (same as V4).
-	// Invalidate FIB cache (same as V4 above).
-	// Look up session before deleting to clean up reverse entry
-	// and SNAT dnat_table entry.
-	// Snapshot zone ownership at BulkStart so reconciliation uses a
-	// consistent view even if primary/secondary roles flip mid-bulk.
-	// Record fence ack timestamp for status observability (#311).
-	// snapshotZoneOwnership returns a map of zoneID→shouldSync for all zones
-	// currently in the zone→RG mapping. Used to freeze ownership at BulkStart.
-	// reconcileStaleSessions deletes local sessions in peer-owned zones that
-	// were not refreshed during the bulk receive. Called on BulkEnd.
-	// shouldSyncAtBulkStart uses the frozen snapshot if available. Zones missing
-	// from that snapshot are treated as syncable to avoid deleting sessions
-	// before the current bulk stream has finished delivering them.
-	// Zone missing from the frozen snapshot means ownership was not known at
-	// BulkStart. Skip stale reconciliation for that zone rather than falling
-	// back to a later live view that can delete sessions we have not finished
-	// receiving from the peer yet.
-	// Collect stale v4 sessions for deletion (can't delete during iteration).
-	// Only reconcile sessions in zones the peer owns (where we're NOT primary).
-	// Look up to clean reverse entry and dnat_table.
-	// Collect stale v6 sessions.
-	// Do NOT reset barrierSeq — the monotonic counter must keep
-	// incrementing across reconnects. Resetting to 0 causes sequence
-	// collisions: a stale WaitForPeerBarrier goroutine from the old
-	// connection holds seq=N, and after reset the next barrier reuses
-	// seq=N. When the stale goroutine's timer fires it deletes the
-	// new waiter, causing the new barrier to time out (#458).
-	// Keep barrierAckSeq monotonic too — resetting to 0 can cause a
-	// completed barrier to be misclassified as a disconnect if the
-	// waiter goroutine checks after handleDisconnect runs.
-	// Close stale waiter channels so any blocked WaitForPeerBarrier
-	// goroutine wakes up immediately instead of leaking until timeout.
-	// Reset any in-progress bulk receive — the connection that started
-	// it is gone, so the BulkEnd will never arrive.
-	// FormatStats returns a formatted string of sync statistics.
-	// PeerIPsecSAs returns the latest IPsec connection names received from the peer.
-	// QueueIPsecSA sends the list of active IPsec connection names to the peer.
-	// monotonicSeconds returns monotonic clock in seconds.
-	// rebaseTimestamp adjusts a peer timestamp to the local clock domain.
-	// offset = localMono − peerMono (computed at connection setup).
-	// --- Wire encoding helpers ---
-	// writeFull loops until all bytes are written or an error occurs,
-	// handling short writes from TCP backpressure.
-	// SessionKey: 4+4+2+2+1+3
-	// includes userspace FIB cache metadata
-	// Key
-	// include pad
-	// Value (key fields for session reconstruction)
-	// include pad0
-	// Counters
-	// Reverse key
-	// include pad
-	// include pad1
-	// generous buffer for v6
-	// Key
-	// include pad
-	// Value
-	// Reverse key
-	// --- Session decode helpers ---
-	// decodeSessionV4Payload decodes a v4 session from wire format.
-	// Returns key, value, and ok flag. Must match encodeSessionV4Payload layout.
-	// minimum key size
-	// include pad
-	// include pad0
-	// partial value is OK for key-only
-	// include pad
-	// include pad1
-	// decodeSessionV6Payload decodes a v6 session from wire format.
-	// minimum key size
-	// include pad
-	// include pad0
-	// include pad1
-	// --- IPsec SA encode/decode ---
-	// encodeIPsecSAPayload encodes a list of IPsec connection names as newline-separated bytes.
-	// decodeIPsecSAPayload decodes a newline-separated list of IPsec connection names.
+	sendCh     chan []byte // buffered channel for outgoing messages
 
-	incrementalPauseDepth       atomic.Int32
-	OnConfigReceived            func(configText string)
-	OnIPsecSAReceived           func(connectionNames []string)
-	OnRemoteFailover            func(rgID int) error
-	OnRemoteFailoverCommit      func(rgID int) error
-	OnRemoteFailoverBatch       func(rgIDs []int) error
+	// incrementalPauseDepth temporarily pauses background incremental producers
+	// during ordered handoff operations.
+	incrementalPauseDepth atomic.Int32
+
+	// OnConfigReceived is called when a config sync message arrives from the peer.
+	OnConfigReceived func(configText string)
+	// OnIPsecSAReceived is called when an IPsec SA list arrives from the peer.
+	OnIPsecSAReceived func(connectionNames []string)
+	// OnRemoteFailover is called when the peer requests a transfer-out for one RG.
+	OnRemoteFailover func(rgID int) error
+	// OnRemoteFailoverCommit finalizes the demoted side of an acknowledged handoff.
+	OnRemoteFailoverCommit func(rgID int) error
+	// OnRemoteFailoverBatch is called when the peer requests a multi-RG transfer-out.
+	OnRemoteFailoverBatch func(rgIDs []int) error
+	// OnRemoteFailoverCommitBatch finalizes a previously acknowledged multi-RG handoff.
 	OnRemoteFailoverCommitBatch func(rgIDs []int) error
-	OnFenceReceived             func()
-	OnPrepareActivation         func(rgID int)
-	OnForwardSessionInstalled   func()
-	OnBulkSyncReceived          func()
-	BulkSyncOverride            func() error
-	OnBulkSyncAckReceived       func()
-	OnPeerConnected             func()
-	OnPeerDisconnected          func()
-	peerIPsecSAs                []string
-	peerIPsecSAsMu              sync.Mutex
-	IsPrimaryFn                 func() bool
-	IsPrimaryForRGFn            func(rgID int) bool
-	lastSweepTime               uint64
-	syncBackfillNeeded          atomic.Bool
-	lastNewCounter              uint64
-	lastClosedCounter           uint64
-	lastSweepEmpty              bool
-	vrfDevice                   string
-	peerClockOffset             atomic.Int64
-	clockSynced                 atomic.Bool
-	zoneRGMu                    sync.RWMutex
-	zoneRGMap                   map[uint16]int
-	deleteJournalMu             sync.Mutex
-	deleteJournal               [][]byte
-	deleteJournalCap            int
-	lastPeerRxUnix              atomic.Int64
-	peerHeartbeatAckEver        atomic.Bool
-	readDeadline                time.Duration
-	peerSilenceLimit            time.Duration
-	bulkSendMu                  sync.Mutex
-	bulkSendNext                atomic.Uint64
-	pendingBulkAckEpoch         atomic.Uint64
-	pendingBulkAckSince         atomic.Int64
-	bulkEverCompleted           atomic.Bool
-	bulkMu                      sync.Mutex
-	bulkInProgress              bool
-	bulkRecvEpoch               uint64
-	bulkRecvV4                  map[dataplane.SessionKey]struct{}
-	bulkRecvV6                  map[dataplane.SessionKeyV6]struct{}
-	bulkZoneSnapshot            map[uint16]bool
-	barrierSeq                  atomic.Uint64
-	barrierAckSeq               atomic.Uint64
-	barrierWaitMu               sync.Mutex
-	barrierWaiters              map[uint64]chan struct{}
-	failoverWaitMu              sync.Mutex
-	failoverWaiters             map[int]failoverWaiter
-	failoverCommitWaiters       map[int]failoverWaiter
-	failoverBatchWaiters        map[string]failoverWaiter
-	failoverBatchCommitWaiters  map[string]failoverWaiter
-	failoverSeq                 atomic.Uint64
-	sessionMirrorWarnedV4       atomic.Bool
-	sessionMirrorWarnedV6       atomic.Bool
+	// OnFenceReceived requests this node to disable all RGs.
+	OnFenceReceived func()
+	// OnPrepareActivation asks the peer to pre-warm neighbors for the given RG.
+	OnPrepareActivation func(rgID int)
+	// OnForwardSessionInstalled fires when a forward synced session is installed locally.
+	OnForwardSessionInstalled func()
+	// OnBulkSyncReceived fires when an inbound bulk sync completes.
+	OnBulkSyncReceived func()
+	// BulkSyncOverride, if set, replaces the default BulkSync implementation.
+	BulkSyncOverride func() error
+	// OnBulkSyncAckReceived fires when the peer acknowledges our outbound bulk sync.
+	OnBulkSyncAckReceived func()
+	// OnPeerConnected fires when a peer sync connection is established.
+	OnPeerConnected func()
+	// OnPeerDisconnected fires when all fabric connections are lost.
+	OnPeerDisconnected func()
+	peerIPsecSAs       []string
+	peerIPsecSAsMu     sync.Mutex
+	// IsPrimaryFn reports whether the local node is primary for the default sync scope.
+	IsPrimaryFn func() bool
+	// IsPrimaryForRGFn reports whether the local node is primary for a given RG.
+	IsPrimaryForRGFn           func(rgID int) bool
+	lastSweepTime              uint64
+	syncBackfillNeeded         atomic.Bool
+	lastNewCounter             uint64
+	lastClosedCounter          uint64
+	lastSweepEmpty             bool
+	vrfDevice                  string
+	peerClockOffset            atomic.Int64
+	clockSynced                atomic.Bool
+	zoneRGMu                   sync.RWMutex
+	zoneRGMap                  map[uint16]int
+	deleteJournalMu            sync.Mutex
+	deleteJournal              [][]byte
+	deleteJournalCap           int
+	lastPeerRxUnix             atomic.Int64
+	peerHeartbeatAckEver       atomic.Bool
+	readDeadline               time.Duration
+	peerSilenceLimit           time.Duration
+	bulkSendMu                 sync.Mutex
+	bulkSendNext               atomic.Uint64
+	pendingBulkAckEpoch        atomic.Uint64
+	pendingBulkAckSince        atomic.Int64
+	bulkEverCompleted          atomic.Bool
+	bulkMu                     sync.Mutex
+	bulkInProgress             bool
+	bulkRecvEpoch              uint64
+	bulkRecvV4                 map[dataplane.SessionKey]struct{}
+	bulkRecvV6                 map[dataplane.SessionKeyV6]struct{}
+	bulkZoneSnapshot           map[uint16]bool
+	barrierSeq                 atomic.Uint64
+	barrierAckSeq              atomic.Uint64
+	barrierWaitMu              sync.Mutex
+	barrierWaiters             map[uint64]chan struct{}
+	failoverWaitMu             sync.Mutex
+	failoverWaiters            map[int]failoverWaiter
+	failoverCommitWaiters      map[int]failoverWaiter
+	failoverBatchWaiters       map[string]failoverWaiter
+	failoverBatchCommitWaiters map[string]failoverWaiter
+	failoverSeq                atomic.Uint64
+	sessionMirrorWarnedV4      atomic.Bool
+	sessionMirrorWarnedV6      atomic.Bool
 }
 type failoverAck struct {
 	status uint8
@@ -654,28 +340,58 @@ type clusterSyncedSessionInstaller interface {
 
 const deleteJournalDefaultCap = 10000
 
+// NewSessionSync creates a new single-fabric session synchronization manager.
 func NewSessionSync(localAddr, peerAddr string, dp dataplane.DataPlane) *SessionSync {
-	return &SessionSync{localAddr: localAddr, peerAddr: peerAddr, dp: dp, sendCh: make(chan []byte, 4096), deleteJournalCap: deleteJournalDefaultCap, failoverWaiters: make(map[int]failoverWaiter), failoverCommitWaiters: make(map[int]failoverWaiter), failoverBatchWaiters: make(map[string]failoverWaiter), failoverBatchCommitWaiters: make(map[string]failoverWaiter)}
+	return &SessionSync{
+		localAddr:                  localAddr,
+		peerAddr:                   peerAddr,
+		dp:                         dp,
+		sendCh:                     make(chan []byte, 4096),
+		deleteJournalCap:           deleteJournalDefaultCap,
+		failoverWaiters:            make(map[int]failoverWaiter),
+		failoverCommitWaiters:      make(map[int]failoverWaiter),
+		failoverBatchWaiters:       make(map[string]failoverWaiter),
+		failoverBatchCommitWaiters: make(map[string]failoverWaiter),
+	}
 }
 
+// NewDualSessionSync creates a session sync manager with dual-fabric transport.
+// If local1 or peer1 is empty, it falls back to single-fabric behavior.
 func NewDualSessionSync(local, peer, local1, peer1 string, dp dataplane.DataPlane) *SessionSync {
-	return &SessionSync{localAddr: local, peerAddr: peer, localAddr1: local1, peerAddr1: peer1, dp: dp, sendCh: make(chan []byte, 4096), deleteJournalCap: deleteJournalDefaultCap, failoverWaiters: make(map[int]failoverWaiter), failoverCommitWaiters: make(map[int]failoverWaiter), failoverBatchWaiters: make(map[string]failoverWaiter), failoverBatchCommitWaiters: make(map[string]failoverWaiter)}
+	return &SessionSync{
+		localAddr:                  local,
+		peerAddr:                   peer,
+		localAddr1:                 local1,
+		peerAddr1:                  peer1,
+		dp:                         dp,
+		sendCh:                     make(chan []byte, 4096),
+		deleteJournalCap:           deleteJournalDefaultCap,
+		failoverWaiters:            make(map[int]failoverWaiter),
+		failoverCommitWaiters:      make(map[int]failoverWaiter),
+		failoverBatchWaiters:       make(map[string]failoverWaiter),
+		failoverBatchCommitWaiters: make(map[string]failoverWaiter),
+	}
 }
 
+// SetVRFDevice sets the VRF device used for SO_BINDTODEVICE on sync sockets.
 func (s *SessionSync) SetVRFDevice(dev string) {
 	s.vrfDevice = dev
 }
 
+// SetZoneRGMap sets the zone ID to redundancy-group mapping used for per-RG
+// session synchronization.
 func (s *SessionSync) SetZoneRGMap(m map[uint16]int) {
 	s.zoneRGMu.Lock()
 	s.zoneRGMap = m
 	s.zoneRGMu.Unlock()
 }
 
+// SetDataPlane sets the dataplane used for installing received sessions.
 func (s *SessionSync) SetDataPlane(dp dataplane.DataPlane) {
 	s.dp = dp
 }
 
+// Stats returns a point-in-time snapshot of sync statistics.
 func (s *SessionSync) Stats() SyncStatsSnapshot {
 	s.mu.Lock()
 	var activeFabric int
@@ -690,14 +406,18 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
+// IsConnected reports whether a peer sync connection is currently established.
 func (s *SessionSync) IsConnected() bool {
 	return s.stats.Connected.Load()
 }
 
+// BulkEverCompleted reports whether at least one full bulk sync exchange has
+// completed during this daemon instance's lifetime.
 func (s *SessionSync) BulkEverCompleted() bool {
 	return s.bulkEverCompleted.Load()
 }
 
+// ActiveFabric reports which fabric carries sync traffic: 0, 1, or -1 if disconnected.
 func (s *SessionSync) ActiveFabric() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -710,6 +430,8 @@ func (s *SessionSync) ActiveFabric() int {
 	return -1
 }
 
+// LastPeerReceiveAge reports how long it has been since the last inbound sync
+// message was received from the peer.
 func (s *SessionSync) LastPeerReceiveAge() (time.Duration, bool) {
 	last := s.lastPeerRxUnix.Load()
 	if last == 0 {
@@ -730,11 +452,15 @@ func (s *SessionSync) peerSilenceDuration() time.Duration {
 	return syncPeerSilenceTimeout
 }
 
+// PeerRecentlyActive reports whether an inbound sync message has been observed
+// from the peer within maxAge.
 func (s *SessionSync) PeerRecentlyActive(maxAge time.Duration) bool {
 	age, ok := s.LastPeerReceiveAge()
 	return ok && age <= maxAge
 }
 
+// PeerHealthy reports whether the sync path is connected and, once the peer
+// has proved heartbeat-ack support, has been observed within the silence window.
 func (s *SessionSync) PeerHealthy() bool {
 	if !s.stats.Connected.Load() {
 		return false

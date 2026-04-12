@@ -66,6 +66,8 @@ func (s *SessionSync) failoverRGInUseLocked(rgIDs []int) bool {
 	return false
 }
 
+// SendFailover sends a remote failover request to the peer and waits for an
+// explicit applied or rejected acknowledgement.
 func (s *SessionSync) SendFailover(rgID int) (uint64, error) {
 	if err := validateFailoverProtocolRGID(rgID); err != nil {
 		return 0, err
@@ -81,10 +83,7 @@ func (s *SessionSync) SendFailover(rgID int) (uint64, error) {
 		s.failoverWaitMu.Unlock()
 		return 0, fmt.Errorf("failover request already in flight for redundancy group %d", rgID)
 	}
-	if s.failoverRGInUseLocked([]int{ // SendFailover sends a remote failover request to the peer and waits for
-		// an explicit applied/rejected acknowledgement. On success it returns the
-		// acknowledged request ID for the later transfer-commit step.
-		rgID}) {
+	if s.failoverRGInUseLocked([]int{rgID}) {
 		s.failoverWaitMu.Unlock()
 		return 0, fmt.Errorf("failover request already in flight for redundancy group %d", rgID)
 	}
@@ -124,9 +123,9 @@ func (s *SessionSync) SendFailover(rgID int) (uint64, error) {
 	}
 }
 
-func (s *SessionSync) SendFailoverBatch(rgIDs []int) ( // SendFailoverBatch sends a remote failover request for multiple RGs and waits
-	// for an explicit applied/rejected acknowledgement.
-	uint64, error) {
+// SendFailoverBatch sends a remote failover request for multiple RGs and waits
+// for an explicit applied or rejected acknowledgement.
+func (s *SessionSync) SendFailoverBatch(rgIDs []int) (uint64, error) {
 	ids, err := normalizeFailoverRGIDs(rgIDs)
 	if err != nil {
 		return 0, err
@@ -217,6 +216,8 @@ func failoverAckError(rgIDs []int, ack failoverAck) error {
 	}
 }
 
+// SendFailoverCommit sends the final ownership-commit step for a previously
+// acknowledged failover request and waits for the peer to finalize transfer-out.
 func (s *SessionSync) SendFailoverCommit(rgID int, reqID uint64) error {
 	if err := validateFailoverProtocolRGID(rgID); err != nil {
 		return err
@@ -231,9 +232,7 @@ func (s *SessionSync) SendFailoverCommit(rgID int, reqID uint64) error {
 		s.failoverWaitMu.Unlock()
 		return fmt.Errorf("failover commit already in flight for redundancy group %d", rgID)
 	}
-	if s.failoverRGInUseLocked([]int{ // SendFailoverCommit sends the final ownership-commit step for a previously
-		// acknowledged failover request and waits for the peer to finalize transfer-out.
-		rgID}) {
+	if s.failoverRGInUseLocked([]int{rgID}) {
 		s.failoverWaitMu.Unlock()
 		return fmt.Errorf("failover commit already in flight for redundancy group %d", rgID)
 	}
@@ -273,9 +272,9 @@ func (s *SessionSync) SendFailoverCommit(rgID int, reqID uint64) error {
 	}
 }
 
-func (s *SessionSync) SendFailoverCommitBatch(rgIDs []int, // SendFailoverCommitBatch sends the final ownership-commit step for a
-	// previously acknowledged multi-RG failover request.
-	reqID uint64) error {
+// SendFailoverCommitBatch sends the final ownership-commit step for a
+// previously acknowledged multi-RG failover request.
+func (s *SessionSync) SendFailoverCommitBatch(rgIDs []int, reqID uint64) error {
 	ids, err := normalizeFailoverRGIDs(rgIDs)
 	if err != nil {
 		return err
@@ -377,6 +376,8 @@ func failoverCommitAckError(rgID int, ack failoverAck) error {
 	}
 }
 
+// SendFence sends a fence message to the peer, requesting it to disable all
+// redundancy groups as a best-effort operation.
 func (s *SessionSync) SendFence() error {
 	conn := s.getActiveConn()
 	if conn == nil {
@@ -396,6 +397,8 @@ func (s *SessionSync) SendFence() error {
 	return nil
 }
 
+// SendPrepareActivation tells the peer to pre-install neighbor entries and
+// warm its ARP/NDP cache for the given redundancy group.
 func (s *SessionSync) SendPrepareActivation(rgID int) {
 	if rgID < 0 || rgID > 255 {
 		slog.Warn("cluster sync: prepare_activation rgID out of range", "rg", rgID)
@@ -405,15 +408,7 @@ func (s *SessionSync) SendPrepareActivation(rgID int) {
 	if conn == nil {
 		return
 	}
-	payload := []byte{ // SendFence sends a fence message to the peer, requesting it to disable all
-		// RGs (set rg_active=false). This is a best-effort operation — if the sync
-		// connection is down (likely during a real failure), the call returns an error.
-		// SendPrepareActivation tells the peer to pre-install neighbor entries
-		// and warm its ARP/NDP cache for the given RG. Sent by the demoting node
-		// after its preflight completes, just before VRRP resign. Best-effort:
-		// if the send fails, the activation path still works (slightly slower
-		// neighbor resolution via warmNeighborCache).
-		byte(rgID)}
+	payload := []byte{byte(rgID)}
 	s.writeMu.Lock()
 	err := writeMsg(conn, syncMsgPrepareActivation, payload)
 	s.writeMu.Unlock()

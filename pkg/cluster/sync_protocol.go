@@ -10,12 +10,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// monotonicSeconds returns the monotonic clock in seconds.
 func monotonicSeconds() uint64 {
 	var ts unix.Timespec
 	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 	return uint64(ts.Sec)
 }
 
+// rebaseTimestamp adjusts a peer timestamp to the local monotonic clock domain.
 func rebaseTimestamp(peerTS uint64, offset int64) uint64 {
 	v := int64(peerTS) + offset
 	if v < 0 {
@@ -24,10 +26,9 @@ func rebaseTimestamp(peerTS uint64, offset int64) uint64 {
 	return uint64(v)
 }
 
-func writeFull(conn net.Conn, buf []byte) error { // monotonicSeconds returns monotonic clock in seconds.
-	// writeFull loops until all bytes are written or an error occurs,
-	// handling short writes from TCP backpressure.
-
+// writeFull loops until all bytes are written or an error occurs, handling
+// short writes from TCP backpressure.
+func writeFull(conn net.Conn, buf []byte) error {
 	if err := conn.SetWriteDeadline(time.Now().Add(syncWriteDeadline)); err != nil {
 		return err
 	}
@@ -259,9 +260,9 @@ func encodeDeleteV6(key dataplane.SessionKeyV6) []byte {
 	return hdr
 }
 
-func decodeSessionV4Payload(payload []byte) ( // decodeSessionV4Payload decodes a v4 session from wire format.
-	// Returns key, value, and ok flag. Must match encodeSessionV4Payload layout.
-	dataplane.SessionKey, dataplane.SessionValue, bool) {
+// decodeSessionV4Payload decodes a v4 session from wire format. It returns the
+// decoded key, value, and an ok flag. The layout must match encodeSessionV4Payload.
+func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.SessionValue, bool) {
 	var key dataplane.SessionKey
 	var val dataplane.SessionValue
 	if len(payload) < 16 {
@@ -357,8 +358,9 @@ func decodeSessionV4Payload(payload []byte) ( // decodeSessionV4Payload decodes 
 	return key, val, true
 }
 
-func decodeSessionV6Payload(payload []byte) ( // decodeSessionV6Payload decodes a v6 session from wire format.
-	dataplane.SessionKeyV6, dataplane.SessionValueV6, bool) {
+// decodeSessionV6Payload decodes a v6 session from wire format. It returns the
+// decoded key, value, and an ok flag. The layout must match encodeSessionV6Payload.
+func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.SessionValueV6, bool) {
 	var key dataplane.SessionKeyV6
 	var val dataplane.SessionValueV6
 	if len(payload) < 40 {
@@ -457,8 +459,9 @@ func decodeSessionV6Payload(payload []byte) ( // decodeSessionV6Payload decodes 
 	return key, val, true
 }
 
-func encodeIPsecSAPayload(names []string) []byte {// encodeIPsecSAPayload encodes a list of IPsec connection names as newline-separated bytes.
-
+// encodeIPsecSAPayload encodes a list of IPsec connection names as
+// newline-separated bytes.
+func encodeIPsecSAPayload(names []string) []byte {
 	if len(names) == 0 {
 		return nil
 	}
@@ -472,8 +475,8 @@ func encodeIPsecSAPayload(names []string) []byte {// encodeIPsecSAPayload encode
 	return []byte(joined)
 }
 
-func decodeIPsecSAPayload(payload []byte) []string {// decodeIPsecSAPayload decodes a newline-separated list of IPsec connection names.
-
+// decodeIPsecSAPayload decodes a newline-separated list of IPsec connection names.
+func decodeIPsecSAPayload(payload []byte) []string {
 	if len(payload) == 0 {
 		return nil
 	}

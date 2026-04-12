@@ -41,6 +41,8 @@ func shouldInitiateFabricDial(localAddr, peerAddr string) bool {
 	return local.Port() < peer.Port()
 }
 
+// activeConnLocked returns the preferred active connection. fab0 is preferred;
+// fab1 is used only when fab0 is down. The caller must hold s.mu.
 func (s *SessionSync) activeConnLocked() net.Conn {
 	if s.conn0 != nil {
 		return s.conn0
@@ -48,6 +50,7 @@ func (s *SessionSync) activeConnLocked() net.Conn {
 	return s.conn1
 }
 
+// getActiveConn returns the active connection while taking s.mu.
 func (s *SessionSync) getActiveConn() net.Conn {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -388,6 +391,8 @@ func (s *SessionSync) syncSweep() int {
 	return count
 }
 
+// PauseIncrementalSync temporarily disables background sweep-driven session
+// replication. Explicit sync producers may continue queueing messages.
 func (s *SessionSync) PauseIncrementalSync(reason string) {
 	depth := s.incrementalPauseDepth.Add(1)
 	if depth == 1 {
@@ -396,6 +401,7 @@ func (s *SessionSync) PauseIncrementalSync(reason string) {
 	}
 }
 
+// ResumeIncrementalSync releases a previous PauseIncrementalSync call.
 func (s *SessionSync) ResumeIncrementalSync(reason string) {
 	depth := s.incrementalPauseDepth.Add(-1)
 	if depth < 0 {
@@ -407,11 +413,7 @@ func (s *SessionSync) ResumeIncrementalSync(reason string) {
 		slog.Info("cluster sync: incremental sync resumed", "reason", reason, "sessions_sent", stats.SessionsSent, "sessions_received", stats.SessionsReceived, "sessions_installed", stats.SessionsInstalled, "queue_len", len(s.sendCh), "queue_cap", cap(s.sendCh))
 	}
 }
-func (s *SessionSync) queueMessage(msg []byte, // activeConnLocked returns the preferred active connection.
-	// fab0 is preferred; fab1 is used only when fab0 is down.
-	// Caller must hold s.mu.
-	// ResumeIncrementalSync releases a previous PauseIncrementalSync call.
-	sentCounter *atomic.Uint64, source string) bool {
+func (s *SessionSync) queueMessage(msg []byte, sentCounter *atomic.Uint64, source string) bool {
 	if !s.stats.Connected.Load() {
 		return false
 	}
@@ -428,16 +430,20 @@ func (s *SessionSync) queueMessage(msg []byte, // activeConnLocked returns the p
 	}
 }
 
+// QueueSessionV4 queues a v4 session for synchronization to the peer.
 func (s *SessionSync) QueueSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) {
 	msg := encodeSessionV4(key, val)
 	s.queueMessage(msg, &s.stats.SessionsSent, "session_v4")
 }
 
+// QueueSessionV6 queues a v6 session for synchronization to the peer.
 func (s *SessionSync) QueueSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
 	msg := encodeSessionV6(key, val)
 	s.queueMessage(msg, &s.stats.SessionsSent, "session_v6")
 }
 
+// QueueDeleteV4 queues a v4 session deletion for synchronization. If the peer
+// is disconnected, the delete is journaled for replay on reconnect.
 func (s *SessionSync) QueueDeleteV4(key dataplane.SessionKey) {
 	msg := encodeDeleteV4(key)
 	if !s.queueMessage(msg, &s.stats.DeletesSent, "delete_v4") {
@@ -445,6 +451,8 @@ func (s *SessionSync) QueueDeleteV4(key dataplane.SessionKey) {
 	}
 }
 
+// QueueDeleteV6 queues a v6 session deletion for synchronization. If the peer
+// is disconnected, the delete is journaled for replay on reconnect.
 func (s *SessionSync) QueueDeleteV6(key dataplane.SessionKeyV6) {
 	msg := encodeDeleteV6(key)
 	if !s.queueMessage(msg, &s.stats.DeletesSent, "delete_v6") {
@@ -452,11 +460,10 @@ func (s *SessionSync) QueueDeleteV6(key dataplane.SessionKeyV6) {
 	}
 }
 
-func (s *SessionSync) journalDelete(msg []byte) { // QueueSessionV4 queues a v4 session for sync to peer.
-	// journalDelete stores a delete message in the bounded ring buffer
-	// for replay on reconnect. If the journal is full, the oldest entry
-	// is evicted and DeletesDropped is incremented.
-
+// journalDelete stores a delete message in the bounded ring buffer for replay
+// on reconnect. If the journal is full, the oldest entry is evicted and
+// DeletesDropped is incremented.
+func (s *SessionSync) journalDelete(msg []byte) {
 	s.deleteJournalMu.Lock()
 	defer s.deleteJournalMu.Unlock()
 	cap := s.deleteJournalCap
@@ -479,9 +486,8 @@ func (s *SessionSync) flushDeleteJournal() {
 		return
 	}
 	var flushed int
-	for _, msg := range // flushDeleteJournal replays all journaled delete messages through the
-	// send channel. Called on reconnect before normal sync resumes.
-	journal {
+	// Replay journaled delete messages before normal sync resumes.
+	for _, msg := range journal {
 		if s.queueMessage(msg, &s.stats.DeletesSent, "journal_flush") {
 			flushed++
 		}
@@ -489,14 +495,13 @@ func (s *SessionSync) flushDeleteJournal() {
 	slog.Info("cluster sync: flushed delete journal", "total", len(journal), "sent", flushed)
 }
 
+// QueueConfig sends the full config text to the peer for configuration synchronization.
 func (s *SessionSync) QueueConfig(configText string) {
 	conn := s.getActiveConn()
 	if conn == nil {
 		return
 	}
-	payload := []byte( // QueueConfig sends the full config text to the peer for config synchronization.
-		// Called by the primary node after a successful commit.
-		configText)
+	payload := []byte(configText)
 	s.writeMu.Lock()
 	err := writeMsg(conn, syncMsgConfig, payload)
 	s.writeMu.Unlock()
@@ -510,11 +515,10 @@ func (s *SessionSync) QueueConfig(configText string) {
 	slog.Info("cluster sync: config sent to peer", "size", len(payload))
 }
 
+// sendClockSync exchanges the local monotonic clock over the sync channel.
 func (s *SessionSync) sendClockSync(conn net.Conn) {
 	var buf [8]byte
-	binary.LittleEndian.PutUint64(buf[: // BulkSync sends the entire session table to the connected peer.
-	// Serialized by bulkSendMu so concurrent callers cannot interleave.
-	], monotonicSeconds())
+	binary.LittleEndian.PutUint64(buf[:], monotonicSeconds())
 	s.writeMu.Lock()
 	err := writeMsg(conn, syncMsgClockSync, buf[:])
 	s.writeMu.Unlock()
