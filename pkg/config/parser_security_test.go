@@ -2408,10 +2408,10 @@ func TestPolicySetSyntax(t *testing.T) {
 
 func TestPolicyMatchSingleLineSetSyntax(t *testing.T) {
 	tree := &ConfigTree{}
-	for _, cmd := range // TestPolicyMatchSingleLineSetSyntax verifies that multiple match criteria on
+	// TestPolicyMatchSingleLineSetSyntax verifies that multiple match criteria on
 	// a single set line become siblings under match, not nested children.
 	// e.g. "set ... match destination-address any source-address any application any"
-	[]string{"set security policies from-zone lan to-zone wan policy allow-ps match destination-address any source-address any application any", "set security policies from-zone lan to-zone wan policy allow-ps then permit"} {
+	for _, cmd := range []string{"set security policies from-zone lan to-zone wan policy allow-ps match destination-address any source-address any application any", "set security policies from-zone lan to-zone wan policy allow-ps then permit"} {
 		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
@@ -3899,7 +3899,9 @@ func TestStaticNATInetSetSyntax(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ParseSetCommand(%q): %v", line, err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -3979,7 +3981,9 @@ func TestNPTv6SetSyntax(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ParseSetCommand(%q): %v", line, err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -4035,7 +4039,9 @@ func TestNATv6v4SetSyntax(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ParseSetCommand(%q): %v", line, err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {

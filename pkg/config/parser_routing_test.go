@@ -421,8 +421,8 @@ func TestRoutingInstances(t *testing.T) {
 		t.Fatalf("expected 2 routing instances, got %d", len(cfg.RoutingInstances))
 	}
 	var comcast, att *RoutingInstanceConfig
-	for _, ri := range // Find the two instances (order not guaranteed)
-	cfg.RoutingInstances {
+	// Find the two instances (order not guaranteed).
+	for _, ri := range cfg.RoutingInstances {
 		switch ri.Name {
 		case "Comcast-GigabitPro":
 			comcast = ri
@@ -612,8 +612,8 @@ func TestRouterAdvertisement(t *testing.T) {
 		t.Fatalf("expected 2 RA interfaces, got %d", len(cfg.Protocols.RouterAdvertisement))
 	}
 	var ra100 *RAInterfaceConfig
-	for _, ra := range // Find vlan100 config
-	cfg.Protocols.RouterAdvertisement {
+	// Find vlan100 config.
+	for _, ra := range cfg.Protocols.RouterAdvertisement {
 		if ra.Interface == "vlan100" {
 			ra100 = ra
 		}
@@ -1445,8 +1445,8 @@ func TestOSPFPassiveDefaultSetSyntax(t *testing.T) {
 		t.Fatalf("expected 2 interfaces, got %d", len(area.Interfaces))
 	}
 	var trust, dmz *OSPFInterface
-	for _, iface := range // trust0 should have NoPassive=true
-	area.Interfaces {
+	// trust0 should have NoPassive=true.
+	for _, iface := range area.Interfaces {
 		switch iface.Name {
 		case "trust0":
 			trust = iface
@@ -2567,7 +2567,9 @@ func TestLLDPPerInterfaceDisableSetSyntax(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ParseSetCommand(%q): %v", line, err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -2642,7 +2644,9 @@ func TestGenerateRoutesSetSyntax(t *testing.T) {
 		if err != nil {
 			t.Fatalf("ParseSetCommand(%q): %v", line, err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -2697,8 +2701,8 @@ interfaces {
 		t.Fatalf("expected 2 bridge domains, got %d", len(cfg.BridgeDomains))
 	}
 	var bd0, bd1 *BridgeDomainConfig
-	for _, bd := range // Find bd0
-	cfg.BridgeDomains {
+	// Find bd0.
+	for _, bd := range cfg.BridgeDomains {
 		switch bd.Name {
 		case "bd0":
 			bd0 = bd

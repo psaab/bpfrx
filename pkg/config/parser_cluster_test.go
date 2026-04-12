@@ -76,7 +76,9 @@ func TestChassisClusterSetSyntax(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath failed for command %q: %v", cmd, err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -180,7 +182,9 @@ func TestChassisClusterExtendedFieldsSet(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q) failed: %v", cmd, err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -232,7 +236,9 @@ func TestChassisClusterSyncOptions(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatal(err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -295,7 +301,9 @@ func TestChassisClusterRethAdvertiseInterval(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatal(err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -537,7 +545,9 @@ func TestChassisClusterIPMonitoringSetSyntax(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatal(err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -621,7 +631,9 @@ func TestStrictVIPOwnershipSetSyntax(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatal(err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {

@@ -254,7 +254,9 @@ func TestFlowFlagsSetSyntax(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatal(err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -817,7 +819,9 @@ func TestDynamicAddressMultiFeedPathsSetSyntax(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %q: %v", line, err)
 		}
-		tree.SetPath(path)
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("set path %q: %v", line, err)
+		}
 	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {

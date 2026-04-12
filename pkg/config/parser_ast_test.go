@@ -488,8 +488,8 @@ func TestSetPathSingleValueDedup(t *testing.T) {
 		t.Errorf("expected host-name new-fw, got %s", hostNames[0])
 	}
 	var hasDomain bool
-	for _, child := range // Verify domain-name is preserved.
-	sysNode.Children {
+	// Verify domain-name is preserved.
+	for _, child := range sysNode.Children {
 		if child.IsLeaf && len(child.Keys) > 0 && child.Keys[0] == "domain-name" {
 			hasDomain = true
 		}
@@ -2205,8 +2205,8 @@ routing-options {
 		}
 	}
 	var dmzVR *RoutingInstanceConfig
-	for _, ri := range // Find dmz-vr and verify rib-group reference
-	cfg.RoutingInstances {
+	// Find dmz-vr and verify rib-group reference.
+	for _, ri := range cfg.RoutingInstances {
 		if ri.Name == "dmz-vr" {
 			dmzVR = ri
 			break
@@ -2238,8 +2238,8 @@ routing-options {
 		t.Errorf("ImportRibs[1] = %q, want inet.0", rg.ImportRibs[1])
 	}
 	var tunnelVR *RoutingInstanceConfig
-	for _, ri := range // Verify tunnel-vr
-	cfg.RoutingInstances {
+	// Verify tunnel-vr.
+	for _, ri := range cfg.RoutingInstances {
 		if ri.Name == "tunnel-vr" {
 			tunnelVR = ri
 			break
@@ -2273,8 +2273,8 @@ func TestMultipleRoutingInstancesSetSyntax(t *testing.T) {
 		t.Fatalf("RoutingInstances = %d, want 2", len(cfg.RoutingInstances))
 	}
 	var dmzVR *RoutingInstanceConfig
-	for _, ri := range // Find dmz-vr
-	cfg.RoutingInstances {
+	// Find dmz-vr.
+	for _, ri := range cfg.RoutingInstances {
 		if ri.Name == "dmz-vr" {
 			dmzVR = ri
 			break
@@ -3190,8 +3190,13 @@ func TestCompileConfigForNodeBackwardCompat(t *testing.T) {
 	tree := &ConfigTree{}
 	setCommands := []string{`set groups node0 system host-name fw0`, `set apply-groups "${node}"`}
 	for _, cmd := range setCommands {
-		path, _ := ParseSetCommand(cmd)
-		tree.SetPath(path)
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
 	}
 	_, err := CompileConfig(tree)
 	if err == nil {
@@ -3206,8 +3211,13 @@ func TestExpandGroupsWithVarsNilPreservesBackwardCompat(t *testing.T) {
 	tree := &ConfigTree{}
 	setCommands := []string{"set groups common system host-name test-fw", "set apply-groups common"}
 	for _, cmd := range setCommands {
-		path, _ := ParseSetCommand(cmd)
-		tree.SetPath(path)
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
 	}
 	if err := tree.ExpandGroupsWithVars(nil); err != nil {
 		t.Fatalf("ExpandGroupsWithVars(nil): %v", err)
