@@ -122,12 +122,14 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 	}
 
 	// Count pools: named pools + interface-mode rules
+	type ruleSetKey struct{ from, to string }
 	type poolInfo struct {
 		name    string
 		address string
 		total   int // total ports (0 = N/A for interface)
 		used    int
 		isIface bool
+		key     ruleSetKey
 	}
 	var pools []poolInfo
 
@@ -145,13 +147,21 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 		pools = append(pools, poolInfo{name: name, address: addr, total: totalPorts})
 	}
 
-	// Interface-mode pools (count from rules)
+	// Interface-mode pools (count from rules, deduplicated by zone pair).
+	ifacePoolSeen := make(map[ruleSetKey]struct{})
 	for _, rs := range cfg.Security.NAT.Source {
+		key := ruleSetKey{from: rs.FromZone, to: rs.ToZone}
 		for _, rule := range rs.Rules {
 			if rule.Then.Interface {
+				if _, exists := ifacePoolSeen[key]; exists {
+					continue
+				}
+				ifacePoolSeen[key] = struct{}{}
 				pools = append(pools, poolInfo{
 					name:    fmt.Sprintf("%s/%s (interface)", rs.FromZone, rs.ToZone),
-					address: "interface", isIface: true,
+					address: "interface",
+					isIface: true,
+					key:     key,
 				})
 			}
 		}
@@ -159,8 +169,7 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 
 	// Count active SNAT translations and per-rule-set sessions
 	totalSNAT := 0
-	type ruleSetKey struct{ from, to string }
-	rsSessionsV4 := make(map[ruleSetKey]int)
+	rsSessions := make(map[ruleSetKey]int)
 	if c.dp != nil && c.dp.IsLoaded() {
 		cr := c.dp.LastCompileResult()
 		// Build reverse zone ID map
@@ -187,7 +196,7 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
 				totalSNAT++
 				if zoneByID != nil {
-					rsSessionsV4[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+					rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
 				}
 			}
 			return true
@@ -197,14 +206,14 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
 				totalSNAT++
 				if zoneByID != nil {
-					rsSessionsV4[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+					rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
 				}
 			}
 			return true
 		})
 		for i := range pools {
 			if pools[i].isIface {
-				pools[i].used = totalSNAT // interface NAT counts all SNAT sessions
+				pools[i].used = rsSessions[pools[i].key]
 			}
 		}
 	}
@@ -232,12 +241,12 @@ func (c *CLI) showNATSourceSummary(cfg *config.Config) error {
 	}
 
 	// Per-rule-set session counts
-	if len(rsSessionsV4) > 0 {
+	if len(rsSessions) > 0 {
 		fmt.Println()
 		fmt.Printf("%-30s %-12s\n", "Rule-set (from -> to)", "Sessions")
 		for _, rs := range cfg.Security.NAT.Source {
 			key := ruleSetKey{rs.FromZone, rs.ToZone}
-			if cnt, ok := rsSessionsV4[key]; ok {
+			if cnt, ok := rsSessions[key]; ok {
 				fmt.Printf("%-30s %-12d\n",
 					fmt.Sprintf("%s -> %s", rs.FromZone, rs.ToZone), cnt)
 			}
@@ -420,6 +429,12 @@ func (c *CLI) showNATSourceRuleDetail(cfg *config.Config) error {
 			zoneByID[id] = name
 		}
 		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
+				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+			}
+			return true
+		})
+		_ = c.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagSNAT != 0 {
 				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
 			}
@@ -858,6 +873,12 @@ func (c *CLI) showNATDestinationRuleDetail(cfg *config.Config) error {
 			zoneByID[id] = name
 		}
 		_ = c.dp.IterateSessions(func(_ dataplane.SessionKey, val dataplane.SessionValue) bool {
+			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
+				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
+			}
+			return true
+		})
+		_ = c.dp.IterateSessionsV6(func(_ dataplane.SessionKeyV6, val dataplane.SessionValueV6) bool {
 			if val.IsReverse == 0 && val.Flags&dataplane.SessFlagDNAT != 0 {
 				rsSessions[ruleSetKey{zoneByID[val.IngressZone], zoneByID[val.EgressZone]}]++
 			}

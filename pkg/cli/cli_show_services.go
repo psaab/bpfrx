@@ -381,9 +381,10 @@ func (c *CLI) showDHCPServer(detail bool) error {
 		}
 	}
 
-	// Read Kea lease files directly
-	leases4, _ := dhcpserver.New().GetLeases4()
-	leases6, _ := dhcpserver.New().GetLeases6()
+	// Read Kea lease files directly.
+	server := dhcpserver.New()
+	leases4, _ := server.GetLeases4()
+	leases6, _ := server.GetLeases6()
 
 	if len(leases4) == 0 && len(leases6) == 0 {
 		if !detail {
