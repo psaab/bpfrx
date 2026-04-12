@@ -852,12 +852,9 @@ impl Coordinator {
     /// Go daemon's refreshFabricFwd resolves a peer MAC that wasn't
     /// available at initial snapshot build time.
     ///
-    /// NOTE: this updates self.forwarding directly. Workers that were spawned
-    /// with an Arc of the previous forwarding state won't see this change
-    /// until the next full reconcile. This is acceptable because fabric
-    /// redirects check the forwarding state on every packet — the workers
-    /// will get the updated state on the next reconcile (which happens
-    /// on config change or rebind).
+    /// This updates both the coordinator's local forwarding state and the
+    /// shared Arc-backed state used by workers, so refreshed fabric links
+    /// become visible to workers as soon as the new values are published.
     pub fn refresh_fabric_links(&mut self, snapshots: &[crate::FabricSnapshot]) {
         let new_fabrics = resolve_fabric_links_from_snapshots(
             snapshots,
