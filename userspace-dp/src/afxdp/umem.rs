@@ -180,7 +180,7 @@ impl MmapArea {
 
     pub(super) fn slice(&self, offset: usize, len: usize) -> Option<&[u8]> {
         let end = offset.checked_add(len)?;
-        if end > self.mapped_len {
+        if end > self.len {
             return None;
         }
         Some(unsafe { std::slice::from_raw_parts(self.ptr.as_ptr().add(offset), len) })
@@ -197,7 +197,7 @@ impl MmapArea {
         len: usize,
     ) -> Option<&mut [u8]> {
         let end = offset.checked_add(len)?;
-        if end > self.mapped_len {
+        if end > self.len {
             return None;
         }
         Some(unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr().add(offset), len) })
@@ -207,6 +207,20 @@ impl MmapArea {
 impl Drop for MmapArea {
     fn drop(&mut self) {
         let _ = unsafe { libc::munmap(self.ptr.as_ptr().cast::<c_void>(), self.mapped_len) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MmapArea;
+
+    #[test]
+    fn mmap_area_rejects_access_beyond_registered_len_even_if_mapping_is_rounded() {
+        let area = MmapArea::new(128).expect("mmap");
+
+        assert!(area.slice(0, 128).is_some());
+        assert!(area.slice(128, 1).is_none());
+        assert!(area.slice(512, 1).is_none());
     }
 }
 
