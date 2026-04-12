@@ -8464,8 +8464,7 @@ mod tests {
             nat: NatDecision::default(),
         };
 
-        // Addr beyond the mapped region forces an extract failure.
-        // MmapArea rounds up to 2 MB, so use an offset well beyond that.
+        // Addr beyond the registered UMEM length forces an extract failure.
         maybe_reinject_slow_path(
             &binding,
             &live,
@@ -8473,7 +8472,7 @@ mod tests {
             &local_tunnel_reinjectors,
             &area,
             XdpDesc {
-                addr: 4 * 1024 * 1024,
+                addr: 512,
                 len: 96,
                 options: 0,
             },
