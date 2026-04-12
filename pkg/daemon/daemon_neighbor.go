@@ -1,0 +1,476 @@
+// Package daemon implements the bpfrx daemon lifecycle.
+package daemon
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
+	"time"
+
+	"github.com/psaab/bpfrx/pkg/cluster"
+	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/vishvananda/netlink"
+)
+
+// preinstallSnapshotNeighbors refreshes the kernel ARP/NDP table from two
+// sources: (1) iterates each configured interface's kernel NeighList and
+// re-installs valid entries as NUD_REACHABLE via netlink.NeighSet, and
+// (2) installs snapshot-learned neighbors from the dataplane provider
+// (populated by buildNeighborSnapshots during Compile and synced from the
+// active node). The periodic neighbor-maintenance loop calls this to keep
+// the standby's neighbor table hot so failover does not depend on
+// activation-time priming.
+func (d *Daemon) preinstallSnapshotNeighbors() {
+	// Read neighbors from the snapshot via the dataplane manager.
+	// Fall back to kernel NeighList if the snapshot isn't available.
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	var installed int
+	// Iterate ALL interfaces and install any neighbor we know about.
+	for name, ifc := range cfg.Interfaces.Interfaces {
+		if ifc == nil {
+			continue
+		}
+		for _, unit := range ifc.Units {
+			if unit == nil {
+				continue
+			}
+			linuxName := config.LinuxIfName(name)
+			if unit.Number != 0 {
+				linuxName = fmt.Sprintf("%s.%d", linuxName, unit.Number)
+			}
+			link, err := netlink.LinkByName(linuxName)
+			if err != nil || link == nil {
+				continue
+			}
+			for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+				neighs, err := netlink.NeighList(link.Attrs().Index, family)
+				if err != nil {
+					continue
+				}
+				for _, neigh := range neighs {
+					if neigh.HardwareAddr == nil || len(neigh.HardwareAddr) == 0 {
+						continue
+					}
+					if neigh.State == netlink.NUD_FAILED || neigh.State == netlink.NUD_NOARP {
+						continue
+					}
+					entry := netlink.Neigh{
+						LinkIndex:    link.Attrs().Index,
+						Family:       family,
+						State:        netlink.NUD_REACHABLE,
+						IP:           neigh.IP,
+						HardwareAddr: neigh.HardwareAddr,
+					}
+					if err := netlink.NeighSet(&entry); err == nil {
+						installed++
+					}
+				}
+			}
+		}
+	}
+	// Also install static route next-hop neighbors that may not be in the
+	// kernel table yet (expired while another node owned the RG). Use the
+	// config's known gateway addresses with their MACs from the snapshot.
+	if d.dp != nil {
+		type snapshotNeighborProvider interface {
+			SnapshotNeighbors() []struct {
+				Ifindex int
+				IP      net.IP
+				MAC     net.HardwareAddr
+				Family  int
+			}
+		}
+		if provider, ok := d.dp.(snapshotNeighborProvider); ok {
+			for _, sn := range provider.SnapshotNeighbors() {
+				entry := netlink.Neigh{
+					LinkIndex:    sn.Ifindex,
+					Family:       sn.Family,
+					State:        netlink.NUD_REACHABLE,
+					IP:           sn.IP,
+					HardwareAddr: sn.MAC,
+				}
+				if err := netlink.NeighSet(&entry); err == nil {
+					installed++
+				}
+			}
+		}
+	}
+	if installed > 0 {
+		slog.Info("preinstalled kernel neighbor entries from snapshot", "count", installed)
+	}
+}
+
+// resolveNeighbors proactively triggers ARP/NDP resolution for all known
+// next-hops, gateways, NAT destinations, and address-book host entries.
+// This ensures bpf_fib_lookup returns SUCCESS (with valid MAC addresses)
+// instead of NO_NEIGH for the first packet.
+//
+// Runtime: the synchronous portion collects targets via netlink RouteGet +
+// NeighList (~1-2ms each), then fires ICMP/NS probes as goroutines. For a
+// typical config with 2-5 next-hops, the blocking phase completes in <10ms.
+// The 500ms sleep at the end waits for ARP replies; callers that cannot
+// afford the sleep should invoke this from a goroutine.
+func (d *Daemon) resolveNeighbors(cfg *config.Config) {
+	d.resolveNeighborsInner(cfg, true)
+}
+
+func (d *Daemon) resolveNeighborsInner(cfg *config.Config, waitForReplies bool) {
+	type target struct {
+		neighborIP net.IP
+		linkIndex  int
+	}
+	var targets []target
+	seen := make(map[string]bool)
+
+	addByLink := func(ip net.IP, linkIndex int) {
+		key := fmt.Sprintf("%s@%d", ip, linkIndex)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		targets = append(targets, target{neighborIP: ip, linkIndex: linkIndex})
+	}
+
+	// addByIP resolves the outgoing interface via the kernel routing table.
+	addByIP := func(ipStr string) {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			return
+		}
+		routes, err := netlink.RouteGet(ip)
+		if err != nil || len(routes) == 0 {
+			return
+		}
+		neighborIP := ip
+		if gw := routes[0].Gw; gw != nil && !gw.IsUnspecified() {
+			neighborIP = gw
+		}
+		addByLink(neighborIP, routes[0].LinkIndex)
+	}
+
+	addByName := func(ipStr, ifName string) {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			return
+		}
+		resolved := resolveJunosIfName(cfg, ifName)
+		if resolved != ifName {
+			slog.Debug("neighbor warmup: resolved interface name", "from", ifName, "to", resolved)
+		}
+		link, err := netlink.LinkByName(resolved)
+		if err != nil {
+			return
+		}
+		addByLink(ip, link.Attrs().Index)
+	}
+
+	// addByIPOrConfig first tries the kernel FIB (addByIP). If the kernel
+	// has no route (e.g. standby node where FRR hasn't installed the route),
+	// fall back to finding the outgoing interface from the config by matching
+	// the next-hop IP against configured interface subnets. This keeps ARP
+	// warm on standby nodes so failback doesn't lose packets to ARP delay.
+	addByIPOrConfig := func(ipStr string) {
+		ip := net.ParseIP(ipStr)
+		if ip == nil {
+			return
+		}
+		// Try kernel FIB first — this is the fast/common path on active nodes.
+		routes, err := netlink.RouteGet(ip)
+		if err == nil && len(routes) > 0 {
+			neighborIP := ip
+			if gw := routes[0].Gw; gw != nil && !gw.IsUnspecified() {
+				neighborIP = gw
+			}
+			addByLink(neighborIP, routes[0].LinkIndex)
+			return
+		}
+		// Kernel has no route — find the interface from config by subnet match.
+		for name, ifc := range cfg.Interfaces.Interfaces {
+			if ifc == nil {
+				continue
+			}
+			for unitNum, unit := range ifc.Units {
+				if unit == nil {
+					continue
+				}
+				for _, addrStr := range unit.Addresses {
+					_, ipNet, err := net.ParseCIDR(addrStr)
+					if err != nil || !ipNet.Contains(ip) {
+						continue
+					}
+					linuxName := resolveJunosIfName(cfg, name)
+					if unit.VlanID > 0 {
+						linuxName = fmt.Sprintf("%s.%d", linuxName, unit.VlanID)
+					} else if unitNum != 0 {
+						linuxName = fmt.Sprintf("%s.%d", linuxName, unitNum)
+					}
+					link, err := netlink.LinkByName(linuxName)
+					if err != nil {
+						slog.Debug("neighbor warmup: config subnet match could not be resolved to a linux link",
+							"nexthop", ipStr, "iface", linuxName, "subnet", addrStr, "err", err)
+						continue
+					}
+					slog.Debug("neighbor warmup: resolved next-hop via config subnet",
+						"nexthop", ipStr, "iface", linuxName, "subnet", addrStr)
+					addByLink(ip, link.Attrs().Index)
+					return
+				}
+			}
+		}
+	}
+
+	// 1. Static route next-hops (resolve interface via FIB if not specified).
+	// Uses addByIPOrConfig so standby nodes without the kernel route still
+	// resolve next-hops via config subnet matching (keeps ARP cache warm).
+	allStaticRoutes := append(cfg.RoutingOptions.StaticRoutes, cfg.RoutingOptions.Inet6StaticRoutes...)
+	for _, sr := range allStaticRoutes {
+		if sr.Discard {
+			continue
+		}
+		for _, nh := range sr.NextHops {
+			if nh.Address == "" {
+				continue
+			}
+			if nh.Interface != "" {
+				addByName(nh.Address, nh.Interface)
+			} else {
+				addByIPOrConfig(nh.Address)
+			}
+		}
+	}
+	for _, ri := range cfg.RoutingInstances {
+		for _, sr := range append(ri.StaticRoutes, ri.Inet6StaticRoutes...) {
+			if sr.Discard {
+				continue
+			}
+			for _, nh := range sr.NextHops {
+				if nh.Address == "" {
+					continue
+				}
+				if nh.Interface != "" {
+					addByName(nh.Address, nh.Interface)
+				} else {
+					addByIPOrConfig(nh.Address)
+				}
+			}
+		}
+	}
+
+	// 2. DHCP-learned gateways
+	if d.dhcp != nil {
+		for _, lease := range d.dhcp.Leases() {
+			if lease.Gateway.IsValid() {
+				addByName(lease.Gateway.String(), lease.Interface)
+			}
+		}
+	}
+
+	// 3. Backup router next-hop
+	if cfg.System.BackupRouter != "" {
+		addByIP(cfg.System.BackupRouter)
+	}
+
+	// 4. DNAT pool addresses (destinations that will receive forwarded traffic)
+	if cfg.Security.NAT.Destination != nil {
+		for _, pool := range cfg.Security.NAT.Destination.Pools {
+			if pool.Address != "" {
+				addByIP(stripCIDR(pool.Address))
+			}
+		}
+	}
+
+	// 5. Static NAT translated addresses (internal hosts receiving forwarded traffic)
+	for _, rs := range cfg.Security.NAT.Static {
+		for _, rule := range rs.Rules {
+			if rule.Then != "" {
+				addByIP(stripCIDR(rule.Then))
+			}
+		}
+	}
+
+	// 6. Address-book host entries (known hosts referenced in policies).
+	// Only resolve host addresses (/32 for v4, /128 for v6) to avoid
+	// flooding entire subnets with ARP requests.
+	if cfg.Security.AddressBook != nil {
+		for _, addr := range cfg.Security.AddressBook.Addresses {
+			ip, ipNet, err := net.ParseCIDR(addr.Value)
+			if err != nil {
+				continue
+			}
+			ones, bits := ipNet.Mask.Size()
+			if ones == bits {
+				addByIP(ip.String())
+			}
+		}
+	}
+
+	// Resolve each target via ping (triggers kernel ARP/NDP resolution)
+	resolved := 0
+	for _, t := range targets {
+		link, err := netlink.LinkByIndex(t.linkIndex)
+		if err != nil {
+			continue
+		}
+		ifName := link.Attrs().Name
+		family := netlink.FAMILY_V4
+		if t.neighborIP.To4() == nil {
+			family = netlink.FAMILY_V6
+		}
+		// Skip if neighbor already exists and is usable
+		neighs, _ := netlink.NeighList(t.linkIndex, family)
+		skip := false
+		for _, n := range neighs {
+			if n.IP.Equal(t.neighborIP) && (n.State&(netlink.NUD_REACHABLE|netlink.NUD_STALE|netlink.NUD_PERMANENT)) != 0 {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		resolved++
+		// Trigger proactive neighbor discovery.
+		// IPv4 continues to use ping so the kernel owns ARP resolution.
+		// IPv6 additionally sends an explicit NS before pinging so the
+		// failover path also nudges peer neighbor caches directly.
+		go func(ip net.IP, iface string) {
+			if ip.To4() == nil {
+				if err := cluster.SendNDSolicitationFromInterface(iface, ip); err != nil {
+					slog.Debug("neighbor warmup: IPv6 NS probe failed",
+						"iface", iface, "ip", ip, "err", err)
+				}
+			}
+			sendICMPProbe(iface, ip)
+		}(t.neighborIP, ifName)
+	}
+
+	if resolved > 0 {
+		slog.Info("proactive neighbor resolution", "resolving", resolved, "total_targets", len(targets))
+		if waitForReplies {
+			// Brief pause to allow ARP responses
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+}
+
+// cleanFailedNeighbors deletes NUD_FAILED neighbor entries on all interfaces
+// and proactively pings the IP to pre-populate ARP/NDP for fast recovery.
+//
+// When a host goes down, the kernel marks its ARP/NDP entry as FAILED and
+// retains it for ~60 seconds (gc_staletime). During that window, packets
+// XDP_PASS'd for NO_NEIGH resolution are silently dropped by the kernel
+// because it refuses to re-resolve a FAILED entry. Deleting the entry and
+// pinging ensures ARP/NDP is resolved before the next forwarded packet.
+func (d *Daemon) cleanFailedNeighbors() int {
+	type probe struct {
+		ip    net.IP
+		iface string
+	}
+	var probes []probe
+	cleaned := 0
+	for _, family := range []int{netlink.FAMILY_V4, netlink.FAMILY_V6} {
+		neighs, err := netlink.NeighList(0, family)
+		if err != nil {
+			continue
+		}
+		for i := range neighs {
+			if neighs[i].State&netlink.NUD_FAILED != 0 {
+				// Capture interface name for probing before delete.
+				link, linkErr := netlink.LinkByIndex(neighs[i].LinkIndex)
+				if err := netlink.NeighDel(&neighs[i]); err == nil {
+					cleaned++
+					if linkErr == nil {
+						probes = append(probes, probe{
+							ip:    neighs[i].IP,
+							iface: link.Attrs().Name,
+						})
+					}
+				}
+			}
+		}
+	}
+	if cleaned > 0 {
+		slog.Debug("cleaned failed neighbor entries", "count", cleaned)
+	}
+	// Reprobe cleaned neighbors so the kernel's table repopulates before
+	// the next forwarded packet. IPv4 keeps the existing ARP probe path.
+	// IPv6 now sends an explicit NS instead of waiting for passive later
+	// traffic to trigger NDP.
+	for _, p := range probes {
+		if p.ip.To4() != nil {
+			cluster.SendARPProbe(p.iface, p.ip)
+		} else {
+			if err := cluster.SendNDSolicitationFromInterface(p.iface, p.ip); err != nil {
+				slog.Debug("failed-neighbor reprobe: IPv6 NS failed",
+					"iface", p.iface, "ip", p.ip, "err", err)
+			}
+		}
+	}
+	return cleaned
+}
+
+// runPeriodicNeighborResolution manages periodic neighbor upkeep:
+//   - Every 5 seconds: clean NUD_FAILED neighbor entries so the kernel
+//     retries ARP/NDP on the next forwarded packet (fast recovery).
+//   - Every 15 seconds: proactively resolve known forwarding targets
+//     (gateways, DNAT pools, etc.) to keep ARP/NDP entries warm.
+//   - In cluster mode: continuously refresh snapshot-learned neighbors and
+//     session-derived neighbor cache entries so standby forwarding stays ready
+//     without activation-time warmup.
+//
+// Runs once immediately at start to avoid a blind spot.
+// Fetches fresh active config on each tick so config changes take effect.
+func (d *Daemon) runPeriodicNeighborResolution(ctx context.Context) {
+	// Immediate first run — don't wait for first tick.
+	if cfg := d.store.ActiveConfig(); cfg != nil {
+		d.resolveNeighbors(cfg)
+		d.maintainClusterNeighborReadiness()
+	}
+	d.cleanFailedNeighbors()
+
+	const (
+		cleanInterval   = 5 * time.Second
+		resolveInterval = 15 * time.Second
+	)
+	cleanTicker := time.NewTicker(cleanInterval)
+	resolveTicker := time.NewTicker(resolveInterval)
+	defer cleanTicker.Stop()
+	defer resolveTicker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-cleanTicker.C:
+			d.cleanFailedNeighbors()
+		case <-resolveTicker.C:
+			if cfg := d.store.ActiveConfig(); cfg != nil {
+				d.resolveNeighbors(cfg)
+				d.maintainClusterNeighborReadiness()
+			}
+		}
+	}
+}
+
+// maintainClusterNeighborReadiness runs every 15 seconds (via the resolve
+// ticker in runPeriodicNeighborResolution) when HA is active. It refreshes
+// kernel neighbor entries and spawns warmNeighborCache which iterates the
+// full session table and sends one UDP probe per unique src/dst IP. The
+// session walk can be large; an atomic guard prevents overlapping runs if
+// a single pass exceeds one tick interval.
+func (d *Daemon) maintainClusterNeighborReadiness() {
+	if d.cluster == nil {
+		return
+	}
+	d.preinstallSnapshotNeighbors()
+	if !d.neighborWarmupInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer d.neighborWarmupInFlight.Store(false)
+		d.warmNeighborCache()
+	}()
+}
