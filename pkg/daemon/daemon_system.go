@@ -199,7 +199,6 @@ func (d *Daemon) applyAggregator(er *logging.EventReader, cfg *config.Config) {
 	slog.Info("session aggregation reporting enabled (5 min interval)")
 }
 
-// applySystemDNS writes /etc/resolv.conf from system { name-server } config.
 // applyHostname sets the system hostname from system { host-name } config.
 func (d *Daemon) applyHostname(cfg *config.Config) {
 	if cfg.System.HostName == "" {

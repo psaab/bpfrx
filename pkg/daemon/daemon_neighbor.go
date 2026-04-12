@@ -22,14 +22,6 @@ import (
 // the standby's neighbor table hot so failover does not depend on
 // activation-time priming.
 func (d *Daemon) preinstallSnapshotNeighbors() {
-	type neighborInstaller interface {
-		LastPublishedNeighbors() []struct {
-			Ifindex int
-			Family  string
-			IP      string
-			MAC     string
-		}
-	}
 	// Read neighbors from the snapshot via the dataplane manager.
 	// Fall back to kernel NeighList if the snapshot isn't available.
 	cfg := d.store.ActiveConfig()
