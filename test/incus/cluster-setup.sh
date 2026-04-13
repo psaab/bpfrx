@@ -123,7 +123,13 @@ suppress_host_parent_ipv6_ra() {
 		"net.ipv6.conf.${parent}.accept_ra=0" \
 		"net.ipv6.conf.${parent}.autoconf=0" \
 		"net.ipv6.conf.${parent}.router_solicitations=0"
-	run_on_host sudo ip -6 addr flush dev "$parent" scope global dynamic || true
+	if ! run_on_host sudo ip -6 addr flush dev "$parent" scope global dynamic; then
+		warn "targeted IPv6 dynamic address flush failed on host parent $parent; falling back to broader global-address flush"
+		run_on_host sudo ip -6 addr flush dev "$parent" scope global ||
+			die "failed to clear learned IPv6 global addresses from host parent $parent"
+	fi
+	run_on_host sudo ip -6 route flush dev "$parent" proto ra ||
+		die "failed to clear RA-learned IPv6 routes from host parent $parent"
 }
 
 # Prefix instance name with remote if set: "loss:bpfrx-fw0" or "bpfrx-fw0"
