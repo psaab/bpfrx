@@ -2189,52 +2189,50 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 	raByIface := make(map[string]*config.RAInterfaceConfig)
 	var result []*config.RAInterfaceConfig
 	for _, ra := range cfg.Protocols.RouterAdvertisement {
-		raByIface[ra.Interface] = ra
-		result = append(result, ra)
+		clone := cloneRAInterfaceConfig(ra)
+		raByIface[clone.Interface] = clone
+		result = append(result, clone)
 	}
 
-	// If no DHCP manager, return static only.
-	if d.dhcp == nil {
-		return result
-	}
-
-	// Merge PD-derived prefixes from DHCPv6 clients.
-	for _, mapping := range d.dhcp.DelegatedPrefixesForRA() {
-		subPrefix := dhcp.DeriveSubPrefix(mapping.Prefix, mapping.SubPrefLen)
-		if !subPrefix.IsValid() {
-			slog.Warn("DHCPv6 PD: invalid sub-prefix derivation",
-				"delegated", mapping.Prefix, "sub_len", mapping.SubPrefLen)
-			continue
-		}
-
-		pfx := &config.RAPrefix{
-			Prefix:     subPrefix.String(),
-			OnLink:     true,
-			Autonomous: true,
-		}
-		if mapping.ValidLifetime > 0 {
-			pfx.ValidLifetime = int(mapping.ValidLifetime.Seconds())
-		}
-		if mapping.PreferredLifetime > 0 {
-			pfx.PreferredLife = int(mapping.PreferredLifetime.Seconds())
-		}
-
-		if existing, ok := raByIface[mapping.RAIface]; ok {
-			// Append prefix to existing RA interface config.
-			existing.Prefixes = append(existing.Prefixes, pfx)
-		} else {
-			// Create a new RA interface config for this downstream interface.
-			ra := &config.RAInterfaceConfig{
-				Interface: mapping.RAIface,
-				Prefixes:  []*config.RAPrefix{pfx},
+	if d.dhcp != nil {
+		// Merge PD-derived prefixes from DHCPv6 clients.
+		for _, mapping := range d.dhcp.DelegatedPrefixesForRA() {
+			subPrefix := dhcp.DeriveSubPrefix(mapping.Prefix, mapping.SubPrefLen)
+			if !subPrefix.IsValid() {
+				slog.Warn("DHCPv6 PD: invalid sub-prefix derivation",
+					"delegated", mapping.Prefix, "sub_len", mapping.SubPrefLen)
+				continue
 			}
-			raByIface[mapping.RAIface] = ra
-			result = append(result, ra)
-		}
 
-		slog.Info("DHCPv6 PD: advertising prefix via RA",
-			"prefix", subPrefix, "interface", mapping.RAIface,
-			"delegated_from", mapping.Interface)
+			pfx := &config.RAPrefix{
+				Prefix:     subPrefix.String(),
+				OnLink:     true,
+				Autonomous: true,
+			}
+			if mapping.ValidLifetime > 0 {
+				pfx.ValidLifetime = int(mapping.ValidLifetime.Seconds())
+			}
+			if mapping.PreferredLifetime > 0 {
+				pfx.PreferredLife = int(mapping.PreferredLifetime.Seconds())
+			}
+
+			if existing, ok := raByIface[mapping.RAIface]; ok {
+				// Append prefix to existing RA interface config.
+				existing.Prefixes = append(existing.Prefixes, pfx)
+			} else {
+				// Create a new RA interface config for this downstream interface.
+				ra := &config.RAInterfaceConfig{
+					Interface: mapping.RAIface,
+					Prefixes:  []*config.RAPrefix{pfx},
+				}
+				raByIface[mapping.RAIface] = ra
+				result = append(result, ra)
+			}
+
+			slog.Info("DHCPv6 PD: advertising prefix via RA",
+				"prefix", subPrefix, "interface", mapping.RAIface,
+				"delegated_from", mapping.Interface)
+		}
 	}
 
 	// Detect explicitly configured link-local addresses on RA interfaces.
@@ -2254,6 +2252,15 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 					}
 				}
 			}
+			if ra.SourceLinkLocal == "" && cfg.Chassis.Cluster != nil && ifc.RedundancyGroup != 0 {
+				// RETH HA startup installs a stable router link-local on the active
+				// member. Bind RA to that address so the sender does not auto-pick a
+				// transient EUI-64 link-local which can later be removed by HA reconcile.
+				ra.SourceLinkLocal = cluster.StableRethLinkLocal(
+					cfg.Chassis.Cluster.ClusterID,
+					ifc.RedundancyGroup,
+				).String()
+			}
 		}
 	}
 
@@ -2263,6 +2270,28 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 	}
 
 	return result
+}
+
+func cloneRAInterfaceConfig(src *config.RAInterfaceConfig) *config.RAInterfaceConfig {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	if len(src.DNSServers) > 0 {
+		clone.DNSServers = append([]string(nil), src.DNSServers...)
+	}
+	if len(src.Prefixes) > 0 {
+		clone.Prefixes = make([]*config.RAPrefix, 0, len(src.Prefixes))
+		for _, pfx := range src.Prefixes {
+			if pfx == nil {
+				clone.Prefixes = append(clone.Prefixes, nil)
+				continue
+			}
+			pfxClone := *pfx
+			clone.Prefixes = append(clone.Prefixes, &pfxClone)
+		}
+	}
+	return &clone
 }
 
 // startDHCPClients iterates the config and starts DHCP/DHCPv6 clients
