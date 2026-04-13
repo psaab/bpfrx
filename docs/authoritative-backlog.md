@@ -1,6 +1,6 @@
 # Authoritative Backlog
 
-Date: 2026-03-06
+Date: 2026-04-13
 Status: Active
 
 This document is the canonical backlog snapshot for parity and HA-followup work.
@@ -21,17 +21,17 @@ Use these sources in this order when there is disagreement:
 ### 1) vSRX parity gaps (from `docs/feature-gaps.md` row data)
 
 Row-level gap totals:
-- Missing: 120
-- Partial: 13
-- Parse-Only: 2
-- Total Open Gaps: 135
+- Missing: 125
+- Partial: 14
+- Parse-Only: 1
+- Total Open Gaps: 140
 
 Category totals:
 
 | Category | Missing | Partial | Parse-Only | Open |
 |---|---:|---:|---:|---:|
 | 1. Security Policies (Unified/Advanced) | 7 | 0 | 1 | 8 |
-| 2. Application Security (AppSecure) | 7 | 1 | 0 | 8 |
+| 2. Application Security (AppSecure) | 8 | 1 | 0 | 9 |
 | 3. Intrusion Detection & Prevention (IDP/IPS) | 8 | 0 | 0 | 8 |
 | 4. Content Security (UTM) | 6 | 0 | 0 | 6 |
 | 5. SSL/TLS Inspection | 4 | 0 | 0 | 4 |
@@ -44,11 +44,12 @@ Category totals:
 | 12. Security Logging Enhancements | 0 | 0 | 0 | 0 |
 | 13. PKI / Certificates | 3 | 1 | 0 | 4 |
 | 14. Routing Enhancements | 10 | 3 | 0 | 13 |
-| 15. VPN Enhancements | 8 | 0 | 0 | 8 |
+| 15. VPN Enhancements | 9 | 0 | 0 | 9 |
+| 16. HA Enhancements | 0 | 1 | 0 | 1 |
 | 17. Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
 | 18. QoS / Class of Service | 7 | 1 | 0 | 8 |
 | 19. Multi-Tenancy | 4 | 0 | 0 | 4 |
-| 20. Management & Automation | 9 | 2 | 0 | 11 |
+| 20. Management & Automation | 12 | 2 | 0 | 14 |
 | 21. Interface Enhancements | 1 | 1 | 0 | 2 |
 | 22. System Enhancements | 5 | 0 | 0 | 5 |
 | 23. Miscellaneous Features | 6 | 0 | 0 | 6 |
@@ -77,14 +78,19 @@ From `docs/next-features` and HA proposal docs:
   - Verify PBR overrides VRF routing (TODO)
   - Multi-ISP VRF test (TODO)
 
-### 4) Candidate gaps not tracked in `feature-gaps.md`
+### 4) PDF-backed gaps now tracked in `feature-gaps.md`
 
-From Juniper vSRX deployment guide (2026-01-20) feature tables:
+After the 2026-04-13 PDF refresh, the previously untracked items from the vSRX
+deployment/user guide are now tracked explicitly in `docs/feature-gaps.md`:
+
 - Junos Telemetry Interface (JTI)
-- AppQoE (called out in CSB license feature list)
-- Cloud-init parity (if this is a product-scope requirement)
+- AppQoE
+- Remote Access IPsec VPN
+- Cloud-init / metadata user-data bootstrap
+- Bootstrap ISO provisioning
+- Geneve Flow Infrastructure / AWS GWLB
 
-These are not currently tracked as explicit rows in `docs/feature-gaps.md`.
+No additional PDF-backed feature families remain untracked from this pass.
 
 ## Implemented and should be treated as closed
 
@@ -122,7 +128,7 @@ These are documented as implemented in `docs/phases.md` and should not remain in
 
 1. Keep `docs/feature-gaps.md` summary totals in lockstep with row-level status changes.
 2. For `docs/next-features/*`, always include explicit `Date` and `Status` metadata and flip to `Implemented` when shipped.
-3. Decide whether JTI/AppQoE/Cloud-init are in product scope; if yes, add explicit rows to `docs/feature-gaps.md`.
+3. Keep PDF-backed parity rows in `docs/feature-gaps.md` synchronized when vSRX docs add new feature tables or deployment workflows.
 
 ## Reproducibility note
 
