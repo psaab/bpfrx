@@ -479,10 +479,41 @@ func (s *Server) completePipeFilter(text string) []string {
 	return candidates
 }
 
+func filterCompletionPairs(tree map[string]*cmdtree.Node, prefix string) []completionPair {
+	pairs := make([]completionPair, 0, len(tree))
+	for name, node := range tree {
+		if prefix == "" || strings.HasPrefix(name, prefix) {
+			pairs = append(pairs, completionPair{name: name, desc: node.Desc})
+		}
+	}
+	return pairs
+}
+
+func resolveShowConfigurationWords(words []string) ([]string, bool) {
+	if len(words) < 2 {
+		return nil, false
+	}
+	show, ok := cmdtree.ResolveUniquePrefix(cmdtree.KeysFromTree(cmdtree.OperationalTree), words[0])
+	if !ok || show != "show" {
+		return nil, false
+	}
+	showNode := cmdtree.OperationalTree[show]
+	if showNode == nil || showNode.Children == nil {
+		return nil, false
+	}
+	conf, ok := cmdtree.ResolveUniquePrefix(cmdtree.KeysFromTree(showNode.Children), words[1])
+	if !ok || conf != "configuration" {
+		return nil, false
+	}
+	return words[2:], true
+}
+
 func (s *Server) completeOperationalPairs(words []string, partial string) []completionPair {
 	// "show configuration <path>" — delegate sub-path to config schema
-	if len(words) >= 2 && words[0] == "show" && words[1] == "configuration" {
-		subPath := words[2:]
+	if subPath, ok := resolveShowConfigurationWords(words); ok {
+		if resolvedPath, resolved := config.ResolveConsumedSetPathTokens(subPath); resolved {
+			subPath = resolvedPath
+		}
 		schemaCompletions := config.CompleteSetPathWithValues(subPath, s.valueProvider)
 		if schemaCompletions != nil {
 			var pairs []completionPair
@@ -496,7 +527,10 @@ func (s *Server) completeOperationalPairs(words []string, partial string) []comp
 			}
 		}
 	}
-	cfg := s.store.ActiveConfig()
+	var cfg *config.Config
+	if s.store != nil {
+		cfg = s.store.ActiveConfig()
+	}
 	candidates := cmdtree.CompleteFromTreeWithDesc(cmdtree.OperationalTree, words, partial, cfg)
 	pairs := make([]completionPair, len(candidates))
 	for i, c := range candidates {
@@ -507,18 +541,24 @@ func (s *Server) completeOperationalPairs(words []string, partial string) []comp
 
 func (s *Server) completeConfigPairs(words []string, partial string) []completionPair {
 	if len(words) == 0 {
-		var pairs []completionPair
-		for name, node := range cmdtree.ConfigTopLevel {
-			if strings.HasPrefix(name, partial) {
-				pairs = append(pairs, completionPair{name: name, desc: node.Desc})
-			}
-		}
-		return pairs
+		return filterCompletionPairs(cmdtree.ConfigTopLevel, partial)
 	}
 
-	switch words[0] {
+	resolvedTop, ok := cmdtree.ResolveUniquePrefix(cmdtree.KeysFromTree(cmdtree.ConfigTopLevel), words[0])
+	if !ok {
+		if len(words) == 1 {
+			return filterCompletionPairs(cmdtree.ConfigTopLevel, words[0])
+		}
+		return nil
+	}
+
+	switch resolvedTop {
 	case "set", "delete", "show", "edit":
-		schemaCompletions := config.CompleteSetPathWithValues(words[1:], s.valueProvider)
+		pathWords := words[1:]
+		if resolvedPath, resolved := config.ResolveConsumedSetPathTokens(pathWords); resolved {
+			pathWords = resolvedPath
+		}
+		schemaCompletions := config.CompleteSetPathWithValues(pathWords, s.valueProvider)
 		if schemaCompletions == nil {
 			return nil
 		}
@@ -530,27 +570,27 @@ func (s *Server) completeConfigPairs(words []string, partial string) []completio
 		}
 		return pairs
 	case "run":
-		cfg := s.store.ActiveConfig()
+		var cfg *config.Config
+		if s.store != nil {
+			cfg = s.store.ActiveConfig()
+		}
 		names := cmdtree.CompleteFromTree(cmdtree.OperationalTree, words[1:], partial, cfg)
 		var pairs []completionPair
 		for _, name := range names {
 			pairs = append(pairs, completionPair{name: name})
 		}
 		return pairs
-	case "commit":
+	case "commit", "load":
 		if len(words) == 1 {
-			var pairs []completionPair
-			for _, name := range cmdtree.FilterPrefix([]string{"check", "confirmed"}, partial) {
-				pairs = append(pairs, completionPair{name: name})
+			node := cmdtree.ConfigTopLevel[resolvedTop]
+			if node == nil || node.Children == nil {
+				return nil
 			}
-			return pairs
-		}
-		return nil
-	case "load":
-		if len(words) == 1 {
 			var pairs []completionPair
-			for _, name := range cmdtree.FilterPrefix([]string{"override", "merge"}, partial) {
-				pairs = append(pairs, completionPair{name: name})
+			for name, child := range node.Children {
+				if strings.HasPrefix(name, partial) {
+					pairs = append(pairs, completionPair{name: name, desc: child.Desc})
+				}
 			}
 			return pairs
 		}

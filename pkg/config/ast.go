@@ -1599,9 +1599,27 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []Schema
 
 		// Look up keyword in current schema level.
 		var childSchema *schemaNode
+		resolvedKeyword := keyword
 		if schema.children != nil {
 			if s, ok := schema.children[keyword]; ok {
 				childSchema = s
+			} else {
+				var matches []string
+				for name := range schema.children {
+					if strings.HasPrefix(name, keyword) {
+						matches = append(matches, name)
+					}
+				}
+				if len(matches) == 1 && i < len(tokens)-1 {
+					resolvedKeyword = matches[0]
+					childSchema = schema.children[resolvedKeyword]
+				} else if len(matches) > 0 && i == len(tokens)-1 {
+					var completions []SchemaCompletion
+					for _, name := range matches {
+						completions = append(completions, SchemaCompletion{Name: name, Desc: schema.children[name].desc})
+					}
+					return completions
+				}
 			}
 		}
 		if childSchema == nil && schema.wildcard != nil {
@@ -1629,7 +1647,10 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []Schema
 		if end > len(tokens) {
 			end = len(tokens)
 		}
-		path = append(path, tokens[i:end]...)
+		path = append(path, resolvedKeyword)
+		if end-i > 1 {
+			path = append(path, tokens[i+1:end]...)
+		}
 		i += nodeKeyCount
 
 		// Compound key: consume child token as part of key.
@@ -1715,4 +1736,86 @@ func CompleteSetPathWithValues(tokens []string, provider ValueProvider) []Schema
 		return nil
 	}
 	return completions
+}
+
+// ResolveConsumedSetPathTokens expands uniquely matching keyword prefixes in a
+// token list that is already known to contain only consumed words, not the
+// current partial token being completed.
+func ResolveConsumedSetPathTokens(tokens []string) ([]string, bool) {
+	schema := setSchema
+	i := 0
+	var resolved []string
+
+	for i < len(tokens) {
+		if schema == nil {
+			return nil, false
+		}
+
+		keyword := tokens[i]
+		resolvedKeyword := keyword
+		var childSchema *schemaNode
+		if schema.children != nil {
+			if s, ok := schema.children[keyword]; ok {
+				childSchema = s
+			} else {
+				var matches []string
+				for name := range schema.children {
+					if strings.HasPrefix(name, keyword) {
+						matches = append(matches, name)
+					}
+				}
+				if len(matches) != 1 {
+					return nil, false
+				}
+				resolvedKeyword = matches[0]
+				childSchema = schema.children[resolvedKeyword]
+			}
+		}
+		if childSchema == nil && schema.wildcard != nil {
+			childSchema = schema.wildcard
+		}
+		if childSchema == nil {
+			return nil, false
+		}
+
+		resolved = append(resolved, resolvedKeyword)
+		nodeKeyCount := 1 + childSchema.args
+		end := i + nodeKeyCount
+		if end > len(tokens) {
+			return resolved, true
+		}
+		if end-i > 1 {
+			resolved = append(resolved, tokens[i+1:end]...)
+		}
+		i += nodeKeyCount
+
+		if childSchema.compoundKey && i < len(tokens) {
+			subKeyword := tokens[i]
+			if sub, ok := childSchema.children[subKeyword]; ok {
+				resolved = append(resolved, subKeyword)
+				i++
+				childSchema = sub
+			} else {
+				var matches []string
+				for name := range childSchema.children {
+					if strings.HasPrefix(name, subKeyword) {
+						matches = append(matches, name)
+					}
+				}
+				if len(matches) != 1 {
+					return nil, false
+				}
+				resolved = append(resolved, matches[0])
+				i++
+				childSchema = childSchema.children[matches[0]]
+			}
+		}
+
+		if childSchema.multi && childSchema.children == nil {
+			continue
+		}
+		schema = childSchema
+	}
+
+	return resolved, true
 }
