@@ -96,7 +96,22 @@ type UserspaceSnapshot struct {
 	RecentExceptions                  []string
 }
 
-func mergedTrafficCounters(snap *Snapshot) trafficCounters {
+func hasUserspaceTrafficSource(snap *UserspaceSnapshot) bool {
+	if snap == nil {
+		return false
+	}
+	return snap.Bindings > 0 ||
+		snap.ReadyBindings > 0 ||
+		snap.BoundBindings > 0 ||
+		snap.XSKRegistered > 0 ||
+		snap.ZeroCopyBindings > 0 ||
+		snap.RxPackets > 0 ||
+		snap.RxBytes > 0 ||
+		snap.TxPackets > 0 ||
+		snap.TxBytes > 0
+}
+
+func displayTrafficCounters(snap *Snapshot) trafficCounters {
 	if snap == nil {
 		return trafficCounters{}
 	}
@@ -106,16 +121,32 @@ func mergedTrafficCounters(snap *Snapshot) trafficCounters {
 		rxPkts:  snap.RxPkts,
 		txPkts:  snap.TxPkts,
 	}
-	if snap.Userspace == nil {
+	if !hasUserspaceTrafficSource(snap.Userspace) {
 		return counters
 	}
-	// Userspace/XSK forwarding bypasses the normal per-interface BPF pipeline, so
-	// monitor output needs both sources to reflect actual interface traffic.
-	counters.rxBytes += snap.Userspace.RxBytes
+	// Userspace/XSK forwarding bypasses the normal egress accounting path, so
+	// monitor output needs helper TX counters merged into interface totals.
 	counters.txBytes += snap.Userspace.TxBytes
-	counters.rxPkts += snap.Userspace.RxPackets
 	counters.txPkts += snap.Userspace.TxPackets
 	return counters
+}
+
+func snapshotTrafficDeltas(curr, prev *Snapshot) (rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta uint64) {
+	if curr == nil || prev == nil {
+		return 0, 0, 0, 0
+	}
+
+	rxPktsDelta = deltaU64(curr.RxPkts, prev.RxPkts)
+	txPktsDelta = deltaU64(curr.TxPkts, prev.TxPkts)
+	rxBytesDelta = deltaU64(curr.RxBytes, prev.RxBytes)
+	txBytesDelta = deltaU64(curr.TxBytes, prev.TxBytes)
+
+	if hasUserspaceTrafficSource(curr.Userspace) && hasUserspaceTrafficSource(prev.Userspace) {
+		txPktsDelta += deltaU64(curr.Userspace.TxPackets, prev.Userspace.TxPackets)
+		txBytesDelta += deltaU64(curr.Userspace.TxBytes, prev.Userspace.TxBytes)
+	}
+
+	return rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta
 }
 
 func ResolvePhysicalParent(name string) string {
@@ -511,27 +542,21 @@ func RenderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 	if prev != nil {
 		dt := snap.Timestamp.Sub(prev.Timestamp).Seconds()
 		if dt > 0 {
-			currCounters := mergedTrafficCounters(snap)
-			prevCounters := mergedTrafficCounters(prev)
-			rxBps = uint64(float64(deltaU64(currCounters.rxBytes, prevCounters.rxBytes)) * 8 / dt)
-			txBps = uint64(float64(deltaU64(currCounters.txBytes, prevCounters.txBytes)) * 8 / dt)
-			rxPps = uint64(float64(deltaU64(currCounters.rxPkts, prevCounters.rxPkts)) / dt)
-			txPps = uint64(float64(deltaU64(currCounters.txPkts, prevCounters.txPkts)) / dt)
+			rxPktsDelta, txPktsDelta, rxBytesDeltaStep, txBytesDeltaStep := snapshotTrafficDeltas(snap, prev)
+			rxBps = uint64(float64(rxBytesDeltaStep) * 8 / dt)
+			txBps = uint64(float64(txBytesDeltaStep) * 8 / dt)
+			rxPps = uint64(float64(rxPktsDelta) / dt)
+			txPps = uint64(float64(txPktsDelta) / dt)
 		}
 	}
 
 	var rxBytesDelta, txBytesDelta, rxPktsDelta, txPktsDelta uint64
 	if baseline != nil {
-		currCounters := mergedTrafficCounters(snap)
-		baseCounters := mergedTrafficCounters(baseline)
-		rxBytesDelta = deltaU64(currCounters.rxBytes, baseCounters.rxBytes)
-		txBytesDelta = deltaU64(currCounters.txBytes, baseCounters.txBytes)
-		rxPktsDelta = deltaU64(currCounters.rxPkts, baseCounters.rxPkts)
-		txPktsDelta = deltaU64(currCounters.txPkts, baseCounters.txPkts)
+		rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta = snapshotTrafficDeltas(snap, baseline)
 	}
-	currCounters := mergedTrafficCounters(snap)
+	currCounters := displayTrafficCounters(snap)
 
-	fmt.Fprintf(w, "Traffic statistics (merged interface + userspace XSK): Current delta\n")
+	fmt.Fprintf(w, "Traffic statistics (interface counters + userspace XSK TX): Current delta\n")
 	fmt.Fprintf(w, "  Input  bytes:         %20d (%d bps)    [%d]\n", currCounters.rxBytes, rxBps, rxBytesDelta)
 	fmt.Fprintf(w, "  Output bytes:         %20d (%d bps)    [%d]\n", currCounters.txBytes, txBps, txBytesDelta)
 	fmt.Fprintf(w, "  Input  packets:       %20d (%d pps)    [%d]\n", currCounters.rxPkts, rxPps, rxPktsDelta)
@@ -736,10 +761,7 @@ func RenderTrafficSummary(w io.Writer, hostname string, names []string, kernelNa
 			}
 			var rxDelta, txDelta uint64
 			if prev := prevSnaps[name]; prev != nil {
-				currCounters := mergedTrafficCounters(snap)
-				prevCounters := mergedTrafficCounters(prev)
-				rxDelta = deltaU64(currCounters.rxPkts, prevCounters.rxPkts)
-				txDelta = deltaU64(currCounters.txPkts, prevCounters.txPkts)
+				rxDelta, txDelta, _, _ = snapshotTrafficDeltas(snap, prev)
 			}
 			totalRxDelta += rxDelta
 			totalTxDelta += txDelta
@@ -828,12 +850,11 @@ func snapshotRates(curr, prev *Snapshot) (rxPps, txPps, rxBytesPerSec, txBytesPe
 	if dt <= 0 {
 		return 0, 0, 0, 0
 	}
-	currCounters := mergedTrafficCounters(curr)
-	prevCounters := mergedTrafficCounters(prev)
-	return uint64(float64(deltaU64(currCounters.rxPkts, prevCounters.rxPkts)) / dt),
-		uint64(float64(deltaU64(currCounters.txPkts, prevCounters.txPkts)) / dt),
-		uint64(float64(deltaU64(currCounters.rxBytes, prevCounters.rxBytes)) / dt),
-		uint64(float64(deltaU64(currCounters.txBytes, prevCounters.txBytes)) / dt)
+	rxPktsDelta, txPktsDelta, rxBytesDelta, txBytesDelta := snapshotTrafficDeltas(curr, prev)
+	return uint64(float64(rxPktsDelta) / dt),
+		uint64(float64(txPktsDelta) / dt),
+		uint64(float64(rxBytesDelta) / dt),
+		uint64(float64(txBytesDelta) / dt)
 }
 
 func deltaU64(curr, prev uint64) uint64 {
