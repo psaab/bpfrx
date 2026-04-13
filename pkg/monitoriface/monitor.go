@@ -124,9 +124,12 @@ func displayTrafficCounters(snap *Snapshot) trafficCounters {
 	if !hasUserspaceTrafficSource(snap.Userspace) {
 		return counters
 	}
-	// Userspace/XSK forwarding bypasses the normal egress accounting path, so
-	// monitor output needs helper TX counters merged into interface totals.
+	// Userspace/XSK forwarding is accounted in the helper bindings rather than
+	// the kernel/BPF interface snapshots that back monitor output, so fold both
+	// directions into the displayed totals.
+	counters.rxBytes += snap.Userspace.RxBytes
 	counters.txBytes += snap.Userspace.TxBytes
+	counters.rxPkts += snap.Userspace.RxPackets
 	counters.txPkts += snap.Userspace.TxPackets
 	return counters
 }
@@ -142,7 +145,9 @@ func snapshotTrafficDeltas(curr, prev *Snapshot) (rxPktsDelta, txPktsDelta, rxBy
 	txBytesDelta = deltaU64(curr.TxBytes, prev.TxBytes)
 
 	if hasUserspaceTrafficSource(curr.Userspace) && hasUserspaceTrafficSource(prev.Userspace) {
+		rxPktsDelta += deltaU64(curr.Userspace.RxPackets, prev.Userspace.RxPackets)
 		txPktsDelta += deltaU64(curr.Userspace.TxPackets, prev.Userspace.TxPackets)
+		rxBytesDelta += deltaU64(curr.Userspace.RxBytes, prev.Userspace.RxBytes)
 		txBytesDelta += deltaU64(curr.Userspace.TxBytes, prev.Userspace.TxBytes)
 	}
 
@@ -556,7 +561,7 @@ func RenderSingleInterface(w io.Writer, hostname, displayName, kernelName string
 	}
 	currCounters := displayTrafficCounters(snap)
 
-	fmt.Fprintf(w, "Traffic statistics (interface counters + userspace XSK TX): Current delta\n")
+	fmt.Fprintf(w, "Traffic statistics (interface counters + userspace XSK traffic): Current delta\n")
 	fmt.Fprintf(w, "  Input  bytes:         %20d (%d bps)    [%d]\n", currCounters.rxBytes, rxBps, rxBytesDelta)
 	fmt.Fprintf(w, "  Output bytes:         %20d (%d bps)    [%d]\n", currCounters.txBytes, txBps, txBytesDelta)
 	fmt.Fprintf(w, "  Input  packets:       %20d (%d pps)    [%d]\n", currCounters.rxPkts, rxPps, rxPktsDelta)
