@@ -95,6 +95,26 @@ func TestRenderTrafficSummaryCombinedIncludesTotals(t *testing.T) {
 	}
 }
 
+func TestMergedTrafficCountersIncludeUserspaceXSK(t *testing.T) {
+	snap := &Snapshot{
+		RxBytes: 1000,
+		TxBytes: 2000,
+		RxPkts:  10,
+		TxPkts:  20,
+		Userspace: &UserspaceSnapshot{
+			RxBytes:   3000,
+			TxBytes:   4000,
+			RxPackets: 30,
+			TxPackets: 40,
+		},
+	}
+
+	counters := mergedTrafficCounters(snap)
+	if counters.rxBytes != 4000 || counters.txBytes != 6000 || counters.rxPkts != 40 || counters.txPkts != 60 {
+		t.Fatalf("mergedTrafficCounters() = %+v, want rxBytes=4000 txBytes=6000 rxPkts=40 txPkts=60", counters)
+	}
+}
+
 func TestSnapshotRatesCounterResetReturnsZero(t *testing.T) {
 	now := time.Now()
 	rxPps, txPps, rxBps, txBps := snapshotRates(&Snapshot{
@@ -112,6 +132,90 @@ func TestSnapshotRatesCounterResetReturnsZero(t *testing.T) {
 	})
 	if rxPps != 0 || txPps != 0 || rxBps != 0 || txBps != 0 {
 		t.Fatalf("snapshotRates should clamp counter resets to zero, got rxPps=%d txPps=%d rxBps=%d txBps=%d", rxPps, txPps, rxBps, txBps)
+	}
+}
+
+func TestSnapshotRatesIncludeUserspaceXSKCounters(t *testing.T) {
+	now := time.Now()
+	rxPps, txPps, rxBps, txBps := snapshotRates(&Snapshot{
+		RxBytes:   1000,
+		TxBytes:   2000,
+		RxPkts:    10,
+		TxPkts:    20,
+		Timestamp: now,
+		Userspace: &UserspaceSnapshot{
+			RxBytes:   2000,
+			TxBytes:   3000,
+			RxPackets: 20,
+			TxPackets: 30,
+		},
+	}, &Snapshot{
+		RxBytes:   400,
+		TxBytes:   500,
+		RxPkts:    4,
+		TxPkts:    5,
+		Timestamp: now.Add(-1 * time.Second),
+		Userspace: &UserspaceSnapshot{
+			RxBytes:   600,
+			TxBytes:   700,
+			RxPackets: 6,
+			TxPackets: 7,
+		},
+	})
+	if rxPps != 20 || txPps != 38 || rxBps != 2000 || txBps != 3800 {
+		t.Fatalf("snapshotRates() = rxPps=%d txPps=%d rxBps=%d txBps=%d, want 20/38/2000/3800", rxPps, txPps, rxBps, txBps)
+	}
+}
+
+func TestRenderTrafficSummaryCombinedIncludesUserspaceXSKTotals(t *testing.T) {
+	now := time.Now()
+	names := []string{"wan0"}
+	kernelNames := map[string]string{"wan0": "wan0"}
+	snaps := map[string]*Snapshot{
+		"wan0": {
+			RxBytes:   1_000_000,
+			TxBytes:   2_000_000,
+			RxPkts:    1_000,
+			TxPkts:    2_000,
+			Timestamp: now,
+			Userspace: &UserspaceSnapshot{
+				RxBytes:   4_000_000,
+				TxBytes:   5_000_000,
+				RxPackets: 4_000,
+				TxPackets: 5_000,
+			},
+		},
+	}
+	prev := map[string]*Snapshot{
+		"wan0": {
+			RxBytes:   500_000,
+			TxBytes:   1_000_000,
+			RxPkts:    500,
+			TxPkts:    1_000,
+			Timestamp: now.Add(-1 * time.Second),
+			Userspace: &UserspaceSnapshot{
+				RxBytes:   2_000_000,
+				TxBytes:   2_500_000,
+				RxPackets: 2_000,
+				TxPackets: 2_500,
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	RenderTrafficSummary(&buf, "bpfrx", names, kernelNames, snaps, prev, SummaryModeCombined, now.Add(-5*time.Second))
+	out := buf.String()
+	for _, needle := range []string{
+		"2.50 MB/s",
+		"3.50 MB/s",
+		"6.00 MB/s",
+		"2.50K",
+		"3.50K",
+		"6.00K",
+	} {
+		if !strings.Contains(out, needle) {
+			t.Fatalf("combined summary missing merged userspace traffic %q\n%s", needle, out)
+		}
 	}
 }
 
