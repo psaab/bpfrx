@@ -69,3 +69,29 @@ func TestCompleteFromTree_ShowRouteTableDynamicNames(t *testing.T) {
 		t.Fatalf("expected per-instance table names, got %v", cands)
 	}
 }
+
+func TestCompleteFromTree_UniquePrefixWordsDescend(t *testing.T) {
+	cands := CompleteFromTree(OperationalTree, []string{"sh", "sec"}, "", nil)
+	if !contains(cands, "flow") || !contains(cands, "nat") {
+		t.Fatalf("expected security subtree completions after unique prefixes, got %v", cands)
+	}
+}
+
+func TestCompleteFromTree_AmbiguousLastConsumedPrefixReturnsMatches(t *testing.T) {
+	cands := CompleteFromTree(OperationalTree, []string{"show", "s"}, "", nil)
+	if !contains(cands, "security") || !contains(cands, "services") || !contains(cands, "system") {
+		t.Fatalf("expected ambiguous show subtree matches, got %v", cands)
+	}
+}
+
+func TestLookupDesc_ResolvesUniquePrefixWords(t *testing.T) {
+	if got := LookupDesc([]string{"show", "sec"}, "flow", false); got != "Show security flow information" {
+		t.Fatalf("LookupDesc() = %q, want %q", got, "Show security flow information")
+	}
+}
+
+func TestLookupDesc_ConfigModeResolvesUniquePrefixWords(t *testing.T) {
+	if got := LookupDesc([]string{"com"}, "confirmed", true); got != "Automatically rollback if not confirmed" {
+		t.Fatalf("LookupDesc() = %q, want %q", got, "Automatically rollback if not confirmed")
+	}
+}

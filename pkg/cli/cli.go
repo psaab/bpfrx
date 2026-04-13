@@ -323,8 +323,10 @@ func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
 		candidates = cc.cli.completeConfigWithDesc(words, partial)
 	} else {
 		// "show configuration <path>" — delegate sub-path to config schema
-		if len(words) >= 2 && words[0] == "show" && words[1] == "configuration" {
-			subPath := words[2:]
+		if subPath, ok := showConfigurationSubPath(words); ok {
+			if resolvedPath, resolved := config.ResolveConsumedSetPathTokens(subPath); resolved {
+				subPath = resolvedPath
+			}
 			schemaCompletions := config.CompleteSetPathWithValues(subPath, cc.cli.valueProvider)
 			if schemaCompletions != nil {
 				for _, sc := range schemaCompletions {
@@ -367,18 +369,24 @@ func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
 
 func (c *CLI) completeConfigWithDesc(words []string, partial string) []completionCandidate {
 	if len(words) == 0 {
-		var candidates []completionCandidate
-		for name, node := range configTopLevel {
-			if strings.HasPrefix(name, partial) {
-				candidates = append(candidates, completionCandidate{name: name, desc: node.Desc})
-			}
-		}
-		return candidates
+		return filterTreeCandidates(configTopLevel, partial)
 	}
 
-	switch words[0] {
+	resolvedTop, ok := resolveUniqueTreePrefix(configTopLevel, words[0])
+	if !ok {
+		if len(words) == 1 {
+			return filterTreeCandidates(configTopLevel, words[0])
+		}
+		return nil
+	}
+
+	switch resolvedTop {
 	case "set", "delete", "show", "edit":
-		schemaCompletions := config.CompleteSetPathWithValues(words[1:], c.valueProvider)
+		pathWords := words[1:]
+		if resolvedPath, resolved := config.ResolveConsumedSetPathTokens(pathWords); resolved {
+			pathWords = resolvedPath
+		}
+		schemaCompletions := config.CompleteSetPathWithValues(pathWords, c.valueProvider)
 		if schemaCompletions == nil {
 			return nil
 		}
@@ -395,7 +403,7 @@ func (c *CLI) completeConfigWithDesc(words []string, partial string) []completio
 
 	case "commit", "load":
 		if len(words) == 1 {
-			node := configTopLevel[words[0]]
+			node := configTopLevel[resolvedTop]
 			if node == nil || node.Children == nil {
 				return nil
 			}
@@ -509,8 +517,10 @@ func (c *CLI) Run() error {
 				candidates = c.completeConfigWithDesc(words, partial)
 			} else {
 				// "show configuration <path>" — delegate sub-path to config schema
-				if len(words) >= 2 && words[0] == "show" && words[1] == "configuration" {
-					subPath := words[2:]
+				if subPath, ok := showConfigurationSubPath(words); ok {
+					if resolvedPath, resolved := config.ResolveConsumedSetPathTokens(subPath); resolved {
+						subPath = resolvedPath
+					}
 					schemaCompletions := config.CompleteSetPathWithValues(subPath, c.valueProvider)
 					if schemaCompletions != nil {
 						for _, sc := range schemaCompletions {

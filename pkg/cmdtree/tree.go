@@ -924,6 +924,32 @@ func findPlaceholder(tree map[string]*Node) *Node {
 	return nil
 }
 
+// ResolveUniquePrefix returns the exact item, or a uniquely matching prefix.
+func ResolveUniquePrefix(items []string, input string) (string, bool) {
+	for _, item := range items {
+		if item == input {
+			return item, true
+		}
+	}
+	matches := FilterPrefix(items, input)
+	if len(matches) != 1 {
+		return "", false
+	}
+	return matches[0], true
+}
+
+func resolveTreeWord(tree map[string]*Node, word string) (string, *Node, []string, bool) {
+	if node, ok := tree[word]; ok {
+		return word, node, nil, true
+	}
+	matches := FilterPrefix(KeysOf(tree), word)
+	if len(matches) == 1 {
+		name := matches[0]
+		return name, tree[name], matches, true
+	}
+	return "", nil, matches, false
+}
+
 // CompleteFromTree walks the tree to find completion candidates for the given words and partial.
 func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg *config.Config) []string {
 	current := tree
@@ -931,7 +957,7 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 	dynamicConsumed := false
 	for wi, w := range words {
 		dynamicConsumed = false
-		node, ok := current[w]
+		_, node, matches, ok := resolveTreeWord(current, w)
 		if !ok {
 			if currentNode != nil && currentNode.HasDynamic() {
 				dynamicConsumed = true
@@ -950,6 +976,9 @@ func CompleteFromTree(tree map[string]*Node, words []string, partial string, cfg
 				}
 				dynamicConsumed = true
 				continue
+			}
+			if wi == len(words)-1 && len(matches) > 0 {
+				return matches
 			}
 			return nil
 		}
@@ -980,7 +1009,7 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 	dynamicConsumed := false
 	for wi, w := range words {
 		dynamicConsumed = false
-		node, ok := current[w]
+		_, node, matches, ok := resolveTreeWord(current, w)
 		if !ok {
 			if currentNode != nil && currentNode.HasDynamic() {
 				dynamicConsumed = true
@@ -994,6 +1023,13 @@ func CompleteFromTreeWithDesc(tree map[string]*Node, words []string, partial str
 				}
 				dynamicConsumed = true
 				continue
+			}
+			if wi == len(words)-1 && len(matches) > 0 {
+				var candidates []Candidate
+				for _, name := range matches {
+					candidates = append(candidates, Candidate{Name: name, Desc: current[name].Desc})
+				}
+				return candidates
 			}
 			return nil
 		}
@@ -1044,12 +1080,16 @@ func LookupDesc(words []string, name string, configMode bool) string {
 			}
 			return ""
 		}
-		if words[0] == "run" {
+		resolvedTop, ok := ResolveUniquePrefix(KeysFromTree(ConfigTopLevel), words[0])
+		if !ok {
+			return ""
+		}
+		if resolvedTop == "run" {
 			tree = OperationalTree
 			words = words[1:]
 		} else {
 			// Walk config top-level children (e.g. "commit" → "check")
-			node, ok := ConfigTopLevel[words[0]]
+			node, ok := ConfigTopLevel[resolvedTop]
 			if !ok {
 				return ""
 			}
@@ -1057,7 +1097,7 @@ func LookupDesc(words []string, name string, configMode bool) string {
 				if node.Children == nil {
 					return ""
 				}
-				node, ok = node.Children[w]
+				_, node, _, ok = resolveTreeWord(node.Children, w)
 				if !ok {
 					return ""
 				}
@@ -1077,7 +1117,7 @@ func LookupDesc(words []string, name string, configMode bool) string {
 	current := tree
 	var currentNode *Node
 	for _, w := range words {
-		node, ok := current[w]
+		_, node, _, ok := resolveTreeWord(current, w)
 		if !ok {
 			// Dynamic value — skip but stay at same children level.
 			if currentNode != nil && currentNode.HasDynamic() {

@@ -65,6 +65,39 @@ func treeHelpCandidates(tree map[string]*completionNode) []completionCandidate {
 	return candidates
 }
 
+func filterTreeCandidates(tree map[string]*completionNode, prefix string) []completionCandidate {
+	candidates := make([]completionCandidate, 0, len(tree))
+	for name, node := range tree {
+		if prefix == "" || strings.HasPrefix(name, prefix) {
+			candidates = append(candidates, completionCandidate{name: name, desc: node.Desc})
+		}
+	}
+	return candidates
+}
+
+func resolveUniqueTreePrefix(tree map[string]*completionNode, input string) (string, bool) {
+	return cmdtree.ResolveUniquePrefix(keysFromTree(tree), input)
+}
+
+func showConfigurationSubPath(words []string) ([]string, bool) {
+	if len(words) < 2 {
+		return nil, false
+	}
+	show, ok := resolveUniqueTreePrefix(operationalTree, words[0])
+	if !ok || show != "show" {
+		return nil, false
+	}
+	showNode := operationalTree[show]
+	if showNode == nil || showNode.Children == nil {
+		return nil, false
+	}
+	conf, ok := resolveUniqueTreePrefix(showNode.Children, words[1])
+	if !ok || conf != "configuration" {
+		return nil, false
+	}
+	return words[2:], true
+}
+
 // commonPrefix returns the longest shared prefix among the given strings.
 func commonPrefix(items []string) string {
 	return cmdtree.CommonPrefix(items)
