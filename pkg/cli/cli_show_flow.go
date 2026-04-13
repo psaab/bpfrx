@@ -2,14 +2,66 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"sort"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/psaab/bpfrx/pkg/appid"
 	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/dataplane"
 )
+
+type sessionBriefRow struct {
+	ID          uint64
+	Source      string
+	Destination string
+	Proto       string
+	Zone        string
+	NAT         string
+	State       string
+	Age         uint64
+	FwdPackets  uint64
+	RevPackets  uint64
+}
+
+func newSessionBriefWriter(w io.Writer) *tabwriter.Writer {
+	return tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+}
+
+func flushSessionBriefWriter(w *tabwriter.Writer) {
+	if w != nil {
+		_ = w.Flush()
+	}
+}
+
+func printSessionBriefHeader(w io.Writer) {
+	fmt.Fprintln(w, "ID\tSource\tDestination\tProto\tZone\tNAT\tState\tAge\tPkts(f/r)")
+}
+
+func printSessionBriefRow(w io.Writer, row sessionBriefRow) {
+	fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%d/%d\n",
+		row.ID,
+		row.Source,
+		row.Destination,
+		row.Proto,
+		row.Zone,
+		row.NAT,
+		row.State,
+		row.Age,
+		row.FwdPackets,
+		row.RevPackets)
+}
+
+func formatSessionBriefEndpoint(addr string, port uint16) string {
+	ip := net.ParseIP(addr)
+	if ip != nil && ip.To4() == nil {
+		return fmt.Sprintf("[%s]:%d", addr, port)
+	}
+	return fmt.Sprintf("%s:%d", addr, port)
+}
 
 func (c *CLI) showStatistics(detail bool) error {
 	if c.dp == nil || !c.dp.IsLoaded() {
@@ -145,9 +197,10 @@ func (c *CLI) showFlowSession(args []string) error {
 		byZonePair = make(map[string]int)
 	}
 
+	var briefWriter *tabwriter.Writer
 	if f.brief {
-		fmt.Printf("%-5s %-22s %-22s %-5s %-20s %-3s %-5s %5s %s\n",
-			"ID", "Source", "Destination", "Proto", "Zone", "NAT", "State", "Age", "Pkts(f/r)")
+		briefWriter = newSessionBriefWriter(os.Stdout)
+		printSessionBriefHeader(briefWriter)
 	}
 
 	// Build reverse zone ID → name map, policy name map, and zone→interface map
@@ -213,7 +266,7 @@ func (c *CLI) showFlowSession(args []string) error {
 		}
 
 		if f.brief {
-			natFlag := " "
+			natFlag := "-"
 			if val.Flags&dataplane.SessFlagSNAT != 0 {
 				natFlag = "S"
 			}
@@ -227,13 +280,18 @@ func (c *CLI) showFlowSession(args []string) error {
 			if now > val.Created {
 				age = now - val.Created
 			}
-			fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
-				sid,
-				fmt.Sprintf("%s:%d", srcIP, srcPort),
-				fmt.Sprintf("%s:%d", dstIP, dstPort),
-				protoName, inZone+"->"+outZone, natFlag,
-				stateName[:min(5, len(stateName))], age,
-				val.FwdPackets, val.RevPackets)
+			printSessionBriefRow(briefWriter, sessionBriefRow{
+				ID:          sid,
+				Source:      formatSessionBriefEndpoint(srcIP.String(), srcPort),
+				Destination: formatSessionBriefEndpoint(dstIP.String(), dstPort),
+				Proto:       protoName,
+				Zone:        inZone + "->" + outZone,
+				NAT:         natFlag,
+				State:       stateName[:min(5, len(stateName))],
+				Age:         age,
+				FwdPackets:  val.FwdPackets,
+				RevPackets:  val.RevPackets,
+			})
 			return
 		}
 
@@ -342,7 +400,7 @@ func (c *CLI) showFlowSession(args []string) error {
 		}
 
 		if f.brief {
-			natFlag := " "
+			natFlag := "-"
 			if val.Flags&dataplane.SessFlagSNAT != 0 {
 				natFlag = "S"
 			}
@@ -356,13 +414,18 @@ func (c *CLI) showFlowSession(args []string) error {
 			if now > val.Created {
 				age = now - val.Created
 			}
-			fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
-				sid,
-				fmt.Sprintf("[%s]:%d", srcIP, srcPort),
-				fmt.Sprintf("[%s]:%d", dstIP, dstPort),
-				protoName, inZone+"->"+outZone, natFlag,
-				stateName[:min(5, len(stateName))], age,
-				val.FwdPackets, val.RevPackets)
+			printSessionBriefRow(briefWriter, sessionBriefRow{
+				ID:          sid,
+				Source:      formatSessionBriefEndpoint(srcIP.String(), srcPort),
+				Destination: formatSessionBriefEndpoint(dstIP.String(), dstPort),
+				Proto:       protoName,
+				Zone:        inZone + "->" + outZone,
+				NAT:         natFlag,
+				State:       stateName[:min(5, len(stateName))],
+				Age:         age,
+				FwdPackets:  val.FwdPackets,
+				RevPackets:  val.RevPackets,
+			})
 			return
 		}
 
@@ -447,6 +510,8 @@ func (c *CLI) showFlowSession(args []string) error {
 		return fmt.Errorf("iterate sessions_v6: %w", err)
 	}
 
+	flushSessionBriefWriter(briefWriter)
+
 	if f.summary {
 		// In cluster mode, print dual-node Junos-style output.
 		if c.cluster != nil {
@@ -527,8 +592,8 @@ func (c *CLI) showFlowSession(args []string) error {
 			fmt.Printf("node%d:\n", peerResp.NodeId)
 			fmt.Println("--------------------------------------------------------------------------")
 			if f.brief {
-				fmt.Printf("%-5s %-22s %-22s %-5s %-20s %-3s %-5s %5s %s\n",
-					"ID", "Source", "Destination", "Proto", "Zone", "NAT", "State", "Age", "Pkts(f/r)")
+				peerBriefWriter := newSessionBriefWriter(os.Stdout)
+				printSessionBriefHeader(peerBriefWriter)
 				for i, se := range peerResp.Sessions {
 					inZone := se.IngressZoneName
 					if inZone == "" {
@@ -538,7 +603,7 @@ func (c *CLI) showFlowSession(args []string) error {
 					if outZone == "" {
 						outZone = fmt.Sprintf("%d", se.EgressZone)
 					}
-					natFlag := " "
+					natFlag := "-"
 					if se.Nat != "" {
 						if strings.Contains(se.Nat, "SNAT") {
 							natFlag = "S"
@@ -555,14 +620,24 @@ func (c *CLI) showFlowSession(args []string) error {
 					if peerSID == 0 {
 						peerSID = uint64(i + 1)
 					}
-					fmt.Printf("%-5d %-22s %-22s %-5s %-20s %-3s %-5s %5d %d/%d\n",
-						peerSID,
-						fmt.Sprintf("%s:%d", se.SrcAddr, se.SrcPort),
-						fmt.Sprintf("%s:%d", se.DstAddr, se.DstPort),
-						se.Protocol, inZone+"->"+outZone, natFlag,
-						st, se.AgeSeconds,
-						se.FwdPackets, se.RevPackets)
+					age := uint64(0)
+					if se.AgeSeconds > 0 {
+						age = uint64(se.AgeSeconds)
+					}
+					printSessionBriefRow(peerBriefWriter, sessionBriefRow{
+						ID:          peerSID,
+						Source:      formatSessionBriefEndpoint(se.SrcAddr, uint16(se.SrcPort)),
+						Destination: formatSessionBriefEndpoint(se.DstAddr, uint16(se.DstPort)),
+						Proto:       se.Protocol,
+						Zone:        inZone + "->" + outZone,
+						NAT:         natFlag,
+						State:       st,
+						Age:         age,
+						FwdPackets:  se.FwdPackets,
+						RevPackets:  se.RevPackets,
+					})
 				}
+				flushSessionBriefWriter(peerBriefWriter)
 			} else {
 				for i, se := range peerResp.Sessions {
 					polDisplay := se.PolicyName
