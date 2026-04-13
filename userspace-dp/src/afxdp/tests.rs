@@ -1,6 +1,9 @@
 use super::test_fixtures::*;
 use super::*;
-use crate::{InterfaceAddressSnapshot, SourceNATRuleSnapshot, StaticNATRuleSnapshot};
+use crate::{
+    DestinationNATRuleSnapshot, InterfaceAddressSnapshot, PolicyRuleSnapshot,
+    SourceNATRuleSnapshot, StaticNATRuleSnapshot,
+};
 
 #[test]
 fn mlx5_keeps_umem_owner_bind_strategy() {
@@ -816,6 +819,87 @@ fn static_nat_v6_dnat_and_snat() {
         snat.unwrap().rewrite_src,
         Some("2001:db8::10".parse::<IpAddr>().unwrap())
     );
+}
+
+#[test]
+fn post_dnat_source_nat_matches_translated_destination() {
+    let mut snapshot = nat_snapshot();
+    snapshot.source_nat_rules = vec![SourceNATRuleSnapshot {
+        name: "twice-snat".to_string(),
+        from_zone: "wan".to_string(),
+        to_zone: "lan".to_string(),
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        destination_addresses: vec!["10.0.61.102/32".to_string()],
+        interface_mode: true,
+        ..Default::default()
+    }];
+    snapshot.destination_nat_rules = vec![DestinationNATRuleSnapshot {
+        name: "web-dnat".to_string(),
+        from_zone: "wan".to_string(),
+        destination_address: "172.16.80.8".to_string(),
+        destination_port: 443,
+        protocol: "tcp".to_string(),
+        pool_address: "10.0.61.102".to_string(),
+        pool_port: 8443,
+    }];
+    snapshot.policies.push(PolicyRuleSnapshot {
+        name: "allow-inbound".to_string(),
+        from_zone: "wan".to_string(),
+        to_zone: "lan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec!["any".to_string()],
+        application_terms: Vec::new(),
+        action: "permit".to_string(),
+    });
+
+    let state = build_forwarding_state(&snapshot);
+    assert!(
+        state
+            .local_v4
+            .contains(&"172.16.80.8".parse::<Ipv4Addr>().unwrap())
+    );
+
+    let flow = SessionFlow {
+        src_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            src_port: 54321,
+            dst_port: 443,
+        },
+    };
+    let dnat = state
+        .dnat_table
+        .lookup(PROTO_TCP, flow.dst_ip, 443, "wan")
+        .expect("dnat");
+    assert_eq!(
+        dnat.rewrite_dst,
+        Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)))
+    );
+    assert_eq!(dnat.rewrite_dst_port, Some(8443));
+
+    let translated_flow = flow.with_destination(dnat.rewrite_dst.unwrap());
+    let snat = match_source_nat_for_flow(&state, "wan", "lan", 24, &translated_flow)
+        .expect("snat after dnat");
+    assert_eq!(
+        snat.rewrite_src,
+        Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)))
+    );
+
+    let merged = dnat.merge(snat);
+    assert_eq!(
+        merged.rewrite_src,
+        Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 1)))
+    );
+    assert_eq!(
+        merged.rewrite_dst,
+        Some(IpAddr::V4(Ipv4Addr::new(10, 0, 61, 102)))
+    );
+    assert_eq!(merged.rewrite_dst_port, Some(8443));
 }
 
 #[test]

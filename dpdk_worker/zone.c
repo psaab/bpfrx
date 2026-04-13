@@ -106,16 +106,26 @@ skip_ingress_zone:
 				.protocol = meta->protocol,
 				.dst_ip = meta->dst_ip.v4,
 				.dst_port = meta->dst_port,
+				.from_zone = meta->ingress_zone,
 			};
 			int dpos = rte_hash_lookup(ctx->shm->dnat_table, &dk);
+			if (dpos < 0) {
+				dk.from_zone = 0;
+				dpos = rte_hash_lookup(ctx->shm->dnat_table, &dk);
+			}
 			/* Fallback: wildcard port (port=0) for IP-only DNAT rules */
 			if (dpos < 0) {
 				struct dnat_key dk_wild = {
 					.protocol = meta->protocol,
 					.dst_ip = meta->dst_ip.v4,
 					.dst_port = 0,
+					.from_zone = meta->ingress_zone,
 				};
 				dpos = rte_hash_lookup(ctx->shm->dnat_table, &dk_wild);
+				if (dpos < 0) {
+					dk_wild.from_zone = 0;
+					dpos = rte_hash_lookup(ctx->shm->dnat_table, &dk_wild);
+				}
 			}
 			if (dpos >= 0) {
 				struct dnat_value *dv = &ctx->shm->dnat_values[dpos];
@@ -152,17 +162,31 @@ skip_ingress_zone:
 
 		/* DNAT v6 table lookup */
 		if (ctx->shm->dnat_table_v6 && ctx->shm->dnat_values_v6) {
-			struct dnat_key_v6 dk6 = { .protocol = meta->protocol };
+			struct dnat_key_v6 dk6 = {
+				.protocol = meta->protocol,
+				.from_zone = meta->ingress_zone,
+			};
 			memcpy(dk6.dst_ip, meta->dst_ip.v6, 16);
 			dk6.dst_port = meta->dst_port;
 
 			int dpos = rte_hash_lookup(ctx->shm->dnat_table_v6, &dk6);
+			if (dpos < 0) {
+				dk6.from_zone = 0;
+				dpos = rte_hash_lookup(ctx->shm->dnat_table_v6, &dk6);
+			}
 			/* Fallback: wildcard port */
 			if (dpos < 0) {
-				struct dnat_key_v6 dk6_wild = { .protocol = meta->protocol };
+				struct dnat_key_v6 dk6_wild = {
+					.protocol = meta->protocol,
+					.from_zone = meta->ingress_zone,
+				};
 				memcpy(dk6_wild.dst_ip, meta->dst_ip.v6, 16);
 				dk6_wild.dst_port = 0;
 				dpos = rte_hash_lookup(ctx->shm->dnat_table_v6, &dk6_wild);
+				if (dpos < 0) {
+					dk6_wild.from_zone = 0;
+					dpos = rte_hash_lookup(ctx->shm->dnat_table_v6, &dk6_wild);
+				}
 			}
 			if (dpos >= 0) {
 				struct dnat_value_v6 *dv6 = &ctx->shm->dnat_values_v6[dpos];

@@ -1150,6 +1150,7 @@ func (m *Manager) ClearAllSessions() (int, int, error) {
 				Protocol: key.Protocol,
 				DstIP:    val.NATSrcIP,
 				DstPort:  val.NATSrcPort,
+				FromZone: 0,
 			})
 		}
 		return true
@@ -1177,6 +1178,7 @@ func (m *Manager) ClearAllSessions() (int, int, error) {
 				Protocol: key.Protocol,
 				DstIP:    val.NATSrcIP,
 				DstPort:  val.NATSrcPort,
+				FromZone: 0,
 			})
 		}
 		return true
@@ -1993,7 +1995,7 @@ func (m *Manager) ZeroStaleFilterConfigs(startID uint32) {
 func (m *Manager) StartFIBSync(_ context.Context) {}
 
 func (m *Manager) NotifyLinkCycle() {} // no-op: eBPF programs survive link cycles
-func (m *Manager) SyncFabricState()  {} // no-op: eBPF uses fabric_fwd BPF map directly
+func (m *Manager) SyncFabricState() {} // no-op: eBPF uses fabric_fwd BPF map directly
 
 func (m *Manager) BumpFIBGeneration() uint32 {
 	zm, ok := m.maps["fib_gen_map"]

@@ -1206,6 +1206,7 @@ fn poll_binding(
                                     meta.protocol,
                                     resolution_target,
                                     flow.forward_key.dst_port,
+                                    ingress_zone_name,
                                 )
                             } else {
                                 None
@@ -1656,11 +1657,13 @@ fn poll_binding(
                                         // Check NPTv6 outbound, then static NAT SNAT, then interface SNAT.
                                         // Use merge() to combine with any pre-routing DNAT
                                         // decision rather than overwriting it.
+                                        let nat_match_flow =
+                                            flow.with_destination(effective_resolution_target);
                                         if decision.nat.rewrite_dst.is_none() {
                                             // Try NPTv6 outbound: if src matches an internal prefix,
                                             // translate to external prefix (stateless, no L4 csum update).
                                             let nptv6_snat = if let IpAddr::V6(mut src_v6) =
-                                                flow.src_ip
+                                                nat_match_flow.src_ip
                                             {
                                                 if forwarding.nptv6.translate_outbound(&mut src_v6)
                                                 {
@@ -1679,9 +1682,10 @@ fn poll_binding(
                                             };
                                             decision.nat = nptv6_snat
                                                 .or_else(|| {
-                                                    forwarding
-                                                        .static_nat
-                                                        .match_snat(flow.src_ip, &from_zone)
+                                                    forwarding.static_nat.match_snat(
+                                                        nat_match_flow.src_ip,
+                                                        &from_zone,
+                                                    )
                                                 })
                                                 .or_else(|| {
                                                     match_source_nat_for_flow(
@@ -1689,21 +1693,21 @@ fn poll_binding(
                                                         &from_zone,
                                                         &to_zone,
                                                         decision.resolution.egress_ifindex,
-                                                        flow,
+                                                        &nat_match_flow,
                                                     )
                                                 })
                                                 .unwrap_or_default();
                                         } else {
                                             let snat_decision = forwarding
                                                 .static_nat
-                                                .match_snat(flow.src_ip, &from_zone)
+                                                .match_snat(nat_match_flow.src_ip, &from_zone)
                                                 .or_else(|| {
                                                     match_source_nat_for_flow(
                                                         forwarding,
                                                         &from_zone,
                                                         &to_zone,
                                                         decision.resolution.egress_ifindex,
-                                                        flow,
+                                                        &nat_match_flow,
                                                     )
                                                 })
                                                 .unwrap_or_default();
@@ -2534,31 +2538,34 @@ fn poll_binding(
                                         flow.forward_key.src_port,
                                         flow.forward_key.dst_port,
                                     ) {
+                                        let nat_match_flow = flow.with_destination(
+                                            pending_decision.nat.rewrite_dst.unwrap_or(flow.dst_ip),
+                                        );
                                         if pending_decision.nat.rewrite_dst.is_none() {
                                             pending_decision.nat = forwarding
                                                 .static_nat
-                                                .match_snat(flow.src_ip, &from_zone)
+                                                .match_snat(nat_match_flow.src_ip, &from_zone)
                                                 .or_else(|| {
                                                     match_source_nat_for_flow(
                                                         forwarding,
                                                         &from_zone,
                                                         &to_zone,
                                                         pending_decision.resolution.egress_ifindex,
-                                                        flow,
+                                                        &nat_match_flow,
                                                     )
                                                 })
                                                 .unwrap_or_default();
                                         } else {
                                             let snat_decision = forwarding
                                                 .static_nat
-                                                .match_snat(flow.src_ip, &from_zone)
+                                                .match_snat(nat_match_flow.src_ip, &from_zone)
                                                 .or_else(|| {
                                                     match_source_nat_for_flow(
                                                         forwarding,
                                                         &from_zone,
                                                         &to_zone,
                                                         pending_decision.resolution.egress_ifindex,
-                                                        flow,
+                                                        &nat_match_flow,
                                                     )
                                                 })
                                                 .unwrap_or_default();

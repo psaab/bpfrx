@@ -1129,8 +1129,13 @@ zone_resolved:
 			.protocol = meta->protocol,
 			.dst_ip   = meta->dst_ip.v4,
 			.dst_port = meta->dst_port,
+			.from_zone = meta->ingress_zone,
 		};
 		struct dnat_value *dv = bpf_map_lookup_elem(&dnat_table, &dk);
+		if (!dv) {
+			dk.from_zone = 0;
+			dv = bpf_map_lookup_elem(&dnat_table, &dk);
+		}
 		/* Fallback: try wildcard port (port=0) for IP-only DNAT rules.
 		 * Skip when dst_port is already 0 — the lookup would be
 		 * identical to the one that just failed. */
@@ -1139,8 +1144,13 @@ zone_resolved:
 				.protocol = meta->protocol,
 				.dst_ip   = meta->dst_ip.v4,
 				.dst_port = 0,
+				.from_zone = meta->ingress_zone,
 			};
 			dv = bpf_map_lookup_elem(&dnat_table, &dk_wild);
+			if (!dv) {
+				dk_wild.from_zone = 0;
+				dv = bpf_map_lookup_elem(&dnat_table, &dk_wild);
+			}
 		}
 		if (dv) {
 			meta->nat_dst_ip.v4 = meta->dst_ip.v4;
@@ -1168,18 +1178,32 @@ zone_resolved:
 			}
 		}
 	} else {
-		struct dnat_key_v6 dk6 = { .protocol = meta->protocol };
+		struct dnat_key_v6 dk6 = {
+			.protocol = meta->protocol,
+			.from_zone = meta->ingress_zone,
+		};
 		__builtin_memcpy(dk6.dst_ip, meta->dst_ip.v6, 16);
 		dk6.dst_port = meta->dst_port;
 
 		struct dnat_value_v6 *dv6 = bpf_map_lookup_elem(&dnat_table_v6, &dk6);
+		if (!dv6) {
+			dk6.from_zone = 0;
+			dv6 = bpf_map_lookup_elem(&dnat_table_v6, &dk6);
+		}
 		/* Fallback: try wildcard port (port=0) for IP-only DNAT rules.
 		 * Skip when dst_port is already 0. */
 		if (!dv6 && meta->dst_port != 0) {
-			struct dnat_key_v6 dk6_wild = { .protocol = meta->protocol };
+			struct dnat_key_v6 dk6_wild = {
+				.protocol = meta->protocol,
+				.from_zone = meta->ingress_zone,
+			};
 			__builtin_memcpy(dk6_wild.dst_ip, meta->dst_ip.v6, 16);
 			dk6_wild.dst_port = 0;
 			dv6 = bpf_map_lookup_elem(&dnat_table_v6, &dk6_wild);
+			if (!dv6) {
+				dk6_wild.from_zone = 0;
+				dv6 = bpf_map_lookup_elem(&dnat_table_v6, &dk6_wild);
+			}
 		}
 		if (dv6) {
 			__builtin_memcpy(meta->nat_dst_ip.v6, meta->dst_ip.v6, 16);

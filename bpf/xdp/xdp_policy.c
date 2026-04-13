@@ -1424,6 +1424,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 								.protocol = meta->protocol,
 								.dst_ip   = alloc_ip,
 								.dst_port = alloc_port,
+								.from_zone = 0,
 							};
 							struct dnat_value dv = {
 								.new_dst_ip   = orig_src_ip,
@@ -1469,6 +1470,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 							.protocol = meta->protocol,
 							.dst_ip   = sess_nat_src_ip,
 							.dst_port = sess_nat_src_port,
+							.from_zone = 0,
 						};
 						bpf_map_delete_elem(&dnat_table, &dk);
 					}
@@ -1741,6 +1743,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 							struct dnat_key_v6 dk6 = {
 								.protocol = meta->protocol,
 								.dst_port = alloc_port,
+								.from_zone = 0,
 							};
 							__builtin_memcpy(dk6.dst_ip, meta->nat_src_ip.v6, 16);
 							struct dnat_value_v6 dv6 = {
@@ -1790,6 +1793,7 @@ int xdp_policy_prog(struct xdp_md *ctx)
 						struct dnat_key_v6 dk6 = {
 							.protocol = meta->protocol,
 							.dst_port = sess_nat_src_port,
+							.from_zone = 0,
 						};
 						__builtin_memcpy(dk6.dst_ip, meta->nat_src_ip.v6, 16);
 						bpf_map_delete_elem(&dnat_table_v6, &dk6);

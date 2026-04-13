@@ -455,15 +455,15 @@ struct {
  * NAT tables (IPv4)
  * ============================================================ */
 
-/* Pre-routing NAT table: (proto, dst_ip, dst_port) -> new destination.
- * Used for both static DNAT entries (from config) and dynamic SNAT
- * return entries (created by xdp_policy when SNAT session is established). */
+/* Pre-routing NAT table: (proto, dst_ip, dst_port, from_zone) -> new destination.
+ * Static DNAT config entries use the configured ingress zone. Dynamic SNAT
+ * return entries use from_zone=0 as a wildcard. */
 struct dnat_key {
 	__u8   protocol;
 	__u8   pad[3];
 	__be32 dst_ip;
 	__be16 dst_port;
-	__be16 pad2;
+	__u16  from_zone;
 };
 
 struct dnat_value {
@@ -533,7 +533,7 @@ struct dnat_key_v6 {
 	__u8   pad[3];
 	__u8   dst_ip[16];
 	__be16 dst_port;
-	__be16 pad2;
+	__u16  from_zone;
 };
 
 struct dnat_value_v6 {

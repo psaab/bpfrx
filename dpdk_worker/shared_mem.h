@@ -437,7 +437,7 @@ struct dnat_key {
 	uint8_t  pad[3];
 	uint32_t dst_ip;
 	uint16_t dst_port;
-	uint16_t pad2;
+	uint16_t from_zone;
 };
 
 struct dnat_value {
@@ -452,7 +452,7 @@ struct dnat_key_v6 {
 	uint8_t  pad[3];
 	uint8_t  dst_ip[16];
 	uint16_t dst_port;
-	uint16_t pad2;
+	uint16_t from_zone;
 };
 
 struct dnat_value_v6 {

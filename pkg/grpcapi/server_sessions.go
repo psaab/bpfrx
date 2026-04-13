@@ -905,16 +905,18 @@ func sessionEntryV4(key dataplane.SessionKey, val dataplane.SessionValue, now ui
 	if val.LastSeen > 0 && now > val.LastSeen {
 		se.IdleSeconds = int64(now - val.LastSeen)
 	}
+	var natParts []string
 	if val.Flags&dataplane.SessFlagSNAT != 0 {
-		se.Nat = fmt.Sprintf("SNAT %s:%d", uint32ToIP(val.NATSrcIP), ntohs(val.NATSrcPort))
+		natParts = append(natParts, fmt.Sprintf("SNAT %s:%d", uint32ToIP(val.NATSrcIP), ntohs(val.NATSrcPort)))
 		se.NatSrcAddr = uint32ToIP(val.NATSrcIP).String()
 		se.NatSrcPort = uint32(ntohs(val.NATSrcPort))
 	}
 	if val.Flags&dataplane.SessFlagDNAT != 0 {
-		se.Nat = fmt.Sprintf("DNAT %s:%d", uint32ToIP(val.NATDstIP), ntohs(val.NATDstPort))
+		natParts = append(natParts, fmt.Sprintf("DNAT %s:%d", uint32ToIP(val.NATDstIP), ntohs(val.NATDstPort)))
 		se.NatDstAddr = uint32ToIP(val.NATDstIP).String()
 		se.NatDstPort = uint32(ntohs(val.NATDstPort))
 	}
+	se.Nat = strings.Join(natParts, "; ")
 	return se
 }
 
@@ -959,16 +961,18 @@ func sessionEntryV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6, no
 	if val.LastSeen > 0 && now > val.LastSeen {
 		se.IdleSeconds = int64(now - val.LastSeen)
 	}
+	var natParts []string
 	if val.Flags&dataplane.SessFlagSNAT != 0 {
-		se.Nat = fmt.Sprintf("SNAT [%s]:%d", net.IP(val.NATSrcIP[:]).String(), ntohs(val.NATSrcPort))
+		natParts = append(natParts, fmt.Sprintf("SNAT [%s]:%d", net.IP(val.NATSrcIP[:]).String(), ntohs(val.NATSrcPort)))
 		se.NatSrcAddr = net.IP(val.NATSrcIP[:]).String()
 		se.NatSrcPort = uint32(ntohs(val.NATSrcPort))
 	}
 	if val.Flags&dataplane.SessFlagDNAT != 0 {
-		se.Nat = fmt.Sprintf("DNAT [%s]:%d", net.IP(val.NATDstIP[:]).String(), ntohs(val.NATDstPort))
+		natParts = append(natParts, fmt.Sprintf("DNAT [%s]:%d", net.IP(val.NATDstIP[:]).String(), ntohs(val.NATDstPort)))
 		se.NatDstAddr = net.IP(val.NATDstIP[:]).String()
 		se.NatDstPort = uint32(ntohs(val.NATDstPort))
 	}
+	se.Nat = strings.Join(natParts, "; ")
 	return se
 }
 

@@ -519,7 +519,7 @@ type DNATKey struct {
 	Pad      [3]byte
 	DstIP    uint32 // network byte order
 	DstPort  uint16 // network byte order
-	Pad2     uint16
+	FromZone uint16 // 0 = wildcard / dynamic SNAT-return entry
 }
 
 // DNATValue mirrors the C struct dnat_value.
@@ -536,7 +536,7 @@ type DNATKeyV6 struct {
 	Pad      [3]byte
 	DstIP    [16]byte
 	DstPort  uint16 // network byte order
-	Pad2     uint16
+	FromZone uint16 // 0 = wildcard / dynamic SNAT-return entry
 }
 
 // DNATValueV6 mirrors the C struct dnat_value_v6.
