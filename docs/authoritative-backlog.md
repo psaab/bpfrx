@@ -22,9 +22,9 @@ Use these sources in this order when there is disagreement:
 
 Row-level gap totals:
 - Missing: 125
-- Partial: 14
+- Partial: 13
 - Parse-Only: 1
-- Total Open Gaps: 140
+- Total Open Gaps: 139
 
 Category totals:
 
@@ -37,7 +37,7 @@ Category totals:
 | 5. SSL/TLS Inspection | 4 | 0 | 0 | 4 |
 | 6. Advanced Threat Prevention (ATP) | 5 | 1 | 0 | 6 |
 | 7. User/Identity Firewall | 5 | 0 | 0 | 5 |
-| 8. NAT Enhancements | 5 | 1 | 0 | 6 |
+| 8. NAT Enhancements | 5 | 0 | 0 | 5 |
 | 9. Screen/IDS Enhancements | 4 | 2 | 0 | 6 |
 | 10. Security Flow Enhancements | 5 | 0 | 0 | 5 |
 | 11. ALG Enhancements | 9 | 0 | 0 | 9 |
@@ -114,6 +114,10 @@ These are documented as implemented in `docs/phases.md` and should not remain in
   - structured DPD parsing and runtime generation
   - `external-interface` to runtime `local-address` resolution
   - Junos `$9$` PSK decoding
+- Twice NAT parity:
+  - static DNAT now keys on ingress zone with wildcard fallback for SNAT return-path entries across eBPF, DPDK, and userspace
+  - userspace post-DNAT SNAT matching evaluates destination filters against the translated destination
+  - session/gRPC visibility preserves both NAT legs for combined NAT flows
 - Sync known-issues pair below are marked fixed in `docs/bugs.md`:
   - NO_NEIGH failover issue
   - Monotonic clock skew session expiry issue

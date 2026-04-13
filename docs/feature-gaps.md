@@ -13,7 +13,7 @@ Last updated: 2026-04-13
 | SSL/TLS Inspection | 4 | 0 | 0 | 4 |
 | Advanced Threat Prevention | 5 | 1 | 0 | 6 |
 | User/Identity Firewall | 5 | 0 | 0 | 5 |
-| NAT Enhancements | 5 | 1 | 0 | 6 |
+| NAT Enhancements | 5 | 0 | 0 | 5 |
 | Screen/IDS Enhancements | 4 | 2 | 0 | 6 |
 | Security Flow Enhancements | 5 | 0 | 0 | 5 |
 | ALG Enhancements | 9 | 0 | 0 | 9 |
@@ -29,7 +29,7 @@ Last updated: 2026-04-13
 | Interface Enhancements | 1 | 1 | 0 | 2 |
 | System Enhancements | 5 | 0 | 0 | 5 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **125** | **14** | **1** | **140** |
+| **TOTAL** | **125** | **13** | **1** | **139** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -155,7 +155,7 @@ bpfrx has SNAT (interface + pool, address-persistent, source-nat off bypass), DN
 |---------|-------------------|-------------|----------|--------|
 | **Proxy ARP for NAT** | `security nat proxy-arp interface ... address ...` | Auto-reply ARP for NAT pool addresses on same subnet as ingress interface. Required when SNAT pool or DNAT addresses are on same L2 segment. | High | **Done** -- Proxy ARP neighbor entries for NAT addresses with GARP on addition. Config: `set security nat proxy-arp interface <iface> address <addr>` with range support. |
 | **Proxy NDP for NAT** | `security nat proxy-ndp interface ... address ...` | IPv6 equivalent of proxy ARP for NAT64/static NAT addresses | Medium | Missing |
-| **Twice NAT** | Combination of SNAT + DNAT rule-sets matching same traffic | Simultaneous source and destination translation in single flow. bpfrx handles SNAT and DNAT independently but may not combine in same session correctly. | Medium | Partial (separate SNAT/DNAT rules exist but not tested as combined twice-NAT) |
+| **Twice NAT** | Combination of SNAT + DNAT rule-sets matching same traffic | Simultaneous source and destination translation in single flow. | Medium | **Done** -- Combined SNAT+DNAT flows now preserve both translations in one session path. Static DNAT is keyed by ingress zone with wildcard fallback for SNAT return-path entries across eBPF, DPDK, and userspace. Userspace post-DNAT SNAT matching now evaluates destination filters against the translated destination, and session/gRPC visibility preserves both NAT legs. |
 | **DNS ALG with NAT** | `security alg dns enable` | DNS payload rewriting when NAT changes embedded IP addresses (A/AAAA record doctoring) | Medium | Missing |
 | **Overflow Pool** | `security nat source pool ... overflow-pool ...` | Fallback to interface NAT or another pool when primary SNAT pool is exhausted | Low | Missing |
 | **Address Pooling (paired/no-paired)** | `security nat source pool ... address-pooling paired` | Per-pool override of global address-persistent: paired ensures same source always maps to same pool address; no-paired allows round-robin | Low | Missing |
@@ -442,7 +442,7 @@ Features commonly requested in enterprise deployments:
 10. **Remote Access IPsec VPN** - Road-warrior IPsec parity beyond site-to-site tunnels
 11. ~~**Aggressive Session Aging**~~ - **Done** (GC high/low-watermark early-ageout behavior)
 12. **Graceful Restart** - Non-stop routing (FRR already supports)
-13. **Twice NAT** - Complex NAT scenarios
+13. ~~**Twice NAT**~~ - **Done** (zone-aware static DNAT + post-DNAT SNAT matching + both-leg session visibility)
 14. **Transparent Mode (L2)** - Inline transparent firewall deployment
 15. ~~**Link Aggregation (LAG)**~~ - **Done**
 16. **PKI / Certificate-Based IPsec** - Certificate-based VPN authentication
