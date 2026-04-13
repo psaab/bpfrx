@@ -5,6 +5,155 @@ import (
 	"testing"
 )
 
+func TestRPMDefaultsAndValidation(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		input := `services {
+    rpm {
+        probe monitor {
+            test ping-test {
+                target 8.8.8.8;
+            }
+            test tcp-test {
+                probe-type tcp-ping;
+                target 1.1.1.1;
+            }
+        }
+    }
+}
+`
+		parser := NewParser(input)
+		tree, errs := parser.Parse()
+		if len(errs) > 0 {
+			t.Fatalf("parse errors: %v", errs)
+		}
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("compile error: %v", err)
+		}
+
+		pingTest := cfg.Services.RPM.Probes["monitor"].Tests["ping-test"]
+		if got := pingTest.EffectiveProbeType(); got != DefaultRPMProbeType {
+			t.Fatalf("EffectiveProbeType() = %q, want %q", got, DefaultRPMProbeType)
+		}
+		if got := pingTest.EffectiveProbeInterval(); got != DefaultRPMProbeIntervalSeconds {
+			t.Fatalf("EffectiveProbeInterval() = %d, want %d", got, DefaultRPMProbeIntervalSeconds)
+		}
+		if got := pingTest.EffectiveProbeCount(); got != DefaultRPMProbeCount {
+			t.Fatalf("EffectiveProbeCount() = %d, want %d", got, DefaultRPMProbeCount)
+		}
+		if got := pingTest.EffectiveTestInterval(); got != DefaultRPMTestIntervalSeconds {
+			t.Fatalf("EffectiveTestInterval() = %d, want %d", got, DefaultRPMTestIntervalSeconds)
+		}
+		if got := pingTest.EffectiveSuccessiveLossThreshold(); got != DefaultRPMSuccessiveLosses {
+			t.Fatalf("EffectiveSuccessiveLossThreshold() = %d, want %d", got, DefaultRPMSuccessiveLosses)
+		}
+
+		tcpTest := cfg.Services.RPM.Probes["monitor"].Tests["tcp-test"]
+		if got := tcpTest.EffectiveDestinationPort(); got != DefaultRPMTCPDestinationPort {
+			t.Fatalf("EffectiveDestinationPort() = %d, want %d", got, DefaultRPMTCPDestinationPort)
+		}
+	})
+
+	tests := []struct {
+		name    string
+		input   string
+		wantErr string
+	}{
+		{
+			name: "missing target",
+			input: `services {
+    rpm {
+        probe monitor {
+            test ping-test {
+                probe-type icmp-ping;
+            }
+        }
+    }
+}
+`,
+			wantErr: "target is required",
+		},
+		{
+			name: "unsupported probe type",
+			input: `services {
+    rpm {
+        probe monitor {
+            test ping-test {
+                probe-type udp-ping;
+                target 8.8.8.8;
+            }
+        }
+    }
+}
+`,
+			wantErr: "unsupported probe-type",
+		},
+		{
+			name: "invalid numeric value",
+			input: `services {
+    rpm {
+        probe monitor {
+            test ping-test {
+                target 8.8.8.8;
+                probe-count nope;
+            }
+        }
+    }
+}
+`,
+			wantErr: "invalid integer",
+		},
+		{
+			name: "zero probe limit rejected",
+			input: `services {
+    rpm {
+        probe monitor {
+            test ping-test {
+                target 8.8.8.8;
+                probe-limit 0;
+            }
+        }
+    }
+}
+`,
+			wantErr: "must be > 0",
+		},
+		{
+			name: "destination port range validated",
+			input: `services {
+    rpm {
+        probe monitor {
+            test ping-test {
+                probe-type tcp-ping;
+                target 8.8.8.8;
+                destination-port 70000;
+            }
+        }
+    }
+}
+`,
+			wantErr: "1-65535",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			parser := NewParser(tc.input)
+			tree, errs := parser.Parse()
+			if len(errs) > 0 {
+				t.Fatalf("parse errors: %v", errs)
+			}
+			_, err := CompileConfig(tree)
+			if err == nil {
+				t.Fatal("expected compile error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("CompileConfig() error = %v, want substring %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestDynamicAddressFeed(t *testing.T) {
 	input := `security {
     dynamic-address {

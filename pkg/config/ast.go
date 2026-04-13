@@ -1362,13 +1362,21 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 	}},
 	"services": {children: map[string]*schemaNode{
-		"rpm": {children: map[string]*schemaNode{
-			"probe": {args: 1, children: map[string]*schemaNode{
-				"test": {args: 1, children: map[string]*schemaNode{
-					"probe-limit": {args: 1, children: nil},
-					"target": {children: map[string]*schemaNode{
-						"url": {args: 1, children: nil},
+		"rpm": {desc: "Real-time Performance Monitoring probes", children: map[string]*schemaNode{
+			"probe": {args: 1, desc: "RPM probe name", children: map[string]*schemaNode{
+				"test": {args: 1, desc: "RPM test name", children: map[string]*schemaNode{
+					"probe-type":       {args: 1, desc: "Probe type: icmp-ping, tcp-ping, or http-get", children: nil},
+					"target":           {desc: "Target IP, hostname, or URL", wildcard: &schemaNode{placeholder: "<target>", desc: "Target IP, hostname, or URL"}, children: map[string]*schemaNode{"url": {args: 1, desc: "HTTP target URL", children: nil}}},
+					"source-address":   {args: 1, desc: "Source address for the probe", children: nil},
+					"routing-instance": {args: 1, desc: "Routing instance / VRF for the probe", children: nil},
+					"probe-interval":   {args: 1, desc: "Seconds between probes within a test", children: nil},
+					"probe-count":      {args: 1, desc: "Number of probes per test cycle", children: nil},
+					"test-interval":    {args: 1, desc: "Seconds between test cycles", children: nil},
+					"thresholds": {desc: "Failure thresholds for the test", children: map[string]*schemaNode{
+						"successive-loss": {args: 1, desc: "Consecutive losses before marking the test failed", children: nil},
 					}},
+					"probe-limit":      {args: 1, desc: "Maximum failed probes before stopping the current test cycle", children: nil},
+					"destination-port": {args: 1, desc: "Destination TCP port for tcp-ping probes", children: nil},
 				}},
 			}},
 		}},

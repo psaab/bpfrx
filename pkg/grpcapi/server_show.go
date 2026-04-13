@@ -31,6 +31,54 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+func writeRPMConfig(buf *strings.Builder, cfg *config.Config) {
+	if cfg == nil || cfg.Services.RPM == nil || len(cfg.Services.RPM.Probes) == 0 {
+		buf.WriteString("No RPM probes configured\n")
+		return
+	}
+
+	buf.WriteString("RPM Probe Configuration:\n")
+	probeNames := make([]string, 0, len(cfg.Services.RPM.Probes))
+	for name := range cfg.Services.RPM.Probes {
+		probeNames = append(probeNames, name)
+	}
+	sort.Strings(probeNames)
+
+	for _, probeName := range probeNames {
+		probe := cfg.Services.RPM.Probes[probeName]
+		testNames := make([]string, 0, len(probe.Tests))
+		for name := range probe.Tests {
+			testNames = append(testNames, name)
+		}
+		sort.Strings(testNames)
+
+		for _, testName := range testNames {
+			test := probe.Tests[testName]
+			fmt.Fprintf(buf, "  Probe: %s, Test: %s\n", probeName, testName)
+			fmt.Fprintf(buf, "    Type: %s, Target: %s\n", test.EffectiveProbeType(), test.Target)
+			if test.SourceAddress != "" {
+				fmt.Fprintf(buf, "    Source: %s\n", test.SourceAddress)
+			}
+			if test.RoutingInstance != "" {
+				fmt.Fprintf(buf, "    Routing instance: %s\n", test.RoutingInstance)
+			}
+			fmt.Fprintf(buf, "    Probe interval: %ds\n", test.EffectiveProbeInterval())
+			fmt.Fprintf(buf, "    Probe count: %d\n", test.EffectiveProbeCount())
+			fmt.Fprintf(buf, "    Test interval: %ds\n", test.EffectiveTestInterval())
+			fmt.Fprintf(buf, "    Successive loss threshold: %d\n", test.EffectiveSuccessiveLossThreshold())
+			if test.ProbeLimit > 0 {
+				fmt.Fprintf(buf, "    Probe limit: %d\n", test.ProbeLimit)
+			} else {
+				buf.WriteString("    Probe limit: unlimited\n")
+			}
+			if test.EffectiveProbeType() == "tcp-ping" || test.DestPort > 0 {
+				fmt.Fprintf(buf, "    Destination port: %d\n", test.EffectiveDestinationPort())
+			}
+			buf.WriteString("\n")
+		}
+	}
+}
+
 // --- Operational show RPCs ---
 
 func (s *Server) GetStatus(_ context.Context, _ *pb.GetStatusRequest) (*pb.GetStatusResponse, error) {
@@ -3256,13 +3304,9 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 
 	case "rpm":
-		if s.rpmResultsFn == nil {
-			buf.WriteString("RPM probes not available\n")
-		} else {
+		if s.rpmResultsFn != nil {
 			results := s.rpmResultsFn()
-			if len(results) == 0 {
-				buf.WriteString("No RPM probes configured\n")
-			} else {
+			if len(results) > 0 {
 				buf.WriteString("RPM Probe Results:\n")
 				for _, r := range results {
 					fmt.Fprintf(&buf, "  Probe: %s, Test: %s\n", r.ProbeName, r.TestName)
@@ -3286,8 +3330,10 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 						fmt.Fprintf(&buf, "    Last probe: %s\n", r.LastProbeAt.Format("2006-01-02 15:04:05"))
 					}
 				}
+				break
 			}
 		}
+		writeRPMConfig(&buf, s.store.ActiveConfig())
 
 	case "version":
 		ver := s.version

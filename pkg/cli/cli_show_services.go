@@ -6,9 +6,51 @@ import (
 	"strings"
 	"time"
 
+	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/dhcp"
 	"github.com/psaab/bpfrx/pkg/dhcpserver"
 )
+
+func sortedRPMProbeNames(probes map[string]*config.RPMProbe) []string {
+	names := make([]string, 0, len(probes))
+	for name := range probes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedRPMTestNames(tests map[string]*config.RPMTest) []string {
+	names := make([]string, 0, len(tests))
+	for name := range tests {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func showRPMConfiguredProbe(probeName, testName string, test *config.RPMTest) {
+	fmt.Printf("  Probe: %s, Test: %s\n", probeName, testName)
+	fmt.Printf("    Type: %s, Target: %s\n", test.EffectiveProbeType(), test.Target)
+	if test.SourceAddress != "" {
+		fmt.Printf("    Source: %s\n", test.SourceAddress)
+	}
+	if test.RoutingInstance != "" {
+		fmt.Printf("    Routing instance: %s\n", test.RoutingInstance)
+	}
+	fmt.Printf("    Probe interval: %ds\n", test.EffectiveProbeInterval())
+	fmt.Printf("    Probe count: %d\n", test.EffectiveProbeCount())
+	fmt.Printf("    Test interval: %ds\n", test.EffectiveTestInterval())
+	fmt.Printf("    Successive loss threshold: %d\n", test.EffectiveSuccessiveLossThreshold())
+	if test.ProbeLimit > 0 {
+		fmt.Printf("    Probe limit: %d\n", test.ProbeLimit)
+	} else {
+		fmt.Println("    Probe limit: unlimited")
+	}
+	if test.EffectiveProbeType() == "tcp-ping" || test.DestPort > 0 {
+		fmt.Printf("    Destination port: %d\n", test.EffectiveDestinationPort())
+	}
+}
 
 func (c *CLI) showDHCPLeases() error {
 	if c.dhcp == nil {
@@ -241,16 +283,11 @@ func (c *CLI) showRPMProbeResults() error {
 	}
 
 	fmt.Println("RPM Probe Configuration:")
-	for probeName, probe := range cfg.Services.RPM.Probes {
-		for testName, test := range probe.Tests {
-			fmt.Printf("  Probe: %s, Test: %s\n", probeName, testName)
-			fmt.Printf("    Type: %s, Target: %s\n", test.ProbeType, test.Target)
-			if test.SourceAddress != "" {
-				fmt.Printf("    Source: %s\n", test.SourceAddress)
-			}
-			if test.RoutingInstance != "" {
-				fmt.Printf("    Routing instance: %s\n", test.RoutingInstance)
-			}
+	for _, probeName := range sortedRPMProbeNames(cfg.Services.RPM.Probes) {
+		probe := cfg.Services.RPM.Probes[probeName]
+		for _, testName := range sortedRPMTestNames(probe.Tests) {
+			showRPMConfiguredProbe(probeName, testName, probe.Tests[testName])
+			fmt.Println()
 		}
 	}
 	return nil

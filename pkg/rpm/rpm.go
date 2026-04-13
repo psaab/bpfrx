@@ -46,20 +46,20 @@ func vrfDeviceName(ri string) string {
 
 // ProbeResult holds the current state of a single RPM test.
 type ProbeResult struct {
-	ProbeName    string
-	TestName     string
-	ProbeType    string
-	Target       string
-	LastRTT      time.Duration
-	MinRTT       time.Duration
-	MaxRTT       time.Duration
-	AvgRTT       time.Duration
-	Jitter       time.Duration // running absolute deviation from average
-	LastStatus   string        // "pass" or "fail"
-	SuccFail     int           // consecutive failures
-	TotalSent    int64
-	TotalRecv    int64
-	LastProbeAt  time.Time
+	ProbeName   string
+	TestName    string
+	ProbeType   string
+	Target      string
+	LastRTT     time.Duration
+	MinRTT      time.Duration
+	MaxRTT      time.Duration
+	AvgRTT      time.Duration
+	Jitter      time.Duration // running absolute deviation from average
+	LastStatus  string        // "pass" or "fail"
+	SuccFail    int           // consecutive failures
+	TotalSent   int64
+	TotalRecv   int64
+	LastProbeAt time.Time
 }
 
 // Event represents an RPM event for event-options matching.
@@ -122,7 +122,7 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.RPMConfig) {
 			m.results[key] = &ProbeResult{
 				ProbeName:  probe.Name,
 				TestName:   test.Name,
-				ProbeType:  test.ProbeType,
+				ProbeType:  test.EffectiveProbeType(),
 				Target:     test.Target,
 				LastStatus: "unknown",
 			}
@@ -170,29 +170,14 @@ func (m *Manager) Results() []*ProbeResult {
 }
 
 func (m *Manager) runProbeLoop(ctx context.Context, probe *config.RPMProbe, test *config.RPMTest, key string) {
-	interval := time.Duration(test.TestInterval) * time.Second
-	if interval <= 0 {
-		interval = 60 * time.Second
-	}
-
-	probeInterval := time.Duration(test.ProbeInterval) * time.Second
-	if probeInterval <= 0 {
-		probeInterval = 5 * time.Second
-	}
-
-	probeCount := test.ProbeCount
-	if probeCount <= 0 {
-		probeCount = 1
-	}
-
-	threshold := test.ThresholdSuccessive
-	if threshold <= 0 {
-		threshold = 3
-	}
+	interval := time.Duration(test.EffectiveTestInterval()) * time.Second
+	probeInterval := time.Duration(test.EffectiveProbeInterval()) * time.Second
+	probeCount := test.EffectiveProbeCount()
+	threshold := test.EffectiveSuccessiveLossThreshold()
 
 	slog.Info("RPM probe started",
 		"probe", probe.Name, "test", test.Name,
-		"type", test.ProbeType, "target", test.Target,
+		"type", test.EffectiveProbeType(), "target", test.Target,
 		"interval", interval)
 
 	ticker := time.NewTicker(interval)
@@ -294,7 +279,7 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 }
 
 func (m *Manager) executeProbe(ctx context.Context, test *config.RPMTest) (time.Duration, error) {
-	switch test.ProbeType {
+	switch test.EffectiveProbeType() {
 	case "icmp-ping":
 		return m.probeICMP(ctx, test)
 	case "tcp-ping":
@@ -302,7 +287,7 @@ func (m *Manager) executeProbe(ctx context.Context, test *config.RPMTest) (time.
 	case "http-get":
 		return m.probeHTTP(ctx, test)
 	default:
-		return m.probeICMP(ctx, test) // default to ICMP
+		return m.probeICMP(ctx, test)
 	}
 }
 
@@ -328,10 +313,7 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest) (time.Dur
 }
 
 func (m *Manager) probeTCP(ctx context.Context, test *config.RPMTest) (time.Duration, error) {
-	port := test.DestPort
-	if port == 0 {
-		port = 80
-	}
+	port := test.EffectiveDestinationPort()
 	addr := net.JoinHostPort(test.Target, fmt.Sprintf("%d", port))
 	dialer := vrfDialer(5*time.Second, test.SourceAddress, vrfDeviceName(test.RoutingInstance))
 
