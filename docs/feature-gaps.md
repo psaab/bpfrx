@@ -21,7 +21,7 @@ Last updated: 2026-04-13
 | PKI / Certificates | 3 | 1 | 0 | 4 |
 | Routing Enhancements | 10 | 3 | 0 | 13 |
 | VPN Enhancements | 9 | 0 | 0 | 9 |
-| HA Enhancements | 0 | 0 | 0 | 0 |
+| HA Enhancements | 0 | 1 | 0 | 1 |
 | Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
 | QoS / Class of Service | 7 | 1 | 0 | 8 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
@@ -29,7 +29,7 @@ Last updated: 2026-04-13
 | Interface Enhancements | 1 | 1 | 0 | 2 |
 | System Enhancements | 5 | 0 | 0 | 5 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **125** | **13** | **2** | **140** |
+| **TOTAL** | **125** | **14** | **1** | **140** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support

@@ -1,6 +1,6 @@
 # Authoritative Backlog
 
-Date: 2026-03-06
+Date: 2026-04-13
 Status: Active
 
 This document is the canonical backlog snapshot for parity and HA-followup work.
@@ -22,8 +22,8 @@ Use these sources in this order when there is disagreement:
 
 Row-level gap totals:
 - Missing: 125
-- Partial: 13
-- Parse-Only: 2
+- Partial: 14
+- Parse-Only: 1
 - Total Open Gaps: 140
 
 Category totals:
@@ -45,6 +45,7 @@ Category totals:
 | 13. PKI / Certificates | 3 | 1 | 0 | 4 |
 | 14. Routing Enhancements | 10 | 3 | 0 | 13 |
 | 15. VPN Enhancements | 9 | 0 | 0 | 9 |
+| 16. HA Enhancements | 0 | 1 | 0 | 1 |
 | 17. Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
 | 18. QoS / Class of Service | 7 | 1 | 0 | 8 |
 | 19. Multi-Tenancy | 4 | 0 | 0 | 4 |
@@ -77,16 +78,17 @@ From `docs/next-features` and HA proposal docs:
   - Verify PBR overrides VRF routing (TODO)
   - Multi-ISP VRF test (TODO)
 
-### 4) Candidate gaps not tracked in `feature-gaps.md`
+### 4) PDF-backed gaps now tracked in `feature-gaps.md`
 
 After the 2026-04-13 PDF refresh, the previously untracked items from the vSRX
 deployment/user guide are now tracked explicitly in `docs/feature-gaps.md`:
 
 - Junos Telemetry Interface (JTI)
 - AppQoE
+- Remote Access IPsec VPN
 - Cloud-init / metadata user-data bootstrap
 - Bootstrap ISO provisioning
-- Geneve flow infrastructure / AWS GWLB framing
+- Geneve Flow Infrastructure / AWS GWLB
 
 No additional PDF-backed feature families remain untracked from this pass.
 
