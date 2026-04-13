@@ -13,6 +13,9 @@ func TestFormatSessionBriefEndpoint(t *testing.T) {
 	if got, want := formatSessionBriefEndpoint("2001:db8::10", 443), "[2001:db8::10]:443"; got != want {
 		t.Fatalf("formatSessionBriefEndpoint() = %q, want %q", got, want)
 	}
+	if got, want := formatSessionBriefEndpoint("", 443), "-"; got != want {
+		t.Fatalf("formatSessionBriefEndpoint() = %q, want %q", got, want)
+	}
 }
 
 func TestSessionBriefWriterPreservesLongValues(t *testing.T) {
