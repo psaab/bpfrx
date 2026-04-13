@@ -1,13 +1,13 @@
 # bpfrx vs Juniper vSRX Feature Gap Analysis
 
-Last updated: 2026-03-06
+Last updated: 2026-04-13
 
 ## Summary
 
 | Category | Fully Missing | Partially Implemented | Parse-Only | Total Gaps |
 |----------|--------------|----------------------|------------|------------|
 | Security Policies (Unified/Advanced) | 7 | 0 | 1 | 8 |
-| Application Security (AppSecure) | 7 | 1 | 0 | 8 |
+| Application Security (AppSecure) | 8 | 1 | 0 | 9 |
 | IDP/IPS | 8 | 0 | 0 | 8 |
 | Content Security (UTM) | 6 | 0 | 0 | 6 |
 | SSL/TLS Inspection | 4 | 0 | 0 | 4 |
@@ -20,16 +20,16 @@ Last updated: 2026-03-06
 | Security Logging Enhancements | 0 | 0 | 0 | 0 |
 | PKI / Certificates | 3 | 1 | 0 | 4 |
 | Routing Enhancements | 10 | 3 | 0 | 13 |
-| VPN Enhancements | 8 | 0 | 0 | 8 |
+| VPN Enhancements | 9 | 0 | 0 | 9 |
 | HA Enhancements | 0 | 0 | 0 | 0 |
 | Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
 | QoS / Class of Service | 7 | 1 | 0 | 8 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
-| Management & Automation | 9 | 2 | 0 | 11 |
+| Management & Automation | 12 | 2 | 0 | 14 |
 | Interface Enhancements | 1 | 1 | 0 | 2 |
 | System Enhancements | 5 | 0 | 0 | 5 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **120** | **13** | **2** | **135** |
+| **TOTAL** | **125** | **13** | **2** | **140** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -65,6 +65,7 @@ The AppSecure suite is a major differentiator for the vSRX as an NGFW. bpfrx now
 | **Application Tracking (AppTrack)** | `security application-tracking` | Log and report on applications traversing the device. Generates AppTrack log messages per session with app name, bytes, duration. | Medium | Missing |
 | **Application Firewall (AppFW)** | `security application-firewall ...` | (Legacy, replaced by unified policies) Policy enforcement based on detected app identity | Medium | Missing |
 | **Application QoS (AppQoS)** | `class-of-service application-traffic-control` | QoS rate-limiting and marking based on detected application | Medium | Missing |
+| **Application Quality of Experience (AppQoE)** | `N/A (service suite / policy integration)` | Monitor application quality and user experience, correlate application behavior to network quality, and feed optimization / reporting workflows. Called out as part of the vSRX Content Security Bundle feature set. | Low | Missing |
 | **Advanced Policy-Based Routing (APBR)** | `security advance-policy-based-routing profile ...` | Route traffic to different routing instances based on L7 application identity. Profile with rules matching apps/groups to routing-instance. Applied per-zone. | Medium | Missing (bpfrx has filter-based PBR but not L7-aware) |
 | **Application Signature Package** | `request services application-identification download` | Downloadable/updatable signature database, predefined app groups (junos:social-networking, junos:web:streaming, etc.) | Medium | Missing |
 | **Application System Cache** | `services application-identification application-system-cache` | Cache app identification results for faster classification of subsequent connections from same source | Low | Missing |
@@ -276,6 +277,7 @@ bpfrx has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfac
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **SSL VPN / Juniper Secure Connect** | `security remote-access ...` | Client-based SSL VPN for remote access (Windows, Mac, Android, iOS). Web portal login. | Medium | Missing |
+| **Remote Access IPsec VPN** | `security ike / ipsec + remote-access or access-profile workflow` | Road-warrior / client remote-access IPsec VPN distinct from site-to-site tunnels. The deployment guide explicitly calls out remote-access IPsec VPN support in addition to site-to-site. | Medium | Missing |
 | **Dynamic VPN** | `security dynamic-vpn ...` | Simplified IPsec remote access with web-based client provisioning and access profiles | Medium | Missing |
 | **AutoVPN** | `security ike gateway ... dynamic ...` | Auto-provisioned hub-and-spoke IPsec VPN. Hub accepts dynamic spoke connections using DNS names or any. | Medium | Missing |
 | **ADVPN** | `security ipsec vpn ... advpn ...` | Auto Discovery VPN: dynamic spoke-to-spoke tunnels created on demand in hub-and-spoke topology | Low | Missing |
@@ -320,18 +322,18 @@ bpfrx has firewall filters with source/dest addresses, prefix-lists (with except
 
 ## 18. QoS / Class of Service
 
-Note: Class of Service is NOT supported on vSRX according to Juniper documentation. However, some CoS-related features work through firewall filters and forwarding-classes. bpfrx has DSCP matching and rewrite via firewall filters.
+Note: The vSRX deployment guide markets CoS as part of the standard feature set, but the user guide also calls out important CoS limitations on vSRX, such as the lack of high-priority SPC queue support. bpfrx currently has filter-based DSCP and forwarding-class plumbing, but not the fuller classifier/scheduler/shaper model.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Forwarding Classes** | `class-of-service forwarding-classes class ...` | Define custom forwarding class names mapped to queue numbers | Low | Missing (N/A on vSRX) |
-| **Scheduler Maps** | `class-of-service scheduler-maps ...` | Associate forwarding classes with schedulers (bandwidth %, priority, buffer) | Low | Missing (N/A on vSRX) |
-| **Schedulers** | `class-of-service schedulers ...` | Define per-queue scheduling parameters (transmit rate, priority, drop profile) | Low | Missing (N/A on vSRX) |
-| **BA Classifiers** | `class-of-service classifiers dscp ...` | Classify incoming traffic by DSCP/802.1p into forwarding classes and loss priorities | Low | Missing (N/A on vSRX) |
+| **Forwarding Classes** | `class-of-service forwarding-classes class ...` | Define custom forwarding class names mapped to queue numbers | Low | Missing |
+| **Scheduler Maps** | `class-of-service scheduler-maps ...` | Associate forwarding classes with schedulers (bandwidth %, priority, buffer) | Low | Missing |
+| **Schedulers** | `class-of-service schedulers ...` | Define per-queue scheduling parameters (transmit rate, priority, drop profile) | Low | Missing |
+| **BA Classifiers** | `class-of-service classifiers dscp ...` | Classify incoming traffic by DSCP/802.1p into forwarding classes and loss priorities | Low | Missing |
 | **Rewrite Rules** | `class-of-service rewrite-rules dscp ...` | Rewrite outgoing DSCP/802.1p values. bpfrx has filter-based DSCP rewrite. | Low | Partial (via firewall filter forwarding-class action) |
-| **WRED Drop Profiles** | `class-of-service drop-profiles ...` | Weighted Random Early Detection congestion avoidance per queue | Low | Missing (N/A on vSRX) |
-| **Traffic Shaping** | `class-of-service interfaces ... shaping-rate ...` | Per-interface output rate shaping | Low | Missing (N/A on vSRX) |
-| **Interface CoS Binding** | `class-of-service interfaces ... scheduler-map ...` | Bind scheduler-map and classifiers to specific interfaces | Low | Missing (N/A on vSRX) |
+| **WRED Drop Profiles** | `class-of-service drop-profiles ...` | Weighted Random Early Detection congestion avoidance per queue | Low | Missing |
+| **Traffic Shaping** | `class-of-service interfaces ... shaping-rate ...` | Per-interface output rate shaping | Low | Missing |
+| **Interface CoS Binding** | `class-of-service interfaces ... scheduler-map ...` | Bind scheduler-map and classifiers to specific interfaces | Low | Missing |
 
 ---
 
@@ -364,6 +366,9 @@ bpfrx has gRPC (48+ RPCs), REST API, Junos-style CLI (local + remote), Prometheu
 | **SNMP Traps/Notifications** | `snmp trap-group ... targets ...` | SNMP trap generation on events (link up/down, auth failure, etc.). bpfrx parses trap-groups but sending is not implemented. | Medium | Partial (parsed, trap sending not implemented) |
 | **J-Web / Full Web GUI** | `system services web-management ...` | Full web-based management UI with dashboard, wizards, monitoring, policy editor. bpfrx has basic REST API. | Low | Missing |
 | **XML/JSON Config Export** | `show configuration | display xml/json` | Export configuration in XML or JSON format for automation tooling | Low | Missing |
+| **Junos Telemetry Interface (JTI)** | `services analytics / streaming telemetry` | Push-model streaming telemetry for counters, sensors, and analytics pipelines. Explicitly listed as supported on vSRX in the feature tables. | Low | Missing |
+| **Cloud-init / Metadata User-Data Bootstrap** | `N/A (deployment/bootstrap workflow)` | Initialize a vSRX instance from validated Junos configuration passed through cloud metadata or config-drive user-data. Extensively documented for OpenStack, AWS, and GCP. | Medium | Missing |
+| **Bootstrap ISO Provisioning** | `N/A (deployment/bootstrap workflow)` | Provision first-boot configuration from a bootstrap ISO image attached as a virtual disk. Documented in the deployment guide for KVM and VMware workflows. | Low | Missing |
 | **Junos Space / Security Director** | N/A (external management platform) | Centralized multi-device policy management. Not applicable as a feature of bpfrx itself. | Low | Missing (N/A) |
 | **Rescue Configuration** | `request system configuration rescue save` | Saved fallback configuration that can be loaded on boot if active config fails | Low | Missing |
 
@@ -409,7 +414,7 @@ bpfrx has hostname, domain-name, domain-search, timezone, name-servers, NTP, ser
 |---------|-------------------|-------------|----------|--------|
 | **802.1X Network Access Control** | `protocols dot1x ...` | Port-based network authentication on access ports | Low | Missing |
 | **SCTP Protocol Support** | `security policies ... match application junos-sctp` | SCTP-aware firewall with multi-homing and stream tracking | Low | Missing |
-| **Geneve Tunnel Inspection** | `security tunnel-inspection ... profile ... geneve ...` | Inspect traffic inside Geneve tunnels (cloud overlay) | Low | Missing |
+| **Geneve Flow Infrastructure / AWS GWLB** | `security tunnel-inspection ... profile ... geneve ...` | Geneve tunnel decapsulation/encapsulation, VNI and vendor-TLV-based policy attachment, and AWS GWLB metadata handling for tunnel-endpoint and transit-router deployment modes. The current repo has no runtime Geneve/GWLB implementation beyond design references. | Low | Missing |
 | **VPLS** | `routing-instances ... instance-type vpls` | Virtual Private LAN Service for L2 VPN | Low | Missing |
 | **Storm Control** | `forwarding-options storm-control ...` | Broadcast/multicast storm protection | Low | Missing |
 | **TAP Mode** | `security forwarding-options ... tap-mode` | Passive monitoring mode (copy of traffic, no inline blocking) | Low | Missing |
@@ -434,29 +439,34 @@ Features commonly requested in enterprise deployments:
 
 8. **RADIUS/TACACS+ Authentication** - Enterprise AAA integration
 9. **SSL VPN / Remote Access VPN** - Remote worker connectivity
-10. ~~**Aggressive Session Aging**~~ - **Done** (GC high/low-watermark early-ageout behavior)
-11. **Graceful Restart** - Non-stop routing (FRR already supports)
-12. **Twice NAT** - Complex NAT scenarios
-13. **Transparent Mode (L2)** - Inline transparent firewall deployment
-14. ~~**Link Aggregation (LAG)**~~ - **Done**
-15. **PKI / Certificate-Based IPsec** - Certificate-based VPN authentication
-16. **SecIntel / GeoIP** - Threat intelligence integration
-17. **Captive Portal / User Firewall** - User-based access control
-18. **Logical Systems (LSYS)** - Multi-tenancy
+10. **Remote Access IPsec VPN** - Road-warrior IPsec parity beyond site-to-site tunnels
+11. ~~**Aggressive Session Aging**~~ - **Done** (GC high/low-watermark early-ageout behavior)
+12. **Graceful Restart** - Non-stop routing (FRR already supports)
+13. **Twice NAT** - Complex NAT scenarios
+14. **Transparent Mode (L2)** - Inline transparent firewall deployment
+15. ~~**Link Aggregation (LAG)**~~ - **Done**
+16. **PKI / Certificate-Based IPsec** - Certificate-based VPN authentication
+17. **SecIntel / GeoIP** - Threat intelligence integration
+18. **Captive Portal / User Firewall** - User-based access control
+19. **Logical Systems (LSYS)** - Multi-tenancy
 
 ### Tier 3 - Low Priority (Specialized / Niche)
 Features for specific use cases or carrier deployments:
 
-19. Content Security (UTM) - AV/web-filtering (consider ClamAV/rspamd)
-20. SSL Proxy - TLS inspection (consider mitmproxy integration)
-21. Multicast (PIM/IGMP)
-22. MPLS/LDP
-23. EVPN/VXLAN
-24. DS-Lite/6rd/MAP-E
-25. GTP Firewall
-26. SD-WAN
-27. PowerMode IPsec
-28. Class of Service (not supported on vSRX anyway)
+20. Content Security (UTM) - AV/web-filtering (consider ClamAV/rspamd)
+21. SSL Proxy - TLS inspection (consider mitmproxy integration)
+22. Multicast (PIM/IGMP)
+23. MPLS/LDP
+24. EVPN/VXLAN
+25. Geneve / AWS GWLB - cloud overlay and load-balancer insertion workflows
+26. Junos Telemetry Interface (JTI) - push telemetry / analytics pipelines
+27. Cloud-init / Bootstrap ISO - cloud and first-boot deployment parity
+28. AppQoE
+29. DS-Lite/6rd/MAP-E
+30. GTP Firewall
+31. SD-WAN
+32. PowerMode IPsec
+33. Class of Service - partial/limited on vSRX, still materially broader than bpfrx today
 
 ---
 
