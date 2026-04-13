@@ -50,3 +50,8 @@ func TestCompleteConfigPairsAmbiguousPrefixReturnsMatches(t *testing.T) {
 		t.Fatalf("expected ambiguous top-level config matches, got %#v", pairs)
 	}
 }
+
+func TestCompleteConfigPairsDynamicPathWithoutStoreDoesNotPanic(t *testing.T) {
+	s := &Server{}
+	_ = s.completeConfigPairs([]string{"set", "security", "policies", "from-zone"}, "")
+}

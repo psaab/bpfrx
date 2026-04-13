@@ -508,13 +508,20 @@ func resolveShowConfigurationWords(words []string) ([]string, bool) {
 	return words[2:], true
 }
 
+func (s *Server) completionValueProvider() config.ValueProvider {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	return s.valueProvider
+}
+
 func (s *Server) completeOperationalPairs(words []string, partial string) []completionPair {
 	// "show configuration <path>" — delegate sub-path to config schema
 	if subPath, ok := resolveShowConfigurationWords(words); ok {
 		if resolvedPath, resolved := config.ResolveConsumedSetPathTokens(subPath); resolved {
 			subPath = resolvedPath
 		}
-		schemaCompletions := config.CompleteSetPathWithValues(subPath, s.valueProvider)
+		schemaCompletions := config.CompleteSetPathWithValues(subPath, s.completionValueProvider())
 		if schemaCompletions != nil {
 			var pairs []completionPair
 			for _, sc := range schemaCompletions {
@@ -558,7 +565,7 @@ func (s *Server) completeConfigPairs(words []string, partial string) []completio
 		if resolvedPath, resolved := config.ResolveConsumedSetPathTokens(pathWords); resolved {
 			pathWords = resolvedPath
 		}
-		schemaCompletions := config.CompleteSetPathWithValues(pathWords, s.valueProvider)
+		schemaCompletions := config.CompleteSetPathWithValues(pathWords, s.completionValueProvider())
 		if schemaCompletions == nil {
 			return nil
 		}
@@ -601,6 +608,9 @@ func (s *Server) completeConfigPairs(words []string, partial string) []completio
 }
 
 func (s *Server) valueProvider(hint config.ValueHint, path []string) []config.SchemaCompletion {
+	if s == nil || s.store == nil {
+		return nil
+	}
 	cfg := s.store.ActiveConfig()
 	if cfg == nil {
 		return nil
