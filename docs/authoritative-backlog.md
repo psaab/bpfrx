@@ -69,6 +69,7 @@ From `docs/next-features` and HA proposal docs:
 - Strict single-owner VIP mode for same-L2 HA (tracking issue #104)
 - Deterministic VRRP failover reconciliation
 - Runtime behavior for `system license autoupdate url`
+- Explicit Twice NAT parity validation and support contract (tracking issue #645; see `docs/next-features/twice-nat.md`)
 
 ### 3) Additional open items from bug/test planning docs
 
