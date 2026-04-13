@@ -44,6 +44,23 @@ func TestShouldAttemptRSTSuppression(t *testing.T) {
 	}
 }
 
+func TestConfigEqualIncludesPollMode(t *testing.T) {
+	a := config.UserspaceConfig{
+		Binary:        "/tmp/helper",
+		ControlSocket: "/tmp/control.sock",
+		EventSocket:   "/tmp/events.sock",
+		StateFile:     "/tmp/state.json",
+		Workers:       4,
+		RingEntries:   1024,
+		PollMode:      "busy-poll",
+	}
+	b := a
+	b.PollMode = "epoll"
+	if configEqual(a, b) {
+		t.Fatal("configEqual() = true after PollMode change, want false")
+	}
+}
+
 func hostToNetwork16(v uint16) uint16 {
 	var raw [2]byte
 	binary.BigEndian.PutUint16(raw[:], v)
@@ -1548,6 +1565,29 @@ func TestBuildLocalAddressEntries(t *testing.T) {
 	got := buildLocalAddressEntries(snapshot)
 	if len(got) != 5 {
 		t.Fatalf("len(got) = %d, want 5 (%+v)", len(got), got)
+	}
+}
+
+func TestPickInterfaceSnapshotFamilyFilters(t *testing.T) {
+	iface := InterfaceSnapshot{
+		Addresses: []InterfaceAddressSnapshot{
+			{Family: "inet6", Address: "192.0.2.10/24"},
+			{Family: "inet", Address: "192.0.2.20/24"},
+			{Family: "inet", Address: "fe80::20/64"},
+			{Family: "inet", Address: "2001:db8::20/64"},
+			{Family: "inet6", Address: "fe80::10/64"},
+			{Family: "inet6", Address: "2001:db8::10/64"},
+		},
+	}
+
+	gotV4 := pickInterfaceSnapshotV4(iface)
+	if gotV4 == nil || !gotV4.Equal(net.ParseIP("192.0.2.20")) {
+		t.Fatalf("pickInterfaceSnapshotV4() = %v, want 192.0.2.20", gotV4)
+	}
+
+	gotV6 := pickInterfaceSnapshotV6(iface)
+	if gotV6 == nil || !gotV6.Equal(net.ParseIP("2001:db8::10")) {
+		t.Fatalf("pickInterfaceSnapshotV6() = %v, want 2001:db8::10", gotV6)
 	}
 }
 

@@ -155,7 +155,6 @@ func (m *Manager) setupUserspaceCPUMapLocked() bool {
 	}
 
 	// cpumap value: struct { __u32 qsize; int bpf_prog_fd; }
-	// cpumap value: struct { __u32 qsize; int bpf_prog_fd; }
 	// With prog_fd=0, no cpumap program is attached — packets go to kernel.
 	// TODO: attach xdp_cpumap_prog for eBPF embedded ICMP NAT reversal.
 	for cpu := 0; cpu < numCPUs; cpu++ {
@@ -1294,6 +1293,9 @@ func buildNATTranslatedLocalAddressExclusions(snapshot *ConfigSnapshot) (map[uin
 func pickInterfaceSnapshotV4(iface InterfaceSnapshot) net.IP {
 	var fallback net.IP
 	for _, addr := range iface.Addresses {
+		if addr.Family != "inet" {
+			continue
+		}
 		ip, _, err := net.ParseCIDR(addr.Address)
 		if err != nil || ip == nil {
 			continue
@@ -1315,6 +1317,9 @@ func pickInterfaceSnapshotV4(iface InterfaceSnapshot) net.IP {
 func pickInterfaceSnapshotV6(iface InterfaceSnapshot) net.IP {
 	var fallback net.IP
 	for _, addr := range iface.Addresses {
+		if addr.Family != "inet6" {
+			continue
+		}
 		ip, _, err := net.ParseCIDR(addr.Address)
 		if err != nil || ip == nil {
 			continue

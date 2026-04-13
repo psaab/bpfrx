@@ -79,6 +79,14 @@ func (m *Manager) ensureProcessLocked(cfg config.UserspaceConfig) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
+		if m.eventStreamCancel != nil {
+			m.eventStreamCancel()
+		}
+		if m.eventStream != nil {
+			m.eventStream.Close()
+		}
+		m.eventStream = nil
+		m.eventStreamCancel = nil
 		return fmt.Errorf("start userspace dataplane helper: %w", err)
 	}
 	m.cfg = cfg
@@ -531,11 +539,11 @@ func (m *Manager) bootstrapNAPIQueuesLocked() {
 	if m.lastSnapshot == nil || m.lastSnapshot.Config == nil {
 		return
 	}
-	// Send ARP requests on each managed interface to generate hardware RX
-	// events from ARP replies. This triggers mlx5 NAPI which processes
-	// the XSK fill ring and posts WQEs for zero-copy packet reception.
-	// Without at least one HW RX event per queue, the fill ring entries
-	// added after socket bind are never consumed by the driver's pool.
+	// Send UDP probes and an ICMP echo on each managed interface to create
+	// hardware RX events and neighbor resolution. This triggers mlx5 NAPI,
+	// which processes the XSK fill ring and posts WQEs for zero-copy packet
+	// reception. Without at least one HW RX event per queue, the fill ring
+	// entries added after socket bind are never consumed by the driver's pool.
 	for _, linuxName := range userspaceBootstrapProbeInterfaces(m.lastSnapshot.Config) {
 		// Send many parallel pings to hit all RSS queues. Each ping
 		// process gets a different ICMP echo ID from the kernel, causing
@@ -952,7 +960,8 @@ func configEqual(a, b config.UserspaceConfig) bool {
 		a.EventSocket == b.EventSocket &&
 		a.StateFile == b.StateFile &&
 		a.Workers == b.Workers &&
-		a.RingEntries == b.RingEntries
+		a.RingEntries == b.RingEntries &&
+		a.PollMode == b.PollMode
 }
 
 func (m *Manager) StartFIBSync(ctx context.Context) {
