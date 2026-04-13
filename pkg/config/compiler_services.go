@@ -33,7 +33,7 @@ func validateRPMTest(probeName string, test *RPMTest) error {
 			probeName, test.Name, test.ProbeType,
 		)
 	}
-	if test.DestPort < 0 || test.DestPort > 65535 {
+	if test.DestPort > 65535 {
 		return fmt.Errorf("services rpm probe %q test %q destination-port: must be 1-65535", probeName, test.Name)
 	}
 	return nil

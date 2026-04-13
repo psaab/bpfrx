@@ -550,7 +550,7 @@ type RPMTest struct {
 	ProbeCount          int // number of probes per test (0 = default 1)
 	TestInterval        int // seconds (0 = default 60)
 	ThresholdSuccessive int // successive failures before probe-fail (0 = default 3)
-	ProbeLimit          int // max consecutive failed probes before test is declared failed (0 = unlimited)
+	ProbeLimit          int // max consecutive failed probes before stopping the current test cycle (0 = unlimited)
 	DestPort            int // for tcp-ping
 }
 

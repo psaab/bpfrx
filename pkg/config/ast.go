@@ -1375,7 +1375,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					"thresholds": {desc: "Failure thresholds for the test", children: map[string]*schemaNode{
 						"successive-loss": {args: 1, desc: "Consecutive losses before marking the test failed", children: nil},
 					}},
-					"probe-limit":      {args: 1, desc: "Maximum failed probes before stopping the current test cycle", children: nil},
+					"probe-limit":      {args: 1, desc: "Maximum consecutive failed probes before stopping the current test cycle", children: nil},
 					"destination-port": {args: 1, desc: "Destination TCP port for tcp-ping probes", children: nil},
 				}},
 			}},

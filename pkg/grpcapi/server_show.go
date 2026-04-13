@@ -25,6 +25,7 @@ import (
 	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
 	"github.com/psaab/bpfrx/pkg/logging"
 	"github.com/psaab/bpfrx/pkg/routing"
+	"github.com/psaab/bpfrx/pkg/rpm"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
@@ -32,48 +33,20 @@ import (
 )
 
 func writeRPMConfig(buf *strings.Builder, cfg *config.Config) {
-	if cfg == nil || cfg.Services.RPM == nil || len(cfg.Services.RPM.Probes) == 0 {
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+		return
+	}
+	if cfg.Services.RPM == nil || len(cfg.Services.RPM.Probes) == 0 {
 		buf.WriteString("No RPM probes configured\n")
 		return
 	}
 
 	buf.WriteString("RPM Probe Configuration:\n")
-	probeNames := make([]string, 0, len(cfg.Services.RPM.Probes))
-	for name := range cfg.Services.RPM.Probes {
-		probeNames = append(probeNames, name)
-	}
-	sort.Strings(probeNames)
-
-	for _, probeName := range probeNames {
+	for _, probeName := range rpm.SortedProbeNames(cfg.Services.RPM.Probes) {
 		probe := cfg.Services.RPM.Probes[probeName]
-		testNames := make([]string, 0, len(probe.Tests))
-		for name := range probe.Tests {
-			testNames = append(testNames, name)
-		}
-		sort.Strings(testNames)
-
-		for _, testName := range testNames {
-			test := probe.Tests[testName]
-			fmt.Fprintf(buf, "  Probe: %s, Test: %s\n", probeName, testName)
-			fmt.Fprintf(buf, "    Type: %s, Target: %s\n", test.EffectiveProbeType(), test.Target)
-			if test.SourceAddress != "" {
-				fmt.Fprintf(buf, "    Source: %s\n", test.SourceAddress)
-			}
-			if test.RoutingInstance != "" {
-				fmt.Fprintf(buf, "    Routing instance: %s\n", test.RoutingInstance)
-			}
-			fmt.Fprintf(buf, "    Probe interval: %ds\n", test.EffectiveProbeInterval())
-			fmt.Fprintf(buf, "    Probe count: %d\n", test.EffectiveProbeCount())
-			fmt.Fprintf(buf, "    Test interval: %ds\n", test.EffectiveTestInterval())
-			fmt.Fprintf(buf, "    Successive loss threshold: %d\n", test.EffectiveSuccessiveLossThreshold())
-			if test.ProbeLimit > 0 {
-				fmt.Fprintf(buf, "    Probe limit: %d\n", test.ProbeLimit)
-			} else {
-				buf.WriteString("    Probe limit: unlimited\n")
-			}
-			if test.EffectiveProbeType() == "tcp-ping" || test.DestPort > 0 {
-				fmt.Fprintf(buf, "    Destination port: %d\n", test.EffectiveDestinationPort())
-			}
+		for _, testName := range rpm.SortedTestNames(probe.Tests) {
+			rpm.WriteConfiguredTest(buf, probeName, testName, probe.Tests[testName])
 			buf.WriteString("\n")
 		}
 	}
@@ -3330,10 +3303,12 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 						fmt.Fprintf(&buf, "    Last probe: %s\n", r.LastProbeAt.Format("2006-01-02 15:04:05"))
 					}
 				}
-				break
+			} else {
+				writeRPMConfig(&buf, s.store.ActiveConfig())
 			}
+		} else {
+			writeRPMConfig(&buf, s.store.ActiveConfig())
 		}
-		writeRPMConfig(&buf, s.store.ActiveConfig())
 
 	case "version":
 		ver := s.version

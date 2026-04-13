@@ -2,55 +2,15 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
 	"github.com/psaab/bpfrx/pkg/dhcp"
 	"github.com/psaab/bpfrx/pkg/dhcpserver"
+	"github.com/psaab/bpfrx/pkg/rpm"
 )
-
-func sortedRPMProbeNames(probes map[string]*config.RPMProbe) []string {
-	names := make([]string, 0, len(probes))
-	for name := range probes {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-func sortedRPMTestNames(tests map[string]*config.RPMTest) []string {
-	names := make([]string, 0, len(tests))
-	for name := range tests {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
-}
-
-func showRPMConfiguredProbe(probeName, testName string, test *config.RPMTest) {
-	fmt.Printf("  Probe: %s, Test: %s\n", probeName, testName)
-	fmt.Printf("    Type: %s, Target: %s\n", test.EffectiveProbeType(), test.Target)
-	if test.SourceAddress != "" {
-		fmt.Printf("    Source: %s\n", test.SourceAddress)
-	}
-	if test.RoutingInstance != "" {
-		fmt.Printf("    Routing instance: %s\n", test.RoutingInstance)
-	}
-	fmt.Printf("    Probe interval: %ds\n", test.EffectiveProbeInterval())
-	fmt.Printf("    Probe count: %d\n", test.EffectiveProbeCount())
-	fmt.Printf("    Test interval: %ds\n", test.EffectiveTestInterval())
-	fmt.Printf("    Successive loss threshold: %d\n", test.EffectiveSuccessiveLossThreshold())
-	if test.ProbeLimit > 0 {
-		fmt.Printf("    Probe limit: %d\n", test.ProbeLimit)
-	} else {
-		fmt.Println("    Probe limit: unlimited")
-	}
-	if test.EffectiveProbeType() == "tcp-ping" || test.DestPort > 0 {
-		fmt.Printf("    Destination port: %d\n", test.EffectiveDestinationPort())
-	}
-}
 
 func (c *CLI) showDHCPLeases() error {
 	if c.dhcp == nil {
@@ -245,48 +205,50 @@ func (c *CLI) showRPMProbeResults() error {
 	// Show live results if RPM manager is available
 	if c.rpmResultsFn != nil {
 		results := c.rpmResultsFn()
-		if len(results) == 0 {
-			fmt.Println("No RPM probes configured")
+		if len(results) > 0 {
+			fmt.Println("RPM Probe Results:")
+			for _, r := range results {
+				fmt.Printf("  Probe: %s, Test: %s\n", r.ProbeName, r.TestName)
+				fmt.Printf("    Type: %s, Target: %s\n", r.ProbeType, r.Target)
+				fmt.Printf("    Status: %s", r.LastStatus)
+				if r.LastRTT > 0 {
+					fmt.Printf(", RTT: %s", r.LastRTT)
+				}
+				fmt.Println()
+				if r.MinRTT > 0 {
+					fmt.Printf("    RTT: min %s, max %s, avg %s, jitter %s\n",
+						r.MinRTT, r.MaxRTT, r.AvgRTT, r.Jitter)
+				}
+				fmt.Printf("    Sent: %d, Received: %d", r.TotalSent, r.TotalRecv)
+				if r.TotalSent > 0 {
+					loss := float64(r.TotalSent-r.TotalRecv) / float64(r.TotalSent) * 100
+					fmt.Printf(", Loss: %.1f%%", loss)
+				}
+				fmt.Println()
+				if !r.LastProbeAt.IsZero() {
+					fmt.Printf("    Last probe: %s\n", r.LastProbeAt.Format("2006-01-02 15:04:05"))
+				}
+			}
 			return nil
 		}
-		fmt.Println("RPM Probe Results:")
-		for _, r := range results {
-			fmt.Printf("  Probe: %s, Test: %s\n", r.ProbeName, r.TestName)
-			fmt.Printf("    Type: %s, Target: %s\n", r.ProbeType, r.Target)
-			fmt.Printf("    Status: %s", r.LastStatus)
-			if r.LastRTT > 0 {
-				fmt.Printf(", RTT: %s", r.LastRTT)
-			}
-			fmt.Println()
-			if r.MinRTT > 0 {
-				fmt.Printf("    RTT: min %s, max %s, avg %s, jitter %s\n",
-					r.MinRTT, r.MaxRTT, r.AvgRTT, r.Jitter)
-			}
-			fmt.Printf("    Sent: %d, Received: %d", r.TotalSent, r.TotalRecv)
-			if r.TotalSent > 0 {
-				loss := float64(r.TotalSent-r.TotalRecv) / float64(r.TotalSent) * 100
-				fmt.Printf(", Loss: %.1f%%", loss)
-			}
-			fmt.Println()
-			if !r.LastProbeAt.IsZero() {
-				fmt.Printf("    Last probe: %s\n", r.LastProbeAt.Format("2006-01-02 15:04:05"))
-			}
-		}
-		return nil
 	}
 
 	// Fallback: show config only
 	cfg := c.store.ActiveConfig()
-	if cfg == nil || cfg.Services.RPM == nil || len(cfg.Services.RPM.Probes) == 0 {
+	if cfg == nil {
+		fmt.Println("No active configuration")
+		return nil
+	}
+	if cfg.Services.RPM == nil || len(cfg.Services.RPM.Probes) == 0 {
 		fmt.Println("No RPM probes configured")
 		return nil
 	}
 
 	fmt.Println("RPM Probe Configuration:")
-	for _, probeName := range sortedRPMProbeNames(cfg.Services.RPM.Probes) {
+	for _, probeName := range rpm.SortedProbeNames(cfg.Services.RPM.Probes) {
 		probe := cfg.Services.RPM.Probes[probeName]
-		for _, testName := range sortedRPMTestNames(probe.Tests) {
-			showRPMConfiguredProbe(probeName, testName, probe.Tests[testName])
+		for _, testName := range rpm.SortedTestNames(probe.Tests) {
+			rpm.WriteConfiguredTest(os.Stdout, probeName, testName, probe.Tests[testName])
 			fmt.Println()
 		}
 	}
