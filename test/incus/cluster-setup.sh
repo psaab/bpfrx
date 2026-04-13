@@ -100,6 +100,38 @@ die()   { echo "ERROR: $*" >&2; exit 1; }
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
+run_on_host() {
+	if [[ -n "${INCUS_REMOTE:-}" ]]; then
+		ssh "$INCUS_REMOTE" "$@"
+	else
+		"$@"
+	fi
+}
+
+suppress_host_parent_ipv6_ra() {
+	local parent="$1"
+
+	if [[ -z "$parent" ]]; then
+		return
+	fi
+
+	# The host-side SR-IOV LAN parent should never learn the isolated LAN
+	# prefix itself. If it accepts RAs, host traffic to the test LAN bypasses
+	# the firewall and tries to resolve the destination directly on-link.
+	info "Disabling IPv6 RA/autoconf on host parent $parent..."
+	run_on_host sudo sysctl -qw \
+		"net.ipv6.conf.${parent}.accept_ra=0" \
+		"net.ipv6.conf.${parent}.autoconf=0" \
+		"net.ipv6.conf.${parent}.router_solicitations=0"
+	if ! run_on_host sudo ip -6 addr flush dev "$parent" scope global dynamic; then
+		warn "targeted IPv6 dynamic address flush failed on host parent $parent; falling back to broader global-address flush"
+		run_on_host sudo ip -6 addr flush dev "$parent" scope global ||
+			die "failed to clear learned IPv6 global addresses from host parent $parent"
+	fi
+	run_on_host sudo ip -6 route flush dev "$parent" proto ra ||
+		die "failed to clear RA-learned IPv6 routes from host parent $parent"
+}
+
 # Prefix instance name with remote if set: "loss:bpfrx-fw0" or "bpfrx-fw0"
 r() {
 	echo "${INCUS_REMOTE:+${INCUS_REMOTE}:}$1"
@@ -212,6 +244,10 @@ devices:
 # ── Instance Management ──────────────────────────────────────────────
 
 cmd_create() {
+	if [[ -n "${SRIOV_LAN_PARENT:-}" ]]; then
+		suppress_host_parent_ipv6_ra "$SRIOV_LAN_PARENT"
+	fi
+
 	# Create both VMs
 	for idx in 0 1; do
 		create_vm "$idx"
@@ -502,6 +538,10 @@ cmd_destroy() {
 
 cmd_deploy() {
 	local target="${1:-all}"
+
+	if [[ -n "${SRIOV_LAN_PARENT:-}" ]]; then
+		suppress_host_parent_ipv6_ra "$SRIOV_LAN_PARENT"
+	fi
 
 	info "Building bpfrxd and cli..."
 	make -C "$PROJECT_ROOT" build build-ctl
