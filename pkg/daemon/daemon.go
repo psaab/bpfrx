@@ -2189,8 +2189,9 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 	raByIface := make(map[string]*config.RAInterfaceConfig)
 	var result []*config.RAInterfaceConfig
 	for _, ra := range cfg.Protocols.RouterAdvertisement {
-		raByIface[ra.Interface] = ra
-		result = append(result, ra)
+		clone := cloneRAInterfaceConfig(ra)
+		raByIface[clone.Interface] = clone
+		result = append(result, clone)
 	}
 
 	if d.dhcp != nil {
@@ -2269,6 +2270,28 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 	}
 
 	return result
+}
+
+func cloneRAInterfaceConfig(src *config.RAInterfaceConfig) *config.RAInterfaceConfig {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	if len(src.DNSServers) > 0 {
+		clone.DNSServers = append([]string(nil), src.DNSServers...)
+	}
+	if len(src.Prefixes) > 0 {
+		clone.Prefixes = make([]*config.RAPrefix, 0, len(src.Prefixes))
+		for _, pfx := range src.Prefixes {
+			if pfx == nil {
+				clone.Prefixes = append(clone.Prefixes, nil)
+				continue
+			}
+			pfxClone := *pfx
+			clone.Prefixes = append(clone.Prefixes, &pfxClone)
+		}
+	}
+	return &clone
 }
 
 // startDHCPClients iterates the config and starts DHCP/DHCPv6 clients
