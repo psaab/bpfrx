@@ -2193,48 +2193,45 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 		result = append(result, ra)
 	}
 
-	// If no DHCP manager, return static only.
-	if d.dhcp == nil {
-		return result
-	}
-
-	// Merge PD-derived prefixes from DHCPv6 clients.
-	for _, mapping := range d.dhcp.DelegatedPrefixesForRA() {
-		subPrefix := dhcp.DeriveSubPrefix(mapping.Prefix, mapping.SubPrefLen)
-		if !subPrefix.IsValid() {
-			slog.Warn("DHCPv6 PD: invalid sub-prefix derivation",
-				"delegated", mapping.Prefix, "sub_len", mapping.SubPrefLen)
-			continue
-		}
-
-		pfx := &config.RAPrefix{
-			Prefix:     subPrefix.String(),
-			OnLink:     true,
-			Autonomous: true,
-		}
-		if mapping.ValidLifetime > 0 {
-			pfx.ValidLifetime = int(mapping.ValidLifetime.Seconds())
-		}
-		if mapping.PreferredLifetime > 0 {
-			pfx.PreferredLife = int(mapping.PreferredLifetime.Seconds())
-		}
-
-		if existing, ok := raByIface[mapping.RAIface]; ok {
-			// Append prefix to existing RA interface config.
-			existing.Prefixes = append(existing.Prefixes, pfx)
-		} else {
-			// Create a new RA interface config for this downstream interface.
-			ra := &config.RAInterfaceConfig{
-				Interface: mapping.RAIface,
-				Prefixes:  []*config.RAPrefix{pfx},
+	if d.dhcp != nil {
+		// Merge PD-derived prefixes from DHCPv6 clients.
+		for _, mapping := range d.dhcp.DelegatedPrefixesForRA() {
+			subPrefix := dhcp.DeriveSubPrefix(mapping.Prefix, mapping.SubPrefLen)
+			if !subPrefix.IsValid() {
+				slog.Warn("DHCPv6 PD: invalid sub-prefix derivation",
+					"delegated", mapping.Prefix, "sub_len", mapping.SubPrefLen)
+				continue
 			}
-			raByIface[mapping.RAIface] = ra
-			result = append(result, ra)
-		}
 
-		slog.Info("DHCPv6 PD: advertising prefix via RA",
-			"prefix", subPrefix, "interface", mapping.RAIface,
-			"delegated_from", mapping.Interface)
+			pfx := &config.RAPrefix{
+				Prefix:     subPrefix.String(),
+				OnLink:     true,
+				Autonomous: true,
+			}
+			if mapping.ValidLifetime > 0 {
+				pfx.ValidLifetime = int(mapping.ValidLifetime.Seconds())
+			}
+			if mapping.PreferredLifetime > 0 {
+				pfx.PreferredLife = int(mapping.PreferredLifetime.Seconds())
+			}
+
+			if existing, ok := raByIface[mapping.RAIface]; ok {
+				// Append prefix to existing RA interface config.
+				existing.Prefixes = append(existing.Prefixes, pfx)
+			} else {
+				// Create a new RA interface config for this downstream interface.
+				ra := &config.RAInterfaceConfig{
+					Interface: mapping.RAIface,
+					Prefixes:  []*config.RAPrefix{pfx},
+				}
+				raByIface[mapping.RAIface] = ra
+				result = append(result, ra)
+			}
+
+			slog.Info("DHCPv6 PD: advertising prefix via RA",
+				"prefix", subPrefix, "interface", mapping.RAIface,
+				"delegated_from", mapping.Interface)
+		}
 	}
 
 	// Detect explicitly configured link-local addresses on RA interfaces.
@@ -2253,6 +2250,15 @@ func (d *Daemon) buildRAConfigs(cfg *config.Config) []*config.RAInterfaceConfig 
 						break
 					}
 				}
+			}
+			if ra.SourceLinkLocal == "" && cfg.Chassis.Cluster != nil && ifc.RedundancyGroup != 0 {
+				// RETH HA startup installs a stable router link-local on the active
+				// member. Bind RA to that address so the sender does not auto-pick a
+				// transient EUI-64 link-local which can later be removed by HA reconcile.
+				ra.SourceLinkLocal = cluster.StableRethLinkLocal(
+					cfg.Chassis.Cluster.ClusterID,
+					ifc.RedundancyGroup,
+				).String()
 			}
 		}
 	}
