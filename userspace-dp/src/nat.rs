@@ -432,15 +432,13 @@ impl DnatTable {
                 _ => continue,
             };
             for proto in protos {
-                table
-                    .entries
-                    .entry(DnatKey {
+                Self::insert_entry(
+                    table.entries.entry(DnatKey {
                         protocol: proto,
                         dst_ip,
                         dst_port: snap.destination_port,
-                    })
-                    .or_default()
-                    .push(DnatEntry {
+                    }),
+                    DnatEntry {
                         from_zone: snap.from_zone.clone().into_boxed_str(),
                         value: DnatValue {
                             new_dst_ip: pool_ip,
@@ -450,7 +448,8 @@ impl DnatTable {
                                 snap.destination_port
                             },
                         },
-                    });
+                    },
+                );
             }
         }
         table
@@ -517,6 +516,21 @@ impl DnatTable {
                     .find(|entry| entry.from_zone.is_empty())
                     .map(|entry| entry.value)
             })
+    }
+
+    fn insert_entry(
+        slot: std::collections::hash_map::Entry<'_, DnatKey, Vec<DnatEntry>>,
+        entry: DnatEntry,
+    ) {
+        let entries = slot.or_default();
+        if let Some(existing) = entries
+            .iter_mut()
+            .find(|existing| existing.from_zone == entry.from_zone)
+        {
+            *existing = entry;
+            return;
+        }
+        entries.push(entry);
     }
 
     /// Returns true if the table has any entries.
@@ -1255,6 +1269,66 @@ mod tests {
                 .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "dmz")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn dnat_duplicate_same_zone_last_rule_wins() {
+        let table = DnatTable::from_snapshots(&[
+            DestinationNATRuleSnapshot {
+                name: "first".to_string(),
+                from_zone: "wan".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.101".to_string(),
+                pool_port: 8443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                name: "second".to_string(),
+                from_zone: "wan".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.102".to_string(),
+                pool_port: 9443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ]);
+        let decision = table
+            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "wan")
+            .unwrap();
+        assert_eq!(decision.rewrite_dst, Some("192.168.1.102".parse().unwrap()));
+        assert_eq!(decision.rewrite_dst_port, Some(9443));
+    }
+
+    #[test]
+    fn dnat_duplicate_any_zone_last_rule_wins() {
+        let table = DnatTable::from_snapshots(&[
+            DestinationNATRuleSnapshot {
+                name: "first".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.101".to_string(),
+                pool_port: 8443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                name: "second".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.102".to_string(),
+                pool_port: 9443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ]);
+        let decision = table
+            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "wan")
+            .unwrap();
+        assert_eq!(decision.rewrite_dst, Some("192.168.1.102".parse().unwrap()));
+        assert_eq!(decision.rewrite_dst_port, Some(9443));
     }
 
     // --- Pool-mode SNAT tests ---
