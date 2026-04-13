@@ -352,13 +352,13 @@ type DPDKPort struct {
 
 // UserspaceConfig holds separate-process userspace dataplane configuration.
 type UserspaceConfig struct {
-	Binary        string `json:"binary"`                    // helper process path
-	ControlSocket string `json:"control_socket"`            // unix control socket path
-	EventSocket   string `json:"event_socket,omitempty"`    // event stream socket path (auto-derived if empty)
-	StateFile     string `json:"state_file"`                // helper state file path
-	Workers       int    `json:"workers"`                   // worker thread count
-	RingEntries   int    `json:"ring_entries"`              // planned AF_XDP ring entries
-	PollMode      string `json:"poll_mode"`                 // "busy-poll" (default) or "interrupt"
+	Binary        string `json:"binary"`                 // helper process path
+	ControlSocket string `json:"control_socket"`         // unix control socket path
+	EventSocket   string `json:"event_socket,omitempty"` // event stream socket path (auto-derived if empty)
+	StateFile     string `json:"state_file"`             // helper state file path
+	Workers       int    `json:"workers"`                // worker thread count
+	RingEntries   int    `json:"ring_entries"`           // planned AF_XDP ring entries
+	PollMode      string `json:"poll_mode"`              // "busy-poll" (default) or "interrupt"
 }
 
 // RootAuthConfig holds root-authentication settings.
@@ -530,6 +530,15 @@ type RPMProbe struct {
 	Tests map[string]*RPMTest
 }
 
+const (
+	DefaultRPMProbeType            = "icmp-ping"
+	DefaultRPMProbeIntervalSeconds = 5
+	DefaultRPMProbeCount           = 1
+	DefaultRPMTestIntervalSeconds  = 60
+	DefaultRPMSuccessiveLosses     = 3
+	DefaultRPMTCPDestinationPort   = 80
+)
+
 // RPMTest defines a test within an RPM probe.
 type RPMTest struct {
 	Name                string
@@ -541,8 +550,50 @@ type RPMTest struct {
 	ProbeCount          int // number of probes per test (0 = default 1)
 	TestInterval        int // seconds (0 = default 60)
 	ThresholdSuccessive int // successive failures before probe-fail (0 = default 3)
-	ProbeLimit          int // max consecutive failed probes before test is declared failed (0 = unlimited)
+	ProbeLimit          int // max consecutive failed probes before stopping the current test cycle (0 = unlimited)
 	DestPort            int // for tcp-ping
+}
+
+func (t *RPMTest) EffectiveProbeType() string {
+	if t == nil || t.ProbeType == "" {
+		return DefaultRPMProbeType
+	}
+	return t.ProbeType
+}
+
+func (t *RPMTest) EffectiveProbeInterval() int {
+	if t == nil || t.ProbeInterval <= 0 {
+		return DefaultRPMProbeIntervalSeconds
+	}
+	return t.ProbeInterval
+}
+
+func (t *RPMTest) EffectiveProbeCount() int {
+	if t == nil || t.ProbeCount <= 0 {
+		return DefaultRPMProbeCount
+	}
+	return t.ProbeCount
+}
+
+func (t *RPMTest) EffectiveTestInterval() int {
+	if t == nil || t.TestInterval <= 0 {
+		return DefaultRPMTestIntervalSeconds
+	}
+	return t.TestInterval
+}
+
+func (t *RPMTest) EffectiveSuccessiveLossThreshold() int {
+	if t == nil || t.ThresholdSuccessive <= 0 {
+		return DefaultRPMSuccessiveLosses
+	}
+	return t.ThresholdSuccessive
+}
+
+func (t *RPMTest) EffectiveDestinationPort() int {
+	if t == nil || t.DestPort <= 0 {
+		return DefaultRPMTCPDestinationPort
+	}
+	return t.DestPort
 }
 
 // FlowMonitoringConfig holds flow monitoring configuration.

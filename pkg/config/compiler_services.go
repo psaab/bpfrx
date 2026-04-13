@@ -6,6 +6,39 @@ import (
 	"strings"
 )
 
+var supportedRPMProbeTypes = map[string]struct{}{
+	DefaultRPMProbeType: {},
+	"tcp-ping":          {},
+	"http-get":          {},
+}
+
+func parseRPMPositiveInt(probeName, testName, field, raw string) (int, error) {
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("services rpm probe %q test %q %s: invalid integer %q", probeName, testName, field, raw)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("services rpm probe %q test %q %s: must be > 0", probeName, testName, field)
+	}
+	return n, nil
+}
+
+func validateRPMTest(probeName string, test *RPMTest) error {
+	if test.Target == "" {
+		return fmt.Errorf("services rpm probe %q test %q: target is required", probeName, test.Name)
+	}
+	if _, ok := supportedRPMProbeTypes[test.EffectiveProbeType()]; !ok {
+		return fmt.Errorf(
+			"services rpm probe %q test %q: unsupported probe-type %q (want icmp-ping, tcp-ping, or http-get)",
+			probeName, test.Name, test.ProbeType,
+		)
+	}
+	if test.DestPort > 65535 {
+		return fmt.Errorf("services rpm probe %q test %q destination-port: must be 1-65535", probeName, test.Name)
+	}
+	return nil
+}
+
 func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error {
 	lsc := &DHCPLocalServerConfig{
 		Groups: make(map[string]*DHCPServerGroup),
@@ -181,45 +214,61 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 					test.RoutingInstance = nodeVal(prop)
 				case "probe-interval":
 					if v := nodeVal(prop); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							test.ProbeInterval = n
+						n, err := parseRPMPositiveInt(probe.Name, test.Name, "probe-interval", v)
+						if err != nil {
+							return err
 						}
+						test.ProbeInterval = n
 					}
 				case "probe-count":
 					if v := nodeVal(prop); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							test.ProbeCount = n
+						n, err := parseRPMPositiveInt(probe.Name, test.Name, "probe-count", v)
+						if err != nil {
+							return err
 						}
+						test.ProbeCount = n
 					}
 				case "test-interval":
 					if v := nodeVal(prop); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							test.TestInterval = n
+						n, err := parseRPMPositiveInt(probe.Name, test.Name, "test-interval", v)
+						if err != nil {
+							return err
 						}
+						test.TestInterval = n
 					}
 				case "thresholds":
 					for _, th := range prop.Children {
 						if th.Name() == "successive-loss" {
 							if v := nodeVal(th); v != "" {
-								if n, err := strconv.Atoi(v); err == nil {
-									test.ThresholdSuccessive = n
+								n, err := parseRPMPositiveInt(probe.Name, test.Name, "thresholds successive-loss", v)
+								if err != nil {
+									return err
 								}
+								test.ThresholdSuccessive = n
 							}
 						}
 					}
 				case "probe-limit":
 					if v := nodeVal(prop); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							test.ProbeLimit = n
+						n, err := parseRPMPositiveInt(probe.Name, test.Name, "probe-limit", v)
+						if err != nil {
+							return err
 						}
+						test.ProbeLimit = n
 					}
 				case "destination-port":
 					if v := nodeVal(prop); v != "" {
-						if n, err := strconv.Atoi(v); err == nil {
-							test.DestPort = n
+						n, err := parseRPMPositiveInt(probe.Name, test.Name, "destination-port", v)
+						if err != nil {
+							return err
 						}
+						test.DestPort = n
 					}
 				}
+			}
+
+			if err := validateRPMTest(probe.Name, test); err != nil {
+				return err
 			}
 
 			probe.Tests[test.Name] = test

@@ -25,11 +25,32 @@ import (
 	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
 	"github.com/psaab/bpfrx/pkg/logging"
 	"github.com/psaab/bpfrx/pkg/routing"
+	"github.com/psaab/bpfrx/pkg/rpm"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func writeRPMConfig(buf *strings.Builder, cfg *config.Config) {
+	if cfg == nil {
+		buf.WriteString("No active configuration\n")
+		return
+	}
+	if cfg.Services.RPM == nil || len(cfg.Services.RPM.Probes) == 0 {
+		buf.WriteString("No RPM probes configured\n")
+		return
+	}
+
+	buf.WriteString("RPM Probe Configuration:\n")
+	for _, probeName := range rpm.SortedProbeNames(cfg.Services.RPM.Probes) {
+		probe := cfg.Services.RPM.Probes[probeName]
+		for _, testName := range rpm.SortedTestNames(probe.Tests) {
+			rpm.WriteConfiguredTest(buf, probeName, testName, probe.Tests[testName])
+			buf.WriteString("\n")
+		}
+	}
+}
 
 // --- Operational show RPCs ---
 
@@ -3256,13 +3277,9 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 
 	case "rpm":
-		if s.rpmResultsFn == nil {
-			buf.WriteString("RPM probes not available\n")
-		} else {
+		if s.rpmResultsFn != nil {
 			results := s.rpmResultsFn()
-			if len(results) == 0 {
-				buf.WriteString("No RPM probes configured\n")
-			} else {
+			if len(results) > 0 {
 				buf.WriteString("RPM Probe Results:\n")
 				for _, r := range results {
 					fmt.Fprintf(&buf, "  Probe: %s, Test: %s\n", r.ProbeName, r.TestName)
@@ -3286,7 +3303,11 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 						fmt.Fprintf(&buf, "    Last probe: %s\n", r.LastProbeAt.Format("2006-01-02 15:04:05"))
 					}
 				}
+			} else {
+				writeRPMConfig(&buf, s.store.ActiveConfig())
 			}
+		} else {
+			writeRPMConfig(&buf, s.store.ActiveConfig())
 		}
 
 	case "version":
