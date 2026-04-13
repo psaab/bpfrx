@@ -27,6 +27,21 @@ type sessionBriefRow struct {
 	RevPackets  uint64
 }
 
+func newSessionBriefRow(id uint64, srcAddr string, srcPort uint16, dstAddr string, dstPort uint16, proto, inZone, outZone, nat, state string, age, fwdPackets, revPackets uint64) sessionBriefRow {
+	return sessionBriefRow{
+		ID:          id,
+		Source:      formatSessionBriefEndpoint(srcAddr, srcPort),
+		Destination: formatSessionBriefEndpoint(dstAddr, dstPort),
+		Proto:       proto,
+		Zone:        inZone + "->" + outZone,
+		NAT:         nat,
+		State:       state,
+		Age:         age,
+		FwdPackets:  fwdPackets,
+		RevPackets:  revPackets,
+	}
+}
+
 func newSessionBriefWriter(w io.Writer) *tabwriter.Writer {
 	return tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 }
@@ -56,6 +71,9 @@ func printSessionBriefRow(w io.Writer, row sessionBriefRow) {
 }
 
 func formatSessionBriefEndpoint(addr string, port uint16) string {
+	if addr == "" {
+		return "-"
+	}
 	ip := net.ParseIP(addr)
 	if ip != nil && ip.To4() == nil {
 		return fmt.Sprintf("[%s]:%d", addr, port)
@@ -280,18 +298,14 @@ func (c *CLI) showFlowSession(args []string) error {
 			if now > val.Created {
 				age = now - val.Created
 			}
-			printSessionBriefRow(briefWriter, sessionBriefRow{
-				ID:          sid,
-				Source:      formatSessionBriefEndpoint(srcIP.String(), srcPort),
-				Destination: formatSessionBriefEndpoint(dstIP.String(), dstPort),
-				Proto:       protoName,
-				Zone:        inZone + "->" + outZone,
-				NAT:         natFlag,
-				State:       stateName[:min(5, len(stateName))],
-				Age:         age,
-				FwdPackets:  val.FwdPackets,
-				RevPackets:  val.RevPackets,
-			})
+			printSessionBriefRow(briefWriter, newSessionBriefRow(
+				sid,
+				srcIP.String(), srcPort,
+				dstIP.String(), dstPort,
+				protoName, inZone, outZone, natFlag,
+				stateName[:min(5, len(stateName))],
+				age, val.FwdPackets, val.RevPackets,
+			))
 			return
 		}
 
@@ -414,18 +428,14 @@ func (c *CLI) showFlowSession(args []string) error {
 			if now > val.Created {
 				age = now - val.Created
 			}
-			printSessionBriefRow(briefWriter, sessionBriefRow{
-				ID:          sid,
-				Source:      formatSessionBriefEndpoint(srcIP.String(), srcPort),
-				Destination: formatSessionBriefEndpoint(dstIP.String(), dstPort),
-				Proto:       protoName,
-				Zone:        inZone + "->" + outZone,
-				NAT:         natFlag,
-				State:       stateName[:min(5, len(stateName))],
-				Age:         age,
-				FwdPackets:  val.FwdPackets,
-				RevPackets:  val.RevPackets,
-			})
+			printSessionBriefRow(briefWriter, newSessionBriefRow(
+				sid,
+				srcIP.String(), srcPort,
+				dstIP.String(), dstPort,
+				protoName, inZone, outZone, natFlag,
+				stateName[:min(5, len(stateName))],
+				age, val.FwdPackets, val.RevPackets,
+			))
 			return
 		}
 
@@ -510,7 +520,9 @@ func (c *CLI) showFlowSession(args []string) error {
 		return fmt.Errorf("iterate sessions_v6: %w", err)
 	}
 
-	flushSessionBriefWriter(briefWriter)
+	if briefWriter != nil {
+		flushSessionBriefWriter(briefWriter)
+	}
 
 	if f.summary {
 		// In cluster mode, print dual-node Junos-style output.
@@ -624,18 +636,14 @@ func (c *CLI) showFlowSession(args []string) error {
 					if se.AgeSeconds > 0 {
 						age = uint64(se.AgeSeconds)
 					}
-					printSessionBriefRow(peerBriefWriter, sessionBriefRow{
-						ID:          peerSID,
-						Source:      formatSessionBriefEndpoint(se.SrcAddr, uint16(se.SrcPort)),
-						Destination: formatSessionBriefEndpoint(se.DstAddr, uint16(se.DstPort)),
-						Proto:       se.Protocol,
-						Zone:        inZone + "->" + outZone,
-						NAT:         natFlag,
-						State:       st,
-						Age:         age,
-						FwdPackets:  se.FwdPackets,
-						RevPackets:  se.RevPackets,
-					})
+					printSessionBriefRow(peerBriefWriter, newSessionBriefRow(
+						peerSID,
+						se.SrcAddr, uint16(se.SrcPort),
+						se.DstAddr, uint16(se.DstPort),
+						se.Protocol, inZone, outZone, natFlag,
+						st,
+						age, se.FwdPackets, se.RevPackets,
+					))
 				}
 				flushSessionBriefWriter(peerBriefWriter)
 			} else {
