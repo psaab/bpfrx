@@ -21,8 +21,8 @@ Use these sources in this order when there is disagreement:
 ### 1) vSRX parity gaps (from `docs/feature-gaps.md` row data)
 
 Row-level gap totals:
-- Missing: 125
-- Partial: 13
+- Missing: 124
+- Partial: 14
 - Parse-Only: 1
 - Total Open Gaps: 139
 
@@ -45,7 +45,7 @@ Category totals:
 | 13. PKI / Certificates | 3 | 1 | 0 | 4 |
 | 14. Routing Enhancements | 10 | 3 | 0 | 13 |
 | 15. VPN Enhancements | 9 | 0 | 0 | 9 |
-| 16. HA Enhancements | 0 | 1 | 0 | 1 |
+| 16. HA Enhancements | 0 | 2 | 0 | 2 |
 | 17. Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
 | 18. QoS / Class of Service | 7 | 1 | 0 | 8 |
 | 19. Multi-Tenancy | 4 | 0 | 0 | 4 |
@@ -69,7 +69,6 @@ From `docs/next-features` and HA proposal docs:
 - Strict single-owner VIP mode for same-L2 HA (tracking issue #104)
 - Deterministic VRRP failover reconciliation
 - Runtime behavior for `system license autoupdate url`
-- Explicit Twice NAT parity validation and support contract (tracking issue #645; see `docs/next-features/twice-nat.md`)
 
 ### 3) Additional open items from bug/test planning docs
 
