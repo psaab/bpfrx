@@ -271,13 +271,21 @@ pub(super) enum TxError {
     Drop(String),
 }
 
+#[derive(Clone, Copy)]
+enum CoSServicePhase {
+    Guarantee,
+    Surplus,
+}
+
 enum CoSBatch {
     Local {
         queue_idx: usize,
+        phase: CoSServicePhase,
         items: VecDeque<TxRequest>,
     },
     Prepared {
         queue_idx: usize,
+        phase: CoSServicePhase,
         items: VecDeque<PreparedTxRequest>,
     },
 }
@@ -352,8 +360,7 @@ fn build_cos_batch(
     root_ifindex: i32,
     now_ns: u64,
 ) -> Option<CoSBatch> {
-    let mut selected = None;
-    {
+    let selected = {
         let root = binding.cos_interfaces.get_mut(&root_ifindex)?;
         advance_cos_timer_wheel(root, now_ns);
         refill_cos_tokens(
@@ -363,116 +370,218 @@ fn build_cos_batch(
             &mut root.last_refill_ns,
             now_ns,
         );
-        for priority in 0..COS_PRIORITY_LEVELS {
-            let indices_len = root.queue_indices_by_priority[priority].len();
-            if indices_len == 0 {
-                continue;
-            }
-            let start = root.rr_index_by_priority[priority] % indices_len;
-            for offset in 0..indices_len {
-                let queue_idx =
-                    root.queue_indices_by_priority[priority][(start + offset) % indices_len];
-                let queue = &mut root.queues[queue_idx];
-                if queue.items.is_empty() || !queue.runnable {
-                    continue;
-                }
-                refill_cos_tokens(
-                    &mut queue.tokens,
-                    queue.transmit_rate_bytes,
-                    queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
-                    &mut queue.last_refill_ns,
-                    now_ns,
-                );
-                let Some(head) = queue.items.front() else {
-                    continue;
-                };
-                let head_len = cos_item_len(head);
-                if root.tokens < head_len || queue.tokens < head_len {
-                    if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
-                        root.tokens,
-                        root.shaping_rate_bytes,
-                        queue.tokens,
-                        queue.transmit_rate_bytes,
-                        head_len,
-                        now_ns,
-                    ) {
-                        park_cos_queue(root, queue_idx, wake_tick);
-                    }
-                    continue;
-                }
-                root.rr_index_by_priority[priority] = (start + offset + 1) % indices_len;
-                let mut remaining_root = root.tokens;
-                let mut remaining_queue = queue.tokens;
-                match head {
-                    CoSPendingTxItem::Local(_) => {
-                        let mut items = VecDeque::new();
-                        while items.len() < TX_BATCH_SIZE {
-                            let Some(front) = queue.items.front() else {
-                                break;
-                            };
-                            let len = cos_item_len(front);
-                            if !matches!(front, CoSPendingTxItem::Local(_))
-                                || remaining_root < len
-                                || remaining_queue < len
-                            {
-                                break;
-                            }
-                            remaining_root = remaining_root.saturating_sub(len);
-                            remaining_queue = remaining_queue.saturating_sub(len);
-                            match queue.items.pop_front() {
-                                Some(CoSPendingTxItem::Local(req)) => items.push_back(req),
-                                Some(other) => {
-                                    queue.items.push_front(other);
-                                    break;
-                                }
-                                None => break,
-                            }
-                        }
-                        if !items.is_empty() {
-                            selected = Some(CoSBatch::Local { queue_idx, items });
-                            break;
-                        }
-                    }
-                    CoSPendingTxItem::Prepared(_) => {
-                        let mut items = VecDeque::new();
-                        while items.len() < TX_BATCH_SIZE {
-                            let Some(front) = queue.items.front() else {
-                                break;
-                            };
-                            let len = cos_item_len(front);
-                            if !matches!(front, CoSPendingTxItem::Prepared(_))
-                                || remaining_root < len
-                                || remaining_queue < len
-                            {
-                                break;
-                            }
-                            remaining_root = remaining_root.saturating_sub(len);
-                            remaining_queue = remaining_queue.saturating_sub(len);
-                            match queue.items.pop_front() {
-                                Some(CoSPendingTxItem::Prepared(req)) => items.push_back(req),
-                                Some(other) => {
-                                    queue.items.push_front(other);
-                                    break;
-                                }
-                                None => break,
-                            }
-                        }
-                        if !items.is_empty() {
-                            selected = Some(CoSBatch::Prepared { queue_idx, items });
-                            break;
-                        }
-                    }
-                }
-            }
-            if selected.is_some() {
-                break;
-            }
-        }
-    }
+        select_cos_guarantee_batch(root, now_ns).or_else(|| select_cos_surplus_batch(root, now_ns))
+    };
     if selected.is_some() {
         refresh_cos_interface_activity(binding, root_ifindex);
     }
     selected
+}
+
+fn select_cos_guarantee_batch(root: &mut CoSInterfaceRuntime, now_ns: u64) -> Option<CoSBatch> {
+    let queue_count = root.queues.len();
+    if queue_count == 0 {
+        return None;
+    }
+    let start = root.guarantee_rr % queue_count;
+    for offset in 0..queue_count {
+        let queue_idx = (start + offset) % queue_count;
+        let queue = &mut root.queues[queue_idx];
+        if queue.items.is_empty() || !queue.runnable {
+            continue;
+        }
+        refill_cos_tokens(
+            &mut queue.tokens,
+            queue.transmit_rate_bytes,
+            queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
+            &mut queue.last_refill_ns,
+            now_ns,
+        );
+        let Some(head) = queue.items.front() else {
+            continue;
+        };
+        let head_len = cos_item_len(head);
+        if root.tokens < head_len {
+            if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
+                root.tokens,
+                root.shaping_rate_bytes,
+                queue.tokens,
+                queue.transmit_rate_bytes,
+                head_len,
+                now_ns,
+                queue.exact,
+            ) {
+                park_cos_queue(root, queue_idx, wake_tick);
+            }
+            continue;
+        }
+        if queue.tokens < head_len {
+            if queue.exact {
+                if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
+                    root.tokens,
+                    root.shaping_rate_bytes,
+                    queue.tokens,
+                    queue.transmit_rate_bytes,
+                    head_len,
+                    now_ns,
+                    true,
+                ) {
+                    park_cos_queue(root, queue_idx, wake_tick);
+                }
+            }
+            continue;
+        }
+        root.guarantee_rr = (start + offset + 1) % queue_count;
+        if let Some(batch) = build_cos_batch_from_queue(
+            queue,
+            queue_idx,
+            root.tokens,
+            queue.tokens,
+            CoSServicePhase::Guarantee,
+        ) {
+            return Some(batch);
+        }
+    }
+    None
+}
+
+fn select_cos_surplus_batch(root: &mut CoSInterfaceRuntime, now_ns: u64) -> Option<CoSBatch> {
+    for priority in 0..COS_PRIORITY_LEVELS {
+        let indices_len = root.queue_indices_by_priority[priority].len();
+        if indices_len == 0 {
+            continue;
+        }
+        let start = root.rr_index_by_priority[priority] % indices_len;
+        for offset in 0..indices_len {
+            let queue_idx =
+                root.queue_indices_by_priority[priority][(start + offset) % indices_len];
+            let queue = &mut root.queues[queue_idx];
+            if queue.items.is_empty() || !queue.runnable || queue.exact {
+                continue;
+            }
+            let Some(head) = queue.items.front() else {
+                continue;
+            };
+            let head_len = cos_item_len(head);
+            if root.tokens < head_len {
+                if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
+                    root.tokens,
+                    root.shaping_rate_bytes,
+                    queue.tokens,
+                    queue.transmit_rate_bytes,
+                    head_len,
+                    now_ns,
+                    false,
+                ) {
+                    park_cos_queue(root, queue_idx, wake_tick);
+                }
+                continue;
+            }
+            if queue.surplus_deficit < head_len {
+                queue.surplus_deficit = queue
+                    .surplus_deficit
+                    .saturating_add(cos_surplus_quantum_bytes(queue));
+                if queue.surplus_deficit < head_len {
+                    continue;
+                }
+            }
+            root.rr_index_by_priority[priority] = (start + offset + 1) % indices_len;
+            if let Some(batch) = build_cos_batch_from_queue(
+                queue,
+                queue_idx,
+                root.tokens,
+                queue.surplus_deficit,
+                CoSServicePhase::Surplus,
+            ) {
+                return Some(batch);
+            }
+        }
+    }
+    None
+}
+
+fn build_cos_batch_from_queue(
+    queue: &mut CoSQueueRuntime,
+    queue_idx: usize,
+    root_budget: u64,
+    secondary_budget: u64,
+    phase: CoSServicePhase,
+) -> Option<CoSBatch> {
+    let head = queue.items.front()?;
+    match head {
+        CoSPendingTxItem::Local(_) => {
+            let mut items = VecDeque::new();
+            let mut remaining_root = root_budget;
+            let mut remaining_secondary = secondary_budget;
+            while items.len() < TX_BATCH_SIZE {
+                let Some(front) = queue.items.front() else {
+                    break;
+                };
+                let len = cos_item_len(front);
+                if !matches!(front, CoSPendingTxItem::Local(_))
+                    || remaining_root < len
+                    || remaining_secondary < len
+                {
+                    break;
+                }
+                remaining_root = remaining_root.saturating_sub(len);
+                remaining_secondary = remaining_secondary.saturating_sub(len);
+                match queue.items.pop_front() {
+                    Some(CoSPendingTxItem::Local(req)) => items.push_back(req),
+                    Some(other) => {
+                        queue.items.push_front(other);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            if items.is_empty() {
+                None
+            } else {
+                Some(CoSBatch::Local {
+                    queue_idx,
+                    phase,
+                    items,
+                })
+            }
+        }
+        CoSPendingTxItem::Prepared(_) => {
+            let mut items = VecDeque::new();
+            let mut remaining_root = root_budget;
+            let mut remaining_secondary = secondary_budget;
+            while items.len() < TX_BATCH_SIZE {
+                let Some(front) = queue.items.front() else {
+                    break;
+                };
+                let len = cos_item_len(front);
+                if !matches!(front, CoSPendingTxItem::Prepared(_))
+                    || remaining_root < len
+                    || remaining_secondary < len
+                {
+                    break;
+                }
+                remaining_root = remaining_root.saturating_sub(len);
+                remaining_secondary = remaining_secondary.saturating_sub(len);
+                match queue.items.pop_front() {
+                    Some(CoSPendingTxItem::Prepared(req)) => items.push_back(req),
+                    Some(other) => {
+                        queue.items.push_front(other);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            if items.is_empty() {
+                None
+            } else {
+                Some(CoSBatch::Prepared {
+                    queue_idx,
+                    phase,
+                    items,
+                })
+            }
+        }
+    }
 }
 
 fn submit_cos_batch(
@@ -485,10 +594,11 @@ fn submit_cos_batch(
     match batch {
         CoSBatch::Local {
             queue_idx,
+            phase,
             mut items,
         } => match transmit_batch(binding, &mut items, now_ns, shared_recycles) {
             Ok((packets, bytes)) => {
-                apply_cos_send_result(binding, root_ifindex, queue_idx, bytes, items);
+                apply_cos_send_result(binding, root_ifindex, queue_idx, phase, bytes, items);
                 if packets > 0 {
                     binding
                         .live
@@ -512,10 +622,11 @@ fn submit_cos_batch(
         },
         CoSBatch::Prepared {
             queue_idx,
+            phase,
             mut items,
         } => match transmit_prepared_queue(binding, &mut items, now_ns) {
             Ok((packets, bytes)) => {
-                apply_cos_prepared_result(binding, root_ifindex, queue_idx, bytes, items);
+                apply_cos_prepared_result(binding, root_ifindex, queue_idx, phase, bytes, items);
                 if packets > 0 {
                     binding
                         .live
@@ -542,6 +653,7 @@ fn submit_cos_batch(
 
 const COS_TIMER_WHEEL_TICK_NS: u64 = 50_000;
 const COS_MIN_BURST_BYTES: u64 = 64 * 1500;
+const COS_SURPLUS_ROUND_QUANTUM_BYTES: u64 = 1500;
 const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 
 fn refill_cos_tokens(
@@ -599,6 +711,10 @@ fn cos_refill_ns_until(tokens: u64, need: u64, rate_bytes_per_sec: u64) -> Optio
     Some(deficit.saturating_mul(1_000_000_000u128).div_ceil(rate) as u64)
 }
 
+fn cos_surplus_quantum_bytes(queue: &CoSQueueRuntime) -> u64 {
+    COS_SURPLUS_ROUND_QUANTUM_BYTES.saturating_mul(u64::from(queue.surplus_weight.max(1)))
+}
+
 fn estimate_cos_queue_wakeup_tick(
     root_tokens: u64,
     root_rate_bytes: u64,
@@ -606,9 +722,14 @@ fn estimate_cos_queue_wakeup_tick(
     queue_rate_bytes: u64,
     need_bytes: u64,
     now_ns: u64,
+    require_queue_tokens: bool,
 ) -> Option<u64> {
     let root_refill_ns = cos_refill_ns_until(root_tokens, need_bytes, root_rate_bytes)?;
-    let queue_refill_ns = cos_refill_ns_until(queue_tokens, need_bytes, queue_rate_bytes)?;
+    let queue_refill_ns = if require_queue_tokens {
+        cos_refill_ns_until(queue_tokens, need_bytes, queue_rate_bytes)?
+    } else {
+        0
+    };
     let wake_ns = now_ns.saturating_add(root_refill_ns.max(queue_refill_ns));
     Some(cos_tick_for_ns(wake_ns).max(cos_tick_for_ns(now_ns).saturating_add(1)))
 }
@@ -859,6 +980,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
         default_queue: config.default_queue,
         nonempty_queues: 0,
         runnable_queues: 0,
+        guarantee_rr: 0,
         queues: config
             .queues
             .iter()
@@ -866,6 +988,9 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 queue_id: queue.queue_id,
                 priority: queue.priority,
                 transmit_rate_bytes: queue.transmit_rate_bytes,
+                exact: queue.exact,
+                surplus_weight: queue.surplus_weight,
+                surplus_deficit: 0,
                 buffer_bytes: queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
                 tokens: queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
                 last_refill_ns: now_ns,
@@ -982,6 +1107,7 @@ fn refresh_cos_interface_activity(binding: &mut BindingWorker, root_ifindex: i32
                 queue.runnable = false;
                 queue.parked = false;
                 queue.next_wakeup_tick = 0;
+                queue.surplus_deficit = 0;
                 continue;
             }
             new_nonempty = new_nonempty.saturating_add(1);
@@ -1010,6 +1136,7 @@ fn apply_cos_send_result(
     binding: &mut BindingWorker,
     root_ifindex: i32,
     queue_idx: usize,
+    phase: CoSServicePhase,
     sent_bytes: u64,
     retry: VecDeque<TxRequest>,
 ) {
@@ -1020,7 +1147,14 @@ fn apply_cos_send_result(
         if let Some(queue) = root.queues.get_mut(queue_idx) {
             restore_cos_local_items_inner(queue, retry);
             queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
-            queue.tokens = queue.tokens.saturating_sub(sent_bytes);
+            match phase {
+                CoSServicePhase::Guarantee => {
+                    queue.tokens = queue.tokens.saturating_sub(sent_bytes);
+                }
+                CoSServicePhase::Surplus => {
+                    queue.surplus_deficit = queue.surplus_deficit.saturating_sub(sent_bytes);
+                }
+            }
         }
         root.tokens = root.tokens.saturating_sub(sent_bytes);
     }
@@ -1031,6 +1165,7 @@ fn apply_cos_prepared_result(
     binding: &mut BindingWorker,
     root_ifindex: i32,
     queue_idx: usize,
+    phase: CoSServicePhase,
     sent_bytes: u64,
     retry: VecDeque<PreparedTxRequest>,
 ) {
@@ -1041,7 +1176,14 @@ fn apply_cos_prepared_result(
         if let Some(queue) = root.queues.get_mut(queue_idx) {
             restore_cos_prepared_items_inner(queue, retry);
             queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
-            queue.tokens = queue.tokens.saturating_sub(sent_bytes);
+            match phase {
+                CoSServicePhase::Guarantee => {
+                    queue.tokens = queue.tokens.saturating_sub(sent_bytes);
+                }
+                CoSServicePhase::Surplus => {
+                    queue.surplus_deficit = queue.surplus_deficit.saturating_sub(sent_bytes);
+                }
+            }
         }
         root.tokens = root.tokens.saturating_sub(sent_bytes);
     }
@@ -1711,12 +1853,14 @@ mod tests {
                     CoSSchedulerSnapshot {
                         name: "be-sched".into(),
                         transmit_rate_bytes: 4_000_000,
+                        transmit_rate_exact: false,
                         priority: "low".into(),
                         buffer_size_bytes: 128_000,
                     },
                     CoSSchedulerSnapshot {
                         name: "ef-sched".into(),
                         transmit_rate_bytes: 6_000_000,
+                        transmit_rate_exact: false,
                         priority: "strict-high".into(),
                         buffer_size_bytes: 64_000,
                     },
@@ -1812,12 +1956,14 @@ mod tests {
                     CoSSchedulerSnapshot {
                         name: "be-sched".into(),
                         transmit_rate_bytes: 4_000_000,
+                        transmit_rate_exact: false,
                         priority: "low".into(),
                         buffer_size_bytes: 128_000,
                     },
                     CoSSchedulerSnapshot {
                         name: "ef-sched".into(),
                         transmit_rate_bytes: 6_000_000,
+                        transmit_rate_exact: false,
                         priority: "strict-high".into(),
                         buffer_size_bytes: 64_000,
                     },
@@ -1881,6 +2027,7 @@ mod tests {
                 schedulers: vec![CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 10_000_000,
+                    transmit_rate_exact: false,
                     priority: "low".into(),
                     buffer_size_bytes: 128_000,
                 }],
@@ -1975,12 +2122,14 @@ mod tests {
                     CoSSchedulerSnapshot {
                         name: "be-sched".into(),
                         transmit_rate_bytes: 10_000_000,
+                        transmit_rate_exact: false,
                         priority: "low".into(),
                         buffer_size_bytes: 128_000,
                     },
                     CoSSchedulerSnapshot {
                         name: "ef-sched".into(),
                         transmit_rate_bytes: 10_000_000,
+                        transmit_rate_exact: false,
                         priority: "strict-high".into(),
                         buffer_size_bytes: 128_000,
                     },
@@ -2038,10 +2187,33 @@ mod tests {
                     forwarding_class: "best-effort".into(),
                     priority: 5,
                     transmit_rate_bytes: 1_000_000,
+                    exact: false,
+                    surplus_weight: 1,
                     buffer_bytes: COS_MIN_BURST_BYTES,
                 }],
             },
             now_ns,
+        )
+    }
+
+    fn test_cos_runtime_with_exact(exact: bool) -> CoSInterfaceRuntime {
+        build_cos_interface_runtime(
+            &CoSInterfaceConfig {
+                shaping_rate_bytes: 1_000_000,
+                burst_bytes: COS_MIN_BURST_BYTES,
+                default_queue: 0,
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![CoSQueueConfig {
+                    queue_id: 0,
+                    forwarding_class: "best-effort".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 500_000,
+                    exact,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                }],
+            },
+            0,
         )
     }
 
@@ -2070,10 +2242,91 @@ mod tests {
             root.queues[0].transmit_rate_bytes,
             1500,
             0,
+            true,
         )
         .expect("wake tick");
 
         assert_eq!(wake_tick, 30);
+    }
+
+    #[test]
+    fn estimate_cos_queue_wakeup_tick_ignores_queue_deficit_for_surplus() {
+        let mut root = test_cos_interface_runtime(0);
+        root.tokens = 0;
+        root.queues[0].tokens = 0;
+
+        let wake_tick = estimate_cos_queue_wakeup_tick(
+            root.tokens,
+            root.shaping_rate_bytes,
+            root.queues[0].tokens,
+            root.queues[0].transmit_rate_bytes,
+            1500,
+            0,
+            false,
+        )
+        .expect("wake tick");
+
+        assert_eq!(wake_tick, 30);
+    }
+
+    #[test]
+    fn surplus_phase_selects_non_exact_queue_without_guarantee_tokens() {
+        let mut root = test_cos_runtime_with_exact(false);
+        root.last_refill_ns = 1;
+        root.tokens = 1500;
+        root.queues[0].last_refill_ns = 1;
+        root.queues[0].tokens = 0;
+        root.queues[0].items.push_back(test_cos_item(1500));
+        root.queues[0].queued_bytes = 1500;
+        root.queues[0].runnable = true;
+        root.nonempty_queues = 1;
+        root.runnable_queues = 1;
+
+        assert!(select_cos_guarantee_batch(&mut root, 1).is_none());
+        let batch = select_cos_surplus_batch(&mut root, 1);
+
+        assert!(matches!(
+            batch,
+            Some(CoSBatch::Local {
+                phase: CoSServicePhase::Surplus,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn surplus_phase_skips_exact_queue_without_guarantee_tokens() {
+        let mut root = test_cos_runtime_with_exact(true);
+        root.last_refill_ns = 1;
+        root.tokens = 1500;
+        root.queues[0].last_refill_ns = 1;
+        root.queues[0].tokens = 0;
+        root.queues[0].items.push_back(test_cos_item(1500));
+        root.queues[0].queued_bytes = 1500;
+        root.queues[0].runnable = true;
+        root.nonempty_queues = 1;
+        root.runnable_queues = 1;
+
+        assert!(select_cos_guarantee_batch(&mut root, 1).is_none());
+        assert!(select_cos_surplus_batch(&mut root, 1).is_none());
+    }
+
+    #[test]
+    fn guarantee_phase_parks_non_exact_queue_on_root_only_wakeup() {
+        let mut root = test_cos_runtime_with_exact(false);
+        root.last_refill_ns = 1;
+        root.tokens = 0;
+        root.queues[0].last_refill_ns = 1;
+        root.queues[0].tokens = 0;
+        root.queues[0].items.push_back(test_cos_item(1500));
+        root.queues[0].queued_bytes = 1500;
+        root.queues[0].runnable = true;
+        root.nonempty_queues = 1;
+        root.runnable_queues = 1;
+
+        assert!(select_cos_guarantee_batch(&mut root, 1).is_none());
+        assert!(root.queues[0].parked);
+        assert_eq!(root.queues[0].next_wakeup_tick, 30);
     }
 
     #[test]

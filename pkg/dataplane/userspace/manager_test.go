@@ -2653,6 +2653,36 @@ func TestBuildInterfaceSnapshotIncludesInputAndOutputFilters(t *testing.T) {
 	}
 }
 
+func TestBuildClassOfServiceSnapshotIncludesTransmitRateExact(t *testing.T) {
+	cfg := &config.Config{
+		ClassOfService: &config.ClassOfServiceConfig{
+			Schedulers: map[string]*config.CoSScheduler{
+				"exact-sched": {
+					Name:              "exact-sched",
+					TransmitRateBytes: 1_250_000,
+					TransmitRateExact: true,
+					Priority:          "strict-high",
+					BufferSizeBytes:   64_000,
+				},
+			},
+		},
+	}
+
+	snap := buildClassOfServiceSnapshot(cfg)
+	if snap == nil {
+		t.Fatal("expected non-nil class-of-service snapshot")
+	}
+	if len(snap.Schedulers) != 1 {
+		t.Fatalf("Schedulers len = %d, want 1", len(snap.Schedulers))
+	}
+	if !snap.Schedulers[0].TransmitRateExact {
+		t.Fatal("expected transmit_rate_exact in class-of-service snapshot")
+	}
+	if got := snap.Schedulers[0].TransmitRateBytes; got != 1_250_000 {
+		t.Fatalf("TransmitRateBytes = %d, want 1250000", got)
+	}
+}
+
 func TestBuildScreenSnapshotsIncludesAdvancedFields(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{

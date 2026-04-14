@@ -314,6 +314,7 @@ type CoSForwardingClass struct {
 type CoSScheduler struct {
 	Name              string
 	TransmitRateBytes uint64
+	TransmitRateExact bool
 	Priority          string
 	BufferSizeBytes   uint64
 }

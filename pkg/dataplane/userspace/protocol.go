@@ -137,6 +137,7 @@ type CoSForwardingClassSnapshot struct {
 type CoSSchedulerSnapshot struct {
 	Name              string `json:"name"`
 	TransmitRateBytes uint64 `json:"transmit_rate_bytes,omitempty"`
+	TransmitRateExact bool   `json:"transmit_rate_exact,omitempty"`
 	Priority          string `json:"priority,omitempty"`
 	BufferSizeBytes   uint64 `json:"buffer_size_bytes,omitempty"`
 }

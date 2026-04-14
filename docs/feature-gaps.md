@@ -322,17 +322,17 @@ xpf has firewall filters with source/dest addresses, prefix-lists (with except),
 
 ## 18. QoS / Class of Service
 
-Note: The vSRX deployment guide markets CoS as part of the standard feature set, but the user guide also calls out important CoS limitations on vSRX, such as the lack of high-priority SPC queue support. xpf now has a userspace-only Phase 1 CoS path with forwarding-class parsing, scheduler-map binding, interface shaping, and FIFO-per-class scheduling, but it is still materially narrower than Junos CoS.
+Note: The vSRX deployment guide markets CoS as part of the standard feature set, but the user guide also calls out important CoS limitations on vSRX, such as the lack of high-priority SPC queue support. xpf now has a userspace-only CoS path with forwarding-class parsing, scheduler-map binding, egress shaping, timer-wheel deferred eligibility, and guarantee/surplus queue scheduling, but it is still materially narrower than Junos CoS.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **Forwarding Classes** | `class-of-service forwarding-classes queue <num> <name>;` | Define custom forwarding class names mapped to queue numbers | Low | Done |
 | **Scheduler Maps** | `class-of-service scheduler-maps ...` | Associate forwarding classes with schedulers (bandwidth %, priority, buffer) | Low | Done |
-| **Schedulers** | `class-of-service schedulers ...` | Define per-queue scheduling parameters (transmit rate, priority, drop profile) | Low | Partial (userspace Phase 1 supports transmit-rate, priority, and buffer-size, but not the fuller Junos scheduler/drop-profile model) |
+| **Schedulers** | `class-of-service schedulers ...` | Define per-queue scheduling parameters (transmit rate, priority, drop profile) | Low | Partial (userspace supports transmit-rate, `transmit-rate exact`, priority, and buffer-size, but not the fuller Junos scheduler/drop-profile model) |
 | **BA Classifiers** | `class-of-service classifiers dscp ...` | Classify incoming traffic by DSCP/802.1p into forwarding classes and loss priorities | Low | Missing |
 | **Rewrite Rules** | `class-of-service rewrite-rules dscp ...` | Rewrite outgoing DSCP/802.1p values. xpf has filter-based DSCP rewrite. | Low | Partial (via firewall filter forwarding-class action) |
 | **WRED Drop Profiles** | `class-of-service drop-profiles ...` | Weighted Random Early Detection congestion avoidance per queue | Low | Missing |
-| **Traffic Shaping** | `class-of-service interfaces ... shaping-rate ...` | Per-interface output rate shaping | Low | Partial (userspace-only Phase 1 egress shaping with FIFO-per-class queues and timer-wheel deferred eligibility; not full Junos CoS parity) |
+| **Traffic Shaping** | `class-of-service interfaces ... shaping-rate ...` | Per-interface output rate shaping | Low | Partial (userspace-only egress shaping with queue guarantees, non-`exact` surplus borrowing, and timer-wheel deferred eligibility; not full Junos CoS parity) |
 | **Interface CoS Binding** | `class-of-service interfaces ... scheduler-map ...` | Bind scheduler-map and classifiers to specific interfaces | Low | Partial (scheduler-map binding works on userspace interfaces, but BA classifiers and broader CoS attachment semantics are still missing) |
 
 ---

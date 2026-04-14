@@ -41,9 +41,11 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 		for _, child := range inst.node.Children {
 			switch child.Name() {
 			case "transmit-rate":
-				if v := nodeVal(child); v != "" {
-					sched.TransmitRateBytes = parseBandwidthLimit(v)
+				rate, exact := parseCoSTransmitRate(child)
+				if rate > 0 {
+					sched.TransmitRateBytes = rate
 				}
+				sched.TransmitRateExact = sched.TransmitRateExact || exact
 			case "priority":
 				sched.Priority = nodeVal(child)
 			case "buffer-size":
@@ -116,4 +118,22 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	}
 
 	return nil
+}
+
+func parseCoSTransmitRate(node *Node) (uint64, bool) {
+	var rate uint64
+	exact := false
+	for _, key := range node.Keys[1:] {
+		if key == "exact" {
+			exact = true
+			continue
+		}
+		if parsed := parseBandwidthLimit(key); parsed > 0 {
+			rate = parsed
+		}
+	}
+	if node.FindChild("exact") != nil {
+		exact = true
+	}
+	return rate, exact
 }

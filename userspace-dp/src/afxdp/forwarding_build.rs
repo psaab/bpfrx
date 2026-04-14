@@ -471,6 +471,10 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                     continue;
                 };
                 let scheduler = schedulers.get(&entry.scheduler).copied();
+                let transmit_rate_bytes = scheduler
+                    .map(|sched| sched.transmit_rate_bytes)
+                    .filter(|rate| *rate > 0)
+                    .unwrap_or(iface.cos_shaping_rate_bytes_per_sec);
                 queues.push(CoSQueueConfig {
                     queue_id,
                     forwarding_class: entry.forwarding_class.clone(),
@@ -479,10 +483,14 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                             .map(|sched| sched.priority.as_str())
                             .unwrap_or("low"),
                     ),
-                    transmit_rate_bytes: scheduler
-                        .map(|sched| sched.transmit_rate_bytes)
-                        .filter(|rate| *rate > 0)
-                        .unwrap_or(iface.cos_shaping_rate_bytes_per_sec),
+                    transmit_rate_bytes,
+                    exact: scheduler
+                        .map(|sched| sched.transmit_rate_exact)
+                        .unwrap_or(false),
+                    surplus_weight: cos_surplus_weight(
+                        transmit_rate_bytes.max(1),
+                        iface.cos_shaping_rate_bytes_per_sec,
+                    ),
                     buffer_bytes: scheduler
                         .map(|sched| sched.buffer_size_bytes)
                         .filter(|size| *size > 0)
@@ -496,6 +504,8 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                 forwarding_class: "best-effort".to_string(),
                 priority: cos_priority_rank("low"),
                 transmit_rate_bytes: iface.cos_shaping_rate_bytes_per_sec,
+                exact: false,
+                surplus_weight: 1,
                 buffer_bytes: burst_bytes,
             });
         }
@@ -529,6 +539,15 @@ fn default_cos_burst_bytes(rate_bytes: u64) -> u64 {
         .checked_div(100)
         .unwrap_or_default()
         .max(64 * 1500)
+}
+
+fn cos_surplus_weight(rate_bytes: u64, root_rate_bytes: u64) -> u32 {
+    if rate_bytes == 0 || root_rate_bytes == 0 {
+        return 1;
+    }
+    ((rate_bytes as u128) * 16)
+        .div_ceil(root_rate_bytes as u128)
+        .clamp(1, 16) as u32
 }
 
 fn cos_priority_rank(priority: &str) -> u8 {
@@ -575,12 +594,14 @@ mod tests {
                     CoSSchedulerSnapshot {
                         name: "be-sched".into(),
                         transmit_rate_bytes: 3_000_000,
+                        transmit_rate_exact: false,
                         priority: "low".into(),
                         buffer_size_bytes: 128_000,
                     },
                     CoSSchedulerSnapshot {
                         name: "ef-sched".into(),
                         transmit_rate_bytes: 7_000_000,
+                        transmit_rate_exact: true,
                         priority: "strict-high".into(),
                         buffer_size_bytes: 64_000,
                     },
@@ -612,11 +633,15 @@ mod tests {
         assert_eq!(iface.queues[0].forwarding_class, "best-effort");
         assert_eq!(iface.queues[0].priority, 5);
         assert_eq!(iface.queues[0].transmit_rate_bytes, 3_000_000);
+        assert!(!iface.queues[0].exact);
+        assert_eq!(iface.queues[0].surplus_weight, 5);
         assert_eq!(iface.queues[0].buffer_bytes, 128_000);
         assert_eq!(iface.queues[1].queue_id, 1);
         assert_eq!(iface.queues[1].forwarding_class, "expedited-forwarding");
         assert_eq!(iface.queues[1].priority, 0);
         assert_eq!(iface.queues[1].transmit_rate_bytes, 7_000_000);
+        assert!(iface.queues[1].exact);
+        assert_eq!(iface.queues[1].surplus_weight, 12);
         assert_eq!(iface.queues[1].buffer_bytes, 64_000);
     }
 
@@ -646,10 +671,51 @@ mod tests {
         assert_eq!(iface.queues[0].forwarding_class, "best-effort");
         assert_eq!(iface.queues[0].priority, 5);
         assert_eq!(iface.queues[0].transmit_rate_bytes, 1_000_000);
+        assert!(!iface.queues[0].exact);
+        assert_eq!(iface.queues[0].surplus_weight, 1);
         assert_eq!(
             iface.queues[0].buffer_bytes,
             default_cos_burst_bytes(1_000_000)
         );
+    }
+
+    #[test]
+    fn build_cos_state_uses_effective_transmit_rate_for_surplus_weight() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                ifindex: 9,
+                cos_shaping_rate_bytes_per_sec: 1_000_000,
+                cos_scheduler_map: "test-map".into(),
+                ..Default::default()
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                }],
+                schedulers: vec![CoSSchedulerSnapshot {
+                    name: "be-sched".into(),
+                    transmit_rate_bytes: 0,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 0,
+                }],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "test-map".into(),
+                    entries: vec![CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be-sched".into(),
+                    }],
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let state = build_cos_state(&snapshot);
+        let iface = state.interfaces.get(&9).expect("missing CoS interface");
+        assert_eq!(iface.queues.len(), 1);
+        assert_eq!(iface.queues[0].transmit_rate_bytes, 1_000_000);
+        assert_eq!(iface.queues[0].surplus_weight, 16);
     }
 }
 

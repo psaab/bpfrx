@@ -188,6 +188,8 @@ pub(super) struct CoSQueueConfig {
     pub(super) forwarding_class: String,
     pub(super) priority: u8,
     pub(super) transmit_rate_bytes: u64,
+    pub(super) exact: bool,
+    pub(super) surplus_weight: u32,
     pub(super) buffer_bytes: u64,
 }
 
@@ -569,6 +571,7 @@ pub(super) struct CoSInterfaceRuntime {
     pub(super) default_queue: u8,
     pub(super) nonempty_queues: usize,
     pub(super) runnable_queues: usize,
+    pub(super) guarantee_rr: usize,
     pub(super) queues: Vec<CoSQueueRuntime>,
     pub(super) queue_indices_by_priority: [Vec<usize>; COS_PRIORITY_LEVELS],
     pub(super) rr_index_by_priority: [usize; COS_PRIORITY_LEVELS],
@@ -579,6 +582,9 @@ pub(super) struct CoSQueueRuntime {
     pub(super) queue_id: u8,
     pub(super) priority: u8,
     pub(super) transmit_rate_bytes: u64,
+    pub(super) exact: bool,
+    pub(super) surplus_weight: u32,
+    pub(super) surplus_deficit: u64,
     pub(super) buffer_bytes: u64,
     pub(super) tokens: u64,
     pub(super) last_refill_ns: u64,

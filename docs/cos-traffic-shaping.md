@@ -770,8 +770,10 @@ Important current behavior:
 - queue selection prefers the shaped interface **egress output filter**
 - if no egress CoS filter is configured, queue selection falls back to the
   current **ingress interface input filter**
+- non-`exact` scheduler `transmit-rate` values act as guarantees and may borrow
+  surplus bandwidth up to the root shaper
+- `transmit-rate exact` prevents that queue from borrowing surplus
 - `per-unit-scheduler` is not implemented
-- `transmit-rate exact` is not implemented yet
 
 For the `loss` userspace lab, the relevant path is:
 
@@ -818,6 +820,8 @@ Notes for this specific test:
   on whatever queue happens to be first in the scheduler map
 - keep ingress `input` filter classification only as a compatibility fallback
   for existing configs that do not yet attach an egress CoS filter
+- use `set class-of-service schedulers <name> transmit-rate <rate> exact` for
+  queues that must stay capped at their guarantee instead of borrowing surplus
 
 Suggested verification commands:
 
