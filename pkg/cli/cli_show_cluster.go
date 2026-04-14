@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/cmdtree"
-	"github.com/psaab/bpfrx/pkg/dataplane"
-	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/cmdtree"
+	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )

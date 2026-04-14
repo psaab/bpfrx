@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // mockGCDP is a minimal mock dataplane for GC testing.

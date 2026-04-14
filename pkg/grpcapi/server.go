@@ -1,4 +1,4 @@
-// Package grpcapi implements the gRPC API server for bpfrx.
+// Package grpcapi implements the gRPC API server for xpf.
 package grpcapi
 
 import (
@@ -13,24 +13,24 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/peer"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/configstore"
-	"github.com/psaab/bpfrx/pkg/conntrack"
-	"github.com/psaab/bpfrx/pkg/dataplane"
-	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
-	"github.com/psaab/bpfrx/pkg/dhcp"
-	"github.com/psaab/bpfrx/pkg/dhcpserver"
-	"github.com/psaab/bpfrx/pkg/feeds"
-	"github.com/psaab/bpfrx/pkg/frr"
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
-	"github.com/psaab/bpfrx/pkg/ipsec"
-	"github.com/psaab/bpfrx/pkg/lldp"
-	"github.com/psaab/bpfrx/pkg/logging"
-	"github.com/psaab/bpfrx/pkg/ra"
-	"github.com/psaab/bpfrx/pkg/routing"
-	"github.com/psaab/bpfrx/pkg/rpm"
-	"github.com/psaab/bpfrx/pkg/vrrp"
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
+	"github.com/psaab/xpf/pkg/conntrack"
+	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/dhcpserver"
+	"github.com/psaab/xpf/pkg/feeds"
+	"github.com/psaab/xpf/pkg/frr"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/ipsec"
+	"github.com/psaab/xpf/pkg/lldp"
+	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/ra"
+	"github.com/psaab/xpf/pkg/routing"
+	"github.com/psaab/xpf/pkg/rpm"
+	"github.com/psaab/xpf/pkg/vrrp"
 )
 
 // Config configures the gRPC server.

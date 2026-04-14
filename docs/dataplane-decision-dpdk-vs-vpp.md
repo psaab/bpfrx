@@ -2,16 +2,16 @@
 
 Date: 2026-03-02
 Status: Active
-Scope: bpfrx dataplane strategy
+Scope: xpf dataplane strategy
 
 ## Decision Summary
 
 For this project today, **DPDK is the better next dataplane path than VPP**.
 
 Why:
-- There is already a substantial in-tree DPDK dataplane (`dpdk_worker/*` + `pkg/dataplane/dpdk/*`) that mirrors bpfrx semantics.
+- There is already a substantial in-tree DPDK dataplane (`dpdk_worker/*` + `pkg/dataplane/dpdk/*`) that mirrors xpf semantics.
 - The current architecture (Go control plane + compiler + dataplane interface) already supports DPDK as a backend.
-- VPP would require a large custom plugin effort to preserve bpfrx-specific behavior (zone policy, screen checks, HA/failover semantics), plus operational model changes.
+- VPP would require a large custom plugin effort to preserve xpf-specific behavior (zone policy, screen checks, HA/failover semantics), plus operational model changes.
 
 When VPP could become better:
 - If product direction prioritizes very high-end encrypted throughput (especially IPsec/WireGuard) at 40/100G scale over short-term delivery and architectural continuity.
@@ -19,7 +19,7 @@ When VPP could become better:
 ## Current Repo Reality
 
 ### eBPF/XDP-TC path (primary)
-- Production path with broad feature coverage and HA behavior implemented around existing bpfrx design.
+- Production path with broad feature coverage and HA behavior implemented around existing xpf design.
 
 ### DPDK path (secondary backend, in-tree)
 - Implemented worker pipeline in C (`parse -> filter -> screen -> zone -> conntrack -> policy -> nat -> nat64 -> forward`).
@@ -39,7 +39,7 @@ Known DPDK gaps visible in code:
 - No in-tree VPP dataplane implementation exists.
 - Existing assessment doc is extensive, but implementation would still start from zero in this repo.
 
-## What Matters Most for bpfrx
+## What Matters Most for xpf
 
 1. Preserve Junos-like behavior:
 - Zone-pair policy semantics, NAT behavior, screens, session model, CLI/runtime parity.
@@ -60,7 +60,7 @@ DPDK aligns better with these constraints than VPP right now.
 ### Option A: Continue DPDK backend evolution (recommended)
 
 Pros:
-- Reuses existing bpfrx pipeline model and compiler outputs.
+- Reuses existing xpf pipeline model and compiler outputs.
 - Lowest migration risk from current eBPF behavior.
 - In-tree code already implemented and testable.
 - Single project-owned control plane model remains intact.
@@ -81,7 +81,7 @@ Pros:
 
 Cons:
 - Large initial implementation cost in this repo.
-- Would require custom logic/plugins to preserve bpfrx semantics.
+- Would require custom logic/plugins to preserve xpf semantics.
 - Operational model complexity (VPP lifecycle, Linux CP integration, API/version coupling).
 - Higher risk to HA and behavior parity during migration.
 

@@ -8,7 +8,7 @@ import (
 
 	"github.com/mdlayher/ndp"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestBuildRA_Basic(t *testing.T) {

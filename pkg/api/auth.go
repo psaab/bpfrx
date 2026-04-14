@@ -39,7 +39,7 @@ func authMiddleware(cfg AuthConfig, next http.Handler) http.Handler {
 			}
 		}
 
-		w.Header().Set("WWW-Authenticate", `Basic realm="bpfrx API"`)
+		w.Header().Set("WWW-Authenticate", `Basic realm="xpf API"`)
 		writeJSON(w, http.StatusUnauthorized, Response{
 			Success: false,
 			Error:   "authentication required",

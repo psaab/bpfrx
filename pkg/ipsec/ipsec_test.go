@@ -4,11 +4,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestGenerateConfig_Basic(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		VPNs: map[string]*config.IPsecVPN{
 			"site-a": {
@@ -51,7 +51,7 @@ func TestGenerateConfig_Basic(t *testing.T) {
 }
 
 func TestGenerateConfig_WithProposal(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		VPNs: map[string]*config.IPsecVPN{
 			"tun1": {
@@ -75,7 +75,7 @@ func TestGenerateConfig_WithProposal(t *testing.T) {
 }
 
 func TestGenerateConfig_GCMNoAuth(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		VPNs: map[string]*config.IPsecVPN{
 			"tun1": {
@@ -233,7 +233,7 @@ func TestParseSAOutput_MultiChild(t *testing.T) {
 }
 
 func TestGenerateConfig_GatewayReference(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		Gateways: map[string]*config.IPsecGateway{
 			"remote-gw": {
@@ -288,7 +288,7 @@ func TestGenerateConfig_GatewayReference(t *testing.T) {
 
 func TestGenerateConfig_DirectGatewayIP(t *testing.T) {
 	// When gateway is an IP (not a reference), it should be used directly
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		Gateways:  map[string]*config.IPsecGateway{},
 		Proposals: map[string]*config.IPsecProposal{},
@@ -364,7 +364,7 @@ site-b: #2, CONNECTING
 }
 
 func TestGenerateConfig_IKEChain(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		IKEProposals: map[string]*config.IKEProposal{
 			"ike-p1": {
@@ -453,7 +453,7 @@ func TestGenerateConfig_IKEChain(t *testing.T) {
 }
 
 func TestGenerateConfig_DynamicHostname(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		Gateways: map[string]*config.IPsecGateway{
 			"dyn-gw": {
@@ -502,7 +502,7 @@ func TestFormatIdentity(t *testing.T) {
 }
 
 func TestGenerateConfig_NATTraversal_Disable(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		Gateways: map[string]*config.IPsecGateway{
 			"gw": {Name: "gw", Address: "10.0.0.1", NATTraversal: "disable", NoNATTraversal: true},
@@ -522,7 +522,7 @@ func TestGenerateConfig_NATTraversal_Disable(t *testing.T) {
 }
 
 func TestGenerateConfig_NATTraversal_Force(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		Gateways: map[string]*config.IPsecGateway{
 			"gw": {Name: "gw", Address: "10.0.0.1", NATTraversal: "force"},
@@ -542,7 +542,7 @@ func TestGenerateConfig_NATTraversal_Force(t *testing.T) {
 }
 
 func TestGenerateConfig_NATTraversal_Enable(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		Gateways: map[string]*config.IPsecGateway{
 			"gw": {Name: "gw", Address: "10.0.0.1", NATTraversal: "enable"},
@@ -565,7 +565,7 @@ func TestGenerateConfig_NATTraversal_Enable(t *testing.T) {
 func TestGenerateConfig_NATTraversal_Default(t *testing.T) {
 	// When NATTraversal is empty (not set), and NoNATTraversal is false,
 	// strongSwan auto-detects NAT — no encap lines needed.
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		Gateways: map[string]*config.IPsecGateway{
 			"gw": {Name: "gw", Address: "10.0.0.1"},
@@ -583,7 +583,7 @@ func TestGenerateConfig_NATTraversal_Default(t *testing.T) {
 
 func TestGenerateConfig_NoNATTraversal_Legacy(t *testing.T) {
 	// Legacy NoNATTraversal=true without NATTraversal field.
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		Gateways: map[string]*config.IPsecGateway{
 			"gw": {Name: "gw", Address: "10.0.0.1", NoNATTraversal: true},
@@ -600,7 +600,7 @@ func TestGenerateConfig_NoNATTraversal_Legacy(t *testing.T) {
 }
 
 func TestGenerateConfig_AggressiveMode(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		IKEPolicies: map[string]*config.IKEPolicy{
 			"aggr-pol": {
@@ -633,7 +633,7 @@ func TestGenerateConfig_AggressiveMode(t *testing.T) {
 }
 
 func TestGenerateConfig_AggressiveMode_NotSet(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		IKEPolicies: map[string]*config.IKEPolicy{
 			"main-pol": {
@@ -661,7 +661,7 @@ func TestGenerateConfig_AggressiveMode_NotSet(t *testing.T) {
 }
 
 func TestGenerateConfig_DFBit(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	tests := []struct {
 		name    string
 		dfbit   string
@@ -693,7 +693,7 @@ func TestGenerateConfig_DFBit(t *testing.T) {
 }
 
 func TestGenerateConfig_EstablishTunnels(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		Proposals: map[string]*config.IPsecProposal{},
 		VPNs: map[string]*config.IPsecVPN{
@@ -714,7 +714,7 @@ func TestGenerateConfig_EstablishTunnels(t *testing.T) {
 }
 
 func TestGenerateConfig_IKELifetime(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		IKEProposals: map[string]*config.IKEProposal{
 			"ike-p1": {
@@ -746,7 +746,7 @@ func TestGenerateConfig_IKELifetime(t *testing.T) {
 }
 
 func TestGenerateConfig_ESPLifetime(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		Proposals: map[string]*config.IPsecProposal{
 			"esp-p2": {
@@ -770,7 +770,7 @@ func TestGenerateConfig_ESPLifetime(t *testing.T) {
 }
 
 func TestGenerateConfig_DPDModes(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		Gateways: map[string]*config.IPsecGateway{
 			"gw": {
@@ -794,7 +794,7 @@ func TestGenerateConfig_DPDModes(t *testing.T) {
 }
 
 func TestGenerateConfig_JunosObfuscatedPSK(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		VPNs: map[string]*config.IPsecVPN{
 			"tun": {Gateway: "10.0.0.1", PSK: "$9$SpRrMLYgaZDirexdwgUDzFn9uO1RhlKW"},
@@ -810,7 +810,7 @@ func TestGenerateConfig_JunosObfuscatedPSK(t *testing.T) {
 }
 
 func TestGenerateConfig_PubkeyAuth(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		IKEProposals: map[string]*config.IKEProposal{
 			"ike-p1": {
@@ -849,7 +849,7 @@ func TestGenerateConfig_PubkeyAuth(t *testing.T) {
 }
 
 func TestGenerateConfig_TrafficSelectors(t *testing.T) {
-	m := &Manager{configDir: "/tmp", configPath: "/tmp/bpfrx.conf"}
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
 		VPNs: map[string]*config.IPsecVPN{
 			"tun": {

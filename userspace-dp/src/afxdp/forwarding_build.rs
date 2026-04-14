@@ -435,8 +435,10 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
         .forwarding_classes
         .iter()
         .filter_map(|class| {
-            (!class.name.is_empty() && class.queue >= 0)
-                .then_some((class.name.clone(), class.queue as u8))
+            if class.name.is_empty() || !(0..=u8::MAX as i32).contains(&class.queue) {
+                return None;
+            }
+            Some((class.name.clone(), class.queue as u8))
         })
         .collect::<FastMap<_, _>>();
     let schedulers = cos
@@ -454,13 +456,13 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
 
     let mut state = CoSState::default();
     for iface in &snapshot.interfaces {
-        if iface.ifindex <= 0 || iface.cos_shaping_rate_bps == 0 {
+        if iface.ifindex <= 0 || iface.cos_shaping_rate_bytes_per_sec == 0 {
             continue;
         }
         let burst_bytes = if iface.cos_shaping_burst_bytes > 0 {
             iface.cos_shaping_burst_bytes
         } else {
-            default_cos_burst_bytes(iface.cos_shaping_rate_bps)
+            default_cos_burst_bytes(iface.cos_shaping_rate_bytes_per_sec)
         };
         let mut queues = Vec::new();
         if let Some(sched_map) = scheduler_maps.get(&iface.cos_scheduler_map) {
@@ -480,7 +482,7 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                     transmit_rate_bytes: scheduler
                         .map(|sched| sched.transmit_rate_bytes)
                         .filter(|rate| *rate > 0)
-                        .unwrap_or(iface.cos_shaping_rate_bps),
+                        .unwrap_or(iface.cos_shaping_rate_bytes_per_sec),
                     buffer_bytes: scheduler
                         .map(|sched| sched.buffer_size_bytes)
                         .filter(|size| *size > 0)
@@ -493,11 +495,15 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                 queue_id: 0,
                 forwarding_class: "best-effort".to_string(),
                 priority: cos_priority_rank("low"),
-                transmit_rate_bytes: iface.cos_shaping_rate_bps,
+                transmit_rate_bytes: iface.cos_shaping_rate_bytes_per_sec,
                 buffer_bytes: burst_bytes,
             });
         }
         queues.sort_by(|a, b| a.queue_id.cmp(&b.queue_id));
+        let queue_by_forwarding_class = queues
+            .iter()
+            .map(|queue| (queue.forwarding_class.clone(), queue.queue_id))
+            .collect::<FastMap<_, _>>();
         let default_queue = queues
             .iter()
             .find(|queue| queue.forwarding_class == "best-effort")
@@ -506,9 +512,10 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
         state.interfaces.insert(
             iface.ifindex,
             CoSInterfaceConfig {
-                shaping_rate_bytes: iface.cos_shaping_rate_bps,
+                shaping_rate_bytes: iface.cos_shaping_rate_bytes_per_sec,
                 burst_bytes,
                 default_queue,
+                queue_by_forwarding_class,
                 queues,
             },
         );
@@ -548,7 +555,7 @@ mod tests {
         let snapshot = ConfigSnapshot {
             interfaces: vec![InterfaceSnapshot {
                 ifindex: 42,
-                cos_shaping_rate_bps: 10_000_000,
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
                 cos_shaping_burst_bytes: 256_000,
                 cos_scheduler_map: "wan-map".into(),
                 ..Default::default()
@@ -618,7 +625,7 @@ mod tests {
         let snapshot = ConfigSnapshot {
             interfaces: vec![InterfaceSnapshot {
                 ifindex: 7,
-                cos_shaping_rate_bps: 1_000_000,
+                cos_shaping_rate_bytes_per_sec: 1_000_000,
                 cos_scheduler_map: "missing-map".into(),
                 ..Default::default()
             }],

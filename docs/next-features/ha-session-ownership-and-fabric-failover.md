@@ -49,7 +49,7 @@ Code paths:
 - `pkg/cluster/sync.go`
 - `pkg/daemon/daemon.go`
 - `pkg/dataplane/types.go`
-- `bpf/headers/bpfrx_conntrack.h`
+- `bpf/headers/xpf_conntrack.h`
 
 ### 2. `NO_NEIGH` failover handling drops VLAN context
 
@@ -70,7 +70,7 @@ Impact:
 Code paths:
 
 - `bpf/xdp/xdp_zone.c`
-- `bpf/headers/bpfrx_helpers.h`
+- `bpf/headers/xpf_helpers.h`
 - `pkg/dataplane/compiler.go`
 
 ### 3. Readiness gates are still too permissive
@@ -108,7 +108,7 @@ Impact:
 
 Code paths:
 
-- `bpf/headers/bpfrx_helpers.h`
+- `bpf/headers/xpf_helpers.h`
 - `pkg/daemon/daemon.go`
 
 ## Concrete Implementation Plan For `#185`
@@ -123,7 +123,7 @@ per-session owner RG model.
 Add `OwnerRGID` to the authoritative session value structs:
 
 - `pkg/dataplane/types.go`
-- `bpf/headers/bpfrx_conntrack.h`
+- `bpf/headers/xpf_conntrack.h`
 - `dpdk_worker/shared_mem.h`
 - `pkg/dataplane/dpdk/dpdk_cgo.go`
 
@@ -144,7 +144,7 @@ before policy/session creation.
 
 Files:
 
-- `bpf/headers/bpfrx_common.h`
+- `bpf/headers/xpf_common.h`
 - `bpf/xdp/xdp_zone.c`
 - DPDK equivalents in `dpdk_worker/zone.c` and metadata definitions
 
@@ -264,7 +264,7 @@ forwarding RG is on node B.
 Files:
 
 - `bpf/xdp/xdp_main.c`
-- `bpf/headers/bpfrx_helpers.h`
+- `bpf/headers/xpf_helpers.h`
 
 ### 2. Screen stage runs, if needed
 
@@ -296,7 +296,7 @@ Encoding:
 Files:
 
 - `bpf/xdp/xdp_zone.c`
-- `bpf/headers/bpfrx_helpers.h`
+- `bpf/headers/xpf_helpers.h`
 
 ### 5. Peer receives the packet on fabric
 

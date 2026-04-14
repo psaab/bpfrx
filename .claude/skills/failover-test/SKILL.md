@@ -36,21 +36,21 @@ ALWAYS build and deploy before running tests. Stale binaries are the #1 source o
 # Build Go daemon + Rust helper + XDP shim
 make build
 cd userspace-dp && cargo build --release && cd ..
-cp userspace-dp/target/release/bpfrx-userspace-dp .
+cp userspace-dp/target/release/xpf-userspace-dp .
 
 # Deploy to both firewalls via rolling deploy
 ENV_FILE=test/incus/loss-userspace-cluster.env sg incus-admin -c "./test/incus/cluster-setup.sh deploy all"
 
 # Verify both nodes have correct binaries
-for node in bpfrx-userspace-fw0 bpfrx-userspace-fw1; do
-    sg incus-admin -c "incus exec loss:$node -- md5sum /usr/local/sbin/bpfrxd /usr/local/sbin/bpfrx-userspace-dp"
+for node in xpf-userspace-fw0 xpf-userspace-fw1; do
+    sg incus-admin -c "incus exec loss:$node -- md5sum /usr/local/sbin/xpfd /usr/local/sbin/xpf-userspace-dp"
 done
-md5sum bpfrxd bpfrx-userspace-dp
+md5sum xpfd xpf-userspace-dp
 
 # Wait for cluster readiness (both takeover ready)
 for i in $(seq 1 12); do
-    fw0=$(sg incus-admin -c "incus exec loss:bpfrx-userspace-fw0 -- cli -c 'show chassis cluster status'" 2>&1 | grep -c "Takeover ready: yes")
-    fw1=$(sg incus-admin -c "incus exec loss:bpfrx-userspace-fw1 -- cli -c 'show chassis cluster status'" 2>&1 | grep -c "Takeover ready: yes")
+    fw0=$(sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- cli -c 'show chassis cluster status'" 2>&1 | grep -c "Takeover ready: yes")
+    fw1=$(sg incus-admin -c "incus exec loss:xpf-userspace-fw1 -- cli -c 'show chassis cluster status'" 2>&1 | grep -c "Takeover ready: yes")
     [ "$fw0" -ge 3 ] && [ "$fw1" -ge 3 ] && break
     sleep 5
 done
@@ -58,23 +58,23 @@ done
 
 If binary checksums don't match after deploy, force-push manually:
 ```bash
-sg incus-admin -c "incus exec loss:$node -- systemctl stop bpfrxd"
-sg incus-admin -c "incus exec loss:$node -- pkill -9 bpfrx-userspace"
+sg incus-admin -c "incus exec loss:$node -- systemctl stop xpfd"
+sg incus-admin -c "incus exec loss:$node -- pkill -9 xpf-userspace"
 sleep 1
-sg incus-admin -c "incus file push bpfrxd loss:$node/usr/local/sbin/bpfrxd --mode 0755"
-sg incus-admin -c "incus file push bpfrx-userspace-dp loss:$node/usr/local/sbin/bpfrx-userspace-dp --mode 0755"
-sg incus-admin -c "incus exec loss:$node -- systemctl start bpfrxd"
+sg incus-admin -c "incus file push xpfd loss:$node/usr/local/sbin/xpfd --mode 0755"
+sg incus-admin -c "incus file push xpf-userspace-dp loss:$node/usr/local/sbin/xpf-userspace-dp --mode 0755"
+sg incus-admin -c "incus exec loss:$node -- systemctl start xpfd"
 ```
 
 ## Environment
 
 ```
 loss-userspace-cluster:
-  FW0=loss:bpfrx-userspace-fw0  FW1=loss:bpfrx-userspace-fw1
+  FW0=loss:xpf-userspace-fw0  FW1=loss:xpf-userspace-fw1
   HOST=loss:cluster-userspace-host  TARGET=172.16.80.200
   CLI=/usr/local/sbin/cli
 local-cluster:
-  FW0=bpfrx-fw0  FW1=bpfrx-fw1
+  FW0=xpf-fw0  FW1=xpf-fw1
   HOST=cluster-lan-host  TARGET=172.16.80.200
 ```
 
@@ -91,7 +91,7 @@ All incus commands: `sg incus-admin -c "incus exec ..."`.
 
 Start iperf3, then force-reboot the primary:
 ```bash
-sg incus-admin -c "incus exec loss:bpfrx-userspace-fw0 -- bash -c 'echo b > /proc/sysrq-trigger'"
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- bash -c 'echo b > /proc/sysrq-trigger'"
 ```
 Wait 30s, verify secondary took over, traffic recovers. Wait 90s for rejoin.
 
@@ -99,7 +99,7 @@ Wait 30s, verify secondary took over, traffic recovers. Wait 90s for rejoin.
 
 Start iperf3 60s, move RG mid-stream:
 ```bash
-sg incus-admin -c "incus exec loss:bpfrx-userspace-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 1'"
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 1'"
 ```
 Check SNAT packets > 0 on new owner. Move back. All 4 streams must survive.
 
@@ -107,7 +107,7 @@ Check SNAT packets > 0 on new owner. Move back. All 4 streams must survive.
 
 When a test fails, capture from both nodes:
 ```bash
-for node in bpfrx-userspace-fw0 bpfrx-userspace-fw1; do
+for node in xpf-userspace-fw0 xpf-userspace-fw1; do
     echo "=== $node ==="
     sg incus-admin -c "incus exec loss:$node -- cli -c 'show chassis cluster status'"
     sg incus-admin -c "incus exec loss:$node -- cli -c 'show chassis cluster data-plane statistics'" | grep -E 'SNAT|Session|Forward|flow cache|installed'

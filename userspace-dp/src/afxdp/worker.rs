@@ -18,7 +18,9 @@ pub(crate) struct BindingWorker {
     pub(crate) pending_tx_local: VecDeque<TxRequest>,
     pub(crate) max_pending_tx: usize,
     pub(crate) cos_interfaces: FastMap<i32, CoSInterfaceRuntime>,
+    pub(crate) cos_interface_order: Vec<i32>,
     pub(crate) cos_interface_rr: usize,
+    pub(crate) cos_nonempty_interfaces: usize,
     pub(crate) pending_fill_frames: VecDeque<u64>,
     pub(crate) scratch_recycle: Vec<u64>,
     pub(crate) scratch_forwards: Vec<PendingForwardRequest>,
@@ -244,7 +246,7 @@ impl BindingWorker {
         // ifindex/queue_id directly — umem.bind() already validated these.
         live.set_socket_binding(binding.ifindex, binding.queue_id, 0);
         eprintln!(
-            "bpfrx-userspace-dp: binding slot={} fd={} strategy={} bound if{}q{} mode={:?} shared_umem={}",
+            "xpf-userspace-dp: binding slot={} fd={} strategy={} bound if{}q{} mode={:?} shared_umem={}",
             binding.slot,
             user_fd,
             actual_bind_strategy.describe(),
@@ -255,13 +257,13 @@ impl BindingWorker {
         );
         if let Err(err) = register_xsk_slot(xsk_map_fd, binding.slot, user_fd) {
             eprintln!(
-                "bpfrx-userspace-dp: ERROR register_xsk_slot slot={} fd={}: {}",
+                "xpf-userspace-dp: ERROR register_xsk_slot slot={} fd={}: {}",
                 binding.slot, user_fd, err,
             );
             live.set_error(format!("register XSK slot: {err}"));
         } else {
             eprintln!(
-                "bpfrx-userspace-dp: registered slot={} fd={} in XSKMAP",
+                "xpf-userspace-dp: registered slot={} fd={} in XSKMAP",
                 binding.slot, user_fd,
             );
             live.set_xsk_registered(true);
@@ -290,7 +292,9 @@ impl BindingWorker {
             pending_tx_local: VecDeque::new(),
             max_pending_tx,
             cos_interfaces: FastMap::default(),
+            cos_interface_order: Vec::new(),
             cos_interface_rr: 0,
+            cos_nonempty_interfaces: 0,
             pending_fill_frames: VecDeque::new(),
             scratch_recycle: Vec::with_capacity(RX_BATCH_SIZE as usize),
             scratch_forwards: Vec::with_capacity(RX_BATCH_SIZE as usize),

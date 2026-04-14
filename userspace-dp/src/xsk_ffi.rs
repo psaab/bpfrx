@@ -937,7 +937,7 @@ pub fn create_xsk_binding(
     // Diagnostic: verify ring structs were populated by create_shared.
     // If any pointer is null or size/mask is 0, the ring wasn't initialised.
     eprintln!(
-        "bpfrx-xsk-ffi: create_xsk_binding fd={} rx_ring=[mask={:#x} size={} \
+        "xpf-xsk-ffi: create_xsk_binding fd={} rx_ring=[mask={:#x} size={} \
          producer={:?} consumer={:?} ring={:?} flags={:?} cached_prod={} cached_cons={}] \
          fill_ring=[mask={:#x} size={} cached_prod={} cached_cons={}]",
         fd,

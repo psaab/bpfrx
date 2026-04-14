@@ -18,8 +18,8 @@ import (
 
 	"net/netip"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -231,7 +231,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// triggers mlx5 to initialize XSK buffer pool from fill ring.
 	// Pinned link reuse (l.Update) only swaps the program without
 	// reinitializing XSK RQs, leaving the fill ring unconsumed.
-	if linkPinDir := "/sys/fs/bpf/bpfrx/links"; true {
+	if linkPinDir := "/sys/fs/bpf/xpf/links"; true {
 		entries, _ := os.ReadDir(linkPinDir)
 		for _, e := range entries {
 			if strings.HasPrefix(e.Name(), "xdp_") {
@@ -470,8 +470,8 @@ func deriveUserspaceConfig(cfg *config.Config) config.UserspaceConfig {
 	out := config.UserspaceConfig{
 		Workers:       1,
 		RingEntries:   1024,
-		ControlSocket: filepath.Join(os.TempDir(), "bpfrx-userspace-dp", "control.sock"),
-		StateFile:     filepath.Join(os.TempDir(), "bpfrx-userspace-dp", "state.json"),
+		ControlSocket: filepath.Join(os.TempDir(), "xpf-userspace-dp", "control.sock"),
+		StateFile:     filepath.Join(os.TempDir(), "xpf-userspace-dp", "state.json"),
 	}
 	if cfg != nil && cfg.System.UserspaceDataplane != nil {
 		out = *cfg.System.UserspaceDataplane
@@ -483,7 +483,7 @@ func deriveUserspaceConfig(cfg *config.Config) config.UserspaceConfig {
 		out.RingEntries = 1024
 	}
 	if out.ControlSocket == "" {
-		out.ControlSocket = filepath.Join(os.TempDir(), "bpfrx-userspace-dp", "control.sock")
+		out.ControlSocket = filepath.Join(os.TempDir(), "xpf-userspace-dp", "control.sock")
 	}
 	if out.StateFile == "" {
 		out.StateFile = filepath.Join(filepath.Dir(out.ControlSocket), "state.json")

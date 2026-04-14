@@ -3,7 +3,7 @@ package grpcapi
 import (
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 func TestPageTokenV4RoundTrip(t *testing.T) {

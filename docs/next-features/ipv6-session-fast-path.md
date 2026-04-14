@@ -13,9 +13,9 @@ handling more expensive than it needs to be.
 
 The real steady-state cost for long-running TCP traffic is concentrated in:
 
-1. IPv6 session-table lookup in [`xdp_zone.c`](/home/ps/git/codex-bpfrx/bpf/xdp/xdp_zone.c)
-2. Larger IPv6 session keys and values in [`bpfrx_conntrack.h`](/home/ps/git/codex-bpfrx/bpf/headers/bpfrx_conntrack.h)
-3. IPv6 header parsing in [`bpfrx_helpers.h`](/home/ps/git/codex-bpfrx/bpf/headers/bpfrx_helpers.h)
+1. IPv6 session-table lookup in [`xdp_zone.c`](/home/ps/git/codex-xpf/bpf/xdp/xdp_zone.c)
+2. Larger IPv6 session keys and values in [`xpf_conntrack.h`](/home/ps/git/codex-xpf/bpf/headers/xpf_conntrack.h)
+3. IPv6 header parsing in [`xpf_helpers.h`](/home/ps/git/codex-xpf/bpf/headers/xpf_helpers.h)
 
 For established flows, policy lookups are usually not the bottleneck. The zone
 stage already fast-paths established sessions and bypasses the full policy path.
@@ -35,7 +35,7 @@ semantics in unsafe ways.
 
 ### Phase 1: Per-CPU IPv6 established-flow cache
 
-Implemented in [`xdp_zone.c`](/home/ps/git/codex-bpfrx/bpf/xdp/xdp_zone.c).
+Implemented in [`xdp_zone.c`](/home/ps/git/codex-xpf/bpf/xdp/xdp_zone.c).
 
 Design:
 
@@ -102,7 +102,7 @@ Follow-on work:
 
 ### Phase 4: IPv6 parser fast path
 
-Implemented in [`parse_ipv6hdr()`](/home/ps/git/codex-bpfrx/bpf/headers/bpfrx_helpers.h).
+Implemented in [`parse_ipv6hdr()`](/home/ps/git/codex-xpf/bpf/headers/xpf_helpers.h).
 
 The parser now returns immediately for the common case where the IPv6 base
 header directly names the upper-layer protocol, and only falls back to the
@@ -111,7 +111,7 @@ headers.
 
 ### Phase 5: Narrower IPv6 NAT rewrite path
 
-Implemented in [`nat_rewrite_v6()`](/home/ps/git/codex-bpfrx/bpf/headers/bpfrx_nat.h).
+Implemented in [`nat_rewrite_v6()`](/home/ps/git/codex-xpf/bpf/headers/xpf_nat.h).
 
 The IPv6 NAT path now specializes work based on:
 
@@ -128,7 +128,7 @@ Current implementation details:
 1. Cache map: per-CPU array, `256` slots.
 2. Placement: XDP zone stage, before `sessions_v6` lookup.
 3. Entry lifetime: replaced on collision, with flush-before-replace.
-4. Loader keeps the cache map FD alive via [`loader_ebpf.go`](/home/ps/git/codex-bpfrx/pkg/dataplane/loader_ebpf.go).
+4. Loader keeps the cache map FD alive via [`loader_ebpf.go`](/home/ps/git/codex-xpf/pkg/dataplane/loader_ebpf.go).
 5. Batch threshold is `256` packets, chosen to reduce steady-state session-map pressure while keeping accounting drift bounded.
 6. The same branch also includes the IPv6 no-extension parse fast path and a narrower IPv6 NAT rewrite path.
 
@@ -146,7 +146,7 @@ reuse. Adding the cache there avoids duplicating another lookup path in
 
 ## Acceptance Criteria
 
-1. `bpfrxd` loads all eBPF programs with the cache enabled.
+1. `xpfd` loads all eBPF programs with the cache enabled.
 2. `go test ./...` remains green.
 3. Long-running IPv6 TCP flows stay functionally correct.
 4. `perf` on IPv6 shows lower `htab_map_hash` / `lookup_nulls_elem_raw` pressure.

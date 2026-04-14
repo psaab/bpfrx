@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
 func (c *ctl) handleShow(args []string) error {

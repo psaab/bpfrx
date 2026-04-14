@@ -77,7 +77,7 @@ func TestSyslogFacilityParsing(t *testing.T) {
 
 func TestSystemConfig(t *testing.T) {
 	input := `system {
-    host-name bpfrx-fw;
+    host-name xpf-fw;
     time-zone America/Los_Angeles;
     no-redirects;
     name-server {
@@ -111,7 +111,7 @@ func TestSystemConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compile error: %v", err)
 	}
-	if cfg.System.HostName != "bpfrx-fw" {
+	if cfg.System.HostName != "xpf-fw" {
 		t.Errorf("hostname = %q", cfg.System.HostName)
 	}
 	if cfg.System.TimeZone != "America/Los_Angeles" {
@@ -1118,8 +1118,8 @@ system {
 	if arch.ArchiveSites[0] != "scp://backup@10.0.0.1:/configs" {
 		t.Errorf("archive-site = %q", arch.ArchiveSites[0])
 	}
-	if arch.ArchiveDir != "/var/lib/bpfrx/archive" {
-		t.Errorf("archive-dir = %q, want /var/lib/bpfrx/archive", arch.ArchiveDir)
+	if arch.ArchiveDir != "/var/lib/xpf/archive" {
+		t.Errorf("archive-dir = %q, want /var/lib/xpf/archive", arch.ArchiveDir)
 	}
 	if arch.MaxArchives != 10 {
 		t.Errorf("max-archives = %d, want 10", arch.MaxArchives)

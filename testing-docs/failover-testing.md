@@ -37,8 +37,8 @@ It does not cover:
 
 - Env file: `test/incus/loss-userspace-cluster.env`
 - Firewalls:
-  - `bpfrx-userspace-fw0`
-  - `bpfrx-userspace-fw1`
+  - `xpf-userspace-fw0`
+  - `xpf-userspace-fw1`
 - Host:
   - `cluster-userspace-host`
 - Main targets:
@@ -48,8 +48,8 @@ It does not cover:
 ### Legacy eBPF HA cluster
 
 - Firewalls:
-  - `bpfrx-fw0`
-  - `bpfrx-fw1`
+  - `xpf-fw0`
+  - `xpf-fw1`
 - Host:
   - `cluster-lan-host`
 
@@ -116,7 +116,7 @@ across all protocols. This validates two things:
 
 1. The XDP shim passes ICMP echo replies for interface-NAT addresses to the
    kernel (`is_icmp_to_interface_nat_local` in `userspace-xdp/src/lib.rs`).
-2. The slow-path TUN (`bpfrx-usp0`) has `rp_filter=0` so the kernel accepts
+2. The slow-path TUN (`xpf-usp0`) has `rp_filter=0` so the kernel accepts
    TCP/UDP replies whose reverse route points at the real egress interface, not
    the TUN. `networkctl reload` resets this sysctl; the Go daemon must re-apply
    it after every reload (`restoreSlowPathRPFilter` in `pkg/networkd/networkd.go`).
@@ -135,8 +135,8 @@ timeout 5 bash -c 'exec 3<>/dev/tcp/1.1.1.1/80; echo -e "GET / HTTP/1.0\r\nHost:
 ```
 
 If ICMP fails, the XDP shim is not recognizing echo replies for interface-NAT
-addresses. If TCP fails but ICMP works, check `rp_filter` on `bpfrx-usp0`
-(`sysctl net.ipv4.conf.bpfrx-usp0.rp_filter` — must be 0).
+addresses. If TCP fails but ICMP works, check `rp_filter` on `xpf-usp0`
+(`sysctl net.ipv4.conf.xpf-usp0.rp_filter` — must be 0).
 
 ### Lab hygiene
 
@@ -509,7 +509,7 @@ At minimum:
 
 1. stop any stale `iperf3`
 2. verify both VMs are up
-3. verify `bpfrxd` is active
+3. verify `xpfd` is active
 4. verify cluster status is stable
 5. reset any stale manual failover flags if needed
 6. pin RG ownership to the intended starting node

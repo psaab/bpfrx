@@ -559,7 +559,7 @@ pub(super) fn publish_bpf_conntrack_entry(
             };
             if rc < 0 {
                 eprintln!(
-                    "bpfrx-ha: conntrack v4 map update failed: {}",
+                    "xpf-ha: conntrack v4 map update failed: {}",
                     io::Error::last_os_error()
                 );
             }
@@ -646,7 +646,7 @@ pub(super) fn publish_bpf_conntrack_entry(
             };
             if rc < 0 {
                 eprintln!(
-                    "bpfrx-ha: conntrack v6 map update failed: {}",
+                    "xpf-ha: conntrack v6 map update failed: {}",
                     io::Error::last_os_error()
                 );
             }
@@ -1023,7 +1023,7 @@ pub(super) static SESSION_CREATIONS_LOGGED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "debug-log")]
 static ICMPV6_EMBED_LOGGED: AtomicU32 = AtomicU32::new(0);
 
-pub(super) const FALLBACK_STATS_PIN_PATH: &str = "/sys/fs/bpf/bpfrx/userspace_fallback_stats";
+pub(super) const FALLBACK_STATS_PIN_PATH: &str = "/sys/fs/bpf/xpf/userspace_fallback_stats";
 pub(super) const FALLBACK_REASON_NAMES: &[&str] = &[
     "ctrl_disabled",     // 0
     "parse_fail",        // 1
@@ -1266,7 +1266,7 @@ mod tests {
 
     #[test]
     fn bpf_conntrack_struct_sizes_match_c() {
-        // Must match C struct sizes from bpfrx_conntrack.h exactly.
+        // Must match C struct sizes from xpf_conntrack.h exactly.
         assert_eq!(core::mem::size_of::<BpfSessionKeyV4>(), 16);
         assert_eq!(core::mem::size_of::<BpfSessionValueV4>(), 128);
         assert_eq!(core::mem::size_of::<BpfSessionKeyV6>(), 40);

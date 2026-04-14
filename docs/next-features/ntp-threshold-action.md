@@ -4,7 +4,7 @@ Date: 2026-03-06
 Status: Implemented
 
 ## Config Evidence
-- Present in `/home/ps/git/bpfrx/vsrx.conf:109` as `threshold 400 action accept;`
+- Present in `/home/ps/git/xpf/vsrx.conf:109` as `threshold 400 action accept;`
 
 ## Implemented Behavior
 1. `system ntp threshold <seconds> action accept` writes chrony `logchange <seconds>` so large offsets are logged while remaining acceptable.
@@ -13,7 +13,7 @@ Status: Implemented
 4. Threshold config is reconciled through a managed chrony drop-in file alongside the existing managed source list.
 
 ## Notes
-- This maps the Junos operator intent onto chrony primitives rather than re-implementing NTP discipline in bpfrxd.
+- This maps the Junos operator intent onto chrony primitives rather than re-implementing NTP discipline in xpfd.
 - The value is treated as seconds, matching Junos documentation and chrony directive units.
 
 ## Validation

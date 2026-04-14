@@ -423,7 +423,7 @@ type ArchivalConfig struct {
 	TransferOnCommit bool
 	TransferInterval int // minutes between auto-archives (0 = on commit only)
 	ArchiveSites     []string
-	ArchiveDir       string // local directory for archives (default /var/lib/bpfrx/archive)
+	ArchiveDir       string // local directory for archives (default /var/lib/xpf/archive)
 	MaxArchives      int    // max number of archives to keep (default 10)
 }
 

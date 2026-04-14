@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dataplane"
 	"golang.org/x/sys/unix"
 )
 

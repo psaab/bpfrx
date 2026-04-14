@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bpfrx cluster rapid failover stress test
+# xpf cluster rapid failover stress test
 #
 # Validates that active TCP connections survive repeated rapid failover
 # cycles (fw0→fw1→fw0→fw1...) without any stream death.
@@ -8,7 +8,7 @@
 # through dual-inactive windows, RST→CLOSED bugs, and txqueuelen drops.
 # This test codifies the stress scenario as a permanent regression gate.
 #
-# Requires: bpfrx-fw0, bpfrx-fw1, cluster-lan-host running.
+# Requires: xpf-fw0, xpf-fw1, cluster-lan-host running.
 # Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.200).
 #
 # Tests:
@@ -87,12 +87,12 @@ cleanup() {
 	info "Cleanup: killing iperf3, resetting failover flags"
 	incus exec cluster-lan-host -- pkill -9 iperf3 2>/dev/null || true
 	for rg in 0 1 2; do
-		incus exec bpfrx-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
-		incus exec bpfrx-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+		incus exec xpf-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+		incus exec xpf-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
 	done
 	# With preempt=false, resetting the flag alone doesn't move VRRP.
 	# Explicitly request RG1 back to fw0 so the next test starts clean.
-	incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 0' 2>/dev/null || true
+	incus exec xpf-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 0' 2>/dev/null || true
 	sleep 2
 }
 
@@ -103,29 +103,29 @@ trap cleanup EXIT
 info "Preflight checks"
 info "Config: ${TOTAL_CYCLES} cycles, ${FAILOVER_INTERVAL}s interval, ${IPERF_STREAMS} streams, ${IPERF_DURATION}s iperf3 duration"
 
-for inst in bpfrx-fw0 bpfrx-fw1 cluster-lan-host; do
+for inst in xpf-fw0 xpf-fw1 cluster-lan-host; do
 	instance_running "$inst" || die "$inst is not running"
 done
 
 # Reset any stale manual failover flags from previous test runs.
 for rg in 0 1 2; do
-	incus exec bpfrx-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
-	incus exec bpfrx-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+	incus exec xpf-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+	incus exec xpf-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
 done
 sleep 2
 
 # Ensure all RGs are on fw0
-fw0_status=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
+fw0_status=$(incus exec xpf-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
 for rg in 0 1 2; do
 	rg_primary=$(echo "$fw0_status" | grep -A2 "Redundancy group: $rg" | grep "node0" | grep -c "primary" || true)
 	if [[ "$rg_primary" -ne 1 ]]; then
-		incus exec bpfrx-fw0 -- cli -c "request chassis cluster failover redundancy-group $rg node 0" 2>/dev/null || true
+		incus exec xpf-fw0 -- cli -c "request chassis cluster failover redundancy-group $rg node 0" 2>/dev/null || true
 	fi
 done
 sleep 3
 
 # Verify fw0 is primary for all RGs
-fw0_status=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
+fw0_status=$(incus exec xpf-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
 all_primary=true
 for rg in 0 1 2; do
 	rg_primary=$(echo "$fw0_status" | grep -A2 "Redundancy group: $rg" | grep "node0" | grep -c "primary" || true)
@@ -169,7 +169,7 @@ else
 fi
 
 # Verify sessions exist on fw0
-fw0_sessions=$(incus exec bpfrx-fw0 -- cli -c \
+fw0_sessions=$(incus exec xpf-fw0 -- cli -c \
 	"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "Session State: Valid" || true)
 if [[ "$fw0_sessions" -ge "$IPERF_STREAMS" ]]; then
 	pass "fw0 has $fw0_sessions established sessions"
@@ -182,7 +182,7 @@ fi
 info "Phase 2: Waiting ${SYNC_WAIT}s for session sync to fw1"
 sleep "$SYNC_WAIT"
 
-fw1_sessions=$(incus exec bpfrx-fw1 -- cli -c \
+fw1_sessions=$(incus exec xpf-fw1 -- cli -c \
 	"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "Session State: Valid" || true)
 if [[ "$fw1_sessions" -ge "$IPERF_STREAMS" ]]; then
 	pass "fw1 has $fw1_sessions synced sessions"
@@ -201,7 +201,7 @@ for cycle in $(seq 1 "$TOTAL_CYCLES"); do
 	info "Cycle ${cycle}/${TOTAL_CYCLES}: failover RG1 fw0→fw1"
 
 	# Failover RG1 to fw1
-	incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1' 2>/dev/null || true
+	incus exec xpf-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1' 2>/dev/null || true
 
 	sleep "$half_interval"
 
@@ -220,9 +220,9 @@ for cycle in $(seq 1 "$TOTAL_CYCLES"); do
 	info "Cycle ${cycle}/${TOTAL_CYCLES}: failback RG1 fw1→fw0"
 
 	# Failback RG1 to fw0
-	incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1' 2>/dev/null || true
-	incus exec bpfrx-fw1 -- cli -c 'request chassis cluster failover reset redundancy-group 1' 2>/dev/null || true
-	incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 0' 2>/dev/null || true
+	incus exec xpf-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1' 2>/dev/null || true
+	incus exec xpf-fw1 -- cli -c 'request chassis cluster failover reset redundancy-group 1' 2>/dev/null || true
+	incus exec xpf-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 0' 2>/dev/null || true
 
 	sleep "$half_interval"
 

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestBuildExportConfig_InlineJflowSourceAddress(t *testing.T) {

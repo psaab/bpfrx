@@ -1,4 +1,4 @@
-# bpfrx vs Juniper vSRX Feature Gap Analysis
+# xpf vs Juniper vSRX Feature Gap Analysis
 
 Last updated: 2026-04-13
 
@@ -40,7 +40,7 @@ Last updated: 2026-04-13
 
 ## 1. Security Policies (Unified/Advanced)
 
-bpfrx has zone-based policies with source/dest address, application match, permit/deny/reject actions, logging, counting, and schedulers. These gaps represent vSRX-specific advanced policy features.
+xpf has zone-based policies with source/dest address, application match, permit/deny/reject actions, logging, counting, and schedulers. These gaps represent vSRX-specific advanced policy features.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -57,7 +57,7 @@ bpfrx has zone-based policies with source/dest address, application match, permi
 
 ## 2. Application Security (AppSecure)
 
-The AppSecure suite is a major differentiator for the vSRX as an NGFW. bpfrx now has real runtime AppID plumbing for L3/L4 application catalog classification, session tracking, and unknown-app handling, but it still does not have a full Junos L7 DPI/signature engine.
+The AppSecure suite is a major differentiator for the vSRX as an NGFW. xpf now has real runtime AppID plumbing for L3/L4 application catalog classification, session tracking, and unknown-app handling, but it still does not have a full Junos L7 DPI/signature engine.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -66,7 +66,7 @@ The AppSecure suite is a major differentiator for the vSRX as an NGFW. bpfrx now
 | **Application Firewall (AppFW)** | `security application-firewall ...` | (Legacy, replaced by unified policies) Policy enforcement based on detected app identity | Medium | Missing |
 | **Application QoS (AppQoS)** | `class-of-service application-traffic-control` | QoS rate-limiting and marking based on detected application | Medium | Missing |
 | **Application Quality of Experience (AppQoE)** | `N/A (service suite / policy integration)` | Monitor application quality and user experience, correlate application behavior to network quality, and feed optimization / reporting workflows. Called out as part of the vSRX Content Security Bundle feature set. | Low | Missing |
-| **Advanced Policy-Based Routing (APBR)** | `security advance-policy-based-routing profile ...` | Route traffic to different routing instances based on L7 application identity. Profile with rules matching apps/groups to routing-instance. Applied per-zone. | Medium | Missing (bpfrx has filter-based PBR but not L7-aware) |
+| **Advanced Policy-Based Routing (APBR)** | `security advance-policy-based-routing profile ...` | Route traffic to different routing instances based on L7 application identity. Profile with rules matching apps/groups to routing-instance. Applied per-zone. | Medium | Missing (xpf has filter-based PBR but not L7-aware) |
 | **Application Signature Package** | `request services application-identification download` | Downloadable/updatable signature database, predefined app groups (junos:social-networking, junos:web:streaming, etc.) | Medium | Missing |
 | **Application System Cache** | `services application-identification application-system-cache` | Cache app identification results for faster classification of subsequent connections from same source | Low | Missing |
 | **Custom Application Signatures** | `services application-identification application ... signature ...` | User-defined L7 signatures with byte patterns for custom/proprietary applications | Low | Missing |
@@ -75,7 +75,7 @@ The AppSecure suite is a major differentiator for the vSRX as an NGFW. bpfrx now
 
 ## 3. Intrusion Detection & Prevention (IDP/IPS)
 
-IDP is a core NGFW feature supported on vSRX with subscription license. bpfrx has no IDP engine.
+IDP is a core NGFW feature supported on vSRX with subscription license. xpf has no IDP engine.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -92,7 +92,7 @@ IDP is a core NGFW feature supported on vSRX with subscription license. bpfrx ha
 
 ## 4. Content Security (UTM)
 
-UTM features require subscription license on vSRX. bpfrx has no content inspection engine.
+UTM features require subscription license on vSRX. xpf has no content inspection engine.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -120,11 +120,11 @@ SSL proxy is supported on vSRX 3.0 and enables inspection of encrypted traffic f
 
 ## 6. Advanced Threat Prevention (ATP)
 
-ATP Cloud integration provides cloud-based threat analysis. bpfrx has dynamic address feeds which partially overlap with SecIntel.
+ATP Cloud integration provides cloud-based threat analysis. xpf has dynamic address feeds which partially overlap with SecIntel.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **SecIntel Threat Feeds** | `services security-intelligence profile ...` | Cloud-curated threat intelligence feeds: C&C servers, attacker IPs, malicious URLs, infected hosts. Applied via security policy. | Medium | Partial (bpfrx has dynamic address feeds but not SecIntel-format integration) |
+| **SecIntel Threat Feeds** | `services security-intelligence profile ...` | Cloud-curated threat intelligence feeds: C&C servers, attacker IPs, malicious URLs, infected hosts. Applied via security policy. | Medium | Partial (xpf has dynamic address feeds but not SecIntel-format integration) |
 | **Malware Sandboxing** | `services advanced-anti-malware policy ...` | Cloud-based sandbox analysis of unknown files (ATP Cloud). File submission, verdict caching. | Low | Missing |
 | **Encrypted Traffic Insights** | `services ssl ... encrypted-traffic-insights ...` | Detect malware in encrypted traffic without decryption using TLS metadata analysis (JA3 fingerprints, certificate characteristics) | Low | Missing |
 | **GeoIP Filtering** | `security intelligence ... geoip ...` | Block/allow traffic by geographic location of source/destination IP | Medium | Missing |
@@ -135,7 +135,7 @@ ATP Cloud integration provides cloud-based threat analysis. bpfrx has dynamic ad
 
 ## 7. User/Identity Firewall
 
-User-based policy enforcement integrating with directory services. Not implemented in bpfrx.
+User-based policy enforcement integrating with directory services. Not implemented in xpf.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -149,7 +149,7 @@ User-based policy enforcement integrating with directory services. Not implement
 
 ## 8. NAT Enhancements
 
-bpfrx has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, protocol-only match, port rewriting, multi-port matching), static 1:1, NAT64, and exemption rules. These are additional NAT features from the vSRX.
+xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, protocol-only match, port rewriting, multi-port matching), static 1:1, NAT64, and exemption rules. These are additional NAT features from the vSRX.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -166,7 +166,7 @@ bpfrx has SNAT (interface + pool, address-persistent, source-nat off bypass), DN
 
 ## 9. Screen/IDS Enhancements
 
-bpfrx implements 11 screen checks (land, syn-flood, ping-death, teardrop, rate-limiting, ip-sweep, winnuke, syn-frag, syn-fin, no-flag, fin-no-ack) plus per-IP session limiting. These are additional vSRX screen options.
+xpf implements 11 screen checks (land, syn-flood, ping-death, teardrop, rate-limiting, ip-sweep, winnuke, syn-frag, syn-fin, no-flag, fin-no-ack) plus per-IP session limiting. These are additional vSRX screen options.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -183,7 +183,7 @@ bpfrx implements 11 screen checks (land, syn-flood, ping-death, teardrop, rate-l
 
 ## 10. Security Flow Enhancements
 
-bpfrx has TCP session timeouts (established, initial, closing, time-wait), UDP/ICMP timeouts, TCP MSS clamping (IPsec, GRE in/out), allow-dns-reply, allow-embedded-icmp, GRE performance acceleration, and flow traceoptions.
+xpf has TCP session timeouts (established, initial, closing, time-wait), UDP/ICMP timeouts, TCP MSS clamping (IPsec, GRE in/out), allow-dns-reply, allow-embedded-icmp, GRE performance acceleration, and flow traceoptions.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -203,7 +203,7 @@ bpfrx has TCP session timeouts (established, initial, closing, time-wait), UDP/I
 
 ## 11. ALG Enhancements
 
-bpfrx has ALG disable flags for DNS, FTP, SIP, TFTP. The vSRX supports many more ALGs.
+xpf has ALG disable flags for DNS, FTP, SIP, TFTP. The vSRX supports many more ALGs.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -221,14 +221,14 @@ bpfrx has ALG disable flags for DNS, FTP, SIP, TFTP. The vSRX supports many more
 
 ## 12. Security Logging Enhancements
 
-bpfrx has security logging with mode (stream/event), format, streams with host/port/severity/facility/category/source-address. These are additional features.
+xpf has security logging with mode (stream/event), format, streams with host/port/severity/facility/category/source-address. These are additional features.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **Structured Syslog Format** | `security log format structured` | Machine-parseable key-value syslog format (RT_FLOW_SESSION_CREATE, etc.) with standardized field names | Medium | Done (vSRX-compatible RT_FLOW format with `[junos@2636.1.1.1.2.129 ...]` SD wrapping) |
 | **Binary Log Format** | `security log format binary` | High-performance compact binary log format for off-box collectors — self-framing records (magic+version+length) over UDP/TCP/TLS and local file | Low | Done |
 | **Transport Protocol Selection** | `security log stream ... transport protocol tcp/tls` | Send security logs over TCP or TLS instead of UDP for reliable delivery | Medium | Done (TCP and TLS transport implemented) |
-| **Per-Policy Logging** | `security policies ... then log session-init session-close` | bpfrx has this but may not fully support all log fields (app-name, nat-*, nested-app, etc.) | Medium | Done (all key fields: policy-name, app, ingress-iface, client/server split, close-reason, session-id) |
+| **Per-Policy Logging** | `security policies ... then log session-init session-close` | xpf has this but may not fully support all log fields (app-name, nat-*, nested-app, etc.) | Medium | Done (all key fields: policy-name, app, ingress-iface, client/server split, close-reason, session-id) |
 | **Log Event Mode** | `security log mode event` | Route security logs through eventd (control plane) for on-box processing, slower but allows local processing | Low | Done (event mode writes to local file) |
 | **Session Aggregation Logs** | `security log ... report` | Aggregate session logs for top-N reporting (top talkers, top applications) | Low | Done (session aggregation reporting implemented) |
 
@@ -236,25 +236,25 @@ bpfrx has security logging with mode (stream/event), format, streams with host/p
 
 ## 13. PKI / Certificates
 
-bpfrx uses strongSwan for IPsec. Basic certificate-auth IKE generation exists, but Junos PKI lifecycle management is still not implemented.
+xpf uses strongSwan for IPsec. Basic certificate-auth IKE generation exists, but Junos PKI lifecycle management is still not implemented.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **CA Profile Management** | `security pki ca-profile ... ca-identity ... enrollment url ...` | CA certificate profiles with SCEP/CMPv2 enrollment, revocation checking (CRL/OCSP) | Medium | Missing |
 | **Local Certificate Management** | `security pki local-certificate ...` | Generate CSRs, load certificates, auto-enrollment, renewal tracking | Medium | Missing |
 | **CRL Management** | `security pki ca-profile ... revocation-check crl ...` | Certificate revocation list download, caching, periodic refresh | Low | Missing |
-| **Certificate-Based IPsec** | `security ike gateway ... local-certificate ...` | IPsec authentication using X.509 certificates instead of PSK | Medium | Partial (gateway `local-certificate` and pubkey auth compile into swanctl, but bpfrx still lacks Junos PKI/local-certificate object lifecycle management) |
+| **Certificate-Based IPsec** | `security ike gateway ... local-certificate ...` | IPsec authentication using X.509 certificates instead of PSK | Medium | Partial (gateway `local-certificate` and pubkey auth compile into swanctl, but xpf still lacks Junos PKI/local-certificate object lifecycle management) |
 
 ---
 
 ## 14. Routing Enhancements
 
-bpfrx has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, IPIP tunnels (IPv4+IPv6), rib-groups, next-table route leaking, PBR, qualified-next-hop with interface (link-local IPv6), per-instance `rib <name>.inet6.0` IPv6 static routes, and FRR integration (OSPF, BGP, IS-IS, RIP, LLDP). These are additional routing features.
+xpf has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, IPIP tunnels (IPv4+IPv6), rib-groups, next-table route leaking, PBR, qualified-next-hop with interface (link-local IPv6), per-instance `rib <name>.inet6.0` IPv6 static routes, and FRR integration (OSPF, BGP, IS-IS, RIP, LLDP). These are additional routing features.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **BFD** | `protocols ospf area ... interface ... bfd-liveness-detection ...` | Bidirectional Forwarding Detection for sub-second failure detection on routing adjacencies. FRR supports BFD natively. | High | **Done** -- OSPF BFD with interval/multiplier via FRR profiles, IS-IS BFD support with optional interval/multiplier, BGP BFD multiplier configurable. |
-| **Graceful Restart** | `routing-options graceful-restart` | Non-stop routing during control plane restart. Keep forwarding while protocols reconverge. FRR supports GR. | Medium | Missing (FRR has GR but bpfrx doesn't configure it) |
+| **Graceful Restart** | `routing-options graceful-restart` | Non-stop routing during control plane restart. Keep forwarding while protocols reconverge. FRR supports GR. | Medium | Missing (FRR has GR but xpf doesn't configure it) |
 | **Aggregate Routes** | `routing-options aggregate route ...` | Aggregate (summary) routes with policy control, different from generate routes in contributing route behavior | Medium | Partial (generate routes implemented but aggregate semantics differ) |
 | **Martian Addresses** | `routing-options martians ... allow/exact/orlonger` | Configure additional martian (reserved) address filtering or allow specific martians | Low | Missing |
 | **Forwarding Table Export** | `routing-options forwarding-table export ...` | Apply routing policy to routes exported from routing table to forwarding table. Used for ECMP load-balancing policy. | Medium | Partial (parsed but not fully wired to FRR) |
@@ -266,13 +266,13 @@ bpfrx has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, IPI
 | **Source Routing / SRv6** | `source-routing ...` | Segment Routing v6 for traffic engineering | Low | Missing |
 | **MPLS / LDP** | `protocols mpls ...; protocols ldp ...` | MPLS label switching. Note: disables flow-based security on SRX. | Low | Missing |
 | **Dynamic Tunnels** | `routing-options dynamic-tunnels ...` | Auto-created GRE tunnels for MPLS-over-GRE | Low | Missing |
-| **Routing Policy Enhancements** | `policy-options policy-statement ... from protocol bgp ... then metric-type 2` | bpfrx has basic policy-statements. Missing: `from route-filter-list`, `from interface`, `from neighbor`, `then tag`, `then as-path-prepend`, `then community add/delete/set` | Medium | Partial (basic from/then exists, several match/action types missing) |
+| **Routing Policy Enhancements** | `policy-options policy-statement ... from protocol bgp ... then metric-type 2` | xpf has basic policy-statements. Missing: `from route-filter-list`, `from interface`, `from neighbor`, `then tag`, `then as-path-prepend`, `then community add/delete/set` | Medium | Partial (basic from/then exists, several match/action types missing) |
 
 ---
 
 ## 15. VPN Enhancements
 
-bpfrx has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfaces, NAT-T, DPD modes, local/remote identity, local-certificate auth generation, DF-bit, establish-tunnels, and traffic selectors. These are additional VPN features.
+xpf has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfaces, NAT-T, DPD modes, local/remote identity, local-certificate auth generation, DF-bit, establish-tunnels, and traffic selectors. These are additional VPN features.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -291,7 +291,7 @@ bpfrx has IPsec via strongSwan with IKE proposals, gateways, VPNs, XFRM interfac
 
 ## 16. HA Enhancements
 
-bpfrx has a broad chassis cluster implementation with redundancy groups, RETH (VRRP-backed, virtual MAC), heartbeat, configurable per-RG gratuitous-arp-count, weight-based failover, session sync (RTO, per-RG aware), config sync, IP monitoring, election logic, VRRP, active/active per-RG service management, fabric forwarding, and ISSU. Remaining gaps are tracked below.
+xpf has a broad chassis cluster implementation with redundancy groups, RETH (VRRP-backed, virtual MAC), heartbeat, configurable per-RG gratuitous-arp-count, weight-based failover, session sync (RTO, per-RG aware), config sync, IP monitoring, election logic, VRRP, active/active per-RG service management, fabric forwarding, and ISSU. Remaining gaps are tracked below.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -308,7 +308,7 @@ bpfrx has a broad chassis cluster implementation with redundancy groups, RETH (V
 
 ## 17. Firewall Filter Enhancements
 
-bpfrx has firewall filters with source/dest addresses, prefix-lists (with except), DSCP, protocol, dest/source ports, ICMP type/code, TCP flags, fragment match, actions (accept/reject/discard), routing-instance, log, count, forwarding-class, loss-priority, DSCP rewrite, and IPv6 traffic-class matching.
+xpf has firewall filters with source/dest addresses, prefix-lists (with except), DSCP, protocol, dest/source ports, ICMP type/code, TCP flags, fragment match, actions (accept/reject/discard), routing-instance, log, count, forwarding-class, loss-priority, DSCP rewrite, and IPv6 traffic-class matching.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -322,15 +322,15 @@ bpfrx has firewall filters with source/dest addresses, prefix-lists (with except
 
 ## 18. QoS / Class of Service
 
-Note: The vSRX deployment guide markets CoS as part of the standard feature set, but the user guide also calls out important CoS limitations on vSRX, such as the lack of high-priority SPC queue support. bpfrx now has a userspace-only Phase 1 CoS path with forwarding-class parsing, scheduler-map binding, interface shaping, and FIFO-per-class scheduling, but it is still materially narrower than Junos CoS.
+Note: The vSRX deployment guide markets CoS as part of the standard feature set, but the user guide also calls out important CoS limitations on vSRX, such as the lack of high-priority SPC queue support. xpf now has a userspace-only Phase 1 CoS path with forwarding-class parsing, scheduler-map binding, interface shaping, and FIFO-per-class scheduling, but it is still materially narrower than Junos CoS.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Forwarding Classes** | `class-of-service forwarding-classes class ...` | Define custom forwarding class names mapped to queue numbers | Low | Done |
+| **Forwarding Classes** | `class-of-service forwarding-classes queue <num> <name>;` | Define custom forwarding class names mapped to queue numbers | Low | Done |
 | **Scheduler Maps** | `class-of-service scheduler-maps ...` | Associate forwarding classes with schedulers (bandwidth %, priority, buffer) | Low | Done |
 | **Schedulers** | `class-of-service schedulers ...` | Define per-queue scheduling parameters (transmit rate, priority, drop profile) | Low | Partial (userspace Phase 1 supports transmit-rate, priority, and buffer-size, but not the fuller Junos scheduler/drop-profile model) |
 | **BA Classifiers** | `class-of-service classifiers dscp ...` | Classify incoming traffic by DSCP/802.1p into forwarding classes and loss priorities | Low | Missing |
-| **Rewrite Rules** | `class-of-service rewrite-rules dscp ...` | Rewrite outgoing DSCP/802.1p values. bpfrx has filter-based DSCP rewrite. | Low | Partial (via firewall filter forwarding-class action) |
+| **Rewrite Rules** | `class-of-service rewrite-rules dscp ...` | Rewrite outgoing DSCP/802.1p values. xpf has filter-based DSCP rewrite. | Low | Partial (via firewall filter forwarding-class action) |
 | **WRED Drop Profiles** | `class-of-service drop-profiles ...` | Weighted Random Early Detection congestion avoidance per queue | Low | Missing |
 | **Traffic Shaping** | `class-of-service interfaces ... shaping-rate ...` | Per-interface output rate shaping | Low | Partial (userspace-only Phase 1 egress shaping with FIFO-per-class queues; not full Junos CoS parity) |
 | **Interface CoS Binding** | `class-of-service interfaces ... scheduler-map ...` | Bind scheduler-map and classifiers to specific interfaces | Low | Partial (scheduler-map binding works on userspace interfaces, but BA classifiers and broader CoS attachment semantics are still missing) |
@@ -352,7 +352,7 @@ Logical systems and tenant systems are supported on vSRX starting from Junos 20.
 
 ## 20. Management & Automation
 
-bpfrx has gRPC (48+ RPCs), REST API, Junos-style CLI (local + remote), Prometheus metrics, config commit/rollback, and event-options. These are additional management features.
+xpf has gRPC (48+ RPCs), REST API, Junos-style CLI (local + remote), Prometheus metrics, config commit/rollback, and event-options. These are additional management features.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -362,38 +362,38 @@ bpfrx has gRPC (48+ RPCs), REST API, Junos-style CLI (local + remote), Prometheu
 | **Op Scripts** | `system scripts op ...` | Custom operational commands via SLAX/Python scripts | Low | Missing |
 | **RADIUS Authentication** | `system radius-server ...; system authentication-order radius` | External RADIUS authentication for management access (SSH, CLI, web) | Medium | Missing |
 | **TACACS+ Authentication** | `system tacplus-server ...; system authentication-order tacplus` | External TACACS+ authentication with per-command authorization | Medium | Missing |
-| **SNMP v3 USM** | `snmp v3 usm local-engine user ...` | Full SNMPv3 with authentication (SHA/MD5) and privacy (AES/DES). bpfrx parses v3 users but runtime may be incomplete. | Medium | Partial (parsed, needs runtime verification) |
-| **SNMP Traps/Notifications** | `snmp trap-group ... targets ...` | SNMP trap generation on events (link up/down, auth failure, etc.). bpfrx parses trap-groups but sending is not implemented. | Medium | Partial (parsed, trap sending not implemented) |
-| **J-Web / Full Web GUI** | `system services web-management ...` | Full web-based management UI with dashboard, wizards, monitoring, policy editor. bpfrx has basic REST API. | Low | Missing |
+| **SNMP v3 USM** | `snmp v3 usm local-engine user ...` | Full SNMPv3 with authentication (SHA/MD5) and privacy (AES/DES). xpf parses v3 users but runtime may be incomplete. | Medium | Partial (parsed, needs runtime verification) |
+| **SNMP Traps/Notifications** | `snmp trap-group ... targets ...` | SNMP trap generation on events (link up/down, auth failure, etc.). xpf parses trap-groups but sending is not implemented. | Medium | Partial (parsed, trap sending not implemented) |
+| **J-Web / Full Web GUI** | `system services web-management ...` | Full web-based management UI with dashboard, wizards, monitoring, policy editor. xpf has basic REST API. | Low | Missing |
 | **XML/JSON Config Export** | `show configuration | display xml/json` | Export configuration in XML or JSON format for automation tooling | Low | Missing |
 | **Junos Telemetry Interface (JTI)** | `services analytics / streaming telemetry` | Push-model streaming telemetry for counters, sensors, and analytics pipelines. Explicitly listed as supported on vSRX in the feature tables. | Low | Missing |
 | **Cloud-init / Metadata User-Data Bootstrap** | `N/A (deployment/bootstrap workflow)` | Initialize a vSRX instance from validated Junos configuration passed through cloud metadata or config-drive user-data. Extensively documented for OpenStack, AWS, and GCP. | Medium | Missing |
 | **Bootstrap ISO Provisioning** | `N/A (deployment/bootstrap workflow)` | Provision first-boot configuration from a bootstrap ISO image attached as a virtual disk. Documented in the deployment guide for KVM and VMware workflows. | Low | Missing |
-| **Junos Space / Security Director** | N/A (external management platform) | Centralized multi-device policy management. Not applicable as a feature of bpfrx itself. | Low | Missing (N/A) |
+| **Junos Space / Security Director** | N/A (external management platform) | Centralized multi-device policy management. Not applicable as a feature of xpf itself. | Low | Missing (N/A) |
 | **Rescue Configuration** | `request system configuration rescue save` | Saved fallback configuration that can be loaded on boot if active config fails | Low | Missing |
 
 ---
 
 ## 21. Interface Enhancements
 
-bpfrx manages all interfaces with .link/.network files, supports VLANs, tunnel interfaces (GRE, IP-IP, XFRM), DHCP, VRRP, MTU, speed/duplex, disable, per-interface sampling (input/output, per-family), forwarding-options sampling instances with inline-jflow, and per-interface firewall filters.
+xpf manages all interfaces with .link/.network files, supports VLANs, tunnel interfaces (GRE, IP-IP, XFRM), DHCP, VRRP, MTU, speed/duplex, disable, per-interface sampling (input/output, per-family), forwarding-options sampling instances with inline-jflow, and per-interface firewall filters.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **Link Aggregation (LAG/ae)** | `interfaces ae0 ...; interfaces ge-0/0/0 gigether-options 802.3ad ae0` | Bundle physical links into aggregate ethernet for bandwidth and redundancy. Different from reth. | Medium | Done (LACP/802.3ad parsing + bond/netdev generation + member enslaving) |
 | **Transparent Mode (L2 Bridging)** | `interfaces ... family ethernet-switching; bridge-domains ...` | Layer 2 bridge mode where firewall acts as transparent inline device. Zone-based policies still apply. MAC learning table. | Medium | Missing |
-| **Flexible VLAN Tagging** | `interfaces ... flexible-vlan-tagging; encapsulation flexible-ethernet-services` | Q-in-Q (802.1ad), flexible VLAN push/pop/swap operations. bpfrx has basic 802.1Q single-tag. | Low | Done (flexible-vlan-tagging + flexible-ethernet-services + inner-vlan parsing/wiring) |
+| **Flexible VLAN Tagging** | `interfaces ... flexible-vlan-tagging; encapsulation flexible-ethernet-services` | Q-in-Q (802.1ad), flexible VLAN push/pop/swap operations. xpf has basic 802.1Q single-tag. | Low | Done (flexible-vlan-tagging + flexible-ethernet-services + inner-vlan parsing/wiring) |
 | **Interface Bandwidth** | `interfaces ... bandwidth ...` | Set logical interface bandwidth for OSPF cost calculation and traffic-engineering | Low | Done (parsed and rendered into FRR interface bandwidth) |
 | **IRB Interfaces** | `interfaces irb unit N family inet address ...; bridge-domains bd0 { vlan-id-list ...; routing-interface irb.0; }` | Integrated Routing and Bridging: kernel Linux bridge per bridge-domain, IRB addresses on bridge device, zone assignment, .netdev/.network generation | Medium | Done (config parsing, compiler, networkd bridge/member/IRB generation, zone resolution) |
 | **Point-to-Point** | `interfaces ... unit ... point-to-point` | Mark interface as point-to-point (affects OSPF network type, ND behavior) | Low | Done (parsed and emitted as FRR OSPF point-to-point where applicable) |
 | **Primary/Preferred Address** | `interfaces ... unit ... family inet address ... primary/preferred` | Control which address is used for sourced traffic. Syslog source and networkd ordering implemented; not yet used for all device-originated traffic. | Low | Partial (syslog source + networkd ordering, not all traffic) |
-| **Interface Description** | `interfaces ... description "..."` | bpfrx parses descriptions. Verify they appear in `show interfaces` output. | Low | Done (description displayed in interface output paths) |
+| **Interface Description** | `interfaces ... description "..."` | xpf parses descriptions. Verify they appear in `show interfaces` output. | Low | Done (description displayed in interface output paths) |
 
 ---
 
 ## 22. System Enhancements
 
-bpfrx has hostname, domain-name, domain-search, timezone, name-servers, NTP, services (SSH, web-management, DNS), syslog, SNMP, login users/classes, root-authentication, archival, internet-options, backup-router, DHCP server (Kea), and DPDK config.
+xpf has hostname, domain-name, domain-search, timezone, name-servers, NTP, services (SSH, web-management, DNS), syslog, SNMP, login users/classes, root-authentication, archival, internet-options, backup-router, DHCP server (Kea), and DPDK config.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -401,7 +401,7 @@ bpfrx has hostname, domain-name, domain-search, timezone, name-servers, NTP, ser
 | **TACACS+ Server Config** | `system tacplus-server ... port ... secret ...` | TACACS+ server definitions for per-command authorization | Medium | Missing |
 | **Authentication Order** | `system authentication-order [radius tacplus password]` | Control order of authentication methods for management access | Medium | Missing |
 | **Auto-Image Upgrade** | `system autoinstallation ...` | Zero-touch provisioning for initial deployment | Low | Missing |
-| **Time Zone (wired)** | `system time-zone ...` | bpfrx applies the configured timezone to the system runtime | Low | Done (daemon updates `/etc/localtime` and `/etc/timezone`) |
+| **Time Zone (wired)** | `system time-zone ...` | xpf applies the configured timezone to the system runtime | Low | Done (daemon updates `/etc/localtime` and `/etc/timezone`) |
 | **NTP Threshold Action** | `system ntp threshold ... action ...` | Action when NTP offset exceeds threshold (accept or reject large time jumps) | Low | Done (maps to chrony `logchange` for `accept` and `logchange` + `maxchange` for `reject`, and is shown in operational output) |
 | **Master Password** | `system master-password ...` | Encrypted password storage with master key for config secrets | Low | Done (active/candidate/rollback config trees are encrypted at rest with a node-local master key derived using the configured PRF) |
 | **DNS Proxy** | `system services dns dns-proxy ...` | DNS proxy/caching server on firewall for client DNS resolution | Low | Missing |
@@ -466,13 +466,13 @@ Features for specific use cases or carrier deployments:
 30. GTP Firewall
 31. SD-WAN
 32. PowerMode IPsec
-33. Class of Service - partial/limited on vSRX, still materially broader than bpfrx today
+33. Class of Service - partial/limited on vSRX, still materially broader than xpf today
 
 ---
 
 ## Parse-Only Features Summary
 
-These features have config parsing in bpfrx but NO runtime effect:
+These features have config parsing in xpf but NO runtime effect:
 
 Note: This includes parse-only knobs that are outside the core category gap
 table, so this list count can be higher than the category-level Parse-Only total.

@@ -2,11 +2,11 @@
 
 ## Symptom
 
-On `loss:bpfrx-userspace-fw0`, the isolated userspace cluster could show nearly 100% softirq CPU with no intentional test traffic:
+On `loss:xpf-userspace-fw0`, the isolated userspace cluster could show nearly 100% softirq CPU with no intentional test traffic:
 
 - `ksoftirqd/0..3` near 100%
 - `%si` near 100%
-- `bpfrx-userspace-dp` itself at low single-digit CPU
+- `xpf-userspace-dp` itself at low single-digit CPU
 
 This looked like the host was spinning in the kernel while the Rust dataplane was mostly idle.
 
@@ -18,7 +18,7 @@ There were two separate bugs.
 
 The helper burned through its initial XSK RX fill stock and was not keeping the fill ring replenished aggressively enough.
 
-Evidence from `ge-0-0-2` on `bpfrx-userspace-fw0`:
+Evidence from `ge-0-0-2` on `xpf-userspace-fw0`:
 
 - `rx_xsk_packets` plateaued around the initial fill budget
 - `rx_xsk_buff_alloc_err` then increased by millions in a few seconds
@@ -52,7 +52,7 @@ Implemented in commit `aefed32`:
   - spare fill frames
 - stopped treating a temporary zero insert as a hard runtime error
 
-Code: [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
+Code: [userspace-dp/src/afxdp.rs](/home/ps/git/codex-xpf/userspace-dp/src/afxdp.rs)
 
 ### Shared-UMEM ring-size fix
 
@@ -61,11 +61,11 @@ Implemented in commit `5086741`:
 - rounded shared UMEM `fill_size` / `complete_size` to a power of two before `fq_cq()` creation
 - kept the spare-frame design without breaking AF_XDP bring-up on mlx5
 
-Code: [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
+Code: [userspace-dp/src/afxdp.rs](/home/ps/git/codex-xpf/userspace-dp/src/afxdp.rs)
 
 ## Verification
 
-After both fixes on `bpfrx-userspace-fw0`:
+After both fixes on `xpf-userspace-fw0`:
 
 - helper re-armed and rebound successfully:
   - `Enabled: true`

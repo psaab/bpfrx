@@ -40,9 +40,9 @@ instead of wan/lan) doesn't matter.
 
 | File | Change |
 |------|--------|
-| `bpf/headers/bpfrx_maps.h` | `fabric_fwd_info` struct + `fabric_fwd` ARRAY map (1 entry) |
-| `bpf/headers/bpfrx_helpers.h` | `try_fabric_redirect()` inline helper |
-| `bpf/headers/bpfrx_common.h` | `GLOBAL_CTR_FABRIC_REDIRECT = 26` |
+| `bpf/headers/xpf_maps.h` | `fabric_fwd_info` struct + `fabric_fwd` ARRAY map (1 entry) |
+| `bpf/headers/xpf_helpers.h` | `try_fabric_redirect()` inline helper |
+| `bpf/headers/xpf_common.h` | `GLOBAL_CTR_FABRIC_REDIRECT = 26` |
 | `bpf/xdp/xdp_zone.c` | Call `try_fabric_redirect()` in NO_NEIGH + NOT_FWDED paths |
 | `pkg/dataplane/types.go` | Go `FabricFwdInfo` struct matching C layout |
 | `pkg/dataplane/maps.go` | `UpdateFabricFwd()` method on eBPF Manager |
@@ -88,7 +88,7 @@ that won't be delivered.
 **Symptom:** `cluster: failed to update fabric_fwd map: fabric_fwd map not found`
 repeated every 2 seconds on both nodes.
 
-**Root cause:** The `fabric_fwd` ARRAY map is defined in `bpf/headers/bpfrx_maps.h`
+**Root cause:** The `fabric_fwd` ARRAY map is defined in `bpf/headers/xpf_maps.h`
 and compiled into the xdp_zone ELF object. The bpf2go codegen creates
 `zoneObjs.FabricFwd`, but `loader_ebpf.go` did not register it in `m.maps[]`
 or add it to `MapReplacements`.

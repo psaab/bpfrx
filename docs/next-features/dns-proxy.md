@@ -4,7 +4,7 @@ Date: 2026-04-13
 Status: Proposed (tracking issue #660)
 
 ## Why this doc exists
-`system services dns dns-proxy ...` now imports cleanly for vSRX compatibility, but bpfrx still does not provide an actual firewall-side DNS proxy. The current implementation only toggles `systemd-resolved` as a host resolver service. That is not vSRX parity.
+`system services dns dns-proxy ...` now imports cleanly for vSRX compatibility, but xpf still does not provide an actual firewall-side DNS proxy. The current implementation only toggles `systemd-resolved` as a host resolver service. That is not vSRX parity.
 
 This document describes how to move from:
 
@@ -42,7 +42,7 @@ Phase 1 does not need to be a full recursive resolver. A forwarding cache is eno
 
 ## Recommended runtime direction
 
-Use a dedicated bpfrx-managed DNS forwarder/cache process and stop using `systemd-resolved` as the mechanism behind any bpfrx-managed DNS behavior.
+Use a dedicated xpf-managed DNS forwarder/cache process and stop using `systemd-resolved` as the mechanism behind any xpf-managed DNS behavior.
 
 Recommended direction:
 
@@ -53,46 +53,46 @@ Why `unbound` is the best initial fit:
 - mature forwarding + caching behavior
 - good interface binding and access-control support
 - straightforward upstream forward-zone configuration
-- predictable daemon model managed by bpfrxd
+- predictable daemon model managed by xpfd
 - easier to reason about as a firewall-side listener than `systemd-resolved`
 
 Alternatives:
 
 - `CoreDNS`: flexible plugin model, but more work to express vSRX-like forwarder/cache behavior cleanly
 - `dnsmasq`: light and simple, but less attractive as the long-term base if we want stronger policy, caching, and per-view behavior
-- custom bpfrxd helper: highest control, worst time-to-value
+- custom xpfd helper: highest control, worst time-to-value
 
 Recommendation:
 
 - Phase 1: manage `unbound`
-- keep the abstraction in bpfrxd generic enough that a future daemon swap is possible
+- keep the abstraction in xpfd generic enough that a future daemon swap is possible
 - have the new runtime replace both:
   - client-facing firewall DNS proxy behavior
   - host OS DNS behavior that is currently being delegated to `systemd-resolved`
 
 ## Required systemd-resolved change
 
-The core design constraint is that `systemd-resolved` should not remain anywhere in the bpfrx DNS path.
+The core design constraint is that `systemd-resolved` should not remain anywhere in the xpf DNS path.
 
 Recommended ownership model:
 
 - stop and disable `systemd-resolved`
 - stop treating `system services dns` as a thin wrapper around a host OS service toggle
-- let the bpfrx-managed DNS runtime own:
+- let the xpf-managed DNS runtime own:
   - client-facing firewall DNS listeners
   - upstream forwarding behavior
   - cache behavior
   - host OS DNS configuration previously delegated to `systemd-resolved`
 
-This is intentionally not a hybrid split design. The DNS runtime should replace all DNS things that `systemd-resolved` currently provides for bpfrx-managed nodes.
+This is intentionally not a hybrid split design. The DNS runtime should replace all DNS things that `systemd-resolved` currently provides for xpf-managed nodes.
 
 What this implies:
 
 - `applyDNSService()` needs to be rewritten around the new DNS runtime
-- `/etc/resolv.conf` management becomes bpfrx-owned
+- `/etc/resolv.conf` management becomes xpf-owned
 - the host OS should either:
   - point at the new local DNS runtime, or
-  - receive explicit upstream resolver config rendered directly by bpfrx
+  - receive explicit upstream resolver config rendered directly by xpf
 
 Why this is preferable:
 
@@ -154,7 +154,7 @@ Tests:
   - inactive subtrees
   - vSRX import snippets from `vsrx.conf`
 
-### Phase 2: Add bpfrxd-managed DNS proxy renderer/manager
+### Phase 2: Add xpfd-managed DNS proxy renderer/manager
 
 Daemon work:
 
@@ -182,10 +182,10 @@ Tests:
 
 Refactor `applyDNSService()`:
 
-- stop calling `systemd-resolved` for any bpfrx-managed DNS behavior
+- stop calling `systemd-resolved` for any xpf-managed DNS behavior
 - disable `systemd-resolved`
 - manage `/etc/resolv.conf` directly or point it at the new local DNS runtime
-- let the bpfrx-managed DNS runtime be the only DNS owner on the node
+- let the xpf-managed DNS runtime be the only DNS owner on the node
 
 Tests:
 
@@ -250,7 +250,7 @@ Warnings/alarms:
 - supported dns-proxy knobs no longer emit “unsupported” warnings
 - firewall listens on the intended address/interface for DNS queries
 - client queries are forwarded to configured upstreams and replied successfully
-- `systemd-resolved` is disabled and no longer provides any bpfrx-managed DNS behavior
+- `systemd-resolved` is disabled and no longer provides any xpf-managed DNS behavior
 - the new runtime owns both firewall DNS behavior and host DNS behavior for the node
 - HA failover preserves service ownership semantics for DNS proxy listeners
 - operator can inspect runtime state with dedicated CLI/status output

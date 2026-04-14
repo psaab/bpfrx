@@ -178,6 +178,7 @@ pub(super) struct CoSInterfaceConfig {
     pub(super) shaping_rate_bytes: u64,
     pub(super) burst_bytes: u64,
     pub(super) default_queue: u8,
+    pub(super) queue_by_forwarding_class: FastMap<String, u8>,
     pub(super) queues: Vec<CoSQueueConfig>,
 }
 
@@ -566,7 +567,9 @@ pub(super) struct CoSInterfaceRuntime {
     pub(super) tokens: u64,
     pub(super) last_refill_ns: u64,
     pub(super) default_queue: u8,
+    pub(super) nonempty_queues: usize,
     pub(super) queues: Vec<CoSQueueRuntime>,
+    pub(super) queue_indices_by_priority: [Vec<usize>; COS_PRIORITY_LEVELS],
     pub(super) rr_index_by_priority: [usize; COS_PRIORITY_LEVELS],
 }
 

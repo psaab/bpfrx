@@ -161,3 +161,28 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
 		t.Fatalf("expected dataplane warning, got: %s", warnings)
 	}
 }
+
+func TestValidateClassOfServiceQueueRangeWarning(t *testing.T) {
+	input := `class-of-service {
+    forwarding-classes {
+        queue 300 invalid-class;
+    }
+}
+system {
+    dataplane-type userspace;
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	warnings := strings.Join(cfg.Warnings, "\n")
+	if !strings.Contains(warnings, `forwarding-class "invalid-class" uses out-of-range queue 300`) {
+		t.Fatalf("expected queue range warning, got: %s", warnings)
+	}
+}

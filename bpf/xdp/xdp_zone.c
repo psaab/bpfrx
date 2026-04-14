@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx XDP zone classification stage.
+ * xpf XDP zone classification stage.
  *
  * Maps the ingress interface to a security zone and performs a FIB
  * lookup to determine the egress interface and egress zone.
  * Supports both IPv4 and IPv6.
  */
 
-#include "../headers/bpfrx_common.h"
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
-#include "../headers/bpfrx_nat.h"
-#include "../headers/bpfrx_trace.h"
+#include "../headers/xpf_common.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
+#include "../headers/xpf_nat.h"
+#include "../headers/xpf_trace.h"
 
 #define FLOW_CACHE_SLOTS           256
 #define FLOW_CACHE_BATCH_PKTS      256

@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
+	"github.com/psaab/xpf/pkg/cluster"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"

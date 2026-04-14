@@ -3,7 +3,7 @@
 Date: 2026-03-06
 
 Note: This is an architecture exploration document. It is intentionally grounded in
-bpfrx's current XDP/TC, HA, and `pkg/dataplane.DataPlane` model.
+xpf's current XDP/TC, HA, and `pkg/dataplane.DataPlane` model.
 
 This file is now best read as a design and migration-history document.
 
@@ -34,7 +34,7 @@ The performant design is a **hybrid**:
   HA ownership gating, and fast bypass decisions.
 - **AF_XDP (XSK)** is the real packet handoff into userspace.
 - **A separate native dataplane process** owns packet workers and packet slow path.
-- **`bpfrxd` stays the Go control plane**, not the packet engine.
+- **`xpfd` stays the Go control plane**, not the packet engine.
 - **io_uring** is used around that fast path for the things it is actually good at:
   slow-path reinjection, control sockets, session-sync transport, logging/export,
   async netlink helpers, disk I/O, and wakeup orchestration.
@@ -51,7 +51,7 @@ This architecture is attractive if you want:
 - easier debugging than deep BPF pipelines
 - a path that is lighter-weight than full DPDK/VFIO in some environments
 - to preserve XDP's early-drop and fail-closed properties
-- to keep bpfrx's current Go control plane and `DataPlane` abstraction
+- to keep xpf's current Go control plane and `DataPlane` abstraction
 
 This architecture is **not** the best fit if the only goal is raw 100G packet I/O.
 For that, the existing DPDK plan is still the cleaner end state.
@@ -76,7 +76,7 @@ So there are only two realistic ways to combine XDP and io_uring:
 2. **Good for max performance:**
    `XDP -> AF_XDP` for the fast path, then use `io_uring` for everything around it.
 
-The second option is the design that makes sense for bpfrx.
+The second option is the design that makes sense for xpf.
 
 ## Recommended Architecture
 
@@ -107,11 +107,11 @@ stateful complexity into userspace.
 
 ### Recommended process boundary
 
-Do not embed the packet slow path under `bpfrxd`.
+Do not embed the packet slow path under `xpfd`.
 
 Recommended split:
 
-- `bpfrxd` remains the control-plane authority:
+- `xpfd` remains the control-plane authority:
   - config parse / compile
   - HA / cluster state
   - VRRP orchestration
@@ -129,12 +129,12 @@ Why:
 
 - packet-path failures should not take down the Go control plane
 - Go GC and scheduler behavior should not be in the packet hot path
-- cgo-heavy hot loops inside `bpfrxd` would make the runtime model harder to reason about
+- cgo-heavy hot loops inside `xpfd` would make the runtime model harder to reason about
 - a separate native process is easier to pin, restart, rate-limit, and observe
 - packet slow path is still dataplane work; once packets cross into Go, the design has
   already lost too much performance
 
-This means the "slow path" in this design is not "send packets into `bpfrxd`".
+This means the "slow path" in this design is not "send packets into `xpfd`".
 It is "send exceptions into a native helper thread inside the dataplane process".
 
 ### Recommended language
@@ -152,7 +152,7 @@ Why Rust over Go for this part:
 
 Recommended language split:
 
-- Go: `bpfrxd` control plane
+- Go: `xpfd` control plane
 - Rust: userspace dataplane process and worker runtime
 
 Go is still fine for orchestration, snapshots, HA control, APIs, and service management.
@@ -204,7 +204,7 @@ dataplanes.
 - raw sockets consumed with io_uring
 - TUN/TAP as the primary packet handoff
 
-If an interface only supports those paths, bpfrx should keep using the current eBPF/TC
+If an interface only supports those paths, xpf should keep using the current eBPF/TC
 dataplane on that interface instead of pretending the userspace dataplane is equivalent.
 
 #### Mixed-mode operation
@@ -218,9 +218,9 @@ The implementation should allow mixed dataplanes on the same node:
 That reduces bring-up risk and avoids turning driver capability mismatches into an
 all-or-nothing deployment problem.
 
-## Why This Fits bpfrx Better Than a Pure io_uring Packet Engine
+## Why This Fits xpf Better Than a Pure io_uring Packet Engine
 
-bpfrx already has:
+xpf already has:
 - a strong `pkg/dataplane.DataPlane` interface
 - a clean Go control plane
 - HA/session-sync logic outside the dataplane hot path
@@ -432,8 +432,8 @@ This is where io_uring is a real win.
 Important:
 
 - this slow path should live in the native dataplane process
-- `bpfrxd` should receive metadata, counters, and summaries, not packet buffers
-- the only reason to let packets cross into `bpfrxd` is as a temporary bring-up hack,
+- `xpfd` should receive metadata, counters, and summaries, not packet buffers
+- the only reason to let packets cross into `xpfd` is as a temporary bring-up hack,
   not as the planned architecture
 
 ## Threading Model
@@ -563,7 +563,7 @@ Move the heavier, stateful, branchy work:
 
 ### Why
 
-This is the right split because the expensive part of bpfrx is not Ethernet parsing.
+This is the right split because the expensive part of xpf is not Ethernet parsing.
 It is state, hashing, timers, NAT, and policy.
 
 ### Feature Coverage Boundaries
@@ -594,7 +594,7 @@ The implementation should be explicit about what is in scope for the first usabl
 - TC egress mirroring / clone semantics
 - any feature that depends on skb-only helpers or existing TC hooks
 
-This is important because bpfrx is not just a basic routed firewall. Pretending the
+This is important because xpf is not just a basic routed firewall. Pretending the
 first userspace backend covers every current feature would guarantee a bad rollout.
 
 ## Where io_uring Actually Helps
@@ -640,11 +640,11 @@ Recommended model:
 - workers use a fast local FIB cache and adjacency cache
 - unresolved neighbor or unsupported route types go to slow path
 
-This mirrors how bpfrx already thinks about FIB generation and route invalidation.
+This mirrors how xpf already thinks about FIB generation and route invalidation.
 
 ## HA and Session Sync
 
-This design can fit bpfrx HA, but only if ownership is explicit and cheap.
+This design can fit xpf HA, but only if ownership is explicit and cheap.
 
 ### Required HA rules
 
@@ -667,7 +667,7 @@ Use batched delta publication from workers to a sync thread:
 - sync thread batches and transmits
 - periodic sweep/backfill remains available for repair
 
-That preserves the current bpfrx sync design principles.
+That preserves the current xpf sync design principles.
 
 ### Shard ownership and replay rules
 
@@ -722,14 +722,14 @@ This gives deterministic failure instead of undefined stale forwarding.
 - workers should not be considered healthy until their AF_XDP rings, config snapshot,
   and route snapshot are all installed
 
-## What an Implementation Would Look Like in bpfrx
+## What an Implementation Would Look Like in xpf
 
 ### Current repo state
 
-As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-tree:
+As of `2026-03-09`, xpf now has the initial userspace backend scaffolding in-tree:
 
 - `system dataplane-type userspace` is implemented
-- `bpfrxd` can launch a separate Rust helper process
+- `xpfd` can launch a separate Rust helper process
 - a dedicated Rust `xdp_userspace` entry program exists and can hand off to an `XSKMAP`
 - pinned control maps exist for userspace enablement, binding state, and AF_XDP sockets
 - the Rust helper can:
@@ -747,7 +747,7 @@ As of `2026-03-09`, bpfrx now has the initial userspace backend scaffolding in-t
     ARP/NDP state and caching live adjacency results per worker
   - record bounded recent exception summaries
   - accept synthetic packet injection requests for safe validation on lab clusters
-- `bpfrxd` already publishes interface, address, neighbor, and static-route summaries
+- `xpfd` already publishes interface, address, neighbor, and static-route summaries
   into the userspace snapshot contract
 - the Rust helper now has a bounded TUN-backed slow path for local-delivery and
   selected exception traffic, with explicit rate limits and helper-visible status counters
@@ -836,14 +836,14 @@ The remaining missing part is broader feature coverage and parity, not the hando
 
 Planned process layout:
 
-- `bpfrxd` remains the Go control plane
+- `xpfd` remains the Go control plane
 - a separate native dataplane process owns:
   - AF_XDP workers
   - packet slow path
   - io_uring helper threads
   - worker-local state and watchdogs
 
-This should not be implemented as normal Go goroutines inside `bpfrxd`.
+This should not be implemented as normal Go goroutines inside `xpfd`.
 If an in-process mode ever exists, it should be treated as a bring-up/debug mode,
 not the target production architecture.
 
@@ -862,7 +862,7 @@ Recommended internal structure:
 - one pinned AF_XDP worker per queue shard
 - one native slow-path / exception thread group
 - one route / adjacency snapshot consumer
-- one control socket thread for commands from `bpfrxd`
+- one control socket thread for commands from `xpfd`
 - one session-delta aggregator for HA/session sync export
 
 Rust is the best default implementation language for this process.
@@ -1005,7 +1005,7 @@ Without that, bring-up and HA debugging will be mostly guesswork.
 
 - preserves XDP's best property: cheap drop before the kernel stack
 - removes eBPF verifier pressure from the stateful firewall path
-- keeps bpfrx's current Go control-plane architecture intact
+- keeps xpf's current Go control-plane architecture intact
 - can reuse much of the DPDK route/session/config backend thinking
 - gives a reasonable path to multithreaded userspace processing without immediately
   committing to full DPDK/VFIO deployment requirements
@@ -1021,7 +1021,7 @@ Without that, bring-up and HA debugging will be mostly guesswork.
 
 ## Recommendation
 
-If bpfrx wants to explore this space seriously, the right target is:
+If xpf wants to explore this space seriously, the right target is:
 
 **XDP front-end + AF_XDP userspace workers + a separate Rust dataplane process + io_uring for slow-path and async systems work**
 
@@ -1040,7 +1040,7 @@ If this path is pursued, the working plan should be:
 2. Rust for the native dataplane runtime
 3. AF_XDP only on native-XDP-capable interfaces, mixed with current eBPF/TC elsewhere
 4. packet slow path remains inside the native dataplane process
-5. `bpfrxd` owns control, HA, and snapshot publication
+5. `xpfd` owns control, HA, and snapshot publication
 6. worker-local delta rings aggregate toward the HA/session-sync layer
 
 ## Open Questions
@@ -1056,7 +1056,7 @@ A performant design exists, but it is really:
 - **XDP + AF_XDP** for packet handoff
 - **multithreaded userspace workers** for stateful processing
 - **io_uring** for the surrounding async plumbing
-- **a separate native dataplane process**, not packet handling inside `bpfrxd`
+- **a separate native dataplane process**, not packet handling inside `xpfd`
 - **Rust for the worker runtime**, with Go retained for the control plane
 
 If the goal is maximum performance, I would design it that way from day one.

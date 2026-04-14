@@ -1,5 +1,5 @@
 // Package networkd generates systemd-networkd .link and .network files
-// for interfaces managed by bpfrxd.
+// for interfaces managed by xpfd.
 package networkd
 
 import (
@@ -14,8 +14,8 @@ import (
 const (
 	// DefaultNetworkDir is the systemd-networkd configuration directory.
 	DefaultNetworkDir = "/etc/systemd/network"
-	// filePrefix distinguishes bpfrx-managed files from manually created ones.
-	filePrefix = "10-bpfrx-"
+	// filePrefix distinguishes xpf-managed files from manually created ones.
+	filePrefix = "10-xpf-"
 )
 
 // InterfaceConfig describes a single interface for networkd generation.
@@ -61,17 +61,17 @@ func New() *Manager {
 
 // Apply writes .link and .network files for all interfaces,
 // then calls networkctl reload if any files changed.
-// Interfaces with existing non-bpfrx networkd configs (e.g. management
+// Interfaces with existing non-xpf networkd configs (e.g. management
 // interface) are skipped to avoid conflicts.
 func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 	if len(interfaces) == 0 {
 		return nil
 	}
 
-	// Discover interfaces with existing non-bpfrx networkd .network files.
+	// Discover interfaces with existing non-xpf networkd .network files.
 	// Only skip unmanaged interfaces that have external configs (e.g.
-	// management interface). Configured interfaces always get bpfrx files
-	// even if old external files exist — bpfrx takes ownership.
+	// management interface). Configured interfaces always get xpf files
+	// even if old external files exist — xpf takes ownership.
 	external := m.findExternallyManaged()
 
 	var filtered []InterfaceConfig
@@ -102,7 +102,7 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 
 	changed := false
 
-	// Remove stale bpfrx-managed files
+	// Remove stale xpf-managed files
 	matches, _ := filepath.Glob(filepath.Join(m.networkDir, filePrefix+"*"))
 	for _, path := range matches {
 		base := filepath.Base(path)
@@ -186,7 +186,7 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 // locally-originated traffic delivery via the TUN (the kernel drops packets
 // whose source route doesn't point at the TUN interface).
 func restoreSlowPathRPFilter() {
-	const tunName = "bpfrx-usp0"
+	const tunName = "xpf-usp0"
 	path := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/rp_filter", tunName)
 	if err := os.WriteFile(path, []byte("0"), 0644); err != nil {
 		if os.IsNotExist(err) {
@@ -197,7 +197,7 @@ func restoreSlowPathRPFilter() {
 	}
 }
 
-// Clear removes all bpfrx-managed networkd files and reloads.
+// Clear removes all xpf-managed networkd files and reloads.
 func (m *Manager) Clear() error {
 	matches, _ := filepath.Glob(filepath.Join(m.networkDir, filePrefix+"*"))
 	if len(matches) == 0 {
@@ -214,14 +214,14 @@ func (m *Manager) Clear() error {
 		return fmt.Errorf("networkctl reload: %w", err)
 	}
 	restoreSlowPathRPFilter()
-	slog.Info("cleared bpfrx networkd files", "removed", len(matches))
+	slog.Info("cleared xpf networkd files", "removed", len(matches))
 	return nil
 }
 
-// FindExternallyManaged scans the given networkd directory for non-bpfrx
+// FindExternallyManaged scans the given networkd directory for non-xpf
 // .network files and returns the set of interface names they match. This
 // protects the management interface (and any other externally configured
-// interface) from being modified or brought down by bpfrx.
+// interface) from being modified or brought down by xpf.
 func FindExternallyManaged(dir string) map[string]bool {
 	result := make(map[string]bool)
 	entries, err := os.ReadDir(dir)
@@ -256,7 +256,7 @@ func (m *Manager) findExternallyManaged() map[string]bool {
 
 func (m *Manager) generateNetdev(ifc InterfaceConfig) string {
 	var b strings.Builder
-	b.WriteString("# Managed by bpfrxd — do not edit\n")
+	b.WriteString("# Managed by xpfd — do not edit\n")
 	b.WriteString("[NetDev]\n")
 	fmt.Fprintf(&b, "Name=%s\n", ifc.Name)
 	b.WriteString("Kind=bond\n")
@@ -292,7 +292,7 @@ func (m *Manager) generateNetdev(ifc InterfaceConfig) string {
 
 func (m *Manager) generateBridgeNetdev(ifc InterfaceConfig) string {
 	var b strings.Builder
-	b.WriteString("# Managed by bpfrxd — do not edit\n")
+	b.WriteString("# Managed by xpfd — do not edit\n")
 	b.WriteString("[NetDev]\n")
 	fmt.Fprintf(&b, "Name=%s\n", ifc.Name)
 	b.WriteString("Kind=bridge\n")
@@ -307,7 +307,7 @@ func (m *Manager) generateBridgeNetdev(ifc InterfaceConfig) string {
 
 func (m *Manager) generateLink(ifc InterfaceConfig) string {
 	var b strings.Builder
-	b.WriteString("# Managed by bpfrxd — do not edit\n")
+	b.WriteString("# Managed by xpfd — do not edit\n")
 	b.WriteString("[Match]\n")
 	if ifc.OriginalName != "" {
 		// RETH members: match by kernel name (PCI-based, stable across
@@ -335,7 +335,7 @@ func (m *Manager) generateLink(ifc InterfaceConfig) string {
 
 func (m *Manager) generateNetwork(ifc InterfaceConfig) string {
 	var b strings.Builder
-	b.WriteString("# Managed by bpfrxd — do not edit\n")
+	b.WriteString("# Managed by xpfd — do not edit\n")
 	b.WriteString("[Match]\n")
 	fmt.Fprintf(&b, "Name=%s\n", ifc.Name)
 

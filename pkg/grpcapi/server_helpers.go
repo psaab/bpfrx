@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/vishvananda/netlink"
 	"google.golang.org/grpc/metadata"
 )

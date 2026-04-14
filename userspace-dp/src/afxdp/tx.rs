@@ -287,10 +287,7 @@ fn binding_has_pending_tx_work(binding: &BindingWorker) -> bool {
         || !binding.pending_tx_prepared.is_empty()
         || !binding.pending_tx_local.is_empty()
         || !binding.live.pending_tx_empty()
-        || binding
-            .cos_interfaces
-            .values()
-            .any(|iface| iface.queues.iter().any(|queue| !queue.items.is_empty()))
+        || binding.cos_nonempty_interfaces > 0
 }
 
 fn ingest_cos_pending_tx(binding: &mut BindingWorker, forwarding: &ForwardingState, now_ns: u64) {
@@ -328,28 +325,22 @@ fn drain_shaped_tx(
     now_ns: u64,
     shared_recycles: &mut Vec<(u32, u64)>,
 ) -> bool {
-    let mut root_keys = binding
-        .cos_interfaces
-        .iter()
-        .filter_map(|(ifindex, iface)| {
-            iface
-                .queues
-                .iter()
-                .any(|queue| !queue.items.is_empty())
-                .then_some(*ifindex)
-        })
-        .collect::<Vec<_>>();
-    if root_keys.is_empty() {
+    if binding.cos_nonempty_interfaces == 0 || binding.cos_interface_order.is_empty() {
         return false;
     }
-    root_keys.sort_unstable();
-    let start = binding.cos_interface_rr % root_keys.len();
-    for offset in 0..root_keys.len() {
-        let root_ifindex = root_keys[(start + offset) % root_keys.len()];
+    let start = binding.cos_interface_rr % binding.cos_interface_order.len();
+    for offset in 0..binding.cos_interface_order.len() {
+        let root_ifindex = binding.cos_interface_order[(start + offset) % binding.cos_interface_order.len()];
+        let Some(root) = binding.cos_interfaces.get(&root_ifindex) else {
+            continue;
+        };
+        if root.nonempty_queues == 0 {
+            continue;
+        }
         let Some(batch) = build_cos_batch(binding, root_ifindex, now_ns) else {
             continue;
         };
-        binding.cos_interface_rr = (start + offset + 1) % root_keys.len();
+        binding.cos_interface_rr = (start + offset + 1) % binding.cos_interface_order.len();
         return submit_cos_batch(binding, root_ifindex, batch, now_ns, shared_recycles);
     }
     false
@@ -360,109 +351,115 @@ fn build_cos_batch(
     root_ifindex: i32,
     now_ns: u64,
 ) -> Option<CoSBatch> {
-    let root = binding.cos_interfaces.get_mut(&root_ifindex)?;
-    refill_cos_tokens(
-        &mut root.tokens,
-        root.shaping_rate_bytes,
-        root.burst_bytes.max(COS_MIN_BURST_BYTES),
-        &mut root.last_refill_ns,
-        now_ns,
-    );
-    for priority in 0..COS_PRIORITY_LEVELS {
-        let priority_value = priority as u8;
-        let indices = root
-            .queues
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, queue)| {
-                (queue.priority == priority_value && !queue.items.is_empty()).then_some(idx)
-            })
-            .collect::<Vec<_>>();
-        if indices.is_empty() {
-            continue;
-        }
-        let start = root.rr_index_by_priority[priority] % indices.len();
-        for offset in 0..indices.len() {
-            let queue_idx = indices[(start + offset) % indices.len()];
-            let queue = &mut root.queues[queue_idx];
-            refill_cos_tokens(
-                &mut queue.tokens,
-                queue.transmit_rate_bytes,
-                queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
-                &mut queue.last_refill_ns,
-                now_ns,
-            );
-            let Some(head) = queue.items.front() else {
-                continue;
-            };
-            let head_len = cos_item_len(head);
-            if root.tokens < head_len || queue.tokens < head_len {
+    let mut selected = None;
+    {
+        let root = binding.cos_interfaces.get_mut(&root_ifindex)?;
+        refill_cos_tokens(
+            &mut root.tokens,
+            root.shaping_rate_bytes,
+            root.burst_bytes.max(COS_MIN_BURST_BYTES),
+            &mut root.last_refill_ns,
+            now_ns,
+        );
+        for priority in 0..COS_PRIORITY_LEVELS {
+            let indices_len = root.queue_indices_by_priority[priority].len();
+            if indices_len == 0 {
                 continue;
             }
-            root.rr_index_by_priority[priority] = (start + offset + 1) % indices.len();
-            let mut remaining_root = root.tokens;
-            let mut remaining_queue = queue.tokens;
-            match head {
-                CoSPendingTxItem::Local(_) => {
-                    let mut items = VecDeque::new();
-                    while items.len() < TX_BATCH_SIZE {
-                        let Some(front) = queue.items.front() else {
-                            break;
-                        };
-                        let len = cos_item_len(front);
-                        if !matches!(front, CoSPendingTxItem::Local(_))
-                            || remaining_root < len
-                            || remaining_queue < len
-                        {
-                            break;
-                        }
-                        remaining_root = remaining_root.saturating_sub(len);
-                        remaining_queue = remaining_queue.saturating_sub(len);
-                        match queue.items.pop_front() {
-                            Some(CoSPendingTxItem::Local(req)) => items.push_back(req),
-                            Some(other) => {
-                                queue.items.push_front(other);
+            let start = root.rr_index_by_priority[priority] % indices_len;
+            for offset in 0..indices_len {
+                let queue_idx = root.queue_indices_by_priority[priority][(start + offset) % indices_len];
+                let queue = &mut root.queues[queue_idx];
+                if queue.items.is_empty() {
+                    continue;
+                }
+                refill_cos_tokens(
+                    &mut queue.tokens,
+                    queue.transmit_rate_bytes,
+                    queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
+                    &mut queue.last_refill_ns,
+                    now_ns,
+                );
+                let Some(head) = queue.items.front() else {
+                    continue;
+                };
+                let head_len = cos_item_len(head);
+                if root.tokens < head_len || queue.tokens < head_len {
+                    continue;
+                }
+                root.rr_index_by_priority[priority] = (start + offset + 1) % indices_len;
+                let mut remaining_root = root.tokens;
+                let mut remaining_queue = queue.tokens;
+                match head {
+                    CoSPendingTxItem::Local(_) => {
+                        let mut items = VecDeque::new();
+                        while items.len() < TX_BATCH_SIZE {
+                            let Some(front) = queue.items.front() else {
+                                break;
+                            };
+                            let len = cos_item_len(front);
+                            if !matches!(front, CoSPendingTxItem::Local(_))
+                                || remaining_root < len
+                                || remaining_queue < len
+                            {
                                 break;
                             }
-                            None => break,
+                            remaining_root = remaining_root.saturating_sub(len);
+                            remaining_queue = remaining_queue.saturating_sub(len);
+                            match queue.items.pop_front() {
+                                Some(CoSPendingTxItem::Local(req)) => items.push_back(req),
+                                Some(other) => {
+                                    queue.items.push_front(other);
+                                    break;
+                                }
+                                None => break,
+                            }
                         }
-                    }
-                    if !items.is_empty() {
-                        return Some(CoSBatch::Local { queue_idx, items });
-                    }
-                }
-                CoSPendingTxItem::Prepared(_) => {
-                    let mut items = VecDeque::new();
-                    while items.len() < TX_BATCH_SIZE {
-                        let Some(front) = queue.items.front() else {
-                            break;
-                        };
-                        let len = cos_item_len(front);
-                        if !matches!(front, CoSPendingTxItem::Prepared(_))
-                            || remaining_root < len
-                            || remaining_queue < len
-                        {
+                        if !items.is_empty() {
+                            selected = Some(CoSBatch::Local { queue_idx, items });
                             break;
                         }
-                        remaining_root = remaining_root.saturating_sub(len);
-                        remaining_queue = remaining_queue.saturating_sub(len);
-                        match queue.items.pop_front() {
-                            Some(CoSPendingTxItem::Prepared(req)) => items.push_back(req),
-                            Some(other) => {
-                                queue.items.push_front(other);
+                    }
+                    CoSPendingTxItem::Prepared(_) => {
+                        let mut items = VecDeque::new();
+                        while items.len() < TX_BATCH_SIZE {
+                            let Some(front) = queue.items.front() else {
+                                break;
+                            };
+                            let len = cos_item_len(front);
+                            if !matches!(front, CoSPendingTxItem::Prepared(_))
+                                || remaining_root < len
+                                || remaining_queue < len
+                            {
                                 break;
                             }
-                            None => break,
+                            remaining_root = remaining_root.saturating_sub(len);
+                            remaining_queue = remaining_queue.saturating_sub(len);
+                            match queue.items.pop_front() {
+                                Some(CoSPendingTxItem::Prepared(req)) => items.push_back(req),
+                                Some(other) => {
+                                    queue.items.push_front(other);
+                                    break;
+                                }
+                                None => break,
+                            }
+                        }
+                        if !items.is_empty() {
+                            selected = Some(CoSBatch::Prepared { queue_idx, items });
+                            break;
                         }
                     }
-                    if !items.is_empty() {
-                        return Some(CoSBatch::Prepared { queue_idx, items });
-                    }
                 }
+            }
+            if selected.is_some() {
+                break;
             }
         }
     }
-    None
+    if selected.is_some() {
+        refresh_cos_interface_activity(binding, root_ifindex);
+    }
+    selected
 }
 
 fn submit_cos_batch(
@@ -566,24 +563,9 @@ pub(super) fn resolve_cos_queue_id(
     flow_key: Option<&SessionKey>,
 ) -> Option<u8> {
     let iface = forwarding.cos.interfaces.get(&egress_ifindex)?;
-    let class_name = resolve_flow_forwarding_class(forwarding, meta, flow_key);
-    if let Some(class_name) = class_name
-        && let Some(queue) = iface
-            .queues
-            .iter()
-            .find(|queue| queue.forwarding_class == class_name)
-    {
-        return Some(queue.queue_id);
-    }
-    Some(iface.default_queue)
-}
-
-fn resolve_flow_forwarding_class(
-    forwarding: &ForwardingState,
-    meta: UserspaceDpMeta,
-    flow_key: Option<&SessionKey>,
-) -> Option<String> {
-    let flow_key = flow_key?;
+    let Some(flow_key) = flow_key else {
+        return Some(iface.default_queue);
+    };
     let ingress_ifindex = resolve_ingress_logical_ifindex(
         forwarding,
         meta.ingress_ifindex as i32,
@@ -602,7 +584,15 @@ fn resolve_flow_forwarding_class(
         flow_key.dst_port,
         meta.dscp,
     );
-    (!result.forwarding_class.is_empty()).then_some(result.forwarding_class)
+    if !result.forwarding_class.is_empty() {
+        if let Some(queue_id) = iface
+            .queue_by_forwarding_class
+            .get(result.forwarding_class.as_ref())
+        {
+            return Some(*queue_id);
+        }
+    }
+    Some(iface.default_queue)
 }
 
 fn enqueue_local_into_cos(
@@ -665,20 +655,30 @@ fn ensure_cos_interface_runtime(
     let Some(config) = forwarding.cos.interfaces.get(&egress_ifindex) else {
         return false;
     };
-    binding
-        .cos_interfaces
-        .entry(egress_ifindex)
-        .or_insert_with(|| build_cos_interface_runtime(config, now_ns));
+    if !binding.cos_interfaces.contains_key(&egress_ifindex) {
+        binding
+            .cos_interfaces
+            .insert(egress_ifindex, build_cos_interface_runtime(config, now_ns));
+        binding.cos_interface_order.push(egress_ifindex);
+        binding.cos_interface_order.sort_unstable();
+    }
     true
 }
 
 fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSInterfaceRuntime {
+    let mut queue_indices_by_priority: [Vec<usize>; COS_PRIORITY_LEVELS] =
+        std::array::from_fn(|_| Vec::new());
+    for (idx, queue) in config.queues.iter().enumerate() {
+        let priority = usize::from(queue.priority).min(COS_PRIORITY_LEVELS - 1);
+        queue_indices_by_priority[priority].push(idx);
+    }
     CoSInterfaceRuntime {
         shaping_rate_bytes: config.shaping_rate_bytes,
         burst_bytes: config.burst_bytes.max(COS_MIN_BURST_BYTES),
         tokens: config.burst_bytes.max(COS_MIN_BURST_BYTES),
         last_refill_ns: now_ns,
         default_queue: config.default_queue,
+        nonempty_queues: 0,
         queues: config
             .queues
             .iter()
@@ -693,6 +693,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 items: VecDeque::new(),
             })
             .collect(),
+        queue_indices_by_priority,
         rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
     }
 }
@@ -704,28 +705,30 @@ fn enqueue_cos_item(
     item_len: u64,
     item: CoSPendingTxItem,
 ) -> Result<(), CoSPendingTxItem> {
-    let Some(root) = binding.cos_interfaces.get_mut(&egress_ifindex) else {
-        return Err(item);
-    };
-    if root.queues.is_empty() {
-        return Err(item);
-    }
-    let target_queue = requested_queue.unwrap_or(root.default_queue);
-    let default_queue = root.default_queue;
-    let mut queue_idx = root
-        .queues
-        .iter()
-        .position(|queue| queue.queue_id == target_queue)
-        .or_else(|| {
-            root.queues
-                .iter()
-                .position(|queue| queue.queue_id == default_queue)
-        })
-        .unwrap_or(0);
-    if queue_idx >= root.queues.len() {
-        queue_idx = 0;
-    }
-    let (queue_id, recycle) = {
+    let mut root_became_nonempty = false;
+    let (accepted, queue_id, recycle) = {
+        let Some(root) = binding.cos_interfaces.get_mut(&egress_ifindex) else {
+            return Err(item);
+        };
+        if root.queues.is_empty() {
+            return Err(item);
+        }
+        let target_queue = requested_queue.unwrap_or(root.default_queue);
+        let default_queue = root.default_queue;
+        let mut queue_idx = root
+            .queues
+            .iter()
+            .position(|queue| queue.queue_id == target_queue)
+            .or_else(|| {
+                root.queues
+                    .iter()
+                    .position(|queue| queue.queue_id == default_queue)
+            })
+            .unwrap_or(0);
+        if queue_idx >= root.queues.len() {
+            queue_idx = 0;
+        }
+        let root_was_empty = root.nonempty_queues == 0;
         let queue = &mut root.queues[queue_idx];
         let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
         if queue.queued_bytes.saturating_add(item_len) > buffer_limit {
@@ -733,13 +736,24 @@ fn enqueue_cos_item(
                 CoSPendingTxItem::Prepared(req) => Some((req.recycle, req.offset)),
                 CoSPendingTxItem::Local(_) => None,
             };
-            (queue.queue_id, recycle)
+            (false, queue.queue_id, recycle)
         } else {
+            let queue_was_empty = queue.items.is_empty();
             queue.queued_bytes = queue.queued_bytes.saturating_add(item_len);
             queue.items.push_back(item);
-            return Ok(());
+            if queue_was_empty {
+                root.nonempty_queues = root.nonempty_queues.saturating_add(1);
+                root_became_nonempty = root_was_empty;
+            }
+            (true, queue.queue_id, None)
         }
     };
+    if root_became_nonempty {
+        binding.cos_nonempty_interfaces = binding.cos_nonempty_interfaces.saturating_add(1);
+    }
+    if accepted {
+        return Ok(());
+    }
     if let Some((recycle, offset)) = recycle {
         match recycle {
             PreparedTxRecycle::FreeTxFrame => binding.free_tx_frames.push_back(offset),
@@ -758,6 +772,24 @@ fn enqueue_cos_item(
     Ok(())
 }
 
+fn refresh_cos_interface_activity(binding: &mut BindingWorker, root_ifindex: i32) {
+    let mut new_nonempty = 0usize;
+    let old_nonempty = binding
+        .cos_interfaces
+        .get(&root_ifindex)
+        .map(|root| root.nonempty_queues)
+        .unwrap_or(0);
+    if let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) {
+        new_nonempty = root.queues.iter().filter(|queue| !queue.items.is_empty()).count();
+        root.nonempty_queues = new_nonempty;
+    }
+    if old_nonempty == 0 && new_nonempty > 0 {
+        binding.cos_nonempty_interfaces = binding.cos_nonempty_interfaces.saturating_add(1);
+    } else if old_nonempty > 0 && new_nonempty == 0 {
+        binding.cos_nonempty_interfaces = binding.cos_nonempty_interfaces.saturating_sub(1);
+    }
+}
+
 fn cos_item_len(item: &CoSPendingTxItem) -> u64 {
     match item {
         CoSPendingTxItem::Local(req) => req.bytes.len() as u64,
@@ -772,15 +804,18 @@ fn apply_cos_send_result(
     sent_bytes: u64,
     retry: VecDeque<TxRequest>,
 ) {
-    let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
-        return;
-    };
-    if let Some(queue) = root.queues.get_mut(queue_idx) {
-        restore_cos_local_items_inner(queue, retry);
-        queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
-        queue.tokens = queue.tokens.saturating_sub(sent_bytes);
+    {
+        let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
+            return;
+        };
+        if let Some(queue) = root.queues.get_mut(queue_idx) {
+            restore_cos_local_items_inner(queue, retry);
+            queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
+            queue.tokens = queue.tokens.saturating_sub(sent_bytes);
+        }
+        root.tokens = root.tokens.saturating_sub(sent_bytes);
     }
-    root.tokens = root.tokens.saturating_sub(sent_bytes);
+    refresh_cos_interface_activity(binding, root_ifindex);
 }
 
 fn apply_cos_prepared_result(
@@ -790,15 +825,18 @@ fn apply_cos_prepared_result(
     sent_bytes: u64,
     retry: VecDeque<PreparedTxRequest>,
 ) {
-    let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
-        return;
-    };
-    if let Some(queue) = root.queues.get_mut(queue_idx) {
-        restore_cos_prepared_items_inner(queue, retry);
-        queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
-        queue.tokens = queue.tokens.saturating_sub(sent_bytes);
+    {
+        let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
+            return;
+        };
+        if let Some(queue) = root.queues.get_mut(queue_idx) {
+            restore_cos_prepared_items_inner(queue, retry);
+            queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
+            queue.tokens = queue.tokens.saturating_sub(sent_bytes);
+        }
+        root.tokens = root.tokens.saturating_sub(sent_bytes);
     }
-    root.tokens = root.tokens.saturating_sub(sent_bytes);
+    refresh_cos_interface_activity(binding, root_ifindex);
 }
 
 fn restore_cos_local_items(
@@ -807,13 +845,16 @@ fn restore_cos_local_items(
     queue_idx: usize,
     retry: VecDeque<TxRequest>,
 ) {
-    let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
-        return;
-    };
-    if let Some(queue) = root.queues.get_mut(queue_idx) {
-        restore_cos_local_items_inner(queue, retry);
-        queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
+    {
+        let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
+            return;
+        };
+        if let Some(queue) = root.queues.get_mut(queue_idx) {
+            restore_cos_local_items_inner(queue, retry);
+            queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
+        }
     }
+    refresh_cos_interface_activity(binding, root_ifindex);
 }
 
 fn restore_cos_prepared_items(
@@ -822,13 +863,16 @@ fn restore_cos_prepared_items(
     queue_idx: usize,
     retry: VecDeque<PreparedTxRequest>,
 ) {
-    let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
-        return;
-    };
-    if let Some(queue) = root.queues.get_mut(queue_idx) {
-        restore_cos_prepared_items_inner(queue, retry);
-        queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
+    {
+        let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) else {
+            return;
+        };
+        if let Some(queue) = root.queues.get_mut(queue_idx) {
+            restore_cos_prepared_items_inner(queue, retry);
+            queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
+        }
     }
+    refresh_cos_interface_activity(binding, root_ifindex);
 }
 
 fn restore_cos_local_items_inner(queue: &mut CoSQueueRuntime, mut retry: VecDeque<TxRequest>) {
@@ -1410,7 +1454,7 @@ mod tests {
                     name: "reth0.0".into(),
                     ifindex: 202,
                     hardware_addr: "02:bf:72:00:80:08".into(),
-                    cos_shaping_rate_bps: 10_000_000,
+                    cos_shaping_rate_bytes_per_sec: 10_000_000,
                     cos_shaping_burst_bytes: 256_000,
                     cos_scheduler_map: "wan-map".into(),
                     ..Default::default()
@@ -1500,7 +1544,7 @@ mod tests {
             interfaces: vec![InterfaceSnapshot {
                 ifindex: 202,
                 hardware_addr: "02:bf:72:00:80:08".into(),
-                cos_shaping_rate_bps: 10_000_000,
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
                 cos_scheduler_map: "wan-map".into(),
                 ..Default::default()
             }],

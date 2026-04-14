@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
-	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 type fakeUserspaceDeltaDrainer struct {

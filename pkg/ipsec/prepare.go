@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // PrepareConfig resolves runtime-only IPsec values from the full config.

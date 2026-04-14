@@ -157,7 +157,7 @@ subsequent stall.
                     VF4            VF5
                      |              |
           +----------+---+  +------+---------+
-          | bpfrx-       |  | bpfrx-         |
+          | xpf-       |  | xpf-         |
           | userspace-   |  | userspace-     |
           | fw0 (node 0) |  | fw1 (node 1)  |
           | pri: 200     |  | pri: 100       |
@@ -197,8 +197,8 @@ subsequent stall.
 
 | Component | Detail |
 |-----------|--------|
-| bpfrxd | Daemon managing BPF pipeline + userspace AF_XDP helper |
-| bpfrx-userspace-dp | Rust AF_XDP packet processor (libxdp C bridge) |
+| xpfd | Daemon managing BPF pipeline + userspace AF_XDP helper |
+| xpf-userspace-dp | Rust AF_XDP packet processor (libxdp C bridge) |
 | Config | `docs/ha-cluster-userspace.conf` |
 | Env | `test/incus/loss-userspace-cluster.env` |
 | Deploy script | `test/incus/cluster-setup.sh` |
@@ -455,12 +455,12 @@ After the liveness gate fires, each node should be running
 
 ```bash
 # Node 0 -- check WAN interface
-sg incus-admin -c "incus exec loss:bpfrx-userspace-fw0 -- \
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- \
   ip link show ge-0-0-2 | grep prog"
 # Expected: prog/xdp id <N> ...
 
 # Node 1 -- check LAN interface
-sg incus-admin -c "incus exec loss:bpfrx-userspace-fw1 -- \
+sg incus-admin -c "incus exec loss:xpf-userspace-fw1 -- \
   ip link show ge-7-0-1 | grep prog"
 # Expected: prog/xdp id <N> ...
 ```
@@ -468,7 +468,7 @@ sg incus-admin -c "incus exec loss:bpfrx-userspace-fw1 -- \
 Verify the program is the eBPF pipeline, not the XDP shim:
 
 ```bash
-sg incus-admin -c "incus exec loss:bpfrx-userspace-fw0 -- \
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- \
   bpftool prog show | grep -A1 'xdp_main_prog'"
 ```
 
@@ -511,7 +511,7 @@ after.
 ```bash
 # Step 1: Move all RGs to node 0
 for rg in 0 1 2; do
-  sg incus-admin -c "incus exec loss:bpfrx-userspace-fw0 -- \
+  sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- \
     /usr/local/sbin/cli -c \
     'request chassis cluster failover redundancy-group $rg node 0'"
   sleep 1
@@ -519,7 +519,7 @@ done
 sleep 5
 
 # Step 2: Verify cluster state
-sg incus-admin -c "incus exec loss:bpfrx-userspace-fw0 -- \
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- \
   /usr/local/sbin/cli -c 'show chassis cluster status'"
 # All three RGs should show node0 as primary
 
@@ -532,7 +532,7 @@ PID=$!
 sleep 8
 
 # Step 5: Failover RG2 (LAN) to node 1
-sg incus-admin -c "incus exec loss:bpfrx-userspace-fw0 -- \
+sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- \
   /usr/local/sbin/cli -c \
   'request chassis cluster failover redundancy-group 2 node 1'"
 
@@ -576,7 +576,7 @@ recovery:
 
 ```bash
 for rg in 0 1 2; do
-  sg incus-admin -c "incus exec loss:bpfrx-userspace-fw0 -- \
+  sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- \
     /usr/local/sbin/cli -c \
     'request chassis cluster failover redundancy-group $rg node 0'"
   sleep 1
@@ -595,11 +595,11 @@ sg incus-admin -c "incus exec loss:cluster-userspace-host -- \
 ### 5.8 Standalone XSK Rebind Test
 
 This is the standalone test used to bisect AF_XDP bugs independently
-of bpfrxd. Run directly on one of the firewall VMs.
+of xpfd. Run directly on one of the firewall VMs.
 
 ```bash
 # SSH into a firewall node
-sg incus-admin -c "incus exec loss:bpfrx-userspace-fw1 -- bash"
+sg incus-admin -c "incus exec loss:xpf-userspace-fw1 -- bash"
 
 # In test/xsk-repro/ (must be pre-built and pushed)
 
@@ -611,7 +611,7 @@ sg incus-admin -c "incus exec loss:bpfrx-userspace-fw1 -- bash"
 
 # xdpilone (expected to fail on both phases)
 ./xsk-rebind-test ge-7-0-1 0 \
-  --xsk-map-pin /sys/fs/bpf/bpfrx/userspace_xsk_map
+  --xsk-map-pin /sys/fs/bpf/xpf/userspace_xsk_map
 ```
 
 **How to use for bisection.** If a future kernel update or driver change
@@ -697,7 +697,7 @@ bpftool prog show | grep -E '(xdp_main|xdp_userspace)'
 Check whether userspace ctrl is enabled in the BPF map:
 
 ```bash
-bpftool map dump pinned /sys/fs/bpf/bpfrx/userspace_ctrl
+bpftool map dump pinned /sys/fs/bpf/xpf/userspace_ctrl
 # Key: 0x00 0x00 0x00 0x00
 # Value: enabled (1) or disabled (0) as first byte
 ```
@@ -707,14 +707,14 @@ bpftool map dump pinned /sys/fs/bpf/bpfrx/userspace_ctrl
 The binding status is maintained in a state file by the daemon:
 
 ```bash
-cat /var/run/bpfrx/xsk-status.json 2>/dev/null || \
-  journalctl -u bpfrxd --no-pager | grep -i "xsk\|binding\|liveness"
+cat /var/run/xpf/xsk-status.json 2>/dev/null || \
+  journalctl -u xpfd --no-pager | grep -i "xsk\|binding\|liveness"
 ```
 
 Check the BPF bindings map:
 
 ```bash
-bpftool map dump pinned /sys/fs/bpf/bpfrx/userspace_bindings
+bpftool map dump pinned /sys/fs/bpf/xpf/userspace_bindings
 # Non-zero entries indicate active XSK bindings
 # All-zero entries after deploy indicate the XSK bind failure
 ```
@@ -744,7 +744,7 @@ Check global counters for fabric redirect and fallback:
 /usr/local/sbin/cli -c 'show security flow statistics'
 
 # Via bpftool -- global counters map
-bpftool map dump pinned /sys/fs/bpf/bpfrx/global_counters
+bpftool map dump pinned /sys/fs/bpf/xpf/global_counters
 # Look for:
 #   GLOBAL_CTR_FABRIC_FWD       — packets fabric-redirected
 #   GLOBAL_CTR_FABRIC_FWD_DROP  — fabric redirect failed (dual-inactive)
@@ -781,19 +781,19 @@ Check active sessions, especially for fabric-forwarded flows:
 
 ```bash
 # XSK liveness gate events
-journalctl -u bpfrxd --no-pager | grep -i "liveness\|swap.*xdp\|xsk.*fail"
+journalctl -u xpfd --no-pager | grep -i "liveness\|swap.*xdp\|xsk.*fail"
 
 # Ctrl enable events
-journalctl -u bpfrxd --no-pager | grep -i "ctrl.*enable\|ctrl.*disable"
+journalctl -u xpfd --no-pager | grep -i "ctrl.*enable\|ctrl.*disable"
 
 # VRRP transitions
-journalctl -u bpfrxd --no-pager | grep -i "vrrp.*master\|vrrp.*backup"
+journalctl -u xpfd --no-pager | grep -i "vrrp.*master\|vrrp.*backup"
 
 # Fabric redirect
-journalctl -u bpfrxd --no-pager | grep -i "fabric"
+journalctl -u xpfd --no-pager | grep -i "fabric"
 
 # NA/GARP
-journalctl -u bpfrxd --no-pager | grep -i "garp\|unsolicited.*na"
+journalctl -u xpfd --no-pager | grep -i "garp\|unsolicited.*na"
 ```
 
 ---
@@ -803,8 +803,8 @@ journalctl -u bpfrxd --no-pager | grep -i "garp\|unsolicited.*na"
 ### 8.1 Purpose
 
 `test/xsk-repro/` contains minimal standalone programs that isolate
-AF_XDP behavior from the rest of bpfrxd. They prove that XSK bugs are
-in the library (xdpilone) or kernel driver (mlx5), not in bpfrx
+AF_XDP behavior from the rest of xpfd. They prove that XSK bugs are
+in the library (xdpilone) or kernel driver (mlx5), not in xpf
 application code.
 
 ### 8.2 Contents
@@ -854,7 +854,7 @@ The fixes have the following logical dependencies (commits higher in
 the graph must be applied before commits lower):
 
 ```
-8d4bb7ce  (standalone test -- proves bugs, no code changes to bpfrxd)
+8d4bb7ce  (standalone test -- proves bugs, no code changes to xpfd)
     |
     v
 375be885  (replace xdpilone with libxdp -- fixes Bug 3.2)

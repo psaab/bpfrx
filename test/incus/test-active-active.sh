@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bpfrx cluster active/active RG failover test
+# xpf cluster active/active RG failover test
 #
 # Validates that active TCP connections survive when a single redundancy
 # group is moved to the peer node (active/active per-RG split).
@@ -8,7 +8,7 @@
 # LAN (RG2, fw0) must cross the fabric link to exit on the WAN (RG1, fw1)
 # when the RGs are split across nodes.
 #
-# Requires: bpfrx-fw0, bpfrx-fw1, cluster-lan-host running.
+# Requires: xpf-fw0, xpf-fw1, cluster-lan-host running.
 # Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.200).
 #
 # Tests:
@@ -57,11 +57,11 @@ cleanup() {
 	# Kill iperf3 on LAN host
 	incus exec cluster-lan-host -- pkill -9 iperf3 2>/dev/null || true
 	# Reset any manual failovers
-	incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1' 2>/dev/null || true
-	incus exec bpfrx-fw1 -- cli -c 'request chassis cluster failover reset redundancy-group 1' 2>/dev/null || true
+	incus exec xpf-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1' 2>/dev/null || true
+	incus exec xpf-fw1 -- cli -c 'request chassis cluster failover reset redundancy-group 1' 2>/dev/null || true
 	# With preempt=false, resetting the flag alone doesn't move VRRP.
 	# Explicitly request RG1 back to fw0 so the next test starts clean.
-	incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 0' 2>/dev/null || true
+	incus exec xpf-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 0' 2>/dev/null || true
 	sleep 2
 }
 
@@ -71,29 +71,29 @@ trap cleanup EXIT
 
 info "Preflight checks"
 
-for inst in bpfrx-fw0 bpfrx-fw1 cluster-lan-host; do
+for inst in xpf-fw0 xpf-fw1 cluster-lan-host; do
 	instance_running "$inst" || die "$inst is not running"
 done
 
 # Reset any stale manual failover flags from previous test runs.
 for rg in 0 1 2; do
-	incus exec bpfrx-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
-	incus exec bpfrx-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+	incus exec xpf-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+	incus exec xpf-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
 done
 sleep 2
 
 # Ensure all RGs are on fw0 (request peer failover if needed)
-fw0_status=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
+fw0_status=$(incus exec xpf-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
 for rg in 0 1 2; do
 	rg_primary=$(echo "$fw0_status" | grep -A2 "Redundancy group: $rg" | grep "node0" | grep -c "primary" || true)
 	if [[ "$rg_primary" -ne 1 ]]; then
-		incus exec bpfrx-fw0 -- cli -c "request chassis cluster failover redundancy-group $rg node 0" 2>/dev/null || true
+		incus exec xpf-fw0 -- cli -c "request chassis cluster failover redundancy-group $rg node 0" 2>/dev/null || true
 	fi
 done
 sleep 3
 
 # Verify fw0 is primary for all RGs
-fw0_status=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
+fw0_status=$(incus exec xpf-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
 rg0_primary=$(echo "$fw0_status" | grep -A2 "Redundancy group: 0" | grep "node0" | grep -c "primary" || true)
 rg1_primary=$(echo "$fw0_status" | grep -A2 "Redundancy group: 1" | grep "node0" | grep -c "primary" || true)
 rg2_primary=$(echo "$fw0_status" | grep -A2 "Redundancy group: 2" | grep "node0" | grep -c "primary" || true)
@@ -135,11 +135,11 @@ fi
 
 info "Phase 2: Failover RG1 (WAN) to node1 — creating active/active split"
 
-incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1' 2>/dev/null || true
+incus exec xpf-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1' 2>/dev/null || true
 sleep "$SETTLE_WAIT"
 
 # Verify RG split: RG1 on fw1, RG2 on fw0
-fw0_status=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
+fw0_status=$(incus exec xpf-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
 
 rg1_node0=$(echo "$fw0_status" | grep -A2 "Redundancy group: 1" | grep "node0" | awk '{print $3}')
 rg2_node0=$(echo "$fw0_status" | grep -A2 "Redundancy group: 2" | grep "node0" | awk '{print $3}')
@@ -157,7 +157,7 @@ else
 fi
 
 # Verify VRRP states match cluster state
-fw0_vrrp=$(incus exec bpfrx-fw0 -- cli -c 'show security vrrp' 2>/dev/null)
+fw0_vrrp=$(incus exec xpf-fw0 -- cli -c 'show security vrrp' 2>/dev/null)
 
 vrrp_101=$(echo "$fw0_vrrp" | grep "101" | head -1)
 vrrp_102=$(echo "$fw0_vrrp" | grep "102" | head -1)
@@ -226,11 +226,11 @@ fi
 
 info "Phase 4: Failover RG1 (WAN) back to node0 — reunifying all RGs"
 
-incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 0' 2>/dev/null || true
+incus exec xpf-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 0' 2>/dev/null || true
 sleep "$SETTLE_WAIT"
 
 # Verify all RGs back on fw0
-fw0_status=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
+fw0_status=$(incus exec xpf-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
 
 rg1_node0=$(echo "$fw0_status" | grep -A2 "Redundancy group: 1" | grep "node0" | awk '{print $3}')
 

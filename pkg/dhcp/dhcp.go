@@ -456,7 +456,7 @@ func (m *Manager) installDNS(lease *Lease) {
 		return
 	}
 	var buf strings.Builder
-	buf.WriteString("# Managed by bpfrx DHCP client — do not edit\n")
+	buf.WriteString("# Managed by xpf DHCP client — do not edit\n")
 	for _, dns := range lease.DNS {
 		fmt.Fprintf(&buf, "nameserver %s\n", dns)
 	}

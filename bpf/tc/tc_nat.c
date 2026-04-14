@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx TC egress NAT rewriting stage.
+ * xpf TC egress NAT rewriting stage.
  *
  * Applies NAT translations to egress packets using metadata
  * propagated by tc_conntrack. Uses the same shared rewrite helpers
  * as the XDP NAT stage.
  */
 
-#include "../headers/bpfrx_common.h"
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
-#include "../headers/bpfrx_nat.h"
-#include "../headers/bpfrx_trace.h"
+#include "../headers/xpf_common.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
+#include "../headers/xpf_nat.h"
+#include "../headers/xpf_trace.h"
 
 SEC("tc")
 int tc_nat_prog(struct __sk_buff *skb)

@@ -1,12 +1,12 @@
-# bpfrx
+# xpf
 
 eBPF zone-based firewall with native Junos configuration syntax.
 
-bpfrx is a high-performance stateful firewall built on Linux eBPF that replicates Juniper vSRX capabilities. It uses the familiar Junos hierarchical configuration syntax and provides a full interactive CLI with tab completion and `?` help.
+xpf is a high-performance stateful firewall built on Linux eBPF that replicates Juniper vSRX capabilities. It uses the familiar Junos hierarchical configuration syntax and provides a full interactive CLI with tab completion and `?` help.
 
 ## Dual Dataplane Architecture
 
-bpfrx provides two dataplane backends selectable via configuration. Both share the same Go control plane (config, HA, routing, CLI, APIs) — only the packet forwarding path differs.
+xpf provides two dataplane backends selectable via configuration. Both share the same Go control plane (config, HA, routing, CLI, APIs) — only the packet forwarding path differs.
 
 ### eBPF Dataplane (default)
 
@@ -45,7 +45,7 @@ NIC → XDP shim (live-session + new-flow redirect, kernel pass-through, explici
 system {
     dataplane-type userspace;
     dataplane {
-        binary /usr/local/sbin/bpfrx-userspace-dp;
+        binary /usr/local/sbin/xpf-userspace-dp;
         workers 6;
         ring-entries 8192;
     }
@@ -106,7 +106,7 @@ The userspace dataplane now covers most of the transit feature set in native Rus
 - **GRE tunnels**, XFRM interfaces, PBR (policy-based routing)
 - **VLANs**: 802.1Q tagging in BPF, trunk ports
 - **IPsec**: strongSwan config generation, IKE proposals, gateway compilation
-- **Full interface management**: bpfrxd owns ALL interfaces — renames via `.link` files, configures addresses/DHCP via `.network` files, brings down unconfigured interfaces
+- **Full interface management**: xpfd owns ALL interfaces — renames via `.link` files, configures addresses/DHCP via `.network` files, brings down unconfigured interfaces
 
 ### High Availability
 - **Chassis cluster** with ~60ms failover (30ms VRRP intervals)
@@ -147,7 +147,7 @@ The userspace dataplane now covers most of the transit feature set in native Rus
 
 ```bash
 make generate           # Generate Go bindings from BPF C (requires clang + bpf headers)
-make build              # Build bpfrxd daemon (embeds version from git)
+make build              # Build xpfd daemon (embeds version from git)
 make build-ctl          # Build remote CLI client
 make build-userspace-dp # Build Rust AF_XDP dataplane binary (requires cargo)
 make test               # Run 1020+ tests across 24 packages
@@ -155,7 +155,7 @@ make test               # Run 1020+ tests across 24 packages
 
 ## Configuration
 
-bpfrx uses Junos-style configuration syntax:
+xpf uses Junos-style configuration syntax:
 
 ```junos
 interfaces {
@@ -209,7 +209,7 @@ set security policies from-zone trust to-zone untrust policy allow-all then perm
 
 ## Management Interfaces
 
-- **Local CLI**: run `bpfrxd` in a TTY for interactive Junos-style shell
+- **Local CLI**: run `xpfd` in a TTY for interactive Junos-style shell
 - **Remote CLI**: `cli -addr <host>:50051` connects via gRPC
 - **gRPC API**: 48+ RPCs on port 50051 (config, sessions, stats, routes, IPsec, DHCP, cluster)
 - **REST API**: HTTP on port 8080 (health, Prometheus `/metrics`, config endpoints)
@@ -309,8 +309,8 @@ To deploy to a single node: `make cluster-deploy NODE=0` or `make cluster-deploy
 | `pkg/rpm/` | RPM probe manager |
 | `pkg/snmp/` | SNMP agent (system + ifTable MIB) |
 | `pkg/lldp/` | LLDP protocol |
-| `proto/bpfrx/v1/` | Protobuf service definition |
-| `cmd/bpfrxd/` | Daemon main binary |
+| `proto/xpf/v1/` | Protobuf service definition |
+| `cmd/xpfd/` | Daemon main binary |
 | `cmd/cli/` | Remote CLI client binary |
 | `userspace-xdp/` | XDP shim for AF_XDP packet steering (Rust/eBPF) |
 | `userspace-dp/` | Rust AF_XDP userspace dataplane binary |

@@ -1,6 +1,6 @@
 # XSK Zero-Copy Rebind Test
 
-Status: Inconclusive — cannot isolate from bpfrxd daemon.
+Status: Inconclusive — cannot isolate from xpfd daemon.
 
 ## What we proved so far:
 
@@ -12,10 +12,10 @@ Status: Inconclusive — cannot isolate from bpfrxd daemon.
 
 ## What's still needed:
 
-A standalone test with its own XDP program (not bpfrxd's XDP shim) to:
+A standalone test with its own XDP program (not xpfd's XDP shim) to:
 - Confirm xdpilone zero-copy works at all on this NIC
 - Confirm whether link DOWN/UP breaks the receive path
 - Compare xdpilone vs libbpf xsk_socket__create
 
-The current test binary coexists with bpfrxd but the daemon's status
+The current test binary coexists with xpfd but the daemon's status
 loop overwrites the xskmap and bindings entries, invalidating results.

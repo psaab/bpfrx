@@ -458,8 +458,8 @@ if (( DEPLOY == 1 )); then
 	BPFRX_CLUSTER_ENV="$ENV_FILE" "${PROJECT_ROOT}/test/incus/cluster-setup.sh" deploy all
 fi
 
-wait_for_vm_cli "$FW0" || die "fw0 bpfrxd did not become reachable in time"
-wait_for_vm_cli "$FW1" || die "fw1 bpfrxd did not become reachable in time"
+wait_for_vm_cli "$FW0" || die "fw0 xpfd did not become reachable in time"
+wait_for_vm_cli "$FW1" || die "fw1 xpfd did not become reachable in time"
 wait_for_cluster_primary() {
 	local rg="$1"
 	local tries=60

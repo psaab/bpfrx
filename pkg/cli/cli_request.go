@@ -10,9 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
-	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
-	"github.com/psaab/bpfrx/pkg/routing"
+	"github.com/psaab/xpf/pkg/cluster"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/routing"
 )
 
 func (c *CLI) handlePing(args []string) error {
@@ -873,7 +873,7 @@ func (c *CLI) handleRequestSystem(args []string) error {
 		}
 
 		// Remove active and candidate configs, rollback history
-		configDir := "/etc/bpfrx"
+		configDir := "/etc/xpf"
 		files, _ := os.ReadDir(configDir)
 		for _, f := range files {
 			if strings.HasSuffix(f.Name(), ".conf") || strings.HasPrefix(f.Name(), "rollback") {
@@ -882,18 +882,18 @@ func (c *CLI) handleRequestSystem(args []string) error {
 		}
 
 		// Remove BPF pins
-		os.RemoveAll("/sys/fs/bpf/bpfrx")
+		os.RemoveAll("/sys/fs/bpf/xpf")
 
 		// Remove managed networkd files
 		ndFiles, _ := os.ReadDir("/etc/systemd/network")
 		for _, f := range ndFiles {
-			if strings.HasPrefix(f.Name(), "10-bpfrx-") {
+			if strings.HasPrefix(f.Name(), "10-xpf-") {
 				os.Remove("/etc/systemd/network/" + f.Name())
 			}
 		}
 
 		// Remove FRR managed section
-		exec.Command("systemctl", "stop", "bpfrxd").Run()
+		exec.Command("systemctl", "stop", "xpfd").Run()
 
 		fmt.Println("System zeroized. Configuration erased.")
 		fmt.Println("Reboot to complete factory reset.")
@@ -943,7 +943,7 @@ func (c *CLI) handleRequestSystemSoftware(args []string) error {
 	fmt.Println("Node is now secondary for all redundancy groups.")
 	fmt.Println("Traffic has been drained to peer.")
 	fmt.Println("You may now replace the binary and restart the service:")
-	fmt.Println("  systemctl stop bpfrxd && <replace binary> && systemctl start bpfrxd")
+	fmt.Println("  systemctl stop xpfd && <replace binary> && systemctl start xpfd")
 	return nil
 }
 

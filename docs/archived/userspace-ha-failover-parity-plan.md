@@ -272,9 +272,9 @@ Current measured baselines on the HA perf branch:
 The next performance work should target the current hot symbols on the fabric
 path, especially:
 
-1. `bpfrx_userspace_dp::afxdp::poll_binding`
-2. `bpfrx_userspace_dp::afxdp::frame::enqueue_pending_forwards`
-3. `bpfrx_userspace_dp::afxdp::session_glue::resolve_flow_session_decision`
+1. `xpf_userspace_dp::afxdp::poll_binding`
+2. `xpf_userspace_dp::afxdp::frame::enqueue_pending_forwards`
+3. `xpf_userspace_dp::afxdp::session_glue::resolve_flow_session_decision`
 4. `memcpy_orig` on the copy-mode fabric path
 
 ### 2. Dedicated Failover Validation Needs Promotion To The Default HA Gate

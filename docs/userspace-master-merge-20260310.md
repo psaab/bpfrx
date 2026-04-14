@@ -44,8 +44,8 @@ Main changed areas:
   - `bpf/xdp/xdp_nat64.c`
   - `bpf/tc/tc_main.c`
   - `bpf/tc/tc_conntrack.c`
-  - `bpf/headers/bpfrx_common.h`
-  - `bpf/headers/bpfrx_helpers.h`
+  - `bpf/headers/xpf_common.h`
+  - `bpf/headers/xpf_helpers.h`
 
 - Compiler / loader / types:
   - `pkg/config/ast.go`

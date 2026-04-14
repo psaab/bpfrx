@@ -1,4 +1,4 @@
-# bpfrx - eBPF Firewall with Junos Configuration Syntax
+# xpf - eBPF Firewall with Junos Configuration Syntax
 
 ## Working Style
 - Think before acting. Read existing files before writing code.
@@ -18,7 +18,7 @@
     - **File(s)**: [Modified Files]
 - Log every `[Write|Edit]` action.
 - **Go**: Use `slog.Debug` for high-frequency/diagnostic messages (HA watchdog sync, per-session traces). Use `slog.Info` only for state transitions and one-time events. HA watchdog sync was flooding at 15 req/s with `slog.Info` — caused 35K+ log lines per session and drowned real diagnostics.
-- **Rust helper**: `eprintln!("bpfrx-ha: ...")` goes to journald via stderr. Use sparingly — remove debug eprints before committing. Keep per-worker `RefreshOwnerRGs`/`FlushFlowCaches` logs (they fire rarely, only on RG transitions).
+- **Rust helper**: `eprintln!("xpf-ha: ...")` goes to journald via stderr. Use sparingly — remove debug eprints before committing. Keep per-worker `RefreshOwnerRGs`/`FlushFlowCaches` logs (they fire rarely, only on RG transitions).
 - **Never** add `slog.Info` inside loops that run per-packet, per-session, or per-poll-tick. If you need per-tick logging, use `slog.Debug`.
 - **Control socket contention**: The userspace helper control socket is shared by status poll (1/s), HA sync, session installs, snapshot sync, and forwarding sync. High-frequency callers MUST be throttled. Adding a new control socket request at >1/s will starve session installs during bulk sync.
 
@@ -28,7 +28,7 @@ An eBPF-based firewall that clones Juniper vSRX capabilities using native Junos 
 ## Quick Start
 ```bash
 make generate        # Generate Go bindings from BPF C via bpf2go
-make build           # Build bpfrxd daemon
+make build           # Build xpfd daemon
 make build-ctl       # Build remote CLI client
 make test            # Run Go tests (640+ tests across 20 packages)
 ```
@@ -40,11 +40,11 @@ make test-vm         # Create Debian 13 VM with FRR, strongSwan
 make test-deploy     # Build -> push binary + config + unit -> systemctl enable --now
 make test-ssh        # Shell into VM
 make test-status     # Instance + service + network info
-make test-logs       # journalctl -u bpfrxd -n 50
-make test-journal    # journalctl -u bpfrxd -f (follow)
-make test-start      # systemctl start bpfrxd
-make test-stop       # systemctl stop bpfrxd
-make test-restart    # systemctl restart bpfrxd
+make test-logs       # journalctl -u xpfd -n 50
+make test-journal    # journalctl -u xpfd -f (follow)
+make test-start      # systemctl start xpfd
+make test-stop       # systemctl stop xpfd
+make test-restart    # systemctl restart xpfd
 make test-destroy    # Tear down VM
 ```
 
@@ -53,7 +53,7 @@ If `incus` commands fail with permission errors, use `sg incus-admin -c "make ..
 ## Cluster Test Environment (Two-VM HA)
 ```bash
 make cluster-init              # Create networks + profile for HA cluster
-make cluster-create            # Launch bpfrx-fw0, bpfrx-fw1, cluster-lan-host
+make cluster-create            # Launch xpf-fw0, xpf-fw1, cluster-lan-host
 make cluster-deploy            # Build + push to both VMs + restart
 make cluster-destroy           # Tear down cluster VMs
 make test-failover             # Reboot fw0 during iperf3 — verify TCP survives failover+failback
@@ -79,7 +79,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **NAT "meta as desired state"**: pipeline stages set meta fields, xdp_nat reconciles packet
 - **Three-phase config compilation**: Junos AST -> typed Go structs -> eBPF map entries
 - **FRR-managed routing**: all routes (static, DHCP, per-VRF) via managed section in `/etc/frr/frr.conf`
-- **Full interface management**: bpfrxd owns ALL interfaces on the firewall — renames them via `.link` files, configures addresses/DHCP via `.network` files, and brings down unconfigured interfaces
+- **Full interface management**: xpfd owns ALL interfaces on the firewall — renames them via `.link` files, configures addresses/DHCP via `.network` files, and brings down unconfigured interfaces
 
 ### APIs
 - **gRPC** on 127.0.0.1:50051 — 48+ RPCs (config, sessions, stats, routes, IPsec, DHCP, cluster)
@@ -115,8 +115,8 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 | `pkg/dhcpserver/` | Kea DHCP server management |
 | `pkg/eventengine/` | Event-driven automation engine |
 | `pkg/rpm/` | RPM probe manager |
-| `proto/bpfrx/v1/` | Protobuf service definition |
-| `cmd/bpfrxd/` | Daemon main binary |
+| `proto/xpf/v1/` | Protobuf service definition |
+| `cmd/xpfd/` | Daemon main binary |
 | `cmd/cli/` | Remote CLI client binary |
 | `dpdk_worker/` | DPDK C pipeline (single-pass packet processing, CGo bridge) |
 | `pkg/dataplane/dpdk/` | DPDK Go manager (CGo shared memory, FIB sync, port stats) |
@@ -154,11 +154,11 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - Use `unix.IoctlGetTermios(fd, TCGETS)` — **not** `os.ModeCharDevice` (`/dev/null` is a CharDevice)
 
 ### Interface Management (networkd)
-- **bpfrxd manages ALL interfaces** on the firewall — no external networkd configs needed
+- **xpfd manages ALL interfaces** on the firewall — no external networkd configs needed
 - Every interface must be defined in the firewall config and assigned to a security zone
 - Interfaces not in the config are brought down and marked `ActivationPolicy=always-down` in networkd
 - VRF devices and tunnel interfaces created by the daemon are excluded from unmanaged detection
-- **`.link` files**: written per-interface, prefix `10-bpfrx-`, rename kernel names (enp7s0→ge-0-0-0)
+- **`.link` files**: written per-interface, prefix `10-xpf-`, rename kernel names (enp7s0→ge-0-0-0)
   - Startup naming: `enumerateAndRenameInterfaces()` in `pkg/daemon/linksetup.go` runs at daemon start, assigns vSRX names (fxp0, em0, ge-{FPC}-0-{PORT})
   - Non-RETH interfaces: match by `MACAddress=` (MAC is stable)
   - RETH member interfaces: match by `OriginalName=` (PCI kernel name) — MAC alternates between physical (boot) and virtual (daemon), so `MACAddress=` is unreliable
@@ -174,7 +174,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **iavf (VF driver) has NO native XDP support** — only generic/SKB mode works, which creates a full `sk_buff` per packet (~16% CPU overhead from `memcpy_orig` + `memset_orig`). Performance drops from 25+ Gbps to ~6.8 Gbps
 - **i40e/ice (PF driver) has native XDP** — driver-mode XDP processes packets before SKB allocation, much faster
 - **`bpf_redirect_map` requires `ndo_xdp_xmit` on target** — you cannot redirect from a native XDP program to an interface that lacks native XDP support. If the target doesn't implement `ndo_xdp_xmit`, the redirect silently fails. This means mixing native+generic interfaces in a redirect set does not work
-- **bpfrx workaround: `redirect_capable` map** — per-interface flag checked in `xdp_forward.c`. Interfaces without native XDP get `XDP_PASS` (kernel forwarding path) instead of `bpf_redirect_map`. This lets native interfaces redirect between each other while non-native interfaces fall back to kernel forwarding
+- **xpf workaround: `redirect_capable` map** — per-interface flag checked in `xdp_forward.c`. Interfaces without native XDP get `XDP_PASS` (kernel forwarding path) instead of `bpf_redirect_map`. This lets native interfaces redirect between each other while non-native interfaces fall back to kernel forwarding
 - **XDP on PF does NOT see VF traffic** — SR-IOV hardware switching delivers VF packets directly to VFs, bypassing the PF's XDP program entirely. You cannot use PF XDP to firewall VF traffic. Each VF would need its own XDP program (but iavf doesn't support native XDP, so that's generic-only)
 - **Current test env uses PF passthrough (i40e)** — the entire PF (`enp10s0f0np0`) is passed through to the VM via VFIO, not a VF. This gives native XDP on the WAN interface. All interfaces (virtio + i40e PF) run native XDP
 - **Why not VF passthrough** — VFs use the iavf driver which forces generic mode. Even with the `redirect_capable` workaround, the WAN interface itself runs in generic XDP which is slower for ingress processing. PF passthrough avoids this entirely
@@ -214,11 +214,11 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 
 ## Network Topology (Test VM)
 
-All interfaces are managed by bpfrxd — renamed via `.link` files, configured via `.network` files.
+All interfaces are managed by xpfd — renamed via `.link` files, configured via `.network` files.
 Startup naming by `enumerateAndRenameInterfaces()` assigns vSRX names based on PCI bus order.
 
 ```
-Standalone VM (bpfrx-fw) — no /etc/bpfrx/node-id, no em0:
+Standalone VM (xpf-fw) — no /etc/xpf/node-id, no em0:
   Virtio (PCI bus 05-08):
     enp5s0  → fxp0       DHCP          — mgmt zone (SSH + ping)
     enp6s0  → ge-0-0-0   10.0.1.10     — trust zone
@@ -229,7 +229,7 @@ Standalone VM (bpfrx-fw) — no /etc/bpfrx/node-id, no em0:
     enp101s0f1np1 → ge-0-0-4               — loss zone
 
 Test containers:
-  trust-host    10.0.1.102  (2001:559:8585:bf01::102)  — bpfrx-trust bridge
-  untrust-host  10.0.2.102  (2001:559:8585:bf02::102)  — bpfrx-untrust bridge
-  dmz-host      10.0.30.101 (2001:559:8585:bf03::101)  — bpfrx-dmz bridge
+  trust-host    10.0.1.102  (2001:559:8585:bf01::102)  — xpf-trust bridge
+  untrust-host  10.0.2.102  (2001:559:8585:bf02::102)  — xpf-untrust bridge
+  dmz-host      10.0.30.101 (2001:559:8585:bf03::101)  — xpf-dmz bridge
 ```

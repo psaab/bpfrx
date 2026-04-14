@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/dataplane"
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
-	"github.com/psaab/bpfrx/pkg/vrrp"
+	"github.com/psaab/xpf/pkg/dataplane"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/vrrp"
 )
 
 func (s *Server) GetNATSource(_ context.Context, _ *pb.GetNATSourceRequest) (*pb.GetNATSourceResponse, error) {

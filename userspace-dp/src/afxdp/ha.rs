@@ -31,7 +31,7 @@ impl super::Coordinator {
             let curr_active = state.get(&rg_id).map(|r| r.active);
             if prev_active != curr_active {
                 eprintln!(
-                    "bpfrx-ha: RG{} state changed: {:?} -> {:?} (demoted={:?} activated={:?})",
+                    "xpf-ha: RG{} state changed: {:?} -> {:?} (demoted={:?} activated={:?})",
                     rg_id, prev_active, curr_active, demoted_rgs, activated_rgs
                 );
             }
@@ -71,7 +71,7 @@ impl super::Coordinator {
         }
         if !activated_rgs.is_empty() {
             eprintln!(
-                "bpfrx-ha: RG activation detected: {:?}, workers={}, shared_sessions={}",
+                "xpf-ha: RG activation detected: {:?}, workers={}, shared_sessions={}",
                 activated_rgs,
                 self.workers.len(),
                 self.shared_sessions.lock().map(|s| s.len()).unwrap_or(0),
@@ -104,7 +104,7 @@ impl super::Coordinator {
                 Ok(pending) => pending,
                 Err(poisoned) => {
                     eprintln!(
-                        "bpfrx-ha: worker command queue lock poisoned while refreshing activated RGs {:?}; recovering inner queue",
+                        "xpf-ha: worker command queue lock poisoned while refreshing activated RGs {:?}; recovering inner queue",
                         activated_rgs
                     );
                     poisoned.into_inner()
@@ -143,7 +143,7 @@ impl super::Coordinator {
             );
             if republished > 0 {
                 eprintln!(
-                    "bpfrx-ha: republished {} USERSPACE_SESSIONS entries for activated RGs {:?}",
+                    "xpf-ha: republished {} USERSPACE_SESSIONS entries for activated RGs {:?}",
                     republished, activated_rgs
                 );
             }
@@ -435,7 +435,7 @@ impl super::Coordinator {
             handle.push_delta_lossless(delta, zone_name_to_id)?;
         }
         eprintln!(
-            "bpfrx-ha: exported {} sessions to event stream for bulk sync",
+            "xpf-ha: exported {} sessions to event stream for bulk sync",
             count
         );
         Ok(count)

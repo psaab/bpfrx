@@ -15,11 +15,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
-	"github.com/psaab/bpfrx/pkg/config"
-	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
-	"github.com/psaab/bpfrx/pkg/monitoriface"
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/monitoriface"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -269,7 +269,7 @@ func (s *Server) MonitorInterface(req *pb.MonitorInterfaceRequest, stream grpc.S
 
 	hostname, _ := os.Hostname()
 	if hostname == "" {
-		hostname = "bpfrx"
+		hostname = "xpf"
 	}
 
 	// resolveToKernel converts a config-level interface name to its kernel name.
@@ -553,7 +553,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 	case "zeroize":
 		slog.Warn("system zeroize requested via gRPC")
 		// Remove configs
-		configDir := "/etc/bpfrx"
+		configDir := "/etc/xpf"
 		files, _ := os.ReadDir(configDir)
 		for _, f := range files {
 			if strings.HasSuffix(f.Name(), ".conf") || strings.HasPrefix(f.Name(), "rollback") {
@@ -561,11 +561,11 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 			}
 		}
 		// Remove BPF pins
-		os.RemoveAll("/sys/fs/bpf/bpfrx")
+		os.RemoveAll("/sys/fs/bpf/xpf")
 		// Remove managed networkd files
 		ndFiles, _ := os.ReadDir("/etc/systemd/network")
 		for _, f := range ndFiles {
-			if strings.HasPrefix(f.Name(), "10-bpfrx-") {
+			if strings.HasPrefix(f.Name(), "10-xpf-") {
 				os.Remove("/etc/systemd/network/" + f.Name())
 			}
 		}
@@ -690,7 +690,7 @@ func (s *Server) SystemAction(ctx context.Context, req *pb.SystemActionRequest) 
 			Message: "Node is now secondary for all redundancy groups.\n" +
 				"Traffic has been drained to peer.\n" +
 				"You may now replace the binary and restart the service:\n" +
-				"  systemctl stop bpfrxd && <replace binary> && systemctl start bpfrxd",
+				"  systemctl stop xpfd && <replace binary> && systemctl start xpfd",
 		}, nil
 
 	default:

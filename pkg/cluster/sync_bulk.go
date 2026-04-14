@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // BulkSync sends all locally-owned forward sessions to the peer.

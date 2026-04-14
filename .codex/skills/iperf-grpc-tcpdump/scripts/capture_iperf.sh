@@ -17,8 +17,8 @@ Options:
                             gRPC capture endpoint. Default: 172.16.80.200:50051
   --capture-interface IFACE Server-side capture interface. Default: eth0
   --client INSTANCE         Client instance. Default: cluster-userspace-host
-  --fw0 INSTANCE            Firewall node0 instance. Default: bpfrx-userspace-fw0
-  --fw1 INSTANCE            Firewall node1 instance. Default: bpfrx-userspace-fw1
+  --fw0 INSTANCE            Firewall node0 instance. Default: xpf-userspace-fw0
+  --fw1 INSTANCE            Firewall node1 instance. Default: xpf-userspace-fw1
   --project NAME            Incus project/prefix. Default: loss
   --help                    Show this help.
 EOF
@@ -104,8 +104,8 @@ ARTIFACT_DIR=""
 CAPTURE_SERVER="172.16.80.200:50051"
 CAPTURE_INTERFACE="eth0"
 CLIENT_VM="cluster-userspace-host"
-FW0_VM="bpfrx-userspace-fw0"
-FW1_VM="bpfrx-userspace-fw1"
+FW0_VM="xpf-userspace-fw0"
+FW1_VM="xpf-userspace-fw1"
 PROJECT="loss"
 
 while [[ $# -gt 0 ]]; do

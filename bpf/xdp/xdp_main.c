@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx XDP main entry point.
+ * xpf XDP main entry point.
  *
  * If cpumap is enabled, distributes IP packets across CPUs via
  * BPF_MAP_TYPE_CPUMAP using a 4-tuple hash.  Non-IP traffic and
@@ -10,11 +10,11 @@
  * parse-and-pipeline path on the target CPU.
  */
 
-#include "../headers/bpfrx_common.h"
+#include "../headers/xpf_common.h"
 #define BPFRX_NAT_POOLS
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
-#include "../headers/bpfrx_trace.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
+#include "../headers/xpf_trace.h"
 
 /*
  * Lightweight 4-tuple hash for CPU selection.

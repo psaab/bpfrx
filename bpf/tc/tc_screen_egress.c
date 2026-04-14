@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx TC egress screen/IDS stage.
+ * xpf TC egress screen/IDS stage.
  *
  * Mirrors xdp_screen.c but for the TC egress pipeline. Looks up the
  * egress zone's screen profile and applies stateless anomaly checks
@@ -9,9 +9,9 @@
  * emits ring buffer event.
  */
 
-#include "../headers/bpfrx_common.h"
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
+#include "../headers/xpf_common.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
 
 /*
  * Drop a packet due to a screen check (TC variant).

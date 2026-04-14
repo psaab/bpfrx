@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx TC egress connection tracking stage.
+ * xpf TC egress connection tracking stage.
  *
  * Looks up existing sessions (v4 and v6), updates last_seen timestamp
  * and counters for egress packets, propagates NAT metadata from the
  * session, and routes to TC NAT or TC forward accordingly.
  */
 
-#include "../headers/bpfrx_common.h"
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
-#include "../headers/bpfrx_conntrack.h"
-#include "../headers/bpfrx_trace.h"
+#include "../headers/xpf_common.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
+#include "../headers/xpf_conntrack.h"
+#include "../headers/xpf_trace.h"
 
 /*
  * Handle a conntrack hit for an IPv4 session on TC egress.

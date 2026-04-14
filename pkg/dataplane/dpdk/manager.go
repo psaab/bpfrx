@@ -2,7 +2,7 @@ package dpdk
 
 import (
 	"github.com/cilium/ebpf"
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // Compile-time assertion.

@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
-	"github.com/psaab/bpfrx/pkg/appid"
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/networkd"
+	"github.com/psaab/xpf/pkg/appid"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/networkd"
 	"github.com/vishvananda/netlink"
 )
 
@@ -3429,7 +3429,7 @@ func findInterfaceByMAC(mac net.HardwareAddr) *net.Interface {
 // .link file for the given interface. Preserves previously-written kernel
 // names across DHCP recompiles.
 func readOriginalNameFromLink(ifName string) string {
-	path := fmt.Sprintf("/etc/systemd/network/10-bpfrx-%s.link", ifName)
+	path := fmt.Sprintf("/etc/systemd/network/10-xpf-%s.link", ifName)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""

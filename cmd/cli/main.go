@@ -1,6 +1,6 @@
-// cli is the remote CLI client for bpfrxd.
+// cli is the remote CLI client for xpfd.
 //
-// It connects to the bpfrxd gRPC API and provides the same Junos-style
+// It connects to the xpfd gRPC API and provides the same Junos-style
 // interactive CLI as the embedded console.
 package main
 
@@ -18,14 +18,14 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
-	"github.com/psaab/bpfrx/pkg/cmdtree"
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
+	"github.com/psaab/xpf/pkg/cmdtree"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 func main() {
-	addr := flag.String("addr", "127.0.0.1:50051", "bpfrxd gRPC address")
+	addr := flag.String("addr", "127.0.0.1:50051", "xpfd gRPC address")
 	cmdFlag := flag.String("c", "", "run a single command non-interactively and exit")
 	flag.Parse()
 
@@ -42,13 +42,13 @@ func main() {
 	resp, err := client.GetStatus(ctx, &pb.GetStatusRequest{})
 	cancel()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "cli: cannot reach bpfrxd at %s: %v\n", *addr, err)
+		fmt.Fprintf(os.Stderr, "cli: cannot reach xpfd at %s: %v\n", *addr, err)
 		os.Exit(1)
 	}
 
 	hostname, _ := os.Hostname()
 	if hostname == "" {
-		hostname = "bpfrx"
+		hostname = "xpf"
 	}
 	username := os.Getenv("USER")
 	if username == "" {
@@ -78,7 +78,7 @@ func main() {
 	rc := &remoteCompleter{ctl: c}
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          c.operationalPrompt(),
-		HistoryFile:     filepath.Join(os.Getenv("HOME"), ".bpfrx_cli_history"),
+		HistoryFile:     filepath.Join(os.Getenv("HOME"), ".xpf_cli_history"),
 		HistoryLimit:    10000,
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
@@ -131,7 +131,7 @@ func main() {
 	defer rl.Close()
 	c.rl = rl
 
-	fmt.Printf("cli — connected to bpfrxd (uptime: %s)\n", resp.Uptime)
+	fmt.Printf("cli — connected to xpfd (uptime: %s)\n", resp.Uptime)
 	fmt.Println("Type '?' for help")
 	fmt.Println()
 

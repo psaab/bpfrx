@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 const (
@@ -249,7 +249,7 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	}
 
 	var b strings.Builder
-	b.WriteString("! bpfrx managed config - do not edit\n")
+	b.WriteString("! xpf managed config - do not edit\n")
 	b.WriteString("!\n")
 
 	// Global static routes
@@ -547,7 +547,7 @@ func (m *Manager) generateStaticRoute(sr *config.StaticRoute, vrfName string, re
 	return b.String()
 }
 
-// Clear removes the bpfrx managed section from frr.conf and reloads FRR.
+// Clear removes the xpf managed section from frr.conf and reloads FRR.
 func (m *Manager) Clear() error {
 	if err := m.writeManagedSection(""); err != nil {
 		return err
@@ -556,7 +556,7 @@ func (m *Manager) Clear() error {
 	return nil
 }
 
-// writeManagedSection replaces the bpfrx-managed section in frr.conf.
+// writeManagedSection replaces the xpf-managed section in frr.conf.
 // If section is empty, the managed block is removed entirely.
 func (m *Manager) writeManagedSection(section string) error {
 	existing, err := os.ReadFile(m.frrConf)
@@ -652,7 +652,7 @@ type bfdProfile struct {
 	multiplier int
 }
 
-// bfdProfileName returns a deterministic profile name like "bpfrx-300-3".
+// bfdProfileName returns a deterministic profile name like "xpf-300-3".
 func bfdProfileName(interval, multiplier int) string {
 	if interval == 0 {
 		interval = 300
@@ -660,7 +660,7 @@ func bfdProfileName(interval, multiplier int) string {
 	if multiplier == 0 {
 		multiplier = 3
 	}
-	return fmt.Sprintf("bpfrx-%d-%d", interval, multiplier)
+	return fmt.Sprintf("xpf-%d-%d", interval, multiplier)
 }
 
 func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPFv3Config, bgp *config.BGPConfig, rip *config.RIPConfig, isis *config.ISISConfig, vrfName string, ecmpMaxPaths int, policyOptions *config.PolicyOptionsConfig) string {
@@ -929,7 +929,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 	}
 
 	if isis != nil {
-		fmt.Fprintf(&b, "router isis bpfrx%s\n", vrfSuffix)
+		fmt.Fprintf(&b, "router isis xpf%s\n", vrfSuffix)
 		if isis.NET != "" {
 			fmt.Fprintf(&b, " net %s\n", isis.NET)
 		}
@@ -966,7 +966,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		b.WriteString("exit\n!\n")
 		for _, iface := range isis.Interfaces {
 			fmt.Fprintf(&b, "interface %s\n", iface.Name)
-			fmt.Fprintf(&b, " ip router isis bpfrx\n")
+			fmt.Fprintf(&b, " ip router isis xpf\n")
 			if iface.Passive {
 				b.WriteString(" isis passive\n")
 			}

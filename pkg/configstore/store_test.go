@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // newTestStore creates a Store backed by a temp file for testing.

@@ -346,9 +346,9 @@ if [[ $DEPLOY -eq 1 ]]; then
 	BPFRX_CLUSTER_ENV="$ENV_FILE" "${PROJECT_ROOT}/test/incus/cluster-setup.sh" deploy all
 fi
 
-info "waiting for bpfrxd gRPC/CLI readiness"
-wait_for_vm_cli "$FW0" || die "fw0 bpfrxd did not become reachable in time"
-wait_for_vm_cli "$FW1" || die "fw1 bpfrxd did not become reachable in time"
+info "waiting for xpfd gRPC/CLI readiness"
+wait_for_vm_cli "$FW0" || die "fw0 xpfd did not become reachable in time"
+wait_for_vm_cli "$FW1" || die "fw1 xpfd did not become reachable in time"
 
 info "detecting userspace runtime mode"
 MODE="$(runtime_mode)" || die "userspace runtime mode did not settle in time"

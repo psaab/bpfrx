@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
 func (c *ctl) handleRequest(args []string) error {

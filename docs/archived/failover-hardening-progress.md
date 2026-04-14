@@ -269,7 +269,7 @@ What happened:
 
 - the CLI failover did not complete
 - `failover.out` reported:
-  - `pre-failover prepare for redundancy group 1: read unix @->/run/bpfrx/userspace-dp.sock: i/o timeout`
+  - `pre-failover prepare for redundancy group 1: read unix @->/run/xpf/userspace-dp.sock: i/o timeout`
 - cluster ownership never moved:
   - `node0` stayed `RG1 primary`
   - `node1` stayed `RG1 secondary`

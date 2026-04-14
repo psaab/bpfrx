@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/logging"
+	"github.com/psaab/xpf/pkg/logging"
 )
 
 // setSSEHeaders configures the response for Server-Sent Events streaming.

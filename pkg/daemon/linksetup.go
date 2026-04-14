@@ -1,4 +1,4 @@
-// Package daemon implements the bpfrx daemon lifecycle.
+// Package daemon implements the xpf daemon lifecycle.
 package daemon
 
 import (
@@ -15,7 +15,7 @@ import (
 
 const (
 	linkDir    = "/etc/systemd/network"
-	linkPrefix = "10-bpfrx-"
+	linkPrefix = "10-xpf-"
 )
 
 // pciNIC holds enumeration data for one physical NIC.
@@ -226,7 +226,7 @@ func containsLine(text, s string) bool {
 // Returns true if the file was created or changed.
 func writeLinkFile(target, originalName string) bool {
 	path := filepath.Join(linkDir, linkPrefix+target+".link")
-	content := fmt.Sprintf(`# Managed by bpfrxd — do not edit
+	content := fmt.Sprintf(`# Managed by xpfd — do not edit
 [Match]
 OriginalName=%s
 
@@ -257,7 +257,7 @@ func writeBootstrapFxp0Network() bool {
 		return false // already exists
 	}
 
-	content := `# Managed by bpfrxd — bootstrap DHCP for provisioning
+	content := `# Managed by xpfd — bootstrap DHCP for provisioning
 [Match]
 Name=fxp0
 

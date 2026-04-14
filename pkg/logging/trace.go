@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // TraceWriter writes matching flow events to a trace file with rotation.

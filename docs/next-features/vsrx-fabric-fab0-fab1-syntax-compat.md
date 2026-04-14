@@ -7,7 +7,7 @@
 - `interfaces fab0 { fabric-options { member-interfaces { ge-0/0/7; } } }`
 - `interfaces fab1 { fabric-options { member-interfaces { ge-7/0/7; } } }`
 
-The current bpfrx HA architecture is still single-fabric in core transport/data-plane wiring, so syntax compatibility is partial.
+The current xpf HA architecture is still single-fabric in core transport/data-plane wiring, so syntax compatibility is partial.
 
 ## Current Gaps (Code-Level)
 
@@ -22,7 +22,7 @@ The current bpfrx HA architecture is still single-fabric in core transport/data-
   - `pkg/cluster/cluster.go` `InterfacesInput` has `FabricInterface string`.
   - `pkg/cli/cli.go` and `pkg/grpcapi/server.go` populate a single fabric field.
 - eBPF fabric forwarding state is single-entry:
-  - `bpf/headers/bpfrx_maps.h` `fabric_fwd` map has `max_entries = 1`.
+  - `bpf/headers/xpf_maps.h` `fabric_fwd` map has `max_entries = 1`.
 - DPDK parity is single-fabric:
   - `dpdk_worker/shared_mem.h` has one `fabric_port_id`.
   - `pkg/dataplane/dpdk/dpdk_cgo.go` updates a single `fabric_port_id`.

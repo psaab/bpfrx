@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/configstore"
-	"github.com/psaab/bpfrx/pkg/rpm"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
+	"github.com/psaab/xpf/pkg/rpm"
 )
 
 // ApplyFn is called after a successful commit to apply the new configuration.

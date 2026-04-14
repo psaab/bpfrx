@@ -1,4 +1,4 @@
-// Package daemon implements the bpfrx daemon lifecycle.
+// Package daemon implements the xpf daemon lifecycle.
 package daemon
 
 import (
@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // applyLo0Filter applies loopback filter rules for host-bound traffic.
@@ -20,12 +20,12 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) {
 	filterV6 := cfg.System.Lo0FilterInputV6
 	if filterV4 == "" && filterV6 == "" {
 		// No lo0 filter configured — clean up any stale nftables rules
-		_ = exec.Command("nft", "delete", "table", "inet", "bpfrx_lo0").Run()
+		_ = exec.Command("nft", "delete", "table", "inet", "xpf_lo0").Run()
 		return
 	}
 
 	var rules []string
-	rules = append(rules, "table inet bpfrx_lo0 {")
+	rules = append(rules, "table inet xpf_lo0 {")
 	rules = append(rules, "  chain input {")
 	rules = append(rules, "    type filter hook input priority 0; policy accept;")
 
@@ -57,7 +57,7 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
-	cmd.Stdin = strings.NewReader("flush ruleset inet bpfrx_lo0\n" + nftConf)
+	cmd.Stdin = strings.NewReader("flush ruleset inet xpf_lo0\n" + nftConf)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		slog.Warn("failed to apply lo0 filter", "err", err, "output", string(out))
 	} else {

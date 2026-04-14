@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
 func (s *Server) GetDHCPLeases(_ context.Context, _ *pb.GetDHCPLeasesRequest) (*pb.GetDHCPLeasesResponse, error) {

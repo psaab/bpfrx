@@ -2642,7 +2642,7 @@ func TestDPDKConfig(t *testing.T) {
 }
 
 func TestUserspaceDataplaneConfig(t *testing.T) {
-	lines := []string{"set system dataplane-type userspace", "set system dataplane binary /usr/local/bin/bpfrx-userspace-dp", "set system dataplane control-socket /run/bpfrx/userspace-dp.sock", "set system dataplane state-file /run/bpfrx/userspace-dp.json", "set system dataplane workers 4", "set system dataplane ring-entries 2048"}
+	lines := []string{"set system dataplane-type userspace", "set system dataplane binary /usr/local/bin/xpf-userspace-dp", "set system dataplane control-socket /run/xpf/userspace-dp.sock", "set system dataplane state-file /run/xpf/userspace-dp.json", "set system dataplane workers 4", "set system dataplane ring-entries 2048"}
 	tree := &ConfigTree{}
 	for _, line := range lines {
 		path, err := ParseSetCommand(line)
@@ -2664,13 +2664,13 @@ func TestUserspaceDataplaneConfig(t *testing.T) {
 	if dp == nil {
 		t.Fatal("UserspaceDataplane is nil")
 	}
-	if dp.Binary != "/usr/local/bin/bpfrx-userspace-dp" {
+	if dp.Binary != "/usr/local/bin/xpf-userspace-dp" {
 		t.Errorf("Binary = %q", dp.Binary)
 	}
-	if dp.ControlSocket != "/run/bpfrx/userspace-dp.sock" {
+	if dp.ControlSocket != "/run/xpf/userspace-dp.sock" {
 		t.Errorf("ControlSocket = %q", dp.ControlSocket)
 	}
-	if dp.StateFile != "/run/bpfrx/userspace-dp.json" {
+	if dp.StateFile != "/run/xpf/userspace-dp.json" {
 		t.Errorf("StateFile = %q", dp.StateFile)
 	}
 	if dp.Workers != 4 {

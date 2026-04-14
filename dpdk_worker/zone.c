@@ -50,7 +50,7 @@ zone_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 	 * a BPF peer.  The OUTBOUND side (actually redirecting packets
 	 * to the fabric peer, i.e. the DPDK equivalent of BPF's
 	 * try_fabric_redirect() and try_fabric_redirect_with_zone()
-	 * in bpfrx_helpers.h) is NOT implemented.  A DPDK-mode node
+	 * in xpf_helpers.h) is NOT implemented.  A DPDK-mode node
 	 * cannot initiate cross-chassis fabric redirects.
 	 *
 	 * Only accept zone-encoded MACs from the fabric interface to

@@ -112,8 +112,8 @@ runs and captures helper deltas so you can distinguish:
 
 ```bash
 # During iperf3 run, inspect helper counters via:
-incus exec loss:bpfrx-userspace-fw0 -- cli -c "show chassis cluster data-plane statistics"
-incus exec loss:bpfrx-userspace-fw1 -- cli -c "show chassis cluster data-plane statistics"
+incus exec loss:xpf-userspace-fw0 -- cli -c "show chassis cluster data-plane statistics"
+incus exec loss:xpf-userspace-fw1 -- cli -c "show chassis cluster data-plane statistics"
 ```
 
 For warm sustained TCP, flow-cache hits should dominate once the sessions are
@@ -183,7 +183,7 @@ Example workflow:
 
 ```bash
 # Make node0 own RG1 so node1 becomes the stale owner for LAN ingress.
-incus exec loss:bpfrx-userspace-fw1 -- \
+incus exec loss:xpf-userspace-fw1 -- \
   bash -lc 'cli -c "request chassis cluster failover redundancy-group 1 node 0"'
 
 # Warm the target, then measure from cluster-userspace-host.
@@ -194,9 +194,9 @@ incus exec loss:cluster-userspace-host -- \
 At the same time, inspect the standby old owner:
 
 ```bash
-incus exec loss:bpfrx-userspace-fw1 -- \
+incus exec loss:xpf-userspace-fw1 -- \
   bash -lc 'timeout 5 cli -c "monitor interface ge-7-0-0"'
-incus exec loss:bpfrx-userspace-fw1 -- \
+incus exec loss:xpf-userspace-fw1 -- \
   bash -lc 'timeout 5 cli -c "monitor interface ge-7-0-2"'
 ```
 

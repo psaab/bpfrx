@@ -64,8 +64,12 @@ pub(crate) struct InterfaceSnapshot {
     pub filter_input_v4: String,
     #[serde(rename = "filter_input_v6", default)]
     pub filter_input_v6: String,
-    #[serde(rename = "cos_shaping_rate_bps", default)]
-    pub cos_shaping_rate_bps: u64,
+    #[serde(
+        rename = "cos_shaping_rate_bytes_per_sec",
+        alias = "cos_shaping_rate_bps",
+        default
+    )]
+    pub cos_shaping_rate_bytes_per_sec: u64,
     #[serde(rename = "cos_shaping_burst_bytes", default)]
     pub cos_shaping_burst_bytes: u64,
     #[serde(rename = "cos_scheduler_map", default)]

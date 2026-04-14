@@ -14,7 +14,7 @@ const (
 	// HeartbeatPort is the UDP port used for cluster heartbeat.
 	HeartbeatPort = 4784
 
-	// heartbeatMagic identifies bpfrx cluster heartbeat packets.
+	// heartbeatMagic identifies xpf cluster heartbeat packets.
 	heartbeatMagic = "BPFX"
 
 	// heartbeatVersion is the current protocol version.

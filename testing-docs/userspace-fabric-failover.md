@@ -507,13 +507,13 @@ workflow before assuming redirect is broken:
 
 ```bash
 # 1. Force RG1 to node0 so node1 becomes the stale owner for LAN ingress.
-incus exec loss:bpfrx-userspace-fw1 -- \
+incus exec loss:xpf-userspace-fw1 -- \
   bash -lc 'cli -c "request chassis cluster failover redundancy-group 1 node 0"'
 
 # 2. Watch both the standby WAN and the standby fabric parent.
-incus exec loss:bpfrx-userspace-fw1 -- \
+incus exec loss:xpf-userspace-fw1 -- \
   bash -lc 'timeout 5 cli -c "monitor interface ge-7-0-2"'
-incus exec loss:bpfrx-userspace-fw1 -- \
+incus exec loss:xpf-userspace-fw1 -- \
   bash -lc 'timeout 5 cli -c "monitor interface ge-7-0-0"'
 
 # 3. Drive traffic from the LAN host.

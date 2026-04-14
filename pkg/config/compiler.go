@@ -570,6 +570,16 @@ func ValidateConfig(cfg *Config) []string {
 	}
 
 	if cos := cfg.ClassOfService; cos != nil {
+		for _, class := range cos.ForwardingClasses {
+			if class == nil {
+				continue
+			}
+			if class.Queue < 0 || class.Queue > 255 {
+				warnings = append(warnings, fmt.Sprintf(
+					"class-of-service forwarding-class %q uses out-of-range queue %d (expected 0..255)",
+					class.Name, class.Queue))
+			}
+		}
 		for _, schedMap := range cos.SchedulerMaps {
 			if schedMap == nil {
 				continue

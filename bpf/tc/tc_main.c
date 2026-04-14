@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx TC egress main entry point.
+ * xpf TC egress main entry point.
  *
  * Parses Ethernet/IPv4/IPv6/L4 headers, populates per-CPU packet metadata,
  * classifies the egress zone, and tail-calls to the TC screen stage.
  */
 
-#include "../headers/bpfrx_common.h"
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
-#include "../headers/bpfrx_trace.h"
+#include "../headers/xpf_common.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
+#include "../headers/xpf_trace.h"
 
 SEC("tc")
 int tc_main_prog(struct __sk_buff *skb)

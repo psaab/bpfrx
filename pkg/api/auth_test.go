@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/configstore"
+	"github.com/psaab/xpf/pkg/configstore"
 )
 
 func basicAuth(user, pass string) string {

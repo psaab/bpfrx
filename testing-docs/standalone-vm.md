@@ -100,12 +100,12 @@ echo "show security screen" | cli
 
 ```bash
 # Verify routes in kernel
-incus exec bpfrx-fw -- ip route show
-incus exec bpfrx-fw -- ip -6 route show
+incus exec xpf-fw -- ip route show
+incus exec xpf-fw -- ip -6 route show
 
 # Verify FRR status
-incus exec bpfrx-fw -- vtysh -c "show ip route"
-incus exec bpfrx-fw -- vtysh -c "show bgp summary"
+incus exec xpf-fw -- vtysh -c "show ip route"
+incus exec xpf-fw -- vtysh -c "show bgp summary"
 ```
 
 ## Test 8: VLAN Tagging

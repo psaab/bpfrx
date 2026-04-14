@@ -18,11 +18,11 @@ VM:   Debian 13, kernel 6.18.9 (from unstable repo)
                           |
               +-----------+-----------+------ ...
               |           |           |
-         incusbr0    bpfrx-trust  bpfrx-untrust  bpfrx-dmz
+         incusbr0    xpf-trust  xpf-untrust  xpf-dmz
          10.0.100.1  10.0.1.1     10.0.2.1       10.0.30.1
               |           |           |              |
         +-----+-----+----+-----------+--------------+-----------+
-        |  bpfrx-fw VM                                          |
+        |  xpf-fw VM                                          |
         |  enp5s0 → fxp0    (mgmt)     DHCP    — incusbr0      |
         |  enp6s0 → em0     (unused in standalone)              |
         |  enp7s0 → ge-0-0-0 (trust)   10.0.1.10  — trust zone |
@@ -44,7 +44,7 @@ VM:   Debian 13, kernel 6.18.9 (from unstable repo)
 | enp10s0f0np0 | ge-0-0-3 | i40e (PF) | native | wan | VLAN 50, 172.16.50.5 + IPv6 |
 | enp101s0f1np1 | ge-0-0-4 | i40e (PF) | native | loss | PCI passthrough |
 
-All interfaces renamed at boot by `bpfrx-link-setup.service` (PCI bus order → vSRX names), configured via `.network` files by bpfrxd.
+All interfaces renamed at boot by `xpf-link-setup.service` (PCI bus order → vSRX names), configured via `.network` files by xpfd.
 
 ### WAN Interface (PF Passthrough)
 - Intel X710 PF (enp10s0f0np0 on host) passed through via PCI/VFIO
@@ -88,13 +88,13 @@ If `incus` commands fail: `sg incus-admin -c "make test-deploy"`
 ### Remote CLI Access
 ```bash
 # Interactive
-incus exec bpfrx-fw -- cli
+incus exec xpf-fw -- cli
 
 # Non-interactive (pipe commands)
-printf 'show security flow session\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show security flow session\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 
 # Via sg if needed
-printf 'show ...\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw -- cli' 2>/dev/null
+printf 'show ...\nexit\n' | sg incus-admin -c 'incus exec xpf-fw -- cli' 2>/dev/null
 ```
 
 ---
@@ -138,10 +138,10 @@ iperf3 -c 10.0.30.100 -P 4 -R -t 30
 **How to profile:**
 ```bash
 # On VM: record 30 seconds of perf data during iperf3
-incus exec bpfrx-fw -- perf record -a -g -F 99 -- sleep 30
+incus exec xpf-fw -- perf record -a -g -F 99 -- sleep 30
 
 # Copy perf.data to host
-incus file pull bpfrx-fw/root/perf.data ./perf.data
+incus file pull xpf-fw/root/perf.data ./perf.data
 
 # Analyze
 perf report --no-children --sort=dso,symbol
@@ -188,32 +188,32 @@ perf report --no-children --sort=dso,symbol
 Daemon restart with zero session loss and zero packet loss via BPF map/link pinning.
 
 ### Prerequisites
-- Stateful maps pinned to `/sys/fs/bpf/bpfrx/`
-- XDP/TC links pinned to `/sys/fs/bpf/bpfrx/links/`
+- Stateful maps pinned to `/sys/fs/bpf/xpf/`
+- XDP/TC links pinned to `/sys/fs/bpf/xpf/links/`
 - Non-destructive SIGTERM shutdown (no route/DHCP/VRF cleanup)
 
 ### Test Procedure
 ```bash
 # 1. Verify clean pinned state
-sg incus-admin -c 'incus exec bpfrx-fw -- ls -la /sys/fs/bpf/bpfrx/'
-sg incus-admin -c 'incus exec bpfrx-fw -- ls -la /sys/fs/bpf/bpfrx/links/'
+sg incus-admin -c 'incus exec xpf-fw -- ls -la /sys/fs/bpf/xpf/'
+sg incus-admin -c 'incus exec xpf-fw -- ls -la /sys/fs/bpf/xpf/links/'
 
 # 2. Start long-running iperf3 (from host, cross-zone through firewall)
 iperf3 -c 10.0.30.100 -P 4 -R -t 60 &
 
 # 3. While iperf3 is running, restart daemon multiple times
-sg incus-admin -c 'incus exec bpfrx-fw -- systemctl restart bpfrxd'
+sg incus-admin -c 'incus exec xpf-fw -- systemctl restart xpfd'
 sleep 5
-sg incus-admin -c 'incus exec bpfrx-fw -- systemctl restart bpfrxd'
+sg incus-admin -c 'incus exec xpf-fw -- systemctl restart xpfd'
 sleep 5
-sg incus-admin -c 'incus exec bpfrx-fw -- systemctl restart bpfrxd'
+sg incus-admin -c 'incus exec xpf-fw -- systemctl restart xpfd'
 
 # 4. Verify iperf3 completes without errors
 # Expected: consistent throughput, no retries, no stuck streams
 
 # 5. Verify sessions survived
 printf 'show security flow session\nexit\n' | \
-  sg incus-admin -c 'incus exec bpfrx-fw -- cli' 2>/dev/null
+  sg incus-admin -c 'incus exec xpf-fw -- cli' 2>/dev/null
 ```
 
 ### Success Criteria
@@ -236,7 +236,7 @@ printf 'show security flow session\nexit\n' | \
 
 **Map pinning:**
 ```
-/sys/fs/bpf/bpfrx/
+/sys/fs/bpf/xpf/
 ├── sessions          # IPv4 conntrack (survives restart)
 ├── sessions_v6       # IPv6 conntrack (survives restart)
 ├── dnat_table        # Reverse DNAT mappings (survives restart)
@@ -247,7 +247,7 @@ printf 'show security flow session\nexit\n' | \
 
 **Link pinning:**
 ```
-/sys/fs/bpf/bpfrx/links/
+/sys/fs/bpf/xpf/links/
 ├── xdp_3             # XDP link for ifindex 3 (enp6s0)
 ├── xdp_4             # XDP link for ifindex 4 (enp7s0)
 ├── xdp_5             # XDP link for ifindex 5 (enp8s0)
@@ -269,8 +269,8 @@ printf 'show security flow session\nexit\n' | \
 
 **Full teardown:**
 ```bash
-incus exec bpfrx-fw -- bpfrxd cleanup
-# Removes /sys/fs/bpf/bpfrx/ recursively + clears FRR routes
+incus exec xpf-fw -- xpfd cleanup
+# Removes /sys/fs/bpf/xpf/ recursively + clears FRR routes
 ```
 
 ---
@@ -280,91 +280,91 @@ incus exec bpfrx-fw -- bpfrxd cleanup
 ### BPF Program Verification
 ```bash
 # Check attached BPF programs
-incus exec bpfrx-fw -- bpftool net show
+incus exec xpf-fw -- bpftool net show
 
 # Check pinned maps
-incus exec bpfrx-fw -- ls -la /sys/fs/bpf/bpfrx/
+incus exec xpf-fw -- ls -la /sys/fs/bpf/xpf/
 
 # Dump map contents (e.g., sessions)
-incus exec bpfrx-fw -- bpftool map dump pinned /sys/fs/bpf/bpfrx/sessions
+incus exec xpf-fw -- bpftool map dump pinned /sys/fs/bpf/xpf/sessions
 ```
 
 ### Session Inspection
 ```bash
 # Via CLI
-printf 'show security flow session\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show security flow session\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 
 # Filter by source
-printf 'show security flow session source-prefix 10.0.1.0/24\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show security flow session source-prefix 10.0.1.0/24\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 ```
 
 ### Route Verification
 ```bash
 # FRR routes
-incus exec bpfrx-fw -- vtysh -c 'show ip route'
-incus exec bpfrx-fw -- vtysh -c 'show ipv6 route'
+incus exec xpf-fw -- vtysh -c 'show ip route'
+incus exec xpf-fw -- vtysh -c 'show ipv6 route'
 
 # Kernel routes (should match FRR)
-incus exec bpfrx-fw -- ip route show
-incus exec bpfrx-fw -- ip -6 route show
+incus exec xpf-fw -- ip route show
+incus exec xpf-fw -- ip -6 route show
 
 # Via CLI: all routes, by VRF, by protocol, by prefix
-printf 'show route\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
-printf 'show route table vrf-dmz-vr\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
-printf 'show route protocol static\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
-printf 'show route 10.0.1.0/24\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show route\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
+printf 'show route table vrf-dmz-vr\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
+printf 'show route protocol static\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
+printf 'show route 10.0.1.0/24\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 ```
 
 ### XDP Mode Verification
 ```bash
 # Check XDP attachment mode per interface
-incus exec bpfrx-fw -- ip link show | grep -A1 xdp
+incus exec xpf-fw -- ip link show | grep -A1 xdp
 
 # Or via bpftool
-incus exec bpfrx-fw -- bpftool net show
+incus exec xpf-fw -- bpftool net show
 ```
 
 ### Counter Inspection
 ```bash
 # Global counters via API
-incus exec bpfrx-fw -- curl -s http://127.0.0.1:8080/api/stats | jq .
+incus exec xpf-fw -- curl -s http://127.0.0.1:8080/api/stats | jq .
 
 # Prometheus metrics
-incus exec bpfrx-fw -- curl -s http://127.0.0.1:8080/metrics | grep bpfrx
+incus exec xpf-fw -- curl -s http://127.0.0.1:8080/metrics | grep xpf
 
 # Flow statistics via CLI
-printf 'show security flow statistics\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show security flow statistics\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 
 # Policy hit counts (with optional zone filter)
-printf 'show security policies hit-count\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
-printf 'show security policies hit-count from-zone trust to-zone untrust\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show security policies hit-count\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
+printf 'show security policies hit-count from-zone trust to-zone untrust\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 
 # Firewall filter hit counters
-printf 'show firewall\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show firewall\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 
 # NAT statistics
-printf 'show security nat source summary\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
-printf 'show security nat destination summary\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show security nat source summary\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
+printf 'show security nat destination summary\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 
 # BPF map utilization
-printf 'show system buffers\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'show system buffers\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 ```
 
 ### Session Management
 ```bash
 # Clear all sessions
-printf 'clear security flow session\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'clear security flow session\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 
 # Clear filtered sessions
-printf 'clear security flow session source-prefix 10.0.1.0/24\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
-printf 'clear security flow session protocol tcp\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
-printf 'clear security flow session destination-prefix 10.0.2.102/32 protocol udp\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'clear security flow session source-prefix 10.0.1.0/24\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
+printf 'clear security flow session protocol tcp\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
+printf 'clear security flow session destination-prefix 10.0.2.102/32 protocol udp\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 
 # Clear policy counters
-printf 'clear security policies hit-count\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'clear security policies hit-count\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 
 # Clear firewall filter counters
-printf 'clear firewall all\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
+printf 'clear firewall all\nexit\n' | incus exec xpf-fw -- cli 2>/dev/null
 ```
 
 ### Common Issues
@@ -375,7 +375,7 @@ printf 'clear firewall all\nexit\n' | incus exec bpfrx-fw -- cli 2>/dev/null
 - Check logs for `native XDP not supported, using generic mode`
 
 **Session count drops to 0 after cleanup**
-- Expected: `bpfrxd cleanup` removes all pinned state
+- Expected: `xpfd cleanup` removes all pinned state
 - Restart daemon to recreate fresh state
 
 ---
@@ -429,19 +429,19 @@ cpumap is only useful when a single CPU is genuinely saturated (40G/100G NICs).
 ```bash
 # Cluster environment must be set up:
 make cluster-init    # one-time: networks + profile
-make cluster-create  # launch bpfrx-fw0, bpfrx-fw1, cluster-lan-host
+make cluster-create  # launch xpf-fw0, xpf-fw1, cluster-lan-host
 make cluster-deploy  # build + push to both VMs
 ```
 
 ### VRRP State Verification
 ```bash
 # Both nodes should agree: fw0=MASTER, fw1=BACKUP for all groups
-printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
-printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw1 -- cli' 2>/dev/null
+printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec xpf-fw0 -- cli' 2>/dev/null
+printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec xpf-fw1 -- cli' 2>/dev/null
 
 # Verify VIPs only on primary (fw0)
-sg incus-admin -c 'incus exec bpfrx-fw0 -- ip addr show ge-0-0-1.50' | grep '172.16.50.6'
-sg incus-admin -c 'incus exec bpfrx-fw1 -- ip addr show ge-7-0-1.50' | grep '172.16.50.6'
+sg incus-admin -c 'incus exec xpf-fw0 -- ip addr show ge-0-0-1.50' | grep '172.16.50.6'
+sg incus-admin -c 'incus exec xpf-fw1 -- ip addr show ge-7-0-1.50' | grep '172.16.50.6'
 # Expected: VIP only on fw0
 ```
 
@@ -452,13 +452,13 @@ ping -c 3 172.16.50.6           # IPv4 WAN VIP
 ping -c 3 2001:559:8585:50::6   # IPv6 WAN VIP
 
 # Verify no DAD issues
-sg incus-admin -c 'incus exec bpfrx-fw0 -- ip -6 addr show ge-0-0-1.50' | grep 2001:559:8585:50::6
+sg incus-admin -c 'incus exec xpf-fw0 -- ip -6 addr show ge-0-0-1.50' | grep 2001:559:8585:50::6
 # Expected: "nodad" flag, NOT "dadfailed tentative"
 
 # Verify FRR IPv6 route on correct sub-interface
-sg incus-admin -c 'incus exec bpfrx-fw0 -- grep "ipv6 route" /etc/frr/frr.conf'
+sg incus-admin -c 'incus exec xpf-fw0 -- grep "ipv6 route" /etc/frr/frr.conf'
 # Expected: "ipv6 route ::/0 fe80::50 ge-0-0-1.50 5"
-sg incus-admin -c 'incus exec bpfrx-fw0 -- ip -6 route show default'
+sg incus-admin -c 'incus exec xpf-fw0 -- ip -6 route show default'
 # Expected: "via fe80::50 dev ge-0-0-1.50" (NOT dev ge-0-0-1)
 ```
 
@@ -468,17 +468,17 @@ sg incus-admin -c 'incus exec bpfrx-fw0 -- ip -6 route show default'
 ping 172.16.50.6 &
 
 # Stop fw0 → fw1 should become MASTER within ~3.5s
-sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl stop bpfrxd'
+sg incus-admin -c 'incus exec xpf-fw0 -- systemctl stop xpfd'
 # Expected: 3-4 lost pings, then recovery
 
 # Verify fw1 is MASTER
 sleep 5
-printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw1 -- cli' 2>/dev/null
+printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec xpf-fw1 -- cli' 2>/dev/null
 
 # Restart fw0 → preemption reclaims primary
-sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl start bpfrxd'
+sg incus-admin -c 'incus exec xpf-fw0 -- systemctl start xpfd'
 sleep 5
-printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
+printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec xpf-fw0 -- cli' 2>/dev/null
 # Expected: fw0=MASTER again
 ```
 
@@ -486,26 +486,26 @@ printf 'show security vrrp\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw0 --
 ```bash
 # Forward: commit on primary → secondary receives
 printf 'configure\nset routing-options static route 10.77.77.0/24 discard\ncommit\nexit\nexit\n' | \
-  sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
+  sg incus-admin -c 'incus exec xpf-fw0 -- cli' 2>/dev/null
 sleep 3
 printf 'show configuration routing-options | match 77\nexit\n' | \
-  sg incus-admin -c 'incus exec bpfrx-fw1 -- cli' 2>/dev/null
+  sg incus-admin -c 'incus exec xpf-fw1 -- cli' 2>/dev/null
 # Expected: "route 10.77.77.0/24 discard;"
 
 # Reverse: returning primary gets config from current primary
-sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl stop bpfrxd'
+sg incus-admin -c 'incus exec xpf-fw0 -- systemctl stop xpfd'
 sleep 2
 printf 'configure\nset routing-options static route 10.88.88.0/24 discard\ncommit\nexit\nexit\n' | \
-  sg incus-admin -c 'incus exec bpfrx-fw1 -- cli' 2>/dev/null
-sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl start bpfrxd'
+  sg incus-admin -c 'incus exec xpf-fw1 -- cli' 2>/dev/null
+sg incus-admin -c 'incus exec xpf-fw0 -- systemctl start xpfd'
 sleep 10
 printf 'show configuration routing-options | match 88\nexit\n' | \
-  sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
+  sg incus-admin -c 'incus exec xpf-fw0 -- cli' 2>/dev/null
 # Expected: "route 10.88.88.0/24 discard;" (synced from fw1)
 
 # Cleanup
 printf 'configure\ndelete routing-options static route 10.77.77.0/24\ndelete routing-options static route 10.88.88.0/24\ncommit\nexit\nexit\n' | \
-  sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
+  sg incus-admin -c 'incus exec xpf-fw0 -- cli' 2>/dev/null
 ```
 
 ### LAN RETH Connectivity (IPv4 + IPv6)
@@ -539,14 +539,14 @@ sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 30 -i 0.5 172.16.100.2
 
 # After 5 seconds, restart primary
 sleep 5
-sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl restart bpfrxd'
+sg incus-admin -c 'incus exec xpf-fw0 -- systemctl restart xpfd'
 
 # Wait for completion — expect 28-29/30 received (1-2 lost, ~1s disruption)
 
 # IPv6: ping gateway through restart
 sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 30 -i 0.5 2001:559:8585:cf01::1' &
 sleep 5
-sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl restart bpfrxd'
+sg incus-admin -c 'incus exec xpf-fw0 -- systemctl restart xpfd'
 # Same expectation: 1-2 packets lost during ARP/NDP warmup
 ```
 
@@ -561,10 +561,10 @@ sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl restart bpfrxd'
 ```bash
 sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 60 -i 0.5 10.0.60.1' &
 sleep 5
-sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl stop bpfrxd'
+sg incus-admin -c 'incus exec xpf-fw0 -- systemctl stop xpfd'
 # Expected: 3-5 packets lost during VRRP Master-down timer (~3.5s)
 sleep 15
-sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl start bpfrxd'
+sg incus-admin -c 'incus exec xpf-fw0 -- systemctl start xpfd'
 # Expected: 3-5 more packets lost during preemption back
 ```
 
@@ -575,8 +575,8 @@ If you modify `ha-cluster.conf` and redeploy, the daemon ignores the new text
 because the DB already exists. Force re-bootstrap:
 
 ```bash
-sg incus-admin -c 'incus exec bpfrx-fw0 -- rm /etc/bpfrx/.configdb/active.json'
-sg incus-admin -c 'incus exec bpfrx-fw1 -- rm /etc/bpfrx/.configdb/active.json'
+sg incus-admin -c 'incus exec xpf-fw0 -- rm /etc/xpf/.configdb/active.json'
+sg incus-admin -c 'incus exec xpf-fw1 -- rm /etc/xpf/.configdb/active.json'
 sg incus-admin -c 'make cluster-deploy'
 ```
 
@@ -584,7 +584,7 @@ sg incus-admin -c 'make cluster-deploy'
 Run after any VRRP/cluster/config-sync changes:
 ```bash
 sg incus-admin -c 'make cluster-deploy' && sleep 10
-printf 'show chassis cluster status\nexit\n' | sg incus-admin -c 'incus exec bpfrx-fw0 -- cli' 2>/dev/null
+printf 'show chassis cluster status\nexit\n' | sg incus-admin -c 'incus exec xpf-fw0 -- cli' 2>/dev/null
 
 # IPv4 VIPs
 ping -c 3 172.16.50.6
@@ -595,9 +595,9 @@ ping -c 3 2001:559:8585:50::6
 sg incus-admin -c 'incus exec cluster-lan-host -- ping -c 3 2001:559:8585:cf01::1'
 
 # Failover + recovery
-sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl stop bpfrxd'
+sg incus-admin -c 'incus exec xpf-fw0 -- systemctl stop xpfd'
 sleep 5 && ping -c 3 172.16.50.6 && ping -c 3 2001:559:8585:50::6
-sg incus-admin -c 'incus exec bpfrx-fw0 -- systemctl start bpfrxd'
+sg incus-admin -c 'incus exec xpf-fw0 -- systemctl start xpfd'
 sleep 5 && ping -c 3 172.16.50.6 && ping -c 3 2001:559:8585:50::6
 ```
 

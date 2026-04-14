@@ -134,7 +134,7 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 			}
 		case "archival":
 			sys.Archival = &ArchivalConfig{
-				ArchiveDir:  "/var/lib/bpfrx/archive",
+				ArchiveDir:  "/var/lib/xpf/archive",
 				MaxArchives: 10,
 			}
 			if cfgNode := child.FindChild("configuration"); cfgNode != nil {

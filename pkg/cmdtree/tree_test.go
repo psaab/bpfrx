@@ -3,7 +3,7 @@ package cmdtree
 import (
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func contains(items []string, want string) bool {

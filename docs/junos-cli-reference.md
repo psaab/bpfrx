@@ -4,7 +4,7 @@ Captured from vSRX 24.4R1-S2.9 chassis cluster (node0: vsrx-ernie, node1: vsrx-b
 User: claude (read-only, no config/log permission).
 
 This document preserves exact spacing, column widths, headers, and separators for replicating
-Junos output formatting in bpfrx.
+Junos output formatting in xpf.
 
 ---
 
@@ -116,7 +116,7 @@ Note: On backup node, Pkts/Bytes are 0 (no traffic flowing through it).
 
 On vSRX 24.4, `brief` produces the **same format** as the regular session output (no tabular view).
 This differs from SRX hardware platforms where `brief` may produce a condensed tabular format.
-bpfrx currently implements a tabular brief view which is a useful enhancement over vSRX behavior.
+xpf currently implements a tabular brief view which is a useful enhancement over vSRX behavior.
 
 ---
 
@@ -1144,7 +1144,7 @@ ATT.inet.0: 62 destinations, 68 routes (62 active, 0 holddown, 0 hidden)
 ### Format Details
 
 - **Router ID line.**
-- **Highwater marks:** 4-space indent, label padded to ~35 chars, `: <N> at <timestamp> / <N>`. (bpfrx omits this section.)
+- **Highwater marks:** 4-space indent, label padded to ~35 chars, `: <N> at <timestamp> / <N>`. (xpf omits this section.)
 - **Per-table summary:** Table header same as route table. IPv4 and IPv6 in separate sections (`inet.0` / `inet6.0`).
   - Protocol lines: right-aligned protocol name to 21 chars including colon, `: %7d routes, %7d active`.
   - Numbers right-aligned within 7 chars.
@@ -1334,19 +1334,19 @@ set security log stream syslog-server host port 514
 
 ---
 
-## Notes for bpfrx Implementation
+## Notes for xpf Implementation
 
 ### Key Differences to Address
 
-1. **Cluster headers:** bpfrx is single-node, so no `node0:/node1:` headers needed (unless cluster mode).
+1. **Cluster headers:** xpf is single-node, so no `node0:/node1:` headers needed (unless cluster mode).
    In cluster mode, should replicate the `nodeN:` + 74-dash separator format.
 
-2. **Session format:** bpfrx currently has a different format. Should match:
+2. **Session format:** xpf currently has a different format. Should match:
    - `Session ID: <id>, Policy name: <name>/<index>, HA State: Active, Timeout: <N>, Session State: Valid`
    - `  In: <src>/<port> --> <dst>/<port>;<proto>, Conn Tag: 0x0, If: <iface>, Pkts: <N>, Bytes: <N>, `
    - Note the trailing comma+space on In/Out lines.
 
-3. **Policy format:** bpfrx should use the 2-space/4-space indent hierarchy.
+3. **Policy format:** xpf should use the 2-space/4-space indent hierarchy.
    - `From zone:` header with no indent.
    - Policy entries at 2-space indent with comma-separated metadata.
    - Field values at 4-space indent.

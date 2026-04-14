@@ -146,7 +146,7 @@ func TestSyslogSendReceive(t *testing.T) {
 	if got[:5] != "<132>" {
 		t.Errorf("unexpected priority prefix: %q", got[:10])
 	}
-	if !strings.Contains(got, "bpfrx: test message") {
+	if !strings.Contains(got, "xpf: test message") {
 		t.Errorf("message not found in %q", got)
 	}
 }
@@ -242,8 +242,8 @@ func TestSyslogTCP(t *testing.T) {
 		if strings.HasPrefix(msg, "ERROR") {
 			t.Fatal(msg)
 		}
-		if !strings.Contains(msg, "bpfrx: tcp test") {
-			t.Errorf("expected message to contain 'bpfrx: tcp test', got %q", msg)
+		if !strings.Contains(msg, "xpf: tcp test") {
+			t.Errorf("expected message to contain 'xpf: tcp test', got %q", msg)
 		}
 		// Check priority: 16*8 + 4 = 132
 		if !strings.HasPrefix(msg, "<132>") {
@@ -378,8 +378,8 @@ func TestSyslogTLS(t *testing.T) {
 
 	select {
 	case msg := <-msgCh:
-		if !strings.Contains(msg, "bpfrx: tls test") {
-			t.Errorf("expected 'bpfrx: tls test' in message, got %q", msg)
+		if !strings.Contains(msg, "xpf: tls test") {
+			t.Errorf("expected 'xpf: tls test' in message, got %q", msg)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timeout waiting for TLS syslog message")

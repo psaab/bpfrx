@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 func (c *CLI) showNATSource(cfg *config.Config, args []string) error {

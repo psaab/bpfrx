@@ -4,7 +4,7 @@ Date: 2026-03-02
 Status: Implemented
 
 ## Config Evidence
-- Present in `/home/ps/git/bpfrx/vsrx.conf:111` as `master-password { pseudorandom-function ... }`
+- Present in `/home/ps/git/xpf/vsrx.conf:111` as `master-password { pseudorandom-function ... }`
 
 ## Current State
 - Parsed into `SystemConfig.MasterPassword`: `pkg/config/compiler.go`
@@ -12,7 +12,7 @@ Status: Implemented
 - `configstore` now encrypts active/candidate/rollback config trees at rest when configured: `pkg/configstore/db.go`, `pkg/configstore/crypto.go`
 
 ## Problem
-Before this change, configuration accepted `master-password` with no runtime effect. bpfrx now uses the configured PRF to derive an at-rest encryption key from a node-local master key and encrypt persisted config trees.
+Before this change, configuration accepted `master-password` with no runtime effect. xpf now uses the configured PRF to derive an at-rest encryption key from a node-local master key and encrypt persisted config trees.
 
 ## Proposed Implementation Scope
 1. Treat `master-password` as the configstore encryption policy knob.

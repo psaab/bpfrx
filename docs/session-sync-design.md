@@ -101,7 +101,7 @@ producer side still behaves like a periodic best-effort replication loop.
 
 ## Options Considered
 
-### Option A: Keep Everything In `bpfrxd`
+### Option A: Keep Everything In `xpfd`
 
 That means:
 
@@ -155,7 +155,7 @@ narrower event producers.
 
 #### Core idea
 
-- `bpfrxd` remains the owner of:
+- `xpfd` remains the owner of:
   - peer transport
   - bulk sync
   - readiness
@@ -182,7 +182,7 @@ In concrete terms:
 
 ## Target Architecture
 
-### 1. `bpfrxd` remains the authoritative sync coordinator
+### 1. `xpfd` remains the authoritative sync coordinator
 
 The daemon should continue to own:
 
@@ -205,7 +205,7 @@ kind of responsibility into the dataplane helper.
 ### 2. Replace helper polling with helper-to-daemon streaming
 
 Instead of periodic `DrainSessionDeltas(...)`, use a long-lived local stream
-between the helper and `bpfrxd`.
+between the helper and `xpfd`.
 
 #### Properties
 
@@ -316,7 +316,7 @@ A slower reconciliation pass periodically verifies:
 
 ### Sync coordinator behavior
 
-The coordinator in `bpfrxd` should:
+The coordinator in `xpfd` should:
 
 - accept events from kernel and helper producers
 - apply ownership filtering once
@@ -349,7 +349,7 @@ That is a net loss.
 
 Implemented in commits `a597d3c1` (Rust producer) and `a09b24f2` (Go consumer):
 
-- Binary-framed event stream over `/run/bpfrx/userspace-dp-events.sock`
+- Binary-framed event stream over `/run/xpf/userspace-dp-events.sock`
 - 9 frame types: SessionOpen/Close/Update, Ack, Pause/Resume, DrainRequest/DrainComplete, FullResync
 - Sequence numbers + replay buffer for reconnect
 - Demotion-prep: Pause → DrainRequest → Barrier → Resume
@@ -408,7 +408,7 @@ The redesign should not be considered complete unless all of these are true:
 3. periodic sweep can be slowed substantially without failover regression
 4. graceful failover does not require broad background drain loops to settle
 5. crash/rejoin still converges correctly with reconnect bulk sync
-6. ownership filtering remains centralized in `bpfrxd`
+6. ownership filtering remains centralized in `xpfd`
 7. the peer sync transport and readiness model stay single-owner and coherent
 
 ## Non-Goals
@@ -428,7 +428,7 @@ The problem is that the producer side is still too polling-oriented.
 
 The right redesign is:
 
-- keep the HA/session-sync control plane in `bpfrxd`
+- keep the HA/session-sync control plane in `xpfd`
 - move userspace session production to a local stream
 - move kernel session sync to an event-first model
 - keep sweep as reconciliation, not as the primary steady-state source
@@ -458,7 +458,7 @@ New:        helper --[events.sock]---> daemon    (push stream, binary framed)
 
 ### Transport
 
-- **Path**: `/run/bpfrx/userspace-dp-events.sock` (derived from control socket path)
+- **Path**: `/run/xpf/userspace-dp-events.sock` (derived from control socket path)
 - **Direction**: Helper connects to daemon listener (daemon creates the socket
   before spawning the helper, helper dials on startup)
 - **Lifetime**: Single persistent connection. Helper reconnects on disconnect.

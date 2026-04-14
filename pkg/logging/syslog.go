@@ -82,7 +82,7 @@ func NewSyslogClientTransport(host string, port int, sourceAddr, protocol string
 	remoteAddr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	hostname, _ := os.Hostname()
 	if hostname == "" {
-		hostname = "bpfrx"
+		hostname = "xpf"
 	}
 
 	c := &SyslogClient{
@@ -179,11 +179,11 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 	if s.Format == "sd-syslog" {
 		// RFC 5424: <PRI>VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID SD MSG
 		ts := time.Now().Format("2006-01-02T15:04:05.000Z07:00")
-		line = fmt.Sprintf("<%d>1 %s %s bpfrx - - - %s", priority, ts, s.hostname, msg)
+		line = fmt.Sprintf("<%d>1 %s %s xpf - - - %s", priority, ts, s.hostname, msg)
 	} else {
 		// RFC 3164: <PRI>TIMESTAMP HOSTNAME TAG: MSG
 		ts := time.Now().Format(time.Stamp) // "Jan _2 15:04:05"
-		line = fmt.Sprintf("<%d>%s %s bpfrx: %s", priority, ts, s.hostname, msg)
+		line = fmt.Sprintf("<%d>%s %s xpf: %s", priority, ts, s.hostname, msg)
 	}
 
 	s.mu.Lock()

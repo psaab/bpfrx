@@ -2,7 +2,7 @@
 
 ## Overview
 
-Two VMs running bpfrxd in chassis cluster (active/passive) mode with:
+Two VMs running xpfd in chassis cluster (active/passive) mode with:
 - **WAN**: SR-IOV VFs from `eno6np1` (i40e, one VF per VM via PCI passthrough, bonded into reth0)
 - **LAN**: One bridged network (one interface per VM, bonded into reth1)
 - **Heartbeat**: Dedicated bridge for cluster health monitoring (UDP:4784)
@@ -17,7 +17,7 @@ peer addresses, interface-to-RETH mappings) live inside `groups { node0 { ... } 
 `groups { node1 { ... } }`. The shared sections (chassis cluster, RETH, security, NAT,
 routing) appear at the top level.
 
-At load time, the daemon reads `/etc/bpfrx/node-id` (a plain integer: 0 or 1) and
+At load time, the daemon reads `/etc/xpf/node-id` (a plain integer: 0 or 1) and
 resolves `apply-groups "${node}"` by substituting `${node}` with `node0` or `node1`.
 This merges the node-specific group into the active config, producing a complete
 per-node configuration from a single source file.
@@ -27,7 +27,7 @@ intact) to the secondary. Each node compiles it with its own `${node}` expansion
 
 ### Interface Naming Convention
 
-bpfrx uses vSRX-style interface names:
+xpf uses vSRX-style interface names:
 
 | vSRX Name | Linux Name | Role |
 |-----------|-----------|------|
@@ -56,8 +56,8 @@ Config files use the Junos form; `.link` files rename kernel interfaces to the L
 Host NIC: eno6np1 (i40e, Intel X710/X722)
   - 32 SR-IOV VFs available (sriov_numvfs=32)
   - VFs passed through as PCI devices (type=pci) to each VM
-  - VF0 (0000:b7:06.0) → bpfrx-fw0
-  - VF1 (0000:b7:06.1) → bpfrx-fw1
+  - VF0 (0000:b7:06.0) → xpf-fw0
+  - VF1 (0000:b7:06.1) → xpf-fw1
   - VFs use iavf driver inside VMs (generic XDP only)
 ```
 
@@ -74,7 +74,7 @@ Host NIC: eno6np1 (i40e, Intel X710/X722)
                    VF0 (PCI)  VF1 (PCI)
                          |        |
               +----------+--+  +--+----------+
-              |  bpfrx-fw0  |  |  bpfrx-fw1  |
+              |  xpf-fw0  |  |  xpf-fw1  |
               |  (node 0)   |  |  (node 1)   |
               |  pri: 200   |  |  pri: 100   |
               +--+--+--+--+-+  +-+--+--+--+--+
@@ -87,9 +87,9 @@ Host NIC: eno6np1 (i40e, Intel X710/X722)
                  +------+   +-------+
                         |   |
            incusbr0             (fxp0, DHCP)
-           bpfrx-heartbeat      (em0, 10.99.0.0/30)
-           bpfrx-fabric         (fab0, 10.99.1.0/30)
-           bpfrx-clan           (reth1: 10.0.60.0/24)
+           xpf-heartbeat      (em0, 10.99.0.0/30)
+           xpf-fabric         (fab0, 10.99.1.0/30)
+           xpf-clan           (reth1: 10.0.60.0/24)
 
               +------------------+
               |  cluster-lan-    |
@@ -108,11 +108,11 @@ whichever VM is primary, same as reth0 for WAN.
 | Network | Purpose | Incus Config |
 |---------|---------|-------------|
 | `incusbr0` | Management (existing, DHCP) | default |
-| `bpfrx-heartbeat` | Cluster heartbeat (UDP:4784) | ipv4.address=none, ipv6.address=none |
-| `bpfrx-fabric` | Session/config/IPsec sync (TCP) | ipv4.address=none, ipv6.address=none |
-| `bpfrx-clan` | LAN segment (reth1 member per VM) | ipv4.address=none, ipv6.address=none |
+| `xpf-heartbeat` | Cluster heartbeat (UDP:4784) | ipv4.address=none, ipv6.address=none |
+| `xpf-fabric` | Session/config/IPsec sync (TCP) | ipv4.address=none, ipv6.address=none |
+| `xpf-clan` | LAN segment (reth1 member per VM) | ipv4.address=none, ipv6.address=none |
 
-### Profile: `bpfrx-cluster`
+### Profile: `xpf-cluster`
 
 ```
 CPU:    4 vCPU
@@ -123,10 +123,10 @@ Disk:   20 GB (pool: default)
 | Device | VM Interface | Renamed To | Network | Purpose |
 |--------|-------------|-----------|---------|---------|
 | `eth0` | enp5s0 | fxp0 | incusbr0 | Management (DHCP) |
-| `eth1` | enp6s0 | em0 | bpfrx-heartbeat | Heartbeat / control |
-| `eth2` | enp7s0 | ge-X-0-0 → fab0 | bpfrx-fabric | Fabric fab0 member |
-| `eth3` | enp8s0 | ge-X-0-1 → fab1 | bpfrx-fabric1 | Fabric fab1 member |
-| `eth4` | enp9s0 | ge-X-0-2 | bpfrx-clan | LAN (reth1 member) |
+| `eth1` | enp6s0 | em0 | xpf-heartbeat | Heartbeat / control |
+| `eth2` | enp7s0 | ge-X-0-0 → fab0 | xpf-fabric | Fabric fab0 member |
+| `eth3` | enp8s0 | ge-X-0-1 → fab1 | xpf-fabric1 | Fabric fab1 member |
+| `eth4` | enp9s0 | ge-X-0-2 | xpf-clan | LAN (reth1 member) |
 | `eth5` | enp10s0 | ge-X-0-3 | incusbr0 | Spare |
 
 SR-IOV WAN VF added per-VM as PCI passthrough (becomes `ge-X-0-4`):
@@ -142,15 +142,15 @@ are renamed to fab0/fab1 by the daemon via fabric-options member-interfaces.
 
 | Instance | Type | Role |
 |----------|------|------|
-| `bpfrx-fw0` | VM | Firewall node 0 (primary, priority 200) |
-| `bpfrx-fw1` | VM | Firewall node 1 (secondary, priority 100) |
+| `xpf-fw0` | VM | Firewall node 0 (primary, priority 200) |
+| `xpf-fw1` | VM | Firewall node 1 (secondary, priority 100) |
 | `cluster-lan-host` | Container | Test traffic source/sink on LAN (eth0 only) |
 
 ## Interface Mapping
 
 ### Per-VM Interfaces
 
-**Node 0 (bpfrx-fw0):**
+**Node 0 (xpf-fw0):**
 
 | Kernel Name | Renamed To | Config Name | Driver | XDP Mode | Role |
 |-------------|-----------|-------------|--------|----------|------|
@@ -161,7 +161,7 @@ are renamed to fab0/fab1 by the daemon via fabric-options member-interfaces.
 | enp9s0 | ge-0-0-2 | ge-0/0/2 | virtio_net | native | LAN (reth1 member) |
 | VF (PCI) | ge-0-0-3 | ge-0/0/3 | iavf | generic | WAN (reth0 member) |
 
-**Node 1 (bpfrx-fw1):**
+**Node 1 (xpf-fw1):**
 
 | Kernel Name | Renamed To | Config Name | Driver | XDP Mode | Role |
 |-------------|-----------|-------------|--------|----------|------|
@@ -199,21 +199,21 @@ are renamed to fab0/fab1 by the daemon via fabric-options member-interfaces.
 
 | Interface | Network | IPv4 Address | IPv6 | Gateway |
 |-----------|---------|-------------|------|---------|
-| eth0 | bpfrx-clan | 10.0.60.102/24 | SLAAC + DHCPv6 | 10.0.60.1 / fe80::... (RA) |
+| eth0 | xpf-clan | 10.0.60.102/24 | SLAAC + DHCPv6 | 10.0.60.1 / fe80::... (RA) |
 
 ## Cluster Configuration
 
 A single config file (`docs/ha-cluster.conf`) is loaded on both nodes. The
 `apply-groups "${node}"` directive selects node-specific overrides at commit time.
 
-Node ID is read from `/etc/bpfrx/node-id` (plain integer: 0 or 1). If this file
+Node ID is read from `/etc/xpf/node-id` (plain integer: 0 or 1). If this file
 does not exist, the daemon runs in standalone (non-cluster) mode.
 
 ### Node-Specific Settings (via groups)
 
 | Setting | node0 (fw0) | node1 (fw1) |
 |---------|------------|------------|
-| host-name | bpfrx-fw0 | bpfrx-fw1 |
+| host-name | xpf-fw0 | xpf-fw1 |
 | cluster node | 0 | 1 |
 | peer-address | 10.99.0.2 | 10.99.0.1 |
 | fabric-peer-address | 10.99.1.2 | 10.99.1.1 |
@@ -394,7 +394,7 @@ All setup is automated via `test/incus/cluster-setup.sh`:
 ```bash
 ./test/incus/cluster-setup.sh init       # Create networks + profile
 ./test/incus/cluster-setup.sh create     # Launch both VMs + test container
-./test/incus/cluster-setup.sh deploy all # Build bpfrxd, push to both VMs
+./test/incus/cluster-setup.sh deploy all # Build xpfd, push to both VMs
 ```
 
 Or via Makefile targets:
@@ -411,22 +411,22 @@ make cluster-start/stop/restart  # Service lifecycle (NODE=0|1|all)
 
 ### What `create` does per VM
 
-1. Launch Debian 13 VM with `bpfrx-cluster` profile (4 virtio NICs)
+1. Launch Debian 13 VM with `xpf-cluster` profile (4 virtio NICs)
 2. Add SR-IOV VF via PCI passthrough (stop VM → add device → restart)
 3. Write `.link` files for vSRX-style interface renaming (MAC-based)
 4. Install packages: FRR, strongSwan, tcpdump, iperf3, bpftool, ethtool, etc.
 5. Upgrade kernel to 6.18+ from Debian unstable
 6. Set GRUB: `init_on_alloc=0` for XDP performance
 7. Configure sysctl: BPF JIT, IP forwarding, RA disable
-8. Write `/etc/bpfrx/node-id` (0 or 1)
+8. Write `/etc/xpf/node-id` (0 or 1)
 9. Reboot for new kernel
 
 ### What `deploy` does per VM
 
-1. Build `bpfrxd` and `cli` binaries
+1. Build `xpfd` and `cli` binaries
 2. Stop running service, push binaries to `/usr/local/sbin/`
-3. Push unified `docs/ha-cluster.conf` to `/etc/bpfrx/bpfrx.conf`
-4. Ensure `/etc/bpfrx/node-id` exists
+3. Push unified `docs/ha-cluster.conf` to `/etc/xpf/xpf.conf`
+4. Ensure `/etc/xpf/node-id` exists
 5. Install and enable systemd service
 
 ## Test Cases
@@ -437,7 +437,7 @@ make cluster-start/stop/restart  # Service lifecycle (NODE=0|1|all)
 
 ```bash
 # On fw0 (expected primary due to priority 200):
-printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw0 -- cli
+printf 'show chassis cluster status\nexit\n' | incus exec xpf-fw0 -- cli
 
 # Expected:
 #   Node 0: primary   (priority 200, weight 255)
@@ -465,7 +465,7 @@ incus exec cluster-lan-host -- ping -c 5 2001:559:8585:cf01::1  # reth1 IPv6 VIP
 incus exec cluster-lan-host -- ping -c 5 2001:559:8585:50::6    # reth0 IPv6 VIP (WAN)
 
 # Verify sessions on primary:
-printf 'show security flow session\nexit\n' | incus exec bpfrx-fw0 -- cli
+printf 'show security flow session\nexit\n' | incus exec xpf-fw0 -- cli
 ```
 
 **Pass criteria:**
@@ -483,13 +483,13 @@ printf 'show security flow session\nexit\n' | incus exec bpfrx-fw0 -- cli
 incus exec cluster-lan-host -- ping 8.8.8.8 &
 
 # 2. Stop primary
-incus exec bpfrx-fw0 -- systemctl stop bpfrxd
+incus exec xpf-fw0 -- systemctl stop xpfd
 
 # 3. Wait for failover (30ms VRRP → ~97ms masterDown; planned stop near-instant)
 sleep 1
 
 # 4. Check cluster status on fw1
-printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
+printf 'show chassis cluster status\nexit\n' | incus exec xpf-fw1 -- cli
 
 # 5. Verify ping continues (expect ~6 lost at 10ms interval = ~60ms)
 ```
@@ -506,13 +506,13 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
 
 ```bash
 # 1. Restart fw0
-incus exec bpfrx-fw0 -- systemctl start bpfrxd
+incus exec xpf-fw0 -- systemctl start xpfd
 
 # 2. Wait for preemption (election + hold timer)
 sleep 10
 
 # 3. Verify fw0 is primary again
-printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw0 -- cli
+printf 'show chassis cluster status\nexit\n' | incus exec xpf-fw0 -- cli
 ```
 
 **Pass criteria:**
@@ -526,10 +526,10 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw0 -- cli
 
 ```bash
 # 1. On fw0 (primary), add a policy:
-printf 'configure\nset security policies from-zone lan to-zone wan policy test-sync match source-address any destination-address any application any then permit\ncommit\nexit\nexit\n' | incus exec bpfrx-fw0 -- cli
+printf 'configure\nset security policies from-zone lan to-zone wan policy test-sync match source-address any destination-address any application any then permit\ncommit\nexit\nexit\n' | incus exec xpf-fw0 -- cli
 
 # 2. On fw1, verify config arrived:
-printf 'show configuration security policies from-zone lan to-zone wan | display set\nexit\n' | incus exec bpfrx-fw1 -- cli
+printf 'show configuration security policies from-zone lan to-zone wan | display set\nexit\n' | incus exec xpf-fw1 -- cli
 ```
 
 **Pass criteria:**
@@ -545,10 +545,10 @@ printf 'show configuration security policies from-zone lan to-zone wan | display
 incus exec cluster-lan-host -- iperf3 -c <wan-target> -t 60 &
 
 # 2. Verify session on fw0
-printf 'show security flow session\nexit\n' | incus exec bpfrx-fw0 -- cli
+printf 'show security flow session\nexit\n' | incus exec xpf-fw0 -- cli
 
 # 3. Verify session is synced to fw1
-printf 'show security flow session\nexit\n' | incus exec bpfrx-fw1 -- cli
+printf 'show security flow session\nexit\n' | incus exec xpf-fw1 -- cli
 ```
 
 **Pass criteria:**
@@ -561,16 +561,16 @@ printf 'show security flow session\nexit\n' | incus exec bpfrx-fw1 -- cli
 
 ```bash
 # 1. Baseline: verify node0 primary for all RGs
-echo 'show chassis cluster' | incus exec bpfrx-fw0 -- cli
+echo 'show chassis cluster' | incus exec xpf-fw0 -- cli
 
 # 2. Manual failover RG1 to node1
 echo 'request chassis cluster failover redundancy-group 1 node 1' | \
-  incus exec bpfrx-fw0 -- cli
+  incus exec xpf-fw0 -- cli
 sleep 2
 
 # 3. Verify RG1: node0=secondary(Manual=yes), node1=primary
-echo 'show chassis cluster' | incus exec bpfrx-fw0 -- cli
-echo 'show chassis cluster' | incus exec bpfrx-fw1 -- cli
+echo 'show chassis cluster' | incus exec xpf-fw0 -- cli
+echo 'show chassis cluster' | incus exec xpf-fw1 -- cli
 
 # 4. LAN VIP connectivity during failover
 incus exec cluster-lan-host -- ping -c 3 10.0.60.1
@@ -578,11 +578,11 @@ incus exec cluster-lan-host -- ping -6 -c 3 2001:559:8585:cf01::1
 
 # 5. Reset failover — node0 preempts back
 echo 'request chassis cluster failover reset redundancy-group 1' | \
-  incus exec bpfrx-fw0 -- cli
+  incus exec xpf-fw0 -- cli
 sleep 2
 
 # 6. Verify RG1: node0=primary, Manual=no, weight restored to 255
-echo 'show chassis cluster' | incus exec bpfrx-fw0 -- cli
+echo 'show chassis cluster' | incus exec xpf-fw0 -- cli
 
 # 7. LAN VIP connectivity after reset
 incus exec cluster-lan-host -- ping -c 3 10.0.60.1
@@ -601,10 +601,10 @@ incus exec cluster-lan-host -- ping -6 -c 3 2001:559:8585:cf01::1
 
 ```bash
 # Simulate WAN VF failure by detaching the PCI device:
-incus config device remove bpfrx-fw0 wan-vf
+incus config device remove xpf-fw0 wan-vf
 
 # Monitor cluster status (reth0 weight should drop to 0):
-printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
+printf 'show chassis cluster status\nexit\n' | incus exec xpf-fw1 -- cli
 ```
 
 **Pass criteria:**
@@ -646,13 +646,13 @@ incus exec cluster-lan-host -- ip addr show eth0
 
 ```bash
 # Disconnect heartbeat by removing device from fw1
-incus config device remove bpfrx-fw1 eth1
+incus config device remove xpf-fw1 eth1
 
 # Both nodes should detect heartbeat loss
 # Node 1 (lower priority) should go secondary-hold
 sleep 10
-printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw0 -- cli
-printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
+printf 'show chassis cluster status\nexit\n' | incus exec xpf-fw0 -- cli
+printf 'show chassis cluster status\nexit\n' | incus exec xpf-fw1 -- cli
 ```
 
 **Pass criteria:**
@@ -666,12 +666,12 @@ printf 'show chassis cluster status\nexit\n' | incus exec bpfrx-fw1 -- cli
 
 ```bash
 # Verify radvd is running on primary with correct interface name
-incus exec bpfrx-fw0 -- systemctl status radvd
-incus exec bpfrx-fw0 -- cat /etc/radvd.conf
+incus exec xpf-fw0 -- systemctl status radvd
+incus exec xpf-fw0 -- cat /etc/radvd.conf
 # Expected: interface name is physical member (ge-0-0-0), NOT "reth1"
 
 # Verify kea-dhcp6 is running on primary
-incus exec bpfrx-fw0 -- systemctl status kea-dhcp6-server
+incus exec xpf-fw0 -- systemctl status kea-dhcp6-server
 
 # Verify cluster-lan-host got IPv6 via SLAAC/DHCPv6
 incus exec cluster-lan-host -- ip -6 addr show eth0
@@ -711,23 +711,23 @@ This tests two `META_FLAG_KERNEL_ROUTE` BPF fallback paths:
 # IPv4 forwarding test through SNAT:
 incus exec cluster-lan-host -- ping -c 30 -i 0.5 172.16.100.200 &
 sleep 5
-incus exec bpfrx-fw0 -- systemctl restart bpfrxd
+incus exec xpf-fw0 -- systemctl restart xpfd
 # Expected: 28-29/30 received (1-2 packets lost during restart)
 
 # IPv6 forwarding test (no SNAT, routed):
 incus exec cluster-lan-host -- ping -c 30 -i 0.5 2607:f8b0:400f:806::200e &
 sleep 5
-incus exec bpfrx-fw0 -- systemctl restart bpfrxd
+incus exec xpf-fw0 -- systemctl restart xpfd
 # Expected: similar 1-2 packet loss
 
 # Full failover test (stop primary, secondary takes over):
 incus exec cluster-lan-host -- ping -i 0.01 -c 500 -W 1 10.0.60.1 &
 sleep 1
-incus exec bpfrx-fw0 -- systemctl stop bpfrxd
+incus exec xpf-fw0 -- systemctl stop xpfd
 # Expected: ~6 packets lost at 10ms interval = ~60ms failover
 # (3× priority-0 burst on shutdown → peer immediate takeover)
 sleep 5
-incus exec bpfrx-fw0 -- systemctl start bpfrxd
+incus exec xpf-fw0 -- systemctl start xpfd
 # Expected: ~13 packets lost = ~130ms failback (daemon startup + sync hold)
 ```
 
@@ -746,13 +746,13 @@ incus exec cluster-lan-host -- iperf3 -c 172.16.100.200 -t 60 -C bbr &
 
 # 2. After 15s of steady state, stop primary (full VRRP failover)
 sleep 15
-incus exec bpfrx-fw0 -- systemctl stop bpfrxd
+incus exec xpf-fw0 -- systemctl stop xpfd
 
 # 3. Wait for secondary to take over, verify throughput resumes
 sleep 20
 
 # 4. Bring primary back (VRRP preemption)
-incus exec bpfrx-fw0 -- systemctl start bpfrxd
+incus exec xpf-fw0 -- systemctl start xpfd
 
 # 5. Wait for iperf3 to finish, check results
 # Expected: throughput dips to ~0 for ~2s during each transition,
@@ -764,9 +764,9 @@ incus exec cluster-lan-host -- iperf3 -c 2001:559:8585:100::247 -t 60 -C bbr &
 
 # 2. Same failover sequence
 sleep 15
-incus exec bpfrx-fw0 -- systemctl stop bpfrxd
+incus exec xpf-fw0 -- systemctl stop xpfd
 sleep 20
-incus exec bpfrx-fw0 -- systemctl start bpfrxd
+incus exec xpf-fw0 -- systemctl start xpfd
 
 # Expected: same behavior — brief throughput dip, full recovery,
 # connection survives. No cwnd collapse to 0.
@@ -796,7 +796,7 @@ incus exec bpfrx-fw0 -- systemctl start bpfrxd
   VRRP MASTER transition + neighbor discovery). Preemption back to fw0 was seamless.
 
 **How it works:**
-1. BPF programs pinned at `/sys/fs/bpf/bpfrx/` survive daemon restart
+1. BPF programs pinned at `/sys/fs/bpf/xpf/` survive daemon restart
 2. Existing sessions preserved in pinned conntrack maps
 3. After restart, FIB cache in session entries is stale (`fib_gen` mismatch)
 4. `bpf_fib_lookup` may return LOCAL/NOT_FWDED (routes not yet in kernel)
@@ -857,13 +857,13 @@ security {
 incus exec cluster-lan-host -- iperf3 -6 -c 2001:559:8585:50::6 -t 60 -P 4 &
 
 # 2. Verify sessions on fw0 (should show DNAT flag)
-incus exec bpfrx-fw0 -- cli -c 'show security flow session destination-prefix 2001:559:8585:50::6'
+incus exec xpf-fw0 -- cli -c 'show security flow session destination-prefix 2001:559:8585:50::6'
 
 # 3. Verify sessions synced to fw1
-incus exec bpfrx-fw1 -- cli -c 'show security flow session destination-prefix 2001:559:8585:50::6'
+incus exec xpf-fw1 -- cli -c 'show security flow session destination-prefix 2001:559:8585:50::6'
 
 # 4. Failover RG1 to fw1
-incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 1'
+incus exec xpf-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 1'
 sleep 5
 
 # 5. Verify traffic still flowing (fw1 now MASTER, fabric redirect active)
@@ -873,7 +873,7 @@ incus exec cluster-lan-host -- curl -6 --connect-timeout 5 http://[2001:559:8585
 # Expected: all streams alive, throughput > 0
 
 # 7. Failback to fw0
-incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1'
+incus exec xpf-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1'
 sleep 5
 
 # 8. Verify traffic still flowing
@@ -941,11 +941,11 @@ incus exec cluster-lan-host -- curl -6 --connect-timeout 5 \
     http://[2001:559:8585:50::6]:80/
 
 # 3. Verify session shows DNAT with port change
-incus exec bpfrx-fw0 -- cli -c 'show security flow session'
+incus exec xpf-fw0 -- cli -c 'show security flow session'
 # Expected: session shows dst port translated 80→8080
 
 # 4. Failover RG1 to fw1 (triggers fabric redirect)
-incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 1'
+incus exec xpf-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 1'
 sleep 3
 
 # 5. New connection to VIP:80 should still work via fabric
@@ -956,7 +956,7 @@ incus exec cluster-lan-host -- curl -6 --connect-timeout 5 \
 # Check fw1 sessions — should show correct port translation
 
 # 7. Reset
-incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1'
+incus exec xpf-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1'
 ```
 
 **Pass criteria:**
@@ -991,14 +991,14 @@ incus exec cluster-lan-host -- iperf3 -6 \
 sleep 8
 
 # 3. Verify v6 sessions on fw0 and fw1
-incus exec bpfrx-fw0 -- cli -c 'show security flow session protocol tcp family inet6' \
+incus exec xpf-fw0 -- cli -c 'show security flow session protocol tcp family inet6' \
     | grep -c 'State: Established'
 # Expected: >= 8
 
 # 4. Run 5 failover/failback cycles (30s interval)
 for cycle in $(seq 1 5); do
     echo "=== Cycle $cycle: failover fw0→fw1 ==="
-    incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1'
+    incus exec xpf-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1'
     sleep 15
 
     # Check for dead streams
@@ -1007,9 +1007,9 @@ for cycle in $(seq 1 5); do
         | grep -c '0.00 bits/sec' || true
 
     echo "=== Cycle $cycle: failback fw1→fw0 ==="
-    incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1'
-    incus exec bpfrx-fw1 -- cli -c 'request chassis cluster failover reset redundancy-group 1'
-    incus exec bpfrx-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 0'
+    incus exec xpf-fw0 -- cli -c 'request chassis cluster failover reset redundancy-group 1'
+    incus exec xpf-fw1 -- cli -c 'request chassis cluster failover reset redundancy-group 1'
+    incus exec xpf-fw0 -- cli -c 'request chassis cluster failover redundancy-group 1 node 0'
     sleep 15
 
     # Check again
@@ -1071,8 +1071,8 @@ DB is empty (first boot or after deletion).
 text file because `active.json` already exists. To force re-bootstrap:
 
 ```bash
-incus exec bpfrx-fw0 -- rm /etc/bpfrx/.configdb/active.json
-incus exec bpfrx-fw1 -- rm /etc/bpfrx/.configdb/active.json
+incus exec xpf-fw0 -- rm /etc/xpf/.configdb/active.json
+incus exec xpf-fw1 -- rm /etc/xpf/.configdb/active.json
 make cluster-deploy  # re-push config + restart
 ```
 
@@ -1087,7 +1087,7 @@ were either dropped (by host-inbound policy) or delivered to the kernel stack wi
 NAT reversal, causing RSTs.
 
 **Fix:** Three-part change:
-1. `bpfrx_common.h`: Added `META_FLAG_KERNEL_ROUTE` (1 << 2)
+1. `xpf_common.h`: Added `META_FLAG_KERNEL_ROUTE` (1 << 2)
 2. `xdp_zone.c`: In the FIB failure else-branch, check if packet matches an existing
    session (sv4/sv6 != NULL). If so, set `META_FLAG_KERNEL_ROUTE` and tail-call to
    conntrack for normal session processing and NAT reversal.

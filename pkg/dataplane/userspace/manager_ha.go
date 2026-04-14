@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // syncHAWatchdogOnlyLocked syncs HA state to the helper from the periodic

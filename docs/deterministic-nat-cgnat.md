@@ -122,7 +122,7 @@ public IPs). `MAX_NAT_POOL_IPS` correspondingly increased to 8192.
 | `pkg/config/compiler.go` | Parse deterministic port config (hierarchical + flat set), address ranges (`addr1/32 to addr2/32`), validation |
 | `pkg/dataplane/compiler.go` | Compile deterministic fields to `NATPoolConfig`, mode 1 vs mode 2 dispatch |
 | `pkg/dataplane/types.go` | `NATPoolConfig` extended with deterministic fields |
-| `pkg/api/metrics.go` | `bpfrx_nat_pool_deterministic_info` Prometheus gauge |
+| `pkg/api/metrics.go` | `xpf_nat_pool_deterministic_info` Prometheus gauge |
 | `pkg/cmdtree/tree.go` | `deterministic-nat nat-table` show command |
 
 ### Validation Rules
@@ -152,7 +152,7 @@ All struct and constant changes are mirrored in `dpdk_worker/`:
 ## Prometheus Metrics
 
 ```
-bpfrx_nat_pool_deterministic_info{pool="CGNAT-POOL", block_size="2016", host_count="1024"} 1
+xpf_nat_pool_deterministic_info{pool="CGNAT-POOL", block_size="2016", host_count="1024"} 1
 ```
 
 A gauge metric exposing the deterministic configuration for each pool.

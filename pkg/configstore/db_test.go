@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestDBWriteReadPlainTree(t *testing.T) {

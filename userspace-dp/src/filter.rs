@@ -11,6 +11,7 @@
 use crate::prefix::{PrefixV4, PrefixV6};
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -49,7 +50,7 @@ pub(crate) struct FilterTerm {
     pub(crate) log: bool,
     pub(crate) policer_name: String,
     pub(crate) routing_instance: String,
-    pub(crate) forwarding_class: String,
+    pub(crate) forwarding_class: Arc<str>,
     pub(crate) dscp_rewrite: Option<u8>,
 }
 
@@ -158,7 +159,7 @@ pub(crate) struct FilterResult {
     pub(crate) dscp_rewrite: Option<u8>,
     pub(crate) policer_name: String,
     pub(crate) routing_instance: String,
-    pub(crate) forwarding_class: String,
+    pub(crate) forwarding_class: Arc<str>,
     pub(crate) log: bool,
 }
 
@@ -169,7 +170,7 @@ impl Default for FilterResult {
             dscp_rewrite: None,
             policer_name: String::new(),
             routing_instance: String::new(),
-            forwarding_class: String::new(),
+            forwarding_class: Arc::<str>::from(""),
             log: false,
         }
     }
@@ -442,7 +443,7 @@ fn parse_term(snap: &FirewallTermSnapshot) -> FilterTerm {
         log: snap.log,
         policer_name: snap.policer.clone(),
         routing_instance: snap.routing_instance.clone(),
-        forwarding_class: snap.forwarding_class.clone(),
+        forwarding_class: Arc::<str>::from(snap.forwarding_class.as_str()),
         dscp_rewrite,
     }
 }

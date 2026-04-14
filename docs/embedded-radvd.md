@@ -1,7 +1,7 @@
 # Embedded Router Advertisement (RA) Daemon
 
 Research document analyzing the feasibility of replacing the external `radvd` dependency
-with a native Go RA sender embedded directly in `bpfrxd`.
+with a native Go RA sender embedded directly in `xpfd`.
 
 ## 1. Current Architecture
 
@@ -24,7 +24,7 @@ Junos AST
       → radvd.Manager.Apply() generates radvd.conf text
 ```
 
-The `RAInterfaceConfig` struct captures all RA options bpfrx uses:
+The `RAInterfaceConfig` struct captures all RA options xpf uses:
 
 ```go
 type RAInterfaceConfig struct {
@@ -67,7 +67,7 @@ type RAPrefix struct {
 1. **Process lifecycle bugs**: `systemctl reload` fails if radvd isn't running; `systemctl stop`
    races with SIGHUP; zombie processes after unclean daemon shutdown.
 
-2. **Config file races**: Writing `/etc/radvd.conf` then reloading has a TOCTOU window. If bpfrxd
+2. **Config file races**: Writing `/etc/radvd.conf` then reloading has a TOCTOU window. If xpfd
    crashes between write and reload, a stale config persists across restart.
 
 3. **Goodbye RA fragility**: `Withdraw()` rewrites config → reloads → sleeps 500ms → kills. If
@@ -157,8 +157,8 @@ Higher-level library built on top of `mdlayher/ndp`. Provides a complete RA daem
 
 **Cons**:
 - Much heavier dependency — pulls in the full daemon framework
-- Less control over integration with bpfrx's VRRP state machine
-- YAML config model doesn't align with bpfrx's compiled RAInterfaceConfig
+- Less control over integration with xpf's VRRP state machine
+- YAML config model doesn't align with xpf's compiled RAInterfaceConfig
 - Overkill — we only need the packet building from ndp plus our own timer logic
 
 ### 2.3 Raw implementation (no library)
@@ -324,7 +324,7 @@ Total withdraw latency: ~100ms (vs ~600ms+ with external radvd).
 
 The RFC specifies randomized RA intervals to prevent synchronization:
 
-| Parameter | Default | bpfrx Config |
+| Parameter | Default | xpf Config |
 |-----------|---------|-------------|
 | `MaxRtrAdvInterval` | 600s | `RAInterfaceConfig.MaxAdvInterval` |
 | `MinRtrAdvInterval` | 0.33 * Max | `RAInterfaceConfig.MinAdvInterval` |
@@ -522,7 +522,7 @@ The RA sender is **simpler** than the VRRP implementation because:
 ### 7.1 Risk: ICMPv6 Socket Requires Root/CAP_NET_RAW
 
 **Severity**: Low
-**Mitigation**: bpfrxd already runs as root (required for XDP attachment, netlink operations,
+**Mitigation**: xpfd already runs as root (required for XDP attachment, netlink operations,
 AF_PACKET sockets in VRRP). The ndp library uses `ipv6:ipv6-icmp` which requires `CAP_NET_RAW`,
 already available.
 

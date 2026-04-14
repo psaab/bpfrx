@@ -1,4 +1,4 @@
-// Package daemon implements the bpfrx daemon lifecycle.
+// Package daemon implements the xpf daemon lifecycle.
 package daemon
 
 import (
@@ -8,8 +8,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
 )
 

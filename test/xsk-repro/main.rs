@@ -1,6 +1,6 @@
 //! Standalone AF_XDP zero-copy rebind test.
 //!
-//! Loads its own XDP program (no bpfrxd dependency), creates XSK sockets,
+//! Loads its own XDP program (no xpfd dependency), creates XSK sockets,
 //! receives packets, does link DOWN/UP, rebinds, and checks receive again.
 //!
 //! Build the XDP object first:

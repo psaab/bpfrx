@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
-	"github.com/psaab/bpfrx/pkg/logging"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/logging"
 )
 
 func TestMonitorFlowFilter_MatchesAll(t *testing.T) {

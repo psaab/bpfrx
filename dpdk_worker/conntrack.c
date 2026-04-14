@@ -42,7 +42,7 @@ ct_csum_update_u16(uint16_t *csum, uint16_t old_val, uint16_t new_val)
  * exceeds the configured maximum, overwrites it and updates the TCP
  * checksum incrementally.
  *
- * Reference: bpf/headers/bpfrx_helpers.h tcp_mss_clamp().
+ * Reference: bpf/headers/xpf_helpers.h tcp_mss_clamp().
  */
 void
 tcp_mss_clamp(struct rte_mbuf *pkt, struct pkt_meta *meta,
@@ -138,7 +138,7 @@ tcp_mss_clamp(struct rte_mbuf *pkt, struct pkt_meta *meta,
 /**
  * ct_tcp_update_state — TCP state machine transition.
  *
- * Matches the BPF implementation in bpfrx_conntrack.h exactly.
+ * Matches the BPF implementation in xpf_conntrack.h exactly.
  */
 static inline uint8_t
 ct_tcp_update_state(uint8_t current_state, uint8_t tcp_flags, uint8_t direction)

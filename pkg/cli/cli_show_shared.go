@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/psaab/bpfrx/pkg/cmdtree"
+	"github.com/psaab/xpf/pkg/cmdtree"
 )
 
 func (c *CLI) showOperationalHelp() {

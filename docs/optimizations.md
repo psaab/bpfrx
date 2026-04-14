@@ -121,7 +121,7 @@ is essentially free from host perspective. Bottleneck is entirely virtualization
 (Percentages sum >100% due to perf report hierarchy duplication)
 
 ### Key insight
-The Incus bridge networks (bpfrx-trust, bpfrx-untrust, etc.) each have only 2 ports
+The Incus bridge networks (xpf-trust, xpf-untrust, etc.) each have only 2 ports
 (VM tap + container veth), so the bridge adds ~24% CPU overhead with zero benefit.
 Switching to macvtap, routed, or tc-redirect could eliminate this entirely.
 
@@ -142,7 +142,7 @@ Switching to macvtap, routed, or tc-redirect could eliminate this entirely.
 - Diminishing returns — 2.8% is already very low
 
 ### Incus bridge bypass for test containers
-- Bridges (bpfrx-trust, etc.) consume ~24% host CPU just for 2-port L2 forwarding
+- Bridges (xpf-trust, etc.) consume ~24% host CPU just for 2-port L2 forwarding
 - Options: macvtap NIC type, `tc redirect` hairpin, or routed mode
 - Would eliminate `br_handle_frame` + `br_dev_queue_push_xmit` overhead
 

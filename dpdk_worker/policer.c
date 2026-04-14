@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * policer.c — Token bucket policer evaluation for DPDK pipeline.
  *
- * Ports evaluate_policer() from BPF helpers (bpfrx_helpers.h:977-1066)
+ * Ports evaluate_policer() from BPF helpers (xpf_helpers.h:977-1066)
  * using rte_rdtsc() / rte_get_tsc_hz() for timing instead of ktime_ns.
  *
  * Returns: 0=conform, 1=exceed, 2=violate

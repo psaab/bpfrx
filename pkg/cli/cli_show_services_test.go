@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/configstore"
-	"github.com/psaab/bpfrx/pkg/rpm"
+	"github.com/psaab/xpf/pkg/configstore"
+	"github.com/psaab/xpf/pkg/rpm"
 )
 
 func TestShowRPMProbeResultsFallsBackToConfigWhenLiveResultsEmpty(t *testing.T) {

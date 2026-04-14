@@ -15,8 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/vishvananda/netlink"
 )
 
@@ -322,9 +322,9 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				Addresses:       addresses,
 				FilterInputV4:   unit.FilterInputV4,
 				FilterInputV6:   unit.FilterInputV6,
-				CoSShapingRate:  coSUnitShapingRate(cosUnit),
-				CoSBurstSize:    coSUnitBurstSize(cosUnit),
-				CoSSchedulerMap: coSUnitSchedulerMap(cosUnit),
+				CoSShapingRateBytesPerSec: coSUnitShapingRate(cosUnit),
+				CoSBurstSize:             coSUnitBurstSize(cosUnit),
+				CoSSchedulerMap:          coSUnitSchedulerMap(cosUnit),
 			})
 		}
 	}

@@ -62,7 +62,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "bpfrx-userspace-xdp"
+name = "xpf-userspace-xdp"
 version = "0.1.0"
 dependencies = [
  "aya-ebpf",

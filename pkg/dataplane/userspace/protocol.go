@@ -3,7 +3,7 @@ package userspace
 import (
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 const (
@@ -116,9 +116,9 @@ type InterfaceSnapshot struct {
 	Addresses       []InterfaceAddressSnapshot `json:"addresses,omitempty"`
 	FilterInputV4   string                     `json:"filter_input_v4,omitempty"`
 	FilterInputV6   string                     `json:"filter_input_v6,omitempty"`
-	CoSShapingRate  uint64                     `json:"cos_shaping_rate_bps,omitempty"`
-	CoSBurstSize    uint64                     `json:"cos_shaping_burst_bytes,omitempty"`
-	CoSSchedulerMap string                     `json:"cos_scheduler_map,omitempty"`
+	CoSShapingRateBytesPerSec uint64                     `json:"cos_shaping_rate_bytes_per_sec,omitempty"`
+	CoSBurstSize             uint64                     `json:"cos_shaping_burst_bytes,omitempty"`
+	CoSSchedulerMap          string                     `json:"cos_scheduler_map,omitempty"`
 }
 
 type ClassOfServiceSnapshot struct {
