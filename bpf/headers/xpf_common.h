@@ -443,7 +443,7 @@ struct pkt_meta {
 	__u32 ingress_ifindex;
 	__u16 ingress_vlan_id;
 	__u8  ingress_pcp;
-	__u8  reserved_vlan;
+	__u8  ingress_vlan_present;
 	__u16 egress_vlan_id;
 
 	/* Pipeline state */

@@ -1067,7 +1067,7 @@ int xdp_zone_prog(struct xdp_md *ctx)
 	 */
 	if (meta->addr_family == AF_INET && meta->protocol == PROTO_VRRP &&
 	    meta->dst_ip.v4 == bpf_htonl(0xE0000012)) {
-		if (meta->ingress_vlan_id != 0)
+		if (meta->ingress_vlan_present)
 			xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
 		return XDP_PASS;
 	}
@@ -1937,7 +1937,7 @@ zone_session_update:
 		}
 		TRACE_ZONE(meta);
 		inc_counter(GLOBAL_CTR_HOST_INBOUND);
-		if (meta->ingress_vlan_id != 0) {
+		if (meta->ingress_vlan_present) {
 			if (xdp_vlan_tag_push(ctx, meta->ingress_vlan_id) < 0)
 				return XDP_DROP;
 		}

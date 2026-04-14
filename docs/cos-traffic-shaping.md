@@ -831,7 +831,8 @@ Notes for this specific test:
 - DSCP BA classifiers are a fallback input to CoS queue selection today; an
   explicit firewall filter `then forwarding-class ...` decision still wins
 - 802.1p BA classifiers are also available as a fallback queue selector on
-  userspace interfaces; they use the ingress VLAN PCP preserved from XDP
+  userspace interfaces; they use the ingress VLAN PCP preserved from tagged
+  XDP traffic, including priority-tagged frames with VLAN ID 0
 - keep ingress `input` filter classification only as a compatibility fallback
   for existing configs that do not yet attach an egress CoS filter
 - use `set class-of-service schedulers <name> transmit-rate <rate> exact` for

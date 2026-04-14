@@ -135,7 +135,7 @@ int xdp_forward_prog(struct xdp_md *ctx)
 				if (fab_rc >= 0)
 					return fab_rc;
 			}
-			if (meta->ingress_vlan_id != 0) {
+			if (meta->ingress_vlan_present) {
 				if (xdp_vlan_tag_push(ctx,
 						meta->ingress_vlan_id) < 0)
 					return XDP_DROP;
@@ -198,7 +198,7 @@ int xdp_forward_prog(struct xdp_md *ctx)
 		}
 		/* Push VLAN tag back so kernel delivers to sub-interface
 		 * (e.g. DHCP on enp10s0f0.100 needs tagged frames). */
-		if (meta->ingress_vlan_id != 0) {
+		if (meta->ingress_vlan_present) {
 			if (xdp_vlan_tag_push(ctx, meta->ingress_vlan_id) < 0)
 				return XDP_DROP;
 		}
@@ -221,14 +221,14 @@ forward_transit:
 	if (meta->addr_family == AF_INET) {
 		struct iphdr *iph_ttl = data + sizeof(struct ethhdr);
 		if ((void *)(iph_ttl + 1) <= data_end && iph_ttl->ttl <= 1) {
-			if (meta->ingress_vlan_id != 0)
+			if (meta->ingress_vlan_present)
 				xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
 			return tunnel_pass(ctx, meta);
 		}
 	} else {
 		struct ipv6hdr *ip6h_ttl = data + sizeof(struct ethhdr);
 		if ((void *)(ip6h_ttl + 1) <= data_end && ip6h_ttl->hop_limit <= 1) {
-			if (meta->ingress_vlan_id != 0)
+			if (meta->ingress_vlan_present)
 				xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
 			return tunnel_pass(ctx, meta);
 		}

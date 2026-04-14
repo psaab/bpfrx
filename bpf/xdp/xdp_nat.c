@@ -36,7 +36,7 @@ int xdp_nat_prog(struct xdp_md *ctx)
 		if (meta->ip_ttl <= 1) {
 			/* Push ingress VLAN tag back so kernel
 			 * delivers to the correct sub-interface. */
-			if (meta->ingress_vlan_id != 0)
+			if (meta->ingress_vlan_present)
 				xdp_vlan_tag_push(ctx, meta->ingress_vlan_id);
 			return XDP_PASS;
 		}

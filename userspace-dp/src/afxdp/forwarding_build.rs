@@ -434,6 +434,16 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
         return CoSState::default();
     };
 
+    let class_to_queue = cos
+        .forwarding_classes
+        .iter()
+        .filter_map(|class| {
+            if class.name.is_empty() || !(0..=u8::MAX as i32).contains(&class.queue) {
+                return None;
+            }
+            Some((class.name.clone(), class.queue as u8))
+        })
+        .collect::<FastMap<_, _>>();
     let dscp_classifiers = cos
         .dscp_classifiers
         .iter()
@@ -444,12 +454,7 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                 if entry.forwarding_class.is_empty() {
                     continue;
                 }
-                let Some(queue_id) = cos
-                    .forwarding_classes
-                    .iter()
-                    .find(|class| class.name == entry.forwarding_class)
-                    .and_then(|class| u8::try_from(class.queue).ok())
-                else {
+                let Some(queue_id) = class_to_queue.get(&entry.forwarding_class).copied() else {
                     continue;
                 };
                 for dscp in &entry.dscp_values {
@@ -472,12 +477,7 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                 if entry.forwarding_class.is_empty() {
                     continue;
                 }
-                let Some(queue_id) = cos
-                    .forwarding_classes
-                    .iter()
-                    .find(|class| class.name == entry.forwarding_class)
-                    .and_then(|class| u8::try_from(class.queue).ok())
-                else {
+                let Some(queue_id) = class_to_queue.get(&entry.forwarding_class).copied() else {
                     continue;
                 };
                 for pcp in &entry.code_points {
@@ -491,16 +491,6 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
         })
         .collect::<FastMap<_, _>>();
 
-    let class_to_queue = cos
-        .forwarding_classes
-        .iter()
-        .filter_map(|class| {
-            if class.name.is_empty() || !(0..=u8::MAX as i32).contains(&class.queue) {
-                return None;
-            }
-            Some((class.name.clone(), class.queue as u8))
-        })
-        .collect::<FastMap<_, _>>();
     let schedulers = cos
         .schedulers
         .iter()

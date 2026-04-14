@@ -59,7 +59,7 @@ pub(super) struct UserspaceDpMeta {
     pub(super) rx_queue_index: u32,
     pub(super) ingress_vlan_id: u16,
     pub(super) ingress_pcp: u8,
-    pub(super) reserved_vlan: u8,
+    pub(super) ingress_vlan_present: u8,
     pub(super) ingress_zone: u16,
     pub(super) routing_table: u32,
     pub(super) l3_offset: u16,

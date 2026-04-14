@@ -16,11 +16,13 @@ struct vlan_hdr {
 /*
  * Parse Ethernet header, handling one level of VLAN tagging.
  * Returns the EtherType of the inner protocol and updates l3_offset.
- * If vlan_id is non-NULL, writes the extracted VLAN ID (0 if untagged).
+ * If vlan_id is non-NULL, writes the extracted VLAN ID (0 if untagged or
+ * priority-tagged). If vlan_present is non-NULL, writes 1 when an 802.1Q/ad
+ * header was present on ingress, including priority-tagged frames with VID 0.
  */
 static __always_inline int
 parse_ethhdr(void *data, void *data_end, __u16 *l3_offset, __u16 *eth_proto,
-	     __u16 *vlan_id, __u8 *vlan_pcp)
+	     __u16 *vlan_id, __u8 *vlan_pcp, __u8 *vlan_present)
 {
 	struct ethhdr *eth = data;
 
@@ -33,6 +35,8 @@ parse_ethhdr(void *data, void *data_end, __u16 *l3_offset, __u16 *eth_proto,
 		*vlan_id = 0;
 	if (vlan_pcp)
 		*vlan_pcp = 0;
+	if (vlan_present)
+		*vlan_present = 0;
 
 	/* Handle one level of VLAN */
 	if (*eth_proto == ETH_P_8021Q || *eth_proto == ETH_P_8021AD) {
@@ -46,6 +50,8 @@ parse_ethhdr(void *data, void *data_end, __u16 *l3_offset, __u16 *eth_proto,
 			if (vlan_pcp)
 				*vlan_pcp = (vlan_tci >> 13) & 0x07;
 		}
+		if (vlan_present)
+			*vlan_present = 1;
 		*eth_proto = bpf_ntohs(vlan->h_vlan_encapsulated_proto);
 		*l3_offset += sizeof(struct vlan_hdr);
 	}
