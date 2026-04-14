@@ -102,6 +102,8 @@ pub(crate) struct CoSSchedulerSnapshot {
     pub name: String,
     #[serde(rename = "transmit_rate_bytes", default)]
     pub transmit_rate_bytes: u64,
+    #[serde(rename = "transmit_rate_exact", default)]
+    pub transmit_rate_exact: bool,
     #[serde(default)]
     pub priority: String,
     #[serde(rename = "buffer_size_bytes", default)]

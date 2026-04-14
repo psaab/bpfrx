@@ -88,6 +88,7 @@ func TestCompileClassOfServiceSetSyntax(t *testing.T) {
 	lines := []string{
 		"set class-of-service forwarding-classes queue 0 best-effort",
 		"set class-of-service schedulers be-sched transmit-rate 5g",
+		"set class-of-service schedulers be-sched transmit-rate exact",
 		"set class-of-service schedulers be-sched priority low",
 		"set class-of-service schedulers be-sched buffer-size 8m",
 		"set class-of-service scheduler-maps edge-map forwarding-class best-effort scheduler be-sched",
@@ -119,6 +120,41 @@ func TestCompileClassOfServiceSetSyntax(t *testing.T) {
 	}
 	if got := unit.SchedulerMap; got != "edge-map" {
 		t.Fatalf("scheduler-map = %q, want edge-map", got)
+	}
+	if !cfg.ClassOfService.Schedulers["be-sched"].TransmitRateExact {
+		t.Fatal("expected be-sched transmit-rate exact")
+	}
+}
+
+func TestCompileClassOfServiceInlineTransmitRateExactSyntax(t *testing.T) {
+	lines := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service schedulers be-sched transmit-rate 5g exact",
+		"set system dataplane-type userspace",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	sched := cfg.ClassOfService.Schedulers["be-sched"]
+	if sched == nil {
+		t.Fatal("expected be-sched scheduler")
+	}
+	if got := sched.TransmitRateBytes; got != parseBandwidthLimit("5g") {
+		t.Fatalf("transmit-rate = %d, want %d", got, parseBandwidthLimit("5g"))
+	}
+	if !sched.TransmitRateExact {
+		t.Fatal("expected inline transmit-rate exact")
 	}
 }
 
