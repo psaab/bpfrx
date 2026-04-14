@@ -19,9 +19,12 @@ pub(super) fn enqueue_pending_forwards(
 ) {
     let ingress_area = ingress_binding.umem.area() as *const MmapArea;
     post_recycles.clear();
-    for request in pending_forwards.drain(..) {
+    for mut request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
+        if request.cos_queue_id.is_none() {
+            request.cos_queue_id = resolve_pending_forward_cos_queue_id(forwarding, &request);
+        }
 
         // Fast path: prebuilt frame (e.g. ICMP error NAT reversal).
         // The frame is already fully rewritten — just enqueue for TX.
@@ -46,6 +49,8 @@ pub(super) fn enqueue_pending_forwards(
                 expected_addr_family: request.meta.addr_family,
                 expected_protocol: request.meta.protocol,
                 flow_key: None,
+                egress_ifindex: request.decision.resolution.egress_ifindex,
+                cos_queue_id: request.cos_queue_id,
             });
             bound_pending_tx_local(target_binding);
             dbg.enqueue_ok += 1;
@@ -152,6 +157,7 @@ pub(super) fn enqueue_pending_forwards(
                 request.apply_nat_on_fabric,
                 expected_ports,
                 request.flow_key.clone(),
+                request.cos_queue_id,
                 now_ns,
                 post_recycles,
             ) {
@@ -164,7 +170,7 @@ pub(super) fn enqueue_pending_forwards(
                 }
                 copied_source_frame = true;
                 if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE {
-                    let _ = drain_pending_tx(target_binding, now_ns, post_recycles);
+                    let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
                 }
             } else if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
                 source_frame,
@@ -208,6 +214,8 @@ pub(super) fn enqueue_pending_forwards(
                         expected_addr_family: request.meta.addr_family,
                         expected_protocol: request.meta.protocol,
                         flow_key: request.flow_key.clone(),
+                        egress_ifindex: request.decision.resolution.egress_ifindex,
+                        cos_queue_id: request.cos_queue_id,
                     });
                     bound_pending_tx_local(target_binding);
                     dbg.enqueue_ok += 1;
@@ -220,7 +228,7 @@ pub(super) fn enqueue_pending_forwards(
                 }
                 copied_source_frame = true;
                 if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
-                    let _ = drain_pending_tx(target_binding, now_ns, post_recycles);
+                    let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
                 }
             }
             // Track when segmentation was needed but returned None
@@ -286,6 +294,8 @@ pub(super) fn enqueue_pending_forwards(
                                     expected_addr_family: request.meta.addr_family,
                                     expected_protocol: request.meta.protocol,
                                     flow_key: request.flow_key.clone(),
+                                    egress_ifindex: request.decision.resolution.egress_ifindex,
+                                    cos_queue_id: request.cos_queue_id,
                                 });
                             bound_pending_tx_prepared(target_binding);
                             target_binding.pending_in_place_tx_packets += 1;
@@ -359,6 +369,8 @@ pub(super) fn enqueue_pending_forwards(
                                     expected_addr_family: request.meta.addr_family,
                                     expected_protocol: request.meta.protocol,
                                     flow_key: request.flow_key.clone(),
+                                    egress_ifindex: request.decision.resolution.egress_ifindex,
+                                    cos_queue_id: request.cos_queue_id,
                                 });
                                 bound_pending_tx_local(target_binding);
                                 dbg.enqueue_ok += 1;
@@ -392,7 +404,7 @@ pub(super) fn enqueue_pending_forwards(
                             || !target_binding.pending_tx_prepared.is_empty()
                             || !target_binding.pending_tx_local.is_empty())
                     {
-                        let _ = drain_pending_tx(target_binding, now_ns, post_recycles);
+                        let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
                         direct_tx_offset = target_binding.free_tx_frames.pop_front();
                     }
                     let mut direct_tx_fallback_reason = None;
@@ -491,6 +503,8 @@ pub(super) fn enqueue_pending_forwards(
                                         expected_addr_family: request.meta.addr_family,
                                         expected_protocol: request.meta.protocol,
                                         flow_key: request.flow_key.clone(),
+                                        egress_ifindex: request.decision.resolution.egress_ifindex,
+                                        cos_queue_id: request.cos_queue_id,
                                     });
                                 bound_pending_tx_prepared(target_binding);
                                 dbg.enqueue_ok += 1;
@@ -588,6 +602,8 @@ pub(super) fn enqueue_pending_forwards(
                                     expected_addr_family: request.meta.addr_family,
                                     expected_protocol: request.meta.protocol,
                                     flow_key: request.flow_key.clone(),
+                                    egress_ifindex: request.decision.resolution.egress_ifindex,
+                                    cos_queue_id: request.cos_queue_id,
                                 });
                                 bound_pending_tx_local(target_binding);
                                 dbg.enqueue_ok += 1;
@@ -609,7 +625,7 @@ pub(super) fn enqueue_pending_forwards(
             if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE
                 || target_binding.pending_tx_local.len() >= TX_BATCH_SIZE
             {
-                let _ = drain_pending_tx(target_binding, now_ns, post_recycles);
+                let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
             }
         }
         if !post_recycles.is_empty() {
@@ -764,6 +780,18 @@ pub(super) fn resolve_tx_binding_ifindex(forwarding: &ForwardingState, egress_if
         .map(|iface| iface.bind_ifindex)
         .filter(|ifindex| *ifindex > 0)
         .unwrap_or(egress_ifindex)
+}
+
+fn resolve_pending_forward_cos_queue_id(
+    forwarding: &ForwardingState,
+    request: &PendingForwardRequest,
+) -> Option<u8> {
+    resolve_cos_queue_id(
+        forwarding,
+        request.decision.resolution.egress_ifindex,
+        request.meta,
+        request.flow_key.as_ref(),
+    )
 }
 
 pub(super) fn maybe_reinject_slow_path(
@@ -971,6 +999,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
     flow_key: Option<SessionKey>,
+    cos_queue_id: Option<u8>,
     now_ns: u64,
     post_recycles: &mut Vec<(u32, u64)>,
 ) -> Option<(u32, u64, u32)> {
@@ -1040,7 +1069,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
             || !target_binding.pending_tx_prepared.is_empty()
             || !target_binding.pending_tx_local.is_empty())
     {
-        let _ = drain_pending_tx(target_binding, now_ns, post_recycles);
+        let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
     }
     if target_binding.free_tx_frames.len() < segment_count {
         return None;
@@ -1216,6 +1245,8 @@ fn segment_forwarded_tcp_frames_into_prepared(
             expected_addr_family: meta.addr_family,
             expected_protocol: meta.protocol,
             flow_key: flow_key.clone(),
+            egress_ifindex: decision.resolution.egress_ifindex,
+            cos_queue_id,
         });
         total_bytes += frame_len as u64;
         max_frame = max_frame.max(frame_len as u32);

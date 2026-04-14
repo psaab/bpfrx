@@ -222,6 +222,13 @@ pub(super) fn build_local_origin_tunnel_tx_request(
             expected_addr_family: 0,
             expected_protocol: 0,
             flow_key: None,
+            egress_ifindex: decision.resolution.egress_ifindex,
+            cos_queue_id: resolve_cos_queue_id(
+                forwarding,
+                decision.resolution.egress_ifindex,
+                meta,
+                None,
+            ),
         },
         session_entry,
         reverse_session_entry,
@@ -439,31 +446,31 @@ mod tests {
 
     #[test]
     fn local_tunnel_io_error_is_fatal_for_permanent_tunnel_fd_errors() {
-        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
-            libc::EINVAL,
-        )));
-        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
-            libc::EBADF,
-        )));
-        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
-            libc::EBADFD,
-        )));
-        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
-            libc::ENODEV,
-        )));
-        assert!(local_tunnel_io_error_is_fatal(&io::Error::from_raw_os_error(
-            libc::ENXIO,
-        )));
+        assert!(local_tunnel_io_error_is_fatal(
+            &io::Error::from_raw_os_error(libc::EINVAL,)
+        ));
+        assert!(local_tunnel_io_error_is_fatal(
+            &io::Error::from_raw_os_error(libc::EBADF,)
+        ));
+        assert!(local_tunnel_io_error_is_fatal(
+            &io::Error::from_raw_os_error(libc::EBADFD,)
+        ));
+        assert!(local_tunnel_io_error_is_fatal(
+            &io::Error::from_raw_os_error(libc::ENODEV,)
+        ));
+        assert!(local_tunnel_io_error_is_fatal(
+            &io::Error::from_raw_os_error(libc::ENXIO,)
+        ));
     }
 
     #[test]
     fn local_tunnel_io_error_is_not_fatal_for_retryable_io() {
-        assert!(!local_tunnel_io_error_is_fatal(
-            &io::Error::from(io::ErrorKind::WouldBlock),
-        ));
-        assert!(!local_tunnel_io_error_is_fatal(
-            &io::Error::from(io::ErrorKind::Interrupted),
-        ));
+        assert!(!local_tunnel_io_error_is_fatal(&io::Error::from(
+            io::ErrorKind::WouldBlock
+        ),));
+        assert!(!local_tunnel_io_error_is_fatal(&io::Error::from(
+            io::ErrorKind::Interrupted
+        ),));
         assert!(!local_tunnel_io_error_is_fatal(
             &io::Error::from_raw_os_error(libc::ETIMEDOUT),
         ));

@@ -23,13 +23,13 @@ Last updated: 2026-04-13
 | VPN Enhancements | 9 | 0 | 0 | 9 |
 | HA Enhancements | 0 | 2 | 0 | 2 |
 | Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
-| QoS / Class of Service | 7 | 1 | 0 | 8 |
+| QoS / Class of Service | 2 | 4 | 0 | 6 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
 | Management & Automation | 12 | 2 | 0 | 14 |
 | Interface Enhancements | 1 | 1 | 0 | 2 |
 | System Enhancements | 5 | 0 | 0 | 5 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **124** | **14** | **1** | **139** |
+| **TOTAL** | **119** | **17** | **1** | **137** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -322,18 +322,18 @@ xpf has firewall filters with source/dest addresses, prefix-lists (with except),
 
 ## 18. QoS / Class of Service
 
-Note: The vSRX deployment guide markets CoS as part of the standard feature set, but the user guide also calls out important CoS limitations on vSRX, such as the lack of high-priority SPC queue support. xpf currently has filter-based DSCP and forwarding-class plumbing, but not the fuller classifier/scheduler/shaper model.
+Note: The vSRX deployment guide markets CoS as part of the standard feature set, but the user guide also calls out important CoS limitations on vSRX, such as the lack of high-priority SPC queue support. xpf now has a userspace-only Phase 1 CoS path with forwarding-class parsing, scheduler-map binding, interface shaping, and FIFO-per-class scheduling, but it is still materially narrower than Junos CoS.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Forwarding Classes** | `class-of-service forwarding-classes class ...` | Define custom forwarding class names mapped to queue numbers | Low | Missing |
-| **Scheduler Maps** | `class-of-service scheduler-maps ...` | Associate forwarding classes with schedulers (bandwidth %, priority, buffer) | Low | Missing |
-| **Schedulers** | `class-of-service schedulers ...` | Define per-queue scheduling parameters (transmit rate, priority, drop profile) | Low | Missing |
+| **Forwarding Classes** | `class-of-service forwarding-classes queue <num> <name>;` | Define custom forwarding class names mapped to queue numbers | Low | Done |
+| **Scheduler Maps** | `class-of-service scheduler-maps ...` | Associate forwarding classes with schedulers (bandwidth %, priority, buffer) | Low | Done |
+| **Schedulers** | `class-of-service schedulers ...` | Define per-queue scheduling parameters (transmit rate, priority, drop profile) | Low | Partial (userspace Phase 1 supports transmit-rate, priority, and buffer-size, but not the fuller Junos scheduler/drop-profile model) |
 | **BA Classifiers** | `class-of-service classifiers dscp ...` | Classify incoming traffic by DSCP/802.1p into forwarding classes and loss priorities | Low | Missing |
 | **Rewrite Rules** | `class-of-service rewrite-rules dscp ...` | Rewrite outgoing DSCP/802.1p values. xpf has filter-based DSCP rewrite. | Low | Partial (via firewall filter forwarding-class action) |
 | **WRED Drop Profiles** | `class-of-service drop-profiles ...` | Weighted Random Early Detection congestion avoidance per queue | Low | Missing |
-| **Traffic Shaping** | `class-of-service interfaces ... shaping-rate ...` | Per-interface output rate shaping | Low | Missing |
-| **Interface CoS Binding** | `class-of-service interfaces ... scheduler-map ...` | Bind scheduler-map and classifiers to specific interfaces | Low | Missing |
+| **Traffic Shaping** | `class-of-service interfaces ... shaping-rate ...` | Per-interface output rate shaping | Low | Partial (userspace-only Phase 1 egress shaping with FIFO-per-class queues; not full Junos CoS parity) |
+| **Interface CoS Binding** | `class-of-service interfaces ... scheduler-map ...` | Bind scheduler-map and classifiers to specific interfaces | Low | Partial (scheduler-map binding works on userspace interfaces, but BA classifiers and broader CoS attachment semantics are still missing) |
 
 ---
 

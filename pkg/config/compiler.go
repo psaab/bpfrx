@@ -69,6 +69,12 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 			Applications:    make(map[string]*Application),
 			ApplicationSets: make(map[string]*ApplicationSet),
 		},
+		ClassOfService: &ClassOfServiceConfig{
+			ForwardingClasses: make(map[string]*CoSForwardingClass),
+			Schedulers:        make(map[string]*CoSScheduler),
+			SchedulerMaps:     make(map[string]*CoSSchedulerMap),
+			Interfaces:        make(map[string]*CoSInterface),
+		},
 	}
 
 	for _, node := range tree.Children {
@@ -100,6 +106,10 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 		case "firewall":
 			if err := compileFirewall(node, &cfg.Firewall); err != nil {
 				return nil, fmt.Errorf("firewall: %w", err)
+			}
+		case "class-of-service":
+			if err := compileClassOfService(node, cfg.ClassOfService); err != nil {
+				return nil, fmt.Errorf("class-of-service: %w", err)
 			}
 		case "services":
 			if err := compileServices(node, &cfg.Services); err != nil {
@@ -556,6 +566,57 @@ func ValidateConfig(cfg *Config) []string {
 			for _, tmpl := range fm.VersionIPFIX.Templates {
 				checkExtWarning("version-ipfix", tmpl.Name, tmpl.ExportExtensions)
 			}
+		}
+	}
+
+	if cos := cfg.ClassOfService; cos != nil {
+		for _, class := range cos.ForwardingClasses {
+			if class == nil {
+				continue
+			}
+			if class.Queue < 0 || class.Queue > 255 {
+				warnings = append(warnings, fmt.Sprintf(
+					"class-of-service forwarding-class %q uses out-of-range queue %d (expected 0..255)",
+					class.Name, class.Queue))
+			}
+		}
+		for _, schedMap := range cos.SchedulerMaps {
+			if schedMap == nil {
+				continue
+			}
+			for className, entry := range schedMap.Entries {
+				if _, ok := cos.ForwardingClasses[className]; !ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"class-of-service scheduler-map %q references undefined forwarding-class %q",
+						schedMap.Name, className))
+				}
+				if entry == nil || entry.Scheduler == "" {
+					continue
+				}
+				if _, ok := cos.Schedulers[entry.Scheduler]; !ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"class-of-service scheduler-map %q references undefined scheduler %q",
+						schedMap.Name, entry.Scheduler))
+				}
+			}
+		}
+		for _, iface := range cos.Interfaces {
+			if iface == nil {
+				continue
+			}
+			for _, unit := range iface.Units {
+				if unit == nil || unit.SchedulerMap == "" {
+					continue
+				}
+				if _, ok := cos.SchedulerMaps[unit.SchedulerMap]; !ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"class-of-service interface %s unit %d references undefined scheduler-map %q",
+						iface.Name, unit.Unit, unit.SchedulerMap))
+				}
+			}
+		}
+		if len(cos.Interfaces) > 0 && cfg.System.DataplaneType != "userspace" {
+			warnings = append(warnings, "class-of-service shaping is only implemented in the userspace dataplane; configuration is accepted but will not take effect on this dataplane")
 		}
 	}
 

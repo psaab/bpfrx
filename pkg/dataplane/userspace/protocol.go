@@ -61,6 +61,7 @@ type ConfigSnapshot struct {
 	Screens         []ScreenProfileSnapshot      `json:"screens,omitempty"`
 	Filters         []FirewallFilterSnapshot     `json:"filters,omitempty"`
 	Policers        []PolicerSnapshot            `json:"policers,omitempty"`
+	ClassOfService  *ClassOfServiceSnapshot      `json:"class_of_service,omitempty"`
 	FlowExport      *FlowExportSnapshot          `json:"flow_export,omitempty"`
 	Config          *config.Config               `json:"config,omitempty"`
 	Userspace       config.UserspaceConfig       `json:"userspace"`
@@ -115,6 +116,37 @@ type InterfaceSnapshot struct {
 	Addresses       []InterfaceAddressSnapshot `json:"addresses,omitempty"`
 	FilterInputV4   string                     `json:"filter_input_v4,omitempty"`
 	FilterInputV6   string                     `json:"filter_input_v6,omitempty"`
+	CoSShapingRateBytesPerSec uint64                     `json:"cos_shaping_rate_bytes_per_sec,omitempty"`
+	CoSBurstSize             uint64                     `json:"cos_shaping_burst_bytes,omitempty"`
+	CoSSchedulerMap          string                     `json:"cos_scheduler_map,omitempty"`
+}
+
+type ClassOfServiceSnapshot struct {
+	ForwardingClasses []CoSForwardingClassSnapshot `json:"forwarding_classes,omitempty"`
+	Schedulers        []CoSSchedulerSnapshot       `json:"schedulers,omitempty"`
+	SchedulerMaps     []CoSSchedulerMapSnapshot    `json:"scheduler_maps,omitempty"`
+}
+
+type CoSForwardingClassSnapshot struct {
+	Name  string `json:"name"`
+	Queue int    `json:"queue"`
+}
+
+type CoSSchedulerSnapshot struct {
+	Name              string `json:"name"`
+	TransmitRateBytes uint64 `json:"transmit_rate_bytes,omitempty"`
+	Priority          string `json:"priority,omitempty"`
+	BufferSizeBytes   uint64 `json:"buffer_size_bytes,omitempty"`
+}
+
+type CoSSchedulerMapSnapshot struct {
+	Name    string                         `json:"name"`
+	Entries []CoSSchedulerMapEntrySnapshot `json:"entries,omitempty"`
+}
+
+type CoSSchedulerMapEntrySnapshot struct {
+	ForwardingClass string `json:"forwarding_class"`
+	Scheduler       string `json:"scheduler,omitempty"`
 }
 
 type FabricSnapshot struct {
@@ -303,18 +335,18 @@ type NeighborSnapshot struct {
 }
 
 type UserspaceMapPins struct {
-	Ctrl         string `json:"ctrl,omitempty"`
-	Bindings     string `json:"bindings,omitempty"`
-	Heartbeat    string `json:"heartbeat,omitempty"`
-	XSK          string `json:"xsk,omitempty"`
-	LocalV4      string `json:"local_v4,omitempty"`
-	LocalV6      string `json:"local_v6,omitempty"`
-	Sessions     string `json:"sessions,omitempty"`
-	ConntrackV4  string `json:"conntrack_v4,omitempty"`
-	ConntrackV6  string `json:"conntrack_v6,omitempty"`
-	DnatTable    string `json:"dnat_table,omitempty"`
-	DnatTableV6  string `json:"dnat_table_v6,omitempty"`
-	Trace        string `json:"trace,omitempty"`
+	Ctrl        string `json:"ctrl,omitempty"`
+	Bindings    string `json:"bindings,omitempty"`
+	Heartbeat   string `json:"heartbeat,omitempty"`
+	XSK         string `json:"xsk,omitempty"`
+	LocalV4     string `json:"local_v4,omitempty"`
+	LocalV6     string `json:"local_v6,omitempty"`
+	Sessions    string `json:"sessions,omitempty"`
+	ConntrackV4 string `json:"conntrack_v4,omitempty"`
+	ConntrackV6 string `json:"conntrack_v6,omitempty"`
+	DnatTable   string `json:"dnat_table,omitempty"`
+	DnatTableV6 string `json:"dnat_table_v6,omitempty"`
+	Trace       string `json:"trace,omitempty"`
 }
 
 type UserspaceCapabilities struct {
@@ -354,10 +386,10 @@ type ProcessStatus struct {
 	LastResolution         *PacketResolution     `json:"last_resolution,omitempty"`
 	SlowPath               SlowPathStatus        `json:"slow_path,omitempty"`
 	LastCacheFlushAt       uint64                `json:"last_cache_flush_at,omitempty"` // monotonic secs (#312)
-	DataplaneMode          string                `json:"dataplane_mode,omitempty"`           // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
-	ConfiguredMode         string                `json:"configured_mode,omitempty"`          // Desired mode from config
-	EntryPrograms          map[int]string        `json:"entry_programs,omitempty"`           // ifindex -> attached XDP program name
-	FallbackCounters       map[string]uint64     `json:"fallback_counters,omitempty"`        // reason_name -> count
+	DataplaneMode          string                `json:"dataplane_mode,omitempty"`      // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
+	ConfiguredMode         string                `json:"configured_mode,omitempty"`     // Desired mode from config
+	EntryPrograms          map[int]string        `json:"entry_programs,omitempty"`      // ifindex -> attached XDP program name
+	FallbackCounters       map[string]uint64     `json:"fallback_counters,omitempty"`   // reason_name -> count
 }
 
 type HAStateUpdateRequest struct {
@@ -618,16 +650,16 @@ const EventFrameHeaderSize = 16
 
 // Event stream message types.
 const (
-	EventTypeSessionOpen     uint8 = 1
-	EventTypeSessionClose    uint8 = 2
-	EventTypeSessionUpdate   uint8 = 3
-	EventTypeAck             uint8 = 4 // daemon → helper
-	EventTypePause           uint8 = 5 // daemon → helper
-	EventTypeResume          uint8 = 6 // daemon → helper
-	EventTypeDrainRequest    uint8 = 7 // daemon → helper (target seq in header)
-	EventTypeDrainComplete   uint8 = 8 // helper → daemon
-	EventTypeFullResync      uint8 = 9  // helper → daemon
-	EventTypeKeepalive       uint8 = 10 // helper → daemon (idle heartbeat)
+	EventTypeSessionOpen   uint8 = 1
+	EventTypeSessionClose  uint8 = 2
+	EventTypeSessionUpdate uint8 = 3
+	EventTypeAck           uint8 = 4  // daemon → helper
+	EventTypePause         uint8 = 5  // daemon → helper
+	EventTypeResume        uint8 = 6  // daemon → helper
+	EventTypeDrainRequest  uint8 = 7  // daemon → helper (target seq in header)
+	EventTypeDrainComplete uint8 = 8  // helper → daemon
+	EventTypeFullResync    uint8 = 9  // helper → daemon
+	EventTypeKeepalive     uint8 = 10 // helper → daemon (idle heartbeat)
 )
 
 // Session event flag bits in the Flags byte of SessionOpen/Update/Close payloads.

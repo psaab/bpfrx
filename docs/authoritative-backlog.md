@@ -21,10 +21,10 @@ Use these sources in this order when there is disagreement:
 ### 1) vSRX parity gaps (from `docs/feature-gaps.md` row data)
 
 Row-level gap totals:
-- Missing: 124
-- Partial: 14
+- Missing: 119
+- Partial: 17
 - Parse-Only: 1
-- Total Open Gaps: 139
+- Total Open Gaps: 137
 
 Category totals:
 
@@ -47,7 +47,7 @@ Category totals:
 | 15. VPN Enhancements | 9 | 0 | 0 | 9 |
 | 16. HA Enhancements | 0 | 2 | 0 | 2 |
 | 17. Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
-| 18. QoS / Class of Service | 7 | 1 | 0 | 8 |
+| 18. QoS / Class of Service | 2 | 4 | 0 | 6 |
 | 19. Multi-Tenancy | 4 | 0 | 0 | 4 |
 | 20. Management & Automation | 12 | 2 | 0 | 14 |
 | 21. Interface Enhancements | 1 | 1 | 0 | 2 |
