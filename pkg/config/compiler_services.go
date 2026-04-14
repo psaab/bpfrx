@@ -381,7 +381,7 @@ func compileFlowMonitoring(node *Node, svc *ServicesConfig) error {
 func rejectUnsupportedFlowExportExtensions(kind, name string, exts []string) error {
 	for _, ext := range exts {
 		if ext == "app-id" {
-			return fmt.Errorf("services flow-monitoring %s template %s: export-extension app-id unsupported", kind, name)
+			return fmt.Errorf("services flow-monitoring %s template %q: export-extension app-id unsupported", kind, name)
 		}
 	}
 	return nil

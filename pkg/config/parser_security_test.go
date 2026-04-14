@@ -1031,6 +1031,9 @@ func TestV9ExportExtensions(t *testing.T) {
 	if len(tmpl2.ExportExtensions) != 2 {
 		t.Fatalf("set syntax: expected 2 extensions, got %d: %v", len(tmpl2.ExportExtensions), tmpl2.ExportExtensions)
 	}
+	if tmpl2.ExportExtensions[0] != "flow-dir" || tmpl2.ExportExtensions[1] != "flow-dir" {
+		t.Fatalf("set syntax: expected both extensions to be flow-dir, got %v", tmpl2.ExportExtensions)
+	}
 }
 
 func TestIPFIXExportExtensionsRejectUnsupportedAppID(t *testing.T) {
