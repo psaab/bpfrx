@@ -146,6 +146,10 @@ pub(crate) struct FilterState {
     pub(crate) iface_filter_v4: rustc_hash::FxHashMap<i32, String>,
     /// Per-interface (ifindex) input filter name for inet6.
     pub(crate) iface_filter_v6: rustc_hash::FxHashMap<i32, String>,
+    /// Per-interface (ifindex) output filter name for inet.
+    pub(crate) iface_filter_out_v4: rustc_hash::FxHashMap<i32, String>,
+    /// Per-interface (ifindex) output filter name for inet6.
+    pub(crate) iface_filter_out_v6: rustc_hash::FxHashMap<i32, String>,
     /// lo0 inet input filter name.
     pub(crate) lo0_filter_v4: String,
     /// lo0 inet6 input filter name.
@@ -251,6 +255,36 @@ pub(crate) fn evaluate_interface_filter(
         state.iface_filter_v6.get(&ifindex)
     } else {
         state.iface_filter_v4.get(&ifindex)
+    };
+    let Some(filter_name) = filter_name else {
+        return FilterResult::default();
+    };
+    if filter_name.is_empty() {
+        return FilterResult::default();
+    }
+    let family = if is_v6 { "inet6" } else { "inet" };
+    let key = format!("{family}:{filter_name}");
+    evaluate_filter(
+        state, &key, src_ip, dst_ip, protocol, src_port, dst_port, dscp,
+    )
+}
+
+/// Evaluate the per-interface output filter for a given address family.
+pub(crate) fn evaluate_interface_output_filter(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+) -> FilterResult {
+    let filter_name = if is_v6 {
+        state.iface_filter_out_v6.get(&ifindex)
+    } else {
+        state.iface_filter_out_v4.get(&ifindex)
     };
     let Some(filter_name) = filter_name else {
         return FilterResult::default();
@@ -375,10 +409,20 @@ pub(crate) fn parse_filter_state(
                 .iface_filter_v4
                 .insert(iface.ifindex, iface.filter_input_v4.clone());
         }
+        if !iface.filter_output_v4.is_empty() {
+            state
+                .iface_filter_out_v4
+                .insert(iface.ifindex, iface.filter_output_v4.clone());
+        }
         if !iface.filter_input_v6.is_empty() {
             state
                 .iface_filter_v6
                 .insert(iface.ifindex, iface.filter_input_v6.clone());
+        }
+        if !iface.filter_output_v6.is_empty() {
+            state
+                .iface_filter_out_v6
+                .insert(iface.ifindex, iface.filter_output_v6.clone());
         }
     }
 
@@ -905,6 +949,8 @@ mod tests {
             ifindex: 5,
             filter_input_v4: "protect-RE".into(),
             filter_input_v6: "protect-RE-v6".into(),
+            filter_output_v4: "egress-v4".into(),
+            filter_output_v6: "egress-v6".into(),
             ..Default::default()
         }];
         let state = parse_filter_state(
@@ -924,6 +970,30 @@ mod tests {
                     terms: vec![FirewallTermSnapshot {
                         name: "deny-all".into(),
                         action: "discard".into(),
+                        ..Default::default()
+                    }],
+                },
+                FirewallFilterSnapshot {
+                    name: "egress-v4".into(),
+                    family: "inet".into(),
+                    terms: vec![FirewallTermSnapshot {
+                        name: "classify".into(),
+                        action: "accept".into(),
+                        forwarding_class: "bandwidth-10mb".into(),
+                        protocols: vec!["tcp".into()],
+                        destination_ports: vec!["5201".into()],
+                        ..Default::default()
+                    }],
+                },
+                FirewallFilterSnapshot {
+                    name: "egress-v6".into(),
+                    family: "inet6".into(),
+                    terms: vec![FirewallTermSnapshot {
+                        name: "classify".into(),
+                        action: "accept".into(),
+                        forwarding_class: "bandwidth-10mb".into(),
+                        protocols: vec!["tcp".into()],
+                        destination_ports: vec!["5201".into()],
                         ..Default::default()
                     }],
                 },
@@ -960,6 +1030,19 @@ mod tests {
             0,
         );
         assert_eq!(result.action, FilterAction::Accept);
+
+        let result = evaluate_interface_output_filter(
+            &state,
+            5,
+            false,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            PROTO_TCP,
+            1234,
+            5201,
+            0,
+        );
+        assert_eq!(result.forwarding_class.as_ref(), "bandwidth-10mb");
     }
 
     #[test]

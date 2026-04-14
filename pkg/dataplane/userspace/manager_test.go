@@ -2612,6 +2612,47 @@ func TestBuildInterfaceSnapshotSetsTunnelFlag(t *testing.T) {
 	}
 }
 
+func TestBuildInterfaceSnapshotIncludesInputAndOutputFilters(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+		"ge-0-0-0": {
+			Name: "ge-0-0-0",
+			Units: map[int]*config.InterfaceUnit{
+				0: {
+					FilterInputV4:  "ingress-v4",
+					FilterOutputV4: "egress-v4",
+					FilterInputV6:  "ingress-v6",
+					FilterOutputV6: "egress-v6",
+				},
+			},
+		},
+	}
+
+	snaps := buildInterfaceSnapshots(cfg)
+	var unitSnap *InterfaceSnapshot
+	for i := range snaps {
+		if snaps[i].Name == "ge-0-0-0.0" {
+			unitSnap = &snaps[i]
+			break
+		}
+	}
+	if unitSnap == nil {
+		t.Fatal("ge-0-0-0.0 snapshot not found")
+	}
+	if unitSnap.FilterInputV4 != "ingress-v4" {
+		t.Fatalf("FilterInputV4 = %q, want ingress-v4", unitSnap.FilterInputV4)
+	}
+	if unitSnap.FilterOutputV4 != "egress-v4" {
+		t.Fatalf("FilterOutputV4 = %q, want egress-v4", unitSnap.FilterOutputV4)
+	}
+	if unitSnap.FilterInputV6 != "ingress-v6" {
+		t.Fatalf("FilterInputV6 = %q, want ingress-v6", unitSnap.FilterInputV6)
+	}
+	if unitSnap.FilterOutputV6 != "egress-v6" {
+		t.Fatalf("FilterOutputV6 = %q, want egress-v6", unitSnap.FilterOutputV6)
+	}
+}
+
 func TestBuildScreenSnapshotsIncludesAdvancedFields(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{

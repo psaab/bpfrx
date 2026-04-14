@@ -62,8 +62,12 @@ pub(crate) struct InterfaceSnapshot {
     pub addresses: Vec<InterfaceAddressSnapshot>,
     #[serde(rename = "filter_input_v4", default)]
     pub filter_input_v4: String,
+    #[serde(rename = "filter_output_v4", default)]
+    pub filter_output_v4: String,
     #[serde(rename = "filter_input_v6", default)]
     pub filter_input_v6: String,
+    #[serde(rename = "filter_output_v6", default)]
+    pub filter_output_v6: String,
     #[serde(
         rename = "cos_shaping_rate_bytes_per_sec",
         alias = "cos_shaping_rate_bps",

@@ -305,26 +305,28 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			ifindex, mtu, hardwareAddr, addresses := buildLinkSnapshot(linuxUnit)
 			addresses = mergeInterfaceAddressSnapshots(addresses, buildConfiguredAddressSnapshots(unit.Addresses))
 			out = append(out, InterfaceSnapshot{
-				Name:            unitName,
-				Zone:            zoneByInterface[unitName],
-				LinuxName:       linuxUnit,
-				ParentLinuxName: parentLinux,
-				Ifindex:         ifindex,
-				ParentIfindex:   parentIfindex,
-				RXQueues:        userspaceRXQueueCount(linuxUnit),
-				VLANID:          unit.VlanID,
-				LocalFabric:     iface.LocalFabricMember,
-				RedundancyGroup: rg, // inherit resolved RG (RETH parent or own)
-				UnitCount:       0,
-				Tunnel:          iface.Tunnel != nil || unit.Tunnel != nil,
-				MTU:             mtu,
-				HardwareAddr:    hardwareAddr,
-				Addresses:       addresses,
-				FilterInputV4:   unit.FilterInputV4,
-				FilterInputV6:   unit.FilterInputV6,
+				Name:                      unitName,
+				Zone:                      zoneByInterface[unitName],
+				LinuxName:                 linuxUnit,
+				ParentLinuxName:           parentLinux,
+				Ifindex:                   ifindex,
+				ParentIfindex:             parentIfindex,
+				RXQueues:                  userspaceRXQueueCount(linuxUnit),
+				VLANID:                    unit.VlanID,
+				LocalFabric:               iface.LocalFabricMember,
+				RedundancyGroup:           rg, // inherit resolved RG (RETH parent or own)
+				UnitCount:                 0,
+				Tunnel:                    iface.Tunnel != nil || unit.Tunnel != nil,
+				MTU:                       mtu,
+				HardwareAddr:              hardwareAddr,
+				Addresses:                 addresses,
+				FilterInputV4:             unit.FilterInputV4,
+				FilterOutputV4:            unit.FilterOutputV4,
+				FilterInputV6:             unit.FilterInputV6,
+				FilterOutputV6:            unit.FilterOutputV6,
 				CoSShapingRateBytesPerSec: coSUnitShapingRate(cosUnit),
-				CoSBurstSize:             coSUnitBurstSize(cosUnit),
-				CoSSchedulerMap:          coSUnitSchedulerMap(cosUnit),
+				CoSBurstSize:              coSUnitBurstSize(cosUnit),
+				CoSSchedulerMap:           coSUnitSchedulerMap(cosUnit),
 			})
 		}
 	}
