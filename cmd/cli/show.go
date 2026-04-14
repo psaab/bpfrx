@@ -109,7 +109,11 @@ func (c *ctl) handleShow(args []string) error {
 
 	case "class-of-service":
 		if len(args) >= 2 && args[1] == "interface" {
-			return c.showText("class-of-service")
+			topic := "class-of-service"
+			if len(args) >= 3 {
+				topic += ":" + args[2]
+			}
+			return c.showText(topic)
 		}
 		printRemoteTreeHelp("show class-of-service:", "show", "class-of-service")
 		return nil

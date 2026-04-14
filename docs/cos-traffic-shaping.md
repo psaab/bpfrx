@@ -846,6 +846,18 @@ Required views:
 - container state
 - shard state for many-core debugging
 
+Currently implemented:
+
+- `show class-of-service interface [IFACE[.UNIT]]`
+- prints configured shaping rate, scheduler-map, attached CoS filters, and the
+  live userspace queue/runtime state that is currently exported by the helper
+
+Still planned:
+
+- reservation detail views
+- container detail views
+- shard detail views
+
 Examples:
 
 ```text

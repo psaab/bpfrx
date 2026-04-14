@@ -679,6 +679,7 @@ mod tests {
                 heartbeat: Arc::new(AtomicU64::new(0)),
                 commands: worker_commands.clone(),
                 session_export_ack: Arc::new(AtomicU64::new(0)),
+                cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
                 join: None,
             },
         );

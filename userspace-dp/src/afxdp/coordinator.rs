@@ -595,6 +595,7 @@ impl Coordinator {
             let stop = Arc::new(AtomicBool::new(false));
             let heartbeat = Arc::new(AtomicU64::new(monotonic_nanos()));
             let session_export_ack = Arc::new(AtomicU64::new(0));
+            let cos_status = Arc::new(ArcSwap::from_pointee(Vec::new()));
             let commands = worker_command_queues
                 .get(&worker_id)
                 .cloned()
@@ -625,6 +626,7 @@ impl Coordinator {
             let shared_fabrics = self.shared_fabrics.clone();
             let rg_epochs = self.rg_epochs.clone();
             let event_stream_handle = self.event_stream_worker_handle();
+            let cos_status_clone = cos_status.clone();
             let join = thread::Builder::new()
                 .name(format!("xpf-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -654,6 +656,7 @@ impl Coordinator {
                         shared_fabrics,
                         event_stream_handle,
                         rg_epochs,
+                        cos_status_clone,
                     );
                 });
             match join {
@@ -669,6 +672,7 @@ impl Coordinator {
                             heartbeat,
                             commands,
                             session_export_ack,
+                            cos_status,
                             join: Some(join),
                         },
                     );
@@ -832,6 +836,86 @@ impl Coordinator {
             .as_ref()
             .map(|slow| slow.status())
             .unwrap_or_else(|| self.last_slow_path_status.clone())
+    }
+
+    pub fn cos_statuses(&self) -> Vec<crate::protocol::CoSInterfaceStatus> {
+        let mut interfaces = BTreeMap::<i32, crate::protocol::CoSInterfaceStatus>::new();
+        let mut queue_maps = BTreeMap::<i32, BTreeMap<u8, crate::protocol::CoSQueueStatus>>::new();
+        for worker in self.workers.values() {
+            let snapshot = worker.cos_status.load();
+            for iface in snapshot.iter() {
+                let entry = interfaces.entry(iface.ifindex).or_default();
+                entry.ifindex = iface.ifindex;
+                if entry.interface_name.is_empty() {
+                    entry.interface_name = iface.interface_name.clone();
+                }
+                entry.shaping_rate_bytes = entry.shaping_rate_bytes.max(iface.shaping_rate_bytes);
+                entry.burst_bytes = entry.burst_bytes.max(iface.burst_bytes);
+                entry.worker_instances = entry
+                    .worker_instances
+                    .saturating_add(iface.worker_instances);
+                entry.timer_level0_sleepers = entry
+                    .timer_level0_sleepers
+                    .saturating_add(iface.timer_level0_sleepers);
+                entry.timer_level1_sleepers = entry
+                    .timer_level1_sleepers
+                    .saturating_add(iface.timer_level1_sleepers);
+                let queue_map = queue_maps.entry(iface.ifindex).or_default();
+                for queue in &iface.queues {
+                    let q = queue_map.entry(queue.queue_id).or_default();
+                    q.queue_id = queue.queue_id;
+                    if q.forwarding_class.is_empty() {
+                        q.forwarding_class = queue.forwarding_class.clone();
+                    }
+                    q.priority = q.priority.min(queue.priority);
+                    if q.worker_instances == 0 {
+                        q.priority = queue.priority;
+                    }
+                    q.exact = queue.exact;
+                    q.transmit_rate_bytes = q.transmit_rate_bytes.max(queue.transmit_rate_bytes);
+                    q.buffer_bytes = q.buffer_bytes.max(queue.buffer_bytes);
+                    q.worker_instances = q.worker_instances.saturating_add(queue.worker_instances);
+                    q.queued_packets = q.queued_packets.saturating_add(queue.queued_packets);
+                    q.queued_bytes = q.queued_bytes.saturating_add(queue.queued_bytes);
+                    q.runnable_instances = q
+                        .runnable_instances
+                        .saturating_add(queue.runnable_instances);
+                    q.parked_instances = q.parked_instances.saturating_add(queue.parked_instances);
+                    if q.next_wakeup_tick == 0
+                        || (queue.next_wakeup_tick > 0
+                            && queue.next_wakeup_tick < q.next_wakeup_tick)
+                    {
+                        q.next_wakeup_tick = queue.next_wakeup_tick;
+                    }
+                    q.surplus_deficit_bytes = q
+                        .surplus_deficit_bytes
+                        .saturating_add(queue.surplus_deficit_bytes);
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(interfaces.len());
+        for (ifindex, mut iface) in interfaces {
+            if let Some(queue_map) = queue_maps.remove(&ifindex) {
+                iface.queues = queue_map.into_values().collect();
+                iface.nonempty_queues = iface
+                    .queues
+                    .iter()
+                    .filter(|queue| queue.queued_packets > 0 || queue.queued_bytes > 0)
+                    .count();
+                iface.runnable_queues = iface
+                    .queues
+                    .iter()
+                    .filter(|queue| queue.runnable_instances > 0)
+                    .count();
+            }
+            out.push(iface);
+        }
+        out.sort_by(|a, b| {
+            a.interface_name
+                .cmp(&b.interface_name)
+                .then(a.ifindex.cmp(&b.ifindex))
+        });
+        out
     }
 
     pub fn drain_session_deltas(&self, max: usize) -> Vec<SessionDeltaInfo> {

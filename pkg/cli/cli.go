@@ -2562,7 +2562,11 @@ func (c *CLI) handleShowClassOfService(args []string) error {
 		cmdtree.PrintTreeHelp("show class-of-service:", operationalTree, "show", "class-of-service")
 		return nil
 	}
-	return c.showClassOfServiceInterface()
+	selector := ""
+	if len(args) > 1 {
+		selector = args[1]
+	}
+	return c.showClassOfServiceInterface(selector)
 }
 
 func (c *CLI) handleShowServices(args []string) error {

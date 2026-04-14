@@ -648,6 +648,8 @@ pub(crate) struct ProcessStatus {
     pub recent_session_deltas: Vec<SessionDeltaInfo>,
     #[serde(rename = "recent_exceptions", default)]
     pub recent_exceptions: Vec<ExceptionStatus>,
+    #[serde(rename = "cos_interfaces", default)]
+    pub cos_interfaces: Vec<CoSInterfaceStatus>,
     #[serde(rename = "last_resolution", skip_serializing_if = "Option::is_none")]
     pub last_resolution: Option<PacketResolution>,
     #[serde(rename = "slow_path", default)]
@@ -679,6 +681,60 @@ pub(crate) struct ProcessStatus {
     /// Monotonic timestamp (secs) of the last HA flow cache flush (#312).
     #[serde(rename = "last_cache_flush_at", default)]
     pub last_cache_flush_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct CoSInterfaceStatus {
+    #[serde(default)]
+    pub ifindex: i32,
+    #[serde(rename = "interface_name", default)]
+    pub interface_name: String,
+    #[serde(rename = "shaping_rate_bytes", default)]
+    pub shaping_rate_bytes: u64,
+    #[serde(rename = "burst_bytes", default)]
+    pub burst_bytes: u64,
+    #[serde(rename = "worker_instances", default)]
+    pub worker_instances: usize,
+    #[serde(rename = "nonempty_queues", default)]
+    pub nonempty_queues: usize,
+    #[serde(rename = "runnable_queues", default)]
+    pub runnable_queues: usize,
+    #[serde(rename = "timer_level0_sleepers", default)]
+    pub timer_level0_sleepers: usize,
+    #[serde(rename = "timer_level1_sleepers", default)]
+    pub timer_level1_sleepers: usize,
+    #[serde(default)]
+    pub queues: Vec<CoSQueueStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct CoSQueueStatus {
+    #[serde(rename = "queue_id", default)]
+    pub queue_id: u8,
+    #[serde(rename = "forwarding_class", default)]
+    pub forwarding_class: String,
+    #[serde(default)]
+    pub priority: u8,
+    #[serde(default)]
+    pub exact: bool,
+    #[serde(rename = "transmit_rate_bytes", default)]
+    pub transmit_rate_bytes: u64,
+    #[serde(rename = "buffer_bytes", default)]
+    pub buffer_bytes: u64,
+    #[serde(rename = "worker_instances", default)]
+    pub worker_instances: usize,
+    #[serde(rename = "queued_packets", default)]
+    pub queued_packets: u64,
+    #[serde(rename = "queued_bytes", default)]
+    pub queued_bytes: u64,
+    #[serde(rename = "runnable_instances", default)]
+    pub runnable_instances: usize,
+    #[serde(rename = "parked_instances", default)]
+    pub parked_instances: usize,
+    #[serde(rename = "next_wakeup_tick", default)]
+    pub next_wakeup_tick: u64,
+    #[serde(rename = "surplus_deficit_bytes", default)]
+    pub surplus_deficit_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

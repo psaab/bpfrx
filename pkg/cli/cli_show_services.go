@@ -3,10 +3,10 @@ package cli
 import (
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/rpm"
@@ -97,107 +97,13 @@ func (c *CLI) showDHCPClientIdentifier() error {
 	return nil
 }
 
-func (c *CLI) showClassOfServiceInterface() error {
+func (c *CLI) showClassOfServiceInterface(selector string) error {
 	cfg := c.store.ActiveConfig()
-	if cfg == nil {
-		fmt.Println("No active configuration")
-		return nil
+	var status *dpuserspace.ProcessStatus
+	if userspaceStatus, err := c.userspaceDataplaneStatus(); err == nil {
+		status = &userspaceStatus
 	}
-
-	// Collect interfaces with filter bindings
-	type ifBinding struct {
-		name     string
-		inputV4  string
-		outputV4 string
-		inputV6  string
-		outputV6 string
-	}
-	var bindings []ifBinding
-	for _, ifc := range cfg.Interfaces.Interfaces {
-		for _, unit := range ifc.Units {
-			b := ifBinding{name: ifc.Name}
-			b.inputV4 = unit.FilterInputV4
-			b.outputV4 = unit.FilterOutputV4
-			b.inputV6 = unit.FilterInputV6
-			b.outputV6 = unit.FilterOutputV6
-			if b.inputV4 != "" || b.outputV4 != "" || b.inputV6 != "" || b.outputV6 != "" {
-				bindings = append(bindings, b)
-			}
-		}
-	}
-
-	if len(bindings) == 0 {
-		fmt.Println("No interfaces with class-of-service configuration")
-		return nil
-	}
-
-	sort.Slice(bindings, func(i, j int) bool { return bindings[i].name < bindings[j].name })
-
-	for _, b := range bindings {
-		fmt.Printf("Interface: %s\n", b.name)
-		printFilterBinding := func(dir, family, filterName string) {
-			filters := cfg.Firewall.FiltersInet
-			if family == "inet6" {
-				filters = cfg.Firewall.FiltersInet6
-			}
-			f, ok := filters[filterName]
-			if !ok {
-				fmt.Printf("  %s filter (%s): %s (not found)\n", dir, family, filterName)
-				return
-			}
-			fmt.Printf("  %s filter (%s): %s\n", dir, family, filterName)
-			for _, term := range f.Terms {
-				var matchParts []string
-				if term.DSCP != "" {
-					matchParts = append(matchParts, "dscp "+term.DSCP)
-				}
-				if term.Protocol != "" {
-					matchParts = append(matchParts, "protocol "+term.Protocol)
-				}
-				if len(term.DestinationPorts) > 0 {
-					matchParts = append(matchParts, "port "+strings.Join(term.DestinationPorts, ","))
-				}
-				if term.ICMPType >= 0 {
-					matchParts = append(matchParts, fmt.Sprintf("icmp-type %d", term.ICMPType))
-				}
-				if term.ICMPCode >= 0 {
-					matchParts = append(matchParts, fmt.Sprintf("icmp-code %d", term.ICMPCode))
-				}
-				matchStr := "any"
-				if len(matchParts) > 0 {
-					matchStr = strings.Join(matchParts, " ")
-				}
-				action := term.Action
-				if action == "" {
-					action = "accept"
-				}
-				extras := ""
-				if term.ForwardingClass != "" {
-					extras += " forwarding-class " + term.ForwardingClass
-				}
-				if term.DSCPRewrite != "" {
-					extras += " dscp " + term.DSCPRewrite
-				}
-				if term.Log {
-					extras += " log"
-				}
-				fmt.Printf("    Term %s: match %s -> %s%s\n", term.Name, matchStr, action, extras)
-			}
-		}
-		if b.inputV4 != "" {
-			printFilterBinding("Input", "inet", b.inputV4)
-		}
-		if b.outputV4 != "" {
-			printFilterBinding("Output", "inet", b.outputV4)
-		}
-		if b.inputV6 != "" {
-			printFilterBinding("Input", "inet6", b.inputV6)
-		}
-		if b.outputV6 != "" {
-			printFilterBinding("Output", "inet6", b.outputV6)
-		}
-		fmt.Println()
-	}
+	fmt.Print(dpuserspace.FormatCoSInterfaceSummary(cfg, status, selector))
 	return nil
 }
 
