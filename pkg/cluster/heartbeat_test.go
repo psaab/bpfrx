@@ -7,9 +7,10 @@ import (
 
 func TestMarshalUnmarshalHeartbeat(t *testing.T) {
 	pkt := &HeartbeatPacket{
-		NodeID:          1,
-		ClusterID:       42,
-		SoftwareVersion: "bpfrx-test-1",
+		NodeID:            1,
+		ClusterID:         42,
+		SoftwareVersion:   "bpfrx-test-1",
+		HAProtocolVersion: CurrentHAProtocolVersion,
 		Groups: []HeartbeatGroup{
 			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
 			{GroupID: 1, Priority: 150, Weight: 100, State: uint8(StateSecondary)},
@@ -46,6 +47,9 @@ func TestMarshalUnmarshalHeartbeat(t *testing.T) {
 	if got.SoftwareVersion != "bpfrx-test-1" {
 		t.Errorf("software version = %q, want bpfrx-test-1", got.SoftwareVersion)
 	}
+	if got.HAProtocolVersion != CurrentHAProtocolVersion {
+		t.Errorf("ha protocol version = %d, want %d", got.HAProtocolVersion, CurrentHAProtocolVersion)
+	}
 }
 
 func TestMarshalUnmarshalHeartbeat_NoGroups(t *testing.T) {
@@ -60,6 +64,9 @@ func TestMarshalUnmarshalHeartbeat_NoGroups(t *testing.T) {
 	}
 	if len(got.Groups) != 0 {
 		t.Errorf("groups = %d, want 0", len(got.Groups))
+	}
+	if got.HAProtocolVersion != LegacyHAProtocolVersion {
+		t.Errorf("ha protocol version = %d, want legacy %d", got.HAProtocolVersion, LegacyHAProtocolVersion)
 	}
 }
 
@@ -116,7 +123,7 @@ func TestMarshalHeartbeat_Size(t *testing.T) {
 		},
 	}
 	data := MarshalHeartbeat(pkt)
-	expected := heartbeatHeaderSize + 2*heartbeatGroupSize + 1 // +1 for NumMonitors byte
+	expected := heartbeatHeaderSize + 2*heartbeatGroupSize + 1 + 2 // +1 NumMonitors, +2 HA protocol version
 	if len(data) != expected {
 		t.Errorf("size = %d, want %d", len(data), expected)
 	}
@@ -134,9 +141,10 @@ func TestHandlePeerHeartbeat(t *testing.T) {
 
 	// Simulate peer heartbeat.
 	pkt := &HeartbeatPacket{
-		NodeID:          1,
-		ClusterID:       1,
-		SoftwareVersion: "peer-test",
+		NodeID:            1,
+		ClusterID:         1,
+		SoftwareVersion:   "peer-test",
+		HAProtocolVersion: CurrentHAProtocolVersion,
 		Groups: []HeartbeatGroup{
 			{GroupID: 0, Priority: 100, Weight: 255, State: uint8(StateSecondary)},
 		},
@@ -156,8 +164,8 @@ func TestHandlePeerHeartbeat(t *testing.T) {
 	} else if pg.Priority != 100 {
 		t.Errorf("peer group 0 priority = %d, want 100", pg.Priority)
 	}
-	if mismatch, local, peer := m.SoftwareVersionMismatch(); !mismatch || local != "local-test" || peer != "peer-test" {
-		t.Fatalf("software mismatch = %v local=%q peer=%q, want true/local-test/peer-test", mismatch, local, peer)
+	if mismatch, local, peer := m.HAProtocolVersionMismatch(); mismatch || local != CurrentHAProtocolVersion || peer != CurrentHAProtocolVersion {
+		t.Fatalf("ha protocol mismatch = %v local=%d peer=%d, want false/%d/%d", mismatch, local, peer, CurrentHAProtocolVersion, CurrentHAProtocolVersion)
 	}
 }
 
@@ -274,6 +282,9 @@ func TestMarshalUnmarshalHeartbeat_NoMonitors_BackwardsCompat(t *testing.T) {
 	if got2.SoftwareVersion != "" {
 		t.Errorf("software version from old format = %q, want empty", got2.SoftwareVersion)
 	}
+	if got2.HAProtocolVersion != LegacyHAProtocolVersion {
+		t.Errorf("ha protocol version from old format = %d, want %d", got2.HAProtocolVersion, LegacyHAProtocolVersion)
+	}
 }
 
 func TestUnmarshalHeartbeat_TruncatedMonitor(t *testing.T) {
@@ -369,6 +380,9 @@ func TestMarshalHeartbeat_LargeMonitorPayload_RGPreserved(t *testing.T) {
 	}
 	if got.SoftwareVersion != "peer-build" {
 		t.Fatalf("software version = %q, want peer-build", got.SoftwareVersion)
+	}
+	if got.HAProtocolVersion != LegacyHAProtocolVersion {
+		t.Fatalf("ha protocol version = %d, want %d", got.HAProtocolVersion, LegacyHAProtocolVersion)
 	}
 
 	// RG groups must be intact.
@@ -470,7 +484,29 @@ func TestBuildHeartbeat(t *testing.T) {
 	if pkt.ClusterID != 1 {
 		t.Errorf("ClusterID = %d, want 1", pkt.ClusterID)
 	}
+	if pkt.HAProtocolVersion != CurrentHAProtocolVersion {
+		t.Errorf("HAProtocolVersion = %d, want %d", pkt.HAProtocolVersion, CurrentHAProtocolVersion)
+	}
 	if len(pkt.Groups) != 2 {
 		t.Fatalf("groups = %d, want 2", len(pkt.Groups))
+	}
+}
+
+func TestHandlePeerHeartbeat_LegacyHeartbeatDefaultsProtocolCompatibility(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(makeRG(0, true, map[int]int{0: 100, 1: 200}))
+	m.UpdateConfig(cfg)
+	<-m.Events()
+
+	m.handlePeerHeartbeat(&HeartbeatPacket{
+		NodeID:    1,
+		ClusterID: 1,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
+		},
+	})
+
+	if mismatch, local, peer := m.HAProtocolVersionMismatch(); mismatch || local != CurrentHAProtocolVersion || peer != LegacyHAProtocolVersion {
+		t.Fatalf("ha protocol mismatch = %v local=%d peer=%d, want false/%d/%d", mismatch, local, peer, CurrentHAProtocolVersion, LegacyHAProtocolVersion)
 	}
 }

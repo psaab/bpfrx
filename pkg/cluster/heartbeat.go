@@ -20,6 +20,16 @@ const (
 	// heartbeatVersion is the current protocol version.
 	heartbeatVersion = 1
 
+	// LegacyHAProtocolVersion is the compatibility version implicitly used by
+	// older heartbeats that predate explicit HA protocol advertisement.
+	LegacyHAProtocolVersion uint16 = 1
+
+	// CurrentHAProtocolVersion is the HA/session-transfer compatibility version
+	// used to decide whether mixed software builds can still hand off RGs. Bump
+	// this only when heartbeat/session-sync/failover wire semantics change in a
+	// way that breaks mixed-version interoperability.
+	CurrentHAProtocolVersion = LegacyHAProtocolVersion
+
 	// maxHeartbeatSize is the max packet size we'll read/write.
 	// 1472 = 1500 MTU - 20 IP header - 8 UDP header.
 	maxHeartbeatSize = 1472
@@ -56,15 +66,21 @@ const (
 //	  Optional SoftwareVersion:
 //	    [0] VersionLen
 //	    [1..1+VersionLen] Version bytes
+//	  Optional HAProtocolVersion:
+//	    [0:2] uint16 little-endian
 //
 // The trailing software-version field is optional; packets may end after the
-// monitor section, or may include the length-prefixed version bytes.
+// monitor section, or may include the length-prefixed version bytes. Newer
+// packets may also append a trailing HA protocol version; older readers ignore
+// those extra bytes, and newer readers treat a missing field as the legacy
+// protocol version.
 type HeartbeatPacket struct {
-	NodeID          uint8
-	ClusterID       uint16
-	Groups          []HeartbeatGroup
-	Monitors        []HeartbeatMonitor
-	SoftwareVersion string
+	NodeID            uint8
+	ClusterID         uint16
+	Groups            []HeartbeatGroup
+	Monitors          []HeartbeatMonitor
+	SoftwareVersion   string
+	HAProtocolVersion uint16
 }
 
 // HeartbeatGroup is a per-RG entry in the heartbeat.
@@ -91,6 +107,13 @@ const heartbeatGroupSize = 5
 
 const maxHeartbeatSoftwareVersionSize = 255
 
+func normalizeHAProtocolVersion(version uint16) uint16 {
+	if version == 0 {
+		return LegacyHAProtocolVersion
+	}
+	return version
+}
+
 // MarshalHeartbeat encodes a heartbeat packet to wire format.
 // The output is capped at maxHeartbeatSize. RG group entries are always
 // included (they are critical for election). When SoftwareVersion is present,
@@ -115,14 +138,14 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 	}
 
 	var version []byte
-	versionReserve := 0
+	versionReserve := 2 // preserve room for HA protocol version
 	if pkt.SoftwareVersion != "" {
 		version = []byte(pkt.SoftwareVersion)
 		if len(version) > maxHeartbeatSoftwareVersionSize {
 			version = version[:maxHeartbeatSoftwareVersionSize]
 		}
-		if off+1+len(version) <= maxHeartbeatSize {
-			versionReserve = 1 + len(version)
+		if off+1+len(version)+versionReserve <= maxHeartbeatSize {
+			versionReserve += 1 + len(version)
 		} else {
 			version = nil
 		}
@@ -159,6 +182,8 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 		copy(buf[off:off+len(version)], version)
 		off += len(version)
 	}
+	binary.LittleEndian.PutUint16(buf[off:off+2], normalizeHAProtocolVersion(pkt.HAProtocolVersion))
+	off += 2
 	return buf[:off]
 }
 
@@ -175,8 +200,9 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 	}
 
 	pkt := &HeartbeatPacket{
-		NodeID:    data[5],
-		ClusterID: binary.LittleEndian.Uint16(data[6:8]),
+		NodeID:            data[5],
+		ClusterID:         binary.LittleEndian.Uint16(data[6:8]),
+		HAProtocolVersion: LegacyHAProtocolVersion,
 	}
 
 	numGroups := int(data[8])
@@ -235,7 +261,11 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 		off++
 		if off+versionLen <= len(data) {
 			pkt.SoftwareVersion = string(data[off : off+versionLen])
+			off += versionLen
 		}
+	}
+	if off+2 <= len(data) {
+		pkt.HAProtocolVersion = normalizeHAProtocolVersion(binary.LittleEndian.Uint16(data[off : off+2]))
 	}
 
 	return pkt, nil

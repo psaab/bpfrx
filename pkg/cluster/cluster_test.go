@@ -1426,8 +1426,14 @@ func TestFormatStatusShowsSoftwareVersions(t *testing.T) {
 	if !strings.Contains(out, "Software version: local-build") {
 		t.Fatalf("status missing local software version: %s", out)
 	}
+	if !strings.Contains(out, "HA protocol version: 1") {
+		t.Fatalf("status missing local ha protocol version: %s", out)
+	}
 	if !strings.Contains(out, "Peer software version: peer-build") {
 		t.Fatalf("status missing peer software version: %s", out)
+	}
+	if !strings.Contains(out, "Peer HA protocol version: 1") {
+		t.Fatalf("status missing peer ha protocol version: %s", out)
 	}
 }
 
@@ -1448,6 +1454,12 @@ func TestFormatInformationShowsUnknownPeerSoftwareVersion(t *testing.T) {
 	out := m.FormatInformation()
 	if !strings.Contains(out, "Peer software version: unknown") {
 		t.Fatalf("information missing unknown peer software version: %s", out)
+	}
+	if !strings.Contains(out, "HA protocol version: 1") {
+		t.Fatalf("information missing local ha protocol version: %s", out)
+	}
+	if !strings.Contains(out, "Peer HA protocol version: 1") {
+		t.Fatalf("information missing peer ha protocol version: %s", out)
 	}
 }
 
