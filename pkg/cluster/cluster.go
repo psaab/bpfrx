@@ -496,12 +496,16 @@ func (m *Manager) HAProtocolVersions() (local, peer uint16) {
 }
 
 // HAProtocolVersionMismatch reports whether both sides advertised incompatible
-// HA/session-transfer versions. A missing peer field is interpreted as the
-// legacy compatibility version.
+// HA/session-transfer versions. When the peer is absent or has not yet
+// advertised a version, mismatch stays false so disconnect/readiness logic can
+// report the more accurate transport-state reason.
 func (m *Manager) HAProtocolVersionMismatch() (bool, uint16, uint16) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	local := normalizeHAProtocolVersion(m.localHAProtocolVersion)
+	if !m.peerAlive || m.peerHAProtocolVersion == 0 {
+		return false, local, 0
+	}
 	peer := normalizeHAProtocolVersion(m.peerHAProtocolVersion)
 	return local != peer, local, peer
 }

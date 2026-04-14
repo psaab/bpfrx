@@ -123,7 +123,7 @@ func TestMarshalHeartbeat_Size(t *testing.T) {
 		},
 	}
 	data := MarshalHeartbeat(pkt)
-	expected := heartbeatHeaderSize + 2*heartbeatGroupSize + 1 + 2 // +1 NumMonitors, +2 HA protocol version
+	expected := heartbeatHeaderSize + 2*heartbeatGroupSize + 1 + 1 + 2 // +1 NumMonitors, +1 version length, +2 HA protocol version
 	if len(data) != expected {
 		t.Errorf("size = %d, want %d", len(data), expected)
 	}
@@ -506,7 +506,39 @@ func TestHandlePeerHeartbeat_LegacyHeartbeatDefaultsProtocolCompatibility(t *tes
 		},
 	})
 
-	if mismatch, local, peer := m.HAProtocolVersionMismatch(); mismatch || local != CurrentHAProtocolVersion || peer != LegacyHAProtocolVersion {
-		t.Fatalf("ha protocol mismatch = %v local=%d peer=%d, want false/%d/%d", mismatch, local, peer, CurrentHAProtocolVersion, LegacyHAProtocolVersion)
+	mismatch, local, peer := m.HAProtocolVersionMismatch()
+	if local != CurrentHAProtocolVersion {
+		t.Fatalf("local ha protocol version = %d, want %d", local, CurrentHAProtocolVersion)
+	}
+	if peer != LegacyHAProtocolVersion {
+		t.Fatalf("peer ha protocol version = %d, want %d", peer, LegacyHAProtocolVersion)
+	}
+	wantMismatch := CurrentHAProtocolVersion != LegacyHAProtocolVersion
+	if mismatch != wantMismatch {
+		t.Fatalf("ha protocol mismatch = %v, want %v (local=%d peer=%d)", mismatch, wantMismatch, local, peer)
+	}
+}
+
+func TestUnmarshalHeartbeat_TruncatedVersionTrailerDoesNotParseHAProtocol(t *testing.T) {
+	pkt := &HeartbeatPacket{
+		NodeID:            1,
+		ClusterID:         5,
+		HAProtocolVersion: CurrentHAProtocolVersion,
+		Groups: []HeartbeatGroup{
+			{GroupID: 0, Priority: 100, Weight: 200, State: uint8(StateSecondary)},
+		},
+	}
+	data := MarshalHeartbeat(pkt)
+
+	// Remove the last HA protocol byte so the version trailer is incomplete.
+	got, err := UnmarshalHeartbeat(data[:len(data)-1])
+	if err != nil {
+		t.Fatalf("unmarshal truncated trailer: %v", err)
+	}
+	if got.SoftwareVersion != "" {
+		t.Fatalf("software version = %q, want empty", got.SoftwareVersion)
+	}
+	if got.HAProtocolVersion != LegacyHAProtocolVersion {
+		t.Fatalf("ha protocol version = %d, want legacy default %d", got.HAProtocolVersion, LegacyHAProtocolVersion)
 	}
 }
