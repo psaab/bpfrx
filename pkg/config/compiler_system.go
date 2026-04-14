@@ -1,6 +1,9 @@
 package config
 
-import "strconv"
+import (
+	"fmt"
+	"strconv"
+)
 
 func compileSystem(node *Node, sys *SystemConfig) error {
 	for _, child := range node.Children {
@@ -251,9 +254,15 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 			}
 		}
 		// DNS service
-		if svcNode.FindChild("dns") != nil {
+		if dnsNode := svcNode.FindChild("dns"); dnsNode != nil {
 			if sys.Services == nil {
 				sys.Services = &SystemServicesConfig{}
+			}
+			if dnsNode.FindChild("dns-proxy") != nil {
+				return fmt.Errorf("system services dns dns-proxy: unsupported")
+			}
+			if len(dnsNode.Children) > 0 {
+				return fmt.Errorf("system services dns: subconfiguration unsupported")
 			}
 			sys.Services.DNSEnabled = true
 		}

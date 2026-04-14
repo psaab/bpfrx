@@ -968,6 +968,29 @@ func TestDNSServiceEnabled(t *testing.T) {
 	}
 }
 
+func TestDNSProxyRejected(t *testing.T) {
+	input := `system {
+    services {
+        dns {
+            dns-proxy {
+                default-domain *;
+                forwarders {
+                    1.1.1.1;
+                }
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	if _, err := CompileConfig(tree); err == nil || !strings.Contains(err.Error(), "system services dns dns-proxy: unsupported") {
+		t.Fatalf("expected dns-proxy unsupported error, got %v", err)
+	}
+}
+
 func TestParseLoginClass(t *testing.T) {
 	input := `system {
     login {
