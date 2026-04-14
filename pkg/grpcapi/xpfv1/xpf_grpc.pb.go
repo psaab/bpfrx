@@ -138,15 +138,15 @@ type BpfrxServiceClient interface {
 	Complete(ctx context.Context, in *CompleteRequest, opts ...grpc.CallOption) (*CompleteResponse, error)
 }
 
-type xpfServiceClient struct {
+type bpfrxServiceClient struct {
 	cc grpc.ClientConnInterface
 }
 
 func NewBpfrxServiceClient(cc grpc.ClientConnInterface) BpfrxServiceClient {
-	return &xpfServiceClient{cc}
+	return &bpfrxServiceClient{cc}
 }
 
-func (c *xpfServiceClient) EnterConfigure(ctx context.Context, in *EnterConfigureRequest, opts ...grpc.CallOption) (*EnterConfigureResponse, error) {
+func (c *bpfrxServiceClient) EnterConfigure(ctx context.Context, in *EnterConfigureRequest, opts ...grpc.CallOption) (*EnterConfigureResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(EnterConfigureResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_EnterConfigure_FullMethodName, in, out, cOpts...)
@@ -156,7 +156,7 @@ func (c *xpfServiceClient) EnterConfigure(ctx context.Context, in *EnterConfigur
 	return out, nil
 }
 
-func (c *xpfServiceClient) ExitConfigure(ctx context.Context, in *ExitConfigureRequest, opts ...grpc.CallOption) (*ExitConfigureResponse, error) {
+func (c *bpfrxServiceClient) ExitConfigure(ctx context.Context, in *ExitConfigureRequest, opts ...grpc.CallOption) (*ExitConfigureResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ExitConfigureResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_ExitConfigure_FullMethodName, in, out, cOpts...)
@@ -166,7 +166,7 @@ func (c *xpfServiceClient) ExitConfigure(ctx context.Context, in *ExitConfigureR
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetConfigModeStatus(ctx context.Context, in *GetConfigModeStatusRequest, opts ...grpc.CallOption) (*GetConfigModeStatusResponse, error) {
+func (c *bpfrxServiceClient) GetConfigModeStatus(ctx context.Context, in *GetConfigModeStatusRequest, opts ...grpc.CallOption) (*GetConfigModeStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetConfigModeStatusResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetConfigModeStatus_FullMethodName, in, out, cOpts...)
@@ -176,7 +176,7 @@ func (c *xpfServiceClient) GetConfigModeStatus(ctx context.Context, in *GetConfi
 	return out, nil
 }
 
-func (c *xpfServiceClient) Set(ctx context.Context, in *SetRequest, opts ...grpc.CallOption) (*SetResponse, error) {
+func (c *bpfrxServiceClient) Set(ctx context.Context, in *SetRequest, opts ...grpc.CallOption) (*SetResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SetResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_Set_FullMethodName, in, out, cOpts...)
@@ -186,7 +186,7 @@ func (c *xpfServiceClient) Set(ctx context.Context, in *SetRequest, opts ...grpc
 	return out, nil
 }
 
-func (c *xpfServiceClient) Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error) {
+func (c *bpfrxServiceClient) Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DeleteResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_Delete_FullMethodName, in, out, cOpts...)
@@ -196,7 +196,7 @@ func (c *xpfServiceClient) Delete(ctx context.Context, in *DeleteRequest, opts .
 	return out, nil
 }
 
-func (c *xpfServiceClient) Load(ctx context.Context, in *LoadRequest, opts ...grpc.CallOption) (*LoadResponse, error) {
+func (c *bpfrxServiceClient) Load(ctx context.Context, in *LoadRequest, opts ...grpc.CallOption) (*LoadResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(LoadResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_Load_FullMethodName, in, out, cOpts...)
@@ -206,7 +206,7 @@ func (c *xpfServiceClient) Load(ctx context.Context, in *LoadRequest, opts ...gr
 	return out, nil
 }
 
-func (c *xpfServiceClient) Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error) {
+func (c *bpfrxServiceClient) Commit(ctx context.Context, in *CommitRequest, opts ...grpc.CallOption) (*CommitResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CommitResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_Commit_FullMethodName, in, out, cOpts...)
@@ -216,7 +216,7 @@ func (c *xpfServiceClient) Commit(ctx context.Context, in *CommitRequest, opts .
 	return out, nil
 }
 
-func (c *xpfServiceClient) CommitCheck(ctx context.Context, in *CommitCheckRequest, opts ...grpc.CallOption) (*CommitCheckResponse, error) {
+func (c *bpfrxServiceClient) CommitCheck(ctx context.Context, in *CommitCheckRequest, opts ...grpc.CallOption) (*CommitCheckResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CommitCheckResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_CommitCheck_FullMethodName, in, out, cOpts...)
@@ -226,7 +226,7 @@ func (c *xpfServiceClient) CommitCheck(ctx context.Context, in *CommitCheckReque
 	return out, nil
 }
 
-func (c *xpfServiceClient) CommitConfirmed(ctx context.Context, in *CommitConfirmedRequest, opts ...grpc.CallOption) (*CommitConfirmedResponse, error) {
+func (c *bpfrxServiceClient) CommitConfirmed(ctx context.Context, in *CommitConfirmedRequest, opts ...grpc.CallOption) (*CommitConfirmedResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CommitConfirmedResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_CommitConfirmed_FullMethodName, in, out, cOpts...)
@@ -236,7 +236,7 @@ func (c *xpfServiceClient) CommitConfirmed(ctx context.Context, in *CommitConfir
 	return out, nil
 }
 
-func (c *xpfServiceClient) ConfirmCommit(ctx context.Context, in *ConfirmCommitRequest, opts ...grpc.CallOption) (*ConfirmCommitResponse, error) {
+func (c *bpfrxServiceClient) ConfirmCommit(ctx context.Context, in *ConfirmCommitRequest, opts ...grpc.CallOption) (*ConfirmCommitResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ConfirmCommitResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_ConfirmCommit_FullMethodName, in, out, cOpts...)
@@ -246,7 +246,7 @@ func (c *xpfServiceClient) ConfirmCommit(ctx context.Context, in *ConfirmCommitR
 	return out, nil
 }
 
-func (c *xpfServiceClient) Rollback(ctx context.Context, in *RollbackRequest, opts ...grpc.CallOption) (*RollbackResponse, error) {
+func (c *bpfrxServiceClient) Rollback(ctx context.Context, in *RollbackRequest, opts ...grpc.CallOption) (*RollbackResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RollbackResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_Rollback_FullMethodName, in, out, cOpts...)
@@ -256,7 +256,7 @@ func (c *xpfServiceClient) Rollback(ctx context.Context, in *RollbackRequest, op
 	return out, nil
 }
 
-func (c *xpfServiceClient) ShowConfig(ctx context.Context, in *ShowConfigRequest, opts ...grpc.CallOption) (*ShowConfigResponse, error) {
+func (c *bpfrxServiceClient) ShowConfig(ctx context.Context, in *ShowConfigRequest, opts ...grpc.CallOption) (*ShowConfigResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ShowConfigResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_ShowConfig_FullMethodName, in, out, cOpts...)
@@ -266,7 +266,7 @@ func (c *xpfServiceClient) ShowConfig(ctx context.Context, in *ShowConfigRequest
 	return out, nil
 }
 
-func (c *xpfServiceClient) ShowCompare(ctx context.Context, in *ShowCompareRequest, opts ...grpc.CallOption) (*ShowCompareResponse, error) {
+func (c *bpfrxServiceClient) ShowCompare(ctx context.Context, in *ShowCompareRequest, opts ...grpc.CallOption) (*ShowCompareResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ShowCompareResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_ShowCompare_FullMethodName, in, out, cOpts...)
@@ -276,7 +276,7 @@ func (c *xpfServiceClient) ShowCompare(ctx context.Context, in *ShowCompareReque
 	return out, nil
 }
 
-func (c *xpfServiceClient) ShowRollback(ctx context.Context, in *ShowRollbackRequest, opts ...grpc.CallOption) (*ShowRollbackResponse, error) {
+func (c *bpfrxServiceClient) ShowRollback(ctx context.Context, in *ShowRollbackRequest, opts ...grpc.CallOption) (*ShowRollbackResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ShowRollbackResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_ShowRollback_FullMethodName, in, out, cOpts...)
@@ -286,7 +286,7 @@ func (c *xpfServiceClient) ShowRollback(ctx context.Context, in *ShowRollbackReq
 	return out, nil
 }
 
-func (c *xpfServiceClient) ListHistory(ctx context.Context, in *ListHistoryRequest, opts ...grpc.CallOption) (*ListHistoryResponse, error) {
+func (c *bpfrxServiceClient) ListHistory(ctx context.Context, in *ListHistoryRequest, opts ...grpc.CallOption) (*ListHistoryResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListHistoryResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_ListHistory_FullMethodName, in, out, cOpts...)
@@ -296,7 +296,7 @@ func (c *xpfServiceClient) ListHistory(ctx context.Context, in *ListHistoryReque
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetStatus(ctx context.Context, in *GetStatusRequest, opts ...grpc.CallOption) (*GetStatusResponse, error) {
+func (c *bpfrxServiceClient) GetStatus(ctx context.Context, in *GetStatusRequest, opts ...grpc.CallOption) (*GetStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetStatusResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetStatus_FullMethodName, in, out, cOpts...)
@@ -306,7 +306,7 @@ func (c *xpfServiceClient) GetStatus(ctx context.Context, in *GetStatusRequest, 
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetGlobalStats(ctx context.Context, in *GetGlobalStatsRequest, opts ...grpc.CallOption) (*GetGlobalStatsResponse, error) {
+func (c *bpfrxServiceClient) GetGlobalStats(ctx context.Context, in *GetGlobalStatsRequest, opts ...grpc.CallOption) (*GetGlobalStatsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetGlobalStatsResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetGlobalStats_FullMethodName, in, out, cOpts...)
@@ -316,7 +316,7 @@ func (c *xpfServiceClient) GetGlobalStats(ctx context.Context, in *GetGlobalStat
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetZones(ctx context.Context, in *GetZonesRequest, opts ...grpc.CallOption) (*GetZonesResponse, error) {
+func (c *bpfrxServiceClient) GetZones(ctx context.Context, in *GetZonesRequest, opts ...grpc.CallOption) (*GetZonesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetZonesResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetZones_FullMethodName, in, out, cOpts...)
@@ -326,7 +326,7 @@ func (c *xpfServiceClient) GetZones(ctx context.Context, in *GetZonesRequest, op
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetPolicies(ctx context.Context, in *GetPoliciesRequest, opts ...grpc.CallOption) (*GetPoliciesResponse, error) {
+func (c *bpfrxServiceClient) GetPolicies(ctx context.Context, in *GetPoliciesRequest, opts ...grpc.CallOption) (*GetPoliciesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetPoliciesResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetPolicies_FullMethodName, in, out, cOpts...)
@@ -336,7 +336,7 @@ func (c *xpfServiceClient) GetPolicies(ctx context.Context, in *GetPoliciesReque
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetSessions(ctx context.Context, in *GetSessionsRequest, opts ...grpc.CallOption) (*GetSessionsResponse, error) {
+func (c *bpfrxServiceClient) GetSessions(ctx context.Context, in *GetSessionsRequest, opts ...grpc.CallOption) (*GetSessionsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSessionsResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetSessions_FullMethodName, in, out, cOpts...)
@@ -346,7 +346,7 @@ func (c *xpfServiceClient) GetSessions(ctx context.Context, in *GetSessionsReque
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetSessionSummary(ctx context.Context, in *GetSessionSummaryRequest, opts ...grpc.CallOption) (*GetSessionSummaryResponse, error) {
+func (c *bpfrxServiceClient) GetSessionSummary(ctx context.Context, in *GetSessionSummaryRequest, opts ...grpc.CallOption) (*GetSessionSummaryResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSessionSummaryResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetSessionSummary_FullMethodName, in, out, cOpts...)
@@ -356,7 +356,7 @@ func (c *xpfServiceClient) GetSessionSummary(ctx context.Context, in *GetSession
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetNATSource(ctx context.Context, in *GetNATSourceRequest, opts ...grpc.CallOption) (*GetNATSourceResponse, error) {
+func (c *bpfrxServiceClient) GetNATSource(ctx context.Context, in *GetNATSourceRequest, opts ...grpc.CallOption) (*GetNATSourceResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetNATSourceResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetNATSource_FullMethodName, in, out, cOpts...)
@@ -366,7 +366,7 @@ func (c *xpfServiceClient) GetNATSource(ctx context.Context, in *GetNATSourceReq
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetNATDestination(ctx context.Context, in *GetNATDestinationRequest, opts ...grpc.CallOption) (*GetNATDestinationResponse, error) {
+func (c *bpfrxServiceClient) GetNATDestination(ctx context.Context, in *GetNATDestinationRequest, opts ...grpc.CallOption) (*GetNATDestinationResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetNATDestinationResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetNATDestination_FullMethodName, in, out, cOpts...)
@@ -376,7 +376,7 @@ func (c *xpfServiceClient) GetNATDestination(ctx context.Context, in *GetNATDest
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetScreen(ctx context.Context, in *GetScreenRequest, opts ...grpc.CallOption) (*GetScreenResponse, error) {
+func (c *bpfrxServiceClient) GetScreen(ctx context.Context, in *GetScreenRequest, opts ...grpc.CallOption) (*GetScreenResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetScreenResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetScreen_FullMethodName, in, out, cOpts...)
@@ -386,7 +386,7 @@ func (c *xpfServiceClient) GetScreen(ctx context.Context, in *GetScreenRequest, 
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetEvents(ctx context.Context, in *GetEventsRequest, opts ...grpc.CallOption) (*GetEventsResponse, error) {
+func (c *bpfrxServiceClient) GetEvents(ctx context.Context, in *GetEventsRequest, opts ...grpc.CallOption) (*GetEventsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetEventsResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetEvents_FullMethodName, in, out, cOpts...)
@@ -396,7 +396,7 @@ func (c *xpfServiceClient) GetEvents(ctx context.Context, in *GetEventsRequest, 
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetInterfaces(ctx context.Context, in *GetInterfacesRequest, opts ...grpc.CallOption) (*GetInterfacesResponse, error) {
+func (c *bpfrxServiceClient) GetInterfaces(ctx context.Context, in *GetInterfacesRequest, opts ...grpc.CallOption) (*GetInterfacesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetInterfacesResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetInterfaces_FullMethodName, in, out, cOpts...)
@@ -406,7 +406,7 @@ func (c *xpfServiceClient) GetInterfaces(ctx context.Context, in *GetInterfacesR
 	return out, nil
 }
 
-func (c *xpfServiceClient) ShowInterfacesDetail(ctx context.Context, in *ShowInterfacesDetailRequest, opts ...grpc.CallOption) (*ShowInterfacesDetailResponse, error) {
+func (c *bpfrxServiceClient) ShowInterfacesDetail(ctx context.Context, in *ShowInterfacesDetailRequest, opts ...grpc.CallOption) (*ShowInterfacesDetailResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ShowInterfacesDetailResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_ShowInterfacesDetail_FullMethodName, in, out, cOpts...)
@@ -416,7 +416,7 @@ func (c *xpfServiceClient) ShowInterfacesDetail(ctx context.Context, in *ShowInt
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetDHCPLeases(ctx context.Context, in *GetDHCPLeasesRequest, opts ...grpc.CallOption) (*GetDHCPLeasesResponse, error) {
+func (c *bpfrxServiceClient) GetDHCPLeases(ctx context.Context, in *GetDHCPLeasesRequest, opts ...grpc.CallOption) (*GetDHCPLeasesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetDHCPLeasesResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetDHCPLeases_FullMethodName, in, out, cOpts...)
@@ -426,7 +426,7 @@ func (c *xpfServiceClient) GetDHCPLeases(ctx context.Context, in *GetDHCPLeasesR
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetDHCPClientIdentifiers(ctx context.Context, in *GetDHCPClientIdentifiersRequest, opts ...grpc.CallOption) (*GetDHCPClientIdentifiersResponse, error) {
+func (c *bpfrxServiceClient) GetDHCPClientIdentifiers(ctx context.Context, in *GetDHCPClientIdentifiersRequest, opts ...grpc.CallOption) (*GetDHCPClientIdentifiersResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetDHCPClientIdentifiersResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetDHCPClientIdentifiers_FullMethodName, in, out, cOpts...)
@@ -436,7 +436,7 @@ func (c *xpfServiceClient) GetDHCPClientIdentifiers(ctx context.Context, in *Get
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetRoutes(ctx context.Context, in *GetRoutesRequest, opts ...grpc.CallOption) (*GetRoutesResponse, error) {
+func (c *bpfrxServiceClient) GetRoutes(ctx context.Context, in *GetRoutesRequest, opts ...grpc.CallOption) (*GetRoutesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetRoutesResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetRoutes_FullMethodName, in, out, cOpts...)
@@ -446,7 +446,7 @@ func (c *xpfServiceClient) GetRoutes(ctx context.Context, in *GetRoutesRequest, 
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetOSPFStatus(ctx context.Context, in *GetOSPFStatusRequest, opts ...grpc.CallOption) (*GetOSPFStatusResponse, error) {
+func (c *bpfrxServiceClient) GetOSPFStatus(ctx context.Context, in *GetOSPFStatusRequest, opts ...grpc.CallOption) (*GetOSPFStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetOSPFStatusResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetOSPFStatus_FullMethodName, in, out, cOpts...)
@@ -456,7 +456,7 @@ func (c *xpfServiceClient) GetOSPFStatus(ctx context.Context, in *GetOSPFStatusR
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetBGPStatus(ctx context.Context, in *GetBGPStatusRequest, opts ...grpc.CallOption) (*GetBGPStatusResponse, error) {
+func (c *bpfrxServiceClient) GetBGPStatus(ctx context.Context, in *GetBGPStatusRequest, opts ...grpc.CallOption) (*GetBGPStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetBGPStatusResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetBGPStatus_FullMethodName, in, out, cOpts...)
@@ -466,7 +466,7 @@ func (c *xpfServiceClient) GetBGPStatus(ctx context.Context, in *GetBGPStatusReq
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetRIPStatus(ctx context.Context, in *GetRIPStatusRequest, opts ...grpc.CallOption) (*GetRIPStatusResponse, error) {
+func (c *bpfrxServiceClient) GetRIPStatus(ctx context.Context, in *GetRIPStatusRequest, opts ...grpc.CallOption) (*GetRIPStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetRIPStatusResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetRIPStatus_FullMethodName, in, out, cOpts...)
@@ -476,7 +476,7 @@ func (c *xpfServiceClient) GetRIPStatus(ctx context.Context, in *GetRIPStatusReq
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetISISStatus(ctx context.Context, in *GetISISStatusRequest, opts ...grpc.CallOption) (*GetISISStatusResponse, error) {
+func (c *bpfrxServiceClient) GetISISStatus(ctx context.Context, in *GetISISStatusRequest, opts ...grpc.CallOption) (*GetISISStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetISISStatusResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetISISStatus_FullMethodName, in, out, cOpts...)
@@ -486,7 +486,7 @@ func (c *xpfServiceClient) GetISISStatus(ctx context.Context, in *GetISISStatusR
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetIPsecSA(ctx context.Context, in *GetIPsecSARequest, opts ...grpc.CallOption) (*GetIPsecSAResponse, error) {
+func (c *bpfrxServiceClient) GetIPsecSA(ctx context.Context, in *GetIPsecSARequest, opts ...grpc.CallOption) (*GetIPsecSAResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetIPsecSAResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetIPsecSA_FullMethodName, in, out, cOpts...)
@@ -496,7 +496,7 @@ func (c *xpfServiceClient) GetIPsecSA(ctx context.Context, in *GetIPsecSARequest
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetNATPoolStats(ctx context.Context, in *GetNATPoolStatsRequest, opts ...grpc.CallOption) (*GetNATPoolStatsResponse, error) {
+func (c *bpfrxServiceClient) GetNATPoolStats(ctx context.Context, in *GetNATPoolStatsRequest, opts ...grpc.CallOption) (*GetNATPoolStatsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetNATPoolStatsResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetNATPoolStats_FullMethodName, in, out, cOpts...)
@@ -506,7 +506,7 @@ func (c *xpfServiceClient) GetNATPoolStats(ctx context.Context, in *GetNATPoolSt
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetNATRuleStats(ctx context.Context, in *GetNATRuleStatsRequest, opts ...grpc.CallOption) (*GetNATRuleStatsResponse, error) {
+func (c *bpfrxServiceClient) GetNATRuleStats(ctx context.Context, in *GetNATRuleStatsRequest, opts ...grpc.CallOption) (*GetNATRuleStatsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetNATRuleStatsResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetNATRuleStats_FullMethodName, in, out, cOpts...)
@@ -516,7 +516,7 @@ func (c *xpfServiceClient) GetNATRuleStats(ctx context.Context, in *GetNATRuleSt
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetVRRPStatus(ctx context.Context, in *GetVRRPStatusRequest, opts ...grpc.CallOption) (*GetVRRPStatusResponse, error) {
+func (c *bpfrxServiceClient) GetVRRPStatus(ctx context.Context, in *GetVRRPStatusRequest, opts ...grpc.CallOption) (*GetVRRPStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetVRRPStatusResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetVRRPStatus_FullMethodName, in, out, cOpts...)
@@ -526,7 +526,7 @@ func (c *xpfServiceClient) GetVRRPStatus(ctx context.Context, in *GetVRRPStatusR
 	return out, nil
 }
 
-func (c *xpfServiceClient) MatchPolicies(ctx context.Context, in *MatchPoliciesRequest, opts ...grpc.CallOption) (*MatchPoliciesResponse, error) {
+func (c *bpfrxServiceClient) MatchPolicies(ctx context.Context, in *MatchPoliciesRequest, opts ...grpc.CallOption) (*MatchPoliciesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(MatchPoliciesResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_MatchPolicies_FullMethodName, in, out, cOpts...)
@@ -536,7 +536,7 @@ func (c *xpfServiceClient) MatchPolicies(ctx context.Context, in *MatchPoliciesR
 	return out, nil
 }
 
-func (c *xpfServiceClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PingResponse], error) {
+func (c *bpfrxServiceClient) Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[PingResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &BpfrxService_ServiceDesc.Streams[0], BpfrxService_Ping_FullMethodName, cOpts...)
 	if err != nil {
@@ -555,7 +555,7 @@ func (c *xpfServiceClient) Ping(ctx context.Context, in *PingRequest, opts ...gr
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type BpfrxService_PingClient = grpc.ServerStreamingClient[PingResponse]
 
-func (c *xpfServiceClient) Traceroute(ctx context.Context, in *TracerouteRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TracerouteResponse], error) {
+func (c *bpfrxServiceClient) Traceroute(ctx context.Context, in *TracerouteRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[TracerouteResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &BpfrxService_ServiceDesc.Streams[1], BpfrxService_Traceroute_FullMethodName, cOpts...)
 	if err != nil {
@@ -574,7 +574,7 @@ func (c *xpfServiceClient) Traceroute(ctx context.Context, in *TracerouteRequest
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type BpfrxService_TracerouteClient = grpc.ServerStreamingClient[TracerouteResponse]
 
-func (c *xpfServiceClient) MonitorPacketDrop(ctx context.Context, in *MonitorPacketDropRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MonitorPacketDropResponse], error) {
+func (c *bpfrxServiceClient) MonitorPacketDrop(ctx context.Context, in *MonitorPacketDropRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MonitorPacketDropResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &BpfrxService_ServiceDesc.Streams[2], BpfrxService_MonitorPacketDrop_FullMethodName, cOpts...)
 	if err != nil {
@@ -593,7 +593,7 @@ func (c *xpfServiceClient) MonitorPacketDrop(ctx context.Context, in *MonitorPac
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type BpfrxService_MonitorPacketDropClient = grpc.ServerStreamingClient[MonitorPacketDropResponse]
 
-func (c *xpfServiceClient) MonitorInterface(ctx context.Context, in *MonitorInterfaceRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MonitorInterfaceResponse], error) {
+func (c *bpfrxServiceClient) MonitorInterface(ctx context.Context, in *MonitorInterfaceRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MonitorInterfaceResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &BpfrxService_ServiceDesc.Streams[3], BpfrxService_MonitorInterface_FullMethodName, cOpts...)
 	if err != nil {
@@ -612,7 +612,7 @@ func (c *xpfServiceClient) MonitorInterface(ctx context.Context, in *MonitorInte
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type BpfrxService_MonitorInterfaceClient = grpc.ServerStreamingClient[MonitorInterfaceResponse]
 
-func (c *xpfServiceClient) ClearSessions(ctx context.Context, in *ClearSessionsRequest, opts ...grpc.CallOption) (*ClearSessionsResponse, error) {
+func (c *bpfrxServiceClient) ClearSessions(ctx context.Context, in *ClearSessionsRequest, opts ...grpc.CallOption) (*ClearSessionsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ClearSessionsResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_ClearSessions_FullMethodName, in, out, cOpts...)
@@ -622,7 +622,7 @@ func (c *xpfServiceClient) ClearSessions(ctx context.Context, in *ClearSessionsR
 	return out, nil
 }
 
-func (c *xpfServiceClient) ClearCounters(ctx context.Context, in *ClearCountersRequest, opts ...grpc.CallOption) (*ClearCountersResponse, error) {
+func (c *bpfrxServiceClient) ClearCounters(ctx context.Context, in *ClearCountersRequest, opts ...grpc.CallOption) (*ClearCountersResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ClearCountersResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_ClearCounters_FullMethodName, in, out, cOpts...)
@@ -632,7 +632,7 @@ func (c *xpfServiceClient) ClearCounters(ctx context.Context, in *ClearCountersR
 	return out, nil
 }
 
-func (c *xpfServiceClient) ClearDHCPClientIdentifier(ctx context.Context, in *ClearDHCPClientIdentifierRequest, opts ...grpc.CallOption) (*ClearDHCPClientIdentifierResponse, error) {
+func (c *bpfrxServiceClient) ClearDHCPClientIdentifier(ctx context.Context, in *ClearDHCPClientIdentifierRequest, opts ...grpc.CallOption) (*ClearDHCPClientIdentifierResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ClearDHCPClientIdentifierResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_ClearDHCPClientIdentifier_FullMethodName, in, out, cOpts...)
@@ -642,7 +642,7 @@ func (c *xpfServiceClient) ClearDHCPClientIdentifier(ctx context.Context, in *Cl
 	return out, nil
 }
 
-func (c *xpfServiceClient) ShowText(ctx context.Context, in *ShowTextRequest, opts ...grpc.CallOption) (*ShowTextResponse, error) {
+func (c *bpfrxServiceClient) ShowText(ctx context.Context, in *ShowTextRequest, opts ...grpc.CallOption) (*ShowTextResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ShowTextResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_ShowText_FullMethodName, in, out, cOpts...)
@@ -652,7 +652,7 @@ func (c *xpfServiceClient) ShowText(ctx context.Context, in *ShowTextRequest, op
 	return out, nil
 }
 
-func (c *xpfServiceClient) GetSystemInfo(ctx context.Context, in *GetSystemInfoRequest, opts ...grpc.CallOption) (*GetSystemInfoResponse, error) {
+func (c *bpfrxServiceClient) GetSystemInfo(ctx context.Context, in *GetSystemInfoRequest, opts ...grpc.CallOption) (*GetSystemInfoResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSystemInfoResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_GetSystemInfo_FullMethodName, in, out, cOpts...)
@@ -662,7 +662,7 @@ func (c *xpfServiceClient) GetSystemInfo(ctx context.Context, in *GetSystemInfoR
 	return out, nil
 }
 
-func (c *xpfServiceClient) SystemAction(ctx context.Context, in *SystemActionRequest, opts ...grpc.CallOption) (*SystemActionResponse, error) {
+func (c *bpfrxServiceClient) SystemAction(ctx context.Context, in *SystemActionRequest, opts ...grpc.CallOption) (*SystemActionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SystemActionResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_SystemAction_FullMethodName, in, out, cOpts...)
@@ -672,7 +672,7 @@ func (c *xpfServiceClient) SystemAction(ctx context.Context, in *SystemActionReq
 	return out, nil
 }
 
-func (c *xpfServiceClient) Complete(ctx context.Context, in *CompleteRequest, opts ...grpc.CallOption) (*CompleteResponse, error) {
+func (c *bpfrxServiceClient) Complete(ctx context.Context, in *CompleteRequest, opts ...grpc.CallOption) (*CompleteResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CompleteResponse)
 	err := c.cc.Invoke(ctx, BpfrxService_Complete_FullMethodName, in, out, cOpts...)

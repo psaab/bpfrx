@@ -82,7 +82,7 @@ type xpfXdpCpumapDnatKey struct {
 	Pad      [3]uint8
 	DstIp    uint32
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpCpumapDnatKeyV6 struct {
@@ -91,7 +91,7 @@ type xpfXdpCpumapDnatKeyV6 struct {
 	Pad      [3]uint8
 	DstIp    [16]uint8
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpCpumapDnatValue struct {
@@ -616,9 +616,9 @@ type xpfXdpCpumapZoneConfig struct {
 	Pad              [3]uint8
 }
 
-// loadBpfrxXdpCpumap returns the embedded CollectionSpec for xpfXdpCpumap.
-func loadBpfrxXdpCpumap() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxXdpCpumapBytes)
+// loadXpfXdpCpumap returns the embedded CollectionSpec for xpfXdpCpumap.
+func loadXpfXdpCpumap() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_XpfXdpCpumapBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
 		return nil, fmt.Errorf("can't load xpfXdpCpumap: %w", err)
@@ -627,7 +627,7 @@ func loadBpfrxXdpCpumap() (*ebpf.CollectionSpec, error) {
 	return spec, err
 }
 
-// loadBpfrxXdpCpumapObjects loads xpfXdpCpumap and converts it into a struct.
+// loadXpfXdpCpumapObjects loads xpfXdpCpumap and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
@@ -636,8 +636,8 @@ func loadBpfrxXdpCpumap() (*ebpf.CollectionSpec, error) {
 //	*xpfXdpCpumapMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxXdpCpumapObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxXdpCpumap()
+func loadXpfXdpCpumapObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadXpfXdpCpumap()
 	if err != nil {
 		return err
 	}
@@ -737,7 +737,7 @@ type xpfXdpCpumapVariableSpecs struct {
 
 // xpfXdpCpumapObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpCpumapObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpCpumapObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpCpumapObjects struct {
 	xpfXdpCpumapPrograms
 	xpfXdpCpumapMaps
@@ -745,7 +745,7 @@ type xpfXdpCpumapObjects struct {
 }
 
 func (o *xpfXdpCpumapObjects) Close() error {
-	return _BpfrxXdpCpumapClose(
+	return _XpfXdpCpumapClose(
 		&o.xpfXdpCpumapPrograms,
 		&o.xpfXdpCpumapMaps,
 	)
@@ -753,7 +753,7 @@ func (o *xpfXdpCpumapObjects) Close() error {
 
 // xpfXdpCpumapMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpCpumapObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpCpumapObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpCpumapMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
@@ -820,7 +820,7 @@ type xpfXdpCpumapMaps struct {
 }
 
 func (m *xpfXdpCpumapMaps) Close() error {
-	return _BpfrxXdpCpumapClose(
+	return _XpfXdpCpumapClose(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -888,24 +888,24 @@ func (m *xpfXdpCpumapMaps) Close() error {
 
 // xpfXdpCpumapVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpCpumapObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpCpumapObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpCpumapVariables struct {
 }
 
 // xpfXdpCpumapPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpCpumapObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpCpumapObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpCpumapPrograms struct {
 	XdpCpumapProg *ebpf.Program `ebpf:"xdp_cpumap_prog"`
 }
 
 func (p *xpfXdpCpumapPrograms) Close() error {
-	return _BpfrxXdpCpumapClose(
+	return _XpfXdpCpumapClose(
 		p.XdpCpumapProg,
 	)
 }
 
-func _BpfrxXdpCpumapClose(closers ...io.Closer) error {
+func _XpfXdpCpumapClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -917,4 +917,4 @@ func _BpfrxXdpCpumapClose(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed xpfxdpcpumap_x86_bpfel.o
-var _BpfrxXdpCpumapBytes []byte
+var _XpfXdpCpumapBytes []byte

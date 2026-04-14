@@ -82,7 +82,7 @@ type xpfTcScreenEgressDnatKey struct {
 	Pad      [3]uint8
 	DstIp    uint32
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfTcScreenEgressDnatKeyV6 struct {
@@ -91,7 +91,7 @@ type xpfTcScreenEgressDnatKeyV6 struct {
 	Pad      [3]uint8
 	DstIp    [16]uint8
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfTcScreenEgressDnatValue struct {
@@ -616,9 +616,9 @@ type xpfTcScreenEgressZoneConfig struct {
 	Pad              [3]uint8
 }
 
-// loadBpfrxTcScreenEgress returns the embedded CollectionSpec for xpfTcScreenEgress.
-func loadBpfrxTcScreenEgress() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxTcScreenEgressBytes)
+// loadXpfTcScreenEgress returns the embedded CollectionSpec for xpfTcScreenEgress.
+func loadXpfTcScreenEgress() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_XpfTcScreenEgressBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
 		return nil, fmt.Errorf("can't load xpfTcScreenEgress: %w", err)
@@ -627,7 +627,7 @@ func loadBpfrxTcScreenEgress() (*ebpf.CollectionSpec, error) {
 	return spec, err
 }
 
-// loadBpfrxTcScreenEgressObjects loads xpfTcScreenEgress and converts it into a struct.
+// loadXpfTcScreenEgressObjects loads xpfTcScreenEgress and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
@@ -636,8 +636,8 @@ func loadBpfrxTcScreenEgress() (*ebpf.CollectionSpec, error) {
 //	*xpfTcScreenEgressMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxTcScreenEgressObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxTcScreenEgress()
+func loadXpfTcScreenEgressObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadXpfTcScreenEgress()
 	if err != nil {
 		return err
 	}
@@ -737,7 +737,7 @@ type xpfTcScreenEgressVariableSpecs struct {
 
 // xpfTcScreenEgressObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcScreenEgressObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcScreenEgressObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcScreenEgressObjects struct {
 	xpfTcScreenEgressPrograms
 	xpfTcScreenEgressMaps
@@ -745,7 +745,7 @@ type xpfTcScreenEgressObjects struct {
 }
 
 func (o *xpfTcScreenEgressObjects) Close() error {
-	return _BpfrxTcScreenEgressClose(
+	return _XpfTcScreenEgressClose(
 		&o.xpfTcScreenEgressPrograms,
 		&o.xpfTcScreenEgressMaps,
 	)
@@ -753,7 +753,7 @@ func (o *xpfTcScreenEgressObjects) Close() error {
 
 // xpfTcScreenEgressMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcScreenEgressObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcScreenEgressObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcScreenEgressMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
@@ -820,7 +820,7 @@ type xpfTcScreenEgressMaps struct {
 }
 
 func (m *xpfTcScreenEgressMaps) Close() error {
-	return _BpfrxTcScreenEgressClose(
+	return _XpfTcScreenEgressClose(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -888,24 +888,24 @@ func (m *xpfTcScreenEgressMaps) Close() error {
 
 // xpfTcScreenEgressVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcScreenEgressObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcScreenEgressObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcScreenEgressVariables struct {
 }
 
 // xpfTcScreenEgressPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcScreenEgressObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcScreenEgressObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcScreenEgressPrograms struct {
 	TcScreenEgressProg *ebpf.Program `ebpf:"tc_screen_egress_prog"`
 }
 
 func (p *xpfTcScreenEgressPrograms) Close() error {
-	return _BpfrxTcScreenEgressClose(
+	return _XpfTcScreenEgressClose(
 		p.TcScreenEgressProg,
 	)
 }
 
-func _BpfrxTcScreenEgressClose(closers ...io.Closer) error {
+func _XpfTcScreenEgressClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -917,4 +917,4 @@ func _BpfrxTcScreenEgressClose(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed xpftcscreenegress_x86_bpfel.o
-var _BpfrxTcScreenEgressBytes []byte
+var _XpfTcScreenEgressBytes []byte

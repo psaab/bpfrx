@@ -82,7 +82,7 @@ type xpfTcMainDnatKey struct {
 	Pad      [3]uint8
 	DstIp    uint32
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfTcMainDnatKeyV6 struct {
@@ -91,7 +91,7 @@ type xpfTcMainDnatKeyV6 struct {
 	Pad      [3]uint8
 	DstIp    [16]uint8
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfTcMainDnatValue struct {
@@ -616,9 +616,9 @@ type xpfTcMainZoneConfig struct {
 	Pad              [3]uint8
 }
 
-// loadBpfrxTcMain returns the embedded CollectionSpec for xpfTcMain.
-func loadBpfrxTcMain() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxTcMainBytes)
+// loadXpfTcMain returns the embedded CollectionSpec for xpfTcMain.
+func loadXpfTcMain() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_XpfTcMainBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
 		return nil, fmt.Errorf("can't load xpfTcMain: %w", err)
@@ -627,7 +627,7 @@ func loadBpfrxTcMain() (*ebpf.CollectionSpec, error) {
 	return spec, err
 }
 
-// loadBpfrxTcMainObjects loads xpfTcMain and converts it into a struct.
+// loadXpfTcMainObjects loads xpfTcMain and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
@@ -636,8 +636,8 @@ func loadBpfrxTcMain() (*ebpf.CollectionSpec, error) {
 //	*xpfTcMainMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxTcMainObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxTcMain()
+func loadXpfTcMainObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadXpfTcMain()
 	if err != nil {
 		return err
 	}
@@ -737,7 +737,7 @@ type xpfTcMainVariableSpecs struct {
 
 // xpfTcMainObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcMainObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcMainObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcMainObjects struct {
 	xpfTcMainPrograms
 	xpfTcMainMaps
@@ -745,7 +745,7 @@ type xpfTcMainObjects struct {
 }
 
 func (o *xpfTcMainObjects) Close() error {
-	return _BpfrxTcMainClose(
+	return _XpfTcMainClose(
 		&o.xpfTcMainPrograms,
 		&o.xpfTcMainMaps,
 	)
@@ -753,7 +753,7 @@ func (o *xpfTcMainObjects) Close() error {
 
 // xpfTcMainMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcMainObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcMainObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcMainMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
@@ -820,7 +820,7 @@ type xpfTcMainMaps struct {
 }
 
 func (m *xpfTcMainMaps) Close() error {
-	return _BpfrxTcMainClose(
+	return _XpfTcMainClose(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -888,24 +888,24 @@ func (m *xpfTcMainMaps) Close() error {
 
 // xpfTcMainVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcMainObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcMainObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcMainVariables struct {
 }
 
 // xpfTcMainPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcMainObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcMainObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcMainPrograms struct {
 	TcMainProg *ebpf.Program `ebpf:"tc_main_prog"`
 }
 
 func (p *xpfTcMainPrograms) Close() error {
-	return _BpfrxTcMainClose(
+	return _XpfTcMainClose(
 		p.TcMainProg,
 	)
 }
 
-func _BpfrxTcMainClose(closers ...io.Closer) error {
+func _XpfTcMainClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -917,4 +917,4 @@ func _BpfrxTcMainClose(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed xpftcmain_x86_bpfel.o
-var _BpfrxTcMainBytes []byte
+var _XpfTcMainBytes []byte

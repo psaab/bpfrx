@@ -82,7 +82,7 @@ type xpfTcForwardDnatKey struct {
 	Pad      [3]uint8
 	DstIp    uint32
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfTcForwardDnatKeyV6 struct {
@@ -91,7 +91,7 @@ type xpfTcForwardDnatKeyV6 struct {
 	Pad      [3]uint8
 	DstIp    [16]uint8
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfTcForwardDnatValue struct {
@@ -616,9 +616,9 @@ type xpfTcForwardZoneConfig struct {
 	Pad              [3]uint8
 }
 
-// loadBpfrxTcForward returns the embedded CollectionSpec for xpfTcForward.
-func loadBpfrxTcForward() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxTcForwardBytes)
+// loadXpfTcForward returns the embedded CollectionSpec for xpfTcForward.
+func loadXpfTcForward() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_XpfTcForwardBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
 		return nil, fmt.Errorf("can't load xpfTcForward: %w", err)
@@ -627,7 +627,7 @@ func loadBpfrxTcForward() (*ebpf.CollectionSpec, error) {
 	return spec, err
 }
 
-// loadBpfrxTcForwardObjects loads xpfTcForward and converts it into a struct.
+// loadXpfTcForwardObjects loads xpfTcForward and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
@@ -636,8 +636,8 @@ func loadBpfrxTcForward() (*ebpf.CollectionSpec, error) {
 //	*xpfTcForwardMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxTcForwardObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxTcForward()
+func loadXpfTcForwardObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadXpfTcForward()
 	if err != nil {
 		return err
 	}
@@ -737,7 +737,7 @@ type xpfTcForwardVariableSpecs struct {
 
 // xpfTcForwardObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcForwardObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcForwardObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcForwardObjects struct {
 	xpfTcForwardPrograms
 	xpfTcForwardMaps
@@ -745,7 +745,7 @@ type xpfTcForwardObjects struct {
 }
 
 func (o *xpfTcForwardObjects) Close() error {
-	return _BpfrxTcForwardClose(
+	return _XpfTcForwardClose(
 		&o.xpfTcForwardPrograms,
 		&o.xpfTcForwardMaps,
 	)
@@ -753,7 +753,7 @@ func (o *xpfTcForwardObjects) Close() error {
 
 // xpfTcForwardMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcForwardObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcForwardObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcForwardMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
@@ -820,7 +820,7 @@ type xpfTcForwardMaps struct {
 }
 
 func (m *xpfTcForwardMaps) Close() error {
-	return _BpfrxTcForwardClose(
+	return _XpfTcForwardClose(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -888,24 +888,24 @@ func (m *xpfTcForwardMaps) Close() error {
 
 // xpfTcForwardVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcForwardObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcForwardObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcForwardVariables struct {
 }
 
 // xpfTcForwardPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcForwardObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcForwardObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcForwardPrograms struct {
 	TcForwardProg *ebpf.Program `ebpf:"tc_forward_prog"`
 }
 
 func (p *xpfTcForwardPrograms) Close() error {
-	return _BpfrxTcForwardClose(
+	return _XpfTcForwardClose(
 		p.TcForwardProg,
 	)
 }
 
-func _BpfrxTcForwardClose(closers ...io.Closer) error {
+func _XpfTcForwardClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -917,4 +917,4 @@ func _BpfrxTcForwardClose(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed xpftcforward_x86_bpfel.o
-var _BpfrxTcForwardBytes []byte
+var _XpfTcForwardBytes []byte

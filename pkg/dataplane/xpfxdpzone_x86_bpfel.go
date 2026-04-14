@@ -82,7 +82,7 @@ type xpfXdpZoneDnatKey struct {
 	Pad      [3]uint8
 	DstIp    uint32
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpZoneDnatKeyV6 struct {
@@ -91,7 +91,7 @@ type xpfXdpZoneDnatKeyV6 struct {
 	Pad      [3]uint8
 	DstIp    [16]uint8
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpZoneDnatValue struct {
@@ -683,9 +683,9 @@ type xpfXdpZoneZoneConfig struct {
 	Pad              [3]uint8
 }
 
-// loadBpfrxXdpZone returns the embedded CollectionSpec for xpfXdpZone.
-func loadBpfrxXdpZone() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxXdpZoneBytes)
+// loadXpfXdpZone returns the embedded CollectionSpec for xpfXdpZone.
+func loadXpfXdpZone() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_XpfXdpZoneBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
 		return nil, fmt.Errorf("can't load xpfXdpZone: %w", err)
@@ -694,7 +694,7 @@ func loadBpfrxXdpZone() (*ebpf.CollectionSpec, error) {
 	return spec, err
 }
 
-// loadBpfrxXdpZoneObjects loads xpfXdpZone and converts it into a struct.
+// loadXpfXdpZoneObjects loads xpfXdpZone and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
@@ -703,8 +703,8 @@ func loadBpfrxXdpZone() (*ebpf.CollectionSpec, error) {
 //	*xpfXdpZoneMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxXdpZoneObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxXdpZone()
+func loadXpfXdpZoneObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadXpfXdpZone()
 	if err != nil {
 		return err
 	}
@@ -806,7 +806,7 @@ type xpfXdpZoneVariableSpecs struct {
 
 // xpfXdpZoneObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpZoneObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpZoneObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpZoneObjects struct {
 	xpfXdpZonePrograms
 	xpfXdpZoneMaps
@@ -814,7 +814,7 @@ type xpfXdpZoneObjects struct {
 }
 
 func (o *xpfXdpZoneObjects) Close() error {
-	return _BpfrxXdpZoneClose(
+	return _XpfXdpZoneClose(
 		&o.xpfXdpZonePrograms,
 		&o.xpfXdpZoneMaps,
 	)
@@ -822,7 +822,7 @@ func (o *xpfXdpZoneObjects) Close() error {
 
 // xpfXdpZoneMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpZoneObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpZoneObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpZoneMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
@@ -891,7 +891,7 @@ type xpfXdpZoneMaps struct {
 }
 
 func (m *xpfXdpZoneMaps) Close() error {
-	return _BpfrxXdpZoneClose(
+	return _XpfXdpZoneClose(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -961,24 +961,24 @@ func (m *xpfXdpZoneMaps) Close() error {
 
 // xpfXdpZoneVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpZoneObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpZoneObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpZoneVariables struct {
 }
 
 // xpfXdpZonePrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpZoneObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpZoneObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpZonePrograms struct {
 	XdpZoneProg *ebpf.Program `ebpf:"xdp_zone_prog"`
 }
 
 func (p *xpfXdpZonePrograms) Close() error {
-	return _BpfrxXdpZoneClose(
+	return _XpfXdpZoneClose(
 		p.XdpZoneProg,
 	)
 }
 
-func _BpfrxXdpZoneClose(closers ...io.Closer) error {
+func _XpfXdpZoneClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -990,4 +990,4 @@ func _BpfrxXdpZoneClose(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed xpfxdpzone_x86_bpfel.o
-var _BpfrxXdpZoneBytes []byte
+var _XpfXdpZoneBytes []byte

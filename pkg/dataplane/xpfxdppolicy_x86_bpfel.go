@@ -82,7 +82,7 @@ type xpfXdpPolicyDnatKey struct {
 	Pad      [3]uint8
 	DstIp    uint32
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpPolicyDnatKeyV6 struct {
@@ -91,7 +91,7 @@ type xpfXdpPolicyDnatKeyV6 struct {
 	Pad      [3]uint8
 	DstIp    [16]uint8
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpPolicyDnatValue struct {
@@ -643,9 +643,9 @@ type xpfXdpPolicyZoneConfig struct {
 	Pad              [3]uint8
 }
 
-// loadBpfrxXdpPolicy returns the embedded CollectionSpec for xpfXdpPolicy.
-func loadBpfrxXdpPolicy() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxXdpPolicyBytes)
+// loadXpfXdpPolicy returns the embedded CollectionSpec for xpfXdpPolicy.
+func loadXpfXdpPolicy() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_XpfXdpPolicyBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
 		return nil, fmt.Errorf("can't load xpfXdpPolicy: %w", err)
@@ -654,7 +654,7 @@ func loadBpfrxXdpPolicy() (*ebpf.CollectionSpec, error) {
 	return spec, err
 }
 
-// loadBpfrxXdpPolicyObjects loads xpfXdpPolicy and converts it into a struct.
+// loadXpfXdpPolicyObjects loads xpfXdpPolicy and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
@@ -663,8 +663,8 @@ func loadBpfrxXdpPolicy() (*ebpf.CollectionSpec, error) {
 //	*xpfXdpPolicyMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxXdpPolicyObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxXdpPolicy()
+func loadXpfXdpPolicyObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadXpfXdpPolicy()
 	if err != nil {
 		return err
 	}
@@ -769,7 +769,7 @@ type xpfXdpPolicyVariableSpecs struct {
 
 // xpfXdpPolicyObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpPolicyObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpPolicyObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpPolicyObjects struct {
 	xpfXdpPolicyPrograms
 	xpfXdpPolicyMaps
@@ -777,7 +777,7 @@ type xpfXdpPolicyObjects struct {
 }
 
 func (o *xpfXdpPolicyObjects) Close() error {
-	return _BpfrxXdpPolicyClose(
+	return _XpfXdpPolicyClose(
 		&o.xpfXdpPolicyPrograms,
 		&o.xpfXdpPolicyMaps,
 	)
@@ -785,7 +785,7 @@ func (o *xpfXdpPolicyObjects) Close() error {
 
 // xpfXdpPolicyMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpPolicyObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpPolicyObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpPolicyMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
@@ -857,7 +857,7 @@ type xpfXdpPolicyMaps struct {
 }
 
 func (m *xpfXdpPolicyMaps) Close() error {
-	return _BpfrxXdpPolicyClose(
+	return _XpfXdpPolicyClose(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -930,24 +930,24 @@ func (m *xpfXdpPolicyMaps) Close() error {
 
 // xpfXdpPolicyVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpPolicyObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpPolicyObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpPolicyVariables struct {
 }
 
 // xpfXdpPolicyPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpPolicyObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpPolicyObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpPolicyPrograms struct {
 	XdpPolicyProg *ebpf.Program `ebpf:"xdp_policy_prog"`
 }
 
 func (p *xpfXdpPolicyPrograms) Close() error {
-	return _BpfrxXdpPolicyClose(
+	return _XpfXdpPolicyClose(
 		p.XdpPolicyProg,
 	)
 }
 
-func _BpfrxXdpPolicyClose(closers ...io.Closer) error {
+func _XpfXdpPolicyClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -959,4 +959,4 @@ func _BpfrxXdpPolicyClose(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed xpfxdppolicy_x86_bpfel.o
-var _BpfrxXdpPolicyBytes []byte
+var _XpfXdpPolicyBytes []byte

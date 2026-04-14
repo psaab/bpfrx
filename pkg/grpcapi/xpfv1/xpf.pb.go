@@ -6899,7 +6899,7 @@ var File_xpf_proto protoreflect.FileDescriptor
 
 const file_xpf_proto_rawDesc = "" +
 	"\n" +
-	"\vxpf.proto\x12\bxpf.v1\"5\n" +
+	"\txpf.proto\x12\x06xpf.v1\"5\n" +
 	"\x15EnterConfigureRequest\x12\x1c\n" +
 	"\texclusive\x18\x01 \x01(\bR\texclusive\"\x18\n" +
 	"\x16EnterConfigureResponse\"\x16\n" +
@@ -6934,10 +6934,10 @@ const file_xpf_proto_rawDesc = "" +
 	"\x15ConfirmCommitResponse\"\x1f\n" +
 	"\x0fRollbackRequest\x12\f\n" +
 	"\x01n\x18\x01 \x01(\x05R\x01n\"\x12\n" +
-	"\x10RollbackResponse\"\x87\x01\n" +
-	"\x11ShowConfigRequest\x12.\n" +
-	"\x06format\x18\x01 \x01(\x0e2\x16.xpf.v1.ConfigFormatR\x06format\x12.\n" +
-	"\x06target\x18\x02 \x01(\x0e2\x16.xpf.v1.ConfigTargetR\x06target\x12\x12\n" +
+	"\x10RollbackResponse\"\x83\x01\n" +
+	"\x11ShowConfigRequest\x12,\n" +
+	"\x06format\x18\x01 \x01(\x0e2\x14.xpf.v1.ConfigFormatR\x06format\x12,\n" +
+	"\x06target\x18\x02 \x01(\x0e2\x14.xpf.v1.ConfigTargetR\x06target\x12\x12\n" +
 	"\x04path\x18\x03 \x03(\tR\x04path\",\n" +
 	"\x12ShowConfigResponse\x12\x16\n" +
 	"\x06output\x18\x01 \x01(\tR\x06output\"3\n" +
@@ -6945,15 +6945,15 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"rollback_n\x18\x01 \x01(\x05R\trollbackN\"-\n" +
 	"\x13ShowCompareResponse\x12\x16\n" +
-	"\x06output\x18\x01 \x01(\tR\x06output\"S\n" +
+	"\x06output\x18\x01 \x01(\tR\x06output\"Q\n" +
 	"\x13ShowRollbackRequest\x12\f\n" +
-	"\x01n\x18\x01 \x01(\x05R\x01n\x12.\n" +
-	"\x06format\x18\x02 \x01(\x0e2\x16.xpf.v1.ConfigFormatR\x06format\".\n" +
+	"\x01n\x18\x01 \x01(\x05R\x01n\x12,\n" +
+	"\x06format\x18\x02 \x01(\x0e2\x14.xpf.v1.ConfigFormatR\x06format\".\n" +
 	"\x14ShowRollbackResponse\x12\x16\n" +
 	"\x06output\x18\x01 \x01(\tR\x06output\"\x14\n" +
-	"\x12ListHistoryRequest\"G\n" +
-	"\x13ListHistoryResponse\x120\n" +
-	"\aentries\x18\x01 \x03(\v2\x16.xpf.v1.HistoryEntryR\aentries\"B\n" +
+	"\x12ListHistoryRequest\"E\n" +
+	"\x13ListHistoryResponse\x12.\n" +
+	"\aentries\x18\x01 \x03(\v2\x14.xpf.v1.HistoryEntryR\aentries\"B\n" +
 	"\fHistoryEntry\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\x05R\x05index\x12\x1c\n" +
 	"\ttimestamp\x18\x02 \x01(\tR\ttimestamp\"\x12\n" +
@@ -6967,7 +6967,7 @@ const file_xpf_proto_rawDesc = "" +
 	"\rsession_count\x18\x05 \x01(\x05R\fsessionCount\x12!\n" +
 	"\fcluster_role\x18\x06 \x01(\tR\vclusterRole\x12&\n" +
 	"\x0fcluster_node_id\x18\a \x01(\x05R\rclusterNodeId\"\x17\n" +
-	"\x15GetGlobalStatsRequest\"\xa2\x05\n" +
+	"\x15GetGlobalStatsRequest\"\xa0\x05\n" +
 	"\x16GetGlobalStatsResponse\x12\x1d\n" +
 	"\n" +
 	"rx_packets\x18\x01 \x01(\x04R\trxPackets\x12\x1d\n" +
@@ -6983,14 +6983,14 @@ const file_xpf_proto_rawDesc = "" +
 	"\x11tc_egress_packets\x18\n" +
 	" \x01(\x04R\x0ftcEgressPackets\x12-\n" +
 	"\x12nat64_translations\x18\v \x01(\x04R\x11nat64Translations\x120\n" +
-	"\x14host_inbound_allowed\x18\f \x01(\x04R\x12hostInboundAllowed\x12g\n" +
-	"\x13screen_drop_details\x18\r \x03(\v27.xpf.v1.GetGlobalStatsResponse.ScreenDropDetailsEntryR\x11screenDropDetails\x1aD\n" +
+	"\x14host_inbound_allowed\x18\f \x01(\x04R\x12hostInboundAllowed\x12e\n" +
+	"\x13screen_drop_details\x18\r \x03(\v25.xpf.v1.GetGlobalStatsResponse.ScreenDropDetailsEntryR\x11screenDropDetails\x1aD\n" +
 	"\x16ScreenDropDetailsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"\x11\n" +
-	"\x0fGetZonesRequest\"<\n" +
-	"\x10GetZonesResponse\x12(\n" +
-	"\x05zones\x18\x01 \x03(\v2\x12.xpf.v1.ZoneInfoR\x05zones\"\xfc\x02\n" +
+	"\x0fGetZonesRequest\":\n" +
+	"\x10GetZonesResponse\x12&\n" +
+	"\x05zones\x18\x01 \x03(\v2\x10.xpf.v1.ZoneInfoR\x05zones\"\xfc\x02\n" +
 	"\bZoneInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x0e\n" +
 	"\x02id\x18\x02 \x01(\rR\x02id\x12%\n" +
@@ -7006,14 +7006,14 @@ const file_xpf_proto_rawDesc = "" +
 	"\atcp_rst\x18\n" +
 	" \x01(\bR\x06tcpRst\x12 \n" +
 	"\vdescription\x18\v \x01(\tR\vdescription\"\x14\n" +
-	"\x12GetPoliciesRequest\"G\n" +
-	"\x13GetPoliciesResponse\x120\n" +
-	"\bpolicies\x18\x01 \x03(\v2\x14.xpf.v1.PolicyInfoR\bpolicies\"n\n" +
+	"\x12GetPoliciesRequest\"E\n" +
+	"\x13GetPoliciesResponse\x12.\n" +
+	"\bpolicies\x18\x01 \x03(\v2\x12.xpf.v1.PolicyInfoR\bpolicies\"l\n" +
 	"\n" +
 	"PolicyInfo\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
-	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12*\n" +
-	"\x05rules\x18\x03 \x03(\v2\x14.xpf.v1.PolicyRuleR\x05rules\"\xae\x02\n" +
+	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12(\n" +
+	"\x05rules\x18\x03 \x03(\v2\x12.xpf.v1.PolicyRuleR\x05rules\"\xae\x02\n" +
 	"\n" +
 	"PolicyRule\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
@@ -7046,14 +7046,14 @@ const file_xpf_proto_rawDesc = "" +
 	"\n" +
 	"page_token\x18\r \x01(\tR\tpageToken\x12\x1b\n" +
 	"\tpage_size\x18\x0e \x01(\x05R\bpageSize\x12\x1b\n" +
-	"\tno_enrich\x18\x0f \x01(\bR\bnoEnrich\"\x81\x02\n" +
+	"\tno_enrich\x18\x0f \x01(\bR\bnoEnrich\"\xfd\x01\n" +
 	"\x13GetSessionsResponse\x12\x14\n" +
 	"\x05total\x18\x01 \x01(\x05R\x05total\x12\x14\n" +
 	"\x05limit\x18\x02 \x01(\x05R\x05limit\x12\x16\n" +
-	"\x06offset\x18\x03 \x01(\x05R\x06offset\x122\n" +
-	"\bsessions\x18\x04 \x03(\v2\x16.xpf.v1.SessionEntryR\bsessions\x12\x17\n" +
-	"\anode_id\x18\x05 \x01(\x05R\x06nodeId\x121\n" +
-	"\x04peer\x18\x06 \x01(\v2\x1d.xpf.v1.GetSessionsResponseR\x04peer\x12&\n" +
+	"\x06offset\x18\x03 \x01(\x05R\x06offset\x120\n" +
+	"\bsessions\x18\x04 \x03(\v2\x14.xpf.v1.SessionEntryR\bsessions\x12\x17\n" +
+	"\anode_id\x18\x05 \x01(\x05R\x06nodeId\x12/\n" +
+	"\x04peer\x18\x06 \x01(\v2\x1b.xpf.v1.GetSessionsResponseR\x04peer\x12&\n" +
 	"\x0fnext_page_token\x18\a \x01(\tR\rnextPageToken\"\xbd\a\n" +
 	"\fSessionEntry\x12\x19\n" +
 	"\bsrc_addr\x18\x01 \x01(\tR\asrcAddr\x12\x19\n" +
@@ -7097,7 +7097,7 @@ const file_xpf_proto_rawDesc = "" +
 	"natDstPort\x12\x1b\n" +
 	"\tha_active\x18\x1d \x01(\bR\bhaActive\"=\n" +
 	"\x18GetSessionSummaryRequest\x12!\n" +
-	"\finclude_peer\x18\x01 \x01(\bR\vincludePeer\"\xeb\x02\n" +
+	"\finclude_peer\x18\x01 \x01(\bR\vincludePeer\"\xe9\x02\n" +
 	"\x19GetSessionSummaryResponse\x12#\n" +
 	"\rtotal_entries\x18\x01 \x01(\x05R\ftotalEntries\x12!\n" +
 	"\fforward_only\x18\x02 \x01(\x05R\vforwardOnly\x12 \n" +
@@ -7106,30 +7106,30 @@ const file_xpf_proto_rawDesc = "" +
 	"\ripv6_sessions\x18\x05 \x01(\x05R\fipv6Sessions\x12#\n" +
 	"\rsnat_sessions\x18\x06 \x01(\x05R\fsnatSessions\x12#\n" +
 	"\rdnat_sessions\x18\a \x01(\x05R\fdnatSessions\x12\x17\n" +
-	"\anode_id\x18\b \x01(\x05R\x06nodeId\x127\n" +
-	"\x04peer\x18\t \x01(\v2#.xpf.v1.GetSessionSummaryResponseR\x04peer\"\x15\n" +
-	"\x13GetNATSourceRequest\"E\n" +
-	"\x14GetNATSourceResponse\x12-\n" +
-	"\x05rules\x18\x01 \x03(\v2\x17.xpf.v1.NATSourceInfoR\x05rules\"m\n" +
+	"\anode_id\x18\b \x01(\x05R\x06nodeId\x125\n" +
+	"\x04peer\x18\t \x01(\v2!.xpf.v1.GetSessionSummaryResponseR\x04peer\"\x15\n" +
+	"\x13GetNATSourceRequest\"C\n" +
+	"\x14GetNATSourceResponse\x12+\n" +
+	"\x05rules\x18\x01 \x03(\v2\x15.xpf.v1.NATSourceInfoR\x05rules\"m\n" +
 	"\rNATSourceInfo\x12\x1b\n" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12\x12\n" +
 	"\x04type\x18\x03 \x01(\tR\x04type\x12\x12\n" +
 	"\x04pool\x18\x04 \x01(\tR\x04pool\"\x1a\n" +
-	"\x18GetNATDestinationRequest\"\xce\x01\n" +
-	"\x19GetNATDestinationResponse\x12+\n" +
-	"\x05rules\x18\x01 \x03(\v2\x15.xpf.v1.NATDestInfoR\x05rules\x12:\n" +
-	"\x19total_active_translations\x18\x02 \x01(\x05R\x17totalActiveTranslations\x12H\n" +
-	"\x11rule_set_sessions\x18\x03 \x03(\v2\x1c.xpf.v1.NATRuleSetSessionsR\x0fruleSetSessions\"\xa1\x01\n" +
+	"\x18GetNATDestinationRequest\"\xca\x01\n" +
+	"\x19GetNATDestinationResponse\x12)\n" +
+	"\x05rules\x18\x01 \x03(\v2\x13.xpf.v1.NATDestInfoR\x05rules\x12:\n" +
+	"\x19total_active_translations\x18\x02 \x01(\x05R\x17totalActiveTranslations\x12F\n" +
+	"\x11rule_set_sessions\x18\x03 \x03(\v2\x1a.xpf.v1.NATRuleSetSessionsR\x0fruleSetSessions\"\xa1\x01\n" +
 	"\vNATDestInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x19\n" +
 	"\bdst_addr\x18\x02 \x01(\tR\adstAddr\x12\x19\n" +
 	"\bdst_port\x18\x03 \x01(\rR\adstPort\x12!\n" +
 	"\ftranslate_ip\x18\x04 \x01(\tR\vtranslateIp\x12%\n" +
 	"\x0etranslate_port\x18\x05 \x01(\rR\rtranslatePort\"\x12\n" +
-	"\x10GetScreenRequest\"C\n" +
-	"\x11GetScreenResponse\x12.\n" +
-	"\ascreens\x18\x01 \x03(\v2\x14.xpf.v1.ScreenInfoR\ascreens\"8\n" +
+	"\x10GetScreenRequest\"A\n" +
+	"\x11GetScreenResponse\x12,\n" +
+	"\ascreens\x18\x01 \x03(\v2\x12.xpf.v1.ScreenInfoR\ascreens\"8\n" +
 	"\n" +
 	"ScreenInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x16\n" +
@@ -7138,9 +7138,9 @@ const file_xpf_proto_rawDesc = "" +
 	"\x05limit\x18\x01 \x01(\x05R\x05limit\x12\x12\n" +
 	"\x04zone\x18\x02 \x01(\rR\x04zone\x12\x16\n" +
 	"\x06action\x18\x03 \x01(\tR\x06action\x12\x1a\n" +
-	"\bprotocol\x18\x04 \x01(\tR\bprotocol\"A\n" +
-	"\x11GetEventsResponse\x12,\n" +
-	"\x06events\x18\x01 \x03(\v2\x14.xpf.v1.EventEntryR\x06events\"\xa0\x05\n" +
+	"\bprotocol\x18\x04 \x01(\tR\bprotocol\"?\n" +
+	"\x11GetEventsResponse\x12*\n" +
+	"\x06events\x18\x01 \x03(\v2\x12.xpf.v1.EventEntryR\x06events\"\xa0\x05\n" +
 	"\n" +
 	"EventEntry\x12\x12\n" +
 	"\x04time\x18\x01 \x01(\tR\x04time\x12\x12\n" +
@@ -7166,10 +7166,10 @@ const file_xpf_proto_rawDesc = "" +
 	"\bapp_name\x18\x12 \x01(\tR\aappName\x12#\n" +
 	"\ringress_iface\x18\x13 \x01(\tR\fingressIface\x12!\n" +
 	"\fclose_reason\x18\x14 \x01(\tR\vcloseReason\"\x16\n" +
-	"\x14GetInterfacesRequest\"P\n" +
-	"\x15GetInterfacesResponse\x127\n" +
+	"\x14GetInterfacesRequest\"N\n" +
+	"\x15GetInterfacesResponse\x125\n" +
 	"\n" +
-	"interfaces\x18\x01 \x03(\v2\x17.xpf.v1.InterfaceInfoR\n" +
+	"interfaces\x18\x01 \x03(\v2\x15.xpf.v1.InterfaceInfoR\n" +
 	"interfaces\"\xc5\x01\n" +
 	"\rInterfaceInfo\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
@@ -7186,9 +7186,9 @@ const file_xpf_proto_rawDesc = "" +
 	"\x05terse\x18\x02 \x01(\bR\x05terse\"6\n" +
 	"\x1cShowInterfacesDetailResponse\x12\x16\n" +
 	"\x06output\x18\x01 \x01(\tR\x06output\"\x16\n" +
-	"\x14GetDHCPLeasesRequest\"H\n" +
-	"\x15GetDHCPLeasesResponse\x12/\n" +
-	"\x06leases\x18\x01 \x03(\v2\x17.xpf.v1.DHCPLeaseInfoR\x06leases\"\x94\x02\n" +
+	"\x14GetDHCPLeasesRequest\"F\n" +
+	"\x15GetDHCPLeasesResponse\x12-\n" +
+	"\x06leases\x18\x01 \x03(\v2\x15.xpf.v1.DHCPLeaseInfoR\x06leases\"\x92\x02\n" +
 	"\rDHCPLeaseInfo\x12\x1c\n" +
 	"\tinterface\x18\x01 \x01(\tR\tinterface\x12\x16\n" +
 	"\x06family\x18\x02 \x01(\tR\x06family\x12\x18\n" +
@@ -7197,17 +7197,17 @@ const file_xpf_proto_rawDesc = "" +
 	"\x03dns\x18\x05 \x03(\tR\x03dns\x12\x1d\n" +
 	"\n" +
 	"lease_time\x18\x06 \x01(\tR\tleaseTime\x12\x1a\n" +
-	"\bobtained\x18\a \x01(\tR\bobtained\x12L\n" +
-	"\x12delegated_prefixes\x18\b \x03(\v2\x1d.xpf.v1.DHCPDelegatedPrefixR\x11delegatedPrefixes\"\xbd\x01\n" +
+	"\bobtained\x18\a \x01(\tR\bobtained\x12J\n" +
+	"\x12delegated_prefixes\x18\b \x03(\v2\x1b.xpf.v1.DHCPDelegatedPrefixR\x11delegatedPrefixes\"\xbd\x01\n" +
 	"\x13DHCPDelegatedPrefix\x12\x1c\n" +
 	"\tinterface\x18\x01 \x01(\tR\tinterface\x12\x16\n" +
 	"\x06prefix\x18\x02 \x01(\tR\x06prefix\x12-\n" +
 	"\x12preferred_lifetime\x18\x03 \x01(\tR\x11preferredLifetime\x12%\n" +
 	"\x0evalid_lifetime\x18\x04 \x01(\tR\rvalidLifetime\x12\x1a\n" +
 	"\bobtained\x18\x05 \x01(\tR\bobtained\"!\n" +
-	"\x1fGetDHCPClientIdentifiersRequest\"h\n" +
-	" GetDHCPClientIdentifiersResponse\x12D\n" +
-	"\videntifiers\x18\x01 \x03(\v2\".xpf.v1.DHCPClientIdentifierInfoR\videntifiers\"x\n" +
+	"\x1fGetDHCPClientIdentifiersRequest\"f\n" +
+	" GetDHCPClientIdentifiersResponse\x12B\n" +
+	"\videntifiers\x18\x01 \x03(\v2 .xpf.v1.DHCPClientIdentifierInfoR\videntifiers\"x\n" +
 	"\x18DHCPClientIdentifierInfo\x12\x1c\n" +
 	"\tinterface\x18\x01 \x01(\tR\tinterface\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12\x18\n" +
@@ -7217,9 +7217,9 @@ const file_xpf_proto_rawDesc = "" +
 	"\tinterface\x18\x01 \x01(\tR\tinterface\"=\n" +
 	"!ClearDHCPClientIdentifierResponse\x12\x18\n" +
 	"\amessage\x18\x01 \x01(\tR\amessage\"\x12\n" +
-	"\x10GetRoutesRequest\"@\n" +
-	"\x11GetRoutesResponse\x12+\n" +
-	"\x06routes\x18\x01 \x03(\v2\x13.xpf.v1.RouteInfoR\x06routes\"\xa2\x01\n" +
+	"\x10GetRoutesRequest\">\n" +
+	"\x11GetRoutesResponse\x12)\n" +
+	"\x06routes\x18\x01 \x03(\v2\x11.xpf.v1.RouteInfoR\x06routes\"\xa2\x01\n" +
 	"\tRouteInfo\x12 \n" +
 	"\vdestination\x18\x01 \x01(\tR\vdestination\x12\x19\n" +
 	"\bnext_hop\x18\x02 \x01(\tR\anextHop\x12\x1c\n" +
@@ -7274,11 +7274,11 @@ const file_xpf_proto_rawDesc = "" +
 	"\fipv6_cleared\x18\x02 \x01(\x05R\vipv6Cleared\"\x16\n" +
 	"\x14ClearCountersRequest\"\x17\n" +
 	"\x15ClearCountersResponse\"\x18\n" +
-	"\x16GetNATPoolStatsRequest\"\xcd\x01\n" +
-	"\x17GetNATPoolStatsResponse\x12,\n" +
-	"\x05pools\x18\x01 \x03(\v2\x16.xpf.v1.NATPoolStatsR\x05pools\x12:\n" +
-	"\x19total_active_translations\x18\x02 \x01(\x05R\x17totalActiveTranslations\x12H\n" +
-	"\x11rule_set_sessions\x18\x03 \x03(\v2\x1c.xpf.v1.NATRuleSetSessionsR\x0fruleSetSessions\"\xea\x01\n" +
+	"\x16GetNATPoolStatsRequest\"\xc9\x01\n" +
+	"\x17GetNATPoolStatsResponse\x12*\n" +
+	"\x05pools\x18\x01 \x03(\v2\x14.xpf.v1.NATPoolStatsR\x05pools\x12:\n" +
+	"\x19total_active_translations\x18\x02 \x01(\x05R\x17totalActiveTranslations\x12F\n" +
+	"\x11rule_set_sessions\x18\x03 \x03(\v2\x1a.xpf.v1.NATRuleSetSessionsR\x0fruleSetSessions\"\xea\x01\n" +
 	"\fNATPoolStats\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x1f\n" +
@@ -7293,9 +7293,9 @@ const file_xpf_proto_rawDesc = "" +
 	"\tfrom_zone\x18\x01 \x01(\tR\bfromZone\x12\x17\n" +
 	"\ato_zone\x18\x02 \x01(\tR\x06toZone\x12\x1a\n" +
 	"\bsessions\x18\x03 \x01(\x05R\bsessions\"\x16\n" +
-	"\x14GetVRRPStatusRequest\"x\n" +
-	"\x15GetVRRPStatusResponse\x128\n" +
-	"\tinstances\x18\x01 \x03(\v2\x1a.xpf.v1.VRRPInstanceInfoR\tinstances\x12%\n" +
+	"\x14GetVRRPStatusRequest\"v\n" +
+	"\x15GetVRRPStatusResponse\x126\n" +
+	"\tinstances\x18\x01 \x03(\v2\x18.xpf.v1.VRRPInstanceInfoR\tinstances\x12%\n" +
 	"\x0eservice_status\x18\x02 \x01(\tR\rserviceStatus\"\xc4\x01\n" +
 	"\x10VRRPInstanceInfo\x12\x1c\n" +
 	"\tinterface\x18\x01 \x01(\tR\tinterface\x12\x19\n" +
@@ -7321,9 +7321,9 @@ const file_xpf_proto_rawDesc = "" +
 	"\amatched\x18\x06 \x01(\bR\amatched\"N\n" +
 	"\x16GetNATRuleStatsRequest\x12\x19\n" +
 	"\brule_set\x18\x01 \x01(\tR\aruleSet\x12\x19\n" +
-	"\bnat_type\x18\x02 \x01(\tR\anatType\"G\n" +
-	"\x17GetNATRuleStatsResponse\x12,\n" +
-	"\x05rules\x18\x01 \x03(\v2\x16.xpf.v1.NATRuleStatsR\x05rules\"\xa2\x02\n" +
+	"\bnat_type\x18\x02 \x01(\tR\anatType\"E\n" +
+	"\x17GetNATRuleStatsResponse\x12*\n" +
+	"\x05rules\x18\x01 \x03(\v2\x14.xpf.v1.NATRuleStatsR\x05rules\"\xa2\x02\n" +
 	"\fNATRuleStats\x12\x19\n" +
 	"\brule_set\x18\x01 \x01(\tR\aruleSet\x12\x1b\n" +
 	"\trule_name\x18\x02 \x01(\tR\bruleName\x12\x1b\n" +
@@ -7371,10 +7371,10 @@ const file_xpf_proto_rawDesc = "" +
 	"\x05count\x18\b \x01(\x05R\x05count\x12\x12\n" +
 	"\x04node\x18\t \x01(\tR\x04node\"/\n" +
 	"\x19MonitorPacketDropResponse\x12\x12\n" +
-	"\x04line\x18\x01 \x01(\tR\x04line\"\x8a\x01\n" +
+	"\x04line\x18\x01 \x01(\tR\x04line\"\x88\x01\n" +
 	"\x17MonitorInterfaceRequest\x12%\n" +
-	"\x0einterface_name\x18\x01 \x01(\tR\rinterfaceName\x12H\n" +
-	"\fsummary_mode\x18\x02 \x01(\x0e2%.xpf.v1.MonitorInterfaceSummaryModeR\vsummaryMode\"0\n" +
+	"\x0einterface_name\x18\x01 \x01(\tR\rinterfaceName\x12F\n" +
+	"\fsummary_mode\x18\x02 \x01(\x0e2#.xpf.v1.MonitorInterfaceSummaryModeR\vsummaryMode\"0\n" +
 	"\x18MonitorInterfaceResponse\x12\x14\n" +
 	"\x05frame\x18\x01 \x01(\tR\x05frame*M\n" +
 	"\fConfigFormat\x12\x10\n" +
@@ -7392,61 +7392,61 @@ const file_xpf_proto_rawDesc = "" +
 	"&MONITOR_INTERFACE_SUMMARY_MODE_PACKETS\x10\x01\x12(\n" +
 	"$MONITOR_INTERFACE_SUMMARY_MODE_BYTES\x10\x02\x12(\n" +
 	"$MONITOR_INTERFACE_SUMMARY_MODE_DELTA\x10\x03\x12'\n" +
-	"#MONITOR_INTERFACE_SUMMARY_MODE_RATE\x10\x042\x99\x1f\n" +
-	"\fBpfrxService\x12S\n" +
-	"\x0eEnterConfigure\x12\x1f.xpf.v1.EnterConfigureRequest\x1a .xpf.v1.EnterConfigureResponse\x12P\n" +
-	"\rExitConfigure\x12\x1e.xpf.v1.ExitConfigureRequest\x1a\x1f.xpf.v1.ExitConfigureResponse\x12b\n" +
-	"\x13GetConfigModeStatus\x12$.xpf.v1.GetConfigModeStatusRequest\x1a%.xpf.v1.GetConfigModeStatusResponse\x122\n" +
-	"\x03Set\x12\x14.xpf.v1.SetRequest\x1a\x15.xpf.v1.SetResponse\x12;\n" +
-	"\x06Delete\x12\x17.xpf.v1.DeleteRequest\x1a\x18.xpf.v1.DeleteResponse\x125\n" +
-	"\x04Load\x12\x15.xpf.v1.LoadRequest\x1a\x16.xpf.v1.LoadResponse\x12;\n" +
-	"\x06Commit\x12\x17.xpf.v1.CommitRequest\x1a\x18.xpf.v1.CommitResponse\x12J\n" +
-	"\vCommitCheck\x12\x1c.xpf.v1.CommitCheckRequest\x1a\x1d.xpf.v1.CommitCheckResponse\x12V\n" +
-	"\x0fCommitConfirmed\x12 .xpf.v1.CommitConfirmedRequest\x1a!.xpf.v1.CommitConfirmedResponse\x12P\n" +
-	"\rConfirmCommit\x12\x1e.xpf.v1.ConfirmCommitRequest\x1a\x1f.xpf.v1.ConfirmCommitResponse\x12A\n" +
-	"\bRollback\x12\x19.xpf.v1.RollbackRequest\x1a\x1a.xpf.v1.RollbackResponse\x12G\n" +
+	"#MONITOR_INTERFACE_SUMMARY_MODE_RATE\x10\x042\xd1\x1d\n" +
+	"\fBpfrxService\x12O\n" +
+	"\x0eEnterConfigure\x12\x1d.xpf.v1.EnterConfigureRequest\x1a\x1e.xpf.v1.EnterConfigureResponse\x12L\n" +
+	"\rExitConfigure\x12\x1c.xpf.v1.ExitConfigureRequest\x1a\x1d.xpf.v1.ExitConfigureResponse\x12^\n" +
+	"\x13GetConfigModeStatus\x12\".xpf.v1.GetConfigModeStatusRequest\x1a#.xpf.v1.GetConfigModeStatusResponse\x12.\n" +
+	"\x03Set\x12\x12.xpf.v1.SetRequest\x1a\x13.xpf.v1.SetResponse\x127\n" +
+	"\x06Delete\x12\x15.xpf.v1.DeleteRequest\x1a\x16.xpf.v1.DeleteResponse\x121\n" +
+	"\x04Load\x12\x13.xpf.v1.LoadRequest\x1a\x14.xpf.v1.LoadResponse\x127\n" +
+	"\x06Commit\x12\x15.xpf.v1.CommitRequest\x1a\x16.xpf.v1.CommitResponse\x12F\n" +
+	"\vCommitCheck\x12\x1a.xpf.v1.CommitCheckRequest\x1a\x1b.xpf.v1.CommitCheckResponse\x12R\n" +
+	"\x0fCommitConfirmed\x12\x1e.xpf.v1.CommitConfirmedRequest\x1a\x1f.xpf.v1.CommitConfirmedResponse\x12L\n" +
+	"\rConfirmCommit\x12\x1c.xpf.v1.ConfirmCommitRequest\x1a\x1d.xpf.v1.ConfirmCommitResponse\x12=\n" +
+	"\bRollback\x12\x17.xpf.v1.RollbackRequest\x1a\x18.xpf.v1.RollbackResponse\x12C\n" +
 	"\n" +
-	"ShowConfig\x12\x1b.xpf.v1.ShowConfigRequest\x1a\x1c.xpf.v1.ShowConfigResponse\x12J\n" +
-	"\vShowCompare\x12\x1c.xpf.v1.ShowCompareRequest\x1a\x1d.xpf.v1.ShowCompareResponse\x12M\n" +
-	"\fShowRollback\x12\x1d.xpf.v1.ShowRollbackRequest\x1a\x1e.xpf.v1.ShowRollbackResponse\x12J\n" +
-	"\vListHistory\x12\x1c.xpf.v1.ListHistoryRequest\x1a\x1d.xpf.v1.ListHistoryResponse\x12D\n" +
-	"\tGetStatus\x12\x1a.xpf.v1.GetStatusRequest\x1a\x1b.xpf.v1.GetStatusResponse\x12S\n" +
-	"\x0eGetGlobalStats\x12\x1f.xpf.v1.GetGlobalStatsRequest\x1a .xpf.v1.GetGlobalStatsResponse\x12A\n" +
-	"\bGetZones\x12\x19.xpf.v1.GetZonesRequest\x1a\x1a.xpf.v1.GetZonesResponse\x12J\n" +
-	"\vGetPolicies\x12\x1c.xpf.v1.GetPoliciesRequest\x1a\x1d.xpf.v1.GetPoliciesResponse\x12J\n" +
-	"\vGetSessions\x12\x1c.xpf.v1.GetSessionsRequest\x1a\x1d.xpf.v1.GetSessionsResponse\x12\\\n" +
-	"\x11GetSessionSummary\x12\".xpf.v1.GetSessionSummaryRequest\x1a#.xpf.v1.GetSessionSummaryResponse\x12M\n" +
-	"\fGetNATSource\x12\x1d.xpf.v1.GetNATSourceRequest\x1a\x1e.xpf.v1.GetNATSourceResponse\x12\\\n" +
-	"\x11GetNATDestination\x12\".xpf.v1.GetNATDestinationRequest\x1a#.xpf.v1.GetNATDestinationResponse\x12D\n" +
-	"\tGetScreen\x12\x1a.xpf.v1.GetScreenRequest\x1a\x1b.xpf.v1.GetScreenResponse\x12D\n" +
-	"\tGetEvents\x12\x1a.xpf.v1.GetEventsRequest\x1a\x1b.xpf.v1.GetEventsResponse\x12P\n" +
-	"\rGetInterfaces\x12\x1e.xpf.v1.GetInterfacesRequest\x1a\x1f.xpf.v1.GetInterfacesResponse\x12e\n" +
-	"\x14ShowInterfacesDetail\x12%.xpf.v1.ShowInterfacesDetailRequest\x1a&.xpf.v1.ShowInterfacesDetailResponse\x12P\n" +
-	"\rGetDHCPLeases\x12\x1e.xpf.v1.GetDHCPLeasesRequest\x1a\x1f.xpf.v1.GetDHCPLeasesResponse\x12q\n" +
-	"\x18GetDHCPClientIdentifiers\x12).xpf.v1.GetDHCPClientIdentifiersRequest\x1a*.xpf.v1.GetDHCPClientIdentifiersResponse\x12D\n" +
-	"\tGetRoutes\x12\x1a.xpf.v1.GetRoutesRequest\x1a\x1b.xpf.v1.GetRoutesResponse\x12P\n" +
-	"\rGetOSPFStatus\x12\x1e.xpf.v1.GetOSPFStatusRequest\x1a\x1f.xpf.v1.GetOSPFStatusResponse\x12M\n" +
-	"\fGetBGPStatus\x12\x1d.xpf.v1.GetBGPStatusRequest\x1a\x1e.xpf.v1.GetBGPStatusResponse\x12M\n" +
-	"\fGetRIPStatus\x12\x1d.xpf.v1.GetRIPStatusRequest\x1a\x1e.xpf.v1.GetRIPStatusResponse\x12P\n" +
-	"\rGetISISStatus\x12\x1e.xpf.v1.GetISISStatusRequest\x1a\x1f.xpf.v1.GetISISStatusResponse\x12G\n" +
+	"ShowConfig\x12\x19.xpf.v1.ShowConfigRequest\x1a\x1a.xpf.v1.ShowConfigResponse\x12F\n" +
+	"\vShowCompare\x12\x1a.xpf.v1.ShowCompareRequest\x1a\x1b.xpf.v1.ShowCompareResponse\x12I\n" +
+	"\fShowRollback\x12\x1b.xpf.v1.ShowRollbackRequest\x1a\x1c.xpf.v1.ShowRollbackResponse\x12F\n" +
+	"\vListHistory\x12\x1a.xpf.v1.ListHistoryRequest\x1a\x1b.xpf.v1.ListHistoryResponse\x12@\n" +
+	"\tGetStatus\x12\x18.xpf.v1.GetStatusRequest\x1a\x19.xpf.v1.GetStatusResponse\x12O\n" +
+	"\x0eGetGlobalStats\x12\x1d.xpf.v1.GetGlobalStatsRequest\x1a\x1e.xpf.v1.GetGlobalStatsResponse\x12=\n" +
+	"\bGetZones\x12\x17.xpf.v1.GetZonesRequest\x1a\x18.xpf.v1.GetZonesResponse\x12F\n" +
+	"\vGetPolicies\x12\x1a.xpf.v1.GetPoliciesRequest\x1a\x1b.xpf.v1.GetPoliciesResponse\x12F\n" +
+	"\vGetSessions\x12\x1a.xpf.v1.GetSessionsRequest\x1a\x1b.xpf.v1.GetSessionsResponse\x12X\n" +
+	"\x11GetSessionSummary\x12 .xpf.v1.GetSessionSummaryRequest\x1a!.xpf.v1.GetSessionSummaryResponse\x12I\n" +
+	"\fGetNATSource\x12\x1b.xpf.v1.GetNATSourceRequest\x1a\x1c.xpf.v1.GetNATSourceResponse\x12X\n" +
+	"\x11GetNATDestination\x12 .xpf.v1.GetNATDestinationRequest\x1a!.xpf.v1.GetNATDestinationResponse\x12@\n" +
+	"\tGetScreen\x12\x18.xpf.v1.GetScreenRequest\x1a\x19.xpf.v1.GetScreenResponse\x12@\n" +
+	"\tGetEvents\x12\x18.xpf.v1.GetEventsRequest\x1a\x19.xpf.v1.GetEventsResponse\x12L\n" +
+	"\rGetInterfaces\x12\x1c.xpf.v1.GetInterfacesRequest\x1a\x1d.xpf.v1.GetInterfacesResponse\x12a\n" +
+	"\x14ShowInterfacesDetail\x12#.xpf.v1.ShowInterfacesDetailRequest\x1a$.xpf.v1.ShowInterfacesDetailResponse\x12L\n" +
+	"\rGetDHCPLeases\x12\x1c.xpf.v1.GetDHCPLeasesRequest\x1a\x1d.xpf.v1.GetDHCPLeasesResponse\x12m\n" +
+	"\x18GetDHCPClientIdentifiers\x12'.xpf.v1.GetDHCPClientIdentifiersRequest\x1a(.xpf.v1.GetDHCPClientIdentifiersResponse\x12@\n" +
+	"\tGetRoutes\x12\x18.xpf.v1.GetRoutesRequest\x1a\x19.xpf.v1.GetRoutesResponse\x12L\n" +
+	"\rGetOSPFStatus\x12\x1c.xpf.v1.GetOSPFStatusRequest\x1a\x1d.xpf.v1.GetOSPFStatusResponse\x12I\n" +
+	"\fGetBGPStatus\x12\x1b.xpf.v1.GetBGPStatusRequest\x1a\x1c.xpf.v1.GetBGPStatusResponse\x12I\n" +
+	"\fGetRIPStatus\x12\x1b.xpf.v1.GetRIPStatusRequest\x1a\x1c.xpf.v1.GetRIPStatusResponse\x12L\n" +
+	"\rGetISISStatus\x12\x1c.xpf.v1.GetISISStatusRequest\x1a\x1d.xpf.v1.GetISISStatusResponse\x12C\n" +
 	"\n" +
-	"GetIPsecSA\x12\x1b.xpf.v1.GetIPsecSARequest\x1a\x1c.xpf.v1.GetIPsecSAResponse\x12V\n" +
-	"\x0fGetNATPoolStats\x12 .xpf.v1.GetNATPoolStatsRequest\x1a!.xpf.v1.GetNATPoolStatsResponse\x12V\n" +
-	"\x0fGetNATRuleStats\x12 .xpf.v1.GetNATRuleStatsRequest\x1a!.xpf.v1.GetNATRuleStatsResponse\x12P\n" +
-	"\rGetVRRPStatus\x12\x1e.xpf.v1.GetVRRPStatusRequest\x1a\x1f.xpf.v1.GetVRRPStatusResponse\x12P\n" +
-	"\rMatchPolicies\x12\x1e.xpf.v1.MatchPoliciesRequest\x1a\x1f.xpf.v1.MatchPoliciesResponse\x127\n" +
-	"\x04Ping\x12\x15.xpf.v1.PingRequest\x1a\x16.xpf.v1.PingResponse0\x01\x12I\n" +
+	"GetIPsecSA\x12\x19.xpf.v1.GetIPsecSARequest\x1a\x1a.xpf.v1.GetIPsecSAResponse\x12R\n" +
+	"\x0fGetNATPoolStats\x12\x1e.xpf.v1.GetNATPoolStatsRequest\x1a\x1f.xpf.v1.GetNATPoolStatsResponse\x12R\n" +
+	"\x0fGetNATRuleStats\x12\x1e.xpf.v1.GetNATRuleStatsRequest\x1a\x1f.xpf.v1.GetNATRuleStatsResponse\x12L\n" +
+	"\rGetVRRPStatus\x12\x1c.xpf.v1.GetVRRPStatusRequest\x1a\x1d.xpf.v1.GetVRRPStatusResponse\x12L\n" +
+	"\rMatchPolicies\x12\x1c.xpf.v1.MatchPoliciesRequest\x1a\x1d.xpf.v1.MatchPoliciesResponse\x123\n" +
+	"\x04Ping\x12\x13.xpf.v1.PingRequest\x1a\x14.xpf.v1.PingResponse0\x01\x12E\n" +
 	"\n" +
-	"Traceroute\x12\x1b.xpf.v1.TracerouteRequest\x1a\x1c.xpf.v1.TracerouteResponse0\x01\x12^\n" +
-	"\x11MonitorPacketDrop\x12\".xpf.v1.MonitorPacketDropRequest\x1a#.xpf.v1.MonitorPacketDropResponse0\x01\x12[\n" +
-	"\x10MonitorInterface\x12!.xpf.v1.MonitorInterfaceRequest\x1a\".xpf.v1.MonitorInterfaceResponse0\x01\x12P\n" +
-	"\rClearSessions\x12\x1e.xpf.v1.ClearSessionsRequest\x1a\x1f.xpf.v1.ClearSessionsResponse\x12P\n" +
-	"\rClearCounters\x12\x1e.xpf.v1.ClearCountersRequest\x1a\x1f.xpf.v1.ClearCountersResponse\x12t\n" +
-	"\x19ClearDHCPClientIdentifier\x12*.xpf.v1.ClearDHCPClientIdentifierRequest\x1a+.xpf.v1.ClearDHCPClientIdentifierResponse\x12A\n" +
-	"\bShowText\x12\x19.xpf.v1.ShowTextRequest\x1a\x1a.xpf.v1.ShowTextResponse\x12P\n" +
-	"\rGetSystemInfo\x12\x1e.xpf.v1.GetSystemInfoRequest\x1a\x1f.xpf.v1.GetSystemInfoResponse\x12M\n" +
-	"\fSystemAction\x12\x1d.xpf.v1.SystemActionRequest\x1a\x1e.xpf.v1.SystemActionResponse\x12A\n" +
-	"\bComplete\x12\x19.xpf.v1.CompleteRequest\x1a\x1a.xpf.v1.CompleteResponseB,Z*github.com/psaab/xpf/pkg/grpcapi/xpfv1b\x06proto3"
+	"Traceroute\x12\x19.xpf.v1.TracerouteRequest\x1a\x1a.xpf.v1.TracerouteResponse0\x01\x12Z\n" +
+	"\x11MonitorPacketDrop\x12 .xpf.v1.MonitorPacketDropRequest\x1a!.xpf.v1.MonitorPacketDropResponse0\x01\x12W\n" +
+	"\x10MonitorInterface\x12\x1f.xpf.v1.MonitorInterfaceRequest\x1a .xpf.v1.MonitorInterfaceResponse0\x01\x12L\n" +
+	"\rClearSessions\x12\x1c.xpf.v1.ClearSessionsRequest\x1a\x1d.xpf.v1.ClearSessionsResponse\x12L\n" +
+	"\rClearCounters\x12\x1c.xpf.v1.ClearCountersRequest\x1a\x1d.xpf.v1.ClearCountersResponse\x12p\n" +
+	"\x19ClearDHCPClientIdentifier\x12(.xpf.v1.ClearDHCPClientIdentifierRequest\x1a).xpf.v1.ClearDHCPClientIdentifierResponse\x12=\n" +
+	"\bShowText\x12\x17.xpf.v1.ShowTextRequest\x1a\x18.xpf.v1.ShowTextResponse\x12L\n" +
+	"\rGetSystemInfo\x12\x1c.xpf.v1.GetSystemInfoRequest\x1a\x1d.xpf.v1.GetSystemInfoResponse\x12I\n" +
+	"\fSystemAction\x12\x1b.xpf.v1.SystemActionRequest\x1a\x1c.xpf.v1.SystemActionResponse\x12=\n" +
+	"\bComplete\x12\x17.xpf.v1.CompleteRequest\x1a\x18.xpf.v1.CompleteResponseB(Z&github.com/psaab/xpf/pkg/grpcapi/xpfv1b\x06proto3"
 
 var (
 	file_xpf_proto_rawDescOnce sync.Once
