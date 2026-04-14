@@ -23,6 +23,17 @@ func parseRPMPositiveInt(probeName, testName, field, raw string) (int, error) {
 	return n, nil
 }
 
+func parseRPMRootPositiveInt(field, raw string) (int, error) {
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("services rpm %s: invalid integer %q", field, raw)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("services rpm %s: must be > 0", field)
+	}
+	return n, nil
+}
+
 func validateRPMTest(probeName string, test *RPMTest) error {
 	if test.Target == "" {
 		return fmt.Errorf("services rpm probe %q test %q: target is required", probeName, test.Name)
@@ -185,6 +196,17 @@ func compileServices(node *Node, svc *ServicesConfig) error {
 
 func compileRPM(node *Node, svc *ServicesConfig) error {
 	rpmCfg := &RPMConfig{Probes: make(map[string]*RPMProbe)}
+	defaultProbeLimit := 0
+
+	if probeLimitNode := node.FindChild("probe-limit"); probeLimitNode != nil {
+		if v := nodeVal(probeLimitNode); v != "" {
+			n, err := parseRPMRootPositiveInt("probe-limit", v)
+			if err != nil {
+				return err
+			}
+			defaultProbeLimit = n
+		}
+	}
 
 	for _, probeInst := range namedInstances(node.FindChildren("probe")) {
 		probe := &RPMProbe{
@@ -265,6 +287,10 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 						test.DestPort = n
 					}
 				}
+			}
+
+			if test.ProbeLimit == 0 && defaultProbeLimit > 0 {
+				test.ProbeLimit = defaultProbeLimit
 			}
 
 			if err := validateRPMTest(probe.Name, test); err != nil {
