@@ -617,11 +617,12 @@ deploy_vm() {
 
 	# Migrate from old bpfrxd naming if present.
 	incus exec "$rinst" -- systemctl stop bpfrxd 2>/dev/null || true
+	incus exec "$rinst" -- /usr/local/sbin/bpfrxd cleanup 2>/dev/null || true
 	incus exec "$rinst" -- systemctl disable bpfrxd 2>/dev/null || true
 	incus exec "$rinst" -- rm -f /etc/systemd/system/bpfrxd.service 2>/dev/null || true
 	incus exec "$rinst" -- rm -f /usr/local/sbin/bpfrxd 2>/dev/null || true
 	incus exec "$rinst" -- rm -f /usr/local/sbin/bpfrx-userspace-dp 2>/dev/null || true
-	incus exec "$rinst" -- bash -c 'if [ -d /etc/bpfrx ] && [ ! -d /etc/xpf ]; then mv /etc/bpfrx /etc/xpf; fi' 2>/dev/null || true
+	incus exec "$rinst" -- bash -c 'if [ -d /etc/bpfrx ] && [ ! -d /etc/xpf ]; then mv /etc/bpfrx /etc/xpf; fi; if [ -f /etc/xpf/bpfrx.conf ] && [ ! -f /etc/xpf/xpf.conf ]; then mv /etc/xpf/bpfrx.conf /etc/xpf/xpf.conf; fi' 2>/dev/null || true
 
 	# Stop service gracefully, then clean BPF state for binary upgrade.
 	# Order matters: systemctl stop sends SIGTERM (graceful socket close),
@@ -631,7 +632,8 @@ deploy_vm() {
 	incus exec "$rinst" -- systemctl stop xpfd 2>/dev/null || true
 	incus exec "$rinst" -- xpfd cleanup 2>/dev/null || true
 	incus exec "$rinst" -- pkill -9 xpfd 2>/dev/null || true
-	incus exec "$rinst" -- pkill -9 xpf-userspace 2>/dev/null || true
+	incus exec "$rinst" -- pkill -9 xpf-userspace-dp 2>/dev/null || true
+	incus exec "$rinst" -- pkill -9 bpfrx-userspace-dp 2>/dev/null || true
 	incus exec "$rinst" -- pkill -9 cli 2>/dev/null || true
 	sleep 1
 

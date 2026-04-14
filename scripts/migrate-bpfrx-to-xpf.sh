@@ -58,6 +58,13 @@ elif [ -d /etc/bpfrx ] && [ -d /etc/xpf ]; then
     rm -rf /etc/bpfrx
 fi
 
+# The daemon now defaults to /etc/xpf/xpf.conf. Preserve the active config
+# filename during rename so upgraded systems still boot the existing config.
+if [ -f /etc/xpf/bpfrx.conf ] && [ ! -f /etc/xpf/xpf.conf ]; then
+    info "Renaming /etc/xpf/bpfrx.conf -> /etc/xpf/xpf.conf"
+    mv /etc/xpf/bpfrx.conf /etc/xpf/xpf.conf
+fi
+
 # --- Migrate networkd files ---
 renamed=0
 for f in /etc/systemd/network/10-bpfrx-*; do
@@ -75,9 +82,12 @@ if [ "$renamed" -gt 0 ]; then
 fi
 
 # --- Migrate CLI history ---
-if [ -f ~/.bpfrx_history ] && [ ! -f ~/.xpf_history ]; then
-    info "Renaming ~/.bpfrx_history -> ~/.xpf_history"
-    mv ~/.bpfrx_history ~/.xpf_history
+if [ -f ~/.bpfrx_cli_history ] && [ ! -f ~/.xpf_cli_history ]; then
+    info "Renaming ~/.bpfrx_cli_history -> ~/.xpf_cli_history"
+    mv ~/.bpfrx_cli_history ~/.xpf_cli_history
+elif [ -f ~/.bpfrx_history ] && [ ! -f ~/.xpf_cli_history ]; then
+    info "Renaming legacy ~/.bpfrx_history -> ~/.xpf_cli_history"
+    mv ~/.bpfrx_history ~/.xpf_cli_history
 fi
 
 # --- Migrate userspace helper binary ---
@@ -85,6 +95,8 @@ if [ -f /usr/local/sbin/bpfrx-userspace-dp ]; then
     info "Removing old /usr/local/sbin/bpfrx-userspace-dp"
     rm -f /usr/local/sbin/bpfrx-userspace-dp
 fi
+pkill -9 bpfrx-userspace-dp 2>/dev/null || true
+pkill -9 xpf-userspace-dp 2>/dev/null || true
 
 # --- Migrate nftables table ---
 if nft list table inet bpfrx_dp_rst &>/dev/null 2>&1; then
