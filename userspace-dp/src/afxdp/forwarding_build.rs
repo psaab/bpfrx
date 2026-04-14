@@ -95,6 +95,9 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
             iface.linux_name.clone()
         };
         state.ifindex_to_name.insert(iface.ifindex, label);
+        state
+            .ifindex_to_config_name
+            .insert(iface.ifindex, iface.name.clone());
         name_to_ifindex.insert(iface.name.clone(), iface.ifindex);
         if !iface.linux_name.is_empty() {
             linux_to_ifindex.insert(iface.linux_name.clone(), iface.ifindex);

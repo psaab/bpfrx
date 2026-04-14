@@ -399,8 +399,10 @@ pub(crate) fn worker_loop(
     shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
     event_stream: Option<crate::event_stream::EventStreamWorkerHandle>,
     rg_epochs: Arc<[AtomicU32; MAX_RG_EPOCHS]>,
+    cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
 ) {
     pin_current_thread(worker_id);
+    const COS_STATUS_INTERVAL_NS: u64 = 100_000_000;
     let ha_startup_grace_until_secs =
         (monotonic_nanos() / 1_000_000_000).saturating_add(TUNNEL_HA_STARTUP_GRACE_SECS);
     let mut validation = **shared_validation.load();
@@ -565,6 +567,11 @@ pub(crate) fn worker_loop(
         .map(|binding| binding.conntrack_v6_fd)
         .unwrap_or(-1);
     let mut last_ct_refresh_ns: u64 = 0;
+    cos_status.store(Arc::new(build_worker_cos_statuses(
+        &bindings,
+        forwarding.as_ref(),
+    )));
+    let mut last_cos_status_ns = monotonic_nanos();
     while !stop.load(Ordering::Relaxed) {
         let loop_now_ns = monotonic_nanos();
         let loop_now_secs = loop_now_ns / 1_000_000_000;
@@ -767,6 +774,13 @@ pub(crate) fn worker_loop(
         }
         if !bindings.is_empty() {
             poll_start = (poll_start + 1) % bindings.len();
+        }
+        if loop_now_ns.saturating_sub(last_cos_status_ns) >= COS_STATUS_INTERVAL_NS {
+            cos_status.store(Arc::new(build_worker_cos_statuses(
+                &bindings,
+                forwarding.as_ref(),
+            )));
+            last_cos_status_ns = loop_now_ns;
         }
         if !command_results.exported_sequences.is_empty() {
             while sessions.has_pending_deltas() {
@@ -1270,7 +1284,232 @@ pub(crate) fn worker_loop(
             }
         }
     }
+    cos_status.store(Arc::new(build_worker_cos_statuses(
+        &bindings,
+        forwarding.as_ref(),
+    )));
     heartbeat.store(monotonic_nanos(), Ordering::Relaxed);
+}
+
+fn build_worker_cos_statuses(
+    bindings: &[BindingWorker],
+    forwarding: &ForwardingState,
+) -> Vec<crate::protocol::CoSInterfaceStatus> {
+    build_worker_cos_statuses_from_maps(
+        bindings.iter().map(|binding| &binding.cos_interfaces),
+        forwarding,
+    )
+}
+
+fn build_worker_cos_statuses_from_maps<'a, I>(
+    cos_maps: I,
+    forwarding: &ForwardingState,
+) -> Vec<crate::protocol::CoSInterfaceStatus>
+where
+    I: IntoIterator<Item = &'a FastMap<i32, CoSInterfaceRuntime>>,
+{
+    let mut interfaces = BTreeMap::<i32, crate::protocol::CoSInterfaceStatus>::new();
+    let mut queue_maps = BTreeMap::<i32, BTreeMap<u8, crate::protocol::CoSQueueStatus>>::new();
+    for cos_map in cos_maps {
+        for (&ifindex, root) in cos_map {
+            let entry = interfaces.entry(ifindex).or_default();
+            entry.ifindex = ifindex;
+            if entry.interface_name.is_empty() {
+                entry.interface_name = forwarding
+                    .ifindex_to_config_name
+                    .get(&ifindex)
+                    .cloned()
+                    .or_else(|| forwarding.ifindex_to_name.get(&ifindex).cloned())
+                    .unwrap_or_else(|| format!("ifindex-{ifindex}"));
+            }
+            entry.shaping_rate_bytes = entry.shaping_rate_bytes.max(root.shaping_rate_bytes);
+            entry.burst_bytes = entry.burst_bytes.max(root.burst_bytes);
+            entry.worker_instances = entry.worker_instances.saturating_add(1);
+            entry.timer_level0_sleepers = entry.timer_level0_sleepers.saturating_add(
+                root.timer_wheel
+                    .level0
+                    .iter()
+                    .map(std::vec::Vec::len)
+                    .sum::<usize>(),
+            );
+            entry.timer_level1_sleepers = entry.timer_level1_sleepers.saturating_add(
+                root.timer_wheel
+                    .level1
+                    .iter()
+                    .map(std::vec::Vec::len)
+                    .sum::<usize>(),
+            );
+            let interface_config = forwarding.cos.interfaces.get(&ifindex);
+            let queue_map = queue_maps.entry(ifindex).or_default();
+            for queue in &root.queues {
+                let status = queue_map.entry(queue.queue_id).or_default();
+                status.queue_id = queue.queue_id;
+                if let Some(config) = interface_config.and_then(|cfg| {
+                    cfg.queues
+                        .iter()
+                        .find(|config| config.queue_id == queue.queue_id)
+                }) {
+                    if status.forwarding_class.is_empty() {
+                        status.forwarding_class = config.forwarding_class.clone();
+                    }
+                }
+                if status.worker_instances == 0 {
+                    status.priority = queue.priority;
+                }
+                status.exact = queue.exact;
+                status.transmit_rate_bytes =
+                    status.transmit_rate_bytes.max(queue.transmit_rate_bytes);
+                status.buffer_bytes = status.buffer_bytes.max(queue.buffer_bytes);
+                status.worker_instances = status.worker_instances.saturating_add(1);
+                status.queued_packets = status
+                    .queued_packets
+                    .saturating_add(queue.items.len() as u64);
+                status.queued_bytes = status.queued_bytes.saturating_add(queue.queued_bytes);
+                if queue.runnable {
+                    status.runnable_instances = status.runnable_instances.saturating_add(1);
+                }
+                if queue.parked {
+                    status.parked_instances = status.parked_instances.saturating_add(1);
+                }
+                if status.next_wakeup_tick == 0
+                    || (queue.next_wakeup_tick > 0
+                        && queue.next_wakeup_tick < status.next_wakeup_tick)
+                {
+                    status.next_wakeup_tick = queue.next_wakeup_tick;
+                }
+                status.surplus_deficit_bytes = status
+                    .surplus_deficit_bytes
+                    .saturating_add(queue.surplus_deficit);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(interfaces.len());
+    for (ifindex, mut iface) in interfaces {
+        if let Some(queue_map) = queue_maps.remove(&ifindex) {
+            iface.queues = queue_map.into_values().collect();
+            iface.nonempty_queues = iface
+                .queues
+                .iter()
+                .filter(|queue| queue.queued_packets > 0 || queue.queued_bytes > 0)
+                .count();
+            iface.runnable_queues = iface
+                .queues
+                .iter()
+                .filter(|queue| queue.runnable_instances > 0)
+                .count();
+        }
+        out.push(iface);
+    }
+    out.sort_by(|a, b| {
+        a.interface_name
+            .cmp(&b.interface_name)
+            .then(a.ifindex.cmp(&b.ifindex))
+    });
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_tx_request(ifindex: i32) -> TxRequest {
+        TxRequest {
+            bytes: vec![0; 128],
+            expected_ports: None,
+            expected_addr_family: 0,
+            expected_protocol: 0,
+            flow_key: None,
+            egress_ifindex: ifindex,
+            cos_queue_id: Some(4),
+        }
+    }
+
+    #[test]
+    fn build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue() {
+        let mut forwarding = ForwardingState::default();
+        forwarding
+            .ifindex_to_config_name
+            .insert(80, "reth0.80".to_string());
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 1_875_000,
+                burst_bytes: 64 * 1024,
+                default_queue: 0,
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![CoSQueueConfig {
+                    queue_id: 4,
+                    forwarding_class: "bandwidth-10mb".to_string(),
+                    priority: 1,
+                    transmit_rate_bytes: 1_250_000,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: 32 * 1024,
+                }],
+            },
+        );
+
+        let make_root = |queued_bytes, runnable, parked, wake_tick| CoSInterfaceRuntime {
+            shaping_rate_bytes: 1_875_000,
+            burst_bytes: 64 * 1024,
+            tokens: 0,
+            last_refill_ns: 0,
+            default_queue: 0,
+            nonempty_queues: 1,
+            runnable_queues: usize::from(runnable),
+            guarantee_rr: 0,
+            queues: vec![CoSQueueRuntime {
+                queue_id: 4,
+                priority: 1,
+                transmit_rate_bytes: 1_250_000,
+                exact: false,
+                surplus_weight: 1,
+                surplus_deficit: 512,
+                buffer_bytes: 32 * 1024,
+                tokens: 0,
+                last_refill_ns: 0,
+                queued_bytes,
+                runnable,
+                parked,
+                next_wakeup_tick: wake_tick,
+                wheel_level: 0,
+                wheel_slot: 0,
+                items: VecDeque::from([CoSPendingTxItem::Local(test_tx_request(80))]),
+            }],
+            queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
+            rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
+            timer_wheel: CoSTimerWheelRuntime {
+                current_tick: 0,
+                level0: std::array::from_fn(|idx| if idx == 3 { vec![0] } else { Vec::new() }),
+                level1: std::array::from_fn(|idx| if idx == 1 { vec![0] } else { Vec::new() }),
+            },
+        };
+
+        let mut first = FastMap::default();
+        first.insert(80, make_root(1024, true, false, 0));
+        let mut second = FastMap::default();
+        second.insert(80, make_root(2048, false, true, 77));
+
+        let statuses = build_worker_cos_statuses_from_maps([&first, &second], &forwarding);
+        assert_eq!(statuses.len(), 1);
+        let iface = &statuses[0];
+        assert_eq!(iface.interface_name, "reth0.80");
+        assert_eq!(iface.worker_instances, 2);
+        assert_eq!(iface.timer_level0_sleepers, 2);
+        assert_eq!(iface.timer_level1_sleepers, 2);
+        assert_eq!(iface.nonempty_queues, 1);
+        assert_eq!(iface.runnable_queues, 1);
+        assert_eq!(iface.queues.len(), 1);
+        let queue = &iface.queues[0];
+        assert_eq!(queue.queue_id, 4);
+        assert_eq!(queue.forwarding_class, "bandwidth-10mb");
+        assert_eq!(queue.queued_packets, 2);
+        assert_eq!(queue.queued_bytes, 3072);
+        assert_eq!(queue.runnable_instances, 1);
+        assert_eq!(queue.parked_instances, 1);
+        assert_eq!(queue.next_wakeup_tick, 77);
+        assert_eq!(queue.surplus_deficit_bytes, 1024);
+    }
 }
 
 pub(crate) fn push_recent_exception(

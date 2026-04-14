@@ -386,6 +386,7 @@ type ProcessStatus struct {
 	Bindings               []BindingStatus       `json:"bindings,omitempty"`
 	RecentSessionDeltas    []SessionDeltaInfo    `json:"recent_session_deltas,omitempty"`
 	RecentExceptions       []ExceptionStatus     `json:"recent_exceptions,omitempty"`
+	CoSInterfaces          []CoSInterfaceStatus  `json:"cos_interfaces,omitempty"`
 	LastResolution         *PacketResolution     `json:"last_resolution,omitempty"`
 	SlowPath               SlowPathStatus        `json:"slow_path,omitempty"`
 	LastCacheFlushAt       uint64                `json:"last_cache_flush_at,omitempty"` // monotonic secs (#312)
@@ -393,6 +394,35 @@ type ProcessStatus struct {
 	ConfiguredMode         string                `json:"configured_mode,omitempty"`     // Desired mode from config
 	EntryPrograms          map[int]string        `json:"entry_programs,omitempty"`      // ifindex -> attached XDP program name
 	FallbackCounters       map[string]uint64     `json:"fallback_counters,omitempty"`   // reason_name -> count
+}
+
+type CoSInterfaceStatus struct {
+	Ifindex             int              `json:"ifindex,omitempty"`
+	InterfaceName       string           `json:"interface_name,omitempty"`
+	ShapingRateBytes    uint64           `json:"shaping_rate_bytes,omitempty"`
+	BurstBytes          uint64           `json:"burst_bytes,omitempty"`
+	WorkerInstances     int              `json:"worker_instances,omitempty"`
+	NonemptyQueues      int              `json:"nonempty_queues,omitempty"`
+	RunnableQueues      int              `json:"runnable_queues,omitempty"`
+	TimerLevel0Sleepers int              `json:"timer_level0_sleepers,omitempty"`
+	TimerLevel1Sleepers int              `json:"timer_level1_sleepers,omitempty"`
+	Queues              []CoSQueueStatus `json:"queues,omitempty"`
+}
+
+type CoSQueueStatus struct {
+	QueueID             int    `json:"queue_id,omitempty"`
+	ForwardingClass     string `json:"forwarding_class,omitempty"`
+	Priority            int    `json:"priority,omitempty"`
+	Exact               bool   `json:"exact,omitempty"`
+	TransmitRateBytes   uint64 `json:"transmit_rate_bytes,omitempty"`
+	BufferBytes         uint64 `json:"buffer_bytes,omitempty"`
+	WorkerInstances     int    `json:"worker_instances,omitempty"`
+	QueuedPackets       uint64 `json:"queued_packets,omitempty"`
+	QueuedBytes         uint64 `json:"queued_bytes,omitempty"`
+	RunnableInstances   int    `json:"runnable_instances,omitempty"`
+	ParkedInstances     int    `json:"parked_instances,omitempty"`
+	NextWakeupTick      uint64 `json:"next_wakeup_tick,omitempty"`
+	SurplusDeficitBytes uint64 `json:"surplus_deficit_bytes,omitempty"`
 }
 
 type HAStateUpdateRequest struct {

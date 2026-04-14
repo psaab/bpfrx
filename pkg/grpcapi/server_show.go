@@ -1314,6 +1314,19 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		return &pb.ShowTextResponse{Output: buf.String()}, nil
 	}
 
+	if req.Topic == "class-of-service" || strings.HasPrefix(req.Topic, "class-of-service:") {
+		selector := ""
+		if strings.HasPrefix(req.Topic, "class-of-service:") {
+			selector = strings.TrimPrefix(req.Topic, "class-of-service:")
+		}
+		var status *dpuserspace.ProcessStatus
+		if userspaceStatus, err := s.userspaceDataplaneStatus(); err == nil {
+			status = &userspaceStatus
+		}
+		buf.WriteString(dpuserspace.FormatCoSInterfaceSummary(cfg, status, selector))
+		return &pb.ShowTextResponse{Output: buf.String()}, nil
+	}
+
 	if strings.HasPrefix(req.Topic, "screen-ids-option:") {
 		profileName := strings.TrimPrefix(req.Topic, "screen-ids-option:")
 		if cfg == nil || len(cfg.Security.Screen) == 0 {
@@ -2093,102 +2106,6 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 			}
 			if cfg != nil && len(cfg.Security.IPsec.VPNs) > 0 {
 				fmt.Fprintf(&buf, "\n  Configured VPNs: %d\n", len(cfg.Security.IPsec.VPNs))
-			}
-		}
-
-	case "class-of-service":
-		if cfg == nil {
-			buf.WriteString("No active configuration\n")
-		} else {
-			type ifBinding struct {
-				name     string
-				inputV4  string
-				outputV4 string
-				inputV6  string
-				outputV6 string
-			}
-			var bindings []ifBinding
-			for _, ifc := range cfg.Interfaces.Interfaces {
-				for _, unit := range ifc.Units {
-					b := ifBinding{name: ifc.Name}
-					b.inputV4 = unit.FilterInputV4
-					b.outputV4 = unit.FilterOutputV4
-					b.inputV6 = unit.FilterInputV6
-					b.outputV6 = unit.FilterOutputV6
-					if b.inputV4 != "" || b.outputV4 != "" || b.inputV6 != "" || b.outputV6 != "" {
-						bindings = append(bindings, b)
-					}
-				}
-			}
-			if len(bindings) == 0 {
-				buf.WriteString("No interfaces with class-of-service configuration\n")
-			} else {
-				sort.Slice(bindings, func(i, j int) bool { return bindings[i].name < bindings[j].name })
-				printBinding := func(dir, family, filterName string) {
-					filters := cfg.Firewall.FiltersInet
-					if family == "inet6" {
-						filters = cfg.Firewall.FiltersInet6
-					}
-					f, ok := filters[filterName]
-					if !ok {
-						fmt.Fprintf(&buf, "  %s filter (%s): %s (not found)\n", dir, family, filterName)
-						return
-					}
-					fmt.Fprintf(&buf, "  %s filter (%s): %s\n", dir, family, filterName)
-					for _, term := range f.Terms {
-						var matchParts []string
-						if term.DSCP != "" {
-							matchParts = append(matchParts, "dscp "+term.DSCP)
-						}
-						if term.Protocol != "" {
-							matchParts = append(matchParts, "protocol "+term.Protocol)
-						}
-						if len(term.DestinationPorts) > 0 {
-							matchParts = append(matchParts, "port "+strings.Join(term.DestinationPorts, ","))
-						}
-						if term.ICMPType >= 0 {
-							matchParts = append(matchParts, fmt.Sprintf("icmp-type %d", term.ICMPType))
-						}
-						if term.ICMPCode >= 0 {
-							matchParts = append(matchParts, fmt.Sprintf("icmp-code %d", term.ICMPCode))
-						}
-						matchStr := "any"
-						if len(matchParts) > 0 {
-							matchStr = strings.Join(matchParts, " ")
-						}
-						action := term.Action
-						if action == "" {
-							action = "accept"
-						}
-						extras := ""
-						if term.ForwardingClass != "" {
-							extras += " forwarding-class " + term.ForwardingClass
-						}
-						if term.DSCPRewrite != "" {
-							extras += " dscp " + term.DSCPRewrite
-						}
-						if term.Log {
-							extras += " log"
-						}
-						fmt.Fprintf(&buf, "    Term %s: match %s -> %s%s\n", term.Name, matchStr, action, extras)
-					}
-				}
-				for _, b := range bindings {
-					fmt.Fprintf(&buf, "Interface: %s\n", b.name)
-					if b.inputV4 != "" {
-						printBinding("Input", "inet", b.inputV4)
-					}
-					if b.outputV4 != "" {
-						printBinding("Output", "inet", b.outputV4)
-					}
-					if b.inputV6 != "" {
-						printBinding("Input", "inet6", b.inputV6)
-					}
-					if b.outputV6 != "" {
-						printBinding("Output", "inet6", b.outputV6)
-					}
-					buf.WriteString("\n")
-				}
 			}
 		}
 

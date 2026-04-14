@@ -90,6 +90,7 @@ pub(super) struct WorkerHandle {
     pub(super) heartbeat: Arc<AtomicU64>,
     pub(super) commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
     pub(super) session_export_ack: Arc<AtomicU64>,
+    pub(super) cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
     pub(super) join: Option<JoinHandle<()>>,
 }
 
@@ -141,6 +142,7 @@ pub(super) struct ForwardingState {
     pub(super) tunnel_endpoint_by_ifindex: FastMap<i32, u16>,
     pub(super) neighbors: FastMap<(i32, IpAddr), NeighborEntry>,
     pub(super) ifindex_to_name: FastMap<i32, String>,
+    pub(super) ifindex_to_config_name: FastMap<i32, String>,
     pub(super) ifindex_to_zone: FastMap<i32, String>,
     pub(super) zone_name_to_id: FastMap<String, u16>,
     pub(super) zone_id_to_name: FastMap<u16, String>,
