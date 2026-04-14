@@ -721,7 +721,7 @@ pub(super) fn resolve_cos_queue_id(
         return Some(iface.default_queue);
     };
     let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
-    let result = if if is_v6 {
+    let has_output_filter = if is_v6 {
         forwarding
             .filter_state
             .iface_filter_out_v6
@@ -731,7 +731,8 @@ pub(super) fn resolve_cos_queue_id(
             .filter_state
             .iface_filter_out_v4
             .contains_key(&egress_ifindex)
-    } {
+    };
+    let result = if has_output_filter {
         crate::filter::evaluate_interface_output_filter(
             &forwarding.filter_state,
             egress_ifindex,
