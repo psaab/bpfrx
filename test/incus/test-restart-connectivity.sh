@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# bpfrx restart connectivity regression test
+# xpf restart connectivity regression test
 #
 # Validates that daemon restart in HA mode does not cause transient
 # connectivity loss. This tests the fix for #75 — neighbor prewarm
 # must run after VRRP MASTER (not before VIPs are installed).
 #
-# Requires: bpfrx-fw0, bpfrx-fw1, cluster-lan-host running.
+# Requires: xpf-fw0, xpf-fw1, cluster-lan-host running.
 # Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.200).
 #
 # Tests:
 #   1. Verify baseline connectivity from cluster-lan-host → IPERF_TARGET
-#   2. Restart bpfrxd on fw0 while continuously pinging
+#   2. Restart xpfd on fw0 while continuously pinging
 #   3. Assert ≤ MAX_LOST_PINGS lost during restart (default: 2)
 #   4. Repeat RESTART_CYCLES times (default: 3) to catch intermittent issues
 #
@@ -38,7 +38,7 @@ SETTLE_TIME="${SETTLE_TIME:-20}"             # seconds between cycles for cluste
 PASS=0
 FAIL=0
 ERRORS=()
-PING_LOG="/tmp/bpfrx-restart-ping.log"
+PING_LOG="/tmp/xpf-restart-ping.log"
 
 info()  { echo "==> $*"; }
 pass()  { echo "  PASS  $*"; PASS=$((PASS + 1)); }
@@ -53,7 +53,7 @@ instance_running() {
 
 fw0_is_primary() {
 	local status
-	status=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null || true)
+	status=$(incus exec xpf-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null || true)
 	for rg in 0 1 2; do
 		if ! echo "$status" | grep -A2 "Redundancy group: $rg" | grep -q "node0.*primary"; then
 			return 1
@@ -68,12 +68,12 @@ restore_fw0_primary() {
 		return 0
 	fi
 	for rg in 0 1 2; do
-		incus exec bpfrx-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
-		incus exec bpfrx-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+		incus exec xpf-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+		incus exec xpf-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
 	done
 	sleep 1
 	for rg in 0 1 2; do
-		incus exec bpfrx-fw1 -- cli -c "request chassis cluster failover redundancy-group $rg" 2>/dev/null || true
+		incus exec xpf-fw1 -- cli -c "request chassis cluster failover redundancy-group $rg" 2>/dev/null || true
 	done
 	sleep 5
 	if fw0_is_primary; then
@@ -87,13 +87,13 @@ restore_fw0_primary() {
 
 cleanup() {
 	incus exec cluster-lan-host -- pkill -9 ping 2>/dev/null || true
-	# Ensure fw0 bpfrxd is running
-	incus exec bpfrx-fw0 -- systemctl start bpfrxd 2>/dev/null || true
+	# Ensure fw0 xpfd is running
+	incus exec xpf-fw0 -- systemctl start xpfd 2>/dev/null || true
 	sleep 5
 	# Reset failover flags
 	for rg in 0 1 2; do
-		incus exec bpfrx-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
-		incus exec bpfrx-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+		incus exec xpf-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+		incus exec xpf-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
 	done
 }
 
@@ -103,13 +103,13 @@ trap cleanup EXIT
 
 info "Preflight checks"
 
-for inst in bpfrx-fw0 bpfrx-fw1 cluster-lan-host; do
+for inst in xpf-fw0 xpf-fw1 cluster-lan-host; do
 	instance_running "$inst" || die "$inst is not running"
 done
 
-for inst in bpfrx-fw0 bpfrx-fw1; do
-	if ! incus exec "$inst" -- systemctl is-active --quiet bpfrxd 2>/dev/null; then
-		die "bpfrxd not active on $inst"
+for inst in xpf-fw0 xpf-fw1; do
+	if ! incus exec "$inst" -- systemctl is-active --quiet xpfd 2>/dev/null; then
+		die "xpfd not active on $inst"
 	fi
 done
 
@@ -122,7 +122,7 @@ else
 fi
 
 # Pre-warm ARP
-incus exec bpfrx-fw0 -- ping -c 1 -W 3 "$IPERF_TARGET" &>/dev/null || true
+incus exec xpf-fw0 -- ping -c 1 -W 3 "$IPERF_TARGET" &>/dev/null || true
 sleep 1
 
 # Verify baseline connectivity
@@ -137,10 +137,10 @@ fi
 total_lost=0
 
 for cycle in $(seq 1 "$RESTART_CYCLES"); do
-	info "Cycle ${cycle}/${RESTART_CYCLES}: restart bpfrxd on fw0 while pinging"
+	info "Cycle ${cycle}/${RESTART_CYCLES}: restart xpfd on fw0 while pinging"
 
 	# Clear stale sessions
-	incus exec bpfrx-fw0 -- cli -c "clear security flow session all" 2>/dev/null || true
+	incus exec xpf-fw0 -- cli -c "clear security flow session all" 2>/dev/null || true
 	sleep 1
 
 	# Start continuous ping in background on lan-host
@@ -150,8 +150,8 @@ for cycle in $(seq 1 "$RESTART_CYCLES"); do
 	# Wait for a few pings to succeed before restart (3s)
 	sleep 3
 
-	# Restart bpfrxd on fw0
-	incus exec bpfrx-fw0 -- systemctl restart bpfrxd 2>/dev/null || true
+	# Restart xpfd on fw0
+	incus exec xpf-fw0 -- systemctl restart xpfd 2>/dev/null || true
 
 	# Wait for ping to finish (~22s total ping time minus 3s pre-restart + 5s buffer)
 	sleep 22
@@ -180,7 +180,7 @@ for cycle in $(seq 1 "$RESTART_CYCLES"); do
 	fi
 
 	# Pre-warm ARP for next cycle
-	incus exec bpfrx-fw0 -- ping -c 1 -W 3 "$IPERF_TARGET" &>/dev/null || true
+	incus exec xpf-fw0 -- ping -c 1 -W 3 "$IPERF_TARGET" &>/dev/null || true
 	sleep 1
 done
 
@@ -188,11 +188,11 @@ done
 
 info "Final health checks"
 
-for inst in bpfrx-fw0 bpfrx-fw1; do
-	if incus exec "$inst" -- systemctl is-active --quiet bpfrxd 2>/dev/null; then
-		pass "final: bpfrxd active on $inst"
+for inst in xpf-fw0 xpf-fw1; do
+	if incus exec "$inst" -- systemctl is-active --quiet xpfd 2>/dev/null; then
+		pass "final: xpfd active on $inst"
 	else
-		fail "final: bpfrxd not active on $inst"
+		fail "final: xpfd not active on $inst"
 	fi
 done
 

@@ -5,7 +5,7 @@ import (
 	"io"
 	"sort"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // SortedProbeNames returns RPM probe names in deterministic order.

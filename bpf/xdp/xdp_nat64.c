@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx XDP NAT64 translation stage.
+ * xpf XDP NAT64 translation stage.
  *
  * Handles IPv6↔IPv4 header translation for NAT64.
  * Called from xdp_nat when SESS_FLAG_NAT64 is set (forward path)
@@ -21,11 +21,11 @@
  *   - Forwards via bpf_fib_lookup + redirect
  */
 
-#include "../headers/bpfrx_common.h"
+#include "../headers/xpf_common.h"
 #define BPFRX_NAT_POOLS
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
-#include "../headers/bpfrx_nat.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
+#include "../headers/xpf_nat.h"
 
 /*
  * Compute IPv4 header checksum from scratch (10 x 16-bit words).

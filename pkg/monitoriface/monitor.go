@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
-	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/vishvananda/netlink"
 )
 
@@ -715,7 +715,7 @@ func RenderTrafficSummary(w io.Writer, hostname string, names []string, kernelNa
 	seconds := int(time.Since(startTime).Seconds())
 	now := time.Now().Format("15:04:05")
 
-	fmt.Fprintf(w, "  bpfrx %s monitor interface traffic (probing every 1.000s), mode: %s\n", hostname, SummaryModeLabel(mode))
+	fmt.Fprintf(w, "  xpf %s monitor interface traffic (probing every 1.000s), mode: %s\n", hostname, SummaryModeLabel(mode))
 	fmt.Fprintf(w, "  elapsed: %ds  time: %s\n\n", seconds, now)
 
 	switch mode {

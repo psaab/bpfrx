@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
+	"github.com/psaab/xpf/pkg/cluster"
 )
 
 func waitForCondition(t *testing.T, timeout time.Duration, fn func() bool, msg string) {

@@ -1,4 +1,4 @@
-// Package daemon implements the bpfrx daemon lifecycle.
+// Package daemon implements the xpf daemon lifecycle.
 package daemon
 
 import (

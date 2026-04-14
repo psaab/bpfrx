@@ -12,7 +12,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 // EventCallback is called for each processed event record.

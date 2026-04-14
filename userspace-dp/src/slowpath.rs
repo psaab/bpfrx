@@ -176,7 +176,7 @@ impl SlowPathReinjector {
         let thread_status = status.clone();
         let name = name.to_string();
         thread::Builder::new()
-            .name("bpfrx-slowpath".to_string())
+            .name("xpf-slowpath".to_string())
             .spawn(move || slow_path_worker(&name, rx, thread_status))
             .map_err(|e| format!("spawn slow-path worker: {e}"))?;
         Ok(Self {
@@ -476,14 +476,14 @@ mod tests {
         status.queued_packets.store(2, Ordering::Relaxed);
         status.injected_packets.store(3, Ordering::Relaxed);
         status.set_mode("io_uring");
-        status.set_device_name("bpfrx-usp0");
+        status.set_device_name("xpf-usp0");
         status.set_last_error("none".to_string());
         let snap = status.snapshot();
         assert!(snap.active);
         assert_eq!(snap.queued_packets, 2);
         assert_eq!(snap.injected_packets, 3);
         assert_eq!(snap.mode, "io_uring");
-        assert_eq!(snap.device_name, "bpfrx-usp0");
+        assert_eq!(snap.device_name, "xpf-usp0");
         assert_eq!(snap.last_error, "none");
     }
 }

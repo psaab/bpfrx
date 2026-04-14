@@ -1,4 +1,4 @@
-# bpfrx Issue History
+# xpf Issue History
 
 Complete record of all issues filed and resolved.
 Total: 378 issues (364 closed, 14 open)
@@ -109,8 +109,8 @@ Host-inbound enforcement currently allows unrecognized services by default, even
 ## Why this is a bug
 `host_inbound_flag()` returns 0 for unknown protocols/ports with explicit "allowed by default" comments:
 
-- `bpf/headers/bpfrx_helpers.h:915-916`
-- `bpf/headers/bpfrx_helpers.h:966`
+- `bpf/headers/xpf_helpers.h:915-916`
+- `bpf/headers/xpf_helpers.h:966`
 
 `xdp_forward` only denies when `flag != 0` and the bit is not allowed:
 
@@ -629,7 +629,7 @@ NAT rule counter IDs are allocated monotonically with no bound check, but the `n
   - `pkg/dataplane/compiler.go:2011`
 - Map capacity constant:
   - `pkg/dataplane/types.go:415`
-  - `bpf/headers/bpfrx_common.h:150`
+  - `bpf/headers/xpf_common.h:150`
 - Runtime counter lookup by key:
   - `bpf/xdp/xdp_policy.c:1291`
   - `bpf/xdp/xdp_policy.c:1566`
@@ -661,7 +661,7 @@ This can yield a successful compile with partially missing pool programming.
   - `pkg/dataplane/compiler.go:2578`
   - `pkg/dataplane/compiler.go:2584`
 - Pool capacity in dataplane:
-  - `bpf/headers/bpfrx_common.h:148`
+  - `bpf/headers/xpf_common.h:148`
 
 ## Expected
 - Hard-fail when `NextPoolID` reaches pool capacity.
@@ -761,7 +761,7 @@ This is O(N rules) per packet for the selected zone pair, with map lookup overhe
   - `bpf/xdp/xdp_policy.c:1190`
   - `bpf/xdp/xdp_policy.c:1195`
 - Two-level design currently relies on flat array lookups per rule:
-  - `bpf/headers/bpfrx_maps.h:133`
+  - `bpf/headers/xpf_maps.h:133`
 
 ## Improvement ideas
 - Add protocol/app buckets (compile-time index) to reduce candidate set before full match checks.
@@ -788,9 +788,9 @@ Given bounded zone IDs (`MAX_ZONES`), this can be represented as array indexing 
   - `bpf/xdp/xdp_policy.c:1104`
   - `bpf/xdp/xdp_policy.c:1108`
 - Current map type is HASH:
-  - `bpf/headers/bpfrx_maps.h:170`
+  - `bpf/headers/xpf_maps.h:170`
 - Key space is bounded by zones:
-  - `bpf/headers/bpfrx_maps.h:171`
+  - `bpf/headers/xpf_maps.h:171`
 
 ## Improvement ideas
 - Replace `zone_pair_policies` with an ARRAY keyed by flattened index: `from_zone * MAX_ZONES + to_zone`.
@@ -844,9 +844,9 @@ For both IPv4 and IPv6 permit paths, SNAT selection iterates `rule_idx` and does
   - `bpf/xdp/xdp_policy.c:1547`
   - `bpf/xdp/xdp_policy.c:1550`
 - SNAT maps are HASH keyed by `(from_zone,to_zone,rule_idx)`:
-  - `bpf/headers/bpfrx_maps.h:452`
-  - `bpf/headers/bpfrx_maps.h:476`
-  - `bpf/headers/bpfrx_maps.h:533`
+  - `bpf/headers/xpf_maps.h:452`
+  - `bpf/headers/xpf_maps.h:476`
+  - `bpf/headers/xpf_maps.h:533`
 
 ## Improvement ideas
 - Maintain per-zone-pair rule-count/offset and store rules in array-backed layout for O(1) sequential access without hash lookups.
@@ -945,14 +945,14 @@ For each filtered packet, the program iterates terms and does `bpf_map_lookup_el
 
 ## Evidence
 - Input filter loop:
-  - `bpf/headers/bpfrx_helpers.h:1113`
-  - `bpf/headers/bpfrx_helpers.h:1122`
+  - `bpf/headers/xpf_helpers.h:1113`
+  - `bpf/headers/xpf_helpers.h:1122`
 - Output filter loop:
-  - `bpf/headers/bpfrx_helpers.h:1327`
-  - `bpf/headers/bpfrx_helpers.h:1336`
+  - `bpf/headers/xpf_helpers.h:1327`
+  - `bpf/headers/xpf_helpers.h:1336`
 - lo0-by-id loop:
-  - `bpf/headers/bpfrx_helpers.h:1507`
-  - `bpf/headers/bpfrx_helpers.h:1516`
+  - `bpf/headers/xpf_helpers.h:1507`
+  - `bpf/headers/xpf_helpers.h:1516`
 - Called from hot stages:
   - `bpf/xdp/xdp_main.c:133`
   - `bpf/xdp/xdp_cpumap.c:80`
@@ -984,7 +984,7 @@ Every packet that traverses the normal pipeline pays at least two hash lookups a
   - `bpf/xdp/xdp_zone.c:445`
   - `bpf/xdp/xdp_zone.c:451`
 - Map type is HASH:
-  - `bpf/headers/bpfrx_maps.h:105`
+  - `bpf/headers/xpf_maps.h:105`
 
 ## Improvement ideas
 - Carry resolved ingress zone/iface metadata from screen to zone in `pkt_meta` (or a compact cached struct) and skip the second lookup on the common path.
@@ -1003,10 +1003,10 @@ Per-CPU map slots are CPU-local. Using atomic RMW on every counter increment add
 
 ## Evidence
 - Atomic increment helper:
-  - `bpf/headers/bpfrx_helpers.h:679`
-  - `bpf/headers/bpfrx_helpers.h:683`
+  - `bpf/headers/xpf_helpers.h:679`
+  - `bpf/headers/xpf_helpers.h:683`
 - Backing map is per-CPU:
-  - `bpf/headers/bpfrx_maps.h:283`
+  - `bpf/headers/xpf_maps.h:283`
 - Widely used on hot paths:
   - `bpf/xdp/xdp_main.c:176`
   - `bpf/xdp/xdp_forward.c:226`
@@ -1073,7 +1073,7 @@ Integer division/modulo is relatively expensive in BPF JITed code, and atomic RM
 - Atomic increment on per-CPU counter:
   - `bpf/tc/tc_forward.c:89`
 - `mirror_counter` is per-CPU array:
-  - `bpf/headers/bpfrx_maps.h:759`
+  - `bpf/headers/xpf_maps.h:759`
 
 ## Improvement ideas
 - Replace atomic increment with direct increment for per-CPU counter.
@@ -1131,7 +1131,7 @@ These loops are significantly heavier than incremental delta updates and can dom
 - 4->6 path calls CHECKSUM_PARTIAL finalization:
   - `bpf/xdp/xdp_nat64.c:522`
 - Finalization helper loop (up to 750 iterations):
-  - `bpf/headers/bpfrx_helpers.h:372`
+  - `bpf/headers/xpf_helpers.h:372`
 
 ## Improvement ideas
 - Prefer incremental checksum transformations where feasible instead of full payload summation.
@@ -1153,9 +1153,9 @@ XDP forwarding redirects through `tx_ports` implemented as `BPF_MAP_TYPE_DEVMAP_
 - Redirect hot path:
   - `bpf/xdp/xdp_forward.c:264`
 - Current map type:
-  - `bpf/headers/bpfrx_maps.h:307`
+  - `bpf/headers/xpf_maps.h:307`
 - Interface cardinality appears bounded:
-  - `bpf/headers/bpfrx_common.h:143`
+  - `bpf/headers/xpf_common.h:143`
 
 ## Improvement ideas
 - Evaluate replacing `BPF_MAP_TYPE_DEVMAP_HASH` with `BPF_MAP_TYPE_DEVMAP` using compact compiler-assigned port indices.
@@ -1178,7 +1178,7 @@ This creates a failover-specific checksum inconsistency: packets redirected over
 - IPv6 path explicitly guards incremental L4 updates on `!meta->csum_partial`:
   - `bpf/xdp/xdp_zone.c:272-299`
 - Main NAT rewrite path is checksum-partial-aware for IPv4:
-  - `bpf/headers/bpfrx_nat.h:142-190`
+  - `bpf/headers/xpf_nat.h:142-190`
 
 ## Why this is risky during failover
 During active/active transitions, `apply_dnat_before_fabric_redirect()` is hit in fast redirect branches before `xdp_nat`. If checksum handling diverges from the regular NAT path, some flows can fail only during RG movement, matching the observed “random” failover-time drops.
@@ -1493,7 +1493,7 @@ When HA mode is enabled (`cfg.Chassis.Cluster != nil`):
 In HA, correctness and deterministic failover are more important than preserving local forwarding through daemon restarts.
 
 ## Acceptance criteria
-- In HA mode, stopping or crashing `bpfrxd` on a node does **not** leave it forwarding traffic as active owner.
+- In HA mode, stopping or crashing `xpfd` on a node does **not** leave it forwarding traffic as active owner.
 - Peer failover converges without prolonged dual-active forwarding.
 - Standalone mode still supports hitless restart behavior.
 - Regression test covers HA daemon-stop/crash path and validates no stale forwarding from the stopped node.
@@ -2568,12 +2568,12 @@ But this path is not executed for ungraceful termination.
 No dataplane-side liveness deadline/watchdog enforces fail-closed when control plane stops making progress.
 
 ## Expected
-Add an HA liveness mechanism so forwarding ownership fails closed even on ungraceful bpfrxd failure:
+Add an HA liveness mechanism so forwarding ownership fails closed even on ungraceful xpfd failure:
 - userspace heartbeat timestamp map checked in XDP/TC fast path, or
 - systemd watchdog/fencing integration that deterministically disables local forwarding state
 
 ## Acceptance criteria
-- In HA mode, killing bpfrxd ungracefully (`kill -9`) on primary stops local forwarding ownership within a bounded small window.
+- In HA mode, killing xpfd ungracefully (`kill -9`) on primary stops local forwarding ownership within a bounded small window.
 - Peer takeover proceeds without prolonged dual-forwarding behavior.
 - Behavior is covered by automated HA crash/hung-node test assertions.
 
@@ -2682,7 +2682,7 @@ This points to VIP ownership overlap (or repeated ownership re-advertisement) th
 
 We need true vSRX HA syntax compatibility for dual fabric interfaces (`fab0` + `fab1`) as seen in `vsrx.conf`.
 
-Today bpfrx can parse interface stanzas for `fab0`/`fab1`, but core HA transport/data-plane still assumes a single fabric endpoint (`fabric-interface`/`fabric-peer-address`), which is not equivalent to vSRX dual-fabric behavior.
+Today xpf can parse interface stanzas for `fab0`/`fab1`, but core HA transport/data-plane still assumes a single fabric endpoint (`fabric-interface`/`fabric-peer-address`), which is not equivalent to vSRX dual-fabric behavior.
 
 Reference doc added:
 - `docs/next-features/vsrx-fabric-fab0-fab1-syntax-compat.md`
@@ -2699,7 +2699,7 @@ Reference doc added:
   - `pkg/cluster/cluster.go` (`InterfacesInput` has one `FabricInterface`)
   - `pkg/cli/cli.go` and `pkg/grpcapi/server.go` populate one value
 - eBPF fabric forwarding state is singleton:
-  - `bpf/headers/bpfrx_maps.h` (`fabric_fwd` map `max_entries = 1`)
+  - `bpf/headers/xpf_maps.h` (`fabric_fwd` map `max_entries = 1`)
 - DPDK parity is singleton:
   - `dpdk_worker/shared_mem.h` (`fabric_port_id` scalar)
   - `pkg/dataplane/dpdk/dpdk_cgo.go` writes one fabric port
@@ -3077,7 +3077,7 @@ If the active node is disconnected from peer sync and sessions age out/delete lo
 `go vet` reports:
 
 ```
-pkg/cluster/sync.go:197:9: return copies lock value: github.com/psaab/bpfrx/pkg/cluster.SyncStats contains sync/atomic.Uint64 contains sync/atomic.noCopy
+pkg/cluster/sync.go:197:9: return copies lock value: github.com/psaab/xpf/pkg/cluster.SyncStats contains sync/atomic.Uint64 contains sync/atomic.noCopy
 ```
 
 ## Impact
@@ -3106,8 +3106,8 @@ Because `try_fabric_redirect()` and `try_fabric_redirect_with_zone()` always pre
 ## Code
 - `pkg/daemon/daemon.go:4183`
 - `pkg/daemon/daemon.go:4312`
-- `bpf/headers/bpfrx_helpers.h:1962`
-- `bpf/headers/bpfrx_helpers.h:2019`
+- `bpf/headers/xpf_helpers.h:1962`
+- `bpf/headers/xpf_helpers.h:2019`
 
 ## Impact
 - existing-session fabric redirect can blackhole after a fabric flap
@@ -3218,7 +3218,7 @@ The Go dataplane layer now exposes `UpdateFabricFwd()` / `UpdateFabricFwd1()` fo
 - `pkg/dataplane/dpdk/dpdk_cgo.go:1164`
 - `pkg/dataplane/dpdk/dpdk_cgo.go:1185`
 - `dpdk_worker/zone.c:42`
-- BPF reference behavior: `bpf/headers/bpfrx_helpers.h:1962` and `:2019`
+- BPF reference behavior: `bpf/headers/xpf_helpers.h:1962` and `:2019`
 
 ## Impact
 - DPDK HA behavior appears materially behind eBPF for fabric redirect
@@ -3482,9 +3482,9 @@ Why this matters:
 - Cross-chassis forwarded traffic can therefore be under-reported or appear missing even when the dataplane is actively redirecting packets over the fabric.
 
 Code evidence:
-- Per-interface TX accounting exists via `inc_iface_tx()`: `bpf/headers/bpfrx_helpers.h:782-786`.
+- Per-interface TX accounting exists via `inc_iface_tx()`: `bpf/headers/xpf_helpers.h:782-786`.
 - Normal forward path uses it in `xdp_forward`: `bpf/xdp/xdp_forward.c:171-173`, `bpf/xdp/xdp_forward.c:225-228`.
-- The fabric redirect helpers do not call it; they only bump `GLOBAL_CTR_FABRIC_REDIRECT` before `bpf_redirect_map(...)`: `bpf/headers/bpfrx_helpers.h:1981-1995`, `bpf/headers/bpfrx_helpers.h:2046-2058`.
+- The fabric redirect helpers do not call it; they only bump `GLOBAL_CTR_FABRIC_REDIRECT` before `bpf_redirect_map(...)`: `bpf/headers/xpf_helpers.h:1981-1995`, `bpf/headers/xpf_helpers.h:2046-2058`.
 - Userspace readers prefer these BPF interface counters for monitor/show output: `pkg/cli/monitor_interface.go:37-44`, `pkg/grpcapi/server.go:8671-8677`, `pkg/dataplane/maps.go:788-804`.
 
 Impact:
@@ -3507,7 +3507,7 @@ Why this matters:
 - This makes HA troubleshooting misleading and encourages chasing forwarding bugs that are really observability bugs.
 
 Code evidence:
-- Cross-chassis forwarding uses `try_fabric_redirect()` / `try_fabric_redirect_with_zone()` and returns `bpf_redirect_map(...)` directly: `bpf/headers/bpfrx_helpers.h:1981-1995`, `bpf/headers/bpfrx_helpers.h:2046-2058`.
+- Cross-chassis forwarding uses `try_fabric_redirect()` / `try_fabric_redirect_with_zone()` and returns `bpf_redirect_map(...)` directly: `bpf/headers/xpf_helpers.h:1981-1995`, `bpf/headers/xpf_helpers.h:2046-2058`.
 - `monitor traffic` is just a thin wrapper around `tcpdump`: `pkg/cli/cli.go:10480-10528`.
 - Fabric interfaces are now IPVLAN overlays for addressing, while the actual dataplane runs on the physical parent/member: `pkg/daemon/daemon.go:1501-1503`, `pkg/daemon/daemon.go:4155-4159`, `pkg/daemon/daemon.go:4219-4222`.
 - Repo performance docs explicitly describe the fast path as native XDP + `ndo_xdp_xmit` -> `bpf_redirect_map`: `docs/optimizations.md:17-26`.
@@ -3533,7 +3533,7 @@ Why this matters:
 - Today, even after fixing interface counter accounting, there is still no fabric-specific telemetry that answers "did this go over fab0 or fab1, and why?"
 
 Code evidence:
-- The redirect helpers increment only one global counter, `GLOBAL_CTR_FABRIC_REDIRECT`, for both fab0 and fab1: `bpf/headers/bpfrx_helpers.h:1985`, `bpf/headers/bpfrx_helpers.h:1993`, `bpf/headers/bpfrx_helpers.h:2049`, `bpf/headers/bpfrx_helpers.h:2056`.
+- The redirect helpers increment only one global counter, `GLOBAL_CTR_FABRIC_REDIRECT`, for both fab0 and fab1: `bpf/headers/xpf_helpers.h:1985`, `bpf/headers/xpf_helpers.h:1993`, `bpf/headers/xpf_helpers.h:2049`, `bpf/headers/xpf_helpers.h:2056`.
 - There is no separate per-link counter or ring-buffer event emitted from the fabric redirect path.
 - The current telemetry therefore cannot distinguish:
   - fab0 vs fab1 use
@@ -3628,7 +3628,7 @@ Impact:
 
 Suggested fix:
 
-- Decide the bpfrx semantics for `probe-limit`.
+- Decide the xpf semantics for `probe-limit`.
 - Either implement it and expose it in show output, or reject it explicitly instead of silently ignoring it.
 
 
@@ -3831,7 +3831,7 @@ Impact:
 
 Suggested fix:
 
-- Define bpfrx semantics for this knob and implement them, or reject / warn explicitly.
+- Define xpf semantics for this knob and implement them, or reject / warn explicitly.
 
 
 ---
@@ -3851,7 +3851,7 @@ Current state:
 Impact:
 
 - The config knob does not control actual behavior.
-- bpfrx cannot match vSRX enable/disable semantics for policy stats.
+- xpf cannot match vSRX enable/disable semantics for policy stats.
 
 Suggested fix:
 
@@ -3875,7 +3875,7 @@ Suggested fix:
 Several gateways in `vsrx.conf` specify `external-interface` without `local-address` (for example `ATH-MARTIS`, `ATH-MINN`, `ATH-CLE` around `vsrx.conf:350-369`). Today those tunnels rely on strongSwan/kernel default source selection instead of Junos-style interface binding.
 
 ## Expected behavior
-When `external-interface` is configured, bpfrx should either:
+When `external-interface` is configured, xpf should either:
 - resolve the current address on that interface and set `local_addrs`, or
 - otherwise program strongSwan/kernel state so the IKE/IPsec connection is pinned to that interface in a deterministic, Junos-compatible way.
 
@@ -3939,7 +3939,7 @@ Obfuscated Junos PSKs (`$9$...`) are parsed as literal strings and written direc
 - `vsrx.conf` contains an obfuscated key at `vsrx.conf:321`
 
 ## Why this matters
-A config imported from Junos display output can look valid but fail every IKE authentication attempt because bpfrx never de-obfuscates or rejects `$9$` secret material.
+A config imported from Junos display output can look valid but fail every IKE authentication attempt because xpf never de-obfuscates or rejects `$9$` secret material.
 
 ## Expected behavior
 Either:
@@ -3978,7 +3978,7 @@ All IKE gateways become PSK-authenticated regardless of configured auth method.
 ## #159 — ipsec: full traffic-selector syntax is still unsupported; only one local_ts/remote_ts pair exists [CLOSED] (closed 2026-03-07)
 
 ## Summary
-bpfrx still only models one `local_ts` / `remote_ts` pair per VPN via `local-identity` and `remote-identity`. Junos `traffic-selector` syntax is not represented in the parser or runtime.
+xpf still only models one `local_ts` / `remote_ts` pair per VPN via `local-identity` and `remote-identity`. Junos `traffic-selector` syntax is not represented in the parser or runtime.
 
 ## Evidence
 - VPN model only has one `LocalID` and `RemoteID` string: `pkg/config/types.go:1554-1563`
@@ -4256,7 +4256,7 @@ That means the dataplane can skip fabric redirect exactly in the failover case w
 
 ## Code
 - `bpf/xdp/xdp_zone.c:1385-1396`
-- `bpf/headers/bpfrx_helpers.h:2150-2158`
+- `bpf/headers/xpf_helpers.h:2150-2158`
 - `pkg/dataplane/compiler.go:666-698`
 
 ## Current behavior
@@ -4812,10 +4812,10 @@ The helper-side event-stream control reader in `userspace-dp/src/event_stream.rs
 Under HA failover load, demotion prep depends on `Pause` / `DrainRequest` / `Ack` working reliably. If the helper misses or truncates a control frame, the daemon can believe the stream is drained or paused while the helper never actually applied that control transition.
 
 ## Code
-- [userspace-dp/src/event_stream.rs:544](https://github.com/psaab/bpfrx/blob/master/userspace-dp/src/event_stream.rs#L544) allocates a fixed `read_buf`
-- [userspace-dp/src/event_stream.rs:695](https://github.com/psaab/bpfrx/blob/master/userspace-dp/src/event_stream.rs#L695) does a plain `read()` into that buffer
-- [userspace-dp/src/event_stream.rs:728](https://github.com/psaab/bpfrx/blob/master/userspace-dp/src/event_stream.rs#L728) hands the raw bytes to `process_control_frames(...)`
-- [userspace-dp/src/event_stream.rs:737](https://github.com/psaab/bpfrx/blob/master/userspace-dp/src/event_stream.rs#L737) walks the bytes as if complete frames are already present
+- [userspace-dp/src/event_stream.rs:544](https://github.com/psaab/xpf/blob/master/userspace-dp/src/event_stream.rs#L544) allocates a fixed `read_buf`
+- [userspace-dp/src/event_stream.rs:695](https://github.com/psaab/xpf/blob/master/userspace-dp/src/event_stream.rs#L695) does a plain `read()` into that buffer
+- [userspace-dp/src/event_stream.rs:728](https://github.com/psaab/xpf/blob/master/userspace-dp/src/event_stream.rs#L728) hands the raw bytes to `process_control_frames(...)`
+- [userspace-dp/src/event_stream.rs:737](https://github.com/psaab/xpf/blob/master/userspace-dp/src/event_stream.rs#L737) walks the bytes as if complete frames are already present
 
 If `read()` returns fewer than 16 bytes, or returns a partial frame plus the start of another frame, the parser has no accumulation buffer and drops the incomplete data.
 
@@ -4837,12 +4837,12 @@ Graceful RG demotion is using this path as part of the handoff barrier before `P
 
 ## Code
 Daemon side:
-- [pkg/dataplane/userspace/eventstream.go:116](https://github.com/psaab/bpfrx/blob/master/pkg/dataplane/userspace/eventstream.go#L116) `SendDrainRequest(...)` writes `EventTypeDrainRequest` with `seq=0`
-- [pkg/daemon/daemon.go:4009](https://github.com/psaab/bpfrx/blob/master/pkg/daemon/daemon.go#L4009) demotion prep relies on `SendDrainRequest(...)` before the final peer barrier
+- [pkg/dataplane/userspace/eventstream.go:116](https://github.com/psaab/xpf/blob/master/pkg/dataplane/userspace/eventstream.go#L116) `SendDrainRequest(...)` writes `EventTypeDrainRequest` with `seq=0`
+- [pkg/daemon/daemon.go:4009](https://github.com/psaab/xpf/blob/master/pkg/daemon/daemon.go#L4009) demotion prep relies on `SendDrainRequest(...)` before the final peer barrier
 
 Helper side:
-- [userspace-dp/src/event_stream.rs:781](https://github.com/psaab/bpfrx/blob/master/userspace-dp/src/event_stream.rs#L781) treats the control-frame sequence as the drain target
-- [userspace-dp/src/event_stream.rs:796](https://github.com/psaab/bpfrx/blob/master/userspace-dp/src/event_stream.rs#L796) exits as soon as the replay buffer already satisfies `>= target_seq`
+- [userspace-dp/src/event_stream.rs:781](https://github.com/psaab/xpf/blob/master/userspace-dp/src/event_stream.rs#L781) treats the control-frame sequence as the drain target
+- [userspace-dp/src/event_stream.rs:796](https://github.com/psaab/xpf/blob/master/userspace-dp/src/event_stream.rs#L796) exits as soon as the replay buffer already satisfies `>= target_seq`
 
 Because `target_seq` is currently always `0`, this path is not fencing anything meaningful.
 
@@ -4863,9 +4863,9 @@ The daemon-side userspace event-stream receiver marks a sequence as received bef
 The local helper->daemon stream is supposed to be the lower-latency path for userspace session replication. If `Ack` means "read from the socket" instead of "fully handed off to session sync", reconnect/replay can lose events under slow callbacks, demotion prep, or daemon-side stalls.
 
 ## Code
-- [pkg/dataplane/userspace/eventstream.go:271](https://github.com/psaab/bpfrx/blob/master/pkg/dataplane/userspace/eventstream.go#L271) stores `lastRecvSeq` before invoking `onEvent(...)`
-- [pkg/dataplane/userspace/eventstream.go:315](https://github.com/psaab/bpfrx/blob/master/pkg/dataplane/userspace/eventstream.go#L315) runs a separate periodic ack loop
-- [pkg/dataplane/userspace/eventstream.go:330](https://github.com/psaab/bpfrx/blob/master/pkg/dataplane/userspace/eventstream.go#L330) sends `Ack` based on `lastRecvSeq` rather than on post-callback completion
+- [pkg/dataplane/userspace/eventstream.go:271](https://github.com/psaab/xpf/blob/master/pkg/dataplane/userspace/eventstream.go#L271) stores `lastRecvSeq` before invoking `onEvent(...)`
+- [pkg/dataplane/userspace/eventstream.go:315](https://github.com/psaab/xpf/blob/master/pkg/dataplane/userspace/eventstream.go#L315) runs a separate periodic ack loop
+- [pkg/dataplane/userspace/eventstream.go:330](https://github.com/psaab/xpf/blob/master/pkg/dataplane/userspace/eventstream.go#L330) sends `Ack` based on `lastRecvSeq` rather than on post-callback completion
 
 That means a slow or blocked `onEvent(...)` can still be acked to the helper.
 
@@ -4886,9 +4886,9 @@ During userspace demotion prep, the daemon pauses the sweep producer but does no
 Under active failover load, graceful demotion is supposed to stop at a well-defined handoff point. Right now the kernel event producer is not part of that handoff. Events that arrive after demotion prep starts but before the RG move completes are neither synced immediately nor explicitly fenced.
 
 ## Code
-- [pkg/daemon/daemon.go:721](https://github.com/psaab/bpfrx/blob/master/pkg/daemon/daemon.go#L721) drops ring-buffer `SESSION_OPEN` events when `userspaceDemotionPrepActive()` is true
-- [pkg/cluster/sync.go:817](https://github.com/psaab/bpfrx/blob/master/pkg/cluster/sync.go#L817) `PauseIncrementalSync(...)` only pauses the sweep producer
-- [pkg/daemon/daemon.go:3998](https://github.com/psaab/bpfrx/blob/master/pkg/daemon/daemon.go#L3998) demotion prep then focuses on userspace export/drain and the peer barrier
+- [pkg/daemon/daemon.go:721](https://github.com/psaab/xpf/blob/master/pkg/daemon/daemon.go#L721) drops ring-buffer `SESSION_OPEN` events when `userspaceDemotionPrepActive()` is true
+- [pkg/cluster/sync.go:817](https://github.com/psaab/xpf/blob/master/pkg/cluster/sync.go#L817) `PauseIncrementalSync(...)` only pauses the sweep producer
+- [pkg/daemon/daemon.go:3998](https://github.com/psaab/xpf/blob/master/pkg/daemon/daemon.go#L3998) demotion prep then focuses on userspace export/drain and the peer barrier
 
 This leaves the kernel-side event producer outside the demotion drain contract.
 
@@ -4919,11 +4919,11 @@ We are trying to make HA failover deterministic under sustained traffic, but the
 
 ## Code
 Event producer:
-- [pkg/daemon/daemon.go:715](https://github.com/psaab/bpfrx/blob/master/pkg/daemon/daemon.go#L715) wires `SESSION_OPEN` to immediate `QueueSessionV4/V6(...)`
+- [pkg/daemon/daemon.go:715](https://github.com/psaab/xpf/blob/master/pkg/daemon/daemon.go#L715) wires `SESSION_OPEN` to immediate `QueueSessionV4/V6(...)`
 
 Sweep producer:
-- [pkg/cluster/sync.go:673](https://github.com/psaab/bpfrx/blob/master/pkg/cluster/sync.go#L673) still defaults to a 1-second active sweep interval
-- [pkg/cluster/sync.go:755](https://github.com/psaab/bpfrx/blob/master/pkg/cluster/sync.go#L755) republishes sessions when `Created >= threshold || LastSeen >= threshold`
+- [pkg/cluster/sync.go:673](https://github.com/psaab/xpf/blob/master/pkg/cluster/sync.go#L673) still defaults to a 1-second active sweep interval
+- [pkg/cluster/sync.go:755](https://github.com/psaab/xpf/blob/master/pkg/cluster/sync.go#L755) republishes sessions when `Created >= threshold || LastSeen >= threshold`
 
 There is no explicit coordination saying "ring event owns create, sweep only reconciles missed events."
 
@@ -4959,13 +4959,13 @@ That makes latency scale with total session count instead of the amount of outpu
 
 ## Code
 Local CLI path:
-- [pkg/cli/cli.go:3325](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3325) collects all IPv4 sessions for later sorting
-- [pkg/cli/cli.go:3367](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3367) sorts all IPv4 entries
-- [pkg/cli/cli.go:3422](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3422) resolves policy/app display during render
-- [pkg/cli/cli.go:3476](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3476) repeats the same pattern for IPv6
+- [pkg/cli/cli.go:3325](https://github.com/psaab/xpf/blob/master/pkg/cli/cli.go#L3325) collects all IPv4 sessions for later sorting
+- [pkg/cli/cli.go:3367](https://github.com/psaab/xpf/blob/master/pkg/cli/cli.go#L3367) sorts all IPv4 entries
+- [pkg/cli/cli.go:3422](https://github.com/psaab/xpf/blob/master/pkg/cli/cli.go#L3422) resolves policy/app display during render
+- [pkg/cli/cli.go:3476](https://github.com/psaab/xpf/blob/master/pkg/cli/cli.go#L3476) repeats the same pattern for IPv6
 
 The reverse-lookup merge is another multiplier:
-- [pkg/cli/cli.go:3449](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3449) / adjacent local logic performs reverse/NAT formatting after per-session data gathering
+- [pkg/cli/cli.go:3449](https://github.com/psaab/xpf/blob/master/pkg/cli/cli.go#L3449) / adjacent local logic performs reverse/NAT formatting after per-session data gathering
 - the same pattern also exists server-side in `GetSessions(...)` for peer fetches
 
 ## Expected fix
@@ -4991,9 +4991,9 @@ Move away from full-table CLI materialization. Reasonable options:
 Operators expect an interface filter to answer "what sessions are hitting this interface?" Today it answers "what sessions are in the same zone as this interface?" Those are not the same thing.
 
 ## Code
-- [pkg/cli/cli.go:3140](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3140) parses `interface` and resolves it to `zoneID`
-- [pkg/cli/cli.go:3178](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3178) matches IPv4 sessions by `IngressZone` / `EgressZone`
-- [pkg/cli/cli.go:3209](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3209) does the same for IPv6
+- [pkg/cli/cli.go:3140](https://github.com/psaab/xpf/blob/master/pkg/cli/cli.go#L3140) parses `interface` and resolves it to `zoneID`
+- [pkg/cli/cli.go:3178](https://github.com/psaab/xpf/blob/master/pkg/cli/cli.go#L3178) matches IPv4 sessions by `IngressZone` / `EgressZone`
+- [pkg/cli/cli.go:3209](https://github.com/psaab/xpf/blob/master/pkg/cli/cli.go#L3209) does the same for IPv6
 
 No actual ingress/egress interface comparison happens in the filter path.
 
@@ -5030,18 +5030,18 @@ Brief output:
 
 ## Code
 Local detailed rendering:
-- [pkg/cli/cli.go:3440](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3440)
-- [pkg/cli/cli.go:3461](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3461)
+- [pkg/cli/cli.go:3440](https://github.com/psaab/xpf/blob/master/pkg/cli/cli.go#L3440)
+- [pkg/cli/cli.go:3461](https://github.com/psaab/xpf/blob/master/pkg/cli/cli.go#L3461)
 
 Peer detailed rendering:
-- [pkg/cli/cli.go:3742](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3742)
-- [pkg/cli/cli.go:3752](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3752)
+- [pkg/cli/cli.go:3742](https://github.com/psaab/xpf/blob/master/pkg/cli/cli.go#L3742)
+- [pkg/cli/cli.go:3752](https://github.com/psaab/xpf/blob/master/pkg/cli/cli.go#L3752)
 
 Available data model fields:
-- [pkg/grpcapi/bpfrxv1/bpfrx.pb.go:2430](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/bpfrxv1/bpfrx.pb.go#L2430) `IngressInterface`
-- [pkg/grpcapi/bpfrxv1/bpfrx.pb.go:2431](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/bpfrxv1/bpfrx.pb.go#L2431) `EgressInterface`
-- [pkg/grpcapi/bpfrxv1/bpfrx.pb.go:2424](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/bpfrxv1/bpfrx.pb.go#L2424) `IngressZoneName`
-- [pkg/grpcapi/bpfrxv1/bpfrx.pb.go:2425](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/bpfrxv1/bpfrx.pb.go#L2425) `EgressZoneName`
+- [pkg/grpcapi/xpfv1/xpf.pb.go:2430](https://github.com/psaab/xpf/blob/master/pkg/grpcapi/xpfv1/xpf.pb.go#L2430) `IngressInterface`
+- [pkg/grpcapi/xpfv1/xpf.pb.go:2431](https://github.com/psaab/xpf/blob/master/pkg/grpcapi/xpfv1/xpf.pb.go#L2431) `EgressInterface`
+- [pkg/grpcapi/xpfv1/xpf.pb.go:2424](https://github.com/psaab/xpf/blob/master/pkg/grpcapi/xpfv1/xpf.pb.go#L2424) `IngressZoneName`
+- [pkg/grpcapi/xpfv1/xpf.pb.go:2425](https://github.com/psaab/xpf/blob/master/pkg/grpcapi/xpfv1/xpf.pb.go#L2425) `EgressZoneName`
 
 ## Expected fix
 Standardize the session display format so every detailed session entry shows:
@@ -5068,10 +5068,10 @@ The local CLI currently does its own full-table walk. That is one problem. But t
 
 ## Code
 Server-side session listing:
-- [pkg/grpcapi/server.go:896](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/server.go#L896) iterates IPv4 sessions
-- [pkg/grpcapi/server.go:930](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/server.go#L930) does reverse-session lookup per included IPv4 session
-- [pkg/grpcapi/server.go:944](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/server.go#L944) repeats the same for IPv6
-- [pkg/grpcapi/server.go:989](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/server.go#L989) sorts the full assembled result slice
+- [pkg/grpcapi/server.go:896](https://github.com/psaab/xpf/blob/master/pkg/grpcapi/server.go#L896) iterates IPv4 sessions
+- [pkg/grpcapi/server.go:930](https://github.com/psaab/xpf/blob/master/pkg/grpcapi/server.go#L930) does reverse-session lookup per included IPv4 session
+- [pkg/grpcapi/server.go:944](https://github.com/psaab/xpf/blob/master/pkg/grpcapi/server.go#L944) repeats the same for IPv6
+- [pkg/grpcapi/server.go:989](https://github.com/psaab/xpf/blob/master/pkg/grpcapi/server.go#L989) sorts the full assembled result slice
 
 ## Additional concern
 `limit` and `offset` are applied while iterating, but the server still walks the full table to compute `Total` and still builds/sorts the returned slice after expensive enrichment. This is not a streaming or cheap-paging design.
@@ -5622,8 +5622,8 @@ If the first reply packet misses `userspace_sessions`, it is treated as local-to
 ## Live evidence
 On current `master`, active-owner repro on `fw0`:
 - helper logs show forwarded LAN SYN RX and WAN SYN TX:
-  - `bpfrx-wan80-tcp: rx ingress_if=5 vlan=0 src=10.0.61.102:44406 dst=172.16.80.200:5201 flags=0x02`
-  - `bpfrx-wan80-tcp: tx-submit-prepared ... 172.16.80.8:44406 -> 172.16.80.200:5201 TCP [SYN]`
+  - `xpf-wan80-tcp: rx ingress_if=5 vlan=0 src=10.0.61.102:44406 dst=172.16.80.200:5201 flags=0x02`
+  - `xpf-wan80-tcp: tx-submit-prepared ... 172.16.80.8:44406 -> 172.16.80.200:5201 TCP [SYN]`
 - helper delta for one failed connect:
   - `RX packets +4`
   - `SNAT packets +4`
@@ -5704,7 +5704,7 @@ Userspace helper TX observability is not good enough to distinguish:
 - packet sent via direct/copy/in-place rewrite path
 
 During the current forwarding repro on active `fw0`:
-- helper logs show `bpfrx-wan80-tcp: tx-submit-prepared ...`
+- helper logs show `xpf-wan80-tcp: tx-submit-prepared ...`
 - per-connect delta shows `TX packets +4`
 - but aggregate stats still show:
   - `Direct TX packets: 0`
@@ -5917,31 +5917,31 @@ We need a tracked work item for making `userspace dataplane active` mean that tr
 
 ## #303 — Define explicit runtime modes for userspace_strict, userspace_compat, and ebpf_only [CLOSED] (closed 2026-04-01)
 
-The runtime currently overloads `userspace running` to mean several different things. We need explicit runtime modes so operators and validation can distinguish:\n- strict userspace forwarding\n- compatibility mode with eBPF/kernel fallback\n- eBPF-only mode\n\nRequired work:\n- define the mode model in code and status surfaces\n- make attach / swap / health logic report the active mode explicitly\n- stop implying `userspace` when the entry program or fallback behavior is not strict\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/302
+The runtime currently overloads `userspace running` to mean several different things. We need explicit runtime modes so operators and validation can distinguish:\n- strict userspace forwarding\n- compatibility mode with eBPF/kernel fallback\n- eBPF-only mode\n\nRequired work:\n- define the mode model in code and status surfaces\n- make attach / swap / health logic report the active mode explicitly\n- stop implying `userspace` when the entry program or fallback behavior is not strict\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/xpf/issues/302
 
 ---
 
 ## #304 — Disallow transit fallback from xdp_userspace_prog into xdp_main_prog or XDP_PASS in strict mode [CLOSED] (closed 2026-04-01)
 
-In strict userspace mode, transit packets must not silently escape to the eBPF pipeline or the kernel forwarding path.\n\nCurrent code paths still do this through `fallback_to_main()`, `cpumap_or_pass()`, and several early fallback branches in `userspace-xdp/src/lib.rs`.\n\nRequired work:\n- classify which packet classes are true control-plane exceptions\n- ban silent transit fallback in strict mode\n- replace silent fallback with explicit drop + counters where strict behavior is required\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/302
+In strict userspace mode, transit packets must not silently escape to the eBPF pipeline or the kernel forwarding path.\n\nCurrent code paths still do this through `fallback_to_main()`, `cpumap_or_pass()`, and several early fallback branches in `userspace-xdp/src/lib.rs`.\n\nRequired work:\n- classify which packet classes are true control-plane exceptions\n- ban silent transit fallback in strict mode\n- replace silent fallback with explicit drop + counters where strict behavior is required\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/xpf/issues/302
 
 ---
 
 ## #305 — Remove or narrowly scope PASS_TO_KERNEL session actions for strict userspace mode [CLOSED] (closed 2026-04-01)
 
-The userspace session steering map still encodes `PASS_TO_KERNEL` decisions. That makes the current userspace dataplane a hybrid forwarding system even when userspace is active.\n\nRequired work:\n- audit every producer of `PASS_TO_KERNEL` decisions\n- separate true local/control-plane exceptions from transit forwarding\n- ensure strict userspace mode never uses `PASS_TO_KERNEL` for transit\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/302
+The userspace session steering map still encodes `PASS_TO_KERNEL` decisions. That makes the current userspace dataplane a hybrid forwarding system even when userspace is active.\n\nRequired work:\n- audit every producer of `PASS_TO_KERNEL` decisions\n- separate true local/control-plane exceptions from transit forwarding\n- ensure strict userspace mode never uses `PASS_TO_KERNEL` for transit\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/xpf/issues/302
 
 ---
 
 ## #306 — Make XSK liveness failure explicit instead of silently swapping back to xdp_main_prog [CLOSED] (closed 2026-04-01)
 
-Today the userspace manager can mark XSK liveness failed and swap the entry program back to `xdp_main_prog`. That preserves forwarding, but it violates a strict userspace invariant and hides the real dataplane mode.\n\nRequired work:\n- decide strict-mode behavior for XSK liveness failure\n- likely fail readiness / fail closed instead of silently preserving transit via eBPF\n- expose the degraded mode in status and validation\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/302
+Today the userspace manager can mark XSK liveness failed and swap the entry program back to `xdp_main_prog`. That preserves forwarding, but it violates a strict userspace invariant and hides the real dataplane mode.\n\nRequired work:\n- decide strict-mode behavior for XSK liveness failure\n- likely fail readiness / fail closed instead of silently preserving transit via eBPF\n- expose the degraded mode in status and validation\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/xpf/issues/302
 
 ---
 
 ## #307 — Expose per-interface entry program and transit fallback counters in status and validation [CLOSED] (closed 2026-04-01)
 
-We need observability that can prove whether the dataplane is actually running in strict userspace mode.\n\nRequired work:\n- expose the attached XDP entry program per interface\n- expose whether any transit fallback counters have incremented\n- make HA / regression validators fail when strict userspace expectations are violated\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/302
+We need observability that can prove whether the dataplane is actually running in strict userspace mode.\n\nRequired work:\n- expose the attached XDP entry program per interface\n- expose whether any transit fallback counters have incremented\n- make HA / regression validators fail when strict userspace expectations are violated\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/xpf/issues/302
 
 ---
 
@@ -5953,25 +5953,25 @@ We need an explicit architectural queue for the work required to make failover c
 
 ## #309 — Enumerate forwarding-relevant state that is not carried in continuous session sync [CLOSED] (closed 2026-04-01)
 
-The repo needs a concrete inventory of every forwarding input that is still outside the continuous HA session stream. That inventory should classify each item as:\n- replicated\n- deterministically derived\n- fenced at cutover\n\nThe audit already identifies likely candidates:\n- HA runtime active/demoting state\n- reverse companion state\n- translated alias state\n- neighbor state\n- fabric-link state\n- flow-cache state / invalidation epoch\n- local-delivery and other filtered session classes\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/308
+The repo needs a concrete inventory of every forwarding input that is still outside the continuous HA session stream. That inventory should classify each item as:\n- replicated\n- deterministically derived\n- fenced at cutover\n\nThe audit already identifies likely candidates:\n- HA runtime active/demoting state\n- reverse companion state\n- translated alias state\n- neighbor state\n- fabric-link state\n- flow-cache state / invalidation epoch\n- local-delivery and other filtered session classes\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/xpf/issues/308
 
 ---
 
 ## #310 — Make reverse-companion and translated-alias state deterministic at takeover [CLOSED] (closed 2026-04-01)
 
-Failover currently relies on helper-side reverse-session prewarm / refresh and translated alias promotion around RG activation and demotion. That is a direct reason failover is not just MAC movement.\n\nRequired work:\n- define whether reverse companions and translated aliases should be fully replicated or deterministically reconstructed\n- remove reliance on best-effort activation-time repair where possible\n- prove the new owner can answer inherited traffic immediately after cutover\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/308
+Failover currently relies on helper-side reverse-session prewarm / refresh and translated alias promotion around RG activation and demotion. That is a direct reason failover is not just MAC movement.\n\nRequired work:\n- define whether reverse companions and translated aliases should be fully replicated or deterministically reconstructed\n- remove reliance on best-effort activation-time repair where possible\n- prove the new owner can answer inherited traffic immediately after cutover\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/xpf/issues/308
 
 ---
 
 ## #311 — Define an install fence for HA cutover instead of relying on continuous sync alone [CLOSED] (closed 2026-04-01)
 
-The current daemon still needs demotion prep, barriers, quiescence checks, bulk acknowledgements, and final peer barriers before graceful failover. That is proof that continuous session sync alone is not a readiness guarantee.\n\nRequired work:\n- define the exact cutover contract (for example: peer has installed all required state through sequence N)\n- make old-owner demotion and MAC movement depend on that fence\n- remove any remaining handoff logic that only exists because readiness is inferred instead of proven\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/308
+The current daemon still needs demotion prep, barriers, quiescence checks, bulk acknowledgements, and final peer barriers before graceful failover. That is proof that continuous session sync alone is not a readiness guarantee.\n\nRequired work:\n- define the exact cutover contract (for example: peer has installed all required state through sequence N)\n- make old-owner demotion and MAC movement depend on that fence\n- remove any remaining handoff logic that only exists because readiness is inferred instead of proven\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/xpf/issues/308
 
 ---
 
 ## #312 — Reduce helper-local cache and non-session dependencies at RG transition [CLOSED] (closed 2026-04-01)
 
-Failover still depends on helper-local state outside the session stream, including flow caches, neighbor state, fabric state, and owner-RG transitions.\n\nRequired work:\n- minimize forwarding-critical worker-local cache state that must be repaired at activation/demotion\n- decide which remaining local dependencies must be replicated versus invalidated versus fenced\n- make the failover validators prove these dependencies are either ready or irrelevant at cutover\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/308
+Failover still depends on helper-local state outside the session stream, including flow caches, neighbor state, fabric state, and owner-RG transitions.\n\nRequired work:\n- minimize forwarding-critical worker-local cache state that must be repaired at activation/demotion\n- decide which remaining local dependencies must be replicated versus invalidated versus fenced\n- make the failover validators prove these dependencies are either ready or irrelevant at cutover\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/xpf/issues/308
 
 ---
 
@@ -7872,19 +7872,19 @@ Locally-originated TCP/UDP traffic from the firewall fails (e.g., DNS queries, H
 
 ## Root Cause
 
-The Rust helper creates the slow-path TUN (`bpfrx-usp0`) and sets `rp_filter=0` via sysctl. However, the Go daemon later calls `networkctl reload` (when writing `.network` files), which resets all interface sysctls to defaults. The default `rp_filter=2` (loose mode) causes the kernel to drop packets arriving on the TUN whose source reverse route points at a different interface.
+The Rust helper creates the slow-path TUN (`xpf-usp0`) and sets `rp_filter=0` via sysctl. However, the Go daemon later calls `networkctl reload` (when writing `.network` files), which resets all interface sysctls to defaults. The default `rp_filter=2` (loose mode) causes the kernel to drop packets arriving on the TUN whose source reverse route points at a different interface.
 
 Flow: locally-originated TCP SYN goes out via kernel → reply arrives on WAN → XDP shim redirects to XSK → userspace helper resolves LocalDelivery → reinjects via TUN → **kernel drops because rp_filter rejects the packet**.
 
 ## Fix
 
-Add `restoreSlowPathRPFilter()` in `pkg/networkd/networkd.go` that re-sets `rp_filter=0` on `bpfrx-usp0` after every `networkctl reload`. Silently no-ops if the TUN doesn't exist (userspace DP not active).
+Add `restoreSlowPathRPFilter()` in `pkg/networkd/networkd.go` that re-sets `rp_filter=0` on `xpf-usp0` after every `networkctl reload`. Silently no-ops if the TUN doesn't exist (userspace DP not active).
 
 ## Testing
 
 - `ping -c 3 1.1.1.1`: 0% loss
 - TCP to 1.1.1.1:80: HTTP response received
-- `sysctl net.ipv4.conf.bpfrx-usp0.rp_filter` = 0 after deploy
+- `sysctl net.ipv4.conf.xpf-usp0.rp_filter` = 0 after deploy
 - Transit traffic unaffected
 
 ---
@@ -8176,7 +8176,7 @@ VM reboots, all traffic dies. The surviving peer takes over but the rebooted nod
 
 ## Workaround
 
-This is a kernel/driver bug, not a bpfrx issue. Possible mitigations:
+This is a kernel/driver bug, not a xpf issue. Possible mitigations:
 - Avoid XDP program swaps during failover (keep the same XDP program, change behavior via BPF maps)
 - Pin the VF to a specific RG so it doesn't get reattached during failover
 - Update to a newer kernel with mlx5 ICOSQ fixes
@@ -8205,12 +8205,12 @@ The discrepancy appears to occur when:
 2. Crash fw0 (or trigger mlx5 kernel panic)
 3. fw1 takes over all RGs
 4. Transit traffic dies on fw1 despite all RGs being primary
-5. `bpftool map dump pinned /sys/fs/bpf/bpfrx/userspace_bindings` shows all zeros
+5. `bpftool map dump pinned /sys/fs/bpf/xpf/userspace_bindings` shows all zeros
 6. `ethtool -S ge-7-0-1 | grep rx_xdp_redirect` shows 0
 
 ## Workaround
 
-`systemctl restart bpfrxd` on fw1 re-registers the XSK bindings.
+`systemctl restart xpfd` on fw1 re-registers the XSK bindings.
 
 ## Expected
 
@@ -8459,10 +8459,10 @@ Revisit whether strict VIP/MAC ownership should be the default for HA activation
 `origin/master` `c666d333` still does global snapshot/FIB work during every RG ownership change instead of limiting HA transitions to ownership/lease movement.
 
 Evidence:
-- [`pkg/dataplane/userspace/manager_ha.go:381`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/dataplane/userspace/manager_ha.go#L381-L442) bumps FIB generation before `update_ha_state`, then bumps again after it, then rebuilds `m.lastSnapshot` and calls `syncSnapshotLocked()`.
-- [`pkg/dataplane/userspace/manager.go:2547`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/dataplane/userspace/manager.go#L2547-L2614) still publishes `apply_snapshot` when the content hash changes.
-- [`userspace-dp/src/main.rs:392`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/main.rs#L392-L415) handles same-plan `apply_snapshot` by calling `refresh_runtime_snapshot()`.
-- [`userspace-dp/src/afxdp.rs:1104`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp.rs#L1104-L1167) rebuilds validation, manager-neighbor keys, and forwarding state from the snapshot.
+- [`pkg/dataplane/userspace/manager_ha.go:381`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/dataplane/userspace/manager_ha.go#L381-L442) bumps FIB generation before `update_ha_state`, then bumps again after it, then rebuilds `m.lastSnapshot` and calls `syncSnapshotLocked()`.
+- [`pkg/dataplane/userspace/manager.go:2547`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/dataplane/userspace/manager.go#L2547-L2614) still publishes `apply_snapshot` when the content hash changes.
+- [`userspace-dp/src/main.rs:392`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/main.rs#L392-L415) handles same-plan `apply_snapshot` by calling `refresh_runtime_snapshot()`.
+- [`userspace-dp/src/afxdp.rs:1104`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp.rs#L1104-L1167) rebuilds validation, manager-neighbor keys, and forwarding state from the snapshot.
 
 Why this is a problem:
 - HA failover/failback still serializes on control-socket work that is broader than the ownership change itself.
@@ -8480,10 +8480,10 @@ Expected direction:
 The helper still does owner-RG session walks on HA state changes instead of treating shared standby state as already authoritative.
 
 Evidence:
-- [`userspace-dp/src/afxdp/ha.rs:78`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/ha.rs#L78-L99) enqueues `ApplyHAState` work for activated and demoted RGs.
-- [`userspace-dp/src/afxdp/session_glue.rs:265`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/session_glue.rs#L265-L315) handles `ApplyHAState` by refreshing affected owner RGs and demoting matching sessions in place.
-- [`userspace-dp/src/afxdp/session_glue.rs:451`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/session_glue.rs#L451-L545) walks `owner_rg_session_keys()` and re-resolves forwarding per session.
-- [`userspace-dp/src/afxdp/shared_ops.rs:311`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/shared_ops.rs#L311-L338) already lets the packet path fall back to shared synced session state after local misses.
+- [`userspace-dp/src/afxdp/ha.rs:78`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/ha.rs#L78-L99) enqueues `ApplyHAState` work for activated and demoted RGs.
+- [`userspace-dp/src/afxdp/session_glue.rs:265`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/session_glue.rs#L265-L315) handles `ApplyHAState` by refreshing affected owner RGs and demoting matching sessions in place.
+- [`userspace-dp/src/afxdp/session_glue.rs:451`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/session_glue.rs#L451-L545) walks `owner_rg_session_keys()` and re-resolves forwarding per session.
+- [`userspace-dp/src/afxdp/shared_ops.rs:311`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/shared_ops.rs#L311-L338) already lets the packet path fall back to shared synced session state after local misses.
 
 Why this is a problem:
 - We still have an HA model where activation/demotion repairs local worker tables during the handoff.
@@ -8501,10 +8501,10 @@ Expected direction:
 `origin/master` still needs an explicit transition-time demotion-prep protocol before VRRP/cluster ownership can move.
 
 Evidence:
-- [`pkg/daemon/daemon_ha.go:1138`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/daemon/daemon_ha.go#L1138-L1215) drains pending barriers, waits for a peer barrier, then calls `preflightDemoteRG()` and sleeps 50ms.
-- [`pkg/daemon/daemon_ha.go:1122`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/daemon/daemon_ha.go#L1122-L1135) describes the goal as shifting traffic to fabric before demotion.
-- [`pkg/dataplane/userspace/manager_ha.go:338`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/dataplane/userspace/manager_ha.go#L338-L355) sends a dedicated `preflight_demote_rg` control request.
-- [`userspace-dp/src/afxdp/ha.rs:102`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/ha.rs#L102-L129) implements that as a lease flip plus RG epoch bump before the real ownership change.
+- [`pkg/daemon/daemon_ha.go:1138`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/daemon/daemon_ha.go#L1138-L1215) drains pending barriers, waits for a peer barrier, then calls `preflightDemoteRG()` and sleeps 50ms.
+- [`pkg/daemon/daemon_ha.go:1122`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/daemon/daemon_ha.go#L1122-L1135) describes the goal as shifting traffic to fabric before demotion.
+- [`pkg/dataplane/userspace/manager_ha.go:338`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/dataplane/userspace/manager_ha.go#L338-L355) sends a dedicated `preflight_demote_rg` control request.
+- [`userspace-dp/src/afxdp/ha.rs:102`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/ha.rs#L102-L129) implements that as a lease flip plus RG epoch bump before the real ownership change.
 
 Why this is a problem:
 - The failover path still assumes the standby is not already sufficient on its own, so it has to prepare a fabric redirect window during demotion.
@@ -8522,8 +8522,8 @@ Expected direction:
 The no-RETH/direct HA path still blocks promotion on cluster session-sync readiness instead of only using sync/bootstrap at true cold start.
 
 Evidence:
-- [`pkg/daemon/daemon_ha.go:2947`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/daemon/daemon_ha.go#L2947-L2961) sets `vrrpReady = d.cluster.IsSyncReady()` in no-RETH mode and reports `session sync not ready` as a takeover blocker.
-- [`pkg/vrrp/manager.go:88`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/vrrp/manager.go#L88-L143) still models startup preemption suppression as a sync-hold released by sync completion or timeout.
+- [`pkg/daemon/daemon_ha.go:2947`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/daemon/daemon_ha.go#L2947-L2961) sets `vrrpReady = d.cluster.IsSyncReady()` in no-RETH mode and reports `session sync not ready` as a takeover blocker.
+- [`pkg/vrrp/manager.go:88`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/vrrp/manager.go#L88-L143) still models startup preemption suppression as a sync-hold released by sync completion or timeout.
 
 Why this is a problem:
 - The target model is that bulk/bootstrap is only for starting from scratch.
@@ -8541,10 +8541,10 @@ Expected direction:
 Cluster promotion still requires the destination RG to stay ready for `TakeoverHoldTime` before ownership can move.
 
 Evidence:
-- [`pkg/cluster/cluster.go:60`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/cluster/cluster.go#L60-L78) stores `ReadySince` and gates `IsReadyForTakeover()` on elapsed hold time.
-- [`pkg/cluster/cluster.go:203`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/cluster/cluster.go#L203-L205) sets the default hold to 3 seconds.
-- [`pkg/cluster/cluster.go:282`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/cluster/cluster.go#L282-L345) starts a timer on the not-ready -> ready transition and only re-runs election after the hold expires.
-- [`pkg/cluster/cluster.go:825`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/cluster/cluster.go#L825-L909) also uses the same hold gate for explicit peer failover requests.
+- [`pkg/cluster/cluster.go:60`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/cluster/cluster.go#L60-L78) stores `ReadySince` and gates `IsReadyForTakeover()` on elapsed hold time.
+- [`pkg/cluster/cluster.go:203`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/cluster/cluster.go#L203-L205) sets the default hold to 3 seconds.
+- [`pkg/cluster/cluster.go:282`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/cluster/cluster.go#L282-L345) starts a timer on the not-ready -> ready transition and only re-runs election after the hold expires.
+- [`pkg/cluster/cluster.go:825`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/cluster/cluster.go#L825-L909) also uses the same hold gate for explicit peer failover requests.
 
 Why this is a problem:
 - If both firewalls are truly kept forwarding-ready at all times, the extra hold timer is no longer a safety proof; it is just an added failover/failback delay.
@@ -8561,8 +8561,8 @@ Expected direction:
 The current "always-hot standby" path still programs `USERSPACE_SESSIONS` immediately even when the worker-side session table would refuse the same synced entry.
 
 Evidence:
-- [`userspace-dp/src/afxdp/ha.rs:237`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/ha.rs#L237-L309) publishes synced entries to shared maps and immediately writes the live BPF session map before worker processing.
-- [`userspace-dp/src/afxdp/session_glue.rs:317`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/session_glue.rs#L317-L327) still computes `allow_replace_local = !is_active`, meaning an active node can reject replacing a live local session.
+- [`userspace-dp/src/afxdp/ha.rs:237`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/ha.rs#L237-L309) publishes synced entries to shared maps and immediately writes the live BPF session map before worker processing.
+- [`userspace-dp/src/afxdp/session_glue.rs:317`](https://github.com/psaab/xpf/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/session_glue.rs#L317-L327) still computes `allow_replace_local = !is_active`, meaning an active node can reject replacing a live local session.
 
 Why this is a problem:
 - XDP redirect state and worker session state can diverge.
@@ -9047,7 +9047,7 @@ A naive silence timeout is not enough by itself because the primary can legitima
 
 ## Reproduction
 1. Deploy current master to `loss-userspace-cluster`.
-2. Restart `bpfrxd` only on `bpfrx-userspace-fw1`.
+2. Restart `xpfd` only on `xpf-userspace-fw1`.
 3. Observe `show chassis cluster status` on `fw1` report `Transfer ready: no (session sync disconnected)` and no new established `:4785` socket.
 
 ## Expected
@@ -9226,7 +9226,7 @@ Before the fix, `show chassis cluster data-plane interfaces` repeatedly reported
 - `fw1`: `read_local_tunnel:File descriptor in bad state (os error 77)`
 - `fw0`: `write_local_tunnel_delivery:Invalid argument (os error 22)`
 
-At the same time, per-thread `top -H` showed the native-GRE helper thread (`bpfrx-n+`) alive on both nodes and consuming CPU.
+At the same time, per-thread `top -H` showed the native-GRE helper thread (`xpf-n+`) alive on both nodes and consuming CPU.
 
 A controlled standby delta check showed pure IPv4/IPv6 iperf itself was not the main both-node dataplane path:
 
@@ -9412,7 +9412,7 @@ Steady-state external IPv6 on the `loss` userspace cluster is currently broken b
 ## Evidence
 - Artifact: `/tmp/ipv6-rg1-repro-20260407-090657`
 - `cluster-userspace-host` baseline `ping -6` to the Internet fails 100% before failover.
-- `bpfrx-userspace-fw0` config still contains `route ::/0 { next-hop 2001:559:8585:50::1; }`.
+- `xpf-userspace-fw0` config still contains `route ::/0 { next-hop 2001:559:8585:50::1; }`.
 - `show route` on `fw0` shows the active route as `::/0 *[Static/20] > to discard via lo`.
 - `/etc/frr/frr.conf` on `fw0` contains:
   - `ipv6 route ::/0 2001:559:8585:50::1 5`
@@ -9460,8 +9460,8 @@ The `userspace-ha-validation.sh` active-node probe can pick a standby helper nod
   - `Forwarding supported: true`
   - `HA groups: rg0 active=false; rg1 active=false; rg2 active=false`
 - At the same time, cluster status clearly showed `node1` as primary for RG1 and RG2.
-- The validator still chose `loss:bpfrx-userspace-fw0` as the active userspace firewall and then failed with:
-  - `ERROR: unable to detect WAN test interface for loss:bpfrx-userspace-fw0`
+- The validator still chose `loss:xpf-userspace-fw0` as the active userspace firewall and then failed with:
+  - `ERROR: unable to detect WAN test interface for loss:xpf-userspace-fw0`
 
 ## Expected
 The validator should identify the active userspace firewall by HA ownership first, then confirm that node's userspace runtime is enabled/ready.
@@ -9489,7 +9489,7 @@ After the restart/deploy cycle on `loss`, standby `fw0` can get stuck with users
 - Logs show repeated binding repair and AF_XDP bind failures:
   - `userspace: bindings watchdog repaired stale BPF map entries`
   - `xsk_socket__create_shared(...): Device or resource busy — trying copy-mode`
-- Only one `bpfrx-userspace-dp` process is running, so this is not just an orphaned old helper process holding the socket.
+- Only one `xpf-userspace-dp` process is running, so this is not just an orphaned old helper process holding the socket.
 
 ## Impact
 - `request chassis cluster failover data node 0` is rejected because RG1 is not ready on `node0`.
@@ -9510,7 +9510,7 @@ The standby helper remains stuck unbound and keeps repairing stale binding state
 Standby HA readiness can remain false even when the userspace helper reports all queues and bindings ready, so explicit failover is rejected despite the standby dataplane already looking forwarding-ready.
 
 ## Evidence
-Before a manual re-arm on `loss:bpfrx-userspace-fw0`, `show chassis cluster data-plane statistics` reported:
+Before a manual re-arm on `loss:xpf-userspace-fw0`, `show chassis cluster data-plane statistics` reported:
 - `Forwarding armed: true`
 - `Bound bindings: 18/18`
 - `XSK-registered bindings: 18/18`
@@ -9602,7 +9602,7 @@ During real `loss-userspace-cluster` HA validation, `RG1 node0 -> node1` can kee
 ## Repro
 - deploy the current combined HA validation build to `loss`
 - run:
-  `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env TOTAL_CYCLES=1 CYCLE_INTERVAL=10 /tmp/bpfrx-pr586/scripts/userspace-ha-failover-validation.sh --rg 1 --source-node 0 --target-node 1 --duration 60 --parallel 4`
+  `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env TOTAL_CYCLES=1 CYCLE_INTERVAL=10 /tmp/xpf-pr586/scripts/userspace-ha-failover-validation.sh --rg 1 --source-node 0 --target-node 1 --duration 60 --parallel 4`
 
 ## Evidence
 Artifact: `/tmp/userspace-ha-failover-rg1-20260407-101426`
@@ -9666,10 +9666,10 @@ After fixing the promoted-owner IPv4 WAN neighbor readiness gap, real `RG1 node0
 
 ## Repro
 Deployed branch: `fix/587-standby-session-neighbor-warmup`
-Validator: patched `/tmp/bpfrx-pr586/scripts/userspace-ha-failover-validation.sh`
+Validator: patched `/tmp/xpf-pr586/scripts/userspace-ha-failover-validation.sh`
 
 Command:
-`BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env TOTAL_CYCLES=1 CYCLE_INTERVAL=10 /tmp/bpfrx-pr586/scripts/userspace-ha-failover-validation.sh --rg 1 --source-node 0 --target-node 1 --duration 60 --parallel 4`
+`BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env TOTAL_CYCLES=1 CYCLE_INTERVAL=10 /tmp/xpf-pr586/scripts/userspace-ha-failover-validation.sh --rg 1 --source-node 0 --target-node 1 --duration 60 --parallel 4`
 
 Artifact: `/tmp/userspace-ha-failover-rg1-20260407-103004`
 
@@ -9694,12 +9694,12 @@ The promoted owner is now reachability-correct and keeps the flow alive, so the 
 
 ---
 
-## #596 — userspace RST suppression install can fail permanently when bpfrx_dp_rst does not exist [CLOSED] (closed 2026-04-07)
+## #596 — userspace RST suppression install can fail permanently when xpf_dp_rst does not exist [CLOSED] (closed 2026-04-07)
 
 On the loss userspace HA lab, old-owner TCP RST suppression can stay disabled permanently after deploy.
 
 Root cause:
-- `InstallRSTSuppression()` always queues `DelTable(inet bpfrx_dp_rst)` before `AddTable(...)`
+- `InstallRSTSuppression()` always queues `DelTable(inet xpf_dp_rst)` before `AddTable(...)`
 - when the table does not already exist, the netlink flush fails with ENOENT
 - the userspace manager caches the failed install attempt as if it succeeded and does not retry until the NAT address set changes
 
@@ -9797,14 +9797,14 @@ On the `loss` userspace HA cluster, `show chassis cluster status` can report:
 - `Takeover ready: yes`
 - `Transfer ready: no (session sync disconnected)`
 
-when the real cause is that the two nodes are running different bpfrx builds.
+when the real cause is that the two nodes are running different xpf builds.
 
 ## Live reproduction
 
 Observed on April 7, 2026 on `loss`:
 
-- `fw0`: `bpfrx eBPF firewall userspace-forwarding-ok-20260402-bfb00432-298-ga2f53a50-dirty`
-- `fw1`: `bpfrx eBPF firewall userspace-forwarding-ok-20260402-bfb00432-299-gd6a538e1`
+- `fw0`: `xpf eBPF firewall userspace-forwarding-ok-20260402-bfb00432-298-ga2f53a50-dirty`
+- `fw1`: `xpf eBPF firewall userspace-forwarding-ok-20260402-bfb00432-299-gd6a538e1`
 
 In that mixed-build state:
 
@@ -9875,7 +9875,7 @@ If the standby already has the same active config, reconnect config sync should 
 
 ## Observed
 
-Repeated RG1 movement under long-lived userspace traffic exposed several bpfrx-level handoff bugs during HA failover/failback.
+Repeated RG1 movement under long-lived userspace traffic exposed several xpf-level handoff bugs during HA failover/failback.
 
 These are separate from the known mlx5 kernel crash in #472.
 
@@ -9903,7 +9903,7 @@ Rapid RG movement should keep the old owner redirecting stale traffic to the act
 
 ## Scope
 
-This issue tracks the bpfrx fixes for those HA handoff bugs. The separate remaining throughput-collapse symptom is tracked independently, and the mlx5 VM panic remains #472.
+This issue tracks the xpf fixes for those HA handoff bugs. The separate remaining throughput-collapse symptom is tracked independently, and the mlx5 VM panic remains #472.
 
 
 ---

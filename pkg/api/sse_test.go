@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/logging"
+	"github.com/psaab/xpf/pkg/logging"
 )
 
 func TestSetSSEHeaders(t *testing.T) {

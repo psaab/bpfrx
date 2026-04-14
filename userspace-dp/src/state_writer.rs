@@ -44,7 +44,7 @@ impl StateWriter {
         let mode_bg = mode.clone();
         let last_error_bg = last_error.clone();
         thread::Builder::new()
-            .name("bpfrx-state-writer".to_string())
+            .name("xpf-state-writer".to_string())
             .spawn(move || {
                 let mut write_mode = match IoUring::new(8) {
                     Ok(ring) => {

@@ -166,8 +166,8 @@ shm_alloc(void)
 	const struct rte_memzone *mz;
 
 	/* Use rte_memzone_reserve so the Go secondary process can find it
-	 * via rte_memzone_lookup("bpfrx_shm"). */
-	mz = rte_memzone_reserve("bpfrx_shm", sizeof(*shm),
+	 * via rte_memzone_lookup("xpf_shm"). */
+	mz = rte_memzone_reserve("xpf_shm", sizeof(*shm),
 	                          rte_socket_id(),
 	                          RTE_MEMZONE_2MB | RTE_MEMZONE_SIZE_HINT_ONLY);
 	if (!mz) {

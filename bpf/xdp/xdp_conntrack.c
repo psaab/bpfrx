@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx XDP connection tracking stage.
+ * xpf XDP connection tracking stage.
  *
  * Looks up the packet's 5-tuple in the session table. On a hit,
  * updates counters and TCP state, then fast-paths established
@@ -9,11 +9,11 @@
  * Supports both IPv4 and IPv6 sessions.
  */
 
-#include "../headers/bpfrx_common.h"
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
-#include "../headers/bpfrx_nat.h"
-#include "../headers/bpfrx_trace.h"
+#include "../headers/xpf_common.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
+#include "../headers/xpf_nat.h"
+#include "../headers/xpf_trace.h"
 
 /*
  * Handle a conntrack hit for an IPv4 session.

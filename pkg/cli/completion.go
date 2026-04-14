@@ -6,8 +6,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/cmdtree"
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/cmdtree"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // completionCandidate holds a command name and its description.

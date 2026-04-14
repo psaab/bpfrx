@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx TC egress forward stage.
+ * xpf TC egress forward stage.
  *
  * Final TC stage. Increments per-zone egress counters and passes
  * the packet to the network.
  */
 
-#include "../headers/bpfrx_common.h"
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
+#include "../headers/xpf_common.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
 
 SEC("tc")
 int tc_forward_prog(struct __sk_buff *skb)

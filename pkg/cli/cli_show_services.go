@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/dhcp"
-	"github.com/psaab/bpfrx/pkg/dhcpserver"
-	"github.com/psaab/bpfrx/pkg/rpm"
+	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/dhcpserver"
+	"github.com/psaab/xpf/pkg/rpm"
 )
 
 func (c *CLI) showDHCPLeases() error {

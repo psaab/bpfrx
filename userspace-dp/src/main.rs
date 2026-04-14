@@ -66,7 +66,7 @@ struct ServerState {
 
 fn main() {
     if let Err(err) = run() {
-        eprintln!("bpfrx-userspace-dp: {err}");
+        eprintln!("xpf-userspace-dp: {err}");
         std::process::exit(1);
     }
 }
@@ -99,7 +99,7 @@ fn run() -> Result<(), String> {
             }
         }
     } else {
-        eprintln!("bpfrx-userspace-dp: interrupt mode — skipping busy_poll sysctls");
+        eprintln!("xpf-userspace-dp: interrupt mode — skipping busy_poll sysctls");
     }
     if let Some(parent) = Path::new(&args.control_socket).parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create control dir: {e}"))?;
@@ -122,7 +122,7 @@ fn run() -> Result<(), String> {
     session_listener
         .set_nonblocking(true)
         .map_err(|e| format!("set nonblocking session listener: {e}"))?;
-    eprintln!("bpfrx-userspace-dp: session socket at {}", session_socket);
+    eprintln!("xpf-userspace-dp: session socket at {}", session_socket);
 
     let state_writer = Arc::new(StateWriter::new());
     let running = Arc::new(AtomicBool::new(true));
@@ -180,7 +180,7 @@ fn run() -> Result<(), String> {
         },
         state_writer: state_writer.clone(),
     }));
-    eprintln!("bpfrx-userspace-dp: poll_mode={:?}", args.poll_mode);
+    eprintln!("xpf-userspace-dp: poll_mode={:?}", args.poll_mode);
 
     // Start the event stream sender (connects to daemon's event listener socket).
     {
@@ -188,7 +188,7 @@ fn run() -> Result<(), String> {
         let mut guard = state.lock().expect("state poisoned");
         guard.afxdp.start_event_stream(&event_socket_path);
         eprintln!(
-            "bpfrx-userspace-dp: event stream targeting {}",
+            "xpf-userspace-dp: event stream targeting {}",
             event_socket_path
         );
     }
@@ -224,7 +224,7 @@ fn run() -> Result<(), String> {
                             thread::sleep(Duration::from_millis(10));
                         }
                         Err(err) => {
-                            eprintln!("bpfrx-userspace-dp: accept session: {err}");
+                            eprintln!("xpf-userspace-dp: accept session: {err}");
                             continue;
                         }
                     }
@@ -247,7 +247,7 @@ fn run() -> Result<(), String> {
 
     // Wait for the session thread to finish.
     if let Err(panic) = session_thread.join() {
-        eprintln!("bpfrx-userspace-dp: session thread panicked: {panic:?}");
+        eprintln!("xpf-userspace-dp: session thread panicked: {panic:?}");
     }
     {
         let mut guard = state.lock().expect("state poisoned");
@@ -262,7 +262,7 @@ fn run() -> Result<(), String> {
 }
 
 /// Derive the session socket path from the control socket path.
-/// `/run/bpfrx/userspace-dp.sock` -> `/run/bpfrx/userspace-dp-sessions.sock`
+/// `/run/xpf/userspace-dp.sock` -> `/run/xpf/userspace-dp-sessions.sock`
 fn derive_session_socket_path(control_socket: &str) -> String {
     match control_socket.rsplit_once('/') {
         Some((dir, _)) => format!("{}/userspace-dp-sessions.sock", dir),
@@ -271,7 +271,7 @@ fn derive_session_socket_path(control_socket: &str) -> String {
 }
 
 /// Derive the event socket path from the control socket path.
-/// `/run/bpfrx/control.sock` -> `/run/bpfrx/userspace-dp-events.sock`
+/// `/run/xpf/control.sock` -> `/run/xpf/userspace-dp-events.sock`
 fn derive_event_socket_path(control_socket: &str) -> String {
     match control_socket.rsplit_once('/') {
         Some((dir, _)) => format!("{dir}/userspace-dp-events.sock"),
@@ -281,12 +281,12 @@ fn derive_event_socket_path(control_socket: &str) -> String {
 
 fn parse_args() -> Result<Args, String> {
     let mut control_socket = env::temp_dir()
-        .join("bpfrx-userspace-dp")
+        .join("xpf-userspace-dp")
         .join("control.sock")
         .to_string_lossy()
         .to_string();
     let mut state_file = env::temp_dir()
-        .join("bpfrx-userspace-dp")
+        .join("xpf-userspace-dp")
         .join("state.json")
         .to_string_lossy()
         .to_string();
@@ -1242,9 +1242,9 @@ mod tests {
     fn same_binding_plan_ignores_runtime_only_snapshot_changes() {
         let current = ConfigSnapshot {
             userspace: serde_json::json!({
-                "binary": "/usr/libexec/bpfrx-userspace-dp",
-                "control_socket": "/run/bpfrx/control.sock",
-                "state_file": "/run/bpfrx/state.json",
+                "binary": "/usr/libexec/xpf-userspace-dp",
+                "control_socket": "/run/xpf/control.sock",
+                "state_file": "/run/xpf/state.json",
                 "workers": 2,
                 "ring_entries": 2048,
                 "poll_mode": "interrupt",

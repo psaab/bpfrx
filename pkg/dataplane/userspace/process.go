@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -164,9 +164,9 @@ func findBinary(explicit string) (string, error) {
 		return "", fmt.Errorf("userspace dataplane binary not found: %s", explicit)
 	}
 	candidates := []string{
-		"./bpfrx-userspace-dp",
-		filepath.Join("userspace-dp", "target", "release", "bpfrx-userspace-dp"),
-		filepath.Join(filepath.Dir(os.Args[0]), "bpfrx-userspace-dp"),
+		"./xpf-userspace-dp",
+		filepath.Join("userspace-dp", "target", "release", "xpf-userspace-dp"),
+		filepath.Join(filepath.Dir(os.Args[0]), "xpf-userspace-dp"),
 	}
 	for _, c := range candidates {
 		if c == "" {
@@ -176,10 +176,10 @@ func findBinary(explicit string) (string, error) {
 			return c, nil
 		}
 	}
-	if p, err := exec.LookPath("bpfrx-userspace-dp"); err == nil {
+	if p, err := exec.LookPath("xpf-userspace-dp"); err == nil {
 		return p, nil
 	}
-	return "", errors.New("userspace dataplane helper binary not found; build ./cmd/bpfrx-userspace-dp or configure system dataplane binary")
+	return "", errors.New("userspace dataplane helper binary not found; build make build-userspace-dp or configure system dataplane binary")
 }
 
 func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, error) {

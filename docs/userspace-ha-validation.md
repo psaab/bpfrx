@@ -5,8 +5,8 @@ Date: 2026-03-14
 This document captures the current repeatable validation path for the isolated
 userspace cluster on `loss`:
 
-- `loss:bpfrx-userspace-fw0`
-- `loss:bpfrx-userspace-fw1`
+- `loss:xpf-userspace-fw0`
+- `loss:xpf-userspace-fw1`
 - `loss:cluster-userspace-host`
 
 Tracked inputs:
@@ -83,8 +83,8 @@ This is the required sequence after each userspace dataplane phase:
 1. commit the phase
 2. push the current branch to GitHub
 3. deploy to:
-   - `loss:bpfrx-userspace-fw0`
-   - `loss:bpfrx-userspace-fw1`
+   - `loss:xpf-userspace-fw0`
+   - `loss:xpf-userspace-fw1`
 4. run the isolated userspace HA validation script
 
 For failover-specific HA/session work, also run the dedicated RG failover

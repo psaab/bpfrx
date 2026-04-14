@@ -27,7 +27,7 @@ type LocalLogWriter struct {
 
 // LocalLogConfig configures a LocalLogWriter.
 type LocalLogConfig struct {
-	Path     string // log file path (default: /var/log/bpfrx/security.log)
+	Path     string // log file path (default: /var/log/xpf/security.log)
 	MaxSize  int64  // max file size in bytes (default: 10MB)
 	MaxFiles int    // number of rotated files to keep (default: 5)
 }
@@ -36,7 +36,7 @@ type LocalLogConfig struct {
 func NewLocalLogWriter(cfg LocalLogConfig) (*LocalLogWriter, error) {
 	path := cfg.Path
 	if path == "" {
-		path = "/var/log/bpfrx/security.log"
+		path = "/var/log/xpf/security.log"
 	}
 	maxSize := cfg.MaxSize
 	if maxSize <= 0 {

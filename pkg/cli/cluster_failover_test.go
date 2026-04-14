@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
+	"github.com/psaab/xpf/pkg/cluster"
 )
 
 func captureStdout(t *testing.T, fn func()) string {

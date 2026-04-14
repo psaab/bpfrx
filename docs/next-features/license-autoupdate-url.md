@@ -4,7 +4,7 @@ Date: 2026-03-02
 Status: Proposed
 
 ## Config Evidence
-- Present in `/home/ps/git/bpfrx/vsrx.conf:98-99` under `license { autoupdate { url ... } }`
+- Present in `/home/ps/git/xpf/vsrx.conf:98-99` under `license { autoupdate { url ... } }`
 
 ## Current State
 - Parsed into `SystemConfig.LicenseAutoUpdate`: `pkg/config/compiler.go`
@@ -12,10 +12,10 @@ Status: Proposed
 - No runtime consumer or scheduler for update flow
 
 ## Problem
-Configuration can specify a license auto-update endpoint, but bpfrx currently ignores it. This leads to silent no-op behavior and operational confusion.
+Configuration can specify a license auto-update endpoint, but xpf currently ignores it. This leads to silent no-op behavior and operational confusion.
 
 ## Proposed Implementation Scope
-1. Decide bpfrx behavior model (explicit unsupported warning vs. pluggable entitlement updater).
+1. Decide xpf behavior model (explicit unsupported warning vs. pluggable entitlement updater).
 2. If implementing updater: add safe fetch loop with TLS validation, backoff, and explicit trust roots.
 3. Add observability for last-success/last-failure and next-attempt timestamps.
 4. Ensure feature can be disabled cleanly and does not block normal dataplane startup.

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 func TestFormatBinaryRecord_Basic(t *testing.T) {

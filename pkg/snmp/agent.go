@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // SNMP v2c PDU types.
@@ -147,7 +147,7 @@ func NewAgent(cfg *config.SNMPConfig) *Agent {
 func (a *Agent) initEngine() {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
-		hostname = "bpfrx"
+		hostname = "xpf"
 	}
 	// RFC 3411 format: enterprise(4) + text(3) = 0x80 | len, enterprise OID, format byte, text.
 	// Simplified: use 0x80 0x00 0x00 0x00 0x01 (enterprise=1) + 0x04 (text) + hostname bytes.
@@ -415,7 +415,7 @@ func (a *Agent) isValidCommunity(community string) bool {
 func (a *Agent) getOIDValue(oid []int) ([]byte, byte) {
 	// System MIB group
 	if oidEqual(oid, oidSysDescr) {
-		desc := "bpfrx eBPF firewall"
+		desc := "xpf eBPF firewall"
 		if a.cfg != nil && a.cfg.Description != "" {
 			desc = a.cfg.Description
 		}

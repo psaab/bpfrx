@@ -5,7 +5,7 @@ Related: #309, PR #301
 
 ## Purpose
 
-Enumerate every piece of forwarding-relevant state in the bpfrx HA
+Enumerate every piece of forwarding-relevant state in the xpf HA
 cluster, classify its replication status, and identify gaps that cause
 packet loss or require post-failover reconstruction. This drives the
 work in #310, #311, and #312.
@@ -28,7 +28,7 @@ work in #310, #311, and #312.
 
 - **What:** Forward (non-reverse) session entries in BPF `sessions` / `sessions_v6` hash maps.
   Each entry contains 5-tuple key, NAT rewrite fields, zone IDs, flags, timestamps, FIB cache.
-- **Where:** `bpf/headers/bpfrx_maps.h:92-106` (BPF maps); `pkg/cluster/sync.go:27-28`
+- **Where:** `bpf/headers/xpf_maps.h:92-106` (BPF maps); `pkg/cluster/sync.go:27-28`
   (syncMsgSessionV4 = 1, syncMsgSessionV6 = 2)
 - **How populated on standby:** Continuous incremental sync from primary
   (`syncUserspaceSessionDeltas` at `pkg/daemon/daemon.go:3639`; event-stream variant
@@ -79,7 +79,7 @@ work in #310, #311, and #312.
 
 - **What:** Per-RG boolean flag in BPF `rg_active` array map. Controls
   whether BPF forwards or fabric-redirects packets for a given RG.
-- **Where:** `bpf/headers/bpfrx_maps.h:799-804` (BPF map);
+- **Where:** `bpf/headers/xpf_maps.h:799-804` (BPF map);
   `pkg/dataplane/userspace/manager.go:2751` (`UpdateRGActive`);
   `pkg/daemon/rg_state.go:31-51` (`rgStateMachine`).
 - **How populated on standby:** Set locally by the Go daemon's
@@ -99,7 +99,7 @@ work in #310, #311, and #312.
 - **What:** Per-RG monotonic timestamp written every 500ms by the Go daemon.
   BPF and Rust helper check freshness; if >2s stale, treat RG as inactive
   (fail-closed liveness check).
-- **Where:** `bpf/headers/bpfrx_maps.h:852-857`;
+- **Where:** `bpf/headers/xpf_maps.h:852-857`;
   `pkg/dataplane/userspace/manager.go:2822` (`UpdateHAWatchdog`);
   `userspace-dp/src/afxdp/forwarding.rs:1078-1086` (staleness check).
 - **How populated on standby:** Written locally by the Go daemon's
@@ -160,7 +160,7 @@ work in #310, #311, and #312.
 
 - **What:** Cross-chassis forwarding info: fabric interface ifindex,
   peer MAC, local MAC, FIB ifindex for main-table lookups.
-- **Where:** BPF: `bpf/headers/bpfrx_maps.h:810-822` (`fabric_fwd` array[2]);
+- **Where:** BPF: `bpf/headers/xpf_maps.h:810-822` (`fabric_fwd` array[2]);
   Go daemon: `pkg/daemon/daemon.go:142-156` (fabricMu fields);
   Rust: `userspace-dp/src/afxdp/types.rs:339-345` (`FabricLink`).
 - **How populated on standby:** Go daemon writes BPF `fabric_fwd` map
@@ -195,7 +195,7 @@ work in #310, #311, and #312.
   recompile, route changes, HA transitions. Sessions cache `fib_gen` in
   their value; BPF/Rust check `session.fib_gen == fib_gen_map[0]` to
   invalidate stale FIB cache entries.
-- **Where:** BPF: `bpf/headers/bpfrx_maps.h:328-333`; Go:
+- **Where:** BPF: `bpf/headers/xpf_maps.h:328-333`; Go:
   `pkg/dataplane/maps.go:1969` (`BumpFIBGeneration`);
   Rust: `ValidationState.fib_generation` at `types.rs:211`.
 - **How populated on standby:** Written locally by `BumpFIBGeneration()`.
@@ -288,7 +288,7 @@ work in #310, #311, and #312.
 
 - **What:** Per-CPU per-pool NAT port counter used by BPF `xdp_nat.c`
   for port allocation in the eBPF pipeline.
-- **Where:** `bpf/headers/bpfrx_maps.h:437-442` (`nat_port_counters`,
+- **Where:** `bpf/headers/xpf_maps.h:437-442` (`nat_port_counters`,
   PERCPU_ARRAY).
 - **How populated on standby:** Populated locally by BPF on each SNAT
   allocation. Counter wraps within the configured port range.
@@ -303,7 +303,7 @@ work in #310, #311, and #312.
   screen/IDS session limiting. Two variants:
   (a) BPF: `session_count_src`, `session_count_dst` LRU hash maps
   (b) Rust: `SessionLimitTracker` in `ScreenState`
-- **Where:** BPF: `bpf/headers/bpfrx_maps.h:864-878`;
+- **Where:** BPF: `bpf/headers/xpf_maps.h:864-878`;
   Rust: `userspace-dp/src/screen.rs:108-135` (`SessionLimitTracker`).
 - **How populated on standby:** BPF maps populated by Go GC sweep.
   Rust counters incremented on session create, decremented on expire.
@@ -336,7 +336,7 @@ work in #310, #311, and #312.
 - **What:** Per-policer token bucket with `tokens` (current bytes),
   `last_refill_ns`, `rate_bytes_per_ns`, `burst_bytes`.
 - **Where:** `userspace-dp/src/filter.rs:74-88` (`PolicerState`).
-  BPF counterpart: `bpf/headers/bpfrx_maps.h:836-842` (`policer_states`,
+  BPF counterpart: `bpf/headers/xpf_maps.h:836-842` (`policer_states`,
   PERCPU_ARRAY).
 - **How populated on standby:** Initialized from config. Token bucket
   starts full. BPF per-CPU state is independent.

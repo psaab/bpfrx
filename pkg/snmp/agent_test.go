@@ -5,7 +5,7 @@ import (
 	"crypto/sha1"
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 var (
@@ -271,7 +271,7 @@ func TestGetOIDValue_SysDescr(t *testing.T) {
 func TestGetOIDValue_SysDescr_Default(t *testing.T) {
 	a := NewAgent(&config.SNMPConfig{})
 	val, tag := a.getOIDValue(oidSysDescr)
-	if tag != tagOctetString || string(val) != "bpfrx eBPF firewall" {
+	if tag != tagOctetString || string(val) != "xpf eBPF firewall" {
 		t.Errorf("sysDescr default: tag=%d val=%q", tag, val)
 	}
 }

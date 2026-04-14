@@ -1,4 +1,4 @@
-// Package cmdtree defines the canonical CLI command trees for bpfrx.
+// Package cmdtree defines the canonical CLI command trees for xpf.
 //
 // This is the SINGLE SOURCE OF TRUTH for all command trees used by:
 //   - pkg/cli (local interactive CLI)
@@ -16,7 +16,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // Node defines a completion tree node with description, children, and optional dynamic values.

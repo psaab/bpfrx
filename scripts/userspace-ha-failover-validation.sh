@@ -1333,7 +1333,7 @@ if [[ $DEPLOY -eq 1 ]]; then
 	BPFRX_CLUSTER_ENV="$ENV_FILE" "${PROJECT_ROOT}/test/incus/cluster-setup.sh" deploy all
 fi
 
-info "waiting for bpfrxd CLI readiness"
+info "waiting for xpfd CLI readiness"
 wait_for_vm_cli "$FW0" || die "fw0 CLI did not become reachable in time"
 wait_for_vm_cli "$FW1" || die "fw1 CLI did not become reachable in time"
 

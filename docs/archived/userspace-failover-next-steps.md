@@ -265,7 +265,7 @@ What happened:
 
 - the CLI failover did not complete
 - `failover.out` reported:
-  - `pre-failover prepare for redundancy group 1: read unix @->/run/bpfrx/userspace-dp.sock: i/o timeout`
+  - `pre-failover prepare for redundancy group 1: read unix @->/run/xpf/userspace-dp.sock: i/o timeout`
 - cluster ownership never moved:
   - `node0` stayed `RG1 primary`
   - `node1` stayed `RG1 secondary`
@@ -516,7 +516,7 @@ What that proves:
 - the old dataplane collapse and the earlier split-brain timeout release are no
   longer the active blocker on this rerun
 - the next blocker is node stability on the new owner after primary transition
-- the next debugging target is why `bpfrx-userspace-fw0` rebooted under the
+- the next debugging target is why `xpf-userspace-fw0` rebooted under the
   admitted `RG1 node1 -> node0` failover load
 
 Immediate next code/debug steps:

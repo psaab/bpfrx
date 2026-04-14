@@ -321,7 +321,7 @@ impl Coordinator {
         // Keep a healthy slow-path worker across back-to-back reconciles. The
         // userspace helper can receive multiple snapshot refreshes during HA
         // role changes; recreating the fixed-name TUN on every reconcile can
-        // race with teardown and leave the new owner without bpfrx-usp0.
+        // race with teardown and leave the new owner without xpf-usp0.
         let preserved_slow_path = self.slow_path.as_ref().and_then(|slow| {
             if slow.status().active {
                 Some(slow.clone())
@@ -560,7 +560,7 @@ impl Coordinator {
             self.live.len()
         );
         eprintln!(
-            "bpfrx-userspace-dp: reconcile planned_workers={} planned_bindings={} live_slots={}",
+            "xpf-userspace-dp: reconcile planned_workers={} planned_bindings={} live_slots={}",
             workers.len(),
             planned_bindings,
             self.live.len()
@@ -626,7 +626,7 @@ impl Coordinator {
             let rg_epochs = self.rg_epochs.clone();
             let event_stream_handle = self.event_stream_worker_handle();
             let join = thread::Builder::new()
-                .name(format!("bpfrx-userspace-worker-{worker_id}"))
+                .name(format!("xpf-userspace-worker-{worker_id}"))
                 .spawn(move || {
                     worker_loop(
                         worker_id,
@@ -659,7 +659,7 @@ impl Coordinator {
             match join {
                 Ok(join) => {
                     eprintln!(
-                        "bpfrx-userspace-dp: started worker thread worker_id={} planned_bindings={}",
+                        "xpf-userspace-dp: started worker thread worker_id={} planned_bindings={}",
                         worker_id, plan_count
                     );
                     self.workers.insert(
@@ -675,7 +675,7 @@ impl Coordinator {
                 }
                 Err(err) => {
                     eprintln!(
-                        "bpfrx-userspace-dp: failed to start worker thread worker_id={} err={}",
+                        "xpf-userspace-dp: failed to start worker thread worker_id={} err={}",
                         worker_id, err
                     );
                     self.last_reconcile_stage = format!("spawn_worker_failed:{worker_id}:{err}");
@@ -754,7 +754,7 @@ impl Coordinator {
             let logical_ifindex = endpoint.logical_ifindex;
             let (delivery_tx, delivery_rx) = mpsc::sync_channel(LOCAL_TUNNEL_DELIVERY_QUEUE_DEPTH);
             let join = thread::Builder::new()
-                .name(format!("bpfrx-native-gre-origin-{}", tunnel_name))
+                .name(format!("xpf-native-gre-origin-{}", tunnel_name))
                 .spawn(move || {
                     local_tunnel_source_loop(
                         thread_tunnel_name,

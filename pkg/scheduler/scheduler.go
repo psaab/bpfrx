@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // Scheduler periodically evaluates time windows for named schedulers

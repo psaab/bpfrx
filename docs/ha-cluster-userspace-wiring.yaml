@@ -26,7 +26,7 @@ cluster:
     fabric: bpu-fab0
 
 instances:
-  bpfrx-userspace-fw0:
+  xpf-userspace-fw0:
     role: firewall
     type: vm
     node_id: 0
@@ -106,7 +106,7 @@ instances:
       router: 10.0.61.1
       dns_server: 8.8.8.8
 
-  bpfrx-userspace-fw1:
+  xpf-userspace-fw1:
     role: firewall
     type: vm
     node_id: 1

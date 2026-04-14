@@ -12,12 +12,12 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
-// bpfrxCollector implements prometheus.Collector, reading BPF maps on each scrape.
-type bpfrxCollector struct {
+// xpfCollector implements prometheus.Collector, reading BPF maps on each scrape.
+type xpfCollector struct {
 	srv *Server
 
 	// Global counters
@@ -73,185 +73,185 @@ type bpfrxCollector struct {
 	daemonMemRSS  *prometheus.Desc
 }
 
-func newCollector(srv *Server) *bpfrxCollector {
-	return &bpfrxCollector{
+func newCollector(srv *Server) *xpfCollector {
+	return &xpfCollector{
 		srv: srv,
 
 		packetsTotal: prometheus.NewDesc(
-			"bpfrx_packets_total",
+			"xpf_packets_total",
 			"Total packets processed.",
 			[]string{"direction"}, nil,
 		),
 		dropsTotal: prometheus.NewDesc(
-			"bpfrx_drops_total",
+			"xpf_drops_total",
 			"Total packets dropped.",
 			nil, nil,
 		),
 		sessionsCreatedTotal: prometheus.NewDesc(
-			"bpfrx_sessions_created_total",
+			"xpf_sessions_created_total",
 			"Total sessions created.",
 			nil, nil,
 		),
 		sessionsClosedTotal: prometheus.NewDesc(
-			"bpfrx_sessions_closed_total",
+			"xpf_sessions_closed_total",
 			"Total sessions closed.",
 			nil, nil,
 		),
 		screenDropsTotal: prometheus.NewDesc(
-			"bpfrx_screen_drops_total",
+			"xpf_screen_drops_total",
 			"Total packets dropped by screen/IDS checks.",
 			nil, nil,
 		),
 		policyDeniesTotal: prometheus.NewDesc(
-			"bpfrx_policy_denies_total",
+			"xpf_policy_denies_total",
 			"Total packets denied by policy.",
 			nil, nil,
 		),
 		natAllocFailsTotal: prometheus.NewDesc(
-			"bpfrx_nat_alloc_failures_total",
+			"xpf_nat_alloc_failures_total",
 			"Total NAT port allocation failures.",
 			nil, nil,
 		),
 		hostInboundDeny: prometheus.NewDesc(
-			"bpfrx_host_inbound_denies_total",
+			"xpf_host_inbound_denies_total",
 			"Total host-inbound traffic denials.",
 			nil, nil,
 		),
 		tcEgressPacketsTotal: prometheus.NewDesc(
-			"bpfrx_tc_egress_packets_total",
+			"xpf_tc_egress_packets_total",
 			"Total TC egress packets processed.",
 			nil, nil,
 		),
 		syncookieTotal: prometheus.NewDesc(
-			"bpfrx_screen_syncookie_total",
+			"xpf_screen_syncookie_total",
 			"SYN cookie counters by type.",
 			[]string{"type"}, nil,
 		),
 		flowCacheTotal: prometheus.NewDesc(
-			"bpfrx_flow_cache_total",
+			"xpf_flow_cache_total",
 			"Flow cache counters by type (IPv4 + IPv6).",
 			[]string{"type"}, nil,
 		),
 		ifacePacketsTotal: prometheus.NewDesc(
-			"bpfrx_interface_packets_total",
+			"xpf_interface_packets_total",
 			"Total packets per interface.",
 			[]string{"iface", "direction"}, nil,
 		),
 		ifaceBytesTotal: prometheus.NewDesc(
-			"bpfrx_interface_bytes_total",
+			"xpf_interface_bytes_total",
 			"Total bytes per interface.",
 			[]string{"iface", "direction"}, nil,
 		),
 		zonePacketsTotal: prometheus.NewDesc(
-			"bpfrx_zone_packets_total",
+			"xpf_zone_packets_total",
 			"Total packets per zone.",
 			[]string{"zone", "direction"}, nil,
 		),
 		zoneBytesTotal: prometheus.NewDesc(
-			"bpfrx_zone_bytes_total",
+			"xpf_zone_bytes_total",
 			"Total bytes per zone.",
 			[]string{"zone", "direction"}, nil,
 		),
 		policyHitsTotal: prometheus.NewDesc(
-			"bpfrx_policy_hits_total",
+			"xpf_policy_hits_total",
 			"Total policy rule hits.",
 			[]string{"from_zone", "to_zone", "rule"}, nil,
 		),
 		filterHitsTotal: prometheus.NewDesc(
-			"bpfrx_filter_hits_total",
+			"xpf_filter_hits_total",
 			"Total firewall filter term hits.",
 			[]string{"filter", "family", "term"}, nil,
 		),
 		sessionsActive: prometheus.NewDesc(
-			"bpfrx_sessions_active",
+			"xpf_sessions_active",
 			"Current number of active session entries.",
 			nil, nil,
 		),
 		sessionsEstablished: prometheus.NewDesc(
-			"bpfrx_sessions_established",
+			"xpf_sessions_established",
 			"Current number of established sessions.",
 			nil, nil,
 		),
 		sessionsIPv4: prometheus.NewDesc(
-			"bpfrx_sessions_ipv4",
+			"xpf_sessions_ipv4",
 			"Current number of IPv4 sessions.",
 			nil, nil,
 		),
 		sessionsIPv6: prometheus.NewDesc(
-			"bpfrx_sessions_ipv6",
+			"xpf_sessions_ipv6",
 			"Current number of IPv6 sessions.",
 			nil, nil,
 		),
 		sessionsSNAT: prometheus.NewDesc(
-			"bpfrx_sessions_snat",
+			"xpf_sessions_snat",
 			"Current number of SNAT sessions.",
 			nil, nil,
 		),
 		sessionsDNAT: prometheus.NewDesc(
-			"bpfrx_sessions_dnat",
+			"xpf_sessions_dnat",
 			"Current number of DNAT sessions.",
 			nil, nil,
 		),
 		gcSweepDuration: prometheus.NewDesc(
-			"bpfrx_gc_sweep_duration_seconds",
+			"xpf_gc_sweep_duration_seconds",
 			"Duration of the last GC sweep in seconds.",
 			nil, nil,
 		),
 		natPoolUsedPorts: prometheus.NewDesc(
-			"bpfrx_nat_pool_used_ports",
+			"xpf_nat_pool_used_ports",
 			"Number of used ports in a NAT pool.",
 			[]string{"pool"}, nil,
 		),
 		natPoolTotalPorts: prometheus.NewDesc(
-			"bpfrx_nat_pool_total_ports",
+			"xpf_nat_pool_total_ports",
 			"Total available ports in a NAT pool.",
 			[]string{"pool"}, nil,
 		),
 		natPoolDeterministicInfo: prometheus.NewDesc(
-			"bpfrx_nat_pool_deterministic_info",
+			"xpf_nat_pool_deterministic_info",
 			"Deterministic NAT pool configuration (1 = enabled).",
 			[]string{"pool", "block_size", "host_count"}, nil,
 		),
 		dhcpLeasesActive: prometheus.NewDesc(
-			"bpfrx_dhcp_leases_active",
+			"xpf_dhcp_leases_active",
 			"Number of active DHCP leases.",
 			[]string{"family"}, nil,
 		),
 
 		sysCPUUser: prometheus.NewDesc(
-			"bpfrx_system_cpu_user_percent",
+			"xpf_system_cpu_user_percent",
 			"User CPU utilization percentage.",
 			nil, nil,
 		),
 		sysCPUSystem: prometheus.NewDesc(
-			"bpfrx_system_cpu_system_percent",
+			"xpf_system_cpu_system_percent",
 			"System CPU utilization percentage.",
 			nil, nil,
 		),
 		sysMemTotal: prometheus.NewDesc(
-			"bpfrx_system_memory_total_bytes",
+			"xpf_system_memory_total_bytes",
 			"Total system memory in bytes.",
 			nil, nil,
 		),
 		sysMemAvail: prometheus.NewDesc(
-			"bpfrx_system_memory_available_bytes",
+			"xpf_system_memory_available_bytes",
 			"Available system memory in bytes.",
 			nil, nil,
 		),
 		daemonUptime: prometheus.NewDesc(
-			"bpfrx_daemon_uptime_seconds",
+			"xpf_daemon_uptime_seconds",
 			"Daemon uptime in seconds.",
 			nil, nil,
 		),
 		daemonMemRSS: prometheus.NewDesc(
-			"bpfrx_daemon_memory_rss_bytes",
+			"xpf_daemon_memory_rss_bytes",
 			"Daemon resident set size in bytes.",
 			nil, nil,
 		),
 	}
 }
 
-func (c *bpfrxCollector) Describe(ch chan<- *prometheus.Desc) {
+func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.packetsTotal
 	ch <- c.dropsTotal
 	ch <- c.sessionsCreatedTotal
@@ -288,7 +288,7 @@ func (c *bpfrxCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.daemonMemRSS
 }
 
-func (c *bpfrxCollector) Collect(ch chan<- prometheus.Metric) {
+func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	dp := c.srv.dp
 	if dp == nil || !dp.IsLoaded() {
 		return
@@ -305,7 +305,7 @@ func (c *bpfrxCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectSystemMetrics(ch)
 }
 
-func (c *bpfrxCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	readCounter := func(idx uint32) float64 {
 		v, _ := dp.ReadGlobalCounter(idx)
 		return float64(v)
@@ -353,7 +353,7 @@ func (c *bpfrxCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp d
 		readCounter(dataplane.GlobalCtrFlowCacheInvalidate), "invalidate")
 }
 
-func (c *bpfrxCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -379,7 +379,7 @@ func (c *bpfrxCollector) collectInterfaceCounters(ch chan<- prometheus.Metric, d
 	}
 }
 
-func (c *bpfrxCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -409,7 +409,7 @@ func (c *bpfrxCollector) collectZoneCounters(ch chan<- prometheus.Metric, dp dat
 	}
 }
 
-func (c *bpfrxCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -442,7 +442,7 @@ func (c *bpfrxCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp d
 	}
 }
 
-func (c *bpfrxCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -496,7 +496,7 @@ func (c *bpfrxCollector) collectFilterCounters(ch chan<- prometheus.Metric, dp d
 	emitFilters("inet6", cfg.Firewall.FiltersInet6)
 }
 
-func (c *bpfrxCollector) collectSessionGauges(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectSessionGauges(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	if c.srv.gc == nil {
 		return
 	}
@@ -540,7 +540,7 @@ func (c *bpfrxCollector) collectSessionGauges(ch chan<- prometheus.Metric, dp da
 	ch <- prometheus.MustNewConstMetric(c.sessionsDNAT, prometheus.GaugeValue, float64(dnat))
 }
 
-func (c *bpfrxCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+func (c *xpfCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	cfg := c.srv.store.ActiveConfig()
 	if cfg == nil {
 		return
@@ -584,7 +584,7 @@ func (c *bpfrxCollector) collectNATPoolMetrics(ch chan<- prometheus.Metric, dp d
 	}
 }
 
-func (c *bpfrxCollector) collectDHCPMetrics(ch chan<- prometheus.Metric) {
+func (c *xpfCollector) collectDHCPMetrics(ch chan<- prometheus.Metric) {
 	if c.srv.dhcp == nil {
 		return
 	}
@@ -603,7 +603,7 @@ func (c *bpfrxCollector) collectDHCPMetrics(ch chan<- prometheus.Metric) {
 		float64(inet6), "inet6")
 }
 
-func (c *bpfrxCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
+func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 	// Daemon uptime
 	ch <- prometheus.MustNewConstMetric(c.daemonUptime, prometheus.GaugeValue,
 		time.Since(c.srv.startTime).Seconds())

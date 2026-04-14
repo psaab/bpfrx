@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/cmdtree"
-	"github.com/psaab/bpfrx/pkg/dataplane"
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
+	"github.com/psaab/xpf/pkg/cmdtree"
+	"github.com/psaab/xpf/pkg/dataplane"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"google.golang.org/grpc/metadata"
 )
 

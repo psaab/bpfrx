@@ -76,7 +76,7 @@ func TestEncodeTTL(t *testing.T) {
 
 func TestBuildFrame(t *testing.T) {
 	mac := net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55}
-	frame := BuildFrame(mac, "trust0", 120, "bpfrx", "eBPF firewall")
+	frame := BuildFrame(mac, "trust0", 120, "xpf", "eBPF firewall")
 
 	// Check Ethernet header.
 	if len(frame) < ethHdrLen {
@@ -115,8 +115,8 @@ func TestBuildFrame(t *testing.T) {
 	if neighbor.TTL != 120 {
 		t.Errorf("TTL: got %d, want 120", neighbor.TTL)
 	}
-	if neighbor.SystemName != "bpfrx" {
-		t.Errorf("system name: got %s, want bpfrx", neighbor.SystemName)
+	if neighbor.SystemName != "xpf" {
+		t.Errorf("system name: got %s, want xpf", neighbor.SystemName)
 	}
 	if neighbor.SystemDesc != "eBPF firewall" {
 		t.Errorf("system desc: got %s, want 'eBPF firewall'", neighbor.SystemDesc)

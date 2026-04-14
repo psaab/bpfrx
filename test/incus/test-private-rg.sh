@@ -39,8 +39,8 @@ wait_cluster_ready() {
 	local max_wait=30
 	local i=0
 	while [[ $i -lt $max_wait ]]; do
-		if incus exec bpfrx-fw0 -- systemctl is-active --quiet bpfrxd 2>/dev/null &&
-		   incus exec bpfrx-fw1 -- systemctl is-active --quiet bpfrxd 2>/dev/null; then
+		if incus exec xpf-fw0 -- systemctl is-active --quiet xpfd 2>/dev/null &&
+		   incus exec xpf-fw1 -- systemctl is-active --quiet xpfd 2>/dev/null; then
 			sleep 5  # Allow election to settle
 			return 0
 		fi
@@ -55,15 +55,15 @@ wait_cluster_ready() {
 check_no_vrrp_multicast() {
 	info "Checking for VRRP multicast on data interfaces..."
 	local count
-	count=$(incus exec bpfrx-fw0 -- timeout 3 tcpdump -c 1 -i ge-0-0-1 vrrp 2>&1 | grep -c "packet" || echo "0")
+	count=$(incus exec xpf-fw0 -- timeout 3 tcpdump -c 1 -i ge-0-0-1 vrrp 2>&1 | grep -c "packet" || echo "0")
 	# tcpdump reports "0 packets captured" if no VRRP seen
-	if incus exec bpfrx-fw0 -- timeout 3 tcpdump -c 1 -i ge-0-0-1 vrrp 2>&1 | grep -q "0 packets captured"; then
+	if incus exec xpf-fw0 -- timeout 3 tcpdump -c 1 -i ge-0-0-1 vrrp 2>&1 | grep -q "0 packets captured"; then
 		pass "No VRRP multicast on ge-0-0-1 (WAN)"
 	else
 		fail "VRRP multicast detected on ge-0-0-1 (WAN)"
 	fi
 
-	if incus exec bpfrx-fw0 -- timeout 3 tcpdump -c 1 -i ge-0-0-0 vrrp 2>&1 | grep -q "0 packets captured"; then
+	if incus exec xpf-fw0 -- timeout 3 tcpdump -c 1 -i ge-0-0-0 vrrp 2>&1 | grep -q "0 packets captured"; then
 		pass "No VRRP multicast on ge-0-0-0 (LAN)"
 	else
 		fail "VRRP multicast detected on ge-0-0-0 (LAN)"
@@ -73,7 +73,7 @@ check_no_vrrp_multicast() {
 check_vrrp_active() {
 	info "Checking VRRP instances are running..."
 	local log
-	log=$(incus exec bpfrx-fw0 -- journalctl -u bpfrxd --no-pager -n 100 2>/dev/null)
+	log=$(incus exec xpf-fw0 -- journalctl -u xpfd --no-pager -n 100 2>/dev/null)
 
 	if echo "$log" | grep -q "vrrp: instance starting"; then
 		pass "VRRP instances started on fw0"
@@ -91,7 +91,7 @@ check_vrrp_active() {
 check_no_vrrp_instances() {
 	info "Checking VRRP instances are NOT running (private-rg mode)..."
 	local log
-	log=$(incus exec bpfrx-fw0 -- journalctl -u bpfrxd --no-pager -n 100 2>/dev/null)
+	log=$(incus exec xpf-fw0 -- journalctl -u xpfd --no-pager -n 100 2>/dev/null)
 
 	if echo "$log" | grep -q "vrrp: instance starting"; then
 		fail "VRRP instances running in private-rg mode"
@@ -103,7 +103,7 @@ check_no_vrrp_instances() {
 check_vips_present() {
 	info "Checking VIPs are present..."
 	local addrs
-	addrs=$(incus exec bpfrx-fw0 -- ip addr show 2>/dev/null)
+	addrs=$(incus exec xpf-fw0 -- ip addr show 2>/dev/null)
 
 	if echo "$addrs" | grep -q "172.16.50.6"; then
 		pass "WAN VIP 172.16.50.6 present"
@@ -163,12 +163,12 @@ check_connectivity() {
 check_manual_failover() {
 	info "Testing manual failover..."
 	# Failover RG1 to node1
-	incus exec bpfrx-fw0 -- bash -c "echo 'request chassis cluster failover redundancy-group 1 node 1' | bpfrxd cli" &>/dev/null 2>&1 || true
+	incus exec xpf-fw0 -- bash -c "echo 'request chassis cluster failover redundancy-group 1 node 1' | xpfd cli" &>/dev/null 2>&1 || true
 	sleep 3
 
 	# Check VIPs moved to fw1
 	local fw1_addrs
-	fw1_addrs=$(incus exec bpfrx-fw1 -- ip addr show 2>/dev/null)
+	fw1_addrs=$(incus exec xpf-fw1 -- ip addr show 2>/dev/null)
 	if echo "$fw1_addrs" | grep -q "172.16.50.6"; then
 		pass "Manual failover: VIP moved to fw1"
 	else
@@ -183,7 +183,7 @@ check_manual_failover() {
 	fi
 
 	# Reset failover
-	incus exec bpfrx-fw0 -- bash -c "echo 'request chassis cluster failover reset redundancy-group 1' | bpfrxd cli" &>/dev/null 2>&1 || true
+	incus exec xpf-fw0 -- bash -c "echo 'request chassis cluster failover reset redundancy-group 1' | xpfd cli" &>/dev/null 2>&1 || true
 	sleep 5
 }
 
@@ -245,7 +245,7 @@ main() {
 			;;
 		check)
 			local log
-			log=$(incus exec bpfrx-fw0 -- journalctl -u bpfrxd --no-pager -n 100 2>/dev/null)
+			log=$(incus exec xpf-fw0 -- journalctl -u xpfd --no-pager -n 100 2>/dev/null)
 			if echo "$log" | grep -q "vrrp: instance starting"; then
 				info "Mode: VRRP (standard)"
 			else

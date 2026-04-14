@@ -3,7 +3,7 @@
 Date: 2026-03-07
 Kernel: 6.18.9 (Debian 13 VM on Incus)
 Hardware: Mellanox ConnectX-5 (mlx5, native XDP), 2 vCPUs
-Test: `iperf3 -P 4 -t 10` through bpfrx HA cluster (loss remote, node0 primary)
+Test: `iperf3 -P 4 -t 10` through xpf HA cluster (loss remote, node0 primary)
 Build: commit fb3cb60 (PR #169 flow cache + #165/#167/#170 optimizations)
 
 ## Throughput
@@ -31,7 +31,7 @@ Flow cache hit rate: 93.9%
 | `xdp_zone_prog` | 7.4% | 8.2% | +0.8% | BPF pipeline |
 | `mlx5e_skb_from_cqe_mpwrq_linear` | 7.2% | 6.1% | -1.1% | MLX5 driver RX |
 | `xdp_forward_prog` | 6.9% | 5.0% | -1.9% | BPF pipeline |
-| `__htab_map_lookup_and_delete_batch` | 6.1% | 4.9% | -1.2% | bpfrxd GC |
+| `__htab_map_lookup_and_delete_batch` | 6.1% | 4.9% | -1.2% | xpfd GC |
 | `htab_map_hash` | 5.6% | **7.9%** | **+2.3%** | BPF hash map |
 | `read_tsc` | 5.0% | 4.5% | -0.5% | Timestamps |
 | `mlx5e_free_xdpsq_desc` | 4.2% | 2.1% | -2.1% | MLX5 driver TX |
@@ -91,9 +91,9 @@ to issue #168 (compact IPv6 session key).
 Driver overhead is ~20% — mostly inherent to the NAPI→XDP flow and hard to
 optimize from userspace.
 
-### 4. Conntrack GC (userspace bpfrxd) — 6.1% (IPv4) / 4.9% (IPv6)
+### 4. Conntrack GC (userspace xpfd) — 6.1% (IPv4) / 4.9% (IPv6)
 
-`__htab_map_lookup_and_delete_batch` runs in bpfrxd's GC goroutine, batch-scanning
+`__htab_map_lookup_and_delete_batch` runs in xpfd's GC goroutine, batch-scanning
 the sessions map for expired entries via `bpf_map_lookup_and_delete_batch()` syscall.
 
 ### 5. Timestamps — 5.0% (IPv4) / 4.5% (IPv6)
@@ -155,7 +155,7 @@ Approach: add `SESS_FLAG_SCREENED` — screen programs check per-CPU scratch for
 
 #### 6. Batch/reduce conntrack GC — 6%
 
-`__htab_map_lookup_and_delete_batch` at 6% is from bpfrxd's 1s GC sweep.
+`__htab_map_lookup_and_delete_batch` at 6% is from xpfd's 1s GC sweep.
 
 Approaches:
 - Adaptive GC frequency (reduce sweep rate when few sessions expire)

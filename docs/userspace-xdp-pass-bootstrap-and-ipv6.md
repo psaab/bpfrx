@@ -6,7 +6,7 @@
 
 ## Problem Statement
 
-After daemon restart on the userspace HA cluster (`loss:bpfrx-userspace-fw0/fw1`), three problems existed:
+After daemon restart on the userspace HA cluster (`loss:xpf-userspace-fw0/fw1`), three problems existed:
 
 1. **IPv4 forwarding dead for 40+ seconds** after restart, even though VRRP election should provide failover in ~1s
 2. **IPv6 forwarding completely broken** on VLAN sub-interfaces (`ge-0-0-2.50`, `ge-0-0-2.80`) — `iperf3 -c 2001:559:8585:80::200` returned "No route to host"

@@ -9,9 +9,9 @@ separate UMEM allocations. On current `master`, the steady-state hot
 transit path is not the copy-path fallback; it is the direct TX builder
 itself. The measured profile on a live transit run shows:
 
-- `bpfrx_userspace_dp::afxdp::poll_binding` about `17.6%`
+- `xpf_userspace_dp::afxdp::poll_binding` about `17.6%`
 - `__memmove_evex_unaligned_erms` about `16.7%`
-- `bpfrx_userspace_dp::afxdp::frame::enqueue_pending_forwards` about `5.8%`
+- `xpf_userspace_dp::afxdp::frame::enqueue_pending_forwards` about `5.8%`
 
 Helper counters on the same run showed:
 
@@ -335,7 +335,7 @@ only valid for the prototype branch after the queue-ownership issue is fixed
 and a real same-device proof topology is available.
 
 1. `cargo build --release` — compiles
-2. Deploy to loss cluster: `loss:bpfrx-userspace-fw0` + `loss:bpfrx-userspace-fw1`
+2. Deploy to loss cluster: `loss:xpf-userspace-fw0` + `loss:xpf-userspace-fw1`
 3. Forward throughput: `iperf3 -c 172.16.80.200 -P 8 -t 10` from `loss:cluster-userspace-host`
 4. Reverse throughput: same with `-R`
 5. Profile: `perf record -a -g --freq=997` — verify memcpy eliminated

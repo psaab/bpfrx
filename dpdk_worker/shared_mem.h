@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * shared_mem.h — Shared memory layout for Go <-> DPDK worker communication.
  *
- * All structs here mirror the BPF definitions in bpf/headers/bpfrx_common.h
- * and bpf/headers/bpfrx_conntrack.h exactly. The Go control plane populates
+ * All structs here mirror the BPF definitions in bpf/headers/xpf_common.h
+ * and bpf/headers/xpf_conntrack.h exactly. The Go control plane populates
  * tables via CGo; the DPDK worker reads them lock-free.
  */
 
@@ -41,7 +41,7 @@
 #define PROTO_VRRP  112
 
 /* ============================================================
- * IP address union (matches struct ip_addr in bpfrx_common.h)
+ * IP address union (matches struct ip_addr in xpf_common.h)
  * ============================================================ */
 
 struct ip_addr {
@@ -52,7 +52,7 @@ struct ip_addr {
 };
 
 /* ============================================================
- * Interface <-> Zone mapping (matches bpfrx_common.h)
+ * Interface <-> Zone mapping (matches xpf_common.h)
  * ============================================================ */
 
 struct iface_zone_key {
@@ -74,7 +74,7 @@ struct iface_zone_value {
 /* Fabric zone-encoded MAC marker for active/active per-RG cross-chassis
  * forwarding of new connections.  Source MAC byte[3] = 0xfe indicates
  * zone is encoded in byte[5].
- * Mirrors FABRIC_ZONE_MAC_MAGIC in bpf/headers/bpfrx_common.h. */
+ * Mirrors FABRIC_ZONE_MAC_MAGIC in bpf/headers/xpf_common.h. */
 #define FABRIC_ZONE_MAC_MAGIC 0xfe
 #define MAX_APP_RANGES        32
 
@@ -86,7 +86,7 @@ struct vlan_iface_info {
 };
 
 /* ============================================================
- * Zone configuration (matches bpfrx_common.h)
+ * Zone configuration (matches xpf_common.h)
  * ============================================================ */
 
 struct zone_config {
@@ -123,7 +123,7 @@ struct zone_config {
 #define HOST_INBOUND_ALL              0xFFFFFFFF
 
 /* ============================================================
- * Session / conntrack (matches bpfrx_conntrack.h)
+ * Session / conntrack (matches xpf_conntrack.h)
  * ============================================================ */
 
 /* Session states */
@@ -250,7 +250,7 @@ struct session_value_v6 {
 };
 
 /* ============================================================
- * Policy (matches bpfrx_maps.h)
+ * Policy (matches xpf_maps.h)
  * ============================================================ */
 
 /* Policy actions */
@@ -303,7 +303,7 @@ struct addr_membership_key {
 };
 
 /* ============================================================
- * Application table (matches bpfrx_maps.h)
+ * Application table (matches xpf_maps.h)
  * ============================================================ */
 
 struct app_key {
@@ -335,7 +335,7 @@ struct app_range_entry {
 };
 
 /* ============================================================
- * Screen/IDS configuration (matches bpfrx_common.h)
+ * Screen/IDS configuration (matches xpf_common.h)
  * ============================================================ */
 
 /* Screen option flags */
@@ -405,7 +405,7 @@ struct scan_track_value {
 };
 
 /* ============================================================
- * NAT (matches bpfrx_maps.h)
+ * NAT (matches xpf_maps.h)
  * ============================================================ */
 
 #define MAX_NAT_POOL_IPS_PER_POOL 256
@@ -508,7 +508,7 @@ struct static_nat_value_v6 {
 };
 
 /* ============================================================
- * NAT64 (matches bpfrx_common.h)
+ * NAT64 (matches xpf_common.h)
  * ============================================================ */
 
 struct nat64_prefix_key {
@@ -539,7 +539,7 @@ struct nat64_state_value {
 };
 
 /* ============================================================
- * Firewall filter (matches bpfrx_common.h / bpfrx_maps.h)
+ * Firewall filter (matches xpf_common.h / xpf_maps.h)
  * ============================================================ */
 
 /* Filter match flags */
@@ -622,7 +622,7 @@ struct policer_state {
 };
 
 /* ============================================================
- * Counter values (matches bpfrx_common.h)
+ * Counter values (matches xpf_common.h)
  * ============================================================ */
 
 struct counter_value {
@@ -638,7 +638,7 @@ struct iface_counter_value {
 };
 
 /* ============================================================
- * NAT port allocation counter (matches bpfrx_common.h)
+ * NAT port allocation counter (matches xpf_common.h)
  * ============================================================ */
 
 struct nat_port_counter {
@@ -646,7 +646,7 @@ struct nat_port_counter {
 };
 
 /* ============================================================
- * Flow configuration (matches bpfrx_common.h)
+ * Flow configuration (matches xpf_common.h)
  * ============================================================ */
 
 struct flow_config {
@@ -738,7 +738,7 @@ struct event {
 };
 
 /* ============================================================
- * Packet metadata (mirrors struct pkt_meta in bpfrx_common.h)
+ * Packet metadata (mirrors struct pkt_meta in xpf_common.h)
  * Passed through the userspace pipeline by reference.
  *
  * DPDK-specific differences from BPF pkt_meta:

@@ -6,7 +6,7 @@ The userspace AF_XDP dataplane processes transit packets in a Rust helper proces
 
 ## Test Environment
 
-- Cluster: `loss:bpfrx-userspace-fw0` / `loss:bpfrx-userspace-fw1`
+- Cluster: `loss:xpf-userspace-fw0` / `loss:xpf-userspace-fw1`
 - Host: `loss:cluster-userspace-host`
 - Test targets: 172.16.80.200 (IPv4), 2001:559:8585:80::200 (IPv6)
 
@@ -42,7 +42,7 @@ test is specifically restart behavior.
 **Procedure**:
 ```bash
 # Restart daemon
-incus exec loss:bpfrx-userspace-fw0 -- systemctl restart bpfrxd
+incus exec loss:xpf-userspace-fw0 -- systemctl restart xpfd
 sleep 40  # Wait for VRRP election + ctrl enable (15s HA delay)
 
 # Test IPv4
@@ -56,7 +56,7 @@ incus exec loss:cluster-userspace-host -- ping6 -c 2 -W 3 2001:559:8585:80::200
 **Automated** (20 restart cycles):
 ```bash
 for i in $(seq 1 20); do
-  incus exec loss:bpfrx-userspace-fw0 -- systemctl restart bpfrxd
+  incus exec loss:xpf-userspace-fw0 -- systemctl restart xpfd
   sleep 40
   v4=$(incus exec loss:cluster-userspace-host -- timeout 5 ping -c 2 -W 3 172.16.80.200 2>&1 | grep -oP '\d+(?= received)')
   v6=$(incus exec loss:cluster-userspace-host -- timeout 5 ping6 -c 2 -W 3 2001:559:8585:80::200 2>&1 | grep -oP '\d+(?= received)')
@@ -76,7 +76,7 @@ The HA startup sequence: BPF load (~3s) → VRRP election (~7s) → RETH MAC + X
 
 ```bash
 # Flush firewall's WAN-side neighbors
-incus exec loss:bpfrx-userspace-fw0 -- \
+incus exec loss:xpf-userspace-fw0 -- \
   bash -c 'ip neigh flush dev ge-0-0-2.80; ip -6 neigh flush dev ge-0-0-2.80'
 
 # Test (should succeed within 2ms via buffer-and-retry)
@@ -148,7 +148,7 @@ incus exec loss:cluster-userspace-host -- mtr -n --report --report-cycles=10 -6 
 **What it tests**: Host receives IPv6 default route via RA after daemon restart.
 
 ```bash
-incus exec loss:bpfrx-userspace-fw0 -- systemctl restart bpfrxd
+incus exec loss:xpf-userspace-fw0 -- systemctl restart xpfd
 sleep 35
 incus exec loss:cluster-userspace-host -- ip -6 route show default
 ```

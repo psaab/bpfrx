@@ -2,7 +2,7 @@
 
 ## Overview
 
-bpfrx HA clusters synchronize stateful firewall sessions between two nodes so
+xpf HA clusters synchronize stateful firewall sessions between two nodes so
 that a new primary can continue forwarding established flows after an RG move
 or peer loss. Session sync rides a custom TCP protocol over the fabric link
 (`fab0` / `fab1`).
@@ -254,7 +254,7 @@ before `OnPeerConnected` and before the fresh bulk starts.
 ### Event Stream (Primary Path)
 
 The Rust helper pushes session events over a persistent binary-framed Unix
-socket (`/run/bpfrx/userspace-dp-events.sock`). Events (SessionOpen,
+socket (`/run/xpf/userspace-dp-events.sock`). Events (SessionOpen,
 SessionClose, SessionUpdate) carry sequence numbers for reliable delivery.
 The daemon reads events, applies ownership filtering, and queues them to the
 peer sync stream. Ack frames flow back for replay buffer management. Pause,

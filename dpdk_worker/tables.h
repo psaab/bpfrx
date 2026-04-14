@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * tables.h — Table size constants and DPDK data structure declarations.
  *
- * Max sizes match BPF constants from bpf/headers/bpfrx_common.h.
+ * Max sizes match BPF constants from bpf/headers/xpf_common.h.
  * DPDK equivalents: BPF HASH -> rte_hash, BPF ARRAY -> C array,
  * BPF LPM_TRIE -> rte_lpm/rte_lpm6, BPF PERCPU_ARRAY -> per-lcore array.
  */
@@ -17,7 +17,7 @@
 #include "shared_mem.h"
 
 /* ============================================================
- * Table size constants (match bpfrx_common.h)
+ * Table size constants (match xpf_common.h)
  * ============================================================ */
 
 #define MAX_ZONES              64

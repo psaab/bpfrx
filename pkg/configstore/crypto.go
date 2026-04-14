@@ -17,10 +17,10 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
-const encryptedTreeFormat = "bpfrx-master-password-v1"
+const encryptedTreeFormat = "xpf-master-password-v1"
 
 type encryptedTreeEnvelope struct {
 	Format string `json:"format"`
@@ -187,7 +187,7 @@ func deriveEncryptionKeyFromSalt(keyMaterial []byte, prf string, salt []byte) ([
 	if err != nil {
 		return nil, err
 	}
-	key, err := hkdf.Key(hashFn, keyMaterial, salt, "bpfrx-configstore-master-password", 32)
+	key, err := hkdf.Key(hashFn, keyMaterial, salt, "xpf-configstore-master-password", 32)
 	if err != nil {
 		return nil, fmt.Errorf("derive key: %w", err)
 	}

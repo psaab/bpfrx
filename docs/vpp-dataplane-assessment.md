@@ -1,4 +1,4 @@
-# VPP Dataplane Assessment for bpfrx
+# VPP Dataplane Assessment for xpf
 
 Note: This is a deep VPP-focused assessment. For the current project-level
 decision and recommendation between DPDK and VPP, see
@@ -9,7 +9,7 @@ decision and recommendation between DPDK and VPP, see
 ## Executive Summary
 
 This document assesses the viability of using fd.io VPP (Vector Packet Processing) as
-a dataplane for bpfrx, either as a replacement for or complement to the existing XDP
+a dataplane for xpf, either as a replacement for or complement to the existing XDP
 and custom DPDK pipelines. The analysis covers VPP's architecture, feature set,
 performance characteristics, integration strategies, VPN/tunnel compatibility, HA
 (VRRP), and Linux kernel integration via pseudo-interfaces.
@@ -18,8 +18,8 @@ performance characteristics, integration strategies, VPN/tunnel compatibility, H
 architectural constraints. The most practical path is a **hybrid XDP + VPP** model
 where XDP handles early drops (screen/DDoS) and VPP handles stateful processing
 (conntrack, policy, NAT) via AF_XDP. However, VPP's lack of zone-based policy
-requires a custom C plugin, and its crash-stops-forwarding model sacrifices bpfrx's
-hitless restart capability. For bpfrx's current scale (25 Gbps XDP, 15.6 Gbps
+requires a custom C plugin, and its crash-stops-forwarding model sacrifices xpf's
+hitless restart capability. For xpf's current scale (25 Gbps XDP, 15.6 Gbps
 virtio-net), the existing architecture is adequate; VPP becomes compelling at 40-100+
 Gbps where its vector processing model dominates.
 
@@ -33,23 +33,23 @@ handles everything natively at near line-rate with no VPP needed.
 **VRRP/HA finding:** VPP includes a production-grade VRRPv3 plugin (RFC 5798, used by
 Netgate TNSR) with real-time async state events via GoVPP API -- eliminating
 keepalived's fragile SIGUSR1 polling. However, VPP VRRP only makes sense if VPP is
-already the dataplane; it lacks sync groups (bpfrx's cluster election handles
+already the dataplane; it lacks sync groups (xpf's cluster election handles
 coordinated failover instead), and VIPs live on VPP interfaces requiring explicit
 kernel mirroring for FRR and management services.
 
 **Hybrid VPP VRRP + XDP finding:** VPP **cannot** serve as a VRRP-only frontend for
 XDP-processed NICs. DPDK removes the NIC from the kernel; AF_XDP replaces the existing
 XDP program; virtual interfaces cannot program VRRP's virtual MAC. The recommended path
-is **native Go VRRP** — implementing VRRPv3 directly in bpfrxd using proven Go libraries
+is **native Go VRRP** — implementing VRRPv3 directly in xpfd using proven Go libraries
 (govrrp, vrrp-go), eliminating both VPP and keepalived dependencies. Estimated effort:
-3 days, leveraging bpfrx's existing GARP/NA, BPF map update, and FRR reload infrastructure.
+3 days, leveraging xpf's existing GARP/NA, BPF map update, and FRR reload infrastructure.
 
 **Linux integration finding:** VPP's Linux Control Plane (LCP) plugin creates TAP
 mirror interfaces in the kernel for each VPP-owned NIC, enabling FRR, SSH, SNMP, and
 management services to operate without modification. Bidirectional netlink
 synchronization keeps routes, addresses, and neighbor tables consistent between VPP
 and the kernel. This is proven in production (IPng Networks: 13 routers, zero LCP
-crashes since 2021; Netgate TNSR; Coloclue: 0% packet loss). LCP replaces bpfrx's
+crashes since 2021; Netgate TNSR; Coloclue: 0% packet loss). LCP replaces xpf's
 current networkd-based interface management but introduces namespace complexity and
 a dependency on VPP's "experimental" plugin label.
 
@@ -75,13 +75,13 @@ a dependency on VPP's "experimental" plugin label.
 
 VPP's core innovation is **batch (vector) packet processing** through a directed graph
 of forwarding nodes. Instead of processing each packet through the entire pipeline
-(as Linux and bpfrx's XDP tail-call chain do), VPP:
+(as Linux and xpf's XDP tail-call chain do), VPP:
 
 1. Reads the largest available vector of packets from the NIC (typically 256).
 2. Pushes the entire vector through one graph node before moving to the next.
 3. The first packet warms the instruction cache; subsequent packets hit warm cache.
 
-This is fundamentally different from bpfrx's BPF pipeline where each packet traverses
+This is fundamentally different from xpf's BPF pipeline where each packet traverses
 `main -> screen -> zone -> conntrack -> policy -> nat -> nat64 -> forward` individually.
 In VPP, all 256 packets would be processed through "screen" first, then all 256 through
 "zone", etc. The I-cache advantage grows with batch size and pipeline depth.
@@ -100,9 +100,9 @@ In VPP, all 256 packets would be processed through "screen" first, then all 256 
 - Thread-local buffer caches (512 entries, allocation is a check + subtraction + memcpy).
 - Prefetching 4 packets ahead to hide memory latency.
 
-### Comparison to bpfrx's Models
+### Comparison to xpf's Models
 
-| Aspect               | bpfrx (XDP)              | bpfrx (DPDK worker)       | VPP                           |
+| Aspect               | xpf (XDP)              | xpf (DPDK worker)       | VPP                           |
 |-----------------------|--------------------------|---------------------------|-------------------------------|
 | Processing model      | Per-packet tail calls    | Single-pass per-packet    | Vector/batch graph dispatch   |
 | I-cache behavior      | Re-loads per packet      | Single function, warm     | First packet warms, rest hit  |
@@ -113,11 +113,11 @@ In VPP, all 256 packets would be processed through "screen" first, then all 256 
 
 ---
 
-## 2. VPP Feature Coverage vs bpfrx Requirements
+## 2. VPP Feature Coverage vs xpf Requirements
 
 ### Features VPP Provides Out of the Box
 
-| Feature               | VPP Maturity | bpfrx Equivalent              | Notes                                      |
+| Feature               | VPP Maturity | xpf Equivalent              | Notes                                      |
 |-----------------------|--------------|-------------------------------|--------------------------------------------|
 | NAT44-ED              | Production   | xdp_nat.c SNAT/DNAT          | More complete: twice-NAT, load-balanced DNAT, forwarding mode |
 | NAT64                 | Production   | xdp_nat64.c                  | Stateful RFC 6146, TCP/UDP/ICMP            |
@@ -138,7 +138,7 @@ In VPP, all 256 packets would be processed through "screen" first, then all 256 
 
 ### Critical Gaps (Would Require Custom VPP Plugins)
 
-| bpfrx Feature                    | VPP Status        | Effort to Implement             |
+| xpf Feature                    | VPP Status        | Effort to Implement             |
 |----------------------------------|-------------------|---------------------------------|
 | **Zone-based policy model**      | Not available     | ~2000 lines C plugin            |
 | **Screen/IDS checks (11 types)** | Not available     | ~1000 lines C plugin            |
@@ -152,7 +152,7 @@ In VPP, all 256 packets would be processed through "screen" first, then all 256 
 | **Session aggregation reports**  | Not available     | Go-side via GoVPP stats         |
 
 **Estimated plugin development: 4000-6000 lines of C** for zone-based stateful
-firewall with bpfrx feature parity. This is the primary cost of VPP adoption.
+firewall with xpf feature parity. This is the primary cost of VPP adoption.
 
 ---
 
@@ -160,7 +160,7 @@ firewall with bpfrx feature parity. This is the primary cost of VPP adoption.
 
 ### Raw Forwarding Throughput
 
-| Workload              | bpfrx (XDP native) | bpfrx (virtio)  | bpfrx (DPDK worker) | VPP (DPDK)      | VPP (AF_XDP)    |
+| Workload              | xpf (XDP native) | xpf (virtio)  | xpf (DPDK worker) | VPP (DPDK)      | VPP (AF_XDP)    |
 |-----------------------|--------------------|-----------------|----------------------|-----------------|-----------------|
 | L3 forwarding         | 25+ Gbps           | 15.6 Gbps       | Not benchmarked      | 100+ Gbps       | ~70-80 Gbps est.|
 | Stateful firewall     | ~20 Gbps est.      | ~12 Gbps est.   | Not benchmarked      | ~50+ Gbps est.  | ~40 Gbps est.   |
@@ -168,7 +168,7 @@ firewall with bpfrx feature parity. This is the primary cost of VPP adoption.
 | NAT44                 | ~20 Gbps est.      | ~12 Gbps est.   | Not benchmarked      | ~40+ Gbps est.  | ~30 Gbps est.   |
 
 *VPP numbers from published benchmarks (Google GCP, Intel, Calico/VPP).*
-*bpfrx estimates based on measured forwarding throughput with stateful overhead.*
+*xpf estimates based on measured forwarding throughput with stateful overhead.*
 
 ### Per-Core Efficiency
 
@@ -179,13 +179,13 @@ VPP's vector model yields better per-core throughput for complex pipelines:
 - **XDP simple forward**: ~14 Mpps per core (native driver)
 
 VPP's stateful path is actually faster than its stateless path because the flow cache
-avoids repeated ACL evaluation -- similar to bpfrx's conntrack fast-path bypassing
+avoids repeated ACL evaluation -- similar to xpf's conntrack fast-path bypassing
 policy re-evaluation.
 
 ### Where VPP Wins
 
 1. **Deep pipelines**: Vector processing advantage grows with pipeline depth.
-   bpfrx's 8-stage XDP chain incurs 8 tail-call transitions per packet; VPP batches
+   xpf's 8-stage XDP chain incurs 8 tail-call transitions per packet; VPP batches
    all packets through each stage.
 2. **100G+ NICs**: DPDK PMD + VPP graph = line-rate at 100 Gbps on commodity hardware.
 3. **IPsec acceleration**: Native crypto engines (IPSecMB, QAT) integrated into the graph.
@@ -275,7 +275,7 @@ XDP program (screen checks, DDoS drops, zone classification)
 Use VPP only for specific high-throughput features, keep XDP as primary dataplane.
 
 ```
-NIC -> XDP pipeline (full bpfrx processing for most traffic)
+NIC -> XDP pipeline (full xpf processing for most traffic)
                 |
                 | IPsec / high-throughput NAT flows
                 v
@@ -365,7 +365,7 @@ natClient.Nat44AddDelAddressRange(ctx, &nat44ed.Nat44AddDelAddressRange{
 ### Stats Collection
 
 VPP exports stats via shared memory -- GoVPP reads counters without impacting the
-data plane. This is analogous to bpfrx's per-CPU BPF map counter aggregation:
+data plane. This is analogous to xpf's per-CPU BPF map counter aggregation:
 
 ```go
 statsClient, _ := statsclient.NewStatsClient("/run/vpp/stats.sock")
@@ -396,18 +396,18 @@ type DPDKBackend struct { ... }  // shared memory writes (existing)
 
 ### VPP Deployment Requirements
 
-| Requirement         | VPP (DPDK mode)                      | VPP (AF_XDP mode)          | bpfrx (XDP)             |
+| Requirement         | VPP (DPDK mode)                      | VPP (AF_XDP mode)          | xpf (XDP)             |
 |---------------------|--------------------------------------|----------------------------|-------------------------|
 | Hugepages           | 1-2 GB per NUMA node                 | Optional (UMEM)            | None                    |
 | Dedicated CPU cores | Yes (main + workers)                 | Yes                        | No (per-CPU BPF)        |
 | Kernel modules      | vfio-pci or igb_uio                  | None                       | None                    |
 | NIC visibility      | Removed from kernel                  | Visible to kernel          | Visible to kernel       |
-| Process model       | Separate VPP daemon                  | Separate VPP daemon        | Embedded in bpfrxd      |
-| Config files        | /etc/vpp/startup.conf                | /etc/vpp/startup.conf      | /etc/bpfrx/bpfrx.conf   |
+| Process model       | Separate VPP daemon                  | Separate VPP daemon        | Embedded in xpfd      |
+| Config files        | /etc/vpp/startup.conf                | /etc/vpp/startup.conf      | /etc/xpf/xpf.conf   |
 | Crash behavior      | Forwarding stops                     | Forwarding stops           | BPF continues (pinned)  |
 | Restart             | Full restart, sessions lost          | Full restart               | Hitless (pinned maps)   |
 | Memory              | Pre-allocated, fixed                 | Pre-allocated              | Dynamic kernel memory   |
-| Binary size         | ~50MB (VPP + plugins)                | ~50MB                      | ~45MB (bpfrxd)          |
+| Binary size         | ~50MB (VPP + plugins)                | ~50MB                      | ~45MB (xpfd)          |
 
 ### FRR Integration
 
@@ -415,18 +415,18 @@ VPP's Linux CP (Control Plane) plugin creates TAP mirror interfaces in the kerne
 each VPP interface. FRR sees these TAP interfaces and manages routes normally. VPP
 learns routes via the linux-cp plugin and populates its FIB.
 
-This is functionally equivalent to bpfrx's current model where FRR manages
+This is functionally equivalent to xpf's current model where FRR manages
 `/etc/frr/frr.conf` and the kernel FIB is used by `bpf_fib_lookup()` / DPDK
 `rte_lpm`. The key difference is that VPP has its own FIB separate from the kernel --
 routes must be synced bidirectionally.
 
 ### Monitoring and Debugging
 
-| Capability          | VPP                                  | bpfrx (XDP)                         |
+| Capability          | VPP                                  | xpf (XDP)                         |
 |---------------------|--------------------------------------|-------------------------------------|
 | Packet tracing      | `trace add` (graph-node level)       | bpf_printk, ring buffer events      |
 | Stats               | Shared-memory counters (GoVPP)       | Per-CPU BPF map aggregation         |
-| CLI debugging       | vppctl (rich, graph-aware)           | bpfrxd CLI, bpftool                 |
+| CLI debugging       | vppctl (rich, graph-aware)           | xpfd CLI, bpftool                 |
 | Performance profile | VPP event logger, perf               | perf, bpftool prog profile          |
 | Live inspection     | `show session table`, `show nat44`   | `show security flow session`        |
 
@@ -445,7 +445,7 @@ routes must be synced bidirectionally.
    between versions with limited backward compatibility guarantees.
 
 3. **Loss of hitless restart**: VPP crash or restart means forwarding stops entirely.
-   bpfrx's pinned BPF maps/links provide zero-downtime restarts -- this is a
+   xpf's pinned BPF maps/links provide zero-downtime restarts -- this is a
    significant operational regression.
 
 4. **Debugging complexity**: VPP's graph dispatch model is powerful but opaque. Custom
@@ -478,7 +478,7 @@ routes must be synced bidirectionally.
 ### Short Term (Current): Stay on XDP + Complete DPDK Worker
 
 The existing XDP pipeline at 25+ Gbps with hitless restart, verifier-checked safety,
-and zero-dependency operation is well-suited for bpfrx's current deployment targets.
+and zero-dependency operation is well-suited for xpf's current deployment targets.
 The custom DPDK worker is ~70% complete and represents 6-8 weeks of remaining work for
 a purpose-built high-performance path under full project control.
 
@@ -500,7 +500,7 @@ stability testing on target hardware must pass.
 
 ### Long Term (If Multi-Service Platform): Consider VPP as Primary
 
-If bpfrx evolves toward a multi-service platform (router + firewall + load balancer +
+If xpf evolves toward a multi-service platform (router + firewall + load balancer +
 VPN concentrator), VPP's integrated feature set becomes compelling. The investment in
 custom plugins would be amortized across multiple services that VPP provides natively.
 
@@ -667,7 +667,7 @@ for inner-packet policy after decryption.
 
 **GRE:** XDP can parse through outer IP + GRE header (4-16 bytes) to access inner
 packet headers. Encap/decap via `bpf_xdp_adjust_head()` is a pointer operation (no
-memcpy). bpfrx already has `gre_accel` infrastructure and GRE-specific TCP MSS
+memcpy). xpf already has `gre_accel` infrastructure and GRE-specific TCP MSS
 clamping (`tcp_mss_gre_in`/`tcp_mss_gre_out`).
 
 **VXLAN/Geneve:** XDP can parse through outer Ethernet + IP + UDP + VXLAN/Geneve
@@ -713,7 +713,7 @@ IPsec hardware offload 10-25+ Gbps.*
 
 ---
 
-## 11. WireGuard Integration Options for bpfrx
+## 11. WireGuard Integration Options for xpf
 
 ### Option A: Kernel WireGuard + TC BPF on wg0 (Recommended Short-Term)
 
@@ -721,7 +721,7 @@ IPsec hardware offload 10-25+ Gbps.*
 Physical NIC (XDP) → encrypted UDP → kernel WireGuard → wg0 (TC BPF) → routing
 ```
 
-- bpfrxd generates WireGuard configs (same pattern as strongSwan config generation)
+- xpfd generates WireGuard configs (same pattern as strongSwan config generation)
 - Kernel handles ChaCha20-Poly1305 crypto
 - TC BPF program on wg0 applies zone-based firewall policy on decrypted traffic
 - XDP on physical NIC handles DDoS/screen on encrypted WireGuard UDP traffic
@@ -741,7 +741,7 @@ Physical NIC (XDP) → kernel WireGuard → wg0 → ip route via veth →
 - Kernel WireGuard decrypts; wg0 routes to a veth pair
 - XDP pipeline runs on the veth peer interface (native XDP supported since kernel 5.9)
 - Full XDP firewall pipeline (screen, zone, conntrack, policy, NAT) on decrypted traffic
-- Clean separation: WireGuard handles crypto, bpfrx handles policy
+- Clean separation: WireGuard handles crypto, xpf handles policy
 
 **Pros:** Full XDP pipeline on decrypted traffic. Reuses all existing BPF code.
 **Cons:** Extra veth hop adds ~1-2 us latency. Routing rules to steer wg0 through veth.
@@ -777,11 +777,11 @@ Physical NIC (DPDK) → VPP WireGuard decrypt → VPP forwarding graph → VPP W
 - Intel QAT offload for ChaCha20-Poly1305 (204 Gbps)
 
 **Pros:** Highest raw performance (34-204 Gbps). Vector processing for multi-tunnel.
-**Cons:** Replaces bpfrx's entire BPF pipeline. Requires zone-policy VPP plugin.
+**Cons:** Replaces xpf's entire BPF pipeline. Requires zone-policy VPP plugin.
 VPP WireGuard has known stability issues (CSIT crashes). Loss of hitless restart.
 **Effort:** 12-16 weeks (VPP zone-policy plugin + GoVPP integration + WireGuard config).
 
-### Option E: Integrate WireGuard into bpfrx DPDK Worker
+### Option E: Integrate WireGuard into xpf DPDK Worker
 
 ```
 Physical NIC (DPDK PMD) → dpdk_worker (parse → WG decrypt → screen → zone →
@@ -790,7 +790,7 @@ Physical NIC (DPDK PMD) → dpdk_worker (parse → WG decrypt → screen → zon
 
 - Add ChaCha20-Poly1305 to the existing single-pass DPDK pipeline
 - Use DPDK's cryptodev API for hardware offload (QAT, AESNI-MB)
-- Full bpfrx feature parity on decrypted traffic within a single pipeline pass
+- Full xpf feature parity on decrypted traffic within a single pipeline pass
 
 **Pros:** Single-pass processing (lowest latency). Full feature parity. No external
 dependencies. Tight Go integration via existing shared memory.
@@ -823,7 +823,7 @@ crypto and VPP+QAT is enormous:
 | WireGuard   | 3-5 Gbps/core      | 8-34 Gbps         | 204 Gbps        | 40-60x    |
 | IPsec       | 1-5 Gbps/core      | 16-50 Gbps/core   | 50 Gbps/core    | 10-50x    |
 
-If bpfrx's deployment targets include high-throughput VPN concentration (site-to-site
+If xpf's deployment targets include high-throughput VPN concentration (site-to-site
 at 40+ Gbps, or hundreds of remote peers), VPP becomes significantly more attractive.
 
 **However**, for deployments where VPN is one feature among many (the typical firewall
@@ -859,12 +859,12 @@ commercial router/firewall platform.
 
 **Features:**
 
-| Feature                     | VPP VRRP Plugin      | keepalived (bpfrx current)  |
+| Feature                     | VPP VRRP Plugin      | keepalived (xpf current)  |
 |-----------------------------|----------------------|-----------------------------|
 | VRRPv3 (RFC 5798)           | Yes                  | Yes                         |
 | VRRPv2 (RFC 3768)           | No                   | Yes                         |
 | IPv4 VIPs                   | Yes                  | Yes                         |
-| IPv6 VIPs                   | Yes (link-local src) | Partial (bpfrx doesn't use) |
+| IPv6 VIPs                   | Yes (link-local src) | Partial (xpf doesn't use) |
 | Multiple VIPs per instance  | Yes                  | Yes                         |
 | Priority / Preemption       | Yes                  | Yes                         |
 | Accept mode                 | Yes                  | Yes                         |
@@ -877,12 +877,12 @@ commercial router/firewall platform.
 | Notify scripts              | No                   | Yes                         |
 | Runtime state query         | API (binary/stats)   | SIGUSR1 → file parse        |
 
-### 13.2 Current bpfrx VRRP Architecture (keepalived)
+### 13.2 Current xpf VRRP Architecture (keepalived)
 
-bpfrx uses keepalived as an external VRRP daemon with a config-generation model:
+xpf uses keepalived as an external VRRP daemon with a config-generation model:
 
 ```
-bpfrx config (cluster/reth) → pkg/vrrp/vrrp.go → keepalived.conf → keepalived daemon
+xpf config (cluster/reth) → pkg/vrrp/vrrp.go → keepalived.conf → keepalived daemon
                                                                           ↓
                                                                     VRRP advertisements
                                                                     GARP/NA on failover
@@ -904,7 +904,7 @@ bpfrx config (cluster/reth) → pkg/vrrp/vrrp.go → keepalived.conf → keepali
 2. State detection is fragile (SIGUSR1 file dump parsing, race conditions).
 3. No native event stream — cannot react to VRRP transitions in real-time.
 4. Dual heartbeat systems: cluster heartbeat (UDP:4784) + VRRP multicast (224.0.0.18).
-5. No IPv6 VRRP currently utilized (keepalived supports it, but bpfrx doesn't generate IPv6 instances).
+5. No IPv6 VRRP currently utilized (keepalived supports it, but xpf doesn't generate IPv6 instances).
 6. Config apply latency from SIGHUP + file write.
 
 ### 13.3 VPP VRRP API (GoVPP Integration)
@@ -950,7 +950,7 @@ vrrpClient.WantVrrpVrrpEvents(ctx, &vrrp.WantVrrpVrrpEvents{
 - `WantVrrpVrrpEvents` — subscribe to state change notifications
 - `VrrpVrDump` — query current VR state
 
-### 13.4 Implementation Approach: VPP VRRP for bpfrx
+### 13.4 Implementation Approach: VPP VRRP for xpf
 
 If VPP is adopted as a dataplane (Strategy B or C), VRRP can be migrated from keepalived
 to VPP's native plugin. Here is the implementation approach:
@@ -958,7 +958,7 @@ to VPP's native plugin. Here is the implementation approach:
 #### Architecture
 
 ```
-bpfrx config (cluster/reth)
+xpf config (cluster/reth)
     ↓
 pkg/vrrp/vpp.go (new VPP VRRP backend)
     ↓
@@ -968,7 +968,7 @@ VRRP advertisements on physical member interfaces
 GARP/NA on MASTER transition
 VIP address on VPP interface (not kernel)
     ↓
-VrrpVrEvent (async) → bpfrx cluster state machine
+VrrpVrEvent (async) → xpf cluster state machine
 ```
 
 #### Step 1: VRRP Backend Interface
@@ -1001,9 +1001,9 @@ this interface. A new `VPPBackend` handles the VPP VRRP API.
 
 #### Step 2: VPP VRRP Instance Mapping
 
-Map bpfrx's RETH/RG model to VPP VR instances:
+Map xpf's RETH/RG model to VPP VR instances:
 
-| bpfrx Concept               | VPP VRRP Mapping                         |
+| xpf Concept               | VPP VRRP Mapping                         |
 |------------------------------|------------------------------------------|
 | Redundancy Group (RG)        | One VR per physical member per RG        |
 | RETH interface (reth0)       | VIPs on physical member's VR             |
@@ -1045,7 +1045,7 @@ interfaces. This means:
 
 - The kernel routing table won't know about VIPs (FRR can't see them).
 - Management traffic (SSH, SNMP) to VIPs won't reach the kernel.
-- bpfrx's gRPC/HTTP APIs bound to VIP addresses won't work.
+- xpf's gRPC/HTTP APIs bound to VIP addresses won't work.
 
 **Solution:** Mirror VIP addresses to kernel interfaces on MASTER transition:
 
@@ -1076,7 +1076,7 @@ This is similar to what keepalived does natively but must be handled explicitly 
 | **State detection**         | Async API events (sub-ms)             | SIGUSR1 file dump (~100ms, fragile)   |
 | **Config application**      | GoVPP API call (instant)              | File write + SIGHUP (10-50ms)         |
 | **Process management**      | Built into VPP (no extra process)     | Separate daemon lifecycle             |
-| **IPv6 VRRP**               | Native VRRPv3 with link-local src     | Supported but unused by bpfrx         |
+| **IPv6 VRRP**               | Native VRRPv3 with link-local src     | Supported but unused by xpf         |
 | **Interface tracking**      | Native API (weight-based)             | Script-based (exec overhead)          |
 | **Sync groups**             | Not supported                         | Supported (failover all RGs together) |
 | **Notify scripts**          | Not supported                         | Supported (exec on transition)        |
@@ -1090,19 +1090,19 @@ This is similar to what keepalived does natively but must be handled explicitly 
 ### 13.6 Sync Group Limitation
 
 VPP's VRRP plugin does **not** support sync groups (coordinated failover of multiple VR
-instances). In bpfrx's model, when one redundancy group fails over, all RGs on the same
+instances). In xpf's model, when one redundancy group fails over, all RGs on the same
 node should fail over together.
 
 **Workarounds:**
 1. **Application-level sync:** On receiving a VPP VRRP event for any VR transitioning to
    BACKUP, programmatically force all other VRs on the same node to BACKUP priority via
    `VrrpVrAddDel` with priority 0. This is the GoVPP equivalent of keepalived's sync groups.
-2. **Use bpfrx's existing cluster election:** The cluster state machine already handles
+2. **Use xpf's existing cluster election:** The cluster state machine already handles
    coordinated failover via heartbeat loss detection. VPP VRRP would only handle the VIP
    advertisement layer, not the election logic. When the cluster decides to fail over,
    it adjusts VPP VRRP priorities accordingly.
 
-Option 2 is the correct approach — bpfrx's cluster election is more sophisticated than
+Option 2 is the correct approach — xpf's cluster election is more sophisticated than
 VRRP sync groups (weight-based scoring, IP monitors, manual failover commands), and VPP
 VRRP simply becomes the mechanism for advertising VIPs and sending GARP/NA.
 
@@ -1117,7 +1117,7 @@ VRRP simply becomes the mechanism for advertising VIPs and sending GARP/NA.
 
 **Key insight:** VPP VRRP is only worth adopting **if VPP is already the dataplane**.
 The primary benefit is eliminating the external keepalived dependency and gaining
-real-time event-driven state detection via GoVPP. If bpfrx stays on XDP or the custom
+real-time event-driven state detection via GoVPP. If xpf stays on XDP or the custom
 DPDK worker, keepalived remains the better choice — it's battle-tested, requires no VPP
 dependency, and manages VIPs natively in the kernel where FRR and management services
 need them.
@@ -1200,7 +1200,7 @@ control-plane and management packets are punted through the TAP mirror:
 | **OSPF / BGP hellos**     | Punted to TAP → FRR in kernel             | Negligible load |
 | **Host-originated**       | kernel → TAP → VPP → physical NIC         | TAP throughput  |
 
-This is architecturally identical to bpfrx's current model where `XDP_PASS` punts
+This is architecturally identical to xpf's current model where `XDP_PASS` punts
 control-plane packets to the kernel while transit traffic stays in the XDP fast path.
 
 ### 14.4 Bidirectional Synchronization
@@ -1308,7 +1308,7 @@ Packets destined to the router itself (SSH, gRPC, HTTP, SNMP) follow the punt pa
 1. Packet arrives on VPP physical interface
 2. VPP L3 lookup determines destination is a **local address**
 3. Packet punted through TAP to kernel
-4. Kernel TCP/UDP stack delivers to application (sshd, bpfrxd, snmpd)
+4. Kernel TCP/UDP stack delivers to application (sshd, xpfd, snmpd)
 5. Response exits through TAP → VPP → physical NIC
 
 For the `dataplane` namespace model, services must run inside the namespace:
@@ -1348,28 +1348,28 @@ traffic, not transit traffic. Actual interface statistics require querying VPP d
 IPng Networks achieves ~35 Mpps on a Xeon D-1518 (4 cores), sustaining 18 Gbps over
 17 days with zero crashes. Full DFZ (870K+133K routes) installs in ~6 seconds.
 
-### 14.10 Relevance to bpfrx
+### 14.10 Relevance to xpf
 
-| Aspect                    | bpfrx (Current)                      | VPP + Linux CP                       |
+| Aspect                    | xpf (Current)                      | VPP + Linux CP                       |
 |---------------------------|--------------------------------------|---------------------------------------|
-| **Interface ownership**   | bpfrxd manages real kernel interfaces| VPP owns NICs, TAPs shadow to kernel  |
+| **Interface ownership**   | xpfd manages real kernel interfaces| VPP owns NICs, TAPs shadow to kernel  |
 | **FRR integration**       | Generate `frr.conf`, `systemctl reload`| FRR sees TAP interfaces natively    |
-| **Route sync**            | bpfrx writes FRR config → FRR installs| FRR → kernel → netlink → VPP FIB   |
+| **Route sync**            | xpf writes FRR config → FRR installs| FRR → kernel → netlink → VPP FIB   |
 | **Control-plane punt**    | `XDP_PASS` for local packets         | Punt to TAP for local packets         |
 | **Address management**    | `.network` files via networkd         | `lcp-sync` copies to TAP             |
 | **ARP/ND**                | Kernel handles (XDP_PASS)            | Kernel handles (TAP x-connect)        |
-| **DHCP**                  | bpfrx's own DHCP client              | Standard dhclient on TAP              |
+| **DHCP**                  | xpf's own DHCP client              | Standard dhclient on TAP              |
 | **Management (SSH/gRPC)** | Kernel interfaces directly           | TAP interfaces (maybe in namespace)   |
 | **Interface rename**      | `.link` files (MAC→name)             | `host-if` parameter names TAP         |
 
-**Key insight:** If VPP is adopted, the Linux CP plugin replaces bpfrx's current interface
+**Key insight:** If VPP is adopted, the Linux CP plugin replaces xpf's current interface
 management model (`.link`/`.network` files, networkd). FRR integration becomes simpler
 (FRR sees TAPs natively instead of needing managed `frr.conf` generation), but the
 operational model shifts to managing a VPP startup config + LIP pairs instead of networkd
 files. The `dataplane` namespace model adds complexity for management services but
 provides clean isolation.
 
-**For bpfrx's GoVPP integration**, the LIP lifecycle would be managed via:
+**For xpf's GoVPP integration**, the LIP lifecycle would be managed via:
 ```go
 lcpClient := lcp.NewServiceClient(conn)
 // Create interface pair
@@ -1382,7 +1382,7 @@ lcpClient.LcpItfPairAddDelV3(ctx, &lcp.LcpItfPairAddDelV3{
 })
 ```
 
-This is analogous to bpfrx's current `writeNetworkdFiles()` but operates at runtime via
+This is analogous to xpf's current `writeNetworkdFiles()` but operates at runtime via
 API calls rather than file generation + networkctl reload.
 
 ---
@@ -1394,7 +1394,7 @@ packet processing?*
 
 ### 15.1 The Question
 
-bpfrx's current HA uses keepalived for VRRP with several pain points (Section 13.2):
+xpf's current HA uses keepalived for VRRP with several pain points (Section 13.2):
 fragile SIGUSR1 state detection, external daemon lifecycle, no native event stream.
 VPP's VRRP plugin solves these with async GoVPP events. The question is whether VPP
 can run **solely for VRRP** on the same NICs that XDP programs are processing packets on.
@@ -1407,7 +1407,7 @@ to attach. These are mutually exclusive:
 
 ```
 VPP DPDK mode:  NIC → vfio-pci → VPP userspace (NIC invisible to kernel)
-XDP mode:       NIC → kernel driver → XDP hook → bpfrx programs
+XDP mode:       NIC → kernel driver → XDP hook → xpf programs
 ```
 
 **Verdict: Not possible.** DPDK and XDP compete for the same hardware resource.
@@ -1418,18 +1418,18 @@ VPP can use AF_XDP instead of DPDK, which keeps the NIC in the kernel. However:
 
 1. **AF_XDP replaces existing XDP programs.** VPP's AF_XDP driver loads its own XDP program
    (a redirect-to-socket stub) which **overwrites** any XDP program already attached to the
-   interface. bpfrx's firewall pipeline would be destroyed.
+   interface. xpf's firewall pipeline would be destroyed.
 
 2. **XSKMAP conflict.** AF_XDP uses `BPF_MAP_TYPE_XSKMAP` to redirect packets to userspace
    sockets. A single XDP program controls this map — it cannot be shared between VPP's
-   AF_XDP redirect and bpfrx's firewall logic without merging them into one program.
+   AF_XDP redirect and xpf's firewall logic without merging them into one program.
 
 3. **libxdp dispatcher workaround.** libxdp can chain up to 10 XDP programs on one interface
-   using `freplace` function-level replacement. This could theoretically run bpfrx's firewall
+   using `freplace` function-level replacement. This could theoretically run xpf's firewall
    XDP first, then VPP's AF_XDP redirect. But:
    - VPP does not natively support libxdp dispatcher — requires forking VPP
    - Priority ordering between programs is fragile
-   - Per-CPU map conflicts between bpfrx and VPP would need careful resolution
+   - Per-CPU map conflicts between xpf and VPP would need careful resolution
    - Maintenance burden of a VPP fork is prohibitive
 
 **Verdict: Not viable.** Engineering effort is enormous, and the result is fragile.
@@ -1476,12 +1476,12 @@ The **keepalived author** (Alexandre Cassen) created
 keepalived/VRRP framework. This demonstrates that VRRP and XDP integrate naturally
 when VRRP runs in userspace alongside XDP programs on the same kernel interfaces.
 
-### 15.6 Architecture: Native Go VRRP in bpfrxd
+### 15.6 Architecture: Native Go VRRP in xpfd
 
 ```
-Server A (bpfrx-fw0)                    Server B (bpfrx-fw1)
+Server A (xpf-fw0)                    Server B (xpf-fw1)
 ┌──────────────────────┐                ┌──────────────────────┐
-│  bpfrxd               │                │  bpfrxd               │
+│  xpfd               │                │  xpfd               │
 │  ┌──────────────────┐ │                │  ┌──────────────────┐ │
 │  │ Go VRRP Manager  │ │   VRRP Advert  │  │ Go VRRP Manager  │ │
 │  │  (govrrp lib)    │←├───────────────→┤→│  (govrrp lib)    │ │
@@ -1504,7 +1504,7 @@ Server A (bpfrx-fw0)                    Server B (bpfrx-fw1)
 ```
 
 **Key design:**
-- VRRP runs inside bpfrxd as a goroutine — no external daemon
+- VRRP runs inside xpfd as a goroutine — no external daemon
 - VRRP sends/receives advertisements via raw IP socket (proto 112) on kernel interfaces
 - XDP programs remain attached to the same interfaces — no conflict
 - On Master transition: send GARP/NA (already implemented in `pkg/cluster/garp.go`),
@@ -1513,7 +1513,7 @@ Server A (bpfrx-fw0)                    Server B (bpfrx-fw1)
 
 ### 15.7 XDP-Assisted VRRP Packet Steering (Optional Optimization)
 
-For maximum performance, bpfrx's XDP pipeline can identify VRRP packets early and
+For maximum performance, xpf's XDP pipeline can identify VRRP packets early and
 `XDP_PASS` them to the kernel stack (where the Go VRRP daemon listens), avoiding
 unnecessary processing through the firewall pipeline:
 
@@ -1525,7 +1525,7 @@ if (iph->protocol == 112 &&
 }
 ```
 
-This is already implicitly handled by bpfrx's zone policy (VRRP multicast would be
+This is already implicitly handled by xpf's zone policy (VRRP multicast would be
 host-bound traffic that gets `XDP_PASS`), but an explicit early check avoids processing
 VRRP packets through conntrack/policy/NAT stages unnecessarily.
 
@@ -1557,10 +1557,10 @@ VRRP packets through conntrack/policy/NAT stages unnecessarily.
 from the kernel; AF_XDP replaces the XDP program; virtual interfaces cannot program the
 VRRP virtual MAC. No hybrid model is viable.
 
-**The recommended path is native Go VRRP** — implementing VRRPv3 directly in bpfrxd using
-existing Go libraries. This eliminates both VPP *and* keepalived, gives bpfrx full control
+**The recommended path is native Go VRRP** — implementing VRRPv3 directly in xpfd using
+existing Go libraries. This eliminates both VPP *and* keepalived, gives xpf full control
 over failover timing, integrates with the existing cluster state machine, and requires
-approximately 3 days of implementation. bpfrx already has the supporting infrastructure:
+approximately 3 days of implementation. xpf already has the supporting infrastructure:
 GARP/NA transmission (`pkg/cluster/garp.go`), BPF map updates on failover, and FRR reload
 on state transitions. The only missing piece is the VRRP state machine itself, which proven
 Go libraries provide.

@@ -15,7 +15,7 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
+	"github.com/psaab/xpf/pkg/cluster"
 	"github.com/vishvananda/netlink"
 )
 

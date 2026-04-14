@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestWriteRPMConfigReportsNoActiveConfiguration(t *testing.T) {

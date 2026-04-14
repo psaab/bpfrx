@@ -8,7 +8,7 @@ HA cluster tests validate failover, crash recovery, session sync, fabric forward
 
 ```bash
 # eBPF cluster
-make cluster-deploy                # Build + push to bpfrx-fw0 + bpfrx-fw1
+make cluster-deploy                # Build + push to xpf-fw0 + xpf-fw1
 
 # Userspace cluster (on loss remote)
 BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
@@ -64,7 +64,7 @@ make test-ha-crash
 
 **Procedure**:
 1. Start continuous ping from host to WAN target
-2. Restart bpfrxd on primary (systemctl restart)
+2. Restart xpfd on primary (systemctl restart)
 3. Count lost pings during restart window
 4. Verify loss is within acceptable threshold
 
@@ -172,13 +172,13 @@ Example:
 
 ```bash
 # Put RG1 on node0 so node1 becomes the stale owner for LAN ingress.
-incus exec loss:bpfrx-userspace-fw1 -- \
+incus exec loss:xpf-userspace-fw1 -- \
   bash -lc 'cli -c "request chassis cluster failover redundancy-group 1 node 0"'
 
 # On node1, watch the standby WAN and fabric parent in real time.
-incus exec loss:bpfrx-userspace-fw1 -- \
+incus exec loss:xpf-userspace-fw1 -- \
   bash -lc 'timeout 5 cli -c "monitor interface ge-7-0-2"'
-incus exec loss:bpfrx-userspace-fw1 -- \
+incus exec loss:xpf-userspace-fw1 -- \
   bash -lc 'timeout 5 cli -c "monitor interface ge-7-0-0"'
 
 # Then run the stale-owner load from cluster-userspace-host.
@@ -240,6 +240,6 @@ After any HA code change, verify:
 - [ ] `scripts/userspace-ha-failover-validation.sh` keeps session/neighbor/route/policy deltas within threshold during each RG move
 - [ ] `iperf3 -P 8` does not collapse to zero on any stream
 - [ ] mtr shows intermediate hops (embedded ICMP NAT reversal)
-- [ ] After `systemctl restart bpfrxd` on primary: connectivity recovers within 40s
+- [ ] After `systemctl restart xpfd` on primary: connectivity recovers within 40s
 - [ ] After failover: connectivity recovers within 500ms
 - [ ] If GRE is affected: `scripts/userspace-native-gre-validation.sh --iperf --udp --traceroute --failover` passes

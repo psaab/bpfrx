@@ -1,5 +1,5 @@
 // Package dataplane manages eBPF program loading, map operations,
-// and XDP/TC attachment for the bpfrx firewall dataplane.
+// and XDP/TC attachment for the xpf firewall dataplane.
 package dataplane
 
 // SessionKey mirrors the C struct session_key (5-tuple).
@@ -342,13 +342,13 @@ const (
 	ActionReject = 2
 )
 
-// MaxZones must match MAX_ZONES in bpfrx_common.h.
+// MaxZones must match MAX_ZONES in xpf_common.h.
 const MaxZones = 64
 
 // MaxRulesPerPolicy is the maximum number of rules in a single policy set.
 const MaxRulesPerPolicy = 256
 
-// MaxSNATRulesPerPair must match MAX_SNAT_RULES_PER_PAIR in bpfrx_maps.h.
+// MaxSNATRulesPerPair must match MAX_SNAT_RULES_PER_PAIR in xpf_maps.h.
 const MaxSNATRulesPerPair = 8
 
 // LPMKeyV4 mirrors the C struct lpm_key_v4 for address book LPM trie.
@@ -431,7 +431,7 @@ type NATPoolIPV6 struct {
 }
 
 // SNATEgressKey identifies an egress interface for interface-mode SNAT.
-// Mirrors struct snat_egress_key in bpfrx_common.h.
+// Mirrors struct snat_egress_key in xpf_common.h.
 type SNATEgressKey struct {
 	Ifindex uint32
 	VlanID  uint16
@@ -439,7 +439,7 @@ type SNATEgressKey struct {
 }
 
 // SNATEgressValue holds the SNAT address for a specific egress interface.
-// Mirrors struct snat_egress_value in bpfrx_common.h.
+// Mirrors struct snat_egress_value in xpf_common.h.
 type SNATEgressValue struct {
 	IPv4 uint32
 	IPv6 [16]byte

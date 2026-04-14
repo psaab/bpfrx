@@ -178,7 +178,7 @@ iperf_metrics() {
 
 top_symbols() {
 	local report="$1"
-	grep -E 'bpfrx-userspace-dp|mlx5e_xsk|bpf_prog_|xsk_|htab_map_hash|lookup_nulls_elem_raw' "${report}" | head -n 12 || true
+	grep -E 'xpf-userspace-dp|mlx5e_xsk|bpf_prog_|xsk_|htab_map_hash|lookup_nulls_elem_raw' "${report}" | head -n 12 || true
 }
 
 write_summary() {

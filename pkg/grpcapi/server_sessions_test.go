@@ -5,7 +5,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 func TestSessionEntryV4PreservesBothNatLegs(t *testing.T) {

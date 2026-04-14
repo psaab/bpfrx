@@ -25,4 +25,4 @@ fi
 	cd "${CRATE_DIR}"
 	"${CARGO_BIN}" +"${TOOLCHAIN}" build --release
 )
-install -m 0644 "${CRATE_DIR}/target/bpfel-unknown-none/release/libbpfrx_userspace_xdp.so" "${OUT_FILE}"
+install -m 0644 "${CRATE_DIR}/target/bpfel-unknown-none/release/libxpf_userspace_xdp.so" "${OUT_FILE}"

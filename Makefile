@@ -1,7 +1,7 @@
 CLANG ?= clang
 GO ?= go
 CARGO ?= $(HOME)/.cargo/bin/cargo
-BINARY := bpfrxd
+BINARY := xpfd
 PREFIX ?= /usr/local
 
 # Version info embedded at build time
@@ -23,7 +23,7 @@ generate:
 
 # Build the daemon binary
 build:
-	CGO_ENABLED=0 $(GO) build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/bpfrxd
+	CGO_ENABLED=0 $(GO) build -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/xpfd
 
 # Build the remote CLI client
 build-ctl:
@@ -32,14 +32,14 @@ build-ctl:
 # Build the userspace dataplane helper
 build-userspace-dp:
 	$(CARGO) build --manifest-path userspace-dp/Cargo.toml --release
-	install -m 0755 userspace-dp/target/release/bpfrx-userspace-dp ./bpfrx-userspace-dp
+	install -m 0755 userspace-dp/target/release/xpf-userspace-dp ./xpf-userspace-dp
 
 # Generate protobuf/gRPC code
 proto:
-	protoc --proto_path=proto/bpfrx/v1 \
-		--go_out=pkg/grpcapi/bpfrxv1 --go_opt=paths=source_relative \
-		--go-grpc_out=pkg/grpcapi/bpfrxv1 --go-grpc_opt=paths=source_relative \
-		proto/bpfrx/v1/bpfrx.proto
+	protoc --proto_path=proto/xpf/v1 \
+		--go_out=pkg/grpcapi/xpfv1 --go_opt=paths=source_relative \
+		--go-grpc_out=pkg/grpcapi/xpfv1 --go-grpc_opt=paths=source_relative \
+		proto/xpf/v1/xpf.proto
 
 install: build build-ctl
 	install -m 0755 $(BINARY) $(PREFIX)/sbin/$(BINARY)
@@ -49,7 +49,7 @@ test:
 	$(GO) test ./...
 
 clean: clean-dpdk
-	rm -f $(BINARY) cli bpfrx-userspace-dp
+	rm -f $(BINARY) cli xpf-userspace-dp
 	rm -f pkg/dataplane/*_bpfel.go pkg/dataplane/*_bpfeb.go
 	rm -f pkg/dataplane/*_bpfel.o pkg/dataplane/*_bpfeb.o
 	rm -rf userspace-dp/target
@@ -205,8 +205,8 @@ build-dpdk-worker:
 	cd dpdk_worker && meson compile -C build
 
 build-dpdk: build-dpdk-worker
-	@echo "==> Building bpfrxd with DPDK support..."
-	CGO_ENABLED=1 go build -tags dpdk -ldflags "$(LDFLAGS)" -o bpfrxd ./cmd/bpfrxd
+	@echo "==> Building xpfd with DPDK support..."
+	CGO_ENABLED=1 go build -tags dpdk -ldflags "$(LDFLAGS)" -o xpfd ./cmd/xpfd
 
 clean-dpdk:
 	rm -rf dpdk_worker/build

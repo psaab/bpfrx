@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestGenerateStaticRoute_SingleNextHop(t *testing.T) {
@@ -241,8 +241,8 @@ func TestGenerateProtocols_ISIS(t *testing.T) {
 		},
 	}
 	got := m.generateProtocols(nil, nil, nil, nil, isis, "", 0, nil)
-	if !strings.Contains(got, "router isis bpfrx\n") {
-		t.Error("missing 'router isis bpfrx'")
+	if !strings.Contains(got, "router isis xpf\n") {
+		t.Error("missing 'router isis xpf'")
 	}
 	if !strings.Contains(got, "net 49.0001.1921.6800.1001.00\n") {
 		t.Error("missing NET")
@@ -596,7 +596,7 @@ func TestApplyFull_BackupRouter(t *testing.T) {
 	// ApplyFull calls reload which fails in test, so just test writeManagedSection.
 	// Build the same string that ApplyFull would.
 	var b strings.Builder
-	b.WriteString("! bpfrx managed config - do not edit\n!\n")
+	b.WriteString("! xpf managed config - do not edit\n!\n")
 	dst := fc.BackupRouterDst
 	if dst == "" {
 		dst = "0.0.0.0/0"
@@ -650,7 +650,7 @@ func TestFRRMultiVRF(t *testing.T) {
 
 	// Build the section that ApplyFull would generate (without calling reload)
 	var b strings.Builder
-	b.WriteString("! bpfrx managed config - do not edit\n!\n")
+	b.WriteString("! xpf managed config - do not edit\n!\n")
 	for _, sr := range fc.StaticRoutes {
 		b.WriteString(m.generateStaticRoute(sr, "", nil, nil))
 	}

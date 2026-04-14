@@ -242,7 +242,7 @@ impl BindingWorker {
         // ifindex/queue_id directly — umem.bind() already validated these.
         live.set_socket_binding(binding.ifindex, binding.queue_id, 0);
         eprintln!(
-            "bpfrx-userspace-dp: binding slot={} fd={} strategy={} bound if{}q{} mode={:?} shared_umem={}",
+            "xpf-userspace-dp: binding slot={} fd={} strategy={} bound if{}q{} mode={:?} shared_umem={}",
             binding.slot,
             user_fd,
             actual_bind_strategy.describe(),
@@ -253,13 +253,13 @@ impl BindingWorker {
         );
         if let Err(err) = register_xsk_slot(xsk_map_fd, binding.slot, user_fd) {
             eprintln!(
-                "bpfrx-userspace-dp: ERROR register_xsk_slot slot={} fd={}: {}",
+                "xpf-userspace-dp: ERROR register_xsk_slot slot={} fd={}: {}",
                 binding.slot, user_fd, err,
             );
             live.set_error(format!("register XSK slot: {err}"));
         } else {
             eprintln!(
-                "bpfrx-userspace-dp: registered slot={} fd={} in XSKMAP",
+                "xpf-userspace-dp: registered slot={} fd={} in XSKMAP",
                 binding.slot, user_fd,
             );
             live.set_xsk_registered(true);

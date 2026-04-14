@@ -106,7 +106,7 @@ Design impact:
 
 Prompt used:
 
-> can you read `../bpfrx/docs/cos-traffic-shaping.md`
+> can you read `../xpf/docs/cos-traffic-shaping.md`
 >
 > this came about because I realized the following
 >
@@ -139,7 +139,7 @@ Design impact:
 
 Prompt used:
 
-> can you read `../bpfrx/docs/cos-traffic-shaping.md` again  
+> can you read `../xpf/docs/cos-traffic-shaping.md` again  
 > review it for errors, enhancemenents [sic] and scale and keep in mind the original design goals are
 >
 > The system should perform well with many competing, adverserial [sic] flows while being performant, and maintain tail latency and throughput with minimal CPU cost  
@@ -192,7 +192,7 @@ Design impact:
 
 Prompt used:
 
-> can you read `../bpfrx/docs/cos-traffic-shaping.md` again  
+> can you read `../xpf/docs/cos-traffic-shaping.md` again  
 > review it for errors, enhancemenents [sic] and scale and keep in mind the original design goals are
 >
 > ...same adversarial / protocol-oblivious goals...
@@ -220,7 +220,7 @@ Design impact:
 
 Prompt used:
 
-> can you read `../bpfrx/docs/cos-traffic-shaping.md` again  
+> can you read `../xpf/docs/cos-traffic-shaping.md` again  
 > make sure that we support many cores to do this and remember the design doc
 >
 > The system should perform well with many competing, adverserial flows while being performant, and maintain tail latency and throughput with minimal CPU cost  

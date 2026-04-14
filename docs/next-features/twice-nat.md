@@ -4,10 +4,10 @@ Date: 2026-04-13
 Status: Proposed (tracking issue #645)
 
 ## Why this doc exists
-The current Twice NAT gap is no longer "bpfrx has separate SNAT and DNAT, but no combined path at all." The userspace dataplane already carries important combined-NAT building blocks. The remaining work is to define the supported contract, validate it end-to-end, and close the parity gap with evidence.
+The current Twice NAT gap is no longer "xpf has separate SNAT and DNAT, but no combined path at all." The userspace dataplane already carries important combined-NAT building blocks. The remaining work is to define the supported contract, validate it end-to-end, and close the parity gap with evidence.
 
 ## Current state
-bpfrx already has concrete userspace support pieces for combined SNAT + DNAT flows:
+xpf already has concrete userspace support pieces for combined SNAT + DNAT flows:
 
 - `userspace-dp/src/nat.rs` has merged `NatDecision` state for source and destination address/port rewrites.
 - `userspace-dp/src/afxdp.rs` merges pre-routing DNAT with post-policy SNAT instead of letting later NAT overwrite earlier NAT.

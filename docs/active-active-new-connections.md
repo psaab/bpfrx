@@ -170,7 +170,7 @@ before generic XDP runs. The BPF program never sees the VLAN tag — it's alread
 been consumed by the bridge layer. MAC-based encoding uses plain Ethernet frames
 that traverse bridges without any stripping or filtering issues.
 
-#### Sender: `try_fabric_redirect_with_zone()` (`bpfrx_helpers.h:1887-1916`)
+#### Sender: `try_fabric_redirect_with_zone()` (`xpf_helpers.h:1887-1916`)
 
 ```c
 static __always_inline int
@@ -475,9 +475,9 @@ cluster-lan-host (10.0.60.102) → ping 172.16.100.200
 
 | File | Change |
 |------|--------|
-| `bpf/headers/bpfrx_common.h` | `META_FLAG_FABRIC_FWD (1<<4)`, `FABRIC_ZONE_MAC_MAGIC 0xfe` |
-| `bpf/headers/bpfrx_helpers.h` | `try_fabric_redirect_with_zone()` — MAC-encoded zone redirect |
-| `bpf/headers/bpfrx_maps.h` | `fabric_fwd_info.fib_ifindex` field for non-VRF FIB lookups |
+| `bpf/headers/xpf_common.h` | `META_FLAG_FABRIC_FWD (1<<4)`, `FABRIC_ZONE_MAC_MAGIC 0xfe` |
+| `bpf/headers/xpf_helpers.h` | `try_fabric_redirect_with_zone()` — MAC-encoded zone redirect |
+| `bpf/headers/xpf_maps.h` | `fabric_fwd_info.fib_ifindex` field for non-VRF FIB lookups |
 | `bpf/xdp/xdp_zone.c` | Zone-encoded MAC detection, FABRIC_FWD flag, session-guarded routing_table override, RG check for new connections, BLACKHOLE session guard, two-pass FIB for sessionless FABRIC_FWD |
 | `bpf/xdp/xdp_forward.c` | FIB re-check in KERNEL_ROUTE path — detect BLACKHOLE after NAT reversal |
 | `pkg/daemon/daemon.go` | `injectBlackholeRoutes()` / `removeBlackholeRoutes()` on VRRP transitions, `fib_ifindex` population in `populateFabricFwd()` |
@@ -759,7 +759,7 @@ Observed stream death times: [5] at t=130s, [7] at t=176s, [11] at t=366s,
 
 Three interacting bugs in the BPF conntrack TCP state machine:
 
-**1. Blind RST→CLOSED transition** (`bpfrx_conntrack.h:ct_tcp_update_state`)
+**1. Blind RST→CLOSED transition** (`xpf_conntrack.h:ct_tcp_update_state`)
 
 ```c
 if (rst) return SESS_STATE_CLOSED;

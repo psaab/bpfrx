@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx XDP policy evaluation stage.
+ * xpf XDP policy evaluation stage.
  *
  * Evaluates zone-pair security policies for new connections. On permit,
  * creates dual session entries (forward + reverse) and proceeds to the
@@ -8,12 +8,12 @@
  * Supports both IPv4 and IPv6.
  */
 
-#include "../headers/bpfrx_common.h"
+#include "../headers/xpf_common.h"
 #define BPFRX_NAT_POOLS
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
-#include "../headers/bpfrx_nat.h"
-#include "../headers/bpfrx_trace.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
+#include "../headers/xpf_nat.h"
+#include "../headers/xpf_trace.h"
 
 /*
  * Check whether an IPv4 address matches a policy rule's address_id.

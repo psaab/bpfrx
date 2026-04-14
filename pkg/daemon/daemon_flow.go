@@ -1,4 +1,4 @@
-// Package daemon implements the bpfrx daemon lifecycle.
+// Package daemon implements the xpf daemon lifecycle.
 package daemon
 
 import (
@@ -8,12 +8,12 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
-	"github.com/psaab/bpfrx/pkg/dhcp"
-	"github.com/psaab/bpfrx/pkg/flowexport"
-	"github.com/psaab/bpfrx/pkg/frr"
-	"github.com/psaab/bpfrx/pkg/logging"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/flowexport"
+	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/logging"
 	"github.com/vishvananda/netlink"
 )
 

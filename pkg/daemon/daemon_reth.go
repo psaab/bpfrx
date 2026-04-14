@@ -1,4 +1,4 @@
-// Package daemon implements the bpfrx daemon lifecycle.
+// Package daemon implements the xpf daemon lifecycle.
 package daemon
 
 import (
@@ -11,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -21,8 +21,8 @@ import (
 // OriginalName= (the kernel name) instead of MACAddress= for matching.
 // This ensures the .link works on reboot when the MAC reverts to physical.
 func fixRethLinkFile(ifName, kernelName string) {
-	path := fmt.Sprintf("/etc/systemd/network/10-bpfrx-%s.link", ifName)
-	content := fmt.Sprintf("# Managed by bpfrxd — do not edit\n[Match]\nOriginalName=%s\n\n[Link]\nName=%s\n", kernelName, ifName)
+	path := fmt.Sprintf("/etc/systemd/network/10-xpf-%s.link", ifName)
+	content := fmt.Sprintf("# Managed by xpfd — do not edit\n[Match]\nOriginalName=%s\n\n[Link]\nName=%s\n", kernelName, ifName)
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		slog.Warn("failed to fix RETH .link file", "path", path, "err", err)
 	}
@@ -33,7 +33,7 @@ func fixRethLinkFile(ifName, kernelName string) {
 // uses MACAddress=, it derives the kernel name and rewrites the file. This
 // handles bootstrap .link files that were created before the daemon ran.
 func ensureRethLinkOriginalName(ifName string) {
-	path := fmt.Sprintf("/etc/systemd/network/10-bpfrx-%s.link", ifName)
+	path := fmt.Sprintf("/etc/systemd/network/10-xpf-%s.link", ifName)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return

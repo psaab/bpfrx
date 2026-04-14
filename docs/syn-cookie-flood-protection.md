@@ -96,16 +96,16 @@ checks this flag to decide between drop mode and cookie mode.
 | `pkg/config/compiler.go` | Parses `syn-flood-protection-mode syn-cookie` |
 | `pkg/dataplane/compiler.go` | Sets `ScreenSynCookie` flag on screen config |
 | `pkg/dataplane/types.go` | `ScreenSynCookie` constant |
-| `pkg/api/metrics.go` | 4 Prometheus metrics (`bpfrx_screen_syncookie_total`) |
+| `pkg/api/metrics.go` | 4 Prometheus metrics (`xpf_screen_syncookie_total`) |
 | `pkg/grpcapi/server.go` | 4 CLI counters in screen statistics display |
 
 ## Prometheus Metrics
 
 ```
-bpfrx_screen_syncookie_total{type="sent"}     # SYN-ACK cookies generated
-bpfrx_screen_syncookie_total{type="valid"}     # Valid cookie ACKs received
-bpfrx_screen_syncookie_total{type="invalid"}   # Invalid cookie ACKs
-bpfrx_screen_syncookie_total{type="bypass"}    # Validated sources bypassing challenge
+xpf_screen_syncookie_total{type="sent"}     # SYN-ACK cookies generated
+xpf_screen_syncookie_total{type="valid"}     # Valid cookie ACKs received
+xpf_screen_syncookie_total{type="invalid"}   # Invalid cookie ACKs
+xpf_screen_syncookie_total{type="bypass"}    # Validated sources bypassing challenge
 ```
 
 ## Verifier Gotchas

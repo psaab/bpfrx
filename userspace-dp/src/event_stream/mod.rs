@@ -110,7 +110,7 @@ impl EventStreamSender {
         let path = socket_path.to_string();
 
         let io_thread = thread::Builder::new()
-            .name("bpfrx-event-stream".to_string())
+            .name("xpf-event-stream".to_string())
             .spawn(move || {
                 io_thread_main(rx, shared_clone, stop_clone, path);
             })
@@ -292,14 +292,14 @@ fn io_thread_main(
         };
         stream.set_nonblocking(true).ok();
         shared.connected.store(true, Ordering::Release);
-        eprintln!("bpfrx-event-stream: connected to {}", socket_path);
+        eprintln!("xpf-event-stream: connected to {}", socket_path);
 
         // Replay buffered events from last acked seq
         let acked = shared.acked_seq.load(Ordering::Acquire);
         let replay_result = replay_buffered(&stream, &mut replay_buf, acked, &shared);
         if replay_result.is_err() {
             shared.connected.store(false, Ordering::Release);
-            eprintln!("bpfrx-event-stream: replay failed, reconnecting");
+            eprintln!("xpf-event-stream: replay failed, reconnecting");
             continue;
         }
 
@@ -316,14 +316,14 @@ fn io_thread_main(
 
         shared.connected.store(false, Ordering::Release);
         if disconnect {
-            eprintln!("bpfrx-event-stream: disconnected, will reconnect");
+            eprintln!("xpf-event-stream: disconnected, will reconnect");
         }
     }
 
     // Drain remaining events on shutdown
     drain_remaining(&rx);
     shared.connected.store(false, Ordering::Release);
-    eprintln!("bpfrx-event-stream: I/O thread exiting");
+    eprintln!("xpf-event-stream: I/O thread exiting");
 }
 
 /// Try to connect to the daemon event socket, retrying every 100ms.
@@ -362,7 +362,7 @@ fn replay_buffered(
         write_frame_blocking(stream, &frame)?;
         shared.frames_sent.fetch_add(1, Ordering::Relaxed);
         eprintln!(
-            "bpfrx-event-stream: sent FullResync (buffer gap: acked={}, oldest_buffered={})",
+            "xpf-event-stream: sent FullResync (buffer gap: acked={}, oldest_buffered={})",
             acked_seq, oldest_buffered
         );
         replay_buf.clear();
@@ -382,7 +382,7 @@ fn replay_buffered(
             .frames_replayed
             .fetch_add(replayed, Ordering::Relaxed);
         shared.frames_sent.fetch_add(replayed, Ordering::Relaxed);
-        eprintln!("bpfrx-event-stream: replayed {replayed} events");
+        eprintln!("xpf-event-stream: replayed {replayed} events");
     }
     Ok(())
 }
@@ -566,11 +566,11 @@ fn process_control_frames(
             }
             MSG_PAUSE => {
                 shared.paused.store(true, Ordering::Release);
-                eprintln!("bpfrx-event-stream: paused by daemon");
+                eprintln!("xpf-event-stream: paused by daemon");
             }
             MSG_RESUME => {
                 shared.paused.store(false, Ordering::Release);
-                eprintln!("bpfrx-event-stream: resumed by daemon");
+                eprintln!("xpf-event-stream: resumed by daemon");
                 // Flush any buffered-during-pause frames on next write cycle
             }
             MSG_DRAIN_REQUEST => {
@@ -581,7 +581,7 @@ fn process_control_frames(
             }
             _ => {
                 eprintln!(
-                    "bpfrx-event-stream: unknown control frame type {}",
+                    "xpf-event-stream: unknown control frame type {}",
                     msg_type
                 );
             }
@@ -629,7 +629,7 @@ fn handle_drain_request(
                 }
                 if Instant::now() >= deadline {
                     eprintln!(
-                        "bpfrx-event-stream: drain timeout, highest_seq={}",
+                        "xpf-event-stream: drain timeout, highest_seq={}",
                         replay_buf.back().map(|f| f.seq).unwrap_or(0)
                     );
                     break;
@@ -644,7 +644,7 @@ fn handle_drain_request(
     stream.set_nonblocking(false).ok();
     for frame in replay_buf.iter() {
         if let Err(e) = (&*stream).write_all(frame.as_bytes()) {
-            eprintln!("bpfrx-event-stream: drain write error: {e}");
+            eprintln!("xpf-event-stream: drain write error: {e}");
             break;
         }
         shared.frames_sent.fetch_add(1, Ordering::Relaxed);
@@ -654,7 +654,7 @@ fn handle_drain_request(
     let drain_seq = replay_buf.back().map(|f| f.seq).unwrap_or(target_seq);
     let complete_frame = EventFrame::encode_drain_complete(drain_seq);
     if let Err(e) = (&*stream).write_all(complete_frame.as_bytes()) {
-        eprintln!("bpfrx-event-stream: drain complete write error: {e}");
+        eprintln!("xpf-event-stream: drain complete write error: {e}");
     }
     shared.frames_sent.fetch_add(1, Ordering::Relaxed);
     stream.set_nonblocking(true).ok();
@@ -664,7 +664,7 @@ fn handle_drain_request(
         shared.paused.store(true, Ordering::Release);
     }
 
-    eprintln!("bpfrx-event-stream: drain complete up to seq {}", drain_seq);
+    eprintln!("xpf-event-stream: drain complete up to seq {}", drain_seq);
 }
 
 /// Drain remaining events from the channel on shutdown.

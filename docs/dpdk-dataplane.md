@@ -1,4 +1,4 @@
-# DPDK Dataplane for bpfrx — Architecture Plan
+# DPDK Dataplane for xpf — Architecture Plan
 
 Note: This is an architecture/planning document. For the current project-level
 decision and recommendation between DPDK and VPP, see
@@ -29,7 +29,7 @@ Add a DPDK-based dataplane as an alternative to the current XDP/TC eBPF pipeline
 
 ```
 ┌─────────────────────────────────────────────────┐
-│                   bpfrxd (Go)                    │
+│                   xpfd (Go)                    │
 │  ┌──────────┐ ┌──────┐ ┌──────┐ ┌───────────┐  │
 │  │ ConfigStore│ │ CLI  │ │ gRPC │ │ REST API  │  │
 │  └─────┬────┘ └──┬───┘ └──┬───┘ └─────┬─────┘  │
@@ -64,7 +64,7 @@ Add a DPDK-based dataplane as an alternative to the current XDP/TC eBPF pipeline
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                    bpfrxd (Go)                       │
+│                    xpfd (Go)                       │
 │  ┌──────────┐ ┌──────┐ ┌──────┐ ┌───────────┐      │
 │  │ConfigStore│ │ CLI  │ │ gRPC │ │ REST API  │      │
 │  └─────┬────┘ └──┬───┘ └──┬───┘ └─────┬─────┘      │
@@ -268,7 +268,7 @@ The Go control plane needs to update DPDK data structures (zones, policies, sess
 
 ```
 ┌──────────────────┐          ┌──────────────────┐
-│   Go (bpfrxd)    │          │  DPDK Worker (C)  │
+│   Go (xpfd)    │          │  DPDK Worker (C)  │
 │                  │          │                    │
 │  DPDKManager     │◄────────►│  Shared hugepage   │
 │  .SetZone()      │  mmap    │  - zone_table[]    │
@@ -397,7 +397,7 @@ func (m *DPDKManager) AttachXDP(ifindex int, forceGeneric bool) error {
 ### Phase 5: Build System & Configuration
 
 ```go
-// cmd/bpfrxd/main.go
+// cmd/xpfd/main.go
 
 var dataplaneBackend = flag.String("dataplane", "ebpf",
     "Dataplane backend: ebpf (default) or dpdk")
@@ -440,7 +440,7 @@ build-dpdk:
     cd dpdk_worker && meson build && ninja -C build
     CGO_ENABLED=1 CGO_CFLAGS="-I/usr/include/dpdk" \
     CGO_LDFLAGS="-L/usr/lib/x86_64-linux-gnu -lrte_eal -lrte_hash -lrte_lpm" \
-    go build -tags dpdk -o bpfrxd ./cmd/bpfrxd
+    go build -tags dpdk -o xpfd ./cmd/xpfd
 
 build-ebpf:
     make generate && make build  # Current flow, no DPDK deps
@@ -560,7 +560,7 @@ void aggregate_counters(uint32_t policy_id, uint64_t *packets, uint64_t *bytes) 
 
 ## Power Management: Interrupt-Driven Mode
 
-Pure poll-mode DPDK burns 100% CPU on dedicated cores even with zero traffic. This is unacceptable for branch/edge deployments, VMs, or any environment where power efficiency matters. bpfrx supports three RX modes that trade latency for power.
+Pure poll-mode DPDK burns 100% CPU on dedicated cores even with zero traffic. This is unacceptable for branch/edge deployments, VMs, or any environment where power efficiency matters. xpf supports three RX modes that trade latency for power.
 
 ### Three RX Modes
 

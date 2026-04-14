@@ -13,7 +13,7 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-const bpfPinPath = "/sys/fs/bpf/bpfrx"
+const bpfPinPath = "/sys/fs/bpf/xpf"
 
 // pinnedMaps lists maps that survive daemon restarts via BPF filesystem pins.
 // Config-derived maps are repopulated from config on every Compile().
@@ -62,7 +62,7 @@ func (m *Manager) loadAllObjects() error {
 			PinPath: bpfPinPath,
 		},
 	}
-	var mainObjs bpfrxXdpMainObjects
+	var mainObjs xpfXdpMainObjects
 	if err := spec.LoadAndAssign(&mainObjs, opts); err != nil {
 		// If pinned maps are incompatible (struct size changed after
 		// upgrade), remove them and retry with fresh maps.
@@ -296,14 +296,14 @@ func (m *Manager) loadAllObjects() error {
 	policyReplaceOpts.MapReplacements["snat_egress_ips"] = mainObjs.SnatEgressIps
 
 	// Load XDP screen program.
-	var screenObjs bpfrxXdpScreenObjects
+	var screenObjs xpfXdpScreenObjects
 	if err := loadBpfrxXdpScreenObjects(&screenObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load xdp_screen: %w", err)
 	}
 	m.programs["xdp_screen_prog"] = screenObjs.XdpScreenProg
 
 	// Load XDP zone program.
-	var zoneObjs bpfrxXdpZoneObjects
+	var zoneObjs xpfXdpZoneObjects
 	if err := loadBpfrxXdpZoneObjects(&zoneObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load xdp_zone: %w", err)
 	}
@@ -328,35 +328,35 @@ func (m *Manager) loadAllObjects() error {
 	for k, v := range replaceOpts.MapReplacements {
 		conntrackReplaceOpts.MapReplacements[k] = v
 	}
-	var ctObjs bpfrxXdpConntrackObjects
+	var ctObjs xpfXdpConntrackObjects
 	if err := loadBpfrxXdpConntrackObjects(&ctObjs, conntrackReplaceOpts); err != nil {
 		return fmt.Errorf("load xdp_conntrack: %w", err)
 	}
 	m.programs["xdp_conntrack_prog"] = ctObjs.XdpConntrackProg
 
 	// Load XDP policy program (uses NAT pool maps).
-	var polObjs bpfrxXdpPolicyObjects
+	var polObjs xpfXdpPolicyObjects
 	if err := loadBpfrxXdpPolicyObjects(&polObjs, policyReplaceOpts); err != nil {
 		return fmt.Errorf("load xdp_policy: %w", err)
 	}
 	m.programs["xdp_policy_prog"] = polObjs.XdpPolicyProg
 
 	// Load XDP NAT program.
-	var natObjs bpfrxXdpNatObjects
+	var natObjs xpfXdpNatObjects
 	if err := loadBpfrxXdpNatObjects(&natObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load xdp_nat: %w", err)
 	}
 	m.programs["xdp_nat_prog"] = natObjs.XdpNatProg
 
 	// Load XDP forward program.
-	var fwdObjs bpfrxXdpForwardObjects
+	var fwdObjs xpfXdpForwardObjects
 	if err := loadBpfrxXdpForwardObjects(&fwdObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load xdp_forward: %w", err)
 	}
 	m.programs["xdp_forward_prog"] = fwdObjs.XdpForwardProg
 
 	// Load XDP NAT64 program (uses NAT pool maps for SNAT allocation).
-	var nat64Objs bpfrxXdpNat64Objects
+	var nat64Objs xpfXdpNat64Objects
 	if err := loadBpfrxXdpNat64Objects(&nat64Objs, policyReplaceOpts); err != nil {
 		return fmt.Errorf("load xdp_nat64: %w", err)
 	}
@@ -391,35 +391,35 @@ func (m *Manager) loadAllObjects() error {
 	}
 
 	// Load TC main program.
-	var tcMainObjs bpfrxTcMainObjects
+	var tcMainObjs xpfTcMainObjects
 	if err := loadBpfrxTcMainObjects(&tcMainObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load tc_main: %w", err)
 	}
 	m.programs["tc_main_prog"] = tcMainObjs.TcMainProg
 
 	// Load TC conntrack program.
-	var tcCtObjs bpfrxTcConntrackObjects
+	var tcCtObjs xpfTcConntrackObjects
 	if err := loadBpfrxTcConntrackObjects(&tcCtObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load tc_conntrack: %w", err)
 	}
 	m.programs["tc_conntrack_prog"] = tcCtObjs.TcConntrackProg
 
 	// Load TC NAT program.
-	var tcNatObjs bpfrxTcNatObjects
+	var tcNatObjs xpfTcNatObjects
 	if err := loadBpfrxTcNatObjects(&tcNatObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load tc_nat: %w", err)
 	}
 	m.programs["tc_nat_prog"] = tcNatObjs.TcNatProg
 
 	// Load TC screen egress program.
-	var tcScreenObjs bpfrxTcScreenEgressObjects
+	var tcScreenObjs xpfTcScreenEgressObjects
 	if err := loadBpfrxTcScreenEgressObjects(&tcScreenObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load tc_screen_egress: %w", err)
 	}
 	m.programs["tc_screen_egress_prog"] = tcScreenObjs.TcScreenEgressProg
 
 	// Load TC forward program.
-	var tcFwdObjs bpfrxTcForwardObjects
+	var tcFwdObjs xpfTcForwardObjects
 	if err := loadBpfrxTcForwardObjects(&tcFwdObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load tc_forward: %w", err)
 	}
@@ -466,7 +466,7 @@ func ensureUserspaceMapPinned(name string, m *ebpf.Map, path string) error {
 // expected_attach_type = BPF_XDP_CPUMAP, which is incompatible with
 // sharing a PROG_ARRAY created by regular XDP programs. So the cpumap
 // gets its own xdp_progs PROG_ARRAY populated with pipeline copies.
-func (m *Manager) loadCPUMapPrograms(replaceOpts *ebpf.CollectionOptions, mainObjs *bpfrxXdpMainObjects) error {
+func (m *Manager) loadCPUMapPrograms(replaceOpts *ebpf.CollectionOptions, mainObjs *xpfXdpMainObjects) error {
 	cpumapSpec, err := loadBpfrxXdpCpumap()
 	if err != nil {
 		return fmt.Errorf("load xdp_cpumap spec: %w", err)
@@ -483,7 +483,7 @@ func (m *Manager) loadCPUMapPrograms(replaceOpts *ebpf.CollectionOptions, mainOb
 		cpumapReplaceOpts.MapReplacements[k] = v
 	}
 
-	var cpumapObjs bpfrxXdpCpumapObjects
+	var cpumapObjs xpfXdpCpumapObjects
 	if err := cpumapSpec.LoadAndAssign(&cpumapObjs, cpumapReplaceOpts); err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {

@@ -16,7 +16,7 @@ debugging entry points, use [`userspace-debug-map.md`](userspace-debug-map.md).
 
 ```
                         ┌─────────────────────────────────┐
-                        │          bpfrxd (Go)             │
+                        │          xpfd (Go)             │
                         │  ┌───────────┐  ┌────────────┐  │
                         │  │  Config   │  │  Cluster    │  │
                         │  │  Store    │  │  Sync       │  │
@@ -29,7 +29,7 @@ debugging entry points, use [`userspace-debug-map.md`](userspace-debug-map.md).
                         └────────┼────────────────────────┘
                     Unix socket  │  (JSON control protocol)
                         ┌────────▼────────────────────────┐
-                        │  bpfrx-userspace-dp (Rust)       │
+                        │  xpf-userspace-dp (Rust)       │
                         │  ┌────────┐ ┌────────┐          │
                         │  │Worker 0│ │Worker 1│ ...      │
                         │  │ AF_XDP │ │ AF_XDP │          │
@@ -97,7 +97,7 @@ Packet arrives at NIC
 
 ### 2. Rust Dataplane Process (`userspace-dp/`)
 
-The main forwarding engine. Spawned by bpfrxd as a child process,
+The main forwarding engine. Spawned by xpfd as a child process,
 communicates over a Unix domain socket.
 
 #### Process Structure
@@ -289,7 +289,7 @@ supports protocol + port ranges.
 
 #### Slow Path (`slowpath.rs`)
 
-A TUN device (`bpfrx-usp0`) for packets that need kernel processing:
+A TUN device (`xpf-usp0`) for packets that need kernel processing:
 
 - ICMP reject responses (policy deny with reject action)
 - Packets that fail forwarding resolution
@@ -342,7 +342,7 @@ The userspace dataplane participates in the chassis cluster HA:
 ┌──────────────────┐     fabric link      ┌──────────────────┐
 │  fw0 (PRIMARY)   │◄───────────────────►│  fw1 (BACKUP)    │
 │                  │                      │                  │
-│  bpfrxd ◄──────────── session sync ────────► bpfrxd       │
+│  xpfd ◄──────────── session sync ────────► xpfd       │
 │    │             │                      │    │             │
 │    ▼             │                      │    ▼             │
 │  userspace-dp    │                      │  userspace-dp    │
@@ -355,9 +355,9 @@ The userspace dataplane participates in the chassis cluster HA:
 
 1. Worker creates forward session → emits `SessionDelta::Open`
 2. Coordinator collects deltas from all workers
-3. bpfrxd drains deltas via control socket
+3. xpfd drains deltas via control socket
 4. Cluster sync sends deltas to peer over TCP fabric link
-5. Peer bpfrxd pushes received sessions into userspace-dp
+5. Peer xpfd pushes received sessions into userspace-dp
 6. Peer workers install as "synced" sessions (no further replication)
 
 **Failover handling:**
@@ -385,7 +385,7 @@ CPU 2: Worker 2 + NAPI (ge-0-0-1 queue 2, ge-0-0-2 queue 2)
 CPU 3: Worker 3 + NAPI (ge-0-0-1 queue 3, ge-0-0-2 queue 3)
 CPU 4: Worker 4 + NAPI (ge-0-0-1 queue 4, ge-0-0-2 queue 4)
 CPU 5: Worker 5 + NAPI (ge-0-0-1 queue 5, ge-0-0-2 queue 5)
-CPU 6: bpfrxd (Go daemon) + sync
+CPU 6: xpfd (Go daemon) + sync
 CPU 7: main thread + io_uring + kernel
 ```
 
@@ -432,9 +432,9 @@ RSS queue count should match worker count for optimal distribution.
 system {
     dataplane-type userspace;
     dataplane {
-        binary /usr/local/sbin/bpfrx-userspace-dp;
-        control-socket /run/bpfrx/userspace-dp.sock;
-        state-file /run/bpfrx/userspace-dp.json;
+        binary /usr/local/sbin/xpf-userspace-dp;
+        control-socket /run/xpf/userspace-dp.sock;
+        state-file /run/xpf/userspace-dp.json;
         workers 6;
         ring-entries 8192;
     }

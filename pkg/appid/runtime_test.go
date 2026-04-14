@@ -4,7 +4,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestCatalogNamesReferencedOnly(t *testing.T) {

@@ -1,4 +1,4 @@
-# bpfrx Testing Procedures
+# xpf Testing Procedures
 
 ## Quick Reference
 
@@ -31,7 +31,7 @@ Run 880+ Go tests across 30 packages. Covers:
 End-to-end network validation for standalone and cluster deployments.
 
 Tests:
-- Service health (bpfrxd systemd unit active)
+- Service health (xpfd systemd unit active)
 - Heartbeat and fabric link connectivity (cluster)
 - RETH VIP reachability (IPv4 + IPv6)
 - Cross-zone routing (LAN -> WAN gateway)
@@ -51,7 +51,7 @@ Validates HA failover survives fw0 reboot with active iperf3 traffic.
 Sequence:
 1. Start iperf3 on cluster-lan-host (IPv4 + IPv6)
 2. Record initial throughput
-3. Reboot bpfrx-fw0 (primary crash)
+3. Reboot xpf-fw0 (primary crash)
 4. Wait for fw1 to take over (VRRP MASTER)
 5. Verify iperf3 continues (session sync preserves TCP)
 6. Wait for fw0 to rejoin and failback
@@ -72,7 +72,7 @@ Tests crash recovery scenarios beyond clean reboot.
 
 Scenarios:
 - Force-stop VM (`incus stop --force`) — simulates power failure
-- Daemon stop (`systemctl stop bpfrxd`) — tests BPF watchdog fail-closed
+- Daemon stop (`systemctl stop xpfd`) — tests BPF watchdog fail-closed
 - Multi-cycle crash recovery — repeated crashes verify no state leak
 
 ### 5. Private RG Election Test (`./test/incus/test-private-rg.sh`)
@@ -104,9 +104,9 @@ Validates zero packet loss during daemon restart (hitless restart).
 ## Known Issues and Workarounds
 
 ### Deploy doesn't update active config
-**Issue:** `make cluster-deploy` pushes `bpfrx.conf` but the daemon loads from the configstore DB (`active.json`). Config changes in `bpfrx.conf` are ignored on subsequent deploys.
+**Issue:** `make cluster-deploy` pushes `xpf.conf` but the daemon loads from the configstore DB (`active.json`). Config changes in `xpf.conf` are ignored on subsequent deploys.
 **Fix:** Deploy script now clears `.configdb/` after pushing config (fixed in `cluster-setup.sh`).
-**Workaround:** Manually run `rm -rf /etc/bpfrx/.configdb` on VMs before restart.
+**Workaround:** Manually run `rm -rf /etc/xpf/.configdb` on VMs before restart.
 
 ### IPv6 SNAT requires explicit ::/0 rule
 **Issue:** SNAT rule `source-address 0.0.0.0/0` only matches IPv4. IPv6 traffic passes without SNAT, causing return path failures if the upstream lacks a route to the internal prefix.
@@ -118,9 +118,9 @@ Validates zero packet loss during daemon restart (hitless restart).
 ## Debugging Tips
 
 ### VRRP not starting
-1. Check configstore DB: `cat /etc/bpfrx/.configdb/active.json | python3 -m json.tool | grep private-rg`
-2. If stale: `rm -rf /etc/bpfrx/.configdb && systemctl restart bpfrxd`
-3. Check logs: `journalctl -u bpfrxd | grep "vrrp:"`
+1. Check configstore DB: `cat /etc/xpf/.configdb/active.json | python3 -m json.tool | grep private-rg`
+2. If stale: `rm -rf /etc/xpf/.configdb && systemctl restart xpfd`
+3. Check logs: `journalctl -u xpfd | grep "vrrp:"`
 4. Verify interfaces exist: `ip link show | grep ge-0-0`
 
 ### IPv6 TCP failing but ping works
@@ -133,10 +133,10 @@ Validates zero packet loss during daemon restart (hitless restart).
 1. Check RG state: `show chassis cluster status`
 2. Check interface addresses: `ip addr show ge-0-0-0` / `ip addr show ge-0-0-1`
 3. Reconcile runs every 2s — wait and check again
-4. Force reconcile: `systemctl restart bpfrxd`
+4. Force reconcile: `systemctl restart xpfd`
 
 ### Dual-active detection
 1. Both nodes primary: check `show chassis cluster status` on both
 2. Heartbeat: `ping 10.99.0.X` between nodes
 3. Non-preempt mode resolves by effective priority then node ID
-4. Logs: `journalctl -u bpfrxd | grep "Dual-active"`
+4. Logs: `journalctl -u xpfd | grep "Dual-active"`

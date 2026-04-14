@@ -119,13 +119,13 @@ func TestGenerateNetwork_DHCP(t *testing.T) {
 func TestFindExternallyManaged(t *testing.T) {
 	dir := t.TempDir()
 
-	// Write a non-bpfrx .network file
+	// Write a non-xpf .network file
 	external := "[Match]\nName=eth0\n\n[Network]\nDHCP=yes\n"
 	os.WriteFile(filepath.Join(dir, "50-mgmt.network"), []byte(external), 0644)
 
-	// Write a bpfrx-managed .network file (should be ignored)
-	bpfrx := "[Match]\nName=trust0\n\n[Network]\nAddress=10.0.1.10/24\n"
-	os.WriteFile(filepath.Join(dir, filePrefix+"trust0.network"), []byte(bpfrx), 0644)
+	// Write a xpf-managed .network file (should be ignored)
+	xpf := "[Match]\nName=trust0\n\n[Network]\nAddress=10.0.1.10/24\n"
+	os.WriteFile(filepath.Join(dir, filePrefix+"trust0.network"), []byte(xpf), 0644)
 
 	// Write a .link file (not .network, should be ignored)
 	os.WriteFile(filepath.Join(dir, "99-custom.link"), []byte("[Match]\nName=foo\n"), 0644)
@@ -135,7 +135,7 @@ func TestFindExternallyManaged(t *testing.T) {
 		t.Error("eth0 should be externally managed")
 	}
 	if result["trust0"] {
-		t.Error("trust0 should not be externally managed (has bpfrx prefix)")
+		t.Error("trust0 should not be externally managed (has xpf prefix)")
 	}
 	if result["foo"] {
 		t.Error("foo should not match (was .link, not .network)")

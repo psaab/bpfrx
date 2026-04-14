@@ -5,11 +5,11 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/cmdtree"
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/frr"
-	"github.com/psaab/bpfrx/pkg/routing"
-	"github.com/psaab/bpfrx/pkg/vrrp"
+	"github.com/psaab/xpf/pkg/cmdtree"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/routing"
+	"github.com/psaab/xpf/pkg/vrrp"
 	"github.com/vishvananda/netlink"
 )
 

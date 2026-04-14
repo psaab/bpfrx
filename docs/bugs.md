@@ -49,11 +49,11 @@
 - **Fix:** Add same RST→CLOSED suppression guard to `zone_ct_update_v4()` and `zone_ct_update_v6()` in `xdp_zone.c` — check `flow_config_map` for `FLOW_TCP_RST_INVALIDATE` flag before allowing ESTABLISHED→CLOSED transition
 - **Key insight:** Two separate conntrack update paths exist: `xdp_conntrack.c` (full path) and `xdp_zone.c:zone_ct_update` (fast-path). Both must have identical RST handling
 
-### Duplicate daemon corrupts BPF programs/maps via "bpfrxd show ..."
+### Duplicate daemon corrupts BPF programs/maps via "xpfd show ..."
 - **Symptom:** Session sync sends 0 sessions, `show security flow statistics` shows 0 packets/sessions despite active traffic. All iperf3 streams die on first failover because peer has no synced sessions
-- **Root cause:** Running `bpfrxd show chassis cluster status` (or any `bpfrxd show ...`) via `incus exec` starts a SECOND full daemon process. The binary falls through to `daemon.New()` + `d.Run()` for any arguments not matching `version` or `cleanup`. The second daemon loads a new set of BPF programs with new maps, updates the pinned PROG_ARRAY (shared tail-call dispatch), and re-attaches interfaces. Original daemon's Go code still references old maps → session sync reads empty Set 1 maps, counters show zero
-- **Fix:** Add positional argument guard in `cmd/bpfrxd/main.go` — reject any non-flag first argument that isn't `version` or `cleanup`. Users should use `cli` binary or run `bpfrxd` interactively on a TTY
-- **Key insight:** ALWAYS use `cli` binary for remote show commands, NEVER `bpfrxd show ...` via non-interactive execution
+- **Root cause:** Running `xpfd show chassis cluster status` (or any `xpfd show ...`) via `incus exec` starts a SECOND full daemon process. The binary falls through to `daemon.New()` + `d.Run()` for any arguments not matching `version` or `cleanup`. The second daemon loads a new set of BPF programs with new maps, updates the pinned PROG_ARRAY (shared tail-call dispatch), and re-attaches interfaces. Original daemon's Go code still references old maps → session sync reads empty Set 1 maps, counters show zero
+- **Fix:** Add positional argument guard in `cmd/xpfd/main.go` — reject any non-flag first argument that isn't `version` or `cleanup`. Users should use `cli` binary or run `xpfd` interactively on a TTY
+- **Key insight:** ALWAYS use `cli` binary for remote show commands, NEVER `xpfd show ...` via non-interactive execution
 
 ### Fabric interface txqueuelen drops under bidirectional active/active load
 - **Symptom:** `bpf_redirect_map` drops exceeded 1.7% under bidirectional active/active load at ~10 Gbps on virtio-net fabric interface
@@ -241,7 +241,7 @@ VF appears as enp10s0f0 inside VM (NOT enp10s0 as initially expected).
 
 ### Destructive daemon shutdown kills sessions and routes
 - `daemon.Close()` called `frr.Clear()`, `dhcp.StopAll()`, `routing.ClearVRFs()`
-- Fix: Non-destructive SIGTERM; full teardown only via `bpfrxd cleanup`
+- Fix: Non-destructive SIGTERM; full teardown only via `xpfd cleanup`
 
 ### DHCP context cancellation removes addresses on restart
 - DHCP context derived from daemon ctx → cancelled on SIGTERM
@@ -253,7 +253,7 @@ VF appears as enp10s0f0 inside VM (NOT enp10s0 as initially expected).
 
 ### Stale generic XDP pinned links after mode change
 - `link.Update()` replaces program but NOT attachment mode
-- Fix: One-time `bpfrxd cleanup` + fresh start after structural changes
+- Fix: One-time `xpfd cleanup` + fresh start after structural changes
 
 ### PROG_ARRAY entries cleared on daemon exit (CRITICAL)
 - Kernel calls `bpf_fd_array_map_clear()` on PROG_ARRAY maps when `usercnt` drops to 0
@@ -767,7 +767,7 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Root cause:** The interface-mode SNAT compiler picked a single interface from the to-zone at compile time and built one pool from ALL RETH unit addresses (e.g., both 172.16.50.6 for VLAN 50 and 172.16.100.6 for VLAN 100). At runtime, BPF `nat_pool_alloc_v4()` allocated from the pool without considering the actual egress ifindex+vlan — so a packet egressing VLAN 100 could get SNAT'd with the VLAN 50 IP
 - **Fix:** New `snat_egress_ips` BPF HASH map keyed by `(ifindex, vlan_id)` → per-interface SNAT IP. The compiler now iterates ALL interfaces in the to-zone and populates the map with each unit's primary IP. New BPF functions `nat_pool_alloc_iface_v4/v6()` look up `meta->fwd_ifindex` + `meta->egress_vlan_id` to select the correct egress IP, falling back to pool-based allocation if the lookup fails
 - **BPF arg limit gotcha:** Initial implementation passed 6 args to the BPF helper (BPF max is 5). Fixed by passing `struct pkt_meta *meta` instead of separate ifindex+vlan args
-- **Files:** `bpfrx_common.h` (interface_mode flag, snat_egress_key/value structs), `bpfrx_maps.h` (snat_egress_ips map), `xdp_policy.c` (nat_pool_alloc_iface_v4/v6, 3 SNAT call sites), `types.go`, `dataplane.go`, `maps.go`, `loader_ebpf.go`, `compiler.go`, DPDK stubs
+- **Files:** `xpf_common.h` (interface_mode flag, snat_egress_key/value structs), `xpf_maps.h` (snat_egress_ips map), `xdp_policy.c` (nat_pool_alloc_iface_v4/v6, 3 SNAT call sites), `types.go`, `dataplane.go`, `maps.go`, `loader_ebpf.go`, `compiler.go`, DPDK stubs
 - **Validated:** `make test` all pass, `make test-failover` 14/14 pass (8.51 Gbps)
 
 ### NAT64 source pool auto-assignment for unreferenced named pools (FIXED `f9e408c`)
@@ -798,7 +798,7 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Symptom:** Unknown services (flag==0) passed through host-inbound allowlist zones; ICMP echo replies and ICMPv6 NDP were blocked
 - **Root cause:** (1) `host_inbound_flag()` only classified echo requests (type 8/128), not replies (type 0/129) or NDP (133-136). (2) Allowlist check `flag != 0 && !(flags & flag)` passed unknown services (flag==0) through
 - **Fix:** Added echo reply + NDP classification to `host_inbound_flag()`. Changed allowlist to true deny: `flags != ALL && (flag == 0 || !(flags & flag))`
-- **Files:** `bpf/headers/bpfrx_helpers.h`, `bpf/xdp/xdp_forward.c`, `dpdk_worker/forward.c`
+- **Files:** `bpf/headers/xpf_helpers.h`, `bpf/xdp/xdp_forward.c`, `dpdk_worker/forward.c`
 
 ### NAT64 SNAT rule shadowing interface-mode rule (FIXED `5781006`)
 - **Symptom:** All LAN→WAN traffic SNAT'd to 172.16.50.6 (nat64-pool) instead of correct egress interface IP
@@ -836,7 +836,7 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Symptom:** `kill -9` or panic leaves `rg_active` set → stale forwarding until peer election catches up
 - **Root cause:** Graceful shutdown path that clears `rg_active` never runs on ungraceful exit
 - **Fix:** BPF `ha_watchdog` ARRAY map written by Go daemon every 500ms with monotonic timestamp. `check_egress_rg_active()` verifies freshness — if >2s stale, treats RG as inactive regardless of `rg_active`. Standalone mode unaffected (watchdog value 0 = skip check)
-- **Files:** `bpf/headers/bpfrx_maps.h`, `bpf/headers/bpfrx_helpers.h`, `pkg/dataplane/maps.go`, `pkg/daemon/daemon.go`
+- **Files:** `bpf/headers/xpf_maps.h`, `bpf/headers/xpf_helpers.h`, `pkg/dataplane/maps.go`, `pkg/daemon/daemon.go`
 
 ### HA startup premature primary takeover (FIXED #103)
 - **Symptom:** On startup/rejoin, RG election could promote to primary before interfaces/VRRP are ready → transient loss/blackhole during HA transitions
@@ -854,9 +854,9 @@ These bugs were discovered testing iperf3 (~4.7 Gbps reverse mode) through the c
 - **Files:** `pkg/daemon/daemon.go`
 
 ### Deploy configstore stale config — VRRP backward compat failure (FIXED)
-- **Symptom:** After deploying new config via `make cluster-deploy` (which pushes `bpfrx.conf`), the daemon still uses the OLD config from `active.json`. Removing `private-rg-election` from `bpfrx.conf` had no effect — VRRP instances didn't start
-- **Root cause:** The configstore DB (`/etc/bpfrx/.configdb/active.json`) persists the compiled config AST from the previous run. On startup, `Store.Load()` reads from `active.json` first (line 87). The text file `bpfrx.conf` is only used when `active.json` doesn't exist (bootstrap). Deploy pushes new `bpfrx.conf` but doesn't clear `active.json`
-- **Fix:** Deploy script (`cluster-setup.sh`) now runs `rm -rf /etc/bpfrx/.configdb` after pushing new config, forcing the daemon to bootstrap from the fresh `bpfrx.conf`
+- **Symptom:** After deploying new config via `make cluster-deploy` (which pushes `xpf.conf`), the daemon still uses the OLD config from `active.json`. Removing `private-rg-election` from `xpf.conf` had no effect — VRRP instances didn't start
+- **Root cause:** The configstore DB (`/etc/xpf/.configdb/active.json`) persists the compiled config AST from the previous run. On startup, `Store.Load()` reads from `active.json` first (line 87). The text file `xpf.conf` is only used when `active.json` doesn't exist (bootstrap). Deploy pushes new `xpf.conf` but doesn't clear `active.json`
+- **Fix:** Deploy script (`cluster-setup.sh`) now runs `rm -rf /etc/xpf/.configdb` after pushing new config, forcing the daemon to bootstrap from the fresh `xpf.conf`
 - **Files:** `test/incus/cluster-setup.sh`
 - **Test:** `test/incus/test-private-rg.sh full` — enables then disables private-rg-election, verifying VRRP restarts
 

@@ -39,8 +39,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 type platformState struct {
@@ -74,7 +74,7 @@ func (m *Manager) Load() error {
 	}
 
 	// Initialize as DPDK secondary process.
-	args := []string{"bpfrxd", "--proc-type=secondary", "--no-pci"}
+	args := []string{"xpfd", "--proc-type=secondary", "--no-pci"}
 	cArgs := make([]*C.char, len(args))
 	for i, a := range args {
 		cArgs[i] = C.CString(a)
@@ -92,11 +92,11 @@ func (m *Manager) Load() error {
 	m.platform.ealInitialized = true
 
 	// Look up shared memory via memzone.
-	cName := C.CString("bpfrx_shm")
+	cName := C.CString("xpf_shm")
 	defer C.free(unsafe.Pointer(cName))
 	mz := C.rte_memzone_lookup(cName)
 	if mz == nil {
-		return fmt.Errorf("rte_memzone_lookup(bpfrx_shm) failed: primary not running?")
+		return fmt.Errorf("rte_memzone_lookup(xpf_shm) failed: primary not running?")
 	}
 	m.platform.shm = (*C.struct_shared_memory)(C.memzone_addr(mz))
 

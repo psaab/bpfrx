@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx XDP screen/IDS stage.
+ * xpf XDP screen/IDS stage.
  *
  * Runs before zone classification. Looks up the ingress zone's screen
  * profile and applies stateless anomaly checks (LAND, TCP SYN+FIN,
@@ -13,9 +13,9 @@
  * pass after a single extra RTT; spoofed sources fail validation.
  */
 
-#include "../headers/bpfrx_common.h"
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
+#include "../headers/xpf_common.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
 
 /*
  * SYN cookie helpers: bpf_tcp_raw_gen_syncookie_ipv4/v6 and

@@ -23,7 +23,7 @@ observation for completion after `#397`.
 ## Environment
 
 - env: `test/incus/loss-userspace-cluster.env`
-- cluster: `bpfrx-userspace-fw0` / `bpfrx-userspace-fw1`
+- cluster: `xpf-userspace-fw0` / `xpf-userspace-fw1`
 - branch under test: `origin/master`
 - requester / target commands run with local `cli`
 
@@ -34,7 +34,7 @@ observation for completion after `#397`.
 Command:
 
 ```bash
-incus exec loss:bpfrx-userspace-fw0 -- \
+incus exec loss:xpf-userspace-fw0 -- \
   cli -c 'request chassis cluster failover redundancy-group 0 node 0'
 ```
 
@@ -79,7 +79,7 @@ Precondition:
 Command:
 
 ```bash
-incus exec loss:bpfrx-userspace-fw0 -- \
+incus exec loss:xpf-userspace-fw0 -- \
   cli -c 'request chassis cluster failover redundancy-group 0 node 0'
 ```
 
@@ -118,7 +118,7 @@ Artifact:
 Command:
 
 ```bash
-incus exec loss:bpfrx-userspace-fw1 -- \
+incus exec loss:xpf-userspace-fw1 -- \
   cli -c 'request chassis cluster failover redundancy-group 0 node 1'
 ```
 

@@ -122,7 +122,7 @@ impl MmapArea {
             let ptr = NonNull::new(ptr.cast::<u8>())
                 .ok_or_else(|| io::Error::other("null mmap pointer"))?;
             eprintln!(
-                "bpfrx-ha: umem alloc {} bytes ({} MB, 2MB hugepages)",
+                "xpf-ha: umem alloc {} bytes ({} MB, 2MB hugepages)",
                 aligned_len,
                 aligned_len / (1024 * 1024)
             );
@@ -155,7 +155,7 @@ impl MmapArea {
         let ptr =
             NonNull::new(ptr.cast::<u8>()).ok_or_else(|| io::Error::other("null mmap pointer"))?;
         eprintln!(
-            "bpfrx-ha: umem alloc {} bytes ({} MB, standard pages + THP hint)",
+            "xpf-ha: umem alloc {} bytes ({} MB, standard pages + THP hint)",
             aligned_len,
             aligned_len / (1024 * 1024)
         );
