@@ -34,6 +34,8 @@ func newFirewallFilterShowStore(t *testing.T) *configstore.Store {
 		"firewall family inet6 filter bandwidth-output term 0 from destination-port 5201",
 		"firewall family inet6 filter bandwidth-output term 0 then count iperf-a-v6",
 		"firewall family inet6 filter bandwidth-output term 0 then accept",
+		"firewall family inet6 filter bandwidth-output term 1 from destination-port 5300",
+		"firewall family inet6 filter bandwidth-output term 1 then accept",
 	} {
 		if err := store.SetFromInput(cmd); err != nil {
 			t.Fatalf("SetFromInput(%q) error = %v", cmd, err)
@@ -81,5 +83,8 @@ func TestShowTextFirewallFilterHonorsFamilyAndUserspaceCounters(t *testing.T) {
 	}
 	if !strings.Contains(out, "Hit count: 7 packets, 1024 bytes") {
 		t.Fatalf("output = %q, want userspace hit counters", out)
+	}
+	if strings.Count(out, "Hit count:") != 1 {
+		t.Fatalf("output = %q, want a hit count only for the counted term", out)
 	}
 }

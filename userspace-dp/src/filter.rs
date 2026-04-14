@@ -1170,7 +1170,7 @@ mod tests {
                     name: "iperf-a".into(),
                     action: "accept".into(),
                     forwarding_class: "iperf-a".into(),
-                    count: "iperf-a".into(),
+                    count: "iperf-a-v6".into(),
                     protocols: vec!["tcp".into()],
                     destination_ports: vec!["5201".into()],
                     ..Default::default()
@@ -1201,6 +1201,54 @@ mod tests {
         let term = filter.terms.first().expect("first term");
         assert_eq!(term.counter.packets.load(Ordering::Relaxed), 1);
         assert_eq!(term.counter.bytes.load(Ordering::Relaxed), 1514);
+    }
+
+    #[test]
+    fn interface_output_filter_without_count_does_not_record_term_hits() {
+        let ifaces = vec![crate::InterfaceSnapshot {
+            name: "reth0.80".into(),
+            ifindex: 7,
+            filter_output_v6: "bandwidth-output".into(),
+            ..Default::default()
+        }];
+        let state = parse_filter_state(
+            &[FirewallFilterSnapshot {
+                name: "bandwidth-output".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "iperf-a".into(),
+                    action: "accept".into(),
+                    forwarding_class: "iperf-a".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["5201".into()],
+                    ..Default::default()
+                }],
+            }],
+            &[],
+            &ifaces,
+            "",
+            "",
+        );
+        let result = evaluate_interface_output_filter_counted(
+            &state,
+            7,
+            true,
+            IpAddr::V6("2001:db8::10".parse().unwrap()),
+            IpAddr::V6("2001:db8::200".parse().unwrap()),
+            PROTO_TCP,
+            40000,
+            5201,
+            0,
+            1514,
+        );
+        assert_eq!(result.forwarding_class.as_ref(), "iperf-a");
+        let filter = state
+            .filters
+            .get("inet6:bandwidth-output")
+            .expect("inet6 output filter");
+        let term = filter.terms.first().expect("first term");
+        assert_eq!(term.counter.packets.load(Ordering::Relaxed), 0);
+        assert_eq!(term.counter.bytes.load(Ordering::Relaxed), 0);
     }
 
     #[test]
