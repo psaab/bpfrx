@@ -42,7 +42,7 @@ Phase 1 does not need to be a full recursive resolver. A forwarding cache is eno
 
 ## Recommended runtime direction
 
-Use a dedicated bpfrx-managed DNS forwarder/cache process and stop using `systemd-resolved` as the mechanism behind `system services dns`.
+Use a dedicated bpfrx-managed DNS forwarder/cache process and stop using `systemd-resolved` as the mechanism behind any bpfrx-managed DNS behavior.
 
 Recommended direction:
 
@@ -66,60 +66,40 @@ Recommendation:
 
 - Phase 1: manage `unbound`
 - keep the abstraction in bpfrxd generic enough that a future daemon swap is possible
+- have the new runtime replace both:
+  - client-facing firewall DNS proxy behavior
+  - host OS DNS behavior that is currently being delegated to `systemd-resolved`
 
 ## Required systemd-resolved change
 
-The core design constraint is that `systemd-resolved` cannot remain the client-facing DNS service pretending to be vSRX DNS proxy.
+The core design constraint is that `systemd-resolved` should not remain anywhere in the bpfrx DNS path.
 
-We should split the problem into two planes:
-
-1. firewall client-facing DNS proxy plane
-2. host OS resolver plane
-
-The firewall client-facing plane should move to the new managed DNS proxy.
-
-For the host OS plane, there are two viable approaches:
-
-### Option A: disable systemd-resolved entirely
+Recommended ownership model:
 
 - stop and disable `systemd-resolved`
-- render `/etc/resolv.conf` directly from configured host resolver inputs
-- let the bpfrx-managed DNS proxy be the only DNS daemon on the node
+- stop treating `system services dns` as a thin wrapper around a host OS service toggle
+- let the bpfrx-managed DNS runtime own:
+  - client-facing firewall DNS listeners
+  - upstream forwarding behavior
+  - cache behavior
+  - host OS DNS configuration previously delegated to `systemd-resolved`
 
-Pros:
+This is intentionally not a hybrid split design. The DNS runtime should replace all DNS things that `systemd-resolved` currently provides for bpfrx-managed nodes.
 
-- simplest ownership model
-- no ambiguity over who owns port 53
-- avoids dual-daemon DNS confusion
+What this implies:
 
-Cons:
+- `applyDNSService()` needs to be rewritten around the new DNS runtime
+- `/etc/resolv.conf` management becomes bpfrx-owned
+- the host OS should either:
+  - point at the new local DNS runtime, or
+  - receive explicit upstream resolver config rendered directly by bpfrx
 
-- we must take over host resolver file management cleanly
-- larger change in host networking assumptions
+Why this is preferable:
 
-### Option B: keep systemd-resolved for host resolution only
-
-- disable stub listener / avoid binding conflicts
-- stop treating it as the implementation of `system services dns`
-- run the bpfrx-managed DNS proxy on the service IPs/interfaces
-- leave host OS resolution on `systemd-resolved` or explicit upstreams
-
-Pros:
-
-- smaller host OS disruption
-- cleaner migration path
-
-Cons:
-
-- more moving parts
-- easier to create confusing failure modes if ownership boundaries are sloppy
-
-Recommendation:
-
-- start with Option B if we can guarantee clean listener separation
-- fall back to Option A if `systemd-resolved` creates too much ownership ambiguity
-
-Either way, the current `applyDNSService()` model needs to stop meaning “toggle `systemd-resolved` and call it done.”
+- one owner for DNS behavior
+- no ambiguity over listener ownership
+- no split-brain between “host DNS” and “firewall DNS”
+- simpler operator story and fewer hidden interactions
 
 ## Proposed config/runtime contract
 
@@ -198,22 +178,14 @@ Tests:
 - unit tests for rendered daemon config
 - daemon tests for create/update/delete behavior
 
-### Phase 3: Replace systemd-resolved ownership model
+### Phase 3: Replace systemd-resolved entirely
 
 Refactor `applyDNSService()`:
 
-- stop calling `systemd-resolved` the DNS implementation for `system services dns`
-- introduce separate host-resolver management and firewall-dns-proxy management
-
-If using Option B:
-
-- disable `systemd-resolved` stub listener or otherwise prevent listener overlap
-- keep host OS resolution explicit and separate
-
-If using Option A:
-
+- stop calling `systemd-resolved` for any bpfrx-managed DNS behavior
 - disable `systemd-resolved`
-- manage `/etc/resolv.conf` directly
+- manage `/etc/resolv.conf` directly or point it at the new local DNS runtime
+- let the bpfrx-managed DNS runtime be the only DNS owner on the node
 
 Tests:
 
@@ -270,7 +242,7 @@ Warnings/alarms:
 
 - daemon failed to bind
 - no reachable forwarders
-- conflicting local DNS listener
+- stale or unexpected local DNS listener
 
 ## Acceptance criteria
 
@@ -278,7 +250,8 @@ Warnings/alarms:
 - supported dns-proxy knobs no longer emit “unsupported” warnings
 - firewall listens on the intended address/interface for DNS queries
 - client queries are forwarded to configured upstreams and replied successfully
-- `systemd-resolved` is no longer the mechanism standing in for vSRX DNS proxy
+- `systemd-resolved` is disabled and no longer provides any bpfrx-managed DNS behavior
+- the new runtime owns both firewall DNS behavior and host DNS behavior for the node
 - HA failover preserves service ownership semantics for DNS proxy listeners
 - operator can inspect runtime state with dedicated CLI/status output
 
@@ -287,13 +260,13 @@ Warnings/alarms:
 - full recursive resolver feature parity on day one
 - DNS security product features beyond forwarding/cache parity
 - cache synchronization between HA peers
-- using DNS proxy as a control-plane replacement for every host OS DNS need
+- preserving `systemd-resolved` as a parallel DNS owner
 
 ## Suggested rollout order
 
 1. config model + warning cleanup
 2. daemon renderer/manager
-3. listener ownership transition away from `systemd-resolved`
+3. full DNS ownership transition away from `systemd-resolved`
 4. single-node functional tests
 5. HA listener ownership tests
 6. operator visibility / CLI
