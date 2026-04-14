@@ -1934,13 +1934,14 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 						}
 						ruleOffset += numRules
 					}
-					if counter, ok := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
+					userspaceCounter, userspaceOk := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
 						Family: family, FilterName: filterName, TermName: term.Name,
-					}]; ok {
-						totalPkts += counter.Packets
-						totalBytes += counter.Bytes
+					}]
+					if userspaceOk {
+						totalPkts += userspaceCounter.Packets
+						totalBytes += userspaceCounter.Bytes
 					}
-					if hasCounters || len(userspaceCounters) > 0 {
+					if hasCounters || userspaceOk {
 						fmt.Fprintf(&buf, "    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
 					}
 				}
@@ -2531,13 +2532,14 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 							}
 							ruleOffset += numRules
 						}
-						if counter, ok := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
+						userspaceCounter, userspaceOk := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
 							Family: family, FilterName: name, TermName: term.Name,
-						}]; ok {
-							totalPkts += counter.Packets
-							totalBytes += counter.Bytes
+						}]
+						if userspaceOk {
+							totalPkts += userspaceCounter.Packets
+							totalBytes += userspaceCounter.Bytes
 						}
-						if hasCounters || len(userspaceCounters) > 0 {
+						if hasCounters || userspaceOk {
 							fmt.Fprintf(&buf, "    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
 						}
 					}

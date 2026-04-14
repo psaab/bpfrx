@@ -1504,13 +1504,14 @@ func (c *CLI) showFirewallFilters() error {
 					}
 					ruleOffset += numRules
 				}
-				if counter, ok := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
+				userspaceCounter, userspaceOk := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
 					Family: family, FilterName: name, TermName: term.Name,
-				}]; ok {
-					totalPkts += counter.Packets
-					totalBytes += counter.Bytes
+				}]
+				if userspaceOk {
+					totalPkts += userspaceCounter.Packets
+					totalBytes += userspaceCounter.Bytes
 				}
-				if hasCounters || len(userspaceCounters) > 0 {
+				if hasCounters || userspaceOk {
 					fmt.Printf("    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
 				}
 			}
@@ -1674,13 +1675,14 @@ func (c *CLI) showFirewallFilter(name, requestedFamily string) error {
 			}
 			ruleOffset += numRules
 		}
-		if counter, ok := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
+		userspaceCounter, userspaceOk := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
 			Family: family, FilterName: name, TermName: term.Name,
-		}]; ok {
-			totalPkts += counter.Packets
-			totalBytes += counter.Bytes
+		}]
+		if userspaceOk {
+			totalPkts += userspaceCounter.Packets
+			totalBytes += userspaceCounter.Bytes
 		}
-		if hasCounters || len(userspaceCounters) > 0 {
+		if hasCounters || userspaceOk {
 			fmt.Printf("    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
 		}
 	}

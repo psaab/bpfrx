@@ -230,7 +230,9 @@ pub(crate) fn evaluate_filter_counted(
         if !term_matches(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
             continue;
         }
-        term.counter.record(packet_bytes);
+        if !term.count.is_empty() {
+            term.counter.record(packet_bytes);
+        }
         return FilterResult {
             action: term.action.clone(),
             dscp_rewrite: term.dscp_rewrite,
@@ -1168,6 +1170,7 @@ mod tests {
                     name: "iperf-a".into(),
                     action: "accept".into(),
                     forwarding_class: "iperf-a".into(),
+                    count: "iperf-a".into(),
                     protocols: vec!["tcp".into()],
                     destination_ports: vec!["5201".into()],
                     ..Default::default()
