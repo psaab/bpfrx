@@ -74,10 +74,12 @@ func TestFormatCoSInterfaceSummaryShowsConfigOnlyInterface(t *testing.T) {
 }
 
 func TestFormatCoSInterfaceSummaryIncludesRuntimeQueueState(t *testing.T) {
+	owner := uint32(7)
 	status := &ProcessStatus{
 		CoSInterfaces: []CoSInterfaceStatus{
 			{
 				InterfaceName:       "reth0.80",
+				OwnerWorkerID:       &owner,
 				WorkerInstances:     2,
 				NonemptyQueues:      1,
 				RunnableQueues:      1,
@@ -104,6 +106,7 @@ func TestFormatCoSInterfaceSummaryIncludesRuntimeQueueState(t *testing.T) {
 	}
 	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "")
 	for _, want := range []string{
+		"Owner worker:             7",
 		"Runtime workers:          2",
 		"Runtime queues:           nonempty=1 runnable=1",
 		"Timer wheel sleepers:     level0=1 level1=0",
@@ -116,6 +119,21 @@ func TestFormatCoSInterfaceSummaryIncludesRuntimeQueueState(t *testing.T) {
 	}
 	if !strings.Contains(out, "77") || !strings.Contains(out, "4.00 KiB") {
 		t.Fatalf("expected runtime queue metrics in output:\n%s", out)
+	}
+}
+
+func TestFormatCoSInterfaceSummaryShowsUnknownOwnerAsDash(t *testing.T) {
+	status := &ProcessStatus{
+		CoSInterfaces: []CoSInterfaceStatus{
+			{
+				InterfaceName:   "reth0.80",
+				WorkerInstances: 1,
+			},
+		},
+	}
+	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	if !strings.Contains(out, "Owner worker:             -") {
+		t.Fatalf("expected unknown owner to render as dash:\n%s", out)
 	}
 }
 

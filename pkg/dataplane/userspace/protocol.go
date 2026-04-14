@@ -399,6 +399,7 @@ type ProcessStatus struct {
 type CoSInterfaceStatus struct {
 	Ifindex             int              `json:"ifindex,omitempty"`
 	InterfaceName       string           `json:"interface_name,omitempty"`
+	OwnerWorkerID       *uint32          `json:"owner_worker_id,omitempty"`
 	ShapingRateBytes    uint64           `json:"shaping_rate_bytes,omitempty"`
 	BurstBytes          uint64           `json:"burst_bytes,omitempty"`
 	WorkerInstances     int              `json:"worker_instances,omitempty"`

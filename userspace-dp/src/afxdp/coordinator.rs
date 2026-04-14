@@ -39,6 +39,7 @@ pub struct Coordinator {
     pub(crate) last_reconcile_stage: String,
     pub(crate) poll_mode: crate::PollMode,
     pub(crate) event_stream: Option<crate::event_stream::EventStreamSender>,
+    pub(crate) cos_owner_worker_by_ifindex: BTreeMap<i32, u32>,
     /// Monotonic timestamp (secs) of the last HA flow cache flush (#312).
     pub(crate) last_cache_flush_at: Arc<AtomicU64>,
     /// Per-RG epoch counters for O(1) flow cache invalidation on demotion.
@@ -89,6 +90,7 @@ impl Coordinator {
             last_reconcile_stage: "idle".to_string(),
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,
+            cos_owner_worker_by_ifindex: BTreeMap::new(),
             last_cache_flush_at: Arc::new(AtomicU64::new(0)),
             rg_epochs: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
         }
@@ -226,6 +228,7 @@ impl Coordinator {
         self.workers.clear();
         self.identities.clear();
         self.live.clear();
+        self.cos_owner_worker_by_ifindex.clear();
         self.last_slow_path_status = self
             .slow_path
             .as_ref()
@@ -577,6 +580,7 @@ impl Coordinator {
             &self.forwarding,
             &workers,
         ));
+        self.cos_owner_worker_by_ifindex = cos_owner_worker_by_ifindex.as_ref().clone();
         let worker_command_queues: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>> =
             Arc::new(
                 workers
@@ -859,6 +863,12 @@ impl Coordinator {
                 entry.ifindex = iface.ifindex;
                 if entry.interface_name.is_empty() {
                     entry.interface_name = iface.interface_name.clone();
+                }
+                if entry.owner_worker_id.is_none() {
+                    entry.owner_worker_id = self
+                        .cos_owner_worker_by_ifindex
+                        .get(&iface.ifindex)
+                        .copied();
                 }
                 entry.shaping_rate_bytes = entry.shaping_rate_bytes.max(iface.shaping_rate_bytes);
                 entry.burst_bytes = entry.burst_bytes.max(iface.burst_bytes);
@@ -1399,14 +1409,29 @@ fn build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
     worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,
 ) -> BTreeMap<i32, u32> {
     let mut owner_by_ifindex = BTreeMap::new();
-    for egress_ifindex in forwarding.cos.interfaces.keys().copied() {
+    let mut next_owner_slot_by_tx_ifindex = BTreeMap::<i32, usize>::new();
+    let mut egress_ifindexes = forwarding
+        .cos
+        .interfaces
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    egress_ifindexes.sort_unstable();
+    for egress_ifindex in egress_ifindexes {
         let tx_ifindex = resolve_tx_binding_ifindex(forwarding, egress_ifindex);
-        for (worker_id, ifindexes) in worker_binding_ifindexes {
-            if ifindexes.contains(&tx_ifindex) {
-                owner_by_ifindex.insert(egress_ifindex, *worker_id);
-                break;
-            }
+        let eligible_workers = worker_binding_ifindexes
+            .iter()
+            .filter_map(|(worker_id, ifindexes)| {
+                ifindexes.contains(&tx_ifindex).then_some(*worker_id)
+            })
+            .collect::<Vec<_>>();
+        if eligible_workers.is_empty() {
+            continue;
         }
+        let next_slot = next_owner_slot_by_tx_ifindex.entry(tx_ifindex).or_default();
+        let owner_worker_id = eligible_workers[*next_slot % eligible_workers.len()];
+        *next_slot += 1;
+        owner_by_ifindex.insert(egress_ifindex, owner_worker_id);
     }
     owner_by_ifindex
 }
@@ -1452,5 +1477,48 @@ mod tests {
         );
 
         assert_eq!(owner_by_ifindex.get(&80), Some(&2));
+    }
+
+    #[test]
+    fn build_cos_owner_worker_by_ifindex_spreads_interfaces_across_eligible_workers() {
+        let mut forwarding = ForwardingState::default();
+        for ifindex in [82, 80, 81] {
+            forwarding.cos.interfaces.insert(
+                ifindex,
+                CoSInterfaceConfig {
+                    shaping_rate_bytes: 1_000_000,
+                    burst_bytes: 64 * 1024,
+                    default_queue: 0,
+                    queue_by_forwarding_class: FastMap::default(),
+                    queues: vec![],
+                },
+            );
+            forwarding.egress.insert(
+                ifindex,
+                EgressInterface {
+                    bind_ifindex: 12,
+                    vlan_id: 0,
+                    mtu: 1500,
+                    src_mac: [0; 6],
+                    zone: "wan".to_string(),
+                    redundancy_group: 0,
+                    primary_v4: None,
+                    primary_v6: None,
+                },
+            );
+        }
+        let worker_binding_ifindexes = BTreeMap::from([
+            (2, std::collections::BTreeSet::from([12])),
+            (7, std::collections::BTreeSet::from([12])),
+        ]);
+
+        let owner_by_ifindex = build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
+            &forwarding,
+            &worker_binding_ifindexes,
+        );
+
+        assert_eq!(owner_by_ifindex.get(&80), Some(&2));
+        assert_eq!(owner_by_ifindex.get(&81), Some(&7));
+        assert_eq!(owner_by_ifindex.get(&82), Some(&2));
     }
 }
