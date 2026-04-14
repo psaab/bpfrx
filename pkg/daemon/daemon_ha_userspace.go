@@ -828,16 +828,16 @@ type userspaceTransferReadinessProvider interface {
 	TransferReadiness() cluster.TransferReadinessSnapshot
 }
 
-type userspaceSoftwareVersionMismatchProvider interface {
-	SoftwareVersionMismatch() (bool, string, string)
+type userspaceHAProtocolMismatchProvider interface {
+	HAProtocolVersionMismatch() (bool, uint16, uint16)
 }
 
-func userspaceSoftwareVersionMismatchReason(provider userspaceSoftwareVersionMismatchProvider) []string {
+func userspaceHAProtocolMismatchReason(provider userspaceHAProtocolMismatchProvider) []string {
 	if provider == nil {
 		return nil
 	}
-	if mismatch, local, peer := provider.SoftwareVersionMismatch(); mismatch {
-		return []string{fmt.Sprintf("software version mismatch local=%q peer=%q", local, peer)}
+	if mismatch, local, peer := provider.HAProtocolVersionMismatch(); mismatch {
+		return []string{fmt.Sprintf("ha protocol mismatch local=%d peer=%d", local, peer)}
 	}
 	return nil
 }
@@ -858,7 +858,7 @@ func computeUserspaceTransferReadiness(sync userspaceTransferReadinessProvider, 
 
 func (d *Daemon) userspaceTransferReadiness(rgID int) (bool, []string) {
 	if d.cluster != nil {
-		if reasons := userspaceSoftwareVersionMismatchReason(d.cluster); len(reasons) > 0 {
+		if reasons := userspaceHAProtocolMismatchReason(d.cluster); len(reasons) > 0 {
 			return false, reasons
 		}
 	}

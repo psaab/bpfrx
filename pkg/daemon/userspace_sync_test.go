@@ -224,23 +224,23 @@ func TestComputeUserspaceTransferReadinessReady(t *testing.T) {
 	}
 }
 
-type fakeUserspaceSoftwareVersionMismatchProvider struct {
+type fakeUserspaceHAProtocolMismatchProvider struct {
 	mismatch bool
-	local    string
-	peer     string
+	local    uint16
+	peer     uint16
 }
 
-func (f fakeUserspaceSoftwareVersionMismatchProvider) SoftwareVersionMismatch() (bool, string, string) {
+func (f fakeUserspaceHAProtocolMismatchProvider) HAProtocolVersionMismatch() (bool, uint16, uint16) {
 	return f.mismatch, f.local, f.peer
 }
 
-func TestUserspaceSoftwareVersionMismatchReason(t *testing.T) {
-	reasons := userspaceSoftwareVersionMismatchReason(fakeUserspaceSoftwareVersionMismatchProvider{
+func TestUserspaceHAProtocolMismatchReason(t *testing.T) {
+	reasons := userspaceHAProtocolMismatchReason(fakeUserspaceHAProtocolMismatchProvider{
 		mismatch: true,
-		local:    "local build",
-		peer:     "peer build",
+		local:    1,
+		peer:     2,
 	})
-	if len(reasons) != 1 || reasons[0] != `software version mismatch local="local build" peer="peer build"` {
+	if len(reasons) != 1 || reasons[0] != `ha protocol mismatch local=1 peer=2` {
 		t.Fatalf("unexpected reasons: %v", reasons)
 	}
 }

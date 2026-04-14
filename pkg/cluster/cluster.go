@@ -126,6 +126,11 @@ type Manager struct {
 	// Optional software version metadata advertised via heartbeat.
 	localSoftwareVersion string
 	peerSoftwareVersion  string
+	// Explicit HA/session-transfer compatibility version carried in heartbeat.
+	// Unlike software version strings, this is a deliberate interoperability
+	// contract and is what userspace transfer readiness gates on.
+	localHAProtocolVersion uint16
+	peerHAProtocolVersion  uint16
 	// peerTransferOutOverride preserves an explicitly acknowledged peer
 	// transfer-out across heartbeat refreshes until the transfer is either
 	// committed or aborted locally.
@@ -138,8 +143,8 @@ type Manager struct {
 	// secondary during the same window so a transient heartbeat gap cannot
 	// immediately re-promote the old primary.
 	localTransferOutHoldUntil map[int]time.Time
-	peerTransferOutPrevious map[int]peerGroupSnapshot
-	peerMonitors            []InterfaceMonitorInfo
+	peerTransferOutPrevious   map[int]peerGroupSnapshot
+	peerMonitors              []InterfaceMonitorInfo
 
 	// Heartbeat goroutines (nil when not started).
 	hbSender   *heartbeatSender
@@ -255,6 +260,7 @@ func NewManager(nodeID, clusterID int) *Manager {
 		peerTransferCommitGraceUntil:   make(map[int]time.Time),
 		localTransferOutHoldUntil:      make(map[int]time.Time),
 		peerTransferOutPrevious:        make(map[int]peerGroupSnapshot),
+		localHAProtocolVersion:         CurrentHAProtocolVersion,
 		hbInterval:                     DefaultHeartbeatInterval,
 		hbThreshold:                    DefaultHeartbeatThreshold,
 		history:                        NewEventHistory(64),
@@ -474,14 +480,34 @@ func (m *Manager) SoftwareVersions() (local, peer string) {
 	return m.localSoftwareVersion, m.peerSoftwareVersion
 }
 
-// SoftwareVersionMismatch reports whether both sides advertised different versions.
-func (m *Manager) SoftwareVersionMismatch() (bool, string, string) {
+// SetHAProtocolVersion records the local HA compatibility version advertised to
+// the peer. Zero falls back to the legacy compatibility version.
+func (m *Manager) SetHAProtocolVersion(version uint16) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.localHAProtocolVersion = normalizeHAProtocolVersion(version)
+}
+
+// HAProtocolVersions returns the currently known local and peer HA protocol versions.
+func (m *Manager) HAProtocolVersions() (local, peer uint16) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.localSoftwareVersion == "" || m.peerSoftwareVersion == "" {
-		return false, m.localSoftwareVersion, m.peerSoftwareVersion
+	return m.localHAProtocolVersion, m.peerHAProtocolVersion
+}
+
+// HAProtocolVersionMismatch reports whether both sides advertised incompatible
+// HA/session-transfer versions. When the peer is absent or has not yet
+// advertised a version, mismatch stays false so disconnect/readiness logic can
+// report the more accurate transport-state reason.
+func (m *Manager) HAProtocolVersionMismatch() (bool, uint16, uint16) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	local := normalizeHAProtocolVersion(m.localHAProtocolVersion)
+	if !m.peerAlive || m.peerHAProtocolVersion == 0 {
+		return false, local, 0
 	}
-	return m.localSoftwareVersion != m.peerSoftwareVersion, m.localSoftwareVersion, m.peerSoftwareVersion
+	peer := normalizeHAProtocolVersion(m.peerHAProtocolVersion)
+	return local != peer, local, peer
 }
 
 // PeerMonitorStatuses returns the peer's interface monitor states from heartbeat.
@@ -1437,9 +1463,10 @@ func (m *Manager) buildHeartbeat() *HeartbeatPacket {
 	defer m.mu.RUnlock()
 
 	pkt := &HeartbeatPacket{
-		NodeID:          uint8(m.nodeID),
-		ClusterID:       uint16(m.clusterID),
-		SoftwareVersion: m.localSoftwareVersion,
+		NodeID:            uint8(m.nodeID),
+		ClusterID:         uint16(m.clusterID),
+		SoftwareVersion:   m.localSoftwareVersion,
+		HAProtocolVersion: m.localHAProtocolVersion,
 	}
 	for _, rg := range m.groups {
 		pkt.Groups = append(pkt.Groups, HeartbeatGroup{
@@ -1473,6 +1500,7 @@ func (m *Manager) handlePeerHeartbeat(pkt *HeartbeatPacket) {
 	m.peerEverSeen = true
 	m.peerNodeID = int(pkt.NodeID)
 	m.peerSoftwareVersion = pkt.SoftwareVersion
+	m.peerHAProtocolVersion = normalizeHAProtocolVersion(pkt.HAProtocolVersion)
 
 	// Rebuild peer group states from scratch — prunes stale RGs that
 	// the peer no longer reports (fix #92).
@@ -1581,6 +1609,7 @@ func (m *Manager) handlePeerTimeout() {
 	m.peerGroups = make(map[int]PeerGroupState)
 	m.peerMonitors = nil
 	m.peerSoftwareVersion = ""
+	m.peerHAProtocolVersion = 0
 	slog.Warn("cluster: peer heartbeat timeout, marking peer lost")
 	m.history.Record(EventHeartbeat, -1, "Peer heartbeat timeout")
 
@@ -1742,6 +1771,8 @@ func (m *Manager) FormatStatus() string {
 	peerNodeID := m.peerNodeID
 	localVersion := m.localSoftwareVersion
 	peerVersion := m.peerSoftwareVersion
+	localProtocol := normalizeHAProtocolVersion(m.localHAProtocolVersion)
+	peerProtocol := normalizeHAProtocolVersion(m.peerHAProtocolVersion)
 	peerGroups := make(map[int]PeerGroupState, len(m.peerGroups))
 	for k, v := range m.peerGroups {
 		peerGroups[k] = v
@@ -1759,15 +1790,15 @@ func (m *Manager) FormatStatus() string {
 	if localVersion != "" {
 		fmt.Fprintf(&b, "Software version: %s\n", localVersion)
 	}
+	fmt.Fprintf(&b, "HA protocol version: %d\n", localProtocol)
 	if peerAlive {
 		if peerVersion == "" {
 			peerVersion = "unknown"
 		}
 		fmt.Fprintf(&b, "Peer software version: %s\n", peerVersion)
+		fmt.Fprintf(&b, "Peer HA protocol version: %d\n", peerProtocol)
 	}
-	if localVersion != "" || peerAlive {
-		fmt.Fprintln(&b)
-	}
+	fmt.Fprintln(&b)
 	fmt.Fprintf(&b, "%-6s %-8s %-14s %-8s %-8s %s\n",
 		"Node", "Priority", "Status", "Preempt", "Manual", "Monitor-failures")
 	fmt.Fprintln(&b)
@@ -1827,6 +1858,8 @@ func (m *Manager) FormatInformation() string {
 	peerNodeID := m.peerNodeID
 	localVersion := m.localSoftwareVersion
 	peerVersion := m.peerSoftwareVersion
+	localProtocol := normalizeHAProtocolVersion(m.localHAProtocolVersion)
+	peerProtocol := normalizeHAProtocolVersion(m.peerHAProtocolVersion)
 	interval := m.hbInterval
 	threshold := m.hbThreshold
 	controlIface := m.controlInterface
@@ -1867,11 +1900,13 @@ func (m *Manager) FormatInformation() string {
 	if localVersion != "" {
 		fmt.Fprintf(&b, "  Software version: %s\n", localVersion)
 	}
+	fmt.Fprintf(&b, "  HA protocol version: %d\n", localProtocol)
 	if peerAlive {
 		if peerVersion == "" {
 			peerVersion = "unknown"
 		}
 		fmt.Fprintf(&b, "  Peer software version: %s\n", peerVersion)
+		fmt.Fprintf(&b, "  Peer HA protocol version: %d\n", peerProtocol)
 	}
 	fmt.Fprintf(&b, "  Sync transport: %s\n", m.SyncTransport())
 	fmt.Fprintln(&b)

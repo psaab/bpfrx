@@ -20,6 +20,16 @@ const (
 	// heartbeatVersion is the current protocol version.
 	heartbeatVersion = 1
 
+	// LegacyHAProtocolVersion is the compatibility version implicitly used by
+	// older heartbeats that predate explicit HA protocol advertisement.
+	LegacyHAProtocolVersion uint16 = 1
+
+	// CurrentHAProtocolVersion is the HA/session-transfer compatibility version
+	// used to decide whether mixed software builds can still hand off RGs. Bump
+	// this only when heartbeat/session-sync/failover wire semantics change in a
+	// way that breaks mixed-version interoperability.
+	CurrentHAProtocolVersion = LegacyHAProtocolVersion
+
 	// maxHeartbeatSize is the max packet size we'll read/write.
 	// 1472 = 1500 MTU - 20 IP header - 8 UDP header.
 	maxHeartbeatSize = 1472
@@ -53,18 +63,24 @@ const (
 //	    [3] NameLen
 //	    [4..4+NameLen] Interface name
 //	After monitors:
-//	  Optional SoftwareVersion:
+//	  Optional VersionTrailer:
 //	    [0] VersionLen
-//	    [1..1+VersionLen] Version bytes
+//	    [1..1+VersionLen] SoftwareVersion bytes
+//	    [..] uint16 little-endian HAProtocolVersion
 //
-// The trailing software-version field is optional; packets may end after the
-// monitor section, or may include the length-prefixed version bytes.
+// The trailing version trailer is optional; packets may end after the monitor
+// section. When present, the trailer always starts with a length byte, even if
+// the software version string is empty, so newer readers can unambiguously find
+// the HA protocol version. Older readers ignore any bytes after the optional
+// software-version field, and newer readers treat a missing trailer as the
+// legacy protocol version.
 type HeartbeatPacket struct {
-	NodeID          uint8
-	ClusterID       uint16
-	Groups          []HeartbeatGroup
-	Monitors        []HeartbeatMonitor
-	SoftwareVersion string
+	NodeID            uint8
+	ClusterID         uint16
+	Groups            []HeartbeatGroup
+	Monitors          []HeartbeatMonitor
+	SoftwareVersion   string
+	HAProtocolVersion uint16
 }
 
 // HeartbeatGroup is a per-RG entry in the heartbeat.
@@ -91,6 +107,13 @@ const heartbeatGroupSize = 5
 
 const maxHeartbeatSoftwareVersionSize = 255
 
+func normalizeHAProtocolVersion(version uint16) uint16 {
+	if version == 0 {
+		return LegacyHAProtocolVersion
+	}
+	return version
+}
+
 // MarshalHeartbeat encodes a heartbeat packet to wire format.
 // The output is capped at maxHeartbeatSize. RG group entries are always
 // included (they are critical for election). When SoftwareVersion is present,
@@ -115,14 +138,15 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 	}
 
 	var version []byte
-	versionReserve := 0
+	const heartbeatVersionTrailerSize = 1 + 2 // version length byte + HA protocol version
+	versionReserve := heartbeatVersionTrailerSize
 	if pkt.SoftwareVersion != "" {
 		version = []byte(pkt.SoftwareVersion)
 		if len(version) > maxHeartbeatSoftwareVersionSize {
 			version = version[:maxHeartbeatSoftwareVersionSize]
 		}
-		if off+1+len(version) <= maxHeartbeatSize {
-			versionReserve = 1 + len(version)
+		if off+heartbeatVersionTrailerSize+len(version) <= maxHeartbeatSize {
+			versionReserve = heartbeatVersionTrailerSize + len(version)
 		} else {
 			version = nil
 		}
@@ -153,11 +177,15 @@ func MarshalHeartbeat(pkt *HeartbeatPacket) []byte {
 		numMon++
 	}
 	buf[monCountOff] = uint8(numMon)
-	if len(version) > 0 {
+	if off+versionReserve <= maxHeartbeatSize {
 		buf[off] = uint8(len(version))
 		off++
-		copy(buf[off:off+len(version)], version)
-		off += len(version)
+		if len(version) > 0 {
+			copy(buf[off:off+len(version)], version)
+			off += len(version)
+		}
+		binary.LittleEndian.PutUint16(buf[off:off+2], normalizeHAProtocolVersion(pkt.HAProtocolVersion))
+		off += 2
 	}
 	return buf[:off]
 }
@@ -175,8 +203,9 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 	}
 
 	pkt := &HeartbeatPacket{
-		NodeID:    data[5],
-		ClusterID: binary.LittleEndian.Uint16(data[6:8]),
+		NodeID:            data[5],
+		ClusterID:         binary.LittleEndian.Uint16(data[6:8]),
+		HAProtocolVersion: LegacyHAProtocolVersion,
 	}
 
 	numGroups := int(data[8])
@@ -230,12 +259,20 @@ func UnmarshalHeartbeat(data []byte) (*HeartbeatPacket, error) {
 			})
 		}
 	}
+	versionSectionComplete := false
 	if monitorSectionComplete && off < len(data) {
 		versionLen := int(data[off])
 		off++
 		if off+versionLen <= len(data) {
 			pkt.SoftwareVersion = string(data[off : off+versionLen])
+			off += versionLen
+			versionSectionComplete = true
+		} else {
+			return pkt, nil
 		}
+	}
+	if monitorSectionComplete && versionSectionComplete && off+2 <= len(data) {
+		pkt.HAProtocolVersion = normalizeHAProtocolVersion(binary.LittleEndian.Uint16(data[off : off+2]))
 	}
 
 	return pkt, nil
