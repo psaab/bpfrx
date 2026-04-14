@@ -771,8 +771,11 @@ Important current behavior:
 - if no egress CoS filter is configured, queue selection falls back to the
   current **ingress interface input filter**
 - if neither filter assigns a forwarding class, queue selection falls back to
-  the shaped interface's attached DSCP classifier under
-  `class-of-service interfaces <if> unit <u> classifiers dscp <name>`
+  the shaped interface's attached BA classifiers:
+  - DSCP under
+    `class-of-service interfaces <if> unit <u> classifiers dscp <name>`
+  - 802.1p under
+    `class-of-service interfaces <if> unit <u> classifiers ieee-802.1 <name>`
 - non-`exact` scheduler `transmit-rate` values act as guarantees and may borrow
   surplus bandwidth up to the root shaper
 - `transmit-rate exact` prevents that queue from borrowing surplus
@@ -827,12 +830,14 @@ Notes for this specific test:
   on whatever queue happens to be first in the scheduler map
 - DSCP BA classifiers are a fallback input to CoS queue selection today; an
   explicit firewall filter `then forwarding-class ...` decision still wins
+- 802.1p BA classifiers are also available as a fallback queue selector on
+  userspace interfaces; they use the ingress VLAN PCP preserved from XDP
 - keep ingress `input` filter classification only as a compatibility fallback
   for existing configs that do not yet attach an egress CoS filter
 - use `set class-of-service schedulers <name> transmit-rate <rate> exact` for
   queues that must stay capped at their guarantee instead of borrowing surplus
-- `loss-priority` on CoS DSCP classifiers is accepted for syntax compatibility
-  but is not enforced yet
+- `loss-priority` on CoS DSCP / 802.1p classifiers is accepted for syntax
+  compatibility but is not enforced yet
 
 Suggested verification commands:
 

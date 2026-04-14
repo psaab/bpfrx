@@ -58,6 +58,8 @@ pub(super) struct UserspaceDpMeta {
     pub(super) ingress_ifindex: u32,
     pub(super) rx_queue_index: u32,
     pub(super) ingress_vlan_id: u16,
+    pub(super) ingress_pcp: u8,
+    pub(super) reserved_vlan: u8,
     pub(super) ingress_zone: u16,
     pub(super) routing_table: u32,
     pub(super) l3_offset: u16,
@@ -174,6 +176,7 @@ pub(super) struct ForwardingState {
 pub(super) struct CoSState {
     pub(super) interfaces: FastMap<i32, CoSInterfaceConfig>,
     pub(super) dscp_classifiers: FastMap<String, CoSDSCPClassifierConfig>,
+    pub(super) ieee8021_classifiers: FastMap<String, CoSIEEE8021ClassifierConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +185,7 @@ pub(super) struct CoSInterfaceConfig {
     pub(super) burst_bytes: u64,
     pub(super) default_queue: u8,
     pub(super) dscp_classifier: String,
+    pub(super) ieee8021_classifier: String,
     pub(super) queue_by_forwarding_class: FastMap<String, u8>,
     pub(super) queues: Vec<CoSQueueConfig>,
 }
@@ -189,6 +193,11 @@ pub(super) struct CoSInterfaceConfig {
 #[derive(Clone, Debug, Default)]
 pub(super) struct CoSDSCPClassifierConfig {
     pub(super) queue_by_dscp: FastMap<u8, u8>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct CoSIEEE8021ClassifierConfig {
+    pub(super) queue_by_pcp: FastMap<u8, u8>,
 }
 
 #[derive(Clone, Debug)]

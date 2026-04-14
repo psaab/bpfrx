@@ -1519,6 +1519,7 @@ mod tests {
                 burst_bytes: 64 * 1024,
                 default_queue: 0,
                 dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
                 queue_by_forwarding_class: FastMap::default(),
                 queues: vec![CoSQueueConfig {
                     queue_id: 4,

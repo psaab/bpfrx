@@ -20,7 +20,7 @@ struct vlan_hdr {
  */
 static __always_inline int
 parse_ethhdr(void *data, void *data_end, __u16 *l3_offset, __u16 *eth_proto,
-	     __u16 *vlan_id)
+	     __u16 *vlan_id, __u8 *vlan_pcp)
 {
 	struct ethhdr *eth = data;
 
@@ -31,14 +31,21 @@ parse_ethhdr(void *data, void *data_end, __u16 *l3_offset, __u16 *eth_proto,
 	*l3_offset = sizeof(struct ethhdr);
 	if (vlan_id)
 		*vlan_id = 0;
+	if (vlan_pcp)
+		*vlan_pcp = 0;
 
 	/* Handle one level of VLAN */
 	if (*eth_proto == ETH_P_8021Q || *eth_proto == ETH_P_8021AD) {
 		struct vlan_hdr *vlan = data + sizeof(struct ethhdr);
 		if ((void *)(vlan + 1) > data_end)
 			return -1;
-		if (vlan_id)
-			*vlan_id = bpf_ntohs(vlan->h_vlan_TCI) & 0x0FFF;
+		if (vlan_id || vlan_pcp) {
+			__u16 vlan_tci = bpf_ntohs(vlan->h_vlan_TCI);
+			if (vlan_id)
+				*vlan_id = vlan_tci & 0x0FFF;
+			if (vlan_pcp)
+				*vlan_pcp = (vlan_tci >> 13) & 0x07;
+		}
 		*eth_proto = bpf_ntohs(vlan->h_vlan_encapsulated_proto);
 		*l3_offset += sizeof(struct vlan_hdr);
 	}

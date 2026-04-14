@@ -462,6 +462,34 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
             )
         })
         .collect::<FastMap<_, _>>();
+    let ieee8021_classifiers = cos
+        .ieee8021_classifiers
+        .iter()
+        .filter(|classifier| !classifier.name.is_empty())
+        .map(|classifier| {
+            let mut queue_by_pcp = FastMap::default();
+            for entry in &classifier.entries {
+                if entry.forwarding_class.is_empty() {
+                    continue;
+                }
+                let Some(queue_id) = cos
+                    .forwarding_classes
+                    .iter()
+                    .find(|class| class.name == entry.forwarding_class)
+                    .and_then(|class| u8::try_from(class.queue).ok())
+                else {
+                    continue;
+                };
+                for pcp in &entry.code_points {
+                    queue_by_pcp.insert(*pcp, queue_id);
+                }
+            }
+            (
+                classifier.name.clone(),
+                CoSIEEE8021ClassifierConfig { queue_by_pcp },
+            )
+        })
+        .collect::<FastMap<_, _>>();
 
     let class_to_queue = cos
         .forwarding_classes
@@ -558,6 +586,7 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                 burst_bytes,
                 default_queue,
                 dscp_classifier: iface.cos_dscp_classifier.clone(),
+                ieee8021_classifier: iface.cos_ieee8021_classifier.clone(),
                 queue_by_forwarding_class,
                 queues,
             },
@@ -565,6 +594,7 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
     }
 
     state.dscp_classifiers = dscp_classifiers;
+    state.ieee8021_classifiers = ieee8021_classifiers;
 
     state
 }
@@ -601,7 +631,8 @@ mod tests {
     use super::*;
     use crate::{
         ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
-        CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot,
+        CoSForwardingClassSnapshot, CoSIEEE8021ClassifierEntrySnapshot,
+        CoSIEEE8021ClassifierSnapshot, CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot,
         CoSSchedulerSnapshot,
     };
 
@@ -656,6 +687,7 @@ mod tests {
                     ],
                 }],
                 dscp_classifiers: vec![],
+                ieee8021_classifiers: vec![],
             }),
             ..Default::default()
         };
@@ -731,6 +763,7 @@ mod tests {
                     queue: 0,
                 }],
                 dscp_classifiers: vec![],
+                ieee8021_classifiers: vec![],
                 schedulers: vec![CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 0,
@@ -764,6 +797,7 @@ mod tests {
                 cos_shaping_rate_bytes_per_sec: 10_000_000,
                 cos_scheduler_map: "wan-map".into(),
                 cos_dscp_classifier: "wan-classifier".into(),
+                cos_ieee8021_classifier: "wan-pcp".into(),
                 ..Default::default()
             }],
             class_of_service: Some(ClassOfServiceSnapshot {
@@ -791,6 +825,14 @@ mod tests {
                             dscp_values: vec![0],
                         },
                     ],
+                }],
+                ieee8021_classifiers: vec![CoSIEEE8021ClassifierSnapshot {
+                    name: "wan-pcp".into(),
+                    entries: vec![CoSIEEE8021ClassifierEntrySnapshot {
+                        forwarding_class: "voice".into(),
+                        loss_priority: "low".into(),
+                        code_points: vec![5],
+                    }],
                 }],
                 schedulers: vec![
                     CoSSchedulerSnapshot {
@@ -829,6 +871,7 @@ mod tests {
         let state = build_cos_state(&snapshot);
         let iface = state.interfaces.get(&42).expect("missing CoS interface");
         assert_eq!(iface.dscp_classifier, "wan-classifier");
+        assert_eq!(iface.ieee8021_classifier, "wan-pcp");
         assert!(iface.queues.iter().any(|queue| queue.queue_id == 5));
         let classifier = state
             .dscp_classifiers
@@ -836,6 +879,11 @@ mod tests {
             .expect("missing classifier");
         assert_eq!(classifier.queue_by_dscp.get(&46), Some(&5));
         assert_eq!(classifier.queue_by_dscp.get(&0), Some(&0));
+        let pcp_classifier = state
+            .ieee8021_classifiers
+            .get("wan-pcp")
+            .expect("missing 802.1p classifier");
+        assert_eq!(pcp_classifier.queue_by_pcp.get(&5), Some(&5));
     }
 }
 

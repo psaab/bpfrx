@@ -101,8 +101,10 @@ int xdp_main_prog(struct xdp_md *ctx)
 		}
 	}
 
+	__u8 vlan_pcp = 0;
+
 	/* Parse Ethernet header (extracts VLAN ID if present) */
-	if (parse_ethhdr(data, data_end, &l3_offset, &eth_proto, &vlan_id) < 0)
+	if (parse_ethhdr(data, data_end, &l3_offset, &eth_proto, &vlan_id, &vlan_pcp) < 0)
 		return XDP_DROP;
 
 	/* ---- cpumap distribution ---- */
@@ -131,6 +133,7 @@ int xdp_main_prog(struct xdp_md *ctx)
 	meta->direction = 0; /* ingress */
 	meta->ingress_ifindex = ctx->ingress_ifindex;
 	meta->ingress_vlan_id = vlan_id;
+	meta->ingress_pcp = vlan_pcp;
 	meta->dscp_rewrite = 0xFF; /* no DSCP rewrite by default */
 	meta->now_sec = (__u32)(bpf_ktime_get_coarse_ns() / 1000000000ULL);
 	meta->ktime_ns = 0;

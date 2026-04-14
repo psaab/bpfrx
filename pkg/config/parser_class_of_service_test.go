@@ -88,6 +88,7 @@ func TestCompileClassOfServiceSetSyntax(t *testing.T) {
 	lines := []string{
 		"set class-of-service forwarding-classes queue 0 best-effort",
 		"set class-of-service classifiers dscp wan-classifier forwarding-class best-effort loss-priority low code-points be",
+		"set class-of-service classifiers ieee-802.1 wan-pcp forwarding-class best-effort loss-priority low code-points 0",
 		"set class-of-service schedulers be-sched transmit-rate 5g",
 		"set class-of-service schedulers be-sched transmit-rate exact",
 		"set class-of-service schedulers be-sched priority low",
@@ -97,6 +98,7 @@ func TestCompileClassOfServiceSetSyntax(t *testing.T) {
 		"set class-of-service interfaces ge-0/0/2 unit 80 shaping-rate burst-size 64m",
 		"set class-of-service interfaces ge-0/0/2 unit 80 scheduler-map edge-map",
 		"set class-of-service interfaces ge-0/0/2 unit 80 classifiers dscp wan-classifier",
+		"set class-of-service interfaces ge-0/0/2 unit 80 classifiers ieee-802.1 wan-pcp",
 		"set system dataplane-type userspace",
 	}
 	tree := &ConfigTree{}
@@ -126,6 +128,9 @@ func TestCompileClassOfServiceSetSyntax(t *testing.T) {
 	if got := unit.DSCPClassifier; got != "wan-classifier" {
 		t.Fatalf("dscp-classifier = %q, want wan-classifier", got)
 	}
+	if got := unit.IEEE8021Classifier; got != "wan-pcp" {
+		t.Fatalf("ieee-802.1 classifier = %q, want wan-pcp", got)
+	}
 	if !cfg.ClassOfService.Schedulers["be-sched"].TransmitRateExact {
 		t.Fatal("expected be-sched transmit-rate exact")
 	}
@@ -135,6 +140,13 @@ func TestCompileClassOfServiceSetSyntax(t *testing.T) {
 	}
 	if got := classifier.Entries[0].DSCPValues; len(got) != 1 || got[0] != 0 {
 		t.Fatalf("wan-classifier dscp values = %v, want [0]", got)
+	}
+	pcpClassifier := cfg.ClassOfService.IEEE8021Classifiers["wan-pcp"]
+	if pcpClassifier == nil || len(pcpClassifier.Entries) != 1 {
+		t.Fatalf("expected wan-pcp entry, got %#v", pcpClassifier)
+	}
+	if got := pcpClassifier.Entries[0].CodePoints; len(got) != 1 || got[0] != 0 {
+		t.Fatalf("wan-pcp code-points = %v, want [0]", got)
 	}
 }
 
@@ -219,6 +231,13 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
                 }
             }
         }
+        ieee-802.1 pcp-classifier {
+            forwarding-class missing-class {
+                loss-priority low {
+                    code-points [ 5 ];
+                }
+            }
+        }
     }
     scheduler-maps {
         edge-map {
@@ -234,6 +253,7 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
                 scheduler-map edge-map;
                 classifiers {
                     dscp missing-classifier;
+                    ieee-802.1 missing-pcp-classifier;
                 }
             }
         }
@@ -256,13 +276,19 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
 	if !strings.Contains(warnings, `dscp classifier "edge-classifier" references undefined forwarding-class "missing-class"`) {
 		t.Fatalf("expected undefined forwarding-class warning, got: %s", warnings)
 	}
+	if !strings.Contains(warnings, `ieee-802.1 classifier "pcp-classifier" references undefined forwarding-class "missing-class"`) {
+		t.Fatalf("expected undefined 802.1p forwarding-class warning, got: %s", warnings)
+	}
 	if !strings.Contains(warnings, `references undefined dscp classifier "missing-classifier"`) {
 		t.Fatalf("expected undefined dscp classifier warning, got: %s", warnings)
 	}
-	if !strings.Contains(warnings, "dscp classifier loss-priority is accepted for compatibility but not yet enforced") {
+	if !strings.Contains(warnings, `references undefined ieee-802.1 classifier "missing-pcp-classifier"`) {
+		t.Fatalf("expected undefined 802.1p classifier warning, got: %s", warnings)
+	}
+	if !strings.Contains(warnings, "dscp/802.1p classifier loss-priority is accepted for compatibility but not yet enforced") {
 		t.Fatalf("expected classifier loss-priority warning, got: %s", warnings)
 	}
-	if !strings.Contains(warnings, "class-of-service shaping and dscp classifier attachment are only implemented in the userspace dataplane") {
+	if !strings.Contains(warnings, "class-of-service shaping and dscp/802.1p classifier attachment are only implemented in the userspace dataplane") {
 		t.Fatalf("expected dataplane warning, got: %s", warnings)
 	}
 }
@@ -324,6 +350,67 @@ system {
 		t.Fatalf("voice code-points = %v, want [46]", got)
 	}
 	if got := classifier.Entries[1].DSCPValues; len(got) != 1 || got[0] != 0 {
+		t.Fatalf("best-effort code-points = %v, want [0]", got)
+	}
+}
+
+func TestCompileClassOfServiceHierarchicalIEEE8021Classifier(t *testing.T) {
+	input := `class-of-service {
+    forwarding-classes {
+        queue 0 best-effort;
+        queue 5 voice;
+    }
+    classifiers {
+        ieee-802.1 edge-pcp {
+            forwarding-class voice {
+                loss-priority low {
+                    code-points [ 5 5 ];
+                }
+            }
+            forwarding-class best-effort {
+                loss-priority low {
+                    code-points [ 0 ];
+                }
+            }
+        }
+    }
+    interfaces {
+        ge-0/0/1 {
+            unit 0 {
+                classifiers {
+                    ieee-802.1 edge-pcp;
+                }
+            }
+        }
+    }
+}
+system {
+    dataplane-type userspace;
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	classifier := cfg.ClassOfService.IEEE8021Classifiers["edge-pcp"]
+	if classifier == nil {
+		t.Fatal("expected edge-pcp classifier")
+	}
+	if got := cfg.ClassOfService.Interfaces["ge-0/0/1"].Units[0].IEEE8021Classifier; got != "edge-pcp" {
+		t.Fatalf("unit classifier = %q, want edge-pcp", got)
+	}
+	if len(classifier.Entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(classifier.Entries))
+	}
+	if got := classifier.Entries[0].CodePoints; len(got) != 1 || got[0] != 5 {
+		t.Fatalf("voice code-points = %v, want [5]", got)
+	}
+	if got := classifier.Entries[1].CodePoints; len(got) != 1 || got[0] != 0 {
 		t.Fatalf("best-effort code-points = %v, want [0]", got)
 	}
 }

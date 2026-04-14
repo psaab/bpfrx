@@ -21,9 +21,10 @@ int xdp_cpumap_prog(struct xdp_md *ctx)
 	void *data     = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;
 	__u16 l3_offset, eth_proto, vlan_id = 0;
+	__u8 vlan_pcp = 0;
 
 	/* Parse Ethernet header (extracts VLAN ID if present) */
-	if (parse_ethhdr(data, data_end, &l3_offset, &eth_proto, &vlan_id) < 0)
+	if (parse_ethhdr(data, data_end, &l3_offset, &eth_proto, &vlan_id, &vlan_pcp) < 0)
 		return XDP_DROP;
 
 	/* Get per-CPU scratch space for packet metadata */
@@ -38,6 +39,7 @@ int xdp_cpumap_prog(struct xdp_md *ctx)
 	meta->direction = 0; /* ingress */
 	meta->ingress_ifindex = ctx->ingress_ifindex;
 	meta->ingress_vlan_id = vlan_id;
+	meta->ingress_pcp = vlan_pcp;
 	meta->dscp_rewrite = 0xFF; /* no DSCP rewrite by default */
 	meta->native_xdp = 1; /* cpumap only runs with native XDP */
 	meta->now_sec = (__u32)(bpf_ktime_get_coarse_ns() / 1000000000ULL);

@@ -328,6 +328,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				CoSBurstSize:              coSUnitBurstSize(cosUnit),
 				CoSSchedulerMap:           coSUnitSchedulerMap(cosUnit),
 				CoSDSCPClassifier:         coSUnitDSCPClassifier(cosUnit),
+				CoSIEEE8021Classifier:     coSUnitIEEE8021Classifier(cosUnit),
 			})
 		}
 	}
@@ -360,6 +361,13 @@ func coSUnitDSCPClassifier(unit *config.CoSInterfaceUnit) string {
 		return ""
 	}
 	return unit.DSCPClassifier
+}
+
+func coSUnitIEEE8021Classifier(unit *config.CoSInterfaceUnit) string {
+	if unit == nil {
+		return ""
+	}
+	return unit.IEEE8021Classifier
 }
 
 func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []TunnelEndpointSnapshot {
@@ -1431,7 +1439,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 		return nil
 	}
 	cos := cfg.ClassOfService
-	if len(cos.ForwardingClasses) == 0 && len(cos.DSCPClassifiers) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 && len(cos.Interfaces) == 0 {
+	if len(cos.ForwardingClasses) == 0 && len(cos.DSCPClassifiers) == 0 && len(cos.IEEE8021Classifiers) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 && len(cos.Interfaces) == 0 {
 		return nil
 	}
 	snap := &ClassOfServiceSnapshot{}
@@ -1479,6 +1487,33 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				})
 			}
 			snap.DSCPClassifiers = append(snap.DSCPClassifiers, classifierSnap)
+		}
+	}
+
+	if len(cos.IEEE8021Classifiers) > 0 {
+		names := make([]string, 0, len(cos.IEEE8021Classifiers))
+		for name := range cos.IEEE8021Classifiers {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		snap.IEEE8021Classifiers = make([]CoSIEEE8021ClassifierSnapshot, 0, len(names))
+		for _, name := range names {
+			classifier := cos.IEEE8021Classifiers[name]
+			if classifier == nil {
+				continue
+			}
+			classifierSnap := CoSIEEE8021ClassifierSnapshot{Name: classifier.Name}
+			for _, entry := range classifier.Entries {
+				if entry == nil {
+					continue
+				}
+				classifierSnap.Entries = append(classifierSnap.Entries, CoSIEEE8021ClassifierEntrySnapshot{
+					ForwardingClass: entry.ForwardingClass,
+					LossPriority:    entry.LossPriority,
+					CodePoints:      append([]uint8(nil), entry.CodePoints...),
+				})
+			}
+			snap.IEEE8021Classifiers = append(snap.IEEE8021Classifiers, classifierSnap)
 		}
 	}
 

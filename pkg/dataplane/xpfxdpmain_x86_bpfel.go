@@ -357,11 +357,14 @@ type xpfXdpMainPktMeta struct {
 	EgressZone     uint16
 	IngressIfindex uint32
 	IngressVlanId  uint16
+	IngressPcp     uint8
+	ReservedVlan   uint8
 	EgressVlanId   uint16
 	Direction      uint8
 	IsFragment     uint8
 	CtState        uint8
 	CtDirection    uint8
+	_              [2]byte
 	PolicyId       uint32
 	NatSrcIp       struct {
 		_  structs.HostLayout
@@ -388,6 +391,7 @@ type xpfXdpMainPktMeta struct {
 	MirrorRate    uint32
 	NowSec        uint32
 	PadTime       uint32
+	_             [4]byte
 	KtimeNs       uint64
 }
 
