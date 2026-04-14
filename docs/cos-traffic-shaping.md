@@ -855,6 +855,8 @@ Currently implemented:
   non-owner workers hand shaped traffic to that owner before CoS queue
   admission so one interface does not silently get independent queue state on
   every worker
+- ownership is now spread deterministically across eligible workers when
+  multiple shaped egress interfaces share the same TX path
 
 Still planned:
 
@@ -922,6 +924,8 @@ At minimum:
 - static reservation/container ownership by scheduler shard
 - first userspace slice is implemented as one owner worker per shaped egress
   interface with cross-worker handoff before CoS enqueue
+- static ownership is now spread deterministically across eligible workers for
+  multiple shaped egress interfaces on the same TX path
 - internal enqueue to the owning shard
 - shared parent budgets plus shard-local leases
 - cache-line isolation for shared pools

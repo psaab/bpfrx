@@ -78,6 +78,7 @@ func TestFormatCoSInterfaceSummaryIncludesRuntimeQueueState(t *testing.T) {
 		CoSInterfaces: []CoSInterfaceStatus{
 			{
 				InterfaceName:       "reth0.80",
+				OwnerWorkerID:       7,
 				WorkerInstances:     2,
 				NonemptyQueues:      1,
 				RunnableQueues:      1,
@@ -104,6 +105,7 @@ func TestFormatCoSInterfaceSummaryIncludesRuntimeQueueState(t *testing.T) {
 	}
 	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "")
 	for _, want := range []string{
+		"Owner worker:             7",
 		"Runtime workers:          2",
 		"Runtime queues:           nonempty=1 runnable=1",
 		"Timer wheel sleepers:     level0=1 level1=0",

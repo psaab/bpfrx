@@ -76,6 +76,7 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 		if view.interfaceState == nil {
 			b.WriteString("  Runtime:                  unavailable\n")
 		} else {
+			fmt.Fprintf(&b, "  Owner worker:             %d\n", view.interfaceState.OwnerWorkerID)
 			fmt.Fprintf(&b, "  Runtime workers:          %d\n", view.interfaceState.WorkerInstances)
 			fmt.Fprintf(&b, "  Runtime queues:           nonempty=%d runnable=%d\n",
 				view.interfaceState.NonemptyQueues,

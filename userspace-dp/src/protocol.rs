@@ -689,6 +689,8 @@ pub(crate) struct CoSInterfaceStatus {
     pub ifindex: i32,
     #[serde(rename = "interface_name", default)]
     pub interface_name: String,
+    #[serde(rename = "owner_worker_id", default)]
+    pub owner_worker_id: usize,
     #[serde(rename = "shaping_rate_bytes", default)]
     pub shaping_rate_bytes: u64,
     #[serde(rename = "burst_bytes", default)]
