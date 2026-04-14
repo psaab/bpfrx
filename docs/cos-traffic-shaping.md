@@ -759,6 +759,76 @@ set class-of-service interfaces ge-0-0-1 unit 0 shaping-rate burst-size 125m
 set class-of-service interfaces ge-0-0-1 unit 0 scheduler-map my-map
 ```
 
+### Current Userspace Test Recipe
+
+This is the current lab recipe that matches what the userspace dataplane
+actually honors today for a simple outbound `iperf3` check from the LAN side.
+
+Important current behavior:
+
+- shaping is enforced on the **egress** interface
+- queue selection is still driven by the **ingress interface input filter**
+- interface **output** filters do not currently drive CoS queue selection
+- `per-unit-scheduler` is not implemented
+- `transmit-rate exact` is not implemented yet
+
+For the `loss` userspace lab, the relevant path is:
+
+- client ingress on `reth1.0`
+- WAN egress on `reth0.80`
+
+So the working test config is:
+
+```text
+set class-of-service forwarding-classes queue 0 best-effort
+set class-of-service forwarding-classes queue 4 bandwidth-10mb
+set class-of-service forwarding-classes queue 5 bandwidth-5mb
+
+set class-of-service schedulers scheduler-be transmit-rate 15m
+set class-of-service schedulers scheduler-10mb transmit-rate 10m
+set class-of-service schedulers scheduler-5mb transmit-rate 5m
+
+set class-of-service scheduler-maps bandwidth-limit forwarding-class best-effort scheduler scheduler-be
+set class-of-service scheduler-maps bandwidth-limit forwarding-class bandwidth-10mb scheduler scheduler-10mb
+set class-of-service scheduler-maps bandwidth-limit forwarding-class bandwidth-5mb scheduler scheduler-5mb
+
+set class-of-service interfaces reth0 unit 80 scheduler-map bandwidth-limit
+set class-of-service interfaces reth0 unit 80 shaping-rate 15m
+
+delete firewall family inet filter sfmix-pbr term default
+set firewall family inet filter sfmix-pbr term cos-10m from destination-port 80
+set firewall family inet filter sfmix-pbr term cos-10m from destination-port 5201
+set firewall family inet filter sfmix-pbr term cos-10m then count input-10m
+set firewall family inet filter sfmix-pbr term cos-10m then forwarding-class bandwidth-10mb
+set firewall family inet filter sfmix-pbr term cos-10m then accept
+set firewall family inet filter sfmix-pbr term default then count input-5m
+set firewall family inet filter sfmix-pbr term default then forwarding-class bandwidth-5mb
+set firewall family inet filter sfmix-pbr term default then accept
+
+set interfaces reth1 unit 0 family inet filter input sfmix-pbr
+```
+
+Notes for this specific test:
+
+- keep the existing `sfmix-route` term ahead of the CoS terms so routing-instance
+  steering still happens first
+- match `destination-port 5201` for client-to-server `iperf3` traffic; matching
+  `source-port 5201` classifies the reverse direction instead
+- shape `reth0.80`, not `reth0.0`, because the WAN test traffic in this lab
+  leaves via `reth0.80`
+- define an explicit `best-effort` queue so unmatched traffic does not depend
+  on whatever queue happens to be first in the scheduler map
+
+Suggested verification commands:
+
+```text
+show configuration class-of-service | display set
+show configuration firewall family inet filter sfmix-pbr | display set
+show class-of-service interface reth0.80
+show firewall filter sfmix-pbr
+monitor interface traffic
+```
+
 ## Observability
 
 Observability should reflect the actual hierarchy.
