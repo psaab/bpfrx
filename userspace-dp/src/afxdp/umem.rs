@@ -580,6 +580,26 @@ impl BindingLiveState {
         }
     }
 
+    pub(super) fn enqueue_tx_owned(&self, req: TxRequest) -> Result<(), TxRequest> {
+        match self.pending_tx.lock() {
+            Ok(mut pending) => {
+                let max_pending = self.max_pending_tx.load(Ordering::Relaxed) as usize;
+                if max_pending > 0 && pending.len() >= max_pending {
+                    if pending.pop_front().is_some() {
+                        self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                pending.push_back(req);
+                self.pending_tx_len.store(
+                    pending.len().min(u32::MAX as usize) as u32,
+                    Ordering::Relaxed,
+                );
+                Ok(())
+            }
+            Err(_) => Err(req),
+        }
+    }
+
     pub(super) fn take_pending_tx(&self) -> VecDeque<TxRequest> {
         if self.pending_tx_len.load(Ordering::Relaxed) == 0 {
             return VecDeque::new();

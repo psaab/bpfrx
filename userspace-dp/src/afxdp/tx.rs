@@ -446,10 +446,7 @@ fn redirect_local_cos_request_to_owner_binding(
     if Arc::ptr_eq(owner_live, current_live) {
         return Err(req);
     }
-    if owner_live.enqueue_tx(req.clone()).is_ok() {
-        return Ok(());
-    }
-    Err(req)
+    owner_live.enqueue_tx_owned(req)
 }
 
 fn redirect_prepared_cos_request_to_owner(

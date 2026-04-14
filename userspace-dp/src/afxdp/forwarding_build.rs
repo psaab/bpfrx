@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn build_cos_state_binds_dscp_classifier_to_interface_queue_ids() {
+    fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
         let snapshot = ConfigSnapshot {
             interfaces: vec![InterfaceSnapshot {
                 ifindex: 42,
@@ -792,9 +792,34 @@ mod tests {
                         },
                     ],
                 }],
+                schedulers: vec![
+                    CoSSchedulerSnapshot {
+                        name: "be".into(),
+                        transmit_rate_bytes: 1_000_000,
+                        transmit_rate_exact: false,
+                        priority: "low".into(),
+                        buffer_size_bytes: 0,
+                    },
+                    CoSSchedulerSnapshot {
+                        name: "voice".into(),
+                        transmit_rate_bytes: 2_000_000,
+                        transmit_rate_exact: false,
+                        priority: "high".into(),
+                        buffer_size_bytes: 0,
+                    },
+                ],
                 scheduler_maps: vec![CoSSchedulerMapSnapshot {
                     name: "wan-map".into(),
-                    entries: vec![],
+                    entries: vec![
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "best-effort".into(),
+                            scheduler: "be".into(),
+                        },
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "voice".into(),
+                            scheduler: "voice".into(),
+                        },
+                    ],
                 }],
                 ..Default::default()
             }),
@@ -804,6 +829,7 @@ mod tests {
         let state = build_cos_state(&snapshot);
         let iface = state.interfaces.get(&42).expect("missing CoS interface");
         assert_eq!(iface.dscp_classifier, "wan-classifier");
+        assert!(iface.queues.iter().any(|queue| queue.queue_id == 5));
         let classifier = state
             .dscp_classifiers
             .get("wan-classifier")

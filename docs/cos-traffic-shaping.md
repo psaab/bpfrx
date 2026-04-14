@@ -771,8 +771,8 @@ Important current behavior:
 - if no egress CoS filter is configured, queue selection falls back to the
   current **ingress interface input filter**
 - if neither filter assigns a forwarding class, queue selection falls back to
-  the shaped interface's attached `class-of-service classifiers dscp ...`
-  binding
+  the shaped interface's attached DSCP classifier under
+  `class-of-service interfaces <if> unit <u> classifiers dscp <name>`
 - non-`exact` scheduler `transmit-rate` values act as guarantees and may borrow
   surplus bandwidth up to the root shaper
 - `transmit-rate exact` prevents that queue from borrowing surplus
