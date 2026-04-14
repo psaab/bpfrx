@@ -88,9 +88,10 @@ fi
 if [ -f ~/.bpfrx_cli_history ] && [ ! -f ~/.xpf_cli_history ]; then
     info "Renaming ~/.bpfrx_cli_history -> ~/.xpf_cli_history"
     mv ~/.bpfrx_cli_history ~/.xpf_cli_history
-elif [ -f ~/.bpfrx_history ] && [ ! -f ~/.xpf_cli_history ]; then
-    info "Renaming legacy ~/.bpfrx_history -> ~/.xpf_cli_history"
-    mv ~/.bpfrx_history ~/.xpf_cli_history
+fi
+if [ -f ~/.bpfrx_history ] && [ ! -f ~/.xpf_history ]; then
+    info "Renaming ~/.bpfrx_history -> ~/.xpf_history"
+    mv ~/.bpfrx_history ~/.xpf_history
 fi
 
 # --- Migrate userspace helper binary ---

@@ -383,7 +383,7 @@ cmd_deploy() {
 	incus exec "$INSTANCE_NAME" -- rm -f /etc/systemd/system/bpfrxd.service 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- rm -f /usr/local/sbin/bpfrxd 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- rm -f /usr/local/sbin/bpfrx-userspace-dp 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- bash -c 'if [ -d /etc/bpfrx ] && [ ! -d /etc/xpf ]; then mv /etc/bpfrx /etc/xpf; fi; if [ -f /etc/xpf/bpfrx.conf ] && [ ! -f /etc/xpf/xpf.conf ]; then mv /etc/xpf/bpfrx.conf /etc/xpf/xpf.conf; fi' 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- bash -c 'if [ -d /etc/bpfrx ] && [ ! -d /etc/xpf ]; then mv /etc/bpfrx /etc/xpf; elif [ -d /etc/bpfrx ] && [ -d /etc/xpf ]; then shopt -s dotglob nullglob; for f in /etc/bpfrx/*; do base=$(basename "$f"); if [ ! -e "/etc/xpf/$base" ]; then cp -a "$f" "/etc/xpf/$base"; fi; done; shopt -u dotglob nullglob; rm -rf /etc/bpfrx; fi; if [ -f /etc/xpf/bpfrx.conf ] && [ ! -f /etc/xpf/xpf.conf ]; then mv /etc/xpf/bpfrx.conf /etc/xpf/xpf.conf; fi' 2>/dev/null || true
 
 	# Stop service gracefully, then clean BPF state for binary upgrade.
 	# Order matters: systemctl stop sends SIGTERM (graceful socket close),
@@ -408,6 +408,8 @@ cmd_deploy() {
 		info "Pushing test config..."
 		incus exec "$INSTANCE_NAME" -- mkdir -p /etc/xpf
 		incus file push "${SCRIPT_DIR}/xpf-test.conf" "$INSTANCE_NAME/etc/xpf/xpf.conf"
+		# Clear configstore DB so daemon bootstraps from the new text file.
+		incus exec "$INSTANCE_NAME" -- rm -rf /etc/xpf/.configdb
 	fi
 
 	# Install systemd unit file
