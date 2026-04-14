@@ -228,6 +228,7 @@ impl Coordinator {
         self.workers.clear();
         self.identities.clear();
         self.live.clear();
+        self.cos_owner_worker_by_ifindex.clear();
         self.last_slow_path_status = self
             .slow_path
             .as_ref()
@@ -863,11 +864,11 @@ impl Coordinator {
                 if entry.interface_name.is_empty() {
                     entry.interface_name = iface.interface_name.clone();
                 }
-                if entry.owner_worker_id == 0 {
-                    entry.owner_worker_id = *self
+                if entry.owner_worker_id.is_none() {
+                    entry.owner_worker_id = self
                         .cos_owner_worker_by_ifindex
                         .get(&iface.ifindex)
-                        .unwrap_or(&0) as usize;
+                        .copied();
                 }
                 entry.shaping_rate_bytes = entry.shaping_rate_bytes.max(iface.shaping_rate_bytes);
                 entry.burst_bytes = entry.burst_bytes.max(iface.burst_bytes);
@@ -1409,7 +1410,14 @@ fn build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
 ) -> BTreeMap<i32, u32> {
     let mut owner_by_ifindex = BTreeMap::new();
     let mut next_owner_slot_by_tx_ifindex = BTreeMap::<i32, usize>::new();
-    for egress_ifindex in forwarding.cos.interfaces.keys().copied() {
+    let mut egress_ifindexes = forwarding
+        .cos
+        .interfaces
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    egress_ifindexes.sort_unstable();
+    for egress_ifindex in egress_ifindexes {
         let tx_ifindex = resolve_tx_binding_ifindex(forwarding, egress_ifindex);
         let eligible_workers = worker_binding_ifindexes
             .iter()
@@ -1474,7 +1482,7 @@ mod tests {
     #[test]
     fn build_cos_owner_worker_by_ifindex_spreads_interfaces_across_eligible_workers() {
         let mut forwarding = ForwardingState::default();
-        for ifindex in [80, 81, 82] {
+        for ifindex in [82, 80, 81] {
             forwarding.cos.interfaces.insert(
                 ifindex,
                 CoSInterfaceConfig {

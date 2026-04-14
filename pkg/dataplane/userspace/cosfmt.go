@@ -76,7 +76,7 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 		if view.interfaceState == nil {
 			b.WriteString("  Runtime:                  unavailable\n")
 		} else {
-			fmt.Fprintf(&b, "  Owner worker:             %d\n", view.interfaceState.OwnerWorkerID)
+			fmt.Fprintf(&b, "  Owner worker:             %s\n", formatOptionalWorkerID(view.interfaceState.OwnerWorkerID))
 			fmt.Fprintf(&b, "  Runtime workers:          %d\n", view.interfaceState.WorkerInstances)
 			fmt.Fprintf(&b, "  Runtime queues:           nonempty=%d runnable=%d\n",
 				view.interfaceState.NonemptyQueues,
@@ -221,6 +221,13 @@ func formatCoSRate(bytesPerSecond uint64) string {
 		unitIdx++
 	}
 	return fmt.Sprintf("%.2f %s", bitsPerSecond, units[unitIdx])
+}
+
+func formatOptionalWorkerID(workerID *uint32) string {
+	if workerID == nil {
+		return "-"
+	}
+	return fmt.Sprintf("%d", *workerID)
 }
 
 func formatCoSBytes(bytes uint64) string {
