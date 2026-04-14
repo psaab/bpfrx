@@ -296,33 +296,34 @@ type SchedulerConfig struct {
 
 // SystemConfig holds system-level configuration.
 type SystemConfig struct {
-	HostName           string
-	DomainName         string   // system domain-name (e.g. "example.com")
-	DomainSearch       []string // system domain-search (search domains)
-	TimeZone           string
-	NameServers        []string // DNS server addresses
-	NTPServers         []string // NTP server addresses
-	NTPThreshold       int      // NTP threshold in seconds (0 = default)
-	NTPThresholdAction string   // "accept" or "reject"
-	NoRedirects        bool     // disable ICMP redirects
-	BackupRouter       string   // backup default gateway IP
-	BackupRouterDst    string   // backup router destination prefix
-	Lo0FilterInputV4   string   // lo0 unit 0 family inet filter input (host-bound filtering)
-	Lo0FilterInputV6   string   // lo0 unit 0 family inet6 filter input (host-bound filtering)
-	DataplaneType      string   // "ebpf" (default), "dpdk", or "userspace"
-	DPDKDataplane      *DPDKConfig
-	UserspaceDataplane *UserspaceConfig
-	InternetOptions    *InternetOptionsConfig
-	Services           *SystemServicesConfig
-	Syslog             *SystemSyslogConfig
-	DHCPServer         DHCPServerConfig
-	SNMP               *SNMPConfig
-	Login              *LoginConfig
-	RootAuthentication *RootAuthConfig
-	Archival           *ArchivalConfig
-	MasterPassword     string   // pseudorandom-function value
-	LicenseAutoUpdate  string   // license autoupdate URL
-	DisabledProcesses  []string // processes marked "disable"
+	HostName                 string
+	DomainName               string   // system domain-name (e.g. "example.com")
+	DomainSearch             []string // system domain-search (search domains)
+	TimeZone                 string
+	NameServers              []string // DNS server addresses
+	NTPServers               []string // NTP server addresses
+	NTPThreshold             int      // NTP threshold in seconds (0 = default)
+	NTPThresholdAction       string   // "accept" or "reject"
+	NoRedirects              bool     // disable ICMP redirects
+	BackupRouter             string   // backup default gateway IP
+	BackupRouterDst          string   // backup router destination prefix
+	Lo0FilterInputV4         string   // lo0 unit 0 family inet filter input (host-bound filtering)
+	Lo0FilterInputV6         string   // lo0 unit 0 family inet6 filter input (host-bound filtering)
+	DataplaneType            string   // "ebpf" (default), "dpdk", or "userspace"
+	DPDKDataplane            *DPDKConfig
+	UserspaceDataplane       *UserspaceConfig
+	InternetOptions          *InternetOptionsConfig
+	Services                 *SystemServicesConfig
+	Syslog                   *SystemSyslogConfig
+	DHCPServer               DHCPServerConfig
+	SNMP                     *SNMPConfig
+	Login                    *LoginConfig
+	RootAuthentication       *RootAuthConfig
+	Archival                 *ArchivalConfig
+	MasterPassword           string   // pseudorandom-function value
+	LicenseAutoUpdate        string   // license autoupdate URL
+	DisabledProcesses        []string // processes marked "disable"
+	PersistGroupsInheritance bool     // system commit persist-groups-inheritance (syntax accepted, runtime no-op)
 }
 
 // DPDKConfig holds DPDK dataplane-specific configuration.
@@ -383,9 +384,10 @@ type InternetOptionsConfig struct {
 
 // SystemServicesConfig holds system services (SSH, web-management).
 type SystemServicesConfig struct {
-	SSH           *SSHServiceConfig
-	WebManagement *WebManagementConfig
-	DNSEnabled    bool // system services dns
+	SSH                *SSHServiceConfig
+	WebManagement      *WebManagementConfig
+	DNSEnabled         bool // system services dns
+	DNSProxyConfigured bool // system services dns dns-proxy (syntax accepted, runtime no-op)
 }
 
 // SSHServiceConfig holds SSH service settings.

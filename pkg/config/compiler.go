@@ -13,13 +13,29 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 	// Clone the tree before expanding groups — the caller's tree must retain
 	// groups and apply-groups nodes for display (show configuration groups).
 	tree = tree.Clone()
+	usedNodeFallback := false
 
 	// Expand groups before compilation — resolve all apply-groups references.
 	if err := tree.ExpandGroups(); err != nil {
-		return nil, fmt.Errorf("apply-groups: %w", err)
+		if strings.Contains(err.Error(), `undefined group "${node}"`) {
+			vars := map[string]string{"node": "node0"}
+			if err2 := tree.ExpandGroupsWithVars(vars); err2 != nil {
+				return nil, fmt.Errorf("apply-groups: %w", err2)
+			}
+			usedNodeFallback = true
+		} else {
+			return nil, fmt.Errorf("apply-groups: %w", err)
+		}
 	}
 
-	return compileExpanded(tree)
+	cfg, err := compileExpanded(tree)
+	if err != nil {
+		return nil, err
+	}
+	if usedNodeFallback {
+		cfg.Warnings = append(cfg.Warnings, `apply-groups "${node}" resolved using default node0 context during generic compile`)
+	}
+	return cfg, nil
 }
 
 // CompileConfigForNode is like CompileConfig but resolves ${node} variables
@@ -512,6 +528,35 @@ func ValidateConfig(cfg *Config) []string {
 	// Warn if no-reth-vrrp set explicitly — redundant since private-rg-election is now default
 	if cc := cfg.Chassis.Cluster; cc != nil && cc.PrivateRGElection && cc.NoRethVRRP {
 		warnings = append(warnings, "chassis cluster: no-reth-vrrp is redundant (private-rg-election is the default)")
+	}
+
+	if cfg.System.PersistGroupsInheritance {
+		warnings = append(warnings, "system commit persist-groups-inheritance configured but group inheritance persistence is not implemented")
+	}
+
+	if cfg.System.Services != nil && cfg.System.Services.DNSProxyConfigured {
+		warnings = append(warnings, "system services dns dns-proxy configured but DNS proxy/forwarder runtime is not implemented")
+	}
+
+	if fm := cfg.Services.FlowMonitoring; fm != nil {
+		checkExtWarning := func(kind, name string, exts []string) {
+			for _, ext := range exts {
+				if ext == "app-id" {
+					warnings = append(warnings, fmt.Sprintf(
+						"flow-monitoring %s template %s: export-extension app-id configured but application data is not available in flow records", kind, name))
+				}
+			}
+		}
+		if fm.Version9 != nil {
+			for _, tmpl := range fm.Version9.Templates {
+				checkExtWarning("version9", tmpl.Name, tmpl.ExportExtensions)
+			}
+		}
+		if fm.VersionIPFIX != nil {
+			for _, tmpl := range fm.VersionIPFIX.Templates {
+				checkExtWarning("version-ipfix", tmpl.Name, tmpl.ExportExtensions)
+			}
+		}
 	}
 
 	return warnings

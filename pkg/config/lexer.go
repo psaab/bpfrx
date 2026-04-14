@@ -243,6 +243,7 @@ func isIdentChar(ch byte) bool {
 		(ch >= '0' && ch <= '9') ||
 		ch == '-' || ch == '_' || ch == '.' ||
 		ch == '/' || ch == ':' || ch == '*' || ch == '+' ||
+		ch == '=' || ch == ',' ||
 		ch == '<' || ch == '>'
 }
 
@@ -251,5 +252,6 @@ func IsIdentRune(r rune) bool {
 	return unicode.IsLetter(r) || unicode.IsDigit(r) ||
 		r == '-' || r == '_' || r == '.' ||
 		r == '/' || r == ':' || r == '*' || r == '+' ||
+		r == '=' || r == ',' ||
 		r == '<' || r == '>'
 }

@@ -968,7 +968,7 @@ func TestDNSServiceEnabled(t *testing.T) {
 	}
 }
 
-func TestCommitPersistGroupsInheritanceRejected(t *testing.T) {
+func TestCommitPersistGroupsInheritanceWarned(t *testing.T) {
 	tests := []string{
 		`system {
     commit {
@@ -985,13 +985,61 @@ func TestCommitPersistGroupsInheritanceRejected(t *testing.T) {
 		if errs != nil {
 			t.Fatal(errs)
 		}
-		_, err := CompileConfig(tree)
-		if err == nil {
-			t.Fatalf("expected compile error for %q", input)
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("unexpected compile error for %q: %v", input, err)
 		}
-		if !strings.Contains(err.Error(), "persist-groups-inheritance") {
-			t.Fatalf("CompileConfig() error = %v, want persist-groups-inheritance", err)
+		if !cfg.System.PersistGroupsInheritance {
+			t.Fatalf("expected PersistGroupsInheritance to be recorded for %q", input)
 		}
+		found := false
+		for _, w := range cfg.Warnings {
+			if strings.Contains(w, "persist-groups-inheritance") {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("expected persist-groups-inheritance warning for %q, got %v", input, cfg.Warnings)
+		}
+	}
+}
+
+func TestDNSProxyWarned(t *testing.T) {
+	input := `system {
+    services {
+        dns {
+            dns-proxy {
+                default-domain *;
+                forwarders {
+                    1.1.1.1;
+                }
+            }
+        }
+    }
+}`
+	p := NewParser(input)
+	tree, errs := p.Parse()
+	if errs != nil {
+		t.Fatal(errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	if cfg.System.Services == nil || !cfg.System.Services.DNSEnabled {
+		t.Fatal("expected DNS service to remain enabled")
+	}
+	if !cfg.System.Services.DNSProxyConfigured {
+		t.Fatal("expected DNSProxyConfigured to be recorded")
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "dns-proxy") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected dns-proxy warning, got %v", cfg.Warnings)
 	}
 }
 
