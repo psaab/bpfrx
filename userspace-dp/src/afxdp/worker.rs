@@ -391,6 +391,7 @@ pub(crate) fn worker_loop(
     last_resolution: Arc<Mutex<Option<PacketResolution>>>,
     commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
     peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    worker_commands_by_id: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>>,
     stop: Arc<AtomicBool>,
     heartbeat: Arc<AtomicU64>,
     session_export_ack: Arc<AtomicU64>,
@@ -399,6 +400,7 @@ pub(crate) fn worker_loop(
     shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
     event_stream: Option<crate::event_stream::EventStreamWorkerHandle>,
     rg_epochs: Arc<[AtomicU32; MAX_RG_EPOCHS]>,
+    cos_owner_worker_by_ifindex: Arc<BTreeMap<i32, u32>>,
     cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
 ) {
     pin_current_thread(worker_id);
@@ -604,10 +606,24 @@ pub(crate) fn worker_loop(
             WorkerCommandResults {
                 cancelled_keys: Vec::new(),
                 exported_sequences: Vec::new(),
+                shaped_tx_requests: Vec::new(),
             }
         };
-        if !command_results.cancelled_keys.is_empty() {
-            for key in &command_results.cancelled_keys {
+        let WorkerCommandResults {
+            cancelled_keys,
+            exported_sequences,
+            shaped_tx_requests,
+        } = command_results;
+        if !shaped_tx_requests.is_empty() {
+            apply_worker_shaped_tx_requests(
+                &mut bindings,
+                forwarding.as_ref(),
+                loop_now_ns,
+                shaped_tx_requests,
+            );
+        }
+        if !cancelled_keys.is_empty() {
+            for key in &cancelled_keys {
                 for binding in bindings.iter_mut() {
                     cancel_queued_flow_on_binding(binding, key, key);
                 }
@@ -702,12 +718,15 @@ pub(crate) fn worker_loop(
                 &recent_session_deltas,
                 &last_resolution,
                 &peer_worker_commands,
+                worker_id,
+                worker_commands_by_id.as_ref(),
                 &mut shared_recycles,
                 &dnat_fds,
                 conntrack_v4_fd,
                 conntrack_v6_fd,
                 &mut dbg_poll,
                 &rg_epochs,
+                cos_owner_worker_by_ifindex.as_ref(),
             ) {
                 did_work = true;
             }
@@ -782,7 +801,7 @@ pub(crate) fn worker_loop(
             )));
             last_cos_status_ns = loop_now_ns;
         }
-        if !command_results.exported_sequences.is_empty() {
+        if !exported_sequences.is_empty() {
             while sessions.has_pending_deltas() {
                 let deltas = sessions.drain_deltas(256);
                 purge_queued_flows_for_closed_deltas(&mut bindings, &deltas);
@@ -806,7 +825,7 @@ pub(crate) fn worker_loop(
                     );
                 }
             }
-            if let Some(sequence) = command_results.exported_sequences.iter().copied().max() {
+            if let Some(sequence) = exported_sequences.iter().copied().max() {
                 session_export_ack.store(sequence, Ordering::Release);
             }
         } else if sessions.has_pending_deltas() {
@@ -1289,6 +1308,30 @@ pub(crate) fn worker_loop(
         forwarding.as_ref(),
     )));
     heartbeat.store(monotonic_nanos(), Ordering::Relaxed);
+}
+
+fn apply_worker_shaped_tx_requests(
+    bindings: &mut [BindingWorker],
+    forwarding: &ForwardingState,
+    now_ns: u64,
+    requests: Vec<TxRequest>,
+) {
+    for req in requests {
+        let tx_ifindex = resolve_tx_binding_ifindex(forwarding, req.egress_ifindex);
+        let Some(binding) = bindings
+            .iter_mut()
+            .find(|binding| binding.ifindex == tx_ifindex)
+        else {
+            continue;
+        };
+        match enqueue_local_into_cos(binding, forwarding, req, now_ns) {
+            Ok(()) => {}
+            Err(req) => {
+                binding.pending_tx_local.push_back(req);
+                bound_pending_tx_local(binding);
+            }
+        }
+    }
 }
 
 fn build_worker_cos_statuses(

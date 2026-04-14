@@ -573,14 +573,21 @@ impl Coordinator {
         self.conntrack_v6_fd = conntrack_v6_fd;
         self.dnat_table_fd = dnat_table_fd;
         self.dnat_table_v6_fd = dnat_table_v6_fd;
-        let worker_command_queues: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = workers
-            .keys()
-            .copied()
-            .map(|worker_id| (worker_id, Arc::new(Mutex::new(VecDeque::new()))))
-            .collect();
+        let cos_owner_worker_by_ifindex = Arc::new(build_cos_owner_worker_by_ifindex(
+            &self.forwarding,
+            &workers,
+        ));
+        let worker_command_queues: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>> =
+            Arc::new(
+                workers
+                    .keys()
+                    .copied()
+                    .map(|worker_id| (worker_id, Arc::new(Mutex::new(VecDeque::new()))))
+                    .collect(),
+            );
         let replayed_synced_sessions = self.replay_synced_sessions(
             &preserved_synced_sessions,
-            &worker_command_queues,
+            worker_command_queues.as_ref(),
             session_map_raw_fd,
         );
         if replayed_synced_sessions > 0 {
@@ -620,6 +627,7 @@ impl Coordinator {
                 .filter(|(id, _)| **id != worker_id)
                 .map(|(_, queue)| queue.clone())
                 .collect::<Vec<_>>();
+            let worker_commands_by_id = worker_command_queues.clone();
             let ha_state = self.ha_state.clone();
             let dynamic_neighbors = self.dynamic_neighbors.clone();
             let worker_poll_mode = self.poll_mode;
@@ -627,6 +635,7 @@ impl Coordinator {
             let rg_epochs = self.rg_epochs.clone();
             let event_stream_handle = self.event_stream_worker_handle();
             let cos_status_clone = cos_status.clone();
+            let cos_owner_worker_by_ifindex = cos_owner_worker_by_ifindex.clone();
             let join = thread::Builder::new()
                 .name(format!("xpf-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -648,6 +657,7 @@ impl Coordinator {
                         last_resolution,
                         commands_clone,
                         peer_commands_clone,
+                        worker_commands_by_id,
                         stop_clone,
                         heartbeat_clone,
                         session_export_ack_clone,
@@ -656,6 +666,7 @@ impl Coordinator {
                         shared_fabrics,
                         event_stream_handle,
                         rg_epochs,
+                        cos_owner_worker_by_ifindex,
                         cos_status_clone,
                     );
                 });
@@ -1361,5 +1372,85 @@ impl Coordinator {
                 binding.ready = false;
             }
         }
+    }
+}
+
+fn build_cos_owner_worker_by_ifindex(
+    forwarding: &ForwardingState,
+    workers: &BTreeMap<u32, Vec<BindingPlan>>,
+) -> BTreeMap<i32, u32> {
+    let worker_binding_ifindexes = workers
+        .iter()
+        .map(|(worker_id, binding_plans)| {
+            (
+                *worker_id,
+                binding_plans
+                    .iter()
+                    .map(|plan| plan.status.ifindex)
+                    .collect::<std::collections::BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    build_cos_owner_worker_by_ifindex_from_binding_ifindexes(forwarding, &worker_binding_ifindexes)
+}
+
+fn build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
+    forwarding: &ForwardingState,
+    worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,
+) -> BTreeMap<i32, u32> {
+    let mut owner_by_ifindex = BTreeMap::new();
+    for egress_ifindex in forwarding.cos.interfaces.keys().copied() {
+        let tx_ifindex = resolve_tx_binding_ifindex(forwarding, egress_ifindex);
+        for (worker_id, ifindexes) in worker_binding_ifindexes {
+            if ifindexes.contains(&tx_ifindex) {
+                owner_by_ifindex.insert(egress_ifindex, *worker_id);
+                break;
+            }
+        }
+    }
+    owner_by_ifindex
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_cos_owner_worker_by_ifindex_prefers_lowest_worker_with_tx_binding() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 1_000_000,
+                burst_bytes: 64 * 1024,
+                default_queue: 0,
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![],
+            },
+        );
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".to_string(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+        let worker_binding_ifindexes = BTreeMap::from([
+            (2, std::collections::BTreeSet::from([12])),
+            (7, std::collections::BTreeSet::from([12, 13])),
+        ]);
+
+        let owner_by_ifindex = build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
+            &forwarding,
+            &worker_binding_ifindexes,
+        );
+
+        assert_eq!(owner_by_ifindex.get(&80), Some(&2));
     }
 }

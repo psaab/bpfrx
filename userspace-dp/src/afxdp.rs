@@ -265,12 +265,15 @@ fn poll_binding(
     _recent_session_deltas: &Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
     peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    worker_id: u32,
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
     shared_recycles: &mut Vec<(u32, u64)>,
     dnat_fds: &DnatTableFds,
     conntrack_v4_fd: c_int,
     conntrack_v6_fd: c_int,
     dbg: &mut DebugPollCounters,
     rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
+    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
 ) -> bool {
     #[derive(Default)]
     struct BatchCounters {
@@ -363,7 +366,15 @@ fn poll_binding(
     };
     let area = binding.umem.area() as *const MmapArea;
     maybe_touch_heartbeat(binding, now_ns);
-    let tx_work = drain_pending_tx(binding, now_ns, shared_recycles, forwarding);
+    let tx_work = drain_pending_tx(
+        binding,
+        now_ns,
+        shared_recycles,
+        forwarding,
+        worker_id,
+        worker_commands_by_id,
+        cos_owner_worker_by_ifindex,
+    );
     apply_shared_recycles(
         left,
         binding_index,
@@ -384,7 +395,15 @@ fn poll_binding(
         if tx_backlog >= binding.max_pending_tx {
             binding.dbg_backpressure += 1;
             // Try to drain TX first — completions free frames for both TX and fill.
-            let _ = drain_pending_tx(binding, now_ns, shared_recycles, forwarding);
+            let _ = drain_pending_tx(
+                binding,
+                now_ns,
+                shared_recycles,
+                forwarding,
+                worker_id,
+                worker_commands_by_id,
+                cos_owner_worker_by_ifindex,
+            );
             apply_shared_recycles(
                 left,
                 binding_index,

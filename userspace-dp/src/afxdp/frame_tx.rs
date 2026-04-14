@@ -170,7 +170,12 @@ pub(super) fn enqueue_pending_forwards(
                 }
                 copied_source_frame = true;
                 if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE {
-                    let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
+                    let _ = drain_pending_tx_local_owner(
+                        target_binding,
+                        now_ns,
+                        post_recycles,
+                        forwarding,
+                    );
                 }
             } else if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
                 source_frame,
@@ -228,7 +233,12 @@ pub(super) fn enqueue_pending_forwards(
                 }
                 copied_source_frame = true;
                 if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
-                    let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
+                    let _ = drain_pending_tx_local_owner(
+                        target_binding,
+                        now_ns,
+                        post_recycles,
+                        forwarding,
+                    );
                 }
             }
             // Track when segmentation was needed but returned None
@@ -404,7 +414,12 @@ pub(super) fn enqueue_pending_forwards(
                             || !target_binding.pending_tx_prepared.is_empty()
                             || !target_binding.pending_tx_local.is_empty())
                     {
-                        let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
+                        let _ = drain_pending_tx_local_owner(
+                            target_binding,
+                            now_ns,
+                            post_recycles,
+                            forwarding,
+                        );
                         direct_tx_offset = target_binding.free_tx_frames.pop_front();
                     }
                     let mut direct_tx_fallback_reason = None;
@@ -625,7 +640,8 @@ pub(super) fn enqueue_pending_forwards(
             if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE
                 || target_binding.pending_tx_local.len() >= TX_BATCH_SIZE
             {
-                let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
+                let _ =
+                    drain_pending_tx_local_owner(target_binding, now_ns, post_recycles, forwarding);
             }
         }
         if !post_recycles.is_empty() {
@@ -1069,7 +1085,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
             || !target_binding.pending_tx_prepared.is_empty()
             || !target_binding.pending_tx_local.is_empty())
     {
-        let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
+        let _ = drain_pending_tx_local_owner(target_binding, now_ns, post_recycles, forwarding);
     }
     if target_binding.free_tx_frames.len() < segment_count {
         return None;

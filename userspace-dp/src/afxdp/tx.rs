@@ -184,6 +184,9 @@ pub(super) fn drain_pending_tx(
     now_ns: u64,
     shared_recycles: &mut Vec<(u32, u64)>,
     forwarding: &ForwardingState,
+    worker_id: u32,
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
 ) -> bool {
     if !binding_has_pending_tx_work(binding) {
         return false;
@@ -198,7 +201,14 @@ pub(super) fn drain_pending_tx(
     {
         maybe_wake_tx(binding, false, now_ns);
     }
-    ingest_cos_pending_tx(binding, forwarding, now_ns);
+    ingest_cos_pending_tx(
+        binding,
+        forwarding,
+        now_ns,
+        worker_id,
+        worker_commands_by_id,
+        cos_owner_worker_by_ifindex,
+    );
     while drain_shaped_tx(binding, now_ns, shared_recycles) {
         did_work = true;
     }
@@ -298,7 +308,33 @@ fn binding_has_pending_tx_work(binding: &BindingWorker) -> bool {
         || binding.cos_nonempty_interfaces > 0
 }
 
-fn ingest_cos_pending_tx(binding: &mut BindingWorker, forwarding: &ForwardingState, now_ns: u64) {
+pub(super) fn drain_pending_tx_local_owner(
+    binding: &mut BindingWorker,
+    now_ns: u64,
+    shared_recycles: &mut Vec<(u32, u64)>,
+    forwarding: &ForwardingState,
+) -> bool {
+    let empty_worker_commands = BTreeMap::new();
+    let empty_owner_by_ifindex = BTreeMap::new();
+    drain_pending_tx(
+        binding,
+        now_ns,
+        shared_recycles,
+        forwarding,
+        binding.worker_id,
+        &empty_worker_commands,
+        &empty_owner_by_ifindex,
+    )
+}
+
+fn ingest_cos_pending_tx(
+    binding: &mut BindingWorker,
+    forwarding: &ForwardingState,
+    now_ns: u64,
+    worker_id: u32,
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
+) {
     if forwarding.cos.interfaces.is_empty() {
         return;
     }
@@ -306,6 +342,16 @@ fn ingest_cos_pending_tx(binding: &mut BindingWorker, forwarding: &ForwardingSta
     if !binding.pending_tx_prepared.is_empty() {
         let mut kept = VecDeque::with_capacity(binding.pending_tx_prepared.len());
         while let Some(req) = binding.pending_tx_prepared.pop_front() {
+            let req = match redirect_prepared_cos_request_to_owner(
+                binding,
+                req,
+                worker_id,
+                worker_commands_by_id,
+                cos_owner_worker_by_ifindex,
+            ) {
+                Ok(()) => continue,
+                Err(req) => req,
+            };
             match enqueue_prepared_into_cos(binding, forwarding, req, now_ns) {
                 Ok(()) => {}
                 Err(req) => kept.push_back(req),
@@ -319,6 +365,15 @@ fn ingest_cos_pending_tx(binding: &mut BindingWorker, forwarding: &ForwardingSta
     let mut pending = merge_pending_tx_requests(local, shared);
     let mut kept = VecDeque::with_capacity(pending.len());
     while let Some(req) = pending.pop_front() {
+        let req = match redirect_local_cos_request_to_owner(
+            req,
+            worker_id,
+            worker_commands_by_id,
+            cos_owner_worker_by_ifindex,
+        ) {
+            Ok(()) => continue,
+            Err(req) => req,
+        };
         match enqueue_local_into_cos(binding, forwarding, req, now_ns) {
             Ok(()) => {}
             Err(req) => kept.push_back(req),
@@ -326,6 +381,87 @@ fn ingest_cos_pending_tx(binding: &mut BindingWorker, forwarding: &ForwardingSta
     }
     binding.pending_tx_local = kept;
     bound_pending_tx_local(binding);
+}
+
+fn cos_owner_worker_for_egress_ifindex(
+    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
+    egress_ifindex: i32,
+    current_worker_id: u32,
+) -> u32 {
+    cos_owner_worker_by_ifindex
+        .get(&egress_ifindex)
+        .copied()
+        .unwrap_or(current_worker_id)
+}
+
+fn redirect_local_cos_request_to_owner(
+    req: TxRequest,
+    current_worker_id: u32,
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
+) -> Result<(), TxRequest> {
+    let owner_worker_id = cos_owner_worker_for_egress_ifindex(
+        cos_owner_worker_by_ifindex,
+        req.egress_ifindex,
+        current_worker_id,
+    );
+    if owner_worker_id == current_worker_id {
+        return Err(req);
+    }
+    let Some(commands) = worker_commands_by_id.get(&owner_worker_id) else {
+        return Err(req);
+    };
+    if let Ok(mut pending) = commands.lock() {
+        pending.push_back(WorkerCommand::EnqueueShapedLocal(req));
+        return Ok(());
+    }
+    Err(req)
+}
+
+fn redirect_prepared_cos_request_to_owner(
+    binding: &mut BindingWorker,
+    req: PreparedTxRequest,
+    current_worker_id: u32,
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
+) -> Result<(), PreparedTxRequest> {
+    let owner_worker_id = cos_owner_worker_for_egress_ifindex(
+        cos_owner_worker_by_ifindex,
+        req.egress_ifindex,
+        current_worker_id,
+    );
+    if owner_worker_id == current_worker_id {
+        return Err(req);
+    }
+    let Some(frame) = binding
+        .umem
+        .area()
+        .slice(req.offset as usize, req.len as usize)
+        .map(|frame| frame.to_vec())
+    else {
+        return Err(req);
+    };
+    let local_req = TxRequest {
+        bytes: frame,
+        expected_ports: req.expected_ports,
+        expected_addr_family: req.expected_addr_family,
+        expected_protocol: req.expected_protocol,
+        flow_key: req.flow_key.clone(),
+        egress_ifindex: req.egress_ifindex,
+        cos_queue_id: req.cos_queue_id,
+    };
+    if redirect_local_cos_request_to_owner(
+        local_req,
+        current_worker_id,
+        worker_commands_by_id,
+        cos_owner_worker_by_ifindex,
+    )
+    .is_ok()
+    {
+        recycle_prepared_immediately(binding, &req);
+        return Ok(());
+    }
+    Err(req)
 }
 
 fn drain_shaped_tx(
@@ -895,7 +1031,7 @@ pub(super) fn resolve_cos_queue_id(
     Some(iface.default_queue)
 }
 
-fn enqueue_local_into_cos(
+pub(super) fn enqueue_local_into_cos(
     binding: &mut BindingWorker,
     forwarding: &ForwardingState,
     req: TxRequest,
@@ -1723,6 +1859,40 @@ mod tests {
         let merged = merge_pending_tx_requests(VecDeque::new(), shared);
         let bytes: Vec<Vec<u8>> = merged.into_iter().map(|req| req.bytes).collect();
         assert_eq!(bytes, vec![vec![9]]);
+    }
+
+    #[test]
+    fn redirect_local_cos_request_to_owner_pushes_worker_command() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let worker_commands_by_id = BTreeMap::from([(7, commands.clone())]);
+        let cos_owner_worker_by_ifindex = BTreeMap::from([(80, 7)]);
+        let req = TxRequest {
+            bytes: vec![1, 2, 3],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(4),
+        };
+
+        let redirected = redirect_local_cos_request_to_owner(
+            req,
+            2,
+            &worker_commands_by_id,
+            &cos_owner_worker_by_ifindex,
+        );
+
+        assert!(redirected.is_ok());
+        let pending = commands.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        match pending.front() {
+            Some(WorkerCommand::EnqueueShapedLocal(req)) => {
+                assert_eq!(req.egress_ifindex, 80);
+                assert_eq!(req.cos_queue_id, Some(4));
+            }
+            other => panic!("unexpected command queued: {other:?}"),
+        }
     }
 
     #[test]
