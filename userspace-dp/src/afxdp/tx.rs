@@ -409,7 +409,7 @@ fn select_cos_guarantee_batch(root: &mut CoSInterfaceRuntime, now_ns: u64) -> Op
                 queue.transmit_rate_bytes,
                 head_len,
                 now_ns,
-                true,
+                queue.exact,
             ) {
                 park_cos_queue(root, queue_idx, wake_tick);
             }
@@ -2309,6 +2309,24 @@ mod tests {
 
         assert!(select_cos_guarantee_batch(&mut root, 1).is_none());
         assert!(select_cos_surplus_batch(&mut root, 1).is_none());
+    }
+
+    #[test]
+    fn guarantee_phase_parks_non_exact_queue_on_root_only_wakeup() {
+        let mut root = test_cos_runtime_with_exact(false);
+        root.last_refill_ns = 1;
+        root.tokens = 0;
+        root.queues[0].last_refill_ns = 1;
+        root.queues[0].tokens = 0;
+        root.queues[0].items.push_back(test_cos_item(1500));
+        root.queues[0].queued_bytes = 1500;
+        root.queues[0].runnable = true;
+        root.nonempty_queues = 1;
+        root.runnable_queues = 1;
+
+        assert!(select_cos_guarantee_batch(&mut root, 1).is_none());
+        assert!(root.queues[0].parked);
+        assert_eq!(root.queues[0].next_wakeup_tick, 30);
     }
 
     #[test]
