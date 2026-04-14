@@ -4161,11 +4161,33 @@ func TestParseBandwidthBps(t *testing.T) {
 	tests := []struct {
 		input string
 		want  uint64
-	}{{"1g", 1000000000}, {"10G", 10000000000}, {"100m", 100000000}, {"500k", 500000}, {"10000", 10000}, {"", 0}, {"abc", 0}}
+	}{{"1g", 1000000000}, {"10G", 10000000000}, {"100m", 100000000}, {"500k", 500000}, {"10000", 10000}, {"10.0g", 10000000000}, {"12.5g", 12500000000}, {"", 0}, {"abc", 0}}
 	for _, tc := range tests {
 		got := parseBandwidthBps(tc.input)
 		if got != tc.want {
 			t.Errorf("parseBandwidthBps(%q) = %d, want %d", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestParseBandwidthLimit(t *testing.T) {
+	tests := []struct {
+		input string
+		want  uint64
+	}{
+		{"1g", 125000000},
+		{"10.0g", 1250000000},
+		{"12.5g", 1562500000},
+		{"100m", 12500000},
+		{"500k", 62500},
+		{"10000", 1250},
+		{"", 0},
+		{"abc", 0},
+	}
+	for _, tc := range tests {
+		got := parseBandwidthLimit(tc.input)
+		if got != tc.want {
+			t.Errorf("parseBandwidthLimit(%q) = %d, want %d", tc.input, got, tc.want)
 		}
 	}
 }

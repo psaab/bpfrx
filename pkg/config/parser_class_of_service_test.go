@@ -170,6 +170,42 @@ func TestCompileClassOfServiceInlineTransmitRateExactSyntax(t *testing.T) {
 	}
 }
 
+func TestCompileClassOfServiceDecimalTransmitRateExactSyntax(t *testing.T) {
+	lines := []string{
+		"set class-of-service forwarding-classes queue 4 iperf-a",
+		"set class-of-service schedulers iperf-a transmit-rate 10.0g",
+		"set class-of-service schedulers iperf-a transmit-rate exact",
+		"set class-of-service scheduler-maps edge-map forwarding-class iperf-a scheduler iperf-a",
+		"set class-of-service interfaces ge-0/0/2 unit 80 shaping-rate 20g",
+		"set class-of-service interfaces ge-0/0/2 unit 80 scheduler-map edge-map",
+		"set system dataplane-type userspace",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	sched := cfg.ClassOfService.Schedulers["iperf-a"]
+	if sched == nil {
+		t.Fatal("expected iperf-a scheduler")
+	}
+	if got := sched.TransmitRateBytes; got != parseBandwidthLimit("10.0g") {
+		t.Fatalf("transmit-rate = %d, want %d", got, parseBandwidthLimit("10.0g"))
+	}
+	if !sched.TransmitRateExact {
+		t.Fatal("expected transmit-rate exact")
+	}
+}
+
 func TestValidateClassOfServiceWarnings(t *testing.T) {
 	input := `class-of-service {
     forwarding-classes {

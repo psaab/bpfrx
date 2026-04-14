@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"net"
 	"strconv"
 	"strings"
@@ -833,52 +834,13 @@ func peerFromPointToPoint(cidr string) string {
 // parseBandwidthBps parses a Junos bandwidth value and returns bits per second.
 // "1g" = 1,000,000,000; "100m" = 100,000,000; "500k" = 500,000; plain number = bps.
 func parseBandwidthBps(s string) uint64 {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0
-	}
-	multiplier := uint64(1)
-	if strings.HasSuffix(s, "g") || strings.HasSuffix(s, "G") {
-		multiplier = 1000000000
-		s = s[:len(s)-1]
-	} else if strings.HasSuffix(s, "m") || strings.HasSuffix(s, "M") {
-		multiplier = 1000000
-		s = s[:len(s)-1]
-	} else if strings.HasSuffix(s, "k") || strings.HasSuffix(s, "K") {
-		multiplier = 1000
-		s = s[:len(s)-1]
-	}
-	v, err := strconv.ParseUint(s, 10, 64)
-	if err != nil {
-		return 0
-	}
-	return v * multiplier
+	return parseScaledDecimalUnit(s)
 }
 
 // parseBandwidthLimit parses a Junos bandwidth-limit value (in bits/sec) to bytes/sec.
 // "1m" = 1,000,000 bps = 125,000 bytes/s; "10g" = 10 Gbps; "500k" = 500,000 bps; plain number = bps.
 func parseBandwidthLimit(s string) uint64 {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return 0
-	}
-	multiplier := uint64(1)
-	if strings.HasSuffix(s, "g") || strings.HasSuffix(s, "G") {
-		multiplier = 1000000000
-		s = s[:len(s)-1]
-	} else if strings.HasSuffix(s, "m") || strings.HasSuffix(s, "M") {
-		multiplier = 1000000
-		s = s[:len(s)-1]
-	} else if strings.HasSuffix(s, "k") || strings.HasSuffix(s, "K") {
-		multiplier = 1000
-		s = s[:len(s)-1]
-	}
-	v, err := strconv.ParseUint(s, 10, 64)
-	if err != nil {
-		return 0
-	}
-	// Junos bandwidth-limit is in bits/sec; convert to bytes/sec
-	return (v * multiplier) / 8
+	return parseScaledDecimalUnit(s) / 8
 }
 
 // parseBurstSizeLimit parses a Junos burst-size-limit value (in bytes).
@@ -905,4 +867,27 @@ func parseBurstSizeLimit(s string) uint64 {
 	}
 	// burst-size-limit is already in bytes
 	return v * multiplier
+}
+
+func parseScaledDecimalUnit(s string) uint64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	multiplier := 1.0
+	if strings.HasSuffix(s, "g") || strings.HasSuffix(s, "G") {
+		multiplier = 1000000000
+		s = s[:len(s)-1]
+	} else if strings.HasSuffix(s, "m") || strings.HasSuffix(s, "M") {
+		multiplier = 1000000
+		s = s[:len(s)-1]
+	} else if strings.HasSuffix(s, "k") || strings.HasSuffix(s, "K") {
+		multiplier = 1000
+		s = s[:len(s)-1]
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v < 0 {
+		return 0
+	}
+	return uint64(math.Round(v * multiplier))
 }
