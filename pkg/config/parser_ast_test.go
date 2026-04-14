@@ -3232,12 +3232,21 @@ func TestCompileConfigForNodeBackwardCompat(t *testing.T) {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
 	}
-	_, err := CompileConfig(tree)
-	if err == nil {
-		t.Fatal("expected error from CompileConfig with ${node} reference")
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig() unexpected error: %v", err)
 	}
-	if !strings.Contains(err.Error(), `"${node}"`) {
-		t.Errorf("error should mention ${node}, got: %v", err)
+	if cfg.System.HostName != "fw0" {
+		t.Fatalf("hostname = %q, want fw0", cfg.System.HostName)
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, `"${node}"`) && strings.Contains(w, "node0") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected node placeholder warning, got %v", cfg.Warnings)
 	}
 }
 
@@ -3751,6 +3760,38 @@ func TestApplyGroupsVsrxHAConf(t *testing.T) {
 		t.Errorf("expected many policies from group expansion, got %d", totalPolicies)
 	}
 	t.Logf("compiled %d zone pairs with %d total policies", len(cfg.Security.Policies), totalPolicies)
+}
+
+func TestCompileLocalVsrxConf(t *testing.T) {
+	data, err := os.ReadFile("../../vsrx.conf")
+	if err != nil {
+		t.Skipf("vsrx.conf not found: %v", err)
+	}
+	tree, errs := NewParser(string(data)).Parse()
+	if len(errs) > 0 {
+		t.Logf("parse warnings (%d): %v", len(errs), errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile vsrx.conf: %v", err)
+	}
+	if len(cfg.Warnings) == 0 {
+		t.Log("compiled vsrx.conf with no warnings")
+	}
+}
+
+func TestParserAcceptsSSHKnownHostTokens(t *testing.T) {
+	input := `system {
+    ssh-known-hosts {
+        host skull.sf.saab.org,2001:559:8585:100::253 {
+            ecdsa-sha2-nistp256-key AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBOzePLJ+YX/jjDmcAr2E4oB/RJ/6aCPsl39581dbjpCEDhdW6ahp+JDUUsHsHkYdJ0qw6cG8qlUbjezKfB3O4Rw=;
+        }
+    }
+}`
+	_, errs := NewParser(input).Parse()
+	if len(errs) > 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
 }
 
 func TestAnnotationFormatText(t *testing.T) {

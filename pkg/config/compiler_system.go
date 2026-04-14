@@ -1,9 +1,6 @@
 package config
 
-import (
-	"fmt"
-	"strconv"
-)
+import "strconv"
 
 func compileSystem(node *Node, sys *SystemConfig) error {
 	for _, child := range node.Children {
@@ -117,11 +114,11 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 		case "commit":
 			for _, key := range child.Keys[1:] {
 				if key == "persist-groups-inheritance" {
-					return fmt.Errorf("system commit persist-groups-inheritance: unsupported")
+					sys.PersistGroupsInheritance = true
 				}
 			}
 			if child.FindChild("persist-groups-inheritance") != nil {
-				return fmt.Errorf("system commit persist-groups-inheritance: unsupported")
+				sys.PersistGroupsInheritance = true
 			}
 		case "root-authentication":
 			sys.RootAuthentication = &RootAuthConfig{}
@@ -263,11 +260,14 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 			}
 		}
 		// DNS service
-		if svcNode.FindChild("dns") != nil {
+		if dnsNode := svcNode.FindChild("dns"); dnsNode != nil {
 			if sys.Services == nil {
 				sys.Services = &SystemServicesConfig{}
 			}
 			sys.Services.DNSEnabled = true
+			if hasDNSProxyChild(dnsNode) {
+				sys.Services.DNSProxyConfigured = true
+			}
 		}
 		// Web management
 		if wmNode := svcNode.FindChild("web-management"); wmNode != nil {
@@ -316,6 +316,15 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 	}
 
 	return nil
+}
+
+func hasDNSProxyChild(node *Node) bool {
+	for _, child := range node.Children {
+		if child.Name() == "dns-proxy" {
+			return true
+		}
+	}
+	return false
 }
 
 func compileDPDKDataplane(node *Node, cfg *DPDKConfig) error {

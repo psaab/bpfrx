@@ -1006,8 +1006,28 @@ func TestV9ExportExtensions(t *testing.T) {
 	if len(errs) > 0 {
 		t.Fatalf("parse errors: %v", errs)
 	}
-	if _, err := CompileConfig(tree); err == nil || !strings.Contains(err.Error(), "export-extension app-id unsupported") {
-		t.Fatalf("expected unsupported app-id error, got %v", err)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	if cfg.Services.FlowMonitoring == nil || cfg.Services.FlowMonitoring.Version9 == nil {
+		t.Fatal("expected Version9 to be non-nil")
+	}
+	tmpl := cfg.Services.FlowMonitoring.Version9.Templates["v9-ext"]
+	if tmpl == nil {
+		t.Fatal("expected template v9-ext")
+	}
+	if len(tmpl.ExportExtensions) != 2 {
+		t.Fatalf("expected 2 export extensions, got %d: %v", len(tmpl.ExportExtensions), tmpl.ExportExtensions)
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "app-id") && strings.Contains(w, "v9-ext") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected app-id warning, got %v", cfg.Warnings)
 	}
 	tree2 := &ConfigTree{}
 	setCommands := []string{"set services flow-monitoring version9 template v9-set2 flow-active-timeout 90", "set services flow-monitoring version9 template v9-set2 ipv4-template export-extension flow-dir", "set services flow-monitoring version9 template v9-set2 ipv6-template export-extension flow-dir"}
@@ -1036,7 +1056,7 @@ func TestV9ExportExtensions(t *testing.T) {
 	}
 }
 
-func TestIPFIXExportExtensionsRejectUnsupportedAppID(t *testing.T) {
+func TestIPFIXExportExtensionsWarnUnsupportedAppID(t *testing.T) {
 	input := `services {
     flow-monitoring {
         version-ipfix {
@@ -1054,8 +1074,18 @@ func TestIPFIXExportExtensionsRejectUnsupportedAppID(t *testing.T) {
 	if len(errs) > 0 {
 		t.Fatalf("parse errors: %v", errs)
 	}
-	if _, err := CompileConfig(tree); err == nil || !strings.Contains(err.Error(), "export-extension app-id unsupported") {
-		t.Fatalf("expected unsupported app-id error, got %v", err)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("unexpected compile error: %v", err)
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "app-id") && strings.Contains(w, "ipfix-ext") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected app-id warning, got %v", cfg.Warnings)
 	}
 }
 
