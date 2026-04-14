@@ -122,13 +122,15 @@ type InterfaceSnapshot struct {
 	CoSBurstSize              uint64                     `json:"cos_shaping_burst_bytes,omitempty"`
 	CoSSchedulerMap           string                     `json:"cos_scheduler_map,omitempty"`
 	CoSDSCPClassifier         string                     `json:"cos_dscp_classifier,omitempty"`
+	CoSIEEE8021Classifier     string                     `json:"cos_ieee8021_classifier,omitempty"`
 }
 
 type ClassOfServiceSnapshot struct {
-	ForwardingClasses []CoSForwardingClassSnapshot `json:"forwarding_classes,omitempty"`
-	DSCPClassifiers   []CoSDSCPClassifierSnapshot  `json:"dscp_classifiers,omitempty"`
-	Schedulers        []CoSSchedulerSnapshot       `json:"schedulers,omitempty"`
-	SchedulerMaps     []CoSSchedulerMapSnapshot    `json:"scheduler_maps,omitempty"`
+	ForwardingClasses   []CoSForwardingClassSnapshot    `json:"forwarding_classes,omitempty"`
+	DSCPClassifiers     []CoSDSCPClassifierSnapshot     `json:"dscp_classifiers,omitempty"`
+	IEEE8021Classifiers []CoSIEEE8021ClassifierSnapshot `json:"ieee8021_classifiers,omitempty"`
+	Schedulers          []CoSSchedulerSnapshot          `json:"schedulers,omitempty"`
+	SchedulerMaps       []CoSSchedulerMapSnapshot       `json:"scheduler_maps,omitempty"`
 }
 
 type CoSForwardingClassSnapshot struct {
@@ -145,6 +147,17 @@ type CoSDSCPClassifierEntrySnapshot struct {
 	ForwardingClass string  `json:"forwarding_class,omitempty"`
 	LossPriority    string  `json:"loss_priority,omitempty"`
 	DSCPValues      []uint8 `json:"dscp_values,omitempty"`
+}
+
+type CoSIEEE8021ClassifierSnapshot struct {
+	Name    string                               `json:"name"`
+	Entries []CoSIEEE8021ClassifierEntrySnapshot `json:"entries,omitempty"`
+}
+
+type CoSIEEE8021ClassifierEntrySnapshot struct {
+	ForwardingClass string  `json:"forwarding_class,omitempty"`
+	LossPriority    string  `json:"loss_priority,omitempty"`
+	CodePoints      []uint8 `json:"code_points,omitempty"`
 }
 
 type CoSSchedulerSnapshot struct {

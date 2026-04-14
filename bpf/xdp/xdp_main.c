@@ -60,6 +60,7 @@ int xdp_main_prog(struct xdp_md *ctx)
 	void *data     = (void *)(long)ctx->data;
 	void *data_end = (void *)(long)ctx->data_end;
 	__u16 l3_offset, eth_proto, vlan_id = 0;
+	__u8 vlan_pcp = 0, vlan_present = 0;
 
 	/* Look up interface zone config early — needed for tunnel
 	 * detection and native_xdp flag. */
@@ -102,7 +103,8 @@ int xdp_main_prog(struct xdp_md *ctx)
 	}
 
 	/* Parse Ethernet header (extracts VLAN ID if present) */
-	if (parse_ethhdr(data, data_end, &l3_offset, &eth_proto, &vlan_id) < 0)
+	if (parse_ethhdr(data, data_end, &l3_offset, &eth_proto, &vlan_id,
+			 &vlan_pcp, &vlan_present) < 0)
 		return XDP_DROP;
 
 	/* ---- cpumap distribution ---- */
@@ -131,6 +133,8 @@ int xdp_main_prog(struct xdp_md *ctx)
 	meta->direction = 0; /* ingress */
 	meta->ingress_ifindex = ctx->ingress_ifindex;
 	meta->ingress_vlan_id = vlan_id;
+	meta->ingress_pcp = vlan_pcp;
+	meta->ingress_vlan_present = vlan_present;
 	meta->dscp_rewrite = 0xFF; /* no DSCP rewrite by default */
 	meta->now_sec = (__u32)(bpf_ktime_get_coarse_ns() / 1000000000ULL);
 	meta->ktime_ns = 0;
@@ -142,7 +146,7 @@ int xdp_main_prog(struct xdp_md *ctx)
 		meta->native_xdp = 1;
 
 	/* Strip VLAN tag if present so pipeline sees plain Ethernet */
-	if (vlan_id != 0) {
+	if (vlan_present) {
 		if (xdp_vlan_tag_pop(ctx) < 0)
 			return XDP_DROP;
 		/* Re-read pointers after adjust_head */
@@ -179,7 +183,7 @@ int xdp_main_prog(struct xdp_md *ctx)
 	} else {
 		/* Non-IP traffic (ARP, etc.) — pass to kernel.
 		 * Restore VLAN tag so kernel delivers to sub-interface. */
-		if (vlan_id != 0) {
+		if (vlan_present) {
 			if (xdp_vlan_tag_push(ctx, vlan_id) < 0)
 				return XDP_DROP;
 		}

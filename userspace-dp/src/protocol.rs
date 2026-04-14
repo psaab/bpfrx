@@ -80,6 +80,8 @@ pub(crate) struct InterfaceSnapshot {
     pub cos_scheduler_map: String,
     #[serde(rename = "cos_dscp_classifier", default)]
     pub cos_dscp_classifier: String,
+    #[serde(rename = "cos_ieee8021_classifier", default)]
+    pub cos_ieee8021_classifier: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -88,6 +90,8 @@ pub(crate) struct ClassOfServiceSnapshot {
     pub forwarding_classes: Vec<CoSForwardingClassSnapshot>,
     #[serde(rename = "dscp_classifiers", default)]
     pub dscp_classifiers: Vec<CoSDSCPClassifierSnapshot>,
+    #[serde(rename = "ieee8021_classifiers", default)]
+    pub ieee8021_classifiers: Vec<CoSIEEE8021ClassifierSnapshot>,
     #[serde(rename = "schedulers", default)]
     pub schedulers: Vec<CoSSchedulerSnapshot>,
     #[serde(rename = "scheduler_maps", default)]
@@ -116,6 +120,23 @@ pub(crate) struct CoSDSCPClassifierEntrySnapshot {
     pub loss_priority: String,
     #[serde(rename = "dscp_values", default)]
     pub dscp_values: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct CoSIEEE8021ClassifierSnapshot {
+    pub name: String,
+    #[serde(default)]
+    pub entries: Vec<CoSIEEE8021ClassifierEntrySnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct CoSIEEE8021ClassifierEntrySnapshot {
+    #[serde(rename = "forwarding_class", default)]
+    pub forwarding_class: String,
+    #[serde(rename = "loss_priority", default)]
+    pub loss_priority: String,
+    #[serde(rename = "code_points", default)]
+    pub code_points: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

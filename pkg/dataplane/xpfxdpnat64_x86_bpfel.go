@@ -334,36 +334,39 @@ type xpfXdpNat64PktMeta struct {
 		V4 uint32
 		_  [12]byte
 	}
-	SrcPort        uint16
-	DstPort        uint16
-	Protocol       uint8
-	TcpFlags       uint8
-	IpTtl          uint8
-	AddrFamily     uint8
-	Dscp           uint8
-	CsumPartial    uint8
-	MetaFlags      uint8
-	EmbeddedProto  uint8
-	IcmpId         uint16
-	IcmpType       uint8
-	IcmpCode       uint8
-	TcpSeq         uint32
-	TcpAckSeq      uint32
-	L3Offset       uint16
-	L4Offset       uint16
-	PayloadOffset  uint16
-	PktLen         uint16
-	IngressZone    uint16
-	EgressZone     uint16
-	IngressIfindex uint32
-	IngressVlanId  uint16
-	EgressVlanId   uint16
-	Direction      uint8
-	IsFragment     uint8
-	CtState        uint8
-	CtDirection    uint8
-	PolicyId       uint32
-	NatSrcIp       struct {
+	SrcPort            uint16
+	DstPort            uint16
+	Protocol           uint8
+	TcpFlags           uint8
+	IpTtl              uint8
+	AddrFamily         uint8
+	Dscp               uint8
+	CsumPartial        uint8
+	MetaFlags          uint8
+	EmbeddedProto      uint8
+	IcmpId             uint16
+	IcmpType           uint8
+	IcmpCode           uint8
+	TcpSeq             uint32
+	TcpAckSeq          uint32
+	L3Offset           uint16
+	L4Offset           uint16
+	PayloadOffset      uint16
+	PktLen             uint16
+	IngressZone        uint16
+	EgressZone         uint16
+	IngressIfindex     uint32
+	IngressVlanId      uint16
+	IngressPcp         uint8
+	IngressVlanPresent uint8
+	EgressVlanId       uint16
+	Direction          uint8
+	IsFragment         uint8
+	CtState            uint8
+	CtDirection        uint8
+	_                  [2]byte
+	PolicyId           uint32
+	NatSrcIp           struct {
 		_  structs.HostLayout
 		V4 uint32
 		_  [12]byte
@@ -388,6 +391,7 @@ type xpfXdpNat64PktMeta struct {
 	MirrorRate    uint32
 	NowSec        uint32
 	PadTime       uint32
+	_             [4]byte
 	KtimeNs       uint64
 }
 

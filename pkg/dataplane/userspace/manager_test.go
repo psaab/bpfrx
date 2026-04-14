@@ -2683,6 +2683,76 @@ func TestBuildClassOfServiceSnapshotIncludesTransmitRateExact(t *testing.T) {
 	}
 }
 
+func TestBuildClassOfServiceSnapshotIncludesIEEE8021Classifier(t *testing.T) {
+	cfg := &config.Config{
+		ClassOfService: &config.ClassOfServiceConfig{
+			ForwardingClasses: map[string]*config.CoSForwardingClass{
+				"best-effort": {Name: "best-effort", Queue: 0},
+				"voice":       {Name: "voice", Queue: 5},
+			},
+			IEEE8021Classifiers: map[string]*config.CoSIEEE8021Classifier{
+				"wan-pcp": {
+					Name: "wan-pcp",
+					Entries: []*config.CoSIEEE8021ClassifierEntry{
+						{
+							ForwardingClass: "voice",
+							LossPriority:    "low",
+							CodePoints:      []uint8{5},
+						},
+					},
+				},
+			},
+			Interfaces: map[string]*config.CoSInterface{
+				"reth0": {
+					Name: "reth0",
+					Units: map[int]*config.CoSInterfaceUnit{
+						80: {
+							Unit:               80,
+							IEEE8021Classifier: "wan-pcp",
+						},
+					},
+				},
+			},
+		},
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {
+					Name: "reth0",
+					Units: map[int]*config.InterfaceUnit{
+						80: {Number: 80},
+					},
+				},
+			},
+		},
+	}
+
+	interfaces := buildInterfaceSnapshots(cfg)
+	var unitSnap *InterfaceSnapshot
+	for i := range interfaces {
+		if interfaces[i].Name == "reth0.80" {
+			unitSnap = &interfaces[i]
+			break
+		}
+	}
+	if unitSnap == nil {
+		t.Fatal("reth0.80 snapshot not found")
+	}
+	if got := unitSnap.CoSIEEE8021Classifier; got != "wan-pcp" {
+		t.Fatalf("CoSIEEE8021Classifier = %q, want wan-pcp", got)
+	}
+
+	snap := buildClassOfServiceSnapshot(cfg)
+	if snap == nil {
+		t.Fatal("expected non-nil class-of-service snapshot")
+	}
+	if len(snap.IEEE8021Classifiers) != 1 {
+		t.Fatalf("IEEE8021Classifiers len = %d, want 1", len(snap.IEEE8021Classifiers))
+	}
+	if got := snap.IEEE8021Classifiers[0].Entries[0].CodePoints; len(got) != 1 || got[0] != 5 {
+		t.Fatalf("CodePoints = %v, want [5]", got)
+	}
+}
+
 func TestBuildScreenSnapshotsIncludesAdvancedFields(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{

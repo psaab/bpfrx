@@ -615,7 +615,26 @@ func ValidateConfig(cfg *Config) []string {
 						classifier.Name, entry.ForwardingClass))
 				}
 				if entry.LossPriority != "" && !warnedClassifierLossPriority {
-					warnings = append(warnings, "class-of-service dscp classifier loss-priority is accepted for compatibility but not yet enforced by the userspace dataplane")
+					warnings = append(warnings, "class-of-service dscp/802.1p classifier loss-priority is accepted for compatibility but not yet enforced by the userspace dataplane")
+					warnedClassifierLossPriority = true
+				}
+			}
+		}
+		for _, classifier := range cos.IEEE8021Classifiers {
+			if classifier == nil {
+				continue
+			}
+			for _, entry := range classifier.Entries {
+				if entry == nil || entry.ForwardingClass == "" {
+					continue
+				}
+				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"class-of-service ieee-802.1 classifier %q references undefined forwarding-class %q",
+						classifier.Name, entry.ForwardingClass))
+				}
+				if entry.LossPriority != "" && !warnedClassifierLossPriority {
+					warnings = append(warnings, "class-of-service dscp/802.1p classifier loss-priority is accepted for compatibility but not yet enforced by the userspace dataplane")
 					warnedClassifierLossPriority = true
 				}
 			}
@@ -642,10 +661,17 @@ func ValidateConfig(cfg *Config) []string {
 							iface.Name, unit.Unit, unit.DSCPClassifier))
 					}
 				}
+				if unit.IEEE8021Classifier != "" {
+					if _, ok := cos.IEEE8021Classifiers[unit.IEEE8021Classifier]; !ok {
+						warnings = append(warnings, fmt.Sprintf(
+							"class-of-service interface %s unit %d references undefined ieee-802.1 classifier %q",
+							iface.Name, unit.Unit, unit.IEEE8021Classifier))
+					}
+				}
 			}
 		}
-		if (len(cos.Interfaces) > 0 || len(cos.DSCPClassifiers) > 0) && cfg.System.DataplaneType != "userspace" {
-			warnings = append(warnings, "class-of-service shaping and dscp classifier attachment are only implemented in the userspace dataplane; configuration is accepted but will not take effect on this dataplane")
+		if (len(cos.Interfaces) > 0 || len(cos.DSCPClassifiers) > 0 || len(cos.IEEE8021Classifiers) > 0) && cfg.System.DataplaneType != "userspace" {
+			warnings = append(warnings, "class-of-service shaping and dscp/802.1p classifier attachment are only implemented in the userspace dataplane; configuration is accepted but will not take effect on this dataplane")
 		}
 	}
 

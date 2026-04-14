@@ -329,11 +329,11 @@ Note: The vSRX deployment guide markets CoS as part of the standard feature set,
 | **Forwarding Classes** | `class-of-service forwarding-classes queue <num> <name>;` | Define custom forwarding class names mapped to queue numbers | Low | Done |
 | **Scheduler Maps** | `class-of-service scheduler-maps ...` | Associate forwarding classes with schedulers (bandwidth %, priority, buffer) | Low | Done |
 | **Schedulers** | `class-of-service schedulers ...` | Define per-queue scheduling parameters (transmit rate, priority, drop profile) | Low | Partial (userspace supports transmit-rate, `transmit-rate exact`, priority, and buffer-size, but not the fuller Junos scheduler/drop-profile model) |
-| **BA Classifiers** | `class-of-service classifiers dscp ...` | Classify incoming traffic by DSCP/802.1p into forwarding classes and loss priorities | Low | Partial (userspace supports DSCP classifier definitions plus interface attachment as a fallback queue selector, but not 802.1p classifiers and not loss-priority enforcement) |
+| **BA Classifiers** | `class-of-service classifiers dscp ...` | Classify incoming traffic by DSCP/802.1p into forwarding classes and loss priorities | Low | Partial (userspace supports DSCP and 802.1p classifier definitions plus interface attachment as fallback queue selectors, but not loss-priority enforcement and not broader non-userspace BA classifier parity) |
 | **Rewrite Rules** | `class-of-service rewrite-rules dscp ...` | Rewrite outgoing DSCP/802.1p values. xpf has filter-based DSCP rewrite. | Low | Partial (via firewall filter forwarding-class action) |
 | **WRED Drop Profiles** | `class-of-service drop-profiles ...` | Weighted Random Early Detection congestion avoidance per queue | Low | Missing |
 | **Traffic Shaping** | `class-of-service interfaces ... shaping-rate ...` | Per-interface output rate shaping | Low | Partial (userspace-only egress shaping with queue guarantees, non-`exact` surplus borrowing, timer-wheel deferred eligibility, and deterministic static owner-worker spreading across shaped egress interfaces; not full Junos CoS parity) |
-| **Interface CoS Binding** | `class-of-service interfaces ... scheduler-map ...` | Bind scheduler-map and classifiers to specific interfaces | Low | Partial (scheduler-map binding and DSCP classifier attachment work on userspace interfaces, but broader classifier and rewrite attachment semantics are still missing) |
+| **Interface CoS Binding** | `class-of-service interfaces ... scheduler-map ...` | Bind scheduler-map and classifiers to specific interfaces | Low | Partial (scheduler-map binding and DSCP / 802.1p classifier attachment work on userspace interfaces, but broader classifier and rewrite attachment semantics are still missing) |
 
 ---
 

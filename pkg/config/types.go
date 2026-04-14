@@ -298,11 +298,12 @@ type SchedulerConfig struct {
 // ClassOfServiceConfig holds CoS forwarding classes, schedulers,
 // scheduler-maps, and per-interface shaping configuration.
 type ClassOfServiceConfig struct {
-	ForwardingClasses map[string]*CoSForwardingClass
-	DSCPClassifiers   map[string]*CoSDSCPClassifier
-	Schedulers        map[string]*CoSScheduler
-	SchedulerMaps     map[string]*CoSSchedulerMap
-	Interfaces        map[string]*CoSInterface
+	ForwardingClasses   map[string]*CoSForwardingClass
+	DSCPClassifiers     map[string]*CoSDSCPClassifier
+	IEEE8021Classifiers map[string]*CoSIEEE8021Classifier
+	Schedulers          map[string]*CoSScheduler
+	SchedulerMaps       map[string]*CoSSchedulerMap
+	Interfaces          map[string]*CoSInterface
 }
 
 // CoSForwardingClass maps a forwarding-class name to a queue number.
@@ -322,6 +323,19 @@ type CoSDSCPClassifierEntry struct {
 	ForwardingClass string
 	LossPriority    string
 	DSCPValues      []uint8
+}
+
+// CoSIEEE8021Classifier maps 802.1p PCP values into forwarding classes.
+type CoSIEEE8021Classifier struct {
+	Name    string
+	Entries []*CoSIEEE8021ClassifierEntry
+}
+
+// CoSIEEE8021ClassifierEntry assigns one or more PCP values to a forwarding class.
+type CoSIEEE8021ClassifierEntry struct {
+	ForwardingClass string
+	LossPriority    string
+	CodePoints      []uint8
 }
 
 // CoSScheduler defines the Phase 1 class scheduler knobs.
@@ -353,11 +367,12 @@ type CoSInterface struct {
 
 // CoSInterfaceUnit defines the Phase 1 root shaper attached to a logical unit.
 type CoSInterfaceUnit struct {
-	Unit             int
-	ShapingRateBytes uint64
-	BurstSizeBytes   uint64
-	SchedulerMap     string
-	DSCPClassifier   string
+	Unit               int
+	ShapingRateBytes   uint64
+	BurstSizeBytes     uint64
+	SchedulerMap       string
+	DSCPClassifier     string
+	IEEE8021Classifier string
 }
 
 // SystemConfig holds system-level configuration.

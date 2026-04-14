@@ -1513,6 +1513,7 @@ mod tests {
                 burst_bytes: 64 * 1024,
                 default_queue: 0,
                 dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
                 queue_by_forwarding_class: FastMap::default(),
                 queues: vec![],
             },
@@ -1554,6 +1555,7 @@ mod tests {
                     burst_bytes: 64 * 1024,
                     default_queue: 0,
                     dscp_classifier: String::new(),
+                    ieee8021_classifier: String::new(),
                     queue_by_forwarding_class: FastMap::default(),
                     queues: vec![],
                 },
@@ -1682,6 +1684,7 @@ mod tests {
                 }],
             }],
             dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
         });
 
         coordinator.refresh_runtime_snapshot(&snapshot);

@@ -15,6 +15,9 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	if cos.DSCPClassifiers == nil {
 		cos.DSCPClassifiers = make(map[string]*CoSDSCPClassifier)
 	}
+	if cos.IEEE8021Classifiers == nil {
+		cos.IEEE8021Classifiers = make(map[string]*CoSIEEE8021Classifier)
+	}
 	if cos.Schedulers == nil {
 		cos.Schedulers = make(map[string]*CoSScheduler)
 	}
@@ -74,6 +77,39 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 			}
 			if len(classifier.Entries) > 0 {
 				cos.DSCPClassifiers[classifier.Name] = classifier
+			}
+		}
+		for _, inst := range namedInstances(classifiersNode.FindChildren("ieee-802.1")) {
+			classifier := &CoSIEEE8021Classifier{Name: inst.name}
+			for _, fcNode := range inst.node.FindChildren("forwarding-class") {
+				className := ""
+				if len(fcNode.Keys) >= 2 {
+					className = fcNode.Keys[1]
+				}
+				if className == "" {
+					continue
+				}
+				for _, lpNode := range fcNode.FindChildren("loss-priority") {
+					lossPriority := ""
+					if len(lpNode.Keys) >= 2 {
+						lossPriority = lpNode.Keys[1]
+					}
+					if lossPriority == "" {
+						lossPriority = nodeVal(lpNode)
+					}
+					codePoints := collectCoS8021CodePoints(lpNode)
+					if len(codePoints) == 0 {
+						continue
+					}
+					classifier.Entries = append(classifier.Entries, &CoSIEEE8021ClassifierEntry{
+						ForwardingClass: className,
+						LossPriority:    lossPriority,
+						CodePoints:      codePoints,
+					})
+				}
+			}
+			if len(classifier.Entries) > 0 {
+				cos.IEEE8021Classifiers[classifier.Name] = classifier
 			}
 		}
 	}
@@ -154,8 +190,11 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 				if dscpNode := classifiersNode.FindChild("dscp"); dscpNode != nil {
 					unit.DSCPClassifier = nodeVal(dscpNode)
 				}
+				if ieeeNode := classifiersNode.FindChild("ieee-802.1"); ieeeNode != nil {
+					unit.IEEE8021Classifier = nodeVal(ieeeNode)
+				}
 			}
-			if unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" || unit.DSCPClassifier != "" {
+			if unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" || unit.DSCPClassifier != "" || unit.IEEE8021Classifier != "" {
 				iface.Units[unitID] = unit
 			}
 		}
@@ -197,6 +236,30 @@ func collectCoSDSCPCodePoints(node *Node) []uint8 {
 				seen[value] = struct{}{}
 				values = append(values, value)
 			}
+		}
+	}
+	return values
+}
+
+func collectCoS8021CodePoints(node *Node) []uint8 {
+	var values []uint8
+	seen := make(map[uint8]struct{})
+	for _, child := range node.FindChildren("code-points") {
+		for _, raw := range child.Keys[1:] {
+			raw = strings.TrimSpace(strings.ToLower(raw))
+			if raw == "" {
+				continue
+			}
+			v, err := strconv.Atoi(raw)
+			if err != nil || v < 0 || v > 7 {
+				continue
+			}
+			value := uint8(v)
+			if _, ok := seen[value]; ok {
+				continue
+			}
+			seen[value] = struct{}{}
+			values = append(values, value)
 		}
 	}
 	return values

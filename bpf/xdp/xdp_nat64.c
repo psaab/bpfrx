@@ -684,7 +684,7 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 		 * XDP_PASS the translated IPv6 packet so the kernel
 		 * resolves NDP and forwards. Push ingress VLAN tag
 		 * back for kernel delivery. */
-		if (meta->ingress_vlan_id != 0) {
+		if (meta->ingress_vlan_present) {
 			if (xdp_vlan_tag_push(ctx,
 					      meta->ingress_vlan_id) < 0)
 				return XDP_DROP;
@@ -995,7 +995,7 @@ nat64_icmp_error_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 	meta->pkt_len = payload_len + 40;
 
 	if (rc == BPF_FIB_LKUP_RET_NO_NEIGH) {
-		if (meta->ingress_vlan_id != 0) {
+		if (meta->ingress_vlan_present) {
 			if (xdp_vlan_tag_push(ctx,
 					      meta->ingress_vlan_id) < 0)
 				return XDP_DROP;

@@ -1143,6 +1143,13 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 					}},
 				}},
 			}},
+			"ieee-802.1": {args: 1, multi: true, children: map[string]*schemaNode{
+				"forwarding-class": {args: 1, multi: true, children: map[string]*schemaNode{
+					"loss-priority": {args: 1, multi: true, children: map[string]*schemaNode{
+						"code-points": {args: 1, multi: true, children: nil},
+					}},
+				}},
+			}},
 		}},
 		"schedulers": {args: 1, multi: true, children: map[string]*schemaNode{
 			"transmit-rate": {args: 1, children: map[string]*schemaNode{
@@ -1159,7 +1166,8 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"interfaces": {args: 1, multi: true, children: map[string]*schemaNode{
 			"unit": {args: 1, multi: true, children: map[string]*schemaNode{
 				"classifiers": {children: map[string]*schemaNode{
-					"dscp": {args: 1, children: nil},
+					"dscp":       {args: 1, children: nil},
+					"ieee-802.1": {args: 1, children: nil},
 				}},
 				"shaping-rate": {args: 1, children: map[string]*schemaNode{
 					"burst-size": {args: 1, children: nil},
