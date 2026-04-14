@@ -514,28 +514,6 @@ func ValidateConfig(cfg *Config) []string {
 		warnings = append(warnings, "chassis cluster: no-reth-vrrp is redundant (private-rg-election is the default)")
 	}
 
-	// Warn about unsupported export-extension app-id in flow monitoring templates
-	if fm := cfg.Services.FlowMonitoring; fm != nil {
-		checkExtWarning := func(kind, name string, exts []string) {
-			for _, ext := range exts {
-				if ext == "app-id" {
-					warnings = append(warnings, fmt.Sprintf(
-						"flow-monitoring %s template %s: export-extension app-id configured but application data is not available in flow records", kind, name))
-				}
-			}
-		}
-		if fm.Version9 != nil {
-			for _, tmpl := range fm.Version9.Templates {
-				checkExtWarning("version9", tmpl.Name, tmpl.ExportExtensions)
-			}
-		}
-		if fm.VersionIPFIX != nil {
-			for _, tmpl := range fm.VersionIPFIX.Templates {
-				checkExtWarning("version-ipfix", tmpl.Name, tmpl.ExportExtensions)
-			}
-		}
-	}
-
 	return warnings
 }
 
