@@ -82,7 +82,7 @@ type xpfXdpMainDnatKey struct {
 	Pad      [3]uint8
 	DstIp    uint32
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpMainDnatKeyV6 struct {
@@ -91,7 +91,7 @@ type xpfXdpMainDnatKeyV6 struct {
 	Pad      [3]uint8
 	DstIp    [16]uint8
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpMainDnatValue struct {
@@ -643,9 +643,9 @@ type xpfXdpMainZoneConfig struct {
 	Pad              [3]uint8
 }
 
-// loadBpfrxXdpMain returns the embedded CollectionSpec for xpfXdpMain.
-func loadBpfrxXdpMain() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxXdpMainBytes)
+// loadXpfXdpMain returns the embedded CollectionSpec for xpfXdpMain.
+func loadXpfXdpMain() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_XpfXdpMainBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
 		return nil, fmt.Errorf("can't load xpfXdpMain: %w", err)
@@ -654,7 +654,7 @@ func loadBpfrxXdpMain() (*ebpf.CollectionSpec, error) {
 	return spec, err
 }
 
-// loadBpfrxXdpMainObjects loads xpfXdpMain and converts it into a struct.
+// loadXpfXdpMainObjects loads xpfXdpMain and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
@@ -663,8 +663,8 @@ func loadBpfrxXdpMain() (*ebpf.CollectionSpec, error) {
 //	*xpfXdpMainMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxXdpMainObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxXdpMain()
+func loadXpfXdpMainObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadXpfXdpMain()
 	if err != nil {
 		return err
 	}
@@ -769,7 +769,7 @@ type xpfXdpMainVariableSpecs struct {
 
 // xpfXdpMainObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpMainObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpMainObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpMainObjects struct {
 	xpfXdpMainPrograms
 	xpfXdpMainMaps
@@ -777,7 +777,7 @@ type xpfXdpMainObjects struct {
 }
 
 func (o *xpfXdpMainObjects) Close() error {
-	return _BpfrxXdpMainClose(
+	return _XpfXdpMainClose(
 		&o.xpfXdpMainPrograms,
 		&o.xpfXdpMainMaps,
 	)
@@ -785,7 +785,7 @@ func (o *xpfXdpMainObjects) Close() error {
 
 // xpfXdpMainMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpMainObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpMainObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpMainMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
@@ -857,7 +857,7 @@ type xpfXdpMainMaps struct {
 }
 
 func (m *xpfXdpMainMaps) Close() error {
-	return _BpfrxXdpMainClose(
+	return _XpfXdpMainClose(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -930,24 +930,24 @@ func (m *xpfXdpMainMaps) Close() error {
 
 // xpfXdpMainVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpMainObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpMainObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpMainVariables struct {
 }
 
 // xpfXdpMainPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpMainObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpMainObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpMainPrograms struct {
 	XdpMainProg *ebpf.Program `ebpf:"xdp_main_prog"`
 }
 
 func (p *xpfXdpMainPrograms) Close() error {
-	return _BpfrxXdpMainClose(
+	return _XpfXdpMainClose(
 		p.XdpMainProg,
 	)
 }
 
-func _BpfrxXdpMainClose(closers ...io.Closer) error {
+func _XpfXdpMainClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -959,4 +959,4 @@ func _BpfrxXdpMainClose(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed xpfxdpmain_x86_bpfel.o
-var _BpfrxXdpMainBytes []byte
+var _XpfXdpMainBytes []byte

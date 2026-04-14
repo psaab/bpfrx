@@ -82,7 +82,7 @@ type xpfTcNatDnatKey struct {
 	Pad      [3]uint8
 	DstIp    uint32
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfTcNatDnatKeyV6 struct {
@@ -91,7 +91,7 @@ type xpfTcNatDnatKeyV6 struct {
 	Pad      [3]uint8
 	DstIp    [16]uint8
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfTcNatDnatValue struct {
@@ -616,9 +616,9 @@ type xpfTcNatZoneConfig struct {
 	Pad              [3]uint8
 }
 
-// loadBpfrxTcNat returns the embedded CollectionSpec for xpfTcNat.
-func loadBpfrxTcNat() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxTcNatBytes)
+// loadXpfTcNat returns the embedded CollectionSpec for xpfTcNat.
+func loadXpfTcNat() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_XpfTcNatBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
 		return nil, fmt.Errorf("can't load xpfTcNat: %w", err)
@@ -627,7 +627,7 @@ func loadBpfrxTcNat() (*ebpf.CollectionSpec, error) {
 	return spec, err
 }
 
-// loadBpfrxTcNatObjects loads xpfTcNat and converts it into a struct.
+// loadXpfTcNatObjects loads xpfTcNat and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
@@ -636,8 +636,8 @@ func loadBpfrxTcNat() (*ebpf.CollectionSpec, error) {
 //	*xpfTcNatMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxTcNatObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxTcNat()
+func loadXpfTcNatObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadXpfTcNat()
 	if err != nil {
 		return err
 	}
@@ -737,7 +737,7 @@ type xpfTcNatVariableSpecs struct {
 
 // xpfTcNatObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcNatObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcNatObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcNatObjects struct {
 	xpfTcNatPrograms
 	xpfTcNatMaps
@@ -745,7 +745,7 @@ type xpfTcNatObjects struct {
 }
 
 func (o *xpfTcNatObjects) Close() error {
-	return _BpfrxTcNatClose(
+	return _XpfTcNatClose(
 		&o.xpfTcNatPrograms,
 		&o.xpfTcNatMaps,
 	)
@@ -753,7 +753,7 @@ func (o *xpfTcNatObjects) Close() error {
 
 // xpfTcNatMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcNatObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcNatObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcNatMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
@@ -820,7 +820,7 @@ type xpfTcNatMaps struct {
 }
 
 func (m *xpfTcNatMaps) Close() error {
-	return _BpfrxTcNatClose(
+	return _XpfTcNatClose(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -888,24 +888,24 @@ func (m *xpfTcNatMaps) Close() error {
 
 // xpfTcNatVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcNatObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcNatObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcNatVariables struct {
 }
 
 // xpfTcNatPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxTcNatObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfTcNatObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfTcNatPrograms struct {
 	TcNatProg *ebpf.Program `ebpf:"tc_nat_prog"`
 }
 
 func (p *xpfTcNatPrograms) Close() error {
-	return _BpfrxTcNatClose(
+	return _XpfTcNatClose(
 		p.TcNatProg,
 	)
 }
 
-func _BpfrxTcNatClose(closers ...io.Closer) error {
+func _XpfTcNatClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -917,4 +917,4 @@ func _BpfrxTcNatClose(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed xpftcnat_x86_bpfel.o
-var _BpfrxTcNatBytes []byte
+var _XpfTcNatBytes []byte

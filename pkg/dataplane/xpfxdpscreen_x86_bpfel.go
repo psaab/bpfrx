@@ -82,7 +82,7 @@ type xpfXdpScreenDnatKey struct {
 	Pad      [3]uint8
 	DstIp    uint32
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpScreenDnatKeyV6 struct {
@@ -91,7 +91,7 @@ type xpfXdpScreenDnatKeyV6 struct {
 	Pad      [3]uint8
 	DstIp    [16]uint8
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpScreenDnatValue struct {
@@ -616,9 +616,9 @@ type xpfXdpScreenZoneConfig struct {
 	Pad              [3]uint8
 }
 
-// loadBpfrxXdpScreen returns the embedded CollectionSpec for xpfXdpScreen.
-func loadBpfrxXdpScreen() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxXdpScreenBytes)
+// loadXpfXdpScreen returns the embedded CollectionSpec for xpfXdpScreen.
+func loadXpfXdpScreen() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_XpfXdpScreenBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
 		return nil, fmt.Errorf("can't load xpfXdpScreen: %w", err)
@@ -627,7 +627,7 @@ func loadBpfrxXdpScreen() (*ebpf.CollectionSpec, error) {
 	return spec, err
 }
 
-// loadBpfrxXdpScreenObjects loads xpfXdpScreen and converts it into a struct.
+// loadXpfXdpScreenObjects loads xpfXdpScreen and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
@@ -636,8 +636,8 @@ func loadBpfrxXdpScreen() (*ebpf.CollectionSpec, error) {
 //	*xpfXdpScreenMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxXdpScreenObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxXdpScreen()
+func loadXpfXdpScreenObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadXpfXdpScreen()
 	if err != nil {
 		return err
 	}
@@ -737,7 +737,7 @@ type xpfXdpScreenVariableSpecs struct {
 
 // xpfXdpScreenObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpScreenObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpScreenObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpScreenObjects struct {
 	xpfXdpScreenPrograms
 	xpfXdpScreenMaps
@@ -745,7 +745,7 @@ type xpfXdpScreenObjects struct {
 }
 
 func (o *xpfXdpScreenObjects) Close() error {
-	return _BpfrxXdpScreenClose(
+	return _XpfXdpScreenClose(
 		&o.xpfXdpScreenPrograms,
 		&o.xpfXdpScreenMaps,
 	)
@@ -753,7 +753,7 @@ func (o *xpfXdpScreenObjects) Close() error {
 
 // xpfXdpScreenMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpScreenObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpScreenObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpScreenMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
@@ -820,7 +820,7 @@ type xpfXdpScreenMaps struct {
 }
 
 func (m *xpfXdpScreenMaps) Close() error {
-	return _BpfrxXdpScreenClose(
+	return _XpfXdpScreenClose(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -888,24 +888,24 @@ func (m *xpfXdpScreenMaps) Close() error {
 
 // xpfXdpScreenVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpScreenObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpScreenObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpScreenVariables struct {
 }
 
 // xpfXdpScreenPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpScreenObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpScreenObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpScreenPrograms struct {
 	XdpScreenProg *ebpf.Program `ebpf:"xdp_screen_prog"`
 }
 
 func (p *xpfXdpScreenPrograms) Close() error {
-	return _BpfrxXdpScreenClose(
+	return _XpfXdpScreenClose(
 		p.XdpScreenProg,
 	)
 }
 
-func _BpfrxXdpScreenClose(closers ...io.Closer) error {
+func _XpfXdpScreenClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -917,4 +917,4 @@ func _BpfrxXdpScreenClose(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed xpfxdpscreen_x86_bpfel.o
-var _BpfrxXdpScreenBytes []byte
+var _XpfXdpScreenBytes []byte

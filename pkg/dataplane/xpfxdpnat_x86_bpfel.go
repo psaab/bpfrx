@@ -82,7 +82,7 @@ type xpfXdpNatDnatKey struct {
 	Pad      [3]uint8
 	DstIp    uint32
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpNatDnatKeyV6 struct {
@@ -91,7 +91,7 @@ type xpfXdpNatDnatKeyV6 struct {
 	Pad      [3]uint8
 	DstIp    [16]uint8
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpNatDnatValue struct {
@@ -616,9 +616,9 @@ type xpfXdpNatZoneConfig struct {
 	Pad              [3]uint8
 }
 
-// loadBpfrxXdpNat returns the embedded CollectionSpec for xpfXdpNat.
-func loadBpfrxXdpNat() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxXdpNatBytes)
+// loadXpfXdpNat returns the embedded CollectionSpec for xpfXdpNat.
+func loadXpfXdpNat() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_XpfXdpNatBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
 		return nil, fmt.Errorf("can't load xpfXdpNat: %w", err)
@@ -627,7 +627,7 @@ func loadBpfrxXdpNat() (*ebpf.CollectionSpec, error) {
 	return spec, err
 }
 
-// loadBpfrxXdpNatObjects loads xpfXdpNat and converts it into a struct.
+// loadXpfXdpNatObjects loads xpfXdpNat and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
@@ -636,8 +636,8 @@ func loadBpfrxXdpNat() (*ebpf.CollectionSpec, error) {
 //	*xpfXdpNatMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxXdpNatObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxXdpNat()
+func loadXpfXdpNatObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadXpfXdpNat()
 	if err != nil {
 		return err
 	}
@@ -737,7 +737,7 @@ type xpfXdpNatVariableSpecs struct {
 
 // xpfXdpNatObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpNatObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpNatObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpNatObjects struct {
 	xpfXdpNatPrograms
 	xpfXdpNatMaps
@@ -745,7 +745,7 @@ type xpfXdpNatObjects struct {
 }
 
 func (o *xpfXdpNatObjects) Close() error {
-	return _BpfrxXdpNatClose(
+	return _XpfXdpNatClose(
 		&o.xpfXdpNatPrograms,
 		&o.xpfXdpNatMaps,
 	)
@@ -753,7 +753,7 @@ func (o *xpfXdpNatObjects) Close() error {
 
 // xpfXdpNatMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpNatObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpNatObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpNatMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
@@ -820,7 +820,7 @@ type xpfXdpNatMaps struct {
 }
 
 func (m *xpfXdpNatMaps) Close() error {
-	return _BpfrxXdpNatClose(
+	return _XpfXdpNatClose(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -888,24 +888,24 @@ func (m *xpfXdpNatMaps) Close() error {
 
 // xpfXdpNatVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpNatObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpNatObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpNatVariables struct {
 }
 
 // xpfXdpNatPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpNatObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpNatObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpNatPrograms struct {
 	XdpNatProg *ebpf.Program `ebpf:"xdp_nat_prog"`
 }
 
 func (p *xpfXdpNatPrograms) Close() error {
-	return _BpfrxXdpNatClose(
+	return _XpfXdpNatClose(
 		p.XdpNatProg,
 	)
 }
 
-func _BpfrxXdpNatClose(closers ...io.Closer) error {
+func _XpfXdpNatClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -917,4 +917,4 @@ func _BpfrxXdpNatClose(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed xpfxdpnat_x86_bpfel.o
-var _BpfrxXdpNatBytes []byte
+var _XpfXdpNatBytes []byte

@@ -82,7 +82,7 @@ type xpfXdpNat64DnatKey struct {
 	Pad      [3]uint8
 	DstIp    uint32
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpNat64DnatKeyV6 struct {
@@ -91,7 +91,7 @@ type xpfXdpNat64DnatKeyV6 struct {
 	Pad      [3]uint8
 	DstIp    [16]uint8
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpNat64DnatValue struct {
@@ -643,9 +643,9 @@ type xpfXdpNat64ZoneConfig struct {
 	Pad              [3]uint8
 }
 
-// loadBpfrxXdpNat64 returns the embedded CollectionSpec for xpfXdpNat64.
-func loadBpfrxXdpNat64() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxXdpNat64Bytes)
+// loadXpfXdpNat64 returns the embedded CollectionSpec for xpfXdpNat64.
+func loadXpfXdpNat64() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_XpfXdpNat64Bytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
 		return nil, fmt.Errorf("can't load xpfXdpNat64: %w", err)
@@ -654,7 +654,7 @@ func loadBpfrxXdpNat64() (*ebpf.CollectionSpec, error) {
 	return spec, err
 }
 
-// loadBpfrxXdpNat64Objects loads xpfXdpNat64 and converts it into a struct.
+// loadXpfXdpNat64Objects loads xpfXdpNat64 and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
@@ -663,8 +663,8 @@ func loadBpfrxXdpNat64() (*ebpf.CollectionSpec, error) {
 //	*xpfXdpNat64Maps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxXdpNat64Objects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxXdpNat64()
+func loadXpfXdpNat64Objects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadXpfXdpNat64()
 	if err != nil {
 		return err
 	}
@@ -769,7 +769,7 @@ type xpfXdpNat64VariableSpecs struct {
 
 // xpfXdpNat64Objects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpNat64Objects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpNat64Objects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpNat64Objects struct {
 	xpfXdpNat64Programs
 	xpfXdpNat64Maps
@@ -777,7 +777,7 @@ type xpfXdpNat64Objects struct {
 }
 
 func (o *xpfXdpNat64Objects) Close() error {
-	return _BpfrxXdpNat64Close(
+	return _XpfXdpNat64Close(
 		&o.xpfXdpNat64Programs,
 		&o.xpfXdpNat64Maps,
 	)
@@ -785,7 +785,7 @@ func (o *xpfXdpNat64Objects) Close() error {
 
 // xpfXdpNat64Maps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpNat64Objects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpNat64Objects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpNat64Maps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
@@ -857,7 +857,7 @@ type xpfXdpNat64Maps struct {
 }
 
 func (m *xpfXdpNat64Maps) Close() error {
-	return _BpfrxXdpNat64Close(
+	return _XpfXdpNat64Close(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -930,24 +930,24 @@ func (m *xpfXdpNat64Maps) Close() error {
 
 // xpfXdpNat64Variables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpNat64Objects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpNat64Objects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpNat64Variables struct {
 }
 
 // xpfXdpNat64Programs contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpNat64Objects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpNat64Objects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpNat64Programs struct {
 	XdpNat64Prog *ebpf.Program `ebpf:"xdp_nat64_prog"`
 }
 
 func (p *xpfXdpNat64Programs) Close() error {
-	return _BpfrxXdpNat64Close(
+	return _XpfXdpNat64Close(
 		p.XdpNat64Prog,
 	)
 }
 
-func _BpfrxXdpNat64Close(closers ...io.Closer) error {
+func _XpfXdpNat64Close(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -959,4 +959,4 @@ func _BpfrxXdpNat64Close(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed xpfxdpnat64_x86_bpfel.o
-var _BpfrxXdpNat64Bytes []byte
+var _XpfXdpNat64Bytes []byte

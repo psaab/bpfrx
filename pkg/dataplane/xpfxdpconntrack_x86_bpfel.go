@@ -82,7 +82,7 @@ type xpfXdpConntrackDnatKey struct {
 	Pad      [3]uint8
 	DstIp    uint32
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpConntrackDnatKeyV6 struct {
@@ -91,7 +91,7 @@ type xpfXdpConntrackDnatKeyV6 struct {
 	Pad      [3]uint8
 	DstIp    [16]uint8
 	DstPort  uint16
-	Pad2     uint16
+	FromZone uint16
 }
 
 type xpfXdpConntrackDnatValue struct {
@@ -616,9 +616,9 @@ type xpfXdpConntrackZoneConfig struct {
 	Pad              [3]uint8
 }
 
-// loadBpfrxXdpConntrack returns the embedded CollectionSpec for xpfXdpConntrack.
-func loadBpfrxXdpConntrack() (*ebpf.CollectionSpec, error) {
-	reader := bytes.NewReader(_BpfrxXdpConntrackBytes)
+// loadXpfXdpConntrack returns the embedded CollectionSpec for xpfXdpConntrack.
+func loadXpfXdpConntrack() (*ebpf.CollectionSpec, error) {
+	reader := bytes.NewReader(_XpfXdpConntrackBytes)
 	spec, err := ebpf.LoadCollectionSpecFromReader(reader)
 	if err != nil {
 		return nil, fmt.Errorf("can't load xpfXdpConntrack: %w", err)
@@ -627,7 +627,7 @@ func loadBpfrxXdpConntrack() (*ebpf.CollectionSpec, error) {
 	return spec, err
 }
 
-// loadBpfrxXdpConntrackObjects loads xpfXdpConntrack and converts it into a struct.
+// loadXpfXdpConntrackObjects loads xpfXdpConntrack and converts it into a struct.
 //
 // The following types are suitable as obj argument:
 //
@@ -636,8 +636,8 @@ func loadBpfrxXdpConntrack() (*ebpf.CollectionSpec, error) {
 //	*xpfXdpConntrackMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadBpfrxXdpConntrackObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
-	spec, err := loadBpfrxXdpConntrack()
+func loadXpfXdpConntrackObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+	spec, err := loadXpfXdpConntrack()
 	if err != nil {
 		return err
 	}
@@ -737,7 +737,7 @@ type xpfXdpConntrackVariableSpecs struct {
 
 // xpfXdpConntrackObjects contains all objects after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpConntrackObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpConntrackObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpConntrackObjects struct {
 	xpfXdpConntrackPrograms
 	xpfXdpConntrackMaps
@@ -745,7 +745,7 @@ type xpfXdpConntrackObjects struct {
 }
 
 func (o *xpfXdpConntrackObjects) Close() error {
-	return _BpfrxXdpConntrackClose(
+	return _XpfXdpConntrackClose(
 		&o.xpfXdpConntrackPrograms,
 		&o.xpfXdpConntrackMaps,
 	)
@@ -753,7 +753,7 @@ func (o *xpfXdpConntrackObjects) Close() error {
 
 // xpfXdpConntrackMaps contains all maps after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpConntrackObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpConntrackObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpConntrackMaps struct {
 	AddressBookV4     *ebpf.Map `ebpf:"address_book_v4"`
 	AddressBookV6     *ebpf.Map `ebpf:"address_book_v6"`
@@ -820,7 +820,7 @@ type xpfXdpConntrackMaps struct {
 }
 
 func (m *xpfXdpConntrackMaps) Close() error {
-	return _BpfrxXdpConntrackClose(
+	return _XpfXdpConntrackClose(
 		m.AddressBookV4,
 		m.AddressBookV6,
 		m.AddressMembership,
@@ -888,24 +888,24 @@ func (m *xpfXdpConntrackMaps) Close() error {
 
 // xpfXdpConntrackVariables contains all global variables after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpConntrackObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpConntrackObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpConntrackVariables struct {
 }
 
 // xpfXdpConntrackPrograms contains all programs after they have been loaded into the kernel.
 //
-// It can be passed to loadBpfrxXdpConntrackObjects or ebpf.CollectionSpec.LoadAndAssign.
+// It can be passed to loadXpfXdpConntrackObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xpfXdpConntrackPrograms struct {
 	XdpConntrackProg *ebpf.Program `ebpf:"xdp_conntrack_prog"`
 }
 
 func (p *xpfXdpConntrackPrograms) Close() error {
-	return _BpfrxXdpConntrackClose(
+	return _XpfXdpConntrackClose(
 		p.XdpConntrackProg,
 	)
 }
 
-func _BpfrxXdpConntrackClose(closers ...io.Closer) error {
+func _XpfXdpConntrackClose(closers ...io.Closer) error {
 	for _, closer := range closers {
 		if err := closer.Close(); err != nil {
 			return err
@@ -917,4 +917,4 @@ func _BpfrxXdpConntrackClose(closers ...io.Closer) error {
 // Do not access this directly.
 //
 //go:embed xpfxdpconntrack_x86_bpfel.o
-var _BpfrxXdpConntrackBytes []byte
+var _XpfXdpConntrackBytes []byte

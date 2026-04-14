@@ -44,7 +44,7 @@ func (m *Manager) loadAllObjects() error {
 	}
 
 	// Get the CollectionSpec (not yet loaded into kernel).
-	spec, err := loadBpfrxXdpMain()
+	spec, err := loadXpfXdpMain()
 	if err != nil {
 		return fmt.Errorf("load xdp_main spec: %w", err)
 	}
@@ -297,14 +297,14 @@ func (m *Manager) loadAllObjects() error {
 
 	// Load XDP screen program.
 	var screenObjs xpfXdpScreenObjects
-	if err := loadBpfrxXdpScreenObjects(&screenObjs, replaceOpts); err != nil {
+	if err := loadXpfXdpScreenObjects(&screenObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load xdp_screen: %w", err)
 	}
 	m.programs["xdp_screen_prog"] = screenObjs.XdpScreenProg
 
 	// Load XDP zone program.
 	var zoneObjs xpfXdpZoneObjects
-	if err := loadBpfrxXdpZoneObjects(&zoneObjs, replaceOpts); err != nil {
+	if err := loadXpfXdpZoneObjects(&zoneObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load xdp_zone: %w", err)
 	}
 	m.programs["xdp_zone_prog"] = zoneObjs.XdpZoneProg
@@ -329,35 +329,35 @@ func (m *Manager) loadAllObjects() error {
 		conntrackReplaceOpts.MapReplacements[k] = v
 	}
 	var ctObjs xpfXdpConntrackObjects
-	if err := loadBpfrxXdpConntrackObjects(&ctObjs, conntrackReplaceOpts); err != nil {
+	if err := loadXpfXdpConntrackObjects(&ctObjs, conntrackReplaceOpts); err != nil {
 		return fmt.Errorf("load xdp_conntrack: %w", err)
 	}
 	m.programs["xdp_conntrack_prog"] = ctObjs.XdpConntrackProg
 
 	// Load XDP policy program (uses NAT pool maps).
 	var polObjs xpfXdpPolicyObjects
-	if err := loadBpfrxXdpPolicyObjects(&polObjs, policyReplaceOpts); err != nil {
+	if err := loadXpfXdpPolicyObjects(&polObjs, policyReplaceOpts); err != nil {
 		return fmt.Errorf("load xdp_policy: %w", err)
 	}
 	m.programs["xdp_policy_prog"] = polObjs.XdpPolicyProg
 
 	// Load XDP NAT program.
 	var natObjs xpfXdpNatObjects
-	if err := loadBpfrxXdpNatObjects(&natObjs, replaceOpts); err != nil {
+	if err := loadXpfXdpNatObjects(&natObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load xdp_nat: %w", err)
 	}
 	m.programs["xdp_nat_prog"] = natObjs.XdpNatProg
 
 	// Load XDP forward program.
 	var fwdObjs xpfXdpForwardObjects
-	if err := loadBpfrxXdpForwardObjects(&fwdObjs, replaceOpts); err != nil {
+	if err := loadXpfXdpForwardObjects(&fwdObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load xdp_forward: %w", err)
 	}
 	m.programs["xdp_forward_prog"] = fwdObjs.XdpForwardProg
 
 	// Load XDP NAT64 program (uses NAT pool maps for SNAT allocation).
 	var nat64Objs xpfXdpNat64Objects
-	if err := loadBpfrxXdpNat64Objects(&nat64Objs, policyReplaceOpts); err != nil {
+	if err := loadXpfXdpNat64Objects(&nat64Objs, policyReplaceOpts); err != nil {
 		return fmt.Errorf("load xdp_nat64: %w", err)
 	}
 	m.programs["xdp_nat64_prog"] = nat64Objs.XdpNat64Prog
@@ -392,35 +392,35 @@ func (m *Manager) loadAllObjects() error {
 
 	// Load TC main program.
 	var tcMainObjs xpfTcMainObjects
-	if err := loadBpfrxTcMainObjects(&tcMainObjs, replaceOpts); err != nil {
+	if err := loadXpfTcMainObjects(&tcMainObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load tc_main: %w", err)
 	}
 	m.programs["tc_main_prog"] = tcMainObjs.TcMainProg
 
 	// Load TC conntrack program.
 	var tcCtObjs xpfTcConntrackObjects
-	if err := loadBpfrxTcConntrackObjects(&tcCtObjs, replaceOpts); err != nil {
+	if err := loadXpfTcConntrackObjects(&tcCtObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load tc_conntrack: %w", err)
 	}
 	m.programs["tc_conntrack_prog"] = tcCtObjs.TcConntrackProg
 
 	// Load TC NAT program.
 	var tcNatObjs xpfTcNatObjects
-	if err := loadBpfrxTcNatObjects(&tcNatObjs, replaceOpts); err != nil {
+	if err := loadXpfTcNatObjects(&tcNatObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load tc_nat: %w", err)
 	}
 	m.programs["tc_nat_prog"] = tcNatObjs.TcNatProg
 
 	// Load TC screen egress program.
 	var tcScreenObjs xpfTcScreenEgressObjects
-	if err := loadBpfrxTcScreenEgressObjects(&tcScreenObjs, replaceOpts); err != nil {
+	if err := loadXpfTcScreenEgressObjects(&tcScreenObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load tc_screen_egress: %w", err)
 	}
 	m.programs["tc_screen_egress_prog"] = tcScreenObjs.TcScreenEgressProg
 
 	// Load TC forward program.
 	var tcFwdObjs xpfTcForwardObjects
-	if err := loadBpfrxTcForwardObjects(&tcFwdObjs, replaceOpts); err != nil {
+	if err := loadXpfTcForwardObjects(&tcFwdObjs, replaceOpts); err != nil {
 		return fmt.Errorf("load tc_forward: %w", err)
 	}
 	m.programs["tc_forward_prog"] = tcFwdObjs.TcForwardProg
@@ -467,7 +467,7 @@ func ensureUserspaceMapPinned(name string, m *ebpf.Map, path string) error {
 // sharing a PROG_ARRAY created by regular XDP programs. So the cpumap
 // gets its own xdp_progs PROG_ARRAY populated with pipeline copies.
 func (m *Manager) loadCPUMapPrograms(replaceOpts *ebpf.CollectionOptions, mainObjs *xpfXdpMainObjects) error {
-	cpumapSpec, err := loadBpfrxXdpCpumap()
+	cpumapSpec, err := loadXpfXdpCpumap()
 	if err != nil {
 		return fmt.Errorf("load xdp_cpumap spec: %w", err)
 	}
@@ -531,13 +531,13 @@ func (m *Manager) loadCPUMapPrograms(replaceOpts *ebpf.CollectionOptions, mainOb
 		opts  *ebpf.CollectionOptions
 	}
 	pipeline := []cpumapProg{
-		{XDPProgScreen, "screen", loadBpfrxXdpScreen, "xdp_screen_prog", cpumapReplaceOpts},
-		{XDPProgZone, "zone", loadBpfrxXdpZone, "xdp_zone_prog", cpumapReplaceOpts},
-		{XDPProgConntrack, "conntrack", loadBpfrxXdpConntrack, "xdp_conntrack_prog", cpumapCtOpts},
-		{XDPProgPolicy, "policy", loadBpfrxXdpPolicy, "xdp_policy_prog", cpumapPolicyOpts},
-		{XDPProgNAT, "nat", loadBpfrxXdpNat, "xdp_nat_prog", cpumapReplaceOpts},
-		{XDPProgForward, "forward", loadBpfrxXdpForward, "xdp_forward_prog", cpumapReplaceOpts},
-		{XDPProgNAT64, "nat64", loadBpfrxXdpNat64, "xdp_nat64_prog", cpumapPolicyOpts},
+		{XDPProgScreen, "screen", loadXpfXdpScreen, "xdp_screen_prog", cpumapReplaceOpts},
+		{XDPProgZone, "zone", loadXpfXdpZone, "xdp_zone_prog", cpumapReplaceOpts},
+		{XDPProgConntrack, "conntrack", loadXpfXdpConntrack, "xdp_conntrack_prog", cpumapCtOpts},
+		{XDPProgPolicy, "policy", loadXpfXdpPolicy, "xdp_policy_prog", cpumapPolicyOpts},
+		{XDPProgNAT, "nat", loadXpfXdpNat, "xdp_nat_prog", cpumapReplaceOpts},
+		{XDPProgForward, "forward", loadXpfXdpForward, "xdp_forward_prog", cpumapReplaceOpts},
+		{XDPProgNAT64, "nat64", loadXpfXdpNat64, "xdp_nat64_prog", cpumapPolicyOpts},
 	}
 	for _, p := range pipeline {
 		pSpec, err := p.load()
