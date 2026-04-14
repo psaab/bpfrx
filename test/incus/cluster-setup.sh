@@ -387,7 +387,7 @@ EOF'
 	incus exec "$rinst" -- sysctl --system
 
 	info "Installing packages ($vm, this may take a few minutes)..."
-	incus exec "$rinst" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony ethtool mtr-tiny linux-perf host pciutils curl wget'
+	incus exec "$rinst" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential clang llvm libbpf-dev linux-headers-amd64 golang tcpdump iproute2 iperf3 bpftool frr strongswan strongswan-swanctl kea-dhcp4-server kea-dhcp6-server chrony ethtool mtr-tiny linux-perf host pciutils curl wget ripgrep'
 
 	# Upgrade kernel to latest from Debian unstable
 	info "Adding Debian unstable repo for kernel upgrade ($vm)..."
@@ -496,7 +496,7 @@ EOF"
 	incus exec "$rinst" -- systemctl restart systemd-networkd
 
 	info "Installing packages on $LAN_HOST (may fail if firewall not yet deployed)..."
-	if ! incus exec "$rinst" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 mtr-tiny pciutils tcpdump curl wget' 2>/dev/null; then
+	if ! incus exec "$rinst" -- bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iperf3 mtr-tiny pciutils tcpdump curl wget ripgrep' 2>/dev/null; then
 		warn "Package install failed (firewall not running?). Re-run after deploy: incus exec $(r "$LAN_HOST") -- apt-get install -y iperf3 mtr-tiny tcpdump curl wget"
 	fi
 
