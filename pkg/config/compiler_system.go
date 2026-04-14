@@ -1,6 +1,9 @@
 package config
 
-import "strconv"
+import (
+	"fmt"
+	"strconv"
+)
 
 func compileSystem(node *Node, sys *SystemConfig) error {
 	for _, child := range node.Children {
@@ -110,6 +113,15 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 			// Also check children for hierarchical format
 			if dstNode := child.FindChild("destination"); dstNode != nil && len(dstNode.Keys) >= 2 {
 				sys.BackupRouterDst = dstNode.Keys[1]
+			}
+		case "commit":
+			for _, key := range child.Keys[1:] {
+				if key == "persist-groups-inheritance" {
+					return fmt.Errorf("system commit persist-groups-inheritance: unsupported")
+				}
+			}
+			if child.FindChild("persist-groups-inheritance") != nil {
+				return fmt.Errorf("system commit persist-groups-inheritance: unsupported")
 			}
 		case "root-authentication":
 			sys.RootAuthentication = &RootAuthConfig{}
