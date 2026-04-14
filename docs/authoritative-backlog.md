@@ -69,6 +69,7 @@ From `docs/next-features` and HA proposal docs:
 - Strict single-owner VIP mode for same-L2 HA (tracking issue #104)
 - Deterministic VRRP failover reconciliation
 - Runtime behavior for `system license autoupdate url`
+- Real firewall-side DNS proxy runtime replacing the current `systemd-resolved` toggle model (tracking issue #660; see `docs/next-features/dns-proxy.md`)
 
 ### 3) Additional open items from bug/test planning docs
 
