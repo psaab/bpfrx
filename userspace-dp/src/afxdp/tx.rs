@@ -354,6 +354,7 @@ fn build_cos_batch(
     let mut selected = None;
     {
         let root = binding.cos_interfaces.get_mut(&root_ifindex)?;
+        advance_cos_timer_wheel(root, now_ns);
         refill_cos_tokens(
             &mut root.tokens,
             root.shaping_rate_bytes,
@@ -370,7 +371,7 @@ fn build_cos_batch(
             for offset in 0..indices_len {
                 let queue_idx = root.queue_indices_by_priority[priority][(start + offset) % indices_len];
                 let queue = &mut root.queues[queue_idx];
-                if queue.items.is_empty() {
+                if queue.items.is_empty() || !queue.runnable {
                     continue;
                 }
                 refill_cos_tokens(
@@ -385,6 +386,16 @@ fn build_cos_batch(
                 };
                 let head_len = cos_item_len(head);
                 if root.tokens < head_len || queue.tokens < head_len {
+                    if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
+                        root.tokens,
+                        root.shaping_rate_bytes,
+                        queue.tokens,
+                        queue.transmit_rate_bytes,
+                        head_len,
+                        now_ns,
+                    ) {
+                        park_cos_queue(root, queue_idx, wake_tick);
+                    }
                     continue;
                 }
                 root.rr_index_by_priority[priority] = (start + offset + 1) % indices_len;
@@ -527,7 +538,9 @@ fn submit_cos_batch(
     }
 }
 
+const COS_TIMER_WHEEL_TICK_NS: u64 = 50_000;
 const COS_MIN_BURST_BYTES: u64 = 64 * 1500;
+const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 
 fn refill_cos_tokens(
     tokens: &mut u64,
@@ -554,6 +567,146 @@ fn refill_cos_tokens(
     }
     *tokens = tokens.saturating_add(added).min(burst_bytes);
     *last_refill_ns = now_ns;
+}
+
+fn cos_tick_for_ns(now_ns: u64) -> u64 {
+    now_ns / COS_TIMER_WHEEL_TICK_NS
+}
+
+fn cos_timer_wheel_level_and_slot(current_tick: u64, wake_tick: u64) -> (u8, usize) {
+    if wake_tick.saturating_sub(current_tick) < COS_TIMER_WHEEL_L0_HORIZON_TICKS {
+        (0, (wake_tick % COS_TIMER_WHEEL_L0_SLOTS as u64) as usize)
+    } else {
+        (
+            1,
+            ((wake_tick / COS_TIMER_WHEEL_L0_SLOTS as u64) % COS_TIMER_WHEEL_L1_SLOTS as u64)
+                as usize,
+        )
+    }
+}
+
+fn cos_refill_ns_until(tokens: u64, need: u64, rate_bytes_per_sec: u64) -> Option<u64> {
+    if tokens >= need {
+        return Some(0);
+    }
+    if rate_bytes_per_sec == 0 {
+        return None;
+    }
+    let deficit = need.saturating_sub(tokens) as u128;
+    let rate = rate_bytes_per_sec as u128;
+    Some(deficit.saturating_mul(1_000_000_000u128).div_ceil(rate) as u64)
+}
+
+fn estimate_cos_queue_wakeup_tick(
+    root_tokens: u64,
+    root_rate_bytes: u64,
+    queue_tokens: u64,
+    queue_rate_bytes: u64,
+    need_bytes: u64,
+    now_ns: u64,
+) -> Option<u64> {
+    let root_refill_ns = cos_refill_ns_until(root_tokens, need_bytes, root_rate_bytes)?;
+    let queue_refill_ns = cos_refill_ns_until(queue_tokens, need_bytes, queue_rate_bytes)?;
+    let wake_ns = now_ns.saturating_add(root_refill_ns.max(queue_refill_ns));
+    Some(cos_tick_for_ns(wake_ns).max(cos_tick_for_ns(now_ns).saturating_add(1)))
+}
+
+fn wake_cos_queue(root: &mut CoSInterfaceRuntime, queue_idx: usize) {
+    let Some(queue) = root.queues.get_mut(queue_idx) else {
+        return;
+    };
+    if queue.items.is_empty() {
+        queue.runnable = false;
+        queue.parked = false;
+        queue.next_wakeup_tick = 0;
+        return;
+    }
+    if !queue.runnable {
+        root.runnable_queues = root.runnable_queues.saturating_add(1);
+    }
+    queue.runnable = true;
+    queue.parked = false;
+}
+
+fn park_cos_queue(root: &mut CoSInterfaceRuntime, queue_idx: usize, wake_tick: u64) {
+    let (level, slot) = cos_timer_wheel_level_and_slot(root.timer_wheel.current_tick, wake_tick);
+    let Some(queue) = root.queues.get_mut(queue_idx) else {
+        return;
+    };
+    if queue.runnable {
+        root.runnable_queues = root.runnable_queues.saturating_sub(1);
+    }
+    queue.runnable = false;
+    queue.parked = true;
+    queue.next_wakeup_tick = wake_tick;
+    queue.wheel_level = level;
+    queue.wheel_slot = slot;
+    if level == 0 {
+        root.timer_wheel.level0[slot].push(queue_idx);
+    } else {
+        root.timer_wheel.level1[slot].push(queue_idx);
+    }
+}
+
+fn rearm_cos_queue(root: &mut CoSInterfaceRuntime, queue_idx: usize, wake_tick: u64) {
+    park_cos_queue(root, queue_idx, wake_tick);
+}
+
+fn advance_cos_timer_wheel(root: &mut CoSInterfaceRuntime, now_ns: u64) {
+    let now_tick = cos_tick_for_ns(now_ns);
+    while root.timer_wheel.current_tick < now_tick {
+        root.timer_wheel.current_tick = root.timer_wheel.current_tick.saturating_add(1);
+        if root.timer_wheel.current_tick % COS_TIMER_WHEEL_L0_SLOTS as u64 == 0 {
+            cascade_cos_timer_wheel_level1(root);
+        }
+        wake_due_cos_timer_slot(root);
+    }
+}
+
+fn cascade_cos_timer_wheel_level1(root: &mut CoSInterfaceRuntime) {
+    let slot =
+        ((root.timer_wheel.current_tick / COS_TIMER_WHEEL_L0_SLOTS as u64) % COS_TIMER_WHEEL_L1_SLOTS as u64)
+            as usize;
+    let queued = core::mem::take(&mut root.timer_wheel.level1[slot]);
+    let mut rearm = Vec::with_capacity(queued.len());
+    for queue_idx in queued {
+        let Some(queue) = root.queues.get(queue_idx) else {
+            continue;
+        };
+        if !queue.parked || queue.wheel_level != 1 || queue.wheel_slot != slot {
+            continue;
+        }
+        rearm.push((queue_idx, queue.next_wakeup_tick));
+    }
+    for (queue_idx, wake_tick) in rearm {
+        rearm_cos_queue(root, queue_idx, wake_tick);
+    }
+}
+
+fn wake_due_cos_timer_slot(root: &mut CoSInterfaceRuntime) {
+    let slot = (root.timer_wheel.current_tick % COS_TIMER_WHEEL_L0_SLOTS as u64) as usize;
+    let queued = core::mem::take(&mut root.timer_wheel.level0[slot]);
+    let mut rearm = Vec::with_capacity(queued.len());
+    let mut wake = Vec::with_capacity(queued.len());
+    for queue_idx in queued {
+        let Some(queue) = root.queues.get(queue_idx) else {
+            continue;
+        };
+        if !queue.parked || queue.wheel_level != 0 || queue.wheel_slot != slot {
+            continue;
+        }
+        if queue.next_wakeup_tick <= root.timer_wheel.current_tick {
+            wake.push(queue_idx);
+        } else {
+            rearm.push((queue_idx, queue.next_wakeup_tick));
+        }
+    }
+    for queue_idx in wake {
+        wake_cos_queue(root, queue_idx);
+    }
+    for (queue_idx, wake_tick) in rearm {
+        rearm_cos_queue(root, queue_idx, wake_tick);
+    }
 }
 
 pub(super) fn resolve_cos_queue_id(
@@ -679,6 +832,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
         last_refill_ns: now_ns,
         default_queue: config.default_queue,
         nonempty_queues: 0,
+        runnable_queues: 0,
         queues: config
             .queues
             .iter()
@@ -690,11 +844,21 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 tokens: queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
                 last_refill_ns: now_ns,
                 queued_bytes: 0,
+                runnable: false,
+                parked: false,
+                next_wakeup_tick: 0,
+                wheel_level: 0,
+                wheel_slot: 0,
                 items: VecDeque::new(),
             })
             .collect(),
         queue_indices_by_priority,
         rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
+        timer_wheel: CoSTimerWheelRuntime {
+            current_tick: cos_tick_for_ns(now_ns),
+            level0: std::array::from_fn(|_| Vec::new()),
+            level1: std::array::from_fn(|_| Vec::new()),
+        },
     }
 }
 
@@ -743,6 +907,12 @@ fn enqueue_cos_item(
             queue.items.push_back(item);
             if queue_was_empty {
                 root.nonempty_queues = root.nonempty_queues.saturating_add(1);
+                if !queue.runnable {
+                    root.runnable_queues = root.runnable_queues.saturating_add(1);
+                }
+                queue.runnable = true;
+                queue.parked = false;
+                queue.next_wakeup_tick = 0;
                 root_became_nonempty = root_was_empty;
             }
             (true, queue.queue_id, None)
@@ -774,14 +944,27 @@ fn enqueue_cos_item(
 
 fn refresh_cos_interface_activity(binding: &mut BindingWorker, root_ifindex: i32) {
     let mut new_nonempty = 0usize;
+    let mut new_runnable = 0usize;
     let old_nonempty = binding
         .cos_interfaces
         .get(&root_ifindex)
         .map(|root| root.nonempty_queues)
         .unwrap_or(0);
     if let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) {
-        new_nonempty = root.queues.iter().filter(|queue| !queue.items.is_empty()).count();
+        for queue in &mut root.queues {
+            if queue.items.is_empty() {
+                queue.runnable = false;
+                queue.parked = false;
+                queue.next_wakeup_tick = 0;
+                continue;
+            }
+            new_nonempty = new_nonempty.saturating_add(1);
+            if queue.runnable {
+                new_runnable = new_runnable.saturating_add(1);
+            }
+        }
         root.nonempty_queues = new_nonempty;
+        root.runnable_queues = new_runnable;
     }
     if old_nonempty == 0 && new_nonempty > 0 {
         binding.cos_nonempty_interfaces = binding.cos_nonempty_interfaces.saturating_add(1);
@@ -1584,5 +1767,108 @@ mod tests {
         );
 
         assert_eq!(queue_id, Some(7));
+    }
+
+    fn test_cos_interface_runtime(now_ns: u64) -> CoSInterfaceRuntime {
+        build_cos_interface_runtime(
+            &CoSInterfaceConfig {
+                shaping_rate_bytes: 1_000_000,
+                burst_bytes: COS_MIN_BURST_BYTES,
+                default_queue: 0,
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![CoSQueueConfig {
+                    queue_id: 0,
+                    forwarding_class: "best-effort".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                }],
+            },
+            now_ns,
+        )
+    }
+
+    fn test_cos_item(len: usize) -> CoSPendingTxItem {
+        CoSPendingTxItem::Local(TxRequest {
+            bytes: vec![0; len],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 42,
+            cos_queue_id: Some(0),
+        })
+    }
+
+    #[test]
+    fn estimate_cos_queue_wakeup_tick_uses_token_deficits() {
+        let mut root = test_cos_interface_runtime(0);
+        root.tokens = 0;
+        root.queues[0].tokens = 0;
+
+        let wake_tick = estimate_cos_queue_wakeup_tick(
+            root.tokens,
+            root.shaping_rate_bytes,
+            root.queues[0].tokens,
+            root.queues[0].transmit_rate_bytes,
+            1500,
+            0,
+        )
+        .expect("wake tick");
+
+        assert_eq!(wake_tick, 30);
+    }
+
+    #[test]
+    fn timer_wheel_wakes_short_parked_queue() {
+        let mut root = test_cos_interface_runtime(0);
+        root.queues[0].items.push_back(test_cos_item(1500));
+        root.queues[0].queued_bytes = 1500;
+        root.queues[0].runnable = true;
+        root.nonempty_queues = 1;
+        root.runnable_queues = 1;
+
+        park_cos_queue(&mut root, 0, 5);
+
+        assert!(root.queues[0].parked);
+        assert!(!root.queues[0].runnable);
+        assert_eq!(root.runnable_queues, 0);
+
+        advance_cos_timer_wheel(&mut root, 4 * COS_TIMER_WHEEL_TICK_NS);
+        assert!(root.queues[0].parked);
+        assert!(!root.queues[0].runnable);
+
+        advance_cos_timer_wheel(&mut root, 5 * COS_TIMER_WHEEL_TICK_NS);
+        assert!(!root.queues[0].parked);
+        assert!(root.queues[0].runnable);
+        assert_eq!(root.runnable_queues, 1);
+    }
+
+    #[test]
+    fn timer_wheel_cascades_long_parked_queue() {
+        let mut root = test_cos_interface_runtime(0);
+        root.queues[0].items.push_back(test_cos_item(1500));
+        root.queues[0].queued_bytes = 1500;
+        root.queues[0].runnable = true;
+        root.nonempty_queues = 1;
+        root.runnable_queues = 1;
+
+        let wake_tick = COS_TIMER_WHEEL_L0_SLOTS as u64 + 10;
+        park_cos_queue(&mut root, 0, wake_tick);
+
+        assert_eq!(root.queues[0].wheel_level, 1);
+        assert!(root.queues[0].parked);
+
+        advance_cos_timer_wheel(
+            &mut root,
+            (wake_tick - 1) * COS_TIMER_WHEEL_TICK_NS,
+        );
+        assert!(root.queues[0].parked);
+        assert!(!root.queues[0].runnable);
+
+        advance_cos_timer_wheel(&mut root, wake_tick * COS_TIMER_WHEEL_TICK_NS);
+        assert!(!root.queues[0].parked);
+        assert!(root.queues[0].runnable);
+        assert_eq!(root.runnable_queues, 1);
     }
 }

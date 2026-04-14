@@ -568,9 +568,11 @@ pub(super) struct CoSInterfaceRuntime {
     pub(super) last_refill_ns: u64,
     pub(super) default_queue: u8,
     pub(super) nonempty_queues: usize,
+    pub(super) runnable_queues: usize,
     pub(super) queues: Vec<CoSQueueRuntime>,
     pub(super) queue_indices_by_priority: [Vec<usize>; COS_PRIORITY_LEVELS],
     pub(super) rr_index_by_priority: [usize; COS_PRIORITY_LEVELS],
+    pub(super) timer_wheel: CoSTimerWheelRuntime,
 }
 
 pub(super) struct CoSQueueRuntime {
@@ -581,7 +583,18 @@ pub(super) struct CoSQueueRuntime {
     pub(super) tokens: u64,
     pub(super) last_refill_ns: u64,
     pub(super) queued_bytes: u64,
+    pub(super) runnable: bool,
+    pub(super) parked: bool,
+    pub(super) next_wakeup_tick: u64,
+    pub(super) wheel_level: u8,
+    pub(super) wheel_slot: usize,
     pub(super) items: VecDeque<CoSPendingTxItem>,
+}
+
+pub(super) struct CoSTimerWheelRuntime {
+    pub(super) current_tick: u64,
+    pub(super) level0: [Vec<usize>; COS_TIMER_WHEEL_L0_SLOTS],
+    pub(super) level1: [Vec<usize>; COS_TIMER_WHEEL_L1_SLOTS],
 }
 
 pub(super) enum CoSPendingTxItem {
@@ -590,6 +603,8 @@ pub(super) enum CoSPendingTxItem {
 }
 
 pub(super) const COS_PRIORITY_LEVELS: usize = 6;
+pub(super) const COS_TIMER_WHEEL_L0_SLOTS: usize = 256;
+pub(super) const COS_TIMER_WHEEL_L1_SLOTS: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PreparedTxRecycle {

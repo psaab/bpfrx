@@ -332,7 +332,7 @@ Note: The vSRX deployment guide markets CoS as part of the standard feature set,
 | **BA Classifiers** | `class-of-service classifiers dscp ...` | Classify incoming traffic by DSCP/802.1p into forwarding classes and loss priorities | Low | Missing |
 | **Rewrite Rules** | `class-of-service rewrite-rules dscp ...` | Rewrite outgoing DSCP/802.1p values. xpf has filter-based DSCP rewrite. | Low | Partial (via firewall filter forwarding-class action) |
 | **WRED Drop Profiles** | `class-of-service drop-profiles ...` | Weighted Random Early Detection congestion avoidance per queue | Low | Missing |
-| **Traffic Shaping** | `class-of-service interfaces ... shaping-rate ...` | Per-interface output rate shaping | Low | Partial (userspace-only Phase 1 egress shaping with FIFO-per-class queues; not full Junos CoS parity) |
+| **Traffic Shaping** | `class-of-service interfaces ... shaping-rate ...` | Per-interface output rate shaping | Low | Partial (userspace-only Phase 1 egress shaping with FIFO-per-class queues and timer-wheel deferred eligibility; not full Junos CoS parity) |
 | **Interface CoS Binding** | `class-of-service interfaces ... scheduler-map ...` | Bind scheduler-map and classifiers to specific interfaces | Low | Partial (scheduler-map binding works on userspace interfaces, but BA classifiers and broader CoS attachment semantics are still missing) |
 
 ---
