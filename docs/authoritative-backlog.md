@@ -21,10 +21,10 @@ Use these sources in this order when there is disagreement:
 ### 1) vSRX parity gaps (from `docs/feature-gaps.md` row data)
 
 Row-level gap totals:
-- Missing: 125
+- Missing: 124
 - Partial: 14
 - Parse-Only: 1
-- Total Open Gaps: 140
+- Total Open Gaps: 139
 
 Category totals:
 
@@ -37,7 +37,7 @@ Category totals:
 | 5. SSL/TLS Inspection | 4 | 0 | 0 | 4 |
 | 6. Advanced Threat Prevention (ATP) | 5 | 1 | 0 | 6 |
 | 7. User/Identity Firewall | 5 | 0 | 0 | 5 |
-| 8. NAT Enhancements | 5 | 1 | 0 | 6 |
+| 8. NAT Enhancements | 5 | 0 | 0 | 5 |
 | 9. Screen/IDS Enhancements | 4 | 2 | 0 | 6 |
 | 10. Security Flow Enhancements | 5 | 0 | 0 | 5 |
 | 11. ALG Enhancements | 9 | 0 | 0 | 9 |
@@ -45,7 +45,7 @@ Category totals:
 | 13. PKI / Certificates | 3 | 1 | 0 | 4 |
 | 14. Routing Enhancements | 10 | 3 | 0 | 13 |
 | 15. VPN Enhancements | 9 | 0 | 0 | 9 |
-| 16. HA Enhancements | 0 | 1 | 0 | 1 |
+| 16. HA Enhancements | 0 | 2 | 0 | 2 |
 | 17. Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
 | 18. QoS / Class of Service | 7 | 1 | 0 | 8 |
 | 19. Multi-Tenancy | 4 | 0 | 0 | 4 |
@@ -69,7 +69,6 @@ From `docs/next-features` and HA proposal docs:
 - Strict single-owner VIP mode for same-L2 HA (tracking issue #104)
 - Deterministic VRRP failover reconciliation
 - Runtime behavior for `system license autoupdate url`
-- Explicit Twice NAT parity validation and support contract (tracking issue #645; see `docs/next-features/twice-nat.md`)
 
 ### 3) Additional open items from bug/test planning docs
 
@@ -115,6 +114,10 @@ These are documented as implemented in `docs/phases.md` and should not remain in
   - structured DPD parsing and runtime generation
   - `external-interface` to runtime `local-address` resolution
   - Junos `$9$` PSK decoding
+- Twice NAT parity:
+  - static DNAT now keys on ingress zone with wildcard fallback for SNAT return-path entries across eBPF, DPDK, and userspace
+  - userspace post-DNAT SNAT matching evaluates destination filters against the translated destination
+  - session/gRPC visibility preserves both NAT legs for combined NAT flows
 - Sync known-issues pair below are marked fixed in `docs/bugs.md`:
   - NO_NEIGH failover issue
   - Monotonic clock skew session expiry issue

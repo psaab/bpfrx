@@ -451,6 +451,16 @@ pub(super) struct SessionFlow {
 }
 
 impl SessionFlow {
+    pub(super) fn with_destination(&self, dst_ip: IpAddr) -> Self {
+        let mut forward_key = self.forward_key.clone();
+        forward_key.dst_ip = dst_ip;
+        Self {
+            src_ip: self.src_ip,
+            dst_ip,
+            forward_key,
+        }
+    }
+
     pub(super) fn reverse_key_with_nat(&self, nat: NatDecision) -> SessionKey {
         reverse_session_key(&self.forward_key, nat)
     }

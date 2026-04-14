@@ -334,6 +334,7 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 																.protocol = meta->protocol,
 																.dst_ip = alloc_ip,
 																.dst_port = rte_cpu_to_be_16(port),
+																.from_zone = 0,
 															};
 															int rdpos = rte_hash_add_key(
 																ctx->shm->dnat_table, &rdk);
@@ -390,6 +391,7 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 												.protocol = meta->protocol,
 												.dst_ip = alloc_ip,
 												.dst_port = rte_cpu_to_be_16(port),
+												.from_zone = 0,
 											};
 											int rdpos = rte_hash_add_key(
 												ctx->shm->dnat_table, &rdk);
@@ -483,6 +485,7 @@ policy_check(struct rte_mbuf *pkt, struct pkt_meta *meta,
 											struct dnat_key_v6 rdk6 = {
 												.protocol = meta->protocol,
 												.dst_port = rte_cpu_to_be_16(port),
+												.from_zone = 0,
 											};
 											memcpy(rdk6.dst_ip, pip6->ip, 16);
 											int rdpos = rte_hash_add_key(

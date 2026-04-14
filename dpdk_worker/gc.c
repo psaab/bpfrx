@@ -60,6 +60,7 @@ gc_cleanup_snat_dnat(struct shared_memory *shm, struct session_value *sv)
 			.protocol = sv->reverse_key.protocol,
 			.dst_ip = sv->nat_src_ip,
 			.dst_port = sv->nat_src_port,
+			.from_zone = 0,
 		};
 		rte_hash_del_key(shm->dnat_table, &dk);
 	}
@@ -86,6 +87,7 @@ gc_cleanup_snat_dnat_v6(struct shared_memory *shm, struct session_value_v6 *sv)
 		dk6.protocol = sv->reverse_key.protocol;
 		memcpy(dk6.dst_ip, sv->nat_src_ip, 16);
 		dk6.dst_port = sv->nat_src_port;
+		dk6.from_zone = 0;
 		rte_hash_del_key(shm->dnat_table_v6, &dk6);
 	}
 }

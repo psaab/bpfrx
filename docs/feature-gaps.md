@@ -13,7 +13,7 @@ Last updated: 2026-04-13
 | SSL/TLS Inspection | 4 | 0 | 0 | 4 |
 | Advanced Threat Prevention | 5 | 1 | 0 | 6 |
 | User/Identity Firewall | 5 | 0 | 0 | 5 |
-| NAT Enhancements | 5 | 1 | 0 | 6 |
+| NAT Enhancements | 5 | 0 | 0 | 5 |
 | Screen/IDS Enhancements | 4 | 2 | 0 | 6 |
 | Security Flow Enhancements | 5 | 0 | 0 | 5 |
 | ALG Enhancements | 9 | 0 | 0 | 9 |
@@ -21,7 +21,7 @@ Last updated: 2026-04-13
 | PKI / Certificates | 3 | 1 | 0 | 4 |
 | Routing Enhancements | 10 | 3 | 0 | 13 |
 | VPN Enhancements | 9 | 0 | 0 | 9 |
-| HA Enhancements | 0 | 1 | 0 | 1 |
+| HA Enhancements | 0 | 2 | 0 | 2 |
 | Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
 | QoS / Class of Service | 7 | 1 | 0 | 8 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
@@ -29,7 +29,7 @@ Last updated: 2026-04-13
 | Interface Enhancements | 1 | 1 | 0 | 2 |
 | System Enhancements | 5 | 0 | 0 | 5 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **125** | **14** | **1** | **140** |
+| **TOTAL** | **124** | **14** | **1** | **139** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -155,7 +155,7 @@ bpfrx has SNAT (interface + pool, address-persistent, source-nat off bypass), DN
 |---------|-------------------|-------------|----------|--------|
 | **Proxy ARP for NAT** | `security nat proxy-arp interface ... address ...` | Auto-reply ARP for NAT pool addresses on same subnet as ingress interface. Required when SNAT pool or DNAT addresses are on same L2 segment. | High | **Done** -- Proxy ARP neighbor entries for NAT addresses with GARP on addition. Config: `set security nat proxy-arp interface <iface> address <addr>` with range support. |
 | **Proxy NDP for NAT** | `security nat proxy-ndp interface ... address ...` | IPv6 equivalent of proxy ARP for NAT64/static NAT addresses | Medium | Missing |
-| **Twice NAT** | Combination of SNAT + DNAT rule-sets matching same traffic | Simultaneous source and destination translation in one flow. bpfrx userspace already has merged DNAT+SNAT decision plumbing, reverse-key handling, and session-sync fields for combined NAT, but explicit end-to-end parity and HA validation are still incomplete. | Medium | Partial (userspace merge/reverse/session-sync plumbing exists; missing explicit end-to-end validation, HA coverage, and supported parity statement across dataplanes) |
+| **Twice NAT** | Combination of SNAT + DNAT rule-sets matching same traffic | Simultaneous source and destination translation in single flow. | Medium | **Done** -- Combined SNAT+DNAT flows now preserve both translations in one session path. Static DNAT is keyed by ingress zone with wildcard fallback for SNAT return-path entries across eBPF, DPDK, and userspace. Userspace post-DNAT SNAT matching now evaluates destination filters against the translated destination, and session/gRPC visibility preserves both NAT legs. |
 | **DNS ALG with NAT** | `security alg dns enable` | DNS payload rewriting when NAT changes embedded IP addresses (A/AAAA record doctoring) | Medium | Missing |
 | **Overflow Pool** | `security nat source pool ... overflow-pool ...` | Fallback to interface NAT or another pool when primary SNAT pool is exhausted | Low | Missing |
 | **Address Pooling (paired/no-paired)** | `security nat source pool ... address-pooling paired` | Per-pool override of global address-persistent: paired ensures same source always maps to same pool address; no-paired allows round-robin | Low | Missing |
@@ -301,7 +301,7 @@ bpfrx has a broad chassis cluster implementation with redundancy groups, RETH (V
 | **Active/Active Mode** | `chassis cluster redundancy-group N node 0 priority N node 1 priority N` (both nonzero) | Both nodes forward traffic simultaneously for different RGs. Per-RG VRRP service management, per-RG session sync with zone→RG mapping. | Medium | Done (per-RG service mgmt, per-RG session sync, per-RG election all implemented and tested) |
 | **Redundant Ethernet (reth) Runtime** | `interfaces reth0 redundant-ether-options ...` | Bondless RETH via VRRP on physical member interfaces, virtual MAC per node (`02:bf:72:CC:RR:NN`), programRethMAC, VIP reconciliation, fabric forwarding (including embedded ICMP redirect for mtr/traceroute through secondary), `.link` files with OriginalName matching, session sync across nodes | Medium | Done (fully implemented and validated in cluster testing) |
 | **Primary/Preferred Address per Interface** | `interfaces ... unit ... family inet address ... primary/preferred` | Select which address is used as source for traffic originated by the device. Syslog source address prefers PrimaryAddress, networkd orders primary first. | Low | Done (syslog source address + networkd ordering) |
-| **vSRX Dual Fabric Syntax Compatibility (`fab0` + `fab1`)** | `interfaces fab0/fab1 fabric-options member-interfaces ...` | Native vSRX HA syntax models two fabric links. Requires multi-fabric transport/data-plane (not single `fabric-interface`). | High | Missing (current core HA transport/data-plane still single-fabric) |
+| **vSRX Dual Fabric Syntax Compatibility (`fab0` + `fab1`)** | `interfaces fab0/fab1 fabric-options member-interfaces ...` | Native vSRX HA syntax models two fabric links. Requires multi-fabric transport/data-plane (not single `fabric-interface`). | High | Partial (parser/compiler/runtime support `fab0` + `fab1` syntax, dual-fabric sync transport, CLI visibility, and eBPF/userspace fabric forwarding; DPDK still lacks full dual-fabric cross-chassis redirect parity) |
 | **Fabric Link Redundancy** | `chassis cluster ... fabric-options member-interfaces` | Multiple fabric links between cluster nodes for data forwarding resilience. Linux bond/failover behavior should be consistent across runtime and networkd. | Low | Partial (networkd generation and runtime bond mode are inconsistent) |
 
 ---
@@ -442,7 +442,7 @@ Features commonly requested in enterprise deployments:
 10. **Remote Access IPsec VPN** - Road-warrior IPsec parity beyond site-to-site tunnels
 11. ~~**Aggressive Session Aging**~~ - **Done** (GC high/low-watermark early-ageout behavior)
 12. **Graceful Restart** - Non-stop routing (FRR already supports)
-13. **Twice NAT** - Complex NAT scenarios
+13. ~~**Twice NAT**~~ - **Done** (zone-aware static DNAT + post-DNAT SNAT matching + both-leg session visibility)
 14. **Transparent Mode (L2)** - Inline transparent firewall deployment
 15. ~~**Link Aggregation (LAG)**~~ - **Done**
 16. **PKI / Certificate-Based IPsec** - Certificate-based VPN authentication

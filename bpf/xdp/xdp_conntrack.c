@@ -367,6 +367,7 @@ handle_embedded_icmp_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 		.protocol = emb_proto,
 		.dst_ip   = emb_saddr,
 		.dst_port = emb_src_port,
+		.from_zone = 0,
 	};
 	struct dnat_value *dv = bpf_map_lookup_elem(&dnat_table, &dk);
 
@@ -612,7 +613,10 @@ handle_embedded_icmp_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 	}
 
 	/* Reverse SNAT via dnat_table_v6: embedded src is the SNAT'd address */
-	struct dnat_key_v6 dk6 = { .protocol = emb_proto };
+	struct dnat_key_v6 dk6 = {
+		.protocol = emb_proto,
+		.from_zone = 0,
+	};
 	__builtin_memcpy(dk6.dst_ip, emb_saddr, 16);
 	dk6.dst_port = emb_src_port;
 

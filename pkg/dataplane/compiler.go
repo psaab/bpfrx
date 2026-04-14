@@ -383,7 +383,6 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 // For RETH interfaces, configName stays as "reth0" (for config lookups) while
 // physName resolves to the local physical member's Linux name.
 
-
 func compileAddressBook(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Clear stale address book entries before repopulating.
 	if err := dp.ClearAddressBookV4(); err != nil {
@@ -1461,6 +1460,14 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Destination NAT
 	if natCfg.Destination != nil {
 		for _, rs := range natCfg.Destination.RuleSets {
+			var fromZone uint16
+			if rs.FromZone != "" {
+				var ok bool
+				fromZone, ok = result.ZoneIDs[rs.FromZone]
+				if !ok {
+					return fmt.Errorf("destination NAT from-zone %q not found", rs.FromZone)
+				}
+			}
 			for _, rule := range rs.Rules {
 				if rule.Then.PoolName == "" {
 					continue
@@ -1601,6 +1608,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 									Protocol: proto,
 									DstIP:    ipToUint32BE(matchIP),
 									DstPort:  htons(dstPort),
+									FromZone: fromZone,
 								}
 								dv := DNATValue{
 									NewDstIP:   ipToUint32BE(poolIP),
@@ -1617,6 +1625,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 									Protocol: proto,
 									DstIP:    ipTo16Bytes(matchIP),
 									DstPort:  htons(dstPort),
+									FromZone: fromZone,
 								}
 								dv := DNATValueV6{
 									NewDstIP:   ipTo16Bytes(poolIP),
@@ -2024,7 +2033,6 @@ func compileNAT64(dp DataPlane, cfg *config.Config, result *CompileResult) error
 	slog.Info("NAT64 compilation complete", "prefixes", count)
 	return nil
 }
-
 
 func compileDefaultPolicy(dp DataPlane, cfg *config.Config) error {
 	action := uint8(ActionDeny) // default deny

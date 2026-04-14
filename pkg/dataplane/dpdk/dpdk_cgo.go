@@ -671,6 +671,7 @@ func (m *Manager) ClearAllSessions() (int, int, error) {
 				Protocol: key.Protocol,
 				DstIP:    val.NATSrcIP,
 				DstPort:  val.NATSrcPort,
+				FromZone: 0,
 			})
 		}
 		return true
@@ -685,6 +686,7 @@ func (m *Manager) ClearAllSessions() (int, int, error) {
 				Protocol: key.Protocol,
 				DstIP:    val.NATSrcIP,
 				DstPort:  val.NATSrcPort,
+				FromZone: 0,
 			})
 		}
 		return true
@@ -714,9 +716,10 @@ func (m *Manager) SetDNATEntry(key dataplane.DNATKey, val dataplane.DNATValue) e
 		return fmt.Errorf("DPDK not initialized")
 	}
 	ck := C.struct_dnat_key{
-		protocol: C.uint8_t(key.Protocol),
-		dst_ip:   C.uint32_t(key.DstIP),
-		dst_port: C.uint16_t(key.DstPort),
+		protocol:  C.uint8_t(key.Protocol),
+		dst_ip:    C.uint32_t(key.DstIP),
+		dst_port:  C.uint16_t(key.DstPort),
+		from_zone: C.uint16_t(key.FromZone),
 	}
 	pos := C.rte_hash_add_key(shm.dnat_table, unsafe.Pointer(&ck))
 	if pos < 0 {
@@ -737,9 +740,10 @@ func (m *Manager) DeleteDNATEntry(key dataplane.DNATKey) error {
 		return fmt.Errorf("DPDK not initialized")
 	}
 	ck := C.struct_dnat_key{
-		protocol: C.uint8_t(key.Protocol),
-		dst_ip:   C.uint32_t(key.DstIP),
-		dst_port: C.uint16_t(key.DstPort),
+		protocol:  C.uint8_t(key.Protocol),
+		dst_ip:    C.uint32_t(key.DstIP),
+		dst_port:  C.uint16_t(key.DstPort),
+		from_zone: C.uint16_t(key.FromZone),
 	}
 	C.rte_hash_del_key(shm.dnat_table, unsafe.Pointer(&ck))
 	return nil
@@ -763,6 +767,7 @@ func (m *Manager) SetDNATEntryV6(key dataplane.DNATKeyV6, val dataplane.DNATValu
 	ck.protocol = C.uint8_t(key.Protocol)
 	copyCBytes(ck.dst_ip[:], key.DstIP[:])
 	ck.dst_port = C.uint16_t(key.DstPort)
+	ck.from_zone = C.uint16_t(key.FromZone)
 	pos := C.rte_hash_add_key(shm.dnat_table_v6, unsafe.Pointer(&ck))
 	if pos < 0 {
 		return fmt.Errorf("rte_hash_add_key(dnat_v6): %d", pos)
@@ -785,6 +790,7 @@ func (m *Manager) DeleteDNATEntryV6(key dataplane.DNATKeyV6) error {
 	ck.protocol = C.uint8_t(key.Protocol)
 	copyCBytes(ck.dst_ip[:], key.DstIP[:])
 	ck.dst_port = C.uint16_t(key.DstPort)
+	ck.from_zone = C.uint16_t(key.FromZone)
 	C.rte_hash_del_key(shm.dnat_table_v6, unsafe.Pointer(&ck))
 	return nil
 }
@@ -1719,7 +1725,7 @@ func (m *Manager) ClearFIBRoutes() {
 }
 
 func (m *Manager) NotifyLinkCycle() {} // no-op for DPDK
-func (m *Manager) SyncFabricState()  {} // no-op for DPDK
+func (m *Manager) SyncFabricState() {} // no-op for DPDK
 
 func (m *Manager) BumpFIBGeneration() uint32 {
 	shm := m.platform.shm
@@ -1869,6 +1875,7 @@ func (m *Manager) DeleteStaleDNATStatic(written map[dataplane.DNATKey]bool) {
 			Protocol: uint8(ck.protocol),
 			DstIP:    uint32(ck.dst_ip),
 			DstPort:  uint16(ck.dst_port),
+			FromZone: uint16(ck.from_zone),
 		}
 		return written[gk]
 	})
@@ -1885,6 +1892,7 @@ func (m *Manager) DeleteStaleDNATStaticV6(written map[dataplane.DNATKeyV6]bool) 
 		gk.Protocol = uint8(ck.protocol)
 		copyBytes(gk.DstIP[:], ck.dst_ip[:])
 		gk.DstPort = uint16(ck.dst_port)
+		gk.FromZone = uint16(ck.from_zone)
 		return written[gk]
 	})
 }

@@ -329,6 +329,31 @@ func TestBuildSessionSyncRequestV4ConvertsPortsToHostOrder(t *testing.T) {
 	}
 }
 
+func TestBuildSessionSyncRequestV4PreservesBothNatLegs(t *testing.T) {
+	m := &Manager{inner: dataplane.New()}
+	key := dataplane.SessionKey{
+		SrcIP:    [4]byte{198, 51, 100, 10},
+		DstIP:    [4]byte{172, 16, 80, 8},
+		SrcPort:  hostToNetwork16(54321),
+		DstPort:  hostToNetwork16(443),
+		Protocol: 6,
+	}
+	val := &dataplane.SessionValue{
+		Flags:      dataplane.SessFlagSNAT | dataplane.SessFlagDNAT,
+		NATSrcIP:   binary.NativeEndian.Uint32([]byte{10, 0, 61, 1}),
+		NATDstIP:   binary.NativeEndian.Uint32([]byte{10, 0, 61, 102}),
+		NATSrcPort: hostToNetwork16(54321),
+		NATDstPort: hostToNetwork16(8443),
+	}
+	req := m.buildSessionSyncRequestV4("upsert", key, val)
+	if req.NATSrcIP != "10.0.61.1" || req.NATDstIP != "10.0.61.102" {
+		t.Fatalf("unexpected nat ips: %+v", req)
+	}
+	if req.NATSrcPort != 54321 || req.NATDstPort != 8443 {
+		t.Fatalf("unexpected nat ports: %+v", req)
+	}
+}
+
 func TestBuildSessionSyncRequestV4PreservesTunnelEndpointIdentity(t *testing.T) {
 	m := &Manager{
 		inner: dataplane.New(),
@@ -475,6 +500,36 @@ func TestBuildSessionSyncRequestV6ConvertsPortsToHostOrder(t *testing.T) {
 	}
 	if !req.FabricIngress {
 		t.Fatalf("expected fabric_ingress to be preserved: %+v", req)
+	}
+}
+
+func TestBuildSessionSyncRequestV6PreservesBothNatLegs(t *testing.T) {
+	m := &Manager{inner: dataplane.New()}
+	var srcIP, dstIP, natSrc, natDst [16]byte
+	copy(srcIP[:], net.ParseIP("2001:db8::10").To16())
+	copy(dstIP[:], net.ParseIP("2001:db8:80::8").To16())
+	copy(natSrc[:], net.ParseIP("2001:db8:61::1").To16())
+	copy(natDst[:], net.ParseIP("2001:db8:61::102").To16())
+	key := dataplane.SessionKeyV6{
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
+		SrcPort:  hostToNetwork16(54321),
+		DstPort:  hostToNetwork16(443),
+		Protocol: 6,
+	}
+	val := &dataplane.SessionValueV6{
+		Flags:      dataplane.SessFlagSNAT | dataplane.SessFlagDNAT,
+		NATSrcIP:   natSrc,
+		NATDstIP:   natDst,
+		NATSrcPort: hostToNetwork16(54321),
+		NATDstPort: hostToNetwork16(8443),
+	}
+	req := m.buildSessionSyncRequestV6("upsert", key, val)
+	if req.NATSrcIP != "2001:db8:61::1" || req.NATDstIP != "2001:db8:61::102" {
+		t.Fatalf("unexpected nat ips: %+v", req)
+	}
+	if req.NATSrcPort != 54321 || req.NATDstPort != 8443 {
+		t.Fatalf("unexpected nat ports: %+v", req)
 	}
 }
 
