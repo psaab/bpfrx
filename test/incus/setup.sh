@@ -376,6 +376,13 @@ cmd_deploy() {
 	info "Building xpfd and cli..."
 	make -C "$PROJECT_ROOT" build build-ctl
 
+	# Migrate from old bpfrxd naming if present.
+	incus exec "$INSTANCE_NAME" -- systemctl stop bpfrxd 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- systemctl disable bpfrxd 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- rm -f /etc/systemd/system/bpfrxd.service 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- rm -f /usr/local/sbin/bpfrxd 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- bash -c 'if [ -d /etc/bpfrx ] && [ ! -d /etc/xpf ]; then mv /etc/bpfrx /etc/xpf; fi' 2>/dev/null || true
+
 	# Stop service gracefully, then clean BPF state for binary upgrade.
 	# Order matters: systemctl stop sends SIGTERM (graceful socket close),
 	# then xpfd cleanup removes pinned BPF maps/links.  The final
@@ -383,6 +390,7 @@ cmd_deploy() {
 	incus exec "$INSTANCE_NAME" -- systemctl stop xpfd 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- xpfd cleanup 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- pkill -9 xpfd 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- pkill -9 xpf-userspace 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- pkill -9 cli 2>/dev/null || true
 	sleep 1
 
