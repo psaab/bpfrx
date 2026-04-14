@@ -258,10 +258,13 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 			if sys.Services == nil {
 				sys.Services = &SystemServicesConfig{}
 			}
-			if dnsNode.FindChild("dns-proxy") != nil {
+			if len(dnsNode.Keys) > 1 {
+				return fmt.Errorf("system services dns: unsupported arguments")
+			}
+			if hasDNSProxySubtree(dnsNode) {
 				return fmt.Errorf("system services dns dns-proxy: unsupported")
 			}
-			if len(dnsNode.Children) > 0 {
+			if !dnsNode.IsLeaf {
 				return fmt.Errorf("system services dns: subconfiguration unsupported")
 			}
 			sys.Services.DNSEnabled = true
@@ -313,6 +316,18 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 	}
 
 	return nil
+}
+
+func hasDNSProxySubtree(node *Node) bool {
+	for _, child := range node.Children {
+		if child.Name() == "dns-proxy" {
+			return true
+		}
+		if len(child.Keys) >= 2 && child.Keys[0] == "inactive:" && child.Keys[1] == "dns-proxy" {
+			return true
+		}
+	}
+	return false
 }
 
 func compileDPDKDataplane(node *Node, cfg *DPDKConfig) error {

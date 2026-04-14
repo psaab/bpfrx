@@ -969,7 +969,14 @@ func TestDNSServiceEnabled(t *testing.T) {
 }
 
 func TestDNSProxyRejected(t *testing.T) {
-	input := `system {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name: "active dns-proxy subtree",
+			input: `system {
     services {
         dns {
             dns-proxy {
@@ -980,14 +987,53 @@ func TestDNSProxyRejected(t *testing.T) {
             }
         }
     }
-}`
-	p := NewParser(input)
-	tree, errs := p.Parse()
-	if errs != nil {
-		t.Fatal(errs)
+}`,
+			want: "system services dns dns-proxy: unsupported",
+		},
+		{
+			name: "inactive dns-proxy subtree",
+			input: `system {
+    services {
+        dns {
+            inactive: dns-proxy {
+                default-domain *;
+            }
+        }
+    }
+}`,
+			want: "system services dns dns-proxy: unsupported",
+		},
+		{
+			name: "empty dns block",
+			input: `system {
+    services {
+        dns {
+        }
+    }
+}`,
+			want: "system services dns: subconfiguration unsupported",
+		},
+		{
+			name: "dns arguments rejected",
+			input: `system {
+    services {
+        dns foo;
+    }
+}`,
+			want: "system services dns: unsupported arguments",
+		},
 	}
-	if _, err := CompileConfig(tree); err == nil || !strings.Contains(err.Error(), "system services dns dns-proxy: unsupported") {
-		t.Fatalf("expected dns-proxy unsupported error, got %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewParser(tt.input)
+			tree, errs := p.Parse()
+			if errs != nil {
+				t.Fatal(errs)
+			}
+			if _, err := CompileConfig(tree); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected %q, got %v", tt.want, err)
+			}
+		})
 	}
 }
 
