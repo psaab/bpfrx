@@ -889,5 +889,13 @@ func parseScaledDecimalUnit(s string) uint64 {
 	if err != nil || v < 0 {
 		return 0
 	}
-	return uint64(math.Round(v * multiplier))
+	scaled := v * multiplier
+	if math.IsNaN(scaled) || math.IsInf(scaled, 0) {
+		return 0
+	}
+	rounded := math.Round(scaled)
+	if rounded > float64(^uint64(0)) {
+		return 0
+	}
+	return uint64(rounded)
 }

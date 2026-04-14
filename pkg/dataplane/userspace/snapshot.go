@@ -1431,7 +1431,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 		return nil
 	}
 	cos := cfg.ClassOfService
-	if len(cos.ForwardingClasses) == 0 && len(cos.DSCPClassifiers) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 {
+	if len(cos.ForwardingClasses) == 0 && len(cos.DSCPClassifiers) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 && len(cos.Interfaces) == 0 {
 		return nil
 	}
 	snap := &ClassOfServiceSnapshot{}
