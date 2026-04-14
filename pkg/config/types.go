@@ -299,6 +299,7 @@ type SchedulerConfig struct {
 // scheduler-maps, and per-interface shaping configuration.
 type ClassOfServiceConfig struct {
 	ForwardingClasses map[string]*CoSForwardingClass
+	DSCPClassifiers   map[string]*CoSDSCPClassifier
 	Schedulers        map[string]*CoSScheduler
 	SchedulerMaps     map[string]*CoSSchedulerMap
 	Interfaces        map[string]*CoSInterface
@@ -308,6 +309,19 @@ type ClassOfServiceConfig struct {
 type CoSForwardingClass struct {
 	Name  string
 	Queue int
+}
+
+// CoSDSCPClassifier maps DSCP code points into forwarding classes.
+type CoSDSCPClassifier struct {
+	Name    string
+	Entries []*CoSDSCPClassifierEntry
+}
+
+// CoSDSCPClassifierEntry assigns one or more DSCP values to a forwarding class.
+type CoSDSCPClassifierEntry struct {
+	ForwardingClass string
+	LossPriority    string
+	DSCPValues      []uint8
 }
 
 // CoSScheduler defines the Phase 1 class scheduler knobs.
@@ -343,6 +357,7 @@ type CoSInterfaceUnit struct {
 	ShapingRateBytes uint64
 	BurstSizeBytes   uint64
 	SchedulerMap     string
+	DSCPClassifier   string
 }
 
 // SystemConfig holds system-level configuration.

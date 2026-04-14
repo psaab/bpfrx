@@ -570,6 +570,7 @@ func ValidateConfig(cfg *Config) []string {
 	}
 
 	if cos := cfg.ClassOfService; cos != nil {
+		warnedClassifierLossPriority := false
 		for _, class := range cos.ForwardingClasses {
 			if class == nil {
 				continue
@@ -600,23 +601,51 @@ func ValidateConfig(cfg *Config) []string {
 				}
 			}
 		}
+		for _, classifier := range cos.DSCPClassifiers {
+			if classifier == nil {
+				continue
+			}
+			for _, entry := range classifier.Entries {
+				if entry == nil || entry.ForwardingClass == "" {
+					continue
+				}
+				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"class-of-service dscp classifier %q references undefined forwarding-class %q",
+						classifier.Name, entry.ForwardingClass))
+				}
+				if entry.LossPriority != "" && !warnedClassifierLossPriority {
+					warnings = append(warnings, "class-of-service dscp classifier loss-priority is accepted for compatibility but not yet enforced by the userspace dataplane")
+					warnedClassifierLossPriority = true
+				}
+			}
+		}
 		for _, iface := range cos.Interfaces {
 			if iface == nil {
 				continue
 			}
 			for _, unit := range iface.Units {
-				if unit == nil || unit.SchedulerMap == "" {
+				if unit == nil {
 					continue
 				}
-				if _, ok := cos.SchedulerMaps[unit.SchedulerMap]; !ok {
-					warnings = append(warnings, fmt.Sprintf(
-						"class-of-service interface %s unit %d references undefined scheduler-map %q",
-						iface.Name, unit.Unit, unit.SchedulerMap))
+				if unit.SchedulerMap != "" {
+					if _, ok := cos.SchedulerMaps[unit.SchedulerMap]; !ok {
+						warnings = append(warnings, fmt.Sprintf(
+							"class-of-service interface %s unit %d references undefined scheduler-map %q",
+							iface.Name, unit.Unit, unit.SchedulerMap))
+					}
+				}
+				if unit.DSCPClassifier != "" {
+					if _, ok := cos.DSCPClassifiers[unit.DSCPClassifier]; !ok {
+						warnings = append(warnings, fmt.Sprintf(
+							"class-of-service interface %s unit %d references undefined dscp classifier %q",
+							iface.Name, unit.Unit, unit.DSCPClassifier))
+					}
 				}
 			}
 		}
-		if len(cos.Interfaces) > 0 && cfg.System.DataplaneType != "userspace" {
-			warnings = append(warnings, "class-of-service shaping is only implemented in the userspace dataplane; configuration is accepted but will not take effect on this dataplane")
+		if (len(cos.Interfaces) > 0 || len(cos.DSCPClassifiers) > 0) && cfg.System.DataplaneType != "userspace" {
+			warnings = append(warnings, "class-of-service shaping and dscp classifier attachment are only implemented in the userspace dataplane; configuration is accepted but will not take effect on this dataplane")
 		}
 	}
 

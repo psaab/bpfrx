@@ -1029,7 +1029,25 @@ pub(super) fn resolve_cos_queue_id(
             return Some(*queue_id);
         }
     }
+    if let Some(queue_id) = resolve_cos_dscp_classifier_queue_id(forwarding, iface, meta.dscp) {
+        return Some(queue_id);
+    }
     Some(iface.default_queue)
+}
+
+fn resolve_cos_dscp_classifier_queue_id(
+    forwarding: &ForwardingState,
+    iface: &CoSInterfaceConfig,
+    dscp: u8,
+) -> Option<u8> {
+    if iface.dscp_classifier.is_empty() {
+        return None;
+    }
+    forwarding
+        .cos
+        .dscp_classifiers
+        .get(&iface.dscp_classifier)
+        .and_then(|classifier| classifier.queue_by_dscp.get(&dscp).copied())
 }
 
 pub(super) fn enqueue_local_into_cos(
@@ -1803,9 +1821,9 @@ pub(super) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, now_ns: u6
 mod tests {
     use super::*;
     use crate::{
-        ClassOfServiceSnapshot, CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot,
-        CoSSchedulerMapSnapshot, CoSSchedulerSnapshot, FirewallFilterSnapshot,
-        FirewallTermSnapshot,
+        ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
+        CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot,
+        CoSSchedulerSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot,
     };
 
     #[test]
@@ -2049,6 +2067,7 @@ mod tests {
                         },
                     ],
                 }],
+                dscp_classifiers: vec![],
             }),
             ..Default::default()
         };
@@ -2123,6 +2142,7 @@ mod tests {
                         queue: 1,
                     },
                 ],
+                dscp_classifiers: vec![],
                 schedulers: vec![
                     CoSSchedulerSnapshot {
                         name: "be-sched".into(),
@@ -2195,6 +2215,7 @@ mod tests {
                     name: "best-effort".into(),
                     queue: 7,
                 }],
+                dscp_classifiers: vec![],
                 schedulers: vec![CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 10_000_000,
@@ -2227,6 +2248,93 @@ mod tests {
         );
 
         assert_eq!(queue_id, Some(7));
+    }
+
+    #[test]
+    fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                ifindex: 202,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
+                cos_scheduler_map: "wan-map".into(),
+                cos_dscp_classifier: "wan-classifier".into(),
+                ..Default::default()
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![
+                    CoSForwardingClassSnapshot {
+                        name: "best-effort".into(),
+                        queue: 0,
+                    },
+                    CoSForwardingClassSnapshot {
+                        name: "voice".into(),
+                        queue: 5,
+                    },
+                ],
+                dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+                    name: "wan-classifier".into(),
+                    entries: vec![CoSDSCPClassifierEntrySnapshot {
+                        forwarding_class: "voice".into(),
+                        loss_priority: "low".into(),
+                        dscp_values: vec![46],
+                    }],
+                }],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "best-effort".into(),
+                            scheduler: "be-sched".into(),
+                        },
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "voice".into(),
+                            scheduler: "voice-sched".into(),
+                        },
+                    ],
+                }],
+                schedulers: vec![
+                    CoSSchedulerSnapshot {
+                        name: "be-sched".into(),
+                        transmit_rate_bytes: 4_000_000,
+                        transmit_rate_exact: false,
+                        priority: "low".into(),
+                        buffer_size_bytes: 128_000,
+                    },
+                    CoSSchedulerSnapshot {
+                        name: "voice-sched".into(),
+                        transmit_rate_bytes: 6_000_000,
+                        transmit_rate_exact: false,
+                        priority: "strict-high".into(),
+                        buffer_size_bytes: 64_000,
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+
+        let forwarding = build_forwarding_state(&snapshot);
+        let queue_id = resolve_cos_queue_id(
+            &forwarding,
+            202,
+            UserspaceDpMeta {
+                ingress_ifindex: 999,
+                ingress_vlan_id: 0,
+                addr_family: libc::AF_INET as u8,
+                dscp: 46,
+                ..Default::default()
+            },
+            Some(&SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 443,
+            }),
+        );
+
+        assert_eq!(queue_id, Some(5));
     }
 
     #[test]
@@ -2289,6 +2397,7 @@ mod tests {
                         queue: 1,
                     },
                 ],
+                dscp_classifiers: vec![],
                 schedulers: vec![
                     CoSSchedulerSnapshot {
                         name: "be-sched".into(),
@@ -2352,6 +2461,7 @@ mod tests {
                 shaping_rate_bytes: 1_000_000,
                 burst_bytes: COS_MIN_BURST_BYTES,
                 default_queue: 0,
+                dscp_classifier: String::new(),
                 queue_by_forwarding_class: FastMap::default(),
                 queues: vec![CoSQueueConfig {
                     queue_id: 0,
@@ -2373,6 +2483,7 @@ mod tests {
                 shaping_rate_bytes: 1_000_000,
                 burst_bytes: COS_MIN_BURST_BYTES,
                 default_queue: 0,
+                dscp_classifier: String::new(),
                 queue_by_forwarding_class: FastMap::default(),
                 queues: vec![CoSQueueConfig {
                     queue_id: 0,

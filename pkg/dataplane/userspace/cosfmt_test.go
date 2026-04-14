@@ -36,6 +36,7 @@ func testCoSConfig() *config.Config {
 							ShapingRateBytes: 1_875_000,
 							BurstSizeBytes:   65_536,
 							SchedulerMap:     "bandwidth-limit",
+							DSCPClassifier:   "wan-classifier",
 						},
 					},
 				},
@@ -62,6 +63,7 @@ func TestFormatCoSInterfaceSummaryShowsConfigOnlyInterface(t *testing.T) {
 	for _, want := range []string{
 		"Interface: reth0.80",
 		"Scheduler map:            bandwidth-limit",
+		"DSCP classifier:          wan-classifier",
 		"Output filter (inet):     bandwidth-output",
 		"Runtime:                  unavailable",
 		"best-effort",

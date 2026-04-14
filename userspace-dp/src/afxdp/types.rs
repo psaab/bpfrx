@@ -173,6 +173,7 @@ pub(super) struct ForwardingState {
 #[derive(Clone, Debug, Default)]
 pub(super) struct CoSState {
     pub(super) interfaces: FastMap<i32, CoSInterfaceConfig>,
+    pub(super) dscp_classifiers: FastMap<String, CoSDSCPClassifierConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -180,8 +181,14 @@ pub(super) struct CoSInterfaceConfig {
     pub(super) shaping_rate_bytes: u64,
     pub(super) burst_bytes: u64,
     pub(super) default_queue: u8,
+    pub(super) dscp_classifier: String,
     pub(super) queue_by_forwarding_class: FastMap<String, u8>,
     pub(super) queues: Vec<CoSQueueConfig>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct CoSDSCPClassifierConfig {
+    pub(super) queue_by_dscp: FastMap<u8, u8>,
 }
 
 #[derive(Clone, Debug)]

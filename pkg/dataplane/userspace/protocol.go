@@ -121,10 +121,12 @@ type InterfaceSnapshot struct {
 	CoSShapingRateBytesPerSec uint64                     `json:"cos_shaping_rate_bytes_per_sec,omitempty"`
 	CoSBurstSize              uint64                     `json:"cos_shaping_burst_bytes,omitempty"`
 	CoSSchedulerMap           string                     `json:"cos_scheduler_map,omitempty"`
+	CoSDSCPClassifier         string                     `json:"cos_dscp_classifier,omitempty"`
 }
 
 type ClassOfServiceSnapshot struct {
 	ForwardingClasses []CoSForwardingClassSnapshot `json:"forwarding_classes,omitempty"`
+	DSCPClassifiers   []CoSDSCPClassifierSnapshot  `json:"dscp_classifiers,omitempty"`
 	Schedulers        []CoSSchedulerSnapshot       `json:"schedulers,omitempty"`
 	SchedulerMaps     []CoSSchedulerMapSnapshot    `json:"scheduler_maps,omitempty"`
 }
@@ -132,6 +134,17 @@ type ClassOfServiceSnapshot struct {
 type CoSForwardingClassSnapshot struct {
 	Name  string `json:"name"`
 	Queue int    `json:"queue"`
+}
+
+type CoSDSCPClassifierSnapshot struct {
+	Name    string                           `json:"name"`
+	Entries []CoSDSCPClassifierEntrySnapshot `json:"entries,omitempty"`
+}
+
+type CoSDSCPClassifierEntrySnapshot struct {
+	ForwardingClass string  `json:"forwarding_class,omitempty"`
+	LossPriority    string  `json:"loss_priority,omitempty"`
+	DSCPValues      []uint8 `json:"dscp_values,omitempty"`
 }
 
 type CoSSchedulerSnapshot struct {

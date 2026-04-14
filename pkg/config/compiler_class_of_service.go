@@ -1,6 +1,9 @@
 package config
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	if cos == nil {
@@ -8,6 +11,9 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	}
 	if cos.ForwardingClasses == nil {
 		cos.ForwardingClasses = make(map[string]*CoSForwardingClass)
+	}
+	if cos.DSCPClassifiers == nil {
+		cos.DSCPClassifiers = make(map[string]*CoSDSCPClassifier)
 	}
 	if cos.Schedulers == nil {
 		cos.Schedulers = make(map[string]*CoSScheduler)
@@ -32,6 +38,42 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 			cos.ForwardingClasses[name] = &CoSForwardingClass{
 				Name:  name,
 				Queue: queue,
+			}
+		}
+	}
+
+	if classifiersNode := node.FindChild("classifiers"); classifiersNode != nil {
+		for _, inst := range namedInstances(classifiersNode.FindChildren("dscp")) {
+			classifier := &CoSDSCPClassifier{Name: inst.name}
+			for _, fcNode := range inst.node.FindChildren("forwarding-class") {
+				className := ""
+				if len(fcNode.Keys) >= 2 {
+					className = fcNode.Keys[1]
+				}
+				if className == "" {
+					continue
+				}
+				for _, lpNode := range fcNode.FindChildren("loss-priority") {
+					lossPriority := ""
+					if len(lpNode.Keys) >= 2 {
+						lossPriority = lpNode.Keys[1]
+					}
+					if lossPriority == "" {
+						lossPriority = nodeVal(lpNode)
+					}
+					codePoints := collectCoSDSCPCodePoints(lpNode)
+					if len(codePoints) == 0 {
+						continue
+					}
+					classifier.Entries = append(classifier.Entries, &CoSDSCPClassifierEntry{
+						ForwardingClass: className,
+						LossPriority:    lossPriority,
+						DSCPValues:      codePoints,
+					})
+				}
+			}
+			if len(classifier.Entries) > 0 {
+				cos.DSCPClassifiers[classifier.Name] = classifier
 			}
 		}
 	}
@@ -108,7 +150,12 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 			if schedMapNode := unitNode.FindChild("scheduler-map"); schedMapNode != nil {
 				unit.SchedulerMap = nodeVal(schedMapNode)
 			}
-			if unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" {
+			if classifiersNode := unitNode.FindChild("classifiers"); classifiersNode != nil {
+				if dscpNode := classifiersNode.FindChild("dscp"); dscpNode != nil {
+					unit.DSCPClassifier = nodeVal(dscpNode)
+				}
+			}
+			if unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" || unit.DSCPClassifier != "" {
 				iface.Units[unitID] = unit
 			}
 		}
@@ -136,4 +183,61 @@ func parseCoSTransmitRate(node *Node) (uint64, bool) {
 		exact = true
 	}
 	return rate, exact
+}
+
+func collectCoSDSCPCodePoints(node *Node) []uint8 {
+	var values []uint8
+	seen := make(map[uint8]struct{})
+	for _, child := range node.FindChildren("code-points") {
+		for _, raw := range child.Keys[1:] {
+			for _, value := range expandCoSCodePointToken(raw) {
+				if _, ok := seen[value]; ok {
+					continue
+				}
+				seen[value] = struct{}{}
+				values = append(values, value)
+			}
+		}
+	}
+	return values
+}
+
+func expandCoSCodePointToken(raw string) []uint8 {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return nil
+	}
+	if value, ok := coSDSCPValues[raw]; ok {
+		return []uint8{value}
+	}
+	if v, err := strconv.Atoi(raw); err == nil && v >= 0 && v <= 63 {
+		return []uint8{uint8(v)}
+	}
+	return nil
+}
+
+var coSDSCPValues = map[string]uint8{
+	"default": 0,
+	"be":      0,
+	"ef":      46,
+	"af11":    10,
+	"af12":    12,
+	"af13":    14,
+	"af21":    18,
+	"af22":    20,
+	"af23":    22,
+	"af31":    26,
+	"af32":    28,
+	"af33":    30,
+	"af41":    34,
+	"af42":    36,
+	"af43":    38,
+	"cs0":     0,
+	"cs1":     8,
+	"cs2":     16,
+	"cs3":     24,
+	"cs4":     32,
+	"cs5":     40,
+	"cs6":     48,
+	"cs7":     56,
 }
