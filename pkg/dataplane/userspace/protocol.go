@@ -99,26 +99,28 @@ type ZoneSnapshot struct {
 }
 
 type InterfaceSnapshot struct {
-	Name            string                     `json:"name"`
-	Zone            string                     `json:"zone,omitempty"`
-	LinuxName       string                     `json:"linux_name,omitempty"`
-	ParentLinuxName string                     `json:"parent_linux_name,omitempty"`
-	Ifindex         int                        `json:"ifindex,omitempty"`
-	ParentIfindex   int                        `json:"parent_ifindex,omitempty"`
-	RXQueues        int                        `json:"rx_queues,omitempty"`
-	VLANID          int                        `json:"vlan_id,omitempty"`
-	LocalFabric     string                     `json:"local_fabric_member,omitempty"`
-	RedundancyGroup int                        `json:"redundancy_group,omitempty"`
-	UnitCount       int                        `json:"unit_count"`
-	Tunnel          bool                       `json:"tunnel"`
-	MTU             int                        `json:"mtu,omitempty"`
-	HardwareAddr    string                     `json:"hardware_addr,omitempty"`
-	Addresses       []InterfaceAddressSnapshot `json:"addresses,omitempty"`
-	FilterInputV4   string                     `json:"filter_input_v4,omitempty"`
-	FilterInputV6   string                     `json:"filter_input_v6,omitempty"`
+	Name                      string                     `json:"name"`
+	Zone                      string                     `json:"zone,omitempty"`
+	LinuxName                 string                     `json:"linux_name,omitempty"`
+	ParentLinuxName           string                     `json:"parent_linux_name,omitempty"`
+	Ifindex                   int                        `json:"ifindex,omitempty"`
+	ParentIfindex             int                        `json:"parent_ifindex,omitempty"`
+	RXQueues                  int                        `json:"rx_queues,omitempty"`
+	VLANID                    int                        `json:"vlan_id,omitempty"`
+	LocalFabric               string                     `json:"local_fabric_member,omitempty"`
+	RedundancyGroup           int                        `json:"redundancy_group,omitempty"`
+	UnitCount                 int                        `json:"unit_count"`
+	Tunnel                    bool                       `json:"tunnel"`
+	MTU                       int                        `json:"mtu,omitempty"`
+	HardwareAddr              string                     `json:"hardware_addr,omitempty"`
+	Addresses                 []InterfaceAddressSnapshot `json:"addresses,omitempty"`
+	FilterInputV4             string                     `json:"filter_input_v4,omitempty"`
+	FilterOutputV4            string                     `json:"filter_output_v4,omitempty"`
+	FilterInputV6             string                     `json:"filter_input_v6,omitempty"`
+	FilterOutputV6            string                     `json:"filter_output_v6,omitempty"`
 	CoSShapingRateBytesPerSec uint64                     `json:"cos_shaping_rate_bytes_per_sec,omitempty"`
-	CoSBurstSize             uint64                     `json:"cos_shaping_burst_bytes,omitempty"`
-	CoSSchedulerMap          string                     `json:"cos_scheduler_map,omitempty"`
+	CoSBurstSize              uint64                     `json:"cos_shaping_burst_bytes,omitempty"`
+	CoSSchedulerMap           string                     `json:"cos_scheduler_map,omitempty"`
 }
 
 type ClassOfServiceSnapshot struct {

@@ -330,7 +330,8 @@ fn drain_shaped_tx(
     }
     let start = binding.cos_interface_rr % binding.cos_interface_order.len();
     for offset in 0..binding.cos_interface_order.len() {
-        let root_ifindex = binding.cos_interface_order[(start + offset) % binding.cos_interface_order.len()];
+        let root_ifindex =
+            binding.cos_interface_order[(start + offset) % binding.cos_interface_order.len()];
         let Some(root) = binding.cos_interfaces.get(&root_ifindex) else {
             continue;
         };
@@ -369,7 +370,8 @@ fn build_cos_batch(
             }
             let start = root.rr_index_by_priority[priority] % indices_len;
             for offset in 0..indices_len {
-                let queue_idx = root.queue_indices_by_priority[priority][(start + offset) % indices_len];
+                let queue_idx =
+                    root.queue_indices_by_priority[priority][(start + offset) % indices_len];
                 let queue = &mut root.queues[queue_idx];
                 if queue.items.is_empty() || !queue.runnable {
                     continue;
@@ -664,9 +666,8 @@ fn advance_cos_timer_wheel(root: &mut CoSInterfaceRuntime, now_ns: u64) {
 }
 
 fn cascade_cos_timer_wheel_level1(root: &mut CoSInterfaceRuntime) {
-    let slot =
-        ((root.timer_wheel.current_tick / COS_TIMER_WHEEL_L0_SLOTS as u64) % COS_TIMER_WHEEL_L1_SLOTS as u64)
-            as usize;
+    let slot = ((root.timer_wheel.current_tick / COS_TIMER_WHEEL_L0_SLOTS as u64)
+        % COS_TIMER_WHEEL_L1_SLOTS as u64) as usize;
     let queued = core::mem::take(&mut root.timer_wheel.level1[slot]);
     let mut rearm = Vec::with_capacity(queued.len());
     for queue_idx in queued {
@@ -719,24 +720,48 @@ pub(super) fn resolve_cos_queue_id(
     let Some(flow_key) = flow_key else {
         return Some(iface.default_queue);
     };
-    let ingress_ifindex = resolve_ingress_logical_ifindex(
-        forwarding,
-        meta.ingress_ifindex as i32,
-        meta.ingress_vlan_id,
-    )
-    .unwrap_or(meta.ingress_ifindex as i32);
     let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
-    let result = crate::filter::evaluate_interface_filter(
-        &forwarding.filter_state,
-        ingress_ifindex,
-        is_v6,
-        flow_key.src_ip,
-        flow_key.dst_ip,
-        flow_key.protocol,
-        flow_key.src_port,
-        flow_key.dst_port,
-        meta.dscp,
-    );
+    let result = if if is_v6 {
+        forwarding
+            .filter_state
+            .iface_filter_out_v6
+            .contains_key(&egress_ifindex)
+    } else {
+        forwarding
+            .filter_state
+            .iface_filter_out_v4
+            .contains_key(&egress_ifindex)
+    } {
+        crate::filter::evaluate_interface_output_filter(
+            &forwarding.filter_state,
+            egress_ifindex,
+            is_v6,
+            flow_key.src_ip,
+            flow_key.dst_ip,
+            flow_key.protocol,
+            flow_key.src_port,
+            flow_key.dst_port,
+            meta.dscp,
+        )
+    } else {
+        let ingress_ifindex = resolve_ingress_logical_ifindex(
+            forwarding,
+            meta.ingress_ifindex as i32,
+            meta.ingress_vlan_id,
+        )
+        .unwrap_or(meta.ingress_ifindex as i32);
+        crate::filter::evaluate_interface_filter(
+            &forwarding.filter_state,
+            ingress_ifindex,
+            is_v6,
+            flow_key.src_ip,
+            flow_key.dst_ip,
+            flow_key.protocol,
+            flow_key.src_port,
+            flow_key.dst_port,
+            meta.dscp,
+        )
+    };
     if !result.forwarding_class.is_empty() {
         if let Some(queue_id) = iface
             .queue_by_forwarding_class
@@ -1621,7 +1646,123 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cos_queue_id_uses_filter_forwarding_class() {
+    fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "reth1.0".into(),
+                    ifindex: 101,
+                    parent_ifindex: 5,
+                    vlan_id: 0,
+                    hardware_addr: "02:bf:72:00:61:01".into(),
+                    filter_input_v4: "cos-classify".into(),
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "reth0.0".into(),
+                    ifindex: 202,
+                    hardware_addr: "02:bf:72:00:80:08".into(),
+                    filter_output_v4: "wan-classify".into(),
+                    cos_shaping_rate_bytes_per_sec: 10_000_000,
+                    cos_shaping_burst_bytes: 256_000,
+                    cos_scheduler_map: "wan-map".into(),
+                    ..Default::default()
+                },
+            ],
+            filters: vec![
+                FirewallFilterSnapshot {
+                    name: "cos-classify".into(),
+                    family: "inet".into(),
+                    terms: vec![FirewallTermSnapshot {
+                        name: "voice".into(),
+                        protocols: vec!["tcp".into()],
+                        destination_ports: vec!["443".into()],
+                        action: "accept".into(),
+                        forwarding_class: "best-effort".into(),
+                        ..Default::default()
+                    }],
+                },
+                FirewallFilterSnapshot {
+                    name: "wan-classify".into(),
+                    family: "inet".into(),
+                    terms: vec![FirewallTermSnapshot {
+                        name: "voice".into(),
+                        protocols: vec!["tcp".into()],
+                        destination_ports: vec!["443".into()],
+                        action: "accept".into(),
+                        forwarding_class: "expedited-forwarding".into(),
+                        ..Default::default()
+                    }],
+                },
+            ],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![
+                    CoSForwardingClassSnapshot {
+                        name: "best-effort".into(),
+                        queue: 0,
+                    },
+                    CoSForwardingClassSnapshot {
+                        name: "expedited-forwarding".into(),
+                        queue: 1,
+                    },
+                ],
+                schedulers: vec![
+                    CoSSchedulerSnapshot {
+                        name: "be-sched".into(),
+                        transmit_rate_bytes: 4_000_000,
+                        priority: "low".into(),
+                        buffer_size_bytes: 128_000,
+                    },
+                    CoSSchedulerSnapshot {
+                        name: "ef-sched".into(),
+                        transmit_rate_bytes: 6_000_000,
+                        priority: "strict-high".into(),
+                        buffer_size_bytes: 64_000,
+                    },
+                ],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "best-effort".into(),
+                            scheduler: "be-sched".into(),
+                        },
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "expedited-forwarding".into(),
+                            scheduler: "ef-sched".into(),
+                        },
+                    ],
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let forwarding = build_forwarding_state(&snapshot);
+        let queue_id = resolve_cos_queue_id(
+            &forwarding,
+            202,
+            UserspaceDpMeta {
+                ingress_ifindex: 5,
+                ingress_vlan_id: 0,
+                addr_family: libc::AF_INET as u8,
+                dscp: 0,
+                ..Default::default()
+            },
+            Some(&SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 443,
+            }),
+        );
+
+        assert_eq!(queue_id, Some(1));
+    }
+
+    #[test]
+    fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists() {
         let snapshot = ConfigSnapshot {
             interfaces: vec![
                 InterfaceSnapshot {
@@ -1769,6 +1910,121 @@ mod tests {
         assert_eq!(queue_id, Some(7));
     }
 
+    #[test]
+    fn resolve_cos_queue_id_defaults_when_output_filter_has_no_forwarding_class() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "reth1.0".into(),
+                    ifindex: 101,
+                    parent_ifindex: 5,
+                    vlan_id: 0,
+                    hardware_addr: "02:bf:72:00:61:01".into(),
+                    filter_input_v4: "cos-classify".into(),
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "reth0.0".into(),
+                    ifindex: 202,
+                    hardware_addr: "02:bf:72:00:80:08".into(),
+                    filter_output_v4: "wan-classify".into(),
+                    cos_shaping_rate_bytes_per_sec: 10_000_000,
+                    cos_shaping_burst_bytes: 256_000,
+                    cos_scheduler_map: "wan-map".into(),
+                    ..Default::default()
+                },
+            ],
+            filters: vec![
+                FirewallFilterSnapshot {
+                    name: "cos-classify".into(),
+                    family: "inet".into(),
+                    terms: vec![FirewallTermSnapshot {
+                        name: "voice".into(),
+                        protocols: vec!["tcp".into()],
+                        destination_ports: vec!["443".into()],
+                        action: "accept".into(),
+                        forwarding_class: "expedited-forwarding".into(),
+                        ..Default::default()
+                    }],
+                },
+                FirewallFilterSnapshot {
+                    name: "wan-classify".into(),
+                    family: "inet".into(),
+                    terms: vec![FirewallTermSnapshot {
+                        name: "allow".into(),
+                        protocols: vec!["tcp".into()],
+                        destination_ports: vec!["443".into()],
+                        action: "accept".into(),
+                        ..Default::default()
+                    }],
+                },
+            ],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![
+                    CoSForwardingClassSnapshot {
+                        name: "best-effort".into(),
+                        queue: 7,
+                    },
+                    CoSForwardingClassSnapshot {
+                        name: "expedited-forwarding".into(),
+                        queue: 1,
+                    },
+                ],
+                schedulers: vec![
+                    CoSSchedulerSnapshot {
+                        name: "be-sched".into(),
+                        transmit_rate_bytes: 10_000_000,
+                        priority: "low".into(),
+                        buffer_size_bytes: 128_000,
+                    },
+                    CoSSchedulerSnapshot {
+                        name: "ef-sched".into(),
+                        transmit_rate_bytes: 10_000_000,
+                        priority: "strict-high".into(),
+                        buffer_size_bytes: 128_000,
+                    },
+                ],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "best-effort".into(),
+                            scheduler: "be-sched".into(),
+                        },
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "expedited-forwarding".into(),
+                            scheduler: "ef-sched".into(),
+                        },
+                    ],
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let forwarding = build_forwarding_state(&snapshot);
+        let queue_id = resolve_cos_queue_id(
+            &forwarding,
+            202,
+            UserspaceDpMeta {
+                ingress_ifindex: 5,
+                ingress_vlan_id: 0,
+                addr_family: libc::AF_INET as u8,
+                dscp: 0,
+                ..Default::default()
+            },
+            Some(&SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 443,
+            }),
+        );
+
+        assert_eq!(queue_id, Some(7));
+    }
+
     fn test_cos_interface_runtime(now_ns: u64) -> CoSInterfaceRuntime {
         build_cos_interface_runtime(
             &CoSInterfaceConfig {
@@ -1859,10 +2115,7 @@ mod tests {
         assert_eq!(root.queues[0].wheel_level, 1);
         assert!(root.queues[0].parked);
 
-        advance_cos_timer_wheel(
-            &mut root,
-            (wake_tick - 1) * COS_TIMER_WHEEL_TICK_NS,
-        );
+        advance_cos_timer_wheel(&mut root, (wake_tick - 1) * COS_TIMER_WHEEL_TICK_NS);
         assert!(root.queues[0].parked);
         assert!(!root.queues[0].runnable);
 
