@@ -343,6 +343,11 @@ fn ingest_cos_pending_tx(
     if !binding.pending_tx_prepared.is_empty() {
         let mut kept = VecDeque::with_capacity(binding.pending_tx_prepared.len());
         while let Some(req) = binding.pending_tx_prepared.pop_front() {
+            let req = match redirect_prepared_cos_request_to_owner_binding(binding, forwarding, req)
+            {
+                Ok(()) => continue,
+                Err(req) => req,
+            };
             let req = match redirect_prepared_cos_request_to_owner(
                 binding,
                 req,
@@ -366,6 +371,15 @@ fn ingest_cos_pending_tx(
     let mut pending = merge_pending_tx_requests(local, shared);
     let mut kept = VecDeque::with_capacity(pending.len());
     while let Some(req) = pending.pop_front() {
+        let req = match redirect_local_cos_request_to_owner_binding(
+            &binding.live,
+            &binding.cos_owner_live_by_tx_ifindex,
+            forwarding,
+            req,
+        ) {
+            Ok(()) => continue,
+            Err(req) => req,
+        };
         let req = match redirect_local_cos_request_to_owner(
             req,
             worker_id,
@@ -419,6 +433,25 @@ fn redirect_local_cos_request_to_owner(
     Err(req)
 }
 
+fn redirect_local_cos_request_to_owner_binding(
+    current_live: &Arc<BindingLiveState>,
+    owner_live_by_tx_ifindex: &BTreeMap<i32, Arc<BindingLiveState>>,
+    forwarding: &ForwardingState,
+    req: TxRequest,
+) -> Result<(), TxRequest> {
+    let tx_ifindex = resolve_tx_binding_ifindex(forwarding, req.egress_ifindex);
+    let Some(owner_live) = owner_live_by_tx_ifindex.get(&tx_ifindex) else {
+        return Err(req);
+    };
+    if Arc::ptr_eq(owner_live, current_live) {
+        return Err(req);
+    }
+    if owner_live.enqueue_tx(req.clone()).is_ok() {
+        return Ok(());
+    }
+    Err(req)
+}
+
 fn redirect_prepared_cos_request_to_owner(
     binding: &mut BindingWorker,
     req: PreparedTxRequest,
@@ -459,6 +492,42 @@ fn redirect_prepared_cos_request_to_owner(
     )
     .is_ok()
     {
+        recycle_prepared_immediately(binding, &req);
+        return Ok(());
+    }
+    Err(req)
+}
+
+fn redirect_prepared_cos_request_to_owner_binding(
+    binding: &mut BindingWorker,
+    forwarding: &ForwardingState,
+    req: PreparedTxRequest,
+) -> Result<(), PreparedTxRequest> {
+    let tx_ifindex = resolve_tx_binding_ifindex(forwarding, req.egress_ifindex);
+    let Some(owner_live) = binding.cos_owner_live_by_tx_ifindex.get(&tx_ifindex) else {
+        return Err(req);
+    };
+    if Arc::ptr_eq(owner_live, &binding.live) {
+        return Err(req);
+    }
+    let Some(frame) = binding
+        .umem
+        .area()
+        .slice(req.offset as usize, req.len as usize)
+        .map(|frame| frame.to_vec())
+    else {
+        return Err(req);
+    };
+    let local_req = TxRequest {
+        bytes: frame,
+        expected_ports: req.expected_ports,
+        expected_addr_family: req.expected_addr_family,
+        expected_protocol: req.expected_protocol,
+        flow_key: req.flow_key.clone(),
+        egress_ifindex: req.egress_ifindex,
+        cos_queue_id: req.cos_queue_id,
+    };
+    if owner_live.enqueue_tx(local_req).is_ok() {
         recycle_prepared_immediately(binding, &req);
         return Ok(());
     }
@@ -1912,6 +1981,49 @@ mod tests {
             }
             other => panic!("unexpected command queued: {other:?}"),
         }
+    }
+
+    #[test]
+    fn redirect_local_cos_request_to_owner_binding_pushes_owner_live_queue() {
+        let current_live = Arc::new(BindingLiveState::new());
+        let owner_live = Arc::new(BindingLiveState::new());
+        let owner_live_by_tx_ifindex = BTreeMap::from([(12, owner_live.clone())]);
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 80,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".to_string(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+        let req = TxRequest {
+            bytes: vec![1, 2, 3],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(4),
+        };
+
+        let redirected = redirect_local_cos_request_to_owner_binding(
+            &current_live,
+            &owner_live_by_tx_ifindex,
+            &forwarding,
+            req,
+        );
+
+        assert!(redirected.is_ok());
+        let queued = owner_live.take_pending_tx();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued.front().map(|req| req.egress_ifindex), Some(80));
+        assert!(current_live.take_pending_tx().is_empty());
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub(crate) struct BindingWorker {
     pub(crate) pending_tx_prepared: VecDeque<PreparedTxRequest>,
     pub(crate) pending_tx_local: VecDeque<TxRequest>,
     pub(crate) max_pending_tx: usize,
+    pub(crate) cos_owner_live_by_tx_ifindex: BTreeMap<i32, Arc<BindingLiveState>>,
     pub(crate) cos_interfaces: FastMap<i32, CoSInterfaceRuntime>,
     pub(crate) cos_interface_order: Vec<i32>,
     pub(crate) cos_interface_rr: usize,
@@ -291,6 +292,7 @@ impl BindingWorker {
             pending_tx_prepared: VecDeque::new(),
             pending_tx_local: VecDeque::new(),
             max_pending_tx,
+            cos_owner_live_by_tx_ifindex: BTreeMap::new(),
             cos_interfaces: FastMap::default(),
             cos_interface_order: Vec::new(),
             cos_interface_rr: 0,
@@ -400,7 +402,7 @@ pub(crate) fn worker_loop(
     shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
     event_stream: Option<crate::event_stream::EventStreamWorkerHandle>,
     rg_epochs: Arc<[AtomicU32; MAX_RG_EPOCHS]>,
-    cos_owner_worker_by_ifindex: Arc<BTreeMap<i32, u32>>,
+    shared_cos_owner_worker_by_ifindex: Arc<ArcSwap<BTreeMap<i32, u32>>>,
     cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
 ) {
     pin_current_thread(worker_id);
@@ -409,6 +411,7 @@ pub(crate) fn worker_loop(
         (monotonic_nanos() / 1_000_000_000).saturating_add(TUNNEL_HA_STARTUP_GRACE_SECS);
     let mut validation = **shared_validation.load();
     let mut forwarding = shared_forwarding.load_full();
+    let mut cos_owner_worker_by_ifindex = shared_cos_owner_worker_by_ifindex.load_full();
     let mut sessions = SessionTable::new();
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
@@ -447,6 +450,14 @@ pub(crate) fn worker_loop(
         }
     }
     let binding_lookup = WorkerBindingLookup::from_bindings(&bindings);
+    let cos_owner_live_by_tx_ifindex = build_worker_cos_owner_live_by_tx_ifindex(
+        bindings
+            .iter()
+            .map(|binding| (binding.ifindex, binding.live.clone())),
+    );
+    for binding in bindings.iter_mut() {
+        binding.cos_owner_live_by_tx_ifindex = cos_owner_live_by_tx_ifindex.clone();
+    }
     let mut interrupt_poll_fds = if poll_mode == crate::PollMode::Interrupt {
         bindings
             .iter()
@@ -586,6 +597,13 @@ pub(crate) fn worker_loop(
             forwarding = live_forwarding;
             screen_state.update_profiles(forwarding.screen_profiles.clone());
             sessions.set_timeouts(forwarding.session_timeouts);
+        }
+        let live_cos_owner_worker_by_ifindex = shared_cos_owner_worker_by_ifindex.load_full();
+        if !Arc::ptr_eq(
+            &cos_owner_worker_by_ifindex,
+            &live_cos_owner_worker_by_ifindex,
+        ) {
+            cos_owner_worker_by_ifindex = live_cos_owner_worker_by_ifindex;
         }
         let ha_runtime = ha_state.load();
         // Only apply commands when pending — avoids lock overhead on
@@ -1344,6 +1362,17 @@ fn apply_worker_shaped_tx_requests(
     }
 }
 
+fn build_worker_cos_owner_live_by_tx_ifindex<I>(bindings: I) -> BTreeMap<i32, Arc<BindingLiveState>>
+where
+    I: IntoIterator<Item = (i32, Arc<BindingLiveState>)>,
+{
+    let mut out = BTreeMap::new();
+    for (ifindex, live) in bindings {
+        out.entry(ifindex).or_insert(live);
+    }
+    out
+}
+
 fn build_worker_cos_statuses(
     bindings: &[BindingWorker],
     forwarding: &ForwardingState,
@@ -1563,6 +1592,21 @@ mod tests {
         assert_eq!(queue.parked_instances, 1);
         assert_eq!(queue.next_wakeup_tick, 77);
         assert_eq!(queue.surplus_deficit_bytes, 1024);
+    }
+
+    #[test]
+    fn build_worker_cos_owner_live_by_tx_ifindex_prefers_first_binding_per_tx_ifindex() {
+        let live_a = Arc::new(BindingLiveState::new());
+        let live_b = Arc::new(BindingLiveState::new());
+        let live_c = Arc::new(BindingLiveState::new());
+        let owners = build_worker_cos_owner_live_by_tx_ifindex([
+            (12, live_a.clone()),
+            (12, live_b.clone()),
+            (13, live_c.clone()),
+        ]);
+
+        assert!(Arc::ptr_eq(owners.get(&12).unwrap(), &live_a));
+        assert!(Arc::ptr_eq(owners.get(&13).unwrap(), &live_c));
     }
 }
 

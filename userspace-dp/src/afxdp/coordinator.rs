@@ -15,6 +15,7 @@ pub struct Coordinator {
     pub(crate) ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     pub(crate) shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
     pub(crate) shared_forwarding: Arc<ArcSwap<ForwardingState>>,
+    pub(crate) shared_cos_owner_worker_by_ifindex: Arc<ArcSwap<BTreeMap<i32, u32>>>,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     pub(crate) neighbor_generation: Arc<AtomicU64>,
@@ -64,6 +65,7 @@ impl Coordinator {
             ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_fabrics: Arc::new(ArcSwap::from_pointee(Vec::new())),
             shared_forwarding: Arc::new(ArcSwap::from_pointee(ForwardingState::default())),
+            shared_cos_owner_worker_by_ifindex: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
             neighbor_generation: Arc::new(AtomicU64::new(0)),
@@ -229,6 +231,8 @@ impl Coordinator {
         self.identities.clear();
         self.live.clear();
         self.cos_owner_worker_by_ifindex.clear();
+        self.shared_cos_owner_worker_by_ifindex
+            .store(Arc::new(BTreeMap::new()));
         self.last_slow_path_status = self
             .slow_path
             .as_ref()
@@ -581,6 +585,8 @@ impl Coordinator {
             &workers,
         ));
         self.cos_owner_worker_by_ifindex = cos_owner_worker_by_ifindex.as_ref().clone();
+        self.shared_cos_owner_worker_by_ifindex
+            .store(cos_owner_worker_by_ifindex.clone());
         let worker_command_queues: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>> =
             Arc::new(
                 workers
@@ -639,7 +645,8 @@ impl Coordinator {
             let rg_epochs = self.rg_epochs.clone();
             let event_stream_handle = self.event_stream_worker_handle();
             let cos_status_clone = cos_status.clone();
-            let cos_owner_worker_by_ifindex = cos_owner_worker_by_ifindex.clone();
+            let shared_cos_owner_worker_by_ifindex =
+                self.shared_cos_owner_worker_by_ifindex.clone();
             let join = thread::Builder::new()
                 .name(format!("xpf-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -670,7 +677,7 @@ impl Coordinator {
                         shared_fabrics,
                         event_stream_handle,
                         rg_epochs,
-                        cos_owner_worker_by_ifindex,
+                        shared_cos_owner_worker_by_ifindex,
                         cos_status_clone,
                     );
                 });
@@ -1040,8 +1047,21 @@ impl Coordinator {
         self.shared_validation.store(Arc::new(self.validation));
         self.shared_forwarding
             .store(Arc::new(self.forwarding.clone()));
+        self.refresh_cos_owner_worker_map_from_identities();
         self.shared_fabrics
             .store(Arc::new(self.forwarding.fabrics.clone()));
+    }
+
+    fn refresh_cos_owner_worker_map_from_identities(&mut self) {
+        let worker_binding_ifindexes =
+            build_worker_binding_ifindexes_from_identities(&self.identities);
+        let owner_map = build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
+            &self.forwarding,
+            &worker_binding_ifindexes,
+        );
+        self.cos_owner_worker_by_ifindex = owner_map.clone();
+        self.shared_cos_owner_worker_by_ifindex
+            .store(Arc::new(owner_map));
     }
 
     /// Bump just the FIB generation counter without a full snapshot rebuild.
@@ -1404,6 +1424,18 @@ fn build_cos_owner_worker_by_ifindex(
     build_cos_owner_worker_by_ifindex_from_binding_ifindexes(forwarding, &worker_binding_ifindexes)
 }
 
+fn build_worker_binding_ifindexes_from_identities(
+    identities: &BTreeMap<u32, BindingIdentity>,
+) -> BTreeMap<u32, std::collections::BTreeSet<i32>> {
+    let mut out = BTreeMap::<u32, std::collections::BTreeSet<i32>>::new();
+    for ident in identities.values() {
+        out.entry(ident.worker_id)
+            .or_default()
+            .insert(ident.ifindex);
+    }
+    out
+}
+
 fn build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
     forwarding: &ForwardingState,
     worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,
@@ -1439,6 +1471,10 @@ fn build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        ClassOfServiceSnapshot, CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot,
+        CoSSchedulerMapSnapshot,
+    };
 
     #[test]
     fn build_cos_owner_worker_by_ifindex_prefers_lowest_worker_with_tx_binding() {
@@ -1522,5 +1558,109 @@ mod tests {
         assert_eq!(owner_by_ifindex.get(&80), Some(&2));
         assert_eq!(owner_by_ifindex.get(&81), Some(&7));
         assert_eq!(owner_by_ifindex.get(&82), Some(&2));
+    }
+
+    #[test]
+    fn build_worker_binding_ifindexes_from_identities_groups_by_worker() {
+        let identities = BTreeMap::from([
+            (
+                10,
+                BindingIdentity {
+                    slot: 10,
+                    queue_id: 0,
+                    worker_id: 2,
+                    interface: "ge-0-0-2".into(),
+                    ifindex: 12,
+                },
+            ),
+            (
+                11,
+                BindingIdentity {
+                    slot: 11,
+                    queue_id: 1,
+                    worker_id: 2,
+                    interface: "ge-0-0-2".into(),
+                    ifindex: 12,
+                },
+            ),
+            (
+                20,
+                BindingIdentity {
+                    slot: 20,
+                    queue_id: 0,
+                    worker_id: 7,
+                    interface: "ge-0-0-3".into(),
+                    ifindex: 13,
+                },
+            ),
+        ]);
+
+        let worker_binding_ifindexes = build_worker_binding_ifindexes_from_identities(&identities);
+
+        assert_eq!(
+            worker_binding_ifindexes.get(&2),
+            Some(&std::collections::BTreeSet::from([12]))
+        );
+        assert_eq!(
+            worker_binding_ifindexes.get(&7),
+            Some(&std::collections::BTreeSet::from([13]))
+        );
+    }
+
+    #[test]
+    fn refresh_runtime_snapshot_rebuilds_cos_owner_worker_map_from_identities() {
+        let mut coordinator = Coordinator::new();
+        coordinator.identities.insert(
+            1,
+            BindingIdentity {
+                slot: 1,
+                queue_id: 0,
+                worker_id: 2,
+                interface: "ge-0-0-2".into(),
+                ifindex: 12,
+            },
+        );
+        coordinator.identities.insert(
+            2,
+            BindingIdentity {
+                slot: 2,
+                queue_id: 0,
+                worker_id: 7,
+                interface: "ge-0-0-3".into(),
+                ifindex: 13,
+            },
+        );
+
+        let mut snapshot = ConfigSnapshot::default();
+        snapshot.interfaces.push(InterfaceSnapshot {
+            name: "reth0.80".into(),
+            ifindex: 80,
+            parent_ifindex: 12,
+            hardware_addr: "02:00:00:00:00:80".into(),
+            cos_shaping_rate_bytes_per_sec: 1_000_000,
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        });
+        snapshot.class_of_service = Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![CoSForwardingClassSnapshot {
+                name: "best-effort".into(),
+                queue: 0,
+            }],
+            schedulers: vec![],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![CoSSchedulerMapEntrySnapshot {
+                    forwarding_class: "best-effort".into(),
+                    scheduler: String::new(),
+                }],
+            }],
+            dscp_classifiers: vec![],
+        });
+
+        coordinator.refresh_runtime_snapshot(&snapshot);
+
+        assert_eq!(coordinator.cos_owner_worker_by_ifindex.get(&80), Some(&2));
+        let shared = coordinator.shared_cos_owner_worker_by_ifindex.load();
+        assert_eq!(shared.get(&80), Some(&2));
     }
 }
