@@ -851,6 +851,10 @@ Currently implemented:
 - `show class-of-service interface [IFACE[.UNIT]]`
 - prints configured shaping rate, scheduler-map, attached CoS filters, and the
   live userspace queue/runtime state that is currently exported by the helper
+- shaped egress interfaces now have a static userspace scheduler owner worker;
+  non-owner workers hand shaped traffic to that owner before CoS queue
+  admission so one interface does not silently get independent queue state on
+  every worker
 
 Still planned:
 
@@ -916,6 +920,8 @@ At minimum:
 ### Phase 4: Many-Core Ownership and Leasing
 
 - static reservation/container ownership by scheduler shard
+- first userspace slice is implemented as one owner worker per shaped egress
+  interface with cross-worker handoff before CoS enqueue
 - internal enqueue to the owning shard
 - shared parent budgets plus shard-local leases
 - cache-line isolation for shared pools

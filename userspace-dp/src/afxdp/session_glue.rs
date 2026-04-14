@@ -239,6 +239,7 @@ fn should_bypass_unseeded_tunnel_ha(
 pub(super) struct WorkerCommandResults {
     pub cancelled_keys: Vec<SessionKey>,
     pub exported_sequences: Vec<u64>,
+    pub shaped_tx_requests: Vec<TxRequest>,
 }
 
 fn force_live_redirect_for_worker_synced_entry(
@@ -331,6 +332,7 @@ pub(super) fn apply_worker_commands(
                 return WorkerCommandResults {
                     cancelled_keys: Vec::new(),
                     exported_sequences: Vec::new(),
+                    shaped_tx_requests: Vec::new(),
                 };
             }
             core::mem::take(&mut *pending)
@@ -339,6 +341,7 @@ pub(super) fn apply_worker_commands(
             return WorkerCommandResults {
                 cancelled_keys: Vec::new(),
                 exported_sequences: Vec::new(),
+                shaped_tx_requests: Vec::new(),
             };
         }
     };
@@ -346,6 +349,7 @@ pub(super) fn apply_worker_commands(
     let now_secs = now_ns / 1_000_000_000;
     let mut cancelled_keys: Vec<SessionKey> = Vec::new();
     let mut exported_sequences = Vec::new();
+    let mut shaped_tx_requests = Vec::new();
     for cmd in pending {
         match cmd {
             WorkerCommand::DemoteOwnerRGS { owner_rgs } => {
@@ -618,11 +622,13 @@ pub(super) fn apply_worker_commands(
                     delete_live_session_key(session_map_fd, &key);
                 }
             }
+            WorkerCommand::EnqueueShapedLocal(req) => shaped_tx_requests.push(req),
         }
     }
     WorkerCommandResults {
         cancelled_keys,
         exported_sequences,
+        shaped_tx_requests,
     }
 }
 

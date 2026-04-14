@@ -644,6 +644,7 @@ pub(super) enum WorkerCommand {
     DemoteOwnerRGS { owner_rgs: Vec<i32> },
     RefreshOwnerRGS { owner_rgs: Vec<i32> },
     ExportOwnerRGSessions { sequence: u64, owner_rgs: Vec<i32> },
+    EnqueueShapedLocal(TxRequest),
 }
 
 #[derive(Default)]

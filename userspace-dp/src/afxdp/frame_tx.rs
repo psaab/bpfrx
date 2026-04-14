@@ -16,6 +16,9 @@ pub(super) fn enqueue_pending_forwards(
     local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     dbg: &mut DebugPollCounters,
+    worker_id: u32,
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
 ) {
     let ingress_area = ingress_binding.umem.area() as *const MmapArea;
     post_recycles.clear();
@@ -160,6 +163,9 @@ pub(super) fn enqueue_pending_forwards(
                 request.cos_queue_id,
                 now_ns,
                 post_recycles,
+                worker_id,
+                worker_commands_by_id,
+                cos_owner_worker_by_ifindex,
             ) {
                 dbg.enqueue_ok += segments as u64;
                 dbg.enqueue_direct += segments as u64;
@@ -170,7 +176,15 @@ pub(super) fn enqueue_pending_forwards(
                 }
                 copied_source_frame = true;
                 if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE {
-                    let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
+                    let _ = drain_pending_tx_local_owner(
+                        target_binding,
+                        now_ns,
+                        post_recycles,
+                        forwarding,
+                        worker_id,
+                        worker_commands_by_id,
+                        cos_owner_worker_by_ifindex,
+                    );
                 }
             } else if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
                 source_frame,
@@ -228,7 +242,15 @@ pub(super) fn enqueue_pending_forwards(
                 }
                 copied_source_frame = true;
                 if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
-                    let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
+                    let _ = drain_pending_tx_local_owner(
+                        target_binding,
+                        now_ns,
+                        post_recycles,
+                        forwarding,
+                        worker_id,
+                        worker_commands_by_id,
+                        cos_owner_worker_by_ifindex,
+                    );
                 }
             }
             // Track when segmentation was needed but returned None
@@ -404,7 +426,15 @@ pub(super) fn enqueue_pending_forwards(
                             || !target_binding.pending_tx_prepared.is_empty()
                             || !target_binding.pending_tx_local.is_empty())
                     {
-                        let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
+                        let _ = drain_pending_tx_local_owner(
+                            target_binding,
+                            now_ns,
+                            post_recycles,
+                            forwarding,
+                            worker_id,
+                            worker_commands_by_id,
+                            cos_owner_worker_by_ifindex,
+                        );
                         direct_tx_offset = target_binding.free_tx_frames.pop_front();
                     }
                     let mut direct_tx_fallback_reason = None;
@@ -625,7 +655,15 @@ pub(super) fn enqueue_pending_forwards(
             if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE
                 || target_binding.pending_tx_local.len() >= TX_BATCH_SIZE
             {
-                let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
+                let _ = drain_pending_tx_local_owner(
+                    target_binding,
+                    now_ns,
+                    post_recycles,
+                    forwarding,
+                    worker_id,
+                    worker_commands_by_id,
+                    cos_owner_worker_by_ifindex,
+                );
             }
         }
         if !post_recycles.is_empty() {
@@ -1002,6 +1040,9 @@ fn segment_forwarded_tcp_frames_into_prepared(
     cos_queue_id: Option<u8>,
     now_ns: u64,
     post_recycles: &mut Vec<(u32, u64)>,
+    worker_id: u32,
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
 ) -> Option<(u32, u64, u32)> {
     if meta.protocol != PROTO_TCP || decision.resolution.tunnel_endpoint_id != 0 {
         return None;
@@ -1069,7 +1110,15 @@ fn segment_forwarded_tcp_frames_into_prepared(
             || !target_binding.pending_tx_prepared.is_empty()
             || !target_binding.pending_tx_local.is_empty())
     {
-        let _ = drain_pending_tx(target_binding, now_ns, post_recycles, forwarding);
+        let _ = drain_pending_tx_local_owner(
+            target_binding,
+            now_ns,
+            post_recycles,
+            forwarding,
+            worker_id,
+            worker_commands_by_id,
+            cos_owner_worker_by_ifindex,
+        );
     }
     if target_binding.free_tx_frames.len() < segment_count {
         return None;
