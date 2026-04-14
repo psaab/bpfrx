@@ -1077,6 +1077,13 @@ impl Coordinator {
                             expected_addr_family: 0,
                             expected_protocol: 0,
                             flow_key: None,
+                            egress_ifindex: resolution.egress_ifindex,
+                            cos_queue_id: resolve_cos_queue_id(
+                                &self.forwarding,
+                                resolution.egress_ifindex,
+                                meta,
+                                None,
+                            ),
                         })?;
                     }
                 } else {

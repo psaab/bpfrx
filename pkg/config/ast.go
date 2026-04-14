@@ -1131,6 +1131,29 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			}},
 		}},
 	}},
+	"class-of-service": {children: map[string]*schemaNode{
+		"forwarding-classes": {children: map[string]*schemaNode{
+			"queue": {args: 2, multi: true, children: nil},
+		}},
+		"schedulers": {args: 1, multi: true, children: map[string]*schemaNode{
+			"transmit-rate": {args: 1, children: nil},
+			"priority":      {args: 1, children: nil},
+			"buffer-size":   {args: 1, children: nil},
+		}},
+		"scheduler-maps": {args: 1, multi: true, children: map[string]*schemaNode{
+			"forwarding-class": {args: 1, multi: true, children: map[string]*schemaNode{
+				"scheduler": {args: 1, children: nil},
+			}},
+		}},
+		"interfaces": {args: 1, multi: true, children: map[string]*schemaNode{
+			"unit": {args: 1, multi: true, children: map[string]*schemaNode{
+				"shaping-rate": {args: 1, children: map[string]*schemaNode{
+					"burst-size": {args: 1, children: nil},
+				}},
+				"scheduler-map": {args: 1, children: nil},
+			}},
+		}},
+	}},
 	"firewall": {children: map[string]*schemaNode{
 		"policer": {args: 1, multi: true, children: map[string]*schemaNode{
 			"if-exceeding": {children: map[string]*schemaNode{

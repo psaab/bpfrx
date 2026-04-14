@@ -118,6 +118,7 @@ type Config struct {
 	Protocols         ProtocolsConfig
 	RoutingInstances  []*RoutingInstanceConfig
 	Firewall          FirewallConfig
+	ClassOfService    *ClassOfServiceConfig
 	Services          ServicesConfig
 	ForwardingOptions ForwardingOptionsConfig
 	System            SystemConfig
@@ -292,6 +293,55 @@ type SchedulerConfig struct {
 	StartDate string // "YYYY-MM-DD" (optional)
 	StopDate  string // "YYYY-MM-DD" (optional)
 	Daily     bool   // recur daily
+}
+
+// ClassOfServiceConfig holds CoS forwarding classes, schedulers,
+// scheduler-maps, and per-interface shaping configuration.
+type ClassOfServiceConfig struct {
+	ForwardingClasses map[string]*CoSForwardingClass
+	Schedulers        map[string]*CoSScheduler
+	SchedulerMaps     map[string]*CoSSchedulerMap
+	Interfaces        map[string]*CoSInterface
+}
+
+// CoSForwardingClass maps a forwarding-class name to a queue number.
+type CoSForwardingClass struct {
+	Name  string
+	Queue int
+}
+
+// CoSScheduler defines the Phase 1 class scheduler knobs.
+type CoSScheduler struct {
+	Name              string
+	TransmitRateBytes uint64
+	Priority          string
+	BufferSizeBytes   uint64
+}
+
+// CoSSchedulerMap binds forwarding classes to named schedulers.
+type CoSSchedulerMap struct {
+	Name    string
+	Entries map[string]*CoSSchedulerMapEntry
+}
+
+// CoSSchedulerMapEntry is a single forwarding-class -> scheduler binding.
+type CoSSchedulerMapEntry struct {
+	ForwardingClass string
+	Scheduler       string
+}
+
+// CoSInterface holds unit-level CoS configuration for an interface.
+type CoSInterface struct {
+	Name  string
+	Units map[int]*CoSInterfaceUnit
+}
+
+// CoSInterfaceUnit defines the Phase 1 root shaper attached to a logical unit.
+type CoSInterfaceUnit struct {
+	Unit             int
+	ShapingRateBytes uint64
+	BurstSizeBytes   uint64
+	SchedulerMap     string
 }
 
 // SystemConfig holds system-level configuration.

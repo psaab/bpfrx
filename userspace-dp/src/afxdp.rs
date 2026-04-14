@@ -363,7 +363,7 @@ fn poll_binding(
     };
     let area = binding.umem.area() as *const MmapArea;
     maybe_touch_heartbeat(binding, now_ns);
-    let tx_work = drain_pending_tx(binding, now_ns, shared_recycles);
+    let tx_work = drain_pending_tx(binding, now_ns, shared_recycles, forwarding);
     apply_shared_recycles(
         left,
         binding_index,
@@ -384,7 +384,7 @@ fn poll_binding(
         if tx_backlog >= binding.max_pending_tx {
             binding.dbg_backpressure += 1;
             // Try to drain TX first — completions free frames for both TX and fill.
-            let _ = drain_pending_tx(binding, now_ns, shared_recycles);
+            let _ = drain_pending_tx(binding, now_ns, shared_recycles, forwarding);
             apply_shared_recycles(
                 left,
                 binding_index,
@@ -979,6 +979,15 @@ fn poll_binding(
                                                     expected_addr_family: meta.addr_family,
                                                     expected_protocol: meta.protocol,
                                                     flow_key: Some(flow_key),
+                                                    egress_ifindex: cached_decision
+                                                        .resolution
+                                                        .egress_ifindex,
+                                                    cos_queue_id: resolve_cos_queue_id(
+                                                        forwarding,
+                                                        cached_decision.resolution.egress_ifindex,
+                                                        meta,
+                                                        Some(&flow.forward_key),
+                                                    ),
                                                 },
                                             );
                                             binding.pending_in_place_tx_packets += 1;
@@ -1565,6 +1574,12 @@ fn poll_binding(
                                                 flow_key: None,
                                                 nat64_reverse: None,
                                                 prebuilt_frame: Some(rewritten_frame),
+                                                cos_queue_id: resolve_cos_queue_id(
+                                                    forwarding,
+                                                    icmp_decision.resolution.egress_ifindex,
+                                                    meta,
+                                                    None,
+                                                ),
                                             });
                                             recycle_now = false;
                                             #[cfg(feature = "debug-log")]
@@ -2890,6 +2905,13 @@ fn retry_pending_neigh(
                             expected_addr_family: pkt.meta.addr_family,
                             expected_protocol: pkt.meta.protocol,
                             flow_key: None,
+                            egress_ifindex: decision.resolution.egress_ifindex,
+                            cos_queue_id: resolve_cos_queue_id(
+                                forwarding,
+                                decision.resolution.egress_ifindex,
+                                pkt.meta,
+                                None,
+                            ),
                         };
                         if target_idx == binding_index {
                             binding.pending_tx_prepared.push_back(req);
@@ -3002,6 +3024,12 @@ fn build_live_forward_request_from_frame(
         flow_key: flow.map(|flow| flow.forward_key.clone()),
         nat64_reverse: None,
         prebuilt_frame: None,
+        cos_queue_id: resolve_cos_queue_id(
+            forwarding,
+            decision.resolution.egress_ifindex,
+            meta,
+            flow.map(|flow| &flow.forward_key),
+        ),
     })
 }
 

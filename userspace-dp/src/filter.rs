@@ -49,6 +49,7 @@ pub(crate) struct FilterTerm {
     pub(crate) log: bool,
     pub(crate) policer_name: String,
     pub(crate) routing_instance: String,
+    pub(crate) forwarding_class: String,
     pub(crate) dscp_rewrite: Option<u8>,
 }
 
@@ -157,6 +158,7 @@ pub(crate) struct FilterResult {
     pub(crate) dscp_rewrite: Option<u8>,
     pub(crate) policer_name: String,
     pub(crate) routing_instance: String,
+    pub(crate) forwarding_class: String,
     pub(crate) log: bool,
 }
 
@@ -167,6 +169,7 @@ impl Default for FilterResult {
             dscp_rewrite: None,
             policer_name: String::new(),
             routing_instance: String::new(),
+            forwarding_class: String::new(),
             log: false,
         }
     }
@@ -196,6 +199,7 @@ pub(crate) fn evaluate_filter(
             dscp_rewrite: term.dscp_rewrite,
             policer_name: term.policer_name.clone(),
             routing_instance: term.routing_instance.clone(),
+            forwarding_class: term.forwarding_class.clone(),
             log: term.log,
         };
     }
@@ -438,6 +442,7 @@ fn parse_term(snap: &FirewallTermSnapshot) -> FilterTerm {
         log: snap.log,
         policer_name: snap.policer.clone(),
         routing_instance: snap.routing_instance.clone(),
+        forwarding_class: snap.forwarding_class.clone(),
         dscp_rewrite,
     }
 }

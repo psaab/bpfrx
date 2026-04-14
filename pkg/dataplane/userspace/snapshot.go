@@ -59,6 +59,7 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 		Screens:         buildScreenSnapshots(cfg),
 		Filters:         buildFirewallFilterSnapshots(cfg),
 		Policers:        buildPolicerSnapshots(cfg),
+		ClassOfService:  buildClassOfServiceSnapshot(cfg),
 		FlowExport:      buildFlowExportSnapshot(cfg),
 		Config:          cfg,
 		Summary: SnapshotSummary{
@@ -291,6 +292,12 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 			if unit == nil {
 				continue
 			}
+			var cosUnit *config.CoSInterfaceUnit
+			if cfg.ClassOfService != nil {
+				if cosIface := cfg.ClassOfService.Interfaces[name]; cosIface != nil {
+					cosUnit = cosIface.Units[unitNum]
+				}
+			}
 			unitName := fmt.Sprintf("%s.%d", name, unitNum)
 			parentLinux := snapshotLinuxName(cfg, name, iface, nil)
 			parentIfindex, _, _, _ := buildLinkSnapshot(parentLinux)
@@ -315,10 +322,34 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				Addresses:       addresses,
 				FilterInputV4:   unit.FilterInputV4,
 				FilterInputV6:   unit.FilterInputV6,
+				CoSShapingRate:  coSUnitShapingRate(cosUnit),
+				CoSBurstSize:    coSUnitBurstSize(cosUnit),
+				CoSSchedulerMap: coSUnitSchedulerMap(cosUnit),
 			})
 		}
 	}
 	return out
+}
+
+func coSUnitShapingRate(unit *config.CoSInterfaceUnit) uint64 {
+	if unit == nil {
+		return 0
+	}
+	return unit.ShapingRateBytes
+}
+
+func coSUnitBurstSize(unit *config.CoSInterfaceUnit) uint64 {
+	if unit == nil {
+		return 0
+	}
+	return unit.BurstSizeBytes
+}
+
+func coSUnitSchedulerMap(unit *config.CoSInterfaceUnit) string {
+	if unit == nil {
+		return ""
+	}
+	return unit.SchedulerMap
 }
 
 func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []TunnelEndpointSnapshot {
@@ -1383,6 +1414,91 @@ func buildPolicerSnapshots(cfg *config.Config) []PolicerSnapshot {
 		out = append(out, snap)
 	}
 	return out
+}
+
+func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
+	if cfg == nil || cfg.ClassOfService == nil {
+		return nil
+	}
+	cos := cfg.ClassOfService
+	if len(cos.ForwardingClasses) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 {
+		return nil
+	}
+	snap := &ClassOfServiceSnapshot{}
+
+	if len(cos.ForwardingClasses) > 0 {
+		names := make([]string, 0, len(cos.ForwardingClasses))
+		for name := range cos.ForwardingClasses {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		snap.ForwardingClasses = make([]CoSForwardingClassSnapshot, 0, len(names))
+		for _, name := range names {
+			class := cos.ForwardingClasses[name]
+			if class == nil {
+				continue
+			}
+			snap.ForwardingClasses = append(snap.ForwardingClasses, CoSForwardingClassSnapshot{
+				Name:  class.Name,
+				Queue: class.Queue,
+			})
+		}
+	}
+
+	if len(cos.Schedulers) > 0 {
+		names := make([]string, 0, len(cos.Schedulers))
+		for name := range cos.Schedulers {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		snap.Schedulers = make([]CoSSchedulerSnapshot, 0, len(names))
+		for _, name := range names {
+			sched := cos.Schedulers[name]
+			if sched == nil {
+				continue
+			}
+			snap.Schedulers = append(snap.Schedulers, CoSSchedulerSnapshot{
+				Name:              sched.Name,
+				TransmitRateBytes: sched.TransmitRateBytes,
+				Priority:          sched.Priority,
+				BufferSizeBytes:   sched.BufferSizeBytes,
+			})
+		}
+	}
+
+	if len(cos.SchedulerMaps) > 0 {
+		names := make([]string, 0, len(cos.SchedulerMaps))
+		for name := range cos.SchedulerMaps {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		snap.SchedulerMaps = make([]CoSSchedulerMapSnapshot, 0, len(names))
+		for _, name := range names {
+			schedMap := cos.SchedulerMaps[name]
+			if schedMap == nil {
+				continue
+			}
+			entryNames := make([]string, 0, len(schedMap.Entries))
+			for className := range schedMap.Entries {
+				entryNames = append(entryNames, className)
+			}
+			sort.Strings(entryNames)
+			mapSnap := CoSSchedulerMapSnapshot{Name: schedMap.Name}
+			for _, className := range entryNames {
+				entry := schedMap.Entries[className]
+				if entry == nil {
+					continue
+				}
+				mapSnap.Entries = append(mapSnap.Entries, CoSSchedulerMapEntrySnapshot{
+					ForwardingClass: entry.ForwardingClass,
+					Scheduler:       entry.Scheduler,
+				})
+			}
+			snap.SchedulerMaps = append(snap.SchedulerMaps, mapSnap)
+		}
+	}
+
+	return snap
 }
 
 func buildPolicySnapshots(cfg *config.Config) []PolicyRuleSnapshot {

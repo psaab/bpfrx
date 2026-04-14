@@ -158,6 +158,7 @@ pub(super) struct ForwardingState {
     pub(super) screen_profiles: FastMap<String, ScreenProfile>,
     pub(super) tunnel_interfaces: FastSet<i32>,
     pub(super) filter_state: crate::filter::FilterState,
+    pub(super) cos: CoSState,
     #[allow(dead_code)]
     pub(super) gre_acceleration: bool,
     pub(super) flow_export_config: Option<crate::flowexport::FlowExportConfig>,
@@ -165,6 +166,28 @@ pub(super) struct ForwardingState {
     pub(super) tcp_mss_ipsec_vpn: u16,
     pub(super) tcp_mss_gre_in: u16,
     pub(super) tcp_mss_gre_out: u16,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct CoSState {
+    pub(super) interfaces: FastMap<i32, CoSInterfaceConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct CoSInterfaceConfig {
+    pub(super) shaping_rate_bytes: u64,
+    pub(super) burst_bytes: u64,
+    pub(super) default_queue: u8,
+    pub(super) queues: Vec<CoSQueueConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct CoSQueueConfig {
+    pub(super) queue_id: u8,
+    pub(super) forwarding_class: String,
+    pub(super) priority: u8,
+    pub(super) transmit_rate_bytes: u64,
+    pub(super) buffer_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -501,6 +524,8 @@ pub(super) struct TxRequest {
     #[allow(dead_code)]
     pub(super) expected_protocol: u8,
     pub(super) flow_key: Option<SessionKey>,
+    pub(super) egress_ifindex: i32,
+    pub(super) cos_queue_id: Option<u8>,
 }
 
 pub(super) struct PendingForwardRequest {
@@ -517,6 +542,7 @@ pub(super) struct PendingForwardRequest {
     pub(super) flow_key: Option<SessionKey>,
     pub(super) nat64_reverse: Option<Nat64ReverseInfo>,
     pub(super) prebuilt_frame: Option<Vec<u8>>,
+    pub(super) cos_queue_id: Option<u8>,
 }
 
 pub(super) struct PreparedTxRequest {
@@ -530,7 +556,37 @@ pub(super) struct PreparedTxRequest {
     #[allow(dead_code)]
     pub(super) expected_protocol: u8,
     pub(super) flow_key: Option<SessionKey>,
+    pub(super) egress_ifindex: i32,
+    pub(super) cos_queue_id: Option<u8>,
 }
+
+pub(super) struct CoSInterfaceRuntime {
+    pub(super) shaping_rate_bytes: u64,
+    pub(super) burst_bytes: u64,
+    pub(super) tokens: u64,
+    pub(super) last_refill_ns: u64,
+    pub(super) default_queue: u8,
+    pub(super) queues: Vec<CoSQueueRuntime>,
+    pub(super) rr_index_by_priority: [usize; COS_PRIORITY_LEVELS],
+}
+
+pub(super) struct CoSQueueRuntime {
+    pub(super) queue_id: u8,
+    pub(super) priority: u8,
+    pub(super) transmit_rate_bytes: u64,
+    pub(super) buffer_bytes: u64,
+    pub(super) tokens: u64,
+    pub(super) last_refill_ns: u64,
+    pub(super) queued_bytes: u64,
+    pub(super) items: VecDeque<CoSPendingTxItem>,
+}
+
+pub(super) enum CoSPendingTxItem {
+    Local(TxRequest),
+    Prepared(PreparedTxRequest),
+}
+
+pub(super) const COS_PRIORITY_LEVELS: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PreparedTxRecycle {

@@ -64,6 +64,55 @@ pub(crate) struct InterfaceSnapshot {
     pub filter_input_v4: String,
     #[serde(rename = "filter_input_v6", default)]
     pub filter_input_v6: String,
+    #[serde(rename = "cos_shaping_rate_bps", default)]
+    pub cos_shaping_rate_bps: u64,
+    #[serde(rename = "cos_shaping_burst_bytes", default)]
+    pub cos_shaping_burst_bytes: u64,
+    #[serde(rename = "cos_scheduler_map", default)]
+    pub cos_scheduler_map: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct ClassOfServiceSnapshot {
+    #[serde(rename = "forwarding_classes", default)]
+    pub forwarding_classes: Vec<CoSForwardingClassSnapshot>,
+    #[serde(rename = "schedulers", default)]
+    pub schedulers: Vec<CoSSchedulerSnapshot>,
+    #[serde(rename = "scheduler_maps", default)]
+    pub scheduler_maps: Vec<CoSSchedulerMapSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct CoSForwardingClassSnapshot {
+    pub name: String,
+    #[serde(default)]
+    pub queue: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct CoSSchedulerSnapshot {
+    pub name: String,
+    #[serde(rename = "transmit_rate_bytes", default)]
+    pub transmit_rate_bytes: u64,
+    #[serde(default)]
+    pub priority: String,
+    #[serde(rename = "buffer_size_bytes", default)]
+    pub buffer_size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct CoSSchedulerMapSnapshot {
+    pub name: String,
+    #[serde(default)]
+    pub entries: Vec<CoSSchedulerMapEntrySnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct CoSSchedulerMapEntrySnapshot {
+    #[serde(rename = "forwarding_class", default)]
+    pub forwarding_class: String,
+    #[serde(default)]
+    pub scheduler: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -180,6 +229,8 @@ pub(crate) struct ConfigSnapshot {
     pub filters: Vec<FirewallFilterSnapshot>,
     #[serde(default)]
     pub policers: Vec<PolicerSnapshot>,
+    #[serde(rename = "class_of_service", default)]
+    pub class_of_service: Option<ClassOfServiceSnapshot>,
     #[serde(rename = "flow_export", default)]
     pub flow_export: Option<FlowExportSnapshot>,
     #[serde(default)]

@@ -310,6 +310,7 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
         &snapshot.flow.lo0_filter_input_v4,
         &snapshot.flow.lo0_filter_input_v6,
     );
+    state.cos = build_cos_state(snapshot);
     // Build flow export config from snapshot
     state.flow_export_config = snapshot.flow_export.as_ref().and_then(|fe| {
         let addr = format!("{}:{}", fe.collector_address, fe.collector_port);
@@ -423,6 +424,226 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
     install_kernel_rst_suppression(&state);
 
     state
+}
+
+fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
+    let Some(cos) = snapshot.class_of_service.as_ref() else {
+        return CoSState::default();
+    };
+
+    let class_to_queue = cos
+        .forwarding_classes
+        .iter()
+        .filter_map(|class| {
+            (!class.name.is_empty() && class.queue >= 0)
+                .then_some((class.name.clone(), class.queue as u8))
+        })
+        .collect::<FastMap<_, _>>();
+    let schedulers = cos
+        .schedulers
+        .iter()
+        .filter(|sched| !sched.name.is_empty())
+        .map(|sched| (sched.name.clone(), sched))
+        .collect::<FastMap<_, _>>();
+    let scheduler_maps = cos
+        .scheduler_maps
+        .iter()
+        .filter(|sched_map| !sched_map.name.is_empty())
+        .map(|sched_map| (sched_map.name.clone(), sched_map))
+        .collect::<FastMap<_, _>>();
+
+    let mut state = CoSState::default();
+    for iface in &snapshot.interfaces {
+        if iface.ifindex <= 0 || iface.cos_shaping_rate_bps == 0 {
+            continue;
+        }
+        let burst_bytes = if iface.cos_shaping_burst_bytes > 0 {
+            iface.cos_shaping_burst_bytes
+        } else {
+            default_cos_burst_bytes(iface.cos_shaping_rate_bps)
+        };
+        let mut queues = Vec::new();
+        if let Some(sched_map) = scheduler_maps.get(&iface.cos_scheduler_map) {
+            for entry in &sched_map.entries {
+                let Some(queue_id) = class_to_queue.get(&entry.forwarding_class).copied() else {
+                    continue;
+                };
+                let scheduler = schedulers.get(&entry.scheduler).copied();
+                queues.push(CoSQueueConfig {
+                    queue_id,
+                    forwarding_class: entry.forwarding_class.clone(),
+                    priority: cos_priority_rank(
+                        scheduler
+                            .map(|sched| sched.priority.as_str())
+                            .unwrap_or("low"),
+                    ),
+                    transmit_rate_bytes: scheduler
+                        .map(|sched| sched.transmit_rate_bytes)
+                        .filter(|rate| *rate > 0)
+                        .unwrap_or(iface.cos_shaping_rate_bps),
+                    buffer_bytes: scheduler
+                        .map(|sched| sched.buffer_size_bytes)
+                        .filter(|size| *size > 0)
+                        .unwrap_or(burst_bytes),
+                });
+            }
+        }
+        if queues.is_empty() {
+            queues.push(CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "best-effort".to_string(),
+                priority: cos_priority_rank("low"),
+                transmit_rate_bytes: iface.cos_shaping_rate_bps,
+                buffer_bytes: burst_bytes,
+            });
+        }
+        queues.sort_by(|a, b| a.queue_id.cmp(&b.queue_id));
+        let default_queue = queues
+            .iter()
+            .find(|queue| queue.forwarding_class == "best-effort")
+            .map(|queue| queue.queue_id)
+            .unwrap_or_else(|| queues[0].queue_id);
+        state.interfaces.insert(
+            iface.ifindex,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: iface.cos_shaping_rate_bps,
+                burst_bytes,
+                default_queue,
+                queues,
+            },
+        );
+    }
+
+    state
+}
+
+fn default_cos_burst_bytes(rate_bytes: u64) -> u64 {
+    rate_bytes
+        .checked_div(100)
+        .unwrap_or_default()
+        .max(64 * 1500)
+}
+
+fn cos_priority_rank(priority: &str) -> u8 {
+    match priority {
+        "strict-high" => 0,
+        "high" => 1,
+        "medium-high" => 2,
+        "medium" => 3,
+        "medium-low" => 4,
+        _ => 5,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ClassOfServiceSnapshot, CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot,
+        CoSSchedulerMapSnapshot, CoSSchedulerSnapshot,
+    };
+
+    #[test]
+    fn build_cos_state_translates_scheduler_map_entries() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                ifindex: 42,
+                cos_shaping_rate_bps: 10_000_000,
+                cos_shaping_burst_bytes: 256_000,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![
+                    CoSForwardingClassSnapshot {
+                        name: "best-effort".into(),
+                        queue: 0,
+                    },
+                    CoSForwardingClassSnapshot {
+                        name: "expedited-forwarding".into(),
+                        queue: 1,
+                    },
+                ],
+                schedulers: vec![
+                    CoSSchedulerSnapshot {
+                        name: "be-sched".into(),
+                        transmit_rate_bytes: 3_000_000,
+                        priority: "low".into(),
+                        buffer_size_bytes: 128_000,
+                    },
+                    CoSSchedulerSnapshot {
+                        name: "ef-sched".into(),
+                        transmit_rate_bytes: 7_000_000,
+                        priority: "strict-high".into(),
+                        buffer_size_bytes: 64_000,
+                    },
+                ],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "expedited-forwarding".into(),
+                            scheduler: "ef-sched".into(),
+                        },
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "best-effort".into(),
+                            scheduler: "be-sched".into(),
+                        },
+                    ],
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let state = build_cos_state(&snapshot);
+        let iface = state.interfaces.get(&42).expect("missing CoS interface");
+        assert_eq!(iface.shaping_rate_bytes, 10_000_000);
+        assert_eq!(iface.burst_bytes, 256_000);
+        assert_eq!(iface.default_queue, 0);
+        assert_eq!(iface.queues.len(), 2);
+        assert_eq!(iface.queues[0].queue_id, 0);
+        assert_eq!(iface.queues[0].forwarding_class, "best-effort");
+        assert_eq!(iface.queues[0].priority, 5);
+        assert_eq!(iface.queues[0].transmit_rate_bytes, 3_000_000);
+        assert_eq!(iface.queues[0].buffer_bytes, 128_000);
+        assert_eq!(iface.queues[1].queue_id, 1);
+        assert_eq!(iface.queues[1].forwarding_class, "expedited-forwarding");
+        assert_eq!(iface.queues[1].priority, 0);
+        assert_eq!(iface.queues[1].transmit_rate_bytes, 7_000_000);
+        assert_eq!(iface.queues[1].buffer_bytes, 64_000);
+    }
+
+    #[test]
+    fn build_cos_state_falls_back_to_default_best_effort_queue() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                ifindex: 7,
+                cos_shaping_rate_bps: 1_000_000,
+                cos_scheduler_map: "missing-map".into(),
+                ..Default::default()
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot::default()),
+            ..Default::default()
+        };
+
+        let state = build_cos_state(&snapshot);
+        let iface = state
+            .interfaces
+            .get(&7)
+            .expect("missing fallback CoS interface");
+        assert_eq!(iface.shaping_rate_bytes, 1_000_000);
+        assert_eq!(iface.burst_bytes, default_cos_burst_bytes(1_000_000));
+        assert_eq!(iface.default_queue, 0);
+        assert_eq!(iface.queues.len(), 1);
+        assert_eq!(iface.queues[0].queue_id, 0);
+        assert_eq!(iface.queues[0].forwarding_class, "best-effort");
+        assert_eq!(iface.queues[0].priority, 5);
+        assert_eq!(iface.queues[0].transmit_rate_bytes, 1_000_000);
+        assert_eq!(
+            iface.queues[0].buffer_bytes,
+            default_cos_burst_bytes(1_000_000)
+        );
+    }
 }
 
 pub(super) fn pick_interface_v4(iface: &InterfaceSnapshot) -> Option<Ipv4Addr> {

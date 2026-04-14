@@ -75,6 +75,7 @@ pub(super) fn build_local_time_exceeded_request(
         flow_key: None,
         nat64_reverse: None,
         prebuilt_frame: Some(prebuilt_frame),
+        cos_queue_id: resolve_cos_queue_id(forwarding, ingress_ident.ifindex, meta, None),
     })
 }
 
