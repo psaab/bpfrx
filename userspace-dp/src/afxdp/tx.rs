@@ -313,17 +313,18 @@ pub(super) fn drain_pending_tx_local_owner(
     now_ns: u64,
     shared_recycles: &mut Vec<(u32, u64)>,
     forwarding: &ForwardingState,
+    worker_id: u32,
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
 ) -> bool {
-    let empty_worker_commands = BTreeMap::new();
-    let empty_owner_by_ifindex = BTreeMap::new();
     drain_pending_tx(
         binding,
         now_ns,
         shared_recycles,
         forwarding,
-        binding.worker_id,
-        &empty_worker_commands,
-        &empty_owner_by_ifindex,
+        worker_id,
+        worker_commands_by_id,
+        cos_owner_worker_by_ifindex,
     )
 }
 

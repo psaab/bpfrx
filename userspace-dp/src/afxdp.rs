@@ -2797,6 +2797,9 @@ fn poll_binding(
             local_tunnel_deliveries,
             recent_exceptions,
             dbg,
+            worker_id,
+            worker_commands_by_id,
+            cos_owner_worker_by_ifindex,
         );
         binding.scratch_post_recycles = scratch_post_recycles;
         binding.scratch_forwards = pending_forwards;

@@ -1322,6 +1322,16 @@ fn apply_worker_shaped_tx_requests(
             .iter_mut()
             .find(|binding| binding.ifindex == tx_ifindex)
         else {
+            if let Some(binding) = bindings.first_mut() {
+                binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            if cfg!(feature = "debug-log") {
+                debug_log!(
+                    "DBG COS_OWNER_MISSING_BINDING: egress_ifindex={} tx_ifindex={}",
+                    req.egress_ifindex,
+                    tx_ifindex,
+                );
+            }
             continue;
         };
         match enqueue_local_into_cos(binding, forwarding, req, now_ns) {
