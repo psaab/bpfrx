@@ -199,7 +199,11 @@ func (c *ctl) handleShow(args []string) error {
 
 	case "firewall":
 		if len(args) >= 3 && args[1] == "filter" {
-			return c.showText("firewall-filter:" + args[2])
+			topic := "firewall-filter:" + args[2]
+			if len(args) >= 5 && args[3] == "family" {
+				topic += ":" + args[4]
+			}
+			return c.showText(topic)
 		}
 		return c.showText("firewall")
 

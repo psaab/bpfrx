@@ -343,6 +343,11 @@ fn ingest_cos_pending_tx(
     if !binding.pending_tx_prepared.is_empty() {
         let mut kept = VecDeque::with_capacity(binding.pending_tx_prepared.len());
         while let Some(req) = binding.pending_tx_prepared.pop_front() {
+            let req = match redirect_prepared_cos_request_to_owner_binding(binding, forwarding, req)
+            {
+                Ok(()) => continue,
+                Err(req) => req,
+            };
             let req = match redirect_prepared_cos_request_to_owner(
                 binding,
                 req,
@@ -366,6 +371,15 @@ fn ingest_cos_pending_tx(
     let mut pending = merge_pending_tx_requests(local, shared);
     let mut kept = VecDeque::with_capacity(pending.len());
     while let Some(req) = pending.pop_front() {
+        let req = match redirect_local_cos_request_to_owner_binding(
+            &binding.live,
+            &binding.cos_owner_live_by_tx_ifindex,
+            forwarding,
+            req,
+        ) {
+            Ok(()) => continue,
+            Err(req) => req,
+        };
         let req = match redirect_local_cos_request_to_owner(
             req,
             worker_id,
@@ -419,6 +433,22 @@ fn redirect_local_cos_request_to_owner(
     Err(req)
 }
 
+fn redirect_local_cos_request_to_owner_binding(
+    current_live: &Arc<BindingLiveState>,
+    owner_live_by_tx_ifindex: &BTreeMap<i32, Arc<BindingLiveState>>,
+    forwarding: &ForwardingState,
+    req: TxRequest,
+) -> Result<(), TxRequest> {
+    let tx_ifindex = resolve_tx_binding_ifindex(forwarding, req.egress_ifindex);
+    let Some(owner_live) = owner_live_by_tx_ifindex.get(&tx_ifindex) else {
+        return Err(req);
+    };
+    if Arc::ptr_eq(owner_live, current_live) {
+        return Err(req);
+    }
+    owner_live.enqueue_tx_owned(req)
+}
+
 fn redirect_prepared_cos_request_to_owner(
     binding: &mut BindingWorker,
     req: PreparedTxRequest,
@@ -459,6 +489,42 @@ fn redirect_prepared_cos_request_to_owner(
     )
     .is_ok()
     {
+        recycle_prepared_immediately(binding, &req);
+        return Ok(());
+    }
+    Err(req)
+}
+
+fn redirect_prepared_cos_request_to_owner_binding(
+    binding: &mut BindingWorker,
+    forwarding: &ForwardingState,
+    req: PreparedTxRequest,
+) -> Result<(), PreparedTxRequest> {
+    let tx_ifindex = resolve_tx_binding_ifindex(forwarding, req.egress_ifindex);
+    let Some(owner_live) = binding.cos_owner_live_by_tx_ifindex.get(&tx_ifindex) else {
+        return Err(req);
+    };
+    if Arc::ptr_eq(owner_live, &binding.live) {
+        return Err(req);
+    }
+    let Some(frame) = binding
+        .umem
+        .area()
+        .slice(req.offset as usize, req.len as usize)
+        .map(|frame| frame.to_vec())
+    else {
+        return Err(req);
+    };
+    let local_req = TxRequest {
+        bytes: frame,
+        expected_ports: req.expected_ports,
+        expected_addr_family: req.expected_addr_family,
+        expected_protocol: req.expected_protocol,
+        flow_key: req.flow_key.clone(),
+        egress_ifindex: req.egress_ifindex,
+        cos_queue_id: req.cos_queue_id,
+    };
+    if owner_live.enqueue_tx(local_req).is_ok() {
         recycle_prepared_immediately(binding, &req);
         return Ok(());
     }
@@ -991,7 +1057,7 @@ pub(super) fn resolve_cos_queue_id(
             .contains_key(&egress_ifindex)
     };
     let result = if has_output_filter {
-        crate::filter::evaluate_interface_output_filter(
+        crate::filter::evaluate_interface_output_filter_counted(
             &forwarding.filter_state,
             egress_ifindex,
             is_v6,
@@ -1001,6 +1067,7 @@ pub(super) fn resolve_cos_queue_id(
             flow_key.src_port,
             flow_key.dst_port,
             meta.dscp,
+            meta.pkt_len as u64,
         )
     } else {
         let ingress_ifindex = resolve_ingress_logical_ifindex(
@@ -1009,7 +1076,7 @@ pub(super) fn resolve_cos_queue_id(
             meta.ingress_vlan_id,
         )
         .unwrap_or(meta.ingress_ifindex as i32);
-        crate::filter::evaluate_interface_filter(
+        crate::filter::evaluate_interface_filter_counted(
             &forwarding.filter_state,
             ingress_ifindex,
             is_v6,
@@ -1019,6 +1086,7 @@ pub(super) fn resolve_cos_queue_id(
             flow_key.src_port,
             flow_key.dst_port,
             meta.dscp,
+            meta.pkt_len as u64,
         )
     };
     if !result.forwarding_class.is_empty() {
@@ -1029,7 +1097,25 @@ pub(super) fn resolve_cos_queue_id(
             return Some(*queue_id);
         }
     }
+    if let Some(queue_id) = resolve_cos_dscp_classifier_queue_id(forwarding, iface, meta.dscp) {
+        return Some(queue_id);
+    }
     Some(iface.default_queue)
+}
+
+fn resolve_cos_dscp_classifier_queue_id(
+    forwarding: &ForwardingState,
+    iface: &CoSInterfaceConfig,
+    dscp: u8,
+) -> Option<u8> {
+    if iface.dscp_classifier.is_empty() {
+        return None;
+    }
+    forwarding
+        .cos
+        .dscp_classifiers
+        .get(&iface.dscp_classifier)
+        .and_then(|classifier| classifier.queue_by_dscp.get(&dscp).copied())
 }
 
 pub(super) fn enqueue_local_into_cos(
@@ -1803,9 +1889,9 @@ pub(super) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, now_ns: u6
 mod tests {
     use super::*;
     use crate::{
-        ClassOfServiceSnapshot, CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot,
-        CoSSchedulerMapSnapshot, CoSSchedulerSnapshot, FirewallFilterSnapshot,
-        FirewallTermSnapshot,
+        ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
+        CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot,
+        CoSSchedulerSnapshot, FirewallFilterSnapshot, FirewallTermSnapshot,
     };
 
     #[test]
@@ -1894,6 +1980,49 @@ mod tests {
             }
             other => panic!("unexpected command queued: {other:?}"),
         }
+    }
+
+    #[test]
+    fn redirect_local_cos_request_to_owner_binding_pushes_owner_live_queue() {
+        let current_live = Arc::new(BindingLiveState::new());
+        let owner_live = Arc::new(BindingLiveState::new());
+        let owner_live_by_tx_ifindex = BTreeMap::from([(12, owner_live.clone())]);
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 80,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".to_string(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+        let req = TxRequest {
+            bytes: vec![1, 2, 3],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(4),
+        };
+
+        let redirected = redirect_local_cos_request_to_owner_binding(
+            &current_live,
+            &owner_live_by_tx_ifindex,
+            &forwarding,
+            req,
+        );
+
+        assert!(redirected.is_ok());
+        let queued = owner_live.take_pending_tx();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued.front().map(|req| req.egress_ifindex), Some(80));
+        assert!(current_live.take_pending_tx().is_empty());
     }
 
     #[test]
@@ -2049,6 +2178,7 @@ mod tests {
                         },
                     ],
                 }],
+                dscp_classifiers: vec![],
             }),
             ..Default::default()
         };
@@ -2123,6 +2253,7 @@ mod tests {
                         queue: 1,
                     },
                 ],
+                dscp_classifiers: vec![],
                 schedulers: vec![
                     CoSSchedulerSnapshot {
                         name: "be-sched".into(),
@@ -2195,6 +2326,7 @@ mod tests {
                     name: "best-effort".into(),
                     queue: 7,
                 }],
+                dscp_classifiers: vec![],
                 schedulers: vec![CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 10_000_000,
@@ -2227,6 +2359,93 @@ mod tests {
         );
 
         assert_eq!(queue_id, Some(7));
+    }
+
+    #[test]
+    fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                ifindex: 202,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
+                cos_scheduler_map: "wan-map".into(),
+                cos_dscp_classifier: "wan-classifier".into(),
+                ..Default::default()
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![
+                    CoSForwardingClassSnapshot {
+                        name: "best-effort".into(),
+                        queue: 0,
+                    },
+                    CoSForwardingClassSnapshot {
+                        name: "voice".into(),
+                        queue: 5,
+                    },
+                ],
+                dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+                    name: "wan-classifier".into(),
+                    entries: vec![CoSDSCPClassifierEntrySnapshot {
+                        forwarding_class: "voice".into(),
+                        loss_priority: "low".into(),
+                        dscp_values: vec![46],
+                    }],
+                }],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "best-effort".into(),
+                            scheduler: "be-sched".into(),
+                        },
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "voice".into(),
+                            scheduler: "voice-sched".into(),
+                        },
+                    ],
+                }],
+                schedulers: vec![
+                    CoSSchedulerSnapshot {
+                        name: "be-sched".into(),
+                        transmit_rate_bytes: 4_000_000,
+                        transmit_rate_exact: false,
+                        priority: "low".into(),
+                        buffer_size_bytes: 128_000,
+                    },
+                    CoSSchedulerSnapshot {
+                        name: "voice-sched".into(),
+                        transmit_rate_bytes: 6_000_000,
+                        transmit_rate_exact: false,
+                        priority: "strict-high".into(),
+                        buffer_size_bytes: 64_000,
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+
+        let forwarding = build_forwarding_state(&snapshot);
+        let queue_id = resolve_cos_queue_id(
+            &forwarding,
+            202,
+            UserspaceDpMeta {
+                ingress_ifindex: 999,
+                ingress_vlan_id: 0,
+                addr_family: libc::AF_INET as u8,
+                dscp: 46,
+                ..Default::default()
+            },
+            Some(&SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 443,
+            }),
+        );
+
+        assert_eq!(queue_id, Some(5));
     }
 
     #[test]
@@ -2289,6 +2508,7 @@ mod tests {
                         queue: 1,
                     },
                 ],
+                dscp_classifiers: vec![],
                 schedulers: vec![
                     CoSSchedulerSnapshot {
                         name: "be-sched".into(),
@@ -2352,6 +2572,7 @@ mod tests {
                 shaping_rate_bytes: 1_000_000,
                 burst_bytes: COS_MIN_BURST_BYTES,
                 default_queue: 0,
+                dscp_classifier: String::new(),
                 queue_by_forwarding_class: FastMap::default(),
                 queues: vec![CoSQueueConfig {
                     queue_id: 0,
@@ -2373,6 +2594,7 @@ mod tests {
                 shaping_rate_bytes: 1_000_000,
                 burst_bytes: COS_MIN_BURST_BYTES,
                 default_queue: 0,
+                dscp_classifier: String::new(),
                 queue_by_forwarding_class: FastMap::default(),
                 queues: vec![CoSQueueConfig {
                     queue_id: 0,

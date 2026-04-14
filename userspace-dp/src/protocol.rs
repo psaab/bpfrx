@@ -78,12 +78,16 @@ pub(crate) struct InterfaceSnapshot {
     pub cos_shaping_burst_bytes: u64,
     #[serde(rename = "cos_scheduler_map", default)]
     pub cos_scheduler_map: String,
+    #[serde(rename = "cos_dscp_classifier", default)]
+    pub cos_dscp_classifier: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct ClassOfServiceSnapshot {
     #[serde(rename = "forwarding_classes", default)]
     pub forwarding_classes: Vec<CoSForwardingClassSnapshot>,
+    #[serde(rename = "dscp_classifiers", default)]
+    pub dscp_classifiers: Vec<CoSDSCPClassifierSnapshot>,
     #[serde(rename = "schedulers", default)]
     pub schedulers: Vec<CoSSchedulerSnapshot>,
     #[serde(rename = "scheduler_maps", default)]
@@ -95,6 +99,23 @@ pub(crate) struct CoSForwardingClassSnapshot {
     pub name: String,
     #[serde(default)]
     pub queue: i32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct CoSDSCPClassifierSnapshot {
+    pub name: String,
+    #[serde(default)]
+    pub entries: Vec<CoSDSCPClassifierEntrySnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct CoSDSCPClassifierEntrySnapshot {
+    #[serde(rename = "forwarding_class", default)]
+    pub forwarding_class: String,
+    #[serde(rename = "loss_priority", default)]
+    pub loss_priority: String,
+    #[serde(rename = "dscp_values", default)]
+    pub dscp_values: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -650,6 +671,8 @@ pub(crate) struct ProcessStatus {
     pub recent_exceptions: Vec<ExceptionStatus>,
     #[serde(rename = "cos_interfaces", default)]
     pub cos_interfaces: Vec<CoSInterfaceStatus>,
+    #[serde(rename = "filter_term_counters", default)]
+    pub filter_term_counters: Vec<FirewallFilterTermCounterStatus>,
     #[serde(rename = "last_resolution", skip_serializing_if = "Option::is_none")]
     pub last_resolution: Option<PacketResolution>,
     #[serde(rename = "slow_path", default)]
@@ -741,6 +764,20 @@ pub(crate) struct CoSQueueStatus {
     pub next_wakeup_tick: u64,
     #[serde(rename = "surplus_deficit_bytes", default)]
     pub surplus_deficit_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct FirewallFilterTermCounterStatus {
+    #[serde(default)]
+    pub family: String,
+    #[serde(rename = "filter_name", default)]
+    pub filter_name: String,
+    #[serde(rename = "term_name", default)]
+    pub term_name: String,
+    #[serde(default)]
+    pub packets: u64,
+    #[serde(default)]
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

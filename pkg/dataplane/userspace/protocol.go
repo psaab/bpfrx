@@ -121,10 +121,12 @@ type InterfaceSnapshot struct {
 	CoSShapingRateBytesPerSec uint64                     `json:"cos_shaping_rate_bytes_per_sec,omitempty"`
 	CoSBurstSize              uint64                     `json:"cos_shaping_burst_bytes,omitempty"`
 	CoSSchedulerMap           string                     `json:"cos_scheduler_map,omitempty"`
+	CoSDSCPClassifier         string                     `json:"cos_dscp_classifier,omitempty"`
 }
 
 type ClassOfServiceSnapshot struct {
 	ForwardingClasses []CoSForwardingClassSnapshot `json:"forwarding_classes,omitempty"`
+	DSCPClassifiers   []CoSDSCPClassifierSnapshot  `json:"dscp_classifiers,omitempty"`
 	Schedulers        []CoSSchedulerSnapshot       `json:"schedulers,omitempty"`
 	SchedulerMaps     []CoSSchedulerMapSnapshot    `json:"scheduler_maps,omitempty"`
 }
@@ -132,6 +134,17 @@ type ClassOfServiceSnapshot struct {
 type CoSForwardingClassSnapshot struct {
 	Name  string `json:"name"`
 	Queue int    `json:"queue"`
+}
+
+type CoSDSCPClassifierSnapshot struct {
+	Name    string                           `json:"name"`
+	Entries []CoSDSCPClassifierEntrySnapshot `json:"entries,omitempty"`
+}
+
+type CoSDSCPClassifierEntrySnapshot struct {
+	ForwardingClass string  `json:"forwarding_class,omitempty"`
+	LossPriority    string  `json:"loss_priority,omitempty"`
+	DSCPValues      []uint8 `json:"dscp_values,omitempty"`
 }
 
 type CoSSchedulerSnapshot struct {
@@ -358,42 +371,43 @@ type UserspaceCapabilities struct {
 }
 
 type ProcessStatus struct {
-	PID                    int                   `json:"pid"`
-	StartedAt              time.Time             `json:"started_at"`
-	ControlSocket          string                `json:"control_socket"`
-	StateFile              string                `json:"state_file"`
-	Workers                int                   `json:"workers"`
-	RingEntries            int                   `json:"ring_entries"`
-	HelperMode             string                `json:"helper_mode"`
-	IOUringPlanned         bool                  `json:"io_uring_planned"`
-	IOUringActive          bool                  `json:"io_uring_active,omitempty"`
-	IOUringMode            string                `json:"io_uring_mode,omitempty"`
-	IOUringLastError       string                `json:"io_uring_last_error,omitempty"`
-	Enabled                bool                  `json:"enabled"`
-	ForwardingArmed        bool                  `json:"forwarding_armed,omitempty"`
-	Capabilities           UserspaceCapabilities `json:"capabilities"`
-	LastSnapshotGeneration uint64                `json:"last_snapshot_generation"`
-	LastFIBGeneration      uint32                `json:"last_fib_generation,omitempty"`
-	LastSnapshotAt         time.Time             `json:"last_snapshot_at,omitempty"`
-	InterfaceAddresses     int                   `json:"interface_addresses,omitempty"`
-	NeighborEntries        int                   `json:"neighbor_entries,omitempty"`
-	NeighborGeneration     uint64                `json:"neighbor_generation,omitempty"`
-	RouteEntries           int                   `json:"route_entries,omitempty"`
-	WorkerHeartbeats       []time.Time           `json:"worker_heartbeats,omitempty"`
-	HAGroups               []HAGroupStatus       `json:"ha_groups,omitempty"`
-	Fabrics                []FabricSnapshot      `json:"fabrics,omitempty"`
-	Queues                 []QueueStatus         `json:"queues,omitempty"`
-	Bindings               []BindingStatus       `json:"bindings,omitempty"`
-	RecentSessionDeltas    []SessionDeltaInfo    `json:"recent_session_deltas,omitempty"`
-	RecentExceptions       []ExceptionStatus     `json:"recent_exceptions,omitempty"`
-	CoSInterfaces          []CoSInterfaceStatus  `json:"cos_interfaces,omitempty"`
-	LastResolution         *PacketResolution     `json:"last_resolution,omitempty"`
-	SlowPath               SlowPathStatus        `json:"slow_path,omitempty"`
-	LastCacheFlushAt       uint64                `json:"last_cache_flush_at,omitempty"` // monotonic secs (#312)
-	DataplaneMode          string                `json:"dataplane_mode,omitempty"`      // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
-	ConfiguredMode         string                `json:"configured_mode,omitempty"`     // Desired mode from config
-	EntryPrograms          map[int]string        `json:"entry_programs,omitempty"`      // ifindex -> attached XDP program name
-	FallbackCounters       map[string]uint64     `json:"fallback_counters,omitempty"`   // reason_name -> count
+	PID                    int                               `json:"pid"`
+	StartedAt              time.Time                         `json:"started_at"`
+	ControlSocket          string                            `json:"control_socket"`
+	StateFile              string                            `json:"state_file"`
+	Workers                int                               `json:"workers"`
+	RingEntries            int                               `json:"ring_entries"`
+	HelperMode             string                            `json:"helper_mode"`
+	IOUringPlanned         bool                              `json:"io_uring_planned"`
+	IOUringActive          bool                              `json:"io_uring_active,omitempty"`
+	IOUringMode            string                            `json:"io_uring_mode,omitempty"`
+	IOUringLastError       string                            `json:"io_uring_last_error,omitempty"`
+	Enabled                bool                              `json:"enabled"`
+	ForwardingArmed        bool                              `json:"forwarding_armed,omitempty"`
+	Capabilities           UserspaceCapabilities             `json:"capabilities"`
+	LastSnapshotGeneration uint64                            `json:"last_snapshot_generation"`
+	LastFIBGeneration      uint32                            `json:"last_fib_generation,omitempty"`
+	LastSnapshotAt         time.Time                         `json:"last_snapshot_at,omitempty"`
+	InterfaceAddresses     int                               `json:"interface_addresses,omitempty"`
+	NeighborEntries        int                               `json:"neighbor_entries,omitempty"`
+	NeighborGeneration     uint64                            `json:"neighbor_generation,omitempty"`
+	RouteEntries           int                               `json:"route_entries,omitempty"`
+	WorkerHeartbeats       []time.Time                       `json:"worker_heartbeats,omitempty"`
+	HAGroups               []HAGroupStatus                   `json:"ha_groups,omitempty"`
+	Fabrics                []FabricSnapshot                  `json:"fabrics,omitempty"`
+	Queues                 []QueueStatus                     `json:"queues,omitempty"`
+	Bindings               []BindingStatus                   `json:"bindings,omitempty"`
+	RecentSessionDeltas    []SessionDeltaInfo                `json:"recent_session_deltas,omitempty"`
+	RecentExceptions       []ExceptionStatus                 `json:"recent_exceptions,omitempty"`
+	CoSInterfaces          []CoSInterfaceStatus              `json:"cos_interfaces,omitempty"`
+	FilterTermCounters     []FirewallFilterTermCounterStatus `json:"filter_term_counters,omitempty"`
+	LastResolution         *PacketResolution                 `json:"last_resolution,omitempty"`
+	SlowPath               SlowPathStatus                    `json:"slow_path,omitempty"`
+	LastCacheFlushAt       uint64                            `json:"last_cache_flush_at,omitempty"` // monotonic secs (#312)
+	DataplaneMode          string                            `json:"dataplane_mode,omitempty"`      // Current active mode: "ebpf_only", "userspace_compat", "userspace_strict"
+	ConfiguredMode         string                            `json:"configured_mode,omitempty"`     // Desired mode from config
+	EntryPrograms          map[int]string                    `json:"entry_programs,omitempty"`      // ifindex -> attached XDP program name
+	FallbackCounters       map[string]uint64                 `json:"fallback_counters,omitempty"`   // reason_name -> count
 }
 
 type CoSInterfaceStatus struct {
@@ -424,6 +438,14 @@ type CoSQueueStatus struct {
 	ParkedInstances     int    `json:"parked_instances,omitempty"`
 	NextWakeupTick      uint64 `json:"next_wakeup_tick,omitempty"`
 	SurplusDeficitBytes uint64 `json:"surplus_deficit_bytes,omitempty"`
+}
+
+type FirewallFilterTermCounterStatus struct {
+	Family     string `json:"family,omitempty"`
+	FilterName string `json:"filter_name,omitempty"`
+	TermName   string `json:"term_name,omitempty"`
+	Packets    uint64 `json:"packets,omitempty"`
+	Bytes      uint64 `json:"bytes,omitempty"`
 }
 
 type HAStateUpdateRequest struct {

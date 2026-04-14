@@ -1135,6 +1135,15 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		"forwarding-classes": {children: map[string]*schemaNode{
 			"queue": {args: 2, multi: true, children: nil},
 		}},
+		"classifiers": {children: map[string]*schemaNode{
+			"dscp": {args: 1, multi: true, children: map[string]*schemaNode{
+				"forwarding-class": {args: 1, multi: true, children: map[string]*schemaNode{
+					"loss-priority": {args: 1, multi: true, children: map[string]*schemaNode{
+						"code-points": {args: 1, multi: true, children: nil},
+					}},
+				}},
+			}},
+		}},
 		"schedulers": {args: 1, multi: true, children: map[string]*schemaNode{
 			"transmit-rate": {args: 1, children: map[string]*schemaNode{
 				"exact": {children: nil},
@@ -1149,6 +1158,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 		}},
 		"interfaces": {args: 1, multi: true, children: map[string]*schemaNode{
 			"unit": {args: 1, multi: true, children: map[string]*schemaNode{
+				"classifiers": {children: map[string]*schemaNode{
+					"dscp": {args: 1, children: nil},
+				}},
 				"shaping-rate": {args: 1, children: map[string]*schemaNode{
 					"burst-size": {args: 1, children: nil},
 				}},

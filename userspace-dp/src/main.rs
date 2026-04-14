@@ -157,6 +157,7 @@ fn run() -> Result<(), String> {
             recent_session_deltas: Vec::new(),
             recent_exceptions: Vec::new(),
             cos_interfaces: Vec::new(),
+            filter_term_counters: Vec::new(),
             last_resolution: None,
             slow_path: SlowPathStatus::default(),
             debug_worker_threads: 0,
@@ -792,6 +793,7 @@ fn refresh_status(state: &mut ServerState) {
     state.status.recent_session_deltas = state.afxdp.recent_session_deltas();
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
     state.status.cos_interfaces = state.afxdp.cos_statuses();
+    state.status.filter_term_counters = state.afxdp.filter_term_counters();
     state.status.last_resolution = state.afxdp.last_resolution();
     state.status.slow_path = state.afxdp.slow_path_status().into();
     if let Some(es_stats) = state.afxdp.event_stream_stats() {

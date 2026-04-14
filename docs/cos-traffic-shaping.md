@@ -770,6 +770,9 @@ Important current behavior:
 - queue selection prefers the shaped interface **egress output filter**
 - if no egress CoS filter is configured, queue selection falls back to the
   current **ingress interface input filter**
+- if neither filter assigns a forwarding class, queue selection falls back to
+  the shaped interface's attached DSCP classifier under
+  `class-of-service interfaces <if> unit <u> classifiers dscp <name>`
 - non-`exact` scheduler `transmit-rate` values act as guarantees and may borrow
   surplus bandwidth up to the root shaper
 - `transmit-rate exact` prevents that queue from borrowing surplus
@@ -795,7 +798,11 @@ set class-of-service scheduler-maps bandwidth-limit forwarding-class best-effort
 set class-of-service scheduler-maps bandwidth-limit forwarding-class bandwidth-10mb scheduler scheduler-10mb
 set class-of-service scheduler-maps bandwidth-limit forwarding-class bandwidth-5mb scheduler scheduler-5mb
 
+set class-of-service classifiers dscp bandwidth-dscp forwarding-class bandwidth-10mb loss-priority low code-points ef
+set class-of-service classifiers dscp bandwidth-dscp forwarding-class bandwidth-5mb loss-priority low code-points default
+
 set class-of-service interfaces reth0 unit 80 scheduler-map bandwidth-limit
+set class-of-service interfaces reth0 unit 80 classifiers dscp bandwidth-dscp
 set class-of-service interfaces reth0 unit 80 shaping-rate 15m
 
 set firewall family inet filter bandwidth-output term 0 from destination-port 80
@@ -818,10 +825,14 @@ Notes for this specific test:
   traffic in this lab leaves via `reth0.80`
 - define an explicit `best-effort` queue so unmatched traffic does not depend
   on whatever queue happens to be first in the scheduler map
+- DSCP BA classifiers are a fallback input to CoS queue selection today; an
+  explicit firewall filter `then forwarding-class ...` decision still wins
 - keep ingress `input` filter classification only as a compatibility fallback
   for existing configs that do not yet attach an egress CoS filter
 - use `set class-of-service schedulers <name> transmit-rate <rate> exact` for
   queues that must stay capped at their guarantee instead of borrowing surplus
+- `loss-priority` on CoS DSCP classifiers is accepted for syntax compatibility
+  but is not enforced yet
 
 Suggested verification commands:
 
@@ -849,8 +860,9 @@ Required views:
 Currently implemented:
 
 - `show class-of-service interface [IFACE[.UNIT]]`
-- prints configured shaping rate, scheduler-map, attached CoS filters, and the
-  live userspace queue/runtime state that is currently exported by the helper
+- prints configured shaping rate, scheduler-map, attached CoS filters, attached
+  DSCP classifier, and the live userspace queue/runtime state that is currently
+  exported by the helper
 - shaped egress interfaces now have a static userspace scheduler owner worker;
   non-owner workers hand shaped traffic to that owner before CoS queue
   admission so one interface does not silently get independent queue state on

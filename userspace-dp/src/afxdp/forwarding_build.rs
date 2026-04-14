@@ -434,6 +434,35 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
         return CoSState::default();
     };
 
+    let dscp_classifiers = cos
+        .dscp_classifiers
+        .iter()
+        .filter(|classifier| !classifier.name.is_empty())
+        .map(|classifier| {
+            let mut queue_by_dscp = FastMap::default();
+            for entry in &classifier.entries {
+                if entry.forwarding_class.is_empty() {
+                    continue;
+                }
+                let Some(queue_id) = cos
+                    .forwarding_classes
+                    .iter()
+                    .find(|class| class.name == entry.forwarding_class)
+                    .and_then(|class| u8::try_from(class.queue).ok())
+                else {
+                    continue;
+                };
+                for dscp in &entry.dscp_values {
+                    queue_by_dscp.insert(*dscp, queue_id);
+                }
+            }
+            (
+                classifier.name.clone(),
+                CoSDSCPClassifierConfig { queue_by_dscp },
+            )
+        })
+        .collect::<FastMap<_, _>>();
+
     let class_to_queue = cos
         .forwarding_classes
         .iter()
@@ -528,11 +557,14 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                 shaping_rate_bytes: iface.cos_shaping_rate_bytes_per_sec,
                 burst_bytes,
                 default_queue,
+                dscp_classifier: iface.cos_dscp_classifier.clone(),
                 queue_by_forwarding_class,
                 queues,
             },
         );
     }
+
+    state.dscp_classifiers = dscp_classifiers;
 
     state
 }
@@ -568,8 +600,9 @@ fn cos_priority_rank(priority: &str) -> u8 {
 mod tests {
     use super::*;
     use crate::{
-        ClassOfServiceSnapshot, CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot,
-        CoSSchedulerMapSnapshot, CoSSchedulerSnapshot,
+        ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
+        CoSForwardingClassSnapshot, CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot,
+        CoSSchedulerSnapshot,
     };
 
     #[test]
@@ -622,6 +655,7 @@ mod tests {
                         },
                     ],
                 }],
+                dscp_classifiers: vec![],
             }),
             ..Default::default()
         };
@@ -696,6 +730,7 @@ mod tests {
                     name: "best-effort".into(),
                     queue: 0,
                 }],
+                dscp_classifiers: vec![],
                 schedulers: vec![CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 0,
@@ -719,6 +754,88 @@ mod tests {
         assert_eq!(iface.queues.len(), 1);
         assert_eq!(iface.queues[0].transmit_rate_bytes, 1_000_000);
         assert_eq!(iface.queues[0].surplus_weight, 16);
+    }
+
+    #[test]
+    fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                ifindex: 42,
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
+                cos_scheduler_map: "wan-map".into(),
+                cos_dscp_classifier: "wan-classifier".into(),
+                ..Default::default()
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![
+                    CoSForwardingClassSnapshot {
+                        name: "best-effort".into(),
+                        queue: 0,
+                    },
+                    CoSForwardingClassSnapshot {
+                        name: "voice".into(),
+                        queue: 5,
+                    },
+                ],
+                dscp_classifiers: vec![CoSDSCPClassifierSnapshot {
+                    name: "wan-classifier".into(),
+                    entries: vec![
+                        CoSDSCPClassifierEntrySnapshot {
+                            forwarding_class: "voice".into(),
+                            loss_priority: "low".into(),
+                            dscp_values: vec![46],
+                        },
+                        CoSDSCPClassifierEntrySnapshot {
+                            forwarding_class: "best-effort".into(),
+                            loss_priority: "low".into(),
+                            dscp_values: vec![0],
+                        },
+                    ],
+                }],
+                schedulers: vec![
+                    CoSSchedulerSnapshot {
+                        name: "be".into(),
+                        transmit_rate_bytes: 1_000_000,
+                        transmit_rate_exact: false,
+                        priority: "low".into(),
+                        buffer_size_bytes: 0,
+                    },
+                    CoSSchedulerSnapshot {
+                        name: "voice".into(),
+                        transmit_rate_bytes: 2_000_000,
+                        transmit_rate_exact: false,
+                        priority: "high".into(),
+                        buffer_size_bytes: 0,
+                    },
+                ],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "best-effort".into(),
+                            scheduler: "be".into(),
+                        },
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "voice".into(),
+                            scheduler: "voice".into(),
+                        },
+                    ],
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let state = build_cos_state(&snapshot);
+        let iface = state.interfaces.get(&42).expect("missing CoS interface");
+        assert_eq!(iface.dscp_classifier, "wan-classifier");
+        assert!(iface.queues.iter().any(|queue| queue.queue_id == 5));
+        let classifier = state
+            .dscp_classifiers
+            .get("wan-classifier")
+            .expect("missing classifier");
+        assert_eq!(classifier.queue_by_dscp.get(&46), Some(&5));
+        assert_eq!(classifier.queue_by_dscp.get(&0), Some(&0));
     }
 }
 

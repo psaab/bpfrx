@@ -327,6 +327,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				CoSShapingRateBytesPerSec: coSUnitShapingRate(cosUnit),
 				CoSBurstSize:              coSUnitBurstSize(cosUnit),
 				CoSSchedulerMap:           coSUnitSchedulerMap(cosUnit),
+				CoSDSCPClassifier:         coSUnitDSCPClassifier(cosUnit),
 			})
 		}
 	}
@@ -352,6 +353,13 @@ func coSUnitSchedulerMap(unit *config.CoSInterfaceUnit) string {
 		return ""
 	}
 	return unit.SchedulerMap
+}
+
+func coSUnitDSCPClassifier(unit *config.CoSInterfaceUnit) string {
+	if unit == nil {
+		return ""
+	}
+	return unit.DSCPClassifier
 }
 
 func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []TunnelEndpointSnapshot {
@@ -1423,7 +1431,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 		return nil
 	}
 	cos := cfg.ClassOfService
-	if len(cos.ForwardingClasses) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 {
+	if len(cos.ForwardingClasses) == 0 && len(cos.DSCPClassifiers) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 && len(cos.Interfaces) == 0 {
 		return nil
 	}
 	snap := &ClassOfServiceSnapshot{}
@@ -1444,6 +1452,33 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				Name:  class.Name,
 				Queue: class.Queue,
 			})
+		}
+	}
+
+	if len(cos.DSCPClassifiers) > 0 {
+		names := make([]string, 0, len(cos.DSCPClassifiers))
+		for name := range cos.DSCPClassifiers {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		snap.DSCPClassifiers = make([]CoSDSCPClassifierSnapshot, 0, len(names))
+		for _, name := range names {
+			classifier := cos.DSCPClassifiers[name]
+			if classifier == nil {
+				continue
+			}
+			classifierSnap := CoSDSCPClassifierSnapshot{Name: classifier.Name}
+			for _, entry := range classifier.Entries {
+				if entry == nil {
+					continue
+				}
+				classifierSnap.Entries = append(classifierSnap.Entries, CoSDSCPClassifierEntrySnapshot{
+					ForwardingClass: entry.ForwardingClass,
+					LossPriority:    entry.LossPriority,
+					DSCPValues:      append([]uint8(nil), entry.DSCPValues...),
+				})
+			}
+			snap.DSCPClassifiers = append(snap.DSCPClassifiers, classifierSnap)
 		}
 	}
 

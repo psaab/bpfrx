@@ -5,6 +5,7 @@ go 1.24.9
 require (
 	github.com/chzyer/readline v1.5.1
 	github.com/cilium/ebpf v0.20.0
+	github.com/google/nftables v0.3.0
 	github.com/insomniacslk/dhcp v0.0.0-20251020182700-175e84fbb167
 	github.com/mdlayher/ndp v1.1.0
 	github.com/prometheus/client_golang v1.23.2
@@ -19,7 +20,6 @@ require (
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/nftables v0.3.0 // indirect
 	github.com/josharian/native v1.1.0 // indirect
 	github.com/mdlayher/netlink v1.7.3-0.20250113171957-fbb4dce95f42 // indirect
 	github.com/mdlayher/packet v1.1.2 // indirect
