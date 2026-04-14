@@ -969,22 +969,29 @@ func TestDNSServiceEnabled(t *testing.T) {
 }
 
 func TestCommitPersistGroupsInheritanceRejected(t *testing.T) {
-	input := `system {
+	tests := []string{
+		`system {
     commit {
         persist-groups-inheritance;
     }
-}`
-	p := NewParser(input)
-	tree, errs := p.Parse()
-	if errs != nil {
-		t.Fatal(errs)
+}`,
+		`system {
+    commit persist-groups-inheritance;
+}`,
 	}
-	_, err := CompileConfig(tree)
-	if err == nil {
-		t.Fatal("expected compile error")
-	}
-	if !strings.Contains(err.Error(), "persist-groups-inheritance") {
-		t.Fatalf("CompileConfig() error = %v, want persist-groups-inheritance", err)
+	for _, input := range tests {
+		p := NewParser(input)
+		tree, errs := p.Parse()
+		if errs != nil {
+			t.Fatal(errs)
+		}
+		_, err := CompileConfig(tree)
+		if err == nil {
+			t.Fatalf("expected compile error for %q", input)
+		}
+		if !strings.Contains(err.Error(), "persist-groups-inheritance") {
+			t.Fatalf("CompileConfig() error = %v, want persist-groups-inheritance", err)
+		}
 	}
 }
 

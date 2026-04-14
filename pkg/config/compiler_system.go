@@ -115,6 +115,11 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 				sys.BackupRouterDst = dstNode.Keys[1]
 			}
 		case "commit":
+			for _, key := range child.Keys[1:] {
+				if key == "persist-groups-inheritance" {
+					return fmt.Errorf("system commit persist-groups-inheritance: unsupported")
+				}
+			}
 			if child.FindChild("persist-groups-inheritance") != nil {
 				return fmt.Errorf("system commit persist-groups-inheritance: unsupported")
 			}
