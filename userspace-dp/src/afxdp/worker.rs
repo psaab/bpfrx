@@ -1339,22 +1339,16 @@ where
                     .map(std::vec::Vec::len)
                     .sum::<usize>(),
             );
-            let queue_config_by_id = forwarding
-                .cos
-                .interfaces
-                .get(&ifindex)
-                .map(|cfg| {
-                    cfg.queues
-                        .iter()
-                        .map(|queue| (queue.queue_id, queue))
-                        .collect::<BTreeMap<_, _>>()
-                })
-                .unwrap_or_default();
+            let interface_config = forwarding.cos.interfaces.get(&ifindex);
             let queue_map = queue_maps.entry(ifindex).or_default();
             for queue in &root.queues {
                 let status = queue_map.entry(queue.queue_id).or_default();
                 status.queue_id = queue.queue_id;
-                if let Some(config) = queue_config_by_id.get(&queue.queue_id) {
+                if let Some(config) = interface_config.and_then(|cfg| {
+                    cfg.queues
+                        .iter()
+                        .find(|config| config.queue_id == queue.queue_id)
+                }) {
                     if status.forwarding_class.is_empty() {
                         status.forwarding_class = config.forwarding_class.clone();
                     }

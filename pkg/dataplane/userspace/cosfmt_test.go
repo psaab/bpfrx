@@ -107,12 +107,9 @@ func TestFormatCoSInterfaceSummaryIncludesRuntimeQueueState(t *testing.T) {
 		"Runtime workers:          2",
 		"Runtime queues:           nonempty=1 runnable=1",
 		"Timer wheel sleepers:     level0=1 level1=0",
+		"Queue  Class           Priority",
 		"bandwidth-10mb",
-		"\t", // ensure tabwriter path generated a table row before flush normalization
 	} {
-		if want == "\t" {
-			continue
-		}
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in output:\n%s", want, out)
 		}

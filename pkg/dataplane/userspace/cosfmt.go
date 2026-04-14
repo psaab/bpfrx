@@ -144,12 +144,7 @@ func configuredCoSInterfaceViews(cfg *config.Config, status *ProcessStatus, sele
 			})
 		}
 	}
-	sort.Slice(views, func(i, j int) bool {
-		if views[i].name == views[j].name {
-			return views[i].unit < views[j].unit
-		}
-		return views[i].name < views[j].name
-	})
+	sort.Slice(views, func(i, j int) bool { return views[i].name < views[j].name })
 	return views
 }
 

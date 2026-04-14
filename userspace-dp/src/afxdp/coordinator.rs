@@ -867,9 +867,10 @@ impl Coordinator {
                     if q.forwarding_class.is_empty() {
                         q.forwarding_class = queue.forwarding_class.clone();
                     }
-                    q.priority = q.priority.min(queue.priority);
                     if q.worker_instances == 0 {
                         q.priority = queue.priority;
+                    } else {
+                        q.priority = q.priority.min(queue.priority);
                     }
                     q.exact = queue.exact;
                     q.transmit_rate_bytes = q.transmit_rate_bytes.max(queue.transmit_rate_bytes);
