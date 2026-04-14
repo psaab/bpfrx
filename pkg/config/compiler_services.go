@@ -321,6 +321,9 @@ func compileFlowMonitoring(node *Node, svc *ServicesConfig) error {
 					tmpl.ExportExtensions = append(tmpl.ExportExtensions, parseExportExtensions(prop)...)
 				}
 			}
+			if err := rejectUnsupportedFlowExportExtensions("version9", tmpl.Name, tmpl.ExportExtensions); err != nil {
+				return err
+			}
 			v9cfg.Templates[tmpl.Name] = tmpl
 		}
 		fm.Version9 = v9cfg
@@ -363,12 +366,24 @@ func compileFlowMonitoring(node *Node, svc *ServicesConfig) error {
 					tmpl.ExportExtensions = append(tmpl.ExportExtensions, parseExportExtensions(prop)...)
 				}
 			}
+			if err := rejectUnsupportedFlowExportExtensions("version-ipfix", tmpl.Name, tmpl.ExportExtensions); err != nil {
+				return err
+			}
 			ipfixCfg.Templates[tmpl.Name] = tmpl
 		}
 		fm.VersionIPFIX = ipfixCfg
 	}
 
 	svc.FlowMonitoring = fm
+	return nil
+}
+
+func rejectUnsupportedFlowExportExtensions(kind, name string, exts []string) error {
+	for _, ext := range exts {
+		if ext == "app-id" {
+			return fmt.Errorf("services flow-monitoring %s template %s: export-extension app-id unsupported", kind, name)
+		}
+	}
 	return nil
 }
 

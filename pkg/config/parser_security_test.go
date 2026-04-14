@@ -1006,38 +1006,8 @@ func TestV9ExportExtensions(t *testing.T) {
 	if len(errs) > 0 {
 		t.Fatalf("parse errors: %v", errs)
 	}
-	cfg, err := CompileConfig(tree)
-	if err != nil {
-		t.Fatalf("compile error: %v", err)
-	}
-	if cfg.Services.FlowMonitoring == nil {
-		t.Fatal("expected FlowMonitoring to be non-nil")
-	}
-	v9 := cfg.Services.FlowMonitoring.Version9
-	if v9 == nil {
-		t.Fatal("expected Version9 to be non-nil")
-	}
-	tmpl := v9.Templates["v9-ext"]
-	if tmpl == nil {
-		t.Fatal("expected template v9-ext")
-	}
-	if len(tmpl.ExportExtensions) != 2 {
-		t.Fatalf("expected 2 export extensions, got %d: %v", len(tmpl.ExportExtensions), tmpl.ExportExtensions)
-	}
-	if tmpl.ExportExtensions[0] != "flow-dir" {
-		t.Errorf("ext[0] = %q, want flow-dir", tmpl.ExportExtensions[0])
-	}
-	if tmpl.ExportExtensions[1] != "app-id" {
-		t.Errorf("ext[1] = %q, want app-id", tmpl.ExportExtensions[1])
-	}
-	found := false
-	for _, w := range cfg.Warnings {
-		if strings.Contains(w, "app-id") && strings.Contains(w, "v9-ext") {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("expected validation warning for app-id export-extension")
+	if _, err := CompileConfig(tree); err == nil || !strings.Contains(err.Error(), "export-extension app-id unsupported") {
+		t.Fatalf("expected unsupported app-id error, got %v", err)
 	}
 	tree2 := &ConfigTree{}
 	setCommands := []string{"set services flow-monitoring version9 template v9-set2 flow-active-timeout 90", "set services flow-monitoring version9 template v9-set2 ipv4-template export-extension flow-dir", "set services flow-monitoring version9 template v9-set2 ipv6-template export-extension flow-dir"}
@@ -1060,6 +1030,29 @@ func TestV9ExportExtensions(t *testing.T) {
 	}
 	if len(tmpl2.ExportExtensions) != 2 {
 		t.Fatalf("set syntax: expected 2 extensions, got %d: %v", len(tmpl2.ExportExtensions), tmpl2.ExportExtensions)
+	}
+}
+
+func TestIPFIXExportExtensionsRejectUnsupportedAppID(t *testing.T) {
+	input := `services {
+    flow-monitoring {
+        version-ipfix {
+            template ipfix-ext {
+                flow-active-timeout 60;
+                ipv4-template {
+                    export-extension app-id;
+                }
+            }
+        }
+    }
+}`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	if _, err := CompileConfig(tree); err == nil || !strings.Contains(err.Error(), "export-extension app-id unsupported") {
+		t.Fatalf("expected unsupported app-id error, got %v", err)
 	}
 }
 
