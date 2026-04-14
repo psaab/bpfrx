@@ -45,8 +45,10 @@ if [ -d /etc/bpfrx ] && [ ! -d /etc/xpf ]; then
     info "Renaming /etc/bpfrx -> /etc/xpf"
     mv /etc/bpfrx /etc/xpf
 elif [ -d /etc/bpfrx ] && [ -d /etc/xpf ]; then
-    # Both exist — copy any files from old that aren't in new
+    # Both exist — merge old tree into the new one, including hidden state
+    # such as .configdb.
     info "Both /etc/bpfrx and /etc/xpf exist, merging..."
+    shopt -s dotglob nullglob
     for f in /etc/bpfrx/*; do
         base=$(basename "$f")
         if [ ! -e "/etc/xpf/$base" ]; then
@@ -54,6 +56,7 @@ elif [ -d /etc/bpfrx ] && [ -d /etc/xpf ]; then
             info "  Copied $base to /etc/xpf/"
         fi
     done
+    shopt -u dotglob nullglob
     info "Removing /etc/bpfrx (merged into /etc/xpf)"
     rm -rf /etc/bpfrx
 fi

@@ -179,7 +179,7 @@ func findBinary(explicit string) (string, error) {
 	if p, err := exec.LookPath("xpf-userspace-dp"); err == nil {
 		return p, nil
 	}
-	return "", errors.New("userspace dataplane helper binary not found; build ./cmd/xpf-userspace-dp or configure system dataplane binary")
+	return "", errors.New("userspace dataplane helper binary not found; build make build-userspace-dp or configure system dataplane binary")
 }
 
 func (m *Manager) requestDetailedLocked(req ControlRequest) (ControlResponse, error) {
