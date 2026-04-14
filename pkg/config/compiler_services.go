@@ -23,6 +23,17 @@ func parseRPMPositiveInt(probeName, testName, field, raw string) (int, error) {
 	return n, nil
 }
 
+func parseRPMRootPositiveInt(field, raw string) (int, error) {
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("services rpm %s: invalid integer %q", field, raw)
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("services rpm %s: must be > 0", field)
+	}
+	return n, nil
+}
+
 func validateRPMTest(probeName string, test *RPMTest) error {
 	if test.Target == "" {
 		return fmt.Errorf("services rpm probe %q test %q: target is required", probeName, test.Name)
@@ -189,9 +200,9 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 
 	if probeLimitNode := node.FindChild("probe-limit"); probeLimitNode != nil {
 		if v := nodeVal(probeLimitNode); v != "" {
-			n, err := parseRPMPositiveInt("rpm", "default", "probe-limit", v)
+			n, err := parseRPMRootPositiveInt("probe-limit", v)
 			if err != nil {
-				return fmt.Errorf("services rpm probe-limit: %w", err)
+				return err
 			}
 			defaultProbeLimit = n
 		}
