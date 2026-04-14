@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx XDP forwarding stage.
+ * xpf XDP forwarding stage.
  *
  * Rewrites Ethernet MAC addresses based on FIB lookup results,
  * decrements TTL/hop_limit, and redirects the packet to the egress
@@ -8,12 +8,12 @@
  * Supports both IPv4 and IPv6.
  */
 
-#include "../headers/bpfrx_common.h"
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
-#include "../headers/bpfrx_trace.h"
+#include "../headers/xpf_common.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
+#include "../headers/xpf_trace.h"
 
-/* host_inbound_flag() is now in bpfrx_helpers.h */
+/* host_inbound_flag() is now in xpf_helpers.h */
 
 SEC("xdp")
 int xdp_forward_prog(struct xdp_md *ctx)

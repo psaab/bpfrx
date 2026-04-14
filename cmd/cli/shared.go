@@ -1,6 +1,6 @@
-// cli is the remote CLI client for bpfrxd.
+// cli is the remote CLI client for xpfd.
 //
-// It connects to the bpfrxd gRPC API and provides the same Junos-style
+// It connects to the xpfd gRPC API and provides the same Junos-style
 // interactive CLI as the embedded console.
 package main
 
@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
-	"github.com/psaab/bpfrx/pkg/cmdtree"
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
+	"github.com/psaab/xpf/pkg/cmdtree"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
 var errExit = fmt.Errorf("exit")

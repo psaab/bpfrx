@@ -949,7 +949,7 @@ What the rerun proved:
 
 Next actions:
 
-1. determine why `bpfrx-userspace-fw0` rebooted under admitted failover load
+1. determine why `xpf-userspace-fw0` rebooted under admitted failover load
 2. separate:
    - kernel panic / watchdog reset
    - host-side VM reset

@@ -13,7 +13,7 @@ import (
 	"hash"
 	"log/slog"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 const (

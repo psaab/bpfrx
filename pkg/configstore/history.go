@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // HistoryEntry represents a snapshot of a configuration tree.

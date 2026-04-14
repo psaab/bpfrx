@@ -1,4 +1,4 @@
-# bpfrx Pull Request History
+# xpf Pull Request History
 
 Complete record of all pull requests.
 Total: 234 PRs (211 merged)
@@ -12,29 +12,29 @@ Branch: `master`
 Profiles reference the networks, so Incus refuses to delete a network while a profile still holds a device entry for it.
 before fix:
 ```
-jdp@coi:~/bpfrx$ ./test/incus/setup.sh destroy
-==> Instance bpfrx-fw does not exist
+jdp@coi:~/xpf$ ./test/incus/setup.sh destroy
+==> Instance xpf-fw does not exist
 Also remove networks and profiles? [y/N] y
-==> Deleting network bpfrx-trust
+==> Deleting network xpf-trust
 Error: The network is currently in use
 ```
 after fix:
 ```
-jdp@coi:~/bpfrx$ ./test/incus/setup.sh destroy
-==> Instance bpfrx-fw does not exist
+jdp@coi:~/xpf$ ./test/incus/setup.sh destroy
+==> Instance xpf-fw does not exist
 Also remove networks and profiles? [y/N] y
-==> Deleting profile bpfrx-vm
-Profile bpfrx-vm deleted
-==> Deleting profile bpfrx-container
-Profile bpfrx-container deleted
-==> Deleting network bpfrx-trust
-Network bpfrx-trust deleted
-==> Deleting network bpfrx-untrust
-Network bpfrx-untrust deleted
-==> Deleting network bpfrx-dmz
-Network bpfrx-dmz deleted
-==> Deleting network bpfrx-tunnel
-Network bpfrx-tunnel deleted
+==> Deleting profile xpf-vm
+Profile xpf-vm deleted
+==> Deleting profile xpf-container
+Profile xpf-container deleted
+==> Deleting network xpf-trust
+Network xpf-trust deleted
+==> Deleting network xpf-untrust
+Network xpf-untrust deleted
+==> Deleting network xpf-dmz
+Network xpf-dmz deleted
+==> Deleting network xpf-tunnel
+Network xpf-tunnel deleted
 ==> Destroy complete.
 ```
 
@@ -79,7 +79,7 @@ func (m *Manager) buildDHCPv6Modifiers(ifaceName string, opts *DHCPv6Options) []
 <!-- START COPILOT CODING AGENT TIPS -->
 ---
 
-✨ Let Copilot coding agent [set things up for you](https://github.com/psaab/bpfrx/issues/new?title=✨+Set+up+Copilot+instructions&body=Configure%20instructions%20for%20this%20repository%20as%20documented%20in%20%5BBest%20practices%20for%20Copilot%20coding%20agent%20in%20your%20repository%5D%28https://gh.io/copilot-coding-agent-tips%29%2E%0A%0A%3COnboard%20this%20repo%3E&assignees=copilot) — coding agent works faster and does higher quality work when set up for your repo.
+✨ Let Copilot coding agent [set things up for you](https://github.com/psaab/xpf/issues/new?title=✨+Set+up+Copilot+instructions&body=Configure%20instructions%20for%20this%20repository%20as%20documented%20in%20%5BBest%20practices%20for%20Copilot%20coding%20agent%20in%20your%20repository%5D%28https://gh.io/copilot-coding-agent-tips%29%2E%0A%0A%3COnboard%20this%20repo%3E&assignees=copilot) — coding agent works faster and does higher quality work when set up for your repo.
 
 
 ---
@@ -233,7 +233,7 @@ Branch: `pr/pre-id-default-policy-tracking`
 - define scoped implementation steps and acceptance criteria
 
 ## Why
-`vsrx.conf` includes `pre-id-default-policy`, but bpfrx currently parses the stanza without applying it in policy/dataplane behavior.
+`vsrx.conf` includes `pre-id-default-policy`, but xpf currently parses the stanza without applying it in policy/dataplane behavior.
 
 ## Testing
 - docs-only change
@@ -269,7 +269,7 @@ Branch: `pr/master-password-tracking`
 - define secure implementation scope and acceptance criteria
 
 ## Why
-`system master-password` exists in the imported config but currently has no runtime effect in bpfrx.
+`system master-password` exists in the imported config but currently has no runtime effect in xpf.
 
 ## Testing
 - docs-only change
@@ -287,7 +287,7 @@ Branch: `pr/license-autoupdate-url-tracking`
 - define implementation scope and acceptance criteria
 
 ## Why
-The imported config includes license autoupdate URL, but bpfrx currently stores it without acting on it.
+The imported config includes license autoupdate URL, but xpf currently stores it without acting on it.
 
 ## Testing
 - docs-only change
@@ -300,14 +300,14 @@ The imported config includes license autoupdate URL, but bpfrx currently stores 
 Branch: `docs/monitor-command-research`
 
 ## Summary
-Adds a new next-feature doc that captures live JUNOS `monitor` behavior from `claude@172.16.100.1` and translates it into an implementation plan for bpfrx.
+Adds a new next-feature doc that captures live JUNOS `monitor` behavior from `claude@172.16.100.1` and translates it into an implementation plan for xpf.
 
 ## What this includes
 - Live command tree and syntax for:
   - `monitor security flow` (`file`, `filter`, `start`, `stop`)
   - `monitor security packet-drop` (filters, `count`, `node`)
 - Observed runtime behavior and errors (preconditions, output shape, start/stop semantics)
-- Implementation checklist for bpfrx CLI grammar, daemon state model, and output compatibility goals
+- Implementation checklist for xpf CLI grammar, daemon state model, and output compatibility goals
 - Open questions to resolve before coding
 
 ## File added
@@ -394,7 +394,7 @@ Current docs contain drift and contradictions (for example summary totals vs row
 Branch: `docs/dataplane-decision-dpdk-vs-vpp-20260302`
 
 ## Summary
-- add an authoritative decision doc comparing DPDK vs VPP for bpfrx
+- add an authoritative decision doc comparing DPDK vs VPP for xpf
 - document a clear recommendation: DPDK-first for current project constraints
 - define explicit triggers for re-evaluating VPP later
 - add cross-reference notes in existing strategy docs to keep guidance consistent
@@ -423,7 +423,7 @@ Document vSRX HA dual-fabric (`fab0` + `fab1`) syntax-compatibility gap and requ
 
 ## Why
 
-`vsrx.conf` defines both `fab0` and `fab1` in HA setups. bpfrx currently has single-fabric assumptions in cluster transport and fabric forwarding wiring, so syntax compatibility is incomplete.
+`vsrx.conf` defines both `fab0` and `fab1` in HA setups. xpf currently has single-fabric assumptions in cluster transport and fabric forwarding wiring, so syntax compatibility is incomplete.
 
 ## Cross-reference
 
@@ -620,7 +620,7 @@ Branch: `perf-ipv6-flow-cache`
 - `go generate ./pkg/dataplane/...`
 - `rm -rf /tmp/go-build-user && mkdir -p /tmp/go-build-user && GOCACHE=/tmp/go-build-user go test ./...`
 - `git diff --check`
-- privileged dataplane load check via `sudo -n env GOCACHE=/tmp/go-build $(command -v go) run /tmp/load_bpfrx.go`
+- privileged dataplane load check via `sudo -n env GOCACHE=/tmp/go-build $(command -v go) run /tmp/load_xpf.go`
 
 Closes #164.
 Closes #165.
@@ -639,14 +639,14 @@ Branch: `perf-xdp-screen-bypass`
 - skip the screen stage for common TCP data/ACK packets when only SYN-centric checks apply
 
 ## Why
-This is the first slice from `/home/ps/git/bpfrx/docs/perf-analysis-ipv6.md`.
+This is the first slice from `/home/ps/git/xpf/docs/perf-analysis-ipv6.md`.
 The profile showed avoidable hot-path cost around `xdp_main_prog` / `xdp_screen_prog`, especially for long-running TCP traffic.
 
 ## Validation
 - `go generate ./pkg/dataplane/...`
 - `GOCACHE=/tmp/go-build-pr1 go test ./pkg/dataplane/... ./pkg/conntrack/... ./pkg/daemon/...`
 - `git diff --check`
-- `sudo -n env GOCACHE=/tmp/go-build-pr1 $(command -v go) run /tmp/load_bpfrx.go`
+- `sudo -n env GOCACHE=/tmp/go-build-pr1 $(command -v go) run /tmp/load_xpf.go`
 
 
 ---
@@ -661,14 +661,14 @@ Branch: `perf-coarse-packet-time`
 - avoid redundant `last_seen` writes when the cached second has not changed
 
 ## Why
-This is the second slice from `/home/ps/git/bpfrx/docs/perf-analysis-ipv6.md`.
+This is the second slice from `/home/ps/git/xpf/docs/perf-analysis-ipv6.md`.
 The profile called out `read_tsc` / packet timestamping as avoidable hot-path work. This keeps precise timing where it matters and removes it from the common path.
 
 ## Validation
 - `go generate ./pkg/dataplane/...`
 - `GOCACHE=/tmp/go-build-pr2 go test ./pkg/dataplane/... ./pkg/conntrack/... ./pkg/daemon/...`
 - `git diff --check`
-- `sudo -n env GOCACHE=/tmp/go-build-pr2 $(command -v go) run /tmp/load_bpfrx.go`
+- `sudo -n env GOCACHE=/tmp/go-build-pr2 $(command -v go) run /tmp/load_xpf.go`
 
 
 ---
@@ -684,7 +684,7 @@ Branch: `perf-conntrack-gc-adaptive`
 - add unit coverage for the new scheduling logic
 
 ## Why
-This is the third slice from `/home/ps/git/bpfrx/docs/perf-analysis-ipv6.md`.
+This is the third slice from `/home/ps/git/xpf/docs/perf-analysis-ipv6.md`.
 The profile showed measurable userspace GC overhead from periodic batch sweeps even when the session table is stable.
 
 ## Validation
@@ -701,7 +701,7 @@ Branch: `docs/xdp-io-uring-userspace-dataplane`
 ## Summary
 - add a design doc for an XDP-fronted userspace dataplane built around multithreaded workers
 - explain why AF_XDP should be the packet handoff boundary and where io_uring actually fits
-- cover threading, memory, HA/session-sync, crash behavior, and phased bpfrx implementation
+- cover threading, memory, HA/session-sync, crash behavior, and phased xpf implementation
 
 ## Key Point
 The performant version of this design is:
@@ -731,7 +731,7 @@ The merged IPv6 perf change moved IPv6 `CHECKSUM_PARTIAL` detection out of `pars
 - `go generate ./pkg/dataplane/...`
 - `GOCACHE=/tmp/go-build-ipv6-fix go test ./pkg/dataplane/... ./pkg/daemon/... ./pkg/cli ./pkg/grpcapi`
 - `GOCACHE=/tmp/go-build-ipv6-fix go test ./...`
-- `sudo -n env GOCACHE=/tmp/go-build-ipv6-fix $(command -v go) run /tmp/load_bpfrx.go`
+- `sudo -n env GOCACHE=/tmp/go-build-ipv6-fix $(command -v go) run /tmp/load_xpf.go`
 
 
 ---
@@ -754,7 +754,7 @@ This PR rolls that fast path out of runtime use so IPv6 forwarding returns to th
 - `git pull --rebase`
 - `go generate ./pkg/dataplane/...`
 - `GOCACHE=/tmp/go-build-ipv6-fix3 go test ./...`
-- `sudo -n env GOCACHE=/tmp/go-build-ipv6-fix3 $(command -v go) run /tmp/load_bpfrx.go`
+- `sudo -n env GOCACHE=/tmp/go-build-ipv6-fix3 $(command -v go) run /tmp/load_xpf.go`
 
 
 ---
@@ -777,7 +777,7 @@ This PR contains only commit `d1c10fd` on top of current `master`.
 ## Validation
 - `go generate ./pkg/dataplane/...`
 - `GOCACHE=/tmp/go-build-ipv6-fix4 go test ./...`
-- `sudo -n env GOCACHE=/tmp/go-build-ipv6-fix4 $(command -v go) run /tmp/load_bpfrx.go`
+- `sudo -n env GOCACHE=/tmp/go-build-ipv6-fix4 $(command -v go) run /tmp/load_xpf.go`
 
 
 ---
@@ -818,7 +818,7 @@ Recent perf captures still show `xdp_main_prog` as the single largest IPv6 hot s
 ## Validation
 - `go generate ./pkg/dataplane/...`
 - `GOCACHE=/tmp/go-build-perf-screen go test ./...`
-- `sudo -n env GOCACHE=/tmp/go-build-perf-screen $(command -v go) run /tmp/load_bpfrx.go`
+- `sudo -n env GOCACHE=/tmp/go-build-perf-screen $(command -v go) run /tmp/load_xpf.go`
 - `git diff --check`
 
 ## Follow-ups
@@ -850,7 +850,7 @@ It also fixes a correctness hole that the recent IPv6 NAT series left behind: so
 ## Validation
 - `go generate ./pkg/dataplane/...`
 - `env -i PATH=$PATH HOME=$HOME TERM=$TERM GOCACHE=/tmp/go-build-pr179-180 $(command -v go) test ./pkg/dataplane/... ./pkg/conntrack/... ./pkg/cluster/...`
-- `sudo -n env -u GOFLAGS -u GOROOT GOCACHE=/tmp/go-build-pr179-180 $(command -v go) run /tmp/load_bpfrx.go`
+- `sudo -n env -u GOFLAGS -u GOROOT GOCACHE=/tmp/go-build-pr179-180 $(command -v go) run /tmp/load_xpf.go`
 
 ## Notes
 - This intentionally keeps the existing IPv6 flow-cache layout in place.
@@ -880,7 +880,7 @@ The authoritative `sessions_v6` map stays unchanged for GC, HA/session sync, and
 ## Validation
 - `go generate ./pkg/dataplane/...`
 - `env -i PATH=$PATH HOME=$HOME TERM=$TERM GOCACHE=/tmp/go-build-pr166-168-user $(command -v go) test ./pkg/dataplane/... ./pkg/conntrack/... ./pkg/cluster/...`
-- `sudo -n env -i PATH=$PATH HOME=$HOME TERM=$TERM GOCACHE=/tmp/go-build-pr166-168-root $(command -v go) run /tmp/load_bpfrx.go`
+- `sudo -n env -i PATH=$PATH HOME=$HOME TERM=$TERM GOCACHE=/tmp/go-build-pr166-168-root $(command -v go) run /tmp/load_xpf.go`
 
 ## Notes
 - Stacked on top of #182.
@@ -900,7 +900,7 @@ Branch: `docs/xdp-afxdp-uring-plan`
 - define overload/fail-closed behavior, snapshot publication rules, feature boundaries, shard-sync rules, and observability requirements
 
 ## Why
-The original doc had the right architecture direction, but it left too many make-or-break details at sketch level. This revision adds the operational contracts that would determine whether such a backend is actually implementable in bpfrx.
+The original doc had the right architecture direction, but it left too many make-or-break details at sketch level. This revision adds the operational contracts that would determine whether such a backend is actually implementable in xpf.
 
 ## Scope
 Docs only:
@@ -969,8 +969,8 @@ This updates the XDP/AF_XDP/io_uring userspace dataplane design with a concrete 
 
 Main decisions captured in the doc:
 
-- do not embed packet slow-path work inside `bpfrxd`
-- keep `bpfrxd` as the Go control plane
+- do not embed packet slow-path work inside `xpfd`
+- keep `xpfd` as the Go control plane
 - use a separate native dataplane process for AF_XDP workers and packet slow path
 - plan for Rust as the implementation language for the userspace dataplane runtime
 - keep the control-plane/dataplane boundary explicit via shared memory + control socket
@@ -1348,7 +1348,7 @@ All 269 tests pass, zero `unused_imports` warnings.
 <!-- START COPILOT CODING AGENT TIPS -->
 ---
 
-✨ Let Copilot coding agent [set things up for you](https://github.com/psaab/bpfrx/issues/new?title=✨+Set+up+Copilot+instructions&body=Configure%20instructions%20for%20this%20repository%20as%20documented%20in%20%5BBest%20practices%20for%20Copilot%20coding%20agent%20in%20your%20repository%5D%28https://gh.io/copilot-coding-agent-tips%29%2E%0A%0A%3COnboard%20this%20repo%3E&assignees=copilot) — coding agent works faster and does higher quality work when set up for your repo.
+✨ Let Copilot coding agent [set things up for you](https://github.com/psaab/xpf/issues/new?title=✨+Set+up+Copilot+instructions&body=Configure%20instructions%20for%20this%20repository%20as%20documented%20in%20%5BBest%20practices%20for%20Copilot%20coding%20agent%20in%20your%20repository%5D%28https://gh.io/copilot-coding-agent-tips%29%2E%0A%0A%3COnboard%20this%20repo%3E&assignees=copilot) — coding agent works faster and does higher quality work when set up for your repo.
 
 
 ---
@@ -1370,7 +1370,7 @@ Validation:
 - cargo test --manifest-path userspace-dp/Cargo.toml authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch -- --nocapture
 - cargo test --manifest-path userspace-dp/Cargo.toml mlx5_keeps_umem_owner_bind_strategy -- --nocapture
 - cargo test --manifest-path userspace-dp/Cargo.toml virtio_prefers_separate_owner_then_falls_back -- --nocapture
-- live deploy to loss:bpfrx-userspace-fw0/1 with dual-stack reachability + IPv4/IPv6 TTL and mtr checks
+- live deploy to loss:xpf-userspace-fw0/1 with dual-stack reachability + IPv4/IPv6 TTL and mtr checks
 
 Notes:
 - virtio_net fabric AF_XDP bind remains unresolved and is tracked as a runtime capability issue, not a reason to keep afxdp.rs monolithic
@@ -1421,7 +1421,7 @@ Branch: `fix/userspace-phase3-session-resolution`
 - `cargo test --manifest-path userspace-dp/Cargo.toml lookup_forward_nat_across_scopes_ -- --nocapture`
 - `cargo test --manifest-path userspace-dp/Cargo.toml icmpv6_te_ -- --nocapture`
 - `cargo test --manifest-path userspace-dp/Cargo.toml authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch -- --nocapture`
-- live deploy to `loss:bpfrx-userspace-fw0/1`
+- live deploy to `loss:xpf-userspace-fw0/1`
 - live checks from `loss:cluster-userspace-host`:
   - IPv4/IPv6 internal ping
   - IPv4/IPv6 TTL=1 traceroute probes
@@ -1450,8 +1450,8 @@ Branch: `fix/userspace-phase4-queue-recycle`
 - `cargo test --manifest-path userspace-dp/Cargo.toml apply_prepared_recycle_routes_fill_and_free_explicitly -- --nocapture`
 - `cargo test --manifest-path userspace-dp/Cargo.toml icmpv6_te_ -- --nocapture`
 - `cargo test --manifest-path userspace-dp/Cargo.toml lookup_session_across_scopes_ -- --nocapture`
-- live deploy to `loss:bpfrx-userspace-fw0` and `loss:bpfrx-userspace-fw1`
-- live validation on active `bpfrx-userspace-fw0`:
+- live deploy to `loss:xpf-userspace-fw0` and `loss:xpf-userspace-fw1`
+- live validation on active `xpf-userspace-fw0`:
   - `show chassis cluster data-plane statistics`
   - `show chassis cluster data-plane interfaces`
   - `ping 172.16.80.200`
@@ -1515,7 +1515,7 @@ Branch: `fix/userspace-phase6-performance`
 ## Validation
 - source "$HOME/.cargo/env" && cargo test --manifest-path userspace-dp/Cargo.toml --no-run
 - source "$HOME/.cargo/env" && cargo test --manifest-path userspace-dp/Cargo.toml remember_prepared_recycle_tracks_only_shared_fill_recycles -- --nocapture
-- live validation on loss:bpfrx-userspace-fw0/1 before this commit series kept:
+- live validation on loss:xpf-userspace-fw0/1 before this commit series kept:
   - IPv4 TTL probe: pass
   - IPv6 TTL probe: pass
   - IPv4 mtr: pass
@@ -1691,7 +1691,7 @@ Branch: `fix/userspace-firewall-local-interrupt`
 - cargo test --manifest-path userspace-dp/Cargo.toml --no-run
 - cargo test --manifest-path userspace-dp/Cargo.toml interface_snat -- --nocapture
 - cargo test --manifest-path userspace-dp/Cargo.toml rate_limiter_refills_after_window -- --nocapture
-- live deploy to bpfrx-userspace-fw0/1
+- live deploy to xpf-userspace-fw0/1
 - fw1 as RG1 primary: iperf3 -c 2001:559:8585:80::200 -P 8 -t 60 sustained ~23.1 Gbps with no zero-throughput intervals
 - fail RG1 to fw0: local IPv4 ping works, local IPv4 iperf3 ~23.4 Gbps, local IPv6 iperf3 ~23.1 Gbps
 - restore RG1 to fw1: cluster-userspace-host transit sanity checks remained in expected range
@@ -1711,7 +1711,7 @@ Branch: `fix/userspace-firewall-local-fastpath`
 ## Validation
 - `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
 - `go test ./pkg/dataplane/userspace/...`
-- live deploy and validation on `bpfrx-userspace-fw0/1`
+- live deploy and validation on `xpf-userspace-fw0/1`
   - local IPv4 `iperf3 -c 172.16.80.200 -P 8 -t 8` sustained ~23.5 Gbps on both primaries
   - local IPv6 `iperf3 -c 2001:559:8585:80::200 -P 8 -t 8` sustained ~23.2 Gbps on both primaries
   - helper counters stayed near first-packet levels instead of tracking the full established flow
@@ -1767,7 +1767,7 @@ Branch: `fix/userspace-cross-nic-ha-perf-baseline`
 ## Validation
 - `go test ./pkg/dataplane/userspace/...`
 - `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
-- live deploys to `loss:bpfrx-userspace-fw0/1`
+- live deploys to `loss:xpf-userspace-fw0/1`
 - `./scripts/userspace-ha-validation.sh --env test/incus/loss-userspace-cluster.env`
 - `./scripts/userspace-ha-failover-validation.sh --duration 30 --parallel 4`
 - matched active-node `perf record` plus manual `iperf3` transit runs
@@ -1833,7 +1833,7 @@ The current direct path already caches `target_binding_index` when building a fo
 - `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
 - `cargo test --manifest-path userspace-dp/Cargo.toml build_live_forward_request_caches_target_binding_index -- --nocapture`
 - `cargo test --manifest-path userspace-dp/Cargo.toml build_forwarded_frame_into_keeps_ipv6_tcp_ports_after_vlan_snat -- --nocapture`
-- live deploy to `bpfrx-userspace-fw0/1`
+- live deploy to `xpf-userspace-fw0/1`
 - manual IPv4 transit samples:
   - `18.95 Gbps`
   - `19.14 Gbps`
@@ -1952,7 +1952,7 @@ Branch: `fix/userspace-worker-umem-panic`
 - expose helper-owned neighbor generation in userspace status output
 
 ## Why
-The old model depended on `bpfrxd` periodically pushing the kernel neighbor table into the helper. That left a cold-start hole: if the kernel already knew a neighbor like `.200` but no new neighbor event arrived after helper startup, the helper stayed blind and returned `missing_neighbor` while the kernel dataplane itself was healthy.
+The old model depended on `xpfd` periodically pushing the kernel neighbor table into the helper. That left a cold-start hole: if the kernel already knew a neighbor like `.200` but no new neighbor event arrived after helper startup, the helper stayed blind and returned `missing_neighbor` while the kernel dataplane itself was healthy.
 
 This change makes the helper the runtime owner of neighbor sync:
 - initial `RTM_GETNEIGH` dump at startup
@@ -2250,7 +2250,7 @@ Branch: `docs/session-sync-design`
 ## Summary
 - add a forward-looking session sync design note
 - compare keeping sync in Go vs moving it into Rust vs a hybrid model
-- recommend keeping HA/session-sync control in `bpfrxd` while moving producers toward event-driven delivery
+- recommend keeping HA/session-sync control in `xpfd` while moving producers toward event-driven delivery
 
 ## Recommendation
 - keep peer session-sync transport, readiness, barriers, and failover admission in Go
@@ -2839,7 +2839,7 @@ Move 109 functions into `daemon_ha.go` (3985 lines). `daemon.go` drops from 8221
 Closes #370
 
 ## Test plan
-- [x] `go build ./cmd/bpfrxd/` passes
+- [x] `go build ./cmd/xpfd/` passes
 - [x] `go test ./pkg/daemon/` passes
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
@@ -2856,7 +2856,7 @@ Three Go file splits — session RPCs, HA methods, NAT compilation moved to dedi
 Closes #371 #372 #373
 
 ## Test plan
-- [x] `go build ./cmd/bpfrxd/` passes
+- [x] `go build ./cmd/xpfd/` passes
 - [x] `go test ./pkg/grpcapi/ ./pkg/dataplane/userspace/ ./pkg/config/` all pass
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
@@ -2873,7 +2873,7 @@ Four Go file splits — bulk/barrier, show commands, session REST, interface com
 Closes #374 #375 #376 #377
 
 ## Test plan
-- [x] `go build ./cmd/bpfrxd/ ./cmd/cli/` passes
+- [x] `go build ./cmd/xpfd/ ./cmd/cli/` passes
 - [x] `go test ./pkg/cluster/ ./pkg/cli/ ./pkg/api/ ./pkg/dataplane/` all pass
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
@@ -3197,7 +3197,7 @@ Closes #403
 Both firewalls have full session state from continuous real-time sync. Planned failover should verify this with one barrier ack, not wait for bulk sync to complete. Bulk sync is only needed at startup/reconnect.
 
 ## Test plan
-- [x] `go build ./cmd/bpfrxd/` passes
+- [x] `go build ./cmd/xpfd/` passes
 - [x] `go test ./pkg/cluster/ ./pkg/daemon/` pass
 - [ ] Manual failover test with iperf3 during bulk sync window
 
@@ -3441,13 +3441,13 @@ Branch: `fix/440-slow-path-tun-rp-filter`
 
 ## Summary
 - `networkctl reload` resets `rp_filter` to default (2) on all interfaces, breaking locally-originated TCP/UDP via the slow-path TUN
-- Add `restoreSlowPathRPFilter()` after each networkd reload to re-set `rp_filter=0` on `bpfrx-usp0`
+- Add `restoreSlowPathRPFilter()` after each networkd reload to re-set `rp_filter=0` on `xpf-usp0`
 - Expand failover testing preflight to cover TCP connectivity (not just ICMP)
 
 ## Test plan
 - [x] `ping -c 3 1.1.1.1`: 0% loss
 - [x] TCP to 1.1.1.1:80: HTTP/1.1 301 response
-- [x] `sysctl net.ipv4.conf.bpfrx-usp0.rp_filter` = 0 after deploy
+- [x] `sysctl net.ipv4.conf.xpf-usp0.rp_filter` = 0 after deploy
 - [x] Transit traffic unaffected
 
 Fixes #440
@@ -3572,7 +3572,7 @@ Branch: `perf/separate-session-channel-phase3`
 Remaining ~12s latency is VM bridge TCP (18ms RTT, retransmissions on virtio), not control socket.
 
 ## Test plan
-- [x] Session socket created on deploy (`/run/bpfrx/userspace-dp-sessions.sock`)
+- [x] Session socket created on deploy (`/run/xpf/userspace-dp-sessions.sock`)
 - [x] Cluster healthy, all RGs on node0
 - [x] Manual failover RG1 → node1: instant success
 - [x] Manual failover RG1 → node0: instant success
@@ -3705,10 +3705,10 @@ During RG demotion on the demoting node, the kernel still briefly has interface-
 |------|--------|
 | `pkg/nftables/rst_suppress.go` | Atomic single-batch nftables install (delete + create in one `Flush`) |
 | `pkg/dataplane/userspace/manager.go` | Remove dedup check; always re-install RST rules |
-| `bpf/headers/bpfrx_maps.h` | New `rst_suppress_v4`/`rst_suppress_v6` hash maps |
+| `bpf/headers/xpf_maps.h` | New `rst_suppress_v4`/`rst_suppress_v6` hash maps |
 | `bpf/tc/tc_conntrack.c` | Drop locally-originated TCP RSTs from NAT addresses |
 | `pkg/dataplane/compiler.go` | New `compileRSTSuppression` phase populates BPF maps |
-| `pkg/dataplane/bpfrx*_x86_bpfel.*` | Regenerated bpf2go bindings |
+| `pkg/dataplane/xpf*_x86_bpfel.*` | Regenerated bpf2go bindings |
 
 ## Test plan
 
@@ -3716,7 +3716,7 @@ During RG demotion on the demoting node, the kernel still briefly has interface-
 - [x] `make build` succeeds
 - [x] `make test` passes (all 30 packages, 880+ tests)
 - [ ] `make cluster-deploy` + `make test-failover` — verify 0 stream deaths during RG failover
-- [ ] Verify nftables rules present on both nodes: `nft list table inet bpfrx_dp_rst`
+- [ ] Verify nftables rules present on both nodes: `nft list table inet xpf_dp_rst`
 - [ ] Verify BPF maps populated: `bpftool map dump name rst_suppress_v4`
 
 Fixes #450
@@ -3759,7 +3759,7 @@ Branch: `fix/456-stream-death-analysis`
 
 - Adds defense-in-depth TC egress RST suppression to prevent kernel-originated TCP RSTs from killing HA-synced sessions during RG failover
 - New `rst_suppress_v4`/`rst_suppress_v6` BPF hash maps in TC egress path, populated alongside existing nftables OUTPUT rules
-- New counter `GLOBAL_CTR_TC_RST_SUPPRESS` exposed in CLI (`show security flow statistics`), REST API, gRPC, and Prometheus (`bpfrx_tc_rst_suppress_total`)
+- New counter `GLOBAL_CTR_TC_RST_SUPPRESS` exposed in CLI (`show security flow statistics`), REST API, gRPC, and Prometheus (`xpf_tc_rst_suppress_total`)
 - New `RSTSuppressionCounters()` API reads nftables rule counters for diagnosing kernel RST suppression during failover
 
 ## Root cause analysis
@@ -3778,7 +3778,7 @@ Both layers use the same address set and fire independently, eliminating timing 
 - [ ] `make cluster-deploy` -- deploy to HA cluster
 - [ ] `make test-failover` -- verify TCP streams survive RG failover
 - [ ] After failover, check `show security flow statistics` for `TC RST suppressed` counter
-- [ ] Check Prometheus metric `bpfrx_tc_rst_suppress_total` 
+- [ ] Check Prometheus metric `xpf_tc_rst_suppress_total` 
 
 Fixes #456
 
@@ -3908,11 +3908,11 @@ Branch: `fix/473-xsk-bindings-watchdog`
 - Also repairs aliased bindings (VLAN children inheriting parent's XSK) and gates on `ctrlWasEnabled` to avoid false positives during startup when the map is expected to be empty.
 
 ## Test plan
-- [ ] `go build ./cmd/bpfrxd/` passes
+- [ ] `go build ./cmd/xpfd/` passes
 - [ ] `make cluster-deploy` to deploy to HA cluster
 - [ ] `make test-failover` to verify zero-drop failover with the watchdog active
 - [ ] `make test-ha-crash` to verify crash recovery repopulates bindings
-- [ ] Verify `journalctl -u bpfrxd` shows "bindings watchdog repaired stale BPF map entries" when the scenario triggers, and no false positives during normal operation
+- [ ] Verify `journalctl -u xpfd` shows "bindings watchdog repaired stale BPF map entries" when the scenario triggers, and no false positives during normal operation
 
 Fixes #473
 
@@ -3934,10 +3934,10 @@ Branch: `fix/475-session-recovery-failback`
 
 - [x] `cargo build --release` passes
 - [x] `cargo test` passes (435 tests, including new test for republish coverage)
-- [x] `go build ./cmd/bpfrxd/` passes
+- [x] `go build ./cmd/xpfd/` passes
 - [ ] `make test-failover` — verify TCP survives failover+failback with throughput recovery
 - [ ] `make cluster-deploy` — deploy to both HA cluster VMs
-- [ ] Verify `bpfrx-ha: republished N USERSPACE_SESSIONS entries` log appears in journald after failback
+- [ ] Verify `xpf-ha: republished N USERSPACE_SESSIONS entries` log appears in journald after failback
 
 Fixes #475
 
@@ -3988,7 +3988,7 @@ Branch: `fix/standby-neighbor-warmup`
 - Covers both global `routing-options` and per-`routing-instance` static routes (IPv4 + IPv6)
 
 ## Test plan
-- [ ] `make build` passes (verified: `CGO_ENABLED=0 go build -o /dev/null ./cmd/bpfrxd/`)
+- [ ] `make build` passes (verified: `CGO_ENABLED=0 go build -o /dev/null ./cmd/xpfd/`)
 - [ ] `make cluster-deploy` to both HA nodes
 - [ ] Verify standby node's ARP cache has WAN gateway entry (`ip neigh show dev ge-0-0-3` on standby)
 - [ ] `make test-failover` — TCP stream survives failover+failback with 0 packet loss
@@ -4064,7 +4064,7 @@ The failback triggers a new HA state transition on the peer, which tears down an
 - [x] `TestManualFailover_DifferentRGsAllowed` — concurrent failover for different RGs succeeds
 - [x] `TestManualFailover_InProgressClearedOnPreHookError` — flag is cleared on preHook failure, retry succeeds
 - [x] All existing cluster tests pass (3.6s)
-- [x] `go build ./cmd/bpfrxd/` clean
+- [x] `go build ./cmd/xpfd/` clean
 - [ ] `make test-failover` on cluster
 
 Fixes #481
@@ -4698,7 +4698,7 @@ Closes #540.
 - `go test ./pkg/cluster ./pkg/daemon`
 - deployed to `loss-userspace-cluster`
 - verified both nodes report `Transfer ready: yes`
-- restarted `bpfrxd` on `bpfrx-userspace-fw1` and confirmed the primary re-dialed session sync and the standby recovered `Transfer ready: yes` instead of staying disconnected
+- restarted `xpfd` on `xpf-userspace-fw1` and confirmed the primary re-dialed session sync and the standby recovered `Transfer ready: yes` instead of staying disconnected
 
 ---
 
@@ -4792,7 +4792,7 @@ Branch: `refactor/547-split-server`
 
 - [x] `CGO_ENABLED=0 go build ./pkg/grpcapi/` passes
 - [x] `CGO_ENABLED=0 go test ./pkg/grpcapi/ -count=1` passes
-- [x] `CGO_ENABLED=0 go build ./cmd/bpfrxd/` (full daemon) passes
+- [x] `CGO_ENABLED=0 go build ./cmd/xpfd/` (full daemon) passes
 - [ ] `make test` full suite
 
 Fixes #547
@@ -4882,7 +4882,7 @@ Branch: `fix/545-local-tunnel-fatal-errors`
 - before fix: `show chassis cluster data-plane interfaces` showed repeated `gr-0-0-0` errors on both firewalls
   - `fw1`: `read_local_tunnel:File descriptor in bad state (os error 77)`
   - `fw0`: `write_local_tunnel_delivery:Invalid argument (os error 22)`
-- after deploy: the native-GRE helper thread (`bpfrx-n+`) disappeared on both firewalls instead of staying alive and retrying the bad FD forever
+- after deploy: the native-GRE helper thread (`xpf-n+`) disappeared on both firewalls instead of staying alive and retrying the bad FD forever
 
 
 ---
@@ -4972,7 +4972,7 @@ Branch: `fix/572-standby-neighbor-prewarm`
 Fixes #572. After the stale-owner forwarding fixes, the remaining failover loss on  was promoted-node  on the first translated WAN packets. The manager had stopped doing any neighbor prewarm after the helper's first 60 seconds, so a long-idle standby could still report takeover-ready while its WAN next-hop was cold.
 
 ## Testing
-- ok  	github.com/psaab/bpfrx/pkg/dataplane/userspace	0.784s
+- ok  	github.com/psaab/xpf/pkg/dataplane/userspace	0.784s
 
 ---
 
@@ -5020,7 +5020,7 @@ Branch: `fix/579-active-userspace-validator`
 ## Validation
 - `bash -n scripts/userspace-ha-validation.sh`
 - `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env RUNS=1 DURATION=5 PARALLEL=4 PREFERRED_ACTIVE_NODE=1 PREFERRED_ACTIVE_RGS='1 2' scripts/userspace-ha-validation.sh`
-  - this now selects `loss:bpfrx-userspace-fw1` as the active userspace firewall and gets past the old bogus `unable to detect WAN test interface for loss:bpfrx-userspace-fw0` failure
+  - this now selects `loss:xpf-userspace-fw1` as the active userspace firewall and gets past the old bogus `unable to detect WAN test interface for loss:xpf-userspace-fw0` failure
 
 
 ---
@@ -5175,11 +5175,11 @@ Branch: `pr/596-rst-suppression-retry`
 
 Fixes #596
 
-This change makes userspace RST suppression install safely when the `inet bpfrx_dp_rst` table does not already exist, and retries failed installs on a backoff instead of caching the failure forever.
+This change makes userspace RST suppression install safely when the `inet xpf_dp_rst` table does not already exist, and retries failed installs on a backoff instead of caching the failure forever.
 
 Validation:
 - `go test ./pkg/nftables ./pkg/dataplane/userspace -count=1`
-- live loss deploy: verified `RST suppression: installed nftables rules via netlink` on both firewalls and verified the `inet bpfrx_dp_rst` table exists on fw0 after deploy
+- live loss deploy: verified `RST suppression: installed nftables rules via netlink` on both firewalls and verified the `inet xpf_dp_rst` table exists on fw0 after deploy
 - live failover/failback debugging before this fix showed old-owner WAN-side TCP RSTs; those RSTs no longer appeared after the install/retry fix
 
 
@@ -5286,7 +5286,7 @@ Branch: `fix/606-skip-identical-config-sync`
 ## Testing
 - `go test ./pkg/daemon -run 'TestHandleConfigSync_(RejectsWhenPrimary|AcceptsWhenSecondary|AcceptsWhenNoCluster|SkipsWhenConfigAlreadyMatchesActive)' -count=1`
 - `go test ./pkg/cluster ./pkg/daemon -count=1`
-- live on `loss`: deploy branch, restart `bpfrxd` on `bpfrx-userspace-fw1`, confirm both nodes return to `Transfer ready: yes`
+- live on `loss`: deploy branch, restart `xpfd` on `xpf-userspace-fw1`, confirm both nodes return to `Transfer ready: yes`
 - live on `loss`: standby journal shows `cluster: skipping config sync apply (config already matches active)` and does not log `restarting heartbeat after VRF rebind` for that reconnect
 
 Fixes #606

@@ -9,7 +9,7 @@ func TestMarshalUnmarshalHeartbeat(t *testing.T) {
 	pkt := &HeartbeatPacket{
 		NodeID:            1,
 		ClusterID:         42,
-		SoftwareVersion:   "bpfrx-test-1",
+		SoftwareVersion:   "xpf-test-1",
 		HAProtocolVersion: CurrentHAProtocolVersion,
 		Groups: []HeartbeatGroup{
 			{GroupID: 0, Priority: 200, Weight: 255, State: uint8(StatePrimary)},
@@ -44,8 +44,8 @@ func TestMarshalUnmarshalHeartbeat(t *testing.T) {
 	if got.Groups[1].State != uint8(StateSecondary) {
 		t.Errorf("group 1 state = %d, want %d", got.Groups[1].State, StateSecondary)
 	}
-	if got.SoftwareVersion != "bpfrx-test-1" {
-		t.Errorf("software version = %q, want bpfrx-test-1", got.SoftwareVersion)
+	if got.SoftwareVersion != "xpf-test-1" {
+		t.Errorf("software version = %q, want xpf-test-1", got.SoftwareVersion)
 	}
 	if got.HAProtocolVersion != CurrentHAProtocolVersion {
 		t.Errorf("ha protocol version = %d, want %d", got.HAProtocolVersion, CurrentHAProtocolVersion)

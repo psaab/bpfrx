@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
-# Analyze bpfrxd journal output from the userspace dataplane helper.
+# Analyze xpfd journal output from the userspace dataplane helper.
 #
 # Parses periodic "DBG wN:" worker stats, RST_DETECT, STALL_*, OVERSIZED_RX,
 # BUILT_ETH, POISON_DETECTED, TX errors, and frame accounting lines emitted
-# by the bpfrx-userspace-dp Rust helper to stderr (captured by journald).
+# by the xpf-userspace-dp Rust helper to stderr (captured by journald).
 #
 # Usage:
 #   ./test/incus/analyze-userspace-traces.sh [instance] [since]
-#   ./test/incus/analyze-userspace-traces.sh bpfrx-userspace-fw0 "10 minutes ago"
+#   ./test/incus/analyze-userspace-traces.sh xpf-userspace-fw0 "10 minutes ago"
 #   REMOTE=loss ./test/incus/analyze-userspace-traces.sh
 
 set -euo pipefail
 
-INSTANCE="${1:-bpfrx-userspace-fw1}"
+INSTANCE="${1:-xpf-userspace-fw1}"
 SINCE="${2:-5 minutes ago}"
 REMOTE="${REMOTE:-loss}"
 
@@ -34,11 +34,11 @@ flag() { printf "  ${RED}!! %s${RESET}\n" "$*"; }
 star() { printf "  ${YELLOW}** %s${RESET}\n" "$*"; }
 
 # ── Pull journal ──────────────────────────────────────────────────────
-TMPFILE=$(mktemp /tmp/bpfrx-trace-XXXXXX.log)
+TMPFILE=$(mktemp /tmp/xpf-trace-XXXXXX.log)
 trap 'rm -f "$TMPFILE"' EXIT
 
 echo "Pulling journal from ${REMOTE}:${INSTANCE} (since \"${SINCE}\")..."
-if ! incus exec "${REMOTE}:${INSTANCE}" -- journalctl -u bpfrxd --since "$SINCE" --no-pager > "$TMPFILE" 2>/dev/null; then
+if ! incus exec "${REMOTE}:${INSTANCE}" -- journalctl -u xpfd --since "$SINCE" --no-pager > "$TMPFILE" 2>/dev/null; then
     err "Failed to pull journal from ${REMOTE}:${INSTANCE}"
     echo "Hint: ensure the instance is running and accessible."
     exit 1
@@ -46,7 +46,7 @@ fi
 
 TOTAL_LINES=$(wc -l < "$TMPFILE")
 if [ "$TOTAL_LINES" -eq 0 ]; then
-    err "No journal output found for bpfrxd since \"${SINCE}\""
+    err "No journal output found for xpfd since \"${SINCE}\""
     exit 1
 fi
 echo "Captured ${TOTAL_LINES} journal lines."
@@ -55,7 +55,7 @@ echo "Captured ${TOTAL_LINES} journal lines."
 LAST_WORKER_LINE=$(grep 'DBG w[0-9]*:' "$TMPFILE" | tail -1 || true)
 
 # ── Helper: extract timestamp from a journal line ─────────────────────
-# Journal format: "Mar 13 10:36:45 hostname bpfrxd[PID]: ..."
+# Journal format: "Mar 13 10:36:45 hostname xpfd[PID]: ..."
 # We extract the time portion.
 extract_time() {
     echo "$1" | awk '{print $3}'
@@ -754,7 +754,7 @@ hdr "BPF Fallback Stats"
 # Check if bpftool is available on the instance
 if incus exec "${REMOTE}:${INSTANCE}" -- which bpftool >/dev/null 2>&1; then
     # Try to dump the userspace_fallback_stats map
-    FALLBACK_OUT=$(incus exec "${REMOTE}:${INSTANCE}" -- bpftool map dump pinned /sys/fs/bpf/bpfrx/userspace_fallback_stats 2>/dev/null || echo "")
+    FALLBACK_OUT=$(incus exec "${REMOTE}:${INSTANCE}" -- bpftool map dump pinned /sys/fs/bpf/xpf/userspace_fallback_stats 2>/dev/null || echo "")
     if [ -n "$FALLBACK_OUT" ] && [ "$FALLBACK_OUT" != "" ]; then
         note "BPF fallback stats map:"
         echo "$FALLBACK_OUT" | head -30 | while IFS= read -r line; do
@@ -765,7 +765,7 @@ if incus exec "${REMOTE}:${INSTANCE}" -- which bpftool >/dev/null 2>&1; then
     fi
 
     # Check userspace_ctrl map for enabled/disabled state
-    CTRL_OUT=$(incus exec "${REMOTE}:${INSTANCE}" -- bpftool map dump pinned /sys/fs/bpf/bpfrx/userspace_ctrl 2>/dev/null || echo "")
+    CTRL_OUT=$(incus exec "${REMOTE}:${INSTANCE}" -- bpftool map dump pinned /sys/fs/bpf/xpf/userspace_ctrl 2>/dev/null || echo "")
     if [ -n "$CTRL_OUT" ]; then
         note ""
         note "Userspace control map:"
@@ -795,7 +795,7 @@ else
     echo "$DAEMON_ERRS" | head -10 | while IFS= read -r line; do
         TSTAMP=$(extract_time "$line")
         # Trim to the relevant part
-        MSG=$(echo "$line" | sed 's/^.*bpfrxd\[[0-9]*\]: //')
+        MSG=$(echo "$line" | sed 's/^.*xpfd\[[0-9]*\]: //')
         note "  ${TSTAMP} ${MSG}"
     done
 fi

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 func readSyncMessage(t *testing.T, conn net.Conn) (uint8, []byte) {

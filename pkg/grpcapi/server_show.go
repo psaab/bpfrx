@@ -14,18 +14,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/appid"
-	"github.com/psaab/bpfrx/pkg/cluster"
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
-	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
-	"github.com/psaab/bpfrx/pkg/dhcp"
-	"github.com/psaab/bpfrx/pkg/feeds"
-	"github.com/psaab/bpfrx/pkg/frr"
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
-	"github.com/psaab/bpfrx/pkg/logging"
-	"github.com/psaab/bpfrx/pkg/routing"
-	"github.com/psaab/bpfrx/pkg/rpm"
+	"github.com/psaab/xpf/pkg/appid"
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/feeds"
+	"github.com/psaab/xpf/pkg/frr"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/routing"
+	"github.com/psaab/xpf/pkg/rpm"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
@@ -3315,7 +3315,7 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		if ver == "" {
 			ver = "dev"
 		}
-		fmt.Fprintf(&buf, "bpfrx eBPF firewall %s\n", ver)
+		fmt.Fprintf(&buf, "xpf eBPF firewall %s\n", ver)
 		var uts unix.Utsname
 		if err := unix.Uname(&uts); err == nil {
 			sysname := strings.TrimRight(string(uts.Sysname[:]), "\x00")
@@ -4980,7 +4980,7 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		}
 
 	case "log":
-		out, err := exec.Command("journalctl", "-u", "bpfrxd", "-n", "50", "--no-pager").CombinedOutput()
+		out, err := exec.Command("journalctl", "-u", "xpfd", "-n", "50", "--no-pager").CombinedOutput()
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "journalctl: %v", err)
 		}
@@ -5172,7 +5172,7 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
 		uptime := time.Since(s.startTime).Truncate(time.Second)
-		buf.WriteString("Task: bpfrxd daemon\n")
+		buf.WriteString("Task: xpfd daemon\n")
 		fmt.Fprintf(&buf, "  Goroutines: %d\n", runtime.NumGoroutine())
 		fmt.Fprintf(&buf, "  Memory allocated: %.1f MB\n", float64(m.Alloc)/1024/1024)
 		fmt.Fprintf(&buf, "  System memory: %.1f MB\n", float64(m.Sys)/1024/1024)

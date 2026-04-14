@@ -19,7 +19,7 @@ This test exercises:
 
 ## Prerequisites
 
-- Both `bpfrx-userspace-fw0` and `bpfrx-userspace-fw1` running with latest code
+- Both `xpf-userspace-fw0` and `xpf-userspace-fw1` running with latest code
 - Cluster healthy: `show chassis cluster status` shows primary + secondary for all RGs
 - Takeover ready: yes on both nodes
 - Warm traffic: `ping -c 3 172.16.80.200 && ping6 -c 3 2001:559:8585:80::200` passes

@@ -1,4 +1,4 @@
-// Package daemon implements the bpfrx daemon lifecycle.
+// Package daemon implements the xpf daemon lifecycle.
 package daemon
 
 import (
@@ -23,32 +23,32 @@ import (
 
 	"github.com/vishvananda/netlink"
 
-	"github.com/psaab/bpfrx/pkg/api"
-	"github.com/psaab/bpfrx/pkg/cli"
-	"github.com/psaab/bpfrx/pkg/cluster"
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/configstore"
-	"github.com/psaab/bpfrx/pkg/conntrack"
-	"github.com/psaab/bpfrx/pkg/dataplane"
-	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
-	"github.com/psaab/bpfrx/pkg/dhcp"
-	"github.com/psaab/bpfrx/pkg/dhcprelay"
-	"github.com/psaab/bpfrx/pkg/dhcpserver"
-	"github.com/psaab/bpfrx/pkg/eventengine"
-	"github.com/psaab/bpfrx/pkg/feeds"
-	"github.com/psaab/bpfrx/pkg/flowexport"
-	"github.com/psaab/bpfrx/pkg/frr"
-	"github.com/psaab/bpfrx/pkg/grpcapi"
-	"github.com/psaab/bpfrx/pkg/ipsec"
-	"github.com/psaab/bpfrx/pkg/lldp"
-	"github.com/psaab/bpfrx/pkg/logging"
-	"github.com/psaab/bpfrx/pkg/networkd"
-	"github.com/psaab/bpfrx/pkg/ra"
-	"github.com/psaab/bpfrx/pkg/routing"
-	"github.com/psaab/bpfrx/pkg/rpm"
-	"github.com/psaab/bpfrx/pkg/scheduler"
-	"github.com/psaab/bpfrx/pkg/snmp"
-	"github.com/psaab/bpfrx/pkg/vrrp"
+	"github.com/psaab/xpf/pkg/api"
+	"github.com/psaab/xpf/pkg/cli"
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
+	"github.com/psaab/xpf/pkg/conntrack"
+	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/dhcprelay"
+	"github.com/psaab/xpf/pkg/dhcpserver"
+	"github.com/psaab/xpf/pkg/eventengine"
+	"github.com/psaab/xpf/pkg/feeds"
+	"github.com/psaab/xpf/pkg/flowexport"
+	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/grpcapi"
+	"github.com/psaab/xpf/pkg/ipsec"
+	"github.com/psaab/xpf/pkg/lldp"
+	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/networkd"
+	"github.com/psaab/xpf/pkg/ra"
+	"github.com/psaab/xpf/pkg/routing"
+	"github.com/psaab/xpf/pkg/rpm"
+	"github.com/psaab/xpf/pkg/scheduler"
+	"github.com/psaab/xpf/pkg/snmp"
+	"github.com/psaab/xpf/pkg/vrrp"
 )
 
 // Options configures the daemon.
@@ -64,9 +64,9 @@ type Options struct {
 // If this file exists and contains a valid integer (0 or 1), the daemon
 // runs in cluster mode with ${node} variable expansion. If the file does
 // not exist, the daemon runs in standalone mode.
-const nodeIDFile = "/etc/bpfrx/node-id"
+const nodeIDFile = "/etc/xpf/node-id"
 
-// Daemon is the main bpfrx daemon.
+// Daemon is the main xpf daemon.
 type Daemon struct {
 	opts                       Options
 	store                      *configstore.Store
@@ -286,7 +286,7 @@ func (d *Daemon) scheduleStandbyNeighborRefresh() {
 // New creates a new Daemon.
 func New(opts Options) *Daemon {
 	if opts.ConfigFile == "" {
-		opts.ConfigFile = "/etc/bpfrx/bpfrx.conf"
+		opts.ConfigFile = "/etc/xpf/xpf.conf"
 	}
 
 	store := configstore.New(opts.ConfigFile)
@@ -357,7 +357,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.slogHandler = logging.NewSyslogSlogHandler(slog.Default().Handler())
 	slog.SetDefault(slog.New(d.slogHandler))
 
-	slog.Info("starting bpfrx daemon",
+	slog.Info("starting xpf daemon",
 		"config", d.opts.ConfigFile,
 		"pid", os.Getpid())
 
@@ -2119,7 +2119,7 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	if cfg.System.Archival != nil {
 		dir := cfg.System.Archival.ArchiveDir
 		if dir == "" {
-			dir = "/var/lib/bpfrx/archive"
+			dir = "/var/lib/xpf/archive"
 		}
 		max := cfg.System.Archival.MaxArchives
 		if max <= 0 {

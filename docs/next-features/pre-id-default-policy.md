@@ -4,7 +4,7 @@ Date: 2026-03-02
 Status: Implemented
 
 ## Config Evidence
-- Present in `/home/ps/git/bpfrx/vsrx.conf:21128` as `pre-id-default-policy { ... }`
+- Present in `/home/ps/git/xpf/vsrx.conf:21128` as `pre-id-default-policy { ... }`
 
 ## Current State
 - Parsed into `SecurityConfig.PreIDDefaultPolicy`: `pkg/config/compiler.go`
@@ -12,7 +12,7 @@ Status: Implemented
 - Session init/close logging is now applied to unknown-app sessions when AppID is enabled
 
 ## Problem
-When application identification is in progress, vSRX can apply explicit pre-ID default handling. bpfrx now honors the configured logging behavior for unknown/pre-ID sessions instead of ignoring the stanza entirely.
+When application identification is in progress, vSRX can apply explicit pre-ID default handling. xpf now honors the configured logging behavior for unknown/pre-ID sessions instead of ignoring the stanza entirely.
 
 ## Proposed Implementation Scope
 1. Treat `app_id == 0` while AppID is enabled as the unknown/pre-ID state.

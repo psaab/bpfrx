@@ -13,7 +13,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 const (
@@ -130,7 +130,7 @@ func (s *sender) run() {
 	defer close(s.stopped)
 
 	// Send an initial burst so hosts do not wait for the periodic timer to
-	// relearn a default router after bpfrxd restarts or HA role changes.
+	// relearn a default router after xpfd restarts or HA role changes.
 	s.sendStartupBurst()
 
 	advTimer := time.NewTimer(s.randomAdvInterval())

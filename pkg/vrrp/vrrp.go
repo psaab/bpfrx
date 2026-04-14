@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // Instance describes a single VRRP instance.

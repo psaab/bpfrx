@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# bpfrx Chassis Cluster (HA) test environment management
+# xpf Chassis Cluster (HA) test environment management
 #
 # Creates a two-VM HA cluster with heartbeat, fabric, and shared LAN
 # networks, plus a test container on the cluster LAN.
 #
 # Single-config model: both nodes share a unified config with
-# apply-groups "${node}" expansion. Node ID comes from /etc/bpfrx/node-id.
+# apply-groups "${node}" expansion. Node ID comes from /etc/xpf/node-id.
 # Interface names follow vSRX conventions: fxp0, em0, ge-X/Y/Z.
 #
 # Parameterized via env file — set BPFRX_CLUSTER_ENV to source custom
@@ -19,10 +19,10 @@
 #   ./test/incus/cluster-setup.sh deploy [0|1|all]   # Build and push to VM(s)
 #   ./test/incus/cluster-setup.sh ssh 0|1            # Shell into VM
 #   ./test/incus/cluster-setup.sh status             # Show all VM status
-#   ./test/incus/cluster-setup.sh logs 0|1           # Show bpfrxd logs
-#   ./test/incus/cluster-setup.sh start [0|1|all]    # Start bpfrxd service
-#   ./test/incus/cluster-setup.sh stop [0|1|all]     # Stop bpfrxd service
-#   ./test/incus/cluster-setup.sh restart [0|1|all]  # Restart bpfrxd service
+#   ./test/incus/cluster-setup.sh logs 0|1           # Show xpfd logs
+#   ./test/incus/cluster-setup.sh start [0|1|all]    # Start xpfd service
+#   ./test/incus/cluster-setup.sh stop [0|1|all]     # Stop xpfd service
+#   ./test/incus/cluster-setup.sh restart [0|1|all]  # Restart xpfd service
 
 set -euo pipefail
 
@@ -49,10 +49,10 @@ fi
 # ── Defaults (local cluster values if no env file) ───────────────────
 
 INCUS_REMOTE="${INCUS_REMOTE:-}"
-VM0="${VM0:-bpfrx-fw0}"
-VM1="${VM1:-bpfrx-fw1}"
+VM0="${VM0:-xpf-fw0}"
+VM1="${VM1:-xpf-fw1}"
 LAN_HOST="${LAN_HOST:-cluster-lan-host}"
-PROFILE="${PROFILE:-bpfrx-cluster}"
+PROFILE="${PROFILE:-xpf-cluster}"
 IMAGE_VM="${IMAGE_VM:-images:debian/13}"
 IMAGE_CT="${IMAGE_CT:-images:debian/13}"
 LAN_ADDR="${LAN_ADDR:-}"
@@ -76,10 +76,10 @@ if [[ -z "${VF_LAN_PCI+x}" ]]; then VF_LAN_PCI=(); fi
 
 # Network names (parameterized for remote)
 NET_MGMT="${NET_MGMT:-incusbr0}"
-NET_HEARTBEAT="${NET_HEARTBEAT:-bpfrx-heartbeat}"
-NET_FABRIC="${NET_FABRIC:-bpfrx-fabric}"
+NET_HEARTBEAT="${NET_HEARTBEAT:-xpf-heartbeat}"
+NET_FABRIC="${NET_FABRIC:-xpf-fabric}"
 # NET_CLAN: set to empty in env file to skip bridge-based LAN (SR-IOV LAN)
-if [[ -z "${NET_CLAN+x}" ]]; then NET_CLAN="bpfrx-clan"; fi
+if [[ -z "${NET_CLAN+x}" ]]; then NET_CLAN="xpf-clan"; fi
 
 # Config file path
 CLUSTER_CONF="${CLUSTER_CONF:-${PROJECT_ROOT}/docs/ha-cluster.conf}"
@@ -132,7 +132,7 @@ suppress_host_parent_ipv6_ra() {
 		die "failed to clear RA-learned IPv6 routes from host parent $parent"
 }
 
-# Prefix instance name with remote if set: "loss:bpfrx-fw0" or "bpfrx-fw0"
+# Prefix instance name with remote if set: "loss:xpf-fw0" or "xpf-fw0"
 r() {
 	echo "${INCUS_REMOTE:+${INCUS_REMOTE}:}$1"
 }
@@ -256,7 +256,7 @@ cmd_create() {
 	# Create test container on cluster LAN
 	create_lan_host
 
-	info "Cluster environment ready. Run '$0 deploy all' to push bpfrxd."
+	info "Cluster environment ready. Run '$0 deploy all' to push xpfd."
 }
 
 create_vm() {
@@ -373,7 +373,7 @@ provision_vm() {
 		fi
 	done
 
-	# Interface naming (fxp0, em0, ge-X/0/Y) is now handled by bpfrxd itself
+	# Interface naming (fxp0, em0, ge-X/0/Y) is now handled by xpfd itself
 	# at startup — no external script needed.
 
 	info "Configuring sysctl ($vm)..."
@@ -433,8 +433,8 @@ EOF'
 
 	# Write cluster node ID file for ${node} variable expansion
 	info "Writing node-id file ($vm, node $idx)..."
-	incus exec "$rinst" -- mkdir -p /etc/bpfrx
-	incus exec "$rinst" -- bash -c "echo $idx > /etc/bpfrx/node-id"
+	incus exec "$rinst" -- mkdir -p /etc/xpf
+	incus exec "$rinst" -- bash -c "echo $idx > /etc/xpf/node-id"
 }
 
 create_lan_host() {
@@ -543,13 +543,13 @@ cmd_deploy() {
 		suppress_host_parent_ipv6_ra "$SRIOV_LAN_PARENT"
 	fi
 
-	info "Building bpfrxd and cli..."
+	info "Building xpfd and cli..."
 	make -C "$PROJECT_ROOT" build build-ctl
 	if [[ -x "$HOME/.cargo/bin/cargo" || -n "$(command -v cargo 2>/dev/null)" ]]; then
-		info "Building bpfrx-userspace-dp helper..."
+		info "Building xpf-userspace-dp helper..."
 		make -C "$PROJECT_ROOT" build-userspace-dp
 	else
-		warn "Rust toolchain not found; skipping bpfrx-userspace-dp build"
+		warn "Rust toolchain not found; skipping xpf-userspace-dp build"
 	fi
 
 	case "$target" in
@@ -617,51 +617,51 @@ deploy_vm() {
 
 	# Stop service gracefully, then clean BPF state for binary upgrade.
 	# Order matters: systemctl stop sends SIGTERM (graceful socket close),
-	# then bpfrxd cleanup removes pinned BPF maps/links.  The final
+	# then xpfd cleanup removes pinned BPF maps/links.  The final
 	# pkill -9 is a safety net only — if the daemon hung during shutdown
 	# the binary is still "text file busy" and the push will fail.
-	incus exec "$rinst" -- systemctl stop bpfrxd 2>/dev/null || true
-	incus exec "$rinst" -- bpfrxd cleanup 2>/dev/null || true
-	incus exec "$rinst" -- pkill -9 bpfrxd 2>/dev/null || true
+	incus exec "$rinst" -- systemctl stop xpfd 2>/dev/null || true
+	incus exec "$rinst" -- xpfd cleanup 2>/dev/null || true
+	incus exec "$rinst" -- pkill -9 xpfd 2>/dev/null || true
 	incus exec "$rinst" -- pkill -9 cli 2>/dev/null || true
 	sleep 1
 
-	info "Pushing bpfrxd to $vm..."
-	incus file push "$PROJECT_ROOT/bpfrxd" "${rinst}/usr/local/sbin/bpfrxd" --mode 0755
+	info "Pushing xpfd to $vm..."
+	incus file push "$PROJECT_ROOT/xpfd" "${rinst}/usr/local/sbin/xpfd" --mode 0755
 
 	info "Pushing cli to $vm..."
 	incus file push "$PROJECT_ROOT/cli" "${rinst}/usr/local/sbin/cli" --mode 0755
 
-	if [[ -f "$PROJECT_ROOT/bpfrx-userspace-dp" ]]; then
-		info "Pushing bpfrx-userspace-dp to $vm..."
-		incus file push "$PROJECT_ROOT/bpfrx-userspace-dp" "${rinst}/usr/local/sbin/bpfrx-userspace-dp" --mode 0755
+	if [[ -f "$PROJECT_ROOT/xpf-userspace-dp" ]]; then
+		info "Pushing xpf-userspace-dp to $vm..."
+		incus file push "$PROJECT_ROOT/xpf-userspace-dp" "${rinst}/usr/local/sbin/xpf-userspace-dp" --mode 0755
 	else
-		warn "bpfrx-userspace-dp not found locally; helper not pushed to $vm"
+		warn "xpf-userspace-dp not found locally; helper not pushed to $vm"
 	fi
 
 	# Push the single unified HA config (same file for both nodes)
 	if [[ -f "$CLUSTER_CONF" ]]; then
 		info "Pushing unified HA config to $vm..."
-		incus exec "$rinst" -- mkdir -p /etc/bpfrx
-		incus file push "$CLUSTER_CONF" "${rinst}/etc/bpfrx/bpfrx.conf"
+		incus exec "$rinst" -- mkdir -p /etc/xpf
+		incus file push "$CLUSTER_CONF" "${rinst}/etc/xpf/xpf.conf"
 		# Clear configstore DB so daemon bootstraps from the new text file.
 		# Without this, the daemon loads the OLD config from active.json.
-		incus exec "$rinst" -- rm -rf /etc/bpfrx/.configdb
+		incus exec "$rinst" -- rm -rf /etc/xpf/.configdb
 	else
 		warn "Config file $CLUSTER_CONF not found"
 	fi
 
 	# Ensure node-id file exists
-	incus exec "$rinst" -- bash -c "echo $idx > /etc/bpfrx/node-id"
+	incus exec "$rinst" -- bash -c "echo $idx > /etc/xpf/node-id"
 
-	# Disable radvd — embedded RA sender in bpfrxd replaces it
+	# Disable radvd — embedded RA sender in xpfd replaces it
 	incus exec "$rinst" -- systemctl disable --now radvd 2>/dev/null || true
 
 	# Install systemd unit
 	info "Installing systemd service on $vm..."
-	incus file push "${SCRIPT_DIR}/bpfrxd.service" "${rinst}/etc/systemd/system/bpfrxd.service"
+	incus file push "${SCRIPT_DIR}/xpfd.service" "${rinst}/etc/systemd/system/xpfd.service"
 	incus exec "$rinst" -- systemctl daemon-reload
-	incus exec "$rinst" -- systemctl enable --now bpfrxd
+	incus exec "$rinst" -- systemctl enable --now xpfd
 
 	info "Deploy complete for $vm."
 }
@@ -698,7 +698,7 @@ cmd_status() {
 		vm=$(vm_name "$idx")
 		if incus info "$(r "$vm")" &>/dev/null 2>&1; then
 			echo "  $vm:"
-			incus exec "$(r "$vm")" -- systemctl is-active bpfrxd 2>/dev/null || echo "    (not installed)"
+			incus exec "$(r "$vm")" -- systemctl is-active xpfd 2>/dev/null || echo "    (not installed)"
 		fi
 	done
 
@@ -727,7 +727,7 @@ cmd_logs() {
 	[[ -z "$idx" ]] && die "Usage: $0 logs 0|1"
 	local vm
 	vm=$(vm_name "$idx")
-	incus exec "$(r "$vm")" -- journalctl -u bpfrxd -n 50 --no-pager
+	incus exec "$(r "$vm")" -- journalctl -u xpfd -n 50 --no-pager
 }
 
 cmd_journal() {
@@ -735,15 +735,15 @@ cmd_journal() {
 	[[ -z "$idx" ]] && die "Usage: $0 journal 0|1"
 	local vm
 	vm=$(vm_name "$idx")
-	incus exec "$(r "$vm")" -- journalctl -u bpfrxd -f
+	incus exec "$(r "$vm")" -- journalctl -u xpfd -f
 }
 
 cmd_start() {
 	local target="${1:-all}"
 	case "$target" in
-		0)   incus exec "$(r "$VM0")" -- systemctl start bpfrxd; info "bpfrxd started on $VM0" ;;
-		1)   incus exec "$(r "$VM1")" -- systemctl start bpfrxd; info "bpfrxd started on $VM1" ;;
-		all) incus exec "$(r "$VM0")" -- systemctl start bpfrxd; incus exec "$(r "$VM1")" -- systemctl start bpfrxd; info "bpfrxd started on both VMs" ;;
+		0)   incus exec "$(r "$VM0")" -- systemctl start xpfd; info "xpfd started on $VM0" ;;
+		1)   incus exec "$(r "$VM1")" -- systemctl start xpfd; info "xpfd started on $VM1" ;;
+		all) incus exec "$(r "$VM0")" -- systemctl start xpfd; incus exec "$(r "$VM1")" -- systemctl start xpfd; info "xpfd started on both VMs" ;;
 		*)   die "Usage: $0 start [0|1|all]" ;;
 	esac
 }
@@ -751,9 +751,9 @@ cmd_start() {
 cmd_stop() {
 	local target="${1:-all}"
 	case "$target" in
-		0)   incus exec "$(r "$VM0")" -- systemctl stop bpfrxd; info "bpfrxd stopped on $VM0" ;;
-		1)   incus exec "$(r "$VM1")" -- systemctl stop bpfrxd; info "bpfrxd stopped on $VM1" ;;
-		all) incus exec "$(r "$VM0")" -- systemctl stop bpfrxd; incus exec "$(r "$VM1")" -- systemctl stop bpfrxd; info "bpfrxd stopped on both VMs" ;;
+		0)   incus exec "$(r "$VM0")" -- systemctl stop xpfd; info "xpfd stopped on $VM0" ;;
+		1)   incus exec "$(r "$VM1")" -- systemctl stop xpfd; info "xpfd stopped on $VM1" ;;
+		all) incus exec "$(r "$VM0")" -- systemctl stop xpfd; incus exec "$(r "$VM1")" -- systemctl stop xpfd; info "xpfd stopped on both VMs" ;;
 		*)   die "Usage: $0 stop [0|1|all]" ;;
 	esac
 }
@@ -761,9 +761,9 @@ cmd_stop() {
 cmd_restart() {
 	local target="${1:-all}"
 	case "$target" in
-		0)   incus exec "$(r "$VM0")" -- systemctl restart bpfrxd; info "bpfrxd restarted on $VM0" ;;
-		1)   incus exec "$(r "$VM1")" -- systemctl restart bpfrxd; info "bpfrxd restarted on $VM1" ;;
-		all) incus exec "$(r "$VM0")" -- systemctl restart bpfrxd; incus exec "$(r "$VM1")" -- systemctl restart bpfrxd; info "bpfrxd restarted on both VMs" ;;
+		0)   incus exec "$(r "$VM0")" -- systemctl restart xpfd; info "xpfd restarted on $VM0" ;;
+		1)   incus exec "$(r "$VM1")" -- systemctl restart xpfd; info "xpfd restarted on $VM1" ;;
+		all) incus exec "$(r "$VM0")" -- systemctl restart xpfd; incus exec "$(r "$VM1")" -- systemctl restart xpfd; info "xpfd restarted on both VMs" ;;
 		*)   die "Usage: $0 restart [0|1|all]" ;;
 	esac
 }
@@ -777,14 +777,14 @@ usage() {
 	echo "  init                 Create networks and profile"
 	echo "  create               Launch both VMs + test container"
 	echo "  destroy              Tear down VMs + container, optionally networks/profile"
-	echo "  deploy [0|1|all]     Build bpfrxd and push to VM(s) (default: all)"
+	echo "  deploy [0|1|all]     Build xpfd and push to VM(s) (default: all)"
 	echo "  ssh 0|1              Shell into VM"
 	echo "  status               Show all VM/container/network status"
-	echo "  logs 0|1             Show recent bpfrxd logs for VM"
-	echo "  journal 0|1          Follow bpfrxd logs (live) for VM"
-	echo "  start [0|1|all]      Start bpfrxd service (default: all)"
-	echo "  stop [0|1|all]       Stop bpfrxd service (default: all)"
-	echo "  restart [0|1|all]    Restart bpfrxd service (default: all)"
+	echo "  logs 0|1             Show recent xpfd logs for VM"
+	echo "  journal 0|1          Follow xpfd logs (live) for VM"
+	echo "  start [0|1|all]      Start xpfd service (default: all)"
+	echo "  stop [0|1|all]       Stop xpfd service (default: all)"
+	echo "  restart [0|1|all]    Restart xpfd service (default: all)"
 	exit 1
 }
 

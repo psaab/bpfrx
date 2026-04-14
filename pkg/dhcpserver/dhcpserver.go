@@ -9,7 +9,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 const (
@@ -30,7 +30,7 @@ func New() *Manager {
 	return &Manager{}
 }
 
-// Apply generates Kea config from the bpfrx DHCP server config and restarts Kea.
+// Apply generates Kea config from the xpf DHCP server config and restarts Kea.
 func (m *Manager) Apply(cfg *config.DHCPServerConfig) error {
 	if cfg == nil {
 		m.Clear()

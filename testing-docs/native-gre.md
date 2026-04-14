@@ -16,7 +16,7 @@ Use this document when the change touches:
 
 ## Environment
 
-- Cluster: `loss:bpfrx-userspace-fw0` / `loss:bpfrx-userspace-fw1`
+- Cluster: `loss:xpf-userspace-fw0` / `loss:xpf-userspace-fw1`
 - Host: `loss:cluster-userspace-host`
 - GRE target: `10.255.192.41`
 - Default TCP probe target: `10.255.192.41:22`

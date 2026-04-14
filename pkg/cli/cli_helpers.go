@@ -7,11 +7,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
-	"github.com/psaab/bpfrx/pkg/cmdtree"
-	"github.com/psaab/bpfrx/pkg/config"
-	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
-	"github.com/psaab/bpfrx/pkg/routing"
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/cmdtree"
+	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/routing"
 	"github.com/vishvananda/netlink"
 )
 

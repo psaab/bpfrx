@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/networkd"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/networkd"
 	"github.com/vishvananda/netlink"
 )
 

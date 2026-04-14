@@ -14,7 +14,7 @@ import (
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // relayPort is the standard DHCP server/relay port.

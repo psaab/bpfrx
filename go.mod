@@ -1,4 +1,4 @@
-module github.com/psaab/bpfrx
+module github.com/psaab/xpf
 
 go 1.24.9
 

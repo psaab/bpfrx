@@ -4,7 +4,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestPolicyActionName(t *testing.T) {

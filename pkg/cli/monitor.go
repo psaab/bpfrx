@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/psaab/bpfrx/pkg/logging"
+	"github.com/psaab/xpf/pkg/logging"
 )
 
 // monitorFlowFilter holds the criteria for a single named flow filter.

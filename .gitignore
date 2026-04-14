@@ -1,6 +1,6 @@
 # Go
-/bpfrxd
-/bpfrx-userspace-dp
+/xpfd
+/xpf-userspace-dp
 /cli
 *.test
 *.out

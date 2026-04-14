@@ -117,7 +117,7 @@ func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
 
 	sysName := cfg.SystemName
 	if sysName == "" {
-		sysName = "bpfrx"
+		sysName = "xpf"
 	}
 
 	for _, lldpIf := range cfg.Interfaces {

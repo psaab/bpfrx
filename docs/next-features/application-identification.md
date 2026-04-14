@@ -4,7 +4,7 @@ Date: 2026-03-02
 Status: Implemented (Partial)
 
 ## Config Evidence
-- Present in `/home/ps/git/bpfrx/vsrx.conf:214` as `application-identification;`
+- Present in `/home/ps/git/xpf/vsrx.conf:214` as `application-identification;`
 
 ## Current State
 - Parsed into config flag: `pkg/config/compiler.go` (`compileServices`)
@@ -14,7 +14,7 @@ Status: Implemented (Partial)
 - Still no full L7 DPI or signature package pipeline
 
 ## Problem
-Before this change, enabling `application-identification` had no runtime effect. bpfrx now has real runtime application tracking for its L3/L4 application catalog, but it still does not implement Junos-style L7 DPI/AppSecure signatures.
+Before this change, enabling `application-identification` had no runtime effect. xpf now has real runtime application tracking for its L3/L4 application catalog, but it still does not implement Junos-style L7 DPI/AppSecure signatures.
 
 ## Proposed Implementation Scope
 1. Compile the broader application catalog when `services application-identification` is enabled.

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestParseSummaryMode(t *testing.T) {
@@ -74,7 +74,7 @@ func TestRenderTrafficSummaryCombinedIncludesTotals(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	RenderTrafficSummary(&buf, "bpfrx", names, kernelNames, snaps, prev, SummaryModeCombined, now.Add(-5*time.Second))
+	RenderTrafficSummary(&buf, "xpf", names, kernelNames, snaps, prev, SummaryModeCombined, now.Add(-5*time.Second))
 	out := buf.String()
 	for _, needle := range []string{
 		"mode: combined",
@@ -229,7 +229,7 @@ func TestRenderTrafficSummaryCombinedIncludesUserspaceXSKTotals(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	RenderTrafficSummary(&buf, "bpfrx", names, kernelNames, snaps, prev, SummaryModeCombined, now.Add(-5*time.Second))
+	RenderTrafficSummary(&buf, "xpf", names, kernelNames, snaps, prev, SummaryModeCombined, now.Add(-5*time.Second))
 	out := buf.String()
 	for _, needle := range []string{
 		"2.50 MB/s",
@@ -286,7 +286,7 @@ func TestRenderTrafficSummaryCombinedShowsIngressAndEgressUserspaceRows(t *testi
 	}
 
 	var buf bytes.Buffer
-	RenderTrafficSummary(&buf, "bpfrx", names, kernelNames, snaps, prev, SummaryModeCombined, now.Add(-5*time.Second))
+	RenderTrafficSummary(&buf, "xpf", names, kernelNames, snaps, prev, SummaryModeCombined, now.Add(-5*time.Second))
 	out := buf.String()
 	for _, needle := range []string{
 		"reth0:",

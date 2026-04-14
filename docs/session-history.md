@@ -1,8 +1,8 @@
-# bpfrx Session History
+# xpf Session History
 
 ## Project Overview
 
-**bpfrx** is an eBPF-based firewall that clones Juniper vSRX capabilities using native Junos configuration syntax. Go userspace (cilium/ebpf) drives C eBPF programs attached at XDP (ingress) and TC (egress).
+**xpf** is an eBPF-based firewall that clones Juniper vSRX capabilities using native Junos configuration syntax. Go userspace (cilium/ebpf) drives C eBPF programs attached at XDP (ingress) and TC (egress).
 
 | Metric | Value |
 |--------|-------|
@@ -105,7 +105,7 @@ This was the first marathon day -- the user asked for a massive feature expansio
 
 **SR-IOV Passthrough** (`edd85be`): Switched the internet-facing interface to SR-IOV PCI passthrough for native XDP support.
 
-**WAN Zone + DHCP** (`7b3fccd` -- `acd2190`): Added WAN zone with DHCP/DHCPv6, renamed `bpfrxctl` to `cli`, IPv6 default route discovery, DHCPv6 DUID persistence, enhanced `show interfaces` and `show route` via gRPC.
+**WAN Zone + DHCP** (`7b3fccd` -- `acd2190`): Added WAN zone with DHCP/DHCPv6, renamed `xpfctl` to `cli`, IPv6 default route discovery, DHCPv6 DUID persistence, enhanced `show interfaces` and `show route` via gRPC.
 
 ---
 
@@ -171,7 +171,7 @@ The user asked for a bulk implementation of 17 phases in a single session.
 
 ### Prompt 14: Hitless restarts (daemon restart should not drop sessions)
 
-**BPF Map/Link Pinning** (`513339f`): Pinned stateful BPF maps and program links to `/sys/fs/bpf/bpfrx/`. Critical discovery: PROG_ARRAY maps must be pinned or kernel clears all tail-call entries when `usercnt` drops to 0.
+**BPF Map/Link Pinning** (`513339f`): Pinned stateful BPF maps and program links to `/sys/fs/bpf/xpf/`. Critical discovery: PROG_ARRAY maps must be pinned or kernel clears all tail-call entries when `usercnt` drops to 0.
 
 **Per-Interface XDP** (`f9edb92`): Native XDP per-interface with `redirect_capable` map. Interfaces without native XDP support (iavf/VF driver) get `XDP_PASS` fallback instead of `bpf_redirect_map`.
 
@@ -213,7 +213,7 @@ The user asked for a bulk implementation of 17 phases in a single session.
 
 **VRF Routing** (`52f2ac5`, `155a71b`, `5a5c21d`): Per-interface VRF routing via `iface_zone_map`, tunnel-vr routing instance, route leaking between VRFs.
 
-**systemd-networkd Management** (`4c56d01`): bpfrxd now manages ALL interfaces on the firewall -- `.link` files (MAC-to-name rename), `.network` files (addresses, DHCP, RA disable). Unconfigured interfaces brought down with `ActivationPolicy=always-down`.
+**systemd-networkd Management** (`4c56d01`): xpfd now manages ALL interfaces on the firewall -- `.link` files (MAC-to-name rename), `.network` files (addresses, DHCP, RA disable). Unconfigured interfaces brought down with `ActivationPolicy=always-down`.
 
 **Hitless Restart Hardening** (`cec07ea`): Deterministic ID assignment (sorted before numbering), populate-before-clear pattern (new entries written first, stale deleted after), FIB cache invalidation on config change.
 
@@ -498,7 +498,7 @@ Ten numbered sprints implementing remaining feature gaps:
 
 ### Prompt 36: Two-VM chassis cluster test environment
 
-**Cluster Test Env** (`c2e13f9`): Two-VM HA test environment -- bpfrx-fw0 (node 0, priority 200), bpfrx-fw1 (node 1, priority 100), cluster-lan-host, heartbeat link (10.99.0.0/30), fabric link (10.99.1.0/30).
+**Cluster Test Env** (`c2e13f9`): Two-VM HA test environment -- xpf-fw0 (node 0, priority 200), xpf-fw1 (node 1, priority 100), cluster-lan-host, heartbeat link (10.99.0.0/30), fabric link (10.99.1.0/30).
 
 **Config Sync** (`58efe1d`): Cluster config sync primary-to-secondary, primary-only config writes (secondary is read-only).
 
@@ -576,9 +576,9 @@ Ten numbered sprints implementing remaining feature gaps:
 
 **HA Test Plan** (`7133ed9` -- `98b04aa`): Detailed test plan for two-VM SR-IOV HA cluster, refined network topology.
 
-**HA Cluster Configs** (`fb686ba`): bpfrx configs for both HA cluster nodes.
+**HA Cluster Configs** (`fb686ba`): xpf configs for both HA cluster nodes.
 
-**Single-Config HA** (`c0d5ae2`): `${node}` variable expansion in apply-groups. `CompileConfigForNode(tree, nodeID)` compiles a single config for both HA nodes. Node ID from `/etc/bpfrx/node-id` file.
+**Single-Config HA** (`c0d5ae2`): `${node}` variable expansion in apply-groups. `CompileConfigForNode(tree, nodeID)` compiles a single config for both HA nodes. Node ID from `/etc/xpf/node-id` file.
 
 **Management VRF** (`068d89d`): Management VRF, cluster CLI prompt showing node role, DHCP route isolation.
 
@@ -650,7 +650,7 @@ The user was testing NAT64 with traceroute and mtr, discovering multiple issues 
 
 The user asked Claude to assess whether VPP (Vector Packet Processing) could serve as a dataplane for the router, and how it could be integrated with or replace XDP.
 
-**VPP Assessment** (`38ea955`): Created `docs/vpp-dataplane-assessment.md` with 8 initial sections: architecture overview, feature coverage vs bpfrx requirements, performance comparison, integration strategies (4 options: full replacement, hybrid XDP+VPP, selective acceleration, DPDK worker evolution), Go control plane integration via GoVPP, operational considerations, risk assessment, and recommendation.
+**VPP Assessment** (`38ea955`): Created `docs/vpp-dataplane-assessment.md` with 8 initial sections: architecture overview, feature coverage vs xpf requirements, performance comparison, integration strategies (4 options: full replacement, hybrid XDP+VPP, selective acceleration, DPDK worker evolution), Go control plane integration via GoVPP, operational considerations, risk assessment, and recommendation.
 
 ### Prompt 53: Add WireGuard and VPN/tunnel analysis to VPP assessment
 

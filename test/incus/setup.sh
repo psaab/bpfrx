@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# bpfrx Incus test environment management
+# xpf Incus test environment management
 #
 # Creates an isolated VM or privileged container with multiple network
-# interfaces for testing the bpfrx eBPF firewall.
+# interfaces for testing the xpf eBPF firewall.
 #
 # Usage:
 #   ./test/incus/setup.sh init        # Install incus, create networks + profiles
-#   ./test/incus/setup.sh create-vm   # Launch bpfrx-fw VM
-#   ./test/incus/setup.sh create-ct   # Launch bpfrx-fw container
+#   ./test/incus/setup.sh create-vm   # Launch xpf-fw VM
+#   ./test/incus/setup.sh create-ct   # Launch xpf-fw container
 #   ./test/incus/setup.sh destroy     # Tear down instance + networks + profiles
-#   ./test/incus/setup.sh deploy      # Build bpfrx, push binary to instance
+#   ./test/incus/setup.sh deploy      # Build xpf, push binary to instance
 #   ./test/incus/setup.sh ssh         # Shell into the instance
 #   ./test/incus/setup.sh status      # Show instance and network status
 
@@ -22,9 +22,9 @@ if ! incus list &>/dev/null 2>&1; then
 	fi
 fi
 
-INSTANCE_NAME="bpfrx-fw"
-VM_PROFILE="bpfrx-vm"
-CT_PROFILE="bpfrx-container"
+INSTANCE_NAME="xpf-fw"
+VM_PROFILE="xpf-vm"
+CT_PROFILE="xpf-container"
 IMAGE_VM="images:debian/13"
 IMAGE_CT="images:debian/13"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,9 +33,9 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # Network definitions: name:subnet:nat
 # Dataplane networks use none — DHCP comes from the firewall VM, not the bridge.
 NETWORKS=(
-	"bpfrx-trust:none:false"
-	"bpfrx-untrust:none:false"
-	"bpfrx-dmz:none:false"
+	"xpf-trust:none:false"
+	"xpf-untrust:none:false"
+	"xpf-dmz:none:false"
 )
 
 info()  { echo "==> $*"; }
@@ -163,15 +163,15 @@ devices:
     type: nic
   eth2:
     name: eth2
-    network: bpfrx-trust
+    network: xpf-trust
     type: nic
   eth3:
     name: eth3
-    network: bpfrx-untrust
+    network: xpf-untrust
     type: nic
   eth4:
     name: eth4
-    network: bpfrx-dmz
+    network: xpf-dmz
     type: nic
 YAML
 }
@@ -203,9 +203,9 @@ cmd_create_vm() {
 
 	# Add virtio data NICs
 	info "Adding virtio data NICs (trust, untrust, dmz)..."
-	incus config device add "$INSTANCE_NAME" eth1 nic network=bpfrx-trust
-	incus config device add "$INSTANCE_NAME" eth2 nic network=bpfrx-untrust
-	incus config device add "$INSTANCE_NAME" eth3 nic network=bpfrx-dmz
+	incus config device add "$INSTANCE_NAME" eth1 nic network=xpf-trust
+	incus config device add "$INSTANCE_NAME" eth2 nic network=xpf-untrust
+	incus config device add "$INSTANCE_NAME" eth3 nic network=xpf-dmz
 
 	# Add PCI passthrough devices
 	local wan_pci loss_pci
@@ -239,7 +239,7 @@ cmd_create_vm() {
 	done
 
 	provision_instance vm
-	info "VM ready. Run '$0 deploy' to push bpfrxd binary."
+	info "VM ready. Run '$0 deploy' to push xpfd binary."
 }
 
 provision_instance() {
@@ -257,11 +257,11 @@ provision_instance() {
 		fi
 	done
 
-	# Interface naming (fxp0, em0, ge-X/0/Y) is now handled by bpfrxd itself
+	# Interface naming (fxp0, em0, ge-X/0/Y) is now handled by xpfd itself
 	# at startup — no external script needed.
-	incus exec "$INSTANCE_NAME" -- mkdir -p /etc/bpfrx
+	incus exec "$INSTANCE_NAME" -- mkdir -p /etc/xpf
 
-	# Remove any stale non-bpfrx networkd files
+	# Remove any stale non-xpf networkd files
 	incus exec "$INSTANCE_NAME" -- rm -f \
 		/etc/systemd/network/enp5s0.network \
 		/etc/systemd/network/10-mgmt0.network \
@@ -319,7 +319,7 @@ EOF'
 	incus exec "$INSTANCE_NAME" -- systemctl enable frr
 
 	# Chrony: enable service and clear default pool sources so only
-	# bpfrxd-managed servers (via sources.d/bpfrx.sources) are used.
+	# xpfd-managed servers (via sources.d/xpf.sources) are used.
 	incus exec "$INSTANCE_NAME" -- systemctl enable chrony
 	incus exec "$INSTANCE_NAME" -- bash -c 'sed -i "s/^pool /#pool /" /etc/chrony/chrony.conf; sed -i "s/^server /#server /" /etc/chrony/chrony.conf'
 	incus exec "$INSTANCE_NAME" -- mkdir -p /etc/chrony/sources.d
@@ -334,7 +334,7 @@ cmd_create_ct() {
 	info "Waiting for container to start..."
 	sleep 3
 	provision_instance ct
-	info "Container ready. Run '$0 deploy' to push bpfrxd binary."
+	info "Container ready. Run '$0 deploy' to push xpfd binary."
 }
 
 cmd_destroy() {
@@ -373,37 +373,37 @@ cmd_deploy() {
 		die "Instance $INSTANCE_NAME does not exist. Run '$0 create-vm' or '$0 create-ct' first."
 	fi
 
-	info "Building bpfrxd and cli..."
+	info "Building xpfd and cli..."
 	make -C "$PROJECT_ROOT" build build-ctl
 
 	# Stop service gracefully, then clean BPF state for binary upgrade.
 	# Order matters: systemctl stop sends SIGTERM (graceful socket close),
-	# then bpfrxd cleanup removes pinned BPF maps/links.  The final
+	# then xpfd cleanup removes pinned BPF maps/links.  The final
 	# pkill -9 is a safety net for "text file busy" on push.
-	incus exec "$INSTANCE_NAME" -- systemctl stop bpfrxd 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- bpfrxd cleanup 2>/dev/null || true
-	incus exec "$INSTANCE_NAME" -- pkill -9 bpfrxd 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- systemctl stop xpfd 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- xpfd cleanup 2>/dev/null || true
+	incus exec "$INSTANCE_NAME" -- pkill -9 xpfd 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- pkill -9 cli 2>/dev/null || true
 	sleep 1
 
-	info "Pushing bpfrxd to $INSTANCE_NAME..."
-	incus file push "$PROJECT_ROOT/bpfrxd" "$INSTANCE_NAME/usr/local/sbin/bpfrxd" --mode 0755
+	info "Pushing xpfd to $INSTANCE_NAME..."
+	incus file push "$PROJECT_ROOT/xpfd" "$INSTANCE_NAME/usr/local/sbin/xpfd" --mode 0755
 
 	info "Pushing cli to $INSTANCE_NAME..."
 	incus file push "$PROJECT_ROOT/cli" "$INSTANCE_NAME/usr/local/sbin/cli" --mode 0755
 
 	# Push test config if it exists
-	if [[ -f "${SCRIPT_DIR}/bpfrx-test.conf" ]]; then
+	if [[ -f "${SCRIPT_DIR}/xpf-test.conf" ]]; then
 		info "Pushing test config..."
-		incus exec "$INSTANCE_NAME" -- mkdir -p /etc/bpfrx
-		incus file push "${SCRIPT_DIR}/bpfrx-test.conf" "$INSTANCE_NAME/etc/bpfrx/bpfrx.conf"
+		incus exec "$INSTANCE_NAME" -- mkdir -p /etc/xpf
+		incus file push "${SCRIPT_DIR}/xpf-test.conf" "$INSTANCE_NAME/etc/xpf/xpf.conf"
 	fi
 
 	# Install systemd unit file
 	info "Installing systemd service..."
-	incus file push "${SCRIPT_DIR}/bpfrxd.service" "$INSTANCE_NAME/etc/systemd/system/bpfrxd.service"
+	incus file push "${SCRIPT_DIR}/xpfd.service" "$INSTANCE_NAME/etc/systemd/system/xpfd.service"
 	incus exec "$INSTANCE_NAME" -- systemctl daemon-reload
-	incus exec "$INSTANCE_NAME" -- systemctl enable --now bpfrxd
+	incus exec "$INSTANCE_NAME" -- systemctl enable --now xpfd
 
 	# Suppress management interface default route so FRR-managed routes take effect.
 	# The permanent fix is UseRoutes=false in networkd, but on existing VMs the
@@ -426,31 +426,31 @@ cmd_ssh() {
 }
 
 cmd_start() {
-	incus exec "$INSTANCE_NAME" -- systemctl start bpfrxd
-	info "bpfrxd started"
+	incus exec "$INSTANCE_NAME" -- systemctl start xpfd
+	info "xpfd started"
 }
 
 cmd_stop() {
-	incus exec "$INSTANCE_NAME" -- systemctl stop bpfrxd
-	info "bpfrxd stopped"
+	incus exec "$INSTANCE_NAME" -- systemctl stop xpfd
+	info "xpfd stopped"
 }
 
 cmd_restart() {
-	incus exec "$INSTANCE_NAME" -- systemctl restart bpfrxd
-	info "bpfrxd restarted"
+	incus exec "$INSTANCE_NAME" -- systemctl restart xpfd
+	info "xpfd restarted"
 }
 
 cmd_logs() {
-	incus exec "$INSTANCE_NAME" -- journalctl -u bpfrxd -n 50 --no-pager
+	incus exec "$INSTANCE_NAME" -- journalctl -u xpfd -n 50 --no-pager
 }
 
 cmd_journal() {
-	incus exec "$INSTANCE_NAME" -- journalctl -u bpfrxd -f
+	incus exec "$INSTANCE_NAME" -- journalctl -u xpfd -f
 }
 
 cmd_status() {
 	echo "── Service ──"
-	incus exec "$INSTANCE_NAME" -- systemctl status bpfrxd --no-pager 2>/dev/null || echo "(service not installed)"
+	incus exec "$INSTANCE_NAME" -- systemctl status xpfd --no-pager 2>/dev/null || echo "(service not installed)"
 	echo ""
 	echo "── Instance ──"
 	incus list "$INSTANCE_NAME" -f table 2>/dev/null || echo "(no instance)"
@@ -485,14 +485,14 @@ usage() {
 	echo "  create-vm   Launch a QEMU VM (full BPF support)"
 	echo "  create-ct   Launch a privileged container (quick testing)"
 	echo "  destroy     Tear down instance, optionally networks/profiles"
-	echo "  deploy      Build bpfrxd and push to instance"
+	echo "  deploy      Build xpfd and push to instance"
 	echo "  ssh         Shell into the instance"
 	echo "  status      Show instance, service, and network status"
-	echo "  start       Start bpfrxd service"
-	echo "  stop        Stop bpfrxd service"
-	echo "  restart     Restart bpfrxd service"
-	echo "  logs        Show recent bpfrxd logs"
-	echo "  journal     Follow bpfrxd logs (live)"
+	echo "  start       Start xpfd service"
+	echo "  stop        Stop xpfd service"
+	echo "  restart     Restart xpfd service"
+	echo "  logs        Show recent xpfd logs"
+	echo "  journal     Follow xpfd logs (live)"
 	exit 1
 }
 

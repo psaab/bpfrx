@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // Manager manages dynamic address feed servers and their periodic updates.

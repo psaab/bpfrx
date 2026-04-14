@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * bpfrx XDP cpumap entry program.
+ * xpf XDP cpumap entry program.
  *
  * Runs on the target CPU after bpf_redirect_map(&cpu_map, ...).
  * Performs the full packet parse and enters the tail-call pipeline
@@ -10,10 +10,10 @@
  * but executes on a different CPU to parallelise XDP processing.
  */
 
-#include "../headers/bpfrx_common.h"
-#include "../headers/bpfrx_maps.h"
-#include "../headers/bpfrx_helpers.h"
-#include "../headers/bpfrx_trace.h"
+#include "../headers/xpf_common.h"
+#include "../headers/xpf_maps.h"
+#include "../headers/xpf_helpers.h"
+#include "../headers/xpf_trace.h"
 
 SEC("xdp_cpumap/cpumap_entry")
 int xdp_cpumap_prog(struct xdp_md *ctx)

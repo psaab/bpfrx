@@ -12,9 +12,9 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/vrrp"
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/vrrp"
 )
 
 // checkVIPReadiness verifies that RETH interfaces for the given RG exist and

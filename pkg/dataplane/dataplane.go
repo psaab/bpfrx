@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/cilium/ebpf"
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // Compile-time assertion that Manager implements DataPlane.

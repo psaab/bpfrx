@@ -18,8 +18,8 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/vishvananda/netlink"
 )
 
@@ -2999,9 +2999,9 @@ func TestSnapshotContentHashDiffersOnForwardingChange(t *testing.T) {
 
 func TestSessionSocketPathDerivation(t *testing.T) {
 	m := &Manager{}
-	m.cfg.ControlSocket = "/run/bpfrx/userspace-dp.sock"
+	m.cfg.ControlSocket = "/run/xpf/userspace-dp.sock"
 	got := m.sessionSocketPath()
-	want := "/run/bpfrx/userspace-dp-sessions.sock"
+	want := "/run/xpf/userspace-dp-sessions.sock"
 	if got != want {
 		t.Fatalf("sessionSocketPath() = %q, want %q", got, want)
 	}

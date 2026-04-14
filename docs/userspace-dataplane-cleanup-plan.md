@@ -59,7 +59,7 @@ Completed under this plan:
    and the shared-lock-ordering fix found during PR review.
 7. Live validation proved that the extracted Phase 2 branch still forwards
    correctly through the userspace dataplane on the active node:
-   - userspace forwarding armed on `bpfrx-userspace-fw0`
+   - userspace forwarding armed on `xpf-userspace-fw0`
    - IPv4 and IPv6 internal reachability working
    - IPv4 and IPv6 TTL=1 probes return native time-exceeded responses
    - IPv4 and IPv6 `mtr` still show the same unresolved intermediate hops as
@@ -69,7 +69,7 @@ Completed under this plan:
    - `mlx5_core` stays on the existing UMEM-owner zerocopy path
    - `virtio_net` fabric bindings on `ifindex 4` now bind cleanly in copy mode
      via the UMEM-owner path with `bind_flags=0`
-   - active node validation on `bpfrx-userspace-fw0` shows `24/24` bound and
+   - active node validation on `xpf-userspace-fw0` shows `24/24` bound and
      `24/24` ready bindings after deploy
 9. A later merge regressed the HA lab by enabling the same-device shared-UMEM
    prototype in normal worker startup on `master`, which left the lab at
@@ -160,11 +160,11 @@ runtime" problems.
 
 ### Primary Files
 
-- [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
-- [userspace-dp/src/session.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/session.rs)
-- [userspace-dp/src/main.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/main.rs)
-- [userspace-dp/src/flowexport.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/flowexport.rs)
-- [userspace-dp/src/screen.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/screen.rs)
+- [userspace-dp/src/afxdp.rs](/home/ps/git/codex-xpf/userspace-dp/src/afxdp.rs)
+- [userspace-dp/src/session.rs](/home/ps/git/codex-xpf/userspace-dp/src/session.rs)
+- [userspace-dp/src/main.rs](/home/ps/git/codex-xpf/userspace-dp/src/main.rs)
+- [userspace-dp/src/flowexport.rs](/home/ps/git/codex-xpf/userspace-dp/src/flowexport.rs)
+- [userspace-dp/src/screen.rs](/home/ps/git/codex-xpf/userspace-dp/src/screen.rs)
 
 ### Exit Criteria
 
@@ -180,24 +180,24 @@ Completed:
 
 1. Local TTL-expiry detection, ICMP/ICMPv6 Time Exceeded builders, ICMP error
    classification, and related local-request helpers were extracted into
-   [userspace-dp/src/afxdp/icmp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/icmp.rs).
+   [userspace-dp/src/afxdp/icmp.rs](/home/ps/git/codex-xpf/userspace-dp/src/afxdp/icmp.rs).
 2. Embedded ICMP and ICMPv6 helper logic was extracted into
-   [userspace-dp/src/afxdp/icmp_embed.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/icmp_embed.rs).
+   [userspace-dp/src/afxdp/icmp_embed.rs](/home/ps/git/codex-xpf/userspace-dp/src/afxdp/icmp_embed.rs).
 3. Shared lock ordering in embedded ICMP resolution was fixed during the PR
    review cycle.
 4. AF_XDP bind/open strategy helpers were extracted into
-   [userspace-dp/src/afxdp/bind.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/bind.rs).
+   [userspace-dp/src/afxdp/bind.rs](/home/ps/git/codex-xpf/userspace-dp/src/afxdp/bind.rs).
 5. Session and reverse-session lookup / repair glue was extracted into
-   [userspace-dp/src/afxdp/session_glue.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/session_glue.rs).
+   [userspace-dp/src/afxdp/session_glue.rs](/home/ps/git/codex-xpf/userspace-dp/src/afxdp/session_glue.rs).
 6. Frame parsing, tuple parsing, frame build, NAT rewrite, and checksum helpers
    were extracted into
-   [userspace-dp/src/afxdp/frame.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/frame.rs).
+   [userspace-dp/src/afxdp/frame.rs](/home/ps/git/codex-xpf/userspace-dp/src/afxdp/frame.rs).
 7. TX queueing, completion, recycle, and wake helpers were extracted into
-   [userspace-dp/src/afxdp/tx.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/tx.rs).
+   [userspace-dp/src/afxdp/tx.rs](/home/ps/git/codex-xpf/userspace-dp/src/afxdp/tx.rs).
 8. Focused Rust tests passed after the extraction.
 9. The extracted branch was deployed live to:
-   - `loss:bpfrx-userspace-fw0`
-   - `loss:bpfrx-userspace-fw1`
+   - `loss:xpf-userspace-fw0`
+   - `loss:xpf-userspace-fw1`
 10. Live validation on the active userspace node confirmed:
    - userspace forwarding armed successfully
    - internal dual-stack reachability still works
@@ -275,7 +275,7 @@ Status: Complete And Merged
 Completed:
 
 1. Session resolution for the worker fast path is now centralized in
-   [userspace-dp/src/afxdp/session_glue.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp/session_glue.rs)
+   [userspace-dp/src/afxdp/session_glue.rs](/home/ps/git/codex-xpf/userspace-dp/src/afxdp/session_glue.rs)
    instead of being split across direct-hit, shared-hit, and reverse-repair
    branches inside `afxdp.rs`.
 2. Shared-session lookup and forward-NAT reverse lookup are now centralized via:
@@ -295,8 +295,8 @@ Completed:
    - shared NAT-reverse resolution
    - IPv4 and IPv6 tuple-authority regressions
    - IPv4 and IPv6 embedded ICMP return-path handling
-8. Live validation on `loss:bpfrx-userspace-fw0/1` passed after deployment:
-   - userspace forwarding armed on `bpfrx-userspace-fw0`
+8. Live validation on `loss:xpf-userspace-fw0/1` passed after deployment:
+   - userspace forwarding armed on `xpf-userspace-fw0`
    - IPv4 internal reachability to `172.16.80.200`
    - IPv6 internal reachability to `2001:559:8585:80::200`
    - IPv4 TTL=1 probe to `1.1.1.1` returns time-exceeded
@@ -333,11 +333,11 @@ inconsistent ownership of the packet tuple and NAT state.
 
 ### Primary Files
 
-- [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
-- [userspace-dp/src/session.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/session.rs)
-- [userspace-dp/src/nat.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/nat.rs)
-- [userspace-dp/src/nat64.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/nat64.rs)
-- [userspace-dp/src/nptv6.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/nptv6.rs)
+- [userspace-dp/src/afxdp.rs](/home/ps/git/codex-xpf/userspace-dp/src/afxdp.rs)
+- [userspace-dp/src/session.rs](/home/ps/git/codex-xpf/userspace-dp/src/session.rs)
+- [userspace-dp/src/nat.rs](/home/ps/git/codex-xpf/userspace-dp/src/nat.rs)
+- [userspace-dp/src/nat64.rs](/home/ps/git/codex-xpf/userspace-dp/src/nat64.rs)
+- [userspace-dp/src/nptv6.rs](/home/ps/git/codex-xpf/userspace-dp/src/nptv6.rs)
 
 ### Exit Criteria
 
@@ -373,9 +373,9 @@ Completed:
    - shared/local queue merge behavior
    - explicit prepared recycle routing
 6. The Phase 4 slice was deployed live to:
-   - `loss:bpfrx-userspace-fw0`
-   - `loss:bpfrx-userspace-fw1`
-7. Live validation on the active userspace node (`bpfrx-userspace-fw0`) passed:
+   - `loss:xpf-userspace-fw0`
+   - `loss:xpf-userspace-fw1`
+7. Live validation on the active userspace node (`xpf-userspace-fw0`) passed:
    - `24/24` bindings bound and ready
    - IPv4 and IPv6 internal reachability
    - native IPv4 and IPv6 time-exceeded responses
@@ -405,9 +405,9 @@ performance tuning.
 
 ### Primary Files
 
-- [userspace-dp/src/afxdp.rs](/home/ps/git/codex-bpfrx/userspace-dp/src/afxdp.rs)
-- [docs/afxdp-packet-processing.md](/home/ps/git/codex-bpfrx/docs/afxdp-packet-processing.md)
-- [docs/userspace-afxdp-idle-softirq-starvation.md](/home/ps/git/codex-bpfrx/docs/userspace-afxdp-idle-softirq-starvation.md)
+- [userspace-dp/src/afxdp.rs](/home/ps/git/codex-xpf/userspace-dp/src/afxdp.rs)
+- [docs/afxdp-packet-processing.md](/home/ps/git/codex-xpf/docs/afxdp-packet-processing.md)
+- [docs/userspace-afxdp-idle-softirq-starvation.md](/home/ps/git/codex-xpf/docs/userspace-afxdp-idle-softirq-starvation.md)
 
 ### Exit Criteria
 
@@ -495,11 +495,11 @@ Move current manual failure discovery into repeatable test coverage.
 
 ### Primary Files
 
-- [docs/userspace-ha-validation.md](/home/ps/git/codex-bpfrx/docs/userspace-ha-validation.md)
-- [docs/userspace-perf-compare.md](/home/ps/git/codex-bpfrx/docs/userspace-perf-compare.md)
-- [docs/userspace-debug-map.md](/home/ps/git/codex-bpfrx/docs/userspace-debug-map.md)
-- [scripts/userspace-ha-validation.sh](/home/ps/git/codex-bpfrx/scripts/userspace-ha-validation.sh)
-- [scripts/userspace-perf-compare.sh](/home/ps/git/codex-bpfrx/scripts/userspace-perf-compare.sh)
+- [docs/userspace-ha-validation.md](/home/ps/git/codex-xpf/docs/userspace-ha-validation.md)
+- [docs/userspace-perf-compare.md](/home/ps/git/codex-xpf/docs/userspace-perf-compare.md)
+- [docs/userspace-debug-map.md](/home/ps/git/codex-xpf/docs/userspace-debug-map.md)
+- [scripts/userspace-ha-validation.sh](/home/ps/git/codex-xpf/scripts/userspace-ha-validation.sh)
+- [scripts/userspace-perf-compare.sh](/home/ps/git/codex-xpf/scripts/userspace-perf-compare.sh)
 
 ### Exit Criteria
 
@@ -567,10 +567,10 @@ Current measured state on the Phase 6 branch:
    - about `25.5M` forwarded packets and `37.39 GB` transmitted in the sample
 7. Current hot symbols after these slices still point to the same remaining
    work:
-   - `bpfrx_userspace_dp::afxdp::poll_binding`
-   - `bpfrx_userspace_dp::afxdp::frame::enqueue_pending_forwards`
-   - `bpfrx_userspace_dp::afxdp::frame::build_forwarded_frame_into_from_frame`
-   - `bpfrx_userspace_dp::afxdp::frame::apply_nat_ipv6`
+   - `xpf_userspace_dp::afxdp::poll_binding`
+   - `xpf_userspace_dp::afxdp::frame::enqueue_pending_forwards`
+   - `xpf_userspace_dp::afxdp::frame::build_forwarded_frame_into_from_frame`
+   - `xpf_userspace_dp::afxdp::frame::apply_nat_ipv6`
 8. The earlier session-resolution cleanup is holding:
    - IPv4 `resolve_flow_session_decision` is now around `2.38%`
    - IPv6 `resolve_flow_session_decision` is now around `3.46%`

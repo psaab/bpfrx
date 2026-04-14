@@ -3,8 +3,8 @@ package daemon
 import (
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestBuildRAConfigsUsesStableRethLinkLocal(t *testing.T) {

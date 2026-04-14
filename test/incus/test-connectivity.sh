@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# bpfrx connectivity test suite
+# xpf connectivity test suite
 #
 # Validates end-to-end connectivity for standalone and cluster deployments.
 # Handles VRF-aware pinging automatically — interfaces in a VRF use
 # "ip vrf exec <vrf> ping" so tests work without manual intervention.
 #
 # Tests include:
-#   - Service health (bpfrxd active)
+#   - Service health (xpfd active)
 #   - Same-subnet ping (fw → hosts)
 #   - Cross-zone ping (trust → untrust, IPv4 + IPv6)
 #   - mtr path validation (verify traffic traverses firewall)
@@ -88,10 +88,10 @@ ping6_test() {
 }
 
 # service_check <instance> <description>
-# Verifies bpfrxd is running and not in a crash loop.
+# Verifies xpfd is running and not in a crash loop.
 service_check() {
 	local inst="$1" desc="$2"
-	if incus exec "$inst" -- systemctl is-active --quiet bpfrxd 2>/dev/null; then
+	if incus exec "$inst" -- systemctl is-active --quiet xpfd 2>/dev/null; then
 		pass "$desc"
 	else
 		fail "$desc"
@@ -140,20 +140,20 @@ internet_test() {
 # ── Standalone Tests ─────────────────────────────────────────────────
 
 test_standalone() {
-	info "Standalone firewall (bpfrx-fw)"
+	info "Standalone firewall (xpf-fw)"
 
-	if ! instance_running "bpfrx-fw"; then
-		skip "bpfrx-fw not running — skipping standalone tests"
+	if ! instance_running "xpf-fw"; then
+		skip "xpf-fw not running — skipping standalone tests"
 		return
 	fi
 
 	# Service health
-	service_check "bpfrx-fw" "standalone: bpfrxd service active"
+	service_check "xpf-fw" "standalone: xpfd service active"
 
 	# Direct host reachability (from firewall, auto VRF detection)
-	ping_test "bpfrx-fw" "10.0.1.102"  "standalone: fw → trust-host (10.0.1.102)"
-	ping_test "bpfrx-fw" "10.0.2.102"  "standalone: fw → untrust-host (10.0.2.102)"
-	ping_test "bpfrx-fw" "10.0.30.101" "standalone: fw → dmz-host (10.0.30.101)"
+	ping_test "xpf-fw" "10.0.1.102"  "standalone: fw → trust-host (10.0.1.102)"
+	ping_test "xpf-fw" "10.0.2.102"  "standalone: fw → untrust-host (10.0.2.102)"
+	ping_test "xpf-fw" "10.0.30.101" "standalone: fw → dmz-host (10.0.30.101)"
 
 	# Cross-zone: trust → untrust (requires policy permit + SNAT)
 	if instance_running "trust-host" && instance_running "untrust-host"; then
@@ -181,32 +181,32 @@ test_standalone() {
 # ── Cluster Tests ────────────────────────────────────────────────────
 
 test_cluster() {
-	info "Cluster HA (bpfrx-fw0 + bpfrx-fw1)"
+	info "Cluster HA (xpf-fw0 + xpf-fw1)"
 
-	if ! instance_running "bpfrx-fw0" || ! instance_running "bpfrx-fw1"; then
-		skip "bpfrx-fw0 or bpfrx-fw1 not running — skipping cluster tests"
+	if ! instance_running "xpf-fw0" || ! instance_running "xpf-fw1"; then
+		skip "xpf-fw0 or xpf-fw1 not running — skipping cluster tests"
 		return
 	fi
 
 	# Service health
-	service_check "bpfrx-fw0" "cluster: bpfrxd service active on fw0"
-	service_check "bpfrx-fw1" "cluster: bpfrxd service active on fw1"
+	service_check "xpf-fw0" "cluster: xpfd service active on fw0"
+	service_check "xpf-fw1" "cluster: xpfd service active on fw1"
 
 	# Heartbeat connectivity (auto VRF — em0/fab0 may be in vrf-mgmt)
-	ping_test "bpfrx-fw0" "10.99.0.2" "cluster: fw0 → fw1 heartbeat (10.99.0.2)"
-	ping_test "bpfrx-fw1" "10.99.0.1" "cluster: fw1 → fw0 heartbeat (10.99.0.1)"
+	ping_test "xpf-fw0" "10.99.0.2" "cluster: fw0 → fw1 heartbeat (10.99.0.2)"
+	ping_test "xpf-fw1" "10.99.0.1" "cluster: fw1 → fw0 heartbeat (10.99.0.1)"
 
 	# Fabric connectivity
-	ping_test "bpfrx-fw0" "10.99.1.2" "cluster: fw0 → fw1 fabric (10.99.1.2)"
-	ping_test "bpfrx-fw1" "10.99.1.1" "cluster: fw1 → fw0 fabric (10.99.1.1)"
+	ping_test "xpf-fw0" "10.99.1.2" "cluster: fw0 → fw1 fabric (10.99.1.2)"
+	ping_test "xpf-fw1" "10.99.1.1" "cluster: fw1 → fw0 fabric (10.99.1.1)"
 
 	# WAN gateway
-	ping_test "bpfrx-fw0" "172.16.50.1" "cluster: fw0 → WAN gateway (172.16.50.1)"
+	ping_test "xpf-fw0" "172.16.50.1" "cluster: fw0 → WAN gateway (172.16.50.1)"
 
 	# LAN host connectivity
 	if instance_running "cluster-lan-host"; then
 		# From firewall to LAN host
-		ping_test "bpfrx-fw0" "10.0.60.102" "cluster: fw0 → LAN host (10.0.60.102)"
+		ping_test "xpf-fw0" "10.0.60.102" "cluster: fw0 → LAN host (10.0.60.102)"
 
 		# From LAN host to RETH VIP (proves VRRP is working)
 		ping_test "cluster-lan-host" "10.0.60.1" "cluster: LAN host → RETH VIP (10.0.60.1)"
@@ -262,7 +262,7 @@ test_cluster() {
 	fi
 
 	# Internet from firewall directly
-	internet_test "bpfrx-fw0" "cluster: fw0 → internet (1.1.1.1)"
+	internet_test "xpf-fw0" "cluster: fw0 → internet (1.1.1.1)"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -271,7 +271,7 @@ main() {
 	local mode="${1:-all}"
 
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	echo "  bpfrx connectivity test suite"
+	echo "  xpf connectivity test suite"
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	echo
 

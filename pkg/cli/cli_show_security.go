@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/dataplane"
-	"github.com/psaab/bpfrx/pkg/feeds"
-	"github.com/psaab/bpfrx/pkg/logging"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/feeds"
+	"github.com/psaab/xpf/pkg/logging"
 )
 
 func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) error {
@@ -274,7 +274,7 @@ func (c *CLI) showZonesDisplay(cfg *config.Config, detail bool, filterZone strin
 			}
 		}
 
-		// Per-zone traffic counters (bpfrx extension, not in Junos)
+		// Per-zone traffic counters (xpf extension, not in Junos)
 		if c.dp != nil && c.dp.IsLoaded() && zoneID > 0 {
 			ingress, errIn := c.dp.ReadZoneCounters(zoneID, 0)
 			egress, errOut := c.dp.ReadZoneCounters(zoneID, 1)
@@ -1305,7 +1305,7 @@ func (c *CLI) showSecurityLog(args []string) error {
 
 	hostname, _ := os.Hostname()
 	if hostname == "" {
-		hostname = "bpfrx"
+		hostname = "xpf"
 	}
 
 	for _, e := range events {

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# bpfrx cluster failover test
+# xpf cluster failover test
 #
 # Validates that active TCP connections survive fw0 reboot.
-# Requires: bpfrx-fw0, bpfrx-fw1, cluster-lan-host running.
+# Requires: xpf-fw0, xpf-fw1, cluster-lan-host running.
 # Requires: iperf3 server reachable at IPERF_TARGET (default 172.16.100.200).
 #
 # Tests:
@@ -53,7 +53,7 @@ instance_running() {
 wait_for_instance() {
 	local inst="$1" max="$2"
 	for i in $(seq 1 "$max"); do
-		if incus exec "$inst" -- systemctl is-active --quiet bpfrxd 2>/dev/null; then
+		if incus exec "$inst" -- systemctl is-active --quiet xpfd 2>/dev/null; then
 			return 0
 		fi
 		sleep 1
@@ -65,7 +65,7 @@ wait_for_instance() {
 
 info "Preflight checks"
 
-for inst in bpfrx-fw0 bpfrx-fw1 cluster-lan-host; do
+for inst in xpf-fw0 xpf-fw1 cluster-lan-host; do
 	instance_running "$inst" || die "$inst is not running"
 done
 
@@ -73,13 +73,13 @@ done
 # Without this, fw1 can't take over during the reboot test because
 # ManualFailover blocks election even when the peer is lost.
 for rg in 0 1 2; do
-	incus exec bpfrx-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
-	incus exec bpfrx-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+	incus exec xpf-fw0 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
+	incus exec xpf-fw1 -- cli -c "request chassis cluster failover reset redundancy-group $rg" 2>/dev/null || true
 done
 sleep 2
 
 # Verify fw0 is primary
-fw0_status=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
+fw0_status=$(incus exec xpf-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
 if echo "$fw0_status" | grep -q "node0.*primary"; then
 	pass "fw0 is primary"
 else
@@ -120,7 +120,7 @@ for attempt in 1 2 3; do
 		continue
 	fi
 
-	fw0_sessions=$(incus exec bpfrx-fw0 -- cli -c \
+	fw0_sessions=$(incus exec xpf-fw0 -- cli -c \
 		"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "Session State: Valid" || true)
 	if [[ "$fw0_sessions" -ge "$IPERF_STREAMS" ]]; then
 		iperf_started=true
@@ -158,7 +158,7 @@ fi
 # iperf3 server is single-client — if a stale session from the previous
 # test lingers, some data streams may not connect. Accept MIN_SESSIONS
 # (control + some data) rather than requiring all IPERF_STREAMS.
-fw0_sessions=$(incus exec bpfrx-fw0 -- cli -c \
+fw0_sessions=$(incus exec xpf-fw0 -- cli -c \
 	"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "Session State: Valid" || true)
 if [[ "$fw0_sessions" -ge "$MIN_SESSIONS" ]]; then
 	pass "fw0 has $fw0_sessions established sessions"
@@ -171,7 +171,7 @@ fi
 info "Waiting ${SYNC_WAIT}s for session sync to fw1"
 sleep "$SYNC_WAIT"
 
-fw1_sessions=$(incus exec bpfrx-fw1 -- cli -c \
+fw1_sessions=$(incus exec xpf-fw1 -- cli -c \
 	"show security flow session destination-prefix ${IPERF_TARGET}" 2>/dev/null | grep -c "Session State: Valid" || true)
 if [[ "$fw1_sessions" -ge "$MIN_SESSIONS" ]]; then
 	pass "fw1 has $fw1_sessions synced sessions"
@@ -183,7 +183,7 @@ fi
 
 info "Rebooting fw0 (unclean shutdown — tests worst-case failover)"
 
-incus exec bpfrx-fw0 -- reboot 2>/dev/null || true
+incus exec xpf-fw0 -- reboot 2>/dev/null || true
 
 # Wait for fw1 to detect failure and become primary
 sleep 3
@@ -201,24 +201,24 @@ info "Waiting for fw0 to reboot and rejoin as secondary (max ${REBOOT_WAIT}s)"
 
 fw0_back=false
 for i in $(seq 1 "$REBOOT_WAIT"); do
-	if wait_for_instance bpfrx-fw0 1; then
+	if wait_for_instance xpf-fw0 1; then
 		fw0_back=true
-		info "fw0 bpfrxd active after ${i}s"
+		info "fw0 xpfd active after ${i}s"
 		break
 	fi
 done
 
 if $fw0_back; then
-	pass "fw0 bpfrxd restarted after reboot"
+	pass "fw0 xpfd restarted after reboot"
 else
-	fail "fw0 bpfrxd did not come back within ${REBOOT_WAIT}s"
+	fail "fw0 xpfd did not come back within ${REBOOT_WAIT}s"
 fi
 
 # Wait for cluster to stabilize (gRPC takes ~15s after systemctl active)
 sleep 20
 
 # Verify fw0 is secondary (NOT primary — no auto-preempt)
-fw0_status_after=$(incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
+fw0_status_after=$(incus exec xpf-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null)
 if echo "$fw0_status_after" | grep -q "node0.*secondary"; then
 	pass "fw0 rejoined as secondary (no auto-preempt)"
 elif echo "$fw0_status_after" | grep -q "node0.*primary"; then
@@ -228,7 +228,7 @@ else
 fi
 
 # Verify fw1 is still primary
-if incus exec bpfrx-fw1 -- cli -c 'show chassis cluster status' 2>/dev/null | grep -q "node1.*primary"; then
+if incus exec xpf-fw1 -- cli -c 'show chassis cluster status' 2>/dev/null | grep -q "node1.*primary"; then
 	pass "fw1 remains primary after fw0 rejoin"
 else
 	fail "fw1 is not primary after fw0 rejoin"
@@ -253,7 +253,7 @@ info "Manual failover: requesting fw1 to failover all RGs to fw0"
 # Each RG must be explicitly failed over — RG0 alone doesn't move RG1/RG2
 # because per-RG election is independent with non-preempt.
 for rg in 0 1 2; do
-	incus exec bpfrx-fw1 -- cli -c "request chassis cluster failover redundancy-group $rg" 2>/dev/null || true
+	incus exec xpf-fw1 -- cli -c "request chassis cluster failover redundancy-group $rg" 2>/dev/null || true
 done
 
 # Wait for failover to complete
@@ -262,7 +262,7 @@ sleep 5
 # Verify fw0 is now primary for ALL RGs
 all_primary=true
 for rg in 0 1 2; do
-	if ! incus exec bpfrx-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null | grep -A1 "Redundancy group: $rg" | grep -q "node0.*primary"; then
+	if ! incus exec xpf-fw0 -- cli -c 'show chassis cluster status' 2>/dev/null | grep -A1 "Redundancy group: $rg" | grep -q "node0.*primary"; then
 		all_primary=false
 		fail "fw0 is not primary for RG$rg after manual failover"
 	fi

@@ -18,16 +18,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/configstore"
-	"github.com/psaab/bpfrx/pkg/conntrack"
-	"github.com/psaab/bpfrx/pkg/dataplane"
-	"github.com/psaab/bpfrx/pkg/dhcp"
-	"github.com/psaab/bpfrx/pkg/frr"
-	"github.com/psaab/bpfrx/pkg/ipsec"
-	"github.com/psaab/bpfrx/pkg/logging"
-	"github.com/psaab/bpfrx/pkg/routing"
-	"github.com/psaab/bpfrx/pkg/vrrp"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
+	"github.com/psaab/xpf/pkg/conntrack"
+	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/ipsec"
+	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/routing"
+	"github.com/psaab/xpf/pkg/vrrp"
 )
 
 // Config configures the API server.
@@ -243,8 +243,8 @@ func (s *Server) Run(ctx context.Context) error {
 }
 
 const (
-	certPath = "/etc/bpfrx/tls/cert.pem"
-	keyPath  = "/etc/bpfrx/tls/key.pem"
+	certPath = "/etc/xpf/tls/cert.pem"
+	keyPath  = "/etc/xpf/tls/key.pem"
 )
 
 // generateSelfSignedCert creates or loads a self-signed TLS certificate.
@@ -264,12 +264,12 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 
 	hostname, _ := os.Hostname()
 	if hostname == "" {
-		hostname = "bpfrx"
+		hostname = "xpf"
 	}
 
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: hostname, Organization: []string{"bpfrx"}},
+		Subject:      pkix.Name{CommonName: hostname, Organization: []string{"xpf"}},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour), // 10 years
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
@@ -289,7 +289,7 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
 
 	// Persist for reuse across restarts
-	os.MkdirAll("/etc/bpfrx/tls", 0700)
+	os.MkdirAll("/etc/xpf/tls", 0700)
 	os.WriteFile(certPath, certPEM, 0644)
 	os.WriteFile(keyPath, keyPEM, 0600)
 

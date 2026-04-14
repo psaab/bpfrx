@@ -3,7 +3,7 @@ package daemon
 import (
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
+	"github.com/psaab/xpf/pkg/cluster"
 )
 
 func TestDirectVIPOwnershipDesired(t *testing.T) {

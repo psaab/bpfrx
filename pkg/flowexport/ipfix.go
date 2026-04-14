@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/logging"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/logging"
 )
 
 // IPFIX field Information Element IDs (IANA-assigned, RFC 5102).

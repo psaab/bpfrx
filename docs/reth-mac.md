@@ -21,7 +21,7 @@ Program a deterministic virtual MAC on RETH physical member interfaces at daemon
 | Byte | Value | Meaning |
 |------|-------|---------|
 | 0 | `02` | Locally-administered unicast (U/L bit set) |
-| 1 | `bf` | bpfrx identifier |
+| 1 | `bf` | xpf identifier |
 | 2 | `72` | ASCII 'r' (bpf**r**x) |
 | 3 | `CC` | cluster_id (from config) |
 | 4 | `RR` | redundancy_group_id |

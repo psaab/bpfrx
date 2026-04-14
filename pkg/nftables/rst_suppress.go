@@ -15,7 +15,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const rstTableName = "bpfrx_dp_rst"
+const rstTableName = "xpf_dp_rst"
 
 type rstSuppressionPlan struct {
 	deleteTable bool

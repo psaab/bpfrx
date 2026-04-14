@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
@@ -380,7 +380,7 @@ func (mon *Monitor) probeICMP(addr string) bool {
 		Body: &icmp.Echo{
 			ID:   0xbf,
 			Seq:  1,
-			Data: []byte("bpfrx"),
+			Data: []byte("xpf"),
 		},
 	}
 	b, err := msg.Marshal(nil)

@@ -11,7 +11,7 @@ import (
 	"runtime"
 
 	"github.com/cilium/ebpf"
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 // SetZoneConfig writes a zone configuration entry.
@@ -1007,7 +1007,7 @@ func (m *Manager) SetFlowTimeout(idx, seconds uint32) error {
 	return zm.Update(idx, seconds, ebpf.UpdateAny)
 }
 
-// FlowConfigValue mirrors struct flow_config in bpfrx_common.h.
+// FlowConfigValue mirrors struct flow_config in xpf_common.h.
 type FlowConfigValue struct {
 	TCPMSSIPsec       uint16
 	TCPMSSGreIn       uint16

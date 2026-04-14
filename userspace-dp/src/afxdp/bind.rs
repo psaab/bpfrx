@@ -101,7 +101,7 @@ pub(super) fn open_binding_worker_rings(
                     let more_strategy_attempts = strategy_idx + 1 < strategies.len();
                     if more_flag_attempts {
                         eprintln!(
-                            "bpfrx-userspace-dp: {} bind failed using {}: {} — trying {}",
+                            "xpf-userspace-dp: {} bind failed using {}: {} — trying {}",
                             describe_bind_flags(flags),
                             strategy.describe(),
                             last_err.as_ref().unwrap(),
@@ -109,7 +109,7 @@ pub(super) fn open_binding_worker_rings(
                         );
                     } else if more_strategy_attempts {
                         eprintln!(
-                            "bpfrx-userspace-dp: {} bind failed using {} on driver {:?}: {} — retrying {}",
+                            "xpf-userspace-dp: {} bind failed using {} on driver {:?}: {} — retrying {}",
                             describe_bind_flags(flags),
                             strategy.describe(),
                             driver_name,
@@ -152,7 +152,7 @@ fn interface_uses_generic_xdp(ifindex: u32) -> bool {
     let rc = unsafe { libbpf_sys::bpf_xdp_query(ifindex as c_int, 0, &mut opts) };
     if rc != 0 {
         eprintln!(
-            "bpfrx-userspace-dp: bpf_xdp_query(ifindex={}) failed rc={} — assuming generic XDP",
+            "xpf-userspace-dp: bpf_xdp_query(ifindex={}) failed rc={} — assuming generic XDP",
             ifindex, rc
         );
         return true;
@@ -325,7 +325,7 @@ fn try_open_bind(
                 let bind_mode = query_bound_xsk_mode(user_fd).unwrap_or(XskBindMode::Copy);
                 set_busy_poll_opts(user_fd, poll_mode);
                 eprintln!(
-                    "bpfrx-userspace-dp: libxdp bind(fd={}) OK on attempt {} mode={:?} flags=0x{:04x}",
+                    "xpf-userspace-dp: libxdp bind(fd={}) OK on attempt {} mode={:?} flags=0x{:04x}",
                     user_fd, attempt, bind_mode, bind_flags,
                 );
 

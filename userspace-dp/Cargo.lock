@@ -42,23 +42,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bpfrx-userspace-dp"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "cc",
- "chrono",
- "ctrlc",
- "io-uring",
- "ipnet",
- "libbpf-sys",
- "libc",
- "rustc-hash",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -476,6 +459,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "xpf-userspace-dp"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "cc",
+ "chrono",
+ "ctrlc",
+ "io-uring",
+ "ipnet",
+ "libbpf-sys",
+ "libc",
+ "rustc-hash",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

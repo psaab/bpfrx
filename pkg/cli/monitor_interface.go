@@ -7,9 +7,9 @@ import (
 	"sort"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
-	dpuserspace "github.com/psaab/bpfrx/pkg/dataplane/userspace"
-	"github.com/psaab/bpfrx/pkg/monitoriface"
+	"github.com/psaab/xpf/pkg/config"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/monitoriface"
 	"golang.org/x/sys/unix"
 )
 

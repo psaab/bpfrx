@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/cluster"
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/configstore"
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 )
 
 // newClusterManager creates a cluster.Manager where node 0 is primary or

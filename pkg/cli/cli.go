@@ -1,4 +1,4 @@
-// Package cli implements the Junos-style interactive CLI for bpfrx.
+// Package cli implements the Junos-style interactive CLI for xpf.
 package cli
 
 import (
@@ -19,23 +19,23 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
-	"github.com/psaab/bpfrx/pkg/appid"
-	"github.com/psaab/bpfrx/pkg/cluster"
-	"github.com/psaab/bpfrx/pkg/cmdtree"
-	"github.com/psaab/bpfrx/pkg/config"
-	"github.com/psaab/bpfrx/pkg/configstore"
-	"github.com/psaab/bpfrx/pkg/dataplane"
-	"github.com/psaab/bpfrx/pkg/dhcp"
-	"github.com/psaab/bpfrx/pkg/dhcprelay"
-	"github.com/psaab/bpfrx/pkg/feeds"
-	"github.com/psaab/bpfrx/pkg/frr"
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
-	"github.com/psaab/bpfrx/pkg/ipsec"
-	"github.com/psaab/bpfrx/pkg/lldp"
-	"github.com/psaab/bpfrx/pkg/logging"
-	"github.com/psaab/bpfrx/pkg/routing"
-	"github.com/psaab/bpfrx/pkg/rpm"
-	"github.com/psaab/bpfrx/pkg/vrrp"
+	"github.com/psaab/xpf/pkg/appid"
+	"github.com/psaab/xpf/pkg/cluster"
+	"github.com/psaab/xpf/pkg/cmdtree"
+	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
+	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dhcp"
+	"github.com/psaab/xpf/pkg/dhcprelay"
+	"github.com/psaab/xpf/pkg/feeds"
+	"github.com/psaab/xpf/pkg/frr"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/ipsec"
+	"github.com/psaab/xpf/pkg/lldp"
+	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/routing"
+	"github.com/psaab/xpf/pkg/rpm"
+	"github.com/psaab/xpf/pkg/vrrp"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -83,7 +83,7 @@ type CLI struct {
 func New(store *configstore.Store, dp dataplane.DataPlane, eventBuf *logging.EventBuffer, eventReader *logging.EventReader, rm *routing.Manager, fm *frr.Manager, im *ipsec.Manager, dm *dhcp.Manager, dr *dhcprelay.Manager, cm *cluster.Manager) *CLI {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
-		hostname = "bpfrx"
+		hostname = "xpf"
 	}
 	username := os.Getenv("USER")
 	if username == "" {
@@ -476,7 +476,7 @@ func (c *CLI) Run() error {
 	completer := &cliCompleter{cli: c}
 	c.rl, err = readline.NewEx(&readline.Config{
 		Prompt:          c.operationalPrompt(),
-		HistoryFile:     filepath.Join(os.Getenv("HOME"), ".bpfrx_history"),
+		HistoryFile:     filepath.Join(os.Getenv("HOME"), ".xpf_history"),
 		HistoryLimit:    10000,
 		InterruptPrompt: "^C",
 		EOFPrompt:       "exit",
@@ -558,7 +558,7 @@ func (c *CLI) Run() error {
 		fmt.Fprintf(os.Stderr, "\ncommit confirmed timed out, configuration has been rolled back\n")
 	})
 
-	fmt.Println("bpfrx firewall - Junos-style eBPF firewall")
+	fmt.Println("xpf firewall - Junos-style eBPF firewall")
 	fmt.Println("Type '?' for help")
 	fmt.Println()
 

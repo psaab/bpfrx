@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestIsWithinWindow_NoTimes(t *testing.T) {

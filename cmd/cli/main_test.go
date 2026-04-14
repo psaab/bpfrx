@@ -3,7 +3,7 @@ package main
 import (
 	"testing"
 
-	pb "github.com/psaab/bpfrx/pkg/grpcapi/bpfrxv1"
+	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 )
 
 func TestRemoteMonitorSummaryModeFromKey(t *testing.T) {

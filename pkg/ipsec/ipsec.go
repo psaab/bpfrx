@@ -11,14 +11,14 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 const (
 	// DefaultSwanctlDir is where swanctl reads conf.d snippets.
 	DefaultSwanctlDir = "/etc/swanctl/conf.d"
-	// BPFRXConfFile is the config file bpfrx manages.
-	BPFRXConfFile = "bpfrx.conf"
+	// BPFRXConfFile is the config file xpf manages.
+	BPFRXConfFile = "xpf.conf"
 )
 
 // Manager handles strongSwan config generation and SA queries.
@@ -65,7 +65,7 @@ func (m *Manager) Apply(ipsecCfg *config.IPsecConfig) error {
 	return nil
 }
 
-// Clear removes the bpfrx config and reloads strongSwan.
+// Clear removes the xpf config and reloads strongSwan.
 func (m *Manager) Clear() error {
 	if err := os.Remove(m.configPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove config: %w", err)
@@ -82,7 +82,7 @@ func (m *Manager) generateConfig(ipsecCfg *config.IPsecConfig) string {
 func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 	var b strings.Builder
 
-	b.WriteString("# bpfrx managed config - do not edit\n\n")
+	b.WriteString("# xpf managed config - do not edit\n\n")
 
 	// Connections
 	b.WriteString("connections {\n")

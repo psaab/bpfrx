@@ -32,7 +32,7 @@ Pre-commit validation checklist. Check the boxes that apply to your change.
 
 - [ ] `bash pkg/dataplane/build-userspace-xdp.sh` — BPF object compiles and embedded object is refreshed
 - [ ] `make build` — Go daemon embeds new XDP object
-- [ ] Deploy and check: `journalctl -u bpfrxd | grep "stack.*too large"` — NO stack overflow
+- [ ] Deploy and check: `journalctl -u xpfd | grep "stack.*too large"` — NO stack overflow
 - [ ] Cluster comes up: `show chassis cluster status` — both nodes have primary/secondary
 
 ## If You Changed Cluster / VRRP / Session Sync

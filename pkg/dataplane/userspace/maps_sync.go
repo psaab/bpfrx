@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
-	"github.com/psaab/bpfrx/pkg/config"
-	bpfrxnft "github.com/psaab/bpfrx/pkg/nftables"
+	"github.com/psaab/xpf/pkg/config"
+	xpfnft "github.com/psaab/xpf/pkg/nftables"
 	"github.com/vishvananda/netlink"
 )
 
@@ -842,7 +842,7 @@ func (m *Manager) syncInterfaceNATAddressMapsLocked(snapshot *ConfigSnapshot) er
 		m.lastRSTAttempt,
 		m.lastRSTInstallOK,
 	) {
-		if err := bpfrxnft.InstallRSTSuppression(rstV4, rstV6); err != nil {
+		if err := xpfnft.InstallRSTSuppression(rstV4, rstV6); err != nil {
 			slog.Warn("userspace: RST suppression unavailable (nftables error, non-fatal)", "err", err)
 			m.lastRSTInstallOK = false
 		} else {

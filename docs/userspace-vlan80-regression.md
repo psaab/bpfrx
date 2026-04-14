@@ -5,12 +5,12 @@ Date: 2026-03-09
 Environment:
 - isolated userspace HA cluster on `loss`
 - firewalls:
-  - `loss:bpfrx-userspace-fw0`
-  - `loss:bpfrx-userspace-fw1`
+  - `loss:xpf-userspace-fw0`
+  - `loss:xpf-userspace-fw1`
 - test host:
   - `loss:cluster-userspace-host`
 - tracked config:
-  - [ha-cluster-userspace.conf](/home/ps/git/codex-bpfrx/docs/ha-cluster-userspace.conf)
+  - [ha-cluster-userspace.conf](/home/ps/git/codex-xpf/docs/ha-cluster-userspace.conf)
 
 This file is historical. It captures a closed lab regression and should not be read
 as the explanation for current userspace forwarding bugs on this branch.
@@ -25,7 +25,7 @@ From 10.0.61.1 icmp_seq=1 Destination Host Unreachable
 From 10.0.61.1 icmp_seq=2 Destination Host Unreachable
 ```
 
-The same failure is visible directly on `loss:bpfrx-userspace-fw0`:
+The same failure is visible directly on `loss:xpf-userspace-fw0`:
 
 ```text
 ping -c 3 -W 1 172.16.80.1
@@ -58,7 +58,7 @@ move to `0000:65:01.4` / `0000:65:01.5`:
 The original non-userspace loss cluster still reaches VLAN 80 over both IPv4 and IPv6:
 
 ```text
-incus exec loss:bpfrx-fw0 -- ping -c 1 -W 1 172.16.80.1
+incus exec loss:xpf-fw0 -- ping -c 1 -W 1 172.16.80.1
 ```
 
 That succeeds, and the original cluster has live VLAN 80 neighbor entries:
@@ -71,7 +71,7 @@ That succeeds, and the original cluster has live VLAN 80 neighbor entries:
 
 ## Wire Evidence
 
-Capture on `loss:bpfrx-userspace-fw0` while pinging `172.16.80.1`:
+Capture on `loss:xpf-userspace-fw0` while pinging `172.16.80.1`:
 
 ```text
 tcpdump -ni ge-0-0-2 -e -vvv vlan 80 and (arp or icmp)
@@ -126,8 +126,8 @@ Isolated userspace cluster:
 
 Current VM device state confirms that:
 
-- `loss:bpfrx-fw0` uses WAN VF `0000:65:00.2`
-- `loss:bpfrx-userspace-fw0` uses WAN VF `0000:65:01.4`
+- `loss:xpf-fw0` uses WAN VF `0000:65:00.2`
+- `loss:xpf-userspace-fw0` uses WAN VF `0000:65:01.4`
 
 That original VF difference mattered earlier, and moving the isolated userspace
 cluster to `65:01.4/65:01.5` restored general WAN + IPv6 behavior. The remaining
@@ -141,8 +141,8 @@ There is also a live address asymmetry on VLAN 80:
 Read-only comparison against the original cluster shows:
 
 ```text
-bpfrx-fw0 (172.16.80.7) -> ARP reply received from 172.16.80.200
-bpfrx-userspace-fw0 (172.16.80.8) -> no ARP reply from 172.16.80.200
+xpf-fw0 (172.16.80.7) -> ARP reply received from 172.16.80.200
+xpf-userspace-fw0 (172.16.80.8) -> no ARP reply from 172.16.80.200
 ```
 
 On the original cluster, tcpdump shows the full ARP exchange:
@@ -202,4 +202,4 @@ Current remaining userspace work is in the forwarding path itself:
 - closing the gap to the `22-23 Gbps` target on the isolated lab
 
 Current repeatable validation is documented in
-[userspace-ha-validation.md](/home/ps/git/codex-bpfrx/docs/userspace-ha-validation.md).
+[userspace-ha-validation.md](/home/ps/git/codex-xpf/docs/userspace-ha-validation.md).

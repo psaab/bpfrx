@@ -34,7 +34,7 @@ These capabilities exist in the current Rust userspace dataplane code path:
 ## Still Gated By `deriveUserspaceCapabilities()`
 
 These are the remaining explicit configuration gates in
-[`pkg/dataplane/userspace/manager.go`](/home/ps/git/codex-bpfrx/pkg/dataplane/userspace/manager.go):
+[`pkg/dataplane/userspace/manager.go`](/home/ps/git/codex-xpf/pkg/dataplane/userspace/manager.go):
 
 | Feature/config shape | Gate status | Reason |
 |----------------------|-------------|--------|

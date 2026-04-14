@@ -105,11 +105,11 @@ Since the root cause is kernel-emitted RSTs for SNAT addresses the kernel
 doesn't own, the dataplane installs nftables rules to suppress them.
 
 `install_kernel_rst_suppression()` (`afxdp.rs:6499`) creates an
-`inet bpfrx_dp_rst` table with an output chain that drops outgoing TCP RSTs
+`inet xpf_dp_rst` table with an output chain that drops outgoing TCP RSTs
 from all interface-NAT (SNAT) addresses:
 
 ```
-table inet bpfrx_dp_rst {
+table inet xpf_dp_rst {
   chain output {
     type filter hook output priority 0; policy accept;
     ip saddr <snat_v4_addr> tcp flags & rst == rst counter drop

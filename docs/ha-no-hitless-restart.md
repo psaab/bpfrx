@@ -2,7 +2,7 @@
 
 Date: 2026-03-01  
 Status: Implemented (Sprint #68)  
-Tracking issue: https://github.com/psaab/bpfrx/issues/68
+Tracking issue: https://github.com/psaab/xpf/issues/68
 
 ## Summary
 
@@ -40,7 +40,7 @@ When `chassis cluster` is enabled:
 
 ## Acceptance criteria
 
-- In HA mode, stopping or crashing `bpfrxd` does not leave stale active
+- In HA mode, stopping or crashing `xpfd` does not leave stale active
   forwarding on that node.
 - Peer failover converges without prolonged dual-active forwarding.
 - Standalone mode continues to support hitless restart.

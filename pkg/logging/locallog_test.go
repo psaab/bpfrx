@@ -113,7 +113,7 @@ func TestLocalLogWriter_DefaultPath(t *testing.T) {
 	// so just verify the config logic)
 	cfg := LocalLogConfig{}
 	if cfg.Path == "" {
-		cfg.Path = "/tmp/bpfrx-test-default.log"
+		cfg.Path = "/tmp/xpf-test-default.log"
 	}
 	lw, err := NewLocalLogWriter(cfg)
 	if err != nil {

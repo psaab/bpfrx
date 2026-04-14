@@ -1,4 +1,4 @@
-# bpfrx Project Memory
+# xpf Project Memory
 
 ## Project Overview
 - **Goal:** eBPF-based firewall cloning Juniper vSRX capabilities with native Junos configuration syntax
@@ -17,7 +17,7 @@
 - All 14 BPF programs pass verifier on kernel 6.18.9 (9 XDP + 5 TC)
 - **Known:** xdp_zone fails verifier on kernel 6.12 (NAT64 loop complexity)
 - 880+ tests pass (`make test`) across 30 packages; `make test-deploy` builds, pushes, installs unit, starts
-- **ALWAYS deploy to ALL VMs:** `make test-deploy` (bpfrx-fw) AND `make cluster-deploy` (bpfrx-fw0 + bpfrx-fw1)
+- **ALWAYS deploy to ALL VMs:** `make test-deploy` (xpf-fw) AND `make cluster-deploy` (xpf-fw0 + xpf-fw1)
 
 ## Architecture
 
@@ -38,23 +38,23 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - `show | display set` for flat set export (FormatSet())
 - **${node} variable expansion:** `ExpandGroupsWithVars()` resolves `${node}` in apply-groups references
   - `CompileConfigForNode(tree, nodeID)` — single config for both HA nodes
-  - Cluster node ID from `/etc/bpfrx/node-id` file (file absent = standalone)
+  - Cluster node ID from `/etc/xpf/node-id` file (file absent = standalone)
   - Configstore `compileTree()` dispatches to correct compiler based on nodeID
 
 ### Interface Management (networkd)
-- **bpfrxd manages ALL interfaces** — renames, addresses, DHCP, and brings down unconfigured ones
-- `.link` files: MAC→name rename (e.g. enp6s0→ge-0-0-0), prefix `10-bpfrx-`; RETH members use `OriginalName=` (PCI name) instead of `MACAddress=` for stable boot matching
+- **xpfd manages ALL interfaces** — renames, addresses, DHCP, and brings down unconfigured ones
+- `.link` files: MAC→name rename (e.g. enp6s0→ge-0-0-0), prefix `10-xpf-`; RETH members use `OriginalName=` (PCI name) instead of `MACAddress=` for stable boot matching
 - `.network` files: addresses, RA disable, VLAN parent, ActivationPolicy=always-down for unmanaged
 - Unmanaged interfaces: brought down immediately + ActivationPolicy=always-down for persistence
 - DHCP interfaces: daemon's DHCP client manages addresses; address reconciliation skipped
 - VRF devices and tunnel interfaces excluded from unmanaged detection (`daemonOwned` map)
-- **Boot-time naming:** `enumerateAndRenameInterfaces()` in `pkg/daemon/linksetup.go` runs at daemon start, assigns vSRX names (fxp0, em0, ge-X-0-Y) based on PCI bus order and `/etc/bpfrx/node-id`
+- **Boot-time naming:** `enumerateAndRenameInterfaces()` in `pkg/daemon/linksetup.go` runs at daemon start, assigns vSRX names (fxp0, em0, ge-X-0-Y) based on PCI bus order and `/etc/xpf/node-id`
 - **Standalone:** no node-id file → fxp0 + ge-0-0-X (no em0). **Cluster:** node-id 0/1 → fxp0 + em0 + ge-{0,7}-0-X
 
 ### APIs & CLIs
 - **gRPC:** 127.0.0.1:50051 (config, sessions, stats, routes, IPsec, DHCP)
 - **HTTP REST:** 127.0.0.1:8080 (health, Prometheus, config, full gRPC parity)
-- **Local CLI:** `bpfrxd` in TTY mode (tab completion, `?` help, pipe filters)
+- **Local CLI:** `xpfd` in TTY mode (tab completion, `?` help, pipe filters)
 - **Remote CLI:** `cli` binary connects via gRPC
 - **Single source of truth:** `pkg/cmdtree/tree.go` defines `OperationalTree` and `ConfigTopLevel`
   - `pkg/cli` imports via type alias `completionNode = cmdtree.Node`
@@ -65,7 +65,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Junos-style prefix matching:** `resolveCommand()` + `cmdtree.KeysFromTree()` — no hardcoded lists
 - **`?` instant help:** readline `Listener` intercepts `?` key, shows help without Enter
 - **Tab descriptions:** Multi-match tab shows descriptions above prompt via `cmdtree.WriteHelp()`
-- **CLI history:** Persisted to `~/.bpfrx_history` (local) and via gRPC `HistoryAppend`/`HistoryGet` (remote CLI)
+- **CLI history:** Persisted to `~/.xpf_history` (local) and via gRPC `HistoryAppend`/`HistoryGet` (remote CLI)
 
 ### Chassis Cluster (HA)
 - **State machine:** StateSecondary(0), StatePrimary(1), SecondaryHold(2), Lost(3), Disabled(4); weight-based election
@@ -97,13 +97,13 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 - **Stateless IPv6 prefix translation:** 1:1 /48 prefix rewriting, checksum-neutral
 - **Algorithm:** precompute adj, rewrite prefix words 0-2, apply adj to word[3] with carry fold
 - **BPF:** `nptv6_rules` HASH (128), key: prefix[6]+direction(u8), value: xlat_prefix[6]+adjustment(u16)
-- **Helper:** `nptv6_translate()` in `bpfrx_nat.h` — inbound adds ~adj, outbound adds adj; 0xFFFF→0x0000
+- **Helper:** `nptv6_translate()` in `xpf_nat.h` — inbound adds ~adj, outbound adds adj; 0xFFFF→0x0000
 - **Session flag:** `SESS_FLAG_NPTV6 (1<<8)`; config: `StaticNATRule.IsNPTv6 bool`
 - **Pipeline:** inbound in xdp_zone (dst rewrite), outbound in xdp_policy (src rewrite)
 - **Config:** `then static-nat nptv6-prefix <internal-prefix>` (both hierarchical + flat set)
 
 ### Routing
-- **FRR is sole route manager** — bpfrx NEVER directly modifies kernel routes
+- **FRR is sole route manager** — xpf NEVER directly modifies kernel routes
 - Static, DHCP-learned, per-VRF routes all managed via FRR frr.conf
 - `systemctl reload frr` triggers diff-based update
 - BGP/OSPF/IS-IS export → FRR redistribute mapping
@@ -158,12 +158,12 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
   - **RST protection:** conntrack skips state→CLOSED transition when META_FLAG_KERNEL_ROUTE set (kernel may drop the RST, poisoning session)
 
 ## Hitless Restart Patterns
-- Non-destructive SIGTERM (no FRR/DHCP/VRF cleanup); full teardown via `bpfrxd cleanup`
+- Non-destructive SIGTERM (no FRR/DHCP/VRF cleanup); full teardown via `xpfd cleanup`
 - DHCP uses `context.Background()` — prevents address removal on restart
-- Deferred `link.Update()` AFTER all compilation; stale pins need `bpfrxd cleanup` + fresh start
+- Deferred `link.Update()` AFTER all compilation; stale pins need `xpfd cleanup` + fresh start
 - **PROG_ARRAY pinning (CRITICAL):** `xdp_progs`/`tc_progs` MUST be pinned to survive daemon exit
 - Deterministic IDs (sorted keys); populate-before-clear; dnat_table before sessions (`a030446`)
-- **Deploy restart:** `systemctl stop` → `bpfrxd cleanup` → push binary → start. SO_REUSEADDR+SO_REUSEPORT for rebind
+- **Deploy restart:** `systemctl stop` → `xpfd cleanup` → push binary → start. SO_REUSEADDR+SO_REUSEPORT for rebind
 
 ## Performance
 - **bpf_printk:** NEVER leave in production (55%+ CPU)
@@ -177,7 +177,7 @@ TC Egress:   main -> screen_egress -> conntrack -> nat -> forward
 ## Incus Test Environment
 - See `test_env.md` for topology; VM: Debian 13, kernel 6.18.9; `sg incus-admin -c "make ..."` for perms
 - **Naming:** vSRX-style via `enumerateAndRenameInterfaces()` — PCI passthrough always higher bus than virtio
-- **Cluster:** bpfrx-fw0 (pri 200) + bpfrx-fw1 (pri 100) + cluster-lan-host; Fabric: 10.99.1.0/30
+- **Cluster:** xpf-fw0 (pri 200) + xpf-fw1 (pri 100) + cluster-lan-host; Fabric: 10.99.1.0/30
 
 ## SSH / Git Push — `source ~/.sshrc` before `git push`
 

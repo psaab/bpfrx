@@ -177,7 +177,7 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
     }
     if fwd_publish_errors > 0 {
         eprintln!(
-            "bpfrx-ha: prewarm forward BPF publish: {} errors out of {} entries",
+            "xpf-ha: prewarm forward BPF publish: {} errors out of {} entries",
             fwd_publish_errors,
             forward_entries.len()
         );
@@ -256,7 +256,7 @@ pub(super) fn republish_bpf_session_entries_for_owner_rgs(
     }
     if errors > 0 {
         eprintln!(
-            "bpfrx-ha: republish_bpf_session_entries: {} errors out of {} attempted",
+            "xpf-ha: republish_bpf_session_entries: {} errors out of {} attempted",
             errors,
             published + errors
         );

@@ -3,7 +3,7 @@ package daemon
 import (
 	"testing"
 
-	"github.com/psaab/bpfrx/pkg/config"
+	"github.com/psaab/xpf/pkg/config"
 )
 
 func TestResolveSourceAddr_PrimaryAddress(t *testing.T) {

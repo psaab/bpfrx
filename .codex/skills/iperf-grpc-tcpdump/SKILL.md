@@ -10,7 +10,7 @@ forwarding failures with synchronized captures.
 
 This skill targets the isolated `loss` userspace lab:
 - client: `loss:cluster-userspace-host`
-- firewalls: `loss:bpfrx-userspace-fw0`, `loss:bpfrx-userspace-fw1`
+- firewalls: `loss:xpf-userspace-fw0`, `loss:xpf-userspace-fw1`
 - server capture gRPC endpoint: `172.16.80.200:50051`
 
 The helper script:

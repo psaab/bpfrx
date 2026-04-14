@@ -161,7 +161,7 @@ func (c *CLI) showTask() error {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	uptime := time.Since(c.startTime).Truncate(time.Second)
-	fmt.Println("Task: bpfrxd daemon")
+	fmt.Println("Task: xpfd daemon")
 	fmt.Printf("  Goroutines: %d\n", runtime.NumGoroutine())
 	fmt.Printf("  Memory allocated: %.1f MB\n", float64(m.Alloc)/1024/1024)
 	fmt.Printf("  System memory: %.1f MB\n", float64(m.Sys)/1024/1024)
@@ -712,7 +712,7 @@ func (c *CLI) showVersion() error {
 	if ver == "" {
 		ver = "dev"
 	}
-	fmt.Printf("bpfrx eBPF firewall %s\n", ver)
+	fmt.Printf("xpf eBPF firewall %s\n", ver)
 	var uts unix.Utsname
 	if err := unix.Uname(&uts); err == nil {
 		sysname := strings.TrimRight(string(uts.Sysname[:]), "\x00")
@@ -757,7 +757,7 @@ func (c *CLI) showDaemonLog(args []string) error {
 		}
 	}
 
-	out, err := exec.Command("journalctl", "-u", "bpfrxd", "-n", strconv.Itoa(n), "--no-pager").CombinedOutput()
+	out, err := exec.Command("journalctl", "-u", "xpfd", "-n", strconv.Itoa(n), "--no-pager").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("journalctl: %w", err)
 	}
