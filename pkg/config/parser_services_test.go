@@ -54,11 +54,64 @@ func TestRPMDefaultsAndValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("root probe-limit inheritance", func(t *testing.T) {
+		input := `services {
+    rpm {
+        probe-limit 3;
+        probe monitor {
+            test inherited {
+                target 8.8.8.8;
+            }
+            test explicit {
+                target 1.1.1.1;
+                probe-limit 5;
+            }
+        }
+    }
+}
+`
+		parser := NewParser(input)
+		tree, errs := parser.Parse()
+		if len(errs) > 0 {
+			t.Fatalf("parse errors: %v", errs)
+		}
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("compile error: %v", err)
+		}
+
+		probe := cfg.Services.RPM.Probes["monitor"]
+		if probe == nil {
+			t.Fatal("expected probe monitor")
+		}
+		if got := probe.Tests["inherited"].ProbeLimit; got != 3 {
+			t.Fatalf("inherited ProbeLimit = %d, want 3", got)
+		}
+		if got := probe.Tests["explicit"].ProbeLimit; got != 5 {
+			t.Fatalf("explicit ProbeLimit = %d, want 5", got)
+		}
+	})
+
 	tests := []struct {
 		name    string
 		input   string
 		wantErr string
 	}{
+		{
+			name: "zero root probe limit rejected",
+			input: `services {
+    rpm {
+        probe-limit 0;
+        probe monitor {
+            test ping-test {
+                target 8.8.8.8;
+            }
+        }
+    }
+}
+`,
+			wantErr: "services rpm probe-limit",
+		},
 		{
 			name: "missing target",
 			input: `services {

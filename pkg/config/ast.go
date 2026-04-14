@@ -1363,6 +1363,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 	}},
 	"services": {children: map[string]*schemaNode{
 		"rpm": {desc: "Real-time Performance Monitoring probes", children: map[string]*schemaNode{
+			"probe-limit": {args: 1, desc: "Default maximum consecutive failed probes before stopping a test cycle", children: nil},
 			"probe": {args: 1, desc: "RPM probe name", children: map[string]*schemaNode{
 				"test": {args: 1, desc: "RPM test name", children: map[string]*schemaNode{
 					"probe-type":       {args: 1, desc: "Probe type: icmp-ping, tcp-ping, or http-get", children: nil},

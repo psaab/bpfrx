@@ -1085,6 +1085,40 @@ func TestRPMTargetURLAndProbeLimit(t *testing.T) {
 	}
 }
 
+func TestRPMRootProbeLimitSetSyntax(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set services rpm probe-limit 3",
+		"set services rpm probe web2 test inherited target 8.8.8.8",
+		"set services rpm probe web2 test explicit target 1.1.1.1",
+		"set services rpm probe web2 test explicit probe-limit 7",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("set-command compile error: %v", err)
+	}
+	probe := cfg.Services.RPM.Probes["web2"]
+	if probe == nil {
+		t.Fatal("expected probe web2")
+	}
+	if got := probe.Tests["inherited"].ProbeLimit; got != 3 {
+		t.Fatalf("inherited probe-limit = %d, want 3", got)
+	}
+	if got := probe.Tests["explicit"].ProbeLimit; got != 7 {
+		t.Fatalf("explicit probe-limit = %d, want 7", got)
+	}
+}
+
 func TestMultipleSNATRules(t *testing.T) {
 	input := `security {
     zones {

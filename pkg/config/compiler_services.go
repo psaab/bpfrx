@@ -185,6 +185,17 @@ func compileServices(node *Node, svc *ServicesConfig) error {
 
 func compileRPM(node *Node, svc *ServicesConfig) error {
 	rpmCfg := &RPMConfig{Probes: make(map[string]*RPMProbe)}
+	defaultProbeLimit := 0
+
+	if probeLimitNode := node.FindChild("probe-limit"); probeLimitNode != nil {
+		if v := nodeVal(probeLimitNode); v != "" {
+			n, err := parseRPMPositiveInt("rpm", "default", "probe-limit", v)
+			if err != nil {
+				return fmt.Errorf("services rpm probe-limit: %w", err)
+			}
+			defaultProbeLimit = n
+		}
+	}
 
 	for _, probeInst := range namedInstances(node.FindChildren("probe")) {
 		probe := &RPMProbe{
@@ -265,6 +276,10 @@ func compileRPM(node *Node, svc *ServicesConfig) error {
 						test.DestPort = n
 					}
 				}
+			}
+
+			if test.ProbeLimit == 0 && defaultProbeLimit > 0 {
+				test.ProbeLimit = defaultProbeLimit
 			}
 
 			if err := validateRPMTest(probe.Name, test); err != nil {
