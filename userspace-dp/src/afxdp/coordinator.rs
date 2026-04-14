@@ -947,6 +947,33 @@ impl Coordinator {
         out
     }
 
+    pub fn filter_term_counters(&self) -> Vec<crate::protocol::FirewallFilterTermCounterStatus> {
+        let mut filter_keys = self
+            .forwarding
+            .filter_state
+            .filters
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        filter_keys.sort();
+        let mut out = Vec::new();
+        for key in filter_keys {
+            let Some(filter) = self.forwarding.filter_state.filters.get(&key) else {
+                continue;
+            };
+            for term in &filter.terms {
+                out.push(crate::protocol::FirewallFilterTermCounterStatus {
+                    family: filter.family.clone(),
+                    filter_name: filter.name.clone(),
+                    term_name: term.name.clone(),
+                    packets: term.counter.packets.load(Ordering::Relaxed),
+                    bytes: term.counter.bytes.load(Ordering::Relaxed),
+                });
+            }
+        }
+        out
+    }
+
     pub fn drain_session_deltas(&self, max: usize) -> Vec<SessionDeltaInfo> {
         let mut remaining = max.max(1);
         let mut out = Vec::new();

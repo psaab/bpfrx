@@ -921,7 +921,7 @@ pub(super) fn ingress_route_table_override(
     )
     .unwrap_or(meta.ingress_ifindex as i32);
     let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
-    let result = crate::filter::evaluate_interface_filter(
+    let result = crate::filter::evaluate_interface_filter_counted(
         &forwarding.filter_state,
         ingress_ifindex,
         is_v6,
@@ -931,6 +931,7 @@ pub(super) fn ingress_route_table_override(
         flow.forward_key.src_port,
         flow.forward_key.dst_port,
         meta.dscp,
+        meta.pkt_len as u64,
     );
     if result.routing_instance.is_empty() {
         return None;

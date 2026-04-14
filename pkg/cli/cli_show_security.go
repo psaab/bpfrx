@@ -11,6 +11,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/logging"
 )
@@ -1401,6 +1402,11 @@ func (c *CLI) showFirewallFilters() error {
 			filterIDs = cr.FilterIDs
 		}
 	}
+	var userspaceStatus *dpuserspace.ProcessStatus
+	if status, err := c.userspaceDataplaneStatus(); err == nil {
+		userspaceStatus = &status
+	}
+	userspaceCounters := dpuserspace.BuildFirewallFilterTermCounterIndex(userspaceStatus)
 
 	showFilters := func(family string, filters map[string]*config.FirewallFilter, names []string) {
 		for _, name := range names {
@@ -1487,47 +1493,25 @@ func (c *CLI) showFirewallFilters() error {
 				// Sum counters across all expanded BPF rules for this term.
 				// Must match the cross-product in expandFilterTerm:
 				// nSrc * nDst * nDstPorts * nSrcPorts
+				numRules := filterTermExpansionCount(cfg, term)
+				var totalPkts, totalBytes uint64
 				if hasCounters {
-					nSrc := len(term.SourceAddresses)
-					for _, ref := range term.SourcePrefixLists {
-						if !ref.Except {
-							if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
-								nSrc += len(pl.Prefixes)
-							}
-						}
-					}
-					if nSrc == 0 {
-						nSrc = 1
-					}
-					nDst := len(term.DestAddresses)
-					for _, ref := range term.DestPrefixLists {
-						if !ref.Except {
-							if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
-								nDst += len(pl.Prefixes)
-							}
-						}
-					}
-					if nDst == 0 {
-						nDst = 1
-					}
-					nDstPorts := len(term.DestinationPorts)
-					if nDstPorts == 0 {
-						nDstPorts = 1
-					}
-					nSrcPorts := len(term.SourcePorts)
-					if nSrcPorts == 0 {
-						nSrcPorts = 1
-					}
-					numRules := uint32(nSrc * nDst * nDstPorts * nSrcPorts)
-					var totalPkts, totalBytes uint64
 					for i := uint32(0); i < numRules; i++ {
 						if ctrs, err := c.dp.ReadFilterCounters(ruleOffset + i); err == nil {
 							totalPkts += ctrs.Packets
 							totalBytes += ctrs.Bytes
 						}
 					}
-					fmt.Printf("    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
 					ruleOffset += numRules
+				}
+				if counter, ok := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
+					Family: family, FilterName: name, TermName: term.Name,
+				}]; ok {
+					totalPkts += counter.Packets
+					totalBytes += counter.Bytes
+				}
+				if hasCounters || len(userspaceCounters) > 0 {
+					fmt.Printf("    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
 				}
 			}
 			fmt.Println()
@@ -1552,25 +1536,43 @@ func (c *CLI) showFirewallFilters() error {
 	return nil
 }
 
-func (c *CLI) showFirewallFilter(name string) error {
+func (c *CLI) showFirewallFilter(name, requestedFamily string) error {
 	cfg := c.store.ActiveConfig()
 	if cfg == nil {
 		fmt.Println("No active configuration")
 		return nil
 	}
 
-	// Find filter by name in both families
+	requestedFamily = strings.TrimSpace(requestedFamily)
+	if requestedFamily != "" && requestedFamily != "inet" && requestedFamily != "inet6" {
+		fmt.Printf("invalid family: %s\n", requestedFamily)
+		return nil
+	}
+
 	var filter *config.FirewallFilter
 	var family string
-	if f, ok := cfg.Firewall.FiltersInet[name]; ok {
-		filter = f
+	switch requestedFamily {
+	case "inet":
+		filter = cfg.Firewall.FiltersInet[name]
 		family = "inet"
-	} else if f, ok := cfg.Firewall.FiltersInet6[name]; ok {
-		filter = f
+	case "inet6":
+		filter = cfg.Firewall.FiltersInet6[name]
 		family = "inet6"
+	default:
+		if f, ok := cfg.Firewall.FiltersInet[name]; ok {
+			filter = f
+			family = "inet"
+		} else if f, ok := cfg.Firewall.FiltersInet6[name]; ok {
+			filter = f
+			family = "inet6"
+		}
 	}
 	if filter == nil {
-		fmt.Printf("Filter not found: %s\n", name)
+		if requestedFamily != "" {
+			fmt.Printf("Filter not found: %s (family %s)\n", name, requestedFamily)
+		} else {
+			fmt.Printf("Filter not found: %s\n", name)
+		}
 		return nil
 	}
 
@@ -1587,6 +1589,11 @@ func (c *CLI) showFirewallFilter(name string) error {
 			}
 		}
 	}
+	var userspaceStatus *dpuserspace.ProcessStatus
+	if status, err := c.userspaceDataplaneStatus(); err == nil {
+		userspaceStatus = &status
+	}
+	userspaceCounters := dpuserspace.BuildFirewallFilterTermCounterIndex(userspaceStatus)
 
 	fmt.Printf("Filter: %s (family %s)\n", name, family)
 
@@ -1656,51 +1663,63 @@ func (c *CLI) showFirewallFilter(name string) error {
 		fmt.Printf("    then %s\n", action)
 
 		// Sum counters across all expanded BPF rules for this term
+		numRules := filterTermExpansionCount(cfg, term)
+		var totalPkts, totalBytes uint64
 		if hasCounters {
-			nSrc := len(term.SourceAddresses)
-			for _, ref := range term.SourcePrefixLists {
-				if !ref.Except {
-					if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
-						nSrc += len(pl.Prefixes)
-					}
-				}
-			}
-			if nSrc == 0 {
-				nSrc = 1
-			}
-			nDst := len(term.DestAddresses)
-			for _, ref := range term.DestPrefixLists {
-				if !ref.Except {
-					if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
-						nDst += len(pl.Prefixes)
-					}
-				}
-			}
-			if nDst == 0 {
-				nDst = 1
-			}
-			nDstPorts := len(term.DestinationPorts)
-			if nDstPorts == 0 {
-				nDstPorts = 1
-			}
-			nSrcPorts := len(term.SourcePorts)
-			if nSrcPorts == 0 {
-				nSrcPorts = 1
-			}
-			numRules := uint32(nSrc * nDst * nDstPorts * nSrcPorts)
-			var totalPkts, totalBytes uint64
 			for i := uint32(0); i < numRules; i++ {
 				if ctrs, err := c.dp.ReadFilterCounters(ruleOffset + i); err == nil {
 					totalPkts += ctrs.Packets
 					totalBytes += ctrs.Bytes
 				}
 			}
-			fmt.Printf("    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
 			ruleOffset += numRules
+		}
+		if counter, ok := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
+			Family: family, FilterName: name, TermName: term.Name,
+		}]; ok {
+			totalPkts += counter.Packets
+			totalBytes += counter.Bytes
+		}
+		if hasCounters || len(userspaceCounters) > 0 {
+			fmt.Printf("    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
 		}
 	}
 	fmt.Println()
 	return nil
+}
+
+func filterTermExpansionCount(cfg *config.Config, term *config.FirewallFilterTerm) uint32 {
+	nSrc := len(term.SourceAddresses)
+	for _, ref := range term.SourcePrefixLists {
+		if !ref.Except {
+			if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+				nSrc += len(pl.Prefixes)
+			}
+		}
+	}
+	if nSrc == 0 {
+		nSrc = 1
+	}
+	nDst := len(term.DestAddresses)
+	for _, ref := range term.DestPrefixLists {
+		if !ref.Except {
+			if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+				nDst += len(pl.Prefixes)
+			}
+		}
+	}
+	if nDst == 0 {
+		nDst = 1
+	}
+	nDstPorts := len(term.DestinationPorts)
+	if nDstPorts == 0 {
+		nDstPorts = 1
+	}
+	nSrcPorts := len(term.SourcePorts)
+	if nSrcPorts == 0 {
+		nSrcPorts = 1
+	}
+	return uint32(nSrc * nDst * nDstPorts * nSrcPorts)
 }
 
 func (c *CLI) showDynamicAddress() error {

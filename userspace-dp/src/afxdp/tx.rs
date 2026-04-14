@@ -1060,7 +1060,7 @@ pub(super) fn resolve_cos_queue_id(
             .contains_key(&egress_ifindex)
     };
     let result = if has_output_filter {
-        crate::filter::evaluate_interface_output_filter(
+        crate::filter::evaluate_interface_output_filter_counted(
             &forwarding.filter_state,
             egress_ifindex,
             is_v6,
@@ -1070,6 +1070,7 @@ pub(super) fn resolve_cos_queue_id(
             flow_key.src_port,
             flow_key.dst_port,
             meta.dscp,
+            meta.pkt_len as u64,
         )
     } else {
         let ingress_ifindex = resolve_ingress_logical_ifindex(
@@ -1078,7 +1079,7 @@ pub(super) fn resolve_cos_queue_id(
             meta.ingress_vlan_id,
         )
         .unwrap_or(meta.ingress_ifindex as i32);
-        crate::filter::evaluate_interface_filter(
+        crate::filter::evaluate_interface_filter_counted(
             &forwarding.filter_state,
             ingress_ifindex,
             is_v6,
@@ -1088,6 +1089,7 @@ pub(super) fn resolve_cos_queue_id(
             flow_key.src_port,
             flow_key.dst_port,
             meta.dscp,
+            meta.pkt_len as u64,
         )
     };
     if !result.forwarding_class.is_empty() {

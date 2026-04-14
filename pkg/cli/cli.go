@@ -750,7 +750,11 @@ func (c *CLI) handleShow(args []string) error {
 
 	case "firewall":
 		if len(args) >= 3 && args[1] == "filter" {
-			return c.showFirewallFilter(args[2])
+			family := ""
+			if len(args) >= 5 && args[3] == "family" {
+				family = args[4]
+			}
+			return c.showFirewallFilter(args[2], family)
 		}
 		return c.showFirewallFilters()
 

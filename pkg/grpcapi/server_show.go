@@ -52,6 +52,40 @@ func writeRPMConfig(buf *strings.Builder, cfg *config.Config) {
 	}
 }
 
+func firewallFilterTermExpansionCount(cfg *config.Config, term *config.FirewallFilterTerm) uint32 {
+	nSrc := len(term.SourceAddresses)
+	for _, ref := range term.SourcePrefixLists {
+		if !ref.Except {
+			if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+				nSrc += len(pl.Prefixes)
+			}
+		}
+	}
+	if nSrc == 0 {
+		nSrc = 1
+	}
+	nDst := len(term.DestAddresses)
+	for _, ref := range term.DestPrefixLists {
+		if !ref.Except {
+			if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
+				nDst += len(pl.Prefixes)
+			}
+		}
+	}
+	if nDst == 0 {
+		nDst = 1
+	}
+	nDstPorts := len(term.DestinationPorts)
+	if nDstPorts == 0 {
+		nDstPorts = 1
+	}
+	nSrcPorts := len(term.SourcePorts)
+	if nSrcPorts == 0 {
+		nSrcPorts = 1
+	}
+	return uint32(nSrc * nDst * nDstPorts * nSrcPorts)
+}
+
 // --- Operational show RPCs ---
 
 func (s *Server) GetStatus(_ context.Context, _ *pb.GetStatusRequest) (*pb.GetStatusResponse, error) {
@@ -1768,22 +1802,49 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 	}
 
 	if strings.HasPrefix(req.Topic, "firewall-filter:") {
-		filterName := strings.TrimPrefix(req.Topic, "firewall-filter:")
+		filterTopic := strings.TrimPrefix(req.Topic, "firewall-filter:")
+		filterName := filterTopic
+		requestedFamily := ""
+		if idx := strings.LastIndex(filterTopic, ":"); idx > 0 {
+			filterName = filterTopic[:idx]
+			requestedFamily = filterTopic[idx+1:]
+		}
 		if cfg == nil {
 			buf.WriteString("No active configuration\n")
 		} else {
 			var filter *config.FirewallFilter
 			var family string
-			if f, ok := cfg.Firewall.FiltersInet[filterName]; ok {
-				filter = f
+			switch requestedFamily {
+			case "":
+				if f, ok := cfg.Firewall.FiltersInet[filterName]; ok {
+					filter = f
+					family = "inet"
+				} else if f, ok := cfg.Firewall.FiltersInet6[filterName]; ok {
+					filter = f
+					family = "inet6"
+				}
+			case "inet":
+				filter = cfg.Firewall.FiltersInet[filterName]
 				family = "inet"
-			} else if f, ok := cfg.Firewall.FiltersInet6[filterName]; ok {
-				filter = f
+			case "inet6":
+				filter = cfg.Firewall.FiltersInet6[filterName]
 				family = "inet6"
+			default:
+				fmt.Fprintf(&buf, "invalid family: %s\n", requestedFamily)
+				return &pb.ShowTextResponse{Output: buf.String()}, nil
 			}
 			if filter == nil {
-				fmt.Fprintf(&buf, "Filter not found: %s\n", filterName)
+				if requestedFamily != "" {
+					fmt.Fprintf(&buf, "Filter not found: %s (family %s)\n", filterName, requestedFamily)
+				} else {
+					fmt.Fprintf(&buf, "Filter not found: %s\n", filterName)
+				}
 			} else {
+				var userspaceStatus *dpuserspace.ProcessStatus
+				if status, err := s.userspaceDataplaneStatus(); err == nil {
+					userspaceStatus = &status
+				}
+				userspaceCounters := dpuserspace.BuildFirewallFilterTermCounterIndex(userspaceStatus)
 				var filterIDs map[string]uint32
 				if s.dp != nil && s.dp.IsLoaded() {
 					if cr := s.dp.LastCompileResult(); cr != nil {
@@ -1862,47 +1923,25 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 						action = "accept"
 					}
 					fmt.Fprintf(&buf, "    then %s\n", action)
+					numRules := firewallFilterTermExpansionCount(cfg, term)
+					var totalPkts, totalBytes uint64
 					if hasCounters {
-						nSrc := len(term.SourceAddresses)
-						for _, ref := range term.SourcePrefixLists {
-							if !ref.Except {
-								if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
-									nSrc += len(pl.Prefixes)
-								}
-							}
-						}
-						if nSrc == 0 {
-							nSrc = 1
-						}
-						nDst := len(term.DestAddresses)
-						for _, ref := range term.DestPrefixLists {
-							if !ref.Except {
-								if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
-									nDst += len(pl.Prefixes)
-								}
-							}
-						}
-						if nDst == 0 {
-							nDst = 1
-						}
-						nDstPorts := len(term.DestinationPorts)
-						if nDstPorts == 0 {
-							nDstPorts = 1
-						}
-						nSrcPorts := len(term.SourcePorts)
-						if nSrcPorts == 0 {
-							nSrcPorts = 1
-						}
-						numRules := uint32(nSrc * nDst * nDstPorts * nSrcPorts)
-						var totalPkts, totalBytes uint64
 						for i := uint32(0); i < numRules; i++ {
 							if ctrs, err := s.dp.ReadFilterCounters(ruleOffset + i); err == nil {
 								totalPkts += ctrs.Packets
 								totalBytes += ctrs.Bytes
 							}
 						}
-						fmt.Fprintf(&buf, "    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
 						ruleOffset += numRules
+					}
+					if counter, ok := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
+						Family: family, FilterName: filterName, TermName: term.Name,
+					}]; ok {
+						totalPkts += counter.Packets
+						totalBytes += counter.Bytes
+					}
+					if hasCounters || len(userspaceCounters) > 0 {
+						fmt.Fprintf(&buf, "    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
 					}
 				}
 				buf.WriteString("\n")
@@ -2384,6 +2423,11 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 		if !hasFilters {
 			buf.WriteString("No firewall filters configured\n")
 		} else {
+			var userspaceStatus *dpuserspace.ProcessStatus
+			if status, err := s.userspaceDataplaneStatus(); err == nil {
+				userspaceStatus = &status
+			}
+			userspaceCounters := dpuserspace.BuildFirewallFilterTermCounterIndex(userspaceStatus)
 			// Resolve filter IDs for counter display
 			var filterIDs map[string]uint32
 			if s.dp != nil && s.dp.IsLoaded() {
@@ -2476,48 +2520,25 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 						}
 						fmt.Fprintf(&buf, "    then %s\n", action)
 
-						// Sum counters across all expanded BPF rules for this term
+						numRules := firewallFilterTermExpansionCount(cfg, term)
+						var totalPkts, totalBytes uint64
 						if hasCounters {
-							nSrc := len(term.SourceAddresses)
-							for _, ref := range term.SourcePrefixLists {
-								if !ref.Except {
-									if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
-										nSrc += len(pl.Prefixes)
-									}
-								}
-							}
-							if nSrc == 0 {
-								nSrc = 1
-							}
-							nDst := len(term.DestAddresses)
-							for _, ref := range term.DestPrefixLists {
-								if !ref.Except {
-									if pl, ok := cfg.PolicyOptions.PrefixLists[ref.Name]; ok {
-										nDst += len(pl.Prefixes)
-									}
-								}
-							}
-							if nDst == 0 {
-								nDst = 1
-							}
-							nDstPorts := len(term.DestinationPorts)
-							if nDstPorts == 0 {
-								nDstPorts = 1
-							}
-							nSrcPorts := len(term.SourcePorts)
-							if nSrcPorts == 0 {
-								nSrcPorts = 1
-							}
-							numRules := uint32(nSrc * nDst * nDstPorts * nSrcPorts)
-							var totalPkts, totalBytes uint64
 							for i := uint32(0); i < numRules; i++ {
 								if ctrs, err := s.dp.ReadFilterCounters(ruleOffset + i); err == nil {
 									totalPkts += ctrs.Packets
 									totalBytes += ctrs.Bytes
 								}
 							}
-							fmt.Fprintf(&buf, "    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
 							ruleOffset += numRules
+						}
+						if counter, ok := userspaceCounters[dpuserspace.FirewallFilterTermCounterKey{
+							Family: family, FilterName: name, TermName: term.Name,
+						}]; ok {
+							totalPkts += counter.Packets
+							totalBytes += counter.Bytes
+						}
+						if hasCounters || len(userspaceCounters) > 0 {
+							fmt.Fprintf(&buf, "    Hit count: %d packets, %d bytes\n", totalPkts, totalBytes)
 						}
 					}
 					buf.WriteString("\n")

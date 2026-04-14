@@ -671,6 +671,8 @@ pub(crate) struct ProcessStatus {
     pub recent_exceptions: Vec<ExceptionStatus>,
     #[serde(rename = "cos_interfaces", default)]
     pub cos_interfaces: Vec<CoSInterfaceStatus>,
+    #[serde(rename = "filter_term_counters", default)]
+    pub filter_term_counters: Vec<FirewallFilterTermCounterStatus>,
     #[serde(rename = "last_resolution", skip_serializing_if = "Option::is_none")]
     pub last_resolution: Option<PacketResolution>,
     #[serde(rename = "slow_path", default)]
@@ -762,6 +764,20 @@ pub(crate) struct CoSQueueStatus {
     pub next_wakeup_tick: u64,
     #[serde(rename = "surplus_deficit_bytes", default)]
     pub surplus_deficit_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct FirewallFilterTermCounterStatus {
+    #[serde(default)]
+    pub family: String,
+    #[serde(rename = "filter_name", default)]
+    pub filter_name: String,
+    #[serde(rename = "term_name", default)]
+    pub term_name: String,
+    #[serde(default)]
+    pub packets: u64,
+    #[serde(default)]
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

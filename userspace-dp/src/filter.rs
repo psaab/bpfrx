@@ -12,6 +12,7 @@ use crate::prefix::{PrefixV4, PrefixV6};
 use ipnet::IpNet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -52,6 +53,7 @@ pub(crate) struct FilterTerm {
     pub(crate) routing_instance: String,
     pub(crate) forwarding_class: Arc<str>,
     pub(crate) dscp_rewrite: Option<u8>,
+    pub(crate) counter: Arc<FilterTermCounter>,
 }
 
 /// Inclusive port range.
@@ -68,6 +70,19 @@ pub(crate) struct Filter {
     pub(crate) name: String,
     pub(crate) family: String,
     pub(crate) terms: Vec<FilterTerm>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct FilterTermCounter {
+    pub(crate) packets: AtomicU64,
+    pub(crate) bytes: AtomicU64,
+}
+
+impl FilterTermCounter {
+    fn record(&self, packet_bytes: u64) {
+        self.packets.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(packet_bytes, Ordering::Relaxed);
+    }
 }
 
 /// Token-bucket policer state.
@@ -192,6 +207,22 @@ pub(crate) fn evaluate_filter(
     dst_port: u16,
     dscp: u8,
 ) -> FilterResult {
+    evaluate_filter_counted(
+        state, filter_key, src_ip, dst_ip, protocol, src_port, dst_port, dscp, 0,
+    )
+}
+
+pub(crate) fn evaluate_filter_counted(
+    state: &FilterState,
+    filter_key: &str,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> FilterResult {
     let Some(filter) = state.filters.get(filter_key) else {
         return FilterResult::default();
     };
@@ -199,6 +230,7 @@ pub(crate) fn evaluate_filter(
         if !term_matches(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
             continue;
         }
+        term.counter.record(packet_bytes);
         return FilterResult {
             action: term.action.clone(),
             dscp_rewrite: term.dscp_rewrite,
@@ -224,6 +256,22 @@ pub(crate) fn evaluate_lo0_filter(
     dst_port: u16,
     dscp: u8,
 ) -> FilterResult {
+    evaluate_lo0_filter_counted(
+        state, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, 0,
+    )
+}
+
+pub(crate) fn evaluate_lo0_filter_counted(
+    state: &FilterState,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> FilterResult {
     let filter_name = if is_v6 {
         &state.lo0_filter_v6
     } else {
@@ -234,8 +282,16 @@ pub(crate) fn evaluate_lo0_filter(
     }
     let family = if is_v6 { "inet6" } else { "inet" };
     let key = format!("{family}:{filter_name}");
-    evaluate_filter(
-        state, &key, src_ip, dst_ip, protocol, src_port, dst_port, dscp,
+    evaluate_filter_counted(
+        state,
+        &key,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        packet_bytes,
     )
 }
 
@@ -251,6 +307,23 @@ pub(crate) fn evaluate_interface_filter(
     dst_port: u16,
     dscp: u8,
 ) -> FilterResult {
+    evaluate_interface_filter_counted(
+        state, ifindex, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, 0,
+    )
+}
+
+pub(crate) fn evaluate_interface_filter_counted(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> FilterResult {
     let filter_name = if is_v6 {
         state.iface_filter_v6.get(&ifindex)
     } else {
@@ -264,8 +337,16 @@ pub(crate) fn evaluate_interface_filter(
     }
     let family = if is_v6 { "inet6" } else { "inet" };
     let key = format!("{family}:{filter_name}");
-    evaluate_filter(
-        state, &key, src_ip, dst_ip, protocol, src_port, dst_port, dscp,
+    evaluate_filter_counted(
+        state,
+        &key,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        packet_bytes,
     )
 }
 
@@ -281,6 +362,23 @@ pub(crate) fn evaluate_interface_output_filter(
     dst_port: u16,
     dscp: u8,
 ) -> FilterResult {
+    evaluate_interface_output_filter_counted(
+        state, ifindex, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, 0,
+    )
+}
+
+pub(crate) fn evaluate_interface_output_filter_counted(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    protocol: u8,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    packet_bytes: u64,
+) -> FilterResult {
     let filter_name = if is_v6 {
         state.iface_filter_out_v6.get(&ifindex)
     } else {
@@ -294,8 +392,16 @@ pub(crate) fn evaluate_interface_output_filter(
     }
     let family = if is_v6 { "inet6" } else { "inet" };
     let key = format!("{family}:{filter_name}");
-    evaluate_filter(
-        state, &key, src_ip, dst_ip, protocol, src_port, dst_port, dscp,
+    evaluate_filter_counted(
+        state,
+        &key,
+        src_ip,
+        dst_ip,
+        protocol,
+        src_port,
+        dst_port,
+        dscp,
+        packet_bytes,
     )
 }
 
@@ -489,6 +595,7 @@ fn parse_term(snap: &FirewallTermSnapshot) -> FilterTerm {
         routing_instance: snap.routing_instance.clone(),
         forwarding_class: Arc::<str>::from(snap.forwarding_class.as_str()),
         dscp_rewrite,
+        counter: Arc::new(FilterTermCounter::default()),
     }
 }
 
@@ -1043,6 +1150,54 @@ mod tests {
             0,
         );
         assert_eq!(result.forwarding_class.as_ref(), "bandwidth-10mb");
+    }
+
+    #[test]
+    fn interface_output_filter_counted_records_term_hits() {
+        let ifaces = vec![crate::InterfaceSnapshot {
+            name: "reth0.80".into(),
+            ifindex: 7,
+            filter_output_v6: "bandwidth-output".into(),
+            ..Default::default()
+        }];
+        let state = parse_filter_state(
+            &[FirewallFilterSnapshot {
+                name: "bandwidth-output".into(),
+                family: "inet6".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "iperf-a".into(),
+                    action: "accept".into(),
+                    forwarding_class: "iperf-a".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["5201".into()],
+                    ..Default::default()
+                }],
+            }],
+            &[],
+            &ifaces,
+            "",
+            "",
+        );
+        let result = evaluate_interface_output_filter_counted(
+            &state,
+            7,
+            true,
+            IpAddr::V6("2001:db8::10".parse().unwrap()),
+            IpAddr::V6("2001:db8::200".parse().unwrap()),
+            PROTO_TCP,
+            40000,
+            5201,
+            0,
+            1514,
+        );
+        assert_eq!(result.forwarding_class.as_ref(), "iperf-a");
+        let filter = state
+            .filters
+            .get("inet6:bandwidth-output")
+            .expect("inet6 output filter");
+        let term = filter.terms.first().expect("first term");
+        assert_eq!(term.counter.packets.load(Ordering::Relaxed), 1);
+        assert_eq!(term.counter.bytes.load(Ordering::Relaxed), 1514);
     }
 
     #[test]
