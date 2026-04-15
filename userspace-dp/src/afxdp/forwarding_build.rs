@@ -170,6 +170,15 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
         } else {
             iface.ifindex
         };
+        let ingress_key = (bind_ifindex, iface.vlan_id.max(0) as u16);
+        if iface.parent_ifindex > 0 {
+            state.ingress_logical_ifindex.insert(ingress_key, iface.ifindex);
+        } else {
+            state
+                .ingress_logical_ifindex
+                .entry(ingress_key)
+                .or_insert(iface.ifindex);
+        }
         let src_mac = match parse_mac(&iface.hardware_addr)
             .or_else(|| mac_by_ifindex.get(&bind_ifindex).copied())
             .or_else(|| iface.tunnel.then_some([0; 6]))
@@ -587,7 +596,9 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                 surplus_weight: 1,
                 buffer_bytes: burst_bytes,
                 dscp_rewrite: dscp_rewrite_rule
-                    .and_then(|rewrite_rule| rewrite_rule.dscp_by_forwarding_class.get("best-effort"))
+                    .and_then(|rewrite_rule| {
+                        rewrite_rule.dscp_by_forwarding_class.get("best-effort")
+                    })
                     .copied(),
             });
         }
@@ -906,7 +917,14 @@ mod tests {
         let iface = state.interfaces.get(&42).expect("missing CoS interface");
         assert_eq!(iface.dscp_classifier, "wan-classifier");
         assert_eq!(iface.ieee8021_classifier, "wan-pcp");
-        assert_eq!(iface.queues.iter().find(|queue| queue.queue_id == 5).and_then(|queue| queue.dscp_rewrite), Some(46));
+        assert_eq!(
+            iface
+                .queues
+                .iter()
+                .find(|queue| queue.queue_id == 5)
+                .and_then(|queue| queue.dscp_rewrite),
+            Some(46)
+        );
         assert!(iface.queues.iter().any(|queue| queue.queue_id == 5));
         let classifier = state
             .dscp_classifiers
@@ -919,6 +937,32 @@ mod tests {
             .get("wan-pcp")
             .expect("missing 802.1p classifier");
         assert_eq!(pcp_classifier.queue_by_pcp.get(&5), Some(&5));
+    }
+
+    #[test]
+    fn build_forwarding_state_prefers_logical_unit_for_ingress_lookup() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "ge-0-0-1".into(),
+                    ifindex: 10,
+                    hardware_addr: "02:00:00:00:00:10".into(),
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "ge-0-0-1.0".into(),
+                    ifindex: 11,
+                    parent_ifindex: 10,
+                    vlan_id: 0,
+                    hardware_addr: "02:00:00:00:00:10".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let state = build_forwarding_state(&snapshot);
+        assert_eq!(state.ingress_logical_ifindex.get(&(10, 0)), Some(&11));
     }
 }
 

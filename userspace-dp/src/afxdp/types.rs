@@ -82,6 +82,15 @@ pub(super) struct UserspaceDpMeta {
     pub(super) reserved2: u32,
 }
 
+const _: [(); 96] = [(); std::mem::size_of::<UserspaceDpMeta>()];
+const _: [(); 18] = [(); std::mem::offset_of!(UserspaceDpMeta, ingress_pcp)];
+const _: [(); 19] = [(); std::mem::offset_of!(UserspaceDpMeta, ingress_vlan_present)];
+const _: [(); 20] = [(); std::mem::offset_of!(UserspaceDpMeta, ingress_zone)];
+const _: [(); 24] = [(); std::mem::offset_of!(UserspaceDpMeta, routing_table)];
+const _: [(); 36] = [(); std::mem::offset_of!(UserspaceDpMeta, addr_family)];
+const _: [(); 40] = [(); std::mem::offset_of!(UserspaceDpMeta, dscp)];
+const _: [(); 80] = [(); std::mem::offset_of!(UserspaceDpMeta, config_generation)];
+
 #[repr(C)]
 pub(super) struct XdpOptions {
     pub(super) flags: u32,
@@ -149,6 +158,7 @@ pub(super) struct ForwardingState {
     pub(super) zone_name_to_id: FastMap<String, u16>,
     pub(super) zone_id_to_name: FastMap<u16, String>,
     pub(super) egress: FastMap<i32, EgressInterface>,
+    pub(super) ingress_logical_ifindex: FastMap<(i32, u16), i32>,
     pub(super) fabrics: Vec<FabricLink>,
     pub(super) allow_dns_reply: bool,
     pub(super) allow_embedded_icmp: bool,
@@ -595,7 +605,6 @@ pub(super) struct CoSInterfaceRuntime {
     pub(super) shaping_rate_bytes: u64,
     pub(super) burst_bytes: u64,
     pub(super) tokens: u64,
-    pub(super) last_refill_ns: u64,
     pub(super) default_queue: u8,
     pub(super) nonempty_queues: usize,
     pub(super) runnable_queues: usize,
@@ -630,6 +639,153 @@ pub(super) struct CoSTimerWheelRuntime {
     pub(super) current_tick: u64,
     pub(super) level0: [Vec<usize>; COS_TIMER_WHEEL_L0_SLOTS],
     pub(super) level1: [Vec<usize>; COS_TIMER_WHEEL_L1_SLOTS],
+}
+
+#[repr(align(64))]
+pub(super) struct SharedCoSRootLease {
+    config: SharedCoSRootLeaseConfig,
+    state: Mutex<SharedCoSRootLeaseState>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SharedCoSRootLeaseConfig {
+    shaping_rate_bytes: u64,
+    burst_bytes: u64,
+    lease_bytes: u64,
+    max_total_leased: u64,
+    active_shards: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SharedCoSRootLeaseState {
+    available_tokens: u64,
+    outstanding_leased_tokens: u64,
+    last_refill_ns: u64,
+}
+
+const COS_ROOT_LEASE_TARGET_US: u64 = 25;
+const COS_ROOT_LEASE_MIN_BYTES: u64 = 1500;
+const COS_ROOT_LEASE_MAX_BYTES: u64 = 64 * 1024;
+
+impl SharedCoSRootLease {
+    fn compute_config(
+        shaping_rate_bytes: u64,
+        burst_bytes: u64,
+        active_shards: usize,
+    ) -> SharedCoSRootLeaseConfig {
+        let burst_bytes = burst_bytes.max(COS_ROOT_LEASE_MIN_BYTES);
+        let active_shards = active_shards.max(1);
+        let target_lease_bytes = ((shaping_rate_bytes as u128) * (COS_ROOT_LEASE_TARGET_US as u128)
+            / 1_000_000u128) as u64;
+        let lease_ceiling = burst_bytes
+            .saturating_div(8)
+            .min(COS_ROOT_LEASE_MAX_BYTES)
+            .max(COS_ROOT_LEASE_MIN_BYTES);
+        let lease_bytes = target_lease_bytes
+            .max(COS_ROOT_LEASE_MIN_BYTES)
+            .min(lease_ceiling);
+        let max_frame_lease_bytes = lease_bytes.max(tx_frame_capacity() as u64);
+        let max_total_leased = burst_bytes
+            .saturating_div(4)
+            .min(max_frame_lease_bytes.saturating_mul(active_shards as u64));
+        SharedCoSRootLeaseConfig {
+            shaping_rate_bytes,
+            burst_bytes,
+            lease_bytes,
+            max_total_leased,
+            active_shards,
+        }
+    }
+
+    pub(super) fn new(shaping_rate_bytes: u64, burst_bytes: u64, active_shards: usize) -> Self {
+        let config = Self::compute_config(shaping_rate_bytes, burst_bytes, active_shards);
+        Self {
+            config,
+            state: Mutex::new(SharedCoSRootLeaseState {
+                available_tokens: config.burst_bytes,
+                outstanding_leased_tokens: 0,
+                last_refill_ns: 0,
+            }),
+        }
+    }
+
+    pub(super) fn lease_bytes(&self) -> u64 {
+        self.config.lease_bytes
+    }
+
+    pub(super) fn matches_config(
+        &self,
+        shaping_rate_bytes: u64,
+        burst_bytes: u64,
+        active_shards: usize,
+    ) -> bool {
+        self.config == Self::compute_config(shaping_rate_bytes, burst_bytes, active_shards)
+    }
+
+    pub(super) fn acquire(&self, now_ns: u64, requested: u64) -> u64 {
+        let Ok(mut state) = self.state.lock() else {
+            return 0;
+        };
+        self.refill_locked(&mut state, now_ns);
+        let lease_headroom = self
+            .config
+            .max_total_leased
+            .saturating_sub(state.outstanding_leased_tokens);
+        if lease_headroom == 0 || state.available_tokens == 0 {
+            return 0;
+        }
+        let granted = requested.min(state.available_tokens).min(lease_headroom);
+        state.available_tokens = state.available_tokens.saturating_sub(granted);
+        state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_add(granted);
+        granted
+    }
+
+    pub(super) fn consume(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_sub(bytes);
+        }
+    }
+
+    pub(super) fn release_unused(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        if let Ok(mut state) = self.state.lock() {
+            state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_sub(bytes);
+            state.available_tokens = state
+                .available_tokens
+                .saturating_add(bytes)
+                .min(self.config.burst_bytes);
+        }
+    }
+
+    fn refill_locked(&self, state: &mut SharedCoSRootLeaseState, now_ns: u64) {
+        if self.config.burst_bytes == 0 {
+            return;
+        }
+        if state.last_refill_ns == 0 {
+            state.available_tokens = self.config.burst_bytes;
+            state.last_refill_ns = now_ns;
+            return;
+        }
+        if now_ns <= state.last_refill_ns || self.config.shaping_rate_bytes == 0 {
+            return;
+        }
+        let elapsed_ns = now_ns - state.last_refill_ns;
+        let added = ((elapsed_ns as u128) * (self.config.shaping_rate_bytes as u128)
+            / 1_000_000_000u128) as u64;
+        if added == 0 {
+            return;
+        }
+        state.available_tokens = state
+            .available_tokens
+            .saturating_add(added)
+            .min(self.config.burst_bytes);
+        state.last_refill_ns = now_ns;
+    }
 }
 
 pub(super) enum CoSPendingTxItem {

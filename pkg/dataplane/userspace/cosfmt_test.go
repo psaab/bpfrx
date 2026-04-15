@@ -93,6 +93,7 @@ func TestFormatCoSInterfaceSummaryIncludesRuntimeQueueState(t *testing.T) {
 				Queues: []CoSQueueStatus{
 					{
 						QueueID:             4,
+						OwnerWorkerID:       &owner,
 						ForwardingClass:     "bandwidth-10mb",
 						Priority:            1,
 						Exact:               true,
@@ -115,7 +116,7 @@ func TestFormatCoSInterfaceSummaryIncludesRuntimeQueueState(t *testing.T) {
 		"Runtime workers:          2",
 		"Runtime queues:           nonempty=1 runnable=1",
 		"Timer wheel sleepers:     level0=1 level1=0",
-		"Queue  Class           Priority",
+		"Queue  Owner  Class",
 		"bandwidth-10mb",
 	} {
 		if !strings.Contains(out, want) {

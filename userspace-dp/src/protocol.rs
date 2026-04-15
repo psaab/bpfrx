@@ -782,6 +782,12 @@ pub(crate) struct CoSInterfaceStatus {
 pub(crate) struct CoSQueueStatus {
     #[serde(rename = "queue_id", default)]
     pub queue_id: u8,
+    #[serde(
+        rename = "owner_worker_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub owner_worker_id: Option<u32>,
     #[serde(rename = "forwarding_class", default)]
     pub forwarding_class: String,
     #[serde(default)]

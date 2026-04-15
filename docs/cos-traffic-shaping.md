@@ -931,7 +931,9 @@ implemented and exercised in the userspace dataplane:
   non-`exact` surplus borrowing
 - timer-wheel deferred eligibility for backlogged-but-ineligible queues
 - static owner-worker handoff for shaped egress interfaces
-- deterministic owner spreading across eligible workers on a shared TX path
+- deterministic queue-owner spreading across eligible workers on a shared TX
+  path
+- shared-root budget leasing across owner workers on the same shaped interface
 - base interface/runtime observability via
   `show class-of-service interface [IFACE[.UNIT]]`
 
@@ -944,7 +946,8 @@ The following pieces are still not complete:
 - fuller Junos scheduler semantics beyond the current transmit-rate/priority/
   buffer-size slice
 - detailed reservation/container/shard observability and metrics
-- shared-budget leasing and more advanced many-core ownership
+- more advanced dynamic many-core ownership and leasing beyond the current
+  static queue-owner model
 
 ## Implementation Plan
 
@@ -956,7 +959,8 @@ Status: implemented in the current userspace baseline.
 - one reservation per class
 - one FIFO container per reservation
 - no bypass for generated packets on shaped interfaces
-- valid implementation may use one scheduler owner per interface
+- valid baseline may start with one scheduler owner per interface before the
+  later Phase 4 queue-ownership and leasing work
 - runnable reservation lists only
 - acceptable without a timer wheel because the reservation count per interface
   is still small enough to scan directly in the baseline implementation
@@ -988,15 +992,16 @@ still broader future CoS work, not a gap in the current userspace slice.
 
 ### Phase 4: Many-Core Ownership and Leasing
 
-Status: partially implemented in userspace. Static owner-worker handoff and
-deterministic owner spreading are landed. Shared-budget leasing is still future
-work.
+Status: implemented for the current userspace slice. Queue ownership is spread
+deterministically across eligible workers on the same TX path, packets are
+handed to the owning worker before CoS enqueue, and shaped root budgets are
+shared through worker-local leases.
 
 - static reservation/container ownership by scheduler shard
-- first userspace slice is implemented as one owner worker per shaped egress
-  interface with cross-worker handoff before CoS enqueue
-- static ownership is now spread deterministically across eligible workers for
-  multiple shaped egress interfaces on the same TX path
+- first userspace slice is implemented as queue ownership on shaped egress
+  interfaces, with cross-worker handoff before CoS enqueue
+- ownership is spread deterministically across eligible workers for queues on
+  the same shaped egress TX path
 - internal enqueue to the owning shard
 - shared parent budgets plus shard-local leases
 - cache-line isolation for shared pools

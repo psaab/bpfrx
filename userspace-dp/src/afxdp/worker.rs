@@ -18,6 +18,7 @@ pub(crate) struct BindingWorker {
     pub(crate) pending_tx_local: VecDeque<TxRequest>,
     pub(crate) max_pending_tx: usize,
     pub(crate) cos_owner_live_by_tx_ifindex: BTreeMap<i32, Arc<BindingLiveState>>,
+    pub(crate) cos_shared_root_leases: BTreeMap<i32, Arc<SharedCoSRootLease>>,
     pub(crate) cos_interfaces: FastMap<i32, CoSInterfaceRuntime>,
     pub(crate) cos_interface_order: Vec<i32>,
     pub(crate) cos_interface_rr: usize,
@@ -293,6 +294,7 @@ impl BindingWorker {
             pending_tx_local: VecDeque::new(),
             max_pending_tx,
             cos_owner_live_by_tx_ifindex: BTreeMap::new(),
+            cos_shared_root_leases: BTreeMap::new(),
             cos_interfaces: FastMap::default(),
             cos_interface_order: Vec::new(),
             cos_interface_rr: 0,
@@ -402,7 +404,8 @@ pub(crate) fn worker_loop(
     shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
     event_stream: Option<crate::event_stream::EventStreamWorkerHandle>,
     rg_epochs: Arc<[AtomicU32; MAX_RG_EPOCHS]>,
-    shared_cos_owner_worker_by_ifindex: Arc<ArcSwap<BTreeMap<i32, u32>>>,
+    shared_cos_owner_worker_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), u32>>>,
+    shared_cos_root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
     cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
 ) {
     pin_current_thread(worker_id);
@@ -411,7 +414,8 @@ pub(crate) fn worker_loop(
         (monotonic_nanos() / 1_000_000_000).saturating_add(TUNNEL_HA_STARTUP_GRACE_SECS);
     let mut validation = **shared_validation.load();
     let mut forwarding = shared_forwarding.load_full();
-    let mut cos_owner_worker_by_ifindex = shared_cos_owner_worker_by_ifindex.load_full();
+    let mut cos_owner_worker_by_queue = shared_cos_owner_worker_by_queue.load_full();
+    let mut cos_shared_root_leases = shared_cos_root_leases.load_full();
     let mut sessions = SessionTable::new();
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
@@ -457,6 +461,7 @@ pub(crate) fn worker_loop(
     );
     for binding in bindings.iter_mut() {
         binding.cos_owner_live_by_tx_ifindex = cos_owner_live_by_tx_ifindex.clone();
+        binding.cos_shared_root_leases = cos_shared_root_leases.as_ref().clone();
     }
     let mut interrupt_poll_fds = if poll_mode == crate::PollMode::Interrupt {
         bindings
@@ -598,12 +603,19 @@ pub(crate) fn worker_loop(
             screen_state.update_profiles(forwarding.screen_profiles.clone());
             sessions.set_timeouts(forwarding.session_timeouts);
         }
-        let live_cos_owner_worker_by_ifindex = shared_cos_owner_worker_by_ifindex.load_full();
-        if !Arc::ptr_eq(
-            &cos_owner_worker_by_ifindex,
-            &live_cos_owner_worker_by_ifindex,
-        ) {
-            cos_owner_worker_by_ifindex = live_cos_owner_worker_by_ifindex;
+        let live_cos_owner_worker_by_queue = shared_cos_owner_worker_by_queue.load_full();
+        if !Arc::ptr_eq(&cos_owner_worker_by_queue, &live_cos_owner_worker_by_queue) {
+            cos_owner_worker_by_queue = live_cos_owner_worker_by_queue;
+        }
+        let live_cos_shared_root_leases = shared_cos_root_leases.load_full();
+        if !Arc::ptr_eq(&cos_shared_root_leases, &live_cos_shared_root_leases) {
+            for binding in bindings.iter_mut() {
+                release_all_cos_root_leases(binding);
+            }
+            cos_shared_root_leases = live_cos_shared_root_leases;
+            for binding in bindings.iter_mut() {
+                binding.cos_shared_root_leases = cos_shared_root_leases.as_ref().clone();
+            }
         }
         let ha_runtime = ha_state.load();
         // Only apply commands when pending — avoids lock overhead on
@@ -744,7 +756,7 @@ pub(crate) fn worker_loop(
                 conntrack_v6_fd,
                 &mut dbg_poll,
                 &rg_epochs,
-                cos_owner_worker_by_ifindex.as_ref(),
+                cos_owner_worker_by_queue.as_ref(),
             ) {
                 did_work = true;
             }
@@ -1321,6 +1333,9 @@ pub(crate) fn worker_loop(
             }
         }
     }
+    for binding in bindings.iter_mut() {
+        release_all_cos_root_leases(binding);
+    }
     cos_status.store(Arc::new(build_worker_cos_statuses(
         &bindings,
         forwarding.as_ref(),
@@ -1539,7 +1554,6 @@ mod tests {
             shaping_rate_bytes: 1_875_000,
             burst_bytes: 64 * 1024,
             tokens: 0,
-            last_refill_ns: 0,
             default_queue: 0,
             nonempty_queues: 1,
             runnable_queues: usize::from(runnable),

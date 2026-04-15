@@ -397,13 +397,10 @@ pub(super) fn resolve_ingress_logical_ifindex(
     ingress_ifindex: i32,
     ingress_vlan_id: u16,
 ) -> Option<i32> {
-    forwarding.egress.iter().find_map(|(ifindex, iface)| {
-        if iface.bind_ifindex == ingress_ifindex && iface.vlan_id == ingress_vlan_id {
-            Some(*ifindex)
-        } else {
-            None
-        }
-    })
+    forwarding
+        .ingress_logical_ifindex
+        .get(&(ingress_ifindex, ingress_vlan_id))
+        .copied()
 }
 
 pub(super) fn enforce_ha_resolution(

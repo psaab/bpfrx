@@ -580,10 +580,7 @@ fn process_control_frames(
                 handle_drain_request(target_seq, rx, stream, shared, replay_buf);
             }
             _ => {
-                eprintln!(
-                    "xpf-event-stream: unknown control frame type {}",
-                    msg_type
-                );
+                eprintln!("xpf-event-stream: unknown control frame type {}", msg_type);
             }
         }
     }

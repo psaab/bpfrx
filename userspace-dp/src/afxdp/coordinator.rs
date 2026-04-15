@@ -15,7 +15,8 @@ pub struct Coordinator {
     pub(crate) ha_state: Arc<ArcSwap<BTreeMap<i32, HAGroupRuntime>>>,
     pub(crate) shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
     pub(crate) shared_forwarding: Arc<ArcSwap<ForwardingState>>,
-    pub(crate) shared_cos_owner_worker_by_ifindex: Arc<ArcSwap<BTreeMap<i32, u32>>>,
+    pub(crate) shared_cos_owner_worker_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), u32>>>,
+    pub(crate) shared_cos_root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     pub(crate) neighbor_generation: Arc<AtomicU64>,
@@ -40,7 +41,7 @@ pub struct Coordinator {
     pub(crate) last_reconcile_stage: String,
     pub(crate) poll_mode: crate::PollMode,
     pub(crate) event_stream: Option<crate::event_stream::EventStreamSender>,
-    pub(crate) cos_owner_worker_by_ifindex: BTreeMap<i32, u32>,
+    pub(crate) cos_owner_worker_by_queue: BTreeMap<(i32, u8), u32>,
     /// Monotonic timestamp (secs) of the last HA flow cache flush (#312).
     pub(crate) last_cache_flush_at: Arc<AtomicU64>,
     /// Per-RG epoch counters for O(1) flow cache invalidation on demotion.
@@ -65,7 +66,8 @@ impl Coordinator {
             ha_state: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_fabrics: Arc::new(ArcSwap::from_pointee(Vec::new())),
             shared_forwarding: Arc::new(ArcSwap::from_pointee(ForwardingState::default())),
-            shared_cos_owner_worker_by_ifindex: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
+            shared_cos_owner_worker_by_queue: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
+            shared_cos_root_leases: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
             neighbor_generation: Arc::new(AtomicU64::new(0)),
@@ -92,7 +94,7 @@ impl Coordinator {
             last_reconcile_stage: "idle".to_string(),
             poll_mode: crate::PollMode::BusyPoll,
             event_stream: None,
-            cos_owner_worker_by_ifindex: BTreeMap::new(),
+            cos_owner_worker_by_queue: BTreeMap::new(),
             last_cache_flush_at: Arc::new(AtomicU64::new(0)),
             rg_epochs: Arc::new(std::array::from_fn(|_| AtomicU32::new(0))),
         }
@@ -230,9 +232,10 @@ impl Coordinator {
         self.workers.clear();
         self.identities.clear();
         self.live.clear();
-        self.cos_owner_worker_by_ifindex.clear();
-        self.shared_cos_owner_worker_by_ifindex
+        self.cos_owner_worker_by_queue.clear();
+        self.shared_cos_owner_worker_by_queue
             .store(Arc::new(BTreeMap::new()));
+        self.shared_cos_root_leases.store(Arc::new(BTreeMap::new()));
         self.last_slow_path_status = self
             .slow_path
             .as_ref()
@@ -580,13 +583,7 @@ impl Coordinator {
         self.conntrack_v6_fd = conntrack_v6_fd;
         self.dnat_table_fd = dnat_table_fd;
         self.dnat_table_v6_fd = dnat_table_v6_fd;
-        let cos_owner_worker_by_ifindex = Arc::new(build_cos_owner_worker_by_ifindex(
-            &self.forwarding,
-            &workers,
-        ));
-        self.cos_owner_worker_by_ifindex = cos_owner_worker_by_ifindex.as_ref().clone();
-        self.shared_cos_owner_worker_by_ifindex
-            .store(cos_owner_worker_by_ifindex.clone());
+        self.refresh_cos_runtime_maps(build_cos_owner_worker_by_queue(&self.forwarding, &workers));
         let worker_command_queues: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>> =
             Arc::new(
                 workers
@@ -645,8 +642,8 @@ impl Coordinator {
             let rg_epochs = self.rg_epochs.clone();
             let event_stream_handle = self.event_stream_worker_handle();
             let cos_status_clone = cos_status.clone();
-            let shared_cos_owner_worker_by_ifindex =
-                self.shared_cos_owner_worker_by_ifindex.clone();
+            let shared_cos_owner_worker_by_queue = self.shared_cos_owner_worker_by_queue.clone();
+            let shared_cos_root_leases = self.shared_cos_root_leases.clone();
             let join = thread::Builder::new()
                 .name(format!("xpf-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -677,7 +674,8 @@ impl Coordinator {
                         shared_fabrics,
                         event_stream_handle,
                         rg_epochs,
-                        shared_cos_owner_worker_by_ifindex,
+                        shared_cos_owner_worker_by_queue,
+                        shared_cos_root_leases,
                         cos_status_clone,
                     );
                 });
@@ -871,12 +869,6 @@ impl Coordinator {
                 if entry.interface_name.is_empty() {
                     entry.interface_name = iface.interface_name.clone();
                 }
-                if entry.owner_worker_id.is_none() {
-                    entry.owner_worker_id = self
-                        .cos_owner_worker_by_ifindex
-                        .get(&iface.ifindex)
-                        .copied();
-                }
                 entry.shaping_rate_bytes = entry.shaping_rate_bytes.max(iface.shaping_rate_bytes);
                 entry.burst_bytes = entry.burst_bytes.max(iface.burst_bytes);
                 entry.worker_instances = entry
@@ -892,6 +884,12 @@ impl Coordinator {
                 for queue in &iface.queues {
                     let q = queue_map.entry(queue.queue_id).or_default();
                     q.queue_id = queue.queue_id;
+                    if q.owner_worker_id.is_none() {
+                        q.owner_worker_id = self
+                            .cos_owner_worker_by_queue
+                            .get(&(iface.ifindex, queue.queue_id))
+                            .copied();
+                    }
                     if q.forwarding_class.is_empty() {
                         q.forwarding_class = queue.forwarding_class.clone();
                     }
@@ -926,6 +924,7 @@ impl Coordinator {
         for (ifindex, mut iface) in interfaces {
             if let Some(queue_map) = queue_maps.remove(&ifindex) {
                 iface.queues = queue_map.into_values().collect();
+                iface.owner_worker_id = unique_interface_owner_worker_id(&iface.queues);
                 iface.nonempty_queues = iface
                     .queues
                     .iter()
@@ -1082,13 +1081,51 @@ impl Coordinator {
     fn refresh_cos_owner_worker_map_from_identities(&mut self) {
         let worker_binding_ifindexes =
             build_worker_binding_ifindexes_from_identities(&self.identities);
-        let owner_map = build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
+        self.refresh_cos_runtime_maps(build_cos_owner_worker_by_queue_from_binding_ifindexes(
             &self.forwarding,
             &worker_binding_ifindexes,
+        ));
+    }
+
+    fn refresh_cos_owner_worker_map_from_binding_statuses(&mut self, bindings: &[BindingStatus]) {
+        let ready_worker_binding_ifindexes = bindings.iter().filter(|binding| binding.ready).fold(
+            BTreeMap::<u32, std::collections::BTreeSet<i32>>::new(),
+            |mut out, binding| {
+                out.entry(binding.worker_id)
+                    .or_default()
+                    .insert(binding.ifindex);
+                out
+            },
         );
-        self.cos_owner_worker_by_ifindex = owner_map.clone();
-        self.shared_cos_owner_worker_by_ifindex
-            .store(Arc::new(owner_map));
+        let fallback_worker_binding_ifindexes =
+            build_worker_binding_ifindexes_from_identities(&self.identities);
+        self.refresh_cos_runtime_maps(build_cos_owner_worker_by_queue_with_fallback_ifindexes(
+            &self.forwarding,
+            &ready_worker_binding_ifindexes,
+            &fallback_worker_binding_ifindexes,
+        ));
+    }
+
+    fn refresh_cos_runtime_maps(&mut self, owner_map: BTreeMap<(i32, u8), u32>) {
+        let owner_changed = owner_map != self.cos_owner_worker_by_queue;
+        let current_leases = self.shared_cos_root_leases.load();
+        let next_leases = build_shared_cos_root_leases_reusing_existing(
+            &self.forwarding,
+            if owner_changed {
+                &owner_map
+            } else {
+                &self.cos_owner_worker_by_queue
+            },
+            current_leases.as_ref(),
+        );
+        if owner_changed {
+            self.cos_owner_worker_by_queue = owner_map.clone();
+            self.shared_cos_owner_worker_by_queue
+                .store(Arc::new(owner_map));
+        }
+        if !shared_cos_root_leases_match(current_leases.as_ref(), &next_leases) {
+            self.shared_cos_root_leases.store(Arc::new(next_leases));
+        }
     }
 
     /// Bump just the FIB generation counter without a full snapshot rebuild.
@@ -1269,7 +1306,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn refresh_bindings(&self, bindings: &mut [BindingStatus]) {
+    pub fn refresh_bindings(&mut self, bindings: &mut [BindingStatus]) {
         for binding in bindings.iter_mut() {
             if let Some(live) = self.live.get(&binding.slot) {
                 let snap = live.snapshot();
@@ -1431,13 +1468,27 @@ impl Coordinator {
                 binding.ready = false;
             }
         }
+        self.refresh_cos_owner_worker_map_from_binding_statuses(bindings);
     }
 }
 
-fn build_cos_owner_worker_by_ifindex(
+fn unique_interface_owner_worker_id(queues: &[crate::protocol::CoSQueueStatus]) -> Option<u32> {
+    let mut owner_worker_id = None;
+    for queue in queues {
+        let queue_owner = queue.owner_worker_id?;
+        match owner_worker_id {
+            None => owner_worker_id = Some(queue_owner),
+            Some(existing) if existing == queue_owner => {}
+            Some(_) => return None,
+        }
+    }
+    owner_worker_id
+}
+
+fn build_cos_owner_worker_by_queue(
     forwarding: &ForwardingState,
     workers: &BTreeMap<u32, Vec<BindingPlan>>,
-) -> BTreeMap<i32, u32> {
+) -> BTreeMap<(i32, u8), u32> {
     let worker_binding_ifindexes = workers
         .iter()
         .map(|(worker_id, binding_plans)| {
@@ -1450,7 +1501,7 @@ fn build_cos_owner_worker_by_ifindex(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    build_cos_owner_worker_by_ifindex_from_binding_ifindexes(forwarding, &worker_binding_ifindexes)
+    build_cos_owner_worker_by_queue_from_binding_ifindexes(forwarding, &worker_binding_ifindexes)
 }
 
 fn build_worker_binding_ifindexes_from_identities(
@@ -1465,11 +1516,23 @@ fn build_worker_binding_ifindexes_from_identities(
     out
 }
 
-fn build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
+fn build_cos_owner_worker_by_queue_from_binding_ifindexes(
     forwarding: &ForwardingState,
     worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,
-) -> BTreeMap<i32, u32> {
-    let mut owner_by_ifindex = BTreeMap::new();
+) -> BTreeMap<(i32, u8), u32> {
+    build_cos_owner_worker_by_queue_with_fallback_ifindexes(
+        forwarding,
+        worker_binding_ifindexes,
+        worker_binding_ifindexes,
+    )
+}
+
+fn build_cos_owner_worker_by_queue_with_fallback_ifindexes(
+    forwarding: &ForwardingState,
+    preferred_worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,
+    fallback_worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,
+) -> BTreeMap<(i32, u8), u32> {
+    let mut owner_by_queue = BTreeMap::new();
     let mut next_owner_slot_by_tx_ifindex = BTreeMap::<i32, usize>::new();
     let mut egress_ifindexes = forwarding
         .cos
@@ -1480,21 +1543,87 @@ fn build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
     egress_ifindexes.sort_unstable();
     for egress_ifindex in egress_ifindexes {
         let tx_ifindex = resolve_tx_binding_ifindex(forwarding, egress_ifindex);
-        let eligible_workers = worker_binding_ifindexes
+        let preferred_workers = preferred_worker_binding_ifindexes
             .iter()
             .filter_map(|(worker_id, ifindexes)| {
                 ifindexes.contains(&tx_ifindex).then_some(*worker_id)
             })
             .collect::<Vec<_>>();
+        let eligible_workers = if preferred_workers.is_empty() {
+            fallback_worker_binding_ifindexes
+                .iter()
+                .filter_map(|(worker_id, ifindexes)| {
+                    ifindexes.contains(&tx_ifindex).then_some(*worker_id)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            preferred_workers
+        };
         if eligible_workers.is_empty() {
             continue;
         }
         let next_slot = next_owner_slot_by_tx_ifindex.entry(tx_ifindex).or_default();
-        let owner_worker_id = eligible_workers[*next_slot % eligible_workers.len()];
-        *next_slot += 1;
-        owner_by_ifindex.insert(egress_ifindex, owner_worker_id);
+        let Some(iface) = forwarding.cos.interfaces.get(&egress_ifindex) else {
+            continue;
+        };
+        for queue in &iface.queues {
+            let owner_worker_id = eligible_workers[*next_slot % eligible_workers.len()];
+            *next_slot += 1;
+            owner_by_queue.insert((egress_ifindex, queue.queue_id), owner_worker_id);
+        }
     }
-    owner_by_ifindex
+    owner_by_queue
+}
+
+fn build_shared_cos_root_leases(
+    forwarding: &ForwardingState,
+    owner_by_queue: &BTreeMap<(i32, u8), u32>,
+) -> BTreeMap<i32, Arc<SharedCoSRootLease>> {
+    build_shared_cos_root_leases_reusing_existing(forwarding, owner_by_queue, &BTreeMap::new())
+}
+
+fn build_shared_cos_root_leases_reusing_existing(
+    forwarding: &ForwardingState,
+    owner_by_queue: &BTreeMap<(i32, u8), u32>,
+    existing: &BTreeMap<i32, Arc<SharedCoSRootLease>>,
+) -> BTreeMap<i32, Arc<SharedCoSRootLease>> {
+    let mut out = BTreeMap::new();
+    for (&ifindex, iface) in &forwarding.cos.interfaces {
+        let active_shards = iface
+            .queues
+            .iter()
+            .filter_map(|queue| owner_by_queue.get(&(ifindex, queue.queue_id)).copied())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            .max(1);
+        let burst_bytes = iface.burst_bytes.max(64 * 1500);
+        if let Some(lease) = existing.get(&ifindex).filter(|lease| {
+            lease.matches_config(iface.shaping_rate_bytes, burst_bytes, active_shards)
+        }) {
+            out.insert(ifindex, lease.clone());
+            continue;
+        }
+        out.insert(
+            ifindex,
+            Arc::new(SharedCoSRootLease::new(
+                iface.shaping_rate_bytes,
+                burst_bytes,
+                active_shards,
+            )),
+        );
+    }
+    out
+}
+
+fn shared_cos_root_leases_match(
+    current: &BTreeMap<i32, Arc<SharedCoSRootLease>>,
+    next: &BTreeMap<i32, Arc<SharedCoSRootLease>>,
+) -> bool {
+    current.len() == next.len()
+        && current.iter().all(|(ifindex, lease)| {
+            next.get(ifindex)
+                .is_some_and(|next| Arc::ptr_eq(lease, next))
+        })
 }
 
 #[cfg(test)]
@@ -1506,7 +1635,7 @@ mod tests {
     };
 
     #[test]
-    fn build_cos_owner_worker_by_ifindex_prefers_lowest_worker_with_tx_binding() {
+    fn build_cos_owner_worker_by_queue_prefers_lowest_worker_with_tx_binding() {
         let mut forwarding = ForwardingState::default();
         forwarding.cos.interfaces.insert(
             80,
@@ -1517,7 +1646,16 @@ mod tests {
                 dscp_classifier: String::new(),
                 ieee8021_classifier: String::new(),
                 queue_by_forwarding_class: FastMap::default(),
-                queues: vec![],
+                queues: vec![CoSQueueConfig {
+                    queue_id: 0,
+                    forwarding_class: "best-effort".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: 64 * 1024,
+                    dscp_rewrite: None,
+                }],
             },
         );
         forwarding.egress.insert(
@@ -1538,57 +1676,196 @@ mod tests {
             (7, std::collections::BTreeSet::from([12, 13])),
         ]);
 
-        let owner_by_ifindex = build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
+        let owner_by_queue = build_cos_owner_worker_by_queue_from_binding_ifindexes(
             &forwarding,
             &worker_binding_ifindexes,
         );
 
-        assert_eq!(owner_by_ifindex.get(&80), Some(&2));
+        assert_eq!(owner_by_queue.get(&(80, 0)), Some(&2));
     }
 
     #[test]
-    fn build_cos_owner_worker_by_ifindex_spreads_interfaces_across_eligible_workers() {
+    fn build_cos_owner_worker_by_queue_spreads_queues_across_eligible_workers() {
         let mut forwarding = ForwardingState::default();
-        for ifindex in [82, 80, 81] {
-            forwarding.cos.interfaces.insert(
-                ifindex,
-                CoSInterfaceConfig {
-                    shaping_rate_bytes: 1_000_000,
-                    burst_bytes: 64 * 1024,
-                    default_queue: 0,
-                    dscp_classifier: String::new(),
-                    ieee8021_classifier: String::new(),
-                    queue_by_forwarding_class: FastMap::default(),
-                    queues: vec![],
-                },
-            );
-            forwarding.egress.insert(
-                ifindex,
-                EgressInterface {
-                    bind_ifindex: 12,
-                    vlan_id: 0,
-                    mtu: 1500,
-                    src_mac: [0; 6],
-                    zone: "wan".to_string(),
-                    redundancy_group: 0,
-                    primary_v4: None,
-                    primary_v6: None,
-                },
-            );
-        }
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 1_000_000,
+                burst_bytes: 64 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![
+                    CoSQueueConfig {
+                        queue_id: 0,
+                        forwarding_class: "best-effort".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 1_000_000,
+                        exact: false,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 1,
+                        forwarding_class: "af11".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 1_000_000,
+                        exact: false,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 2,
+                        forwarding_class: "af12".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 1_000_000,
+                        exact: false,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                ],
+            },
+        );
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".to_string(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
         let worker_binding_ifindexes = BTreeMap::from([
             (2, std::collections::BTreeSet::from([12])),
             (7, std::collections::BTreeSet::from([12])),
         ]);
 
-        let owner_by_ifindex = build_cos_owner_worker_by_ifindex_from_binding_ifindexes(
+        let owner_by_queue = build_cos_owner_worker_by_queue_from_binding_ifindexes(
             &forwarding,
             &worker_binding_ifindexes,
         );
 
-        assert_eq!(owner_by_ifindex.get(&80), Some(&2));
-        assert_eq!(owner_by_ifindex.get(&81), Some(&7));
-        assert_eq!(owner_by_ifindex.get(&82), Some(&2));
+        assert_eq!(owner_by_queue.get(&(80, 0)), Some(&2));
+        assert_eq!(owner_by_queue.get(&(80, 1)), Some(&7));
+        assert_eq!(owner_by_queue.get(&(80, 2)), Some(&2));
+    }
+
+    #[test]
+    fn build_cos_owner_worker_by_queue_prefers_ready_workers_when_available() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 1_000_000,
+                burst_bytes: 64 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![
+                    CoSQueueConfig {
+                        queue_id: 0,
+                        forwarding_class: "best-effort".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 1_000_000,
+                        exact: false,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 4,
+                        forwarding_class: "iperf-a".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 1_000_000,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                ],
+            },
+        );
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".to_string(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+
+        let owner_by_queue = build_cos_owner_worker_by_queue_with_fallback_ifindexes(
+            &forwarding,
+            &BTreeMap::from([(7, std::collections::BTreeSet::from([12]))]),
+            &BTreeMap::from([
+                (2, std::collections::BTreeSet::from([12])),
+                (7, std::collections::BTreeSet::from([12])),
+            ]),
+        );
+
+        assert_eq!(owner_by_queue.get(&(80, 0)), Some(&7));
+        assert_eq!(owner_by_queue.get(&(80, 4)), Some(&7));
+    }
+
+    #[test]
+    fn build_cos_owner_worker_by_queue_falls_back_when_no_ready_workers_exist() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 1_000_000,
+                burst_bytes: 64 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![CoSQueueConfig {
+                    queue_id: 0,
+                    forwarding_class: "best-effort".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: 64 * 1024,
+                    dscp_rewrite: None,
+                }],
+            },
+        );
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".to_string(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+
+        let owner_by_queue = build_cos_owner_worker_by_queue_with_fallback_ifindexes(
+            &forwarding,
+            &BTreeMap::new(),
+            &BTreeMap::from([(2, std::collections::BTreeSet::from([12]))]),
+        );
+
+        assert_eq!(owner_by_queue.get(&(80, 0)), Some(&2));
     }
 
     #[test]
@@ -1692,8 +1969,196 @@ mod tests {
 
         coordinator.refresh_runtime_snapshot(&snapshot);
 
-        assert_eq!(coordinator.cos_owner_worker_by_ifindex.get(&80), Some(&2));
-        let shared = coordinator.shared_cos_owner_worker_by_ifindex.load();
-        assert_eq!(shared.get(&80), Some(&2));
+        assert_eq!(
+            coordinator.cos_owner_worker_by_queue.get(&(80, 0)),
+            Some(&2)
+        );
+        let shared = coordinator.shared_cos_owner_worker_by_queue.load();
+        assert_eq!(shared.get(&(80, 0)), Some(&2));
+    }
+
+    #[test]
+    fn build_shared_cos_root_leases_uses_distinct_owner_workers_per_interface() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 100_000_000,
+                burst_bytes: 256 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![
+                    CoSQueueConfig {
+                        queue_id: 0,
+                        forwarding_class: "best-effort".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 50_000_000,
+                        exact: false,
+                        surplus_weight: 1,
+                        buffer_bytes: 128 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 1,
+                        forwarding_class: "af11".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 50_000_000,
+                        exact: false,
+                        surplus_weight: 1,
+                        buffer_bytes: 128 * 1024,
+                        dscp_rewrite: None,
+                    },
+                ],
+            },
+        );
+        let owner_by_queue = BTreeMap::from([((80, 0), 2), ((80, 1), 7)]);
+
+        let leases = build_shared_cos_root_leases(&forwarding, &owner_by_queue);
+        let lease = leases.get(&80).expect("shared root lease");
+
+        let first = lease.acquire(1, 2500);
+        let second = lease.acquire(1, 2500);
+        let third = lease.acquire(1, 2500);
+        let fourth = lease.acquire(1, 2500);
+        let fifth = lease.acquire(1, 1);
+
+        assert_eq!(first, 2500);
+        assert_eq!(second, 2500);
+        assert_eq!(third, 2500);
+        assert_eq!(
+            first + second + third + fourth,
+            (tx_frame_capacity() as u64) * 2
+        );
+        assert_eq!(fifth, 0);
+    }
+
+    #[test]
+    fn build_shared_cos_root_leases_reuses_existing_matching_lease_arc() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 100_000_000,
+                burst_bytes: 256 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![CoSQueueConfig {
+                    queue_id: 0,
+                    forwarding_class: "best-effort".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 100_000_000,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: 128 * 1024,
+                    dscp_rewrite: None,
+                }],
+            },
+        );
+        let owner_by_queue = BTreeMap::from([((80, 0), 2)]);
+
+        let existing = build_shared_cos_root_leases(&forwarding, &owner_by_queue);
+        let reused =
+            build_shared_cos_root_leases_reusing_existing(&forwarding, &owner_by_queue, &existing);
+
+        assert!(Arc::ptr_eq(
+            existing.get(&80).expect("existing lease"),
+            reused.get(&80).expect("reused lease")
+        ));
+    }
+
+    #[test]
+    fn refresh_cos_owner_worker_map_from_binding_statuses_keeps_shared_arcs_when_unchanged() {
+        let mut coordinator = Coordinator::new();
+        coordinator.forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 100_000_000,
+                burst_bytes: 256 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![
+                    CoSQueueConfig {
+                        queue_id: 0,
+                        forwarding_class: "best-effort".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 50_000_000,
+                        exact: false,
+                        surplus_weight: 1,
+                        buffer_bytes: 128 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 1,
+                        forwarding_class: "af11".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 50_000_000,
+                        exact: false,
+                        surplus_weight: 1,
+                        buffer_bytes: 128 * 1024,
+                        dscp_rewrite: None,
+                    },
+                ],
+            },
+        );
+        coordinator.forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".to_string(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+        let bindings = vec![BindingStatus {
+            worker_id: 7,
+            ifindex: 12,
+            ready: true,
+            ..Default::default()
+        }];
+
+        coordinator.refresh_cos_owner_worker_map_from_binding_statuses(&bindings);
+        let owners_before = coordinator.shared_cos_owner_worker_by_queue.load_full();
+        let leases_before = coordinator.shared_cos_root_leases.load_full();
+        let lease_before = leases_before.get(&80).expect("shared root lease").clone();
+        assert_eq!(lease_before.acquire(1, 2500), 2500);
+
+        coordinator.refresh_cos_owner_worker_map_from_binding_statuses(&bindings);
+        let owners_after = coordinator.shared_cos_owner_worker_by_queue.load_full();
+        let leases_after = coordinator.shared_cos_root_leases.load_full();
+
+        assert!(Arc::ptr_eq(&owners_before, &owners_after));
+        assert!(Arc::ptr_eq(
+            &lease_before,
+            leases_after.get(&80).expect("shared root lease")
+        ));
+    }
+
+    #[test]
+    fn unique_interface_owner_worker_id_returns_none_when_queues_split() {
+        let owner = 7u32;
+        let queues = vec![
+            crate::protocol::CoSQueueStatus {
+                queue_id: 0,
+                owner_worker_id: Some(2),
+                ..Default::default()
+            },
+            crate::protocol::CoSQueueStatus {
+                queue_id: 1,
+                owner_worker_id: Some(owner),
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(unique_interface_owner_worker_id(&queues), None);
     }
 }
