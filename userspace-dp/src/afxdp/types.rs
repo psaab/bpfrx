@@ -643,15 +643,21 @@ pub(super) struct CoSTimerWheelRuntime {
 
 #[repr(align(64))]
 pub(super) struct SharedCoSRootLease {
+    config: SharedCoSRootLeaseConfig,
     state: Mutex<SharedCoSRootLeaseState>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct SharedCoSRootLeaseState {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SharedCoSRootLeaseConfig {
     shaping_rate_bytes: u64,
     burst_bytes: u64,
     lease_bytes: u64,
     max_total_leased: u64,
+    active_shards: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SharedCoSRootLeaseState {
     available_tokens: u64,
     outstanding_leased_tokens: u64,
     last_refill_ns: u64,
@@ -662,9 +668,13 @@ const COS_ROOT_LEASE_MIN_BYTES: u64 = 1500;
 const COS_ROOT_LEASE_MAX_BYTES: u64 = 64 * 1024;
 
 impl SharedCoSRootLease {
-    pub(super) fn new(shaping_rate_bytes: u64, burst_bytes: u64, active_shards: usize) -> Self {
+    fn compute_config(
+        shaping_rate_bytes: u64,
+        burst_bytes: u64,
+        active_shards: usize,
+    ) -> SharedCoSRootLeaseConfig {
         let burst_bytes = burst_bytes.max(COS_ROOT_LEASE_MIN_BYTES);
-        let active_shards = active_shards.max(1) as u64;
+        let active_shards = active_shards.max(1);
         let target_lease_bytes = ((shaping_rate_bytes as u128) * (COS_ROOT_LEASE_TARGET_US as u128)
             / 1_000_000u128) as u64;
         let lease_ceiling = burst_bytes
@@ -677,14 +687,22 @@ impl SharedCoSRootLease {
         let max_frame_lease_bytes = lease_bytes.max(tx_frame_capacity() as u64);
         let max_total_leased = burst_bytes
             .saturating_div(4)
-            .min(max_frame_lease_bytes.saturating_mul(active_shards));
+            .min(max_frame_lease_bytes.saturating_mul(active_shards as u64));
+        SharedCoSRootLeaseConfig {
+            shaping_rate_bytes,
+            burst_bytes,
+            lease_bytes,
+            max_total_leased,
+            active_shards,
+        }
+    }
+
+    pub(super) fn new(shaping_rate_bytes: u64, burst_bytes: u64, active_shards: usize) -> Self {
+        let config = Self::compute_config(shaping_rate_bytes, burst_bytes, active_shards);
         Self {
+            config,
             state: Mutex::new(SharedCoSRootLeaseState {
-                shaping_rate_bytes,
-                burst_bytes,
-                lease_bytes,
-                max_total_leased,
-                available_tokens: burst_bytes,
+                available_tokens: config.burst_bytes,
                 outstanding_leased_tokens: 0,
                 last_refill_ns: 0,
             }),
@@ -692,18 +710,25 @@ impl SharedCoSRootLease {
     }
 
     pub(super) fn lease_bytes(&self) -> u64 {
-        self.state
-            .lock()
-            .map(|state| state.lease_bytes)
-            .unwrap_or(COS_ROOT_LEASE_MIN_BYTES)
+        self.config.lease_bytes
+    }
+
+    pub(super) fn matches_config(
+        &self,
+        shaping_rate_bytes: u64,
+        burst_bytes: u64,
+        active_shards: usize,
+    ) -> bool {
+        self.config == Self::compute_config(shaping_rate_bytes, burst_bytes, active_shards)
     }
 
     pub(super) fn acquire(&self, now_ns: u64, requested: u64) -> u64 {
         let Ok(mut state) = self.state.lock() else {
             return 0;
         };
-        Self::refill_locked(&mut state, now_ns);
-        let lease_headroom = state
+        self.refill_locked(&mut state, now_ns);
+        let lease_headroom = self
+            .config
             .max_total_leased
             .saturating_sub(state.outstanding_leased_tokens);
         if lease_headroom == 0 || state.available_tokens == 0 {
@@ -733,32 +758,32 @@ impl SharedCoSRootLease {
             state.available_tokens = state
                 .available_tokens
                 .saturating_add(bytes)
-                .min(state.burst_bytes);
+                .min(self.config.burst_bytes);
         }
     }
 
-    fn refill_locked(state: &mut SharedCoSRootLeaseState, now_ns: u64) {
-        if state.burst_bytes == 0 {
+    fn refill_locked(&self, state: &mut SharedCoSRootLeaseState, now_ns: u64) {
+        if self.config.burst_bytes == 0 {
             return;
         }
         if state.last_refill_ns == 0 {
-            state.available_tokens = state.burst_bytes;
+            state.available_tokens = self.config.burst_bytes;
             state.last_refill_ns = now_ns;
             return;
         }
-        if now_ns <= state.last_refill_ns || state.shaping_rate_bytes == 0 {
+        if now_ns <= state.last_refill_ns || self.config.shaping_rate_bytes == 0 {
             return;
         }
         let elapsed_ns = now_ns - state.last_refill_ns;
-        let added =
-            ((elapsed_ns as u128) * (state.shaping_rate_bytes as u128) / 1_000_000_000u128) as u64;
+        let added = ((elapsed_ns as u128) * (self.config.shaping_rate_bytes as u128)
+            / 1_000_000_000u128) as u64;
         if added == 0 {
             return;
         }
         state.available_tokens = state
             .available_tokens
             .saturating_add(added)
-            .min(state.burst_bytes);
+            .min(self.config.burst_bytes);
         state.last_refill_ns = now_ns;
     }
 }

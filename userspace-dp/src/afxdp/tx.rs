@@ -241,7 +241,7 @@ pub(super) fn drain_pending_tx(
     }
     let mut pending = take_pending_tx_requests(binding);
     if pending.is_empty() {
-        return did_work || !binding.pending_tx_prepared.is_empty();
+        return did_work || binding_has_pending_tx_work(binding);
     }
     let mut retry = VecDeque::new();
     while let Some(req) = pending.pop_front() {
@@ -274,10 +274,7 @@ pub(super) fn drain_pending_tx(
         restore_pending_tx_requests(binding, retry);
     }
     update_binding_debug_state(binding);
-    did_work
-        || !binding.pending_tx_prepared.is_empty()
-        || !binding.pending_tx_local.is_empty()
-        || !binding.live.pending_tx_empty()
+    did_work || binding_has_pending_tx_work(binding)
 }
 
 pub(super) enum TxError {
@@ -1369,7 +1366,6 @@ fn enqueue_prepared_into_cos(
     // owner TX frames. Otherwise a local item can reach the head of the same queue while
     // all free frames are trapped inside queued prepared items, leading to a persistent
     // "no free TX frame available" livelock.
-    recycle_prepared_immediately(binding, &req);
     let item_len = local_req.bytes.len() as u64;
     match enqueue_cos_item(
         binding,
@@ -1378,8 +1374,11 @@ fn enqueue_prepared_into_cos(
         item_len,
         CoSPendingTxItem::Local(local_req),
     ) {
-        Ok(()) => Ok(()),
-        Err(CoSPendingTxItem::Local(_)) => Ok(()),
+        Ok(()) => {
+            recycle_prepared_immediately(binding, &req);
+            Ok(())
+        }
+        Err(CoSPendingTxItem::Local(_)) => Err(req),
         Err(CoSPendingTxItem::Prepared(_)) => {
             unreachable!("prepared queueing converted to local request")
         }
@@ -2408,19 +2407,19 @@ mod tests {
         // At 400 Mbps / 256 KB burst / 1 shard, lease_bytes() == 1500, which is less than
         // tx_frame_capacity() == 4096.  Without the .max(tx_frame_capacity()) fix, root.tokens
         // could never exceed 1500 and any frame with len > 1500 would deadlock the CoS queue.
-        let lease = Arc::new(SharedCoSRootLease::new(400_000_000, 256 * 1024, 1));
+        let lease = Arc::new(SharedCoSRootLease::new(400_000_000 / 8, 256 * 1024, 1));
         assert!(
             lease.lease_bytes() < tx_frame_capacity() as u64,
             "precondition: lease_bytes must be below tx_frame_capacity for this regression"
         );
 
         let mut root = test_cos_runtime_with_queues(
-            400_000_000,
+            400_000_000 / 8,
             vec![CoSQueueConfig {
                 queue_id: 0,
                 forwarding_class: "best-effort".into(),
                 priority: 5,
-                transmit_rate_bytes: 400_000_000,
+                transmit_rate_bytes: 400_000_000 / 8,
                 exact: false,
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
@@ -2596,7 +2595,10 @@ mod tests {
         assert_eq!(local.cos_queue_id, Some(4));
         assert_eq!(local.dscp_rewrite, Some(46));
         assert_eq!(
-            local.flow_key.as_ref().map(|key| (key.src_port, key.dst_port)),
+            local
+                .flow_key
+                .as_ref()
+                .map(|key| (key.src_port, key.dst_port)),
             Some((1111, 2222))
         );
     }
