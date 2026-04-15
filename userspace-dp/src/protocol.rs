@@ -523,7 +523,7 @@ pub(crate) struct FirewallTermSnapshot {
     #[serde(rename = "forwarding_class", default)]
     pub forwarding_class: String,
     #[serde(rename = "dscp_rewrite", default)]
-    pub dscp_rewrite: u8,
+    pub dscp_rewrite: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

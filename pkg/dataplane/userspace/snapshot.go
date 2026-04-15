@@ -1404,9 +1404,11 @@ func buildFilterTermSnapshots(filter *config.FirewallFilter, cfg *config.Config)
 		// DSCP rewrite
 		if term.DSCPRewrite != "" {
 			if val, ok := dataplane.DSCPValues[strings.ToLower(term.DSCPRewrite)]; ok {
-				snap.DSCPRewrite = val
+				rewrite := val
+				snap.DSCPRewrite = &rewrite
 			} else if v, err := strconv.Atoi(term.DSCPRewrite); err == nil && v >= 0 && v <= 63 {
-				snap.DSCPRewrite = uint8(v)
+				rewrite := uint8(v)
+				snap.DSCPRewrite = &rewrite
 			}
 		}
 		terms = append(terms, snap)

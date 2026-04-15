@@ -2929,7 +2929,7 @@ mod tests {
                     protocols: vec!["tcp".into()],
                     destination_ports: vec!["443".into()],
                     action: "accept".into(),
-                    dscp_rewrite: 46,
+                    dscp_rewrite: Some(46),
                     ..Default::default()
                 }],
             }],
@@ -3005,14 +3005,14 @@ mod tests {
                 flow_key: None,
                 egress_ifindex: 42,
                 cos_queue_id: Some(0),
-                dscp_rewrite: Some(10),
+                dscp_rewrite: Some(0),
             },
         ]);
 
         assign_local_dscp_rewrite(&mut items, Some(46));
 
         assert_eq!(items[0].dscp_rewrite, Some(46));
-        assert_eq!(items[1].dscp_rewrite, Some(10));
+        assert_eq!(items[1].dscp_rewrite, Some(0));
     }
 
     fn test_cos_interface_runtime(now_ns: u64) -> CoSInterfaceRuntime {

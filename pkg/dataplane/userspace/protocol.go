@@ -312,7 +312,7 @@ type FirewallTermSnapshot struct {
 	PolicerName     string   `json:"policer,omitempty"`
 	RoutingInstance string   `json:"routing_instance,omitempty"`
 	ForwardingClass string   `json:"forwarding_class,omitempty"`
-	DSCPRewrite     uint8    `json:"dscp_rewrite,omitempty"`
+	DSCPRewrite     *uint8   `json:"dscp_rewrite,omitempty"`
 }
 
 type PolicerSnapshot struct {

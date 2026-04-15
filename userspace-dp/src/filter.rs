@@ -574,11 +574,7 @@ fn parse_term(snap: &FirewallTermSnapshot) -> FilterTerm {
         "discard" => FilterAction::Discard,
         _ => FilterAction::Accept,
     };
-    let dscp_rewrite = if snap.dscp_rewrite > 0 {
-        Some(snap.dscp_rewrite)
-    } else {
-        None
-    };
+    let dscp_rewrite = snap.dscp_rewrite.map(|value| value & 0x3f);
 
     FilterTerm {
         name: snap.name.clone(),
@@ -708,7 +704,7 @@ mod tests {
                         policer: String::new(),
                         routing_instance: String::new(),
                         forwarding_class: String::new(),
-                        dscp_rewrite: 0,
+                        dscp_rewrite: None,
                     },
                     FirewallTermSnapshot {
                         name: "allow-all".into(),
@@ -724,7 +720,7 @@ mod tests {
                         policer: String::new(),
                         routing_instance: String::new(),
                         forwarding_class: String::new(),
-                        dscp_rewrite: 0,
+                        dscp_rewrite: None,
                     },
                 ],
             }],
@@ -777,7 +773,7 @@ mod tests {
                     policer: String::new(),
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
-                    dscp_rewrite: 0,
+                    dscp_rewrite: None,
                 }],
             }],
             &[],
@@ -829,7 +825,7 @@ mod tests {
                     policer: String::new(),
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
-                    dscp_rewrite: 0,
+                    dscp_rewrite: None,
                 }],
             }],
             &[],
@@ -881,7 +877,7 @@ mod tests {
                     policer: String::new(),
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
-                    dscp_rewrite: 46, // EF
+                    dscp_rewrite: Some(46), // EF
                 }],
             }],
             &[],
@@ -898,6 +894,45 @@ mod tests {
         );
         assert_eq!(result.action, FilterAction::Accept);
         assert_eq!(result.dscp_rewrite, Some(46));
+    }
+
+    #[test]
+    fn dscp_rewrite_action_allows_default_zero() {
+        let state = make_filter_state(
+            &[FirewallFilterSnapshot {
+                name: "dscp-default".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "mark-default".into(),
+                    destination_addresses: vec![],
+                    source_addresses: vec![],
+                    protocols: vec!["udp".into()],
+                    source_ports: vec![],
+                    destination_ports: vec!["5060".into()],
+                    dscp_values: vec![],
+                    action: "accept".into(),
+                    count: String::new(),
+                    log: false,
+                    policer: String::new(),
+                    routing_instance: String::new(),
+                    forwarding_class: String::new(),
+                    dscp_rewrite: Some(0),
+                }],
+            }],
+            &[],
+        );
+        let result = evaluate_filter(
+            &state,
+            "inet:dscp-default",
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            PROTO_UDP,
+            54321,
+            5060,
+            0,
+        );
+        assert_eq!(result.action, FilterAction::Accept);
+        assert_eq!(result.dscp_rewrite, Some(0));
     }
 
     #[test]
@@ -950,7 +985,7 @@ mod tests {
                         policer: String::new(),
                         routing_instance: String::new(),
                         forwarding_class: String::new(),
-                        dscp_rewrite: 0,
+                        dscp_rewrite: None,
                     },
                     FirewallTermSnapshot {
                         name: "deny-all-udp".into(),
@@ -966,7 +1001,7 @@ mod tests {
                         policer: String::new(),
                         routing_instance: String::new(),
                         forwarding_class: String::new(),
-                        dscp_rewrite: 0,
+                        dscp_rewrite: None,
                     },
                 ],
             }],
@@ -1019,7 +1054,7 @@ mod tests {
                     policer: String::new(),
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
-                    dscp_rewrite: 0,
+                    dscp_rewrite: None,
                 }],
             }],
             &[],
@@ -1315,7 +1350,7 @@ mod tests {
                         name: "match-ef".into(),
                         dscp_values: vec![46],
                         action: "accept".into(),
-                        dscp_rewrite: 0,
+                        dscp_rewrite: None,
                         ..Default::default()
                     },
                     FirewallTermSnapshot {

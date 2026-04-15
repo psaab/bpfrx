@@ -164,6 +164,7 @@ pub(super) fn enqueue_pending_forwards(
                 expected_ports,
                 request.flow_key.clone(),
                 request.cos_queue_id,
+                request.dscp_rewrite,
                 now_ns,
                 post_recycles,
                 worker_id,
@@ -1046,6 +1047,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
     expected_ports: Option<(u16, u16)>,
     flow_key: Option<SessionKey>,
     cos_queue_id: Option<u8>,
+    dscp_rewrite: Option<u8>,
     now_ns: u64,
     post_recycles: &mut Vec<(u32, u64)>,
     worker_id: u32,
@@ -1304,7 +1306,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
             flow_key: flow_key.clone(),
             egress_ifindex: decision.resolution.egress_ifindex,
             cos_queue_id,
-            dscp_rewrite: None,
+            dscp_rewrite,
         });
         total_bytes += frame_len as u64;
         max_frame = max_frame.max(frame_len as u32);

@@ -287,6 +287,7 @@ pub(super) fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
 }
 
 pub(super) fn apply_dscp_rewrite_to_frame(frame: &mut [u8], dscp: u8) -> Option<()> {
+    let dscp = dscp & 0x3f;
     let l3 = frame_l3_offset(frame)?;
     let ip = frame.get_mut(l3..)?;
     match ip.first()? >> 4 {
