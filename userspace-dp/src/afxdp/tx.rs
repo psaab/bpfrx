@@ -1101,23 +1101,8 @@ pub(super) fn resolve_cos_tx_selection(
     } else {
         crate::filter::FilterResult::default()
     };
-    let Some(iface) = iface else {
-        return CoSTxSelection {
-            queue_id: None,
-            dscp_rewrite: output_result.dscp_rewrite,
-        };
-    };
-    if !output_result.forwarding_class.is_empty() {
-        if let Some(queue_id) = iface
-            .queue_by_forwarding_class
-            .get(output_result.forwarding_class.as_ref())
-        {
-            return CoSTxSelection {
-                queue_id: Some(*queue_id),
-                dscp_rewrite: output_result.dscp_rewrite,
-            };
-        }
-    }
+    let mut effective_dscp_rewrite = output_result.dscp_rewrite;
+    let mut ingress_forwarding_class = Arc::<str>::from("");
     if !has_output_filter {
         let ingress_ifindex = resolve_ingress_logical_ifindex(
             forwarding,
@@ -1137,22 +1122,41 @@ pub(super) fn resolve_cos_tx_selection(
             meta.dscp,
             meta.pkt_len as u64,
         );
-        if !ingress_result.forwarding_class.is_empty() {
-            if let Some(queue_id) = iface
-                .queue_by_forwarding_class
-                .get(ingress_result.forwarding_class.as_ref())
-            {
-                return CoSTxSelection {
-                    queue_id: Some(*queue_id),
-                    dscp_rewrite: output_result.dscp_rewrite,
-                };
-            }
+        effective_dscp_rewrite = effective_dscp_rewrite.or(ingress_result.dscp_rewrite);
+        ingress_forwarding_class = ingress_result.forwarding_class;
+    }
+    let Some(iface) = iface else {
+        return CoSTxSelection {
+            queue_id: None,
+            dscp_rewrite: effective_dscp_rewrite,
+        };
+    };
+    if !output_result.forwarding_class.is_empty() {
+        if let Some(queue_id) = iface
+            .queue_by_forwarding_class
+            .get(output_result.forwarding_class.as_ref())
+        {
+            return CoSTxSelection {
+                queue_id: Some(*queue_id),
+                dscp_rewrite: effective_dscp_rewrite,
+            };
+        }
+    }
+    if !ingress_forwarding_class.is_empty() {
+        if let Some(queue_id) = iface
+            .queue_by_forwarding_class
+            .get(ingress_forwarding_class.as_ref())
+        {
+            return CoSTxSelection {
+                queue_id: Some(*queue_id),
+                dscp_rewrite: effective_dscp_rewrite,
+            };
         }
     }
     if let Some(queue_id) = resolve_cos_dscp_classifier_queue_id(forwarding, iface, meta.dscp) {
         return CoSTxSelection {
             queue_id: Some(queue_id),
-            dscp_rewrite: output_result.dscp_rewrite,
+            dscp_rewrite: effective_dscp_rewrite,
         };
     }
     if let Some(queue_id) = resolve_cos_ieee8021_classifier_queue_id(
@@ -1163,12 +1167,12 @@ pub(super) fn resolve_cos_tx_selection(
     ) {
         return CoSTxSelection {
             queue_id: Some(queue_id),
-            dscp_rewrite: output_result.dscp_rewrite,
+            dscp_rewrite: effective_dscp_rewrite,
         };
     }
     CoSTxSelection {
         queue_id: Some(iface.default_queue),
-        dscp_rewrite: output_result.dscp_rewrite,
+        dscp_rewrite: effective_dscp_rewrite,
     }
 }
 
@@ -2467,6 +2471,114 @@ mod tests {
         );
 
         assert_eq!(queue_id, Some(1));
+    }
+
+    #[test]
+    fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filter_exists() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "reth1.0".into(),
+                    ifindex: 101,
+                    parent_ifindex: 5,
+                    vlan_id: 0,
+                    hardware_addr: "02:bf:72:00:61:01".into(),
+                    filter_input_v4: "cos-classify".into(),
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "reth0.0".into(),
+                    ifindex: 202,
+                    hardware_addr: "02:bf:72:00:80:08".into(),
+                    cos_shaping_rate_bytes_per_sec: 10_000_000,
+                    cos_shaping_burst_bytes: 256_000,
+                    cos_scheduler_map: "wan-map".into(),
+                    ..Default::default()
+                },
+            ],
+            filters: vec![FirewallFilterSnapshot {
+                name: "cos-classify".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "voice".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: "accept".into(),
+                    forwarding_class: "expedited-forwarding".into(),
+                    dscp_rewrite: Some(0),
+                    ..Default::default()
+                }],
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![
+                    CoSForwardingClassSnapshot {
+                        name: "best-effort".into(),
+                        queue: 0,
+                    },
+                    CoSForwardingClassSnapshot {
+                        name: "expedited-forwarding".into(),
+                        queue: 1,
+                    },
+                ],
+                dscp_classifiers: vec![],
+                ieee8021_classifiers: vec![],
+                dscp_rewrite_rules: vec![],
+                schedulers: vec![
+                    CoSSchedulerSnapshot {
+                        name: "be-sched".into(),
+                        transmit_rate_bytes: 4_000_000,
+                        transmit_rate_exact: false,
+                        priority: "low".into(),
+                        buffer_size_bytes: 128_000,
+                    },
+                    CoSSchedulerSnapshot {
+                        name: "ef-sched".into(),
+                        transmit_rate_bytes: 6_000_000,
+                        transmit_rate_exact: false,
+                        priority: "strict-high".into(),
+                        buffer_size_bytes: 64_000,
+                    },
+                ],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "best-effort".into(),
+                            scheduler: "be-sched".into(),
+                        },
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "expedited-forwarding".into(),
+                            scheduler: "ef-sched".into(),
+                        },
+                    ],
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let forwarding = build_forwarding_state(&snapshot);
+        let selection = resolve_cos_tx_selection(
+            &forwarding,
+            202,
+            UserspaceDpMeta {
+                ingress_ifindex: 5,
+                ingress_vlan_id: 0,
+                addr_family: libc::AF_INET as u8,
+                dscp: 46,
+                ..Default::default()
+            },
+            Some(&SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 443,
+            }),
+        );
+
+        assert_eq!(selection.queue_id, Some(1));
+        assert_eq!(selection.dscp_rewrite, Some(0));
     }
 
     #[test]
