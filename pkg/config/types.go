@@ -301,6 +301,7 @@ type ClassOfServiceConfig struct {
 	ForwardingClasses   map[string]*CoSForwardingClass
 	DSCPClassifiers     map[string]*CoSDSCPClassifier
 	IEEE8021Classifiers map[string]*CoSIEEE8021Classifier
+	DSCPRewriteRules    map[string]*CoSDSCPRewriteRule
 	Schedulers          map[string]*CoSScheduler
 	SchedulerMaps       map[string]*CoSSchedulerMap
 	Interfaces          map[string]*CoSInterface
@@ -338,6 +339,19 @@ type CoSIEEE8021ClassifierEntry struct {
 	CodePoints      []uint8
 }
 
+// CoSDSCPRewriteRule maps forwarding classes to egress DSCP rewrite values.
+type CoSDSCPRewriteRule struct {
+	Name    string
+	Entries []*CoSDSCPRewriteRuleEntry
+}
+
+// CoSDSCPRewriteRuleEntry assigns a DSCP rewrite code point to a forwarding class.
+type CoSDSCPRewriteRuleEntry struct {
+	ForwardingClass string
+	LossPriority    string
+	DSCPValue       uint8
+}
+
 // CoSScheduler defines the Phase 1 class scheduler knobs.
 type CoSScheduler struct {
 	Name              string
@@ -373,6 +387,7 @@ type CoSInterfaceUnit struct {
 	SchedulerMap       string
 	DSCPClassifier     string
 	IEEE8021Classifier string
+	DSCPRewriteRule    string
 }
 
 // SystemConfig holds system-level configuration.

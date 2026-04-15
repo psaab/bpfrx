@@ -71,6 +71,8 @@ func compileExpanded(tree *ConfigTree) (*Config, error) {
 		},
 		ClassOfService: &ClassOfServiceConfig{
 			ForwardingClasses: make(map[string]*CoSForwardingClass),
+			DSCPClassifiers:   make(map[string]*CoSDSCPClassifier),
+			DSCPRewriteRules:  make(map[string]*CoSDSCPRewriteRule),
 			Schedulers:        make(map[string]*CoSScheduler),
 			SchedulerMaps:     make(map[string]*CoSSchedulerMap),
 			Interfaces:        make(map[string]*CoSInterface),
@@ -571,6 +573,7 @@ func ValidateConfig(cfg *Config) []string {
 
 	if cos := cfg.ClassOfService; cos != nil {
 		warnedClassifierLossPriority := false
+		warnedRewriteLossPriority := false
 		for _, class := range cos.ForwardingClasses {
 			if class == nil {
 				continue
@@ -639,6 +642,25 @@ func ValidateConfig(cfg *Config) []string {
 				}
 			}
 		}
+		for _, rewriteRule := range cos.DSCPRewriteRules {
+			if rewriteRule == nil {
+				continue
+			}
+			for _, entry := range rewriteRule.Entries {
+				if entry == nil || entry.ForwardingClass == "" {
+					continue
+				}
+				if _, ok := cos.ForwardingClasses[entry.ForwardingClass]; !ok {
+					warnings = append(warnings, fmt.Sprintf(
+						"class-of-service dscp rewrite-rule %q references undefined forwarding-class %q",
+						rewriteRule.Name, entry.ForwardingClass))
+				}
+				if entry.LossPriority != "" && !warnedRewriteLossPriority {
+					warnings = append(warnings, "class-of-service dscp rewrite-rule loss-priority is accepted for compatibility but not yet enforced by the userspace dataplane")
+					warnedRewriteLossPriority = true
+				}
+			}
+		}
 		for _, iface := range cos.Interfaces {
 			if iface == nil {
 				continue
@@ -668,10 +690,17 @@ func ValidateConfig(cfg *Config) []string {
 							iface.Name, unit.Unit, unit.IEEE8021Classifier))
 					}
 				}
+				if unit.DSCPRewriteRule != "" {
+					if _, ok := cos.DSCPRewriteRules[unit.DSCPRewriteRule]; !ok {
+						warnings = append(warnings, fmt.Sprintf(
+							"class-of-service interface %s unit %d references undefined dscp rewrite-rule %q",
+							iface.Name, unit.Unit, unit.DSCPRewriteRule))
+					}
+				}
 			}
 		}
-		if (len(cos.Interfaces) > 0 || len(cos.DSCPClassifiers) > 0 || len(cos.IEEE8021Classifiers) > 0) && cfg.System.DataplaneType != "userspace" {
-			warnings = append(warnings, "class-of-service shaping and dscp/802.1p classifier attachment are only implemented in the userspace dataplane; configuration is accepted but will not take effect on this dataplane")
+		if (len(cos.Interfaces) > 0 || len(cos.DSCPClassifiers) > 0 || len(cos.IEEE8021Classifiers) > 0 || len(cos.DSCPRewriteRules) > 0) && cfg.System.DataplaneType != "userspace" {
+			warnings = append(warnings, "class-of-service shaping, classifier attachment, and dscp rewrite-rule attachment are only implemented in the userspace dataplane; configuration is accepted but will not take effect on this dataplane")
 		}
 	}
 

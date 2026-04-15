@@ -286,6 +286,45 @@ pub(super) fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     Some(14)
 }
 
+pub(super) fn apply_dscp_rewrite_to_frame(frame: &mut [u8], dscp: u8) -> Option<()> {
+    let dscp = dscp & 0x3f;
+    let l3 = frame_l3_offset(frame)?;
+    let ip = frame.get_mut(l3..)?;
+    match ip.first()? >> 4 {
+        4 => {
+            if ip.len() < 20 {
+                return None;
+            }
+            let new_tos = (dscp << 2) | (ip[1] & 0x03);
+            if new_tos == ip[1] {
+                return Some(());
+            }
+            let old_word = u16::from_be_bytes([ip[0], ip[1]]);
+            let new_word = u16::from_be_bytes([ip[0], new_tos]);
+            let current = u16::from_be_bytes([ip[10], ip[11]]);
+            let updated = checksum16_adjust(current, &[old_word], &[new_word]);
+            ip[1] = new_tos;
+            ip[10] = (updated >> 8) as u8;
+            ip[11] = updated as u8;
+            Some(())
+        }
+        6 => {
+            if ip.len() < 40 {
+                return None;
+            }
+            let current_tc = ((ip[0] & 0x0f) << 4) | (ip[1] >> 4);
+            let new_tc = (dscp << 2) | (current_tc & 0x03);
+            if new_tc == current_tc {
+                return Some(());
+            }
+            ip[0] = (ip[0] & 0xf0) | (new_tc >> 4);
+            ip[1] = ((new_tc & 0x0f) << 4) | (ip[1] & 0x0f);
+            Some(())
+        }
+        _ => None,
+    }
+}
+
 /// Decode an Ethernet frame into a human-readable summary showing IP src/dst,
 /// TCP/UDP ports, TCP flags, and checksums. For debugging packet forwarding.
 pub(super) fn decode_frame_summary(frame: &[u8]) -> String {
@@ -7106,5 +7145,46 @@ mod tests {
             None,
         );
         assert!(result.is_none(), "NAT64 should fall back to generic");
+    }
+
+    #[test]
+    fn apply_dscp_rewrite_to_ipv4_frame_updates_tos_and_checksum() {
+        let src = Ipv4Addr::new(10, 0, 61, 102);
+        let dst = Ipv4Addr::new(172, 16, 80, 200);
+        let mut frame = build_icmp_echo_frame_v4(src, dst, 64);
+        let l3 = frame_l3_offset(&frame).expect("l3");
+        let old_tos = frame[l3 + 1];
+        let old_checksum = u16::from_be_bytes([frame[l3 + 10], frame[l3 + 11]]);
+
+        apply_dscp_rewrite_to_frame(&mut frame, 46).expect("rewrite");
+
+        assert_eq!(frame[l3 + 1] >> 2, 46);
+        assert_eq!(frame[l3 + 1] & 0x03, old_tos & 0x03);
+        let new_checksum = u16::from_be_bytes([frame[l3 + 10], frame[l3 + 11]]);
+        assert_ne!(new_checksum, old_checksum);
+        assert_eq!(checksum16(&frame[l3..l3 + 20]), 0);
+    }
+
+    #[test]
+    fn apply_dscp_rewrite_to_ipv6_frame_updates_traffic_class() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0x86, 0xdd]);
+        frame.extend_from_slice(&[
+            0x60, 0x0b, 0x12, 0x34, // version + traffic class + flow label
+            0x00, 0x08, // payload len
+            58, 64, // next header + hop limit
+        ]);
+        frame.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        frame.extend_from_slice(&Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x200).octets());
+        frame.extend_from_slice(&[128, 0, 0, 0, 0, 1, 0, 1]);
+
+        let l3 = frame_l3_offset(&frame).expect("l3");
+        let old_tc = ((frame[l3] & 0x0f) << 4) | (frame[l3 + 1] >> 4);
+
+        apply_dscp_rewrite_to_frame(&mut frame, 46).expect("rewrite");
+
+        let new_tc = ((frame[l3] & 0x0f) << 4) | (frame[l3 + 1] >> 4);
+        assert_eq!(new_tc >> 2, 46);
+        assert_eq!(new_tc & 0x03, old_tc & 0x03);
     }
 }

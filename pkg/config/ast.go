@@ -1151,6 +1151,16 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				}},
 			}},
 		}},
+		"rewrite-rules": {children: map[string]*schemaNode{
+			"dscp": {args: 1, multi: true, children: map[string]*schemaNode{
+				"forwarding-class": {args: 1, multi: true, children: map[string]*schemaNode{
+					"loss-priority": {args: 1, multi: true, children: map[string]*schemaNode{
+						"code-point":  {args: 1, children: nil},
+						"code-points": {args: 1, multi: true, children: nil},
+					}},
+				}},
+			}},
+		}},
 		"schedulers": {args: 1, multi: true, children: map[string]*schemaNode{
 			"transmit-rate": {args: 1, children: map[string]*schemaNode{
 				"exact": {children: nil},
@@ -1168,6 +1178,9 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 				"classifiers": {children: map[string]*schemaNode{
 					"dscp":       {args: 1, children: nil},
 					"ieee-802.1": {args: 1, children: nil},
+				}},
+				"rewrite-rules": {children: map[string]*schemaNode{
+					"dscp": {args: 1, children: nil},
 				}},
 				"shaping-rate": {args: 1, children: map[string]*schemaNode{
 					"burst-size": {args: 1, children: nil},

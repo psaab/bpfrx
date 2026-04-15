@@ -66,6 +66,7 @@ func TestFormatCoSInterfaceSummaryShowsConfigOnlyInterface(t *testing.T) {
 		"Scheduler map:            bandwidth-limit",
 		"DSCP classifier:          wan-classifier",
 		"IEEE 802.1 classifier:    wan-pcp",
+		"DSCP rewrite-rule:        -",
 		"Output filter (inet):     bandwidth-output",
 		"Runtime:                  unavailable",
 		"best-effort",

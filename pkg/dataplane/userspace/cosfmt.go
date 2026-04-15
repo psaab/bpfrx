@@ -58,6 +58,7 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 			fmt.Fprintf(&b, "  Scheduler map:            %s\n", emptyDash(view.cosUnit.SchedulerMap))
 			fmt.Fprintf(&b, "  DSCP classifier:          %s\n", emptyDash(view.cosUnit.DSCPClassifier))
 			fmt.Fprintf(&b, "  IEEE 802.1 classifier:    %s\n", emptyDash(view.cosUnit.IEEE8021Classifier))
+			fmt.Fprintf(&b, "  DSCP rewrite-rule:        %s\n", emptyDash(view.cosUnit.DSCPRewriteRule))
 			fmt.Fprintf(&b, "  Shaping rate:             %s\n", formatCoSRate(view.cosUnit.ShapingRateBytes))
 			fmt.Fprintf(&b, "  Burst size:               %s\n", formatCoSBytes(view.cosUnit.BurstSizeBytes))
 		}

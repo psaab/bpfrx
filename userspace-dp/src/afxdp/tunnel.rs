@@ -214,6 +214,12 @@ pub(super) fn build_local_origin_tunnel_tx_request(
         &session_entry,
         monotonic_nanos() / 1_000_000_000,
     );
+    let cos = resolve_cos_tx_selection(
+        forwarding,
+        decision.resolution.egress_ifindex,
+        meta,
+        None,
+    );
     Ok(LocalTunnelTxPlan {
         tx_ifindex: decision.resolution.tx_ifindex,
         tx_request: TxRequest {
@@ -223,12 +229,8 @@ pub(super) fn build_local_origin_tunnel_tx_request(
             expected_protocol: 0,
             flow_key: None,
             egress_ifindex: decision.resolution.egress_ifindex,
-            cos_queue_id: resolve_cos_queue_id(
-                forwarding,
-                decision.resolution.egress_ifindex,
-                meta,
-                None,
-            ),
+            cos_queue_id: cos.queue_id,
+            dscp_rewrite: cos.dscp_rewrite,
         },
         session_entry,
         reverse_session_entry,

@@ -329,6 +329,7 @@ func buildInterfaceSnapshots(cfg *config.Config) []InterfaceSnapshot {
 				CoSSchedulerMap:           coSUnitSchedulerMap(cosUnit),
 				CoSDSCPClassifier:         coSUnitDSCPClassifier(cosUnit),
 				CoSIEEE8021Classifier:     coSUnitIEEE8021Classifier(cosUnit),
+				CoSDSCPRewriteRule:        coSUnitDSCPRewriteRule(cosUnit),
 			})
 		}
 	}
@@ -368,6 +369,13 @@ func coSUnitIEEE8021Classifier(unit *config.CoSInterfaceUnit) string {
 		return ""
 	}
 	return unit.IEEE8021Classifier
+}
+
+func coSUnitDSCPRewriteRule(unit *config.CoSInterfaceUnit) string {
+	if unit == nil {
+		return ""
+	}
+	return unit.DSCPRewriteRule
 }
 
 func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnapshot) []TunnelEndpointSnapshot {
@@ -1396,9 +1404,11 @@ func buildFilterTermSnapshots(filter *config.FirewallFilter, cfg *config.Config)
 		// DSCP rewrite
 		if term.DSCPRewrite != "" {
 			if val, ok := dataplane.DSCPValues[strings.ToLower(term.DSCPRewrite)]; ok {
-				snap.DSCPRewrite = val
+				rewrite := val
+				snap.DSCPRewrite = &rewrite
 			} else if v, err := strconv.Atoi(term.DSCPRewrite); err == nil && v >= 0 && v <= 63 {
-				snap.DSCPRewrite = uint8(v)
+				rewrite := uint8(v)
+				snap.DSCPRewrite = &rewrite
 			}
 		}
 		terms = append(terms, snap)
@@ -1439,7 +1449,7 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 		return nil
 	}
 	cos := cfg.ClassOfService
-	if len(cos.ForwardingClasses) == 0 && len(cos.DSCPClassifiers) == 0 && len(cos.IEEE8021Classifiers) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 && len(cos.Interfaces) == 0 {
+	if len(cos.ForwardingClasses) == 0 && len(cos.DSCPClassifiers) == 0 && len(cos.IEEE8021Classifiers) == 0 && len(cos.DSCPRewriteRules) == 0 && len(cos.Schedulers) == 0 && len(cos.SchedulerMaps) == 0 && len(cos.Interfaces) == 0 {
 		return nil
 	}
 	snap := &ClassOfServiceSnapshot{}
@@ -1514,6 +1524,33 @@ func buildClassOfServiceSnapshot(cfg *config.Config) *ClassOfServiceSnapshot {
 				})
 			}
 			snap.IEEE8021Classifiers = append(snap.IEEE8021Classifiers, classifierSnap)
+		}
+	}
+
+	if len(cos.DSCPRewriteRules) > 0 {
+		names := make([]string, 0, len(cos.DSCPRewriteRules))
+		for name := range cos.DSCPRewriteRules {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		snap.DSCPRewriteRules = make([]CoSDSCPRewriteRuleSnapshot, 0, len(names))
+		for _, name := range names {
+			rewriteRule := cos.DSCPRewriteRules[name]
+			if rewriteRule == nil {
+				continue
+			}
+			rewriteSnap := CoSDSCPRewriteRuleSnapshot{Name: rewriteRule.Name}
+			for _, entry := range rewriteRule.Entries {
+				if entry == nil {
+					continue
+				}
+				rewriteSnap.Entries = append(rewriteSnap.Entries, CoSDSCPRewriteRuleEntrySnapshot{
+					ForwardingClass: entry.ForwardingClass,
+					LossPriority:    entry.LossPriority,
+					DSCPValue:       entry.DSCPValue,
+				})
+			}
+			snap.DSCPRewriteRules = append(snap.DSCPRewriteRules, rewriteSnap)
 		}
 	}
 

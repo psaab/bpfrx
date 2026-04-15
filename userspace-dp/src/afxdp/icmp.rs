@@ -48,6 +48,7 @@ pub(super) fn build_local_time_exceeded_request(
         _ => return None,
     }?;
 
+    let cos = resolve_cos_tx_selection(forwarding, ingress_ident.ifindex, meta, None);
     Some(PendingForwardRequest {
         target_ifindex,
         target_binding_index: None,
@@ -75,7 +76,8 @@ pub(super) fn build_local_time_exceeded_request(
         flow_key: None,
         nat64_reverse: None,
         prebuilt_frame: Some(prebuilt_frame),
-        cos_queue_id: resolve_cos_queue_id(forwarding, ingress_ident.ifindex, meta, None),
+        cos_queue_id: cos.queue_id,
+        dscp_rewrite: cos.dscp_rewrite,
     })
 }
 
