@@ -912,9 +912,44 @@ At minimum:
 - lease returns and lease expirations
 - shard-local backlog and service
 
+## Current Implementation Status
+
+As of April 2026, xpf has landed a **userspace-only** CoS slice. The current
+implementation is no longer just a design sketch; the following pieces are
+implemented and exercised in the userspace dataplane:
+
+- forwarding-class, scheduler, and scheduler-map parsing/compile support
+- shaped egress interface binding through
+  `class-of-service interfaces ... scheduler-map ... shaping-rate ...`
+- queue selection from the shaped interface's egress output filter
+- ingress input-filter fallback when no egress CoS filter is attached
+- DSCP and 802.1p BA classifier attachment as fallback queue selectors
+- DSCP rewrite-rule attachment on shaped egress interfaces
+- firewall-filter DSCP rewrite precedence over queue-level rewrite-rules
+- root shaping, per-queue guarantees, `transmit-rate exact`, and non-`exact`
+  surplus borrowing
+- timer-wheel deferred eligibility for backlogged-but-ineligible queues
+- static owner-worker handoff for shaped egress interfaces
+- deterministic owner spreading across eligible workers on a shared TX path
+- base interface/runtime observability via
+  `show class-of-service interface [IFACE[.UNIT]]`
+
+The following pieces are still not complete:
+
+- non-userspace dataplane CoS parity
+- WRED/drop profiles
+- 802.1p rewrite-rules
+- `loss-priority` enforcement for BA classifiers / rewrite-rules
+- fuller Junos scheduler semantics beyond the current transmit-rate/priority/
+  buffer-size slice
+- detailed reservation/container/shard observability and metrics
+- shared-budget leasing and more advanced many-core ownership
+
 ## Implementation Plan
 
 ### Phase 1: Root + Reservation + Container FIFO
+
+Status: implemented in the current userspace baseline.
 
 - root aggregate shaping
 - one reservation per class
@@ -927,6 +962,8 @@ At minimum:
 
 ### Phase 2: Timer Wheel and Deferred Eligibility
 
+Status: implemented in the current userspace baseline.
+
 - add a per-shard timer wheel for sleeping reservations
 - park backlogged-but-ineligible reservations instead of rescanning them
 - compute wakeups from root/reservation refill time to at least one MTU
@@ -934,6 +971,10 @@ At minimum:
   cheap enough
 
 ### Phase 3: Reservation Guarantees and Surplus
+
+Status: partially implemented in userspace. Guarantee service, surplus
+borrowing, and `transmit-rate exact` are landed. Fuller priority/weight parity
+is still future work.
 
 - guarantee service phase
 - surplus service phase
@@ -944,6 +985,10 @@ At minimum:
   phases
 
 ### Phase 4: Many-Core Ownership and Leasing
+
+Status: partially implemented in userspace. Static owner-worker handoff and
+deterministic owner spreading are landed. Shared-budget leasing is still future
+work.
 
 - static reservation/container ownership by scheduler shard
 - first userspace slice is implemented as one owner worker per shaped egress
@@ -956,6 +1001,10 @@ At minimum:
 - one timer wheel per scheduler shard, not one global timer queue
 
 ### Phase 5: Observability and Tuning
+
+Status: partially implemented. Interface/root-level live observability is
+landed; deeper reservation/container/shard views and metrics are still future
+work.
 
 - root/reservation/container CLI
 - shard metrics
