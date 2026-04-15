@@ -186,7 +186,7 @@ pub(super) fn drain_pending_tx(
     forwarding: &ForwardingState,
     worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
-    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
+    cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
 ) -> bool {
     if !binding_has_pending_tx_work(binding) {
         return false;
@@ -207,7 +207,7 @@ pub(super) fn drain_pending_tx(
         now_ns,
         worker_id,
         worker_commands_by_id,
-        cos_owner_worker_by_ifindex,
+        cos_owner_worker_by_queue,
     );
     while drain_shaped_tx(binding, now_ns, shared_recycles) {
         did_work = true;
@@ -321,7 +321,7 @@ pub(super) fn drain_pending_tx_local_owner(
     forwarding: &ForwardingState,
     worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
-    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
+    cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
 ) -> bool {
     drain_pending_tx(
         binding,
@@ -330,7 +330,7 @@ pub(super) fn drain_pending_tx_local_owner(
         forwarding,
         worker_id,
         worker_commands_by_id,
-        cos_owner_worker_by_ifindex,
+        cos_owner_worker_by_queue,
     )
 }
 
@@ -340,7 +340,7 @@ fn ingest_cos_pending_tx(
     now_ns: u64,
     worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
-    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
+    cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
 ) {
     if forwarding.cos.interfaces.is_empty() {
         return;
@@ -349,18 +349,19 @@ fn ingest_cos_pending_tx(
     if !binding.pending_tx_prepared.is_empty() {
         let mut kept = VecDeque::with_capacity(binding.pending_tx_prepared.len());
         while let Some(req) = binding.pending_tx_prepared.pop_front() {
-            let req = match redirect_prepared_cos_request_to_owner_binding(binding, forwarding, req)
-            {
-                Ok(()) => continue,
-                Err(req) => req,
-            };
             let req = match redirect_prepared_cos_request_to_owner(
                 binding,
+                forwarding,
                 req,
                 worker_id,
                 worker_commands_by_id,
-                cos_owner_worker_by_ifindex,
+                cos_owner_worker_by_queue,
             ) {
+                Ok(()) => continue,
+                Err(req) => req,
+            };
+            let req = match redirect_prepared_cos_request_to_owner_binding(binding, forwarding, req)
+            {
                 Ok(()) => continue,
                 Err(req) => req,
             };
@@ -377,20 +378,21 @@ fn ingest_cos_pending_tx(
     let mut pending = merge_pending_tx_requests(local, shared);
     let mut kept = VecDeque::with_capacity(pending.len());
     while let Some(req) = pending.pop_front() {
+        let req = match redirect_local_cos_request_to_owner(
+            forwarding,
+            req,
+            worker_id,
+            worker_commands_by_id,
+            cos_owner_worker_by_queue,
+        ) {
+            Ok(()) => continue,
+            Err(req) => req,
+        };
         let req = match redirect_local_cos_request_to_owner_binding(
             &binding.live,
             &binding.cos_owner_live_by_tx_ifindex,
             forwarding,
             req,
-        ) {
-            Ok(()) => continue,
-            Err(req) => req,
-        };
-        let req = match redirect_local_cos_request_to_owner(
-            req,
-            worker_id,
-            worker_commands_by_id,
-            cos_owner_worker_by_ifindex,
         ) {
             Ok(()) => continue,
             Err(req) => req,
@@ -404,26 +406,48 @@ fn ingest_cos_pending_tx(
     bound_pending_tx_local(binding);
 }
 
-fn cos_owner_worker_for_egress_ifindex(
-    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
+fn effective_cos_queue_id(
+    forwarding: &ForwardingState,
     egress_ifindex: i32,
+    requested_queue_id: Option<u8>,
+) -> Option<u8> {
+    requested_queue_id.or_else(|| {
+        forwarding
+            .cos
+            .interfaces
+            .get(&egress_ifindex)
+            .map(|iface| iface.default_queue)
+    })
+}
+
+fn cos_owner_worker_for_cos_queue(
+    forwarding: &ForwardingState,
+    cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
+    egress_ifindex: i32,
+    requested_queue_id: Option<u8>,
     current_worker_id: u32,
 ) -> u32 {
-    cos_owner_worker_by_ifindex
-        .get(&egress_ifindex)
-        .copied()
+    effective_cos_queue_id(forwarding, egress_ifindex, requested_queue_id)
+        .and_then(|queue_id| {
+            cos_owner_worker_by_queue
+                .get(&(egress_ifindex, queue_id))
+                .copied()
+        })
         .unwrap_or(current_worker_id)
 }
 
 fn redirect_local_cos_request_to_owner(
+    forwarding: &ForwardingState,
     req: TxRequest,
     current_worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
-    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
+    cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
 ) -> Result<(), TxRequest> {
-    let owner_worker_id = cos_owner_worker_for_egress_ifindex(
-        cos_owner_worker_by_ifindex,
+    let owner_worker_id = cos_owner_worker_for_cos_queue(
+        forwarding,
+        cos_owner_worker_by_queue,
         req.egress_ifindex,
+        req.cos_queue_id,
         current_worker_id,
     );
     if owner_worker_id == current_worker_id {
@@ -457,14 +481,17 @@ fn redirect_local_cos_request_to_owner_binding(
 
 fn redirect_prepared_cos_request_to_owner(
     binding: &mut BindingWorker,
+    forwarding: &ForwardingState,
     req: PreparedTxRequest,
     current_worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
-    cos_owner_worker_by_ifindex: &BTreeMap<i32, u32>,
+    cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
 ) -> Result<(), PreparedTxRequest> {
-    let owner_worker_id = cos_owner_worker_for_egress_ifindex(
-        cos_owner_worker_by_ifindex,
+    let owner_worker_id = cos_owner_worker_for_cos_queue(
+        forwarding,
+        cos_owner_worker_by_queue,
         req.egress_ifindex,
+        req.cos_queue_id,
         current_worker_id,
     );
     if owner_worker_id == current_worker_id {
@@ -489,10 +516,11 @@ fn redirect_prepared_cos_request_to_owner(
         dscp_rewrite: req.dscp_rewrite,
     };
     if redirect_local_cos_request_to_owner(
+        forwarding,
         local_req,
         current_worker_id,
         worker_commands_by_id,
-        cos_owner_worker_by_ifindex,
+        cos_owner_worker_by_queue,
     )
     .is_ok()
     {
@@ -571,16 +599,13 @@ fn build_cos_batch(
     root_ifindex: i32,
     now_ns: u64,
 ) -> Option<CoSBatch> {
+    let shared_root_lease = binding.cos_shared_root_leases.get(&root_ifindex).cloned();
     let selected = {
         let root = binding.cos_interfaces.get_mut(&root_ifindex)?;
         advance_cos_timer_wheel(root, now_ns);
-        refill_cos_tokens(
-            &mut root.tokens,
-            root.shaping_rate_bytes,
-            root.burst_bytes.max(COS_MIN_BURST_BYTES),
-            &mut root.last_refill_ns,
-            now_ns,
-        );
+        if let Some(shared_root_lease) = shared_root_lease.as_ref() {
+            maybe_top_up_cos_root_lease(root, shared_root_lease, now_ns);
+        }
         select_cos_guarantee_batch(root, now_ns).or_else(|| select_cos_surplus_batch(root, now_ns))
     };
     if selected.is_some() {
@@ -812,7 +837,10 @@ fn submit_cos_batch(
             phase,
             mut items,
         } => {
-            assign_local_dscp_rewrite(&mut items, cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx));
+            assign_local_dscp_rewrite(
+                &mut items,
+                cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx),
+            );
             match transmit_batch(binding, &mut items, now_ns, shared_recycles) {
                 Ok((packets, bytes)) => {
                     apply_cos_send_result(binding, root_ifindex, queue_idx, phase, bytes, items);
@@ -849,7 +877,14 @@ fn submit_cos_batch(
             );
             match transmit_prepared_queue(binding, &mut items, now_ns) {
                 Ok((packets, bytes)) => {
-                    apply_cos_prepared_result(binding, root_ifindex, queue_idx, phase, bytes, items);
+                    apply_cos_prepared_result(
+                        binding,
+                        root_ifindex,
+                        queue_idx,
+                        phase,
+                        bytes,
+                        items,
+                    );
                     if packets > 0 {
                         binding
                             .live
@@ -882,6 +917,24 @@ const COS_GUARANTEE_QUANTUM_MIN_BYTES: u64 = 1500;
 const COS_GUARANTEE_QUANTUM_MAX_BYTES: u64 = 32 * 1024;
 const COS_SURPLUS_ROUND_QUANTUM_BYTES: u64 = 1500;
 const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
+
+fn maybe_top_up_cos_root_lease(
+    root: &mut CoSInterfaceRuntime,
+    shared_root_lease: &SharedCoSRootLease,
+    now_ns: u64,
+) {
+    let lease_bytes = shared_root_lease
+        .lease_bytes()
+        .min(root.burst_bytes.max(COS_MIN_BURST_BYTES));
+    if root.tokens >= lease_bytes {
+        return;
+    }
+    let grant = shared_root_lease.acquire(now_ns, lease_bytes.saturating_sub(root.tokens));
+    root.tokens = root
+        .tokens
+        .saturating_add(grant)
+        .min(root.burst_bytes.max(COS_MIN_BURST_BYTES));
+}
 
 fn refill_cos_tokens(
     tokens: &mut u64,
@@ -1303,8 +1356,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
     CoSInterfaceRuntime {
         shaping_rate_bytes: config.shaping_rate_bytes,
         burst_bytes: config.burst_bytes.max(COS_MIN_BURST_BYTES),
-        tokens: config.burst_bytes.max(COS_MIN_BURST_BYTES),
-        last_refill_ns: now_ns,
+        tokens: 0,
         default_queue: config.default_queue,
         nonempty_queues: 0,
         runnable_queues: 0,
@@ -1484,6 +1536,28 @@ fn refresh_cos_interface_activity(binding: &mut BindingWorker, root_ifindex: i32
         binding.cos_nonempty_interfaces = binding.cos_nonempty_interfaces.saturating_add(1);
     } else if old_nonempty > 0 && new_nonempty == 0 {
         binding.cos_nonempty_interfaces = binding.cos_nonempty_interfaces.saturating_sub(1);
+        release_cos_root_lease(binding, root_ifindex);
+    }
+}
+
+fn release_cos_root_lease(binding: &mut BindingWorker, root_ifindex: i32) {
+    let released = binding
+        .cos_interfaces
+        .get_mut(&root_ifindex)
+        .map(|root| core::mem::take(&mut root.tokens))
+        .unwrap_or(0);
+    if released == 0 {
+        return;
+    }
+    if let Some(shared_root_lease) = binding.cos_shared_root_leases.get(&root_ifindex) {
+        shared_root_lease.release_unused(released);
+    }
+}
+
+pub(super) fn release_all_cos_root_leases(binding: &mut BindingWorker) {
+    let root_ifindexes = binding.cos_interfaces.keys().copied().collect::<Vec<_>>();
+    for root_ifindex in root_ifindexes {
+        release_cos_root_lease(binding, root_ifindex);
     }
 }
 
@@ -1520,6 +1594,9 @@ fn apply_cos_send_result(
         }
         root.tokens = root.tokens.saturating_sub(sent_bytes);
     }
+    if let Some(shared_root_lease) = binding.cos_shared_root_leases.get(&root_ifindex) {
+        shared_root_lease.consume(sent_bytes);
+    }
     refresh_cos_interface_activity(binding, root_ifindex);
 }
 
@@ -1548,6 +1625,9 @@ fn apply_cos_prepared_result(
             }
         }
         root.tokens = root.tokens.saturating_sub(sent_bytes);
+    }
+    if let Some(shared_root_lease) = binding.cos_shared_root_leases.get(&root_ifindex) {
+        shared_root_lease.consume(sent_bytes);
     }
     refresh_cos_interface_activity(binding, root_ifindex);
 }
@@ -2122,7 +2202,20 @@ mod tests {
     fn redirect_local_cos_request_to_owner_pushes_worker_command() {
         let commands = Arc::new(Mutex::new(VecDeque::new()));
         let worker_commands_by_id = BTreeMap::from([(7, commands.clone())]);
-        let cos_owner_worker_by_ifindex = BTreeMap::from([(80, 7)]);
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 1_000_000,
+                burst_bytes: COS_MIN_BURST_BYTES,
+                default_queue: 4,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                queue_by_forwarding_class: FastMap::default(),
+                queues: Vec::new(),
+            },
+        );
+        let cos_owner_worker_by_queue = BTreeMap::from([((80, 4), 7)]);
         let req = TxRequest {
             bytes: vec![1, 2, 3],
             expected_ports: None,
@@ -2135,10 +2228,11 @@ mod tests {
         };
 
         let redirected = redirect_local_cos_request_to_owner(
+            &forwarding,
             req,
             2,
             &worker_commands_by_id,
-            &cos_owner_worker_by_ifindex,
+            &cos_owner_worker_by_queue,
         );
 
         assert!(redirected.is_ok());
@@ -2151,6 +2245,66 @@ mod tests {
             }
             other => panic!("unexpected command queued: {other:?}"),
         }
+    }
+
+    #[test]
+    fn redirect_local_cos_request_to_owner_uses_interface_default_queue_owner_when_unset() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let worker_commands_by_id = BTreeMap::from([(7, commands.clone())]);
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 1_000_000,
+                burst_bytes: COS_MIN_BURST_BYTES,
+                default_queue: 5,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                queue_by_forwarding_class: FastMap::default(),
+                queues: Vec::new(),
+            },
+        );
+        let cos_owner_worker_by_queue = BTreeMap::from([((80, 5), 7)]);
+        let req = TxRequest {
+            bytes: vec![1, 2, 3],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: None,
+            dscp_rewrite: None,
+        };
+
+        let redirected = redirect_local_cos_request_to_owner(
+            &forwarding,
+            req,
+            2,
+            &worker_commands_by_id,
+            &cos_owner_worker_by_queue,
+        );
+
+        assert!(redirected.is_ok());
+        let pending = commands.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn shared_cos_root_lease_bounds_total_outstanding_credit() {
+        let lease = SharedCoSRootLease::new(400_000_000, 256 * 1024, 2);
+        let lease_bytes = lease.lease_bytes();
+
+        let first = lease.acquire(1, lease_bytes);
+        let second = lease.acquire(1, lease_bytes);
+        let third = lease.acquire(1, lease_bytes);
+
+        assert_eq!(first, lease_bytes);
+        assert_eq!(second, lease_bytes);
+        assert_eq!(third, 0);
+
+        lease.release_unused(lease_bytes);
+        let fourth = lease.acquire(1, lease_bytes);
+        assert_eq!(fourth, lease_bytes);
     }
 
     #[test]
@@ -3257,7 +3411,6 @@ mod tests {
     #[test]
     fn surplus_phase_selects_non_exact_queue_without_guarantee_tokens() {
         let mut root = test_cos_runtime_with_exact(false);
-        root.last_refill_ns = 1;
         root.tokens = 1500;
         root.queues[0].last_refill_ns = 1;
         root.queues[0].tokens = 0;
@@ -3282,7 +3435,6 @@ mod tests {
     #[test]
     fn surplus_phase_skips_exact_queue_without_guarantee_tokens() {
         let mut root = test_cos_runtime_with_exact(true);
-        root.last_refill_ns = 1;
         root.tokens = 1500;
         root.queues[0].last_refill_ns = 1;
         root.queues[0].tokens = 0;
@@ -3299,7 +3451,6 @@ mod tests {
     #[test]
     fn guarantee_phase_parks_non_exact_queue_on_root_only_wakeup() {
         let mut root = test_cos_runtime_with_exact(false);
-        root.last_refill_ns = 1;
         root.tokens = 0;
         root.queues[0].last_refill_ns = 1;
         root.queues[0].tokens = 0;
@@ -3425,7 +3576,6 @@ mod tests {
                 },
             ],
         );
-        root.last_refill_ns = 1;
         root.tokens = 64 * 1024;
         for queue in &mut root.queues {
             queue.last_refill_ns = 1;
@@ -3472,7 +3622,6 @@ mod tests {
                 },
             ],
         );
-        root.last_refill_ns = 1;
         root.tokens = 64 * 1024;
         for queue in &mut root.queues {
             queue.last_refill_ns = 1;
@@ -3490,14 +3639,18 @@ mod tests {
         let second = select_cos_surplus_batch(&mut root, 1).expect("second surplus batch");
 
         match first {
-            CoSBatch::Local { queue_idx, items, .. } => {
+            CoSBatch::Local {
+                queue_idx, items, ..
+            } => {
                 assert_eq!(queue_idx, 0);
                 assert_eq!(items.len(), 1);
             }
             CoSBatch::Prepared { .. } => panic!("expected local batch"),
         }
         match second {
-            CoSBatch::Local { queue_idx, items, .. } => {
+            CoSBatch::Local {
+                queue_idx, items, ..
+            } => {
                 assert_eq!(queue_idx, 1);
                 assert_eq!(items.len(), 4);
             }

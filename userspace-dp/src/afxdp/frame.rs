@@ -7175,7 +7175,9 @@ mod tests {
             58, 64, // next header + hop limit
         ]);
         frame.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
-        frame.extend_from_slice(&Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x200).octets());
+        frame.extend_from_slice(
+            &Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x200).octets(),
+        );
         frame.extend_from_slice(&[128, 0, 0, 0, 0, 1, 0, 1]);
 
         let l3 = frame_l3_offset(&frame).expect("l3");

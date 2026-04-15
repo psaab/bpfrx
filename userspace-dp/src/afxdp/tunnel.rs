@@ -214,12 +214,7 @@ pub(super) fn build_local_origin_tunnel_tx_request(
         &session_entry,
         monotonic_nanos() / 1_000_000_000,
     );
-    let cos = resolve_cos_tx_selection(
-        forwarding,
-        decision.resolution.egress_ifindex,
-        meta,
-        None,
-    );
+    let cos = resolve_cos_tx_selection(forwarding, decision.resolution.egress_ifindex, meta, None);
     Ok(LocalTunnelTxPlan {
         tx_ifindex: decision.resolution.tx_ifindex,
         tx_request: TxRequest {

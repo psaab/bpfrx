@@ -19,6 +19,7 @@ type cosInterfaceView struct {
 
 type cosQueueView struct {
 	queueID         int
+	ownerWorker     *uint32
 	forwardingClass string
 	priority        string
 	exact           bool
@@ -95,10 +96,11 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 		}
 		b.WriteString("  Queues:\n")
 		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-		fmt.Fprintln(tw, "    Queue\tClass\tPriority\tExact\tTransmit rate\tBuffer\tQueued pkts\tQueued bytes\tRunnable\tParked\tNext wake\tSurplus deficit")
+		fmt.Fprintln(tw, "    Queue\tOwner\tClass\tPriority\tExact\tTransmit rate\tBuffer\tQueued pkts\tQueued bytes\tRunnable\tParked\tNext wake\tSurplus deficit")
 		for _, queue := range queues {
-			fmt.Fprintf(tw, "    %d\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d\t%d\t%s\t%s\n",
+			fmt.Fprintf(tw, "    %d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d\t%d\t%s\t%s\n",
 				queue.queueID,
+				formatOptionalWorkerID(queue.ownerWorker),
 				emptyDash(queue.forwardingClass),
 				queue.priority,
 				yesNo(queue.exact),
@@ -181,6 +183,7 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 		for _, runtimeQueue := range view.interfaceState.Queues {
 			qv := queueViews[int(runtimeQueue.QueueID)]
 			qv.queueID = int(runtimeQueue.QueueID)
+			qv.ownerWorker = runtimeQueue.OwnerWorkerID
 			if runtimeQueue.ForwardingClass != "" {
 				qv.forwardingClass = runtimeQueue.ForwardingClass
 			}

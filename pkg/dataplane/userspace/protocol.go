@@ -451,19 +451,20 @@ type CoSInterfaceStatus struct {
 }
 
 type CoSQueueStatus struct {
-	QueueID             int    `json:"queue_id,omitempty"`
-	ForwardingClass     string `json:"forwarding_class,omitempty"`
-	Priority            int    `json:"priority,omitempty"`
-	Exact               bool   `json:"exact,omitempty"`
-	TransmitRateBytes   uint64 `json:"transmit_rate_bytes,omitempty"`
-	BufferBytes         uint64 `json:"buffer_bytes,omitempty"`
-	WorkerInstances     int    `json:"worker_instances,omitempty"`
-	QueuedPackets       uint64 `json:"queued_packets,omitempty"`
-	QueuedBytes         uint64 `json:"queued_bytes,omitempty"`
-	RunnableInstances   int    `json:"runnable_instances,omitempty"`
-	ParkedInstances     int    `json:"parked_instances,omitempty"`
-	NextWakeupTick      uint64 `json:"next_wakeup_tick,omitempty"`
-	SurplusDeficitBytes uint64 `json:"surplus_deficit_bytes,omitempty"`
+	QueueID             int     `json:"queue_id,omitempty"`
+	OwnerWorkerID       *uint32 `json:"owner_worker_id,omitempty"`
+	ForwardingClass     string  `json:"forwarding_class,omitempty"`
+	Priority            int     `json:"priority,omitempty"`
+	Exact               bool    `json:"exact,omitempty"`
+	TransmitRateBytes   uint64  `json:"transmit_rate_bytes,omitempty"`
+	BufferBytes         uint64  `json:"buffer_bytes,omitempty"`
+	WorkerInstances     int     `json:"worker_instances,omitempty"`
+	QueuedPackets       uint64  `json:"queued_packets,omitempty"`
+	QueuedBytes         uint64  `json:"queued_bytes,omitempty"`
+	RunnableInstances   int     `json:"runnable_instances,omitempty"`
+	ParkedInstances     int     `json:"parked_instances,omitempty"`
+	NextWakeupTick      uint64  `json:"next_wakeup_tick,omitempty"`
+	SurplusDeficitBytes uint64  `json:"surplus_deficit_bytes,omitempty"`
 }
 
 type FirewallFilterTermCounterStatus struct {

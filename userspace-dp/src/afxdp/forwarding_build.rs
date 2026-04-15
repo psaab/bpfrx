@@ -587,7 +587,9 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                 surplus_weight: 1,
                 buffer_bytes: burst_bytes,
                 dscp_rewrite: dscp_rewrite_rule
-                    .and_then(|rewrite_rule| rewrite_rule.dscp_by_forwarding_class.get("best-effort"))
+                    .and_then(|rewrite_rule| {
+                        rewrite_rule.dscp_by_forwarding_class.get("best-effort")
+                    })
                     .copied(),
             });
         }
@@ -906,7 +908,14 @@ mod tests {
         let iface = state.interfaces.get(&42).expect("missing CoS interface");
         assert_eq!(iface.dscp_classifier, "wan-classifier");
         assert_eq!(iface.ieee8021_classifier, "wan-pcp");
-        assert_eq!(iface.queues.iter().find(|queue| queue.queue_id == 5).and_then(|queue| queue.dscp_rewrite), Some(46));
+        assert_eq!(
+            iface
+                .queues
+                .iter()
+                .find(|queue| queue.queue_id == 5)
+                .and_then(|queue| queue.dscp_rewrite),
+            Some(46)
+        );
         assert!(iface.queues.iter().any(|queue| queue.queue_id == 5));
         let classifier = state
             .dscp_classifiers
