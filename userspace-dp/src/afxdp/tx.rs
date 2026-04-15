@@ -643,11 +643,15 @@ fn select_cos_guarantee_batch(root: &mut CoSInterfaceRuntime, now_ns: u64) -> Op
             continue;
         }
         root.guarantee_rr = (start + offset + 1) % queue_count;
+        let guarantee_budget = queue
+            .tokens
+            .min(cos_guarantee_quantum_bytes(queue))
+            .max(head_len);
         if let Some(batch) = build_cos_batch_from_queue(
             queue,
             queue_idx,
             root.tokens,
-            queue.tokens,
+            guarantee_budget,
             CoSServicePhase::Guarantee,
         ) {
             return Some(batch);
@@ -873,6 +877,9 @@ fn submit_cos_batch(
 
 const COS_TIMER_WHEEL_TICK_NS: u64 = 50_000;
 const COS_MIN_BURST_BYTES: u64 = 64 * 1500;
+const COS_GUARANTEE_VISIT_NS: u64 = 100_000;
+const COS_GUARANTEE_QUANTUM_MIN_BYTES: u64 = 1500;
+const COS_GUARANTEE_QUANTUM_MAX_BYTES: u64 = 32 * 1024;
 const COS_SURPLUS_ROUND_QUANTUM_BYTES: u64 = 1500;
 const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 
@@ -933,6 +940,15 @@ fn cos_refill_ns_until(tokens: u64, need: u64, rate_bytes_per_sec: u64) -> Optio
 
 fn cos_surplus_quantum_bytes(queue: &CoSQueueRuntime) -> u64 {
     COS_SURPLUS_ROUND_QUANTUM_BYTES.saturating_mul(u64::from(queue.surplus_weight.max(1)))
+}
+
+fn cos_guarantee_quantum_bytes(queue: &CoSQueueRuntime) -> u64 {
+    let bytes_for_visit = ((queue.transmit_rate_bytes as u128) * (COS_GUARANTEE_VISIT_NS as u128)
+        / 1_000_000_000u128) as u64;
+    bytes_for_visit.clamp(
+        COS_GUARANTEE_QUANTUM_MIN_BYTES,
+        COS_GUARANTEE_QUANTUM_MAX_BYTES,
+    )
 }
 
 fn estimate_cos_queue_wakeup_tick(
@@ -3152,24 +3168,34 @@ mod tests {
     }
 
     fn test_cos_runtime_with_exact(exact: bool) -> CoSInterfaceRuntime {
+        test_cos_runtime_with_queues(
+            1_000_000,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "best-effort".into(),
+                priority: 5,
+                transmit_rate_bytes: 500_000,
+                exact,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        )
+    }
+
+    fn test_cos_runtime_with_queues(
+        shaping_rate_bytes: u64,
+        queues: Vec<CoSQueueConfig>,
+    ) -> CoSInterfaceRuntime {
         build_cos_interface_runtime(
             &CoSInterfaceConfig {
-                shaping_rate_bytes: 1_000_000,
+                shaping_rate_bytes,
                 burst_bytes: COS_MIN_BURST_BYTES,
                 default_queue: 0,
                 dscp_classifier: String::new(),
                 ieee8021_classifier: String::new(),
                 queue_by_forwarding_class: FastMap::default(),
-                queues: vec![CoSQueueConfig {
-                    queue_id: 0,
-                    forwarding_class: "best-effort".into(),
-                    priority: 5,
-                    transmit_rate_bytes: 500_000,
-                    exact,
-                    surplus_weight: 1,
-                    buffer_bytes: COS_MIN_BURST_BYTES,
-                    dscp_rewrite: None,
-                }],
+                queues,
             },
             0,
         )
@@ -3286,6 +3312,197 @@ mod tests {
         assert!(select_cos_guarantee_batch(&mut root, 1).is_none());
         assert!(root.queues[0].parked);
         assert_eq!(root.queues[0].next_wakeup_tick, 30);
+    }
+
+    #[test]
+    fn guarantee_phase_limits_service_to_visit_quantum() {
+        let mut root = test_cos_runtime_with_queues(
+            100_000_000,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "best-effort".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000,
+                exact: false,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.tokens = 64 * 1024;
+        root.queues[0].tokens = 64 * 1024;
+        root.queues[0].runnable = true;
+        for _ in 0..4 {
+            root.queues[0].items.push_back(test_cos_item(1500));
+        }
+        root.queues[0].queued_bytes = 4 * 1500;
+        root.nonempty_queues = 1;
+        root.runnable_queues = 1;
+
+        let batch = select_cos_guarantee_batch(&mut root, 1).expect("guarantee batch");
+        match batch {
+            CoSBatch::Local { items, .. } => assert_eq!(items.len(), 1),
+            CoSBatch::Prepared { .. } => panic!("expected local batch"),
+        }
+        assert_eq!(root.queues[0].items.len(), 3);
+    }
+
+    #[test]
+    fn guarantee_phase_rotates_between_backlogged_queues() {
+        let mut root = test_cos_runtime_with_queues(
+            100_000_000,
+            vec![
+                CoSQueueConfig {
+                    queue_id: 0,
+                    forwarding_class: "best-effort".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                },
+                CoSQueueConfig {
+                    queue_id: 1,
+                    forwarding_class: "af11".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                },
+            ],
+        );
+        root.tokens = 64 * 1024;
+        for queue in &mut root.queues {
+            queue.tokens = 64 * 1024;
+            queue.runnable = true;
+            queue.items.push_back(test_cos_item(1500));
+            queue.items.push_back(test_cos_item(1500));
+            queue.queued_bytes = 2 * 1500;
+        }
+        root.nonempty_queues = 2;
+        root.runnable_queues = 2;
+
+        let first = select_cos_guarantee_batch(&mut root, 1).expect("first guarantee batch");
+        let second = select_cos_guarantee_batch(&mut root, 1).expect("second guarantee batch");
+
+        match first {
+            CoSBatch::Local { queue_idx, .. } => assert_eq!(queue_idx, 0),
+            CoSBatch::Prepared { .. } => panic!("expected local batch"),
+        }
+        match second {
+            CoSBatch::Local { queue_idx, .. } => assert_eq!(queue_idx, 1),
+            CoSBatch::Prepared { .. } => panic!("expected local batch"),
+        }
+    }
+
+    #[test]
+    fn surplus_phase_prefers_higher_priority_queue() {
+        let mut root = test_cos_runtime_with_queues(
+            100_000_000,
+            vec![
+                CoSQueueConfig {
+                    queue_id: 0,
+                    forwarding_class: "bulk".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                },
+                CoSQueueConfig {
+                    queue_id: 1,
+                    forwarding_class: "voice".into(),
+                    priority: 0,
+                    transmit_rate_bytes: 1_000_000,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                },
+            ],
+        );
+        root.last_refill_ns = 1;
+        root.tokens = 64 * 1024;
+        for queue in &mut root.queues {
+            queue.last_refill_ns = 1;
+            queue.tokens = 0;
+            queue.runnable = true;
+            queue.items.push_back(test_cos_item(1500));
+            queue.queued_bytes = 1500;
+        }
+        root.nonempty_queues = 2;
+        root.runnable_queues = 2;
+
+        assert!(select_cos_guarantee_batch(&mut root, 1).is_none());
+        let batch = select_cos_surplus_batch(&mut root, 1).expect("surplus batch");
+        match batch {
+            CoSBatch::Local { queue_idx, .. } => assert_eq!(queue_idx, 1),
+            CoSBatch::Prepared { .. } => panic!("expected local batch"),
+        }
+    }
+
+    #[test]
+    fn surplus_phase_applies_weighted_same_priority_sharing() {
+        let mut root = test_cos_runtime_with_queues(
+            100_000_000,
+            vec![
+                CoSQueueConfig {
+                    queue_id: 0,
+                    forwarding_class: "small".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                },
+                CoSQueueConfig {
+                    queue_id: 1,
+                    forwarding_class: "large".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 4_000_000,
+                    exact: false,
+                    surplus_weight: 4,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                },
+            ],
+        );
+        root.last_refill_ns = 1;
+        root.tokens = 64 * 1024;
+        for queue in &mut root.queues {
+            queue.last_refill_ns = 1;
+            queue.tokens = 0;
+            queue.runnable = true;
+            for _ in 0..8 {
+                queue.items.push_back(test_cos_item(1500));
+            }
+            queue.queued_bytes = 8 * 1500;
+        }
+        root.nonempty_queues = 2;
+        root.runnable_queues = 2;
+
+        let first = select_cos_surplus_batch(&mut root, 1).expect("first surplus batch");
+        let second = select_cos_surplus_batch(&mut root, 1).expect("second surplus batch");
+
+        match first {
+            CoSBatch::Local { queue_idx, items, .. } => {
+                assert_eq!(queue_idx, 0);
+                assert_eq!(items.len(), 1);
+            }
+            CoSBatch::Prepared { .. } => panic!("expected local batch"),
+        }
+        match second {
+            CoSBatch::Local { queue_idx, items, .. } => {
+                assert_eq!(queue_idx, 1);
+                assert_eq!(items.len(), 4);
+            }
+            CoSBatch::Prepared { .. } => panic!("expected local batch"),
+        }
     }
 
     #[test]

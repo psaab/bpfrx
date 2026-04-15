@@ -926,8 +926,9 @@ implemented and exercised in the userspace dataplane:
 - DSCP and 802.1p BA classifier attachment as fallback queue selectors
 - DSCP rewrite-rule attachment on shaped egress interfaces
 - firewall-filter DSCP rewrite precedence over queue-level rewrite-rules
-- root shaping, per-queue guarantees, `transmit-rate exact`, and non-`exact`
-  surplus borrowing
+- root shaping, bounded per-visit guarantee service, `transmit-rate exact`,
+  strict-priority surplus selection, same-priority weighted DWRR, and
+  non-`exact` surplus borrowing
 - timer-wheel deferred eligibility for backlogged-but-ineligible queues
 - static owner-worker handoff for shaped egress interfaces
 - deterministic owner spreading across eligible workers on a shared TX path
@@ -972,9 +973,10 @@ Status: implemented in the current userspace baseline.
 
 ### Phase 3: Reservation Guarantees and Surplus
 
-Status: partially implemented in userspace. Guarantee service, surplus
-borrowing, and `transmit-rate exact` are landed. Fuller priority/weight parity
-is still future work.
+Status: implemented for the current userspace CoS slice. Bounded guarantee
+service, strict-priority surplus selection, same-priority weighted DWRR, and
+`transmit-rate exact` are landed. Explicit Junos-style ceiling/PIR expansion is
+still broader future CoS work, not a gap in the current userspace slice.
 
 - guarantee service phase
 - surplus service phase
