@@ -70,6 +70,7 @@ pub(crate) struct Filter {
     pub(crate) name: String,
     pub(crate) family: String,
     pub(crate) terms: Vec<FilterTerm>,
+    pub(crate) affects_tx_selection: bool,
 }
 
 #[derive(Debug, Default)]
@@ -157,17 +158,21 @@ pub(crate) struct FilterState {
     pub(crate) filters: rustc_hash::FxHashMap<String, Filter>,
     /// Named policer states keyed by policer name.
     pub(crate) policers: rustc_hash::FxHashMap<String, PolicerState>,
-    /// Per-interface (ifindex) input filter name for inet.
+    /// Per-interface (ifindex) input filter key for inet.
     pub(crate) iface_filter_v4: rustc_hash::FxHashMap<i32, String>,
-    /// Per-interface (ifindex) input filter name for inet6.
+    /// Per-interface inet input filters that can affect CoS TX selection.
+    pub(crate) iface_filter_v4_affects_tx_selection: rustc_hash::FxHashSet<i32>,
+    /// Per-interface (ifindex) input filter key for inet6.
     pub(crate) iface_filter_v6: rustc_hash::FxHashMap<i32, String>,
-    /// Per-interface (ifindex) output filter name for inet.
+    /// Per-interface inet6 input filters that can affect CoS TX selection.
+    pub(crate) iface_filter_v6_affects_tx_selection: rustc_hash::FxHashSet<i32>,
+    /// Per-interface (ifindex) output filter key for inet.
     pub(crate) iface_filter_out_v4: rustc_hash::FxHashMap<i32, String>,
-    /// Per-interface (ifindex) output filter name for inet6.
+    /// Per-interface (ifindex) output filter key for inet6.
     pub(crate) iface_filter_out_v6: rustc_hash::FxHashMap<i32, String>,
-    /// lo0 inet input filter name.
+    /// lo0 inet input filter key.
     pub(crate) lo0_filter_v4: String,
-    /// lo0 inet6 input filter name.
+    /// lo0 inet6 input filter key.
     pub(crate) lo0_filter_v6: String,
 }
 
@@ -282,11 +287,9 @@ pub(crate) fn evaluate_lo0_filter_counted(
     if filter_name.is_empty() {
         return FilterResult::default();
     }
-    let family = if is_v6 { "inet6" } else { "inet" };
-    let key = format!("{family}:{filter_name}");
     evaluate_filter_counted(
         state,
-        &key,
+        filter_name,
         src_ip,
         dst_ip,
         protocol,
@@ -337,11 +340,9 @@ pub(crate) fn evaluate_interface_filter_counted(
     if filter_name.is_empty() {
         return FilterResult::default();
     }
-    let family = if is_v6 { "inet6" } else { "inet" };
-    let key = format!("{family}:{filter_name}");
     evaluate_filter_counted(
         state,
-        &key,
+        filter_name,
         src_ip,
         dst_ip,
         protocol,
@@ -392,11 +393,9 @@ pub(crate) fn evaluate_interface_output_filter_counted(
     if filter_name.is_empty() {
         return FilterResult::default();
     }
-    let family = if is_v6 { "inet6" } else { "inet" };
-    let key = format!("{family}:{filter_name}");
     evaluate_filter_counted(
         state,
-        &key,
+        filter_name,
         src_ip,
         dst_ip,
         protocol,
@@ -405,6 +404,26 @@ pub(crate) fn evaluate_interface_output_filter_counted(
         dscp,
         packet_bytes,
     )
+}
+
+pub(crate) fn interface_filter_affects_tx_selection(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+) -> bool {
+    if is_v6 {
+        state.iface_filter_v6_affects_tx_selection.contains(&ifindex)
+    } else {
+        state.iface_filter_v4_affects_tx_selection.contains(&ifindex)
+    }
+}
+
+fn filter_key_affects_tx_selection(state: &FilterState, filter_key: &str) -> bool {
+    state
+        .filters
+        .get(filter_key)
+        .map(|filter| filter.affects_tx_selection)
+        .unwrap_or(false)
 }
 
 /// Check whether a single filter term matches the given packet fields.
@@ -485,11 +504,15 @@ pub(crate) fn parse_filter_state(
 
     // Parse filters
     for snap in filters {
-        let key = format!("{}:{}", snap.family, snap.name);
+        let key = qualify_filter_key(&snap.family, &snap.name);
         let filter = Filter {
             name: snap.name.clone(),
             family: snap.family.clone(),
             terms: snap.terms.iter().map(|t| parse_term(t)).collect(),
+            affects_tx_selection: snap
+                .terms
+                .iter()
+                .any(|term| !term.forwarding_class.is_empty() || term.dscp_rewrite.is_some()),
         };
         state.filters.insert(key, filter);
     }
@@ -513,31 +536,47 @@ pub(crate) fn parse_filter_state(
             continue;
         }
         if !iface.filter_input_v4.is_empty() {
-            state
-                .iface_filter_v4
-                .insert(iface.ifindex, iface.filter_input_v4.clone());
+            let key = qualify_filter_key("inet", &iface.filter_input_v4);
+            if filter_key_affects_tx_selection(&state, &key) {
+                state.iface_filter_v4_affects_tx_selection.insert(iface.ifindex);
+            }
+            state.iface_filter_v4.insert(iface.ifindex, key);
         }
         if !iface.filter_output_v4.is_empty() {
             state
                 .iface_filter_out_v4
-                .insert(iface.ifindex, iface.filter_output_v4.clone());
+                .insert(iface.ifindex, qualify_filter_key("inet", &iface.filter_output_v4));
         }
         if !iface.filter_input_v6.is_empty() {
-            state
-                .iface_filter_v6
-                .insert(iface.ifindex, iface.filter_input_v6.clone());
+            let key = qualify_filter_key("inet6", &iface.filter_input_v6);
+            if filter_key_affects_tx_selection(&state, &key) {
+                state.iface_filter_v6_affects_tx_selection.insert(iface.ifindex);
+            }
+            state.iface_filter_v6.insert(iface.ifindex, key);
         }
         if !iface.filter_output_v6.is_empty() {
             state
                 .iface_filter_out_v6
-                .insert(iface.ifindex, iface.filter_output_v6.clone());
+                .insert(iface.ifindex, qualify_filter_key("inet6", &iface.filter_output_v6));
         }
     }
 
-    state.lo0_filter_v4 = lo0_filter_v4.to_string();
-    state.lo0_filter_v6 = lo0_filter_v6.to_string();
+    state.lo0_filter_v4 = if lo0_filter_v4.is_empty() {
+        String::new()
+    } else {
+        qualify_filter_key("inet", lo0_filter_v4)
+    };
+    state.lo0_filter_v6 = if lo0_filter_v6.is_empty() {
+        String::new()
+    } else {
+        qualify_filter_key("inet6", lo0_filter_v6)
+    };
 
     state
+}
+
+fn qualify_filter_key(family: &str, filter_name: &str) -> String {
+    format!("{family}:{filter_name}")
 }
 
 fn parse_term(snap: &FirewallTermSnapshot) -> FilterTerm {
@@ -1187,6 +1226,60 @@ mod tests {
             0,
         );
         assert_eq!(result.forwarding_class.as_ref(), "bandwidth-10mb");
+    }
+
+    #[test]
+    fn parse_filter_state_prequalifies_interface_and_lo0_filter_keys() {
+        let ifaces = vec![crate::InterfaceSnapshot {
+            name: "reth0.80".into(),
+            ifindex: 7,
+            filter_input_v4: "ingress-v4".into(),
+            filter_output_v6: "egress-v6".into(),
+            ..Default::default()
+        }];
+        let state = parse_filter_state(
+            &[
+                FirewallFilterSnapshot {
+                    name: "ingress-v4".into(),
+                    family: "inet".into(),
+                    terms: vec![FirewallTermSnapshot {
+                        name: "tx-select".into(),
+                        forwarding_class: "best-effort".into(),
+                        ..Default::default()
+                    }],
+                },
+                FirewallFilterSnapshot {
+                    name: "egress-v6".into(),
+                    family: "inet6".into(),
+                    terms: vec![],
+                },
+                FirewallFilterSnapshot {
+                    name: "protect-re".into(),
+                    family: "inet".into(),
+                    terms: vec![],
+                },
+                FirewallFilterSnapshot {
+                    name: "protect-re-v6".into(),
+                    family: "inet6".into(),
+                    terms: vec![],
+                },
+            ],
+            &[],
+            &ifaces,
+            "protect-re",
+            "protect-re-v6",
+        );
+        assert_eq!(
+            state.iface_filter_v4.get(&7).map(String::as_str),
+            Some("inet:ingress-v4")
+        );
+        assert!(state.iface_filter_v4_affects_tx_selection.contains(&7));
+        assert_eq!(
+            state.iface_filter_out_v6.get(&7).map(String::as_str),
+            Some("inet6:egress-v6")
+        );
+        assert_eq!(state.lo0_filter_v4, "inet:protect-re");
+        assert_eq!(state.lo0_filter_v6, "inet6:protect-re-v6");
     }
 
     #[test]

@@ -1215,20 +1215,26 @@ pub(super) fn resolve_cos_tx_selection(
             meta.ingress_vlan_id,
         )
         .unwrap_or(meta.ingress_ifindex as i32);
-        let ingress_result = crate::filter::evaluate_interface_filter_counted(
+        if crate::filter::interface_filter_affects_tx_selection(
             &forwarding.filter_state,
             ingress_ifindex,
             is_v6,
-            flow_key.src_ip,
-            flow_key.dst_ip,
-            flow_key.protocol,
-            flow_key.src_port,
-            flow_key.dst_port,
-            meta.dscp,
-            meta.pkt_len as u64,
-        );
-        effective_dscp_rewrite = effective_dscp_rewrite.or(ingress_result.dscp_rewrite);
-        ingress_forwarding_class = ingress_result.forwarding_class;
+        ) {
+            let ingress_result = crate::filter::evaluate_interface_filter_counted(
+                &forwarding.filter_state,
+                ingress_ifindex,
+                is_v6,
+                flow_key.src_ip,
+                flow_key.dst_ip,
+                flow_key.protocol,
+                flow_key.src_port,
+                flow_key.dst_port,
+                meta.dscp,
+                meta.pkt_len as u64,
+            );
+            effective_dscp_rewrite = effective_dscp_rewrite.or(ingress_result.dscp_rewrite);
+            ingress_forwarding_class = ingress_result.forwarding_class;
+        }
     }
     let Some(iface) = iface else {
         return CoSTxSelection {
@@ -2937,6 +2943,106 @@ mod tests {
 
         assert_eq!(selection.queue_id, Some(1));
         assert_eq!(selection.dscp_rewrite, Some(0));
+    }
+
+    #[test]
+    fn resolve_cos_tx_selection_skips_ingress_filter_without_tx_selection_effects() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "reth1.0".into(),
+                    ifindex: 101,
+                    parent_ifindex: 5,
+                    vlan_id: 0,
+                    hardware_addr: "02:bf:72:00:61:01".into(),
+                    filter_input_v4: "sfmix-pbr".into(),
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "reth0.0".into(),
+                    ifindex: 202,
+                    hardware_addr: "02:bf:72:00:80:08".into(),
+                    cos_shaping_rate_bytes_per_sec: 10_000_000,
+                    cos_shaping_burst_bytes: 256_000,
+                    cos_scheduler_map: "wan-map".into(),
+                    ..Default::default()
+                },
+            ],
+            filters: vec![FirewallFilterSnapshot {
+                name: "sfmix-pbr".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "sfmix-route".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: "accept".into(),
+                    count: "tx-duplicate".into(),
+                    routing_instance: "sfmix".into(),
+                    ..Default::default()
+                }],
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 7,
+                }],
+                dscp_classifiers: vec![],
+                ieee8021_classifiers: vec![],
+                dscp_rewrite_rules: vec![],
+                schedulers: vec![CoSSchedulerSnapshot {
+                    name: "be-sched".into(),
+                    transmit_rate_bytes: 10_000_000,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 128_000,
+                }],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be-sched".into(),
+                    }],
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let forwarding = build_forwarding_state(&snapshot);
+        let selection = resolve_cos_tx_selection(
+            &forwarding,
+            202,
+            UserspaceDpMeta {
+                ingress_ifindex: 5,
+                ingress_vlan_id: 0,
+                addr_family: libc::AF_INET as u8,
+                dscp: 0,
+                pkt_len: 1500,
+                ..Default::default()
+            },
+            Some(&SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 443,
+            }),
+        );
+
+        assert_eq!(selection.queue_id, Some(7));
+        assert_eq!(selection.dscp_rewrite, None);
+        let filter = forwarding
+            .filter_state
+            .filters
+            .get("inet:sfmix-pbr")
+            .expect("filter");
+        assert_eq!(
+            filter.terms[0]
+                .counter
+                .packets
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]
