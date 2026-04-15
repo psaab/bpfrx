@@ -99,6 +99,8 @@ func TestCompileClassOfServiceSetSyntax(t *testing.T) {
 		"set class-of-service interfaces ge-0/0/2 unit 80 scheduler-map edge-map",
 		"set class-of-service interfaces ge-0/0/2 unit 80 classifiers dscp wan-classifier",
 		"set class-of-service interfaces ge-0/0/2 unit 80 classifiers ieee-802.1 wan-pcp",
+		"set class-of-service rewrite-rules dscp wan-rewrite forwarding-class best-effort loss-priority low code-point ef",
+		"set class-of-service interfaces ge-0/0/2 unit 80 rewrite-rules dscp wan-rewrite",
 		"set system dataplane-type userspace",
 	}
 	tree := &ConfigTree{}
@@ -131,6 +133,9 @@ func TestCompileClassOfServiceSetSyntax(t *testing.T) {
 	if got := unit.IEEE8021Classifier; got != "wan-pcp" {
 		t.Fatalf("ieee-802.1 classifier = %q, want wan-pcp", got)
 	}
+	if got := unit.DSCPRewriteRule; got != "wan-rewrite" {
+		t.Fatalf("dscp rewrite-rule = %q, want wan-rewrite", got)
+	}
 	if !cfg.ClassOfService.Schedulers["be-sched"].TransmitRateExact {
 		t.Fatal("expected be-sched transmit-rate exact")
 	}
@@ -147,6 +152,13 @@ func TestCompileClassOfServiceSetSyntax(t *testing.T) {
 	}
 	if got := pcpClassifier.Entries[0].CodePoints; len(got) != 1 || got[0] != 0 {
 		t.Fatalf("wan-pcp code-points = %v, want [0]", got)
+	}
+	rewriteRule := cfg.ClassOfService.DSCPRewriteRules["wan-rewrite"]
+	if rewriteRule == nil || len(rewriteRule.Entries) != 1 {
+		t.Fatalf("expected wan-rewrite entry, got %#v", rewriteRule)
+	}
+	if got := rewriteRule.Entries[0].DSCPValue; got != 46 {
+		t.Fatalf("wan-rewrite code-point = %d, want 46", got)
 	}
 }
 
@@ -255,6 +267,18 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
                     dscp missing-classifier;
                     ieee-802.1 missing-pcp-classifier;
                 }
+                rewrite-rules {
+                    dscp missing-rewrite;
+                }
+            }
+        }
+    }
+    rewrite-rules {
+        dscp edge-rewrite {
+            forwarding-class missing-class {
+                loss-priority low {
+                    code-point ef;
+                }
             }
         }
     }
@@ -285,10 +309,19 @@ func TestValidateClassOfServiceWarnings(t *testing.T) {
 	if !strings.Contains(warnings, `references undefined ieee-802.1 classifier "missing-pcp-classifier"`) {
 		t.Fatalf("expected undefined 802.1p classifier warning, got: %s", warnings)
 	}
+	if !strings.Contains(warnings, `references undefined dscp rewrite-rule "missing-rewrite"`) {
+		t.Fatalf("expected undefined dscp rewrite-rule warning, got: %s", warnings)
+	}
+	if !strings.Contains(warnings, `dscp rewrite-rule "edge-rewrite" references undefined forwarding-class "missing-class"`) {
+		t.Fatalf("expected undefined dscp rewrite-rule forwarding-class warning, got: %s", warnings)
+	}
 	if !strings.Contains(warnings, "dscp/802.1p classifier loss-priority is accepted for compatibility but not yet enforced") {
 		t.Fatalf("expected classifier loss-priority warning, got: %s", warnings)
 	}
-	if !strings.Contains(warnings, "class-of-service shaping and dscp/802.1p classifier attachment are only implemented in the userspace dataplane") {
+	if !strings.Contains(warnings, "dscp rewrite-rule loss-priority is accepted for compatibility but not yet enforced") {
+		t.Fatalf("expected rewrite-rule loss-priority warning, got: %s", warnings)
+	}
+	if !strings.Contains(warnings, "class-of-service shaping, classifier attachment, and dscp rewrite-rule attachment are only implemented in the userspace dataplane") {
 		t.Fatalf("expected dataplane warning, got: %s", warnings)
 	}
 }
@@ -374,20 +407,20 @@ func TestCompileClassOfServiceHierarchicalIEEE8021Classifier(t *testing.T) {
             }
         }
     }
-    interfaces {
-        ge-0/0/1 {
-            unit 0 {
-                classifiers {
-                    ieee-802.1 edge-pcp;
-                }
-            }
-        }
-    }
-}
-system {
-    dataplane-type userspace;
-}
-`
+	    interfaces {
+	        ge-0/0/1 {
+	            unit 0 {
+	                classifiers {
+	                    ieee-802.1 edge-pcp;
+	                }
+	            }
+	        }
+	    }
+	}
+	system {
+	    dataplane-type userspace;
+	}
+	`
 	parser := NewParser(input)
 	tree, errs := parser.Parse()
 	if len(errs) > 0 {
@@ -412,6 +445,67 @@ system {
 	}
 	if got := classifier.Entries[1].CodePoints; len(got) != 1 || got[0] != 0 {
 		t.Fatalf("best-effort code-points = %v, want [0]", got)
+	}
+}
+
+func TestCompileClassOfServiceHierarchicalDSCPRewriteRule(t *testing.T) {
+	input := `class-of-service {
+    forwarding-classes {
+        queue 0 best-effort;
+        queue 5 voice;
+    }
+    rewrite-rules {
+        dscp edge-rewrite {
+            forwarding-class voice {
+                loss-priority low {
+                    code-point ef;
+                }
+            }
+            forwarding-class best-effort {
+                loss-priority low {
+                    code-point default;
+                }
+            }
+        }
+    }
+    interfaces {
+        ge-0/0/1 {
+            unit 0 {
+                rewrite-rules {
+                    dscp edge-rewrite;
+                }
+            }
+        }
+    }
+}
+system {
+    dataplane-type userspace;
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile error: %v", err)
+	}
+	rewriteRule := cfg.ClassOfService.DSCPRewriteRules["edge-rewrite"]
+	if rewriteRule == nil {
+		t.Fatal("expected edge-rewrite")
+	}
+	if got := cfg.ClassOfService.Interfaces["ge-0/0/1"].Units[0].DSCPRewriteRule; got != "edge-rewrite" {
+		t.Fatalf("unit rewrite-rule = %q, want edge-rewrite", got)
+	}
+	if len(rewriteRule.Entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(rewriteRule.Entries))
+	}
+	if got := rewriteRule.Entries[0].DSCPValue; got != 46 {
+		t.Fatalf("voice code-point = %d, want 46", got)
+	}
+	if got := rewriteRule.Entries[1].DSCPValue; got != 0 {
+		t.Fatalf("best-effort code-point = %d, want 0", got)
 	}
 }
 

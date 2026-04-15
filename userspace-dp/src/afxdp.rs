@@ -987,6 +987,12 @@ fn poll_binding(
                                             )
                                         });
                                         if let Some(frame_len) = frame_len {
+                                            let cos = resolve_cos_tx_selection(
+                                                forwarding,
+                                                cached_decision.resolution.egress_ifindex,
+                                                meta,
+                                                Some(&flow.forward_key),
+                                            );
                                             binding.pending_tx_prepared.push_back(
                                                 PreparedTxRequest {
                                                     offset: desc.addr,
@@ -1001,12 +1007,8 @@ fn poll_binding(
                                                     egress_ifindex: cached_decision
                                                         .resolution
                                                         .egress_ifindex,
-                                                    cos_queue_id: resolve_cos_queue_id(
-                                                        forwarding,
-                                                        cached_decision.resolution.egress_ifindex,
-                                                        meta,
-                                                        Some(&flow.forward_key),
-                                                    ),
+                                                    cos_queue_id: cos.queue_id,
+                                                    dscp_rewrite: cos.dscp_rewrite,
                                                 },
                                             );
                                             binding.pending_in_place_tx_packets += 1;
@@ -1574,6 +1576,12 @@ fn poll_binding(
                                                         icmp_decision.resolution.egress_ifindex,
                                                     )
                                                 };
+                                            let cos = resolve_cos_tx_selection(
+                                                forwarding,
+                                                icmp_decision.resolution.egress_ifindex,
+                                                meta,
+                                                None,
+                                            );
                                             binding.scratch_forwards.push(PendingForwardRequest {
                                                 target_ifindex,
                                                 target_binding_index: binding_lookup.target_index(
@@ -1593,12 +1601,8 @@ fn poll_binding(
                                                 flow_key: None,
                                                 nat64_reverse: None,
                                                 prebuilt_frame: Some(rewritten_frame),
-                                                cos_queue_id: resolve_cos_queue_id(
-                                                    forwarding,
-                                                    icmp_decision.resolution.egress_ifindex,
-                                                    meta,
-                                                    None,
-                                                ),
+                                                cos_queue_id: cos.queue_id,
+                                                dscp_rewrite: cos.dscp_rewrite,
                                             });
                                             recycle_now = false;
                                             #[cfg(feature = "debug-log")]
@@ -2919,6 +2923,12 @@ fn retry_pending_neigh(
                         ingress_queue,
                         target_ifindex,
                     ) {
+                        let cos = resolve_cos_tx_selection(
+                            forwarding,
+                            decision.resolution.egress_ifindex,
+                            pkt.meta,
+                            None,
+                        );
                         let req = PreparedTxRequest {
                             offset: pkt.desc.addr,
                             len: frame_len,
@@ -2928,12 +2938,8 @@ fn retry_pending_neigh(
                             expected_protocol: pkt.meta.protocol,
                             flow_key: None,
                             egress_ifindex: decision.resolution.egress_ifindex,
-                            cos_queue_id: resolve_cos_queue_id(
-                                forwarding,
-                                decision.resolution.egress_ifindex,
-                                pkt.meta,
-                                None,
-                            ),
+                            cos_queue_id: cos.queue_id,
+                            dscp_rewrite: cos.dscp_rewrite,
                         };
                         if target_idx == binding_index {
                             binding.pending_tx_prepared.push_back(req);
@@ -3032,6 +3038,12 @@ fn build_live_forward_request_from_frame(
     {
         decision.resolution.src_mac = zone_redirect.src_mac;
     }
+    let cos = resolve_cos_tx_selection(
+        forwarding,
+        decision.resolution.egress_ifindex,
+        meta,
+        flow.map(|flow| &flow.forward_key),
+    );
     Some(PendingForwardRequest {
         target_ifindex,
         target_binding_index,
@@ -3046,12 +3058,8 @@ fn build_live_forward_request_from_frame(
         flow_key: flow.map(|flow| flow.forward_key.clone()),
         nat64_reverse: None,
         prebuilt_frame: None,
-        cos_queue_id: resolve_cos_queue_id(
-            forwarding,
-            decision.resolution.egress_ifindex,
-            meta,
-            flow.map(|flow| &flow.forward_key),
-        ),
+        cos_queue_id: cos.queue_id,
+        dscp_rewrite: cos.dscp_rewrite,
     })
 }
 

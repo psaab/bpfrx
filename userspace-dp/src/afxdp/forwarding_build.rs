@@ -490,6 +490,28 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
             )
         })
         .collect::<FastMap<_, _>>();
+    let dscp_rewrite_rules = cos
+        .dscp_rewrite_rules
+        .iter()
+        .filter(|rewrite_rule| !rewrite_rule.name.is_empty())
+        .map(|rewrite_rule| {
+            let mut dscp_by_forwarding_class = FastMap::default();
+            for entry in &rewrite_rule.entries {
+                if entry.forwarding_class.is_empty() {
+                    continue;
+                }
+                dscp_by_forwarding_class
+                    .entry(entry.forwarding_class.clone())
+                    .or_insert(entry.dscp_value);
+            }
+            (
+                rewrite_rule.name.clone(),
+                CoSDSCPRewriteRuleConfig {
+                    dscp_by_forwarding_class,
+                },
+            )
+        })
+        .collect::<FastMap<_, _>>();
 
     let schedulers = cos
         .schedulers
@@ -515,6 +537,7 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
             default_cos_burst_bytes(iface.cos_shaping_rate_bytes_per_sec)
         };
         let mut queues = Vec::new();
+        let dscp_rewrite_rule = dscp_rewrite_rules.get(&iface.cos_dscp_rewrite_rule);
         if let Some(sched_map) = scheduler_maps.get(&iface.cos_scheduler_map) {
             for entry in &sched_map.entries {
                 let Some(queue_id) = class_to_queue.get(&entry.forwarding_class).copied() else {
@@ -545,6 +568,12 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                         .map(|sched| sched.buffer_size_bytes)
                         .filter(|size| *size > 0)
                         .unwrap_or(burst_bytes),
+                    dscp_rewrite: dscp_rewrite_rule.and_then(|rewrite_rule| {
+                        rewrite_rule
+                            .dscp_by_forwarding_class
+                            .get(&entry.forwarding_class)
+                            .copied()
+                    }),
                 });
             }
         }
@@ -557,6 +586,9 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                 exact: false,
                 surplus_weight: 1,
                 buffer_bytes: burst_bytes,
+                dscp_rewrite: dscp_rewrite_rule
+                    .and_then(|rewrite_rule| rewrite_rule.dscp_by_forwarding_class.get("best-effort"))
+                    .copied(),
             });
         }
         queues.sort_by(|a, b| a.queue_id.cmp(&b.queue_id));
@@ -585,6 +617,7 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
 
     state.dscp_classifiers = dscp_classifiers;
     state.ieee8021_classifiers = ieee8021_classifiers;
+    state.dscp_rewrite_rules = dscp_rewrite_rules;
 
     state
 }
@@ -621,9 +654,9 @@ mod tests {
     use super::*;
     use crate::{
         ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
-        CoSForwardingClassSnapshot, CoSIEEE8021ClassifierEntrySnapshot,
-        CoSIEEE8021ClassifierSnapshot, CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot,
-        CoSSchedulerSnapshot,
+        CoSDSCPRewriteRuleEntrySnapshot, CoSDSCPRewriteRuleSnapshot, CoSForwardingClassSnapshot,
+        CoSIEEE8021ClassifierEntrySnapshot, CoSIEEE8021ClassifierSnapshot,
+        CoSSchedulerMapEntrySnapshot, CoSSchedulerMapSnapshot, CoSSchedulerSnapshot,
     };
 
     #[test]
@@ -678,6 +711,7 @@ mod tests {
                 }],
                 dscp_classifiers: vec![],
                 ieee8021_classifiers: vec![],
+                dscp_rewrite_rules: vec![],
             }),
             ..Default::default()
         };
@@ -754,6 +788,7 @@ mod tests {
                 }],
                 dscp_classifiers: vec![],
                 ieee8021_classifiers: vec![],
+                dscp_rewrite_rules: vec![],
                 schedulers: vec![CoSSchedulerSnapshot {
                     name: "be-sched".into(),
                     transmit_rate_bytes: 0,
@@ -788,6 +823,7 @@ mod tests {
                 cos_scheduler_map: "wan-map".into(),
                 cos_dscp_classifier: "wan-classifier".into(),
                 cos_ieee8021_classifier: "wan-pcp".into(),
+                cos_dscp_rewrite_rule: "wan-rewrite".into(),
                 ..Default::default()
             }],
             class_of_service: Some(ClassOfServiceSnapshot {
@@ -822,6 +858,14 @@ mod tests {
                         forwarding_class: "voice".into(),
                         loss_priority: "low".into(),
                         code_points: vec![5],
+                    }],
+                }],
+                dscp_rewrite_rules: vec![CoSDSCPRewriteRuleSnapshot {
+                    name: "wan-rewrite".into(),
+                    entries: vec![CoSDSCPRewriteRuleEntrySnapshot {
+                        forwarding_class: "voice".into(),
+                        loss_priority: "low".into(),
+                        dscp_value: 46,
                     }],
                 }],
                 schedulers: vec![
@@ -862,6 +906,7 @@ mod tests {
         let iface = state.interfaces.get(&42).expect("missing CoS interface");
         assert_eq!(iface.dscp_classifier, "wan-classifier");
         assert_eq!(iface.ieee8021_classifier, "wan-pcp");
+        assert_eq!(iface.queues.iter().find(|queue| queue.queue_id == 5).and_then(|queue| queue.dscp_rewrite), Some(46));
         assert!(iface.queues.iter().any(|queue| queue.queue_id == 5));
         let classifier = state
             .dscp_classifiers

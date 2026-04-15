@@ -1503,6 +1503,7 @@ mod tests {
             flow_key: None,
             egress_ifindex: ifindex,
             cos_queue_id: Some(4),
+            dscp_rewrite: None,
         }
     }
 
@@ -1529,6 +1530,7 @@ mod tests {
                     exact: false,
                     surplus_weight: 1,
                     buffer_bytes: 32 * 1024,
+                    dscp_rewrite: None,
                 }],
             },
         );
@@ -1550,6 +1552,7 @@ mod tests {
                 surplus_weight: 1,
                 surplus_deficit: 512,
                 buffer_bytes: 32 * 1024,
+                dscp_rewrite: None,
                 tokens: 0,
                 last_refill_ns: 0,
                 queued_bytes,

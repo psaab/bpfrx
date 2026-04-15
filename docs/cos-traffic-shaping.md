@@ -830,6 +830,10 @@ Notes for this specific test:
   on whatever queue happens to be first in the scheduler map
 - DSCP BA classifiers are a fallback input to CoS queue selection today; an
   explicit firewall filter `then forwarding-class ...` decision still wins
+- DSCP rewrite-rules can also be attached under
+  `class-of-service interfaces ... unit ... rewrite-rules dscp <name>` on
+  shaped userspace egress interfaces; they apply after queue selection and act
+  as a fallback behind any explicit firewall-filter DSCP rewrite action
 - 802.1p BA classifiers are also available as a fallback queue selector on
   userspace interfaces; they use the ingress VLAN PCP preserved from tagged
   XDP traffic, including priority-tagged frames with VLAN ID 0
@@ -838,6 +842,8 @@ Notes for this specific test:
 - use `set class-of-service schedulers <name> transmit-rate <rate> exact` for
   queues that must stay capped at their guarantee instead of borrowing surplus
 - `loss-priority` on CoS DSCP / 802.1p classifiers is accepted for syntax
+  compatibility but is not enforced yet
+- `loss-priority` on CoS DSCP rewrite-rules is accepted for syntax
   compatibility but is not enforced yet
 
 Suggested verification commands:

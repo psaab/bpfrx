@@ -18,6 +18,9 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	if cos.IEEE8021Classifiers == nil {
 		cos.IEEE8021Classifiers = make(map[string]*CoSIEEE8021Classifier)
 	}
+	if cos.DSCPRewriteRules == nil {
+		cos.DSCPRewriteRules = make(map[string]*CoSDSCPRewriteRule)
+	}
 	if cos.Schedulers == nil {
 		cos.Schedulers = make(map[string]*CoSScheduler)
 	}
@@ -114,6 +117,42 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 		}
 	}
 
+	if rewriteRulesNode := node.FindChild("rewrite-rules"); rewriteRulesNode != nil {
+		for _, inst := range namedInstances(rewriteRulesNode.FindChildren("dscp")) {
+			rewriteRule := &CoSDSCPRewriteRule{Name: inst.name}
+			for _, fcNode := range inst.node.FindChildren("forwarding-class") {
+				className := ""
+				if len(fcNode.Keys) >= 2 {
+					className = fcNode.Keys[1]
+				}
+				if className == "" {
+					continue
+				}
+				for _, lpNode := range fcNode.FindChildren("loss-priority") {
+					lossPriority := ""
+					if len(lpNode.Keys) >= 2 {
+						lossPriority = lpNode.Keys[1]
+					}
+					if lossPriority == "" {
+						lossPriority = nodeVal(lpNode)
+					}
+					codePoint, ok := collectCoSDSCPRewriteCodePoint(lpNode)
+					if !ok {
+						continue
+					}
+					rewriteRule.Entries = append(rewriteRule.Entries, &CoSDSCPRewriteRuleEntry{
+						ForwardingClass: className,
+						LossPriority:    lossPriority,
+						DSCPValue:       codePoint,
+					})
+				}
+			}
+			if len(rewriteRule.Entries) > 0 {
+				cos.DSCPRewriteRules[rewriteRule.Name] = rewriteRule
+			}
+		}
+	}
+
 	for _, inst := range namedInstances(node.FindChildren("schedulers")) {
 		sched := &CoSScheduler{Name: inst.name}
 		for _, child := range inst.node.Children {
@@ -194,7 +233,12 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 					unit.IEEE8021Classifier = nodeVal(ieeeNode)
 				}
 			}
-			if unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" || unit.DSCPClassifier != "" || unit.IEEE8021Classifier != "" {
+			if rewriteRulesNode := unitNode.FindChild("rewrite-rules"); rewriteRulesNode != nil {
+				if dscpNode := rewriteRulesNode.FindChild("dscp"); dscpNode != nil {
+					unit.DSCPRewriteRule = nodeVal(dscpNode)
+				}
+			}
+			if unit.ShapingRateBytes > 0 || unit.BurstSizeBytes > 0 || unit.SchedulerMap != "" || unit.DSCPClassifier != "" || unit.IEEE8021Classifier != "" || unit.DSCPRewriteRule != "" {
 				iface.Units[unitID] = unit
 			}
 		}
@@ -263,6 +307,25 @@ func collectCoS8021CodePoints(node *Node) []uint8 {
 		}
 	}
 	return values
+}
+
+func collectCoSDSCPRewriteCodePoint(node *Node) (uint8, bool) {
+	for _, child := range node.FindChildren("code-point") {
+		if len(child.Keys) < 2 {
+			continue
+		}
+		if values := expandCoSCodePointToken(child.Keys[1]); len(values) > 0 {
+			return values[0], true
+		}
+	}
+	for _, child := range node.FindChildren("code-points") {
+		for _, raw := range child.Keys[1:] {
+			if values := expandCoSCodePointToken(raw); len(values) > 0 {
+				return values[0], true
+			}
+		}
+	}
+	return 0, false
 }
 
 func expandCoSCodePointToken(raw string) []uint8 {

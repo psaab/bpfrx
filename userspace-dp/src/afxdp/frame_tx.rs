@@ -25,8 +25,10 @@ pub(super) fn enqueue_pending_forwards(
     for mut request in pending_forwards.drain(..) {
         let source_offset = request.source_offset;
         let ingress_slot = ingress_binding.slot;
-        if request.cos_queue_id.is_none() {
-            request.cos_queue_id = resolve_pending_forward_cos_queue_id(forwarding, &request);
+        if request.cos_queue_id.is_none() && request.dscp_rewrite.is_none() {
+            let cos = resolve_pending_forward_cos_tx_selection(forwarding, &request);
+            request.cos_queue_id = cos.queue_id;
+            request.dscp_rewrite = cos.dscp_rewrite;
         }
 
         // Fast path: prebuilt frame (e.g. ICMP error NAT reversal).
@@ -54,6 +56,7 @@ pub(super) fn enqueue_pending_forwards(
                 flow_key: None,
                 egress_ifindex: request.decision.resolution.egress_ifindex,
                 cos_queue_id: request.cos_queue_id,
+                dscp_rewrite: request.dscp_rewrite,
             });
             bound_pending_tx_local(target_binding);
             dbg.enqueue_ok += 1;
@@ -230,6 +233,7 @@ pub(super) fn enqueue_pending_forwards(
                         flow_key: request.flow_key.clone(),
                         egress_ifindex: request.decision.resolution.egress_ifindex,
                         cos_queue_id: request.cos_queue_id,
+                        dscp_rewrite: request.dscp_rewrite,
                     });
                     bound_pending_tx_local(target_binding);
                     dbg.enqueue_ok += 1;
@@ -318,6 +322,7 @@ pub(super) fn enqueue_pending_forwards(
                                     flow_key: request.flow_key.clone(),
                                     egress_ifindex: request.decision.resolution.egress_ifindex,
                                     cos_queue_id: request.cos_queue_id,
+                                    dscp_rewrite: request.dscp_rewrite,
                                 });
                             bound_pending_tx_prepared(target_binding);
                             target_binding.pending_in_place_tx_packets += 1;
@@ -393,6 +398,7 @@ pub(super) fn enqueue_pending_forwards(
                                     flow_key: request.flow_key.clone(),
                                     egress_ifindex: request.decision.resolution.egress_ifindex,
                                     cos_queue_id: request.cos_queue_id,
+                                    dscp_rewrite: request.dscp_rewrite,
                                 });
                                 bound_pending_tx_local(target_binding);
                                 dbg.enqueue_ok += 1;
@@ -535,6 +541,7 @@ pub(super) fn enqueue_pending_forwards(
                                         flow_key: request.flow_key.clone(),
                                         egress_ifindex: request.decision.resolution.egress_ifindex,
                                         cos_queue_id: request.cos_queue_id,
+                                        dscp_rewrite: request.dscp_rewrite,
                                     });
                                 bound_pending_tx_prepared(target_binding);
                                 dbg.enqueue_ok += 1;
@@ -634,6 +641,7 @@ pub(super) fn enqueue_pending_forwards(
                                     flow_key: request.flow_key.clone(),
                                     egress_ifindex: request.decision.resolution.egress_ifindex,
                                     cos_queue_id: request.cos_queue_id,
+                                    dscp_rewrite: request.dscp_rewrite,
                                 });
                                 bound_pending_tx_local(target_binding);
                                 dbg.enqueue_ok += 1;
@@ -820,11 +828,11 @@ pub(super) fn resolve_tx_binding_ifindex(forwarding: &ForwardingState, egress_if
         .unwrap_or(egress_ifindex)
 }
 
-fn resolve_pending_forward_cos_queue_id(
+fn resolve_pending_forward_cos_tx_selection(
     forwarding: &ForwardingState,
     request: &PendingForwardRequest,
-) -> Option<u8> {
-    resolve_cos_queue_id(
+) -> CoSTxSelection {
+    resolve_cos_tx_selection(
         forwarding,
         request.decision.resolution.egress_ifindex,
         request.meta,
@@ -1296,6 +1304,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
             flow_key: flow_key.clone(),
             egress_ifindex: decision.resolution.egress_ifindex,
             cos_queue_id,
+            dscp_rewrite: None,
         });
         total_bytes += frame_len as u64;
         max_frame = max_frame.max(frame_len as u32);

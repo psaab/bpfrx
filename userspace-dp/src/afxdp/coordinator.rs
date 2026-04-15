@@ -1224,6 +1224,12 @@ impl Coordinator {
                             format!("binding slot {} has no live state", target_slot)
                         })?;
                         let frame = build_injected_packet(&req, dst, resolution, egress)?;
+                        let cos = resolve_cos_tx_selection(
+                            &self.forwarding,
+                            resolution.egress_ifindex,
+                            meta,
+                            None,
+                        );
                         target_live.enqueue_tx(TxRequest {
                             bytes: frame,
                             expected_ports: None,
@@ -1231,12 +1237,8 @@ impl Coordinator {
                             expected_protocol: 0,
                             flow_key: None,
                             egress_ifindex: resolution.egress_ifindex,
-                            cos_queue_id: resolve_cos_queue_id(
-                                &self.forwarding,
-                                resolution.egress_ifindex,
-                                meta,
-                                None,
-                            ),
+                            cos_queue_id: cos.queue_id,
+                            dscp_rewrite: cos.dscp_rewrite,
                         })?;
                     }
                 } else {
@@ -1685,6 +1687,7 @@ mod tests {
             }],
             dscp_classifiers: vec![],
             ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
         });
 
         coordinator.refresh_runtime_snapshot(&snapshot);

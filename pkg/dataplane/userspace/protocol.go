@@ -123,12 +123,14 @@ type InterfaceSnapshot struct {
 	CoSSchedulerMap           string                     `json:"cos_scheduler_map,omitempty"`
 	CoSDSCPClassifier         string                     `json:"cos_dscp_classifier,omitempty"`
 	CoSIEEE8021Classifier     string                     `json:"cos_ieee8021_classifier,omitempty"`
+	CoSDSCPRewriteRule        string                     `json:"cos_dscp_rewrite_rule,omitempty"`
 }
 
 type ClassOfServiceSnapshot struct {
 	ForwardingClasses   []CoSForwardingClassSnapshot    `json:"forwarding_classes,omitempty"`
 	DSCPClassifiers     []CoSDSCPClassifierSnapshot     `json:"dscp_classifiers,omitempty"`
 	IEEE8021Classifiers []CoSIEEE8021ClassifierSnapshot `json:"ieee8021_classifiers,omitempty"`
+	DSCPRewriteRules    []CoSDSCPRewriteRuleSnapshot    `json:"dscp_rewrite_rules,omitempty"`
 	Schedulers          []CoSSchedulerSnapshot          `json:"schedulers,omitempty"`
 	SchedulerMaps       []CoSSchedulerMapSnapshot       `json:"scheduler_maps,omitempty"`
 }
@@ -158,6 +160,17 @@ type CoSIEEE8021ClassifierEntrySnapshot struct {
 	ForwardingClass string  `json:"forwarding_class,omitempty"`
 	LossPriority    string  `json:"loss_priority,omitempty"`
 	CodePoints      []uint8 `json:"code_points,omitempty"`
+}
+
+type CoSDSCPRewriteRuleSnapshot struct {
+	Name    string                            `json:"name"`
+	Entries []CoSDSCPRewriteRuleEntrySnapshot `json:"entries,omitempty"`
+}
+
+type CoSDSCPRewriteRuleEntrySnapshot struct {
+	ForwardingClass string `json:"forwarding_class,omitempty"`
+	LossPriority    string `json:"loss_priority,omitempty"`
+	DSCPValue       uint8  `json:"dscp_value,omitempty"`
 }
 
 type CoSSchedulerSnapshot struct {

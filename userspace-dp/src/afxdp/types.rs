@@ -177,6 +177,7 @@ pub(super) struct CoSState {
     pub(super) interfaces: FastMap<i32, CoSInterfaceConfig>,
     pub(super) dscp_classifiers: FastMap<String, CoSDSCPClassifierConfig>,
     pub(super) ieee8021_classifiers: FastMap<String, CoSIEEE8021ClassifierConfig>,
+    pub(super) dscp_rewrite_rules: FastMap<String, CoSDSCPRewriteRuleConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -200,6 +201,11 @@ pub(super) struct CoSIEEE8021ClassifierConfig {
     pub(super) queue_by_pcp: FastMap<u8, u8>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct CoSDSCPRewriteRuleConfig {
+    pub(super) dscp_by_forwarding_class: FastMap<String, u8>,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct CoSQueueConfig {
     pub(super) queue_id: u8,
@@ -209,6 +215,7 @@ pub(super) struct CoSQueueConfig {
     pub(super) exact: bool,
     pub(super) surplus_weight: u32,
     pub(super) buffer_bytes: u64,
+    pub(super) dscp_rewrite: Option<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -547,6 +554,7 @@ pub(super) struct TxRequest {
     pub(super) flow_key: Option<SessionKey>,
     pub(super) egress_ifindex: i32,
     pub(super) cos_queue_id: Option<u8>,
+    pub(super) dscp_rewrite: Option<u8>,
 }
 
 pub(super) struct PendingForwardRequest {
@@ -564,6 +572,7 @@ pub(super) struct PendingForwardRequest {
     pub(super) nat64_reverse: Option<Nat64ReverseInfo>,
     pub(super) prebuilt_frame: Option<Vec<u8>>,
     pub(super) cos_queue_id: Option<u8>,
+    pub(super) dscp_rewrite: Option<u8>,
 }
 
 pub(super) struct PreparedTxRequest {
@@ -579,6 +588,7 @@ pub(super) struct PreparedTxRequest {
     pub(super) flow_key: Option<SessionKey>,
     pub(super) egress_ifindex: i32,
     pub(super) cos_queue_id: Option<u8>,
+    pub(super) dscp_rewrite: Option<u8>,
 }
 
 pub(super) struct CoSInterfaceRuntime {
@@ -604,6 +614,7 @@ pub(super) struct CoSQueueRuntime {
     pub(super) surplus_weight: u32,
     pub(super) surplus_deficit: u64,
     pub(super) buffer_bytes: u64,
+    pub(super) dscp_rewrite: Option<u8>,
     pub(super) tokens: u64,
     pub(super) last_refill_ns: u64,
     pub(super) queued_bytes: u64,

@@ -2753,6 +2753,76 @@ func TestBuildClassOfServiceSnapshotIncludesIEEE8021Classifier(t *testing.T) {
 	}
 }
 
+func TestBuildClassOfServiceSnapshotIncludesDSCPRewriteRule(t *testing.T) {
+	cfg := &config.Config{
+		ClassOfService: &config.ClassOfServiceConfig{
+			ForwardingClasses: map[string]*config.CoSForwardingClass{
+				"best-effort": {Name: "best-effort", Queue: 0},
+				"voice":       {Name: "voice", Queue: 5},
+			},
+			DSCPRewriteRules: map[string]*config.CoSDSCPRewriteRule{
+				"wan-rewrite": {
+					Name: "wan-rewrite",
+					Entries: []*config.CoSDSCPRewriteRuleEntry{
+						{
+							ForwardingClass: "voice",
+							LossPriority:    "low",
+							DSCPValue:       46,
+						},
+					},
+				},
+			},
+			Interfaces: map[string]*config.CoSInterface{
+				"reth0": {
+					Name: "reth0",
+					Units: map[int]*config.CoSInterfaceUnit{
+						80: {
+							Unit:            80,
+							DSCPRewriteRule: "wan-rewrite",
+						},
+					},
+				},
+			},
+		},
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"reth0": {
+					Name: "reth0",
+					Units: map[int]*config.InterfaceUnit{
+						80: {Number: 80},
+					},
+				},
+			},
+		},
+	}
+
+	interfaces := buildInterfaceSnapshots(cfg)
+	var unitSnap *InterfaceSnapshot
+	for i := range interfaces {
+		if interfaces[i].Name == "reth0.80" {
+			unitSnap = &interfaces[i]
+			break
+		}
+	}
+	if unitSnap == nil {
+		t.Fatal("reth0.80 snapshot not found")
+	}
+	if got := unitSnap.CoSDSCPRewriteRule; got != "wan-rewrite" {
+		t.Fatalf("CoSDSCPRewriteRule = %q, want wan-rewrite", got)
+	}
+
+	snap := buildClassOfServiceSnapshot(cfg)
+	if snap == nil {
+		t.Fatal("expected non-nil class-of-service snapshot")
+	}
+	if len(snap.DSCPRewriteRules) != 1 {
+		t.Fatalf("DSCPRewriteRules len = %d, want 1", len(snap.DSCPRewriteRules))
+	}
+	if got := snap.DSCPRewriteRules[0].Entries[0].DSCPValue; got != 46 {
+		t.Fatalf("DSCPValue = %d, want 46", got)
+	}
+}
+
 func TestBuildScreenSnapshotsIncludesAdvancedFields(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.Zones = map[string]*config.ZoneConfig{
