@@ -1322,18 +1322,42 @@ fn enqueue_prepared_into_cos(
     if !ensure_cos_interface_runtime(binding, forwarding, egress_ifindex, now_ns) {
         return Err(req);
     }
-    let item_len = req.len as u64;
+    let Some(local_req) = clone_prepared_request_for_cos(binding.umem.area(), &req) else {
+        return Err(req);
+    };
+    // Once shaped traffic is queued behind the CoS scheduler, it must not keep holding
+    // owner TX frames. Otherwise a local item can reach the head of the same queue while
+    // all free frames are trapped inside queued prepared items, leading to a persistent
+    // "no free TX frame available" livelock.
+    recycle_prepared_immediately(binding, &req);
+    let item_len = local_req.bytes.len() as u64;
     match enqueue_cos_item(
         binding,
         egress_ifindex,
-        req.cos_queue_id,
+        local_req.cos_queue_id,
         item_len,
-        CoSPendingTxItem::Prepared(req),
+        CoSPendingTxItem::Local(local_req),
     ) {
         Ok(()) => Ok(()),
-        Err(CoSPendingTxItem::Prepared(req)) => Err(req),
-        Err(CoSPendingTxItem::Local(_)) => unreachable!("prepared request returned local item"),
+        Err(CoSPendingTxItem::Local(_)) => Ok(()),
+        Err(CoSPendingTxItem::Prepared(_)) => {
+            unreachable!("prepared queueing converted to local request")
+        }
     }
+}
+
+fn clone_prepared_request_for_cos(area: &MmapArea, req: &PreparedTxRequest) -> Option<TxRequest> {
+    let frame = area.slice(req.offset as usize, req.len as usize)?.to_vec();
+    Some(TxRequest {
+        bytes: frame,
+        expected_ports: req.expected_ports,
+        expected_addr_family: req.expected_addr_family,
+        expected_protocol: req.expected_protocol,
+        flow_key: req.flow_key.clone(),
+        egress_ifindex: req.egress_ifindex,
+        cos_queue_id: req.cos_queue_id,
+        dscp_rewrite: req.dscp_rewrite,
+    })
 }
 
 fn ensure_cos_interface_runtime(
@@ -2490,6 +2514,67 @@ mod tests {
             Some(&PreparedTxRecycle::FillOnSlot(7))
         );
         assert!(!in_flight_prepared_recycles.contains_key(&41));
+    }
+
+    #[test]
+    fn clone_prepared_request_for_cos_returns_local_copy_with_metadata() {
+        let mut area = MmapArea::new(4096).expect("mmap");
+        let payload = [0xde, 0xad, 0xbe, 0xef];
+        area.slice_mut(128, payload.len())
+            .expect("slice")
+            .copy_from_slice(&payload);
+        let req = PreparedTxRequest {
+            offset: 128,
+            len: payload.len() as u32,
+            recycle: PreparedTxRecycle::FreeTxFrame,
+            expected_ports: Some((1111, 2222)),
+            expected_addr_family: libc::AF_INET6 as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: Some(SessionKey {
+                addr_family: libc::AF_INET6 as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+                dst_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+                src_port: 1111,
+                dst_port: 2222,
+            }),
+            egress_ifindex: 80,
+            cos_queue_id: Some(4),
+            dscp_rewrite: Some(46),
+        };
+
+        let local = clone_prepared_request_for_cos(&area, &req).expect("local copy");
+
+        assert_eq!(local.bytes, payload);
+        assert_eq!(local.expected_ports, Some((1111, 2222)));
+        assert_eq!(local.expected_addr_family, libc::AF_INET6 as u8);
+        assert_eq!(local.expected_protocol, PROTO_TCP);
+        assert_eq!(local.egress_ifindex, 80);
+        assert_eq!(local.cos_queue_id, Some(4));
+        assert_eq!(local.dscp_rewrite, Some(46));
+        assert_eq!(
+            local.flow_key.as_ref().map(|key| (key.src_port, key.dst_port)),
+            Some((1111, 2222))
+        );
+    }
+
+    #[test]
+    fn clone_prepared_request_for_cos_rejects_out_of_range_offset() {
+        let area = MmapArea::new(256).expect("mmap");
+        let req = PreparedTxRequest {
+            offset: 1024,
+            len: 64,
+            recycle: PreparedTxRecycle::FreeTxFrame,
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        };
+
+        assert!(clone_prepared_request_for_cos(&area, &req).is_none());
     }
 
     #[test]
