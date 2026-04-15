@@ -95,6 +95,8 @@ struct UserspaceDpMeta {
     ingress_ifindex: u32,
     rx_queue_index: u32,
     ingress_vlan_id: u16,
+    ingress_pcp: u8,
+    ingress_vlan_present: u8,
     ingress_zone: u16,
     routing_table: u32,
     l3_offset: u16,
@@ -116,6 +118,15 @@ struct UserspaceDpMeta {
     fib_generation: u32,
     reserved2: u32,
 }
+
+const _: [(); 96] = [(); mem::size_of::<UserspaceDpMeta>()];
+const _: [(); 18] = [(); mem::offset_of!(UserspaceDpMeta, ingress_pcp)];
+const _: [(); 19] = [(); mem::offset_of!(UserspaceDpMeta, ingress_vlan_present)];
+const _: [(); 20] = [(); mem::offset_of!(UserspaceDpMeta, ingress_zone)];
+const _: [(); 24] = [(); mem::offset_of!(UserspaceDpMeta, routing_table)];
+const _: [(); 36] = [(); mem::offset_of!(UserspaceDpMeta, addr_family)];
+const _: [(); 40] = [(); mem::offset_of!(UserspaceDpMeta, dscp)];
+const _: [(); 80] = [(); mem::offset_of!(UserspaceDpMeta, config_generation)];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -324,12 +335,13 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
 
     let data = ctx.data();
     let data_end = ctx.data_end();
-    let Some((eth_proto, vlan_id, l3_offset)) = parse_l2(data, data_end) else {
+    let Some((eth_proto, vlan_id, vlan_pcp, vlan_present, l3_offset)) = parse_l2(data, data_end)
+    else {
         return Ok(cpumap_or_pass(ctrl));
     };
     let parsed = match eth_proto {
-        ETH_P_IP => parse_ipv4(data, data_end, vlan_id, l3_offset),
-        ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, l3_offset),
+        ETH_P_IP => parse_ipv4(data, data_end, vlan_id, vlan_pcp, vlan_present, l3_offset),
+        ETH_P_IPV6 => parse_ipv6(data, data_end, vlan_id, vlan_pcp, vlan_present, l3_offset),
         // Non-IP (ARP, LLDP, etc.): XDP_PASS to kernel stack.
         // cpumap redirect for ARP breaks kernel neighbor resolution:
         // the cpumap processing path on the remote CPU doesn't trigger
@@ -593,6 +605,8 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
             ingress_ifindex,
             rx_queue_index,
             ingress_vlan_id: parsed.vlan_id,
+            ingress_pcp: parsed.vlan_pcp,
+            ingress_vlan_present: parsed.vlan_present as u8,
             ingress_zone: 0,
             routing_table: 0,
             l3_offset: parsed.l3_offset,
@@ -972,6 +986,8 @@ fn cpumap_or_pass(ctrl: &UserspaceCtrl) -> u32 {
 #[derive(Clone, Copy)]
 struct ParsedPacket {
     vlan_id: u16,
+    vlan_pcp: u8,
+    vlan_present: bool,
     l3_offset: u16,
     l4_offset: u16,
     payload_offset: u16,
@@ -987,23 +1003,35 @@ struct ParsedPacket {
     dst_addr: [u8; 16],
 }
 
-fn parse_l2(data: usize, data_end: usize) -> Option<(u16, u16, u16)> {
+fn parse_l2(data: usize, data_end: usize) -> Option<(u16, u16, u8, bool, u16)> {
     let eth = read_bytes(data, data_end, 0, 14)?;
     let mut eth_proto = u16::from_be_bytes([eth[12], eth[13]]);
     let mut l3_offset = mem::size_of::<EthHdr>() as u16;
     let mut vlan_id = 0u16;
+    let mut vlan_pcp = 0u8;
+    let mut vlan_present = false;
 
     if eth_proto == ETH_P_8021Q || eth_proto == ETH_P_8021AD {
         let vlan = read_bytes(data, data_end, l3_offset as usize, 4)?;
-        vlan_id = u16::from_be_bytes([vlan[0], vlan[1]]) & 0x0fff;
+        let tci = u16::from_be_bytes([vlan[0], vlan[1]]);
+        vlan_id = tci & 0x0fff;
+        vlan_pcp = ((tci >> 13) & 0x07) as u8;
+        vlan_present = true;
         eth_proto = u16::from_be_bytes([vlan[2], vlan[3]]);
         l3_offset += mem::size_of::<VlanHdr>() as u16;
     }
 
-    Some((eth_proto, vlan_id, l3_offset))
+    Some((eth_proto, vlan_id, vlan_pcp, vlan_present, l3_offset))
 }
 
-fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Option<ParsedPacket> {
+fn parse_ipv4(
+    data: usize,
+    data_end: usize,
+    vlan_id: u16,
+    vlan_pcp: u8,
+    vlan_present: bool,
+    l3_offset: u16,
+) -> Option<ParsedPacket> {
     let iph = read_bytes(data, data_end, l3_offset as usize, 20)?;
     let version_ihl = iph[0];
     if (version_ihl >> 4) != 4 {
@@ -1027,6 +1055,8 @@ fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
     dst_addr[..4].copy_from_slice(dst_bytes);
     Some(ParsedPacket {
         vlan_id,
+        vlan_pcp,
+        vlan_present,
         l3_offset,
         l4_offset,
         payload_offset,
@@ -1043,7 +1073,14 @@ fn parse_ipv4(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
     })
 }
 
-fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Option<ParsedPacket> {
+fn parse_ipv6(
+    data: usize,
+    data_end: usize,
+    vlan_id: u16,
+    vlan_pcp: u8,
+    vlan_present: bool,
+    l3_offset: u16,
+) -> Option<ParsedPacket> {
     let ip6 = read_bytes(data, data_end, l3_offset as usize, 40)?;
     let version_priority = ip6[0];
     if (version_priority >> 4) != 6 {
@@ -1096,6 +1133,8 @@ fn parse_ipv6(data: usize, data_end: usize, vlan_id: u16, l3_offset: u16) -> Opt
     dst_addr.copy_from_slice(read_bytes(data, data_end, l3_offset as usize + 24, 16)?);
     Some(ParsedPacket {
         vlan_id,
+        vlan_pcp,
+        vlan_present,
         l3_offset,
         l4_offset: offset,
         payload_offset,

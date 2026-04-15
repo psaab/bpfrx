@@ -82,6 +82,15 @@ pub(super) struct UserspaceDpMeta {
     pub(super) reserved2: u32,
 }
 
+const _: [(); 96] = [(); std::mem::size_of::<UserspaceDpMeta>()];
+const _: [(); 18] = [(); std::mem::offset_of!(UserspaceDpMeta, ingress_pcp)];
+const _: [(); 19] = [(); std::mem::offset_of!(UserspaceDpMeta, ingress_vlan_present)];
+const _: [(); 20] = [(); std::mem::offset_of!(UserspaceDpMeta, ingress_zone)];
+const _: [(); 24] = [(); std::mem::offset_of!(UserspaceDpMeta, routing_table)];
+const _: [(); 36] = [(); std::mem::offset_of!(UserspaceDpMeta, addr_family)];
+const _: [(); 40] = [(); std::mem::offset_of!(UserspaceDpMeta, dscp)];
+const _: [(); 80] = [(); std::mem::offset_of!(UserspaceDpMeta, config_generation)];
+
 #[repr(C)]
 pub(super) struct XdpOptions {
     pub(super) flags: u32,
@@ -664,9 +673,10 @@ impl SharedCoSRootLease {
         let lease_bytes = target_lease_bytes
             .max(COS_ROOT_LEASE_MIN_BYTES)
             .min(lease_ceiling);
+        let max_frame_lease_bytes = lease_bytes.max(tx_frame_capacity() as u64);
         let max_total_leased = burst_bytes
             .saturating_div(4)
-            .min(lease_bytes.saturating_mul(active_shards));
+            .min(max_frame_lease_bytes.saturating_mul(active_shards));
         Self {
             state: Mutex::new(SharedCoSRootLeaseState {
                 shaping_rate_bytes,
