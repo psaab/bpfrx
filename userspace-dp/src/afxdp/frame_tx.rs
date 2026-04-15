@@ -1,5 +1,20 @@
 use super::*;
 
+#[inline]
+fn recycle_ingress_frame(
+    ingress_binding: &mut BindingWorker,
+    source_offset: u64,
+    now_ns: u64,
+    fill_drain_pending: &mut bool,
+) {
+    ingress_binding.pending_fill_frames.push_back(source_offset);
+    *fill_drain_pending = true;
+    if ingress_binding.pending_fill_frames.len() >= FILL_BATCH_SIZE {
+        let _ = drain_pending_fill(ingress_binding, now_ns);
+        *fill_drain_pending = false;
+    }
+}
+
 pub(super) fn enqueue_pending_forwards(
     left: &mut [BindingWorker],
     ingress_index: usize,
@@ -20,20 +35,43 @@ pub(super) fn enqueue_pending_forwards(
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
     cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
 ) {
+    if pending_forwards.is_empty() {
+        return;
+    }
     let ingress_area = ingress_binding.umem.area() as *const MmapArea;
+    let mut fill_drain_pending = false;
+    let tx_selection_enabled_v4 = forwarding.tx_selection_enabled_v4;
+    let tx_selection_enabled_v6 = forwarding.tx_selection_enabled_v6;
     post_recycles.clear();
-    for mut request in pending_forwards.drain(..) {
-        let source_offset = request.source_offset;
+    // Walk the scratch vector in place. Moving large PendingForwardRequest
+    // values through the iterator path was still forcing per-request memcpy
+    // traffic before any forwarding work started.
+    for request in pending_forwards.iter_mut() {
+        let source_offset = request.desc.addr;
         let ingress_slot = ingress_binding.slot;
-        if request.cos_queue_id.is_none() && request.dscp_rewrite.is_none() {
+        let tx_selection_enabled = if request.meta.addr_family as i32 == libc::AF_INET6 {
+            tx_selection_enabled_v6
+        } else {
+            tx_selection_enabled_v4
+        };
+        if tx_selection_enabled && request.cos_queue_id.is_none() && request.dscp_rewrite.is_none()
+        {
             let cos = resolve_pending_forward_cos_tx_selection(forwarding, &request);
             request.cos_queue_id = cos.queue_id;
             request.dscp_rewrite = cos.dscp_rewrite;
         }
+        let target_binding_index = request.target_binding_index.or_else(|| {
+            binding_lookup.target_index(
+                ingress_index,
+                ingress_binding.ifindex,
+                request.ingress_queue_id,
+                request.target_ifindex,
+            )
+        });
 
         // Fast path: prebuilt frame (e.g. ICMP error NAT reversal).
         // The frame is already fully rewritten — just enqueue for TX.
-        if let Some(prebuilt) = request.prebuilt_frame {
+        if let PendingForwardFrame::Prebuilt(prebuilt) = core::mem::take(&mut request.frame) {
             let Some(target_binding) = resolve_pending_forward_target_binding(
                 left,
                 ingress_index,
@@ -41,10 +79,15 @@ pub(super) fn enqueue_pending_forwards(
                 request.ingress_queue_id,
                 right,
                 binding_lookup,
-                request.target_binding_index,
+                target_binding_index,
                 request.target_ifindex,
             ) else {
-                ingress_binding.pending_fill_frames.push_back(source_offset);
+                recycle_ingress_frame(
+                    ingress_binding,
+                    source_offset,
+                    now_ns,
+                    &mut fill_drain_pending,
+                );
                 continue;
             };
             let frame_len = prebuilt.len();
@@ -66,23 +109,36 @@ pub(super) fn enqueue_pending_forwards(
             if (frame_len as u32) > dbg.tx_max_frame {
                 dbg.tx_max_frame = frame_len as u32;
             }
-            ingress_binding.pending_fill_frames.push_back(source_offset);
+            recycle_ingress_frame(
+                ingress_binding,
+                source_offset,
+                now_ns,
+                &mut fill_drain_pending,
+            );
             continue;
         }
 
         // Read source frame directly from ingress UMEM — no heap copy needed.
         // The frame is safe to read: RX ring released but frame not yet returned
         // to fill ring (that happens after this function completes).
-        let owned_source_frame = request.source_frame.as_deref();
-        let source_frame = if let Some(frame) = owned_source_frame {
-            frame
-        } else if let Some(frame) = (unsafe { &*ingress_area })
-            .slice(request.source_offset as usize, request.desc.len as usize)
-        {
-            frame
-        } else {
-            ingress_binding.pending_fill_frames.push_back(source_offset);
-            continue;
+        let source_frame = match &request.frame {
+            PendingForwardFrame::Owned(frame) => frame.as_slice(),
+            PendingForwardFrame::Live => {
+                if let Some(frame) = (unsafe { &*ingress_area })
+                    .slice(request.desc.addr as usize, request.desc.len as usize)
+                {
+                    frame
+                } else {
+                    recycle_ingress_frame(
+                        ingress_binding,
+                        source_offset,
+                        now_ns,
+                        &mut fill_drain_pending,
+                    );
+                    continue;
+                }
+            }
+            PendingForwardFrame::Prebuilt(_) => unreachable!(),
         };
         let expected_ports = request.expected_ports;
         let ingress_umem_ptr = ingress_binding.umem.allocation_ptr();
@@ -93,14 +149,14 @@ pub(super) fn enqueue_pending_forwards(
             request.ingress_queue_id,
             right,
             binding_lookup,
-            request.target_binding_index,
+            target_binding_index,
             request.target_ifindex,
         ) else {
             // No XSK binding for the target interface.  Normally fabric
             // parents have bindings; this is a safety-net fallback in case
             // the binding is not yet ready or bind() failed.
             if request.decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
-                if request.source_frame.is_some() {
+                if matches!(request.frame, PendingForwardFrame::Owned(_)) {
                     maybe_reinject_slow_path_from_frame(
                         ingress_ident,
                         ingress_live,
@@ -125,7 +181,12 @@ pub(super) fn enqueue_pending_forwards(
                         recent_exceptions,
                     );
                 }
-                ingress_binding.pending_fill_frames.push_back(source_offset);
+                recycle_ingress_frame(
+                    ingress_binding,
+                    source_offset,
+                    now_ns,
+                    &mut fill_drain_pending,
+                );
                 continue;
             }
             dbg.no_egress_binding += 1;
@@ -145,117 +206,127 @@ pub(super) fn enqueue_pending_forwards(
                 None,
                 None,
             );
-            ingress_binding.pending_fill_frames.push_back(source_offset);
+            recycle_ingress_frame(
+                ingress_binding,
+                source_offset,
+                now_ns,
+                &mut fill_drain_pending,
+            );
             continue;
         };
-        post_recycles.clear();
         let mut build_failed = false;
         let mut fallback_to_slow_path = false;
         let mut copied_source_frame = false;
         let mut retained_source_frame = false;
+        let mut flow_key = request.flow_key.take();
         {
-            if let Some((segments, bytes, max_frame)) = segment_forwarded_tcp_frames_into_prepared(
-                target_binding,
+            if forwarded_tcp_may_need_segmentation(
                 source_frame,
                 request.meta,
                 &request.decision,
                 forwarding,
-                request.apply_nat_on_fabric,
-                expected_ports,
-                request.flow_key.clone(),
-                request.cos_queue_id,
-                request.dscp_rewrite,
-                now_ns,
-                post_recycles,
-                worker_id,
-                worker_commands_by_id,
-                cos_owner_worker_by_queue,
             ) {
-                dbg.enqueue_ok += segments as u64;
-                dbg.enqueue_direct += segments as u64;
-                target_binding.pending_direct_tx_packets += segments as u64;
-                dbg.tx_bytes_total += bytes;
-                if max_frame > dbg.tx_max_frame {
-                    dbg.tx_max_frame = max_frame;
-                }
-                copied_source_frame = true;
-                if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE {
-                    let _ = drain_pending_tx_local_owner(
+                if let Some((segments, bytes, max_frame)) =
+                    segment_forwarded_tcp_frames_into_prepared(
                         target_binding,
+                        source_frame,
+                        request.meta,
+                        &request.decision,
+                        forwarding,
+                        request.apply_nat_on_fabric,
+                        expected_ports,
+                        flow_key.clone(),
+                        request.cos_queue_id,
+                        request.dscp_rewrite,
                         now_ns,
                         post_recycles,
-                        forwarding,
                         worker_id,
                         worker_commands_by_id,
                         cos_owner_worker_by_queue,
-                    );
-                }
-            } else if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
-                source_frame,
-                request.meta,
-                &request.decision,
-                forwarding,
-                request.apply_nat_on_fabric,
-                expected_ports,
-            ) {
-                for frame in segmented {
-                    if cfg!(feature = "debug-log") {
-                        if let Some(reason) = forward_tuple_mismatch_reason(
-                            live_frame_ports_bytes(
-                                source_frame,
-                                request.meta.addr_family,
-                                request.meta.protocol,
-                            ),
+                    )
+                {
+                    dbg.enqueue_ok += segments as u64;
+                    dbg.enqueue_direct += segments as u64;
+                    target_binding.pending_direct_tx_packets += segments as u64;
+                    dbg.tx_bytes_total += bytes;
+                    if max_frame > dbg.tx_max_frame {
+                        dbg.tx_max_frame = max_frame;
+                    }
+                    copied_source_frame = true;
+                    if target_binding.pending_tx_prepared.len() >= TX_BATCH_SIZE {
+                        let _ = drain_pending_tx_local_owner(
+                            target_binding,
+                            now_ns,
+                            post_recycles,
+                            forwarding,
+                            worker_id,
+                            worker_commands_by_id,
+                            cos_owner_worker_by_queue,
+                        );
+                    }
+                } else if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
+                    source_frame,
+                    request.meta,
+                    &request.decision,
+                    forwarding,
+                    request.apply_nat_on_fabric,
+                    expected_ports,
+                ) {
+                    for frame in segmented {
+                        if cfg!(feature = "debug-log") {
+                            if let Some(reason) = forward_tuple_mismatch_reason(
+                                live_frame_ports_from_meta_bytes(source_frame, request.meta),
+                                expected_ports,
+                                live_frame_ports_bytes(
+                                    &frame,
+                                    request.meta.addr_family,
+                                    request.meta.protocol,
+                                ),
+                            ) {
+                                record_exception(
+                                    recent_exceptions,
+                                    ingress_ident,
+                                    &reason,
+                                    frame.len() as u32,
+                                    Some(request.meta.into()),
+                                    None,
+                                );
+                                build_failed = true;
+                                break;
+                            }
+                        }
+                        let seg_frame_len = frame.len();
+                        target_binding.pending_tx_local.push_back(TxRequest {
+                            bytes: frame,
                             expected_ports,
-                            live_frame_ports_bytes(
-                                &frame,
-                                request.meta.addr_family,
-                                request.meta.protocol,
-                            ),
-                        ) {
-                            record_exception(
-                                recent_exceptions,
-                                ingress_ident,
-                                &reason,
-                                frame.len() as u32,
-                                Some(request.meta),
-                                None,
-                            );
-                            build_failed = true;
-                            break;
+                            expected_addr_family: request.meta.addr_family,
+                            expected_protocol: request.meta.protocol,
+                            flow_key: flow_key.clone(),
+                            egress_ifindex: request.decision.resolution.egress_ifindex,
+                            cos_queue_id: request.cos_queue_id,
+                            dscp_rewrite: request.dscp_rewrite,
+                        });
+                        bound_pending_tx_local(target_binding);
+                        dbg.enqueue_ok += 1;
+                        dbg.enqueue_copy += 1;
+                        target_binding.pending_copy_tx_packets += 1;
+                        dbg.tx_bytes_total += seg_frame_len as u64;
+                        if (seg_frame_len as u32) > dbg.tx_max_frame {
+                            dbg.tx_max_frame = seg_frame_len as u32;
                         }
                     }
-                    let seg_frame_len = frame.len();
-                    target_binding.pending_tx_local.push_back(TxRequest {
-                        bytes: frame,
-                        expected_ports,
-                        expected_addr_family: request.meta.addr_family,
-                        expected_protocol: request.meta.protocol,
-                        flow_key: request.flow_key.clone(),
-                        egress_ifindex: request.decision.resolution.egress_ifindex,
-                        cos_queue_id: request.cos_queue_id,
-                        dscp_rewrite: request.dscp_rewrite,
-                    });
-                    bound_pending_tx_local(target_binding);
-                    dbg.enqueue_ok += 1;
-                    dbg.enqueue_copy += 1;
-                    target_binding.pending_copy_tx_packets += 1;
-                    dbg.tx_bytes_total += seg_frame_len as u64;
-                    if (seg_frame_len as u32) > dbg.tx_max_frame {
-                        dbg.tx_max_frame = seg_frame_len as u32;
+                    copied_source_frame = true;
+                    if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
+                        let _ = drain_pending_tx_local_owner(
+                            target_binding,
+                            now_ns,
+                            post_recycles,
+                            forwarding,
+                            worker_id,
+                            worker_commands_by_id,
+                            cos_owner_worker_by_queue,
+                        );
                     }
-                }
-                copied_source_frame = true;
-                if target_binding.pending_tx_local.len() >= TX_BATCH_SIZE {
-                    let _ = drain_pending_tx_local_owner(
-                        target_binding,
-                        now_ns,
-                        post_recycles,
-                        forwarding,
-                        worker_id,
-                        worker_commands_by_id,
-                        cos_owner_worker_by_queue,
-                    );
                 }
             }
             // Track when segmentation was needed but returned None
@@ -300,7 +371,7 @@ pub(super) fn enqueue_pending_forwards(
                 let can_rewrite_in_place = target_binding.umem.allocation_ptr() == ingress_umem_ptr
                     && !is_nat64
                     && !uses_native_tunnel
-                    && request.source_frame.is_none();
+                    && matches!(request.frame, PendingForwardFrame::Live);
                 if can_rewrite_in_place {
                     match rewrite_forwarded_frame_in_place(
                         unsafe { &*ingress_area },
@@ -320,7 +391,7 @@ pub(super) fn enqueue_pending_forwards(
                                     expected_ports,
                                     expected_addr_family: request.meta.addr_family,
                                     expected_protocol: request.meta.protocol,
-                                    flow_key: request.flow_key.clone(),
+                                    flow_key: flow_key.take(),
                                     egress_ifindex: request.decision.resolution.egress_ifindex,
                                     cos_queue_id: request.cos_queue_id,
                                     dscp_rewrite: request.dscp_rewrite,
@@ -355,10 +426,9 @@ pub(super) fn enqueue_pending_forwards(
                             Some(frame) => {
                                 if cfg!(feature = "debug-log") {
                                     if let Some(reason) = forward_tuple_mismatch_reason(
-                                        live_frame_ports_bytes(
+                                        live_frame_ports_from_meta_bytes(
                                             source_frame,
-                                            request.meta.addr_family,
-                                            request.meta.protocol,
+                                            request.meta,
                                         ),
                                         expected_ports,
                                         live_frame_ports_bytes(
@@ -372,7 +442,7 @@ pub(super) fn enqueue_pending_forwards(
                                             ingress_ident,
                                             &reason,
                                             frame.len() as u32,
-                                            Some(request.meta),
+                                            Some(request.meta.into()),
                                             None,
                                         );
                                         // Don't continue — the frame was built successfully,
@@ -386,7 +456,7 @@ pub(super) fn enqueue_pending_forwards(
                                         ingress_ident,
                                         "oversized_forward_frame",
                                         cp1_len as u32,
-                                        Some(request.meta),
+                                        Some(request.meta.into()),
                                         None,
                                     );
                                     continue;
@@ -396,7 +466,7 @@ pub(super) fn enqueue_pending_forwards(
                                     expected_ports,
                                     expected_addr_family: request.meta.addr_family,
                                     expected_protocol: request.meta.protocol,
-                                    flow_key: request.flow_key.clone(),
+                                    flow_key: flow_key.take(),
                                     egress_ifindex: request.decision.resolution.egress_ifindex,
                                     cos_queue_id: request.cos_queue_id,
                                     dscp_rewrite: request.dscp_rewrite,
@@ -495,11 +565,7 @@ pub(super) fn enqueue_pending_forwards(
                                     )
                                 });
                                 if let Some(reason) = forward_tuple_mismatch_reason(
-                                    live_frame_ports_bytes(
-                                        source_frame,
-                                        request.meta.addr_family,
-                                        request.meta.protocol,
-                                    ),
+                                    live_frame_ports_from_meta_bytes(source_frame, request.meta),
                                     expected_ports,
                                     built_ports,
                                 ) {
@@ -509,7 +575,7 @@ pub(super) fn enqueue_pending_forwards(
                                         ingress_ident,
                                         &reason,
                                         written as u32,
-                                        Some(request.meta),
+                                        Some(request.meta.into()),
                                         None,
                                     );
                                     build_failed = true;
@@ -525,7 +591,7 @@ pub(super) fn enqueue_pending_forwards(
                                     ingress_ident,
                                     "oversized_forward_frame",
                                     written as u32,
-                                    Some(request.meta),
+                                    Some(request.meta.into()),
                                     None,
                                 );
                                 true
@@ -539,7 +605,7 @@ pub(super) fn enqueue_pending_forwards(
                                         expected_ports,
                                         expected_addr_family: request.meta.addr_family,
                                         expected_protocol: request.meta.protocol,
-                                        flow_key: request.flow_key.clone(),
+                                        flow_key: flow_key.take(),
                                         egress_ifindex: request.decision.resolution.egress_ifindex,
                                         cos_queue_id: request.cos_queue_id,
                                         dscp_rewrite: request.dscp_rewrite,
@@ -598,10 +664,9 @@ pub(super) fn enqueue_pending_forwards(
                             Some(frame) => {
                                 if cfg!(feature = "debug-log") {
                                     if let Some(reason) = forward_tuple_mismatch_reason(
-                                        live_frame_ports_bytes(
+                                        live_frame_ports_from_meta_bytes(
                                             source_frame,
-                                            request.meta.addr_family,
-                                            request.meta.protocol,
+                                            request.meta,
                                         ),
                                         expected_ports,
                                         live_frame_ports_bytes(
@@ -615,7 +680,7 @@ pub(super) fn enqueue_pending_forwards(
                                             ingress_ident,
                                             &reason,
                                             frame.len() as u32,
-                                            Some(request.meta),
+                                            Some(request.meta.into()),
                                             None,
                                         );
                                         // Don't continue — the frame was built successfully,
@@ -629,7 +694,7 @@ pub(super) fn enqueue_pending_forwards(
                                         ingress_ident,
                                         "oversized_forward_frame",
                                         cp2_len as u32,
-                                        Some(request.meta),
+                                        Some(request.meta.into()),
                                         None,
                                     );
                                     continue;
@@ -639,7 +704,7 @@ pub(super) fn enqueue_pending_forwards(
                                     expected_ports,
                                     expected_addr_family: request.meta.addr_family,
                                     expected_protocol: request.meta.protocol,
-                                    flow_key: request.flow_key.clone(),
+                                    flow_key: flow_key.take(),
                                     egress_ifindex: request.decision.resolution.egress_ifindex,
                                     cos_queue_id: request.cos_queue_id,
                                     dscp_rewrite: request.dscp_rewrite,
@@ -685,7 +750,6 @@ pub(super) fn enqueue_pending_forwards(
                 post_recycles,
             );
         }
-        update_binding_debug_state(ingress_binding);
         if build_failed {
             handle_forward_build_failure(
                 ingress_ident,
@@ -702,21 +766,29 @@ pub(super) fn enqueue_pending_forwards(
                 fallback_to_slow_path,
             );
             if !retained_source_frame {
-                ingress_binding.pending_fill_frames.push_back(source_offset);
+                recycle_ingress_frame(
+                    ingress_binding,
+                    source_offset,
+                    now_ns,
+                    &mut fill_drain_pending,
+                );
             }
             continue;
         }
         if !retained_source_frame {
-            ingress_binding.pending_fill_frames.push_back(source_offset);
+            recycle_ingress_frame(
+                ingress_binding,
+                source_offset,
+                now_ns,
+                &mut fill_drain_pending,
+            );
         }
-        // Always drain fill immediately — no watermark delay. In copy mode,
-        // the kernel queues packets in the socket buffer when the fill ring
-        // is low, causing latency spikes that stall TCP.
-        if !ingress_binding.pending_fill_frames.is_empty() {
-            let _ = drain_pending_fill(ingress_binding, now_ns);
-        }
-        update_binding_debug_state(ingress_binding);
     }
+    if fill_drain_pending && !ingress_binding.pending_fill_frames.is_empty() {
+        let _ = drain_pending_fill(ingress_binding, now_ns);
+    }
+    update_binding_debug_state(ingress_binding);
+    pending_forwards.clear();
 }
 
 fn resolve_pending_forward_target_binding<'a>(
@@ -753,10 +825,11 @@ pub(super) fn handle_forward_build_failure(
     _target_ifindex: i32,
     packet_length: u32,
     frame: &[u8],
-    meta: UserspaceDpMeta,
+    meta: impl Into<UserspaceDpMeta>,
     decision: SessionDecision,
     fallback_to_slow_path: bool,
 ) {
+    let meta = meta.into();
     dbg.build_fail += 1;
     #[cfg(feature = "debug-log")]
     if dbg.build_fail <= 3 {
@@ -848,10 +921,11 @@ pub(super) fn maybe_reinject_slow_path(
     local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     area: &MmapArea,
     desc: XdpDesc,
-    meta: UserspaceDpMeta,
+    meta: impl Into<UserspaceDpMeta>,
     decision: SessionDecision,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) {
+    let meta = meta.into();
     if !matches!(
         decision.resolution.disposition,
         ForwardingDisposition::LocalDelivery
@@ -892,11 +966,12 @@ pub(super) fn maybe_reinject_slow_path_from_frame(
     slow_path: Option<&Arc<SlowPathReinjector>>,
     local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
     frame: &[u8],
-    meta: UserspaceDpMeta,
+    meta: impl Into<UserspaceDpMeta>,
     decision: SessionDecision,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     reason: &str,
 ) {
+    let meta = meta.into();
     let Some(packet) = extract_l3_packet_with_nat(frame, meta, decision.nat) else {
         live.slow_path_drops.fetch_add(1, Ordering::Relaxed);
         record_exception(
@@ -1015,7 +1090,11 @@ pub(super) fn extract_l3_packet(
     extract_l3_packet_from_frame(frame, meta)
 }
 
-pub(super) fn extract_l3_packet_from_frame(frame: &[u8], meta: UserspaceDpMeta) -> Option<Vec<u8>> {
+pub(super) fn extract_l3_packet_from_frame(
+    frame: &[u8],
+    meta: impl Into<ForwardPacketMeta>,
+) -> Option<Vec<u8>> {
+    let meta = meta.into();
     let l3 = meta.l3_offset as usize;
     if l3 >= frame.len() {
         return None;
@@ -1025,9 +1104,10 @@ pub(super) fn extract_l3_packet_from_frame(frame: &[u8], meta: UserspaceDpMeta) 
 
 pub(super) fn extract_l3_packet_with_nat(
     frame: &[u8],
-    meta: UserspaceDpMeta,
+    meta: impl Into<ForwardPacketMeta>,
     nat: NatDecision,
 ) -> Option<Vec<u8>> {
+    let meta = meta.into();
     let mut packet = extract_l3_packet_from_frame(frame, meta)?;
     match meta.addr_family as i32 {
         libc::AF_INET => apply_nat_ipv4(&mut packet, meta.protocol, nat)?,
@@ -1040,7 +1120,7 @@ pub(super) fn extract_l3_packet_with_nat(
 fn segment_forwarded_tcp_frames_into_prepared(
     target_binding: &mut BindingWorker,
     frame: &[u8],
-    meta: UserspaceDpMeta,
+    meta: impl Into<ForwardPacketMeta>,
     decision: &SessionDecision,
     forwarding: &ForwardingState,
     apply_nat_on_fabric: bool,
@@ -1054,6 +1134,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
     cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
 ) -> Option<(u32, u64, u32)> {
+    let meta = meta.into();
     if meta.protocol != PROTO_TCP || decision.resolution.tunnel_endpoint_id != 0 {
         return None;
     }
@@ -1161,11 +1242,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
         *payload.get(tcp_offset + 6)?,
         *payload.get(tcp_offset + 7)?,
     ]);
-    let enforced_ports = expected_ports.or(live_frame_ports_bytes(
-        frame,
-        meta.addr_family,
-        meta.protocol,
-    ));
+    let enforced_ports = expected_ports.or(live_frame_ports_from_meta_bytes(frame, meta));
     let tcp_header = payload.get(tcp_offset..tcp_offset + tcp_header_len)?;
     let ip_header = payload.get(..ip_header_len)?;
     let mut prepared: Vec<PreparedTxRequest> = Vec::with_capacity(segment_count);
@@ -1318,4 +1395,111 @@ fn segment_forwarded_tcp_frames_into_prepared(
     }
     bound_pending_tx_prepared(target_binding);
     Some((segment_count as u32, total_bytes, max_frame))
+}
+
+#[inline(always)]
+fn forwarded_tcp_may_need_segmentation(
+    frame: &[u8],
+    meta: impl Into<ForwardPacketMeta>,
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+) -> bool {
+    let meta = meta.into();
+    if meta.protocol != PROTO_TCP || decision.resolution.tunnel_endpoint_id != 0 {
+        return false;
+    }
+    let mtu = forwarding
+        .egress
+        .get(&decision.resolution.egress_ifindex)
+        .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex))
+        .map(|egress| egress.mtu)
+        .unwrap_or_default()
+        .max(1280);
+    if mtu == 0 {
+        return false;
+    }
+    let l3 = match meta.l3_offset {
+        14 | 18 => meta.l3_offset as usize,
+        _ => match frame_l3_offset(frame) {
+            Some(offset) => offset,
+            None => return false,
+        },
+    };
+    l3 < frame.len() && frame.len().saturating_sub(l3) > mtu
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_forwarding_with_egress_mtu(mtu: usize) -> ForwardingState {
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 11,
+                vlan_id: 80,
+                mtu,
+                src_mac: [0; 6],
+                zone: "wan".into(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+        forwarding
+    }
+
+    fn test_decision() -> SessionDecision {
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 80,
+                tx_ifindex: 11,
+                tunnel_endpoint_id: 0,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 80,
+            },
+            nat: NatDecision::default(),
+        }
+    }
+
+    #[test]
+    fn forwarded_tcp_may_need_segmentation_skips_mtu_sized_frame() {
+        let forwarding = test_forwarding_with_egress_mtu(1500);
+        let meta = UserspaceDpMeta {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            l3_offset: 14,
+            ..UserspaceDpMeta::default()
+        };
+        let frame = vec![0u8; 14 + 1500];
+        assert!(!forwarded_tcp_may_need_segmentation(
+            &frame,
+            meta,
+            &test_decision(),
+            &forwarding,
+        ));
+    }
+
+    #[test]
+    fn forwarded_tcp_may_need_segmentation_flags_oversized_frame() {
+        let forwarding = test_forwarding_with_egress_mtu(1500);
+        let meta = UserspaceDpMeta {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            l3_offset: 14,
+            ..UserspaceDpMeta::default()
+        };
+        let frame = vec![0u8; 14 + 1600];
+        assert!(forwarded_tcp_may_need_segmentation(
+            &frame,
+            meta,
+            &test_decision(),
+            &forwarding,
+        ));
+    }
 }

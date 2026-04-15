@@ -9,20 +9,22 @@ pub(super) fn authoritative_forward_ports(
     if !matches!(meta.protocol, PROTO_TCP | PROTO_UDP) {
         return None;
     }
-    let flow_ports = flow.and_then(|flow| {
+    if let Some(flow_ports) = flow.and_then(|flow| {
         if flow.forward_key.src_port != 0 && flow.forward_key.dst_port != 0 {
             Some((flow.forward_key.src_port, flow.forward_key.dst_port))
         } else {
             None
         }
-    });
+    }) {
+        return Some(flow_ports);
+    }
     let meta_ports = if meta.flow_src_port != 0 && meta.flow_dst_port != 0 {
         Some((meta.flow_src_port, meta.flow_dst_port))
     } else {
         None
     };
-    let frame_ports = live_frame_ports_bytes(frame, meta.addr_family, meta.protocol);
-    flow_ports.or(frame_ports).or(meta_ports)
+    let frame_ports = live_frame_ports_from_meta_bytes(frame, meta);
+    frame_ports.or(meta_ports)
 }
 
 #[allow(dead_code)]
@@ -35,6 +37,24 @@ pub(super) fn live_frame_ports(
         return None;
     }
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
+    live_frame_ports_from_meta_bytes(frame, meta)
+}
+
+#[inline(always)]
+pub(super) fn live_frame_ports_from_meta_bytes(
+    frame: &[u8],
+    meta: impl Into<ForwardPacketMeta>,
+) -> Option<(u16, u16)> {
+    let meta = meta.into();
+    if !matches!(meta.protocol, PROTO_TCP | PROTO_UDP) {
+        return None;
+    }
+    let l4 = meta.l4_offset as usize;
+    if l4 != 0
+        && let Some(ports) = parse_flow_ports(frame, l4, meta.protocol)
+    {
+        return Some(ports);
+    }
     live_frame_ports_bytes(frame, meta.addr_family, meta.protocol)
 }
 
@@ -71,14 +91,15 @@ pub(super) fn parse_session_flow_from_bytes(
     frame: &[u8],
     meta: UserspaceDpMeta,
 ) -> Option<SessionFlow> {
+    let meta_flow = parse_session_flow_from_meta(meta);
     // Fast path: for TCP/UDP with complete metadata tuple, use meta directly
     // without parsing the frame. This avoids extra L3/L4 parsing for the
     // common established-flow case.
     if matches!(meta.protocol, PROTO_TCP | PROTO_UDP)
-        && let Some(meta_flow) = parse_session_flow_from_meta(meta)
-        && metadata_tuple_complete(meta, &meta_flow)
+        && let Some(meta_flow) = meta_flow.as_ref()
+        && metadata_tuple_complete(meta, meta_flow)
     {
-        return Some(meta_flow);
+        return Some(meta_flow.clone());
     }
 
     let frame_flow = if matches!(meta.addr_family as i32, libc::AF_INET) {
@@ -87,7 +108,7 @@ pub(super) fn parse_session_flow_from_bytes(
         parse_session_flow_from_frame(frame, meta)
     };
 
-    if let Some(meta_flow) = parse_session_flow_from_meta(meta)
+    if let Some(meta_flow) = meta_flow
         && metadata_tuple_complete(meta, &meta_flow)
     {
         if let Some(ref frame_flow) = frame_flow {
@@ -623,8 +644,22 @@ pub(super) fn parse_session_flow_from_frame(
     match meta.addr_family as i32 {
         libc::AF_INET => parse_ipv4_session_flow_from_frame(frame, meta),
         libc::AF_INET6 => {
-            let l3 = frame_l3_offset(frame)?;
-            let l4 = frame_l4_offset(frame, meta.addr_family)?;
+            let l3 = match meta.l3_offset {
+                14 | 18
+                    if frame
+                        .get(meta.l3_offset as usize)
+                        .is_some_and(|byte| (byte >> 4) == 6) =>
+                {
+                    meta.l3_offset as usize
+                }
+                _ => frame_l3_offset(frame)?,
+            };
+            let meta_rel = meta.l4_offset.wrapping_sub(meta.l3_offset) as usize;
+            let l4 = if meta_rel >= 40 && meta.l4_offset > meta.l3_offset {
+                l3.checked_add(meta_rel)?
+            } else {
+                frame_l4_offset(frame, meta.addr_family)?
+            };
             if frame.len() < l3 + 40 || frame.len() < l4 {
                 return None;
             }
@@ -689,19 +724,17 @@ pub(super) fn parse_ipv4_session_flow_from_frame(
     frame: &[u8],
     meta: UserspaceDpMeta,
 ) -> Option<SessionFlow> {
-    let mut l3 = 14usize;
-    if frame.len() < l3 {
-        return None;
-    }
-    let mut eth_proto = u16::from_be_bytes([*frame.get(12)?, *frame.get(13)?]);
-    if matches!(eth_proto, 0x8100 | 0x88a8) {
-        if frame.len() < l3 + 4 {
-            return None;
+    let l3 = match meta.l3_offset {
+        14 | 18
+            if frame
+                .get(meta.l3_offset as usize)
+                .is_some_and(|byte| (byte >> 4) == 4) =>
+        {
+            meta.l3_offset as usize
         }
-        eth_proto = u16::from_be_bytes([*frame.get(16)?, *frame.get(17)?]);
-        l3 += 4;
-    }
-    if eth_proto != 0x0800 || frame.len() < l3 + 20 {
+        _ => frame_l3_offset(frame)?,
+    };
+    if frame.len() < l3 + 20 {
         return None;
     }
     let ihl = usize::from(frame[l3] & 0x0f) * 4;
@@ -709,7 +742,15 @@ pub(super) fn parse_ipv4_session_flow_from_frame(
         return None;
     }
     let protocol = frame[l3 + 9];
-    let l4 = l3 + ihl;
+    let parsed_l4 = l3 + ihl;
+    let l4 = if meta.l4_offset > meta.l3_offset && meta.l4_offset as usize == parsed_l4 {
+        meta.l4_offset as usize
+    } else {
+        parsed_l4
+    };
+    if frame.len() < l4 {
+        return None;
+    }
     let src_ip = IpAddr::V4(Ipv4Addr::new(
         frame[l3 + 12],
         frame[l3 + 13],
@@ -839,10 +880,11 @@ pub(super) fn build_injected_packet(
 /// by 20). This always uses a copy path — in-place rewrite is not possible.
 pub(super) fn build_nat64_forwarded_frame(
     frame: &[u8],
-    meta: UserspaceDpMeta,
+    meta: impl Into<ForwardPacketMeta>,
     decision: &SessionDecision,
     nat64_reverse: Option<&Nat64ReverseInfo>,
 ) -> Option<Vec<u8>> {
+    let meta = meta.into();
     let dst_mac = decision.resolution.neighbor_mac?;
     let src_mac = decision.resolution.src_mac?;
     let vlan_id = decision.resolution.tx_vlan_id;
@@ -881,12 +923,13 @@ pub(super) fn build_nat64_forwarded_frame(
 
 pub(super) fn build_forwarded_frame_from_frame(
     frame: &[u8],
-    meta: UserspaceDpMeta,
+    meta: impl Into<ForwardPacketMeta>,
     decision: &SessionDecision,
     forwarding: &ForwardingState,
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<Vec<u8>> {
+    let meta = meta.into();
     let mut out = vec![0u8; frame.len().saturating_add(4)];
     let written = build_forwarded_frame_into_from_frame(
         &mut out,
@@ -906,12 +949,13 @@ pub(super) fn build_forwarded_frame_from_frame(
 
 pub(super) fn segment_forwarded_tcp_frames_from_frame(
     frame: &[u8],
-    meta: UserspaceDpMeta,
+    meta: impl Into<ForwardPacketMeta>,
     decision: &SessionDecision,
     forwarding: &ForwardingState,
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<Vec<Vec<u8>>> {
+    let meta = meta.into();
     if meta.protocol != PROTO_TCP {
         return None;
     }
@@ -1015,11 +1059,7 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
         *payload.get(tcp_offset + 6)?,
         *payload.get(tcp_offset + 7)?,
     ]);
-    let enforced_ports = expected_ports.or(live_frame_ports_bytes(
-        frame,
-        meta.addr_family,
-        meta.protocol,
-    ));
+    let enforced_ports = expected_ports.or(live_frame_ports_from_meta_bytes(frame, meta));
     let Some(tcp_header) = payload.get(tcp_offset..tcp_offset + tcp_header_len) else {
         return None;
     };
@@ -1218,12 +1258,13 @@ pub(super) fn segment_forwarded_tcp_frames_from_frame(
 pub(super) fn build_forwarded_frame_into_from_frame(
     out: &mut [u8],
     frame: &[u8],
-    meta: UserspaceDpMeta,
+    meta: impl Into<ForwardPacketMeta>,
     decision: &SessionDecision,
     forwarding: &ForwardingState,
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<usize> {
+    let meta = meta.into();
     let dst_mac = decision.resolution.neighbor_mac?;
     let enforced_ports = expected_ports;
     // Use meta L3 offset when it's a valid Ethernet header size (14 or 18),
@@ -1236,31 +1277,7 @@ pub(super) fn build_forwarded_frame_into_from_frame(
         return None;
     }
     let raw_payload = &frame[l3..];
-    // Trim Ethernet padding: use ip_total_len so we don't carry trailing
-    // pad bytes (small frames padded to 60/64 by hardware).
-    let payload = if raw_payload.len() >= 4 {
-        let ip_version = raw_payload[0] >> 4;
-        if ip_version == 4 {
-            let ip_total_len = u16::from_be_bytes([raw_payload[2], raw_payload[3]]) as usize;
-            if ip_total_len > 0 && ip_total_len < raw_payload.len() {
-                &raw_payload[..ip_total_len]
-            } else {
-                raw_payload
-            }
-        } else if ip_version == 6 && raw_payload.len() >= 40 {
-            let ipv6_payload_len = u16::from_be_bytes([raw_payload[4], raw_payload[5]]) as usize;
-            let ip6_total = 40 + ipv6_payload_len;
-            if ip6_total > 0 && ip6_total < raw_payload.len() {
-                &raw_payload[..ip6_total]
-            } else {
-                raw_payload
-            }
-        } else {
-            raw_payload
-        }
-    } else {
-        raw_payload
-    };
+    let payload = trim_l3_payload(raw_payload, meta);
     let (src_mac, vlan_id, apply_nat) =
         if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
             (
@@ -1513,7 +1530,7 @@ pub(super) fn build_forwarded_frame_into(
     out: &mut [u8],
     area: &MmapArea,
     desc: XdpDesc,
-    meta: UserspaceDpMeta,
+    meta: impl Into<ForwardPacketMeta>,
     decision: &SessionDecision,
     forwarding: &ForwardingState,
     expected_ports: Option<(u16, u16)>,
@@ -1533,11 +1550,12 @@ pub(super) fn build_forwarded_frame_into(
 pub(super) fn rewrite_forwarded_frame_in_place(
     area: &MmapArea,
     desc: XdpDesc,
-    meta: UserspaceDpMeta,
+    meta: impl Into<ForwardPacketMeta>,
     decision: &SessionDecision,
     apply_nat_on_fabric: bool,
     expected_ports: Option<(u16, u16)>,
 ) -> Option<u32> {
+    let meta = meta.into();
     let dst_mac = decision.resolution.neighbor_mac?;
     let enforced_ports = expected_ports;
     let frame = unsafe { area.slice_mut_unchecked(desc.addr as usize, UMEM_FRAME_SIZE as usize)? };
@@ -1549,24 +1567,7 @@ pub(super) fn rewrite_forwarded_frame_in_place(
     if l3 >= current_len {
         return None;
     }
-    let mut payload_len = current_len.checked_sub(l3)?;
-    // Trim Ethernet padding: use ip_total_len when available so we don't
-    // carry trailing pad bytes (small frames padded to 60/64 by hardware).
-    if payload_len >= 4 {
-        let ip_version = frame[l3] >> 4;
-        if ip_version == 4 {
-            let ip_total_len = u16::from_be_bytes([frame[l3 + 2], frame[l3 + 3]]) as usize;
-            if ip_total_len > 0 && ip_total_len < payload_len {
-                payload_len = ip_total_len;
-            }
-        } else if ip_version == 6 && payload_len >= 40 {
-            let ipv6_payload_len = u16::from_be_bytes([frame[l3 + 4], frame[l3 + 5]]) as usize;
-            let ip6_total = 40 + ipv6_payload_len;
-            if ip6_total > 0 && ip6_total < payload_len {
-                payload_len = ip6_total;
-            }
-        }
-    }
+    let payload_len = trim_l3_payload(&frame[l3..current_len], meta).len();
     let (src_mac, vlan_id, apply_nat) =
         if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
             (
@@ -1718,6 +1719,51 @@ pub(super) fn rewrite_forwarded_frame_in_place(
         verify_built_frame_checksums(&packet[..frame_len]);
     }
     Some(frame_len as u32)
+}
+
+#[inline(always)]
+fn trim_l3_payload<'a>(raw_payload: &'a [u8], meta: impl Into<ForwardPacketMeta>) -> &'a [u8] {
+    let meta = meta.into();
+    let meta_len = meta.pkt_len as usize;
+    if meta_len >= 20 && meta_len <= raw_payload.len() {
+        return &raw_payload[..meta_len];
+    }
+    let meta_l3_len = match meta.l3_offset {
+        14 | 18 if meta_len > meta.l3_offset as usize => Some(meta_len - meta.l3_offset as usize),
+        _ => None,
+    };
+    if let Some(meta_l3_len) = meta_l3_len
+        && meta_l3_len >= 20
+        && meta_l3_len <= raw_payload.len()
+    {
+        return &raw_payload[..meta_l3_len];
+    }
+    // Fall back to parsing the IP header only when metadata does not carry a
+    // usable payload length. This preserves the padding-trim safety net for
+    // synthetic or incomplete metadata while keeping the hot path metadata-led.
+    if raw_payload.len() < 4 {
+        return raw_payload;
+    }
+    match raw_payload[0] >> 4 {
+        4 => {
+            let ip_total_len = u16::from_be_bytes([raw_payload[2], raw_payload[3]]) as usize;
+            if ip_total_len > 0 && ip_total_len < raw_payload.len() {
+                &raw_payload[..ip_total_len]
+            } else {
+                raw_payload
+            }
+        }
+        6 if raw_payload.len() >= 40 => {
+            let ipv6_payload_len = u16::from_be_bytes([raw_payload[4], raw_payload[5]]) as usize;
+            let ip6_total = 40 + ipv6_payload_len;
+            if ip6_total > 0 && ip6_total < raw_payload.len() {
+                &raw_payload[..ip6_total]
+            } else {
+                raw_payload
+            }
+        }
+        _ => raw_payload,
+    }
 }
 
 /// Straight-line frame rewrite using a precomputed `RewriteDescriptor`.
@@ -2083,19 +2129,17 @@ pub(super) fn apply_nat_ipv6(packet: &mut [u8], protocol: u8, nat: NatDecision) 
     let skip_l4_csum = nat.nptv6;
     if new_src.is_some() && new_dst.is_none() {
         let new_src = new_src?;
-        let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
+        let old_src: [u8; 16] = packet.get(8..24)?.try_into().ok()?;
         packet.get_mut(8..24)?.copy_from_slice(&new_src);
         if !skip_l4_csum {
-            let new_src_words = ipv6_words_from_octets(new_src);
-            adjust_l4_checksum_ipv6_words(packet, protocol, &old_src_words, &new_src_words)?;
+            adjust_l4_checksum_ipv6_addr_bytes(packet, protocol, &old_src, &new_src)?;
         }
     } else if new_dst.is_some() && new_src.is_none() {
         let new_dst = new_dst?;
-        let old_dst_words = ipv6_words_from_slice(packet.get(24..40)?)?;
+        let old_dst: [u8; 16] = packet.get(24..40)?.try_into().ok()?;
         packet.get_mut(24..40)?.copy_from_slice(&new_dst);
         if !skip_l4_csum {
-            let new_dst_words = ipv6_words_from_octets(new_dst);
-            adjust_l4_checksum_ipv6_words(packet, protocol, &old_dst_words, &new_dst_words)?;
+            adjust_l4_checksum_ipv6_addr_bytes(packet, protocol, &old_dst, &new_dst)?;
         }
     } else if new_src.is_some() || new_dst.is_some() {
         let old_src_words = ipv6_words_from_slice(packet.get(8..24)?)?;
@@ -2283,9 +2327,10 @@ pub(super) fn enforce_expected_ports_at(
 
 pub(super) fn restore_l4_tuple_from_meta(
     packet: &mut [u8],
-    meta: UserspaceDpMeta,
+    meta: impl Into<ForwardPacketMeta>,
     rel_l4: usize,
 ) -> Option<bool> {
+    let meta = meta.into();
     match meta.protocol {
         PROTO_TCP | PROTO_UDP => Some(false),
         PROTO_ICMP | PROTO_ICMPV6 => {
@@ -2486,6 +2531,24 @@ pub(super) fn checksum16_adjust(checksum: u16, old_words: &[u16], new_words: &[u
     }
     for word in new_words {
         sum += u32::from(*word);
+    }
+    checksum16_finish(sum)
+}
+
+#[inline(always)]
+fn checksum16_adjust_ipv6_addr_bytes(
+    checksum: u16,
+    old_addr: &[u8; 16],
+    new_addr: &[u8; 16],
+) -> u16 {
+    let mut sum = (!checksum as u32) & 0xffff;
+    let mut idx = 0usize;
+    while idx < 16 {
+        let old_word = u16::from_be_bytes([old_addr[idx], old_addr[idx + 1]]);
+        let new_word = u16::from_be_bytes([new_addr[idx], new_addr[idx + 1]]);
+        sum += (!u32::from(old_word)) & 0xffff;
+        sum += u32::from(new_word);
+        idx += 2;
     }
     checksum16_finish(sum)
 }
@@ -2728,6 +2791,33 @@ pub(super) fn adjust_l4_checksum_ipv6_words(
         *packet.get(checksum_offset + 1)?,
     ]);
     let mut updated = checksum16_adjust(current, old_words, new_words);
+    if matches!(protocol, PROTO_UDP | PROTO_ICMPV6) && updated == 0 {
+        updated = 0xffff;
+    }
+    packet
+        .get_mut(checksum_offset..checksum_offset + 2)?
+        .copy_from_slice(&updated.to_be_bytes());
+    Some(())
+}
+
+#[inline(always)]
+fn adjust_l4_checksum_ipv6_addr_bytes(
+    packet: &mut [u8],
+    protocol: u8,
+    old_addr: &[u8; 16],
+    new_addr: &[u8; 16],
+) -> Option<()> {
+    let checksum_offset = match protocol {
+        PROTO_TCP => 56usize,
+        PROTO_UDP => 46usize,
+        PROTO_ICMPV6 => 42usize,
+        _ => return Some(()),
+    };
+    let current = u16::from_be_bytes([
+        *packet.get(checksum_offset)?,
+        *packet.get(checksum_offset + 1)?,
+    ]);
+    let mut updated = checksum16_adjust_ipv6_addr_bytes(current, old_addr, new_addr);
     if matches!(protocol, PROTO_UDP | PROTO_ICMPV6) && updated == 0 {
         updated = 0xffff;
     }
@@ -3064,6 +3154,34 @@ mod tests {
         frame
     }
 
+    fn build_icmp_echo_frame_v4_vlan(
+        src: Ipv4Addr,
+        dst: Ipv4Addr,
+        ttl: u8,
+        vlan_id: u16,
+    ) -> Vec<u8> {
+        let mut frame = Vec::new();
+        write_eth_header(
+            &mut frame,
+            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            [0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+            vlan_id,
+            0x0800,
+        );
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, ttl, PROTO_ICMP, 0x00, 0x00,
+        ]);
+        frame.extend_from_slice(&src.octets());
+        frame.extend_from_slice(&dst.octets());
+        let ip_csum = checksum16(&frame[18..38]);
+        frame[28..30].copy_from_slice(&ip_csum.to_be_bytes());
+        let icmp_start = frame.len();
+        frame.extend_from_slice(&[8, 0, 0x00, 0x00, 0x12, 0x34, 0x00, 0x01]);
+        let icmp_csum = checksum16(&frame[icmp_start..]);
+        frame[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_csum.to_be_bytes());
+        frame
+    }
+
     fn build_ipv6_gre_frame(
         inner_packet: &[u8],
         src: Ipv6Addr,
@@ -3101,6 +3219,47 @@ mod tests {
         }
         frame.extend_from_slice(inner_packet);
         frame
+    }
+
+    #[test]
+    fn trim_l3_payload_uses_frame_length_metadata_relative_to_l3_offset_without_parsing_header() {
+        let mut frame =
+            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2), 64);
+        let wire_len = frame.len();
+        frame[14] = 0;
+        frame.extend_from_slice(&[0u8; 8]);
+        let raw_payload = &frame[14..];
+        let meta = UserspaceDpMeta {
+            l3_offset: 14,
+            pkt_len: wire_len as u16,
+            addr_family: libc::AF_INET as u8,
+            ..UserspaceDpMeta::default()
+        };
+
+        assert_eq!(trim_l3_payload(raw_payload, meta).len(), wire_len - 14);
+    }
+
+    #[test]
+    fn trim_l3_payload_uses_vlan_frame_length_metadata_relative_to_l3_offset_without_parsing_header()
+     {
+        let mut frame = build_icmp_echo_frame_v4_vlan(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(10, 0, 0, 2),
+            64,
+            80,
+        );
+        let wire_len = frame.len();
+        frame[18] = 0;
+        frame.extend_from_slice(&[0u8; 8]);
+        let raw_payload = &frame[18..];
+        let meta = UserspaceDpMeta {
+            l3_offset: 18,
+            pkt_len: wire_len as u16,
+            addr_family: libc::AF_INET as u8,
+            ..UserspaceDpMeta::default()
+        };
+
+        assert_eq!(trim_l3_payload(raw_payload, meta).len(), wire_len - 18);
     }
 
     fn native_gre_outer_meta() -> UserspaceDpMeta {
@@ -6583,6 +6742,7 @@ mod tests {
             egress_ifindex: decision.resolution.egress_ifindex,
             tx_ifindex: decision.resolution.tx_ifindex,
             target_binding_index: None,
+            tx_selection: CachedTxSelectionDescriptor::default(),
             nat64: false,
             nptv6: false,
             apply_nat_on_fabric: false,
@@ -7127,6 +7287,7 @@ mod tests {
             egress_ifindex: 0,
             tx_ifindex: 0,
             target_binding_index: None,
+            tx_selection: CachedTxSelectionDescriptor::default(),
             nat64: true,
             nptv6: false,
             apply_nat_on_fabric: false,

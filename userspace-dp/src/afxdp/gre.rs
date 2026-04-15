@@ -296,10 +296,11 @@ pub(super) fn try_native_gre_decap_from_frame(
 
 pub(super) fn encapsulate_native_gre_frame(
     inner_frame: &[u8],
-    inner_meta: UserspaceDpMeta,
+    inner_meta: impl Into<ForwardPacketMeta>,
     decision: &SessionDecision,
     forwarding: &ForwardingState,
 ) -> Option<Vec<u8>> {
+    let inner_meta = inner_meta.into();
     let endpoint = forwarding
         .tunnel_endpoints
         .get(&decision.resolution.tunnel_endpoint_id)?;

@@ -92,6 +92,82 @@ const _: [(); 40] = [(); std::mem::offset_of!(UserspaceDpMeta, dscp)];
 const _: [(); 80] = [(); std::mem::offset_of!(UserspaceDpMeta, config_generation)];
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ForwardPacketMeta {
+    pub(super) ingress_ifindex: u32,
+    pub(super) ingress_vlan_id: u16,
+    pub(super) ingress_pcp: u8,
+    pub(super) ingress_vlan_present: u8,
+    pub(super) l3_offset: u16,
+    pub(super) l4_offset: u16,
+    pub(super) payload_offset: u16,
+    pub(super) pkt_len: u16,
+    pub(super) addr_family: u8,
+    pub(super) protocol: u8,
+    pub(super) tcp_flags: u8,
+    pub(super) meta_flags: u8,
+    pub(super) dscp: u8,
+    pub(super) flow_src_port: u16,
+    pub(super) flow_dst_port: u16,
+}
+
+impl From<UserspaceDpMeta> for ForwardPacketMeta {
+    fn from(meta: UserspaceDpMeta) -> Self {
+        Self {
+            ingress_ifindex: meta.ingress_ifindex,
+            ingress_vlan_id: meta.ingress_vlan_id,
+            ingress_pcp: meta.ingress_pcp,
+            ingress_vlan_present: meta.ingress_vlan_present,
+            l3_offset: meta.l3_offset,
+            l4_offset: meta.l4_offset,
+            payload_offset: meta.payload_offset,
+            pkt_len: meta.pkt_len,
+            addr_family: meta.addr_family,
+            protocol: meta.protocol,
+            tcp_flags: meta.tcp_flags,
+            meta_flags: meta.meta_flags,
+            dscp: meta.dscp,
+            flow_src_port: meta.flow_src_port,
+            flow_dst_port: meta.flow_dst_port,
+        }
+    }
+}
+
+impl From<ForwardPacketMeta> for UserspaceDpMeta {
+    fn from(meta: ForwardPacketMeta) -> Self {
+        Self {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: meta.ingress_ifindex,
+            rx_queue_index: 0,
+            ingress_vlan_id: meta.ingress_vlan_id,
+            ingress_pcp: meta.ingress_pcp,
+            ingress_vlan_present: meta.ingress_vlan_present,
+            ingress_zone: 0,
+            routing_table: 0,
+            l3_offset: meta.l3_offset,
+            l4_offset: meta.l4_offset,
+            payload_offset: meta.payload_offset,
+            pkt_len: meta.pkt_len,
+            addr_family: meta.addr_family,
+            protocol: meta.protocol,
+            tcp_flags: meta.tcp_flags,
+            meta_flags: meta.meta_flags,
+            dscp: meta.dscp,
+            dscp_rewrite: 0,
+            reserved: 0,
+            flow_src_port: meta.flow_src_port,
+            flow_dst_port: meta.flow_dst_port,
+            flow_src_addr: [0; 16],
+            flow_dst_addr: [0; 16],
+            config_generation: 0,
+            fib_generation: 0,
+            reserved2: 0,
+        }
+    }
+}
+#[repr(C)]
 pub(super) struct XdpOptions {
     pub(super) flags: u32,
 }
@@ -173,6 +249,8 @@ pub(super) struct ForwardingState {
     pub(super) tunnel_interfaces: FastSet<i32>,
     pub(super) filter_state: crate::filter::FilterState,
     pub(super) cos: CoSState,
+    pub(super) tx_selection_enabled_v4: bool,
+    pub(super) tx_selection_enabled_v6: bool,
     #[allow(dead_code)]
     pub(super) gre_acceleration: bool,
     pub(super) flow_export_config: Option<crate::flowexport::FlowExportConfig>,
@@ -197,6 +275,8 @@ pub(super) struct CoSInterfaceConfig {
     pub(super) default_queue: u8,
     pub(super) dscp_classifier: String,
     pub(super) ieee8021_classifier: String,
+    pub(super) dscp_queue_by_dscp: [u8; 64],
+    pub(super) ieee8021_queue_by_pcp: [u8; 8],
     pub(super) queue_by_forwarding_class: FastMap<String, u8>,
     pub(super) queues: Vec<CoSQueueConfig>,
 }
@@ -567,20 +647,30 @@ pub(super) struct TxRequest {
     pub(super) dscp_rewrite: Option<u8>,
 }
 
+pub(super) enum PendingForwardFrame {
+    Live,
+    Owned(Vec<u8>),
+    Prebuilt(Vec<u8>),
+}
+
+impl Default for PendingForwardFrame {
+    fn default() -> Self {
+        Self::Live
+    }
+}
+
 pub(super) struct PendingForwardRequest {
     pub(super) target_ifindex: i32,
     pub(super) target_binding_index: Option<usize>,
     pub(super) ingress_queue_id: u32,
-    pub(super) source_offset: u64,
     pub(super) desc: XdpDesc,
-    pub(super) source_frame: Option<Vec<u8>>,
-    pub(super) meta: UserspaceDpMeta,
+    pub(super) frame: PendingForwardFrame,
+    pub(super) meta: ForwardPacketMeta,
     pub(super) decision: SessionDecision,
     pub(super) apply_nat_on_fabric: bool,
     pub(super) expected_ports: Option<(u16, u16)>,
     pub(super) flow_key: Option<SessionKey>,
     pub(super) nat64_reverse: Option<Nat64ReverseInfo>,
-    pub(super) prebuilt_frame: Option<Vec<u8>>,
     pub(super) cos_queue_id: Option<u8>,
     pub(super) dscp_rewrite: Option<u8>,
 }

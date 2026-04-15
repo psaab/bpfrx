@@ -307,6 +307,128 @@ pub(super) struct CoSTxSelection {
     pub(super) dscp_rewrite: Option<u8>,
 }
 
+fn map_cached_forwarding_class_queue(
+    iface: &CoSInterfaceConfig,
+    forwarding_class: Option<&Arc<str>>,
+) -> Option<u8> {
+    forwarding_class.and_then(|class| iface.queue_by_forwarding_class.get(class.as_ref()).copied())
+}
+
+pub(super) fn resolve_cached_cos_tx_selection(
+    forwarding: &ForwardingState,
+    egress_ifindex: i32,
+    meta: UserspaceDpMeta,
+    flow_key: Option<&SessionKey>,
+) -> CachedTxSelectionDescriptor {
+    let iface = forwarding.cos.interfaces.get(&egress_ifindex);
+    let Some(flow_key) = flow_key else {
+        return CachedTxSelectionDescriptor {
+            queue_id: iface.map(|iface| iface.default_queue),
+            dscp_rewrite: None,
+            filter_counter: None,
+        };
+    };
+
+    let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
+    let has_output_tx_selection =
+        crate::filter::filter_state_has_output_tx_selection(&forwarding.filter_state, is_v6);
+    let has_input_tx_selection =
+        crate::filter::filter_state_has_input_tx_selection(&forwarding.filter_state, is_v6);
+    if iface.is_none() && !has_output_tx_selection && !has_input_tx_selection {
+        return CachedTxSelectionDescriptor::default();
+    }
+    let output_filter = if has_output_tx_selection {
+        if is_v6 {
+            forwarding
+                .filter_state
+                .iface_filter_out_v6_fast
+                .get(&egress_ifindex)
+                .map(Arc::as_ref)
+        } else {
+            forwarding
+                .filter_state
+                .iface_filter_out_v4_fast
+                .get(&egress_ifindex)
+                .map(Arc::as_ref)
+        }
+    } else {
+        None
+    };
+    let output_result = output_filter
+        .filter(|filter| filter.affects_tx_selection)
+        .map(|filter| {
+            crate::filter::evaluate_filter_ref_tx_selection_cached(
+                filter,
+                flow_key.src_ip,
+                flow_key.dst_ip,
+                flow_key.protocol,
+                flow_key.src_port,
+                flow_key.dst_port,
+                meta.dscp,
+            )
+        })
+        .unwrap_or_default();
+
+    let mut effective_dscp_rewrite = output_result.dscp_rewrite;
+    let mut forwarding_class = output_result.forwarding_class.clone();
+    let mut filter_counter = output_result.counter.clone();
+
+    if output_filter.is_none() && has_input_tx_selection {
+        let ingress_ifindex = resolve_ingress_logical_ifindex(
+            forwarding,
+            meta.ingress_ifindex as i32,
+            meta.ingress_vlan_id,
+        )
+        .unwrap_or(meta.ingress_ifindex as i32);
+        let ingress_filter = if is_v6 {
+            forwarding
+                .filter_state
+                .iface_filter_v6_fast
+                .get(&ingress_ifindex)
+                .map(Arc::as_ref)
+        } else {
+            forwarding
+                .filter_state
+                .iface_filter_v4_fast
+                .get(&ingress_ifindex)
+                .map(Arc::as_ref)
+        };
+        if let Some(ingress_filter) = ingress_filter.filter(|filter| filter.affects_tx_selection) {
+            let ingress_result = crate::filter::evaluate_filter_ref_tx_selection_cached(
+                ingress_filter,
+                flow_key.src_ip,
+                flow_key.dst_ip,
+                flow_key.protocol,
+                flow_key.src_port,
+                flow_key.dst_port,
+                meta.dscp,
+            );
+            effective_dscp_rewrite = effective_dscp_rewrite.or(ingress_result.dscp_rewrite);
+            forwarding_class = ingress_result.forwarding_class;
+            filter_counter = ingress_result.counter;
+        }
+    }
+
+    let queue_id = iface.and_then(|iface| {
+        map_cached_forwarding_class_queue(iface, forwarding_class.as_ref())
+            .or_else(|| resolve_cos_dscp_classifier_queue_id(iface, meta.dscp))
+            .or_else(|| {
+                resolve_cos_ieee8021_classifier_queue_id(
+                    iface,
+                    meta.ingress_pcp,
+                    meta.ingress_vlan_present != 0,
+                )
+            })
+            .or(Some(iface.default_queue))
+    });
+
+    CachedTxSelectionDescriptor {
+        queue_id,
+        dscp_rewrite: effective_dscp_rewrite,
+        filter_counter,
+    }
+}
+
 fn binding_has_pending_tx_work(binding: &BindingWorker) -> bool {
     binding.outstanding_tx > 0
         || !binding.pending_tx_prepared.is_empty()
@@ -1156,7 +1278,7 @@ fn wake_due_cos_timer_slot(root: &mut CoSInterfaceRuntime) {
 pub(super) fn resolve_cos_queue_id(
     forwarding: &ForwardingState,
     egress_ifindex: i32,
-    meta: UserspaceDpMeta,
+    meta: impl Into<ForwardPacketMeta>,
     flow_key: Option<&SessionKey>,
 ) -> Option<u8> {
     resolve_cos_tx_selection(forwarding, egress_ifindex, meta, flow_key).queue_id
@@ -1165,9 +1287,18 @@ pub(super) fn resolve_cos_queue_id(
 pub(super) fn resolve_cos_tx_selection(
     forwarding: &ForwardingState,
     egress_ifindex: i32,
-    meta: UserspaceDpMeta,
+    meta: impl Into<ForwardPacketMeta>,
     flow_key: Option<&SessionKey>,
 ) -> CoSTxSelection {
+    let meta = meta.into();
+    let tx_selection_enabled = if meta.addr_family as i32 == libc::AF_INET6 {
+        forwarding.tx_selection_enabled_v6
+    } else {
+        forwarding.tx_selection_enabled_v4
+    };
+    if !tx_selection_enabled {
+        return CoSTxSelection::default();
+    }
     let iface = forwarding.cos.interfaces.get(&egress_ifindex);
     let Some(flow_key) = flow_key else {
         return CoSTxSelection {
@@ -1176,18 +1307,35 @@ pub(super) fn resolve_cos_tx_selection(
         };
     };
     let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
-    let has_output_filter = if is_v6 {
-        forwarding
-            .filter_state
-            .iface_filter_out_v6
-            .contains_key(&egress_ifindex)
+    let has_output_tx_selection =
+        crate::filter::filter_state_has_output_tx_selection(&forwarding.filter_state, is_v6);
+    let has_input_tx_selection =
+        crate::filter::filter_state_has_input_tx_selection(&forwarding.filter_state, is_v6);
+    if iface.is_none() && !has_output_tx_selection && !has_input_tx_selection {
+        return CoSTxSelection {
+            queue_id: None,
+            dscp_rewrite: None,
+        };
+    }
+    let output_filter = if has_output_tx_selection {
+        if is_v6 {
+            forwarding
+                .filter_state
+                .iface_filter_out_v6_fast
+                .get(&egress_ifindex)
+                .map(Arc::as_ref)
+        } else {
+            forwarding
+                .filter_state
+                .iface_filter_out_v4_fast
+                .get(&egress_ifindex)
+                .map(Arc::as_ref)
+        }
     } else {
-        forwarding
-            .filter_state
-            .iface_filter_out_v4
-            .contains_key(&egress_ifindex)
+        None
     };
-    let ingress_ifindex = if !has_output_filter {
+    let has_output_filter = output_filter.is_some();
+    let ingress_ifindex = if !has_output_filter && has_input_tx_selection {
         resolve_ingress_logical_ifindex(
             forwarding,
             meta.ingress_ifindex as i32,
@@ -1197,41 +1345,43 @@ pub(super) fn resolve_cos_tx_selection(
     } else {
         0
     };
-    let ingress_filter_affects_tx_selection = !has_output_filter
-        && crate::filter::interface_filter_affects_tx_selection(
-            &forwarding.filter_state,
-            ingress_ifindex,
-            is_v6,
-        );
-    if iface.is_none() && !has_output_filter && !ingress_filter_affects_tx_selection {
-        return CoSTxSelection {
-            queue_id: None,
-            dscp_rewrite: None,
-        };
-    }
-    let output_result = if has_output_filter {
-        crate::filter::evaluate_interface_output_filter_counted(
-            &forwarding.filter_state,
-            egress_ifindex,
-            is_v6,
-            flow_key.src_ip,
-            flow_key.dst_ip,
-            flow_key.protocol,
-            flow_key.src_port,
-            flow_key.dst_port,
-            meta.dscp,
-            meta.pkt_len as u64,
-        )
+    let ingress_filter = if !has_output_filter && has_input_tx_selection {
+        if is_v6 {
+            forwarding
+                .filter_state
+                .iface_filter_v6_fast
+                .get(&ingress_ifindex)
+                .map(Arc::as_ref)
+        } else {
+            forwarding
+                .filter_state
+                .iface_filter_v4_fast
+                .get(&ingress_ifindex)
+                .map(Arc::as_ref)
+        }
     } else {
-        crate::filter::FilterResult::default()
+        None
     };
+    let output_result =
+        if let Some(output_filter) = output_filter.filter(|filter| filter.affects_tx_selection) {
+            crate::filter::evaluate_filter_ref_tx_selection_counted(
+                output_filter,
+                flow_key.src_ip,
+                flow_key.dst_ip,
+                flow_key.protocol,
+                flow_key.src_port,
+                flow_key.dst_port,
+                meta.dscp,
+                meta.pkt_len as u64,
+            )
+        } else {
+            crate::filter::TxSelectionFilterResult::default()
+        };
     let mut effective_dscp_rewrite = output_result.dscp_rewrite;
-    let mut ingress_forwarding_class = Arc::<str>::from("");
-    if ingress_filter_affects_tx_selection {
-        let ingress_result = crate::filter::evaluate_interface_filter_counted(
-            &forwarding.filter_state,
-            ingress_ifindex,
-            is_v6,
+    let mut ingress_forwarding_class = None;
+    if let Some(ingress_filter) = ingress_filter.filter(|filter| filter.affects_tx_selection) {
+        let ingress_result = crate::filter::evaluate_filter_ref_tx_selection_counted(
+            ingress_filter,
             flow_key.src_ip,
             flow_key.dst_ip,
             flow_key.protocol,
@@ -1249,36 +1399,29 @@ pub(super) fn resolve_cos_tx_selection(
             dscp_rewrite: effective_dscp_rewrite,
         };
     };
-    if !output_result.forwarding_class.is_empty() {
-        if let Some(queue_id) = iface
-            .queue_by_forwarding_class
-            .get(output_result.forwarding_class.as_ref())
-        {
+    if let Some(forwarding_class) = output_result.forwarding_class {
+        if let Some(queue_id) = iface.queue_by_forwarding_class.get(forwarding_class) {
             return CoSTxSelection {
                 queue_id: Some(*queue_id),
                 dscp_rewrite: effective_dscp_rewrite,
             };
         }
     }
-    if !ingress_forwarding_class.is_empty() {
-        if let Some(queue_id) = iface
-            .queue_by_forwarding_class
-            .get(ingress_forwarding_class.as_ref())
-        {
+    if let Some(forwarding_class) = ingress_forwarding_class {
+        if let Some(queue_id) = iface.queue_by_forwarding_class.get(forwarding_class) {
             return CoSTxSelection {
                 queue_id: Some(*queue_id),
                 dscp_rewrite: effective_dscp_rewrite,
             };
         }
     }
-    if let Some(queue_id) = resolve_cos_dscp_classifier_queue_id(forwarding, iface, meta.dscp) {
+    if let Some(queue_id) = resolve_cos_dscp_classifier_queue_id(iface, meta.dscp) {
         return CoSTxSelection {
             queue_id: Some(queue_id),
             dscp_rewrite: effective_dscp_rewrite,
         };
     }
     if let Some(queue_id) = resolve_cos_ieee8021_classifier_queue_id(
-        forwarding,
         iface,
         meta.ingress_pcp,
         meta.ingress_vlan_present != 0,
@@ -1294,35 +1437,21 @@ pub(super) fn resolve_cos_tx_selection(
     }
 }
 
-fn resolve_cos_dscp_classifier_queue_id(
-    forwarding: &ForwardingState,
-    iface: &CoSInterfaceConfig,
-    dscp: u8,
-) -> Option<u8> {
-    if iface.dscp_classifier.is_empty() {
-        return None;
-    }
-    forwarding
-        .cos
-        .dscp_classifiers
-        .get(&iface.dscp_classifier)
-        .and_then(|classifier| classifier.queue_by_dscp.get(&dscp).copied())
+fn resolve_cos_dscp_classifier_queue_id(iface: &CoSInterfaceConfig, dscp: u8) -> Option<u8> {
+    let queue_id = iface.dscp_queue_by_dscp[usize::from(dscp & 0x3f)];
+    (queue_id != u8::MAX).then_some(queue_id)
 }
 
 fn resolve_cos_ieee8021_classifier_queue_id(
-    forwarding: &ForwardingState,
     iface: &CoSInterfaceConfig,
     pcp: u8,
     vlan_present: bool,
 ) -> Option<u8> {
-    if iface.ieee8021_classifier.is_empty() || !vlan_present {
+    if !vlan_present {
         return None;
     }
-    forwarding
-        .cos
-        .ieee8021_classifiers
-        .get(&iface.ieee8021_classifier)
-        .and_then(|classifier| classifier.queue_by_pcp.get(&pcp).copied())
+    let queue_id = iface.ieee8021_queue_by_pcp[usize::from(pcp.min(7))];
+    (queue_id != u8::MAX).then_some(queue_id)
 }
 
 pub(super) fn enqueue_local_into_cos(
@@ -2306,6 +2435,8 @@ mod tests {
                 default_queue: 4,
                 dscp_classifier: String::new(),
                 ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
                 queue_by_forwarding_class: FastMap::default(),
                 queues: Vec::new(),
             },
@@ -2355,6 +2486,8 @@ mod tests {
                 default_queue: 5,
                 dscp_classifier: String::new(),
                 ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
                 queue_by_forwarding_class: FastMap::default(),
                 queues: Vec::new(),
             },
@@ -2744,6 +2877,130 @@ mod tests {
     }
 
     #[test]
+    fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counter() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "reth1.0".into(),
+                    ifindex: 101,
+                    parent_ifindex: 5,
+                    vlan_id: 0,
+                    hardware_addr: "02:bf:72:00:61:01".into(),
+                    filter_input_v4: "cos-classify".into(),
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "reth0.0".into(),
+                    ifindex: 202,
+                    hardware_addr: "02:bf:72:00:80:08".into(),
+                    filter_output_v4: "wan-classify".into(),
+                    cos_shaping_rate_bytes_per_sec: 10_000_000,
+                    cos_shaping_burst_bytes: 256_000,
+                    cos_scheduler_map: "wan-map".into(),
+                    ..Default::default()
+                },
+            ],
+            filters: vec![
+                FirewallFilterSnapshot {
+                    name: "cos-classify".into(),
+                    family: "inet".into(),
+                    terms: vec![FirewallTermSnapshot {
+                        name: "voice".into(),
+                        protocols: vec!["tcp".into()],
+                        destination_ports: vec!["443".into()],
+                        action: "accept".into(),
+                        forwarding_class: "best-effort".into(),
+                        ..Default::default()
+                    }],
+                },
+                FirewallFilterSnapshot {
+                    name: "wan-classify".into(),
+                    family: "inet".into(),
+                    terms: vec![FirewallTermSnapshot {
+                        name: "voice".into(),
+                        protocols: vec!["tcp".into()],
+                        destination_ports: vec!["443".into()],
+                        action: "accept".into(),
+                        count: "wan-hits".into(),
+                        forwarding_class: "expedited-forwarding".into(),
+                        ..Default::default()
+                    }],
+                },
+            ],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![
+                    CoSForwardingClassSnapshot {
+                        name: "best-effort".into(),
+                        queue: 0,
+                    },
+                    CoSForwardingClassSnapshot {
+                        name: "expedited-forwarding".into(),
+                        queue: 1,
+                    },
+                ],
+                schedulers: vec![
+                    CoSSchedulerSnapshot {
+                        name: "be-sched".into(),
+                        transmit_rate_bytes: 4_000_000,
+                        transmit_rate_exact: false,
+                        priority: "low".into(),
+                        buffer_size_bytes: 128_000,
+                    },
+                    CoSSchedulerSnapshot {
+                        name: "ef-sched".into(),
+                        transmit_rate_bytes: 6_000_000,
+                        transmit_rate_exact: false,
+                        priority: "strict-high".into(),
+                        buffer_size_bytes: 64_000,
+                    },
+                ],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "best-effort".into(),
+                            scheduler: "be-sched".into(),
+                        },
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "expedited-forwarding".into(),
+                            scheduler: "ef-sched".into(),
+                        },
+                    ],
+                }],
+                dscp_classifiers: vec![],
+                ieee8021_classifiers: vec![],
+                dscp_rewrite_rules: vec![],
+            }),
+            ..Default::default()
+        };
+
+        let forwarding = build_forwarding_state(&snapshot);
+        let cached = resolve_cached_cos_tx_selection(
+            &forwarding,
+            202,
+            UserspaceDpMeta {
+                ingress_ifindex: 5,
+                ingress_vlan_id: 0,
+                addr_family: libc::AF_INET as u8,
+                dscp: 0,
+                ..Default::default()
+            },
+            Some(&SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 443,
+            }),
+        );
+
+        assert_eq!(cached.queue_id, Some(1));
+        assert_eq!(cached.dscp_rewrite, None);
+        assert!(cached.filter_counter.is_some());
+    }
+
+    #[test]
     fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists() {
         let snapshot = ConfigSnapshot {
             interfaces: vec![
@@ -2847,6 +3104,115 @@ mod tests {
         );
 
         assert_eq!(queue_id, Some(1));
+    }
+
+    #[test]
+    fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exists() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "reth1.0".into(),
+                    ifindex: 101,
+                    parent_ifindex: 5,
+                    vlan_id: 0,
+                    hardware_addr: "02:bf:72:00:61:01".into(),
+                    filter_input_v4: "cos-classify".into(),
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "reth0.0".into(),
+                    ifindex: 202,
+                    hardware_addr: "02:bf:72:00:80:08".into(),
+                    cos_shaping_rate_bytes_per_sec: 10_000_000,
+                    cos_shaping_burst_bytes: 256_000,
+                    cos_scheduler_map: "wan-map".into(),
+                    ..Default::default()
+                },
+            ],
+            filters: vec![FirewallFilterSnapshot {
+                name: "cos-classify".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "voice".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: "accept".into(),
+                    count: "lan-hits".into(),
+                    forwarding_class: "expedited-forwarding".into(),
+                    ..Default::default()
+                }],
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![
+                    CoSForwardingClassSnapshot {
+                        name: "best-effort".into(),
+                        queue: 0,
+                    },
+                    CoSForwardingClassSnapshot {
+                        name: "expedited-forwarding".into(),
+                        queue: 1,
+                    },
+                ],
+                dscp_classifiers: vec![],
+                ieee8021_classifiers: vec![],
+                dscp_rewrite_rules: vec![],
+                schedulers: vec![
+                    CoSSchedulerSnapshot {
+                        name: "be-sched".into(),
+                        transmit_rate_bytes: 4_000_000,
+                        transmit_rate_exact: false,
+                        priority: "low".into(),
+                        buffer_size_bytes: 128_000,
+                    },
+                    CoSSchedulerSnapshot {
+                        name: "ef-sched".into(),
+                        transmit_rate_bytes: 6_000_000,
+                        transmit_rate_exact: false,
+                        priority: "strict-high".into(),
+                        buffer_size_bytes: 64_000,
+                    },
+                ],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "best-effort".into(),
+                            scheduler: "be-sched".into(),
+                        },
+                        CoSSchedulerMapEntrySnapshot {
+                            forwarding_class: "expedited-forwarding".into(),
+                            scheduler: "ef-sched".into(),
+                        },
+                    ],
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let forwarding = build_forwarding_state(&snapshot);
+        let cached = resolve_cached_cos_tx_selection(
+            &forwarding,
+            202,
+            UserspaceDpMeta {
+                ingress_ifindex: 5,
+                ingress_vlan_id: 0,
+                addr_family: libc::AF_INET as u8,
+                dscp: 0,
+                ..Default::default()
+            },
+            Some(&SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 443,
+            }),
+        );
+
+        assert_eq!(cached.queue_id, Some(1));
+        assert_eq!(cached.dscp_rewrite, None);
+        assert!(cached.filter_counter.is_some());
     }
 
     #[test]
@@ -3042,6 +3408,72 @@ mod tests {
         );
 
         assert_eq!(selection.queue_id, Some(7));
+        assert_eq!(selection.dscp_rewrite, None);
+        let filter = forwarding
+            .filter_state
+            .filters
+            .get("inet:sfmix-pbr")
+            .expect("filter");
+        assert_eq!(
+            filter.terms[0]
+                .counter
+                .packets
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[test]
+    fn resolve_cos_tx_selection_returns_none_when_no_cos_or_tx_selection_filters_exist() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                name: "reth1.0".into(),
+                ifindex: 101,
+                parent_ifindex: 5,
+                vlan_id: 0,
+                hardware_addr: "02:bf:72:00:61:01".into(),
+                filter_input_v4: "sfmix-pbr".into(),
+                ..Default::default()
+            }],
+            filters: vec![FirewallFilterSnapshot {
+                name: "sfmix-pbr".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "sfmix-route".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: "accept".into(),
+                    count: "tx-duplicate".into(),
+                    routing_instance: "sfmix".into(),
+                    ..Default::default()
+                }],
+            }],
+            ..Default::default()
+        };
+
+        let forwarding = build_forwarding_state(&snapshot);
+        let selection = resolve_cos_tx_selection(
+            &forwarding,
+            202,
+            UserspaceDpMeta {
+                ingress_ifindex: 5,
+                ingress_vlan_id: 0,
+                addr_family: libc::AF_INET as u8,
+                dscp: 0,
+                pkt_len: 1500,
+                ..Default::default()
+            },
+            Some(&SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 443,
+            }),
+        );
+
+        assert_eq!(selection.queue_id, None);
         assert_eq!(selection.dscp_rewrite, None);
         let filter = forwarding
             .filter_state
@@ -3611,6 +4043,8 @@ mod tests {
                 default_queue: 0,
                 dscp_classifier: String::new(),
                 ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
                 queue_by_forwarding_class: FastMap::default(),
                 queues: vec![CoSQueueConfig {
                     queue_id: 0,
@@ -3654,6 +4088,8 @@ mod tests {
                 default_queue: 0,
                 dscp_classifier: String::new(),
                 ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
                 queue_by_forwarding_class: FastMap::default(),
                 queues,
             },

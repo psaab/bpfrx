@@ -166,6 +166,70 @@ fn worker_binding_lookup_resolves_slot_index() {
 }
 
 #[test]
+fn build_live_forward_request_from_frame_uses_precomputed_hints() {
+    let lookup = WorkerBindingLookup::default();
+    let ingress_ident = BindingIdentity {
+        slot: 7,
+        queue_id: 3,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-1"),
+        ifindex: 10,
+    };
+    let desc = XdpDesc {
+        addr: 0,
+        len: 0,
+        options: 0,
+    };
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 80,
+        },
+        nat: NatDecision::default(),
+    };
+    let hints = PendingForwardHints {
+        expected_ports: Some((12345, 5201)),
+        target_binding_index: Some(9),
+    };
+
+    let req = build_live_forward_request_from_frame(
+        &lookup,
+        2,
+        &ingress_ident,
+        desc,
+        &[],
+        meta,
+        &decision,
+        &ForwardingState::default(),
+        None,
+        None,
+        false,
+        Some(hints),
+        None,
+    )
+    .expect("request");
+
+    assert_eq!(req.expected_ports, hints.expected_ports);
+    assert_eq!(req.target_binding_index, hints.target_binding_index);
+    assert_eq!(req.target_ifindex, 11);
+}
+
+#[test]
 fn icmp_reverse_key_keeps_identifier_position() {
     let flow = SessionFlow {
         src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
@@ -1093,8 +1157,8 @@ fn build_local_time_exceeded_request_returns_prebuilt_forward_for_ttl_expiry() {
 
     assert_eq!(request.target_ifindex, 5);
     assert_eq!(request.ingress_queue_id, ingress_ident.queue_id);
-    assert_eq!(request.source_offset, desc.addr);
-    assert!(request.prebuilt_frame.is_some());
+    assert_eq!(request.desc.addr, desc.addr);
+    assert!(matches!(request.frame, PendingForwardFrame::Prebuilt(_)));
 }
 
 #[test]

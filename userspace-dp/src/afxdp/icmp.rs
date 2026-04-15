@@ -53,10 +53,9 @@ pub(super) fn build_local_time_exceeded_request(
         target_ifindex,
         target_binding_index: None,
         ingress_queue_id: ingress_ident.queue_id,
-        source_offset: desc.addr,
         desc,
-        source_frame: None,
-        meta,
+        frame: PendingForwardFrame::Prebuilt(prebuilt_frame),
+        meta: meta.into(),
         decision: SessionDecision {
             resolution: ForwardingResolution {
                 disposition: ForwardingDisposition::ForwardCandidate,
@@ -75,7 +74,6 @@ pub(super) fn build_local_time_exceeded_request(
         expected_ports: None,
         flow_key: None,
         nat64_reverse: None,
-        prebuilt_frame: Some(prebuilt_frame),
         cos_queue_id: cos.queue_id,
         dscp_rewrite: cos.dscp_rewrite,
     })

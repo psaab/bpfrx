@@ -761,6 +761,7 @@ pub(crate) fn worker_loop(
                 did_work = true;
             }
         }
+        crate::filter::flush_recorded_filter_counters();
         dbg_rx_total += dbg_poll.rx;
         #[cfg(feature = "debug-log")]
         {
@@ -1536,6 +1537,8 @@ mod tests {
                 default_queue: 0,
                 dscp_classifier: String::new(),
                 ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
                 queue_by_forwarding_class: FastMap::default(),
                 queues: vec![CoSQueueConfig {
                     queue_id: 4,

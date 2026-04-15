@@ -786,7 +786,7 @@ pub(super) fn cancel_pending_forwards(
     let mut kept = Vec::with_capacity(pending_forwards.len());
     for req in pending_forwards.drain(..) {
         if pending_forward_matches_flow(&req, forward_key, reverse_key) {
-            binding.pending_fill_frames.push_back(req.source_offset);
+            binding.pending_fill_frames.push_back(req.desc.addr);
             continue;
         }
         kept.push(req);
@@ -3008,6 +3008,7 @@ mod tests {
                 egress_ifindex: 6,
                 tx_ifindex: 6,
                 target_binding_index: None,
+                tx_selection: CachedTxSelectionDescriptor::default(),
                 nat64: false,
                 nptv6: false,
                 apply_nat_on_fabric: false,
@@ -3086,6 +3087,7 @@ mod tests {
                 egress_ifindex: 6,
                 tx_ifindex: 6,
                 target_binding_index: None,
+                tx_selection: CachedTxSelectionDescriptor::default(),
                 nat64: false,
                 nptv6: false,
                 apply_nat_on_fabric: false,

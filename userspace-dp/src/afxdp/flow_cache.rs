@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
 const FLOW_CACHE_SIZE: usize = 4096;
@@ -7,10 +8,17 @@ const FLOW_CACHE_MASK: usize = FLOW_CACHE_SIZE - 1;
 /// Maximum number of redundancy groups for epoch-based cache invalidation.
 pub(super) const MAX_RG_EPOCHS: usize = 16;
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct CachedTxSelectionDescriptor {
+    pub(super) queue_id: Option<u8>,
+    pub(super) dscp_rewrite: Option<u8>,
+    pub(super) filter_counter: Option<Arc<crate::filter::FilterTermCounter>>,
+}
+
 /// Precomputed rewrite descriptor for an established flow.
 /// All fields are constant for the lifetime of the session.
 /// Per-packet cost: write MACs + TTL-- + apply precomputed csum deltas.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct RewriteDescriptor {
     pub(super) dst_mac: [u8; 6],
     pub(super) src_mac: [u8; 6],
@@ -29,6 +37,7 @@ pub(super) struct RewriteDescriptor {
     pub(super) tx_ifindex: i32,
     #[allow(dead_code)] // populated for future flow-cache fast-path TX
     pub(super) target_binding_index: Option<usize>,
+    pub(super) tx_selection: CachedTxSelectionDescriptor,
     pub(super) nat64: bool,
     pub(super) nptv6: bool,
     #[allow(dead_code)] // populated for future flow-cache fast-path TX
@@ -126,6 +135,7 @@ impl FlowCacheEntry {
         decision: SessionDecision,
         flow_owner_rg_id: i32,
         ingress_zone: Option<Arc<str>>,
+        target_binding_index: Option<usize>,
         forwarding: &ForwardingState,
         ha_state: &BTreeMap<i32, HAGroupRuntime>,
         apply_nat_on_fabric: bool,
@@ -165,7 +175,13 @@ impl FlowCacheEntry {
                 l4_csum_delta: compute_l4_csum_delta(flow, &decision.nat),
                 egress_ifindex: decision.resolution.egress_ifindex,
                 tx_ifindex: decision.resolution.tx_ifindex,
-                target_binding_index: None,
+                target_binding_index,
+                tx_selection: resolve_cached_cos_tx_selection(
+                    forwarding,
+                    decision.resolution.egress_ifindex,
+                    meta,
+                    Some(&flow.forward_key),
+                ),
                 nat64: false,
                 nptv6: false,
                 apply_nat_on_fabric,
@@ -326,6 +342,7 @@ mod tests {
             egress_ifindex: 6,
             tx_ifindex: 6,
             target_binding_index: None,
+            tx_selection: CachedTxSelectionDescriptor::default(),
             nat64: false,
             nptv6: false,
             apply_nat_on_fabric: false,
@@ -729,6 +746,7 @@ mod tests {
             decision,
             1,
             ingress_zone.clone(),
+            Some(7),
             &forwarding,
             &BTreeMap::from([(
                 1,
@@ -762,6 +780,7 @@ mod tests {
         assert_eq!(entry.descriptor.tx_vlan_id, 50);
         assert_eq!(entry.descriptor.egress_ifindex, 6);
         assert_eq!(entry.descriptor.tx_ifindex, 6);
+        assert_eq!(entry.descriptor.target_binding_index, Some(7));
         assert_eq!(entry.descriptor.ether_type, 0x0800);
         assert_eq!(
             entry.descriptor.fabric_redirect,
@@ -821,6 +840,7 @@ mod tests {
             validation,
             decision,
             0,
+            None,
             None,
             &forwarding,
             &BTreeMap::new(),
@@ -888,6 +908,7 @@ mod tests {
             decision,
             2,
             Some(Arc::<str>::from("trust")),
+            Some(3),
             &forwarding,
             &BTreeMap::from([(
                 2,
@@ -905,5 +926,6 @@ mod tests {
         assert_eq!(entry.stamp.owner_rg_id, 2);
         assert_eq!(entry.metadata.owner_rg_id, 2);
         assert!(entry.descriptor.fabric_redirect);
+        assert_eq!(entry.descriptor.target_binding_index, Some(3));
     }
 }
