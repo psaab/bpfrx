@@ -158,6 +158,7 @@ pub(super) struct ForwardingState {
     pub(super) zone_name_to_id: FastMap<String, u16>,
     pub(super) zone_id_to_name: FastMap<u16, String>,
     pub(super) egress: FastMap<i32, EgressInterface>,
+    pub(super) ingress_logical_ifindex: FastMap<(i32, u16), i32>,
     pub(super) fabrics: Vec<FabricLink>,
     pub(super) allow_dns_reply: bool,
     pub(super) allow_embedded_icmp: bool,

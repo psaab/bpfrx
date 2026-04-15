@@ -170,6 +170,15 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
         } else {
             iface.ifindex
         };
+        let ingress_key = (bind_ifindex, iface.vlan_id.max(0) as u16);
+        if iface.parent_ifindex > 0 {
+            state.ingress_logical_ifindex.insert(ingress_key, iface.ifindex);
+        } else {
+            state
+                .ingress_logical_ifindex
+                .entry(ingress_key)
+                .or_insert(iface.ifindex);
+        }
         let src_mac = match parse_mac(&iface.hardware_addr)
             .or_else(|| mac_by_ifindex.get(&bind_ifindex).copied())
             .or_else(|| iface.tunnel.then_some([0; 6]))
@@ -928,6 +937,32 @@ mod tests {
             .get("wan-pcp")
             .expect("missing 802.1p classifier");
         assert_eq!(pcp_classifier.queue_by_pcp.get(&5), Some(&5));
+    }
+
+    #[test]
+    fn build_forwarding_state_prefers_logical_unit_for_ingress_lookup() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![
+                InterfaceSnapshot {
+                    name: "ge-0-0-1".into(),
+                    ifindex: 10,
+                    hardware_addr: "02:00:00:00:00:10".into(),
+                    ..Default::default()
+                },
+                InterfaceSnapshot {
+                    name: "ge-0-0-1.0".into(),
+                    ifindex: 11,
+                    parent_ifindex: 10,
+                    vlan_id: 0,
+                    hardware_addr: "02:00:00:00:00:10".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let state = build_forwarding_state(&snapshot);
+        assert_eq!(state.ingress_logical_ifindex.get(&(10, 0)), Some(&11));
     }
 }
 

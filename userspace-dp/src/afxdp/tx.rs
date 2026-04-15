@@ -1190,6 +1190,28 @@ pub(super) fn resolve_cos_tx_selection(
             .iface_filter_out_v4
             .contains_key(&egress_ifindex)
     };
+    let ingress_ifindex = if !has_output_filter {
+        resolve_ingress_logical_ifindex(
+            forwarding,
+            meta.ingress_ifindex as i32,
+            meta.ingress_vlan_id,
+        )
+        .unwrap_or(meta.ingress_ifindex as i32)
+    } else {
+        0
+    };
+    let ingress_filter_affects_tx_selection = !has_output_filter
+        && crate::filter::interface_filter_affects_tx_selection(
+            &forwarding.filter_state,
+            ingress_ifindex,
+            is_v6,
+        );
+    if iface.is_none() && !has_output_filter && !ingress_filter_affects_tx_selection {
+        return CoSTxSelection {
+            queue_id: None,
+            dscp_rewrite: None,
+        };
+    }
     let output_result = if has_output_filter {
         crate::filter::evaluate_interface_output_filter_counted(
             &forwarding.filter_state,
@@ -1208,33 +1230,21 @@ pub(super) fn resolve_cos_tx_selection(
     };
     let mut effective_dscp_rewrite = output_result.dscp_rewrite;
     let mut ingress_forwarding_class = Arc::<str>::from("");
-    if !has_output_filter {
-        let ingress_ifindex = resolve_ingress_logical_ifindex(
-            forwarding,
-            meta.ingress_ifindex as i32,
-            meta.ingress_vlan_id,
-        )
-        .unwrap_or(meta.ingress_ifindex as i32);
-        if crate::filter::interface_filter_affects_tx_selection(
+    if ingress_filter_affects_tx_selection {
+        let ingress_result = crate::filter::evaluate_interface_filter_counted(
             &forwarding.filter_state,
             ingress_ifindex,
             is_v6,
-        ) {
-            let ingress_result = crate::filter::evaluate_interface_filter_counted(
-                &forwarding.filter_state,
-                ingress_ifindex,
-                is_v6,
-                flow_key.src_ip,
-                flow_key.dst_ip,
-                flow_key.protocol,
-                flow_key.src_port,
-                flow_key.dst_port,
-                meta.dscp,
-                meta.pkt_len as u64,
-            );
-            effective_dscp_rewrite = effective_dscp_rewrite.or(ingress_result.dscp_rewrite);
-            ingress_forwarding_class = ingress_result.forwarding_class;
-        }
+            flow_key.src_ip,
+            flow_key.dst_ip,
+            flow_key.protocol,
+            flow_key.src_port,
+            flow_key.dst_port,
+            meta.dscp,
+            meta.pkt_len as u64,
+        );
+        effective_dscp_rewrite = effective_dscp_rewrite.or(ingress_result.dscp_rewrite);
+        ingress_forwarding_class = ingress_result.forwarding_class;
     }
     let Some(iface) = iface else {
         return CoSTxSelection {
