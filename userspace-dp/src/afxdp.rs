@@ -274,6 +274,7 @@ fn poll_binding(
     dbg: &mut DebugPollCounters,
     rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
     cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
+    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 ) -> bool {
     #[derive(Default)]
     struct BatchCounters {
@@ -374,6 +375,7 @@ fn poll_binding(
         worker_id,
         worker_commands_by_id,
         cos_owner_worker_by_queue,
+        cos_owner_live_by_queue,
     );
     apply_shared_recycles(
         left,
@@ -403,6 +405,7 @@ fn poll_binding(
                 worker_id,
                 worker_commands_by_id,
                 cos_owner_worker_by_queue,
+                cos_owner_live_by_queue,
             );
             apply_shared_recycles(
                 left,
@@ -2838,6 +2841,7 @@ fn poll_binding(
                 worker_id,
                 worker_commands_by_id,
                 cos_owner_worker_by_queue,
+                cos_owner_live_by_queue,
             );
             binding.scratch_post_recycles = scratch_post_recycles;
         }

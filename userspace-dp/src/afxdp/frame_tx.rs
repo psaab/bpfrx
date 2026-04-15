@@ -1,5 +1,44 @@
 use super::*;
 
+fn cos_owner_live_for_request(
+    forwarding: &ForwardingState,
+    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
+    egress_ifindex: i32,
+    requested_queue_id: Option<u8>,
+) -> Option<Arc<BindingLiveState>> {
+    let effective_queue_id = requested_queue_id.or_else(|| {
+        forwarding
+            .cos
+            .interfaces
+            .get(&egress_ifindex)
+            .map(|iface| iface.default_queue)
+    });
+    effective_queue_id
+        .and_then(|queue_id| cos_owner_live_by_queue.get(&(egress_ifindex, queue_id)).cloned())
+}
+
+fn enqueue_local_request_to_target_or_owner(
+    target_binding: &mut BindingWorker,
+    forwarding: &ForwardingState,
+    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
+    req: TxRequest,
+) -> Result<(), TxRequest> {
+    let owner_live = cos_owner_live_for_request(
+        forwarding,
+        cos_owner_live_by_queue,
+        req.egress_ifindex,
+        req.cos_queue_id,
+    );
+    if let Some(owner_live) = owner_live {
+        if !Arc::ptr_eq(&owner_live, &target_binding.live) {
+            return owner_live.enqueue_tx_owned(req);
+        }
+    }
+    target_binding.pending_tx_local.push_back(req);
+    bound_pending_tx_local(target_binding);
+    Ok(())
+}
+
 #[inline]
 fn recycle_ingress_frame(
     ingress_binding: &mut BindingWorker,
@@ -34,6 +73,7 @@ pub(super) fn enqueue_pending_forwards(
     worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
     cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
+    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 ) {
     if pending_forwards.is_empty() {
         return;
@@ -91,7 +131,7 @@ pub(super) fn enqueue_pending_forwards(
                 continue;
             };
             let frame_len = prebuilt.len();
-            target_binding.pending_tx_local.push_back(TxRequest {
+            let req = TxRequest {
                 bytes: prebuilt,
                 expected_ports: None,
                 expected_addr_family: request.meta.addr_family,
@@ -100,8 +140,23 @@ pub(super) fn enqueue_pending_forwards(
                 egress_ifindex: request.decision.resolution.egress_ifindex,
                 cos_queue_id: request.cos_queue_id,
                 dscp_rewrite: request.dscp_rewrite,
-            });
-            bound_pending_tx_local(target_binding);
+            };
+            if enqueue_local_request_to_target_or_owner(
+                target_binding,
+                forwarding,
+                cos_owner_live_by_queue,
+                req,
+            )
+            .is_err()
+            {
+                recycle_ingress_frame(
+                    ingress_binding,
+                    source_offset,
+                    now_ns,
+                    &mut fill_drain_pending,
+                );
+                continue;
+            }
             dbg.enqueue_ok += 1;
             dbg.enqueue_copy += 1;
             target_binding.pending_copy_tx_packets += 1;
@@ -243,6 +298,7 @@ pub(super) fn enqueue_pending_forwards(
                         worker_id,
                         worker_commands_by_id,
                         cos_owner_worker_by_queue,
+                        cos_owner_live_by_queue,
                     )
                 {
                     dbg.enqueue_ok += segments as u64;
@@ -262,6 +318,7 @@ pub(super) fn enqueue_pending_forwards(
                             worker_id,
                             worker_commands_by_id,
                             cos_owner_worker_by_queue,
+                            cos_owner_live_by_queue,
                         );
                     }
                 } else if let Some(segmented) = segment_forwarded_tcp_frames_from_frame(
@@ -325,6 +382,7 @@ pub(super) fn enqueue_pending_forwards(
                             worker_id,
                             worker_commands_by_id,
                             cos_owner_worker_by_queue,
+                            cos_owner_live_by_queue,
                         );
                     }
                 }
@@ -360,6 +418,14 @@ pub(super) fn enqueue_pending_forwards(
                 // Always use copy path with NAT64-specific frame builder.
                 let is_nat64 = request.decision.nat.nat64;
                 let uses_native_tunnel = request.decision.resolution.tunnel_endpoint_id != 0;
+                let owner_matches_target = cos_owner_live_for_request(
+                    forwarding,
+                    cos_owner_live_by_queue,
+                    request.decision.resolution.egress_ifindex,
+                    request.cos_queue_id,
+                )
+                .as_ref()
+                .is_none_or(|live| Arc::ptr_eq(live, &target_binding.live));
 
                 /*
                  * In-place TX optimization: rewrite the ingress frame directly in UMEM
@@ -371,6 +437,7 @@ pub(super) fn enqueue_pending_forwards(
                 let can_rewrite_in_place = target_binding.umem.allocation_ptr() == ingress_umem_ptr
                     && !is_nat64
                     && !uses_native_tunnel
+                    && owner_matches_target
                     && matches!(request.frame, PendingForwardFrame::Live);
                 if can_rewrite_in_place {
                     match rewrite_forwarded_frame_in_place(
@@ -461,7 +528,7 @@ pub(super) fn enqueue_pending_forwards(
                                     );
                                     continue;
                                 }
-                                target_binding.pending_tx_local.push_back(TxRequest {
+                                let req = TxRequest {
                                     bytes: frame,
                                     expected_ports,
                                     expected_addr_family: request.meta.addr_family,
@@ -470,8 +537,19 @@ pub(super) fn enqueue_pending_forwards(
                                     egress_ifindex: request.decision.resolution.egress_ifindex,
                                     cos_queue_id: request.cos_queue_id,
                                     dscp_rewrite: request.dscp_rewrite,
-                                });
-                                bound_pending_tx_local(target_binding);
+                                };
+                                if enqueue_local_request_to_target_or_owner(
+                                    target_binding,
+                                    forwarding,
+                                    cos_owner_live_by_queue,
+                                    req,
+                                )
+                                .is_err()
+                                {
+                                    build_failed = true;
+                                    fallback_to_slow_path = true;
+                                    continue;
+                                }
                                 dbg.enqueue_ok += 1;
                                 dbg.enqueue_copy += 1;
                                 target_binding.pending_copy_tx_packets += 1;
@@ -511,6 +589,7 @@ pub(super) fn enqueue_pending_forwards(
                             worker_id,
                             worker_commands_by_id,
                             cos_owner_worker_by_queue,
+                            cos_owner_live_by_queue,
                         );
                         direct_tx_offset = target_binding.free_tx_frames.pop_front();
                     }
@@ -520,6 +599,16 @@ pub(super) fn enqueue_pending_forwards(
                         if let Some(off) = direct_tx_offset {
                             target_binding.free_tx_frames.push_front(off);
                         }
+                        direct_tx_fallback_reason =
+                            Some(DirectTxFallbackReason::DisallowedByRewriteMode);
+                        false
+                    } else if !owner_matches_target {
+                        if let Some(off) = direct_tx_offset {
+                            target_binding.free_tx_frames.push_front(off);
+                        }
+                        // A prepared/direct frame on a non-owner binding would be
+                        // cloned back into a local Vec during CoS owner redirection.
+                        // Skip that waste and fall back to the single-copy local path.
                         direct_tx_fallback_reason =
                             Some(DirectTxFallbackReason::DisallowedByRewriteMode);
                         false
@@ -699,7 +788,7 @@ pub(super) fn enqueue_pending_forwards(
                                     );
                                     continue;
                                 }
-                                target_binding.pending_tx_local.push_back(TxRequest {
+                                let req = TxRequest {
                                     bytes: frame,
                                     expected_ports,
                                     expected_addr_family: request.meta.addr_family,
@@ -708,8 +797,19 @@ pub(super) fn enqueue_pending_forwards(
                                     egress_ifindex: request.decision.resolution.egress_ifindex,
                                     cos_queue_id: request.cos_queue_id,
                                     dscp_rewrite: request.dscp_rewrite,
-                                });
-                                bound_pending_tx_local(target_binding);
+                                };
+                                if enqueue_local_request_to_target_or_owner(
+                                    target_binding,
+                                    forwarding,
+                                    cos_owner_live_by_queue,
+                                    req,
+                                )
+                                .is_err()
+                                {
+                                    build_failed = true;
+                                    fallback_to_slow_path = true;
+                                    continue;
+                                }
                                 dbg.enqueue_ok += 1;
                                 dbg.enqueue_copy += 1;
                                 target_binding.pending_copy_tx_packets += 1;
@@ -737,6 +837,7 @@ pub(super) fn enqueue_pending_forwards(
                     worker_id,
                     worker_commands_by_id,
                     cos_owner_worker_by_queue,
+                    cos_owner_live_by_queue,
                 );
             }
         }
@@ -1133,6 +1234,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
     worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
     cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
+    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 ) -> Option<(u32, u64, u32)> {
     let meta = meta.into();
     if meta.protocol != PROTO_TCP || decision.resolution.tunnel_endpoint_id != 0 {
@@ -1209,6 +1311,7 @@ fn segment_forwarded_tcp_frames_into_prepared(
             worker_id,
             worker_commands_by_id,
             cos_owner_worker_by_queue,
+            cos_owner_live_by_queue,
         );
     }
     if target_binding.free_tx_frames.len() < segment_count {
@@ -1449,7 +1552,6 @@ mod tests {
         );
         forwarding
     }
-
     fn test_decision() -> SessionDecision {
         SessionDecision {
             resolution: ForwardingResolution {

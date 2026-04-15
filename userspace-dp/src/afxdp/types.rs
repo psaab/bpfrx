@@ -260,7 +260,7 @@ pub(super) struct ForwardingState {
     pub(super) tcp_mss_gre_out: u16,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct CoSState {
     pub(super) interfaces: FastMap<i32, CoSInterfaceConfig>,
     pub(super) dscp_classifiers: FastMap<String, CoSDSCPClassifierConfig>,
@@ -268,7 +268,7 @@ pub(super) struct CoSState {
     pub(super) dscp_rewrite_rules: FastMap<String, CoSDSCPRewriteRuleConfig>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CoSInterfaceConfig {
     pub(super) shaping_rate_bytes: u64,
     pub(super) burst_bytes: u64,
@@ -281,22 +281,22 @@ pub(super) struct CoSInterfaceConfig {
     pub(super) queues: Vec<CoSQueueConfig>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct CoSDSCPClassifierConfig {
     pub(super) queue_by_dscp: FastMap<u8, u8>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct CoSIEEE8021ClassifierConfig {
     pub(super) queue_by_pcp: FastMap<u8, u8>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct CoSDSCPRewriteRuleConfig {
     pub(super) dscp_by_forwarding_class: FastMap<String, u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CoSQueueConfig {
     pub(super) queue_id: u8,
     pub(super) forwarding_class: String,
@@ -753,9 +753,9 @@ struct SharedCoSRootLeaseState {
     last_refill_ns: u64,
 }
 
-const COS_ROOT_LEASE_TARGET_US: u64 = 25;
+const COS_ROOT_LEASE_TARGET_US: u64 = 200;
 const COS_ROOT_LEASE_MIN_BYTES: u64 = 1500;
-const COS_ROOT_LEASE_MAX_BYTES: u64 = 64 * 1024;
+const COS_ROOT_LEASE_MAX_BYTES: u64 = 512 * 1024;
 
 impl SharedCoSRootLease {
     fn compute_config(

@@ -16,6 +16,8 @@ pub struct Coordinator {
     pub(crate) shared_fabrics: Arc<ArcSwap<Vec<FabricLink>>>,
     pub(crate) shared_forwarding: Arc<ArcSwap<ForwardingState>>,
     pub(crate) shared_cos_owner_worker_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), u32>>>,
+    pub(crate) shared_cos_owner_live_by_queue:
+        Arc<ArcSwap<BTreeMap<(i32, u8), Arc<BindingLiveState>>>>,
     pub(crate) shared_cos_root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
@@ -67,6 +69,7 @@ impl Coordinator {
             shared_fabrics: Arc::new(ArcSwap::from_pointee(Vec::new())),
             shared_forwarding: Arc::new(ArcSwap::from_pointee(ForwardingState::default())),
             shared_cos_owner_worker_by_queue: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
+            shared_cos_owner_live_by_queue: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_cos_root_leases: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
@@ -234,6 +237,8 @@ impl Coordinator {
         self.live.clear();
         self.cos_owner_worker_by_queue.clear();
         self.shared_cos_owner_worker_by_queue
+            .store(Arc::new(BTreeMap::new()));
+        self.shared_cos_owner_live_by_queue
             .store(Arc::new(BTreeMap::new()));
         self.shared_cos_root_leases.store(Arc::new(BTreeMap::new()));
         self.last_slow_path_status = self
@@ -643,6 +648,7 @@ impl Coordinator {
             let event_stream_handle = self.event_stream_worker_handle();
             let cos_status_clone = cos_status.clone();
             let shared_cos_owner_worker_by_queue = self.shared_cos_owner_worker_by_queue.clone();
+            let shared_cos_owner_live_by_queue = self.shared_cos_owner_live_by_queue.clone();
             let shared_cos_root_leases = self.shared_cos_root_leases.clone();
             let join = thread::Builder::new()
                 .name(format!("xpf-userspace-worker-{worker_id}"))
@@ -675,6 +681,7 @@ impl Coordinator {
                         event_stream_handle,
                         rg_epochs,
                         shared_cos_owner_worker_by_queue,
+                        shared_cos_owner_live_by_queue,
                         shared_cos_root_leases,
                         cos_status_clone,
                     );
@@ -1108,20 +1115,32 @@ impl Coordinator {
 
     fn refresh_cos_runtime_maps(&mut self, owner_map: BTreeMap<(i32, u8), u32>) {
         let owner_changed = owner_map != self.cos_owner_worker_by_queue;
+        let owner_map_for_runtime = if owner_changed {
+            &owner_map
+        } else {
+            &self.cos_owner_worker_by_queue
+        };
+        let current_owner_live = self.shared_cos_owner_live_by_queue.load();
+        let next_owner_live = build_cos_owner_live_by_queue(
+            &self.forwarding,
+            owner_map_for_runtime,
+            &self.identities,
+            &self.live,
+        );
         let current_leases = self.shared_cos_root_leases.load();
         let next_leases = build_shared_cos_root_leases_reusing_existing(
             &self.forwarding,
-            if owner_changed {
-                &owner_map
-            } else {
-                &self.cos_owner_worker_by_queue
-            },
+            owner_map_for_runtime,
             current_leases.as_ref(),
         );
         if owner_changed {
             self.cos_owner_worker_by_queue = owner_map.clone();
             self.shared_cos_owner_worker_by_queue
                 .store(Arc::new(owner_map));
+        }
+        if !shared_cos_owner_live_by_queue_match(current_owner_live.as_ref(), &next_owner_live) {
+            self.shared_cos_owner_live_by_queue
+                .store(Arc::new(next_owner_live));
         }
         if !shared_cos_root_leases_match(current_leases.as_ref(), &next_leases) {
             self.shared_cos_root_leases.store(Arc::new(next_leases));
@@ -1582,6 +1601,33 @@ fn build_shared_cos_root_leases(
     build_shared_cos_root_leases_reusing_existing(forwarding, owner_by_queue, &BTreeMap::new())
 }
 
+fn build_cos_owner_live_by_queue(
+    forwarding: &ForwardingState,
+    owner_by_queue: &BTreeMap<(i32, u8), u32>,
+    identities: &BTreeMap<u32, BindingIdentity>,
+    live: &BTreeMap<u32, Arc<BindingLiveState>>,
+) -> BTreeMap<(i32, u8), Arc<BindingLiveState>> {
+    let mut live_by_worker_ifindex = BTreeMap::<(u32, i32), Arc<BindingLiveState>>::new();
+    for (slot, ident) in identities {
+        let Some(binding_live) = live.get(slot) else {
+            continue;
+        };
+        live_by_worker_ifindex
+            .entry((ident.worker_id, ident.ifindex))
+            .or_insert_with(|| binding_live.clone());
+    }
+
+    let mut out = BTreeMap::new();
+    for (&(egress_ifindex, queue_id), &worker_id) in owner_by_queue {
+        let tx_ifindex = resolve_tx_binding_ifindex(forwarding, egress_ifindex);
+        let Some(owner_live) = live_by_worker_ifindex.get(&(worker_id, tx_ifindex)) else {
+            continue;
+        };
+        out.insert((egress_ifindex, queue_id), owner_live.clone());
+    }
+    out
+}
+
 fn build_shared_cos_root_leases_reusing_existing(
     forwarding: &ForwardingState,
     owner_by_queue: &BTreeMap<(i32, u8), u32>,
@@ -1623,6 +1669,17 @@ fn shared_cos_root_leases_match(
         && current.iter().all(|(ifindex, lease)| {
             next.get(ifindex)
                 .is_some_and(|next| Arc::ptr_eq(lease, next))
+        })
+}
+
+fn shared_cos_owner_live_by_queue_match(
+    current: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
+    next: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
+) -> bool {
+    current.len() == next.len()
+        && current.iter().all(|(key, live)| {
+            next.get(key)
+                .is_some_and(|next_live| Arc::ptr_eq(live, next_live))
         })
 }
 
