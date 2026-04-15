@@ -923,8 +923,12 @@ fn maybe_top_up_cos_root_lease(
     shared_root_lease: &SharedCoSRootLease,
     now_ns: u64,
 ) {
+    // Ensure the target is at least tx_frame_capacity() so that a maximum-sized frame
+    // can always become eligible.  shared_root_lease already sizes max_total_leased using
+    // lease_bytes.max(tx_frame_capacity()), so the shared pool can always satisfy this.
     let lease_bytes = shared_root_lease
         .lease_bytes()
+        .max(tx_frame_capacity() as u64)
         .min(root.burst_bytes.max(COS_MIN_BURST_BYTES));
     if root.tokens >= lease_bytes {
         return;
@@ -2305,6 +2309,53 @@ mod tests {
         lease.release_unused(lease_bytes);
         let fourth = lease.acquire(1, lease_bytes);
         assert_eq!(fourth, lease_bytes);
+    }
+
+    #[test]
+    fn maybe_top_up_cos_root_lease_unblocks_large_frame_exceeding_lease_bytes() {
+        // At 400 Mbps / 256 KB burst / 1 shard, lease_bytes() == 1500, which is less than
+        // tx_frame_capacity() == 4096.  Without the .max(tx_frame_capacity()) fix, root.tokens
+        // could never exceed 1500 and any frame with len > 1500 would deadlock the CoS queue.
+        let lease = Arc::new(SharedCoSRootLease::new(400_000_000, 256 * 1024, 1));
+        assert!(
+            lease.lease_bytes() < tx_frame_capacity() as u64,
+            "precondition: lease_bytes must be below tx_frame_capacity for this regression"
+        );
+
+        let mut root = test_cos_runtime_with_queues(
+            400_000_000,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "best-effort".into(),
+                priority: 5,
+                transmit_rate_bytes: 400_000_000,
+                exact: false,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        let frame_len = tx_frame_capacity();
+        root.queues[0].tokens = 64 * 1024;
+        root.queues[0].runnable = true;
+        root.queues[0].items.push_back(test_cos_item(frame_len));
+        root.queues[0].queued_bytes = frame_len as u64;
+        root.nonempty_queues = 1;
+        root.runnable_queues = 1;
+
+        maybe_top_up_cos_root_lease(&mut root, &lease, 1_000_000_000);
+
+        assert!(
+            root.tokens >= frame_len as u64,
+            "root tokens ({}) must cover frame len ({}) after lease top-up",
+            root.tokens,
+            frame_len
+        );
+        let batch = select_cos_guarantee_batch(&mut root, 1_000_000_000);
+        assert!(
+            batch.is_some(),
+            "large frame must be dequeued after lease top-up"
+        );
     }
 
     #[test]
