@@ -1048,8 +1048,7 @@ fn wake_cos_queue(root: &mut CoSInterfaceRuntime, queue_idx: usize) {
     if !queue.runnable {
         root.runnable_queues = root.runnable_queues.saturating_add(1);
     }
-    queue.runnable = true;
-    queue.parked = false;
+    mark_cos_queue_runnable(queue);
 }
 
 fn park_cos_queue(root: &mut CoSInterfaceRuntime, queue_idx: usize, wake_tick: u64) {
@@ -1074,6 +1073,31 @@ fn park_cos_queue(root: &mut CoSInterfaceRuntime, queue_idx: usize, wake_tick: u
 
 fn rearm_cos_queue(root: &mut CoSInterfaceRuntime, queue_idx: usize, wake_tick: u64) {
     park_cos_queue(root, queue_idx, wake_tick);
+}
+
+fn mark_cos_queue_runnable(queue: &mut CoSQueueRuntime) {
+    queue.runnable = true;
+    queue.parked = false;
+    queue.next_wakeup_tick = 0;
+}
+
+fn normalize_cos_queue_state(queue: &mut CoSQueueRuntime) {
+    if queue.items.is_empty() {
+        queue.runnable = false;
+        queue.parked = false;
+        queue.next_wakeup_tick = 0;
+        queue.surplus_deficit = 0;
+        return;
+    }
+    // Non-empty queues have only two valid steady states:
+    // 1. parked with a wakeup tick
+    // 2. runnable immediately
+    // Anything else can strand backlog forever.
+    if queue.parked && queue.next_wakeup_tick > 0 {
+        queue.runnable = false;
+        return;
+    }
+    mark_cos_queue_runnable(queue);
 }
 
 fn advance_cos_timer_wheel(root: &mut CoSInterfaceRuntime, now_ns: u64) {
@@ -1508,13 +1532,13 @@ fn enqueue_cos_item(
             queue.items.push_back(item);
             if queue_was_empty {
                 root.nonempty_queues = root.nonempty_queues.saturating_add(1);
-                if !queue.runnable {
-                    root.runnable_queues = root.runnable_queues.saturating_add(1);
-                }
-                queue.runnable = true;
-                queue.parked = false;
-                queue.next_wakeup_tick = 0;
                 root_became_nonempty = root_was_empty;
+            }
+            if !queue.parked && !queue.runnable {
+                root.runnable_queues = root.runnable_queues.saturating_add(1);
+            }
+            if !queue.parked {
+                mark_cos_queue_runnable(queue);
             }
             (true, queue.queue_id, None)
         }
@@ -1553,11 +1577,8 @@ fn refresh_cos_interface_activity(binding: &mut BindingWorker, root_ifindex: i32
         .unwrap_or(0);
     if let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) {
         for queue in &mut root.queues {
+            normalize_cos_queue_state(queue);
             if queue.items.is_empty() {
-                queue.runnable = false;
-                queue.parked = false;
-                queue.next_wakeup_tick = 0;
-                queue.surplus_deficit = 0;
                 continue;
             }
             new_nonempty = new_nonempty.saturating_add(1);
@@ -1708,6 +1729,9 @@ fn restore_cos_local_items_inner(queue: &mut CoSQueueRuntime, mut retry: VecDequ
     while let Some(req) = retry.pop_back() {
         queue.items.push_front(CoSPendingTxItem::Local(req));
     }
+    if !queue.items.is_empty() {
+        mark_cos_queue_runnable(queue);
+    }
 }
 
 fn restore_cos_prepared_items_inner(
@@ -1716,6 +1740,9 @@ fn restore_cos_prepared_items_inner(
 ) {
     while let Some(req) = retry.pop_back() {
         queue.items.push_front(CoSPendingTxItem::Prepared(req));
+    }
+    if !queue.items.is_empty() {
+        mark_cos_queue_runnable(queue);
     }
 }
 
@@ -3867,5 +3894,114 @@ mod tests {
         assert!(!root.queues[0].parked);
         assert!(root.queues[0].runnable);
         assert_eq!(root.runnable_queues, 1);
+    }
+
+    #[test]
+    fn normalize_cos_queue_state_repairs_nonempty_unparked_queue_to_runnable() {
+        let mut queue = CoSQueueRuntime {
+            queue_id: 5,
+            priority: 5,
+            transmit_rate_bytes: 11_000_000_000 / 8,
+            exact: true,
+            surplus_weight: 1,
+            surplus_deficit: 0,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            tokens: 0,
+            last_refill_ns: 0,
+            queued_bytes: 1500,
+            runnable: false,
+            parked: false,
+            next_wakeup_tick: 0,
+            wheel_level: 0,
+            wheel_slot: 0,
+            items: VecDeque::from([test_cos_item(1500)]),
+        };
+
+        normalize_cos_queue_state(&mut queue);
+
+        assert!(queue.runnable);
+        assert!(!queue.parked);
+        assert_eq!(queue.next_wakeup_tick, 0);
+    }
+
+    #[test]
+    fn restore_cos_local_items_marks_queue_runnable_after_retry() {
+        let mut queue = CoSQueueRuntime {
+            queue_id: 5,
+            priority: 5,
+            transmit_rate_bytes: 11_000_000_000 / 8,
+            exact: true,
+            surplus_weight: 1,
+            surplus_deficit: 0,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            tokens: 0,
+            last_refill_ns: 0,
+            queued_bytes: 0,
+            runnable: false,
+            parked: false,
+            next_wakeup_tick: 0,
+            wheel_level: 0,
+            wheel_slot: 0,
+            items: VecDeque::new(),
+        };
+        let retry = VecDeque::from([TxRequest {
+            bytes: vec![0; 1500],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(5),
+            dscp_rewrite: None,
+        }]);
+
+        restore_cos_local_items_inner(&mut queue, retry);
+
+        assert_eq!(queue.items.len(), 1);
+        assert!(queue.runnable);
+        assert!(!queue.parked);
+    }
+
+    #[test]
+    fn restore_cos_prepared_items_marks_queue_runnable_after_retry() {
+        let mut queue = CoSQueueRuntime {
+            queue_id: 5,
+            priority: 5,
+            transmit_rate_bytes: 11_000_000_000 / 8,
+            exact: true,
+            surplus_weight: 1,
+            surplus_deficit: 0,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            tokens: 0,
+            last_refill_ns: 0,
+            queued_bytes: 0,
+            runnable: false,
+            parked: false,
+            next_wakeup_tick: 0,
+            wheel_level: 0,
+            wheel_slot: 0,
+            items: VecDeque::new(),
+        };
+        let retry = VecDeque::from([PreparedTxRequest {
+            offset: 64,
+            len: 1500,
+            recycle: PreparedTxRecycle::FreeTxFrame,
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(5),
+            dscp_rewrite: None,
+        }]);
+
+        restore_cos_prepared_items_inner(&mut queue, retry);
+
+        assert_eq!(queue.items.len(), 1);
+        assert!(queue.runnable);
+        assert!(!queue.parked);
     }
 }
