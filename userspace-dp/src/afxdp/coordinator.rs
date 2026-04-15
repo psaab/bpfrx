@@ -1101,6 +1101,33 @@ impl Coordinator {
         self.shared_cos_root_leases.store(Arc::new(cos_root_leases));
     }
 
+    fn refresh_cos_owner_worker_map_from_binding_statuses(&mut self, bindings: &[BindingStatus]) {
+        let ready_worker_binding_ifindexes = bindings
+            .iter()
+            .filter(|binding| binding.ready)
+            .fold(
+                BTreeMap::<u32, std::collections::BTreeSet<i32>>::new(),
+                |mut out, binding| {
+                    out.entry(binding.worker_id)
+                        .or_default()
+                        .insert(binding.ifindex);
+                    out
+                },
+            );
+        let fallback_worker_binding_ifindexes =
+            build_worker_binding_ifindexes_from_identities(&self.identities);
+        let owner_map = build_cos_owner_worker_by_queue_with_fallback_ifindexes(
+            &self.forwarding,
+            &ready_worker_binding_ifindexes,
+            &fallback_worker_binding_ifindexes,
+        );
+        let cos_root_leases = build_shared_cos_root_leases(&self.forwarding, &owner_map);
+        self.cos_owner_worker_by_queue = owner_map.clone();
+        self.shared_cos_owner_worker_by_queue
+            .store(Arc::new(owner_map));
+        self.shared_cos_root_leases.store(Arc::new(cos_root_leases));
+    }
+
     /// Bump just the FIB generation counter without a full snapshot rebuild.
     /// Workers will invalidate flow cache entries with stale FIB generations.
     pub fn bump_fib_generation(&mut self, fib_generation: u32) {
@@ -1279,7 +1306,7 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn refresh_bindings(&self, bindings: &mut [BindingStatus]) {
+    pub fn refresh_bindings(&mut self, bindings: &mut [BindingStatus]) {
         for binding in bindings.iter_mut() {
             if let Some(live) = self.live.get(&binding.slot) {
                 let snap = live.snapshot();
@@ -1441,6 +1468,7 @@ impl Coordinator {
                 binding.ready = false;
             }
         }
+        self.refresh_cos_owner_worker_map_from_binding_statuses(bindings);
     }
 }
 
@@ -1492,6 +1520,18 @@ fn build_cos_owner_worker_by_queue_from_binding_ifindexes(
     forwarding: &ForwardingState,
     worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,
 ) -> BTreeMap<(i32, u8), u32> {
+    build_cos_owner_worker_by_queue_with_fallback_ifindexes(
+        forwarding,
+        worker_binding_ifindexes,
+        worker_binding_ifindexes,
+    )
+}
+
+fn build_cos_owner_worker_by_queue_with_fallback_ifindexes(
+    forwarding: &ForwardingState,
+    preferred_worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,
+    fallback_worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,
+) -> BTreeMap<(i32, u8), u32> {
     let mut owner_by_queue = BTreeMap::new();
     let mut next_owner_slot_by_tx_ifindex = BTreeMap::<i32, usize>::new();
     let mut egress_ifindexes = forwarding
@@ -1503,12 +1543,22 @@ fn build_cos_owner_worker_by_queue_from_binding_ifindexes(
     egress_ifindexes.sort_unstable();
     for egress_ifindex in egress_ifindexes {
         let tx_ifindex = resolve_tx_binding_ifindex(forwarding, egress_ifindex);
-        let eligible_workers = worker_binding_ifindexes
+        let preferred_workers = preferred_worker_binding_ifindexes
             .iter()
             .filter_map(|(worker_id, ifindexes)| {
                 ifindexes.contains(&tx_ifindex).then_some(*worker_id)
             })
             .collect::<Vec<_>>();
+        let eligible_workers = if preferred_workers.is_empty() {
+            fallback_worker_binding_ifindexes
+                .iter()
+                .filter_map(|(worker_id, ifindexes)| {
+                    ifindexes.contains(&tx_ifindex).then_some(*worker_id)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            preferred_workers
+        };
         if eligible_workers.is_empty() {
             continue;
         }
@@ -1680,6 +1730,116 @@ mod tests {
         assert_eq!(owner_by_queue.get(&(80, 0)), Some(&2));
         assert_eq!(owner_by_queue.get(&(80, 1)), Some(&7));
         assert_eq!(owner_by_queue.get(&(80, 2)), Some(&2));
+    }
+
+    #[test]
+    fn build_cos_owner_worker_by_queue_prefers_ready_workers_when_available() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 1_000_000,
+                burst_bytes: 64 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![
+                    CoSQueueConfig {
+                        queue_id: 0,
+                        forwarding_class: "best-effort".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 1_000_000,
+                        exact: false,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 4,
+                        forwarding_class: "iperf-a".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 1_000_000,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                ],
+            },
+        );
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".to_string(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+
+        let owner_by_queue = build_cos_owner_worker_by_queue_with_fallback_ifindexes(
+            &forwarding,
+            &BTreeMap::from([(7, std::collections::BTreeSet::from([12]))]),
+            &BTreeMap::from([
+                (2, std::collections::BTreeSet::from([12])),
+                (7, std::collections::BTreeSet::from([12])),
+            ]),
+        );
+
+        assert_eq!(owner_by_queue.get(&(80, 0)), Some(&7));
+        assert_eq!(owner_by_queue.get(&(80, 4)), Some(&7));
+    }
+
+    #[test]
+    fn build_cos_owner_worker_by_queue_falls_back_when_no_ready_workers_exist() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 1_000_000,
+                burst_bytes: 64 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![CoSQueueConfig {
+                    queue_id: 0,
+                    forwarding_class: "best-effort".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: 64 * 1024,
+                    dscp_rewrite: None,
+                }],
+            },
+        );
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".to_string(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+
+        let owner_by_queue = build_cos_owner_worker_by_queue_with_fallback_ifindexes(
+            &forwarding,
+            &BTreeMap::new(),
+            &BTreeMap::from([(2, std::collections::BTreeSet::from([12]))]),
+        );
+
+        assert_eq!(owner_by_queue.get(&(80, 0)), Some(&2));
     }
 
     #[test]

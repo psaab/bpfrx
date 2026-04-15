@@ -209,6 +209,10 @@ pub(super) fn drain_pending_tx(
         worker_commands_by_id,
         cos_owner_worker_by_queue,
     );
+    // Only continue this loop while shaped service is making real forward
+    // progress. A retrying CoS batch (for example, no free TX frame on the
+    // owner binding) must yield back to the worker loop so other bindings can
+    // run and completions/recycles can free resources.
     while drain_shaped_tx(binding, now_ns, shared_recycles) {
         did_work = true;
     }
@@ -851,18 +855,18 @@ fn submit_cos_batch(
                             .fetch_add(packets, Ordering::Relaxed);
                         binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
                     }
-                    packets > 0 || bytes > 0
+                    cos_batch_tx_made_progress(Ok((packets, bytes)))
                 }
                 Err(TxError::Retry(err)) => {
                     binding.live.set_error(err);
                     restore_cos_local_items(binding, root_ifindex, queue_idx, items);
-                    true
+                    cos_batch_tx_made_progress(Err(TxError::Retry(String::new())))
                 }
                 Err(TxError::Drop(err)) => {
                     binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
                     binding.live.set_error(err);
                     restore_cos_local_items(binding, root_ifindex, queue_idx, items);
-                    true
+                    cos_batch_tx_made_progress(Err(TxError::Drop(String::new())))
                 }
             }
         }
@@ -892,22 +896,26 @@ fn submit_cos_batch(
                             .fetch_add(packets, Ordering::Relaxed);
                         binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
                     }
-                    packets > 0 || bytes > 0
+                    cos_batch_tx_made_progress(Ok((packets, bytes)))
                 }
                 Err(TxError::Retry(err)) => {
                     binding.live.set_error(err);
                     restore_cos_prepared_items(binding, root_ifindex, queue_idx, items);
-                    true
+                    cos_batch_tx_made_progress(Err(TxError::Retry(String::new())))
                 }
                 Err(TxError::Drop(err)) => {
                     binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
                     binding.live.set_error(err);
                     restore_cos_prepared_items(binding, root_ifindex, queue_idx, items);
-                    true
+                    cos_batch_tx_made_progress(Err(TxError::Drop(String::new())))
                 }
             }
         }
     }
+}
+
+fn cos_batch_tx_made_progress(result: Result<(u64, u64), TxError>) -> bool {
+    matches!(result, Ok((packets, bytes)) if packets > 0 || bytes > 0)
 }
 
 const COS_TIMER_WHEEL_TICK_NS: u64 = 50_000;
@@ -2200,6 +2208,23 @@ mod tests {
         let merged = merge_pending_tx_requests(VecDeque::new(), shared);
         let bytes: Vec<Vec<u8>> = merged.into_iter().map(|req| req.bytes).collect();
         assert_eq!(bytes, vec![vec![9]]);
+    }
+
+    #[test]
+    fn cos_batch_tx_made_progress_requires_real_send_progress() {
+        assert!(!cos_batch_tx_made_progress(Ok((0, 0))));
+        assert!(cos_batch_tx_made_progress(Ok((1, 0))));
+        assert!(cos_batch_tx_made_progress(Ok((0, 1500))));
+    }
+
+    #[test]
+    fn cos_batch_tx_made_progress_yields_on_retry_and_drop() {
+        assert!(!cos_batch_tx_made_progress(Err(TxError::Retry(
+            "no free TX frame available".to_string()
+        ))));
+        assert!(!cos_batch_tx_made_progress(Err(TxError::Drop(
+            "tx ring insert failed".to_string()
+        ))));
     }
 
     #[test]
