@@ -19,6 +19,8 @@ pub struct Coordinator {
     pub(crate) shared_cos_owner_live_by_queue:
         Arc<ArcSwap<BTreeMap<(i32, u8), Arc<BindingLiveState>>>>,
     pub(crate) shared_cos_root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
+    pub(crate) shared_cos_queue_leases:
+        Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>>>,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     pub(crate) neighbor_generation: Arc<AtomicU64>,
@@ -71,6 +73,7 @@ impl Coordinator {
             shared_cos_owner_worker_by_queue: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_cos_owner_live_by_queue: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_cos_root_leases: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
+            shared_cos_queue_leases: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),
             dynamic_neighbors: Arc::new(Mutex::new(FastMap::default())),
             neighbor_generation: Arc::new(AtomicU64::new(0)),
@@ -241,6 +244,7 @@ impl Coordinator {
         self.shared_cos_owner_live_by_queue
             .store(Arc::new(BTreeMap::new()));
         self.shared_cos_root_leases.store(Arc::new(BTreeMap::new()));
+        self.shared_cos_queue_leases.store(Arc::new(BTreeMap::new()));
         self.last_slow_path_status = self
             .slow_path
             .as_ref()
@@ -588,7 +592,26 @@ impl Coordinator {
         self.conntrack_v6_fd = conntrack_v6_fd;
         self.dnat_table_fd = dnat_table_fd;
         self.dnat_table_v6_fd = dnat_table_v6_fd;
-        self.refresh_cos_runtime_maps(build_cos_owner_worker_by_queue(&self.forwarding, &workers));
+        let worker_binding_ifindexes = workers
+            .iter()
+            .map(|(worker_id, binding_plans)| {
+                (
+                    *worker_id,
+                    binding_plans
+                        .iter()
+                        .map(|plan| plan.status.ifindex)
+                        .collect::<std::collections::BTreeSet<_>>(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let owner_map = build_cos_owner_worker_by_queue(&self.forwarding, &workers);
+        let active_shards_by_egress_ifindex =
+            build_cos_active_shards_by_egress_ifindex_with_fallback_ifindexes(
+                &self.forwarding,
+                &worker_binding_ifindexes,
+                &worker_binding_ifindexes,
+            );
+        self.refresh_cos_runtime_maps(owner_map, active_shards_by_egress_ifindex);
         let worker_command_queues: Arc<BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>> =
             Arc::new(
                 workers
@@ -650,6 +673,7 @@ impl Coordinator {
             let shared_cos_owner_worker_by_queue = self.shared_cos_owner_worker_by_queue.clone();
             let shared_cos_owner_live_by_queue = self.shared_cos_owner_live_by_queue.clone();
             let shared_cos_root_leases = self.shared_cos_root_leases.clone();
+            let shared_cos_queue_leases = self.shared_cos_queue_leases.clone();
             let join = thread::Builder::new()
                 .name(format!("xpf-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -683,6 +707,7 @@ impl Coordinator {
                         shared_cos_owner_worker_by_queue,
                         shared_cos_owner_live_by_queue,
                         shared_cos_root_leases,
+                        shared_cos_queue_leases,
                         cos_status_clone,
                     );
                 });
@@ -1088,10 +1113,17 @@ impl Coordinator {
     fn refresh_cos_owner_worker_map_from_identities(&mut self) {
         let worker_binding_ifindexes =
             build_worker_binding_ifindexes_from_identities(&self.identities);
-        self.refresh_cos_runtime_maps(build_cos_owner_worker_by_queue_from_binding_ifindexes(
+        let owner_map = build_cos_owner_worker_by_queue_from_binding_ifindexes(
             &self.forwarding,
             &worker_binding_ifindexes,
-        ));
+        );
+        let active_shards_by_egress_ifindex =
+            build_cos_active_shards_by_egress_ifindex_with_fallback_ifindexes(
+                &self.forwarding,
+                &worker_binding_ifindexes,
+                &worker_binding_ifindexes,
+            );
+        self.refresh_cos_runtime_maps(owner_map, active_shards_by_egress_ifindex);
     }
 
     fn refresh_cos_owner_worker_map_from_binding_statuses(&mut self, bindings: &[BindingStatus]) {
@@ -1106,14 +1138,25 @@ impl Coordinator {
         );
         let fallback_worker_binding_ifindexes =
             build_worker_binding_ifindexes_from_identities(&self.identities);
-        self.refresh_cos_runtime_maps(build_cos_owner_worker_by_queue_with_fallback_ifindexes(
+        let owner_map = build_cos_owner_worker_by_queue_with_fallback_ifindexes(
             &self.forwarding,
             &ready_worker_binding_ifindexes,
             &fallback_worker_binding_ifindexes,
-        ));
+        );
+        let active_shards_by_egress_ifindex =
+            build_cos_active_shards_by_egress_ifindex_with_fallback_ifindexes(
+                &self.forwarding,
+                &ready_worker_binding_ifindexes,
+                &fallback_worker_binding_ifindexes,
+            );
+        self.refresh_cos_runtime_maps(owner_map, active_shards_by_egress_ifindex);
     }
 
-    fn refresh_cos_runtime_maps(&mut self, owner_map: BTreeMap<(i32, u8), u32>) {
+    fn refresh_cos_runtime_maps(
+        &mut self,
+        owner_map: BTreeMap<(i32, u8), u32>,
+        active_shards_by_egress_ifindex: BTreeMap<i32, usize>,
+    ) {
         let owner_changed = owner_map != self.cos_owner_worker_by_queue;
         let owner_map_for_runtime = if owner_changed {
             &owner_map
@@ -1130,8 +1173,14 @@ impl Coordinator {
         let current_leases = self.shared_cos_root_leases.load();
         let next_leases = build_shared_cos_root_leases_reusing_existing(
             &self.forwarding,
-            owner_map_for_runtime,
+            &active_shards_by_egress_ifindex,
             current_leases.as_ref(),
+        );
+        let current_queue_leases = self.shared_cos_queue_leases.load();
+        let next_queue_leases = build_shared_cos_queue_leases_reusing_existing(
+            &self.forwarding,
+            &active_shards_by_egress_ifindex,
+            current_queue_leases.as_ref(),
         );
         if owner_changed {
             self.cos_owner_worker_by_queue = owner_map.clone();
@@ -1144,6 +1193,9 @@ impl Coordinator {
         }
         if !shared_cos_root_leases_match(current_leases.as_ref(), &next_leases) {
             self.shared_cos_root_leases.store(Arc::new(next_leases));
+        }
+        if !shared_cos_queue_leases_match(current_queue_leases.as_ref(), &next_queue_leases) {
+            self.shared_cos_queue_leases.store(Arc::new(next_queue_leases));
         }
     }
 
@@ -1594,11 +1646,49 @@ fn build_cos_owner_worker_by_queue_with_fallback_ifindexes(
     owner_by_queue
 }
 
+fn build_cos_active_shards_by_egress_ifindex_with_fallback_ifindexes(
+    forwarding: &ForwardingState,
+    preferred_worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,
+    fallback_worker_binding_ifindexes: &BTreeMap<u32, std::collections::BTreeSet<i32>>,
+) -> BTreeMap<i32, usize> {
+    let mut out = BTreeMap::new();
+    let mut egress_ifindexes = forwarding
+        .cos
+        .interfaces
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    egress_ifindexes.sort_unstable();
+    for egress_ifindex in egress_ifindexes {
+        let tx_ifindex = resolve_tx_binding_ifindex(forwarding, egress_ifindex);
+        let preferred_count = preferred_worker_binding_ifindexes
+            .values()
+            .filter(|ifindexes| ifindexes.contains(&tx_ifindex))
+            .count();
+        let fallback_count = fallback_worker_binding_ifindexes
+            .values()
+            .filter(|ifindexes| ifindexes.contains(&tx_ifindex))
+            .count();
+        let active_shards = if preferred_count > 0 {
+            preferred_count
+        } else {
+            fallback_count
+        }
+        .max(1);
+        out.insert(egress_ifindex, active_shards);
+    }
+    out
+}
+
 fn build_shared_cos_root_leases(
     forwarding: &ForwardingState,
-    owner_by_queue: &BTreeMap<(i32, u8), u32>,
+    active_shards_by_egress_ifindex: &BTreeMap<i32, usize>,
 ) -> BTreeMap<i32, Arc<SharedCoSRootLease>> {
-    build_shared_cos_root_leases_reusing_existing(forwarding, owner_by_queue, &BTreeMap::new())
+    build_shared_cos_root_leases_reusing_existing(
+        forwarding,
+        active_shards_by_egress_ifindex,
+        &BTreeMap::new(),
+    )
 }
 
 fn build_cos_owner_live_by_queue(
@@ -1630,17 +1720,15 @@ fn build_cos_owner_live_by_queue(
 
 fn build_shared_cos_root_leases_reusing_existing(
     forwarding: &ForwardingState,
-    owner_by_queue: &BTreeMap<(i32, u8), u32>,
+    active_shards_by_egress_ifindex: &BTreeMap<i32, usize>,
     existing: &BTreeMap<i32, Arc<SharedCoSRootLease>>,
 ) -> BTreeMap<i32, Arc<SharedCoSRootLease>> {
     let mut out = BTreeMap::new();
     for (&ifindex, iface) in &forwarding.cos.interfaces {
-        let active_shards = iface
-            .queues
-            .iter()
-            .filter_map(|queue| owner_by_queue.get(&(ifindex, queue.queue_id)).copied())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
+        let active_shards = active_shards_by_egress_ifindex
+            .get(&ifindex)
+            .copied()
+            .unwrap_or(1)
             .max(1);
         let burst_bytes = iface.burst_bytes.max(64 * 1500);
         if let Some(lease) = existing.get(&ifindex).filter(|lease| {
@@ -1661,6 +1749,43 @@ fn build_shared_cos_root_leases_reusing_existing(
     out
 }
 
+fn build_shared_cos_queue_leases_reusing_existing(
+    forwarding: &ForwardingState,
+    active_shards_by_egress_ifindex: &BTreeMap<i32, usize>,
+    existing: &BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>,
+) -> BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>> {
+    let mut out = BTreeMap::new();
+    for (&ifindex, iface) in &forwarding.cos.interfaces {
+        let active_shards = active_shards_by_egress_ifindex
+            .get(&ifindex)
+            .copied()
+            .unwrap_or(1)
+            .max(1);
+        for queue in &iface.queues {
+            if !queue.exact || queue.transmit_rate_bytes == 0 {
+                continue;
+            }
+            let burst_bytes = queue.buffer_bytes.max(64 * 1500);
+            let key = (ifindex, queue.queue_id);
+            if let Some(lease) = existing.get(&key).filter(|lease| {
+                lease.matches_config(queue.transmit_rate_bytes, burst_bytes, active_shards)
+            }) {
+                out.insert(key, lease.clone());
+                continue;
+            }
+            out.insert(
+                key,
+                Arc::new(SharedCoSQueueLease::new(
+                    queue.transmit_rate_bytes,
+                    burst_bytes,
+                    active_shards,
+                )),
+            );
+        }
+    }
+    out
+}
+
 fn shared_cos_root_leases_match(
     current: &BTreeMap<i32, Arc<SharedCoSRootLease>>,
     next: &BTreeMap<i32, Arc<SharedCoSRootLease>>,
@@ -1670,6 +1795,16 @@ fn shared_cos_root_leases_match(
             next.get(ifindex)
                 .is_some_and(|next| Arc::ptr_eq(lease, next))
         })
+}
+
+fn shared_cos_queue_leases_match(
+    current: &BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>,
+    next: &BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>,
+) -> bool {
+    current.len() == next.len()
+        && current
+            .iter()
+            .all(|(key, lease)| next.get(key).is_some_and(|next| Arc::ptr_eq(lease, next)))
 }
 
 fn shared_cos_owner_live_by_queue_match(
@@ -2043,7 +2178,7 @@ mod tests {
     }
 
     #[test]
-    fn build_shared_cos_root_leases_uses_distinct_owner_workers_per_interface() {
+    fn build_shared_cos_root_leases_uses_active_workers_per_interface() {
         let mut forwarding = ForwardingState::default();
         forwarding.cos.interfaces.insert(
             80,
@@ -2080,9 +2215,9 @@ mod tests {
                 ],
             },
         );
-        let owner_by_queue = BTreeMap::from([((80, 0), 2), ((80, 1), 7)]);
+        let active_shards_by_egress_ifindex = BTreeMap::from([(80, 2usize)]);
 
-        let leases = build_shared_cos_root_leases(&forwarding, &owner_by_queue);
+        let leases = build_shared_cos_root_leases(&forwarding, &active_shards_by_egress_ifindex);
         let lease = leases.get(&80).expect("shared root lease");
 
         let first = lease.acquire(1, 2500);
@@ -2127,15 +2262,63 @@ mod tests {
                 }],
             },
         );
-        let owner_by_queue = BTreeMap::from([((80, 0), 2)]);
+        let active_shards_by_egress_ifindex = BTreeMap::from([(80, 1usize)]);
 
-        let existing = build_shared_cos_root_leases(&forwarding, &owner_by_queue);
-        let reused =
-            build_shared_cos_root_leases_reusing_existing(&forwarding, &owner_by_queue, &existing);
+        let existing = build_shared_cos_root_leases(&forwarding, &active_shards_by_egress_ifindex);
+        let reused = build_shared_cos_root_leases_reusing_existing(
+            &forwarding,
+            &active_shards_by_egress_ifindex,
+            &existing,
+        );
 
         assert!(Arc::ptr_eq(
             existing.get(&80).expect("existing lease"),
             reused.get(&80).expect("reused lease")
+        ));
+    }
+
+    #[test]
+    fn build_shared_cos_queue_leases_reuses_existing_matching_lease_arc() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 100_000_000,
+                burst_bytes: 256 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![CoSQueueConfig {
+                    queue_id: 4,
+                    forwarding_class: "iperf-b".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 50_000_000,
+                    exact: true,
+                    surplus_weight: 1,
+                    buffer_bytes: 128 * 1024,
+                    dscp_rewrite: None,
+                }],
+            },
+        );
+        let active_shards_by_egress_ifindex = BTreeMap::from([(80, 2usize)]);
+
+        let existing = build_shared_cos_queue_leases_reusing_existing(
+            &forwarding,
+            &active_shards_by_egress_ifindex,
+            &BTreeMap::new(),
+        );
+        let reused = build_shared_cos_queue_leases_reusing_existing(
+            &forwarding,
+            &active_shards_by_egress_ifindex,
+            &existing,
+        );
+
+        assert!(Arc::ptr_eq(
+            existing.get(&(80, 4)).expect("existing queue lease"),
+            reused.get(&(80, 4)).expect("reused queue lease")
         ));
     }
 

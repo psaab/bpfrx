@@ -732,14 +732,20 @@ pub(super) struct CoSTimerWheelRuntime {
 }
 
 #[repr(align(64))]
+pub(super) struct SharedCoSQueueLease {
+    config: SharedCoSLeaseConfig,
+    state: Mutex<SharedCoSLeaseState>,
+}
+
+#[repr(align(64))]
 pub(super) struct SharedCoSRootLease {
-    config: SharedCoSRootLeaseConfig,
-    state: Mutex<SharedCoSRootLeaseState>,
+    config: SharedCoSLeaseConfig,
+    state: Mutex<SharedCoSLeaseState>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SharedCoSRootLeaseConfig {
-    shaping_rate_bytes: u64,
+struct SharedCoSLeaseConfig {
+    rate_bytes: u64,
     burst_bytes: u64,
     lease_bytes: u64,
     max_total_leased: u64,
@@ -747,7 +753,7 @@ struct SharedCoSRootLeaseConfig {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct SharedCoSRootLeaseState {
+struct SharedCoSLeaseState {
     available_tokens: u64,
     outstanding_leased_tokens: u64,
     last_refill_ns: u64,
@@ -757,41 +763,157 @@ const COS_ROOT_LEASE_TARGET_US: u64 = 200;
 const COS_ROOT_LEASE_MIN_BYTES: u64 = 1500;
 const COS_ROOT_LEASE_MAX_BYTES: u64 = 512 * 1024;
 
-impl SharedCoSRootLease {
-    fn compute_config(
-        shaping_rate_bytes: u64,
-        burst_bytes: u64,
-        active_shards: usize,
-    ) -> SharedCoSRootLeaseConfig {
-        let burst_bytes = burst_bytes.max(COS_ROOT_LEASE_MIN_BYTES);
-        let active_shards = active_shards.max(1);
-        let target_lease_bytes = ((shaping_rate_bytes as u128) * (COS_ROOT_LEASE_TARGET_US as u128)
-            / 1_000_000u128) as u64;
-        let lease_ceiling = burst_bytes
-            .saturating_div(8)
-            .min(COS_ROOT_LEASE_MAX_BYTES)
-            .max(COS_ROOT_LEASE_MIN_BYTES);
-        let lease_bytes = target_lease_bytes
-            .max(COS_ROOT_LEASE_MIN_BYTES)
-            .min(lease_ceiling);
-        let max_frame_lease_bytes = lease_bytes.max(tx_frame_capacity() as u64);
-        let max_total_leased = burst_bytes
-            .saturating_div(4)
-            .min(max_frame_lease_bytes.saturating_mul(active_shards as u64));
-        SharedCoSRootLeaseConfig {
-            shaping_rate_bytes,
-            burst_bytes,
-            lease_bytes,
-            max_total_leased,
-            active_shards,
+fn compute_shared_cos_lease_config(
+    rate_bytes: u64,
+    burst_bytes: u64,
+    active_shards: usize,
+) -> SharedCoSLeaseConfig {
+    let burst_bytes = burst_bytes.max(COS_ROOT_LEASE_MIN_BYTES);
+    let active_shards = active_shards.max(1);
+    let target_lease_bytes = ((rate_bytes as u128) * (COS_ROOT_LEASE_TARGET_US as u128)
+        / 1_000_000u128) as u64;
+    let lease_ceiling = burst_bytes
+        .saturating_div(8)
+        .min(COS_ROOT_LEASE_MAX_BYTES)
+        .max(COS_ROOT_LEASE_MIN_BYTES);
+    let lease_bytes = target_lease_bytes
+        .max(COS_ROOT_LEASE_MIN_BYTES)
+        .min(lease_ceiling);
+    let max_frame_lease_bytes = lease_bytes.max(tx_frame_capacity() as u64);
+    let max_total_leased = burst_bytes
+        .saturating_div(4)
+        .min(max_frame_lease_bytes.saturating_mul(active_shards as u64));
+    SharedCoSLeaseConfig {
+        rate_bytes,
+        burst_bytes,
+        lease_bytes,
+        max_total_leased,
+        active_shards,
+    }
+}
+
+fn shared_cos_lease_acquire(
+    config: SharedCoSLeaseConfig,
+    state: &Mutex<SharedCoSLeaseState>,
+    now_ns: u64,
+    requested: u64,
+) -> u64 {
+    let Ok(mut state) = state.lock() else {
+        return 0;
+    };
+    refill_shared_cos_lease_locked(config, &mut state, now_ns);
+    let lease_headroom = config
+        .max_total_leased
+        .saturating_sub(state.outstanding_leased_tokens);
+    if lease_headroom == 0 || state.available_tokens == 0 {
+        return 0;
+    }
+    let granted = requested.min(state.available_tokens).min(lease_headroom);
+    state.available_tokens = state.available_tokens.saturating_sub(granted);
+    state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_add(granted);
+    granted
+}
+
+fn shared_cos_lease_consume(state: &Mutex<SharedCoSLeaseState>, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    if let Ok(mut state) = state.lock() {
+        state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_sub(bytes);
+    }
+}
+
+fn shared_cos_lease_release_unused(
+    config: SharedCoSLeaseConfig,
+    state: &Mutex<SharedCoSLeaseState>,
+    bytes: u64,
+) {
+    if bytes == 0 {
+        return;
+    }
+    if let Ok(mut state) = state.lock() {
+        state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_sub(bytes);
+        state.available_tokens = state
+            .available_tokens
+            .saturating_add(bytes)
+            .min(config.burst_bytes);
+    }
+}
+
+fn refill_shared_cos_lease_locked(
+    config: SharedCoSLeaseConfig,
+    state: &mut SharedCoSLeaseState,
+    now_ns: u64,
+) {
+    if config.burst_bytes == 0 {
+        return;
+    }
+    if state.last_refill_ns == 0 {
+        state.available_tokens = config.burst_bytes;
+        state.last_refill_ns = now_ns;
+        return;
+    }
+    if now_ns <= state.last_refill_ns || config.rate_bytes == 0 {
+        return;
+    }
+    let elapsed_ns = now_ns - state.last_refill_ns;
+    let added = ((elapsed_ns as u128) * (config.rate_bytes as u128) / 1_000_000_000u128) as u64;
+    if added == 0 {
+        return;
+    }
+    state.available_tokens = state
+        .available_tokens
+        .saturating_add(added)
+        .min(config.burst_bytes);
+    state.last_refill_ns = now_ns;
+}
+
+impl SharedCoSQueueLease {
+    pub(super) fn new(rate_bytes: u64, burst_bytes: u64, active_shards: usize) -> Self {
+        let config = compute_shared_cos_lease_config(rate_bytes, burst_bytes, active_shards);
+        Self {
+            config,
+            state: Mutex::new(SharedCoSLeaseState {
+                available_tokens: config.burst_bytes,
+                outstanding_leased_tokens: 0,
+                last_refill_ns: 0,
+            }),
         }
     }
 
+    pub(super) fn lease_bytes(&self) -> u64 {
+        self.config.lease_bytes
+    }
+
+    pub(super) fn matches_config(
+        &self,
+        rate_bytes: u64,
+        burst_bytes: u64,
+        active_shards: usize,
+    ) -> bool {
+        self.config == compute_shared_cos_lease_config(rate_bytes, burst_bytes, active_shards)
+    }
+
+    pub(super) fn acquire(&self, now_ns: u64, requested: u64) -> u64 {
+        shared_cos_lease_acquire(self.config, &self.state, now_ns, requested)
+    }
+
+    pub(super) fn consume(&self, bytes: u64) {
+        shared_cos_lease_consume(&self.state, bytes);
+    }
+
+    pub(super) fn release_unused(&self, bytes: u64) {
+        shared_cos_lease_release_unused(self.config, &self.state, bytes);
+    }
+}
+
+impl SharedCoSRootLease {
     pub(super) fn new(shaping_rate_bytes: u64, burst_bytes: u64, active_shards: usize) -> Self {
-        let config = Self::compute_config(shaping_rate_bytes, burst_bytes, active_shards);
+        let config =
+            compute_shared_cos_lease_config(shaping_rate_bytes, burst_bytes, active_shards);
         Self {
             config,
-            state: Mutex::new(SharedCoSRootLeaseState {
+            state: Mutex::new(SharedCoSLeaseState {
                 available_tokens: config.burst_bytes,
                 outstanding_leased_tokens: 0,
                 last_refill_ns: 0,
@@ -809,72 +931,20 @@ impl SharedCoSRootLease {
         burst_bytes: u64,
         active_shards: usize,
     ) -> bool {
-        self.config == Self::compute_config(shaping_rate_bytes, burst_bytes, active_shards)
+        self.config
+            == compute_shared_cos_lease_config(shaping_rate_bytes, burst_bytes, active_shards)
     }
 
     pub(super) fn acquire(&self, now_ns: u64, requested: u64) -> u64 {
-        let Ok(mut state) = self.state.lock() else {
-            return 0;
-        };
-        self.refill_locked(&mut state, now_ns);
-        let lease_headroom = self
-            .config
-            .max_total_leased
-            .saturating_sub(state.outstanding_leased_tokens);
-        if lease_headroom == 0 || state.available_tokens == 0 {
-            return 0;
-        }
-        let granted = requested.min(state.available_tokens).min(lease_headroom);
-        state.available_tokens = state.available_tokens.saturating_sub(granted);
-        state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_add(granted);
-        granted
+        shared_cos_lease_acquire(self.config, &self.state, now_ns, requested)
     }
 
     pub(super) fn consume(&self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        if let Ok(mut state) = self.state.lock() {
-            state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_sub(bytes);
-        }
+        shared_cos_lease_consume(&self.state, bytes);
     }
 
     pub(super) fn release_unused(&self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        if let Ok(mut state) = self.state.lock() {
-            state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_sub(bytes);
-            state.available_tokens = state
-                .available_tokens
-                .saturating_add(bytes)
-                .min(self.config.burst_bytes);
-        }
-    }
-
-    fn refill_locked(&self, state: &mut SharedCoSRootLeaseState, now_ns: u64) {
-        if self.config.burst_bytes == 0 {
-            return;
-        }
-        if state.last_refill_ns == 0 {
-            state.available_tokens = self.config.burst_bytes;
-            state.last_refill_ns = now_ns;
-            return;
-        }
-        if now_ns <= state.last_refill_ns || self.config.shaping_rate_bytes == 0 {
-            return;
-        }
-        let elapsed_ns = now_ns - state.last_refill_ns;
-        let added = ((elapsed_ns as u128) * (self.config.shaping_rate_bytes as u128)
-            / 1_000_000_000u128) as u64;
-        if added == 0 {
-            return;
-        }
-        state.available_tokens = state
-            .available_tokens
-            .saturating_add(added)
-            .min(self.config.burst_bytes);
-        state.last_refill_ns = now_ns;
+        shared_cos_lease_release_unused(self.config, &self.state, bytes);
     }
 }
 

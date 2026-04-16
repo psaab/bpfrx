@@ -19,6 +19,7 @@ pub(crate) struct BindingWorker {
     pub(crate) max_pending_tx: usize,
     pub(crate) cos_owner_live_by_tx_ifindex: BTreeMap<i32, Arc<BindingLiveState>>,
     pub(crate) cos_shared_root_leases: BTreeMap<i32, Arc<SharedCoSRootLease>>,
+    pub(crate) cos_shared_queue_leases: BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>,
     pub(crate) cos_interfaces: FastMap<i32, CoSInterfaceRuntime>,
     pub(crate) cos_interface_order: Vec<i32>,
     pub(crate) cos_interface_rr: usize,
@@ -295,6 +296,7 @@ impl BindingWorker {
             max_pending_tx,
             cos_owner_live_by_tx_ifindex: BTreeMap::new(),
             cos_shared_root_leases: BTreeMap::new(),
+            cos_shared_queue_leases: BTreeMap::new(),
             cos_interfaces: FastMap::default(),
             cos_interface_order: Vec::new(),
             cos_interface_rr: 0,
@@ -407,6 +409,7 @@ pub(crate) fn worker_loop(
     shared_cos_owner_worker_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), u32>>>,
     shared_cos_owner_live_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<BindingLiveState>>>>,
     shared_cos_root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
+    shared_cos_queue_leases: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>>>,
     cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
 ) {
     pin_current_thread(worker_id);
@@ -418,6 +421,7 @@ pub(crate) fn worker_loop(
     let mut cos_owner_worker_by_queue = shared_cos_owner_worker_by_queue.load_full();
     let mut cos_owner_live_by_queue = shared_cos_owner_live_by_queue.load_full();
     let mut cos_shared_root_leases = shared_cos_root_leases.load_full();
+    let mut cos_shared_queue_leases = shared_cos_queue_leases.load_full();
     let mut sessions = SessionTable::new();
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
@@ -464,6 +468,7 @@ pub(crate) fn worker_loop(
     for binding in bindings.iter_mut() {
         binding.cos_owner_live_by_tx_ifindex = cos_owner_live_by_tx_ifindex.clone();
         binding.cos_shared_root_leases = cos_shared_root_leases.as_ref().clone();
+        binding.cos_shared_queue_leases = cos_shared_queue_leases.as_ref().clone();
     }
     let mut interrupt_poll_fds = if poll_mode == crate::PollMode::Interrupt {
         bindings
@@ -622,10 +627,21 @@ pub(crate) fn worker_loop(
         if !Arc::ptr_eq(&cos_shared_root_leases, &live_cos_shared_root_leases) {
             for binding in bindings.iter_mut() {
                 release_all_cos_root_leases(binding);
+                release_all_cos_queue_leases(binding);
             }
             cos_shared_root_leases = live_cos_shared_root_leases;
             for binding in bindings.iter_mut() {
                 binding.cos_shared_root_leases = cos_shared_root_leases.as_ref().clone();
+            }
+        }
+        let live_cos_shared_queue_leases = shared_cos_queue_leases.load_full();
+        if !Arc::ptr_eq(&cos_shared_queue_leases, &live_cos_shared_queue_leases) {
+            for binding in bindings.iter_mut() {
+                release_all_cos_queue_leases(binding);
+            }
+            cos_shared_queue_leases = live_cos_shared_queue_leases;
+            for binding in bindings.iter_mut() {
+                binding.cos_shared_queue_leases = cos_shared_queue_leases.as_ref().clone();
             }
         }
         let ha_runtime = ha_state.load();
@@ -1349,6 +1365,7 @@ pub(crate) fn worker_loop(
     }
     for binding in bindings.iter_mut() {
         release_all_cos_root_leases(binding);
+        release_all_cos_queue_leases(binding);
     }
     cos_status.store(Arc::new(build_worker_cos_statuses(
         &bindings,
@@ -1418,6 +1435,8 @@ fn cos_runtime_config_changed(current: &ForwardingState, next: &ForwardingState)
 }
 
 fn reset_binding_cos_runtime(binding: &mut BindingWorker) {
+    release_all_cos_root_leases(binding);
+    release_all_cos_queue_leases(binding);
     let mut dropped_local = 0u64;
     let mut dropped_prepared = Vec::new();
     for root in binding.cos_interfaces.values_mut() {
