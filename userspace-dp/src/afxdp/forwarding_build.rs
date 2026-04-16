@@ -619,7 +619,7 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                     buffer_bytes: scheduler
                         .map(|sched| sched.buffer_size_bytes)
                         .filter(|size| *size > 0)
-                        .unwrap_or(burst_bytes),
+                        .unwrap_or_else(|| default_cos_burst_bytes(transmit_rate_bytes)),
                     dscp_rewrite: dscp_rewrite_rule.and_then(|rewrite_rule| {
                         rewrite_rule
                             .dscp_by_forwarding_class
@@ -831,6 +831,60 @@ mod tests {
         assert_eq!(
             iface.queues[0].buffer_bytes,
             default_cos_burst_bytes(1_000_000)
+        );
+    }
+
+    #[test]
+    fn build_cos_state_derives_exact_queue_default_burst_from_queue_rate() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                ifindex: 42,
+                cos_shaping_rate_bytes_per_sec: 25_000_000_000 / 8,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                }],
+                schedulers: vec![CoSSchedulerSnapshot {
+                    name: "be-sched".into(),
+                    transmit_rate_bytes: 100_000_000 / 8,
+                    transmit_rate_exact: true,
+                    priority: "low".into(),
+                    buffer_size_bytes: 0,
+                }],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be-sched".into(),
+                    }],
+                }],
+                dscp_classifiers: vec![],
+                ieee8021_classifiers: vec![],
+                dscp_rewrite_rules: vec![],
+            }),
+            ..Default::default()
+        };
+
+        let state = build_cos_state(&snapshot);
+        let iface = state.interfaces.get(&42).expect("missing CoS interface");
+
+        assert_eq!(iface.shaping_rate_bytes, 25_000_000_000 / 8);
+        assert_eq!(
+            iface.burst_bytes,
+            default_cos_burst_bytes(25_000_000_000 / 8),
+            "interface burst should still derive from the parent shaper"
+        );
+        assert_eq!(iface.queues.len(), 1);
+        assert_eq!(iface.queues[0].transmit_rate_bytes, 100_000_000 / 8);
+        assert!(iface.queues[0].exact);
+        assert_eq!(
+            iface.queues[0].buffer_bytes,
+            default_cos_burst_bytes(100_000_000 / 8),
+            "exact queue burst must derive from the scheduler rate, not the 25 Gb/s parent shaper"
         );
     }
 
