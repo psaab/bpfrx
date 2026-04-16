@@ -1458,9 +1458,10 @@ where
 // Empirical per-worker sustained exact throughput ceiling in bytes/sec. A
 // single owner worker can reliably drive an exact queue up to about this rate
 // before the drain loop backs up and throughput collapses (the collapse case
-// motivated shared-worker execution in PR #680). Queues below this floor get
-// deterministic single-owner arbitration; queues at or above it get sharded
-// across eligible workers so one worker is not the bottleneck.
+// motivated shared-worker execution in PR #680). This constant is the
+// absolute floor component of the shared-exact threshold:
+// `shared_threshold = max(iface_rate / 4, COS_SHARED_EXACT_MIN_RATE_BYTES)`.
+// Exact queues are sharded only once they reach that computed threshold.
 const COS_SHARED_EXACT_MIN_RATE_BYTES: u64 = 2_500_000_000 / 8;
 
 /// Decide whether an exact queue runs under shared-worker execution.
@@ -1477,9 +1478,10 @@ const COS_SHARED_EXACT_MIN_RATE_BYTES: u64 = 2_500_000_000 / 8;
 ///   worker throughput collapse from PR #680.
 ///
 /// `shared_threshold = max(iface_rate / 4, COS_SHARED_EXACT_MIN_RATE_BYTES)`.
-/// The absolute `MIN` is a per-worker capacity ceiling and is the primary
-/// gate. The `iface_rate / 4` term is an iface-rate-relative floor intended
-/// to keep very-small queues single-owner on fast interfaces.
+/// `COS_SHARED_EXACT_MIN_RATE_BYTES` provides an absolute floor, while
+/// `iface_rate / 4` is the iface-rate-relative term and becomes the
+/// effective gate on faster interfaces, keeping very-small queues
+/// single-owner there.
 ///
 /// Known rough edge (#690 follow-on): at iface rates well above 10g the
 /// `/4` component dominates `MIN` and will classify a genuinely high-rate
