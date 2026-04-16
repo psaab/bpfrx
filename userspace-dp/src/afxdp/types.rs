@@ -586,6 +586,7 @@ impl WorkerBindingLookup {
 }
 
 pub(super) const COS_FAST_QUEUE_INDEX_MISS: u16 = u16::MAX;
+pub(super) const COS_FLOW_FAIR_BUCKETS: usize = 64;
 
 #[derive(Clone)]
 pub(super) struct WorkerCoSQueueFastPath {
@@ -757,6 +758,7 @@ pub(super) struct CoSQueueRuntime {
     pub(super) priority: u8,
     pub(super) transmit_rate_bytes: u64,
     pub(super) exact: bool,
+    pub(super) flow_fair: bool,
     pub(super) surplus_weight: u32,
     pub(super) surplus_deficit: u64,
     pub(super) buffer_bytes: u64,
@@ -764,6 +766,10 @@ pub(super) struct CoSQueueRuntime {
     pub(super) tokens: u64,
     pub(super) last_refill_ns: u64,
     pub(super) queued_bytes: u64,
+    pub(super) active_flow_buckets: u16,
+    pub(super) flow_bucket_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
+    pub(super) flow_rr_buckets: VecDeque<u8>,
+    pub(super) flow_bucket_items: [VecDeque<CoSPendingTxItem>; COS_FLOW_FAIR_BUCKETS],
     pub(super) runnable: bool,
     pub(super) parked: bool,
     pub(super) next_wakeup_tick: u64,

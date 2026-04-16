@@ -1451,6 +1451,23 @@ where
     out
 }
 
+const COS_SHARED_EXACT_MIN_RATE_BYTES: u64 = 2_500_000_000 / 8;
+
+#[inline]
+fn queue_uses_shared_exact_service(iface: &CoSInterfaceConfig, queue: &CoSQueueConfig) -> bool {
+    if !queue.exact {
+        return false;
+    }
+    // Low-rate exact queues care more about deterministic single-queue arbitration
+    // than shared-worker throughput. Only shard exact service once the queue rate is
+    // high enough that a single worker is no longer the clear fast path.
+    let shared_threshold = iface
+        .shaping_rate_bytes
+        .saturating_div(4)
+        .max(COS_SHARED_EXACT_MIN_RATE_BYTES);
+    queue.transmit_rate_bytes >= shared_threshold
+}
+
 fn build_worker_cos_fast_interfaces(
     forwarding: &ForwardingState,
     current_worker_id: u32,
@@ -1468,8 +1485,9 @@ fn build_worker_cos_fast_interfaces(
         for (queue_idx, queue) in iface.queues.iter().enumerate() {
             queue_index_by_id[usize::from(queue.queue_id)] = queue_idx as u16;
             let queue_key = (egress_ifindex, queue.queue_id);
+            let shared_exact = queue_uses_shared_exact_service(iface, queue);
             queue_fast_path.push(WorkerCoSQueueFastPath {
-                shared_exact: queue.exact,
+                shared_exact,
                 owner_worker_id: owner_worker_by_queue
                     .get(&queue_key)
                     .copied()
@@ -1521,7 +1539,7 @@ fn reset_binding_cos_runtime(binding: &mut BindingWorker) {
     let mut dropped_prepared = Vec::new();
     for root in binding.cos_interfaces.values_mut() {
         for queue in &mut root.queues {
-            while let Some(item) = queue.items.pop_front() {
+            while let Some(item) = cos_queue_pop_front(queue) {
                 match item {
                     CoSPendingTxItem::Local(_) => {
                         dropped_local = dropped_local.saturating_add(1);
@@ -1622,7 +1640,7 @@ where
                 status.worker_instances = status.worker_instances.saturating_add(1);
                 status.queued_packets = status
                     .queued_packets
-                    .saturating_add(queue.items.len() as u64);
+                    .saturating_add(cos_queue_len(queue) as u64);
                 status.queued_bytes = status.queued_bytes.saturating_add(queue.queued_bytes);
                 if queue.runnable {
                     status.runnable_instances = status.runnable_instances.saturating_add(1);
@@ -1727,6 +1745,7 @@ mod tests {
                 priority: 1,
                 transmit_rate_bytes: 1_250_000,
                 exact: false,
+                flow_fair: false,
                 surplus_weight: 1,
                 surplus_deficit: 512,
                 buffer_bytes: 32 * 1024,
@@ -1734,6 +1753,10 @@ mod tests {
                 tokens: 0,
                 last_refill_ns: 0,
                 queued_bytes,
+                active_flow_buckets: 0,
+                flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                flow_rr_buckets: VecDeque::new(),
+                flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                 runnable,
                 parked,
                 next_wakeup_tick: wake_tick,
@@ -1797,7 +1820,7 @@ mod tests {
         forwarding.cos.interfaces.insert(
             80,
             CoSInterfaceConfig {
-                shaping_rate_bytes: 25_000_000,
+                shaping_rate_bytes: 25_000_000_000 / 8,
                 burst_bytes: 256 * 1024,
                 default_queue: 5,
                 dscp_classifier: String::new(),
@@ -1810,7 +1833,7 @@ mod tests {
                         queue_id: 4,
                         forwarding_class: "best-effort".into(),
                         priority: 5,
-                        transmit_rate_bytes: 1_000_000,
+                        transmit_rate_bytes: 1_000_000_000 / 8,
                         exact: false,
                         surplus_weight: 1,
                         buffer_bytes: 64 * 1024,
@@ -1820,7 +1843,7 @@ mod tests {
                         queue_id: 5,
                         forwarding_class: "iperf-b".into(),
                         priority: 5,
-                        transmit_rate_bytes: 10_000_000,
+                        transmit_rate_bytes: 10_000_000_000 / 8,
                         exact: true,
                         surplus_weight: 1,
                         buffer_bytes: 128 * 1024,
@@ -1845,8 +1868,8 @@ mod tests {
 
         let tx_owner_live = Arc::new(BindingLiveState::new());
         let queue_owner_live = Arc::new(BindingLiveState::new());
-        let root_lease = Arc::new(SharedCoSRootLease::new(25_000_000, 256 * 1024, 4));
-        let queue_lease = Arc::new(SharedCoSQueueLease::new(10_000_000, 128 * 1024, 4));
+        let root_lease = Arc::new(SharedCoSRootLease::new(25_000_000_000 / 8, 256 * 1024, 4));
+        let queue_lease = Arc::new(SharedCoSQueueLease::new(10_000_000_000 / 8, 128 * 1024, 4));
 
         let tx_owner_live_by_tx_ifindex = FastMap::from_iter([(12, tx_owner_live.clone())]);
         let owner_worker_by_queue = BTreeMap::from([((80, 5), 7)]);
@@ -1900,6 +1923,103 @@ mod tests {
             iface.queue_fast_path(None).expect("default queue"),
             queue5
         ));
+    }
+
+    #[test]
+    fn build_worker_cos_fast_interfaces_keeps_low_rate_exact_queue_owner_local() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 25_000_000_000 / 8,
+                burst_bytes: 256 * 1024,
+                default_queue: 4,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![
+                    CoSQueueConfig {
+                        queue_id: 4,
+                        forwarding_class: "iperf-a".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 1_000_000_000 / 8,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 128 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 5,
+                        forwarding_class: "iperf-b".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 10_000_000_000 / 8,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 128 * 1024,
+                        dscp_rewrite: None,
+                    },
+                ],
+            },
+        );
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 80,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".into(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+
+        let queue4_owner_live = Arc::new(BindingLiveState::new());
+        let queue5_owner_live = Arc::new(BindingLiveState::new());
+        let tx_owner_live_by_tx_ifindex = FastMap::from_iter([(12, queue4_owner_live.clone())]);
+        let owner_worker_by_queue = BTreeMap::from([((80, 4), 4), ((80, 5), 7)]);
+        let owner_live_by_queue = BTreeMap::from([
+            ((80, 4), queue4_owner_live.clone()),
+            ((80, 5), queue5_owner_live.clone()),
+        ]);
+        let shared_root_leases = BTreeMap::from([(
+            80,
+            Arc::new(SharedCoSRootLease::new(25_000_000_000 / 8, 256 * 1024, 4)),
+        )]);
+        let shared_queue_leases = BTreeMap::from([
+            (
+                (80, 4),
+                Arc::new(SharedCoSQueueLease::new(1_000_000_000 / 8, 128 * 1024, 4)),
+            ),
+            (
+                (80, 5),
+                Arc::new(SharedCoSQueueLease::new(10_000_000_000 / 8, 128 * 1024, 4)),
+            ),
+        ]);
+
+        let fast = build_worker_cos_fast_interfaces(
+            &forwarding,
+            3,
+            &tx_owner_live_by_tx_ifindex,
+            &owner_worker_by_queue,
+            &owner_live_by_queue,
+            &shared_root_leases,
+            &shared_queue_leases,
+        );
+
+        let iface = fast.get(&80).expect("fast cos interface");
+        let queue4 = iface.queue_fast_path(Some(4)).expect("queue 4");
+        assert!(!queue4.shared_exact);
+        assert_eq!(queue4.owner_worker_id, 4);
+        assert!(queue4.shared_queue_lease.is_some());
+
+        let queue5 = iface.queue_fast_path(Some(5)).expect("queue 5");
+        assert!(queue5.shared_exact);
+        assert_eq!(queue5.owner_worker_id, 7);
+        assert!(queue5.shared_queue_lease.is_some());
     }
 
     #[test]
