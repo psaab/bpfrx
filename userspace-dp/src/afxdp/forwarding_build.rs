@@ -839,7 +839,7 @@ mod tests {
         let snapshot = ConfigSnapshot {
             interfaces: vec![InterfaceSnapshot {
                 ifindex: 42,
-                cos_shaping_rate_bytes_per_sec: 25_000_000 / 8,
+                cos_shaping_rate_bytes_per_sec: 25_000_000_000 / 8,
                 cos_scheduler_map: "wan-map".into(),
                 ..Default::default()
             }],
@@ -872,10 +872,10 @@ mod tests {
         let state = build_cos_state(&snapshot);
         let iface = state.interfaces.get(&42).expect("missing CoS interface");
 
-        assert_eq!(iface.shaping_rate_bytes, 25_000_000 / 8);
+        assert_eq!(iface.shaping_rate_bytes, 25_000_000_000 / 8);
         assert_eq!(
             iface.burst_bytes,
-            default_cos_burst_bytes(25_000_000 / 8),
+            default_cos_burst_bytes(25_000_000_000 / 8),
             "interface burst should still derive from the parent shaper"
         );
         assert_eq!(iface.queues.len(), 1);
@@ -884,7 +884,7 @@ mod tests {
         assert_eq!(
             iface.queues[0].buffer_bytes,
             default_cos_burst_bytes(100_000_000 / 8),
-            "exact queue burst must derive from the scheduler rate, not the 25g parent shaper"
+            "exact queue burst must derive from the scheduler rate, not the 25 Gb/s parent shaper"
         );
     }
 
