@@ -773,9 +773,15 @@ pub(super) struct CoSInterfaceRuntime {
     pub(super) exact_guarantee_rr: usize,
     pub(super) nonexact_guarantee_rr: usize,
     // Unified-walk cursor used only by the test-only legacy selector
-    // `select_cos_guarantee_batch_with_fast_path`. Separate from the
-    // production cursors above so test harnesses that call the legacy
-    // selector do not disturb production rotation state and vice versa.
+    // `select_cos_guarantee_batch_with_fast_path`. Gated on `cfg(test)`
+    // so non-test builds of the hot CoS fast-path runtime do not pay
+    // field footprint or init churn for compatibility scaffolding.
+    // Separate from the production cursors above so test harnesses that
+    // exercise the legacy walk do not disturb production rotation state
+    // and vice versa — see the
+    // `legacy_guarantee_rr_does_not_advance_class_cursors` regression
+    // that pins that isolation contract.
+    #[cfg(test)]
     pub(super) legacy_guarantee_rr: usize,
     pub(super) queues: Vec<CoSQueueRuntime>,
     pub(super) queue_indices_by_priority: [Vec<usize>; COS_PRIORITY_LEVELS],

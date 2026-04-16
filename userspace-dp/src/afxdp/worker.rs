@@ -1773,6 +1773,7 @@ mod tests {
             runnable_queues: usize::from(runnable),
             exact_guarantee_rr: 0,
             nonexact_guarantee_rr: 0,
+            #[cfg(test)]
             legacy_guarantee_rr: 0,
             queues: vec![CoSQueueRuntime {
                 queue_id: 4,

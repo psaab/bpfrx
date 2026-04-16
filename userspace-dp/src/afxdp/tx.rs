@@ -832,6 +832,7 @@ fn service_exact_guarantee_queue_direct(
     Some(progress)
 }
 
+#[cfg(test)]
 fn select_cos_guarantee_batch(root: &mut CoSInterfaceRuntime, now_ns: u64) -> Option<CoSBatch> {
     select_cos_guarantee_batch_with_fast_path(root, &[], now_ns)
 }
@@ -840,10 +841,12 @@ fn select_cos_guarantee_batch(root: &mut CoSInterfaceRuntime, now_ns: u64) -> Op
 // iteration. The production path in `drain_shaped_tx` no longer calls this
 // (it uses the two specialized selectors for strict-priority exact-over-
 // nonexact service); `select_cos_guarantee_batch_with_fast_path` is retained
-// solely for unit-test coverage of the batch-build mechanics. Uses its own
-// `legacy_guarantee_rr` cursor so test harnesses that call this do not
+// solely for unit-test coverage of the batch-build mechanics and is
+// compiled out of non-test builds along with its `legacy_guarantee_rr`
+// cursor. Uses its own cursor so test harnesses that call this do not
 // corrupt the production `exact_guarantee_rr` / `nonexact_guarantee_rr`
 // cursors and vice versa.
+#[cfg(test)]
 fn select_cos_guarantee_batch_with_fast_path(
     root: &mut CoSInterfaceRuntime,
     queue_fast_path: &[WorkerCoSQueueFastPath],
@@ -3458,6 +3461,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
         runnable_queues: 0,
         exact_guarantee_rr: 0,
         nonexact_guarantee_rr: 0,
+        #[cfg(test)]
         legacy_guarantee_rr: 0,
         queues: config
             .queues
@@ -8319,10 +8323,14 @@ mod tests {
         // Four queues on the same iface: two exact (queue_id 0, 2),
         // two non-exact (queue_id 1, 3). Per-queue rate is set low
         // enough that `cos_guarantee_quantum_bytes` clamps to the
-        // minimum (1500 bytes) so each selector call takes exactly
-        // one packet from the chosen queue. That keeps backlog available
-        // across multiple rotation rounds without any test having to
-        // push hundreds of items.
+        // minimum (1500 bytes). That means the non-exact batch-build
+        // path (`select_nonexact_cos_guarantee_batch`) dequeues exactly
+        // one 1500-byte item per call, while the exact fast-path
+        // selector (`select_exact_cos_guarantee_queue_with_fast_path`)
+        // only picks a queue and advances its cursor — it does not
+        // dequeue. Eight primed items per queue keeps backlog available
+        // across every rotation round below without any test having to
+        // push additional items.
         //
         // Shared by the #689 split-cursor regression tests.
         let slow_rate = 1_000_000 / 8; // 1 Mbps → quantum clamps to MIN
@@ -8437,19 +8445,19 @@ mod tests {
         // so the next exact call would skip exact-2 and loop back to
         // exact-0. This test pins that the split cursor rotates exact
         // queues deterministically without regard for non-exact service.
+        // Helper primes eight 1500-byte items and sets `queued_bytes`
+        // to match; no additional priming needed here. Only bump
+        // queue.tokens on the exact queues to make sure they never hit
+        // token-starvation during the four interleaved rounds below —
+        // the exact selector does not refill exact-queue tokens itself
+        // (that is done by the shared-lease path), so this test bypasses
+        // that machinery by handing the queues a large local budget.
         let mut root = test_mixed_class_root_with_primed_queues();
-        // Give each exact queue enough backlog + tokens to be served
-        // repeatedly without token starvation.
         for queue in &mut root.queues {
             if queue.exact {
-                for _ in 0..3 {
-                    queue.items.push_back(test_cos_item(1500));
-                }
-                queue.queued_bytes = 4 * 1500;
                 queue.tokens = 128 * 1024;
             }
         }
-        root.tokens = 1024 * 1024;
 
         let mut exact_order = Vec::new();
         for _ in 0..4 {
@@ -8468,17 +8476,10 @@ mod tests {
     #[test]
     fn nonexact_guarantee_rr_walks_nonexact_queues_in_order_independent_of_exact() {
         // Symmetric to the exact test: non-exact rotation is 1 -> 3 -> 1 -> 3
-        // regardless of exact-queue activity between calls.
+        // regardless of exact-queue activity between calls. Helper primes
+        // eight 1500-byte items per queue with `queued_bytes` already
+        // consistent; no additional priming needed.
         let mut root = test_mixed_class_root_with_primed_queues();
-        for queue in &mut root.queues {
-            if !queue.exact {
-                for _ in 0..3 {
-                    queue.items.push_back(test_cos_item(1500));
-                }
-                queue.queued_bytes = 4 * 1500;
-            }
-        }
-        root.tokens = 1024 * 1024;
 
         let mut nonexact_order = Vec::new();
         for _ in 0..4 {
@@ -8492,6 +8493,37 @@ mod tests {
             let _ = select_exact_cos_guarantee_queue_with_fast_path(&mut root, &[], 1);
         }
         assert_eq!(nonexact_order, vec![1, 3, 1, 3]);
+    }
+
+    #[test]
+    fn legacy_guarantee_rr_does_not_advance_class_cursors() {
+        // The entire reason `legacy_guarantee_rr` exists as a third cursor
+        // (instead of the legacy unified selector reusing one of the
+        // production cursors) is to keep the legacy walk isolated from the
+        // production exact/nonexact rotation state. Pin that contract:
+        // a call through the legacy selector must advance only its own
+        // cursor, never the two production cursors.
+        let mut root = test_mixed_class_root_with_primed_queues();
+        let batch = select_cos_guarantee_batch(&mut root, 1).expect("legacy guarantee batch");
+        // Served something, so `legacy_guarantee_rr` advanced.
+        match batch {
+            CoSBatch::Local { queue_idx, .. } => {
+                assert_eq!(queue_idx, 0, "legacy walk starts at index 0");
+            }
+            CoSBatch::Prepared { .. } => panic!("expected local batch"),
+        }
+        assert_eq!(root.legacy_guarantee_rr, 1);
+        // Production cursors untouched — this is the isolation guarantee
+        // that justifies the extra field over reusing either production
+        // cursor for the legacy walk.
+        assert_eq!(
+            root.exact_guarantee_rr, 0,
+            "legacy selector must not advance exact production cursor"
+        );
+        assert_eq!(
+            root.nonexact_guarantee_rr, 0,
+            "legacy selector must not advance nonexact production cursor"
+        );
     }
 
     #[test]
