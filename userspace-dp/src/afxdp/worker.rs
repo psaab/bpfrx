@@ -1781,6 +1781,7 @@ mod tests {
                 transmit_rate_bytes: 1_250_000,
                 exact: false,
                 flow_fair: false,
+                flow_hash_seed: 0,
                 surplus_weight: 1,
                 surplus_deficit: 512,
                 buffer_bytes: 32 * 1024,

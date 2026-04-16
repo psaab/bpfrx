@@ -2507,12 +2507,35 @@ fn mix_cos_flow_bucket(seed: &mut u64, value: u64) {
         .wrapping_add(*seed >> 2);
 }
 
+/// Draw a fresh per-queue hash salt from the kernel.
+///
+/// `getrandom(2)` with `flags=0` blocks only during early boot before the
+/// urandom pool is initialized, which is not a path this daemon runs on
+/// (xpfd starts well after systemd-random-seed). If the syscall ever fails
+/// for any reason we fall through to a CLOCK_MONOTONIC-mixed fallback so
+/// the daemon does not abort on queue construction. A predictable seed is
+/// strictly weaker than a random one, but still strictly stronger than the
+/// zero-seed it replaces, so the fallback degrades gracefully.
+pub(super) fn cos_flow_hash_seed_from_os() -> u64 {
+    let mut buf = [0u8; 8];
+    // SAFETY: libc::getrandom writes exactly buf.len() bytes on success.
+    let rc = unsafe { libc::getrandom(buf.as_mut_ptr().cast::<libc::c_void>(), buf.len(), 0) };
+    if rc == buf.len() as isize {
+        return u64::from_ne_bytes(buf);
+    }
+    let now = std::time::Instant::now().elapsed().as_nanos() as u64;
+    let pid = std::process::id() as u64;
+    let mut fallback = now ^ pid.wrapping_mul(0x9e3779b97f4a7c15);
+    mix_cos_flow_bucket(&mut fallback, now.rotate_left(17));
+    fallback
+}
+
 #[inline(always)]
-fn exact_cos_flow_bucket(flow_key: Option<&SessionKey>) -> u8 {
+fn exact_cos_flow_bucket(queue_seed: u64, flow_key: Option<&SessionKey>) -> u8 {
     let Some(flow_key) = flow_key else {
         return 0;
     };
-    let mut seed = flow_key.protocol as u64 ^ ((flow_key.addr_family as u64) << 8);
+    let mut seed = queue_seed ^ (flow_key.protocol as u64) ^ ((flow_key.addr_family as u64) << 8);
     match flow_key.src_ip {
         IpAddr::V4(ip) => mix_cos_flow_bucket(&mut seed, u32::from(ip) as u64),
         IpAddr::V6(ip) => {
@@ -2543,8 +2566,8 @@ fn cos_item_flow_key(item: &CoSPendingTxItem) -> Option<&SessionKey> {
 }
 
 #[inline(always)]
-fn cos_flow_bucket_index(flow_key: Option<&SessionKey>) -> usize {
-    usize::from(exact_cos_flow_bucket(flow_key)) & (COS_FLOW_FAIR_BUCKETS - 1)
+fn cos_flow_bucket_index(queue_seed: u64, flow_key: Option<&SessionKey>) -> usize {
+    usize::from(exact_cos_flow_bucket(queue_seed, flow_key)) & (COS_FLOW_FAIR_BUCKETS - 1)
 }
 
 #[inline]
@@ -2573,7 +2596,7 @@ fn account_cos_queue_flow_enqueue(
     if !queue.flow_fair || item_len == 0 {
         return;
     }
-    let bucket = cos_flow_bucket_index(flow_key);
+    let bucket = cos_flow_bucket_index(queue.flow_hash_seed, flow_key);
     if queue.flow_bucket_bytes[bucket] == 0 {
         queue.active_flow_buckets = queue.active_flow_buckets.saturating_add(1);
     }
@@ -2589,7 +2612,7 @@ fn account_cos_queue_flow_dequeue(
     if !queue.flow_fair || item_len == 0 {
         return;
     }
-    let bucket = cos_flow_bucket_index(flow_key);
+    let bucket = cos_flow_bucket_index(queue.flow_hash_seed, flow_key);
     let remaining = queue.flow_bucket_bytes[bucket].saturating_sub(item_len);
     if queue.flow_bucket_bytes[bucket] > 0 && remaining == 0 {
         queue.active_flow_buckets = queue.active_flow_buckets.saturating_sub(1);
@@ -2635,7 +2658,7 @@ pub(super) fn cos_queue_push_back(queue: &mut CoSQueueRuntime, item: CoSPendingT
         queue.items.push_back(item);
         return;
     }
-    let bucket = cos_flow_bucket_index(flow_key);
+    let bucket = cos_flow_bucket_index(queue.flow_hash_seed, flow_key);
     let bucket_queue = &mut queue.flow_bucket_items[bucket];
     let was_empty = bucket_queue.is_empty();
     bucket_queue.push_back(item);
@@ -2653,7 +2676,7 @@ pub(super) fn cos_queue_push_front(queue: &mut CoSQueueRuntime, item: CoSPending
         queue.items.push_front(item);
         return;
     }
-    let bucket = cos_flow_bucket_index(flow_key);
+    let bucket = cos_flow_bucket_index(queue.flow_hash_seed, flow_key);
     let bucket_queue = &mut queue.flow_bucket_items[bucket];
     let was_empty = bucket_queue.is_empty();
     bucket_queue.push_front(item);
@@ -3372,6 +3395,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 transmit_rate_bytes: queue.transmit_rate_bytes,
                 exact: queue.exact,
                 flow_fair: false,
+                flow_hash_seed: cos_flow_hash_seed_from_os(),
                 surplus_weight: queue.surplus_weight,
                 surplus_deficit: 0,
                 buffer_bytes: queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
@@ -3460,7 +3484,7 @@ fn enqueue_cos_item(
         let queue = &mut root.queues[queue_idx];
         let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
         let flow_share_exceeded = if queue.flow_fair {
-            let flow_bucket = cos_flow_bucket_index(cos_item_flow_key(&item));
+            let flow_bucket = cos_flow_bucket_index(queue.flow_hash_seed, cos_item_flow_key(&item));
             queue.flow_bucket_bytes[flow_bucket].saturating_add(item_len)
                 > cos_queue_flow_share_limit(queue, buffer_limit, flow_bucket)
         } else {
@@ -7696,11 +7720,12 @@ mod tests {
         );
         let queue = &mut root.queues[0];
         queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
         let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
         let flow_a = test_session_key(1111, 5201);
         let flow_b = test_session_key(1112, 5201);
-        let bucket_a = cos_flow_bucket_index(Some(&flow_a));
-        let bucket_b = cos_flow_bucket_index(Some(&flow_b));
+        let bucket_a = cos_flow_bucket_index(queue.flow_hash_seed, Some(&flow_a));
+        let bucket_b = cos_flow_bucket_index(queue.flow_hash_seed, Some(&flow_b));
         assert_ne!(bucket_a, bucket_b);
 
         assert_eq!(
@@ -7742,6 +7767,7 @@ mod tests {
         );
         let queue = &mut root.queues[0];
         queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
 
         let req_a = TxRequest {
             bytes: vec![0; 1500],
@@ -7763,8 +7789,8 @@ mod tests {
             cos_queue_id: Some(4),
             dscp_rewrite: None,
         };
-        let bucket_a = cos_flow_bucket_index(req_a.flow_key.as_ref());
-        let bucket_b = cos_flow_bucket_index(req_b.flow_key.as_ref());
+        let bucket_a = cos_flow_bucket_index(queue.flow_hash_seed, req_a.flow_key.as_ref());
+        let bucket_b = cos_flow_bucket_index(queue.flow_hash_seed, req_b.flow_key.as_ref());
         assert_ne!(bucket_a, bucket_b);
 
         cos_queue_push_back(queue, CoSPendingTxItem::Local(req_a));
@@ -7799,6 +7825,7 @@ mod tests {
         );
         let queue = &mut root.queues[0];
         queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
 
         cos_queue_push_back(queue, test_flow_cos_item(1111, 1500));
         cos_queue_push_back(queue, test_flow_cos_item(1111, 1500));
@@ -7832,6 +7859,7 @@ mod tests {
         );
         let queue = &mut root.queues[0];
         queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
 
         cos_queue_push_back(queue, test_flow_prepared_cos_item(1111, 1500, 64));
         cos_queue_push_back(queue, test_flow_prepared_cos_item(1111, 1500, 128));
@@ -7845,6 +7873,98 @@ mod tests {
         assert_eq!(order, vec![1111, 1112, 1111]);
         assert_eq!(queue.active_flow_buckets, 0);
         assert!(queue.flow_rr_buckets.is_empty());
+    }
+
+    #[test]
+    fn exact_cos_flow_bucket_is_stable_for_same_seed_and_flow() {
+        // Required property (#693): determinism inside one runtime instance.
+        // Enqueue/dequeue bucket accounting would break if the same flow key
+        // hashed to different buckets between push and pop. One random seed
+        // drawn from the OS, same 5-tuple in, same bucket out, every time.
+        let flow = test_session_key(9000, 5201);
+        let seed = cos_flow_hash_seed_from_os();
+        let first = cos_flow_bucket_index(seed, Some(&flow));
+        for _ in 0..4096 {
+            assert_eq!(first, cos_flow_bucket_index(seed, Some(&flow)));
+        }
+    }
+
+    #[test]
+    fn exact_cos_flow_bucket_diverges_across_seeds_for_same_flow() {
+        // Required property (#693): the bucket mapping is not an externally-
+        // probeable pure function of the 5-tuple. Two queues with different
+        // seeds must be able to send the same flow into different buckets.
+        // A deterministic hash would make this test a tautology that always
+        // fails, so we scan seeds until we find a divergence; with a 64-bucket
+        // output, collision rate is ~1/64 per seed pair, so 8192 attempts is
+        // well below any reasonable flake tolerance (collision probability
+        // ≈ (1/64)^8192 if the hash were uniform).
+        let flow = test_session_key(9000, 5201);
+        let reference = cos_flow_bucket_index(0, Some(&flow));
+        let mut saw_divergence = false;
+        for seed in 1u64..8192u64 {
+            if cos_flow_bucket_index(seed, Some(&flow)) != reference {
+                saw_divergence = true;
+                break;
+            }
+        }
+        assert!(
+            saw_divergence,
+            "hash must diverge across seeds; seed is not being mixed into the bucket function"
+        );
+    }
+
+    #[test]
+    fn exact_cos_flow_bucket_preserves_legacy_behavior_at_zero_seed() {
+        // Required property (#693): preserve existing behavior for queues
+        // with a zero seed. The pre-seed hash initialized `seed = protocol ^
+        // (addr_family << 8)`; the seeded hash initializes `seed = queue_seed
+        // ^ protocol ^ (addr_family << 8)`. At `queue_seed = 0` the two are
+        // byte-identical. Pin this so a future refactor that reorders the
+        // mix cannot silently change the bucket mapping under zero seed.
+        let flow_v4 = test_session_key(1111, 5201);
+        let mut flow_v6 = test_session_key(2222, 5201);
+        flow_v6.src_ip = IpAddr::V6("2001:db8::1".parse().unwrap());
+        flow_v6.dst_ip = IpAddr::V6("2001:db8::2".parse().unwrap());
+        flow_v6.addr_family = libc::AF_INET6 as u8;
+        let b_v4 = cos_flow_bucket_index(0, Some(&flow_v4));
+        let b_v6 = cos_flow_bucket_index(0, Some(&flow_v6));
+        // Hash-mix regression pins. If the seed=0 path ever gets new bits
+        // (a refactor that reorders the mix or adds a term) these
+        // assertions will fail and the change becomes an explicit decision
+        // rather than a silent flip. Update baselines only after live
+        // re-validation of 5201 fairness on the loss HA cluster.
+        assert_eq!(b_v4, 26);
+        assert_eq!(b_v6, 4);
+    }
+
+    #[test]
+    fn exact_cos_flow_bucket_handles_missing_flow_key() {
+        // An item without a flow_key (e.g. a non-TCP/UDP frame, or a
+        // pre-session packet) must still produce a valid bucket. Pick
+        // bucket 0 deterministically so these items share one SFQ lane
+        // rather than splaying across the ring and inflating
+        // active_flow_buckets.
+        assert_eq!(cos_flow_bucket_index(0, None), 0);
+        assert_eq!(cos_flow_bucket_index(0x1234_5678_9abc_def0, None), 0);
+    }
+
+    #[test]
+    fn cos_flow_hash_seed_from_os_draws_nonzero_entropy() {
+        // Best-effort: getrandom(2) is required by the xpfd runtime
+        // environment; the fallback path exists but should not fire in
+        // tests. Draw a few seeds and assert at least one is non-zero
+        // (a zero seed is possible, just astronomically unlikely for
+        // multiple draws — failing on all-zero catches the degenerate
+        // "seed is always 0" regression, not a cold-boot urandom case).
+        let mut any_nonzero = false;
+        for _ in 0..4 {
+            if cos_flow_hash_seed_from_os() != 0 {
+                any_nonzero = true;
+                break;
+            }
+        }
+        assert!(any_nonzero, "getrandom + fallback path both returned 0");
     }
 
     #[test]
@@ -8228,6 +8348,7 @@ mod tests {
             transmit_rate_bytes: 11_000_000_000 / 8,
             exact: true,
             flow_fair: false,
+            flow_hash_seed: 0,
             surplus_weight: 1,
             surplus_deficit: 0,
             buffer_bytes: COS_MIN_BURST_BYTES,
@@ -8262,6 +8383,7 @@ mod tests {
             transmit_rate_bytes: 11_000_000_000 / 8,
             exact: true,
             flow_fair: false,
+            flow_hash_seed: 0,
             surplus_weight: 1,
             surplus_deficit: 0,
             buffer_bytes: COS_MIN_BURST_BYTES,
@@ -8307,6 +8429,7 @@ mod tests {
             transmit_rate_bytes: 11_000_000_000 / 8,
             exact: true,
             flow_fair: false,
+            flow_hash_seed: 0,
             surplus_weight: 1,
             surplus_deficit: 0,
             buffer_bytes: COS_MIN_BURST_BYTES,
