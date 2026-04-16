@@ -1481,17 +1481,17 @@ const COS_SHARED_EXACT_MIN_RATE_BYTES: u64 = 2_500_000_000 / 8;
 /// Before PR #697 the threshold was `max(iface_rate / 4, MIN)`. That scaled
 /// the threshold up with iface rate, which is the wrong direction: the
 /// single-worker drain ceiling is an absolute property of the loop, not a
-/// fraction of the iface. On a 25g or 100g iface the `iface_rate / 4` term
-/// dominated and would classify a genuinely high-rate queue (e.g. a 10g
-/// exact queue on a 100g iface) as single-owner — routing it straight back
-/// into the PR #680 collapse shape. The `/ 4` term is now gone; the
-/// threshold is just the absolute per-worker ceiling.
+/// fraction of the iface. Once `iface_rate / 4` exceeded `MIN`, the policy
+/// would classify a genuinely high-rate queue (e.g. a 10g exact queue on a
+/// 100g iface) as single-owner — routing it straight back into the PR #680
+/// collapse shape. The `/ 4` term is now gone; the threshold is just the
+/// absolute per-worker ceiling.
 ///
-/// On the current 10g-iface lab the new threshold equals the old threshold
-/// (`max(2.5g, 2.5g) == 2.5g`), so 5201 / 5202 / 5203 classification is
-/// byte-identical. The change only affects lab configs running on faster
-/// interfaces, which is why #697 notes "live validation requires a >10g
-/// iface" before closing the loop.
+/// The old and new policies classify queues identically whenever
+/// `iface_rate / 4 <= COS_SHARED_EXACT_MIN_RATE_BYTES` (both evaluate to
+/// `MIN`). Behavior diverges only in the `iface_rate / 4 > MIN` regime,
+/// which is the regime that previously mis-classified mid/high-rate exact
+/// queues as single-owner.
 #[inline]
 fn queue_uses_shared_exact_service(_iface: &CoSInterfaceConfig, queue: &CoSQueueConfig) -> bool {
     if !queue.exact {
@@ -2053,6 +2053,101 @@ mod tests {
         assert!(queue5.shared_exact);
         assert_eq!(queue5.owner_worker_id, 7);
         assert!(queue5.shared_queue_lease.is_some());
+    }
+
+    #[test]
+    fn build_worker_cos_fast_interfaces_high_iface_rate_shards_mid_rate_exact_queue() {
+        // #697 regression: a mid-rate exact queue on a >10g iface must end
+        // up on the shared-worker path end-to-end. The helper predicate is
+        // tested directly elsewhere in this module, but the runtime effect
+        // of this PR lands in `build_worker_cos_fast_interfaces` and is
+        // later consumed by `ensure_cos_interface_runtime` to set
+        // `flow_fair` and by the dispatch path to pick shared vs owner-
+        // local service. Pin the assembled output for the new regime
+        // (`iface_rate / 4 > MIN`) so a future refactor of either the
+        // predicate or the assembly cannot quietly re-introduce the
+        // PR #680 collapse shape.
+        //
+        // Shape: 100g iface, 5g exact queue on queue_id=6. Under the
+        // pre-fix policy the threshold was 25g and a 5g exact queue would
+        // have assembled with `shared_exact=false` and `shared_queue_lease
+        // = None`. Under the fix the 5g queue crosses the 2.5g absolute
+        // floor and assembles as shared.
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 100_000_000_000 / 8,
+                burst_bytes: 1 * 1024 * 1024,
+                default_queue: 6,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![CoSQueueConfig {
+                    queue_id: 6,
+                    forwarding_class: "mid-rate".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 5_000_000_000 / 8,
+                    exact: true,
+                    surplus_weight: 1,
+                    buffer_bytes: 256 * 1024,
+                    dscp_rewrite: None,
+                }],
+            },
+        );
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 80,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".into(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+
+        let queue_owner_live = Arc::new(BindingLiveState::new());
+        let tx_owner_live = Arc::new(BindingLiveState::new());
+        let tx_owner_live_by_tx_ifindex = FastMap::from_iter([(12, tx_owner_live.clone())]);
+        let owner_worker_by_queue = BTreeMap::from([((80, 6), 5)]);
+        let owner_live_by_queue = BTreeMap::from([((80, 6), queue_owner_live.clone())]);
+        let shared_root_leases = BTreeMap::from([(
+            80,
+            Arc::new(SharedCoSRootLease::new(
+                100_000_000_000 / 8,
+                1 * 1024 * 1024,
+                4,
+            )),
+        )]);
+        let queue_lease = Arc::new(SharedCoSQueueLease::new(5_000_000_000 / 8, 256 * 1024, 4));
+        let shared_queue_leases = BTreeMap::from([((80, 6), queue_lease.clone())]);
+
+        let fast = build_worker_cos_fast_interfaces(
+            &forwarding,
+            3,
+            &tx_owner_live_by_tx_ifindex,
+            &owner_worker_by_queue,
+            &owner_live_by_queue,
+            &shared_root_leases,
+            &shared_queue_leases,
+        );
+
+        let iface = fast.get(&80).expect("fast cos interface");
+        let queue6 = iface.queue_fast_path(Some(6)).expect("queue 6");
+        assert!(
+            queue6.shared_exact,
+            "5g exact queue on 100g iface must be classified as shared after #697"
+        );
+        assert!(
+            queue6.shared_queue_lease.is_some(),
+            "shared queue lease must be wired up for a sharded exact queue"
+        );
+        assert_eq!(queue6.owner_worker_id, 5);
     }
 
     fn test_cos_iface_with_rate(shaping_bits: u64) -> CoSInterfaceConfig {
