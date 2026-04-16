@@ -655,6 +655,8 @@ fn redirect_local_cos_request_to_owner_binding(
     forwarding: &ForwardingState,
     req: TxRequest,
 ) -> Result<(), TxRequest> {
+    // Caller ordering matters: shared exact queues that already have a local TX
+    // path were filtered out in redirect_local_cos_request_to_owner().
     let tx_ifindex = resolve_tx_binding_ifindex(forwarding, req.egress_ifindex);
     let Some(owner_live) = owner_live_by_tx_ifindex.get(&tx_ifindex) else {
         return Err(req);
@@ -663,6 +665,17 @@ fn redirect_local_cos_request_to_owner_binding(
         return Err(req);
     }
     owner_live.enqueue_tx_owned(req)
+}
+
+#[inline]
+fn prepared_cos_request_stays_on_current_tx_binding(
+    binding_ifindex: i32,
+    tx_ifindex: i32,
+    forwarding: &ForwardingState,
+    req: &PreparedTxRequest,
+) -> bool {
+    binding_ifindex == tx_ifindex
+        && cos_queue_uses_shared_exact_execution(forwarding, req.egress_ifindex, req.cos_queue_id)
 }
 
 fn redirect_prepared_cos_request_to_owner(
@@ -734,6 +747,17 @@ fn redirect_prepared_cos_request_to_owner_binding(
     req: PreparedTxRequest,
 ) -> Result<(), PreparedTxRequest> {
     let tx_ifindex = resolve_tx_binding_ifindex(forwarding, req.egress_ifindex);
+    // Keep shared exact traffic on the current binding when it already sits on
+    // the resolved TX path; redirecting it sideways would force a copy back
+    // into local TX instead of preserving the prepared path.
+    if prepared_cos_request_stays_on_current_tx_binding(
+        binding.ifindex,
+        tx_ifindex,
+        forwarding,
+        &req,
+    ) {
+        return Err(req);
+    }
     let Some(owner_live) = binding.cos_owner_live_by_tx_ifindex.get(&tx_ifindex) else {
         return Err(req);
     };
@@ -3306,6 +3330,132 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued.front().map(|req| req.egress_ifindex), Some(80));
         assert!(current_live.take_pending_tx().is_empty());
+    }
+
+    #[test]
+    fn prepared_cos_request_stays_on_current_tx_binding_for_exact_queue() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 1_000_000,
+                burst_bytes: COS_MIN_BURST_BYTES,
+                default_queue: 5,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![CoSQueueConfig {
+                    queue_id: 5,
+                    forwarding_class: "iperf-b".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000,
+                    exact: true,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                }],
+            },
+        );
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 80,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".to_string(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+        let req = PreparedTxRequest {
+            offset: 64,
+            len: 1500,
+            recycle: PreparedTxRecycle::FreeTxFrame,
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET6 as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(5),
+            dscp_rewrite: None,
+        };
+
+        assert!(prepared_cos_request_stays_on_current_tx_binding(
+            12,
+            12,
+            &forwarding,
+            &req,
+        ));
+        assert!(!prepared_cos_request_stays_on_current_tx_binding(
+            13,
+            12,
+            &forwarding,
+            &req,
+        ));
+    }
+
+    #[test]
+    fn prepared_cos_request_stays_on_current_tx_binding_only_for_exact_queue() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 1_000_000,
+                burst_bytes: COS_MIN_BURST_BYTES,
+                default_queue: 5,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![CoSQueueConfig {
+                    queue_id: 5,
+                    forwarding_class: "iperf-b".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                }],
+            },
+        );
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 80,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".to_string(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+        let req = PreparedTxRequest {
+            offset: 64,
+            len: 1500,
+            recycle: PreparedTxRecycle::FreeTxFrame,
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET6 as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(5),
+            dscp_rewrite: None,
+        };
+
+        assert!(!prepared_cos_request_stays_on_current_tx_binding(
+            12,
+            12,
+            &forwarding,
+            &req,
+        ));
     }
 
     #[test]
