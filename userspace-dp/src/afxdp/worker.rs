@@ -1455,16 +1455,45 @@ where
     out
 }
 
+// Empirical per-worker sustained exact throughput ceiling in bytes/sec. A
+// single owner worker can reliably drive an exact queue up to about this rate
+// before the drain loop backs up and throughput collapses (the collapse case
+// motivated shared-worker execution in PR #680). Queues below this floor get
+// deterministic single-owner arbitration; queues at or above it get sharded
+// across eligible workers so one worker is not the bottleneck.
 const COS_SHARED_EXACT_MIN_RATE_BYTES: u64 = 2_500_000_000 / 8;
 
+/// Decide whether an exact queue runs under shared-worker execution.
+///
+/// Policy:
+/// - Non-exact queues are never shared (they run through the non-exact
+///   guarantee batch path regardless).
+/// - Exact queues below `shared_threshold` route to a single owner worker
+///   (one FIFO arbitration domain, SFQ inside). See issue #690 for why
+///   low-rate exact queues want one arbitration domain rather than N
+///   racing worker-local FIFOs.
+/// - Exact queues at or above `shared_threshold` run sharded across every
+///   eligible worker with shared root/queue leases, avoiding the single-
+///   worker throughput collapse from PR #680.
+///
+/// `shared_threshold = max(iface_rate / 4, COS_SHARED_EXACT_MIN_RATE_BYTES)`.
+/// The absolute `MIN` is a per-worker capacity ceiling and is the primary
+/// gate. The `iface_rate / 4` term is an iface-rate-relative floor intended
+/// to keep very-small queues single-owner on fast interfaces.
+///
+/// Known rough edge (#690 follow-on): at iface rates well above 10g the
+/// `/4` component dominates `MIN` and will classify a genuinely high-rate
+/// queue (e.g. 10g exact on a 100g iface) as single-owner, regressing to
+/// PR #680's throughput collapse shape. Current lab runs 10g interfaces
+/// where `/4 == MIN`, so this is latent; the test
+/// `queue_uses_shared_exact_service_high_iface_rate_keeps_large_queues_single_owner`
+/// pins the current behavior so a future fix is an explicit policy change
+/// rather than a silent drift.
 #[inline]
 fn queue_uses_shared_exact_service(iface: &CoSInterfaceConfig, queue: &CoSQueueConfig) -> bool {
     if !queue.exact {
         return false;
     }
-    // Low-rate exact queues care more about deterministic single-queue arbitration
-    // than shared-worker throughput. Only shard exact service once the queue rate is
-    // high enough that a single worker is no longer the clear fast path.
     let shared_threshold = iface
         .shaping_rate_bytes
         .saturating_div(4)
@@ -2024,6 +2053,123 @@ mod tests {
         assert!(queue5.shared_exact);
         assert_eq!(queue5.owner_worker_id, 7);
         assert!(queue5.shared_queue_lease.is_some());
+    }
+
+    fn test_cos_iface_with_rate(shaping_bits: u64) -> CoSInterfaceConfig {
+        CoSInterfaceConfig {
+            shaping_rate_bytes: shaping_bits / 8,
+            burst_bytes: 64 * 1024,
+            default_queue: 0,
+            dscp_classifier: String::new(),
+            ieee8021_classifier: String::new(),
+            dscp_queue_by_dscp: [u8::MAX; 64],
+            ieee8021_queue_by_pcp: [u8::MAX; 8],
+            queue_by_forwarding_class: FastMap::default(),
+            queues: Vec::new(),
+        }
+    }
+
+    fn test_exact_queue_at_rate(queue_id: u8, rate_bits: u64) -> CoSQueueConfig {
+        CoSQueueConfig {
+            queue_id,
+            forwarding_class: format!("q{queue_id}"),
+            priority: 5,
+            transmit_rate_bytes: rate_bits / 8,
+            exact: true,
+            surplus_weight: 1,
+            buffer_bytes: 64 * 1024,
+            dscp_rewrite: None,
+        }
+    }
+
+    #[test]
+    fn queue_uses_shared_exact_service_rejects_non_exact_queue() {
+        let iface = test_cos_iface_with_rate(10_000_000_000);
+        let mut q = test_exact_queue_at_rate(4, 10_000_000_000);
+        q.exact = false;
+        assert!(!queue_uses_shared_exact_service(&iface, &q));
+    }
+
+    #[test]
+    fn queue_uses_shared_exact_service_10g_iface_pins_5201_config_policy() {
+        // Mirrors the live loss HA CoS config:
+        //   reth0.80 shaper 10g
+        //   best-effort 100m exact  -> single owner
+        //   iperf-a     1.0g exact  -> single owner  (this is 5201)
+        //   iperf-b     10.0g exact -> shared
+        // Threshold on a 10g iface = max(10g/4, 2.5g) = 2.5g.
+        let iface = test_cos_iface_with_rate(10_000_000_000);
+        let be = test_exact_queue_at_rate(0, 100_000_000);
+        let iperf_a = test_exact_queue_at_rate(4, 1_000_000_000);
+        let iperf_b = test_exact_queue_at_rate(5, 10_000_000_000);
+        assert!(!queue_uses_shared_exact_service(&iface, &be));
+        assert!(!queue_uses_shared_exact_service(&iface, &iperf_a));
+        assert!(queue_uses_shared_exact_service(&iface, &iperf_b));
+    }
+
+    #[test]
+    fn queue_uses_shared_exact_service_10g_iface_threshold_is_exactly_inclusive() {
+        // Threshold = 2.5 Gbps = 312_500_000 bytes/s. Exactly at threshold
+        // selects the shared path; one byte below stays single-owner. The
+        // boundary must be deterministic — a fairness fix that accidentally
+        // flips classification for a queue at the stated threshold will
+        // silently regress 5201 or 5202.
+        let iface = test_cos_iface_with_rate(10_000_000_000);
+        let mut q = test_exact_queue_at_rate(4, 0);
+        q.transmit_rate_bytes = COS_SHARED_EXACT_MIN_RATE_BYTES - 1;
+        assert!(!queue_uses_shared_exact_service(&iface, &q));
+        q.transmit_rate_bytes = COS_SHARED_EXACT_MIN_RATE_BYTES;
+        assert!(queue_uses_shared_exact_service(&iface, &q));
+    }
+
+    #[test]
+    fn queue_uses_shared_exact_service_slow_iface_absolute_floor_applies() {
+        // 1g iface -> /4 = 250m; MIN = 2.5g dominates. Every exact queue
+        // on a 1g iface is at or below 1g, which is below the 2.5g floor,
+        // so all of them run single-owner. This documents the slow-iface
+        // case where the absolute MIN term is what matters.
+        let iface = test_cos_iface_with_rate(1_000_000_000);
+        let q_100m = test_exact_queue_at_rate(0, 100_000_000);
+        let q_1g = test_exact_queue_at_rate(4, 1_000_000_000);
+        assert!(!queue_uses_shared_exact_service(&iface, &q_100m));
+        assert!(!queue_uses_shared_exact_service(&iface, &q_1g));
+    }
+
+    #[test]
+    fn queue_uses_shared_exact_service_high_iface_rate_keeps_large_queues_single_owner() {
+        // KNOWN ROUGH EDGE (#690 follow-on). On a 100g iface the /4 term
+        // dominates: threshold = max(25g, 2.5g) = 25g. A 10g or 20g exact
+        // queue is classified as single-owner, even though a single worker
+        // cannot sustain 10g exact throughput (the collapse case from
+        // PR #680). The policy scales UP with iface rate, which is the
+        // wrong direction relative to per-worker capacity.
+        //
+        // This test asserts the CURRENT behavior on purpose so a future
+        // policy fix is an explicit decision rather than a silent flip.
+        // Do not change these assertions without a corresponding live
+        // validation on a >10g iface that the change does not regress
+        // 5202-class throughput.
+        let iface = test_cos_iface_with_rate(100_000_000_000);
+        let q_10g = test_exact_queue_at_rate(5, 10_000_000_000);
+        let q_20g = test_exact_queue_at_rate(6, 20_000_000_000);
+        let q_25g = test_exact_queue_at_rate(7, 25_000_000_000);
+        assert!(!queue_uses_shared_exact_service(&iface, &q_10g));
+        assert!(!queue_uses_shared_exact_service(&iface, &q_20g));
+        assert!(queue_uses_shared_exact_service(&iface, &q_25g));
+    }
+
+    #[test]
+    fn queue_uses_shared_exact_service_zero_iface_rate_falls_back_to_absolute_floor() {
+        // Bootstrap / pathological case: iface shaper is 0 (unconfigured).
+        // saturating_div(4) == 0, MIN dominates, behavior is the absolute
+        // 2.5g floor. Verifies there is no divide-by-zero or underflow path
+        // and that a brand-new iface at startup does not accidentally mark
+        // every exact queue as shared.
+        let iface = test_cos_iface_with_rate(0);
+        let q_2g = test_exact_queue_at_rate(4, 2_000_000_000);
+        let q_3g = test_exact_queue_at_rate(5, 3_000_000_000);
+        assert!(!queue_uses_shared_exact_service(&iface, &q_2g));
+        assert!(queue_uses_shared_exact_service(&iface, &q_3g));
     }
 
     #[test]
