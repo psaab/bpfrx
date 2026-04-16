@@ -13,8 +13,11 @@ fn cos_owner_live_for_request(
             .get(&egress_ifindex)
             .map(|iface| iface.default_queue)
     });
-    effective_queue_id
-        .and_then(|queue_id| cos_owner_live_by_queue.get(&(egress_ifindex, queue_id)).cloned())
+    effective_queue_id.and_then(|queue_id| {
+        cos_owner_live_by_queue
+            .get(&(egress_ifindex, queue_id))
+            .cloned()
+    })
 }
 
 fn request_uses_shared_exact_queue_lease(
@@ -30,9 +33,8 @@ fn request_uses_shared_exact_queue_lease(
             .get(&egress_ifindex)
             .map(|iface| iface.default_queue)
     });
-    effective_queue_id.is_some_and(|queue_id| {
-        cos_shared_queue_leases.contains_key(&(egress_ifindex, queue_id))
-    })
+    effective_queue_id
+        .is_some_and(|queue_id| cos_shared_queue_leases.contains_key(&(egress_ifindex, queue_id)))
 }
 
 fn enqueue_local_request_to_target_or_owner(
@@ -1642,7 +1644,10 @@ mod tests {
     fn shared_exact_queue_lease_uses_requested_queue_id() {
         let forwarding = ForwardingState::default();
         let mut shared_queue_leases = BTreeMap::new();
-        shared_queue_leases.insert((80, 5), Arc::new(SharedCoSQueueLease::new(1_250_000_000, 256 * 1024, 2)));
+        shared_queue_leases.insert(
+            (80, 5),
+            Arc::new(SharedCoSQueueLease::new(1_250_000_000, 256 * 1024, 2)),
+        );
 
         assert!(request_uses_shared_exact_queue_lease(
             &shared_queue_leases,
@@ -1676,7 +1681,10 @@ mod tests {
             },
         );
         let mut shared_queue_leases = BTreeMap::new();
-        shared_queue_leases.insert((80, 5), Arc::new(SharedCoSQueueLease::new(1_250_000_000, 256 * 1024, 2)));
+        shared_queue_leases.insert(
+            (80, 5),
+            Arc::new(SharedCoSQueueLease::new(1_250_000_000, 256 * 1024, 2)),
+        );
 
         assert!(request_uses_shared_exact_queue_lease(
             &shared_queue_leases,

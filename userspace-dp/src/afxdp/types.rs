@@ -770,8 +770,8 @@ fn compute_shared_cos_lease_config(
 ) -> SharedCoSLeaseConfig {
     let burst_bytes = burst_bytes.max(COS_ROOT_LEASE_MIN_BYTES);
     let active_shards = active_shards.max(1);
-    let target_lease_bytes = ((rate_bytes as u128) * (COS_ROOT_LEASE_TARGET_US as u128)
-        / 1_000_000u128) as u64;
+    let target_lease_bytes =
+        ((rate_bytes as u128) * (COS_ROOT_LEASE_TARGET_US as u128) / 1_000_000u128) as u64;
     let lease_ceiling = burst_bytes
         .saturating_div(8)
         .min(COS_ROOT_LEASE_MAX_BYTES)

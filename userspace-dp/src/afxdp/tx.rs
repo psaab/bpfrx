@@ -489,11 +489,8 @@ fn ingest_cos_pending_tx(
                 Ok(()) => continue,
                 Err(req) => req,
             };
-            let req = match redirect_prepared_cos_request_to_owner_binding(
-                binding,
-                forwarding,
-                req,
-            ) {
+            let req = match redirect_prepared_cos_request_to_owner_binding(binding, forwarding, req)
+            {
                 Ok(()) => continue,
                 Err(req) => req,
             };
@@ -1610,6 +1607,18 @@ pub(super) fn enqueue_local_into_cos(
             Err(req) => {
                 // Fall through to the local CoS path when no TX frame is
                 // available or the request cannot be materialized safely.
+                let area = binding.umem.area();
+                let slot = binding.slot;
+                if let Some(root) = binding.cos_interfaces.get_mut(&egress_ifindex) {
+                    let _ = demote_prepared_cos_queue_to_local(
+                        area,
+                        &mut binding.free_tx_frames,
+                        &mut binding.pending_fill_frames,
+                        slot,
+                        root,
+                        req.cos_queue_id,
+                    );
+                }
                 let req = req;
                 let item_len = req.bytes.len() as u64;
                 return match enqueue_cos_item(
@@ -1743,13 +1752,12 @@ fn clone_prepared_request_for_cos(area: &MmapArea, req: &PreparedTxRequest) -> O
     })
 }
 
-fn cos_queue_accepts_prepared(root: &CoSInterfaceRuntime, requested_queue: Option<u8>) -> bool {
+fn resolve_cos_queue_idx(root: &CoSInterfaceRuntime, requested_queue: Option<u8>) -> Option<usize> {
     if root.queues.is_empty() {
-        return false;
+        return None;
     }
     let target_queue = requested_queue.unwrap_or(root.default_queue);
-    let queue_idx = root
-        .queues
+    root.queues
         .iter()
         .position(|queue| queue.queue_id == target_queue)
         .or_else(|| {
@@ -1757,7 +1765,82 @@ fn cos_queue_accepts_prepared(root: &CoSInterfaceRuntime, requested_queue: Optio
                 .iter()
                 .position(|queue| queue.queue_id == root.default_queue)
         })
-        .unwrap_or(0);
+        .or(Some(0))
+}
+
+fn recycle_cancelled_prepared_offset(
+    free_tx_frames: &mut VecDeque<u64>,
+    pending_fill_frames: &mut VecDeque<u64>,
+    slot: u32,
+    recycle: PreparedTxRecycle,
+    offset: u64,
+) {
+    match recycle {
+        PreparedTxRecycle::FreeTxFrame => free_tx_frames.push_back(offset),
+        PreparedTxRecycle::FillOnSlot(fill_slot) if fill_slot == slot => {
+            pending_fill_frames.push_back(offset);
+        }
+        PreparedTxRecycle::FillOnSlot(_) => free_tx_frames.push_back(offset),
+    }
+}
+
+fn demote_prepared_cos_queue_to_local(
+    area: &MmapArea,
+    free_tx_frames: &mut VecDeque<u64>,
+    pending_fill_frames: &mut VecDeque<u64>,
+    slot: u32,
+    root: &mut CoSInterfaceRuntime,
+    requested_queue: Option<u8>,
+) -> bool {
+    let Some(queue_idx) = resolve_cos_queue_idx(root, requested_queue) else {
+        return false;
+    };
+    let Some(queue) = root.queues.get(queue_idx) else {
+        return false;
+    };
+    if !queue.exact || queue.items.is_empty() {
+        return false;
+    }
+    if queue
+        .items
+        .iter()
+        .any(|item| matches!(item, CoSPendingTxItem::Local(_)))
+    {
+        return false;
+    }
+
+    let mut local_items = VecDeque::with_capacity(queue.items.len());
+    let mut recycles = Vec::with_capacity(queue.items.len());
+    for item in queue.items.iter() {
+        let CoSPendingTxItem::Prepared(req) = item else {
+            return false;
+        };
+        let Some(local_req) = clone_prepared_request_for_cos(area, req) else {
+            return false;
+        };
+        local_items.push_back(CoSPendingTxItem::Local(local_req));
+        recycles.push((req.recycle, req.offset));
+    }
+
+    if let Some(queue) = root.queues.get_mut(queue_idx) {
+        queue.items = local_items;
+    }
+    for (recycle, offset) in recycles {
+        recycle_cancelled_prepared_offset(
+            free_tx_frames,
+            pending_fill_frames,
+            slot,
+            recycle,
+            offset,
+        );
+    }
+    true
+}
+
+fn cos_queue_accepts_prepared(root: &CoSInterfaceRuntime, requested_queue: Option<u8>) -> bool {
+    let Some(queue_idx) = resolve_cos_queue_idx(root, requested_queue) else {
+        return false;
+    };
     let Some(queue) = root.queues.get(queue_idx) else {
         return false;
     };
@@ -1987,7 +2070,10 @@ fn refresh_cos_interface_activity(binding: &mut BindingWorker, root_ifindex: i32
         release_cos_root_lease(binding, root_ifindex);
     }
     for (queue_id, released) in released_queue_leases {
-        if let Some(shared_queue_lease) = binding.cos_shared_queue_leases.get(&(root_ifindex, queue_id)) {
+        if let Some(shared_queue_lease) = binding
+            .cos_shared_queue_leases
+            .get(&(root_ifindex, queue_id))
+        {
             shared_queue_lease.release_unused(released);
         }
     }
@@ -2039,7 +2125,10 @@ pub(super) fn release_all_cos_queue_leases(binding: &mut BindingWorker) {
         if released == 0 {
             continue;
         }
-        if let Some(shared_queue_lease) = binding.cos_shared_queue_leases.get(&(root_ifindex, queue_id)) {
+        if let Some(shared_queue_lease) = binding
+            .cos_shared_queue_leases
+            .get(&(root_ifindex, queue_id))
+        {
             shared_queue_lease.release_unused(released);
         }
     }
@@ -2254,7 +2343,13 @@ fn recycle_completed_tx_offset(
 }
 
 pub(super) fn recycle_prepared_immediately(binding: &mut BindingWorker, req: &PreparedTxRequest) {
-    recycle_cancelled_prepared(binding, req);
+    recycle_cancelled_prepared_offset(
+        &mut binding.free_tx_frames,
+        &mut binding.pending_fill_frames,
+        binding.slot,
+        req.recycle,
+        req.offset,
+    );
 }
 
 fn remember_prepared_recycle(
@@ -3420,6 +3515,139 @@ mod tests {
             }));
 
         assert!(!cos_queue_accepts_prepared(&root, Some(5)));
+    }
+
+    #[test]
+    fn demote_prepared_cos_queue_to_local_recycles_frames_and_blocks_prepared_appends() {
+        let area = MmapArea::new(4096).expect("mmap");
+        unsafe { area.slice_mut_unchecked(64, 4) }
+            .expect("frame")
+            .copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        unsafe { area.slice_mut_unchecked(128, 4) }
+            .expect("frame")
+            .copy_from_slice(&[0xca, 0xfe, 0xba, 0xbe]);
+
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 64,
+                len: 4,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: Some((1111, 5202)),
+                expected_addr_family: libc::AF_INET6 as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 128,
+                len: 4,
+                recycle: PreparedTxRecycle::FillOnSlot(7),
+                expected_ports: Some((1112, 5202)),
+                expected_addr_family: libc::AF_INET6 as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+
+        let mut free_tx_frames = VecDeque::from([512]);
+        let mut pending_fill_frames = VecDeque::new();
+        assert!(demote_prepared_cos_queue_to_local(
+            &area,
+            &mut free_tx_frames,
+            &mut pending_fill_frames,
+            7,
+            &mut root,
+            Some(5),
+        ));
+
+        let items = root.queues[0]
+            .items
+            .iter()
+            .map(|item| match item {
+                CoSPendingTxItem::Local(req) => req.bytes.clone(),
+                CoSPendingTxItem::Prepared(_) => panic!("prepared item should be demoted"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items,
+            vec![vec![0xde, 0xad, 0xbe, 0xef], vec![0xca, 0xfe, 0xba, 0xbe]]
+        );
+        assert_eq!(free_tx_frames, VecDeque::from([512, 64]));
+        assert_eq!(pending_fill_frames, VecDeque::from([128]));
+        assert!(!cos_queue_accepts_prepared(&root, Some(5)));
+    }
+
+    #[test]
+    fn demote_prepared_cos_queue_to_local_skips_non_exact_queue() {
+        let area = MmapArea::new(4096).expect("mmap");
+        unsafe { area.slice_mut_unchecked(64, 4) }
+            .expect("frame")
+            .copy_from_slice(&[1, 2, 3, 4]);
+
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: false,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 64,
+                len: 4,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET6 as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+
+        let mut free_tx_frames = VecDeque::new();
+        let mut pending_fill_frames = VecDeque::new();
+        assert!(!demote_prepared_cos_queue_to_local(
+            &area,
+            &mut free_tx_frames,
+            &mut pending_fill_frames,
+            7,
+            &mut root,
+            Some(5),
+        ));
+        assert!(matches!(
+            root.queues[0].items.front(),
+            Some(CoSPendingTxItem::Prepared(_))
+        ));
+        assert!(free_tx_frames.is_empty());
+        assert!(pending_fill_frames.is_empty());
     }
 
     #[test]

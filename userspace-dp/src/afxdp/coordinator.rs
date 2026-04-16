@@ -19,8 +19,7 @@ pub struct Coordinator {
     pub(crate) shared_cos_owner_live_by_queue:
         Arc<ArcSwap<BTreeMap<(i32, u8), Arc<BindingLiveState>>>>,
     pub(crate) shared_cos_root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
-    pub(crate) shared_cos_queue_leases:
-        Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>>>,
+    pub(crate) shared_cos_queue_leases: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>>>,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
     pub(crate) dynamic_neighbors: Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
     pub(crate) neighbor_generation: Arc<AtomicU64>,
@@ -244,7 +243,8 @@ impl Coordinator {
         self.shared_cos_owner_live_by_queue
             .store(Arc::new(BTreeMap::new()));
         self.shared_cos_root_leases.store(Arc::new(BTreeMap::new()));
-        self.shared_cos_queue_leases.store(Arc::new(BTreeMap::new()));
+        self.shared_cos_queue_leases
+            .store(Arc::new(BTreeMap::new()));
         self.last_slow_path_status = self
             .slow_path
             .as_ref()
@@ -1195,7 +1195,8 @@ impl Coordinator {
             self.shared_cos_root_leases.store(Arc::new(next_leases));
         }
         if !shared_cos_queue_leases_match(current_queue_leases.as_ref(), &next_queue_leases) {
-            self.shared_cos_queue_leases.store(Arc::new(next_queue_leases));
+            self.shared_cos_queue_leases
+                .store(Arc::new(next_queue_leases));
         }
     }
 
