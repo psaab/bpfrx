@@ -1458,10 +1458,11 @@ where
 // Empirical per-worker sustained exact throughput ceiling in bytes/sec. A
 // single owner worker can reliably drive an exact queue up to about this rate
 // before the drain loop backs up and throughput collapses (the collapse case
-// motivated shared-worker execution in PR #680). This constant is the
-// absolute floor component of the shared-exact threshold:
-// `shared_threshold = max(iface_rate / 4, COS_SHARED_EXACT_MIN_RATE_BYTES)`.
-// Exact queues are sharded only once they reach that computed threshold.
+// that motivated shared-worker execution in PR #680). This is the sole
+// shared-exact threshold: a queue at or above this rate shards across every
+// eligible worker; a queue below it runs under a single owner. The ceiling
+// is a property of the drain loop and the TX ring, not a function of the
+// interface shaper — it does not scale with iface rate.
 const COS_SHARED_EXACT_MIN_RATE_BYTES: u64 = 2_500_000_000 / 8;
 
 /// Decide whether an exact queue runs under shared-worker execution.
@@ -1469,38 +1470,34 @@ const COS_SHARED_EXACT_MIN_RATE_BYTES: u64 = 2_500_000_000 / 8;
 /// Policy:
 /// - Non-exact queues are never shared (they run through the non-exact
 ///   guarantee batch path regardless).
-/// - Exact queues below `shared_threshold` route to a single owner worker
-///   (one FIFO arbitration domain, SFQ inside). See issue #690 for why
-///   low-rate exact queues want one arbitration domain rather than N
-///   racing worker-local FIFOs.
-/// - Exact queues at or above `shared_threshold` run sharded across every
+/// - Exact queues below `COS_SHARED_EXACT_MIN_RATE_BYTES` route to a single
+///   owner worker (one FIFO arbitration domain, SFQ inside). See issue
+///   #690 for why low-rate exact queues want one arbitration domain rather
+///   than N racing worker-local FIFOs.
+/// - Exact queues at or above the threshold run sharded across every
 ///   eligible worker with shared root/queue leases, avoiding the single-
 ///   worker throughput collapse from PR #680.
 ///
-/// `shared_threshold = max(iface_rate / 4, COS_SHARED_EXACT_MIN_RATE_BYTES)`.
-/// `COS_SHARED_EXACT_MIN_RATE_BYTES` provides an absolute floor, while
-/// `iface_rate / 4` is the iface-rate-relative term and becomes the
-/// effective gate on faster interfaces, keeping very-small queues
-/// single-owner there.
+/// Before PR #697 the threshold was `max(iface_rate / 4, MIN)`. That scaled
+/// the threshold up with iface rate, which is the wrong direction: the
+/// single-worker drain ceiling is an absolute property of the loop, not a
+/// fraction of the iface. On a 25g or 100g iface the `iface_rate / 4` term
+/// dominated and would classify a genuinely high-rate queue (e.g. a 10g
+/// exact queue on a 100g iface) as single-owner — routing it straight back
+/// into the PR #680 collapse shape. The `/ 4` term is now gone; the
+/// threshold is just the absolute per-worker ceiling.
 ///
-/// Known rough edge (#690 follow-on): at iface rates well above 10g the
-/// `/4` component dominates `MIN` and will classify a genuinely high-rate
-/// queue (e.g. 10g exact on a 100g iface) as single-owner, regressing to
-/// PR #680's throughput collapse shape. Current lab runs 10g interfaces
-/// where `/4 == MIN`, so this is latent; the test
-/// `queue_uses_shared_exact_service_high_iface_rate_keeps_large_queues_single_owner`
-/// pins the current behavior so a future fix is an explicit policy change
-/// rather than a silent drift.
+/// On the current 10g-iface lab the new threshold equals the old threshold
+/// (`max(2.5g, 2.5g) == 2.5g`), so 5201 / 5202 / 5203 classification is
+/// byte-identical. The change only affects lab configs running on faster
+/// interfaces, which is why #697 notes "live validation requires a >10g
+/// iface" before closing the loop.
 #[inline]
-fn queue_uses_shared_exact_service(iface: &CoSInterfaceConfig, queue: &CoSQueueConfig) -> bool {
+fn queue_uses_shared_exact_service(_iface: &CoSInterfaceConfig, queue: &CoSQueueConfig) -> bool {
     if !queue.exact {
         return false;
     }
-    let shared_threshold = iface
-        .shaping_rate_bytes
-        .saturating_div(4)
-        .max(COS_SHARED_EXACT_MIN_RATE_BYTES);
-    queue.transmit_rate_bytes >= shared_threshold
+    queue.transmit_rate_bytes >= COS_SHARED_EXACT_MIN_RATE_BYTES
 }
 
 fn build_worker_cos_fast_interfaces(
@@ -2100,7 +2097,7 @@ mod tests {
         //   best-effort 100m exact  -> single owner
         //   iperf-a     1.0g exact  -> single owner  (this is 5201)
         //   iperf-b     10.0g exact -> shared
-        // Threshold on a 10g iface = max(10g/4, 2.5g) = 2.5g.
+        // Threshold is the absolute per-worker ceiling (2.5g) on any iface.
         let iface = test_cos_iface_with_rate(10_000_000_000);
         let be = test_exact_queue_at_rate(0, 100_000_000);
         let iperf_a = test_exact_queue_at_rate(4, 1_000_000_000);
@@ -2111,26 +2108,36 @@ mod tests {
     }
 
     #[test]
-    fn queue_uses_shared_exact_service_10g_iface_threshold_is_exactly_inclusive() {
-        // Threshold = 2.5 Gbps = 312_500_000 bytes/s. Exactly at threshold
-        // selects the shared path; one byte below stays single-owner. The
-        // boundary must be deterministic — a fairness fix that accidentally
-        // flips classification for a queue at the stated threshold will
-        // silently regress 5201 or 5202.
-        let iface = test_cos_iface_with_rate(10_000_000_000);
-        let mut q = test_exact_queue_at_rate(4, 0);
-        q.transmit_rate_bytes = COS_SHARED_EXACT_MIN_RATE_BYTES - 1;
-        assert!(!queue_uses_shared_exact_service(&iface, &q));
-        q.transmit_rate_bytes = COS_SHARED_EXACT_MIN_RATE_BYTES;
-        assert!(queue_uses_shared_exact_service(&iface, &q));
+    fn queue_uses_shared_exact_service_threshold_is_exactly_inclusive() {
+        // Threshold = COS_SHARED_EXACT_MIN_RATE_BYTES (2.5 Gbps =
+        // 312_500_000 bytes/s). Exactly at threshold selects the shared
+        // path; one byte below stays single-owner. The boundary must be
+        // deterministic — a fairness fix that accidentally flips
+        // classification for a queue at the stated threshold will silently
+        // regress 5201 or 5202. Pinned across a slow and a fast iface so
+        // the boundary cannot re-gain an iface-dependent term without
+        // being caught.
+        for iface_bits in [1_000_000_000u64, 10_000_000_000, 100_000_000_000] {
+            let iface = test_cos_iface_with_rate(iface_bits);
+            let mut q = test_exact_queue_at_rate(4, 0);
+            q.transmit_rate_bytes = COS_SHARED_EXACT_MIN_RATE_BYTES - 1;
+            assert!(
+                !queue_uses_shared_exact_service(&iface, &q),
+                "iface {iface_bits}: one byte below threshold must stay single-owner"
+            );
+            q.transmit_rate_bytes = COS_SHARED_EXACT_MIN_RATE_BYTES;
+            assert!(
+                queue_uses_shared_exact_service(&iface, &q),
+                "iface {iface_bits}: at threshold must be shared"
+            );
+        }
     }
 
     #[test]
-    fn queue_uses_shared_exact_service_slow_iface_absolute_floor_applies() {
-        // 1g iface -> /4 = 250m; MIN = 2.5g dominates. Every exact queue
-        // on a 1g iface is at or below 1g, which is below the 2.5g floor,
-        // so all of them run single-owner. This documents the slow-iface
-        // case where the absolute MIN term is what matters.
+    fn queue_uses_shared_exact_service_slow_iface_below_threshold_is_single_owner() {
+        // 1g iface, every exact queue is below the 2.5g ceiling → single
+        // owner. Documents that the predicate does not depend on the
+        // queue/iface ratio, only on the queue's absolute rate.
         let iface = test_cos_iface_with_rate(1_000_000_000);
         let q_100m = test_exact_queue_at_rate(0, 100_000_000);
         let q_1g = test_exact_queue_at_rate(4, 1_000_000_000);
@@ -2139,31 +2146,12 @@ mod tests {
     }
 
     #[test]
-    fn queue_uses_shared_exact_service_iface_rate_gate_boundary_is_byte_precise() {
-        // On a 100g iface the iface_rate/4 term is the active gate
-        // (25 Gbps = 3_125_000_000 bytes/s, well above the 2.5 Gbps MIN).
-        // Pin the inclusive boundary on the iface_rate/4 axis specifically
-        // so a future policy change to that term is an explicit assertion
-        // edit, not a silent flip. The 10g-iface "exactly_inclusive" test
-        // cannot distinguish MIN from iface_rate/4 because they coincide
-        // at exactly 2.5 Gbps there.
-        let iface = test_cos_iface_with_rate(100_000_000_000);
-        let expected_threshold_bytes = iface.shaping_rate_bytes / 4;
-        assert!(expected_threshold_bytes > COS_SHARED_EXACT_MIN_RATE_BYTES);
-        let mut q = test_exact_queue_at_rate(4, 0);
-        q.transmit_rate_bytes = expected_threshold_bytes - 1;
-        assert!(!queue_uses_shared_exact_service(&iface, &q));
-        q.transmit_rate_bytes = expected_threshold_bytes;
-        assert!(queue_uses_shared_exact_service(&iface, &q));
-    }
-
-    #[test]
     fn queue_uses_shared_exact_service_zero_rate_exact_queue_is_single_owner() {
         // Config validation should normally reject a 0-rate exact queue,
         // but if one ever reaches the predicate (race during reload, test
         // fixture, malformed journal replay) the policy is "single owner":
         // a queue with no budget cannot justify burning a shared-lease
-        // slot, and the threshold is strictly positive on every iface.
+        // slot, and the threshold is strictly positive.
         let iface_10g = test_cos_iface_with_rate(10_000_000_000);
         let iface_100g = test_cos_iface_with_rate(100_000_000_000);
         let mut q = test_exact_queue_at_rate(4, 0);
@@ -2173,35 +2161,51 @@ mod tests {
     }
 
     #[test]
-    fn queue_uses_shared_exact_service_high_iface_rate_keeps_large_queues_single_owner() {
-        // KNOWN ROUGH EDGE (#690 follow-on). On a 100g iface the /4 term
-        // dominates: threshold = max(25g, 2.5g) = 25g. A 10g or 20g exact
-        // queue is classified as single-owner, even though a single worker
-        // cannot sustain 10g exact throughput (the collapse case from
-        // PR #680). The policy scales UP with iface rate, which is the
-        // wrong direction relative to per-worker capacity.
-        //
-        // This test asserts the CURRENT behavior on purpose so a future
-        // policy fix is an explicit decision rather than a silent flip.
-        // Do not change these assertions without a corresponding live
-        // validation on a >10g iface that the change does not regress
-        // 5202-class throughput.
-        let iface = test_cos_iface_with_rate(100_000_000_000);
+    fn queue_uses_shared_exact_service_threshold_does_not_scale_with_iface_rate() {
+        // #697: the pre-fix policy was `max(iface_rate / 4, MIN)` which
+        // scaled the threshold up with iface rate. A 10g exact queue on a
+        // 100g iface got classified as single-owner (threshold was 25g),
+        // routing a genuinely high-rate queue straight into PR #680's
+        // throughput-collapse shape. The fix removes the `/ 4` term; the
+        // threshold is now the absolute per-worker ceiling regardless of
+        // iface rate. Exercise that: a 10g exact queue must be shared on
+        // every realistic iface rate, not just on a 10g iface.
         let q_10g = test_exact_queue_at_rate(5, 10_000_000_000);
-        let q_20g = test_exact_queue_at_rate(6, 20_000_000_000);
-        let q_25g = test_exact_queue_at_rate(7, 25_000_000_000);
-        assert!(!queue_uses_shared_exact_service(&iface, &q_10g));
-        assert!(!queue_uses_shared_exact_service(&iface, &q_20g));
-        assert!(queue_uses_shared_exact_service(&iface, &q_25g));
+        for iface_bits in [10u64, 25, 40, 50, 100, 200, 400].map(|g| g * 1_000_000_000) {
+            let iface = test_cos_iface_with_rate(iface_bits);
+            assert!(
+                queue_uses_shared_exact_service(&iface, &q_10g),
+                "iface {iface_bits}: 10g exact queue must be shared — single-owner would \
+                 reintroduce the PR #680 throughput collapse"
+            );
+        }
     }
 
     #[test]
-    fn queue_uses_shared_exact_service_zero_iface_rate_falls_back_to_absolute_floor() {
+    fn queue_uses_shared_exact_service_high_iface_rate_shards_mid_rate_queues() {
+        // Same shape as the scale-invariance test but pinned byte-precise
+        // at the threshold for a specific fast iface. On a 100g iface a
+        // 2.5g exact queue must shard (it crosses the per-worker ceiling),
+        // and a 2.5g-minus-one-byte queue must not. Under the pre-fix
+        // policy this iface had threshold 25g and both of these would have
+        // been single-owner.
+        let iface = test_cos_iface_with_rate(100_000_000_000);
+        let mut q = test_exact_queue_at_rate(4, 0);
+        q.transmit_rate_bytes = COS_SHARED_EXACT_MIN_RATE_BYTES - 1;
+        assert!(!queue_uses_shared_exact_service(&iface, &q));
+        q.transmit_rate_bytes = COS_SHARED_EXACT_MIN_RATE_BYTES;
+        assert!(queue_uses_shared_exact_service(&iface, &q));
+        q.transmit_rate_bytes = 5_000_000_000 / 8; // 5 Gbps
+        assert!(queue_uses_shared_exact_service(&iface, &q));
+    }
+
+    #[test]
+    fn queue_uses_shared_exact_service_zero_iface_rate_uses_absolute_threshold() {
         // Bootstrap / pathological case: iface shaper is 0 (unconfigured).
-        // saturating_div(4) == 0, MIN dominates, behavior is the absolute
-        // 2.5g floor. Verifies there is no divide-by-zero or underflow path
-        // and that a brand-new iface at startup does not accidentally mark
-        // every exact queue as shared.
+        // Predicate is iface-rate-independent, so this is just the absolute
+        // threshold applied to the queue rate. Verifies there is no
+        // divide-by-zero or underflow on any code path the previous
+        // `saturating_div(4)` branch used to guard.
         let iface = test_cos_iface_with_rate(0);
         let q_2g = test_exact_queue_at_rate(4, 2_000_000_000);
         let q_3g = test_exact_queue_at_rate(5, 3_000_000_000);
