@@ -489,8 +489,11 @@ fn ingest_cos_pending_tx(
                 Ok(()) => continue,
                 Err(req) => req,
             };
-            let req = match redirect_prepared_cos_request_to_owner_binding(binding, forwarding, req)
-            {
+            let req = match redirect_prepared_cos_request_to_owner_binding(
+                binding,
+                forwarding,
+                req,
+            ) {
                 Ok(()) => continue,
                 Err(req) => req,
             };
@@ -1563,57 +1566,79 @@ pub(super) fn enqueue_local_into_cos(
     if !ensure_cos_interface_runtime(binding, forwarding, egress_ifindex, now_ns) {
         return Err(req);
     }
-    match prepare_local_request_for_cos(binding.umem.area(), &mut binding.free_tx_frames, req) {
-        Ok(prepared_req) => {
-            let item_len = prepared_req.len as u64;
-            match enqueue_cos_item(
-                binding,
-                egress_ifindex,
-                prepared_req.cos_queue_id,
-                item_len,
-                CoSPendingTxItem::Prepared(prepared_req),
-            ) {
-                Ok(()) => Ok(()),
-                Err(CoSPendingTxItem::Prepared(prepared_req)) => {
-                    let req = clone_prepared_request_for_cos(binding.umem.area(), &prepared_req)
-                        .expect("prepared CoS fallback clone");
-                    recycle_prepared_immediately(binding, &prepared_req);
-                    let item_len = req.bytes.len() as u64;
-                    match enqueue_cos_item(
-                        binding,
-                        egress_ifindex,
-                        req.cos_queue_id,
-                        item_len,
-                        CoSPendingTxItem::Local(req),
-                    ) {
-                        Ok(()) => Ok(()),
-                        Err(CoSPendingTxItem::Local(req)) => Err(req),
-                        Err(CoSPendingTxItem::Prepared(_)) => {
-                            unreachable!("local request returned prepared item")
-                        }
+    if binding
+        .cos_interfaces
+        .get(&egress_ifindex)
+        .is_some_and(|root| cos_queue_accepts_prepared(root, req.cos_queue_id))
+    {
+        match prepare_local_request_for_cos(binding.umem.area(), &mut binding.free_tx_frames, req) {
+            Ok(prepared_req) => {
+                let item_len = prepared_req.len as u64;
+                match enqueue_cos_item(
+                    binding,
+                    egress_ifindex,
+                    prepared_req.cos_queue_id,
+                    item_len,
+                    CoSPendingTxItem::Prepared(prepared_req),
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(CoSPendingTxItem::Prepared(prepared_req)) => {
+                        let req =
+                            clone_prepared_request_for_cos(binding.umem.area(), &prepared_req)
+                                .expect("prepared CoS fallback clone");
+                        recycle_prepared_immediately(binding, &prepared_req);
+                        let item_len = req.bytes.len() as u64;
+                        return match enqueue_cos_item(
+                            binding,
+                            egress_ifindex,
+                            req.cos_queue_id,
+                            item_len,
+                            CoSPendingTxItem::Local(req),
+                        ) {
+                            Ok(()) => Ok(()),
+                            Err(CoSPendingTxItem::Local(req)) => Err(req),
+                            Err(CoSPendingTxItem::Prepared(_)) => {
+                                unreachable!("local request returned prepared item")
+                            }
+                        };
+                    }
+                    Err(CoSPendingTxItem::Local(_)) => {
+                        unreachable!("local request prepared into prepared item")
                     }
                 }
-                Err(CoSPendingTxItem::Local(_)) => {
-                    unreachable!("local request prepared into prepared item")
-                }
+            }
+            Err(req) => {
+                // Fall through to the local CoS path when no TX frame is
+                // available or the request cannot be materialized safely.
+                let req = req;
+                let item_len = req.bytes.len() as u64;
+                return match enqueue_cos_item(
+                    binding,
+                    egress_ifindex,
+                    req.cos_queue_id,
+                    item_len,
+                    CoSPendingTxItem::Local(req),
+                ) {
+                    Ok(()) => Ok(()),
+                    Err(CoSPendingTxItem::Local(req)) => Err(req),
+                    Err(CoSPendingTxItem::Prepared(_)) => {
+                        unreachable!("local request returned prepared item")
+                    }
+                };
             }
         }
-        Err(req) => {
-            let item_len = req.bytes.len() as u64;
-            match enqueue_cos_item(
-                binding,
-                egress_ifindex,
-                req.cos_queue_id,
-                item_len,
-                CoSPendingTxItem::Local(req),
-            ) {
-                Ok(()) => Ok(()),
-                Err(CoSPendingTxItem::Local(req)) => Err(req),
-                Err(CoSPendingTxItem::Prepared(_)) => {
-                    unreachable!("local request returned prepared item")
-                }
-            }
-        }
+    }
+    let item_len = req.bytes.len() as u64;
+    match enqueue_cos_item(
+        binding,
+        egress_ifindex,
+        req.cos_queue_id,
+        item_len,
+        CoSPendingTxItem::Local(req),
+    ) {
+        Ok(()) => Ok(()),
+        Err(CoSPendingTxItem::Local(req)) => Err(req),
+        Err(CoSPendingTxItem::Prepared(_)) => unreachable!("local request returned prepared item"),
     }
 }
 
@@ -1658,17 +1683,49 @@ fn enqueue_prepared_into_cos(
     if !ensure_cos_interface_runtime(binding, forwarding, egress_ifindex, now_ns) {
         return Err(req);
     }
-    let item_len = req.len as u64;
+    if binding
+        .cos_interfaces
+        .get(&egress_ifindex)
+        .is_some_and(|root| cos_queue_accepts_prepared(root, req.cos_queue_id))
+    {
+        let item_len = req.len as u64;
+        match enqueue_cos_item(
+            binding,
+            egress_ifindex,
+            req.cos_queue_id,
+            item_len,
+            CoSPendingTxItem::Prepared(req),
+        ) {
+            Ok(()) => return Ok(()),
+            Err(CoSPendingTxItem::Prepared(req)) => return Err(req),
+            Err(CoSPendingTxItem::Local(_)) => unreachable!("prepared request returned local item"),
+        }
+    }
+
+    let Some(local_req) = clone_prepared_request_for_cos(binding.umem.area(), &req) else {
+        return Err(req);
+    };
+    // Keep prepared/direct frames in CoS while a queue stays prepared-only.
+    // Once any copied local item enters that queue, later prepared frames must
+    // fall back to local copies until the queue drains empty again; otherwise a
+    // local head item can block behind prepared frames that are holding every
+    // free TX frame on the owner binding.
+    let item_len = local_req.bytes.len() as u64;
     match enqueue_cos_item(
         binding,
         egress_ifindex,
-        req.cos_queue_id,
+        local_req.cos_queue_id,
         item_len,
-        CoSPendingTxItem::Prepared(req),
+        CoSPendingTxItem::Local(local_req),
     ) {
-        Ok(()) => Ok(()),
-        Err(CoSPendingTxItem::Prepared(req)) => Err(req),
-        Err(CoSPendingTxItem::Local(_)) => unreachable!("prepared request returned local item"),
+        Ok(()) => {
+            recycle_prepared_immediately(binding, &req);
+            Ok(())
+        }
+        Err(CoSPendingTxItem::Local(_)) => Err(req),
+        Err(CoSPendingTxItem::Prepared(_)) => {
+            unreachable!("prepared queueing converted to local request")
+        }
     }
 }
 
@@ -1684,6 +1741,30 @@ fn clone_prepared_request_for_cos(area: &MmapArea, req: &PreparedTxRequest) -> O
         cos_queue_id: req.cos_queue_id,
         dscp_rewrite: req.dscp_rewrite,
     })
+}
+
+fn cos_queue_accepts_prepared(root: &CoSInterfaceRuntime, requested_queue: Option<u8>) -> bool {
+    if root.queues.is_empty() {
+        return false;
+    }
+    let target_queue = requested_queue.unwrap_or(root.default_queue);
+    let queue_idx = root
+        .queues
+        .iter()
+        .position(|queue| queue.queue_id == target_queue)
+        .or_else(|| {
+            root.queues
+                .iter()
+                .position(|queue| queue.queue_id == root.default_queue)
+        })
+        .unwrap_or(0);
+    let Some(queue) = root.queues.get(queue_idx) else {
+        return false;
+    };
+    !queue
+        .items
+        .iter()
+        .any(|item| matches!(item, CoSPendingTxItem::Local(_)))
 }
 
 fn ensure_cos_interface_runtime(
@@ -1906,10 +1987,7 @@ fn refresh_cos_interface_activity(binding: &mut BindingWorker, root_ifindex: i32
         release_cos_root_lease(binding, root_ifindex);
     }
     for (queue_id, released) in released_queue_leases {
-        if let Some(shared_queue_lease) = binding
-            .cos_shared_queue_leases
-            .get(&(root_ifindex, queue_id))
-        {
+        if let Some(shared_queue_lease) = binding.cos_shared_queue_leases.get(&(root_ifindex, queue_id)) {
             shared_queue_lease.release_unused(released);
         }
     }
@@ -1961,10 +2039,7 @@ pub(super) fn release_all_cos_queue_leases(binding: &mut BindingWorker) {
         if released == 0 {
             continue;
         }
-        if let Some(shared_queue_lease) = binding
-            .cos_shared_queue_leases
-            .get(&(root_ifindex, queue_id))
-        {
+        if let Some(shared_queue_lease) = binding.cos_shared_queue_leases.get(&(root_ifindex, queue_id)) {
             shared_queue_lease.release_unused(released);
         }
     }
@@ -3270,7 +3345,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_cos_queue_preserves_prepared_batches_after_local_fallback() {
+    fn cos_queue_accepts_prepared_when_queue_is_prepared_only() {
         let mut root = test_cos_runtime_with_queues(
             10_000_000_000 / 8,
             vec![CoSQueueConfig {
@@ -3284,8 +3359,7 @@ mod tests {
                 dscp_rewrite: None,
             }],
         );
-        let queue = &mut root.queues[0];
-        queue
+        root.queues[0]
             .items
             .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
                 offset: 64,
@@ -3299,20 +3373,29 @@ mod tests {
                 cos_queue_id: Some(5),
                 dscp_rewrite: None,
             }));
-        queue.items.push_back(CoSPendingTxItem::Local(TxRequest {
-            bytes: vec![0; 1500],
-            expected_ports: None,
-            expected_addr_family: libc::AF_INET6 as u8,
-            expected_protocol: PROTO_TCP,
-            flow_key: None,
-            egress_ifindex: 80,
-            cos_queue_id: Some(5),
-            dscp_rewrite: None,
-        }));
-        queue
+
+        assert!(cos_queue_accepts_prepared(&root, Some(5)));
+    }
+
+    #[test]
+    fn cos_queue_rejects_prepared_once_local_items_enter_queue() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.queues[0]
             .items
             .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
-                offset: 128,
+                offset: 64,
                 len: 1500,
                 recycle: PreparedTxRecycle::FreeTxFrame,
                 expected_ports: None,
@@ -3323,29 +3406,20 @@ mod tests {
                 cos_queue_id: Some(5),
                 dscp_rewrite: None,
             }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![0; 1500],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET6 as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
 
-        let first =
-            build_cos_batch_from_queue(queue, 0, 64 * 1024, 64 * 1024, CoSServicePhase::Guarantee)
-                .expect("first queue batch");
-        let second =
-            build_cos_batch_from_queue(queue, 0, 64 * 1024, 64 * 1024, CoSServicePhase::Guarantee)
-                .expect("second queue batch");
-        let third =
-            build_cos_batch_from_queue(queue, 0, 64 * 1024, 64 * 1024, CoSServicePhase::Guarantee)
-                .expect("third queue batch");
-
-        match first {
-            CoSBatch::Prepared { items, .. } => assert_eq!(items.len(), 1),
-            CoSBatch::Local { .. } => panic!("first batch should stay prepared"),
-        }
-        match second {
-            CoSBatch::Local { items, .. } => assert_eq!(items.len(), 1),
-            CoSBatch::Prepared { .. } => panic!("second batch should drain the local fallback"),
-        }
-        match third {
-            CoSBatch::Prepared { items, .. } => assert_eq!(items.len(), 1),
-            CoSBatch::Local { .. } => panic!("third batch should return to prepared"),
-        }
+        assert!(!cos_queue_accepts_prepared(&root, Some(5)));
     }
 
     #[test]
