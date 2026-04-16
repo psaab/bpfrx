@@ -292,11 +292,13 @@ enum CoSBatch {
     Local {
         queue_idx: usize,
         phase: CoSServicePhase,
+        batch_bytes: u64,
         items: VecDeque<TxRequest>,
     },
     Prepared {
         queue_idx: usize,
         phase: CoSServicePhase,
+        batch_bytes: u64,
         items: VecDeque<PreparedTxRequest>,
     },
 }
@@ -474,41 +476,40 @@ fn ingest_cos_pending_tx(
     }
 
     if !binding.pending_tx_prepared.is_empty() {
-        let mut kept = VecDeque::with_capacity(binding.pending_tx_prepared.len());
-        while let Some(req) = binding.pending_tx_prepared.pop_front() {
+        let mut pending = core::mem::take(&mut binding.pending_tx_prepared);
+        process_pending_queue_in_place(&mut pending, |req| {
             let req = match redirect_prepared_cos_request_to_owner(
                 binding,
                 req,
                 worker_id,
                 worker_commands_by_id,
             ) {
-                Ok(()) => continue,
+                Ok(()) => return Ok(()),
                 Err(req) => req,
             };
             let req = match redirect_prepared_cos_request_to_owner_binding(binding, req) {
-                Ok(()) => continue,
+                Ok(()) => return Ok(()),
                 Err(req) => req,
             };
             match enqueue_prepared_into_cos(binding, forwarding, req, now_ns) {
-                Ok(()) => {}
-                Err(req) => kept.push_back(req),
+                Ok(()) => Ok(()),
+                Err(req) => Err(req),
             }
-        }
-        binding.pending_tx_prepared = kept;
+        });
+        binding.pending_tx_prepared = pending;
     }
 
-    let local = core::mem::take(&mut binding.pending_tx_local);
-    let shared = binding.live.take_pending_tx();
-    let mut pending = merge_pending_tx_requests(local, shared);
-    let mut kept = VecDeque::with_capacity(pending.len());
-    while let Some(req) = pending.pop_front() {
+    let mut pending = core::mem::take(&mut binding.pending_tx_local);
+    let mut shared = binding.live.take_pending_tx();
+    append_pending_queue(&mut pending, &mut shared);
+    process_pending_queue_in_place(&mut pending, |req| {
         let req = match redirect_local_cos_request_to_owner(
             &binding.cos_fast_interfaces,
             req,
             worker_id,
             worker_commands_by_id,
         ) {
-            Ok(()) => continue,
+            Ok(()) => return Ok(()),
             Err(req) => req,
         };
         let req = match redirect_local_cos_request_to_owner_binding(
@@ -516,15 +517,15 @@ fn ingest_cos_pending_tx(
             &binding.cos_fast_interfaces,
             req,
         ) {
-            Ok(()) => continue,
+            Ok(()) => return Ok(()),
             Err(req) => req,
         };
         match enqueue_local_into_cos(binding, forwarding, req, now_ns) {
-            Ok(()) => {}
-            Err(req) => kept.push_back(req),
+            Ok(()) => Ok(()),
+            Err(req) => Err(req),
         }
-    }
-    binding.pending_tx_local = kept;
+    });
+    binding.pending_tx_local = pending;
     bound_pending_tx_local(binding);
 }
 
@@ -915,6 +916,7 @@ fn build_cos_batch_from_queue(
             let mut items = VecDeque::new();
             let mut remaining_root = root_budget;
             let mut remaining_secondary = secondary_budget;
+            let mut batch_bytes = 0u64;
             while items.len() < TX_BATCH_SIZE {
                 let Some(front) = queue.items.front() else {
                     break;
@@ -929,7 +931,10 @@ fn build_cos_batch_from_queue(
                 remaining_root = remaining_root.saturating_sub(len);
                 remaining_secondary = remaining_secondary.saturating_sub(len);
                 match queue.items.pop_front() {
-                    Some(CoSPendingTxItem::Local(req)) => items.push_back(req),
+                    Some(CoSPendingTxItem::Local(req)) => {
+                        batch_bytes = batch_bytes.saturating_add(len);
+                        items.push_back(req);
+                    }
                     Some(other) => {
                         queue.items.push_front(other);
                         break;
@@ -943,6 +948,7 @@ fn build_cos_batch_from_queue(
                 Some(CoSBatch::Local {
                     queue_idx,
                     phase,
+                    batch_bytes,
                     items,
                 })
             }
@@ -951,6 +957,7 @@ fn build_cos_batch_from_queue(
             let mut items = VecDeque::new();
             let mut remaining_root = root_budget;
             let mut remaining_secondary = secondary_budget;
+            let mut batch_bytes = 0u64;
             while items.len() < TX_BATCH_SIZE {
                 let Some(front) = queue.items.front() else {
                     break;
@@ -965,7 +972,10 @@ fn build_cos_batch_from_queue(
                 remaining_root = remaining_root.saturating_sub(len);
                 remaining_secondary = remaining_secondary.saturating_sub(len);
                 match queue.items.pop_front() {
-                    Some(CoSPendingTxItem::Prepared(req)) => items.push_back(req),
+                    Some(CoSPendingTxItem::Prepared(req)) => {
+                        batch_bytes = batch_bytes.saturating_add(len);
+                        items.push_back(req);
+                    }
                     Some(other) => {
                         queue.items.push_front(other);
                         break;
@@ -979,6 +989,7 @@ fn build_cos_batch_from_queue(
                 Some(CoSBatch::Prepared {
                     queue_idx,
                     phase,
+                    batch_bytes,
                     items,
                 })
             }
@@ -997,6 +1008,7 @@ fn submit_cos_batch(
         CoSBatch::Local {
             queue_idx,
             phase,
+            batch_bytes,
             mut items,
         } => {
             assign_local_dscp_rewrite(
@@ -1005,45 +1017,12 @@ fn submit_cos_batch(
             );
             match transmit_batch(binding, &mut items, now_ns, shared_recycles) {
                 Ok((packets, bytes)) => {
-                    apply_cos_send_result(binding, root_ifindex, queue_idx, phase, bytes, items);
-                    if packets > 0 {
-                        binding
-                            .live
-                            .tx_packets
-                            .fetch_add(packets, Ordering::Relaxed);
-                        binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
-                    }
-                    cos_batch_tx_made_progress(Ok((packets, bytes)))
-                }
-                Err(TxError::Retry(err)) => {
-                    binding.live.set_error(err);
-                    restore_cos_local_items(binding, root_ifindex, queue_idx, items);
-                    cos_batch_tx_made_progress(Err(TxError::Retry(String::new())))
-                }
-                Err(TxError::Drop(err)) => {
-                    binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
-                    binding.live.set_error(err);
-                    restore_cos_local_items(binding, root_ifindex, queue_idx, items);
-                    cos_batch_tx_made_progress(Err(TxError::Drop(String::new())))
-                }
-            }
-        }
-        CoSBatch::Prepared {
-            queue_idx,
-            phase,
-            mut items,
-        } => {
-            assign_prepared_dscp_rewrite(
-                &mut items,
-                cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx),
-            );
-            match transmit_prepared_queue(binding, &mut items, now_ns) {
-                Ok((packets, bytes)) => {
-                    apply_cos_prepared_result(
+                    apply_cos_send_result(
                         binding,
                         root_ifindex,
                         queue_idx,
                         phase,
+                        batch_bytes,
                         bytes,
                         items,
                     );
@@ -1058,13 +1037,68 @@ fn submit_cos_batch(
                 }
                 Err(TxError::Retry(err)) => {
                     binding.live.set_error(err);
-                    restore_cos_prepared_items(binding, root_ifindex, queue_idx, items);
+                    restore_cos_local_items(binding, root_ifindex, queue_idx, batch_bytes, items);
                     cos_batch_tx_made_progress(Err(TxError::Retry(String::new())))
                 }
                 Err(TxError::Drop(err)) => {
                     binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
                     binding.live.set_error(err);
-                    restore_cos_prepared_items(binding, root_ifindex, queue_idx, items);
+                    restore_cos_local_items(binding, root_ifindex, queue_idx, batch_bytes, items);
+                    cos_batch_tx_made_progress(Err(TxError::Drop(String::new())))
+                }
+            }
+        }
+        CoSBatch::Prepared {
+            queue_idx,
+            phase,
+            batch_bytes,
+            mut items,
+        } => {
+            assign_prepared_dscp_rewrite(
+                &mut items,
+                cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx),
+            );
+            match transmit_prepared_queue(binding, &mut items, now_ns) {
+                Ok((packets, bytes)) => {
+                    apply_cos_prepared_result(
+                        binding,
+                        root_ifindex,
+                        queue_idx,
+                        phase,
+                        batch_bytes,
+                        bytes,
+                        items,
+                    );
+                    if packets > 0 {
+                        binding
+                            .live
+                            .tx_packets
+                            .fetch_add(packets, Ordering::Relaxed);
+                        binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+                    }
+                    cos_batch_tx_made_progress(Ok((packets, bytes)))
+                }
+                Err(TxError::Retry(err)) => {
+                    binding.live.set_error(err);
+                    restore_cos_prepared_items(
+                        binding,
+                        root_ifindex,
+                        queue_idx,
+                        batch_bytes,
+                        items,
+                    );
+                    cos_batch_tx_made_progress(Err(TxError::Retry(String::new())))
+                }
+                Err(TxError::Drop(err)) => {
+                    binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+                    binding.live.set_error(err);
+                    restore_cos_prepared_items(
+                        binding,
+                        root_ifindex,
+                        queue_idx,
+                        batch_bytes,
+                        items,
+                    );
                     cos_batch_tx_made_progress(Err(TxError::Drop(String::new())))
                 }
             }
@@ -1730,16 +1764,16 @@ fn resolve_cos_queue_idx(root: &CoSInterfaceRuntime, requested_queue: Option<u8>
     if root.queues.is_empty() {
         return None;
     }
-    let target_queue = requested_queue.unwrap_or(root.default_queue);
+    if let Some(queue_id) = requested_queue {
+        return root
+            .queues
+            .iter()
+            .position(|queue| queue.queue_id == queue_id);
+    }
     root.queues
         .iter()
-        .position(|queue| queue.queue_id == target_queue)
-        .or_else(|| {
-            root.queues
-                .iter()
-                .position(|queue| queue.queue_id == root.default_queue)
-        })
-        .or(Some(0))
+        .position(|queue| queue.queue_id == root.default_queue)
+        .or_else(|| (!root.queues.is_empty()).then_some(0))
 }
 
 fn recycle_cancelled_prepared_offset(
@@ -1946,21 +1980,9 @@ fn enqueue_cos_item(
         let Some(root) = binding.cos_interfaces.get_mut(&egress_ifindex) else {
             return Err(item);
         };
-        if root.queues.is_empty() {
+        let Some(mut queue_idx) = resolve_cos_queue_idx(root, requested_queue) else {
             return Err(item);
-        }
-        let target_queue = requested_queue.unwrap_or(root.default_queue);
-        let default_queue = root.default_queue;
-        let mut queue_idx = root
-            .queues
-            .iter()
-            .position(|queue| queue.queue_id == target_queue)
-            .or_else(|| {
-                root.queues
-                    .iter()
-                    .position(|queue| queue.queue_id == default_queue)
-            })
-            .unwrap_or(0);
+        };
         if queue_idx >= root.queues.len() {
             queue_idx = 0;
         }
@@ -2129,6 +2151,7 @@ fn apply_cos_send_result(
     root_ifindex: i32,
     queue_idx: usize,
     phase: CoSServicePhase,
+    batch_bytes: u64,
     sent_bytes: u64,
     retry: VecDeque<TxRequest>,
 ) {
@@ -2139,8 +2162,11 @@ fn apply_cos_send_result(
         };
         if let Some(queue) = root.queues.get_mut(queue_idx) {
             exact_queue_idx = queue.exact.then_some(queue_idx);
-            restore_cos_local_items_inner(queue, retry);
-            queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
+            let retry_bytes = restore_cos_local_items_inner(queue, retry);
+            queue.queued_bytes = queue
+                .queued_bytes
+                .saturating_sub(batch_bytes)
+                .saturating_add(retry_bytes);
             match phase {
                 CoSServicePhase::Guarantee => {
                     queue.tokens = queue.tokens.saturating_sub(sent_bytes);
@@ -2177,6 +2203,7 @@ fn apply_cos_prepared_result(
     root_ifindex: i32,
     queue_idx: usize,
     phase: CoSServicePhase,
+    batch_bytes: u64,
     sent_bytes: u64,
     retry: VecDeque<PreparedTxRequest>,
 ) {
@@ -2187,8 +2214,11 @@ fn apply_cos_prepared_result(
         };
         if let Some(queue) = root.queues.get_mut(queue_idx) {
             exact_queue_idx = queue.exact.then_some(queue_idx);
-            restore_cos_prepared_items_inner(queue, retry);
-            queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
+            let retry_bytes = restore_cos_prepared_items_inner(queue, retry);
+            queue.queued_bytes = queue
+                .queued_bytes
+                .saturating_sub(batch_bytes)
+                .saturating_add(retry_bytes);
             match phase {
                 CoSServicePhase::Guarantee => {
                     queue.tokens = queue.tokens.saturating_sub(sent_bytes);
@@ -2224,6 +2254,7 @@ fn restore_cos_local_items(
     binding: &mut BindingWorker,
     root_ifindex: i32,
     queue_idx: usize,
+    batch_bytes: u64,
     retry: VecDeque<TxRequest>,
 ) {
     {
@@ -2231,8 +2262,11 @@ fn restore_cos_local_items(
             return;
         };
         if let Some(queue) = root.queues.get_mut(queue_idx) {
-            restore_cos_local_items_inner(queue, retry);
-            queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
+            let retry_bytes = restore_cos_local_items_inner(queue, retry);
+            queue.queued_bytes = queue
+                .queued_bytes
+                .saturating_sub(batch_bytes)
+                .saturating_add(retry_bytes);
         }
     }
     refresh_cos_interface_activity(binding, root_ifindex);
@@ -2242,6 +2276,7 @@ fn restore_cos_prepared_items(
     binding: &mut BindingWorker,
     root_ifindex: i32,
     queue_idx: usize,
+    batch_bytes: u64,
     retry: VecDeque<PreparedTxRequest>,
 ) {
     {
@@ -2249,36 +2284,44 @@ fn restore_cos_prepared_items(
             return;
         };
         if let Some(queue) = root.queues.get_mut(queue_idx) {
-            restore_cos_prepared_items_inner(queue, retry);
-            queue.queued_bytes = recompute_cos_queue_bytes(&queue.items);
+            let retry_bytes = restore_cos_prepared_items_inner(queue, retry);
+            queue.queued_bytes = queue
+                .queued_bytes
+                .saturating_sub(batch_bytes)
+                .saturating_add(retry_bytes);
         }
     }
     refresh_cos_interface_activity(binding, root_ifindex);
 }
 
-fn restore_cos_local_items_inner(queue: &mut CoSQueueRuntime, mut retry: VecDeque<TxRequest>) {
+fn restore_cos_local_items_inner(
+    queue: &mut CoSQueueRuntime,
+    mut retry: VecDeque<TxRequest>,
+) -> u64 {
+    let mut retry_bytes = 0u64;
     while let Some(req) = retry.pop_back() {
+        retry_bytes = retry_bytes.saturating_add(req.bytes.len() as u64);
         queue.items.push_front(CoSPendingTxItem::Local(req));
     }
     if !queue.items.is_empty() {
         mark_cos_queue_runnable(queue);
     }
+    retry_bytes
 }
 
 fn restore_cos_prepared_items_inner(
     queue: &mut CoSQueueRuntime,
     mut retry: VecDeque<PreparedTxRequest>,
-) {
+) -> u64 {
+    let mut retry_bytes = 0u64;
     while let Some(req) = retry.pop_back() {
+        retry_bytes = retry_bytes.saturating_add(req.len as u64);
         queue.items.push_front(CoSPendingTxItem::Prepared(req));
     }
     if !queue.items.is_empty() {
         mark_cos_queue_runnable(queue);
     }
-}
-
-fn recompute_cos_queue_bytes(queue: &VecDeque<CoSPendingTxItem>) -> u64 {
-    queue.iter().map(cos_item_len).sum()
+    retry_bytes
 }
 
 fn merge_pending_tx_requests(
@@ -2292,6 +2335,29 @@ fn merge_pending_tx_requests(
         local.append(&mut shared);
     }
     local
+}
+
+fn append_pending_queue<T>(pending: &mut VecDeque<T>, shared: &mut VecDeque<T>) {
+    if pending.is_empty() {
+        *pending = core::mem::take(shared);
+    } else if !shared.is_empty() {
+        pending.append(shared);
+    }
+}
+
+fn process_pending_queue_in_place<T, F>(pending: &mut VecDeque<T>, mut f: F)
+where
+    F: FnMut(T) -> Result<(), T>,
+{
+    let initial_len = pending.len();
+    for _ in 0..initial_len {
+        let Some(item) = pending.pop_front() else {
+            break;
+        };
+        if let Err(item) = f(item) {
+            pending.push_back(item);
+        }
+    }
 }
 
 fn take_pending_tx_requests(binding: &mut BindingWorker) -> VecDeque<TxRequest> {
@@ -2846,6 +2912,29 @@ mod tests {
     }
 
     #[test]
+    fn append_pending_queue_moves_shared_into_empty_pending() {
+        let mut pending = VecDeque::new();
+        let mut shared = VecDeque::from([1u8, 2, 3]);
+
+        append_pending_queue(&mut pending, &mut shared);
+
+        assert!(shared.is_empty());
+        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn process_pending_queue_in_place_preserves_failed_item_order() {
+        let mut pending = VecDeque::from([1u8, 2, 3, 4]);
+
+        process_pending_queue_in_place(&mut pending, |item| match item {
+            1 | 3 => Ok(()),
+            other => Err(other),
+        });
+
+        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![2, 4]);
+    }
+
+    #[test]
     fn cos_batch_tx_made_progress_requires_real_send_progress() {
         assert!(!cos_batch_tx_made_progress(Ok((0, 0))));
         assert!(cos_batch_tx_made_progress(Ok((1, 0))));
@@ -2937,6 +3026,60 @@ mod tests {
         assert!(redirected.is_ok());
         let pending = commands.lock().unwrap();
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn redirect_local_cos_request_to_owner_rejects_explicit_queue_miss() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let worker_commands_by_id = BTreeMap::from([(7, commands.clone())]);
+        let cos_fast_interfaces = test_cos_fast_interfaces(
+            80,
+            12,
+            5,
+            vec![(5, test_queue_fast_path(false, 7, None, None))],
+            None,
+            None,
+        );
+        let req = TxRequest {
+            bytes: vec![1, 2, 3],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        };
+
+        let redirected = redirect_local_cos_request_to_owner(
+            &cos_fast_interfaces,
+            req,
+            2,
+            &worker_commands_by_id,
+        );
+
+        assert!(redirected.is_err());
+        assert!(commands.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_cos_queue_idx_rejects_explicit_queue_miss() {
+        let root = test_cos_runtime_with_queues(
+            10_000_000,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "best-effort".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000,
+                exact: false,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+
+        assert_eq!(resolve_cos_queue_idx(&root, Some(4)), None);
+        assert_eq!(resolve_cos_queue_idx(&root, None), Some(0));
     }
 
     #[test]
@@ -5679,9 +5822,10 @@ mod tests {
             dscp_rewrite: None,
         }]);
 
-        restore_cos_local_items_inner(&mut queue, retry);
+        let retry_bytes = restore_cos_local_items_inner(&mut queue, retry);
 
         assert_eq!(queue.items.len(), 1);
+        assert_eq!(retry_bytes, 1500);
         assert!(queue.runnable);
         assert!(!queue.parked);
     }
@@ -5720,9 +5864,10 @@ mod tests {
             dscp_rewrite: None,
         }]);
 
-        restore_cos_prepared_items_inner(&mut queue, retry);
+        let retry_bytes = restore_cos_prepared_items_inner(&mut queue, retry);
 
         assert_eq!(queue.items.len(), 1);
+        assert_eq!(retry_bytes, 1500);
         assert!(queue.runnable);
         assert!(!queue.parked);
     }

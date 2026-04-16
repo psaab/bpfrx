@@ -778,13 +778,11 @@ pub(super) struct CoSTimerWheelRuntime {
     pub(super) level1: [Vec<usize>; COS_TIMER_WHEEL_L1_SLOTS],
 }
 
-#[repr(align(64))]
 pub(super) struct SharedCoSQueueLease {
     config: SharedCoSLeaseConfig,
     state: SharedCoSLeaseState,
 }
 
-#[repr(align(64))]
 pub(super) struct SharedCoSRootLease {
     config: SharedCoSLeaseConfig,
     state: SharedCoSLeaseState,
@@ -799,6 +797,7 @@ struct SharedCoSLeaseConfig {
     active_shards: usize,
 }
 
+#[repr(align(64))]
 #[derive(Debug)]
 struct SharedCoSLeaseState {
     credits: AtomicU64,
@@ -814,12 +813,9 @@ fn compute_shared_cos_lease_config(
     burst_bytes: u64,
     active_shards: usize,
 ) -> SharedCoSLeaseConfig {
-    let burst_bytes = burst_bytes.max(COS_ROOT_LEASE_MIN_BYTES);
-    assert!(
-        burst_bytes <= u32::MAX as u64,
-        "shared CoS burst exceeds packed lease range: {}",
-        burst_bytes
-    );
+    let burst_bytes = burst_bytes
+        .max(COS_ROOT_LEASE_MIN_BYTES)
+        .min(u32::MAX as u64);
     let active_shards = active_shards.max(1);
     let target_lease_bytes =
         ((rate_bytes as u128) * (COS_ROOT_LEASE_TARGET_US as u128) / 1_000_000u128) as u64;
@@ -1088,6 +1084,7 @@ impl SharedCoSRootLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::align_of;
 
     fn shared_cos_lease_snapshot(lease: &SharedCoSRootLease) -> (u64, u64, u64) {
         let (available_tokens, outstanding_leased_tokens) =
@@ -1129,6 +1126,17 @@ mod tests {
             available_tokens + outstanding_leased_tokens,
             lease.config.burst_bytes
         );
+    }
+
+    #[test]
+    fn shared_cos_lease_state_is_cacheline_aligned() {
+        assert_eq!(align_of::<SharedCoSLeaseState>(), 64);
+    }
+
+    #[test]
+    fn shared_cos_lease_config_clamps_burst_to_packed_range() {
+        let lease = SharedCoSRootLease::new(10_000_000, u64::MAX, 1);
+        assert_eq!(lease.config.burst_bytes, u32::MAX as u64);
     }
 }
 
