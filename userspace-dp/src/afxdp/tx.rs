@@ -239,6 +239,10 @@ pub(super) fn drain_pending_tx(
             }
         }
     }
+    if binding.pending_tx_local.is_empty() && binding.live.pending_tx_empty() {
+        update_binding_debug_state(binding);
+        return did_work || binding_has_pending_tx_work(binding);
+    }
     let mut pending = take_pending_tx_requests(binding);
     if pending.is_empty() {
         return did_work || binding_has_pending_tx_work(binding);
@@ -1114,6 +1118,126 @@ fn service_exact_local_queue_direct(
     now_ns: u64,
     shared_recycles: &mut Vec<(u32, u64)>,
 ) -> bool {
+    let flow_fair = binding
+        .cos_interfaces
+        .get(&root_ifindex)
+        .and_then(|root| root.queues.get(queue_idx))
+        .map(|queue| queue.flow_fair)
+        .unwrap_or(false);
+    if flow_fair {
+        return service_exact_local_queue_direct_flow_fair(
+            binding,
+            root_ifindex,
+            queue_idx,
+            secondary_budget,
+            now_ns,
+            shared_recycles,
+        );
+    }
+    if binding.free_tx_frames.is_empty() {
+        let _ = reap_tx_completions(binding, shared_recycles);
+    }
+    let queue_dscp_rewrite = cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx);
+    binding.scratch_exact_local_tx.clear();
+    let root_budget = binding
+        .cos_interfaces
+        .get(&root_ifindex)
+        .map(|root| root.tokens)
+        .unwrap_or(0);
+    let build = {
+        let root = match binding.cos_interfaces.get_mut(&root_ifindex) {
+            Some(root) => root,
+            None => return false,
+        };
+        let queue = match root.queues.get_mut(queue_idx) {
+            Some(queue) => queue,
+            None => return false,
+        };
+        drain_exact_local_fifo_items_to_scratch(
+            queue,
+            &mut binding.free_tx_frames,
+            &mut binding.scratch_exact_local_tx,
+            binding.umem.area(),
+            root_budget,
+            secondary_budget,
+            queue_dscp_rewrite,
+        )
+    };
+    match build {
+        ExactCoSScratchBuild::Ready => {}
+        ExactCoSScratchBuild::Drop {
+            error,
+            dropped_bytes,
+        } => {
+            release_exact_local_scratch_frames(
+                &mut binding.free_tx_frames,
+                &mut binding.scratch_exact_local_tx,
+            );
+            if dropped_bytes > 0 {
+                subtract_direct_cos_queue_bytes(binding, root_ifindex, queue_idx, dropped_bytes);
+            } else {
+                refresh_cos_interface_activity(binding, root_ifindex);
+            }
+            binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+            binding.live.set_error(error);
+            return false;
+        }
+    }
+    if binding.scratch_exact_local_tx.is_empty() {
+        maybe_wake_tx(binding, true, now_ns);
+        binding
+            .live
+            .set_error("no free TX frame available".to_string());
+        return false;
+    }
+
+    let mut writer = binding
+        .tx
+        .transmit(binding.scratch_exact_local_tx.len() as u32);
+    let inserted = writer.insert(binding.scratch_exact_local_tx.iter().map(|req| XdpDesc {
+        addr: req.offset,
+        len: req.len,
+        options: 0,
+    }));
+    writer.commit();
+    drop(writer);
+
+    if inserted == 0 {
+        binding.dbg_tx_ring_full += 1;
+        maybe_wake_tx(binding, true, now_ns);
+        release_exact_local_scratch_frames(
+            &mut binding.free_tx_frames,
+            &mut binding.scratch_exact_local_tx,
+        );
+        refresh_cos_interface_activity(binding, root_ifindex);
+        binding.live.set_error("tx ring insert failed".to_string());
+        return false;
+    }
+    binding.dbg_tx_ring_submitted += inserted as u64;
+    binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
+
+    let (sent_packets, sent_bytes) = settle_exact_local_fifo_submission(
+        binding
+            .cos_interfaces
+            .get_mut(&root_ifindex)
+            .and_then(|root| root.queues.get_mut(queue_idx)),
+        &mut binding.free_tx_frames,
+        &mut binding.scratch_exact_local_tx,
+        inserted as usize,
+    );
+    apply_direct_exact_send_result(binding, root_ifindex, queue_idx, sent_packets, sent_bytes);
+    maybe_wake_tx(binding, true, now_ns);
+    sent_packets > 0 || sent_bytes > 0
+}
+
+fn service_exact_local_queue_direct_flow_fair(
+    binding: &mut BindingWorker,
+    root_ifindex: i32,
+    queue_idx: usize,
+    secondary_budget: u64,
+    now_ns: u64,
+    shared_recycles: &mut Vec<(u32, u64)>,
+) -> bool {
     if binding.free_tx_frames.is_empty() {
         let _ = reap_tx_completions(binding, shared_recycles);
     }
@@ -1133,7 +1257,7 @@ fn service_exact_local_queue_direct(
             Some(queue) => queue,
             None => return false,
         };
-        drain_exact_local_items_to_scratch(
+        drain_exact_local_items_to_scratch_flow_fair(
             queue,
             &mut binding.free_tx_frames,
             &mut binding.scratch_local_tx,
@@ -1149,7 +1273,7 @@ fn service_exact_local_queue_direct(
             error,
             dropped_bytes,
         } => {
-            restore_exact_local_scratch_to_queue_head(
+            restore_exact_local_scratch_to_queue_head_flow_fair(
                 binding
                     .cos_interfaces
                     .get_mut(&root_ifindex)
@@ -1192,7 +1316,7 @@ fn service_exact_local_queue_direct(
     if inserted == 0 {
         binding.dbg_tx_ring_full += 1;
         maybe_wake_tx(binding, true, now_ns);
-        restore_exact_local_scratch_to_queue_head(
+        restore_exact_local_scratch_to_queue_head_flow_fair(
             binding
                 .cos_interfaces
                 .get_mut(&root_ifindex)
@@ -1207,7 +1331,7 @@ fn service_exact_local_queue_direct(
     binding.dbg_tx_ring_submitted += inserted as u64;
     binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
 
-    let (sent_packets, sent_bytes) = settle_exact_local_scratch_submission(
+    let (sent_packets, sent_bytes) = settle_exact_local_scratch_submission_flow_fair(
         binding
             .cos_interfaces
             .get_mut(&root_ifindex)
@@ -1222,6 +1346,129 @@ fn service_exact_local_queue_direct(
 }
 
 fn service_exact_prepared_queue_direct(
+    binding: &mut BindingWorker,
+    root_ifindex: i32,
+    queue_idx: usize,
+    secondary_budget: u64,
+    now_ns: u64,
+) -> bool {
+    let flow_fair = binding
+        .cos_interfaces
+        .get(&root_ifindex)
+        .and_then(|root| root.queues.get(queue_idx))
+        .map(|queue| queue.flow_fair)
+        .unwrap_or(false);
+    if flow_fair {
+        return service_exact_prepared_queue_direct_flow_fair(
+            binding,
+            root_ifindex,
+            queue_idx,
+            secondary_budget,
+            now_ns,
+        );
+    }
+    let queue_dscp_rewrite = cos_queue_dscp_rewrite(binding, root_ifindex, queue_idx);
+    binding.scratch_exact_prepared_tx.clear();
+    let root_budget = binding
+        .cos_interfaces
+        .get(&root_ifindex)
+        .map(|root| root.tokens)
+        .unwrap_or(0);
+    let build = {
+        let root = match binding.cos_interfaces.get_mut(&root_ifindex) {
+            Some(root) => root,
+            None => return false,
+        };
+        let queue = match root.queues.get_mut(queue_idx) {
+            Some(queue) => queue,
+            None => return false,
+        };
+        drain_exact_prepared_fifo_items_to_scratch(
+            queue,
+            &mut binding.scratch_exact_prepared_tx,
+            binding.umem.area(),
+            &mut binding.free_tx_frames,
+            &mut binding.pending_fill_frames,
+            binding.slot,
+            root_budget,
+            secondary_budget,
+            queue_dscp_rewrite,
+        )
+    };
+    match build {
+        ExactCoSScratchBuild::Ready => {}
+        ExactCoSScratchBuild::Drop {
+            error,
+            dropped_bytes,
+        } => {
+            release_exact_prepared_scratch(&mut binding.scratch_exact_prepared_tx);
+            if dropped_bytes > 0 {
+                subtract_direct_cos_queue_bytes(binding, root_ifindex, queue_idx, dropped_bytes);
+            } else {
+                refresh_cos_interface_activity(binding, root_ifindex);
+            }
+            binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+            binding.live.set_error(error);
+            return false;
+        }
+    }
+    if binding.scratch_exact_prepared_tx.is_empty() {
+        return false;
+    }
+
+    if cfg!(feature = "debug-log") {
+        for req in &binding.scratch_exact_prepared_tx {
+            if let Some(frame_data) = binding
+                .umem
+                .area()
+                .slice(req.offset as usize, req.len as usize)
+            {
+                if frame_has_tcp_rst(frame_data) {
+                    binding.dbg_tx_tcp_rst += 1;
+                }
+            }
+        }
+    }
+
+    let mut writer = binding
+        .tx
+        .transmit(binding.scratch_exact_prepared_tx.len() as u32);
+    let inserted = writer.insert(binding.scratch_exact_prepared_tx.iter().map(|req| XdpDesc {
+        addr: req.offset,
+        len: req.len,
+        options: 0,
+    }));
+    writer.commit();
+    drop(writer);
+
+    if inserted == 0 {
+        binding.dbg_tx_ring_full += 1;
+        maybe_wake_tx(binding, true, now_ns);
+        release_exact_prepared_scratch(&mut binding.scratch_exact_prepared_tx);
+        refresh_cos_interface_activity(binding, root_ifindex);
+        binding
+            .live
+            .set_error("prepared tx ring insert failed".to_string());
+        return false;
+    }
+    binding.dbg_tx_ring_submitted += inserted as u64;
+    binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
+
+    let (sent_packets, sent_bytes) = settle_exact_prepared_fifo_submission(
+        binding
+            .cos_interfaces
+            .get_mut(&root_ifindex)
+            .and_then(|root| root.queues.get_mut(queue_idx)),
+        &mut binding.scratch_exact_prepared_tx,
+        &mut binding.in_flight_prepared_recycles,
+        inserted as usize,
+    );
+    apply_direct_exact_send_result(binding, root_ifindex, queue_idx, sent_packets, sent_bytes);
+    maybe_wake_tx(binding, true, now_ns);
+    sent_packets > 0 || sent_bytes > 0
+}
+
+fn service_exact_prepared_queue_direct_flow_fair(
     binding: &mut BindingWorker,
     root_ifindex: i32,
     queue_idx: usize,
@@ -1244,7 +1491,7 @@ fn service_exact_prepared_queue_direct(
             Some(queue) => queue,
             None => return false,
         };
-        drain_exact_prepared_items_to_scratch(
+        drain_exact_prepared_items_to_scratch_flow_fair(
             queue,
             &mut binding.scratch_prepared_tx,
             binding.umem.area(),
@@ -1262,7 +1509,7 @@ fn service_exact_prepared_queue_direct(
             error,
             dropped_bytes,
         } => {
-            restore_exact_prepared_scratch_to_queue_head(
+            restore_exact_prepared_scratch_to_queue_head_flow_fair(
                 binding
                     .cos_interfaces
                     .get_mut(&root_ifindex)
@@ -1311,7 +1558,7 @@ fn service_exact_prepared_queue_direct(
     if inserted == 0 {
         binding.dbg_tx_ring_full += 1;
         maybe_wake_tx(binding, true, now_ns);
-        restore_exact_prepared_scratch_to_queue_head(
+        restore_exact_prepared_scratch_to_queue_head_flow_fair(
             binding
                 .cos_interfaces
                 .get_mut(&root_ifindex)
@@ -1327,7 +1574,7 @@ fn service_exact_prepared_queue_direct(
     binding.dbg_tx_ring_submitted += inserted as u64;
     binding.outstanding_tx = binding.outstanding_tx.saturating_add(inserted);
 
-    let (sent_packets, sent_bytes) = settle_exact_prepared_scratch_submission(
+    let (sent_packets, sent_bytes) = settle_exact_prepared_scratch_submission_flow_fair(
         binding
             .cos_interfaces
             .get_mut(&root_ifindex)
@@ -1341,7 +1588,98 @@ fn service_exact_prepared_queue_direct(
     sent_packets > 0 || sent_bytes > 0
 }
 
-fn drain_exact_local_items_to_scratch(
+fn drain_exact_local_fifo_items_to_scratch(
+    queue: &mut CoSQueueRuntime,
+    free_tx_frames: &mut VecDeque<u64>,
+    scratch_local_tx: &mut Vec<ExactLocalScratchTxRequest>,
+    area: &MmapArea,
+    root_budget: u64,
+    secondary_budget: u64,
+    queue_dscp_rewrite: Option<u8>,
+) -> ExactCoSScratchBuild {
+    debug_assert!(!queue.flow_fair);
+    let mut remaining_root = root_budget;
+    let mut remaining_secondary = secondary_budget;
+    let mut index = 0usize;
+    while scratch_local_tx.len() < TX_BATCH_SIZE {
+        if free_tx_frames.is_empty() {
+            break;
+        }
+        let mut drop_error: Option<(String, u64)> = None;
+        let mut built = false;
+        {
+            let Some(front) = queue.items.get(index) else {
+                break;
+            };
+            let CoSPendingTxItem::Local(req) = front else {
+                break;
+            };
+            let len = req.bytes.len() as u64;
+            if remaining_root < len || remaining_secondary < len {
+                break;
+            }
+            if req.bytes.len() > tx_frame_capacity() {
+                drop_error = Some((
+                    format!(
+                        "local tx frame exceeds UMEM frame capacity: len={} cap={}",
+                        req.bytes.len(),
+                        tx_frame_capacity()
+                    ),
+                    len,
+                ));
+            } else {
+                let Some(offset) = free_tx_frames.pop_front() else {
+                    break;
+                };
+                if let Some(frame) =
+                    unsafe { area.slice_mut_unchecked(offset as usize, req.bytes.len()) }
+                {
+                    frame.copy_from_slice(&req.bytes);
+                    if let Some(dscp_rewrite) = req.dscp_rewrite.or(queue_dscp_rewrite) {
+                        let _ = apply_dscp_rewrite_to_frame(frame, dscp_rewrite);
+                    }
+                    scratch_local_tx.push(ExactLocalScratchTxRequest {
+                        offset,
+                        len: req.bytes.len() as u32,
+                    });
+                    remaining_root = remaining_root.saturating_sub(len);
+                    remaining_secondary = remaining_secondary.saturating_sub(len);
+                    built = true;
+                } else {
+                    free_tx_frames.push_front(offset);
+                    drop_error = Some((
+                        format!(
+                            "tx frame slice out of range: offset={offset} len={}",
+                            req.bytes.len()
+                        ),
+                        len,
+                    ));
+                }
+            }
+        }
+        if let Some((error, fallback_dropped_bytes)) = drop_error {
+            // Error path only: remove the specific malformed item we just
+            // examined. VecDeque::remove(index) is O(N), but this only runs for
+            // oversized/out-of-range frames, never on the steady-state hot path.
+            let dropped_bytes = match queue.items.remove(index) {
+                Some(CoSPendingTxItem::Local(req)) => req.bytes.len() as u64,
+                Some(CoSPendingTxItem::Prepared(_)) | None => fallback_dropped_bytes,
+            };
+            return ExactCoSScratchBuild::Drop {
+                error,
+                dropped_bytes,
+            };
+        }
+        if !built {
+            break;
+        }
+        index += 1;
+    }
+
+    ExactCoSScratchBuild::Ready
+}
+
+fn drain_exact_local_items_to_scratch_flow_fair(
     queue: &mut CoSQueueRuntime,
     free_tx_frames: &mut VecDeque<u64>,
     scratch_local_tx: &mut Vec<(u64, TxRequest)>,
@@ -1410,7 +1748,106 @@ fn drain_exact_local_items_to_scratch(
     ExactCoSScratchBuild::Ready
 }
 
-fn drain_exact_prepared_items_to_scratch(
+fn drain_exact_prepared_fifo_items_to_scratch(
+    queue: &mut CoSQueueRuntime,
+    scratch_prepared_tx: &mut Vec<ExactPreparedScratchTxRequest>,
+    area: &MmapArea,
+    free_tx_frames: &mut VecDeque<u64>,
+    pending_fill_frames: &mut VecDeque<u64>,
+    slot: u32,
+    root_budget: u64,
+    secondary_budget: u64,
+    queue_dscp_rewrite: Option<u8>,
+) -> ExactCoSScratchBuild {
+    debug_assert!(!queue.flow_fair);
+    let mut remaining_root = root_budget;
+    let mut remaining_secondary = secondary_budget;
+    let mut index = 0usize;
+
+    while scratch_prepared_tx.len() < TX_BATCH_SIZE {
+        let mut drop_error: Option<(String, u64)> = None;
+        let mut built = false;
+        {
+            let Some(front) = queue.items.get(index) else {
+                break;
+            };
+            let CoSPendingTxItem::Prepared(req) = front else {
+                break;
+            };
+            let len = req.len as u64;
+            if remaining_root < len || remaining_secondary < len {
+                break;
+            }
+            if req.len as usize > tx_frame_capacity() {
+                drop_error = Some((
+                    format!(
+                        "prepared tx frame exceeds UMEM frame capacity: len={} cap={}",
+                        req.len,
+                        tx_frame_capacity()
+                    ),
+                    len,
+                ));
+            } else {
+                let valid = if let Some(dscp_rewrite) = req.dscp_rewrite.or(queue_dscp_rewrite) {
+                    match unsafe { area.slice_mut_unchecked(req.offset as usize, req.len as usize) }
+                    {
+                        Some(frame) => {
+                            let _ = apply_dscp_rewrite_to_frame(frame, dscp_rewrite);
+                            true
+                        }
+                        None => false,
+                    }
+                } else {
+                    area.slice(req.offset as usize, req.len as usize).is_some()
+                };
+                if !valid {
+                    drop_error = Some((
+                        format!(
+                            "prepared tx frame slice out of range: offset={} len={}",
+                            req.offset, req.len
+                        ),
+                        len,
+                    ));
+                } else {
+                    scratch_prepared_tx.push(ExactPreparedScratchTxRequest {
+                        offset: req.offset,
+                        len: req.len,
+                    });
+                    remaining_root = remaining_root.saturating_sub(len);
+                    remaining_secondary = remaining_secondary.saturating_sub(len);
+                    built = true;
+                }
+            }
+        }
+        if let Some((error, fallback_dropped_bytes)) = drop_error {
+            let dropped_bytes = match queue.items.remove(index) {
+                Some(CoSPendingTxItem::Prepared(req)) => {
+                    recycle_cancelled_prepared_offset(
+                        free_tx_frames,
+                        pending_fill_frames,
+                        slot,
+                        req.recycle,
+                        req.offset,
+                    );
+                    req.len as u64
+                }
+                Some(CoSPendingTxItem::Local(_)) | None => fallback_dropped_bytes,
+            };
+            return ExactCoSScratchBuild::Drop {
+                error,
+                dropped_bytes,
+            };
+        }
+        if !built {
+            break;
+        }
+        index += 1;
+    }
+
+    ExactCoSScratchBuild::Ready
+}
+
+fn drain_exact_prepared_items_to_scratch_flow_fair(
     queue: &mut CoSQueueRuntime,
     scratch_prepared_tx: &mut Vec<PreparedTxRequest>,
     area: &MmapArea,
@@ -1494,7 +1931,16 @@ fn drain_exact_prepared_items_to_scratch(
     ExactCoSScratchBuild::Ready
 }
 
-fn restore_exact_local_scratch_to_queue_head(
+fn release_exact_local_scratch_frames(
+    free_tx_frames: &mut VecDeque<u64>,
+    scratch_local_tx: &mut Vec<ExactLocalScratchTxRequest>,
+) {
+    while let Some(req) = scratch_local_tx.pop() {
+        free_tx_frames.push_front(req.offset);
+    }
+}
+
+fn restore_exact_local_scratch_to_queue_head_flow_fair(
     queue: Option<&mut CoSQueueRuntime>,
     free_tx_frames: &mut VecDeque<u64>,
     scratch_local_tx: &mut Vec<(u64, TxRequest)>,
@@ -1509,7 +1955,11 @@ fn restore_exact_local_scratch_to_queue_head(
     }
 }
 
-fn restore_exact_prepared_scratch_to_queue_head(
+fn release_exact_prepared_scratch(scratch_prepared_tx: &mut Vec<ExactPreparedScratchTxRequest>) {
+    scratch_prepared_tx.clear();
+}
+
+fn restore_exact_prepared_scratch_to_queue_head_flow_fair(
     queue: Option<&mut CoSQueueRuntime>,
     scratch_prepared_tx: &mut Vec<PreparedTxRequest>,
 ) {
@@ -1522,7 +1972,40 @@ fn restore_exact_prepared_scratch_to_queue_head(
     }
 }
 
-fn settle_exact_local_scratch_submission(
+fn settle_exact_local_fifo_submission(
+    queue: Option<&mut CoSQueueRuntime>,
+    free_tx_frames: &mut VecDeque<u64>,
+    scratch_local_tx: &mut Vec<ExactLocalScratchTxRequest>,
+    inserted: usize,
+) -> (u64, u64) {
+    let Some(queue) = queue else {
+        release_exact_local_scratch_frames(free_tx_frames, scratch_local_tx);
+        return (0, 0);
+    };
+    let sent = inserted.min(scratch_local_tx.len());
+    let mut sent_packets = 0u64;
+    let mut sent_bytes = 0u64;
+    for _ in 0..sent {
+        match queue.items.pop_front() {
+            Some(CoSPendingTxItem::Local(req)) => {
+                sent_packets += 1;
+                sent_bytes += req.bytes.len() as u64;
+            }
+            Some(item) => {
+                queue.items.push_front(item);
+                break;
+            }
+            None => break,
+        }
+    }
+    for req in scratch_local_tx.drain(sent..).rev() {
+        free_tx_frames.push_front(req.offset);
+    }
+    scratch_local_tx.clear();
+    (sent_packets, sent_bytes)
+}
+
+fn settle_exact_local_scratch_submission_flow_fair(
     queue: Option<&mut CoSQueueRuntime>,
     free_tx_frames: &mut VecDeque<u64>,
     scratch_local_tx: &mut Vec<(u64, TxRequest)>,
@@ -1546,7 +2029,38 @@ fn settle_exact_local_scratch_submission(
     (sent_packets, sent_bytes)
 }
 
-fn settle_exact_prepared_scratch_submission(
+fn settle_exact_prepared_fifo_submission(
+    queue: Option<&mut CoSQueueRuntime>,
+    scratch_prepared_tx: &mut Vec<ExactPreparedScratchTxRequest>,
+    in_flight_prepared_recycles: &mut FastMap<u64, PreparedTxRecycle>,
+    inserted: usize,
+) -> (u64, u64) {
+    let Some(queue) = queue else {
+        scratch_prepared_tx.clear();
+        return (0, 0);
+    };
+    let sent = inserted.min(scratch_prepared_tx.len());
+    let mut sent_packets = 0u64;
+    let mut sent_bytes = 0u64;
+    for _ in 0..sent {
+        match queue.items.pop_front() {
+            Some(CoSPendingTxItem::Prepared(req)) => {
+                remember_prepared_recycle(in_flight_prepared_recycles, &req);
+                sent_packets += 1;
+                sent_bytes += req.len as u64;
+            }
+            Some(item) => {
+                queue.items.push_front(item);
+                break;
+            }
+            None => break,
+        }
+    }
+    scratch_prepared_tx.clear();
+    (sent_packets, sent_bytes)
+}
+
+fn settle_exact_prepared_scratch_submission_flow_fair(
     queue: Option<&mut CoSQueueRuntime>,
     scratch_prepared_tx: &mut Vec<PreparedTxRequest>,
     in_flight_prepared_recycles: &mut FastMap<u64, PreparedTxRecycle>,
@@ -4923,7 +5437,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_exact_local_items_to_scratch_stops_before_prepared_tail() {
+    fn drain_exact_local_fifo_items_to_scratch_keeps_queue_until_commit() {
         let area = MmapArea::new(4096).expect("mmap");
         let mut root = test_cos_runtime_with_queues(
             10_000_000_000 / 8,
@@ -4980,7 +5494,7 @@ mod tests {
         let mut free_tx_frames = VecDeque::from([64, 128, 192]);
         let mut scratch_local_tx = Vec::new();
 
-        let build = drain_exact_local_items_to_scratch(
+        let build = drain_exact_local_fifo_items_to_scratch(
             &mut root.queues[0],
             &mut free_tx_frames,
             &mut scratch_local_tx,
@@ -4997,12 +5511,17 @@ mod tests {
         assert_eq!(area.slice(128, 4).expect("second frame"), &[5, 6, 7, 8]);
         assert!(matches!(
             root.queues[0].items.front(),
+            Some(CoSPendingTxItem::Local(_))
+        ));
+        assert!(matches!(
+            root.queues[0].items.get(2),
             Some(CoSPendingTxItem::Prepared(_))
         ));
     }
 
     #[test]
-    fn settle_exact_local_scratch_submission_restores_unsent_tail_in_order() {
+    fn release_exact_local_scratch_frames_preserves_queue_after_failed_submit() {
+        let area = MmapArea::new(4096).expect("mmap");
         let mut root = test_cos_runtime_with_queues(
             10_000_000_000 / 8,
             vec![CoSQueueConfig {
@@ -5016,50 +5535,123 @@ mod tests {
                 dscp_rewrite: None,
             }],
         );
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![1],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![2],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        let mut free_tx_frames = VecDeque::from([64, 128]);
+        let mut scratch_local_tx = Vec::new();
+
+        let build = drain_exact_local_fifo_items_to_scratch(
+            &mut root.queues[0],
+            &mut free_tx_frames,
+            &mut scratch_local_tx,
+            &area,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+
+        assert!(matches!(build, ExactCoSScratchBuild::Ready));
+        release_exact_local_scratch_frames(&mut free_tx_frames, &mut scratch_local_tx);
+        assert!(scratch_local_tx.is_empty());
+        assert_eq!(free_tx_frames, VecDeque::from([64, 128]));
+        assert_eq!(root.queues[0].items.len(), 2);
+        match root.queues[0].items.pop_front().expect("first queued") {
+            CoSPendingTxItem::Local(req) => assert_eq!(req.bytes, vec![1]),
+            CoSPendingTxItem::Prepared(_) => panic!("unexpected prepared item"),
+        }
+        match root.queues[0].items.pop_front().expect("second queued") {
+            CoSPendingTxItem::Local(req) => assert_eq!(req.bytes, vec![2]),
+            CoSPendingTxItem::Prepared(_) => panic!("unexpected prepared item"),
+        }
+    }
+
+    #[test]
+    fn settle_exact_local_fifo_submission_pops_only_committed_prefix() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![1],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![2],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![3],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
         let mut free_tx_frames = VecDeque::new();
         let mut scratch_local_tx = vec![
-            (
-                64,
-                TxRequest {
-                    bytes: vec![1],
-                    expected_ports: None,
-                    expected_addr_family: libc::AF_INET as u8,
-                    expected_protocol: PROTO_TCP,
-                    flow_key: None,
-                    egress_ifindex: 80,
-                    cos_queue_id: Some(5),
-                    dscp_rewrite: None,
-                },
-            ),
-            (
-                128,
-                TxRequest {
-                    bytes: vec![2],
-                    expected_ports: None,
-                    expected_addr_family: libc::AF_INET as u8,
-                    expected_protocol: PROTO_TCP,
-                    flow_key: None,
-                    egress_ifindex: 80,
-                    cos_queue_id: Some(5),
-                    dscp_rewrite: None,
-                },
-            ),
-            (
-                192,
-                TxRequest {
-                    bytes: vec![3],
-                    expected_ports: None,
-                    expected_addr_family: libc::AF_INET as u8,
-                    expected_protocol: PROTO_TCP,
-                    flow_key: None,
-                    egress_ifindex: 80,
-                    cos_queue_id: Some(5),
-                    dscp_rewrite: None,
-                },
-            ),
+            ExactLocalScratchTxRequest { offset: 64, len: 1 },
+            ExactLocalScratchTxRequest {
+                offset: 128,
+                len: 1,
+            },
+            ExactLocalScratchTxRequest {
+                offset: 192,
+                len: 1,
+            },
         ];
 
-        let (sent_packets, sent_bytes) = settle_exact_local_scratch_submission(
+        let (sent_packets, sent_bytes) = settle_exact_local_fifo_submission(
             Some(&mut root.queues[0]),
             &mut free_tx_frames,
             &mut scratch_local_tx,
@@ -5079,6 +5671,117 @@ mod tests {
             CoSPendingTxItem::Local(req) => assert_eq!(req.bytes, vec![3]),
             CoSPendingTxItem::Prepared(_) => panic!("unexpected prepared restored item"),
         }
+    }
+
+    #[test]
+    fn exact_local_fifo_boundary_survives_partial_commit() {
+        let area = MmapArea::new(4096).expect("mmap");
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![1],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![2],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 256,
+                len: 1,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+
+        let mut free_tx_frames = VecDeque::from([64, 128, 192]);
+        let mut scratch_local_tx = Vec::new();
+
+        let build = drain_exact_local_fifo_items_to_scratch(
+            &mut root.queues[0],
+            &mut free_tx_frames,
+            &mut scratch_local_tx,
+            &area,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+        assert!(matches!(build, ExactCoSScratchBuild::Ready));
+        assert_eq!(scratch_local_tx.len(), 2);
+
+        let (sent_packets, sent_bytes) = settle_exact_local_fifo_submission(
+            Some(&mut root.queues[0]),
+            &mut free_tx_frames,
+            &mut scratch_local_tx,
+            1,
+        );
+        assert_eq!(sent_packets, 1);
+        assert_eq!(sent_bytes, 1);
+        assert_eq!(free_tx_frames, VecDeque::from([128, 192]));
+        assert!(matches!(
+            root.queues[0].items.front(),
+            Some(CoSPendingTxItem::Local(req)) if req.bytes == vec![2]
+        ));
+        assert!(matches!(
+            root.queues[0].items.get(1),
+            Some(CoSPendingTxItem::Prepared(req)) if req.offset == 256
+        ));
+
+        let build = drain_exact_local_fifo_items_to_scratch(
+            &mut root.queues[0],
+            &mut free_tx_frames,
+            &mut scratch_local_tx,
+            &area,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+        assert!(matches!(build, ExactCoSScratchBuild::Ready));
+        assert_eq!(scratch_local_tx.len(), 1);
+        assert_eq!(scratch_local_tx[0].offset, 128);
+        assert_eq!(free_tx_frames, VecDeque::from([192]));
+        assert!(matches!(
+            root.queues[0].items.front(),
+            Some(CoSPendingTxItem::Local(req)) if req.bytes == vec![2]
+        ));
+        assert!(matches!(
+            root.queues[0].items.get(1),
+            Some(CoSPendingTxItem::Prepared(req)) if req.offset == 256
+        ));
     }
 
     #[test]
@@ -5116,7 +5819,7 @@ mod tests {
         let mut free_tx_frames = VecDeque::new();
         let mut pending_fill_frames = VecDeque::new();
 
-        let build = drain_exact_prepared_items_to_scratch(
+        let build = drain_exact_prepared_fifo_items_to_scratch(
             &mut root.queues[0],
             &mut scratch_prepared_tx,
             &area,
@@ -5141,7 +5844,8 @@ mod tests {
     }
 
     #[test]
-    fn settle_exact_prepared_scratch_submission_restores_unsent_tail_in_order() {
+    fn release_exact_prepared_scratch_preserves_queue_after_failed_submit() {
+        let area = MmapArea::new(4096).expect("mmap");
         let mut root = test_cos_runtime_with_queues(
             10_000_000_000 / 8,
             vec![CoSQueueConfig {
@@ -5155,8 +5859,66 @@ mod tests {
                 dscp_rewrite: None,
             }],
         );
-        let mut scratch_prepared_tx = vec![
-            PreparedTxRequest {
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 64,
+                len: 4,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        let frame = unsafe { area.slice_mut_unchecked(64, 4) }.expect("frame");
+        frame.copy_from_slice(&[1, 2, 3, 4]);
+        let mut scratch_prepared_tx = Vec::new();
+        let mut free_tx_frames = VecDeque::new();
+        let mut pending_fill_frames = VecDeque::new();
+
+        let build = drain_exact_prepared_fifo_items_to_scratch(
+            &mut root.queues[0],
+            &mut scratch_prepared_tx,
+            &area,
+            &mut free_tx_frames,
+            &mut pending_fill_frames,
+            7,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+
+        assert!(matches!(build, ExactCoSScratchBuild::Ready));
+        release_exact_prepared_scratch(&mut scratch_prepared_tx);
+        assert!(scratch_prepared_tx.is_empty());
+        assert_eq!(root.queues[0].items.len(), 1);
+        match root.queues[0].items.front().expect("queued prepared") {
+            CoSPendingTxItem::Prepared(req) => assert_eq!(req.offset, 64),
+            CoSPendingTxItem::Local(_) => panic!("unexpected local item"),
+        }
+    }
+
+    #[test]
+    fn settle_exact_prepared_fifo_submission_pops_only_committed_prefix() {
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
                 offset: 64,
                 len: 1,
                 recycle: PreparedTxRecycle::FillOnSlot(7),
@@ -5167,8 +5929,10 @@ mod tests {
                 egress_ifindex: 80,
                 cos_queue_id: Some(5),
                 dscp_rewrite: None,
-            },
-            PreparedTxRequest {
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
                 offset: 128,
                 len: 1,
                 recycle: PreparedTxRecycle::FreeTxFrame,
@@ -5179,8 +5943,10 @@ mod tests {
                 egress_ifindex: 80,
                 cos_queue_id: Some(5),
                 dscp_rewrite: None,
-            },
-            PreparedTxRequest {
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
                 offset: 192,
                 len: 1,
                 recycle: PreparedTxRecycle::FillOnSlot(9),
@@ -5191,11 +5957,21 @@ mod tests {
                 egress_ifindex: 80,
                 cos_queue_id: Some(5),
                 dscp_rewrite: None,
+            }));
+        let mut scratch_prepared_tx = vec![
+            ExactPreparedScratchTxRequest { offset: 64, len: 1 },
+            ExactPreparedScratchTxRequest {
+                offset: 128,
+                len: 1,
+            },
+            ExactPreparedScratchTxRequest {
+                offset: 192,
+                len: 1,
             },
         ];
         let mut in_flight_prepared_recycles = FastMap::default();
 
-        let (sent_packets, sent_bytes) = settle_exact_prepared_scratch_submission(
+        let (sent_packets, sent_bytes) = settle_exact_prepared_fifo_submission(
             Some(&mut root.queues[0]),
             &mut scratch_prepared_tx,
             &mut in_flight_prepared_recycles,
@@ -5220,6 +5996,130 @@ mod tests {
             CoSPendingTxItem::Prepared(req) => assert_eq!(req.offset, 192),
             CoSPendingTxItem::Local(_) => panic!("unexpected local restored item"),
         }
+    }
+
+    #[test]
+    fn exact_prepared_fifo_boundary_survives_partial_commit() {
+        let area = MmapArea::new(4096).expect("mmap");
+        unsafe { area.slice_mut_unchecked(64, 1) }
+            .expect("prepared frame 1")
+            .copy_from_slice(&[1]);
+        unsafe { area.slice_mut_unchecked(128, 1) }
+            .expect("prepared frame 2")
+            .copy_from_slice(&[2]);
+
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 64,
+                len: 1,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+                offset: 128,
+                len: 1,
+                recycle: PreparedTxRecycle::FreeTxFrame,
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+        root.queues[0]
+            .items
+            .push_back(CoSPendingTxItem::Local(TxRequest {
+                bytes: vec![9],
+                expected_ports: None,
+                expected_addr_family: libc::AF_INET as u8,
+                expected_protocol: PROTO_TCP,
+                flow_key: None,
+                egress_ifindex: 80,
+                cos_queue_id: Some(5),
+                dscp_rewrite: None,
+            }));
+
+        let mut scratch_prepared_tx = Vec::new();
+        let mut free_tx_frames = VecDeque::new();
+        let mut pending_fill_frames = VecDeque::new();
+
+        let build = drain_exact_prepared_fifo_items_to_scratch(
+            &mut root.queues[0],
+            &mut scratch_prepared_tx,
+            &area,
+            &mut free_tx_frames,
+            &mut pending_fill_frames,
+            7,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+        assert!(matches!(build, ExactCoSScratchBuild::Ready));
+        assert_eq!(scratch_prepared_tx.len(), 2);
+
+        let mut in_flight_prepared_recycles = FastMap::default();
+        let (sent_packets, sent_bytes) = settle_exact_prepared_fifo_submission(
+            Some(&mut root.queues[0]),
+            &mut scratch_prepared_tx,
+            &mut in_flight_prepared_recycles,
+            1,
+        );
+        assert_eq!(sent_packets, 1);
+        assert_eq!(sent_bytes, 1);
+        assert!(matches!(
+            root.queues[0].items.front(),
+            Some(CoSPendingTxItem::Prepared(req)) if req.offset == 128
+        ));
+        assert!(matches!(
+            root.queues[0].items.get(1),
+            Some(CoSPendingTxItem::Local(req)) if req.bytes == vec![9]
+        ));
+
+        let build = drain_exact_prepared_fifo_items_to_scratch(
+            &mut root.queues[0],
+            &mut scratch_prepared_tx,
+            &area,
+            &mut free_tx_frames,
+            &mut pending_fill_frames,
+            7,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+        assert!(matches!(build, ExactCoSScratchBuild::Ready));
+        assert_eq!(scratch_prepared_tx.len(), 1);
+        assert_eq!(scratch_prepared_tx[0].offset, 128);
+        assert!(matches!(
+            root.queues[0].items.front(),
+            Some(CoSPendingTxItem::Prepared(req)) if req.offset == 128
+        ));
+        assert!(matches!(
+            root.queues[0].items.get(1),
+            Some(CoSPendingTxItem::Local(req)) if req.bytes == vec![9]
+        ));
     }
 
     #[test]

@@ -739,6 +739,18 @@ pub(super) struct PreparedTxRequest {
     pub(super) dscp_rewrite: Option<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ExactLocalScratchTxRequest {
+    pub(super) offset: u64,
+    pub(super) len: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ExactPreparedScratchTxRequest {
+    pub(super) offset: u64,
+    pub(super) len: u32,
+}
+
 pub(super) struct CoSInterfaceRuntime {
     pub(super) shaping_rate_bytes: u64,
     pub(super) burst_bytes: u64,

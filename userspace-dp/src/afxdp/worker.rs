@@ -28,6 +28,8 @@ pub(crate) struct BindingWorker {
     pub(crate) scratch_fill: Vec<u64>,
     pub(crate) scratch_prepared_tx: Vec<PreparedTxRequest>,
     pub(crate) scratch_local_tx: Vec<(u64, TxRequest)>,
+    pub(crate) scratch_exact_prepared_tx: Vec<ExactPreparedScratchTxRequest>,
+    pub(crate) scratch_exact_local_tx: Vec<ExactLocalScratchTxRequest>,
     pub(crate) scratch_completed_offsets: Vec<u64>,
     pub(crate) scratch_post_recycles: Vec<(u32, u64)>,
     /// Packets waiting for neighbor resolution. The UMEM frame is held
@@ -303,6 +305,8 @@ impl BindingWorker {
             scratch_fill: Vec::with_capacity(FILL_BATCH_SIZE),
             scratch_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
             scratch_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
+            scratch_exact_prepared_tx: Vec::with_capacity(TX_BATCH_SIZE),
+            scratch_exact_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
             scratch_completed_offsets: Vec::with_capacity(ring_entries as usize),
             scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
             pending_neigh: VecDeque::with_capacity(MAX_PENDING_NEIGH),
