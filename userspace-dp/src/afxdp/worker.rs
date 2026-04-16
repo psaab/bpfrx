@@ -2138,6 +2138,40 @@ mod tests {
     }
 
     #[test]
+    fn queue_uses_shared_exact_service_iface_rate_gate_boundary_is_byte_precise() {
+        // On a 100g iface the iface_rate/4 term is the active gate
+        // (25 Gbps = 3_125_000_000 bytes/s, well above the 2.5 Gbps MIN).
+        // Pin the inclusive boundary on the iface_rate/4 axis specifically
+        // so a future policy change to that term is an explicit assertion
+        // edit, not a silent flip. The 10g-iface "exactly_inclusive" test
+        // cannot distinguish MIN from iface_rate/4 because they coincide
+        // at exactly 2.5 Gbps there.
+        let iface = test_cos_iface_with_rate(100_000_000_000);
+        let expected_threshold_bytes = iface.shaping_rate_bytes / 4;
+        assert!(expected_threshold_bytes > COS_SHARED_EXACT_MIN_RATE_BYTES);
+        let mut q = test_exact_queue_at_rate(4, 0);
+        q.transmit_rate_bytes = expected_threshold_bytes - 1;
+        assert!(!queue_uses_shared_exact_service(&iface, &q));
+        q.transmit_rate_bytes = expected_threshold_bytes;
+        assert!(queue_uses_shared_exact_service(&iface, &q));
+    }
+
+    #[test]
+    fn queue_uses_shared_exact_service_zero_rate_exact_queue_is_single_owner() {
+        // Config validation should normally reject a 0-rate exact queue,
+        // but if one ever reaches the predicate (race during reload, test
+        // fixture, malformed journal replay) the policy is "single owner":
+        // a queue with no budget cannot justify burning a shared-lease
+        // slot, and the threshold is strictly positive on every iface.
+        let iface_10g = test_cos_iface_with_rate(10_000_000_000);
+        let iface_100g = test_cos_iface_with_rate(100_000_000_000);
+        let mut q = test_exact_queue_at_rate(4, 0);
+        q.transmit_rate_bytes = 0;
+        assert!(!queue_uses_shared_exact_service(&iface_10g, &q));
+        assert!(!queue_uses_shared_exact_service(&iface_100g, &q));
+    }
+
+    #[test]
     fn queue_uses_shared_exact_service_high_iface_rate_keeps_large_queues_single_owner() {
         // KNOWN ROUGH EDGE (#690 follow-on). On a 100g iface the /4 term
         // dominates: threshold = max(25g, 2.5g) = 25g. A 10g or 20g exact
