@@ -2221,29 +2221,39 @@ mod tests {
         let leases = build_shared_cos_root_leases(&forwarding, &active_shards_by_egress_ifindex);
         let lease = leases.get(&80).expect("shared root lease");
 
-        // The root lease budget should scale with active_shards: at lease_bytes = 20 000 bytes and
-        // active_shards = 2, per-lease-config budget is lease_bytes * active_shards = 40 000 bytes.
-        // That is what this test pins — drain the budget with fixed-size requests and assert the
-        // cumulative grant equals lease_bytes * active_shards and that further acquires return 0.
+        // The root lease budget must scale with active_shards: total
+        // grantable = lease_bytes * active_shards. That is the actual
+        // invariant this test pins. Drive it by reading active_shards
+        // from the fixture (so the assertion does not silently decouple
+        // from the setup) and drain the budget with fixed-size requests
+        // plus a tail remainder for whatever the budget does not cleanly
+        // divide by — lease_bytes is a function of shaping rate and
+        // COS_ROOT_LEASE_TARGET_US, both of which are tuning knobs, so
+        // an exact-divisibility assertion would make this test brittle
+        // against legitimate scheduler tuning.
+        let active_shards = *active_shards_by_egress_ifindex
+            .get(&80)
+            .expect("active shards configured for egress ifindex 80")
+            as u64;
         let lease_bytes = lease.lease_bytes();
+        let expected_total = lease_bytes * active_shards;
         let per_request = 2500u64;
-        let expected_total = lease_bytes * 2;
-        assert_eq!(
-            expected_total % per_request,
-            0,
-            "test assumes budget divides evenly into request size"
-        );
-        let request_count = (expected_total / per_request) as usize;
 
+        let mut remaining = expected_total;
         let mut total = 0u64;
-        for _ in 0..request_count {
-            let granted = lease.acquire(1, per_request);
-            assert_eq!(granted, per_request);
+        while remaining > 0 {
+            let req = remaining.min(per_request);
+            let granted = lease.acquire(1, req);
+            assert_eq!(
+                granted, req,
+                "root lease must grant the full request while budget remains",
+            );
             total += granted;
+            remaining -= granted;
         }
         assert_eq!(total, expected_total);
-        let overflow = lease.acquire(1, 1);
-        assert_eq!(overflow, 0);
+        // Budget fully drained — any further acquire must return 0.
+        assert_eq!(lease.acquire(1, 1), 0);
     }
 
     #[test]
