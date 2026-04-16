@@ -17,12 +17,40 @@ fn cos_owner_live_for_request(
         .and_then(|queue_id| cos_owner_live_by_queue.get(&(egress_ifindex, queue_id)).cloned())
 }
 
+fn request_uses_shared_exact_queue_lease(
+    cos_shared_queue_leases: &BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>,
+    forwarding: &ForwardingState,
+    egress_ifindex: i32,
+    requested_queue_id: Option<u8>,
+) -> bool {
+    let effective_queue_id = requested_queue_id.or_else(|| {
+        forwarding
+            .cos
+            .interfaces
+            .get(&egress_ifindex)
+            .map(|iface| iface.default_queue)
+    });
+    effective_queue_id.is_some_and(|queue_id| {
+        cos_shared_queue_leases.contains_key(&(egress_ifindex, queue_id))
+    })
+}
+
 fn enqueue_local_request_to_target_or_owner(
     target_binding: &mut BindingWorker,
     forwarding: &ForwardingState,
     cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
     req: TxRequest,
 ) -> Result<(), TxRequest> {
+    if request_uses_shared_exact_queue_lease(
+        &target_binding.cos_shared_queue_leases,
+        forwarding,
+        req.egress_ifindex,
+        req.cos_queue_id,
+    ) {
+        target_binding.pending_tx_local.push_back(req);
+        bound_pending_tx_local(target_binding);
+        return Ok(());
+    }
     let owner_live = cos_owner_live_for_request(
         forwarding,
         cos_owner_live_by_queue,
@@ -418,7 +446,12 @@ pub(super) fn enqueue_pending_forwards(
                 // Always use copy path with NAT64-specific frame builder.
                 let is_nat64 = request.decision.nat.nat64;
                 let uses_native_tunnel = request.decision.resolution.tunnel_endpoint_id != 0;
-                let owner_matches_target = cos_owner_live_for_request(
+                let owner_matches_target = request_uses_shared_exact_queue_lease(
+                    &target_binding.cos_shared_queue_leases,
+                    forwarding,
+                    request.decision.resolution.egress_ifindex,
+                    request.cos_queue_id,
+                ) || cos_owner_live_for_request(
                     forwarding,
                     cos_owner_live_by_queue,
                     request.decision.resolution.egress_ifindex,
@@ -1602,6 +1635,54 @@ mod tests {
             meta,
             &test_decision(),
             &forwarding,
+        ));
+    }
+
+    #[test]
+    fn shared_exact_queue_lease_uses_requested_queue_id() {
+        let forwarding = ForwardingState::default();
+        let mut shared_queue_leases = BTreeMap::new();
+        shared_queue_leases.insert((80, 5), Arc::new(SharedCoSQueueLease::new(1_250_000_000, 256 * 1024, 2)));
+
+        assert!(request_uses_shared_exact_queue_lease(
+            &shared_queue_leases,
+            &forwarding,
+            80,
+            Some(5),
+        ));
+        assert!(!request_uses_shared_exact_queue_lease(
+            &shared_queue_leases,
+            &forwarding,
+            80,
+            Some(4),
+        ));
+    }
+
+    #[test]
+    fn shared_exact_queue_lease_uses_interface_default_queue() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 10_000_000_000u64 / 8,
+                burst_bytes: 256 * 1024,
+                default_queue: 5,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [0; 64],
+                ieee8021_queue_by_pcp: [0; 8],
+                queue_by_forwarding_class: FastMap::default(),
+                queues: Vec::new(),
+            },
+        );
+        let mut shared_queue_leases = BTreeMap::new();
+        shared_queue_leases.insert((80, 5), Arc::new(SharedCoSQueueLease::new(1_250_000_000, 256 * 1024, 2)));
+
+        assert!(request_uses_shared_exact_queue_lease(
+            &shared_queue_leases,
+            &forwarding,
+            80,
+            None,
         ));
     }
 }
