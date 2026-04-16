@@ -2511,22 +2511,68 @@ fn mix_cos_flow_bucket(seed: &mut u64, value: u64) {
 ///
 /// `getrandom(2)` with `flags=0` blocks only during early boot before the
 /// urandom pool is initialized, which is not a path this daemon runs on
-/// (xpfd starts well after systemd-random-seed). If the syscall ever fails
-/// for any reason we fall through to a CLOCK_MONOTONIC-mixed fallback so
-/// the daemon does not abort on queue construction. A predictable seed is
-/// strictly weaker than a random one, but still strictly stronger than the
-/// zero-seed it replaces, so the fallback degrades gracefully.
+/// (xpfd starts well after systemd-random-seed). Retries on `EINTR` and
+/// partial reads (the kernel is allowed to return fewer bytes than
+/// requested; 8 bytes is well below any documented per-call limit so a
+/// partial is pathological, but still explicitly handled rather than
+/// silently degrading). If the syscall ever fails for a real reason we
+/// fall through to a CLOCK_MONOTONIC + pid + stack-address-mixed
+/// fallback so the daemon does not abort on queue construction. The
+/// fallback is strictly weaker than `getrandom` — predictable enough
+/// that it must not be the production path — but strictly stronger
+/// than the zero-seed it replaces, and stays per-call-distinct because
+/// each call mixes in a live clock read and the stack address of the
+/// return buffer.
 pub(super) fn cos_flow_hash_seed_from_os() -> u64 {
     let mut buf = [0u8; 8];
-    // SAFETY: libc::getrandom writes exactly buf.len() bytes on success.
-    let rc = unsafe { libc::getrandom(buf.as_mut_ptr().cast::<libc::c_void>(), buf.len(), 0) };
-    if rc == buf.len() as isize {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        // SAFETY: `buf[filled..]` is a valid mutable slice of length
+        // `buf.len() - filled` for the duration of the call.
+        let rc = unsafe {
+            libc::getrandom(
+                buf.as_mut_ptr().add(filled).cast::<libc::c_void>(),
+                buf.len() - filled,
+                0,
+            )
+        };
+        if rc > 0 {
+            filled += rc as usize;
+            continue;
+        }
+        if rc < 0 {
+            let err = std::io::Error::last_os_error().raw_os_error();
+            if err == Some(libc::EINTR) {
+                continue;
+            }
+        }
+        // rc == 0 (should not happen for getrandom) or a real error: bail
+        // to the fallback rather than spinning.
+        break;
+    }
+    if filled == buf.len() {
         return u64::from_ne_bytes(buf);
     }
-    let now = std::time::Instant::now().elapsed().as_nanos() as u64;
+
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid out-pointer for `clock_gettime`.
+    let now = unsafe {
+        if libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) == 0 {
+            (ts.tv_sec as u64)
+                .wrapping_mul(1_000_000_000)
+                .wrapping_add(ts.tv_nsec as u64)
+        } else {
+            0
+        }
+    };
     let pid = std::process::id() as u64;
+    let stack_addr = (&buf as *const [u8; 8]) as usize as u64;
     let mut fallback = now ^ pid.wrapping_mul(0x9e3779b97f4a7c15);
     mix_cos_flow_bucket(&mut fallback, now.rotate_left(17));
+    mix_cos_flow_bucket(&mut fallback, stack_addr.rotate_left(31));
     fallback
 }
 
@@ -3362,6 +3408,15 @@ fn ensure_cos_interface_runtime(
         if let Some(iface_fast) = binding.cos_fast_interfaces.get(&egress_ifindex) {
             for (queue, queue_fast) in runtime.queues.iter_mut().zip(&iface_fast.queue_fast_path) {
                 queue.flow_fair = queue.exact && !queue_fast.shared_exact;
+                // Draw the SFQ salt only for queues that actually use the
+                // flow-fair path. Non-flow-fair queues do not consult the
+                // seed (exact_cos_flow_bucket is only called from the
+                // flow-fair callers), so issuing a getrandom syscall for
+                // them would be wasted work. Keeping them at seed=0 also
+                // preserves byte-identical legacy behavior on that path.
+                if queue.flow_fair {
+                    queue.flow_hash_seed = cos_flow_hash_seed_from_os();
+                }
             }
         }
         binding.cos_interfaces.insert(egress_ifindex, runtime);
@@ -3395,7 +3450,10 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 transmit_rate_bytes: queue.transmit_rate_bytes,
                 exact: queue.exact,
                 flow_fair: false,
-                flow_hash_seed: cos_flow_hash_seed_from_os(),
+                // Zero until `ensure_cos_interface_runtime` promotes a queue
+                // onto the flow-fair path and draws a real seed. On the
+                // non-flow-fair path this field is never read.
+                flow_hash_seed: 0,
                 surplus_weight: queue.surplus_weight,
                 surplus_deficit: 0,
                 buffer_bytes: queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
@@ -7950,13 +8008,55 @@ mod tests {
     }
 
     #[test]
+    fn build_cos_interface_runtime_leaves_flow_hash_seed_zero_until_promotion() {
+        // The seed is drawn in `ensure_cos_interface_runtime`, not in
+        // `build_cos_interface_runtime`. Pin this so a refactor that
+        // accidentally moves the getrandom call into the builder is
+        // caught: builder-time seeding would burn a syscall per non-
+        // flow-fair queue and would also drift the struct doc invariant
+        // that non-flow-fair queues keep seed=0.
+        let root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![
+                CoSQueueConfig {
+                    queue_id: 4,
+                    forwarding_class: "iperf-a".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000_000 / 8,
+                    exact: true,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                },
+                CoSQueueConfig {
+                    queue_id: 5,
+                    forwarding_class: "iperf-b".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 10_000_000_000 / 8,
+                    exact: true,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                },
+            ],
+        );
+        for queue in &root.queues {
+            assert!(!queue.flow_fair);
+            assert_eq!(queue.flow_hash_seed, 0);
+        }
+    }
+
+    #[test]
     fn cos_flow_hash_seed_from_os_draws_nonzero_entropy() {
-        // Best-effort: getrandom(2) is required by the xpfd runtime
-        // environment; the fallback path exists but should not fire in
-        // tests. Draw a few seeds and assert at least one is non-zero
-        // (a zero seed is possible, just astronomically unlikely for
-        // multiple draws — failing on all-zero catches the degenerate
-        // "seed is always 0" regression, not a cold-boot urandom case).
+        // Regression guard for the degenerate "seed is always 0" case.
+        // Does NOT distinguish getrandom(2) from the fallback path — either
+        // source is acceptable to satisfy the not-all-zero invariant. The
+        // fallback path's own quality is exercised indirectly by the
+        // diverges-across-seeds test; here we only catch "seeding is wired
+        // up end-to-end and produces non-zero output most of the time". A
+        // single zero draw is possible, just astronomically unlikely for
+        // four independent draws, so four-trial not-all-zero is a safe
+        // floor.
         let mut any_nonzero = false;
         for _ in 0..4 {
             if cos_flow_hash_seed_from_os() != 0 {
@@ -7964,7 +8064,7 @@ mod tests {
                 break;
             }
         }
-        assert!(any_nonzero, "getrandom + fallback path both returned 0");
+        assert!(any_nonzero, "seed source returned 0 on four draws in a row");
     }
 
     #[test]

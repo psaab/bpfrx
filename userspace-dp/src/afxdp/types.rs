@@ -773,12 +773,14 @@ pub(super) struct CoSQueueRuntime {
     pub(super) flow_fair: bool,
     // Per-queue hash salt mixed into `exact_cos_flow_bucket()` so the SFQ
     // bucket mapping is not an externally-probeable pure function of the
-    // 5-tuple. Initialized once from getrandom(2) at queue construction and
-    // never rotated for the lifetime of this runtime — within one instance
-    // the mapping stays deterministic (required for correct enqueue/dequeue
+    // 5-tuple. Drawn from getrandom(2) exactly when a queue is promoted
+    // onto the flow-fair path (see `ensure_cos_interface_runtime`), never
+    // rotated for the lifetime of this runtime — within one instance the
+    // mapping stays deterministic (required for correct enqueue/dequeue
     // bucket accounting), but is unpredictable across restarts and nodes.
-    // Non-flow-fair queues keep `flow_hash_seed: 0`; the seed is a no-op on
-    // the non-flow-fair path.
+    // Non-flow-fair queues keep `flow_hash_seed: 0`; the field is not read
+    // on that path and the zero value preserves byte-identical legacy
+    // hashing for any caller that reuses the function.
     pub(super) flow_hash_seed: u64,
     pub(super) surplus_weight: u32,
     pub(super) surplus_deficit: u64,
