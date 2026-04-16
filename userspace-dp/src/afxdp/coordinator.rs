@@ -2221,20 +2221,39 @@ mod tests {
         let leases = build_shared_cos_root_leases(&forwarding, &active_shards_by_egress_ifindex);
         let lease = leases.get(&80).expect("shared root lease");
 
-        let first = lease.acquire(1, 2500);
-        let second = lease.acquire(1, 2500);
-        let third = lease.acquire(1, 2500);
-        let fourth = lease.acquire(1, 2500);
-        let fifth = lease.acquire(1, 1);
+        // The root lease budget must scale with active_shards: total
+        // grantable = lease_bytes * active_shards. That is the actual
+        // invariant this test pins. Drive it by reading active_shards
+        // from the fixture (so the assertion does not silently decouple
+        // from the setup) and drain the budget with fixed-size requests
+        // plus a tail remainder for whatever the budget does not cleanly
+        // divide by — lease_bytes is a function of shaping rate and
+        // COS_ROOT_LEASE_TARGET_US, both of which are tuning knobs, so
+        // an exact-divisibility assertion would make this test brittle
+        // against legitimate scheduler tuning.
+        let active_shards = *active_shards_by_egress_ifindex
+            .get(&80)
+            .expect("active shards configured for egress ifindex 80")
+            as u64;
+        let lease_bytes = lease.lease_bytes();
+        let expected_total = lease_bytes * active_shards;
+        let per_request = 2500u64;
 
-        assert_eq!(first, 2500);
-        assert_eq!(second, 2500);
-        assert_eq!(third, 2500);
-        assert_eq!(
-            first + second + third + fourth,
-            (tx_frame_capacity() as u64) * 2
-        );
-        assert_eq!(fifth, 0);
+        let mut remaining = expected_total;
+        let mut total = 0u64;
+        while remaining > 0 {
+            let req = remaining.min(per_request);
+            let granted = lease.acquire(1, req);
+            assert_eq!(
+                granted, req,
+                "root lease must grant the full request while budget remains",
+            );
+            total += granted;
+            remaining -= granted;
+        }
+        assert_eq!(total, expected_total);
+        // Budget fully drained — any further acquire must return 0.
+        assert_eq!(lease.acquire(1, 1), 0);
     }
 
     #[test]

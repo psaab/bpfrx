@@ -7455,7 +7455,8 @@ mod tests {
     // classify does not clobber upstream classification.  The new invariant asserted below: when
     // the output filter has no tx-side effect, ingress input-filter classification is preserved.
     #[test]
-    fn resolve_cos_queue_id_defaults_when_output_filter_has_no_forwarding_class() {
+    fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_no_forwarding_class()
+     {
         let snapshot = ConfigSnapshot {
             interfaces: vec![
                 InterfaceSnapshot {
