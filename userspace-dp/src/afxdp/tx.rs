@@ -1145,6 +1145,25 @@ fn maybe_top_up_cos_queue_lease(
     shared_queue_lease: Option<&Arc<SharedCoSQueueLease>>,
     now_ns: u64,
 ) {
+    if queue.exact {
+        let Some(shared_queue_lease) = shared_queue_lease else {
+            return;
+        };
+        let lease_bytes = shared_queue_lease
+            .lease_bytes()
+            .max(tx_frame_capacity() as u64)
+            .min(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
+        if queue.tokens >= lease_bytes {
+            return;
+        }
+        let grant = shared_queue_lease.acquire(now_ns, lease_bytes.saturating_sub(queue.tokens));
+        queue.tokens = queue
+            .tokens
+            .saturating_add(grant)
+            .min(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
+        queue.last_refill_ns = now_ns;
+        return;
+    }
     let Some(shared_queue_lease) = shared_queue_lease else {
         refill_cos_tokens(
             &mut queue.tokens,
@@ -3267,6 +3286,41 @@ mod tests {
             select_cos_guarantee_batch_with_fast_path(&mut root, &queue_fast_path, 1_000_000_000,)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn exact_queue_without_shared_lease_does_not_locally_refill() {
+        let mut root = test_cos_runtime_with_queues(
+            400_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "best-effort".into(),
+                priority: 5,
+                transmit_rate_bytes: 100_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 125_000,
+                dscp_rewrite: None,
+            }],
+        );
+        root.tokens = 1500;
+        root.queues[0].tokens = 0;
+        root.queues[0].items.push_back(test_cos_item(1500));
+        root.queues[0].queued_bytes = 1500;
+        root.queues[0].runnable = true;
+        root.nonempty_queues = 1;
+        root.runnable_queues = 1;
+        let queue_fast_path = vec![test_queue_fast_path(true, 0, None, None)];
+
+        let batch =
+            select_cos_guarantee_batch_with_fast_path(&mut root, &queue_fast_path, 1_000_000_000);
+
+        assert!(
+            batch.is_none(),
+            "exact queues must not locally refill when the shared queue lease is unavailable"
+        );
+        assert_eq!(root.queues[0].tokens, 0);
+        assert_eq!(root.queues[0].last_refill_ns, 0);
     }
 
     #[test]
