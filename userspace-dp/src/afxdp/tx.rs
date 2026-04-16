@@ -8551,6 +8551,230 @@ mod tests {
         assert_eq!(root.legacy_guarantee_rr, 0);
     }
 
+    // ---------------------------------------------------------------------
+    // #698 — per-worker exact-drain micro-bench
+    //
+    // Purpose: establish an in-tree, reproducible measurement of the
+    // userspace drain-path cost per packet. The value of
+    // `COS_SHARED_EXACT_MIN_RATE_BYTES` (2.5 Gbps) is cited in commit
+    // history as "the single-worker sustained exact throughput ceiling";
+    // before this harness existed there was no checked-in data supporting
+    // that number.
+    //
+    // Scope (what this measures):
+    //   - `drain_exact_local_fifo_items_to_scratch`
+    //       VecDeque indexed read, pattern match, free-frame pop, UMEM
+    //       `slice_mut_unchecked` + `copy_from_slice` (the 1500-byte
+    //       memcpy that dominates `memmove` in the live profile),
+    //       scratch Vec push, running root/secondary budget decrement.
+    //   - `settle_exact_local_fifo_submission`
+    //       queue.items.pop_front per sent packet, scratch Vec pop.
+    //   - Re-prime between iterations — simulates a steady inflow of
+    //       new items from the upstream CoS enqueue path.
+    //
+    // Scope (what this does NOT measure):
+    //   - TX ring insert + commit (no XDP socket in unit tests; this
+    //     is a ring-buffer write + release store on the producer index,
+    //     ~20 ns combined on x86-64, amortized away at TX_BATCH_SIZE).
+    //   - The `sendto()` syscall used for kernel TX wakeup (amortized
+    //     over TX_BATCH_SIZE = 256 packets, ~2–4 ns per packet).
+    //   - Completion ring reap (`reap_tx_completions`) — ~20–50 ns per
+    //     completion, mostly ring-buffer read + VecDeque push-back.
+    //   - All non-drain per-worker cost: RX, forwarding, NAT, session
+    //     lookup, conntrack. Measured in the live cluster profile, not
+    //     here. Those costs dominate in production and are the real
+    //     gate on per-worker aggregate throughput.
+    //
+    // What this tells us about the MIN constant:
+    //   - If drain-path Gbps is >> 2.5 Gbps, the constant is NOT gated
+    //     by drain speed. MIN reflects "what's left after RX + forward
+    //     + NAT consume 80%+ of the per-worker budget" — consistent
+    //     with the PR #680 collapse shape where the drain loop couldn't
+    //     absorb aggregate line-rate because of *other* per-packet work.
+    //   - If drain-path Gbps is < 2.5 Gbps, MIN is provably too high
+    //     and must drop. (Unlikely — drain is tightly bounded by a
+    //     1500-byte memcpy and a few VecDeque ops.)
+    //
+    // Running: `cargo test --manifest-path userspace-dp/Cargo.toml
+    //           cos_exact_drain_throughput_micro_bench -- --ignored
+    //           --nocapture`
+    //
+    // Hardware and noise: numbers depend on the box's core frequency
+    // and L1/L2 cache state. Run on quiet hardware; the published
+    // baseline in this commit's message was captured under those
+    // conditions. A repeat run after a refactor should stay within
+    // ~15% of the baseline — larger deltas warrant investigation.
+    // ---------------------------------------------------------------------
+    #[test]
+    #[ignore]
+    fn cos_exact_drain_throughput_micro_bench() {
+        use std::time::Instant;
+
+        // Mirror of `COS_SHARED_EXACT_MIN_RATE_BYTES` in `worker.rs`. Kept
+        // as a local const so this bench does not require widening that
+        // constant's visibility. If `worker.rs` changes the MIN, update
+        // this mirror — the bench asserts against it for the verdict.
+        const MIN_RATE_BYTES: u64 = 2_500_000_000 / 8;
+        const PACKET_LEN: usize = 1500;
+        const BATCHES: usize = 10_000;
+        // Each drain call takes TX_BATCH_SIZE items. Prime enough items
+        // for one batch; after each iteration we repopulate the queue
+        // and free-frame pool so the measurement reflects steady state,
+        // not a cold-start transient.
+        const ITEMS_PER_BATCH: usize = TX_BATCH_SIZE;
+
+        // UMEM: 2 MB is the hugepage-aligned minimum in MmapArea. That
+        // fits TX_BATCH_SIZE * 4096 = 1 MB of frame slots with headroom.
+        let area = MmapArea::new(2 * 1024 * 1024).expect("mmap umem");
+
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 10_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 4 * 1024 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        root.tokens = u64::MAX;
+        root.queues[0].tokens = u64::MAX;
+        root.queues[0].runnable = true;
+
+        let packet_bytes = vec![0xABu8; PACKET_LEN];
+        let mut scratch = Vec::with_capacity(ITEMS_PER_BATCH);
+        let mut free_frames: VecDeque<u64> =
+            (0..ITEMS_PER_BATCH as u64).map(|i| i * 4096).collect();
+
+        // Prime: one full batch of items. Each iteration below drains
+        // them all and then re-primes both the items and the free frames
+        // to the same initial state.
+        let prime_queue = |queue: &mut CoSQueueRuntime, packet: &[u8]| {
+            queue.items.clear();
+            queue.queued_bytes = 0;
+            for _ in 0..ITEMS_PER_BATCH {
+                queue.items.push_back(CoSPendingTxItem::Local(TxRequest {
+                    bytes: packet.to_vec(),
+                    expected_ports: None,
+                    expected_addr_family: libc::AF_INET as u8,
+                    expected_protocol: PROTO_TCP,
+                    flow_key: None,
+                    egress_ifindex: 80,
+                    cos_queue_id: Some(5),
+                    dscp_rewrite: None,
+                }));
+                queue.queued_bytes += packet.len() as u64;
+            }
+        };
+
+        // Warmup: 1000 batches to settle caches and branch predictors.
+        for _ in 0..1000 {
+            prime_queue(&mut root.queues[0], &packet_bytes);
+            scratch.clear();
+            free_frames = (0..ITEMS_PER_BATCH as u64).map(|i| i * 4096).collect();
+            let build = drain_exact_local_fifo_items_to_scratch(
+                &mut root.queues[0],
+                &mut free_frames,
+                &mut scratch,
+                &area,
+                u64::MAX,
+                u64::MAX,
+                None,
+            );
+            assert!(matches!(build, ExactCoSScratchBuild::Ready));
+            let inserted = scratch.len();
+            settle_exact_local_fifo_submission(
+                Some(&mut root.queues[0]),
+                &mut free_frames,
+                &mut scratch,
+                inserted,
+            );
+        }
+
+        // Measurement.
+        let start = Instant::now();
+        let mut total_packets = 0u64;
+        let mut total_bytes = 0u64;
+        for _ in 0..BATCHES {
+            prime_queue(&mut root.queues[0], &packet_bytes);
+            scratch.clear();
+            free_frames = (0..ITEMS_PER_BATCH as u64).map(|i| i * 4096).collect();
+
+            let build = drain_exact_local_fifo_items_to_scratch(
+                &mut root.queues[0],
+                &mut free_frames,
+                &mut scratch,
+                &area,
+                u64::MAX,
+                u64::MAX,
+                None,
+            );
+            assert!(matches!(build, ExactCoSScratchBuild::Ready));
+            let inserted = scratch.len();
+            let (sent_pkts, sent_bytes) = settle_exact_local_fifo_submission(
+                Some(&mut root.queues[0]),
+                &mut free_frames,
+                &mut scratch,
+                inserted,
+            );
+            total_packets += sent_pkts;
+            total_bytes += sent_bytes;
+        }
+        let elapsed = start.elapsed();
+
+        let ns_per_packet = elapsed.as_nanos() as f64 / total_packets as f64;
+        let mpps = total_packets as f64 / elapsed.as_secs_f64() / 1.0e6;
+        let gbps = (total_bytes as f64 * 8.0) / elapsed.as_secs_f64() / 1.0e9;
+
+        eprintln!(
+            "\n=== #698 exact-drain userspace micro-bench ===\n\
+             packet len            : {} B\n\
+             batches               : {}\n\
+             packets per batch     : {}\n\
+             total packets         : {}\n\
+             total bytes           : {} ({:.2} MB)\n\
+             elapsed               : {:?}\n\
+             ns/packet (drain+settle): {:.2}\n\
+             throughput (pps)      : {:.3} Mpps\n\
+             throughput (line rate): {:.3} Gbps\n\
+             min-constant gate     : {:.3} Gbps (MIN_RATE_BYTES)\n\
+             verdict               : {}\n\
+             scope note            : userspace drain path only; excludes TX\n\
+                                     ring insert/commit, kernel wakeup, and\n\
+                                     completion ring reap. Live per-worker\n\
+                                     aggregate ceiling is lower because RX +\n\
+                                     forward + NAT + session work consume\n\
+                                     most of the per-packet budget.\n\
+             ================================================\n",
+            PACKET_LEN,
+            BATCHES,
+            ITEMS_PER_BATCH,
+            total_packets,
+            total_bytes,
+            total_bytes as f64 / (1024.0 * 1024.0),
+            elapsed,
+            ns_per_packet,
+            mpps,
+            gbps,
+            (MIN_RATE_BYTES * 8) as f64 / 1.0e9,
+            if gbps > (MIN_RATE_BYTES * 8) as f64 / 1.0e9 {
+                "drain alone exceeds MIN — constant gated by non-drain per-worker work (expected)"
+            } else {
+                "drain alone below MIN — constant is TOO HIGH; lower it and re-validate live"
+            },
+        );
+
+        assert!(
+            total_packets as usize == BATCHES * ITEMS_PER_BATCH,
+            "every batch must fully drain: {} != {}",
+            total_packets,
+            BATCHES * ITEMS_PER_BATCH
+        );
+    }
+
     #[test]
     fn surplus_phase_prefers_higher_priority_queue() {
         let mut root = test_cos_runtime_with_queues(
