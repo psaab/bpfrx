@@ -2221,20 +2221,29 @@ mod tests {
         let leases = build_shared_cos_root_leases(&forwarding, &active_shards_by_egress_ifindex);
         let lease = leases.get(&80).expect("shared root lease");
 
-        let first = lease.acquire(1, 2500);
-        let second = lease.acquire(1, 2500);
-        let third = lease.acquire(1, 2500);
-        let fourth = lease.acquire(1, 2500);
-        let fifth = lease.acquire(1, 1);
-
-        assert_eq!(first, 2500);
-        assert_eq!(second, 2500);
-        assert_eq!(third, 2500);
+        // The root lease budget should scale with active_shards: at lease_bytes = 20 000 bytes and
+        // active_shards = 2, per-lease-config budget is lease_bytes * active_shards = 40 000 bytes.
+        // That is what this test pins — drain the budget with fixed-size requests and assert the
+        // cumulative grant equals lease_bytes * active_shards and that further acquires return 0.
+        let lease_bytes = lease.lease_bytes();
+        let per_request = 2500u64;
+        let expected_total = lease_bytes * 2;
         assert_eq!(
-            first + second + third + fourth,
-            (tx_frame_capacity() as u64) * 2
+            expected_total % per_request,
+            0,
+            "test assumes budget divides evenly into request size"
         );
-        assert_eq!(fifth, 0);
+        let request_count = (expected_total / per_request) as usize;
+
+        let mut total = 0u64;
+        for _ in 0..request_count {
+            let granted = lease.acquire(1, per_request);
+            assert_eq!(granted, per_request);
+            total += granted;
+        }
+        assert_eq!(total, expected_total);
+        let overflow = lease.acquire(1, 1);
+        assert_eq!(overflow, 0);
     }
 
     #[test]

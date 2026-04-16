@@ -4733,22 +4733,25 @@ mod tests {
 
     #[test]
     fn maybe_top_up_cos_root_lease_unblocks_large_frame_exceeding_lease_bytes() {
-        // At 400 Mbps / 256 KB burst / 1 shard, lease_bytes() == 1500, which is less than
-        // tx_frame_capacity() == 4096.  Without the .max(tx_frame_capacity()) fix, root.tokens
+        // Pick a shaping rate low enough that lease_bytes() floors to COS_ROOT_LEASE_MIN_BYTES
+        // (1500) and stays below tx_frame_capacity() (4096).  At 50 Mbps / 256 KB burst / 1 shard
+        // the raw target lease is rate*TARGET_US/1e6 = 1250 bytes, which floors up to 1500.
+        // Without the .max(tx_frame_capacity()) fix in maybe_top_up_cos_root_lease, root.tokens
         // could never exceed 1500 and any frame with len > 1500 would deadlock the CoS queue.
-        let lease = Arc::new(SharedCoSRootLease::new(400_000_000 / 8, 256 * 1024, 1));
+        let rate_bytes = 50_000_000u64 / 8;
+        let lease = Arc::new(SharedCoSRootLease::new(rate_bytes, 256 * 1024, 1));
         assert!(
             lease.lease_bytes() < tx_frame_capacity() as u64,
             "precondition: lease_bytes must be below tx_frame_capacity for this regression"
         );
 
         let mut root = test_cos_runtime_with_queues(
-            400_000_000 / 8,
+            rate_bytes,
             vec![CoSQueueConfig {
                 queue_id: 0,
                 forwarding_class: "best-effort".into(),
                 priority: 5,
-                transmit_rate_bytes: 400_000_000 / 8,
+                transmit_rate_bytes: rate_bytes,
                 exact: false,
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
@@ -7421,6 +7424,14 @@ mod tests {
         assert_eq!(queue_id, Some(0));
     }
 
+    // Note on invariant change (replaces the pre-a15a6120 "defaults to iface default" behavior):
+    // The original shape of this test asserted that an output filter with NO tx-side effect (no
+    // forwarding_class, no counter) would still shadow the ingress input filter's classification
+    // and leave egress at the interface default queue.  Commit a15a6120 changed the gating so the
+    // output filter is skipped entirely when it has neither forwarding_class, dscp_rewrite, nor
+    // counter terms — matching Junos semantics, where a classify-only output filter that does not
+    // classify does not clobber upstream classification.  The new invariant asserted below: when
+    // the output filter has no tx-side effect, ingress input-filter classification is preserved.
     #[test]
     fn resolve_cos_queue_id_defaults_when_output_filter_has_no_forwarding_class() {
         let snapshot = ConfigSnapshot {
@@ -7538,7 +7549,12 @@ mod tests {
             }),
         );
 
-        assert_eq!(queue_id, Some(7));
+        // cos-classify on reth1.0 maps expedited-forwarding -> queue 1.  The output filter
+        // wan-classify on reth0.0 has no tx-side effect (no forwarding_class, no dscp_rewrite,
+        // no counter), so post-a15a6120 it is bypassed and the ingress classification is
+        // preserved.  Pre-a15a6120 this was expected to fall through to the iface default queue
+        // (best-effort = 7); that contract no longer holds and is captured by this test.
+        assert_eq!(queue_id, Some(1));
     }
 
     #[test]
