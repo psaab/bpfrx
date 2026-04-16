@@ -1,51 +1,38 @@
 use super::*;
 
+fn cos_queue_fast_path_for_request<'a>(
+    cos_fast_interfaces: &'a FastMap<i32, WorkerCoSInterfaceFastPath>,
+    egress_ifindex: i32,
+    requested_queue_id: Option<u8>,
+) -> Option<&'a WorkerCoSQueueFastPath> {
+    let iface = cos_fast_interfaces.get(&egress_ifindex)?;
+    iface.queue_fast_path(requested_queue_id)
+}
+
 fn cos_owner_live_for_request(
-    forwarding: &ForwardingState,
-    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
+    cos_fast_interfaces: &FastMap<i32, WorkerCoSInterfaceFastPath>,
     egress_ifindex: i32,
     requested_queue_id: Option<u8>,
 ) -> Option<Arc<BindingLiveState>> {
-    let effective_queue_id = requested_queue_id.or_else(|| {
-        forwarding
-            .cos
-            .interfaces
-            .get(&egress_ifindex)
-            .map(|iface| iface.default_queue)
-    });
-    effective_queue_id.and_then(|queue_id| {
-        cos_owner_live_by_queue
-            .get(&(egress_ifindex, queue_id))
-            .cloned()
-    })
+    cos_queue_fast_path_for_request(cos_fast_interfaces, egress_ifindex, requested_queue_id)
+        .and_then(|queue_fast| queue_fast.owner_live.clone())
 }
 
 fn request_uses_shared_exact_queue_lease(
-    cos_shared_queue_leases: &BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>,
-    forwarding: &ForwardingState,
+    cos_fast_interfaces: &FastMap<i32, WorkerCoSInterfaceFastPath>,
     egress_ifindex: i32,
     requested_queue_id: Option<u8>,
 ) -> bool {
-    let effective_queue_id = requested_queue_id.or_else(|| {
-        forwarding
-            .cos
-            .interfaces
-            .get(&egress_ifindex)
-            .map(|iface| iface.default_queue)
-    });
-    effective_queue_id
-        .is_some_and(|queue_id| cos_shared_queue_leases.contains_key(&(egress_ifindex, queue_id)))
+    cos_queue_fast_path_for_request(cos_fast_interfaces, egress_ifindex, requested_queue_id)
+        .is_some_and(|queue_fast| queue_fast.shared_queue_lease.is_some())
 }
 
 fn enqueue_local_request_to_target_or_owner(
     target_binding: &mut BindingWorker,
-    forwarding: &ForwardingState,
-    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
     req: TxRequest,
 ) -> Result<(), TxRequest> {
     if request_uses_shared_exact_queue_lease(
-        &target_binding.cos_shared_queue_leases,
-        forwarding,
+        &target_binding.cos_fast_interfaces,
         req.egress_ifindex,
         req.cos_queue_id,
     ) {
@@ -54,8 +41,7 @@ fn enqueue_local_request_to_target_or_owner(
         return Ok(());
     }
     let owner_live = cos_owner_live_for_request(
-        forwarding,
-        cos_owner_live_by_queue,
+        &target_binding.cos_fast_interfaces,
         req.egress_ifindex,
         req.cos_queue_id,
     );
@@ -158,14 +144,7 @@ pub(super) fn enqueue_pending_forwards(
                 cos_queue_id: request.cos_queue_id,
                 dscp_rewrite: request.dscp_rewrite,
             };
-            if enqueue_local_request_to_target_or_owner(
-                target_binding,
-                forwarding,
-                cos_owner_live_by_queue,
-                req,
-            )
-            .is_err()
-            {
+            if enqueue_local_request_to_target_or_owner(target_binding, req).is_err() {
                 recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                 continue;
             }
@@ -411,13 +390,11 @@ pub(super) fn enqueue_pending_forwards(
                 let is_nat64 = request.decision.nat.nat64;
                 let uses_native_tunnel = request.decision.resolution.tunnel_endpoint_id != 0;
                 let owner_matches_target = request_uses_shared_exact_queue_lease(
-                    &target_binding.cos_shared_queue_leases,
-                    forwarding,
+                    &target_binding.cos_fast_interfaces,
                     request.decision.resolution.egress_ifindex,
                     request.cos_queue_id,
                 ) || cos_owner_live_for_request(
-                    forwarding,
-                    cos_owner_live_by_queue,
+                    &target_binding.cos_fast_interfaces,
                     request.decision.resolution.egress_ifindex,
                     request.cos_queue_id,
                 )
@@ -535,13 +512,8 @@ pub(super) fn enqueue_pending_forwards(
                                     cos_queue_id: request.cos_queue_id,
                                     dscp_rewrite: request.dscp_rewrite,
                                 };
-                                if enqueue_local_request_to_target_or_owner(
-                                    target_binding,
-                                    forwarding,
-                                    cos_owner_live_by_queue,
-                                    req,
-                                )
-                                .is_err()
+                                if enqueue_local_request_to_target_or_owner(target_binding, req)
+                                    .is_err()
                                 {
                                     build_failed = true;
                                     fallback_to_slow_path = true;
@@ -795,13 +767,8 @@ pub(super) fn enqueue_pending_forwards(
                                     cos_queue_id: request.cos_queue_id,
                                     dscp_rewrite: request.dscp_rewrite,
                                 };
-                                if enqueue_local_request_to_target_or_owner(
-                                    target_binding,
-                                    forwarding,
-                                    cos_owner_live_by_queue,
-                                    req,
-                                )
-                                .is_err()
+                                if enqueue_local_request_to_target_or_owner(target_binding, req)
+                                    .is_err()
                                 {
                                     build_failed = true;
                                     fallback_to_slow_path = true;
@@ -1557,6 +1524,38 @@ mod tests {
         }
     }
 
+    fn test_cos_fast_interfaces(
+        egress_ifindex: i32,
+        default_queue: u8,
+        shared_exact_queues: &[(u8, bool)],
+    ) -> FastMap<i32, WorkerCoSInterfaceFastPath> {
+        let mut queue_index_by_id = [COS_FAST_QUEUE_INDEX_MISS; 256];
+        let mut queue_fast_path = Vec::new();
+        for (idx, (queue_id, shared_exact)) in shared_exact_queues.iter().copied().enumerate() {
+            queue_index_by_id[usize::from(queue_id)] = idx as u16;
+            queue_fast_path.push(WorkerCoSQueueFastPath {
+                shared_exact,
+                owner_worker_id: 0,
+                owner_live: None,
+                shared_queue_lease: shared_exact
+                    .then(|| Arc::new(SharedCoSQueueLease::new(1_250_000_000, 256 * 1024, 2))),
+            });
+        }
+        let mut interfaces = FastMap::default();
+        interfaces.insert(
+            egress_ifindex,
+            WorkerCoSInterfaceFastPath {
+                tx_ifindex: 11,
+                default_queue_index: queue_index_by_id[usize::from(default_queue)] as usize,
+                queue_index_by_id,
+                tx_owner_live: None,
+                shared_root_lease: None,
+                queue_fast_path,
+            },
+        );
+        interfaces
+    }
+
     #[test]
     fn forwarded_tcp_may_need_segmentation_skips_mtu_sized_frame() {
         let forwarding = test_forwarding_with_egress_mtu(1500);
@@ -1595,22 +1594,15 @@ mod tests {
 
     #[test]
     fn shared_exact_queue_lease_uses_requested_queue_id() {
-        let forwarding = ForwardingState::default();
-        let mut shared_queue_leases = BTreeMap::new();
-        shared_queue_leases.insert(
-            (80, 5),
-            Arc::new(SharedCoSQueueLease::new(1_250_000_000, 256 * 1024, 2)),
-        );
+        let cos_fast_interfaces = test_cos_fast_interfaces(80, 5, &[(5, true)]);
 
         assert!(request_uses_shared_exact_queue_lease(
-            &shared_queue_leases,
-            &forwarding,
+            &cos_fast_interfaces,
             80,
             Some(5),
         ));
         assert!(!request_uses_shared_exact_queue_lease(
-            &shared_queue_leases,
-            &forwarding,
+            &cos_fast_interfaces,
             80,
             Some(4),
         ));
@@ -1618,30 +1610,10 @@ mod tests {
 
     #[test]
     fn shared_exact_queue_lease_uses_interface_default_queue() {
-        let mut forwarding = ForwardingState::default();
-        forwarding.cos.interfaces.insert(
-            80,
-            CoSInterfaceConfig {
-                shaping_rate_bytes: 10_000_000_000u64 / 8,
-                burst_bytes: 256 * 1024,
-                default_queue: 5,
-                dscp_classifier: String::new(),
-                ieee8021_classifier: String::new(),
-                dscp_queue_by_dscp: [0; 64],
-                ieee8021_queue_by_pcp: [0; 8],
-                queue_by_forwarding_class: FastMap::default(),
-                queues: Vec::new(),
-            },
-        );
-        let mut shared_queue_leases = BTreeMap::new();
-        shared_queue_leases.insert(
-            (80, 5),
-            Arc::new(SharedCoSQueueLease::new(1_250_000_000, 256 * 1024, 2)),
-        );
+        let cos_fast_interfaces = test_cos_fast_interfaces(80, 5, &[(5, true)]);
 
         assert!(request_uses_shared_exact_queue_lease(
-            &shared_queue_leases,
-            &forwarding,
+            &cos_fast_interfaces,
             80,
             None,
         ));

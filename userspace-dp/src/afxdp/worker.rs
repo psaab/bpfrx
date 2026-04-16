@@ -17,9 +17,7 @@ pub(crate) struct BindingWorker {
     pub(crate) pending_tx_prepared: VecDeque<PreparedTxRequest>,
     pub(crate) pending_tx_local: VecDeque<TxRequest>,
     pub(crate) max_pending_tx: usize,
-    pub(crate) cos_owner_live_by_tx_ifindex: BTreeMap<i32, Arc<BindingLiveState>>,
-    pub(crate) cos_shared_root_leases: BTreeMap<i32, Arc<SharedCoSRootLease>>,
-    pub(crate) cos_shared_queue_leases: BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>,
+    pub(crate) cos_fast_interfaces: FastMap<i32, WorkerCoSInterfaceFastPath>,
     pub(crate) cos_interfaces: FastMap<i32, CoSInterfaceRuntime>,
     pub(crate) cos_interface_order: Vec<i32>,
     pub(crate) cos_interface_rr: usize,
@@ -294,9 +292,7 @@ impl BindingWorker {
             pending_tx_prepared: VecDeque::new(),
             pending_tx_local: VecDeque::new(),
             max_pending_tx,
-            cos_owner_live_by_tx_ifindex: BTreeMap::new(),
-            cos_shared_root_leases: BTreeMap::new(),
-            cos_shared_queue_leases: BTreeMap::new(),
+            cos_fast_interfaces: FastMap::default(),
             cos_interfaces: FastMap::default(),
             cos_interface_order: Vec::new(),
             cos_interface_rr: 0,
@@ -465,10 +461,17 @@ pub(crate) fn worker_loop(
             .iter()
             .map(|binding| (binding.ifindex, binding.live.clone())),
     );
+    let cos_fast_interfaces = build_worker_cos_fast_interfaces(
+        forwarding.as_ref(),
+        worker_id,
+        &cos_owner_live_by_tx_ifindex,
+        cos_owner_worker_by_queue.as_ref(),
+        cos_owner_live_by_queue.as_ref(),
+        cos_shared_root_leases.as_ref(),
+        cos_shared_queue_leases.as_ref(),
+    );
     for binding in bindings.iter_mut() {
-        binding.cos_owner_live_by_tx_ifindex = cos_owner_live_by_tx_ifindex.clone();
-        binding.cos_shared_root_leases = cos_shared_root_leases.as_ref().clone();
-        binding.cos_shared_queue_leases = cos_shared_queue_leases.as_ref().clone();
+        binding.cos_fast_interfaces = cos_fast_interfaces.clone();
     }
     let mut interrupt_poll_fds = if poll_mode == crate::PollMode::Interrupt {
         bindings
@@ -605,6 +608,7 @@ pub(crate) fn worker_loop(
             validation = **live_validation;
         }
         let live_forwarding = shared_forwarding.load_full();
+        let mut rebuild_cos_fast_interfaces = false;
         if !Arc::ptr_eq(&forwarding, &live_forwarding) {
             let cos_changed =
                 cos_runtime_config_changed(forwarding.as_ref(), live_forwarding.as_ref());
@@ -613,15 +617,18 @@ pub(crate) fn worker_loop(
             sessions.set_timeouts(forwarding.session_timeouts);
             if cos_changed {
                 reset_worker_cos_runtimes(&mut bindings);
+                rebuild_cos_fast_interfaces = true;
             }
         }
         let live_cos_owner_worker_by_queue = shared_cos_owner_worker_by_queue.load_full();
         if !Arc::ptr_eq(&cos_owner_worker_by_queue, &live_cos_owner_worker_by_queue) {
             cos_owner_worker_by_queue = live_cos_owner_worker_by_queue;
+            rebuild_cos_fast_interfaces = true;
         }
         let live_cos_owner_live_by_queue = shared_cos_owner_live_by_queue.load_full();
         if !Arc::ptr_eq(&cos_owner_live_by_queue, &live_cos_owner_live_by_queue) {
             cos_owner_live_by_queue = live_cos_owner_live_by_queue;
+            rebuild_cos_fast_interfaces = true;
         }
         let live_cos_shared_root_leases = shared_cos_root_leases.load_full();
         if !Arc::ptr_eq(&cos_shared_root_leases, &live_cos_shared_root_leases) {
@@ -630,9 +637,7 @@ pub(crate) fn worker_loop(
                 release_all_cos_queue_leases(binding);
             }
             cos_shared_root_leases = live_cos_shared_root_leases;
-            for binding in bindings.iter_mut() {
-                binding.cos_shared_root_leases = cos_shared_root_leases.as_ref().clone();
-            }
+            rebuild_cos_fast_interfaces = true;
         }
         let live_cos_shared_queue_leases = shared_cos_queue_leases.load_full();
         if !Arc::ptr_eq(&cos_shared_queue_leases, &live_cos_shared_queue_leases) {
@@ -640,8 +645,25 @@ pub(crate) fn worker_loop(
                 release_all_cos_queue_leases(binding);
             }
             cos_shared_queue_leases = live_cos_shared_queue_leases;
+            rebuild_cos_fast_interfaces = true;
+        }
+        if rebuild_cos_fast_interfaces {
+            let cos_owner_live_by_tx_ifindex = build_worker_cos_owner_live_by_tx_ifindex(
+                bindings
+                    .iter()
+                    .map(|binding| (binding.ifindex, binding.live.clone())),
+            );
+            let cos_fast_interfaces = build_worker_cos_fast_interfaces(
+                forwarding.as_ref(),
+                worker_id,
+                &cos_owner_live_by_tx_ifindex,
+                cos_owner_worker_by_queue.as_ref(),
+                cos_owner_live_by_queue.as_ref(),
+                cos_shared_root_leases.as_ref(),
+                cos_shared_queue_leases.as_ref(),
+            );
             for binding in bindings.iter_mut() {
-                binding.cos_shared_queue_leases = cos_shared_queue_leases.as_ref().clone();
+                binding.cos_fast_interfaces = cos_fast_interfaces.clone();
             }
         }
         let ha_runtime = ha_state.load();
@@ -675,8 +697,8 @@ pub(crate) fn worker_loop(
             apply_worker_shaped_tx_requests(
                 &mut bindings,
                 forwarding.as_ref(),
+                &binding_lookup,
                 loop_now_ns,
-                cos_owner_live_by_queue.as_ref(),
                 shaped_tx_requests,
             );
         }
@@ -1378,24 +1400,32 @@ pub(crate) fn worker_loop(
 fn apply_worker_shaped_tx_requests(
     bindings: &mut [BindingWorker],
     forwarding: &ForwardingState,
+    binding_lookup: &WorkerBindingLookup,
     now_ns: u64,
-    _cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
     requests: Vec<TxRequest>,
 ) {
     for req in requests {
-        let tx_ifindex = resolve_tx_binding_ifindex(forwarding, req.egress_ifindex);
-        let Some(binding) = bindings
-            .iter_mut()
-            .find(|binding| binding.ifindex == tx_ifindex)
-        else {
+        let binding_index = bindings
+            .first()
+            .and_then(|binding| binding.cos_fast_interfaces.get(&req.egress_ifindex))
+            .and_then(|iface_fast| {
+                binding_lookup
+                    .first_by_if
+                    .get(&iface_fast.tx_ifindex)
+                    .copied()
+            })
+            .or_else(|| {
+                let tx_ifindex = resolve_tx_binding_ifindex(forwarding, req.egress_ifindex);
+                binding_lookup.first_by_if.get(&tx_ifindex).copied()
+            });
+        let Some(binding) = binding_index.and_then(|idx| bindings.get_mut(idx)) else {
             if let Some(binding) = bindings.first_mut() {
                 binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
             }
             if cfg!(feature = "debug-log") {
                 debug_log!(
-                    "DBG COS_OWNER_MISSING_BINDING: egress_ifindex={} tx_ifindex={}",
+                    "DBG COS_OWNER_MISSING_BINDING: egress_ifindex={}",
                     req.egress_ifindex,
-                    tx_ifindex,
                 );
             }
             continue;
@@ -1410,13 +1440,62 @@ fn apply_worker_shaped_tx_requests(
     }
 }
 
-fn build_worker_cos_owner_live_by_tx_ifindex<I>(bindings: I) -> BTreeMap<i32, Arc<BindingLiveState>>
+fn build_worker_cos_owner_live_by_tx_ifindex<I>(bindings: I) -> FastMap<i32, Arc<BindingLiveState>>
 where
     I: IntoIterator<Item = (i32, Arc<BindingLiveState>)>,
 {
-    let mut out = BTreeMap::new();
+    let mut out = FastMap::default();
     for (ifindex, live) in bindings {
         out.entry(ifindex).or_insert(live);
+    }
+    out
+}
+
+fn build_worker_cos_fast_interfaces(
+    forwarding: &ForwardingState,
+    current_worker_id: u32,
+    tx_owner_live_by_tx_ifindex: &FastMap<i32, Arc<BindingLiveState>>,
+    owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
+    owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
+    shared_root_leases: &BTreeMap<i32, Arc<SharedCoSRootLease>>,
+    shared_queue_leases: &BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>,
+) -> FastMap<i32, WorkerCoSInterfaceFastPath> {
+    let mut out = FastMap::default();
+    for (&egress_ifindex, iface) in &forwarding.cos.interfaces {
+        let tx_ifindex = resolve_tx_binding_ifindex(forwarding, egress_ifindex);
+        let mut queue_index_by_id = [COS_FAST_QUEUE_INDEX_MISS; 256];
+        let mut queue_fast_path = Vec::with_capacity(iface.queues.len());
+        for (queue_idx, queue) in iface.queues.iter().enumerate() {
+            queue_index_by_id[usize::from(queue.queue_id)] = queue_idx as u16;
+            let queue_key = (egress_ifindex, queue.queue_id);
+            queue_fast_path.push(WorkerCoSQueueFastPath {
+                shared_exact: queue.exact,
+                owner_worker_id: owner_worker_by_queue
+                    .get(&queue_key)
+                    .copied()
+                    .unwrap_or(current_worker_id),
+                owner_live: owner_live_by_queue.get(&queue_key).cloned(),
+                shared_queue_lease: queue
+                    .exact
+                    .then(|| shared_queue_leases.get(&queue_key).cloned())
+                    .flatten(),
+            });
+        }
+        let default_queue_index = match queue_index_by_id[usize::from(iface.default_queue)] {
+            COS_FAST_QUEUE_INDEX_MISS => 0,
+            idx => idx as usize,
+        };
+        out.insert(
+            egress_ifindex,
+            WorkerCoSInterfaceFastPath {
+                tx_ifindex,
+                default_queue_index,
+                queue_index_by_id,
+                tx_owner_live: tx_owner_live_by_tx_ifindex.get(&tx_ifindex).cloned(),
+                shared_root_lease: shared_root_leases.get(&egress_ifindex).cloned(),
+                queue_fast_path,
+            },
+        );
     }
     out
 }
@@ -1710,6 +1789,117 @@ mod tests {
 
         assert!(Arc::ptr_eq(owners.get(&12).unwrap(), &live_a));
         assert!(Arc::ptr_eq(owners.get(&13).unwrap(), &live_c));
+    }
+
+    #[test]
+    fn build_worker_cos_fast_interfaces_flattens_owner_and_lease_state() {
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 25_000_000,
+                burst_bytes: 256 * 1024,
+                default_queue: 5,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![
+                    CoSQueueConfig {
+                        queue_id: 4,
+                        forwarding_class: "best-effort".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 1_000_000,
+                        exact: false,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 5,
+                        forwarding_class: "iperf-b".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 10_000_000,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 128 * 1024,
+                        dscp_rewrite: None,
+                    },
+                ],
+            },
+        );
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 80,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".into(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+
+        let tx_owner_live = Arc::new(BindingLiveState::new());
+        let queue_owner_live = Arc::new(BindingLiveState::new());
+        let root_lease = Arc::new(SharedCoSRootLease::new(25_000_000, 256 * 1024, 4));
+        let queue_lease = Arc::new(SharedCoSQueueLease::new(10_000_000, 128 * 1024, 4));
+
+        let tx_owner_live_by_tx_ifindex = FastMap::from_iter([(12, tx_owner_live.clone())]);
+        let owner_worker_by_queue = BTreeMap::from([((80, 5), 7)]);
+        let owner_live_by_queue = BTreeMap::from([((80, 5), queue_owner_live.clone())]);
+        let shared_root_leases = BTreeMap::from([(80, root_lease.clone())]);
+        let shared_queue_leases = BTreeMap::from([((80, 5), queue_lease.clone())]);
+
+        let fast = build_worker_cos_fast_interfaces(
+            &forwarding,
+            3,
+            &tx_owner_live_by_tx_ifindex,
+            &owner_worker_by_queue,
+            &owner_live_by_queue,
+            &shared_root_leases,
+            &shared_queue_leases,
+        );
+
+        let iface = fast.get(&80).expect("fast cos interface");
+        assert_eq!(iface.tx_ifindex, 12);
+        assert_eq!(iface.default_queue_index, 1);
+        assert!(Arc::ptr_eq(
+            iface.tx_owner_live.as_ref().expect("tx owner live"),
+            &tx_owner_live
+        ));
+        assert!(Arc::ptr_eq(
+            iface.shared_root_lease.as_ref().expect("shared root lease"),
+            &root_lease
+        ));
+
+        let queue4 = iface.queue_fast_path(Some(4)).expect("queue 4");
+        assert!(!queue4.shared_exact);
+        assert_eq!(queue4.owner_worker_id, 3);
+        assert!(queue4.owner_live.is_none());
+        assert!(queue4.shared_queue_lease.is_none());
+
+        let queue5 = iface.queue_fast_path(Some(5)).expect("queue 5");
+        assert!(queue5.shared_exact);
+        assert_eq!(queue5.owner_worker_id, 7);
+        assert!(Arc::ptr_eq(
+            queue5.owner_live.as_ref().expect("queue owner live"),
+            &queue_owner_live
+        ));
+        assert!(Arc::ptr_eq(
+            queue5
+                .shared_queue_lease
+                .as_ref()
+                .expect("shared queue lease"),
+            &queue_lease
+        ));
+        assert!(std::ptr::eq(
+            iface.queue_fast_path(None).expect("default queue"),
+            queue5
+        ));
     }
 
     #[test]
