@@ -332,14 +332,17 @@ pub(super) fn resolve_cached_cos_tx_selection(
     };
 
     let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
-    let has_output_tx_selection =
-        crate::filter::filter_state_has_output_tx_selection(&forwarding.filter_state, is_v6);
+    let has_output_tx_eval = crate::filter::interface_output_filter_needs_tx_eval(
+        &forwarding.filter_state,
+        egress_ifindex,
+        is_v6,
+    );
     let has_input_tx_selection =
         crate::filter::filter_state_has_input_tx_selection(&forwarding.filter_state, is_v6);
-    if iface.is_none() && !has_output_tx_selection && !has_input_tx_selection {
+    if iface.is_none() && !has_output_tx_eval && !has_input_tx_selection {
         return CachedTxSelectionDescriptor::default();
     }
-    let output_filter = if has_output_tx_selection {
+    let output_filter = if has_output_tx_eval {
         if is_v6 {
             forwarding
                 .filter_state
@@ -357,7 +360,7 @@ pub(super) fn resolve_cached_cos_tx_selection(
         None
     };
     let output_result = output_filter
-        .filter(|filter| filter.affects_tx_selection)
+        .filter(|filter| filter.affects_tx_selection || filter.has_counter_terms)
         .map(|filter| {
             crate::filter::evaluate_filter_ref_tx_selection_cached(
                 filter,
@@ -1406,17 +1409,20 @@ pub(super) fn resolve_cos_tx_selection(
         };
     };
     let is_v6 = meta.addr_family as i32 == libc::AF_INET6;
-    let has_output_tx_selection =
-        crate::filter::filter_state_has_output_tx_selection(&forwarding.filter_state, is_v6);
+    let has_output_tx_eval = crate::filter::interface_output_filter_needs_tx_eval(
+        &forwarding.filter_state,
+        egress_ifindex,
+        is_v6,
+    );
     let has_input_tx_selection =
         crate::filter::filter_state_has_input_tx_selection(&forwarding.filter_state, is_v6);
-    if iface.is_none() && !has_output_tx_selection && !has_input_tx_selection {
+    if iface.is_none() && !has_output_tx_eval && !has_input_tx_selection {
         return CoSTxSelection {
             queue_id: None,
             dscp_rewrite: None,
         };
     }
-    let output_filter = if has_output_tx_selection {
+    let output_filter = if has_output_tx_eval {
         if is_v6 {
             forwarding
                 .filter_state
@@ -1461,21 +1467,22 @@ pub(super) fn resolve_cos_tx_selection(
     } else {
         None
     };
-    let output_result =
-        if let Some(output_filter) = output_filter.filter(|filter| filter.affects_tx_selection) {
-            crate::filter::evaluate_filter_ref_tx_selection_counted(
-                output_filter,
-                flow_key.src_ip,
-                flow_key.dst_ip,
-                flow_key.protocol,
-                flow_key.src_port,
-                flow_key.dst_port,
-                meta.dscp,
-                meta.pkt_len as u64,
-            )
-        } else {
-            crate::filter::TxSelectionFilterResult::default()
-        };
+    let output_result = if let Some(output_filter) =
+        output_filter.filter(|filter| filter.affects_tx_selection || filter.has_counter_terms)
+    {
+        crate::filter::evaluate_filter_ref_tx_selection_counted(
+            output_filter,
+            flow_key.src_ip,
+            flow_key.dst_ip,
+            flow_key.protocol,
+            flow_key.src_port,
+            flow_key.dst_port,
+            meta.dscp,
+            meta.pkt_len as u64,
+        )
+    } else {
+        crate::filter::TxSelectionFilterResult::default()
+    };
     let mut effective_dscp_rewrite = output_result.dscp_rewrite;
     let mut ingress_forwarding_class = None;
     if let Some(ingress_filter) = ingress_filter.filter(|filter| filter.affects_tx_selection) {
@@ -4108,6 +4115,169 @@ mod tests {
         assert_eq!(cached.queue_id, Some(1));
         assert_eq!(cached.dscp_rewrite, None);
         assert!(cached.filter_counter.is_some());
+    }
+
+    #[test]
+    fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                name: "reth0.0".into(),
+                ifindex: 202,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                filter_output_v4: "wan-count".into(),
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
+                cos_shaping_burst_bytes: 256_000,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            }],
+            filters: vec![FirewallFilterSnapshot {
+                name: "wan-count".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "count-only".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: "accept".into(),
+                    count: "wan-hits".into(),
+                    ..Default::default()
+                }],
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                }],
+                dscp_classifiers: vec![],
+                ieee8021_classifiers: vec![],
+                dscp_rewrite_rules: vec![],
+                schedulers: vec![CoSSchedulerSnapshot {
+                    name: "be-sched".into(),
+                    transmit_rate_bytes: 4_000_000,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 128_000,
+                }],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be-sched".into(),
+                    }],
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let forwarding = build_forwarding_state(&snapshot);
+        let cached = resolve_cached_cos_tx_selection(
+            &forwarding,
+            202,
+            UserspaceDpMeta {
+                ingress_ifindex: 5,
+                ingress_vlan_id: 0,
+                addr_family: libc::AF_INET as u8,
+                dscp: 0,
+                ..Default::default()
+            },
+            Some(&SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 443,
+            }),
+        );
+
+        assert_eq!(cached.queue_id, Some(0));
+        assert_eq!(cached.dscp_rewrite, None);
+        assert!(cached.filter_counter.is_some());
+    }
+
+    #[test]
+    fn resolve_cos_tx_selection_counts_counter_only_output_filter_hits() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                name: "reth0.0".into(),
+                ifindex: 202,
+                hardware_addr: "02:bf:72:00:80:08".into(),
+                filter_output_v4: "wan-count".into(),
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
+                cos_shaping_burst_bytes: 256_000,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            }],
+            filters: vec![FirewallFilterSnapshot {
+                name: "wan-count".into(),
+                family: "inet".into(),
+                terms: vec![FirewallTermSnapshot {
+                    name: "count-only".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: "accept".into(),
+                    count: "wan-hits".into(),
+                    ..Default::default()
+                }],
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                }],
+                dscp_classifiers: vec![],
+                ieee8021_classifiers: vec![],
+                dscp_rewrite_rules: vec![],
+                schedulers: vec![CoSSchedulerSnapshot {
+                    name: "be-sched".into(),
+                    transmit_rate_bytes: 4_000_000,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 128_000,
+                }],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be-sched".into(),
+                    }],
+                }],
+            }),
+            ..Default::default()
+        };
+
+        let forwarding = build_forwarding_state(&snapshot);
+        let selection = resolve_cos_tx_selection(
+            &forwarding,
+            202,
+            UserspaceDpMeta {
+                ingress_ifindex: 5,
+                ingress_vlan_id: 0,
+                addr_family: libc::AF_INET as u8,
+                dscp: 0,
+                pkt_len: 1514,
+                ..Default::default()
+            },
+            Some(&SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_TCP,
+                src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+                dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+                src_port: 12345,
+                dst_port: 443,
+            }),
+        );
+
+        assert_eq!(selection.queue_id, Some(0));
+        assert_eq!(selection.dscp_rewrite, None);
+
+        let filter = forwarding
+            .filter_state
+            .filters
+            .get("inet:wan-count")
+            .expect("inet output filter");
+        let term = filter.terms.first().expect("first term");
+        assert_eq!(term.counter.packets.load(Ordering::Relaxed), 1);
+        assert_eq!(term.counter.bytes.load(Ordering::Relaxed), 1514);
     }
 
     #[test]

@@ -823,6 +823,14 @@ fn shared_cos_lease_consume(state: &Mutex<SharedCoSLeaseState>, bytes: u64) {
     }
 }
 
+#[inline(always)]
+fn shared_cos_lease_available_cap(
+    config: SharedCoSLeaseConfig,
+    outstanding_leased_tokens: u64,
+) -> u64 {
+    config.burst_bytes.saturating_sub(outstanding_leased_tokens)
+}
+
 fn shared_cos_lease_release_unused(
     config: SharedCoSLeaseConfig,
     state: &Mutex<SharedCoSLeaseState>,
@@ -833,10 +841,14 @@ fn shared_cos_lease_release_unused(
     }
     if let Ok(mut state) = state.lock() {
         state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_sub(bytes);
-        state.available_tokens = state
-            .available_tokens
-            .saturating_add(bytes)
-            .min(config.burst_bytes);
+        state.available_tokens =
+            state
+                .available_tokens
+                .saturating_add(bytes)
+                .min(shared_cos_lease_available_cap(
+                    config,
+                    state.outstanding_leased_tokens,
+                ));
     }
 }
 
@@ -849,7 +861,8 @@ fn refill_shared_cos_lease_locked(
         return;
     }
     if state.last_refill_ns == 0 {
-        state.available_tokens = config.burst_bytes;
+        state.available_tokens =
+            shared_cos_lease_available_cap(config, state.outstanding_leased_tokens);
         state.last_refill_ns = now_ns;
         return;
     }
@@ -861,10 +874,14 @@ fn refill_shared_cos_lease_locked(
     if added == 0 {
         return;
     }
-    state.available_tokens = state
-        .available_tokens
-        .saturating_add(added)
-        .min(config.burst_bytes);
+    state.available_tokens =
+        state
+            .available_tokens
+            .saturating_add(added)
+            .min(shared_cos_lease_available_cap(
+                config,
+                state.outstanding_leased_tokens,
+            ));
     state.last_refill_ns = now_ns;
 }
 
@@ -945,6 +962,45 @@ impl SharedCoSRootLease {
 
     pub(super) fn release_unused(&self, bytes: u64) {
         shared_cos_lease_release_unused(self.config, &self.state, bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_cos_root_lease_refill_respects_outstanding_burst_credit() {
+        let lease = SharedCoSRootLease::new(10_000_000, 16_000, 1);
+        let mut state = lease.state.lock().unwrap();
+        state.available_tokens = 0;
+        state.outstanding_leased_tokens = 4_000;
+        state.last_refill_ns = 1;
+
+        refill_shared_cos_lease_locked(lease.config, &mut state, 1_000_000_001);
+
+        assert_eq!(
+            state.available_tokens,
+            lease.config.burst_bytes - state.outstanding_leased_tokens
+        );
+    }
+
+    #[test]
+    fn shared_cos_root_lease_release_unused_preserves_total_burst_bound() {
+        let lease = SharedCoSRootLease::new(10_000_000, 16_000, 1);
+        {
+            let mut state = lease.state.lock().unwrap();
+            state.available_tokens = lease.config.burst_bytes;
+            state.outstanding_leased_tokens = 4_000;
+        }
+
+        lease.release_unused(1_500);
+
+        let state = lease.state.lock().unwrap();
+        assert_eq!(
+            state.available_tokens + state.outstanding_leased_tokens,
+            lease.config.burst_bytes
+        );
     }
 }
 

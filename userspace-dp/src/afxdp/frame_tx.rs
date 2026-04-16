@@ -70,17 +70,10 @@ fn enqueue_local_request_to_target_or_owner(
 }
 
 #[inline]
-fn recycle_ingress_frame(
-    ingress_binding: &mut BindingWorker,
-    source_offset: u64,
-    now_ns: u64,
-    fill_drain_pending: &mut bool,
-) {
+fn recycle_ingress_frame(ingress_binding: &mut BindingWorker, source_offset: u64, now_ns: u64) {
     ingress_binding.pending_fill_frames.push_back(source_offset);
-    *fill_drain_pending = true;
     if ingress_binding.pending_fill_frames.len() >= FILL_BATCH_SIZE {
         let _ = drain_pending_fill(ingress_binding, now_ns);
-        *fill_drain_pending = false;
     }
 }
 
@@ -109,7 +102,6 @@ pub(super) fn enqueue_pending_forwards(
         return;
     }
     let ingress_area = ingress_binding.umem.area() as *const MmapArea;
-    let mut fill_drain_pending = false;
     let tx_selection_enabled_v4 = forwarding.tx_selection_enabled_v4;
     let tx_selection_enabled_v6 = forwarding.tx_selection_enabled_v6;
     post_recycles.clear();
@@ -141,7 +133,7 @@ pub(super) fn enqueue_pending_forwards(
 
         // Fast path: prebuilt frame (e.g. ICMP error NAT reversal).
         // The frame is already fully rewritten — just enqueue for TX.
-        if let PendingForwardFrame::Prebuilt(prebuilt) = core::mem::take(&mut request.frame) {
+        if let PendingForwardFrame::Prebuilt(prebuilt) = &mut request.frame {
             let Some(target_binding) = resolve_pending_forward_target_binding(
                 left,
                 ingress_index,
@@ -152,17 +144,12 @@ pub(super) fn enqueue_pending_forwards(
                 target_binding_index,
                 request.target_ifindex,
             ) else {
-                recycle_ingress_frame(
-                    ingress_binding,
-                    source_offset,
-                    now_ns,
-                    &mut fill_drain_pending,
-                );
+                recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                 continue;
             };
             let frame_len = prebuilt.len();
             let req = TxRequest {
-                bytes: prebuilt,
+                bytes: core::mem::take(prebuilt),
                 expected_ports: None,
                 expected_addr_family: request.meta.addr_family,
                 expected_protocol: request.meta.protocol,
@@ -179,12 +166,7 @@ pub(super) fn enqueue_pending_forwards(
             )
             .is_err()
             {
-                recycle_ingress_frame(
-                    ingress_binding,
-                    source_offset,
-                    now_ns,
-                    &mut fill_drain_pending,
-                );
+                recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                 continue;
             }
             dbg.enqueue_ok += 1;
@@ -194,12 +176,7 @@ pub(super) fn enqueue_pending_forwards(
             if (frame_len as u32) > dbg.tx_max_frame {
                 dbg.tx_max_frame = frame_len as u32;
             }
-            recycle_ingress_frame(
-                ingress_binding,
-                source_offset,
-                now_ns,
-                &mut fill_drain_pending,
-            );
+            recycle_ingress_frame(ingress_binding, source_offset, now_ns);
             continue;
         }
 
@@ -214,12 +191,7 @@ pub(super) fn enqueue_pending_forwards(
                 {
                     frame
                 } else {
-                    recycle_ingress_frame(
-                        ingress_binding,
-                        source_offset,
-                        now_ns,
-                        &mut fill_drain_pending,
-                    );
+                    recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                     continue;
                 }
             }
@@ -266,12 +238,7 @@ pub(super) fn enqueue_pending_forwards(
                         recent_exceptions,
                     );
                 }
-                recycle_ingress_frame(
-                    ingress_binding,
-                    source_offset,
-                    now_ns,
-                    &mut fill_drain_pending,
-                );
+                recycle_ingress_frame(ingress_binding, source_offset, now_ns);
                 continue;
             }
             dbg.no_egress_binding += 1;
@@ -291,12 +258,7 @@ pub(super) fn enqueue_pending_forwards(
                 None,
                 None,
             );
-            recycle_ingress_frame(
-                ingress_binding,
-                source_offset,
-                now_ns,
-                &mut fill_drain_pending,
-            );
+            recycle_ingress_frame(ingress_binding, source_offset, now_ns);
             continue;
         };
         let mut build_failed = false;
@@ -902,26 +864,20 @@ pub(super) fn enqueue_pending_forwards(
                 fallback_to_slow_path,
             );
             if !retained_source_frame {
-                recycle_ingress_frame(
-                    ingress_binding,
-                    source_offset,
-                    now_ns,
-                    &mut fill_drain_pending,
-                );
+                recycle_ingress_frame(ingress_binding, source_offset, now_ns);
             }
             continue;
         }
         if !retained_source_frame {
-            recycle_ingress_frame(
-                ingress_binding,
-                source_offset,
-                now_ns,
-                &mut fill_drain_pending,
-            );
+            recycle_ingress_frame(ingress_binding, source_offset, now_ns);
         }
     }
-    if fill_drain_pending && !ingress_binding.pending_fill_frames.is_empty() {
+    while !ingress_binding.pending_fill_frames.is_empty() {
+        let pending_before = ingress_binding.pending_fill_frames.len();
         let _ = drain_pending_fill(ingress_binding, now_ns);
+        if ingress_binding.pending_fill_frames.len() >= pending_before {
+            break;
+        }
     }
     update_binding_debug_state(ingress_binding);
     pending_forwards.clear();
@@ -1553,9 +1509,6 @@ fn forwarded_tcp_may_need_segmentation(
         .map(|egress| egress.mtu)
         .unwrap_or_default()
         .max(1280);
-    if mtu == 0 {
-        return false;
-    }
     let l3 = match meta.l3_offset {
         14 | 18 => meta.l3_offset as usize,
         _ => match frame_l3_offset(frame) {

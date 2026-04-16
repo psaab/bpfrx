@@ -1363,6 +1363,7 @@ pub(crate) fn worker_loop(
             }
         }
     }
+    crate::filter::flush_recorded_filter_counters();
     for binding in bindings.iter_mut() {
         release_all_cos_root_leases(binding);
         release_all_cos_queue_leases(binding);
