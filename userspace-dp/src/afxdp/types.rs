@@ -758,7 +758,31 @@ pub(super) struct CoSInterfaceRuntime {
     pub(super) default_queue: u8,
     pub(super) nonempty_queues: usize,
     pub(super) runnable_queues: usize,
-    pub(super) guarantee_rr: usize,
+    // Round-robin cursors for the two guarantee service classes. Exact and
+    // non-exact guarantee queues rotate independently — the scheduler gives
+    // exact queues strict priority over non-exact guarantee service (the
+    // exact path runs first in `drain_shaped_tx`; non-exact only runs when
+    // the exact path returns None), and within each class RR ordering is
+    // preserved across calls without coupling to the other class's service
+    // events. Prior to #689 both passes shared a single `guarantee_rr`
+    // cursor; that had neither pure unified-RR semantics (because the exact
+    // path always wins at a shared rr position) nor clean class-independent
+    // semantics (because service events in one class advanced the cursor
+    // seen by the other), and in pathological backlog mixes could produce
+    // non-obvious skips in the non-exact rotation.
+    pub(super) exact_guarantee_rr: usize,
+    pub(super) nonexact_guarantee_rr: usize,
+    // Unified-walk cursor used only by the test-only legacy selector
+    // `select_cos_guarantee_batch_with_fast_path`. Gated on `cfg(test)`
+    // so non-test builds of the hot CoS fast-path runtime do not pay
+    // field footprint or init churn for compatibility scaffolding.
+    // Separate from the production cursors above so test harnesses that
+    // exercise the legacy walk do not disturb production rotation state
+    // and vice versa — see the
+    // `legacy_guarantee_rr_does_not_advance_class_cursors` regression
+    // that pins that isolation contract.
+    #[cfg(test)]
+    pub(super) legacy_guarantee_rr: usize,
     pub(super) queues: Vec<CoSQueueRuntime>,
     pub(super) queue_indices_by_priority: [Vec<usize>; COS_PRIORITY_LEVELS],
     pub(super) rr_index_by_priority: [usize; COS_PRIORITY_LEVELS],

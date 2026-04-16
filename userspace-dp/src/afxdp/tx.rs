@@ -832,10 +832,21 @@ fn service_exact_guarantee_queue_direct(
     Some(progress)
 }
 
+#[cfg(test)]
 fn select_cos_guarantee_batch(root: &mut CoSInterfaceRuntime, now_ns: u64) -> Option<CoSBatch> {
     select_cos_guarantee_batch_with_fast_path(root, &[], now_ns)
 }
 
+// Legacy single-pass guarantee selector that walks both classes in one
+// iteration. The production path in `drain_shaped_tx` no longer calls this
+// (it uses the two specialized selectors for strict-priority exact-over-
+// nonexact service); `select_cos_guarantee_batch_with_fast_path` is retained
+// solely for unit-test coverage of the batch-build mechanics and is
+// compiled out of non-test builds along with its `legacy_guarantee_rr`
+// cursor. Uses its own cursor so test harnesses that call this do not
+// corrupt the production `exact_guarantee_rr` / `nonexact_guarantee_rr`
+// cursors and vice versa.
+#[cfg(test)]
 fn select_cos_guarantee_batch_with_fast_path(
     root: &mut CoSInterfaceRuntime,
     queue_fast_path: &[WorkerCoSQueueFastPath],
@@ -845,7 +856,7 @@ fn select_cos_guarantee_batch_with_fast_path(
     if queue_count == 0 {
         return None;
     }
-    let start = root.guarantee_rr % queue_count;
+    let start = root.legacy_guarantee_rr % queue_count;
     for offset in 0..queue_count {
         let queue_idx = (start + offset) % queue_count;
         let queue = &mut root.queues[queue_idx];
@@ -903,7 +914,7 @@ fn select_cos_guarantee_batch_with_fast_path(
             }
             continue;
         }
-        root.guarantee_rr = (start + offset + 1) % queue_count;
+        root.legacy_guarantee_rr = (start + offset + 1) % queue_count;
         let guarantee_budget = queue
             .tokens
             .min(cos_guarantee_quantum_bytes(queue))
@@ -921,6 +932,10 @@ fn select_cos_guarantee_batch_with_fast_path(
     None
 }
 
+// Selects the next exact-class guarantee queue for service. Rotates
+// independently of the non-exact pass via `exact_guarantee_rr` — the two
+// classes are scheduled with strict-priority exact-over-nonexact and
+// class-independent RR within each class.
 fn select_exact_cos_guarantee_queue_with_fast_path(
     root: &mut CoSInterfaceRuntime,
     queue_fast_path: &[WorkerCoSQueueFastPath],
@@ -930,7 +945,7 @@ fn select_exact_cos_guarantee_queue_with_fast_path(
     if queue_count == 0 {
         return None;
     }
-    let start = root.guarantee_rr % queue_count;
+    let start = root.exact_guarantee_rr % queue_count;
     for offset in 0..queue_count {
         let queue_idx = (start + offset) % queue_count;
         let queue = &mut root.queues[queue_idx];
@@ -976,7 +991,7 @@ fn select_exact_cos_guarantee_queue_with_fast_path(
             }
             continue;
         }
-        root.guarantee_rr = (start + offset + 1) % queue_count;
+        root.exact_guarantee_rr = (start + offset + 1) % queue_count;
         let secondary_budget = queue
             .tokens
             .min(cos_guarantee_quantum_bytes(queue))
@@ -994,6 +1009,10 @@ fn select_exact_cos_guarantee_queue_with_fast_path(
     None
 }
 
+// Selects the next non-exact guarantee queue for service. Rotates
+// independently of the exact pass via `nonexact_guarantee_rr` — a service
+// event on an exact queue does not advance this cursor, so non-exact RR
+// order is stable across bursts of exact-queue activity.
 fn select_nonexact_cos_guarantee_batch(
     root: &mut CoSInterfaceRuntime,
     now_ns: u64,
@@ -1002,7 +1021,7 @@ fn select_nonexact_cos_guarantee_batch(
     if queue_count == 0 {
         return None;
     }
-    let start = root.guarantee_rr % queue_count;
+    let start = root.nonexact_guarantee_rr % queue_count;
     for offset in 0..queue_count {
         let queue_idx = (start + offset) % queue_count;
         let queue = &mut root.queues[queue_idx];
@@ -1037,7 +1056,7 @@ fn select_nonexact_cos_guarantee_batch(
         if queue.tokens < head_len {
             continue;
         }
-        root.guarantee_rr = (start + offset + 1) % queue_count;
+        root.nonexact_guarantee_rr = (start + offset + 1) % queue_count;
         let guarantee_budget = queue
             .tokens
             .min(cos_guarantee_quantum_bytes(queue))
@@ -3440,7 +3459,10 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
         default_queue: config.default_queue,
         nonempty_queues: 0,
         runnable_queues: 0,
-        guarantee_rr: 0,
+        exact_guarantee_rr: 0,
+        nonexact_guarantee_rr: 0,
+        #[cfg(test)]
+        legacy_guarantee_rr: 0,
         queues: config
             .queues
             .iter()
@@ -4733,22 +4755,25 @@ mod tests {
 
     #[test]
     fn maybe_top_up_cos_root_lease_unblocks_large_frame_exceeding_lease_bytes() {
-        // At 400 Mbps / 256 KB burst / 1 shard, lease_bytes() == 1500, which is less than
-        // tx_frame_capacity() == 4096.  Without the .max(tx_frame_capacity()) fix, root.tokens
+        // Pick a shaping rate low enough that lease_bytes() floors to COS_ROOT_LEASE_MIN_BYTES
+        // (1500) and stays below tx_frame_capacity() (4096).  At 50 Mbps / 256 KB burst / 1 shard
+        // the raw target lease is rate*TARGET_US/1e6 = 1250 bytes, which floors up to 1500.
+        // Without the .max(tx_frame_capacity()) fix in maybe_top_up_cos_root_lease, root.tokens
         // could never exceed 1500 and any frame with len > 1500 would deadlock the CoS queue.
-        let lease = Arc::new(SharedCoSRootLease::new(400_000_000 / 8, 256 * 1024, 1));
+        let rate_bytes = 50_000_000u64 / 8;
+        let lease = Arc::new(SharedCoSRootLease::new(rate_bytes, 256 * 1024, 1));
         assert!(
             lease.lease_bytes() < tx_frame_capacity() as u64,
             "precondition: lease_bytes must be below tx_frame_capacity for this regression"
         );
 
         let mut root = test_cos_runtime_with_queues(
-            400_000_000 / 8,
+            rate_bytes,
             vec![CoSQueueConfig {
                 queue_id: 0,
                 forwarding_class: "best-effort".into(),
                 priority: 5,
-                transmit_rate_bytes: 400_000_000 / 8,
+                transmit_rate_bytes: rate_bytes,
                 exact: false,
                 surplus_weight: 1,
                 buffer_bytes: COS_MIN_BURST_BYTES,
@@ -7421,6 +7446,14 @@ mod tests {
         assert_eq!(queue_id, Some(0));
     }
 
+    // Note on invariant change (replaces the pre-a15a6120 "defaults to iface default" behavior):
+    // The original shape of this test asserted that an output filter with NO tx-side effect (no
+    // forwarding_class, no counter) would still shadow the ingress input filter's classification
+    // and leave egress at the interface default queue.  Commit a15a6120 changed the gating so the
+    // output filter is skipped entirely when it has neither forwarding_class, dscp_rewrite, nor
+    // counter terms — matching Junos semantics, where a classify-only output filter that does not
+    // classify does not clobber upstream classification.  The new invariant asserted below: when
+    // the output filter has no tx-side effect, ingress input-filter classification is preserved.
     #[test]
     fn resolve_cos_queue_id_defaults_when_output_filter_has_no_forwarding_class() {
         let snapshot = ConfigSnapshot {
@@ -7538,7 +7571,12 @@ mod tests {
             }),
         );
 
-        assert_eq!(queue_id, Some(7));
+        // cos-classify on reth1.0 maps expedited-forwarding -> queue 1.  The output filter
+        // wan-classify on reth0.0 has no tx-side effect (no forwarding_class, no dscp_rewrite,
+        // no counter), so post-a15a6120 it is bypassed and the ingress classification is
+        // preserved.  Pre-a15a6120 this was expected to fall through to the iface default queue
+        // (best-effort = 7); that contract no longer holds and is captured by this test.
+        assert_eq!(queue_id, Some(1));
     }
 
     #[test]
@@ -8279,6 +8317,237 @@ mod tests {
             CoSBatch::Local { queue_idx, .. } => assert_eq!(queue_idx, 1),
             CoSBatch::Prepared { .. } => panic!("expected local batch"),
         }
+    }
+
+    fn test_mixed_class_root_with_primed_queues() -> CoSInterfaceRuntime {
+        // Four queues on the same iface: two exact (queue_id 0, 2),
+        // two non-exact (queue_id 1, 3). Per-queue rate is set low
+        // enough that `cos_guarantee_quantum_bytes` clamps to the
+        // minimum (1500 bytes). That means the non-exact batch-build
+        // path (`select_nonexact_cos_guarantee_batch`) dequeues exactly
+        // one 1500-byte item per call, while the exact fast-path
+        // selector (`select_exact_cos_guarantee_queue_with_fast_path`)
+        // only picks a queue and advances its cursor — it does not
+        // dequeue. Eight primed items per queue keeps backlog available
+        // across every rotation round below without any test having to
+        // push additional items.
+        //
+        // Shared by the #689 split-cursor regression tests.
+        let slow_rate = 1_000_000 / 8; // 1 Mbps → quantum clamps to MIN
+        let mut root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![
+                CoSQueueConfig {
+                    queue_id: 0,
+                    forwarding_class: "exact-0".into(),
+                    priority: 5,
+                    transmit_rate_bytes: slow_rate,
+                    exact: true,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                },
+                CoSQueueConfig {
+                    queue_id: 1,
+                    forwarding_class: "nonexact-1".into(),
+                    priority: 5,
+                    transmit_rate_bytes: slow_rate,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                },
+                CoSQueueConfig {
+                    queue_id: 2,
+                    forwarding_class: "exact-2".into(),
+                    priority: 5,
+                    transmit_rate_bytes: slow_rate,
+                    exact: true,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                },
+                CoSQueueConfig {
+                    queue_id: 3,
+                    forwarding_class: "nonexact-3".into(),
+                    priority: 5,
+                    transmit_rate_bytes: slow_rate,
+                    exact: false,
+                    surplus_weight: 1,
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                },
+            ],
+        );
+        root.tokens = 1024 * 1024;
+        for queue in &mut root.queues {
+            queue.tokens = 64 * 1024;
+            queue.runnable = true;
+            // Eight items per queue covers the longest rotation test below
+            // without any queue draining to empty.
+            for _ in 0..8 {
+                queue.items.push_back(test_cos_item(1500));
+            }
+            queue.queued_bytes = 8 * 1500;
+        }
+        root.nonempty_queues = 4;
+        root.runnable_queues = 4;
+        root
+    }
+
+    #[test]
+    fn exact_and_nonexact_guarantee_rr_cursors_advance_independently() {
+        // #689 regression. Prior to the cursor split, serving an exact
+        // queue advanced the shared `guarantee_rr` and could cause the
+        // non-exact pass to skip a waiting queue on its next run. Pin
+        // that the exact pass does not touch `nonexact_guarantee_rr`
+        // and vice versa.
+        let mut root = test_mixed_class_root_with_primed_queues();
+        assert_eq!(root.exact_guarantee_rr, 0);
+        assert_eq!(root.nonexact_guarantee_rr, 0);
+
+        // Serving an exact queue must not disturb the non-exact cursor.
+        let selection = select_exact_cos_guarantee_queue_with_fast_path(&mut root, &[], 1)
+            .expect("exact queue selection");
+        assert_eq!(selection.queue_idx, 0);
+        assert_eq!(
+            root.exact_guarantee_rr, 1,
+            "exact cursor must advance past the served queue"
+        );
+        assert_eq!(
+            root.nonexact_guarantee_rr, 0,
+            "serving an exact queue must not advance the non-exact cursor"
+        );
+
+        // Serving a non-exact queue must not disturb the exact cursor.
+        let batch =
+            select_nonexact_cos_guarantee_batch(&mut root, 1).expect("nonexact queue batch");
+        match batch {
+            CoSBatch::Local { queue_idx, .. } => assert_eq!(queue_idx, 1),
+            CoSBatch::Prepared { .. } => panic!("expected local batch"),
+        }
+        assert_eq!(
+            root.exact_guarantee_rr, 1,
+            "non-exact service must not advance the exact cursor"
+        );
+        assert_eq!(
+            root.nonexact_guarantee_rr, 2,
+            "non-exact cursor must advance past the served queue"
+        );
+    }
+
+    #[test]
+    fn exact_guarantee_rr_walks_exact_queues_in_order_independent_of_nonexact() {
+        // Exact queues must rotate exact-0 -> exact-2 -> exact-0 -> exact-2
+        // regardless of non-exact activity between calls. #689 before-fix
+        // behavior under the shared cursor was: exact-0 served (rr=1),
+        // then a non-exact service would bump rr past exact-2's position,
+        // so the next exact call would skip exact-2 and loop back to
+        // exact-0. This test pins that the split cursor rotates exact
+        // queues deterministically without regard for non-exact service.
+        // Helper primes eight 1500-byte items and sets `queued_bytes`
+        // to match; no additional priming needed here. Only bump
+        // queue.tokens on the exact queues to make sure they never hit
+        // token-starvation during the four interleaved rounds below —
+        // the exact selector does not refill exact-queue tokens itself
+        // (that is done by the shared-lease path), so this test bypasses
+        // that machinery by handing the queues a large local budget.
+        let mut root = test_mixed_class_root_with_primed_queues();
+        for queue in &mut root.queues {
+            if queue.exact {
+                queue.tokens = 128 * 1024;
+            }
+        }
+
+        let mut exact_order = Vec::new();
+        for _ in 0..4 {
+            // Interleave a non-exact service between exact calls; the exact
+            // rotation must not notice.
+            let selection = select_exact_cos_guarantee_queue_with_fast_path(&mut root, &[], 1)
+                .expect("exact queue");
+            exact_order.push(selection.queue_idx);
+            // Service a non-exact queue to simulate concurrent class activity;
+            // ignore the result.
+            let _ = select_nonexact_cos_guarantee_batch(&mut root, 1);
+        }
+        assert_eq!(exact_order, vec![0, 2, 0, 2]);
+    }
+
+    #[test]
+    fn nonexact_guarantee_rr_walks_nonexact_queues_in_order_independent_of_exact() {
+        // Symmetric to the exact test: non-exact rotation is 1 -> 3 -> 1 -> 3
+        // regardless of exact-queue activity between calls. Helper primes
+        // eight 1500-byte items per queue with `queued_bytes` already
+        // consistent; no additional priming needed.
+        let mut root = test_mixed_class_root_with_primed_queues();
+
+        let mut nonexact_order = Vec::new();
+        for _ in 0..4 {
+            let batch = select_nonexact_cos_guarantee_batch(&mut root, 1).expect("nonexact batch");
+            let queue_idx = match batch {
+                CoSBatch::Local { queue_idx, .. } => queue_idx,
+                CoSBatch::Prepared { queue_idx, .. } => queue_idx,
+            };
+            nonexact_order.push(queue_idx);
+            // Interleave an exact service; must not disturb non-exact rotation.
+            let _ = select_exact_cos_guarantee_queue_with_fast_path(&mut root, &[], 1);
+        }
+        assert_eq!(nonexact_order, vec![1, 3, 1, 3]);
+    }
+
+    #[test]
+    fn legacy_guarantee_rr_does_not_advance_class_cursors() {
+        // The entire reason `legacy_guarantee_rr` exists as a third cursor
+        // (instead of the legacy unified selector reusing one of the
+        // production cursors) is to keep the legacy walk isolated from the
+        // production exact/nonexact rotation state. Pin that contract:
+        // a call through the legacy selector must advance only its own
+        // cursor, never the two production cursors.
+        let mut root = test_mixed_class_root_with_primed_queues();
+        let batch = select_cos_guarantee_batch(&mut root, 1).expect("legacy guarantee batch");
+        // Served something, so `legacy_guarantee_rr` advanced.
+        match batch {
+            CoSBatch::Local { queue_idx, .. } => {
+                assert_eq!(queue_idx, 0, "legacy walk starts at index 0");
+            }
+            CoSBatch::Prepared { .. } => panic!("expected local batch"),
+        }
+        assert_eq!(root.legacy_guarantee_rr, 1);
+        // Production cursors untouched — this is the isolation guarantee
+        // that justifies the extra field over reusing either production
+        // cursor for the legacy walk.
+        assert_eq!(
+            root.exact_guarantee_rr, 0,
+            "legacy selector must not advance exact production cursor"
+        );
+        assert_eq!(
+            root.nonexact_guarantee_rr, 0,
+            "legacy selector must not advance nonexact production cursor"
+        );
+    }
+
+    #[test]
+    fn guarantee_rr_cursors_start_at_zero_after_runtime_build() {
+        // Pin the invariant that a fresh runtime starts with both cursors
+        // at 0. `build_cos_interface_runtime` is the one production init
+        // site; any refactor that accidentally leaves a cursor uninitialized
+        // or drops one of the fields fails here.
+        let root = test_cos_runtime_with_queues(
+            10_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "q0".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: COS_MIN_BURST_BYTES,
+                dscp_rewrite: None,
+            }],
+        );
+        assert_eq!(root.exact_guarantee_rr, 0);
+        assert_eq!(root.nonexact_guarantee_rr, 0);
+        assert_eq!(root.legacy_guarantee_rr, 0);
     }
 
     #[test]
