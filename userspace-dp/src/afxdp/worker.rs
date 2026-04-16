@@ -1771,7 +1771,9 @@ mod tests {
             default_queue: 0,
             nonempty_queues: 1,
             runnable_queues: usize::from(runnable),
-            guarantee_rr: 0,
+            exact_guarantee_rr: 0,
+            nonexact_guarantee_rr: 0,
+            legacy_guarantee_rr: 0,
             queues: vec![CoSQueueRuntime {
                 queue_id: 4,
                 priority: 1,
