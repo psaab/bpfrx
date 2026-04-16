@@ -845,7 +845,7 @@ fn select_cos_guarantee_batch_with_fast_path(
     for offset in 0..queue_count {
         let queue_idx = (start + offset) % queue_count;
         let queue = &mut root.queues[queue_idx];
-        if queue.items.is_empty() || !queue.runnable {
+        if cos_queue_is_empty(queue) || !queue.runnable {
             continue;
         }
         if queue.exact {
@@ -865,7 +865,7 @@ fn select_cos_guarantee_batch_with_fast_path(
                 now_ns,
             );
         }
-        let Some(head) = queue.items.front() else {
+        let Some(head) = cos_queue_front(queue) else {
             continue;
         };
         let head_len = cos_item_len(head);
@@ -930,7 +930,7 @@ fn select_exact_cos_guarantee_queue_with_fast_path(
     for offset in 0..queue_count {
         let queue_idx = (start + offset) % queue_count;
         let queue = &mut root.queues[queue_idx];
-        if queue.items.is_empty() || !queue.runnable || !queue.exact {
+        if cos_queue_is_empty(queue) || !queue.runnable || !queue.exact {
             continue;
         }
         maybe_top_up_cos_queue_lease(
@@ -940,7 +940,7 @@ fn select_exact_cos_guarantee_queue_with_fast_path(
                 .and_then(|queue_fast| queue_fast.shared_queue_lease.as_ref()),
             now_ns,
         );
-        let Some(head) = queue.items.front() else {
+        let Some(head) = cos_queue_front(queue) else {
             continue;
         };
         let head_len = cos_item_len(head);
@@ -1002,7 +1002,7 @@ fn select_nonexact_cos_guarantee_batch(
     for offset in 0..queue_count {
         let queue_idx = (start + offset) % queue_count;
         let queue = &mut root.queues[queue_idx];
-        if queue.items.is_empty() || !queue.runnable || queue.exact {
+        if cos_queue_is_empty(queue) || !queue.runnable || queue.exact {
             continue;
         }
         refill_cos_tokens(
@@ -1012,7 +1012,7 @@ fn select_nonexact_cos_guarantee_batch(
             &mut queue.last_refill_ns,
             now_ns,
         );
-        let Some(head) = queue.items.front() else {
+        let Some(head) = cos_queue_front(queue) else {
             continue;
         };
         let head_len = cos_item_len(head);
@@ -1062,10 +1062,10 @@ fn select_cos_surplus_batch(root: &mut CoSInterfaceRuntime, now_ns: u64) -> Opti
             let queue_idx =
                 root.queue_indices_by_priority[priority][(start + offset) % indices_len];
             let queue = &mut root.queues[queue_idx];
-            if queue.items.is_empty() || !queue.runnable || queue.exact {
+            if cos_queue_is_empty(queue) || !queue.runnable || queue.exact {
                 continue;
             }
-            let Some(head) = queue.items.front() else {
+            let Some(head) = cos_queue_front(queue) else {
                 continue;
             };
             let head_len = cos_item_len(head);
@@ -1356,7 +1356,7 @@ fn drain_exact_local_items_to_scratch(
         if free_tx_frames.is_empty() {
             break;
         }
-        let Some(front) = queue.items.front() else {
+        let Some(front) = cos_queue_front(queue) else {
             break;
         };
         let len = match front {
@@ -1366,7 +1366,7 @@ fn drain_exact_local_items_to_scratch(
         if remaining_root < len || remaining_secondary < len {
             break;
         }
-        let Some(CoSPendingTxItem::Local(mut req)) = queue.items.pop_front() else {
+        let Some(CoSPendingTxItem::Local(mut req)) = cos_queue_pop_front(queue) else {
             break;
         };
         remaining_root = remaining_root.saturating_sub(len);
@@ -1389,7 +1389,7 @@ fn drain_exact_local_items_to_scratch(
             };
         }
         let Some(offset) = free_tx_frames.pop_front() else {
-            queue.items.push_front(CoSPendingTxItem::Local(req));
+            cos_queue_push_front(queue, CoSPendingTxItem::Local(req));
             break;
         };
         let Some(frame) = (unsafe { area.slice_mut_unchecked(offset as usize, req.bytes.len()) })
@@ -1425,7 +1425,7 @@ fn drain_exact_prepared_items_to_scratch(
     let mut remaining_secondary = secondary_budget;
 
     while scratch_prepared_tx.len() < TX_BATCH_SIZE {
-        let Some(front) = queue.items.front() else {
+        let Some(front) = cos_queue_front(queue) else {
             break;
         };
         let len = match front {
@@ -1435,7 +1435,7 @@ fn drain_exact_prepared_items_to_scratch(
         if remaining_root < len || remaining_secondary < len {
             break;
         }
-        let Some(CoSPendingTxItem::Prepared(mut req)) = queue.items.pop_front() else {
+        let Some(CoSPendingTxItem::Prepared(mut req)) = cos_queue_pop_front(queue) else {
             break;
         };
         remaining_root = remaining_root.saturating_sub(len);
@@ -1505,7 +1505,7 @@ fn restore_exact_local_scratch_to_queue_head(
     };
     while let Some((offset, req)) = scratch_local_tx.pop() {
         free_tx_frames.push_front(offset);
-        queue.items.push_front(CoSPendingTxItem::Local(req));
+        cos_queue_push_front(queue, CoSPendingTxItem::Local(req));
     }
 }
 
@@ -1518,7 +1518,7 @@ fn restore_exact_prepared_scratch_to_queue_head(
         return;
     };
     while let Some(req) = scratch_prepared_tx.pop() {
-        queue.items.push_front(CoSPendingTxItem::Prepared(req));
+        cos_queue_push_front(queue, CoSPendingTxItem::Prepared(req));
     }
 }
 
@@ -1537,7 +1537,7 @@ fn settle_exact_local_scratch_submission(
     while let Some((offset, req)) = scratch_local_tx.pop() {
         if scratch_local_tx.len() >= inserted {
             free_tx_frames.push_front(offset);
-            queue.items.push_front(CoSPendingTxItem::Local(req));
+            cos_queue_push_front(queue, CoSPendingTxItem::Local(req));
         } else {
             sent_packets += 1;
             sent_bytes += req.bytes.len() as u64;
@@ -1560,7 +1560,7 @@ fn settle_exact_prepared_scratch_submission(
     let mut sent_bytes = 0u64;
     while let Some(req) = scratch_prepared_tx.pop() {
         if scratch_prepared_tx.len() >= inserted {
-            queue.items.push_front(CoSPendingTxItem::Prepared(req));
+            cos_queue_push_front(queue, CoSPendingTxItem::Prepared(req));
         } else {
             remember_prepared_recycle(in_flight_prepared_recycles, &req);
             sent_packets += 1;
@@ -1637,7 +1637,7 @@ fn build_cos_batch_from_queue(
     secondary_budget: u64,
     phase: CoSServicePhase,
 ) -> Option<CoSBatch> {
-    let head = queue.items.front()?;
+    let head = cos_queue_front(queue)?;
     match head {
         CoSPendingTxItem::Local(_) => {
             let mut items = VecDeque::new();
@@ -1645,7 +1645,7 @@ fn build_cos_batch_from_queue(
             let mut remaining_secondary = secondary_budget;
             let mut batch_bytes = 0u64;
             while items.len() < TX_BATCH_SIZE {
-                let Some(front) = queue.items.front() else {
+                let Some(front) = cos_queue_front(queue) else {
                     break;
                 };
                 let len = cos_item_len(front);
@@ -1657,13 +1657,13 @@ fn build_cos_batch_from_queue(
                 }
                 remaining_root = remaining_root.saturating_sub(len);
                 remaining_secondary = remaining_secondary.saturating_sub(len);
-                match queue.items.pop_front() {
+                match cos_queue_pop_front(queue) {
                     Some(CoSPendingTxItem::Local(req)) => {
                         batch_bytes = batch_bytes.saturating_add(len);
                         items.push_back(req);
                     }
                     Some(other) => {
-                        queue.items.push_front(other);
+                        cos_queue_push_front(queue, other);
                         break;
                     }
                     None => break,
@@ -1686,7 +1686,7 @@ fn build_cos_batch_from_queue(
             let mut remaining_secondary = secondary_budget;
             let mut batch_bytes = 0u64;
             while items.len() < TX_BATCH_SIZE {
-                let Some(front) = queue.items.front() else {
+                let Some(front) = cos_queue_front(queue) else {
                     break;
                 };
                 let len = cos_item_len(front);
@@ -1698,13 +1698,13 @@ fn build_cos_batch_from_queue(
                 }
                 remaining_root = remaining_root.saturating_sub(len);
                 remaining_secondary = remaining_secondary.saturating_sub(len);
-                match queue.items.pop_front() {
+                match cos_queue_pop_front(queue) {
                     Some(CoSPendingTxItem::Prepared(req)) => {
                         batch_bytes = batch_bytes.saturating_add(len);
                         items.push_back(req);
                     }
                     Some(other) => {
-                        queue.items.push_front(other);
+                        cos_queue_push_front(queue, other);
                         break;
                     }
                     None => break,
@@ -1842,6 +1842,7 @@ const COS_MIN_BURST_BYTES: u64 = 64 * 1500;
 const COS_GUARANTEE_VISIT_NS: u64 = 200_000;
 const COS_GUARANTEE_QUANTUM_MIN_BYTES: u64 = 1500;
 const COS_GUARANTEE_QUANTUM_MAX_BYTES: u64 = 512 * 1024;
+const COS_FLOW_FAIR_MIN_SHARE_BYTES: u64 = 4 * 1500;
 const COS_SURPLUS_ROUND_QUANTUM_BYTES: u64 = 1500;
 const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 
@@ -1984,6 +1985,205 @@ fn cos_guarantee_quantum_bytes(queue: &CoSQueueRuntime) -> u64 {
     )
 }
 
+#[inline(always)]
+fn mix_cos_flow_bucket(seed: &mut u64, value: u64) {
+    *seed ^= value
+        .wrapping_add(0x9e3779b97f4a7c15)
+        .wrapping_add(*seed << 6)
+        .wrapping_add(*seed >> 2);
+}
+
+#[inline(always)]
+fn exact_cos_flow_bucket(flow_key: Option<&SessionKey>) -> u8 {
+    let Some(flow_key) = flow_key else {
+        return 0;
+    };
+    let mut seed = flow_key.protocol as u64 ^ ((flow_key.addr_family as u64) << 8);
+    match flow_key.src_ip {
+        IpAddr::V4(ip) => mix_cos_flow_bucket(&mut seed, u32::from(ip) as u64),
+        IpAddr::V6(ip) => {
+            for chunk in ip.octets().chunks_exact(8) {
+                mix_cos_flow_bucket(&mut seed, u64::from_be_bytes(chunk.try_into().unwrap()));
+            }
+        }
+    }
+    match flow_key.dst_ip {
+        IpAddr::V4(ip) => mix_cos_flow_bucket(&mut seed, u32::from(ip) as u64),
+        IpAddr::V6(ip) => {
+            for chunk in ip.octets().chunks_exact(8) {
+                mix_cos_flow_bucket(&mut seed, u64::from_be_bytes(chunk.try_into().unwrap()));
+            }
+        }
+    }
+    mix_cos_flow_bucket(&mut seed, flow_key.src_port as u64);
+    mix_cos_flow_bucket(&mut seed, flow_key.dst_port as u64);
+    seed as u8
+}
+
+#[inline]
+fn cos_item_flow_key(item: &CoSPendingTxItem) -> Option<&SessionKey> {
+    match item {
+        CoSPendingTxItem::Local(req) => req.flow_key.as_ref(),
+        CoSPendingTxItem::Prepared(req) => req.flow_key.as_ref(),
+    }
+}
+
+#[inline(always)]
+fn cos_flow_bucket_index(flow_key: Option<&SessionKey>) -> usize {
+    usize::from(exact_cos_flow_bucket(flow_key)) & (COS_FLOW_FAIR_BUCKETS - 1)
+}
+
+#[inline]
+fn cos_queue_flow_share_limit(
+    queue: &CoSQueueRuntime,
+    buffer_limit: u64,
+    flow_bucket: usize,
+) -> u64 {
+    if !queue.flow_fair {
+        return buffer_limit;
+    }
+    let prospective_active = u64::from(queue.active_flow_buckets)
+        .saturating_add(u64::from(queue.flow_bucket_bytes[flow_bucket] == 0))
+        .max(1);
+    buffer_limit
+        .div_ceil(prospective_active)
+        .clamp(COS_FLOW_FAIR_MIN_SHARE_BYTES, buffer_limit)
+}
+
+#[inline]
+fn account_cos_queue_flow_enqueue(
+    queue: &mut CoSQueueRuntime,
+    flow_key: Option<&SessionKey>,
+    item_len: u64,
+) {
+    if !queue.flow_fair || item_len == 0 {
+        return;
+    }
+    let bucket = cos_flow_bucket_index(flow_key);
+    if queue.flow_bucket_bytes[bucket] == 0 {
+        queue.active_flow_buckets = queue.active_flow_buckets.saturating_add(1);
+    }
+    queue.flow_bucket_bytes[bucket] = queue.flow_bucket_bytes[bucket].saturating_add(item_len);
+}
+
+#[inline]
+fn account_cos_queue_flow_dequeue(
+    queue: &mut CoSQueueRuntime,
+    flow_key: Option<&SessionKey>,
+    item_len: u64,
+) {
+    if !queue.flow_fair || item_len == 0 {
+        return;
+    }
+    let bucket = cos_flow_bucket_index(flow_key);
+    let remaining = queue.flow_bucket_bytes[bucket].saturating_sub(item_len);
+    if queue.flow_bucket_bytes[bucket] > 0 && remaining == 0 {
+        queue.active_flow_buckets = queue.active_flow_buckets.saturating_sub(1);
+    }
+    queue.flow_bucket_bytes[bucket] = remaining;
+}
+
+#[inline]
+pub(super) fn cos_queue_is_empty(queue: &CoSQueueRuntime) -> bool {
+    if !queue.flow_fair {
+        return queue.items.is_empty();
+    }
+    queue.flow_rr_buckets.is_empty()
+}
+
+#[inline]
+pub(super) fn cos_queue_len(queue: &CoSQueueRuntime) -> usize {
+    if !queue.flow_fair {
+        return queue.items.len();
+    }
+    queue
+        .flow_rr_buckets
+        .iter()
+        .map(|bucket| queue.flow_bucket_items[usize::from(*bucket)].len())
+        .sum()
+}
+
+#[inline]
+pub(super) fn cos_queue_front(queue: &CoSQueueRuntime) -> Option<&CoSPendingTxItem> {
+    if !queue.flow_fair {
+        return queue.items.front();
+    }
+    let bucket = usize::from(*queue.flow_rr_buckets.front()?);
+    queue.flow_bucket_items[bucket].front()
+}
+
+#[inline]
+pub(super) fn cos_queue_push_back(queue: &mut CoSQueueRuntime, item: CoSPendingTxItem) {
+    let item_len = cos_item_len(&item);
+    let flow_key = cos_item_flow_key(&item);
+    account_cos_queue_flow_enqueue(queue, flow_key, item_len);
+    if !queue.flow_fair {
+        queue.items.push_back(item);
+        return;
+    }
+    let bucket = cos_flow_bucket_index(flow_key);
+    let bucket_queue = &mut queue.flow_bucket_items[bucket];
+    let was_empty = bucket_queue.is_empty();
+    bucket_queue.push_back(item);
+    if was_empty {
+        queue.flow_rr_buckets.push_back(bucket as u8);
+    }
+}
+
+#[inline]
+pub(super) fn cos_queue_push_front(queue: &mut CoSQueueRuntime, item: CoSPendingTxItem) {
+    let item_len = cos_item_len(&item);
+    let flow_key = cos_item_flow_key(&item);
+    account_cos_queue_flow_enqueue(queue, flow_key, item_len);
+    if !queue.flow_fair {
+        queue.items.push_front(item);
+        return;
+    }
+    let bucket = cos_flow_bucket_index(flow_key);
+    let bucket_queue = &mut queue.flow_bucket_items[bucket];
+    let was_empty = bucket_queue.is_empty();
+    bucket_queue.push_front(item);
+    if was_empty {
+        queue.flow_rr_buckets.push_front(bucket as u8);
+    }
+}
+
+#[inline]
+pub(super) fn cos_queue_pop_front(queue: &mut CoSQueueRuntime) -> Option<CoSPendingTxItem> {
+    let item = if !queue.flow_fair {
+        queue.items.pop_front()?
+    } else {
+        let bucket = usize::from(*queue.flow_rr_buckets.front()?);
+        let item = queue.flow_bucket_items[bucket].pop_front()?;
+        let active = queue
+            .flow_rr_buckets
+            .pop_front()
+            .expect("active flow bucket must exist");
+        if !queue.flow_bucket_items[bucket].is_empty() {
+            queue.flow_rr_buckets.push_back(active);
+        }
+        item
+    };
+    let item_len = cos_item_len(&item);
+    let flow_key = cos_item_flow_key(&item);
+    account_cos_queue_flow_dequeue(queue, flow_key, item_len);
+    Some(item)
+}
+
+fn cos_queue_drain_all(queue: &mut CoSQueueRuntime) -> VecDeque<CoSPendingTxItem> {
+    let mut items = VecDeque::new();
+    while let Some(item) = cos_queue_pop_front(queue) {
+        items.push_back(item);
+    }
+    items
+}
+
+fn cos_queue_restore_front(queue: &mut CoSQueueRuntime, mut items: VecDeque<CoSPendingTxItem>) {
+    while let Some(item) = items.pop_back() {
+        cos_queue_push_front(queue, item);
+    }
+}
+
 fn estimate_cos_queue_wakeup_tick(
     root_tokens: u64,
     root_rate_bytes: u64,
@@ -2007,7 +2207,7 @@ fn wake_cos_queue(root: &mut CoSInterfaceRuntime, queue_idx: usize) {
     let Some(queue) = root.queues.get_mut(queue_idx) else {
         return;
     };
-    if queue.items.is_empty() {
+    if cos_queue_is_empty(queue) {
         queue.runnable = false;
         queue.parked = false;
         queue.next_wakeup_tick = 0;
@@ -2050,7 +2250,7 @@ fn mark_cos_queue_runnable(queue: &mut CoSQueueRuntime) {
 }
 
 fn normalize_cos_queue_state(queue: &mut CoSQueueRuntime) {
-    if queue.items.is_empty() {
+    if cos_queue_is_empty(queue) {
         queue.runnable = false;
         queue.parked = false;
         queue.next_wakeup_tick = 0;
@@ -2549,35 +2749,29 @@ fn demote_prepared_cos_queue_to_local(
     let Some(queue_idx) = resolve_cos_queue_idx(root, requested_queue) else {
         return false;
     };
-    let Some(queue) = root.queues.get(queue_idx) else {
+    let Some(queue) = root.queues.get_mut(queue_idx) else {
         return false;
     };
-    if !queue.exact || queue.items.is_empty() {
+    if !queue.exact || cos_queue_is_empty(queue) {
         return false;
     }
-    if queue
-        .items
-        .iter()
-        .any(|item| matches!(item, CoSPendingTxItem::Local(_)))
-    {
-        return false;
-    }
-
-    let mut local_items = VecDeque::with_capacity(queue.items.len());
-    let mut recycles = Vec::with_capacity(queue.items.len());
-    for item in queue.items.iter() {
+    let drained = cos_queue_drain_all(queue);
+    let mut local_items = VecDeque::with_capacity(drained.len());
+    let mut recycles = Vec::with_capacity(drained.len());
+    for item in &drained {
         let CoSPendingTxItem::Prepared(req) = item else {
+            cos_queue_restore_front(queue, drained);
             return false;
         };
         let Some(local_req) = clone_prepared_request_for_cos(area, req) else {
+            cos_queue_restore_front(queue, drained);
             return false;
         };
         local_items.push_back(CoSPendingTxItem::Local(local_req));
         recycles.push((req.recycle, req.offset));
     }
-
-    if let Some(queue) = root.queues.get_mut(queue_idx) {
-        queue.items = local_items;
+    for item in local_items {
+        cos_queue_push_back(queue, item);
     }
     for (recycle, offset) in recycles {
         recycle_cancelled_prepared_offset(
@@ -2598,10 +2792,17 @@ fn cos_queue_accepts_prepared(root: &CoSInterfaceRuntime, requested_queue: Optio
     let Some(queue) = root.queues.get(queue_idx) else {
         return false;
     };
-    !queue
-        .items
-        .iter()
-        .any(|item| matches!(item, CoSPendingTxItem::Local(_)))
+    if !queue.flow_fair {
+        return !queue
+            .items
+            .iter()
+            .any(|item| matches!(item, CoSPendingTxItem::Local(_)));
+    }
+    !queue.flow_rr_buckets.iter().any(|bucket| {
+        queue.flow_bucket_items[usize::from(*bucket)]
+            .iter()
+            .any(|item| matches!(item, CoSPendingTxItem::Local(_)))
+    })
 }
 
 fn ensure_cos_interface_runtime(
@@ -2620,9 +2821,13 @@ fn ensure_cos_interface_runtime(
         return false;
     }
     if !binding.cos_interfaces.contains_key(&egress_ifindex) {
-        binding
-            .cos_interfaces
-            .insert(egress_ifindex, build_cos_interface_runtime(config, now_ns));
+        let mut runtime = build_cos_interface_runtime(config, now_ns);
+        if let Some(iface_fast) = binding.cos_fast_interfaces.get(&egress_ifindex) {
+            for (queue, queue_fast) in runtime.queues.iter_mut().zip(&iface_fast.queue_fast_path) {
+                queue.flow_fair = queue.exact && !queue_fast.shared_exact;
+            }
+        }
+        binding.cos_interfaces.insert(egress_ifindex, runtime);
         binding.cos_interface_order.push(egress_ifindex);
         binding.cos_interface_order.sort_unstable();
     }
@@ -2652,6 +2857,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 priority: queue.priority,
                 transmit_rate_bytes: queue.transmit_rate_bytes,
                 exact: queue.exact,
+                flow_fair: false,
                 surplus_weight: queue.surplus_weight,
                 surplus_deficit: 0,
                 buffer_bytes: queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
@@ -2663,6 +2869,10 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 },
                 last_refill_ns: if queue.exact { 0 } else { now_ns },
                 queued_bytes: 0,
+                active_flow_buckets: 0,
+                flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                flow_rr_buckets: VecDeque::new(),
+                flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                 runnable: false,
                 parked: false,
                 next_wakeup_tick: 0,
@@ -2735,16 +2945,23 @@ fn enqueue_cos_item(
         let root_was_empty = root.nonempty_queues == 0;
         let queue = &mut root.queues[queue_idx];
         let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
-        if queue.queued_bytes.saturating_add(item_len) > buffer_limit {
+        let flow_share_exceeded = if queue.flow_fair {
+            let flow_bucket = cos_flow_bucket_index(cos_item_flow_key(&item));
+            queue.flow_bucket_bytes[flow_bucket].saturating_add(item_len)
+                > cos_queue_flow_share_limit(queue, buffer_limit, flow_bucket)
+        } else {
+            false
+        };
+        if flow_share_exceeded || queue.queued_bytes.saturating_add(item_len) > buffer_limit {
             let recycle = match &item {
                 CoSPendingTxItem::Prepared(req) => Some((req.recycle, req.offset)),
                 CoSPendingTxItem::Local(_) => None,
             };
             (false, queue.queue_id, recycle)
         } else {
-            let queue_was_empty = queue.items.is_empty();
+            let queue_was_empty = cos_queue_is_empty(queue);
             queue.queued_bytes = queue.queued_bytes.saturating_add(item_len);
-            queue.items.push_back(item);
+            cos_queue_push_back(queue, item);
             if queue_was_empty {
                 root.nonempty_queues = root.nonempty_queues.saturating_add(1);
                 root_became_nonempty = root_was_empty;
@@ -2794,10 +3011,10 @@ fn refresh_cos_interface_activity(binding: &mut BindingWorker, root_ifindex: i32
     if let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) {
         for (queue_idx, queue) in root.queues.iter_mut().enumerate() {
             normalize_cos_queue_state(queue);
-            if queue.items.is_empty() && queue.exact && queue.tokens > 0 {
+            if cos_queue_is_empty(queue) && queue.exact && queue.tokens > 0 {
                 released_queue_leases.push((queue_idx, core::mem::take(&mut queue.tokens)));
             }
-            if queue.items.is_empty() {
+            if cos_queue_is_empty(queue) {
                 continue;
             }
             new_nonempty = new_nonempty.saturating_add(1);
@@ -3047,9 +3264,9 @@ fn restore_cos_local_items_inner(
     let mut retry_bytes = 0u64;
     while let Some(req) = retry.pop_back() {
         retry_bytes = retry_bytes.saturating_add(req.bytes.len() as u64);
-        queue.items.push_front(CoSPendingTxItem::Local(req));
+        cos_queue_push_front(queue, CoSPendingTxItem::Local(req));
     }
-    if !queue.items.is_empty() {
+    if !cos_queue_is_empty(queue) {
         mark_cos_queue_runnable(queue);
     }
     retry_bytes
@@ -3062,9 +3279,9 @@ fn restore_cos_prepared_items_inner(
     let mut retry_bytes = 0u64;
     while let Some(req) = retry.pop_back() {
         retry_bytes = retry_bytes.saturating_add(req.len as u64);
-        queue.items.push_front(CoSPendingTxItem::Prepared(req));
+        cos_queue_push_front(queue, CoSPendingTxItem::Prepared(req));
     }
-    if !queue.items.is_empty() {
+    if !cos_queue_is_empty(queue) {
         mark_cos_queue_runnable(queue);
     }
     retry_bytes
@@ -4249,6 +4466,60 @@ mod tests {
         assert_eq!(queued.len(), 1);
         assert_eq!(queued.front().map(|req| req.egress_ifindex), Some(80));
         assert_eq!(queued.front().map(|req| req.cos_queue_id), Some(Some(4)));
+    }
+
+    #[test]
+    fn redirect_local_cos_request_to_owner_redirects_low_rate_exact_queue() {
+        let commands = Arc::new(Mutex::new(VecDeque::new()));
+        let worker_commands_by_id = BTreeMap::from([(7, commands.clone())]);
+        let cos_fast_interfaces = test_cos_fast_interfaces(
+            80,
+            12,
+            4,
+            vec![(
+                4,
+                test_queue_fast_path(
+                    false,
+                    7,
+                    None,
+                    Some(Arc::new(SharedCoSQueueLease::new(
+                        1_000_000_000 / 8,
+                        COS_MIN_BURST_BYTES,
+                        4,
+                    ))),
+                ),
+            )],
+            Some(Arc::new(BindingLiveState::new())),
+            None,
+        );
+        let req = TxRequest {
+            bytes: vec![1, 2, 3],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 80,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        };
+
+        let redirected = redirect_local_cos_request_to_owner(
+            &cos_fast_interfaces,
+            req,
+            2,
+            &worker_commands_by_id,
+        );
+
+        assert!(redirected.is_ok());
+        let pending = commands.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        match pending.front() {
+            Some(WorkerCommand::EnqueueShapedLocal(req)) => {
+                assert_eq!(req.egress_ifindex, 80);
+                assert_eq!(req.cos_queue_id, Some(4));
+            }
+            other => panic!("unexpected command queued: {other:?}"),
+        }
     }
 
     #[test]
@@ -6469,6 +6740,213 @@ mod tests {
         })
     }
 
+    fn test_flow_cos_item(src_port: u16, len: usize) -> CoSPendingTxItem {
+        CoSPendingTxItem::Local(TxRequest {
+            bytes: vec![0; len],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: Some(test_session_key(src_port, 5201)),
+            egress_ifindex: 42,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        })
+    }
+
+    fn test_flow_prepared_cos_item(src_port: u16, len: u32, offset: u64) -> CoSPendingTxItem {
+        CoSPendingTxItem::Prepared(PreparedTxRequest {
+            offset,
+            len,
+            recycle: PreparedTxRecycle::FreeTxFrame,
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: Some(test_session_key(src_port, 5201)),
+            egress_ifindex: 42,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        })
+    }
+
+    fn test_session_key(src_port: u16, dst_port: u16) -> SessionKey {
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, (src_port & 0xff) as u8)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port,
+            dst_port,
+        }
+    }
+
+    #[test]
+    fn flow_fair_exact_queue_limits_dominant_flow_share() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        let flow_a = test_session_key(1111, 5201);
+        let flow_b = test_session_key(1112, 5201);
+        let bucket_a = cos_flow_bucket_index(Some(&flow_a));
+        let bucket_b = cos_flow_bucket_index(Some(&flow_b));
+        assert_ne!(bucket_a, bucket_b);
+
+        assert_eq!(
+            cos_queue_flow_share_limit(queue, buffer_limit, bucket_a),
+            buffer_limit
+        );
+        account_cos_queue_flow_enqueue(queue, Some(&flow_a), 64 * 1024);
+        account_cos_queue_flow_enqueue(queue, Some(&flow_a), 32 * 1024);
+        assert_eq!(queue.active_flow_buckets, 1);
+        assert_eq!(queue.flow_bucket_bytes[bucket_a], 96 * 1024);
+
+        account_cos_queue_flow_enqueue(queue, Some(&flow_b), 16 * 1024);
+        assert_eq!(queue.active_flow_buckets, 2);
+        assert_eq!(queue.flow_bucket_bytes[bucket_b], 16 * 1024);
+
+        let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, bucket_a);
+        assert_eq!(share_cap, buffer_limit / 2);
+        assert!(queue.flow_bucket_bytes[bucket_a].saturating_add(16 * 1024) > share_cap);
+
+        account_cos_queue_flow_dequeue(queue, Some(&flow_b), 16 * 1024);
+        assert_eq!(queue.active_flow_buckets, 1);
+        assert_eq!(queue.flow_bucket_bytes[bucket_b], 0);
+    }
+
+    #[test]
+    fn cos_queue_push_and_pop_track_flow_bucket_bytes() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+
+        let req_a = TxRequest {
+            bytes: vec![0; 1500],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: Some(test_session_key(1111, 5201)),
+            egress_ifindex: 80,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        };
+        let req_b = TxRequest {
+            bytes: vec![0; 1500],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: Some(test_session_key(1112, 5201)),
+            egress_ifindex: 80,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        };
+        let bucket_a = cos_flow_bucket_index(req_a.flow_key.as_ref());
+        let bucket_b = cos_flow_bucket_index(req_b.flow_key.as_ref());
+        assert_ne!(bucket_a, bucket_b);
+
+        cos_queue_push_back(queue, CoSPendingTxItem::Local(req_a));
+        cos_queue_push_back(queue, CoSPendingTxItem::Local(req_b));
+        assert_eq!(queue.active_flow_buckets, 2);
+        assert_eq!(queue.flow_bucket_bytes[bucket_a], 1500);
+        assert_eq!(queue.flow_bucket_bytes[bucket_b], 1500);
+
+        let Some(CoSPendingTxItem::Local(req)) = cos_queue_pop_front(queue) else {
+            panic!("expected first queued local request");
+        };
+        assert_eq!(req.flow_key.as_ref().map(|flow| flow.src_port), Some(1111));
+        assert_eq!(queue.active_flow_buckets, 1);
+        assert_eq!(queue.flow_bucket_bytes[bucket_a], 0);
+        assert_eq!(queue.flow_bucket_bytes[bucket_b], 1500);
+    }
+
+    #[test]
+    fn flow_fair_queue_round_robins_distinct_local_flows() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+
+        cos_queue_push_back(queue, test_flow_cos_item(1111, 1500));
+        cos_queue_push_back(queue, test_flow_cos_item(1111, 1500));
+        cos_queue_push_back(queue, test_flow_cos_item(1112, 1500));
+        cos_queue_push_back(queue, test_flow_cos_item(1113, 1500));
+
+        let mut order = Vec::new();
+        while let Some(CoSPendingTxItem::Local(req)) = cos_queue_pop_front(queue) {
+            order.push(req.flow_key.expect("flow key").src_port);
+        }
+
+        assert_eq!(order, vec![1111, 1112, 1113, 1111]);
+        assert_eq!(queue.active_flow_buckets, 0);
+        assert!(queue.flow_rr_buckets.is_empty());
+    }
+
+    #[test]
+    fn flow_fair_queue_round_robins_distinct_prepared_flows() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+
+        cos_queue_push_back(queue, test_flow_prepared_cos_item(1111, 1500, 64));
+        cos_queue_push_back(queue, test_flow_prepared_cos_item(1111, 1500, 128));
+        cos_queue_push_back(queue, test_flow_prepared_cos_item(1112, 1500, 192));
+
+        let mut order = Vec::new();
+        while let Some(CoSPendingTxItem::Prepared(req)) = cos_queue_pop_front(queue) {
+            order.push(req.flow_key.expect("flow key").src_port);
+        }
+
+        assert_eq!(order, vec![1111, 1112, 1111]);
+        assert_eq!(queue.active_flow_buckets, 0);
+        assert!(queue.flow_rr_buckets.is_empty());
+    }
+
     #[test]
     fn estimate_cos_queue_wakeup_tick_uses_token_deficits() {
         let mut root = test_cos_interface_runtime(0);
@@ -6849,6 +7327,7 @@ mod tests {
             priority: 5,
             transmit_rate_bytes: 11_000_000_000 / 8,
             exact: true,
+            flow_fair: false,
             surplus_weight: 1,
             surplus_deficit: 0,
             buffer_bytes: COS_MIN_BURST_BYTES,
@@ -6856,6 +7335,10 @@ mod tests {
             tokens: 0,
             last_refill_ns: 0,
             queued_bytes: 1500,
+            active_flow_buckets: 0,
+            flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            flow_rr_buckets: VecDeque::new(),
+            flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
             parked: false,
             next_wakeup_tick: 0,
@@ -6878,6 +7361,7 @@ mod tests {
             priority: 5,
             transmit_rate_bytes: 11_000_000_000 / 8,
             exact: true,
+            flow_fair: false,
             surplus_weight: 1,
             surplus_deficit: 0,
             buffer_bytes: COS_MIN_BURST_BYTES,
@@ -6885,6 +7369,10 @@ mod tests {
             tokens: 0,
             last_refill_ns: 0,
             queued_bytes: 0,
+            active_flow_buckets: 0,
+            flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            flow_rr_buckets: VecDeque::new(),
+            flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
             parked: false,
             next_wakeup_tick: 0,
@@ -6918,6 +7406,7 @@ mod tests {
             priority: 5,
             transmit_rate_bytes: 11_000_000_000 / 8,
             exact: true,
+            flow_fair: false,
             surplus_weight: 1,
             surplus_deficit: 0,
             buffer_bytes: COS_MIN_BURST_BYTES,
@@ -6925,6 +7414,10 @@ mod tests {
             tokens: 0,
             last_refill_ns: 0,
             queued_bytes: 0,
+            active_flow_buckets: 0,
+            flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+            flow_rr_buckets: VecDeque::new(),
+            flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
             parked: false,
             next_wakeup_tick: 0,
