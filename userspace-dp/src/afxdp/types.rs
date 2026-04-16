@@ -92,6 +92,82 @@ const _: [(); 40] = [(); std::mem::offset_of!(UserspaceDpMeta, dscp)];
 const _: [(); 80] = [(); std::mem::offset_of!(UserspaceDpMeta, config_generation)];
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct ForwardPacketMeta {
+    pub(super) ingress_ifindex: u32,
+    pub(super) ingress_vlan_id: u16,
+    pub(super) ingress_pcp: u8,
+    pub(super) ingress_vlan_present: u8,
+    pub(super) l3_offset: u16,
+    pub(super) l4_offset: u16,
+    pub(super) payload_offset: u16,
+    pub(super) pkt_len: u16,
+    pub(super) addr_family: u8,
+    pub(super) protocol: u8,
+    pub(super) tcp_flags: u8,
+    pub(super) meta_flags: u8,
+    pub(super) dscp: u8,
+    pub(super) flow_src_port: u16,
+    pub(super) flow_dst_port: u16,
+}
+
+impl From<UserspaceDpMeta> for ForwardPacketMeta {
+    fn from(meta: UserspaceDpMeta) -> Self {
+        Self {
+            ingress_ifindex: meta.ingress_ifindex,
+            ingress_vlan_id: meta.ingress_vlan_id,
+            ingress_pcp: meta.ingress_pcp,
+            ingress_vlan_present: meta.ingress_vlan_present,
+            l3_offset: meta.l3_offset,
+            l4_offset: meta.l4_offset,
+            payload_offset: meta.payload_offset,
+            pkt_len: meta.pkt_len,
+            addr_family: meta.addr_family,
+            protocol: meta.protocol,
+            tcp_flags: meta.tcp_flags,
+            meta_flags: meta.meta_flags,
+            dscp: meta.dscp,
+            flow_src_port: meta.flow_src_port,
+            flow_dst_port: meta.flow_dst_port,
+        }
+    }
+}
+
+impl From<ForwardPacketMeta> for UserspaceDpMeta {
+    fn from(meta: ForwardPacketMeta) -> Self {
+        Self {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: meta.ingress_ifindex,
+            rx_queue_index: 0,
+            ingress_vlan_id: meta.ingress_vlan_id,
+            ingress_pcp: meta.ingress_pcp,
+            ingress_vlan_present: meta.ingress_vlan_present,
+            ingress_zone: 0,
+            routing_table: 0,
+            l3_offset: meta.l3_offset,
+            l4_offset: meta.l4_offset,
+            payload_offset: meta.payload_offset,
+            pkt_len: meta.pkt_len,
+            addr_family: meta.addr_family,
+            protocol: meta.protocol,
+            tcp_flags: meta.tcp_flags,
+            meta_flags: meta.meta_flags,
+            dscp: meta.dscp,
+            dscp_rewrite: 0,
+            reserved: 0,
+            flow_src_port: meta.flow_src_port,
+            flow_dst_port: meta.flow_dst_port,
+            flow_src_addr: [0; 16],
+            flow_dst_addr: [0; 16],
+            config_generation: 0,
+            fib_generation: 0,
+            reserved2: 0,
+        }
+    }
+}
+#[repr(C)]
 pub(super) struct XdpOptions {
     pub(super) flags: u32,
 }
@@ -173,6 +249,8 @@ pub(super) struct ForwardingState {
     pub(super) tunnel_interfaces: FastSet<i32>,
     pub(super) filter_state: crate::filter::FilterState,
     pub(super) cos: CoSState,
+    pub(super) tx_selection_enabled_v4: bool,
+    pub(super) tx_selection_enabled_v6: bool,
     #[allow(dead_code)]
     pub(super) gre_acceleration: bool,
     pub(super) flow_export_config: Option<crate::flowexport::FlowExportConfig>,
@@ -182,7 +260,7 @@ pub(super) struct ForwardingState {
     pub(super) tcp_mss_gre_out: u16,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct CoSState {
     pub(super) interfaces: FastMap<i32, CoSInterfaceConfig>,
     pub(super) dscp_classifiers: FastMap<String, CoSDSCPClassifierConfig>,
@@ -190,33 +268,35 @@ pub(super) struct CoSState {
     pub(super) dscp_rewrite_rules: FastMap<String, CoSDSCPRewriteRuleConfig>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CoSInterfaceConfig {
     pub(super) shaping_rate_bytes: u64,
     pub(super) burst_bytes: u64,
     pub(super) default_queue: u8,
     pub(super) dscp_classifier: String,
     pub(super) ieee8021_classifier: String,
+    pub(super) dscp_queue_by_dscp: [u8; 64],
+    pub(super) ieee8021_queue_by_pcp: [u8; 8],
     pub(super) queue_by_forwarding_class: FastMap<String, u8>,
     pub(super) queues: Vec<CoSQueueConfig>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct CoSDSCPClassifierConfig {
     pub(super) queue_by_dscp: FastMap<u8, u8>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct CoSIEEE8021ClassifierConfig {
     pub(super) queue_by_pcp: FastMap<u8, u8>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct CoSDSCPRewriteRuleConfig {
     pub(super) dscp_by_forwarding_class: FastMap<String, u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CoSQueueConfig {
     pub(super) queue_id: u8,
     pub(super) forwarding_class: String,
@@ -567,20 +647,30 @@ pub(super) struct TxRequest {
     pub(super) dscp_rewrite: Option<u8>,
 }
 
+pub(super) enum PendingForwardFrame {
+    Live,
+    Owned(Vec<u8>),
+    Prebuilt(Vec<u8>),
+}
+
+impl Default for PendingForwardFrame {
+    fn default() -> Self {
+        Self::Live
+    }
+}
+
 pub(super) struct PendingForwardRequest {
     pub(super) target_ifindex: i32,
     pub(super) target_binding_index: Option<usize>,
     pub(super) ingress_queue_id: u32,
-    pub(super) source_offset: u64,
     pub(super) desc: XdpDesc,
-    pub(super) source_frame: Option<Vec<u8>>,
-    pub(super) meta: UserspaceDpMeta,
+    pub(super) frame: PendingForwardFrame,
+    pub(super) meta: ForwardPacketMeta,
     pub(super) decision: SessionDecision,
     pub(super) apply_nat_on_fabric: bool,
     pub(super) expected_ports: Option<(u16, u16)>,
     pub(super) flow_key: Option<SessionKey>,
     pub(super) nat64_reverse: Option<Nat64ReverseInfo>,
-    pub(super) prebuilt_frame: Option<Vec<u8>>,
     pub(super) cos_queue_id: Option<u8>,
     pub(super) dscp_rewrite: Option<u8>,
 }
@@ -642,14 +732,20 @@ pub(super) struct CoSTimerWheelRuntime {
 }
 
 #[repr(align(64))]
+pub(super) struct SharedCoSQueueLease {
+    config: SharedCoSLeaseConfig,
+    state: Mutex<SharedCoSLeaseState>,
+}
+
+#[repr(align(64))]
 pub(super) struct SharedCoSRootLease {
-    config: SharedCoSRootLeaseConfig,
-    state: Mutex<SharedCoSRootLeaseState>,
+    config: SharedCoSLeaseConfig,
+    state: Mutex<SharedCoSLeaseState>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SharedCoSRootLeaseConfig {
-    shaping_rate_bytes: u64,
+struct SharedCoSLeaseConfig {
+    rate_bytes: u64,
     burst_bytes: u64,
     lease_bytes: u64,
     max_total_leased: u64,
@@ -657,51 +753,184 @@ struct SharedCoSRootLeaseConfig {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-struct SharedCoSRootLeaseState {
+struct SharedCoSLeaseState {
     available_tokens: u64,
     outstanding_leased_tokens: u64,
     last_refill_ns: u64,
 }
 
-const COS_ROOT_LEASE_TARGET_US: u64 = 25;
+const COS_ROOT_LEASE_TARGET_US: u64 = 200;
 const COS_ROOT_LEASE_MIN_BYTES: u64 = 1500;
-const COS_ROOT_LEASE_MAX_BYTES: u64 = 64 * 1024;
+const COS_ROOT_LEASE_MAX_BYTES: u64 = 512 * 1024;
 
-impl SharedCoSRootLease {
-    fn compute_config(
-        shaping_rate_bytes: u64,
-        burst_bytes: u64,
-        active_shards: usize,
-    ) -> SharedCoSRootLeaseConfig {
-        let burst_bytes = burst_bytes.max(COS_ROOT_LEASE_MIN_BYTES);
-        let active_shards = active_shards.max(1);
-        let target_lease_bytes = ((shaping_rate_bytes as u128) * (COS_ROOT_LEASE_TARGET_US as u128)
-            / 1_000_000u128) as u64;
-        let lease_ceiling = burst_bytes
-            .saturating_div(8)
-            .min(COS_ROOT_LEASE_MAX_BYTES)
-            .max(COS_ROOT_LEASE_MIN_BYTES);
-        let lease_bytes = target_lease_bytes
-            .max(COS_ROOT_LEASE_MIN_BYTES)
-            .min(lease_ceiling);
-        let max_frame_lease_bytes = lease_bytes.max(tx_frame_capacity() as u64);
-        let max_total_leased = burst_bytes
-            .saturating_div(4)
-            .min(max_frame_lease_bytes.saturating_mul(active_shards as u64));
-        SharedCoSRootLeaseConfig {
-            shaping_rate_bytes,
-            burst_bytes,
-            lease_bytes,
-            max_total_leased,
-            active_shards,
+fn compute_shared_cos_lease_config(
+    rate_bytes: u64,
+    burst_bytes: u64,
+    active_shards: usize,
+) -> SharedCoSLeaseConfig {
+    let burst_bytes = burst_bytes.max(COS_ROOT_LEASE_MIN_BYTES);
+    let active_shards = active_shards.max(1);
+    let target_lease_bytes =
+        ((rate_bytes as u128) * (COS_ROOT_LEASE_TARGET_US as u128) / 1_000_000u128) as u64;
+    let lease_ceiling = burst_bytes
+        .saturating_div(8)
+        .min(COS_ROOT_LEASE_MAX_BYTES)
+        .max(COS_ROOT_LEASE_MIN_BYTES);
+    let lease_bytes = target_lease_bytes
+        .max(COS_ROOT_LEASE_MIN_BYTES)
+        .min(lease_ceiling);
+    let max_frame_lease_bytes = lease_bytes.max(tx_frame_capacity() as u64);
+    let max_total_leased = burst_bytes
+        .saturating_div(4)
+        .min(max_frame_lease_bytes.saturating_mul(active_shards as u64));
+    SharedCoSLeaseConfig {
+        rate_bytes,
+        burst_bytes,
+        lease_bytes,
+        max_total_leased,
+        active_shards,
+    }
+}
+
+fn shared_cos_lease_acquire(
+    config: SharedCoSLeaseConfig,
+    state: &Mutex<SharedCoSLeaseState>,
+    now_ns: u64,
+    requested: u64,
+) -> u64 {
+    let Ok(mut state) = state.lock() else {
+        return 0;
+    };
+    refill_shared_cos_lease_locked(config, &mut state, now_ns);
+    let lease_headroom = config
+        .max_total_leased
+        .saturating_sub(state.outstanding_leased_tokens);
+    if lease_headroom == 0 || state.available_tokens == 0 {
+        return 0;
+    }
+    let granted = requested.min(state.available_tokens).min(lease_headroom);
+    state.available_tokens = state.available_tokens.saturating_sub(granted);
+    state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_add(granted);
+    granted
+}
+
+fn shared_cos_lease_consume(state: &Mutex<SharedCoSLeaseState>, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    if let Ok(mut state) = state.lock() {
+        state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_sub(bytes);
+    }
+}
+
+#[inline(always)]
+fn shared_cos_lease_available_cap(
+    config: SharedCoSLeaseConfig,
+    outstanding_leased_tokens: u64,
+) -> u64 {
+    config.burst_bytes.saturating_sub(outstanding_leased_tokens)
+}
+
+fn shared_cos_lease_release_unused(
+    config: SharedCoSLeaseConfig,
+    state: &Mutex<SharedCoSLeaseState>,
+    bytes: u64,
+) {
+    if bytes == 0 {
+        return;
+    }
+    if let Ok(mut state) = state.lock() {
+        state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_sub(bytes);
+        state.available_tokens =
+            state
+                .available_tokens
+                .saturating_add(bytes)
+                .min(shared_cos_lease_available_cap(
+                    config,
+                    state.outstanding_leased_tokens,
+                ));
+    }
+}
+
+fn refill_shared_cos_lease_locked(
+    config: SharedCoSLeaseConfig,
+    state: &mut SharedCoSLeaseState,
+    now_ns: u64,
+) {
+    if config.burst_bytes == 0 {
+        return;
+    }
+    if state.last_refill_ns == 0 {
+        state.available_tokens =
+            shared_cos_lease_available_cap(config, state.outstanding_leased_tokens);
+        state.last_refill_ns = now_ns;
+        return;
+    }
+    if now_ns <= state.last_refill_ns || config.rate_bytes == 0 {
+        return;
+    }
+    let elapsed_ns = now_ns - state.last_refill_ns;
+    let added = ((elapsed_ns as u128) * (config.rate_bytes as u128) / 1_000_000_000u128) as u64;
+    if added == 0 {
+        return;
+    }
+    state.available_tokens =
+        state
+            .available_tokens
+            .saturating_add(added)
+            .min(shared_cos_lease_available_cap(
+                config,
+                state.outstanding_leased_tokens,
+            ));
+    state.last_refill_ns = now_ns;
+}
+
+impl SharedCoSQueueLease {
+    pub(super) fn new(rate_bytes: u64, burst_bytes: u64, active_shards: usize) -> Self {
+        let config = compute_shared_cos_lease_config(rate_bytes, burst_bytes, active_shards);
+        Self {
+            config,
+            state: Mutex::new(SharedCoSLeaseState {
+                available_tokens: config.burst_bytes,
+                outstanding_leased_tokens: 0,
+                last_refill_ns: 0,
+            }),
         }
     }
 
+    pub(super) fn lease_bytes(&self) -> u64 {
+        self.config.lease_bytes
+    }
+
+    pub(super) fn matches_config(
+        &self,
+        rate_bytes: u64,
+        burst_bytes: u64,
+        active_shards: usize,
+    ) -> bool {
+        self.config == compute_shared_cos_lease_config(rate_bytes, burst_bytes, active_shards)
+    }
+
+    pub(super) fn acquire(&self, now_ns: u64, requested: u64) -> u64 {
+        shared_cos_lease_acquire(self.config, &self.state, now_ns, requested)
+    }
+
+    pub(super) fn consume(&self, bytes: u64) {
+        shared_cos_lease_consume(&self.state, bytes);
+    }
+
+    pub(super) fn release_unused(&self, bytes: u64) {
+        shared_cos_lease_release_unused(self.config, &self.state, bytes);
+    }
+}
+
+impl SharedCoSRootLease {
     pub(super) fn new(shaping_rate_bytes: u64, burst_bytes: u64, active_shards: usize) -> Self {
-        let config = Self::compute_config(shaping_rate_bytes, burst_bytes, active_shards);
+        let config =
+            compute_shared_cos_lease_config(shaping_rate_bytes, burst_bytes, active_shards);
         Self {
             config,
-            state: Mutex::new(SharedCoSRootLeaseState {
+            state: Mutex::new(SharedCoSLeaseState {
                 available_tokens: config.burst_bytes,
                 outstanding_leased_tokens: 0,
                 last_refill_ns: 0,
@@ -719,72 +948,59 @@ impl SharedCoSRootLease {
         burst_bytes: u64,
         active_shards: usize,
     ) -> bool {
-        self.config == Self::compute_config(shaping_rate_bytes, burst_bytes, active_shards)
+        self.config
+            == compute_shared_cos_lease_config(shaping_rate_bytes, burst_bytes, active_shards)
     }
 
     pub(super) fn acquire(&self, now_ns: u64, requested: u64) -> u64 {
-        let Ok(mut state) = self.state.lock() else {
-            return 0;
-        };
-        self.refill_locked(&mut state, now_ns);
-        let lease_headroom = self
-            .config
-            .max_total_leased
-            .saturating_sub(state.outstanding_leased_tokens);
-        if lease_headroom == 0 || state.available_tokens == 0 {
-            return 0;
-        }
-        let granted = requested.min(state.available_tokens).min(lease_headroom);
-        state.available_tokens = state.available_tokens.saturating_sub(granted);
-        state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_add(granted);
-        granted
+        shared_cos_lease_acquire(self.config, &self.state, now_ns, requested)
     }
 
     pub(super) fn consume(&self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        if let Ok(mut state) = self.state.lock() {
-            state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_sub(bytes);
-        }
+        shared_cos_lease_consume(&self.state, bytes);
     }
 
     pub(super) fn release_unused(&self, bytes: u64) {
-        if bytes == 0 {
-            return;
-        }
-        if let Ok(mut state) = self.state.lock() {
-            state.outstanding_leased_tokens = state.outstanding_leased_tokens.saturating_sub(bytes);
-            state.available_tokens = state
-                .available_tokens
-                .saturating_add(bytes)
-                .min(self.config.burst_bytes);
-        }
+        shared_cos_lease_release_unused(self.config, &self.state, bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_cos_root_lease_refill_respects_outstanding_burst_credit() {
+        let lease = SharedCoSRootLease::new(10_000_000, 16_000, 1);
+        let mut state = lease.state.lock().unwrap();
+        state.available_tokens = 0;
+        state.outstanding_leased_tokens = 4_000;
+        state.last_refill_ns = 1;
+
+        refill_shared_cos_lease_locked(lease.config, &mut state, 1_000_000_001);
+
+        assert_eq!(
+            state.available_tokens,
+            lease.config.burst_bytes - state.outstanding_leased_tokens
+        );
     }
 
-    fn refill_locked(&self, state: &mut SharedCoSRootLeaseState, now_ns: u64) {
-        if self.config.burst_bytes == 0 {
-            return;
+    #[test]
+    fn shared_cos_root_lease_release_unused_preserves_total_burst_bound() {
+        let lease = SharedCoSRootLease::new(10_000_000, 16_000, 1);
+        {
+            let mut state = lease.state.lock().unwrap();
+            state.available_tokens = lease.config.burst_bytes;
+            state.outstanding_leased_tokens = 4_000;
         }
-        if state.last_refill_ns == 0 {
-            state.available_tokens = self.config.burst_bytes;
-            state.last_refill_ns = now_ns;
-            return;
-        }
-        if now_ns <= state.last_refill_ns || self.config.shaping_rate_bytes == 0 {
-            return;
-        }
-        let elapsed_ns = now_ns - state.last_refill_ns;
-        let added = ((elapsed_ns as u128) * (self.config.shaping_rate_bytes as u128)
-            / 1_000_000_000u128) as u64;
-        if added == 0 {
-            return;
-        }
-        state.available_tokens = state
-            .available_tokens
-            .saturating_add(added)
-            .min(self.config.burst_bytes);
-        state.last_refill_ns = now_ns;
+
+        lease.release_unused(1_500);
+
+        let state = lease.state.lock().unwrap();
+        assert_eq!(
+            state.available_tokens + state.outstanding_leased_tokens,
+            lease.config.burst_bytes
+        );
     }
 }
 

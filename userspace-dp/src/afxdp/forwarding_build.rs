@@ -32,6 +32,40 @@ pub(super) fn build_screen_profiles(snapshot: &ConfigSnapshot) -> FxHashMap<Stri
     profiles
 }
 
+fn build_cos_dscp_queue_table(
+    classifier_name: &str,
+    classifiers: &FastMap<String, CoSDSCPClassifierConfig>,
+) -> [u8; 64] {
+    let mut table = [u8::MAX; 64];
+    if classifier_name.is_empty() {
+        return table;
+    }
+    if let Some(classifier) = classifiers.get(classifier_name) {
+        for (&dscp, &queue_id) in &classifier.queue_by_dscp {
+            let idx = usize::from(dscp & 0x3f);
+            table[idx] = queue_id;
+        }
+    }
+    table
+}
+
+fn build_cos_ieee8021_queue_table(
+    classifier_name: &str,
+    classifiers: &FastMap<String, CoSIEEE8021ClassifierConfig>,
+) -> [u8; 8] {
+    let mut table = [u8::MAX; 8];
+    if classifier_name.is_empty() {
+        return table;
+    }
+    if let Some(classifier) = classifiers.get(classifier_name) {
+        for (&pcp, &queue_id) in &classifier.queue_by_pcp {
+            let idx = usize::from(pcp.min(7));
+            table[idx] = queue_id;
+        }
+    }
+    table
+}
+
 pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingState {
     let mut state = ForwardingState::default();
     let mut name_to_ifindex = BTreeMap::new();
@@ -172,7 +206,9 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
         };
         let ingress_key = (bind_ifindex, iface.vlan_id.max(0) as u16);
         if iface.parent_ifindex > 0 {
-            state.ingress_logical_ifindex.insert(ingress_key, iface.ifindex);
+            state
+                .ingress_logical_ifindex
+                .insert(ingress_key, iface.ifindex);
         } else {
             state
                 .ingress_logical_ifindex
@@ -323,6 +359,13 @@ pub(super) fn build_forwarding_state(snapshot: &ConfigSnapshot) -> ForwardingSta
         &snapshot.flow.lo0_filter_input_v6,
     );
     state.cos = build_cos_state(snapshot);
+    let has_cos_interfaces = !state.cos.interfaces.is_empty();
+    state.tx_selection_enabled_v4 = has_cos_interfaces
+        || state.filter_state.has_input_tx_selection_v4
+        || state.filter_state.has_output_tx_selection_v4;
+    state.tx_selection_enabled_v6 = has_cos_interfaces
+        || state.filter_state.has_input_tx_selection_v6
+        || state.filter_state.has_output_tx_selection_v6;
     // Build flow export config from snapshot
     state.flow_export_config = snapshot.flow_export.as_ref().and_then(|fe| {
         let addr = format!("{}:{}", fe.collector_address, fe.collector_port);
@@ -620,6 +663,14 @@ fn build_cos_state(snapshot: &ConfigSnapshot) -> CoSState {
                 default_queue,
                 dscp_classifier: iface.cos_dscp_classifier.clone(),
                 ieee8021_classifier: iface.cos_ieee8021_classifier.clone(),
+                dscp_queue_by_dscp: build_cos_dscp_queue_table(
+                    &iface.cos_dscp_classifier,
+                    &dscp_classifiers,
+                ),
+                ieee8021_queue_by_pcp: build_cos_ieee8021_queue_table(
+                    &iface.cos_ieee8021_classifier,
+                    &ieee8021_classifiers,
+                ),
                 queue_by_forwarding_class,
                 queues,
             },
@@ -963,6 +1014,48 @@ mod tests {
 
         let state = build_forwarding_state(&snapshot);
         assert_eq!(state.ingress_logical_ifindex.get(&(10, 0)), Some(&11));
+    }
+    #[test]
+    fn build_forwarding_state_disables_tx_selection_when_no_cos_or_filters_exist() {
+        let state = build_forwarding_state(&ConfigSnapshot::default());
+        assert!(!state.tx_selection_enabled_v4);
+        assert!(!state.tx_selection_enabled_v6);
+    }
+
+    #[test]
+    fn build_forwarding_state_enables_tx_selection_when_cos_interfaces_exist() {
+        let snapshot = ConfigSnapshot {
+            interfaces: vec![InterfaceSnapshot {
+                ifindex: 42,
+                cos_shaping_rate_bytes_per_sec: 10_000_000,
+                cos_scheduler_map: "wan-map".into(),
+                ..Default::default()
+            }],
+            class_of_service: Some(ClassOfServiceSnapshot {
+                forwarding_classes: vec![CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                }],
+                schedulers: vec![CoSSchedulerSnapshot {
+                    name: "be-sched".into(),
+                    transmit_rate_bytes: 10_000_000,
+                    ..Default::default()
+                }],
+                scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                    name: "wan-map".into(),
+                    entries: vec![CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be-sched".into(),
+                    }],
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let state = build_forwarding_state(&snapshot);
+        assert!(state.tx_selection_enabled_v4);
+        assert!(state.tx_selection_enabled_v6);
     }
 }
 

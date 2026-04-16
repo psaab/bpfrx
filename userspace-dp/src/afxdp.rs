@@ -274,6 +274,7 @@ fn poll_binding(
     dbg: &mut DebugPollCounters,
     rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
     cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
+    cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 ) -> bool {
     #[derive(Default)]
     struct BatchCounters {
@@ -374,6 +375,7 @@ fn poll_binding(
         worker_id,
         worker_commands_by_id,
         cos_owner_worker_by_queue,
+        cos_owner_live_by_queue,
     );
     apply_shared_recycles(
         left,
@@ -403,6 +405,7 @@ fn poll_binding(
                 worker_id,
                 worker_commands_by_id,
                 cos_owner_worker_by_queue,
+                cos_owner_live_by_queue,
             );
             apply_shared_recycles(
                 left,
@@ -887,8 +890,16 @@ fn poll_binding(
                                 // HA resolution → fabric redirect.
                             } else {
                                 let cached_decision = cached.decision;
-                                let cached_descriptor = cached.descriptor;
-                                let cached_metadata = cached.metadata.clone();
+                                let cached_descriptor = &cached.descriptor;
+                                let cached_metadata = &cached.metadata;
+                                if let Some(counter) =
+                                    cached_descriptor.tx_selection.filter_counter.as_ref()
+                                {
+                                    crate::filter::record_filter_counter(
+                                        counter,
+                                        meta.pkt_len as u64,
+                                    );
+                                }
                                 // Amortize session timestamp touch — every 64 cache hits.
                                 binding.flow_cache_session_touch += 1;
                                 if binding.flow_cache_session_touch & 63 == 0 {
@@ -945,21 +956,28 @@ fn poll_binding(
                                         };
                                     let expected_ports =
                                         authoritative_forward_ports(packet_frame, meta, Some(flow));
-                                    let target_bi = if cached_decision.resolution.disposition
-                                        == ForwardingDisposition::FabricRedirect
-                                    {
-                                        binding_lookup.fabric_target_index(
-                                            target_ifindex,
-                                            fabric_queue_hash(Some(flow), expected_ports, meta),
-                                        )
-                                    } else {
-                                        binding_lookup.target_index(
-                                            binding_index,
-                                            ident.ifindex,
-                                            ident.queue_id,
-                                            target_ifindex,
-                                        )
-                                    };
+                                    let target_bi =
+                                        cached_descriptor.target_binding_index.or_else(|| {
+                                            if cached_decision.resolution.disposition
+                                                == ForwardingDisposition::FabricRedirect
+                                            {
+                                                binding_lookup.fabric_target_index(
+                                                    target_ifindex,
+                                                    fabric_queue_hash(
+                                                        Some(flow),
+                                                        expected_ports,
+                                                        meta,
+                                                    ),
+                                                )
+                                            } else {
+                                                binding_lookup.target_index(
+                                                    binding_index,
+                                                    ident.ifindex,
+                                                    ident.queue_id,
+                                                    target_ifindex,
+                                                )
+                                            }
+                                        });
                                     // Check if target is same binding (hairpin) or same-UMEM.
                                     // For simplicity, only do in-place fast path when target == self.
                                     let is_self_target = target_bi == Some(binding_index);
@@ -987,12 +1005,6 @@ fn poll_binding(
                                             )
                                         });
                                         if let Some(frame_len) = frame_len {
-                                            let cos = resolve_cos_tx_selection(
-                                                forwarding,
-                                                cached_decision.resolution.egress_ifindex,
-                                                meta,
-                                                Some(&flow.forward_key),
-                                            );
                                             binding.pending_tx_prepared.push_back(
                                                 PreparedTxRequest {
                                                     offset: desc.addr,
@@ -1007,8 +1019,12 @@ fn poll_binding(
                                                     egress_ifindex: cached_decision
                                                         .resolution
                                                         .egress_ifindex,
-                                                    cos_queue_id: cos.queue_id,
-                                                    dscp_rewrite: cos.dscp_rewrite,
+                                                    cos_queue_id: cached_descriptor
+                                                        .tx_selection
+                                                        .queue_id,
+                                                    dscp_rewrite: cached_descriptor
+                                                        .tx_selection
+                                                        .dscp_rewrite,
                                                 },
                                             );
                                             binding.pending_in_place_tx_packets += 1;
@@ -1032,9 +1048,17 @@ fn poll_binding(
                                                 Some(flow),
                                                 Some(&cached_metadata.ingress_zone),
                                                 cached_descriptor.apply_nat_on_fabric,
+                                                Some(PendingForwardHints {
+                                                    expected_ports,
+                                                    target_binding_index: target_bi,
+                                                }),
+                                                Some(&cached_descriptor.tx_selection),
                                             )
                                         {
-                                            request.source_frame = owned_packet_frame.take();
+                                            request.frame = owned_packet_frame
+                                                .take()
+                                                .map(PendingForwardFrame::Owned)
+                                                .unwrap_or(PendingForwardFrame::Live);
                                             dbg.forward += 1;
                                             dbg.tx += 1;
                                             binding.scratch_forwards.push(request);
@@ -1148,7 +1172,7 @@ fn poll_binding(
                                 if let Some(request) = local_icmp_te {
                                     binding.scratch_forwards.push(request);
                                     // Don't recycle: the TE response references
-                                    // the original frame via desc in its source_offset.
+                                    // the original frame via desc.addr on the request.
                                     // The continue skips recycle_now handling.
                                     continue;
                                 }
@@ -1195,8 +1219,13 @@ fn poll_binding(
                                     Some(flow),
                                     None,
                                     false,
+                                    None,
+                                    None,
                                 ) {
-                                    request.source_frame = owned_packet_frame.take();
+                                    request.frame = owned_packet_frame
+                                        .take()
+                                        .map(PendingForwardFrame::Owned)
+                                        .unwrap_or(PendingForwardFrame::Live);
                                     if sessions.install_with_protocol_with_origin(
                                         flow.forward_key.clone(),
                                         fabric_return_decision,
@@ -1591,16 +1620,16 @@ fn poll_binding(
                                                     target_ifindex,
                                                 ),
                                                 ingress_queue_id: ident.queue_id,
-                                                source_offset: desc.addr,
                                                 desc,
-                                                source_frame: None,
-                                                meta,
+                                                frame: PendingForwardFrame::Prebuilt(
+                                                    rewritten_frame,
+                                                ),
+                                                meta: meta.into(),
                                                 decision: icmp_decision,
                                                 apply_nat_on_fabric: false,
                                                 expected_ports: None,
                                                 flow_key: None,
                                                 nat64_reverse: None,
-                                                prebuilt_frame: Some(rewritten_frame),
                                                 cos_queue_id: cos.queue_id,
                                                 dscp_rewrite: cos.dscp_rewrite,
                                             });
@@ -2383,8 +2412,13 @@ fn poll_binding(
                             flow.as_ref(),
                             session_ingress_zone.as_ref(),
                             apply_nat_on_fabric,
+                            None,
+                            None,
                         ) {
-                            request.source_frame = owned_packet_frame.take();
+                            request.frame = owned_packet_frame
+                                .take()
+                                .map(PendingForwardFrame::Owned)
+                                .unwrap_or(PendingForwardFrame::Live);
                             dbg.tx += 1; // track forward requests queued
                             if cfg!(feature = "debug-log") {
                                 if dbg.tx <= 5 {
@@ -2434,6 +2468,7 @@ fn poll_binding(
                                     );
                                 }
                             }
+                            let request_target_binding_index = request.target_binding_index;
                             binding.scratch_forwards.push(request);
                             recycle_now = false;
                             // ── Flow cache population ────────────────────
@@ -2447,6 +2482,7 @@ fn poll_binding(
                                     decision,
                                     flow_cache_owner_rg_id,
                                     session_ingress_zone.as_ref().cloned(),
+                                    request_target_binding_index,
                                     forwarding,
                                     ha_state,
                                     apply_nat_on_fabric,
@@ -2779,33 +2815,36 @@ fn poll_binding(
             );
         }
         binding.scratch_rst_teardowns = rst_teardowns;
-        // Use raw pointer to avoid Arc::clone (~5% CPU from lock incq).
-        // Safety: the Arc<BindingLiveState> outlives this function call;
-        // binding is borrowed mutably by enqueue_pending_forwards but
-        // ingress_live is only used for read-only error logging inside it.
-        let ingress_live: *const BindingLiveState = &*binding.live;
-        let mut scratch_post_recycles = core::mem::take(&mut binding.scratch_post_recycles);
-        enqueue_pending_forwards(
-            left,
-            binding_index,
-            binding,
-            right,
-            binding_lookup,
-            &mut pending_forwards,
-            &mut scratch_post_recycles,
-            now_ns,
-            forwarding,
-            &ident,
-            unsafe { &*ingress_live },
-            slow_path,
-            local_tunnel_deliveries,
-            recent_exceptions,
-            dbg,
-            worker_id,
-            worker_commands_by_id,
-            cos_owner_worker_by_queue,
-        );
-        binding.scratch_post_recycles = scratch_post_recycles;
+        if !pending_forwards.is_empty() {
+            // Use raw pointer to avoid Arc::clone (~5% CPU from lock incq).
+            // Safety: the Arc<BindingLiveState> outlives this function call;
+            // binding is borrowed mutably by enqueue_pending_forwards but
+            // ingress_live is only used for read-only error logging inside it.
+            let ingress_live: *const BindingLiveState = &*binding.live;
+            let mut scratch_post_recycles = core::mem::take(&mut binding.scratch_post_recycles);
+            enqueue_pending_forwards(
+                left,
+                binding_index,
+                binding,
+                right,
+                binding_lookup,
+                &mut pending_forwards,
+                &mut scratch_post_recycles,
+                now_ns,
+                forwarding,
+                &ident,
+                unsafe { &*ingress_live },
+                slow_path,
+                local_tunnel_deliveries,
+                recent_exceptions,
+                dbg,
+                worker_id,
+                worker_commands_by_id,
+                cos_owner_worker_by_queue,
+                cos_owner_live_by_queue,
+            );
+            binding.scratch_post_recycles = scratch_post_recycles;
+        }
         binding.scratch_forwards = pending_forwards;
         // Reserved: cross-binding in-place TX from flow cache fast path.
         // Currently only self-target (hairpin) uses the inline path;
@@ -2991,7 +3030,15 @@ fn build_live_forward_request(
         flow,
         fabric_ingress_zone,
         apply_nat_on_fabric,
+        None,
+        None,
     )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PendingForwardHints {
+    expected_ports: Option<(u16, u16)>,
+    target_binding_index: Option<usize>,
 }
 
 fn build_live_forward_request_from_frame(
@@ -3006,7 +3053,10 @@ fn build_live_forward_request_from_frame(
     flow: Option<&SessionFlow>,
     fabric_ingress_zone: Option<&Arc<str>>,
     apply_nat_on_fabric: bool,
+    hints: Option<PendingForwardHints>,
+    precomputed_tx_selection: Option<&CachedTxSelectionDescriptor>,
 ) -> Option<PendingForwardRequest> {
+    let hints = hints.unwrap_or_default();
     let target_ifindex = if decision.resolution.tx_ifindex > 0 {
         decision.resolution.tx_ifindex
     } else {
@@ -3015,8 +3065,10 @@ fn build_live_forward_request_from_frame(
     // Prefer session flow ports (set by conntrack, immune to DMA races),
     // then live frame ports (lazy — only parsed if session ports unavailable),
     // then metadata as last resort.
-    let expected_ports = authoritative_forward_ports(frame, meta, flow);
-    let target_binding_index =
+    let expected_ports = hints
+        .expected_ports
+        .or_else(|| authoritative_forward_ports(frame, meta, flow));
+    let target_binding_index = hints.target_binding_index.or_else(|| {
         if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
             binding_lookup.fabric_target_index(
                 target_ifindex,
@@ -3029,7 +3081,8 @@ fn build_live_forward_request_from_frame(
                 ingress_ident.queue_id,
                 target_ifindex,
             )
-        };
+        }
+    });
     let mut decision = *decision;
     if decision.resolution.disposition == ForwardingDisposition::FabricRedirect
         && let Some(ingress_zone) = fabric_ingress_zone
@@ -3038,26 +3091,31 @@ fn build_live_forward_request_from_frame(
     {
         decision.resolution.src_mac = zone_redirect.src_mac;
     }
-    let cos = resolve_cos_tx_selection(
-        forwarding,
-        decision.resolution.egress_ifindex,
-        meta,
-        flow.map(|flow| &flow.forward_key),
-    );
+    let cos = precomputed_tx_selection
+        .map(|selection| CoSTxSelection {
+            queue_id: selection.queue_id,
+            dscp_rewrite: selection.dscp_rewrite,
+        })
+        .unwrap_or_else(|| {
+            resolve_cos_tx_selection(
+                forwarding,
+                decision.resolution.egress_ifindex,
+                meta,
+                flow.map(|flow| &flow.forward_key),
+            )
+        });
     Some(PendingForwardRequest {
         target_ifindex,
         target_binding_index,
         ingress_queue_id: ingress_ident.queue_id,
-        source_offset: desc.addr,
         desc,
-        source_frame: None,
-        meta,
+        frame: PendingForwardFrame::Live,
+        meta: meta.into(),
         decision,
         apply_nat_on_fabric,
         expected_ports,
         flow_key: flow.map(|flow| flow.forward_key.clone()),
         nat64_reverse: None,
-        prebuilt_frame: None,
         cos_queue_id: cos.queue_id,
         dscp_rewrite: cos.dscp_rewrite,
     })

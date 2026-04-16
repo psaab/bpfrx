@@ -19,6 +19,7 @@ pub(crate) struct BindingWorker {
     pub(crate) max_pending_tx: usize,
     pub(crate) cos_owner_live_by_tx_ifindex: BTreeMap<i32, Arc<BindingLiveState>>,
     pub(crate) cos_shared_root_leases: BTreeMap<i32, Arc<SharedCoSRootLease>>,
+    pub(crate) cos_shared_queue_leases: BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>,
     pub(crate) cos_interfaces: FastMap<i32, CoSInterfaceRuntime>,
     pub(crate) cos_interface_order: Vec<i32>,
     pub(crate) cos_interface_rr: usize,
@@ -295,6 +296,7 @@ impl BindingWorker {
             max_pending_tx,
             cos_owner_live_by_tx_ifindex: BTreeMap::new(),
             cos_shared_root_leases: BTreeMap::new(),
+            cos_shared_queue_leases: BTreeMap::new(),
             cos_interfaces: FastMap::default(),
             cos_interface_order: Vec::new(),
             cos_interface_rr: 0,
@@ -405,7 +407,9 @@ pub(crate) fn worker_loop(
     event_stream: Option<crate::event_stream::EventStreamWorkerHandle>,
     rg_epochs: Arc<[AtomicU32; MAX_RG_EPOCHS]>,
     shared_cos_owner_worker_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), u32>>>,
+    shared_cos_owner_live_by_queue: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<BindingLiveState>>>>,
     shared_cos_root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
+    shared_cos_queue_leases: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>>>,
     cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
 ) {
     pin_current_thread(worker_id);
@@ -415,7 +419,9 @@ pub(crate) fn worker_loop(
     let mut validation = **shared_validation.load();
     let mut forwarding = shared_forwarding.load_full();
     let mut cos_owner_worker_by_queue = shared_cos_owner_worker_by_queue.load_full();
+    let mut cos_owner_live_by_queue = shared_cos_owner_live_by_queue.load_full();
     let mut cos_shared_root_leases = shared_cos_root_leases.load_full();
+    let mut cos_shared_queue_leases = shared_cos_queue_leases.load_full();
     let mut sessions = SessionTable::new();
     let mut screen_state = ScreenState::new();
     screen_state.update_profiles(forwarding.screen_profiles.clone());
@@ -462,6 +468,7 @@ pub(crate) fn worker_loop(
     for binding in bindings.iter_mut() {
         binding.cos_owner_live_by_tx_ifindex = cos_owner_live_by_tx_ifindex.clone();
         binding.cos_shared_root_leases = cos_shared_root_leases.as_ref().clone();
+        binding.cos_shared_queue_leases = cos_shared_queue_leases.as_ref().clone();
     }
     let mut interrupt_poll_fds = if poll_mode == crate::PollMode::Interrupt {
         bindings
@@ -599,22 +606,42 @@ pub(crate) fn worker_loop(
         }
         let live_forwarding = shared_forwarding.load_full();
         if !Arc::ptr_eq(&forwarding, &live_forwarding) {
+            let cos_changed =
+                cos_runtime_config_changed(forwarding.as_ref(), live_forwarding.as_ref());
             forwarding = live_forwarding;
             screen_state.update_profiles(forwarding.screen_profiles.clone());
             sessions.set_timeouts(forwarding.session_timeouts);
+            if cos_changed {
+                reset_worker_cos_runtimes(&mut bindings);
+            }
         }
         let live_cos_owner_worker_by_queue = shared_cos_owner_worker_by_queue.load_full();
         if !Arc::ptr_eq(&cos_owner_worker_by_queue, &live_cos_owner_worker_by_queue) {
             cos_owner_worker_by_queue = live_cos_owner_worker_by_queue;
         }
+        let live_cos_owner_live_by_queue = shared_cos_owner_live_by_queue.load_full();
+        if !Arc::ptr_eq(&cos_owner_live_by_queue, &live_cos_owner_live_by_queue) {
+            cos_owner_live_by_queue = live_cos_owner_live_by_queue;
+        }
         let live_cos_shared_root_leases = shared_cos_root_leases.load_full();
         if !Arc::ptr_eq(&cos_shared_root_leases, &live_cos_shared_root_leases) {
             for binding in bindings.iter_mut() {
                 release_all_cos_root_leases(binding);
+                release_all_cos_queue_leases(binding);
             }
             cos_shared_root_leases = live_cos_shared_root_leases;
             for binding in bindings.iter_mut() {
                 binding.cos_shared_root_leases = cos_shared_root_leases.as_ref().clone();
+            }
+        }
+        let live_cos_shared_queue_leases = shared_cos_queue_leases.load_full();
+        if !Arc::ptr_eq(&cos_shared_queue_leases, &live_cos_shared_queue_leases) {
+            for binding in bindings.iter_mut() {
+                release_all_cos_queue_leases(binding);
+            }
+            cos_shared_queue_leases = live_cos_shared_queue_leases;
+            for binding in bindings.iter_mut() {
+                binding.cos_shared_queue_leases = cos_shared_queue_leases.as_ref().clone();
             }
         }
         let ha_runtime = ha_state.load();
@@ -649,6 +676,7 @@ pub(crate) fn worker_loop(
                 &mut bindings,
                 forwarding.as_ref(),
                 loop_now_ns,
+                cos_owner_live_by_queue.as_ref(),
                 shaped_tx_requests,
             );
         }
@@ -757,10 +785,12 @@ pub(crate) fn worker_loop(
                 &mut dbg_poll,
                 &rg_epochs,
                 cos_owner_worker_by_queue.as_ref(),
+                cos_owner_live_by_queue.as_ref(),
             ) {
                 did_work = true;
             }
         }
+        crate::filter::flush_recorded_filter_counters();
         dbg_rx_total += dbg_poll.rx;
         #[cfg(feature = "debug-log")]
         {
@@ -1333,8 +1363,10 @@ pub(crate) fn worker_loop(
             }
         }
     }
+    crate::filter::flush_recorded_filter_counters();
     for binding in bindings.iter_mut() {
         release_all_cos_root_leases(binding);
+        release_all_cos_queue_leases(binding);
     }
     cos_status.store(Arc::new(build_worker_cos_statuses(
         &bindings,
@@ -1347,6 +1379,7 @@ fn apply_worker_shaped_tx_requests(
     bindings: &mut [BindingWorker],
     forwarding: &ForwardingState,
     now_ns: u64,
+    _cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
     requests: Vec<TxRequest>,
 ) {
     for req in requests {
@@ -1396,6 +1429,56 @@ fn build_worker_cos_statuses(
         bindings.iter().map(|binding| &binding.cos_interfaces),
         forwarding,
     )
+}
+
+fn cos_runtime_config_changed(current: &ForwardingState, next: &ForwardingState) -> bool {
+    current.cos != next.cos
+}
+
+fn reset_binding_cos_runtime(binding: &mut BindingWorker) {
+    release_all_cos_root_leases(binding);
+    release_all_cos_queue_leases(binding);
+    let mut dropped_local = 0u64;
+    let mut dropped_prepared = Vec::new();
+    for root in binding.cos_interfaces.values_mut() {
+        for queue in &mut root.queues {
+            while let Some(item) = queue.items.pop_front() {
+                match item {
+                    CoSPendingTxItem::Local(_) => {
+                        dropped_local = dropped_local.saturating_add(1);
+                    }
+                    CoSPendingTxItem::Prepared(req) => dropped_prepared.push(req),
+                }
+            }
+            queue.queued_bytes = 0;
+            queue.runnable = false;
+            queue.parked = false;
+            queue.next_wakeup_tick = 0;
+        }
+        root.nonempty_queues = 0;
+        root.runnable_queues = 0;
+    }
+    binding.cos_interfaces.clear();
+    binding.cos_interface_order.clear();
+    binding.cos_interface_rr = 0;
+    binding.cos_nonempty_interfaces = 0;
+
+    let dropped_total = dropped_local.saturating_add(dropped_prepared.len() as u64);
+    if dropped_total > 0 {
+        binding
+            .live
+            .tx_errors
+            .fetch_add(dropped_total, Ordering::Relaxed);
+    }
+    for req in dropped_prepared {
+        recycle_prepared_immediately(binding, &req);
+    }
+}
+
+fn reset_worker_cos_runtimes(bindings: &mut [BindingWorker]) {
+    for binding in bindings {
+        reset_binding_cos_runtime(binding);
+    }
 }
 
 fn build_worker_cos_statuses_from_maps<'a, I>(
@@ -1536,6 +1619,8 @@ mod tests {
                 default_queue: 0,
                 dscp_classifier: String::new(),
                 ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
                 queue_by_forwarding_class: FastMap::default(),
                 queues: vec![CoSQueueConfig {
                     queue_id: 4,
@@ -1625,6 +1710,43 @@ mod tests {
 
         assert!(Arc::ptr_eq(owners.get(&12).unwrap(), &live_a));
         assert!(Arc::ptr_eq(owners.get(&13).unwrap(), &live_c));
+    }
+
+    #[test]
+    fn cos_runtime_config_changed_detects_queue_rate_change() {
+        let iface = CoSInterfaceConfig {
+            shaping_rate_bytes: 1_250_000_000,
+            burst_bytes: 1_000_000,
+            default_queue: 0,
+            dscp_classifier: String::new(),
+            ieee8021_classifier: String::new(),
+            dscp_queue_by_dscp: [u8::MAX; 64],
+            ieee8021_queue_by_pcp: [u8::MAX; 8],
+            queue_by_forwarding_class: [("iperf-b".to_string(), 5)].into_iter().collect(),
+            queues: vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-b".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_250_000_000,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 1_000_000,
+                dscp_rewrite: None,
+            }],
+        };
+        let mut current = ForwardingState::default();
+        current.cos.interfaces.insert(12, iface.clone());
+
+        let mut next = current.clone();
+        next.cos
+            .interfaces
+            .get_mut(&12)
+            .expect("cos interface")
+            .queues[0]
+            .transmit_rate_bytes = 1_875_000_000;
+
+        assert!(cos_runtime_config_changed(&current, &next));
+        assert!(!cos_runtime_config_changed(&current, &current));
     }
 }
 
