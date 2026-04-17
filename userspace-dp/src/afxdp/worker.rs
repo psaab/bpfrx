@@ -1583,8 +1583,13 @@ fn build_worker_cos_statuses(
     bindings: &[BindingWorker],
     forwarding: &ForwardingState,
 ) -> Vec<crate::protocol::CoSInterfaceStatus> {
+    // #709: pair each cos_map with its owner-binding's live state so the
+    // per-queue telemetry fields (drain_latency_hist, owner_pps, ...)
+    // can be populated from the binding that actually did the work.
     build_worker_cos_statuses_from_maps(
-        bindings.iter().map(|binding| &binding.cos_interfaces),
+        bindings
+            .iter()
+            .map(|binding| (&binding.cos_interfaces, Some(binding.live.as_ref()))),
         forwarding,
     )
 }
@@ -1639,16 +1644,124 @@ fn reset_worker_cos_runtimes(bindings: &mut [BindingWorker]) {
     }
 }
 
+/// #709: snapshot the owner-profile counter set from a `BindingLiveState`
+/// into a struct-local copy. Histograms are fixed-cap arrays on both
+/// sides; copying into an owned value lets the caller attribute the
+/// same snapshot to multiple queues without re-reading the atomics
+/// (which would tear across queues in the same scrape).
+pub(super) struct OwnerProfileSnapshot {
+    pub(super) drain_latency_hist: [u64; DRAIN_HIST_BUCKETS],
+    pub(super) drain_invocations: u64,
+    pub(super) drain_noop_invocations: u64,
+    pub(super) redirect_acquire_hist: [u64; DRAIN_HIST_BUCKETS],
+    pub(super) owner_pps: u64,
+    pub(super) peer_pps: u64,
+}
+
+#[inline]
+pub(super) fn owner_profile_snapshot(live: &BindingLiveState) -> OwnerProfileSnapshot {
+    OwnerProfileSnapshot {
+        drain_latency_hist: std::array::from_fn(|i| {
+            live.drain_latency_hist[i].load(Ordering::Relaxed)
+        }),
+        drain_invocations: live.drain_invocations.load(Ordering::Relaxed),
+        drain_noop_invocations: live.drain_noop_invocations.load(Ordering::Relaxed),
+        redirect_acquire_hist: std::array::from_fn(|i| {
+            live.redirect_acquire_hist[i].load(Ordering::Relaxed)
+        }),
+        owner_pps: live.pps_owner_vs_peer[0].load(Ordering::Relaxed),
+        peer_pps: live.pps_owner_vs_peer[1].load(Ordering::Relaxed),
+    }
+}
+
+/// #709: max-merge the owner-profile fields of one `CoSQueueStatus`
+/// into another. Used by `coordinator::aggregate_cos_statuses_across_workers`
+/// to fold per-worker snapshots into the operator-facing view without
+/// double-counting the owner-only histogram. Signature mirrors
+/// `merge_owner_profile_max` so both layers share the same contract.
+pub(crate) fn merge_cos_queue_owner_profile_max(
+    dst: &mut crate::protocol::CoSQueueStatus,
+    src: &crate::protocol::CoSQueueStatus,
+) {
+    if dst.drain_latency_hist.len() < DRAIN_HIST_BUCKETS {
+        dst.drain_latency_hist.resize(DRAIN_HIST_BUCKETS, 0);
+    }
+    if dst.redirect_acquire_hist.len() < DRAIN_HIST_BUCKETS {
+        dst.redirect_acquire_hist.resize(DRAIN_HIST_BUCKETS, 0);
+    }
+    for i in 0..DRAIN_HIST_BUCKETS {
+        let src_drain = src.drain_latency_hist.get(i).copied().unwrap_or(0);
+        dst.drain_latency_hist[i] = dst.drain_latency_hist[i].max(src_drain);
+        let src_redirect = src.redirect_acquire_hist.get(i).copied().unwrap_or(0);
+        dst.redirect_acquire_hist[i] = dst.redirect_acquire_hist[i].max(src_redirect);
+    }
+    dst.drain_invocations = dst.drain_invocations.max(src.drain_invocations);
+    dst.drain_noop_invocations = dst.drain_noop_invocations.max(src.drain_noop_invocations);
+    dst.owner_pps = dst.owner_pps.max(src.owner_pps);
+    dst.peer_pps = dst.peer_pps.max(src.peer_pps);
+}
+
+/// #709: max-merge a binding's owner-profile snapshot into a per-queue
+/// `CoSQueueStatus`. Max is the right aggregation: only one worker per
+/// exact queue is the owner, and only that worker's snapshot has
+/// non-zero values. For shared_exact queues every worker drains, and
+/// taking max surfaces the busiest worker's profile — not perfect, but
+/// better than sum (which would inflate the histogram) or overwrite
+/// (which would be order-dependent). For non-exact queues the fields
+/// stay zero because those queues don't have a single owner binding.
+pub(super) fn merge_owner_profile_max(
+    status: &mut crate::protocol::CoSQueueStatus,
+    profile: &OwnerProfileSnapshot,
+) {
+    // Lazily size the histogram vectors on first touch; every queue
+    // serialised with #709 fields populated has exactly
+    // DRAIN_HIST_BUCKETS entries. A queue that was never merged stays
+    // `Vec::new()` and serialises as an empty array — readers gate
+    // on `owner_pps || drain_invocations` being > 0 before
+    // interpreting the histogram.
+    if status.drain_latency_hist.len() < DRAIN_HIST_BUCKETS {
+        status.drain_latency_hist.resize(DRAIN_HIST_BUCKETS, 0);
+    }
+    if status.redirect_acquire_hist.len() < DRAIN_HIST_BUCKETS {
+        status.redirect_acquire_hist.resize(DRAIN_HIST_BUCKETS, 0);
+    }
+    for i in 0..DRAIN_HIST_BUCKETS {
+        status.drain_latency_hist[i] =
+            status.drain_latency_hist[i].max(profile.drain_latency_hist[i]);
+        status.redirect_acquire_hist[i] =
+            status.redirect_acquire_hist[i].max(profile.redirect_acquire_hist[i]);
+    }
+    status.drain_invocations = status.drain_invocations.max(profile.drain_invocations);
+    status.drain_noop_invocations = status
+        .drain_noop_invocations
+        .max(profile.drain_noop_invocations);
+    status.owner_pps = status.owner_pps.max(profile.owner_pps);
+    status.peer_pps = status.peer_pps.max(profile.peer_pps);
+}
+
 fn build_worker_cos_statuses_from_maps<'a, I>(
     cos_maps: I,
     forwarding: &ForwardingState,
 ) -> Vec<crate::protocol::CoSInterfaceStatus>
 where
-    I: IntoIterator<Item = &'a FastMap<i32, CoSInterfaceRuntime>>,
+    I: IntoIterator<
+        Item = (
+            &'a FastMap<i32, CoSInterfaceRuntime>,
+            Option<&'a BindingLiveState>,
+        ),
+    >,
 {
     let mut interfaces = BTreeMap::<i32, crate::protocol::CoSInterfaceStatus>::new();
     let mut queue_maps = BTreeMap::<i32, BTreeMap<u8, crate::protocol::CoSQueueStatus>>::new();
-    for cos_map in cos_maps {
+    for (cos_map, binding_live) in cos_maps {
+        // #709: snapshot the binding's owner-profile counters ONCE per
+        // binding per scrape. Every queue this binding owns gets the
+        // same snapshot attributed to it — the counters are per-binding
+        // (not per-queue) because drain_shaped_tx operates across all
+        // queues on the binding's interface in one invocation. Readers
+        // interpret identical values across queues on the same
+        // interface as exactly this shape.
+        let binding_profile = binding_live.map(owner_profile_snapshot);
         for (&ifindex, root) in cos_map {
             let entry = interfaces.entry(ifindex).or_default();
             entry.ifindex = ifindex;
@@ -1744,6 +1857,19 @@ where
                 status.tx_ring_full_submit_stalls = status
                     .tx_ring_full_submit_stalls
                     .saturating_add(queue.drop_counters.tx_ring_full_submit_stalls);
+                // #709: attribute this binding's owner-profile snapshot
+                // to every queue served by this binding. When the
+                // coordinator aggregates across workers, each queue row
+                // will see the owner worker's values on its snapshot
+                // and zeros (or near-zero) from peer workers that
+                // happen to surface a runtime entry. `max` aggregation
+                // preserves the owner's data and ignores the peer's
+                // zeros; sum would double-count if any peer worker
+                // also populated (it should not in practice, but max
+                // is the safer contract to document).
+                if let Some(profile) = binding_profile.as_ref() {
+                    merge_owner_profile_max(status, profile);
+                }
             }
         }
     }
@@ -1892,7 +2018,8 @@ mod tests {
         let mut second = FastMap::default();
         second.insert(80, make_root(2048, false, true, 77, counters_b));
 
-        let statuses = build_worker_cos_statuses_from_maps([&first, &second], &forwarding);
+        let statuses =
+            build_worker_cos_statuses_from_maps([(&first, None), (&second, None)], &forwarding);
         assert_eq!(statuses.len(), 1);
         let iface = &statuses[0];
         assert_eq!(iface.interface_name, "reth0.80");
@@ -2757,4 +2884,13 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) debug_in_flight_recycles: u32,
     pub(crate) last_heartbeat: Option<chrono::DateTime<Utc>>,
     pub(crate) last_error: String,
+    // #709: owner-profile telemetry snapshot. Fixed-size arrays (no
+    // `Vec`) to keep the snapshot allocation-free on the hot path;
+    // readers that want a `Vec` for JSON can copy on demand.
+    pub(crate) drain_latency_hist: [u64; DRAIN_HIST_BUCKETS],
+    pub(crate) drain_invocations: u64,
+    pub(crate) drain_noop_invocations: u64,
+    pub(crate) redirect_acquire_hist: [u64; DRAIN_HIST_BUCKETS],
+    pub(crate) owner_pps: u64,
+    pub(crate) peer_pps: u64,
 }

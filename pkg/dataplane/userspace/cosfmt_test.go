@@ -268,6 +268,161 @@ func TestFormatCoSInterfaceSummaryInterleavesPerQueueDropsInOrder(t *testing.T) 
 	}
 }
 
+// #709: The OwnerProfile line renders below the Drops line for exact
+// queues with a single named owner worker. Fields: drain_p50 µs,
+// drain_p99 µs, redirect_p99 µs, owner_pps, peer_pps. Anchor on
+// non-zero values so a regression that swaps the ordering of the
+// percentile calls fails loudly.
+func TestFormatCoSInterfaceSummaryRendersOwnerProfileLineForExactQueues(t *testing.T) {
+	owner := uint32(1)
+	// Histogram layout (see umem.rs DRAIN_HIST_BUCKETS): bucket 0
+	// = [0, 1024) ns ("0us"), bucket 1 = [1024, 2048) ns ("1us"),
+	// ... bucket 5 = [2^14, 2^15) ns → lower bound 16384 ns = 16us.
+	// We want p50 in bucket 1 and p99 in bucket 5:
+	//   target50 = ceil(100 * 50 / 100) = 50; cumulative reaches 50 at
+	//     bucket 1 (50 samples there).
+	//   target99 = ceil(100 * 99 / 100) = 99; cumulative reaches 99 at
+	//     bucket 5 (50 + 48 + 0 + 0 + 0 + 2 = 100 >= 99, and 98 < 99
+	//     at bucket 4).
+	hist := make([]uint64, 16)
+	hist[1] = 50
+	hist[2] = 48
+	hist[5] = 2
+	redirectHist := make([]uint64, 16)
+	redirectHist[2] = 10 // p99 of redirect-acquire → bucket 2 = ~2us
+
+	status := &ProcessStatus{
+		CoSInterfaces: []CoSInterfaceStatus{
+			{
+				InterfaceName:   "reth0.80",
+				OwnerWorkerID:   &owner,
+				WorkerInstances: 1,
+				Queues: []CoSQueueStatus{
+					{
+						QueueID:              4,
+						OwnerWorkerID:        &owner,
+						ForwardingClass:      "bandwidth-10mb",
+						Priority:             1,
+						Exact:                true,
+						TransmitRateBytes:    1_250_000,
+						BufferBytes:          32 * 1024,
+						DrainLatencyHist:     hist,
+						DrainInvocations:     100,
+						DrainNoopInvocations: 30,
+						RedirectAcquireHist:  redirectHist,
+						OwnerPPS:             12345,
+						PeerPPS:              6789,
+					},
+				},
+			},
+		},
+	}
+	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	// Exact substring match on the line format: leading whitespace
+	// aligns with `Drops:` above it (11 spaces). p50 is "1us" (bucket
+	// 1 lower bound), p99 is "16us" (bucket 5 = 2^14 ns = 16384 ns
+	// → 16 µs). Redirect p99 is "2us" (bucket 2 = 2^11 ns = 2048 ns
+	// → 2 µs).
+	want := "OwnerProfile: drain_p50=1us  drain_p99=16us  redirect_p99=2us  owner_pps=12345  peer_pps=6789"
+	if !strings.Contains(out, want) {
+		t.Fatalf("missing %q in output:\n%s", want, out)
+	}
+	// Positional invariant: OwnerProfile must follow Drops. A
+	// regression that emits OwnerProfile above the Drops line would
+	// still include both strings but in the wrong order.
+	dropsIdx := strings.Index(out, "Drops: flow_share=")
+	ownerIdx := strings.Index(out, "OwnerProfile:")
+	if dropsIdx < 0 || ownerIdx < 0 || ownerIdx <= dropsIdx {
+		t.Fatalf("OwnerProfile line must render AFTER Drops line: drops=%d owner=%d\n%s",
+			dropsIdx, ownerIdx, out)
+	}
+}
+
+// #709: Non-exact / no-owner queues do not get an OwnerProfile line.
+// The plan's telemetry is only meaningful on single-owner exact queues
+// (see docs/709-owner-hotspot-plan.md §4). Counter-factual: render a
+// queue without OwnerWorkerID set and assert the line is absent while
+// the Drops line still renders.
+func TestFormatCoSInterfaceSummaryOmitsOwnerProfileForQueuesWithoutOwner(t *testing.T) {
+	owner := uint32(2)
+	status := &ProcessStatus{
+		CoSInterfaces: []CoSInterfaceStatus{
+			{
+				InterfaceName:   "reth0.80",
+				OwnerWorkerID:   &owner,
+				WorkerInstances: 1,
+				Queues: []CoSQueueStatus{
+					{
+						QueueID: 4,
+						// OwnerWorkerID intentionally nil: shared_exact
+						// or non-exact queue has no single owner binding.
+						ForwardingClass:      "bandwidth-10mb",
+						Priority:             1,
+						Exact:                true,
+						TransmitRateBytes:    1_250_000,
+						BufferBytes:          32 * 1024,
+						DrainLatencyHist:     []uint64{0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+						DrainInvocations:     5,
+						DrainNoopInvocations: 0,
+						OwnerPPS:             999,
+						PeerPPS:              0,
+					},
+				},
+			},
+		},
+	}
+	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	if !strings.Contains(out, "Drops: flow_share=0") {
+		t.Fatalf("expected Drops line to still render for no-owner queue:\n%s", out)
+	}
+	if strings.Contains(out, "OwnerProfile:") {
+		t.Fatalf("OwnerProfile line should NOT render for queue without owner_worker_id:\n%s", out)
+	}
+}
+
+// #709: Zeroed owner-profile telemetry must render "0us" not "nan" /
+// "-". An operator staring at a freshly-deployed firewall with no
+// traffic still needs to see the field alignment. The test pins the
+// exact rendering so a future change to the default-string helper
+// doesn't accidentally emit "nan" (which breaks grep/awk pipelines).
+func TestFormatCoSInterfaceSummaryRendersZeroedOwnerProfile(t *testing.T) {
+	owner := uint32(1)
+	status := &ProcessStatus{
+		CoSInterfaces: []CoSInterfaceStatus{
+			{
+				InterfaceName:   "reth0.80",
+				OwnerWorkerID:   &owner,
+				WorkerInstances: 1,
+				Queues: []CoSQueueStatus{
+					{
+						QueueID:           4,
+						OwnerWorkerID:     &owner,
+						ForwardingClass:   "bandwidth-10mb",
+						Priority:          1,
+						Exact:             true,
+						TransmitRateBytes: 1_250_000,
+						BufferBytes:       32 * 1024,
+						// All telemetry fields zero / empty.
+					},
+				},
+			},
+		},
+	}
+	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	want := "OwnerProfile: drain_p50=0us  drain_p99=0us  redirect_p99=0us  owner_pps=0  peer_pps=0"
+	if !strings.Contains(out, want) {
+		t.Fatalf("missing %q in output:\n%s", want, out)
+	}
+	// Counter-factual: ensure "nan" and "-" don't creep in via the
+	// percentile helper on the empty-histogram path.
+	if strings.Contains(out, "nan") {
+		t.Fatalf("zeroed OwnerProfile must not emit 'nan':\n%s", out)
+	}
+	if strings.Contains(out, "drain_p50=-") || strings.Contains(out, "drain_p99=-") {
+		t.Fatalf("zeroed OwnerProfile must not emit placeholder '-':\n%s", out)
+	}
+}
+
 // Zero-valued counters MUST still render — operators need to see the
 // counter is wired, otherwise "no output" is indistinguishable from
 // "counter missing from the pipeline" when chasing #718 / #722.

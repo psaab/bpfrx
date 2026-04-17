@@ -224,7 +224,32 @@ pub(super) fn drain_pending_tx(
     // progress. A retrying CoS batch (for example, no free TX frame on the
     // owner binding) must yield back to the worker loop so other bindings can
     // run and completions/recycles can free resources.
-    while drain_shaped_tx(binding, now_ns, shared_recycles) {
+    //
+    // #709: time every `drain_shaped_tx` invocation (not per queue, not per
+    // batch) with one pair of `monotonic_nanos()` calls. `monotonic_nanos`
+    // is `clock_gettime(CLOCK_MONOTONIC)` via VDSO — no syscall, ~15 ns
+    // each. The owner-drain latency histogram is the primary signal for
+    // deciding whether Option B / C / D in #709 is justified. Noop
+    // invocations (drain returned `false`) are bucketed too so the
+    // operator can distinguish "owner busy but fast" from "owner
+    // spinning on empty".
+    loop {
+        let start_ns = monotonic_nanos();
+        let progressed = drain_shaped_tx(binding, now_ns, shared_recycles);
+        let delta = monotonic_nanos().saturating_sub(start_ns);
+        let bucket = bucket_index_for_ns(delta);
+        binding.live.drain_latency_hist[bucket].fetch_add(1, Ordering::Relaxed);
+        binding
+            .live
+            .drain_invocations
+            .fetch_add(1, Ordering::Relaxed);
+        if !progressed {
+            binding
+                .live
+                .drain_noop_invocations
+                .fetch_add(1, Ordering::Relaxed);
+            break;
+        }
         did_work = true;
     }
     while !binding.pending_tx_prepared.is_empty() {
@@ -539,7 +564,26 @@ fn ingest_cos_pending_tx(
     }
 
     let mut pending = core::mem::take(&mut binding.pending_tx_local);
+    // #709: the split between owner-local and peer-redirected packets.
+    // `pending` starts with this worker's own locally-produced requests
+    // (this worker drove RX on this binding). `take_pending_tx_into`
+    // then APPENDS the MPSC inbox — every item appended was pushed by
+    // a peer worker that redirected a TxRequest at this binding as
+    // owner. Count the split here, before
+    // `process_pending_queue_in_place` mixes them with outbound
+    // re-redirects.
+    //
+    // For non-owner bindings the MPSC inbox is empty (peers never push
+    // to a binding they do not own), so `peer` naturally stays at 0.
+    let owner_local_count = pending.len() as u64;
     binding.live.take_pending_tx_into(&mut pending);
+    let peer_count = (pending.len() as u64).saturating_sub(owner_local_count);
+    if owner_local_count > 0 {
+        binding.live.pps_owner_vs_peer[0].fetch_add(owner_local_count, Ordering::Relaxed);
+    }
+    if peer_count > 0 {
+        binding.live.pps_owner_vs_peer[1].fetch_add(peer_count, Ordering::Relaxed);
+    }
     process_pending_queue_in_place(&mut pending, |req| {
         let req = match redirect_local_cos_request_to_owner(
             &binding.cos_fast_interfaces,

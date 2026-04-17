@@ -1579,6 +1579,15 @@ pub(super) fn aggregate_cos_statuses_across_workers(
                 q.tx_ring_full_submit_stalls = q
                     .tx_ring_full_submit_stalls
                     .saturating_add(queue.tx_ring_full_submit_stalls);
+                // #709: cross-worker aggregation for owner-profile
+                // counters uses `max` (not `saturating_add`) because
+                // only the owner worker's snapshot has non-zero
+                // values for a given exact queue — summing would
+                // double-count if any peer worker surfaced the queue
+                // with zeros (same bucket contents). See
+                // `merge_owner_profile_max` for the same-shape
+                // intra-worker merge.
+                super::worker::merge_cos_queue_owner_profile_max(q, queue);
             }
         }
     }
