@@ -2517,44 +2517,70 @@ const ECN_CE: u8 = 0b0000_0011;
 
 /// Size of a bare Ethernet header (6 dst MAC + 6 src MAC + 2 ethertype).
 const ETH_HDR_LEN: usize = 14;
-/// Size of a single 802.1Q VLAN tag (TPID + TCI).
+/// Size of a single 802.1Q / 802.1ad VLAN tag (TPID + TCI).
 const VLAN_TAG_LEN: usize = 4;
 
-/// Derive the L3 header offset from an Ethernet-framed buffer, taking
-/// a single 802.1Q / 802.1ad VLAN tag into account. Returns `None` for
-/// buffers too short to decode or ethertypes that aren't recognised.
-///
-/// The CoS admission path sees frames post-forward-build, so VLAN tags
+/// Parsed L3 discriminator + offset from a forwarded Ethernet frame.
+/// Carries both pieces together so the ECN mark path dispatches off the
+/// bytes it actually parsed, not the `expected_addr_family` sideband —
+/// a malformed frame whose sideband says AF_INET but whose ethertype
+/// says something else must not get its "TOS byte" stamped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EthernetL3 {
+    Ipv4(usize),
+    Ipv6(usize),
+}
+
+/// Parse the outer Ethernet header, transparently walk a single 802.1Q
+/// / 802.1ad VLAN tag, and report the L3 family + header offset. The
+/// CoS admission path sees frames post-forward-build, so VLAN tags
 /// from tagged subinterfaces (e.g. `reth0 unit 80`) are already
-/// present. Hard-coding offset=14 misses that — on a VLAN-tagged
-/// interface it would point into the TCI byte instead of the IPv4 TOS
-/// or IPv6 traffic-class byte, and ECN marking would silently no-op
-/// because the extracted "ECN bits" actually live inside the VLAN
-/// priority / CFI field and rarely match ECT(0)/ECT(1). This helper
-/// fixes that regression (surfaced live on the #727 validation run:
-/// packets were ECT(0) end-to-end per gRPC capture, but
-/// `admission_ecn_marked` stayed at zero because the TOS byte we were
-/// reading wasn't the TOS byte).
+/// present. Callers use the returned family to dispatch to the
+/// matching ECN marker and the offset to locate the TOS / tclass byte.
 ///
-/// Double-VLAN (QinQ) is not covered yet — the inner tag would need
-/// a second 4-byte hop — but the lab fixture uses single-VLAN unit-80
-/// subinterfaces, so this covers the exercised path. QinQ can be added
-/// without touching the markers themselves.
+/// Returns `None` for:
+/// - buffers shorter than the parse requires (no slice-out-of-bounds
+///   panic on the hot path),
+/// - non-IP ethertypes (including ARP, MPLS, and the tail of a QinQ
+///   stack) — we refuse to guess rather than stamp a byte that is not
+///   a TOS / tclass byte,
+/// - nested VLAN tags (QinQ / 802.1ad-over-Q) — not implemented yet;
+///   adding support means one more 4-byte hop plus recursive inner-
+///   ethertype inspection. The single-tag path covers the only lab
+///   fixture we currently exercise.
+///
+/// Historically this helper just returned an offset, and dispatch was
+/// based on `expected_addr_family`. The gap that exposed was: if the
+/// sideband said AF_INET but the frame was ARP-inside-VLAN, we would
+/// still compute offset = 18 and stamp byte 19 inside the ARP body.
+/// Returning the parsed family here closes that drift permanently —
+/// the marker cannot disagree with the wire bytes it is mutating.
 #[inline]
-fn ethernet_l3_offset(bytes: &[u8]) -> Option<usize> {
+fn ethernet_l3(bytes: &[u8]) -> Option<EthernetL3> {
     if bytes.len() < ETH_HDR_LEN {
         return None;
     }
-    let ethertype = u16::from_be_bytes([bytes[12], bytes[13]]);
-    match ethertype {
-        // IPv4, IPv6 — no VLAN tag, L3 starts immediately after the eth header.
-        0x0800 | 0x86DD => Some(ETH_HDR_LEN),
-        // 802.1Q / 802.1ad single VLAN tag — L3 starts 4 bytes later.
+    let outer = u16::from_be_bytes([bytes[12], bytes[13]]);
+    match outer {
+        0x0800 => Some(EthernetL3::Ipv4(ETH_HDR_LEN)),
+        0x86DD => Some(EthernetL3::Ipv6(ETH_HDR_LEN)),
+        // 802.1Q / 802.1ad single VLAN tag. The inner ethertype lives
+        // 4 bytes after the outer one; if that inner ethertype is
+        // *itself* a VLAN TPID we have a QinQ stack that we do not
+        // support yet — reject it rather than stamping into an inner
+        // tag.
         0x8100 | 0x88A8 => {
-            if bytes.len() < ETH_HDR_LEN + VLAN_TAG_LEN {
+            let inner_off = ETH_HDR_LEN + VLAN_TAG_LEN;
+            if bytes.len() < inner_off + 2 {
                 return None;
             }
-            Some(ETH_HDR_LEN + VLAN_TAG_LEN)
+            let inner = u16::from_be_bytes([bytes[inner_off - 2], bytes[inner_off - 1]]);
+            match inner {
+                0x0800 => Some(EthernetL3::Ipv4(inner_off)),
+                0x86DD => Some(EthernetL3::Ipv6(inner_off)),
+                // QinQ or unknown inner — refuse to guess.
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -2646,13 +2672,16 @@ fn mark_ecn_ce_ipv6(bytes: &mut [u8], l3_offset: usize) -> bool {
 /// the TxRequest. Returns true iff the packet was marked.
 #[inline]
 fn maybe_mark_ecn_ce(req: &mut TxRequest) -> bool {
-    let Some(l3_offset) = ethernet_l3_offset(&req.bytes) else {
-        return false;
-    };
-    match req.expected_addr_family as i32 {
-        libc::AF_INET => mark_ecn_ce_ipv4(&mut req.bytes, l3_offset),
-        libc::AF_INET6 => mark_ecn_ce_ipv6(&mut req.bytes, l3_offset),
-        _ => false,
+    // Dispatch off the parsed Ethernet header, not the sideband
+    // `expected_addr_family`. The sideband is populated at RX time and
+    // can drift for injected or re-queued frames whose wire bytes got
+    // rewritten (e.g. NAT64, tunnel transit). Trusting the parse keeps
+    // the marker from stamping the wrong protocol body on any frame
+    // where the two disagree.
+    match ethernet_l3(&req.bytes) {
+        Some(EthernetL3::Ipv4(l3_offset)) => mark_ecn_ce_ipv4(&mut req.bytes, l3_offset),
+        Some(EthernetL3::Ipv6(l3_offset)) => mark_ecn_ce_ipv6(&mut req.bytes, l3_offset),
+        None => false,
     }
 }
 
@@ -2689,13 +2718,13 @@ fn maybe_mark_ecn_ce_prepared(req: &PreparedTxRequest, umem: &MmapArea) -> bool 
     let Some(bytes) = (unsafe { umem.slice_mut_unchecked(offset, len) }) else {
         return false;
     };
-    let Some(l3_offset) = ethernet_l3_offset(bytes) else {
-        return false;
-    };
-    match req.expected_addr_family as i32 {
-        libc::AF_INET => mark_ecn_ce_ipv4(bytes, l3_offset),
-        libc::AF_INET6 => mark_ecn_ce_ipv6(bytes, l3_offset),
-        _ => false,
+    // Same rationale as `maybe_mark_ecn_ce`: dispatch off the parsed
+    // wire bytes, not `expected_addr_family`. See that helper's
+    // comment for the drift scenarios this protects against.
+    match ethernet_l3(bytes) {
+        Some(EthernetL3::Ipv4(l3_offset)) => mark_ecn_ce_ipv4(bytes, l3_offset),
+        Some(EthernetL3::Ipv6(l3_offset)) => mark_ecn_ce_ipv6(bytes, l3_offset),
+        None => false,
     }
 }
 
@@ -10578,8 +10607,8 @@ mod tests {
         tagged.extend_from_slice(&[0x08, 0x00]); // inner ethertype (IPv4)
         tagged.extend_from_slice(&base[14..]); // IPv4 header + payload
 
-        // Confirm `ethernet_l3_offset` resolves to 18 for this frame.
-        assert_eq!(ethernet_l3_offset(&tagged), Some(18));
+        // Confirm `ethernet_l3` parses IPv4 at offset 18 for this frame.
+        assert_eq!(ethernet_l3(&tagged), Some(EthernetL3::Ipv4(18)));
 
         let mut req = TxRequest {
             bytes: tagged,
@@ -10609,7 +10638,7 @@ mod tests {
     }
 
     /// Counter-factual: ethertype 0 (or anything we don't understand)
-    /// returns None from `ethernet_l3_offset`, so marking is a no-op.
+    /// returns `None` from `ethernet_l3`, so marking is a no-op.
     /// Guards against a regression that defaults to offset 14 on
     /// unknown frames.
     #[test]
@@ -10629,10 +10658,73 @@ mod tests {
             cos_queue_id: Some(0),
             dscp_rewrite: None,
         };
-        assert_eq!(ethernet_l3_offset(&req.bytes), None);
+        assert_eq!(ethernet_l3(&req.bytes), None);
         assert!(!maybe_mark_ecn_ce(&mut req));
         // ECT(0) bits at the would-have-been-wrong-offset untouched.
         assert_eq!(req.bytes[15] & ECN_MASK, ECN_ECT_0);
+    }
+
+    /// QinQ (0x88A8 outer + 0x8100 inner) must be rejected rather than
+    /// guessed at, because L3 actually lives at offset 22 on those
+    /// frames and a default to 18 would stamp into the inner VLAN TCI.
+    /// #728 review pin: once we've paid to parse the outer ethertype,
+    /// the parse must be the source of truth.
+    #[test]
+    fn ethernet_l3_rejects_qinq_until_explicitly_supported() {
+        let base = build_ipv4_test_packet(ECN_ECT_0);
+        let mut qinq = Vec::with_capacity(base.len() + 8);
+        qinq.extend_from_slice(&base[..12]); // MACs
+        // Outer 802.1ad: TPID 0x88A8, TCI with an outer VID 100.
+        qinq.extend_from_slice(&[0x88, 0xA8]);
+        let outer_tci: u16 = 100;
+        qinq.extend_from_slice(&outer_tci.to_be_bytes());
+        // Inner 802.1Q: TPID 0x8100 at the "inner ethertype" position.
+        qinq.extend_from_slice(&[0x81, 0x00]);
+        let inner_tci: u16 = 80;
+        qinq.extend_from_slice(&inner_tci.to_be_bytes());
+        qinq.extend_from_slice(&[0x08, 0x00]); // IPv4 (well beyond where we care)
+        qinq.extend_from_slice(&base[14..]);
+
+        assert_eq!(
+            ethernet_l3(&qinq),
+            None,
+            "QinQ (0x88A8 → 0x8100) must be rejected — inner VLAN tag not yet supported"
+        );
+
+        // And the marker refuses such a frame — no ECN bits are flipped.
+        let mut req = TxRequest {
+            bytes: qinq,
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 1,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        };
+        assert!(!maybe_mark_ecn_ce(&mut req));
+    }
+
+    /// A VLAN-tagged frame whose inner ethertype is ARP / MPLS / etc.
+    /// must be rejected too, matching the `refuse to guess` contract.
+    /// Without this check we'd treat offset 18 as an IPv4 TOS byte and
+    /// stamp the low 2 bits of whatever is there (ARP's hardware type
+    /// in this case), corrupting the frame.
+    #[test]
+    fn ethernet_l3_rejects_vlan_tagged_non_ip_payload() {
+        let base = build_ipv4_test_packet(ECN_ECT_0);
+        let mut tagged = Vec::with_capacity(base.len() + 4);
+        tagged.extend_from_slice(&base[..12]);
+        tagged.extend_from_slice(&[0x81, 0x00]); // outer 802.1Q
+        let tci: u16 = 80;
+        tagged.extend_from_slice(&tci.to_be_bytes());
+        tagged.extend_from_slice(&[0x08, 0x06]); // inner = ARP (0x0806)
+        tagged.extend_from_slice(&base[14..]);
+        assert_eq!(
+            ethernet_l3(&tagged),
+            None,
+            "VLAN-tagged non-IP payload must not dispatch to an IP marker",
+        );
     }
 
     /// Helper: build a `CoSPendingTxItem::Local` with an IPv4 test
@@ -10888,15 +10980,19 @@ mod tests {
             buffer_limit.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
         let flow_ecn_threshold =
             share_cap.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+        // Concrete expected values — at the current NUM/DEN = 1/5,
+        // aggregate = 384_000 / 5 = 76_800 and per-flow = 24_000 / 5
+        // = 4_800. Asserting against the computed expression would be
+        // a tautology (RHS recomputes the LHS). Using concrete numbers
+        // makes a silent retune of NUM/DEN or a formula refactor both
+        // fail here — which is the whole point of a regression pin.
         assert_eq!(
-            aggregate_ecn_threshold,
-            buffer_limit * COS_ECN_MARK_THRESHOLD_NUM / COS_ECN_MARK_THRESHOLD_DEN,
-            "aggregate threshold must track the constants",
+            aggregate_ecn_threshold, 76_800,
+            "aggregate threshold must remain pinned for this fixture",
         );
         assert_eq!(
-            flow_ecn_threshold,
-            share_cap * COS_ECN_MARK_THRESHOLD_NUM / COS_ECN_MARK_THRESHOLD_DEN,
-            "per-flow threshold must track the constants",
+            flow_ecn_threshold, 4_800,
+            "per-flow threshold must remain pinned for this fixture",
         );
 
         // Counter-factual: reconstruct the pre-#722 aggregate-only
@@ -11468,6 +11564,102 @@ mod tests {
             after.admission_ecn_marked,
             before.admission_ecn_marked + 2,
             "single counter must reflect both Local and Prepared marks",
+        );
+    }
+
+    /// Insert a single 802.1Q VLAN tag into an Ethernet-wrapped packet
+    /// between the MAC addresses and the ethertype. Used by the
+    /// VLAN-aware regression tests for both Local and Prepared paths.
+    fn insert_single_vlan_tag(packet: Vec<u8>, vid: u16, priority: u8) -> Vec<u8> {
+        assert!(packet.len() >= ETH_HDR_LEN, "packet must be eth-framed");
+        let mut tagged = Vec::with_capacity(packet.len() + VLAN_TAG_LEN);
+        tagged.extend_from_slice(&packet[..12]); // dst + src MAC
+        tagged.extend_from_slice(&[0x81, 0x00]); // TPID
+        let tci: u16 = ((priority as u16) << 13) | (vid & 0x0FFF);
+        tagged.extend_from_slice(&tci.to_be_bytes());
+        tagged.extend_from_slice(&packet[12..]); // original ethertype + payload
+        tagged
+    }
+
+    /// #728 review pin: the Prepared (zero-copy) path has its own
+    /// slice/offset plumbing on top of the L3-offset helper. The VLAN
+    /// regression on the Local path is necessary but not sufficient —
+    /// Local could stay correct while Prepared silently regressed to
+    /// stamping the wrong byte. This drives a single-802.1Q ECT(0)
+    /// frame through `apply_cos_admission_ecn_policy` at a *non-zero*
+    /// UMEM offset and pins that:
+    ///   - CE lands at `l3_offset + 1` relative to the frame start
+    ///     (i.e. at `frame_offset + 19` inside the UMEM),
+    ///   - the VLAN TCI bytes at frame-offset 14..16 are unchanged,
+    ///   - the IPv4 header checksum still validates from scratch.
+    /// A revert to a hardcoded 14 would stamp byte 15 (inside the TCI)
+    /// and this test would fail on the checksum validate as well as
+    /// on the TCI-untouched assertion.
+    #[test]
+    fn admission_ecn_marks_prepared_single_vlan_tagged_ipv4_packet() {
+        let mut root = test_cos_runtime_with_exact(false);
+        let queue = &mut root.queues[0];
+        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        queue.queued_bytes = (buffer_limit / 2) + 1;
+
+        let packet = build_ipv4_test_packet(ECN_ECT_0);
+        let vid: u16 = 80;
+        let priority: u8 = 5;
+        let tci: u16 = ((priority as u16) << 13) | vid;
+        let tagged = insert_single_vlan_tag(packet, vid, priority);
+
+        // Non-zero UMEM offset so we also prove offset arithmetic
+        // (slice_mut_unchecked + l3_offset) composes correctly on a
+        // non-head frame.
+        let frame_offset: u64 = 128;
+        let umem = test_admission_umem();
+        let mut item =
+            test_prepared_item_in_umem(&umem, frame_offset, &tagged, libc::AF_INET as u8);
+
+        let before = snapshot_counters(queue);
+        let marked = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            0,
+            false,
+            false,
+            &mut item,
+            &umem,
+        );
+        assert!(
+            marked,
+            "VLAN-tagged ECT(0) Prepared frame must be marked at the VLAN-shifted offset",
+        );
+        let after = snapshot_counters(queue);
+        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked + 1);
+
+        // Read back the UMEM bytes for the frame and verify ECN = CE
+        // at frame_offset + 19 (= l3_offset + 1 = 18 + 1).
+        let post = umem
+            .slice(frame_offset as usize, tagged.len())
+            .expect("umem slice readback")
+            .to_vec();
+        assert_eq!(
+            post[19] & ECN_MASK,
+            ECN_CE,
+            "CE must land at VLAN-shifted l3_offset + 1",
+        );
+        // VLAN TCI at bytes 14..16 must be byte-identical. A revert to
+        // hardcoded offset 14 would corrupt these bytes.
+        assert_eq!(
+            u16::from_be_bytes([post[14], post[15]]),
+            tci,
+            "VLAN TCI must be untouched by ECN marking on the Prepared path",
+        );
+        // IP checksum recomputed from scratch over the post-mark
+        // IPv4 header must equal the 16-bit value in the frame.
+        let iphdr_start = 18;
+        let iphdr = &post[iphdr_start..iphdr_start + 20];
+        let expected_csum = compute_ipv4_header_checksum(iphdr);
+        let actual_csum = u16::from_be_bytes([post[iphdr_start + 10], post[iphdr_start + 11]]);
+        assert_eq!(
+            actual_csum, expected_csum,
+            "incremental checksum update must match a from-scratch recomputation",
         );
     }
 }
