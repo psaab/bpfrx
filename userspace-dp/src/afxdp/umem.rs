@@ -296,6 +296,39 @@ mod tests {
         );
         assert_eq!(live.tx_errors.load(Ordering::Relaxed), 0);
     }
+
+    #[test]
+    fn binding_live_snapshot_propagates_710_drop_counters() {
+        // #710: `refresh_bindings` in the coordinator copies
+        // `snap.redirect_inbox_overflow_drops`, `pending_tx_local_overflow_drops`,
+        // and `tx_submit_error_drops` onto the per-binding `BindingStatus`.
+        // This test pins the contract that BindingLiveState::snapshot() actually
+        // reads those atomics and writes them into the BindingLiveSnapshot
+        // struct — the middle layer between the counter increments and
+        // the operator-facing BindingStatus. `no_owner_binding_drops` is
+        // intentionally NOT in the snapshot (see the rustdoc on
+        // `BindingLiveSnapshot` for why), so it is not asserted here.
+        let live = BindingLiveState::new();
+        live.redirect_inbox_overflow_drops
+            .store(3, Ordering::Relaxed);
+        live.pending_tx_local_overflow_drops
+            .store(5, Ordering::Relaxed);
+        live.tx_submit_error_drops.store(7, Ordering::Relaxed);
+        live.no_owner_binding_drops.store(11, Ordering::Relaxed);
+
+        let snap = live.snapshot();
+        assert_eq!(snap.redirect_inbox_overflow_drops, 3);
+        assert_eq!(snap.pending_tx_local_overflow_drops, 5);
+        assert_eq!(snap.tx_submit_error_drops, 7);
+        // `no_owner_binding_drops` has no per-binding protocol surface;
+        // it is read directly from the atomic by
+        // `Coordinator::cos_no_owner_binding_drops_total()`.
+        assert_eq!(
+            live.no_owner_binding_drops.load(Ordering::Relaxed),
+            11,
+            "atomic remains readable for the coordinator-level aggregation"
+        );
+    }
 }
 
 /// Raw ring state: (rxP, rxC, frP, frC, txP, txC, crP, crC)
@@ -645,7 +678,9 @@ impl BindingLiveState {
                 .pending_tx_local_overflow_drops
                 .load(Ordering::Relaxed),
             tx_submit_error_drops: self.tx_submit_error_drops.load(Ordering::Relaxed),
-            no_owner_binding_drops: self.no_owner_binding_drops.load(Ordering::Relaxed),
+            // `no_owner_binding_drops` is read directly from the atomic
+            // by `Coordinator::cos_no_owner_binding_drops_total()` — not
+            // snapshotted here because it is not exposed per-binding.
             direct_tx_packets: self.direct_tx_packets.load(Ordering::Relaxed),
             copy_tx_packets: self.copy_tx_packets.load(Ordering::Relaxed),
             in_place_tx_packets: self.in_place_tx_packets.load(Ordering::Relaxed),

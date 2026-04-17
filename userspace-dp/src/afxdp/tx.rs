@@ -1254,7 +1254,7 @@ fn service_exact_local_queue_direct(
     if inserted == 0 {
         let dropped = binding.scratch_exact_local_tx.len() as u64;
         binding.dbg_tx_ring_full += 1;
-        count_tx_ring_full_drop(binding, root_ifindex, queue_idx, dropped);
+        count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         release_exact_local_scratch_frames(
             &mut binding.free_tx_frames,
@@ -1374,7 +1374,7 @@ fn service_exact_local_queue_direct_flow_fair(
     if inserted == 0 {
         let dropped = binding.scratch_local_tx.len() as u64;
         binding.dbg_tx_ring_full += 1;
-        count_tx_ring_full_drop(binding, root_ifindex, queue_idx, dropped);
+        count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         restore_exact_local_scratch_to_queue_head_flow_fair(
             binding
@@ -1511,7 +1511,7 @@ fn service_exact_prepared_queue_direct(
     if inserted == 0 {
         let dropped = binding.scratch_exact_prepared_tx.len() as u64;
         binding.dbg_tx_ring_full += 1;
-        count_tx_ring_full_drop(binding, root_ifindex, queue_idx, dropped);
+        count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         release_exact_prepared_scratch(&mut binding.scratch_exact_prepared_tx);
         refresh_cos_interface_activity(binding, root_ifindex);
@@ -1634,7 +1634,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
     if inserted == 0 {
         let dropped = binding.scratch_prepared_tx.len() as u64;
         binding.dbg_tx_ring_full += 1;
-        count_tx_ring_full_drop(binding, root_ifindex, queue_idx, dropped);
+        count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         restore_exact_prepared_scratch_to_queue_head_flow_fair(
             binding
@@ -2906,26 +2906,35 @@ enum ParkReason {
     QueueTokenStarvation,
 }
 
-// #710: attribute `dropped` TX-ring-full drops to a specific CoS queue
-// on the exact path (`service_exact_*_queue_direct`). Non-exact
-// transmit paths (`transmit_batch`, `transmit_prepared_queue`) do not
-// carry queue identity at the submit site and continue to increment
-// only the generic `tx_errors` counter; that scope is documented on
-// the `tx_ring_full_drops` field in `types::CoSQueueDropCounters`.
+// #710: count an exact-drain TX submit stall on a specific queue.
+// NOT packet loss — on the exact path, `writer.insert == 0` leaves
+// the FIFO items in `queue.items` or restores them (flow-fair path);
+// frames that had been copied into UMEM are released back to
+// `free_tx_frames`, and the items get another chance next drain tick.
+// The counter signals TX-ring / completion-reap pressure, which is
+// an upstream cause for the downstream effects operators chase
+// (#706 mutex contention, #709 owner-worker hotspot).
+//
+// Non-exact transmit paths (`transmit_batch`, `transmit_prepared_queue`)
+// do not carry queue identity at the submit site and do not reach
+// this helper. Their frame-level failures are counted in the binding-
+// level `tx_submit_error_drops` counter instead.
 #[inline]
-fn count_tx_ring_full_drop(
+fn count_tx_ring_full_submit_stall(
     binding: &mut BindingWorker,
     root_ifindex: i32,
     queue_idx: usize,
-    dropped: u64,
+    stalled_packets: u64,
 ) {
-    if dropped == 0 {
+    if stalled_packets == 0 {
         return;
     }
     if let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) {
         if let Some(queue) = root.queues.get_mut(queue_idx) {
-            queue.drop_counters.tx_ring_full_drops =
-                queue.drop_counters.tx_ring_full_drops.wrapping_add(dropped);
+            queue.drop_counters.tx_ring_full_submit_stalls = queue
+                .drop_counters
+                .tx_ring_full_submit_stalls
+                .wrapping_add(stalled_packets);
         }
     }
 }
@@ -4329,6 +4338,21 @@ fn transmit_prepared_queue(
             for r in &orphaned {
                 recycle_prepared_immediately(binding, r);
             }
+            // #710: each orphan is a silently-recycled packet that will
+            // not reach the TX ring. The caller's post-return `+= 1`
+            // covers the offender (`req`); this accounts for the
+            // orphans so `tx_submit_error_drops` matches the actual
+            // packet count lost on this Drop return.
+            if !orphaned.is_empty() {
+                binding
+                    .live
+                    .tx_submit_error_drops
+                    .fetch_add(orphaned.len() as u64, Ordering::Relaxed);
+                binding
+                    .live
+                    .tx_errors
+                    .fetch_add(orphaned.len() as u64, Ordering::Relaxed);
+            }
             return Err(TxError::Drop(format!(
                 "prepared tx frame exceeds UMEM frame capacity: len={} cap={}",
                 req.len,
@@ -4356,6 +4380,19 @@ fn transmit_prepared_queue(
             for r in &orphaned {
                 recycle_prepared_immediately(binding, r);
             }
+            // #710: each orphan is a silently-recycled packet. Caller
+            // will `+= 1` for the offender; this accounts for the rest.
+            let orphan_count = orphaned.len();
+            if orphan_count > 0 {
+                binding
+                    .live
+                    .tx_submit_error_drops
+                    .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
+                binding
+                    .live
+                    .tx_errors
+                    .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
+            }
             return Err(TxError::Drop(format!(
                 "prepared tx frame slice out of range: offset={} len={}",
                 err_offset, err_len
@@ -4375,6 +4412,21 @@ fn transmit_prepared_queue(
             let orphaned: Vec<_> = binding.scratch_prepared_tx.drain(..).collect();
             for r in &orphaned {
                 recycle_prepared_immediately(binding, r);
+            }
+            // #710: same shape as the slice_mut_unchecked site above —
+            // `orphaned` drains EVERY entry including the offender.
+            // Caller adds 1 for the offender; we add (len-1) for the
+            // rest so `tx_submit_error_drops` matches the actual count.
+            let orphan_count = orphaned.len();
+            if orphan_count > 0 {
+                binding
+                    .live
+                    .tx_submit_error_drops
+                    .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
+                binding
+                    .live
+                    .tx_errors
+                    .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
             }
             return Err(TxError::Drop(format!(
                 "prepared tx frame slice out of range: offset={} len={}",
@@ -9282,7 +9334,10 @@ mod tests {
             before.admission_flow_share_drops
         );
         assert_eq!(after.admission_buffer_drops, before.admission_buffer_drops);
-        assert_eq!(after.tx_ring_full_drops, before.tx_ring_full_drops);
+        assert_eq!(
+            after.tx_ring_full_submit_stalls,
+            before.tx_ring_full_submit_stalls
+        );
     }
 
     #[test]
@@ -9321,7 +9376,10 @@ mod tests {
             before.admission_flow_share_drops
         );
         assert_eq!(after.admission_buffer_drops, before.admission_buffer_drops);
-        assert_eq!(after.tx_ring_full_drops, before.tx_ring_full_drops);
+        assert_eq!(
+            after.tx_ring_full_submit_stalls,
+            before.tx_ring_full_submit_stalls
+        );
     }
 
     #[test]

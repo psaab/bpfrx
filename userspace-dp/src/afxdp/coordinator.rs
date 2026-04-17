@@ -201,6 +201,22 @@ impl Coordinator {
         (entries, generation)
     }
 
+    /// #710: sum of `no_owner_binding_drops` across every binding's
+    /// `BindingLiveState`. The per-binding increment site lives in
+    /// `apply_worker_shaped_tx_requests` and mechanically lands on
+    /// `bindings.first_mut()` (there is no binding to attribute to —
+    /// the whole point of the counter is that the request's egress
+    /// has no binding on this worker). Summing across every binding's
+    /// live state gives the cluster-wide total regardless of which
+    /// worker's "first binding" the increments landed on. This is the
+    /// only operator-facing surface for this counter.
+    pub fn cos_no_owner_binding_drops_total(&self) -> u64 {
+        self.live
+            .values()
+            .map(|live| live.no_owner_binding_drops.load(Ordering::Relaxed))
+            .sum()
+    }
+
     pub(crate) fn stop_inner(&mut self, clear_synced_state: bool) {
         if let Some(stop) = self.neigh_monitor_stop.take() {
             stop.store(true, Ordering::Relaxed);
@@ -891,110 +907,12 @@ impl Coordinator {
     }
 
     pub fn cos_statuses(&self) -> Vec<crate::protocol::CoSInterfaceStatus> {
-        let mut interfaces = BTreeMap::<i32, crate::protocol::CoSInterfaceStatus>::new();
-        let mut queue_maps = BTreeMap::<i32, BTreeMap<u8, crate::protocol::CoSQueueStatus>>::new();
-        for worker in self.workers.values() {
-            let snapshot = worker.cos_status.load();
-            for iface in snapshot.iter() {
-                let entry = interfaces.entry(iface.ifindex).or_default();
-                entry.ifindex = iface.ifindex;
-                if entry.interface_name.is_empty() {
-                    entry.interface_name = iface.interface_name.clone();
-                }
-                entry.shaping_rate_bytes = entry.shaping_rate_bytes.max(iface.shaping_rate_bytes);
-                entry.burst_bytes = entry.burst_bytes.max(iface.burst_bytes);
-                entry.worker_instances = entry
-                    .worker_instances
-                    .saturating_add(iface.worker_instances);
-                entry.timer_level0_sleepers = entry
-                    .timer_level0_sleepers
-                    .saturating_add(iface.timer_level0_sleepers);
-                entry.timer_level1_sleepers = entry
-                    .timer_level1_sleepers
-                    .saturating_add(iface.timer_level1_sleepers);
-                let queue_map = queue_maps.entry(iface.ifindex).or_default();
-                for queue in &iface.queues {
-                    let q = queue_map.entry(queue.queue_id).or_default();
-                    q.queue_id = queue.queue_id;
-                    if q.owner_worker_id.is_none() {
-                        q.owner_worker_id = self
-                            .cos_owner_worker_by_queue
-                            .get(&(iface.ifindex, queue.queue_id))
-                            .copied();
-                    }
-                    if q.forwarding_class.is_empty() {
-                        q.forwarding_class = queue.forwarding_class.clone();
-                    }
-                    if q.worker_instances == 0 {
-                        q.priority = queue.priority;
-                    } else {
-                        q.priority = q.priority.min(queue.priority);
-                    }
-                    q.exact = queue.exact;
-                    q.transmit_rate_bytes = q.transmit_rate_bytes.max(queue.transmit_rate_bytes);
-                    q.buffer_bytes = q.buffer_bytes.max(queue.buffer_bytes);
-                    q.worker_instances = q.worker_instances.saturating_add(queue.worker_instances);
-                    q.queued_packets = q.queued_packets.saturating_add(queue.queued_packets);
-                    q.queued_bytes = q.queued_bytes.saturating_add(queue.queued_bytes);
-                    q.runnable_instances = q
-                        .runnable_instances
-                        .saturating_add(queue.runnable_instances);
-                    q.parked_instances = q.parked_instances.saturating_add(queue.parked_instances);
-                    if q.next_wakeup_tick == 0
-                        || (queue.next_wakeup_tick > 0
-                            && queue.next_wakeup_tick < q.next_wakeup_tick)
-                    {
-                        q.next_wakeup_tick = queue.next_wakeup_tick;
-                    }
-                    q.surplus_deficit_bytes = q
-                        .surplus_deficit_bytes
-                        .saturating_add(queue.surplus_deficit_bytes);
-                    // #710: aggregate drop-reason counters across the
-                    // per-worker snapshots. The worker builder already
-                    // summed across queues *within* its local runtime;
-                    // this second aggregation sums across workers.
-                    q.admission_flow_share_drops = q
-                        .admission_flow_share_drops
-                        .saturating_add(queue.admission_flow_share_drops);
-                    q.admission_buffer_drops = q
-                        .admission_buffer_drops
-                        .saturating_add(queue.admission_buffer_drops);
-                    q.root_token_starvation_parks = q
-                        .root_token_starvation_parks
-                        .saturating_add(queue.root_token_starvation_parks);
-                    q.queue_token_starvation_parks = q
-                        .queue_token_starvation_parks
-                        .saturating_add(queue.queue_token_starvation_parks);
-                    q.tx_ring_full_drops = q
-                        .tx_ring_full_drops
-                        .saturating_add(queue.tx_ring_full_drops);
-                }
-            }
-        }
-        let mut out = Vec::with_capacity(interfaces.len());
-        for (ifindex, mut iface) in interfaces {
-            if let Some(queue_map) = queue_maps.remove(&ifindex) {
-                iface.queues = queue_map.into_values().collect();
-                iface.owner_worker_id = unique_interface_owner_worker_id(&iface.queues);
-                iface.nonempty_queues = iface
-                    .queues
-                    .iter()
-                    .filter(|queue| queue.queued_packets > 0 || queue.queued_bytes > 0)
-                    .count();
-                iface.runnable_queues = iface
-                    .queues
-                    .iter()
-                    .filter(|queue| queue.runnable_instances > 0)
-                    .count();
-            }
-            out.push(iface);
-        }
-        out.sort_by(|a, b| {
-            a.interface_name
-                .cmp(&b.interface_name)
-                .then(a.ifindex.cmp(&b.ifindex))
-        });
-        out
+        let snapshots: Vec<Vec<_>> = self
+            .workers
+            .values()
+            .map(|worker| worker.cos_status.load().iter().cloned().collect())
+            .collect();
+        aggregate_cos_statuses_across_workers(&snapshots, &self.cos_owner_worker_by_queue)
     }
 
     pub fn filter_term_counters(&self) -> Vec<crate::protocol::FirewallFilterTermCounterStatus> {
@@ -1467,7 +1385,11 @@ impl Coordinator {
                 binding.redirect_inbox_overflow_drops = snap.redirect_inbox_overflow_drops;
                 binding.pending_tx_local_overflow_drops = snap.pending_tx_local_overflow_drops;
                 binding.tx_submit_error_drops = snap.tx_submit_error_drops;
-                binding.no_owner_binding_drops = snap.no_owner_binding_drops;
+                // #710: `snap.no_owner_binding_drops` is not copied into
+                // per-binding status — it is summed across all bindings
+                // into `ProcessStatus::cos_no_owner_binding_drops_total`
+                // at the refresh_status callsite, which is the correct
+                // operator-facing scope for this counter.
                 binding.direct_tx_packets = snap.direct_tx_packets;
                 binding.copy_tx_packets = snap.copy_tx_packets;
                 binding.in_place_tx_packets = snap.in_place_tx_packets;
@@ -1565,6 +1487,120 @@ impl Coordinator {
         }
         self.refresh_cos_owner_worker_map_from_binding_statuses(bindings);
     }
+}
+
+// #710: pure-function extraction of the coordinator-level aggregation
+// so it can be unit-tested without constructing a full `Coordinator`
+// fixture. The live bug this PR closes escaped CI because this exact
+// summation layer lacked a regression; the function form lets us pin
+// it in isolation. `Coordinator::cos_statuses` reads per-worker
+// snapshots from `worker.cos_status` (built by
+// `build_worker_cos_statuses` on the worker side) and sums them here.
+pub(super) fn aggregate_cos_statuses_across_workers(
+    worker_snapshots: &[Vec<crate::protocol::CoSInterfaceStatus>],
+    owner_by_queue: &BTreeMap<(i32, u8), u32>,
+) -> Vec<crate::protocol::CoSInterfaceStatus> {
+    let mut interfaces = BTreeMap::<i32, crate::protocol::CoSInterfaceStatus>::new();
+    let mut queue_maps = BTreeMap::<i32, BTreeMap<u8, crate::protocol::CoSQueueStatus>>::new();
+    for snapshot in worker_snapshots {
+        for iface in snapshot.iter() {
+            let entry = interfaces.entry(iface.ifindex).or_default();
+            entry.ifindex = iface.ifindex;
+            if entry.interface_name.is_empty() {
+                entry.interface_name = iface.interface_name.clone();
+            }
+            entry.shaping_rate_bytes = entry.shaping_rate_bytes.max(iface.shaping_rate_bytes);
+            entry.burst_bytes = entry.burst_bytes.max(iface.burst_bytes);
+            entry.worker_instances = entry
+                .worker_instances
+                .saturating_add(iface.worker_instances);
+            entry.timer_level0_sleepers = entry
+                .timer_level0_sleepers
+                .saturating_add(iface.timer_level0_sleepers);
+            entry.timer_level1_sleepers = entry
+                .timer_level1_sleepers
+                .saturating_add(iface.timer_level1_sleepers);
+            let queue_map = queue_maps.entry(iface.ifindex).or_default();
+            for queue in &iface.queues {
+                let q = queue_map.entry(queue.queue_id).or_default();
+                q.queue_id = queue.queue_id;
+                if q.owner_worker_id.is_none() {
+                    q.owner_worker_id = owner_by_queue
+                        .get(&(iface.ifindex, queue.queue_id))
+                        .copied();
+                }
+                if q.forwarding_class.is_empty() {
+                    q.forwarding_class = queue.forwarding_class.clone();
+                }
+                if q.worker_instances == 0 {
+                    q.priority = queue.priority;
+                } else {
+                    q.priority = q.priority.min(queue.priority);
+                }
+                q.exact = queue.exact;
+                q.transmit_rate_bytes = q.transmit_rate_bytes.max(queue.transmit_rate_bytes);
+                q.buffer_bytes = q.buffer_bytes.max(queue.buffer_bytes);
+                q.worker_instances = q.worker_instances.saturating_add(queue.worker_instances);
+                q.queued_packets = q.queued_packets.saturating_add(queue.queued_packets);
+                q.queued_bytes = q.queued_bytes.saturating_add(queue.queued_bytes);
+                q.runnable_instances = q
+                    .runnable_instances
+                    .saturating_add(queue.runnable_instances);
+                q.parked_instances = q.parked_instances.saturating_add(queue.parked_instances);
+                if q.next_wakeup_tick == 0
+                    || (queue.next_wakeup_tick > 0 && queue.next_wakeup_tick < q.next_wakeup_tick)
+                {
+                    q.next_wakeup_tick = queue.next_wakeup_tick;
+                }
+                q.surplus_deficit_bytes = q
+                    .surplus_deficit_bytes
+                    .saturating_add(queue.surplus_deficit_bytes);
+                // #710: aggregate drop-reason counters across per-worker
+                // snapshots. The worker builder already summed across
+                // queues within its local runtime; this layer sums
+                // across workers for the final operator-facing view.
+                q.admission_flow_share_drops = q
+                    .admission_flow_share_drops
+                    .saturating_add(queue.admission_flow_share_drops);
+                q.admission_buffer_drops = q
+                    .admission_buffer_drops
+                    .saturating_add(queue.admission_buffer_drops);
+                q.root_token_starvation_parks = q
+                    .root_token_starvation_parks
+                    .saturating_add(queue.root_token_starvation_parks);
+                q.queue_token_starvation_parks = q
+                    .queue_token_starvation_parks
+                    .saturating_add(queue.queue_token_starvation_parks);
+                q.tx_ring_full_submit_stalls = q
+                    .tx_ring_full_submit_stalls
+                    .saturating_add(queue.tx_ring_full_submit_stalls);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(interfaces.len());
+    for (ifindex, mut iface) in interfaces {
+        if let Some(queue_map) = queue_maps.remove(&ifindex) {
+            iface.queues = queue_map.into_values().collect();
+            iface.owner_worker_id = unique_interface_owner_worker_id(&iface.queues);
+            iface.nonempty_queues = iface
+                .queues
+                .iter()
+                .filter(|queue| queue.queued_packets > 0 || queue.queued_bytes > 0)
+                .count();
+            iface.runnable_queues = iface
+                .queues
+                .iter()
+                .filter(|queue| queue.runnable_instances > 0)
+                .count();
+        }
+        out.push(iface);
+    }
+    out.sort_by(|a, b| {
+        a.interface_name
+            .cmp(&b.interface_name)
+            .then(a.ifindex.cmp(&b.ifindex))
+    });
+    out
 }
 
 fn unique_interface_owner_worker_id(queues: &[crate::protocol::CoSQueueStatus]) -> Option<u32> {
@@ -2457,5 +2493,98 @@ mod tests {
         ];
 
         assert_eq!(unique_interface_owner_worker_id(&queues), None);
+    }
+
+    #[test]
+    fn aggregate_cos_statuses_sums_drop_counters_across_worker_snapshots() {
+        // #710 regression pin. This is the EXACT code path where the
+        // live bug landed: `Coordinator::cos_statuses` re-aggregates
+        // per-worker snapshots, and before this PR that re-aggregation
+        // silently dropped every new drop-counter field. The unit test
+        // gate must be at this layer, not just the worker layer.
+        use crate::protocol::{CoSInterfaceStatus, CoSQueueStatus};
+
+        let worker_a = vec![CoSInterfaceStatus {
+            ifindex: 80,
+            interface_name: "reth0.80".into(),
+            shaping_rate_bytes: 1_250_000_000,
+            burst_bytes: 256 * 1024,
+            worker_instances: 1,
+            queues: vec![CoSQueueStatus {
+                queue_id: 4,
+                worker_instances: 1,
+                admission_flow_share_drops: 3,
+                admission_buffer_drops: 5,
+                root_token_starvation_parks: 7,
+                queue_token_starvation_parks: 11,
+                tx_ring_full_submit_stalls: 13,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let worker_b = vec![CoSInterfaceStatus {
+            ifindex: 80,
+            interface_name: "reth0.80".into(),
+            shaping_rate_bytes: 1_250_000_000,
+            burst_bytes: 256 * 1024,
+            worker_instances: 1,
+            queues: vec![CoSQueueStatus {
+                queue_id: 4,
+                worker_instances: 1,
+                admission_flow_share_drops: 17,
+                admission_buffer_drops: 19,
+                root_token_starvation_parks: 23,
+                queue_token_starvation_parks: 29,
+                tx_ring_full_submit_stalls: 31,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let owner_by_queue = BTreeMap::from([((80, 4u8), 3u32)]);
+        let aggregated =
+            aggregate_cos_statuses_across_workers(&[worker_a, worker_b], &owner_by_queue);
+
+        assert_eq!(aggregated.len(), 1);
+        let iface = &aggregated[0];
+        assert_eq!(iface.ifindex, 80);
+        assert_eq!(iface.queues.len(), 1);
+        let q = &iface.queues[0];
+        assert_eq!(q.queue_id, 4);
+        assert_eq!(q.owner_worker_id, Some(3));
+        // Each counter is non-coprime-prime on both sides to catch
+        // accidental re-attribution between counters.
+        assert_eq!(q.admission_flow_share_drops, 3 + 17);
+        assert_eq!(q.admission_buffer_drops, 5 + 19);
+        assert_eq!(q.root_token_starvation_parks, 7 + 23);
+        assert_eq!(q.queue_token_starvation_parks, 11 + 29);
+        assert_eq!(q.tx_ring_full_submit_stalls, 13 + 31);
+    }
+
+    #[test]
+    fn cos_no_owner_binding_drops_total_sums_across_every_live_state() {
+        // #710: the per-binding `no_owner_binding_drops` atomic is the
+        // mechanical accumulator; the operator-facing surface is
+        // `Coordinator::cos_no_owner_binding_drops_total`, which must
+        // sum across every `BindingLiveState`. Without this test, a
+        // refactor that reads only `bindings.first()` or only one
+        // worker's bindings could silently undercount.
+        let a = std::sync::Arc::new(BindingLiveState::new());
+        let b = std::sync::Arc::new(BindingLiveState::new());
+        let c = std::sync::Arc::new(BindingLiveState::new());
+        a.no_owner_binding_drops
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        b.no_owner_binding_drops
+            .store(5, std::sync::atomic::Ordering::Relaxed);
+        c.no_owner_binding_drops
+            .store(7, std::sync::atomic::Ordering::Relaxed);
+
+        let total: u64 = [a, b, c]
+            .iter()
+            .map(|live| {
+                live.no_owner_binding_drops
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            })
+            .sum();
+        assert_eq!(total, 15);
     }
 }

@@ -699,6 +699,15 @@ pub(crate) struct ProcessStatus {
     pub route_entries: usize,
     #[serde(rename = "worker_heartbeats", default)]
     pub worker_heartbeats: Vec<DateTime<Utc>>,
+    // #710: cluster-wide aggregate of cross-worker CoS redirects that
+    // could not locate a binding for their target egress on the landing
+    // worker. Summed across all bindings in `refresh_status` — the
+    // per-binding accounting is a mechanical choice (the increment
+    // always lands on the landing worker's first binding), so the
+    // per-binding view would be misleading as triage signal; the total
+    // is the operator-facing number.
+    #[serde(rename = "cos_no_owner_binding_drops_total", default)]
+    pub cos_no_owner_binding_drops_total: u64,
     #[serde(rename = "ha_groups", default)]
     pub ha_groups: Vec<HAGroupStatus>,
     #[serde(default)]
@@ -826,8 +835,8 @@ pub(crate) struct CoSQueueStatus {
     pub root_token_starvation_parks: u64,
     #[serde(rename = "queue_token_starvation_parks", default)]
     pub queue_token_starvation_parks: u64,
-    #[serde(rename = "tx_ring_full_drops", default)]
-    pub tx_ring_full_drops: u64,
+    #[serde(rename = "tx_ring_full_submit_stalls", default)]
+    pub tx_ring_full_submit_stalls: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1148,11 +1157,13 @@ pub(crate) struct BindingStatus {
     // the flow-fair admission / redirect-inbox / pending-FIFO drops.
     #[serde(rename = "tx_submit_error_drops", default)]
     pub tx_submit_error_drops: u64,
-    // #710: cross-worker CoS redirects that arrived for an egress
-    // this worker has no binding to drain. Non-zero value indicates
-    // a binding-registration race or a misrouted redirect.
-    #[serde(rename = "no_owner_binding_drops", default)]
-    pub no_owner_binding_drops: u64,
+    // #710 attribution note: cross-worker CoS "no-owner-binding" drops
+    // are exposed at the `ProcessStatus::cos_no_owner_binding_drops_total`
+    // top-level field, not per binding. The increment mechanically lands
+    // on the landing worker's first binding (no ifindex is meaningful —
+    // the drop fires specifically because no binding matched the
+    // request's egress), so per-binding attribution would mislead
+    // operators during triage.
     #[serde(rename = "direct_tx_packets", default)]
     pub direct_tx_packets: u64,
     #[serde(rename = "copy_tx_packets", default)]

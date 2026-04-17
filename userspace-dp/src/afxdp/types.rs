@@ -854,10 +854,17 @@ pub(super) struct CoSQueueDropCounters {
     /// refill. High count indicates the per-queue rate cap is the
     /// limiter for this queue.
     pub(super) queue_token_starvation_parks: u64,
-    /// TX ring submission failed; `writer.insert` returned zero or the
-    /// ring was full. Frames already copied into UMEM are released back
-    /// to `free_tx_frames` by the caller. See #706 / #709.
-    pub(super) tx_ring_full_drops: u64,
+    /// Counts `writer.insert` returning zero on the exact-drain path —
+    /// i.e. the TX ring refused the batch. NOT a packet-loss event on
+    /// the exact path: FIFO variants leave items in `queue.items` and
+    /// flow-fair variants explicitly restore them via
+    /// `restore_exact_*_scratch_to_queue_head_flow_fair`. Frames copied
+    /// into UMEM are released back to `free_tx_frames` by the caller;
+    /// the packets themselves are retried on the next drain cycle.
+    /// Elevated values indicate TX ring / completion reap pressure, not
+    /// packet loss. See #706 / #709 for the downstream causes operators
+    /// typically chase when this fires.
+    pub(super) tx_ring_full_submit_stalls: u64,
 }
 
 pub(super) struct CoSTimerWheelRuntime {
