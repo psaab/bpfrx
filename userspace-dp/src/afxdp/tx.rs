@@ -2708,7 +2708,7 @@ fn cos_item_flow_key(item: &CoSPendingTxItem) -> Option<&SessionKey> {
 
 #[inline(always)]
 fn cos_flow_bucket_index(queue_seed: u64, flow_key: Option<&SessionKey>) -> usize {
-    usize::from(exact_cos_flow_bucket(queue_seed, flow_key)) & (COS_FLOW_FAIR_BUCKETS - 1)
+    usize::from(exact_cos_flow_bucket(queue_seed, flow_key)) & COS_FLOW_FAIR_BUCKET_MASK
 }
 
 #[inline]
@@ -8263,33 +8263,54 @@ mod tests {
     #[test]
     fn exact_cos_flow_bucket_distribution_at_1024_keeps_collisions_below_budget() {
         // #711 correctness pin. The whole point of growing buckets
-        // 64 → 1024 is collision reduction. Hash 64 distinct 5-tuples
-        // with a fixed seed and assert at least 60 of them land in
-        // distinct buckets (no more than 4 collisions among 64 flows).
+        // 64 → 1024 is collision reduction. A hash-mix regression can
+        // produce acceptable distribution on one seed while clustering
+        // badly under others; a single-seed test is too easy to
+        // accidentally satisfy. Exercise multiple deterministic seeds
+        // and mix v4/v6 tuples so the guarantee covers a realistic
+        // traffic shape.
         //
-        // Theoretical baseline for 64 flows into 1024 uniform buckets
-        // is E[pairs] ≈ 64·63/(2·1024) ≈ 1.97 colliding pairs (so
-        // ~62–63 unique buckets on average). A budget of 60/64 unique
-        // allows headroom for hash non-uniformity without hiding a
-        // real distribution regression. If this test fires, the hash
-        // function has become non-uniform — which would silently
-        // undo the fairness improvement #711 is about.
-        let seed: u64 = 0xA5A5_0000_C3C3_FFFF;
-        let mut buckets = std::collections::BTreeSet::new();
-        for src_port in 10_000u16..10_064 {
-            let flow = test_session_key(src_port, 5201);
-            buckets.insert(cos_flow_bucket_index(seed, Some(&flow)));
+        // Theoretical baseline for 64 uniform flows into 1024 buckets:
+        // E[colliding pairs] ≈ 64·63/(2·1024) ≈ 1.97 — so ~62-63
+        // distinct buckets on average. A budget of 58/64 per seed is
+        // ~2 sigma conservative under a uniform-hash null hypothesis;
+        // if this test fires, the hash function has become materially
+        // non-uniform and the fairness guarantee is silently gone.
+        use std::collections::BTreeSet;
+
+        let seeds: [u64; 3] = [0, 0xA5A5_0000_C3C3_FFFF, 0x0123_4567_89AB_CDEF];
+        for &seed in &seeds {
+            let mut buckets = BTreeSet::new();
+            for i in 0..64u16 {
+                let mut flow = test_session_key(10_000 + i, 5201);
+                // Alternate between v4 and v6 tuples so the test
+                // exercises both address-family branches of the hash.
+                if i & 1 == 1 {
+                    flow.addr_family = libc::AF_INET6 as u8;
+                    let v6 = format!("2001:db8::{i:x}")
+                        .parse::<std::net::Ipv6Addr>()
+                        .expect("v6 literal");
+                    flow.src_ip = IpAddr::V6(v6);
+                    flow.dst_ip = IpAddr::V6(
+                        "2001:db8::5201"
+                            .parse::<std::net::Ipv6Addr>()
+                            .expect("v6 literal"),
+                    );
+                }
+                buckets.insert(cos_flow_bucket_index(seed, Some(&flow)));
+            }
+            assert!(
+                buckets.len() >= 58,
+                "seed={:#x}: 64 flows landed in only {} distinct buckets — \
+                 hash distribution regressed",
+                seed,
+                buckets.len()
+            );
+            assert!(
+                buckets.iter().all(|&b| b < COS_FLOW_FAIR_BUCKETS),
+                "bucket index out of range after mask: seed={seed:#x}"
+            );
         }
-        assert!(
-            buckets.len() >= 60,
-            "64 flows landed in only {} distinct buckets — hash distribution regressed",
-            buckets.len()
-        );
-        // Sanity: the values are within the 10-bit mask.
-        assert!(
-            buckets.iter().all(|&b| b < COS_FLOW_FAIR_BUCKETS),
-            "bucket index out of range after mask"
-        );
     }
 
     #[test]

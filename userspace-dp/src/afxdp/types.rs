@@ -605,6 +605,25 @@ pub(super) const COS_FAST_QUEUE_INDEX_MISS: u16 = u16::MAX;
 /// 4 workers × 8 queues × 1 iface = ~1 MB, well within tolerance.
 pub(super) const COS_FLOW_FAIR_BUCKETS: usize = 1024;
 
+// Compile-time invariants for COS_FLOW_FAIR_BUCKETS — the #711 design
+// depends on both and a future refactor that changes the constant
+// without checking these must fail at build time, not at runtime:
+//
+// 1. Power of two — `cos_flow_bucket_index` masks with
+//    `COS_FLOW_FAIR_BUCKETS - 1` instead of modulo, and `FlowRrRing`
+//    uses mask-based wrap math on the hot push/pop path. Without
+//    power-of-two sizing that math silently indexes off the end.
+// 2. Fits in `u16` — `FlowRrRing` stores bucket IDs as `u16`. A
+//    larger constant would silently truncate.
+const _: () = assert!(COS_FLOW_FAIR_BUCKETS.is_power_of_two());
+const _: () = assert!(COS_FLOW_FAIR_BUCKETS <= u16::MAX as usize);
+
+/// Pre-computed mask for `COS_FLOW_FAIR_BUCKETS`-modulo on the hot
+/// path. Using a mask (rather than `%`) gives deterministic codegen
+/// independent of the optimizer proving the power-of-two property at
+/// each call site.
+pub(super) const COS_FLOW_FAIR_BUCKET_MASK: usize = COS_FLOW_FAIR_BUCKETS - 1;
+
 /// #694: Fixed-capacity ring buffer holding the set of currently-active
 /// flow bucket IDs, driving SFQ round-robin dequeue.
 ///
@@ -664,6 +683,17 @@ impl FlowRrRing {
         }
     }
 
+    // Hot-path invariant: the caller in `cos_queue_push_*` gates every
+    // push on "bucket transitioned empty → non-empty", so a bucket ID
+    // is in the ring at most once. The ring therefore never holds more
+    // than `COS_FLOW_FAIR_BUCKETS` entries, and `len < CAP` is a
+    // structural invariant — not a runtime bound we need to defend
+    // against. `debug_assert!` enforces it in tests; release uses a
+    // plain `+= 1` rather than `saturating_add` because a silent
+    // saturation on a violated invariant would hide a real bug (the
+    // push would succeed at the wrapped-buffer index and the ring
+    // would lose either the new entry or an older one, depending on
+    // head placement — very hard to triage).
     #[inline]
     pub(super) fn push_back(&mut self, bucket: u16) {
         debug_assert!(
@@ -672,9 +702,9 @@ impl FlowRrRing {
             self.len,
             COS_FLOW_FAIR_BUCKETS
         );
-        let tail = (usize::from(self.head) + usize::from(self.len)) % COS_FLOW_FAIR_BUCKETS;
+        let tail = (usize::from(self.head) + usize::from(self.len)) & COS_FLOW_FAIR_BUCKET_MASK;
         self.buf[tail] = bucket;
-        self.len = self.len.saturating_add(1);
+        self.len += 1;
     }
 
     #[inline]
@@ -685,14 +715,13 @@ impl FlowRrRing {
             self.len,
             COS_FLOW_FAIR_BUCKETS
         );
-        let cap = COS_FLOW_FAIR_BUCKETS as u16;
-        self.head = if self.head == 0 {
-            cap - 1
-        } else {
-            self.head - 1
-        };
+        // head := (head + CAP - 1) mod CAP, with CAP a power of two
+        // so this is a mask-only op. Avoids the `if head == 0` branch
+        // on the hot path.
+        self.head = ((usize::from(self.head) + COS_FLOW_FAIR_BUCKETS - 1)
+            & COS_FLOW_FAIR_BUCKET_MASK) as u16;
         self.buf[usize::from(self.head)] = bucket;
-        self.len = self.len.saturating_add(1);
+        self.len += 1;
     }
 
     #[inline]
@@ -700,9 +729,8 @@ impl FlowRrRing {
         if self.len == 0 {
             return None;
         }
-        let cap = COS_FLOW_FAIR_BUCKETS as u16;
         let bucket = self.buf[usize::from(self.head)];
-        self.head = (self.head + 1) % cap;
+        self.head = ((usize::from(self.head) + 1) & COS_FLOW_FAIR_BUCKET_MASK) as u16;
         self.len -= 1;
         Some(bucket)
     }
@@ -720,7 +748,7 @@ impl<'a> Iterator for FlowRrRingIter<'a> {
         if self.offset >= usize::from(self.ring.len) {
             return None;
         }
-        let idx = (usize::from(self.ring.head) + self.offset) % COS_FLOW_FAIR_BUCKETS;
+        let idx = (usize::from(self.ring.head) + self.offset) & COS_FLOW_FAIR_BUCKET_MASK;
         self.offset += 1;
         Some(self.ring.buf[idx])
     }
