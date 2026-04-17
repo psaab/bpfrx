@@ -1,7 +1,7 @@
-# xpf Pull Request History
+# bpfrx Pull Request History
 
 Complete record of all pull requests.
-Total: 234 PRs (211 merged)
+Total: 317 PRs (293 merged)
 
 ---
 
@@ -12,29 +12,29 @@ Branch: `master`
 Profiles reference the networks, so Incus refuses to delete a network while a profile still holds a device entry for it.
 before fix:
 ```
-jdp@coi:~/xpf$ ./test/incus/setup.sh destroy
-==> Instance xpf-fw does not exist
+jdp@coi:~/bpfrx$ ./test/incus/setup.sh destroy
+==> Instance bpfrx-fw does not exist
 Also remove networks and profiles? [y/N] y
-==> Deleting network xpf-trust
+==> Deleting network bpfrx-trust
 Error: The network is currently in use
 ```
 after fix:
 ```
-jdp@coi:~/xpf$ ./test/incus/setup.sh destroy
-==> Instance xpf-fw does not exist
+jdp@coi:~/bpfrx$ ./test/incus/setup.sh destroy
+==> Instance bpfrx-fw does not exist
 Also remove networks and profiles? [y/N] y
-==> Deleting profile xpf-vm
-Profile xpf-vm deleted
-==> Deleting profile xpf-container
-Profile xpf-container deleted
-==> Deleting network xpf-trust
-Network xpf-trust deleted
-==> Deleting network xpf-untrust
-Network xpf-untrust deleted
-==> Deleting network xpf-dmz
-Network xpf-dmz deleted
-==> Deleting network xpf-tunnel
-Network xpf-tunnel deleted
+==> Deleting profile bpfrx-vm
+Profile bpfrx-vm deleted
+==> Deleting profile bpfrx-container
+Profile bpfrx-container deleted
+==> Deleting network bpfrx-trust
+Network bpfrx-trust deleted
+==> Deleting network bpfrx-untrust
+Network bpfrx-untrust deleted
+==> Deleting network bpfrx-dmz
+Network bpfrx-dmz deleted
+==> Deleting network bpfrx-tunnel
+Network bpfrx-tunnel deleted
 ==> Destroy complete.
 ```
 
@@ -79,7 +79,7 @@ func (m *Manager) buildDHCPv6Modifiers(ifaceName string, opts *DHCPv6Options) []
 <!-- START COPILOT CODING AGENT TIPS -->
 ---
 
-✨ Let Copilot coding agent [set things up for you](https://github.com/psaab/xpf/issues/new?title=✨+Set+up+Copilot+instructions&body=Configure%20instructions%20for%20this%20repository%20as%20documented%20in%20%5BBest%20practices%20for%20Copilot%20coding%20agent%20in%20your%20repository%5D%28https://gh.io/copilot-coding-agent-tips%29%2E%0A%0A%3COnboard%20this%20repo%3E&assignees=copilot) — coding agent works faster and does higher quality work when set up for your repo.
+✨ Let Copilot coding agent [set things up for you](https://github.com/psaab/bpfrx/issues/new?title=✨+Set+up+Copilot+instructions&body=Configure%20instructions%20for%20this%20repository%20as%20documented%20in%20%5BBest%20practices%20for%20Copilot%20coding%20agent%20in%20your%20repository%5D%28https://gh.io/copilot-coding-agent-tips%29%2E%0A%0A%3COnboard%20this%20repo%3E&assignees=copilot) — coding agent works faster and does higher quality work when set up for your repo.
 
 
 ---
@@ -233,7 +233,7 @@ Branch: `pr/pre-id-default-policy-tracking`
 - define scoped implementation steps and acceptance criteria
 
 ## Why
-`vsrx.conf` includes `pre-id-default-policy`, but xpf currently parses the stanza without applying it in policy/dataplane behavior.
+`vsrx.conf` includes `pre-id-default-policy`, but bpfrx currently parses the stanza without applying it in policy/dataplane behavior.
 
 ## Testing
 - docs-only change
@@ -269,7 +269,7 @@ Branch: `pr/master-password-tracking`
 - define secure implementation scope and acceptance criteria
 
 ## Why
-`system master-password` exists in the imported config but currently has no runtime effect in xpf.
+`system master-password` exists in the imported config but currently has no runtime effect in bpfrx.
 
 ## Testing
 - docs-only change
@@ -287,7 +287,7 @@ Branch: `pr/license-autoupdate-url-tracking`
 - define implementation scope and acceptance criteria
 
 ## Why
-The imported config includes license autoupdate URL, but xpf currently stores it without acting on it.
+The imported config includes license autoupdate URL, but bpfrx currently stores it without acting on it.
 
 ## Testing
 - docs-only change
@@ -300,14 +300,14 @@ The imported config includes license autoupdate URL, but xpf currently stores it
 Branch: `docs/monitor-command-research`
 
 ## Summary
-Adds a new next-feature doc that captures live JUNOS `monitor` behavior from `claude@172.16.100.1` and translates it into an implementation plan for xpf.
+Adds a new next-feature doc that captures live JUNOS `monitor` behavior from `claude@172.16.100.1` and translates it into an implementation plan for bpfrx.
 
 ## What this includes
 - Live command tree and syntax for:
   - `monitor security flow` (`file`, `filter`, `start`, `stop`)
   - `monitor security packet-drop` (filters, `count`, `node`)
 - Observed runtime behavior and errors (preconditions, output shape, start/stop semantics)
-- Implementation checklist for xpf CLI grammar, daemon state model, and output compatibility goals
+- Implementation checklist for bpfrx CLI grammar, daemon state model, and output compatibility goals
 - Open questions to resolve before coding
 
 ## File added
@@ -394,7 +394,7 @@ Current docs contain drift and contradictions (for example summary totals vs row
 Branch: `docs/dataplane-decision-dpdk-vs-vpp-20260302`
 
 ## Summary
-- add an authoritative decision doc comparing DPDK vs VPP for xpf
+- add an authoritative decision doc comparing DPDK vs VPP for bpfrx
 - document a clear recommendation: DPDK-first for current project constraints
 - define explicit triggers for re-evaluating VPP later
 - add cross-reference notes in existing strategy docs to keep guidance consistent
@@ -423,7 +423,7 @@ Document vSRX HA dual-fabric (`fab0` + `fab1`) syntax-compatibility gap and requ
 
 ## Why
 
-`vsrx.conf` defines both `fab0` and `fab1` in HA setups. xpf currently has single-fabric assumptions in cluster transport and fabric forwarding wiring, so syntax compatibility is incomplete.
+`vsrx.conf` defines both `fab0` and `fab1` in HA setups. bpfrx currently has single-fabric assumptions in cluster transport and fabric forwarding wiring, so syntax compatibility is incomplete.
 
 ## Cross-reference
 
@@ -620,7 +620,7 @@ Branch: `perf-ipv6-flow-cache`
 - `go generate ./pkg/dataplane/...`
 - `rm -rf /tmp/go-build-user && mkdir -p /tmp/go-build-user && GOCACHE=/tmp/go-build-user go test ./...`
 - `git diff --check`
-- privileged dataplane load check via `sudo -n env GOCACHE=/tmp/go-build $(command -v go) run /tmp/load_xpf.go`
+- privileged dataplane load check via `sudo -n env GOCACHE=/tmp/go-build $(command -v go) run /tmp/load_bpfrx.go`
 
 Closes #164.
 Closes #165.
@@ -639,14 +639,14 @@ Branch: `perf-xdp-screen-bypass`
 - skip the screen stage for common TCP data/ACK packets when only SYN-centric checks apply
 
 ## Why
-This is the first slice from `/home/ps/git/xpf/docs/perf-analysis-ipv6.md`.
+This is the first slice from `/home/ps/git/bpfrx/docs/perf-analysis-ipv6.md`.
 The profile showed avoidable hot-path cost around `xdp_main_prog` / `xdp_screen_prog`, especially for long-running TCP traffic.
 
 ## Validation
 - `go generate ./pkg/dataplane/...`
 - `GOCACHE=/tmp/go-build-pr1 go test ./pkg/dataplane/... ./pkg/conntrack/... ./pkg/daemon/...`
 - `git diff --check`
-- `sudo -n env GOCACHE=/tmp/go-build-pr1 $(command -v go) run /tmp/load_xpf.go`
+- `sudo -n env GOCACHE=/tmp/go-build-pr1 $(command -v go) run /tmp/load_bpfrx.go`
 
 
 ---
@@ -661,14 +661,14 @@ Branch: `perf-coarse-packet-time`
 - avoid redundant `last_seen` writes when the cached second has not changed
 
 ## Why
-This is the second slice from `/home/ps/git/xpf/docs/perf-analysis-ipv6.md`.
+This is the second slice from `/home/ps/git/bpfrx/docs/perf-analysis-ipv6.md`.
 The profile called out `read_tsc` / packet timestamping as avoidable hot-path work. This keeps precise timing where it matters and removes it from the common path.
 
 ## Validation
 - `go generate ./pkg/dataplane/...`
 - `GOCACHE=/tmp/go-build-pr2 go test ./pkg/dataplane/... ./pkg/conntrack/... ./pkg/daemon/...`
 - `git diff --check`
-- `sudo -n env GOCACHE=/tmp/go-build-pr2 $(command -v go) run /tmp/load_xpf.go`
+- `sudo -n env GOCACHE=/tmp/go-build-pr2 $(command -v go) run /tmp/load_bpfrx.go`
 
 
 ---
@@ -684,7 +684,7 @@ Branch: `perf-conntrack-gc-adaptive`
 - add unit coverage for the new scheduling logic
 
 ## Why
-This is the third slice from `/home/ps/git/xpf/docs/perf-analysis-ipv6.md`.
+This is the third slice from `/home/ps/git/bpfrx/docs/perf-analysis-ipv6.md`.
 The profile showed measurable userspace GC overhead from periodic batch sweeps even when the session table is stable.
 
 ## Validation
@@ -701,7 +701,7 @@ Branch: `docs/xdp-io-uring-userspace-dataplane`
 ## Summary
 - add a design doc for an XDP-fronted userspace dataplane built around multithreaded workers
 - explain why AF_XDP should be the packet handoff boundary and where io_uring actually fits
-- cover threading, memory, HA/session-sync, crash behavior, and phased xpf implementation
+- cover threading, memory, HA/session-sync, crash behavior, and phased bpfrx implementation
 
 ## Key Point
 The performant version of this design is:
@@ -731,7 +731,7 @@ The merged IPv6 perf change moved IPv6 `CHECKSUM_PARTIAL` detection out of `pars
 - `go generate ./pkg/dataplane/...`
 - `GOCACHE=/tmp/go-build-ipv6-fix go test ./pkg/dataplane/... ./pkg/daemon/... ./pkg/cli ./pkg/grpcapi`
 - `GOCACHE=/tmp/go-build-ipv6-fix go test ./...`
-- `sudo -n env GOCACHE=/tmp/go-build-ipv6-fix $(command -v go) run /tmp/load_xpf.go`
+- `sudo -n env GOCACHE=/tmp/go-build-ipv6-fix $(command -v go) run /tmp/load_bpfrx.go`
 
 
 ---
@@ -754,7 +754,7 @@ This PR rolls that fast path out of runtime use so IPv6 forwarding returns to th
 - `git pull --rebase`
 - `go generate ./pkg/dataplane/...`
 - `GOCACHE=/tmp/go-build-ipv6-fix3 go test ./...`
-- `sudo -n env GOCACHE=/tmp/go-build-ipv6-fix3 $(command -v go) run /tmp/load_xpf.go`
+- `sudo -n env GOCACHE=/tmp/go-build-ipv6-fix3 $(command -v go) run /tmp/load_bpfrx.go`
 
 
 ---
@@ -777,7 +777,7 @@ This PR contains only commit `d1c10fd` on top of current `master`.
 ## Validation
 - `go generate ./pkg/dataplane/...`
 - `GOCACHE=/tmp/go-build-ipv6-fix4 go test ./...`
-- `sudo -n env GOCACHE=/tmp/go-build-ipv6-fix4 $(command -v go) run /tmp/load_xpf.go`
+- `sudo -n env GOCACHE=/tmp/go-build-ipv6-fix4 $(command -v go) run /tmp/load_bpfrx.go`
 
 
 ---
@@ -818,7 +818,7 @@ Recent perf captures still show `xdp_main_prog` as the single largest IPv6 hot s
 ## Validation
 - `go generate ./pkg/dataplane/...`
 - `GOCACHE=/tmp/go-build-perf-screen go test ./...`
-- `sudo -n env GOCACHE=/tmp/go-build-perf-screen $(command -v go) run /tmp/load_xpf.go`
+- `sudo -n env GOCACHE=/tmp/go-build-perf-screen $(command -v go) run /tmp/load_bpfrx.go`
 - `git diff --check`
 
 ## Follow-ups
@@ -850,7 +850,7 @@ It also fixes a correctness hole that the recent IPv6 NAT series left behind: so
 ## Validation
 - `go generate ./pkg/dataplane/...`
 - `env -i PATH=$PATH HOME=$HOME TERM=$TERM GOCACHE=/tmp/go-build-pr179-180 $(command -v go) test ./pkg/dataplane/... ./pkg/conntrack/... ./pkg/cluster/...`
-- `sudo -n env -u GOFLAGS -u GOROOT GOCACHE=/tmp/go-build-pr179-180 $(command -v go) run /tmp/load_xpf.go`
+- `sudo -n env -u GOFLAGS -u GOROOT GOCACHE=/tmp/go-build-pr179-180 $(command -v go) run /tmp/load_bpfrx.go`
 
 ## Notes
 - This intentionally keeps the existing IPv6 flow-cache layout in place.
@@ -880,7 +880,7 @@ The authoritative `sessions_v6` map stays unchanged for GC, HA/session sync, and
 ## Validation
 - `go generate ./pkg/dataplane/...`
 - `env -i PATH=$PATH HOME=$HOME TERM=$TERM GOCACHE=/tmp/go-build-pr166-168-user $(command -v go) test ./pkg/dataplane/... ./pkg/conntrack/... ./pkg/cluster/...`
-- `sudo -n env -i PATH=$PATH HOME=$HOME TERM=$TERM GOCACHE=/tmp/go-build-pr166-168-root $(command -v go) run /tmp/load_xpf.go`
+- `sudo -n env -i PATH=$PATH HOME=$HOME TERM=$TERM GOCACHE=/tmp/go-build-pr166-168-root $(command -v go) run /tmp/load_bpfrx.go`
 
 ## Notes
 - Stacked on top of #182.
@@ -900,7 +900,7 @@ Branch: `docs/xdp-afxdp-uring-plan`
 - define overload/fail-closed behavior, snapshot publication rules, feature boundaries, shard-sync rules, and observability requirements
 
 ## Why
-The original doc had the right architecture direction, but it left too many make-or-break details at sketch level. This revision adds the operational contracts that would determine whether such a backend is actually implementable in xpf.
+The original doc had the right architecture direction, but it left too many make-or-break details at sketch level. This revision adds the operational contracts that would determine whether such a backend is actually implementable in bpfrx.
 
 ## Scope
 Docs only:
@@ -969,8 +969,8 @@ This updates the XDP/AF_XDP/io_uring userspace dataplane design with a concrete 
 
 Main decisions captured in the doc:
 
-- do not embed packet slow-path work inside `xpfd`
-- keep `xpfd` as the Go control plane
+- do not embed packet slow-path work inside `bpfrxd`
+- keep `bpfrxd` as the Go control plane
 - use a separate native dataplane process for AF_XDP workers and packet slow path
 - plan for Rust as the implementation language for the userspace dataplane runtime
 - keep the control-plane/dataplane boundary explicit via shared memory + control socket
@@ -1348,7 +1348,7 @@ All 269 tests pass, zero `unused_imports` warnings.
 <!-- START COPILOT CODING AGENT TIPS -->
 ---
 
-✨ Let Copilot coding agent [set things up for you](https://github.com/psaab/xpf/issues/new?title=✨+Set+up+Copilot+instructions&body=Configure%20instructions%20for%20this%20repository%20as%20documented%20in%20%5BBest%20practices%20for%20Copilot%20coding%20agent%20in%20your%20repository%5D%28https://gh.io/copilot-coding-agent-tips%29%2E%0A%0A%3COnboard%20this%20repo%3E&assignees=copilot) — coding agent works faster and does higher quality work when set up for your repo.
+✨ Let Copilot coding agent [set things up for you](https://github.com/psaab/bpfrx/issues/new?title=✨+Set+up+Copilot+instructions&body=Configure%20instructions%20for%20this%20repository%20as%20documented%20in%20%5BBest%20practices%20for%20Copilot%20coding%20agent%20in%20your%20repository%5D%28https://gh.io/copilot-coding-agent-tips%29%2E%0A%0A%3COnboard%20this%20repo%3E&assignees=copilot) — coding agent works faster and does higher quality work when set up for your repo.
 
 
 ---
@@ -1370,7 +1370,7 @@ Validation:
 - cargo test --manifest-path userspace-dp/Cargo.toml authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch -- --nocapture
 - cargo test --manifest-path userspace-dp/Cargo.toml mlx5_keeps_umem_owner_bind_strategy -- --nocapture
 - cargo test --manifest-path userspace-dp/Cargo.toml virtio_prefers_separate_owner_then_falls_back -- --nocapture
-- live deploy to loss:xpf-userspace-fw0/1 with dual-stack reachability + IPv4/IPv6 TTL and mtr checks
+- live deploy to loss:bpfrx-userspace-fw0/1 with dual-stack reachability + IPv4/IPv6 TTL and mtr checks
 
 Notes:
 - virtio_net fabric AF_XDP bind remains unresolved and is tracked as a runtime capability issue, not a reason to keep afxdp.rs monolithic
@@ -1421,7 +1421,7 @@ Branch: `fix/userspace-phase3-session-resolution`
 - `cargo test --manifest-path userspace-dp/Cargo.toml lookup_forward_nat_across_scopes_ -- --nocapture`
 - `cargo test --manifest-path userspace-dp/Cargo.toml icmpv6_te_ -- --nocapture`
 - `cargo test --manifest-path userspace-dp/Cargo.toml authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch -- --nocapture`
-- live deploy to `loss:xpf-userspace-fw0/1`
+- live deploy to `loss:bpfrx-userspace-fw0/1`
 - live checks from `loss:cluster-userspace-host`:
   - IPv4/IPv6 internal ping
   - IPv4/IPv6 TTL=1 traceroute probes
@@ -1450,8 +1450,8 @@ Branch: `fix/userspace-phase4-queue-recycle`
 - `cargo test --manifest-path userspace-dp/Cargo.toml apply_prepared_recycle_routes_fill_and_free_explicitly -- --nocapture`
 - `cargo test --manifest-path userspace-dp/Cargo.toml icmpv6_te_ -- --nocapture`
 - `cargo test --manifest-path userspace-dp/Cargo.toml lookup_session_across_scopes_ -- --nocapture`
-- live deploy to `loss:xpf-userspace-fw0` and `loss:xpf-userspace-fw1`
-- live validation on active `xpf-userspace-fw0`:
+- live deploy to `loss:bpfrx-userspace-fw0` and `loss:bpfrx-userspace-fw1`
+- live validation on active `bpfrx-userspace-fw0`:
   - `show chassis cluster data-plane statistics`
   - `show chassis cluster data-plane interfaces`
   - `ping 172.16.80.200`
@@ -1515,7 +1515,7 @@ Branch: `fix/userspace-phase6-performance`
 ## Validation
 - source "$HOME/.cargo/env" && cargo test --manifest-path userspace-dp/Cargo.toml --no-run
 - source "$HOME/.cargo/env" && cargo test --manifest-path userspace-dp/Cargo.toml remember_prepared_recycle_tracks_only_shared_fill_recycles -- --nocapture
-- live validation on loss:xpf-userspace-fw0/1 before this commit series kept:
+- live validation on loss:bpfrx-userspace-fw0/1 before this commit series kept:
   - IPv4 TTL probe: pass
   - IPv6 TTL probe: pass
   - IPv4 mtr: pass
@@ -1691,7 +1691,7 @@ Branch: `fix/userspace-firewall-local-interrupt`
 - cargo test --manifest-path userspace-dp/Cargo.toml --no-run
 - cargo test --manifest-path userspace-dp/Cargo.toml interface_snat -- --nocapture
 - cargo test --manifest-path userspace-dp/Cargo.toml rate_limiter_refills_after_window -- --nocapture
-- live deploy to xpf-userspace-fw0/1
+- live deploy to bpfrx-userspace-fw0/1
 - fw1 as RG1 primary: iperf3 -c 2001:559:8585:80::200 -P 8 -t 60 sustained ~23.1 Gbps with no zero-throughput intervals
 - fail RG1 to fw0: local IPv4 ping works, local IPv4 iperf3 ~23.4 Gbps, local IPv6 iperf3 ~23.1 Gbps
 - restore RG1 to fw1: cluster-userspace-host transit sanity checks remained in expected range
@@ -1711,7 +1711,7 @@ Branch: `fix/userspace-firewall-local-fastpath`
 ## Validation
 - `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
 - `go test ./pkg/dataplane/userspace/...`
-- live deploy and validation on `xpf-userspace-fw0/1`
+- live deploy and validation on `bpfrx-userspace-fw0/1`
   - local IPv4 `iperf3 -c 172.16.80.200 -P 8 -t 8` sustained ~23.5 Gbps on both primaries
   - local IPv6 `iperf3 -c 2001:559:8585:80::200 -P 8 -t 8` sustained ~23.2 Gbps on both primaries
   - helper counters stayed near first-packet levels instead of tracking the full established flow
@@ -1767,7 +1767,7 @@ Branch: `fix/userspace-cross-nic-ha-perf-baseline`
 ## Validation
 - `go test ./pkg/dataplane/userspace/...`
 - `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
-- live deploys to `loss:xpf-userspace-fw0/1`
+- live deploys to `loss:bpfrx-userspace-fw0/1`
 - `./scripts/userspace-ha-validation.sh --env test/incus/loss-userspace-cluster.env`
 - `./scripts/userspace-ha-failover-validation.sh --duration 30 --parallel 4`
 - matched active-node `perf record` plus manual `iperf3` transit runs
@@ -1833,7 +1833,7 @@ The current direct path already caches `target_binding_index` when building a fo
 - `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
 - `cargo test --manifest-path userspace-dp/Cargo.toml build_live_forward_request_caches_target_binding_index -- --nocapture`
 - `cargo test --manifest-path userspace-dp/Cargo.toml build_forwarded_frame_into_keeps_ipv6_tcp_ports_after_vlan_snat -- --nocapture`
-- live deploy to `xpf-userspace-fw0/1`
+- live deploy to `bpfrx-userspace-fw0/1`
 - manual IPv4 transit samples:
   - `18.95 Gbps`
   - `19.14 Gbps`
@@ -1952,7 +1952,7 @@ Branch: `fix/userspace-worker-umem-panic`
 - expose helper-owned neighbor generation in userspace status output
 
 ## Why
-The old model depended on `xpfd` periodically pushing the kernel neighbor table into the helper. That left a cold-start hole: if the kernel already knew a neighbor like `.200` but no new neighbor event arrived after helper startup, the helper stayed blind and returned `missing_neighbor` while the kernel dataplane itself was healthy.
+The old model depended on `bpfrxd` periodically pushing the kernel neighbor table into the helper. That left a cold-start hole: if the kernel already knew a neighbor like `.200` but no new neighbor event arrived after helper startup, the helper stayed blind and returned `missing_neighbor` while the kernel dataplane itself was healthy.
 
 This change makes the helper the runtime owner of neighbor sync:
 - initial `RTM_GETNEIGH` dump at startup
@@ -2250,7 +2250,7 @@ Branch: `docs/session-sync-design`
 ## Summary
 - add a forward-looking session sync design note
 - compare keeping sync in Go vs moving it into Rust vs a hybrid model
-- recommend keeping HA/session-sync control in `xpfd` while moving producers toward event-driven delivery
+- recommend keeping HA/session-sync control in `bpfrxd` while moving producers toward event-driven delivery
 
 ## Recommendation
 - keep peer session-sync transport, readiness, barriers, and failover admission in Go
@@ -2839,7 +2839,7 @@ Move 109 functions into `daemon_ha.go` (3985 lines). `daemon.go` drops from 8221
 Closes #370
 
 ## Test plan
-- [x] `go build ./cmd/xpfd/` passes
+- [x] `go build ./cmd/bpfrxd/` passes
 - [x] `go test ./pkg/daemon/` passes
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
@@ -2856,7 +2856,7 @@ Three Go file splits — session RPCs, HA methods, NAT compilation moved to dedi
 Closes #371 #372 #373
 
 ## Test plan
-- [x] `go build ./cmd/xpfd/` passes
+- [x] `go build ./cmd/bpfrxd/` passes
 - [x] `go test ./pkg/grpcapi/ ./pkg/dataplane/userspace/ ./pkg/config/` all pass
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
@@ -2873,7 +2873,7 @@ Four Go file splits — bulk/barrier, show commands, session REST, interface com
 Closes #374 #375 #376 #377
 
 ## Test plan
-- [x] `go build ./cmd/xpfd/ ./cmd/cli/` passes
+- [x] `go build ./cmd/bpfrxd/ ./cmd/cli/` passes
 - [x] `go test ./pkg/cluster/ ./pkg/cli/ ./pkg/api/ ./pkg/dataplane/` all pass
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
@@ -3197,7 +3197,7 @@ Closes #403
 Both firewalls have full session state from continuous real-time sync. Planned failover should verify this with one barrier ack, not wait for bulk sync to complete. Bulk sync is only needed at startup/reconnect.
 
 ## Test plan
-- [x] `go build ./cmd/xpfd/` passes
+- [x] `go build ./cmd/bpfrxd/` passes
 - [x] `go test ./pkg/cluster/ ./pkg/daemon/` pass
 - [ ] Manual failover test with iperf3 during bulk sync window
 
@@ -3441,13 +3441,13 @@ Branch: `fix/440-slow-path-tun-rp-filter`
 
 ## Summary
 - `networkctl reload` resets `rp_filter` to default (2) on all interfaces, breaking locally-originated TCP/UDP via the slow-path TUN
-- Add `restoreSlowPathRPFilter()` after each networkd reload to re-set `rp_filter=0` on `xpf-usp0`
+- Add `restoreSlowPathRPFilter()` after each networkd reload to re-set `rp_filter=0` on `bpfrx-usp0`
 - Expand failover testing preflight to cover TCP connectivity (not just ICMP)
 
 ## Test plan
 - [x] `ping -c 3 1.1.1.1`: 0% loss
 - [x] TCP to 1.1.1.1:80: HTTP/1.1 301 response
-- [x] `sysctl net.ipv4.conf.xpf-usp0.rp_filter` = 0 after deploy
+- [x] `sysctl net.ipv4.conf.bpfrx-usp0.rp_filter` = 0 after deploy
 - [x] Transit traffic unaffected
 
 Fixes #440
@@ -3572,7 +3572,7 @@ Branch: `perf/separate-session-channel-phase3`
 Remaining ~12s latency is VM bridge TCP (18ms RTT, retransmissions on virtio), not control socket.
 
 ## Test plan
-- [x] Session socket created on deploy (`/run/xpf/userspace-dp-sessions.sock`)
+- [x] Session socket created on deploy (`/run/bpfrx/userspace-dp-sessions.sock`)
 - [x] Cluster healthy, all RGs on node0
 - [x] Manual failover RG1 → node1: instant success
 - [x] Manual failover RG1 → node0: instant success
@@ -3705,10 +3705,10 @@ During RG demotion on the demoting node, the kernel still briefly has interface-
 |------|--------|
 | `pkg/nftables/rst_suppress.go` | Atomic single-batch nftables install (delete + create in one `Flush`) |
 | `pkg/dataplane/userspace/manager.go` | Remove dedup check; always re-install RST rules |
-| `bpf/headers/xpf_maps.h` | New `rst_suppress_v4`/`rst_suppress_v6` hash maps |
+| `bpf/headers/bpfrx_maps.h` | New `rst_suppress_v4`/`rst_suppress_v6` hash maps |
 | `bpf/tc/tc_conntrack.c` | Drop locally-originated TCP RSTs from NAT addresses |
 | `pkg/dataplane/compiler.go` | New `compileRSTSuppression` phase populates BPF maps |
-| `pkg/dataplane/xpf*_x86_bpfel.*` | Regenerated bpf2go bindings |
+| `pkg/dataplane/bpfrx*_x86_bpfel.*` | Regenerated bpf2go bindings |
 
 ## Test plan
 
@@ -3716,7 +3716,7 @@ During RG demotion on the demoting node, the kernel still briefly has interface-
 - [x] `make build` succeeds
 - [x] `make test` passes (all 30 packages, 880+ tests)
 - [ ] `make cluster-deploy` + `make test-failover` — verify 0 stream deaths during RG failover
-- [ ] Verify nftables rules present on both nodes: `nft list table inet xpf_dp_rst`
+- [ ] Verify nftables rules present on both nodes: `nft list table inet bpfrx_dp_rst`
 - [ ] Verify BPF maps populated: `bpftool map dump name rst_suppress_v4`
 
 Fixes #450
@@ -3759,7 +3759,7 @@ Branch: `fix/456-stream-death-analysis`
 
 - Adds defense-in-depth TC egress RST suppression to prevent kernel-originated TCP RSTs from killing HA-synced sessions during RG failover
 - New `rst_suppress_v4`/`rst_suppress_v6` BPF hash maps in TC egress path, populated alongside existing nftables OUTPUT rules
-- New counter `GLOBAL_CTR_TC_RST_SUPPRESS` exposed in CLI (`show security flow statistics`), REST API, gRPC, and Prometheus (`xpf_tc_rst_suppress_total`)
+- New counter `GLOBAL_CTR_TC_RST_SUPPRESS` exposed in CLI (`show security flow statistics`), REST API, gRPC, and Prometheus (`bpfrx_tc_rst_suppress_total`)
 - New `RSTSuppressionCounters()` API reads nftables rule counters for diagnosing kernel RST suppression during failover
 
 ## Root cause analysis
@@ -3778,7 +3778,7 @@ Both layers use the same address set and fire independently, eliminating timing 
 - [ ] `make cluster-deploy` -- deploy to HA cluster
 - [ ] `make test-failover` -- verify TCP streams survive RG failover
 - [ ] After failover, check `show security flow statistics` for `TC RST suppressed` counter
-- [ ] Check Prometheus metric `xpf_tc_rst_suppress_total` 
+- [ ] Check Prometheus metric `bpfrx_tc_rst_suppress_total` 
 
 Fixes #456
 
@@ -3908,11 +3908,11 @@ Branch: `fix/473-xsk-bindings-watchdog`
 - Also repairs aliased bindings (VLAN children inheriting parent's XSK) and gates on `ctrlWasEnabled` to avoid false positives during startup when the map is expected to be empty.
 
 ## Test plan
-- [ ] `go build ./cmd/xpfd/` passes
+- [ ] `go build ./cmd/bpfrxd/` passes
 - [ ] `make cluster-deploy` to deploy to HA cluster
 - [ ] `make test-failover` to verify zero-drop failover with the watchdog active
 - [ ] `make test-ha-crash` to verify crash recovery repopulates bindings
-- [ ] Verify `journalctl -u xpfd` shows "bindings watchdog repaired stale BPF map entries" when the scenario triggers, and no false positives during normal operation
+- [ ] Verify `journalctl -u bpfrxd` shows "bindings watchdog repaired stale BPF map entries" when the scenario triggers, and no false positives during normal operation
 
 Fixes #473
 
@@ -3934,10 +3934,10 @@ Branch: `fix/475-session-recovery-failback`
 
 - [x] `cargo build --release` passes
 - [x] `cargo test` passes (435 tests, including new test for republish coverage)
-- [x] `go build ./cmd/xpfd/` passes
+- [x] `go build ./cmd/bpfrxd/` passes
 - [ ] `make test-failover` — verify TCP survives failover+failback with throughput recovery
 - [ ] `make cluster-deploy` — deploy to both HA cluster VMs
-- [ ] Verify `xpf-ha: republished N USERSPACE_SESSIONS entries` log appears in journald after failback
+- [ ] Verify `bpfrx-ha: republished N USERSPACE_SESSIONS entries` log appears in journald after failback
 
 Fixes #475
 
@@ -3988,7 +3988,7 @@ Branch: `fix/standby-neighbor-warmup`
 - Covers both global `routing-options` and per-`routing-instance` static routes (IPv4 + IPv6)
 
 ## Test plan
-- [ ] `make build` passes (verified: `CGO_ENABLED=0 go build -o /dev/null ./cmd/xpfd/`)
+- [ ] `make build` passes (verified: `CGO_ENABLED=0 go build -o /dev/null ./cmd/bpfrxd/`)
 - [ ] `make cluster-deploy` to both HA nodes
 - [ ] Verify standby node's ARP cache has WAN gateway entry (`ip neigh show dev ge-0-0-3` on standby)
 - [ ] `make test-failover` — TCP stream survives failover+failback with 0 packet loss
@@ -4064,7 +4064,7 @@ The failback triggers a new HA state transition on the peer, which tears down an
 - [x] `TestManualFailover_DifferentRGsAllowed` — concurrent failover for different RGs succeeds
 - [x] `TestManualFailover_InProgressClearedOnPreHookError` — flag is cleared on preHook failure, retry succeeds
 - [x] All existing cluster tests pass (3.6s)
-- [x] `go build ./cmd/xpfd/` clean
+- [x] `go build ./cmd/bpfrxd/` clean
 - [ ] `make test-failover` on cluster
 
 Fixes #481
@@ -4698,7 +4698,7 @@ Closes #540.
 - `go test ./pkg/cluster ./pkg/daemon`
 - deployed to `loss-userspace-cluster`
 - verified both nodes report `Transfer ready: yes`
-- restarted `xpfd` on `xpf-userspace-fw1` and confirmed the primary re-dialed session sync and the standby recovered `Transfer ready: yes` instead of staying disconnected
+- restarted `bpfrxd` on `bpfrx-userspace-fw1` and confirmed the primary re-dialed session sync and the standby recovered `Transfer ready: yes` instead of staying disconnected
 
 ---
 
@@ -4792,7 +4792,7 @@ Branch: `refactor/547-split-server`
 
 - [x] `CGO_ENABLED=0 go build ./pkg/grpcapi/` passes
 - [x] `CGO_ENABLED=0 go test ./pkg/grpcapi/ -count=1` passes
-- [x] `CGO_ENABLED=0 go build ./cmd/xpfd/` (full daemon) passes
+- [x] `CGO_ENABLED=0 go build ./cmd/bpfrxd/` (full daemon) passes
 - [ ] `make test` full suite
 
 Fixes #547
@@ -4882,7 +4882,7 @@ Branch: `fix/545-local-tunnel-fatal-errors`
 - before fix: `show chassis cluster data-plane interfaces` showed repeated `gr-0-0-0` errors on both firewalls
   - `fw1`: `read_local_tunnel:File descriptor in bad state (os error 77)`
   - `fw0`: `write_local_tunnel_delivery:Invalid argument (os error 22)`
-- after deploy: the native-GRE helper thread (`xpf-n+`) disappeared on both firewalls instead of staying alive and retrying the bad FD forever
+- after deploy: the native-GRE helper thread (`bpfrx-n+`) disappeared on both firewalls instead of staying alive and retrying the bad FD forever
 
 
 ---
@@ -4972,7 +4972,7 @@ Branch: `fix/572-standby-neighbor-prewarm`
 Fixes #572. After the stale-owner forwarding fixes, the remaining failover loss on  was promoted-node  on the first translated WAN packets. The manager had stopped doing any neighbor prewarm after the helper's first 60 seconds, so a long-idle standby could still report takeover-ready while its WAN next-hop was cold.
 
 ## Testing
-- ok  	github.com/psaab/xpf/pkg/dataplane/userspace	0.784s
+- ok  	github.com/psaab/bpfrx/pkg/dataplane/userspace	0.784s
 
 ---
 
@@ -5020,7 +5020,7 @@ Branch: `fix/579-active-userspace-validator`
 ## Validation
 - `bash -n scripts/userspace-ha-validation.sh`
 - `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env RUNS=1 DURATION=5 PARALLEL=4 PREFERRED_ACTIVE_NODE=1 PREFERRED_ACTIVE_RGS='1 2' scripts/userspace-ha-validation.sh`
-  - this now selects `loss:xpf-userspace-fw1` as the active userspace firewall and gets past the old bogus `unable to detect WAN test interface for loss:xpf-userspace-fw0` failure
+  - this now selects `loss:bpfrx-userspace-fw1` as the active userspace firewall and gets past the old bogus `unable to detect WAN test interface for loss:bpfrx-userspace-fw0` failure
 
 
 ---
@@ -5175,11 +5175,11 @@ Branch: `pr/596-rst-suppression-retry`
 
 Fixes #596
 
-This change makes userspace RST suppression install safely when the `inet xpf_dp_rst` table does not already exist, and retries failed installs on a backoff instead of caching the failure forever.
+This change makes userspace RST suppression install safely when the `inet bpfrx_dp_rst` table does not already exist, and retries failed installs on a backoff instead of caching the failure forever.
 
 Validation:
 - `go test ./pkg/nftables ./pkg/dataplane/userspace -count=1`
-- live loss deploy: verified `RST suppression: installed nftables rules via netlink` on both firewalls and verified the `inet xpf_dp_rst` table exists on fw0 after deploy
+- live loss deploy: verified `RST suppression: installed nftables rules via netlink` on both firewalls and verified the `inet bpfrx_dp_rst` table exists on fw0 after deploy
 - live failover/failback debugging before this fix showed old-owner WAN-side TCP RSTs; those RSTs no longer appeared after the install/retry fix
 
 
@@ -5286,7 +5286,7 @@ Branch: `fix/606-skip-identical-config-sync`
 ## Testing
 - `go test ./pkg/daemon -run 'TestHandleConfigSync_(RejectsWhenPrimary|AcceptsWhenSecondary|AcceptsWhenNoCluster|SkipsWhenConfigAlreadyMatchesActive)' -count=1`
 - `go test ./pkg/cluster ./pkg/daemon -count=1`
-- live on `loss`: deploy branch, restart `xpfd` on `xpf-userspace-fw1`, confirm both nodes return to `Transfer ready: yes`
+- live on `loss`: deploy branch, restart `bpfrxd` on `bpfrx-userspace-fw1`, confirm both nodes return to `Transfer ready: yes`
 - live on `loss`: standby journal shows `cluster: skipping config sync apply (config already matches active)` and does not log `restarting heartbeat after VRF rebind` for that reconnect
 
 Fixes #606
@@ -5317,6 +5317,2687 @@ Live notes:
 - the separate remaining first-failover throughput collapse is tracked in #609
 - the later VM panic remains the known kernel/driver issue in #472
 
+
+---
+
+## PR #614 — cluster: preserve committed reverse failovers through heartbeat gaps [MERGED] (merged 2026-04-08)
+
+Branch: `pr/611-reverse-failover-commit-grace`
+
+## Summary
+- preserve committed manual failovers through transient post-commit heartbeat gaps
+- keep the new primary from self-demoting while the matching session-sync barrier ack is still in flight
+- clear stale inbound transfer grace when RG ownership direction flips repeatedly
+- update the HA failover docs to require reverse-path `iperf3 -R` validation, not only host-sending tests
+
+## What changed
+- add a transfer-commit grace window that keeps the peer in `secondary-hold` briefly after commit and suppresses old-primary heartbeat reclaim during that window
+- apply the same grace handling to batch failovers
+- clear stale `peerTransferOutOverride` / `peerTransferCommitGraceUntil` markers when finalizing a peer transfer-out, so the old owner cannot re-elect itself on the next heartbeat during rapid alternating moves
+- add regression tests for:
+  - post-commit heartbeat-gap handling
+  - single-RG direction flips
+  - batch direction flips
+- document forward and reverse failover test requirements in:
+  - `docs/ha-failover-status.md`
+  - `docs/userspace-ha-validation.md`
+  - `testing-docs/failover-testing.md`
+
+## Verification
+- `go test ./pkg/cluster ./pkg/daemon -count=1`
+- `go test ./pkg/cluster -run 'TestFinalizePeerTransferOut(ClearsStaleInboundTransferGrace|BatchClearsStaleInboundTransferGrace)' -count=1`
+
+## Live validation
+- before this follow-up fix, alternating RG1 transfers could snap ownership back to the old owner a few seconds after a committed direction change
+- after this fix, the old-owner snapback is gone, but the first reverse `-P 12` failover now cleanly exposes the remaining mlx5 kernel panic on the old owner
+
+Closes #611
+Closes #612
+Closes #615
+
+Related to #613
+Related to #472
+
+
+---
+
+## PR #616 — userspace-dp: keep reverse sessions live across RG moves [MERGED] (merged 2026-04-08)
+
+Branch: `pr/613-reverse-fabric-cache-owner-rg`
+
+Fixes #613.
+
+## Summary
+- stamp cached forwarding decisions with the logical owner RG so stale fabric redirects are invalidated when that RG becomes locally active again
+- refresh demoted local sessions through current HA/fabric resolution so repeated RG moves republish reverse-path sessions with a concrete fabric redirect instead of leaving a stale local decision behind
+- keep reverse-prewarm/shared-owner indexes aligned with owner-RG demotion so failback reactivation can recover the correct session path quickly
+
+## Validation
+- `cargo test --manifest-path userspace-dp/Cargo.toml afxdp::session_glue::tests -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml afxdp::forwarding::tests -- --nocapture`
+- live HA validation artifact: `/tmp/reverse-rg2-6move-cuh-fw1ctl-20260408-111638`
+  - source host: `loss:cluster-userspace-host` (`10.0.61.102` path)
+  - command: `iperf3 -c 172.16.80.200 -P 12 -t 34 -R`
+  - six committed RG2 moves: `node0,node1,node0,node1,node0,node1`
+  - no `[SUM] 0.00 bits/sec` intervals
+  - split-RG intervals held around `3.96-4.54 Gbits/sec`
+  - failback recovered to `19.2-20.8 Gbits/sec` within about 1-2 seconds
+
+
+---
+
+## PR #617 — userspace-dp: refresh synced reverse sessions on RG demotion [MERGED] (merged 2026-04-09)
+
+Branch: `pr/617-split-rg-reverse-demotion-refresh`
+
+## Summary
+- revisit all sessions owned by a demoting RG so synced reverse companions also get HA transition refresh
+- preserve the existing origin conversion behavior for locally-owned sessions while still returning synced keys for worker-side re-resolution
+- add regressions for synced owner-RG demotion and split-RG reverse rewrite to fabric redirect
+
+## Testing
+- cargo test --manifest-path userspace-dp/Cargo.toml demote_owner_rg -- --nocapture
+- cargo test --manifest-path userspace-dp/Cargo.toml apply_worker_commands_demote_split_reverse_owner_rg_rewrites_to_fabric_redirect -- --nocapture
+
+Related: #613
+
+---
+
+## PR #618 — docs: add CoS design history summary [MERGED] (merged 2026-04-09)
+
+Branch: `pr/cos-design-steps-summary`
+
+## Summary
+Add `docs/cos-design-steps.md`, a design-history summary for how `docs/cos-traffic-shaping.md` was developed.
+
+## What it includes
+- the prompt chronology that drove each review/rewrite step
+- what each `/tmp` review artifact represented
+- the major design pivots, including the reset back to a true hierarchy
+- how those iterations led to the current CoS shaping doc
+
+## Testing
+- not run; documentation-only change
+
+
+---
+
+## PR #619 — HA: wait for local failover settle before peer demotion [MERGED] (merged 2026-04-09)
+
+Branch: `pr/536-local-failover-settle-rebased`
+
+## Summary
+- restore the previous peer RG snapshot when a requested failover aborts after local promotion, instead of leaving the peer parked in synthetic `secondary-hold`
+- wait for the target daemon to observe local promotion side effects before sending the peer-demotion commit
+- tighten userspace transfer readiness and direct announce behavior during HA handoff
+- treat interface-NAT local-delivery session decisions as HA-owned so standby cached/session-hit decisions invalidate or redirect correctly
+
+## Validation
+- `go test ./pkg/daemon ./pkg/cluster -count=1`
+- `cargo test --manifest-path userspace-dp/Cargo.toml afxdp::forwarding::tests -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml afxdp::session_glue::tests -- --nocapture`
+
+## Live Smoke
+Deployed the equivalent tree from `~/git/codex-bpfrx` to the isolated `loss` userspace HA cluster and ran:
+- `iperf3 -c 172.16.80.200 -P 12 -t 32 -R -J`
+- RG1 moves: `node1 -> node0 -> node1 -> node0`
+
+The cluster recovered healthy after all four moves, but reverse traffic still showed multi-second blackout windows with several `0.0 Gbps` intervals. Artifact:
+- `/tmp/reverse-rg1-smoke-local-20260409-145558.json`
+
+This PR is draft because that repeated reverse-failover dataplane gap is still open.
+
+
+---
+
+## PR #620 — docs: simplify CoS shaping hierarchy [MERGED] (merged 2026-04-10)
+
+Branch: `pr/cos-traffic-shaping-reservation-container`
+
+## Summary
+- rewrite the service tree as `root(interface) -> reservation -> container`
+- make the first pass explicitly FIFO per container with weighted scheduling among reservations
+- replace the abstract sharding language with a concrete many-core ownership model
+- document the phase-1 limitation that same-container micro-flow fairness is not solved yet
+
+## Testing
+- not run (documentation-only change)
+
+---
+
+## PR #621 — HA: stabilize repeated RG2 failover recovery [MERGED] (merged 2026-04-12)
+
+Branch: `pr/ha-rg2-100x10-no-exact-zero-streams`
+
+## Summary
+- keep repeated RG activation bookkeeping from getting stuck behind stale rgStateMachine epochs
+- republish and prewarm split-RG reverse sessions on owner-RG transitions in the userspace dataplane
+- validate the clean origin/master-based deploy with repeated RG2 failovers on the isolated loss userspace HA cluster
+
+## Validation
+- `GOTOOLCHAIN=local go test ./pkg/daemon -run 'TestWaitLocalFailoverCommitReadyWaitsForPromotionSettle|TestWaitLocalFailoverCommitReadyTimesOutWithoutPromotionSettle|TestRecordRGActiveAppliedIfCurrentOrStableClearsSameDesiredStaleEpoch|TestRecordRGActiveAppliedIfCurrentOrStableRejectsChangedDesiredState' -count=1`
+- `cargo test --manifest-path userspace-dp/Cargo.toml afxdp::ha::tests -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml prewarm_reverse_synced_sessions_after_demotion_recomputes_split_owner_reverse -- --nocapture`
+
+## Live HA Validation
+- clean rebooted/stabilized userspace HA boot before validation to avoid mlx/XSK guest-crash contamination
+- 4-move 10s cadence artifact: `/tmp/narrow-short-4move-10s-fg-20260410-065125`
+- 100-move 10s cadence artifact: `/tmp/narrow-long-100move-10s-fg-20260410-065357`
+- `100/100` RG2 failover requests committed successfully
+- `exact_zero_intervals=0`
+- `exact_zero_streams=0`
+- no mlx/XSK crash signatures captured on either userspace firewall console
+
+## Note
+The existing `scripts/iperf-json-metrics.py` zero counters are thresholded at `<= 50 Mbps`, not literal `0.0 bps`, so the soak still reports nonzero thresholded zero counters even though no stream hit an exact zero interval.
+
+---
+
+## PR #622 — docs: sync CoS design notes with current hierarchy [MERGED] (merged 2026-04-10)
+
+Branch: `pr/cos-doc-sync-after-cleanup`
+
+## Summary
+- sync `docs/cos-design-steps.md` with the later simplification that produced the current `root(interface) -> reservation -> container` CoS model
+- make the design-steps summary explicit about Phase 1 being FIFO-per-container and reservation-level weighted scheduling
+- clean up `docs/cos-traffic-shaping.md` so it matches the intended current wording after the earlier local merge cleanup
+
+## Notes
+- documentation-only change
+- no tests run
+
+---
+
+## PR #623 — userspace: clarify standby forwarding status [MERGED] (merged 2026-04-12)
+
+Branch: `pr/userspace-standby-role-status`
+
+## Summary
+- add an explicit local HA forwarding role line to userspace dataplane status
+- distinguish active ownership from standby armed-for-failover state
+- cover both active and standby-armed output in status formatter tests
+
+## Validation
+- go test ./pkg/dataplane/userspace -run 'TestFormatStatusSummary|TestFormatStatusSummaryReportsStandbyArmedRole|TestFormatBindings' -count=1
+- live cluster check on 2026-04-10:
+  - fw0 primary, fw1 secondary
+  - fw1 had blackhole default routes and no service IPs on data interfaces
+  - during iperf3 -c 172.16.80.200 -P 8 -t 10, fw0 dataplane counters advanced by ~19.9M RX packets while fw1 advanced by 1 RX / 1 TX packet
+  - issue was misleading status wording, not real dual transit forwarding
+
+---
+
+## PR #624 — docs: add CoS timer wheel plan [MERGED] (merged 2026-04-11)
+
+Branch: `wip/cos-timer-wheel-plan`
+
+## Summary
+- add a concrete timer-wheel design to the CoS shaping doc
+- make the timer wheel a reservation wakeup mechanism, not per-packet pacing
+- update the implementation and validation plans accordingly
+- record the timer-wheel design pivot in cos-design-steps
+
+## Details
+- parking applies to backlogged-but-ineligible reservations, not packets
+- wakeups are driven by expected root/reservation budget refill or lease-age deadlines
+- the initial sketch uses a per-shard multi-level wheel so sleeping reservations do not require busy rescans across shards
+- the many-core section stays hierarchical: the wheel serves the root/reservation/container scheduler rather than bypassing it
+
+## Validation
+- documentation-only change
+- git diff --check
+
+---
+
+## PR #626 — userspace-dp: keep UMEM bounds at registered length [MERGED] (merged 2026-04-12)
+
+Branch: `pr/umem-hugepage-registered-bounds`
+
+Fixes #625.
+
+## Summary
+- keep hugepage-backed UMEM allocation and rounded `munmap` length
+- restore `MmapArea` slice bounds to the registered UMEM length
+- add a regression test that rejects accesses into the rounded hugepage tail
+- restore the small invalid-descriptor slow-path regression to the original past-the-end semantics
+
+## Problem
+Commit `136b9dbb64754723350a7f338f62fc4af22f965a` changed `MmapArea` access bounds from the registered UMEM length to the rounded mapping length. That made descriptors in the padded hugepage tail look valid to userspace parsing helpers even though those bytes are outside the UMEM region registered with XSK.
+
+## Validation
+- cargo test --manifest-path userspace-dp/Cargo.toml mmap_area_rejects_access_beyond_registered_len_even_if_mapping_is_rounded -- --nocapture
+- cargo test --manifest-path userspace-dp/Cargo.toml maybe_reinject_slow_path_records_extract_failure_for_invalid_desc -- --nocapture
+
+---
+
+## PR #627 — refactor: split userspace manager snapshot builders [MERGED] (merged 2026-04-12)
+
+Branch: `pr/550-userspace-manager-split`
+
+Move-only first pass for #550.
+
+This extracts the pure snapshot assembly helpers from pkg/dataplane/userspace/manager.go into pkg/dataplane/userspace/snapshot.go while keeping lifecycle/control-plane entrypoints in manager.go.
+
+Scope:
+- move buildSnapshot and the snapshot helper functions into snapshot.go
+- keep behavior unchanged
+- keep the rest of manager.go focused on control flow and process lifecycle
+
+Validation:
+- go test ./pkg/dataplane/userspace -count=1
+
+---
+
+## PR #628 — refactor: split pkg/config/ast.go [MERGED] (merged 2026-04-12)
+
+Branch: `pr/553-config-ast-split`
+
+Move-only first pass for #553.
+
+This splits pkg/config/ast.go into:
+- ast_groups.go for apply-groups expansion
+- ast_edit.go for set/delete/copy/rename/insert path mutation
+- ast_format.go for hierarchical/set/JSON/XML/inheritance formatting
+
+Core types, navigation helpers, and schema completion stay in ast.go.
+
+Tests:
+- go test ./pkg/config
+
+---
+
+## PR #629 — refactor: split config parser tests by subsystem [MERGED] (merged 2026-04-12)
+
+Branch: `pr/555-parser-test-subsystem-split`
+
+Move-only first-pass split of pkg/config/parser_test.go into subsystem files per #555.
+
+Files:
+- parser_ast_test.go
+- parser_system_test.go
+- parser_security_test.go
+- parser_routing_test.go
+- parser_services_test.go
+- parser_cluster_test.go
+
+Validation:
+- go test ./pkg/config -count=1
+
+---
+
+## PR #630 — refactor: split daemon helpers by subsystem [MERGED] (merged 2026-04-12)
+
+Branch: `pr/549-daemon-system-config-split`
+
+Move-only first pass for #549.
+
+This splits pkg/daemon/daemon.go into subsystem files:
+- daemon_system.go
+- daemon_reth.go
+- daemon_neighbor.go
+- daemon_flow.go
+- daemon_nft.go
+- daemon_cluster_bind.go
+
+Behavior is unchanged. Validation:
+- go test ./pkg/daemon -count=1
+
+---
+
+## PR #631 — refactor: split pkg/cli dispatch paths [MERGED] (merged 2026-04-12)
+
+Branch: `pr/552-cli-dispatch-split`
+
+Issue #552 move-only first pass for pkg/cli/cli.go.
+
+What changed:
+- split dispatch and command-family handlers into pkg/cli/cli_dispatch.go, cli_clear.go, cli_config.go, cli_request.go, and cli_helpers.go
+- left cli_show.go and cmd/cli/main.go untouched
+- kept this as a mechanical move-only refactor with no behavior changes
+
+Validation:
+- go test ./pkg/cli -count=1
+- go test ./pkg/cli -run ^$
+
+
+---
+
+## PR #632 — refactor: split cluster sync helpers [MERGED] (merged 2026-04-12)
+
+Branch: `pr/551-cluster-sync-split`
+
+Implements the move-only first pass for #551.
+
+Changes:
+- split protocol encoding/decoding helpers into pkg/cluster/sync_protocol.go
+- split connection lifecycle and message handling into pkg/cluster/sync_conn.go
+- split manual failover request/ack/commit paths into pkg/cluster/sync_failover.go
+- left sync bulk logic and stale reconciliation in pkg/cluster/sync.go
+
+Validation:
+- go test ./pkg/cluster -count=1
+
+---
+
+## PR #633 — userspace-dp: split afxdp root module [MERGED] (merged 2026-04-12)
+
+Branch: `pr/556-afxdp-root-split`
+
+Move-only refactor for issue #556.\n\nSummary:\n- move Coordinator into userspace-dp/src/afxdp/coordinator.rs\n- move BindingWorker and worker_loop into userspace-dp/src/afxdp/worker.rs\n- move afxdp tests into userspace-dp/src/afxdp/tests.rs\n- keep userspace-dp/src/afxdp.rs as module wiring and shared top-level helpers\n\nValidation:\n- cargo test --manifest-path userspace-dp/Cargo.toml afxdp::tests -- --nocapture
+
+---
+
+## PR #634 — cli: split show commands by domain [MERGED] (merged 2026-04-12)
+
+Branch: `pr/548-cli-show-domain-split`
+
+Fixes #548.
+
+First-pass move-only split of pkg/cli/cli_show.go into domain files, keeping shared help helpers separate and leaving cmd/cli/main.go untouched. This also accounts for the open #552 shared CLI split by isolating the show-command domains without changing behavior.
+
+Tests:
+- go test ./pkg/cli -run "^$"
+- go test ./pkg/cli -count=1
+
+
+---
+
+## PR #635 — refactor: split cmd/cli/main.go by command family [MERGED] (merged 2026-04-12)
+
+Branch: `pr/554-cmd-cli-main-split`
+
+Move-only first pass for #554.
+
+Scope:
+- split cmd/cli/main.go into shared runtime plus show/request/clear/monitor files
+- keep main() and top-level wiring in main.go
+- leave ping/traceroute/load/test families in main.go for this pass
+
+Validation:
+- go test ./cmd/cli -count=1
+- go test ./pkg/cli -count=1
+
+---
+
+## PR #636 — daemon: bind RETH RA to stable link-local [MERGED] (merged 2026-04-13)
+
+Branch: `pr/ha-ra-stable-link-local-source`
+
+## Summary
+- bind RA senders on HA RETH interfaces to the stable router link-local when no explicit RA source link-local is configured
+- keep explicit configured link-local addresses taking precedence
+- stop skipping RA source-link-local selection for static RA configs when DHCP-PD is not in use
+- add daemon tests for both the stable-link-local and explicit-link-local cases
+
+## Problem
+On the `loss` userspace HA cluster, IPv6 could degrade after deploy even though policy/config looked unchanged. The active node logged repeated RA send failures like:
+
+```
+ra: failed to send RA ... fe80::bf:72ff:fe16:200%ge-0-0-1->ff02::1%ge-0-0-1: sendmsg: invalid argument
+```
+
+The root cause was that the RA sender auto-selected a transient EUI-64 link-local, while HA reconcile had already removed that address and installed the stable router link-local on the active RETH member. The sender then kept trying to transmit from an address the interface no longer owned.
+
+## Validation
+- `go test ./pkg/daemon -run 'TestBuildRAConfigsUsesStableRethLinkLocal|TestBuildRAConfigsPrefersExplicitLinkLocal|TestSelectClusterBindAddr|TestSelectClusterBindAddrSkipsLinkLocalIPv6Fallback' -count=1`
+- `go test ./pkg/daemon -count=1`
+- live deploy to `loss:bpfrx-userspace-fw0/1`
+- post-deploy `show ipv6 router-advertisement` on `fw0` now reports source `fe80::bf72:16:2%ge-0-0-1`
+- no new `ra: failed to send RA` warnings after deploy
+- `cluster-userspace-host` recovered IPv6 default route via `fe80::bf72:16:2` and successful IPv6 ping to `2607:f8b0:4005:814::200e`
+
+
+---
+
+## PR #637 — test/incus: keep isolated LAN IPv6 off the host parent [MERGED] (merged 2026-04-13)
+
+Branch: `pr/loss-host-ignore-lan-ra`
+
+## Summary
+- disable IPv6 RA/autoconf on the host-side SR-IOV LAN parent before create/deploy
+- flush any dynamic global IPv6 addresses learned on that parent
+- prevent the host from installing an on-link route to the isolated LAN and bypassing the firewall
+
+## Validation
+- `bash -n test/incus/cluster-setup.sh`
+- on `loss`, before the fix: `ip -6 route get 2001:559:8585:ef00:1266:6aff:fe0b:d017` resolved to `dev mlx1` and `ping -6` returned `Destination unreachable: Address unreachable`
+- applied the runtime equivalent on `loss`: disabled `accept_ra`/`autoconf` on `mlx1` and flushed dynamic global IPv6 state
+- after the fix on `loss`, the same route resolves via `fe80::100 dev ix0` and `ping -6 -c 5 2001:559:8585:ef00:1266:6aff:fe0b:d017` succeeds
+
+
+---
+
+## PR #638 — refactor: complete userspace manager split [MERGED] (merged 2026-04-13)
+
+Branch: `pr/finish-602-userspace-manager-split`
+
+Fixes #550
+Fixes #602
+
+## Summary
+- move userspace manager map/bootstrap/watchdog helpers into `maps_sync.go`
+- move helper lifecycle, control socket, status loop, and link-cycle handling into `process.go`
+- leave `manager.go` focused on the core manager type and public entrypoints
+
+## Testing
+- `go test ./pkg/dataplane/userspace -count=1`
+- `go test ./pkg/dataplane/userspace ./pkg/daemon -count=1`
+
+---
+
+## PR #639 — cli: follow up flow brief formatting review [MERGED] (merged 2026-04-13)
+
+Branch: `pr/cli-flow-brief-followups`
+
+Follow-up to `5aa6a110` based on review feedback.
+
+## Summary
+- guard the local brief-writer flush explicitly
+- handle empty endpoint strings defensively in brief output
+- collapse duplicated local/peer brief-row construction into one helper
+
+## Testing
+- `go test ./pkg/cli -count=1`
+
+---
+
+## PR #640 — monitor: merge userspace XSK traffic into interface view [MERGED] (merged 2026-04-13)
+
+Branch: `pr/monitor-interface-merge-userspace-xsk`
+
+## Summary
+- merge userspace/XSK RX/TX counters into monitor interface traffic totals and rates
+- keep kernel/interface error stats separate
+- add monitor regression coverage for merged summary and rate calculations
+
+## Why
+`monitor interface traffic` was rendering from interface counters only. On the userspace dataplane that misses the XSK/helper path, so 10Gbps of forwarded traffic could look mostly idle.
+
+## Validation
+- `go test ./pkg/monitoriface ./pkg/cli -count=1`
+
+
+---
+
+## PR #642 — cli: fix command help and completion prefix handling [MERGED] (merged 2026-04-13)
+
+Branch: `pr/cli-completion-prefix-audit`
+
+## Summary
+- make command-tree completion and help resolve unique prefixes in already-typed words instead of requiring exact parent tokens
+- normalize consumed config-path prefixes before schema completion so `show configuration` and config-mode completions work after abbreviated parents
+- remove the stale hardcoded gRPC config completion lists so `commit comment` and `load set` show up again
+
+## Validation
+- go test ./pkg/cmdtree ./pkg/config ./pkg/grpcapi ./pkg/cli ./cmd/cli -count=1
+
+---
+
+## PR #643 — monitor: include userspace ingress in interface traffic [MERGED] (merged 2026-04-13)
+
+Branch: `pr/monitor-interface-userspace-rx-fix`
+
+## Summary
+- merge userspace RX as well as TX into monitor interface traffic counters
+- keep per-interface delta/rate calculations aligned with the merged userspace view
+- add regressions for ingress-only and egress-only userspace rows
+
+## Validation
+- go test ./pkg/monitoriface ./pkg/cli -count=1
+
+## Root cause
+Live userspace binding stats on `loss:bpfrx-userspace-fw0` showed `ge-0-0-1` carrying the ingress side and `ge-0-0-2` carrying the egress side, while the monitor summary only folded in helper TX counters. The interface/BPF counters for those rows remained tiny, so `reth1` stayed near zero even though XSK RX was busy.
+
+
+---
+
+## PR #644 — docs: refresh vSRX parity gaps from PDFs [MERGED] (merged 2026-04-13)
+
+Branch: `pr/vsrx-gap-refresh-from-pdfs`
+
+## Summary
+- refresh the vSRX parity docs from the consolidated deployment, user, and datasheet PDFs
+- add the untracked PDF-backed gaps for JTI, AppQoE, cloud-init/bootstrap ISO, and remote-access IPsec VPN
+- broaden the Geneve row to cover the documented Geneve flow infrastructure and AWS GWLB behavior
+- tighten completeness notes for partially implemented areas, including CoS wording and existing partial-parity rows
+- sync `docs/authoritative-backlog.md` so these are no longer listed as untracked candidate gaps
+
+## Validation
+- `git diff --check`
+
+
+---
+
+## PR #646 — docs: propose explicit Twice NAT parity work [MERGED] (merged 2026-04-13)
+
+Branch: `pr/twice-nat-parity-proposal`
+
+## Summary
+- add a dedicated Twice NAT proposal doc tied to #645
+- update the stale Twice NAT gap row to reflect existing userspace merge plumbing
+- track the remaining parity/validation work in the authoritative backlog
+
+## Why
+The repo already has userspace building blocks for combined SNAT+DNAT, so the real gap is explicit support definition and end-to-end / HA validation rather than a blank implementation area.
+
+## Validation
+- `git diff --check`
+
+Closes #645 only after the actual implementation/validation work lands; this PR just captures the proposal and tracking updates.
+
+---
+
+## PR #647 — twice-nat: enforce zone-aware dnat parity [MERGED] (merged 2026-04-14)
+
+Branch: `pr/twice-nat-completeness`
+
+Fixes #645
+
+This finishes the main Twice NAT parity gaps across the supported dataplanes:
+- make static DNAT lookup zone-aware in eBPF, DPDK, and userspace
+- keep dynamic SNAT return-path DNAT entries wildcarded by zone
+- match post-DNAT SNAT against the translated destination in userspace
+- preserve both NAT legs in gRPC/session visibility and session-sync tests
+
+Validation:
+- go test ./pkg/dataplane ./pkg/conntrack ./pkg/cluster ./pkg/grpcapi ./pkg/dataplane/userspace -count=1
+- cargo test --manifest-path userspace-dp/Cargo.toml dnat_ -- --nocapture
+- cargo test --manifest-path userspace-dp/Cargo.toml post_dnat_source_nat_matches_translated_destination -- --nocapture
+
+---
+
+## PR #649 — services: tighten rpm probe config support [MERGED] (merged 2026-04-13)
+
+Branch: `pr/rpm-tightening`
+
+## Summary
+- expand the RPM schema/help tree to match the probe/test syntax the compiler already supports
+- tighten RPM compile-time validation so missing targets, unsupported probe types, and bad numeric values fail early
+- improve local and remote `show services rpm` config fallback so it shows the effective probe settings instead of a partial stub
+
+## Details
+- centralize RPM default handling on `RPMTest` helper methods and use those defaults in the runtime and operational output
+- add explicit completion coverage for the RPM subtree
+- add config tests for default behavior and validation failures
+- keep the deeper vSRX parity gaps tracked separately in #648
+
+## Validation
+- `git diff --check`
+- `go test ./pkg/config ./pkg/rpm ./pkg/cli ./pkg/grpcapi -count=1`
+
+
+---
+
+## PR #655 — services: inherit root rpm probe-limit [MERGED] (merged 2026-04-14)
+
+Branch: `pr/rpm-root-probe-limit`
+
+Fixes #142\n\nThis wires top-level services rpm { probe-limit N; } into the existing per-test RPM behavior instead of silently dropping it. Tests without an explicit probe-limit now inherit the root value, while per-test overrides still win.\n\nValidation:\n- go test ./pkg/config ./pkg/grpcapi -count=1
+
+---
+
+## PR #656 — config: reject persist-groups-inheritance [MERGED] (merged 2026-04-14)
+
+Branch: `pr/commit-persist-groups-reject`
+
+Fixes #650\n\nThis stops silently dropping system commit persist-groups-inheritance. The compiler now fails explicitly when that Junos-only knob is present, which keeps imported configs honest instead of pretending the behavior exists.\n\nValidation:\n- go test ./pkg/config -count=1
+
+---
+
+## PR #657 — config: reject unsupported flow export app-id [MERGED] (merged 2026-04-14)
+
+Branch: `pr/flow-export-appid-reject`
+
+Fixes #144
+
+This narrows flow-monitoring export-extension handling to what runtime actually supports. `flow-dir` remains supported; `app-id` is now rejected at compile time for both NetFlow v9 and IPFIX templates instead of compiling with a misleading warning.
+
+Validation:
+- go test ./pkg/config ./pkg/flowexport -count=1
+
+---
+
+## PR #658 — config: reject unsupported dns-proxy subtree [CLOSED] (closed 2026-04-14)
+
+Branch: `pr/dns-proxy-reject`
+
+Fixes #652
+
+This keeps `system services dns;` as the existing service toggle, but rejects `system services dns { dns-proxy { ... } }` explicitly so imported vSRX config cannot look supported when it is not.
+
+Validation:
+- go test ./pkg/config -count=1
+
+---
+
+## PR #659 — config: accept unsupported vSRX syntax with warnings [MERGED] (merged 2026-04-14)
+
+Branch: `pr/vsrx-syntax-noop-warnings`
+
+Fixes #650
+Fixes #652
+
+This follow-up changes the import-compatibility policy for vSRX config:
+- accept unsupported vSRX syntax as compile-time no-op state instead of rejecting it
+- emit explicit warnings so operators still see that behavior is not implemented
+
+Included in this change:
+- `system commit persist-groups-inheritance` compiles and warns instead of failing
+- `system services dns dns-proxy` compiles and warns instead of failing
+- `services flow-monitoring ... export-extension app-id` compiles and warns instead of failing
+- generic `CompileConfig()` now falls back to `node0` for `apply-groups "${node}"` and warns
+- lexer accepts the SSH/base64/comma tokens present in `vsrx.conf`
+
+Validation:
+- go test ./pkg/config -count=1
+- go test ./pkg/config -run TestCompileLocalVsrxConf -count=1 -v
+
+This supersedes the reject-based direction from #656 and #658 and aligns import behavior with the requirement that vSRX config should load even when some features are runtime no-ops.
+
+---
+
+## PR #661 — docs: add dns-proxy runtime plan [MERGED] (merged 2026-04-14)
+
+Branch: `pr/dns-proxy-runtime-plan`
+
+Refs #660
+
+Adds a detailed feature design for real firewall-side DNS proxy support, including:
+- why `systemd-resolved` is not sufficient
+- recommended runtime direction (`unbound`)
+- host resolver vs client-facing DNS proxy split
+- phased implementation plan
+- acceptance criteria and HA/runtime concerns
+
+Also links the work from `docs/authoritative-backlog.md`.
+
+Validation:
+- git diff --check
+
+---
+
+## PR #662 — cluster: gate HA transfer on protocol compatibility [MERGED] (merged 2026-04-14)
+
+Branch: `pr/ha-protocol-compat`
+
+Fixes #641
+
+## Summary
+- advertise an explicit HA protocol compatibility version in cluster heartbeat
+- gate userspace transfer readiness on HA protocol compatibility instead of software build string equality
+- keep software version strings as status/information metadata only
+- treat heartbeats from older daemons that do not advertise the field as the legacy compatibility version
+
+## Why
+Rolling upgrades were blocked by `Transfer ready: no (software version mismatch ...)` even when heartbeat/session-sync/failover wire behavior had not changed. The readiness contract should follow protocol compatibility, not build-label drift.
+
+## Implementation
+- add `HAProtocolVersion` to the optional heartbeat trailer without changing the existing heartbeat wire version byte
+- reserve space for the field during marshal so monitor truncation does not drop compatibility metadata
+- default missing peer values to `LegacyHAProtocolVersion` for backward compatibility with older heartbeats
+- surface local/peer HA protocol versions in cluster status/information output
+- switch userspace transfer readiness mismatch reporting to `ha protocol mismatch local=X peer=Y`
+
+## Validation
+- `go test ./pkg/cluster ./pkg/daemon -count=1`
+
+
+---
+
+## PR #663 — userspace-dp: add phase 1 class-of-service shaping [MERGED] (merged 2026-04-14)
+
+Branch: `pr/cos-phase1-shaper`
+
+## Summary
+- add Phase 1 `class-of-service` parsing/compiler/types for forwarding classes, schedulers, scheduler-maps, and interface shaping
+- propagate CoS config into the userspace snapshot and implement userspace egress queue selection plus shaped per-interface TX scheduling
+- update the parity docs to reflect that bpfrx now has a userspace-only Phase 1 CoS implementation rather than a fully missing feature set
+
+## Scope
+This is the documented Phase 1 cut from `docs/cos-traffic-shaping.md`:
+- userspace-only
+- egress-only
+- one shaped root per interface
+- one FIFO container per forwarding class / reservation
+- forwarding-class classification via existing firewall filter actions
+- scheduler-map driven queue selection and interface shaping
+
+This does **not** try to claim full Junos CoS parity yet:
+- no BA classifiers
+- no WRED
+- no richer Junos scheduler/drop-profile model
+- no multi-shard ownership/timer-wheel work yet
+
+## Validation
+- `go test ./pkg/config ./pkg/dataplane/userspace -count=1`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml resolve_cos_queue_id -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
+- `git diff --check`
+
+
+---
+
+## PR #664 — rename: bpfrx -> xpf across entire codebase [MERGED] (merged 2026-04-14)
+
+Branch: `pr/rename-bpfrx-to-xpf`
+
+## Summary
+- Rename the project from bpfrx to xpf throughout the entire codebase
+- Add deploy-time migration for existing VMs with old bpfrxd service
+- Add standalone migration script for manual use on deployed systems
+
+## Scope
+
+**Content replacement** (352 files, 4516 lines):
+- Go module: `github.com/psaab/bpfrx` -> `github.com/psaab/xpf`
+- Daemon binary: `bpfrxd` -> `xpfd`
+- Rust crate: `bpfrx-userspace-dp` -> `xpf-userspace-dp`
+- Config directory: `/etc/bpfrx/` -> `/etc/xpf/`
+- All code, configs, docs, tests, scripts, proto, CLAUDE.md
+
+**File renames** (44 files):
+- BPF headers: `bpfrx_*.h` -> `xpf_*.h`
+- bpf2go bindings: `bpfrx{tc,xdp}*_x86_bpfel.{go,o}` -> `xpf{tc,xdp}*`
+- Proto: `proto/bpfrx/v1/bpfrx.proto` -> `proto/xpf/v1/xpf.proto`
+- gRPC: `pkg/grpcapi/bpfrxv1/` -> `pkg/grpcapi/xpfv1/`
+- Test configs: `test/incus/bpfrx-*.conf` -> `test/incus/xpf-*.conf`
+- Systemd unit: `bpfrxd.service` -> `xpfd.service`
+- Daemon cmd: `cmd/bpfrxd/` -> `cmd/xpfd/`
+
+**Deploy migration** (automatic on next deploy):
+- `setup.sh` and `cluster-setup.sh` deploy functions now stop/disable/remove old `bpfrxd.service`, remove `/usr/local/sbin/bpfrxd`, and rename `/etc/bpfrx` -> `/etc/xpf` before installing `xpfd`
+
+**Standalone migration script** (`scripts/migrate-bpfrx-to-xpf.sh`):
+- Stops old service, cleans BPF state, removes old binaries
+- Renames config dir, networkd files, CLI history
+- Cleans up old nftables table
+- Enables new xpfd service
+
+## Validation
+- `go build ./cmd/xpfd/` compiles clean
+- `cargo check` (Rust userspace-dp) compiles clean
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #665 — build: repair native xpf generated artifacts [MERGED] (merged 2026-04-14)
+
+Branch: `pr/xpf-native-build-repair`
+
+## Summary
+- regenerate the renamed xpf protobuf bindings so native `xpfd` and `cli` no longer panic during proto init
+- regenerate the renamed eBPF objects/bpf2go bindings and fix stale `loadBpfrx...` loader references that still pointed at pre-rename symbols
+- restore a clean native xpf build/deploy path for `xpfd` and `xpf-userspace-dp`
+
+## Why
+The xpf rename left the repo in a state where freshly built binaries were not deployable:
+- generated protobuf bindings under `pkg/grpcapi/xpfv1/` were corrupted and caused immediate startup panics
+- generated eBPF objects/bindings under `pkg/dataplane/` were corrupted
+- `pkg/dataplane/loader_ebpf.go` still referenced stale `loadBpfrx...` symbols after regeneration
+
+This is the exact repair set required to make the live binary migration on `xpf-userspace-fw0/1` work with real native xpf binaries instead of wrappers.
+
+## Validation
+- `make build build-ctl`
+- `go test ./pkg/dataplane/... ./pkg/grpcapi/... -count=1`
+- `./xpfd -h`
+- `./cli -h`
+- live rollout to `xpf-userspace-fw0/1` using real native binaries:
+  - `/usr/local/sbin/xpfd`
+  - `/usr/local/sbin/xpf-userspace-dp`
+  - `/run/xpf/userspace-dp.sock`
+  - `/run/xpf/userspace-dp-sessions.sock`
+  - `/run/xpf/userspace-dp.json`
+- post-rollout cluster state healthy on both nodes with `Takeover ready: yes` and `Transfer ready: yes`
+
+
+---
+
+## PR #666 — userspace-dp: add CoS timer-wheel wakeups [MERGED] (merged 2026-04-14)
+
+Branch: `pr/cos-timer-wheel-userspace`
+
+## Summary
+- add queue-level timer-wheel deferred eligibility to the userspace CoS shaper
+- park backlogged but ineligible CoS queues instead of rescanning them every scheduler poll
+- update the CoS gap note to reflect timer-wheel wakeups in the userspace shaping path
+
+## Scope
+This is the next userspace CoS step after the Phase 1 FIFO-per-class shaper.
+
+It intentionally stays within the current queue-based runtime model:
+- userspace only
+- egress only
+- queue-level park/wake semantics
+- not the later full reservation/container hierarchy yet
+
+## What changed
+- extend `CoSInterfaceRuntime` / `CoSQueueRuntime` with runnable/parked wake state and a two-level per-interface timer wheel
+- estimate earliest eligible wake ticks from root and queue token deficits
+- advance the timer wheel on each shaped TX scheduler pass
+- park ineligible queues and wake them back into the runnable set when due
+- add focused Rust regressions for short wakes, long cascaded wakes, and wake-tick calculation
+
+## Validation
+- `cargo test --manifest-path userspace-dp/Cargo.toml timer_wheel_wakes_short_parked_queue -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml timer_wheel_cascades_long_parked_queue -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml estimate_cos_queue_wakeup_tick_uses_token_deficits -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml resolve_cos_queue_id -- --nocapture`
+
+
+---
+
+## PR #667 — userspace-dp: classify CoS queues from egress filters [MERGED] (merged 2026-04-14)
+
+Branch: `pr/cos-egress-filter-classification`
+
+## Summary
+- teach the userspace snapshot/protocol to carry per-interface output filters
+- make CoS queue selection prefer the shaped egress output filter with ingress-input fallback
+- update the CoS test recipe docs and add Go/Rust regressions
+
+## Validation
+- go test ./pkg/dataplane/userspace -count=1
+- cargo test --manifest-path userspace-dp/Cargo.toml interface_filter_assignment -- --nocapture
+- cargo test --manifest-path userspace-dp/Cargo.toml resolve_cos_queue_id_ -- --nocapture
+- cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state -- --nocapture
+- git diff --check
+
+---
+
+## PR #668 — userspace-dp: add CoS guarantee and surplus scheduling [MERGED] (merged 2026-04-14)
+
+Branch: `pr/cos-guarantee-surplus-exact`
+
+## Summary
+- carry `transmit-rate exact` from config into the userspace CoS snapshot
+- treat ordinary `transmit-rate` as a guarantee and add a surplus-borrow phase for non-`exact` queues
+- update CoS docs and feature-gap notes to match the new userspace behavior
+
+## Validation
+- `go test ./pkg/config ./pkg/dataplane/userspace -count=1`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml resolve_cos_queue_id_ -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml surplus_phase_ -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml estimate_cos_queue_wakeup_tick_ -- --nocapture`
+- `git diff --check`
+
+---
+
+## PR #669 — userspace: add CoS interface runtime observability [MERGED] (merged 2026-04-14)
+
+Branch: `pr/cos-interface-observability`
+
+## Summary
+- export worker-local CoS queue runtime into helper status snapshots
+- replace the old class-of-service filter dump with a shared local/remote formatter
+- support `show class-of-service interface [IFACE[.UNIT]]` with config plus live userspace queue state
+
+## Validation
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml resolve_cos_queue_id_ -- --nocapture`
+- `go test ./pkg/dataplane/userspace ./pkg/cli ./pkg/grpcapi ./cmd/cli -count=1`
+- `git diff --check`
+
+---
+
+## PR #670 — userspace: add CoS owner-worker handoff [MERGED] (merged 2026-04-14)
+
+Branch: `pr/cos-owner-worker-handoff`
+
+## Summary
+- add a first Phase 4 CoS slice: one static owner worker per shaped egress interface
+- hand shaped traffic from non-owner workers to the owner before CoS queue admission
+- update CoS docs/gap notes to reflect the implemented owner-worker model
+
+## Details
+This does not attempt full many-core leasing yet. It implements the first concrete step from the CoS plan:
+- the coordinator derives an owner worker for each shaped egress interface from the TX binding map
+- non-owner workers redirect shaped `TxRequest`s to that owner worker
+- prepared shaped frames on a non-owner worker are copied back into a local `TxRequest`, redirected, and the original prepared frame is recycled locally
+- owner workers enqueue the handed-off traffic into the existing CoS queueing/scheduling path
+
+## Validation
+- `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_owner_worker_by_ifindex_prefers_lowest_worker_with_tx_binding -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml redirect_local_cos_request_to_owner_pushes_worker_command -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue -- --nocapture`
+- `go test ./pkg/dataplane/userspace ./pkg/cli ./pkg/grpcapi ./cmd/cli -count=1`
+- `git diff --check`
+
+
+---
+
+## PR #671 — userspace: spread static CoS owners across workers [MERGED] (merged 2026-04-14)
+
+Branch: `pr/cos-owner-spread-status`
+
+## Summary
+- spread static CoS interface ownership across eligible workers on the same TX path
+- expose the chosen owner worker in `show class-of-service interface`
+- update the CoS docs/gap note to reflect the stronger static ownership model
+
+## Details
+This is still the static-ownership part of Phase 4, not shared-budget leasing.
+
+The coordinator now assigns shaped egress interfaces deterministically across the workers that can transmit on the resolved TX binding, instead of always pinning every such interface to the lowest worker. That keeps one owner per shaped interface, but avoids piling every shaped interface on the same worker when several share the same TX path.
+
+The merged CoS runtime status now includes `owner_worker_id`, and the CLI summary shows it so the static ownership decision is visible during testing.
+
+## Validation
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_owner_worker_by_ifindex_ -- --nocapture`
+- `go test ./pkg/dataplane/userspace ./pkg/cli ./pkg/grpcapi ./cmd/cli -count=1`
+- `git diff --check`
+
+
+---
+
+## PR #672 — cos: add userspace dscp classifier attachment [MERGED] (merged 2026-04-14)
+
+Branch: `pr/cos-dscp-classifiers`
+
+## Summary
+- add `class-of-service classifiers dscp ...` parsing plus interface `classifiers dscp <name>` attachment
+- carry DSCP classifier definitions through the userspace snapshot/runtime and use them as a fallback CoS queue selector when filters do not set a forwarding class
+- accept decimal CoS bandwidth syntax used by live configs such as `10.0g` and `12.5g`, and keep interface-only CoS configs from being dropped from the snapshot
+- tighten CoS exact-budget handling on shared TX paths and fix userspace firewall-filter observability for `show firewall filter ... family inet6`
+
+## Validation
+- `go test ./pkg/config ./pkg/dataplane/userspace ./pkg/cli ./pkg/grpcapi ./cmd/cli -count=1`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml resolve_cos_queue_id_ -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml interface_output_filter_counted_records_term_hits -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml redirect_local_cos_request_to_owner_binding_pushes_owner_live_queue -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids -- --nocapture`
+- `git diff --check`
+
+## Live Validation
+- binary-only rollout to `xpf-userspace-fw0/1` on build `userspace-forwarding-ok-20260402-bfb00432-472-g097d57c5` to preserve the live CoS test config
+- `show firewall filter bandwidth-output family inet6` now resolves the real `inet6` filter instead of the `inet` filter with the same name
+- after a 5s IPv6 `iperf3 -c 2001:559:8585:80::200 -p 5201 -P 4 -t 5`, term `0` reported `179327 packets, 271465458 bytes`
+- HA remained healthy during the skewed rollout and after both nodes converged on the same build
+
+## Scope Notes
+- userspace-only
+- DSCP classifiers act as a fallback after explicit firewall filter `then forwarding-class ...` decisions
+- `loss-priority` on CoS DSCP classifiers is accepted for syntax compatibility but is not enforced yet
+- 802.1p BA classifiers are still not implemented
+- this PR now includes validation-driven follow-up fixes discovered while exercising the DSCP classifier path: decimal CoS bandwidth parsing, exact-budget centralization on shared TX paths, and userspace firewall-filter counter/family fixes
+
+
+---
+
+## PR #673 — cos: add userspace 802.1p classifiers [MERGED] (merged 2026-04-14)
+
+Branch: `pr/cos-8021p-classifiers`
+
+## Summary
+- add `class-of-service classifiers ieee-802.1 ...` parsing, compiler support, and unit attachment
+- preserve ingress VLAN PCP and explicit VLAN-header presence through XDP metadata and use the attached 802.1p classifier as a CoS queue-selection fallback in the userspace dataplane
+- surface the classifier in userspace CoS observability and update the CoS docs / feature-gap notes
+
+## Scope
+- userspace dataplane only
+- DSCP / firewall filter forwarding-class still take precedence over 802.1p fallback classification
+- 802.1p fallback applies only to tagged ingress traffic; untagged packets do not implicitly match PCP 0
+- priority-tagged frames (VID 0) retain VLAN-header presence and remain eligible for 802.1p fallback classification
+- `loss-priority` is still syntax-only and not enforced yet
+- 802.1p rewrite / remarking is not implemented in this change
+
+## Validation
+- `go generate ./pkg/dataplane/...`
+- `go test ./pkg/config ./pkg/dataplane/userspace ./pkg/cli ./pkg/grpcapi ./cmd/cli -count=1`
+- `cargo test --manifest-path userspace-dp/Cargo.toml ieee8021_classifier -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids -- --nocapture`
+- `git diff --check`
+
+
+---
+
+## PR #674 — cos: add userspace dscp rewrite-rules [MERGED] (merged 2026-04-15)
+
+Branch: `pr/cos-dscp-rewrite-rules`
+
+## Summary
+- add `class-of-service rewrite-rules dscp ...` parsing and userspace snapshot support
+- attach DSCP rewrite-rules on shaped userspace egress interfaces and map them onto CoS queues by forwarding-class
+- apply queue-level DSCP rewrite as a fallback behind explicit firewall-filter DSCP rewrite actions
+- update CoS docs and feature-gap status for userspace DSCP rewrite-rule support
+
+## Validation
+- `go test ./pkg/config ./pkg/dataplane/userspace ./pkg/cli ./pkg/grpcapi ./cmd/cli -count=1`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml resolve_cos_ -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml apply_dscp_rewrite_to_ -- --nocapture`
+- `git diff --check`
+
+
+---
+
+## PR #676 — cos: finish userspace phase 3 scheduling [MERGED] (merged 2026-04-15)
+
+Branch: `pr/cos-phase3-fairness`
+
+## Summary
+- bound guarantee-phase service to a per-visit CIR quantum instead of draining an entire queue turn
+- add explicit regressions for guarantee rotation, strict surplus priority, and same-priority weighted sharing
+- refresh the CoS implementation docs/status to mark Phase 3 complete in the userspace path
+
+## Validation
+- `cargo test --manifest-path userspace-dp/Cargo.toml guarantee_phase_limits_service_to_visit_quantum -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml guarantee_phase_rotates_between_backlogged_queues -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml surplus_phase_ -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state -- --nocapture`
+- `git diff --check`
+
+---
+
+## PR #677 — cos: complete phase 4 userspace leasing [MERGED] (merged 2026-04-15)
+
+Branch: `pr/cos-phase4-leasing`
+
+## Summary
+- complete the current userspace Phase 4 CoS slice with deterministic queue ownership across eligible workers
+- add shared root-budget leasing so shaped interfaces can safely share bandwidth across queue owners
+- fix the userspace XDP metadata layout drift that broke forwarding after the queue-owner/lease work landed
+- surface queue-level owner worker information in CoS status and update the CoS docs/gap text to mark Phase 4 complete for userspace
+
+## Details
+- replace interface-level CoS owner maps with `(egress_ifindex, queue_id)` ownership maps
+- build shared root lease state per shaped interface and hand it to workers through the coordinator
+- redirect shaped packets to the owning worker before local owner-binding enqueue so same-worker binding redirects do not bypass CoS ownership
+- release unused root lease credit on reload, drain, and empty-queue transitions
+- expose queue owner worker IDs in the userspace status schema and CLI formatter
+- restore `UserspaceDpMeta` layout compatibility between `userspace-xdp` and `xpf-userspace-dp` by reintroducing VLAN-presence/PCP fields and adding compile-time size/offset assertions on both sides of the wire format
+
+## Validation
+- `cargo test --manifest-path userspace-dp/Cargo.toml shared_cos_root_lease_ -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_shared_cos_root_leases_ -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml guarantee_phase_limits_service_to_visit_quantum -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml guarantee_phase_rotates_between_backlogged_queues -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_owner_worker_by_queue_ -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml redirect_local_cos_request_to_owner_ -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
+- `cargo +nightly build --release` in `userspace-xdp`
+- `bash pkg/dataplane/build-userspace-xdp.sh`
+- `make build build-userspace-dp`
+- `go test ./pkg/dataplane/userspace ./pkg/cli ./pkg/grpcapi ./cmd/cli -count=1`
+- `git diff --check`
+- clean binary-only rollout of exact PR head `47cd9891` to `xpf-userspace-fw0/1`
+- live forwarding validation from `cluster-userspace-host`:
+  - IPv4 ping to `172.16.80.200`: `3/3`
+  - IPv6 ping to `2001:559:8585:80::200`: `3/3`
+  - IPv4 `iperf3 -t 5 -P 2`: about `449 Mbit/s` sender / `440 Mbit/s` receiver
+  - IPv6 `iperf3 -t 5 -P 2`: about `568 Mbit/s` sender / `558 Mbit/s` receiver
+
+
+---
+
+## PR #679 — userspace-dp: cut hot-path CPU overhead [MERGED] (merged 2026-04-16)
+
+Branch: `pr/userspace-perf-hotpath-cuts`
+
+## Summary
+
+This PR cuts the hot-path CPU overhead that showed up after the recent userspace dataplane CoS work and restores the no-CoS fast path to the expected throughput band.
+
+It includes:
+
+- hot-path filter lookup and match reductions
+- precomputed ingress logical-interface lookup
+- reduced TX-selection work when CoS / filter state cannot affect the packet
+- lower-overhead pending-forward request handling
+- smaller flow-cache fallback overhead by reusing precomputed `expected_ports` and `target_binding_index`
+- exact CoS queue correctness hardening: when an exact queue first falls back to a local item, already-queued prepared items are demoted to local and their TX frames are recycled immediately
+- an engineering note in `docs/userspace-dataplane-perf-hotspots.md`
+
+Remaining perf tail work is tracked separately in `#678`.
+
+## Validation
+
+Local:
+
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_live_forward_request_from_frame_uses_precomputed_hints -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml demote_prepared_cos_queue_to_local_ -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml cos_queue_accepts_prepared_ -- --nocapture`
+- `make build-userspace-dp`
+- `git diff --check`
+
+Live on the `loss` userspace HA cluster with helper-only rollouts preserving `/etc/xpf/xpf.conf` and `/etc/xpf/.configdb`:
+
+- `./scripts/userspace-perf-compare.sh --duration 8 --parallel 12`
+- IPv4: `23.02 Gbps`
+- IPv6: `22.77 Gbps`
+- helper hash on `xpf-userspace-fw0/1`: `8ec95142d5093be59558a035947f71b2dbb2301fff8f724d6234c7361582f88c`
+- `iperf3 -c 2001:559:8585:80::200 -t 20 -P 12 -p 5202`
+- exact `5202` queue completed cleanly at `9.45 Gbits/sec`; the earlier zero-throughput hang is fixed, but throughput is still capped well below the desired `10g exact` target
+
+Representative remaining hot symbols after the perf slice:
+
+- IPv4: `poll_binding` ~13.4%, `enqueue_pending_forwards` ~4.3%
+- IPv6: `poll_binding` ~13.3%, `enqueue_pending_forwards` ~3.7%, `apply_nat_ipv6` ~3.2%
+
+Remaining exact-queue work is architectural rather than another small fast-path tweak: the current exact queue service still behaves like a single-owner / single-frame-pool design.
+
+
+---
+
+## PR #682 — userspace-dp: share exact CoS queues across workers [MERGED] (merged 2026-04-16)
+
+Branch: `pr/cos-shared-exact-queue-service`
+
+## Summary
+
+This implements the core architecture from #680.
+
+The exact CoS queue path no longer collapses into single-owner execution when multiple eligible workers already have a valid local TX path for the shaped egress interface.
+
+The implementation does three things together:
+
+- introduces authoritative shared exact-queue lease state per egress interface and queue id
+- keeps exact queue execution on the local worker when that worker already has a valid TX path
+- derives default exact queue burst from the scheduler rate instead of inheriting the root shaper burst directly
+
+The result is that exact queue service is now sharded across eligible workers instead of being funneled through one logical owner / frame pool.
+
+## What Changed
+
+- added `SharedCoSQueueLease` and coordinator plumbing for exact queues
+- compute active shard counts per shaped egress interface and build shared queue/root leases from that view
+- allow exact queues to execute locally on workers with a valid TX path instead of cross-worker redirecting by default
+- keep non-exact queue behavior on the existing local-token model
+- start exact queue runtimes with zero local tokens and top them up from the shared queue lease
+- return unused exact queue credit when queues drain or bindings refresh
+- derive default exact queue burst from the queue scheduler rate, capped by the root burst
+
+## Correctness Notes
+
+- root shaping remains shared
+- exact queue shaping is now also shared and authoritative across eligible workers
+- the existing mixed exact queue demotion safety belt from `a736d010` remains in place
+- this does **not** try to solve the separate best-effort / exact enforcement semantics tracked in #681
+
+## Validation
+
+### Local
+
+```bash
+cargo fmt --manifest-path userspace-dp/Cargo.toml
+cargo test --manifest-path userspace-dp/Cargo.toml shared_cos_queue_lease_bounds_total_outstanding_credit -- --nocapture
+cargo test --manifest-path userspace-dp/Cargo.toml build_shared_cos_queue_leases_only_tracks_exact_queues -- --nocapture
+cargo test --manifest-path userspace-dp/Cargo.toml build_shared_cos_queue_leases_reuses_existing_matching_lease_arc -- --nocapture
+cargo test --manifest-path userspace-dp/Cargo.toml refresh_cos_owner_worker_map_from_binding_statuses_keeps_shared_arcs_when_unchanged -- --nocapture
+cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state_derives_default_exact_queue_burst_from_scheduler_rate -- --nocapture
+cargo test --manifest-path userspace-dp/Cargo.toml redirect_local_cos_request_to_owner_keeps_exact_queue_on_eligible_worker -- --nocapture
+cargo test --manifest-path userspace-dp/Cargo.toml maybe_top_up_cos_queue_lease_unblocks_large_frame_exceeding_lease_bytes -- --nocapture
+cargo test --manifest-path userspace-dp/Cargo.toml build_cos_owner_worker_by_queue_ -- --nocapture
+cargo test --manifest-path userspace-dp/Cargo.toml guarantee_phase_ -- --nocapture
+cargo test --manifest-path userspace-dp/Cargo.toml --no-run
+git diff --check
+```
+
+
+*(truncated — 82 lines total)*
+
+
+---
+
+## PR #684 — userspace-dp: flatten exact CoS hot path [MERGED] (merged 2026-04-16)
+
+Branch: `pr/cos-exact-hotpath-flatten`
+
+## Summary
+- replace mutex-backed shared exact CoS lease state with packed atomic lease state
+- publish worker-local flattened CoS fast-path metadata for queue owner/live/root lease lookups
+- rewire exact CoS redirect, scheduler, and shaped-worker enqueue paths to use the flattened metadata instead of tree lookups
+- preserve explicit queue-id semantics by treating an explicit queue miss as a miss, not a default-queue fallback
+
+## Validation
+- cargo test --manifest-path userspace-dp/Cargo.toml --no-run
+- cargo test --manifest-path userspace-dp/Cargo.toml shared_cos_root_lease_ -- --nocapture
+- cargo test --manifest-path userspace-dp/Cargo.toml redirect_local_cos_request_to_owner_ -- --nocapture
+- cargo test --manifest-path userspace-dp/Cargo.toml build_worker_cos_fast_interfaces_flattens_owner_and_lease_state -- --nocapture
+- cargo test --manifest-path userspace-dp/Cargo.toml maybe_top_up_cos_queue_lease_unblocks_local_exact_queue_without_tokens -- --nocapture
+- cargo test --manifest-path userspace-dp/Cargo.toml shared_exact_queue_lease_uses_ -- --nocapture
+- cargo fmt --manifest-path userspace-dp/Cargo.toml
+- git diff --check
+
+Closes #683
+
+---
+
+## PR #686 — userspace-dp: make exact CoS queue enforcement authoritative [MERGED] (merged 2026-04-16)
+
+Branch: `pr/cos-exact-enforcement`
+
+## Summary
+- derive default exact queue burst from the scheduler queue rate instead of inheriting the parent interface shaper burst
+- stop exact queues from silently falling back to local per-runtime token refill when the shared queue lease is unavailable
+- add focused regressions for scheduler-rate-derived exact burst sizing and for exact queues refusing local refill without a shared lease
+
+Closes #681.
+
+## Why
+The old behavior had two semantic problems:
+- an exact queue with no explicit buffer inherited the interface shaper burst, which let a low-rate exact queue start with a budget sized for the much larger parent shaper
+- exact queue service could still degrade into local refill if the shared lease was absent, which breaks the idea that exact queue rate is authoritative and shared
+
+This slice makes the queue contract tighter:
+- exact queue default burst now tracks queue rate
+- exact queue refill is authoritative through the shared queue lease path only
+
+## Files
+- `userspace-dp/src/afxdp/forwarding_build.rs`
+- `userspace-dp/src/afxdp/tx.rs`
+
+## Focused tests
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state_derives_exact_queue_default_burst_from_queue_rate -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml exact_queue_without_shared_lease_does_not_locally_refill -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml maybe_top_up_cos_queue_lease_unblocks_local_exact_queue_without_tokens -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml build_cos_state -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml shared_cos_queue_lease_ -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml redirect_local_cos_request_to_owner_keeps_exact_queue_on_eligible_worker -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
+- `cargo fmt --manifest-path userspace-dp/Cargo.toml`
+- `git diff --check`
+
+## Live rollout
+Helper-only rollout to the isolated loss userspace HA cluster:
+- deployed `/usr/local/sbin/xpf-userspace-dp` only
+- preserved `/etc/xpf/xpf.conf`
+- preserved `/etc/xpf/.configdb`
+- restarted secondary first, then primary
+- deployed helper SHA: `d4c9306c14688dc1f62379c0d2709a3713475635eda632cd47fa332b4704a676`
+
+## Live validation
+Configured CoS contract on `reth0.80`:
+- `5201` -> `iperf-a` -> `1g exact`
+- `5202` -> `iperf-b` -> `10g exact`
+- `5203` -> `best-effort` -> `100m exact`
+
+Runtime CoS state after rollout:
+- queue 0 buffer: `122.07 KiB` at `100 Mb/s`
+- queue 4 buffer: `1.19 MiB` at `1 Gb/s`
+- queue 5 buffer: `11.92 MiB` at `10 Gb/s`
+
+
+*(truncated — 84 lines total)*
+
+
+---
+
+## PR #687 — userspace-dp: drain exact CoS queues directly [MERGED] (merged 2026-04-16)
+
+Branch: `pr/cos-direct-exact-drain`
+
+## Summary
+- fix #685 by bypassing transient `CoSBatch` materialization for exact guarantee queues
+- drain exact local/prepared queue heads directly into the existing TX scratch vectors and submit from scratch
+- restore only the unsent tail back to the CoS queue head after partial ring insertion instead of rebuilding a batch container
+- fix the direct prepared-path drop case so invalid/oversized prepared frames are recycled immediately instead of being lost
+
+## Code
+- `userspace-dp/src/afxdp/tx.rs`
+  - split exact guarantee selection from the non-exact batch path
+  - added direct exact local/prepared queue service helpers
+  - kept non-exact/surplus service on the existing `CoSBatch` path
+  - added regressions for exact scratch drain ordering and prepared-drop recycle behavior
+
+## Validation
+### Rust
+- `cargo test --manifest-path /tmp/xpf-685/userspace-dp/Cargo.toml drain_exact_ -- --nocapture`
+- `cargo test --manifest-path /tmp/xpf-685/userspace-dp/Cargo.toml settle_exact_ -- --nocapture`
+- `cargo test --manifest-path /tmp/xpf-685/userspace-dp/Cargo.toml maybe_top_up_cos_queue_lease_ -- --nocapture`
+- `cargo test --manifest-path /tmp/xpf-685/userspace-dp/Cargo.toml exact_queue_without_shared_lease_ -- --nocapture`
+- `cargo test --manifest-path /tmp/xpf-685/userspace-dp/Cargo.toml prepared_cos_request_stays_on_current_tx_binding_ -- --nocapture`
+- `cargo test --manifest-path /tmp/xpf-685/userspace-dp/Cargo.toml build_cos_state -- --nocapture`
+- `cargo test --manifest-path /tmp/xpf-685/userspace-dp/Cargo.toml guarantee_phase_ -- --nocapture`
+- `cargo test --manifest-path /tmp/xpf-685/userspace-dp/Cargo.toml --no-run`
+- `cargo fmt --manifest-path /tmp/xpf-685/userspace-dp/Cargo.toml`
+- `git -C /tmp/xpf-685 diff --check`
+- `make -C /tmp/xpf-685 build-userspace-dp`
+
+### Helper-only rollout
+- rolled `/tmp/xpf-685/xpf-userspace-dp` to `loss:xpf-userspace-fw1` then `loss:xpf-userspace-fw0`
+- preserved `/etc/xpf/xpf.conf`
+- preserved `/etc/xpf/.configdb`
+- deployed helper sha256: `aa9df922439e93405824530ba5b45469bd62cc7e7815a4793de6f0ffd8ebacde`
+- HA recovered cleanly with `Takeover ready: yes` / `Transfer ready: yes`
+
+### Live CoS validation
+Two separate agents ran the IPv4 and IPv6 `iperf3` matrices and only reported findings back to the coordinator.
+
+IPv4 agent:
+- `5201` exact 1G: `962 / 955 Mbit/s`, `86` retransmits
+- `5202` exact 10G: `9.57 / 9.54 Gbit/s`, `550` retransmits
+- `5203` best-effort 100M short: `96.3 / 95.3 Mbit/s`, `28` retransmits
+
+IPv6 agent:
+- `5201` exact 1G: `949 / 942 Mbit/s`, `86` retransmits
+- `5202` exact 10G: `9.41 / 9.39 Gbit/s`, `25842` retransmits
+
+Note on the low 30s `5203` runs from the parallel matrix: they overlapped cross-family best-effort traffic. A coordinator follow-up running IPv4 `5203` and IPv6 `5203` together held about `48.0 + 47.3 = 95.3 Mbit/s` aggregate, which is consistent with a shared `100m exact` best-effort queue budget rather than a rate-enforcement miss.
+
+### Coordinator-side perf on exact path
+Serial perf captures on the active firewall during `5202` runs:
+
+*(truncated — 68 lines total)*
+
+
+---
+
+## PR #692 — userspace-dp: add fair service for low-rate exact CoS queues [MERGED] (merged 2026-04-16)
+
+Branch: `pr/cos-5201-flow-fairness`
+
+## Summary
+- add hashed per-flow round-robin service for low-rate owner-local exact CoS queues
+- keep the earlier per-flow backlog admission guard, but stop treating the queue as a single FIFO once packets are admitted
+- leave the high-rate shared exact path unchanged so `5202` stays on the existing fast path
+
+## Root Cause
+`5201` was still using a single FIFO inside the low-rate exact queue. Even after fixing rate enforcement and owner-local placement, one flow could occupy the head of the queue for too long and the rest of the TCP fanout would only see tail-drop fairness, not service fairness.
+
+That showed up live as:
+- IPv4 `5201`: `1.019 / 1.015 Gbit/s`, retrans `88549`, per-stream `min/max/avg 0.032/0.235/0.085`, ratio `7.283`
+
+The correct fix was not another token tweak. The queue discipline itself needed to become flow-aware on the low-rate owner-local exact path.
+
+## Implementation
+- extend `CoSQueueRuntime` with hashed flow buckets and a round-robin bucket ring
+- use the existing flow key to map packets into per-flow buckets
+- preserve FIFO inside each flow bucket
+- dequeue low-rate exact work in bucket round-robin order
+- keep the flow-share admission guard so one bucket cannot consume the whole queue backlog
+- keep high-rate shared exact queues on the existing queue structure and fast path
+- update reset/status/demotion paths so they operate correctly on both FIFO and fair-bucket queues
+
+## Validation
+Unit / build:
+- `cargo test --manifest-path userspace-dp/Cargo.toml flow_fair_queue_round_robins_distinct_local_flows -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml flow_fair_queue_round_robins_distinct_prepared_flows -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml flow_fair_exact_queue_limits_dominant_flow_share -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml cos_queue_push_and_pop_track_flow_bucket_bytes -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml drain_exact_local_items_to_scratch_stops_before_prepared_tail -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
+- `cargo fmt --manifest-path userspace-dp/Cargo.toml`
+- `git diff --check`
+- `make build-userspace-dp`
+
+Live rollout:
+- helper-only rollout to `xpf-userspace-fw1` then `xpf-userspace-fw0`
+- config preserved on both nodes
+- helper SHA `b1e2d993ec10c4c44c8f0536f4adaff392816ce1d1e07d2044a71a7597c44431`
+
+Live port matrix:
+- IPv4 `5201`: `1.036 / 1.034 Gbit/s`, retrans `148560`, per-stream `min/max/avg 0.050/0.103/0.086`, ratio `2.057`
+- IPv4 `5202`: `9.533 / 9.518 Gbit/s`, retrans `43012`
+- IPv4 `5203`: `0.103 / 0.103 Gbit/s`, retrans `14416`
+- IPv6 `5201` repeat: `1.042 / 1.041 Gbit/s`, retrans `213359`, per-stream `min/max/avg 0.073/0.098/0.087`, ratio `1.34`
+- IPv6 `5202`: `9.388 / 9.372 Gbit/s`, retrans `68831`
+- IPv6 `5203`: `0.098 / 0.098 Gbit/s`, retrans `7356`
+
+Perf samples after the slice:
+- IPv4 `5201`: `worker_loop 24.37%`, `poll_binding 13.31%`, `drain_pending_tx 2.23%`
+- IPv4 `5202`: `memmove 14.54%`, `drain_pending_tx 11.41%`, `poll_binding 9.36%`, `drain_shaped_tx 4.06%`
+
+*(truncated — 56 lines total)*
+
+
+---
+
+## PR #695 — userspace-dp: cut exact drain request movement [MERGED] (merged 2026-04-16)
+
+Branch: `pr/cos-exact-zero-move-drain`
+
+## Summary
+- remove transient request reshaping from exact CoS direct service by draining exact local/prepared queues straight into dedicated TX scratch descriptors
+- commit exact FIFO queue progress only after TX ring submission and restore only the unsent tail, instead of materializing and rebuilding queue batches
+- keep the low-rate flow-fair exact path unchanged and leave the rejected empty-ingest micro-cut out of this PR because it regressed live behavior
+
+## Validation
+- `cargo test --manifest-path userspace-dp/Cargo.toml exact_ -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
+- `cargo fmt --manifest-path userspace-dp/Cargo.toml`
+- `git diff --check`
+- `make build-userspace-dp`
+- helper-only rollout with `scripts/userspace-helper-rollout.sh`, preserving `/etc/xpf/xpf.conf` and `/etc/xpf/.configdb`
+
+## Live CoS checks on helper `45c3f170b41d43209f13dd10ef753ec0b831489ed92688147724929b52542ff4`
+- IPv4 `5201`: `1.112 / 1.105 Gbit/s`
+- IPv4 `5202`: `9.565 / 9.543 Gbit/s`
+- IPv4 `5203`: `0.097 / 0.095 Gbit/s`
+- IPv6 `5201`: `1.024 / 1.019 Gbit/s`
+- IPv6 `5202`: `9.385 / 9.363 Gbit/s`
+- IPv6 `5203`: `0.095 / 0.094 Gbit/s`
+- IPv6 `5201` repeat 30s: `1.016 / 1.014 Gbit/s`
+
+## Perf on active firewall (`5202`, `-P 12`, `20s`)
+Before this slice (`#688` baseline):
+- IPv4: `drain_pending_tx 27.33%`, `memmove 13.47%`, `poll_binding 8.20%`
+- IPv6: `memmove 16.33%`, `drain_pending_tx 11.54%`, `poll_binding 9.32%`
+
+With this PR helper:
+- IPv4: `drain_pending_tx 22.70%`, `memmove 14.54%`, `poll_binding 8.40%`
+- IPv6: `drain_pending_tx 27.35%`, `memmove 11.44%`, `poll_binding 8.52%`
+
+Interpretation:
+- this slice removes exact-drain request movement and reduces the combined exact-path request-management tail on IPv4
+- IPv6 remains dominated by `drain_pending_tx`, but the remaining `memmove` now looks more like packet-byte copy than queue-structure churn
+- the follow-on empty-ingest fast-path experiment was tested live and rejected because it worsened the exact path and made low-rate fairness noisier
+
+Closes #688
+
+
+---
+
+## PR #696 — userspace-dp: pin shared-exact threshold policy with unit tests [MERGED] (merged 2026-04-16)
+
+Branch: `pr/cos-shared-exact-threshold-tests`
+
+## Summary
+- document what the low-rate-exact single-owner threshold is and why the constants have the values they have
+- add six boundary unit tests for `queue_uses_shared_exact_service` covering the exact 10g-iface config from the live loss HA CoS lab
+- pin the current 100g-iface behavior as a known rough edge (shaping_rate/4 dominates MIN and mis-classifies genuinely high-rate queues) so a future policy fix is explicit rather than silent
+
+## Motivation
+Issue #690's required change (route low-rate exact queues to a single owner worker) is implemented by `queue_uses_shared_exact_service` at `userspace-dp/src/afxdp/worker.rs:1461`. The predicate is correct for the current 10g lab:
+- `100m exact` / `1g exact` → single owner (below the 2.5g MIN floor)
+- `10g exact` → shared
+
+Live 5201 fairness on the deployed helper (SHA `45c3f170…`, matches master):
+- IPv4 12-flow 30s: `1.123 / 1.119 Gbit/s`, ratio `1.41`
+- IPv6 12-flow 30s: `1.012 / 1.009 Gbit/s`, ratio `1.40`
+
+Both meet #690's stated acceptance criteria. The residual imperfection is SFQ hash-bucket collisions (tracked separately in #693), not a single-owner routing problem.
+
+What was missing was explicit regression coverage for the predicate itself. The only existing asserts are inside `build_worker_cos_fast_interfaces_flattens_owner_and_lease_state`, which tests the whole flat-path assembly. A future perf or refactor slice that tweaks the threshold could flip classification for `5201` or `5202` without a single focused test firing.
+
+## What this PR does
+- **Expanded rustdoc** on `queue_uses_shared_exact_service`:
+  - describes the two threshold components (absolute per-worker capacity floor, and the iface-rate-relative term)
+  - explains the 2.5 Gbps MIN as an empirical single-worker exact throughput ceiling tied to PR #680's throughput-collapse investigation
+  - calls out the high-iface rough edge
+- **Six unit tests**:
+  - `queue_uses_shared_exact_service_rejects_non_exact_queue`
+  - `queue_uses_shared_exact_service_10g_iface_pins_5201_config_policy` — asserts the exact loss HA lab shape (best-effort / iperf-a single-owner, iperf-b shared)
+  - `queue_uses_shared_exact_service_10g_iface_threshold_is_exactly_inclusive` — byte-precise boundary; guards against off-by-one drift
+  - `queue_uses_shared_exact_service_slow_iface_absolute_floor_applies` — documents the 1g-iface case where MIN dominates
+  - `queue_uses_shared_exact_service_high_iface_rate_keeps_large_queues_single_owner` — pins the 100g-iface rough edge on purpose; see the inline comment
+  - `queue_uses_shared_exact_service_zero_iface_rate_falls_back_to_absolute_floor` — bootstrap / unconfigured iface case; no underflow
+
+No behavior change. No code path other than the predicate is touched.
+
+## Not in this PR
+- Any change to the threshold policy itself. The 100g-iface rough edge is a real bug (a 10g exact queue on a 100g iface gets single-owner service, which regresses to PR #680's collapse shape), but fixing it is a separate change that needs live validation on a >10g iface. Filing that as a follow-on is better than sneaking a policy flip in under "add tests".
+- The residual SFQ hash collisions (#693). Orthogonal.
+
+## Validation
+- `cargo test --manifest-path userspace-dp/Cargo.toml queue_uses_shared_exact_service` — 6 tests, all pass.
+- `cargo test --manifest-path userspace-dp/Cargo.toml --no-run`
+- `cargo fmt --manifest-path userspace-dp/Cargo.toml`
+- `git diff --check`
+- Three pre-existing failures on master (`build_shared_cos_root_leases_uses_active_workers_per_interface`, `maybe_top_up_cos_root_lease_unblocks_large_frame_exceeding_lease_bytes`, `resolve_cos_queue_id_defaults_when_output_filter_has_no_forwarding_class`) fail before and after this change. Not this PR's concern; worth a separate look.
+- Live 5201 fairness checks noted above show the policy is in place on the deployed helper.
+
+Refs #690.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #699 — userspace-dp: per-queue randomized SFQ hash seed [MERGED] (merged 2026-04-16)
+
+Branch: `pr/cos-flow-fair-hash-seed`
+
+## Summary
+- add a per-queue `flow_hash_seed: u64` drawn from `getrandom(2)` at runtime construction and mixed into `exact_cos_flow_bucket()` before the 5-tuple terms
+- preserves determinism inside one runtime instance (required for correct enqueue/dequeue bucket accounting) while making the bucket mapping unpredictable across restarts and nodes
+- hot-path shape is one cached `u64` XOR — no per-packet RNG, no allocations, no locks
+- closes #693
+
+## Why
+PR #692's SFQ gives 5201 flow fairness inside one queue but the bucket mapping is still a pure function of the 5-tuple. That is externally probeable: a hostile or just unlucky source that can vary ports can steer flows into a small number of buckets and degrade fairness on purpose, and collision hot spots repeat across restarts and across HA nodes.
+
+Live IPv6 5201 12-flow 30s run currently shows five identical streams at `92.3 Mbit/s` (rates `[66.0, 71.3, 73.8, 76.0, 77.8, 92.3, 92.3, 92.3, 92.3, 92.4, 92.4, 92.6]`). That is the textbook signature of 12 flows mapping into <12 distinct SFQ buckets under a stable hash — multiple flows sharing a bucket split that bucket's fair share.
+
+## Implementation
+
+**Field:**
+```rust
+pub(super) struct CoSQueueRuntime {
+    ...
+    pub(super) flow_fair: bool,
+    pub(super) flow_hash_seed: u64,  // new
+    ...
+}
+```
+
+**Seed source:** `cos_flow_hash_seed_from_os()` — `libc::getrandom()` with `flags=0`. The daemon starts well after `systemd-random-seed`, so urandom is initialized. A CLOCK_MONOTONIC-mixed fallback exists for degenerate syscall failure; it is strictly better than the zero-seed it replaces, and is exercised by a regression test.
+
+**Hash mix:**
+```rust
+let mut seed = queue_seed
+    ^ (flow_key.protocol as u64)
+    ^ ((flow_key.addr_family as u64) << 8);
+```
+
+At `queue_seed == 0`, XOR is identity → mathematically byte-identical to the pre-seed behavior. Legacy flow-fair tests stay green with explicit `flow_hash_seed = 0` pinning after enabling `flow_fair`.
+
+**Callers updated (all four):**
+- `account_cos_queue_flow_enqueue` / `_dequeue` — accounting
+- `cos_queue_push_back` / `cos_queue_push_front` — item placement
+- The admission check in the CoS enqueue path (`flow_share_exceeded`)
+
+## Performance shape
+- Adds one `u64` field to `CoSQueueRuntime` (8 bytes, colocated with the flow-fair hot fields).
+- Adds one XOR in the hash function (one register op, same instruction count order as a single `mix_cos_flow_bucket` call).
+- Zero added syscalls on the hot path; `getrandom` only runs once per queue at runtime construction.
+- No allocations, no locks, no RNG state to manage across threads.
+
+## Validation
+
+**Unit coverage (4 new tests covering every required property from #693):**
+- `exact_cos_flow_bucket_is_stable_for_same_seed_and_flow` — 4096 iterations of one (seed, flow) pair must all return the same bucket. Pins the determinism property.
+- `exact_cos_flow_bucket_diverges_across_seeds_for_same_flow` — scans 1..8192 seeds, requires at least one to map the same flow to a different bucket. Pins the "seed is actually mixed in" property.
+
+*(truncated — 72 lines total)*
+
+
+---
+
+## PR #700 — userspace-dp: drop iface_rate/4 term from shared-exact threshold (#697) [MERGED] (merged 2026-04-16)
+
+Branch: `pr/cos-shared-exact-absolute-threshold`
+
+## Summary
+- replace `max(iface_rate / 4, MIN)` with just `COS_SHARED_EXACT_MIN_RATE_BYTES`
+- fixes the shared-exact policy inversion at >10g iface rates where the old threshold scaled UP with iface rate and mis-classified high-rate queues as single-owner, routing them into the PR #680 throughput-collapse shape
+- byte-identical behavior on the 10g loss HA lab (where `iface_rate / 4 == MIN == 2.5g`)
+- closes #697
+
+## Why
+The old policy treated the shared-exact cutoff as a fraction of the interface shaper. That was backwards. A single worker's sustained exact drain throughput is an absolute property of the drain loop and the TX ring — it does not scale with iface rate. The `/ 4` term meant:
+
+| iface | old threshold | 10g exact queue gets |
+|-------|---------------|---------------------|
+| 10g   | max(2.5g, 2.5g) = 2.5g | **shared** (correct) |
+| 25g   | max(6.25g, 2.5g) = 6.25g | **single-owner** (collapse) |
+| 100g  | max(25g, 2.5g) = 25g | **single-owner** (collapse) |
+
+At 25g+ a 10g exact queue would have been routed to one owner worker that cannot sustain 10g exact — exactly PR #680's failure mode.
+
+## Implementation
+
+One line in `userspace-dp/src/afxdp/worker.rs`:
+
+```rust
+fn queue_uses_shared_exact_service(_iface: &CoSInterfaceConfig, queue: &CoSQueueConfig) -> bool {
+    if !queue.exact { return false; }
+    queue.transmit_rate_bytes >= COS_SHARED_EXACT_MIN_RATE_BYTES
+}
+```
+
+The `iface` parameter is retained so call sites do not churn; it is no longer consulted. Rustdoc updated to document the policy and name #697 / PR #680 as the rationale.
+
+## Test diff
+
+**Removed:**
+- `queue_uses_shared_exact_service_high_iface_rate_keeps_large_queues_single_owner` — this test explicitly pinned the BUG (a 10g exact queue on a 100g iface asserted as single-owner). Its job was done the moment the policy change landed.
+- `queue_uses_shared_exact_service_iface_rate_gate_boundary_is_byte_precise` — the iface-rate gate no longer exists, so this test asserts a code path that does not run.
+
+**Added:**
+- `queue_uses_shared_exact_service_threshold_does_not_scale_with_iface_rate` — iterates iface rates {10, 25, 40, 50, 100, 200, 400 Gbps} and asserts a 10g exact queue shards on every one. This is the correctness property #697 asked for.
+- `queue_uses_shared_exact_service_high_iface_rate_shards_mid_rate_queues` — byte-precise boundary at a 100g iface. Under the old policy a 2.5g exact queue on a 100g iface would have been single-owner (threshold was 25g); under the fix it shards.
+
+**Tightened:**
+- `queue_uses_shared_exact_service_threshold_is_exactly_inclusive` — now iterates iface rates {1g, 10g, 100g} and asserts the byte-precise boundary holds on all three. Pins that the threshold cannot re-gain an iface-dependent term without the test failing loudly.
+- `queue_uses_shared_exact_service_slow_iface_below_threshold_is_single_owner` — renamed and re-documented; no longer talks about MIN "dominating" `/ 4` since `/ 4` is gone.
+- `queue_uses_shared_exact_service_zero_iface_rate_uses_absolute_threshold` — retained as a bootstrap sanity check (no divide-by-zero etc).
+
+## Live validation
+
+Helper SHA `b4c8bfa9e56e399b63c3261b2455eabd73cb8a9c1b44eb2b616781f6b8c8043a` rolled out to `xpf-userspace-fw0` and `xpf-userspace-fw1`; xpfd restarted on both nodes.
+
+12-stream iperf3, 20–30s:
+
+*(truncated — 74 lines total)*
+
+
+---
+
+## PR #701 — userspace-dp: split guarantee RR cursors by class (#689) [MERGED] (merged 2026-04-16)
+
+Branch: `pr/cos-split-guarantee-rr-cursors`
+
+## Summary
+- split `root.guarantee_rr` into `exact_guarantee_rr` + `nonexact_guarantee_rr` (plus `legacy_guarantee_rr` for the test-only unified selector) so the two guarantee passes in `drain_shaped_tx` rotate independently
+- documents the scheduler semantics as strict-priority exact-over-nonexact with class-independent round-robin within each class, matching what `drain_shaped_tx` actually does
+- closes #689
+
+## Why
+The guarantee service phase runs two passes:
+
+1. `service_exact_guarantee_queue_direct` (exact pass, runs first in `drain_shaped_tx`)
+2. `build_nonexact_cos_batch` (non-exact fallback when exact returned None)
+
+Before this PR both read from and wrote to the same `root.guarantee_rr` cursor. That is the shape #689 calls out as "accidentally coupled by an implementation detail" — neither true unified RR (because the exact pass always wins at a shared rr position) nor true class-independent RR (because serving an exact queue advances the cursor the non-exact pass will read next).
+
+Worked example. Queues `[Q0 exact, Q1 nonexact, Q2 exact, Q3 nonexact]`, all backlogged with tokens to send:
+- shared cursor: exact pass picks Q0, advances rr to 1; next call picks Q2 (skipping Q1), advances rr to 3; next call picks Q0 (skipping Q3), advances rr back to 1. If Q0 and Q2 always have tokens, Q1 and Q3 are starved indefinitely while the cursor oscillates 1 ↔ 3. Even if exact queues go token-starved occasionally and let non-exact run, the non-exact rotation is a function of *where the exact pass happened to leave the cursor*, not of non-exact service history.
+
+Split cursor:
+- `exact_guarantee_rr` rotates 0 → 2 → 0 → 2 regardless of non-exact activity.
+- `nonexact_guarantee_rr` rotates 1 → 3 → 1 → 3 regardless of exact activity.
+- Strict priority between classes is preserved (exact pass runs first in `drain_shaped_tx`; non-exact fires when exact yields).
+
+## Implementation
+
+`types.rs`:
+```rust
+pub(super) exact_guarantee_rr: usize,
+pub(super) nonexact_guarantee_rr: usize,
+pub(super) legacy_guarantee_rr: usize,
+```
+
+`tx.rs`:
+- `select_exact_cos_guarantee_queue_with_fast_path` reads/writes `exact_guarantee_rr`
+- `select_nonexact_cos_guarantee_batch` reads/writes `nonexact_guarantee_rr`
+- `select_cos_guarantee_batch_with_fast_path` (test-only unified selector) reads/writes `legacy_guarantee_rr`. Kept separate so test harnesses that exercise the legacy walk do not corrupt the production cursors and vice versa.
+
+Rustdoc on each selector names its cursor explicitly.
+
+## Test diff
+
+**Added**:
+- `exact_and_nonexact_guarantee_rr_cursors_advance_independently` — serving an exact queue must leave the non-exact cursor untouched and vice versa.
+- `exact_guarantee_rr_walks_exact_queues_in_order_independent_of_nonexact` — 4 rounds, non-exact service interleaved between exact calls; exact sequence must be `[0, 2, 0, 2]`.
+- `nonexact_guarantee_rr_walks_nonexact_queues_in_order_independent_of_exact` — symmetric: non-exact sequence `[1, 3, 1, 3]` regardless of exact activity.
+- `guarantee_rr_cursors_start_at_zero_after_runtime_build` — pin that all three cursors initialize to 0 (catches a refactor that drops a field or leaves it uninitialized).
+
+**Test helper** `test_mixed_class_root_with_primed_queues` uses a 1 Mbps per-queue rate so `cos_guarantee_quantum_bytes` clamps to its 1500-byte minimum and each selector call consumes exactly one packet from the chosen queue. That lets the rotation tests run multiple rounds of selection without any queue draining to empty.
+
+## Validation
+
+- `cargo test --manifest-path userspace-dp/Cargo.toml guarantee_rr` — 4 new tests green (plus 3 existing flow-fair tests untouched)
+
+*(truncated — 71 lines total)*
+
+
+---
+
+## PR #702 — userspace-dp: fix three pre-existing CoS test failures [MERGED] (merged 2026-04-16)
+
+Branch: `pr/fix-pre-existing-test-failures`
+
+Three CoS tests were asserting stale invariants and failing on master. Fix each:
+
+**build_shared_cos_root_leases_uses_active_workers_per_interface** (coordinator.rs)
+Root cause: assertion `first+second+third+fourth == tx_frame_capacity()*2` (8192) was copy-pasted from the sibling queue-lease test. For this test's config (100 Mbps / 256 KB / 2 shards) `lease_bytes=20 000` and `max_total_leased = lease_bytes * active_shards = 40 000`, not 8192.
+Fix: rewrite to drain the full budget and pin the real invariant — root budget scales with `active_shards`.
+
+**maybe_top_up_cos_root_lease_unblocks_large_frame_exceeding_lease_bytes** (tx.rs)
+Root cause: precondition `lease_bytes() < tx_frame_capacity()` was valid when `COS_ROOT_LEASE_TARGET_US=25`. Commit e4ae9eeb bumped it to 200, so at 400 Mbps lease_bytes is now 10 000 (> 4096) and the precondition trips.
+Fix: drop rate to 50 Mbps so the raw target (1250) floors up to `COS_ROOT_LEASE_MIN_BYTES=1500` < 4096, exercising the same regression path.
+
+**resolve_cos_queue_id_defaults_when_output_filter_has_no_forwarding_class** (tx.rs)
+Root cause: test expected an assigned but no-op output filter to shadow ingress classification and fall back to default queue. Commit a15a6120 intentionally changed the gating (`interface_output_filter_needs_tx_eval`) to skip the output filter entirely when it has no `forwarding_class`, `dscp_rewrite`, or counter term — matching Junos semantics.
+Fix: update assertion to the new invariant (ingress classification is preserved) and leave a comment above the test explaining the contract change.
+
+## Validation
+- `cargo test --manifest-path userspace-dp/Cargo.toml` — 620 pass, 0 fail
+- `cargo fmt --manifest-path userspace-dp/Cargo.toml`
+- `git diff --check`
+
+---
+
+## PR #703 — userspace-dp: validate COS_SHARED_EXACT_MIN_RATE_BYTES + end-to-end dispatch coverage (#698) [MERGED] (merged 2026-04-17)
+
+Branch: `pr/cos-min-constant-validation`
+
+## Summary
+- drain-path micro-bench (`cargo test -- --ignored --nocapture`) with documented scope and baseline
+- end-to-end fast-interface assembly test for the live loss HA 3-queue shape (100m / 1g / 10g exact on 10g iface)
+- queue-rate > iface-rate misconfig pin
+- rustdoc on `COS_SHARED_EXACT_MIN_RATE_BYTES` now cites the bench and names the actual gating mechanism
+- closes #698
+
+## Why
+The 2.5 Gbps `COS_SHARED_EXACT_MIN_RATE_BYTES` constant has been load-bearing across four merged PRs (#692, #696, #700, #701) without any checked-in measurement backing it. The rustdoc called it "empirical" but pointed at no data a reader could verify. Similarly, every CoS PR in this series validated live against the 100m/1g/10g three-queue loss HA config, but that shape had never been exercised end-to-end through `build_worker_cos_fast_interfaces` in unit tests — the predicate was tested in isolation, and the assembly was tested with two-queue shapes.
+
+## Micro-bench
+
+**Scope (what it covers):**
+- `drain_exact_local_fifo_items_to_scratch` — VecDeque indexed read, pattern match, free-frame pop, UMEM `slice_mut_unchecked` + `copy_from_slice` (the 1500-byte memcpy that dominates `memmove` in the live profile), scratch Vec push, root/secondary budget decrement.
+- `settle_exact_local_fifo_submission` — queue.items.pop_front per sent packet, scratch Vec pop.
+- Re-prime between iterations to simulate steady inflow.
+- 10 000 batches × 256 packets × 1500 B, with 1000 warmup iterations for cache + branch predictor settle.
+
+**Scope (what it does NOT cover):**
+- TX ring insert + commit — no XDP socket in unit tests; ~20 ns combined on x86-64 amortized at TX_BATCH_SIZE.
+- Kernel wakeup syscall (`sendto`) — amortized over batches of 256 at ~2-4 ns/packet.
+- Completion ring reap — ~20-50 ns per completion.
+- Non-drain per-worker cost: RX, forwarding, NAT, session lookup, conntrack. These are measured in the live cluster profile, not here. **They dominate in production and are the real gate on per-worker aggregate throughput.**
+
+**Baseline** (development host, release build):
+```
+packet len            : 1500 B
+batches               : 10000
+packets per batch     : 256
+total packets         : 2 560 000
+elapsed               : 768.6 ms
+ns/packet (drain+settle): 300.24
+throughput (pps)      : 3.331 Mpps
+throughput (line rate): 39.968 Gbps
+min-constant gate     : 2.500 Gbps
+verdict               : drain alone exceeds MIN — constant gated by non-drain per-worker work (expected)
+```
+
+## What this tells us about the MIN constant
+
+Drain alone sustains ~16× the 2.5 Gbps MIN on reasonable hardware. That's the key signal: **the constant is not gated by drain speed.** It's gated by the per-worker aggregate budget after RX / forward / NAT / session / conntrack work consume their share of the per-packet cycle budget. That's consistent with the PR #680 collapse shape — the drain couldn't absorb 10g line-rate not because it was too slow in isolation, but because non-drain work left insufficient CPU for drain+completion to keep up.
+
+If the drain micro-bench ever drops below 2.5 Gbps, the MIN constant would need to drop too. The bench catches that regression the first time a human re-runs it.
+
+## End-to-end dispatch test
+
+`build_worker_cos_fast_interfaces_matches_live_loss_ha_3_queue_shape` covers the exact production CoS config every PR in this series has validated live:
+
+```
+reth0.80 shaper 10g
+
+*(truncated — 85 lines total)*
+
+
+---
+
+## PR #713 — userspace-dp: add per-reason CoS drop telemetry (#710) [MERGED] (merged 2026-04-17)
+
+Branch: `pr/cos-drop-telemetry`
+
+## Summary
+- Nine new drop-reason counters spanning the CoS enqueue / shaper / submit / redirect pipeline, per (ifindex, queue_id) where meaningful and per-binding where inherently cross-queue.
+- Both worker-level and coordinator-level aggregators updated so the counters survive the two-layer status aggregation.
+- Live data on the #704 repro ranks the root causes with real numbers instead of hypotheses.
+- Closes #710.
+
+## Why
+
+Before this PR the only live drop signal was `tx_errors` (a monotonic counter) plus a "last_error" string. That is useless for triage. #704's 16-flow bimodal-fairness-collapse investigation had four credible root-cause hypotheses (#705 SFQ admission cap, #706 redirect-inbox mutex, #707 buffer undersizing, #709 owner-worker hotspot) and no way to rank them by actual in-production cost. This PR closes that gap.
+
+## Counter design
+
+**Per-queue (`CoSQueueRuntime.drop_counters`)** — single-writer per worker, plain `u64` with `wrapping_add`. No atomics needed on the hot path; snapshot reads happen through the already-existing `build_worker_cos_statuses` → `ArcSwap` publication path.
+
+| Counter | Where | Indicates |
+|---------|-------|-----------|
+| `admission_flow_share_drops` | `enqueue_cos_item` admission | SFQ per-flow cap exceeded (#705, #711) |
+| `admission_buffer_drops` | same | Queue buffer cap exceeded (#707) |
+| `root_token_starvation_parks` | `select_cos_*_guarantee_*` | Root shaper tokens empty (scheduling, not a drop) |
+| `queue_token_starvation_parks` | exact selector | Per-queue tokens empty (scheduling, not a drop) |
+| `tx_ring_full_drops` | `service_exact_*_queue_direct` | `writer.insert` returned 0; frames recycled |
+
+**Per-binding (`BindingLiveState`)** — multi-writer, `AtomicU64` with `Relaxed`. These are inherently cross-queue or cross-worker.
+
+| Counter | Where | Indicates |
+|---------|-------|-----------|
+| `redirect_inbox_overflow_drops` | `enqueue_tx` / `enqueue_tx_owned` | Owner not draining redirects fast enough (#706, #709) |
+| `pending_tx_local_overflow_drops` | `bound_pending_tx_*` | Per-worker FIFO cap hit |
+| `tx_submit_error_drops` | `TxError::Drop` / `ExactCoSScratchBuild::Drop` | Frame-level submit errors (capacity/slice) |
+| `no_owner_binding_drops` | `apply_worker_shaped_tx_requests` | Cross-worker redirect arrived for an unknown egress |
+
+## Aggregation fix caught during validation
+
+First attempt showed every per-queue counter at zero during live traffic while `tx_errors` was advancing monotonically. Triaged by iterating: telemetry-first, not hypothesis-first. The bug was that `Coordinator::cos_statuses` does its *own* second-layer aggregation across per-worker snapshots, and that aggregator did not sum the new drop-counter fields — they were being discarded on the way out of the coordinator. Caught only because the live numbers did not add up. Fix landed in the same commit; the second-layer aggregation now mirrors the first.
+
+Lesson for reviewers: when adding a counter, grep for every aggregation layer it must survive. This repo has two for CoS status.
+
+## Live validation on #704 repro
+
+Helper SHA `5a6914152c18c0d604f4a0f5e99e7b9d4554680f44a344847d99b14245e3db83` deployed to both loss-HA nodes. 16-flow iperf3 on port 5201 (1g exact iperf-a queue) for 30s:
+
+```
+aggregate: 1.079 Gbps  retrans: 149701
+tx_errors on owner slot 4: 2671
+```
+
+Drop-reason breakdown on `reth0.80 q4 (iperf-a)`:
+
+| Counter | Value | Notes |
+|---------|-------|-------|
+
+*(truncated — 100 lines total)*
+
+
+---
+
+## PR #714 — userspace-dp: grow SFQ buckets 64→1024 + fixed-capacity RR ring (#711, #694) [MERGED] (merged 2026-04-17)
+
+Branch: `pr/cos-sfq-1024-buckets`
+
+## Summary
+- `COS_FLOW_FAIR_BUCKETS: 64 → 1024`. Collision probability at 16 flows: 88% → 11%.
+- `flow_rr_buckets: VecDeque<u8>` → `FlowRrRing` (heap-free, `[u16; 1024] + head + len`). Closes #694.
+- `exact_cos_flow_bucket` returns `u16` (was `u8`) so the widened mask isn't silently truncated.
+- 8 new regression tests. Drain-path cost slightly faster (169 vs 177 ns/pkt). Live ratio on the #704 repro: **13.26× → 1.35×**.
+
+## Evidence driving the change
+
+#710 telemetry shipped in #713 produced hard numbers on the #704 16-flow collapse:
+- `admission_flow_share_drops` = 2671, matching `tx_errors` exactly. Primary drop reason.
+- Zero activity on the mutex, owner-hotspot, pending-FIFO, buffer-cap, or submit-error paths.
+
+Hypothesis: the primary driver isn't the admission cap itself (that's #705's scope) — it's that 16 flows into 64 buckets collide ~88% of the time, and colliding flows share one admission slot. Three or four unlucky flows get half the admission budget of the rest, compounding the cwnd-collapse cycle.
+
+#711 tests that hypothesis directly by 16×-ing the bucket count.
+
+## Bucket-count selection
+
+Birthday-paradox collision probability by flow count:
+
+| N flows | 64 buckets | 1024 buckets |
+|--------:|-----------:|-------------:|
+| 8       | 40%        | <1%          |
+| 16      | 88%        | 11%          |
+| 32      | 99%        | 38%          |
+| 64      | 99.99%     | 87%          |
+
+1024 covers the production regime (N ≤ 64 flows/queue) with headroom. Not 4096 or higher — the per-queue memory overhead of `[VecDeque; N]` inline headers grows linearly and the gains beyond 1024 stop mattering for realistic flow counts.
+
+## HFT-lens design decisions
+
+**Bucket ID width: u16.** 1024 buckets need 10 bits. `u8` (the prior return type of `exact_cos_flow_bucket`) would have silently truncated the hash to 8 bits — giving the widened mask no actual work to do. u16 is the minimum that exposes the full 10-bit bucket space; u32 would waste cache.
+
+**Fixed ring (#694).** Heap-free `[u16; 1024] + head + len` (2 KB total) fits in L1d. Replaces `VecDeque<u8>` which paid allocator cost per queue. Same O(1) push/pop complexity. Head/tail indexing via `% COS_FLOW_FAIR_BUCKETS`.
+
+**Invariant unchanged.** The callers in `cos_queue_push_*` / `cos_queue_pop_front` already gate on "bucket transitioned empty → non-empty" before pushing, and on "bucket still non-empty" before re-enqueueing the RR cursor after dequeue. The ring itself does not re-validate on the hot path. New ring-invariant unit tests pin this contract (no-duplicates, wrap-around, capacity edges).
+
+**Memory budget.** Per flow-fair queue: ~34 KB (1024 × 24-byte VecDeque headers + 1024 × 8-byte u64 + 2 KB fixed ring). Non-flow-fair queues have the same inline footprint but their headers stay cold (never touched on the non-flow-fair path). At 4 workers × 8 queues × 1 iface ≈ 1 MB per cluster. Tolerable.
+
+## Hot-path cost
+
+Drain micro-bench (release, development host):
+```
+before: 177 ns/packet, 5.65 Mpps, ~68 Gbps
+after:  169 ns/packet, 5.91 Mpps, ~71 Gbps
+```
+
+Within noise, slightly faster if anything. The fixed ring avoids the `VecDeque<u8>` heap indirection on push/pop; the bucket-count grow itself doesn't affect per-packet cost (same O(1) ops, same cache behavior for the small active-bucket set actually in use).
+
+## Live validation on the #704 repro
+
+*(truncated — 111 lines total)*
+
+
+---
+
+## PR #715 — userspace-dp: lock-free redirect inbox eliminates cross-producer mutex (#706) [MERGED] (merged 2026-04-17)
+
+Branch: `pr/706-mpsc-redirect-inbox`
+
+## Summary
+
+- Replace `Mutex<VecDeque<TxRequest>>` in `BindingLiveState::pending_tx` with a hand-rolled bounded MPMC queue (Vyukov's bounded algorithm, used MPSC-style — N worker producers, owner-worker consumer).
+- Eliminates the cross-producer and producer↔consumer serialisation on every redirected `TxRequest`.
+- Overflow semantics flip to drop-newest (old queued packets are closer to being serviced by the owner; evicting them only extends tail latency). Counter contract — `tx_errors` + `redirect_inbox_overflow_drops` — is preserved.
+- `cancel_queued_flow_on_binding` loses the in-place filter on the redirect inbox (cannot mutate a lock-free ring from a non-consumer thread). Worker-owned queues still filter; post-RST stragglers are absorbed by the peer's RST handling.
+
+## Test plan
+
+- [x] `cargo test` — 649 userspace-dp tests green, 0 fail. New `mpsc_inbox` suite covers: FIFO on single producer, `Err` on full ring, capacity power-of-two rounding, concurrent producers below-cap lose no items, concurrent producers above-cap drop exactly the overflow (`pushed_ok + err == total`, `popped == pushed_ok`), `Drop` runs for orphaned values.
+- [x] Updated `enqueue_tx_owned_increments_redirect_inbox_overflow_counter_when_soft_cap_drops_newcomer` — drop-newest flip, counter contract preserved.
+- [x] `make test` — full Go suite green.
+- [x] Live deploy on `loss:xpf-userspace-{fw0,fw1}` with CoS re-applied (iperf-a 1g exact queue at 5201, iperf-b 10g shared, best-effort 100m). Both nodes active, no panics.
+
+## Live data (16-flow iperf3, 30s, port 5201, 1 Gbps exact queue)
+
+| Run | Total | Rate ratio | Retrans/30s | Flows with max_cwnd < 50 KB |
+|---|---|---|---|---|
+| 1 | 1.07 Gbps | 1.49× | 139 k | 9/16 |
+| 2 | 1.16 Gbps | 1.64× | 217 k | 13/16 |
+| 3 | 1.11 Gbps | 1.91× | 190 k | 12/16 |
+
+## What this PR did and did not do
+
+**Did**: the rate distribution across the 16 flows is now flat (50–94 Mbps, ~1.5× max/min). Before this change, the split was bimodal (5 owner-local flows healthy multi-Gbps, 11 redirected flows collapsed sub-500 Mbps). Removing the cross-worker mutex let every redirected flow move at the same rate as owner-local ones.
+
+**Did not**: cwnd collapse and the retransmit storm persist. #706's hypothesis was that mutex jitter was driving single-packet drops which forced RTOs (cwnd reset to 1 MSS) and drove the bimodal pattern. The data shows that theory was only half right — the mutex was causing the *bimodal split*, not the retransmit storm itself. With the mutex gone, every flow shares the *same* pathology: admission-cap drops push per-flow cwnd below the 3-dupack fast-retransmit threshold, so single drops take an RTO, and cwnd oscillates between "just below the cap" and 1 MSS.
+
+That failure mode is now unambiguously pinned to **#705 (admission cap off distinct flow count) and/or #707 (1.19 MB exact-queue buffer too small for 16 flows × RTT × BDP)** — with the mutex out of the way, there is no other structural throttle between the ring-level fairness and the TCP-layer behaviour. This PR is a prerequisite for either fix being measurable.
+
+Refs: #706, #704, #705, #707, #709.
+
+---
+
+## PR #716 — userspace-dp: flow-aware CoS admission buffer + 16 MSS fast-retransmit floor (#707) [MERGED] (merged 2026-04-17)
+
+Branch: `pr/707-flow-aware-buffer-limit`
+
+## Summary
+
+Flow-fair admission on low-rate exact queues has two undersized gates. Both need to be fixed together because each is hidden by the other tripping first.
+
+1. **`COS_FLOW_FAIR_MIN_SHARE_BYTES` raised 4 → 16 MTU-sized packets** (6 KB → 24 KB). 4 is exactly the 3-dupack fast-retransmit threshold with no headroom — a single drop in the last MTU produces < 3 dupacks before cwnd is drained → RTO → cwnd reset to 1 MSS. 16 gives 3 dupacks + ~13 MTU of reorder/retransmit window. A top-level `const _: () = assert!` pins the floor at build time, not just test time.
+
+2. **Flow-aware aggregate cap** matching the per-flow clamp's denominator. Per-flow clamp already reasoned about *prospective* active flows (current + 1 when the target bucket is empty). Aggregate cap was keyed off current active count, so at the new-flow boundary the per-flow gate admitted the first packet while the aggregate gate rejected it. Helper `cos_flow_aware_buffer_limit(queue, flow_bucket)` now uses the same prospective-active formula, driven from a single `flow_bucket` computed once per admission.
+
+Non-flow-fair queues (best-effort, pure rate-limited) bypass the scaling and keep the operator-configured buffer.
+
+## HFT hot-path shape
+
+- One `flow_bucket` computation per admission (already present, reordered earlier).
+- Branchless `prospective_active` compute via `saturating_add` on the `is_empty?1:0` boolean.
+- One `saturating_mul` + one `max` extra per admission (~2–3 ns on modern x86).
+- No allocations, no atomics, no heap state.
+- Backing `VecDeque` is dynamic — logical cap only, zero memory cost until traffic fills it.
+
+## Deferred to follow-up
+
+Reviewer flagged a latency-envelope concern: `COS_FLOW_FAIR_BUCKETS = 1024` active flows would allow the cap to reach ~24 MB = ~190 ms of queue residence time on a 1 Gbps queue. A `COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS`-derived clamp is the right shape but it is an operator-visible behaviour choice, not a bug fix — kept out of this PR pending queueing-budget policy discussion. Rustdoc on the helper calls it out so the concern is visible at the source.
+
+## Test plan
+
+- [x] `cargo test` — 651 green.
+  - `cos_flow_aware_buffer_limit_scales_with_prospective_active_flow_count`: base wins low, floor wins high, prospective count (+1 for empty target) is the denominator.
+  - `cos_flow_aware_buffer_limit_matches_share_limit_at_new_flow_boundary`: **new regression guard for the review's correctness finding** — at 15 active + 1 new-flow boundary, both gates admit the new flow's first packet.
+  - `cos_flow_aware_buffer_limit_respects_non_flow_fair_queues`: `flow_fair=false` bypass.
+  - `cos_queue_flow_share_limit_never_drops_below_fast_retransmit_floor`: per-flow share stays ≥ 16 MTU at 16 flows.
+  - Top-level `const _: () = assert!` enforces floor at `cargo build`.
+- [x] `make test` — full Go suite green.
+- [x] Live deploy + CoS re-apply via new `test/incus/apply-cos-config.sh` + 3× 16-flow iperf3 on 5201.
+
+## Live data and honest framing
+
+With CoS active and the 1 Gbps exact queue, the **scheduler auto-sizes `buffer` to 1.19 MiB** (~9.5 ms × rate), not the 125 KB the issue's math assumed. That means:
+
+- Before this PR, `buffer / 16 = 75 KB` per flow — already 3× above the 16-MTU floor.
+- This PR's flow-aware expansion is a **no-op for scheduler-auto-sized buffers** (`base (1.19 MB)` > `prospective × 24 KB`) at this workload.
+
+16-flow iperf3 results (3 runs, 30 s, port 5201):
+
+| Run | Total | Rate ratio | Retrans / 30 s | cwnd < 50 KB |
+|---|---|---|---|---|
+| 1 | 1.10 Gbps | 1.48× | 175 k | 11 / 16 |
+| 2 | 1.06 Gbps | 1.53× | 125 k | 8 / 16 |
+| 3 | 1.10 Gbps | 1.44× | 204 k | 12 / 16 |
+
+Rate ratio (1.5×) is healthy. Retransmit and cwnd-collapse numbers are statistically identical to the post-#706 baseline — the dominant driver on this workload is **bursty tail-drop on a ~10 ms bufferbloat queue**, not undersized per-flow share. That requires AQM (ECN marking or CoDel) rather than larger caps, and is properly scoped as a separate change.
+
+
+*(truncated — 58 lines total)*
+
+
+---
+
+## PR #719 — docs: engineering-style.md — coding and review discipline [MERGED] (merged 2026-04-17)
+
+Branch: `pr/engineering-style-doc`
+
+## Summary
+
+Distill the coding / review personality that has emerged across the recent CoS work (#714, #715, #716) into a checked-in file that future sessions always load.
+
+- **New**: `docs/engineering-style.md` — terse, opinionated, meant to be read once in full before touching hot-path code or reviewing a PR.
+- **Updated**: `CLAUDE.md` now points at the style doc in the *Working Style* section, so agent sessions load it automatically alongside the project facts.
+
+## What it covers
+
+- First principles (latency > memory, correctness > perf > convenience, one source of truth per formula, honest framing, narrow scope).
+- Hot-path coding rules: allocation, atomic orderings, cache-padding cross-core atomics, branchless arithmetic, `const _: () = assert!` vs `#[test]` pins.
+- API shape discipline: drain-into-buffer signatures, `unsafe` fn for SC invariants, operator-visible units match live config.
+- Overflow / failure policy matrix (drop-newest vs drop-oldest, return Err vs panic vs counter-bump).
+- Review discipline: adversarial by design, severity tags, concrete code shape in comments, test-strength standards with counter-factual assertions.
+- PR discipline: title/body/commit/merge conventions.
+- Project-specific gotchas that repeatedly bite (CoS wipe on deploy, iperf3 endpoint, `cli` not `xpfctl`, `source ~/.sshrc`).
+- Tone signals from reviews that worked (`"I would either ... or ..."`, `"behaviour choice, not a bug fix"`, `"does not recreate the old failure mode"`).
+
+## Test plan
+
+- [x] Docs-only change.
+- [x] Links verified, no dangling file refs.
+
+Since the file prescribes the *taste* of the codebase, please review the prescriptions themselves — not just the prose. Anything I got wrong, overclaimed, or missed from what you actually want the personality to be is worth calling out before merge.
+
+---
+
+## PR #720 — userspace-dp: latency-envelope clamp on cos_flow_aware_buffer_limit (#717) [MERGED] (merged 2026-04-17)
+
+Branch: `pr/717-latency-clamp`
+
+## Summary
+
+- Adds `COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS = 5 ms` and clamps the flow-aware admission cap in `cos_flow_aware_buffer_limit` against `delay_cap = transmit_rate_bytes × 5 ms`.
+- Applied as `.min(delay_cap.max(base))` — operator-configured `buffer-size` always wins over the clamp. Explicit operator intent is preserved.
+- Compile-time pin `const _: () = assert!(MAX_QUEUE_DELAY_NS >= 1 ms)` so the constant cannot drift below a value where TCP has no room to grow cwnd past a handful of packets.
+- Deletes the "currently uncapped on the high side" rustdoc paragraph and rewrites it to describe the clamp and cite #717.
+- Deferred: operator-visible `set class-of-service max-queue-delay` knob — tracked as a follow-up under #717 design question 2.
+
+## Why
+
+`cos_flow_aware_buffer_limit()` after #716 scales the aggregate admission cap with `prospective_active × COS_FLOW_FAIR_MIN_SHARE_BYTES`. With the #711 bucket grow this reaches `1024 × 24 KB ≈ 24 MB` at max. On a 1 Gbps queue that is `~190 ms` of queue residence — far outside the scheduler's predictable regime. Flagged in #716 review; explicitly deferred because clamping queueing delay is a behaviour choice, not a bug fix.
+
+## Hot-path shape
+
+One extra `u128` multiply + divide per admission decision. Branchless arithmetic (`.max()`, `.min()`, `.saturating_mul()`) all the way down. No new branches that depend on runtime-varying data other than `queue.flow_fair`, which is already a config-time boolean lifted to the top of the hot function. The enqueue path calls this once per admission, not per packet.
+
+## Test plan
+
+- [x] `cargo test --manifest-path userspace-dp/Cargo.toml cos_flow_aware` — 7/7 pass (3 pre-existing + 4 new)
+- [x] `cargo test --manifest-path userspace-dp/Cargo.toml` — 655/655 pass (651 pre-existing + 4 new), 0 fail, 1 ignored
+
+New tests (all pin the clamp mechanically, not via trivial arithmetic):
+
+- `cos_flow_aware_buffer_limit_clamps_high_flow_count_to_max_delay` — at 1024 active flows on a 1 Gbps queue the cap equals `delay_cap` (625 KB), not the flow-aware expansion (~24 MB). Carries a counter-factual that reconstructs the pre-clamp 24 MB value so a future refactor that deletes the clamp fails loudly.
+- `cos_flow_aware_buffer_limit_honours_operator_base_above_delay_cap` — with `buffer_bytes = 100 MiB` (above delay_cap on a 1 Gbps queue), the returned cap equals the operator base; counter-factual asserts a naive `.min(delay_cap)` would have shrunk operator intent.
+- `cos_flow_aware_buffer_limit_preserves_non_flow_fair_path_after_clamp` — `flow_fair = false` bypasses both the floor and the clamp; returns raw `buffer_bytes.max(COS_MIN_BURST_BYTES)`. Exercises a 10 MB operator base at 1 Gbps so a future refactor that moves the clamp above the `flow_fair` early return fails here.
+- `cos_flow_aware_buffer_limit_delay_cap_scales_linearly_with_rate` — same flow count, same max-delay const, 1 Gbps (625 KB) vs 10 Gbps (6.25 MB) — pins the formula's linearity.
+
+All operator-visible units are decimal bytes/rate matching operator config semantics per `docs/engineering-style.md` (e.g. `buffer_bytes: 125_000`, `transmit_rate_bytes: 125_000_000`, not `* 1024`).
+
+## Live data
+
+No runtime data claimed. This is a bounded worst-case latency fix; the observable effect is a tail-latency envelope under 1024-flow saturation. Orchestrator will run failover + CoS iperf3 validation after this and #718 both land.
+
+## Deferred
+
+- Operator-visible `set class-of-service max-queue-delay <ms>` config knob. Const for now; follow-up tracked under #717 (design question 2).
+- `show class-of-service interface` surfacing the effective cap — separate issue.
+
+## Refs
+
+- #716 (flow-aware buffer + fast-retransmit floor — PR this clamps)
+- #717 (this PR)
+- #707 (original buffer undersizing bug)
+
+---
+
+## PR #721 — userspace-dp: ECN CE marking at CoS admission (#718) [MERGED] (merged 2026-04-17)
+
+Branch: `pr/718-ecn-marking`
+
+## Summary
+
+- Mark ECN-negotiated packets CE at 50% of `buffer_limit` before the admission drop decision fires. Non-ECT packets are untouched per RFC 3168 6.1.1.1 — they fall through to the existing buffer / flow-share drop path, so the fix degrades gracefully.
+- IPv4 updates the header checksum incrementally per RFC 1624 on the one-byte TOS mutation. IPv6 has no header checksum.
+- New `admission_ecn_marked` counter plumbed through `CoSQueueDropCounters` -> worker status -> coordinator aggregation -> `CoSQueueStatus` protocol, so operators see the marking rate alongside existing admission drop reasons.
+- Compile-time pins: `COS_ECN_MARK_THRESHOLD_NUM < COS_ECN_MARK_THRESHOLD_DEN` and `DEN > 0` via `const _: () = assert!`, so a refactor flipping the fraction or zeroing the denominator fails `cargo build`.
+
+## Scope constraints
+
+- **Only `CoSPendingTxItem::Local` is marked in this PR.** `Prepared` points into the umem and needs separate slice-mut plumbing; marked with `TODO(#718-followup):` at the call site and covered by a regression test (`admission_does_not_mark_prepared_variant`) so the follow-up implementer sees an explicit pin.
+- Does not touch `cos_flow_aware_buffer_limit` internals (Agent A's territory on #717).
+- No operator-visible config knobs yet — the 1/2 threshold is a constant. A knob is a follow-up once the signal from the live data supports sizing it.
+
+## Hot-path cost
+
+Per admission, when NOT above threshold:
+- 1 `saturating_mul` + 1 divide to compute `ecn_threshold`
+- 1 compare against `queue.queued_bytes`
+- Total: ~2-3 ns
+
+When above threshold with an ECT packet:
+- Above + 1 match on `expected_addr_family`
+- ~20 ns of bit-twiddle for ECN extract / mask / set
+- IPv4 only: ~5 ns for the incremental checksum update (one `u32` add, two folds, one XOR)
+- No allocations, no atomics, no mutex acquisition.
+
+## Test plan
+
+- [x] `cargo test --manifest-path userspace-dp/Cargo.toml mark_ecn_ce` — 11 marker tests pass
+- [x] `cargo test --manifest-path userspace-dp/Cargo.toml admission` — 5 admission tests pass
+- [x] `cargo test --manifest-path userspace-dp/Cargo.toml` — 667 pass / 0 fail / 1 ignored (baseline 651, delta +16)
+- [ ] Live validation deferred until #717 lands too (orchestrator will run `test-failover` + iperf3 burst on loss cluster)
+
+### New tests
+
+Marker-level (byte-precise, catch endian / offset / mask regressions):
+- `mark_ecn_ce_ipv4_converts_ect0_to_ce_and_updates_checksum`
+- `mark_ecn_ce_ipv4_converts_ect1_to_ce_and_updates_checksum`
+- `mark_ecn_ce_ipv4_leaves_not_ect_untouched` (RFC 3168 guard)
+- `mark_ecn_ce_ipv4_leaves_ce_untouched` (idempotent)
+- `mark_ecn_ce_ipv4_rejects_short_buffer`
+- `mark_ecn_ce_ipv6_converts_ect0_to_ce`
+- `mark_ecn_ce_ipv6_converts_ect1_to_ce`
+- `mark_ecn_ce_ipv6_leaves_not_ect_untouched`
+- `mark_ecn_ce_ipv6_leaves_ce_untouched`
+- `mark_ecn_ce_ipv6_rejects_short_buffer`
+- `maybe_mark_ecn_ce_dispatches_by_addr_family`
+
+Admission-level (drive `apply_cos_admission_ecn_policy` at exact byte boundaries):
+- `admission_ecn_marked_counter_increments_when_marking_above_threshold`
+
+*(truncated — 70 lines total)*
+
+
+---
+
+## PR #723 — userspace-dp: ECN mark on per-flow threshold alongside aggregate (#722) [MERGED] (merged 2026-04-17)
+
+Branch: `pr/722-per-flow-ecn`
+
+## Summary
+
+- Extend `apply_cos_admission_ecn_policy` so CE-marking fires on either the aggregate **or** the per-flow threshold, whichever trips first.
+- Per-flow threshold is derived from `cos_queue_flow_share_limit(queue, buffer_limit, flow_bucket) * NUM/DEN` — same fraction the aggregate arm uses.
+- Non-flow-fair queues are unaffected (`cos_queue_flow_share_limit` returns `buffer_limit`, so the two arms collapse into one).
+
+## Why
+
+#718 landed ECN CE marking keyed off aggregate queue depth. Live validation on the 16-flow iperf3 / 1 Gbps exact queue workload showed the aggregate threshold never fires — the queue sits at ~31% utilisation (~378 KB of a 1.19 MiB buffer) while the 50% threshold is ~594 KB. Drops on that workload come from the **per-flow** fair-share cap (24 KB per flow under `flow_fair`), not the aggregate cap, so `admission_ecn_marked` stayed at 0 and ECN-negotiated TCP flows still fell into RTO.
+
+With the per-flow arm in place, flows get a CE mark when their bucket crosses half of the share cap — before the share cap itself trips the drop. ECN-negotiated TCP halves cwnd via ECE instead of collapsing through fast-retransmit/RTO.
+
+## Hot-path shape
+
+Added per admission:
+
+- 1× `cos_queue_flow_share_limit` call (pure, inlined: `saturating_add + max + div_ceil + clamp`): ~5 ns
+- 1× `saturating_mul` + 1× divide for `flow_ecn_threshold`: ~2 ns
+- 1× array index + compare for `flow_above`: ~1 ns
+
+Total: ~10 ns per admission on top of #718's cost. No allocations, no atomics.
+
+## Test plan
+
+- [x] `cargo test --manifest-path userspace-dp/Cargo.toml admission_ecn` — 6 tests pass (1 pre-existing + 5 new).
+- [x] `cargo test --manifest-path userspace-dp/Cargo.toml` — **676 passed, 0 failed** (was 671; +5 new as expected).
+- [ ] Live: `admission_ecn_marked` counter should advance on the 16-flow / 1 Gbps exact-queue workload once deployed (deferred to follow-up validation, see #722 acceptance criteria).
+
+### New tests
+
+- `admission_ecn_marks_when_per_flow_above_threshold_aggregate_below` — recreates the #722 live state (aggregate ~31%, per-flow bucket > 50% of share_cap). Includes a **counter-factual assertion** that reconstructs the pre-#722 aggregate-only formula and proves it would have missed this state — guards against a future refactor silently dropping the per-flow arm.
+- `admission_ecn_marks_when_aggregate_above_threshold_per_flow_below` — keeps the #718 aggregate arm alive.
+- `admission_ecn_does_not_mark_when_both_thresholds_below` — below-threshold guard.
+- `admission_ecn_does_not_mark_when_flow_share_already_exceeded` — keeps the #718 invariant that doomed packets do not burn ECN marks.
+- `admission_ecn_per_flow_threshold_matches_share_cap_denominator` — pins both arms to the same `NUM/DEN` fraction so they cannot drift if the constants change.
+
+## Deferred
+
+- Live `admission_ecn_marked` validation on the 16-flow workload (#722 acceptance criteria).
+- Prepared (`umem` slice) variant of the ECN mark path — still the TODO(#718-followup) left by #718.
+- Whether to lower the aggregate threshold (or drop it entirely in favour of the per-flow arm) is a behaviour choice and intentionally not in this PR.
+
+## Refs
+
+- #722 — this issue
+- #718 — initial ECN implementation (aggregate-only arm)
+- #704 — umbrella cwnd-collapse symptom
+
+---
+
+## PR #724 — cos: surface admission drop counters in show class-of-service interface [MERGED] (merged 2026-04-17)
+
+Branch: `pr/observability-cos-drops`
+
+## Summary
+
+- Three per-queue admission counters — `admission_flow_share_drops`, `admission_buffer_drops`, `admission_ecn_marked` — already exist in the Rust dataplane (`CoSQueueDropCounters` in `userspace-dp/src/afxdp/types.rs`), are already aggregated across workers in `coordinator.rs`, and are already serialised on the wire in `userspace-dp/src/protocol.rs`.
+- The Go `CoSQueueStatus` never had matching fields, and `FormatCoSInterfaceSummary` never rendered them. Operators had **no** way to see which admission decision was firing on the live system.
+- This PR surfaces the existing counters. No new counters, no behaviour changes, no new `show` subcommand.
+
+## Before / After
+
+**Before** (`show class-of-service interface`):
+
+```
+    Queue  Owner  Class        Priority  Exact  Transmit rate  Buffer       Queued pkts  Queued bytes  Runnable  Parked  Next wake   Surplus deficit
+    4      1      iperf-a      5         yes    1.00 Gb/s      1.19 MiB     255          378.02 KiB    0         1       6053592261  -
+```
+
+**After**:
+
+```
+    Queue  Owner  Class        Priority  Exact  Transmit rate  Buffer       Queued pkts  Queued bytes  Runnable  Parked  Next wake   Surplus deficit
+    4      1      iperf-a      5         yes    1.00 Gb/s      1.19 MiB     255          378.02 KiB    0         1       6053592261  -
+           Drops: flow_share=12345  buffer=0  ecn_marked=4567
+```
+
+Column alignment across queue rows is preserved (a naive tabwriter interleave breaks it; see the implementation note in `cosfmt.go`). Zero-valued counters are still rendered — operators need to SEE the zero to confirm the counter is wired end-to-end.
+
+## Why this matters
+
+We have been iterating on CoS admission-path fixes across #706 / #707 / #708 / #709 / #711 / #718 / #722. Without live operator visibility into which admission counter is incrementing, there is no way to confirm on the running system whether e.g. #722's per-flow ECN threshold is firing or whether flow-share drops dominate instead. Log scraping is not a substitute; a per-queue counter summary is what operators need at the CLI.
+
+## Hot-path impact
+
+None. `FormatCoSInterfaceSummary` is display-path code on the status poll; it runs once per CLI invocation, not per packet.
+
+## Scope discipline
+
+- The JSON tags on the new Go struct fields match the Rust `serde(rename = ...)` names exactly. They are the wire contract.
+- No change to admission decision logic (`tx.rs`), no new counters, no renames.
+- Extends the existing rendering; no new `show class-of-service interface extensive` subcommand.
+
+## Test plan
+
+- [x] `go test ./pkg/dataplane/userspace/...` — 6 of 6 format tests pass, including two new ones covering the non-zero and all-zero render paths.
+- [x] `go test ./pkg/cli/... ./pkg/grpcapi/...` — green.
+- [x] `cargo test --manifest-path userspace-dp/Cargo.toml` — 671 passed, 1 ignored, 0 failed. Test count unchanged because no Rust code was modified.
+
+## Refs
+
+- #718 — ECN CE marking at CoS admission (the counter this PR exposes)
+- #722 — per-flow ECN threshold (pending; this PR unblocks live validation of #722 by making the counter visible)
+
+---
+
+## PR #726 — docs+cos: validation methodology + #725 findings + interface-level drops gate [MERGED] (merged 2026-04-17)
+
+Branch: `pr/cos-validation-docs`
+
+## Summary
+
+Originally a docs-only follow-up to #725. Review surfaced a real correctness issue in the render path from #724 (per-queue gate suppresses the Drops line in exactly the \`wired-but-silent\` case operators care about), so this PR now carries both:
+
+**Docs** (\`docs/cos-validation-notes.md\`): how to read the CoS admission drop counters surfaced in #724, a decision tree mapping \`(flow_share, buffer, ecn_marked)\` patterns to fixes, and the current (dated, verifiable) test-env limitation that blocks ECN end-to-end validation.
+
+**Code** (\`pkg/dataplane/userspace/cosfmt.go\`, \`cosfmt_test.go\`): Drops-line suppression keyed on **interface** runtime, not per-queue runtime. New multi-queue regression test pinning the queue-row → drops-row interleave invariant.
+
+Updated: \`docs/engineering-style.md\` cross-links the validation methodology so future sessions hit it before writing admission-path code.
+
+## Review findings applied
+
+- **psaab / cosfmt.go:150** — interface-level gate, not per-queue. Removed \`cosQueueView.hasRuntime\`; gate is \`view.interfaceState != nil\`. Zero-valued counters now render on every configured queue of a runtime-visible interface, preserving the \`zero means wired-and-quiet\` contract.
+- **psaab / cosfmt_test.go** — new \`TestFormatCoSInterfaceSummaryInterleavesPerQueueDropsInOrder\` with distinct counter tuples per queue. Uses class-name anchors so tabwriter column-width changes don't make it fragile.
+- **psaab / cos-validation-notes.md:61** — ECN-never-negotiated section now stamped \`Observed state 2026-04-17\` with a tcpdump verification command operators can re-run.
+- **Copilot / cos-validation-notes.md:92** — clarified #717 (tracking issue) vs #720 (the PR that landed the latency clamp).
+- **Copilot / cos-validation-notes.md:103** — corrected per-flow drop-rate math: 190/sec / 16 flows ≈ 12 drops/sec per flow (one every ~80 ms), not one every 1–2 s.
+- **Copilot / cos-validation-notes.md:123** — replaced dead \`feedback_cos_deploy_config.md\` reference with real paths (\`test/incus/apply-cos-config.sh\` + cross-link to engineering-style.md).
+- **Copilot / PR description** — PR body/title updated to reflect both docs and code changes.
+
+## Test plan
+
+- [x] \`go test ./pkg/dataplane/userspace/... ./pkg/cli/... ./pkg/grpcapi/...\` green (+1 new test).
+- [x] \`cargo test --manifest-path userspace-dp/Cargo.toml\` unchanged (no Rust source changes in this PR).
+- [x] Links verified, no dangling refs in docs.
+
+Refs: #725, #724, #722, #721, #720, #716, #704.
+
+---
+
+## PR #727 — userspace-dp: ECN CE marking on Prepared CoS variant (#718 follow-up) [MERGED] (merged 2026-04-17)
+
+Branch: `pr/727-ecn-prepared-marking`
+
+## Summary
+
+- #718 / #722 landed ECN CE marking at CoS admission, but the policy only handled `CoSPendingTxItem::Local` — the Prepared variant (the XSK-RX→XSK-TX zero-copy hot path carrying iperf3 and NAT'd flows) fell through to a `TODO(#718-followup)` and left `ecn_marked` dormant on the exact workload the marker was meant to attack.
+- This PR wires the Prepared variant into `apply_cos_admission_ecn_policy` via a new `maybe_mark_ecn_ce_prepared(req, umem)` helper that mutates the frame bytes in place via `MmapArea::slice_mut_unchecked`. The existing `mark_ecn_ce_ipv4` / `mark_ecn_ce_ipv6` primitives stay unchanged.
+- `apply_cos_admission_ecn_policy` now dispatches on `CoSPendingTxItem` and bumps a single `admission_ecn_marked` counter on either branch. Per-variant subcounters can be added later if operators ask for Local-vs-Prepared attribution.
+
+## Why the marker was dormant
+
+See [`docs/cos-validation-notes.md`](https://github.com/psaab/xpf/blob/master/docs/cos-validation-notes.md) for the counter-reading methodology. Live-workload findings from the gRPC-captured iperf3 runs showed `ecn_marked=0` across all admission events because every packet on the 16-flow / 1 Gbps exact-queue path went through the `CoSPendingTxItem::Prepared` branch of `enqueue_cos_item`, and that branch hit the TODO and returned false without marking. Local-variant packets only appear on the slow path (first packet of a new flow, CoS-demoted queues), so the marker's dormancy on Prepared was invisible in the unit tests that only covered Local.
+
+## Safety
+
+The new helper is documented at the call site. Admission runs strictly before the frame is enqueued into the CoS queue, let alone submitted to the XSK TX ring, so the worker that built the frame is still the sole owner of `[req.offset, req.offset + req.len)` within the UMEM. Out-of-range slices return None and the marker returns false — no panic, counter unchanged, packet falls through to the existing admission path.
+
+## Hot-path cost (Prepared branch)
+
+- 1 `slice_mut_unchecked` call: in-range check + pointer arithmetic. ~5 ns.
+- 1 dispatch match on `expected_addr_family`. ~1 ns (predictable).
+- 1 call to `mark_ecn_ce_ipv4` or `_ipv6`. Already budgeted in #718.
+
+Total ~10 ns added per Prepared admission, same order as the Local branch. No allocations, no atomics, no new branches on unpredictable state.
+
+## Test plan
+
+- [x] `admission_ecn_marks_prepared_ipv4_ect0_packet_above_threshold` — pre-state ECT(0), post-state CE, counter bumped by exactly 1, IP checksum recomputed-from-scratch matches what's in the UMEM.
+- [x] `admission_ecn_marks_prepared_ipv6_ect0_packet_above_threshold` — at a non-zero UMEM offset (128); verifies `req.offset` is honoured; tclass goes ECT(0)→CE; version + flow-label nibbles unchanged.
+- [x] `admission_ecn_leaves_prepared_not_ect_packet_untouched` — NOT-ECT packet above threshold: counter unchanged, UMEM bytes byte-identical (RFC 3168 §6.1.1.1).
+- [x] `admission_ecn_skips_prepared_when_umem_slice_out_of_range` — `offset: u64::MAX / 2, len: 1` → `slice_mut_unchecked` returns None → marker returns false → counter unchanged, no panic.
+- [x] `admission_ecn_counter_increments_for_both_local_and_prepared_in_same_queue` — ECT(0) Local + ECT(0) Prepared on one queue: single counter advances by exactly 2. Counter-factual for an accidental counter split.
+- [x] Existing admission-ECN tests (6) updated to pass the new `&MmapArea` argument; all still green.
+- [x] `mark_ecn_ce_*` primitives unchanged, group 11/11 pass.
+- [x] `admission_ecn` group 11/11 pass.
+- [x] `cargo test --manifest-path userspace-dp/Cargo.toml` — full suite 680/680 pass.
+
+## Acceptance target (post-merge, orchestrator-driven)
+
+Per [`docs/cos-validation-notes.md`](https://github.com/psaab/xpf/blob/master/docs/cos-validation-notes.md), `ecn_marked` on queue 4 should become non-zero during a live 16-flow iperf3 run through the loss userspace cluster, once the test-env ECN negotiation gap is closed. This PR does not change the marker's RFC 3168 behaviour (still mark-only-on-ECT); it just lets the marker reach the packets it was already supposed to see.
+
+## Refs
+
+- #718 — ECN CE marking at CoS admission (Local-variant landing)
+- #722 — per-flow ECN mark threshold
+- #704 — umbrella cwnd-collapse symptom
+- #725 — validation-pipeline gap findings that surfaced the dormancy
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+
+---
+
+## PR #728 — userspace-dp: VLAN-aware L3 offset for ECN marking + threshold tune (fixes dormant #727) [MERGED] (merged 2026-04-17)
+
+Branch: `pr/728-vlan-l3-offset`
+
+## Summary
+
+The ECN marker added in #718 / #722 / #727 was structurally correct but **dormant on the live workload** despite verified end-to-end ECT(0) packets. Root cause: the hard-coded `TX_L3_OFFSET = 14` in both Local and Prepared markers missed the 802.1Q tag on VLAN subinterfaces (`reth0 unit 80` → frames are tagged, L3 at offset 18). The marker was reading into the VLAN TCI byte, which rarely matches ECT(0)/ECT(1), so RFC 3168 NOT-ECT early-return fired on every packet.
+
+## Fix
+
+- New `ethernet_l3_offset(bytes)` helper decodes the ethertype and hops a single 802.1Q / 802.1ad VLAN tag. Returns 14 for bare IPv4/IPv6, 18 for single-tagged, `None` for unknown ethertypes (refuses to guess).
+- `maybe_mark_ecn_ce` and `maybe_mark_ecn_ce_prepared` derive the L3 offset from each frame instead of the old constant. `TX_L3_OFFSET` deleted.
+- Constants `ETH_HDR_LEN = 14`, `VLAN_TAG_LEN = 4` replace magic numbers.
+
+Also tuned `COS_ECN_MARK_THRESHOLD` from 1/2 → 1/5. 50% was too high to catch microburst spikes; 20% fires an order of magnitude earlier and bumps the counter reliably on live load. Rustdoc on the constants documents this as a telemetry-driven tuning knob, not a from-first-principles value.
+
+## Regression pins
+
+- `maybe_mark_ecn_ce_handles_single_vlan_tagged_frame` — VLAN-tagged ECT(0) frame, asserts mark landed at byte 19 (l3_offset 18 + 1) and VLAN TCI at 14–15 is untouched. A revert to hardcoded offset 14 would stamp the TCI instead and this test fails loudly.
+- `maybe_mark_ecn_ce_rejects_unknown_ethertype` — unknown ethertype → `None` → no marking. Guards against a future refactor defaulting to 14 on unrecognised frames.
+
+## Live data (`loss:xpf-userspace-fw0`, 16-flow iperf3, 30s, port 5201)
+
+|  | Pre-fix (ecn_marked=0) | Post-fix | Δ |
+|---|---|---|---|
+| Rate ratio | 1.74× | **1.28×** | best recorded |
+| Retransmits | ~200 k | **114 k** | −43% |
+| flow_share drops | 2809 | **75** | **−97%** |
+| ecn_marked | 0 | **97 349** | ∞ |
+| Rate distribution | 42–91 Mbps | 55–71 Mbps | tight |
+
+Queue depth steady at ~150 KB (1.2 ms queueing latency at 1 Gbps, down from microburst-spike pattern). `collapsed=16/16` by the old metric definition is an artefact — all flows now hold `cwnd ≈ 12 KB` steady-state under ECN, which is correct behaviour for a rate-limited link with AQM, not the RTO-driven collapse that metric was designed to catch.
+
+## Test plan
+
+- [x] `cargo test --manifest-path userspace-dp/Cargo.toml` — 682 green, +2 new pins, 0 fail.
+- [x] Build + deploy + re-apply CoS via `./test/incus/apply-cos-config.sh`.
+- [x] 16-flow iperf3 at port 5201 with `tcp_ecn=1` end-to-end — counters bump as expected (97k marks / 30s / 16 flows).
+- [x] Server-side gRPC capture at `172.16.80.200:50051` confirmed ECT(0) preserved through the firewall pre-fix.
+
+Refs: #718, #722, #727, #725.
+
+---
+
+## PR #729 — docs: refresh cos-validation-notes with post-#728 baseline [MERGED] (merged 2026-04-17)
+
+Branch: `pr/cos-notes-post-728-refresh`
+
+## Summary
+
+- Fold the post-#728 live baseline (1.28x rate ratio, 114k retransmits, 75 flow_share drops, 97k ecn_marked per 30 s, ~150 KB queue / 1.5 ms latency, cwnd 8-17 KB) into the CoS validation methodology doc so future sessions don't start from the stale pre-ECN numbers.
+- Reframe the "ECN never negotiated" section as **resolved 2026-04-17 via #728**. The old framing was wrong: the server negotiates ECN, but the marker was reading into the 802.1Q TCI byte because `TX_L3_OFFSET=14` missed the VLAN tag on `reth0 unit 80`. Keeps the tcpdump verification command but narrows the conclusion you can draw from it.
+- Update the decision tree: new first row describes the current healthy ECN-paced baseline with microburst residual, pointing at #709 (owner-worker hotspot) / #718 Option B (CoDel) as the remaining levers. The old `flow_share high / ecn_marked 0` row now carries the #728 lesson: run the gRPC server-side capture before concluding the endpoint isn't negotiating ECN.
+- Add a new **gRPC server-side capture** section pointing at `.codex/skills/iperf-grpc-tcpdump/SKILL.md` and the helper script, with a one-liner `grpcurl` example. Explains why firewall-side netdev tcpdump is useless on AF_XDP and how this capture path unblocked #728.
+- All live numbers are tagged "Observed 2026-04-17, post-#728" so future rot is visible.
+- Docs-only. No Rust, no tests, no scripts.
+
+## Test plan
+
+- [x] `go test ./pkg/dataplane/userspace/...` — passes (docs-only change, unaffected).
+- [x] Re-read top-to-bottom for coherence; reordered so methodology (counters + gRPC capture + decision tree) sits before the dated baseline and the resolved-history section.
+- [x] Verified the `engineering-style.md#project-specific-reminders` cross-link anchor still exists (section heading unchanged at line 198).
+
+## Refs
+
+- #727, #728 — the PRs whose live data this doc now reflects
+- #725 — validation-pipeline gap that motivated the original doc
+- #709, #718 — remaining levers for the microburst residual called out in the new baseline section
+
+---
+
+## PR #730 — docs: #709 owner-worker hotspot design plan [MERGED] (merged 2026-04-17)
+
+Branch: `pr/709-architect-plan`
+
+## Summary
+
+Architect plan for #709 (low-rate exact queue owner-worker hotspot). Docs only. Implementation lands in a follow-up PR against the narrow write scope in section 4 of the plan.
+
+**Recommended slice: Option E — close the telemetry gap before committing to a structural fix.**
+
+Post-#715 / #716 / #720 / #727 / #728, the visible-to-operator symptoms of the owner hotspot (cwnd bimodality tied to RSS landing) are largely masked by ECN working. Residual per-flow variance is not distinguishable on current telemetry from CPU scheduler jitter (#712), ECN-residual microbursts, or sender-side noise. Landing Option B (work-stealing off-worker drain) against noise-level symptoms would violate [engineering-style.md](../blob/master/docs/engineering-style.md)'s discipline for performance PRs (before/after data required).
+
+Plan: [docs/709-owner-hotspot-plan.md](../blob/pr/709-architect-plan/docs/709-owner-hotspot-plan.md).
+
+Contents:
+- Options A–E summary table
+- Recommendation + why (and what it does not fix)
+- Narrow write scope: 7 files, mostly in `userspace-dp/src/afxdp/`
+- Invariants: MPSC inbox unchanged, no hot-path allocations, sampled redirect-acquire timing only
+- Acceptance criteria tied to `show class-of-service interface` + `cos-validation-notes.md` methodology
+- Out-of-scope items filed as follow-up issues on merge (B/C/D as separate issues; A subsumed by #712)
+
+## Test plan
+
+This PR is docs only — no code changes, no tests to run. The implementation PR is responsible for:
+
+- [ ] New `OwnerProfile:` line in `show class-of-service interface` on queue 4 shows non-zero drain_p50/p99 and owner_pps/peer_pps mid-iperf3
+- [ ] `flow_share_drops` / `buffer_drops` / `ecn_marked` on queue 4 unchanged from post-#728 baseline (±20%)
+- [ ] 5202 / 5203 throughput unchanged
+- [ ] Prometheus scrape adds the new series; `promtool check metrics` clean
+
+## Refs
+
+- #709 — issue this plan addresses
+- #712 — CPU pinning; Option A is subsumed there
+- #715 / #716 / #720 / #727 / #728 — merged fixes that mask the visible symptoms
+- `docs/engineering-style.md` — narrow-scope, honest-framing principles
+- `docs/cos-validation-notes.md` — validation methodology
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #731 — userspace-dp: owner-profile telemetry for low-rate exact queues (#709 Option E) [MERGED] (merged 2026-04-17)
+
+Branch: `pr/709-owner-profile-telemetry`
+
+## Summary
+
+Implements the measure-before-fix slice from `docs/709-owner-hotspot-plan.md`
+§4/§5/§6. Closes the telemetry gap that currently prevents us from
+attributing residual #704 cwnd variance on low-rate exact queues to
+the owner-worker hotspot versus CPU jitter versus ECN-residual
+microbursts.
+
+- Add `drain_latency_hist` (16 power-of-two ns buckets, 1 µs to ~16 ms),
+  `drain_invocations`, `drain_noop_invocations`, `redirect_acquire_hist`
+  (sampled 1-in-256 on peer-redirect push), and owner-vs-peer pps
+  counters on `BindingLiveState`. Bucket selection is branchless
+  (one `leading_zeros` + one saturating subtract + one min).
+- Time every `drain_shaped_tx` invocation with one pair of
+  `monotonic_nanos()` calls (VDSO, no syscall); sample
+  `enqueue_tx_owned` producer-side with a worker-seeded counter so
+  samples don't lockstep.
+- Surface via `show class-of-service interface` (new `OwnerProfile:`
+  line under the `Drops:` line, only for exact queues with a named
+  owner worker) and Prometheus (`xpf_cos_drain_latency_ns_bucket`,
+  `xpf_cos_redirect_acquire_ns_bucket`, `xpf_cos_drain_invocations_total`,
+  `xpf_cos_owner_pps`, `xpf_cos_peer_pps`).
+- New "Reading the owner-profile counters" section in
+  `docs/cos-validation-notes.md` with the decision tree §3 of the
+  plan depends on (fat drain_p99 tail → Option B; redirect_p99 > 1 ms
+  → smaller producer-side fix; owner_pps >> peer_pps → Option C/D).
+
+## Hot-path shape
+
+- Common `enqueue_tx_owned` push: +1 `fetch_add(Relaxed)` + `&` + `==` (~2-3 ns).
+- Sampled push (1-in-256): +2 `monotonic_nanos()` (~30 ns VDSO) + 1 bucket write — amortises to ~0.13 ns per push.
+- Every `drain_shaped_tx` invocation: +2 `monotonic_nanos()` + 1 bucket write (~30 ns per tick — an order of magnitude below drain itself).
+- Zero allocations. Histograms are `[AtomicU64; 16]` inline on `BindingLiveState`. No `Vec`, no `HashMap`.
+- MPSC invariants from #715 preserved: the sample timer wraps `push` externally, no new atomic on the MPSC ring itself.
+- Bucket select branchless per plan §5 invariant.
+
+## Deliberately does NOT fix
+
+- The owner hotspot itself. That's Option B (work-stealing off-owner drain) / C (RSS retargeting) / D (owner rotation), each gated on what the new telemetry shows. Deferred per plan §7.
+- Live perf numbers today. This PR is telemetry-only; it does not claim to move retransmits, cwnd, or throughput on the 16-flow iperf3 workload. The whole point is to gather data before committing to a structural change.
+
+## Prometheus cardinality
+
+Per plan §5: `num_queues (≤ 64) × num_interfaces (≤ 8) × DRAIN_HIST_BUCKETS (16) = ≤ 8192 series` for each of the two histograms, plus `512` for each of the two gauges. Total ≤ **16896 series**. Within the plan's envelope; flagging here for reviewer visibility per plan §5.
+
+## Design decisions not spelled out in the plan
+
+1. **Bucket lower-bound layout.** The plan comment sketched `ns=0..1024 → 0, 1024..2048 → 1, ... 2^(B+10)..2^(B+11) → B`. The formula `b = 54 - (ns | 1).leading_zeros()` yields `ns=1024 → 1`, not `ns=1024 → 0`. I aligned both the Rust const doc and the CLI µs-formatter on the formula's actual behavior (bucket 0 = sub-1024 ns catch-all; bucket N for N ≥ 1 = [2^(N+9), 2^(N+10))). Flagged explicitly in `bucket_index_for_ns` rustdoc.
+
+2. **Owner-profile aggregation = max, not sum.** The admission counters use `saturating_add` across workers because only the owner writes non-zero. For owner-profile histograms, sum would double-count if any peer worker surfaced the queue with identical values; max is idempotent and preserves the owner's data. Documented in `merge_owner_profile_max` rustdoc.
+
+*(truncated — 73 lines total)*
+
+
+---
+
+## PR #733 — docs: #708 enqueue pacing design plan [MERGED] (merged 2026-04-17)
+
+Branch: `pr/708-architect-plan`
+
+## Summary
+
+Architect plan for #708 enqueue-side pacing. Docs-only; the
+implementor writes code against `docs/708-enqueue-pacing-plan.md §4`
+in a follow-up PR.
+
+**Pick:** Option B — per-SFQ-bucket token bucket, reusing #711's
+`flow_bucket_bytes` array layout. Narrowest surface that plausibly
+moves the residual microburst signal.
+
+**Load-bearing ordering decision:** pacing gate sits **strictly
+after** `apply_cos_admission_ecn_policy` in `enqueue_cos_item`. ECN
+keeps priority as the lower-latency signal (#718 "mark only if
+admitted" invariant); pacing catches microbursts ECN can't react to
+in one tick. Reversing the order would make either the marker or
+the pacer dead code depending on which threshold fires first.
+
+**Honest framing (per `engineering-style.md`):** the ~114–136k
+iperf3 retransmit count on the post-#728 baseline is dominated by
+ECN-induced fast-recovery entries (100k CE marks/30s → recovery
+entries bump `RetransSegs`), not by wire loss. §3 predicts ≤10%
+movement on retrans and names a zero-valued
+`admission_pacing_drops` counter as a valid
+"close-as-implemented-dormant" outcome.
+
+## Plan structure (matches `docs/709-owner-hotspot-plan.md`)
+
+1. Problem restatement with post-#728 baseline
+2. Options A-E at-a-glance with specific verdicts (Option D
+   flagged as already landed via #727/#728 — not a new scope)
+3. Recommendation (Option B) with honest predictions
+4. Narrow write scope — exact files, exact fields, exact integration points
+5. Invariants the implementor must preserve (ECN ordering first)
+6. Acceptance criteria — quantitative, citing `cos-validation-notes.md`
+7. Out-of-scope with named follow-up issue titles
+
+## Test plan
+
+- [ ] Reviewers read the plan, flag any ordering concern (§5 "ECN
+      ordering is load-bearing" is the top risk)
+- [ ] Reviewers confirm §4 slice is small enough to land as one PR
+- [ ] Implementor spawns against §4; the plan is specific enough to
+      execute without re-reading issue threads
+
+## Refs
+
+- #708 (closes via implementation follow-up)
+- #704 umbrella, #709 companion plan, #727/#728 landed ECN marker,
+  #711 SFQ array this plan reuses, #724 counter render pattern
+- `docs/engineering-style.md` — narrow-scope, honest-framing
+
+*(truncated — 53 lines total)*
+
+
+---
+
+## PR #734 — userspace-dp: per-bucket pacing at CoS admission (#708 Option B) [MERGED] (merged 2026-04-17)
+
+Branch: `pr/708-per-bucket-pacing`
+
+## Summary
+
+Implements #708 Option B per [architect plan](docs/708-enqueue-pacing-plan.md) §4/§5: an enqueue-side per-SFQ-bucket token-bucket pacing gate that sits strictly after the ECN marker in `enqueue_cos_item`, with a new `admission_pacing_drops` counter surfaced through the CLI `Drops:` line and Prometheus.
+
+- Adds `flow_bucket_tokens: [u64; 1024]` + `flow_bucket_last_refill_ns: [u64; 1024]` on `CoSQueueRuntime`, and `admission_pacing_drops` on `CoSQueueDropCounters`.
+- Pacing gate is integrated inline in `enqueue_cos_item`. Drop-reason attribution priority: `flow_share > pacing > buffer` (plan §5 invariant).
+- Refill primitive mirrors the `elapsed_ns × rate / 1e9` math from `refill_cos_tokens`. Per-bucket rate = `queue.transmit_rate_bytes / cos_queue_prospective_active_flows()` — same denominator the per-flow share cap uses (#704 duplication guard).
+- Burst cap clamps at `COS_FLOW_FAIR_MIN_SHARE_BYTES` (fast-retransmit floor, 24 KB) so a freshly-arriving flow gets a full recovery window without pacing firing.
+- Prometheus exports `xpf_cos_admission_pacing_drops_total{ifindex, queue_id}`.
+
+## Hot-path shape
+
+Per admission, on flow-fair queues: one `refill_cos_flow_bucket_tokens` call (O(1) after the lazy per-bucket refill choice), one `cos_flow_bucket_pacing_exceeded` check, one `saturating_sub` on admit. All branchless `saturating_*` / `.min()` arithmetic. `flow_bucket_tokens` and `flow_bucket_last_refill_ns` are inline `[u64; 1024]` — no allocations.
+
+**Refill strategy: lazy per-bucket (strategy b in the brief), diverges from plan §4.** Plan §4 specified a single shared `pacing_last_refill_ns: u64` + O(1024) refill loop on every admission. At 1 Gbps × 83 kpps that's 83M u64 adds/second — pit-of-expensive. This PR lands per-bucket timestamps up front (8 KB extra per queue) to keep the hot path O(1). Plan §7 had deferred this to a follow-up; I'm landing it now because the perf cost otherwise is baked into every admission. Called out here honestly per engineering-style.md "trust but verify". If the reviewer disagrees, reverting to shared-timestamp is one array removal.
+
+## Top-of-mind risk: ECN ordering
+
+The marker MUST run before pacing. Counter-factual Rust test `pacing_gate_after_ecn_marker_ordering` reconstructs the reversed order and proves `admission_ecn_marked` does NOT bump in that formulation — meaning pacing-before-marker makes ECN dead code. This is the load-bearing invariant for the whole slice.
+
+## Honest framing on live outcome (per plan §3)
+
+`admission_pacing_drops` may land at zero on the current workload. If the ~75 residual `flow_share_drops`/30s are not microburst-driven (i.e. come from slow-timescale buildup that ECN is already marking), pacing will sit dormant. **That is a valid close-as-implemented-not-needed outcome** per plan §3, and this PR does not claim iperf3 retrans will move. The decision tree in `docs/cos-validation-notes.md` now has a row for exactly this shape.
+
+## Test plan
+
+- [x] `cargo test --manifest-path userspace-dp/Cargo.toml` — 699 passed (up from 692, +7 new tests)
+- [x] `go test ./pkg/dataplane/userspace/... ./pkg/api/...` — all green
+- [x] `go test ./...` — all green
+- [x] New Rust tests cover: refill math at queue fair rate, drop on token starvation, admit on sufficient tokens, ECN ordering counter-factual, non-flow-fair bypass, burst-cap at fast-retransmit floor, snapshot propagation
+- [x] Extended Go `TestFormatCoSInterfaceSummaryRendersAdmissionDropCounters` and the multi-queue interleave test to cover the new `pacing=N` column
+- [x] New Go `TestFormatCoSInterfaceSummaryRendersZeroPacingDropsExplicitly` pins the zero-visibility invariant from #724
+
+## Deferred
+
+- Live validation on the 16-flow / 1 Gbps exact-queue workload — orchestrator will run this after merge per the agent brief "Do NOT deploy to cluster VMs. Orchestrator validates live after merge."
+- Per-flow token-bucket pacing (plan §7 Option A) — only if this slice's counter shows ≥100k pacing drops/30s, which would mean per-bucket resolution is insufficient.
+- Option C BQL-style adaptive admission cap — deferred per plan §7.
+- `admission_flow_share_drops` and `admission_buffer_drops` Prometheus counters — only `admission_pacing_drops` is exported here per the narrow scope contract; adding the others is one more three-line block that can land in a follow-up if operators ask for it.
+
+## Refs
+
+- Closes #708 (on live-data validation)
+- Plan: `docs/708-enqueue-pacing-plan.md`
+- Methodology: `docs/cos-validation-notes.md` (decision tree updated with `pacing` column)
+- Related: #704, #705, #710, #711, #716, #717, #718, #722, #724, #727, #728
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #736 — Revert #734 pacing — burst cap too aggressive, doubles retrans; retry in #735 [MERGED] (merged 2026-04-17)
+
+Branch: `pr/revert-708-pacing`
+
+## Why revert
+
+Live validation of #734 on the 16-flow / 1 Gbps exact queue workload showed net regression on the primary jitter metrics:
+
+| Metric | pre-#708 | post-#708 | Δ |
+|---|---|---|---|
+| `flow_share_drops` / 30s | 75–156 | **0** | −100% |
+| `ecn_marked` / 30s | 97–101 k | 27 k | −73% |
+| `admission_pacing_drops` / 30s | — | **23 k** (firing heavily) | new |
+| iperf3 retransmits / 30s | 114–136 k | **260 k** | **+100%** |
+| Rate ratio | 1.24–1.28× | **1.55×** | degraded |
+
+Pacing absorbed all flow-share drops (good), but converted ECN marks into tail-drops (bad), doubling sender-side retrans.
+
+## Root cause
+
+Architect plan §5 chose burst cap = `COS_FLOW_FAIR_MIN_SHARE_BYTES = 24 KB` (the fast-retransmit floor). TCP cubic at steady state runs cwnd > 24 KB routinely during burst transmission — normal behaviour, not a microburst. Pacing drops those legitimate bursts.
+
+The ordering invariant ("ECN first, pacing second") prevents ECN becoming dead code but doesn't protect against a marked packet ALSO being dropped by pacing on a later admission: sender sees CE + drop, weights the drop heavier, ECN's smooth-backoff benefit is lost.
+
+## Next step
+
+Retry tracked in #735 with burst cap = `share_cap` (~76 KB at 16 flows on 1 Gbps) instead of `MIN_SHARE_BYTES` (24 KB). Expected to keep the flow_share-drops improvement while not converting ECN signals into drops. Re-measure before re-merging.
+
+## Test plan
+
+- [x] `cargo test` — 692 green (same as pre-#734).
+- [x] `go test ./pkg/dataplane/userspace/...` — green.
+- [ ] Re-deploy + re-validate post-revert restores 1.24× ratio / 114k retrans.
+
+Refs: #708, #734, #735, #733 (plan that needs a §5 update before retry).
 
 ---
 
