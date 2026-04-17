@@ -2480,13 +2480,27 @@ const _: () = assert!(COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS >= 1_000_000);
 const COS_SURPLUS_ROUND_QUANTUM_BYTES: u64 = 1500;
 const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 
-/// ECN CE-marking threshold as a fraction of `buffer_limit`. At 50%
-/// the scheduler signals TCP to back off well before the aggregate
-/// cap trips, so ECN-negotiated flows converge on their fair share
-/// with smooth cwnd dynamics instead of the drop->RTO->cwnd=1MSS
-/// oscillation documented in #718's live data.
+/// ECN CE-marking threshold as a fraction of the relevant cap.
+/// Applied to both the aggregate `buffer_limit` and the per-flow
+/// `share_cap` in `apply_cos_admission_ecn_policy`.
+///
+/// Initially 1/2. Live validation on the 16-flow / 1 Gbps exact queue
+/// workload (see `docs/cos-validation-notes.md`) showed the 50% mark
+/// never fired: aggregate steady-state at ~31% utilisation, per-flow
+/// buckets averaging ~36% of share_cap with brief spikes that hit the
+/// hard cap and drop before the admission loop observed them cross
+/// 50%. Lowered to 1/5 (20%) so marks fire an order of magnitude
+/// earlier — roughly when a flow reaches 3 dupacks' worth of buffering
+/// under steady fair-share — giving ECN-negotiated TCP room to halve
+/// cwnd smoothly before a microburst pushes the bucket past the cap.
+///
+/// This is a tuning knob against live counter telemetry, not a
+/// from-first-principles derivation. If `admission_ecn_marked` stays
+/// pathologically low under load despite ECT traffic, lower further;
+/// if marks fire so often that throughput drops (ECN double-backoff),
+/// raise. Observe via `show class-of-service interface`.
 const COS_ECN_MARK_THRESHOLD_NUM: u64 = 1;
-const COS_ECN_MARK_THRESHOLD_DEN: u64 = 2;
+const COS_ECN_MARK_THRESHOLD_DEN: u64 = 5;
 
 // Guard against a refactor flipping the fraction. A threshold >= 1
 // would never fire (queue is capped at buffer_limit) and a zero
@@ -2501,10 +2515,50 @@ const ECN_ECT_0: u8 = 0b0000_0010;
 const ECN_ECT_1: u8 = 0b0000_0001;
 const ECN_CE: u8 = 0b0000_0011;
 
-/// Offset of the L3 header inside a TxRequest's `bytes` buffer. TxRequest
-/// construction sites always wrap the frame with a 14-byte Ethernet
-/// header (6 dst MAC + 6 src MAC + 2 ethertype) so L3 starts at byte 14.
-const TX_L3_OFFSET: usize = 14;
+/// Size of a bare Ethernet header (6 dst MAC + 6 src MAC + 2 ethertype).
+const ETH_HDR_LEN: usize = 14;
+/// Size of a single 802.1Q VLAN tag (TPID + TCI).
+const VLAN_TAG_LEN: usize = 4;
+
+/// Derive the L3 header offset from an Ethernet-framed buffer, taking
+/// a single 802.1Q / 802.1ad VLAN tag into account. Returns `None` for
+/// buffers too short to decode or ethertypes that aren't recognised.
+///
+/// The CoS admission path sees frames post-forward-build, so VLAN tags
+/// from tagged subinterfaces (e.g. `reth0 unit 80`) are already
+/// present. Hard-coding offset=14 misses that — on a VLAN-tagged
+/// interface it would point into the TCI byte instead of the IPv4 TOS
+/// or IPv6 traffic-class byte, and ECN marking would silently no-op
+/// because the extracted "ECN bits" actually live inside the VLAN
+/// priority / CFI field and rarely match ECT(0)/ECT(1). This helper
+/// fixes that regression (surfaced live on the #727 validation run:
+/// packets were ECT(0) end-to-end per gRPC capture, but
+/// `admission_ecn_marked` stayed at zero because the TOS byte we were
+/// reading wasn't the TOS byte).
+///
+/// Double-VLAN (QinQ) is not covered yet — the inner tag would need
+/// a second 4-byte hop — but the lab fixture uses single-VLAN unit-80
+/// subinterfaces, so this covers the exercised path. QinQ can be added
+/// without touching the markers themselves.
+#[inline]
+fn ethernet_l3_offset(bytes: &[u8]) -> Option<usize> {
+    if bytes.len() < ETH_HDR_LEN {
+        return None;
+    }
+    let ethertype = u16::from_be_bytes([bytes[12], bytes[13]]);
+    match ethertype {
+        // IPv4, IPv6 — no VLAN tag, L3 starts immediately after the eth header.
+        0x0800 | 0x86DD => Some(ETH_HDR_LEN),
+        // 802.1Q / 802.1ad single VLAN tag — L3 starts 4 bytes later.
+        0x8100 | 0x88A8 => {
+            if bytes.len() < ETH_HDR_LEN + VLAN_TAG_LEN {
+                return None;
+            }
+            Some(ETH_HDR_LEN + VLAN_TAG_LEN)
+        }
+        _ => None,
+    }
+}
 
 /// Mark the IPv4 packet at `l3_offset` within `bytes` as ECN CE if it
 /// is already ECT(0) or ECT(1). Updates the IP header checksum
@@ -2592,9 +2646,12 @@ fn mark_ecn_ce_ipv6(bytes: &mut [u8], l3_offset: usize) -> bool {
 /// the TxRequest. Returns true iff the packet was marked.
 #[inline]
 fn maybe_mark_ecn_ce(req: &mut TxRequest) -> bool {
+    let Some(l3_offset) = ethernet_l3_offset(&req.bytes) else {
+        return false;
+    };
     match req.expected_addr_family as i32 {
-        libc::AF_INET => mark_ecn_ce_ipv4(&mut req.bytes, TX_L3_OFFSET),
-        libc::AF_INET6 => mark_ecn_ce_ipv6(&mut req.bytes, TX_L3_OFFSET),
+        libc::AF_INET => mark_ecn_ce_ipv4(&mut req.bytes, l3_offset),
+        libc::AF_INET6 => mark_ecn_ce_ipv6(&mut req.bytes, l3_offset),
         _ => false,
     }
 }
@@ -2632,9 +2689,12 @@ fn maybe_mark_ecn_ce_prepared(req: &PreparedTxRequest, umem: &MmapArea) -> bool 
     let Some(bytes) = (unsafe { umem.slice_mut_unchecked(offset, len) }) else {
         return false;
     };
+    let Some(l3_offset) = ethernet_l3_offset(bytes) else {
+        return false;
+    };
     match req.expected_addr_family as i32 {
-        libc::AF_INET => mark_ecn_ce_ipv4(bytes, TX_L3_OFFSET),
-        libc::AF_INET6 => mark_ecn_ce_ipv6(bytes, TX_L3_OFFSET),
+        libc::AF_INET => mark_ecn_ce_ipv4(bytes, l3_offset),
+        libc::AF_INET6 => mark_ecn_ce_ipv6(bytes, l3_offset),
         _ => false,
     }
 }
@@ -10496,6 +10556,85 @@ mod tests {
         assert!(!maybe_mark_ecn_ce(&mut req));
     }
 
+    /// Regression pin for the VLAN-tagged admission path discovered in
+    /// the #727 live validation: a single 802.1Q tag (ethertype 0x8100)
+    /// pushes L3 four bytes deeper. `maybe_mark_ecn_ce` must detect
+    /// that via `ethernet_l3_offset` and still mark the ECN bits at
+    /// the correct offset rather than stamping into the VLAN TCI.
+    #[test]
+    fn maybe_mark_ecn_ce_handles_single_vlan_tagged_frame() {
+        // Build a standard IPv4 test packet, then splice a 4-byte VLAN
+        // tag between the MAC addresses and the ethertype. The result
+        // is: 6 dst + 6 src + TPID(0x8100) + TCI(VID=80, prio=5) +
+        //     EthType(0x0800) + <20-byte IPv4 header>.
+        let tos = ECN_ECT_0;
+        let base = build_ipv4_test_packet(tos);
+        let mut tagged = Vec::with_capacity(base.len() + 4);
+        tagged.extend_from_slice(&base[..12]); // dst + src MAC
+        tagged.extend_from_slice(&[0x81, 0x00]); // TPID
+        // TCI: priority 5 << 13 | DEI 0 | VID 80.
+        let tci: u16 = (5 << 13) | 80;
+        tagged.extend_from_slice(&tci.to_be_bytes());
+        tagged.extend_from_slice(&[0x08, 0x00]); // inner ethertype (IPv4)
+        tagged.extend_from_slice(&base[14..]); // IPv4 header + payload
+
+        // Confirm `ethernet_l3_offset` resolves to 18 for this frame.
+        assert_eq!(ethernet_l3_offset(&tagged), Some(18));
+
+        let mut req = TxRequest {
+            bytes: tagged,
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 1,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        };
+        assert!(
+            maybe_mark_ecn_ce(&mut req),
+            "VLAN-tagged ECT(0) frame must be marked at the VLAN-shifted L3 offset"
+        );
+        // TOS byte sits at l3_offset + 1 = 19 in the tagged frame.
+        assert_eq!(req.bytes[19] & ECN_MASK, ECN_CE);
+        // And critically: the VLAN TCI bytes must NOT have been
+        // mutated — if the old hardcoded offset 14 had hit, the "ECN
+        // bits" we'd have touched are inside the VLAN priority nibble
+        // at byte 15, which we assert stayed intact.
+        let tci_after = u16::from_be_bytes([req.bytes[14], req.bytes[15]]);
+        assert_eq!(
+            tci_after, tci,
+            "VLAN TCI must be untouched by ECN marking"
+        );
+    }
+
+    /// Counter-factual: ethertype 0 (or anything we don't understand)
+    /// returns None from `ethernet_l3_offset`, so marking is a no-op.
+    /// Guards against a regression that defaults to offset 14 on
+    /// unknown frames.
+    #[test]
+    fn maybe_mark_ecn_ce_rejects_unknown_ethertype() {
+        let mut req = TxRequest {
+            bytes: {
+                let mut b = build_ipv4_test_packet(ECN_ECT_0);
+                b[12] = 0x12;
+                b[13] = 0x34;
+                b
+            },
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 1,
+            cos_queue_id: Some(0),
+            dscp_rewrite: None,
+        };
+        assert_eq!(ethernet_l3_offset(&req.bytes), None);
+        assert!(!maybe_mark_ecn_ce(&mut req));
+        // ECT(0) bits at the would-have-been-wrong-offset untouched.
+        assert_eq!(req.bytes[15] & ECN_MASK, ECN_ECT_0);
+    }
+
     /// Helper: build a `CoSPendingTxItem::Local` with an IPv4 test
     /// packet carrying the given TOS byte. Default flow key routes it
     /// into queue 0 of `test_cos_runtime_with_exact`.
@@ -10564,8 +10703,13 @@ mod tests {
         let mut root = test_cos_runtime_with_exact(false);
         let queue = &mut root.queues[0];
         let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
-        // Exactly at threshold — `>` comparison must not fire.
-        queue.queued_bytes = buffer_limit / 2;
+        // Exactly at the mark threshold — `>` comparison must not fire.
+        // Written against the constants so retuning NUM/DEN doesn't
+        // silently break this pin; at any fraction < 1, an at-threshold
+        // queue must stay unmarked by the `>` comparison in
+        // `apply_cos_admission_ecn_policy`.
+        queue.queued_bytes =
+            buffer_limit * COS_ECN_MARK_THRESHOLD_NUM / COS_ECN_MARK_THRESHOLD_DEN;
         let before = snapshot_counters(queue);
 
         let mut item = test_local_ipv4_item(ECN_ECT_0);
@@ -10728,9 +10872,12 @@ mod tests {
 
         // buffer_limit at 16 active flows: 16 × 24 KB = 384 KB (clamped
         // by delay_cap = 625 KB on a 1 Gbps queue @ 5 ms). share_cap =
-        // 384000 / 16 = 24000. aggregate_ecn_threshold = 192000.
-        // flow_ecn_threshold = 12000.
-        let target_bucket_bytes = 15_000; // > 12 000 per-flow threshold
+        // 384000 / 16 = 24000. At the current NUM/DEN = 1/5 (20%), the
+        // thresholds are aggregate = 384000 / 5 = 76_800 and per-flow =
+        // 24000 / 5 = 4_800. If NUM/DEN is retuned, both derived values
+        // move together — the asserts below are written against the
+        // constants, not baked-in magic numbers.
+        let target_bucket_bytes = 15_000; // > 4 800 per-flow threshold with a generous margin
         let queued_bytes = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
         queue.queued_bytes = queued_bytes;
         let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
@@ -10741,8 +10888,16 @@ mod tests {
             buffer_limit.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
         let flow_ecn_threshold =
             share_cap.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
-        assert_eq!(aggregate_ecn_threshold, 192_000);
-        assert_eq!(flow_ecn_threshold, 12_000);
+        assert_eq!(
+            aggregate_ecn_threshold,
+            buffer_limit * COS_ECN_MARK_THRESHOLD_NUM / COS_ECN_MARK_THRESHOLD_DEN,
+            "aggregate threshold must track the constants",
+        );
+        assert_eq!(
+            flow_ecn_threshold,
+            share_cap * COS_ECN_MARK_THRESHOLD_NUM / COS_ECN_MARK_THRESHOLD_DEN,
+            "per-flow threshold must track the constants",
+        );
 
         // Counter-factual: reconstruct the pre-#722 aggregate-only
         // formula and assert that on this exact state it would NOT
