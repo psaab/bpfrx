@@ -837,6 +837,19 @@ pub(crate) struct CoSQueueStatus {
     /// per-queue retrans rates fall while this increments.
     #[serde(rename = "admission_ecn_marked", default)]
     pub admission_ecn_marked: u64,
+    /// #708: packets tail-dropped by the per-SFQ-bucket pacing gate
+    /// because the target bucket had fewer pacing tokens than the
+    /// packet's byte count. Sits *after* the ECN marker in
+    /// `enqueue_cos_item` so ECT packets above the ECN threshold get
+    /// marked on the previously-admitted packet AND tail-dropped
+    /// here — consistent signals for the sender. A non-zero value
+    /// with a steady `admission_ecn_marked` means pacing is absorbing
+    /// microbursts the ECN marker couldn't catch in time.
+    /// Zero with a steady `admission_flow_share_drops` means the
+    /// residual is not microburst-driven; per plan §3 that is a valid
+    /// "gate implemented, dormant on workload" outcome.
+    #[serde(rename = "admission_pacing_drops", default)]
+    pub admission_pacing_drops: u64,
     #[serde(rename = "root_token_starvation_parks", default)]
     pub root_token_starvation_parks: u64,
     #[serde(rename = "queue_token_starvation_parks", default)]

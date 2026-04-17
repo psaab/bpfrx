@@ -174,13 +174,14 @@ func TestFormatCoSInterfaceSummaryRendersAdmissionDropCounters(t *testing.T) {
 						AdmissionFlowShareDrops: 12345,
 						AdmissionBufferDrops:    0,
 						AdmissionEcnMarked:      4567,
+						AdmissionPacingDrops:    890,
 					},
 				},
 			},
 		},
 	}
 	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
-	want := "Drops: flow_share=12345  buffer=0  ecn_marked=4567"
+	want := "Drops: flow_share=12345  buffer=0  ecn_marked=4567  pacing=890"
 	if !strings.Contains(out, want) {
 		t.Fatalf("missing %q in output:\n%s", want, out)
 	}
@@ -214,6 +215,7 @@ func TestFormatCoSInterfaceSummaryInterleavesPerQueueDropsInOrder(t *testing.T) 
 						AdmissionFlowShareDrops: 11,
 						AdmissionBufferDrops:    22,
 						AdmissionEcnMarked:      33,
+						AdmissionPacingDrops:    77,
 					},
 					{
 						QueueID:                 4,
@@ -226,6 +228,7 @@ func TestFormatCoSInterfaceSummaryInterleavesPerQueueDropsInOrder(t *testing.T) 
 						AdmissionFlowShareDrops: 44,
 						AdmissionBufferDrops:    55,
 						AdmissionEcnMarked:      66,
+						AdmissionPacingDrops:    99,
 					},
 				},
 			},
@@ -244,8 +247,8 @@ func TestFormatCoSInterfaceSummaryInterleavesPerQueueDropsInOrder(t *testing.T) 
 	// (not under the next queue's). We pin that with unique counter
 	// values per queue (33 vs 66) so a misaligned interleave would be
 	// detectable.
-	q0Drops := "Drops: flow_share=11  buffer=22  ecn_marked=33"
-	q4Drops := "Drops: flow_share=44  buffer=55  ecn_marked=66"
+	q0Drops := "Drops: flow_share=11  buffer=22  ecn_marked=33  pacing=77"
+	q4Drops := "Drops: flow_share=44  buffer=55  ecn_marked=66  pacing=99"
 	// The word "best-effort" anchors queue 0's row. "bandwidth-10mb"
 	// anchors queue 4's. Both strings appear exactly once in the
 	// output (once in the data row).
@@ -446,8 +449,47 @@ func TestFormatCoSInterfaceSummaryRendersZeroAdmissionCounters(t *testing.T) {
 		},
 	}
 	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
-	want := "Drops: flow_share=0  buffer=0  ecn_marked=0"
+	want := "Drops: flow_share=0  buffer=0  ecn_marked=0  pacing=0"
 	if !strings.Contains(out, want) {
 		t.Fatalf("missing %q in output (zero-valued drops must still render):\n%s", want, out)
+	}
+}
+
+// #708: The pacing= column MUST render explicitly at zero, not be
+// omitted when zero. Same zero-visibility invariant as #724 for the
+// other admission counters: an operator looking at the Drops line on
+// a freshly-deployed firewall needs to see every column wired so they
+// can tell "pacing never fired" apart from "pacing column was dropped
+// in a rebase". Counter-factual: if the renderer ever adds a
+// `omitEmpty`-style short-circuit for zero pacing drops, this test
+// fails while the non-zero tests above keep passing.
+func TestFormatCoSInterfaceSummaryRendersZeroPacingDropsExplicitly(t *testing.T) {
+	owner := uint32(1)
+	status := &ProcessStatus{
+		CoSInterfaces: []CoSInterfaceStatus{
+			{
+				InterfaceName:   "reth0.80",
+				OwnerWorkerID:   &owner,
+				WorkerInstances: 1,
+				Queues: []CoSQueueStatus{
+					{
+						QueueID:                 4,
+						OwnerWorkerID:           &owner,
+						ForwardingClass:         "bandwidth-10mb",
+						AdmissionFlowShareDrops: 42,
+						AdmissionBufferDrops:    17,
+						AdmissionEcnMarked:      8,
+						// AdmissionPacingDrops intentionally zero — the
+						// column must still render as "pacing=0", not
+						// be omitted.
+					},
+				},
+			},
+		},
+	}
+	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	want := "Drops: flow_share=42  buffer=17  ecn_marked=8  pacing=0"
+	if !strings.Contains(out, want) {
+		t.Fatalf("missing %q in output (zero pacing column must render):\n%s", want, out)
 	}
 }

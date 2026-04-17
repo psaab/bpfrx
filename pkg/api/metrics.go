@@ -84,6 +84,11 @@ type xpfCollector struct {
 	cosRedirectAcquireBucket *prometheus.Desc
 	cosOwnerPPS              *prometheus.Desc
 	cosPeerPPS               *prometheus.Desc
+
+	// #708: per-SFQ-bucket pacing-gate drops, per (ifindex, queue_id).
+	// Cardinality: num_queues (≤ 64) × num_interfaces (≤ 8) ≤ 512
+	// series.
+	cosAdmissionPacingDrops *prometheus.Desc
 }
 
 func newCollector(srv *Server) *xpfCollector {
@@ -295,6 +300,20 @@ func newCollector(srv *Server) *xpfCollector {
 			"CoS peer-redirected pps (window accumulator, cleared by operator) (#709).",
 			[]string{"ifindex", "queue_id"}, nil,
 		),
+		// #708: per-SFQ-bucket pacing-gate drops. Monotonic counter —
+		// one increment per packet tail-dropped because its target
+		// bucket had fewer pacing tokens than the packet's byte count.
+		// Sits after the ECN marker in the admission pipeline, so a
+		// rising counter with a steady `admission_ecn_marked` means
+		// pacing is absorbing microbursts the marker couldn't catch in
+		// time. Zero with rising `admission_flow_share_drops` means
+		// the residual is not microburst-driven; per plan §3 that is a
+		// valid "gate implemented, dormant on workload" outcome.
+		cosAdmissionPacingDrops: prometheus.NewDesc(
+			"xpf_cos_admission_pacing_drops_total",
+			"Packets tail-dropped by the per-SFQ-bucket pacing gate at CoS admission (#708).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
 	}
 }
 
@@ -338,6 +357,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cosRedirectAcquireBucket
 	ch <- c.cosOwnerPPS
 	ch <- c.cosPeerPPS
+	ch <- c.cosAdmissionPacingDrops
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
@@ -377,13 +397,21 @@ func (c *xpfCollector) collectCoSOwnerProfile(ch chan<- prometheus.Metric, dp da
 	for _, iface := range status.CoSInterfaces {
 		ifindexLabel := strconv.Itoa(iface.Ifindex)
 		for _, queue := range iface.Queues {
+			queueLabel := strconv.Itoa(queue.QueueID)
+			// #708: pacing-gate drop counter is NOT gated on
+			// OwnerWorkerID — it applies to every flow-fair queue
+			// regardless of owner-binding shape. Emit before the
+			// owner-profile gate so shared_exact / non-exact queues
+			// still surface pacing drops.
+			ch <- prometheus.MustNewConstMetric(c.cosAdmissionPacingDrops,
+				prometheus.CounterValue, float64(queue.AdmissionPacingDrops),
+				ifindexLabel, queueLabel)
 			// Only exact queues with a named owner worker have
 			// meaningful owner-profile telemetry. See cosfmt.go for
 			// the same gating on the CLI side.
 			if queue.OwnerWorkerID == nil {
 				continue
 			}
-			queueLabel := strconv.Itoa(queue.QueueID)
 			emitHistogram(ch, c.cosDrainLatencyBucket,
 				queue.DrainLatencyHist, ifindexLabel, queueLabel)
 			emitHistogram(ch, c.cosRedirectAcquireBucket,
