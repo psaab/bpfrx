@@ -8102,8 +8102,9 @@ mod tests {
         // the per-flow clamp used `active + (target bucket empty ? 1 :
         // 0)`, so the first packet of a newly arriving flow could
         // pass the per-flow gate and fail the aggregate one right at
-        // the boundary. This test pins the fix by driving exactly that
-        // case.
+        // the boundary. This test drives the queue to the *actual*
+        // admission boundary so the assertion exercises the old
+        // failure mode rather than trivial 0-bytes arithmetic.
         let mut root = test_cos_runtime_with_queues(
             25_000_000_000 / 8,
             vec![CoSQueueConfig {
@@ -8120,30 +8121,59 @@ mod tests {
         let queue = &mut root.queues[0];
         queue.flow_fair = true;
 
-        // 15 active flows, target bucket empty → prospective = 16.
-        // Both caps must key off 16, not 15.
+        // 15 active flows filled to 24 KB each. Target bucket empty →
+        // prospective_active = 16. Both caps must key off 16, not 15.
         queue.active_flow_buckets = 15;
         for bucket in 0..15 {
-            queue.flow_bucket_bytes[bucket] = 1_000;
+            queue.flow_bucket_bytes[bucket] = COS_FLOW_FAIR_MIN_SHARE_BYTES;
         }
+        // Aggregate queued equals the pre-fix aggregate cap exactly —
+        // this is the value that made the bug observable: under the
+        // old formula the aggregate cap was `15 × min-share` and the
+        // check `queued + 1500 > cap` tripped; under the fix the cap
+        // is `16 × min-share` and the packet fits.
+        queue.queued_bytes = 15 * COS_FLOW_FAIR_MIN_SHARE_BYTES;
+
         let new_flow_bucket = 100;
         assert_eq!(queue.flow_bucket_bytes[new_flow_bucket], 0);
 
         let buffer_limit = cos_flow_aware_buffer_limit(queue, new_flow_bucket);
         let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, new_flow_bucket);
 
-        // 16 × 24 KB = 384 KB aggregate; 384 KB / 16 = 24 KB per-flow.
+        // Fixed caps: aggregate = 16 × min-share, per-flow = min-share.
         assert_eq!(buffer_limit, 16 * COS_FLOW_FAIR_MIN_SHARE_BYTES);
         assert_eq!(share_cap, COS_FLOW_FAIR_MIN_SHARE_BYTES);
-        // A single MTU-sized packet for the new flow must fit under
-        // BOTH caps simultaneously — this is the regression guard.
+
+        // Per-flow gate: new bucket is empty, so +1500 is well below cap.
         assert!(
             queue.flow_bucket_bytes[new_flow_bucket].saturating_add(1500) <= share_cap,
             "per-flow share must admit the new flow's first packet"
         );
+
+        // Aggregate gate: queued is at the pre-fix cap. Fix makes
+        // +1500 still fit; without the fix this was a drop.
         assert!(
             queue.queued_bytes.saturating_add(1500) <= buffer_limit,
-            "aggregate cap must also admit the new flow's first packet at the boundary"
+            "aggregate cap must admit the new flow's first packet at the near-cap boundary \
+             (queued_bytes = {}, +1500 must fit within buffer_limit = {})",
+            queue.queued_bytes,
+            buffer_limit,
+        );
+
+        // Counter-factual: prove the pre-fix formula (non-prospective)
+        // would have rejected the same packet. Guards against a future
+        // refactor silently reverting to `active_flow_buckets` without
+        // the `+1` bump.
+        let non_prospective_cap = u64::from(queue.active_flow_buckets)
+            .max(1)
+            .saturating_mul(COS_FLOW_FAIR_MIN_SHARE_BYTES)
+            .max(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
+        assert!(
+            queue.queued_bytes.saturating_add(1500) > non_prospective_cap,
+            "without prospective-active, the same queued state would reject the new flow \
+             (queued_bytes + 1500 = {}, non-prospective cap = {})",
+            queue.queued_bytes + 1500,
+            non_prospective_cap,
         );
     }
 
