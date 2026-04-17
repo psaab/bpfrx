@@ -8556,7 +8556,7 @@ mod tests {
     //
     // Purpose: establish an in-tree, reproducible measurement of the
     // userspace drain-path cost per packet. The value of
-    // `COS_SHARED_EXACT_MIN_RATE_BYTES` (2.5 Gbps) is cited in commit
+    // `COS_SHARED_EXACT_COS_SHARED_EXACT_MIN_RATE_BYTES` (2.5 Gbps) is cited in commit
     // history as "the single-worker sustained exact throughput ceiling";
     // before this harness existed there was no checked-in data supporting
     // that number.
@@ -8595,26 +8595,36 @@ mod tests {
     //     and must drop. (Unlikely — drain is tightly bounded by a
     //     1500-byte memcpy and a few VecDeque ops.)
     //
-    // Running: `cargo test --manifest-path userspace-dp/Cargo.toml
-    //           cos_exact_drain_throughput_micro_bench -- --ignored
-    //           --nocapture`
+    // Running (release is mandatory — debug build numbers are not
+    // meaningful for this baseline):
+    //   cargo test --release --manifest-path userspace-dp/Cargo.toml \
+    //       cos_exact_drain_throughput_micro_bench -- --ignored --nocapture
+    //
+    // The bench reports two separate timings:
+    //   - "drain+settle (measured)" — the inner loop only. Setup work
+    //     (VecDeque priming, packet cloning, free-frame pool rebuild)
+    //     is excluded.
+    //   - "setup (per batch, unmeasured)" — setup cost printed for
+    //     reference so future changes to the setup path are visible.
     //
     // Hardware and noise: numbers depend on the box's core frequency
     // and L1/L2 cache state. Run on quiet hardware; the published
     // baseline in this commit's message was captured under those
     // conditions. A repeat run after a refactor should stay within
-    // ~15% of the baseline — larger deltas warrant investigation.
+    // ~15% of the baseline on the same host — larger deltas warrant
+    // investigation. A single development-host measurement does NOT
+    // validate the MIN constant on other deployment hardware; it only
+    // rules out the inner drain loop as the limiter on this host.
     // ---------------------------------------------------------------------
     #[test]
     #[ignore]
     fn cos_exact_drain_throughput_micro_bench() {
         use std::time::Instant;
 
-        // Mirror of `COS_SHARED_EXACT_MIN_RATE_BYTES` in `worker.rs`. Kept
-        // as a local const so this bench does not require widening that
-        // constant's visibility. If `worker.rs` changes the MIN, update
-        // this mirror — the bench asserts against it for the verdict.
-        const MIN_RATE_BYTES: u64 = 2_500_000_000 / 8;
+        // Single source of truth — `worker::COS_SHARED_EXACT_MIN_RATE_BYTES`
+        // is `pub(super)` so the bench asserts against the production
+        // constant directly rather than carrying a mirror that could drift.
+        use super::super::worker::COS_SHARED_EXACT_MIN_RATE_BYTES;
         const PACKET_LEN: usize = 1500;
         const BATCHES: usize = 10_000;
         // Each drain call takes TX_BATCH_SIZE items. Prime enough items
@@ -8694,15 +8704,24 @@ mod tests {
             );
         }
 
-        // Measurement.
-        let start = Instant::now();
+        // Measurement. Setup (priming, packet cloning, free-frame pool
+        // rebuild) happens outside the `iter_start.elapsed()` window so
+        // the reported ns/packet reflects only drain+settle. Setup cost
+        // is separately accumulated and printed for reference.
+        use std::time::Duration;
+        let mut measured = Duration::ZERO;
+        let mut setup_time = Duration::ZERO;
         let mut total_packets = 0u64;
         let mut total_bytes = 0u64;
         for _ in 0..BATCHES {
+            let setup_start = Instant::now();
             prime_queue(&mut root.queues[0], &packet_bytes);
             scratch.clear();
-            free_frames = (0..ITEMS_PER_BATCH as u64).map(|i| i * 4096).collect();
+            free_frames.clear();
+            free_frames.extend((0..ITEMS_PER_BATCH as u64).map(|i| i * 4096));
+            setup_time += setup_start.elapsed();
 
+            let iter_start = Instant::now();
             let build = drain_exact_local_fifo_items_to_scratch(
                 &mut root.queues[0],
                 &mut free_frames,
@@ -8712,7 +8731,6 @@ mod tests {
                 u64::MAX,
                 None,
             );
-            assert!(matches!(build, ExactCoSScratchBuild::Ready));
             let inserted = scratch.len();
             let (sent_pkts, sent_bytes) = settle_exact_local_fifo_submission(
                 Some(&mut root.queues[0]),
@@ -8720,34 +8738,38 @@ mod tests {
                 &mut scratch,
                 inserted,
             );
+            measured += iter_start.elapsed();
+
+            assert!(matches!(build, ExactCoSScratchBuild::Ready));
             total_packets += sent_pkts;
             total_bytes += sent_bytes;
         }
-        let elapsed = start.elapsed();
 
-        let ns_per_packet = elapsed.as_nanos() as f64 / total_packets as f64;
-        let mpps = total_packets as f64 / elapsed.as_secs_f64() / 1.0e6;
-        let gbps = (total_bytes as f64 * 8.0) / elapsed.as_secs_f64() / 1.0e9;
+        let ns_per_packet = measured.as_nanos() as f64 / total_packets as f64;
+        let mpps = total_packets as f64 / measured.as_secs_f64() / 1.0e6;
+        let gbps = (total_bytes as f64 * 8.0) / measured.as_secs_f64() / 1.0e9;
+        let setup_ns_per_packet = setup_time.as_nanos() as f64 / total_packets as f64;
 
         eprintln!(
             "\n=== #698 exact-drain userspace micro-bench ===\n\
-             packet len            : {} B\n\
-             batches               : {}\n\
-             packets per batch     : {}\n\
-             total packets         : {}\n\
-             total bytes           : {} ({:.2} MB)\n\
-             elapsed               : {:?}\n\
+             packet len              : {} B\n\
+             batches                 : {}\n\
+             packets per batch       : {}\n\
+             total packets           : {}\n\
+             total bytes             : {} ({:.2} MB)\n\
+             drain+settle (measured) : {:?}\n\
+             setup (per batch, unmeasured): {:?}\n\
              ns/packet (drain+settle): {:.2}\n\
-             throughput (pps)      : {:.3} Mpps\n\
-             throughput (line rate): {:.3} Gbps\n\
-             min-constant gate     : {:.3} Gbps (MIN_RATE_BYTES)\n\
-             verdict               : {}\n\
-             scope note            : userspace drain path only; excludes TX\n\
-                                     ring insert/commit, kernel wakeup, and\n\
-                                     completion ring reap. Live per-worker\n\
-                                     aggregate ceiling is lower because RX +\n\
-                                     forward + NAT + session work consume\n\
-                                     most of the per-packet budget.\n\
+             ns/packet (setup only)  : {:.2}\n\
+             throughput (pps)        : {:.3} Mpps\n\
+             throughput (line rate)  : {:.3} Gbps\n\
+             min-constant gate       : {:.3} Gbps (COS_SHARED_EXACT_MIN_RATE_BYTES)\n\
+             verdict (this host)     : {}\n\
+             scope note              : userspace drain path only; excludes TX\n\
+                                       ring insert/commit, kernel wakeup, and\n\
+                                       completion ring reap. Single-host number\n\
+                                       only — does not validate MIN on other\n\
+                                       deployment hardware.\n\
              ================================================\n",
             PACKET_LEN,
             BATCHES,
@@ -8755,15 +8777,19 @@ mod tests {
             total_packets,
             total_bytes,
             total_bytes as f64 / (1024.0 * 1024.0),
-            elapsed,
+            measured,
+            setup_time,
             ns_per_packet,
+            setup_ns_per_packet,
             mpps,
             gbps,
-            (MIN_RATE_BYTES * 8) as f64 / 1.0e9,
-            if gbps > (MIN_RATE_BYTES * 8) as f64 / 1.0e9 {
-                "drain alone exceeds MIN — constant gated by non-drain per-worker work (expected)"
+            (COS_SHARED_EXACT_MIN_RATE_BYTES * 8) as f64 / 1.0e9,
+            if gbps > (COS_SHARED_EXACT_MIN_RATE_BYTES * 8) as f64 / 1.0e9 {
+                "drain alone exceeds MIN on this host — rules out drain as \
+                 the immediate limiter here"
             } else {
-                "drain alone below MIN — constant is TOO HIGH; lower it and re-validate live"
+                "drain alone below MIN on this host — constant is TOO HIGH, \
+                 lower it and re-validate live"
             },
         );
 
