@@ -30,15 +30,26 @@ struct Slot<T> {
     val: UnsafeCell<MaybeUninit<T>>,
 }
 
+/// Force a field onto its own 64-byte cache line. Producers CAS `head`
+/// while the owner worker advances `tail`; without this padding the two
+/// atomics would share a line and every producer operation would
+/// invalidate the consumer's cached view of `tail` (and vice versa),
+/// which re-introduces exactly the kind of cross-core coherence traffic
+/// the lock-free conversion is trying to eliminate.
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
 pub(super) struct MpscInbox<T> {
     slots: Box<[Slot<T>]>,
     mask: usize,
-    /// Producer cursor. Advanced via CAS by any pushing thread.
-    head: AtomicUsize,
+    /// Producer cursor. Advanced via CAS by any pushing thread. On its
+    /// own cache line to avoid false sharing with `tail`.
+    head: CachePadded<AtomicUsize>,
     /// Consumer cursor. Advanced only by the single consumer (the owner
     /// worker for this binding). Exposed atomically so producers and the
-    /// `is_empty` / `len` helpers can observe it.
-    tail: AtomicUsize,
+    /// `is_empty` / `len` helpers can observe it. On its own cache line
+    /// to avoid false sharing with `head`.
+    tail: CachePadded<AtomicUsize>,
 }
 
 // Safety: the queue is designed to be shared across producer threads and
@@ -62,8 +73,8 @@ impl<T> MpscInbox<T> {
         Self {
             slots,
             mask: cap - 1,
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            head: CachePadded(AtomicUsize::new(0)),
+            tail: CachePadded(AtomicUsize::new(0)),
         }
     }
 
@@ -78,19 +89,19 @@ impl<T> MpscInbox<T> {
     /// the updated `tail`. Safe for observability and soft-cap gating.
     #[inline]
     pub(super) fn len(&self) -> usize {
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.0.load(Ordering::Relaxed);
+        let tail = self.tail.0.load(Ordering::Relaxed);
         head.wrapping_sub(tail)
     }
 
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
-        self.head.load(Ordering::Relaxed) == self.tail.load(Ordering::Relaxed)
+        self.head.0.load(Ordering::Relaxed) == self.tail.0.load(Ordering::Relaxed)
     }
 
     /// Multi-producer push. Returns `Err(val)` when the ring is full.
     pub(super) fn push(&self, val: T) -> Result<(), T> {
-        let mut pos = self.head.load(Ordering::Relaxed);
+        let mut pos = self.head.0.load(Ordering::Relaxed);
         loop {
             // SAFETY: `pos & mask` is in range because `mask = cap - 1`
             // and `cap = slots.len()`.
@@ -99,7 +110,7 @@ impl<T> MpscInbox<T> {
             let diff = (seq as isize).wrapping_sub(pos as isize);
             if diff == 0 {
                 // Slot ready for this producer at `pos`. Try to claim.
-                match self.head.compare_exchange_weak(
+                match self.head.0.compare_exchange_weak(
                     pos,
                     pos.wrapping_add(1),
                     Ordering::Relaxed,
@@ -124,7 +135,7 @@ impl<T> MpscInbox<T> {
                 return Err(val);
             } else {
                 // Another producer claimed this slot first; refresh and retry.
-                pos = self.head.load(Ordering::Relaxed);
+                pos = self.head.0.load(Ordering::Relaxed);
             }
         }
     }
@@ -135,7 +146,7 @@ impl<T> MpscInbox<T> {
     /// contract is that only the owner worker for a binding pops from its
     /// inbox.
     pub(super) unsafe fn pop(&self) -> Option<T> {
-        let pos = self.tail.load(Ordering::Relaxed);
+        let pos = self.tail.0.load(Ordering::Relaxed);
         // SAFETY: `pos & mask` is in range.
         let slot = unsafe { self.slots.get_unchecked(pos & self.mask) };
         let seq = slot.seq.load(Ordering::Acquire);
@@ -154,6 +165,7 @@ impl<T> MpscInbox<T> {
                 Ordering::Release,
             );
             self.tail
+                .0
                 .store(pos.wrapping_add(1), Ordering::Release);
             Some(val)
         } else {

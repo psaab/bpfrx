@@ -766,11 +766,9 @@ pub(super) fn cancel_queued_flow_on_binding(
     // redirect inbox for a now-canceled flow will drain out on the next
     // owner poll and hit the wire; the peer already saw a RST, so the
     // extra late packets are ignored (or provoke a benign RST-for-RST
-    // response) rather than causing protocol harm. This trade is
-    // documented in #706's fix notes. The worker-owned `pending_tx_local`
-    // and `pending_tx_prepared` queues above are still filtered because
-    // they are never touched by another thread.
-    let _ = (forward_key, reverse_key);
+    // response) rather than causing protocol harm. The worker-owned
+    // `pending_tx_local` and `pending_tx_prepared` queues above are still
+    // filtered because they are never touched by another thread.
 
     update_binding_debug_state(binding);
 }

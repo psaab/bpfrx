@@ -98,15 +98,15 @@ pub(super) struct MmapArea {
 /// 2 MB hugepage size.
 const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
-/// Hard capacity of the per-binding redirect inbox (`BindingLiveState::
-/// pending_tx`). Sized to cover the highest expected soft cap produced
-/// by `pending_tx_capacity()` in prod (`ring_entries = 2048` →
-/// `2 * ring_entries = 4096`). The MPSC ring is allocated once at
-/// `BindingLiveState::new()` with this capacity, then the soft cap from
-/// `set_max_pending_tx()` gates admissions inside `enqueue_tx` /
-/// `enqueue_tx_owned`. If a caller ever requests a soft cap larger than
-/// the hard cap, the effective cap clamps here and excess pushes drop
-/// with a `redirect_inbox_overflow_drops` counter bump.
+/// Hard capacity of the per-binding redirect inbox
+/// (`BindingLiveState::pending_tx`). Sized to cover the highest expected
+/// soft cap produced by `pending_tx_capacity()` in prod
+/// (`ring_entries = 2048` → `2 * ring_entries = 4096`). The MPSC ring is
+/// allocated once at `BindingLiveState::new()` with this capacity, then
+/// the soft cap from `set_max_pending_tx()` gates admissions inside
+/// `enqueue_tx` / `enqueue_tx_owned`. If a caller ever requests a soft
+/// cap larger than the hard cap, the effective cap clamps here and
+/// excess pushes drop with a `redirect_inbox_overflow_drops` counter bump.
 pub(super) const PENDING_TX_INBOX_HARD_CAP: usize = 4096;
 
 impl MmapArea {
@@ -293,6 +293,35 @@ mod tests {
             2
         );
         assert_eq!(live.tx_errors.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn take_pending_tx_into_appends_without_resetting_caller_buffer() {
+        // #706: pin that `take_pending_tx_into` preserves the caller's
+        // existing `VecDeque` contents. The owner-worker drain feeds its
+        // `pending_tx_local` buffer through the call; if the new API ever
+        // regressed to `*out = drained` or `out.clear()`, items already
+        // queued locally would be dropped on every poll.
+        let live = BindingLiveState::new();
+        live.max_pending_tx.store(8, Ordering::Relaxed);
+        live.enqueue_tx_owned(test_tx_request_for_inbox(10))
+            .expect("push inbox");
+        live.enqueue_tx_owned(test_tx_request_for_inbox(11))
+            .expect("push inbox");
+
+        let mut out = VecDeque::from([
+            test_tx_request_for_inbox(1),
+            test_tx_request_for_inbox(2),
+        ]);
+        live.take_pending_tx_into(&mut out);
+
+        let payloads: Vec<u8> = out.iter().map(|req| req.bytes[0]).collect();
+        assert_eq!(
+            payloads,
+            vec![1, 2, 10, 11],
+            "caller-provided items must come first; inbox items appended in FIFO order"
+        );
+        assert!(live.pending_tx_empty(), "inbox fully drained");
     }
 
     #[test]
@@ -746,8 +775,8 @@ impl BindingLiveState {
     /// a deliberate change from the pre-#706 drop-oldest behaviour —
     /// older queued packets are closer to being serviced by the owner
     /// worker, so evicting them just extends tail latency. The counter
-    /// contract (`tx_errors` as the generic error, `redirect_inbox_
-    /// overflow_drops` as the dedicated view) is preserved.
+    /// contract (`tx_errors` as the generic error,
+    /// `redirect_inbox_overflow_drops` as the dedicated view) is preserved.
     #[inline]
     fn push_redirect_inbox(&self, req: TxRequest) {
         let max_pending = self.max_pending_tx.load(Ordering::Relaxed) as usize;
@@ -778,20 +807,24 @@ impl BindingLiveState {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn take_pending_tx(&self) -> VecDeque<TxRequest> {
+    /// Drain the redirect inbox into a caller-provided `VecDeque`, so the
+    /// owner worker's drain stays allocation-free on the hot path. The
+    /// caller reuses its existing `pending_tx_local` buffer across polls
+    /// — calling `VecDeque::new()` / growing a fresh buffer on every drain
+    /// put allocator noise back on the exact thread #706 is trying to
+    /// keep quiet.
+    pub(super) fn take_pending_tx_into(&self, out: &mut VecDeque<TxRequest>) {
         if self.pending_tx.is_empty() {
-            return VecDeque::new();
+            return;
         }
-        let mut drained = VecDeque::new();
         // SAFETY: `MpscInbox::pop` requires the single-consumer
         // invariant. The per-binding redirect inbox has exactly one
         // consumer — the owner worker — which is also the sole caller
-        // of `take_pending_tx`. Enforced by convention (see the doc
+        // of `take_pending_tx_into`. Enforced by convention (see the doc
         // comment on `pending_tx` in `BindingLiveState`).
         while let Some(req) = unsafe { self.pending_tx.pop() } {
-            drained.push_back(req);
+            out.push_back(req);
         }
-        drained
     }
 
     pub(super) fn pending_tx_empty(&self) -> bool {
