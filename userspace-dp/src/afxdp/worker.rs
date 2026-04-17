@@ -1425,6 +1425,13 @@ fn apply_worker_shaped_tx_requests(
         let Some(binding) = binding_index.and_then(|idx| bindings.get_mut(idx)) else {
             if let Some(binding) = bindings.first_mut() {
                 binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+                // #710: dedicated counter — a cross-worker shaped TX
+                // request arrived for an egress this worker has no
+                // binding to drain. Subset of tx_errors.
+                binding
+                    .live
+                    .no_owner_binding_drops
+                    .fetch_add(1, Ordering::Relaxed);
             }
             if cfg!(feature = "debug-log") {
                 debug_log!(
@@ -1711,6 +1718,26 @@ where
                 status.surplus_deficit_bytes = status
                     .surplus_deficit_bytes
                     .saturating_add(queue.surplus_deficit);
+                // #710: aggregate drop-reason counters across worker
+                // instances for this queue. Each worker's per-queue
+                // runtime is single-writer (only the owner worker
+                // increments the counter for its own queue), so
+                // summing across workers gives the cluster-wide totals.
+                status.admission_flow_share_drops = status
+                    .admission_flow_share_drops
+                    .saturating_add(queue.drop_counters.admission_flow_share_drops);
+                status.admission_buffer_drops = status
+                    .admission_buffer_drops
+                    .saturating_add(queue.drop_counters.admission_buffer_drops);
+                status.root_token_starvation_parks = status
+                    .root_token_starvation_parks
+                    .saturating_add(queue.drop_counters.root_token_starvation_parks);
+                status.queue_token_starvation_parks = status
+                    .queue_token_starvation_parks
+                    .saturating_add(queue.drop_counters.queue_token_starvation_parks);
+                status.tx_ring_full_drops = status
+                    .tx_ring_full_drops
+                    .saturating_add(queue.drop_counters.tx_ring_full_drops);
             }
         }
     }
@@ -1821,6 +1848,7 @@ mod tests {
                 wheel_level: 0,
                 wheel_slot: 0,
                 items: VecDeque::from([CoSPendingTxItem::Local(test_tx_request(80))]),
+                drop_counters: CoSQueueDropCounters::default(),
             }],
             queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
             rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
@@ -2667,6 +2695,10 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) tx_bytes: u64,
     pub(crate) tx_completions: u64,
     pub(crate) tx_errors: u64,
+    pub(crate) redirect_inbox_overflow_drops: u64,
+    pub(crate) pending_tx_local_overflow_drops: u64,
+    pub(crate) tx_submit_error_drops: u64,
+    pub(crate) no_owner_binding_drops: u64,
     pub(crate) direct_tx_packets: u64,
     pub(crate) copy_tx_packets: u64,
     pub(crate) in_place_tx_packets: u64,

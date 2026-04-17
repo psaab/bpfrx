@@ -823,6 +823,41 @@ pub(super) struct CoSQueueRuntime {
     pub(super) wheel_level: u8,
     pub(super) wheel_slot: usize,
     pub(super) items: VecDeque<CoSPendingTxItem>,
+    // #710: per-queue drop-reason counters. Single-writer (the owner
+    // worker is the only code path that mutates this queue's runtime),
+    // so plain `u64` is sufficient — no atomics needed on the hot path.
+    // Snapshot reads happen through the `build_worker_cos_statuses`
+    // path which copies the whole runtime into a status struct published
+    // via `ArcSwap`, so reads are consistent without ordering discipline
+    // here.
+    pub(super) drop_counters: CoSQueueDropCounters,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CoSQueueDropCounters {
+    /// Flow-share admission cap exceeded; packet tail-dropped at
+    /// `enqueue_cos_item`. Indicates SFQ bucket collision or a single
+    /// flow attempting to occupy more than its fair share of the
+    /// buffer. See #705, #711.
+    pub(super) admission_flow_share_drops: u64,
+    /// Physical queue buffer exceeded; packet tail-dropped at
+    /// `enqueue_cos_item`. Indicates buffer undersizing relative to
+    /// the offered-load × RTT product. See #707.
+    pub(super) admission_buffer_drops: u64,
+    /// Queue parked because the interface shaping-rate token bucket is
+    /// empty. Not a drop — the queue will be woken on timer-wheel tick.
+    /// High count relative to serviced-batches indicates the root
+    /// shaper is the limiter.
+    pub(super) root_token_starvation_parks: u64,
+    /// Queue parked because the per-queue (exact) token bucket is
+    /// empty. Not a drop — the queue will be woken when its own tokens
+    /// refill. High count indicates the per-queue rate cap is the
+    /// limiter for this queue.
+    pub(super) queue_token_starvation_parks: u64,
+    /// TX ring submission failed; `writer.insert` returned zero or the
+    /// ring was full. Frames already copied into UMEM are released back
+    /// to `free_tx_frames` by the caller. See #706 / #709.
+    pub(super) tx_ring_full_drops: u64,
 }
 
 pub(super) struct CoSTimerWheelRuntime {

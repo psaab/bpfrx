@@ -949,6 +949,25 @@ impl Coordinator {
                     q.surplus_deficit_bytes = q
                         .surplus_deficit_bytes
                         .saturating_add(queue.surplus_deficit_bytes);
+                    // #710: aggregate drop-reason counters across the
+                    // per-worker snapshots. The worker builder already
+                    // summed across queues *within* its local runtime;
+                    // this second aggregation sums across workers.
+                    q.admission_flow_share_drops = q
+                        .admission_flow_share_drops
+                        .saturating_add(queue.admission_flow_share_drops);
+                    q.admission_buffer_drops = q
+                        .admission_buffer_drops
+                        .saturating_add(queue.admission_buffer_drops);
+                    q.root_token_starvation_parks = q
+                        .root_token_starvation_parks
+                        .saturating_add(queue.root_token_starvation_parks);
+                    q.queue_token_starvation_parks = q
+                        .queue_token_starvation_parks
+                        .saturating_add(queue.queue_token_starvation_parks);
+                    q.tx_ring_full_drops = q
+                        .tx_ring_full_drops
+                        .saturating_add(queue.tx_ring_full_drops);
                 }
             }
         }
@@ -1445,6 +1464,10 @@ impl Coordinator {
                 binding.tx_bytes = snap.tx_bytes;
                 binding.tx_completions = snap.tx_completions;
                 binding.tx_errors = snap.tx_errors;
+                binding.redirect_inbox_overflow_drops = snap.redirect_inbox_overflow_drops;
+                binding.pending_tx_local_overflow_drops = snap.pending_tx_local_overflow_drops;
+                binding.tx_submit_error_drops = snap.tx_submit_error_drops;
+                binding.no_owner_binding_drops = snap.no_owner_binding_drops;
                 binding.direct_tx_packets = snap.direct_tx_packets;
                 binding.copy_tx_packets = snap.copy_tx_packets;
                 binding.in_place_tx_packets = snap.in_place_tx_packets;

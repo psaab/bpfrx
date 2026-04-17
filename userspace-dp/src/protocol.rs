@@ -812,6 +812,22 @@ pub(crate) struct CoSQueueStatus {
     pub next_wakeup_tick: u64,
     #[serde(rename = "surplus_deficit_bytes", default)]
     pub surplus_deficit_bytes: u64,
+    // #710 drop-reason counters, aggregated across worker instances for
+    // this (ifindex, queue_id). `parks` are not drops — the queue is
+    // only deferred until its root/queue token bucket refills — but
+    // tracking them alongside drops tells an operator which *scheduler*
+    // decision is limiting the queue. See `types::CoSQueueDropCounters`
+    // for per-reason semantics and refs to the issues driving each.
+    #[serde(rename = "admission_flow_share_drops", default)]
+    pub admission_flow_share_drops: u64,
+    #[serde(rename = "admission_buffer_drops", default)]
+    pub admission_buffer_drops: u64,
+    #[serde(rename = "root_token_starvation_parks", default)]
+    pub root_token_starvation_parks: u64,
+    #[serde(rename = "queue_token_starvation_parks", default)]
+    pub queue_token_starvation_parks: u64,
+    #[serde(rename = "tx_ring_full_drops", default)]
+    pub tx_ring_full_drops: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1111,6 +1127,32 @@ pub(crate) struct BindingStatus {
     pub tx_bytes: u64,
     #[serde(rename = "tx_errors", default)]
     pub tx_errors: u64,
+    // #710: per-binding subset of `tx_errors` attributed to the
+    // redirect-inbox overflow path in `BindingLiveState::enqueue_tx` /
+    // `enqueue_tx_owned`. Indicates the owner is not draining redirects
+    // fast enough for the rate of incoming redirects from non-owner
+    // workers. See #706 / #709.
+    #[serde(rename = "redirect_inbox_overflow_drops", default)]
+    pub redirect_inbox_overflow_drops: u64,
+    // #710: per-binding `pending_tx_local`/`pending_tx_prepared` FIFO
+    // overflow drops. Subset of `tx_errors`. Indicates the worker
+    // cannot ingest redirected traffic into CoS as fast as it arrives
+    // — often the load-bearing drop category on the owner worker
+    // under multi-flow load.
+    #[serde(rename = "pending_tx_local_overflow_drops", default)]
+    pub pending_tx_local_overflow_drops: u64,
+    // #710: catch-all counter for frame-level TX submit errors
+    // (`TxError::Drop`, scratch-build slice/capacity failures). Subset
+    // of `tx_errors`. Non-zero usually indicates a frame-builder bug
+    // rather than a scheduler/shaper decision — separate category from
+    // the flow-fair admission / redirect-inbox / pending-FIFO drops.
+    #[serde(rename = "tx_submit_error_drops", default)]
+    pub tx_submit_error_drops: u64,
+    // #710: cross-worker CoS redirects that arrived for an egress
+    // this worker has no binding to drain. Non-zero value indicates
+    // a binding-registration race or a misrouted redirect.
+    #[serde(rename = "no_owner_binding_drops", default)]
+    pub no_owner_binding_drops: u64,
     #[serde(rename = "direct_tx_packets", default)]
     pub direct_tx_packets: u64,
     #[serde(rename = "copy_tx_packets", default)]
