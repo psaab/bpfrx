@@ -2445,7 +2445,15 @@ const COS_MIN_BURST_BYTES: u64 = 64 * 1500;
 const COS_GUARANTEE_VISIT_NS: u64 = 200_000;
 const COS_GUARANTEE_QUANTUM_MIN_BYTES: u64 = 1500;
 const COS_GUARANTEE_QUANTUM_MAX_BYTES: u64 = 512 * 1024;
-const COS_FLOW_FAIR_MIN_SHARE_BYTES: u64 = 4 * 1500;
+/// Minimum per-flow admission share. Sized so TCP fast-retransmit can
+/// trigger reliably on a single-packet drop:
+/// - 3 dupacks to trigger fast-retransmit (Linux `tcp_reordering = 3`)
+/// - headroom for in-flight reordering up to ~13 MSS
+/// - 16 MSS total = 24 KB
+/// Below this, a single drop produces < 3 dupacks before cwnd is drained,
+/// forcing an RTO with cwnd reset to 1 MSS and starting the oscillation
+/// observed in #704 / #707 at high flow counts on low-rate exact queues.
+const COS_FLOW_FAIR_MIN_SHARE_BYTES: u64 = 16 * 1500;
 const COS_SURPLUS_ROUND_QUANTUM_BYTES: u64 = 1500;
 const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 
@@ -2725,6 +2733,34 @@ fn cos_queue_flow_share_limit(
     buffer_limit
         .div_ceil(prospective_active)
         .clamp(COS_FLOW_FAIR_MIN_SHARE_BYTES, buffer_limit)
+}
+
+/// Effective buffer cap for the admission check. Grows with the observed
+/// distinct-flow count so the total admission threshold never drops
+/// below `active × COS_FLOW_FAIR_MIN_SHARE_BYTES` — without this, the
+/// per-flow clamp inside `cos_queue_flow_share_limit` can raise each
+/// flow's share to the fast-retransmit floor, but the aggregate
+/// `queue.queued_bytes > buffer_limit` check trips first and drops the
+/// packet anyway (the exact pathology driving #704 / #707 at 16 flows
+/// on the 1 Gbps exact queue: `buffer 125 KB / 16 flows = 7.8 KB` per
+/// share, well below the 16 MSS floor).
+///
+/// Non-flow-fair queues (e.g. best-effort or pure rate-limited) bypass
+/// this scaling; their admission is buffer-bound by the operator's
+/// configured `buffer-size` alone.
+///
+/// This is a logical threshold only. The backing `VecDeque` storage is
+/// dynamic, so raising the cap costs nothing until traffic actually
+/// fills it; at peak 16-flow steady state the extra committed memory is
+/// `16 × 24 KB − 125 KB ≈ 259 KB` per exact queue.
+#[inline]
+fn cos_flow_aware_buffer_limit(queue: &CoSQueueRuntime) -> u64 {
+    let base = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+    if !queue.flow_fair {
+        return base;
+    }
+    let active = u64::from(queue.active_flow_buckets).max(1);
+    base.max(active.saturating_mul(COS_FLOW_FAIR_MIN_SHARE_BYTES))
 }
 
 #[inline]
@@ -3705,7 +3741,10 @@ fn enqueue_cos_item(
         }
         let root_was_empty = root.nonempty_queues == 0;
         let queue = &mut root.queues[queue_idx];
-        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        // #707: `buffer_limit` scales with active flow count so the per-
+        // flow fast-retransmit floor (`COS_FLOW_FAIR_MIN_SHARE_BYTES`)
+        // can actually be satisfied without tripping the aggregate cap.
+        let buffer_limit = cos_flow_aware_buffer_limit(queue);
         let flow_share_exceeded = if queue.flow_fair {
             let flow_bucket = cos_flow_bucket_index(queue.flow_hash_seed, cos_item_flow_key(&item));
             queue.flow_bucket_bytes[flow_bucket].saturating_add(item_len)
@@ -7969,6 +8008,137 @@ mod tests {
         account_cos_queue_flow_dequeue(queue, Some(&flow_b), 16 * 1024);
         assert_eq!(queue.active_flow_buckets, 1);
         assert_eq!(queue.flow_bucket_bytes[bucket_b], 0);
+    }
+
+    #[test]
+    fn cos_flow_aware_buffer_limit_scales_with_active_flow_buckets() {
+        // #707: at the 1 Gbps/16-flow workload a fixed 125 KB buffer
+        // divided across 16 flows gives each flow a 7.8 KB share,
+        // below the TCP fast-retransmit floor of 16 MSS = 24 KB. The
+        // flow-aware buffer limit grows the aggregate cap so the per-
+        // flow floor can be honoured without the buffer-cap tripping
+        // first.
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 125 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+
+        // Base floor wins when the flow count × min share is small.
+        queue.active_flow_buckets = 0;
+        assert_eq!(
+            cos_flow_aware_buffer_limit(queue),
+            queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
+            "zero active flows must collapse to the operator-configured base cap"
+        );
+        queue.active_flow_buckets = 2;
+        assert_eq!(
+            cos_flow_aware_buffer_limit(queue),
+            queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
+            "2 × 24 KB = 48 KB stays below the 125 KB configured base, so base wins"
+        );
+
+        // Flow-aware floor wins past the break-even point.
+        queue.active_flow_buckets = 16;
+        assert_eq!(
+            cos_flow_aware_buffer_limit(queue),
+            16 * COS_FLOW_FAIR_MIN_SHARE_BYTES,
+            "16 × 24 KB = 384 KB exceeds the 125 KB base and becomes the cap"
+        );
+    }
+
+    #[test]
+    fn cos_flow_aware_buffer_limit_respects_non_flow_fair_queues() {
+        // Pure rate-limited (non-flow-fair) queues must keep the
+        // operator's configured buffer. The flow-aware scaling only
+        // applies when SFQ-style per-flow accounting is active.
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "best-effort".into(),
+                priority: 5,
+                transmit_rate_bytes: 100_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = false;
+        queue.active_flow_buckets = 64; // should be ignored
+
+        assert_eq!(
+            cos_flow_aware_buffer_limit(queue),
+            queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
+            "flow_fair=false must bypass the flow-count multiplier"
+        );
+    }
+
+    #[test]
+    fn cos_queue_flow_share_limit_never_drops_below_fast_retransmit_floor() {
+        // At 16 flows with a 125 KB buffer, the naive arithmetic share
+        // is 7.8 KB — a single packet drop yields < 3 dupacks, forcing
+        // RTO. The clamp to `COS_FLOW_FAIR_MIN_SHARE_BYTES` must hold
+        // the per-flow cap at 16 MSS = 24 KB no matter the denominator.
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 125 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+
+        // Simulate 16 distinct populated flow buckets.
+        queue.active_flow_buckets = 16;
+        for bucket in 0..16 {
+            queue.flow_bucket_bytes[bucket] = 1_000;
+        }
+
+        let buffer_limit = cos_flow_aware_buffer_limit(queue);
+        assert_eq!(
+            buffer_limit,
+            16 * COS_FLOW_FAIR_MIN_SHARE_BYTES,
+            "flow-aware cap must expand to accommodate 16 × min-share"
+        );
+
+        let share = cos_queue_flow_share_limit(queue, buffer_limit, 0);
+        assert!(
+            share >= COS_FLOW_FAIR_MIN_SHARE_BYTES,
+            "per-flow cap ({share}) must stay ≥ {COS_FLOW_FAIR_MIN_SHARE_BYTES} (16 MSS)"
+        );
+        assert_eq!(
+            share, COS_FLOW_FAIR_MIN_SHARE_BYTES,
+            "with buffer_limit == active × min-share, per-flow cap equals the floor"
+        );
+    }
+
+    #[test]
+    fn cos_flow_fair_min_share_is_sized_for_tcp_fast_retransmit() {
+        // Compile-time pin: the floor must stay at or above 16 MSS so
+        // TCP fast-retransmit has headroom for 3 dupacks plus reorder.
+        // Lowering this is a behaviour change that warrants explicit
+        // review; the const should not drift silently.
+        const _: () = assert!(COS_FLOW_FAIR_MIN_SHARE_BYTES >= 16 * 1500);
     }
 
     #[test]
