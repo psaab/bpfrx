@@ -209,6 +209,15 @@ they repeatedly bite:
 - **Use `cli`, not `xpfctl`.** The remote CLI binary is `cli`.
 - **Primary is fw0 on RG0 in the loss userspace cluster.** Apply config
   changes to the primary; sync takes care of the secondary.
+- **Before claiming a CoS admission-path PR moves a metric, read the
+  counters.** `show class-of-service interface` surfaces `flow_share`,
+  `buffer`, and `ecn_marked` drop counts per queue since #724. See
+  [`cos-validation-notes.md`](cos-validation-notes.md) for the
+  methodology, the decision tree mapping counter patterns to fixes,
+  and the current test-env limitation that blocks ECN end-to-end
+  validation. Iterating on admission logic without reading these
+  counters is how #721/#722 landed dormant on the live workload
+  (#725).
 
 ## Tone signals (patterns that have worked)
 
