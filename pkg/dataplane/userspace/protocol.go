@@ -465,6 +465,12 @@ type CoSQueueStatus struct {
 	ParkedInstances     int     `json:"parked_instances,omitempty"`
 	NextWakeupTick      uint64  `json:"next_wakeup_tick,omitempty"`
 	SurplusDeficitBytes uint64  `json:"surplus_deficit_bytes,omitempty"`
+	// #710/#718: per-queue admission-path counters aggregated across
+	// worker instances by the Rust coordinator. JSON tags MUST match the
+	// Rust serde rename(...) exactly — the wire format is the contract.
+	AdmissionFlowShareDrops uint64 `json:"admission_flow_share_drops,omitempty"`
+	AdmissionBufferDrops    uint64 `json:"admission_buffer_drops,omitempty"`
+	AdmissionEcnMarked      uint64 `json:"admission_ecn_marked,omitempty"`
 }
 
 type FirewallFilterTermCounterStatus struct {

@@ -149,3 +149,68 @@ func TestFormatCoSInterfaceSummaryFiltersByBaseInterface(t *testing.T) {
 		t.Fatalf("expected base selector to include logical unit:\n%s", out)
 	}
 }
+
+// #710/#718: admission-drop counters must render under each queue row
+// with real values. Without this line, operators debugging the
+// admission path (SFQ flow-share cap, buffer cap, ECN threshold) have
+// no way to tell which admission decision is firing on the live system.
+func TestFormatCoSInterfaceSummaryRendersAdmissionDropCounters(t *testing.T) {
+	owner := uint32(1)
+	status := &ProcessStatus{
+		CoSInterfaces: []CoSInterfaceStatus{
+			{
+				InterfaceName:   "reth0.80",
+				OwnerWorkerID:   &owner,
+				WorkerInstances: 1,
+				Queues: []CoSQueueStatus{
+					{
+						QueueID:                 4,
+						OwnerWorkerID:           &owner,
+						ForwardingClass:         "bandwidth-10mb",
+						Priority:                5,
+						Exact:                   true,
+						TransmitRateBytes:       1_250_000,
+						BufferBytes:             32 * 1024,
+						AdmissionFlowShareDrops: 12345,
+						AdmissionBufferDrops:    0,
+						AdmissionEcnMarked:      4567,
+					},
+				},
+			},
+		},
+	}
+	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	want := "Drops: flow_share=12345  buffer=0  ecn_marked=4567"
+	if !strings.Contains(out, want) {
+		t.Fatalf("missing %q in output:\n%s", want, out)
+	}
+}
+
+// Zero-valued counters MUST still render — operators need to see the
+// counter is wired, otherwise "no output" is indistinguishable from
+// "counter missing from the pipeline" when chasing #718 / #722.
+func TestFormatCoSInterfaceSummaryRendersZeroAdmissionCounters(t *testing.T) {
+	owner := uint32(1)
+	status := &ProcessStatus{
+		CoSInterfaces: []CoSInterfaceStatus{
+			{
+				InterfaceName:   "reth0.80",
+				OwnerWorkerID:   &owner,
+				WorkerInstances: 1,
+				Queues: []CoSQueueStatus{
+					{
+						QueueID:         4,
+						OwnerWorkerID:   &owner,
+						ForwardingClass: "bandwidth-10mb",
+						// all admission counters default to 0
+					},
+				},
+			},
+		},
+	}
+	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	want := "Drops: flow_share=0  buffer=0  ecn_marked=0"
+	if !strings.Contains(out, want) {
+		t.Fatalf("missing %q in output (zero-valued drops must still render):\n%s", want, out)
+	}
+}
