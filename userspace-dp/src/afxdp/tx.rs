@@ -2666,8 +2666,13 @@ pub(super) fn cos_flow_hash_seed_from_os() -> u64 {
     fallback
 }
 
+// #711: returns `u16` (was `u8`). With `COS_FLOW_FAIR_BUCKETS = 1024`
+// the mask in `cos_flow_bucket_index` is 10 bits wide; a `u8` return
+// would silently re-collapse the hash into 256 buckets and give no
+// benefit from the bucket grow. Returning `u16` preserves the full
+// hash width through the mask step.
 #[inline(always)]
-fn exact_cos_flow_bucket(queue_seed: u64, flow_key: Option<&SessionKey>) -> u8 {
+fn exact_cos_flow_bucket(queue_seed: u64, flow_key: Option<&SessionKey>) -> u16 {
     let Some(flow_key) = flow_key else {
         return 0;
     };
@@ -2690,7 +2695,7 @@ fn exact_cos_flow_bucket(queue_seed: u64, flow_key: Option<&SessionKey>) -> u8 {
     }
     mix_cos_flow_bucket(&mut seed, flow_key.src_port as u64);
     mix_cos_flow_bucket(&mut seed, flow_key.dst_port as u64);
-    seed as u8
+    seed as u16
 }
 
 #[inline]
@@ -2772,7 +2777,7 @@ pub(super) fn cos_queue_len(queue: &CoSQueueRuntime) -> usize {
     queue
         .flow_rr_buckets
         .iter()
-        .map(|bucket| queue.flow_bucket_items[usize::from(*bucket)].len())
+        .map(|bucket| queue.flow_bucket_items[usize::from(bucket)].len())
         .sum()
 }
 
@@ -2781,7 +2786,7 @@ pub(super) fn cos_queue_front(queue: &CoSQueueRuntime) -> Option<&CoSPendingTxIt
     if !queue.flow_fair {
         return queue.items.front();
     }
-    let bucket = usize::from(*queue.flow_rr_buckets.front()?);
+    let bucket = usize::from(queue.flow_rr_buckets.front()?);
     queue.flow_bucket_items[bucket].front()
 }
 
@@ -2799,7 +2804,7 @@ pub(super) fn cos_queue_push_back(queue: &mut CoSQueueRuntime, item: CoSPendingT
     let was_empty = bucket_queue.is_empty();
     bucket_queue.push_back(item);
     if was_empty {
-        queue.flow_rr_buckets.push_back(bucket as u8);
+        queue.flow_rr_buckets.push_back(bucket as u16);
     }
 }
 
@@ -2817,7 +2822,7 @@ pub(super) fn cos_queue_push_front(queue: &mut CoSQueueRuntime, item: CoSPending
     let was_empty = bucket_queue.is_empty();
     bucket_queue.push_front(item);
     if was_empty {
-        queue.flow_rr_buckets.push_front(bucket as u8);
+        queue.flow_rr_buckets.push_front(bucket as u16);
     }
 }
 
@@ -2826,7 +2831,7 @@ pub(super) fn cos_queue_pop_front(queue: &mut CoSQueueRuntime) -> Option<CoSPend
     let item = if !queue.flow_fair {
         queue.items.pop_front()?
     } else {
-        let bucket = usize::from(*queue.flow_rr_buckets.front()?);
+        let bucket = usize::from(queue.flow_rr_buckets.front()?);
         let item = queue.flow_bucket_items[bucket].pop_front()?;
         let active = queue
             .flow_rr_buckets
@@ -3539,7 +3544,7 @@ fn cos_queue_accepts_prepared(root: &CoSInterfaceRuntime, requested_queue: Optio
             .any(|item| matches!(item, CoSPendingTxItem::Local(_)));
     }
     !queue.flow_rr_buckets.iter().any(|bucket| {
-        queue.flow_bucket_items[usize::from(*bucket)]
+        queue.flow_bucket_items[usize::from(bucket)]
             .iter()
             .any(|item| matches!(item, CoSPendingTxItem::Local(_)))
     })
@@ -3627,7 +3632,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 queued_bytes: 0,
                 active_flow_buckets: 0,
                 flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-                flow_rr_buckets: VecDeque::new(),
+                flow_rr_buckets: FlowRrRing::default(),
                 flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                 runnable: false,
                 parked: false,
@@ -8225,13 +8230,23 @@ mod tests {
         flow_v6.addr_family = libc::AF_INET6 as u8;
         let b_v4 = cos_flow_bucket_index(0, Some(&flow_v4));
         let b_v6 = cos_flow_bucket_index(0, Some(&flow_v6));
-        // Hash-mix regression pins. If the seed=0 path ever gets new bits
-        // (a refactor that reorders the mix or adds a term) these
-        // assertions will fail and the change becomes an explicit decision
-        // rather than a silent flip. Update baselines only after live
-        // re-validation of 5201 fairness on the loss HA cluster.
-        assert_eq!(b_v4, 26);
-        assert_eq!(b_v6, 4);
+        // #711: hash-mix regression pins, updated for the bucket-count
+        // grow from 64 → 1024. The hash function itself is unchanged
+        // at seed=0; the values moved only because the mask widened
+        // from 6 bits (0x3F) to 10 bits (0x3FF). Under the previous
+        // 6-bit mask these values were 26 (v4) and 4 (v6); the
+        // low 10 bits of the same hash output give the new pins below.
+        // A refactor that reorders the mix or adds a term still fails
+        // here and becomes an explicit decision. Update baselines only
+        // after live re-validation of 5201 fairness on the loss HA
+        // cluster.
+        // Sanity: low 6 bits of the new pins equal the old pins
+        // (26 and 4 respectively), confirming the mask-widening
+        // interpretation above.
+        assert_eq!(b_v4 & 0x3F, 26);
+        assert_eq!(b_v6 & 0x3F, 4);
+        assert_eq!(b_v4, 410);
+        assert_eq!(b_v6, 260);
     }
 
     #[test]
@@ -8243,6 +8258,38 @@ mod tests {
         // active_flow_buckets.
         assert_eq!(cos_flow_bucket_index(0, None), 0);
         assert_eq!(cos_flow_bucket_index(0x1234_5678_9abc_def0, None), 0);
+    }
+
+    #[test]
+    fn exact_cos_flow_bucket_distribution_at_1024_keeps_collisions_below_budget() {
+        // #711 correctness pin. The whole point of growing buckets
+        // 64 → 1024 is collision reduction. Hash 64 distinct 5-tuples
+        // with a fixed seed and assert at least 60 of them land in
+        // distinct buckets (no more than 4 collisions among 64 flows).
+        //
+        // Theoretical baseline for 64 flows into 1024 uniform buckets
+        // is E[pairs] ≈ 64·63/(2·1024) ≈ 1.97 colliding pairs (so
+        // ~62–63 unique buckets on average). A budget of 60/64 unique
+        // allows headroom for hash non-uniformity without hiding a
+        // real distribution regression. If this test fires, the hash
+        // function has become non-uniform — which would silently
+        // undo the fairness improvement #711 is about.
+        let seed: u64 = 0xA5A5_0000_C3C3_FFFF;
+        let mut buckets = std::collections::BTreeSet::new();
+        for src_port in 10_000u16..10_064 {
+            let flow = test_session_key(src_port, 5201);
+            buckets.insert(cos_flow_bucket_index(seed, Some(&flow)));
+        }
+        assert!(
+            buckets.len() >= 60,
+            "64 flows landed in only {} distinct buckets — hash distribution regressed",
+            buckets.len()
+        );
+        // Sanity: the values are within the 10-bit mask.
+        assert!(
+            buckets.iter().all(|&b| b < COS_FLOW_FAIR_BUCKETS),
+            "bucket index out of range after mask"
+        );
     }
 
     #[test]
@@ -9177,7 +9224,7 @@ mod tests {
             queued_bytes: 1500,
             active_flow_buckets: 0,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_rr_buckets: VecDeque::new(),
+            flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
             parked: false,
@@ -9213,7 +9260,7 @@ mod tests {
             queued_bytes: 0,
             active_flow_buckets: 0,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_rr_buckets: VecDeque::new(),
+            flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
             parked: false,
@@ -9260,7 +9307,7 @@ mod tests {
             queued_bytes: 0,
             active_flow_buckets: 0,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_rr_buckets: VecDeque::new(),
+            flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
             parked: false,
