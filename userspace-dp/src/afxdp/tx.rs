@@ -2599,6 +2599,46 @@ fn maybe_mark_ecn_ce(req: &mut TxRequest) -> bool {
     }
 }
 
+/// Mark a prepared (zero-copy) TX frame as ECN CE in place inside the
+/// UMEM. Only fires on ECT(0)/ECT(1) per RFC 3168 §6.1.1.1. Returns
+/// true iff the packet was marked. Out-of-range offset/len pairs
+/// (e.g. a PreparedTxRequest that somehow escaped bounds checks)
+/// return false without panicking — the caller falls through into
+/// the existing admission path unchanged.
+///
+/// This is the Prepared-variant counterpart to `maybe_mark_ecn_ce`;
+/// #718 / #722 originally only handled the Local variant, leaving
+/// the XSK-RX→XSK-TX zero-copy hot path (iperf3, NAT'd flows) with
+/// the marker dormant. See `docs/cos-validation-notes.md` for the
+/// counter-reading methodology.
+///
+/// # Safety
+///
+/// The caller must hold exclusive access to the frame at
+/// `[req.offset, req.offset + req.len)` within `umem`. On the CoS
+/// admission path this is guaranteed: admission runs *before* the
+/// frame is enqueued into the CoS queue, let alone submitted to the
+/// XSK TX ring, so the worker that built the frame is still the sole
+/// owner. Callers that invoke this outside of the admission gate
+/// must provide the same guarantee.
+#[inline]
+fn maybe_mark_ecn_ce_prepared(req: &PreparedTxRequest, umem: &MmapArea) -> bool {
+    let offset = req.offset as usize;
+    let len = req.len as usize;
+    // SAFETY: see function-level doc. The admission path owns the
+    // frame until `cos_queue_push_back` takes it, which is strictly
+    // after this call. Out-of-range slices return None (handled
+    // below) rather than producing a dangling reference.
+    let Some(bytes) = (unsafe { umem.slice_mut_unchecked(offset, len) }) else {
+        return false;
+    };
+    match req.expected_addr_family as i32 {
+        libc::AF_INET => mark_ecn_ce_ipv4(bytes, TX_L3_OFFSET),
+        libc::AF_INET6 => mark_ecn_ce_ipv6(bytes, TX_L3_OFFSET),
+        _ => false,
+    }
+}
+
 /// Core ECN admission decision, factored out so tests can drive it
 /// without spinning up a full `BindingWorker` while still exercising
 /// the exact code path that `enqueue_cos_item` uses. Mutates both the
@@ -2646,6 +2686,7 @@ fn apply_cos_admission_ecn_policy(
     flow_share_exceeded: bool,
     buffer_exceeded: bool,
     item: &mut CoSPendingTxItem,
+    umem: &MmapArea,
 ) -> bool {
     // Integer division by the compile-time-asserted nonzero
     // `COS_ECN_MARK_THRESHOLD_DEN` is one saturating_mul + one divide
@@ -2667,19 +2708,23 @@ fn apply_cos_admission_ecn_policy(
     if (!aggregate_above && !flow_above) || flow_share_exceeded || buffer_exceeded {
         return false;
     }
-    if let CoSPendingTxItem::Local(req) = item {
-        if maybe_mark_ecn_ce(req) {
-            queue.drop_counters.admission_ecn_marked = queue
-                .drop_counters
-                .admission_ecn_marked
-                .wrapping_add(1);
-            return true;
-        }
+    // Both variants share a single `admission_ecn_marked` counter: the
+    // CoS counter surfaced in `show class-of-service interface` tracks
+    // how often the admission policy marked a packet, independent of
+    // whether that packet is Local-owned bytes or a zero-copy UMEM
+    // frame. Split subcounters can be introduced later if operators
+    // ask for Local-vs-Prepared attribution.
+    let marked = match item {
+        CoSPendingTxItem::Local(req) => maybe_mark_ecn_ce(req),
+        CoSPendingTxItem::Prepared(req) => maybe_mark_ecn_ce_prepared(req, umem),
+    };
+    if marked {
+        queue.drop_counters.admission_ecn_marked = queue
+            .drop_counters
+            .admission_ecn_marked
+            .wrapping_add(1);
     }
-    // TODO(#718-followup): Prepared variant marks the packet via umem
-    // slice_mut, needs separate plumbing. Return false for now so the
-    // packet falls through to the existing admission path unchanged.
-    false
+    marked
 }
 
 fn maybe_top_up_cos_root_lease(
@@ -3990,6 +4035,16 @@ fn enqueue_cos_item(
 ) -> Result<(), CoSPendingTxItem> {
     let mut root_became_nonempty = false;
     let (accepted, queue_id, recycle) = {
+        // Split-borrow: `umem` sits alongside `cos_interfaces` on
+        // `BindingWorker`, so we can take a shared borrow on the umem
+        // field while holding `&mut binding.cos_interfaces` for the
+        // admission-gate block. The Prepared-variant ECN marker
+        // (#727) needs this to mutate frame bytes in the UMEM
+        // in-place; the admission gate runs strictly before the
+        // frame is enqueued, so nothing else in the system observes
+        // the bytes concurrently. Both fields are borrowed explicitly
+        // here so the borrow checker keeps us honest.
+        let umem = binding.umem.area();
         let Some(root) = binding.cos_interfaces.get_mut(&egress_ifindex) else {
             return Err(item);
         };
@@ -4037,6 +4092,7 @@ fn enqueue_cos_item(
             flow_share_exceeded,
             buffer_exceeded,
             &mut item,
+            umem,
         );
         if flow_share_exceeded || buffer_exceeded {
             // #710: attribute the drop to the specific admission-path
@@ -10456,6 +10512,15 @@ mod tests {
         })
     }
 
+    /// Small dummy UMEM area for admission tests that exercise the
+    /// Local variant. The mark helpers never consult `umem` on the
+    /// Local path (they mutate `req.bytes` directly), so any valid
+    /// `MmapArea` satisfies the signature. A 4 KB mapping is cheap
+    /// and enough to round up to hugepage alignment internally.
+    fn test_admission_umem() -> MmapArea {
+        MmapArea::new(4096).expect("mmap")
+    }
+
     #[test]
     fn admission_ecn_marked_counter_increments_when_marking_above_threshold() {
         // Drive the queue to >50% of buffer_limit with an ECT(0) packet
@@ -10470,11 +10535,12 @@ mod tests {
         let before = snapshot_counters(queue);
 
         let mut item = test_local_ipv4_item(ECN_ECT_0);
+        let umem = test_admission_umem();
         // Non-flow-fair queue: share_cap == buffer_limit, so both
         // thresholds collapse onto the aggregate one. `flow_bucket=0`
         // is unused beyond the (constant-returning) share-limit call.
         let marked =
-            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, false, &mut item);
+            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, false, &mut item, &umem);
 
         assert!(marked);
         let after = snapshot_counters(queue);
@@ -10503,8 +10569,9 @@ mod tests {
         let before = snapshot_counters(queue);
 
         let mut item = test_local_ipv4_item(ECN_ECT_0);
+        let umem = test_admission_umem();
         let marked =
-            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, false, &mut item);
+            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, false, &mut item, &umem);
 
         assert!(!marked, "at-threshold must not mark");
         let after = snapshot_counters(queue);
@@ -10528,8 +10595,9 @@ mod tests {
         let before = snapshot_counters(queue);
 
         let mut item = test_local_ipv4_item(ECN_NOT_ECT);
+        let umem = test_admission_umem();
         let marked =
-            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, false, &mut item);
+            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, false, &mut item, &umem);
 
         assert!(!marked);
         let after = snapshot_counters(queue);
@@ -10552,15 +10620,16 @@ mod tests {
         let before = snapshot_counters(queue);
 
         let mut item = test_local_ipv4_item(ECN_ECT_0);
+        let umem = test_admission_umem();
         // Signal that the caller already decided this packet will drop.
         let marked =
-            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, true, false, &mut item);
+            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, true, false, &mut item, &umem);
         assert!(!marked, "flow_share_exceeded path must skip marking");
         let after_share = snapshot_counters(queue);
         assert_eq!(after_share.admission_ecn_marked, before.admission_ecn_marked);
 
         let marked =
-            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, true, &mut item);
+            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, true, &mut item, &umem);
         assert!(!marked, "buffer_exceeded path must skip marking");
         let after_buf = snapshot_counters(queue);
         assert_eq!(after_buf.admission_ecn_marked, before.admission_ecn_marked);
@@ -10573,24 +10642,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn admission_does_not_mark_prepared_variant() {
-        // Prepared variant is the TODO(#718-followup) path. Exercised
-        // here so a future implementer sees an explicit pin when they
-        // land the umem-slice marking work.
-        let mut root = test_cos_runtime_with_exact(false);
-        let queue = &mut root.queues[0];
-        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
-        queue.queued_bytes = (buffer_limit / 2) + 1;
-        let before = snapshot_counters(queue);
-
-        let mut item = test_flow_prepared_cos_item(1111, 1500, 0);
-        let marked =
-            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, false, &mut item);
-        assert!(!marked);
-        let after = snapshot_counters(queue);
-        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked);
-    }
+    // `admission_does_not_mark_prepared_variant` was removed in #727:
+    // the Prepared variant is now handled by
+    // `maybe_mark_ecn_ce_prepared`, and the positive-behaviour pins
+    // for the Prepared hot path live in the
+    // `admission_ecn_marks_prepared_*` tests below.
 
     // ---------------------------------------------------------------------
     // #722 per-flow ECN threshold. #718 landed ECN CE marking keyed off
@@ -10702,8 +10758,16 @@ mod tests {
 
         let before = snapshot_counters(queue);
         let mut item = test_local_ipv4_item(ECN_ECT_0);
-        let marked =
-            apply_cos_admission_ecn_policy(queue, buffer_limit, target, false, false, &mut item);
+        let umem = test_admission_umem();
+        let marked = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            target,
+            false,
+            false,
+            &mut item,
+            &umem,
+        );
 
         assert!(marked, "per-flow arm must fire when aggregate is below");
         let after = snapshot_counters(queue);
@@ -10755,8 +10819,16 @@ mod tests {
 
         let before = snapshot_counters(queue);
         let mut item = test_local_ipv4_item(ECN_ECT_0);
-        let marked =
-            apply_cos_admission_ecn_policy(queue, buffer_limit, target, false, false, &mut item);
+        let umem = test_admission_umem();
+        let marked = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            target,
+            false,
+            false,
+            &mut item,
+            &umem,
+        );
 
         assert!(marked, "aggregate arm must still fire (the #718 case)");
         let after = snapshot_counters(queue);
@@ -10785,8 +10857,16 @@ mod tests {
 
         let before = snapshot_counters(queue);
         let mut item = test_local_ipv4_item(ECN_ECT_0);
-        let marked =
-            apply_cos_admission_ecn_policy(queue, buffer_limit, target, false, false, &mut item);
+        let umem = test_admission_umem();
+        let marked = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            target,
+            false,
+            false,
+            &mut item,
+            &umem,
+        );
 
         assert!(!marked, "no threshold tripped — no mark");
         let after = snapshot_counters(queue);
@@ -10820,8 +10900,16 @@ mod tests {
 
         let before = snapshot_counters(queue);
         let mut item = test_local_ipv4_item(ECN_ECT_0);
-        let marked =
-            apply_cos_admission_ecn_policy(queue, buffer_limit, target, true, false, &mut item);
+        let umem = test_admission_umem();
+        let marked = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            target,
+            true,
+            false,
+            &mut item,
+            &umem,
+        );
 
         assert!(!marked, "flow_share_exceeded must suppress the mark");
         let after = snapshot_counters(queue);
@@ -10880,10 +10968,351 @@ mod tests {
         queue.flow_bucket_bytes[target] = expected_flow + 1;
         let before = snapshot_counters(queue);
         let mut item = test_local_ipv4_item(ECN_ECT_0);
-        let marked =
-            apply_cos_admission_ecn_policy(queue, buffer_limit, target, false, false, &mut item);
+        let umem = test_admission_umem();
+        let marked = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            target,
+            false,
+            false,
+            &mut item,
+            &umem,
+        );
         assert!(marked);
         let after = snapshot_counters(queue);
         assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked + 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // #727 Prepared-variant ECN marking. The #718 / #722 marker was
+    // dormant on the XSK-RX→XSK-TX zero-copy hot path because the
+    // admission policy only handled `CoSPendingTxItem::Local`. These
+    // tests pin the Prepared branch byte-precisely: pre-state is
+    // ECT(0/1), post-state is CE, counter bumps exactly once, and
+    // the IPv4 checksum is still valid from scratch. A NOT-ECT
+    // counterfactual and an out-of-range-offset counterfactual are
+    // included so a regression that short-circuits either arm fails
+    // loudly.
+    // ---------------------------------------------------------------------
+
+    /// Build a Prepared CoS item whose frame lives in `umem` at the
+    /// given offset. Copies `packet_bytes` into the UMEM in place,
+    /// then returns the `CoSPendingTxItem::Prepared` referencing
+    /// those bytes. The caller is responsible for keeping `umem`
+    /// alive for the duration of the item's lifetime (each test
+    /// keeps both on the stack).
+    fn test_prepared_item_in_umem(
+        umem: &MmapArea,
+        offset: u64,
+        packet_bytes: &[u8],
+        expected_addr_family: u8,
+    ) -> CoSPendingTxItem {
+        // SAFETY: in-range by construction (caller passes a valid
+        // offset into a freshly-allocated MmapArea that is larger
+        // than `packet_bytes`). Exclusive access holds because the
+        // MmapArea is stack-local to the test.
+        let dest = unsafe { umem.slice_mut_unchecked(offset as usize, packet_bytes.len()) }
+            .expect("umem slice");
+        dest.copy_from_slice(packet_bytes);
+        CoSPendingTxItem::Prepared(PreparedTxRequest {
+            offset,
+            len: packet_bytes.len() as u32,
+            recycle: PreparedTxRecycle::FreeTxFrame,
+            expected_ports: None,
+            expected_addr_family,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 42,
+            cos_queue_id: Some(0),
+            dscp_rewrite: None,
+        })
+    }
+
+    #[test]
+    fn admission_ecn_marks_prepared_ipv4_ect0_packet_above_threshold() {
+        // Pre: queue above aggregate threshold, Prepared IPv4 ECT(0)
+        // packet lives at UMEM offset 0. Counter-factual pins that
+        // make this robust against partial regressions:
+        //   1. Before the call: TOS byte has ECN = ECT(0).
+        //   2. After the call: TOS byte has ECN = CE.
+        //   3. Counter bumped by exactly 1.
+        //   4. IP checksum recomputed-from-scratch matches what's in
+        //      the UMEM bytes.
+        let mut root = test_cos_runtime_with_exact(false);
+        let queue = &mut root.queues[0];
+        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        queue.queued_bytes = (buffer_limit / 2) + 1;
+        let before = snapshot_counters(queue);
+
+        let tos = (0x28u8 << 2) | ECN_ECT_0;
+        let packet = build_ipv4_test_packet(tos);
+        let umem = test_admission_umem();
+        let mut item =
+            test_prepared_item_in_umem(&umem, 0, &packet, libc::AF_INET as u8);
+
+        // Pin (1): pre-state is ECT(0).
+        let pre_bytes = umem
+            .slice(0, packet.len())
+            .expect("slice readback")
+            .to_vec();
+        assert_eq!(pre_bytes[15] & ECN_MASK, ECN_ECT_0);
+
+        let marked = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            0,
+            false,
+            false,
+            &mut item,
+            &umem,
+        );
+
+        assert!(marked, "Prepared variant must be marked");
+        // Pin (3): counter bumped by exactly 1.
+        let after = snapshot_counters(queue);
+        assert_eq!(
+            after.admission_ecn_marked,
+            before.admission_ecn_marked + 1,
+            "ECN counter must advance by exactly 1",
+        );
+        assert_eq!(after.admission_flow_share_drops, before.admission_flow_share_drops);
+        assert_eq!(after.admission_buffer_drops, before.admission_buffer_drops);
+
+        // Pin (2): UMEM bytes now carry CE and preserve DSCP.
+        let post_bytes = umem
+            .slice(0, packet.len())
+            .expect("slice readback")
+            .to_vec();
+        assert_eq!(post_bytes[15] & ECN_MASK, ECN_CE, "ECN bits must be CE");
+        assert_eq!(post_bytes[15] >> 2, 0x28, "DSCP must survive marking");
+
+        // Pin (4): IP checksum recomputed from scratch matches what's
+        // actually sitting in UMEM. If the incremental update were
+        // off-by-one or skipped a word, this would fail.
+        let stored_csum = ((post_bytes[24] as u16) << 8) | post_bytes[25] as u16;
+        let from_scratch = compute_ipv4_header_checksum(&post_bytes[14..34]);
+        assert_eq!(
+            stored_csum, from_scratch,
+            "incremental IP checksum must match a from-scratch recompute",
+        );
+    }
+
+    #[test]
+    fn admission_ecn_marks_prepared_ipv6_ect0_packet_above_threshold() {
+        // IPv6 Prepared packet at a non-zero UMEM offset. IPv6 has no
+        // header checksum, so the pins are:
+        //   1. Pre-state tclass has ECN = ECT(0).
+        //   2. Post-state tclass has ECN = CE.
+        //   3. Version + flow-label untouched.
+        //   4. Counter bumped by exactly 1.
+        let mut root = test_cos_runtime_with_exact(false);
+        let queue = &mut root.queues[0];
+        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        queue.queued_bytes = (buffer_limit / 2) + 1;
+        let before = snapshot_counters(queue);
+
+        let tclass = (0x2eu8 << 2) | ECN_ECT_0;
+        let packet = build_ipv6_test_packet(tclass);
+        // Pick a non-zero offset to prove that `slice_mut_unchecked`
+        // is honouring `req.offset` rather than always slicing from 0.
+        let offset: u64 = 128;
+        let umem = test_admission_umem();
+        let mut item =
+            test_prepared_item_in_umem(&umem, offset, &packet, libc::AF_INET6 as u8);
+
+        let pre_bytes = umem
+            .slice(offset as usize, packet.len())
+            .expect("slice readback")
+            .to_vec();
+        let pre_version_nibble = pre_bytes[14] & 0xf0;
+        let pre_flow_label_low = pre_bytes[15] & 0x0f;
+        assert_eq!(
+            ((pre_bytes[14] & 0x0f) << 4) | ((pre_bytes[15] >> 4) & 0x0f),
+            tclass,
+        );
+
+        let marked = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            0,
+            false,
+            false,
+            &mut item,
+            &umem,
+        );
+
+        assert!(marked, "Prepared IPv6 must be marked");
+        let after = snapshot_counters(queue);
+        assert_eq!(
+            after.admission_ecn_marked,
+            before.admission_ecn_marked + 1,
+        );
+
+        let post_bytes = umem
+            .slice(offset as usize, packet.len())
+            .expect("slice readback")
+            .to_vec();
+        let post_tclass = ((post_bytes[14] & 0x0f) << 4) | ((post_bytes[15] >> 4) & 0x0f);
+        assert_eq!(post_tclass & ECN_MASK, ECN_CE);
+        assert_eq!(post_tclass >> 2, 0x2e, "DSCP must survive marking");
+        assert_eq!(
+            post_bytes[14] & 0xf0,
+            pre_version_nibble,
+            "version nibble must not drift",
+        );
+        assert_eq!(
+            post_bytes[15] & 0x0f,
+            pre_flow_label_low,
+            "flow-label low nibble must not drift",
+        );
+    }
+
+    #[test]
+    fn admission_ecn_leaves_prepared_not_ect_packet_untouched() {
+        // Queue above threshold, but the Prepared packet is NOT-ECT.
+        // RFC 3168 §6.1.1.1: never mark a flow that did not negotiate
+        // ECN. Counter must stay put and UMEM bytes byte-identical.
+        let mut root = test_cos_runtime_with_exact(false);
+        let queue = &mut root.queues[0];
+        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        queue.queued_bytes = (buffer_limit / 2) + 1;
+        let before = snapshot_counters(queue);
+
+        let tos = 0xb8; // DSCP 46 (EF), ECN = 00 (NOT-ECT)
+        let packet = build_ipv4_test_packet(tos);
+        let umem = test_admission_umem();
+        let mut item =
+            test_prepared_item_in_umem(&umem, 0, &packet, libc::AF_INET as u8);
+        let pre_bytes = umem
+            .slice(0, packet.len())
+            .expect("slice readback")
+            .to_vec();
+
+        let marked = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            0,
+            false,
+            false,
+            &mut item,
+            &umem,
+        );
+
+        assert!(!marked, "NOT-ECT packet must not be marked");
+        let after = snapshot_counters(queue);
+        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked);
+        let post_bytes = umem
+            .slice(0, packet.len())
+            .expect("slice readback")
+            .to_vec();
+        assert_eq!(
+            post_bytes, pre_bytes,
+            "NOT-ECT packet bytes must be byte-identical",
+        );
+        assert_eq!(post_bytes[15] & ECN_MASK, ECN_NOT_ECT);
+    }
+
+    #[test]
+    fn admission_ecn_skips_prepared_when_umem_slice_out_of_range() {
+        // Constructed `PreparedTxRequest` points past the end of the
+        // UMEM (`offset` > umem.len()). `slice_mut_unchecked` returns
+        // None, the marker returns false, and the admission policy
+        // must neither panic nor bump the counter. Guards the
+        // out-of-range None-handling path — a regression that removed
+        // the `let Some(...) = ... else { return false }` shape would
+        // fail here without needing to catch a UB-flavoured panic.
+        let mut root = test_cos_runtime_with_exact(false);
+        let queue = &mut root.queues[0];
+        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        queue.queued_bytes = (buffer_limit / 2) + 1;
+        let before = snapshot_counters(queue);
+
+        let umem = test_admission_umem();
+        // Offset deliberately past the UMEM len. `len: 1` so we do
+        // not trip the internal `checked_add` overflow path — we want
+        // the `end > self.len` check in `slice_mut_unchecked` to be
+        // what returns None.
+        let mut item = CoSPendingTxItem::Prepared(PreparedTxRequest {
+            offset: u64::MAX / 2,
+            len: 1,
+            recycle: PreparedTxRecycle::FreeTxFrame,
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 42,
+            cos_queue_id: Some(0),
+            dscp_rewrite: None,
+        });
+
+        let marked = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            0,
+            false,
+            false,
+            &mut item,
+            &umem,
+        );
+
+        assert!(!marked, "out-of-range slice must not be marked");
+        let after = snapshot_counters(queue);
+        assert_eq!(
+            after.admission_ecn_marked, before.admission_ecn_marked,
+            "counter must stay put when the slice is out of range",
+        );
+    }
+
+    #[test]
+    fn admission_ecn_counter_increments_for_both_local_and_prepared_in_same_queue() {
+        // Drive the queue above threshold and pass ONE Local + ONE
+        // Prepared, both ECT(0). The single `admission_ecn_marked`
+        // counter must advance by exactly 2 — proves neither variant
+        // is double-counting or under-counting, and that both paths
+        // share the same counter. Counter-factual for a refactor
+        // that accidentally split the counter: this test would drop
+        // to +1.
+        let mut root = test_cos_runtime_with_exact(false);
+        let queue = &mut root.queues[0];
+        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        queue.queued_bytes = (buffer_limit / 2) + 1;
+        let before = snapshot_counters(queue);
+
+        let umem = test_admission_umem();
+
+        // Local variant first.
+        let mut local_item = test_local_ipv4_item(ECN_ECT_0);
+        let marked_local = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            0,
+            false,
+            false,
+            &mut local_item,
+            &umem,
+        );
+        assert!(marked_local, "Local variant must mark");
+
+        // Prepared variant next.
+        let packet = build_ipv4_test_packet(ECN_ECT_0);
+        let mut prepared_item =
+            test_prepared_item_in_umem(&umem, 0, &packet, libc::AF_INET as u8);
+        let marked_prepared = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            0,
+            false,
+            false,
+            &mut prepared_item,
+            &umem,
+        );
+        assert!(marked_prepared, "Prepared variant must mark");
+
+        let after = snapshot_counters(queue);
+        assert_eq!(
+            after.admission_ecn_marked,
+            before.admission_ecn_marked + 2,
+            "single counter must reflect both Local and Prepared marks",
+        );
     }
 }

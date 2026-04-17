@@ -248,3 +248,10 @@
 - **Action**: Add CoSQueueDropCounters.admission_ecn_marked field + protocol/worker/coordinator aggregation
   - **File(s)**: `userspace-dp/src/afxdp/types.rs`, `userspace-dp/src/afxdp/worker.rs`, `userspace-dp/src/afxdp/coordinator.rs`, `userspace-dp/src/protocol.rs`
 - **Result**: 16 new tests (11 marker, 5 admission); full suite 667 pass / 0 fail (baseline 651); Local variant only, Prepared deferred to #718-followup
+
+## 2026-04-17 — #727 ECN CE marking on Prepared CoS variant (#718 follow-up)
+- **Action**: Add `maybe_mark_ecn_ce_prepared(req, umem)` helper; extend `apply_cos_admission_ecn_policy` to handle both `CoSPendingTxItem::Local` and `::Prepared` under a single `admission_ecn_marked` counter; take a shared `&MmapArea` inside `enqueue_cos_item` via split-borrow and thread it to the policy call
+  - **File(s)**: `userspace-dp/src/afxdp/tx.rs`
+- **Action**: Add 5 Prepared-variant admission tests (IPv4 ECT(0), IPv6 ECT(0), NOT-ECT, out-of-range offset, combined Local+Prepared counter pin); remove stale `admission_does_not_mark_prepared_variant` negative pin
+  - **File(s)**: `userspace-dp/src/afxdp/tx.rs`
+- **Result**: admission_ecn group 11/11 pass, mark_ecn_ce group 11/11 pass, full suite 680/680 pass. Marker now fires on the XSK-RX→XSK-TX zero-copy hot path (iperf3, NAT'd flows); acceptance target per `docs/cos-validation-notes.md` is `ecn_marked` becoming non-zero during live 16-flow iperf3
