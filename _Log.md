@@ -270,3 +270,9 @@
 - **Action**: New "Reading the owner-profile counters" section with decision tree mapping drain_p99 / redirect_p99 / owner_pps ratio to #709 Option B/C/D follow-ups
   - **File(s)**: `docs/cos-validation-notes.md`
 - **Result**: 7 new Rust tests (+692 total, baseline 685), 3 new Go tests; full `cargo test` + `go test ./...` green. Telemetry-only: no hot-path allocations, no new syscalls, MPSC invariants preserved, histogram bucket select branchless
+
+## 2026-04-17 — #708 architect plan
+
+- **Timestamp**: 2026-04-17
+  - **Action**: Write #708 enqueue-pacing architect plan — Option B (per-SFQ-bucket token bucket), measurement-first, pacing gate strictly AFTER ECN marker to preserve #718 invariants. Honest framing on residual retrans (most of the ~100k retrans signal is likely ECN-induced recovery entries, not wire loss, so pacing is unlikely to move retrans meaningfully; §3 says so explicitly)
+  - **File(s)**: `docs/708-enqueue-pacing-plan.md` (new)
