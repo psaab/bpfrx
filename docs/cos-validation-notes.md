@@ -10,14 +10,13 @@ mistake described in #725 or the VLAN-offset bug resolved in #728.
 
 ## How to read admission drop counters live
 
-Since #724, `show class-of-service interface` renders four per-queue
-counters on an indented `Drops:` line (the fourth, `pacing`, landed
-via #708):
+Since #724, `show class-of-service interface` renders three per-queue
+counters on an indented `Drops:` line:
 
 ```
 Queue  Owner  Class    ...  Buffer     Queued pkts  Queued bytes  ...
 4      1      iperf-a  ...  1.19 MiB   299          443.24 KiB    ...
-       Drops: flow_share=1923  buffer=0  ecn_marked=0  pacing=0
+       Drops: flow_share=1923  buffer=0  ecn_marked=0
 ```
 
 Definitions (from `CoSQueueDropCounters` in `userspace-dp/src/afxdp/types.rs`):
@@ -34,46 +33,6 @@ Definitions (from `CoSQueueDropCounters` in `userspace-dp/src/afxdp/types.rs`):
   firewall, or (c) the marker is reading the wrong byte (see #728 —
   the VLAN-offset bug made the marker dormant even with ECT(0)
   on the wire).
-- `pacing` — packets tail-dropped by the #708 per-SFQ-bucket pacing
-  gate because the bucket's token bucket had fewer tokens than the
-  packet's byte count. Sits **after** the ECN marker in the admission
-  pipeline so ECT packets above the ECN threshold get marked on the
-  previously-admitted packet AND tail-dropped here. A rising counter
-  with a steady `ecn_marked` means pacing is absorbing microbursts
-  the marker couldn't catch in time. Zero with rising `flow_share`
-  means the residual is not microburst-driven — per plan §3 that is
-  a valid "gate implemented, dormant on workload" outcome and closes
-  #708 as wontfix for the current baseline.
-
-### Interpreting `admission_pacing_drops`
-
-The pacing gate fires on flow-fair queues when the packet's target
-bucket has fewer pacing tokens than the packet's byte count. The
-refill rate is `queue.transmit_rate_bytes /
-cos_queue_prospective_active_flows()` (same denominator the per-flow
-share cap uses — centralised via #704's single-source-of-truth
-rule), clamped to a burst ceiling of `COS_FLOW_FAIR_MIN_SHARE_BYTES`
-so the gate cannot silently disable itself for a freshly-arriving
-flow. Expected signals at read time:
-
-- **Non-zero `pacing`, non-zero `ecn_marked`, low `flow_share`** —
-  pacing is doing the microburst smoothing the plan predicted. ECN
-  still carries the fairness signal on slow-timescale buildup. This
-  is the "pacing absorbing residual" shape.
-- **Zero `pacing`, unchanged `flow_share` and `ecn_marked`** — the
-  residual is not microburst-driven. Per plan §3 this is a valid
-  close-as-not-needed outcome for #708. Redirect effort to #709
-  owner-hotspot or #712 CPU jitter instead.
-- **High `pacing`, rising `flow_share`** — pacing ran out of
-  resolution and per-bucket pacing is not enough. Open the deferred
-  #708 follow-up "per-flow token-bucket pacing with deferred-admit
-  timer wheel" (plan §7 Option A).
-- **Non-zero `pacing`, zero `ecn_marked`** — ordering broke. Should
-  never happen on a config where ECT packets reach the queue; see
-  the counter-factual pin
-  `pacing_gate_after_ecn_marker_ordering` in `tx.rs` tests and
-  #728 VLAN-offset for the class of bug that previously silenced the
-  marker.
 
 Zero-valued counters are still printed. That is deliberate: an operator
 needs to see the zero to confirm the counter is wired and the drop path
@@ -140,15 +99,13 @@ When the counters show something different from the current baseline
 (see below), the pathology and the right fix may be different. The
 decision tree:
 
-| `flow_share` | `buffer` | `ecn_marked` | `pacing` | Interpretation | Likely fix |
-|---|---|---|---|---|---|
-| low (~10s/flow/30s) | 0 | high (~100k/30s) | 0 | Current post-#728 baseline with #708 dormant. ECN holds cwnd at the knee; residual drops are microburst arrivals the marker couldn't catch in time, but pacing sees no token starvation — residual is not microburst-driven. | Close #708 as implemented-dormant. Redirect to #709 owner-worker hotspot / #712 CPU pinning. |
-| low | 0 | high | ≥ 50/30s | Post-#708 "pacing absorbing microbursts". ECN carries slow-timescale fairness, pacing absorbs fast-timescale arrivals. | Stable shape — monitor `pacing` vs `flow_share` ratio; if `pacing` dominates and `flow_share` stays low, the gate is doing its job. |
-| high | low | 0 | 0 | Per-flow cap too tight; no ECN to soften it. Before concluding "endpoint doesn't negotiate ECN", run a gRPC server-side capture (see above) — #728 was this symptom caused by a VLAN-offset bug, not by the endpoint. | Confirm ECT on the wire via gRPC capture, then: fix marker if ECT present; otherwise ECN end-to-end, or relax per-flow cap. |
-| high | low | high | 0 | ECN fires but TCP still drops — ECN signal not enough, and pacing is not the bottleneck. | Lower ECN threshold, or investigate non-ECN-aware flows. |
-| low | high | any | any | Aggregate cap tripping — bufferbloat | Revisit #720 clamp; look at operator `buffer-size` setting |
-| high | low | high | high (dominant) | Pacing ran out of resolution; per-bucket pacing not enough. | Open the deferred plan §7 follow-up: "userspace-dp: per-flow token-bucket pacing with deferred-admit timer wheel" (Option A). |
-| 0 | 0 | 0 | 0 | Nothing is dropping; problem is elsewhere | Look at #709 (owner worker), #712 (CPU pinning), or network-layer loss |
+| `flow_share` | `buffer` | `ecn_marked` | Interpretation | Likely fix |
+|---|---|---|---|---|
+| low (~10s/flow/30s) | 0 | high (~100k/30s) | Current post-#728 baseline. ECN holds cwnd at the knee; residual drops are microburst arrivals the marker couldn't catch in time. | #709 owner-worker hotspot / #718 Option B CoDel for the microburst residual. |
+| high | low | 0 | Per-flow cap too tight; no ECN to soften it. Before concluding "endpoint doesn't negotiate ECN", run a gRPC server-side capture (see above) — #728 was this symptom caused by a VLAN-offset bug, not by the endpoint. | Confirm ECT on the wire via gRPC capture, then: fix marker if ECT present; otherwise ECN end-to-end, or CoDel (non-ECN AQM), or relax per-flow cap. |
+| high | low | high | ECN fires but TCP still drops — ECN signal not enough | Lower ECN threshold, or combine with rate-based pacing |
+| low | high | any | Aggregate cap tripping — bufferbloat | Revisit #720 clamp; look at operator `buffer-size` setting |
+| 0 | 0 | 0 | Nothing is dropping; problem is elsewhere | Look at #709 (owner worker), #712 (CPU pinning), or network-layer loss |
 
 ## Current dominant failure mode on this workload
 

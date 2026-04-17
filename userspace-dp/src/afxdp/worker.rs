@@ -1848,11 +1848,6 @@ where
                 status.admission_ecn_marked = status
                     .admission_ecn_marked
                     .saturating_add(queue.drop_counters.admission_ecn_marked);
-                // #708: aggregate pacing-drop counter across workers.
-                // Same shape as `admission_ecn_marked`.
-                status.admission_pacing_drops = status
-                    .admission_pacing_drops
-                    .saturating_add(queue.drop_counters.admission_pacing_drops);
                 status.root_token_starvation_parks = status
                     .root_token_starvation_parks
                     .saturating_add(queue.drop_counters.root_token_starvation_parks);
@@ -1978,8 +1973,6 @@ mod tests {
                     queued_bytes,
                     active_flow_buckets: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-                    flow_bucket_tokens: [0; COS_FLOW_FAIR_BUCKETS],
-                    flow_bucket_last_refill_ns: [0; COS_FLOW_FAIR_BUCKETS],
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                     runnable,
@@ -2007,7 +2000,6 @@ mod tests {
             admission_flow_share_drops: 3,
             admission_buffer_drops: 1,
             admission_ecn_marked: 37,
-            admission_pacing_drops: 47,
             root_token_starvation_parks: 5,
             queue_token_starvation_parks: 7,
             tx_ring_full_submit_stalls: 11,
@@ -2016,7 +2008,6 @@ mod tests {
             admission_flow_share_drops: 13,
             admission_buffer_drops: 17,
             admission_ecn_marked: 41,
-            admission_pacing_drops: 53,
             root_token_starvation_parks: 19,
             queue_token_starvation_parks: 23,
             tx_ring_full_submit_stalls: 29,
@@ -2052,11 +2043,6 @@ mod tests {
         assert_eq!(queue.admission_flow_share_drops, 3 + 13);
         assert_eq!(queue.admission_buffer_drops, 1 + 17);
         assert_eq!(queue.admission_ecn_marked, 37 + 41);
-        // #708: pacing counter follows the same cross-worker aggregation
-        // shape as the ECN counter. Non-coprime-prime values on either
-        // side so re-attribution to a neighbouring counter would fail
-        // this assertion.
-        assert_eq!(queue.admission_pacing_drops, 47 + 53);
         assert_eq!(queue.root_token_starvation_parks, 5 + 19);
         assert_eq!(queue.queue_token_starvation_parks, 7 + 23);
         assert_eq!(queue.tx_ring_full_submit_stalls, 11 + 29);

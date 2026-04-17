@@ -618,20 +618,6 @@ pub(super) const COS_FLOW_FAIR_BUCKETS: usize = 1024;
 const _: () = assert!(COS_FLOW_FAIR_BUCKETS.is_power_of_two());
 const _: () = assert!(COS_FLOW_FAIR_BUCKETS <= u16::MAX as usize);
 
-// #708: the pacing gate indexes `flow_bucket_tokens` /
-// `flow_bucket_last_refill_ns` with the same bucket id that indexes
-// `flow_bucket_bytes`. A refactor that changed one array length without
-// the others would silently desync the gate. Pin all three to the same
-// constant at build time.
-const _: () = assert!({
-    let _bytes: [u64; COS_FLOW_FAIR_BUCKETS] = [0; COS_FLOW_FAIR_BUCKETS];
-    let _tokens: [u64; COS_FLOW_FAIR_BUCKETS] = [0; COS_FLOW_FAIR_BUCKETS];
-    let _refill: [u64; COS_FLOW_FAIR_BUCKETS] = [0; COS_FLOW_FAIR_BUCKETS];
-    COS_FLOW_FAIR_BUCKETS == _bytes.len()
-        && _bytes.len() == _tokens.len()
-        && _tokens.len() == _refill.len()
-});
-
 /// Pre-computed mask for `COS_FLOW_FAIR_BUCKETS`-modulo on the hot
 /// path. Using a mask (rather than `%`) gives deterministic codegen
 /// independent of the optimizer proving the power-of-two property at
@@ -995,22 +981,6 @@ pub(super) struct CoSQueueRuntime {
     pub(super) queued_bytes: u64,
     pub(super) active_flow_buckets: u16,
     pub(super) flow_bucket_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
-    /// #708: per-SFQ-bucket token-bucket for enqueue-side pacing. Lives
-    /// alongside `flow_bucket_bytes` so the admission gate keys off the
-    /// same index with no extra hash. Bytes, not packets — same unit
-    /// `transmit_rate_bytes` is in so the refill primitive from
-    /// `refill_cos_tokens` reuses without a conversion. Initialised to 0;
-    /// the first admission on an empty queue primes the bucket via
-    /// `refill_cos_flow_bucket_tokens`. Cold on non-flow-fair queues
-    /// (the gate short-circuits on `!queue.flow_fair`).
-    pub(super) flow_bucket_tokens: [u64; COS_FLOW_FAIR_BUCKETS],
-    /// #708: per-bucket monotonic ns timestamp of the last refill. One
-    /// u64 per bucket so the pacing gate does O(1) work on admission
-    /// (refill only the target bucket) rather than O(1024) scanning
-    /// every bucket on every admission. Costs 8 KB per queue versus
-    /// the `single shared last_refill_ns` that plan §4 originally
-    /// scoped; accepted in exchange for hot-path O(1) refill.
-    pub(super) flow_bucket_last_refill_ns: [u64; COS_FLOW_FAIR_BUCKETS],
     pub(super) flow_rr_buckets: FlowRrRing,
     pub(super) flow_bucket_items: [VecDeque<CoSPendingTxItem>; COS_FLOW_FAIR_BUCKETS],
     pub(super) runnable: bool,
@@ -1047,19 +1017,6 @@ pub(super) struct CoSQueueDropCounters {
     /// path and are counted under the respective drop-reason field.
     /// See #718.
     pub(super) admission_ecn_marked: u64,
-    /// #708: packets tail-dropped because the per-SFQ-bucket pacing
-    /// token bucket had fewer tokens than the packet's byte count. Sits
-    /// *after* the ECN marker in `enqueue_cos_item` so that ECT packets
-    /// above the mark threshold get marked on the previously-admitted
-    /// packet AND tail-dropped here — the sender sees consistent
-    /// signals (CE mark + tail drop) rather than pacing silencing the
-    /// ECN path. Counter-factual: put pacing before the marker and ECN
-    /// becomes dead code. The gate is engaged only on `flow_fair=true`
-    /// queues; non-flow-fair queues bypass with zero tokens accounted.
-    /// Distinct from `admission_flow_share_drops` /
-    /// `admission_buffer_drops` — those count capacity caps, this
-    /// counts rate pacing.
-    pub(super) admission_pacing_drops: u64,
     /// Queue parked because the interface shaping-rate token bucket is
     /// empty. Not a drop — the queue will be woken on timer-wheel tick.
     /// High count relative to serviced-batches indicates the root

@@ -1,11 +1,5 @@
 # Action Log
 
-## 2026-04-17
-
-- **Timestamp**: 2026-04-17T17:00:00Z
-  - **Action**: Issue #708 Option B — Per-SFQ-bucket token-bucket pacing slice. Added `flow_bucket_tokens: [u64; 1024]` and `flow_bucket_last_refill_ns: [u64; 1024]` on CoSQueueRuntime, `admission_pacing_drops` counter on CoSQueueDropCounters, and a new helper `refill_cos_flow_bucket_tokens()` + `cos_flow_bucket_pacing_exceeded()` gate inline in `enqueue_cos_item`. Gate sits AFTER `apply_cos_admission_ecn_policy` to preserve #718's ECN ordering invariant. Drop-reason attribution order: flow_share > pacing > buffer. Lazy per-bucket refill strategy (O(1) hot path, 8 KB/queue overhead) vs plan §4's shared-timestamp O(1024) strategy. Added 7 Rust tests including a counter-factual pin for the ECN-ordering invariant. Extended Go cosfmt Drops line with `pacing=N` column and added `TestFormatCoSInterfaceSummaryRendersZeroPacingDropsExplicitly`. Added `xpf_cos_admission_pacing_drops_total` Prometheus counter. Updated cos-validation-notes.md decision tree with the new column.
-  - **File(s)**: userspace-dp/src/afxdp/types.rs, userspace-dp/src/afxdp/tx.rs, userspace-dp/src/afxdp/worker.rs, userspace-dp/src/afxdp/coordinator.rs, userspace-dp/src/protocol.rs, pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/cosfmt.go, pkg/dataplane/userspace/cosfmt_test.go, pkg/api/metrics.go, docs/cos-validation-notes.md
-
 ## 2026-04-03
 
 - **Timestamp**: 2026-04-03
