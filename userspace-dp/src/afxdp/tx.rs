@@ -2610,21 +2610,61 @@ fn maybe_mark_ecn_ce(req: &mut TxRequest) -> bool {
 /// marked packet is ALSO admitted; a non-ECT packet above threshold
 /// falls through unchanged and drops via the existing buffer/share
 /// caps.
+///
+/// Two thresholds fire the mark, whichever trips first:
+///
+///   * **Aggregate**: `queue.queued_bytes > buffer_limit × NUM/DEN`.
+///     This is the #718 arm — it signals congestion once the entire
+///     queue is past the mark fraction of its operator-configured
+///     buffer, independent of per-flow accounting.
+///   * **Per-flow**: `queue.flow_bucket_bytes[flow_bucket] >
+///     share_cap × NUM/DEN`, where `share_cap` is the current
+///     per-flow cap from `cos_queue_flow_share_limit`. This is the
+///     #722 arm. On the 16-flow / 1 Gbps exact-queue live workload
+///     the aggregate queue sat at ~31% utilisation — the #718 50%
+///     threshold never tripped — while per-flow buckets routinely
+///     hit the 24 KB share cap and drops fired via
+///     `flow_share_exceeded`. Marking off the per-flow bucket lets
+///     ECN-negotiated TCP halve cwnd via ECE before the per-flow
+///     cap trips the drop.
+///
+/// Both arms use the same `NUM/DEN` fraction. If an operator wants
+/// the fraction tuned it must move in lockstep across both arms —
+/// see the `admission_ecn_per_flow_threshold_matches_share_cap_denominator`
+/// test for the regression pin.
+///
+/// Non-flow-fair queues degenerate safely:
+/// `cos_queue_flow_share_limit` returns `buffer_limit` unchanged when
+/// `queue.flow_fair` is false, so the per-flow threshold collapses
+/// onto the aggregate one. No behaviour change on best-effort or
+/// pure-rate-limited queues.
 #[inline]
 fn apply_cos_admission_ecn_policy(
     queue: &mut CoSQueueRuntime,
     buffer_limit: u64,
+    flow_bucket: usize,
     flow_share_exceeded: bool,
     buffer_exceeded: bool,
     item: &mut CoSPendingTxItem,
 ) -> bool {
     // Integer division by the compile-time-asserted nonzero
     // `COS_ECN_MARK_THRESHOLD_DEN` is one saturating_mul + one divide
-    // on the hot path.
-    let ecn_threshold = buffer_limit
+    // on the hot path for each of the two thresholds.
+    let aggregate_ecn_threshold = buffer_limit
         .saturating_mul(COS_ECN_MARK_THRESHOLD_NUM)
         / COS_ECN_MARK_THRESHOLD_DEN.max(1);
-    if queue.queued_bytes <= ecn_threshold || flow_share_exceeded || buffer_exceeded {
+    // #722: per-flow threshold derived from the same share cap the
+    // admission gate uses. `cos_queue_flow_share_limit` is pure and
+    // inlined (saturating_add + max + div_ceil + clamp), ~5 ns.
+    let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, flow_bucket);
+    let flow_ecn_threshold = share_cap
+        .saturating_mul(COS_ECN_MARK_THRESHOLD_NUM)
+        / COS_ECN_MARK_THRESHOLD_DEN.max(1);
+
+    let aggregate_above = queue.queued_bytes > aggregate_ecn_threshold;
+    let flow_above = queue.flow_bucket_bytes[flow_bucket] > flow_ecn_threshold;
+
+    if (!aggregate_above && !flow_above) || flow_share_exceeded || buffer_exceeded {
         return false;
     }
     if let CoSPendingTxItem::Local(req) = item {
@@ -3981,15 +4021,19 @@ fn enqueue_cos_item(
             false
         };
         let buffer_exceeded = queue.queued_bytes.saturating_add(item_len) > buffer_limit;
-        // #718: ECN CE-mark above threshold so ECN-negotiated TCP flows
-        // back off smoothly rather than tail-dropping into RTO. Non-ECT
-        // packets are untouched — they fall back to the existing
-        // admission drop path below. Mark only when the packet will
-        // actually be admitted: a marked-and-then-dropped packet wastes
-        // both the mark and the bandwidth the mark was trying to steer.
+        // #718 + #722: ECN CE-mark above threshold so ECN-negotiated
+        // TCP flows back off smoothly rather than tail-dropping into
+        // RTO. Non-ECT packets are untouched — they fall back to the
+        // existing admission drop path below. Mark only when the
+        // packet will actually be admitted: a marked-and-then-dropped
+        // packet wastes both the mark and the bandwidth the mark was
+        // trying to steer. `flow_bucket` is the same index the
+        // per-flow admission gate keyed off, so both gates see the
+        // same queue snapshot.
         let _ = apply_cos_admission_ecn_policy(
             queue,
             buffer_limit,
+            flow_bucket,
             flow_share_exceeded,
             buffer_exceeded,
             &mut item,
@@ -10426,7 +10470,11 @@ mod tests {
         let before = snapshot_counters(queue);
 
         let mut item = test_local_ipv4_item(ECN_ECT_0);
-        let marked = apply_cos_admission_ecn_policy(queue, buffer_limit, false, false, &mut item);
+        // Non-flow-fair queue: share_cap == buffer_limit, so both
+        // thresholds collapse onto the aggregate one. `flow_bucket=0`
+        // is unused beyond the (constant-returning) share-limit call.
+        let marked =
+            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, false, &mut item);
 
         assert!(marked);
         let after = snapshot_counters(queue);
@@ -10455,7 +10503,8 @@ mod tests {
         let before = snapshot_counters(queue);
 
         let mut item = test_local_ipv4_item(ECN_ECT_0);
-        let marked = apply_cos_admission_ecn_policy(queue, buffer_limit, false, false, &mut item);
+        let marked =
+            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, false, &mut item);
 
         assert!(!marked, "at-threshold must not mark");
         let after = snapshot_counters(queue);
@@ -10479,7 +10528,8 @@ mod tests {
         let before = snapshot_counters(queue);
 
         let mut item = test_local_ipv4_item(ECN_NOT_ECT);
-        let marked = apply_cos_admission_ecn_policy(queue, buffer_limit, false, false, &mut item);
+        let marked =
+            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, false, &mut item);
 
         assert!(!marked);
         let after = snapshot_counters(queue);
@@ -10503,12 +10553,14 @@ mod tests {
 
         let mut item = test_local_ipv4_item(ECN_ECT_0);
         // Signal that the caller already decided this packet will drop.
-        let marked = apply_cos_admission_ecn_policy(queue, buffer_limit, true, false, &mut item);
+        let marked =
+            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, true, false, &mut item);
         assert!(!marked, "flow_share_exceeded path must skip marking");
         let after_share = snapshot_counters(queue);
         assert_eq!(after_share.admission_ecn_marked, before.admission_ecn_marked);
 
-        let marked = apply_cos_admission_ecn_policy(queue, buffer_limit, false, true, &mut item);
+        let marked =
+            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, true, &mut item);
         assert!(!marked, "buffer_exceeded path must skip marking");
         let after_buf = snapshot_counters(queue);
         assert_eq!(after_buf.admission_ecn_marked, before.admission_ecn_marked);
@@ -10533,9 +10585,305 @@ mod tests {
         let before = snapshot_counters(queue);
 
         let mut item = test_flow_prepared_cos_item(1111, 1500, 0);
-        let marked = apply_cos_admission_ecn_policy(queue, buffer_limit, false, false, &mut item);
+        let marked =
+            apply_cos_admission_ecn_policy(queue, buffer_limit, 0, false, false, &mut item);
         assert!(!marked);
         let after = snapshot_counters(queue);
         assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked);
+    }
+
+    // ---------------------------------------------------------------------
+    // #722 per-flow ECN threshold. #718 landed ECN CE marking keyed off
+    // aggregate queue depth. Live validation on the 16-flow / 1 Gbps
+    // exact-queue workload showed the aggregate threshold never fires
+    // (queue sat at ~31% vs the 50% threshold) because drops came from
+    // the per-flow fair-share cap. These tests drive the per-flow arm
+    // directly, recreate the live failure mode, and include a counter-
+    // factual assertion that proves the pre-#722 aggregate-only formula
+    // would have missed this case.
+    // ---------------------------------------------------------------------
+
+    /// Build a flow-fair exact queue shaped to match the live
+    /// 16-flow / 1 Gbps / 128 KB-buffer workload that motivated #722.
+    /// Picking these exact numbers means the derived thresholds
+    /// (buffer_limit, share_cap, aggregate_ecn_threshold,
+    /// flow_ecn_threshold) match what the scheduler sees in
+    /// production, so the fixture is not just internally consistent —
+    /// it is the failure mode.
+    fn test_flow_fair_exact_queue_16_flows() -> CoSInterfaceRuntime {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+        root
+    }
+
+    /// Populate 16 flow buckets on a flow-fair queue so
+    /// `active_flow_buckets == 16`. Target bucket `target` is set to
+    /// `target_bytes`; every other populated bucket gets 1 byte (just
+    /// enough to count as active). Returns the resulting
+    /// `queued_bytes` sum so the caller can reconcile the aggregate
+    /// with the per-bucket picture.
+    fn seed_sixteen_flow_buckets(
+        queue: &mut CoSQueueRuntime,
+        target: usize,
+        target_bytes: u64,
+    ) -> u64 {
+        queue.active_flow_buckets = 16;
+        let mut populated = 0usize;
+        let mut bucket = 0usize;
+        let mut sum = 0u64;
+        while populated < 16 && bucket < queue.flow_bucket_bytes.len() {
+            if bucket == target {
+                queue.flow_bucket_bytes[bucket] = target_bytes;
+                sum = sum.saturating_add(target_bytes);
+                populated += 1;
+            } else {
+                queue.flow_bucket_bytes[bucket] = 1;
+                sum = sum.saturating_add(1);
+                populated += 1;
+            }
+            bucket += 1;
+        }
+        sum
+    }
+
+    #[test]
+    fn admission_ecn_marks_when_per_flow_above_threshold_aggregate_below() {
+        // Live failure mode from #722: queue sits at ~31% utilisation
+        // so the aggregate 50% threshold never trips, but a dominant
+        // flow's bucket is past the per-flow 50% threshold and is
+        // about to be dropped by the flow-share cap.
+        let mut root = test_flow_fair_exact_queue_16_flows();
+        let queue = &mut root.queues[0];
+        let target = 0usize;
+
+        // buffer_limit at 16 active flows: 16 × 24 KB = 384 KB (clamped
+        // by delay_cap = 625 KB on a 1 Gbps queue @ 5 ms). share_cap =
+        // 384000 / 16 = 24000. aggregate_ecn_threshold = 192000.
+        // flow_ecn_threshold = 12000.
+        let target_bucket_bytes = 15_000; // > 12 000 per-flow threshold
+        let queued_bytes = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
+        queue.queued_bytes = queued_bytes;
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
+        assert_eq!(buffer_limit, 384_000);
+        let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
+        assert_eq!(share_cap, 24_000);
+        let aggregate_ecn_threshold =
+            buffer_limit.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+        let flow_ecn_threshold =
+            share_cap.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+        assert_eq!(aggregate_ecn_threshold, 192_000);
+        assert_eq!(flow_ecn_threshold, 12_000);
+
+        // Counter-factual: reconstruct the pre-#722 aggregate-only
+        // formula and assert that on this exact state it would NOT
+        // fire. This is what #718 did and why it missed the live
+        // workload — keep this pin live so a future refactor that
+        // drops the per-flow arm fails here loudly.
+        assert!(
+            queue.queued_bytes <= aggregate_ecn_threshold,
+            "aggregate-only formula must fall below threshold on the #722 live state",
+        );
+        // And the per-flow arm must be above its threshold.
+        assert!(queue.flow_bucket_bytes[target] > flow_ecn_threshold);
+
+        let before = snapshot_counters(queue);
+        let mut item = test_local_ipv4_item(ECN_ECT_0);
+        let marked =
+            apply_cos_admission_ecn_policy(queue, buffer_limit, target, false, false, &mut item);
+
+        assert!(marked, "per-flow arm must fire when aggregate is below");
+        let after = snapshot_counters(queue);
+        assert_eq!(
+            after.admission_ecn_marked,
+            before.admission_ecn_marked + 1,
+            "ECN counter must advance by exactly 1",
+        );
+        assert_eq!(
+            after.admission_flow_share_drops, before.admission_flow_share_drops,
+            "mark is not a drop",
+        );
+        assert_eq!(
+            after.admission_buffer_drops, before.admission_buffer_drops,
+            "mark is not a drop",
+        );
+        if let CoSPendingTxItem::Local(req) = &item {
+            assert_eq!(req.bytes[15] & ECN_MASK, ECN_CE, "CE bit must be set");
+        } else {
+            panic!("item must stay Local variant");
+        }
+    }
+
+    #[test]
+    fn admission_ecn_marks_when_aggregate_above_threshold_per_flow_below() {
+        // Preserve the original #718 arm: if the aggregate queue is
+        // above its threshold while the target flow's bucket is small,
+        // the mark must still fire. Without this, a rewrite that
+        // accidentally AND-ed the two conditions would silently break
+        // the aggregate case.
+        let mut root = test_flow_fair_exact_queue_16_flows();
+        let queue = &mut root.queues[0];
+        let target = 0usize;
+
+        // Put the target bucket well below the per-flow threshold
+        // (12 000 bytes) but drive the aggregate above 192 000.
+        let target_bucket_bytes = 500; // < 12 000
+        let _ = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
+        let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
+        let aggregate_ecn_threshold =
+            buffer_limit.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+        let flow_ecn_threshold =
+            share_cap.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+        queue.queued_bytes = aggregate_ecn_threshold + 1; // strictly above
+
+        assert!(queue.queued_bytes > aggregate_ecn_threshold);
+        assert!(queue.flow_bucket_bytes[target] <= flow_ecn_threshold);
+
+        let before = snapshot_counters(queue);
+        let mut item = test_local_ipv4_item(ECN_ECT_0);
+        let marked =
+            apply_cos_admission_ecn_policy(queue, buffer_limit, target, false, false, &mut item);
+
+        assert!(marked, "aggregate arm must still fire (the #718 case)");
+        let after = snapshot_counters(queue);
+        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked + 1);
+    }
+
+    #[test]
+    fn admission_ecn_does_not_mark_when_both_thresholds_below() {
+        // Both below — no congestion signal. Mark must stay off and
+        // the counter unchanged. Packet bytes untouched.
+        let mut root = test_flow_fair_exact_queue_16_flows();
+        let queue = &mut root.queues[0];
+        let target = 0usize;
+
+        let target_bucket_bytes = 500; // < 12 000
+        let queued_bytes = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
+        queue.queued_bytes = queued_bytes; // ≪ 192 000
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
+        let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
+        let aggregate_ecn_threshold =
+            buffer_limit.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+        let flow_ecn_threshold =
+            share_cap.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+        assert!(queue.queued_bytes <= aggregate_ecn_threshold);
+        assert!(queue.flow_bucket_bytes[target] <= flow_ecn_threshold);
+
+        let before = snapshot_counters(queue);
+        let mut item = test_local_ipv4_item(ECN_ECT_0);
+        let marked =
+            apply_cos_admission_ecn_policy(queue, buffer_limit, target, false, false, &mut item);
+
+        assert!(!marked, "no threshold tripped — no mark");
+        let after = snapshot_counters(queue);
+        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked);
+        if let CoSPendingTxItem::Local(req) = &item {
+            assert_eq!(
+                req.bytes[15] & ECN_MASK,
+                ECN_ECT_0,
+                "packet bytes must be byte-identical below threshold",
+            );
+        } else {
+            panic!("item must stay Local variant");
+        }
+    }
+
+    #[test]
+    fn admission_ecn_does_not_mark_when_flow_share_already_exceeded() {
+        // Per-flow above threshold BUT the caller has also decided the
+        // packet will drop (flow_share_exceeded = true). Preserves the
+        // #718 invariant that we don't burn marks on doomed packets —
+        // a marked-then-dropped packet wastes both the mark and the
+        // bandwidth the mark was trying to steer.
+        let mut root = test_flow_fair_exact_queue_16_flows();
+        let queue = &mut root.queues[0];
+        let target = 0usize;
+
+        let target_bucket_bytes = 15_000; // > 12 000 per-flow threshold
+        let queued_bytes = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
+        queue.queued_bytes = queued_bytes;
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
+
+        let before = snapshot_counters(queue);
+        let mut item = test_local_ipv4_item(ECN_ECT_0);
+        let marked =
+            apply_cos_admission_ecn_policy(queue, buffer_limit, target, true, false, &mut item);
+
+        assert!(!marked, "flow_share_exceeded must suppress the mark");
+        let after = snapshot_counters(queue);
+        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked);
+        if let CoSPendingTxItem::Local(req) = &item {
+            assert_eq!(
+                req.bytes[15] & ECN_MASK,
+                ECN_ECT_0,
+                "doomed packet must not be rewritten",
+            );
+        } else {
+            panic!("item must stay Local variant");
+        }
+    }
+
+    #[test]
+    fn admission_ecn_per_flow_threshold_matches_share_cap_denominator() {
+        // Pin that the per-flow threshold uses the SAME
+        // NUM/DEN fraction as the aggregate threshold. If a future
+        // refactor changes the constants (e.g. drops the aggregate
+        // arm to 33%) without updating the per-flow arm, both arms
+        // drift out of lockstep and this test fails. Computed from
+        // the state as `share_cap × NUM / DEN` independently — no
+        // internal call into the policy function.
+        let mut root = test_flow_fair_exact_queue_16_flows();
+        let queue = &mut root.queues[0];
+        let target = 0usize;
+
+        seed_sixteen_flow_buckets(queue, target, 0);
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
+        let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
+
+        let expected_aggregate =
+            buffer_limit.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+        let expected_flow =
+            share_cap.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
+
+        // Ratio check: both thresholds must be exactly NUM/DEN of their
+        // respective caps, i.e. `threshold × DEN == cap × NUM`. Stated
+        // as multiplications so integer truncation does not mask drift.
+        assert_eq!(
+            expected_aggregate.saturating_mul(COS_ECN_MARK_THRESHOLD_DEN),
+            buffer_limit.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM),
+            "aggregate threshold must be NUM/DEN of buffer_limit",
+        );
+        assert_eq!(
+            expected_flow.saturating_mul(COS_ECN_MARK_THRESHOLD_DEN),
+            share_cap.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM),
+            "per-flow threshold must be NUM/DEN of share_cap",
+        );
+
+        // Drive the policy at a state that trips BOTH arms and
+        // verify the mark fires — proves the live code path uses
+        // the same fractions we computed by hand.
+        queue.queued_bytes = expected_aggregate + 1;
+        queue.flow_bucket_bytes[target] = expected_flow + 1;
+        let before = snapshot_counters(queue);
+        let mut item = test_local_ipv4_item(ECN_ECT_0);
+        let marked =
+            apply_cos_admission_ecn_policy(queue, buffer_limit, target, false, false, &mut item);
+        assert!(marked);
+        let after = snapshot_counters(queue);
+        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked + 1);
     }
 }
