@@ -36,6 +36,17 @@ type cosQueueView struct {
 	admissionFlowShareDrops uint64
 	admissionBufferDrops    uint64
 	admissionEcnMarked      uint64
+	// #709: owner-profile telemetry for exact queues with single
+	// owner binding. When ownerWorker is set AND these fields are
+	// non-default, the formatter renders a second indented line under
+	// the Drops row. See docs/cos-validation-notes.md "Reading the
+	// owner-profile counters".
+	drainLatencyHist     []uint64
+	drainInvocations     uint64
+	drainNoopInvocations uint64
+	redirectAcquireHist  []uint64
+	ownerPPS             uint64
+	peerPPS              uint64
 }
 
 func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, selector string) string {
@@ -163,9 +174,83 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 				queue.admissionBufferDrops,
 				queue.admissionEcnMarked,
 			)
+			// #709: OwnerProfile line — rendered only for exact queues
+			// with a named owner worker. Non-exact / shared_exact
+			// queues have no single owner binding whose latency is
+			// meaningful, so the row would be misleading for those
+			// (see `TestFormatCoSInterfaceSummaryOmitsOwnerProfileForQueuesWithoutOwner`).
+			if queue.ownerWorker != nil {
+				fmt.Fprintf(
+					&b,
+					"           OwnerProfile: drain_p50=%s  drain_p99=%s  redirect_p99=%s  owner_pps=%d  peer_pps=%d\n",
+					formatHistPercentileMicros(queue.drainLatencyHist, queue.drainInvocations, 50),
+					formatHistPercentileMicros(queue.drainLatencyHist, queue.drainInvocations, 99),
+					formatHistPercentileMicrosFromBuckets(queue.redirectAcquireHist, 99),
+					queue.ownerPPS,
+					queue.peerPPS,
+				)
+			}
 		}
 	}
 	return b.String()
+}
+
+// #709: render a histogram percentile as microseconds. The Rust side
+// fills the histogram with `DRAIN_HIST_BUCKETS` powers-of-two buckets;
+// we approximate the percentile as the lower bound of the bucket
+// containing the Nth-percentile sample. This is intentionally lossy —
+// operators want ballpark µs figures to make the decision tree in
+// docs/709-owner-hotspot-plan.md actionable, not exact stats.
+//
+// `total` is the authoritative sample count (drain_invocations). When
+// `total == 0`, emit "0µs" rather than "nan" or "-" so the field
+// aligns visually across queues and the zero value is obvious.
+func formatHistPercentileMicros(hist []uint64, total uint64, percentile int) string {
+	if len(hist) == 0 || total == 0 {
+		return "0us"
+	}
+	// Target = ceil(total * percentile / 100). We want the smallest
+	// bucket index whose cumulative sum reaches the target.
+	target := (total*uint64(percentile) + 99) / 100
+	if target == 0 {
+		target = 1
+	}
+	var cumulative uint64
+	for i, count := range hist {
+		cumulative += count
+		if cumulative >= target {
+			return bucketLowerBoundMicros(i)
+		}
+	}
+	// Reaching the end means cumulative < target (hist is sparse or
+	// `total` is larger than the sum of hist buckets). Saturate at the
+	// top bucket's lower bound.
+	return bucketLowerBoundMicros(len(hist) - 1)
+}
+
+// #709: redirect-acquire has no dedicated "invocations" counter
+// (sampling is 1-in-256, so the total is implicit in the bucket sum).
+// Derive `total` from the buckets and delegate.
+func formatHistPercentileMicrosFromBuckets(hist []uint64, percentile int) string {
+	var total uint64
+	for _, count := range hist {
+		total += count
+	}
+	return formatHistPercentileMicros(hist, total, percentile)
+}
+
+// #709: map a bucket index to its lower bound, formatted as µs. The
+// bucket layout (see `DRAIN_HIST_BUCKETS` comment in umem.rs):
+//   - bucket 0: [0, 1024) ns — render as "0us" (sub-1µs)
+//   - bucket N (N >= 1): [2^(N+9), 2^(N+10)) ns — lower bound in µs
+//     is `(1 << (N+9)) / 1000`.
+func bucketLowerBoundMicros(bucket int) string {
+	if bucket <= 0 {
+		return "0us"
+	}
+	ns := uint64(1) << uint(bucket+9)
+	us := ns / 1000
+	return fmt.Sprintf("%dus", us)
 }
 
 func configuredCoSInterfaceViews(cfg *config.Config, status *ProcessStatus, selector string) []cosInterfaceView {
@@ -253,6 +338,17 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 			qv.admissionFlowShareDrops = runtimeQueue.AdmissionFlowShareDrops
 			qv.admissionBufferDrops = runtimeQueue.AdmissionBufferDrops
 			qv.admissionEcnMarked = runtimeQueue.AdmissionEcnMarked
+			// #709: owner-profile telemetry copied from the runtime
+			// snapshot. The Rust side populates these only when the
+			// queue has a single owner binding (exact && !shared_exact);
+			// otherwise the histograms are empty and the pps counters
+			// are 0, which the formatter skips.
+			qv.drainLatencyHist = runtimeQueue.DrainLatencyHist
+			qv.drainInvocations = runtimeQueue.DrainInvocations
+			qv.drainNoopInvocations = runtimeQueue.DrainNoopInvocations
+			qv.redirectAcquireHist = runtimeQueue.RedirectAcquireHist
+			qv.ownerPPS = runtimeQueue.OwnerPPS
+			qv.peerPPS = runtimeQueue.PeerPPS
 			queueViews[qv.queueID] = qv
 		}
 	}

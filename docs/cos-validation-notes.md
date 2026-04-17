@@ -181,6 +181,83 @@ is narrower than before:
 incus exec <client> -- tcpdump -v -c 4 -n 'tcp port 5201'
 ```
 
+## Reading the owner-profile counters
+
+Since #709 (Option E), `show class-of-service interface` renders a
+second indented line under each queue row whose owner is a single
+worker. This gives operators a latency view of the owner-worker
+drain path without having to scrape Prometheus or attach perf:
+
+```
+Queue  Owner  Class    ...  Buffer     Queued pkts  Queued bytes  ...
+4      1      iperf-a  ...  1.19 MiB   299          443.24 KiB    ...
+       Drops: flow_share=75  buffer=0  ecn_marked=97349
+       OwnerProfile: drain_p50=1us  drain_p99=16us  redirect_p99=2us  owner_pps=12345  peer_pps=6789
+```
+
+Field meanings (from `BindingLiveState` in `userspace-dp/src/afxdp/umem.rs`):
+
+- `drain_p50 / drain_p99` — p50/p99 of the time spent inside
+  `drain_shaped_tx` across its servicing tick. Sampled on EVERY
+  invocation, bucketed into power-of-two ns buckets from 1 µs to
+  ~16 ms. Lower bound of the bucket containing the Nth percentile
+  sample is reported — it is a ballpark, not an exact stat.
+- `redirect_p99` — p99 of the time spent in
+  `BindingLiveState::enqueue_tx_owned` (the redirect-inbox push path
+  peer workers use to deliver packets to the owner). Sampled 1-in-256
+  on each producer to keep the common case allocation- and
+  timer-free.
+- `owner_pps` — packets the owner sourced itself on the window
+  (accumulator, cleared by
+  `clear statistics class-of-service`).
+- `peer_pps` — packets peer workers redirected into the owner's
+  MPSC inbox on the same window. Ratio tells the operator whether
+  the owner is sourcing the bulk of the work itself or acting
+  mostly as a fan-in point for peer redirects.
+
+### What the shape means for #709
+
+The plan (`docs/709-owner-hotspot-plan.md` §3) lays out a decision
+tree that converts these counters into a fix path:
+
+- **drain_p99 ≈ drain_p50 (flat right tail).** The owner drain is
+  not the bottleneck. Close #709 as not-needed; keep #712 for CPU
+  jitter.
+- **drain_p99 ≥ 10× drain_p50 (fat right tail).** The owner has a
+  head-of-line stall — most drains finish fast but a long tail of
+  slow ones accumulates. Data supports Option B (work-stealing
+  off-owner drain). The structural fix is worth the complexity.
+- **drain_p99 is fine but redirect_p99 > 1 ms.** Unusual post-#715
+  (the MPSC inbox is lock-free); if seen, pivot to a smaller
+  producer-side fix rather than Option B.
+- **drain_p99 ~ µs but owner_pps >> peer_pps.** The owner is
+  overloaded with its own RX/forward/NAT work and only does a small
+  amount of cross-worker redirect drain — Option C (RSS retargeting)
+  or Option D (owner rotation) becomes more justified because the
+  issue is "owner doing 2× work" not "inbox latency".
+
+The guideline is the same one `engineering-style.md` sets out for
+all perf PRs: read the counters, then decide. Iterating on fixes
+without reading them is how we ship dormant code.
+
+### Operational gotchas
+
+- **Non-exact / shared_exact queues have NO OwnerProfile line.**
+  The telemetry is per-binding on the owner's `BindingLiveState`;
+  if there is no single owner binding (shared_exact at ≥ 2.5 Gbps,
+  or non-exact queues), the CLI suppresses the row. An operator
+  wanting the same view for a high-rate shared queue must wait for
+  a sharded-per-worker histogram to land (not planned).
+- **The counters are process-monotonic.** For a windowed delta on
+  live traffic, snapshot before and after and subtract — same as
+  the `Drops:` line.
+- **Prometheus:** the same data flows out as
+  `xpf_cos_drain_latency_ns_bucket{ifindex, queue_id, bucket_hi_ns}`,
+  `xpf_cos_redirect_acquire_ns_bucket{...}`,
+  `xpf_cos_drain_invocations_total{ifindex, queue_id}`,
+  `xpf_cos_owner_pps{ifindex, queue_id}`, and `xpf_cos_peer_pps{...}`.
+  Expected cardinality per the plan: ≤ 8192 series per histogram.
+
 ## Gotchas the deploy wipes
 
 The cluster deploy path (`cluster-setup.sh deploy`) wipes the CoS

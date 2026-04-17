@@ -14,6 +14,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // xpfCollector implements prometheus.Collector, reading BPF maps on each scrape.
@@ -71,6 +72,18 @@ type xpfCollector struct {
 	sysMemAvail   *prometheus.Desc
 	daemonUptime  *prometheus.Desc
 	daemonMemRSS  *prometheus.Desc
+
+	// #709: CoS owner-profile telemetry (userspace dataplane only).
+	// Cardinality estimate per plan §5: num_queues (≤ 64) × num_interfaces
+	// (≤ 8) × DRAIN_HIST_BUCKETS (16) = ≤ 8192 series for each of the
+	// two histograms. The two gauges (owner_pps, peer_pps) add 512
+	// more. Total ≤ 16896 series — within the envelope the plan
+	// flagged.
+	cosDrainLatencyBucket    *prometheus.Desc
+	cosDrainInvocationsTotal *prometheus.Desc
+	cosRedirectAcquireBucket *prometheus.Desc
+	cosOwnerPPS              *prometheus.Desc
+	cosPeerPPS               *prometheus.Desc
 }
 
 func newCollector(srv *Server) *xpfCollector {
@@ -248,6 +261,40 @@ func newCollector(srv *Server) *xpfCollector {
 			"Daemon resident set size in bytes.",
 			nil, nil,
 		),
+
+		// #709: owner-profile telemetry. Labels:
+		//   ifindex:      interface ifindex as string
+		//   queue_id:     CoS queue id 0-255
+		//   bucket_hi_ns: upper bound of the histogram bucket (ns),
+		//                 formatted as the power-of-two.
+		// The histogram metrics are counters (monotonic bucket counts
+		// in the Rust dataplane); owner/peer pps are gauges since the
+		// Rust side re-uses them across the window.
+		cosDrainLatencyBucket: prometheus.NewDesc(
+			"xpf_cos_drain_latency_ns_bucket",
+			"CoS owner-drain latency histogram — power-of-two ns buckets (#709).",
+			[]string{"ifindex", "queue_id", "bucket_hi_ns"}, nil,
+		),
+		cosDrainInvocationsTotal: prometheus.NewDesc(
+			"xpf_cos_drain_invocations_total",
+			"Total CoS owner-drain invocations per (ifindex, queue_id) (#709).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosRedirectAcquireBucket: prometheus.NewDesc(
+			"xpf_cos_redirect_acquire_ns_bucket",
+			"CoS redirect-acquire latency histogram — power-of-two ns buckets, sampled 1-in-256 (#709).",
+			[]string{"ifindex", "queue_id", "bucket_hi_ns"}, nil,
+		),
+		cosOwnerPPS: prometheus.NewDesc(
+			"xpf_cos_owner_pps",
+			"CoS owner-local pps (window accumulator, cleared by operator) (#709).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosPeerPPS: prometheus.NewDesc(
+			"xpf_cos_peer_pps",
+			"CoS peer-redirected pps (window accumulator, cleared by operator) (#709).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
 	}
 }
 
@@ -286,6 +333,11 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.sysMemAvail
 	ch <- c.daemonUptime
 	ch <- c.daemonMemRSS
+	ch <- c.cosDrainLatencyBucket
+	ch <- c.cosDrainInvocationsTotal
+	ch <- c.cosRedirectAcquireBucket
+	ch <- c.cosOwnerPPS
+	ch <- c.cosPeerPPS
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
@@ -303,6 +355,82 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectNATPoolMetrics(ch, dp)
 	c.collectDHCPMetrics(ch)
 	c.collectSystemMetrics(ch)
+	c.collectCoSOwnerProfile(ch, dp)
+}
+
+// #709: export owner-profile telemetry when the dataplane is the
+// userspace-dp helper. The eBPF-only build path doesn't have this
+// shape (it has no CoS scheduler), so we type-assert on the optional
+// `Status() (dpuserspace.ProcessStatus, error)` interface — if the
+// assertion fails we skip silently (not an error).
+func (c *xpfCollector) collectCoSOwnerProfile(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+	provider, ok := dp.(interface {
+		Status() (dpuserspace.ProcessStatus, error)
+	})
+	if !ok {
+		return
+	}
+	status, err := provider.Status()
+	if err != nil {
+		return
+	}
+	for _, iface := range status.CoSInterfaces {
+		ifindexLabel := strconv.Itoa(iface.Ifindex)
+		for _, queue := range iface.Queues {
+			// Only exact queues with a named owner worker have
+			// meaningful owner-profile telemetry. See cosfmt.go for
+			// the same gating on the CLI side.
+			if queue.OwnerWorkerID == nil {
+				continue
+			}
+			queueLabel := strconv.Itoa(queue.QueueID)
+			emitHistogram(ch, c.cosDrainLatencyBucket,
+				queue.DrainLatencyHist, ifindexLabel, queueLabel)
+			emitHistogram(ch, c.cosRedirectAcquireBucket,
+				queue.RedirectAcquireHist, ifindexLabel, queueLabel)
+			ch <- prometheus.MustNewConstMetric(c.cosDrainInvocationsTotal,
+				prometheus.CounterValue, float64(queue.DrainInvocations),
+				ifindexLabel, queueLabel)
+			ch <- prometheus.MustNewConstMetric(c.cosOwnerPPS,
+				prometheus.GaugeValue, float64(queue.OwnerPPS),
+				ifindexLabel, queueLabel)
+			ch <- prometheus.MustNewConstMetric(c.cosPeerPPS,
+				prometheus.GaugeValue, float64(queue.PeerPPS),
+				ifindexLabel, queueLabel)
+		}
+	}
+}
+
+// #709: emit per-bucket counter samples. Bucket index maps to a
+// power-of-two ns upper bound; see Rust `bucket_index_for_ns` and
+// cosfmt.go `bucketLowerBoundMicros` for the shared layout. Label is
+// the upper bound so Prometheus histogram consumers can plot a
+// rate()-based le-histogram without needing the Rust-side layout
+// inlined in promql.
+func emitHistogram(ch chan<- prometheus.Metric, desc *prometheus.Desc, hist []uint64, ifindexLabel, queueLabel string) {
+	for i, count := range hist {
+		upperNs := bucketUpperBoundNs(i)
+		ch <- prometheus.MustNewConstMetric(
+			desc,
+			prometheus.CounterValue,
+			float64(count),
+			ifindexLabel,
+			queueLabel,
+			strconv.FormatUint(upperNs, 10),
+		)
+	}
+}
+
+// #709: upper-bound ns for histogram bucket index `i`. Bucket 0 is
+// [0, 1024 ns) — upper bound 1024. Bucket N (N >= 1) is
+// [2^(N+9), 2^(N+10)) — upper bound 2^(N+10). Bucket 15 (top bucket)
+// saturates at 2^24 and we report upper bound = math.MaxUint64-safe
+// value (2^25) as the "+Inf" sentinel.
+func bucketUpperBoundNs(i int) uint64 {
+	if i <= 0 {
+		return 1024
+	}
+	return uint64(1) << uint(i+10)
 }
 
 func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {

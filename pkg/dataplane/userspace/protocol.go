@@ -471,6 +471,22 @@ type CoSQueueStatus struct {
 	AdmissionFlowShareDrops uint64 `json:"admission_flow_share_drops,omitempty"`
 	AdmissionBufferDrops    uint64 `json:"admission_buffer_drops,omitempty"`
 	AdmissionEcnMarked      uint64 `json:"admission_ecn_marked,omitempty"`
+	// #709: owner-profile telemetry. Populated on exact queues with
+	// single owner binding; zero for shared_exact / non-exact. See
+	// docs/709-owner-hotspot-plan.md for the decision tree these
+	// counters drive. JSON tags MUST match Rust serde rename(...)
+	// byte-for-byte.
+	//
+	// DrainLatencyHist and RedirectAcquireHist are power-of-two ns
+	// bucketed (see Rust `bucket_index_for_ns`): index 0 is < 1 µs,
+	// index N >= 1 is [2^(N+9), 2^(N+10)) ns, index 15 saturates at
+	// >= 2^24 ns (~16 ms).
+	DrainLatencyHist     []uint64 `json:"drain_latency_hist,omitempty"`
+	DrainInvocations     uint64   `json:"drain_invocations,omitempty"`
+	DrainNoopInvocations uint64   `json:"drain_noop_invocations,omitempty"`
+	RedirectAcquireHist  []uint64 `json:"redirect_acquire_hist,omitempty"`
+	OwnerPPS             uint64   `json:"owner_pps,omitempty"`
+	PeerPPS              uint64   `json:"peer_pps,omitempty"`
 }
 
 type FirewallFilterTermCounterStatus struct {

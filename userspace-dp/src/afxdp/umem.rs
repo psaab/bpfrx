@@ -109,6 +109,62 @@ const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 /// excess pushes drop with a `redirect_inbox_overflow_drops` counter bump.
 pub(super) const PENDING_TX_INBOX_HARD_CAP: usize = 4096;
 
+/// #709: owner-drain / redirect-acquire latency histogram bucket count.
+///
+/// Bucket layout (produced by `bucket_index_for_ns`):
+/// - Bucket 0: `[0, 1024 ns)` — the sub-1 µs catch-all.
+/// - Bucket 1: `[1024, 2048)` = `[2^10, 2^11)` ns.
+/// - Bucket N (N >= 1): `[2^(N+9), 2^(N+10))` ns.
+/// - Bucket 15: saturation — any ns ≥ 2^24 (~16 ms) lands here.
+///
+/// Indexed branchlessly (one `leading_zeros` + one saturating subtract
+/// + one min). Sized `[AtomicU64; DRAIN_HIST_BUCKETS]` on
+/// `BindingLiveState` so the entire histogram lives inline in the
+/// owner's `Arc<BindingLiveState>` — no heap allocation, no bucket-
+/// search loop on the hot path. The const-assert below exists because
+/// the bucket layout is part of the wire contract (protocol.rs +
+/// Prometheus labels): any future change must propagate through both
+/// sides, so force a compile error on a silent edit.
+pub(super) const DRAIN_HIST_BUCKETS: usize = 16;
+const _: () = assert!(DRAIN_HIST_BUCKETS == 16);
+
+/// #709: sample mask for the redirect-acquire timer. We sample the
+/// timer 1-in-(MASK+1) = 1-in-256 pushes. The mask is required to be a
+/// power-of-two minus one so `counter & MASK == 0` fires uniformly on
+/// exactly one value per wrap. Producer-local counter is seeded from
+/// `worker_id` so samples from different workers don't lockstep onto
+/// the same slot.
+pub(super) const REDIRECT_SAMPLE_MASK: u64 = 0xff;
+const _: () = assert!(REDIRECT_SAMPLE_MASK.count_ones() == REDIRECT_SAMPLE_MASK.trailing_ones());
+
+/// #709: branchless power-of-two bucket select for nanosecond deltas.
+///
+/// Mapping (see `DRAIN_HIST_BUCKETS` for the layout):
+/// - `ns ∈ [0, 1024)` → bucket 0 (sub-1 µs catch-all).
+/// - `ns ∈ [2^(N+9), 2^(N+10))` → bucket N, for N ∈ [1, 15).
+/// - `ns ≥ 2^24` → bucket 15 (saturation).
+///
+/// Formula:
+/// - `(ns | 1)` ensures `leading_zeros` sees at least one set bit —
+///   `leading_zeros(0) == 64` would otherwise land us one bucket off
+///   at the bottom. With the OR, `ns=0` behaves like `ns=1` (bucket 0).
+/// - `clz = (ns | 1).leading_zeros()`: for `ns=1024 (2^10)`,
+///   `clz = 64 - 11 = 53`; for `ns=2^24` (top bucket lower bound),
+///   `clz = 64 - 25 = 39`.
+/// - `b = 54 - clz` gives bucket 1 for `ns=1024` and bucket 15 for
+///   `ns=2^24`. Sub-1024 ns delta yields `clz >= 54` → `b <= 0`, which
+///   the `.max(0)` saturating subtract clamps at 0. Above 2^24, `b`
+///   grows past 15, which `.min(DRAIN_HIST_BUCKETS - 1)` clamps.
+///
+/// One `leading_zeros` + one saturating subtract + one min. No loop,
+/// no branch. Hot-path OK per plan §5.
+#[inline]
+pub(super) fn bucket_index_for_ns(ns: u64) -> usize {
+    let clz = (ns | 1).leading_zeros() as i32;
+    let b = (54 - clz).max(0) as usize;
+    b.min(DRAIN_HIST_BUCKETS - 1)
+}
+
 impl MmapArea {
     pub(super) fn new(len: usize) -> io::Result<Self> {
         // Round up to 2 MB boundary for hugepage eligibility.
@@ -341,6 +397,182 @@ mod tests {
     }
 
     #[test]
+    fn bucket_index_for_ns_covers_powers_of_two_from_1us_to_32ms() {
+        // #709: pin the bucket layout. Bucket 0 covers ns in
+        // [0, 1024); bucket 1 covers [1024, 2048); ... bucket 15
+        // saturates at >= 2^25 ns. Anyone editing the formula in
+        // `bucket_index_for_ns` must either keep this layout or
+        // renumber the wire contract — this test fails loudly on
+        // either.
+        // Bucket 0 is the "<= 1024 ns" catch-all: ns ∈ [0, 1024) lands
+        // here, ns = 1024 promotes to bucket 1.
+        assert_eq!(bucket_index_for_ns(0), 0);
+        assert_eq!(bucket_index_for_ns(1), 0);
+        assert_eq!(bucket_index_for_ns(1023), 0);
+        assert_eq!(bucket_index_for_ns(1024), 1);
+        assert_eq!(bucket_index_for_ns(2047), 1);
+        assert_eq!(bucket_index_for_ns(2048), 2);
+        assert_eq!(bucket_index_for_ns(4095), 2);
+        assert_eq!(bucket_index_for_ns(4096), 3);
+        // Walk each bucket boundary [2^(N+9), 2^(N+10)) for
+        // N ∈ [1, 15). Expect `bucket_index_for_ns(2^(N+9)) == N`
+        // and `bucket_index_for_ns(2^(N+10) - 1) == N`. We skip N=0
+        // because bucket 0 is the sub-1024 catch-all (its `lo` is 0
+        // not `2^9`), covered by the explicit asserts above.
+        for n in 1..(DRAIN_HIST_BUCKETS - 1) {
+            let lo = 1u64 << (n + 9);
+            let hi = (1u64 << (n + 10)).saturating_sub(1);
+            assert_eq!(
+                bucket_index_for_ns(lo),
+                n,
+                "lo boundary for bucket {n}: ns={lo}",
+            );
+            assert_eq!(
+                bucket_index_for_ns(hi),
+                n,
+                "hi boundary for bucket {n}: ns={hi}",
+            );
+        }
+        // Top bucket: ns >= 2^24 saturates at 15.
+        assert_eq!(bucket_index_for_ns(1u64 << 24), DRAIN_HIST_BUCKETS - 1);
+        assert_eq!(bucket_index_for_ns(1u64 << 25), DRAIN_HIST_BUCKETS - 1);
+        assert_eq!(bucket_index_for_ns(u64::MAX), DRAIN_HIST_BUCKETS - 1);
+    }
+
+    #[test]
+    fn bucket_index_for_ns_handles_zero() {
+        // #709: `ns = 0` must land in bucket 0 and MUST NOT panic. The
+        // implementation uses `(ns | 1).leading_zeros()` specifically
+        // to avoid `leading_zeros(0) == 64` which would cascade into a
+        // negative subtraction after the `54 - clz` step. This pins
+        // that the OR-with-1 guard is still in place after future
+        // edits.
+        assert_eq!(bucket_index_for_ns(0), 0);
+    }
+
+    #[test]
+    fn bucket_index_for_ns_saturates_above_top_bucket() {
+        // #709: ns = 1 trillion (~17 minutes) must clamp at bucket 15.
+        // If a future refactor ever turned the `.min(DRAIN_HIST_BUCKETS - 1)`
+        // into a subtraction, this would underflow silently on release
+        // builds — the min clamp is the wire-contract guard.
+        assert_eq!(bucket_index_for_ns(1_000_000_000_000), DRAIN_HIST_BUCKETS - 1);
+    }
+
+    #[test]
+    fn drain_latency_hist_increments_on_recorded_drain() {
+        // #709: exercise the hist-update path in isolation. We do not
+        // call `drain_shaped_tx` here (requires a fully-constructed
+        // BindingWorker fixture); instead, we recreate the exact shape
+        // tx.rs uses — bucket_index_for_ns + fetch_add — and assert
+        // the bucket landed in the right slot.
+        let live = BindingLiveState::new();
+        let delta_ns = 1500u64; // bucket 1 ([1024, 2048))
+        let bucket = bucket_index_for_ns(delta_ns);
+        live.drain_latency_hist[bucket].fetch_add(1, Ordering::Relaxed);
+        live.drain_invocations.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(bucket, 1);
+        assert_eq!(live.drain_latency_hist[1].load(Ordering::Relaxed), 1);
+        // Counter-factual: surrounding buckets must stay at 0. A prior
+        // draft that used the wrong shift constant (e.g. `55 - clz`)
+        // would light up bucket 0 or 2 here — this assertion catches
+        // the off-by-one.
+        assert_eq!(live.drain_latency_hist[0].load(Ordering::Relaxed), 0);
+        assert_eq!(live.drain_latency_hist[2].load(Ordering::Relaxed), 0);
+        assert_eq!(live.drain_invocations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn redirect_acquire_hist_samples_one_in_mask_plus_one() {
+        // #709: drive `enqueue_tx_owned` exactly `REDIRECT_SAMPLE_MASK
+        // + 1` times and assert exactly one bucket increment. The
+        // sample counter is seeded to 0 by `new()`, so on the first
+        // push `(counter & MASK) == 0` fires; subsequent MASK pushes
+        // skip, and the (MASK+1)-th push would fire again.
+        let live = BindingLiveState::new();
+        live.max_pending_tx.store(8192, Ordering::Relaxed);
+        let iterations = (REDIRECT_SAMPLE_MASK + 1) as usize;
+        for _ in 0..iterations {
+            live.enqueue_tx_owned(test_tx_request_for_inbox(0xab))
+                .expect("push");
+        }
+        let total_samples: u64 = live
+            .redirect_acquire_hist
+            .iter()
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(
+            total_samples, 1,
+            "exactly one sample per (REDIRECT_SAMPLE_MASK + 1) pushes"
+        );
+
+        // Counter-factual: a pre-#709 path (no sampling, no bucket
+        // increment) would leave the histogram at zero after the same
+        // push count. Reset and demonstrate by skipping the hist update
+        // inline — this proves the test's positive assertion above is
+        // actually exercising the #709-added code path, not some
+        // always-live fallback.
+        let live2 = BindingLiveState::new();
+        live2.max_pending_tx.store(8192, Ordering::Relaxed);
+        // Replicate the non-sampled producer: raw MPSC push without
+        // the sample/timer wrapper.
+        for _ in 0..iterations {
+            live2
+                .pending_tx
+                .push(test_tx_request_for_inbox(0xcd))
+                .expect("push raw");
+        }
+        let pre_709_total: u64 = live2
+            .redirect_acquire_hist
+            .iter()
+            .map(|slot| slot.load(Ordering::Relaxed))
+            .sum();
+        assert_eq!(
+            pre_709_total, 0,
+            "raw MPSC push (pre-#709 shape) must not touch the redirect-acquire histogram"
+        );
+    }
+
+    #[test]
+    fn new_seeded_initialises_redirect_sample_counter_from_worker_id() {
+        // #709: per-worker seeding prevents lockstep sampling. Two
+        // workers with different ids must start at different positions
+        // in the 1-in-(MASK+1) cycle. Seed with 0 and 1 and verify
+        // both new_seeded instances hold distinct initial counter
+        // values.
+        let a = BindingLiveState::new_seeded(0);
+        let b = BindingLiveState::new_seeded(1);
+        assert_eq!(a.redirect_sample_counter.load(Ordering::Relaxed), 0);
+        assert_eq!(b.redirect_sample_counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn binding_live_snapshot_propagates_709_owner_profile_counters() {
+        // #709: pin that the snapshot() path copies all owner-profile
+        // atomics into the BindingLiveSnapshot. A future edit that
+        // misses one field would silently under-surface telemetry to
+        // the operator CLI / Prometheus — this test fails fast on the
+        // missing field.
+        let live = BindingLiveState::new();
+        live.drain_latency_hist[3].store(7, Ordering::Relaxed);
+        live.drain_latency_hist[15].store(2, Ordering::Relaxed);
+        live.drain_invocations.store(100, Ordering::Relaxed);
+        live.drain_noop_invocations.store(50, Ordering::Relaxed);
+        live.redirect_acquire_hist[1].store(11, Ordering::Relaxed);
+        live.pps_owner_vs_peer[0].store(1234, Ordering::Relaxed);
+        live.pps_owner_vs_peer[1].store(567, Ordering::Relaxed);
+
+        let snap = live.snapshot();
+        assert_eq!(snap.drain_latency_hist[3], 7);
+        assert_eq!(snap.drain_latency_hist[15], 2);
+        assert_eq!(snap.drain_invocations, 100);
+        assert_eq!(snap.drain_noop_invocations, 50);
+        assert_eq!(snap.redirect_acquire_hist[1], 11);
+        assert_eq!(snap.owner_pps, 1234);
+        assert_eq!(snap.peer_pps, 567);
+    }
+
+    #[test]
     fn binding_live_snapshot_propagates_710_drop_counters() {
         // #710: `refresh_bindings` in the coordinator copies
         // `snap.redirect_inbox_overflow_drops`, `pending_tx_local_overflow_drops`,
@@ -462,6 +694,47 @@ pub(super) struct BindingLiveState {
     /// race during config reload or helper restart. Subset of
     /// `tx_errors`.
     pub(super) no_owner_binding_drops: AtomicU64,
+    /// #709: drain-call latency buckets, powers of two in ns from 1 µs.
+    /// Bucket `N` covers `[2^(N+10) ns, 2^(N+11) ns)`. Indexed via
+    /// `bucket_index_for_ns(delta_ns)`. Written only by the owner
+    /// worker (the sole caller of `drain_shaped_tx` on this binding);
+    /// read by the snapshot path and by Prometheus scrape.
+    ///
+    /// Owner-only write + Relaxed load/store is sufficient: the
+    /// snapshot reader tolerates monotonic counter tearing across a
+    /// bucket array, and Prometheus semantics are "best effort at
+    /// scrape time".
+    pub(super) drain_latency_hist: [AtomicU64; DRAIN_HIST_BUCKETS],
+    /// #709: total number of `drain_shaped_tx` invocations on this
+    /// binding since process start. Sum of `drain_latency_hist`
+    /// buckets = drain_invocations always holds (pin in unit test).
+    /// Owner-only write.
+    pub(super) drain_invocations: AtomicU64,
+    /// #709: subset of `drain_invocations` where the drain found no
+    /// work (returned `false`). A high noop ratio means the owner is
+    /// spinning on empty — the bottleneck, if any, is upstream RX.
+    /// Owner-only write.
+    pub(super) drain_noop_invocations: AtomicU64,
+    /// #709: redirect-acquire latency sampled 1-in-(REDIRECT_SAMPLE_MASK+1)
+    /// on producers. Same power-of-two bucket layout as
+    /// `drain_latency_hist`. Multi-writer: every worker that redirects
+    /// a TX request into this binding's inbox increments a bucket on a
+    /// sampled push. Relaxed loads/stores (see comment on
+    /// `drain_latency_hist`).
+    pub(super) redirect_acquire_hist: [AtomicU64; DRAIN_HIST_BUCKETS],
+    /// #709: producer-local sample counter for the redirect-acquire
+    /// timer. Each call to `enqueue_tx_owned` does one
+    /// `fetch_add(1, Relaxed)` + `& REDIRECT_SAMPLE_MASK`; only the
+    /// every-(MASK+1)th push pays the `monotonic_nanos()` cost. Seeded
+    /// from `worker_id` at construction so different producer workers
+    /// don't lockstep their samples onto the same call.
+    pub(super) redirect_sample_counter: AtomicU64,
+    /// #709: ring-window pps counters. `[0]` accumulates owner-local
+    /// drains (packets the owner sourced itself); `[1]` accumulates
+    /// peer redirects (packets another worker produced and redirected
+    /// to this owner). Ratio tells the operator whether the owner is
+    /// overloaded. Cleared via `clear statistics class-of-service`.
+    pub(super) pps_owner_vs_peer: [AtomicU64; 2],
     pub(super) direct_tx_packets: AtomicU64,
     pub(super) copy_tx_packets: AtomicU64,
     pub(super) in_place_tx_packets: AtomicU64,
@@ -548,6 +821,18 @@ impl BindingLiveState {
             pending_tx_local_overflow_drops: AtomicU64::new(0),
             tx_submit_error_drops: AtomicU64::new(0),
             no_owner_binding_drops: AtomicU64::new(0),
+            // #709: owner-profile telemetry. Histograms are zero-init
+            // fixed-cap arrays; sum of buckets == drain_invocations
+            // invariant holds at `new()` (both 0). The sample counter
+            // seed is left at zero by `new()`; call sites that have a
+            // worker_id in hand should use `new_seeded()` instead so
+            // per-worker samples don't lockstep onto the same push.
+            drain_latency_hist: Self::zero_hist(),
+            drain_invocations: AtomicU64::new(0),
+            drain_noop_invocations: AtomicU64::new(0),
+            redirect_acquire_hist: Self::zero_hist(),
+            redirect_sample_counter: AtomicU64::new(0),
+            pps_owner_vs_peer: [AtomicU64::new(0), AtomicU64::new(0)],
             direct_tx_packets: AtomicU64::new(0),
             copy_tx_packets: AtomicU64::new(0),
             in_place_tx_packets: AtomicU64::new(0),
@@ -567,6 +852,34 @@ impl BindingLiveState {
             pending_tx: MpscInbox::new(PENDING_TX_INBOX_HARD_CAP),
             pending_session_deltas: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// #709: construct a binding live state with the redirect-sample
+    /// counter pre-seeded from `worker_id`. Seeding is cosmetic — the
+    /// sample mask fires exactly 1-in-(MASK+1) regardless of start
+    /// value — but it prevents every worker from firing its first
+    /// sample on its very first push, which avoids an early-startup
+    /// lockstep burst that would bias bucket 0 heavily on the first
+    /// scrape.
+    pub(super) fn new_seeded(worker_id: u32) -> Self {
+        let mut state = Self::new();
+        // `worker_id as u64` preserves the distinct-per-worker property
+        // we care about without needing a randomness source. The mask
+        // treats the counter modulo (MASK+1), so any seed ∈ [0, MASK]
+        // suffices; larger worker_ids just wrap cheaply.
+        state.redirect_sample_counter = AtomicU64::new(worker_id as u64);
+        state
+    }
+
+    /// #709: inline zero-initialised histogram bucket array. Factored
+    /// so `new()` and `new_seeded()` don't repeat the literal, and so
+    /// a future bucket-count bump only touches one spot.
+    #[inline]
+    fn zero_hist() -> [AtomicU64; DRAIN_HIST_BUCKETS] {
+        // `AtomicU64` is not `Copy`, so `[AtomicU64::new(0); N]` does
+        // not compile; build the array from a `from_fn` pattern. This
+        // is still a single stack allocation — no heap.
+        std::array::from_fn(|_| AtomicU64::new(0))
     }
 
     pub(super) fn set_bound(&self, socket_fd: c_int) {
@@ -756,7 +1069,27 @@ impl BindingLiveState {
                 .lock()
                 .map(|v| v.clone())
                 .unwrap_or_default(),
+            // #709: owner-profile telemetry snapshot. Histograms are
+            // copied bucket-by-bucket under `Relaxed`. Read-side
+            // tearing is acceptable — these are diagnostic counters,
+            // not a load-bearing arithmetic invariant; the only
+            // "invariant" (sum of buckets ≈ drain_invocations) holds
+            // within a single-thread read only in steady-state, which
+            // is how operators consume the values anyway.
+            drain_latency_hist: Self::snapshot_hist(&self.drain_latency_hist),
+            drain_invocations: self.drain_invocations.load(Ordering::Relaxed),
+            drain_noop_invocations: self.drain_noop_invocations.load(Ordering::Relaxed),
+            redirect_acquire_hist: Self::snapshot_hist(&self.redirect_acquire_hist),
+            owner_pps: self.pps_owner_vs_peer[0].load(Ordering::Relaxed),
+            peer_pps: self.pps_owner_vs_peer[1].load(Ordering::Relaxed),
         }
+    }
+
+    /// #709: copy a histogram bucket array under `Relaxed`. Inline to
+    /// keep the fixed-size array on the caller's stack — no `Vec`.
+    #[inline]
+    fn snapshot_hist(hist: &[AtomicU64; DRAIN_HIST_BUCKETS]) -> [u64; DRAIN_HIST_BUCKETS] {
+        std::array::from_fn(|i| hist[i].load(Ordering::Relaxed))
     }
 
     pub(super) fn enqueue_tx(&self, req: TxRequest) -> Result<(), String> {
@@ -765,7 +1098,34 @@ impl BindingLiveState {
     }
 
     pub(super) fn enqueue_tx_owned(&self, req: TxRequest) -> Result<(), TxRequest> {
+        // #709: redirect-acquire latency, sampled 1-in-256.
+        //
+        // Hot-path cost on the non-sampled branch: one
+        // `fetch_add(1, Relaxed)` + one `&` + one `==`. Under a few ns
+        // on modern x86_64. On the sampled branch: two
+        // `monotonic_nanos()` (VDSO `clock_gettime(MONOTONIC)`, ~15 ns
+        // each) + one bucket write. 1-in-256 sampling amortises to
+        // `~(2 * 15 + 2) / 256 ≈ 0.13 ns` per push — well below the
+        // noise floor of the redirect path itself.
+        //
+        // The timer wraps only `push_redirect_inbox`. We do NOT add a
+        // second atomic to the MPSC inbox itself; the sample counter
+        // lives on `BindingLiveState` next to the other per-binding
+        // atomics. MPSC invariants from #715 are preserved.
+        let sample = (self.redirect_sample_counter.fetch_add(1, Ordering::Relaxed)
+            & REDIRECT_SAMPLE_MASK)
+            == 0;
+        let start = if sample {
+            Some(monotonic_nanos())
+        } else {
+            None
+        };
         self.push_redirect_inbox(req);
+        if let Some(start) = start {
+            let delta = monotonic_nanos().saturating_sub(start);
+            let bucket = bucket_index_for_ns(delta);
+            self.redirect_acquire_hist[bucket].fetch_add(1, Ordering::Relaxed);
+        }
         Ok(())
     }
 

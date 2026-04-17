@@ -255,3 +255,18 @@
 - **Action**: Add 5 Prepared-variant admission tests (IPv4 ECT(0), IPv6 ECT(0), NOT-ECT, out-of-range offset, combined Local+Prepared counter pin); remove stale `admission_does_not_mark_prepared_variant` negative pin
   - **File(s)**: `userspace-dp/src/afxdp/tx.rs`
 - **Result**: admission_ecn group 11/11 pass, mark_ecn_ce group 11/11 pass, full suite 680/680 pass. Marker now fires on the XSK-RX→XSK-TX zero-copy hot path (iperf3, NAT'd flows); acceptance target per `docs/cos-validation-notes.md` is `ecn_marked` becoming non-zero during live 16-flow iperf3
+
+## 2026-04-17 — #709 Option E owner-profile telemetry (measure before optimizing)
+- **Action**: Add `DRAIN_HIST_BUCKETS = 16` const-asserted, `bucket_index_for_ns` branchless helper, `drain_latency_hist` + `drain_invocations` + `drain_noop_invocations` + `redirect_acquire_hist` + `redirect_sample_counter` + `pps_owner_vs_peer` on `BindingLiveState`; add `new_seeded(worker_id)` constructor so per-worker redirect samples don't lockstep
+  - **File(s)**: `userspace-dp/src/afxdp/umem.rs`
+- **Action**: Time every `drain_shaped_tx` invocation with one pair of `monotonic_nanos()` calls; count owner-local vs peer-redirected packets on `ingest_cos_pending_tx` split-point; sample `enqueue_tx_owned` 1-in-256 producer-side
+  - **File(s)**: `userspace-dp/src/afxdp/tx.rs`, `userspace-dp/src/afxdp/umem.rs`
+- **Action**: Extend `CoSQueueStatus` serde with histograms + owner/peer pps; populate from owner binding's live snapshot in `build_worker_cos_statuses` with `max` aggregation across workers (only owner writes non-zero). Cross-worker coordinator aggregation mirrors `admission_ecn_marked` shape
+  - **File(s)**: `userspace-dp/src/protocol.rs`, `userspace-dp/src/afxdp/worker.rs`, `userspace-dp/src/afxdp/coordinator.rs`
+- **Action**: Go-side protocol mirror + `OwnerProfile:` line in `show class-of-service interface` under the existing `Drops:` line (only for exact queues with named owner)
+  - **File(s)**: `pkg/dataplane/userspace/protocol.go`, `pkg/dataplane/userspace/cosfmt.go`, `pkg/dataplane/userspace/cosfmt_test.go`
+- **Action**: Prometheus gauges/counters for `xpf_cos_drain_latency_ns_bucket`, `xpf_cos_drain_invocations_total`, `xpf_cos_redirect_acquire_ns_bucket`, `xpf_cos_owner_pps`, `xpf_cos_peer_pps`. Cardinality ≤ 16896 series (within plan §5 envelope)
+  - **File(s)**: `pkg/api/metrics.go`
+- **Action**: New "Reading the owner-profile counters" section with decision tree mapping drain_p99 / redirect_p99 / owner_pps ratio to #709 Option B/C/D follow-ups
+  - **File(s)**: `docs/cos-validation-notes.md`
+- **Result**: 7 new Rust tests (+692 total, baseline 685), 3 new Go tests; full `cargo test` + `go test ./...` green. Telemetry-only: no hot-path allocations, no new syscalls, MPSC invariants preserved, histogram bucket select branchless
