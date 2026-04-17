@@ -10,6 +10,12 @@
 - Keep solutions simple and direct.
 - When working with many teams, don't let the context windows get too large.
 
+**Read `docs/engineering-style.md` before writing non-trivial code or
+reviewing a PR.** It encodes the coding and review discipline this
+project has settled on — hot-path allocation rules, review severity,
+compile-time invariants, PR discipline, and the project-specific
+gotchas that repeatedly bite (deploy wipes CoS, iperf3 target, etc.).
+
 ## Logging Rules
 - Maintain a log of all major actions in `_Log.md`.
 - Use YAML or Markdown bullet points for structure:
