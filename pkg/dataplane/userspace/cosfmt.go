@@ -31,6 +31,14 @@ type cosQueueView struct {
 	parked          int
 	nextWakeupTick  uint64
 	surplusDeficit  uint64
+	// #710/#718: admission-path counters sourced from runtime. Zero values
+	// are still rendered — operators need to see the counter exists.
+	admissionFlowShareDrops uint64
+	admissionBufferDrops    uint64
+	admissionEcnMarked      uint64
+	// hasRuntime is true when the queue view was populated from a runtime
+	// snapshot. Config-only queues (no runtime yet) skip the Drops line.
+	hasRuntime bool
 }
 
 func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, selector string) string {
@@ -95,7 +103,14 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 			continue
 		}
 		b.WriteString("  Queues:\n")
-		tw := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+		// Render queue rows via tabwriter into a local buffer so columns
+		// align across ALL queues. Then walk the rendered lines and
+		// interleave the per-queue Drops line. Emitting Drops directly
+		// into the tabwriter breaks column alignment — a line without
+		// tabs restarts tabwriter's contiguous-column grouping — so we
+		// keep the Drops line outside the aligned grid (#710, #718).
+		var tableBuf strings.Builder
+		tw := tabwriter.NewWriter(&tableBuf, 0, 0, 2, ' ', 0)
 		fmt.Fprintln(tw, "    Queue\tOwner\tClass\tPriority\tExact\tTransmit rate\tBuffer\tQueued pkts\tQueued bytes\tRunnable\tParked\tNext wake\tSurplus deficit")
 		for _, queue := range queues {
 			fmt.Fprintf(tw, "    %d\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d\t%d\t%s\t%s\n",
@@ -115,6 +130,32 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 			)
 		}
 		_ = tw.Flush()
+		// First rendered line is the header; subsequent lines map 1:1 to
+		// queues in order. Re-emit into the main builder, appending a
+		// Drops line under each queue data row. Zero-valued counters are
+		// still printed so operators can confirm the counter is wired.
+		tableLines := strings.Split(strings.TrimRight(tableBuf.String(), "\n"), "\n")
+		for i, line := range tableLines {
+			b.WriteString(line)
+			b.WriteByte('\n')
+			if i == 0 {
+				// header — no drops line
+				continue
+			}
+			queueIdx := i - 1
+			if queueIdx >= len(queues) {
+				continue
+			}
+			queue := queues[queueIdx]
+			if !queue.hasRuntime {
+				continue
+			}
+			fmt.Fprintf(&b, "           Drops: flow_share=%d  buffer=%d  ecn_marked=%d\n",
+				queue.admissionFlowShareDrops,
+				queue.admissionBufferDrops,
+				queue.admissionEcnMarked,
+			)
+		}
 	}
 	return b.String()
 }
@@ -201,6 +242,10 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 			qv.parked = runtimeQueue.ParkedInstances
 			qv.nextWakeupTick = runtimeQueue.NextWakeupTick
 			qv.surplusDeficit = runtimeQueue.SurplusDeficitBytes
+			qv.admissionFlowShareDrops = runtimeQueue.AdmissionFlowShareDrops
+			qv.admissionBufferDrops = runtimeQueue.AdmissionBufferDrops
+			qv.admissionEcnMarked = runtimeQueue.AdmissionEcnMarked
+			qv.hasRuntime = true
 			queueViews[qv.queueID] = qv
 		}
 	}
