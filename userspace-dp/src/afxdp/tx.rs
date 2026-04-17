@@ -2467,6 +2467,168 @@ const _: () = assert!(COS_FLOW_FAIR_MIN_SHARE_BYTES >= 16 * 1500);
 const COS_SURPLUS_ROUND_QUANTUM_BYTES: u64 = 1500;
 const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 
+/// ECN CE-marking threshold as a fraction of `buffer_limit`. At 50%
+/// the scheduler signals TCP to back off well before the aggregate
+/// cap trips, so ECN-negotiated flows converge on their fair share
+/// with smooth cwnd dynamics instead of the drop->RTO->cwnd=1MSS
+/// oscillation documented in #718's live data.
+const COS_ECN_MARK_THRESHOLD_NUM: u64 = 1;
+const COS_ECN_MARK_THRESHOLD_DEN: u64 = 2;
+
+// Guard against a refactor flipping the fraction. A threshold >= 1
+// would never fire (queue is capped at buffer_limit) and a zero
+// denominator would divide-by-zero at admission time.
+const _: () = assert!(COS_ECN_MARK_THRESHOLD_NUM < COS_ECN_MARK_THRESHOLD_DEN);
+const _: () = assert!(COS_ECN_MARK_THRESHOLD_DEN > 0);
+
+/// ECN codepoint masks (low 2 bits of IPv4 TOS / IPv6 tclass).
+const ECN_MASK: u8 = 0b0000_0011;
+const ECN_NOT_ECT: u8 = 0b0000_0000;
+const ECN_ECT_0: u8 = 0b0000_0010;
+const ECN_ECT_1: u8 = 0b0000_0001;
+const ECN_CE: u8 = 0b0000_0011;
+
+/// Offset of the L3 header inside a TxRequest's `bytes` buffer. TxRequest
+/// construction sites always wrap the frame with a 14-byte Ethernet
+/// header (6 dst MAC + 6 src MAC + 2 ethertype) so L3 starts at byte 14.
+const TX_L3_OFFSET: usize = 14;
+
+/// Mark the IPv4 packet at `l3_offset` within `bytes` as ECN CE if it
+/// is already ECT(0) or ECT(1). Updates the IP header checksum
+/// incrementally (RFC 1624). Returns true iff the packet was marked.
+/// Never modifies a NOT-ECT packet (protects non-ECN flows per RFC
+/// 3168 section 6.1.1.1).
+#[inline]
+fn mark_ecn_ce_ipv4(bytes: &mut [u8], l3_offset: usize) -> bool {
+    // Need the full 20-byte base IPv4 header (through the checksum field).
+    // Short buffers are returned false rather than panicking — this path
+    // runs per admission on the hot path and cannot trust upstream
+    // length validation to have covered every corner.
+    let end = l3_offset.saturating_add(20);
+    if bytes.len() < end {
+        return false;
+    }
+    let tos_idx = l3_offset + 1;
+    let old_tos = bytes[tos_idx];
+    let ecn = old_tos & ECN_MASK;
+    // Branchless: only ECT(0) and ECT(1) cross to CE; NOT-ECT and CE
+    // are left unchanged. A non-ECT packet returning false routes into
+    // the existing admission drop path unchanged.
+    if ecn != ECN_ECT_0 && ecn != ECN_ECT_1 {
+        return false;
+    }
+    let new_tos = (old_tos & !ECN_MASK) | ECN_CE;
+    bytes[tos_idx] = new_tos;
+
+    // RFC 1624 incremental checksum update for a single byte change to
+    // the TOS field (16-bit word = [version/IHL, TOS]). The header
+    // checksum sits at l3_offset+10..l3_offset+12 in network byte order.
+    //
+    //   HC' = ~(~HC + ~m + m')
+    //
+    // where m and m' are the 16-bit words at the mutated position. The
+    // version/IHL byte is unchanged so it cancels inside `old_word` /
+    // `new_word` — but keeping it in the word avoids a conditional on
+    // which half of the 16-bit word we touched.
+    let ihl = bytes[l3_offset];
+    let old_word = ((ihl as u32) << 8) | old_tos as u32;
+    let new_word = ((ihl as u32) << 8) | new_tos as u32;
+    let csum_idx = l3_offset + 10;
+    let old_csum = ((bytes[csum_idx] as u32) << 8) | bytes[csum_idx + 1] as u32;
+    // ~HC + ~m + m' in 32-bit arithmetic, then fold carries.
+    let mut sum = (!old_csum & 0xffff) + (!old_word & 0xffff) + new_word;
+    // Fold any carries out of the low 16 bits. Two folds are sufficient
+    // for the three 16-bit addends above (max ~3 * 0xffff fits in 18
+    // bits, one fold collapses to 17 bits, second to 16 bits).
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let new_csum = (!sum) & 0xffff;
+    bytes[csum_idx] = (new_csum >> 8) as u8;
+    bytes[csum_idx + 1] = (new_csum & 0xff) as u8;
+    true
+}
+
+/// Mark the IPv6 packet at `l3_offset` within `bytes` as ECN CE if it
+/// is already ECT(0) or ECT(1). IPv6 has no header checksum so no
+/// incremental update is needed. Returns true iff the packet was marked.
+#[inline]
+fn mark_ecn_ce_ipv6(bytes: &mut [u8], l3_offset: usize) -> bool {
+    // tclass spans the low nibble of byte[l3_offset] and the high
+    // nibble of byte[l3_offset+1]. We need both bytes in range.
+    let end = l3_offset.saturating_add(2);
+    if bytes.len() < end {
+        return false;
+    }
+    // Version/tclass-high byte: [vvvv tttt]. ECN bits are the low 2
+    // bits of tclass, which sit in the high nibble of byte[l3_offset+1]
+    // as bits 5..4. Extract with a simple shift-mask.
+    let b1 = bytes[l3_offset + 1];
+    let ecn = (b1 >> 4) & ECN_MASK;
+    if ecn != ECN_ECT_0 && ecn != ECN_ECT_1 {
+        return false;
+    }
+    // Clear the old ECN bits (bits 5..4 of byte[l3_offset+1]) and OR in
+    // CE shifted into place.
+    let cleared = b1 & !(ECN_MASK << 4);
+    bytes[l3_offset + 1] = cleared | (ECN_CE << 4);
+    true
+}
+
+/// Dispatch ECN marking based on the L3 protocol family stamped on
+/// the TxRequest. Returns true iff the packet was marked.
+#[inline]
+fn maybe_mark_ecn_ce(req: &mut TxRequest) -> bool {
+    match req.expected_addr_family as i32 {
+        libc::AF_INET => mark_ecn_ce_ipv4(&mut req.bytes, TX_L3_OFFSET),
+        libc::AF_INET6 => mark_ecn_ce_ipv6(&mut req.bytes, TX_L3_OFFSET),
+        _ => false,
+    }
+}
+
+/// Core ECN admission decision, factored out so tests can drive it
+/// without spinning up a full `BindingWorker` while still exercising
+/// the exact code path that `enqueue_cos_item` uses. Mutates both the
+/// item (CE bits + incremental IP checksum) and the queue's
+/// `admission_ecn_marked` counter.
+///
+/// Returns whether the packet was marked. The caller is still
+/// responsible for the subsequent drop-vs-admit decision: a
+/// marked packet is ALSO admitted; a non-ECT packet above threshold
+/// falls through unchanged and drops via the existing buffer/share
+/// caps.
+#[inline]
+fn apply_cos_admission_ecn_policy(
+    queue: &mut CoSQueueRuntime,
+    buffer_limit: u64,
+    flow_share_exceeded: bool,
+    buffer_exceeded: bool,
+    item: &mut CoSPendingTxItem,
+) -> bool {
+    // Integer division by the compile-time-asserted nonzero
+    // `COS_ECN_MARK_THRESHOLD_DEN` is one saturating_mul + one divide
+    // on the hot path.
+    let ecn_threshold = buffer_limit
+        .saturating_mul(COS_ECN_MARK_THRESHOLD_NUM)
+        / COS_ECN_MARK_THRESHOLD_DEN.max(1);
+    if queue.queued_bytes <= ecn_threshold || flow_share_exceeded || buffer_exceeded {
+        return false;
+    }
+    if let CoSPendingTxItem::Local(req) = item {
+        if maybe_mark_ecn_ce(req) {
+            queue.drop_counters.admission_ecn_marked = queue
+                .drop_counters
+                .admission_ecn_marked
+                .wrapping_add(1);
+            return true;
+        }
+    }
+    // TODO(#718-followup): Prepared variant marks the packet via umem
+    // slice_mut, needs separate plumbing. Return false for now so the
+    // packet falls through to the existing admission path unchanged.
+    false
+}
+
 fn maybe_top_up_cos_root_lease(
     root: &mut CoSInterfaceRuntime,
     shared_root_lease: &SharedCoSRootLease,
@@ -3758,7 +3920,7 @@ fn enqueue_cos_item(
     egress_ifindex: i32,
     requested_queue: Option<u8>,
     item_len: u64,
-    item: CoSPendingTxItem,
+    mut item: CoSPendingTxItem,
 ) -> Result<(), CoSPendingTxItem> {
     let mut root_became_nonempty = false;
     let (accepted, queue_id, recycle) = {
@@ -3793,6 +3955,19 @@ fn enqueue_cos_item(
             false
         };
         let buffer_exceeded = queue.queued_bytes.saturating_add(item_len) > buffer_limit;
+        // #718: ECN CE-mark above threshold so ECN-negotiated TCP flows
+        // back off smoothly rather than tail-dropping into RTO. Non-ECT
+        // packets are untouched — they fall back to the existing
+        // admission drop path below. Mark only when the packet will
+        // actually be admitted: a marked-and-then-dropped packet wastes
+        // both the mark and the bandwidth the mark was trying to steer.
+        let _ = apply_cos_admission_ecn_policy(
+            queue,
+            buffer_limit,
+            flow_share_exceeded,
+            buffer_exceeded,
+            &mut item,
+        );
         if flow_share_exceeded || buffer_exceeded {
             // #710: attribute the drop to the specific admission-path
             // reason. `flow_share_exceeded` is checked first so that
@@ -9708,5 +9883,429 @@ mod tests {
             snapshot_counters(&root.queues[0]).root_token_starvation_parks,
             after.root_token_starvation_parks
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #718 ECN CE-marking. The markers are the load-bearing helpers;
+    // the admission-path tests exercise `apply_cos_admission_ecn_policy`
+    // which is what `enqueue_cos_item` calls in-line. Keep the marker
+    // tests byte-precise so a future refactor that flips an endian /
+    // offset / masks a different bit fails loudly.
+    // ---------------------------------------------------------------------
+
+    /// Build a minimal IPv4 packet (Ethernet + IPv4 header, no
+    /// payload) with the given `tos` byte and a valid IP checksum.
+    /// 34-byte total so `l3_offset = 14` lands on the IPv4 version/IHL
+    /// byte. Returns the buffer for mutation.
+    fn build_ipv4_test_packet(tos: u8) -> Vec<u8> {
+        let mut pkt = vec![0u8; 34];
+        // Ethernet header: dst + src MAC (12 bytes of zeros is fine
+        // for a checksum-only test), ethertype = IPv4 (0x0800).
+        pkt[12] = 0x08;
+        pkt[13] = 0x00;
+        // IPv4 header, l3_offset = 14:
+        //   byte 0: version (4) + IHL (5) = 0x45
+        //   byte 1: TOS
+        //   bytes 2..3: total length (20)
+        //   bytes 4..5: id
+        //   bytes 6..7: flags + frag offset
+        //   byte 8: TTL (64)
+        //   byte 9: protocol (TCP=6)
+        //   bytes 10..11: header checksum (placeholder)
+        //   bytes 12..15: src IP 10.0.0.1
+        //   bytes 16..19: dst IP 10.0.0.2
+        pkt[14] = 0x45;
+        pkt[15] = tos;
+        pkt[16] = 0;
+        pkt[17] = 20;
+        pkt[22] = 64;
+        pkt[23] = 6;
+        pkt[26] = 10;
+        pkt[27] = 0;
+        pkt[28] = 0;
+        pkt[29] = 1;
+        pkt[30] = 10;
+        pkt[31] = 0;
+        pkt[32] = 0;
+        pkt[33] = 2;
+        let csum = compute_ipv4_header_checksum(&pkt[14..34]);
+        pkt[24] = (csum >> 8) as u8;
+        pkt[25] = (csum & 0xff) as u8;
+        pkt
+    }
+
+    /// Compute the IPv4 header checksum over the given header bytes.
+    /// Used by tests to independently verify that the incremental
+    /// update in `mark_ecn_ce_ipv4` produced the same value a
+    /// from-scratch computation would.
+    fn compute_ipv4_header_checksum(header: &[u8]) -> u16 {
+        assert_eq!(header.len(), 20, "test fixture must be a 20-byte header");
+        let mut sum: u32 = 0;
+        for i in (0..20).step_by(2) {
+            if i == 10 {
+                // Skip the checksum field itself.
+                continue;
+            }
+            sum += ((header[i] as u32) << 8) | header[i + 1] as u32;
+        }
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        (!sum & 0xffff) as u16
+    }
+
+    fn ipv4_tos(pkt: &[u8]) -> u8 {
+        pkt[15]
+    }
+
+    fn ipv4_checksum(pkt: &[u8]) -> u16 {
+        ((pkt[24] as u16) << 8) | pkt[25] as u16
+    }
+
+    #[test]
+    fn mark_ecn_ce_ipv4_converts_ect0_to_ce_and_updates_checksum() {
+        // ECT(0) = 0b10 in the low 2 bits of the TOS byte. Pick a
+        // non-zero DSCP (0x28 = CS5 = expedited forwarding) to verify
+        // the upper 6 bits survive the mark. TOS before = 0xa2.
+        let tos = (0x28u8 << 2) | ECN_ECT_0;
+        let mut pkt = build_ipv4_test_packet(tos);
+        assert_eq!(ipv4_tos(&pkt), 0xa2);
+        let csum_before = ipv4_checksum(&pkt);
+
+        assert!(mark_ecn_ce_ipv4(&mut pkt, 14));
+
+        // Low 2 bits now CE, upper 6 bits (DSCP) unchanged.
+        assert_eq!(ipv4_tos(&pkt) & ECN_MASK, ECN_CE);
+        assert_eq!(ipv4_tos(&pkt) >> 2, 0x28);
+        // Checksum must differ from the before-state (ECN flipped one
+        // bit in the low byte) AND be valid from scratch.
+        assert_ne!(
+            ipv4_checksum(&pkt),
+            csum_before,
+            "ECN bit flip must change the IP checksum",
+        );
+        assert_eq!(
+            ipv4_checksum(&pkt),
+            compute_ipv4_header_checksum(&pkt[14..34]),
+            "incremental checksum must match a from-scratch recompute",
+        );
+    }
+
+    #[test]
+    fn mark_ecn_ce_ipv4_converts_ect1_to_ce_and_updates_checksum() {
+        // ECT(1) = 0b01. DSCP = 0, so TOS starts at 0x01 — stresses
+        // the case where the high nibble is zero and only the low
+        // bits mutate.
+        let tos = ECN_ECT_1;
+        let mut pkt = build_ipv4_test_packet(tos);
+
+        assert!(mark_ecn_ce_ipv4(&mut pkt, 14));
+        assert_eq!(ipv4_tos(&pkt), ECN_CE);
+        assert_eq!(
+            ipv4_checksum(&pkt),
+            compute_ipv4_header_checksum(&pkt[14..34]),
+        );
+    }
+
+    #[test]
+    fn mark_ecn_ce_ipv4_leaves_not_ect_untouched() {
+        // NOT-ECT packet must be left entirely alone — RFC 3168 6.1.1.1
+        // forbids forcing ECN on flows that did not negotiate it.
+        let tos = 0xb8; // DSCP 46 (EF), ECN = 00
+        let mut pkt = build_ipv4_test_packet(tos);
+        let before = pkt.clone();
+
+        assert!(!mark_ecn_ce_ipv4(&mut pkt, 14));
+        assert_eq!(pkt, before, "NOT-ECT packet must be byte-identical");
+    }
+
+    #[test]
+    fn mark_ecn_ce_ipv4_leaves_ce_untouched() {
+        // CE already — idempotent: function reports "not marked" but
+        // also doesn't re-write the checksum, so bytes stay identical.
+        let tos = 0xb8 | ECN_CE;
+        let mut pkt = build_ipv4_test_packet(tos);
+        let before = pkt.clone();
+
+        assert!(!mark_ecn_ce_ipv4(&mut pkt, 14));
+        assert_eq!(pkt, before, "CE packet must be byte-identical");
+    }
+
+    #[test]
+    fn mark_ecn_ce_ipv4_rejects_short_buffer() {
+        // Buffer too short to hold a full 20-byte IPv4 header starting
+        // at l3_offset=14 (only 33 bytes — one short). Must return
+        // false and not panic.
+        let mut pkt = vec![0u8; 33];
+        assert!(!mark_ecn_ce_ipv4(&mut pkt, 14));
+
+        // Also exercise the case where `l3_offset` itself pushes past
+        // the buffer end.
+        let mut pkt = vec![0u8; 16];
+        assert!(!mark_ecn_ce_ipv4(&mut pkt, 14));
+    }
+
+    /// Build a minimal IPv6 packet (Ethernet + IPv6 header, no
+    /// payload) with the given full tclass byte. Returns the buffer
+    /// for mutation.
+    fn build_ipv6_test_packet(tclass: u8) -> Vec<u8> {
+        let mut pkt = vec![0u8; 54];
+        pkt[12] = 0x86;
+        pkt[13] = 0xdd;
+        // IPv6 header, l3_offset = 14:
+        //   version/tclass high nibble in byte 0 (version=6 -> 0x60
+        //   in the high nibble; tclass high nibble in the low nibble)
+        //   tclass low nibble + flow label high nibble in byte 1
+        pkt[14] = 0x60 | ((tclass >> 4) & 0x0f);
+        pkt[15] = ((tclass & 0x0f) << 4) | 0x00;
+        // Payload length = 0, next header = TCP, hop limit = 64.
+        pkt[20] = 6;
+        pkt[21] = 64;
+        pkt
+    }
+
+    fn ipv6_tclass(pkt: &[u8]) -> u8 {
+        ((pkt[14] & 0x0f) << 4) | ((pkt[15] >> 4) & 0x0f)
+    }
+
+    #[test]
+    fn mark_ecn_ce_ipv6_converts_ect0_to_ce() {
+        // DSCP 46 (EF) + ECT(0) → full tclass 0xba.
+        let tclass = (0x2eu8 << 2) | ECN_ECT_0;
+        let mut pkt = build_ipv6_test_packet(tclass);
+        assert_eq!(ipv6_tclass(&pkt), 0xba);
+        // Preserve flow label / version bits for the round-trip check.
+        let version_nibble_before = pkt[14] & 0xf0;
+        let flow_label_low_before = pkt[15] & 0x0f;
+
+        assert!(mark_ecn_ce_ipv6(&mut pkt, 14));
+        assert_eq!(ipv6_tclass(&pkt) & ECN_MASK, ECN_CE);
+        assert_eq!(ipv6_tclass(&pkt) >> 2, 0x2e);
+        // Version + flow-label bits must not drift.
+        assert_eq!(pkt[14] & 0xf0, version_nibble_before);
+        assert_eq!(pkt[15] & 0x0f, flow_label_low_before);
+    }
+
+    #[test]
+    fn mark_ecn_ce_ipv6_converts_ect1_to_ce() {
+        let tclass = ECN_ECT_1;
+        let mut pkt = build_ipv6_test_packet(tclass);
+        assert!(mark_ecn_ce_ipv6(&mut pkt, 14));
+        assert_eq!(ipv6_tclass(&pkt), ECN_CE);
+    }
+
+    #[test]
+    fn mark_ecn_ce_ipv6_leaves_not_ect_untouched() {
+        let tclass = 0xb8; // DSCP 46, ECN 00
+        let mut pkt = build_ipv6_test_packet(tclass);
+        let before = pkt.clone();
+        assert!(!mark_ecn_ce_ipv6(&mut pkt, 14));
+        assert_eq!(pkt, before);
+    }
+
+    #[test]
+    fn mark_ecn_ce_ipv6_leaves_ce_untouched() {
+        let tclass = 0xb8 | ECN_CE;
+        let mut pkt = build_ipv6_test_packet(tclass);
+        let before = pkt.clone();
+        assert!(!mark_ecn_ce_ipv6(&mut pkt, 14));
+        assert_eq!(pkt, before);
+    }
+
+    #[test]
+    fn mark_ecn_ce_ipv6_rejects_short_buffer() {
+        let mut pkt = vec![0u8; 15];
+        assert!(!mark_ecn_ce_ipv6(&mut pkt, 14));
+    }
+
+    #[test]
+    fn maybe_mark_ecn_ce_dispatches_by_addr_family() {
+        // IPv4 dispatch: ECT(0) → CE.
+        let tos = ECN_ECT_0;
+        let bytes = build_ipv4_test_packet(tos);
+        let mut req = TxRequest {
+            bytes,
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 1,
+            cos_queue_id: Some(0),
+            dscp_rewrite: None,
+        };
+        assert!(maybe_mark_ecn_ce(&mut req));
+        assert_eq!(req.bytes[15] & ECN_MASK, ECN_CE);
+
+        // IPv6 dispatch: ECT(1) → CE.
+        let tclass = ECN_ECT_1;
+        let bytes = build_ipv6_test_packet(tclass);
+        let mut req = TxRequest {
+            bytes,
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET6 as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 1,
+            cos_queue_id: Some(0),
+            dscp_rewrite: None,
+        };
+        assert!(maybe_mark_ecn_ce(&mut req));
+        assert_eq!(ipv6_tclass(&req.bytes), ECN_CE);
+
+        // Unknown address family: no-op (and no panic).
+        let mut req = TxRequest {
+            bytes: vec![0u8; 64],
+            expected_ports: None,
+            expected_addr_family: 0,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 1,
+            cos_queue_id: Some(0),
+            dscp_rewrite: None,
+        };
+        assert!(!maybe_mark_ecn_ce(&mut req));
+    }
+
+    /// Helper: build a `CoSPendingTxItem::Local` with an IPv4 test
+    /// packet carrying the given TOS byte. Default flow key routes it
+    /// into queue 0 of `test_cos_runtime_with_exact`.
+    fn test_local_ipv4_item(tos: u8) -> CoSPendingTxItem {
+        CoSPendingTxItem::Local(TxRequest {
+            bytes: build_ipv4_test_packet(tos),
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 42,
+            cos_queue_id: Some(0),
+            dscp_rewrite: None,
+        })
+    }
+
+    #[test]
+    fn admission_ecn_marked_counter_increments_when_marking_above_threshold() {
+        // Drive the queue to >50% of buffer_limit with an ECT(0) packet
+        // incoming. The mark must fire; the counter must advance by
+        // exactly one; no drop counters advance; the packet is "admitted"
+        // (we run the decision in isolation, so we just assert `marked`).
+        let mut root = test_cos_runtime_with_exact(false);
+        let queue = &mut root.queues[0];
+        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        // Half + 1 byte — strictly above the 50% threshold.
+        queue.queued_bytes = (buffer_limit / 2) + 1;
+        let before = snapshot_counters(queue);
+
+        let mut item = test_local_ipv4_item(ECN_ECT_0);
+        let marked = apply_cos_admission_ecn_policy(queue, buffer_limit, false, false, &mut item);
+
+        assert!(marked);
+        let after = snapshot_counters(queue);
+        assert_eq!(
+            after.admission_ecn_marked,
+            before.admission_ecn_marked + 1,
+            "ECN counter must advance by 1",
+        );
+        assert_eq!(after.admission_flow_share_drops, before.admission_flow_share_drops);
+        assert_eq!(after.admission_buffer_drops, before.admission_buffer_drops);
+        // Packet bytes now carry CE.
+        if let CoSPendingTxItem::Local(req) = &item {
+            assert_eq!(req.bytes[15] & ECN_MASK, ECN_CE);
+        } else {
+            panic!("item must stay Local variant");
+        }
+    }
+
+    #[test]
+    fn admission_does_not_mark_below_threshold() {
+        let mut root = test_cos_runtime_with_exact(false);
+        let queue = &mut root.queues[0];
+        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        // Exactly at threshold — `>` comparison must not fire.
+        queue.queued_bytes = buffer_limit / 2;
+        let before = snapshot_counters(queue);
+
+        let mut item = test_local_ipv4_item(ECN_ECT_0);
+        let marked = apply_cos_admission_ecn_policy(queue, buffer_limit, false, false, &mut item);
+
+        assert!(!marked, "at-threshold must not mark");
+        let after = snapshot_counters(queue);
+        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked);
+        // Packet bytes unchanged.
+        if let CoSPendingTxItem::Local(req) = &item {
+            assert_eq!(req.bytes[15] & ECN_MASK, ECN_ECT_0);
+        } else {
+            panic!("item must stay Local variant");
+        }
+    }
+
+    #[test]
+    fn admission_does_not_mark_non_ect_packets() {
+        // Queue above threshold, but packet is NOT-ECT. Mark must not
+        // fire and counter must not advance — RFC 3168 compliance.
+        let mut root = test_cos_runtime_with_exact(false);
+        let queue = &mut root.queues[0];
+        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        queue.queued_bytes = (buffer_limit / 2) + 1;
+        let before = snapshot_counters(queue);
+
+        let mut item = test_local_ipv4_item(ECN_NOT_ECT);
+        let marked = apply_cos_admission_ecn_policy(queue, buffer_limit, false, false, &mut item);
+
+        assert!(!marked);
+        let after = snapshot_counters(queue);
+        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked);
+        if let CoSPendingTxItem::Local(req) = &item {
+            assert_eq!(req.bytes[15] & ECN_MASK, ECN_NOT_ECT);
+        } else {
+            panic!("item must stay Local variant");
+        }
+    }
+
+    #[test]
+    fn admission_does_not_mark_when_drop_is_imminent() {
+        // Queue above threshold AND flow-share/buffer exceeded: don't
+        // burn the mark on a packet that's about to be dropped.
+        let mut root = test_cos_runtime_with_exact(false);
+        let queue = &mut root.queues[0];
+        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        queue.queued_bytes = (buffer_limit / 2) + 1;
+        let before = snapshot_counters(queue);
+
+        let mut item = test_local_ipv4_item(ECN_ECT_0);
+        // Signal that the caller already decided this packet will drop.
+        let marked = apply_cos_admission_ecn_policy(queue, buffer_limit, true, false, &mut item);
+        assert!(!marked, "flow_share_exceeded path must skip marking");
+        let after_share = snapshot_counters(queue);
+        assert_eq!(after_share.admission_ecn_marked, before.admission_ecn_marked);
+
+        let marked = apply_cos_admission_ecn_policy(queue, buffer_limit, false, true, &mut item);
+        assert!(!marked, "buffer_exceeded path must skip marking");
+        let after_buf = snapshot_counters(queue);
+        assert_eq!(after_buf.admission_ecn_marked, before.admission_ecn_marked);
+
+        // Packet bytes unchanged through both calls.
+        if let CoSPendingTxItem::Local(req) = &item {
+            assert_eq!(req.bytes[15] & ECN_MASK, ECN_ECT_0);
+        } else {
+            panic!("item must stay Local variant");
+        }
+    }
+
+    #[test]
+    fn admission_does_not_mark_prepared_variant() {
+        // Prepared variant is the TODO(#718-followup) path. Exercised
+        // here so a future implementer sees an explicit pin when they
+        // land the umem-slice marking work.
+        let mut root = test_cos_runtime_with_exact(false);
+        let queue = &mut root.queues[0];
+        let buffer_limit = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        queue.queued_bytes = (buffer_limit / 2) + 1;
+        let before = snapshot_counters(queue);
+
+        let mut item = test_flow_prepared_cos_item(1111, 1500, 0);
+        let marked = apply_cos_admission_ecn_policy(queue, buffer_limit, false, false, &mut item);
+        assert!(!marked);
+        let after = snapshot_counters(queue);
+        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked);
     }
 }

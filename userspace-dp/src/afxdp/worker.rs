@@ -1729,6 +1729,12 @@ where
                 status.admission_buffer_drops = status
                     .admission_buffer_drops
                     .saturating_add(queue.drop_counters.admission_buffer_drops);
+                // #718: aggregate ECN CE-mark counter across workers.
+                // Same single-writer invariant as the other admission
+                // counters — owner worker only.
+                status.admission_ecn_marked = status
+                    .admission_ecn_marked
+                    .saturating_add(queue.drop_counters.admission_ecn_marked);
                 status.root_token_starvation_parks = status
                     .root_token_starvation_parks
                     .saturating_add(queue.drop_counters.root_token_starvation_parks);
@@ -1867,6 +1873,7 @@ mod tests {
         let counters_a = CoSQueueDropCounters {
             admission_flow_share_drops: 3,
             admission_buffer_drops: 1,
+            admission_ecn_marked: 37,
             root_token_starvation_parks: 5,
             queue_token_starvation_parks: 7,
             tx_ring_full_submit_stalls: 11,
@@ -1874,6 +1881,7 @@ mod tests {
         let counters_b = CoSQueueDropCounters {
             admission_flow_share_drops: 13,
             admission_buffer_drops: 17,
+            admission_ecn_marked: 41,
             root_token_starvation_parks: 19,
             queue_token_starvation_parks: 23,
             tx_ring_full_submit_stalls: 29,
@@ -1907,6 +1915,7 @@ mod tests {
         // that the live bug in #710 review occurred in.
         assert_eq!(queue.admission_flow_share_drops, 3 + 13);
         assert_eq!(queue.admission_buffer_drops, 1 + 17);
+        assert_eq!(queue.admission_ecn_marked, 37 + 41);
         assert_eq!(queue.root_token_starvation_parks, 5 + 19);
         assert_eq!(queue.queue_token_starvation_parks, 7 + 23);
         assert_eq!(queue.tx_ring_full_submit_stalls, 11 + 29);

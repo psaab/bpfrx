@@ -241,3 +241,10 @@
 - Transfer ready: yes on both nodes after deploy
 - Manual failover test PASSES: iperf3 -P2 at 11 Gbps survives RG move with no visible throughput drop
 - Automated script reports false failure (samples at exact transition moment)
+
+## 2026-04-17 — #718 ECN CE marking at CoS admission
+- **Action**: Add mark_ecn_ce_ipv4 / mark_ecn_ce_ipv6 / maybe_mark_ecn_ce / apply_cos_admission_ecn_policy; wire into enqueue_cos_item
+  - **File(s)**: `userspace-dp/src/afxdp/tx.rs`
+- **Action**: Add CoSQueueDropCounters.admission_ecn_marked field + protocol/worker/coordinator aggregation
+  - **File(s)**: `userspace-dp/src/afxdp/types.rs`, `userspace-dp/src/afxdp/worker.rs`, `userspace-dp/src/afxdp/coordinator.rs`, `userspace-dp/src/protocol.rs`
+- **Result**: 16 new tests (11 marker, 5 admission); full suite 667 pass / 0 fail (baseline 651); Local variant only, Prepared deferred to #718-followup

@@ -1565,6 +1565,11 @@ pub(super) fn aggregate_cos_statuses_across_workers(
                 q.admission_buffer_drops = q
                     .admission_buffer_drops
                     .saturating_add(queue.admission_buffer_drops);
+                // #718: cross-worker aggregation for the ECN-marked
+                // counter. Mirrors the other admission counters above.
+                q.admission_ecn_marked = q
+                    .admission_ecn_marked
+                    .saturating_add(queue.admission_ecn_marked);
                 q.root_token_starvation_parks = q
                     .root_token_starvation_parks
                     .saturating_add(queue.root_token_starvation_parks);
@@ -2515,6 +2520,7 @@ mod tests {
                 worker_instances: 1,
                 admission_flow_share_drops: 3,
                 admission_buffer_drops: 5,
+                admission_ecn_marked: 37,
                 root_token_starvation_parks: 7,
                 queue_token_starvation_parks: 11,
                 tx_ring_full_submit_stalls: 13,
@@ -2533,6 +2539,7 @@ mod tests {
                 worker_instances: 1,
                 admission_flow_share_drops: 17,
                 admission_buffer_drops: 19,
+                admission_ecn_marked: 41,
                 root_token_starvation_parks: 23,
                 queue_token_starvation_parks: 29,
                 tx_ring_full_submit_stalls: 31,
@@ -2555,6 +2562,7 @@ mod tests {
         // accidental re-attribution between counters.
         assert_eq!(q.admission_flow_share_drops, 3 + 17);
         assert_eq!(q.admission_buffer_drops, 5 + 19);
+        assert_eq!(q.admission_ecn_marked, 37 + 41);
         assert_eq!(q.root_token_starvation_parks, 7 + 23);
         assert_eq!(q.queue_token_starvation_parks, 11 + 29);
         assert_eq!(q.tx_ring_full_submit_stalls, 13 + 31);
