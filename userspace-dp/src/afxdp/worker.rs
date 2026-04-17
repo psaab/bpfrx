@@ -1460,10 +1460,32 @@ where
 // before the drain loop backs up and throughput collapses (the collapse case
 // that motivated shared-worker execution in PR #680). This is the sole
 // shared-exact threshold: a queue at or above this rate shards across every
-// eligible worker; a queue below it runs under a single owner. The ceiling
-// is a property of the drain loop and the TX ring, not a function of the
-// interface shaper — it does not scale with iface rate.
-const COS_SHARED_EXACT_MIN_RATE_BYTES: u64 = 2_500_000_000 / 8;
+// eligible worker; a queue below it runs under a single owner.
+//
+// Evidence basis (#698):
+// - Drain-path userspace micro-bench `cos_exact_drain_throughput_micro_bench`
+//   (in `afxdp::tx::tests`, run with
+//   `cargo test --release -- --ignored --nocapture`; debug-build numbers are
+//   not meaningful for this baseline) measures the inner
+//   `drain_exact_local_fifo_items_to_scratch` +
+//   `settle_exact_local_fifo_submission` loop in isolation with setup work
+//   excluded from the timed region. Baseline on the development host is
+//   comfortably above MIN (order of a few Mpps / tens of Gbps at 1500 B);
+//   drain alone is not the limiter there.
+// - This bench only rules out the inner drain loop as the immediate
+//   limiter on the development host. It does NOT by itself validate MIN
+//   on other deployment hardware, and it does not fully attribute the
+//   remaining ceiling to non-drain work without a live single-worker
+//   measurement.
+// - The 2.5 Gbps figure is best read as a per-worker *aggregate* budget
+//   threshold consistent with the PR #680 collapse shape: there the drain
+//   loop failed to absorb 10g line-rate despite drain alone being able
+//   to go much faster, because non-drain per-packet work (RX, forwarding,
+//   NAT, session-lookup, conntrack) consumed the per-packet cycle budget
+//   that drain+completion needed to keep up.
+// - The ceiling is a property of the full per-worker pipeline, not of
+//   the interface shaper — it does not scale with iface rate.
+pub(super) const COS_SHARED_EXACT_MIN_RATE_BYTES: u64 = 2_500_000_000 / 8;
 
 /// Decide whether an exact queue runs under shared-worker execution.
 ///
@@ -2153,6 +2175,200 @@ mod tests {
         assert_eq!(queue6.owner_worker_id, 5);
     }
 
+    #[test]
+    fn build_worker_cos_fast_interfaces_matches_live_loss_ha_3_queue_shape() {
+        // #698 regression: end-to-end dispatch coverage for the exact
+        // live loss HA CoS config every other PR in this series has
+        // validated against. Prior predicate tests pin the
+        // `queue_uses_shared_exact_service` output; the earlier 2-queue
+        // assembly test pins the shared-lease plumbing for one mixed
+        // case. Neither exercises all three production queues in
+        // their production interface shape at once.
+        //
+        // Wiring matches what the coordinator actually produces.
+        // `build_shared_cos_queue_leases_reusing_existing` creates a
+        // `SharedCoSQueueLease` for *every* exact queue with a nonzero
+        // rate — regardless of whether `shared_exact` is true. So on
+        // the live path, owner-local exact queues (queues 0 and 4 here)
+        // carry a shared queue lease *object* that simply isn't used
+        // by their dispatch path. That's the real contract this test
+        // pins: `shared_exact` flips the *execution* policy, not the
+        // *lease presence*.
+        //
+        // Shape:
+        //   reth0.80 shaper 10g
+        //     queue 0  best-effort  100m exact
+        //                  -> shared_exact=false (owner-local service)
+        //                  -> shared_queue_lease=Some(_)  (coordinator always wires)
+        //     queue 4  iperf-a      1g   exact
+        //                  -> shared_exact=false (owner-local service)
+        //                  -> shared_queue_lease=Some(_)
+        //     queue 5  iperf-b      10g  exact
+        //                  -> shared_exact=true  (sharded service)
+        //                  -> shared_queue_lease=Some(_)
+        //
+        // Threshold on a 10g iface = `COS_SHARED_EXACT_MIN_RATE_BYTES`
+        // = 2.5 Gbps. queues 0 and 4 are below; queue 5 is at 10g.
+        let mut forwarding = ForwardingState::default();
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 10_000_000_000 / 8,
+                burst_bytes: 256 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![
+                    CoSQueueConfig {
+                        queue_id: 0,
+                        forwarding_class: "best-effort".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 100_000_000 / 8,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 4,
+                        forwarding_class: "iperf-a".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 1_000_000_000 / 8,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 128 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 5,
+                        forwarding_class: "iperf-b".into(),
+                        priority: 5,
+                        transmit_rate_bytes: 10_000_000_000 / 8,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 256 * 1024,
+                        dscp_rewrite: None,
+                    },
+                ],
+            },
+        );
+        forwarding.egress.insert(
+            80,
+            EgressInterface {
+                bind_ifindex: 12,
+                vlan_id: 80,
+                mtu: 1500,
+                src_mac: [0; 6],
+                zone: "wan".into(),
+                redundancy_group: 0,
+                primary_v4: None,
+                primary_v6: None,
+            },
+        );
+
+        let tx_owner_live = Arc::new(BindingLiveState::new());
+        let q0_owner_live = Arc::new(BindingLiveState::new());
+        let q4_owner_live = Arc::new(BindingLiveState::new());
+        let q5_owner_live = Arc::new(BindingLiveState::new());
+
+        let tx_owner_live_by_tx_ifindex = FastMap::from_iter([(12, tx_owner_live.clone())]);
+        let owner_worker_by_queue = BTreeMap::from([((80, 0), 2), ((80, 4), 4), ((80, 5), 7)]);
+        let owner_live_by_queue = BTreeMap::from([
+            ((80, 0), q0_owner_live.clone()),
+            ((80, 4), q4_owner_live.clone()),
+            ((80, 5), q5_owner_live.clone()),
+        ]);
+        let shared_root_leases = BTreeMap::from([(
+            80,
+            Arc::new(SharedCoSRootLease::new(10_000_000_000 / 8, 256 * 1024, 4)),
+        )]);
+        // Coordinator wires a shared queue lease for every non-zero-rate
+        // exact queue, not only the shared ones. Mirror that here so the
+        // test exercises the live shape rather than a hand-pruned one.
+        let q0_shared_queue_lease =
+            Arc::new(SharedCoSQueueLease::new(100_000_000 / 8, 64 * 1024, 4));
+        let q4_shared_queue_lease =
+            Arc::new(SharedCoSQueueLease::new(1_000_000_000 / 8, 128 * 1024, 4));
+        let q5_shared_queue_lease =
+            Arc::new(SharedCoSQueueLease::new(10_000_000_000 / 8, 256 * 1024, 4));
+        let shared_queue_leases = BTreeMap::from([
+            ((80, 0), q0_shared_queue_lease.clone()),
+            ((80, 4), q4_shared_queue_lease.clone()),
+            ((80, 5), q5_shared_queue_lease.clone()),
+        ]);
+
+        let fast = build_worker_cos_fast_interfaces(
+            &forwarding,
+            3,
+            &tx_owner_live_by_tx_ifindex,
+            &owner_worker_by_queue,
+            &owner_live_by_queue,
+            &shared_root_leases,
+            &shared_queue_leases,
+        );
+
+        let iface = fast.get(&80).expect("fast cos interface");
+        assert_eq!(iface.tx_ifindex, 12);
+
+        let q0 = iface.queue_fast_path(Some(0)).expect("queue 0");
+        assert!(
+            !q0.shared_exact,
+            "best-effort 100m exact must be owner-local (single-owner service) on 10g iface"
+        );
+        assert_eq!(q0.owner_worker_id, 2);
+        assert!(Arc::ptr_eq(
+            q0.owner_live.as_ref().expect("q0 owner live"),
+            &q0_owner_live,
+        ));
+        assert!(
+            Arc::ptr_eq(
+                q0.shared_queue_lease
+                    .as_ref()
+                    .expect("q0 shared queue lease"),
+                &q0_shared_queue_lease,
+            ),
+            "coordinator wires a shared queue lease for every non-zero-rate exact queue, \
+             including owner-local ones; the lease object must survive fast-path assembly"
+        );
+
+        let q4 = iface.queue_fast_path(Some(4)).expect("queue 4");
+        assert!(
+            !q4.shared_exact,
+            "iperf-a 1g exact must be owner-local (single-owner service) on 10g iface"
+        );
+        assert_eq!(q4.owner_worker_id, 4);
+        assert!(Arc::ptr_eq(
+            q4.owner_live.as_ref().expect("q4 owner live"),
+            &q4_owner_live,
+        ));
+        assert!(Arc::ptr_eq(
+            q4.shared_queue_lease
+                .as_ref()
+                .expect("q4 shared queue lease"),
+            &q4_shared_queue_lease,
+        ));
+
+        let q5 = iface.queue_fast_path(Some(5)).expect("queue 5");
+        assert!(
+            q5.shared_exact,
+            "iperf-b 10g exact must be sharded on 10g iface"
+        );
+        assert_eq!(q5.owner_worker_id, 7);
+        assert!(Arc::ptr_eq(
+            q5.owner_live.as_ref().expect("q5 owner live"),
+            &q5_owner_live,
+        ));
+        assert!(Arc::ptr_eq(
+            q5.shared_queue_lease
+                .as_ref()
+                .expect("q5 shared queue lease"),
+            &q5_shared_queue_lease
+        ));
+    }
+
     fn test_cos_iface_with_rate(shaping_bits: u64) -> CoSInterfaceConfig {
         CoSInterfaceConfig {
             shaping_rate_bytes: shaping_bits / 8,
@@ -2309,6 +2525,31 @@ mod tests {
         let q_3g = test_exact_queue_at_rate(5, 3_000_000_000);
         assert!(!queue_uses_shared_exact_service(&iface, &q_2g));
         assert!(queue_uses_shared_exact_service(&iface, &q_3g));
+    }
+
+    #[test]
+    fn queue_uses_shared_exact_service_queue_rate_above_iface_rate_uses_queue_rate() {
+        // #698 misconfig pin. Junos config validation does not cap the
+        // queue's `transmit-rate` at the iface `shaping-rate`, so a
+        // 10g exact queue can appear on a 1g iface. The predicate does
+        // not read iface rate, so classification is a function of the
+        // queue's absolute rate only — in this case 10g ≥ 2.5g → shared.
+        // Whether such a queue can actually achieve 10g on a 1g iface
+        // is a separate shaper question; the predicate's job is to
+        // produce a deterministic classification even under
+        // malformed config, not to reject the config.
+        let iface = test_cos_iface_with_rate(1_000_000_000);
+        let q_10g = test_exact_queue_at_rate(5, 10_000_000_000);
+        assert!(
+            queue_uses_shared_exact_service(&iface, &q_10g),
+            "a 10g exact queue on a 1g iface must classify on its own rate (shared), \
+             not on queue/iface ratio"
+        );
+        // Same logic holds at the exact threshold — nothing about the
+        // iface rate influences the decision.
+        let mut q = test_exact_queue_at_rate(6, 0);
+        q.transmit_rate_bytes = COS_SHARED_EXACT_MIN_RATE_BYTES;
+        assert!(queue_uses_shared_exact_service(&iface, &q));
     }
 
     #[test]
