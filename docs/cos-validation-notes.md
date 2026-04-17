@@ -258,6 +258,85 @@ without reading them is how we ship dormant code.
   `xpf_cos_owner_pps{ifindex, queue_id}`, and `xpf_cos_peer_pps{...}`.
   Expected cardinality per the plan: ≤ 8192 series per histogram.
 
+## CPU pinning layout for the loss lab
+
+**Measured 2026-04-17 for #712 Option A.** Conclusion: the
+`CPUAffinity=` directive on `xpfd.service` is a no-op on the 6-core
+loss userspace lab because `userspace-dp` re-pins its workers inside
+the process after systemd's mask is applied. Keep this section dated;
+re-measure if any of the three blockers below move.
+
+### Intended layout on the 6-core lab
+
+The host is a 6-CPU VM. NIC IRQ distribution on fw0 under 16-flow
+iperf3 load, sampled from `/proc/interrupts`:
+
+- mlx5_comp0 (WAN VF RX q0) → CPU 0, ~800 M interrupts
+- mlx5_comp1 (WAN VF RX q1) → CPU 1, ~900 M interrupts
+- mlx5_comp2..5 (WAN VF RX q2..5) → CPUs 2..5, ~500-900 M each
+- virtio-input/output q0..5 → pinned 1-per-CPU across CPUs 0..5
+
+Each CPU carries NIC IRQ load; CPUs 0-1 are the hottest. The recipe in
+`docs/712-cpu-pinning-recipe.md` §"6-core host" reserves CPUs 0-1 for
+IRQ + housekeeping and gives xpfd and its four dp workers CPUs 2-5:
+
+```
+[Service]
+CPUAffinity=2 3 4 5
+```
+
+### Why that recipe is a no-op today
+
+`xpf-userspace-dp` calls `pin_current_thread(worker_id)` in
+`userspace-dp/src/afxdp/neighbor.rs`, which issues
+`sched_setaffinity(0, CPU_SET(worker_id % nproc))` per worker **after**
+systemd has installed the unit mask. `nproc` (via
+`std::thread::available_parallelism()`) correctly reports 4 when the
+process is launched with `CPUAffinity=2 3 4 5`, but the call pins each
+worker to absolute CPU `worker_id % 4` — i.e. CPU 0, 1, 2, 3 — not to
+the 0th..3rd CPU of the allowed set. Result: the four hot-path workers
+land on CPUs 0-3 regardless, colliding with `mlx5_comp0` and
+`mlx5_comp1`. The Go main and the dp aux threads (state-writer,
+event-stream, slowpath, neigh-monitor) do honour the mask and run on
+CPUs 2-5.
+
+### Measurement
+
+16-flow iperf3 × 30 s × 3 runs, client
+`cluster-userspace-host`, target `172.16.80.200`, CoS fixture
+`test/incus/cos-iperf-config.set` applied, fw0 primary. Computed with
+`/tmp/712-pinning/analyze.py` (iperf3 `-J` on the client; per-flow CoV
+is the standard deviation of the per-second bps samples on each stream,
+divided by that stream's mean).
+
+| Metric | Pre-pin mean | Post-pin mean | Δ |
+|---|---|---|---|
+| Rate ratio (max/min per-flow) | 1.39× | 1.45× | +4% (worse) |
+| Retransmits / 30 s | 181 k | 204 k | +13% (worse) |
+| Per-flow CoV mean | 14.3% | 15.9% | +1.6 pp (worse) |
+| Per-flow CoV max | 25.4% | 26.4% | +1.0 pp (flat) |
+
+All deltas within run-to-run noise. No metric moved in a good
+direction. Acceptance criterion from #712 — per-flow stdev/mean ≤ 10% —
+was not met pre-pin (~14%) and not closer post-pin. Per
+`engineering-style.md` §"Hot-path coding discipline", the directive
+was reverted in the same PR; the recipe doc lives on as design intent.
+
+### Blockers before Option A can land as a win
+
+1. `pin_current_thread` must pick the Nth allowed CPU, not absolute
+   CPU N. One-line follow-up in `userspace-dp/src/afxdp/neighbor.rs`.
+2. Option B (kernel cmdline `isolcpus=`+`nohz_full=`) would remove
+   kernel timers and RCU callbacks from worker CPUs entirely. It
+   requires a cmdline edit and reboot, so deployment shape has to opt
+   in. Tracked as a follow-up to #712.
+3. Option D (cgroup cpuset) is softer and does not require a cmdline
+   change but needs operator decisions about which cpuset holds which
+   non-xpfd process. Tracked as a follow-up to #712.
+
+Until one of these lands, the 14% per-flow CoV on this lab is the
+floor — Option A alone does not move it.
+
 ## Gotchas the deploy wipes
 
 The cluster deploy path (`cluster-setup.sh deploy`) wipes the CoS
@@ -291,3 +370,4 @@ See also the "CoS deploy preserves config" bullet in
 - #725 — validation-pipeline gap findings (live data + path forward)
 - #727 — ECN marking on Prepared CoS variant (closed the Local-only gap)
 - #728 — VLAN-aware L3 offset + threshold tune (resolved the dormant-marker symptom)
+- #712 — CPU pinning + IRQ isolation (Option A measured no-op on this lab; see "CPU pinning layout for the loss lab")
