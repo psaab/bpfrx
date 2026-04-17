@@ -65,6 +65,8 @@ mod forwarding_build;
 mod frame;
 #[path = "afxdp/frame_tx.rs"]
 mod frame_tx;
+#[path = "afxdp/mpsc_inbox.rs"]
+mod mpsc_inbox;
 #[path = "afxdp/gre.rs"]
 mod gre;
 #[path = "afxdp/ha.rs"]
@@ -134,6 +136,7 @@ use self::rst::*;
 use self::session_glue::*;
 use self::shared_ops::*;
 use self::tunnel::*;
+use self::mpsc_inbox::MpscInbox;
 use self::tx::*;
 use self::types::*;
 pub(crate) use self::types::{ForwardingDisposition, ForwardingResolution, NeighborEntry};

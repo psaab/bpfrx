@@ -98,6 +98,17 @@ pub(super) struct MmapArea {
 /// 2 MB hugepage size.
 const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
+/// Hard capacity of the per-binding redirect inbox
+/// (`BindingLiveState::pending_tx`). Sized to cover the highest expected
+/// soft cap produced by `pending_tx_capacity()` in prod
+/// (`ring_entries = 2048` → `2 * ring_entries = 4096`). The MPSC ring is
+/// allocated once at `BindingLiveState::new()` with this capacity, then
+/// the soft cap from `set_max_pending_tx()` gates admissions inside
+/// `enqueue_tx` / `enqueue_tx_owned`. If a caller ever requests a soft
+/// cap larger than the hard cap, the effective cap clamps here and
+/// excess pushes drop with a `redirect_inbox_overflow_drops` counter bump.
+pub(super) const PENDING_TX_INBOX_HARD_CAP: usize = 4096;
+
 impl MmapArea {
     pub(super) fn new(len: usize) -> io::Result<Self> {
         // Round up to 2 MB boundary for hugepage eligibility.
@@ -237,16 +248,19 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_tx_owned_increments_redirect_inbox_overflow_counter_on_eviction() {
-        // #710: pin that a redirect-inbox overflow in `enqueue_tx_owned`
-        // increments the dedicated `redirect_inbox_overflow_drops`
-        // counter (not just the generic `tx_errors`). A regression that
-        // moves the drop to a different code path without incrementing
-        // this counter fails here.
+    fn enqueue_tx_owned_increments_redirect_inbox_overflow_counter_when_soft_cap_drops_newcomer() {
+        // #710 / #706: pin that a redirect-inbox overflow in
+        // `enqueue_tx_owned` increments both `redirect_inbox_overflow_drops`
+        // (dedicated view) and `tx_errors` (generic), regardless of
+        // which request gets dropped. Post-#706 the policy is drop-
+        // newest (the incoming push is discarded); pre-#706 it was
+        // drop-oldest (the head of the queue was evicted). Either way,
+        // every push must return `Ok(())` and both counters advance in
+        // lockstep.
         let live = BindingLiveState::new();
         live.max_pending_tx.store(2, Ordering::Relaxed);
 
-        // Fill to cap — no eviction yet.
+        // Fill to cap — no overflow yet.
         live.enqueue_tx_owned(test_tx_request_for_inbox(1))
             .expect("push 1");
         live.enqueue_tx_owned(test_tx_request_for_inbox(2))
@@ -257,9 +271,9 @@ mod tests {
         );
         assert_eq!(live.tx_errors.load(Ordering::Relaxed), 0);
 
-        // Third push exceeds cap — eldest evicted, counter advances.
+        // Third push hits the soft cap — drop-newest, counters advance.
         live.enqueue_tx_owned(test_tx_request_for_inbox(3))
-            .expect("push 3 evicts");
+            .expect("push 3 drops newest");
         assert_eq!(
             live.redirect_inbox_overflow_drops.load(Ordering::Relaxed),
             1
@@ -271,14 +285,43 @@ mod tests {
              counter on this path — the dedicated counter is a subset view"
         );
 
-        // Fourth push, another eviction — both counters advance.
+        // Fourth push, another overflow — both counters advance again.
         live.enqueue_tx_owned(test_tx_request_for_inbox(4))
-            .expect("push 4 evicts");
+            .expect("push 4 drops newest");
         assert_eq!(
             live.redirect_inbox_overflow_drops.load(Ordering::Relaxed),
             2
         );
         assert_eq!(live.tx_errors.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn take_pending_tx_into_appends_without_resetting_caller_buffer() {
+        // #706: pin that `take_pending_tx_into` preserves the caller's
+        // existing `VecDeque` contents. The owner-worker drain feeds its
+        // `pending_tx_local` buffer through the call; if the new API ever
+        // regressed to `*out = drained` or `out.clear()`, items already
+        // queued locally would be dropped on every poll.
+        let live = BindingLiveState::new();
+        live.max_pending_tx.store(8, Ordering::Relaxed);
+        live.enqueue_tx_owned(test_tx_request_for_inbox(10))
+            .expect("push inbox");
+        live.enqueue_tx_owned(test_tx_request_for_inbox(11))
+            .expect("push inbox");
+
+        let mut out = VecDeque::from([
+            test_tx_request_for_inbox(1),
+            test_tx_request_for_inbox(2),
+        ]);
+        live.take_pending_tx_into(&mut out);
+
+        let payloads: Vec<u8> = out.iter().map(|req| req.bytes[0]).collect();
+        assert_eq!(
+            payloads,
+            vec![1, 2, 10, 11],
+            "caller-provided items must come first; inbox items appended in FIFO order"
+        );
+        assert!(live.pending_tx_empty(), "inbox fully drained");
     }
 
     #[test]
@@ -434,9 +477,13 @@ pub(super) struct BindingLiveState {
     pub(super) debug_in_flight_recycles: AtomicU32,
     pub(super) last_heartbeat: AtomicU64,
     pub(super) max_pending_tx: AtomicU32,
-    pub(super) pending_tx_len: AtomicU32,
     pub(super) last_error: Mutex<String>,
-    pub(super) pending_tx: Mutex<VecDeque<TxRequest>>,
+    /// Cross-worker redirect inbox (#706). N producer workers push
+    /// redirected `TxRequest`s; the single owner worker drains. Bounded
+    /// lock-free ring — replaces the pre-#706 `Mutex<VecDeque>` that
+    /// serialised every producer against every other producer and
+    /// against the owner's drain.
+    pub(super) pending_tx: MpscInbox<TxRequest>,
     pub(super) pending_session_deltas: Mutex<VecDeque<SessionDeltaInfo>>,
 }
 
@@ -516,9 +563,8 @@ impl BindingLiveState {
             debug_in_flight_recycles: AtomicU32::new(0),
             last_heartbeat: AtomicU64::new(0),
             max_pending_tx: AtomicU32::new(0),
-            pending_tx_len: AtomicU32::new(0),
             last_error: Mutex::new(String::new()),
-            pending_tx: Mutex::new(VecDeque::new()),
+            pending_tx: MpscInbox::new(PENDING_TX_INBOX_HARD_CAP),
             pending_session_deltas: Mutex::new(VecDeque::new()),
         }
     }
@@ -714,77 +760,75 @@ impl BindingLiveState {
     }
 
     pub(super) fn enqueue_tx(&self, req: TxRequest) -> Result<(), String> {
-        match self.pending_tx.lock() {
-            Ok(mut pending) => {
-                let max_pending = self.max_pending_tx.load(Ordering::Relaxed) as usize;
-                if max_pending > 0 && pending.len() >= max_pending {
-                    if pending.pop_front().is_some() {
-                        self.tx_errors.fetch_add(1, Ordering::Relaxed);
-                        // #710: this is the redirect-inbox overflow
-                        // drop site. A packet already in the inbox was
-                        // evicted to make room for an incoming one —
-                        // the owner worker is not draining fast enough
-                        // relative to redirects arriving from non-owner
-                        // workers.
-                        self.redirect_inbox_overflow_drops
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                pending.push_back(req);
-                self.pending_tx_len.store(
-                    pending.len().min(u32::MAX as usize) as u32,
-                    Ordering::Relaxed,
-                );
-                Ok(())
-            }
-            Err(_) => Err("pending_tx lock poisoned".to_string()),
-        }
+        self.push_redirect_inbox(req);
+        Ok(())
     }
 
     pub(super) fn enqueue_tx_owned(&self, req: TxRequest) -> Result<(), TxRequest> {
-        match self.pending_tx.lock() {
-            Ok(mut pending) => {
-                let max_pending = self.max_pending_tx.load(Ordering::Relaxed) as usize;
-                if max_pending > 0 && pending.len() >= max_pending {
-                    if pending.pop_front().is_some() {
-                        self.tx_errors.fetch_add(1, Ordering::Relaxed);
-                        // #710: this is the redirect-inbox overflow
-                        // drop site. A packet already in the inbox was
-                        // evicted to make room for an incoming one —
-                        // the owner worker is not draining fast enough
-                        // relative to redirects arriving from non-owner
-                        // workers.
-                        self.redirect_inbox_overflow_drops
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                pending.push_back(req);
-                self.pending_tx_len.store(
-                    pending.len().min(u32::MAX as usize) as u32,
-                    Ordering::Relaxed,
-                );
-                Ok(())
-            }
-            Err(_) => Err(req),
+        self.push_redirect_inbox(req);
+        Ok(())
+    }
+
+    /// Shared push path for `enqueue_tx` and `enqueue_tx_owned`.
+    /// Drop-newest on overflow: if the soft cap or ring hard cap is hit,
+    /// drop the incoming request and bump the overflow counters. This is
+    /// a deliberate change from the pre-#706 drop-oldest behaviour —
+    /// older queued packets are closer to being serviced by the owner
+    /// worker, so evicting them just extends tail latency. The counter
+    /// contract (`tx_errors` as the generic error,
+    /// `redirect_inbox_overflow_drops` as the dedicated view) is preserved.
+    #[inline]
+    fn push_redirect_inbox(&self, req: TxRequest) {
+        let max_pending = self.max_pending_tx.load(Ordering::Relaxed) as usize;
+        if max_pending > 0 && self.pending_tx.len() >= max_pending {
+            self.record_redirect_inbox_overflow();
+            return;
+        }
+        if self.pending_tx.push(req).is_err() {
+            // Hard cap hit — ring is full. Rare: the hard cap sits at
+            // `PENDING_TX_INBOX_HARD_CAP`, so a non-zero soft cap
+            // normally fires first. This branch is reachable only under
+            // concurrent producers racing past the soft-cap check, or
+            // when the caller has set `max_pending_tx = 0` (treat as
+            // unlimited → hard cap is the only brake).
+            self.record_redirect_inbox_overflow();
         }
     }
 
-    pub(super) fn take_pending_tx(&self) -> VecDeque<TxRequest> {
-        if self.pending_tx_len.load(Ordering::Relaxed) == 0 {
-            return VecDeque::new();
+    #[inline]
+    fn record_redirect_inbox_overflow(&self) {
+        self.tx_errors.fetch_add(1, Ordering::Relaxed);
+        // #710 / #706: non-zero values here indicate the owner worker
+        // cannot drain redirects fast enough relative to producer push
+        // rate. After #706 the path is lock-free, so contention is no
+        // longer the bottleneck — further growth typically points at
+        // owner-worker hotspot (#709) or CoS admission (#707 / #708).
+        self.redirect_inbox_overflow_drops
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Drain the redirect inbox into a caller-provided `VecDeque`, so the
+    /// owner worker's drain stays allocation-free on the hot path. The
+    /// caller reuses its existing `pending_tx_local` buffer across polls
+    /// — calling `VecDeque::new()` / growing a fresh buffer on every drain
+    /// put allocator noise back on the exact thread #706 is trying to
+    /// keep quiet.
+    pub(super) fn take_pending_tx_into(&self, out: &mut VecDeque<TxRequest>) {
+        if self.pending_tx.is_empty() {
+            return;
         }
-        match self.pending_tx.lock() {
-            Ok(mut pending) => {
-                let drained = core::mem::take(&mut *pending);
-                self.pending_tx_len.store(0, Ordering::Relaxed);
-                drained
-            }
-            Err(_) => VecDeque::new(),
+        // SAFETY: `MpscInbox::pop` requires the single-consumer
+        // invariant. The per-binding redirect inbox has exactly one
+        // consumer — the owner worker — which is also the sole caller
+        // of `take_pending_tx_into`. Enforced by convention (see the doc
+        // comment on `pending_tx` in `BindingLiveState`).
+        while let Some(req) = unsafe { self.pending_tx.pop() } {
+            out.push_back(req);
         }
     }
 
     pub(super) fn pending_tx_empty(&self) -> bool {
-        self.pending_tx_len.load(Ordering::Relaxed) == 0
+        self.pending_tx.is_empty()
     }
 
     pub(super) fn push_session_delta(&self, delta: SessionDeltaInfo) {

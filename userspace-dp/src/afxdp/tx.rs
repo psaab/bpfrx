@@ -539,8 +539,7 @@ fn ingest_cos_pending_tx(
     }
 
     let mut pending = core::mem::take(&mut binding.pending_tx_local);
-    let mut shared = binding.live.take_pending_tx();
-    append_pending_queue(&mut pending, &mut shared);
+    binding.live.take_pending_tx_into(&mut pending);
     process_pending_queue_in_place(&mut pending, |req| {
         let req = match redirect_local_cos_request_to_owner(
             &binding.cos_fast_interfaces,
@@ -4066,27 +4065,6 @@ fn restore_cos_prepared_items_inner(
     retry_bytes
 }
 
-fn merge_pending_tx_requests(
-    mut local: VecDeque<TxRequest>,
-    mut shared: VecDeque<TxRequest>,
-) -> VecDeque<TxRequest> {
-    if local.is_empty() {
-        return shared;
-    }
-    if !shared.is_empty() {
-        local.append(&mut shared);
-    }
-    local
-}
-
-fn append_pending_queue<T>(pending: &mut VecDeque<T>, shared: &mut VecDeque<T>) {
-    if pending.is_empty() {
-        *pending = core::mem::take(shared);
-    } else if !shared.is_empty() {
-        pending.append(shared);
-    }
-}
-
 fn process_pending_queue_in_place<T, F>(pending: &mut VecDeque<T>, mut f: F)
 where
     F: FnMut(T) -> Result<(), T>,
@@ -4103,9 +4081,13 @@ where
 }
 
 fn take_pending_tx_requests(binding: &mut BindingWorker) -> VecDeque<TxRequest> {
-    let local = core::mem::take(&mut binding.pending_tx_local);
-    let shared = binding.live.take_pending_tx();
-    merge_pending_tx_requests(local, shared)
+    // Reuse the worker-owned `pending_tx_local` buffer as the drain
+    // target so the owner-worker hot path stays allocation-free. `pop`
+    // from the lock-free inbox appends into the same buffer without a
+    // queue-to-queue copy.
+    let mut out = core::mem::take(&mut binding.pending_tx_local);
+    binding.live.take_pending_tx_into(&mut out);
+    out
 }
 
 fn restore_pending_tx_requests(binding: &mut BindingWorker, mut retry: VecDeque<TxRequest>) {
@@ -4639,75 +4621,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_pending_tx_requests_appends_shared_after_local() {
-        let local = VecDeque::from(vec![
-            TxRequest {
-                bytes: vec![1],
-                expected_ports: None,
-                expected_addr_family: libc::AF_INET as u8,
-                expected_protocol: PROTO_TCP,
-                flow_key: None,
-                egress_ifindex: 0,
-                cos_queue_id: None,
-                dscp_rewrite: None,
-            },
-            TxRequest {
-                bytes: vec![2],
-                expected_ports: None,
-                expected_addr_family: libc::AF_INET as u8,
-                expected_protocol: PROTO_TCP,
-                flow_key: None,
-                egress_ifindex: 0,
-                cos_queue_id: None,
-                dscp_rewrite: None,
-            },
-        ]);
-        let shared = VecDeque::from(vec![TxRequest {
-            bytes: vec![3],
-            expected_ports: None,
-            expected_addr_family: libc::AF_INET as u8,
-            expected_protocol: PROTO_TCP,
-            flow_key: None,
-            egress_ifindex: 0,
-            cos_queue_id: None,
-            dscp_rewrite: None,
-        }]);
-
-        let merged = merge_pending_tx_requests(local, shared);
-        let bytes: Vec<Vec<u8>> = merged.into_iter().map(|req| req.bytes).collect();
-        assert_eq!(bytes, vec![vec![1], vec![2], vec![3]]);
-    }
-
-    #[test]
-    fn merge_pending_tx_requests_uses_shared_when_local_empty() {
-        let shared = VecDeque::from(vec![TxRequest {
-            bytes: vec![9],
-            expected_ports: None,
-            expected_addr_family: libc::AF_INET6 as u8,
-            expected_protocol: PROTO_UDP,
-            flow_key: None,
-            egress_ifindex: 0,
-            cos_queue_id: None,
-            dscp_rewrite: None,
-        }]);
-
-        let merged = merge_pending_tx_requests(VecDeque::new(), shared);
-        let bytes: Vec<Vec<u8>> = merged.into_iter().map(|req| req.bytes).collect();
-        assert_eq!(bytes, vec![vec![9]]);
-    }
-
-    #[test]
-    fn append_pending_queue_moves_shared_into_empty_pending() {
-        let mut pending = VecDeque::new();
-        let mut shared = VecDeque::from([1u8, 2, 3]);
-
-        append_pending_queue(&mut pending, &mut shared);
-
-        assert!(shared.is_empty());
-        assert_eq!(pending.into_iter().collect::<Vec<_>>(), vec![1, 2, 3]);
-    }
-
-    #[test]
     fn process_pending_queue_in_place_preserves_failed_item_order() {
         let mut pending = VecDeque::from([1u8, 2, 3, 4]);
 
@@ -5149,10 +5062,13 @@ mod tests {
             redirect_local_cos_request_to_owner_binding(&current_live, &cos_fast_interfaces, req);
 
         assert!(redirected.is_ok());
-        let queued = owner_live.take_pending_tx();
+        let mut queued = VecDeque::new();
+        owner_live.take_pending_tx_into(&mut queued);
         assert_eq!(queued.len(), 1);
         assert_eq!(queued.front().map(|req| req.egress_ifindex), Some(80));
-        assert!(current_live.take_pending_tx().is_empty());
+        let mut current_queued = VecDeque::new();
+        current_live.take_pending_tx_into(&mut current_queued);
+        assert!(current_queued.is_empty());
     }
 
     #[test]
@@ -5194,10 +5110,13 @@ mod tests {
             redirect_local_cos_request_to_owner_binding(&current_live, &cos_fast_interfaces, req);
 
         assert!(redirected.is_ok());
-        let queued = owner_live.take_pending_tx();
+        let mut queued = VecDeque::new();
+        owner_live.take_pending_tx_into(&mut queued);
         assert_eq!(queued.len(), 1);
         assert_eq!(queued.front().map(|req| req.egress_ifindex), Some(80));
-        assert!(current_live.take_pending_tx().is_empty());
+        let mut current_queued = VecDeque::new();
+        current_live.take_pending_tx_into(&mut current_queued);
+        assert!(current_queued.is_empty());
     }
 
     #[test]
@@ -5287,7 +5206,8 @@ mod tests {
 
         assert!(redirected.is_ok());
         assert!(commands.lock().unwrap().is_empty());
-        let queued = owner_live.take_pending_tx();
+        let mut queued = VecDeque::new();
+        owner_live.take_pending_tx_into(&mut queued);
         assert_eq!(queued.len(), 1);
         assert_eq!(queued.front().map(|req| req.egress_ifindex), Some(80));
         assert_eq!(queued.front().map(|req| req.cos_queue_id), Some(Some(4)));

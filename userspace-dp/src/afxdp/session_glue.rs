@@ -759,20 +759,16 @@ pub(super) fn cancel_queued_flow_on_binding(
     }
     binding.pending_tx_prepared = kept_prepared;
 
-    if let Ok(mut pending) = binding.live.pending_tx.lock() {
-        let mut kept_shared = VecDeque::with_capacity(pending.len());
-        while let Some(req) = pending.pop_front() {
-            if tx_request_matches_flow(&req, forward_key, reverse_key) {
-                continue;
-            }
-            kept_shared.push_back(req);
-        }
-        binding
-            .live
-            .pending_tx_len
-            .store(kept_shared.len() as u32, Ordering::Relaxed);
-        *pending = kept_shared;
-    }
+    // #706: the cross-worker redirect inbox (`binding.live.pending_tx`) is
+    // now a lock-free MPSC ring (`MpscInbox`). In-place filtering from an
+    // arbitrary thread is not safe on that structure — only the owner
+    // worker may drain it. We accept that packets already sitting in the
+    // redirect inbox for a now-canceled flow will drain out on the next
+    // owner poll and hit the wire; the peer already saw a RST, so the
+    // extra late packets are ignored (or provoke a benign RST-for-RST
+    // response) rather than causing protocol harm. The worker-owned
+    // `pending_tx_local` and `pending_tx_prepared` queues above are still
+    // filtered because they are never touched by another thread.
 
     update_binding_debug_state(binding);
 }
