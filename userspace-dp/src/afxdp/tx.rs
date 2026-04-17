@@ -2448,12 +2448,22 @@ const COS_GUARANTEE_QUANTUM_MAX_BYTES: u64 = 512 * 1024;
 /// Minimum per-flow admission share. Sized so TCP fast-retransmit can
 /// trigger reliably on a single-packet drop:
 /// - 3 dupacks to trigger fast-retransmit (Linux `tcp_reordering = 3`)
-/// - headroom for in-flight reordering up to ~13 MSS
-/// - 16 MSS total = 24 KB
+/// - headroom for in-flight reordering up to ~13 MTU-sized packets
+/// - 16 MTU-sized (1500 B) packets total = 24 KB
 /// Below this, a single drop produces < 3 dupacks before cwnd is drained,
 /// forcing an RTO with cwnd reset to 1 MSS and starting the oscillation
 /// observed in #704 / #707 at high flow counts on low-rate exact queues.
+/// 1500 matches the default MTU and is a conservative proxy for TCP
+/// payload size; actual MSS (1460 v4 / 1440 v6) is smaller, so 16 × 1500
+/// is a safe over-count of the "packets needed for fast-retransmit".
 const COS_FLOW_FAIR_MIN_SHARE_BYTES: u64 = 16 * 1500;
+
+// Compile-time pin so the floor cannot silently drift below the
+// fast-retransmit-safe threshold on a rebase/refactor. Parallels the
+// `const _: () = assert!` invariants in `types.rs`. Lives here (at the
+// constant) rather than in `tests/` so `cargo build` enforces it, not
+// just `cargo test`.
+const _: () = assert!(COS_FLOW_FAIR_MIN_SHARE_BYTES >= 16 * 1500);
 const COS_SURPLUS_ROUND_QUANTUM_BYTES: u64 = 1500;
 const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 
@@ -2735,15 +2745,19 @@ fn cos_queue_flow_share_limit(
         .clamp(COS_FLOW_FAIR_MIN_SHARE_BYTES, buffer_limit)
 }
 
-/// Effective buffer cap for the admission check. Grows with the observed
-/// distinct-flow count so the total admission threshold never drops
-/// below `active × COS_FLOW_FAIR_MIN_SHARE_BYTES` — without this, the
-/// per-flow clamp inside `cos_queue_flow_share_limit` can raise each
-/// flow's share to the fast-retransmit floor, but the aggregate
-/// `queue.queued_bytes > buffer_limit` check trips first and drops the
-/// packet anyway (the exact pathology driving #704 / #707 at 16 flows
-/// on the 1 Gbps exact queue: `buffer 125 KB / 16 flows = 7.8 KB` per
-/// share, well below the 16 MSS floor).
+/// Effective buffer cap for the admission check. Grows with the
+/// *prospective* distinct-flow count — same denominator that
+/// `cos_queue_flow_share_limit` uses — so the aggregate admission
+/// threshold never drops below `prospective_active ×
+/// COS_FLOW_FAIR_MIN_SHARE_BYTES`.
+///
+/// Why "prospective" and not current `active_flow_buckets`: the per-
+/// flow clamp already adds `+1` when the target bucket is empty, so it
+/// reserves headroom for a newly arriving flow. If the aggregate cap
+/// uses the *current* count it asymmetrically excludes that same new
+/// flow and the first packet of every new flow can get rejected right
+/// at the boundary even though the per-flow path was trying to admit
+/// it. Matching the two denominators removes that off-by-one window.
 ///
 /// Non-flow-fair queues (e.g. best-effort or pure rate-limited) bypass
 /// this scaling; their admission is buffer-bound by the operator's
@@ -2751,16 +2765,22 @@ fn cos_queue_flow_share_limit(
 ///
 /// This is a logical threshold only. The backing `VecDeque` storage is
 /// dynamic, so raising the cap costs nothing until traffic actually
-/// fills it; at peak 16-flow steady state the extra committed memory is
-/// `16 × 24 KB − 125 KB ≈ 259 KB` per exact queue.
+/// fills it. The cap is currently uncapped on the high side: at
+/// `COS_FLOW_FAIR_BUCKETS = 1024` active flows it can reach `~24 MB`,
+/// which on a 1 Gbps queue is `~190 ms` of queue residence time — an
+/// operator-visible latency envelope concern flagged in the #716
+/// review. A derived max-queue-delay clamp belongs in a follow-up
+/// change alongside the queueing-budget policy discussion.
 #[inline]
-fn cos_flow_aware_buffer_limit(queue: &CoSQueueRuntime) -> u64 {
+fn cos_flow_aware_buffer_limit(queue: &CoSQueueRuntime, flow_bucket: usize) -> u64 {
     let base = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
     if !queue.flow_fair {
         return base;
     }
-    let active = u64::from(queue.active_flow_buckets).max(1);
-    base.max(active.saturating_mul(COS_FLOW_FAIR_MIN_SHARE_BYTES))
+    let prospective_active = u64::from(queue.active_flow_buckets)
+        .saturating_add(u64::from(queue.flow_bucket_bytes[flow_bucket] == 0))
+        .max(1);
+    base.max(prospective_active.saturating_mul(COS_FLOW_FAIR_MIN_SHARE_BYTES))
 }
 
 #[inline]
@@ -3741,12 +3761,20 @@ fn enqueue_cos_item(
         }
         let root_was_empty = root.nonempty_queues == 0;
         let queue = &mut root.queues[queue_idx];
-        // #707: `buffer_limit` scales with active flow count so the per-
-        // flow fast-retransmit floor (`COS_FLOW_FAIR_MIN_SHARE_BYTES`)
-        // can actually be satisfied without tripping the aggregate cap.
-        let buffer_limit = cos_flow_aware_buffer_limit(queue);
+        // #707: aggregate cap scales with prospective-active flow count
+        // so the per-flow fast-retransmit floor can be satisfied, and
+        // the aggregate gate uses the same denominator as the per-flow
+        // clamp — otherwise the first packet of a new flow can get
+        // stuck at the boundary even when the per-flow path is trying
+        // to admit it. Compute `flow_bucket` once so both gates key off
+        // the same queue state snapshot.
+        let flow_bucket = if queue.flow_fair {
+            cos_flow_bucket_index(queue.flow_hash_seed, cos_item_flow_key(&item))
+        } else {
+            0
+        };
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, flow_bucket);
         let flow_share_exceeded = if queue.flow_fair {
-            let flow_bucket = cos_flow_bucket_index(queue.flow_hash_seed, cos_item_flow_key(&item));
             queue.flow_bucket_bytes[flow_bucket].saturating_add(item_len)
                 > cos_queue_flow_share_limit(queue, buffer_limit, flow_bucket)
         } else {
@@ -8011,13 +8039,16 @@ mod tests {
     }
 
     #[test]
-    fn cos_flow_aware_buffer_limit_scales_with_active_flow_buckets() {
-        // #707: at the 1 Gbps/16-flow workload a fixed 125 KB buffer
-        // divided across 16 flows gives each flow a 7.8 KB share,
-        // below the TCP fast-retransmit floor of 16 MSS = 24 KB. The
-        // flow-aware buffer limit grows the aggregate cap so the per-
-        // flow floor can be honoured without the buffer-cap tripping
-        // first.
+    fn cos_flow_aware_buffer_limit_scales_with_prospective_active_flow_count() {
+        // #707 + #716 review: at the 1 Gbps/16-flow workload a fixed
+        // 125 KB buffer divided across 16 flows gives each flow a 7.8
+        // KB share, below the TCP fast-retransmit floor of 16 MSS =
+        // 24 KB. The flow-aware buffer limit grows the aggregate cap
+        // so the per-flow floor can be honoured. "Prospective" count
+        // means the same denominator the per-flow clamp uses: current
+        // `active_flow_buckets + (target bucket empty ? 1 : 0)`, so
+        // the two gates never disagree about whether a new flow's
+        // first packet has room.
         let mut root = test_cos_runtime_with_queues(
             25_000_000_000 / 8,
             vec![CoSQueueConfig {
@@ -8034,26 +8065,85 @@ mod tests {
         let queue = &mut root.queues[0];
         queue.flow_fair = true;
 
-        // Base floor wins when the flow count × min share is small.
+        // Base floor wins when prospective flow count × min share is
+        // small. `flow_bucket = 0` is empty → prospective_active += 1.
         queue.active_flow_buckets = 0;
         assert_eq!(
-            cos_flow_aware_buffer_limit(queue),
+            cos_flow_aware_buffer_limit(queue, 0),
             queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
-            "zero active flows must collapse to the operator-configured base cap"
+            "zero active (+1 prospective) flows must stay at the operator-configured base"
         );
         queue.active_flow_buckets = 2;
         assert_eq!(
-            cos_flow_aware_buffer_limit(queue),
+            cos_flow_aware_buffer_limit(queue, 0),
             queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
-            "2 × 24 KB = 48 KB stays below the 125 KB configured base, so base wins"
+            "3 prospective × 24 KB = 72 KB stays below the 125 KB configured base, so base wins"
         );
 
-        // Flow-aware floor wins past the break-even point.
+        // Flow-aware floor wins past the break-even point. Now mark 16
+        // buckets populated so prospective = 16 (target bucket already
+        // non-empty).
         queue.active_flow_buckets = 16;
+        for bucket in 0..16 {
+            queue.flow_bucket_bytes[bucket] = 1_000;
+        }
         assert_eq!(
-            cos_flow_aware_buffer_limit(queue),
+            cos_flow_aware_buffer_limit(queue, 0),
             16 * COS_FLOW_FAIR_MIN_SHARE_BYTES,
             "16 × 24 KB = 384 KB exceeds the 125 KB base and becomes the cap"
+        );
+    }
+
+    #[test]
+    fn cos_flow_aware_buffer_limit_matches_share_limit_at_new_flow_boundary() {
+        // #716 review: the aggregate cap and the per-flow clamp must
+        // use the SAME denominator. Before the review fix the
+        // aggregate cap used the current `active_flow_buckets` while
+        // the per-flow clamp used `active + (target bucket empty ? 1 :
+        // 0)`, so the first packet of a newly arriving flow could
+        // pass the per-flow gate and fail the aggregate one right at
+        // the boundary. This test pins the fix by driving exactly that
+        // case.
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 125 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+
+        // 15 active flows, target bucket empty → prospective = 16.
+        // Both caps must key off 16, not 15.
+        queue.active_flow_buckets = 15;
+        for bucket in 0..15 {
+            queue.flow_bucket_bytes[bucket] = 1_000;
+        }
+        let new_flow_bucket = 100;
+        assert_eq!(queue.flow_bucket_bytes[new_flow_bucket], 0);
+
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, new_flow_bucket);
+        let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, new_flow_bucket);
+
+        // 16 × 24 KB = 384 KB aggregate; 384 KB / 16 = 24 KB per-flow.
+        assert_eq!(buffer_limit, 16 * COS_FLOW_FAIR_MIN_SHARE_BYTES);
+        assert_eq!(share_cap, COS_FLOW_FAIR_MIN_SHARE_BYTES);
+        // A single MTU-sized packet for the new flow must fit under
+        // BOTH caps simultaneously — this is the regression guard.
+        assert!(
+            queue.flow_bucket_bytes[new_flow_bucket].saturating_add(1500) <= share_cap,
+            "per-flow share must admit the new flow's first packet"
+        );
+        assert!(
+            queue.queued_bytes.saturating_add(1500) <= buffer_limit,
+            "aggregate cap must also admit the new flow's first packet at the boundary"
         );
     }
 
@@ -8079,8 +8169,9 @@ mod tests {
         queue.flow_fair = false;
         queue.active_flow_buckets = 64; // should be ignored
 
+        // `flow_bucket` argument is irrelevant when flow_fair=false; use 0.
         assert_eq!(
-            cos_flow_aware_buffer_limit(queue),
+            cos_flow_aware_buffer_limit(queue, 0),
             queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
             "flow_fair=false must bypass the flow-count multiplier"
         );
@@ -8091,7 +8182,7 @@ mod tests {
         // At 16 flows with a 125 KB buffer, the naive arithmetic share
         // is 7.8 KB — a single packet drop yields < 3 dupacks, forcing
         // RTO. The clamp to `COS_FLOW_FAIR_MIN_SHARE_BYTES` must hold
-        // the per-flow cap at 16 MSS = 24 KB no matter the denominator.
+        // the per-flow cap at 24 KB no matter the denominator.
         let mut root = test_cos_runtime_with_queues(
             25_000_000_000 / 8,
             vec![CoSQueueConfig {
@@ -8114,7 +8205,7 @@ mod tests {
             queue.flow_bucket_bytes[bucket] = 1_000;
         }
 
-        let buffer_limit = cos_flow_aware_buffer_limit(queue);
+        let buffer_limit = cos_flow_aware_buffer_limit(queue, 0);
         assert_eq!(
             buffer_limit,
             16 * COS_FLOW_FAIR_MIN_SHARE_BYTES,
@@ -8124,21 +8215,12 @@ mod tests {
         let share = cos_queue_flow_share_limit(queue, buffer_limit, 0);
         assert!(
             share >= COS_FLOW_FAIR_MIN_SHARE_BYTES,
-            "per-flow cap ({share}) must stay ≥ {COS_FLOW_FAIR_MIN_SHARE_BYTES} (16 MSS)"
+            "per-flow cap ({share}) must stay ≥ {COS_FLOW_FAIR_MIN_SHARE_BYTES} (16 MTU-sized packets)"
         );
         assert_eq!(
             share, COS_FLOW_FAIR_MIN_SHARE_BYTES,
             "with buffer_limit == active × min-share, per-flow cap equals the floor"
         );
-    }
-
-    #[test]
-    fn cos_flow_fair_min_share_is_sized_for_tcp_fast_retransmit() {
-        // Compile-time pin: the floor must stay at or above 16 MSS so
-        // TCP fast-retransmit has headroom for 3 dupacks plus reorder.
-        // Lowering this is a behaviour change that warrants explicit
-        // review; the const should not drift silently.
-        const _: () = assert!(COS_FLOW_FAIR_MIN_SHARE_BYTES >= 16 * 1500);
     }
 
     #[test]
