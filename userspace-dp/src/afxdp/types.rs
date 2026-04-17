@@ -586,7 +586,173 @@ impl WorkerBindingLookup {
 }
 
 pub(super) const COS_FAST_QUEUE_INDEX_MISS: u16 = u16::MAX;
-pub(super) const COS_FLOW_FAIR_BUCKETS: usize = 64;
+/// Number of SFQ flow buckets per flow-fair CoS queue.
+///
+/// Sized to keep birthday-paradox collision probability well below 15%
+/// at the production-regime flow count (N ≤ 64 concurrent flows per
+/// queue). At 16 flows the collision rate is ~11% (was ~88% at the
+/// prior 64-bucket sizing); at 32 flows ~38%; at 64 flows ~87%.
+/// Collisions cost fairness — two flows in the same bucket share one
+/// SFQ dequeue slot and one admission-cap slice (#705) — so making
+/// them rare is directly fairness-load-bearing. See #711.
+///
+/// Per-queue memory overhead:
+///   `flow_bucket_bytes: [u64; N]`    =  8 KB
+///   `flow_bucket_items: [VecDeque; N]` = 24 KB inline headers
+///   `flow_rr_buckets: FlowRrRing` (`[u16; N] + head + len`) = 2 KB
+/// = ~34 KB per flow-fair queue. Non-flow-fair queues pay the same
+/// inline footprint but never touch the storage; it stays cold. At
+/// 4 workers × 8 queues × 1 iface = ~1 MB, well within tolerance.
+pub(super) const COS_FLOW_FAIR_BUCKETS: usize = 1024;
+
+// Compile-time invariants for COS_FLOW_FAIR_BUCKETS — the #711 design
+// depends on both and a future refactor that changes the constant
+// without checking these must fail at build time, not at runtime:
+//
+// 1. Power of two — `cos_flow_bucket_index` masks with
+//    `COS_FLOW_FAIR_BUCKETS - 1` instead of modulo, and `FlowRrRing`
+//    uses mask-based wrap math on the hot push/pop path. Without
+//    power-of-two sizing that math silently indexes off the end.
+// 2. Fits in `u16` — `FlowRrRing` stores bucket IDs as `u16`. A
+//    larger constant would silently truncate.
+const _: () = assert!(COS_FLOW_FAIR_BUCKETS.is_power_of_two());
+const _: () = assert!(COS_FLOW_FAIR_BUCKETS <= u16::MAX as usize);
+
+/// Pre-computed mask for `COS_FLOW_FAIR_BUCKETS`-modulo on the hot
+/// path. Using a mask (rather than `%`) gives deterministic codegen
+/// independent of the optimizer proving the power-of-two property at
+/// each call site.
+pub(super) const COS_FLOW_FAIR_BUCKET_MASK: usize = COS_FLOW_FAIR_BUCKETS - 1;
+
+/// #694: Fixed-capacity ring buffer holding the set of currently-active
+/// flow bucket IDs, driving SFQ round-robin dequeue.
+///
+/// Storage is exactly `COS_FLOW_FAIR_BUCKETS` u16 slots — no heap
+/// allocation. Replaces a prior `VecDeque<u8>` which paid allocator
+/// cost per queue and capped bucket IDs at 256 (incompatible with the
+/// #711 bucket-count grow). The ring is accessed exclusively through
+/// the associated methods, which are all O(1).
+///
+/// Invariant: the ring contains no duplicate bucket IDs. The callers
+/// in `cos_queue_push_*` / `cos_queue_pop_front` already gate on
+/// "bucket transitioned empty → non-empty" before pushing and on
+/// "bucket still non-empty" before re-enqueueing the RR cursor, so the
+/// ring itself does not revalidate on the hot path.
+#[derive(Debug)]
+pub(super) struct FlowRrRing {
+    buf: [u16; COS_FLOW_FAIR_BUCKETS],
+    head: u16,
+    len: u16,
+}
+
+impl Default for FlowRrRing {
+    fn default() -> Self {
+        Self {
+            buf: [0; COS_FLOW_FAIR_BUCKETS],
+            head: 0,
+            len: 0,
+        }
+    }
+}
+
+impl FlowRrRing {
+    #[inline]
+    pub(super) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub(super) fn len(&self) -> usize {
+        usize::from(self.len)
+    }
+
+    #[inline]
+    pub(super) fn front(&self) -> Option<u16> {
+        if self.len == 0 {
+            None
+        } else {
+            Some(self.buf[usize::from(self.head)])
+        }
+    }
+
+    /// Iterate active bucket IDs in service order (head first).
+    pub(super) fn iter(&self) -> FlowRrRingIter<'_> {
+        FlowRrRingIter {
+            ring: self,
+            offset: 0,
+        }
+    }
+
+    // Hot-path invariant: the caller in `cos_queue_push_*` gates every
+    // push on "bucket transitioned empty → non-empty", so a bucket ID
+    // is in the ring at most once. The ring therefore never holds more
+    // than `COS_FLOW_FAIR_BUCKETS` entries, and `len < CAP` is a
+    // structural invariant — not a runtime bound we need to defend
+    // against. `debug_assert!` enforces it in tests; release uses a
+    // plain `+= 1` rather than `saturating_add` because a silent
+    // saturation on a violated invariant would hide a real bug (the
+    // push would succeed at the wrapped-buffer index and the ring
+    // would lose either the new entry or an older one, depending on
+    // head placement — very hard to triage).
+    #[inline]
+    pub(super) fn push_back(&mut self, bucket: u16) {
+        debug_assert!(
+            usize::from(self.len) < COS_FLOW_FAIR_BUCKETS,
+            "FlowRrRing overflow: len={} cap={}",
+            self.len,
+            COS_FLOW_FAIR_BUCKETS
+        );
+        let tail = (usize::from(self.head) + usize::from(self.len)) & COS_FLOW_FAIR_BUCKET_MASK;
+        self.buf[tail] = bucket;
+        self.len += 1;
+    }
+
+    #[inline]
+    pub(super) fn push_front(&mut self, bucket: u16) {
+        debug_assert!(
+            usize::from(self.len) < COS_FLOW_FAIR_BUCKETS,
+            "FlowRrRing overflow: len={} cap={}",
+            self.len,
+            COS_FLOW_FAIR_BUCKETS
+        );
+        // head := (head + CAP - 1) mod CAP, with CAP a power of two
+        // so this is a mask-only op. Avoids the `if head == 0` branch
+        // on the hot path.
+        self.head = ((usize::from(self.head) + COS_FLOW_FAIR_BUCKETS - 1)
+            & COS_FLOW_FAIR_BUCKET_MASK) as u16;
+        self.buf[usize::from(self.head)] = bucket;
+        self.len += 1;
+    }
+
+    #[inline]
+    pub(super) fn pop_front(&mut self) -> Option<u16> {
+        if self.len == 0 {
+            return None;
+        }
+        let bucket = self.buf[usize::from(self.head)];
+        self.head = ((usize::from(self.head) + 1) & COS_FLOW_FAIR_BUCKET_MASK) as u16;
+        self.len -= 1;
+        Some(bucket)
+    }
+}
+
+pub(super) struct FlowRrRingIter<'a> {
+    ring: &'a FlowRrRing,
+    offset: usize,
+}
+
+impl<'a> Iterator for FlowRrRingIter<'a> {
+    type Item = u16;
+    #[inline]
+    fn next(&mut self) -> Option<u16> {
+        if self.offset >= usize::from(self.ring.len) {
+            return None;
+        }
+        let idx = (usize::from(self.ring.head) + self.offset) & COS_FLOW_FAIR_BUCKET_MASK;
+        self.offset += 1;
+        Some(self.ring.buf[idx])
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct WorkerCoSQueueFastPath {
@@ -815,7 +981,7 @@ pub(super) struct CoSQueueRuntime {
     pub(super) queued_bytes: u64,
     pub(super) active_flow_buckets: u16,
     pub(super) flow_bucket_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
-    pub(super) flow_rr_buckets: VecDeque<u8>,
+    pub(super) flow_rr_buckets: FlowRrRing,
     pub(super) flow_bucket_items: [VecDeque<CoSPendingTxItem>; COS_FLOW_FAIR_BUCKETS],
     pub(super) runnable: bool,
     pub(super) parked: bool,
@@ -1180,6 +1346,157 @@ impl SharedCoSRootLease {
 mod tests {
     use super::*;
     use std::mem::align_of;
+
+    // #694 / #711: `FlowRrRing` invariant pins.
+    //
+    // The ring is the SFQ round-robin cursor storage. Every bug class
+    // that can break it is pinned here so a future refactor that
+    // changes the indexing math, the wrap condition, or the head/len
+    // update order fails loudly in CI instead of during live
+    // validation.
+
+    #[test]
+    fn flow_rr_ring_push_pop_round_robin_order() {
+        let mut ring = FlowRrRing::default();
+        assert!(ring.is_empty());
+        assert_eq!(ring.len(), 0);
+        assert_eq!(ring.front(), None);
+
+        ring.push_back(7);
+        ring.push_back(11);
+        ring.push_back(13);
+        assert_eq!(ring.len(), 3);
+        assert_eq!(ring.front(), Some(7));
+
+        // FIFO dequeue preserves push order.
+        assert_eq!(ring.pop_front(), Some(7));
+        assert_eq!(ring.pop_front(), Some(11));
+        assert_eq!(ring.pop_front(), Some(13));
+        assert_eq!(ring.pop_front(), None);
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn flow_rr_ring_push_front_places_at_head() {
+        let mut ring = FlowRrRing::default();
+        ring.push_back(5);
+        ring.push_back(9);
+        ring.push_front(3); // restore at head
+        assert_eq!(ring.len(), 3);
+        assert_eq!(ring.pop_front(), Some(3));
+        assert_eq!(ring.pop_front(), Some(5));
+        assert_eq!(ring.pop_front(), Some(9));
+    }
+
+    #[test]
+    fn flow_rr_ring_wraps_around_buffer_end_correctly() {
+        // Drive the head past the backing-array end and back around.
+        // A naive implementation that uses `head + len` without mod
+        // breaks exactly here.
+        let mut ring = FlowRrRing::default();
+        // Fill to 3/4 of capacity, drain half, then fill by another
+        // half-capacity worth — the tail write crosses the backing-
+        // array end and wraps. Total in-flight stays within capacity.
+        let first = COS_FLOW_FAIR_BUCKETS * 3 / 4;
+        let second = COS_FLOW_FAIR_BUCKETS / 2;
+        for i in 0..first {
+            ring.push_back(i as u16);
+        }
+        for _ in 0..(first / 2) {
+            ring.pop_front();
+        }
+        for i in 0..second {
+            ring.push_back((i + 10_000) as u16);
+        }
+        let mut drained = Vec::with_capacity(ring.len());
+        while let Some(b) = ring.pop_front() {
+            drained.push(b);
+        }
+        let mut expected: Vec<u16> = ((first / 2)..first).map(|i| i as u16).collect();
+        expected.extend((0..second).map(|i| (i + 10_000) as u16));
+        assert_eq!(drained, expected);
+    }
+
+    #[test]
+    fn flow_rr_ring_iter_yields_same_order_as_pop() {
+        let mut ring = FlowRrRing::default();
+        for v in [17u16, 3, 11, 29, 7] {
+            ring.push_back(v);
+        }
+        let iter_snapshot: Vec<u16> = ring.iter().collect();
+        let mut pop_snapshot = Vec::new();
+        while let Some(b) = ring.pop_front() {
+            pop_snapshot.push(b);
+        }
+        assert_eq!(iter_snapshot, pop_snapshot);
+    }
+
+    #[test]
+    fn flow_rr_ring_accepts_full_cap_minus_one_without_wraparound_bug() {
+        // Exactly-at-capacity-minus-one fills: common off-by-one site
+        // for ring buffers where the "full" condition is tested.
+        let mut ring = FlowRrRing::default();
+        let cap = COS_FLOW_FAIR_BUCKETS as u16;
+        for i in 0..(cap - 1) {
+            ring.push_back(i);
+        }
+        assert_eq!(ring.len(), usize::from(cap - 1));
+        // Drain and re-fill to force internal head advancement past
+        // 3/4 of the buffer.
+        for _ in 0..((cap - 1) / 2) {
+            ring.pop_front();
+        }
+        // Push enough to wrap past the buffer end.
+        for i in 0..((cap - 1) / 2) {
+            ring.push_back(i + 10_000);
+        }
+        // Drain and assert no duplicate IDs and no spurious values.
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(b) = ring.pop_front() {
+            assert!(seen.insert(b), "ring produced duplicate bucket id: {b}");
+        }
+        assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn flow_rr_ring_holds_full_bucket_count_without_panic() {
+        // The ring's own capacity is `COS_FLOW_FAIR_BUCKETS`. The
+        // caller guards against duplicate pushes, so in practice the
+        // ring holds at most `COS_FLOW_FAIR_BUCKETS` entries. Verify
+        // that exactly-at-capacity is well-defined (no push_back
+        // panic in release, no wrong head index) and that the ring
+        // empties correctly.
+        let mut ring = FlowRrRing::default();
+        for i in 0..COS_FLOW_FAIR_BUCKETS {
+            ring.push_back(i as u16);
+        }
+        assert_eq!(ring.len(), COS_FLOW_FAIR_BUCKETS);
+        // Front is 0, tail write would wrap — but we're not over-
+        // filling, so this is the well-defined "exactly at capacity"
+        // case.
+        assert_eq!(ring.front(), Some(0));
+        // Drain and verify every ID came back exactly once.
+        let mut count = 0usize;
+        while let Some(b) = ring.pop_front() {
+            assert_eq!(b, count as u16);
+            count += 1;
+        }
+        assert_eq!(count, COS_FLOW_FAIR_BUCKETS);
+    }
+
+    #[test]
+    fn flow_rr_ring_memory_footprint_fits_expected_budget() {
+        // Sanity pin: `FlowRrRing` should be ~2 KB at the chosen
+        // bucket count (1024 u16 entries + two u16 indices +
+        // padding). A future refactor that accidentally widens the
+        // entry type to u32 would double this without a loud signal;
+        // this bound catches it.
+        let size = std::mem::size_of::<FlowRrRing>();
+        assert!(
+            size <= 2 * 1024 + 64,
+            "FlowRrRing unexpectedly large: {size} bytes"
+        );
+    }
 
     fn shared_cos_lease_snapshot(lease: &SharedCoSRootLease) -> (u64, u64, u64) {
         let (available_tokens, outstanding_leased_tokens) =

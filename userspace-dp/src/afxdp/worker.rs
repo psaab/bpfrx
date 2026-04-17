@@ -1841,7 +1841,7 @@ mod tests {
                     queued_bytes,
                     active_flow_buckets: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-                    flow_rr_buckets: VecDeque::new(),
+                    flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                     runnable,
                     parked,
