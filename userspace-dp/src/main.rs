@@ -150,6 +150,7 @@ fn run() -> Result<(), String> {
             neighbor_generation: 0,
             route_entries: 0,
             worker_heartbeats: Vec::new(),
+            cos_no_owner_binding_drops_total: 0,
             ha_groups: Vec::new(),
             fabrics: Vec::new(),
             queues: Vec::new(),
@@ -757,6 +758,10 @@ fn refresh_status(state: &mut ServerState) {
     let (neighbor_entries, neighbor_generation) = state.afxdp.dynamic_neighbor_status();
     state.status.neighbor_entries = neighbor_entries;
     state.status.neighbor_generation = neighbor_generation;
+    // #710: cluster-wide aggregate of cross-worker CoS no-owner-binding
+    // drops. The per-binding increment site is mechanical; this is the
+    // only operator-facing surface for the counter.
+    state.status.cos_no_owner_binding_drops_total = state.afxdp.cos_no_owner_binding_drops_total();
     state.status.route_entries = state.snapshot.as_ref().map(|s| s.routes.len()).unwrap_or(0);
     state.status.fabrics = state
         .snapshot

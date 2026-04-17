@@ -1425,6 +1425,13 @@ fn apply_worker_shaped_tx_requests(
         let Some(binding) = binding_index.and_then(|idx| bindings.get_mut(idx)) else {
             if let Some(binding) = bindings.first_mut() {
                 binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+                // #710: dedicated counter — a cross-worker shaped TX
+                // request arrived for an egress this worker has no
+                // binding to drain. Subset of tx_errors.
+                binding
+                    .live
+                    .no_owner_binding_drops
+                    .fetch_add(1, Ordering::Relaxed);
             }
             if cfg!(feature = "debug-log") {
                 debug_log!(
@@ -1711,6 +1718,26 @@ where
                 status.surplus_deficit_bytes = status
                     .surplus_deficit_bytes
                     .saturating_add(queue.surplus_deficit);
+                // #710: aggregate drop-reason counters across worker
+                // instances for this queue. Each worker's per-queue
+                // runtime is single-writer (only the owner worker
+                // increments the counter for its own queue), so
+                // summing across workers gives the cluster-wide totals.
+                status.admission_flow_share_drops = status
+                    .admission_flow_share_drops
+                    .saturating_add(queue.drop_counters.admission_flow_share_drops);
+                status.admission_buffer_drops = status
+                    .admission_buffer_drops
+                    .saturating_add(queue.drop_counters.admission_buffer_drops);
+                status.root_token_starvation_parks = status
+                    .root_token_starvation_parks
+                    .saturating_add(queue.drop_counters.root_token_starvation_parks);
+                status.queue_token_starvation_parks = status
+                    .queue_token_starvation_parks
+                    .saturating_add(queue.drop_counters.queue_token_starvation_parks);
+                status.tx_ring_full_submit_stalls = status
+                    .tx_ring_full_submit_stalls
+                    .saturating_add(queue.drop_counters.tx_ring_full_submit_stalls);
             }
         }
     }
@@ -1786,55 +1813,76 @@ mod tests {
             },
         );
 
-        let make_root = |queued_bytes, runnable, parked, wake_tick| CoSInterfaceRuntime {
-            shaping_rate_bytes: 1_875_000,
-            burst_bytes: 64 * 1024,
-            tokens: 0,
-            default_queue: 0,
-            nonempty_queues: 1,
-            runnable_queues: usize::from(runnable),
-            exact_guarantee_rr: 0,
-            nonexact_guarantee_rr: 0,
-            #[cfg(test)]
-            legacy_guarantee_rr: 0,
-            queues: vec![CoSQueueRuntime {
-                queue_id: 4,
-                priority: 1,
-                transmit_rate_bytes: 1_250_000,
-                exact: false,
-                flow_fair: false,
-                flow_hash_seed: 0,
-                surplus_weight: 1,
-                surplus_deficit: 512,
-                buffer_bytes: 32 * 1024,
-                dscp_rewrite: None,
+        let make_root =
+            |queued_bytes, runnable, parked, wake_tick, drop_counters| CoSInterfaceRuntime {
+                shaping_rate_bytes: 1_875_000,
+                burst_bytes: 64 * 1024,
                 tokens: 0,
-                last_refill_ns: 0,
-                queued_bytes,
-                active_flow_buckets: 0,
-                flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-                flow_rr_buckets: VecDeque::new(),
-                flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
-                runnable,
-                parked,
-                next_wakeup_tick: wake_tick,
-                wheel_level: 0,
-                wheel_slot: 0,
-                items: VecDeque::from([CoSPendingTxItem::Local(test_tx_request(80))]),
-            }],
-            queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
-            rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
-            timer_wheel: CoSTimerWheelRuntime {
-                current_tick: 0,
-                level0: std::array::from_fn(|idx| if idx == 3 { vec![0] } else { Vec::new() }),
-                level1: std::array::from_fn(|idx| if idx == 1 { vec![0] } else { Vec::new() }),
-            },
+                default_queue: 0,
+                nonempty_queues: 1,
+                runnable_queues: usize::from(runnable),
+                exact_guarantee_rr: 0,
+                nonexact_guarantee_rr: 0,
+                #[cfg(test)]
+                legacy_guarantee_rr: 0,
+                queues: vec![CoSQueueRuntime {
+                    queue_id: 4,
+                    priority: 1,
+                    transmit_rate_bytes: 1_250_000,
+                    exact: false,
+                    flow_fair: false,
+                    flow_hash_seed: 0,
+                    surplus_weight: 1,
+                    surplus_deficit: 512,
+                    buffer_bytes: 32 * 1024,
+                    dscp_rewrite: None,
+                    tokens: 0,
+                    last_refill_ns: 0,
+                    queued_bytes,
+                    active_flow_buckets: 0,
+                    flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_rr_buckets: VecDeque::new(),
+                    flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+                    runnable,
+                    parked,
+                    next_wakeup_tick: wake_tick,
+                    wheel_level: 0,
+                    wheel_slot: 0,
+                    items: VecDeque::from([CoSPendingTxItem::Local(test_tx_request(80))]),
+                    drop_counters,
+                }],
+                queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
+                rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
+                timer_wheel: CoSTimerWheelRuntime {
+                    current_tick: 0,
+                    level0: std::array::from_fn(|idx| if idx == 3 { vec![0] } else { Vec::new() }),
+                    level1: std::array::from_fn(|idx| if idx == 1 { vec![0] } else { Vec::new() }),
+                },
+            };
+
+        // #710 regression pin: worker-level aggregation must sum every
+        // drop-reason counter across runtime instances. Use distinct
+        // non-zero values per runtime and assert the sum, not a bool,
+        // so a silent re-attribution between counters is caught.
+        let counters_a = CoSQueueDropCounters {
+            admission_flow_share_drops: 3,
+            admission_buffer_drops: 1,
+            root_token_starvation_parks: 5,
+            queue_token_starvation_parks: 7,
+            tx_ring_full_submit_stalls: 11,
+        };
+        let counters_b = CoSQueueDropCounters {
+            admission_flow_share_drops: 13,
+            admission_buffer_drops: 17,
+            root_token_starvation_parks: 19,
+            queue_token_starvation_parks: 23,
+            tx_ring_full_submit_stalls: 29,
         };
 
         let mut first = FastMap::default();
-        first.insert(80, make_root(1024, true, false, 0));
+        first.insert(80, make_root(1024, true, false, 0, counters_a));
         let mut second = FastMap::default();
-        second.insert(80, make_root(2048, false, true, 77));
+        second.insert(80, make_root(2048, false, true, 77, counters_b));
 
         let statuses = build_worker_cos_statuses_from_maps([&first, &second], &forwarding);
         assert_eq!(statuses.len(), 1);
@@ -1855,6 +1903,13 @@ mod tests {
         assert_eq!(queue.parked_instances, 1);
         assert_eq!(queue.next_wakeup_tick, 77);
         assert_eq!(queue.surplus_deficit_bytes, 1024);
+        // Drop-reason aggregation across workers — this is the layer
+        // that the live bug in #710 review occurred in.
+        assert_eq!(queue.admission_flow_share_drops, 3 + 13);
+        assert_eq!(queue.admission_buffer_drops, 1 + 17);
+        assert_eq!(queue.root_token_starvation_parks, 5 + 19);
+        assert_eq!(queue.queue_token_starvation_parks, 7 + 23);
+        assert_eq!(queue.tx_ring_full_submit_stalls, 11 + 29);
     }
 
     #[test]
@@ -2667,6 +2722,16 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) tx_bytes: u64,
     pub(crate) tx_completions: u64,
     pub(crate) tx_errors: u64,
+    pub(crate) redirect_inbox_overflow_drops: u64,
+    pub(crate) pending_tx_local_overflow_drops: u64,
+    pub(crate) tx_submit_error_drops: u64,
+    // #710: `no_owner_binding_drops` is intentionally NOT snapshotted
+    // per-binding. The atomic on `BindingLiveState` accumulates drops
+    // for mechanical accounting (the increment site can only write to
+    // `bindings.first_mut()`), but the operator-facing aggregate lives
+    // at `ProcessStatus::cos_no_owner_binding_drops_total`, summed
+    // across every live state by
+    // `Coordinator::cos_no_owner_binding_drops_total()`.
     pub(crate) direct_tx_packets: u64,
     pub(crate) copy_tx_packets: u64,
     pub(crate) in_place_tx_packets: u64,

@@ -212,7 +212,7 @@ impl Drop for MmapArea {
 
 #[cfg(test)]
 mod tests {
-    use super::MmapArea;
+    use super::*;
 
     #[test]
     fn mmap_area_rejects_access_beyond_registered_len_even_if_mapping_is_rounded() {
@@ -221,6 +221,113 @@ mod tests {
         assert!(area.slice(0, 128).is_some());
         assert!(area.slice(128, 1).is_none());
         assert!(area.slice(512, 1).is_none());
+    }
+
+    fn test_tx_request_for_inbox(payload: u8) -> TxRequest {
+        TxRequest {
+            bytes: vec![payload; 16],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: 6,
+            flow_key: None,
+            egress_ifindex: 0,
+            cos_queue_id: None,
+            dscp_rewrite: None,
+        }
+    }
+
+    #[test]
+    fn enqueue_tx_owned_increments_redirect_inbox_overflow_counter_on_eviction() {
+        // #710: pin that a redirect-inbox overflow in `enqueue_tx_owned`
+        // increments the dedicated `redirect_inbox_overflow_drops`
+        // counter (not just the generic `tx_errors`). A regression that
+        // moves the drop to a different code path without incrementing
+        // this counter fails here.
+        let live = BindingLiveState::new();
+        live.max_pending_tx.store(2, Ordering::Relaxed);
+
+        // Fill to cap — no eviction yet.
+        live.enqueue_tx_owned(test_tx_request_for_inbox(1))
+            .expect("push 1");
+        live.enqueue_tx_owned(test_tx_request_for_inbox(2))
+            .expect("push 2");
+        assert_eq!(
+            live.redirect_inbox_overflow_drops.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(live.tx_errors.load(Ordering::Relaxed), 0);
+
+        // Third push exceeds cap — eldest evicted, counter advances.
+        live.enqueue_tx_owned(test_tx_request_for_inbox(3))
+            .expect("push 3 evicts");
+        assert_eq!(
+            live.redirect_inbox_overflow_drops.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            live.tx_errors.load(Ordering::Relaxed),
+            1,
+            "generic tx_errors stays in lockstep with the dedicated drop \
+             counter on this path — the dedicated counter is a subset view"
+        );
+
+        // Fourth push, another eviction — both counters advance.
+        live.enqueue_tx_owned(test_tx_request_for_inbox(4))
+            .expect("push 4 evicts");
+        assert_eq!(
+            live.redirect_inbox_overflow_drops.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(live.tx_errors.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn enqueue_tx_owned_below_cap_does_not_touch_overflow_counter() {
+        let live = BindingLiveState::new();
+        live.max_pending_tx.store(8, Ordering::Relaxed);
+
+        for payload in 0..4 {
+            live.enqueue_tx_owned(test_tx_request_for_inbox(payload))
+                .expect("push below cap");
+        }
+        assert_eq!(
+            live.redirect_inbox_overflow_drops.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(live.tx_errors.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn binding_live_snapshot_propagates_710_drop_counters() {
+        // #710: `refresh_bindings` in the coordinator copies
+        // `snap.redirect_inbox_overflow_drops`, `pending_tx_local_overflow_drops`,
+        // and `tx_submit_error_drops` onto the per-binding `BindingStatus`.
+        // This test pins the contract that BindingLiveState::snapshot() actually
+        // reads those atomics and writes them into the BindingLiveSnapshot
+        // struct — the middle layer between the counter increments and
+        // the operator-facing BindingStatus. `no_owner_binding_drops` is
+        // intentionally NOT in the snapshot (see the rustdoc on
+        // `BindingLiveSnapshot` for why), so it is not asserted here.
+        let live = BindingLiveState::new();
+        live.redirect_inbox_overflow_drops
+            .store(3, Ordering::Relaxed);
+        live.pending_tx_local_overflow_drops
+            .store(5, Ordering::Relaxed);
+        live.tx_submit_error_drops.store(7, Ordering::Relaxed);
+        live.no_owner_binding_drops.store(11, Ordering::Relaxed);
+
+        let snap = live.snapshot();
+        assert_eq!(snap.redirect_inbox_overflow_drops, 3);
+        assert_eq!(snap.pending_tx_local_overflow_drops, 5);
+        assert_eq!(snap.tx_submit_error_drops, 7);
+        // `no_owner_binding_drops` has no per-binding protocol surface;
+        // it is read directly from the atomic by
+        // `Coordinator::cos_no_owner_binding_drops_total()`.
+        assert_eq!(
+            live.no_owner_binding_drops.load(Ordering::Relaxed),
+            11,
+            "atomic remains readable for the coordinator-level aggregation"
+        );
     }
 }
 
@@ -280,6 +387,38 @@ pub(super) struct BindingLiveState {
     pub(super) tx_bytes: AtomicU64,
     pub(super) tx_completions: AtomicU64,
     pub(super) tx_errors: AtomicU64,
+    /// #710: counts packets that hit the redirect-inbox overflow path
+    /// in `enqueue_tx` / `enqueue_tx_owned`. Multi-writer (every
+    /// redirecting worker writes; the owner reads). Atomic because
+    /// cross-thread. A non-zero value indicates the owner worker is
+    /// not draining redirects fast enough — see #706 (mutex
+    /// contention) and #709 (owner-worker hotspot).
+    pub(super) redirect_inbox_overflow_drops: AtomicU64,
+    /// #710: counts packets dropped from `pending_tx_local` /
+    /// `pending_tx_prepared` when those bounded FIFOs overflow their
+    /// `max_pending_tx` cap. Single-writer per binding (the worker
+    /// that owns this binding), but exposed via atomic for cross-
+    /// thread readers (status snapshotter). Indicates the worker is
+    /// receiving redirected-in traffic faster than it can ingest into
+    /// its CoS queues — upstream contributing cause is usually
+    /// #706 / #709 (owner worker not keeping up) or #707 / #708
+    /// (CoS enqueue throttled by buffer/admission caps).
+    pub(super) pending_tx_local_overflow_drops: AtomicU64,
+    /// #710: packets dropped at the TX submit path with a
+    /// frame-level error (capacity exceeded, slice out of range, or
+    /// other `TxError::Drop` from `transmit_batch` / transmit_prepared
+    /// paths). Distinct from admission and redirect-inbox drops; a
+    /// non-zero value usually indicates a frame-building bug upstream
+    /// or a legitimate oversize packet. Subset of `tx_errors`.
+    pub(super) tx_submit_error_drops: AtomicU64,
+    /// #710: packets dropped in `apply_worker_shaped_tx_requests`
+    /// because the worker could not locate any binding for the
+    /// request's egress_ifindex. Happens when a cross-worker CoS
+    /// redirect lands on a worker whose bound interfaces do not
+    /// include the target. Typically reveals a binding-registration
+    /// race during config reload or helper restart. Subset of
+    /// `tx_errors`.
+    pub(super) no_owner_binding_drops: AtomicU64,
     pub(super) direct_tx_packets: AtomicU64,
     pub(super) copy_tx_packets: AtomicU64,
     pub(super) in_place_tx_packets: AtomicU64,
@@ -358,6 +497,10 @@ impl BindingLiveState {
             tx_bytes: AtomicU64::new(0),
             tx_completions: AtomicU64::new(0),
             tx_errors: AtomicU64::new(0),
+            redirect_inbox_overflow_drops: AtomicU64::new(0),
+            pending_tx_local_overflow_drops: AtomicU64::new(0),
+            tx_submit_error_drops: AtomicU64::new(0),
+            no_owner_binding_drops: AtomicU64::new(0),
             direct_tx_packets: AtomicU64::new(0),
             copy_tx_packets: AtomicU64::new(0),
             in_place_tx_packets: AtomicU64::new(0),
@@ -528,6 +671,16 @@ impl BindingLiveState {
             tx_bytes: self.tx_bytes.load(Ordering::Relaxed),
             tx_completions: self.tx_completions.load(Ordering::Relaxed),
             tx_errors: self.tx_errors.load(Ordering::Relaxed),
+            redirect_inbox_overflow_drops: self
+                .redirect_inbox_overflow_drops
+                .load(Ordering::Relaxed),
+            pending_tx_local_overflow_drops: self
+                .pending_tx_local_overflow_drops
+                .load(Ordering::Relaxed),
+            tx_submit_error_drops: self.tx_submit_error_drops.load(Ordering::Relaxed),
+            // `no_owner_binding_drops` is read directly from the atomic
+            // by `Coordinator::cos_no_owner_binding_drops_total()` — not
+            // snapshotted here because it is not exposed per-binding.
             direct_tx_packets: self.direct_tx_packets.load(Ordering::Relaxed),
             copy_tx_packets: self.copy_tx_packets.load(Ordering::Relaxed),
             in_place_tx_packets: self.in_place_tx_packets.load(Ordering::Relaxed),
@@ -567,6 +720,14 @@ impl BindingLiveState {
                 if max_pending > 0 && pending.len() >= max_pending {
                     if pending.pop_front().is_some() {
                         self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                        // #710: this is the redirect-inbox overflow
+                        // drop site. A packet already in the inbox was
+                        // evicted to make room for an incoming one —
+                        // the owner worker is not draining fast enough
+                        // relative to redirects arriving from non-owner
+                        // workers.
+                        self.redirect_inbox_overflow_drops
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 pending.push_back(req);
@@ -587,6 +748,14 @@ impl BindingLiveState {
                 if max_pending > 0 && pending.len() >= max_pending {
                     if pending.pop_front().is_some() {
                         self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                        // #710: this is the redirect-inbox overflow
+                        // drop site. A packet already in the inbox was
+                        // evicted to make room for an incoming one —
+                        // the owner worker is not draining fast enough
+                        // relative to redirects arriving from non-owner
+                        // workers.
+                        self.redirect_inbox_overflow_drops
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 pending.push_back(req);

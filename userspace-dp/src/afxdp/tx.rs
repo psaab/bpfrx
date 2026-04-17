@@ -156,6 +156,11 @@ pub(super) fn bound_pending_tx_local(binding: &mut BindingWorker) {
         if binding.pending_tx_local.pop_front().is_some() {
             binding.dbg_pending_overflow += 1;
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+            // #710: dedicated drop-reason counter. Subset of tx_errors.
+            binding
+                .live
+                .pending_tx_local_overflow_drops
+                .fetch_add(1, Ordering::Relaxed);
             binding.live.set_error(format!(
                 "pending TX local overflow on slot {}",
                 binding.slot
@@ -171,6 +176,12 @@ pub(super) fn bound_pending_tx_prepared(binding: &mut BindingWorker) {
             binding.dbg_pending_overflow += 1;
             recycle_prepared_immediately(binding, &req);
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+            // #710: same drop category — prepared vs local FIFO is an
+            // internal distinction irrelevant to the operator.
+            binding
+                .live
+                .pending_tx_local_overflow_drops
+                .fetch_add(1, Ordering::Relaxed);
             binding.live.set_error(format!(
                 "pending TX prepared overflow on slot {}",
                 binding.slot
@@ -235,6 +246,12 @@ pub(super) fn drain_pending_tx(
             }
             Err(TxError::Drop(err)) => {
                 binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+                // #710: frame-level submit error (capacity / slice /
+                // other `TxError::Drop`). Subset of tx_errors.
+                binding
+                    .live
+                    .tx_submit_error_drops
+                    .fetch_add(1, Ordering::Relaxed);
                 binding.live.set_error(err);
             }
         }
@@ -894,6 +911,7 @@ fn select_cos_guarantee_batch_with_fast_path(
                 now_ns,
                 queue.exact,
             ) {
+                count_park_reason(root, queue_idx, ParkReason::RootTokenStarvation);
                 park_cos_queue(root, queue_idx, wake_tick);
             }
             continue;
@@ -909,6 +927,7 @@ fn select_cos_guarantee_batch_with_fast_path(
                     now_ns,
                     true,
                 ) {
+                    count_park_reason(root, queue_idx, ParkReason::QueueTokenStarvation);
                     park_cos_queue(root, queue_idx, wake_tick);
                 }
             }
@@ -973,6 +992,7 @@ fn select_exact_cos_guarantee_queue_with_fast_path(
                 now_ns,
                 true,
             ) {
+                count_park_reason(root, queue_idx, ParkReason::RootTokenStarvation);
                 park_cos_queue(root, queue_idx, wake_tick);
             }
             continue;
@@ -987,6 +1007,7 @@ fn select_exact_cos_guarantee_queue_with_fast_path(
                 now_ns,
                 true,
             ) {
+                count_park_reason(root, queue_idx, ParkReason::QueueTokenStarvation);
                 park_cos_queue(root, queue_idx, wake_tick);
             }
             continue;
@@ -1049,6 +1070,7 @@ fn select_nonexact_cos_guarantee_batch(
                 now_ns,
                 false,
             ) {
+                count_park_reason(root, queue_idx, ParkReason::RootTokenStarvation);
                 park_cos_queue(root, queue_idx, wake_tick);
             }
             continue;
@@ -1102,6 +1124,7 @@ fn select_cos_surplus_batch(root: &mut CoSInterfaceRuntime, now_ns: u64) -> Opti
                     now_ns,
                     false,
                 ) {
+                    count_park_reason(root, queue_idx, ParkReason::RootTokenStarvation);
                     park_cos_queue(root, queue_idx, wake_tick);
                 }
                 continue;
@@ -1198,6 +1221,13 @@ fn service_exact_local_queue_direct(
                 refresh_cos_interface_activity(binding, root_ifindex);
             }
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+            // #710: the scratch-build fell through `ExactCoSScratchBuild::Drop`
+            // with a frame-level error (capacity or slice). Subset of
+            // tx_errors.
+            binding
+                .live
+                .tx_submit_error_drops
+                .fetch_add(1, Ordering::Relaxed);
             binding.live.set_error(error);
             return false;
         }
@@ -1222,7 +1252,9 @@ fn service_exact_local_queue_direct(
     drop(writer);
 
     if inserted == 0 {
+        let dropped = binding.scratch_exact_local_tx.len() as u64;
         binding.dbg_tx_ring_full += 1;
+        count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         release_exact_local_scratch_frames(
             &mut binding.free_tx_frames,
@@ -1306,6 +1338,13 @@ fn service_exact_local_queue_direct_flow_fair(
                 refresh_cos_interface_activity(binding, root_ifindex);
             }
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+            // #710: the scratch-build fell through `ExactCoSScratchBuild::Drop`
+            // with a frame-level error (capacity or slice). Subset of
+            // tx_errors.
+            binding
+                .live
+                .tx_submit_error_drops
+                .fetch_add(1, Ordering::Relaxed);
             binding.live.set_error(error);
             return false;
         }
@@ -1333,7 +1372,9 @@ fn service_exact_local_queue_direct_flow_fair(
     drop(writer);
 
     if inserted == 0 {
+        let dropped = binding.scratch_local_tx.len() as u64;
         binding.dbg_tx_ring_full += 1;
+        count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         restore_exact_local_scratch_to_queue_head_flow_fair(
             binding
@@ -1427,6 +1468,13 @@ fn service_exact_prepared_queue_direct(
                 refresh_cos_interface_activity(binding, root_ifindex);
             }
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+            // #710: the scratch-build fell through `ExactCoSScratchBuild::Drop`
+            // with a frame-level error (capacity or slice). Subset of
+            // tx_errors.
+            binding
+                .live
+                .tx_submit_error_drops
+                .fetch_add(1, Ordering::Relaxed);
             binding.live.set_error(error);
             return false;
         }
@@ -1461,7 +1509,9 @@ fn service_exact_prepared_queue_direct(
     drop(writer);
 
     if inserted == 0 {
+        let dropped = binding.scratch_exact_prepared_tx.len() as u64;
         binding.dbg_tx_ring_full += 1;
+        count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         release_exact_prepared_scratch(&mut binding.scratch_exact_prepared_tx);
         refresh_cos_interface_activity(binding, root_ifindex);
@@ -1541,6 +1591,13 @@ fn service_exact_prepared_queue_direct_flow_fair(
                 refresh_cos_interface_activity(binding, root_ifindex);
             }
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+            // #710: the scratch-build fell through `ExactCoSScratchBuild::Drop`
+            // with a frame-level error (capacity or slice). Subset of
+            // tx_errors.
+            binding
+                .live
+                .tx_submit_error_drops
+                .fetch_add(1, Ordering::Relaxed);
             binding.live.set_error(error);
             return false;
         }
@@ -1575,7 +1632,9 @@ fn service_exact_prepared_queue_direct_flow_fair(
     drop(writer);
 
     if inserted == 0 {
+        let dropped = binding.scratch_prepared_tx.len() as u64;
         binding.dbg_tx_ring_full += 1;
+        count_tx_ring_full_submit_stall(binding, root_ifindex, queue_idx, dropped);
         maybe_wake_tx(binding, true, now_ns);
         restore_exact_prepared_scratch_to_queue_head_flow_fair(
             binding
@@ -2302,6 +2361,14 @@ fn submit_cos_batch(
                 }
                 Err(TxError::Drop(err)) => {
                     binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+                    // #710: frame-level submit drop during CoS batch
+                    // transmit; items are restored to the queue head,
+                    // so this counts the submit-attempt failure, not a
+                    // lost packet. Subset of tx_errors.
+                    binding
+                        .live
+                        .tx_submit_error_drops
+                        .fetch_add(1, Ordering::Relaxed);
                     binding.live.set_error(err);
                     restore_cos_local_items(binding, root_ifindex, queue_idx, batch_bytes, items);
                     cos_batch_tx_made_progress(Err(TxError::Drop(String::new())))
@@ -2351,6 +2418,10 @@ fn submit_cos_batch(
                 }
                 Err(TxError::Drop(err)) => {
                     binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
+                    binding
+                        .live
+                        .tx_submit_error_drops
+                        .fetch_add(1, Ordering::Relaxed);
                     binding.live.set_error(err);
                     restore_cos_prepared_items(
                         binding,
@@ -2819,6 +2890,73 @@ fn wake_cos_queue(root: &mut CoSInterfaceRuntime, queue_idx: usize) {
         root.runnable_queues = root.runnable_queues.saturating_add(1);
     }
     mark_cos_queue_runnable(queue);
+}
+
+// #710: park-reason classification used at every `park_cos_queue` call
+// site to attribute the wait to its upstream cause. `RootTokenStarvation`
+// means the interface-level shaper token bucket was empty; the queue
+// itself had work and tokens to send but the root could not admit more
+// bytes this tick. `QueueTokenStarvation` means the per-queue (exact)
+// token bucket was empty — the queue's own rate cap is the limiter.
+// Both are "parks" rather than "drops" because the timer wheel will
+// wake the queue when tokens refill; no packet is lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParkReason {
+    RootTokenStarvation,
+    QueueTokenStarvation,
+}
+
+// #710: count an exact-drain TX submit stall on a specific queue.
+// NOT packet loss — on the exact path, `writer.insert == 0` leaves
+// the FIFO items in `queue.items` or restores them (flow-fair path);
+// frames that had been copied into UMEM are released back to
+// `free_tx_frames`, and the items get another chance next drain tick.
+// The counter signals TX-ring / completion-reap pressure, which is
+// an upstream cause for the downstream effects operators chase
+// (#706 mutex contention, #709 owner-worker hotspot).
+//
+// Non-exact transmit paths (`transmit_batch`, `transmit_prepared_queue`)
+// do not carry queue identity at the submit site and do not reach
+// this helper. Their frame-level failures are counted in the binding-
+// level `tx_submit_error_drops` counter instead.
+#[inline]
+fn count_tx_ring_full_submit_stall(
+    binding: &mut BindingWorker,
+    root_ifindex: i32,
+    queue_idx: usize,
+    stalled_packets: u64,
+) {
+    if stalled_packets == 0 {
+        return;
+    }
+    if let Some(root) = binding.cos_interfaces.get_mut(&root_ifindex) {
+        if let Some(queue) = root.queues.get_mut(queue_idx) {
+            queue.drop_counters.tx_ring_full_submit_stalls = queue
+                .drop_counters
+                .tx_ring_full_submit_stalls
+                .wrapping_add(stalled_packets);
+        }
+    }
+}
+
+#[inline]
+fn count_park_reason(root: &mut CoSInterfaceRuntime, queue_idx: usize, reason: ParkReason) {
+    if let Some(queue) = root.queues.get_mut(queue_idx) {
+        match reason {
+            ParkReason::RootTokenStarvation => {
+                queue.drop_counters.root_token_starvation_parks = queue
+                    .drop_counters
+                    .root_token_starvation_parks
+                    .wrapping_add(1);
+            }
+            ParkReason::QueueTokenStarvation => {
+                queue.drop_counters.queue_token_starvation_parks = queue
+                    .drop_counters
+                    .queue_token_starvation_parks
+                    .wrapping_add(1);
+            }
+        }
+    }
 }
 
 fn park_cos_queue(root: &mut CoSInterfaceRuntime, queue_idx: usize, wake_tick: u64) {
@@ -3497,6 +3635,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 wheel_level: 0,
                 wheel_slot: 0,
                 items: VecDeque::new(),
+                drop_counters: CoSQueueDropCounters::default(),
             })
             .collect(),
         queue_indices_by_priority,
@@ -3570,7 +3709,24 @@ fn enqueue_cos_item(
         } else {
             false
         };
-        if flow_share_exceeded || queue.queued_bytes.saturating_add(item_len) > buffer_limit {
+        let buffer_exceeded = queue.queued_bytes.saturating_add(item_len) > buffer_limit;
+        if flow_share_exceeded || buffer_exceeded {
+            // #710: attribute the drop to the specific admission-path
+            // reason. `flow_share_exceeded` is checked first so that
+            // when both caps trip simultaneously, the root cause
+            // (per-flow bucket saturation under SFQ collision / cap
+            // undersizing) is counted rather than the buffer cap — the
+            // buffer-cap hit is a symptom downstream of flow-share
+            // admission failing to throttle the flow.
+            if flow_share_exceeded {
+                queue.drop_counters.admission_flow_share_drops = queue
+                    .drop_counters
+                    .admission_flow_share_drops
+                    .wrapping_add(1);
+            } else {
+                queue.drop_counters.admission_buffer_drops =
+                    queue.drop_counters.admission_buffer_drops.wrapping_add(1);
+            }
             let recycle = match &item {
                 CoSPendingTxItem::Prepared(req) => Some((req.recycle, req.offset)),
                 CoSPendingTxItem::Local(_) => None,
@@ -4182,6 +4338,21 @@ fn transmit_prepared_queue(
             for r in &orphaned {
                 recycle_prepared_immediately(binding, r);
             }
+            // #710: each orphan is a silently-recycled packet that will
+            // not reach the TX ring. The caller's post-return `+= 1`
+            // covers the offender (`req`); this accounts for the
+            // orphans so `tx_submit_error_drops` matches the actual
+            // packet count lost on this Drop return.
+            if !orphaned.is_empty() {
+                binding
+                    .live
+                    .tx_submit_error_drops
+                    .fetch_add(orphaned.len() as u64, Ordering::Relaxed);
+                binding
+                    .live
+                    .tx_errors
+                    .fetch_add(orphaned.len() as u64, Ordering::Relaxed);
+            }
             return Err(TxError::Drop(format!(
                 "prepared tx frame exceeds UMEM frame capacity: len={} cap={}",
                 req.len,
@@ -4209,6 +4380,19 @@ fn transmit_prepared_queue(
             for r in &orphaned {
                 recycle_prepared_immediately(binding, r);
             }
+            // #710: each orphan is a silently-recycled packet. Caller
+            // will `+= 1` for the offender; this accounts for the rest.
+            let orphan_count = orphaned.len();
+            if orphan_count > 0 {
+                binding
+                    .live
+                    .tx_submit_error_drops
+                    .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
+                binding
+                    .live
+                    .tx_errors
+                    .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
+            }
             return Err(TxError::Drop(format!(
                 "prepared tx frame slice out of range: offset={} len={}",
                 err_offset, err_len
@@ -4228,6 +4412,21 @@ fn transmit_prepared_queue(
             let orphaned: Vec<_> = binding.scratch_prepared_tx.drain(..).collect();
             for r in &orphaned {
                 recycle_prepared_immediately(binding, r);
+            }
+            // #710: same shape as the slice_mut_unchecked site above —
+            // `orphaned` drains EVERY entry including the offender.
+            // Caller adds 1 for the offender; we add (len-1) for the
+            // rest so `tx_submit_error_drops` matches the actual count.
+            let orphan_count = orphaned.len();
+            if orphan_count > 0 {
+                binding
+                    .live
+                    .tx_submit_error_drops
+                    .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
+                binding
+                    .live
+                    .tx_errors
+                    .fetch_add(orphan_count.saturating_sub(1) as u64, Ordering::Relaxed);
             }
             return Err(TxError::Drop(format!(
                 "prepared tx frame slice out of range: offset={} len={}",
@@ -8986,6 +9185,7 @@ mod tests {
             wheel_level: 0,
             wheel_slot: 0,
             items: VecDeque::from([test_cos_item(1500)]),
+            drop_counters: CoSQueueDropCounters::default(),
         };
 
         normalize_cos_queue_state(&mut queue);
@@ -9021,6 +9221,7 @@ mod tests {
             wheel_level: 0,
             wheel_slot: 0,
             items: VecDeque::new(),
+            drop_counters: CoSQueueDropCounters::default(),
         };
         let retry = VecDeque::from([TxRequest {
             bytes: vec![0; 1500],
@@ -9067,6 +9268,7 @@ mod tests {
             wheel_level: 0,
             wheel_slot: 0,
             items: VecDeque::new(),
+            drop_counters: CoSQueueDropCounters::default(),
         };
         let retry = VecDeque::from([PreparedTxRequest {
             offset: 64,
@@ -9087,5 +9289,133 @@ mod tests {
         assert_eq!(retry_bytes, 1500);
         assert!(queue.runnable);
         assert!(!queue.parked);
+    }
+
+    // ---------------------------------------------------------------------
+    // #710 drop-reason counter tests. Each test drives the exact code
+    // path that should tick the named counter, and asserts:
+    //   (a) the expected counter advances by the expected amount
+    //   (b) no other counter on the same queue advances
+    // Byte-precise so a future refactor that accidentally re-attributes a
+    // drop to the wrong reason is caught on CI.
+    // ---------------------------------------------------------------------
+
+    fn snapshot_counters(queue: &CoSQueueRuntime) -> CoSQueueDropCounters {
+        queue.drop_counters
+    }
+
+    #[test]
+    fn park_counter_root_token_starvation_ticks_only_its_reason() {
+        let mut root = test_cos_runtime_with_exact(true);
+        root.tokens = 0;
+        root.queues[0].tokens = 0;
+        root.queues[0].runnable = true;
+        root.queues[0].items.push_back(test_cos_item(1500));
+        root.queues[0].queued_bytes = 1500;
+        root.nonempty_queues = 1;
+        root.runnable_queues = 1;
+
+        let before = snapshot_counters(&root.queues[0]);
+        // Drive a selector that will park on root-token starvation.
+        assert!(select_cos_guarantee_batch(&mut root, 1).is_none());
+        let after = snapshot_counters(&root.queues[0]);
+
+        assert_eq!(
+            after.root_token_starvation_parks,
+            before.root_token_starvation_parks + 1,
+            "root-token park counter must advance by 1"
+        );
+        assert_eq!(
+            after.queue_token_starvation_parks,
+            before.queue_token_starvation_parks
+        );
+        assert_eq!(
+            after.admission_flow_share_drops,
+            before.admission_flow_share_drops
+        );
+        assert_eq!(after.admission_buffer_drops, before.admission_buffer_drops);
+        assert_eq!(
+            after.tx_ring_full_submit_stalls,
+            before.tx_ring_full_submit_stalls
+        );
+    }
+
+    #[test]
+    fn park_counter_queue_token_starvation_ticks_only_its_reason_on_exact() {
+        let mut root = test_cos_runtime_with_exact(true);
+        // Root has headroom; per-queue tokens do not. Forces the
+        // queue-token park branch on the exact selector.
+        root.tokens = 1_000_000;
+        root.queues[0].tokens = 0;
+        root.queues[0].last_refill_ns = 1; // skip the first-refill init path
+        root.queues[0].runnable = true;
+        root.queues[0].items.push_back(test_cos_item(1500));
+        root.queues[0].queued_bytes = 1500;
+        root.nonempty_queues = 1;
+        root.runnable_queues = 1;
+
+        let before = snapshot_counters(&root.queues[0]);
+        let selection = select_exact_cos_guarantee_queue_with_fast_path(&mut root, &[], 1);
+        assert!(
+            selection.is_none(),
+            "exact selector must park, not return a queue"
+        );
+        let after = snapshot_counters(&root.queues[0]);
+
+        assert_eq!(
+            after.queue_token_starvation_parks,
+            before.queue_token_starvation_parks + 1,
+            "queue-token park counter must advance by 1"
+        );
+        assert_eq!(
+            after.root_token_starvation_parks,
+            before.root_token_starvation_parks
+        );
+        assert_eq!(
+            after.admission_flow_share_drops,
+            before.admission_flow_share_drops
+        );
+        assert_eq!(after.admission_buffer_drops, before.admission_buffer_drops);
+        assert_eq!(
+            after.tx_ring_full_submit_stalls,
+            before.tx_ring_full_submit_stalls
+        );
+    }
+
+    #[test]
+    fn count_park_reason_helper_advances_exact_counter() {
+        // Low-level test of the helper itself — paranoia pin against a
+        // refactor that accidentally writes to the wrong field.
+        let mut root = test_cos_runtime_with_exact(true);
+        let before = snapshot_counters(&root.queues[0]);
+
+        count_park_reason(&mut root, 0, ParkReason::RootTokenStarvation);
+        let mid = snapshot_counters(&root.queues[0]);
+        assert_eq!(
+            mid.root_token_starvation_parks,
+            before.root_token_starvation_parks + 1
+        );
+        assert_eq!(
+            mid.queue_token_starvation_parks,
+            before.queue_token_starvation_parks
+        );
+
+        count_park_reason(&mut root, 0, ParkReason::QueueTokenStarvation);
+        let after = snapshot_counters(&root.queues[0]);
+        assert_eq!(
+            after.queue_token_starvation_parks,
+            before.queue_token_starvation_parks + 1
+        );
+        assert_eq!(
+            after.root_token_starvation_parks,
+            mid.root_token_starvation_parks
+        );
+
+        // Out-of-range queue_idx is a no-op, not a panic.
+        count_park_reason(&mut root, 999, ParkReason::RootTokenStarvation);
+        assert_eq!(
+            snapshot_counters(&root.queues[0]).root_token_starvation_parks,
+            after.root_token_starvation_parks
+        );
     }
 }

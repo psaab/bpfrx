@@ -699,6 +699,15 @@ pub(crate) struct ProcessStatus {
     pub route_entries: usize,
     #[serde(rename = "worker_heartbeats", default)]
     pub worker_heartbeats: Vec<DateTime<Utc>>,
+    // #710: cluster-wide aggregate of cross-worker CoS redirects that
+    // could not locate a binding for their target egress on the landing
+    // worker. Summed across all bindings in `refresh_status` — the
+    // per-binding accounting is a mechanical choice (the increment
+    // always lands on the landing worker's first binding), so the
+    // per-binding view would be misleading as triage signal; the total
+    // is the operator-facing number.
+    #[serde(rename = "cos_no_owner_binding_drops_total", default)]
+    pub cos_no_owner_binding_drops_total: u64,
     #[serde(rename = "ha_groups", default)]
     pub ha_groups: Vec<HAGroupStatus>,
     #[serde(default)]
@@ -812,6 +821,22 @@ pub(crate) struct CoSQueueStatus {
     pub next_wakeup_tick: u64,
     #[serde(rename = "surplus_deficit_bytes", default)]
     pub surplus_deficit_bytes: u64,
+    // #710 drop-reason counters, aggregated across worker instances for
+    // this (ifindex, queue_id). `parks` are not drops — the queue is
+    // only deferred until its root/queue token bucket refills — but
+    // tracking them alongside drops tells an operator which *scheduler*
+    // decision is limiting the queue. See `types::CoSQueueDropCounters`
+    // for per-reason semantics and refs to the issues driving each.
+    #[serde(rename = "admission_flow_share_drops", default)]
+    pub admission_flow_share_drops: u64,
+    #[serde(rename = "admission_buffer_drops", default)]
+    pub admission_buffer_drops: u64,
+    #[serde(rename = "root_token_starvation_parks", default)]
+    pub root_token_starvation_parks: u64,
+    #[serde(rename = "queue_token_starvation_parks", default)]
+    pub queue_token_starvation_parks: u64,
+    #[serde(rename = "tx_ring_full_submit_stalls", default)]
+    pub tx_ring_full_submit_stalls: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1111,6 +1136,34 @@ pub(crate) struct BindingStatus {
     pub tx_bytes: u64,
     #[serde(rename = "tx_errors", default)]
     pub tx_errors: u64,
+    // #710: per-binding subset of `tx_errors` attributed to the
+    // redirect-inbox overflow path in `BindingLiveState::enqueue_tx` /
+    // `enqueue_tx_owned`. Indicates the owner is not draining redirects
+    // fast enough for the rate of incoming redirects from non-owner
+    // workers. See #706 / #709.
+    #[serde(rename = "redirect_inbox_overflow_drops", default)]
+    pub redirect_inbox_overflow_drops: u64,
+    // #710: per-binding `pending_tx_local`/`pending_tx_prepared` FIFO
+    // overflow drops. Subset of `tx_errors`. Indicates the worker
+    // cannot ingest redirected traffic into CoS as fast as it arrives
+    // — often the load-bearing drop category on the owner worker
+    // under multi-flow load.
+    #[serde(rename = "pending_tx_local_overflow_drops", default)]
+    pub pending_tx_local_overflow_drops: u64,
+    // #710: catch-all counter for frame-level TX submit errors
+    // (`TxError::Drop`, scratch-build slice/capacity failures). Subset
+    // of `tx_errors`. Non-zero usually indicates a frame-builder bug
+    // rather than a scheduler/shaper decision — separate category from
+    // the flow-fair admission / redirect-inbox / pending-FIFO drops.
+    #[serde(rename = "tx_submit_error_drops", default)]
+    pub tx_submit_error_drops: u64,
+    // #710 attribution note: cross-worker CoS "no-owner-binding" drops
+    // are exposed at the `ProcessStatus::cos_no_owner_binding_drops_total`
+    // top-level field, not per binding. The increment mechanically lands
+    // on the landing worker's first binding (no ifindex is meaningful —
+    // the drop fires specifically because no binding matched the
+    // request's egress), so per-binding attribution would mislead
+    // operators during triage.
     #[serde(rename = "direct_tx_packets", default)]
     pub direct_tx_packets: u64,
     #[serde(rename = "copy_tx_packets", default)]
