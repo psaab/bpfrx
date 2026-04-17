@@ -2464,6 +2464,19 @@ const COS_FLOW_FAIR_MIN_SHARE_BYTES: u64 = 16 * 1500;
 // constant) rather than in `tests/` so `cargo build` enforces it, not
 // just `cargo test`.
 const _: () = assert!(COS_FLOW_FAIR_MIN_SHARE_BYTES >= 16 * 1500);
+
+/// Hard upper bound on per-flow fair queue residence time. Without
+/// this, `cos_flow_aware_buffer_limit` can scale the aggregate cap
+/// to `COS_FLOW_FAIR_BUCKETS × COS_FLOW_FAIR_MIN_SHARE_BYTES`
+/// (~24 MB at max), which on a 1 Gbps queue is ~190 ms of queueing
+/// — far outside the scheduler's predictable regime. 5 ms is ~5×
+/// BDP at 1 Gbps cluster RTT and keeps the tail bounded while
+/// leaving generous room for bulk TCP. Tracked in #717.
+const COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS: u64 = 5_000_000;
+
+// Compile-time sanity: must be at least 1 ms. Below that TCP has
+// no room to grow cwnd past a handful of packets.
+const _: () = assert!(COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS >= 1_000_000);
 const COS_SURPLUS_ROUND_QUANTUM_BYTES: u64 = 1500;
 const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 
@@ -2779,12 +2792,19 @@ fn cos_queue_flow_share_limit(
 ///
 /// This is a logical threshold only. The backing `VecDeque` storage is
 /// dynamic, so raising the cap costs nothing until traffic actually
-/// fills it. The cap is currently uncapped on the high side: at
-/// `COS_FLOW_FAIR_BUCKETS = 1024` active flows it can reach `~24 MB`,
-/// which on a 1 Gbps queue is `~190 ms` of queue residence time — an
-/// operator-visible latency envelope concern flagged in the #716
-/// review. A derived max-queue-delay clamp belongs in a follow-up
-/// change alongside the queueing-budget policy discussion.
+/// fills it.
+///
+/// #717 latency-envelope clamp: the flow-aware expansion is bounded
+/// on the high side by `delay_cap = transmit_rate_bytes ×
+/// COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS / 1e9`, i.e. the number of bytes
+/// the queue can drain in the max tolerated residence time. Without
+/// this, at 1024 active buckets the cap reaches ~24 MB, which on a
+/// 1 Gbps queue is ~190 ms of queueing — far outside the scheduler's
+/// predictable regime. The clamp is applied as
+/// `.min(delay_cap.max(base))`: it never shrinks below the operator's
+/// explicit `buffer-size`, so an operator who asked for a deeper
+/// buffer still gets it. Adds one u128 multiply + divide per admission
+/// decision, not per packet.
 #[inline]
 fn cos_flow_aware_buffer_limit(queue: &CoSQueueRuntime, flow_bucket: usize) -> u64 {
     let base = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
@@ -2792,7 +2812,13 @@ fn cos_flow_aware_buffer_limit(queue: &CoSQueueRuntime, flow_bucket: usize) -> u
         return base;
     }
     let prospective_active = cos_queue_prospective_active_flows(queue, flow_bucket);
+    // u128 to keep the intermediate product safe at 10 Gbps × 5 ms
+    // (plus any plausible operator-configured rate inflation).
+    let delay_cap = ((queue.transmit_rate_bytes as u128)
+        * (COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS as u128)
+        / 1_000_000_000u128) as u64;
     base.max(prospective_active.saturating_mul(COS_FLOW_FAIR_MIN_SHARE_BYTES))
+        .min(delay_cap.max(base))
 }
 
 #[inline]
@@ -8271,6 +8297,210 @@ mod tests {
         assert_eq!(
             share, COS_FLOW_FAIR_MIN_SHARE_BYTES,
             "with buffer_limit == active × min-share, per-flow cap equals the floor"
+        );
+    }
+
+    #[test]
+    fn cos_flow_aware_buffer_limit_clamps_high_flow_count_to_max_delay() {
+        // #717: at the architectural maximum of 1024 active buckets
+        // the pre-clamp flow-aware expansion reaches
+        // 1024 × COS_FLOW_FAIR_MIN_SHARE_BYTES ≈ 24 MB. On a 1 Gbps
+        // queue that is ~190 ms of queue residence — far outside the
+        // scheduler's predictable regime. The latency-envelope clamp
+        // caps the aggregate at
+        // `transmit_rate_bytes × COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS / 1e9`
+        // so the tail stays bounded.
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                // 1 Gbps → 125_000_000 bytes/s (decimal, matches
+                // operator `transmit-rate 1g` semantics).
+                transmit_rate_bytes: 125_000_000,
+                exact: true,
+                surplus_weight: 1,
+                // Decimal KB to match the operator `buffer-size 125k`
+                // config, not KiB.
+                buffer_bytes: 125_000,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+
+        // Drive to the architectural maximum: 1024 populated buckets.
+        queue.active_flow_buckets = COS_FLOW_FAIR_BUCKETS as u16;
+        for bucket in 0..COS_FLOW_FAIR_BUCKETS {
+            queue.flow_bucket_bytes[bucket] = 1_000;
+        }
+
+        let cap = cos_flow_aware_buffer_limit(queue, 0);
+
+        // Expected delay cap: 125_000_000 B/s × 5 ms = 625_000 B.
+        let expected_delay_cap = 625_000u64;
+        assert_eq!(
+            cap, expected_delay_cap,
+            "flow-aware cap must be clamped to the 5 ms delay envelope, not the ~24 MB \
+             unclamped expansion"
+        );
+
+        // Counter-factual: prove the pre-clamp formula would have
+        // returned 24 MB. Guards against a future refactor silently
+        // deleting the clamp.
+        let unclamped = u64::from(queue.active_flow_buckets)
+            .max(1)
+            .saturating_mul(COS_FLOW_FAIR_MIN_SHARE_BYTES)
+            .max(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
+        assert_eq!(
+            unclamped,
+            COS_FLOW_FAIR_BUCKETS as u64 * COS_FLOW_FAIR_MIN_SHARE_BYTES,
+            "unclamped formula baseline: 1024 × 24 KB = ~24 MB"
+        );
+        assert!(
+            cap < unclamped,
+            "clamp must shrink the flow-aware expansion (cap = {cap}, unclamped = {unclamped})"
+        );
+    }
+
+    #[test]
+    fn cos_flow_aware_buffer_limit_honours_operator_base_above_delay_cap() {
+        // #717: the clamp is `.min(delay_cap.max(base))` — if the
+        // operator explicitly configured a buffer larger than
+        // `delay_cap`, we honour their intent. The clamp must never
+        // shrink below the operator's `buffer-size`. On a 1 Gbps queue
+        // the delay cap is 625_000 B; a 100 MiB operator base is well
+        // above that.
+        let operator_base: u64 = 100 * 1024 * 1024;
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 125_000_000,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: operator_base,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+
+        // Use a middling flow count so prospective × min-share sits
+        // between delay_cap and operator_base. That exercises the
+        // branch where delay_cap < base < flow-aware expansion.
+        queue.active_flow_buckets = 16;
+        for bucket in 0..16 {
+            queue.flow_bucket_bytes[bucket] = 1_000;
+        }
+
+        let cap = cos_flow_aware_buffer_limit(queue, 0);
+        assert_eq!(
+            cap, operator_base,
+            "operator base ({operator_base}) must survive the clamp even when it exceeds \
+             delay_cap (625_000) — the clamp is .min(delay_cap.max(base))"
+        );
+
+        // Counter-factual: a naive `.min(delay_cap)` (without
+        // `.max(base)`) would have clamped the operator's explicit
+        // 100 MiB down to 625 KB. Pin that this is NOT what we do.
+        let naive_delay_cap = 625_000u64;
+        assert!(
+            cap > naive_delay_cap,
+            "naive delay-only clamp would shrink operator intent to {naive_delay_cap}; the \
+             `.max(base)` guard must preserve {operator_base}"
+        );
+    }
+
+    #[test]
+    fn cos_flow_aware_buffer_limit_preserves_non_flow_fair_path_after_clamp() {
+        // #717: the latency clamp must not leak into the non-flow-fair
+        // path. Pure rate-limited queues bypass both the floor and the
+        // clamp and return the raw `buffer_bytes.max(COS_MIN_BURST_BYTES)`.
+        // This is the companion to
+        // `cos_flow_aware_buffer_limit_respects_non_flow_fair_queues`
+        // but exercises the config shape where the delay cap *would*
+        // have been tighter than the operator base, to catch a future
+        // refactor that moves the clamp above the `flow_fair` early
+        // return.
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "best-effort".into(),
+                priority: 5,
+                // 1 Gbps → delay_cap = 625 KB.
+                transmit_rate_bytes: 125_000_000,
+                exact: true,
+                surplus_weight: 1,
+                // Operator configured 10 MB — well above delay_cap.
+                // If the clamp leaks into this path, the returned cap
+                // would be 625 KB, not 10 MB.
+                buffer_bytes: 10 * 1_000_000,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = false;
+        queue.active_flow_buckets = 64; // should be ignored
+
+        assert_eq!(
+            cos_flow_aware_buffer_limit(queue, 0),
+            queue.buffer_bytes.max(COS_MIN_BURST_BYTES),
+            "flow_fair=false must bypass both the flow-aware floor and the latency clamp"
+        );
+    }
+
+    #[test]
+    fn cos_flow_aware_buffer_limit_delay_cap_scales_linearly_with_rate() {
+        // #717: pin the delay-cap formula's linearity. Same active
+        // flow count and same COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS, but
+        // 10 Gbps vs 1 Gbps — the delay-cap-driven return must be 10×
+        // larger. Catches future refactors that accidentally clamp
+        // the rate (e.g. saturating at a hardcoded byte count) or
+        // swap the product for a divide.
+        fn run_at_rate(rate_bytes: u64) -> u64 {
+            let mut root = test_cos_runtime_with_queues(
+                25_000_000_000 / 8,
+                vec![CoSQueueConfig {
+                    queue_id: 4,
+                    forwarding_class: "iperf-a".into(),
+                    priority: 5,
+                    transmit_rate_bytes: rate_bytes,
+                    exact: true,
+                    surplus_weight: 1,
+                    // Small operator base so the delay cap dominates.
+                    buffer_bytes: COS_MIN_BURST_BYTES,
+                    dscp_rewrite: None,
+                }],
+            );
+            let queue = &mut root.queues[0];
+            queue.flow_fair = true;
+            // Populate all buckets so prospective_active × min-share
+            // blows past the delay cap at both rates — the clamp is
+            // what's being measured.
+            queue.active_flow_buckets = COS_FLOW_FAIR_BUCKETS as u16;
+            for bucket in 0..COS_FLOW_FAIR_BUCKETS {
+                queue.flow_bucket_bytes[bucket] = 1_000;
+            }
+            cos_flow_aware_buffer_limit(queue, 0)
+        }
+
+        // 1 Gbps decimal: 125_000_000 B/s × 5 ms = 625_000 B.
+        let cap_1g = run_at_rate(125_000_000);
+        // 10 Gbps decimal: 1_250_000_000 B/s × 5 ms = 6_250_000 B.
+        let cap_10g = run_at_rate(1_250_000_000);
+
+        assert_eq!(cap_1g, 625_000);
+        assert_eq!(cap_10g, 6_250_000);
+        assert_eq!(
+            cap_10g,
+            cap_1g * 10,
+            "delay cap must scale linearly with transmit_rate_bytes \
+             (1 Gbps → {cap_1g}, 10 Gbps → {cap_10g})"
         );
     }
 
