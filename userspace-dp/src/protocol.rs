@@ -831,6 +831,12 @@ pub(crate) struct CoSQueueStatus {
     pub admission_flow_share_drops: u64,
     #[serde(rename = "admission_buffer_drops", default)]
     pub admission_buffer_drops: u64,
+    /// #718: packets ECN CE-marked at admission (not dropped). A rising
+    /// counter here indicates the admission-threshold signalling is
+    /// steering ECN-negotiated TCP flows; operators should see
+    /// per-queue retrans rates fall while this increments.
+    #[serde(rename = "admission_ecn_marked", default)]
+    pub admission_ecn_marked: u64,
     #[serde(rename = "root_token_starvation_parks", default)]
     pub root_token_starvation_parks: u64,
     #[serde(rename = "queue_token_starvation_parks", default)]

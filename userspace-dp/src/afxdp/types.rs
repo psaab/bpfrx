@@ -1010,6 +1010,13 @@ pub(super) struct CoSQueueDropCounters {
     /// `enqueue_cos_item`. Indicates buffer undersizing relative to
     /// the offered-load × RTT product. See #707.
     pub(super) admission_buffer_drops: u64,
+    /// Packet ECN CE-marked at admission (not dropped). Incremented
+    /// when queue depth crosses the ECN threshold derived from
+    /// `buffer_limit` AND the packet was already ECT(0) or ECT(1).
+    /// Non-ECT packets above the threshold fall through to the drop
+    /// path and are counted under the respective drop-reason field.
+    /// See #718.
+    pub(super) admission_ecn_marked: u64,
     /// Queue parked because the interface shaping-rate token bucket is
     /// empty. Not a drop — the queue will be woken on timer-wheel tick.
     /// High count relative to serviced-batches indicates the root
