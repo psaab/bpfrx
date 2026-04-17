@@ -36,9 +36,6 @@ type cosQueueView struct {
 	admissionFlowShareDrops uint64
 	admissionBufferDrops    uint64
 	admissionEcnMarked      uint64
-	// hasRuntime is true when the queue view was populated from a runtime
-	// snapshot. Config-only queues (no runtime yet) skip the Drops line.
-	hasRuntime bool
 }
 
 func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, selector string) string {
@@ -132,8 +129,19 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 		_ = tw.Flush()
 		// First rendered line is the header; subsequent lines map 1:1 to
 		// queues in order. Re-emit into the main builder, appending a
-		// Drops line under each queue data row. Zero-valued counters are
-		// still printed so operators can confirm the counter is wired.
+		// Drops line under each queue data row.
+		//
+		// The Drops line is gated on **interface** runtime (not per-queue
+		// runtime): once an interface reports runtime state, every
+		// configured queue on it emits a Drops line with whatever counts
+		// are exported, defaulting to zero for queues not yet materialised
+		// in the runtime snapshot. This avoids the "wired-but-silent vs
+		// missing-from-export" ambiguity — an operator seeing `flow_share=0
+		// buffer=0 ecn_marked=0` now unambiguously means the counter path
+		// is live and nothing is tripping, whereas a missing Drops line
+		// means the interface itself is not yet exported (see
+		// cos-validation-notes.md "Reading the counters live").
+		interfaceHasRuntime := view.interfaceState != nil
 		tableLines := strings.Split(strings.TrimRight(tableBuf.String(), "\n"), "\n")
 		for i, line := range tableLines {
 			b.WriteString(line)
@@ -146,10 +154,10 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 			if queueIdx >= len(queues) {
 				continue
 			}
-			queue := queues[queueIdx]
-			if !queue.hasRuntime {
+			if !interfaceHasRuntime {
 				continue
 			}
+			queue := queues[queueIdx]
 			fmt.Fprintf(&b, "           Drops: flow_share=%d  buffer=%d  ecn_marked=%d\n",
 				queue.admissionFlowShareDrops,
 				queue.admissionBufferDrops,
@@ -245,7 +253,6 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 			qv.admissionFlowShareDrops = runtimeQueue.AdmissionFlowShareDrops
 			qv.admissionBufferDrops = runtimeQueue.AdmissionBufferDrops
 			qv.admissionEcnMarked = runtimeQueue.AdmissionEcnMarked
-			qv.hasRuntime = true
 			queueViews[qv.queueID] = qv
 		}
 	}

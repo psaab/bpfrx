@@ -56,11 +56,14 @@ snapshot before and after and subtract.
 
 ## Current test-env limitation: ECN never negotiated
 
-The iperf3 server at `172.16.80.200` is not on any VM in the
-`loss:xpf-userspace-*` project — it lives on bare metal (or an
-unreachable network segment) and does **not** negotiate ECN. That
-means, regardless of `net.ipv4.tcp_ecn` settings on the client and
-firewalls:
+**Observed state 2026-04-17** — this is not timeless methodology, it
+is a lab-setup snapshot that will rot as endpoints, kernels, and
+network segments change. Re-run the verification commands below before
+trusting anything in this section.
+
+The iperf3 server at `172.16.80.200` (at time of writing) does not
+respond with ECN-negotiated SYN-ACKs. That means, regardless of
+`net.ipv4.tcp_ecn` settings on the client and firewalls:
 
 - Every packet arrives at the firewall with `tos 0x0` (NOT-ECT).
 - `maybe_mark_ecn_ce` correctly early-returns per RFC 3168 §6.1.1.1
@@ -72,32 +75,47 @@ firewalls:
 ECN threshold) are structurally correct but dormant on this workload.
 They would fire as designed if packets were ECT.
 
-To validate ECN-path changes end-to-end:
+### Verify the current state
+
+```bash
+# Capture 4 packets from an in-progress iperf3 run and look at tos.
+# tos 0x0 on both directions == no ECN negotiation == ECN-path code dormant.
+incus exec <client> -- tcpdump -v -c 4 -n 'tcp port 5201'
+```
+
+If the verification shows `tos != 0x0` on both directions, ECN is
+live and this section is stale — update it.
+
+### Controlling the endpoint for ECN validation
+
+To exercise #721/#722 end-to-end, stand up a controllable iperf3
+server:
 
 1. Run an iperf3 server on a VM where both endpoints can set
    `tcp_ecn=1` (e.g., reuse `cluster-userspace-host` as the server
    and point a second client at it through the firewall, or add a new
    VM on the WAN side).
-2. Verify ECT bits show up on the wire with tcpdump:
-   ```bash
-   incus exec <client> -- tcpdump -v -c 4 -n 'tcp port 5201'
-   # expect tos != 0x0 on both directions after the SYN exchange
-   ```
+2. Verify ECT bits show up on the wire with the tcpdump above.
 3. Re-run the iperf3 load and watch `ecn_marked` bump during the run.
 
 ## Current dominant failure mode on this workload
 
-With #716/#717/#720 landed, the 16-flow / 1 Gbps exact queue workload
-sits at ~31% aggregate buffer utilisation (~378 KB of a 1.19 MiB
-buffer) during steady state. The dominant drop source is:
+With #716 and #720 (latency clamp from issue #717) landed, the
+16-flow / 1 Gbps exact queue workload sits at ~31% aggregate buffer
+utilisation (~378 KB of a 1.19 MiB buffer) during steady state. The
+dominant drop source is:
 
 - `flow_share_drops`: ~190/sec on queue 4.
 - `buffer_drops`: 0.
 - `ecn_marked`: 0 (see above).
 
-190 drops/sec × 30 s run × 16 flows ≈ per-flow drop every 1–2 s.
-Because these drops cluster (tail-drop on microbursts), many do not
-produce the 3 dupacks required for TCP fast-retransmit, so the flow
+At 190 drops/sec distributed across 16 flows, each flow sees
+~12 drops/sec on average — one drop every ~80 ms. That is much
+faster than the 1–2 s this file previously claimed. At ~80 ms
+between drops the flow never gets a clean RTT to re-open cwnd
+past ~5–6 MSS before the next drop lands; drops also arrive in
+bursts (tail-drop on microbursts), so many of the 12/sec do not
+produce the 3 dupacks needed for TCP fast-retransmit and the flow
 takes RTO instead, collapsing cwnd to 1 MSS. That is the
 10–15/16-flows-collapsed pattern in #704/#722.
 
@@ -114,17 +132,23 @@ When the counters show something different from "`flow_share` dominant, `buffer`
 
 ## Gotchas the deploy wipes
 
-Per `feedback_cos_deploy_config.md` (auto-memory): the cluster deploy path
-wipes the CoS config. After every `cluster-setup.sh deploy`, re-apply
-the config:
+The cluster deploy path (`cluster-setup.sh deploy`) wipes the CoS
+config every run — the bootstrapped `xpf.conf` does not carry the
+iperf CoS fixture. After every deploy, re-apply:
 
 ```bash
 ./test/incus/apply-cos-config.sh loss:xpf-userspace-fw0
 ```
 
-The loader is intentionally strict on `load merge` / `commit` since
-#716 — if you see a validation error, stop and investigate rather than
-re-running.
+The loader script lives at `test/incus/apply-cos-config.sh` and is
+documented inline. It is intentionally strict on `load merge` / `commit`
+since #716 — if you see a validation error, stop and investigate rather
+than re-running. The accompanying fixture at
+`test/incus/cos-iperf-config.set` covers both `family inet` and
+`family inet6` classifier state.
+
+See also the "CoS deploy preserves config" bullet in
+[`engineering-style.md`](engineering-style.md#project-specific-reminders).
 
 ## Refs
 

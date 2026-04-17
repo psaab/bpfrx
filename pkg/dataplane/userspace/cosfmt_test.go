@@ -186,6 +186,88 @@ func TestFormatCoSInterfaceSummaryRendersAdmissionDropCounters(t *testing.T) {
 	}
 }
 
+// The formatter renders queues via tabwriter into a scratch buffer and
+// interleaves the per-queue Drops line on a second pass. That second
+// pass relies on a strict 1:1 mapping between the i-th table data line
+// and the i-th element of `queues` (sorted by queue_id ascending).
+// This test pins that invariant — a future refactor that, say, adds a
+// blank separator line, re-orders queues, or attaches one queue's
+// Drops row under another's data row would break this assertion while
+// the single-queue tests above would still pass.
+func TestFormatCoSInterfaceSummaryInterleavesPerQueueDropsInOrder(t *testing.T) {
+	owner := uint32(1)
+	status := &ProcessStatus{
+		CoSInterfaces: []CoSInterfaceStatus{
+			{
+				InterfaceName:   "reth0.80",
+				OwnerWorkerID:   &owner,
+				WorkerInstances: 1,
+				Queues: []CoSQueueStatus{
+					{
+						QueueID:                 0,
+						OwnerWorkerID:           &owner,
+						ForwardingClass:         "best-effort",
+						Priority:                5,
+						Exact:                   true,
+						TransmitRateBytes:       1_875_000,
+						BufferBytes:             16 * 1024,
+						AdmissionFlowShareDrops: 11,
+						AdmissionBufferDrops:    22,
+						AdmissionEcnMarked:      33,
+					},
+					{
+						QueueID:                 4,
+						OwnerWorkerID:           &owner,
+						ForwardingClass:         "bandwidth-10mb",
+						Priority:                5,
+						Exact:                   true,
+						TransmitRateBytes:       1_250_000,
+						BufferBytes:             32 * 1024,
+						AdmissionFlowShareDrops: 44,
+						AdmissionBufferDrops:    55,
+						AdmissionEcnMarked:      66,
+					},
+				},
+			},
+		},
+	}
+	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+
+	// Use content-unique markers rather than full row-text substrings
+	// because tabwriter's column widths depend on cell content across
+	// all rows — a new queue with a longer forwarding-class name in
+	// the fixture would shift spacing and break a literal-row match
+	// without actually breaking the invariant this test pins.
+	//
+	// The invariant: queue rows emit in queue_id ascending order, and
+	// each queue's Drops line sits directly under its own data row
+	// (not under the next queue's). We pin that with unique counter
+	// values per queue (33 vs 66) so a misaligned interleave would be
+	// detectable.
+	q0Drops := "Drops: flow_share=11  buffer=22  ecn_marked=33"
+	q4Drops := "Drops: flow_share=44  buffer=55  ecn_marked=66"
+	// The word "best-effort" anchors queue 0's row. "bandwidth-10mb"
+	// anchors queue 4's. Both strings appear exactly once in the
+	// output (once in the data row).
+	q0RowIdx := strings.Index(out, "best-effort")
+	q0DropsIdx := strings.Index(out, q0Drops)
+	q4RowIdx := strings.Index(out, "bandwidth-10mb")
+	q4DropsIdx := strings.Index(out, q4Drops)
+
+	if q0RowIdx < 0 || q0DropsIdx < 0 || q4RowIdx < 0 || q4DropsIdx < 0 {
+		t.Fatalf("missing queue row anchor or drops line:\n%s", out)
+	}
+	// Strict order: q0 row, q0 drops, q4 row, q4 drops. A swap would
+	// mean queue 0's row is followed by queue 4's Drops line (or
+	// similar) — exactly the pathology this test guards against.
+	if !(q0RowIdx < q0DropsIdx && q0DropsIdx < q4RowIdx && q4RowIdx < q4DropsIdx) {
+		t.Fatalf(
+			"drops-line interleave broken: q0Row=%d q0Drops=%d q4Row=%d q4Drops=%d\n%s",
+			q0RowIdx, q0DropsIdx, q4RowIdx, q4DropsIdx, out,
+		)
+	}
+}
+
 // Zero-valued counters MUST still render — operators need to see the
 // counter is wired, otherwise "no output" is indistinguishable from
 // "counter missing from the pipeline" when chasing #718 / #722.
