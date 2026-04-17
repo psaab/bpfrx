@@ -2728,6 +2728,22 @@ fn cos_flow_bucket_index(queue_seed: u64, flow_key: Option<&SessionKey>) -> usiz
     usize::from(exact_cos_flow_bucket(queue_seed, flow_key)) & COS_FLOW_FAIR_BUCKET_MASK
 }
 
+/// Prospective distinct-flow count: current `active_flow_buckets` plus
+/// one when the target bucket is currently empty (i.e. we are admitting
+/// the first packet of a newly arriving flow). Both admission gates —
+/// the per-flow clamp and the aggregate cap — must use this value so
+/// they stay in lockstep. The original #704 bug was exactly this
+/// denominator drifting: one gate bumped for the new flow, the other
+/// did not, and the new flow's first packet got rejected at the
+/// boundary. Keeping the formula in one place removes that class of
+/// reintroduction risk.
+#[inline]
+fn cos_queue_prospective_active_flows(queue: &CoSQueueRuntime, flow_bucket: usize) -> u64 {
+    u64::from(queue.active_flow_buckets)
+        .saturating_add(u64::from(queue.flow_bucket_bytes[flow_bucket] == 0))
+        .max(1)
+}
+
 #[inline]
 fn cos_queue_flow_share_limit(
     queue: &CoSQueueRuntime,
@@ -2737,9 +2753,7 @@ fn cos_queue_flow_share_limit(
     if !queue.flow_fair {
         return buffer_limit;
     }
-    let prospective_active = u64::from(queue.active_flow_buckets)
-        .saturating_add(u64::from(queue.flow_bucket_bytes[flow_bucket] == 0))
-        .max(1);
+    let prospective_active = cos_queue_prospective_active_flows(queue, flow_bucket);
     buffer_limit
         .div_ceil(prospective_active)
         .clamp(COS_FLOW_FAIR_MIN_SHARE_BYTES, buffer_limit)
@@ -2777,9 +2791,7 @@ fn cos_flow_aware_buffer_limit(queue: &CoSQueueRuntime, flow_bucket: usize) -> u
     if !queue.flow_fair {
         return base;
     }
-    let prospective_active = u64::from(queue.active_flow_buckets)
-        .saturating_add(u64::from(queue.flow_bucket_bytes[flow_bucket] == 0))
-        .max(1);
+    let prospective_active = cos_queue_prospective_active_flows(queue, flow_bucket);
     base.max(prospective_active.saturating_mul(COS_FLOW_FAIR_MIN_SHARE_BYTES))
 }
 
@@ -8058,7 +8070,10 @@ mod tests {
                 transmit_rate_bytes: 1_000_000_000 / 8,
                 exact: true,
                 surplus_weight: 1,
-                buffer_bytes: 125 * 1024,
+                // Decimal KB to match the operator `buffer-size 125k`
+                // config, not KiB — the admission-boundary math must
+                // use the same units as the live system.
+                buffer_bytes: 125_000,
                 dscp_rewrite: None,
             }],
         );
@@ -8114,7 +8129,10 @@ mod tests {
                 transmit_rate_bytes: 1_000_000_000 / 8,
                 exact: true,
                 surplus_weight: 1,
-                buffer_bytes: 125 * 1024,
+                // Decimal KB to match the operator `buffer-size 125k`
+                // config, not KiB — the admission-boundary math must
+                // use the same units as the live system.
+                buffer_bytes: 125_000,
                 dscp_rewrite: None,
             }],
         );
@@ -8222,7 +8240,10 @@ mod tests {
                 transmit_rate_bytes: 1_000_000_000 / 8,
                 exact: true,
                 surplus_weight: 1,
-                buffer_bytes: 125 * 1024,
+                // Decimal KB to match the operator `buffer-size 125k`
+                // config, not KiB — the admission-boundary math must
+                // use the same units as the live system.
+                buffer_bytes: 125_000,
                 dscp_rewrite: None,
             }],
         );
