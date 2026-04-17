@@ -471,6 +471,12 @@ type CoSQueueStatus struct {
 	AdmissionFlowShareDrops uint64 `json:"admission_flow_share_drops,omitempty"`
 	AdmissionBufferDrops    uint64 `json:"admission_buffer_drops,omitempty"`
 	AdmissionEcnMarked      uint64 `json:"admission_ecn_marked,omitempty"`
+	// #708: per-SFQ-bucket pacing-gate drops. See Rust
+	// `CoSQueueStatus::admission_pacing_drops` for semantics — sits
+	// after the ECN marker in the admission pipeline so a non-zero
+	// pacing count WITH a steady ECN-marked count is the expected
+	// shape on the post-#728 baseline.
+	AdmissionPacingDrops uint64 `json:"admission_pacing_drops,omitempty"`
 	// #709: owner-profile telemetry. Populated on exact queues with
 	// single owner binding; zero for shared_exact / non-exact. See
 	// docs/709-owner-hotspot-plan.md for the decision tree these

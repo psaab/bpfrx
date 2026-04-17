@@ -31,11 +31,14 @@ type cosQueueView struct {
 	parked          int
 	nextWakeupTick  uint64
 	surplusDeficit  uint64
-	// #710/#718: admission-path counters sourced from runtime. Zero values
-	// are still rendered — operators need to see the counter exists.
+	// #710/#718/#708: admission-path counters sourced from runtime.
+	// Zero values are still rendered — operators need to see the
+	// counter exists so they can distinguish "telemetry wired but
+	// nothing dropping" from "telemetry missing".
 	admissionFlowShareDrops uint64
 	admissionBufferDrops    uint64
 	admissionEcnMarked      uint64
+	admissionPacingDrops    uint64
 	// #709: owner-profile telemetry for exact queues with single
 	// owner binding. When ownerWorker is set AND these fields are
 	// non-default, the formatter renders a second indented line under
@@ -169,10 +172,11 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 				continue
 			}
 			queue := queues[queueIdx]
-			fmt.Fprintf(&b, "           Drops: flow_share=%d  buffer=%d  ecn_marked=%d\n",
+			fmt.Fprintf(&b, "           Drops: flow_share=%d  buffer=%d  ecn_marked=%d  pacing=%d\n",
 				queue.admissionFlowShareDrops,
 				queue.admissionBufferDrops,
 				queue.admissionEcnMarked,
+				queue.admissionPacingDrops,
 			)
 			// #709: OwnerProfile line — rendered only for exact queues
 			// with a named owner worker. Non-exact / shared_exact
@@ -338,6 +342,7 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 			qv.admissionFlowShareDrops = runtimeQueue.AdmissionFlowShareDrops
 			qv.admissionBufferDrops = runtimeQueue.AdmissionBufferDrops
 			qv.admissionEcnMarked = runtimeQueue.AdmissionEcnMarked
+			qv.admissionPacingDrops = runtimeQueue.AdmissionPacingDrops
 			// #709: owner-profile telemetry copied from the runtime
 			// snapshot. The Rust side populates these only when the
 			// queue has a single owner binding (exact && !shared_exact);
