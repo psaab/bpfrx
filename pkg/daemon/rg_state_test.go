@@ -858,6 +858,42 @@ func TestRGStateMachine_ShouldLogRetry_GatesPerStreak(t *testing.T) {
 	}
 }
 
+// TestRGStateMachine_ApplyIfCurrentClearsLogGates pins a reviewer
+// finding on #757: the cluster/VRRP event handlers apply via
+// ApplyIfCurrent(), not MarkApplied(). If only MarkApplied() cleared
+// the log-once gates, a fresh failure streak after an ApplyIfCurrent
+// success would stay silent. Both reset paths must behave identically.
+func TestRGStateMachine_ApplyIfCurrentClearsLogGates(t *testing.T) {
+	s := newRGStateMachine()
+
+	// Start a failure streak: one INFO + one WARN fire.
+	if !s.ShouldLogRetry() {
+		t.Fatal("first retry INFO should fire")
+	}
+	if !s.ShouldLogApplyError("err-X") {
+		t.Fatal("first WARN should fire")
+	}
+	// Subsequent calls in the same streak are silent.
+	if s.ShouldLogRetry() || s.ShouldLogApplyError("err-X") {
+		t.Fatal("same streak should be silent")
+	}
+
+	// Grab a current transition and apply it via ApplyIfCurrent.
+	tr := s.SetCluster(true)
+	if !s.ApplyIfCurrent(tr) {
+		t.Fatal("ApplyIfCurrent must succeed when epoch matches")
+	}
+
+	// After the success, the gates must be cleared — a fresh
+	// failure streak must surface both INFO and WARN again.
+	if !s.ShouldLogRetry() {
+		t.Fatal("ApplyIfCurrent must clear lastRetryLogged so next streak logs")
+	}
+	if !s.ShouldLogApplyError("err-X") {
+		t.Fatal("ApplyIfCurrent must clear lastApplyErrMsg so next streak logs")
+	}
+}
+
 // TestRGStateMachine_ShouldLogApplyError_OnlyOnMessageChange pins the
 // #757 fix for the WARN half: repeated identical errors stay silent,
 // but a new/changed error text re-fires. Combined with the retry gate,

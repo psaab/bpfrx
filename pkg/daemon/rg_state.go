@@ -55,8 +55,13 @@ type rgStateMachine struct {
 	// UpdateRGActive every 500ms when applied != desired. Without these
 	// gates, the "retrying" INFO and "failed" WARN fire every tick —
 	// 9+ lines/sec per cluster, which buries real diagnostics.
-	lastRetryLogged  bool   // "retrying" INFO emitted since last apply/error change
-	lastApplyErrMsg  string // text of last error that was WARN'd (empty = not warned)
+	//
+	// Reset contract: both fields are cleared by MarkApplied() AND by
+	// ApplyIfCurrent() on success. A successful apply starts a fresh
+	// streak so the next failure surfaces one WARN and the next retry
+	// streak surfaces one INFO.
+	lastRetryLogged bool   // "retrying" INFO already emitted for the current failure streak
+	lastApplyErrMsg string // text of last error WARN'd in the current failure streak (empty = not warned)
 }
 
 // rgTransition is returned by state machine updates to inform the caller
@@ -223,6 +228,13 @@ func (s *rgStateMachine) ApplyIfCurrent(tr rgTransition) bool {
 	if s.applied == s.active {
 		s.applyPending = false
 	}
+	// Mirror MarkApplied()'s reset of the log-once gates (#757).
+	// Without this, an apply path that uses ApplyIfCurrent() instead
+	// of MarkApplied() (e.g. the cluster/VRRP event handlers via
+	// recordRGActiveAppliedIfCurrentOrStable) leaves the gates stuck
+	// — the next failure streak would stay silent.
+	s.lastRetryLogged = false
+	s.lastApplyErrMsg = ""
 	return true
 }
 
