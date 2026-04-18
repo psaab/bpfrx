@@ -2,6 +2,23 @@
 
 ## 2026-04-17
 
+- **Timestamp**: 2026-04-17T19:30:00Z
+  - **Action**: Issue #735 — #708 pacing retry with `share_cap` burst cap.
+    Cherry-picked the reverted #734 implementation (af884420) and changed
+    exactly one policy: the pacing burst cap went from
+    `COS_FLOW_FAIR_MIN_SHARE_BYTES` (24 KB, fast-retransmit floor) to the
+    per-flow `share_cap` returned by `cos_queue_flow_share_limit`
+    (≈76 KB at 16 flows / 1 Gbps). Threaded `buffer_limit` into
+    `refill_cos_flow_bucket_tokens` — `buffer_limit` was already in scope
+    at the call site for the flow_share / buffer gates, one value, three
+    consumers. Replaced the MIN_SHARE-floor burst-cap test with three new
+    ones: `pacing_burst_cap_is_share_cap_not_min_share` (counter-factual
+    pinning both formulas at deploy config), `pacing_burst_cap_scales_with_active_flows`
+    (4- and 64-flow pin), `pacing_burst_cap_respects_min_share_floor`
+    (regression guard against removing the clamp). Updated
+    docs/cos-validation-notes.md with the new policy rationale.
+  - **File(s)**: userspace-dp/src/afxdp/tx.rs, docs/cos-validation-notes.md, _Log.md
+
 - **Timestamp**: 2026-04-17T17:00:00Z
   - **Action**: Issue #708 Option B — Per-SFQ-bucket token-bucket pacing slice. Added `flow_bucket_tokens: [u64; 1024]` and `flow_bucket_last_refill_ns: [u64; 1024]` on CoSQueueRuntime, `admission_pacing_drops` counter on CoSQueueDropCounters, and a new helper `refill_cos_flow_bucket_tokens()` + `cos_flow_bucket_pacing_exceeded()` gate inline in `enqueue_cos_item`. Gate sits AFTER `apply_cos_admission_ecn_policy` to preserve #718's ECN ordering invariant. Drop-reason attribution order: flow_share > pacing > buffer. Lazy per-bucket refill strategy (O(1) hot path, 8 KB/queue overhead) vs plan §4's shared-timestamp O(1024) strategy. Added 7 Rust tests including a counter-factual pin for the ECN-ordering invariant. Extended Go cosfmt Drops line with `pacing=N` column and added `TestFormatCoSInterfaceSummaryRendersZeroPacingDropsExplicitly`. Added `xpf_cos_admission_pacing_drops_total` Prometheus counter. Updated cos-validation-notes.md decision tree with the new column.
   - **File(s)**: userspace-dp/src/afxdp/types.rs, userspace-dp/src/afxdp/tx.rs, userspace-dp/src/afxdp/worker.rs, userspace-dp/src/afxdp/coordinator.rs, userspace-dp/src/protocol.rs, pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/cosfmt.go, pkg/dataplane/userspace/cosfmt_test.go, pkg/api/metrics.go, docs/cos-validation-notes.md

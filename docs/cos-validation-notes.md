@@ -52,9 +52,23 @@ bucket has fewer pacing tokens than the packet's byte count. The
 refill rate is `queue.transmit_rate_bytes /
 cos_queue_prospective_active_flows()` (same denominator the per-flow
 share cap uses — centralised via #704's single-source-of-truth
-rule), clamped to a burst ceiling of `COS_FLOW_FAIR_MIN_SHARE_BYTES`
-so the gate cannot silently disable itself for a freshly-arriving
-flow. Expected signals at read time:
+rule), clamped to a burst ceiling of the per-flow `share_cap`
+returned by `cos_queue_flow_share_limit` (#735). That is
+approximately 76 KB on the 16-flow / 1 Gbps deploy config and
+scales inversely with active flow count via the shared denominator;
+the floor is `COS_FLOW_FAIR_MIN_SHARE_BYTES` (fast-retransmit
+window) via the existing clamp inside `cos_queue_flow_share_limit`.
+
+The first attempt (#734) pinned the burst cap to
+`COS_FLOW_FAIR_MIN_SHARE_BYTES` directly. Live measurement showed
+that capped normal TCP cubic cwnd and converted ECN marks into
+tail-drops (retrans doubled from ~120k to ~260k / 30s). The retry
+(#735) raises the cap to `share_cap` so pacing still catches
+egregious microbursts (a flow attempting multiple flow-shares'
+worth of admission in one tick) while leaving steady-state cwnd
+unaffected.
+
+Expected signals at read time:
 
 - **Non-zero `pacing`, non-zero `ecn_marked`, low `flow_share`** —
   pacing is doing the microburst smoothing the plan predicted. ECN
