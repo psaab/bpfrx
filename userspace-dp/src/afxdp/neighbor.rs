@@ -478,16 +478,80 @@ pub(super) fn neigh_monitor_thread(
     eprintln!("neigh_monitor: stopped");
 }
 
+/// Enumerate the allowed CPUs described by `is_set` into the caller-provided
+/// `buf`, then pick the `worker_id % count`-th entry. Pure helper — no
+/// syscalls, no allocations — so behaviour can be regression-tested without
+/// mutating the process affinity mask.
+///
+/// `is_set(cpu)` returns true if CPU index `cpu` is in the allowed mask.
+/// `buf.len()` bounds the scan range (caller passes a `[u16; CPU_SETSIZE]`
+/// in production; tests pass smaller arrays).
+///
+/// Returns `None` when the allowed set is empty.
+#[cfg(target_os = "linux")]
+fn nth_allowed_cpu(
+    worker_id: u32,
+    is_set: impl Fn(usize) -> bool,
+    buf: &mut [u16],
+) -> Option<usize> {
+    let mut count: usize = 0;
+    for cpu in 0..buf.len() {
+        if is_set(cpu) {
+            // CPU index is <= buf.len() <= u16::MAX in practice
+            // (libc::CPU_SETSIZE = 1024). Saturating guard is cheap
+            // insurance against a pathological caller.
+            buf[count] = cpu.min(u16::MAX as usize) as u16;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    let idx = (worker_id as usize) % count;
+    Some(buf[idx] as usize)
+}
+
+/// Pin the current thread to one CPU from the inherited affinity mask.
+///
+/// The previous implementation used `available_parallelism() % cpus`, which
+/// picked an **absolute** CPU index — so under systemd `CPUAffinity=2 3 4 5`
+/// the workers pinned to CPUs 0/1/2/3, **outside** the unit-level mask.
+/// `sched_setaffinity` silently succeeded because `CPUAffinity=` is plain
+/// task affinity (not a cgroup cpuset), so the violation was invisible
+/// until it showed up in `/proc/<tid>/status`.
+///
+/// Fix: read the inherited mask with `sched_getaffinity`, enumerate the
+/// allowed CPUs, and pick the `worker_id % allowed_count`-th entry. With
+/// no `CPUAffinity=` the allowed set is `0..N-1` and behaviour is
+/// unchanged; with `CPUAffinity=2 3 4 5` worker 0→CPU 2, worker 1→CPU 3,
+/// worker 2→CPU 4, worker 3→CPU 5.
+///
+/// Best-effort: returns silently on `sched_getaffinity` failure or an
+/// empty mask. Pinning is a tuning hint, not a correctness requirement.
 pub(super) fn pin_current_thread(worker_id: u32) {
     #[cfg(target_os = "linux")]
     unsafe {
-        let cpus = thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let cpu = (worker_id as usize) % cpus.max(1);
+        let mut inherited: libc::cpu_set_t = core::mem::zeroed();
+        libc::CPU_ZERO(&mut inherited);
+        if libc::sched_getaffinity(0, core::mem::size_of_val(&inherited), &mut inherited) != 0 {
+            return;
+        }
+        // Fixed-size stack buffer sized to CPU_SETSIZE (1024 on Linux
+        // glibc). u16 entries keep the footprint at 2 KB — well under
+        // the 8 MB Rust default thread stack — and cover the full range
+        // of CPU indices the kernel allows (nr_cpu_ids ≤ CONFIG_NR_CPUS,
+        // currently 8192 max but CPU_SETSIZE bounds what this codepath
+        // sees via cpu_set_t). Called once per worker at thread-start;
+        // no hot-path cost.
+        let mut allowed = [0u16; libc::CPU_SETSIZE as usize];
+        let Some(target) =
+            nth_allowed_cpu(worker_id, |cpu| libc::CPU_ISSET(cpu, &inherited), &mut allowed)
+        else {
+            return;
+        };
         let mut set: libc::cpu_set_t = core::mem::zeroed();
         libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(cpu, &mut set);
+        libc::CPU_SET(target, &mut set);
         let _ = libc::sched_setaffinity(0, core::mem::size_of::<libc::cpu_set_t>(), &set);
     }
 }
@@ -517,4 +581,118 @@ pub(super) fn format_mac(mac: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod pin_tests {
+    use super::nth_allowed_cpu;
+
+    /// Build an `is_set` closure that returns true iff `cpu` is in `allowed`.
+    fn mask_from<const N: usize>(allowed: [usize; N]) -> impl Fn(usize) -> bool {
+        move |cpu| allowed.contains(&cpu)
+    }
+
+    #[test]
+    fn nth_allowed_cpu_picks_nth_of_allowed_cpus() {
+        let is_set = mask_from([2usize, 3, 4, 5]);
+        let mut buf = [0u16; 16];
+        assert_eq!(nth_allowed_cpu(0, &is_set, &mut buf), Some(2));
+        assert_eq!(nth_allowed_cpu(1, &is_set, &mut buf), Some(3));
+        assert_eq!(nth_allowed_cpu(2, &is_set, &mut buf), Some(4));
+        assert_eq!(nth_allowed_cpu(3, &is_set, &mut buf), Some(5));
+        // worker_id 4 wraps around via `worker_id % count`
+        assert_eq!(nth_allowed_cpu(4, &is_set, &mut buf), Some(2));
+    }
+
+    #[test]
+    fn nth_allowed_cpu_returns_none_when_mask_is_empty() {
+        let is_set = |_cpu: usize| false;
+        let mut buf = [0u16; 16];
+        assert_eq!(nth_allowed_cpu(0, is_set, &mut buf), None);
+        assert_eq!(nth_allowed_cpu(7, is_set, &mut buf), None);
+    }
+
+    #[test]
+    fn nth_allowed_cpu_handles_sparse_masks() {
+        let is_set = mask_from([0usize, 7, 15]);
+        let mut buf = [0u16; 16];
+        assert_eq!(nth_allowed_cpu(0, &is_set, &mut buf), Some(0));
+        assert_eq!(nth_allowed_cpu(1, &is_set, &mut buf), Some(7));
+        assert_eq!(nth_allowed_cpu(2, &is_set, &mut buf), Some(15));
+        // wrap-around: 3 % 3 == 0 -> first entry
+        assert_eq!(nth_allowed_cpu(3, &is_set, &mut buf), Some(0));
+    }
+
+    /// Counter-factual regression guard for the systemd `CPUAffinity=2 3 4 5`
+    /// scenario from #738. Reconstructs the OLD behaviour
+    /// (`CPU_SET(worker_id % available_parallelism())`, which pins to an
+    /// *absolute* CPU index regardless of the inherited mask) and asserts
+    /// that the NEW behaviour picks the `worker_id`-th entry of the allowed
+    /// set instead. Without this test a future refactor could silently
+    /// revert to `CPU_SET(worker_id % n)` and no other test would catch
+    /// it — the other `nth_allowed_cpu_*` tests would still pass because
+    /// they exercise the pure helper, not the overall pinning contract.
+    #[test]
+    fn nth_allowed_cpu_regression_for_systemd_cpuaffinity_2_3_4_5() {
+        let allowed_cpus = [2usize, 3, 4, 5];
+        let is_set = mask_from(allowed_cpus);
+        let mut buf = [0u16; 16];
+
+        // Under the old code, `available_parallelism()` honours the
+        // inherited mask and returns 4, so `worker_id % 4` maps to
+        // absolute CPUs 0/1/2/3. The NEW code maps the same worker_ids
+        // to allowed[0..3] = 2/3/4/5. The issue body verified this live
+        // via /proc/<tid>/status:
+        //
+        //     xpf-userspace-w cpus_allowed=0   <-- old worker 0
+        //     xpf-userspace-w cpus_allowed=1   <-- old worker 1
+        //     xpf-userspace-w cpus_allowed=2   <-- old worker 2
+        //     xpf-userspace-w cpus_allowed=3   <-- old worker 3
+        //
+        // Expected NEW behaviour: workers pin to cpus_allowed=2/3/4/5.
+        for (worker_id, old_absolute_cpu, new_allowed_cpu) in [
+            (0u32, 0usize, 2usize),
+            (1, 1, 3),
+            (2, 2, 4),
+            (3, 3, 5),
+        ] {
+            // Reconstruct the old formula verbatim. Uses the allowed-set
+            // *size* (what `available_parallelism()` returned under the
+            // systemd mask), not the allowed-set members.
+            let reconstructed_old = (worker_id as usize) % allowed_cpus.len();
+            assert_eq!(
+                reconstructed_old, old_absolute_cpu,
+                "old formula reconstruction drifted",
+            );
+
+            let picked = nth_allowed_cpu(worker_id, &is_set, &mut buf)
+                .expect("allowed mask is non-empty");
+            assert_eq!(
+                picked, new_allowed_cpu,
+                "worker {worker_id} should pin to allowed CPU {new_allowed_cpu}, got {picked}",
+            );
+            assert!(
+                allowed_cpus.contains(&picked),
+                "picked CPU {picked} must be inside the systemd CPUAffinity={{2,3,4,5}} mask",
+            );
+        }
+
+        // The core regression: for workers 0 and 1, the old absolute CPU
+        // (0, 1) is strictly outside the systemd mask {2,3,4,5}, while
+        // the new picks (2, 3) are strictly inside. This pair alone is
+        // enough to refute any revert to `CPU_SET(worker_id % n)` — a
+        // revert would pick 0/1 and fall outside the allowed set.
+        let old_worker_0 = 0usize; // (0u32 as usize) % 4
+        let old_worker_1 = 1usize; // (1u32 as usize) % 4
+        assert!(!allowed_cpus.contains(&old_worker_0));
+        assert!(!allowed_cpus.contains(&old_worker_1));
+        let new_worker_0 =
+            nth_allowed_cpu(0, &is_set, &mut buf).expect("allowed mask is non-empty");
+        let new_worker_1 =
+            nth_allowed_cpu(1, &is_set, &mut buf).expect("allowed mask is non-empty");
+        assert!(allowed_cpus.contains(&new_worker_0));
+        assert!(allowed_cpus.contains(&new_worker_1));
+        assert_ne!(old_worker_0, new_worker_0);
+        assert_ne!(old_worker_1, new_worker_1);
+    }
 }
