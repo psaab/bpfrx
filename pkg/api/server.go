@@ -30,6 +30,16 @@ import (
 	"github.com/psaab/xpf/pkg/vrrp"
 )
 
+// CompileHealthSnapshot mirrors daemon.CompileHealth without the import.
+// Keeping pkg/api -> pkg/daemon free of a back-edge preserves the layered
+// build shape; the daemon injects a callback that returns this struct.
+type CompileHealthSnapshot struct {
+	EverSucceeded    bool
+	FailureCount     uint64
+	LastError        string
+	LastErrorUnixSec int64
+}
+
 // Config configures the API server.
 type Config struct {
 	Addr      string
@@ -46,6 +56,12 @@ type Config struct {
 	DHCP      *dhcp.Manager
 	VRRPMgr   *vrrp.Manager       // native VRRP manager
 	ApplyFn   func(*config.Config) // daemon's applyConfig callback
+	// CompileHealthFn surfaces dataplane compile state via /health (#758).
+	// Returning a snapshot with EverSucceeded=false and FailureCount>0
+	// makes /health return 503 so operators see the degraded state
+	// instead of reading "status: ok" alongside a one-shot WARN in the
+	// journal. Optional; if nil, /health keeps the pre-#758 behaviour.
+	CompileHealthFn func() CompileHealthSnapshot
 }
 
 // Server is the HTTP API server.
@@ -60,9 +76,10 @@ type Server struct {
 	frr         *frr.Manager
 	ipsec       *ipsec.Manager
 	dhcp        *dhcp.Manager
-	vrrpMgr     *vrrp.Manager
-	applyFn     func(*config.Config)
-	startTime   time.Time
+	vrrpMgr         *vrrp.Manager
+	applyFn         func(*config.Config)
+	compileHealthFn func() CompileHealthSnapshot
+	startTime       time.Time
 }
 
 // NewServer creates a new API server.
@@ -76,9 +93,10 @@ func NewServer(cfg Config) *Server {
 		frr:       cfg.FRR,
 		ipsec:     cfg.IPsec,
 		dhcp:      cfg.DHCP,
-		vrrpMgr:   cfg.VRRPMgr,
-		applyFn:   cfg.ApplyFn,
-		startTime: time.Now(),
+		vrrpMgr:         cfg.VRRPMgr,
+		applyFn:         cfg.ApplyFn,
+		compileHealthFn: cfg.CompileHealthFn,
+		startTime:       time.Now(),
 	}
 
 	mux := http.NewServeMux()

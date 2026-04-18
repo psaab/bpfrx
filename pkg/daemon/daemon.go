@@ -250,6 +250,76 @@ type Daemon struct {
 	// not rerun the same barrier sequence immediately afterward.
 	userspaceDemotionPrepMu    sync.Mutex
 	userspaceDemotionPrepUntil map[int]time.Time
+
+	// Compile health (#758). If dataplane compile fails and never
+	// succeeds, the daemon is in a degraded state: config is accepted
+	// but the forwarding path may be partial or absent. Track this so
+	// /health can surface it and operators aren't left staring at a
+	// single pre-existing WARN line with no other signal.
+	compileHealthMu         sync.Mutex
+	compileFailureCount     uint64 // total failed compiles since daemon start
+	compileEverSucceeded    bool   // true once any compile completed cleanly
+	compileLastError        string // text of the most recent compile error
+	compileLastErrorUnixSec int64  // timestamp of the most recent compile error
+}
+
+// CompileHealth is a snapshot of dataplane compile health (#758).
+// Consumed by /health to surface a degraded state instead of returning
+// OK when the dataplane never compiled successfully.
+type CompileHealth struct {
+	EverSucceeded    bool
+	FailureCount     uint64
+	LastError        string
+	LastErrorUnixSec int64
+}
+
+// recordCompileFailure tracks a dataplane compile failure and emits an
+// escalating log (#758). The first failure remains a single WARN;
+// every Nth repeat re-emits at ERROR level so an operator tailing the
+// journal sees the degraded state without needing to know the original
+// failure text. A success clears the counter via recordCompileSuccess.
+func (d *Daemon) recordCompileFailure(err error) {
+	d.compileHealthMu.Lock()
+	d.compileFailureCount++
+	d.compileLastError = err.Error()
+	d.compileLastErrorUnixSec = time.Now().Unix()
+	count := d.compileFailureCount
+	everOk := d.compileEverSucceeded
+	d.compileHealthMu.Unlock()
+
+	// First WARN fires on every failure — matches pre-#758 behaviour.
+	// Escalate to ERROR on the 5th consecutive failure with no prior
+	// success, and again every 10 failures thereafter, so a persistent
+	// degraded state stays visible in the log without flooding.
+	slog.Warn("failed to compile dataplane", "err", err, "attempt", count, "ever_ok", everOk)
+	if !everOk && (count == 5 || (count > 5 && count%10 == 0)) {
+		slog.Error("dataplane compile has failed repeatedly; forwarding path is degraded",
+			"attempt", count, "err", err)
+	}
+}
+
+// recordCompileSuccess clears compile failure state. The failure count
+// is intentionally preserved as a monotonic "have we ever hit this"
+// counter (exported via CompileHealthSnapshot), but the "ever ok" flag
+// flips true so /health goes back to healthy.
+func (d *Daemon) recordCompileSuccess() {
+	d.compileHealthMu.Lock()
+	d.compileEverSucceeded = true
+	d.compileLastError = ""
+	d.compileHealthMu.Unlock()
+}
+
+// CompileHealthSnapshot returns the current compile health for /health
+// and operator-facing RPCs. Safe to call concurrently.
+func (d *Daemon) CompileHealthSnapshot() CompileHealth {
+	d.compileHealthMu.Lock()
+	defer d.compileHealthMu.Unlock()
+	return CompileHealth{
+		EverSucceeded:    d.compileEverSucceeded,
+		FailureCount:     d.compileFailureCount,
+		LastError:        d.compileLastError,
+		LastErrorUnixSec: d.compileLastErrorUnixSec,
+	}
 }
 
 const standbyNeighborRefreshMinInterval = time.Second
@@ -845,6 +915,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 			DHCP:     d.dhcp,
 			VRRPMgr:  d.vrrpMgr,
 			ApplyFn:  d.applyConfig,
+			// #758: surface compile state so /health returns 503
+			// when the dataplane has never compiled successfully.
+			CompileHealthFn: func() api.CompileHealthSnapshot {
+				h := d.CompileHealthSnapshot()
+				return api.CompileHealthSnapshot{
+					EverSucceeded:    h.EverSucceeded,
+					FailureCount:     h.FailureCount,
+					LastError:        h.LastError,
+					LastErrorUnixSec: h.LastErrorUnixSec,
+				}
+			},
 		}
 		// Resolve interface bindings from web-management config
 		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Services != nil &&
@@ -1642,7 +1723,9 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	if d.dp != nil {
 		var err error
 		if compileResult, err = d.dp.Compile(cfg); err != nil {
-			slog.Warn("failed to compile dataplane", "err", err)
+			d.recordCompileFailure(err)
+		} else {
+			d.recordCompileSuccess()
 		}
 	}
 
