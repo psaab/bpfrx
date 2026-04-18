@@ -304,11 +304,15 @@ struct {
 	__type(value, struct counter_value);
 } zone_counters SEC(".maps");
 
+/* Keyed on kernel ifindex which can exceed MAX_INTERFACES on long-lived
+ * VMs/namespaces (incus/k8s). HASH + NO_PREALLOC allocates only for
+ * registered interfaces and accepts arbitrary ifindex values. */
 struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(type, BPF_MAP_TYPE_PERCPU_HASH);
 	__uint(max_entries, MAX_INTERFACES);
 	__type(key, __u32);
 	__type(value, struct iface_counter_value);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
 } interface_counters SEC(".maps");
 
 struct {
@@ -336,8 +340,11 @@ struct {
  * Forwarding -- device map for XDP_REDIRECT
  * ============================================================ */
 
+/* DEVMAP_HASH accepts sparse ifindex keys; kernel ifindex can exceed
+ * MAX_INTERFACES on long-lived namespaces. bpf_redirect_map() behaves
+ * identically on DEVMAP and DEVMAP_HASH. */
 struct {
-	__uint(type, BPF_MAP_TYPE_DEVMAP);
+	__uint(type, BPF_MAP_TYPE_DEVMAP_HASH);
 	__uint(max_entries, MAX_INTERFACES);
 	__type(key, __u32);
 	__type(value, struct bpf_devmap_val);
@@ -345,12 +352,14 @@ struct {
 
 /* Per-interface flag: 1 = native XDP redirect capable (has ndo_xdp_xmit).
  * xdp_forward checks this before bpf_redirect_map; interfaces without
- * native redirect support get XDP_PASS so the kernel forwards instead. */
+ * native redirect support get XDP_PASS so the kernel forwards instead.
+ * HASH + NO_PREALLOC tolerates sparse ifindex values. */
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_INTERFACES);
 	__type(key, __u32);
 	__type(value, __u8);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
 } redirect_capable SEC(".maps");
 
 /* ============================================================
@@ -777,11 +786,13 @@ struct {
  * Key: ingress ifindex, Value: mirror destination + rate
  * ============================================================ */
 
+/* HASH + NO_PREALLOC accepts sparse ifindex keys (see tx_ports). */
 struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, MAX_INTERFACES);
 	__type(key, __u32);
 	__type(value, struct mirror_config);
+	__uint(map_flags, BPF_F_NO_PREALLOC);
 } mirror_config SEC(".maps");
 
 /* Per-CPU counter for 1-in-N mirror sampling */

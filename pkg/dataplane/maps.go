@@ -841,15 +841,24 @@ func (m *Manager) SetMirrorConfig(ifindex int, mirrorIfindex int, rate uint32) e
 	return zm.Update(uint32(ifindex), val, ebpf.UpdateAny)
 }
 
-// ClearMirrorConfigs zeroes all mirror_config entries.
+// ClearMirrorConfigs removes all mirror_config entries.
+// mirror_config is a HASH (#756): iterate-and-delete existing keys.
 func (m *Manager) ClearMirrorConfigs() error {
 	zm, ok := m.maps["mirror_config"]
 	if !ok {
 		return fmt.Errorf("mirror_config map not found")
 	}
-	empty := MirrorConfig{}
-	for i := uint32(0); i < 256; i++ {
-		zm.Update(i, empty, ebpf.UpdateAny)
+	var key uint32
+	var val MirrorConfig
+	iter := zm.Iterate()
+	var keys []uint32
+	for iter.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	for _, k := range keys {
+		if err := zm.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("delete mirror_config %d: %w", k, err)
+		}
 	}
 	return nil
 }
@@ -914,6 +923,8 @@ func (m *Manager) ReadFloodCounters(zoneID uint16) (FloodState, error) {
 }
 
 // ReadInterfaceCounters reads the per-CPU interface counter values and sums them.
+// interface_counters is a PERCPU_HASH (#756): a missing key simply means
+// no traffic has traversed the interface yet, which reads as zero.
 func (m *Manager) ReadInterfaceCounters(ifindex int) (InterfaceCounterValue, error) {
 	zm, ok := m.maps["interface_counters"]
 	if !ok {
@@ -921,6 +932,9 @@ func (m *Manager) ReadInterfaceCounters(ifindex int) (InterfaceCounterValue, err
 	}
 	var perCPU []InterfaceCounterValue
 	if err := zm.Lookup(uint32(ifindex), &perCPU); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return InterfaceCounterValue{}, nil
+		}
 		return InterfaceCounterValue{}, err
 	}
 	var total InterfaceCounterValue
@@ -1214,6 +1228,8 @@ func (m *Manager) ClearGlobalCounters() error {
 }
 
 // ClearInterfaceCounters zeroes all interface counter entries.
+// interface_counters is a PERCPU_HASH (#756): iterate-and-zero existing
+// keys; missing keys stay absent and read as zero.
 func (m *Manager) ClearInterfaceCounters() error {
 	zm, ok := m.maps["interface_counters"]
 	if !ok {
@@ -1221,8 +1237,15 @@ func (m *Manager) ClearInterfaceCounters() error {
 	}
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]InterfaceCounterValue, numCPUs)
-	for i := uint32(0); i < 256; i++ {
-		zm.Update(i, zero, ebpf.UpdateAny)
+	var key uint32
+	var val []InterfaceCounterValue
+	iter := zm.Iterate()
+	var keys []uint32
+	for iter.Next(&key, &val) {
+		keys = append(keys, key)
+	}
+	for _, k := range keys {
+		_ = zm.Update(k, zero, ebpf.UpdateAny)
 	}
 	return nil
 }

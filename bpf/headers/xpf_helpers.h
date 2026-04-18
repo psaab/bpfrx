@@ -1029,10 +1029,18 @@ inc_screen_counter(__u32 screen_flag)
 	inc_counter(idx);
 }
 
+/* interface_counters is a PERCPU_HASH (#756). On the first packet for a
+ * given ifindex, lookup returns NULL; seed the entry with zeros then
+ * increment. The NOEXIST flag makes the seeding race-safe across cores. */
 static __always_inline void
 inc_iface_rx(__u32 ifindex, __u32 pkt_len)
 {
 	struct iface_counter_value *ic = bpf_map_lookup_elem(&interface_counters, &ifindex);
+	if (!ic) {
+		struct iface_counter_value zero = {};
+		bpf_map_update_elem(&interface_counters, &ifindex, &zero, BPF_NOEXIST);
+		ic = bpf_map_lookup_elem(&interface_counters, &ifindex);
+	}
 	if (ic) { ic->rx_packets++; ic->rx_bytes += pkt_len; }
 }
 
@@ -1040,6 +1048,11 @@ static __always_inline void
 inc_iface_tx(__u32 ifindex, __u32 pkt_len)
 {
 	struct iface_counter_value *ic = bpf_map_lookup_elem(&interface_counters, &ifindex);
+	if (!ic) {
+		struct iface_counter_value zero = {};
+		bpf_map_update_elem(&interface_counters, &ifindex, &zero, BPF_NOEXIST);
+		ic = bpf_map_lookup_elem(&interface_counters, &ifindex);
+	}
 	if (ic) { ic->tx_packets++; ic->tx_bytes += pkt_len; }
 }
 
