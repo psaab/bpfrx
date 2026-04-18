@@ -572,7 +572,9 @@ func (d *Daemon) reconcileRGState() {
 			if tr.Changed {
 				slog.Info("reconcile: correcting rg_active drift",
 					"rg", rgID, "active", tr.Active, "epoch", tr.Epoch)
-			} else {
+			} else if s.ShouldLogRetry() {
+				// #757: only log retry once per apply streak; subsequent
+				// ticks stay silent until MarkApplied() clears the gate.
 				slog.Info("reconcile: retrying rg_active apply",
 					"rg", rgID, "active", tr.Active)
 			}
@@ -580,8 +582,10 @@ func (d *Daemon) reconcileRGState() {
 				// Activation ordering: set rg_active FIRST, then
 				// remove blackholes.
 				if err := d.dp.UpdateRGActive(rgID, true); err != nil {
-					slog.Warn("reconcile: failed to update rg_active",
-						"rg", rgID, "active", true, "err", err)
+					if s.ShouldLogApplyError(err.Error()) {
+						slog.Warn("reconcile: failed to update rg_active",
+							"rg", rgID, "active", true, "err", err)
+					}
 				} else {
 					s.MarkApplied(true)
 					if noRethVRRP && clusterPri && !s.NeedsApply() {
@@ -594,8 +598,10 @@ func (d *Daemon) reconcileRGState() {
 				d.injectBlackholeRoutes(rgID)
 				d.tryPrepareUserspaceRGDemotion(rgID)
 				if err := d.dp.UpdateRGActive(rgID, false); err != nil {
-					slog.Warn("reconcile: failed to update rg_active",
-						"rg", rgID, "active", false, "err", err)
+					if s.ShouldLogApplyError(err.Error()) {
+						slog.Warn("reconcile: failed to update rg_active",
+							"rg", rgID, "active", false, "err", err)
+					}
 				} else {
 					s.MarkApplied(false)
 					d.setLocalFailoverCommitReady(rgID, false)

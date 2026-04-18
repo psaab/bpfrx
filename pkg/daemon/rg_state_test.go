@@ -818,3 +818,112 @@ func TestStrictVIPOwnershipToggle(t *testing.T) {
 		t.Error("IsStrictVIPOwnership should return true")
 	}
 }
+
+// TestRGStateMachine_ShouldLogRetry_GatesPerStreak pins the #757 fix:
+// ShouldLogRetry() returns true once per retry streak, then stays false
+// until MarkApplied() resets the gate. Without this gate, the reconcile
+// loop would log "retrying rg_active apply" at INFO every 500ms tick
+// when the helper is down — 3 RGs × 2 ticks/sec = 6 lines/sec forever.
+func TestRGStateMachine_ShouldLogRetry_GatesPerStreak(t *testing.T) {
+	s := newRGStateMachine()
+
+	// First call in a streak: fires.
+	if !s.ShouldLogRetry() {
+		t.Fatal("first ShouldLogRetry() must fire")
+	}
+	// Subsequent calls in the same streak: silent.
+	for i := 0; i < 10; i++ {
+		if s.ShouldLogRetry() {
+			t.Fatalf("tick %d: retry INFO should be gated", i)
+		}
+	}
+
+	// MarkApplied resets the gate.
+	s.MarkApplied(true)
+	if !s.ShouldLogRetry() {
+		t.Fatal("after MarkApplied, ShouldLogRetry() must fire again on the next streak")
+	}
+
+	// Counter-factual: without the gate, every call would return true —
+	// verify by calling 100x and expecting exactly 1 true.
+	s.MarkApplied(true)
+	fires := 0
+	for i := 0; i < 100; i++ {
+		if s.ShouldLogRetry() {
+			fires++
+		}
+	}
+	if fires != 1 {
+		t.Fatalf("streak-gated retry log fired %d times over 100 ticks, want 1", fires)
+	}
+}
+
+// TestRGStateMachine_ApplyIfCurrentClearsLogGates pins a reviewer
+// finding on #757: the cluster/VRRP event handlers apply via
+// ApplyIfCurrent(), not MarkApplied(). If only MarkApplied() cleared
+// the log-once gates, a fresh failure streak after an ApplyIfCurrent
+// success would stay silent. Both reset paths must behave identically.
+func TestRGStateMachine_ApplyIfCurrentClearsLogGates(t *testing.T) {
+	s := newRGStateMachine()
+
+	// Start a failure streak: one INFO + one WARN fire.
+	if !s.ShouldLogRetry() {
+		t.Fatal("first retry INFO should fire")
+	}
+	if !s.ShouldLogApplyError("err-X") {
+		t.Fatal("first WARN should fire")
+	}
+	// Subsequent calls in the same streak are silent.
+	if s.ShouldLogRetry() || s.ShouldLogApplyError("err-X") {
+		t.Fatal("same streak should be silent")
+	}
+
+	// Grab a current transition and apply it via ApplyIfCurrent.
+	tr := s.SetCluster(true)
+	if !s.ApplyIfCurrent(tr) {
+		t.Fatal("ApplyIfCurrent must succeed when epoch matches")
+	}
+
+	// After the success, the gates must be cleared — a fresh
+	// failure streak must surface both INFO and WARN again.
+	if !s.ShouldLogRetry() {
+		t.Fatal("ApplyIfCurrent must clear lastRetryLogged so next streak logs")
+	}
+	if !s.ShouldLogApplyError("err-X") {
+		t.Fatal("ApplyIfCurrent must clear lastApplyErrMsg so next streak logs")
+	}
+}
+
+// TestRGStateMachine_ShouldLogApplyError_OnlyOnMessageChange pins the
+// #757 fix for the WARN half: repeated identical errors stay silent,
+// but a new/changed error text re-fires. Combined with the retry gate,
+// this keeps the reconcile loop from flooding journald while still
+// surfacing the first failure and any state change.
+func TestRGStateMachine_ShouldLogApplyError_OnlyOnMessageChange(t *testing.T) {
+	s := newRGStateMachine()
+
+	// First error of a given text: fires.
+	if !s.ShouldLogApplyError("control socket not configured") {
+		t.Fatal("first WARN for a new error must fire")
+	}
+	// Same text repeated: silent.
+	for i := 0; i < 50; i++ {
+		if s.ShouldLogApplyError("control socket not configured") {
+			t.Fatalf("tick %d: same error text must be gated", i)
+		}
+	}
+	// Different error text: fires.
+	if !s.ShouldLogApplyError("connection refused") {
+		t.Fatal("WARN on changed error text must fire")
+	}
+	// Same new text repeated: silent.
+	if s.ShouldLogApplyError("connection refused") {
+		t.Fatal("second WARN for the same changed text must be gated")
+	}
+	// MarkApplied clears the gate — the next time the same error recurs
+	// (after a successful apply and a new failure streak), it re-fires.
+	s.MarkApplied(true)
+	if !s.ShouldLogApplyError("connection refused") {
+		t.Fatal("MarkApplied must clear the gate so a recurring error surfaces again")
+	}
+}
