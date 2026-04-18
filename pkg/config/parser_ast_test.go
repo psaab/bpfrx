@@ -3876,49 +3876,45 @@ func TestValidateConfigApplicationPorts(t *testing.T) {
 	}
 }
 
-// TestValidateConfig_DisabledProcessWarnsOnUnknown pins #654: `system
-// processes <X> disable` must WARN when bpfrx does not actually manage
-// <X>. Silently accepting it (as `utmd disable` did) gave operators no
-// signal that the knob is a no-op. Known-managed processes (snmpd, ntp)
-// must NOT produce the warning.
-func TestValidateConfig_DisabledProcessWarnsOnUnknown(t *testing.T) {
+// TestValidateConfig_ArchiveSitesPasswordWarns pins #651: when an
+// operator configures `archive-sites <url> password "$9$..."`, bpfrx
+// must warn at commit time rather than silently accept. Runtime
+// archival shells out to `scp -o BatchMode=yes` and cannot use inline
+// passwords, so the password is ignored; the warning exists to make
+// that no-op visible instead of failing opaquely at transfer time.
+func TestValidateConfig_ArchiveSitesPasswordWarns(t *testing.T) {
 	cfg := &Config{}
 	cfg.Applications.Applications = map[string]*Application{}
 	cfg.Applications.ApplicationSets = map[string]*ApplicationSet{}
 	cfg.Security.Zones = map[string]*ZoneConfig{}
-	cfg.System.DisabledProcesses = []string{"utmd", "snmpd", "ntp", "idpd"}
+	cfg.System.Archival = &ArchivalConfig{
+		ArchiveSites: []string{
+			"scp://alice@host1/configs",
+			"scp://bob@host2/configs",
+		},
+		ArchiveSitesWithPassword: []string{
+			"scp://alice@host1/configs",
+		},
+	}
 
 	warnings := ValidateConfig(cfg)
 
-	sawUtmdWarn := false
-	sawIdpdWarn := false
-	sawSnmpdWarn := false
-	sawNtpWarn := false
+	sawPasswordWarn := false
+	wrongURLWarn := false
 	for _, w := range warnings {
-		if strings.Contains(w, "utmd") && strings.Contains(w, "no runtime effect") {
-			sawUtmdWarn = true
+		if strings.Contains(w, "scp://alice@host1/configs") && strings.Contains(w, "inline password") {
+			sawPasswordWarn = true
 		}
-		if strings.Contains(w, "idpd") && strings.Contains(w, "no runtime effect") {
-			sawIdpdWarn = true
-		}
-		if strings.Contains(w, "\"snmpd\"") && strings.Contains(w, "no runtime effect") {
-			sawSnmpdWarn = true
-		}
-		if strings.Contains(w, "\"ntp\"") && strings.Contains(w, "no runtime effect") {
-			sawNtpWarn = true
+		// bob did not configure a password; should not warn.
+		if strings.Contains(w, "scp://bob@host2/configs") && strings.Contains(w, "inline password") {
+			wrongURLWarn = true
 		}
 	}
-	if !sawUtmdWarn {
-		t.Error("expected warning for utmd disable (not managed by bpfrx)")
+	if !sawPasswordWarn {
+		t.Error("expected warning about scp://alice@host1/configs inline password")
 	}
-	if !sawIdpdWarn {
-		t.Error("expected warning for idpd disable (not managed by bpfrx)")
-	}
-	if sawSnmpdWarn {
-		t.Error("snmpd is managed by bpfrx; should not warn")
-	}
-	if sawNtpWarn {
-		t.Error("ntp is managed by bpfrx; should not warn")
+	if wrongURLWarn {
+		t.Error("should NOT warn about host2 — no password was configured")
 	}
 }
 

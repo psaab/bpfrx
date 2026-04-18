@@ -147,13 +147,51 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 					}
 				}
 				for _, asNode := range cfgNode.FindChildren("archive-sites") {
-					if asNode.IsLeaf && len(asNode.Keys) >= 2 {
-						// Flat set syntax: archive-sites <url>;
-						sys.Archival.ArchiveSites = append(sys.Archival.ArchiveSites, asNode.Keys[1])
+					// Flat-set form (`set ... archive-sites <url>
+					// [password <s>]`): schema consumes the URL as a
+					// trailing key, so asNode.Keys = ["archive-sites",
+					// URL]. Password lands either in subsequent keys
+					// (leaf form) or as a child leaf (Keys=["password",
+					// "$9$..."]).
+					if len(asNode.Keys) >= 2 {
+						url := asNode.Keys[1]
+						sys.Archival.ArchiveSites = append(sys.Archival.ArchiveSites, url)
+						for i := 2; i+1 < len(asNode.Keys); i++ {
+							if asNode.Keys[i] == "password" {
+								sys.Archival.ArchiveSitesWithPassword = append(
+									sys.Archival.ArchiveSitesWithPassword, url)
+								break
+							}
+						}
+						for _, child := range asNode.Children {
+							if child.IsLeaf && len(child.Keys) >= 1 && child.Keys[0] == "password" {
+								sys.Archival.ArchiveSitesWithPassword = append(
+									sys.Archival.ArchiveSitesWithPassword, url)
+								break
+							}
+						}
+						continue
 					}
+					// Hierarchical form (archive-sites { <url> { password
+					// "$9$..."; } } or archive-sites { <url> password
+					// "$9$..."; }): each site is a child node whose first
+					// key is the URL.
 					for _, site := range asNode.Children {
 						if len(site.Keys) >= 1 {
-							sys.Archival.ArchiveSites = append(sys.Archival.ArchiveSites, site.Keys[0])
+							url := site.Keys[0]
+							sys.Archival.ArchiveSites = append(sys.Archival.ArchiveSites, url)
+							if site.FindChild("password") != nil {
+								sys.Archival.ArchiveSitesWithPassword = append(
+									sys.Archival.ArchiveSitesWithPassword, url)
+							} else {
+								for i := 1; i+1 < len(site.Keys); i++ {
+									if site.Keys[i] == "password" {
+										sys.Archival.ArchiveSitesWithPassword = append(
+											sys.Archival.ArchiveSitesWithPassword, url)
+										break
+									}
+								}
+							}
 						}
 					}
 				}
