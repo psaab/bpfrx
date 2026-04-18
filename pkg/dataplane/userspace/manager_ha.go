@@ -387,13 +387,20 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 		return err
 	}
 
-	group := m.haGroups[rgID]
+	prior, known := m.haGroups[rgID]
+	group := prior
 	group.RGID = rgID
 	group.Active = active
 	m.haGroups[rgID] = group
 
-	slog.Info("userspace: RG state updated (helper stays in control)",
-		"rg", rgID, "active", active)
+	// Only log on real transitions. The reconcile loop retries this
+	// call whenever applied != desired (see #757), so emitting INFO
+	// on every call floods journald at 9+ lines/sec when the helper
+	// is down. First-seen registration counts as a transition.
+	if !known || prior.Active != active {
+		slog.Info("userspace: RG state updated (helper stays in control)",
+			"rg", rgID, "active", active)
+	}
 
 	// HA ownership moves must not start queue bootstrap or neighbor repair
 	// work here. TakeoverReady() already requires the helper to be armed and

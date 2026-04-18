@@ -50,6 +50,13 @@ type rgStateMachine struct {
 	// solely from VRRP master state, NOT clusterPri || anyVrrpMaster.
 	// This prevents the brief dual-active window during failover.
 	strictVIPOwnership bool
+
+	// Log-once state for the reconcile loop (#757). The loop retries
+	// UpdateRGActive every 500ms when applied != desired. Without these
+	// gates, the "retrying" INFO and "failed" WARN fire every tick —
+	// 9+ lines/sec per cluster, which buries real diagnostics.
+	lastRetryLogged  bool   // "retrying" INFO emitted since last apply/error change
+	lastApplyErrMsg  string // text of last error that was WARN'd (empty = not warned)
 }
 
 // rgTransition is returned by state machine updates to inform the caller
@@ -146,7 +153,8 @@ func (s *rgStateMachine) Reconcile(clusterPri bool, vrrpStates map[string]bool) 
 }
 
 // MarkApplied records that the desired rg_active value was successfully
-// written to the BPF map.
+// written to the BPF map. Clears any sticky log-once state so the next
+// failure/retry cycle produces a fresh WARN and INFO (#757).
 func (s *rgStateMachine) MarkApplied(active bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -154,6 +162,36 @@ func (s *rgStateMachine) MarkApplied(active bool) {
 	if s.applied == s.active {
 		s.applyPending = false
 	}
+	s.lastRetryLogged = false
+	s.lastApplyErrMsg = ""
+}
+
+// ShouldLogRetry reports whether the "reconcile: retrying rg_active apply"
+// INFO should be emitted this tick. Returns true the first time the
+// retry loop fires after a transition; subsequent ticks in the same
+// retry streak stay silent until MarkApplied() clears the flag (#757).
+func (s *rgStateMachine) ShouldLogRetry() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastRetryLogged {
+		return false
+	}
+	s.lastRetryLogged = true
+	return true
+}
+
+// ShouldLogApplyError reports whether the given error should be WARN'd
+// this tick. Returns true only when the message text differs from the
+// last WARN'd text for this RG, so a steady-state retry loop stays
+// silent while a changing fault still surfaces (#757).
+func (s *rgStateMachine) ShouldLogApplyError(errMsg string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastApplyErrMsg == errMsg {
+		return false
+	}
+	s.lastApplyErrMsg = errMsg
+	return true
 }
 
 // NeedsApply returns true if the desired rg_active differs from the last
