@@ -266,8 +266,11 @@ static USERSPACE_CTRL: Array<UserspaceCtrl> = Array::with_max_entries(1, 0);
 static USERSPACE_BINDINGS: Array<UserspaceBindingValue> =
     Array::with_max_entries(BINDING_ARRAY_MAX_ENTRIES, 0);
 
+// Keyed on kernel ifindex which can exceed 1024 on long-lived VMs
+// (incus/k8s ifindex grows monotonically). HashMap tolerates sparse
+// keys so updates never hit E2BIG regardless of ifindex magnitude.
 #[map(name = "userspace_ingress_ifaces")]
-static USERSPACE_INGRESS_IFACES: Array<u8> = Array::with_max_entries(1024, 0);
+static USERSPACE_INGRESS_IFACES: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
 
 #[map(name = "userspace_heartbeat")]
 static USERSPACE_HEARTBEAT: Array<u64> = Array::with_max_entries(4096, 0);
@@ -355,8 +358,7 @@ fn try_xdp_userspace(ctx: &XdpContext) -> Result<u32, i64> {
     };
 
     let ingress_ifindex = unsafe { (*ctx.ctx).ingress_ifindex };
-    if USERSPACE_INGRESS_IFACES
-        .get(ingress_ifindex)
+    if unsafe { USERSPACE_INGRESS_IFACES.get(&ingress_ifindex) }
         .map_or(true, |v| *v == 0)
     {
         return Ok(cpumap_or_pass(ctrl));

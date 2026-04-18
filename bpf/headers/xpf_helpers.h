@@ -1029,6 +1029,10 @@ inc_screen_counter(__u32 screen_flag)
 	inc_counter(idx);
 }
 
+/* interface_counters is a PERCPU_HASH (#756). Go control plane pre-seeds
+ * entries on interface registration (AddTxPort / AttachXDP) so the
+ * hot path stays lookup-only — no allocation or update from softirq.
+ * A missing entry on an unregistered interface reads as zero. */
 static __always_inline void
 inc_iface_rx(__u32 ifindex, __u32 pkt_len)
 {
