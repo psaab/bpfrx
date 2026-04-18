@@ -581,9 +581,9 @@ pub(crate) fn worker_loop(
     let mut stall_prev_fwd = 0u64;
     let mut stall_reported = false;
     const DBG_REPORT_INTERVAL_NS: u64 = 1_000_000_000; // 1 second
-    // Throttle for BPF conntrack last_seen refresh (~10s).
-    // Keeps `show security flow session` idle times accurate without
-    // per-second syscall overhead per session.  See issue #333.
+                                                       // Throttle for BPF conntrack last_seen refresh (~10s).
+                                                       // Keeps `show security flow session` idle times accurate without
+                                                       // per-second syscall overhead per session.  See issue #333.
     const CT_REFRESH_INTERVAL_NS: u64 = 10_000_000_000;
     // Cache BPF map FDs — they don't change during the worker's lifetime.
     let session_map_fd = bindings
@@ -1594,6 +1594,45 @@ fn build_worker_cos_statuses(
     )
 }
 
+/// Return the one queue ID that can truthfully inherit a binding-scoped
+/// owner-profile snapshot for this CoS runtime.
+///
+/// The snapshot source is `BindingLiveState`, which is binding-local, not
+/// queue-local. That means we only have a coherent per-queue export when
+/// exactly one queue on the binding is an owner-local exact queue. Shared
+/// exact queues are explicitly out of contract, and if multiple owner-local
+/// exact queues exist the binding-wide snapshot is ambiguous and must stay
+/// zero until the accounting is made queue-scoped.
+fn unique_owner_profile_queue_id(
+    interface_config: Option<&CoSInterfaceConfig>,
+    root: &CoSInterfaceRuntime,
+) -> Option<u8> {
+    let iface = interface_config?;
+    let mut eligible_queue_id = None;
+    for queue in &root.queues {
+        if !queue.exact {
+            continue;
+        }
+        let Some(config) = iface
+            .queues
+            .iter()
+            .find(|cfg| cfg.queue_id == queue.queue_id)
+        else {
+            return None;
+        };
+        if !config.exact {
+            return None;
+        }
+        if queue_uses_shared_exact_service(iface, config) {
+            continue;
+        }
+        if eligible_queue_id.replace(queue.queue_id).is_some() {
+            return None;
+        }
+    }
+    eligible_queue_id
+}
+
 fn cos_runtime_config_changed(current: &ForwardingState, next: &ForwardingState) -> bool {
     current.cos != next.cos
 }
@@ -1777,12 +1816,11 @@ where
     let mut queue_maps = BTreeMap::<i32, BTreeMap<u8, crate::protocol::CoSQueueStatus>>::new();
     for (cos_map, binding_live) in cos_maps {
         // #709: snapshot the binding's owner-profile counters ONCE per
-        // binding per scrape. Every queue this binding owns gets the
-        // same snapshot attributed to it — the counters are per-binding
-        // (not per-queue) because drain_shaped_tx operates across all
-        // queues on the binding's interface in one invocation. Readers
-        // interpret identical values across queues on the same
-        // interface as exactly this shape.
+        // binding per scrape. The source is binding-scoped, so we only
+        // surface it on an unambiguous queue row: exactly one owner-local
+        // exact queue on this binding. Shared-exact, non-exact, and
+        // multi-owner-local exact shapes stay zero here until the
+        // telemetry becomes queue-scoped.
         let binding_profile = binding_live.map(owner_profile_snapshot);
         for (&ifindex, root) in cos_map {
             let entry = interfaces.entry(ifindex).or_default();
@@ -1813,15 +1851,17 @@ where
                     .sum::<usize>(),
             );
             let interface_config = forwarding.cos.interfaces.get(&ifindex);
+            let owner_profile_queue_id = unique_owner_profile_queue_id(interface_config, root);
             let queue_map = queue_maps.entry(ifindex).or_default();
             for queue in &root.queues {
                 let status = queue_map.entry(queue.queue_id).or_default();
                 status.queue_id = queue.queue_id;
-                if let Some(config) = interface_config.and_then(|cfg| {
+                let queue_config = interface_config.and_then(|cfg| {
                     cfg.queues
                         .iter()
                         .find(|config| config.queue_id == queue.queue_id)
-                }) {
+                });
+                if let Some(config) = queue_config {
                     if status.forwarding_class.is_empty() {
                         status.forwarding_class = config.forwarding_class.clone();
                     }
@@ -1879,19 +1919,14 @@ where
                 status.tx_ring_full_submit_stalls = status
                     .tx_ring_full_submit_stalls
                     .saturating_add(queue.drop_counters.tx_ring_full_submit_stalls);
-                // #709 / #748: the owner-profile snapshot is
-                // binding-scoped (`drain_shaped_tx` runs per-binding
-                // across all its queues) — we attribute this binding's
-                // snapshot into every queue row it contributes to.
-                // Aggregation is saturating-sum across contributors
-                // that surface the same queue row, not `max`:
-                // sum preserves `sum(drain_latency_hist) ==
-                // drain_invocations` when multiple bindings/workers
-                // service the same shared-exact queue. `max` hid
-                // non-dominant contributors and broke that invariant
-                // — the bug #748 fixes.
-                if let Some(profile) = binding_profile.as_ref() {
-                    merge_owner_profile_sum(status, profile);
+                // #709 / #748 / #751: owner-profile export is valid only
+                // for an unambiguous owner-local exact queue row. Shared,
+                // non-exact, and ambiguous multi-owner-local bindings stay
+                // zero rather than surfacing a binding-wide mixed profile.
+                if owner_profile_queue_id == Some(queue.queue_id) {
+                    if let Some(profile) = binding_profile.as_ref() {
+                        merge_owner_profile_sum(status, profile);
+                    }
                 }
             }
         }
@@ -2211,6 +2246,339 @@ mod tests {
             queue.drain_invocations,
             "aggregated histogram must stay coherent with invocation count",
         );
+    }
+
+    #[test]
+    fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_local_exact_queue(
+    ) {
+        let mut forwarding = ForwardingState::default();
+        forwarding
+            .ifindex_to_config_name
+            .insert(80, "reth0.80".to_string());
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 10_000_000_000 / 8,
+                burst_bytes: 256 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![
+                    CoSQueueConfig {
+                        queue_id: 0,
+                        forwarding_class: "best-effort".to_string(),
+                        priority: 1,
+                        transmit_rate_bytes: 100_000_000 / 8,
+                        exact: false,
+                        surplus_weight: 1,
+                        buffer_bytes: 32 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 4,
+                        forwarding_class: "iperf-a".to_string(),
+                        priority: 1,
+                        transmit_rate_bytes: 1_000_000_000 / 8,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 5,
+                        forwarding_class: "iperf-b".to_string(),
+                        priority: 1,
+                        transmit_rate_bytes: 10_000_000_000 / 8,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 128 * 1024,
+                        dscp_rewrite: None,
+                    },
+                ],
+            },
+        );
+
+        let root = CoSInterfaceRuntime {
+            shaping_rate_bytes: 10_000_000_000 / 8,
+            burst_bytes: 256 * 1024,
+            tokens: 0,
+            default_queue: 0,
+            nonempty_queues: 0,
+            runnable_queues: 0,
+            exact_guarantee_rr: 0,
+            nonexact_guarantee_rr: 0,
+            #[cfg(test)]
+            legacy_guarantee_rr: 0,
+            queues: vec![
+                CoSQueueRuntime {
+                    queue_id: 0,
+                    priority: 1,
+                    transmit_rate_bytes: 100_000_000 / 8,
+                    exact: false,
+                    flow_fair: false,
+                    flow_hash_seed: 0,
+                    surplus_weight: 1,
+                    surplus_deficit: 0,
+                    buffer_bytes: 32 * 1024,
+                    dscp_rewrite: None,
+                    tokens: 0,
+                    last_refill_ns: 0,
+                    queued_bytes: 0,
+                    active_flow_buckets: 0,
+                    flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_rr_buckets: FlowRrRing::default(),
+                    flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+                    runnable: false,
+                    parked: false,
+                    next_wakeup_tick: 0,
+                    wheel_level: 0,
+                    wheel_slot: 0,
+                    items: VecDeque::new(),
+                    drop_counters: CoSQueueDropCounters::default(),
+                },
+                CoSQueueRuntime {
+                    queue_id: 4,
+                    priority: 1,
+                    transmit_rate_bytes: 1_000_000_000 / 8,
+                    exact: true,
+                    flow_fair: false,
+                    flow_hash_seed: 0,
+                    surplus_weight: 1,
+                    surplus_deficit: 0,
+                    buffer_bytes: 64 * 1024,
+                    dscp_rewrite: None,
+                    tokens: 0,
+                    last_refill_ns: 0,
+                    queued_bytes: 0,
+                    active_flow_buckets: 0,
+                    flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_rr_buckets: FlowRrRing::default(),
+                    flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+                    runnable: false,
+                    parked: false,
+                    next_wakeup_tick: 0,
+                    wheel_level: 0,
+                    wheel_slot: 0,
+                    items: VecDeque::new(),
+                    drop_counters: CoSQueueDropCounters::default(),
+                },
+                CoSQueueRuntime {
+                    queue_id: 5,
+                    priority: 1,
+                    transmit_rate_bytes: 10_000_000_000 / 8,
+                    exact: true,
+                    flow_fair: false,
+                    flow_hash_seed: 0,
+                    surplus_weight: 1,
+                    surplus_deficit: 0,
+                    buffer_bytes: 128 * 1024,
+                    dscp_rewrite: None,
+                    tokens: 0,
+                    last_refill_ns: 0,
+                    queued_bytes: 0,
+                    active_flow_buckets: 0,
+                    flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_rr_buckets: FlowRrRing::default(),
+                    flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+                    runnable: false,
+                    parked: false,
+                    next_wakeup_tick: 0,
+                    wheel_level: 0,
+                    wheel_slot: 0,
+                    items: VecDeque::new(),
+                    drop_counters: CoSQueueDropCounters::default(),
+                },
+            ],
+            queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
+            rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
+            timer_wheel: CoSTimerWheelRuntime {
+                current_tick: 0,
+                level0: std::array::from_fn(|_| Vec::new()),
+                level1: std::array::from_fn(|_| Vec::new()),
+            },
+        };
+
+        let live = BindingLiveState::new();
+        live.owner_profile_owner.drain_latency_hist[2].store(9, Ordering::Relaxed);
+        live.owner_profile_owner
+            .drain_invocations
+            .store(9, Ordering::Relaxed);
+        live.owner_profile_owner
+            .drain_noop_invocations
+            .store(1, Ordering::Relaxed);
+        live.owner_profile_peer.redirect_acquire_hist[4].store(7, Ordering::Relaxed);
+        live.owner_profile_owner
+            .owner_pps
+            .store(123, Ordering::Relaxed);
+        live.owner_profile_peer
+            .peer_pps
+            .store(45, Ordering::Relaxed);
+
+        let mut cos_map = FastMap::default();
+        cos_map.insert(80, root);
+
+        let statuses = build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding);
+        let queues = &statuses[0].queues;
+        let q0 = queues.iter().find(|q| q.queue_id == 0).unwrap();
+        let q4 = queues.iter().find(|q| q.queue_id == 4).unwrap();
+        let q5 = queues.iter().find(|q| q.queue_id == 5).unwrap();
+
+        assert_eq!(q0.drain_invocations, 0);
+        assert!(q0.drain_latency_hist.is_empty());
+        assert_eq!(q0.owner_pps, 0);
+
+        assert_eq!(q4.drain_latency_hist[2], 9);
+        assert_eq!(q4.redirect_acquire_hist[4], 7);
+        assert_eq!(q4.drain_invocations, 9);
+        assert_eq!(q4.owner_pps, 123);
+        assert_eq!(q4.peer_pps, 45);
+
+        assert_eq!(q5.drain_invocations, 0);
+        assert!(q5.drain_latency_hist.is_empty());
+        assert_eq!(q5.owner_pps, 0);
+    }
+
+    #[test]
+    fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_binding() {
+        let mut forwarding = ForwardingState::default();
+        forwarding
+            .ifindex_to_config_name
+            .insert(80, "reth0.80".to_string());
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 10_000_000_000 / 8,
+                burst_bytes: 256 * 1024,
+                default_queue: 4,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![
+                    CoSQueueConfig {
+                        queue_id: 4,
+                        forwarding_class: "iperf-a".to_string(),
+                        priority: 1,
+                        transmit_rate_bytes: 1_000_000_000 / 8,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 6,
+                        forwarding_class: "iperf-c".to_string(),
+                        priority: 1,
+                        transmit_rate_bytes: 2_000_000_000 / 8,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                ],
+            },
+        );
+
+        let root = CoSInterfaceRuntime {
+            shaping_rate_bytes: 10_000_000_000 / 8,
+            burst_bytes: 256 * 1024,
+            tokens: 0,
+            default_queue: 4,
+            nonempty_queues: 0,
+            runnable_queues: 0,
+            exact_guarantee_rr: 0,
+            nonexact_guarantee_rr: 0,
+            #[cfg(test)]
+            legacy_guarantee_rr: 0,
+            queues: vec![
+                CoSQueueRuntime {
+                    queue_id: 4,
+                    priority: 1,
+                    transmit_rate_bytes: 1_000_000_000 / 8,
+                    exact: true,
+                    flow_fair: false,
+                    flow_hash_seed: 0,
+                    surplus_weight: 1,
+                    surplus_deficit: 0,
+                    buffer_bytes: 64 * 1024,
+                    dscp_rewrite: None,
+                    tokens: 0,
+                    last_refill_ns: 0,
+                    queued_bytes: 0,
+                    active_flow_buckets: 0,
+                    flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_rr_buckets: FlowRrRing::default(),
+                    flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+                    runnable: false,
+                    parked: false,
+                    next_wakeup_tick: 0,
+                    wheel_level: 0,
+                    wheel_slot: 0,
+                    items: VecDeque::new(),
+                    drop_counters: CoSQueueDropCounters::default(),
+                },
+                CoSQueueRuntime {
+                    queue_id: 6,
+                    priority: 1,
+                    transmit_rate_bytes: 2_000_000_000 / 8,
+                    exact: true,
+                    flow_fair: false,
+                    flow_hash_seed: 0,
+                    surplus_weight: 1,
+                    surplus_deficit: 0,
+                    buffer_bytes: 64 * 1024,
+                    dscp_rewrite: None,
+                    tokens: 0,
+                    last_refill_ns: 0,
+                    queued_bytes: 0,
+                    active_flow_buckets: 0,
+                    flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_rr_buckets: FlowRrRing::default(),
+                    flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+                    runnable: false,
+                    parked: false,
+                    next_wakeup_tick: 0,
+                    wheel_level: 0,
+                    wheel_slot: 0,
+                    items: VecDeque::new(),
+                    drop_counters: CoSQueueDropCounters::default(),
+                },
+            ],
+            queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
+            rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
+            timer_wheel: CoSTimerWheelRuntime {
+                current_tick: 0,
+                level0: std::array::from_fn(|_| Vec::new()),
+                level1: std::array::from_fn(|_| Vec::new()),
+            },
+        };
+
+        let live = BindingLiveState::new();
+        live.owner_profile_owner.drain_latency_hist[1].store(5, Ordering::Relaxed);
+        live.owner_profile_owner
+            .drain_invocations
+            .store(5, Ordering::Relaxed);
+        live.owner_profile_owner
+            .owner_pps
+            .store(77, Ordering::Relaxed);
+
+        let mut cos_map = FastMap::default();
+        cos_map.insert(80, root);
+
+        let statuses = build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding);
+        for queue in &statuses[0].queues {
+            assert_eq!(
+                queue.drain_invocations, 0,
+                "ambiguous binding-scoped profile must stay zero on queue {}",
+                queue.queue_id
+            );
+            assert!(queue.drain_latency_hist.is_empty());
+            assert_eq!(queue.owner_pps, 0);
+        }
     }
 
     #[test]
