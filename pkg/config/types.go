@@ -471,6 +471,13 @@ type ArchivalConfig struct {
 	ArchiveSites     []string
 	ArchiveDir       string // local directory for archives (default /var/lib/xpf/archive)
 	MaxArchives      int    // max number of archives to keep (default 10)
+
+	// #651: archive site URLs for which an inline `password "$9$..."`
+	// credential was configured. bpfrx's archival shells out to `scp`
+	// with `-o BatchMode=yes` and cannot use inline passwords, so a
+	// password here is ignored silently unless we warn. We keep the
+	// URLs (not the passwords) so the warning can name the site.
+	ArchiveSitesWithPassword []string
 }
 
 // InternetOptionsConfig holds internet-options settings.

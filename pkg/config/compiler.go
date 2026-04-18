@@ -557,6 +557,17 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
+	// #651: warn when archive-sites include inline `password`
+	// credentials. Runtime archival shells out to `scp` with
+	// `-o BatchMode=yes`, so the password is silently ignored and
+	// archival can fail unless matching SSH keys are already set up.
+	if cfg.System.Archival != nil {
+		for _, url := range cfg.System.Archival.ArchiveSitesWithPassword {
+			warnings = append(warnings, fmt.Sprintf(
+				"system archival archive-sites %q: inline password is accepted but ignored — archival uses scp BatchMode and relies on SSH keys, not passwords", url))
+		}
+	}
+
 	if cfg.System.Services != nil && cfg.System.Services.DNSProxyConfigured {
 		warnings = append(warnings, "system services dns dns-proxy configured but DNS proxy/forwarder runtime is not implemented")
 	}
