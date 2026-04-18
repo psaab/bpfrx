@@ -36,6 +36,16 @@ Read this file in full before:
    a tracking issue and cross-reference it. Don't silently expand
    scope.
 
+6. **All code changes go through a PR.** No direct pushes to `master`
+   for code — not for one-line fixes, not for hotfixes, not for revert
+   commits. The PR flow is where reviewers catch what tests miss,
+   where live data gets contrasted against the hypothesis, and where
+   the commit message and PR body become the permanent record of why
+   the change was made. Skipping it to "save time" is how regressions
+   land. Docs-only maintenance skills that explicitly direct-push
+   (e.g. `/sync-history`) are the only exception and must be declared
+   in their `SKILL.md`.
+
 ## Hot-path coding discipline
 
 ### Allocations
@@ -189,6 +199,11 @@ Read this file in full before:
 
 ### Merging
 
+- **Every code change lands via PR.** Even revert commits. Even
+  "obviously right" one-line fixes. Even cherry-picks from someone
+  else's branch. If you find yourself typing `git push origin master`
+  for anything except a docs-only maintenance skill that explicitly
+  does that (see first principle #6), stop — open a PR.
 - Squash-merge, single commit per PR on master. Commit message is the
   PR title.
 - Do not merge with failing tests. Do not `--no-verify` to skip hooks.
