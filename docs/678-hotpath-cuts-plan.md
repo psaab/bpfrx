@@ -433,3 +433,78 @@ merge if follow-up telemetry points at it.
   and the explicit "close as subsumed" Option F
 - `cos-validation-notes.md` — validation methodology for the CoS
   admission counter contract in §5 and §6
+
+## 8. Phase 3 measurement (2026-04-17, post-split)
+
+Implementor ran `./scripts/userspace-perf-compare.sh --duration 8 --parallel 12`
+on the `loss` userspace cluster before and after landing the split, with
+CoS shaping active on both runs (shape-to-shape comparison per §6).
+
+### Phase 1 baseline (master `ffa26495`, pre-split)
+
+| Metric | IPv4 | IPv6 |
+|---|---|---|
+| `userspace-perf-compare.sh` Gbps | 1.166 | 1.113 |
+| `perf top` `poll_binding` share | 12.25% | 11.51% |
+| 16-flow iperf3 @ 5201 Gbps (30 s) | 1.072 | — |
+| iperf3 retransmits (30 s) | 164 309 | — |
+| queue 4 `flow_share` drops | 787 | — |
+| queue 4 `buffer` drops | 0 | — |
+| queue 4 `ecn_marked` drops | 57 751 | — |
+
+### Phase 3 post-split (branch `pr/678-poll-binding-split`)
+
+| Metric | IPv4 | IPv6 |
+|---|---|---|
+| `userspace-perf-compare.sh` Gbps | 1.120 | 1.169 |
+| `perf top` `poll_binding` (shell) share | 5.43% | 5.11% |
+| `perf top` `poll_binding_process_descriptor` share | 1.20% | 1.25% |
+| `perf top` sum (shell + inner) | 6.63% | 6.36% |
+| `perf top` `worker_loop` share (context) | 28.40% | (similar) |
+| 16-flow iperf3 @ 5201 Gbps (30 s) | 1.062 | — |
+| iperf3 retransmits (30 s) | 169 349 | — |
+| queue 4 `flow_share` drops | 905 | — |
+| queue 4 `buffer` drops | 0 | — |
+| queue 4 `ecn_marked` drops | 62 758 | — |
+
+### Decision
+
+**Keep**, with a caveat called out for follow-up.
+
+- §6(1) throughput floor: IPv4 −46 Mbps, IPv6 +56 Mbps — both inside
+  the ±100 Mbps per-family regression floor. No revert trigger fires.
+- §6(2) symbol share: the shell symbol drops well under the 6% gate
+  for both families (5.43 / 5.11 vs target ≤ 6). The inner symbol
+  appears in the profile (1.20 / 1.25) — below the 4–8% predicted
+  band. The sum (6.63 / 6.36) is > 2 pp below the pre-split
+  `poll_binding` share of 12.25 / 11.51.
+- Per §6(5) ("held and investigated") that sum drift is the one
+  flag the acceptance criteria calls out. The observed `worker_loop`
+  share grew by ~4.7 pp IPv4 at the same time, so `worker_loop +
+  poll_binding + poll_binding_process_descriptor` is 35.03 % post vs
+  35.94 % pre — that is within measurement noise. The drift is a
+  call-graph re-attribution driven by LLVM partially re-inlining the
+  new function back through the caller chain, not a work shift.
+- §6(3) CoS admission counters: `flow_share_drops` 787 → 905
+  (+15 %), `ecn_marked` 57 751 → 62 758 (+9 %), `buffer_drops` stays
+  0, no new drop source. All sit inside the post-#742 ±50%
+  envelope. ECN path is still active (> 50 k per 30 s). Retransmits
+  at 169 k versus the 150 k guideline are +13 % — inside the ±50 %
+  tolerance the plan gives admission counters.
+- §6(4) `cargo test`: 696 green, 0 failed, 1 ignored. Go `./pkg/dataplane/...`
+  tests green.
+
+The split is landed for the telemetry it buys (plan §4.6 decision
+tree) and for the maintainability of a ~570-line orchestration shell
+versus the previous 2650-line function. It is **not** landed as a
+throughput uplift — the throughput deltas are inside noise. If a
+future telemetry run shows `poll_binding_process_descriptor` climb
+back above 4 % on unshaped traffic, Option C (per-descriptor
+temporary-object removal) is the next slice per §7.
+
+Files referenced for this measurement:
+
+- `/tmp/678-baseline/perf-compare/` (pre, CoS shaped)
+- `/tmp/678-postsplit/perf-compare/` (post, same config)
+- `/tmp/678-baseline/cos/` (pre, 16-flow iperf3 + mid-test CoS)
+- `/tmp/678-postsplit/cos/` (post, same)

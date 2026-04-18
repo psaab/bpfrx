@@ -245,6 +245,99 @@ fn should_install_local_reverse_session(decision: SessionDecision, fabric_ingres
         || (fabric_ingress && !fabric_wire_placeholder)
 }
 
+// Lifted from `poll_binding` so the per-descriptor batch function
+// (`poll_binding_process_descriptor`) can take `&mut BatchCounters`.
+// Shape and semantics are byte-for-byte identical to the previous nested
+// definition — see #678 poll_binding split.
+#[derive(Default)]
+struct BatchCounters {
+    touched: bool,
+    rx_packets: u64,
+    rx_bytes: u64,
+    rx_batches: u64,
+    metadata_packets: u64,
+    validated_packets: u64,
+    validated_bytes: u64,
+    forward_candidate_packets: u64,
+    session_hits: u64,
+    session_misses: u64,
+    session_creates: u64,
+    snat_packets: u64,
+    dnat_packets: u64,
+}
+
+impl BatchCounters {
+    fn flush(&mut self, live: &BindingLiveState) {
+        if !self.touched {
+            return;
+        }
+        if self.rx_packets != 0 {
+            live.rx_packets
+                .fetch_add(self.rx_packets, Ordering::Relaxed);
+            self.rx_packets = 0;
+        }
+        if self.rx_bytes != 0 {
+            live.rx_bytes.fetch_add(self.rx_bytes, Ordering::Relaxed);
+            self.rx_bytes = 0;
+        }
+        if self.rx_batches != 0 {
+            live.rx_batches
+                .fetch_add(self.rx_batches, Ordering::Relaxed);
+            self.rx_batches = 0;
+        }
+        if self.metadata_packets != 0 {
+            live.metadata_packets
+                .fetch_add(self.metadata_packets, Ordering::Relaxed);
+            self.metadata_packets = 0;
+        }
+        if self.validated_packets != 0 {
+            live.validated_packets
+                .fetch_add(self.validated_packets, Ordering::Relaxed);
+            self.validated_packets = 0;
+        }
+        if self.validated_bytes != 0 {
+            live.validated_bytes
+                .fetch_add(self.validated_bytes, Ordering::Relaxed);
+            self.validated_bytes = 0;
+        }
+        if self.forward_candidate_packets != 0 {
+            live.forward_candidate_packets
+                .fetch_add(self.forward_candidate_packets, Ordering::Relaxed);
+            self.forward_candidate_packets = 0;
+        }
+        if self.session_hits != 0 {
+            live.session_hits
+                .fetch_add(self.session_hits, Ordering::Relaxed);
+            self.session_hits = 0;
+        }
+        if self.session_misses != 0 {
+            live.session_misses
+                .fetch_add(self.session_misses, Ordering::Relaxed);
+            self.session_misses = 0;
+        }
+        if self.session_creates != 0 {
+            live.session_creates
+                .fetch_add(self.session_creates, Ordering::Relaxed);
+            self.session_creates = 0;
+        }
+        if self.snat_packets != 0 {
+            live.snat_packets
+                .fetch_add(self.snat_packets, Ordering::Relaxed);
+            self.snat_packets = 0;
+        }
+        if self.dnat_packets != 0 {
+            live.dnat_packets
+                .fetch_add(self.dnat_packets, Ordering::Relaxed);
+            self.dnat_packets = 0;
+        }
+        self.touched = false;
+    }
+}
+
+// Pins the invariant that `poll_binding` relies on: the RX batch loop
+// must run at least once. Cheap compile-time guard.
+const _: () = assert!(MAX_RX_BATCHES_PER_POLL >= 1);
+
 fn poll_binding(
     binding_index: usize,
     bindings: &mut [BindingWorker],
@@ -279,90 +372,6 @@ fn poll_binding(
     cos_owner_worker_by_queue: &BTreeMap<(i32, u8), u32>,
     cos_owner_live_by_queue: &BTreeMap<(i32, u8), Arc<BindingLiveState>>,
 ) -> bool {
-    #[derive(Default)]
-    struct BatchCounters {
-        touched: bool,
-        rx_packets: u64,
-        rx_bytes: u64,
-        rx_batches: u64,
-        metadata_packets: u64,
-        validated_packets: u64,
-        validated_bytes: u64,
-        forward_candidate_packets: u64,
-        session_hits: u64,
-        session_misses: u64,
-        session_creates: u64,
-        snat_packets: u64,
-        dnat_packets: u64,
-    }
-
-    impl BatchCounters {
-        fn flush(&mut self, live: &BindingLiveState) {
-            if !self.touched {
-                return;
-            }
-            if self.rx_packets != 0 {
-                live.rx_packets
-                    .fetch_add(self.rx_packets, Ordering::Relaxed);
-                self.rx_packets = 0;
-            }
-            if self.rx_bytes != 0 {
-                live.rx_bytes.fetch_add(self.rx_bytes, Ordering::Relaxed);
-                self.rx_bytes = 0;
-            }
-            if self.rx_batches != 0 {
-                live.rx_batches
-                    .fetch_add(self.rx_batches, Ordering::Relaxed);
-                self.rx_batches = 0;
-            }
-            if self.metadata_packets != 0 {
-                live.metadata_packets
-                    .fetch_add(self.metadata_packets, Ordering::Relaxed);
-                self.metadata_packets = 0;
-            }
-            if self.validated_packets != 0 {
-                live.validated_packets
-                    .fetch_add(self.validated_packets, Ordering::Relaxed);
-                self.validated_packets = 0;
-            }
-            if self.validated_bytes != 0 {
-                live.validated_bytes
-                    .fetch_add(self.validated_bytes, Ordering::Relaxed);
-                self.validated_bytes = 0;
-            }
-            if self.forward_candidate_packets != 0 {
-                live.forward_candidate_packets
-                    .fetch_add(self.forward_candidate_packets, Ordering::Relaxed);
-                self.forward_candidate_packets = 0;
-            }
-            if self.session_hits != 0 {
-                live.session_hits
-                    .fetch_add(self.session_hits, Ordering::Relaxed);
-                self.session_hits = 0;
-            }
-            if self.session_misses != 0 {
-                live.session_misses
-                    .fetch_add(self.session_misses, Ordering::Relaxed);
-                self.session_misses = 0;
-            }
-            if self.session_creates != 0 {
-                live.session_creates
-                    .fetch_add(self.session_creates, Ordering::Relaxed);
-                self.session_creates = 0;
-            }
-            if self.snat_packets != 0 {
-                live.snat_packets
-                    .fetch_add(self.snat_packets, Ordering::Relaxed);
-                self.snat_packets = 0;
-            }
-            if self.dnat_packets != 0 {
-                live.dnat_packets
-                    .fetch_add(self.dnat_packets, Ordering::Relaxed);
-                self.dnat_packets = 0;
-            }
-            self.touched = false;
-        }
-    }
 
     let (left, rest) = bindings.split_at_mut(binding_index);
     let Some((binding, right)) = rest.split_first_mut() else {
@@ -473,6 +482,177 @@ fn poll_binding(
             .as_ref()
             .expect("identity initialized when RX has work");
 
+        poll_binding_process_descriptor(
+            binding,
+            binding_index,
+            area,
+            ident,
+            available,
+            binding_lookup,
+            sessions,
+            screen,
+            validation,
+            now_ns,
+            now_secs,
+            ha_startup_grace_until_secs,
+            forwarding,
+            ha_state,
+            dynamic_neighbors,
+            shared_sessions,
+            shared_nat_sessions,
+            shared_forward_wire_sessions,
+            shared_owner_rg_indexes,
+            slow_path,
+            local_tunnel_deliveries,
+            recent_exceptions,
+            last_resolution,
+            peer_worker_commands,
+            worker_id,
+            dnat_fds,
+            conntrack_v4_fd,
+            conntrack_v6_fd,
+            dbg,
+            rg_epochs,
+            &mut counters,
+        );
+        let mut pending_forwards = core::mem::take(&mut binding.scratch_forwards);
+        let mut rst_teardowns = core::mem::take(&mut binding.scratch_rst_teardowns);
+        for (forward_key, nat) in rst_teardowns.drain(..) {
+            // Evict from flow cache so stale entries aren't used after RST.
+            let idx = FlowCache::slot(&forward_key, binding.ifindex);
+            binding.flow_cache.entries[idx] = None;
+            teardown_tcp_rst_flow(
+                left,
+                binding,
+                right,
+                sessions,
+                shared_sessions,
+                shared_nat_sessions,
+                shared_forward_wire_sessions,
+                &shared_owner_rg_indexes,
+                peer_worker_commands,
+                &forward_key,
+                nat,
+                &mut pending_forwards,
+            );
+        }
+        binding.scratch_rst_teardowns = rst_teardowns;
+        if !pending_forwards.is_empty() {
+            // Use raw pointer to avoid Arc::clone (~5% CPU from lock incq).
+            // Safety: the Arc<BindingLiveState> outlives this function call;
+            // binding is borrowed mutably by enqueue_pending_forwards but
+            // ingress_live is only used for read-only error logging inside it.
+            let ingress_live: *const BindingLiveState = &*binding.live;
+            let mut scratch_post_recycles = core::mem::take(&mut binding.scratch_post_recycles);
+            enqueue_pending_forwards(
+                left,
+                binding_index,
+                binding,
+                right,
+                binding_lookup,
+                &mut pending_forwards,
+                &mut scratch_post_recycles,
+                now_ns,
+                forwarding,
+                &ident,
+                unsafe { &*ingress_live },
+                slow_path,
+                local_tunnel_deliveries,
+                recent_exceptions,
+                dbg,
+                worker_id,
+                worker_commands_by_id,
+                cos_owner_worker_by_queue,
+                cos_owner_live_by_queue,
+            );
+            binding.scratch_post_recycles = scratch_post_recycles;
+        }
+        binding.scratch_forwards = pending_forwards;
+        // Reserved: cross-binding in-place TX from flow cache fast path.
+        // Currently only self-target (hairpin) uses the inline path;
+        // cross-binding goes through enqueue_pending_forwards above.
+        // Eager TX completion reaping: free TX frames immediately after
+        // enqueueing forwards so they can be recycled to fill ring within
+        // the same poll cycle. Without this, completions wait until next
+        // poll entry, starving the fill ring during sustained forwarding.
+        reap_tx_completions(binding, shared_recycles);
+        // Also reap completions on the egress bindings that just transmitted.
+        for other in left.iter_mut().chain(right.iter_mut()) {
+            reap_tx_completions(other, shared_recycles);
+        }
+        apply_shared_recycles(
+            left,
+            binding_index,
+            binding,
+            right,
+            binding_lookup,
+            shared_recycles,
+        );
+        if !binding.scratch_recycle.is_empty() {
+            binding
+                .pending_fill_frames
+                .extend(binding.scratch_recycle.drain(..));
+        }
+        let _ = drain_pending_fill(binding, now_ns);
+        counters.rx_batches += 1;
+        did_work = true;
+    }
+    retry_pending_neigh(
+        binding,
+        left,
+        binding_index,
+        right,
+        binding_lookup,
+        forwarding,
+        dynamic_neighbors,
+        now_ns,
+        unsafe { &*area },
+    );
+    counters.flush(&binding.live);
+    update_binding_debug_state(binding);
+    did_work
+}
+// Per-batch packet processing lifted from `poll_binding` (#678).
+//
+// Runs `binding.rx.receive(available)` + the descriptor while-let +
+// `received.release(); drop(received);` as its own compilation unit so
+// it surfaces under its own symbol in `perf top`. Body is byte-for-byte
+// identical to the previous inner-loop content; only the enclosing
+// function boundary is new.
+#[allow(clippy::too_many_arguments)]
+fn poll_binding_process_descriptor(
+    binding: &mut BindingWorker,
+    binding_index: usize,
+    area: *const MmapArea,
+    ident: &BindingIdentity,
+    available: u32,
+    binding_lookup: &WorkerBindingLookup,
+    sessions: &mut SessionTable,
+    screen: &mut ScreenState,
+    validation: ValidationState,
+    now_ns: u64,
+    now_secs: u64,
+    ha_startup_grace_until_secs: u64,
+    forwarding: &ForwardingState,
+    ha_state: &BTreeMap<i32, HAGroupRuntime>,
+    dynamic_neighbors: &Arc<Mutex<FastMap<(i32, IpAddr), NeighborEntry>>>,
+    shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
+    shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
+    slow_path: Option<&Arc<SlowPathReinjector>>,
+    local_tunnel_deliveries: &Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>>,
+    recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
+    last_resolution: &Arc<Mutex<Option<PacketResolution>>>,
+    peer_worker_commands: &[Arc<Mutex<VecDeque<WorkerCommand>>>],
+    worker_id: u32,
+    dnat_fds: &DnatTableFds,
+    conntrack_v4_fd: c_int,
+    conntrack_v6_fd: c_int,
+    dbg: &mut DebugPollCounters,
+    rg_epochs: &[AtomicU32; MAX_RG_EPOCHS],
+    counters: &mut BatchCounters,
+) {
         let mut received = binding.rx.receive(available);
         binding.scratch_recycle.clear();
         binding.scratch_forwards.clear();
@@ -2796,103 +2976,8 @@ fn poll_binding(
         }
         received.release();
         drop(received);
-        let mut pending_forwards = core::mem::take(&mut binding.scratch_forwards);
-        let mut rst_teardowns = core::mem::take(&mut binding.scratch_rst_teardowns);
-        for (forward_key, nat) in rst_teardowns.drain(..) {
-            // Evict from flow cache so stale entries aren't used after RST.
-            let idx = FlowCache::slot(&forward_key, binding.ifindex);
-            binding.flow_cache.entries[idx] = None;
-            teardown_tcp_rst_flow(
-                left,
-                binding,
-                right,
-                sessions,
-                shared_sessions,
-                shared_nat_sessions,
-                shared_forward_wire_sessions,
-                &shared_owner_rg_indexes,
-                peer_worker_commands,
-                &forward_key,
-                nat,
-                &mut pending_forwards,
-            );
-        }
-        binding.scratch_rst_teardowns = rst_teardowns;
-        if !pending_forwards.is_empty() {
-            // Use raw pointer to avoid Arc::clone (~5% CPU from lock incq).
-            // Safety: the Arc<BindingLiveState> outlives this function call;
-            // binding is borrowed mutably by enqueue_pending_forwards but
-            // ingress_live is only used for read-only error logging inside it.
-            let ingress_live: *const BindingLiveState = &*binding.live;
-            let mut scratch_post_recycles = core::mem::take(&mut binding.scratch_post_recycles);
-            enqueue_pending_forwards(
-                left,
-                binding_index,
-                binding,
-                right,
-                binding_lookup,
-                &mut pending_forwards,
-                &mut scratch_post_recycles,
-                now_ns,
-                forwarding,
-                &ident,
-                unsafe { &*ingress_live },
-                slow_path,
-                local_tunnel_deliveries,
-                recent_exceptions,
-                dbg,
-                worker_id,
-                worker_commands_by_id,
-                cos_owner_worker_by_queue,
-                cos_owner_live_by_queue,
-            );
-            binding.scratch_post_recycles = scratch_post_recycles;
-        }
-        binding.scratch_forwards = pending_forwards;
-        // Reserved: cross-binding in-place TX from flow cache fast path.
-        // Currently only self-target (hairpin) uses the inline path;
-        // cross-binding goes through enqueue_pending_forwards above.
-        // Eager TX completion reaping: free TX frames immediately after
-        // enqueueing forwards so they can be recycled to fill ring within
-        // the same poll cycle. Without this, completions wait until next
-        // poll entry, starving the fill ring during sustained forwarding.
-        reap_tx_completions(binding, shared_recycles);
-        // Also reap completions on the egress bindings that just transmitted.
-        for other in left.iter_mut().chain(right.iter_mut()) {
-            reap_tx_completions(other, shared_recycles);
-        }
-        apply_shared_recycles(
-            left,
-            binding_index,
-            binding,
-            right,
-            binding_lookup,
-            shared_recycles,
-        );
-        if !binding.scratch_recycle.is_empty() {
-            binding
-                .pending_fill_frames
-                .extend(binding.scratch_recycle.drain(..));
-        }
-        let _ = drain_pending_fill(binding, now_ns);
-        counters.rx_batches += 1;
-        did_work = true;
-    }
-    retry_pending_neigh(
-        binding,
-        left,
-        binding_index,
-        right,
-        binding_lookup,
-        forwarding,
-        dynamic_neighbors,
-        now_ns,
-        unsafe { &*area },
-    );
-    counters.flush(&binding.live);
-    update_binding_debug_state(binding);
-    did_work
 }
+
 
 fn retry_pending_neigh(
     binding: &mut BindingWorker,
