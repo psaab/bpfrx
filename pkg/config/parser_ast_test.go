@@ -3876,6 +3876,52 @@ func TestValidateConfigApplicationPorts(t *testing.T) {
 	}
 }
 
+// TestValidateConfig_DisabledProcessWarnsOnUnknown pins #654: `system
+// processes <X> disable` must WARN when bpfrx does not actually manage
+// <X>. Silently accepting it (as `utmd disable` did) gave operators no
+// signal that the knob is a no-op. Known-managed processes (snmpd, ntp)
+// must NOT produce the warning.
+func TestValidateConfig_DisabledProcessWarnsOnUnknown(t *testing.T) {
+	cfg := &Config{}
+	cfg.Applications.Applications = map[string]*Application{}
+	cfg.Applications.ApplicationSets = map[string]*ApplicationSet{}
+	cfg.Security.Zones = map[string]*ZoneConfig{}
+	cfg.System.DisabledProcesses = []string{"utmd", "snmpd", "ntp", "idpd"}
+
+	warnings := ValidateConfig(cfg)
+
+	sawUtmdWarn := false
+	sawIdpdWarn := false
+	sawSnmpdWarn := false
+	sawNtpWarn := false
+	for _, w := range warnings {
+		if strings.Contains(w, "utmd") && strings.Contains(w, "no runtime effect") {
+			sawUtmdWarn = true
+		}
+		if strings.Contains(w, "idpd") && strings.Contains(w, "no runtime effect") {
+			sawIdpdWarn = true
+		}
+		if strings.Contains(w, "\"snmpd\"") && strings.Contains(w, "no runtime effect") {
+			sawSnmpdWarn = true
+		}
+		if strings.Contains(w, "\"ntp\"") && strings.Contains(w, "no runtime effect") {
+			sawNtpWarn = true
+		}
+	}
+	if !sawUtmdWarn {
+		t.Error("expected warning for utmd disable (not managed by bpfrx)")
+	}
+	if !sawIdpdWarn {
+		t.Error("expected warning for idpd disable (not managed by bpfrx)")
+	}
+	if sawSnmpdWarn {
+		t.Error("snmpd is managed by bpfrx; should not warn")
+	}
+	if sawNtpWarn {
+		t.Error("ntp is managed by bpfrx; should not warn")
+	}
+}
+
 func TestLo0FilterExtraction(t *testing.T) {
 	input := `interfaces {
     lo0 {

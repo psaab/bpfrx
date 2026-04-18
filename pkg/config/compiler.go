@@ -546,6 +546,17 @@ func ValidateConfig(cfg *Config) []string {
 		warnings = append(warnings, "system commit persist-groups-inheritance configured but group inheritance persistence is not implemented")
 	}
 
+	// #654: warn on `system processes X disable` for a process that
+	// bpfrx does not actually manage. Silently accepting the knob (as
+	// used to happen with e.g. `utmd disable` on vSRX) means the
+	// operator gets no signal that the setting is a no-op.
+	for _, proc := range cfg.System.DisabledProcesses {
+		if !isKnownProcessName(proc) {
+			warnings = append(warnings, fmt.Sprintf(
+				"system processes %q disable: bpfrx does not manage %q; setting has no runtime effect", proc, proc))
+		}
+	}
+
 	if cfg.System.Services != nil && cfg.System.Services.DNSProxyConfigured {
 		warnings = append(warnings, "system services dns dns-proxy configured but DNS proxy/forwarder runtime is not implemented")
 	}
@@ -705,6 +716,25 @@ func ValidateConfig(cfg *Config) []string {
 	}
 
 	return warnings
+}
+
+// knownManagedProcessNames is the set of Junos process names that bpfrx
+// actually honours when `system processes X disable` is configured.
+// The runtime sites hard-code their process name (not a table lookup):
+//   - pkg/daemon/daemon.go ~:715 — `isProcessDisabled(cfg, "snmpd")`
+//   - pkg/daemon/daemon_system.go ~:383 — `isProcessDisabled(cfg, "ntp")`
+// This table mirrors those hard-codes for the purpose of the #654
+// validation warning. Any addition here MUST be paired with a matching
+// runtime gating site, or the warning will go quiet while the knob
+// remains a no-op.
+var knownManagedProcessNames = map[string]struct{}{
+	"snmpd": {},
+	"ntp":   {},
+}
+
+func isKnownProcessName(name string) bool {
+	_, ok := knownManagedProcessNames[name]
+	return ok
 }
 
 func compileApplications(node *Node, apps *ApplicationsConfig) error {
