@@ -855,6 +855,9 @@ func (m *Manager) ClearMirrorConfigs() error {
 	for iter.Next(&key, &val) {
 		keys = append(keys, key)
 	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("iterate mirror_config: %w", err)
+	}
 	for _, k := range keys {
 		if err := zm.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			return fmt.Errorf("delete mirror_config %d: %w", k, err)
@@ -1244,8 +1247,13 @@ func (m *Manager) ClearInterfaceCounters() error {
 	for iter.Next(&key, &val) {
 		keys = append(keys, key)
 	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("iterate interface_counters: %w", err)
+	}
 	for _, k := range keys {
-		_ = zm.Update(k, zero, ebpf.UpdateAny)
+		if err := zm.Update(k, zero, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("clear interface_counters %d: %w", k, err)
+		}
 	}
 	return nil
 }

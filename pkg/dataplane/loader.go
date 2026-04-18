@@ -142,12 +142,28 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 	}
 
 	m.xdpLinks[ifindex] = l
+	m.seedInterfaceCounter(ifindex)
 	mode := "native"
 	if forceGeneric {
 		mode = "generic"
 	}
 	slog.Info("attached XDP program", "ifindex", ifindex, "mode", mode)
 	return nil
+}
+
+// seedInterfaceCounter pre-populates the PERCPU_HASH interface_counters
+// entry for ifindex. Called from control-plane interface registration
+// (AttachXDP, AddTxPort) so the BPF hot path stays lookup-only and
+// never allocates in softirq context (#759). Idempotent: UpdateNoExist
+// races safely across repeated registrations.
+func (m *Manager) seedInterfaceCounter(ifindex int) {
+	ic := m.maps["interface_counters"]
+	if ic == nil {
+		return
+	}
+	numCPUs := ebpf.MustPossibleCPU()
+	zero := make([]InterfaceCounterValue, numCPUs)
+	_ = ic.Update(uint32(ifindex), zero, ebpf.UpdateNoExist)
 }
 
 // SwapXDPEntryProg atomically replaces the XDP entry program on all
@@ -321,7 +337,11 @@ func (m *Manager) AddTxPort(ifindex int) error {
 		Ifindex uint32
 		ProgFD  uint32
 	}{Ifindex: uint32(ifindex)}
-	return tm.Update(uint32(ifindex), val, ebpf.UpdateAny)
+	if err := tm.Update(uint32(ifindex), val, ebpf.UpdateAny); err != nil {
+		return err
+	}
+	m.seedInterfaceCounter(ifindex)
+	return nil
 }
 
 // AttachTC attaches the TC main program to the egress path of the given interface.

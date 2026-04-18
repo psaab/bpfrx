@@ -682,15 +682,17 @@ func (m *Manager) syncIngressIfaceMapLocked(snapshot *ConfigSnapshot) error {
 			return fmt.Errorf("update userspace_ingress_ifaces %d: %w", ifindex, err)
 		}
 	}
-	// HashMap: Delete removes the entry. Ignore ErrKeyNotExist so
-	// re-sync across daemon restarts is idempotent.
+	// HashMap: Delete removes the entry. ErrKeyNotExist is expected
+	// across daemon restarts (idempotent). Any other failure must be
+	// fatal — a stale entry the dataplane still treats as ingress
+	// would silently redirect traffic for an interface removed from
+	// the config.
 	for _, k := range m.lastIngressIfaces {
 		if _, keep := newIngressSet[k]; keep {
 			continue
 		}
 		if err := ifaceMap.Delete(k); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
-			slog.Warn("userspace: failed to delete stale ingress iface entry",
-				"ifindex", k, "err", err)
+			return fmt.Errorf("delete userspace_ingress_ifaces %d: %w", k, err)
 		}
 	}
 	m.lastIngressIfaces = newIngress
