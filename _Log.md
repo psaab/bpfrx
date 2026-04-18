@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-04-17
+
+- **Timestamp**: 2026-04-17
+  - **Action**: Issue #678 — Architect plan for remaining hot-path CPU cuts. Remeasured on loss userspace cluster (master 7c1e55b9): poll_binding 10.4%/10.6% (down from issue's 13.4%/13.3%), enqueue_pending_forwards 0.71%/<1% (down from 4.3%/3.7%), apply_nat_ipv6 <1% (down from 3.2% IPv6). Recommendation: Option A — split poll_binding into orchestration shell + per-descriptor hot path as a measurement-first structural refactor. Options B/C/D deferred as issues; Option F (close as subsumed) is the expected path post-split.
+  - **File(s)**: docs/678-hotpath-cuts-plan.md
+
 ## 2026-04-03
 
 - **Timestamp**: 2026-04-03
