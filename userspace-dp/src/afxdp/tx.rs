@@ -238,14 +238,17 @@ pub(super) fn drain_pending_tx(
         let progressed = drain_shaped_tx(binding, now_ns, shared_recycles);
         let delta = monotonic_nanos().saturating_sub(start_ns);
         let bucket = bucket_index_for_ns(delta);
-        binding.live.drain_latency_hist[bucket].fetch_add(1, Ordering::Relaxed);
+        binding.live.owner_profile_owner.drain_latency_hist[bucket]
+            .fetch_add(1, Ordering::Relaxed);
         binding
             .live
+            .owner_profile_owner
             .drain_invocations
             .fetch_add(1, Ordering::Relaxed);
         if !progressed {
             binding
                 .live
+                .owner_profile_owner
                 .drain_noop_invocations
                 .fetch_add(1, Ordering::Relaxed);
             break;
@@ -579,10 +582,18 @@ fn ingest_cos_pending_tx(
     binding.live.take_pending_tx_into(&mut pending);
     let peer_count = (pending.len() as u64).saturating_sub(owner_local_count);
     if owner_local_count > 0 {
-        binding.live.pps_owner_vs_peer[0].fetch_add(owner_local_count, Ordering::Relaxed);
+        binding
+            .live
+            .owner_profile_owner
+            .owner_pps
+            .fetch_add(owner_local_count, Ordering::Relaxed);
     }
     if peer_count > 0 {
-        binding.live.pps_owner_vs_peer[1].fetch_add(peer_count, Ordering::Relaxed);
+        binding
+            .live
+            .owner_profile_peer
+            .peer_pps
+            .fetch_add(peer_count, Ordering::Relaxed);
     }
     process_pending_queue_in_place(&mut pending, |req| {
         let req = match redirect_local_cos_request_to_owner(

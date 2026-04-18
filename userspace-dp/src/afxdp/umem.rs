@@ -165,6 +165,94 @@ pub(super) fn bucket_index_for_ns(ns: u64) -> usize {
     b.min(DRAIN_HIST_BUCKETS - 1)
 }
 
+/// #746: owner-worker-written owner-profile telemetry. The owner of a
+/// binding is the sole writer of these atomics (the single drain caller
+/// for this binding); peer workers only read via `snapshot()`. Isolated
+/// onto its own 64-byte cacheline so owner writes do not invalidate
+/// peer-writer cachelines (see `OwnerProfilePeerWrites`) and so
+/// telemetry updates do not ping-pong unrelated `BindingLiveState`
+/// fields.
+///
+/// Matches the in-repo `#[repr(align(64))]` idiom established in
+/// `mpsc_inbox.rs::CachePadded` (#715). We use a freestanding struct
+/// here instead of wrapping each atomic individually because the
+/// grouped atomics are updated together on one code path — isolating
+/// the whole group on one line is the alignment contract that matters.
+///
+/// Counter semantics are unchanged from #709 / #731 (`drain_latency_hist`
+/// buckets sum to `drain_invocations`; `drain_noop_invocations` is a
+/// subset counter). See `BindingLiveState::snapshot()` for how these
+/// values flow into `BindingLiveSnapshot`.
+#[repr(align(64))]
+pub(super) struct OwnerProfileOwnerWrites {
+    pub(super) drain_latency_hist: [AtomicU64; DRAIN_HIST_BUCKETS],
+    pub(super) drain_invocations: AtomicU64,
+    pub(super) drain_noop_invocations: AtomicU64,
+    /// #709: owner-local pps window. Formerly `pps_owner_vs_peer[0]`;
+    /// split by writer for cacheline isolation (#746). The owner is
+    /// the only writer; peers read through `snapshot()`.
+    pub(super) owner_pps: AtomicU64,
+}
+
+/// #746: peer-worker-written owner-profile telemetry. Every redirecting
+/// worker is a writer of these atomics. Isolated onto its own 64-byte
+/// cacheline so peer writes do not invalidate the owner's cacheline
+/// (see `OwnerProfileOwnerWrites`) and so the redirect-sample counter
+/// churn does not ping-pong unrelated `BindingLiveState` fields.
+///
+/// The owner reads the peer-written counters only via `snapshot()`;
+/// there is no owner-write path into this struct.
+#[repr(align(64))]
+pub(super) struct OwnerProfilePeerWrites {
+    pub(super) redirect_acquire_hist: [AtomicU64; DRAIN_HIST_BUCKETS],
+    pub(super) redirect_sample_counter: AtomicU64,
+    /// #709: peer-redirect pps window. Formerly `pps_owner_vs_peer[1]`;
+    /// split by writer for cacheline isolation (#746). Any worker that
+    /// redirects into this binding is a writer; the owner reads via
+    /// `snapshot()`.
+    pub(super) peer_pps: AtomicU64,
+}
+
+// #746: compile-time layout enforcement. A silent drop of the
+// `#[repr(align(64))]` attribute — or a future refactor that inlines
+// a packed neighbor — is caught at build time, not at runtime.
+const _: () = assert!(core::mem::align_of::<OwnerProfileOwnerWrites>() == 64);
+const _: () = assert!(core::mem::align_of::<OwnerProfilePeerWrites>() == 64);
+// Size ceiling: owner struct is 16 hist + 3 scalar AtomicU64 = 152 B,
+// padded to 192 B (3 cachelines) at 64-B alignment. Peer struct is
+// 16 hist + 2 scalar AtomicU64 = 144 B, padded to 192 B. Allow up to
+// 5 cachelines (320 B) so a follow-up can add one or two atomics
+// without this assert breaking — but if someone drops a giant field
+// in here, the build fails loudly and forces a reshape decision.
+const _: () = assert!(core::mem::size_of::<OwnerProfileOwnerWrites>() <= 320);
+const _: () = assert!(core::mem::size_of::<OwnerProfilePeerWrites>() <= 320);
+
+impl OwnerProfileOwnerWrites {
+    /// Inline zero-init. `AtomicU64` is not `Copy`, so `[AtomicU64::new(0); N]`
+    /// does not compile; `from_fn` builds the array inline on the caller's
+    /// stack — no heap.
+    #[inline]
+    fn new() -> Self {
+        Self {
+            drain_latency_hist: std::array::from_fn(|_| AtomicU64::new(0)),
+            drain_invocations: AtomicU64::new(0),
+            drain_noop_invocations: AtomicU64::new(0),
+            owner_pps: AtomicU64::new(0),
+        }
+    }
+}
+
+impl OwnerProfilePeerWrites {
+    #[inline]
+    fn new() -> Self {
+        Self {
+            redirect_acquire_hist: std::array::from_fn(|_| AtomicU64::new(0)),
+            redirect_sample_counter: AtomicU64::new(0),
+            peer_pps: AtomicU64::new(0),
+        }
+    }
+}
+
 impl MmapArea {
     pub(super) fn new(len: usize) -> io::Result<Self> {
         // Round up to 2 MB boundary for hugepage eligibility.
@@ -469,17 +557,33 @@ mod tests {
         let live = BindingLiveState::new();
         let delta_ns = 1500u64; // bucket 1 ([1024, 2048))
         let bucket = bucket_index_for_ns(delta_ns);
-        live.drain_latency_hist[bucket].fetch_add(1, Ordering::Relaxed);
-        live.drain_invocations.fetch_add(1, Ordering::Relaxed);
+        live.owner_profile_owner.drain_latency_hist[bucket].fetch_add(1, Ordering::Relaxed);
+        live.owner_profile_owner
+            .drain_invocations
+            .fetch_add(1, Ordering::Relaxed);
         assert_eq!(bucket, 1);
-        assert_eq!(live.drain_latency_hist[1].load(Ordering::Relaxed), 1);
+        assert_eq!(
+            live.owner_profile_owner.drain_latency_hist[1].load(Ordering::Relaxed),
+            1
+        );
         // Counter-factual: surrounding buckets must stay at 0. A prior
         // draft that used the wrong shift constant (e.g. `55 - clz`)
         // would light up bucket 0 or 2 here — this assertion catches
         // the off-by-one.
-        assert_eq!(live.drain_latency_hist[0].load(Ordering::Relaxed), 0);
-        assert_eq!(live.drain_latency_hist[2].load(Ordering::Relaxed), 0);
-        assert_eq!(live.drain_invocations.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            live.owner_profile_owner.drain_latency_hist[0].load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            live.owner_profile_owner.drain_latency_hist[2].load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            live.owner_profile_owner
+                .drain_invocations
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -497,6 +601,7 @@ mod tests {
                 .expect("push");
         }
         let total_samples: u64 = live
+            .owner_profile_peer
             .redirect_acquire_hist
             .iter()
             .map(|slot| slot.load(Ordering::Relaxed))
@@ -523,6 +628,7 @@ mod tests {
                 .expect("push raw");
         }
         let pre_709_total: u64 = live2
+            .owner_profile_peer
             .redirect_acquire_hist
             .iter()
             .map(|slot| slot.load(Ordering::Relaxed))
@@ -542,8 +648,18 @@ mod tests {
         // values.
         let a = BindingLiveState::new_seeded(0);
         let b = BindingLiveState::new_seeded(1);
-        assert_eq!(a.redirect_sample_counter.load(Ordering::Relaxed), 0);
-        assert_eq!(b.redirect_sample_counter.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            a.owner_profile_peer
+                .redirect_sample_counter
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            b.owner_profile_peer
+                .redirect_sample_counter
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -554,13 +670,21 @@ mod tests {
         // the operator CLI / Prometheus — this test fails fast on the
         // missing field.
         let live = BindingLiveState::new();
-        live.drain_latency_hist[3].store(7, Ordering::Relaxed);
-        live.drain_latency_hist[15].store(2, Ordering::Relaxed);
-        live.drain_invocations.store(100, Ordering::Relaxed);
-        live.drain_noop_invocations.store(50, Ordering::Relaxed);
-        live.redirect_acquire_hist[1].store(11, Ordering::Relaxed);
-        live.pps_owner_vs_peer[0].store(1234, Ordering::Relaxed);
-        live.pps_owner_vs_peer[1].store(567, Ordering::Relaxed);
+        live.owner_profile_owner.drain_latency_hist[3].store(7, Ordering::Relaxed);
+        live.owner_profile_owner.drain_latency_hist[15].store(2, Ordering::Relaxed);
+        live.owner_profile_owner
+            .drain_invocations
+            .store(100, Ordering::Relaxed);
+        live.owner_profile_owner
+            .drain_noop_invocations
+            .store(50, Ordering::Relaxed);
+        live.owner_profile_peer.redirect_acquire_hist[1].store(11, Ordering::Relaxed);
+        live.owner_profile_owner
+            .owner_pps
+            .store(1234, Ordering::Relaxed);
+        live.owner_profile_peer
+            .peer_pps
+            .store(567, Ordering::Relaxed);
 
         let snap = live.snapshot();
         assert_eq!(snap.drain_latency_hist[3], 7);
@@ -570,6 +694,52 @@ mod tests {
         assert_eq!(snap.redirect_acquire_hist[1], 11);
         assert_eq!(snap.owner_pps, 1234);
         assert_eq!(snap.peer_pps, 567);
+    }
+
+    #[test]
+    fn owner_profile_telemetry_is_cacheline_isolated_from_binding_live_state() {
+        // #746: pin the alignment invariant this PR is buying. If a
+        // future refactor silently drops the `#[repr(align(64))]`
+        // attribute on either of the owner-profile structs — or
+        // reshuffles `BindingLiveState` fields so the two groups
+        // land on the same cacheline as their neighbor — this test
+        // fails loudly.
+        //
+        // The two assertions are complementary: alignment on the
+        // struct types alone is not enough if the containing
+        // `BindingLiveState` somehow mis-places them, and field-offset
+        // alignment alone is not enough if the struct itself lost its
+        // `#[repr(align(64))]`.
+        use core::mem::{align_of, offset_of, size_of};
+
+        assert_eq!(align_of::<OwnerProfileOwnerWrites>(), 64);
+        assert_eq!(align_of::<OwnerProfilePeerWrites>(), 64);
+
+        let owner_off = offset_of!(BindingLiveState, owner_profile_owner);
+        let peer_off = offset_of!(BindingLiveState, owner_profile_peer);
+        assert_eq!(
+            owner_off % 64,
+            0,
+            "owner_profile_owner must sit on a 64-byte cacheline boundary",
+        );
+        assert_eq!(
+            peer_off % 64,
+            0,
+            "owner_profile_peer must sit on a 64-byte cacheline boundary",
+        );
+
+        // The two profile structs must NOT share a cacheline: their
+        // offset difference must be at least the larger struct size
+        // (both are padded to 64-B alignment, so this also implies
+        // rounded-up cacheline distance).
+        let gap = peer_off.abs_diff(owner_off);
+        assert!(
+            gap >= size_of::<OwnerProfileOwnerWrites>().max(size_of::<OwnerProfilePeerWrites>()),
+            "owner and peer profile structs must not share a cacheline (gap={gap}, \
+             owner_size={}, peer_size={})",
+            size_of::<OwnerProfileOwnerWrites>(),
+            size_of::<OwnerProfilePeerWrites>(),
+        );
     }
 
     #[test]
@@ -694,47 +864,31 @@ pub(super) struct BindingLiveState {
     /// race during config reload or helper restart. Subset of
     /// `tx_errors`.
     pub(super) no_owner_binding_drops: AtomicU64,
-    /// #709: drain-call latency buckets, powers of two in ns from 1 µs.
-    /// Bucket `N` covers `[2^(N+10) ns, 2^(N+11) ns)`. Indexed via
-    /// `bucket_index_for_ns(delta_ns)`. Written only by the owner
-    /// worker (the sole caller of `drain_shaped_tx` on this binding);
-    /// read by the snapshot path and by Prometheus scrape.
+    /// #709 / #746: owner-written telemetry, cacheline-isolated.
+    /// `drain_latency_hist` buckets sum to `drain_invocations` (pinned
+    /// in unit tests); `drain_noop_invocations` is a subset counter
+    /// (drains that returned `false`). `owner_pps` is the owner-local
+    /// pps window.
     ///
-    /// Owner-only write + Relaxed load/store is sufficient: the
-    /// snapshot reader tolerates monotonic counter tearing across a
-    /// bucket array, and Prometheus semantics are "best effort at
-    /// scrape time".
-    pub(super) drain_latency_hist: [AtomicU64; DRAIN_HIST_BUCKETS],
-    /// #709: total number of `drain_shaped_tx` invocations on this
-    /// binding since process start. Sum of `drain_latency_hist`
-    /// buckets = drain_invocations always holds (pin in unit test).
-    /// Owner-only write.
-    pub(super) drain_invocations: AtomicU64,
-    /// #709: subset of `drain_invocations` where the drain found no
-    /// work (returned `false`). A high noop ratio means the owner is
-    /// spinning on empty — the bottleneck, if any, is upstream RX.
-    /// Owner-only write.
-    pub(super) drain_noop_invocations: AtomicU64,
-    /// #709: redirect-acquire latency sampled 1-in-(REDIRECT_SAMPLE_MASK+1)
-    /// on producers. Same power-of-two bucket layout as
-    /// `drain_latency_hist`. Multi-writer: every worker that redirects
-    /// a TX request into this binding's inbox increments a bucket on a
-    /// sampled push. Relaxed loads/stores (see comment on
-    /// `drain_latency_hist`).
-    pub(super) redirect_acquire_hist: [AtomicU64; DRAIN_HIST_BUCKETS],
-    /// #709: producer-local sample counter for the redirect-acquire
-    /// timer. Each call to `enqueue_tx_owned` does one
-    /// `fetch_add(1, Relaxed)` + `& REDIRECT_SAMPLE_MASK`; only the
-    /// every-(MASK+1)th push pays the `monotonic_nanos()` cost. Seeded
-    /// from `worker_id` at construction so different producer workers
-    /// don't lockstep their samples onto the same call.
-    pub(super) redirect_sample_counter: AtomicU64,
-    /// #709: ring-window pps counters. `[0]` accumulates owner-local
-    /// drains (packets the owner sourced itself); `[1]` accumulates
-    /// peer redirects (packets another worker produced and redirected
-    /// to this owner). Ratio tells the operator whether the owner is
-    /// overloaded. Cleared via `clear statistics class-of-service`.
-    pub(super) pps_owner_vs_peer: [AtomicU64; 2],
+    /// Written only by the owner worker (the sole caller of
+    /// `drain_shaped_tx` on this binding); read by the snapshot path
+    /// and by Prometheus scrape. Owner-only write + Relaxed load/store
+    /// is sufficient: the snapshot reader tolerates monotonic counter
+    /// tearing across a bucket array, and Prometheus semantics are
+    /// "best effort at scrape time".
+    pub(super) owner_profile_owner: OwnerProfileOwnerWrites,
+    /// #709 / #746: peer-written telemetry, cacheline-isolated.
+    /// `redirect_acquire_hist` is the redirect-acquire latency
+    /// histogram, sampled 1-in-(`REDIRECT_SAMPLE_MASK`+1) on
+    /// producers. `redirect_sample_counter` is the producer-local
+    /// sample counter; seeded from `worker_id` at construction so
+    /// different producer workers don't lockstep their samples onto
+    /// the same call. `peer_pps` is the peer-redirect pps window.
+    ///
+    /// Multi-writer: every worker that redirects a TX request into
+    /// this binding's inbox increments a bucket on a sampled push.
+    /// The owner reads via `snapshot()`.
+    pub(super) owner_profile_peer: OwnerProfilePeerWrites,
     pub(super) direct_tx_packets: AtomicU64,
     pub(super) copy_tx_packets: AtomicU64,
     pub(super) in_place_tx_packets: AtomicU64,
@@ -821,18 +975,15 @@ impl BindingLiveState {
             pending_tx_local_overflow_drops: AtomicU64::new(0),
             tx_submit_error_drops: AtomicU64::new(0),
             no_owner_binding_drops: AtomicU64::new(0),
-            // #709: owner-profile telemetry. Histograms are zero-init
-            // fixed-cap arrays; sum of buckets == drain_invocations
-            // invariant holds at `new()` (both 0). The sample counter
-            // seed is left at zero by `new()`; call sites that have a
-            // worker_id in hand should use `new_seeded()` instead so
-            // per-worker samples don't lockstep onto the same push.
-            drain_latency_hist: Self::zero_hist(),
-            drain_invocations: AtomicU64::new(0),
-            drain_noop_invocations: AtomicU64::new(0),
-            redirect_acquire_hist: Self::zero_hist(),
-            redirect_sample_counter: AtomicU64::new(0),
-            pps_owner_vs_peer: [AtomicU64::new(0), AtomicU64::new(0)],
+            // #709 / #746: owner-profile telemetry, split by writer
+            // into two cacheline-isolated groups. Histograms are zero-
+            // init fixed-cap arrays; sum of buckets == drain_invocations
+            // invariant holds at `new()` (both 0). The redirect-sample
+            // counter seed is left at zero by `new()`; call sites that
+            // have a worker_id in hand should use `new_seeded()` instead
+            // so per-worker samples don't lockstep onto the same push.
+            owner_profile_owner: OwnerProfileOwnerWrites::new(),
+            owner_profile_peer: OwnerProfilePeerWrites::new(),
             direct_tx_packets: AtomicU64::new(0),
             copy_tx_packets: AtomicU64::new(0),
             in_place_tx_packets: AtomicU64::new(0),
@@ -867,19 +1018,12 @@ impl BindingLiveState {
         // we care about without needing a randomness source. The mask
         // treats the counter modulo (MASK+1), so any seed ∈ [0, MASK]
         // suffices; larger worker_ids just wrap cheaply.
-        state.redirect_sample_counter = AtomicU64::new(worker_id as u64);
+        //
+        // #746: the sample counter moved into `owner_profile_peer`
+        // when the owner/peer split landed; seeding writes through the
+        // new nested path but the effect is identical.
+        state.owner_profile_peer.redirect_sample_counter = AtomicU64::new(worker_id as u64);
         state
-    }
-
-    /// #709: inline zero-initialised histogram bucket array. Factored
-    /// so `new()` and `new_seeded()` don't repeat the literal, and so
-    /// a future bucket-count bump only touches one spot.
-    #[inline]
-    fn zero_hist() -> [AtomicU64; DRAIN_HIST_BUCKETS] {
-        // `AtomicU64` is not `Copy`, so `[AtomicU64::new(0); N]` does
-        // not compile; build the array from a `from_fn` pattern. This
-        // is still a single stack allocation — no heap.
-        std::array::from_fn(|_| AtomicU64::new(0))
     }
 
     pub(super) fn set_bound(&self, socket_fd: c_int) {
@@ -1069,19 +1213,30 @@ impl BindingLiveState {
                 .lock()
                 .map(|v| v.clone())
                 .unwrap_or_default(),
-            // #709: owner-profile telemetry snapshot. Histograms are
-            // copied bucket-by-bucket under `Relaxed`. Read-side
-            // tearing is acceptable — these are diagnostic counters,
-            // not a load-bearing arithmetic invariant; the only
-            // "invariant" (sum of buckets ≈ drain_invocations) holds
-            // within a single-thread read only in steady-state, which
-            // is how operators consume the values anyway.
-            drain_latency_hist: Self::snapshot_hist(&self.drain_latency_hist),
-            drain_invocations: self.drain_invocations.load(Ordering::Relaxed),
-            drain_noop_invocations: self.drain_noop_invocations.load(Ordering::Relaxed),
-            redirect_acquire_hist: Self::snapshot_hist(&self.redirect_acquire_hist),
-            owner_pps: self.pps_owner_vs_peer[0].load(Ordering::Relaxed),
-            peer_pps: self.pps_owner_vs_peer[1].load(Ordering::Relaxed),
+            // #709 / #746: owner-profile telemetry snapshot.
+            // Histograms are copied bucket-by-bucket under `Relaxed`
+            // through the cacheline-isolated owner/peer structs.
+            // Read-side tearing is acceptable — these are diagnostic
+            // counters, not a load-bearing arithmetic invariant; the
+            // only "invariant" (sum of buckets ≈ drain_invocations)
+            // holds within a single-thread read only in steady-state,
+            // which is how operators consume the values anyway.
+            drain_latency_hist: Self::snapshot_hist(
+                &self.owner_profile_owner.drain_latency_hist,
+            ),
+            drain_invocations: self
+                .owner_profile_owner
+                .drain_invocations
+                .load(Ordering::Relaxed),
+            drain_noop_invocations: self
+                .owner_profile_owner
+                .drain_noop_invocations
+                .load(Ordering::Relaxed),
+            redirect_acquire_hist: Self::snapshot_hist(
+                &self.owner_profile_peer.redirect_acquire_hist,
+            ),
+            owner_pps: self.owner_profile_owner.owner_pps.load(Ordering::Relaxed),
+            peer_pps: self.owner_profile_peer.peer_pps.load(Ordering::Relaxed),
         }
     }
 
@@ -1112,7 +1267,10 @@ impl BindingLiveState {
         // second atomic to the MPSC inbox itself; the sample counter
         // lives on `BindingLiveState` next to the other per-binding
         // atomics. MPSC invariants from #715 are preserved.
-        let sample = (self.redirect_sample_counter.fetch_add(1, Ordering::Relaxed)
+        let sample = (self
+            .owner_profile_peer
+            .redirect_sample_counter
+            .fetch_add(1, Ordering::Relaxed)
             & REDIRECT_SAMPLE_MASK)
             == 0;
         let start = if sample {
@@ -1124,7 +1282,8 @@ impl BindingLiveState {
         if let Some(start) = start {
             let delta = monotonic_nanos().saturating_sub(start);
             let bucket = bucket_index_for_ns(delta);
-            self.redirect_acquire_hist[bucket].fetch_add(1, Ordering::Relaxed);
+            self.owner_profile_peer.redirect_acquire_hist[bucket]
+                .fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
