@@ -1580,14 +1580,13 @@ pub(super) fn aggregate_cos_statuses_across_workers(
                     .tx_ring_full_submit_stalls
                     .saturating_add(queue.tx_ring_full_submit_stalls);
                 // #709: cross-worker aggregation for owner-profile
-                // counters uses `max` (not `saturating_add`) because
-                // only the owner worker's snapshot has non-zero
-                // values for a given exact queue — summing would
-                // double-count if any peer worker surfaced the queue
-                // with zeros (same bucket contents). See
-                // `merge_owner_profile_max` for the same-shape
-                // intra-worker merge.
-                super::worker::merge_cos_queue_owner_profile_max(q, queue);
+                // counters is sum, not max. Histograms and invocation
+                // counters must stay coherent after aggregation;
+                // per-bucket max can synthesize a profile no worker
+                // observed while breaking `sum(hist) == invocations`.
+                // See `merge_owner_profile_sum` /
+                // `merge_cos_queue_owner_profile_sum`.
+                super::worker::merge_cos_queue_owner_profile_sum(q, queue);
             }
         }
     }
@@ -2575,6 +2574,83 @@ mod tests {
         assert_eq!(q.root_token_starvation_parks, 7 + 23);
         assert_eq!(q.queue_token_starvation_parks, 11 + 29);
         assert_eq!(q.tx_ring_full_submit_stalls, 13 + 31);
+    }
+
+    #[test]
+    fn aggregate_cos_statuses_sums_owner_profile_across_workers_coherently() {
+        use crate::protocol::{CoSInterfaceStatus, CoSQueueStatus};
+
+        let worker_a = vec![CoSInterfaceStatus {
+            ifindex: 80,
+            interface_name: "reth0.80".into(),
+            worker_instances: 1,
+            queues: vec![CoSQueueStatus {
+                queue_id: 4,
+                worker_instances: 1,
+                exact: true,
+                drain_latency_hist: {
+                    let mut v = vec![0; super::super::umem::DRAIN_HIST_BUCKETS];
+                    v[0] = 5;
+                    v
+                },
+                redirect_acquire_hist: {
+                    let mut v = vec![0; super::super::umem::DRAIN_HIST_BUCKETS];
+                    v[1] = 3;
+                    v
+                },
+                drain_invocations: 5,
+                drain_noop_invocations: 1,
+                owner_pps: 100,
+                peer_pps: 40,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let worker_b = vec![CoSInterfaceStatus {
+            ifindex: 80,
+            interface_name: "reth0.80".into(),
+            worker_instances: 1,
+            queues: vec![CoSQueueStatus {
+                queue_id: 4,
+                worker_instances: 1,
+                exact: true,
+                drain_latency_hist: {
+                    let mut v = vec![0; super::super::umem::DRAIN_HIST_BUCKETS];
+                    v[7] = 11;
+                    v
+                },
+                redirect_acquire_hist: {
+                    let mut v = vec![0; super::super::umem::DRAIN_HIST_BUCKETS];
+                    v[2] = 13;
+                    v
+                },
+                drain_invocations: 11,
+                drain_noop_invocations: 2,
+                owner_pps: 200,
+                peer_pps: 50,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+
+        let owner_by_queue = BTreeMap::from([((80, 4u8), 3u32)]);
+        let aggregated =
+            aggregate_cos_statuses_across_workers(&[worker_a, worker_b], &owner_by_queue);
+
+        let q = &aggregated[0].queues[0];
+        assert_eq!(q.drain_latency_hist[0], 5);
+        assert_eq!(q.drain_latency_hist[7], 11);
+        assert_eq!(q.redirect_acquire_hist[1], 3);
+        assert_eq!(q.redirect_acquire_hist[2], 13);
+        assert_eq!(q.drain_invocations, 16);
+        assert_eq!(q.drain_noop_invocations, 3);
+        assert_eq!(q.owner_pps, 300);
+        assert_eq!(q.peer_pps, 90);
+        assert_eq!(
+            q.drain_latency_hist.iter().copied().sum::<u64>(),
+            q.drain_invocations,
+            "cross-worker aggregation must preserve hist == invocation invariant",
+        );
     }
 
     #[test]
