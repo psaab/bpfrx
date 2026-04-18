@@ -1674,12 +1674,20 @@ pub(super) fn owner_profile_snapshot(live: &BindingLiveState) -> OwnerProfileSna
     }
 }
 
-/// #709: max-merge the owner-profile fields of one `CoSQueueStatus`
+/// #709: sum-merge the owner-profile fields of one `CoSQueueStatus`
 /// into another. Used by `coordinator::aggregate_cos_statuses_across_workers`
-/// to fold per-worker snapshots into the operator-facing view without
-/// double-counting the owner-only histogram. Signature mirrors
-/// `merge_owner_profile_max` so both layers share the same contract.
-pub(crate) fn merge_cos_queue_owner_profile_max(
+/// to fold per-worker snapshots into the operator-facing view while
+/// preserving the histogram invariant that
+/// `sum(drain_latency_hist) == drain_invocations`.
+///
+/// `max` across workers is wrong for histograms and counters: it can
+/// synthesize a profile no worker actually observed (bucket 0 from one
+/// worker, bucket 7 from another) while leaving `drain_invocations` at
+/// only the larger side's count. Summation preserves a coherent queue-
+/// level view for both owner-local and shared-exact service.
+/// Signature mirrors `merge_owner_profile_sum` so both layers share the
+/// same contract.
+pub(crate) fn merge_cos_queue_owner_profile_sum(
     dst: &mut crate::protocol::CoSQueueStatus,
     src: &crate::protocol::CoSQueueStatus,
 ) {
@@ -1691,25 +1699,28 @@ pub(crate) fn merge_cos_queue_owner_profile_max(
     }
     for i in 0..DRAIN_HIST_BUCKETS {
         let src_drain = src.drain_latency_hist.get(i).copied().unwrap_or(0);
-        dst.drain_latency_hist[i] = dst.drain_latency_hist[i].max(src_drain);
+        dst.drain_latency_hist[i] = dst.drain_latency_hist[i].saturating_add(src_drain);
         let src_redirect = src.redirect_acquire_hist.get(i).copied().unwrap_or(0);
-        dst.redirect_acquire_hist[i] = dst.redirect_acquire_hist[i].max(src_redirect);
+        dst.redirect_acquire_hist[i] = dst.redirect_acquire_hist[i].saturating_add(src_redirect);
     }
-    dst.drain_invocations = dst.drain_invocations.max(src.drain_invocations);
-    dst.drain_noop_invocations = dst.drain_noop_invocations.max(src.drain_noop_invocations);
-    dst.owner_pps = dst.owner_pps.max(src.owner_pps);
-    dst.peer_pps = dst.peer_pps.max(src.peer_pps);
+    dst.drain_invocations = dst.drain_invocations.saturating_add(src.drain_invocations);
+    dst.drain_noop_invocations = dst
+        .drain_noop_invocations
+        .saturating_add(src.drain_noop_invocations);
+    dst.owner_pps = dst.owner_pps.saturating_add(src.owner_pps);
+    dst.peer_pps = dst.peer_pps.saturating_add(src.peer_pps);
 }
 
-/// #709: max-merge a binding's owner-profile snapshot into a per-queue
-/// `CoSQueueStatus`. Max is the right aggregation: only one worker per
-/// exact queue is the owner, and only that worker's snapshot has
-/// non-zero values. For shared_exact queues every worker drains, and
-/// taking max surfaces the busiest worker's profile — not perfect, but
-/// better than sum (which would inflate the histogram) or overwrite
-/// (which would be order-dependent). For non-exact queues the fields
-/// stay zero because those queues don't have a single owner binding.
-pub(super) fn merge_owner_profile_max(
+/// #709: sum-merge a binding's owner-profile snapshot into a per-queue
+/// `CoSQueueStatus`.
+///
+/// For owner-local exact queues, only one binding contributes non-zero
+/// values so sum and max are equivalent. For shared-exact queues or any
+/// future topology where multiple bindings contribute to the same queue,
+/// summation preserves a coherent aggregate distribution and keeps
+/// `sum(histogram) == invocations` intact. A per-bucket `max` breaks
+/// that invariant and can manufacture an impossible mixed profile.
+pub(super) fn merge_owner_profile_sum(
     status: &mut crate::protocol::CoSQueueStatus,
     profile: &OwnerProfileSnapshot,
 ) {
@@ -1727,16 +1738,18 @@ pub(super) fn merge_owner_profile_max(
     }
     for i in 0..DRAIN_HIST_BUCKETS {
         status.drain_latency_hist[i] =
-            status.drain_latency_hist[i].max(profile.drain_latency_hist[i]);
+            status.drain_latency_hist[i].saturating_add(profile.drain_latency_hist[i]);
         status.redirect_acquire_hist[i] =
-            status.redirect_acquire_hist[i].max(profile.redirect_acquire_hist[i]);
+            status.redirect_acquire_hist[i].saturating_add(profile.redirect_acquire_hist[i]);
     }
-    status.drain_invocations = status.drain_invocations.max(profile.drain_invocations);
+    status.drain_invocations = status
+        .drain_invocations
+        .saturating_add(profile.drain_invocations);
     status.drain_noop_invocations = status
         .drain_noop_invocations
-        .max(profile.drain_noop_invocations);
-    status.owner_pps = status.owner_pps.max(profile.owner_pps);
-    status.peer_pps = status.peer_pps.max(profile.peer_pps);
+        .saturating_add(profile.drain_noop_invocations);
+    status.owner_pps = status.owner_pps.saturating_add(profile.owner_pps);
+    status.peer_pps = status.peer_pps.saturating_add(profile.peer_pps);
 }
 
 fn build_worker_cos_statuses_from_maps<'a, I>(
@@ -1857,18 +1870,19 @@ where
                 status.tx_ring_full_submit_stalls = status
                     .tx_ring_full_submit_stalls
                     .saturating_add(queue.drop_counters.tx_ring_full_submit_stalls);
-                // #709: attribute this binding's owner-profile snapshot
-                // to every queue served by this binding. When the
-                // coordinator aggregates across workers, each queue row
-                // will see the owner worker's values on its snapshot
-                // and zeros (or near-zero) from peer workers that
-                // happen to surface a runtime entry. `max` aggregation
-                // preserves the owner's data and ignores the peer's
-                // zeros; sum would double-count if any peer worker
-                // also populated (it should not in practice, but max
-                // is the safer contract to document).
+                // #709 / #748: the owner-profile snapshot is
+                // binding-scoped (`drain_shaped_tx` runs per-binding
+                // across all its queues) — we attribute this binding's
+                // snapshot into every queue row it contributes to.
+                // Aggregation is saturating-sum across contributors
+                // that surface the same queue row, not `max`:
+                // sum preserves `sum(drain_latency_hist) ==
+                // drain_invocations` when multiple bindings/workers
+                // service the same shared-exact queue. `max` hid
+                // non-dominant contributors and broke that invariant
+                // — the bug #748 fixes.
                 if let Some(profile) = binding_profile.as_ref() {
-                    merge_owner_profile_max(status, profile);
+                    merge_owner_profile_sum(status, profile);
                 }
             }
         }
@@ -2046,6 +2060,124 @@ mod tests {
         assert_eq!(queue.root_token_starvation_parks, 5 + 19);
         assert_eq!(queue.queue_token_starvation_parks, 7 + 23);
         assert_eq!(queue.tx_ring_full_submit_stalls, 11 + 29);
+    }
+
+    #[test]
+    fn build_worker_cos_statuses_sums_owner_profile_without_breaking_hist_invariant() {
+        let mut forwarding = ForwardingState::default();
+        forwarding
+            .ifindex_to_config_name
+            .insert(80, "reth0.80".to_string());
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 1_250_000_000,
+                burst_bytes: 256 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![CoSQueueConfig {
+                    queue_id: 4,
+                    forwarding_class: "iperf-a".to_string(),
+                    priority: 1,
+                    transmit_rate_bytes: 1_250_000,
+                    exact: true,
+                    surplus_weight: 1,
+                    buffer_bytes: 32 * 1024,
+                    dscp_rewrite: None,
+                }],
+            },
+        );
+
+        let make_root = || CoSInterfaceRuntime {
+            shaping_rate_bytes: 1_250_000_000,
+            burst_bytes: 256 * 1024,
+            tokens: 0,
+            default_queue: 0,
+            nonempty_queues: 1,
+            runnable_queues: 1,
+            exact_guarantee_rr: 0,
+            nonexact_guarantee_rr: 0,
+            #[cfg(test)]
+            legacy_guarantee_rr: 0,
+            queues: vec![CoSQueueRuntime {
+                queue_id: 4,
+                priority: 1,
+                transmit_rate_bytes: 1_250_000,
+                exact: true,
+                flow_fair: false,
+                flow_hash_seed: 0,
+                surplus_weight: 1,
+                surplus_deficit: 0,
+                buffer_bytes: 32 * 1024,
+                dscp_rewrite: None,
+                tokens: 0,
+                last_refill_ns: 0,
+                queued_bytes: 0,
+                active_flow_buckets: 0,
+                flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                flow_rr_buckets: FlowRrRing::default(),
+                flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+                runnable: true,
+                parked: false,
+                next_wakeup_tick: 0,
+                wheel_level: 0,
+                wheel_slot: 0,
+                items: VecDeque::new(),
+                drop_counters: CoSQueueDropCounters::default(),
+            }],
+            queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
+            rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
+            timer_wheel: CoSTimerWheelRuntime {
+                current_tick: 0,
+                level0: std::array::from_fn(|_| Vec::new()),
+                level1: std::array::from_fn(|_| Vec::new()),
+            },
+        };
+
+        let live_a = BindingLiveState::new();
+        live_a.drain_latency_hist[0].store(5, Ordering::Relaxed);
+        live_a.redirect_acquire_hist[1].store(3, Ordering::Relaxed);
+        live_a.drain_invocations.store(5, Ordering::Relaxed);
+        live_a.drain_noop_invocations.store(1, Ordering::Relaxed);
+        live_a.pps_owner_vs_peer[0].store(100, Ordering::Relaxed);
+        live_a.pps_owner_vs_peer[1].store(40, Ordering::Relaxed);
+
+        let live_b = BindingLiveState::new();
+        live_b.drain_latency_hist[7].store(11, Ordering::Relaxed);
+        live_b.redirect_acquire_hist[2].store(13, Ordering::Relaxed);
+        live_b.drain_invocations.store(11, Ordering::Relaxed);
+        live_b.drain_noop_invocations.store(2, Ordering::Relaxed);
+        live_b.pps_owner_vs_peer[0].store(200, Ordering::Relaxed);
+        live_b.pps_owner_vs_peer[1].store(50, Ordering::Relaxed);
+
+        let mut first = FastMap::default();
+        first.insert(80, make_root());
+        let mut second = FastMap::default();
+        second.insert(80, make_root());
+
+        let statuses = build_worker_cos_statuses_from_maps(
+            [(&first, Some(&live_a)), (&second, Some(&live_b))],
+            &forwarding,
+        );
+        let queue = &statuses[0].queues[0];
+
+        assert_eq!(queue.drain_latency_hist[0], 5);
+        assert_eq!(queue.drain_latency_hist[7], 11);
+        assert_eq!(queue.redirect_acquire_hist[1], 3);
+        assert_eq!(queue.redirect_acquire_hist[2], 13);
+        assert_eq!(queue.drain_invocations, 16);
+        assert_eq!(queue.drain_noop_invocations, 3);
+        assert_eq!(queue.owner_pps, 300);
+        assert_eq!(queue.peer_pps, 90);
+        assert_eq!(
+            queue.drain_latency_hist.iter().copied().sum::<u64>(),
+            queue.drain_invocations,
+            "aggregated histogram must stay coherent with invocation count",
+        );
     }
 
     #[test]
