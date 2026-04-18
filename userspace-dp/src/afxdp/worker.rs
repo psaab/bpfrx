@@ -1870,12 +1870,17 @@ where
                 status.tx_ring_full_submit_stalls = status
                     .tx_ring_full_submit_stalls
                     .saturating_add(queue.drop_counters.tx_ring_full_submit_stalls);
-                // #709: attribute this binding's owner-profile snapshot
-                // to every queue served by this binding. Aggregation is
-                // sum, not max: if multiple bindings/workers service the
-                // same queue (shared exact), we want the queue-level
-                // total histogram and invocation counters, not a mixed
-                // per-bucket maximum that breaks invariants.
+                // #709 / #748: the owner-profile snapshot is
+                // binding-scoped (`drain_shaped_tx` runs per-binding
+                // across all its queues) — we attribute this binding's
+                // snapshot into every queue row it contributes to.
+                // Aggregation is saturating-sum across contributors
+                // that surface the same queue row, not `max`:
+                // sum preserves `sum(drain_latency_hist) ==
+                // drain_invocations` when multiple bindings/workers
+                // service the same shared-exact queue. `max` hid
+                // non-dominant contributors and broke that invariant
+                // — the bug #748 fixes.
                 if let Some(profile) = binding_profile.as_ref() {
                     merge_owner_profile_sum(status, profile);
                 }
