@@ -1660,17 +1660,26 @@ pub(super) struct OwnerProfileSnapshot {
 
 #[inline]
 pub(super) fn owner_profile_snapshot(live: &BindingLiveState) -> OwnerProfileSnapshot {
+    // #746: atomics now live on cacheline-isolated `owner_profile_owner`
+    // / `owner_profile_peer` nested structs. This snapshot reads from
+    // both but the shape it produces is byte-identical to pre-refactor.
     OwnerProfileSnapshot {
         drain_latency_hist: std::array::from_fn(|i| {
-            live.drain_latency_hist[i].load(Ordering::Relaxed)
+            live.owner_profile_owner.drain_latency_hist[i].load(Ordering::Relaxed)
         }),
-        drain_invocations: live.drain_invocations.load(Ordering::Relaxed),
-        drain_noop_invocations: live.drain_noop_invocations.load(Ordering::Relaxed),
+        drain_invocations: live
+            .owner_profile_owner
+            .drain_invocations
+            .load(Ordering::Relaxed),
+        drain_noop_invocations: live
+            .owner_profile_owner
+            .drain_noop_invocations
+            .load(Ordering::Relaxed),
         redirect_acquire_hist: std::array::from_fn(|i| {
-            live.redirect_acquire_hist[i].load(Ordering::Relaxed)
+            live.owner_profile_peer.redirect_acquire_hist[i].load(Ordering::Relaxed)
         }),
-        owner_pps: live.pps_owner_vs_peer[0].load(Ordering::Relaxed),
-        peer_pps: live.pps_owner_vs_peer[1].load(Ordering::Relaxed),
+        owner_pps: live.owner_profile_owner.owner_pps.load(Ordering::Relaxed),
+        peer_pps: live.owner_profile_peer.peer_pps.load(Ordering::Relaxed),
     }
 }
 
@@ -2139,20 +2148,44 @@ mod tests {
         };
 
         let live_a = BindingLiveState::new();
-        live_a.drain_latency_hist[0].store(5, Ordering::Relaxed);
-        live_a.redirect_acquire_hist[1].store(3, Ordering::Relaxed);
-        live_a.drain_invocations.store(5, Ordering::Relaxed);
-        live_a.drain_noop_invocations.store(1, Ordering::Relaxed);
-        live_a.pps_owner_vs_peer[0].store(100, Ordering::Relaxed);
-        live_a.pps_owner_vs_peer[1].store(40, Ordering::Relaxed);
+        live_a.owner_profile_owner.drain_latency_hist[0].store(5, Ordering::Relaxed);
+        live_a.owner_profile_peer.redirect_acquire_hist[1].store(3, Ordering::Relaxed);
+        live_a
+            .owner_profile_owner
+            .drain_invocations
+            .store(5, Ordering::Relaxed);
+        live_a
+            .owner_profile_owner
+            .drain_noop_invocations
+            .store(1, Ordering::Relaxed);
+        live_a
+            .owner_profile_owner
+            .owner_pps
+            .store(100, Ordering::Relaxed);
+        live_a
+            .owner_profile_peer
+            .peer_pps
+            .store(40, Ordering::Relaxed);
 
         let live_b = BindingLiveState::new();
-        live_b.drain_latency_hist[7].store(11, Ordering::Relaxed);
-        live_b.redirect_acquire_hist[2].store(13, Ordering::Relaxed);
-        live_b.drain_invocations.store(11, Ordering::Relaxed);
-        live_b.drain_noop_invocations.store(2, Ordering::Relaxed);
-        live_b.pps_owner_vs_peer[0].store(200, Ordering::Relaxed);
-        live_b.pps_owner_vs_peer[1].store(50, Ordering::Relaxed);
+        live_b.owner_profile_owner.drain_latency_hist[7].store(11, Ordering::Relaxed);
+        live_b.owner_profile_peer.redirect_acquire_hist[2].store(13, Ordering::Relaxed);
+        live_b
+            .owner_profile_owner
+            .drain_invocations
+            .store(11, Ordering::Relaxed);
+        live_b
+            .owner_profile_owner
+            .drain_noop_invocations
+            .store(2, Ordering::Relaxed);
+        live_b
+            .owner_profile_owner
+            .owner_pps
+            .store(200, Ordering::Relaxed);
+        live_b
+            .owner_profile_peer
+            .peer_pps
+            .store(50, Ordering::Relaxed);
 
         let mut first = FastMap::default();
         first.insert(80, make_root());
