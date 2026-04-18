@@ -324,18 +324,122 @@ was reverted in the same PR; the recipe doc lives on as design intent.
 
 ### Blockers before Option A can land as a win
 
-1. `pin_current_thread` must pick the Nth allowed CPU, not absolute
-   CPU N. One-line follow-up in `userspace-dp/src/afxdp/neighbor.rs`.
+1. ~~`pin_current_thread` must pick the Nth allowed CPU, not absolute
+   CPU N.~~ **Fixed in #740.** Workers correctly honour the inherited
+   mask as of master `b5e7fc2f`. Verified during the #741 retry below.
 2. Option B (kernel cmdline `isolcpus=`+`nohz_full=`) would remove
    kernel timers and RCU callbacks from worker CPUs entirely. It
    requires a cmdline edit and reboot, so deployment shape has to opt
-   in. Tracked as a follow-up to #712.
+   in. Tracked as a follow-up to #712 (#739). After the #741 retry
+   this is the next lever to try on this hardware.
 3. Option D (cgroup cpuset) is softer and does not require a cmdline
    change but needs operator decisions about which cpuset holds which
    non-xpfd process. Tracked as a follow-up to #712.
 
-Until one of these lands, the 14% per-flow CoV on this lab is the
-floor — Option A alone does not move it.
+## CPU pinning retry post-#740
+
+**Measured 2026-04-17 for #712 Option A retry (#741).** Conclusion:
+with the #740 fix in place, workers correctly pin to CPUs 2-5 — but
+the aggregate iperf3 metrics still do not move by the #712 thresholds
+on this hardware. The layout is verified as applied; the 6-core lab
+does not benefit from systemd-level pinning alone.
+
+### Verification (Phase 3)
+
+Taken live with `CPUAffinity=2 3 4 5` loaded, xpfd running, before
+the Phase 4 iperf3 runs:
+
+```
+pid 65616's current affinity mask: 3c
+
+65619 ctrl-c         cpus_allowed=2-5 psr=3
+65620 iou-wrk-...    cpus_allowed=2-5 psr=5
+65628 neigh-monitor  cpus_allowed=2-5 psr=2
+65621 session-socket cpus_allowed=2-5 psr=2
+65618 xpf-event-strea cpus_allowed=2-5 psr=2
+65622 xpf-slowpath   cpus_allowed=2-5 psr=3
+65617 xpf-state-write cpus_allowed=2-5 psr=4
+65616 xpf-userspace-d cpus_allowed=2-5 psr=5
+65624 xpf-userspace-w cpus_allowed=2   psr=2
+65625 xpf-userspace-w cpus_allowed=3   psr=3
+65626 xpf-userspace-w cpus_allowed=4   psr=4
+65627 xpf-userspace-w cpus_allowed=5   psr=5
+```
+
+Every worker on its own CPU in {2,3,4,5}; `psr` matches
+`cpus_allowed` one-to-one. No worker lands on CPU 0 or 1. The
+pre-#740 failure mode — workers on CPUs 0-3 regardless of the unit
+mask — does not recur.
+
+### Phase 4 measurement
+
+Same fixture as #737: 3 × 30 s × 16-flow iperf3, client
+`cluster-userspace-host`, target `172.16.80.200`, CoS fixture
+`test/incus/cos-iperf-config.set` applied, fw0 primary,
+`net.ipv4.tcp_ecn=1` end-to-end. Per-flow CoV = per-second bps
+stdev / mean per stream, mean across streams (16 streams per run).
+
+Per-run raw values:
+
+| Run | Ratio | Retrans / 30 s | CoV mean | CoV max |
+|---|---|---|---|---|
+| Pre  1 | 1.370× | 198,317 | 16.3% | 26.4% |
+| Pre  2 | 1.365× | 186,389 | 15.3% | 26.9% |
+| Pre  3 | 1.383× | 245,724 | 18.9% | 27.0% |
+| Post 1 | 1.288× | 264,493 | 17.4% | 27.6% |
+| Post 2 | 1.492× | 179,843 | 16.7% | 32.5% |
+| Post 3 | 1.419× | 257,562 | 14.6% | 25.4% |
+
+Aggregate:
+
+| Metric | Pre-pin mean | Post-pin mean | Δ |
+|---|---|---|---|
+| Rate ratio (max/min per-flow) | 1.373× | 1.400× | +2% (worse, within noise) |
+| Retransmits / 30 s | 210 k | 234 k | +11% (worse, within noise) |
+| Per-flow CoV mean | 16.8% | 16.2% | -0.6 pp (better, within noise) |
+| Per-flow CoV max | 26.8% | 28.5% | +1.7 pp (worse, within noise) |
+
+### Decision
+
+Per #712's keep/revert/defer thresholds (also cited verbatim in the
+#741 task brief):
+
+- **Keep** requires: ratio improves ≥ 5%, OR per-flow CoV mean drops
+  ≥ 3 pp on 2+ runs, OR retrans drops ≥ 15%. **None satisfied.**
+- **Revert** if no metric moves above thresholds. Three of four
+  metrics moved in the *worse* direction within noise; CoV mean
+  improved 0.6 pp, far below the 3 pp threshold.
+- **Defer** is for "small movement without any metric going worse".
+  That condition is not met either — ratio + retrans + CoV max all
+  regressed.
+
+**Decision: revert the directive.** Same engineering outcome as #737,
+different mechanism. #737 revert was forced by the pin logic bug;
+#741 revert is forced by the hardware. The recipe lives on as design
+intent; the next lever is #739 (kernel cmdline isolcpus/nohz_full).
+
+### Why the pin doesn't help on this lab
+
+IRQ layout sampled mid-run (abbreviated from `/proc/interrupts`):
+
+- `virtio11-input.0..5` (one of the NICs) — each pinned to its own
+  CPU across CPUs 0-5, each carrying tens of thousands of interrupts
+  per run.
+- `virtio12-input.0..5` — same 1-per-CPU spread, hundreds of
+  thousands of interrupts per CPU per run (LAN-side).
+- `virtio5-virtqueues` → CPU 2, 65 k interrupts.
+
+CPUs 2-5 carry virtio RX interrupts for four of the six virtio
+queues; moving xpfd workers onto those CPUs collides with the same
+softirq work that was running there before. The pin moves the
+workload alongside its IRQs rather than away from them. To actually
+separate the worker from kernel timer + softirq preemption you need
+either (a) `isolcpus=2-5` on the cmdline (Option B, #739), or (b)
+`ethtool`-level RSS reshape to park the RX queues on CPUs 0-1 so
+CPUs 2-5 are truly quiet (out of scope per the recipe).
+
+Until one of those lands, the 14-18% per-flow CoV on this lab is the
+floor for `CPUAffinity=` alone.
 
 ## Gotchas the deploy wipes
 
