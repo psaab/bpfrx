@@ -384,6 +384,150 @@ system {
 	}
 }
 
+// TestArchiveSitesPasswordParsed pins the #651 parser behaviour: a
+// site configured with an inline `password "$9$..."` must land on
+// ArchiveSitesWithPassword, and a site without one must NOT. Covers
+// the three concrete syntaxes the Junos parser produces:
+//   - hierarchical nested: archive-sites { "<url>" { password "..."; } }
+//   - hierarchical leaf:   archive-sites { "<url>" password "..."; }
+//   - flat-set:            set system archival ... archive-sites "<url>" password "..."
+// The existing ValidateConfig test pre-populates the slice; this test
+// exercises the compile-time extraction so regressions in how Junos
+// shapes enter ArchiveSitesWithPassword are caught at the parser level.
+func TestArchiveSitesPasswordParsed(t *testing.T) {
+	type want struct {
+		urls        []string
+		withPasswd  []string
+	}
+
+	cases := []struct {
+		name  string
+		input string
+		want  want
+	}{
+		{
+			name: "hierarchical_nested_password",
+			input: `
+system {
+    archival {
+        configuration {
+            archive-sites {
+                "scp://alice@host1/configs" {
+                    password "$9$abc";
+                }
+                "scp://bob@host2/configs";
+            }
+        }
+    }
+}
+`,
+			want: want{
+				urls:       []string{"scp://alice@host1/configs", "scp://bob@host2/configs"},
+				withPasswd: []string{"scp://alice@host1/configs"},
+			},
+		},
+		{
+			name: "hierarchical_leaf_password",
+			input: `
+system {
+    archival {
+        configuration {
+            archive-sites {
+                "scp://carol@host3/configs" password "$9$xyz";
+                "scp://dave@host4/configs";
+            }
+        }
+    }
+}
+`,
+			want: want{
+				urls:       []string{"scp://carol@host3/configs", "scp://dave@host4/configs"},
+				withPasswd: []string{"scp://carol@host3/configs"},
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewParser(tc.input)
+			tree, errs := p.Parse()
+			if len(errs) > 0 {
+				t.Fatalf("parse errors: %v", errs)
+			}
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("CompileConfig: %v", err)
+			}
+			arch := cfg.System.Archival
+			if arch == nil {
+				t.Fatal("archival is nil")
+			}
+			if !equalStringSlices(arch.ArchiveSites, tc.want.urls) {
+				t.Errorf("ArchiveSites = %v, want %v", arch.ArchiveSites, tc.want.urls)
+			}
+			if !equalStringSlices(arch.ArchiveSitesWithPassword, tc.want.withPasswd) {
+				t.Errorf("ArchiveSitesWithPassword = %v, want %v",
+					arch.ArchiveSitesWithPassword, tc.want.withPasswd)
+			}
+		})
+	}
+
+	// Flat-set form: each `set` line is parsed independently via
+	// ParseSetCommand + tree.SetPath (NewParser merges newlines — see
+	// CLAUDE.md "Flat set tests").
+	t.Run("flat_set_password", func(t *testing.T) {
+		tree := &ConfigTree{}
+		setLines := []string{
+			`set system archival configuration archive-sites "scp://eve@host5/configs" password "$9$secret"`,
+			`set system archival configuration archive-sites "scp://frank@host6/configs"`,
+		}
+		for _, line := range setLines {
+			path, err := ParseSetCommand(line)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", line, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath: %v", err)
+			}
+		}
+		cfg, err := CompileConfig(tree)
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		arch := cfg.System.Archival
+		if arch == nil {
+			t.Fatal("archival is nil")
+		}
+		gotURLs := append([]string{}, arch.ArchiveSites...)
+		wantURLs := []string{"scp://eve@host5/configs", "scp://frank@host6/configs"}
+		if !equalStringSlices(gotURLs, wantURLs) {
+			t.Errorf("ArchiveSites = %v, want %v", gotURLs, wantURLs)
+		}
+		wantPasswd := []string{"scp://eve@host5/configs"}
+		if !equalStringSlices(arch.ArchiveSitesWithPassword, wantPasswd) {
+			t.Errorf("ArchiveSitesWithPassword = %v, want %v",
+				arch.ArchiveSitesWithPassword, wantPasswd)
+		}
+	})
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	aa := make(map[string]int, len(a))
+	for _, s := range a {
+		aa[s]++
+	}
+	for _, s := range b {
+		if aa[s] == 0 {
+			return false
+		}
+		aa[s]--
+	}
+	return true
+}
+
 func TestSystemConfigWebManagementEnhanced(t *testing.T) {
 	input := `
 system {
