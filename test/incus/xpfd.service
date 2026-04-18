@@ -14,17 +14,16 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=xpfd
 
-# #712 Option A (CPUAffinity=) was measured on the 6-core loss userspace
-# lab and did not move per-flow jitter, retransmits, or rate ratio on
-# this hardware; no directive is added here. The cause is that the
-# userspace-dp helper calls sched_setaffinity per worker (see
-# pin_current_thread() in userspace-dp/src/afxdp/neighbor.rs) and that
-# call runs AFTER systemd's CPUAffinity= is applied, so the hot-path
-# workers land on CPUs 0..N-1 regardless of the unit-level mask. Only
-# the Go daemon and the dp auxiliary threads honoured CPUAffinity=.
-# See docs/712-cpu-pinning-recipe.md for the per-CPU-budget recipe
-# (which is still useful on hosts where the worker count is ≤ the
-# budget) and the measured-no-op finding that blocks it on 6-core.
+# #712 Option A retry (after #740 fix): measured on the 6-core loss
+# userspace lab with workers correctly pinned to CPUs 2-5 via
+# CPUAffinity=2 3 4 5 — no metric moved by the #712 thresholds
+# (rate ratio +2%, retrans +11%, per-flow CoV mean -0.6 pp, per-flow
+# CoV max +1.7 pp; all within run-to-run noise). The directive is
+# NOT shipped. See docs/cos-validation-notes.md §"CPU pinning retry
+# post-#740" for the dated measurement, docs/712-cpu-pinning-recipe.md
+# for the recipe (kept as design intent), and #739 for the kernel
+# cmdline (isolcpus/nohz_full) follow-up which is now the next lever
+# to try on this hardware.
 
 [Install]
 WantedBy=multi-user.target

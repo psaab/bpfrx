@@ -7,13 +7,18 @@ userspace-dp workers. It also spells out what is **not** in the recipe:
 those are either deferred to a separate option in #712 or out of scope.
 
 Read `docs/cos-validation-notes.md` §"CPU pinning layout for the loss
-lab" before applying this recipe — the loss userspace lab measurement
-found that `CPUAffinity=` alone is a no-op on that hardware because
-userspace-dp re-pins its workers internally. The recipe below is
-written assuming that ceiling is eventually lifted (either by Option B
-kernel cmdline, by a cgroup cpuset under Option D, or by a worker-pin
-fix in #742). Until then, treat the recipe as design intent rather than
-as something to cargo-cult onto a running firewall.
+lab" and §"CPU pinning retry post-#740" before applying this recipe.
+
+The first attempt (#737) measured `CPUAffinity=` as a no-op because
+userspace-dp re-pinned its workers to absolute CPUs 0..N-1 via
+`sched_setaffinity`. That was fixed in #740; workers now pick the Nth
+entry of the inherited mask. The retry (#741) re-ran the measurement
+with the fix in place and confirmed that workers land on the intended
+CPUs 2-5 — but no aggregate metric moved by the #712 thresholds on the
+6-core loss lab. The recipe below is kept as design intent; it is
+validated as correctly applied, not as a measurable win on this
+hardware. The next lever is Option B (kernel cmdline `isolcpus=` +
+`nohz_full=`, tracked at #739).
 
 ## What the recipe covers
 
@@ -107,12 +112,28 @@ for irq in $(grep -E 'mlx|virtio.*-input|virtio.*-output' /proc/interrupts | awk
 done
 ```
 
-**Measured effect on the loss lab:** no-op, see
-`cos-validation-notes.md` §"CPU pinning layout for the loss lab". The
-recipe is the right layout for the hardware; the userspace-dp worker-pin
-logic needs to honour the inherited affinity (new follow-up issue) or
-the kernel cmdline needs isolcpus (Option B, also a follow-up) before
-the layout lands as a win.
+**Measured effect on the loss lab:** no-op, in both phases.
+
+- **First attempt (#737):** workers ignored the mask via
+  `pin_current_thread`'s absolute-CPU bug; the measured deltas
+  confirmed the bug rather than the pinning.
+- **Retry (#741) after #740 fix:** workers correctly pin to CPUs 2-5
+  (`taskset -p` reports `0x3c`, per-thread `Cpus_allowed_list=2-5`,
+  `psr` under load ∈ {2,3,4,5}). Rerun of the 3 × 30 s × 16-flow iperf3
+  fixture still showed no aggregate metric moving by the #712
+  thresholds. Rate ratio went from 1.37× → 1.40× (+2%, within noise),
+  retrans 210 k → 234 k (+11%, within noise), per-flow CoV mean
+  16.8% → 16.2% (-0.6 pp, within noise), CoV max 26.8% → 28.5%
+  (+1.7 pp, within noise). Per #712's keep/revert/defer table the
+  directive was reverted.
+
+The recipe is the right layout for the hardware; on a 6-core VM where
+every CPU already carries NIC IRQ load (comp0..5 spread 1-per-CPU on
+both mlx5 and virtio queues), moving workers to a subset of CPUs that
+still share IRQ load with the kernel does not reduce jitter. The next
+lever is Option B (kernel cmdline `isolcpus=` + `nohz_full=`) which
+removes kernel timer + softirq work from the worker CPUs entirely —
+tracked at #739.
 
 ### 8-core host (CPUs 0..7)
 
@@ -159,46 +180,52 @@ ps -eTo pid,tid,comm,psr,pcpu | grep -E 'xpfd|xpf-userspace|ksoftirq'
 grep -E 'mlx|virtio.*input|virtio.*output' /proc/interrupts
 ```
 
-Expected after a fresh apply on a 6-core host:
+Expected after a fresh apply on a 6-core host, post-#740:
 - `taskset -p` of xpfd → mask `0x3c` (CPUs 2-5)
 - Per-thread `cpus_allowed`: all xpfd + dp aux threads show `2-5`
-- Per-thread `cpus_allowed` for `xpf-userspace-w[0-3]`: **today** shows
-  `0 / 1 / 2 / 3` because of the worker-pin logic in
-  `userspace-dp/src/afxdp/neighbor.rs::pin_current_thread()`. After that
-  logic is fixed, expect `2 / 3 / 4 / 5`.
-- `psr` under load: non-worker threads on 2-5; workers on 0-3 today, on
-  2-5 after the fix.
+- Per-thread `cpus_allowed` for `xpf-userspace-w[0-3]`: shows
+  `2 / 3 / 4 / 5` — the #740 fix makes `pin_current_thread` pick the
+  Nth entry of the allowed mask, so workers land inside the unit-level
+  mask.
+- `psr` under load: all non-worker threads on 2-5; workers on 2/3/4/5
+  one-to-one.
+- Verified live on 2026-04-17 during the #741 retry.
 
-## Known blocker: worker-pin logic overrides systemd CPUAffinity
+## Historical blocker: worker-pin logic overrode systemd CPUAffinity
 
-`pin_current_thread(worker_id)` in
-`userspace-dp/src/afxdp/neighbor.rs` calls
+Before #740, `pin_current_thread(worker_id)` in
+`userspace-dp/src/afxdp/neighbor.rs` called
 `sched_setaffinity(0, … CPU_SET(worker_id % nproc))`. On a process
-whose `CPUAffinity=` is `2 3 4 5`, `available_parallelism()` reports 4
-(correct), but the loop pins to absolute CPU `worker_id % 4` — i.e.
-CPU 0, 1, 2, 3 — not to the 0th, 1st, 2nd, 3rd CPU of the allowed set.
-The result: the hot-path workers ignore systemd's mask.
+whose `CPUAffinity=` was `2 3 4 5`, `available_parallelism()` reported
+4 correctly, but the loop pinned to absolute CPU `worker_id % 4` —
+i.e. CPU 0, 1, 2, 3 — not to the 0th, 1st, 2nd, 3rd CPU of the allowed
+set. The result: hot-path workers ignored systemd's mask.
 
-Recipe options until that logic is fixed:
+**Fixed in #740.** `pin_current_thread` now calls `sched_getaffinity`,
+enumerates the allowed CPUs, and pins to `allowed[worker_id % count]`.
+Verified live during the #741 retry — workers report
+`cpus_allowed_list=2-5` and `psr ∈ {2,3,4,5}` under load.
 
-- **Leave `CPUAffinity=` unset.** This is what
-  `test/incus/xpfd.service` ships today (see `#712 Option A` comment
-  in the unit file). The recipe is design intent, not live policy.
-- **Set `CPUAffinity=` anyway and pay the cost.** Non-worker threads
-  move off the NIC-IRQ CPUs; workers stay put. On the loss lab this
-  was measured as no better than unpinned (slightly worse within
-  noise); on larger hosts with more CPUs the non-worker-thread share
-  is small enough that the cost is invisible but so is the win.
-- **Wait for the follow-up that fixes `pin_current_thread` to pick the
-  Nth allowed CPU.** That is a one-line change to the helper; it is
-  called out as a blocker here rather than folded silently into this
-  recipe because it widens the scope beyond a systemd unit edit.
+The blocker is not on the layout any more; it is on the hardware.
+On a 6-core VM where NIC IRQs distribute one-per-CPU across all 6
+CPUs (mlx5_comp0..5 and virtio-input.0..5 each carry hundreds of
+millions of interrupts per run), moving workers onto a subset of
+CPUs that still share IRQ load with the kernel does not reduce
+jitter. The layout is correct; the hardware needs a stronger lever
+to surface the improvement — see #739 for Option B kernel cmdline
+(`isolcpus=` / `nohz_full=` / `rcu_nocbs=`) which actually evicts
+timers and RCU callbacks from worker CPUs.
 
 ## Refs
 
 - #712 — umbrella CPU pinning issue. This recipe implements Option A.
 - `docs/cos-validation-notes.md` — measurement methodology and the
-  no-op finding on the loss lab.
-- `userspace-dp/src/afxdp/neighbor.rs::pin_current_thread` — the
-  worker-pin call site that blocks Option A landing as a
-  measurable win.
+  no-op finding on the loss lab (both attempts).
+- #737 — first attempt at Option A; measured no-op because of the
+  worker-pin bug.
+- #740 — fix for `pin_current_thread` to pick the Nth entry of the
+  allowed mask.
+- #741 — retry of Option A after #740; measured no-op on aggregate
+  metrics despite workers now landing on CPUs 2-5 as intended.
+- #739 — Option B kernel cmdline (`isolcpus=` + `nohz_full=`), the
+  next lever to try on this hardware.
