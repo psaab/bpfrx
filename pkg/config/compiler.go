@@ -553,7 +553,7 @@ func ValidateConfig(cfg *Config) []string {
 	for _, proc := range cfg.System.DisabledProcesses {
 		if !isKnownProcessName(proc) {
 			warnings = append(warnings, fmt.Sprintf(
-				"system processes %s disable: bpfrx does not manage %q; setting has no runtime effect", proc, proc))
+				"system processes %q disable: bpfrx does not manage %q; setting has no runtime effect", proc, proc))
 		}
 	}
 
@@ -720,9 +720,13 @@ func ValidateConfig(cfg *Config) []string {
 
 // knownManagedProcessNames is the set of Junos process names that bpfrx
 // actually honours when `system processes X disable` is configured.
-// See pkg/daemon/daemon.go (snmpd) and daemon_system.go (ntp) for the
-// runtime sites that consult this list. Extending the set requires both
-// updating this map AND adding the gating logic at the runtime site.
+// The runtime sites hard-code their process name (not a table lookup):
+//   - pkg/daemon/daemon.go ~:715 — `isProcessDisabled(cfg, "snmpd")`
+//   - pkg/daemon/daemon_system.go ~:383 — `isProcessDisabled(cfg, "ntp")`
+// This table mirrors those hard-codes for the purpose of the #654
+// validation warning. Any addition here MUST be paired with a matching
+// runtime gating site, or the warning will go quiet while the knob
+// remains a no-op.
 var knownManagedProcessNames = map[string]struct{}{
 	"snmpd": {},
 	"ntp":   {},
