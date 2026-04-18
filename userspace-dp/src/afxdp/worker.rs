@@ -581,9 +581,9 @@ pub(crate) fn worker_loop(
     let mut stall_prev_fwd = 0u64;
     let mut stall_reported = false;
     const DBG_REPORT_INTERVAL_NS: u64 = 1_000_000_000; // 1 second
-                                                       // Throttle for BPF conntrack last_seen refresh (~10s).
-                                                       // Keeps `show security flow session` idle times accurate without
-                                                       // per-second syscall overhead per session.  See issue #333.
+    // Throttle for BPF conntrack last_seen refresh (~10s).
+    // Keeps `show security flow session` idle times accurate without
+    // per-second syscall overhead per session.  See issue #333.
     const CT_REFRESH_INTERVAL_NS: u64 = 10_000_000_000;
     // Cache BPF map FDs — they don't change during the worker's lifetime.
     let session_map_fd = bindings
@@ -1594,43 +1594,64 @@ fn build_worker_cos_statuses(
     )
 }
 
-/// Return the one queue ID that can truthfully inherit a binding-scoped
-/// owner-profile snapshot for this CoS runtime.
+/// Return the single `(ifindex, queue_id)` that can truthfully inherit
+/// a binding-scoped owner-profile snapshot, scanning **all** interfaces
+/// on the binding's `cos_map`.
 ///
-/// The snapshot source is `BindingLiveState`, which is binding-local, not
-/// queue-local. That means we only have a coherent per-queue export when
-/// exactly one queue on the binding is an owner-local exact queue. Shared
-/// exact queues are explicitly out of contract, and if multiple owner-local
-/// exact queues exist the binding-wide snapshot is ambiguous and must stay
-/// zero until the accounting is made queue-scoped.
-fn unique_owner_profile_queue_id(
-    interface_config: Option<&CoSInterfaceConfig>,
-    root: &CoSInterfaceRuntime,
-) -> Option<u8> {
-    let iface = interface_config?;
-    let mut eligible_queue_id = None;
-    for queue in &root.queues {
-        if !queue.exact {
-            continue;
-        }
-        let Some(config) = iface
-            .queues
-            .iter()
-            .find(|cfg| cfg.queue_id == queue.queue_id)
-        else {
-            return None;
+/// The snapshot source is `BindingLiveState`, which is binding-local,
+/// not queue-local. A binding can drain multiple interfaces (via
+/// `drain_shaped_tx` round-robining `binding.cos_interface_order`), so
+/// attribution has to be unambiguous at the BINDING level, not the
+/// interface level: if two interfaces on the same binding each have
+/// one owner-local exact queue, the binding-wide snapshot still has
+/// no single queue to land on, and the whole export must stay zero.
+///
+/// We return `Some((ifindex, queue_id))` only when exactly one queue
+/// across the whole binding is owner-local exact. Shared-exact,
+/// non-exact, and any multi-owner-local shape — whether within one
+/// interface or spread across interfaces — keep the binding silent.
+fn unique_owner_profile_row(
+    cos_map: &FastMap<i32, CoSInterfaceRuntime>,
+    forwarding: &ForwardingState,
+) -> Option<(i32, u8)> {
+    let mut eligible = None;
+    for (&ifindex, root) in cos_map {
+        let iface = match forwarding.cos.interfaces.get(&ifindex) {
+            Some(iface) => iface,
+            None => {
+                // Missing config for a runtime is ambiguous — we can't
+                // confirm the queue is exact from the config side, so
+                // if the runtime claims any exact queues we silence
+                // the whole binding.
+                if root.queues.iter().any(|q| q.exact) {
+                    return None;
+                }
+                continue;
+            }
         };
-        if !config.exact {
-            return None;
-        }
-        if queue_uses_shared_exact_service(iface, config) {
-            continue;
-        }
-        if eligible_queue_id.replace(queue.queue_id).is_some() {
-            return None;
+        for queue in &root.queues {
+            if !queue.exact {
+                continue;
+            }
+            let Some(config) = iface
+                .queues
+                .iter()
+                .find(|cfg| cfg.queue_id == queue.queue_id)
+            else {
+                return None;
+            };
+            if !config.exact {
+                return None;
+            }
+            if queue_uses_shared_exact_service(iface, config) {
+                continue;
+            }
+            if eligible.replace((ifindex, queue.queue_id)).is_some() {
+                return None;
+            }
         }
     }
-    eligible_queue_id
+    eligible
 }
 
 fn cos_runtime_config_changed(current: &ForwardingState, next: &ForwardingState) -> bool {
@@ -1818,10 +1839,12 @@ where
         // #709: snapshot the binding's owner-profile counters ONCE per
         // binding per scrape. The source is binding-scoped, so we only
         // surface it on an unambiguous queue row: exactly one owner-local
-        // exact queue on this binding. Shared-exact, non-exact, and
-        // multi-owner-local exact shapes stay zero here until the
-        // telemetry becomes queue-scoped.
+        // exact queue ACROSS THE WHOLE BINDING (all interfaces it drains).
+        // Shared-exact, non-exact, and multi-owner-local exact shapes —
+        // whether within one interface or spread across interfaces —
+        // stay zero here until the telemetry becomes queue-scoped.
         let binding_profile = binding_live.map(owner_profile_snapshot);
+        let owner_profile_row = unique_owner_profile_row(cos_map, forwarding);
         for (&ifindex, root) in cos_map {
             let entry = interfaces.entry(ifindex).or_default();
             entry.ifindex = ifindex;
@@ -1851,7 +1874,6 @@ where
                     .sum::<usize>(),
             );
             let interface_config = forwarding.cos.interfaces.get(&ifindex);
-            let owner_profile_queue_id = unique_owner_profile_queue_id(interface_config, root);
             let queue_map = queue_maps.entry(ifindex).or_default();
             for queue in &root.queues {
                 let status = queue_map.entry(queue.queue_id).or_default();
@@ -1920,10 +1942,12 @@ where
                     .tx_ring_full_submit_stalls
                     .saturating_add(queue.drop_counters.tx_ring_full_submit_stalls);
                 // #709 / #748 / #751: owner-profile export is valid only
-                // for an unambiguous owner-local exact queue row. Shared,
-                // non-exact, and ambiguous multi-owner-local bindings stay
+                // for the single unambiguous owner-local exact queue row
+                // on the whole binding. Shared, non-exact, and ambiguous
+                // multi-owner-local shapes (whether within one interface
+                // or spread across interfaces on the same binding) stay
                 // zero rather than surfacing a binding-wide mixed profile.
-                if owner_profile_queue_id == Some(queue.queue_id) {
+                if owner_profile_row == Some((ifindex, queue.queue_id)) {
                     if let Some(profile) = binding_profile.as_ref() {
                         merge_owner_profile_sum(status, profile);
                     }
@@ -1959,6 +1983,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rates used to force owner-local vs shared-exact classification in
+    // the owner-profile export tests. Defined relative to the boundary
+    // constant so the tests remain valid if `COS_SHARED_EXACT_MIN_RATE_BYTES`
+    // moves, and so `CoSQueueConfig.transmit_rate_bytes` stays identical
+    // to `CoSQueueRuntime.transmit_rate_bytes` by construction (no
+    // config/runtime drift, per #753 Copilot review finding).
+    const OWNER_LOCAL_EXACT_RATE: u64 = COS_SHARED_EXACT_MIN_RATE_BYTES - 1;
+    const SHARED_EXACT_RATE: u64 = COS_SHARED_EXACT_MIN_RATE_BYTES;
 
     fn test_tx_request(ifindex: i32) -> TxRequest {
         TxRequest {
@@ -2281,7 +2314,7 @@ mod tests {
                         queue_id: 4,
                         forwarding_class: "iperf-a".to_string(),
                         priority: 1,
-                        transmit_rate_bytes: 1_000_000_000 / 8,
+                        transmit_rate_bytes: OWNER_LOCAL_EXACT_RATE,
                         exact: true,
                         surplus_weight: 1,
                         buffer_bytes: 64 * 1024,
@@ -2291,7 +2324,7 @@ mod tests {
                         queue_id: 5,
                         forwarding_class: "iperf-b".to_string(),
                         priority: 1,
-                        transmit_rate_bytes: 10_000_000_000 / 8,
+                        transmit_rate_bytes: SHARED_EXACT_RATE,
                         exact: true,
                         surplus_weight: 1,
                         buffer_bytes: 128 * 1024,
@@ -2342,7 +2375,7 @@ mod tests {
                 CoSQueueRuntime {
                     queue_id: 4,
                     priority: 1,
-                    transmit_rate_bytes: 1_000_000_000 / 8,
+                    transmit_rate_bytes: OWNER_LOCAL_EXACT_RATE,
                     exact: true,
                     flow_fair: false,
                     flow_hash_seed: 0,
@@ -2368,7 +2401,7 @@ mod tests {
                 CoSQueueRuntime {
                     queue_id: 5,
                     priority: 1,
-                    transmit_rate_bytes: 10_000_000_000 / 8,
+                    transmit_rate_bytes: SHARED_EXACT_RATE,
                     exact: true,
                     flow_fair: false,
                     flow_hash_seed: 0,
@@ -2463,7 +2496,7 @@ mod tests {
                         queue_id: 4,
                         forwarding_class: "iperf-a".to_string(),
                         priority: 1,
-                        transmit_rate_bytes: 1_000_000_000 / 8,
+                        transmit_rate_bytes: OWNER_LOCAL_EXACT_RATE,
                         exact: true,
                         surplus_weight: 1,
                         buffer_bytes: 64 * 1024,
@@ -2473,7 +2506,9 @@ mod tests {
                         queue_id: 6,
                         forwarding_class: "iperf-c".to_string(),
                         priority: 1,
-                        transmit_rate_bytes: 2_000_000_000 / 8,
+                        // Also owner-local-exact — any rate < boundary works;
+                        // differ from queue 4 only for readability.
+                        transmit_rate_bytes: OWNER_LOCAL_EXACT_RATE / 2,
                         exact: true,
                         surplus_weight: 1,
                         buffer_bytes: 64 * 1024,
@@ -2498,7 +2533,7 @@ mod tests {
                 CoSQueueRuntime {
                     queue_id: 4,
                     priority: 1,
-                    transmit_rate_bytes: 1_000_000_000 / 8,
+                    transmit_rate_bytes: OWNER_LOCAL_EXACT_RATE,
                     exact: true,
                     flow_fair: false,
                     flow_hash_seed: 0,
@@ -2524,7 +2559,7 @@ mod tests {
                 CoSQueueRuntime {
                     queue_id: 6,
                     priority: 1,
-                    transmit_rate_bytes: 2_000_000_000 / 8,
+                    transmit_rate_bytes: OWNER_LOCAL_EXACT_RATE / 2,
                     exact: true,
                     flow_fair: false,
                     flow_hash_seed: 0,
@@ -2579,6 +2614,145 @@ mod tests {
             assert!(queue.drain_latency_hist.is_empty());
             assert_eq!(queue.owner_pps, 0);
         }
+    }
+
+    /// #753 Copilot review: the first revision of the export gate scoped
+    /// uniqueness per-interface, which missed the case where a binding
+    /// drains multiple interfaces each with exactly one owner-local
+    /// exact queue — the binding-level attribution is still ambiguous,
+    /// but the per-interface gate would stamp the same snapshot onto
+    /// both queue rows. This test drives that exact shape (two
+    /// interfaces, one owner-local exact queue each, same binding) and
+    /// asserts every queue stays zero.
+    #[test]
+    fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_interface_binding() {
+        let mut forwarding = ForwardingState::default();
+        forwarding
+            .ifindex_to_config_name
+            .insert(80, "reth0.80".to_string());
+        forwarding
+            .ifindex_to_config_name
+            .insert(81, "reth0.81".to_string());
+
+        // Two interfaces on the same binding, each carrying one
+        // owner-local exact queue. Each interface on its own would
+        // satisfy the old per-interface gate (single owner-local
+        // exact). Together they're ambiguous at the binding level.
+        let make_iface_config = || CoSInterfaceConfig {
+            shaping_rate_bytes: SHARED_EXACT_RATE,
+            burst_bytes: 256 * 1024,
+            default_queue: 4,
+            dscp_classifier: String::new(),
+            ieee8021_classifier: String::new(),
+            dscp_queue_by_dscp: [u8::MAX; 64],
+            ieee8021_queue_by_pcp: [u8::MAX; 8],
+            queue_by_forwarding_class: FastMap::default(),
+            queues: vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".to_string(),
+                priority: 1,
+                transmit_rate_bytes: OWNER_LOCAL_EXACT_RATE,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 64 * 1024,
+                dscp_rewrite: None,
+            }],
+        };
+        forwarding.cos.interfaces.insert(80, make_iface_config());
+        forwarding.cos.interfaces.insert(81, make_iface_config());
+
+        let make_runtime = || CoSInterfaceRuntime {
+            shaping_rate_bytes: SHARED_EXACT_RATE,
+            burst_bytes: 256 * 1024,
+            tokens: 0,
+            default_queue: 4,
+            nonempty_queues: 0,
+            runnable_queues: 0,
+            exact_guarantee_rr: 0,
+            nonexact_guarantee_rr: 0,
+            #[cfg(test)]
+            legacy_guarantee_rr: 0,
+            queues: vec![CoSQueueRuntime {
+                queue_id: 4,
+                priority: 1,
+                transmit_rate_bytes: OWNER_LOCAL_EXACT_RATE,
+                exact: true,
+                flow_fair: false,
+                flow_hash_seed: 0,
+                surplus_weight: 1,
+                surplus_deficit: 0,
+                buffer_bytes: 64 * 1024,
+                dscp_rewrite: None,
+                tokens: 0,
+                last_refill_ns: 0,
+                queued_bytes: 0,
+                active_flow_buckets: 0,
+                flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                flow_rr_buckets: FlowRrRing::default(),
+                flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+                runnable: false,
+                parked: false,
+                next_wakeup_tick: 0,
+                wheel_level: 0,
+                wheel_slot: 0,
+                items: VecDeque::new(),
+                drop_counters: CoSQueueDropCounters::default(),
+            }],
+            queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
+            rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
+            timer_wheel: CoSTimerWheelRuntime {
+                current_tick: 0,
+                level0: std::array::from_fn(|_| Vec::new()),
+                level1: std::array::from_fn(|_| Vec::new()),
+            },
+        };
+
+        let live = BindingLiveState::new();
+        live.owner_profile_owner.drain_latency_hist[2].store(11, Ordering::Relaxed);
+        live.owner_profile_owner
+            .drain_invocations
+            .store(11, Ordering::Relaxed);
+        live.owner_profile_owner
+            .owner_pps
+            .store(222, Ordering::Relaxed);
+        live.owner_profile_peer
+            .peer_pps
+            .store(88, Ordering::Relaxed);
+
+        let mut cos_map = FastMap::default();
+        cos_map.insert(80, make_runtime());
+        cos_map.insert(81, make_runtime());
+
+        let statuses = build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding);
+        assert_eq!(statuses.len(), 2, "both interfaces should appear in output");
+        for iface in &statuses {
+            for queue in &iface.queues {
+                assert_eq!(
+                    queue.drain_invocations, 0,
+                    "binding drains multiple interfaces with owner-local exact queues \
+                     — attribution is ambiguous at the binding level, export must stay \
+                     zero on {}:{}",
+                    iface.interface_name, queue.queue_id,
+                );
+                assert!(queue.drain_latency_hist.is_empty());
+                assert_eq!(queue.owner_pps, 0);
+                assert_eq!(queue.peer_pps, 0);
+            }
+        }
+
+        // Counter-factual: the pre-#753-Copilot-review per-interface
+        // gate would have returned `Some(4)` for each interface
+        // independently and stamped the snapshot onto both queue rows.
+        // Pinning the NEW behaviour: the binding-wide scan returns
+        // None because the eligible slot gets .replace()'d on the
+        // second interface's queue 4.
+        let row = unique_owner_profile_row(&cos_map, &forwarding);
+        assert!(
+            row.is_none(),
+            "unique_owner_profile_row must return None when the binding has \
+             multiple owner-local exact queues across interfaces; got {:?}",
+            row
+        );
     }
 
     #[test]
