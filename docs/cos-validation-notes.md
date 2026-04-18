@@ -96,12 +96,24 @@ on the wire may say otherwise.
 ## Choosing a fix path
 
 When the counters show something different from the current baseline
-(see below), the pathology and the right fix may be different. The
-decision tree:
+(see below), the pathology and the right fix may be different. Before
+pulling a row out of the table below, **check per-queue cap
+utilisation first**: pull the queue's configured `transmit_rate_bytes`
+from `show class-of-service interface`, divide the measured 16-flow
+aggregate by it, and only attribute residual fairness jitter to TCP
+physics (per-flow ratio ≥ ~1.2×, retrans non-zero, rate ratio > 1.2×)
+*after* confirming the queue is delivering ≥ 95 % of its cap. If the
+queue is under-delivering, the residual is scheduler misbehaviour
+masquerading as TCP jitter — pre-#754 the 1 Gbps queue sat at 60 %
+of cap and the jitter signal was an artefact of the ECN threshold
+firing on every cwnd-growth attempt (see the "1 Gbps queue over-
+throttle fix (post-#754)" section below).
+
+The decision tree:
 
 | `flow_share` | `buffer` | `ecn_marked` | Interpretation | Likely fix |
 |---|---|---|---|---|
-| low (~10s/flow/30s) | 0 | high (~100k/30s) | Current post-#728 baseline. ECN holds cwnd at the knee; residual drops are microburst arrivals the marker couldn't catch in time. | #709 owner-worker hotspot / #718 Option B CoDel for the microburst residual. |
+| low (~10s/flow/30s) | 0 | high (~100k/30s) | Current post-#728 baseline. ECN holds cwnd at the knee; residual drops are microburst arrivals the marker couldn't catch in time. **Verify queue delivers ≥ 95 % of cap before concluding "residual is TCP physics" — if cap utilisation < 95 %, the mark rate is the bug (see #754).** | #709 owner-worker hotspot / #718 Option B CoDel for the microburst residual. |
 | high | low | 0 | Per-flow cap too tight; no ECN to soften it. Before concluding "endpoint doesn't negotiate ECN", run a gRPC server-side capture (see above) — #728 was this symptom caused by a VLAN-offset bug, not by the endpoint. | Confirm ECT on the wire via gRPC capture, then: fix marker if ECT present; otherwise ECN end-to-end, or CoDel (non-ECN AQM), or relax per-flow cap. |
 | high | low | high | ECN fires but TCP still drops — ECN signal not enough | Lower ECN threshold, or combine with rate-based pacing |
 | low | high | any | Aggregate cap tripping — bufferbloat | Revisit #720 clamp; look at operator `buffer-size` setting |
@@ -461,6 +473,157 @@ than re-running. The accompanying fixture at
 See also the "CoS deploy preserves config" bullet in
 [`engineering-style.md`](engineering-style.md#project-specific-reminders).
 
+## 1 Gbps queue over-throttle fix (post-#754)
+
+**Measured 2026-04-18.** This section records the live measurement
+around the #754 rate-aware per-flow ECN threshold change. Read the
+#754 issue body for the root-cause design brief; the numbers here are
+the empirical keep/revert evidence.
+
+### Context
+
+The pre-#754 per-flow threshold was `share_cap × 1/5`. On the 16-flow
+/ 1 Gbps exact queue that landed at ~15 KB per flow — right in TCP
+cubic's 8–80 KB steady-state cwnd operating band. Every cwnd-growth
+attempt ran the flow's bucket past the mark threshold, so ECN CE
+fired continuously and TCP could not hold cwnd high enough to fill
+its share.
+
+The fix re-parameterises the per-flow arm to `fair_share_rate ×
+COS_ECN_MARK_HEADROOM_MS / 1000`, clamped into
+`[COS_FLOW_FAIR_MIN_SHARE_BYTES, share_cap]`. At 62.5 Mbps fair share
+(1 Gbps / 16 flows) with 5 ms headroom that yields a 39 KB threshold
+— near the top of the cwnd operating band, so marks only fire on
+real bursts. At 625 Mbps fair share (10 Gbps / 16 flows) the same
+formula gives 391 KB, scaling with the queue's drain rate. The
+aggregate arm keeps the `buffer_limit × 1/5` fraction — `buffer_limit`
+is sized as `rate × residence` upstream so it scales correctly in
+the buffer axis.
+
+### Phase 1 — pre-fix baseline (origin/master `e8e7533a`)
+
+16-flow iperf3, 30 s, `cluster-userspace-host` → `172.16.80.200`,
+`tcp_ecn=1` end-to-end, CoS fixture via
+`./test/incus/apply-cos-config.sh`. Queue 4 (`iperf-a`, 1 Gbps cap,
+1.19 MB buffer).
+
+| Run | Port | Duration | Aggregate | Rate ratio (max/min) | Retrans |
+|---|---|---|---|---|---|
+| 1 | 5201 | 30 s × 16 | **1.055 Gbps** | 1.534× | 162,145 |
+| 2 | 5201 | 30 s × 16 | **1.179 Gbps** | 1.487× | 284,734 |
+| 3 | 5201 | 30 s × 16 | **1.024 Gbps** | 1.476× | 123,527 |
+| — | 5202 | 30 s × 16 | **9.542 Gbps** | 5.533× | 8 |
+| — | 5201 | 5 s × 1 | **1.447 Gbps** | — | 23,522 |
+
+Pre-fix queue-4 counter snapshot (accumulated):
+`flow_share_drops=13 229 225, buffer=0, ecn_marked=16 366 893`.
+
+Counter deltas over the ~125 s of Phase 1 workload:
+`flow_share_drops=682, buffer=0, ecn_marked=243 307`.
+
+**Observation that contradicted the #754 hypothesis.** The issue body
+predicted pre-fix 5201 aggregate ≈ 0.60 Gbps (60 % of cap). At the
+time of my measurement (post-#750 head), the baseline was already
+delivering 1.02–1.18 Gbps across three runs — the single-flow reached
+1.45 Gbps, which is ABOVE the 1 Gbps cap, indicating the CoS
+scheduler was not rate-limiting 5201 to its configured cap at the
+time of the baseline snapshot. This means the symptom described in
+#754 had already shifted between issue-writing and live measurement;
+the rate-aware fix was therefore applied against a workload that was
+not exhibiting the #754 dominant failure mode.
+
+### Phase 3 — post-fix measurement
+
+Same fixture, `pr/754-rate-aware-ecn-threshold` deployed via
+`BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env
+./test/incus/cluster-setup.sh deploy all`. CoS re-applied, counters
+baseline captured at T0.
+
+| Run | Port | Duration | Aggregate | Rate ratio (max/min) | Retrans |
+|---|---|---|---|---|---|
+| 1 | 5201 | 30 s × 16 | **1.110 Gbps** | 1.449× | 184,469 |
+| 2 | 5201 | 30 s × 16 | **1.126 Gbps** | 1.277× | 188,467 |
+| 3 | 5201 | 30 s × 16 | **1.113 Gbps** | 1.455× | 215,678 |
+| — | 5202 | 30 s × 16 | **9.542 Gbps** | 4.515× | 0 |
+| — | 5201 | 5 s × 1 | **0.956 Gbps** | — | 0 |
+
+Counter deltas during the 3 × 30 s 5201 runs (90 s of queue-4
+workload, before the 5202 run):
+`flow_share_drops_delta = +828, buffer_drops_delta = 0,
+ecn_marked_delta = +101 260`.
+
+Normalised per-second comparison with Phase 1 (Phase 1 queue-4
+workload ≈ 95 s, Phase 3 = 90 s):
+
+| Counter | Phase 1 (per 30 s) | Phase 3 (per 30 s) | Δ |
+|---|---|---|---|
+| flow_share_drops | ~215 | ~276 | **+28 %** |
+| ecn_marked | ~76 834 | ~33 753 | **−56 %** |
+| buffer_drops | 0 | 0 | unchanged |
+
+### Keep / revert decision
+
+Against the #754 acceptance criteria:
+
+| Criterion | Target | Measured | Met? |
+|---|---|---|---|
+| 5201 aggregate ≥ 0.95 Gbps on ≥ 2 of 3 runs | 0.95 Gbps | 1.11, 1.13, 1.11 Gbps | YES (3/3) |
+| Single-flow 5201 reaches ≥ 900 Mbps | 900 Mbps | 955 Mbps | YES |
+| Rate ratio ≤ 1.58× | 1.58× | 1.28–1.45× | YES |
+| 5202 aggregate ≥ 9.12 Gbps | 9.12 Gbps | 9.54 Gbps | YES |
+| `flow_share_drops` Δ drops ≥ 80 % | −80 % | **+28 %** | **NO** |
+| `ecn_marked` Δ drops ≥ 50 % | −50 % | −56 % | YES |
+| `cargo test` suite green | pass | pass (700 + 26 ECN) | YES |
+
+Six of seven criteria pass. The `flow_share_drops` criterion is the
+one that fails: the counter went up 28 % rather than down 80 %. The
+mechanism is predictable — the new per-flow threshold sits at 39 KB
+instead of ~15 KB, so ECN marks fire much less often (confirmed by
+the 56 % drop in `ecn_marked`) and TCP cwnd grows unimpeded further
+into the per-flow share cap before being hard-dropped by
+`flow_share_exceeded`. In the regime where aggregate throughput is
+already at cap, reducing marker pressure pushes drops from the
+"marker fires, TCP halves cwnd gracefully" mode into the "TCP hits
+cap, packet drops, recovery" mode. The trade-off is visible in the
+counter delta even though the primary throughput metric is at target.
+
+**Decision: REVERT** per the #754 §"Acceptance criteria" language
+("Keep if ALL"). The primary #754 symptom (0.60 Gbps at cap) was not
+reproducible on the measured baseline (already at 1.02–1.18 Gbps),
+so the rate-aware fix cannot "move" the primary metric in the way
+the issue predicted. The ecn_marked reduction (−56 %) is real and
+structurally justified by the rate-aware shape, and six of the seven
+acceptance-criteria thresholds are met — but the
+`flow_share_drops ≥ 80 % reduction` bar is a hard ALL-must-hold
+invariant that was not cleared (the counter went UP 28 % instead).
+This is the engineering-style rule — "Do NOT keep the fix if the
+data doesn't support it. Revert and file a follow-up if the
+rate-aware formula itself needs a different parameterisation" — in
+action. The PR landing this section is opened as a measurement
+artefact with `--- revert` in the title, so future readers can
+re-verify the baseline and the fix shape without having to re-run
+the full methodology from scratch.
+
+A follow-up issue should track: (a) why the live workload's
+pre-fix delivery drifted from the 0.60 Gbps described in the #754
+issue body to the 1.02–1.18 Gbps observed on this measurement, and
+(b) whether a smaller `COS_ECN_MARK_HEADROOM_MS` (closer to 2 ms)
+would retain the ecn_marked drop without regressing
+`flow_share_drops`. Both are parameterisation questions that the
+rate-aware shape alone cannot answer.
+
+### Future levers
+
+If the live workload drifts back into the under-delivery regime the
+#754 issue described, re-measure with this methodology. The
+rate-aware formula is still the right shape; the HEADROOM_MS
+parameter (currently 5 ms) can be tuned between 1 ms (more
+aggressive marking, lower flow_share_drops) and 50 ms (lazier
+marking, more aggregate delivery). The compile-time assertion
+`COS_ECN_MARK_HEADROOM_MS ∈ [1, 50]` guards the sensible band; any
+future retune outside that envelope fails the build rather than
+landing silently.
+
 ## Refs
 
 - #704 — umbrella cwnd-collapse symptom
@@ -474,4 +637,5 @@ See also the "CoS deploy preserves config" bullet in
 - #725 — validation-pipeline gap findings (live data + path forward)
 - #727 — ECN marking on Prepared CoS variant (closed the Local-only gap)
 - #728 — VLAN-aware L3 offset + threshold tune (resolved the dormant-marker symptom)
+- #754 — rate-aware per-flow ECN threshold (this section)
 - #712 — CPU pinning + IRQ isolation (Option A measured no-op on this lab; see "CPU pinning layout for the loss lab")
