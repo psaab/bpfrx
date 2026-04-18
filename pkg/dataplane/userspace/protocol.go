@@ -471,11 +471,12 @@ type CoSQueueStatus struct {
 	AdmissionFlowShareDrops uint64 `json:"admission_flow_share_drops,omitempty"`
 	AdmissionBufferDrops    uint64 `json:"admission_buffer_drops,omitempty"`
 	AdmissionEcnMarked      uint64 `json:"admission_ecn_marked,omitempty"`
-	// #709: owner-profile telemetry. Populated on exact queues with
-	// single owner binding; zero for shared_exact / non-exact. See
-	// docs/709-owner-hotspot-plan.md for the decision tree these
-	// counters drive. JSON tags MUST match Rust serde rename(...)
-	// byte-for-byte.
+	// #709 / #751: owner-profile telemetry. Populated only when an
+	// exact queue can inherit a binding-scoped owner profile
+	// unambiguously; zero for shared_exact, non-exact, and ambiguous
+	// multi-owner-local shapes. See docs/709-owner-hotspot-plan.md for
+	// the decision tree these counters drive. JSON tags MUST match Rust
+	// serde rename(...) byte-for-byte.
 	//
 	// DrainLatencyHist and RedirectAcquireHist are power-of-two ns
 	// bucketed (see Rust `bucket_index_for_ns`): index 0 is < 1 µs,

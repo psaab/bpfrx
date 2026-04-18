@@ -843,16 +843,17 @@ pub(crate) struct CoSQueueStatus {
     pub queue_token_starvation_parks: u64,
     #[serde(rename = "tx_ring_full_submit_stalls", default)]
     pub tx_ring_full_submit_stalls: u64,
-    // #709: owner-profile telemetry for exact queues with a single
-    // owner binding. See `docs/709-owner-hotspot-plan.md` for the
-    // measurement methodology. These fields are populated from the
-    // owner binding's `BindingLiveState` when the queue is exact and
-    // not shared; for shared_exact and non-exact queues they are
-    // zero. The serde wire format is the cross-language contract to
-    // Go (pkg/dataplane/userspace/protocol.go); rename strings MUST
-    // match byte-for-byte. Histograms are `Vec<u64>` on the wire so
-    // serde can serialise them without a schema for the fixed-size
-    // array; the Rust side always fills them to DRAIN_HIST_BUCKETS.
+    // #709 / #751: owner-profile telemetry for exact queues with an
+    // unambiguous single owner-local binding snapshot. These fields are
+    // populated only when exactly one owner-local exact queue can
+    // inherit the binding's `BindingLiveState` profile truthfully; for
+    // shared_exact, non-exact, and ambiguous multi-owner-local shapes
+    // they are zero. The serde wire format is the cross-language
+    // contract to Go (pkg/dataplane/userspace/protocol.go); rename
+    // strings MUST match byte-for-byte. Histograms are `Vec<u64>` on
+    // the wire so serde can serialise them without a schema for the
+    // fixed-size array; the Rust side always fills them to
+    // DRAIN_HIST_BUCKETS.
     #[serde(rename = "drain_latency_hist", default)]
     pub drain_latency_hist: Vec<u64>,
     #[serde(rename = "drain_invocations", default)]
