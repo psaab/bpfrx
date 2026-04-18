@@ -2860,128 +2860,6 @@ fn apply_cos_admission_ecn_policy(
     marked
 }
 
-// #735 (retry of #708): the per-SFQ-bucket pacing burst cap is the
-// per-flow `share_cap` returned by `cos_queue_flow_share_limit` — the
-// same value the flow-share admission gate uses. It is computed at
-// each refill (not a module constant) so it tracks the current flow
-// count via the shared `cos_queue_prospective_active_flows`
-// denominator.
-//
-// The first attempt (#734) wired this as `COS_FLOW_FAIR_MIN_SHARE_BYTES`
-// (24 KB = 16 × MSS, the fast-retransmit floor). Live 16-flow / 1 Gbps
-// validation showed that capped TCP cubic's normal cwnd operating
-// range — pacing converted ECN marks into tail-drops and doubled
-// iperf3 retransmits from 114-136k / 30s to 260k / 30s, while the
-// fairness ratio degraded from 1.24× to 1.55×.
-//
-// Switching to `share_cap` lets a flow burst up to its fair share of
-// the buffer (≈76 KB at 16 flows on 1 Gbps) before the pacing gate
-// fires. Steady-state TCP operates freely; pacing now only catches
-// egregious microbursts — a flow attempting to dump multiple
-// flow-shares' worth of bytes in a single admission tick. See
-// `docs/cos-validation-notes.md` "Interpreting admission_pacing_drops"
-// for the decision tree this burst-cap policy assumes.
-//
-// #704 drift guard: `cos_queue_flow_share_limit` is the single source
-// of truth for the per-flow share; reusing it here pins pacing rate
-// and flow-share cap to the same denominator. That was the exact class
-// of duplication that produced #704.
-//
-// MIN_SHARE floor: `cos_queue_flow_share_limit` already clamps its
-// result to `COS_FLOW_FAIR_MIN_SHARE_BYTES` on the low side, so pacing
-// can never starve a recovering flow below 16 MSS. The
-// `pacing_burst_cap_respects_min_share_floor` test pins this.
-
-/// #708: refill a single SFQ-bucket's pacing token bucket using the
-/// `elapsed_ns × per_bucket_rate / 1e9` primitive from
-/// `refill_cos_tokens`, keyed off this bucket's own
-/// `flow_bucket_last_refill_ns`. Lazy per-bucket refill (vs refilling
-/// all 1024 buckets on every admission) keeps the hot path O(1).
-///
-/// Hot-path shape: one load of `last_refill_ns[bucket]`, one
-/// `saturating_sub` for elapsed, one u128 multiply + divide for added
-/// tokens, one `saturating_add`, one `.min(burst_cap)`, one store each
-/// to `flow_bucket_tokens[bucket]` and `flow_bucket_last_refill_ns[bucket]`.
-/// No branches except the fast-path short-circuits (flow_fair off,
-/// rate 0, or cold first touch).
-///
-/// First-touch semantics match `refill_cos_tokens`: when
-/// `last_refill_ns[bucket] == 0`, prime the bucket to the full burst
-/// cap so a freshly arriving flow is not starved by a cold bucket.
-///
-/// #735: `buffer_limit` is threaded through from the caller (already
-/// computed for the flow_share / buffer gates — one call to
-/// `cos_flow_aware_buffer_limit` per admission) so the burst cap sees
-/// the same snapshot every other admission-path helper sees. Computing
-/// it inside the refill would double the `cos_flow_aware_buffer_limit`
-/// work per admission for zero correctness gain.
-#[inline]
-fn refill_cos_flow_bucket_tokens(
-    queue: &mut CoSQueueRuntime,
-    flow_bucket: usize,
-    buffer_limit: u64,
-    now_ns: u64,
-) {
-    if !queue.flow_fair || queue.transmit_rate_bytes == 0 {
-        return;
-    }
-    // #704 drift guard: reuse the exact denominator
-    // `cos_queue_flow_share_limit` / `cos_flow_aware_buffer_limit` use so
-    // the pacing rate cannot drift out of lockstep with the admission
-    // caps. That class of duplication caused #704.
-    let per_bucket_rate =
-        queue.transmit_rate_bytes / cos_queue_prospective_active_flows(queue, flow_bucket).max(1);
-    // #735: burst cap is the per-flow `share_cap`, not MIN_SHARE_BYTES.
-    // At 16 flows on 1 Gbps this is ~76 KB instead of 24 KB, giving
-    // TCP cubic room to operate with normal cwnd without the gate
-    // dropping legitimate bursts. MIN_SHARE was the fast-retransmit
-    // floor; share_cap is the fair share of the buffer. The clamp
-    // inside `cos_queue_flow_share_limit` keeps this at MIN_SHARE on
-    // the low side — `pacing_burst_cap_respects_min_share_floor` pins
-    // that invariant.
-    let burst_cap = cos_queue_flow_share_limit(queue, buffer_limit, flow_bucket);
-    let last = queue.flow_bucket_last_refill_ns[flow_bucket];
-    if last == 0 {
-        queue.flow_bucket_tokens[flow_bucket] = burst_cap;
-        queue.flow_bucket_last_refill_ns[flow_bucket] = now_ns;
-        return;
-    }
-    if now_ns <= last {
-        return;
-    }
-    let elapsed_ns = now_ns - last;
-    let added = ((elapsed_ns as u128) * (per_bucket_rate as u128) / 1_000_000_000u128) as u64;
-    if added == 0 {
-        // Still clamp against `burst_cap` in case it shrank (flow
-        // count rose) since the last refill — otherwise the bucket
-        // would sit above the new cap until an actual refill.
-        queue.flow_bucket_tokens[flow_bucket] =
-            queue.flow_bucket_tokens[flow_bucket].min(burst_cap);
-        return;
-    }
-    queue.flow_bucket_tokens[flow_bucket] = queue.flow_bucket_tokens[flow_bucket]
-        .saturating_add(added)
-        .min(burst_cap);
-    queue.flow_bucket_last_refill_ns[flow_bucket] = now_ns;
-}
-
-/// #708: check whether the target bucket has at least `item_len` tokens
-/// available. Returns `true` iff the gate must drop the packet (i.e.
-/// tokens < item_len). Non-flow-fair queues degenerate to `false` —
-/// the gate is disabled and admission falls through to the existing
-/// capacity-based caps.
-#[inline]
-fn cos_flow_bucket_pacing_exceeded(
-    queue: &CoSQueueRuntime,
-    flow_bucket: usize,
-    item_len: u64,
-) -> bool {
-    if !queue.flow_fair {
-        return false;
-    }
-    queue.flow_bucket_tokens[flow_bucket] < item_len
-}
-
 fn maybe_top_up_cos_root_lease(
     root: &mut CoSInterfaceRuntime,
     shared_root_lease: &SharedCoSRootLease,
@@ -3871,7 +3749,6 @@ pub(super) fn enqueue_local_into_cos(
                     prepared_req.cos_queue_id,
                     item_len,
                     CoSPendingTxItem::Prepared(prepared_req),
-                    now_ns,
                 ) {
                     Ok(()) => return Ok(()),
                     Err(CoSPendingTxItem::Prepared(prepared_req)) => {
@@ -3886,7 +3763,6 @@ pub(super) fn enqueue_local_into_cos(
                             req.cos_queue_id,
                             item_len,
                             CoSPendingTxItem::Local(req),
-                            now_ns,
                         ) {
                             Ok(()) => Ok(()),
                             Err(CoSPendingTxItem::Local(req)) => Err(req),
@@ -3923,7 +3799,6 @@ pub(super) fn enqueue_local_into_cos(
                     req.cos_queue_id,
                     item_len,
                     CoSPendingTxItem::Local(req),
-                    now_ns,
                 ) {
                     Ok(()) => Ok(()),
                     Err(CoSPendingTxItem::Local(req)) => Err(req),
@@ -3941,7 +3816,6 @@ pub(super) fn enqueue_local_into_cos(
         req.cos_queue_id,
         item_len,
         CoSPendingTxItem::Local(req),
-        now_ns,
     ) {
         Ok(()) => Ok(()),
         Err(CoSPendingTxItem::Local(req)) => Err(req),
@@ -4002,7 +3876,6 @@ fn enqueue_prepared_into_cos(
             req.cos_queue_id,
             item_len,
             CoSPendingTxItem::Prepared(req),
-            now_ns,
         ) {
             Ok(()) => return Ok(()),
             Err(CoSPendingTxItem::Prepared(req)) => return Err(req),
@@ -4025,7 +3898,6 @@ fn enqueue_prepared_into_cos(
         local_req.cos_queue_id,
         item_len,
         CoSPendingTxItem::Local(local_req),
-        now_ns,
     ) {
         Ok(()) => {
             recycle_prepared_immediately(binding, &req);
@@ -4233,8 +4105,6 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 queued_bytes: 0,
                 active_flow_buckets: 0,
                 flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-                flow_bucket_tokens: [0; COS_FLOW_FAIR_BUCKETS],
-                flow_bucket_last_refill_ns: [0; COS_FLOW_FAIR_BUCKETS],
                 flow_rr_buckets: FlowRrRing::default(),
                 flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                 runnable: false,
@@ -4295,7 +4165,6 @@ fn enqueue_cos_item(
     requested_queue: Option<u8>,
     item_len: u64,
     mut item: CoSPendingTxItem,
-    now_ns: u64,
 ) -> Result<(), CoSPendingTxItem> {
     let mut root_became_nonempty = false;
     let (accepted, queue_id, recycle) = {
@@ -4349,15 +4218,6 @@ fn enqueue_cos_item(
         // trying to steer. `flow_bucket` is the same index the
         // per-flow admission gate keyed off, so both gates see the
         // same queue snapshot.
-        //
-        // #708 ORDERING INVARIANT (load-bearing): the pacing gate runs
-        // strictly AFTER `apply_cos_admission_ecn_policy`. If pacing
-        // ran first and dropped the packet on token exhaustion, the ECN
-        // marker would never see it — ECN would go dormant and the
-        // fairness signal (~100k marks/30s on the post-#728 baseline)
-        // would disappear. Reversing these two lines reproduces the
-        // dead-code regression pinned by
-        // `pacing_gate_after_ecn_marker_ordering`.
         let _ = apply_cos_admission_ecn_policy(
             queue,
             buffer_limit,
@@ -4367,43 +4227,18 @@ fn enqueue_cos_item(
             &mut item,
             umem,
         );
-        // #708: refill this bucket's pacing tokens based on elapsed-ns
-        // since its last refill. Lazy per-bucket strategy keeps the hot
-        // path O(1) (one bucket, not 1024) at the cost of an extra
-        // 8 KB `flow_bucket_last_refill_ns` array per queue. No-op on
-        // non-flow-fair queues — the helper short-circuits.
-        //
-        // #735: `buffer_limit` is threaded through so the burst cap =
-        // per-flow `share_cap`. `buffer_limit` was already computed a
-        // few lines above for flow_share / buffer gating — one value,
-        // three call sites.
-        refill_cos_flow_bucket_tokens(queue, flow_bucket, buffer_limit, now_ns);
-        let pacing_exceeded = cos_flow_bucket_pacing_exceeded(queue, flow_bucket, item_len);
-        if flow_share_exceeded || pacing_exceeded || buffer_exceeded {
-            // #710 + #708: drop-reason attribution priority is
-            // `flow_share` > `pacing` > `buffer`. flow_share is root
-            // cause for SFQ bucket saturation (original #710 rule);
-            // pacing sits above buffer because pacing IS the root
-            // cause of buffer-side microbursts on flow-fair queues —
-            // buffer overflow is a symptom of admission outrunning
-            // drain on short timescales. Reordering without a separate
-            // PR is explicitly forbidden by plan §5.
+        if flow_share_exceeded || buffer_exceeded {
+            // #710: attribute the drop to the specific admission-path
+            // reason. `flow_share_exceeded` is checked first so that
+            // when both caps trip simultaneously, the root cause
+            // (per-flow bucket saturation under SFQ collision / cap
+            // undersizing) is counted rather than the buffer cap — the
+            // buffer-cap hit is a symptom downstream of flow-share
+            // admission failing to throttle the flow.
             if flow_share_exceeded {
                 queue.drop_counters.admission_flow_share_drops = queue
                     .drop_counters
                     .admission_flow_share_drops
-                    .wrapping_add(1);
-            } else if pacing_exceeded {
-                // Drop-newest policy: the packet that failed the token
-                // check is the one dropped, not the head of the
-                // bucket. Dropping the head would evict a packet that
-                // was already close to being serviced and extend tail
-                // latency; dropping the incoming packet loses one that
-                // has travelled zero further than the sender. See
-                // engineering-style.md "drop-newest".
-                queue.drop_counters.admission_pacing_drops = queue
-                    .drop_counters
-                    .admission_pacing_drops
                     .wrapping_add(1);
             } else {
                 queue.drop_counters.admission_buffer_drops =
@@ -4415,18 +4250,6 @@ fn enqueue_cos_item(
             };
             (false, queue.queue_id, recycle)
         } else {
-            // #708: consume `item_len` tokens on admit. Saturating so a
-            // cold first admission that finds the bucket primed to the
-            // burst cap doesn't underflow even with a >burst item_len;
-            // the next admission will just re-refill. Non-flow-fair
-            // queues have `flow_bucket_tokens[0]` staying at zero —
-            // harmless because the gate short-circuits out of
-            // `cos_flow_bucket_pacing_exceeded` for those queues.
-            if queue.flow_fair {
-                queue.flow_bucket_tokens[flow_bucket] = queue
-                    .flow_bucket_tokens[flow_bucket]
-                    .saturating_sub(item_len);
-            }
             let queue_was_empty = cos_queue_is_empty(queue);
             queue.queued_bytes = queue.queued_bytes.saturating_add(item_len);
             cos_queue_push_back(queue, item);
@@ -10283,8 +10106,6 @@ mod tests {
             queued_bytes: 1500,
             active_flow_buckets: 0,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_tokens: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_last_refill_ns: [0; COS_FLOW_FAIR_BUCKETS],
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
@@ -10321,8 +10142,6 @@ mod tests {
             queued_bytes: 0,
             active_flow_buckets: 0,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_tokens: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_last_refill_ns: [0; COS_FLOW_FAIR_BUCKETS],
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
@@ -10370,8 +10189,6 @@ mod tests {
             queued_bytes: 0,
             active_flow_buckets: 0,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_tokens: [0; COS_FLOW_FAIR_BUCKETS],
-            flow_bucket_last_refill_ns: [0; COS_FLOW_FAIR_BUCKETS],
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
@@ -11887,481 +11704,6 @@ mod tests {
         assert_eq!(
             actual_csum, expected_csum,
             "incremental checksum update must match a from-scratch recomputation",
-        );
-    }
-
-    // ---------------------------------------------------------------------
-    // #708 per-SFQ-bucket pacing gate. Admission-time rate pacing that
-    // sits after the ECN marker and before the drop-reason attribution.
-    // Tests cover: refill math at the queue fair rate, drop on token
-    // starvation, admit + decrement on sufficient tokens, ECN ordering
-    // invariant, non-flow-fair bypass, burst-cap clamping at the
-    // fast-retransmit floor, and snapshot/aggregation plumbing.
-    // ---------------------------------------------------------------------
-
-    /// Helper: flow-fair exact queue with a concrete
-    /// `transmit_rate_bytes` the pacing math can be asserted against.
-    /// 1 Gbps = 125 MB/s. With 16 active buckets the per-bucket rate
-    /// is 125 MB/s / 16 = 7.8125 MB/s, so in 1 ms the bucket earns
-    /// 7_812 bytes. Assertions below key off these exact numbers.
-    fn test_pacing_flow_fair_queue() -> CoSInterfaceRuntime {
-        let mut root = test_flow_fair_exact_queue_16_flows();
-        let queue = &mut root.queues[0];
-        queue.active_flow_buckets = 16;
-        // Pre-empty the token bucket and timestamp so the first refill
-        // is driven by elapsed_ns, not the cold-touch primer branch.
-        queue.flow_bucket_tokens[0] = 0;
-        queue.flow_bucket_last_refill_ns[0] = 0;
-        root
-    }
-
-    #[test]
-    fn pacing_gate_refills_at_queue_fair_rate() {
-        // 1 Gbps queue with 16 active buckets, target bucket
-        // non-empty so `cos_queue_prospective_active_flows` returns
-        // 16 (not 16 + 1). Per-bucket rate = 1_000_000_000 / 8 / 16
-        // = 7_812_500 bytes/sec. 1 ms elapsed → 7_812_500 ×
-        // 1_000_000 / 1_000_000_000 = 7_812 bytes. The shape of the
-        // u128 math is identical to `refill_cos_tokens`, which is
-        // how the queue/root shapers land on the same number; if it
-        // drifts, the pacing rate has desynced from the shaper and
-        // #704 has reintroduced.
-        let mut root = test_pacing_flow_fair_queue();
-        let queue = &mut root.queues[0];
-        // Populate the target bucket so `prospective_active_flows`
-        // stays at 16 (empty bucket would bump it to 17 via the
-        // "reserve headroom for a new flow" rule in
-        // `cos_queue_prospective_active_flows`). This keeps the
-        // denominator aligned with the "16 flows already established"
-        // scenario — otherwise the refill math would drift by 1 flow.
-        queue.flow_bucket_bytes[0] = 1;
-        // Seed the timestamp so elapsed_ns is deterministic.
-        queue.flow_bucket_last_refill_ns[0] = 1_000_000_000;
-        queue.flow_bucket_tokens[0] = 0;
-        let now_ns = 1_001_000_000; // exactly +1 ms
-        let buffer_limit = cos_flow_aware_buffer_limit(queue, 0);
-        refill_cos_flow_bucket_tokens(queue, 0, buffer_limit, now_ns);
-        assert_eq!(
-            queue.flow_bucket_tokens[0], 7_812,
-            "per-bucket refill must equal elapsed_ns × rate / 1e9 at 1 Gbps / 16 flows / 1 ms",
-        );
-        assert_eq!(
-            queue.flow_bucket_last_refill_ns[0], now_ns,
-            "refill must advance last_refill_ns on success",
-        );
-    }
-
-    #[test]
-    fn pacing_gate_drops_packet_when_bucket_tokens_insufficient() {
-        // Seed one bucket with 100 tokens, try to admit a 1500-byte
-        // packet. Pacing must drop it; flow-share and buffer drops
-        // must NOT increment (no double-counting). Compare against a
-        // snapshot to catch any counter re-attribution.
-        let mut root = test_pacing_flow_fair_queue();
-        let queue = &mut root.queues[0];
-        queue.flow_bucket_tokens[0] = 100;
-        // Preserve the last_refill_ns so the refill helper doesn't
-        // cold-prime the bucket to the burst cap.
-        queue.flow_bucket_last_refill_ns[0] = 1_000_000_000;
-        let item_len = 1_500u64;
-        assert!(cos_flow_bucket_pacing_exceeded(queue, 0, item_len));
-
-        // Exercise the full admission attribution in-line so the
-        // invariant "pacing drop does not bump flow_share or buffer"
-        // is regression-pinned through the branching the real
-        // `enqueue_cos_item` takes.
-        let before = snapshot_counters(queue);
-        queue.drop_counters.admission_pacing_drops = queue
-            .drop_counters
-            .admission_pacing_drops
-            .wrapping_add(1);
-        let after = snapshot_counters(queue);
-        assert_eq!(
-            after.admission_pacing_drops,
-            before.admission_pacing_drops + 1,
-        );
-        assert_eq!(after.admission_flow_share_drops, before.admission_flow_share_drops);
-        assert_eq!(after.admission_buffer_drops, before.admission_buffer_drops);
-    }
-
-    #[test]
-    fn pacing_gate_admits_packet_when_bucket_tokens_sufficient() {
-        // Seed one bucket with 10 KB of tokens, admit a 1500-byte
-        // packet. Gate must NOT fire; on admit the tokens must
-        // decrement by exactly item_len. Saturating math means a
-        // later under-full packet still lands cleanly.
-        let mut root = test_pacing_flow_fair_queue();
-        let queue = &mut root.queues[0];
-        queue.flow_bucket_tokens[0] = 10_000;
-        queue.flow_bucket_last_refill_ns[0] = 1_000_000_000;
-        let item_len = 1_500u64;
-        assert!(
-            !cos_flow_bucket_pacing_exceeded(queue, 0, item_len),
-            "10 KB of tokens must be sufficient for a 1.5 KB admission",
-        );
-        // Emulate the admit path's saturating_sub.
-        queue.flow_bucket_tokens[0] = queue.flow_bucket_tokens[0].saturating_sub(item_len);
-        assert_eq!(queue.flow_bucket_tokens[0], 10_000 - 1_500);
-    }
-
-    #[test]
-    fn pacing_gate_after_ecn_marker_ordering() {
-        // ORDERING INVARIANT #1: ECN marker runs BEFORE pacing. This
-        // pin recreates the "ECT above threshold + pacing starved"
-        // scenario end-to-end through `enqueue_cos_item`'s call order.
-        //
-        // Counter-factual (reconstructing the pre-fix formula): if we
-        // ran pacing BEFORE the marker and the packet drops on
-        // pacing, the mark counter would never bump — ECN would be
-        // dead code on this path. We reproduce that below and assert
-        // the mark counter does NOT move, proving the ordering is
-        // load-bearing.
-        let mut root = test_flow_fair_exact_queue_16_flows();
-        let queue = &mut root.queues[0];
-        queue.active_flow_buckets = 16;
-        // Drive the queue into the ECN mark zone: set the target
-        // bucket well above the per-flow ECN threshold so
-        // `apply_cos_admission_ecn_policy` will mark an ECT packet.
-        let target = 0usize;
-        let queued = seed_sixteen_flow_buckets(queue, target, 15_000);
-        queue.queued_bytes = queued;
-        let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
-        // Starve the pacing bucket so the gate fires.
-        queue.flow_bucket_tokens[target] = 0;
-        queue.flow_bucket_last_refill_ns[target] = 1_000_000_000; // non-zero so refill is rate-driven, not cold-primed
-
-        let before = snapshot_counters(queue);
-
-        // Step 1 (correct order): ECN marker runs first.
-        let mut item = test_local_ipv4_item(ECN_ECT_0);
-        let umem = test_admission_umem();
-        let marked =
-            apply_cos_admission_ecn_policy(queue, buffer_limit, target, false, false, &mut item, &umem);
-        assert!(marked, "ECT packet above per-flow threshold must be marked");
-
-        // Step 2: pacing gate sees starved bucket, drops.
-        let item_len = 1_500u64;
-        // With last_refill_ns = 1_000_000_000 and now_ns = 1_000_000_001 (+1 ns),
-        // the refill adds ~0 bytes — keeps the bucket starved.
-        refill_cos_flow_bucket_tokens(queue, target, buffer_limit, 1_000_000_001);
-        assert!(cos_flow_bucket_pacing_exceeded(queue, target, item_len));
-        queue.drop_counters.admission_pacing_drops = queue
-            .drop_counters
-            .admission_pacing_drops
-            .wrapping_add(1);
-
-        let after = snapshot_counters(queue);
-        assert_eq!(
-            after.admission_ecn_marked,
-            before.admission_ecn_marked + 1,
-            "ECN marker must fire BEFORE pacing — reversing the order makes ECN dead code on this path",
-        );
-        assert_eq!(
-            after.admission_pacing_drops,
-            before.admission_pacing_drops + 1,
-            "pacing counter must bump on token-starved drop",
-        );
-
-        // --------- Counter-factual pin ---------
-        // Reconstruct the REVERSED order: pacing-drop-first, marker
-        // never runs on the dropped packet. Assert that in that
-        // (broken) ordering the mark counter would NOT have moved,
-        // which is exactly why #708 invariant #1 insists on the
-        // marker running first.
-        let mut root_rev = test_flow_fair_exact_queue_16_flows();
-        let queue_rev = &mut root_rev.queues[0];
-        queue_rev.active_flow_buckets = 16;
-        let queued_rev = seed_sixteen_flow_buckets(queue_rev, target, 15_000);
-        queue_rev.queued_bytes = queued_rev;
-        queue_rev.flow_bucket_tokens[target] = 0;
-        queue_rev.flow_bucket_last_refill_ns[target] = 1_000_000_000;
-        let before_rev = snapshot_counters(queue_rev);
-
-        // Pretend we ran pacing first and dropped — do NOT call the
-        // marker afterwards. In the real (correct) wiring the marker
-        // runs first and the counter bumps; in this counter-factual
-        // it does not.
-        queue_rev.drop_counters.admission_pacing_drops = queue_rev
-            .drop_counters
-            .admission_pacing_drops
-            .wrapping_add(1);
-
-        let after_rev = snapshot_counters(queue_rev);
-        assert_eq!(
-            after_rev.admission_ecn_marked, before_rev.admission_ecn_marked,
-            "counter-factual: pacing-before-marker leaves ECN counter at zero, proving ECN becomes dead code",
-        );
-    }
-
-    #[test]
-    fn pacing_gate_bypassed_on_non_flow_fair_queue() {
-        // flow_fair=false queues must short-circuit out of the pacing
-        // gate. Seed tokens=0 and assert the gate returns false
-        // (would-admit) regardless of item_len. Also assert that
-        // `refill_cos_flow_bucket_tokens` is a no-op on the non-flow-
-        // fair path — the tokens array must stay zero.
-        let mut root = test_cos_runtime_with_exact(true); // flow_fair defaults to false here
-        let queue = &mut root.queues[0];
-        assert!(!queue.flow_fair, "test fixture must start with flow_fair=false");
-        queue.flow_bucket_tokens[0] = 0;
-        queue.flow_bucket_last_refill_ns[0] = 0;
-
-        assert!(
-            !cos_flow_bucket_pacing_exceeded(queue, 0, 64 * 1024),
-            "non-flow-fair queue must bypass the pacing gate",
-        );
-        // Also assert the refill is a no-op on non-flow-fair.
-        refill_cos_flow_bucket_tokens(queue, 0, 1_000_000, 1_000_000_000);
-        assert_eq!(
-            queue.flow_bucket_tokens[0], 0,
-            "refill must not touch tokens on a non-flow-fair queue",
-        );
-        assert_eq!(
-            queue.flow_bucket_last_refill_ns[0], 0,
-            "refill must not touch last_refill_ns on a non-flow-fair queue",
-        );
-    }
-
-    /// Helper: flow-fair exact queue sized to match the live 16-flow /
-    /// 1 Gbps / 1.19 MiB workload (`test/incus/cos-iperf-config.set`
-    /// queue 4 observed under load, see
-    /// `docs/cos-validation-notes.md`). The share_cap this queue
-    /// exposes is ~76 KB — the new #735 burst cap — not MIN_SHARE.
-    fn test_pacing_flow_fair_queue_with_big_buffer(
-        flow_count: u16,
-        buffer_bytes: u64,
-    ) -> CoSInterfaceRuntime {
-        let mut root = test_cos_runtime_with_queues(
-            25_000_000_000 / 8,
-            vec![CoSQueueConfig {
-                queue_id: 4,
-                forwarding_class: "iperf-a".into(),
-                priority: 5,
-                transmit_rate_bytes: 1_000_000_000 / 8,
-                exact: true,
-                surplus_weight: 1,
-                buffer_bytes,
-                dscp_rewrite: None,
-            }],
-        );
-        let queue = &mut root.queues[0];
-        queue.flow_fair = true;
-        queue.flow_hash_seed = 0;
-        queue.active_flow_buckets = flow_count;
-        // Mark `flow_count` buckets as active (1 byte each) so
-        // `cos_queue_prospective_active_flows` returns `flow_count`
-        // (target bucket 0 is among the populated) rather than
-        // `flow_count + 1`.
-        for bucket in 0..(flow_count as usize).min(queue.flow_bucket_bytes.len()) {
-            queue.flow_bucket_bytes[bucket] = 1;
-        }
-        queue.flow_bucket_tokens[0] = 0;
-        queue.flow_bucket_last_refill_ns[0] = 0;
-        root
-    }
-
-    #[test]
-    fn pacing_burst_cap_is_share_cap_not_min_share() {
-        // #735 core pin: at the deploy config (16 flows on 1 Gbps,
-        // buffer_limit = 1_216_000 after #720 latency-envelope work),
-        // the pacing burst cap must be `share_cap` ≈ 76 KB — NOT
-        // `MIN_SHARE_BYTES` = 24 KB.
-        //
-        // Counter-factual: reconstruct both formulas at the exact
-        // config we deploy and assert they differ. If the burst cap
-        // ever reverts to MIN_SHARE, this test fails because the
-        // "would-have-been" share_cap is materially larger.
-        let buffer_bytes = 1_216_000u64;
-        let mut root = test_pacing_flow_fair_queue_with_big_buffer(16, buffer_bytes);
-        let queue = &mut root.queues[0];
-        let buffer_limit = cos_flow_aware_buffer_limit(queue, 0);
-        let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, 0);
-
-        // On the deploy config the operator's 1.216 MB request is
-        // larger than delay_cap (625 KB at 1 Gbps × 5 ms), and the
-        // flow-aware expansion floor (16 × MIN_SHARE = 384 KB) is
-        // also smaller. The aware limit resolves to the operator
-        // request via `base.max(expansion).min(delay_cap.max(base))`
-        // = min(base, max(delay_cap, base)) = base.
-        //
-        // With 16 active flows: share_cap = 1_216_000 / 16 = 76_000
-        // bytes. The low-side clamp to MIN_SHARE (24_000) has no
-        // effect at this scale — 76_000 > 24_000.
-        assert_eq!(
-            buffer_limit, 1_216_000,
-            "deploy config resolves buffer_limit to the operator's raw buffer (1.19 MiB ~ 1_216_000 B)",
-        );
-        assert_eq!(
-            share_cap, 76_000,
-            "16 flows / 1 Gbps / 1_216_000 B buffer yields the 76 KB share_cap the retry is targeting",
-        );
-        assert!(
-            share_cap > COS_FLOW_FAIR_MIN_SHARE_BYTES,
-            "share_cap ({share_cap}) must be strictly larger than MIN_SHARE ({COS_FLOW_FAIR_MIN_SHARE_BYTES}) at the deploy config — otherwise this test does not differentiate the two formulas",
-        );
-
-        // Seed the bucket starved and let it sit idle across a long
-        // elapsed_ns. Per-bucket refill rate at 1 Gbps / 16 flows =
-        // 7_812_500 B/s. 10 s elapsed → 78 MB of "potential" refill.
-        // It must clamp to `share_cap`, not MIN_SHARE.
-        queue.flow_bucket_tokens[0] = 0;
-        queue.flow_bucket_last_refill_ns[0] = 1;
-        let now_ns = 10_000_000_001u64;
-        refill_cos_flow_bucket_tokens(queue, 0, buffer_limit, now_ns);
-
-        assert_eq!(
-            queue.flow_bucket_tokens[0], share_cap,
-            "#735: burst cap MUST clamp to share_cap ({share_cap}), not MIN_SHARE ({})",
-            COS_FLOW_FAIR_MIN_SHARE_BYTES,
-        );
-        // Counter-factual: if the formula reverted to MIN_SHARE the
-        // clamp would land at 24_000 instead. Prove that number
-        // would NOT match the live refill.
-        let would_have_been_min_share = COS_FLOW_FAIR_MIN_SHARE_BYTES;
-        assert_ne!(
-            share_cap, would_have_been_min_share,
-            "counter-factual: share_cap and MIN_SHARE must differ at deploy config — otherwise this regression guard is vacuous",
-        );
-        assert_ne!(
-            queue.flow_bucket_tokens[0], would_have_been_min_share,
-            "counter-factual: if this test ever asserted MIN_SHARE, the #735 policy has regressed",
-        );
-    }
-
-    #[test]
-    fn pacing_burst_cap_scales_with_active_flows() {
-        // The whole point of keying the burst cap off share_cap is
-        // that it scales inversely with flow count. Pin both ends of
-        // the scale at the deploy buffer size.
-        let buffer_bytes = 1_216_000u64;
-
-        // 4 active flows → share_cap is large (the 1 Gbps / 4 =
-        // ~156 KB fair share, capped by buffer_limit which at 4
-        // flows = max(buffer_bytes, 4 × MIN_SHARE) = buffer_bytes,
-        // then .min(delay_cap.max(base)) = min(1_216_000,
-        // max(625_000, 1_216_000)) = 1_216_000. share_cap =
-        // 1_216_000.div_ceil(4) = 304_000 bytes).
-        {
-            let mut root = test_pacing_flow_fair_queue_with_big_buffer(4, buffer_bytes);
-            let queue = &mut root.queues[0];
-            let buffer_limit = cos_flow_aware_buffer_limit(queue, 0);
-            let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, 0);
-            assert!(
-                share_cap >= 300_000,
-                "4 active flows: share_cap ({share_cap}) must be ≥ 300 KB (fair share of the operator buffer)",
-            );
-            queue.flow_bucket_tokens[0] = 0;
-            queue.flow_bucket_last_refill_ns[0] = 1;
-            refill_cos_flow_bucket_tokens(queue, 0, buffer_limit, 10_000_000_001u64);
-            assert_eq!(
-                queue.flow_bucket_tokens[0], share_cap,
-                "4 active flows: burst cap must equal share_cap, not MIN_SHARE",
-            );
-        }
-
-        // 64 active flows → share_cap is small but stays ≥ MIN_SHARE
-        // thanks to `cos_queue_flow_share_limit`'s clamp. The
-        // buffer_limit at 64 flows: base.max(prospective × MIN_SHARE)
-        // .min(delay_cap.max(base)). base=1_216_000, prospective ×
-        // MIN_SHARE = 64 × 24_000 = 1_536_000, delay_cap = 625_000.
-        // max(1_216_000, 1_536_000) = 1_536_000; min(1_536_000,
-        // max(625_000, 1_216_000)) = 1_216_000. share_cap =
-        // 1_216_000.div_ceil(64) = 19_000 → clamped to MIN_SHARE
-        // (24_000) by the low-side clamp.
-        {
-            let mut root = test_pacing_flow_fair_queue_with_big_buffer(64, buffer_bytes);
-            let queue = &mut root.queues[0];
-            let buffer_limit = cos_flow_aware_buffer_limit(queue, 0);
-            let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, 0);
-            // `div_ceil(1_216_000, 64) = 19_000`, but the clamp
-            // pulls it up to MIN_SHARE_BYTES (24_000). This pin
-            // guards the low side of the scale.
-            assert_eq!(
-                share_cap, COS_FLOW_FAIR_MIN_SHARE_BYTES,
-                "64 active flows: raw share would be 19 KB, clamp must lift to MIN_SHARE (24 KB) — otherwise a recovering flow can be paced below its fast-retransmit window",
-            );
-            queue.flow_bucket_tokens[0] = 0;
-            queue.flow_bucket_last_refill_ns[0] = 1;
-            refill_cos_flow_bucket_tokens(queue, 0, buffer_limit, 10_000_000_001u64);
-            assert_eq!(
-                queue.flow_bucket_tokens[0], share_cap,
-                "64 active flows: burst cap must equal the clamped share_cap (= MIN_SHARE)",
-            );
-        }
-    }
-
-    #[test]
-    fn pacing_burst_cap_respects_min_share_floor() {
-        // Regression guard: if someone "optimizes"
-        // `cos_queue_flow_share_limit` by removing its low-side
-        // clamp to COS_FLOW_FAIR_MIN_SHARE_BYTES, the pacing burst
-        // cap can drop below the fast-retransmit floor and pace a
-        // recovering flow into cwnd-collapse. This test asserts the
-        // floor holds through the helper.
-        //
-        // Construct the worst-case scale: many flows + a small
-        // buffer so the raw `buffer_limit / flows` share would drop
-        // below MIN_SHARE.
-        let buffer_bytes = 64 * 1024u64; // operator asked for 64 KB
-        let mut root = test_pacing_flow_fair_queue_with_big_buffer(64, buffer_bytes);
-        let queue = &mut root.queues[0];
-        let buffer_limit = cos_flow_aware_buffer_limit(queue, 0);
-        let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, 0);
-        assert_eq!(
-            share_cap, COS_FLOW_FAIR_MIN_SHARE_BYTES,
-            "64 flows / 64 KB buffer: share_cap must be clamped up to MIN_SHARE — losing the clamp is how #708 retry would regress into pacing recovering flows",
-        );
-
-        // Drive the refill across a long elapsed so the bucket sits
-        // at the cap, not somewhere below.
-        queue.flow_bucket_tokens[0] = 0;
-        queue.flow_bucket_last_refill_ns[0] = 1;
-        refill_cos_flow_bucket_tokens(queue, 0, buffer_limit, 10_000_000_001u64);
-        assert_eq!(
-            queue.flow_bucket_tokens[0], COS_FLOW_FAIR_MIN_SHARE_BYTES,
-            "burst cap must never drop below the MIN_SHARE floor — the clamp in cos_queue_flow_share_limit is load-bearing for the pacing gate",
-        );
-
-        // Counter-factual: reconstruct the "no clamp" formula and
-        // prove it WOULD fall below MIN_SHARE at this fixture.
-        // prospective_active = 64 (target bucket 0 is populated).
-        let unclamped_share = buffer_limit.div_ceil(64);
-        assert!(
-            unclamped_share < COS_FLOW_FAIR_MIN_SHARE_BYTES,
-            "counter-factual must differentiate: unclamped share ({unclamped_share}) < MIN_SHARE ({})",
-            COS_FLOW_FAIR_MIN_SHARE_BYTES,
-        );
-    }
-
-    #[test]
-    fn admission_pacing_drops_snapshot_propagates_to_status() {
-        // Mirror of `admission_ecn_marked_counter_snapshot` pattern:
-        // bump the drop counter on the runtime, build the worker-side
-        // CoS status view, and assert the new field reached the
-        // operator-facing struct. Without this pin a refactor that
-        // adds the counter to the runtime but forgets the aggregation
-        // path would leave CLI + Prometheus showing zero while the
-        // runtime counter ticks.
-        //
-        // The plumbing is exercised via direct assignment on the
-        // drop_counters struct + a manual build of the status; the
-        // real path goes
-        // `CoSQueueDropCounters → worker::build_worker_cos_statuses →
-        // coordinator::aggregate_cos_statuses_across_workers`, both
-        // layers of which are pinned by the existing `admission_ecn`
-        // aggregation tests (now extended to cover pacing).
-        let mut root = test_pacing_flow_fair_queue();
-        let queue = &mut root.queues[0];
-        let before = snapshot_counters(queue);
-        queue.drop_counters.admission_pacing_drops = queue
-            .drop_counters
-            .admission_pacing_drops
-            .wrapping_add(17);
-        let after = snapshot_counters(queue);
-        assert_eq!(
-            after.admission_pacing_drops,
-            before.admission_pacing_drops + 17,
-            "drop_counters.admission_pacing_drops must be single-writer incrementable",
         );
     }
 }
