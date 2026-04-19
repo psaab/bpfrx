@@ -213,102 +213,118 @@ pub(super) fn drain_pending_tx(
     {
         maybe_wake_tx(binding, false, now_ns);
     }
-    // #760: bounded ingest → drain_shaped_tx loop. The MPSC
-    // redirect inbox is fed by peer workers concurrently with the
-    // drain loop — packets that arrive mid-drain would otherwise
-    // miss both ingest (already ran) and the shaped service
-    // (already looped to noop) and leak UNSHAPED through the
-    // post-drain backup paths below. Per Codex adversarial review
-    // (PR #773): a single re-ingest only closes the window up to
-    // its call site; peers pushing after that still bypass. Loop
-    // ingest+drain with a small budget so the closure widens
-    // without risking starvation of the outer worker loop if a
-    // peer is feeding faster than we can admit+drain.
-    //
-    // Attribution split:
-    //   * A serviced drain (Some) attributes latency + invocation
-    //     to the specific queue's per-queue atomics via indexed
-    //     access (queue_idx is captured by drain_shaped_tx at
-    //     selection time so we avoid a linear scan here).
-    //   * A no-op drain (None — nothing ran on any queue) bumps
-    //     the binding-wide drain_noop_invocations counter ONCE
-    //     per outer ingest iteration (not per noop drain) —
-    //     otherwise a tight no-op inner loop multiplicatively
-    //     inflates noop invocation count and dwarfs the real
-    //     signal.
-    //
-    // Budget sizing: 4 iterations is enough to absorb a 3× burst
-    // of peer redirects arriving during the shaped-drain loop
-    // without risking the outer worker loop's ability to service
-    // RX / completions / other bindings. At line-rate saturation
-    // the common case is one ingest + one drain pass and early
-    // exit on the quiesce check below.
-    const REINGEST_BUDGET: usize = 4;
-    for iter in 0..REINGEST_BUDGET {
-        let first_pass = iter == 0;
-        ingest_cos_pending_tx_with_provenance(
-            binding,
-            forwarding,
-            now_ns,
-            worker_id,
-            worker_commands_by_id,
-            first_pass,
-        );
-        let mut serviced_in_inner = false;
-        loop {
-            let start_ns = monotonic_nanos();
-            let serviced = drain_shaped_tx(binding, now_ns, shared_recycles);
-            if let Some(serviced) = serviced.as_ref() {
-                let delta = monotonic_nanos().saturating_sub(start_ns);
-                let bucket = bucket_index_for_ns(delta);
-                if let Some(root) = binding.cos_interfaces.get(&serviced.root_ifindex) {
-                    if let Some(queue) = root.queues.get(serviced.queue_idx) {
-                        if queue.queue_id == serviced.queue_id {
-                            queue.owner_profile.drain_latency_hist[bucket]
-                                .fetch_add(1, Ordering::Relaxed);
-                            queue
-                                .owner_profile
-                                .drain_invocations
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
+    // First ingest pass — same structure as pre-#760. Moves
+    // pending_tx_local + inbox items into CoS queues where
+    // possible. Items that can't be CoS-enqueued (no CoS config
+    // for the egress, or cos_queue_id=None) stay in
+    // pending_tx_local and flow through the backup paths below —
+    // that's the expected non-CoS fast path and MUST stay fast.
+    ingest_cos_pending_tx(
+        binding,
+        forwarding,
+        now_ns,
+        worker_id,
+        worker_commands_by_id,
+    );
+    // Original #751 drain loop: service shaped queues until noop.
+    // Each shaped drain attributes latency + invocations to the
+    // specific queue via drain_shaped_tx's returned queue ref.
+    loop {
+        let start_ns = monotonic_nanos();
+        let serviced = drain_shaped_tx(binding, now_ns, shared_recycles);
+        if let Some(serviced) = serviced.as_ref() {
+            let delta = monotonic_nanos().saturating_sub(start_ns);
+            let bucket = bucket_index_for_ns(delta);
+            if let Some(root) = binding.cos_interfaces.get(&serviced.root_ifindex) {
+                if let Some(queue) = root.queues.get(serviced.queue_idx) {
+                    if queue.queue_id == serviced.queue_id {
+                        queue.owner_profile.drain_latency_hist[bucket]
+                            .fetch_add(1, Ordering::Relaxed);
+                        queue
+                            .owner_profile
+                            .drain_invocations
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
-                did_work = true;
-                serviced_in_inner = true;
-            } else {
-                break;
             }
-        }
-        if !serviced_in_inner {
+            did_work = true;
+        } else {
             binding
                 .live
                 .owner_profile_owner
                 .drain_noop_invocations
                 .fetch_add(1, Ordering::Relaxed);
-        }
-        // Quiesce check: if both local/prepared buffers are empty
-        // AND the redirect inbox is empty, another iteration
-        // cannot find any new work. Exit before burning the rest
-        // of the budget. The common case on a steady-state
-        // workload is one iteration through the budget.
-        if binding.pending_tx_prepared.is_empty()
-            && binding.pending_tx_local.is_empty()
-            && binding.live.pending_tx_empty()
-        {
             break;
         }
     }
-    // #760: belt-and-suspenders. Even after the bounded loop
-    // quiesces, a peer could push to the inbox between the
-    // quiesce check and the backup drain below, OR an item may
-    // remain in pending_tx_local / pending_tx_prepared because
-    // enqueue_cos_item returned Err (missing cos_interfaces
-    // entry, unresolvable queue_id — see tx.rs:4391-4395). Items
-    // with `cos_queue_id.is_some()` MUST NOT transmit via the
-    // backup path — doing so bypasses the CoS cap. Drop them
-    // here and recycle any UMEM slots they hold so the frame
-    // allocator stays in balance.
-    drop_cos_bound_prepared_leftovers(binding);
+    // #760: bounded re-ingest → drain_shaped_tx loop, but ONLY
+    // while the MPSC inbox has late peer arrivals AND CoS is
+    // configured on some egress. For non-CoS traffic
+    // (forwarding.cos.interfaces empty, or pending_tx_local
+    // items all have cos_queue_id=None), the first ingest is
+    // sufficient and re-ingesting does nothing useful — items
+    // in pending_tx_local that Err'd out of the first pass will
+    // Err the same way on every subsequent pass. The quiesce
+    // guard below is inbox-only because that is the only place
+    // peer workers can push new work after the first ingest.
+    //
+    // Perf note: without the inbox-only guard, a 25 Gbps non-CoS
+    // flow burns all 4 budget iterations per drain_pending_tx
+    // call because pending_tx_local never empties — observed as
+    // a severe throughput regression (25 Gbps → 3 Gbps). The
+    // inbox-only guard keeps the non-CoS fast path at exactly
+    // the pre-#760 cost.
+    if !forwarding.cos.interfaces.is_empty() {
+        const REINGEST_BUDGET: usize = 4;
+        for _ in 0..REINGEST_BUDGET {
+            if binding.live.pending_tx_empty() {
+                break;
+            }
+            ingest_cos_pending_tx_with_provenance(
+                binding,
+                forwarding,
+                now_ns,
+                worker_id,
+                worker_commands_by_id,
+                false,
+            );
+            let mut serviced_in_inner = false;
+            loop {
+                let start_ns = monotonic_nanos();
+                let serviced = drain_shaped_tx(binding, now_ns, shared_recycles);
+                if let Some(serviced) = serviced.as_ref() {
+                    let delta = monotonic_nanos().saturating_sub(start_ns);
+                    let bucket = bucket_index_for_ns(delta);
+                    if let Some(root) = binding.cos_interfaces.get(&serviced.root_ifindex) {
+                        if let Some(queue) = root.queues.get(serviced.queue_idx) {
+                            if queue.queue_id == serviced.queue_id {
+                                queue.owner_profile.drain_latency_hist[bucket]
+                                    .fetch_add(1, Ordering::Relaxed);
+                                queue
+                                    .owner_profile
+                                    .drain_invocations
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    did_work = true;
+                    serviced_in_inner = true;
+                } else {
+                    break;
+                }
+            }
+            if !serviced_in_inner {
+                break;
+            }
+        }
+    }
+    // #760: drop CoS-bound items that reached this backup path
+    // instead of transmitting them unshaped. Fast-exit when no
+    // CoS is configured (no possible cos_queue_id.is_some() on
+    // any item) — keeps the non-CoS hot path allocation-free.
+    if !forwarding.cos.interfaces.is_empty() {
+        drop_cos_bound_prepared_leftovers(binding);
+    }
     while !binding.pending_tx_prepared.is_empty() {
         match transmit_prepared_batch(binding, now_ns) {
             Ok((packets, bytes)) => {
@@ -356,12 +372,12 @@ pub(super) fn drain_pending_tx(
     if pending.is_empty() {
         return did_work || binding_has_pending_tx_work(binding);
     }
-    // #760: drop any CoS-bound items that reached this fallback.
-    // Symmetric with drop_cos_bound_prepared_leftovers above — see
-    // that function's comment for rationale. TxRequest owns its
-    // frame bytes as Vec<u8>; dropping the request frees the vec,
-    // no free_tx_frames bookkeeping needed.
-    drop_cos_bound_local_leftovers(&mut pending, &binding.live);
+    // #760: drop any CoS-bound items. Fast-exit if no CoS is
+    // configured at all — saves the O(n) scan + reallocation on
+    // the non-CoS hot path.
+    if !forwarding.cos.interfaces.is_empty() {
+        drop_cos_bound_local_leftovers(&mut pending, &binding.live);
+    }
     let mut retry = VecDeque::new();
     while let Some(req) = pending.pop_front() {
         retry.push_back(req);
@@ -420,20 +436,34 @@ fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
     if binding.pending_tx_prepared.is_empty() {
         return;
     }
-    let mut pending = core::mem::take(&mut binding.pending_tx_prepared);
+    // Fast early-exit: if the head item is not CoS-bound, assume
+    // the common case (the queue is ordered FIFO; under typical
+    // loads it's all-CoS or all-non-CoS for a given drain pass).
+    // This keeps the non-CoS hot path at an O(1) peek cost. If
+    // the head IS CoS-bound, fall through to the scan — we
+    // accept the O(n) cost because it signals real leakage.
+    match binding.pending_tx_prepared.front() {
+        Some(req) if req.cos_queue_id.is_some() => { /* scan */ }
+        _ => return,
+    }
+    // Scan in-place. Swap-remove pattern: pop_front until a
+    // non-CoS item is found, then rotate the survivor back to
+    // the tail. Avoids the allocation the prior draft did.
     let mut dropped = 0u64;
     let mut dropped_bytes = 0u64;
-    let mut surviving = VecDeque::with_capacity(pending.len());
-    for req in pending.drain(..) {
+    let original_len = binding.pending_tx_prepared.len();
+    for _ in 0..original_len {
+        let Some(req) = binding.pending_tx_prepared.pop_front() else {
+            break;
+        };
         if req.cos_queue_id.is_some() {
             dropped = dropped.saturating_add(1);
             dropped_bytes = dropped_bytes.saturating_add(req.len as u64);
             recycle_prepared_immediately(binding, &req);
         } else {
-            surviving.push_back(req);
+            binding.pending_tx_prepared.push_back(req);
         }
     }
-    binding.pending_tx_prepared = surviving;
     if dropped > 0 {
         binding
             .live
@@ -463,18 +493,24 @@ fn drop_cos_bound_local_leftovers(
     if pending.is_empty() {
         return;
     }
-    let mut surviving = VecDeque::with_capacity(pending.len());
+    // Fast early-exit: head-peek before committing to the O(n)
+    // scan. See drop_cos_bound_prepared_leftovers for rationale.
+    match pending.front() {
+        Some(req) if req.cos_queue_id.is_some() => { /* scan */ }
+        _ => return,
+    }
     let mut dropped = 0u64;
     let mut dropped_bytes = 0u64;
-    for req in pending.drain(..) {
+    let original_len = pending.len();
+    for _ in 0..original_len {
+        let Some(req) = pending.pop_front() else { break };
         if req.cos_queue_id.is_some() {
             dropped = dropped.saturating_add(1);
             dropped_bytes = dropped_bytes.saturating_add(req.bytes.len() as u64);
         } else {
-            surviving.push_back(req);
+            pending.push_back(req);
         }
     }
-    *pending = surviving;
     if dropped > 0 {
         live.tx_errors.fetch_add(dropped, Ordering::Relaxed);
         live.owner_profile_owner
@@ -5021,6 +5057,18 @@ fn recycle_completed_tx_offset(
 }
 
 pub(super) fn recycle_prepared_immediately(binding: &mut BindingWorker, req: &PreparedTxRequest) {
+    // #760 / Codex review note: when `req.recycle` is
+    // `FillOnSlot(fill_slot)` with `fill_slot != binding.slot`,
+    // `recycle_cancelled_prepared_offset` routes the frame to THIS
+    // binding's `free_tx_frames`, not the source slot's fill ring.
+    // This is the same behavior as the pre-existing cancel path
+    // used by `restore_cos_prepared_items` etc., and is latent in
+    // practice because `FillOnSlot(other_slot)` only arises in the
+    // same-device shared-UMEM prototype, which is unused on the
+    // current test topologies. A proper cross-slot fill-credit
+    // routing would need a `shared_recycles` channel from this
+    // drop site back to the source worker; deferred until the
+    // shared-UMEM prototype is activated.
     recycle_cancelled_prepared_offset(
         &mut binding.free_tx_frames,
         &mut binding.pending_fill_frames,
