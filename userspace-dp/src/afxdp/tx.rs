@@ -286,6 +286,25 @@ pub(super) fn drain_pending_tx(
             break;
         }
     }
+    // #760: cross-worker items can arrive on the redirect inbox
+    // DURING the drain_shaped_tx loop above, after the initial
+    // ingest_cos_pending_tx already ran. Without a second pass
+    // those late arrivals fall through the post-drain backup paths
+    // below and transmit UNSHAPED, bypassing the CoS gate. On fw1
+    // primary iperf3 -P 1 showed 27% of tx bytes bypassing via
+    // this path. Re-ingest now so every fresh cos-queued item
+    // gets a chance at CoS admission before the backup paths pick
+    // it up. Allocation-free: both pending buffers are worker-
+    // owned VecDeques reused across polls; the inbox drain is
+    // lock-free MPSC; the call is a no-op when all three
+    // (pending_tx_local, pending_tx_prepared, inbox) are empty.
+    ingest_cos_pending_tx(
+        binding,
+        forwarding,
+        now_ns,
+        worker_id,
+        worker_commands_by_id,
+    );
     while !binding.pending_tx_prepared.is_empty() {
         match transmit_prepared_batch(binding, now_ns) {
             Ok((packets, bytes)) => {
