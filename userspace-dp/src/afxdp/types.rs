@@ -997,6 +997,21 @@ pub(super) struct CoSQueueRuntime {
     // via `ArcSwap`, so reads are consistent without ordering discipline
     // here.
     pub(super) drop_counters: CoSQueueDropCounters,
+    // #751: per-queue owner-side drain telemetry. Lives inline on the
+    // queue runtime so each queue's drain_latency + drain_invocations
+    // are genuinely per-queue rather than a binding-wide rollup
+    // surfaced under every queue row (#732). Single-writer on the
+    // owner worker thread; atomic because the snapshot path reads
+    // from a different thread.
+    //
+    // Cross-core ping-pong: this lives on the owner worker's hot
+    // data, so it shares cache lines with the surrounding queue
+    // state (tokens, queued_bytes, etc.). Owner-only writes to all
+    // of them, so false-sharing risk is internal to the worker and
+    // already accepted by the design. The #709 cache-pad isolation
+    // on BindingLiveState was specifically for owner/peer split;
+    // here both are owner-side so no separate pad is needed.
+    pub(super) owner_profile: CoSQueueOwnerProfile,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1044,6 +1059,45 @@ pub(super) struct CoSTimerWheelRuntime {
     pub(super) current_tick: u64,
     pub(super) level0: [Vec<usize>; COS_TIMER_WHEEL_L0_SLOTS],
     pub(super) level1: [Vec<usize>; COS_TIMER_WHEEL_L1_SLOTS],
+}
+
+/// #751: per-queue owner-side drain telemetry. Written by the owner
+/// worker when a drain cycle services this specific queue (see
+/// `drain_shaped_tx`'s per-queue return signal in tx.rs); read via
+/// the snapshot path published through ArcSwap to Prometheus and to
+/// `show class-of-service interface`.
+///
+/// Buckets sum to `drain_invocations` modulo the reader's scrape
+/// window, pinned in
+/// `queue_owner_profile_buckets_sum_to_drain_invocations`.
+///
+/// Single-writer. Relaxed is sufficient:
+///   - The snapshot reader tolerates monotonic counter tearing
+///     across the bucket array (same tolerance the BindingLiveState
+///     owner_profile_owner already assumed).
+///   - Prometheus scrape semantics are "best effort at scrape time".
+///   - No happens-before requirement between the buckets themselves
+///     or between `drain_latency_hist` and `drain_invocations` —
+///     readers compute percentiles independently and a brief skew
+///     just rounds the p50/p99 into an adjacent bucket.
+pub(super) struct CoSQueueOwnerProfile {
+    pub(super) drain_latency_hist: [AtomicU64; super::umem::DRAIN_HIST_BUCKETS],
+    pub(super) drain_invocations: AtomicU64,
+}
+
+impl CoSQueueOwnerProfile {
+    pub(super) fn new() -> Self {
+        Self {
+            drain_latency_hist: std::array::from_fn(|_| AtomicU64::new(0)),
+            drain_invocations: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for CoSQueueOwnerProfile {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub(super) struct SharedCoSQueueLease {

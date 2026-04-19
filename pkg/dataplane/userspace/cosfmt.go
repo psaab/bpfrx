@@ -105,6 +105,14 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 				view.interfaceState.TimerLevel0Sleepers,
 				view.interfaceState.TimerLevel1Sleepers)
 		}
+		// #732 / #751: binding-scoped telemetry rendered once per
+		// interface instead of under every queue row. owner_pps /
+		// peer_pps / redirect_p99 describe binding-wide arrivals
+		// and redirects; producers don't know a target queue at
+		// redirect time so these values are inherently per-binding.
+		// Pre-#751 each queue row reported the same values, which
+		// was the #732 symptom.
+		renderBindingScopedTelemetry(&b, cfg, view)
 		queues := buildCoSQueueViews(cfg, view)
 		if len(queues) == 0 {
 			b.WriteString("  Queues:                   none\n")
@@ -174,20 +182,22 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 				queue.admissionBufferDrops,
 				queue.admissionEcnMarked,
 			)
-			// #709: OwnerProfile line — rendered only for exact queues
-			// with a named owner worker. Non-exact / shared_exact
-			// queues have no single owner binding whose latency is
-			// meaningful, so the row would be misleading for those
-			// (see `TestFormatCoSInterfaceSummaryOmitsOwnerProfileForQueuesWithoutOwner`).
-			if queue.ownerWorker != nil {
+			// #709 / #751: per-queue OwnerProfile line renders only
+			// the queue-scoped drain percentiles. The binding-scoped
+			// fields (redirect_p99 / owner_pps / peer_pps) moved to
+			// the interface header via renderBindingScopedTelemetry
+			// so they are no longer repeated under every queue row
+			// (#732). Non-exact / shared_exact queues keep an empty
+			// per-queue hist post-#751 because the drain path only
+			// writes the atomics when it services them, so
+			// drainInvocations==0 correctly suppresses the row.
+			if queue.ownerWorker != nil && queue.drainInvocations > 0 {
 				fmt.Fprintf(
 					&b,
-					"           OwnerProfile: drain_p50=%s  drain_p99=%s  redirect_p99=%s  owner_pps=%d  peer_pps=%d\n",
+					"           OwnerProfile: drain_p50=%s  drain_p99=%s  drain_invocations=%d\n",
 					formatHistPercentileMicros(queue.drainLatencyHist, queue.drainInvocations, 50),
 					formatHistPercentileMicros(queue.drainLatencyHist, queue.drainInvocations, 99),
-					formatHistPercentileMicrosFromBuckets(queue.redirectAcquireHist, 99),
-					queue.ownerPPS,
-					queue.peerPPS,
+					queue.drainInvocations,
 				)
 			}
 		}
@@ -237,6 +247,50 @@ func formatHistPercentileMicrosFromBuckets(hist []uint64, percentile int) string
 		total += count
 	}
 	return formatHistPercentileMicros(hist, total, percentile)
+}
+
+// #732 / #751: render a single "Binding telemetry" line per interface
+// carrying the values that are inherently binding-scoped (producers do
+// not know the target queue at redirect time). Rust's snapshot path
+// attributes these to the sole unambiguous owner-local exact queue row,
+// or leaves them at zero when the shape is ambiguous. We gather them
+// from whichever queue carries non-zero values and render once at the
+// interface level, replacing the pre-#751 per-queue repetition.
+//
+// Zero-in-all-fields is suppressed so interfaces with no exact queue
+// or ambiguous shape don't get a noise line.
+func renderBindingScopedTelemetry(b *strings.Builder, cfg *config.Config, view cosInterfaceView) {
+	if view.interfaceState == nil {
+		return
+	}
+	queues := buildCoSQueueViews(cfg, view)
+	var (
+		ownerPPS       uint64
+		peerPPS        uint64
+		redirectHist   []uint64
+	)
+	for _, q := range queues {
+		if q.ownerPPS > ownerPPS {
+			ownerPPS = q.ownerPPS
+		}
+		if q.peerPPS > peerPPS {
+			peerPPS = q.peerPPS
+		}
+		if redirectHist == nil && len(q.redirectAcquireHist) > 0 {
+			redirectHist = q.redirectAcquireHist
+		}
+	}
+	// Gate: nothing meaningful to render.
+	if ownerPPS == 0 && peerPPS == 0 && len(redirectHist) == 0 {
+		return
+	}
+	fmt.Fprintf(
+		b,
+		"  Binding telemetry:        redirect_p99=%s  owner_pps=%d  peer_pps=%d\n",
+		formatHistPercentileMicrosFromBuckets(redirectHist, 99),
+		ownerPPS,
+		peerPPS,
+	)
 }
 
 // #709: map a bucket index to its lower bound, formatted as µs. The

@@ -225,17 +225,25 @@ pub(super) fn drain_pending_tx(
     // owner binding) must yield back to the worker loop so other bindings can
     // run and completions/recycles can free resources.
     //
-    // #709: time every `drain_shaped_tx` invocation (not per queue, not per
-    // batch) with one pair of `monotonic_nanos()` calls. `monotonic_nanos`
-    // is `clock_gettime(CLOCK_MONOTONIC)` via VDSO — no syscall, ~15 ns
-    // each. The owner-drain latency histogram is the primary signal for
-    // deciding whether Option B / C / D in #709 is justified. Noop
-    // invocations (drain returned `false`) are bucketed too so the
-    // operator can distinguish "owner busy but fast" from "owner
-    // spinning on empty".
+    // #709: time every `drain_shaped_tx` invocation with one pair of
+    // `monotonic_nanos()` calls. `monotonic_nanos` is
+    // `clock_gettime(CLOCK_MONOTONIC)` via VDSO — no syscall, ~15 ns
+    // each. The owner-drain latency histogram is the primary signal
+    // for deciding whether Option B / C / D in #709 is justified.
+    //
+    // #751: attribute the measured latency to the specific queue
+    // that was serviced on this drain pass, not to a binding-wide
+    // rollup. Producers don't know the target queue at redirect time
+    // so peer-side telemetry (redirect_acquire_hist, peer_pps) stays
+    // binding-scoped; only the owner-side drain stats move per-queue.
+    //
+    // Noop invocations (drain returned `None` — no queue made
+    // progress) keep binding-wide attribution on BindingLiveState so
+    // the operator can still tell "owner busy but fast" from "owner
+    // spinning on empty" as a binding-wide property.
     loop {
         let start_ns = monotonic_nanos();
-        let progressed = drain_shaped_tx(binding, now_ns, shared_recycles);
+        let serviced = drain_shaped_tx(binding, now_ns, shared_recycles);
         let delta = monotonic_nanos().saturating_sub(start_ns);
         let bucket = bucket_index_for_ns(delta);
         binding.live.owner_profile_owner.drain_latency_hist[bucket]
@@ -245,7 +253,23 @@ pub(super) fn drain_pending_tx(
             .owner_profile_owner
             .drain_invocations
             .fetch_add(1, Ordering::Relaxed);
-        if !progressed {
+        if let Some(serviced) = serviced.as_ref() {
+            if let Some(root) = binding.cos_interfaces.get(&serviced.root_ifindex) {
+                if let Some(queue) = root
+                    .queues
+                    .iter()
+                    .find(|q| q.queue_id == serviced.queue_id)
+                {
+                    queue.owner_profile.drain_latency_hist[bucket]
+                        .fetch_add(1, Ordering::Relaxed);
+                    queue
+                        .owner_profile
+                        .drain_invocations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        if serviced.is_none() {
             binding
                 .live
                 .owner_profile_owner
@@ -800,13 +824,25 @@ fn redirect_prepared_cos_request_to_owner_binding(
     Err(req)
 }
 
+/// #751: one drain pass through the binding's CoS interfaces. Returns
+/// the (root_ifindex, queue_id) that was actually serviced so the
+/// caller can attribute the drain latency to the specific queue
+/// instead of into a binding-wide rollup.
+///
+/// `Some((ifindex, qid))` — a batch from this queue was submitted.
+/// `None` — no progress on any queue.
+pub(super) struct DrainedQueueRef {
+    pub(super) root_ifindex: i32,
+    pub(super) queue_id: u8,
+}
+
 fn drain_shaped_tx(
     binding: &mut BindingWorker,
     now_ns: u64,
     shared_recycles: &mut Vec<(u32, u64)>,
-) -> bool {
+) -> Option<DrainedQueueRef> {
     if binding.cos_nonempty_interfaces == 0 || binding.cos_interface_order.is_empty() {
-        return false;
+        return None;
     }
     let start = binding.cos_interface_rr % binding.cos_interface_order.len();
     for offset in 0..binding.cos_interface_order.len() {
@@ -821,19 +857,44 @@ fn drain_shaped_tx(
         if !prime_cos_root_for_service(binding, root_ifindex, now_ns) {
             continue;
         }
-        if let Some(progress) =
-            service_exact_guarantee_queue_direct(binding, root_ifindex, now_ns, shared_recycles)
-        {
+        if let Some(serviced) = service_exact_guarantee_queue_direct_with_info(
+            binding,
+            root_ifindex,
+            now_ns,
+            shared_recycles,
+        ) {
             binding.cos_interface_rr = (start + offset + 1) % binding.cos_interface_order.len();
-            return progress;
+            return serviced;
         }
         let Some(batch) = build_nonexact_cos_batch(binding, root_ifindex, now_ns) else {
             continue;
         };
+        let queue_id = cos_batch_queue_id(binding, root_ifindex, &batch);
         binding.cos_interface_rr = (start + offset + 1) % binding.cos_interface_order.len();
-        return submit_cos_batch(binding, root_ifindex, batch, now_ns, shared_recycles);
+        if submit_cos_batch(binding, root_ifindex, batch, now_ns, shared_recycles) {
+            return queue_id.map(|queue_id| DrainedQueueRef {
+                root_ifindex,
+                queue_id,
+            });
+        }
+        return None;
     }
-    false
+    None
+}
+
+fn cos_batch_queue_id(
+    binding: &BindingWorker,
+    root_ifindex: i32,
+    batch: &CoSBatch,
+) -> Option<u8> {
+    let queue_idx = match batch {
+        CoSBatch::Local { queue_idx, .. } | CoSBatch::Prepared { queue_idx, .. } => *queue_idx,
+    };
+    binding
+        .cos_interfaces
+        .get(&root_ifindex)
+        .and_then(|root| root.queues.get(queue_idx))
+        .map(|queue| queue.queue_id)
 }
 
 fn prime_cos_root_for_service(binding: &mut BindingWorker, root_ifindex: i32, now_ns: u64) -> bool {
@@ -873,6 +934,30 @@ fn service_exact_guarantee_queue_direct(
     now_ns: u64,
     shared_recycles: &mut Vec<(u32, u64)>,
 ) -> Option<bool> {
+    service_exact_guarantee_queue_direct_with_info(
+        binding,
+        root_ifindex,
+        now_ns,
+        shared_recycles,
+    )
+    .map(|slot| slot.is_some())
+}
+
+/// #751: variant that additionally reports which queue was actually
+/// serviced so the caller can attribute per-queue drain latency.
+/// Returns:
+///   * `Some(Some(ref))` — exact-guarantee selection fired, batch
+///     service progressed on `ref`.
+///   * `Some(None)` — exact-guarantee selection fired but the service
+///     call made no progress (batch build declined / TX ring refused).
+///   * `None` — no exact-guarantee selection; caller falls through
+///     to the non-exact path.
+fn service_exact_guarantee_queue_direct_with_info(
+    binding: &mut BindingWorker,
+    root_ifindex: i32,
+    now_ns: u64,
+    shared_recycles: &mut Vec<(u32, u64)>,
+) -> Option<Option<DrainedQueueRef>> {
     let queue_fast_path = binding
         .cos_fast_interfaces
         .get(&root_ifindex)?
@@ -882,6 +967,12 @@ fn service_exact_guarantee_queue_direct(
         let root = binding.cos_interfaces.get_mut(&root_ifindex)?;
         select_exact_cos_guarantee_queue_with_fast_path(root, queue_fast_path, now_ns)?
     };
+
+    let queue_id = binding
+        .cos_interfaces
+        .get(&root_ifindex)
+        .and_then(|root| root.queues.get(selection.queue_idx))
+        .map(|queue| queue.queue_id);
 
     let progress = match selection.kind {
         ExactCoSQueueKind::Local => service_exact_local_queue_direct(
@@ -900,7 +991,15 @@ fn service_exact_guarantee_queue_direct(
             now_ns,
         ),
     };
-    Some(progress)
+
+    Some(if progress {
+        queue_id.map(|queue_id| DrainedQueueRef {
+            root_ifindex,
+            queue_id,
+        })
+    } else {
+        None
+    })
 }
 
 #[cfg(test)]
@@ -4133,6 +4232,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 wheel_slot: 0,
                 items: VecDeque::new(),
                 drop_counters: CoSQueueDropCounters::default(),
+                owner_profile: CoSQueueOwnerProfile::new(),
             })
             .collect(),
         queue_indices_by_priority,
@@ -10134,6 +10234,7 @@ mod tests {
             wheel_slot: 0,
             items: VecDeque::from([test_cos_item(1500)]),
             drop_counters: CoSQueueDropCounters::default(),
+            owner_profile: CoSQueueOwnerProfile::new(),
         };
 
         normalize_cos_queue_state(&mut queue);
@@ -10170,6 +10271,7 @@ mod tests {
             wheel_slot: 0,
             items: VecDeque::new(),
             drop_counters: CoSQueueDropCounters::default(),
+            owner_profile: CoSQueueOwnerProfile::new(),
         };
         let retry = VecDeque::from([TxRequest {
             bytes: vec![0; 1500],
@@ -10217,6 +10319,7 @@ mod tests {
             wheel_slot: 0,
             items: VecDeque::new(),
             drop_counters: CoSQueueDropCounters::default(),
+            owner_profile: CoSQueueOwnerProfile::new(),
         };
         let retry = VecDeque::from([PreparedTxRequest {
             offset: 64,
