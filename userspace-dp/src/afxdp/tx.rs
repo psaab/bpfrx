@@ -2539,23 +2539,31 @@ const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 /// Applied to both the aggregate `buffer_limit` and the per-flow
 /// `share_cap` in `apply_cos_admission_ecn_policy`.
 ///
-/// Initially 1/2. Live validation on the 16-flow / 1 Gbps exact queue
-/// workload (see `docs/cos-validation-notes.md`) showed the 50% mark
-/// never fired: aggregate steady-state at ~31% utilisation, per-flow
-/// buckets averaging ~36% of share_cap with brief spikes that hit the
-/// hard cap and drop before the admission loop observed them cross
-/// 50%. Lowered to 1/5 (20%) so marks fire an order of magnitude
-/// earlier — roughly when a flow reaches 3 dupacks' worth of buffering
-/// under steady fair-share — giving ECN-negotiated TCP room to halve
-/// cwnd smoothly before a microburst pushes the bucket past the cap.
+/// History:
+///   1/2 (initial) — marks never fired under the 16-flow / 1 Gbps
+///     workload; per-flow buckets averaged ~36% of share_cap.
+///   1/5 (#728)    — one-order-of-magnitude earlier marking to give
+///     ECN-negotiated TCP room to halve cwnd smoothly.
+///   1/3 (#754)    — 1/5 over-marked on a single-flow / low-rate
+///     exact queue. Live trace on loss:xpf-userspace-fw0:
+///       * 1 Gbps queue: 971K ECN marks vs. 1766 flow_share drops
+///       * single iperf3 -P 1 -t 30: bimodal 1.44 Gbps spikes and
+///         hard stalls to 0 bps, 78K retrans, avg 820 Mbps
+///     Raising to 1/3 backs the marker off to 33% of share_cap so
+///     TCP cubic has more headroom before mark pressure collapses
+///     cwnd. Still fires before hard-drop, still lets ECN do its
+///     job on elephant flows.
 ///
 /// This is a tuning knob against live counter telemetry, not a
-/// from-first-principles derivation. If `admission_ecn_marked` stays
+/// first-principles derivation. If `admission_ecn_marked` stays
 /// pathologically low under load despite ECT traffic, lower further;
 /// if marks fire so often that throughput drops (ECN double-backoff),
-/// raise. Observe via `show class-of-service interface`.
+/// raise. Observe via `show class-of-service interface`. Longer-term
+/// a rate-aware threshold (#747) replaces this single ratio with a
+/// signal that scales with configured drain rate rather than buffer
+/// depth alone.
 const COS_ECN_MARK_THRESHOLD_NUM: u64 = 1;
-const COS_ECN_MARK_THRESHOLD_DEN: u64 = 5;
+const COS_ECN_MARK_THRESHOLD_DEN: u64 = 3;
 
 // Guard against a refactor flipping the fraction. A threshold >= 1
 // would never fire (queue is capped at buffer_limit) and a zero
@@ -11019,12 +11027,13 @@ mod tests {
 
         // buffer_limit at 16 active flows: 16 × 24 KB = 384 KB (clamped
         // by delay_cap = 625 KB on a 1 Gbps queue @ 5 ms). share_cap =
-        // 384000 / 16 = 24000. At the current NUM/DEN = 1/5 (20%), the
-        // thresholds are aggregate = 384000 / 5 = 76_800 and per-flow =
-        // 24000 / 5 = 4_800. If NUM/DEN is retuned, both derived values
-        // move together — the asserts below are written against the
-        // constants, not baked-in magic numbers.
-        let target_bucket_bytes = 15_000; // > 4 800 per-flow threshold with a generous margin
+        // 384000 / 16 = 24000. At the current NUM/DEN = 1/3 (33%) per
+        // #754, the thresholds are aggregate = 384000 / 3 = 128_000 and
+        // per-flow = 24000 / 3 = 8_000. If NUM/DEN is retuned, both
+        // derived values move together — the asserts below are written
+        // against concrete numbers (not the constants) so a future
+        // retune fails the pin loudly, which is the whole point.
+        let target_bucket_bytes = 15_000; // > 8 000 per-flow threshold with a generous margin
         let queued_bytes = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
         queue.queued_bytes = queued_bytes;
         let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
@@ -11035,18 +11044,14 @@ mod tests {
             buffer_limit.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
         let flow_ecn_threshold =
             share_cap.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM) / COS_ECN_MARK_THRESHOLD_DEN;
-        // Concrete expected values — at the current NUM/DEN = 1/5,
-        // aggregate = 384_000 / 5 = 76_800 and per-flow = 24_000 / 5
-        // = 4_800. Asserting against the computed expression would be
-        // a tautology (RHS recomputes the LHS). Using concrete numbers
-        // makes a silent retune of NUM/DEN or a formula refactor both
-        // fail here — which is the whole point of a regression pin.
+        // Concrete expected values at NUM/DEN = 1/3: aggregate =
+        // 384_000 / 3 = 128_000 and per-flow = 24_000 / 3 = 8_000.
         assert_eq!(
-            aggregate_ecn_threshold, 76_800,
+            aggregate_ecn_threshold, 128_000,
             "aggregate threshold must remain pinned for this fixture",
         );
         assert_eq!(
-            flow_ecn_threshold, 4_800,
+            flow_ecn_threshold, 8_000,
             "per-flow threshold must remain pinned for this fixture",
         );
 
@@ -11109,8 +11114,9 @@ mod tests {
         let target = 0usize;
 
         // Put the target bucket well below the per-flow threshold
-        // (12 000 bytes) but drive the aggregate above 192 000.
-        let target_bucket_bytes = 500; // < 12 000
+        // (8 000 bytes at NUM/DEN = 1/3) but drive the aggregate
+        // above 128 000.
+        let target_bucket_bytes = 500; // < 8 000
         let _ = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
         let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
         let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
@@ -11149,9 +11155,9 @@ mod tests {
         let queue = &mut root.queues[0];
         let target = 0usize;
 
-        let target_bucket_bytes = 500; // < 12 000
+        let target_bucket_bytes = 500; // < 8 000 (per-flow threshold at NUM/DEN = 1/3)
         let queued_bytes = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
-        queue.queued_bytes = queued_bytes; // ≪ 192 000
+        queue.queued_bytes = queued_bytes; // ≪ 128 000 (aggregate threshold at 1/3)
         let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
         let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
         let aggregate_ecn_threshold =
@@ -11199,7 +11205,7 @@ mod tests {
         let queue = &mut root.queues[0];
         let target = 0usize;
 
-        let target_bucket_bytes = 15_000; // > 12 000 per-flow threshold
+        let target_bucket_bytes = 15_000; // > 8 000 per-flow threshold (NUM/DEN = 1/3)
         let queued_bytes = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
         queue.queued_bytes = queued_bytes;
         let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
