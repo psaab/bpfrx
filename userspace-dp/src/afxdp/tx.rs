@@ -4679,6 +4679,19 @@ fn apply_cos_prepared_result(
                     queue.surplus_deficit = queue.surplus_deficit.saturating_sub(sent_bytes);
                 }
             }
+            // #760 instrumentation, the FOURTH apply_* site. This is
+            // the prepared-batch path (CoSBatch::Prepared, in-place
+            // rewrite — the common case for forwarded traffic). The
+            // initial instrumentation commit missed this site; the
+            // first 120 s iperf3 measurement showed only ~987 Mbps
+            // on drain_sent_bytes while the receiver reported 1.55
+            // Gbps, leaving ~563 Mbps unaccounted — all of it
+            // flowing through this path. Same Relaxed semantics as
+            // the other three apply_* sites.
+            queue
+                .owner_profile
+                .drain_sent_bytes
+                .fetch_add(sent_bytes, Ordering::Relaxed);
         }
         root.tokens = root.tokens.saturating_sub(sent_bytes);
     }
