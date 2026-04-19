@@ -3173,6 +3173,43 @@ const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 /// convergence stays pinned by the gate rather than by the burst.
 const COS_CROSS_WORKER_BURST_NS: u64 = 3_000_000;
 
+/// #785 slice 2 — cross-worker DRR.
+///
+/// Peak-decay window for the rate-gate division denominator. Every
+/// `COS_FAIR_SHARE_PEAK_WINDOW_NS`, each worker snaps its
+/// `local_fair_share_peak` to the live `active_flow_buckets` value,
+/// and also snaps `SharedCoSQueueLease.active_flow_count_peak` to
+/// the live `active_flow_count`. Within a window, peaks grow
+/// monotonically on bucket 0→>0 transitions (capturing the max-ever
+/// flow count during that window and absorbing SFQ bucket-bytes
+/// oscillation between packets). At the window boundary peaks drop
+/// back to reflect whatever flows are actually still active.
+///
+/// Without this decay, peaks pin at their lifetime high-water mark
+/// and a queue that once saw 12 concurrent flows keeps dividing by
+/// 12 forever — on realistic workloads with flow churn (HTTP
+/// short-lived TCP, L7LB terminations) that progressively starves
+/// every worker down to 1/lifetime_peak of the shaper rate. Codex
+/// review on the first slice-2 revision flagged this as HIGH.
+///
+/// 2 s chosen as the trade-off between:
+///
+///   * Shorter (hundreds of ms) — peak-reset fires often, but each
+///     reset temporarily exposes the rate gate to the SFQ bucket-
+///     churn oscillation (1-5 vs true 12) for the ~ms it takes
+///     `add_active_flow` to CAS the peak back up. At 500 ms empirical
+///     variance on iperf3 -P 12 ran 14-22 Gbps across three runs
+///     (individually correct but run-to-run unstable).
+///   * Longer (tens of seconds) — stale high-water marks persist
+///     through flow-count drops, starving workers during ramp-down.
+///
+/// 2 s is ~10× steady-state TCP convergence time at a 20 ms RTT,
+/// so a short reset-exposure window amortises over ~100 drain
+/// cycles. Flows that leave see the gate's denominator drop within
+/// ~2 s, which is acceptable for realistic workloads (L7LB
+/// connection churn horizon is seconds, not sub-second).
+const COS_FAIR_SHARE_PEAK_WINDOW_NS: u64 = 2_000_000_000;
+
 /// ECN CE-marking threshold as a fraction of the relevant cap.
 /// Applied to both the aggregate `buffer_limit` and the per-flow
 /// `share_cap` in `apply_cos_admission_ecn_policy`.
@@ -3682,19 +3719,35 @@ fn maybe_top_up_local_fair_share(queue: &mut CoSQueueRuntime, now_ns: u64) {
     let Some(lease) = queue.shared_lease.as_ref() else {
         return;
     };
-    // #785 slice 2: use PEAK counts for both local and total so the
-    // division denominator is stable in steady state. SFQ bucket
-    // bytes transition to 0 and back between packet arrivals, which
+    // #785 slice 2: decay the windowed peak every
+    // `COS_FAIR_SHARE_PEAK_WINDOW_NS`. Addresses Codex HIGH: without
+    // this, peaks pin at lifetime max and a queue that briefly saw
+    // many concurrent flows keeps dividing by that count forever.
+    // Snap local_fair_share_peak to the live `active_flow_buckets`
+    // value, and delegate the shared snap to the lease so the
+    // cross-worker peak drops too. First deadline (== 0 on a fresh
+    // runtime) fires immediately and arms the timer.
+    if now_ns >= queue.local_fair_share_peak_deadline_ns {
+        queue.local_fair_share_peak = queue.active_flow_buckets;
+        lease.snap_peak_to_current();
+        queue.local_fair_share_peak_deadline_ns =
+            now_ns.saturating_add(COS_FAIR_SHARE_PEAK_WINDOW_NS);
+    }
+    // Use peak counts for both local and total so the division
+    // denominator is stable in steady state. SFQ bucket bytes
+    // transition to 0 and back between packet arrivals, which
     // causes `active_flow_buckets` / `active_flow_count` to
-    // oscillate rapidly (live diagnostic: total seen at 1-5 when the
-    // true flow count was 12). Instantaneous counts would let
+    // oscillate rapidly (live diagnostic: total seen at 1-5 when
+    // the true flow count was 12). Instantaneous counts would let
     // workers briefly over-rate during dips and starve during
-    // spikes. Peak-based counts are a conservative upper bound that
-    // converges to the true flow count within ~1 ms on a steady-
-    // state workload. Matching peak-vs-peak on both sides preserves
-    // the sum-across-workers == queue_rate invariant.
+    // spikes. Peak-based counts are a conservative upper bound
+    // that converges to the true flow count within ~1 ms on a
+    // steady-state workload and decays back within
+    // `COS_FAIR_SHARE_PEAK_WINDOW_NS` when flows leave. Matching
+    // peak-vs-peak on both sides preserves the sum-across-workers
+    // == queue_rate invariant within each window.
     let total = lease.active_flow_count_peak();
-    let local = queue.active_flow_buckets_peak as u32;
+    let local = queue.local_fair_share_peak as u32;
     // Also use the SHARED LEASE's rate, not
     // `queue.transmit_rate_bytes`. On queues where multiple
     // forwarding classes share the same queue ID (e.g. iperf-b
@@ -4016,9 +4069,25 @@ fn cos_flow_aware_buffer_limit(queue: &CoSQueueRuntime, flow_bucket: usize) -> u
         return base;
     }
     let prospective_active = cos_queue_prospective_active_flows(queue, flow_bucket);
-    // u128 to keep the intermediate product safe at 10 Gbps × 5 ms
+    // #785 slice 2 Codex MEDIUM: derive the delay cap from the
+    // SHARED LEASE rate on shared_exact queues so the admission
+    // gate agrees with the drain-side rate gate
+    // (`maybe_top_up_local_fair_share`) about what rate the queue
+    // is actually shaped at. `queue.transmit_rate_bytes` can
+    // diverge from the shaper rate when multiple forwarding
+    // classes with different scheduler rates map to the same
+    // queue id (e.g. iperf-b at 10 Gbps + iperf-c at 25 Gbps both
+    // → queue 5). Without this, the two gates disagree and the
+    // admission path systematically over-buffers relative to what
+    // the shaper will actually drain.
+    let rate_bytes = queue
+        .shared_lease
+        .as_ref()
+        .map(|lease| lease.rate_bytes())
+        .unwrap_or(queue.transmit_rate_bytes);
+    // u128 to keep the intermediate product safe at 100 Gbps × 5 ms
     // (plus any plausible operator-configured rate inflation).
-    let delay_cap = ((queue.transmit_rate_bytes as u128)
+    let delay_cap = ((rate_bytes as u128)
         * (COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS as u128)
         / 1_000_000_000u128) as u64;
     base.max(prospective_active.saturating_mul(COS_FLOW_FAIR_MIN_SHARE_BYTES))
@@ -4042,6 +4111,16 @@ fn account_cos_queue_flow_enqueue(
         // detect SFQ hash collisions under real workloads.
         if queue.active_flow_buckets > queue.active_flow_buckets_peak {
             queue.active_flow_buckets_peak = queue.active_flow_buckets;
+        }
+        // #785 slice 2: windowed scheduler peak. Bumped on every
+        // bucket 0→>0 transition, reset to the live
+        // `active_flow_buckets` on a 500 ms cadence in
+        // `maybe_top_up_local_fair_share`. Separate from
+        // `active_flow_buckets_peak` because #784 documents that
+        // field as never reset during daemon lifetime (operator
+        // contract for SFQ hash-collision detection).
+        if queue.active_flow_buckets > queue.local_fair_share_peak {
+            queue.local_fair_share_peak = queue.active_flow_buckets;
         }
         // #785 slice 2: cross-worker DRR counter. Increment the
         // shared `active_flow_count` on the FIRST packet of a flow
@@ -5094,6 +5173,8 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 queued_bytes: 0,
                 active_flow_buckets: 0,
                 active_flow_buckets_peak: 0,
+                local_fair_share_peak: 0,
+                local_fair_share_peak_deadline_ns: 0,
                 local_drain_tokens: 0,
                 local_drain_last_refill_ns: 0,
                 local_drain_rate_bytes: 0,
@@ -11526,6 +11607,8 @@ mod tests {
             queued_bytes: 1500,
             active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
+            local_fair_share_peak: 0,
+            local_fair_share_peak_deadline_ns: 0,
             local_drain_tokens: 0,
             local_drain_last_refill_ns: 0,
             local_drain_rate_bytes: 0,
@@ -11570,6 +11653,8 @@ mod tests {
             queued_bytes: 0,
             active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
+            local_fair_share_peak: 0,
+            local_fair_share_peak_deadline_ns: 0,
             local_drain_tokens: 0,
             local_drain_last_refill_ns: 0,
             local_drain_rate_bytes: 0,
@@ -11625,6 +11710,8 @@ mod tests {
             queued_bytes: 0,
             active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
+            local_fair_share_peak: 0,
+            local_fair_share_peak_deadline_ns: 0,
             local_drain_tokens: 0,
             local_drain_last_refill_ns: 0,
             local_drain_rate_bytes: 0,
@@ -13235,6 +13322,195 @@ mod tests {
              lease's active_flow_count — only shared_exact queues \
              (with shared_lease=Some) participate in cross-worker \
              DRR accounting",
+        );
+    }
+
+    /// #785 slice 2 Codex HIGH: peaks decay so flow churn doesn't
+    /// pin the rate-gate denominator at the lifetime max.
+    ///
+    /// Simulates the failure mode Codex flagged: a shared_exact
+    /// queue briefly sees 12 concurrent flows, then 11 of them
+    /// leave. Without decay, `lease.active_flow_count_peak()` stays
+    /// at 12 and the remaining flow gets 1/12 of the shaper rate
+    /// indefinitely. With decay, one window-boundary snap later the
+    /// peak drops to the live count (1) and the remaining flow gets
+    /// the full share.
+    ///
+    /// This test drives the production promotion + drain paths
+    /// directly so a future regression that silently re-pins the
+    /// peak (e.g. removing the snap in
+    /// `maybe_top_up_local_fair_share`) fails loudly here.
+    #[test]
+    fn fair_share_peaks_decay_when_flows_leave() {
+        use std::sync::Arc;
+
+        let lease = Arc::new(SharedCoSQueueLease::new(
+            25_000_000_000 / 8,
+            256 * 1024,
+            4,
+        ));
+        let mut runtime = test_cos_runtime_with_queues(
+            100_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: 25_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let fast_path = vec![WorkerCoSQueueFastPath {
+            shared_exact: true,
+            owner_worker_id: 0,
+            owner_live: None,
+            shared_queue_lease: Some(lease.clone()),
+        }];
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
+        let queue = &mut runtime.queues[0];
+
+        // Ramp: 12 flows arrive over the initial window.
+        let now_ns_start = 1_000_000_000u64;
+        for port in 33001..33013u16 {
+            let flow = test_session_key(5201, port);
+            account_cos_queue_flow_enqueue(queue, Some(&flow), 1500);
+        }
+        // Initial top-up arms the decay deadline.
+        maybe_top_up_local_fair_share(queue, now_ns_start);
+        assert_eq!(queue.local_fair_share_peak, 12);
+        assert_eq!(lease.active_flow_count_peak(), 12);
+
+        // 11 flows leave (their SFQ buckets drain to 0).
+        for port in 33001..33012u16 {
+            let flow = test_session_key(5201, port);
+            account_cos_queue_flow_dequeue(queue, Some(&flow), 1500);
+        }
+        // Live counts drop; peaks should NOT yet (within window).
+        assert_eq!(queue.active_flow_buckets, 1);
+        assert_eq!(lease.active_flow_count(), 1);
+        maybe_top_up_local_fair_share(queue, now_ns_start + 1_000_000);
+        assert_eq!(
+            queue.local_fair_share_peak, 12,
+            "within decay window the peak MUST stay at the observed \
+             max — otherwise flow-bucket oscillation on the one \
+             remaining flow would immediately drop it",
+        );
+        assert_eq!(
+            lease.active_flow_count_peak(),
+            12,
+            "shared peak must also be sticky within the window",
+        );
+
+        // Cross the decay window boundary.
+        let after_window = now_ns_start + COS_FAIR_SHARE_PEAK_WINDOW_NS + 1;
+        maybe_top_up_local_fair_share(queue, after_window);
+        assert_eq!(
+            queue.local_fair_share_peak, 1,
+            "#785 Codex HIGH: after decay window, local peak MUST \
+             snap to live active_flow_buckets (1). Regression here \
+             re-introduces the lifetime-pinned denominator that \
+             starves workers on flow churn.",
+        );
+        assert_eq!(
+            lease.active_flow_count_peak(),
+            1,
+            "#785 Codex HIGH: shared peak MUST snap too — otherwise \
+             one worker decays locally but the shared denominator \
+             stays pinned and the fair-share math is still stale.",
+        );
+    }
+
+    /// #785 slice 2 Codex MEDIUM: rate-source consistency — both
+    /// the drain-side gate (`maybe_top_up_local_fair_share`) and
+    /// the admission-side gate (`cos_flow_aware_buffer_limit`) must
+    /// derive off the SHARED LEASE rate on shared_exact queues,
+    /// not `queue.transmit_rate_bytes`. Regression: if admission
+    /// sees a smaller rate than drain, the queue under-buffers
+    /// relative to drain — packets drop instead of waiting.
+    ///
+    /// Construct a queue where `queue.transmit_rate_bytes` and
+    /// `lease.rate_bytes()` DIFFER (the same config shape that
+    /// surfaced the original bug: two forwarding classes with
+    /// different scheduler rates mapped to the same queue id). Pin
+    /// that `cos_flow_aware_buffer_limit`'s `delay_cap` scales off
+    /// the lease rate.
+    #[test]
+    fn buffer_limit_delay_cap_uses_lease_rate_on_shared_exact() {
+        use std::sync::Arc;
+
+        // lease rate != queue.transmit_rate_bytes by construction.
+        // Lease is the real shaper rate (25 Gbps); queue's
+        // transmit_rate_bytes is the scheduler rate for the
+        // (possibly-misconfigured) forwarding class this runtime
+        // instance ended up attached to (10 Gbps).
+        let lease_rate_bytes = 25_000_000_000u64 / 8;
+        let queue_scheduler_rate_bytes = 10_000_000_000u64 / 8;
+        let lease = Arc::new(SharedCoSQueueLease::new(
+            lease_rate_bytes,
+            256 * 1024,
+            4,
+        ));
+        let mut runtime = test_cos_runtime_with_queues(
+            100_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: queue_scheduler_rate_bytes,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let fast_path = vec![WorkerCoSQueueFastPath {
+            shared_exact: true,
+            owner_worker_id: 0,
+            owner_live: None,
+            shared_queue_lease: Some(lease.clone()),
+        }];
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
+        let queue = &mut runtime.queues[0];
+
+        // Seed 16 flows so `prospective_active` is stable at 16
+        // for the math below (avoids an off-by-one between the
+        // prospective-active helper and our expected computation).
+        let target = 0usize;
+        seed_sixteen_flow_buckets(queue, target, 1);
+
+        let got = cos_flow_aware_buffer_limit(queue, target);
+
+        // Expected delay_cap uses LEASE rate, NOT queue rate.
+        let lease_delay_cap = (lease_rate_bytes as u128
+            * COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS as u128
+            / 1_000_000_000u128) as u64;
+        let queue_delay_cap = (queue_scheduler_rate_bytes as u128
+            * COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS as u128
+            / 1_000_000_000u128) as u64;
+        assert!(
+            lease_delay_cap > queue_delay_cap,
+            "fixture must put lease and queue rates far enough \
+             apart that the delay caps differ; got lease={} \
+             queue={}",
+            lease_delay_cap,
+            queue_delay_cap,
+        );
+
+        let base = queue.buffer_bytes.max(COS_MIN_BURST_BYTES);
+        let prospective = cos_queue_prospective_active_flows(queue, target);
+        let floor = prospective.saturating_mul(COS_FLOW_FAIR_MIN_SHARE_BYTES);
+        let expected_if_lease = base.max(floor).min(lease_delay_cap.max(base));
+
+        assert_eq!(
+            got, expected_if_lease,
+            "#785 Codex MEDIUM: cos_flow_aware_buffer_limit must \
+             derive its delay_cap from the shared LEASE rate on \
+             shared_exact queues, not from the per-queue-runtime \
+             transmit_rate_bytes. Regression re-introduces the \
+             drain-vs-admission rate disagreement where drain sees \
+             the full shaper rate but admission under-buffers.",
         );
     }
 

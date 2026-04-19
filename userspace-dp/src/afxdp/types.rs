@@ -1005,14 +1005,38 @@ pub(super) struct CoSQueueRuntime {
     /// without resetting (Codex review: do NOT reset on
     /// snapshot, the doc here is the contract).
     pub(super) active_flow_buckets_peak: u16,
+    /// #785 slice 2: windowed peak of `active_flow_buckets` on this
+    /// worker used as the LOCAL input to the cross-worker fair-share
+    /// rate calculation. Kept SEPARATE from
+    /// `active_flow_buckets_peak` above because that field has a
+    /// "never reset during daemon lifetime" contract from #784
+    /// (operators inspect it to detect SFQ hash collisions).
+    /// Perturbing that semantics by adding a reset for the scheduler
+    /// would regress the diagnostic.
+    ///
+    /// Bumped on bucket 0→>0 transitions in lockstep with
+    /// `active_flow_buckets_peak`, so it captures the maximum live
+    /// flow count within the current window. Reset to the live
+    /// instantaneous `active_flow_buckets` value every
+    /// `COS_FAIR_SHARE_PEAK_WINDOW_NS` (currently 500 ms) in
+    /// `maybe_top_up_local_fair_share`. The reset is the decay
+    /// mechanism: on flow churn (HTTP short-lived TCP, L7LB
+    /// terminations) the peak stops pinning the rate gate's
+    /// denominator at a stale high-water mark, which would
+    /// progressively starve the worker as flows leave.
+    pub(super) local_fair_share_peak: u16,
+    /// Wall-time deadline for the next peak-reset. Absolute monotonic
+    /// nanoseconds. Compared against `now_ns` in
+    /// `maybe_top_up_local_fair_share`; when exceeded the peak snaps
+    /// to the live `active_flow_buckets` and the deadline advances
+    /// by another window.
+    pub(super) local_fair_share_peak_deadline_ns: u64,
     /// #785 cross-worker DRR: per-worker local token bucket that
-    /// enforces `fair_share_rate_bytes = queue.transmit_rate_bytes
-    /// × (local_flow_count / total_flow_count)` on the shared_exact
-    /// service path, where `local_flow_count` = `active_flow_buckets`
-    /// on this worker and `total_flow_count` comes from the shared
-    /// lease's atomic counter. Refilled on every drain attempt using
-    /// `local_drain_rate_bytes` (cached fair-share rate) and the
-    /// time elapsed since `local_drain_last_refill_ns`.
+    /// enforces `fair_share_rate_bytes = lease.rate_bytes()
+    /// × (local_fair_share_peak / lease.active_flow_count_peak())` on
+    /// the shared_exact service path. Refilled on every drain
+    /// attempt using `local_drain_rate_bytes` (cached fair-share
+    /// rate) and the time elapsed since `local_drain_last_refill_ns`.
     ///
     /// These fields are meaningful only on flow-fair shared_exact
     /// queues. On owner-local-exact queues the shared lease's
@@ -1518,14 +1542,35 @@ impl SharedCoSQueueLease {
         }
     }
 
-    /// Read the monotonically non-decreasing peak of observed
-    /// `active_flow_count`. Stable in steady state once all flows
-    /// have arrived on their respective workers; prefer this over
-    /// `active_flow_count()` when computing fair-share rates that
-    /// depend on a low-noise denominator.
+    /// Read the peak of observed `active_flow_count` within the
+    /// current decay window. Bumped on every `add_active_flow` via
+    /// the CAS loop, snapped down to the live instantaneous
+    /// `active_flow_count` by any worker that calls
+    /// `snap_peak_to_current` at a window boundary. Stable enough
+    /// to use as the rate-gate denominator on steady state; bounded
+    /// to the last-window max on flow churn.
     #[inline]
     pub(super) fn active_flow_count_peak(&self) -> u32 {
         self.active_flow_count_peak.load(Ordering::Relaxed)
+    }
+
+    /// Snap `active_flow_count_peak` down to the live
+    /// `active_flow_count`. Called by each worker at the boundary
+    /// of its own peak-decay window (one per
+    /// `COS_FAIR_SHARE_PEAK_WINDOW_NS`, currently 500 ms). Multiple
+    /// workers can snap concurrently; the store is lossy but the
+    /// next `add_active_flow` CAS-walks the peak back up to the
+    /// true max if it under-shot.
+    ///
+    /// Must NOT be called from any path that needs peak to be
+    /// monotonic across the daemon's lifetime — this is solely the
+    /// rate-gate's decay hook. The #784 per-worker diagnostic peak
+    /// `CoSQueueRuntime.active_flow_buckets_peak` has its own
+    /// "never reset" contract and a separate field.
+    #[inline]
+    pub(super) fn snap_peak_to_current(&self) {
+        let current = self.active_flow_count.load(Ordering::Relaxed);
+        self.active_flow_count_peak.store(current, Ordering::Relaxed);
     }
 
     /// Reverse of `add_active_flow`. Uses `saturating_sub` via
