@@ -10,7 +10,7 @@ cherry-pick, revert — runs through the same five checks in the same order.
 Forwarding-path changes that look safe on other test beds (virtio on a
 Debian-stable kernel, for example) have broken on this cluster in ways
 that show up only under live traffic. A checked-in runbook that names
-the four things that actually distinguish "healthy" from "silently
+the five things that actually distinguish "healthy" from "silently
 broken" means:
 
 - a deploy regression is caught in under a minute, not after the
@@ -123,19 +123,29 @@ sg incus-admin -c "incus exec loss:xpf-userspace-fw0 -- journalctl -u xpfd --sin
   | grep -iE 'error|fail|warn|DBG SEG_MISS|connection refused|key too big'
 ```
 
-**Pass**: empty or only VRF-rebind / neighbor-resolution INFO lines.
+**Pass**: the grep returns nothing. Any matching line in a 30-second
+window immediately after a deploy is a fail signal.
 
-**Fail indicators**:
+**Fail indicators** (what the grep output will look like for each):
+
 - `DBG SEG_MISS[N]: ...` printed repeatedly — the Rust helper is
-  hitting a segmentation-fallback path. This was the fingerprint of
-  the #767 regression on mlx5.
+  hitting a segmentation-fallback path. This was the observed
+  fingerprint of the #767 regression on mlx5 (many lines per second).
+  A single isolated line over 90 s is an edge case, not a regression.
 - `ha watchdog write failed ... connection refused` looping — the
   helper died and isn't being restarted.
-- `failed to compile dataplane` — the compile-time fault path from
-  #758 (post-#766 /health should also return 503 in this case; spot
-  check via `curl -fsS http://127.0.0.1:8080/health` if available).
+- `failed to compile dataplane` — the compile-time fault path
+  addressed by #758. The /health endpoint should also return 503 in
+  this case (see PR #766 for the wiring); spot-check via
+  `curl -fsS http://127.0.0.1:8080/health` if the HTTP listener is
+  bound.
 - `userspace dataplane status sync failed ... key too big for map`
   — the original #756 BPF-map-cap crash reappearing.
+
+If you want to see the INFO lines you'd expect in a clean run (VRF
+bind, neighbor resolution, cluster sync sweep), drop the grep and
+read the journal directly. The grep exists to turn "clean" into a
+fast empty-output signal.
 
 ### 5. CoS counter health
 
@@ -175,10 +185,11 @@ verification and triggers Rollback before further investigation.
 
 ## Rollback
 
-The last known-good build for this cluster is `e8e7533a` (pre-#759
-master + #768 ECN tune applied on top). Keep a locally-built binary
-from that tag handy during any risky deploy. Rebuild from source
-is ~30 seconds:
+The last pristine known-good reference for this cluster is
+`e8e7533a`. It is pre-#768 (the ECN threshold tune), but it forwards
+cleanly on mlx5 and is the state the cluster ran for months — a
+valid rollback target when the alternative is "broken." Rebuild
+from source is ~30 seconds:
 
 ```bash
 git checkout e8e7533a -- .
@@ -186,6 +197,18 @@ make build
 make build-userspace-dp
 BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
   ./test/incus/cluster-setup.sh deploy all
+```
+
+If you need #768's ECN tune included — i.e. you want the exact
+behaviour we validated this runbook against — cherry-pick the #768
+merge on top of `e8e7533a` before building:
+
+```bash
+git checkout e8e7533a
+git cherry-pick 0d339eb0  # #768 ECN tune merge commit
+make build
+make build-userspace-dp
+# ...deploy as above
 ```
 
 Re-apply CoS config after rollback deploys too — same as the
@@ -196,8 +219,12 @@ can wait until after the regression is diagnosed.
 
 ## References
 
-- #767 — the regression that motivated this runbook; mlx5 + kernel
-  7.0.0-rc7 incompatibility with #759's DEVMAP_HASH conversion.
+- #767 — the regression that motivated this runbook. The bisect
+  in that issue's fix PR pinned the change to #759's `tx_ports`
+  DEVMAP_HASH conversion specifically. The underlying mechanism —
+  why that one map type interacts badly with mlx5 native XDP on
+  kernel 7.0.0-rc7 — is consistent with the symptoms but has not
+  been source-verified against the driver.
 - #756, #759 — the fix that introduced the #767 regression; context
   for why future deploys need this check.
 - #754, #768 — the ECN threshold tune whose effect is measured by
