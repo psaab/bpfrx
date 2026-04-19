@@ -436,7 +436,7 @@ system {
         control-socket /run/xpf/userspace-dp.sock;
         state-file /run/xpf/userspace-dp.json;
         workers 6;
-        ring-entries 8192;
+        ring-entries 16384;
     }
 }
 ```
@@ -451,9 +451,40 @@ system {
 
 **Tuning guidelines:**
 - Set `workers` to match NIC RSS queue count (`ethtool -L <dev> combined N`)
-- Set `ring-entries` to 8192 for high throughput (uses ~50MB UMEM per binding)
+- Set `ring-entries` to 16384 for ≥20 Gbps throughput.
+  UMEM cost per binding at ring=16384:
+    - mlx5 / native XDP: `reserved_tx (min(ring/2, 8192)) + 2 × ring_entries` = `8192 + 32768 = 40960 frames × 4 KB = 160 MB per binding`
+    - virtio_net: `ring_entries + 2 × ring_entries` = `3 × 16384 × 4 KB = 192 MB per binding`
+  `binding_frame_count_for_driver` in `userspace-dp/src/afxdp/bind.rs` is authoritative.
+  At 8192, `iperf3 -P 12 @ 25 Gbps` sees 92-170K retrans/30s and median 16.9 Gbps due
+  to kernel-side TX ring fill stalls (`ethtool -S` shows `tx_xsk_full` accumulating).
+  Raising to 16384 dropped retrans to 0-1900/30s and lifted the median to 21.5 Gbps
+  on the loss:xpf-userspace-fw test cluster (#774). **DO NOT raise to 32768** —
+  measurement on the same workload showed regression to 11-18 Gbps with 17-37K retrans,
+  likely TLB pressure + excess UMEM memset at bind.
+- **Hugepages (REQUIRED for ring ≥ 16384)**: UMEM mapping tries `MAP_HUGETLB` (2 MB
+  pages) first, falls back to `MADV_HUGEPAGE` (advisory, kernel may or may not promote).
+  At ring=16384 × 4 KB pages = 40960 TLB entries per binding × 6 bindings = 245K TLB
+  entries — that's larger than a typical CPU's TLB can hold, and throughput will stall
+  in TLB-miss latency. With 2 MB hugepages the same UMEM needs ~480 TLB entries,
+  fitting comfortably in the iTLB/dTLB.
+
+  **Reserve via `/etc/sysctl.d/99-xpf-hugepages.conf`:**
+  ```
+  vm.nr_hugepages = 600
+  ```
+  Apply with `sysctl --system` (or reboot). 600 × 2 MiB = 1.2 GiB covers one NIC's
+  UMEM at ring=16384. Verify with `grep HugePages_ /proc/meminfo` — `HugePages_Total`
+  must be ≥ 560 before xpfd starts, else `MAP_HUGETLB` will fail silently and the
+  daemon will fall back to THP which is not guaranteed to promote all pages.
+
+  **Measurement on loss:xpf-userspace-fw0 (8 GiB VM, kernel 7.0.0-rc7, mlx5 ConnectX):**
+    - ring=8192 (no hugepages needed): median 16.9 Gbps, stddev 1.7
+    - ring=16384 without hugepages: median 20.4 Gbps, stddev 1.7
+    - ring=16384 with 600 hugepages: **median 22.1 Gbps, stddev 1.5** ← campaign target
 - Ensure VM has enough vCPUs: workers + 2 (daemon + kernel headroom)
-- Ensure VM has enough RAM: workers × bindings × 50MB + 2GB base
+- Ensure VM has enough RAM: `workers × bindings × 160 MB + 2 GB` base (at 16384 ring,
+  mlx5 driver; 192 MB for virtio_net)
 
 ## Limitations
 
