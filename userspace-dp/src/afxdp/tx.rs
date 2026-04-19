@@ -4432,6 +4432,7 @@ fn cos_queue_accepts_prepared(root: &CoSInterfaceRuntime, requested_queue: Optio
     queue.local_item_count == 0
 }
 
+#[inline]
 fn ensure_cos_interface_runtime(
     binding: &mut BindingWorker,
     forwarding: &ForwardingState,
@@ -4441,13 +4442,22 @@ fn ensure_cos_interface_runtime(
     if egress_ifindex <= 0 {
         return false;
     }
+    // #774 fast path: if the runtime is already materialised,
+    // that's the dominant case on steady state. A single
+    // `contains_key` on the cos_interfaces hot map skips the two
+    // forwarding.cos.interfaces + cos_fast_interfaces lookups
+    // and the later-pass duplicate. Profiled at 0.9% CPU before
+    // this fix.
+    if binding.cos_interfaces.contains_key(&egress_ifindex) {
+        return true;
+    }
     let Some(config) = forwarding.cos.interfaces.get(&egress_ifindex) else {
         return false;
     };
     if !binding.cos_fast_interfaces.contains_key(&egress_ifindex) {
         return false;
     }
-    if !binding.cos_interfaces.contains_key(&egress_ifindex) {
+    {
         let mut runtime = build_cos_interface_runtime(config, now_ns);
         if let Some(iface_fast) = binding.cos_fast_interfaces.get(&egress_ifindex) {
             for (queue, queue_fast) in runtime.queues.iter_mut().zip(&iface_fast.queue_fast_path) {
