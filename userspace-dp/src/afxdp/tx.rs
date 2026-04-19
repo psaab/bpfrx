@@ -11114,8 +11114,9 @@ mod tests {
         let target = 0usize;
 
         // Put the target bucket well below the per-flow threshold
-        // (12 000 bytes) but drive the aggregate above 192 000.
-        let target_bucket_bytes = 500; // < 12 000
+        // (8 000 bytes at NUM/DEN = 1/3) but drive the aggregate
+        // above 128 000.
+        let target_bucket_bytes = 500; // < 8 000
         let _ = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
         let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
         let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
@@ -11154,9 +11155,9 @@ mod tests {
         let queue = &mut root.queues[0];
         let target = 0usize;
 
-        let target_bucket_bytes = 500; // < 12 000
+        let target_bucket_bytes = 500; // < 8 000 (per-flow threshold at NUM/DEN = 1/3)
         let queued_bytes = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
-        queue.queued_bytes = queued_bytes; // ≪ 192 000
+        queue.queued_bytes = queued_bytes; // ≪ 128 000 (aggregate threshold at 1/3)
         let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
         let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
         let aggregate_ecn_threshold =
@@ -11204,7 +11205,7 @@ mod tests {
         let queue = &mut root.queues[0];
         let target = 0usize;
 
-        let target_bucket_bytes = 15_000; // > 12 000 per-flow threshold
+        let target_bucket_bytes = 15_000; // > 8 000 per-flow threshold (NUM/DEN = 1/3)
         let queued_bytes = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
         queue.queued_bytes = queued_bytes;
         let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
