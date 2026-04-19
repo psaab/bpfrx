@@ -1198,6 +1198,24 @@ pub(super) struct SharedCoSQueueLease {
     /// bucket transition, so brief staleness between workers just
     /// delays convergence by one packet-scale interval.
     active_flow_count: AtomicU32,
+    /// #785 slice 2: monotonically non-decreasing peak of
+    /// `active_flow_count` observed by any worker. Used by the
+    /// per-worker fair-share rate gate to stabilise the division
+    /// denominator — `active_flow_count` oscillates rapidly in
+    /// steady state because SFQ bucket transitions fire on every
+    /// `bucket_bytes == 0` moment (between packets), producing
+    /// transient dips in the count that would over-rate individual
+    /// workers. Reading the peak instead gives an upper bound on
+    /// the true flow count that converges within ~1 ms of a new
+    /// flow arriving.
+    ///
+    /// Trade-off: on dynamic workloads where flows come and go, the
+    /// peak never decays, so a worker's fair share stays under-rated
+    /// after flows leave. Acceptable for the steady-state throughput
+    /// tests that motivate #785; a follow-up slice can add a slow
+    /// decay (e.g. reset to current count on a 1 s timer) if
+    /// dynamic workloads become important.
+    active_flow_count_peak: AtomicU32,
 }
 
 pub(super) struct SharedCoSRootLease {
@@ -1430,6 +1448,7 @@ impl SharedCoSQueueLease {
                 last_refill_ns: AtomicU64::new(0),
             },
             active_flow_count: AtomicU32::new(0),
+            active_flow_count_peak: AtomicU32::new(0),
         }
     }
 
@@ -1477,9 +1496,36 @@ impl SharedCoSQueueLease {
     /// (>0 bytes). Relaxed ordering is fine: the counter is
     /// advisory input to `fair_share_rate_bytes`, not a
     /// synchronisation point.
+    ///
+    /// Bumps `active_flow_count_peak` via a compare-and-swap loop
+    /// so the peak monotonically tracks the live maximum — used by
+    /// the rate gate to stabilise the division denominator against
+    /// SFQ bucket-churn.
     #[inline]
     pub(super) fn add_active_flow(&self) {
-        self.active_flow_count.fetch_add(1, Ordering::Relaxed);
+        let new = self.active_flow_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut peak = self.active_flow_count_peak.load(Ordering::Relaxed);
+        while new > peak {
+            match self.active_flow_count_peak.compare_exchange_weak(
+                peak,
+                new,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => peak = observed,
+            }
+        }
+    }
+
+    /// Read the monotonically non-decreasing peak of observed
+    /// `active_flow_count`. Stable in steady state once all flows
+    /// have arrived on their respective workers; prefer this over
+    /// `active_flow_count()` when computing fair-share rates that
+    /// depend on a low-noise denominator.
+    #[inline]
+    pub(super) fn active_flow_count_peak(&self) -> u32 {
+        self.active_flow_count_peak.load(Ordering::Relaxed)
     }
 
     /// Reverse of `add_active_flow`. Uses `saturating_sub` via

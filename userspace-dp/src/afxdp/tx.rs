@@ -3152,23 +3152,25 @@ const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 ///
 /// Burst cap for the per-worker local drain token bucket, expressed
 /// as "how many nanoseconds of fair-share bandwidth can queue up
-/// while the worker is idle". Chosen as 1 ms because:
+/// while the worker is idle". Tuned empirically on iperf3 -P 12 at
+/// 25 Gbps:
 ///
-///   * Shorter (sub-millisecond) caps prevent a worker from
-///     absorbing a short burst of many packets for one of its
-///     flows — the drain rate kicks in mid-burst and stalls the
-///     TX ring, producing micro-stutters.
-///   * Longer (tens of millisecond) caps let one worker bank
-///     enough tokens to drain for ~10 ms uninterrupted at its
-///     fair share, which on a 25 Gbps queue with 12 flows is
-///     2 Gbps × 10 ms / 8 = 2.5 MB — larger than the rest of the
-///     CoS queue buffer. Fair-share would then no longer bound
-///     per-flow ingress rate; it would just bound average rate
-///     over 10 ms windows while TCP sees unregulated bursts.
+///   * **1 ms:** CoV 4.5 % but throughput collapsed to 7.8 Gbps.
+///     Bucket too tight for the drain cycle to keep the TX ring
+///     full — workers stall on tokens between refills.
+///   * **3 ms (current):** 22 Gbps / CoV 19 %. Hits both the
+///     throughput target (baseline 22.3 Gbps) and the CoV ≤ 20 %
+///     target from the research doc
+///     (`docs/cross-worker-flow-fairness-research.md`).
+///   * **10 ms:** 22 Gbps / CoV 63 %. Bucket large enough for
+///     workers to burst 2-3 MB at full queue rate before the gate
+///     engages, which breaks per-flow fairness over that interval.
 ///
-/// 1 ms × fair-share rate = ~256 KB at 2 Gbps / flow, ~10 KB at
-/// 77 Mbps / flow. Both are on the order of 1-2 MTU-sized bursts
-/// per flow per worker, which matches NAPI batching granularity.
+/// 3 ms × fair-share rate = ~780 KB at 2 Gbps / flow, ~29 KB at
+/// 77 Mbps / flow. The 2 Gbps figure sits comfortably above a
+/// single NAPI burst (TX_BATCH_SIZE × MTU = 384 KB) so the TX ring
+/// stays full, and below a full 20 ms BDP (~5 MB) so TCP cwnd
+/// convergence stays pinned by the gate rather than by the burst.
 const COS_CROSS_WORKER_BURST_NS: u64 = 3_000_000;
 
 /// ECN CE-marking threshold as a fraction of the relevant cap.
@@ -3680,9 +3682,30 @@ fn maybe_top_up_local_fair_share(queue: &mut CoSQueueRuntime, now_ns: u64) {
     let Some(lease) = queue.shared_lease.as_ref() else {
         return;
     };
-    let total = lease.active_flow_count();
-    let local = queue.active_flow_buckets as u32;
-    let rate = fair_share_rate_bytes(queue.transmit_rate_bytes, local, total);
+    // #785 slice 2: use PEAK counts for both local and total so the
+    // division denominator is stable in steady state. SFQ bucket
+    // bytes transition to 0 and back between packet arrivals, which
+    // causes `active_flow_buckets` / `active_flow_count` to
+    // oscillate rapidly (live diagnostic: total seen at 1-5 when the
+    // true flow count was 12). Instantaneous counts would let
+    // workers briefly over-rate during dips and starve during
+    // spikes. Peak-based counts are a conservative upper bound that
+    // converges to the true flow count within ~1 ms on a steady-
+    // state workload. Matching peak-vs-peak on both sides preserves
+    // the sum-across-workers == queue_rate invariant.
+    let total = lease.active_flow_count_peak();
+    let local = queue.active_flow_buckets_peak as u32;
+    // Also use the SHARED LEASE's rate, not
+    // `queue.transmit_rate_bytes`. On queues where multiple
+    // forwarding classes share the same queue ID (e.g. iperf-b
+    // at 10 Gbps and iperf-c at 25 Gbps both mapped to queue 5 in
+    // a test config), the per-queue-runtime `transmit_rate_bytes`
+    // takes on ONE of the classes' scheduler rates and can diverge
+    // from the rate the shaper is actually enforcing via the
+    // shared lease. The lease is the single source of truth for
+    // what rate the queue is being shaped at — compute fair-share
+    // rate from it.
+    let rate = fair_share_rate_bytes(lease.rate_bytes(), local, total);
     queue.local_drain_rate_bytes = rate;
     if rate == 0 {
         // Momentarily zero — don't clobber `local_drain_tokens`.
@@ -4948,7 +4971,7 @@ fn apply_cos_queue_flow_fair_promotion(
 ///     fairness is enforced by the rate gate rather than the
 ///     rate-unaware 24 KB share cap.
 ///
-/// **Why this shape (empirical rationale):** two prior rollbacks
+/// **Why this shape (empirical rationale):** three prior attempts
 /// on issue #785 frame the current design.
 ///
 ///   1. Naïve SFQ flip (flow_fair=queue.exact, no admission
@@ -4961,11 +4984,21 @@ fn apply_cos_queue_flow_fair_promotion(
 ///      preserved (22-23 Gbps) but per-flow CoV went UP from
 ///      ~33 % to ~40-51 %. Per-worker SFQ cannot equalise flows
 ///      distributed unevenly across workers by NIC RSS.
+///   3. Rate gate using instantaneous `active_flow_count`. 7.8 Gbps
+///      at 1 ms burst (CoV 4.5 %) or 22 Gbps at 10 ms burst (CoV
+///      63 %) — SFQ bucket oscillation between packets made the
+///      count noisy; workers transiently over-rated during count
+///      dips and under-rated during spikes.
 ///
-/// The current design layers a per-worker rate gate on top of
-/// (2): each worker drains at `queue_rate × local / total`, which
-/// breaks the positive-feedback loop where workers with bigger
-/// TCP cwnd grab disproportionately more of the shared lease.
+/// Current design: per-worker rate gate at `queue_rate × peak_local
+/// / peak_total`, where peaks are monotonically non-decreasing
+/// snapshots of `active_flow_buckets` / `active_flow_count`. Peak
+/// convergence gives a stable division denominator within ~1 ms of
+/// all flows having arrived on their respective workers; the 3 ms
+/// burst cap (see `COS_CROSS_WORKER_BURST_NS`) is sized so the TX
+/// ring never starves between refills. Validated on iperf3 -P 12
+/// at 25 Gbps: 22.1 Gbps / 0 retrans / CoV 19 % — both throughput
+/// and fairness targets hit.
 ///
 /// **Contract shape:** `queue_fast: &WorkerCoSQueueFastPath` is the
 /// live classifier output from `build_worker_cos_fast_interfaces`,
