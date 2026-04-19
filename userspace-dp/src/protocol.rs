@@ -821,6 +821,13 @@ pub(crate) struct CoSQueueStatus {
     pub next_wakeup_tick: u64,
     #[serde(rename = "surplus_deficit_bytes", default)]
     pub surplus_deficit_bytes: u64,
+    /// #784 SFQ fairness diagnostic. Peak count of distinct
+    /// active flow buckets observed on this queue since the last
+    /// snapshot. Compare against iperf3 `-P N` count: if a flow-
+    /// fair queue serving N flows shows peak < N, hash collisions
+    /// are shrinking SFQ shares and forcing unfair rates.
+    #[serde(rename = "active_flow_buckets_peak", default)]
+    pub active_flow_buckets_peak: u64,
     // #710 drop-reason counters, aggregated across worker instances for
     // this (ifindex, queue_id). `parks` are not drops — the queue is
     // only deferred until its root/queue token bucket refills — but

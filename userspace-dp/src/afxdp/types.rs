@@ -980,6 +980,13 @@ pub(super) struct CoSQueueRuntime {
     pub(super) last_refill_ns: u64,
     pub(super) queued_bytes: u64,
     pub(super) active_flow_buckets: u16,
+    /// #784 diagnostic: peak `active_flow_buckets` seen since the
+    /// last snapshot. Lets operators detect SFQ hash-collision
+    /// regressions empirically — at steady state an iperf3 -P N
+    /// workload should show `active_flow_buckets_peak >= N` if
+    /// the hash is spreading correctly. Owner-only writes; reset
+    /// to the current value on snapshot read.
+    pub(super) active_flow_buckets_peak: u16,
     pub(super) flow_bucket_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
     pub(super) flow_rr_buckets: FlowRrRing,
     pub(super) flow_bucket_items: [VecDeque<CoSPendingTxItem>; COS_FLOW_FAIR_BUCKETS],

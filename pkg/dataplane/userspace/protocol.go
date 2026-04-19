@@ -482,6 +482,7 @@ type CoSQueueStatus struct {
 	// bucketed (see Rust `bucket_index_for_ns`): index 0 is < 1 µs,
 	// index N >= 1 is [2^(N+9), 2^(N+10)) ns, index 15 saturates at
 	// >= 2^24 ns (~16 ms).
+	ActiveFlowBucketsPeak uint64   `json:"active_flow_buckets_peak,omitempty"`
 	DrainLatencyHist     []uint64 `json:"drain_latency_hist,omitempty"`
 	DrainInvocations     uint64   `json:"drain_invocations,omitempty"`
 	DrainNoopInvocations uint64   `json:"drain_noop_invocations,omitempty"`

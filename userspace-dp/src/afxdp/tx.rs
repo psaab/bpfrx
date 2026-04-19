@@ -3748,6 +3748,12 @@ fn account_cos_queue_flow_enqueue(
     let bucket = cos_flow_bucket_index(queue.flow_hash_seed, flow_key);
     if queue.flow_bucket_bytes[bucket] == 0 {
         queue.active_flow_buckets = queue.active_flow_buckets.saturating_add(1);
+        // #784 diagnostic: track the peak distinct-flow count.
+        // Operators can compare this to the test's -P N count to
+        // detect SFQ hash collisions under real workloads.
+        if queue.active_flow_buckets > queue.active_flow_buckets_peak {
+            queue.active_flow_buckets_peak = queue.active_flow_buckets;
+        }
     }
     queue.flow_bucket_bytes[bucket] = queue.flow_bucket_bytes[bucket].saturating_add(item_len);
 }
@@ -4663,6 +4669,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 last_refill_ns: if queue.exact { 0 } else { now_ns },
                 queued_bytes: 0,
                 active_flow_buckets: 0,
+            active_flow_buckets_peak: 0,
                 flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                 flow_rr_buckets: FlowRrRing::default(),
                 flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -9964,6 +9971,98 @@ mod tests {
         }
     }
 
+    /// #784 regression pin: narrow-input flow distribution.
+    ///
+    /// The iperf3-style workload hits an SFQ bucket collision
+    /// cliff that the mixed-v4/v6 distribution test above misses:
+    /// 12 flows to the same (src_ip, dst_ip, dst_port, proto,
+    /// addr_family) differing only in src_port (consecutive
+    /// ephemeral range, all v4 TCP). Real-world iperf3 reports
+    /// 3 flows at ~145 Mbps with 0 retrans and 9 flows at
+    /// ~60 Mbps with thousands of retrans each — caused by
+    /// multiple flows landing on the same SFQ bucket and having
+    /// their flow_share caps shrunk (each bucket's share = total
+    /// buffer / prospective_active_flows, halved/thirded if a
+    /// bucket holds 2-3 flows).
+    ///
+    /// Budget: for 12 narrow-input flows in 1024 buckets under a
+    /// good hash, E[colliding pairs] ≈ 12*11/(2*1024) ≈ 0.06 —
+    /// essentially always 12 distinct buckets. Under the prior
+    /// boost-style hash_combine, narrow inputs observably collapse
+    /// to 3-6 distinct buckets across most seeds. Demand >=11
+    /// distinct buckets (allowing one pair collision worst-case
+    /// under uniform null).
+    ///
+    /// Adversarial review posture: if this test ever weakens to
+    /// accept fewer distinct buckets, or drops the all-v4 shape,
+    /// the iperf3 fairness regression WILL return silently.
+    #[test]
+    fn exact_cos_flow_bucket_distribution_narrow_inputs_all_v4() {
+        use std::collections::BTreeSet;
+
+        // Production-like ephemeral port range. Linux kernel's
+        // default ephemeral range is 32768-60999; 12 consecutive
+        // ports starting at 39754 matches the actual iperf3
+        // capture that motivated this test.
+        let ports: Vec<u16> = (39754..39754 + 12).collect();
+        // Test multiple seeds so a hash-mix fix cannot pass by
+        // accident on a lucky seed. Including 0 pins the
+        // pre-flow-fair default.
+        let seeds: [u64; 5] = [
+            0,
+            0xA5A5_0000_C3C3_FFFF,
+            0x0123_4567_89AB_CDEF,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0xDEAD_BEEF_CAFE_BABE,
+        ];
+        for &seed in &seeds {
+            let mut buckets = BTreeSet::new();
+            for port in &ports {
+                let flow = test_session_key(*port, 5201);
+                // Explicitly v4 TCP — no mixed-family shortcut.
+                assert_eq!(flow.addr_family, libc::AF_INET as u8);
+                buckets.insert(cos_flow_bucket_index(seed, Some(&flow)));
+            }
+            assert!(
+                buckets.len() >= 11,
+                "seed={:#x}: 12 all-v4 iperf3-style flows landed in only {} distinct \
+                 buckets — SFQ fairness regression. This is the flow-spread bug from #784; \
+                 if this fires, the hash function is not spreading narrow-variance inputs \
+                 (identical src_ip/dst_ip/dst_port/proto/family, only src_port differs).",
+                seed,
+                buckets.len()
+            );
+        }
+    }
+
+    /// #784 companion: also pin the wider 12-flow case with
+    /// non-consecutive src_ports (simulating a different
+    /// ephemeral-port allocator or long-running connections
+    /// from different source processes).
+    #[test]
+    fn exact_cos_flow_bucket_distribution_narrow_inputs_scattered_ports() {
+        use std::collections::BTreeSet;
+        // 12 src_ports scattered across the ephemeral range.
+        let ports: [u16; 12] = [
+            33000, 35719, 38112, 41003, 43517, 46281, 48907, 51214, 53841, 56118, 58792, 60999,
+        ];
+        let seeds: [u64; 3] = [0, 0xA5A5_0000_C3C3_FFFF, 0x0123_4567_89AB_CDEF];
+        for &seed in &seeds {
+            let mut buckets = BTreeSet::new();
+            for port in &ports {
+                let flow = test_session_key(*port, 5201);
+                buckets.insert(cos_flow_bucket_index(seed, Some(&flow)));
+            }
+            assert!(
+                buckets.len() >= 11,
+                "seed={:#x}: 12 scattered all-v4 flows landed in only {} distinct \
+                 buckets — SFQ hash regression on non-consecutive src_ports",
+                seed,
+                buckets.len()
+            );
+        }
+    }
+
     #[test]
     fn build_cos_interface_runtime_leaves_flow_hash_seed_zero_until_promotion() {
         // The seed is drawn in `ensure_cos_interface_runtime`, not in
@@ -10895,6 +10994,7 @@ mod tests {
             last_refill_ns: 0,
             queued_bytes: 1500,
             active_flow_buckets: 0,
+            active_flow_buckets_peak: 0,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -10933,6 +11033,7 @@ mod tests {
             last_refill_ns: 0,
             queued_bytes: 0,
             active_flow_buckets: 0,
+            active_flow_buckets_peak: 0,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -10982,6 +11083,7 @@ mod tests {
             last_refill_ns: 0,
             queued_bytes: 0,
             active_flow_buckets: 0,
+            active_flow_buckets_peak: 0,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
