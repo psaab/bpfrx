@@ -961,6 +961,17 @@ pub(super) struct CoSQueueRuntime {
     pub(super) transmit_rate_bytes: u64,
     pub(super) exact: bool,
     pub(super) flow_fair: bool,
+    /// #785: cached shadow of `WorkerCoSQueueFastPath.shared_exact`
+    /// populated by `promote_cos_queue_flow_fair`. When `true`, the
+    /// admission hot path skips the per-flow share cap (which is
+    /// rate-unaware and starved high-rate TCP flows at 25 Gbps) and
+    /// the per-flow ECN arm; SFQ DRR ordering still runs.
+    ///
+    /// Keeping the field on the queue runtime avoids an iface_fast
+    /// lookup in `cos_queue_flow_share_limit` /
+    /// `apply_cos_admission_ecn_policy`, both called on every
+    /// admission decision.
+    pub(super) shared_exact: bool,
     // Per-queue hash salt mixed into `exact_cos_flow_bucket()` so the SFQ
     // bucket mapping is not an externally-probeable pure function of the
     // 5-tuple. Drawn from getrandom(2) exactly when a queue is promoted
