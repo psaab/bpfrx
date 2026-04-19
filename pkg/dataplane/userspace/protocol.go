@@ -483,6 +483,7 @@ type CoSQueueStatus struct {
 	// index N >= 1 is [2^(N+9), 2^(N+10)) ns, index 15 saturates at
 	// >= 2^24 ns (~16 ms).
 	ActiveFlowBucketsPeak uint64   `json:"active_flow_buckets_peak,omitempty"`
+	FlowFair              bool     `json:"flow_fair,omitempty"`
 	DrainLatencyHist     []uint64 `json:"drain_latency_hist,omitempty"`
 	DrainInvocations     uint64   `json:"drain_invocations,omitempty"`
 	DrainNoopInvocations uint64   `json:"drain_noop_invocations,omitempty"`

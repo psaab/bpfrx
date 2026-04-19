@@ -2004,6 +2004,11 @@ where
                 if peak > status.active_flow_buckets_peak {
                     status.active_flow_buckets_peak = peak;
                 }
+                // #784: surface flow_fair so we can detect queues
+                // that were expected to run SFQ but aren't.
+                if queue.flow_fair {
+                    status.flow_fair = true;
+                }
                 // #710: aggregate drop-reason counters across worker
                 // instances for this queue. Each worker's per-queue
                 // runtime is single-writer (only the owner worker
