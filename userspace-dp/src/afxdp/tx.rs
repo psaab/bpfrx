@@ -3356,24 +3356,57 @@ fn apply_cos_admission_ecn_policy(
     item: &mut CoSPendingTxItem,
     umem: &MmapArea,
 ) -> bool {
-    // Integer division by the compile-time-asserted nonzero
-    // `COS_ECN_MARK_THRESHOLD_DEN` is one saturating_mul + one divide
-    // on the hot path for each of the two thresholds.
+    // #784: ECN mark policy differs by queue kind:
+    //
+    // - **Flow-fair queues** (SFQ active): mark ONLY on the
+    //   per-flow threshold. An aggregate-queue mark penalises
+    //   every flow that happens to enqueue during a
+    //   high-aggregate window — regardless of whether THAT flow
+    //   is contributing to the congestion. With N flows actively
+    //   sharing a queue at its rate cap, the aggregate sits above
+    //   1/3 the buffer almost permanently, so the aggregate clause
+    //   used to mark effectively every packet. The per-flow cwnd
+    //   collapse from the marks concentrated on flows that hadn't
+    //   yet filled their bucket (because their current cwnd was
+    //   smaller) — a positive feedback loop producing the observed
+    //   3-winner / 9-loser bimodal rate distribution on
+    //   iperf3 -P 12 to a 1 Gbps cap.
+    //
+    // - **Non-flow-fair queues**: the aggregate IS the right
+    //   signal — there's no per-flow isolation, so aggregate
+    //   saturation is the only congestion indicator available.
+    //
+    // Adversarial review posture (required by campaign #775 /
+    // issue #784): if the flow_fair branch ever grows back to
+    // include the aggregate queued_bytes check, the fairness
+    // regression observed in #784 (iperf3 -P 12 returning 3
+    // flows at 145 Mbps with 0 retrans and 9 flows at 50-75 Mbps
+    // with thousands of retrans) WILL come back.
+    //
+    // #722: per-flow threshold derived from the same share cap
+    // the admission gate uses. `cos_queue_flow_share_limit` is
+    // pure and inlined (saturating_add + max + div_ceil + clamp),
+    // ~5 ns.
     let aggregate_ecn_threshold = buffer_limit
         .saturating_mul(COS_ECN_MARK_THRESHOLD_NUM)
         / COS_ECN_MARK_THRESHOLD_DEN.max(1);
-    // #722: per-flow threshold derived from the same share cap the
-    // admission gate uses. `cos_queue_flow_share_limit` is pure and
-    // inlined (saturating_add + max + div_ceil + clamp), ~5 ns.
     let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, flow_bucket);
     let flow_ecn_threshold = share_cap
         .saturating_mul(COS_ECN_MARK_THRESHOLD_NUM)
         / COS_ECN_MARK_THRESHOLD_DEN.max(1);
 
-    let aggregate_above = queue.queued_bytes > aggregate_ecn_threshold;
     let flow_above = queue.flow_bucket_bytes[flow_bucket] > flow_ecn_threshold;
+    let aggregate_above = queue.queued_bytes > aggregate_ecn_threshold;
+    // flow_fair queue: only per-flow threshold triggers marks.
+    // non-flow-fair queue: use the aggregate as before
+    // (flow_bucket_bytes is unused on non-flow-fair queues).
+    let should_mark = if queue.flow_fair {
+        flow_above
+    } else {
+        aggregate_above
+    };
 
-    if (!aggregate_above && !flow_above) || flow_share_exceeded || buffer_exceeded {
+    if !should_mark || flow_share_exceeded || buffer_exceeded {
         return false;
     }
     // Both variants share a single `admission_ecn_marked` counter: the
@@ -11981,21 +12014,24 @@ mod tests {
         }
     }
 
+    /// #784: SFQ fairness regression pin. The former behavior of
+    /// the aggregate-above ECN arm actively broke per-flow fairness
+    /// on iperf3 -P 12 against a 1 Gbps cap (3 winners at 145 Mbps
+    /// with 0 retrans, 9 losers at 50-75 Mbps with thousands of
+    /// retrans each). Removing the aggregate arm restored fairness
+    /// because flows that hadn't filled their bucket no longer got
+    /// penalised for OTHER flows' bursts.
+    ///
+    /// If this test ever flips to assert `marked` is true, the
+    /// aggregate arm has been reintroduced and the iperf3 fairness
+    /// regression in #784 WILL come back. Do not weaken this test.
     #[test]
-    fn admission_ecn_marks_when_aggregate_above_threshold_per_flow_below() {
-        // Preserve the original #718 arm: if the aggregate queue is
-        // above its threshold while the target flow's bucket is small,
-        // the mark must still fire. Without this, a rewrite that
-        // accidentally AND-ed the two conditions would silently break
-        // the aggregate case.
+    fn admission_ecn_does_not_mark_when_only_aggregate_above_threshold() {
         let mut root = test_flow_fair_exact_queue_16_flows();
         let queue = &mut root.queues[0];
         let target = 0usize;
 
-        // Put the target bucket well below the per-flow threshold
-        // (8 000 bytes at NUM/DEN = 1/3) but drive the aggregate
-        // above 128 000.
-        let target_bucket_bytes = 500; // < 8 000
+        let target_bucket_bytes = 500; // << per-flow threshold (8 000 B at 1/3)
         let _ = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
         let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
         let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
@@ -12021,9 +12057,13 @@ mod tests {
             &umem,
         );
 
-        assert!(marked, "aggregate arm must still fire (the #718 case)");
+        assert!(
+            !marked,
+            "#784: aggregate arm must NOT fire — only per-flow threshold triggers marks. \
+             If this assertion ever flips, the SFQ iperf3 -P 12 fairness regression returns."
+        );
         let after = snapshot_counters(queue);
-        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked + 1);
+        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked);
     }
 
     #[test]
@@ -12125,11 +12165,18 @@ mod tests {
         // drift out of lockstep and this test fails. Computed from
         // the state as `share_cap × NUM / DEN` independently — no
         // internal call into the policy function.
+        //
+        // #784: seed with `target_bytes > 0` so prospective_active
+        // stays at 16 both in the test's computed threshold and in
+        // the policy's live recompute. Earlier revision seeded
+        // target=0 and set the bucket above threshold later, which
+        // shifted prospective_active from 17 → 16 between compute
+        // and policy call and silently passed on the aggregate arm.
         let mut root = test_flow_fair_exact_queue_16_flows();
         let queue = &mut root.queues[0];
         let target = 0usize;
 
-        seed_sixteen_flow_buckets(queue, target, 0);
+        seed_sixteen_flow_buckets(queue, target, 1);
         let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
         let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
 
