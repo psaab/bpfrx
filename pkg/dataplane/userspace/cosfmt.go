@@ -105,7 +105,22 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 				view.interfaceState.TimerLevel0Sleepers,
 				view.interfaceState.TimerLevel1Sleepers)
 		}
+		// Build queue views once per interface and share the slice
+		// between the binding-scoped telemetry render and the main
+		// queue table below. Copilot flagged that the first rev of
+		// this PR invoked buildCoSQueueViews twice — once inside
+		// renderBindingScopedTelemetry, again here — which doubled
+		// work and risked drift if buildCoSQueueViews filter/order
+		// ever changed.
 		queues := buildCoSQueueViews(cfg, view)
+		// #732 / #751: binding-scoped telemetry rendered once per
+		// interface instead of under every queue row. owner_pps /
+		// peer_pps / redirect_p99 describe binding-wide arrivals
+		// and redirects; producers don't know a target queue at
+		// redirect time so these values are inherently per-binding.
+		// Pre-#751 each queue row reported the same values, which
+		// was the #732 symptom.
+		renderBindingScopedTelemetry(&b, view, queues)
 		if len(queues) == 0 {
 			b.WriteString("  Queues:                   none\n")
 			continue
@@ -174,20 +189,22 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 				queue.admissionBufferDrops,
 				queue.admissionEcnMarked,
 			)
-			// #709: OwnerProfile line — rendered only for exact queues
-			// with a named owner worker. Non-exact / shared_exact
-			// queues have no single owner binding whose latency is
-			// meaningful, so the row would be misleading for those
-			// (see `TestFormatCoSInterfaceSummaryOmitsOwnerProfileForQueuesWithoutOwner`).
-			if queue.ownerWorker != nil {
+			// #709 / #751: per-queue OwnerProfile line renders only
+			// the queue-scoped drain percentiles. The binding-scoped
+			// fields (redirect_p99 / owner_pps / peer_pps) moved to
+			// the interface header via renderBindingScopedTelemetry
+			// so they are no longer repeated under every queue row
+			// (#732). Non-exact / shared_exact queues keep an empty
+			// per-queue hist post-#751 because the drain path only
+			// writes the atomics when it services them, so
+			// drainInvocations==0 correctly suppresses the row.
+			if queue.ownerWorker != nil && queue.drainInvocations > 0 {
 				fmt.Fprintf(
 					&b,
-					"           OwnerProfile: drain_p50=%s  drain_p99=%s  redirect_p99=%s  owner_pps=%d  peer_pps=%d\n",
+					"           OwnerProfile: drain_p50=%s  drain_p99=%s  drain_invocations=%d\n",
 					formatHistPercentileMicros(queue.drainLatencyHist, queue.drainInvocations, 50),
 					formatHistPercentileMicros(queue.drainLatencyHist, queue.drainInvocations, 99),
-					formatHistPercentileMicrosFromBuckets(queue.redirectAcquireHist, 99),
-					queue.ownerPPS,
-					queue.peerPPS,
+					queue.drainInvocations,
 				)
 			}
 		}
@@ -237,6 +254,90 @@ func formatHistPercentileMicrosFromBuckets(hist []uint64, percentile int) string
 		total += count
 	}
 	return formatHistPercentileMicros(hist, total, percentile)
+}
+
+// #732 / #751: render a single "Binding telemetry" line per interface
+// carrying the values that are inherently binding-scoped (producers
+// do not know the target queue at redirect time). Rust's snapshot
+// path attributes these to the sole unambiguous owner-local exact
+// queue row, or leaves them at zero when the shape is ambiguous.
+//
+// Copilot-review-driven design notes:
+//   - We SUM across queues instead of MAX. Rust populates the fields
+//     on at most one queue per binding in the normal case, so sum and
+//     max are equivalent — except if a bug or mixed-version mismatch
+//     ever puts non-zero values on multiple queue rows, the sum makes
+//     that divergence visible (inflated value in the output) instead
+//     of silently hiding it like max would.
+//   - The redirect-acquire histogram gate checks for at least one
+//     non-zero bucket, not just a non-empty slice. Rust resizes the
+//     vector to DRAIN_HIST_BUCKETS on the eligible row even when
+//     every sample is 0, so a length-only gate would render a noisy
+//     "redirect_p99=0us" line on ambiguous bindings.
+//   - The `queues` slice is built once by the caller so the binding-
+//     scoped line and the per-queue table see exactly the same data.
+//
+// Zero-in-all-fields is suppressed so interfaces with no exact queue
+// or ambiguous shape don't get a noise line.
+func renderBindingScopedTelemetry(b *strings.Builder, view cosInterfaceView, queues []cosQueueView) {
+	if view.interfaceState == nil {
+		return
+	}
+	var (
+		ownerPPS     uint64
+		peerPPS      uint64
+		redirectHist []uint64
+	)
+	for _, q := range queues {
+		ownerPPS = saturatingAddU64(ownerPPS, q.ownerPPS)
+		peerPPS = saturatingAddU64(peerPPS, q.peerPPS)
+		// Fold histograms element-wise; unset-slice queues are
+		// skipped so we don't allocate for queues that reported
+		// no samples.
+		for i, count := range q.redirectAcquireHist {
+			if count == 0 {
+				continue
+			}
+			if len(redirectHist) < len(q.redirectAcquireHist) {
+				resized := make([]uint64, len(q.redirectAcquireHist))
+				copy(resized, redirectHist)
+				redirectHist = resized
+			}
+			redirectHist[i] = saturatingAddU64(redirectHist[i], count)
+		}
+	}
+	if ownerPPS == 0 && peerPPS == 0 && !histHasSample(redirectHist) {
+		return
+	}
+	fmt.Fprintf(
+		b,
+		"  Binding telemetry:        redirect_p99=%s  owner_pps=%d  peer_pps=%d\n",
+		formatHistPercentileMicrosFromBuckets(redirectHist, 99),
+		ownerPPS,
+		peerPPS,
+	)
+}
+
+// saturatingAddU64 avoids silent wraparound in the telemetry render.
+// Hot-path this is not (called once per interface at scrape cadence)
+// but honesty-of-summation matters more here than the cycle cost —
+// an overflow under adversarial input is a visible ceiling, not a
+// reset to zero.
+func saturatingAddU64(a, b uint64) uint64 {
+	sum := a + b
+	if sum < a {
+		return ^uint64(0)
+	}
+	return sum
+}
+
+func histHasSample(hist []uint64) bool {
+	for _, count := range hist {
+		if count > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // #709: map a bucket index to its lower bound, formatted as µs. The

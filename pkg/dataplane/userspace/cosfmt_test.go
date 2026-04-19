@@ -318,23 +318,102 @@ func TestFormatCoSInterfaceSummaryRendersOwnerProfileLineForExactQueues(t *testi
 		},
 	}
 	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
-	// Exact substring match on the line format: leading whitespace
-	// aligns with `Drops:` above it (11 spaces). p50 is "1us" (bucket
-	// 1 lower bound), p99 is "16us" (bucket 5 = 2^14 ns = 16384 ns
-	// → 16 µs). Redirect p99 is "2us" (bucket 2 = 2^11 ns = 2048 ns
-	// → 2 µs).
-	want := "OwnerProfile: drain_p50=1us  drain_p99=16us  redirect_p99=2us  owner_pps=12345  peer_pps=6789"
-	if !strings.Contains(out, want) {
-		t.Fatalf("missing %q in output:\n%s", want, out)
+	// #751: per-queue OwnerProfile line now renders only the
+	// queue-scoped fields (drain_p50, drain_p99, drain_invocations).
+	// p50 is "1us" (bucket 1 lower bound), p99 is "16us" (bucket 5 =
+	// 2^14 ns = 16384 ns → 16µs).
+	wantQueue := "OwnerProfile: drain_p50=1us  drain_p99=16us  drain_invocations=100"
+	if !strings.Contains(out, wantQueue) {
+		t.Fatalf("missing queue-scoped OwnerProfile line %q in output:\n%s", wantQueue, out)
 	}
-	// Positional invariant: OwnerProfile must follow Drops. A
-	// regression that emits OwnerProfile above the Drops line would
-	// still include both strings but in the wrong order.
+	// #732: binding-scoped fields now render once at the interface
+	// level instead of being repeated under every queue row. p99 of
+	// redirect-acquire is "2us" (bucket 2 = 2^11 ns = 2048 ns → 2µs).
+	wantBinding := "Binding telemetry:        redirect_p99=2us  owner_pps=12345  peer_pps=6789"
+	if !strings.Contains(out, wantBinding) {
+		t.Fatalf("missing binding-scoped telemetry line %q in output:\n%s", wantBinding, out)
+	}
+	// Positional invariant: per-queue OwnerProfile must follow Drops
+	// on the same queue row. Binding telemetry must appear ABOVE
+	// the Queues table (it's an interface-level summary).
 	dropsIdx := strings.Index(out, "Drops: flow_share=")
 	ownerIdx := strings.Index(out, "OwnerProfile:")
+	queuesIdx := strings.Index(out, "Queues:")
+	bindingIdx := strings.Index(out, "Binding telemetry:")
 	if dropsIdx < 0 || ownerIdx < 0 || ownerIdx <= dropsIdx {
 		t.Fatalf("OwnerProfile line must render AFTER Drops line: drops=%d owner=%d\n%s",
 			dropsIdx, ownerIdx, out)
+	}
+	if bindingIdx < 0 || queuesIdx < 0 || bindingIdx >= queuesIdx {
+		t.Fatalf("Binding telemetry must render ABOVE the Queues table: binding=%d queues=%d\n%s",
+			bindingIdx, queuesIdx, out)
+	}
+}
+
+// #751 / #732: pin that two exact queues on the same interface with
+// distinct drain profiles render distinct per-queue OwnerProfile
+// lines. Pre-#751 the hist was sourced from a binding-wide rollup and
+// both queues carried identical values (#732 symptom).
+//
+// Counter-factual: the two queues are seeded with DISJOINT bucket
+// sets (q4 at bucket 1 = "1us", q6 at bucket 5 = "16us"). If the
+// render collapsed them to a single distribution — the pre-#751
+// behaviour — the formatted line for each queue would show the
+// same p50/p99 and the distinct-percentile assertion would fail.
+func TestFormatCoSInterfaceSummaryRendersDistinctPerQueueOwnerProfiles(t *testing.T) {
+	owner := uint32(1)
+	q4Hist := make([]uint64, 16)
+	q4Hist[1] = 100 // p50 & p99 in bucket 1 → "1us"
+	q6Hist := make([]uint64, 16)
+	q6Hist[5] = 200 // p50 & p99 in bucket 5 → "16us"
+
+	status := &ProcessStatus{
+		CoSInterfaces: []CoSInterfaceStatus{
+			{
+				InterfaceName:   "reth0.80",
+				OwnerWorkerID:   &owner,
+				WorkerInstances: 1,
+				Queues: []CoSQueueStatus{
+					{
+						QueueID:           4,
+						OwnerWorkerID:     &owner,
+						ForwardingClass:   "bandwidth-10mb",
+						Priority:          1,
+						Exact:             true,
+						TransmitRateBytes: 1_250_000,
+						BufferBytes:       32 * 1024,
+						DrainLatencyHist:  q4Hist,
+						DrainInvocations:  100,
+					},
+					{
+						QueueID:           6,
+						OwnerWorkerID:     &owner,
+						ForwardingClass:   "bandwidth-iperf-c",
+						Priority:          1,
+						Exact:             true,
+						TransmitRateBytes: 625_000,
+						BufferBytes:       32 * 1024,
+						DrainLatencyHist:  q6Hist,
+						DrainInvocations:  200,
+					},
+				},
+			},
+		},
+	}
+	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
+	wantQ4 := "OwnerProfile: drain_p50=1us  drain_p99=1us  drain_invocations=100"
+	wantQ6 := "OwnerProfile: drain_p50=16us  drain_p99=16us  drain_invocations=200"
+	if !strings.Contains(out, wantQ4) {
+		t.Fatalf("missing q4 per-queue OwnerProfile %q:\n%s", wantQ4, out)
+	}
+	if !strings.Contains(out, wantQ6) {
+		t.Fatalf("missing q6 per-queue OwnerProfile %q:\n%s", wantQ6, out)
+	}
+	// Counter-factual: the pre-#751 regression would produce identical
+	// lines for both queues (both showing the same p50/p99). Pin that
+	// the two OwnerProfile strings are actually distinct in the output.
+	if strings.Count(out, wantQ4) != 1 || strings.Count(out, wantQ6) != 1 {
+		t.Fatalf("expected exactly one per-queue OwnerProfile per queue; got:\n%s", out)
 	}
 }
 
@@ -380,12 +459,20 @@ func TestFormatCoSInterfaceSummaryOmitsOwnerProfileForQueuesWithoutOwner(t *test
 	}
 }
 
-// #709: Zeroed owner-profile telemetry must render "0us" not "nan" /
-// "-". An operator staring at a freshly-deployed firewall with no
-// traffic still needs to see the field alignment. The test pins the
-// exact rendering so a future change to the default-string helper
-// doesn't accidentally emit "nan" (which breaks grep/awk pipelines).
-func TestFormatCoSInterfaceSummaryRendersZeroedOwnerProfile(t *testing.T) {
+// #751: zeroed owner-profile telemetry now SUPPRESSES the per-queue
+// OwnerProfile line entirely (drainInvocations == 0 ⇒ nothing to
+// report). Same for the interface-level Binding telemetry line:
+// when all three fields are zero there's nothing meaningful to show.
+// This keeps "show class-of-service interface" tight on a freshly-
+// deployed firewall with no traffic instead of surfacing rows of
+// "0us 0us 0us 0 0" noise that operators learn to skip over and
+// that dilute the signal when a real non-zero does appear.
+//
+// Counter-factual pin: if a future change started emitting the
+// OwnerProfile line on zero-invocation queues, it would produce
+// "drain_p50=0us" somewhere in the output and this test would
+// catch it.
+func TestFormatCoSInterfaceSummarySuppressesZeroedOwnerProfile(t *testing.T) {
 	owner := uint32(1)
 	status := &ProcessStatus{
 		CoSInterfaces: []CoSInterfaceStatus{
@@ -409,17 +496,18 @@ func TestFormatCoSInterfaceSummaryRendersZeroedOwnerProfile(t *testing.T) {
 		},
 	}
 	out := FormatCoSInterfaceSummary(testCoSConfig(), status, "reth0.80")
-	want := "OwnerProfile: drain_p50=0us  drain_p99=0us  redirect_p99=0us  owner_pps=0  peer_pps=0"
-	if !strings.Contains(out, want) {
-		t.Fatalf("missing %q in output:\n%s", want, out)
+	if strings.Contains(out, "OwnerProfile:") {
+		t.Fatalf("OwnerProfile line must not render for zeroed queue:\n%s", out)
 	}
-	// Counter-factual: ensure "nan" and "-" don't creep in via the
-	// percentile helper on the empty-histogram path.
-	if strings.Contains(out, "nan") {
-		t.Fatalf("zeroed OwnerProfile must not emit 'nan':\n%s", out)
+	if strings.Contains(out, "Binding telemetry:") {
+		t.Fatalf("Binding telemetry line must not render when all fields are zero:\n%s", out)
 	}
-	if strings.Contains(out, "drain_p50=-") || strings.Contains(out, "drain_p99=-") {
-		t.Fatalf("zeroed OwnerProfile must not emit placeholder '-':\n%s", out)
+	// The Drops line MUST still render — zero-valued admission
+	// counters are the signal that the counter path is wired; see
+	// TestFormatCoSInterfaceSummaryRendersZeroAdmissionCounters
+	// below for the same invariant documented there.
+	if !strings.Contains(out, "Drops: flow_share=0") {
+		t.Fatalf("Drops line must still render even with zeroed telemetry:\n%s", out)
 	}
 }
 

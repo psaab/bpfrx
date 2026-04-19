@@ -1789,6 +1789,15 @@ pub(crate) fn merge_cos_queue_owner_profile_sum(
 /// summation preserves a coherent aggregate distribution and keeps
 /// `sum(histogram) == invocations` intact. A per-bucket `max` breaks
 /// that invariant and can manufacture an impossible mixed profile.
+///
+/// Post-#751: this still merges the full owner profile into the
+/// destination status. It's retained for call sites that snapshot a
+/// binding wholesale (tests, the coordinator fold-across-workers path).
+/// Production `build_worker_cos_statuses_from_maps` no longer uses this
+/// for drain_latency_hist / drain_invocations — those are now populated
+/// per-queue from the per-queue atomics — but it still applies to the
+/// binding-scoped fields (owner_pps, peer_pps, redirect_acquire_hist,
+/// drain_noop_invocations) via `merge_binding_scoped_owner_profile`.
 pub(super) fn merge_owner_profile_sum(
     status: &mut crate::protocol::CoSQueueStatus,
     profile: &OwnerProfileSnapshot,
@@ -1802,18 +1811,40 @@ pub(super) fn merge_owner_profile_sum(
     if status.drain_latency_hist.len() < DRAIN_HIST_BUCKETS {
         status.drain_latency_hist.resize(DRAIN_HIST_BUCKETS, 0);
     }
-    if status.redirect_acquire_hist.len() < DRAIN_HIST_BUCKETS {
-        status.redirect_acquire_hist.resize(DRAIN_HIST_BUCKETS, 0);
-    }
     for i in 0..DRAIN_HIST_BUCKETS {
         status.drain_latency_hist[i] =
             status.drain_latency_hist[i].saturating_add(profile.drain_latency_hist[i]);
-        status.redirect_acquire_hist[i] =
-            status.redirect_acquire_hist[i].saturating_add(profile.redirect_acquire_hist[i]);
     }
     status.drain_invocations = status
         .drain_invocations
         .saturating_add(profile.drain_invocations);
+    merge_binding_scoped_owner_profile(status, profile);
+}
+
+/// #751: merge only the binding-scoped fields from a binding's
+/// owner-profile snapshot into a per-queue status. The fields
+/// covered — `redirect_acquire_hist`, `owner_pps`, `peer_pps`,
+/// `drain_noop_invocations` — are inherently per-binding: producers
+/// do not know the target queue at redirect time (so
+/// `redirect_acquire_hist` and `peer_pps` cannot be queue-scoped),
+/// `owner_pps` measures binding-wide TX arrivals, and
+/// `drain_noop_invocations` counts drain calls that made no
+/// progress on *any* queue (so no queue to attribute them to).
+///
+/// The per-queue drain fields (`drain_latency_hist`,
+/// `drain_invocations`) are populated separately from the queue's
+/// own atomics — see `build_worker_cos_statuses_from_maps`.
+pub(super) fn merge_binding_scoped_owner_profile(
+    status: &mut crate::protocol::CoSQueueStatus,
+    profile: &OwnerProfileSnapshot,
+) {
+    if status.redirect_acquire_hist.len() < DRAIN_HIST_BUCKETS {
+        status.redirect_acquire_hist.resize(DRAIN_HIST_BUCKETS, 0);
+    }
+    for i in 0..DRAIN_HIST_BUCKETS {
+        status.redirect_acquire_hist[i] =
+            status.redirect_acquire_hist[i].saturating_add(profile.redirect_acquire_hist[i]);
+    }
     status.drain_noop_invocations = status
         .drain_noop_invocations
         .saturating_add(profile.drain_noop_invocations);
@@ -1941,15 +1972,71 @@ where
                 status.tx_ring_full_submit_stalls = status
                     .tx_ring_full_submit_stalls
                     .saturating_add(queue.drop_counters.tx_ring_full_submit_stalls);
-                // #709 / #748 / #751: owner-profile export is valid only
-                // for the single unambiguous owner-local exact queue row
-                // on the whole binding. Shared, non-exact, and ambiguous
-                // multi-owner-local shapes (whether within one interface
-                // or spread across interfaces on the same binding) stay
-                // zero rather than surfacing a binding-wide mixed profile.
+                // #751: the owner-side drain telemetry
+                // (drain_latency_hist + drain_invocations) now lives
+                // per-queue on CoSQueueRuntime.owner_profile — each
+                // exact queue gets its OWN histogram populated
+                // directly from its own atomics, with no eligibility
+                // gate. Pre-#751 these came from a binding-wide
+                // rollup that was only surfaced on the single
+                // "unambiguous owner-local exact queue" row; as a
+                // result #732 showed every queue row of a
+                // multi-queue binding with identical values.
+                //
+                // HFT notes on the atomic loads below:
+                //   * Single-writer (owner worker thread) + cross-
+                //     thread read (snapshot path). Relaxed is the
+                //     correct ordering: the reader tolerates ~1
+                //     count of tearing between the hist buckets
+                //     and drain_invocations, and Prometheus scrape
+                //     semantics are "best effort at scrape time".
+                //   * The owner_profile atomics sit alongside the
+                //     plain u64 fields in CoSQueueRuntime that the
+                //     same owner also mutates each tick, so there is
+                //     no false-sharing cost internal to the worker.
+                //     The snapshot reader pulls the cache line
+                //     once per scrape — negligible.
+                //   * Load invocations first so an untouched queue
+                //     (zero counter) skips the histogram walk and
+                //     keeps the on-wire status vector empty — saves
+                //     the resize + 16 bucket copies plus the 128
+                //     bytes of serde overhead on queues that never
+                //     drained. The writer always bumps both hist and
+                //     invocations under Relaxed, so
+                //     invocations==0 ⇒ all buckets are zero; the
+                //     reverse may briefly be false due to tearing,
+                //     but a ~1-count under-report from a single
+                //     reader is within the tolerance documented on
+                //     CoSQueueOwnerProfile.
+                let queue_invocations =
+                    queue.owner_profile.drain_invocations.load(Ordering::Relaxed);
+                if queue_invocations > 0 {
+                    if status.drain_latency_hist.len() < DRAIN_HIST_BUCKETS {
+                        status.drain_latency_hist.resize(DRAIN_HIST_BUCKETS, 0);
+                    }
+                    for i in 0..DRAIN_HIST_BUCKETS {
+                        let bucket_count =
+                            queue.owner_profile.drain_latency_hist[i].load(Ordering::Relaxed);
+                        status.drain_latency_hist[i] =
+                            status.drain_latency_hist[i].saturating_add(bucket_count);
+                    }
+                    status.drain_invocations =
+                        status.drain_invocations.saturating_add(queue_invocations);
+                }
+
+                // #709 / #748 / #751: the *binding-scoped* fields
+                // (redirect_acquire_hist, owner_pps, peer_pps,
+                // drain_noop_invocations) are surfaced only on the
+                // single unambiguous owner-local exact queue row on
+                // the whole binding. Producers don't know the target
+                // queue at redirect time so these fields cannot be
+                // queue-scoped and still stay truthful; any
+                // shared-exact, non-exact, or multi-owner-local
+                // shape keeps them at zero rather than surfacing a
+                // binding-wide mixed profile under an arbitrary row.
                 if owner_profile_row == Some((ifindex, queue.queue_id)) {
                     if let Some(profile) = binding_profile.as_ref() {
-                        merge_owner_profile_sum(status, profile);
+                        merge_binding_scoped_owner_profile(status, profile);
                     }
                 }
             }
@@ -2073,6 +2160,7 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::from([CoSPendingTxItem::Local(test_tx_request(80))]),
                     drop_counters,
+                    owner_profile: CoSQueueOwnerProfile::new(),
                 }],
                 queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
                 rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
@@ -2205,6 +2293,7 @@ mod tests {
                 wheel_slot: 0,
                 items: VecDeque::new(),
                 drop_counters: CoSQueueDropCounters::default(),
+                owner_profile: CoSQueueOwnerProfile::new(),
             }],
             queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
             rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
@@ -2216,12 +2305,9 @@ mod tests {
         };
 
         let live_a = BindingLiveState::new();
-        live_a.owner_profile_owner.drain_latency_hist[0].store(5, Ordering::Relaxed);
+        // binding-scoped fields (unchanged by #751): redirect_acquire
+        // histogram, owner_pps, peer_pps, drain_noop_invocations.
         live_a.owner_profile_peer.redirect_acquire_hist[1].store(3, Ordering::Relaxed);
-        live_a
-            .owner_profile_owner
-            .drain_invocations
-            .store(5, Ordering::Relaxed);
         live_a
             .owner_profile_owner
             .drain_noop_invocations
@@ -2236,12 +2322,7 @@ mod tests {
             .store(40, Ordering::Relaxed);
 
         let live_b = BindingLiveState::new();
-        live_b.owner_profile_owner.drain_latency_hist[7].store(11, Ordering::Relaxed);
         live_b.owner_profile_peer.redirect_acquire_hist[2].store(13, Ordering::Relaxed);
-        live_b
-            .owner_profile_owner
-            .drain_invocations
-            .store(11, Ordering::Relaxed);
         live_b
             .owner_profile_owner
             .drain_noop_invocations
@@ -2257,8 +2338,41 @@ mod tests {
 
         let mut first = FastMap::default();
         first.insert(80, make_root());
+        // #751: seed per-queue drain stats directly on the first
+        // worker's queue runtime. This is what the TX drain loop
+        // writes in production (tx.rs line ~250); tests pin the
+        // aggregated value rather than the old binding-wide rollup.
+        first
+            .get_mut(&80)
+            .unwrap()
+            .queues[0]
+            .owner_profile
+            .drain_latency_hist[0]
+            .store(5, Ordering::Relaxed);
+        first
+            .get_mut(&80)
+            .unwrap()
+            .queues[0]
+            .owner_profile
+            .drain_invocations
+            .store(5, Ordering::Relaxed);
+
         let mut second = FastMap::default();
         second.insert(80, make_root());
+        second
+            .get_mut(&80)
+            .unwrap()
+            .queues[0]
+            .owner_profile
+            .drain_latency_hist[7]
+            .store(11, Ordering::Relaxed);
+        second
+            .get_mut(&80)
+            .unwrap()
+            .queues[0]
+            .owner_profile
+            .drain_invocations
+            .store(11, Ordering::Relaxed);
 
         let statuses = build_worker_cos_statuses_from_maps(
             [(&first, Some(&live_a)), (&second, Some(&live_b))],
@@ -2266,19 +2380,26 @@ mod tests {
         );
         let queue = &statuses[0].queues[0];
 
+        // #751: drain_latency_hist + drain_invocations come from
+        // per-queue atomics, summed across workers servicing the
+        // same (ifindex, queue_id).
         assert_eq!(queue.drain_latency_hist[0], 5);
         assert_eq!(queue.drain_latency_hist[7], 11);
-        assert_eq!(queue.redirect_acquire_hist[1], 3);
-        assert_eq!(queue.redirect_acquire_hist[2], 13);
         assert_eq!(queue.drain_invocations, 16);
-        assert_eq!(queue.drain_noop_invocations, 3);
-        assert_eq!(queue.owner_pps, 300);
-        assert_eq!(queue.peer_pps, 90);
         assert_eq!(
             queue.drain_latency_hist.iter().copied().sum::<u64>(),
             queue.drain_invocations,
-            "aggregated histogram must stay coherent with invocation count",
+            "per-queue histogram must stay coherent with invocation count",
         );
+
+        // Binding-scoped fields still attributed to the eligible
+        // queue (there's only one in this fixture) and summed
+        // across workers.
+        assert_eq!(queue.redirect_acquire_hist[1], 3);
+        assert_eq!(queue.redirect_acquire_hist[2], 13);
+        assert_eq!(queue.drain_noop_invocations, 3);
+        assert_eq!(queue.owner_pps, 300);
+        assert_eq!(queue.peer_pps, 90);
     }
 
     #[test]
@@ -2371,6 +2492,7 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     drop_counters: CoSQueueDropCounters::default(),
+                    owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 CoSQueueRuntime {
                     queue_id: 4,
@@ -2397,6 +2519,7 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     drop_counters: CoSQueueDropCounters::default(),
+                    owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 CoSQueueRuntime {
                     queue_id: 5,
@@ -2423,6 +2546,7 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     drop_counters: CoSQueueDropCounters::default(),
+                    owner_profile: CoSQueueOwnerProfile::new(),
                 },
             ],
             queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
@@ -2435,10 +2559,7 @@ mod tests {
         };
 
         let live = BindingLiveState::new();
-        live.owner_profile_owner.drain_latency_hist[2].store(9, Ordering::Relaxed);
-        live.owner_profile_owner
-            .drain_invocations
-            .store(9, Ordering::Relaxed);
+        // Binding-scoped fields (unchanged by #751).
         live.owner_profile_owner
             .drain_noop_invocations
             .store(1, Ordering::Relaxed);
@@ -2452,6 +2573,20 @@ mod tests {
 
         let mut cos_map = FastMap::default();
         cos_map.insert(80, root);
+        // #751: seed per-queue drain stats on queue_id=4 only
+        // (the owner-local exact queue in this fixture).
+        {
+            let runtime = cos_map.get_mut(&80).unwrap();
+            let q4 = runtime
+                .queues
+                .iter_mut()
+                .find(|q| q.queue_id == 4)
+                .unwrap();
+            q4.owner_profile.drain_latency_hist[2].store(9, Ordering::Relaxed);
+            q4.owner_profile
+                .drain_invocations
+                .store(9, Ordering::Relaxed);
+        }
 
         let statuses = build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding);
         let queues = &statuses[0].queues;
@@ -2459,18 +2594,26 @@ mod tests {
         let q4 = queues.iter().find(|q| q.queue_id == 4).unwrap();
         let q5 = queues.iter().find(|q| q.queue_id == 5).unwrap();
 
+        // q0 is non-exact: no per-queue drain stats seeded and not
+        // the eligible row for binding-scoped fields.
         assert_eq!(q0.drain_invocations, 0);
-        assert!(q0.drain_latency_hist.is_empty());
         assert_eq!(q0.owner_pps, 0);
 
+        // q4 is the owner-local exact queue: it gets BOTH its own
+        // per-queue drain stats (seeded on the runtime) AND the
+        // binding-scoped fields (redirect_acquire, owner_pps,
+        // peer_pps, drain_noop) because it's the unambiguous row.
         assert_eq!(q4.drain_latency_hist[2], 9);
-        assert_eq!(q4.redirect_acquire_hist[4], 7);
         assert_eq!(q4.drain_invocations, 9);
+        assert_eq!(q4.redirect_acquire_hist[4], 7);
         assert_eq!(q4.owner_pps, 123);
         assert_eq!(q4.peer_pps, 45);
+        assert_eq!(q4.drain_noop_invocations, 1);
 
+        // q5 is shared-exact (via SHARED_EXACT_RATE fixture): no
+        // per-queue drain stats seeded, and it's not the eligible
+        // row for binding-scoped fields.
         assert_eq!(q5.drain_invocations, 0);
-        assert!(q5.drain_latency_hist.is_empty());
         assert_eq!(q5.owner_pps, 0);
     }
 
@@ -2555,6 +2698,7 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     drop_counters: CoSQueueDropCounters::default(),
+                    owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 CoSQueueRuntime {
                     queue_id: 6,
@@ -2581,6 +2725,7 @@ mod tests {
                     wheel_slot: 0,
                     items: VecDeque::new(),
                     drop_counters: CoSQueueDropCounters::default(),
+                    owner_profile: CoSQueueOwnerProfile::new(),
                 },
             ],
             queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
@@ -2697,6 +2842,7 @@ mod tests {
                 wheel_slot: 0,
                 items: VecDeque::new(),
                 drop_counters: CoSQueueDropCounters::default(),
+                owner_profile: CoSQueueOwnerProfile::new(),
             }],
             queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
             rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
@@ -2753,6 +2899,210 @@ mod tests {
              multiple owner-local exact queues across interfaces; got {:?}",
             row
         );
+    }
+
+    /// #751 / #732: per-queue drain telemetry.
+    ///
+    /// Pre-#751 (symptom of #732): the same drain_latency_hist /
+    /// drain_invocations read from BindingLiveState and stamped under
+    /// every queue row of a multi-queue binding. The on-wire status
+    /// repeated identical values on each queue even when the owner
+    /// worker was draining two queues with wildly different latency
+    /// profiles — e.g. a low-rate "iperf-a" queue with ~8 µs drains
+    /// and a high-rate "iperf-b" queue with ~1 µs drains collapsed
+    /// into a single flat shape.
+    ///
+    /// Post-#751: each queue carries its own per-queue atomics
+    /// (CoSQueueRuntime::owner_profile). The snapshot reads from the
+    /// queue itself; distinct queues report distinct distributions.
+    ///
+    /// This test pins that behaviour by seeding two owner-local
+    /// exact queues on the same binding with disjoint latency
+    /// histograms (non-overlapping bucket sets) and invocation
+    /// counts, running the snapshot path, and asserting the two
+    /// on-wire queue rows carry different values. The counter-factual
+    /// pre-#751 behaviour (both queues showing the same profile)
+    /// would fail the disjoint-bucket assertion loudly.
+    #[test]
+    fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
+        let mut forwarding = ForwardingState::default();
+        forwarding
+            .ifindex_to_config_name
+            .insert(80, "reth0.80".to_string());
+        forwarding.cos.interfaces.insert(
+            80,
+            CoSInterfaceConfig {
+                shaping_rate_bytes: 10_000_000_000 / 8,
+                burst_bytes: 256 * 1024,
+                default_queue: 0,
+                dscp_classifier: String::new(),
+                ieee8021_classifier: String::new(),
+                dscp_queue_by_dscp: [u8::MAX; 64],
+                ieee8021_queue_by_pcp: [u8::MAX; 8],
+                queue_by_forwarding_class: FastMap::default(),
+                queues: vec![
+                    CoSQueueConfig {
+                        queue_id: 4,
+                        forwarding_class: "iperf-a".into(),
+                        priority: 1,
+                        transmit_rate_bytes: OWNER_LOCAL_EXACT_RATE,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                    CoSQueueConfig {
+                        queue_id: 6,
+                        forwarding_class: "iperf-c".into(),
+                        priority: 1,
+                        // Also owner-local-exact — same shape as the
+                        // ambiguous-multi-exact fixture above.
+                        transmit_rate_bytes: OWNER_LOCAL_EXACT_RATE / 2,
+                        exact: true,
+                        surplus_weight: 1,
+                        buffer_bytes: 64 * 1024,
+                        dscp_rewrite: None,
+                    },
+                ],
+            },
+        );
+
+        let mut root = CoSInterfaceRuntime {
+            shaping_rate_bytes: 10_000_000_000 / 8,
+            burst_bytes: 256 * 1024,
+            tokens: 0,
+            default_queue: 0,
+            nonempty_queues: 0,
+            runnable_queues: 0,
+            exact_guarantee_rr: 0,
+            nonexact_guarantee_rr: 0,
+            #[cfg(test)]
+            legacy_guarantee_rr: 0,
+            queues: vec![
+                CoSQueueRuntime {
+                    queue_id: 4,
+                    priority: 1,
+                    transmit_rate_bytes: OWNER_LOCAL_EXACT_RATE,
+                    exact: true,
+                    flow_fair: false,
+                    flow_hash_seed: 0,
+                    surplus_weight: 1,
+                    surplus_deficit: 0,
+                    buffer_bytes: 64 * 1024,
+                    dscp_rewrite: None,
+                    tokens: 0,
+                    last_refill_ns: 0,
+                    queued_bytes: 0,
+                    active_flow_buckets: 0,
+                    flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_rr_buckets: FlowRrRing::default(),
+                    flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+                    runnable: false,
+                    parked: false,
+                    next_wakeup_tick: 0,
+                    wheel_level: 0,
+                    wheel_slot: 0,
+                    items: VecDeque::new(),
+                    drop_counters: CoSQueueDropCounters::default(),
+                    owner_profile: CoSQueueOwnerProfile::new(),
+                },
+                CoSQueueRuntime {
+                    queue_id: 6,
+                    priority: 1,
+                    transmit_rate_bytes: OWNER_LOCAL_EXACT_RATE / 2,
+                    exact: true,
+                    flow_fair: false,
+                    flow_hash_seed: 0,
+                    surplus_weight: 1,
+                    surplus_deficit: 0,
+                    buffer_bytes: 64 * 1024,
+                    dscp_rewrite: None,
+                    tokens: 0,
+                    last_refill_ns: 0,
+                    queued_bytes: 0,
+                    active_flow_buckets: 0,
+                    flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_rr_buckets: FlowRrRing::default(),
+                    flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
+                    runnable: false,
+                    parked: false,
+                    next_wakeup_tick: 0,
+                    wheel_level: 0,
+                    wheel_slot: 0,
+                    items: VecDeque::new(),
+                    drop_counters: CoSQueueDropCounters::default(),
+                    owner_profile: CoSQueueOwnerProfile::new(),
+                },
+            ],
+            queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
+            rr_index_by_priority: [0; COS_PRIORITY_LEVELS],
+            timer_wheel: CoSTimerWheelRuntime {
+                current_tick: 0,
+                level0: std::array::from_fn(|_| Vec::new()),
+                level1: std::array::from_fn(|_| Vec::new()),
+            },
+        };
+
+        // Queue 4: "slow drain" profile — landings in high bucket.
+        {
+            let q = root.queues.iter_mut().find(|q| q.queue_id == 4).unwrap();
+            q.owner_profile.drain_latency_hist[12].store(7, Ordering::Relaxed);
+            q.owner_profile
+                .drain_invocations
+                .store(7, Ordering::Relaxed);
+        }
+        // Queue 6: "fast drain" profile — landings in low bucket.
+        // Disjoint from queue 4's bucket so a regression that collapses
+        // to a single profile fails the per-queue distinctness check.
+        {
+            let q = root.queues.iter_mut().find(|q| q.queue_id == 6).unwrap();
+            q.owner_profile.drain_latency_hist[2].store(23, Ordering::Relaxed);
+            q.owner_profile
+                .drain_invocations
+                .store(23, Ordering::Relaxed);
+        }
+
+        // Binding-scoped fields: ambiguous shape (two owner-local
+        // exact queues), so these stay at zero on all queues
+        // regardless of what we seed — the test does NOT seed
+        // BindingLiveState to make that invariant explicit.
+        let live = BindingLiveState::new();
+        let mut cos_map = FastMap::default();
+        cos_map.insert(80, root);
+
+        let statuses =
+            build_worker_cos_statuses_from_maps([(&cos_map, Some(&live))], &forwarding);
+        let queues = &statuses[0].queues;
+        let q4 = queues.iter().find(|q| q.queue_id == 4).unwrap();
+        let q6 = queues.iter().find(|q| q.queue_id == 6).unwrap();
+
+        // Per-queue distinctness.
+        assert_eq!(q4.drain_invocations, 7);
+        assert_eq!(q4.drain_latency_hist[12], 7);
+        assert_eq!(q4.drain_latency_hist[2], 0);
+
+        assert_eq!(q6.drain_invocations, 23);
+        assert_eq!(q6.drain_latency_hist[2], 23);
+        assert_eq!(q6.drain_latency_hist[12], 0);
+
+        // Counter-factual: if the snapshot collapsed both queues to
+        // a shared profile (the pre-#751 / #732 behaviour), q4 would
+        // carry q6's bucket[2] count and vice versa. Assert both
+        // hists are disjoint in their non-zero buckets.
+        assert!(
+            q4.drain_latency_hist[12] > 0 && q4.drain_latency_hist[2] == 0
+                && q6.drain_latency_hist[2] > 0 && q6.drain_latency_hist[12] == 0,
+            "queues must surface their own per-queue hist, not share a \
+             binding-wide rollup (pre-#751 regression)",
+        );
+
+        // Binding-scoped fields stay at zero on ambiguous shapes.
+        assert_eq!(q4.owner_pps, 0);
+        assert_eq!(q6.owner_pps, 0);
+        assert_eq!(q4.peer_pps, 0);
+        assert_eq!(q6.peer_pps, 0);
+        assert_eq!(q4.drain_noop_invocations, 0);
+        assert_eq!(q6.drain_noop_invocations, 0);
     }
 
     #[test]
