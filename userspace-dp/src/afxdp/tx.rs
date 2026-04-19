@@ -2442,6 +2442,14 @@ fn apply_direct_exact_send_result(
             .live
             .tx_bytes
             .fetch_add(sent_bytes, Ordering::Relaxed);
+        // #760 instrumentation, exact-owner-local path. Paired with
+        // tx_bytes unconditionally — if the per-queue drain_sent_bytes
+        // above (guarded by `if let Some(queue)`) ever undercounts
+        // this, the gap is an `apply_*` early-return / queue-miss.
+        binding
+            .live
+            .drain_sent_bytes_shaped_unconditional
+            .fetch_add(sent_bytes, Ordering::Relaxed);
     }
 }
 
@@ -2574,6 +2582,12 @@ fn submit_cos_batch(
                             .tx_packets
                             .fetch_add(packets, Ordering::Relaxed);
                         binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+                        // #760 instrumentation, non-exact / shared-exact
+                        // Local path. See umem.rs field comment.
+                        binding
+                            .live
+                            .drain_sent_bytes_shaped_unconditional
+                            .fetch_add(bytes, Ordering::Relaxed);
                     }
                     cos_batch_tx_made_progress(Ok((packets, bytes)))
                 }
@@ -2625,6 +2639,13 @@ fn submit_cos_batch(
                             .tx_packets
                             .fetch_add(packets, Ordering::Relaxed);
                         binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+                        // #760 instrumentation, Prepared path (the
+                        // in-place-rewrite hot path). See umem.rs
+                        // field comment.
+                        binding
+                            .live
+                            .drain_sent_bytes_shaped_unconditional
+                            .fetch_add(bytes, Ordering::Relaxed);
                     }
                     cos_batch_tx_made_progress(Ok((packets, bytes)))
                 }

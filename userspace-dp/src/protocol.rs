@@ -882,6 +882,13 @@ pub(crate) struct CoSQueueStatus {
     // binding — the Go renderer shows it once per interface.
     #[serde(rename = "post_drain_backup_bytes", default)]
     pub post_drain_backup_bytes: u64,
+    /// #760 triage. Binding-scoped bytes observed at the three
+    /// `apply_*` tx_bytes sites, written unconditionally. Compare
+    /// against the sum of `drain_sent_bytes` across all queues —
+    /// any gap attributes shaped traffic that bypassed the
+    /// per-queue write via an `apply_*` early-return / queue miss.
+    #[serde(rename = "drain_sent_bytes_shaped_unconditional", default)]
+    pub drain_sent_bytes_shaped_unconditional: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

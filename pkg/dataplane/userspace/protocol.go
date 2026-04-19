@@ -496,7 +496,8 @@ type CoSQueueStatus struct {
 	DrainSentBytes        uint64 `json:"drain_sent_bytes,omitempty"`
 	DrainParkRootTokens   uint64 `json:"drain_park_root_tokens,omitempty"`
 	DrainParkQueueTokens  uint64 `json:"drain_park_queue_tokens,omitempty"`
-	PostDrainBackupBytes  uint64 `json:"post_drain_backup_bytes,omitempty"`
+	PostDrainBackupBytes                uint64 `json:"post_drain_backup_bytes,omitempty"`
+	DrainSentBytesShapedUnconditional   uint64 `json:"drain_sent_bytes_shaped_unconditional,omitempty"`
 }
 
 type FirewallFilterTermCounterStatus struct {

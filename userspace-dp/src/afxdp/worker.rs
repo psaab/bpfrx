@@ -1722,6 +1722,12 @@ pub(super) struct OwnerProfileSnapshot {
     /// the same "unambiguous owner-local exact queue" row the
     /// other binding-scoped fields use.
     pub(super) post_drain_backup_bytes: u64,
+    /// #760 instrumentation, binding-scoped. Bytes observed at the
+    /// three `apply_*` tx_bytes sites, incremented unconditionally.
+    /// Compare against the sum of per-queue `drain_sent_bytes`; any
+    /// gap is shaped traffic that bypassed the per-queue write via
+    /// an `apply_*` early-return.
+    pub(super) drain_sent_bytes_shaped_unconditional: u64,
 }
 
 #[inline]
@@ -1747,6 +1753,9 @@ pub(super) fn owner_profile_snapshot(live: &BindingLiveState) -> OwnerProfileSna
         owner_pps: live.owner_profile_owner.owner_pps.load(Ordering::Relaxed),
         peer_pps: live.owner_profile_peer.peer_pps.load(Ordering::Relaxed),
         post_drain_backup_bytes: live.post_drain_backup_bytes.load(Ordering::Relaxed),
+        drain_sent_bytes_shaped_unconditional: live
+            .drain_sent_bytes_shaped_unconditional
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -1801,6 +1810,9 @@ pub(crate) fn merge_cos_queue_owner_profile_sum(
     dst.post_drain_backup_bytes = dst
         .post_drain_backup_bytes
         .saturating_add(src.post_drain_backup_bytes);
+    dst.drain_sent_bytes_shaped_unconditional = dst
+        .drain_sent_bytes_shaped_unconditional
+        .saturating_add(src.drain_sent_bytes_shaped_unconditional);
 }
 
 /// #709: sum-merge a binding's owner-profile snapshot into a per-queue
@@ -1881,6 +1893,9 @@ pub(super) fn merge_binding_scoped_owner_profile(
     status.post_drain_backup_bytes = status
         .post_drain_backup_bytes
         .saturating_add(profile.post_drain_backup_bytes);
+    status.drain_sent_bytes_shaped_unconditional = status
+        .drain_sent_bytes_shaped_unconditional
+        .saturating_add(profile.drain_sent_bytes_shaped_unconditional);
 }
 
 fn build_worker_cos_statuses_from_maps<'a, I>(

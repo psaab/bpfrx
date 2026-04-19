@@ -856,6 +856,16 @@ pub(super) struct BindingLiveState {
     /// non-zero value usually indicates a frame-building bug upstream
     /// or a legitimate oversize packet. Subset of `tx_errors`.
     pub(super) tx_submit_error_drops: AtomicU64,
+    /// #760 instrumentation. Bytes the three `apply_*` sites
+    /// observed in `sent_bytes`, incremented WITHOUT the
+    /// `if let Some(queue)` guard the per-queue
+    /// `CoSQueueOwnerProfile::drain_sent_bytes` write uses. The sum
+    /// of this plus `post_drain_backup_bytes` equals `tx_bytes` on
+    /// the shaped path. Per-queue `drain_sent_bytes` can undercount
+    /// vs this one; the gap reveals how much shaped traffic is
+    /// leaving the binding via `apply_*`'s early-return / queue-miss
+    /// branches. Not a user-facing metric — purely for #760 triage.
+    pub(super) drain_sent_bytes_shaped_unconditional: AtomicU64,
     /// #760 instrumentation. Bytes delivered by the post-CoS backup
     /// transmit paths in `drain_pending_tx` (transmit_prepared_batch
     /// + transmit_batch calls at tx.rs:289/330). These sites bypass
@@ -984,6 +994,7 @@ impl BindingLiveState {
             pending_tx_local_overflow_drops: AtomicU64::new(0),
             tx_submit_error_drops: AtomicU64::new(0),
             post_drain_backup_bytes: AtomicU64::new(0),
+            drain_sent_bytes_shaped_unconditional: AtomicU64::new(0),
             no_owner_binding_drops: AtomicU64::new(0),
             // #709 / #746: owner-profile telemetry, split by writer
             // into two cacheline-isolated groups. Histograms are zero-
