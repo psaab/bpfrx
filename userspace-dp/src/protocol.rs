@@ -866,6 +866,29 @@ pub(crate) struct CoSQueueStatus {
     pub owner_pps: u64,
     #[serde(rename = "peer_pps", default)]
     pub peer_pps: u64,
+    // #760 overshoot-hunt instrumentation. Read at the same
+    // cadence as the other owner-profile fields; zeroed for
+    // queues without a single unambiguous owner-local binding.
+    #[serde(rename = "drain_sent_bytes", default)]
+    pub drain_sent_bytes: u64,
+    #[serde(rename = "drain_park_root_tokens", default)]
+    pub drain_park_root_tokens: u64,
+    #[serde(rename = "drain_park_queue_tokens", default)]
+    pub drain_park_queue_tokens: u64,
+    // #760 binding-scoped: non-zero means the post-CoS backup
+    // transmit path (drain_pending_tx) sent bytes without
+    // going through any queue's token gate. Same value is
+    // broadcast on every queue status belonging to the
+    // binding — the Go renderer shows it once per interface.
+    #[serde(rename = "post_drain_backup_bytes", default)]
+    pub post_drain_backup_bytes: u64,
+    /// #760 triage. Binding-scoped bytes observed at the three
+    /// `apply_*` tx_bytes sites, written unconditionally. Compare
+    /// against the sum of `drain_sent_bytes` across all queues —
+    /// any gap attributes shaped traffic that bypassed the
+    /// per-queue write via an `apply_*` early-return / queue miss.
+    #[serde(rename = "drain_sent_bytes_shaped_unconditional", default)]
+    pub drain_sent_bytes_shaped_unconditional: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -1186,6 +1209,27 @@ pub(crate) struct BindingStatus {
     // the flow-fair admission / redirect-inbox / pending-FIFO drops.
     #[serde(rename = "tx_submit_error_drops", default)]
     pub tx_submit_error_drops: u64,
+    // #760 instrumentation: post-CoS backup transmit bytes
+    // (drain_pending_tx fallbacks at tx.rs:289/330) that bypass
+    // any CoS queue's token gate.
+    #[serde(rename = "post_drain_backup_bytes", default)]
+    pub post_drain_backup_bytes: u64,
+    // #760 instrumentation: binding-scoped bytes observed at the
+    // three apply_* tx_bytes sites, written unconditionally. Gap
+    // vs the sum of per-queue drain_sent_bytes attributes shaped
+    // traffic that bypassed the per-queue write via an apply_*
+    // early-return / queue miss.
+    #[serde(rename = "drain_sent_bytes_shaped_unconditional", default)]
+    pub drain_sent_bytes_shaped_unconditional: u64,
+    // #760 (PR #773): CoS-bound items dropped at the post-drain
+    // backup filter — cross-worker routing failures the bounded
+    // ingest-drain loop didn't absorb. Non-zero is the primary
+    // operator signal that the backup-path belt-and-suspenders
+    // is catching real leakage.
+    #[serde(rename = "post_drain_backup_cos_drops", default)]
+    pub post_drain_backup_cos_drops: u64,
+    #[serde(rename = "post_drain_backup_cos_drop_bytes", default)]
+    pub post_drain_backup_cos_drop_bytes: u64,
     // #710 attribution note: cross-worker CoS "no-owner-binding" drops
     // are exposed at the `ProcessStatus::cos_no_owner_binding_drops_total`
     // top-level field, not per binding. The increment mechanically lands

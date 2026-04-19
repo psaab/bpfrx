@@ -989,6 +989,14 @@ pub(super) struct CoSQueueRuntime {
     pub(super) wheel_level: u8,
     pub(super) wheel_slot: usize,
     pub(super) items: VecDeque<CoSPendingTxItem>,
+    /// #774 optimization: cached count of `Local` items currently
+    /// resident in `items` + `flow_bucket_items`. Incremented /
+    /// decremented at every `cos_queue_push_*` and
+    /// `cos_queue_pop_front` site. Replaces an O(n) scan in
+    /// `cos_queue_accepts_prepared` that profiled at 3.25% CPU on
+    /// the hot path at line rate. Owner-only writes; no atomic
+    /// needed (same discipline as `queued_bytes`).
+    pub(super) local_item_count: u32,
     // #710: per-queue drop-reason counters. Single-writer (the owner
     // worker is the only code path that mutates this queue's runtime),
     // so plain `u64` is sufficient — no atomics needed on the hot path.
@@ -1083,6 +1091,24 @@ pub(super) struct CoSTimerWheelRuntime {
 pub(super) struct CoSQueueOwnerProfile {
     pub(super) drain_latency_hist: [AtomicU64; super::umem::DRAIN_HIST_BUCKETS],
     pub(super) drain_invocations: AtomicU64,
+    /// #760 instrumentation. Bytes the shaped drain actually
+    /// submitted on behalf of this queue. Divide by a scrape window
+    /// to get an observed drain rate and compare against
+    /// `queue.transmit_rate_bytes`. Writer = owner worker on the
+    /// single site that also decrements `queue.tokens` after a send
+    /// (apply_direct_exact_send_result for exact-owner-local,
+    /// apply_cos_send_result for the non-exact / shared-exact paths).
+    pub(super) drain_sent_bytes: AtomicU64,
+    /// #760 instrumentation. Count of drain iterations where the
+    /// root token gate fired (root.tokens < head_len) and the queue
+    /// got parked waiting for the interface shaper to refill.
+    pub(super) drain_park_root_tokens: AtomicU64,
+    /// #760 instrumentation. Count of drain iterations where the
+    /// per-queue token gate fired (queue.tokens < head_len) and the
+    /// queue got parked waiting for its own refill. A queue that
+    /// sustains throughput above its configured rate with this near
+    /// zero is a direct signal the gate never fired.
+    pub(super) drain_park_queue_tokens: AtomicU64,
 }
 
 impl CoSQueueOwnerProfile {
@@ -1090,6 +1116,9 @@ impl CoSQueueOwnerProfile {
         Self {
             drain_latency_hist: std::array::from_fn(|_| AtomicU64::new(0)),
             drain_invocations: AtomicU64::new(0),
+            drain_sent_bytes: AtomicU64::new(0),
+            drain_park_root_tokens: AtomicU64::new(0),
+            drain_park_queue_tokens: AtomicU64::new(0),
         }
     }
 }

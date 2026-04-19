@@ -1716,6 +1716,18 @@ pub(super) struct OwnerProfileSnapshot {
     pub(super) redirect_acquire_hist: [u64; DRAIN_HIST_BUCKETS],
     pub(super) owner_pps: u64,
     pub(super) peer_pps: u64,
+    /// #760 instrumentation, binding-scoped. Bytes delivered via
+    /// the post-CoS backup transmit paths in `drain_pending_tx`
+    /// — these never passed a queue's token gate. Surfaced on
+    /// the same "unambiguous owner-local exact queue" row the
+    /// other binding-scoped fields use.
+    pub(super) post_drain_backup_bytes: u64,
+    /// #760 instrumentation, binding-scoped. Bytes observed at the
+    /// three `apply_*` tx_bytes sites, incremented unconditionally.
+    /// Compare against the sum of per-queue `drain_sent_bytes`; any
+    /// gap is shaped traffic that bypassed the per-queue write via
+    /// an `apply_*` early-return.
+    pub(super) drain_sent_bytes_shaped_unconditional: u64,
 }
 
 #[inline]
@@ -1740,6 +1752,14 @@ pub(super) fn owner_profile_snapshot(live: &BindingLiveState) -> OwnerProfileSna
         }),
         owner_pps: live.owner_profile_owner.owner_pps.load(Ordering::Relaxed),
         peer_pps: live.owner_profile_peer.peer_pps.load(Ordering::Relaxed),
+        post_drain_backup_bytes: live
+            .owner_profile_owner
+            .post_drain_backup_bytes
+            .load(Ordering::Relaxed),
+        drain_sent_bytes_shaped_unconditional: live
+            .owner_profile_owner
+            .drain_sent_bytes_shaped_unconditional
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -1778,6 +1798,25 @@ pub(crate) fn merge_cos_queue_owner_profile_sum(
         .saturating_add(src.drain_noop_invocations);
     dst.owner_pps = dst.owner_pps.saturating_add(src.owner_pps);
     dst.peer_pps = dst.peer_pps.saturating_add(src.peer_pps);
+    // #760 sum-merge the new per-queue + binding-scoped counters
+    // across workers. Same saturating-add discipline as the rest of
+    // this function — a single queue can be owned by at most one
+    // worker per scrape, so cross-worker aggregation is almost
+    // always sum-of-single-non-zero, but saturating_add keeps us
+    // safe if the ownership ever shifts mid-scrape.
+    dst.drain_sent_bytes = dst.drain_sent_bytes.saturating_add(src.drain_sent_bytes);
+    dst.drain_park_root_tokens = dst
+        .drain_park_root_tokens
+        .saturating_add(src.drain_park_root_tokens);
+    dst.drain_park_queue_tokens = dst
+        .drain_park_queue_tokens
+        .saturating_add(src.drain_park_queue_tokens);
+    dst.post_drain_backup_bytes = dst
+        .post_drain_backup_bytes
+        .saturating_add(src.post_drain_backup_bytes);
+    dst.drain_sent_bytes_shaped_unconditional = dst
+        .drain_sent_bytes_shaped_unconditional
+        .saturating_add(src.drain_sent_bytes_shaped_unconditional);
 }
 
 /// #709: sum-merge a binding's owner-profile snapshot into a per-queue
@@ -1850,6 +1889,17 @@ pub(super) fn merge_binding_scoped_owner_profile(
         .saturating_add(profile.drain_noop_invocations);
     status.owner_pps = status.owner_pps.saturating_add(profile.owner_pps);
     status.peer_pps = status.peer_pps.saturating_add(profile.peer_pps);
+    // #760 smoking gun. Surfaced once per binding on the same
+    // unambiguous owner-local exact queue row the other
+    // binding-scoped fields ride on, so we don't multiply-count
+    // the same binding-wide atomic across several queues of a
+    // shared-exact shape.
+    status.post_drain_backup_bytes = status
+        .post_drain_backup_bytes
+        .saturating_add(profile.post_drain_backup_bytes);
+    status.drain_sent_bytes_shaped_unconditional = status
+        .drain_sent_bytes_shaped_unconditional
+        .saturating_add(profile.drain_sent_bytes_shaped_unconditional);
 }
 
 fn build_worker_cos_statuses_from_maps<'a, I>(
@@ -2023,6 +2073,35 @@ where
                     status.drain_invocations =
                         status.drain_invocations.saturating_add(queue_invocations);
                 }
+                // #760 overshoot-hunt instrumentation. Same Relaxed
+                // load pattern as drain_invocations — single writer
+                // (owner worker, at the queue-token decrement sites
+                // in tx.rs) + single reader (this snapshot path).
+                // drain_sent_bytes is the authoritative per-queue
+                // "bytes the scheduler actually shaped out"; pair it
+                // with `queue.transmit_rate_bytes` over a scrape
+                // window to detect a direct cap bypass on this row.
+                // drain_park_root_tokens / drain_park_queue_tokens
+                // both rising with drain_sent_bytes sustaining above
+                // configured rate would mean the gate fires but the
+                // refill/accounting is wrong; both near zero with
+                // drain_sent_bytes above rate means the gate never
+                // ran for this queue.
+                status.drain_sent_bytes = status.drain_sent_bytes.saturating_add(
+                    queue.owner_profile.drain_sent_bytes.load(Ordering::Relaxed),
+                );
+                status.drain_park_root_tokens = status.drain_park_root_tokens.saturating_add(
+                    queue
+                        .owner_profile
+                        .drain_park_root_tokens
+                        .load(Ordering::Relaxed),
+                );
+                status.drain_park_queue_tokens = status.drain_park_queue_tokens.saturating_add(
+                    queue
+                        .owner_profile
+                        .drain_park_queue_tokens
+                        .load(Ordering::Relaxed),
+                );
 
                 // #709 / #748 / #751: the *binding-scoped* fields
                 // (redirect_acquire_hist, owner_pps, peer_pps,
@@ -2159,6 +2238,7 @@ mod tests {
                     wheel_level: 0,
                     wheel_slot: 0,
                     items: VecDeque::from([CoSPendingTxItem::Local(test_tx_request(80))]),
+                    local_item_count: 1,
                     drop_counters,
                     owner_profile: CoSQueueOwnerProfile::new(),
                 }],
@@ -2292,6 +2372,7 @@ mod tests {
                 wheel_level: 0,
                 wheel_slot: 0,
                 items: VecDeque::new(),
+                local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                 owner_profile: CoSQueueOwnerProfile::new(),
             }],
@@ -2491,7 +2572,8 @@ mod tests {
                     wheel_level: 0,
                     wheel_slot: 0,
                     items: VecDeque::new(),
-                    drop_counters: CoSQueueDropCounters::default(),
+                    local_item_count: 0,
+                drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 CoSQueueRuntime {
@@ -2518,7 +2600,8 @@ mod tests {
                     wheel_level: 0,
                     wheel_slot: 0,
                     items: VecDeque::new(),
-                    drop_counters: CoSQueueDropCounters::default(),
+                    local_item_count: 0,
+                drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 CoSQueueRuntime {
@@ -2545,7 +2628,8 @@ mod tests {
                     wheel_level: 0,
                     wheel_slot: 0,
                     items: VecDeque::new(),
-                    drop_counters: CoSQueueDropCounters::default(),
+                    local_item_count: 0,
+                drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
             ],
@@ -2697,7 +2781,8 @@ mod tests {
                     wheel_level: 0,
                     wheel_slot: 0,
                     items: VecDeque::new(),
-                    drop_counters: CoSQueueDropCounters::default(),
+                    local_item_count: 0,
+                drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 CoSQueueRuntime {
@@ -2724,7 +2809,8 @@ mod tests {
                     wheel_level: 0,
                     wheel_slot: 0,
                     items: VecDeque::new(),
-                    drop_counters: CoSQueueDropCounters::default(),
+                    local_item_count: 0,
+                drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
             ],
@@ -2841,6 +2927,7 @@ mod tests {
                 wheel_level: 0,
                 wheel_slot: 0,
                 items: VecDeque::new(),
+                local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                 owner_profile: CoSQueueOwnerProfile::new(),
             }],
@@ -3003,7 +3090,8 @@ mod tests {
                     wheel_level: 0,
                     wheel_slot: 0,
                     items: VecDeque::new(),
-                    drop_counters: CoSQueueDropCounters::default(),
+                    local_item_count: 0,
+                drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 CoSQueueRuntime {
@@ -3030,7 +3118,8 @@ mod tests {
                     wheel_level: 0,
                     wheel_slot: 0,
                     items: VecDeque::new(),
-                    drop_counters: CoSQueueDropCounters::default(),
+                    local_item_count: 0,
+                drop_counters: CoSQueueDropCounters::default(),
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
             ],
@@ -3918,6 +4007,16 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) redirect_inbox_overflow_drops: u64,
     pub(crate) pending_tx_local_overflow_drops: u64,
     pub(crate) tx_submit_error_drops: u64,
+    // #760 triage: surfaced on BindingStatus so operators can
+    // compare binding-level vs per-queue drain accounting.
+    pub(crate) post_drain_backup_bytes: u64,
+    pub(crate) drain_sent_bytes_shaped_unconditional: u64,
+    // #760 (PR #773): drop-filter counters for CoS-bound items
+    // that reached the post-CoS backup paths. Non-zero indicates
+    // a cross-worker routing failure the bounded ingest-drain
+    // loop did not absorb.
+    pub(crate) post_drain_backup_cos_drops: u64,
+    pub(crate) post_drain_backup_cos_drop_bytes: u64,
     // #710: `no_owner_binding_drops` is intentionally NOT snapshotted
     // per-binding. The atomic on `BindingLiveState` accumulates drops
     // for mechanical accounting (the increment site can only write to

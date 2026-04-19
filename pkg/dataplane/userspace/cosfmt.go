@@ -47,6 +47,14 @@ type cosQueueView struct {
 	redirectAcquireHist  []uint64
 	ownerPPS             uint64
 	peerPPS              uint64
+	// #760 overshoot-hunt instrumentation. drainSentBytes /
+	// drainParkRootTokens / drainParkQueueTokens are queue-scoped.
+	// postDrainBackupBytes is binding-scoped (one-per-binding Rust
+	// attribution; summed across queues here for rendering).
+	drainSentBytes        uint64
+	drainParkRootTokens   uint64
+	drainParkQueueTokens  uint64
+	postDrainBackupBytes  uint64
 }
 
 func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, selector string) string {
@@ -206,6 +214,19 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 					formatHistPercentileMicros(queue.drainLatencyHist, queue.drainInvocations, 99),
 					queue.drainInvocations,
 				)
+				// #760 overshoot-hunt row. Sibling of the OwnerProfile
+				// line so operators can correlate drain-latency with
+				// the rate the queue actually shaped out and the two
+				// gate-park counters. Only rendered when the queue has
+				// been drained at least once — a never-drained queue's
+				// zeros carry no signal.
+				fmt.Fprintf(
+					&b,
+					"           DrainShape:   sent_bytes=%d  park_root=%d  park_queue=%d\n",
+					queue.drainSentBytes,
+					queue.drainParkRootTokens,
+					queue.drainParkQueueTokens,
+				)
 			}
 		}
 	}
@@ -284,13 +305,15 @@ func renderBindingScopedTelemetry(b *strings.Builder, view cosInterfaceView, que
 		return
 	}
 	var (
-		ownerPPS     uint64
-		peerPPS      uint64
-		redirectHist []uint64
+		ownerPPS      uint64
+		peerPPS       uint64
+		redirectHist  []uint64
+		backupBytes   uint64
 	)
 	for _, q := range queues {
 		ownerPPS = saturatingAddU64(ownerPPS, q.ownerPPS)
 		peerPPS = saturatingAddU64(peerPPS, q.peerPPS)
+		backupBytes = saturatingAddU64(backupBytes, q.postDrainBackupBytes)
 		// Fold histograms element-wise; unset-slice queues are
 		// skipped so we don't allocate for queues that reported
 		// no samples.
@@ -306,15 +329,16 @@ func renderBindingScopedTelemetry(b *strings.Builder, view cosInterfaceView, que
 			redirectHist[i] = saturatingAddU64(redirectHist[i], count)
 		}
 	}
-	if ownerPPS == 0 && peerPPS == 0 && !histHasSample(redirectHist) {
+	if ownerPPS == 0 && peerPPS == 0 && !histHasSample(redirectHist) && backupBytes == 0 {
 		return
 	}
 	fmt.Fprintf(
 		b,
-		"  Binding telemetry:        redirect_p99=%s  owner_pps=%d  peer_pps=%d\n",
+		"  Binding telemetry:        redirect_p99=%s  owner_pps=%d  peer_pps=%d  post_drain_backup_bytes=%d\n",
 		formatHistPercentileMicrosFromBuckets(redirectHist, 99),
 		ownerPPS,
 		peerPPS,
+		backupBytes,
 	)
 }
 
@@ -450,6 +474,14 @@ func buildCoSQueueViews(cfg *config.Config, view cosInterfaceView) []cosQueueVie
 			qv.redirectAcquireHist = runtimeQueue.RedirectAcquireHist
 			qv.ownerPPS = runtimeQueue.OwnerPPS
 			qv.peerPPS = runtimeQueue.PeerPPS
+			// #760 copy-through. See field comments on cosQueueView
+			// and on the Rust CoSQueueStatus. A queue that never got
+			// drained leaves these at zero; the renderer gates on
+			// drainInvocations > 0 so a silent queue stays silent.
+			qv.drainSentBytes = runtimeQueue.DrainSentBytes
+			qv.drainParkRootTokens = runtimeQueue.DrainParkRootTokens
+			qv.drainParkQueueTokens = runtimeQueue.DrainParkQueueTokens
+			qv.postDrainBackupBytes = runtimeQueue.PostDrainBackupBytes
 			queueViews[qv.queueID] = qv
 		}
 	}
