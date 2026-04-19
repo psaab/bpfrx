@@ -833,114 +833,120 @@ fn ingest_cos_pending_tx_with_provenance(
     // this hits >99%. Saves 2-3 FastMap lookups per item on the
     // hot path (profile: 1.96% CPU in this function at line rate).
     //
-    // The decision tree is:
-    //   A. Route to a different owner WORKER via MPSC command
-    //   B. Route to a different owner BINDING via MPSC inbox
-    //   C. Enqueue into this binding's local CoS runtime
+    // Semantic correctness: this mirrors the pre-#780 cascade of
+    //   Step 1: redirect_local_cos_request_to_owner
+    //   Step 2: redirect_local_cos_request_to_owner_binding
+    //   Step 3: enqueue_local_into_cos (Err→item stays in pending)
+    // exactly. Step 1 bails (Err) on:
+    //   - queue not in iface, OR
+    //   - shared_exact AND tx_owner_live is Some, OR
+    //   - owner_worker_id == current_worker_id
+    // Step 2 (only reached when Step 1 bailed) ignores the queue
+    // and checks iface-level tx_owner_live; routes if set AND not
+    // ptr_eq(tx_owner_live, &binding.live).
     //
-    // A/B collapse into one `enqueue_tx_owned` call when
-    // `owner_live` is set and we're not already that owner.
-    // Caching just the Option<Arc<BindingLiveState>> for the
-    // resolved owner binding covers both, since
-    // `redirect_local_cos_request_to_owner_binding` and
-    // `redirect_local_cos_request_to_owner` both ultimately
-    // resolve to the same owner live state for this queue.
-    #[derive(Clone, Copy)]
-    enum LocalRoutingDecision {
-        RedirectToCrossWorker(u32), // owner_worker_id != current
-        RedirectToOwnerBinding,     // owner binding on same worker
-        EnqueueLocal,
-    }
+    // Codex adversarial review (PR #782 round 1) flagged that
+    // collapsing both steps lost the "queue_fast=None but Step 2
+    // would still route via iface" path, and the "same owner
+    // worker but not owner binding" path. This rewrite evaluates
+    // Step 1 and Step 2 independently on the cached lookup and
+    // picks whichever routes, falling through to EnqueueLocal
+    // only when both bail — matching the prior cascade.
     let mut cached_key: Option<(i32, Option<u8>)> = None;
-    let mut cached_decision: Option<(LocalRoutingDecision, Option<Arc<BindingLiveState>>)> = None;
+    let mut cached_decision: Option<LocalRoutingDecision> = None;
     process_pending_queue_in_place(&mut pending, |req| {
-        // #780 cache hit check: if this item's routing key matches
-        // the previous item's, reuse the resolved decision.
         let key = (req.egress_ifindex, req.cos_queue_id);
         if cached_key != Some(key) {
             cached_key = Some(key);
-            // Resolve fresh. Replicates the prior three-step
-            // logic in one FastMap lookup.
-            let Some((iface_fast, queue_fast)) = cos_fast_queue(
-                &binding.cos_fast_interfaces,
-                req.egress_ifindex,
+            // Look up once; iface_fast always consulted (matches
+            // Step 2), queue_fast only for Step 1.
+            let iface_fast_opt = binding.cos_fast_interfaces.get(&req.egress_ifindex);
+            cached_decision = Some(resolve_local_routing_decision(
+                iface_fast_opt,
                 req.cos_queue_id,
-            ) else {
-                cached_decision = Some((LocalRoutingDecision::EnqueueLocal, None));
-                return enqueue_local_into_cos(binding, forwarding, req, now_ns);
-            };
-            // shared_exact with tx_owner_live set: owner-binding
-            // path takes precedence (the original code's step 2
-            // wins when step 1 bails on the shared_exact check).
-            if queue_fast.shared_exact && iface_fast.tx_owner_live.is_some() {
-                let owner_live = iface_fast.tx_owner_live.clone();
-                if owner_live
-                    .as_ref()
-                    .is_some_and(|ol| Arc::ptr_eq(ol, &binding.live))
-                {
-                    // We ARE the owner binding. Enqueue locally.
-                    cached_decision = Some((LocalRoutingDecision::EnqueueLocal, None));
-                } else {
-                    cached_decision =
-                        Some((LocalRoutingDecision::RedirectToOwnerBinding, owner_live));
-                }
-            } else {
-                let owner_worker_id = queue_fast.owner_worker_id;
-                if owner_worker_id == worker_id {
-                    cached_decision = Some((LocalRoutingDecision::EnqueueLocal, None));
-                } else if queue_fast.owner_live.is_some() {
-                    cached_decision = Some((
-                        LocalRoutingDecision::RedirectToCrossWorker(owner_worker_id),
-                        queue_fast.owner_live.clone(),
-                    ));
-                } else {
-                    cached_decision = Some((
-                        LocalRoutingDecision::RedirectToCrossWorker(owner_worker_id),
-                        None,
-                    ));
-                }
-            }
+                worker_id,
+                &binding.live,
+            ));
         }
-        match cached_decision.as_ref().expect("decision cached above") {
-            (LocalRoutingDecision::EnqueueLocal, _) => {
+        let decision = cached_decision.as_ref().expect("decision cached above");
+        match decision {
+            LocalRoutingDecision::Step1RedirectArc(arc)
+            | LocalRoutingDecision::Step2RedirectArc(arc) => match arc.enqueue_tx_owned(req) {
+                Ok(()) => Ok(()),
+                Err(req) => Err(req),
+            },
+            LocalRoutingDecision::Step1RedirectCommand(owner_worker_id) => {
+                if let Some(commands) = worker_commands_by_id.get(owner_worker_id) {
+                    if let Ok(mut pending) = commands.lock() {
+                        pending.push_back(WorkerCommand::EnqueueShapedLocal(req));
+                        return Ok(());
+                    }
+                }
+                Err(req)
+            }
+            LocalRoutingDecision::EnqueueLocal => {
                 match enqueue_local_into_cos(binding, forwarding, req, now_ns) {
                     Ok(()) => Ok(()),
                     Err(req) => Err(req),
-                }
-            }
-            (LocalRoutingDecision::RedirectToOwnerBinding, Some(owner_live)) => {
-                match owner_live.enqueue_tx_owned(req) {
-                    Ok(()) => Ok(()),
-                    Err(req) => Err(req),
-                }
-            }
-            (LocalRoutingDecision::RedirectToOwnerBinding, None) => {
-                // Should be unreachable (owner_live guaranteed Some
-                // in the branch that sets this decision) but keep
-                // a correctness fallback.
-                Err(req)
-            }
-            (LocalRoutingDecision::RedirectToCrossWorker(owner_worker_id), owner_live) => {
-                if let Some(owner_live) = owner_live.as_ref() {
-                    match owner_live.enqueue_tx_owned(req) {
-                        Ok(()) => Ok(()),
-                        Err(req) => Err(req),
-                    }
-                } else if let Some(commands) = worker_commands_by_id.get(owner_worker_id) {
-                    if let Ok(mut pending) = commands.lock() {
-                        pending.push_back(WorkerCommand::EnqueueShapedLocal(req));
-                        Ok(())
-                    } else {
-                        Err(req)
-                    }
-                } else {
-                    Err(req)
                 }
             }
         }
     });
     binding.pending_tx_local = pending;
     bound_pending_tx_local(binding);
+}
+
+/// #780: routing-decision cache value. Preserves the exact
+/// pre-#780 three-step cascade semantics: Step 1 and Step 2 are
+/// tracked as separate outcomes so we don't lose Codex-flagged
+/// cases where Step 1 bails but Step 2 routes via iface.
+#[derive(Clone)]
+enum LocalRoutingDecision {
+    EnqueueLocal,
+    /// Step 1 outcome: redirect to owner worker's owner_live arc
+    /// (matches the `owner_live.enqueue_tx_owned` branch of
+    /// `redirect_local_cos_request_to_owner`).
+    Step1RedirectArc(Arc<BindingLiveState>),
+    /// Step 1 outcome: redirect via worker_commands_by_id channel
+    /// (matches the `commands.lock().push_back` branch).
+    Step1RedirectCommand(u32),
+    /// Step 2 outcome: redirect to iface-level tx_owner_live arc
+    /// (matches `redirect_local_cos_request_to_owner_binding`).
+    Step2RedirectArc(Arc<BindingLiveState>),
+}
+
+/// #780: resolve the routing decision for a (iface, queue) pair.
+/// Preserves the exact pre-#780 cascade semantics. Moved out of
+/// the closure so it can be unit-tested independently.
+fn resolve_local_routing_decision(
+    iface_fast_opt: Option<&WorkerCoSInterfaceFastPath>,
+    cos_queue_id: Option<u8>,
+    current_worker_id: u32,
+    current_live: &Arc<BindingLiveState>,
+) -> LocalRoutingDecision {
+    // Step 1 check (mirrors redirect_local_cos_request_to_owner):
+    if let Some(iface_fast) = iface_fast_opt {
+        if let Some(queue_fast) = iface_fast.queue_fast_path(cos_queue_id) {
+            let step1_bail = (queue_fast.shared_exact && iface_fast.tx_owner_live.is_some())
+                || queue_fast.owner_worker_id == current_worker_id;
+            if !step1_bail {
+                // Step 1 routes. Pick arc or command channel.
+                if let Some(owner_live) = queue_fast.owner_live.as_ref() {
+                    return LocalRoutingDecision::Step1RedirectArc(owner_live.clone());
+                }
+                return LocalRoutingDecision::Step1RedirectCommand(queue_fast.owner_worker_id);
+            }
+        }
+        // Step 1 bailed (or no queue in iface). Step 2 only uses
+        // iface-level tx_owner_live:
+        if let Some(owner_live) = iface_fast.tx_owner_live.as_ref() {
+            if !Arc::ptr_eq(owner_live, current_live) {
+                return LocalRoutingDecision::Step2RedirectArc(owner_live.clone());
+            }
+        }
+    }
+    // Both bailed. Fall through to local enqueue.
+    LocalRoutingDecision::EnqueueLocal
 }
 
 #[inline]
@@ -6090,6 +6096,184 @@ mod tests {
 
         assert_eq!(runtime.queues[0].tokens, 0);
         assert_eq!(runtime.queues[0].last_refill_ns, 0);
+    }
+
+    /// #780 / Codex adversarial review: verify the decision DAG
+    /// inside `resolve_local_routing_decision` exactly mirrors the
+    /// pre-#780 three-step cascade across every quadrant that was
+    /// flagged. If any of these diverge from the equivalent
+    /// `redirect_local_cos_request_to_owner` →
+    /// `redirect_local_cos_request_to_owner_binding` →
+    /// enqueue-local fallthrough, the test will fail.
+    #[test]
+    fn resolve_local_routing_decision_step1_routes_via_arc() {
+        let current_live = Arc::new(BindingLiveState::new());
+        let owner_live = Arc::new(BindingLiveState::new());
+        let ifaces = test_cos_fast_interfaces(
+            80,
+            12,
+            4,
+            vec![(
+                4,
+                test_queue_fast_path(false, 7, Some(owner_live.clone()), None),
+            )],
+            None,
+            None,
+        );
+        let iface = ifaces.get(&80);
+        let decision =
+            resolve_local_routing_decision(iface, Some(4), 3 /* != owner_worker */, &current_live);
+        match decision {
+            LocalRoutingDecision::Step1RedirectArc(arc) => {
+                assert!(Arc::ptr_eq(&arc, &owner_live));
+            }
+            _ => panic!("expected Step1RedirectArc"),
+        }
+    }
+
+    #[test]
+    fn resolve_local_routing_decision_step1_routes_via_command_when_no_arc() {
+        let current_live = Arc::new(BindingLiveState::new());
+        let ifaces = test_cos_fast_interfaces(
+            80,
+            12,
+            4,
+            vec![(4, test_queue_fast_path(false, 7, None, None))],
+            None,
+            None,
+        );
+        let decision =
+            resolve_local_routing_decision(ifaces.get(&80), Some(4), 3, &current_live);
+        match decision {
+            LocalRoutingDecision::Step1RedirectCommand(w) => assert_eq!(w, 7),
+            _ => panic!("expected Step1RedirectCommand"),
+        }
+    }
+
+    #[test]
+    fn resolve_local_routing_decision_step2_routes_when_owner_worker_is_current() {
+        // Step 1 bails because owner_worker_id == current_worker_id.
+        // Step 2 still has a tx_owner_live on the iface that is NOT
+        // this binding → must route to it. This is the Codex-flagged
+        // (shared_exact=0, tx_owner_live=Some, owner_worker==current,
+        //  !ptr_eq) quadrant.
+        let current_live = Arc::new(BindingLiveState::new());
+        let owner_live = Arc::new(BindingLiveState::new());
+        let ifaces = test_cos_fast_interfaces(
+            80,
+            12,
+            4,
+            vec![(
+                4,
+                test_queue_fast_path(false, 3, Some(owner_live.clone()), None),
+            )],
+            Some(owner_live.clone()),
+            None,
+        );
+        let decision =
+            resolve_local_routing_decision(ifaces.get(&80), Some(4), 3, &current_live);
+        match decision {
+            LocalRoutingDecision::Step2RedirectArc(arc) => {
+                assert!(Arc::ptr_eq(&arc, &owner_live));
+            }
+            _ => panic!("expected Step2RedirectArc"),
+        }
+    }
+
+    #[test]
+    fn resolve_local_routing_decision_step2_routes_when_shared_exact_bails_step1() {
+        // Step 1 bails because shared_exact && tx_owner_live is Some.
+        // Step 2 routes via iface.tx_owner_live.
+        let current_live = Arc::new(BindingLiveState::new());
+        let owner_live = Arc::new(BindingLiveState::new());
+        let ifaces = test_cos_fast_interfaces(
+            80,
+            12,
+            4,
+            vec![(
+                4,
+                test_queue_fast_path(
+                    true, /* shared_exact */
+                    3,
+                    None,
+                    Some(Arc::new(SharedCoSQueueLease::new(
+                        1_000_000,
+                        COS_MIN_BURST_BYTES,
+                        2,
+                    ))),
+                ),
+            )],
+            Some(owner_live.clone()),
+            None,
+        );
+        let decision =
+            resolve_local_routing_decision(ifaces.get(&80), Some(4), 3, &current_live);
+        match decision {
+            LocalRoutingDecision::Step2RedirectArc(arc) => {
+                assert!(Arc::ptr_eq(&arc, &owner_live));
+            }
+            _ => panic!("expected Step2RedirectArc"),
+        }
+    }
+
+    #[test]
+    fn resolve_local_routing_decision_enqueue_local_when_both_bail() {
+        // Step 1 bails (owner_worker == current). Step 2 bails
+        // (ptr_eq to current_live). Must EnqueueLocal.
+        let current_live = Arc::new(BindingLiveState::new());
+        let ifaces = test_cos_fast_interfaces(
+            80,
+            12,
+            4,
+            vec![(
+                4,
+                test_queue_fast_path(false, 3, Some(current_live.clone()), None),
+            )],
+            Some(current_live.clone()),
+            None,
+        );
+        let decision =
+            resolve_local_routing_decision(ifaces.get(&80), Some(4), 3, &current_live);
+        matches!(decision, LocalRoutingDecision::EnqueueLocal)
+            .then_some(())
+            .expect("expected EnqueueLocal");
+    }
+
+    #[test]
+    fn resolve_local_routing_decision_step2_routes_when_queue_absent() {
+        // Queue id not in iface → Step 1 has no queue_fast, bails.
+        // Step 2 uses iface-level tx_owner_live → routes.
+        // This is the Codex-flagged "queue_fast=None but Step 2
+        // would still route via iface" quadrant.
+        let current_live = Arc::new(BindingLiveState::new());
+        let owner_live = Arc::new(BindingLiveState::new());
+        let ifaces = test_cos_fast_interfaces(
+            80,
+            12,
+            4,
+            vec![(4, test_queue_fast_path(false, 7, None, None))],
+            Some(owner_live.clone()),
+            None,
+        );
+        let decision =
+            resolve_local_routing_decision(ifaces.get(&80), Some(99) /* absent */, 3, &current_live);
+        match decision {
+            LocalRoutingDecision::Step2RedirectArc(arc) => {
+                assert!(Arc::ptr_eq(&arc, &owner_live));
+            }
+            _ => panic!("expected Step2RedirectArc"),
+        }
+    }
+
+    #[test]
+    fn resolve_local_routing_decision_enqueue_local_when_iface_absent() {
+        let current_live = Arc::new(BindingLiveState::new());
+        let ifaces: FastMap<i32, WorkerCoSInterfaceFastPath> = FastMap::default();
+        let decision =
+            resolve_local_routing_decision(ifaces.get(&80), Some(4), 3, &current_live);
+        matches!(decision, LocalRoutingDecision::EnqueueLocal)
+            .then_some(())
+            .expect("expected EnqueueLocal when iface absent");
     }
 
     #[test]
