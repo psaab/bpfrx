@@ -213,98 +213,102 @@ pub(super) fn drain_pending_tx(
     {
         maybe_wake_tx(binding, false, now_ns);
     }
-    ingest_cos_pending_tx(
-        binding,
-        forwarding,
-        now_ns,
-        worker_id,
-        worker_commands_by_id,
-    );
-    // Only continue this loop while shaped service is making real forward
-    // progress. A retrying CoS batch (for example, no free TX frame on the
-    // owner binding) must yield back to the worker loop so other bindings can
-    // run and completions/recycles can free resources.
-    //
-    // #709 / #751: time every `drain_shaped_tx` invocation with one
-    // pair of `monotonic_nanos()` calls. `monotonic_nanos` is
-    // `clock_gettime(CLOCK_MONOTONIC)` via VDSO — no syscall, ~15 ns
-    // each.
+    // #760: bounded ingest → drain_shaped_tx loop. The MPSC
+    // redirect inbox is fed by peer workers concurrently with the
+    // drain loop — packets that arrive mid-drain would otherwise
+    // miss both ingest (already ran) and the shaped service
+    // (already looped to noop) and leak UNSHAPED through the
+    // post-drain backup paths below. Per Codex adversarial review
+    // (PR #773): a single re-ingest only closes the window up to
+    // its call site; peers pushing after that still bypass. Loop
+    // ingest+drain with a small budget so the closure widens
+    // without risking starvation of the outer worker loop if a
+    // peer is feeding faster than we can admit+drain.
     //
     // Attribution split:
     //   * A serviced drain (Some) attributes latency + invocation
     //     to the specific queue's per-queue atomics via indexed
     //     access (queue_idx is captured by drain_shaped_tx at
-    //     selection time so we avoid a linear scan here — see
-    //     Copilot review on the initial revision of this PR).
+    //     selection time so we avoid a linear scan here).
     //   * A no-op drain (None — nothing ran on any queue) bumps
-    //     the binding-wide drain_noop_invocations counter. That
-    //     field stays binding-scoped because there is no queue
-    //     context to attribute it to.
+    //     the binding-wide drain_noop_invocations counter ONCE
+    //     per outer ingest iteration (not per noop drain) —
+    //     otherwise a tight no-op inner loop multiplicatively
+    //     inflates noop invocation count and dwarfs the real
+    //     signal.
     //
-    // Pre-#751 also wrote the drain latency + invocations into the
-    // binding-wide `owner_profile_owner` atomics unconditionally.
-    // Those writes are dead post-#751 — the snapshot path reads
-    // drain stats from per-queue atomics and
-    // `merge_binding_scoped_owner_profile` no longer touches them —
-    // so removing the writes reclaims the fetch_add cost on the
-    // hot path and keeps BindingLiveState's drain fields as a pure
-    // noop accounting slot.
-    loop {
-        let start_ns = monotonic_nanos();
-        let serviced = drain_shaped_tx(binding, now_ns, shared_recycles);
-        if let Some(serviced) = serviced.as_ref() {
-            let delta = monotonic_nanos().saturating_sub(start_ns);
-            let bucket = bucket_index_for_ns(delta);
-            if let Some(root) = binding.cos_interfaces.get(&serviced.root_ifindex) {
-                if let Some(queue) = root.queues.get(serviced.queue_idx) {
-                    // queue_idx + queue_id are captured at selection
-                    // time inside drain_shaped_tx. `root.queues` is
-                    // not reshaped during a single drain pass, so
-                    // the indexed access is safe and O(1). The id
-                    // recheck guards against a future refactor that
-                    // swaps queue positions between selection and
-                    // attribution — the miss path just skips the
-                    // write rather than poisoning another queue's
-                    // counters.
-                    if queue.queue_id == serviced.queue_id {
-                        queue.owner_profile.drain_latency_hist[bucket]
-                            .fetch_add(1, Ordering::Relaxed);
-                        queue
-                            .owner_profile
-                            .drain_invocations
-                            .fetch_add(1, Ordering::Relaxed);
+    // Budget sizing: 4 iterations is enough to absorb a 3× burst
+    // of peer redirects arriving during the shaped-drain loop
+    // without risking the outer worker loop's ability to service
+    // RX / completions / other bindings. At line-rate saturation
+    // the common case is one ingest + one drain pass and early
+    // exit on the quiesce check below.
+    const REINGEST_BUDGET: usize = 4;
+    for iter in 0..REINGEST_BUDGET {
+        let first_pass = iter == 0;
+        ingest_cos_pending_tx_with_provenance(
+            binding,
+            forwarding,
+            now_ns,
+            worker_id,
+            worker_commands_by_id,
+            first_pass,
+        );
+        let mut serviced_in_inner = false;
+        loop {
+            let start_ns = monotonic_nanos();
+            let serviced = drain_shaped_tx(binding, now_ns, shared_recycles);
+            if let Some(serviced) = serviced.as_ref() {
+                let delta = monotonic_nanos().saturating_sub(start_ns);
+                let bucket = bucket_index_for_ns(delta);
+                if let Some(root) = binding.cos_interfaces.get(&serviced.root_ifindex) {
+                    if let Some(queue) = root.queues.get(serviced.queue_idx) {
+                        if queue.queue_id == serviced.queue_id {
+                            queue.owner_profile.drain_latency_hist[bucket]
+                                .fetch_add(1, Ordering::Relaxed);
+                            queue
+                                .owner_profile
+                                .drain_invocations
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
+                did_work = true;
+                serviced_in_inner = true;
+            } else {
+                break;
             }
-            did_work = true;
-        } else {
+        }
+        if !serviced_in_inner {
             binding
                 .live
                 .owner_profile_owner
                 .drain_noop_invocations
                 .fetch_add(1, Ordering::Relaxed);
+        }
+        // Quiesce check: if both local/prepared buffers are empty
+        // AND the redirect inbox is empty, another iteration
+        // cannot find any new work. Exit before burning the rest
+        // of the budget. The common case on a steady-state
+        // workload is one iteration through the budget.
+        if binding.pending_tx_prepared.is_empty()
+            && binding.pending_tx_local.is_empty()
+            && binding.live.pending_tx_empty()
+        {
             break;
         }
     }
-    // #760: cross-worker items can arrive on the redirect inbox
-    // DURING the drain_shaped_tx loop above, after the initial
-    // ingest_cos_pending_tx already ran. Without a second pass
-    // those late arrivals fall through the post-drain backup paths
-    // below and transmit UNSHAPED, bypassing the CoS gate. On fw1
-    // primary iperf3 -P 1 showed 27% of tx bytes bypassing via
-    // this path. Re-ingest now so every fresh cos-queued item
-    // gets a chance at CoS admission before the backup paths pick
-    // it up. Allocation-free: both pending buffers are worker-
-    // owned VecDeques reused across polls; the inbox drain is
-    // lock-free MPSC; the call is a no-op when all three
-    // (pending_tx_local, pending_tx_prepared, inbox) are empty.
-    ingest_cos_pending_tx(
-        binding,
-        forwarding,
-        now_ns,
-        worker_id,
-        worker_commands_by_id,
-    );
+    // #760: belt-and-suspenders. Even after the bounded loop
+    // quiesces, a peer could push to the inbox between the
+    // quiesce check and the backup drain below, OR an item may
+    // remain in pending_tx_local / pending_tx_prepared because
+    // enqueue_cos_item returned Err (missing cos_interfaces
+    // entry, unresolvable queue_id — see tx.rs:4391-4395). Items
+    // with `cos_queue_id.is_some()` MUST NOT transmit via the
+    // backup path — doing so bypasses the CoS cap. Drop them
+    // here and recycle any UMEM slots they hold so the frame
+    // allocator stays in balance.
+    drop_cos_bound_prepared_leftovers(binding);
     while !binding.pending_tx_prepared.is_empty() {
         match transmit_prepared_batch(binding, now_ns) {
             Ok((packets, bytes)) => {
@@ -324,6 +328,7 @@ pub(super) fn drain_pending_tx(
                 // cap bypass we're hunting.
                 binding
                     .live
+                    .owner_profile_owner
                     .post_drain_backup_bytes
                     .fetch_add(bytes, Ordering::Relaxed);
             }
@@ -351,6 +356,12 @@ pub(super) fn drain_pending_tx(
     if pending.is_empty() {
         return did_work || binding_has_pending_tx_work(binding);
     }
+    // #760: drop any CoS-bound items that reached this fallback.
+    // Symmetric with drop_cos_bound_prepared_leftovers above — see
+    // that function's comment for rationale. TxRequest owns its
+    // frame bytes as Vec<u8>; dropping the request frees the vec,
+    // no free_tx_frames bookkeeping needed.
+    drop_cos_bound_local_leftovers(&mut pending, &binding.live);
     let mut retry = VecDeque::new();
     while let Some(req) = pending.pop_front() {
         retry.push_back(req);
@@ -371,6 +382,7 @@ pub(super) fn drain_pending_tx(
                         // for why this is the #760 smoking gun.
                         binding
                             .live
+                            .owner_profile_owner
                             .post_drain_backup_bytes
                             .fetch_add(bytes, Ordering::Relaxed);
                     }
@@ -392,6 +404,86 @@ pub(super) fn drain_pending_tx(
     }
     update_binding_debug_state(binding);
     did_work || binding_has_pending_tx_work(binding)
+}
+
+/// #760: drop any prepared TX requests whose `cos_queue_id` is
+/// `Some(_)` — these items should have been admitted to a CoS
+/// queue via `ingest_cos_pending_tx`, and transmitting them
+/// through the post-CoS backup path bypasses the shaper. The
+/// UMEM frame slot each request holds is recycled immediately so
+/// the free-frame allocator stays in balance. A non-zero drop
+/// count here indicates a cross-worker routing failure
+/// (redirect-to-owner returned Err AND local-enqueue returned
+/// Err), which is the narrow failure mode the re-ingest + drop
+/// pair is designed to defend against.
+fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
+    if binding.pending_tx_prepared.is_empty() {
+        return;
+    }
+    let mut pending = core::mem::take(&mut binding.pending_tx_prepared);
+    let mut dropped = 0u64;
+    let mut dropped_bytes = 0u64;
+    let mut surviving = VecDeque::with_capacity(pending.len());
+    for req in pending.drain(..) {
+        if req.cos_queue_id.is_some() {
+            dropped = dropped.saturating_add(1);
+            dropped_bytes = dropped_bytes.saturating_add(req.len as u64);
+            recycle_prepared_immediately(binding, &req);
+        } else {
+            surviving.push_back(req);
+        }
+    }
+    binding.pending_tx_prepared = surviving;
+    if dropped > 0 {
+        binding
+            .live
+            .tx_errors
+            .fetch_add(dropped, Ordering::Relaxed);
+        binding
+            .live
+            .owner_profile_owner
+            .post_drain_backup_cos_drops
+            .fetch_add(dropped, Ordering::Relaxed);
+        binding
+            .live
+            .owner_profile_owner
+            .post_drain_backup_cos_drop_bytes
+            .fetch_add(dropped_bytes, Ordering::Relaxed);
+    }
+}
+
+/// #760: symmetric to `drop_cos_bound_prepared_leftovers` but for
+/// local (non-prepared) TxRequests. `TxRequest::bytes` is a
+/// Vec<u8> owned by the request — dropping the request frees the
+/// buffer, so no explicit recycle is needed here.
+fn drop_cos_bound_local_leftovers(
+    pending: &mut VecDeque<TxRequest>,
+    live: &BindingLiveState,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut surviving = VecDeque::with_capacity(pending.len());
+    let mut dropped = 0u64;
+    let mut dropped_bytes = 0u64;
+    for req in pending.drain(..) {
+        if req.cos_queue_id.is_some() {
+            dropped = dropped.saturating_add(1);
+            dropped_bytes = dropped_bytes.saturating_add(req.bytes.len() as u64);
+        } else {
+            surviving.push_back(req);
+        }
+    }
+    *pending = surviving;
+    if dropped > 0 {
+        live.tx_errors.fetch_add(dropped, Ordering::Relaxed);
+        live.owner_profile_owner
+            .post_drain_backup_cos_drops
+            .fetch_add(dropped, Ordering::Relaxed);
+        live.owner_profile_owner
+            .post_drain_backup_cos_drop_bytes
+            .fetch_add(dropped_bytes, Ordering::Relaxed);
+    }
 }
 
 pub(super) enum TxError {
@@ -606,6 +698,37 @@ fn ingest_cos_pending_tx(
     worker_id: u32,
     worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
 ) {
+    ingest_cos_pending_tx_with_provenance(
+        binding,
+        forwarding,
+        now_ns,
+        worker_id,
+        worker_commands_by_id,
+        true,
+    );
+}
+
+/// #760: same as `ingest_cos_pending_tx` but skips the
+/// `owner_pps` / `peer_pps` attribution. `drain_pending_tx` calls
+/// ingest once at the top (attribution ON) and then again after
+/// the shaped-drain loop exits (attribution OFF). The second pass
+/// drains items that peers pushed to the MPSC inbox DURING the
+/// shaped drain; counting those as `owner_pps` would corrupt the
+/// provenance telemetry because items left over in
+/// `pending_tx_local` from the first pass get indistinguishably
+/// mixed with fresh inbox arrivals on the second pass. Per Codex
+/// adversarial review (PR #773): "The second pass reclassifies
+/// peer requests as owner-local; inflates owner_pps, deflates
+/// peer_pps — exactly the wrong signal for diagnosing owner
+/// hotspots."
+fn ingest_cos_pending_tx_with_provenance(
+    binding: &mut BindingWorker,
+    forwarding: &ForwardingState,
+    now_ns: u64,
+    worker_id: u32,
+    worker_commands_by_id: &BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>>,
+    count_pps: bool,
+) {
     if forwarding.cos.interfaces.is_empty() {
         return;
     }
@@ -646,17 +769,22 @@ fn ingest_cos_pending_tx(
     //
     // For non-owner bindings the MPSC inbox is empty (peers never push
     // to a binding they do not own), so `peer` naturally stays at 0.
+    //
+    // #760: `count_pps` is false on re-ingest passes — items already
+    // in `pending_tx_local` at that point were left over from the
+    // first pass (Err returns), and re-classifying them as owner-
+    // local would double-count or mis-attribute them.
     let owner_local_count = pending.len() as u64;
     binding.live.take_pending_tx_into(&mut pending);
     let peer_count = (pending.len() as u64).saturating_sub(owner_local_count);
-    if owner_local_count > 0 {
+    if count_pps && owner_local_count > 0 {
         binding
             .live
             .owner_profile_owner
             .owner_pps
             .fetch_add(owner_local_count, Ordering::Relaxed);
     }
-    if peer_count > 0 {
+    if count_pps && peer_count > 0 {
         binding
             .live
             .owner_profile_peer
@@ -2467,6 +2595,7 @@ fn apply_direct_exact_send_result(
         // this, the gap is an `apply_*` early-return / queue-miss.
         binding
             .live
+            .owner_profile_owner
             .drain_sent_bytes_shaped_unconditional
             .fetch_add(sent_bytes, Ordering::Relaxed);
     }
@@ -2605,6 +2734,7 @@ fn submit_cos_batch(
                         // Local path. See umem.rs field comment.
                         binding
                             .live
+                            .owner_profile_owner
                             .drain_sent_bytes_shaped_unconditional
                             .fetch_add(bytes, Ordering::Relaxed);
                     }
@@ -2663,6 +2793,7 @@ fn submit_cos_batch(
                         // field comment.
                         binding
                             .live
+                            .owner_profile_owner
                             .drain_sent_bytes_shaped_unconditional
                             .fetch_add(bytes, Ordering::Relaxed);
                     }

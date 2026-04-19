@@ -192,6 +192,41 @@ pub(super) struct OwnerProfileOwnerWrites {
     /// split by writer for cacheline isolation (#746). The owner is
     /// the only writer; peers read through `snapshot()`.
     pub(super) owner_pps: AtomicU64,
+    /// #760 instrumentation (Codex adversarial review, PR #773):
+    /// moved here from `BindingLiveState` so owner-only writes
+    /// don't ping-pong on the cacheline that holds multi-writer
+    /// `redirect_inbox_overflow_drops`.
+    ///
+    /// Bytes observed at the three `apply_*` tx_bytes sites,
+    /// incremented unconditionally. Sum of this + `post_drain_backup_bytes`
+    /// equals `tx_bytes` on the shaped path. Gap vs the per-queue
+    /// `drain_sent_bytes` reveals apply_* queue-miss bytes.
+    ///
+    /// Read skew note (Codex adversarial review, PR #773): these
+    /// three atomics (`tx_bytes`, `drain_sent_bytes_shaped_unconditional`,
+    /// `post_drain_backup_bytes`) are written at separate sites
+    /// and loaded at separate scrape instants. A snapshot that
+    /// lands between the `tx_bytes.fetch_add` and the companion
+    /// `fetch_add` will show a transient "bypass gap" that is
+    /// pure read skew, not a real bypass event. Interpret these
+    /// as DELTA-OVER-WINDOW diagnostics rather than point-in-
+    /// time equalities. The window needs to span many cache-line
+    /// writes (microseconds) to amortise the skew to negligible.
+    pub(super) drain_sent_bytes_shaped_unconditional: AtomicU64,
+    /// #760 instrumentation. Bytes delivered by the post-CoS
+    /// backup transmit paths in `drain_pending_tx`
+    /// (transmit_prepared_batch + transmit_batch). Post-fix (PR
+    /// #773) this reflects non-CoS traffic only; CoS-bound items
+    /// are dropped before reaching those sites.
+    pub(super) post_drain_backup_bytes: AtomicU64,
+    /// #760 (PR #773) drop-filter counters: items with
+    /// `cos_queue_id.is_some()` that reached the post-drain
+    /// backup paths and were dropped instead of transmitted
+    /// unshaped. Non-zero indicates a cross-worker routing
+    /// failure that the bounded ingest-drain loop did not
+    /// absorb.
+    pub(super) post_drain_backup_cos_drops: AtomicU64,
+    pub(super) post_drain_backup_cos_drop_bytes: AtomicU64,
 }
 
 /// #746: peer-worker-written owner-profile telemetry. Every redirecting
@@ -238,6 +273,10 @@ impl OwnerProfileOwnerWrites {
             drain_invocations: AtomicU64::new(0),
             drain_noop_invocations: AtomicU64::new(0),
             owner_pps: AtomicU64::new(0),
+            drain_sent_bytes_shaped_unconditional: AtomicU64::new(0),
+            post_drain_backup_bytes: AtomicU64::new(0),
+            post_drain_backup_cos_drops: AtomicU64::new(0),
+            post_drain_backup_cos_drop_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -856,25 +895,6 @@ pub(super) struct BindingLiveState {
     /// non-zero value usually indicates a frame-building bug upstream
     /// or a legitimate oversize packet. Subset of `tx_errors`.
     pub(super) tx_submit_error_drops: AtomicU64,
-    /// #760 instrumentation. Bytes the three `apply_*` sites
-    /// observed in `sent_bytes`, incremented WITHOUT the
-    /// `if let Some(queue)` guard the per-queue
-    /// `CoSQueueOwnerProfile::drain_sent_bytes` write uses. The sum
-    /// of this plus `post_drain_backup_bytes` equals `tx_bytes` on
-    /// the shaped path. Per-queue `drain_sent_bytes` can undercount
-    /// vs this one; the gap reveals how much shaped traffic is
-    /// leaving the binding via `apply_*`'s early-return / queue-miss
-    /// branches. Not a user-facing metric — purely for #760 triage.
-    pub(super) drain_sent_bytes_shaped_unconditional: AtomicU64,
-    /// #760 instrumentation. Bytes delivered by the post-CoS backup
-    /// transmit paths in `drain_pending_tx` (transmit_prepared_batch
-    /// + transmit_batch calls at tx.rs:289/330). These sites bypass
-    /// the CoS token gate entirely — anything non-zero here means
-    /// packets are leaving the binding without being rate-limited
-    /// by any queue's admission, which is the most likely bypass
-    /// path for #760's observed 57% overshoot on single-flow
-    /// exact-queue workloads.
-    pub(super) post_drain_backup_bytes: AtomicU64,
     /// #710: packets dropped in `apply_worker_shaped_tx_requests`
     /// because the worker could not locate any binding for the
     /// request's egress_ifindex. Happens when a cross-worker CoS
@@ -993,8 +1013,6 @@ impl BindingLiveState {
             redirect_inbox_overflow_drops: AtomicU64::new(0),
             pending_tx_local_overflow_drops: AtomicU64::new(0),
             tx_submit_error_drops: AtomicU64::new(0),
-            post_drain_backup_bytes: AtomicU64::new(0),
-            drain_sent_bytes_shaped_unconditional: AtomicU64::new(0),
             no_owner_binding_drops: AtomicU64::new(0),
             // #709 / #746: owner-profile telemetry, split by writer
             // into two cacheline-isolated groups. Histograms are zero-
@@ -1202,10 +1220,25 @@ impl BindingLiveState {
                 .pending_tx_local_overflow_drops
                 .load(Ordering::Relaxed),
             tx_submit_error_drops: self.tx_submit_error_drops.load(Ordering::Relaxed),
-            post_drain_backup_bytes: self.post_drain_backup_bytes.load(Ordering::Relaxed),
+            post_drain_backup_bytes: self
+                .owner_profile_owner
+                .post_drain_backup_bytes
+                .load(Ordering::Relaxed),
             drain_sent_bytes_shaped_unconditional: self
+                .owner_profile_owner
                 .drain_sent_bytes_shaped_unconditional
                 .load(Ordering::Relaxed),
+            post_drain_backup_cos_drops: self
+                .owner_profile_owner
+                .post_drain_backup_cos_drops
+                .load(Ordering::Relaxed),
+            post_drain_backup_cos_drop_bytes: self
+                .owner_profile_owner
+                .post_drain_backup_cos_drop_bytes
+                .load(Ordering::Relaxed),
+            // Compile-time check: these four counters live on the
+            // owner-only cacheline-isolated block to avoid ping-
+            // pong with multi-writer overflow counters.
             // `no_owner_binding_drops` is read directly from the atomic
             // by `Coordinator::cos_no_owner_binding_drops_total()` — not
             // snapshotted here because it is not exposed per-binding.

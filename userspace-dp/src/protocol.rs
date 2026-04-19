@@ -1221,6 +1221,15 @@ pub(crate) struct BindingStatus {
     // early-return / queue miss.
     #[serde(rename = "drain_sent_bytes_shaped_unconditional", default)]
     pub drain_sent_bytes_shaped_unconditional: u64,
+    // #760 (PR #773): CoS-bound items dropped at the post-drain
+    // backup filter — cross-worker routing failures the bounded
+    // ingest-drain loop didn't absorb. Non-zero is the primary
+    // operator signal that the backup-path belt-and-suspenders
+    // is catching real leakage.
+    #[serde(rename = "post_drain_backup_cos_drops", default)]
+    pub post_drain_backup_cos_drops: u64,
+    #[serde(rename = "post_drain_backup_cos_drop_bytes", default)]
+    pub post_drain_backup_cos_drop_bytes: u64,
     // #710 attribution note: cross-worker CoS "no-owner-binding" drops
     // are exposed at the `ProcessStatus::cos_no_owner_binding_drops_total`
     // top-level field, not per binding. The increment mechanically lands

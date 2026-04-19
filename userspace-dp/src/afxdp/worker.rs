@@ -1752,8 +1752,12 @@ pub(super) fn owner_profile_snapshot(live: &BindingLiveState) -> OwnerProfileSna
         }),
         owner_pps: live.owner_profile_owner.owner_pps.load(Ordering::Relaxed),
         peer_pps: live.owner_profile_peer.peer_pps.load(Ordering::Relaxed),
-        post_drain_backup_bytes: live.post_drain_backup_bytes.load(Ordering::Relaxed),
+        post_drain_backup_bytes: live
+            .owner_profile_owner
+            .post_drain_backup_bytes
+            .load(Ordering::Relaxed),
         drain_sent_bytes_shaped_unconditional: live
+            .owner_profile_owner
             .drain_sent_bytes_shaped_unconditional
             .load(Ordering::Relaxed),
     }
@@ -3997,6 +4001,12 @@ pub(crate) struct BindingLiveSnapshot {
     // compare binding-level vs per-queue drain accounting.
     pub(crate) post_drain_backup_bytes: u64,
     pub(crate) drain_sent_bytes_shaped_unconditional: u64,
+    // #760 (PR #773): drop-filter counters for CoS-bound items
+    // that reached the post-CoS backup paths. Non-zero indicates
+    // a cross-worker routing failure the bounded ingest-drain
+    // loop did not absorb.
+    pub(crate) post_drain_backup_cos_drops: u64,
+    pub(crate) post_drain_backup_cos_drop_bytes: u64,
     // #710: `no_owner_binding_drops` is intentionally NOT snapshotted
     // per-binding. The atomic on `BindingLiveState` accumulates drops
     // for mechanical accounting (the increment site can only write to
