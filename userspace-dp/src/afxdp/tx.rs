@@ -436,19 +436,18 @@ fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
     if binding.pending_tx_prepared.is_empty() {
         return;
     }
-    // Fast early-exit: if the head item is not CoS-bound, assume
-    // the common case (the queue is ordered FIFO; under typical
-    // loads it's all-CoS or all-non-CoS for a given drain pass).
-    // This keeps the non-CoS hot path at an O(1) peek cost. If
-    // the head IS CoS-bound, fall through to the scan — we
-    // accept the O(n) cost because it signals real leakage.
-    match binding.pending_tx_prepared.front() {
-        Some(req) if req.cos_queue_id.is_some() => { /* scan */ }
-        _ => return,
-    }
-    // Scan in-place. Swap-remove pattern: pop_front until a
-    // non-CoS item is found, then rotate the survivor back to
-    // the tail. Avoids the allocation the prior draft did.
+    // #784 Codex review: the earlier head-peek fast-exit was a
+    // correctness bug. `take_pending_tx_into` / inbox drain can
+    // interleave non-CoS items (head) with CoS-bound items
+    // (tail). If the head is non-CoS and we return early, later
+    // CoS-bound items escape to the unshaped transmit_batch
+    // path, bypassing the CoS cap. Scan the full deque always.
+    //
+    // Scan in-place. pop_front until empty; CoS-bound items are
+    // dropped (+ recycled), non-CoS items are rotated back to
+    // the tail. O(n) but only runs when a leftover exists AFTER
+    // the bounded ingest-drain loop exited with residue, not
+    // per-frame.
     let mut dropped = 0u64;
     let mut dropped_bytes = 0u64;
     let original_len = binding.pending_tx_prepared.len();
@@ -506,19 +505,29 @@ fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
 /// on the next drain. If it fails (the genuine cross-worker
 /// routing failure case this function was originally designed for),
 /// drop as before so the #760 CoS cap bypass stays closed.
-fn drop_cos_bound_local_leftovers(
-    binding: &mut BindingWorker,
-    forwarding: &ForwardingState,
-    now_ns: u64,
+/// #784 pure-function scan: for each item in `pending`, classify
+/// by `cos_queue_id`. Non-CoS items are preserved (rotated back
+/// to tail). CoS-bound items get one last rescue attempt via
+/// `try_rescue`; if that returns Err, the item is dropped (not
+/// re-enqueued) and counted. Returns `(dropped_count, dropped_bytes)`.
+///
+/// **CRITICAL INVARIANT** (pinned by
+/// `partition_cos_bound_local_scans_mixed_head_deque` below): the
+/// scan walks the ENTIRE deque, not just the head. An earlier
+/// head-peek fast-exit was a correctness bug: items pulled from
+/// the redirect inbox via `take_pending_tx_requests` can
+/// interleave non-CoS and CoS-bound; exiting early on a non-CoS
+/// head lets later CoS-bound items escape to the unshaped
+/// `transmit_batch` backup path, bypassing the CoS cap.
+/// Adversarial reviewers MUST reject any PR that re-introduces
+/// an early-exit on head inspection.
+fn partition_cos_bound_local_with_rescue<F>(
     pending: &mut VecDeque<TxRequest>,
-) {
-    if pending.is_empty() {
-        return;
-    }
-    match pending.front() {
-        Some(req) if req.cos_queue_id.is_some() => { /* scan */ }
-        _ => return,
-    }
+    mut try_rescue: F,
+) -> (u64, u64)
+where
+    F: FnMut(TxRequest) -> Result<(), TxRequest>,
+{
     let mut dropped = 0u64;
     let mut dropped_bytes = 0u64;
     let original_len = pending.len();
@@ -526,14 +535,7 @@ fn drop_cos_bound_local_leftovers(
         let Some(req) = pending.pop_front() else { break };
         if req.cos_queue_id.is_some() {
             let bytes_len = req.bytes.len() as u64;
-            // Last-chance enqueue into CoS. If the runtime /
-            // queue lookup succeeds (common case for valid
-            // cos_queue_id on an owner-local binding), item gets
-            // queued and is NOT dropped. Only items that fail
-            // this call are genuine cross-worker routing
-            // failures that the drop filter was originally
-            // designed for.
-            match enqueue_local_into_cos(binding, forwarding, req, now_ns) {
+            match try_rescue(req) {
                 Ok(()) => { /* rescued — do not drop */ }
                 Err(_req) => {
                     dropped = dropped.saturating_add(1);
@@ -544,6 +546,25 @@ fn drop_cos_bound_local_leftovers(
             pending.push_back(req);
         }
     }
+    (dropped, dropped_bytes)
+}
+
+fn drop_cos_bound_local_leftovers(
+    binding: &mut BindingWorker,
+    forwarding: &ForwardingState,
+    now_ns: u64,
+    pending: &mut VecDeque<TxRequest>,
+) {
+    // Delegate the scan to the pure helper so the mixed-head
+    // invariant (Codex review on #784) is unit-testable without
+    // constructing a full BindingWorker.
+    let (dropped, dropped_bytes) = partition_cos_bound_local_with_rescue(
+        pending,
+        |req| match enqueue_local_into_cos(binding, forwarding, req, now_ns) {
+            Ok(()) => Ok(()),
+            Err(req) => Err(req),
+        },
+    );
     if dropped > 0 {
         binding
             .live
@@ -5806,6 +5827,108 @@ mod tests {
             },
         );
         interfaces
+    }
+
+    /// #784 Codex review regression pin: mixed-head deque scan.
+    ///
+    /// The first revision of `drop_cos_bound_local_leftovers` did
+    /// a head-peek fast-exit: if the deque's front item had
+    /// `cos_queue_id.is_none()`, the function returned before
+    /// scanning. That let CoS-bound items LATER in the deque
+    /// escape to the unshaped `transmit_batch` backup path,
+    /// bypassing the CoS cap — the exact #760 bypass this filter
+    /// was designed to close.
+    ///
+    /// This test constructs a mixed-head deque
+    /// `[non-cos, cos-bound, non-cos, cos-bound]` and verifies
+    /// every cos-bound item is either rescued or dropped (NEVER
+    /// left in the deque), while non-cos items are preserved for
+    /// the downstream backup transmit path.
+    ///
+    /// If this test ever relaxes to allow cos-bound items in the
+    /// survivor set, the #760 cap bypass returns. Adversarial
+    /// reviewers MUST reject PRs that weaken this.
+    #[test]
+    fn partition_cos_bound_local_scans_mixed_head_deque() {
+        // Build a pending deque with a NON-CoS head followed by
+        // a mix of CoS-bound and non-CoS items. Codex flagged
+        // the pre-refactor head-peek as HIGH severity — this is
+        // the regression pin.
+        let non_cos = |payload: u8| TxRequest {
+            bytes: vec![payload; 64],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 99,
+            cos_queue_id: None,
+            dscp_rewrite: None,
+        };
+        let cos_bound = |payload: u8| TxRequest {
+            bytes: vec![payload; 64],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 14,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        };
+        let mut pending: VecDeque<TxRequest> = VecDeque::from([
+            non_cos(1),
+            cos_bound(2),
+            non_cos(3),
+            cos_bound(4),
+            non_cos(5),
+        ]);
+        // Rescue stub: always fails (returns Err) so every
+        // cos-bound item falls through to drop. Verifies the
+        // scan covers the WHOLE deque, not just the head.
+        let (dropped, dropped_bytes) =
+            partition_cos_bound_local_with_rescue(&mut pending, Err);
+        assert_eq!(dropped, 2, "both cos-bound items must be dropped (scan covers tail)");
+        assert_eq!(dropped_bytes, 128, "2 × 64 bytes dropped");
+        // Survivors: only the 3 non-CoS items, in original order.
+        let survivors: Vec<u8> = pending.iter().map(|r| r.bytes[0]).collect();
+        assert_eq!(survivors, vec![1, 3, 5]);
+    }
+
+    /// #784 companion: rescue path pins. When `try_rescue` returns
+    /// Ok, items are consumed (rescued) — they must NOT remain in
+    /// the survivor set. Only items that actually fail rescue
+    /// count toward the drop.
+    #[test]
+    fn partition_cos_bound_local_rescues_when_try_rescue_ok() {
+        let non_cos = TxRequest {
+            bytes: vec![0xAA; 64],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 99,
+            cos_queue_id: None,
+            dscp_rewrite: None,
+        };
+        let cos_bound = TxRequest {
+            bytes: vec![0xBB; 64],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 14,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        };
+        let mut pending: VecDeque<TxRequest> = VecDeque::from([non_cos, cos_bound]);
+        // Rescue always succeeds — CoS items must NOT count as drops.
+        let (dropped, dropped_bytes) =
+            partition_cos_bound_local_with_rescue(&mut pending, |_| Ok(()));
+        assert_eq!(dropped, 0);
+        assert_eq!(dropped_bytes, 0);
+        // Survivor set: only the non-CoS item (rescued CoS item
+        // was consumed by try_rescue closure).
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].bytes[0], 0xAA);
     }
 
     #[test]
