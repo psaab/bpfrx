@@ -827,27 +827,116 @@ fn ingest_cos_pending_tx_with_provenance(
             .peer_pps
             .fetch_add(peer_count, Ordering::Relaxed);
     }
+    // #780 fast path: memoize the routing decision per
+    // (egress_ifindex, cos_queue_id) across the batch. iperf-style
+    // workloads push ~all items in a batch to the same queue, so
+    // this hits >99%. Saves 2-3 FastMap lookups per item on the
+    // hot path (profile: 1.96% CPU in this function at line rate).
+    //
+    // The decision tree is:
+    //   A. Route to a different owner WORKER via MPSC command
+    //   B. Route to a different owner BINDING via MPSC inbox
+    //   C. Enqueue into this binding's local CoS runtime
+    //
+    // A/B collapse into one `enqueue_tx_owned` call when
+    // `owner_live` is set and we're not already that owner.
+    // Caching just the Option<Arc<BindingLiveState>> for the
+    // resolved owner binding covers both, since
+    // `redirect_local_cos_request_to_owner_binding` and
+    // `redirect_local_cos_request_to_owner` both ultimately
+    // resolve to the same owner live state for this queue.
+    #[derive(Clone, Copy)]
+    enum LocalRoutingDecision {
+        RedirectToCrossWorker(u32), // owner_worker_id != current
+        RedirectToOwnerBinding,     // owner binding on same worker
+        EnqueueLocal,
+    }
+    let mut cached_key: Option<(i32, Option<u8>)> = None;
+    let mut cached_decision: Option<(LocalRoutingDecision, Option<Arc<BindingLiveState>>)> = None;
     process_pending_queue_in_place(&mut pending, |req| {
-        let req = match redirect_local_cos_request_to_owner(
-            &binding.cos_fast_interfaces,
-            req,
-            worker_id,
-            worker_commands_by_id,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(req) => req,
-        };
-        let req = match redirect_local_cos_request_to_owner_binding(
-            &binding.live,
-            &binding.cos_fast_interfaces,
-            req,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(req) => req,
-        };
-        match enqueue_local_into_cos(binding, forwarding, req, now_ns) {
-            Ok(()) => Ok(()),
-            Err(req) => Err(req),
+        // #780 cache hit check: if this item's routing key matches
+        // the previous item's, reuse the resolved decision.
+        let key = (req.egress_ifindex, req.cos_queue_id);
+        if cached_key != Some(key) {
+            cached_key = Some(key);
+            // Resolve fresh. Replicates the prior three-step
+            // logic in one FastMap lookup.
+            let Some((iface_fast, queue_fast)) = cos_fast_queue(
+                &binding.cos_fast_interfaces,
+                req.egress_ifindex,
+                req.cos_queue_id,
+            ) else {
+                cached_decision = Some((LocalRoutingDecision::EnqueueLocal, None));
+                return enqueue_local_into_cos(binding, forwarding, req, now_ns);
+            };
+            // shared_exact with tx_owner_live set: owner-binding
+            // path takes precedence (the original code's step 2
+            // wins when step 1 bails on the shared_exact check).
+            if queue_fast.shared_exact && iface_fast.tx_owner_live.is_some() {
+                let owner_live = iface_fast.tx_owner_live.clone();
+                if owner_live
+                    .as_ref()
+                    .is_some_and(|ol| Arc::ptr_eq(ol, &binding.live))
+                {
+                    // We ARE the owner binding. Enqueue locally.
+                    cached_decision = Some((LocalRoutingDecision::EnqueueLocal, None));
+                } else {
+                    cached_decision =
+                        Some((LocalRoutingDecision::RedirectToOwnerBinding, owner_live));
+                }
+            } else {
+                let owner_worker_id = queue_fast.owner_worker_id;
+                if owner_worker_id == worker_id {
+                    cached_decision = Some((LocalRoutingDecision::EnqueueLocal, None));
+                } else if queue_fast.owner_live.is_some() {
+                    cached_decision = Some((
+                        LocalRoutingDecision::RedirectToCrossWorker(owner_worker_id),
+                        queue_fast.owner_live.clone(),
+                    ));
+                } else {
+                    cached_decision = Some((
+                        LocalRoutingDecision::RedirectToCrossWorker(owner_worker_id),
+                        None,
+                    ));
+                }
+            }
+        }
+        match cached_decision.as_ref().expect("decision cached above") {
+            (LocalRoutingDecision::EnqueueLocal, _) => {
+                match enqueue_local_into_cos(binding, forwarding, req, now_ns) {
+                    Ok(()) => Ok(()),
+                    Err(req) => Err(req),
+                }
+            }
+            (LocalRoutingDecision::RedirectToOwnerBinding, Some(owner_live)) => {
+                match owner_live.enqueue_tx_owned(req) {
+                    Ok(()) => Ok(()),
+                    Err(req) => Err(req),
+                }
+            }
+            (LocalRoutingDecision::RedirectToOwnerBinding, None) => {
+                // Should be unreachable (owner_live guaranteed Some
+                // in the branch that sets this decision) but keep
+                // a correctness fallback.
+                Err(req)
+            }
+            (LocalRoutingDecision::RedirectToCrossWorker(owner_worker_id), owner_live) => {
+                if let Some(owner_live) = owner_live.as_ref() {
+                    match owner_live.enqueue_tx_owned(req) {
+                        Ok(()) => Ok(()),
+                        Err(req) => Err(req),
+                    }
+                } else if let Some(commands) = worker_commands_by_id.get(owner_worker_id) {
+                    if let Ok(mut pending) = commands.lock() {
+                        pending.push_back(WorkerCommand::EnqueueShapedLocal(req));
+                        Ok(())
+                    } else {
+                        Err(req)
+                    }
+                } else {
+                    Err(req)
+                }
+            }
         }
     });
     binding.pending_tx_local = pending;
