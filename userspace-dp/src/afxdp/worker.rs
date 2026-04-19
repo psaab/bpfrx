@@ -3993,6 +3993,10 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) redirect_inbox_overflow_drops: u64,
     pub(crate) pending_tx_local_overflow_drops: u64,
     pub(crate) tx_submit_error_drops: u64,
+    // #760 triage: surfaced on BindingStatus so operators can
+    // compare binding-level vs per-queue drain accounting.
+    pub(crate) post_drain_backup_bytes: u64,
+    pub(crate) drain_sent_bytes_shaped_unconditional: u64,
     // #710: `no_owner_binding_drops` is intentionally NOT snapshotted
     // per-binding. The atomic on `BindingLiveState` accumulates drops
     // for mechanical accounting (the increment site can only write to

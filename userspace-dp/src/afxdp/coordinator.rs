@@ -1385,6 +1385,9 @@ impl Coordinator {
                 binding.redirect_inbox_overflow_drops = snap.redirect_inbox_overflow_drops;
                 binding.pending_tx_local_overflow_drops = snap.pending_tx_local_overflow_drops;
                 binding.tx_submit_error_drops = snap.tx_submit_error_drops;
+                binding.post_drain_backup_bytes = snap.post_drain_backup_bytes;
+                binding.drain_sent_bytes_shaped_unconditional =
+                    snap.drain_sent_bytes_shaped_unconditional;
                 // #710: `snap.no_owner_binding_drops` is not copied into
                 // per-binding status — it is summed across all bindings
                 // into `ProcessStatus::cos_no_owner_binding_drops_total`
@@ -1467,6 +1470,8 @@ impl Coordinator {
                 binding.tx_bytes = 0;
                 binding.tx_completions = 0;
                 binding.tx_errors = 0;
+                binding.post_drain_backup_bytes = 0;
+                binding.drain_sent_bytes_shaped_unconditional = 0;
                 binding.direct_tx_packets = 0;
                 binding.copy_tx_packets = 0;
                 binding.in_place_tx_packets = 0;

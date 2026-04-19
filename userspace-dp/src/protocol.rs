@@ -1209,6 +1209,18 @@ pub(crate) struct BindingStatus {
     // the flow-fair admission / redirect-inbox / pending-FIFO drops.
     #[serde(rename = "tx_submit_error_drops", default)]
     pub tx_submit_error_drops: u64,
+    // #760 instrumentation: post-CoS backup transmit bytes
+    // (drain_pending_tx fallbacks at tx.rs:289/330) that bypass
+    // any CoS queue's token gate.
+    #[serde(rename = "post_drain_backup_bytes", default)]
+    pub post_drain_backup_bytes: u64,
+    // #760 instrumentation: binding-scoped bytes observed at the
+    // three apply_* tx_bytes sites, written unconditionally. Gap
+    // vs the sum of per-queue drain_sent_bytes attributes shaped
+    // traffic that bypassed the per-queue write via an apply_*
+    // early-return / queue miss.
+    #[serde(rename = "drain_sent_bytes_shaped_unconditional", default)]
+    pub drain_sent_bytes_shaped_unconditional: u64,
     // #710 attribution note: cross-worker CoS "no-owner-binding" drops
     // are exposed at the `ProcessStatus::cos_no_owner_binding_drops_total`
     // top-level field, not per binding. The increment mechanically lands

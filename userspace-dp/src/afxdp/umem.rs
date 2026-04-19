@@ -1202,6 +1202,10 @@ impl BindingLiveState {
                 .pending_tx_local_overflow_drops
                 .load(Ordering::Relaxed),
             tx_submit_error_drops: self.tx_submit_error_drops.load(Ordering::Relaxed),
+            post_drain_backup_bytes: self.post_drain_backup_bytes.load(Ordering::Relaxed),
+            drain_sent_bytes_shaped_unconditional: self
+                .drain_sent_bytes_shaped_unconditional
+                .load(Ordering::Relaxed),
             // `no_owner_binding_drops` is read directly from the atomic
             // by `Coordinator::cos_no_owner_binding_drops_total()` — not
             // snapshotted here because it is not exposed per-binding.
