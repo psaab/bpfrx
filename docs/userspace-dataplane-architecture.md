@@ -451,13 +451,26 @@ system {
 
 **Tuning guidelines:**
 - Set `workers` to match NIC RSS queue count (`ethtool -L <dev> combined N`)
-- Set `ring-entries` to 16384 for ≥20 Gbps throughput (uses ~100MB UMEM per binding).
+- Set `ring-entries` to 16384 for ≥20 Gbps throughput.
+  UMEM cost per binding at ring=16384:
+    - mlx5 / native XDP: `reserved_tx (min(ring/2, 8192)) + 2 × ring_entries` = `8192 + 32768 = 40960 frames × 4 KB = 160 MB per binding`
+    - virtio_net: `ring_entries + 2 × ring_entries` = `3 × 16384 × 4 KB = 192 MB per binding`
+  `binding_frame_count_for_driver` in `userspace-dp/src/afxdp/bind.rs` is authoritative.
   At 8192, `iperf3 -P 12 @ 25 Gbps` sees 92-170K retrans/30s and median 16.9 Gbps due
   to kernel-side TX ring fill stalls (`ethtool -S` shows `tx_xsk_full` accumulating).
   Raising to 16384 dropped retrans to 0-1900/30s and lifted the median to 21.5 Gbps
-  on the loss:xpf-userspace-fw test cluster (#774).
+  on the loss:xpf-userspace-fw test cluster (#774). **DO NOT raise to 32768** —
+  measurement on the same workload showed regression to 11-18 Gbps with 17-37K retrans,
+  likely TLB pressure + excess UMEM memset at bind.
+- **Hugepages**: UMEM mapping tries `MAP_HUGETLB` (2 MB pages) first, falls back to
+  `MADV_HUGEPAGE` if hugepages aren't reserved. At ring=16384 × 4KB pages = 40960 TLB
+  entries per binding × 6 bindings = 245K TLB entries. Without hugepages that's a
+  massive TLB footprint; with 2 MB hugepages it collapses to ~480 entries. Check
+  `/proc/meminfo | grep HugePages` — if `HugePages_Total` is 0, throughput will be
+  TLB-bound above 8192 ring size.
 - Ensure VM has enough vCPUs: workers + 2 (daemon + kernel headroom)
-- Ensure VM has enough RAM: workers × bindings × 100MB + 2GB base (at 16384 ring size)
+- Ensure VM has enough RAM: `workers × bindings × 160 MB + 2 GB` base (at 16384 ring,
+  mlx5 driver; 192 MB for virtio_net)
 
 ## Limitations
 
