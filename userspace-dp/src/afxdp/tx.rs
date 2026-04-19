@@ -3662,6 +3662,13 @@ pub(super) fn cos_queue_front(queue: &CoSQueueRuntime) -> Option<&CoSPendingTxIt
 pub(super) fn cos_queue_push_back(queue: &mut CoSQueueRuntime, item: CoSPendingTxItem) {
     let item_len = cos_item_len(&item);
     let flow_key = cos_item_flow_key(&item);
+    // #774: maintain local_item_count alongside the queue pushes
+    // so cos_queue_accepts_prepared becomes O(1). `matches!` on a
+    // tagged enum is a single branch; far cheaper than an O(n)
+    // scan at check time.
+    if matches!(item, CoSPendingTxItem::Local(_)) {
+        queue.local_item_count = queue.local_item_count.saturating_add(1);
+    }
     account_cos_queue_flow_enqueue(queue, flow_key, item_len);
     if !queue.flow_fair {
         queue.items.push_back(item);
@@ -3680,6 +3687,9 @@ pub(super) fn cos_queue_push_back(queue: &mut CoSQueueRuntime, item: CoSPendingT
 pub(super) fn cos_queue_push_front(queue: &mut CoSQueueRuntime, item: CoSPendingTxItem) {
     let item_len = cos_item_len(&item);
     let flow_key = cos_item_flow_key(&item);
+    if matches!(item, CoSPendingTxItem::Local(_)) {
+        queue.local_item_count = queue.local_item_count.saturating_add(1);
+    }
     account_cos_queue_flow_enqueue(queue, flow_key, item_len);
     if !queue.flow_fair {
         queue.items.push_front(item);
@@ -3710,6 +3720,13 @@ pub(super) fn cos_queue_pop_front(queue: &mut CoSQueueRuntime) -> Option<CoSPend
         }
         item
     };
+    // #774: decrement the Local counter BEFORE account_flow_dequeue
+    // so that if account_flow_dequeue panics the counter isn't
+    // stuck high. saturating_sub is a no-op on 0 (never should be
+    // 0 when a Local item is popping, but defense-in-depth).
+    if matches!(item, CoSPendingTxItem::Local(_)) {
+        queue.local_item_count = queue.local_item_count.saturating_sub(1);
+    }
     let item_len = cos_item_len(&item);
     let flow_key = cos_item_flow_key(&item);
     account_cos_queue_flow_dequeue(queue, flow_key, item_len);
@@ -4398,6 +4415,13 @@ fn demote_prepared_cos_queue_to_local(
     true
 }
 
+/// #774: O(1) check replacing the prior O(n) scan. Profiled at
+/// 3.25% CPU on the hot path at line rate before this fix.
+/// `local_item_count` is maintained at every push/pop site in
+/// `cos_queue_push_*` / `cos_queue_pop_front`. Single-writer
+/// (owner worker), same discipline as `queued_bytes` — no atomic
+/// needed.
+#[inline]
 fn cos_queue_accepts_prepared(root: &CoSInterfaceRuntime, requested_queue: Option<u8>) -> bool {
     let Some(queue_idx) = resolve_cos_queue_idx(root, requested_queue) else {
         return false;
@@ -4405,17 +4429,7 @@ fn cos_queue_accepts_prepared(root: &CoSInterfaceRuntime, requested_queue: Optio
     let Some(queue) = root.queues.get(queue_idx) else {
         return false;
     };
-    if !queue.flow_fair {
-        return !queue
-            .items
-            .iter()
-            .any(|item| matches!(item, CoSPendingTxItem::Local(_)));
-    }
-    !queue.flow_rr_buckets.iter().any(|bucket| {
-        queue.flow_bucket_items[usize::from(bucket)]
-            .iter()
-            .any(|item| matches!(item, CoSPendingTxItem::Local(_)))
-    })
+    queue.local_item_count == 0
 }
 
 fn ensure_cos_interface_runtime(
@@ -4508,6 +4522,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 wheel_level: 0,
                 wheel_slot: 0,
                 items: VecDeque::new(),
+                local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
                 owner_profile: CoSQueueOwnerProfile::new(),
             })
@@ -6447,9 +6462,12 @@ mod tests {
                 dscp_rewrite: None,
             }],
         );
-        root.queues[0]
-            .items
-            .push_back(CoSPendingTxItem::Prepared(PreparedTxRequest {
+        // #774: use cos_queue_push_back so local_item_count
+        // stays in sync. Previously this test poked queue.items
+        // directly, which bypassed the counter maintenance.
+        cos_queue_push_back(
+            &mut root.queues[0],
+            CoSPendingTxItem::Prepared(PreparedTxRequest {
                 offset: 64,
                 len: 1500,
                 recycle: PreparedTxRecycle::FreeTxFrame,
@@ -6460,10 +6478,11 @@ mod tests {
                 egress_ifindex: 80,
                 cos_queue_id: Some(5),
                 dscp_rewrite: None,
-            }));
-        root.queues[0]
-            .items
-            .push_back(CoSPendingTxItem::Local(TxRequest {
+            }),
+        );
+        cos_queue_push_back(
+            &mut root.queues[0],
+            CoSPendingTxItem::Local(TxRequest {
                 bytes: vec![0; 1500],
                 expected_ports: None,
                 expected_addr_family: libc::AF_INET6 as u8,
@@ -6472,7 +6491,8 @@ mod tests {
                 egress_ifindex: 80,
                 cos_queue_id: Some(5),
                 dscp_rewrite: None,
-            }));
+            }),
+        );
 
         assert!(!cos_queue_accepts_prepared(&root, Some(5)));
     }
@@ -10544,6 +10564,7 @@ mod tests {
             wheel_level: 0,
             wheel_slot: 0,
             items: VecDeque::from([test_cos_item(1500)]),
+            local_item_count: 0,
             drop_counters: CoSQueueDropCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
         };
@@ -10581,6 +10602,7 @@ mod tests {
             wheel_level: 0,
             wheel_slot: 0,
             items: VecDeque::new(),
+            local_item_count: 0,
             drop_counters: CoSQueueDropCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
         };
@@ -10629,6 +10651,7 @@ mod tests {
             wheel_level: 0,
             wheel_slot: 0,
             items: VecDeque::new(),
+            local_item_count: 0,
             drop_counters: CoSQueueDropCounters::default(),
             owner_profile: CoSQueueOwnerProfile::new(),
         };

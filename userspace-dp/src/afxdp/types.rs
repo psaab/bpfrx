@@ -989,6 +989,14 @@ pub(super) struct CoSQueueRuntime {
     pub(super) wheel_level: u8,
     pub(super) wheel_slot: usize,
     pub(super) items: VecDeque<CoSPendingTxItem>,
+    /// #774 optimization: cached count of `Local` items currently
+    /// resident in `items` + `flow_bucket_items`. Incremented /
+    /// decremented at every `cos_queue_push_*` and
+    /// `cos_queue_pop_front` site. Replaces an O(n) scan in
+    /// `cos_queue_accepts_prepared` that profiled at 3.25% CPU on
+    /// the hot path at line rate. Owner-only writes; no atomic
+    /// needed (same discipline as `queued_bytes`).
+    pub(super) local_item_count: u32,
     // #710: per-queue drop-reason counters. Single-writer (the owner
     // worker is the only code path that mutates this queue's runtime),
     // so plain `u64` is sufficient — no atomics needed on the hot path.
