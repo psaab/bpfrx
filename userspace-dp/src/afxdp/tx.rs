@@ -376,7 +376,7 @@ pub(super) fn drain_pending_tx(
     // configured at all — saves the O(n) scan + reallocation on
     // the non-CoS hot path.
     if !forwarding.cos.interfaces.is_empty() {
-        drop_cos_bound_local_leftovers(&mut pending, &binding.live);
+        drop_cos_bound_local_leftovers(binding, forwarding, now_ns, &mut pending);
     }
     let mut retry = VecDeque::new();
     while let Some(req) = pending.pop_front() {
@@ -486,15 +486,35 @@ fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
 /// local (non-prepared) TxRequests. `TxRequest::bytes` is a
 /// Vec<u8> owned by the request — dropping the request frees the
 /// buffer, so no explicit recycle is needed here.
+/// #784 rewrite: give CoS-bound items one final chance to route
+/// into their queue before dropping. The previous revision
+/// dropped unconditionally, which was correct for items that had
+/// failed ingest's full three-step cascade — BUT items pulled
+/// from the MPSC redirect inbox at `take_pending_tx_requests`
+/// (after the bounded ingest-drain loop exited) had never been
+/// attempted for ingest at all. On iperf3 -P 12 against a 1 Gbps
+/// cap with owner-local-exact queue 4, peer workers continuously
+/// push packets to the owner binding's inbox. The budget-loop
+/// exits while packets are still arriving; `take_pending_tx_requests`
+/// then pulls them; the drop filter killed them wholesale. That
+/// produced the reported bimodal fairness: flows whose packets
+/// happened to land on the owner worker's own RX got through;
+/// flows that crossed workers got dropped here.
+///
+/// The fix: attempt `enqueue_local_into_cos` here. If it succeeds,
+/// the item joins its queue and traverses the normal shaped path
+/// on the next drain. If it fails (the genuine cross-worker
+/// routing failure case this function was originally designed for),
+/// drop as before so the #760 CoS cap bypass stays closed.
 fn drop_cos_bound_local_leftovers(
+    binding: &mut BindingWorker,
+    forwarding: &ForwardingState,
+    now_ns: u64,
     pending: &mut VecDeque<TxRequest>,
-    live: &BindingLiveState,
 ) {
     if pending.is_empty() {
         return;
     }
-    // Fast early-exit: head-peek before committing to the O(n)
-    // scan. See drop_cos_bound_prepared_leftovers for rationale.
     match pending.front() {
         Some(req) if req.cos_queue_id.is_some() => { /* scan */ }
         _ => return,
@@ -505,18 +525,38 @@ fn drop_cos_bound_local_leftovers(
     for _ in 0..original_len {
         let Some(req) = pending.pop_front() else { break };
         if req.cos_queue_id.is_some() {
-            dropped = dropped.saturating_add(1);
-            dropped_bytes = dropped_bytes.saturating_add(req.bytes.len() as u64);
+            let bytes_len = req.bytes.len() as u64;
+            // Last-chance enqueue into CoS. If the runtime /
+            // queue lookup succeeds (common case for valid
+            // cos_queue_id on an owner-local binding), item gets
+            // queued and is NOT dropped. Only items that fail
+            // this call are genuine cross-worker routing
+            // failures that the drop filter was originally
+            // designed for.
+            match enqueue_local_into_cos(binding, forwarding, req, now_ns) {
+                Ok(()) => { /* rescued — do not drop */ }
+                Err(_req) => {
+                    dropped = dropped.saturating_add(1);
+                    dropped_bytes = dropped_bytes.saturating_add(bytes_len);
+                }
+            }
         } else {
             pending.push_back(req);
         }
     }
     if dropped > 0 {
-        live.tx_errors.fetch_add(dropped, Ordering::Relaxed);
-        live.owner_profile_owner
+        binding
+            .live
+            .tx_errors
+            .fetch_add(dropped, Ordering::Relaxed);
+        binding
+            .live
+            .owner_profile_owner
             .post_drain_backup_cos_drops
             .fetch_add(dropped, Ordering::Relaxed);
-        live.owner_profile_owner
+        binding
+            .live
+            .owner_profile_owner
             .post_drain_backup_cos_drop_bytes
             .fetch_add(dropped_bytes, Ordering::Relaxed);
     }
