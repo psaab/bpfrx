@@ -344,22 +344,31 @@ struct {
  *
  * #759 converted this to BPF_MAP_TYPE_DEVMAP_HASH so sparse ifindex
  * values above MAX_INTERFACES would not hit E2BIG. That broke
- * forwarding on mlx5 SR-IOV VFs running kernel 7.0.0-rc7+: under
- * live traffic the helper's TX path hit a segmentation-fallback
- * that fires when the redirect returns without delivering, ping
- * RTT rose from 0.4 ms to 300 ms with 33% loss, and iperf3 sustained
- * 0 bps.
+ * forwarding on mlx5 SR-IOV VFs running kernel 7.0.0-rc7+. Observed
+ * symptoms: ping RTT 0.4 ms → 300 ms with 33% loss, iperf3 sustained
+ * 0 bps, and the Rust helper emitted `DBG SEG_MISS` for every
+ * frame it handled. (The SEG_MISS log fires from frame_tx.rs on
+ * frame-length criteria independent of bpf_redirect_map's result,
+ * so it's a symptom that packets reached the helper in a state the
+ * TX path couldn't service — not direct evidence about the redirect.)
  *
  * Bisection of the five HASH conversions in #759 (see the #767
- * investigation) showed this was the only one mlx5 could not
- * tolerate. The likely mechanism: mlx5 native XDP's
- * bpf_redirect_map fast-path assumes DEVMAP layout. DEVMAP_HASH
- * works on virtio-net on kernel 6.x but is broken here.
+ * investigation) confirmed this was the only one mlx5 could not
+ * tolerate. The driver-level mechanism has not been source-verified;
+ * the consistent hypothesis is that mlx5 native XDP's
+ * bpf_redirect_map fast-path assumes DEVMAP layout and DEVMAP_HASH
+ * routes through a different path that does not deliver end-to-end
+ * on this kernel. DEVMAP_HASH worked on virtio-net on kernel 6.x.
  *
  * The ifindex-above-cap case #759 was fixing is only realistic on
  * long-lived namespaces where ifindex has drifted past
  * MAX_INTERFACES. When that becomes a live concern again, the fix
- * is to raise MAX_INTERFACES rather than reintroduce DEVMAP_HASH. */
+ * is to raise MAX_INTERFACES rather than reintroduce DEVMAP_HASH.
+ *
+ * Note: this header change alone would not flip the runtime map
+ * type unless the bpf2go-generated objects in pkg/dataplane/*.o are
+ * also regenerated and committed. That regeneration is part of this
+ * PR's commit (see `make generate` artifacts). */
 struct {
 	__uint(type, BPF_MAP_TYPE_DEVMAP);
 	__uint(max_entries, MAX_INTERFACES);
