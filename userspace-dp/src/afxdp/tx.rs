@@ -298,6 +298,15 @@ pub(super) fn drain_pending_tx(
                     .tx_packets
                     .fetch_add(packets, Ordering::Relaxed);
                 binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+                // #760 instrumentation: these bytes went out via
+                // the post-CoS backup path in drain_pending_tx —
+                // they did NOT pass through any queue's token gate.
+                // Non-zero here is the direct fingerprint of the
+                // cap bypass we're hunting.
+                binding
+                    .live
+                    .post_drain_backup_bytes
+                    .fetch_add(bytes, Ordering::Relaxed);
             }
             Err(TxError::Retry(err)) => {
                 binding.live.set_error(err);
@@ -336,6 +345,15 @@ pub(super) fn drain_pending_tx(
                             .tx_packets
                             .fetch_add(packets, Ordering::Relaxed);
                         binding.live.tx_bytes.fetch_add(bytes, Ordering::Relaxed);
+                        // #760 instrumentation: bytes that left via
+                        // the fallback transmit_batch WITHOUT going
+                        // through any CoS queue's token gate. See
+                        // the post_drain_backup_bytes field comment
+                        // for why this is the #760 smoking gun.
+                        binding
+                            .live
+                            .post_drain_backup_bytes
+                            .fetch_add(bytes, Ordering::Relaxed);
                     }
                 }
                 Err(TxError::Retry(err)) => {
@@ -1161,6 +1179,16 @@ fn select_exact_cos_guarantee_queue_with_fast_path(
         };
         let head_len = cos_item_len(head);
         if root.tokens < head_len {
+            // #760 instrumentation: record the per-queue observation
+            // that the interface shaper held it back. Written
+            // regardless of whether the wakeup-tick estimator
+            // succeeds in parking it, because "gate fired" is the
+            // signal we care about, not "queue successfully
+            // scheduled". Same Relaxed reasoning as drain_invocations.
+            queue
+                .owner_profile
+                .drain_park_root_tokens
+                .fetch_add(1, Ordering::Relaxed);
             if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
                 root.tokens,
                 root.shaping_rate_bytes,
@@ -1176,6 +1204,14 @@ fn select_exact_cos_guarantee_queue_with_fast_path(
             continue;
         }
         if queue.tokens < head_len {
+            // #760 instrumentation: the per-queue token gate held
+            // this queue back. A queue that sustains throughput
+            // above its configured rate with this counter near zero
+            // is direct evidence the gate never fired.
+            queue
+                .owner_profile
+                .drain_park_queue_tokens
+                .fetch_add(1, Ordering::Relaxed);
             if let Some(wake_tick) = estimate_cos_queue_wakeup_tick(
                 root.tokens,
                 root.shaping_rate_bytes,
@@ -2369,6 +2405,15 @@ fn apply_direct_exact_send_result(
         if let Some(queue) = root.queues.get_mut(queue_idx) {
             queue.queued_bytes = queue.queued_bytes.saturating_sub(sent_bytes);
             queue.tokens = queue.tokens.saturating_sub(sent_bytes);
+            // #760 instrumentation: record the exact-owner-local
+            // send at the same place the token bucket decrements.
+            // Divide by a scrape window to get an observed per-queue
+            // drain rate and compare against
+            // `queue.transmit_rate_bytes` to detect a cap bypass.
+            queue
+                .owner_profile
+                .drain_sent_bytes
+                .fetch_add(sent_bytes, Ordering::Relaxed);
         }
         root.tokens = root.tokens.saturating_sub(sent_bytes);
     }
@@ -4573,6 +4618,15 @@ fn apply_cos_send_result(
                     queue.surplus_deficit = queue.surplus_deficit.saturating_sub(sent_bytes);
                 }
             }
+            // #760 instrumentation: record non-exact / surplus /
+            // shared-exact sends at the same site the queue's token
+            // or surplus accounting is debited. Paired with the
+            // apply_direct_exact_send_result write so the sum across
+            // all sites equals the bytes the CoS scheduler accounted.
+            queue
+                .owner_profile
+                .drain_sent_bytes
+                .fetch_add(sent_bytes, Ordering::Relaxed);
         }
         root.tokens = root.tokens.saturating_sub(sent_bytes);
     }

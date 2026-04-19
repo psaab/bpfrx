@@ -856,6 +856,15 @@ pub(super) struct BindingLiveState {
     /// non-zero value usually indicates a frame-building bug upstream
     /// or a legitimate oversize packet. Subset of `tx_errors`.
     pub(super) tx_submit_error_drops: AtomicU64,
+    /// #760 instrumentation. Bytes delivered by the post-CoS backup
+    /// transmit paths in `drain_pending_tx` (transmit_prepared_batch
+    /// + transmit_batch calls at tx.rs:289/330). These sites bypass
+    /// the CoS token gate entirely — anything non-zero here means
+    /// packets are leaving the binding without being rate-limited
+    /// by any queue's admission, which is the most likely bypass
+    /// path for #760's observed 57% overshoot on single-flow
+    /// exact-queue workloads.
+    pub(super) post_drain_backup_bytes: AtomicU64,
     /// #710: packets dropped in `apply_worker_shaped_tx_requests`
     /// because the worker could not locate any binding for the
     /// request's egress_ifindex. Happens when a cross-worker CoS
@@ -974,6 +983,7 @@ impl BindingLiveState {
             redirect_inbox_overflow_drops: AtomicU64::new(0),
             pending_tx_local_overflow_drops: AtomicU64::new(0),
             tx_submit_error_drops: AtomicU64::new(0),
+            post_drain_backup_bytes: AtomicU64::new(0),
             no_owner_binding_drops: AtomicU64::new(0),
             // #709 / #746: owner-profile telemetry, split by writer
             // into two cacheline-isolated groups. Histograms are zero-

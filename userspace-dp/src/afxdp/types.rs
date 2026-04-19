@@ -1083,6 +1083,24 @@ pub(super) struct CoSTimerWheelRuntime {
 pub(super) struct CoSQueueOwnerProfile {
     pub(super) drain_latency_hist: [AtomicU64; super::umem::DRAIN_HIST_BUCKETS],
     pub(super) drain_invocations: AtomicU64,
+    /// #760 instrumentation. Bytes the shaped drain actually
+    /// submitted on behalf of this queue. Divide by a scrape window
+    /// to get an observed drain rate and compare against
+    /// `queue.transmit_rate_bytes`. Writer = owner worker on the
+    /// single site that also decrements `queue.tokens` after a send
+    /// (apply_direct_exact_send_result for exact-owner-local,
+    /// apply_cos_send_result for the non-exact / shared-exact paths).
+    pub(super) drain_sent_bytes: AtomicU64,
+    /// #760 instrumentation. Count of drain iterations where the
+    /// root token gate fired (root.tokens < head_len) and the queue
+    /// got parked waiting for the interface shaper to refill.
+    pub(super) drain_park_root_tokens: AtomicU64,
+    /// #760 instrumentation. Count of drain iterations where the
+    /// per-queue token gate fired (queue.tokens < head_len) and the
+    /// queue got parked waiting for its own refill. A queue that
+    /// sustains throughput above its configured rate with this near
+    /// zero is a direct signal the gate never fired.
+    pub(super) drain_park_queue_tokens: AtomicU64,
 }
 
 impl CoSQueueOwnerProfile {
@@ -1090,6 +1108,9 @@ impl CoSQueueOwnerProfile {
         Self {
             drain_latency_hist: std::array::from_fn(|_| AtomicU64::new(0)),
             drain_invocations: AtomicU64::new(0),
+            drain_sent_bytes: AtomicU64::new(0),
+            drain_park_root_tokens: AtomicU64::new(0),
+            drain_park_queue_tokens: AtomicU64::new(0),
         }
     }
 }

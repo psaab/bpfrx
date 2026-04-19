@@ -488,6 +488,15 @@ type CoSQueueStatus struct {
 	RedirectAcquireHist  []uint64 `json:"redirect_acquire_hist,omitempty"`
 	OwnerPPS             uint64   `json:"owner_pps,omitempty"`
 	PeerPPS              uint64   `json:"peer_pps,omitempty"`
+	// #760 overshoot-hunt instrumentation. DrainSentBytes /
+	// DrainParkRootTokens / DrainParkQueueTokens are queue-scoped.
+	// PostDrainBackupBytes is binding-scoped (same row as
+	// OwnerPPS/PeerPPS). See Rust `CoSQueueStatus` for field
+	// semantics and write-site locations.
+	DrainSentBytes        uint64 `json:"drain_sent_bytes,omitempty"`
+	DrainParkRootTokens   uint64 `json:"drain_park_root_tokens,omitempty"`
+	DrainParkQueueTokens  uint64 `json:"drain_park_queue_tokens,omitempty"`
+	PostDrainBackupBytes  uint64 `json:"post_drain_backup_bytes,omitempty"`
 }
 
 type FirewallFilterTermCounterStatus struct {
