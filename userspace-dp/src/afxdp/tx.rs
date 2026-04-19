@@ -3679,8 +3679,20 @@ pub(super) fn cos_flow_hash_seed_from_os() -> u64 {
         // to the fallback rather than spinning.
         break;
     }
+    // Production invariant (#785 Copilot review): never return 0.
+    // Zero is a valid getrandom output (probability 2^-64 per call,
+    // but across a fleet of daemons × per-binding promotions it DOES
+    // occur), and a zero seed turns the SFQ hash mapping into a pure
+    // function of the 5-tuple — externally probeable, and identical
+    // across all bindings on all nodes, which collapses SFQ bucket
+    // diversity to zero. The `assert_ne!(flow_hash_seed, 0)` test
+    // downstream depends on this invariant and would otherwise be
+    // theoretically flaky. One in 2^64 getrandom reads gets OR'd
+    // with 1 — indistinguishable from the raw entropy for any
+    // downstream use.
+    let nonzero = |v: u64| if v == 0 { 1 } else { v };
     if filled == buf.len() {
-        return u64::from_ne_bytes(buf);
+        return nonzero(u64::from_ne_bytes(buf));
     }
 
     let mut ts = libc::timespec {
@@ -3702,7 +3714,7 @@ pub(super) fn cos_flow_hash_seed_from_os() -> u64 {
     let mut fallback = now ^ pid.wrapping_mul(0x9e3779b97f4a7c15);
     mix_cos_flow_bucket(&mut fallback, now.rotate_left(17));
     mix_cos_flow_bucket(&mut fallback, stack_addr.rotate_left(31));
-    fallback
+    nonzero(fallback)
 }
 
 // #711: returns `u16` (was `u8`). With `COS_FLOW_FAIR_BUCKETS = 1024`
@@ -4786,9 +4798,12 @@ fn apply_cos_queue_flow_fair_promotion(
 /// live classifier output from `build_worker_cos_fast_interfaces`,
 /// i.e. the exact same field the service path (`drain_shaped_tx`,
 /// `try_drain_shared_exact`, etc.) consults. Taking the reference
-/// directly rather than a loose `bool` pins the contract: tests
-/// cannot fabricate a `shared_exact` value in isolation from the
-/// production classifier.
+/// directly rather than a loose `bool` pins the contract to the
+/// same struct shape production uses: tests exercise the same
+/// `WorkerCoSQueueFastPath` contract rather than an unrelated
+/// standalone flag, so any future addition of fields to the
+/// fast-path struct (e.g. a `min_local_flow_count` guarantee for
+/// the cross-worker DRR work) is automatically visible here.
 ///
 /// **Adversarial review posture (campaign #775 / issue #785):**
 /// reviewers MUST reject PRs that drop the `!shared_exact` clause
