@@ -340,11 +340,28 @@ struct {
  * Forwarding -- device map for XDP_REDIRECT
  * ============================================================ */
 
-/* DEVMAP_HASH accepts sparse ifindex keys; kernel ifindex can exceed
- * MAX_INTERFACES on long-lived namespaces. bpf_redirect_map() behaves
- * identically on DEVMAP and DEVMAP_HASH. */
+/* #767: keep plain DEVMAP on this map.
+ *
+ * #759 converted this to BPF_MAP_TYPE_DEVMAP_HASH so sparse ifindex
+ * values above MAX_INTERFACES would not hit E2BIG. That broke
+ * forwarding on mlx5 SR-IOV VFs running kernel 7.0.0-rc7+: under
+ * live traffic the helper's TX path hit a segmentation-fallback
+ * that fires when the redirect returns without delivering, ping
+ * RTT rose from 0.4 ms to 300 ms with 33% loss, and iperf3 sustained
+ * 0 bps.
+ *
+ * Bisection of the five HASH conversions in #759 (see the #767
+ * investigation) showed this was the only one mlx5 could not
+ * tolerate. The likely mechanism: mlx5 native XDP's
+ * bpf_redirect_map fast-path assumes DEVMAP layout. DEVMAP_HASH
+ * works on virtio-net on kernel 6.x but is broken here.
+ *
+ * The ifindex-above-cap case #759 was fixing is only realistic on
+ * long-lived namespaces where ifindex has drifted past
+ * MAX_INTERFACES. When that becomes a live concern again, the fix
+ * is to raise MAX_INTERFACES rather than reintroduce DEVMAP_HASH. */
 struct {
-	__uint(type, BPF_MAP_TYPE_DEVMAP_HASH);
+	__uint(type, BPF_MAP_TYPE_DEVMAP);
 	__uint(max_entries, MAX_INTERFACES);
 	__type(key, __u32);
 	__type(value, struct bpf_devmap_val);
