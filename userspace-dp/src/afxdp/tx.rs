@@ -376,7 +376,7 @@ pub(super) fn drain_pending_tx(
     // configured at all — saves the O(n) scan + reallocation on
     // the non-CoS hot path.
     if !forwarding.cos.interfaces.is_empty() {
-        drop_cos_bound_local_leftovers(&mut pending, &binding.live);
+        drop_cos_bound_local_leftovers(binding, forwarding, now_ns, &mut pending);
     }
     let mut retry = VecDeque::new();
     while let Some(req) = pending.pop_front() {
@@ -436,19 +436,18 @@ fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
     if binding.pending_tx_prepared.is_empty() {
         return;
     }
-    // Fast early-exit: if the head item is not CoS-bound, assume
-    // the common case (the queue is ordered FIFO; under typical
-    // loads it's all-CoS or all-non-CoS for a given drain pass).
-    // This keeps the non-CoS hot path at an O(1) peek cost. If
-    // the head IS CoS-bound, fall through to the scan — we
-    // accept the O(n) cost because it signals real leakage.
-    match binding.pending_tx_prepared.front() {
-        Some(req) if req.cos_queue_id.is_some() => { /* scan */ }
-        _ => return,
-    }
-    // Scan in-place. Swap-remove pattern: pop_front until a
-    // non-CoS item is found, then rotate the survivor back to
-    // the tail. Avoids the allocation the prior draft did.
+    // #784 Codex review: the earlier head-peek fast-exit was a
+    // correctness bug. `take_pending_tx_into` / inbox drain can
+    // interleave non-CoS items (head) with CoS-bound items
+    // (tail). If the head is non-CoS and we return early, later
+    // CoS-bound items escape to the unshaped transmit_batch
+    // path, bypassing the CoS cap. Scan the full deque always.
+    //
+    // Scan in-place. pop_front until empty; CoS-bound items are
+    // dropped (+ recycled), non-CoS items are rotated back to
+    // the tail. O(n) but only runs when a leftover exists AFTER
+    // the bounded ingest-drain loop exited with residue, not
+    // per-frame.
     let mut dropped = 0u64;
     let mut dropped_bytes = 0u64;
     let original_len = binding.pending_tx_prepared.len();
@@ -486,37 +485,99 @@ fn drop_cos_bound_prepared_leftovers(binding: &mut BindingWorker) {
 /// local (non-prepared) TxRequests. `TxRequest::bytes` is a
 /// Vec<u8> owned by the request — dropping the request frees the
 /// buffer, so no explicit recycle is needed here.
-fn drop_cos_bound_local_leftovers(
+/// #784 rewrite: give CoS-bound items one final chance to route
+/// into their queue before dropping. The previous revision
+/// dropped unconditionally, which was correct for items that had
+/// failed ingest's full three-step cascade — BUT items pulled
+/// from the MPSC redirect inbox at `take_pending_tx_requests`
+/// (after the bounded ingest-drain loop exited) had never been
+/// attempted for ingest at all. On iperf3 -P 12 against a 1 Gbps
+/// cap with owner-local-exact queue 4, peer workers continuously
+/// push packets to the owner binding's inbox. The budget-loop
+/// exits while packets are still arriving; `take_pending_tx_requests`
+/// then pulls them; the drop filter killed them wholesale. That
+/// produced the reported bimodal fairness: flows whose packets
+/// happened to land on the owner worker's own RX got through;
+/// flows that crossed workers got dropped here.
+///
+/// The fix: attempt `enqueue_local_into_cos` here. If it succeeds,
+/// the item joins its queue and traverses the normal shaped path
+/// on the next drain. If it fails (the genuine cross-worker
+/// routing failure case this function was originally designed for),
+/// drop as before so the #760 CoS cap bypass stays closed.
+/// #784 pure-function scan: for each item in `pending`, classify
+/// by `cos_queue_id`. Non-CoS items are preserved (rotated back
+/// to tail). CoS-bound items get one last rescue attempt via
+/// `try_rescue`; if that returns Err, the item is dropped (not
+/// re-enqueued) and counted. Returns `(dropped_count, dropped_bytes)`.
+///
+/// **CRITICAL INVARIANT** (pinned by
+/// `partition_cos_bound_local_scans_mixed_head_deque` below): the
+/// scan walks the ENTIRE deque, not just the head. An earlier
+/// head-peek fast-exit was a correctness bug: items pulled from
+/// the redirect inbox via `take_pending_tx_requests` can
+/// interleave non-CoS and CoS-bound; exiting early on a non-CoS
+/// head lets later CoS-bound items escape to the unshaped
+/// `transmit_batch` backup path, bypassing the CoS cap.
+/// Adversarial reviewers MUST reject any PR that re-introduces
+/// an early-exit on head inspection.
+fn partition_cos_bound_local_with_rescue<F>(
     pending: &mut VecDeque<TxRequest>,
-    live: &BindingLiveState,
-) {
-    if pending.is_empty() {
-        return;
-    }
-    // Fast early-exit: head-peek before committing to the O(n)
-    // scan. See drop_cos_bound_prepared_leftovers for rationale.
-    match pending.front() {
-        Some(req) if req.cos_queue_id.is_some() => { /* scan */ }
-        _ => return,
-    }
+    mut try_rescue: F,
+) -> (u64, u64)
+where
+    F: FnMut(TxRequest) -> Result<(), TxRequest>,
+{
     let mut dropped = 0u64;
     let mut dropped_bytes = 0u64;
     let original_len = pending.len();
     for _ in 0..original_len {
         let Some(req) = pending.pop_front() else { break };
         if req.cos_queue_id.is_some() {
-            dropped = dropped.saturating_add(1);
-            dropped_bytes = dropped_bytes.saturating_add(req.bytes.len() as u64);
+            let bytes_len = req.bytes.len() as u64;
+            match try_rescue(req) {
+                Ok(()) => { /* rescued — do not drop */ }
+                Err(_req) => {
+                    dropped = dropped.saturating_add(1);
+                    dropped_bytes = dropped_bytes.saturating_add(bytes_len);
+                }
+            }
         } else {
             pending.push_back(req);
         }
     }
+    (dropped, dropped_bytes)
+}
+
+fn drop_cos_bound_local_leftovers(
+    binding: &mut BindingWorker,
+    forwarding: &ForwardingState,
+    now_ns: u64,
+    pending: &mut VecDeque<TxRequest>,
+) {
+    // Delegate the scan to the pure helper so the mixed-head
+    // invariant (Codex review on #784) is unit-testable without
+    // constructing a full BindingWorker.
+    let (dropped, dropped_bytes) = partition_cos_bound_local_with_rescue(
+        pending,
+        |req| match enqueue_local_into_cos(binding, forwarding, req, now_ns) {
+            Ok(()) => Ok(()),
+            Err(req) => Err(req),
+        },
+    );
     if dropped > 0 {
-        live.tx_errors.fetch_add(dropped, Ordering::Relaxed);
-        live.owner_profile_owner
+        binding
+            .live
+            .tx_errors
+            .fetch_add(dropped, Ordering::Relaxed);
+        binding
+            .live
+            .owner_profile_owner
             .post_drain_backup_cos_drops
             .fetch_add(dropped, Ordering::Relaxed);
-        live.owner_profile_owner
+        binding
+            .live
+            .owner_profile_owner
             .post_drain_backup_cos_drop_bytes
             .fetch_add(dropped_bytes, Ordering::Relaxed);
     }
@@ -3356,24 +3417,57 @@ fn apply_cos_admission_ecn_policy(
     item: &mut CoSPendingTxItem,
     umem: &MmapArea,
 ) -> bool {
-    // Integer division by the compile-time-asserted nonzero
-    // `COS_ECN_MARK_THRESHOLD_DEN` is one saturating_mul + one divide
-    // on the hot path for each of the two thresholds.
+    // #784: ECN mark policy differs by queue kind:
+    //
+    // - **Flow-fair queues** (SFQ active): mark ONLY on the
+    //   per-flow threshold. An aggregate-queue mark penalises
+    //   every flow that happens to enqueue during a
+    //   high-aggregate window — regardless of whether THAT flow
+    //   is contributing to the congestion. With N flows actively
+    //   sharing a queue at its rate cap, the aggregate sits above
+    //   1/3 the buffer almost permanently, so the aggregate clause
+    //   used to mark effectively every packet. The per-flow cwnd
+    //   collapse from the marks concentrated on flows that hadn't
+    //   yet filled their bucket (because their current cwnd was
+    //   smaller) — a positive feedback loop producing the observed
+    //   3-winner / 9-loser bimodal rate distribution on
+    //   iperf3 -P 12 to a 1 Gbps cap.
+    //
+    // - **Non-flow-fair queues**: the aggregate IS the right
+    //   signal — there's no per-flow isolation, so aggregate
+    //   saturation is the only congestion indicator available.
+    //
+    // Adversarial review posture (required by campaign #775 /
+    // issue #784): if the flow_fair branch ever grows back to
+    // include the aggregate queued_bytes check, the fairness
+    // regression observed in #784 (iperf3 -P 12 returning 3
+    // flows at 145 Mbps with 0 retrans and 9 flows at 50-75 Mbps
+    // with thousands of retrans) WILL come back.
+    //
+    // #722: per-flow threshold derived from the same share cap
+    // the admission gate uses. `cos_queue_flow_share_limit` is
+    // pure and inlined (saturating_add + max + div_ceil + clamp),
+    // ~5 ns.
     let aggregate_ecn_threshold = buffer_limit
         .saturating_mul(COS_ECN_MARK_THRESHOLD_NUM)
         / COS_ECN_MARK_THRESHOLD_DEN.max(1);
-    // #722: per-flow threshold derived from the same share cap the
-    // admission gate uses. `cos_queue_flow_share_limit` is pure and
-    // inlined (saturating_add + max + div_ceil + clamp), ~5 ns.
     let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, flow_bucket);
     let flow_ecn_threshold = share_cap
         .saturating_mul(COS_ECN_MARK_THRESHOLD_NUM)
         / COS_ECN_MARK_THRESHOLD_DEN.max(1);
 
-    let aggregate_above = queue.queued_bytes > aggregate_ecn_threshold;
     let flow_above = queue.flow_bucket_bytes[flow_bucket] > flow_ecn_threshold;
+    let aggregate_above = queue.queued_bytes > aggregate_ecn_threshold;
+    // flow_fair queue: only per-flow threshold triggers marks.
+    // non-flow-fair queue: use the aggregate as before
+    // (flow_bucket_bytes is unused on non-flow-fair queues).
+    let should_mark = if queue.flow_fair {
+        flow_above
+    } else {
+        aggregate_above
+    };
 
-    if (!aggregate_above && !flow_above) || flow_share_exceeded || buffer_exceeded {
+    if !should_mark || flow_share_exceeded || buffer_exceeded {
         return false;
     }
     // Both variants share a single `admission_ecn_marked` counter: the
@@ -3748,6 +3842,12 @@ fn account_cos_queue_flow_enqueue(
     let bucket = cos_flow_bucket_index(queue.flow_hash_seed, flow_key);
     if queue.flow_bucket_bytes[bucket] == 0 {
         queue.active_flow_buckets = queue.active_flow_buckets.saturating_add(1);
+        // #784 diagnostic: track the peak distinct-flow count.
+        // Operators can compare this to the test's -P N count to
+        // detect SFQ hash collisions under real workloads.
+        if queue.active_flow_buckets > queue.active_flow_buckets_peak {
+            queue.active_flow_buckets_peak = queue.active_flow_buckets;
+        }
     }
     queue.flow_bucket_bytes[bucket] = queue.flow_bucket_bytes[bucket].saturating_add(item_len);
 }
@@ -4663,6 +4763,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 last_refill_ns: if queue.exact { 0 } else { now_ns },
                 queued_bytes: 0,
                 active_flow_buckets: 0,
+            active_flow_buckets_peak: 0,
                 flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                 flow_rr_buckets: FlowRrRing::default(),
                 flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -5726,6 +5827,108 @@ mod tests {
             },
         );
         interfaces
+    }
+
+    /// #784 Codex review regression pin: mixed-head deque scan.
+    ///
+    /// The first revision of `drop_cos_bound_local_leftovers` did
+    /// a head-peek fast-exit: if the deque's front item had
+    /// `cos_queue_id.is_none()`, the function returned before
+    /// scanning. That let CoS-bound items LATER in the deque
+    /// escape to the unshaped `transmit_batch` backup path,
+    /// bypassing the CoS cap — the exact #760 bypass this filter
+    /// was designed to close.
+    ///
+    /// This test constructs a mixed-head deque
+    /// `[non-cos, cos-bound, non-cos, cos-bound]` and verifies
+    /// every cos-bound item is either rescued or dropped (NEVER
+    /// left in the deque), while non-cos items are preserved for
+    /// the downstream backup transmit path.
+    ///
+    /// If this test ever relaxes to allow cos-bound items in the
+    /// survivor set, the #760 cap bypass returns. Adversarial
+    /// reviewers MUST reject PRs that weaken this.
+    #[test]
+    fn partition_cos_bound_local_scans_mixed_head_deque() {
+        // Build a pending deque with a NON-CoS head followed by
+        // a mix of CoS-bound and non-CoS items. Codex flagged
+        // the pre-refactor head-peek as HIGH severity — this is
+        // the regression pin.
+        let non_cos = |payload: u8| TxRequest {
+            bytes: vec![payload; 64],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 99,
+            cos_queue_id: None,
+            dscp_rewrite: None,
+        };
+        let cos_bound = |payload: u8| TxRequest {
+            bytes: vec![payload; 64],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 14,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        };
+        let mut pending: VecDeque<TxRequest> = VecDeque::from([
+            non_cos(1),
+            cos_bound(2),
+            non_cos(3),
+            cos_bound(4),
+            non_cos(5),
+        ]);
+        // Rescue stub: always fails (returns Err) so every
+        // cos-bound item falls through to drop. Verifies the
+        // scan covers the WHOLE deque, not just the head.
+        let (dropped, dropped_bytes) =
+            partition_cos_bound_local_with_rescue(&mut pending, Err);
+        assert_eq!(dropped, 2, "both cos-bound items must be dropped (scan covers tail)");
+        assert_eq!(dropped_bytes, 128, "2 × 64 bytes dropped");
+        // Survivors: only the 3 non-CoS items, in original order.
+        let survivors: Vec<u8> = pending.iter().map(|r| r.bytes[0]).collect();
+        assert_eq!(survivors, vec![1, 3, 5]);
+    }
+
+    /// #784 companion: rescue path pins. When `try_rescue` returns
+    /// Ok, items are consumed (rescued) — they must NOT remain in
+    /// the survivor set. Only items that actually fail rescue
+    /// count toward the drop.
+    #[test]
+    fn partition_cos_bound_local_rescues_when_try_rescue_ok() {
+        let non_cos = TxRequest {
+            bytes: vec![0xAA; 64],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 99,
+            cos_queue_id: None,
+            dscp_rewrite: None,
+        };
+        let cos_bound = TxRequest {
+            bytes: vec![0xBB; 64],
+            expected_ports: None,
+            expected_addr_family: libc::AF_INET as u8,
+            expected_protocol: PROTO_TCP,
+            flow_key: None,
+            egress_ifindex: 14,
+            cos_queue_id: Some(4),
+            dscp_rewrite: None,
+        };
+        let mut pending: VecDeque<TxRequest> = VecDeque::from([non_cos, cos_bound]);
+        // Rescue always succeeds — CoS items must NOT count as drops.
+        let (dropped, dropped_bytes) =
+            partition_cos_bound_local_with_rescue(&mut pending, |_| Ok(()));
+        assert_eq!(dropped, 0);
+        assert_eq!(dropped_bytes, 0);
+        // Survivor set: only the non-CoS item (rescued CoS item
+        // was consumed by try_rescue closure).
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].bytes[0], 0xAA);
     }
 
     #[test]
@@ -9964,6 +10167,98 @@ mod tests {
         }
     }
 
+    /// #784 regression pin: narrow-input flow distribution.
+    ///
+    /// The iperf3-style workload hits an SFQ bucket collision
+    /// cliff that the mixed-v4/v6 distribution test above misses:
+    /// 12 flows to the same (src_ip, dst_ip, dst_port, proto,
+    /// addr_family) differing only in src_port (consecutive
+    /// ephemeral range, all v4 TCP). Real-world iperf3 reports
+    /// 3 flows at ~145 Mbps with 0 retrans and 9 flows at
+    /// ~60 Mbps with thousands of retrans each — caused by
+    /// multiple flows landing on the same SFQ bucket and having
+    /// their flow_share caps shrunk (each bucket's share = total
+    /// buffer / prospective_active_flows, halved/thirded if a
+    /// bucket holds 2-3 flows).
+    ///
+    /// Budget: for 12 narrow-input flows in 1024 buckets under a
+    /// good hash, E[colliding pairs] ≈ 12*11/(2*1024) ≈ 0.06 —
+    /// essentially always 12 distinct buckets. Under the prior
+    /// boost-style hash_combine, narrow inputs observably collapse
+    /// to 3-6 distinct buckets across most seeds. Demand >=11
+    /// distinct buckets (allowing one pair collision worst-case
+    /// under uniform null).
+    ///
+    /// Adversarial review posture: if this test ever weakens to
+    /// accept fewer distinct buckets, or drops the all-v4 shape,
+    /// the iperf3 fairness regression WILL return silently.
+    #[test]
+    fn exact_cos_flow_bucket_distribution_narrow_inputs_all_v4() {
+        use std::collections::BTreeSet;
+
+        // Production-like ephemeral port range. Linux kernel's
+        // default ephemeral range is 32768-60999; 12 consecutive
+        // ports starting at 39754 matches the actual iperf3
+        // capture that motivated this test.
+        let ports: Vec<u16> = (39754..39754 + 12).collect();
+        // Test multiple seeds so a hash-mix fix cannot pass by
+        // accident on a lucky seed. Including 0 pins the
+        // pre-flow-fair default.
+        let seeds: [u64; 5] = [
+            0,
+            0xA5A5_0000_C3C3_FFFF,
+            0x0123_4567_89AB_CDEF,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0xDEAD_BEEF_CAFE_BABE,
+        ];
+        for &seed in &seeds {
+            let mut buckets = BTreeSet::new();
+            for port in &ports {
+                let flow = test_session_key(*port, 5201);
+                // Explicitly v4 TCP — no mixed-family shortcut.
+                assert_eq!(flow.addr_family, libc::AF_INET as u8);
+                buckets.insert(cos_flow_bucket_index(seed, Some(&flow)));
+            }
+            assert!(
+                buckets.len() >= 11,
+                "seed={:#x}: 12 all-v4 iperf3-style flows landed in only {} distinct \
+                 buckets — SFQ fairness regression. This is the flow-spread bug from #784; \
+                 if this fires, the hash function is not spreading narrow-variance inputs \
+                 (identical src_ip/dst_ip/dst_port/proto/family, only src_port differs).",
+                seed,
+                buckets.len()
+            );
+        }
+    }
+
+    /// #784 companion: also pin the wider 12-flow case with
+    /// non-consecutive src_ports (simulating a different
+    /// ephemeral-port allocator or long-running connections
+    /// from different source processes).
+    #[test]
+    fn exact_cos_flow_bucket_distribution_narrow_inputs_scattered_ports() {
+        use std::collections::BTreeSet;
+        // 12 src_ports scattered across the ephemeral range.
+        let ports: [u16; 12] = [
+            33000, 35719, 38112, 41003, 43517, 46281, 48907, 51214, 53841, 56118, 58792, 60999,
+        ];
+        let seeds: [u64; 3] = [0, 0xA5A5_0000_C3C3_FFFF, 0x0123_4567_89AB_CDEF];
+        for &seed in &seeds {
+            let mut buckets = BTreeSet::new();
+            for port in &ports {
+                let flow = test_session_key(*port, 5201);
+                buckets.insert(cos_flow_bucket_index(seed, Some(&flow)));
+            }
+            assert!(
+                buckets.len() >= 11,
+                "seed={:#x}: 12 scattered all-v4 flows landed in only {} distinct \
+                 buckets — SFQ hash regression on non-consecutive src_ports",
+                seed,
+                buckets.len()
+            );
+        }
+    }
+
     #[test]
     fn build_cos_interface_runtime_leaves_flow_hash_seed_zero_until_promotion() {
         // The seed is drawn in `ensure_cos_interface_runtime`, not in
@@ -10895,6 +11190,7 @@ mod tests {
             last_refill_ns: 0,
             queued_bytes: 1500,
             active_flow_buckets: 0,
+            active_flow_buckets_peak: 0,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -10933,6 +11229,7 @@ mod tests {
             last_refill_ns: 0,
             queued_bytes: 0,
             active_flow_buckets: 0,
+            active_flow_buckets_peak: 0,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -10982,6 +11279,7 @@ mod tests {
             last_refill_ns: 0,
             queued_bytes: 0,
             active_flow_buckets: 0,
+            active_flow_buckets_peak: 0,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -11879,21 +12177,24 @@ mod tests {
         }
     }
 
+    /// #784: SFQ fairness regression pin. The former behavior of
+    /// the aggregate-above ECN arm actively broke per-flow fairness
+    /// on iperf3 -P 12 against a 1 Gbps cap (3 winners at 145 Mbps
+    /// with 0 retrans, 9 losers at 50-75 Mbps with thousands of
+    /// retrans each). Removing the aggregate arm restored fairness
+    /// because flows that hadn't filled their bucket no longer got
+    /// penalised for OTHER flows' bursts.
+    ///
+    /// If this test ever flips to assert `marked` is true, the
+    /// aggregate arm has been reintroduced and the iperf3 fairness
+    /// regression in #784 WILL come back. Do not weaken this test.
     #[test]
-    fn admission_ecn_marks_when_aggregate_above_threshold_per_flow_below() {
-        // Preserve the original #718 arm: if the aggregate queue is
-        // above its threshold while the target flow's bucket is small,
-        // the mark must still fire. Without this, a rewrite that
-        // accidentally AND-ed the two conditions would silently break
-        // the aggregate case.
+    fn admission_ecn_does_not_mark_when_only_aggregate_above_threshold() {
         let mut root = test_flow_fair_exact_queue_16_flows();
         let queue = &mut root.queues[0];
         let target = 0usize;
 
-        // Put the target bucket well below the per-flow threshold
-        // (8 000 bytes at NUM/DEN = 1/3) but drive the aggregate
-        // above 128 000.
-        let target_bucket_bytes = 500; // < 8 000
+        let target_bucket_bytes = 500; // << per-flow threshold (8 000 B at 1/3)
         let _ = seed_sixteen_flow_buckets(queue, target, target_bucket_bytes);
         let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
         let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
@@ -11919,9 +12220,13 @@ mod tests {
             &umem,
         );
 
-        assert!(marked, "aggregate arm must still fire (the #718 case)");
+        assert!(
+            !marked,
+            "#784: aggregate arm must NOT fire — only per-flow threshold triggers marks. \
+             If this assertion ever flips, the SFQ iperf3 -P 12 fairness regression returns."
+        );
         let after = snapshot_counters(queue);
-        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked + 1);
+        assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked);
     }
 
     #[test]
@@ -12023,11 +12328,18 @@ mod tests {
         // drift out of lockstep and this test fails. Computed from
         // the state as `share_cap × NUM / DEN` independently — no
         // internal call into the policy function.
+        //
+        // #784: seed with `target_bytes > 0` so prospective_active
+        // stays at 16 both in the test's computed threshold and in
+        // the policy's live recompute. Earlier revision seeded
+        // target=0 and set the bucket above threshold later, which
+        // shifted prospective_active from 17 → 16 between compute
+        // and policy call and silently passed on the aggregate arm.
         let mut root = test_flow_fair_exact_queue_16_flows();
         let queue = &mut root.queues[0];
         let target = 0usize;
 
-        seed_sixteen_flow_buckets(queue, target, 0);
+        seed_sixteen_flow_buckets(queue, target, 1);
         let buffer_limit = cos_flow_aware_buffer_limit(queue, target);
         let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, target);
 

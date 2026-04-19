@@ -1996,6 +1996,19 @@ where
                 status.surplus_deficit_bytes = status
                     .surplus_deficit_bytes
                     .saturating_add(queue.surplus_deficit);
+                // #784: use MAX across worker instances (not sum) —
+                // the peak is per-worker observed; aggregating by
+                // max gives the worst-case collision visibility
+                // without inflating the number by double-counting.
+                let peak = u64::from(queue.active_flow_buckets_peak);
+                if peak > status.active_flow_buckets_peak {
+                    status.active_flow_buckets_peak = peak;
+                }
+                // #784: surface flow_fair so we can detect queues
+                // that were expected to run SFQ but aren't.
+                if queue.flow_fair {
+                    status.flow_fair = true;
+                }
                 // #710: aggregate drop-reason counters across worker
                 // instances for this queue. Each worker's per-queue
                 // runtime is single-writer (only the owner worker
@@ -2229,6 +2242,7 @@ mod tests {
                     last_refill_ns: 0,
                     queued_bytes,
                     active_flow_buckets: 0,
+                    active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -2363,6 +2377,7 @@ mod tests {
                 last_refill_ns: 0,
                 queued_bytes: 0,
                 active_flow_buckets: 0,
+                active_flow_buckets_peak: 0,
                 flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                 flow_rr_buckets: FlowRrRing::default(),
                 flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -2563,6 +2578,7 @@ mod tests {
                     last_refill_ns: 0,
                     queued_bytes: 0,
                     active_flow_buckets: 0,
+                    active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -2591,6 +2607,7 @@ mod tests {
                     last_refill_ns: 0,
                     queued_bytes: 0,
                     active_flow_buckets: 0,
+                    active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -2619,6 +2636,7 @@ mod tests {
                     last_refill_ns: 0,
                     queued_bytes: 0,
                     active_flow_buckets: 0,
+                    active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -2772,6 +2790,7 @@ mod tests {
                     last_refill_ns: 0,
                     queued_bytes: 0,
                     active_flow_buckets: 0,
+                    active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -2800,6 +2819,7 @@ mod tests {
                     last_refill_ns: 0,
                     queued_bytes: 0,
                     active_flow_buckets: 0,
+                    active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -2918,6 +2938,7 @@ mod tests {
                 last_refill_ns: 0,
                 queued_bytes: 0,
                 active_flow_buckets: 0,
+                active_flow_buckets_peak: 0,
                 flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                 flow_rr_buckets: FlowRrRing::default(),
                 flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -3081,6 +3102,7 @@ mod tests {
                     last_refill_ns: 0,
                     queued_bytes: 0,
                     active_flow_buckets: 0,
+                    active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -3109,6 +3131,7 @@ mod tests {
                     last_refill_ns: 0,
                     queued_bytes: 0,
                     active_flow_buckets: 0,
+                    active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),

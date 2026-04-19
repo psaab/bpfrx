@@ -1547,6 +1547,17 @@ pub(super) fn aggregate_cos_statuses_across_workers(
                     q.priority = q.priority.min(queue.priority);
                 }
                 q.exact = queue.exact;
+                // #784: flow_fair is per-worker-queue-runtime; OR
+                // across workers so any worker with flow_fair=true
+                // surfaces. active_flow_buckets_peak is already
+                // max-aggregated by the worker snapshot; take max
+                // here across workers too.
+                if queue.flow_fair {
+                    q.flow_fair = true;
+                }
+                if queue.active_flow_buckets_peak > q.active_flow_buckets_peak {
+                    q.active_flow_buckets_peak = queue.active_flow_buckets_peak;
+                }
                 q.transmit_rate_bytes = q.transmit_rate_bytes.max(queue.transmit_rate_bytes);
                 q.buffer_bytes = q.buffer_bytes.max(queue.buffer_bytes);
                 q.worker_instances = q.worker_instances.saturating_add(queue.worker_instances);
