@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub(super) type FastMap<K, V> = FxHashMap<K, V>;
 pub(super) type FastSet<T> = FxHashSet<T>;
@@ -1005,6 +1005,32 @@ pub(super) struct CoSQueueRuntime {
     /// without resetting (Codex review: do NOT reset on
     /// snapshot, the doc here is the contract).
     pub(super) active_flow_buckets_peak: u16,
+    /// #785 cross-worker DRR: per-worker local token bucket that
+    /// enforces `fair_share_rate_bytes = queue.transmit_rate_bytes
+    /// × (local_flow_count / total_flow_count)` on the shared_exact
+    /// service path, where `local_flow_count` = `active_flow_buckets`
+    /// on this worker and `total_flow_count` comes from the shared
+    /// lease's atomic counter. Refilled on every drain attempt using
+    /// `local_drain_rate_bytes` (cached fair-share rate) and the
+    /// time elapsed since `local_drain_last_refill_ns`.
+    ///
+    /// These fields are meaningful only on flow-fair shared_exact
+    /// queues. On owner-local-exact queues the shared lease's
+    /// `active_flow_count` stays 0 and the fields are inert.
+    pub(super) local_drain_tokens: u64,
+    pub(super) local_drain_last_refill_ns: u64,
+    pub(super) local_drain_rate_bytes: u64,
+    /// #785 cross-worker DRR: cached shared-queue lease Arc so the
+    /// enqueue/dequeue accounting hooks can atomically bump
+    /// `active_flow_count` on the shared counter without walking
+    /// through `iface_fast.queue_fast_path[idx].shared_queue_lease`
+    /// on every packet. `Some` only on flow-fair shared_exact
+    /// queues; `None` on owner-local-exact and non-exact queues.
+    /// Populated by `promote_cos_queue_flow_fair`; the Arc cloned
+    /// from `WorkerCoSQueueFastPath.shared_queue_lease`, which
+    /// itself is populated from the coordinator-owned shared
+    /// `BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>`.
+    pub(super) shared_lease: Option<Arc<SharedCoSQueueLease>>,
     pub(super) flow_bucket_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
     pub(super) flow_rr_buckets: FlowRrRing,
     pub(super) flow_bucket_items: [VecDeque<CoSPendingTxItem>; COS_FLOW_FAIR_BUCKETS],
@@ -1157,6 +1183,21 @@ impl Default for CoSQueueOwnerProfile {
 pub(super) struct SharedCoSQueueLease {
     config: SharedCoSLeaseConfig,
     state: SharedCoSLeaseState,
+    /// #785 cross-worker DRR: atomically-tracked total flow count
+    /// across all workers servicing this shared_exact queue. Each
+    /// worker uses this to compute its local fair-share drain rate
+    /// (`queue_rate × local_flow_count / total_flow_count`), which
+    /// it enforces via a per-worker local token bucket. This
+    /// breaks the positive-feedback loop where workers with
+    /// higher-cwnd flows grab disproportionately more of the
+    /// shared lease.
+    ///
+    /// Updated on per-worker SFQ bucket transitions 0↔>0. Kept at
+    /// the `Relaxed` ordering — the value is advisory input to the
+    /// local rate calculation, recomputed on every per-worker
+    /// bucket transition, so brief staleness between workers just
+    /// delays convergence by one packet-scale interval.
+    active_flow_count: AtomicU32,
 }
 
 pub(super) struct SharedCoSRootLease {
@@ -1388,11 +1429,16 @@ impl SharedCoSQueueLease {
                 credits: AtomicU64::new(pack_shared_cos_lease_credits(config.burst_bytes, 0)),
                 last_refill_ns: AtomicU64::new(0),
             },
+            active_flow_count: AtomicU32::new(0),
         }
     }
 
     pub(super) fn lease_bytes(&self) -> u64 {
         self.config.lease_bytes
+    }
+
+    pub(super) fn rate_bytes(&self) -> u64 {
+        self.config.rate_bytes
     }
 
     pub(super) fn matches_config(
@@ -1414,6 +1460,50 @@ impl SharedCoSQueueLease {
 
     pub(super) fn release_unused(&self, bytes: u64) {
         shared_cos_lease_release_unused(self.config, &self.state, bytes);
+    }
+
+    /// #785 cross-worker DRR: total active flow count across all
+    /// workers servicing this queue. Clamped to `>=1` at the use
+    /// site (`fair_share_rate_bytes`) so divisions are safe even
+    /// during the brief window where a worker has enqueued its
+    /// first packet but has not yet incremented the counter.
+    #[inline]
+    pub(super) fn active_flow_count(&self) -> u32 {
+        self.active_flow_count.load(Ordering::Relaxed)
+    }
+
+    /// Called by a worker when a locally-tracked flow transitions
+    /// from idle (0 bytes queued in its SFQ bucket) to active
+    /// (>0 bytes). Relaxed ordering is fine: the counter is
+    /// advisory input to `fair_share_rate_bytes`, not a
+    /// synchronisation point.
+    #[inline]
+    pub(super) fn add_active_flow(&self) {
+        self.active_flow_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Reverse of `add_active_flow`. Uses `saturating_sub` via
+    /// compare-and-swap to avoid underflow if counter drift ever
+    /// occurs — defensive because an underflow would mint an
+    /// enormous `active_flow_count` and collapse every worker's
+    /// fair-share rate to zero.
+    #[inline]
+    pub(super) fn remove_active_flow(&self) {
+        let mut cur = self.active_flow_count.load(Ordering::Relaxed);
+        loop {
+            if cur == 0 {
+                return;
+            }
+            match self.active_flow_count.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
     }
 }
 

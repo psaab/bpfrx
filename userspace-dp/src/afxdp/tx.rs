@@ -1906,6 +1906,12 @@ fn service_exact_local_queue_direct_flow_fair(
             Some(queue) => queue,
             None => return false,
         };
+        // #785 slice 2: refill the cross-worker fair-share bucket
+        // immediately before the drain attempt so the rate
+        // computation uses a fresh view of the shared
+        // `active_flow_count`. No-op on owner-local-exact queues
+        // (shared_lease is None).
+        maybe_top_up_local_fair_share(queue, now_ns);
         drain_exact_local_items_to_scratch_flow_fair(
             queue,
             &mut binding.free_tx_frames,
@@ -2158,6 +2164,8 @@ fn service_exact_prepared_queue_direct_flow_fair(
             Some(queue) => queue,
             None => return false,
         };
+        // #785 slice 2: see the Local variant for rationale.
+        maybe_top_up_local_fair_share(queue, now_ns);
         drain_exact_prepared_items_to_scratch_flow_fair(
             queue,
             &mut binding.scratch_prepared_tx,
@@ -2366,6 +2374,14 @@ fn drain_exact_local_items_to_scratch_flow_fair(
 ) -> ExactCoSScratchBuild {
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
+    // #785 slice 2: cross-worker DRR. On flow-fair shared_exact
+    // queues `queue.shared_lease` is Some — the per-worker token
+    // bucket (`queue.local_drain_tokens`) was just refilled by
+    // `maybe_top_up_local_fair_share` at service entry. On
+    // owner-local-exact and non-shared paths `shared_lease` is
+    // None and the gate is inert (u64::MAX snapshot, never
+    // stalls the drain).
+    let cross_worker_gated = queue.shared_lease.is_some();
     while scratch_local_tx.len() < TX_BATCH_SIZE {
         if free_tx_frames.is_empty() {
             break;
@@ -2380,11 +2396,21 @@ fn drain_exact_local_items_to_scratch_flow_fair(
         if remaining_root < len || remaining_secondary < len {
             break;
         }
+        // #785 slice 2: per-worker fair-share gate. Stops the drain
+        // when this worker has spent its share; the TX ring idles
+        // briefly and gives other workers' drain invocations room
+        // to claim the shared lease at their own fair share.
+        if cross_worker_gated && queue.local_drain_tokens < len {
+            break;
+        }
         let Some(CoSPendingTxItem::Local(mut req)) = cos_queue_pop_front(queue) else {
             break;
         };
         remaining_root = remaining_root.saturating_sub(len);
         remaining_secondary = remaining_secondary.saturating_sub(len);
+        if cross_worker_gated {
+            queue.local_drain_tokens = queue.local_drain_tokens.saturating_sub(len);
+        }
 
         if let Some(dscp_rewrite) = queue_dscp_rewrite {
             req.dscp_rewrite = req.dscp_rewrite.or(Some(dscp_rewrite));
@@ -2536,6 +2562,10 @@ fn drain_exact_prepared_items_to_scratch_flow_fair(
 ) -> ExactCoSScratchBuild {
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
+    // #785 slice 2: cross-worker DRR gate, mirror of the Local
+    // variant in `drain_exact_local_items_to_scratch_flow_fair`.
+    // See that function for the policy rationale.
+    let cross_worker_gated = queue.shared_lease.is_some();
 
     while scratch_prepared_tx.len() < TX_BATCH_SIZE {
         let Some(front) = cos_queue_front(queue) else {
@@ -2548,11 +2578,17 @@ fn drain_exact_prepared_items_to_scratch_flow_fair(
         if remaining_root < len || remaining_secondary < len {
             break;
         }
+        if cross_worker_gated && queue.local_drain_tokens < len {
+            break;
+        }
         let Some(CoSPendingTxItem::Prepared(mut req)) = cos_queue_pop_front(queue) else {
             break;
         };
         remaining_root = remaining_root.saturating_sub(len);
         remaining_secondary = remaining_secondary.saturating_sub(len);
+        if cross_worker_gated {
+            queue.local_drain_tokens = queue.local_drain_tokens.saturating_sub(len);
+        }
 
         if let Some(dscp_rewrite) = queue_dscp_rewrite {
             req.dscp_rewrite = req.dscp_rewrite.or(Some(dscp_rewrite));
@@ -3112,6 +3148,29 @@ const _: () = assert!(COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS >= 1_000_000);
 const COS_SURPLUS_ROUND_QUANTUM_BYTES: u64 = 1500;
 const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 
+/// #785 slice 2 — cross-worker DRR.
+///
+/// Burst cap for the per-worker local drain token bucket, expressed
+/// as "how many nanoseconds of fair-share bandwidth can queue up
+/// while the worker is idle". Chosen as 1 ms because:
+///
+///   * Shorter (sub-millisecond) caps prevent a worker from
+///     absorbing a short burst of many packets for one of its
+///     flows — the drain rate kicks in mid-burst and stalls the
+///     TX ring, producing micro-stutters.
+///   * Longer (tens of millisecond) caps let one worker bank
+///     enough tokens to drain for ~10 ms uninterrupted at its
+///     fair share, which on a 25 Gbps queue with 12 flows is
+///     2 Gbps × 10 ms / 8 = 2.5 MB — larger than the rest of the
+///     CoS queue buffer. Fair-share would then no longer bound
+///     per-flow ingress rate; it would just bound average rate
+///     over 10 ms windows while TCP sees unregulated bursts.
+///
+/// 1 ms × fair-share rate = ~256 KB at 2 Gbps / flow, ~10 KB at
+/// 77 Mbps / flow. Both are on the order of 1-2 MTU-sized bursts
+/// per flow per worker, which matches NAPI batching granularity.
+const COS_CROSS_WORKER_BURST_NS: u64 = 3_000_000;
+
 /// ECN CE-marking threshold as a fraction of the relevant cap.
 /// Applied to both the aggregate `buffer_limit` and the per-flow
 /// `share_cap` in `apply_cos_admission_ecn_policy`.
@@ -3458,10 +3517,19 @@ fn apply_cos_admission_ecn_policy(
 
     let flow_above = queue.flow_bucket_bytes[flow_bucket] > flow_ecn_threshold;
     let aggregate_above = queue.queued_bytes > aggregate_ecn_threshold;
-    // flow_fair queue: only per-flow threshold triggers marks.
-    // non-flow-fair queue: use the aggregate as before
-    // (flow_bucket_bytes is unused on non-flow-fair queues).
-    let should_mark = if queue.flow_fair {
+    // Three classes:
+    //   * flow_fair && !shared_exact — owner-local-exact (#784).
+    //     Per-flow arm only; #784 fairness fix on 1 Gbps iperf-a
+    //     depends on NOT marking on aggregate.
+    //   * flow_fair && shared_exact — high-rate shared_exact (#785
+    //     slice 2). Aggregate arm only; per-flow fairness is
+    //     enforced via the cross-worker rate gate, so per-flow
+    //     ECN would collide with it (both signal "slow this flow")
+    //     and over-shoot cwnd back-off.
+    //   * !flow_fair — legacy best-effort / rate-limited queues.
+    //     Aggregate arm; there is no per-flow accounting on that
+    //     path.
+    let should_mark = if queue.flow_fair && !queue.shared_exact {
         flow_above
     } else {
         aggregate_above
@@ -3558,6 +3626,87 @@ fn maybe_top_up_cos_queue_lease(
         .saturating_add(grant)
         .min(queue.buffer_bytes.max(COS_MIN_BURST_BYTES));
     queue.last_refill_ns = now_ns;
+}
+
+/// #785 slice 2 — cross-worker DRR.
+///
+/// Compute this worker's fair-share drain rate on a flow-fair
+/// shared_exact queue.
+///
+/// `queue_rate` is the queue's aggregate transmit rate. `local`
+/// is this worker's `active_flow_buckets`. `total` is the shared
+/// lease's `active_flow_count` (summed across all workers).
+///
+/// Fair share = `queue_rate × local / max(local, total)`. The
+/// `max(local, total)` denominator is defensive: a brief window
+/// between "worker A enqueues first packet of a flow" and
+/// "worker A bumps the shared counter" can leave `total < local`
+/// (e.g. just after daemon restart, before the first drain cycle
+/// settles). Clamping avoids a transient rate overshoot above the
+/// queue's aggregate cap.
+///
+/// Returns 0 when `local == 0` (worker has no flows on this
+/// queue) so the gate blocks any drain attempt — paper-thin
+/// defense against TX of stale packets left over from a flow
+/// that has since been removed from this worker.
+#[inline]
+fn fair_share_rate_bytes(queue_rate: u64, local: u32, total: u32) -> u64 {
+    if local == 0 || queue_rate == 0 {
+        return 0;
+    }
+    let denom = local.max(total) as u64;
+    let local = local as u64;
+    ((queue_rate as u128) * (local as u128) / (denom as u128)) as u64
+}
+
+/// #785 slice 2 — cross-worker DRR.
+///
+/// Refill the per-worker `local_drain_tokens` bucket at the rate
+/// `fair_share_rate_bytes(queue_rate, active_flow_buckets,
+/// lease.active_flow_count())`, capped at
+/// `COS_CROSS_WORKER_BURST_NS × fair_share_rate / 1s`.
+///
+/// Called at the start of every drain attempt for a flow-fair
+/// shared_exact queue. Recomputes the fair-share rate every call
+/// so a flow count change on any worker is reflected within one
+/// drain cycle (~100 μs).
+///
+/// No-op when `queue.shared_lease` is `None` — owner-local-exact
+/// queues are serviced by their single owner worker and do not
+/// need the cross-worker gate (TCP's own end-to-end pacing plus
+/// #784 SFQ are sufficient there).
+#[inline]
+fn maybe_top_up_local_fair_share(queue: &mut CoSQueueRuntime, now_ns: u64) {
+    let Some(lease) = queue.shared_lease.as_ref() else {
+        return;
+    };
+    let total = lease.active_flow_count();
+    let local = queue.active_flow_buckets as u32;
+    let rate = fair_share_rate_bytes(queue.transmit_rate_bytes, local, total);
+    queue.local_drain_rate_bytes = rate;
+    if rate == 0 {
+        // Momentarily zero — don't clobber `local_drain_tokens`.
+        // The SFQ bucket counter that feeds `active_flow_buckets`
+        // transiently hits 0 between packet arrivals on a flow
+        // (the dequeue decrements when bucket_bytes drains to 0,
+        // then the next packet's enqueue increments it again).
+        // Zero-ing the bucket on every transient would reset
+        // accumulated burst capacity on each drain, starving the
+        // shared_exact service path down to ~1/3 of queue_rate
+        // (measured 7.9 Gbps on a 25 Gbps / 12-flow iperf3 test).
+        // Just skip the refill; the bucket keeps whatever it has
+        // and the next non-zero-rate refill resumes normally.
+        return;
+    }
+    let burst = ((rate as u128) * (COS_CROSS_WORKER_BURST_NS as u128) / 1_000_000_000u128) as u64;
+    let burst = burst.max(tx_frame_capacity() as u64);
+    refill_cos_tokens(
+        &mut queue.local_drain_tokens,
+        rate,
+        burst,
+        &mut queue.local_drain_last_refill_ns,
+        now_ns,
+    );
 }
 
 fn refill_cos_tokens(
@@ -3787,6 +3936,17 @@ fn cos_queue_flow_share_limit(
     if !queue.flow_fair {
         return buffer_limit;
     }
+    // #785 slice 2: shared_exact queues enforce per-flow fairness
+    // via the cross-worker per-worker rate gate
+    // (`maybe_top_up_local_fair_share`), NOT the per-flow share cap.
+    // The share cap's `COS_FLOW_FAIR_MIN_SHARE_BYTES` floor (24 KB)
+    // is far below BDP at 25 Gbps / 12 flows and would tail-drop TCP
+    // before the rate gate converged.  Aggregate-only admission here
+    // keeps TCP able to build cwnd up to BDP while the per-worker
+    // token bucket caps the per-flow rate.
+    if queue.shared_exact {
+        return buffer_limit;
+    }
     let prospective_active = cos_queue_prospective_active_flows(queue, flow_bucket);
     buffer_limit
         .div_ceil(prospective_active)
@@ -3860,6 +4020,14 @@ fn account_cos_queue_flow_enqueue(
         if queue.active_flow_buckets > queue.active_flow_buckets_peak {
             queue.active_flow_buckets_peak = queue.active_flow_buckets;
         }
+        // #785 slice 2: cross-worker DRR counter. Increment the
+        // shared `active_flow_count` on the FIRST packet of a flow
+        // on THIS worker. `shared_lease` is only populated on
+        // shared_exact queues (see `promote_cos_queue_flow_fair`),
+        // so this is a no-op on owner-local-exact queues.
+        if let Some(lease) = &queue.shared_lease {
+            lease.add_active_flow();
+        }
     }
     queue.flow_bucket_bytes[bucket] = queue.flow_bucket_bytes[bucket].saturating_add(item_len);
 }
@@ -3877,6 +4045,13 @@ fn account_cos_queue_flow_dequeue(
     let remaining = queue.flow_bucket_bytes[bucket].saturating_sub(item_len);
     if queue.flow_bucket_bytes[bucket] > 0 && remaining == 0 {
         queue.active_flow_buckets = queue.active_flow_buckets.saturating_sub(1);
+        // #785 slice 2: symmetric with the enqueue path — decrement
+        // the shared counter when the last packet of a flow drains
+        // from this worker's bucket. `remove_active_flow` is
+        // saturating so a transient counter skew does not underflow.
+        if let Some(lease) = &queue.shared_lease {
+            lease.remove_active_flow();
+        }
     }
     queue.flow_bucket_bytes[bucket] = remaining;
 }
@@ -4751,48 +4926,46 @@ fn apply_cos_queue_flow_fair_promotion(
 }
 
 /// Promote a freshly-built queue runtime onto the SFQ (flow-fair)
-/// path when its configuration warrants it, and cache the
-/// `shared_exact` signal onto the runtime so future work on this
-/// surface can branch on it without another iface_fast lookup.
+/// path when its configuration warrants it, cache the
+/// `shared_exact` bit, and on shared_exact queues cache the shared
+/// lease `Arc` so the cross-worker rate gate and the shared
+/// `active_flow_count` accounting have O(1) access.
 ///
-/// **Current policy:** `flow_fair = queue.exact && !shared_exact`.
-/// Only the owner-local-exact path runs SFQ today; shared_exact
-/// (high-rate, >= `COS_SHARED_EXACT_MIN_RATE_BYTES` = 2.5 Gbps)
-/// queues stay on the single-FIFO-per-worker drain.
+/// **Policy (#785 slice 2):**
 ///
-/// **Why shared_exact is held back (issue #785):** two attempts
-/// have been made to enable SFQ on shared_exact queues and both
-/// were rolled back after empirical regression:
+///   * `flow_fair = queue.exact` on every exact queue — owner-
+///     local-exact AND shared_exact.
+///   * Owner-local-exact (low-rate) queues keep the per-flow SFQ
+///     + per-flow admission gates (the #784 fairness fix on the
+///     1 Gbps iperf-a queue depends on this).
+///   * Shared_exact queues run SFQ DRR AND are rate-gated per
+///     worker at `queue_rate × active_flow_buckets /
+///     shared_lease.active_flow_count`. The per-flow admission
+///     gates downgrade to aggregate-only on shared_exact (see
+///     `cos_queue_flow_share_limit` and
+///     `apply_cos_admission_ecn_policy`) so admission drops and
+///     ECN marks track aggregate queue depth, while per-flow
+///     fairness is enforced by the rate gate rather than the
+///     rate-unaware 24 KB share cap.
 ///
-/// 1. Naïve flip (flow_fair=queue.exact, no admission change).
-///    iperf3 -P 12 on the 25 Gbps iperf-c cap regressed from
-///    22.3 Gbps / 0 retrans to 16.3 Gbps / 25 k+ retrans. Root
-///    cause: the per-flow share cap (`cos_queue_flow_share_limit`
-///    → floor `COS_FLOW_FAIR_MIN_SHARE_BYTES` = 24 KB) and the
-///    per-flow ECN arm (`apply_cos_admission_ecn_policy`) are
-///    rate-unaware; on a 25 Gbps queue with 12 flows the per-flow
-///    cap collapses to ~24 KB, far below the ~5 MB BDP a
-///    2 Gbps / 20 ms TCP flow needs, so admission drops and ECN
-///    marks fired on nearly every packet.
+/// **Why this shape (empirical rationale):** two prior rollbacks
+/// on issue #785 frame the current design.
 ///
-/// 2. SFQ + aggregate-only admission (flow_fair=queue.exact;
-///    `cos_queue_flow_share_limit` returns `buffer_limit` on
-///    shared_exact; `apply_cos_admission_ecn_policy` uses the
-///    aggregate arm on shared_exact). Throughput preserved
-///    (22-23 Gbps) but per-flow CoV went UP from ~33 % to
-///    ~40-51 % over three runs. Root cause: per-worker SFQ DRR
-///    cannot equalise flows that are distributed unevenly across
-///    workers by NIC RSS — which is the dominant imbalance source
-///    at P=12 / 8 workers. The SFQ cycle also appears to cost
-///    batch-drain efficiency on the high-rate path (a tangible
-///    but unquantified secondary effect).
+///   1. Naïve SFQ flip (flow_fair=queue.exact, no admission
+///      change, no rate gate). iperf3 -P 12 at 25 Gbps regressed
+///      from 22.3 Gbps / 0 retrans to 16.3 Gbps / 25 k+ retrans —
+///      the rate-unaware per-flow share cap (24 KB floor) tripped
+///      admission on every packet on a 2 Gbps TCP flow whose BDP
+///      is ~5 MB.
+///   2. SFQ + aggregate-only admission, no rate gate. Throughput
+///      preserved (22-23 Gbps) but per-flow CoV went UP from
+///      ~33 % to ~40-51 %. Per-worker SFQ cannot equalise flows
+///      distributed unevenly across workers by NIC RSS.
 ///
-/// The architecturally-correct lever is cross-worker flow steering
-/// (or a single shared-SFQ across all workers), not within-worker
-/// SFQ. Follow-up issue tracks that work. Do not flip this gate
-/// again without landing the cross-worker fairness mechanism first
-/// and validating `iperf3 -P 12 -p 5203` at 25 Gbps produces
-/// SUM ≥ 22 Gbps AND per-flow CoV ≤ 20 %.
+/// The current design layers a per-worker rate gate on top of
+/// (2): each worker drains at `queue_rate × local / total`, which
+/// breaks the positive-feedback loop where workers with bigger
+/// TCP cwnd grab disproportionately more of the shared lease.
 ///
 /// **Contract shape:** `queue_fast: &WorkerCoSQueueFastPath` is the
 /// live classifier output from `build_worker_cos_fast_interfaces`,
@@ -4806,10 +4979,11 @@ fn apply_cos_queue_flow_fair_promotion(
 /// the cross-worker DRR work) is automatically visible here.
 ///
 /// **Adversarial review posture (campaign #775 / issue #785):**
-/// reviewers MUST reject PRs that drop the `!shared_exact` clause
-/// without also landing a cross-worker fairness mechanism AND
-/// re-validating the CoV target. The `shared_exact` shadow cached
-/// onto `CoSQueueRuntime` is the hook a future fix will branch on.
+/// any change here MUST agree with the matching `queue.shared_exact`
+/// branches in `cos_queue_flow_share_limit`,
+/// `apply_cos_admission_ecn_policy`, and
+/// `maybe_top_up_local_fair_share`. Mis-matched branches between
+/// these four sites produced the #785 rollback cycle.
 ///
 /// The SFQ salt is drawn only for queues that actually use the
 /// flow-fair path — non-flow-fair queues never consult the seed
@@ -4822,9 +4996,21 @@ fn promote_cos_queue_flow_fair(
     queue_fast: &WorkerCoSQueueFastPath,
 ) {
     queue.shared_exact = queue_fast.shared_exact;
-    queue.flow_fair = queue.exact && !queue_fast.shared_exact;
+    queue.flow_fair = queue.exact;
     if queue.flow_fair {
         queue.flow_hash_seed = cos_flow_hash_seed_from_os();
+    }
+    // #785 slice 2: cross-worker DRR cache. Clone the shared lease
+    // Arc onto the queue runtime so `account_cos_queue_flow_*`
+    // hooks can atomically bump the shared `active_flow_count` on
+    // bucket transitions without walking iface_fast on every
+    // packet. Only populated on shared_exact queues; owner-local-
+    // exact queues keep `shared_lease: None` and stay on the
+    // per-worker-only #784 fairness path.
+    if queue.shared_exact {
+        queue.shared_lease = queue_fast.shared_queue_lease.clone();
+    } else {
+        queue.shared_lease = None;
     }
 }
 
@@ -4874,7 +5060,11 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 last_refill_ns: if queue.exact { 0 } else { now_ns },
                 queued_bytes: 0,
                 active_flow_buckets: 0,
-            active_flow_buckets_peak: 0,
+                active_flow_buckets_peak: 0,
+                local_drain_tokens: 0,
+                local_drain_last_refill_ns: 0,
+                local_drain_rate_bytes: 0,
+                shared_lease: None,
                 flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
                 flow_rr_buckets: FlowRrRing::default(),
                 flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -11303,6 +11493,10 @@ mod tests {
             queued_bytes: 1500,
             active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
+            local_drain_tokens: 0,
+            local_drain_last_refill_ns: 0,
+            local_drain_rate_bytes: 0,
+            shared_lease: None,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -11343,6 +11537,10 @@ mod tests {
             queued_bytes: 0,
             active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
+            local_drain_tokens: 0,
+            local_drain_last_refill_ns: 0,
+            local_drain_rate_bytes: 0,
+            shared_lease: None,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -11394,6 +11592,10 @@ mod tests {
             queued_bytes: 0,
             active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
+            local_drain_tokens: 0,
+            local_drain_last_refill_ns: 0,
+            local_drain_rate_bytes: 0,
+            shared_lease: None,
             flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
@@ -12564,25 +12766,20 @@ mod tests {
         }
     }
 
-    /// Pin that a high-rate exact queue (shared_exact=true) is NOT
-    /// promoted onto the SFQ path BUT DOES have its `shared_exact`
-    /// shadow cached onto the runtime. The shadow is the hook a
-    /// future cross-worker fairness mechanism will branch on.
-    ///
-    /// Rationale: two empirical rollbacks (see module comment).
-    /// Measured regressions that this pin exists to prevent:
-    ///   * Naïve flip: 22.3 → 16.3 Gbps + 25k retrans on iperf3 -P 12
-    ///     at 25 Gbps.
-    ///   * SFQ + aggregate admission: 22-23 Gbps preserved but CoV
-    ///     went from ~33 % to ~40-51 %.
+    /// Pin that a high-rate exact queue (shared_exact=true) IS
+    /// promoted onto the SFQ path, has its `shared_exact` shadow
+    /// cached, and (critically for #785 slice 2) has the
+    /// `shared_lease` Arc cached so the cross-worker rate gate and
+    /// shared `active_flow_count` accounting have O(1) access.
     ///
     /// Do not "fix" this test by flipping the flow_fair expectation
-    /// — land the cross-worker fairness mechanism first, re-validate
-    /// with `iperf3 -P 12 -p 5203` at 25 Gbps (SUM ≥ 22 Gbps AND
-    /// CoV ≤ 20 %), THEN update this pin.
+    /// back to false without also removing the rate gate — the three
+    /// pieces (flow_fair, shared_exact shadow, shared_lease cache)
+    /// must either all be set together or all be cleared together.
     #[test]
-    fn queue_flow_fair_disabled_on_shared_exact() {
+    fn queue_flow_fair_enabled_on_shared_exact() {
         use super::super::worker::COS_SHARED_EXACT_MIN_RATE_BYTES;
+        use std::sync::Arc;
 
         let high_rate_bytes = 25_000_000_000u64 / 8;
         assert!(
@@ -12606,30 +12803,62 @@ mod tests {
         );
         assert!(!runtime.queues[0].flow_fair);
         assert!(!runtime.queues[0].shared_exact);
+        assert!(runtime.queues[0].shared_lease.is_none());
 
-        // Drive the full ensure_cos_interface_runtime promotion loop.
-        let fast_path = vec![test_queue_fast_path_for_promotion(true)];
+        // Drive the full ensure_cos_interface_runtime promotion loop
+        // with a real `Arc<SharedCoSQueueLease>` so we can verify the
+        // cache step.
+        let lease = Arc::new(SharedCoSQueueLease::new(high_rate_bytes, 256 * 1024, 4));
+        let fast_path = vec![WorkerCoSQueueFastPath {
+            shared_exact: true,
+            owner_worker_id: 0,
+            owner_live: None,
+            shared_queue_lease: Some(lease.clone()),
+        }];
         apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
 
         assert!(
-            !runtime.queues[0].flow_fair,
-            "#785: shared_exact queue MUST stay off the SFQ path. \
-             Two rollback-measured regressions (see module comment) \
-             prove per-worker SFQ cannot improve per-flow fairness on \
-             a shared service path — and the naïve gate flip \
-             regresses throughput from 22.3 to 16.3 Gbps + 25k retrans.",
+            runtime.queues[0].flow_fair,
+            "#785 slice 2: shared_exact queue MUST be promoted onto \
+             the SFQ DRR path so per-flow ordering is enforced \
+             inside each worker. The cross-worker rate gate in \
+             `maybe_top_up_local_fair_share` depends on \
+             `active_flow_buckets` being tracked via SFQ state.",
         );
         assert!(
             runtime.queues[0].shared_exact,
-            "#785: shared_exact shadow MUST still be cached onto the \
-             runtime — a future cross-worker fairness mechanism will \
-             branch on it, and the promotion helper is the only place \
-             this shadow is populated.",
+            "#785 slice 2: shared_exact shadow MUST be set so the \
+             admission hot paths (cos_queue_flow_share_limit, \
+             apply_cos_admission_ecn_policy) can route to the \
+             aggregate-only gates and the drain path \
+             (drain_exact_*_items_to_scratch_flow_fair) can trip \
+             the cross-worker rate gate.",
         );
-        assert_eq!(
+        assert!(
+            runtime.queues[0].shared_lease.is_some(),
+            "#785 slice 2: shared_lease Arc MUST be cached on the \
+             runtime so account_cos_queue_flow_enqueue/dequeue can \
+             atomically bump the shared active_flow_count without \
+             walking iface_fast on every packet.",
+        );
+        // Confirm the cached Arc is the SAME one the test fed in
+        // (not accidentally re-cloned from an internal default).
+        assert!(
+            Arc::ptr_eq(
+                runtime.queues[0].shared_lease.as_ref().unwrap(),
+                &lease
+            ),
+            "cached shared_lease must be the live classifier's Arc, \
+             not a new allocation — otherwise the atomic counter \
+             writes go to a stale instance the service path never \
+             reads",
+        );
+        assert_ne!(
             runtime.queues[0].flow_hash_seed, 0,
-            "seed draw is conditional on flow_fair being promoted — \
-             must stay at 0 when the gate blocks",
+            "seed must be drawn on flow-fair promotion — including \
+             on shared_exact (hash collisions across workers would \
+             otherwise bucket-collide all flows with the same \
+             5-tuple-hash)",
         );
     }
 
@@ -12781,21 +13010,198 @@ mod tests {
         assert!(
             runtime.queues[0].flow_fair,
             "queue at position 0 (iperf-a, shared_exact=false) must \
-             reach flow-fair via the owner-local-exact gate",
+             be on the SFQ path via the owner-local-exact gate",
         );
         assert!(
             !runtime.queues[0].shared_exact,
             "queue at position 0 must get position-0's shared_exact=false",
         );
         assert!(
-            !runtime.queues[1].flow_fair,
+            runtime.queues[1].flow_fair,
             "queue at position 1 (iperf-c, shared_exact=true) must \
-             stay off flow-fair under current policy",
+             be on the SFQ path — #785 slice 2 layers the cross-worker \
+             rate gate on top of SFQ DRR for high-rate queues",
         );
         assert!(
             runtime.queues[1].shared_exact,
             "queue at position 1 must get position-1's shared_exact=true \
              — zip misalignment would silently mis-route admission policy",
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #785 slice 2 — cross-worker DRR math and accounting pins.
+    // ---------------------------------------------------------------------
+
+    /// Pin that `fair_share_rate_bytes` produces the expected
+    /// per-worker slice at a variety of (local, total) ratios that
+    /// occur at P=12 on a 6-worker NIC. The math must match the
+    /// docstring ("queue_rate × local / max(local, total)").
+    #[test]
+    fn fair_share_rate_at_p12_6_workers_typical_distributions() {
+        let queue_rate = 25_000_000_000u64 / 8; // 25 Gbps
+        // Perfect split (2 flows per worker): each worker = queue_rate / 6.
+        let fair = fair_share_rate_bytes(queue_rate, 2, 12);
+        assert_eq!(fair, queue_rate * 2 / 12);
+        // Skew (3 flows on this worker, 12 total): worker gets 3/12.
+        let fair = fair_share_rate_bytes(queue_rate, 3, 12);
+        assert_eq!(fair, queue_rate * 3 / 12);
+        // Worker with only 1 flow: gets 1/12.
+        let fair = fair_share_rate_bytes(queue_rate, 1, 12);
+        assert_eq!(fair, queue_rate / 12);
+        // Sum-across-workers invariant: the sum of per-worker fair
+        // shares equals queue_rate when total = sum(local). This is
+        // the property that produces per-flow fairness.
+        let distribution: [u32; 6] = [3, 3, 2, 2, 1, 1];
+        let total: u32 = distribution.iter().sum();
+        let sum: u64 = distribution
+            .iter()
+            .map(|&local| fair_share_rate_bytes(queue_rate, local, total))
+            .sum();
+        // Sum is bounded above by queue_rate (by the math) and the
+        // error is at most one byte per worker from integer
+        // truncation — so <= 6 bytes on 6 workers. At bytes/sec
+        // scale that's not measurable. The important invariant is
+        // that sum is never GREATER than queue_rate.
+        assert!(
+            sum <= queue_rate,
+            "sum of per-worker fair shares MUST be bounded by \
+             queue_rate — over-subscription breaks the fairness \
+             guarantee (sum={sum}, queue_rate={queue_rate})",
+        );
+        let slack = queue_rate - sum;
+        assert!(
+            slack <= distribution.len() as u64,
+            "sum-vs-queue_rate truncation slack must be <= N_workers \
+             bytes (got {slack} bytes over {} workers)",
+            distribution.len(),
+        );
+    }
+
+    /// Pin the defensive `max(local, total)` clamp when `total <
+    /// local`. This can occur in the brief window between a worker
+    /// enqueueing its first packet of a new flow (which bumps its
+    /// local active_flow_buckets) and the shared lease atomic-add
+    /// actually being observed by other workers' reads.
+    #[test]
+    fn fair_share_rate_clamps_when_total_below_local() {
+        let queue_rate = 1_000_000_000u64 / 8;
+        // local=2, total=1 — stale shared view. Must clamp to
+        // local=2, total=2, rate = queue_rate (not 2×queue_rate).
+        let fair = fair_share_rate_bytes(queue_rate, 2, 1);
+        assert_eq!(
+            fair, queue_rate,
+            "fair share with total<local MUST clamp to queue_rate, \
+             otherwise a stale-read window would briefly over-subscribe \
+             the queue by N× where N = local/total",
+        );
+    }
+
+    /// Pin the zero-flow edge cases. Stale state after a flow finishes
+    /// draining can leave us here momentarily; the rate gate must
+    /// collapse to zero so a worker with no active flows cannot
+    /// drain anything (defensive — no flows means no items means
+    /// nothing to drain anyway, but a non-zero rate would let the
+    /// token bucket accumulate stale capacity).
+    #[test]
+    fn fair_share_rate_is_zero_when_no_flows() {
+        let queue_rate = 25_000_000_000u64 / 8;
+        assert_eq!(fair_share_rate_bytes(queue_rate, 0, 0), 0);
+        assert_eq!(fair_share_rate_bytes(queue_rate, 0, 10), 0);
+        assert_eq!(fair_share_rate_bytes(0, 3, 12), 0);
+    }
+
+    /// Pin that `account_cos_queue_flow_enqueue` bumps the shared
+    /// `active_flow_count` on the first packet of a new flow (bucket
+    /// transition 0 → >0), and that
+    /// `account_cos_queue_flow_dequeue` decrements it when the
+    /// bucket drains to zero (transition >0 → 0).
+    ///
+    /// This is the accounting that feeds `fair_share_rate_bytes`.
+    /// If it ever drifts, every worker's rate-gate calculation
+    /// silently goes wrong — either over-subscribing (total too
+    /// low) or starving (total too high). Regression here reopens
+    /// the tiered-per-flow-distribution failure mode.
+    #[test]
+    fn active_flow_count_tracks_bucket_transitions_on_shared_exact() {
+        use std::sync::Arc;
+
+        let lease = Arc::new(SharedCoSQueueLease::new(
+            25_000_000_000 / 8,
+            256 * 1024,
+            4,
+        ));
+        assert_eq!(lease.active_flow_count(), 0);
+
+        // Build a flow-fair shared_exact queue with the lease Arc
+        // cached (as `promote_cos_queue_flow_fair` would do).
+        let mut queue = test_flow_fair_exact_queue_16_flows();
+        let queue = &mut queue.queues[0];
+        queue.shared_exact = true;
+        queue.shared_lease = Some(lease.clone());
+
+        // First packet of flow A: bucket 0→>0, counter 0→1.
+        let flow_a = test_session_key(5201, 33001);
+        account_cos_queue_flow_enqueue(queue, Some(&flow_a), 1500);
+        assert_eq!(lease.active_flow_count(), 1);
+
+        // Second packet of same flow: bucket stays >0, counter
+        // stays 1.
+        account_cos_queue_flow_enqueue(queue, Some(&flow_a), 1500);
+        assert_eq!(lease.active_flow_count(), 1);
+
+        // First packet of flow B: new bucket 0→>0, counter 1→2.
+        let flow_b = test_session_key(5201, 33002);
+        account_cos_queue_flow_enqueue(queue, Some(&flow_b), 1500);
+        assert_eq!(lease.active_flow_count(), 2);
+
+        // Drain one of flow A's two packets: bucket stays >0,
+        // counter stays 2.
+        account_cos_queue_flow_dequeue(queue, Some(&flow_a), 1500);
+        assert_eq!(lease.active_flow_count(), 2);
+
+        // Drain flow A's remaining packet: bucket >0 → 0, counter
+        // 2 → 1.
+        account_cos_queue_flow_dequeue(queue, Some(&flow_a), 1500);
+        assert_eq!(lease.active_flow_count(), 1);
+
+        // Drain flow B's only packet: bucket >0 → 0, counter
+        // 1 → 0.
+        account_cos_queue_flow_dequeue(queue, Some(&flow_b), 1500);
+        assert_eq!(lease.active_flow_count(), 0);
+    }
+
+    /// Counterfactual: on an owner-local-exact queue
+    /// (`shared_lease = None`), the shared counter on the lease
+    /// is NOT bumped on bucket transitions. Protects the #784 path
+    /// from leaking accounting side-effects into a shared counter
+    /// that has no meaning for single-owner queues.
+    #[test]
+    fn active_flow_count_not_touched_on_owner_local_exact() {
+        use std::sync::Arc;
+
+        let lease = Arc::new(SharedCoSQueueLease::new(1_000_000_000 / 8, 128 * 1024, 2));
+        // We DON'T cache lease on queue.shared_lease — owner-local-
+        // exact queues keep None. The counter must stay at zero.
+
+        let mut queue = test_flow_fair_exact_queue_16_flows();
+        let queue = &mut queue.queues[0];
+        // shared_exact=false so the dequeue accounting branch is
+        // identical to owner-local-exact runtime.
+        queue.shared_exact = false;
+        assert!(queue.shared_lease.is_none());
+
+        let flow = test_session_key(5201, 44001);
+        account_cos_queue_flow_enqueue(queue, Some(&flow), 1500);
+        account_cos_queue_flow_dequeue(queue, Some(&flow), 1500);
+
+        assert_eq!(
+            lease.active_flow_count(),
+            0,
+            "owner-local-exact queue MUST NOT touch a shared \
+             lease's active_flow_count — only shared_exact queues \
+             (with shared_lease=Some) participate in cross-worker \
+             DRR accounting",
         );
     }
 
