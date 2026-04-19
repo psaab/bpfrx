@@ -225,51 +225,59 @@ pub(super) fn drain_pending_tx(
     // owner binding) must yield back to the worker loop so other bindings can
     // run and completions/recycles can free resources.
     //
-    // #709: time every `drain_shaped_tx` invocation with one pair of
-    // `monotonic_nanos()` calls. `monotonic_nanos` is
+    // #709 / #751: time every `drain_shaped_tx` invocation with one
+    // pair of `monotonic_nanos()` calls. `monotonic_nanos` is
     // `clock_gettime(CLOCK_MONOTONIC)` via VDSO — no syscall, ~15 ns
-    // each. The owner-drain latency histogram is the primary signal
-    // for deciding whether Option B / C / D in #709 is justified.
+    // each.
     //
-    // #751: attribute the measured latency to the specific queue
-    // that was serviced on this drain pass, not to a binding-wide
-    // rollup. Producers don't know the target queue at redirect time
-    // so peer-side telemetry (redirect_acquire_hist, peer_pps) stays
-    // binding-scoped; only the owner-side drain stats move per-queue.
+    // Attribution split:
+    //   * A serviced drain (Some) attributes latency + invocation
+    //     to the specific queue's per-queue atomics via indexed
+    //     access (queue_idx is captured by drain_shaped_tx at
+    //     selection time so we avoid a linear scan here — see
+    //     Copilot review on the initial revision of this PR).
+    //   * A no-op drain (None — nothing ran on any queue) bumps
+    //     the binding-wide drain_noop_invocations counter. That
+    //     field stays binding-scoped because there is no queue
+    //     context to attribute it to.
     //
-    // Noop invocations (drain returned `None` — no queue made
-    // progress) keep binding-wide attribution on BindingLiveState so
-    // the operator can still tell "owner busy but fast" from "owner
-    // spinning on empty" as a binding-wide property.
+    // Pre-#751 also wrote the drain latency + invocations into the
+    // binding-wide `owner_profile_owner` atomics unconditionally.
+    // Those writes are dead post-#751 — the snapshot path reads
+    // drain stats from per-queue atomics and
+    // `merge_binding_scoped_owner_profile` no longer touches them —
+    // so removing the writes reclaims the fetch_add cost on the
+    // hot path and keeps BindingLiveState's drain fields as a pure
+    // noop accounting slot.
     loop {
         let start_ns = monotonic_nanos();
         let serviced = drain_shaped_tx(binding, now_ns, shared_recycles);
-        let delta = monotonic_nanos().saturating_sub(start_ns);
-        let bucket = bucket_index_for_ns(delta);
-        binding.live.owner_profile_owner.drain_latency_hist[bucket]
-            .fetch_add(1, Ordering::Relaxed);
-        binding
-            .live
-            .owner_profile_owner
-            .drain_invocations
-            .fetch_add(1, Ordering::Relaxed);
         if let Some(serviced) = serviced.as_ref() {
+            let delta = monotonic_nanos().saturating_sub(start_ns);
+            let bucket = bucket_index_for_ns(delta);
             if let Some(root) = binding.cos_interfaces.get(&serviced.root_ifindex) {
-                if let Some(queue) = root
-                    .queues
-                    .iter()
-                    .find(|q| q.queue_id == serviced.queue_id)
-                {
-                    queue.owner_profile.drain_latency_hist[bucket]
-                        .fetch_add(1, Ordering::Relaxed);
-                    queue
-                        .owner_profile
-                        .drain_invocations
-                        .fetch_add(1, Ordering::Relaxed);
+                if let Some(queue) = root.queues.get(serviced.queue_idx) {
+                    // queue_idx + queue_id are captured at selection
+                    // time inside drain_shaped_tx. `root.queues` is
+                    // not reshaped during a single drain pass, so
+                    // the indexed access is safe and O(1). The id
+                    // recheck guards against a future refactor that
+                    // swaps queue positions between selection and
+                    // attribution — the miss path just skips the
+                    // write rather than poisoning another queue's
+                    // counters.
+                    if queue.queue_id == serviced.queue_id {
+                        queue.owner_profile.drain_latency_hist[bucket]
+                            .fetch_add(1, Ordering::Relaxed);
+                        queue
+                            .owner_profile
+                            .drain_invocations
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
-        }
-        if serviced.is_none() {
+            did_work = true;
+        } else {
             binding
                 .live
                 .owner_profile_owner
@@ -277,7 +285,6 @@ pub(super) fn drain_pending_tx(
                 .fetch_add(1, Ordering::Relaxed);
             break;
         }
-        did_work = true;
     }
     while !binding.pending_tx_prepared.is_empty() {
         match transmit_prepared_batch(binding, now_ns) {
@@ -825,14 +832,24 @@ fn redirect_prepared_cos_request_to_owner_binding(
 }
 
 /// #751: one drain pass through the binding's CoS interfaces. Returns
-/// the (root_ifindex, queue_id) that was actually serviced so the
-/// caller can attribute the drain latency to the specific queue
-/// instead of into a binding-wide rollup.
+/// the (root_ifindex, queue_idx, queue_id) that was actually serviced
+/// so the caller can attribute the drain latency to the specific
+/// queue's per-queue atomics without walking the queues vec a second
+/// time.
 ///
-/// `Some((ifindex, qid))` — a batch from this queue was submitted.
-/// `None` — no progress on any queue.
+/// `queue_idx` is the stable position within `root.queues` captured
+/// at selection time. The drain path mutates queue state (tokens,
+/// queued_bytes) but does not reorder or reshape `root.queues`
+/// within a single drain pass, so using the idx for direct indexed
+/// access is safe and avoids the O(#queues) linear scan by
+/// `queue_id` that the first revision of this PR used (Copilot
+/// review, tx.rs:262).
+///
+/// `queue_id` is retained as a stable 8-bit identifier for the
+/// snapshot and telemetry paths which key on id, not idx.
 pub(super) struct DrainedQueueRef {
     pub(super) root_ifindex: i32,
+    pub(super) queue_idx: usize,
     pub(super) queue_id: u8,
 }
 
@@ -869,11 +886,18 @@ fn drain_shaped_tx(
         let Some(batch) = build_nonexact_cos_batch(binding, root_ifindex, now_ns) else {
             continue;
         };
-        let queue_id = cos_batch_queue_id(binding, root_ifindex, &batch);
+        // #751: capture both queue_idx (stable Vec position) and
+        // queue_id (stable u8 identifier) BEFORE submit_cos_batch
+        // takes ownership of the batch. Pre-Copilot-review this
+        // resolved only queue_id and the outer loop did a linear
+        // scan by id; now we carry the idx through for direct
+        // indexed access.
+        let located = cos_batch_queue_ref(binding, root_ifindex, &batch);
         binding.cos_interface_rr = (start + offset + 1) % binding.cos_interface_order.len();
         if submit_cos_batch(binding, root_ifindex, batch, now_ns, shared_recycles) {
-            return queue_id.map(|queue_id| DrainedQueueRef {
+            return located.map(|(queue_idx, queue_id)| DrainedQueueRef {
                 root_ifindex,
+                queue_idx,
                 queue_id,
             });
         }
@@ -882,11 +906,11 @@ fn drain_shaped_tx(
     None
 }
 
-fn cos_batch_queue_id(
+fn cos_batch_queue_ref(
     binding: &BindingWorker,
     root_ifindex: i32,
     batch: &CoSBatch,
-) -> Option<u8> {
+) -> Option<(usize, u8)> {
     let queue_idx = match batch {
         CoSBatch::Local { queue_idx, .. } | CoSBatch::Prepared { queue_idx, .. } => *queue_idx,
     };
@@ -894,7 +918,7 @@ fn cos_batch_queue_id(
         .cos_interfaces
         .get(&root_ifindex)
         .and_then(|root| root.queues.get(queue_idx))
-        .map(|queue| queue.queue_id)
+        .map(|queue| (queue_idx, queue.queue_id))
 }
 
 fn prime_cos_root_for_service(binding: &mut BindingWorker, root_ifindex: i32, now_ns: u64) -> bool {
@@ -995,6 +1019,7 @@ fn service_exact_guarantee_queue_direct_with_info(
     Some(if progress {
         queue_id.map(|queue_id| DrainedQueueRef {
             root_ifindex,
+            queue_idx: selection.queue_idx,
             queue_id,
         })
     } else {

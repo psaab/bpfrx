@@ -105,6 +105,14 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 				view.interfaceState.TimerLevel0Sleepers,
 				view.interfaceState.TimerLevel1Sleepers)
 		}
+		// Build queue views once per interface and share the slice
+		// between the binding-scoped telemetry render and the main
+		// queue table below. Copilot flagged that the first rev of
+		// this PR invoked buildCoSQueueViews twice — once inside
+		// renderBindingScopedTelemetry, again here — which doubled
+		// work and risked drift if buildCoSQueueViews filter/order
+		// ever changed.
+		queues := buildCoSQueueViews(cfg, view)
 		// #732 / #751: binding-scoped telemetry rendered once per
 		// interface instead of under every queue row. owner_pps /
 		// peer_pps / redirect_p99 describe binding-wide arrivals
@@ -112,8 +120,7 @@ func FormatCoSInterfaceSummary(cfg *config.Config, status *ProcessStatus, select
 		// redirect time so these values are inherently per-binding.
 		// Pre-#751 each queue row reported the same values, which
 		// was the #732 symptom.
-		renderBindingScopedTelemetry(&b, cfg, view)
-		queues := buildCoSQueueViews(cfg, view)
+		renderBindingScopedTelemetry(&b, view, queues)
 		if len(queues) == 0 {
 			b.WriteString("  Queues:                   none\n")
 			continue
@@ -250,38 +257,56 @@ func formatHistPercentileMicrosFromBuckets(hist []uint64, percentile int) string
 }
 
 // #732 / #751: render a single "Binding telemetry" line per interface
-// carrying the values that are inherently binding-scoped (producers do
-// not know the target queue at redirect time). Rust's snapshot path
-// attributes these to the sole unambiguous owner-local exact queue row,
-// or leaves them at zero when the shape is ambiguous. We gather them
-// from whichever queue carries non-zero values and render once at the
-// interface level, replacing the pre-#751 per-queue repetition.
+// carrying the values that are inherently binding-scoped (producers
+// do not know the target queue at redirect time). Rust's snapshot
+// path attributes these to the sole unambiguous owner-local exact
+// queue row, or leaves them at zero when the shape is ambiguous.
+//
+// Copilot-review-driven design notes:
+//   - We SUM across queues instead of MAX. Rust populates the fields
+//     on at most one queue per binding in the normal case, so sum and
+//     max are equivalent — except if a bug or mixed-version mismatch
+//     ever puts non-zero values on multiple queue rows, the sum makes
+//     that divergence visible (inflated value in the output) instead
+//     of silently hiding it like max would.
+//   - The redirect-acquire histogram gate checks for at least one
+//     non-zero bucket, not just a non-empty slice. Rust resizes the
+//     vector to DRAIN_HIST_BUCKETS on the eligible row even when
+//     every sample is 0, so a length-only gate would render a noisy
+//     "redirect_p99=0us" line on ambiguous bindings.
+//   - The `queues` slice is built once by the caller so the binding-
+//     scoped line and the per-queue table see exactly the same data.
 //
 // Zero-in-all-fields is suppressed so interfaces with no exact queue
 // or ambiguous shape don't get a noise line.
-func renderBindingScopedTelemetry(b *strings.Builder, cfg *config.Config, view cosInterfaceView) {
+func renderBindingScopedTelemetry(b *strings.Builder, view cosInterfaceView, queues []cosQueueView) {
 	if view.interfaceState == nil {
 		return
 	}
-	queues := buildCoSQueueViews(cfg, view)
 	var (
-		ownerPPS       uint64
-		peerPPS        uint64
-		redirectHist   []uint64
+		ownerPPS     uint64
+		peerPPS      uint64
+		redirectHist []uint64
 	)
 	for _, q := range queues {
-		if q.ownerPPS > ownerPPS {
-			ownerPPS = q.ownerPPS
-		}
-		if q.peerPPS > peerPPS {
-			peerPPS = q.peerPPS
-		}
-		if redirectHist == nil && len(q.redirectAcquireHist) > 0 {
-			redirectHist = q.redirectAcquireHist
+		ownerPPS = saturatingAddU64(ownerPPS, q.ownerPPS)
+		peerPPS = saturatingAddU64(peerPPS, q.peerPPS)
+		// Fold histograms element-wise; unset-slice queues are
+		// skipped so we don't allocate for queues that reported
+		// no samples.
+		for i, count := range q.redirectAcquireHist {
+			if count == 0 {
+				continue
+			}
+			if len(redirectHist) < len(q.redirectAcquireHist) {
+				resized := make([]uint64, len(q.redirectAcquireHist))
+				copy(resized, redirectHist)
+				redirectHist = resized
+			}
+			redirectHist[i] = saturatingAddU64(redirectHist[i], count)
 		}
 	}
-	// Gate: nothing meaningful to render.
-	if ownerPPS == 0 && peerPPS == 0 && len(redirectHist) == 0 {
+	if ownerPPS == 0 && peerPPS == 0 && !histHasSample(redirectHist) {
 		return
 	}
 	fmt.Fprintf(
@@ -291,6 +316,28 @@ func renderBindingScopedTelemetry(b *strings.Builder, cfg *config.Config, view c
 		ownerPPS,
 		peerPPS,
 	)
+}
+
+// saturatingAddU64 avoids silent wraparound in the telemetry render.
+// Hot-path this is not (called once per interface at scrape cadence)
+// but honesty-of-summation matters more here than the cycle cost —
+// an overflow under adversarial input is a visible ceiling, not a
+// reset to zero.
+func saturatingAddU64(a, b uint64) uint64 {
+	sum := a + b
+	if sum < a {
+		return ^uint64(0)
+	}
+	return sum
+}
+
+func histHasSample(hist []uint64) bool {
+	for _, count := range hist {
+		if count > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // #709: map a bucket index to its lower bound, formatted as µs. The
