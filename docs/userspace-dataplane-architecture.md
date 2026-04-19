@@ -436,7 +436,7 @@ system {
         control-socket /run/xpf/userspace-dp.sock;
         state-file /run/xpf/userspace-dp.json;
         workers 6;
-        ring-entries 8192;
+        ring-entries 16384;
     }
 }
 ```
@@ -451,9 +451,13 @@ system {
 
 **Tuning guidelines:**
 - Set `workers` to match NIC RSS queue count (`ethtool -L <dev> combined N`)
-- Set `ring-entries` to 8192 for high throughput (uses ~50MB UMEM per binding)
+- Set `ring-entries` to 16384 for ≥20 Gbps throughput (uses ~100MB UMEM per binding).
+  At 8192, `iperf3 -P 12 @ 25 Gbps` sees 92-170K retrans/30s and median 16.9 Gbps due
+  to kernel-side TX ring fill stalls (`ethtool -S` shows `tx_xsk_full` accumulating).
+  Raising to 16384 dropped retrans to 0-1900/30s and lifted the median to 21.5 Gbps
+  on the loss:xpf-userspace-fw test cluster (#774).
 - Ensure VM has enough vCPUs: workers + 2 (daemon + kernel headroom)
-- Ensure VM has enough RAM: workers × bindings × 50MB + 2GB base
+- Ensure VM has enough RAM: workers × bindings × 100MB + 2GB base (at 16384 ring size)
 
 ## Limitations
 
