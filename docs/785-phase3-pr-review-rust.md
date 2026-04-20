@@ -224,3 +224,91 @@ regression. Snapshot mechanism is allocation-free, leak-free, and
 composable with the Codex symmetric-rewind fix. No new Rust-quality
 concerns introduced. 11 mqfq_* tests green (`cargo test --release
 ... mqfq`). Merge-ready.
+
+## Round 3 verification
+
+Scope: two commits since round-2 sign-off.
+  * `758384f4` — LIFO snapshot stack (`Vec<CoSQueuePopSnapshot>` of
+    capacity `TX_BATCH_SIZE`) replacing the single-`Option<>` slot.
+  * `45a003e2` — D3 doc narrowing.
+
+1. **Allocation-free hot path (YES).** All 10 `CoSQueueRuntime`
+   construction sites use `Vec::with_capacity(TX_BATCH_SIZE)` (types.rs
+   default, plus tx.rs:5152 and the 10 worker.rs/tests sites). `push`
+   onto the back and `pop` from the back are both amortized-O(1) with
+   no realloc as long as `len <= 256`. Drain helpers cap scratch depth
+   at `TX_BATCH_SIZE`, so within a single batch the stack cannot grow
+   past capacity. `Vec::clear()` retains capacity — no realloc on the
+   `cos_queue_push_back` clear path either. Confirmed by grep:
+   `pop_snapshot_stack` appears 19 times, never with `.reserve(`,
+   `.shrink`, `.extend`, or `.append`.
+
+2. **Drop semantics (CLEAN).** `CoSQueuePopSnapshot` is `Copy + Default`
+   (POD, 24 bytes, three primitive fields). `Vec<POD>` drop is trivial —
+   no custom `Drop` impl needed, and there's no risk of double-free or
+   use-after-move. Struct remains `pub(super)`; no new public API.
+
+3. **Stack-clear on `push_back` — whole stack, documented (CORRECT).**
+   `cos_queue_push_back` calls `queue.pop_snapshot_stack.clear()` (tx.rs:4031),
+   not a per-bucket filter. The intent is documented at the call site
+   (tx.rs:4023-4030) AND in the struct doc (types.rs:1141-1147): "any
+   new enqueue invalidates all outstanding pop snapshots … bucket state
+   under them has changed." Bulk clear is correct — a push_back can
+   advance any bucket's `tail_finish`, so ANY earlier snapshot's
+   `pre_pop_tail_finish` could be stale. Whole-stack is the simplest
+   contract.
+
+4. **Doc change on D3 (VERIFIED).** Greps in the doc match reality
+   byte-for-byte: `rss_indirection.go` — zero hits for
+   `cos|mqfq|flow_bucket|queue_vtime`; `userspace-dp/src/afxdp/*.rs` —
+   exactly three RSS/indirection mentions at tx.rs:5040, 14008, 14159,
+   all in comments/docstrings.
+
+5. **New pins (TRIP ON REGRESSION, FULL-STATE).**
+   * `mqfq_batched_rollback_restores_queue_vtime` — single-bucket,
+     4-item batch; asserts head, tail, bytes, vtime, active, peak,
+     item-count all equal pre-batch. Asserts `pop_snapshot_stack.len()
+     == 4` after drain and `is_empty()` after rollback — tight
+     book-keeping pin.
+   * `mqfq_batched_rollback_across_multiple_buckets` — the regression-
+     catching pin. Pre-advances `queue_vtime` from 100 → 5000 between
+     enqueue and drain so the old single-`Option` code would
+     re-anchor at `max(0, 5000) + 900 = 5900` on B's restore versus
+     pre-pop 1000. Commit message confirms "temporarily simulating the
+     old single-Option behavior (`pop_snapshot_stack.clear()` before
+     each push) — B's head comes out 5900 vs. pre-pop 1000, and the
+     downstream `assert_eq!` fails loudly." Verified: this pin would
+     trip on regression.
+
+6. **Minor doc nit (not blocking).** Struct doc at types.rs:1149-1152
+   claims "Flow-fair drain helpers (`drain_exact_*_flow_fair`) clear
+   the stack at batch start." That's not true — neither drain helper
+   calls `.clear()`, only `cos_queue_push_back` does (and tests
+   don't). It's not a correctness bug: stale snapshots below the
+   current batch's pushes are never consumed on the normal
+   pop-count == push_front-count rollback path, and any new enqueue
+   via `push_back` clears them. But in the pathological case of many
+   successful-submit batches without an intervening `push_back`
+   (e.g. a queue already containing N > 256 items where workers drain
+   in bursts and the producer pauses), snapshots could accumulate
+   above 256 and force a realloc — breaking the "allocation-free"
+   guarantee. Worth a follow-up to either (a) actually clear in the
+   drain helpers as the doc claims, or (b) correct the doc.
+   Recommend filing as a LOW follow-up; not a merge blocker given
+   normal workload keeps producer push_backs interleaved with worker
+   drains.
+
+7. **Tests.** `cargo test --release --bin xpf-userspace-dp` — 733
+   passed, 1 ignored, 0 failed. Full mqfq subset (`-- mqfq`) —
+   13 passed, 0 failed, including both new pins.
+
+### Round 3 disposition
+
+ROUND 3: merge-ready from Rust-quality angle.
+
+NEW-1 fix is well-implemented: LIFO stack semantics match the rollback
+traversal exactly, preallocated to avoid hot-path realloc, bulk-cleared
+on push_back with documented rationale, and the regression is locked in
+by two full-state pins (one of them designed to trip under the old
+single-`Option` behavior). One LOW doc/code mismatch noted above —
+non-blocking. Merge YES.
