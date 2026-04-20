@@ -30,6 +30,11 @@ type fakeRSSExecutor struct {
 	queues map[string]int
 	// Scripted ethtool -x <iface> output for idempotency probe.
 	ethtoolX map[string][]byte
+	// Scripted ethtool -c <iface> output for coalescence probe (#801).
+	// Separate from ethtoolX so a test can script one without the
+	// other and a production misuse (reading -x when probing
+	// coalescence, for example) fails loudly.
+	ethtoolC map[string][]byte
 	// Recorded argvs, in call order. `{"-X", "eth0", "weight", "1", "1", "0", "0"}`, etc.
 	calls [][]string
 }
@@ -44,6 +49,12 @@ func (f *fakeRSSExecutor) runEthtool(args ...string) ([]byte, error) {
 		}
 		// Wrap exec.ErrNotFound so errors.Is detects it — mirrors the
 		// real *exec.Error shape returned by os/exec.
+		return nil, &exec.Error{Name: "ethtool", Err: exec.ErrNotFound}
+	}
+	if len(args) >= 2 && args[0] == "-c" {
+		if out, ok := f.ethtoolC[args[1]]; ok {
+			return out, nil
+		}
 		return nil, &exec.Error{Name: "ethtool", Err: exec.ErrNotFound}
 	}
 	return nil, nil
