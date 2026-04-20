@@ -1147,15 +1147,23 @@ pub(super) struct CoSQueueRuntime {
     ///     can invalidate earlier snapshots — bucket state under
     ///     those snapshots has changed).
     ///   * Flow-fair drain helpers (`drain_exact_*_flow_fair`) clear
-    ///     the stack at batch start so stale snapshots from a
-    ///     previous batch's successful submit do not leak into the
-    ///     current batch.
+    ///     the stack at batch start (not end) so successful-commit
+    ///     chains from prior batches do not leak into the current
+    ///     batch — and so the bound below holds even when a
+    ///     committed submission never called push_front.
+    ///   * Teardown paths (`cos_queue_drain_all` and
+    ///     `reset_binding_cos_runtime`) call
+    ///     `cos_queue_pop_front_no_snapshot` so that drains of
+    ///     >TX_BATCH_SIZE items never grow the stack.
     ///
     /// Size bound: at most `TX_BATCH_SIZE` entries alive at once —
-    /// pop_front on a flow-fair queue is only called from the drain
-    /// helpers, which cap scratch depth at `TX_BATCH_SIZE` and push
-    /// onto the stack once per pop. Preallocated to that capacity so
-    /// no hot-path realloc occurs. Each entry is 24 bytes
+    /// enforced by the batch-start clear above. The hot-path drain
+    /// helpers cap scratch depth at `TX_BATCH_SIZE` and push onto
+    /// the stack once per pop, so ≤ `TX_BATCH_SIZE` snapshots
+    /// accumulate between a drain and its paired push_front /
+    /// commit. `cos_queue_pop_front` contains a `debug_assert!` to
+    /// catch regressions in dev/test. Preallocated to that capacity
+    /// so no hot-path realloc occurs. Each entry is 24 bytes
     /// (`CoSQueuePopSnapshot`), so the worst-case footprint is
     /// 256 × 24 = ~6 KB per queue — on top of the 1024-bucket
     /// bookkeeping arrays already resident in `CoSQueueRuntime`.

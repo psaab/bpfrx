@@ -1665,7 +1665,14 @@ fn reset_binding_cos_runtime(binding: &mut BindingWorker) {
     let mut dropped_prepared = Vec::new();
     for root in binding.cos_interfaces.values_mut() {
         for queue in &mut root.queues {
-            while let Some(item) = cos_queue_pop_front(queue) {
+            // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer
+            // LOW: teardown drains the whole queue without a
+            // matching push_front rollback, so no snapshots are
+            // ever consumed. Use the no-snapshot pop variant so
+            // we don't grow pop_snapshot_stack past its documented
+            // TX_BATCH_SIZE bound (the queue may hold more items
+            // than that). The runtime is replaced below anyway.
+            while let Some(item) = cos_queue_pop_front_no_snapshot(queue) {
                 match item {
                     CoSPendingTxItem::Local(_) => {
                         dropped_local = dropped_local.saturating_add(1);

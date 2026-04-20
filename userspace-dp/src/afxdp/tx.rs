@@ -2364,6 +2364,16 @@ fn drain_exact_local_items_to_scratch_flow_fair(
     secondary_budget: u64,
     queue_dscp_rewrite: Option<u8>,
 ) -> ExactCoSScratchBuild {
+    // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer LOW:
+    // clear the pop-snapshot stack at batch start. The bound
+    // "at most TX_BATCH_SIZE snapshots live at once" (see
+    // `CoSQueueRuntime::pop_snapshot_stack` doc) relies on each
+    // batch drain starting from an empty stack; committed
+    // submissions leave stale snapshots until some later event
+    // (push_back or another rollback) happens to clear them.
+    // Without this clear, drain-all teardown paths and
+    // successful-commit chains can grow the stack unbounded.
+    queue.pop_snapshot_stack.clear();
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
     while scratch_local_tx.len() < TX_BATCH_SIZE {
@@ -2534,6 +2544,13 @@ fn drain_exact_prepared_items_to_scratch_flow_fair(
     secondary_budget: u64,
     queue_dscp_rewrite: Option<u8>,
 ) -> ExactCoSScratchBuild {
+    // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer LOW:
+    // clear the pop-snapshot stack at batch start. See the
+    // matching comment in `drain_exact_local_items_to_scratch_flow_fair`
+    // for the rationale — committed-submit chains or drain-all
+    // teardowns can otherwise leave stale snapshots that violate
+    // the documented TX_BATCH_SIZE bound.
+    queue.pop_snapshot_stack.clear();
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
 
@@ -4164,6 +4181,33 @@ pub(super) fn cos_queue_push_front(queue: &mut CoSQueueRuntime, item: CoSPending
 
 #[inline]
 pub(super) fn cos_queue_pop_front(queue: &mut CoSQueueRuntime) -> Option<CoSPendingTxItem> {
+    cos_queue_pop_front_inner(queue, true)
+}
+
+/// #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer LOW:
+/// teardown-only variant of `cos_queue_pop_front` that does NOT
+/// push a rollback snapshot. Used by drain-all-items-until-empty
+/// paths (`cos_queue_drain_all` and the worker teardown loop)
+/// where the drained items are either discarded or restored via
+/// a single reverse push_front loop that doesn't need per-pop
+/// pre-state capture (nothing has mutated the bucket between
+/// drain and restore in those paths).
+///
+/// Without this variant, a teardown of >TX_BATCH_SIZE items would
+/// grow `pop_snapshot_stack` past its documented bound and trip
+/// the per-pop debug_assert.
+#[inline]
+pub(super) fn cos_queue_pop_front_no_snapshot(
+    queue: &mut CoSQueueRuntime,
+) -> Option<CoSPendingTxItem> {
+    cos_queue_pop_front_inner(queue, false)
+}
+
+#[inline]
+fn cos_queue_pop_front_inner(
+    queue: &mut CoSQueueRuntime,
+    push_snapshot: bool,
+) -> Option<CoSPendingTxItem> {
     let item = if !queue.flow_fair {
         queue.items.pop_front()?
     } else {
@@ -4175,29 +4219,46 @@ pub(super) fn cos_queue_pop_front(queue: &mut CoSQueueRuntime) -> Option<CoSPend
         // 2-16), not all 1024.
         let bucket_u16 = cos_queue_min_finish_bucket(queue)?;
         let bucket = usize::from(bucket_u16);
-        // #785 Phase 3 — Codex round-3 HIGH + NEW-1: snapshot
-        // pre-pop bucket + vtime state BEFORE we mutate anything,
-        // and push onto the per-queue LIFO stack. Every popped
-        // item gets its own snapshot so a batched rollback (N
-        // pops into scratch, submit a prefix, push_front the tail
-        // in LIFO order) can restore exact pre-pop head/tail for
-        // EVERY item — not just the most recent pop.
-        //
-        // Earlier revision kept a single `Option<...>`; Codex
-        // NEW-1 flagged that earlier drained buckets in a
-        // multi-pop rollback fell back to the
-        // `max(tail, queue_vtime) + bytes` re-anchor formula,
-        // which can overshoot the pre-pop head when queue_vtime
-        // has advanced since the bucket's original enqueue.
-        //
-        // Stack capacity is preallocated to TX_BATCH_SIZE
-        // (see types.rs), so this push is amortized O(1) and
-        // allocation-free.
-        queue.pop_snapshot_stack.push(CoSQueuePopSnapshot {
-            bucket: bucket_u16,
-            pre_pop_head_finish: queue.flow_bucket_head_finish_bytes[bucket],
-            pre_pop_tail_finish: queue.flow_bucket_tail_finish_bytes[bucket],
-        });
+        if push_snapshot {
+            // #785 Phase 3 — Codex round-3 HIGH + NEW-1: snapshot
+            // pre-pop bucket + vtime state BEFORE we mutate anything,
+            // and push onto the per-queue LIFO stack. Every popped
+            // item gets its own snapshot so a batched rollback (N
+            // pops into scratch, submit a prefix, push_front the tail
+            // in LIFO order) can restore exact pre-pop head/tail for
+            // EVERY item — not just the most recent pop.
+            //
+            // Earlier revision kept a single `Option<...>`; Codex
+            // NEW-1 flagged that earlier drained buckets in a
+            // multi-pop rollback fell back to the
+            // `max(tail, queue_vtime) + bytes` re-anchor formula,
+            // which can overshoot the pre-pop head when queue_vtime
+            // has advanced since the bucket's original enqueue.
+            //
+            // Stack capacity is preallocated to TX_BATCH_SIZE
+            // (see types.rs), so this push is amortized O(1) and
+            // allocation-free.
+            //
+            // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer LOW:
+            // debug_assert the stack stays within its documented bound.
+            // Drain helpers clear at batch start and teardown paths
+            // use `cos_queue_pop_front_no_snapshot`. If this trips
+            // under dev/test, a new caller is leaking snapshots
+            // and could realloc on the hot path in release builds.
+            debug_assert!(
+                queue.pop_snapshot_stack.len() < TX_BATCH_SIZE,
+                "pop_snapshot_stack exceeded TX_BATCH_SIZE bound ({}); \
+                 a caller is leaking snapshots — drain helpers must \
+                 clear at batch start and teardown paths must use \
+                 cos_queue_pop_front_no_snapshot",
+                TX_BATCH_SIZE,
+            );
+            queue.pop_snapshot_stack.push(CoSQueuePopSnapshot {
+                bucket: bucket_u16,
+                pre_pop_head_finish: queue.flow_bucket_head_finish_bytes[bucket],
+                pre_pop_tail_finish: queue.flow_bucket_tail_finish_bytes[bucket],
+            });
+        }
         let item = queue.flow_bucket_items[bucket].pop_front()?;
         // Advance queue virtual time by the drained packet's byte
         // count (classical SFQ V(t): total bytes drained across
@@ -4242,7 +4303,15 @@ pub(super) fn cos_queue_pop_front(queue: &mut CoSQueueRuntime) -> Option<CoSPend
 
 fn cos_queue_drain_all(queue: &mut CoSQueueRuntime) -> VecDeque<CoSPendingTxItem> {
     let mut items = VecDeque::new();
-    while let Some(item) = cos_queue_pop_front(queue) {
+    // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer LOW:
+    // drain-all is a teardown/reconfigure helper. Unlike the
+    // hot-path batch drains (which cap at TX_BATCH_SIZE and
+    // may be followed by a matching push_front rollback), this
+    // path pops the entire queue without a paired rollback and
+    // can visit >TX_BATCH_SIZE items. Use the no-snapshot
+    // variant so we don't grow the snapshot stack past its
+    // documented bound or trip the per-pop debug_assert.
+    while let Some(item) = cos_queue_pop_front_no_snapshot(queue) {
         items.push_back(item);
     }
     items
@@ -11400,6 +11469,194 @@ mod tests {
              activate both buckets.",
         );
         assert_eq!(queue.active_flow_buckets_peak, pre_batch_peak);
+    }
+
+    /// #785 Phase 3 Codex round-3 NEW-2 / Rust reviewer LOW —
+    /// pop-snapshot stack must remain bounded by `TX_BATCH_SIZE`
+    /// across a committed-only drain (no push_front rollback).
+    ///
+    /// Setup:
+    ///   * Flow-fair queue with `TX_BATCH_SIZE + 64` items enqueued
+    ///     (spread across two buckets so MQFQ selection gets
+    ///     meaningful coverage).
+    ///   * First "drain batch": pop TX_BATCH_SIZE items via direct
+    ///     `cos_queue_pop_front`, never call push_front — this is
+    ///     the committed-submit pattern where every scratch item
+    ///     was accepted by the TX ring. The snapshot stack should
+    ///     never exceed `TX_BATCH_SIZE` during the drain.
+    ///   * Second "drain batch": drain the remaining 64 items.
+    ///     Before the second batch starts, simulate the helper
+    ///     contract by clearing the stack (what
+    ///     `drain_exact_*_flow_fair` does at batch start). The
+    ///     stack must then stay bounded through the second batch
+    ///     too.
+    ///
+    /// Without the fix, every committed pop would leave a stale
+    /// snapshot on the stack and the second batch would grow it
+    /// past `TX_BATCH_SIZE` (reallocating on each push and
+    /// violating the documented bound).
+    ///
+    /// This pin validates (1) the bound during a single batch,
+    /// (2) the bound across batches once the drain-start clear
+    /// runs, and (3) that no realloc grows capacity past the
+    /// pre-allocated `TX_BATCH_SIZE`.
+    #[test]
+    fn mqfq_pop_snapshot_stack_bounded_to_tx_batch_size() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 8 * 1024 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
+        let pre_cap = queue.pop_snapshot_stack.capacity();
+        assert_eq!(
+            pre_cap, TX_BATCH_SIZE,
+            "stack must be preallocated to TX_BATCH_SIZE",
+        );
+
+        // Enqueue TX_BATCH_SIZE + 64 items across two flows so the
+        // MQFQ min-finish scan exercises real selection, not a
+        // single-bucket shortcut.
+        let total = TX_BATCH_SIZE + 64;
+        for i in 0..total {
+            let src_port = if i % 2 == 0 { 9001u16 } else { 9002u16 };
+            cos_queue_push_back(queue, test_flow_cos_item(src_port, 100));
+        }
+
+        // Batch 1: committed drain — pop TX_BATCH_SIZE items and
+        // DROP them (simulates the "TX ring accepted all of them"
+        // path where scratch is cleared with no push_front).
+        for _ in 0..TX_BATCH_SIZE {
+            let popped = cos_queue_pop_front(queue);
+            assert!(popped.is_some(), "queue still has items");
+            assert!(
+                queue.pop_snapshot_stack.len() <= TX_BATCH_SIZE,
+                "NEW-2: pop_snapshot_stack must never exceed \
+                 TX_BATCH_SIZE during a single drain batch",
+            );
+        }
+        assert_eq!(
+            queue.pop_snapshot_stack.len(),
+            TX_BATCH_SIZE,
+            "full-batch commit should leave exactly TX_BATCH_SIZE \
+             snapshots (no push_front rollback consumed any)",
+        );
+
+        // Simulate what `drain_exact_*_flow_fair` does at batch
+        // start: clear the stack before the next batch drains.
+        // This is the fix point.
+        queue.pop_snapshot_stack.clear();
+
+        // Batch 2: drain the remaining 64 items. Stack must stay
+        // bounded; without the batch-start clear this would grow
+        // from TX_BATCH_SIZE → TX_BATCH_SIZE + 64 and realloc.
+        for _ in 0..64 {
+            let popped = cos_queue_pop_front(queue);
+            assert!(popped.is_some());
+            assert!(
+                queue.pop_snapshot_stack.len() <= TX_BATCH_SIZE,
+                "NEW-2: cross-batch drain must stay bounded after \
+                 the drain-start clear",
+            );
+        }
+
+        // No realloc: capacity must equal the preallocated
+        // TX_BATCH_SIZE exactly. A realloc would prove the bound
+        // was violated at some point.
+        assert_eq!(
+            queue.pop_snapshot_stack.capacity(),
+            pre_cap,
+            "NEW-2: stack must not realloc past TX_BATCH_SIZE",
+        );
+    }
+
+    /// #785 Phase 3 Codex round-3 NEW-2 / Rust reviewer LOW —
+    /// teardown/reconfigure drain path (`reset_binding_cos_runtime`
+    /// style) must not grow the pop-snapshot stack past its bound
+    /// and must leave the stack cleared afterwards.
+    ///
+    /// We exercise `cos_queue_drain_all` directly — it's the shared
+    /// teardown helper used by `demote_prepared_cos_queue_to_local`
+    /// and mirrors the direct-`cos_queue_pop_front_no_snapshot` loop
+    /// in `reset_binding_cos_runtime`. Both paths drain all items
+    /// without a matching push_front rollback.
+    ///
+    /// Pre-fix: drain-all pushed a snapshot per pop and never
+    /// cleared them; with a queue holding > TX_BATCH_SIZE items
+    /// the stack would realloc past its preallocated capacity
+    /// (the documented-and-preallocated bound) and leave stale
+    /// snapshots resident until the next push_back cleared them.
+    ///
+    /// Post-fix: drain-all uses `cos_queue_pop_front_no_snapshot`
+    /// so the stack is never grown. Teardown leaves the stack at
+    /// its pre-drain state (empty in this test).
+    #[test]
+    fn mqfq_drain_all_teardown_clears_stack() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 8 * 1024 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
+        let pre_cap = queue.pop_snapshot_stack.capacity();
+        assert_eq!(pre_cap, TX_BATCH_SIZE);
+
+        // Enqueue more items than the snapshot stack could hold
+        // under the old always-push-snapshot policy.
+        let total = TX_BATCH_SIZE + 300;
+        for i in 0..total {
+            let src_port = if i % 3 == 0 {
+                9101u16
+            } else if i % 3 == 1 {
+                9102u16
+            } else {
+                9103u16
+            };
+            cos_queue_push_back(queue, test_flow_cos_item(src_port, 100));
+        }
+        // push_back clears the stack; confirm pre-condition.
+        assert!(queue.pop_snapshot_stack.is_empty());
+
+        // Drain via the teardown helper. Must NOT grow the stack
+        // and must NOT trip the pop_front debug_assert on overflow.
+        let drained = cos_queue_drain_all(queue);
+        assert_eq!(
+            drained.len(),
+            total,
+            "drain_all must yield every enqueued item",
+        );
+        assert!(
+            queue.pop_snapshot_stack.is_empty(),
+            "NEW-2: teardown drain path must leave the snapshot \
+             stack empty — no stale snapshots resident",
+        );
+        assert_eq!(
+            queue.pop_snapshot_stack.capacity(),
+            pre_cap,
+            "NEW-2: teardown must not realloc past TX_BATCH_SIZE",
+        );
     }
 
     /// #785 Phase 3 Codex round-2 MEDIUM — brief-idle re-entry pin.
