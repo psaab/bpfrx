@@ -130,6 +130,13 @@ func (realRSSExecutor) listInterfaces() []string {
 //     interface bring-up.
 func applyRSSIndirection(enabled bool, workers int, execer rssExecutor) {
 	if !enabled {
+		// Kill switch. Actively restore default (equal-weight) RSS on
+		// every mlx5 interface so toggling disable at runtime reverts
+		// the table without a daemon restart. Idempotent: restoring an
+		// already-default table is a no-op ethtool call. The restore is
+		// scoped per-interface with the same driver filter as the apply
+		// path, so non-mlx5 netdevs are never touched.
+		restoreDefaultRSSIndirection(execer)
 		slog.Info("linksetup: rss indirection disabled by config")
 		return
 	}
@@ -164,6 +171,39 @@ func applyRSSIndirection(enabled bool, workers int, execer rssExecutor) {
 			continue
 		}
 		applyRSSIndirectionOne(iface, workers, execer)
+	}
+}
+
+// restoreDefaultRSSIndirection is called when the kill switch is engaged.
+// Runs `ethtool -X <iface> default` on every mlx5 interface so the kernel
+// reverts to equal-weight RSS across all HW queues. Idempotent (already-
+// default is a no-op). Non-mlx5 interfaces are filtered out at the call
+// site, mirroring applyRSSIndirection's guard.
+func restoreDefaultRSSIndirection(execer rssExecutor) {
+	ifaces := execer.listInterfaces()
+	if len(ifaces) == 0 {
+		return
+	}
+	for _, iface := range ifaces {
+		if iface == "lo" {
+			continue
+		}
+		if execer.readDriver(iface) != mlx5Driver {
+			continue
+		}
+		out, err := execer.runEthtool("-X", iface, "default")
+		if err != nil {
+			if isExecNotFound(err) {
+				slog.Warn("linksetup: ethtool binary not found, cannot restore default rss indirection",
+					"iface", iface)
+				return
+			}
+			slog.Warn("linksetup: ethtool -X default failed",
+				"iface", iface, "err", err,
+				"output", strings.TrimSpace(string(out)))
+			continue
+		}
+		slog.Info("linksetup: restored default rss indirection", "iface", iface)
 	}
 }
 

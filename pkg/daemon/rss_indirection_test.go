@@ -282,23 +282,38 @@ func TestApplyRSSIndirection_ZeroWorkers_Skips(t *testing.T) {
 	}
 }
 
-// MEDIUM (Codex) rollback: when enabled=false the function is a no-op
-// regardless of worker/queue configuration. This is the operator kill
-// switch surface; without it, #797 reviewers couldn't disable D3 at
-// runtime short of a binary downgrade.
-func TestApplyRSSIndirection_DisabledKillsSwitch(t *testing.T) {
-	defaultTable := []byte(`RX flow hash indirection table for eth0 with 6 RX ring(s):
-    0:      0     1     2     3     4     5
-`)
+// MEDIUM (Codex) rollback: when enabled=false the apply path short-
+// circuits, and on mlx5 interfaces the kernel's default RSS table is
+// restored via `ethtool -X <iface> default`. Non-mlx5 interfaces are
+// untouched.
+func TestApplyRSSIndirection_DisabledRestoresDefault(t *testing.T) {
 	f := &fakeRSSExecutor{
-		ifaces:   []string{"eth0"},
-		drivers:  map[string]string{"eth0": "mlx5_core"},
-		queues:   map[string]int{"eth0": 6},
-		ethtoolX: map[string][]byte{"eth0": defaultTable},
+		ifaces: []string{"lo", "virt0", "mlx0", "mlx1"},
+		drivers: map[string]string{
+			"virt0": "virtio_net",
+			"mlx0":  "mlx5_core",
+			"mlx1":  "mlx5_core",
+		},
+		queues: map[string]int{"mlx0": 6, "mlx1": 6, "virt0": 4},
 	}
 	applyRSSIndirection(false, 4, f)
-	if len(f.calls) != 0 {
-		t.Fatalf("disabled=false must issue no ethtool calls, got %v", f.calls)
+
+	// Exactly one restore call per mlx5 interface; virt0/lo untouched.
+	if len(f.calls) != 2 {
+		t.Fatalf("want 2 restore calls (mlx0, mlx1), got %d: %v", len(f.calls), f.calls)
+	}
+	seen := map[string]bool{}
+	for _, c := range f.calls {
+		if len(c) != 3 || c[0] != "-X" || c[2] != "default" {
+			t.Fatalf("expected `ethtool -X <iface> default`, got %v", c)
+		}
+		if d := f.drivers[c[1]]; d != "mlx5_core" {
+			t.Fatalf("restore invoked on non-mlx5 iface %q (driver=%q)", c[1], d)
+		}
+		seen[c[1]] = true
+	}
+	if !seen["mlx0"] || !seen["mlx1"] {
+		t.Fatalf("both mlx5 interfaces must be restored, saw %v", seen)
 	}
 }
 
