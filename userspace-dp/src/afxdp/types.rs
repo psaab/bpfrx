@@ -996,6 +996,36 @@ pub(super) struct CoSInterfaceRuntime {
     pub(super) timer_wheel: CoSTimerWheelRuntime,
 }
 
+/// #785 Phase 3 — Codex round-3 HIGH: pop→push_front round-trip
+/// snapshot. Captured by `cos_queue_pop_front` immediately before
+/// advancing `queue_vtime`, consumed by `cos_queue_push_front` to
+/// restore pre-pop head/tail when the popped item rolls back onto
+/// the queue (TX-ring-full retry path).
+///
+/// Without this snapshot, a push_front onto a drained bucket
+/// (Rust reviewer MEDIUM #1) re-anchors head/tail to
+/// `max(0, queue_vtime) + bytes`. Even if `queue_vtime` is rewound
+/// symmetrically, that formula overshoots the pre-pop head by one
+/// packet when the item was freshly enqueued at the pre-pop vtime:
+/// the pre-pop head was `V + X`, the post-pop+rewind anchor would
+/// be `V + X` (correct only by coincidence), but in the general
+/// case where the item was enqueued long before pop (so head
+/// trailed vtime) the rewound-anchor overshoots. Restoring the
+/// snapshot exactly is the only path to true round-trip neutrality.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CoSQueuePopSnapshot {
+    /// The bucket that was popped from. Used to verify the
+    /// push_front is restoring the SAME bucket; a mismatch means
+    /// the snapshot is stale (some other bucket drained in between)
+    /// and the push_front falls back to the standard re-anchor
+    /// path.
+    pub(super) bucket: u16,
+    /// Bucket's HEAD finish time BEFORE the pop-time advance.
+    pub(super) pre_pop_head_finish: u64,
+    /// Bucket's TAIL finish time BEFORE the pop-time advance.
+    pub(super) pre_pop_tail_finish: u64,
+}
+
 pub(super) struct CoSQueueRuntime {
     pub(super) queue_id: u8,
     pub(super) priority: u8,
@@ -1076,6 +1106,9 @@ pub(super) struct CoSQueueRuntime {
     /// uptime. No normalisation needed.
     ///
     /// Meaningful only on `flow_fair` queues.
+    ///
+    /// Read by `cos_queue_min_finish_bucket` as the selection key
+    /// for MQFQ dequeue ordering.
     pub(super) flow_bucket_head_finish_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
     /// #785 Phase 3 — MQFQ per-bucket TAIL finish: the finish
     /// time of the LAST-enqueued packet on this bucket. Used by
@@ -1093,7 +1126,38 @@ pub(super) struct CoSQueueRuntime {
     /// `queue_vtime` so it starts competing at the current frontier
     /// rather than from 0 (which would let it sweep past all
     /// established flows in bounded rounds).
+    ///
+    /// Read by `cos_queue_min_finish_bucket` (as the `max(tail, vtime)`
+    /// anchor source on idle-bucket re-entry) and updated by
+    /// `cos_queue_pop_front` (+= drained bytes) and
+    /// `cos_queue_push_front` (-= pushed bytes, symmetric rewind —
+    /// see PR #796 Codex round-3 HIGH).
     pub(super) queue_vtime: u64,
+    /// #785 Phase 3 — Codex round-3 HIGH: snapshot of the bucket
+    /// state at the moment of the most recent `cos_queue_pop_front`,
+    /// used by `cos_queue_push_front` to restore pre-pop head/tail
+    /// when the caller rolls back a pop on TX-ring-full. Without
+    /// this, a push_front to a bucket that drained on pop hits the
+    /// `was_empty` re-anchor branch and writes
+    /// `max(0, queue_vtime) + bytes`, which overshoots the pre-pop
+    /// head by one packet (Rust reviewer MEDIUM #1).
+    ///
+    /// Only the MOST RECENT pop's snapshot is preserved — multi-pop
+    /// sequences overwrite. In the common TX-ring-full retry flow,
+    /// pop_front → push_front happens in the same control block
+    /// with no intervening pop, so the snapshot is fresh at
+    /// push_front time. For multi-pop sequences where N pops then
+    /// push_front the tail items in LIFO order, only the FIRST
+    /// push_front uses the snapshot; subsequent ones fall back to
+    /// the rewound-vtime re-anchor (still correctness-safe: the
+    /// per-item `queue_vtime` rewind in push_front is symmetric,
+    /// so the aggregate vtime returns to pre-batch regardless).
+    ///
+    /// Consumed (set to `None`) on push_front of the snapshotted
+    /// bucket. Cleared on `cos_queue_push_back` so a new enqueue
+    /// cannot stale-read the snapshot from a bucket that has since
+    /// been modified.
+    pub(super) last_pop_snapshot: Option<CoSQueuePopSnapshot>,
     /// #785 Phase 3 — active-set tracking for flow-fair MQFQ.
     /// Still populated on bucket 0→>0 / >0→0 transitions so that
     /// `cos_queue_front`/`cos_queue_pop_front` can scan just the

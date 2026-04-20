@@ -4020,6 +4020,11 @@ pub(super) fn cos_queue_push_back(queue: &mut CoSQueueRuntime, item: CoSPendingT
     if matches!(item, CoSPendingTxItem::Local(_)) {
         queue.local_item_count = queue.local_item_count.saturating_add(1);
     }
+    // #785 Phase 3 — Codex round-3 HIGH: any push_back invalidates
+    // the last-pop snapshot. A subsequent push_front must re-anchor
+    // fresh rather than restoring pre-pop head/tail of a bucket
+    // whose state has since changed underneath us.
+    queue.last_pop_snapshot = None;
     account_cos_queue_flow_enqueue(queue, flow_key, item_len);
     if !queue.flow_fair {
         queue.items.push_back(item);
@@ -4047,11 +4052,59 @@ pub(super) fn cos_queue_push_front(queue: &mut CoSQueueRuntime, item: CoSPending
         return;
     }
     let bucket = cos_flow_bucket_index(queue.flow_hash_seed, flow_key);
+    // #785 Phase 3 — Codex round-3 HIGH: `queue_vtime` must be
+    // round-trip neutral across pop→push_front. The pop advanced
+    // vtime by the popped item's bytes; on push_front we rewind
+    // by the same amount so a complete rollback returns vtime to
+    // its pre-pop value.
+    //
+    // Why per-item symmetric rewind (not a single snapshot):
+    // TX-ring-full settle paths pop multiple items into a scratch
+    // Vec, submit the head slice, and push_front the tail slice
+    // in LIFO order. A single pre-batch snapshot would only
+    // restore fully when NONE of the batch committed; a per-item
+    // rewind handles partial-commit too — vtime ends at
+    // `vtime_pre_batch + bytes(committed)` regardless of how many
+    // items the TX ring accepted.
+    queue.queue_vtime = queue.queue_vtime.saturating_sub(item_len);
+    let snapshot = queue.last_pop_snapshot.take();
     let was_empty = queue.flow_bucket_items[bucket].is_empty();
     if was_empty {
-        // Bucket is idle — act as a fresh enqueue. head = tail =
-        // max(tail, queue.vtime) + bytes via `account_enqueue`'s
-        // was_idle branch.
+        // Bucket is idle (either this item is being restored to a
+        // bucket the caller drained, or push_front was called on a
+        // genuinely fresh flow). If we have a fresh pop snapshot
+        // for THIS bucket, restore head/tail exactly from it —
+        // that's the only way to make the round-trip neutral when
+        // the pop drained the bucket (Rust reviewer MEDIUM #1:
+        // without the snapshot, the re-anchor formula
+        // `max(0, queue_vtime) + bytes` writes one packet past
+        // the pre-pop head).
+        //
+        // Snapshot match test: snapshot.bucket == this bucket. A
+        // mismatch means either no pop preceded this push_front
+        // (e.g. a non-Phase-3 caller) or the snapshot was taken
+        // for a different bucket (pop from X, push_front onto Y —
+        // not a pattern any current caller emits, but harmless if
+        // it ever does). In either case fall back to the fresh
+        // re-anchor path.
+        if let Some(snap) = snapshot.filter(|s| usize::from(s.bucket) == bucket) {
+            queue.flow_bucket_bytes[bucket] =
+                queue.flow_bucket_bytes[bucket].saturating_add(item_len);
+            queue.flow_bucket_head_finish_bytes[bucket] = snap.pre_pop_head_finish;
+            queue.flow_bucket_tail_finish_bytes[bucket] = snap.pre_pop_tail_finish;
+            queue.active_flow_buckets = queue.active_flow_buckets.saturating_add(1);
+            if queue.active_flow_buckets > queue.active_flow_buckets_peak {
+                queue.active_flow_buckets_peak = queue.active_flow_buckets;
+            }
+            queue.flow_bucket_items[bucket].push_front(item);
+            queue.flow_rr_buckets.push_front(bucket as u16);
+            return;
+        }
+        // No usable snapshot — fall through to the standard
+        // idle-bucket re-anchor. Correctness-safe (new head/tail
+        // at `max(tail, vtime) + bytes` is a valid MQFQ state for
+        // a flow that's genuinely returning from idle) but not
+        // strictly neutral across the drain-reset case.
         account_cos_queue_flow_enqueue(queue, flow_key, item_len);
         queue.flow_bucket_items[bucket].push_front(item);
         queue.flow_rr_buckets.push_front(bucket as u16);
@@ -4059,15 +4112,15 @@ pub(super) fn cos_queue_push_front(queue: &mut CoSQueueRuntime, item: CoSPending
     }
     // #785 Phase 3 — MQFQ push_front onto an ACTIVE bucket.
     //
-    // Codex adversarial review flagged this path as HIGH: prior
-    // revision funnelled through `account_cos_queue_flow_enqueue`,
-    // which only advances `tail` on an active bucket — head stayed
-    // stale at a value keyed off whatever was the HEAD packet
-    // before this push_front. Selection would then pick the bucket
-    // based on the STALE head finish (stale because the item-queue
-    // front changed), and the subsequent non-drain pop would
-    // `head += bytes(next_head)` off the stale base, producing
-    // arbitrary finish values.
+    // Codex adversarial review (round-2) flagged this path as HIGH:
+    // the prior revision funnelled through
+    // `account_cos_queue_flow_enqueue`, which only advances `tail`
+    // on an active bucket — head stayed stale at a value keyed off
+    // whatever was the HEAD packet before this push_front.
+    // Selection would then pick the bucket based on the STALE head
+    // finish (stale because the item-queue front changed), and the
+    // subsequent non-drain pop would `head += bytes(next_head)`
+    // off the stale base, producing arbitrary finish values.
     //
     // Fix: push_front is only called from TX-ring-full restoration
     // paths where an item was JUST popped from this same bucket.
@@ -4109,6 +4162,23 @@ pub(super) fn cos_queue_pop_front(queue: &mut CoSQueueRuntime) -> Option<CoSPend
         // 2-16), not all 1024.
         let bucket_u16 = cos_queue_min_finish_bucket(queue)?;
         let bucket = usize::from(bucket_u16);
+        // #785 Phase 3 — Codex round-3 HIGH: snapshot pre-pop
+        // bucket + vtime state BEFORE we mutate anything. The
+        // snapshot lets `cos_queue_push_front` restore exact
+        // pre-pop head/tail on a TX-ring-full rollback, which is
+        // the only way to make pop→push_front round-trip
+        // finish-time neutral across BOTH the still-active and
+        // drained-bucket cases (Rust reviewer MEDIUM #1).
+        //
+        // `queue_vtime` is also rewound symmetrically in
+        // push_front; the snapshot is the belt to that rewind's
+        // braces — a raw vtime restore alone does not recover
+        // head/tail when the pop drained the bucket.
+        queue.last_pop_snapshot = Some(CoSQueuePopSnapshot {
+            bucket: bucket_u16,
+            pre_pop_head_finish: queue.flow_bucket_head_finish_bytes[bucket],
+            pre_pop_tail_finish: queue.flow_bucket_tail_finish_bytes[bucket],
+        });
         let item = queue.flow_bucket_items[bucket].pop_front()?;
         // Advance queue virtual time by the drained packet's byte
         // count (classical SFQ V(t): total bytes drained across
@@ -5060,6 +5130,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
             flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             queue_vtime: 0,
+            last_pop_snapshot: None,
                 flow_rr_buckets: FlowRrRing::default(),
                 flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                 runnable: false,
@@ -10397,6 +10468,194 @@ mod tests {
         );
     }
 
+    /// #785 Phase 3 Rust reviewer MEDIUM #3 — golden-vector table
+    /// pinning MQFQ pop order across a small matrix of mixed-size
+    /// inputs. Each row encodes (packet_sizes_per_flow,
+    /// expected_mqfq_pop_order_by_src_port,
+    /// reference_drr_pop_order_by_src_port).
+    ///
+    /// The DRR reference column is a static assertion of "what
+    /// packet-count-fair DRR would produce" for the same input —
+    /// kept as a golden vector rather than executed against a live
+    /// DRR implementation (the old DRR path has been removed from
+    /// this tree). The value of the table is regression-testing
+    /// the tie-break rule in `cos_queue_min_finish_bucket` and
+    /// locking the MQFQ-vs-DRR divergence into the test surface.
+    ///
+    /// Flow-to-bucket hashing depends on `flow_hash_seed=0` and
+    /// the current `cos_flow_bucket_index` formula; if that hash
+    /// changes, `insertion_port_order` below may need updating —
+    /// test will fail with a clear "bucket collision" or
+    /// "wrong port drains first" message.
+    #[test]
+    fn mqfq_golden_vector_pop_order_vs_drr() {
+        struct GoldenRow {
+            name: &'static str,
+            // (src_port, bytes) tuples in push_back order.
+            packets: &'static [(u16, usize)],
+            // Expected MQFQ pop order (by src_port).
+            mqfq_order: &'static [u16],
+            // Reference DRR order (documented, not asserted against
+            // live DRR).
+            drr_order: &'static [u16],
+        }
+
+        const TABLE: &[GoldenRow] = &[
+            // All packets same size: MQFQ and DRR produce identical
+            // orderings (both are byte-rate fair on uniform sizes).
+            GoldenRow {
+                name: "equal-1500-two-flows",
+                packets: &[(2001, 1500), (2001, 1500), (2002, 1500), (2002, 1500)],
+                mqfq_order: &[2001, 2002, 2001, 2002],
+                drr_order: &[2001, 2002, 2001, 2002],
+            },
+            // 2x size disparity, two flows. MQFQ pops the smaller
+            // packet first (head=1500 vs 3000). After that pop,
+            // flow B's second packet becomes its head at
+            // head=1500+1500=3000 (active-bucket head advance on
+            // non-drain pop). Flow A's head is still 3000. Tie on
+            // head — insertion-order tie-break picks A (its bucket
+            // was added to the ring first). Then B's last packet
+            // drains. Order: B, A, B.
+            //
+            // DRR rotation would be A, B, B (larger inserted first;
+            // DRR walks ring insertion order per round, not finish
+            // time). Orders differ → this row proves MQFQ's
+            // tie-break and non-drain-head-advance invariants
+            // diverge from DRR on size-disparate traffic.
+            GoldenRow {
+                name: "mixed-3000-1500-two-flows",
+                packets: &[(2101, 3000), (2102, 1500), (2102, 1500)],
+                mqfq_order: &[2102, 2101, 2102],
+                drr_order: &[2101, 2102, 2102],
+            },
+            // 3-way mixed: 2000 vs 1000 vs 500. MQFQ orders by
+            // head finish (500, 1000, 2000) and then catches up.
+            // DRR rotates insertion order (2201, 2202, 2203, ...).
+            GoldenRow {
+                name: "mixed-three-flows-progressive-sizes",
+                packets: &[(2201, 2000), (2202, 1000), (2203, 500)],
+                mqfq_order: &[2203, 2202, 2201],
+                drr_order: &[2201, 2202, 2203],
+            },
+        ];
+
+        for row in TABLE {
+            let mut root = test_cos_runtime_with_queues(
+                25_000_000_000 / 8,
+                vec![CoSQueueConfig {
+                    queue_id: 4,
+                    forwarding_class: "iperf-a".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000_000 / 8,
+                    exact: true,
+                    surplus_weight: 1,
+                    buffer_bytes: 128 * 1024,
+                    dscp_rewrite: None,
+                }],
+            );
+            let queue = &mut root.queues[0];
+            queue.flow_fair = true;
+            queue.flow_hash_seed = 0;
+
+            for (src_port, bytes) in row.packets {
+                cos_queue_push_back(queue, test_flow_cos_item(*src_port, *bytes));
+            }
+
+            let mut mqfq_order = Vec::with_capacity(row.packets.len());
+            while let Some(CoSPendingTxItem::Local(req)) = cos_queue_pop_front(queue) {
+                mqfq_order.push(req.flow_key.expect("flow key").src_port);
+            }
+
+            assert_eq!(
+                mqfq_order, row.mqfq_order,
+                "#785 Phase 3 golden vector '{}': MQFQ pop order \
+                 mismatch. Expected {:?} (byte-rate fair), got \
+                 {:?}. DRR reference would be {:?} — if the actual \
+                 matches DRR, MQFQ has collapsed to packet-count \
+                 fairness and the #785 CoV gap has reopened.",
+                row.name, row.mqfq_order, mqfq_order, row.drr_order,
+            );
+        }
+
+        // Separately assert that AT LEAST ONE row in the table
+        // diverges MQFQ from DRR — otherwise the golden vector
+        // isn't demonstrating the MQFQ advantage at all (equal-
+        // size rows are expected to match; mixed-size rows are
+        // the discriminating cases). A regression that collapses
+        // MQFQ to DRR flips at least one mixed-size row's output
+        // to the drr_order column, failing the assert_eq above.
+        let any_divergent = TABLE.iter().any(|row| row.mqfq_order != row.drr_order);
+        assert!(
+            any_divergent,
+            "#785 Phase 3 golden vector table must include at \
+             least one row where MQFQ diverges from DRR; otherwise \
+             the table is not demonstrating byte-rate fairness vs. \
+             packet-count fairness.",
+        );
+    }
+
+    /// #785 Phase 3 Rust reviewer LOW — idle-return anchor pin.
+    /// Complements `mqfq_queue_vtime_advances_by_drained_bytes`
+    /// and `mqfq_bucket_drain_resets_finish_time` by asserting the
+    /// CONSEQUENCE of those invariants: a flow that idles while
+    /// others drain must re-anchor at `queue_vtime + bytes`, NOT
+    /// sweep past established flows by re-entering at 0.
+    ///
+    /// Without the idle re-anchor, a bursty flow that goes silent
+    /// and returns would drain all its packets before the active
+    /// flow got another slot (anchor=0+bytes wins every min-scan
+    /// for several rounds). With it, the returning flow competes
+    /// at the current frontier and interleaves correctly.
+    #[test]
+    fn mqfq_idle_flow_reanchors_at_frontier_not_zero() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
+        let flow_a = test_session_key(3301, 5201);
+        let bucket_a = cos_flow_bucket_index(0, Some(&flow_a));
+        let flow_b = test_session_key(3302, 5201);
+        let bucket_b = cos_flow_bucket_index(0, Some(&flow_b));
+        assert_ne!(bucket_a, bucket_b, "test hash collision");
+
+        // Drain flow A for 3 x 1500 = 4500 bytes. vtime reaches
+        // 4500.
+        for _ in 0..3 {
+            cos_queue_push_back(queue, test_flow_cos_item(3301, 1500));
+        }
+        for _ in 0..3 {
+            let _ = cos_queue_pop_front(queue);
+        }
+        assert_eq!(queue.queue_vtime, 4500);
+
+        // Flow B was idle the whole time. It now returns with a
+        // 1200-byte packet. It MUST anchor at queue_vtime+bytes =
+        // 4500+1200 = 5700, NOT at 0+1200 = 1200.
+        cos_queue_push_back(queue, test_flow_cos_item(3302, 1200));
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_b], 5700,
+            "#785 Phase 3: idle-returning bucket MUST re-anchor at \
+             current queue_vtime, not 0. Anchoring at 0 lets the \
+             returning flow sweep past all established flows for \
+             several rounds (#785 CoV regression).",
+        );
+        assert_eq!(queue.flow_bucket_tail_finish_bytes[bucket_b], 5700);
+    }
+
     /// #785 Phase 3 — same mixed-size byte-rate ordering on the
     /// Prepared (zero-copy) path. Both Local and Prepared variants
     /// must share MQFQ ordering; the pop path picks by finish time
@@ -10697,9 +10956,16 @@ mod tests {
     /// where a push_front mid-drain produced a 500-byte discrepancy
     /// on a 1500-byte packet's finish time.
     ///
-    /// Test: pop the head, observe advanced head-finish, push_front
-    /// the popped item back, observe head-finish returned to its
-    /// pre-pop value.
+    /// Round-3 extension (Codex HIGH): also pin `queue_vtime`
+    /// neutrality. The prior revision advanced `queue_vtime` on
+    /// pop-time but never rewound on push_front, biasing newly-
+    /// active flows behind a phantom amount of drained bytes
+    /// whenever TX-ring-full rolled a pop back onto the queue.
+    ///
+    /// Test: pop the head, observe advanced head-finish and vtime,
+    /// push_front the popped item back, observe ALL of head-finish,
+    /// tail-finish, bucket-bytes, AND queue_vtime returned to their
+    /// pre-pop values.
     #[test]
     fn mqfq_push_front_is_finish_time_neutral_on_active_bucket() {
         let mut root = test_cos_runtime_with_queues(
@@ -10731,9 +10997,11 @@ mod tests {
         let pre_pop_head = queue.flow_bucket_head_finish_bytes[bucket];
         let pre_pop_tail = queue.flow_bucket_tail_finish_bytes[bucket];
         let pre_pop_bytes = queue.flow_bucket_bytes[bucket];
+        let pre_pop_vtime = queue.queue_vtime;
         assert_eq!(pre_pop_head, 1000);
         assert_eq!(pre_pop_tail, 4500);
         assert_eq!(pre_pop_bytes, 4500);
+        assert_eq!(pre_pop_vtime, 0);
 
         // Pop head (the 1000-byte packet). Head advances to 3000
         // (= pre_pop_head + bytes(new head = 2000)). vtime += 1000.
@@ -10742,7 +11010,8 @@ mod tests {
         assert_eq!(queue.queue_vtime, 1000);
 
         // Push the same item back onto the front. Head-finish MUST
-        // return to the pre-pop value (1000).
+        // return to the pre-pop value (1000), AND queue_vtime MUST
+        // return to its pre-pop value (0) — Codex round-3 HIGH.
         cos_queue_push_front(queue, popped);
         assert_eq!(
             queue.flow_bucket_head_finish_bytes[bucket], pre_pop_head,
@@ -10753,33 +11022,300 @@ mod tests {
         // Tail unchanged — we didn't add at tail.
         assert_eq!(queue.flow_bucket_tail_finish_bytes[bucket], pre_pop_tail);
         assert_eq!(queue.flow_bucket_bytes[bucket], pre_pop_bytes);
+        assert_eq!(
+            queue.queue_vtime, pre_pop_vtime,
+            "#785 Phase 3 Codex round-3 HIGH: queue_vtime must be \
+             round-trip neutral on pop→push_front. Without this, \
+             newly-active flows inherit an inflated vtime anchor \
+             and start behind established traffic even though zero \
+             bytes were actually transmitted during the rollback.",
+        );
     }
 
-    /// Pin the overflow bound on `flow_bucket_{head,tail}_finish_bytes` — at
-    /// 100 Gbps sustained throughput the u64 won't wrap within a
-    /// daemon lifetime (2^64 bytes / (100 Gbps / 8) ≈ 46 years).
-    /// Regression would be changing the accumulator to u32 or
-    /// dividing by a small weight that inflates the delta.
+    /// #785 Phase 3 Codex round-3 HIGH — companion pin for the
+    /// DRAINED-bucket case (Rust reviewer MEDIUM #1). When the
+    /// popped item is the SOLE packet in its bucket, the pop
+    /// path's `account_cos_queue_flow_dequeue` resets head=tail=0
+    /// AND the bucket deregisters from the active set. A naive
+    /// push_front would hit the `was_empty` branch and re-anchor
+    /// head=tail=`max(0, queue_vtime) + bytes`, which overshoots
+    /// the pre-pop head by up to one packet and leaves the
+    /// bucket competing at the wrong virtual-time.
+    ///
+    /// Fix: the last-pop snapshot records pre-pop head/tail at
+    /// pop time; push_front restores them exactly when the
+    /// snapshot's bucket matches.
+    #[test]
+    fn mqfq_push_front_is_neutral_on_drained_bucket_round_trip() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
+        // Simulate a vtime that's already advanced (as it would
+        // be mid-stream when other flows have drained), then
+        // enqueue a single packet on flow A. The idle-bucket
+        // re-anchor writes head=tail=max(tail=0, vtime=5000)+1500
+        // = 6500.
+        queue.queue_vtime = 5000;
+        let flow_a = test_session_key(7777, 5201);
+        let bucket_a = cos_flow_bucket_index(0, Some(&flow_a));
+        cos_queue_push_back(queue, test_flow_cos_item(7777, 1500));
+
+        let pre_pop_head = queue.flow_bucket_head_finish_bytes[bucket_a];
+        let pre_pop_tail = queue.flow_bucket_tail_finish_bytes[bucket_a];
+        let pre_pop_bytes = queue.flow_bucket_bytes[bucket_a];
+        let pre_pop_vtime = queue.queue_vtime;
+        let pre_pop_active = queue.active_flow_buckets;
+        assert_eq!(pre_pop_head, 6500);
+        assert_eq!(pre_pop_tail, 6500);
+        assert_eq!(pre_pop_bytes, 1500);
+        assert_eq!(pre_pop_vtime, 5000);
+
+        // Pop the sole item. Bucket drains: head=tail=0, active
+        // count -=1, vtime advances to 6500.
+        let popped = cos_queue_pop_front(queue).expect("pop");
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_a], 0);
+        assert_eq!(queue.flow_bucket_tail_finish_bytes[bucket_a], 0);
+        assert_eq!(queue.flow_bucket_bytes[bucket_a], 0);
+        assert_eq!(queue.queue_vtime, pre_pop_vtime + 1500);
+        assert!(queue.flow_bucket_items[bucket_a].is_empty());
+
+        // Restore it via push_front. Without the snapshot fix this
+        // re-anchors to vtime+bytes = 6500+1500 = 8000 — one packet
+        // past the pre-pop head of 6500. With the fix, head/tail
+        // restore to 6500 exactly.
+        cos_queue_push_front(queue, popped);
+
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_a], pre_pop_head,
+            "#785 Phase 3 Codex round-3 HIGH / Rust MEDIUM #1: \
+             push_front on a drained bucket must restore pre-pop \
+             head exactly, not re-anchor one packet past it.",
+        );
+        assert_eq!(queue.flow_bucket_tail_finish_bytes[bucket_a], pre_pop_tail);
+        assert_eq!(queue.flow_bucket_bytes[bucket_a], pre_pop_bytes);
+        assert_eq!(
+            queue.queue_vtime, pre_pop_vtime,
+            "#785 Phase 3: queue_vtime must rewind to pre-pop on \
+             drained-bucket round-trip too.",
+        );
+        assert_eq!(queue.active_flow_buckets, pre_pop_active);
+        assert_eq!(queue.flow_bucket_items[bucket_a].len(), 1);
+    }
+
+    /// #785 Phase 3 Codex round-2 MEDIUM — brief-idle re-entry pin.
+    /// Previous pins covered the LARGE-idle case (bucket drains,
+    /// lots of other traffic flows, bucket re-enqueues far in the
+    /// future). This pin covers the BRIEF-idle case where a bucket
+    /// drains, another bucket drains advancing vtime modestly, the
+    /// first bucket re-enqueues — the `max(tail_finish, queue_vtime)
+    /// + bytes` anchor formula must exercise BOTH arms of the max
+    /// over the lifetime of this bucket:
+    ///
+    ///   * First re-enqueue after drain: tail_finish was reset to 0,
+    ///     queue_vtime > 0 → max picks queue_vtime, anchor =
+    ///     queue_vtime + bytes.
+    ///   * Second enqueue (to now-active bucket): tail_finish >
+    ///     queue_vtime, max picks tail_finish, anchor =
+    ///     tail_finish + bytes.
+    #[test]
+    fn mqfq_brief_idle_reentry_exercises_both_max_arms() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
+        let flow_a = test_session_key(1001, 5201);
+        let bucket_a = cos_flow_bucket_index(0, Some(&flow_a));
+        let flow_b = test_session_key(1002, 5201);
+        let bucket_b = cos_flow_bucket_index(0, Some(&flow_b));
+        assert_ne!(bucket_a, bucket_b, "test hash collision");
+
+        // Flow A: single packet. Enqueue + drain fully. Bucket A
+        // goes idle with head/tail=0.
+        cos_queue_push_back(queue, test_flow_cos_item(1001, 1500));
+        let _ = cos_queue_pop_front(queue);
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_a], 0);
+        assert_eq!(queue.flow_bucket_tail_finish_bytes[bucket_a], 0);
+        assert_eq!(queue.queue_vtime, 1500);
+
+        // Flow B: one packet, drain it. Advances queue_vtime to
+        // 1500 + 800 = 2300 (small amount vs. flow A's lifetime).
+        cos_queue_push_back(queue, test_flow_cos_item(1002, 800));
+        let _ = cos_queue_pop_front(queue);
+        assert_eq!(queue.queue_vtime, 2300);
+        assert_eq!(queue.flow_bucket_tail_finish_bytes[bucket_b], 0);
+
+        // Flow A returns with a 1200-byte packet. tail_finish[A]=0,
+        // queue_vtime=2300 → max picks vtime → head = tail = 2300
+        // + 1200 = 3500. This is the "brief-idle" re-anchor.
+        cos_queue_push_back(queue, test_flow_cos_item(1001, 1200));
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_a], 3500,
+            "#785 Phase 3 brief-idle re-entry: first arm of max \
+             (tail_finish=0 < queue_vtime=2300) must anchor at \
+             queue_vtime + bytes",
+        );
+        assert_eq!(queue.flow_bucket_tail_finish_bytes[bucket_a], 3500);
+
+        // Flow A appends a second 900-byte packet on its now-
+        // active bucket. tail_finish=3500 > queue_vtime=2300 →
+        // max picks tail_finish → tail = 3500 + 900 = 4400. Head
+        // unchanged (head packet is still the first one, 3500).
+        cos_queue_push_back(queue, test_flow_cos_item(1001, 900));
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_a], 3500,
+            "#785 Phase 3 brief-idle re-entry: active-bucket \
+             enqueue must NOT alter head (head packet didn't \
+             change)",
+        );
+        assert_eq!(
+            queue.flow_bucket_tail_finish_bytes[bucket_a], 4400,
+            "#785 Phase 3 brief-idle re-entry: second arm of max \
+             (tail_finish=3500 > queue_vtime=2300) must anchor at \
+             tail_finish + bytes",
+        );
+    }
+
+    /// Pin the overflow bound on `flow_bucket_{head,tail}_finish_bytes`
+    /// by driving the ACTUAL runtime field near `u64::MAX` and
+    /// exercising the real enqueue path through
+    /// `cos_queue_push_back`/`account_cos_queue_flow_enqueue`.
+    ///
+    /// Rust reviewer MEDIUM #2 (round-2): the prior revision
+    /// recomputed the wrap-interval math in the test body and
+    /// asserted `years_to_wrap > 40`. That is a calculator, not a
+    /// pin — a regression that narrowed the field to u32, or swapped
+    /// `saturating_add` for `+`, would have left this test green
+    /// because the test never touched the field. This revision:
+    ///
+    ///   1. Drives `queue.queue_vtime` to `u64::MAX - 10_000`.
+    ///   2. Enqueues a 9000-byte packet (MTU-size upper bound).
+    ///   3. Asserts the bucket's head/tail finish DID NOT wrap AND
+    ///      landed at exactly `u64::MAX - 10_000 + 9_000`.
+    ///   4. Enqueues again at u64::MAX-adjacent vtime and asserts
+    ///      the saturating_add path keeps the field bounded.
+    ///
+    /// A regression that changes the accumulator type to u32,
+    /// replaces `saturating_add` with `+`, or widens the per-enqueue
+    /// delta (e.g. by dividing by a small weight) will fail THIS
+    /// test, not a recomputed calculator.
     #[test]
     fn mqfq_finish_time_u64_has_decades_of_headroom() {
+        let mut root = test_cos_runtime_with_queues(
+            100_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 25_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
         // Largest plausible single enqueue: MTU 9000 at weight 1.
-        const MAX_SINGLE_DELTA: u64 = 9_000;
-        // Bytes to wrap u64: 2^64 ≈ 1.84e19.
+        const MAX_SINGLE_DELTA: usize = 9_000;
+        const SLACK: u64 = 10_000;
+        let near_wrap = u64::MAX - SLACK;
+
+        // Drive the runtime field near wrap by setting queue_vtime
+        // (the re-anchor source for idle-bucket enqueue). The first
+        // enqueue re-anchors head=tail=max(0, near_wrap)+9000 =
+        // near_wrap + 9000 — well within u64 and exactly one delta
+        // past queue_vtime.
+        queue.queue_vtime = near_wrap;
+
+        let flow_a = test_session_key(9999, 5201);
+        let bucket_a = cos_flow_bucket_index(0, Some(&flow_a));
+
+        cos_queue_push_back(queue, test_flow_cos_item(9999, MAX_SINGLE_DELTA));
+        let expected_first = near_wrap + MAX_SINGLE_DELTA as u64;
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_a], expected_first,
+            "first enqueue near u64 wrap must anchor at queue_vtime \
+             + bytes; regression to u32 or non-saturating add would \
+             fail here with a wrapped or truncated value",
+        );
+        assert_eq!(
+            queue.flow_bucket_tail_finish_bytes[bucket_a], expected_first,
+        );
+        assert!(
+            queue.flow_bucket_head_finish_bytes[bucket_a] > near_wrap,
+            "finish time did not advance past pre-enqueue vtime — \
+             type narrowed or wrap occurred",
+        );
+
+        // Second enqueue onto the ACTIVE bucket: tail advances by
+        // MAX_SINGLE_DELTA, but saturating_add caps at u64::MAX.
+        // With near_wrap + 2*9000 = u64::MAX - 10_000 + 18_000 =
+        // u64::MAX + 8_000 — this SHOULD saturate to u64::MAX.
+        cos_queue_push_back(queue, test_flow_cos_item(9999, MAX_SINGLE_DELTA));
+        let new_tail = queue.flow_bucket_tail_finish_bytes[bucket_a];
+        assert!(
+            new_tail >= expected_first,
+            "tail must monotonically advance; got {} < {}",
+            new_tail,
+            expected_first,
+        );
+        assert_eq!(
+            new_tail,
+            u64::MAX,
+            "second enqueue must saturate at u64::MAX (input was \
+             near_wrap + 2*9000 > u64::MAX); regression that replaces \
+             saturating_add with `+` would panic on overflow in debug \
+             builds or wrap in release builds",
+        );
+
+        // Head unchanged on active-bucket enqueue (head packet is
+        // still the first one).
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_a], expected_first,
+            "active-bucket enqueue must not alter head",
+        );
+
+        // Sanity-check the original calculator claim — 40+ years at
+        // 100 Gbps — is still true. Kept alongside the real-field
+        // pin above; the pin above is what would fail on regression.
         const WRAP_BYTES: u128 = 1u128 << 64;
-        // Minimum years to wrap, at 100 Gbps line rate:
         let bytes_per_sec: u128 = 100_000_000_000u128 / 8;
         let years_to_wrap = WRAP_BYTES / bytes_per_sec / 60 / 60 / 24 / 365;
         assert!(
             years_to_wrap > 40,
             "u64 finish-time headroom at 100 Gbps should exceed 40 \
-             years of uptime, got {} years — formula changed to a \
-             narrower type or an inflated delta?",
+             years of uptime, got {} years",
             years_to_wrap,
         );
-        // Single-enqueue delta must not wrap regardless of vtime.
-        let finish: u64 = u64::MAX.saturating_sub(MAX_SINGLE_DELTA);
-        let next = finish.saturating_add(MAX_SINGLE_DELTA);
-        assert!(next >= finish, "saturating_add must not overflow");
     }
 
     #[test]
@@ -11948,6 +12484,7 @@ mod tests {
             flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             queue_vtime: 0,
+            last_pop_snapshot: None,
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
@@ -11991,6 +12528,7 @@ mod tests {
             flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             queue_vtime: 0,
+            last_pop_snapshot: None,
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
@@ -12045,6 +12583,7 @@ mod tests {
             flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             queue_vtime: 0,
+            last_pop_snapshot: None,
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
