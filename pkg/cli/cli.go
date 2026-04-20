@@ -66,6 +66,15 @@ type CLI struct {
 
 	vrrpMgr *vrrp.Manager
 
+	// applyConfigFn is the daemon's full reconcile callback. When set,
+	// local CLI commits invoke this (the single source of truth used by
+	// gRPC/HTTP commits via ApplyFn) so every commit path runs through
+	// the same reconcile — including D3 RSS indirection reapply (#797
+	// H2). When nil (not wired), the CLI falls back to the legacy
+	// applyToDataplane() which covers dataplane/FRR/IPsec but misses
+	// daemon-level steps like D3 and cluster/VRRP reconcile.
+	applyConfigFn func(*config.Config)
+
 	// Fabric peer dialing for cluster-wide queries (fab0 + optional fab1).
 	fabricPeerAddrFn   func() []string
 	fabricVRFDevice    string
@@ -135,6 +144,16 @@ func (c *CLI) SetUserClass(class string) {
 // SetVRRPManager sets the VRRP manager for runtime state queries.
 func (c *CLI) SetVRRPManager(m *vrrp.Manager) {
 	c.vrrpMgr = m
+}
+
+// SetApplyConfigFn wires the daemon's full reconcile callback into the
+// CLI so commits issued through the in-process CLI go through the same
+// path gRPC/HTTP use. Required for D3 RSS indirection reapply on
+// `set system dataplane workers N` and `rss-indirection enable|disable`
+// (#797 H2). When nil, CLI commits fall back to the legacy
+// applyToDataplane() path.
+func (c *CLI) SetApplyConfigFn(fn func(*config.Config)) {
+	c.applyConfigFn = fn
 }
 
 // SetFabricPeer configures fabric peer dialing for cluster-wide queries.
@@ -547,9 +566,15 @@ func (c *CLI) Run() error {
 	}
 	defer c.rl.Close()
 
-	// Register auto-rollback handler for commit confirmed
+	// Register auto-rollback handler for commit confirmed.
+	// Prefer the daemon's full reconcile (applyConfigFn) so D3,
+	// cluster, VRRP, etc. all re-converge on rollback — matches the
+	// gRPC/HTTP rollback path. Falls back to applyToDataplane if
+	// applyConfigFn is not wired (e.g. CLI spawned outside daemon).
 	c.store.SetCentralRollbackHandler(func(cfg *config.Config) {
-		if c.dp != nil {
+		if c.applyConfigFn != nil {
+			c.applyConfigFn(cfg)
+		} else if c.dp != nil {
 			if err := c.applyToDataplane(cfg); err != nil {
 				fmt.Fprintf(os.Stderr, "\nwarning: auto-rollback dataplane apply failed: %v\n", err)
 			}

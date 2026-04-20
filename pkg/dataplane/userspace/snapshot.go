@@ -74,6 +74,69 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 	}
 }
 
+// UserspaceBoundLinuxInterfaces returns the deduplicated, sorted set of
+// Linux interface names that the userspace dataplane will bind AF_XDP
+// sockets to for the given compiled config. This is the authoritative
+// allowlist used by the D3 RSS indirection path (#797) so that we only
+// reshape RSS on interfaces we actually steer into AF_XDP workers —
+// siblings like a spare mlx5 PF or a management netdev must not be
+// touched.
+//
+// Scope mirrors buildUserspaceIngressIfindexes() and
+// userspaceSkipsIngressInterface(): include zoned non-tunnel interfaces
+// excluding fxp*, em*, fab*, lo0, mgmt/control zones, and RETH member
+// children; plus every fabric's parent member (fab0/fab1 themselves are
+// IPVLAN overlays and are excluded above, but their physical parent is
+// where AF_XDP binds). For zoned VLAN units whose parent is the physical
+// interface, we emit the parent Linux name — that is the netdev the
+// AF_XDP socket actually binds to.
+//
+// Returns nil on nil config. Never returns an error: this is a
+// best-effort derivation used to scope a best-effort optimization.
+func UserspaceBoundLinuxInterfaces(cfg *config.Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	ucfg := deriveUserspaceConfig(cfg)
+	// Build a snapshot without depending on ifindex resolution — the
+	// allowlist is by Linux name (what `ethtool` consumes), so ifindex
+	// lookups are unnecessary here. We reuse the shared filter via the
+	// real builder to stay in lock-step with binding logic.
+	snap := buildSnapshot(cfg, ucfg, 0, 0)
+	if snap == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	out := make([]string, 0)
+	add := func(name string) {
+		if name == "" {
+			return
+		}
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	for _, iface := range snap.Interfaces {
+		if iface.Zone == "" || userspaceSkipsIngressInterface(iface) {
+			continue
+		}
+		// Prefer the parent Linux name when present (VLAN units bind on
+		// the parent physical netdev); otherwise the iface's own name.
+		if iface.ParentLinuxName != "" {
+			add(iface.ParentLinuxName)
+		} else {
+			add(iface.LinuxName)
+		}
+	}
+	for _, fab := range snap.Fabrics {
+		add(fab.ParentLinuxName)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // snapshotContentHash computes a SHA-256 hash over the stable content of a
 // snapshot, excluding volatile fields (Generation, FIBGeneration, GeneratedAt)
 // that change on every build even when the forwarding-relevant content is

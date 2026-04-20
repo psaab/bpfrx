@@ -108,17 +108,24 @@ func (realRSSExecutor) listInterfaces() []string {
 	return out
 }
 
-// applyRSSIndirection reshapes the RSS indirection table on every mlx5_core
-// interface so that only queues 0..workers-1 receive traffic.
+// applyRSSIndirection reshapes the RSS indirection table on mlx5_core
+// interfaces that are actually bound to the userspace dataplane so that
+// only queues 0..workers-1 receive traffic.
 //
 // Invariants:
 //   - Runs at daemon startup (and on reconcile for worker-count changes),
 //     before the dataplane binds any AF_XDP socket on startup.
-//   - Non-mlx5 interfaces are skipped at the per-interface call site —
-//     `ethtool` is never invoked on virtio, iavf, i40e, etc. The
-//     driver-guard is also repeated inside applyRSSIndirectionOne as
-//     defense in depth, so a mis-fed allowlist cannot touch non-mlx5.
-//   - enabled == false is a hard kill switch: skip everything.
+//   - `allowed` is the userspace-dp binding allowlist — the authoritative
+//     set of Linux interface names that AF_XDP will bind. Only members
+//     of that set are ever considered, and every member is still passed
+//     through the mlx5 driver guard. An empty allowlist is treated as
+//     "no interfaces to touch" (no-op) — never a fall-back to scanning
+//     every netdev. Review finding Codex H1.
+//   - Non-mlx5 interfaces in the allowlist are skipped — `ethtool` is
+//     never invoked on virtio, iavf, i40e, etc. The driver-guard is
+//     also repeated inside applyRSSIndirectionOne as defense in depth.
+//   - enabled == false is a hard kill switch: restore the default
+//     indirection table on every allowlisted mlx5 interface.
 //   - workers == 1 is skipped (single worker benefits from default RSS
 //     spreading across all HW queues / IRQ lines; weight-pinning to a
 //     single queue would serialize the worker on one IRQ — reviewer #L1).
@@ -128,16 +135,18 @@ func (realRSSExecutor) listInterfaces() []string {
 //     computed layout, no write is issued.
 //   - Never returns a non-nil error — D3 regressions must not break
 //     interface bring-up.
-func applyRSSIndirection(enabled bool, workers int, execer rssExecutor) {
+func applyRSSIndirection(enabled bool, workers int, allowed []string, execer rssExecutor) {
 	if !enabled {
 		// Kill switch. Actively restore default (equal-weight) RSS on
-		// every mlx5 interface so toggling disable at runtime reverts
-		// the table without a daemon restart. Idempotent: restoring an
-		// already-default table is a no-op ethtool call. The restore is
-		// scoped per-interface with the same driver filter as the apply
-		// path, so non-mlx5 netdevs are never touched.
-		restoreDefaultRSSIndirection(execer)
-		slog.Info("linksetup: rss indirection disabled by config")
+		// every allowlisted mlx5 interface so toggling disable at
+		// runtime reverts the table without a daemon restart.
+		// Idempotent: restoring an already-default table is a no-op
+		// ethtool call. The restore is scoped per-interface with the
+		// same driver filter as the apply path, so non-mlx5 netdevs
+		// and non-userspace-dp interfaces are never touched.
+		restoreDefaultRSSIndirection(allowed, execer)
+		slog.Info("linksetup: rss indirection disabled by config",
+			"allowed_count", len(allowed))
 		return
 	}
 	if workers <= 0 {
@@ -150,22 +159,27 @@ func applyRSSIndirection(enabled bool, workers int, execer rssExecutor) {
 		slog.Info("linksetup: rss indirection skipped (single worker — keep default RSS)")
 		return
 	}
-
-	ifaces := execer.listInterfaces()
-	if len(ifaces) == 0 {
-		slog.Warn("linksetup: rss indirection could not enumerate interfaces")
+	if len(allowed) == 0 {
+		// No userspace-dp bindings derived from config — nothing to
+		// reshape. This is distinct from "listInterfaces returned
+		// nothing": an empty allowlist means the compiled config has
+		// no userspace-dp-bound mlx5 interfaces (e.g. management-only
+		// deploy), not a sysfs error.
+		slog.Debug("linksetup: rss indirection skipped (no userspace-dp bound interfaces)",
+			"workers", workers)
 		return
 	}
 
-	for _, iface := range ifaces {
+	for _, iface := range allowed {
 		if iface == "lo" {
 			continue
 		}
 		drv := execer.readDriver(iface)
 		if drv != mlx5Driver {
-			// Explicit per-interface mlx5 guard at the call site —
-			// prevents any `ethtool` invocation on virtio/iavf/i40e/etc.
-			// Review finding HIGH #1.
+			// Allowlist can legitimately include non-mlx5 interfaces
+			// (virtio/iavf/i40e that userspace-dp binds on); skip
+			// silently at the driver guard. Codex H1: never invoke
+			// ethtool on a non-mlx5 netdev.
 			slog.Debug("linksetup: rss indirection skipped (non-mlx5 driver)",
 				"iface", iface, "driver", drv)
 			continue
@@ -175,16 +189,17 @@ func applyRSSIndirection(enabled bool, workers int, execer rssExecutor) {
 }
 
 // restoreDefaultRSSIndirection is called when the kill switch is engaged.
-// Runs `ethtool -X <iface> default` on every mlx5 interface so the kernel
-// reverts to equal-weight RSS across all HW queues. Idempotent (already-
-// default is a no-op). Non-mlx5 interfaces are filtered out at the call
-// site, mirroring applyRSSIndirection's guard.
-func restoreDefaultRSSIndirection(execer rssExecutor) {
-	ifaces := execer.listInterfaces()
-	if len(ifaces) == 0 {
+// Runs `ethtool -X <iface> default` on every allowlisted mlx5 interface so
+// the kernel reverts to equal-weight RSS across all HW queues. Idempotent
+// (already-default is a no-op). Non-mlx5 interfaces are filtered out at
+// the call site, mirroring applyRSSIndirection's guard. An empty allowlist
+// is a no-op: the restore path must not escape the userspace-dp binding
+// scope (Codex H1).
+func restoreDefaultRSSIndirection(allowed []string, execer rssExecutor) {
+	if len(allowed) == 0 {
 		return
 	}
-	for _, iface := range ifaces {
+	for _, iface := range allowed {
 		if iface == "lo" {
 			continue
 		}

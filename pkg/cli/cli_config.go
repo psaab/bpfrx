@@ -5,7 +5,31 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/psaab/xpf/pkg/config"
 )
+
+// commitApply invokes the reconcile path for a freshly-committed config.
+// Prefers the daemon's full applyConfig (single source of truth used by
+// gRPC/HTTP) so D3 RSS indirection, cluster, VRRP, DHCP, etc. all
+// re-converge. Falls back to the legacy applyToDataplane() when
+// applyConfigFn is not wired. Warnings are non-fatal (match the prior
+// applyToDataplane contract).
+//
+// #797 H2: worker-count changes and rss-indirection enable|disable
+// committed through the in-process CLI must trigger D3 reapply; that
+// only happens on the applyConfig path.
+func (c *CLI) commitApply(compiled *config.Config) {
+	if c.applyConfigFn != nil {
+		c.applyConfigFn(compiled)
+		return
+	}
+	if c.dp != nil {
+		if err := c.applyToDataplane(compiled); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: dataplane apply failed: %v\n", err)
+		}
+	}
+}
 
 func (c *CLI) handleCopyRename(parts []string) error {
 	cmd := parts[0]
@@ -172,11 +196,7 @@ func (c *CLI) handleCommit(args []string) error {
 			return fmt.Errorf("commit failed: %w", err)
 		}
 
-		if c.dp != nil {
-			if err := c.applyToDataplane(compiled); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: dataplane apply failed: %v\n", err)
-			}
-		}
+		c.commitApply(compiled)
 		c.reloadSyslog(compiled)
 		c.refreshPrompt()
 
@@ -201,12 +221,8 @@ func (c *CLI) handleCommit(args []string) error {
 			return fmt.Errorf("commit confirmed failed: %w", err)
 		}
 
-		// Apply to dataplane
-		if c.dp != nil {
-			if err := c.applyToDataplane(compiled); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: dataplane apply failed: %v\n", err)
-			}
-		}
+		// Apply to dataplane (daemon full reconcile when wired).
+		c.commitApply(compiled)
 		c.reloadSyslog(compiled)
 		c.refreshPrompt()
 
@@ -231,12 +247,8 @@ func (c *CLI) handleCommit(args []string) error {
 		return fmt.Errorf("commit failed: %w", err)
 	}
 
-	// Apply to dataplane
-	if c.dp != nil {
-		if err := c.applyToDataplane(compiled); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: dataplane apply failed: %v\n", err)
-		}
-	}
+	// Apply to dataplane (daemon full reconcile when wired).
+	c.commitApply(compiled)
 
 	// Hot-reload syslog clients
 	c.reloadSyslog(compiled)

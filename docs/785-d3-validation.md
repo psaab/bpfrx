@@ -15,6 +15,69 @@ before any XSK bind, so mid-traffic re-hashing is impossible. Skips
 non-mlx5 drivers, single-worker bindings, and when `workers >=
 queues`.
 
+### Scope — which interfaces D3 touches
+
+D3 only touches the mlx5 interfaces that the userspace dataplane
+actually binds AF_XDP sockets to — derived from the compiled
+userspace-dp binding plan
+(`userspace.UserspaceBoundLinuxInterfaces(cfg)`), which in turn is the
+same filter used by the binding-plan key
+(`userspaceSkipsIngressInterface`). Sibling mlx5 PFs, management
+interfaces (`fxp*`, `em*`), fabric overlays (`fab*`), tunnel netdevs,
+and interfaces in the `mgmt`/`control` zones are excluded from the
+allowlist and will never see an `ethtool -X` invocation.
+
+On a host with two mlx5 ports where only one is bound to
+`xpf-userspace-dp`, the other port keeps its driver-default RSS table
+and is not reshaped. Non-mlx5 drivers (virtio, iavf, i40e) in the
+allowlist are still filtered out at the per-interface driver guard as
+defence in depth.
+
+### Operator knob — `rss-indirection enable | disable`
+
+D3 can be turned off at runtime with
+
+```
+set system dataplane rss-indirection disable
+commit
+```
+
+The knob defaults to **enabled**; operators opt out explicitly. On
+commit, the daemon's full reconcile path (`applyConfig`) re-runs D3
+against the new config — this is true regardless of commit source
+(gRPC, HTTP, local CLI). Lowering `workers` from N to 1, raising
+`workers` to `>= queues`, or toggling the knob all take effect without
+a daemon restart.
+
+### Runtime toggle semantics
+
+- `enable` (default): apply `weight 1..1 0..0` to each allowlisted
+  mlx5 interface. Idempotent — matching tables skip the write.
+- `disable`: actively restore the **driver's** default equal-weight
+  table on each allowlisted mlx5 interface via
+  `ethtool -X <iface> default`. This is the driver's default, **not**
+  a snapshot of whatever RSS layout the operator configured before
+  starting `xpfd`. If you had pre-set a custom indirection table on
+  these NICs before bringing the daemon up, engaging the kill switch
+  will overwrite that custom layout with the mlx5 driver's equal-
+  weight default. Snapshot-and-restore is intentionally not
+  implemented: it would require carrying operator state across
+  commits and is overkill for a kill switch.
+
+### Daemon stop behaviour
+
+`systemctl stop xpfd` (or `SIGTERM`) does **not** restore the RSS
+indirection table. The constrained layout from the last apply
+persists across daemon lifecycles. Rationale: D3 is a best-effort
+steering optimisation, not a correctness feature, and a busy host
+should not take a fleet-wide NIC configuration churn as part of
+graceful shutdown. If an operator needs the driver default before
+removing the daemon, they can:
+
+1. `set system dataplane rss-indirection disable` + `commit` (daemon
+   actively restores the driver default), then stop the daemon, or
+2. manually run `ethtool -X <iface> default` per interface.
+
 ## Baseline (no D3, default RSS — matched 5-run earlier)
 
 | | |

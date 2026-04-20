@@ -454,6 +454,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// D3 (#797): default enabled. Operators opt out via
 		// `set system dataplane rss-indirection disable`.
 		rssEnabled := true
+		var rssAllowed []string
 		if cfg := d.store.ActiveConfig(); cfg != nil {
 			if cfg.Chassis.Cluster != nil {
 				clusterMode = true
@@ -468,9 +469,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 				if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
 					rssEnabled = false
 				}
+				// Codex H1: scope D3 to only interfaces that
+				// userspace-dp actually binds AF_XDP sockets on.
+				rssAllowed = dpuserspace.UserspaceBoundLinuxInterfaces(cfg)
 			}
 		}
-		if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled); err != nil {
+		if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
 			slog.Warn("interface naming failed", "err", err)
 		}
 	}
@@ -1078,6 +1082,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if isInteractive() {
 		shell := cli.New(d.store, d.dp, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
 		shell.SetVersion(d.opts.Version)
+		// #797 H2: route in-process CLI commits through the daemon's
+		// full reconcile (same path gRPC/HTTP use via ApplyFn) so D3
+		// RSS indirection reapply, cluster/VRRP, DHCP etc. converge
+		// on every commit — not only the subset applyToDataplane() did.
+		shell.SetApplyConfigFn(d.applyConfig)
 		shell.SetRPMResultsFn(func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()
@@ -2285,17 +2294,22 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 	// workers 6`), and the D3 disable knob can flip; either requires
 	// re-running the reshape (or restore) against the current HW state.
 	// Idempotent: matching tables skip the write. Non-mlx5 interfaces
-	// are skipped at the per-interface guard.
+	// are skipped at the per-interface guard. The allowlist is
+	// recomputed from the *new* compiled config so interface-set
+	// changes (added/removed zoned mlx5 interfaces, fabric interface
+	// changes) take effect on the same commit.
 	if !d.opts.NoDataplane {
 		rssEnabled := true
 		workers := 0
+		var rssAllowed []string
 		if cfg.System.DataplaneType == "userspace" && cfg.System.UserspaceDataplane != nil {
 			workers = cfg.System.UserspaceDataplane.Workers
 			if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
 				rssEnabled = false
 			}
+			rssAllowed = dpuserspace.UserspaceBoundLinuxInterfaces(cfg)
 		}
-		reapplyRSSIndirection(rssEnabled, workers)
+		reapplyRSSIndirection(rssEnabled, workers, rssAllowed)
 	}
 }
 

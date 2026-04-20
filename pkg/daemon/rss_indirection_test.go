@@ -196,7 +196,7 @@ func TestApplyRSSIndirection_NonMlx_Skips(t *testing.T) {
 		drivers: map[string]string{"eth0": "virtio_net", "eth1": "iavf"},
 		queues:  map[string]int{"eth0": 4, "eth1": 4},
 	}
-	applyRSSIndirection(true, 4, f)
+	applyRSSIndirection(true, 4, f.ifaces, f)
 	if len(f.calls) != 0 {
 		t.Fatalf("non-mlx5 interfaces must not trigger any ethtool call, got %v", f.calls)
 	}
@@ -219,7 +219,7 @@ func TestApplyRSSIndirection_MixedDrivers_OnlyMlxTouched(t *testing.T) {
 		queues:   map[string]int{"mlx0": 6, "virt0": 4, "iavf0": 4},
 		ethtoolX: map[string][]byte{"mlx0": defaultTable},
 	}
-	applyRSSIndirection(true, 4, f)
+	applyRSSIndirection(true, 4, f.ifaces, f)
 
 	// All ethtool invocations must target mlx0 only.
 	for _, c := range f.calls {
@@ -263,7 +263,7 @@ func TestApplyRSSIndirection_SingleWorker_Skips(t *testing.T) {
 		drivers: map[string]string{"eth0": "mlx5_core"},
 		queues:  map[string]int{"eth0": 4},
 	}
-	applyRSSIndirection(true, 1, f)
+	applyRSSIndirection(true, 1, f.ifaces, f)
 	if len(f.calls) != 0 {
 		t.Fatalf("workers=1 must issue no ethtool calls, got %v", f.calls)
 	}
@@ -276,7 +276,7 @@ func TestApplyRSSIndirection_ZeroWorkers_Skips(t *testing.T) {
 		drivers: map[string]string{"eth0": "mlx5_core"},
 		queues:  map[string]int{"eth0": 4},
 	}
-	applyRSSIndirection(true, 0, f)
+	applyRSSIndirection(true, 0, f.ifaces, f)
 	if len(f.calls) != 0 {
 		t.Fatalf("workers=0 must issue no ethtool calls, got %v", f.calls)
 	}
@@ -296,7 +296,7 @@ func TestApplyRSSIndirection_DisabledRestoresDefault(t *testing.T) {
 		},
 		queues: map[string]int{"mlx0": 6, "mlx1": 6, "virt0": 4},
 	}
-	applyRSSIndirection(false, 4, f)
+	applyRSSIndirection(false, 4, f.ifaces, f)
 
 	// Exactly one restore call per mlx5 interface; virt0/lo untouched.
 	if len(f.calls) != 2 {
@@ -337,11 +337,11 @@ func TestApplyRSSIndirection_TwiceIsIdempotent(t *testing.T) {
 		ethtoolX: map[string][]byte{"eth0": matchingTable},
 	}
 
-	applyRSSIndirection(true, 4, f)
+	applyRSSIndirection(true, 4, f.ifaces, f)
 	if len(f.calls) != 1 || f.calls[0][0] != "-x" {
 		t.Fatalf("first call: want probe-only, got %v", f.calls)
 	}
-	applyRSSIndirection(true, 4, f)
+	applyRSSIndirection(true, 4, f.ifaces, f)
 	if len(f.calls) != 2 {
 		t.Fatalf("second call must be exactly +1 probe, got total %d: %v",
 			len(f.calls), f.calls)
@@ -370,6 +370,108 @@ func TestIndirectionTableMatches_FalseWhenQueueOutOfRange(t *testing.T) {
 `)
 	if indirectionTableMatches(out, []int{1, 1, 1, 1, 0, 0}) {
 		t.Fatal("queue 4 and 5 appear: must not match")
+	}
+}
+
+// Codex H1: the allowlist must scope apply — mlx5 siblings not in the
+// userspace-dp binding list must never see an ethtool call. An mlx5 PF
+// unused by xpf must stay at its driver-default RSS regardless of its
+// sysfs presence.
+func TestApplyRSSIndirection_AllowlistScopesApply(t *testing.T) {
+	defaultTable := []byte(`RX flow hash indirection table for mlx_bound with 6 RX ring(s):
+    0:      0     1     2     3     4     5
+`)
+	f := &fakeRSSExecutor{
+		ifaces: []string{"lo", "mlx_bound", "mlx_sibling"},
+		drivers: map[string]string{
+			"mlx_bound":   "mlx5_core",
+			"mlx_sibling": "mlx5_core",
+		},
+		queues:   map[string]int{"mlx_bound": 6, "mlx_sibling": 6},
+		ethtoolX: map[string][]byte{"mlx_bound": defaultTable},
+	}
+	// Allowlist contains only mlx_bound — mlx_sibling must be untouched
+	// even though it is also mlx5_core.
+	applyRSSIndirection(true, 4, []string{"mlx_bound"}, f)
+
+	for _, c := range f.calls {
+		if len(c) < 2 {
+			t.Fatalf("malformed call: %v", c)
+		}
+		if c[1] != "mlx_bound" {
+			t.Fatalf("allowlist violated: ethtool invoked on %v", c)
+		}
+	}
+	if len(f.calls) == 0 {
+		t.Fatal("expected ethtool calls on the allowlisted iface")
+	}
+}
+
+// Codex H1: empty allowlist → zero ethtool calls. A userspace-dp config
+// with no bound mlx5 interfaces (e.g. management-only deploy) must not
+// touch any netdev, regardless of the sysfs scan.
+func TestApplyRSSIndirection_EmptyAllowlist_NoOp(t *testing.T) {
+	f := &fakeRSSExecutor{
+		ifaces:  []string{"mlx0"},
+		drivers: map[string]string{"mlx0": "mlx5_core"},
+		queues:  map[string]int{"mlx0": 6},
+	}
+	applyRSSIndirection(true, 4, nil, f)
+	if len(f.calls) != 0 {
+		t.Fatalf("empty allowlist must not issue ethtool calls, got %v", f.calls)
+	}
+}
+
+// Codex H1 (restore path): the kill switch must also respect the
+// allowlist so we never "restore default" on a sibling mlx5 PF the
+// operator reserved for a non-xpf workload.
+func TestApplyRSSIndirection_RestoreRespectsAllowlist(t *testing.T) {
+	f := &fakeRSSExecutor{
+		ifaces: []string{"mlx_bound", "mlx_sibling"},
+		drivers: map[string]string{
+			"mlx_bound":   "mlx5_core",
+			"mlx_sibling": "mlx5_core",
+		},
+		queues: map[string]int{"mlx_bound": 6, "mlx_sibling": 6},
+	}
+	applyRSSIndirection(false, 4, []string{"mlx_bound"}, f)
+	if len(f.calls) != 1 {
+		t.Fatalf("want exactly one restore call, got %v", f.calls)
+	}
+	if f.calls[0][1] != "mlx_bound" {
+		t.Fatalf("restore escaped allowlist: %v", f.calls[0])
+	}
+}
+
+// Codex LOW (new): end-to-end coverage from reapplyRSSIndirectionWith
+// (the commit-time reapply entry point) through to an ethtool `-X
+// ... weight ...` call. Proves the wiring on the exact code path
+// applyConfig() uses — not just the helper.
+func TestReapplyRSSIndirection_EndToEndWritesWeights(t *testing.T) {
+	defaultTable := []byte(`RX flow hash indirection table for ge-0-0-1 with 6 RX ring(s):
+    0:      0     1     2     3     4     5
+`)
+	f := &fakeRSSExecutor{
+		ifaces:   []string{"lo", "ge-0-0-1"},
+		drivers:  map[string]string{"ge-0-0-1": "mlx5_core"},
+		queues:   map[string]int{"ge-0-0-1": 6},
+		ethtoolX: map[string][]byte{"ge-0-0-1": defaultTable},
+	}
+	reapplyRSSIndirectionWith(true, 4, []string{"ge-0-0-1"}, f)
+
+	sawWrite := false
+	for _, c := range f.calls {
+		if len(c) >= 4 && c[0] == "-X" && c[1] == "ge-0-0-1" && c[2] == "weight" {
+			// Expect `1 1 1 1 0 0` for workers=4, queues=6.
+			want := []string{"-X", "ge-0-0-1", "weight", "1", "1", "1", "1", "0", "0"}
+			if !reflect.DeepEqual(c, want) {
+				t.Fatalf("weight argv mismatch: want %v, got %v", want, c)
+			}
+			sawWrite = true
+		}
+	}
+	if !sawWrite {
+		t.Fatalf("reapplyRSSIndirectionWith did not reach ethtool -X weight: %v", f.calls)
 	}
 }
 
