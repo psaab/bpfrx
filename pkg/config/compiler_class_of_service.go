@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -32,6 +33,51 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	}
 
 	if fcNode := node.FindChild("forwarding-classes"); fcNode != nil {
+		// Enforce the FC ↔ queue bijection. Junos semantics give
+		// each queue ID one forwarding class, and each FC one
+		// queue — schedulers attach to an FC, so two FCs on one
+		// queue give the queue two conflicting rate targets, and
+		// one FC on two queues leaves classifier / scheduler-map
+		// references ambiguous.
+		//
+		// The userspace dataplane's compile path
+		// (`forwarding_build.rs`) iterates the scheduler-map and
+		// creates ONE `CoSQueueConfig` per FC. Without this guard
+		// either direction of a bijection violation produces
+		// inconsistent runtime state that downstream code
+		// silently disambiguates three different ways:
+		//
+		//   * `resolve_cos_queue_idx` returns the first match by
+		//     queue_id, so packets for an ambiguous queue go to
+		//     whichever duplicate the scheduler-map produced
+		//     first.
+		//   * The shared-queue lease derives its rate from a
+		//     separate path, which can land on yet another value.
+		//   * `show class-of-service interface` displays one
+		//     entry's FC name alongside a different entry's rate
+		//     — a debugger-hostile mismatch on live output.
+		//
+		// Both directions are rejected:
+		//
+		//   * queue N → two different FCs (`queue 5 iperf-b`
+		//     followed by `queue 5 iperf-c`) surfaced during the
+		//     #785 investigation; the scheduler-map would attach
+		//     both schedulers to queue 5 at conflicting rates.
+		//   * FC X → two different queue numbers (`queue 4 iperf-a`
+		//     followed by `queue 5 iperf-a`) — the second silently
+		//     overwrote `ForwardingClasses[X].Queue`, leaving any
+		//     `classifier`/`scheduler-map` reference to FC X
+		//     resolving to the wrong queue at runtime.
+		//     (Flagged by Codex review of PR #787; can arise from
+		//     `apply-groups` / `${node}` expansion producing
+		//     unintended duplicate entries in a user's config.)
+		//
+		// Idempotent reassignment of the SAME FC to the SAME
+		// queue is explicitly allowed so `load merge` /
+		// `load override` paths that re-apply the same line
+		// remain clean.
+		queueOwner := make(map[int]string) // queue_id → FC name
+		fcQueue := make(map[string]int)    // FC name → queue_id
 		for _, queueNode := range fcNode.FindChildren("queue") {
 			if len(queueNode.Keys) < 3 {
 				continue
@@ -41,6 +87,30 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 				continue
 			}
 			name := queueNode.Keys[2]
+			if existing, claimed := queueOwner[queue]; claimed && existing != name {
+				return fmt.Errorf(
+					"class-of-service forwarding-classes queue %d: "+
+						"forwarding-class %q conflicts with %q "+
+						"(a queue can only be owned by one "+
+						"forwarding-class; schedulers attach to an "+
+						"FC, so two FCs on one queue give the queue "+
+						"two conflicting scheduler rates)",
+					queue, name, existing,
+				)
+			}
+			if existingQueue, claimed := fcQueue[name]; claimed && existingQueue != queue {
+				return fmt.Errorf(
+					"class-of-service forwarding-classes "+
+						"forwarding-class %q: queue %d conflicts with "+
+						"queue %d (an FC can only be assigned to one "+
+						"queue; classifier and scheduler-map "+
+						"references to %q would otherwise resolve to "+
+						"different queues depending on evaluation order)",
+					name, queue, existingQueue, name,
+				)
+			}
+			queueOwner[queue] = name
+			fcQueue[name] = queue
 			cos.ForwardingClasses[name] = &CoSForwardingClass{
 				Name:  name,
 				Queue: queue,
