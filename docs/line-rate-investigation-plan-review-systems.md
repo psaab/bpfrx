@@ -1,5 +1,8 @@
 # Line-rate investigation plan — systems / OS review
 
+**ROUND 3: plan-ready YES from systems angle** (tip `dd6234b7`).
+
+
 Reviewer focus: OS, driver, NIC, syscall, affinity, cache. Codex is
 handling plan-structure / architecture. No duplicate findings.
 
@@ -185,3 +188,52 @@ Round-2 new findings:
 Plan-ready: **YES with R2-1 and R2-3 folded in** (both one-line
 edits in Step 3). Zero-code gates in Step 0 remain the correct
 first action.
+
+---
+
+ROUND 3: plan-ready YES from systems angle (with one residual nit).
+
+## Round 3 verification
+
+Revision tip `dd6234b7`. Plan now 781 lines.
+
+- **R2-1 dual ping size** (lines 409-416): RESOLVED. Two pinned
+  `taskset -c` ping procs, `-s 56` and `-s 1400`, full window,
+  separate p50/p99 per size land in capture. Rollback gate
+  (lines 575-579) applied independently to each p99.
+- **R2-2 `ss -ti` cadence** (lines 420-425): RESOLVED. Explicit
+  "every 5 s for full window, capture ALL flows, port-filtered to
+  iperf3". Stronger than a sample.
+- **R2-3 `perf stat` scope** (lines 426-435): RESOLVED.
+  `perf stat --per-thread -p $WORKER_PIDS` with
+  `WORKER_PIDS=$(pgrep -f xpf-userspace-dp)`, explicit
+  "NOT system-wide" rationale.
+
+Round-3 angles:
+- **Proxy semantics** (lines 674-706): `rx_fill_ring_empty_descs`
+  vs `fill_batch_starved`, and `outstanding_tx` vs
+  `completion_reap_max_batch` are explicitly NOT claimed equivalent.
+  Phase C start forces (a) document proxy OR (b) land one-commit
+  instrumentation PR. Row marked `DEFERRED-INSTRUMENTATION` until
+  decided. Well-handled.
+- **R3-1 LOW — IRQ → queue correlation method underspecified.**
+  Step 0.1 reads `smp_affinity_list` and greps `mlx5` from
+  `/proc/interrupts`, but mlx5 IRQ names encode queue as
+  `mlx5_comp<N>@pci:<bdf>` — the plan never pins the parser
+  (e.g. "IRQ line whose name matches `mlx5_comp<queue>@` for the
+  BDF of `ge-0-0-1`"). On a multi-NIC box, grep mlx5 matches all
+  PFs/VFs. Add one sentence in Step 0.1:
+  `grep -E "mlx5_comp[0-9]+@pci:$(basename $(readlink /sys/class/net/<iface>/device))"`
+  to scope to the right PF. Non-blocking; a one-line fix.
+- **S-7 (C-states) promotion.** Still LOW. For a time-bounded
+  investigation, if Bzy_MHz scales down during runs it invalidates
+  every throughput number silently. Worth promoting to a Step 0
+  gate (require `performance` governor + `intel_idle.max_cstate=1`
+  or `processor.max_cstate=1` kernel arg; `turbostat` verifies),
+  NOT just a Step 0.5 diagnostic. Recommend promote to MEDIUM gate
+  before Phase A tuning starts — otherwise governor-induced noise
+  will show up as phantom regressions in the 5-run deltas.
+
+Both round-3 findings are diagnostic improvements, not blockers.
+Plan-ready from systems angle: **YES**. Proceed with Phase C
+pre-work (instrumentation decision) then Step 0 gates.
