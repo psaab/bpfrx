@@ -85,3 +85,11 @@ closes the CoV gap without any Rust / dataplane code change. Ship.
 D1' is the path to reliably meeting the target, but it's larger
 work (multiple architectural constraints surfaced during six agent
 iterations on branch `pr/785-d1-flow-worker-lb`).
+
+## Errata
+
+The commit body for `ef92b448` cites a median CoV of "39.5 %". The
+correct median of the fresh 5-run, sorted
+`[19.2, 37.2, 38.8, 48.4, 63.2]`, is **38.8 %** (the third element).
+The "39.5" figure was an interim mean of runs 2 and 3 and does not
+match any statistic in this document. The doc tables are authoritative.
