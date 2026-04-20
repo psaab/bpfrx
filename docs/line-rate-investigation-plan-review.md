@@ -51,3 +51,13 @@ FAIL. The latency probe is only `ping -i 0.01 <dst>` or `sockperf` on "the same 
 
 ### Round-2 #7
 FAIL. Ring-quadruple material is split across Step 0.4 and Step 5, and authoritative overflow evidence is only recoverable by combining Step 1/H-FWD-1 userspace counters such as `dbg_tx_ring_full` and `pending_tx_local_overflow_drops`; there is no single canonical audit section. Plan lines 224-230, 250-255, 261-264, 308-318.
+
+## Round 3 verification
+**#4** CLOSED. Step 0 says "per-item checklist"; table columns are `Observed | Expected | Status`, with "`X of N Step-0 audit items PASS`."
+**#5** CLOSED. CoV gate requires BOTH "`> 2 × stddev(pre-CoV)`" and "`> 3 percentage points`."
+**#6** CLOSED. Step 3 names source/target, isolated CPUs, dual sizes, and small/large p50/p99; rollback adds "`> 20 µs`."
+**#7** CLOSED. Step 0.4 is the "ONE canonical ring-inspection section"; Step 5 is "deltas only."
+**#5(new)** OPEN. Both counters say "Decision: captured at the start of Phase C"; no per-counter pre-Phase-B proxy/instrumentation call is made.
+**#6(new)** OPEN. The protocol says "compute mean and stddev across the 5 pre-change runs" but never says sample or population.
+**#7(new)** CLOSED. Step 0 says "Any FAIL" is addressed "BEFORE any dataplane investigation proceeds"; no investigation beyond Step 0 begins until fixed/deferred.
+ROUND 3: plan-ready NO — open: #5(new), #6(new)
