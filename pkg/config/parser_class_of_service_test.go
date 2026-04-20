@@ -533,3 +533,100 @@ system {
 		t.Fatalf("expected queue range warning, got: %s", warnings)
 	}
 }
+
+// TestCompileClassOfServiceRejectsDuplicateFCPerQueue pins the validation
+// added for the #785 follow-up: two forwarding classes assigned to the
+// same queue ID must cause `CompileConfig` to return an error, not a
+// silent warning.
+//
+// Before the fix, a config like the one below silently compiled into two
+// CoSQueueConfig entries sharing `queue_id=5` with different transmit
+// rates, which the userspace dataplane then resolved inconsistently
+// across three code paths (runtime queue transmit_rate, shared-lease
+// rate, and display) — the discovery that pre-empted the #785 cross-
+// worker investigation's throughput-vs-fairness analysis. Rejection at
+// compile time prevents the inconsistency from ever reaching the
+// dataplane.
+func TestCompileClassOfServiceRejectsDuplicateFCPerQueue(t *testing.T) {
+	lines := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service forwarding-classes queue 5 iperf-b",
+		"set class-of-service forwarding-classes queue 5 iperf-c", // conflict
+		"set class-of-service schedulers scheduler-iperf-b transmit-rate 10g",
+		"set class-of-service schedulers scheduler-iperf-b transmit-rate exact",
+		"set class-of-service schedulers scheduler-iperf-c transmit-rate 25g",
+		"set class-of-service schedulers scheduler-iperf-c transmit-rate exact",
+		"set class-of-service scheduler-maps bandwidth-limit forwarding-class iperf-b scheduler scheduler-iperf-b",
+		"set class-of-service scheduler-maps bandwidth-limit forwarding-class iperf-c scheduler scheduler-iperf-c",
+		"set class-of-service interfaces reth0 unit 80 shaping-rate 25g",
+		"set class-of-service interfaces reth0 unit 80 scheduler-map bandwidth-limit",
+		"set system dataplane-type userspace",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal(
+			"expected CompileConfig to REJECT a config with two " +
+				"forwarding-classes on the same queue; got no error. " +
+				"Regression re-introduces the three-way runtime " +
+				"inconsistency that bit the #785 investigation.",
+		)
+	}
+	msg := err.Error()
+	// The error must name the offending queue and BOTH FCs so the
+	// operator can fix the config without having to diff the whole
+	// forwarding-classes block.
+	if !strings.Contains(msg, "queue 5") {
+		t.Errorf("error message must identify the conflicting queue ID 5, got: %s", msg)
+	}
+	if !strings.Contains(msg, "iperf-b") {
+		t.Errorf("error message must identify first FC iperf-b, got: %s", msg)
+	}
+	if !strings.Contains(msg, "iperf-c") {
+		t.Errorf("error message must identify second FC iperf-c, got: %s", msg)
+	}
+}
+
+// TestCompileClassOfServiceAllowsIdempotentReassignment pins that
+// setting the SAME FC-to-queue mapping twice does NOT produce an
+// error — reconciliation paths (e.g. `load merge`, `load override`,
+// or applying a set script that re-runs the same assignment) must
+// remain idempotent.
+func TestCompileClassOfServiceAllowsIdempotentReassignment(t *testing.T) {
+	lines := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service forwarding-classes queue 5 iperf-c",
+		"set class-of-service forwarding-classes queue 5 iperf-c", // same, not duplicate
+		"set system dataplane-type userspace",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("idempotent reassignment must compile cleanly: %v", err)
+	}
+	fc := cfg.ClassOfService.ForwardingClasses["iperf-c"]
+	if fc == nil {
+		t.Fatal("expected iperf-c forwarding class")
+	}
+	if fc.Queue != 5 {
+		t.Fatalf("iperf-c queue = %d, want 5", fc.Queue)
+	}
+}

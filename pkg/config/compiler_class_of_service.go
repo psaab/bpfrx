@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -32,6 +33,34 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 	}
 
 	if fcNode := node.FindChild("forwarding-classes"); fcNode != nil {
+		// Track which FC owns each queue so we can reject
+		// duplicate-FC-per-queue configs with a clear error.
+		//
+		// Junos semantics give each queue ID one forwarding class
+		// (schedulers attach to an FC, so two FCs with different
+		// schedulers on the same queue contradict each other on
+		// rate). The userspace dataplane's compile path
+		// (forwarding_build.rs) iterates the scheduler-map and
+		// creates ONE CoSQueueConfig per FC; when two FCs map to
+		// the same queue_id the result is two runtime entries
+		// that share queue_id but carry different transmit rates
+		// and forwarding-class names. Downstream:
+		//
+		//   * `resolve_cos_queue_idx` returns the first match by
+		//     queue_id, so packets go to one of the two duplicates
+		//     at random (depends on scheduler-map iteration order).
+		//   * The shared-queue lease gets its rate from yet
+		//     another code path, so the live shaper rate can be a
+		//     third value distinct from both queue entries.
+		//   * `show class-of-service interface` displays one
+		//     forwarding-class name alongside a rate that belongs
+		//     to the OTHER FC on the same queue — a
+		//     debugger-hostile mismatch.
+		//
+		// Surfaced during #785 investigation when a user config
+		// mapped iperf-b (scheduler 10g) AND iperf-c (scheduler
+		// 25g) to queue 5 simultaneously.
+		queueOwner := make(map[int]string)
 		for _, queueNode := range fcNode.FindChildren("queue") {
 			if len(queueNode.Keys) < 3 {
 				continue
@@ -41,6 +70,18 @@ func compileClassOfService(node *Node, cos *ClassOfServiceConfig) error {
 				continue
 			}
 			name := queueNode.Keys[2]
+			if existing, claimed := queueOwner[queue]; claimed && existing != name {
+				return fmt.Errorf(
+					"class-of-service forwarding-classes queue %d: "+
+						"forwarding-class %q conflicts with %q "+
+						"(a queue can only be owned by one "+
+						"forwarding-class; schedulers attach to an "+
+						"FC, so two FCs on one queue give the queue "+
+						"two conflicting scheduler rates)",
+					queue, name, existing,
+				)
+			}
+			queueOwner[queue] = name
 			cos.ForwardingClasses[name] = &CoSForwardingClass{
 				Name:  name,
 				Queue: queue,
