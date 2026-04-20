@@ -35,7 +35,18 @@ type pciNIC struct {
 //
 //	idx 0 → fxp0, idx 1 → em0, idx 2+ → ge-{FPC}-0-{idx-2}
 //	FPC = 0 for node 0, FPC = 7 for node 1
-func enumerateAndRenameInterfaces(nodeID int, clusterMode bool) error {
+//
+// userspaceWorkers is the userspace-dp worker count from the active
+// config (0 if userspace dataplane is not configured). Used by D3 RSS
+// indirection to constrain mlx5 RSS to queues 0..workers-1 before any
+// AF_XDP socket binds.
+// rssEnabled is the operator kill switch for D3 (#797 review feedback);
+// false skips D3 entirely even when userspace-dp has multiple workers.
+// rssAllowedInterfaces is the authoritative set of Linux interface
+// names that userspace-dp will bind AF_XDP on; D3 only touches
+// interfaces in that set (Codex H1 — prevents ethtool from reshaping
+// sibling mlx5 PFs or non-userspace-dp netdevs).
+func enumerateAndRenameInterfaces(nodeID int, clusterMode bool, userspaceWorkers int, rssEnabled bool, rssAllowedInterfaces []string) error {
 	nics, err := enumeratePCINICs()
 	if err != nil {
 		return fmt.Errorf("enumerate NICs: %w", err)
@@ -91,7 +102,34 @@ func enumerateAndRenameInterfaces(nodeID int, clusterMode bool) error {
 	} else {
 		slog.Info("linksetup: interface naming unchanged")
 	}
+
+	// D3 (#785): constrain mlx5 RSS indirection to queues 0..workers-1
+	// on every mlx5_core interface that userspace-dp will bind on.
+	// Must run strictly before any AF_XDP bind — that ordering is
+	// structurally guaranteed because the dataplane is loaded later in
+	// daemon.Run(). The allowlist was derived from the compiled
+	// userspace-dp binding plan (Codex H1) so we never touch sibling
+	// mlx5 PFs that xpf is not driving.
+	applyRSSIndirection(rssEnabled, userspaceWorkers, rssAllowedInterfaces, realRSSExecutor{})
 	return nil
+}
+
+// reapplyRSSIndirection re-runs D3 on an already-renamed firewall. Called
+// from the daemon reconcile path on every applyConfig, so worker-count
+// changes and the enable/disable knob both take effect without a restart.
+// Safe to invoke repeatedly: applyRSSIndirection is idempotent (matching
+// tables skip the write) and per-interface driver-filtered.
+// allowedInterfaces is the userspace-dp binding allowlist; see
+// applyRSSIndirection for semantics.
+func reapplyRSSIndirection(rssEnabled bool, userspaceWorkers int, allowedInterfaces []string) {
+	reapplyRSSIndirectionWith(rssEnabled, userspaceWorkers, allowedInterfaces, realRSSExecutor{})
+}
+
+// reapplyRSSIndirectionWith is the injectable variant used by tests so
+// the end-to-end commit→reapply→ethtool pipeline can be asserted without
+// touching real sysfs.
+func reapplyRSSIndirectionWith(rssEnabled bool, userspaceWorkers int, allowedInterfaces []string, execer rssExecutor) {
+	applyRSSIndirection(rssEnabled, userspaceWorkers, allowedInterfaces, execer)
 }
 
 // enumeratePCINICs discovers all PCI network interfaces via sysfs, sorted
