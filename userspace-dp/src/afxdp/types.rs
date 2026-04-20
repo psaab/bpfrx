@@ -961,6 +961,20 @@ pub(super) struct CoSQueueRuntime {
     pub(super) transmit_rate_bytes: u64,
     pub(super) exact: bool,
     pub(super) flow_fair: bool,
+    /// #785: cached shadow of `WorkerCoSQueueFastPath.shared_exact`
+    /// populated by `promote_cos_queue_flow_fair`. Under the current
+    /// promotion policy (`flow_fair = queue.exact && !shared_exact`),
+    /// shared_exact queues are NOT on the flow-fair path — they stay
+    /// on the single-FIFO-per-worker drain with no SFQ DRR ordering.
+    /// The shadow exists so future cross-worker fairness work
+    /// (tracked in issue #786) can branch on it.
+    ///
+    /// Keeping the field on the queue runtime makes the policy bit
+    /// available to hot-path helpers directly from
+    /// `&CoSQueueRuntime`, so current and future branching does not
+    /// have to thread extra interface state through admission-path
+    /// call sites or add an iface_fast lookup there.
+    pub(super) shared_exact: bool,
     // Per-queue hash salt mixed into `exact_cos_flow_bucket()` so the SFQ
     // bucket mapping is not an externally-probeable pure function of the
     // 5-tuple. Drawn from getrandom(2) exactly when a queue is promoted

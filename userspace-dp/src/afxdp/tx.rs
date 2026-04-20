@@ -3679,8 +3679,20 @@ pub(super) fn cos_flow_hash_seed_from_os() -> u64 {
         // to the fallback rather than spinning.
         break;
     }
+    // Production invariant (#785 Copilot review): never return 0.
+    // Zero is a valid getrandom output (probability 2^-64 per call,
+    // but across a fleet of daemons × per-binding promotions it DOES
+    // occur), and a zero seed turns the SFQ hash mapping into a pure
+    // function of the 5-tuple — externally probeable, and identical
+    // across all bindings on all nodes, which collapses SFQ bucket
+    // diversity to zero. The `assert_ne!(flow_hash_seed, 0)` test
+    // downstream depends on this invariant and would otherwise be
+    // theoretically flaky. One in 2^64 getrandom reads gets OR'd
+    // with 1 — indistinguishable from the raw entropy for any
+    // downstream use.
+    let nonzero = |v: u64| if v == 0 { 1 } else { v };
     if filled == buf.len() {
-        return u64::from_ne_bytes(buf);
+        return nonzero(u64::from_ne_bytes(buf));
     }
 
     let mut ts = libc::timespec {
@@ -3702,7 +3714,7 @@ pub(super) fn cos_flow_hash_seed_from_os() -> u64 {
     let mut fallback = now ^ pid.wrapping_mul(0x9e3779b97f4a7c15);
     mix_cos_flow_bucket(&mut fallback, now.rotate_left(17));
     mix_cos_flow_bucket(&mut fallback, stack_addr.rotate_left(31));
-    fallback
+    nonzero(fallback)
 }
 
 // #711: returns `u16` (was `u8`). With `COS_FLOW_FAIR_BUCKETS = 1024`
@@ -4700,24 +4712,120 @@ fn ensure_cos_interface_runtime(
     {
         let mut runtime = build_cos_interface_runtime(config, now_ns);
         if let Some(iface_fast) = binding.cos_fast_interfaces.get(&egress_ifindex) {
-            for (queue, queue_fast) in runtime.queues.iter_mut().zip(&iface_fast.queue_fast_path) {
-                queue.flow_fair = queue.exact && !queue_fast.shared_exact;
-                // Draw the SFQ salt only for queues that actually use the
-                // flow-fair path. Non-flow-fair queues do not consult the
-                // seed (exact_cos_flow_bucket is only called from the
-                // flow-fair callers), so issuing a getrandom syscall for
-                // them would be wasted work. Keeping them at seed=0 also
-                // preserves byte-identical legacy behavior on that path.
-                if queue.flow_fair {
-                    queue.flow_hash_seed = cos_flow_hash_seed_from_os();
-                }
-            }
+            apply_cos_queue_flow_fair_promotion(&mut runtime, &iface_fast.queue_fast_path);
         }
         binding.cos_interfaces.insert(egress_ifindex, runtime);
         binding.cos_interface_order.push(egress_ifindex);
         binding.cos_interface_order.sort_unstable();
     }
     true
+}
+
+/// Promote every queue on a freshly-built `CoSInterfaceRuntime` onto
+/// (or off) the SFQ (flow-fair) path, using the per-queue
+/// `WorkerCoSQueueFastPath.shared_exact` signal as the gate. This is
+/// the whole-runtime entry point — `ensure_cos_interface_runtime`
+/// calls it exactly once after `build_cos_interface_runtime`. The
+/// zip alignment between `runtime.queues` and
+/// `iface_fast.queue_fast_path` is load-bearing: both vectors are
+/// built by iterating the same `CoSInterfaceConfig.queues` slice in
+/// order (`build_cos_interface_runtime` → `CoSQueueRuntime`,
+/// `build_worker_cos_fast_interfaces` → `WorkerCoSQueueFastPath`),
+/// so position N in one always corresponds to position N in the
+/// other.  Passing both vectors through this helper — rather than
+/// inlining the `zip` at the call site — lets the integration test
+/// drive the exact production promotion path with hand-authored
+/// fast-path state, pinning the zip + per-queue gate end-to-end.
+///
+/// See `promote_cos_queue_flow_fair` below for the per-queue policy
+/// rationale, and the `#785` test block for the pins that guard this
+/// surface against silent regressions.
+#[inline]
+fn apply_cos_queue_flow_fair_promotion(
+    runtime: &mut CoSInterfaceRuntime,
+    queue_fast_path: &[WorkerCoSQueueFastPath],
+) {
+    for (queue, queue_fast) in runtime.queues.iter_mut().zip(queue_fast_path) {
+        promote_cos_queue_flow_fair(queue, queue_fast);
+    }
+}
+
+/// Promote a freshly-built queue runtime onto the SFQ (flow-fair)
+/// path when its configuration warrants it, and cache the
+/// `shared_exact` signal onto the runtime so future work on this
+/// surface can branch on it without another iface_fast lookup.
+///
+/// **Current policy:** `flow_fair = queue.exact && !shared_exact`.
+/// Only the owner-local-exact path runs SFQ today; shared_exact
+/// (high-rate, >= `COS_SHARED_EXACT_MIN_RATE_BYTES` = 2.5 Gbps)
+/// queues stay on the single-FIFO-per-worker drain.
+///
+/// **Why shared_exact is held back (issue #785):** two attempts
+/// have been made to enable SFQ on shared_exact queues and both
+/// were rolled back after empirical regression:
+///
+/// 1. Naïve flip (flow_fair=queue.exact, no admission change).
+///    iperf3 -P 12 on the 25 Gbps iperf-c cap regressed from
+///    22.3 Gbps / 0 retrans to 16.3 Gbps / 25 k+ retrans. Root
+///    cause: the per-flow share cap (`cos_queue_flow_share_limit`
+///    → floor `COS_FLOW_FAIR_MIN_SHARE_BYTES` = 24 KB) and the
+///    per-flow ECN arm (`apply_cos_admission_ecn_policy`) are
+///    rate-unaware; on a 25 Gbps queue with 12 flows the per-flow
+///    cap collapses to ~24 KB, far below the ~5 MB BDP a
+///    2 Gbps / 20 ms TCP flow needs, so admission drops and ECN
+///    marks fired on nearly every packet.
+///
+/// 2. SFQ + aggregate-only admission (flow_fair=queue.exact;
+///    `cos_queue_flow_share_limit` returns `buffer_limit` on
+///    shared_exact; `apply_cos_admission_ecn_policy` uses the
+///    aggregate arm on shared_exact). Throughput preserved
+///    (22-23 Gbps) but per-flow CoV went UP from ~33 % to
+///    ~40-51 % over three runs. Root cause: per-worker SFQ DRR
+///    cannot equalise flows that are distributed unevenly across
+///    workers by NIC RSS — which is the dominant imbalance source
+///    at P=12 / 8 workers. The SFQ cycle also appears to cost
+///    batch-drain efficiency on the high-rate path (a tangible
+///    but unquantified secondary effect).
+///
+/// The architecturally-correct lever is cross-worker flow steering
+/// (or a single shared-SFQ across all workers), not within-worker
+/// SFQ. Follow-up issue tracks that work. Do not flip this gate
+/// again without landing the cross-worker fairness mechanism first
+/// and validating `iperf3 -P 12 -p 5203` at 25 Gbps produces
+/// SUM ≥ 22 Gbps AND per-flow CoV ≤ 20 %.
+///
+/// **Contract shape:** `queue_fast: &WorkerCoSQueueFastPath` is the
+/// live classifier output from `build_worker_cos_fast_interfaces`,
+/// i.e. the exact same field the service path (`drain_shaped_tx`,
+/// `try_drain_shared_exact`, etc.) consults. Taking the reference
+/// directly rather than a loose `bool` pins the contract to the
+/// same struct shape production uses: tests exercise the same
+/// `WorkerCoSQueueFastPath` contract rather than an unrelated
+/// standalone flag, so any future addition of fields to the
+/// fast-path struct (e.g. a `min_local_flow_count` guarantee for
+/// the cross-worker DRR work) is automatically visible here.
+///
+/// **Adversarial review posture (campaign #775 / issue #785):**
+/// reviewers MUST reject PRs that drop the `!shared_exact` clause
+/// without also landing a cross-worker fairness mechanism AND
+/// re-validating the CoV target. The `shared_exact` shadow cached
+/// onto `CoSQueueRuntime` is the hook a future fix will branch on.
+///
+/// The SFQ salt is drawn only for queues that actually use the
+/// flow-fair path — non-flow-fair queues never consult the seed
+/// (`exact_cos_flow_bucket` is only called from the flow-fair
+/// callers). Keeping them at seed=0 also preserves byte-identical
+/// legacy behavior on that path.
+#[inline]
+fn promote_cos_queue_flow_fair(
+    queue: &mut CoSQueueRuntime,
+    queue_fast: &WorkerCoSQueueFastPath,
+) {
+    queue.shared_exact = queue_fast.shared_exact;
+    queue.flow_fair = queue.exact && !queue_fast.shared_exact;
+    if queue.flow_fair {
+        queue.flow_hash_seed = cos_flow_hash_seed_from_os();
+    }
 }
 
 fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSInterfaceRuntime {
@@ -4747,6 +4855,9 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 transmit_rate_bytes: queue.transmit_rate_bytes,
                 exact: queue.exact,
                 flow_fair: false,
+                // Populated by `promote_cos_queue_flow_fair` from the
+                // live `WorkerCoSQueueFastPath.shared_exact` signal.
+                shared_exact: false,
                 // Zero until `ensure_cos_interface_runtime` promotes a queue
                 // onto the flow-fair path and draws a real seed. On the
                 // non-flow-fair path this field is never read.
@@ -11181,6 +11292,7 @@ mod tests {
             transmit_rate_bytes: 11_000_000_000 / 8,
             exact: true,
             flow_fair: false,
+            shared_exact: false,
             flow_hash_seed: 0,
             surplus_weight: 1,
             surplus_deficit: 0,
@@ -11220,6 +11332,7 @@ mod tests {
             transmit_rate_bytes: 11_000_000_000 / 8,
             exact: true,
             flow_fair: false,
+            shared_exact: false,
             flow_hash_seed: 0,
             surplus_weight: 1,
             surplus_deficit: 0,
@@ -11270,6 +11383,7 @@ mod tests {
             transmit_rate_bytes: 11_000_000_000 / 8,
             exact: true,
             flow_fair: false,
+            shared_exact: false,
             flow_hash_seed: 0,
             surplus_weight: 1,
             surplus_deficit: 0,
@@ -12382,6 +12496,307 @@ mod tests {
         assert!(marked);
         let after = snapshot_counters(queue);
         assert_eq!(after.admission_ecn_marked, before.admission_ecn_marked + 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // #785 SFQ promotion. `ensure_cos_interface_runtime` calls
+    // `apply_cos_queue_flow_fair_promotion` on a freshly-built
+    // `CoSInterfaceRuntime`, which in turn calls
+    // `promote_cos_queue_flow_fair` per queue.
+    //
+    // Current policy:
+    //   * SFQ (flow-fair) runs on owner-local-exact queues only.
+    //   * Shared_exact (>= `COS_SHARED_EXACT_MIN_RATE_BYTES` =
+    //     2.5 Gbps) queues stay on the single-FIFO-per-worker drain.
+    //   * `promote_cos_queue_flow_fair` caches the live
+    //     `WorkerCoSQueueFastPath.shared_exact` bit onto the runtime
+    //     as `CoSQueueRuntime.shared_exact` so the admission hot
+    //     paths (or future cross-worker fairness work) can branch
+    //     on it without another iface_fast lookup.
+    //
+    // Why shared_exact is held back: issue #785 tried two paths to
+    // land SFQ on the high-rate service path. Both regressed and
+    // were rolled back:
+    //
+    //   1. Naïve SFQ (flow_fair=queue.exact, no admission change).
+    //      iperf3 -P 12 on the 25 Gbps iperf-c cap regressed from
+    //      22.3 Gbps / 0 retrans to 16.3 Gbps / 25k+ retrans. Root
+    //      cause: per-flow share cap + per-flow ECN arm are
+    //      rate-unaware (24 KB floor); on 25 Gbps / 12 flows that
+    //      is ≪ 5 MB BDP so admission drops and ECN fire on every
+    //      packet.
+    //
+    //   2. SFQ + aggregate-only admission on shared_exact. Throughput
+    //      preserved (22-23 Gbps) but per-flow CoV went UP from
+    //      ~33 % to ~40-51 % over three runs. Per-worker SFQ cannot
+    //      equalise flows distributed unevenly across workers by NIC
+    //      RSS — which is the dominant imbalance source at P=12.
+    //
+    // The architecturally-correct lever is cross-worker flow
+    // steering (or a single shared SFQ across workers), tracked in
+    // the follow-up issue.
+    //
+    // Adversarial review posture (campaign #775 / issue #785):
+    // reviewers MUST reject PRs that drop the `!shared_exact` clause
+    // from `promote_cos_queue_flow_fair` without also landing a
+    // cross-worker fairness mechanism AND re-validating
+    // `iperf3 -P 12 -p 5203` at 25 Gbps (expect SUM ≥ 22 Gbps AND
+    // per-flow CoV ≤ 20 %). The tests below drive the full
+    // production promotion path (via
+    // `apply_cos_queue_flow_fair_promotion` with hand-authored
+    // `WorkerCoSQueueFastPath` vectors) so breaking the zip alignment
+    // at the `ensure_cos_interface_runtime` call site — or feeding
+    // the wrong `shared_exact` bit — is caught.
+    // ---------------------------------------------------------------------
+
+    /// Build a `WorkerCoSQueueFastPath` shaped like
+    /// `build_worker_cos_fast_interfaces` would build it for a queue
+    /// with the given `shared_exact` bit. Only the fields the
+    /// promotion path consults are populated — the rest stay at the
+    /// stable defaults the live builder uses when no lease or owner
+    /// live state is present.
+    fn test_queue_fast_path_for_promotion(shared_exact: bool) -> WorkerCoSQueueFastPath {
+        WorkerCoSQueueFastPath {
+            shared_exact,
+            owner_worker_id: 0,
+            owner_live: None,
+            shared_queue_lease: None,
+        }
+    }
+
+    /// Pin that a high-rate exact queue (shared_exact=true) is NOT
+    /// promoted onto the SFQ path BUT DOES have its `shared_exact`
+    /// shadow cached onto the runtime. The shadow is the hook a
+    /// future cross-worker fairness mechanism will branch on.
+    ///
+    /// Rationale: two empirical rollbacks (see module comment).
+    /// Measured regressions that this pin exists to prevent:
+    ///   * Naïve flip: 22.3 → 16.3 Gbps + 25k retrans on iperf3 -P 12
+    ///     at 25 Gbps.
+    ///   * SFQ + aggregate admission: 22-23 Gbps preserved but CoV
+    ///     went from ~33 % to ~40-51 %.
+    ///
+    /// Do not "fix" this test by flipping the flow_fair expectation
+    /// — land the cross-worker fairness mechanism first, re-validate
+    /// with `iperf3 -P 12 -p 5203` at 25 Gbps (SUM ≥ 22 Gbps AND
+    /// CoV ≤ 20 %), THEN update this pin.
+    #[test]
+    fn queue_flow_fair_disabled_on_shared_exact() {
+        use super::super::worker::COS_SHARED_EXACT_MIN_RATE_BYTES;
+
+        let high_rate_bytes = 25_000_000_000u64 / 8;
+        assert!(
+            high_rate_bytes >= COS_SHARED_EXACT_MIN_RATE_BYTES,
+            "fixture must be above the shared_exact threshold or the \
+             test does not exercise the regression surface",
+        );
+
+        let mut runtime = test_cos_runtime_with_queues(
+            100_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 5,
+                forwarding_class: "iperf-c".into(),
+                priority: 5,
+                transmit_rate_bytes: high_rate_bytes,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        assert!(!runtime.queues[0].flow_fair);
+        assert!(!runtime.queues[0].shared_exact);
+
+        // Drive the full ensure_cos_interface_runtime promotion loop.
+        let fast_path = vec![test_queue_fast_path_for_promotion(true)];
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
+
+        assert!(
+            !runtime.queues[0].flow_fair,
+            "#785: shared_exact queue MUST stay off the SFQ path. \
+             Two rollback-measured regressions (see module comment) \
+             prove per-worker SFQ cannot improve per-flow fairness on \
+             a shared service path — and the naïve gate flip \
+             regresses throughput from 22.3 to 16.3 Gbps + 25k retrans.",
+        );
+        assert!(
+            runtime.queues[0].shared_exact,
+            "#785: shared_exact shadow MUST still be cached onto the \
+             runtime — a future cross-worker fairness mechanism will \
+             branch on it, and the promotion helper is the only place \
+             this shadow is populated.",
+        );
+        assert_eq!(
+            runtime.queues[0].flow_hash_seed, 0,
+            "seed draw is conditional on flow_fair being promoted — \
+             must stay at 0 when the gate blocks",
+        );
+    }
+
+    /// Pin that a low-rate exact queue (shared_exact=false) IS
+    /// promoted onto the SFQ path AND has `shared_exact=false` on
+    /// its runtime. The #784 fairness fix on the 1 Gbps iperf-a
+    /// queue depends on BOTH halves: flow_fair=true so DRR orders
+    /// per-flow, and shared_exact=false so the per-flow share cap
+    /// + per-flow ECN arm still run (at 1 Gbps / 12 flows the cap is
+    /// ~24 KB which matches TCP cwnd at 77 Mbps flows cleanly).
+    #[test]
+    fn queue_flow_fair_enabled_on_owner_local_exact() {
+        use super::super::worker::COS_SHARED_EXACT_MIN_RATE_BYTES;
+
+        let low_rate_bytes = 1_000_000_000u64 / 8;
+        assert!(
+            low_rate_bytes < COS_SHARED_EXACT_MIN_RATE_BYTES,
+            "fixture must be below the shared_exact threshold to \
+             exercise the owner-local-exact path",
+        );
+
+        let mut runtime = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: low_rate_bytes,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let fast_path = vec![test_queue_fast_path_for_promotion(false)];
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
+
+        assert!(
+            runtime.queues[0].flow_fair,
+            "owner-local-exact queue MUST be promoted onto the SFQ \
+             path — #784 fairness fix depends on it",
+        );
+        assert!(
+            !runtime.queues[0].shared_exact,
+            "owner-local-exact queue MUST keep shared_exact=false so \
+             the per-flow share cap and per-flow ECN arm continue to \
+             run — #784 depends on the per-flow cap firing at 1 Gbps",
+        );
+        assert_ne!(
+            runtime.queues[0].flow_hash_seed, 0,
+            "seed must be drawn on flow-fair promotion — otherwise \
+             every binding hashes flows identically and one flow's \
+             RSS bucket collides across the whole deployment",
+        );
+    }
+
+    /// Pin that a non-exact (best-effort) queue is NOT promoted onto
+    /// the flow-fair path. SFQ would be wasted work on these queues:
+    /// there is no per-flow rate contract, so per-flow isolation is
+    /// meaningless, and drawing an OS random seed for every
+    /// non-exact queue on every runtime build would add a syscall
+    /// per queue for zero benefit. This pin also doubles as a sanity
+    /// check that the gate did not collapse to
+    /// `queue.flow_fair = true` unconditionally.
+    #[test]
+    fn queue_flow_fair_disabled_on_non_exact() {
+        let mut runtime = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 0,
+                forwarding_class: "best-effort".into(),
+                priority: 3,
+                transmit_rate_bytes: 0,
+                exact: false,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+
+        // Drive the production loop with shared_exact=false first,
+        // then again with shared_exact=true — both MUST leave a
+        // non-exact queue off the flow-fair path, because the gate's
+        // LHS (`queue.exact`) fails regardless of the fast-path bit.
+        let fast_path_owner_local = vec![test_queue_fast_path_for_promotion(false)];
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path_owner_local);
+        assert!(
+            !runtime.queues[0].flow_fair,
+            "non-exact queues must stay off the flow-fair path: SFQ \
+             has no rate contract to enforce there, and draws an OS \
+             random seed per queue",
+        );
+
+        let fast_path_shared = vec![test_queue_fast_path_for_promotion(true)];
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path_shared);
+        assert!(
+            !runtime.queues[0].flow_fair,
+            "non-exact queues must stay off the flow-fair path \
+             regardless of the shared_exact signal",
+        );
+    }
+
+    /// Pin that `apply_cos_queue_flow_fair_promotion` propagates the
+    /// per-queue `shared_exact` bits correctly when the interface
+    /// has a mix of shared_exact and owner-local-exact queues — the
+    /// common production shape (a low-rate iperf-a queue next to a
+    /// high-rate iperf-c queue on the same interface). Breaking the
+    /// zip alignment between `runtime.queues` and
+    /// `iface_fast.queue_fast_path` at the
+    /// `ensure_cos_interface_runtime` call site would swap the two
+    /// queues' `shared_exact` shadows and their `flow_fair` bits,
+    /// silently routing both to the wrong admission branch and
+    /// turning off SFQ on the iperf-a queue (re-breaking #784).
+    #[test]
+    fn apply_promotion_pairs_queues_with_their_fast_path_entries() {
+        let mut runtime = test_cos_runtime_with_queues(
+            100_000_000_000 / 8,
+            vec![
+                CoSQueueConfig {
+                    queue_id: 4,
+                    forwarding_class: "iperf-a".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 1_000_000_000 / 8,
+                    exact: true,
+                    surplus_weight: 1,
+                    buffer_bytes: 128 * 1024,
+                    dscp_rewrite: None,
+                },
+                CoSQueueConfig {
+                    queue_id: 5,
+                    forwarding_class: "iperf-c".into(),
+                    priority: 5,
+                    transmit_rate_bytes: 25_000_000_000 / 8,
+                    exact: true,
+                    surplus_weight: 1,
+                    buffer_bytes: 128 * 1024,
+                    dscp_rewrite: None,
+                },
+            ],
+        );
+
+        // Position 0 -> owner-local-exact; position 1 -> shared_exact.
+        let fast_path = vec![
+            test_queue_fast_path_for_promotion(false),
+            test_queue_fast_path_for_promotion(true),
+        ];
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
+
+        assert!(
+            runtime.queues[0].flow_fair,
+            "queue at position 0 (iperf-a, shared_exact=false) must \
+             reach flow-fair via the owner-local-exact gate",
+        );
+        assert!(
+            !runtime.queues[0].shared_exact,
+            "queue at position 0 must get position-0's shared_exact=false",
+        );
+        assert!(
+            !runtime.queues[1].flow_fair,
+            "queue at position 1 (iperf-c, shared_exact=true) must \
+             stay off flow-fair under current policy",
+        );
+        assert!(
+            runtime.queues[1].shared_exact,
+            "queue at position 1 must get position-1's shared_exact=true \
+             — zip misalignment would silently mis-route admission policy",
+        );
     }
 
     // ---------------------------------------------------------------------
