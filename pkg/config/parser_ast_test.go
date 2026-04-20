@@ -2679,6 +2679,61 @@ func TestUserspaceDataplaneConfig(t *testing.T) {
 	if dp.RingEntries != 2048 {
 		t.Errorf("RingEntries = %d, want 2048", dp.RingEntries)
 	}
+	// Default: omitting rss-indirection leaves RSSIndirectionDisabled at
+	// zero value (false), i.e. D3 enabled. This pins the "safe default"
+	// semantic for the PR #797 kill switch.
+	if dp.RSSIndirectionDisabled {
+		t.Errorf("RSSIndirectionDisabled = true by default, want false")
+	}
+}
+
+// #797 HIGH/MEDIUM: operator must be able to toggle D3 RSS indirection
+// via a first-class config knob. Setting `rss-indirection disable`
+// must compile to RSSIndirectionDisabled=true; `enable` (or anything
+// other than "disable") must leave it false.
+func TestUserspaceDataplaneRSSIndirectionDisable(t *testing.T) {
+	cases := []struct {
+		name    string
+		setLine string
+		want    bool
+	}{
+		{"disable_sets_true", "set system dataplane rss-indirection disable", true},
+		{"enable_leaves_false", "set system dataplane rss-indirection enable", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := &ConfigTree{}
+			base := []string{
+				"set system dataplane-type userspace",
+				"set system dataplane binary /usr/local/bin/xpf-userspace-dp",
+				"set system dataplane control-socket /run/xpf/userspace-dp.sock",
+				"set system dataplane state-file /run/xpf/userspace-dp.json",
+				"set system dataplane workers 4",
+				tc.setLine,
+			}
+			for _, line := range base {
+				path, err := ParseSetCommand(line)
+				if err != nil {
+					t.Fatalf("ParseSetCommand(%q): %v", line, err)
+				}
+				if err := tree.SetPath(path); err != nil {
+					t.Fatalf("SetPath(%v): %v", path, err)
+				}
+			}
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dp := cfg.System.UserspaceDataplane
+			if dp == nil {
+				t.Fatal("UserspaceDataplane is nil")
+			}
+			if dp.RSSIndirectionDisabled != tc.want {
+				t.Fatalf("RSSIndirectionDisabled=%v, want %v",
+					dp.RSSIndirectionDisabled, tc.want)
+			}
+		})
+	}
 }
 
 func TestRIPAuthSetSyntax(t *testing.T) {

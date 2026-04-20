@@ -4,20 +4,25 @@
 //   - mlx5 vs non-mlx5 gating via fake sysfs.
 //   - idempotent skip when the live table already matches.
 //   - graceful skip when ethtool is missing.
+//   - top-level kill-switch via the enabled argument (#797).
+//   - twice-call idempotency on matching state (#797 Go LOW #3).
 //
-// No real NIC is required — ethtool and sysfs access are injected via
-// the rssExecutor interface.
+// No real NIC is required — ethtool, sysfs driver lookup, queue count,
+// and netdev enumeration are all injected via the rssExecutor interface.
 package daemon
 
 import (
 	"errors"
 	"io/fs"
+	"os/exec"
 	"reflect"
 	"testing"
 )
 
 // fakeRSSExecutor records ethtool invocations and replays scripted output.
 type fakeRSSExecutor struct {
+	// Interfaces visible to the sysfs scan. Order preserved as returned.
+	ifaces []string
 	// Per-iface driver name. Missing key → non-PCI / unknown; treated
 	// as empty string (skip).
 	drivers map[string]string
@@ -25,8 +30,6 @@ type fakeRSSExecutor struct {
 	queues map[string]int
 	// Scripted ethtool -x <iface> output for idempotency probe.
 	ethtoolX map[string][]byte
-	// Simulate ethtool missing on -X path for this set of ifaces.
-	ethtoolXFailNotFound map[string]bool
 	// Recorded argvs, in call order. `{"-X", "eth0", "weight", "1", "1", "0", "0"}`, etc.
 	calls [][]string
 }
@@ -39,13 +42,9 @@ func (f *fakeRSSExecutor) runEthtool(args ...string) ([]byte, error) {
 		if out, ok := f.ethtoolX[args[1]]; ok {
 			return out, nil
 		}
-		return nil, &fs.PathError{Op: "exec", Path: "ethtool", Err: errors.New("executable file not found in $PATH")}
-	}
-	if len(args) >= 2 && args[0] == "-X" {
-		if f.ethtoolXFailNotFound[args[1]] {
-			return nil, &fs.PathError{Op: "exec", Path: "ethtool", Err: errors.New("executable file not found in $PATH")}
-		}
-		return nil, nil
+		// Wrap exec.ErrNotFound so errors.Is detects it — mirrors the
+		// real *exec.Error shape returned by os/exec.
+		return nil, &exec.Error{Name: "ethtool", Err: exec.ErrNotFound}
 	}
 	return nil, nil
 }
@@ -56,6 +55,10 @@ func (f *fakeRSSExecutor) readDriver(iface string) string {
 
 func (f *fakeRSSExecutor) readQueueCount(iface string) int {
 	return f.queues[iface]
+}
+
+func (f *fakeRSSExecutor) listInterfaces() []string {
+	return f.ifaces
 }
 
 func TestComputeWeightVector_WorkersOne_Skips(t *testing.T) {
@@ -183,25 +186,60 @@ func TestApplyRSSIndirectionOne_MatchingTable_SkipsWrite(t *testing.T) {
 	}
 }
 
-// Non-mlx5 driver → no ethtool invocation at all.
+// Go MEDIUM #2 + #3: Non-mlx5 driver must short-circuit at the top-level
+// scan, with no ethtool invocation at all. The test now actually calls
+// applyRSSIndirection with a fake that owns both the interface list and
+// the driver map — the driver guard is exercised for real.
 func TestApplyRSSIndirection_NonMlx_Skips(t *testing.T) {
 	f := &fakeRSSExecutor{
-		drivers: map[string]string{"eth0": "virtio_net"},
-		queues:  map[string]int{"eth0": 4},
+		ifaces:  []string{"eth0", "eth1"},
+		drivers: map[string]string{"eth0": "virtio_net", "eth1": "iavf"},
+		queues:  map[string]int{"eth0": 4, "eth1": 4},
 	}
-	// Call applyRSSIndirectionOne directly — applyRSSIndirection scans
-	// sysfs which is global; the unit boundary for this test is the
-	// driver check, proven by exercising the single-iface path after
-	// pre-filtering.
-	if f.readDriver("eth0") == mlx5Driver {
-		t.Fatal("fake executor mis-configured")
+	applyRSSIndirection(true, 4, f)
+	if len(f.calls) != 0 {
+		t.Fatalf("non-mlx5 interfaces must not trigger any ethtool call, got %v", f.calls)
 	}
-	// Proxy the real driver-filter: we expect no calls.
-	if f.readDriver("eth0") != mlx5Driver {
-		// matches the filter in applyRSSIndirection
-		return
+}
+
+// Go HIGH #1 flavour: mixed interface set. Only the mlx5 interface
+// receives ethtool writes; virtio/iavf siblings are untouched.
+func TestApplyRSSIndirection_MixedDrivers_OnlyMlxTouched(t *testing.T) {
+	defaultTable := []byte(`RX flow hash indirection table for mlx0 with 6 RX ring(s):
+    0:      0     1     2     3     4     5
+    8:      0     1     2     3     4     5
+`)
+	f := &fakeRSSExecutor{
+		ifaces: []string{"lo", "virt0", "mlx0", "iavf0"},
+		drivers: map[string]string{
+			"virt0": "virtio_net",
+			"mlx0":  "mlx5_core",
+			"iavf0": "iavf",
+		},
+		queues:   map[string]int{"mlx0": 6, "virt0": 4, "iavf0": 4},
+		ethtoolX: map[string][]byte{"mlx0": defaultTable},
 	}
-	t.Fatal("unreachable: non-mlx5 driver should have exited early")
+	applyRSSIndirection(true, 4, f)
+
+	// All ethtool invocations must target mlx0 only.
+	for _, c := range f.calls {
+		if len(c) < 2 {
+			t.Fatalf("malformed call: %v", c)
+		}
+		if c[1] != "mlx0" {
+			t.Fatalf("ethtool invoked on non-mlx5 iface: %v", c)
+		}
+	}
+	// And the write must have happened.
+	sawWrite := false
+	for _, c := range f.calls {
+		if c[0] == "-X" {
+			sawWrite = true
+		}
+	}
+	if !sawWrite {
+		t.Fatalf("expected a -X write on mlx0, got %v", f.calls)
+	}
 }
 
 // ethtool binary missing on probe → function skips cleanly, no write.
@@ -221,10 +259,11 @@ func TestApplyRSSIndirectionOne_EthtoolMissing_SkipsGracefully(t *testing.T) {
 // Workers == 1 skips at the top level (no sysfs scan, no ethtool).
 func TestApplyRSSIndirection_SingleWorker_Skips(t *testing.T) {
 	f := &fakeRSSExecutor{
+		ifaces:  []string{"eth0"},
 		drivers: map[string]string{"eth0": "mlx5_core"},
 		queues:  map[string]int{"eth0": 4},
 	}
-	applyRSSIndirection(1, f)
+	applyRSSIndirection(true, 1, f)
 	if len(f.calls) != 0 {
 		t.Fatalf("workers=1 must issue no ethtool calls, got %v", f.calls)
 	}
@@ -233,12 +272,67 @@ func TestApplyRSSIndirection_SingleWorker_Skips(t *testing.T) {
 // Workers == 0 skips at the top level.
 func TestApplyRSSIndirection_ZeroWorkers_Skips(t *testing.T) {
 	f := &fakeRSSExecutor{
+		ifaces:  []string{"eth0"},
 		drivers: map[string]string{"eth0": "mlx5_core"},
 		queues:  map[string]int{"eth0": 4},
 	}
-	applyRSSIndirection(0, f)
+	applyRSSIndirection(true, 0, f)
 	if len(f.calls) != 0 {
 		t.Fatalf("workers=0 must issue no ethtool calls, got %v", f.calls)
+	}
+}
+
+// MEDIUM (Codex) rollback: when enabled=false the function is a no-op
+// regardless of worker/queue configuration. This is the operator kill
+// switch surface; without it, #797 reviewers couldn't disable D3 at
+// runtime short of a binary downgrade.
+func TestApplyRSSIndirection_DisabledKillsSwitch(t *testing.T) {
+	defaultTable := []byte(`RX flow hash indirection table for eth0 with 6 RX ring(s):
+    0:      0     1     2     3     4     5
+`)
+	f := &fakeRSSExecutor{
+		ifaces:   []string{"eth0"},
+		drivers:  map[string]string{"eth0": "mlx5_core"},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": defaultTable},
+	}
+	applyRSSIndirection(false, 4, f)
+	if len(f.calls) != 0 {
+		t.Fatalf("disabled=false must issue no ethtool calls, got %v", f.calls)
+	}
+}
+
+// Go LOW #3: the idempotency claim must be demonstrated on repeated
+// invocation. After the first call writes the weight vector, the second
+// call sees a matching table and must not write again.
+func TestApplyRSSIndirection_TwiceIsIdempotent(t *testing.T) {
+	// We can't replay the kernel's actual post-write table from a pure
+	// fake, but the semantics we need to pin are: "if the probe already
+	// returns a matching layout, the second call issues exactly one more
+	// ethtool call (the probe) and no write." Simulate that by pre-
+	// populating ethtoolX with a matching table.
+	matchingTable := []byte(`RX flow hash indirection table for eth0 with 6 RX ring(s):
+    0:      0     1     2     3     0     1
+    8:      2     3     0     1     2     3
+`)
+	f := &fakeRSSExecutor{
+		ifaces:   []string{"eth0"},
+		drivers:  map[string]string{"eth0": "mlx5_core"},
+		queues:   map[string]int{"eth0": 6},
+		ethtoolX: map[string][]byte{"eth0": matchingTable},
+	}
+
+	applyRSSIndirection(true, 4, f)
+	if len(f.calls) != 1 || f.calls[0][0] != "-x" {
+		t.Fatalf("first call: want probe-only, got %v", f.calls)
+	}
+	applyRSSIndirection(true, 4, f)
+	if len(f.calls) != 2 {
+		t.Fatalf("second call must be exactly +1 probe, got total %d: %v",
+			len(f.calls), f.calls)
+	}
+	if f.calls[1][0] != "-x" {
+		t.Fatalf("second call must be probe-only, got %v", f.calls[1])
 	}
 }
 
@@ -261,5 +355,26 @@ func TestIndirectionTableMatches_FalseWhenQueueOutOfRange(t *testing.T) {
 `)
 	if indirectionTableMatches(out, []int{1, 1, 1, 1, 0, 0}) {
 		t.Fatal("queue 4 and 5 appear: must not match")
+	}
+}
+
+// Sanity: the production isExecNotFound detects the stable sentinel that
+// `exec.Command("missing").CombinedOutput()` wraps, without substring
+// matching (Go MEDIUM #1).
+func TestIsExecNotFound_DetectsSentinel(t *testing.T) {
+	wrapped := &exec.Error{Name: "ethtool", Err: exec.ErrNotFound}
+	if !isExecNotFound(wrapped) {
+		t.Fatal("expected true for wrapped exec.ErrNotFound")
+	}
+	fsPathErr := &fs.PathError{Op: "exec", Path: "ethtool", Err: exec.ErrNotFound}
+	if !isExecNotFound(fsPathErr) {
+		t.Fatal("expected true for PathError wrapping exec.ErrNotFound")
+	}
+	other := errors.New("some other error")
+	if isExecNotFound(other) {
+		t.Fatal("must not match unrelated errors")
+	}
+	if isExecNotFound(nil) {
+		t.Fatal("nil must not match")
 	}
 }

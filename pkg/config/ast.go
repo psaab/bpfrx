@@ -1376,6 +1376,7 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"workers":        {args: 1, desc: "Worker thread count", children: nil},
 			"ring-entries":   {args: 1, desc: "AF_XDP ring entries per queue", children: nil},
 			"poll-mode":      {args: 1, desc: "Worker poll mode (busy-poll or interrupt)", children: nil},
+			"rss-indirection": {args: 1, desc: "mlx5 RSS indirection reshaping (enable|disable)", children: nil},
 			"rx-mode": {children: map[string]*schemaNode{
 				"idle-threshold":   {args: 1, children: nil},
 				"resume-threshold": {args: 1, children: nil},

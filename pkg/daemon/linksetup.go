@@ -40,7 +40,9 @@ type pciNIC struct {
 // config (0 if userspace dataplane is not configured). Used by D3 RSS
 // indirection to constrain mlx5 RSS to queues 0..workers-1 before any
 // AF_XDP socket binds.
-func enumerateAndRenameInterfaces(nodeID int, clusterMode bool, userspaceWorkers int) error {
+// rssEnabled is the operator kill switch for D3 (#797 review feedback);
+// false skips D3 entirely even when userspace-dp has multiple workers.
+func enumerateAndRenameInterfaces(nodeID int, clusterMode bool, userspaceWorkers int, rssEnabled bool) error {
 	nics, err := enumeratePCINICs()
 	if err != nil {
 		return fmt.Errorf("enumerate NICs: %w", err)
@@ -101,8 +103,17 @@ func enumerateAndRenameInterfaces(nodeID int, clusterMode bool, userspaceWorkers
 	// on every mlx5_core interface. Must run strictly before any AF_XDP
 	// bind — that ordering is structurally guaranteed because the
 	// dataplane is loaded later in daemon.Run().
-	applyRSSIndirection(userspaceWorkers, realRSSExecutor{})
+	applyRSSIndirection(rssEnabled, userspaceWorkers, realRSSExecutor{})
 	return nil
+}
+
+// reapplyRSSIndirection re-runs D3 on an already-renamed firewall. Called
+// from the daemon reconcile path on every applyConfig, so worker-count
+// changes and the enable/disable knob both take effect without a restart.
+// Safe to invoke repeatedly: applyRSSIndirection is idempotent (matching
+// tables skip the write) and per-interface driver-filtered.
+func reapplyRSSIndirection(rssEnabled bool, userspaceWorkers int) {
+	applyRSSIndirection(rssEnabled, userspaceWorkers, realRSSExecutor{})
 }
 
 // enumeratePCINICs discovers all PCI network interfaces via sysfs, sorted

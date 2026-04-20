@@ -445,6 +445,13 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 			if v := nodeVal(child); v == "interrupt" || v == "busy-poll" {
 				cfg.PollMode = v
 			}
+		case "rss-indirection":
+			// Defaults to enabled; only the string "disable" flips it off.
+			// Anything else (including "enable" and empty) leaves the
+			// default behaviour — D3 runs.
+			if nodeVal(child) == "disable" {
+				cfg.RSSIndirectionDisabled = true
+			}
 		}
 	}
 	return nil

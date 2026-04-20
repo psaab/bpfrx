@@ -451,6 +451,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		clusterMode := false
 		nodeID := 0
 		userspaceWorkers := 0
+		// D3 (#797): default enabled. Operators opt out via
+		// `set system dataplane rss-indirection disable`.
+		rssEnabled := true
 		if cfg := d.store.ActiveConfig(); cfg != nil {
 			if cfg.Chassis.Cluster != nil {
 				clusterMode = true
@@ -462,9 +465,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// treats that as a no-op.
 			if cfg.System.DataplaneType == "userspace" && cfg.System.UserspaceDataplane != nil {
 				userspaceWorkers = cfg.System.UserspaceDataplane.Workers
+				if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
+					rssEnabled = false
+				}
 			}
 		}
-		if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers); err != nil {
+		if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled); err != nil {
 			slog.Warn("interface naming failed", "err", err)
 		}
 	}
@@ -2272,6 +2278,24 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 			d.stopClusterComms()
 			d.startClusterComms(d.daemonCtx)
 		}
+	}
+
+	// 21. Re-apply D3 RSS indirection on config change (#797 HIGH #2).
+	// Worker count can change via commit (e.g. `set system dataplane
+	// workers 6`), and the D3 disable knob can flip; either requires
+	// re-running the reshape (or restore) against the current HW state.
+	// Idempotent: matching tables skip the write. Non-mlx5 interfaces
+	// are skipped at the per-interface guard.
+	if !d.opts.NoDataplane {
+		rssEnabled := true
+		workers := 0
+		if cfg.System.DataplaneType == "userspace" && cfg.System.UserspaceDataplane != nil {
+			workers = cfg.System.UserspaceDataplane.Workers
+			if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
+				rssEnabled = false
+			}
+		}
+		reapplyRSSIndirection(rssEnabled, workers)
 	}
 }
 

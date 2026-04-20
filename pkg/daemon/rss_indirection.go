@@ -14,15 +14,23 @@
 // logic without bloating linksetup.go, which already owns PCI enumeration
 // and .link-file management.
 //
-// Applied strictly before any AF_XDP socket binding opens an RX ring —
-// driven from enumerateAndRenameInterfaces() at daemon startup. The
-// reviewer's #M4 concern (no mid-traffic re-hash) is addressed by call
-// ordering: this runs from Run() before the dataplane is loaded, so RX
-// rings do not yet exist.
+// Applied strictly before any AF_XDP socket binding opens an RX ring on
+// first boot — driven from enumerateAndRenameInterfaces() at daemon
+// startup. The reviewer's #M4 concern (no mid-traffic re-hash) is
+// addressed by call ordering: this runs from Run() before the dataplane
+// is loaded, so RX rings do not yet exist.
+//
+// Re-applied from the daemon reconcile path (applyConfig) on every
+// commit, so changes to `system dataplane workers` or the
+// `rss-indirection enable|disable` knob take effect without a restart.
+// Re-application is idempotent (matching tables skip the write) and
+// strictly per-mlx5 (driver-guarded at both the top-level scan and the
+// per-interface call site).
 package daemon
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -40,8 +48,9 @@ const (
 	mlx5Driver = "mlx5_core"
 )
 
-// rssExecutor abstracts ethtool invocation so unit tests can inject a
-// fake without touching the real binary. Real callers use realRSSExecutor.
+// rssExecutor abstracts ethtool invocation and sysfs enumeration so unit
+// tests can inject a fake without touching the real binary or real sysfs.
+// Real callers use realRSSExecutor.
 type rssExecutor interface {
 	// runEthtool runs `ethtool <args...>` and returns combined output + err.
 	// On ErrNotFound (binary missing), callers treat it as non-fatal.
@@ -52,6 +61,10 @@ type rssExecutor interface {
 	// readQueueCount returns the number of RX queues for iface, as
 	// enumerated from /sys/class/net/<iface>/queues/rx-*.
 	readQueueCount(iface string) int
+	// listInterfaces returns the set of netdev names to consider (real
+	// sysfs: basenames of /sys/class/net). Injection point for tests so
+	// the top-level scan path is exercised without touching real netdevs.
+	listInterfaces() []string
 }
 
 // realRSSExecutor is the production implementation of rssExecutor.
@@ -83,12 +96,29 @@ func (realRSSExecutor) readQueueCount(iface string) int {
 	return n
 }
 
+func (realRSSExecutor) listInterfaces() []string {
+	entries, err := os.ReadDir("/sys/class/net")
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Name())
+	}
+	return out
+}
+
 // applyRSSIndirection reshapes the RSS indirection table on every mlx5_core
 // interface so that only queues 0..workers-1 receive traffic.
 //
 // Invariants:
-//   - Runs at daemon startup, before the dataplane binds any AF_XDP socket.
-//   - Non-mlx5 interfaces are skipped silently.
+//   - Runs at daemon startup (and on reconcile for worker-count changes),
+//     before the dataplane binds any AF_XDP socket on startup.
+//   - Non-mlx5 interfaces are skipped at the per-interface call site —
+//     `ethtool` is never invoked on virtio, iavf, i40e, etc. The
+//     driver-guard is also repeated inside applyRSSIndirectionOne as
+//     defense in depth, so a mis-fed allowlist cannot touch non-mlx5.
+//   - enabled == false is a hard kill switch: skip everything.
 //   - workers == 1 is skipped (single worker benefits from default RSS
 //     spreading across all HW queues / IRQ lines; weight-pinning to a
 //     single queue would serialize the worker on one IRQ — reviewer #L1).
@@ -98,9 +128,15 @@ func (realRSSExecutor) readQueueCount(iface string) int {
 //     computed layout, no write is issued.
 //   - Never returns a non-nil error — D3 regressions must not break
 //     interface bring-up.
-func applyRSSIndirection(workers int, execer rssExecutor) {
+func applyRSSIndirection(enabled bool, workers int, execer rssExecutor) {
+	if !enabled {
+		slog.Info("linksetup: rss indirection disabled by config")
+		return
+	}
 	if workers <= 0 {
-		slog.Info("linksetup: rss indirection skipped (no workers configured)")
+		// Non-userspace deploys (ebpf/dpdk) hit this path every boot —
+		// keep at Debug to avoid info-level noise on the default path.
+		slog.Debug("linksetup: rss indirection skipped (no workers configured)")
 		return
 	}
 	if workers == 1 {
@@ -108,18 +144,23 @@ func applyRSSIndirection(workers int, execer rssExecutor) {
 		return
 	}
 
-	entries, err := os.ReadDir("/sys/class/net")
-	if err != nil {
-		slog.Warn("linksetup: rss indirection could not read /sys/class/net", "err", err)
+	ifaces := execer.listInterfaces()
+	if len(ifaces) == 0 {
+		slog.Warn("linksetup: rss indirection could not enumerate interfaces")
 		return
 	}
 
-	for _, e := range entries {
-		iface := e.Name()
+	for _, iface := range ifaces {
 		if iface == "lo" {
 			continue
 		}
-		if execer.readDriver(iface) != mlx5Driver {
+		drv := execer.readDriver(iface)
+		if drv != mlx5Driver {
+			// Explicit per-interface mlx5 guard at the call site —
+			// prevents any `ethtool` invocation on virtio/iavf/i40e/etc.
+			// Review finding HIGH #1.
+			slog.Debug("linksetup: rss indirection skipped (non-mlx5 driver)",
+				"iface", iface, "driver", drv)
 			continue
 		}
 		applyRSSIndirectionOne(iface, workers, execer)
@@ -128,7 +169,16 @@ func applyRSSIndirection(workers int, execer rssExecutor) {
 
 // applyRSSIndirectionOne applies the weight-vector to a single mlx5 iface.
 // Errors are logged and swallowed: D3 is best-effort.
+//
+// The caller (applyRSSIndirection) is responsible for driver filtering;
+// this function additionally re-checks the driver as defense in depth so a
+// future caller cannot accidentally invoke ethtool on a non-mlx5 netdev.
 func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
+	if drv := execer.readDriver(iface); drv != mlx5Driver {
+		slog.Debug("linksetup: rss indirection skipped (non-mlx5 driver at per-iface check)",
+			"iface", iface, "driver", drv)
+		return
+	}
 	queues := execer.readQueueCount(iface)
 	weights, reason := computeWeightVector(workers, queues)
 	if weights == nil {
@@ -268,16 +318,9 @@ func indirectionTableMatches(output []byte, weights []int) bool {
 }
 
 // isExecNotFound returns true if err indicates the ethtool binary is
-// missing. The shape of `exec.Command("ethtool").CombinedOutput()` on a
-// missing binary is `exec.ErrNotFound` wrapped in *exec.Error.
+// missing. `exec.Command("ethtool").CombinedOutput()` wraps the stable
+// `exec.ErrNotFound` sentinel in an *exec.Error, so errors.Is is the
+// correct mechanism — no substring matching required.
 func isExecNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	// exec.Error wraps the underlying os error; match by substring to
-	// avoid pulling in errors.Is() wrapping across the stdlib versions
-	// we support. "executable file not found" is the stable message.
-	msg := err.Error()
-	return strings.Contains(msg, "executable file not found") ||
-		strings.Contains(msg, "no such file or directory")
+	return errors.Is(err, exec.ErrNotFound)
 }

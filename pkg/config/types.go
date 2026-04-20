@@ -456,6 +456,13 @@ type UserspaceConfig struct {
 	Workers       int    `json:"workers"`                // worker thread count
 	RingEntries   int    `json:"ring_entries"`           // planned AF_XDP ring entries
 	PollMode      string `json:"poll_mode"`              // "busy-poll" (default) or "interrupt"
+
+	// RSSIndirectionDisabled, when true, disables D3 RSS indirection
+	// reshaping (#785 / #797). Default is enabled — operators opt out
+	// explicitly via `set system dataplane rss-indirection disable`.
+	// Serialized as an inverted bool so omission implies the safe
+	// default (enabled) and only disabled deploys carry the field.
+	RSSIndirectionDisabled bool `json:"rss_indirection_disabled,omitempty"`
 }
 
 // RootAuthConfig holds root-authentication settings.
