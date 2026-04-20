@@ -122,3 +122,105 @@ actually ships, hot-path is allocation-free, test isolation is
 clean, and the commit message and doc comments carry the
 institutional context forward. #1 is the only one worth a
 targeted pin before Phase 4 re-enters this code.
+
+## Round 2 verification
+
+**ROUND 2: merge-ready from Rust-quality angle.**
+
+Verification of `4416eb27` + `ab8abb4d` against prior findings.
+
+### Round 1 finding status
+
+- **MED #1 (drained-bucket round-trip neutrality)** — CLOSED.
+  Fixed by `CoSQueuePopSnapshot` mechanism (types.rs:999-1026):
+  `cos_queue_pop_front` snapshots `{bucket, pre_pop_head_finish,
+  pre_pop_tail_finish}` BEFORE any mutation (tx.rs:4165-4181).
+  `cos_queue_push_front` consumes (takes) the snapshot and on
+  bucket match restores head/tail EXACTLY (tx.rs:4093-4106). The
+  snapshot is invalidated on any `cos_queue_push_back`
+  (tx.rs:4023-4027), closing the stale-snapshot race.
+  New pin `mqfq_push_front_is_neutral_on_drained_bucket_round_trip`
+  (tx.rs:10640-10711) asserts full state restore (head, tail, bytes,
+  vtime, active count, item length) across drain-pop/push_front.
+  The Codex HIGH vtime-rewind fix and the Rust MED #1 snapshot fix
+  compose correctly — the PR commit message explicitly calls out
+  why per-item symmetric rewind is needed alongside the snapshot
+  (partial-commit settle paths).
+
+- **MED #2 (headroom-is-calculator)** — CLOSED.
+  Rewritten. Test now drives `queue.queue_vtime = u64::MAX - 10_000`
+  and calls the REAL `cos_queue_push_back` path twice:
+  (1) verifies first enqueue anchors at `near_wrap + 9000` exactly,
+  (2) verifies second enqueue saturates at `u64::MAX`
+  (tx.rs:11232-11322). The old calculator block is kept as a
+  commentary sanity assert, but the field-driving portion is what
+  a u32 narrowing or `+` replacement regression would fail.
+
+- **MED #3 (mixed-size golden vector)** — CLOSED.
+  New pin `mqfq_golden_vector_pop_order_vs_drr` (tx.rs:10470-10578)
+  adds a table of 3 rows (equal-1500, mixed-3000-1500,
+  three-flows-progressive). MQFQ pop order is hard-coded in the
+  `mqfq_order` column; DRR reference column is documented but not
+  executed (old DRR path is gone). A closing `any_divergent` assert
+  guarantees the table still demonstrates MQFQ-vs-DRR divergence
+  even if someone later edits rows. If MQFQ regresses to
+  packet-count fairness, at least one row's actual order will
+  match the `drr_order` column and fail `assert_eq`.
+
+### New-angle findings
+
+4. **Snapshot implementation** (types.rs:999-1026): `Option<CoSQueuePopSnapshot>`
+   — 24-byte POD (u16 + 2xu64) + Option discriminant. `Copy + Clone`, zero heap,
+   lives inline on `CoSQueueRuntime`. Cleared on `push_back`, taken on
+   `push_front`. No new pin leaks through — `push_back` already resets it,
+   and `push_front` uses `Option::take()` so stale reuse is structurally
+   impossible.
+
+5. **Symmetric rewind arithmetic** (tx.rs:4068): uses
+   `queue.queue_vtime.saturating_sub(item_len)`. If `queue_vtime <
+   item_len` (only reachable if pop accounting is broken — normal pop
+   advances vtime by `item_len`, so rewinding the same item cannot
+   underflow), saturates to 0 cleanly. No `checked_sub + panic`, no
+   wrapping surprise. Not separately unit-tested for the pathological
+   `vtime < bytes` case, but by invariant this path is unreachable.
+
+6. **New pin quality** — all pins verified:
+   - `push_front_is_neutral_on_drained_bucket_round_trip`: asserts head,
+     tail, bytes, vtime, active count, item length (6 fields) — full.
+   - `brief_idle_reentry_exercises_both_max_arms`: NOT split, single-flow
+     sequence exercising tail=0/vtime>0 (arm 1) then tail>vtime (arm 2)
+     in order; clear arm-naming in assert messages.
+   - `finish_time_u64_has_decades_of_headroom`: real push_back near
+     `u64::MAX - 10_000`, two enqueues, asserts saturation on second.
+   - `golden_vector_pop_order_vs_drr`: hard-coded `mqfq_order` array per
+     row; DRR column documented-not-executed; `any_divergent` meta-assert.
+   - `idle_flow_reanchors_at_frontier_not_zero`: checks exact non-zero
+     anchor `5700 = queue_vtime(4500) + bytes(1200)`, not just
+     `> bytes`.
+   - Existing pin `push_front_is_finish_time_neutral_on_active_bucket`
+     extended with `pre_pop_vtime == post_restore_vtime` assertion.
+
+7. **New unsafe/unwrap/expect/eprintln/panic** — NONE in production.
+   Diff sweep: two `.expect()` added (both in tests: `"flow key"` tie-break
+   in golden vector; `"pop"` in drained-bucket pin). Zero production-path
+   `unsafe`, `unwrap`, `expect`, `eprintln`. One `panic` mention in a
+   comment explaining saturating_add semantics. Clean.
+
+8. **Performance cost of the snapshot**: written on EVERY
+   `cos_queue_pop_front` (tx.rs:4176-4181) regardless of caller. Cost:
+   one `Option<(u16, u64, u64)>` struct write = 24 bytes + discriminant
+   on the queue struct (no allocation, already-in-cache line). Cleared
+   on every `push_back` (tx.rs:4023-4027) — one `Option::None` write.
+   This is unavoidable given the TX-ring-full rollback contract (caller
+   doesn't declare intent at pop time). Cheaper than the alternative
+   (tracking rollback-intent via a separate API). Acceptable overhead
+   for the correctness guarantee — matches engineering-style.md's
+   "hot-path discipline, not hot-path absolutism".
+
+### Final disposition
+
+3 round-1 MEDIUMs all CLOSED with targeted pins that would fail on
+regression. Snapshot mechanism is allocation-free, leak-free, and
+composable with the Codex symmetric-rewind fix. No new Rust-quality
+concerns introduced. 11 mqfq_* tests green (`cargo test --release
+... mqfq`). Merge-ready.
