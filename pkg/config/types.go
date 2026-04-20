@@ -463,6 +463,54 @@ type UserspaceConfig struct {
 	// Serialized as an inverted bool so omission implies the safe
 	// default (enabled) and only disabled deploys carry the field.
 	RSSIndirectionDisabled bool `json:"rss_indirection_disabled,omitempty"`
+
+	// Phase B Step-0 tunables (#801). Each is a first-class knob with
+	// a documented default so operators can override without editing
+	// systemd units or sysctl.conf. Omission leaves the zero value and
+	// daemon resolves the default at apply-time (empty string / 0).
+
+	// CPUGovernor requests a cpufreq governor on every writable
+	// /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor node on the
+	// host. Accepted values:
+	//   "performance"          — explicit (default)
+	//   "schedutil"            — explicit override
+	//   "default" / ""         — skip (leave whatever the host has set)
+	// Running inside a VM without a writable cpufreq sysfs is a no-op
+	// (detected at apply-time); the daemon logs a single informational
+	// line noting the skip. On bare metal the setting is applied on
+	// daemon start and re-applied on every commit.
+	CPUGovernor string `json:"cpu_governor,omitempty"`
+
+	// NetdevBudget is the value written to /proc/sys/net/core/netdev_budget.
+	// 0 means "leave the kernel default" (no write); the daemon
+	// resolves a non-zero default at apply-time (600, per #801).
+	NetdevBudget int `json:"netdev_budget,omitempty"`
+
+	// CoalescenceAdaptiveDisabled, when true, disables mlx5 adaptive
+	// coalescing on every userspace-dp-bound mlx5 interface
+	// (`ethtool -C <iface> adaptive-rx off adaptive-tx off`). Default
+	// is true (disable) at apply-time; the config knob is
+	// `set system dataplane coalescence adaptive disable|enable`.
+	// Serialized as an inverted bool so the most-common "disable"
+	// deploy case is the zero value.
+	//
+	// CoalescenceAdaptiveExplicit distinguishes "operator explicitly
+	// set enable" from "omitted, use default". Default is
+	// "disabled" so an omitted knob leaves the field at
+	// CoalescenceAdaptiveDisabled=false but the daemon still applies
+	// "adaptive off". An explicit "enable" sets Explicit=true and
+	// Disabled=false so the daemon skips the ethtool write (operator
+	// override).
+	CoalescenceAdaptiveDisabled bool `json:"coalescence_adaptive_disabled,omitempty"`
+	CoalescenceAdaptiveExplicit bool `json:"coalescence_adaptive_explicit,omitempty"`
+
+	// CoalescenceRXUsecs / CoalescenceTXUsecs set the rx-usecs and
+	// tx-usecs coalescing ceiling on mlx5 interfaces. 0 means "use
+	// daemon default" (8 µs per #801). Only written when adaptive
+	// coalescing is disabled — with adaptive on, the kernel controls
+	// these values dynamically and writes are a waste.
+	CoalescenceRXUsecs int `json:"coalescence_rx_usecs,omitempty"`
+	CoalescenceTXUsecs int `json:"coalescence_tx_usecs,omitempty"`
 }
 
 // RootAuthConfig holds root-authentication settings.
