@@ -27,3 +27,27 @@ Concrete revision: Define success once and reuse it everywhere: for example, "fi
 7. **SEVERITY: LOW** Rollback and phasing mechanics need sharper boundaries to keep regressions attributable once multiple fixes exist.
 Explanation: The plan says "rollback that commit immediately" and separately says rollback commits stay in branch history, while also forcing fully serialized Phases C and D with one PR per issue (`docs/line-rate-investigation-plan.md`, "Validation at every step", "Phasing", and "Risks"). That is directionally safe, but it does not say what happens when a regression is discovered after several commits on the investigation branch, nor does it justify blocking issue filing and PR work on independent findings once Phase B evidence is frozen. The result is avoidable ambiguity in the recovery path and unnecessary serialization after the no-code review phase.
 Concrete revision: Keep Phases A and B fully serialized, then require each accepted root cause to branch from a tagged last-known-green commit. Specify that regressions are reverted per offending commit or by resetting the workstream branch to the last green tag, rather than leaving "rollback immediately" as an informal instruction.
+
+## Round 2 verification
+ROUND 2: plan-ready NO
+
+### Round-1 HIGH #1
+FIXED. The plan now says userspace evidence comes before NIC counters, puts `flow_steer_snapshot` plus `dbg_tx_ring_full`/`dbg_sendto_enobufs`/`dbg_pending_overflow`/`pending_tx_local_overflow_drops`/`tx_submit_error_drops`/`outstanding_tx` in Step 1, and moves NIC counters to Step 2. Plan lines 178-181, 245-268.
+
+### Round-1 HIGH #2
+FIXED. Rollback is now a matched 5-run pre/post protocol with mean and stddev calculations, replacing the prior single absolute threshold. Plan lines 384-423.
+
+### Round-1 MEDIUM
+FIXED. Step 0.3 records `tcp_congestion_control` on both endpoints, pins one algorithm, and verifies in-run with `ss -ti`. Plan lines 214-223.
+
+### Round-2 #4
+FAIL. Step 0.2 records mlx5 coalescence fields, but its gate only fires if "any value is clearly pathological"; it does not require a per-item disposition, so coalescence can be noted without an explicit flag. Plan lines 201-212.
+
+### Round-2 #5
+FAIL. The CoV rollback rule is `mean(post-CoV) - mean(pre-CoV) > 2 x stddev(pre-CoV)` with no floor if `stddev(pre-CoV)` is near zero. Plan lines 410-412, 516-519.
+
+### Round-2 #6
+FAIL. The latency probe is only `ping -i 0.01 <dst>` or `sockperf` on "the same path"; no interface selection, CPU pinning, or statement about load-test-induced probe jitter is defined. Plan lines 286-290, 395-396, 431-432.
+
+### Round-2 #7
+FAIL. Ring-quadruple material is split across Step 0.4 and Step 5, and authoritative overflow evidence is only recoverable by combining Step 1/H-FWD-1 userspace counters such as `dbg_tx_ring_full` and `pending_tx_local_overflow_drops`; there is no single canonical audit section. Plan lines 224-230, 250-255, 261-264, 308-318.

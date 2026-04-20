@@ -136,3 +136,52 @@ base clock during run, frequency scaling is an unlock.
 Plan-readiness from systems angle: **NO** — 3 HIGH + 3 MEDIUM. S-1
 and S-3 are potential zero-code fixes; must validate before any
 dataplane change.
+
+---
+
+## Round 2 verification
+
+Revision tip `b3559a7e`. Plan now 522 lines.
+
+Round-1 findings:
+- S-1 (IRQ affinity): **RESOLVED.** Step 0.1 reads
+  `/proc/irq/<N>/smp_affinity_list` per mlx5 queue, names the
+  zero-code fix (`echo <cpu> > ...`), gates before proceeding.
+- S-2 (latency): **RESOLVED.** Step 3 + Validation capture
+  concurrent `ping -i 0.01` p50/p99 AND `ss -ti` RTT every run;
+  rollback gate `post-p99 − pre-p99 > 2×stddev(pre-p99)`.
+- S-3 (NAPI/coalescence/busy-poll): **RESOLVED.** Step 0.2 covers
+  `ethtool -c`, `netdev_budget{,_usecs}`, `gro_flush_timeout`,
+  `SO_BUSY_POLL` readback. H-FWD-5 promoted to real hypothesis
+  with Step 3 `%usr/%sys/%soft/%irq` diagnostic.
+- S-4 (ring quad): **RESOLVED.** Step 0.4 + Step 5 audit RX/TX/
+  fill/completion separately; plan explicitly distinguishes
+  TX-produce from completion-reap starvation.
+- S-5 (L1d): **RESOLVED.** Step 3 runs `perf stat -e
+  L1-dcache-load-misses,LLC-loads` on worker PIDs.
+- S-6 (small-ACK): **RESOLVED.** H-REV-6 added; Step 7 jumbo-MSS
+  diagnostic + ACK-bucket histogram.
+- S-7 (C-states): **RESOLVED.** Step 0.5 captures `cpupower` +
+  `turbostat`, treated as diagnostic not gate (acceptable).
+
+Round-2 new findings:
+
+- **R2-1 MEDIUM — ping probe packet size.** Step 3 specifies
+  `ping -i 0.01` but not `-s`. Default 64 B ICMP may traverse a
+  different worker / cache footprint than 1500 B TCP data frames.
+  **Fix:** run concurrent probes at two sizes, `ping -i 0.01 -s
+  56` AND `ping -i 0.01 -s 1400`, keep both in the p50/p99 table.
+- **R2-2 LOW — `ss -ti` cadence unspecified.** Plan says "5 s
+  intervals" in Step 3; acceptable, but clarify that it runs for
+  the full window and all flows are captured (not just sample
+  flow). Not blocking.
+- **R2-3 MEDIUM — `perf stat` scope ambiguous.** Step 3 says
+  "on worker PIDs" which is correct, but `perf stat` defaults to
+  per-thread when given `-p`. Explicitly specify `perf stat -p
+  <worker_pids> --per-thread` OR `perf stat -C <worker_cpus>` so
+  results are not conflated across the 4 workers — system-wide
+  would hide the bottleneck worker.
+
+Plan-ready: **YES with R2-1 and R2-3 folded in** (both one-line
+edits in Step 3). Zero-code gates in Step 0 remain the correct
+first action.
