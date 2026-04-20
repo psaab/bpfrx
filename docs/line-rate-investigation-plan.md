@@ -700,28 +700,18 @@ via grep against `userspace-dp/src/**`):
   `ethtool -S` on mlx5_core; no in-process instrumentation
   required
 
-**Counters the plan requires that do NOT yet exist** (pre-req
-before the investigation relies on them):
-- `fill_batch_starved` (per-worker, increments when a fill-ring
-  top-up batch cannot obtain any free UMEM frames). The kernel
-  `rx_fill_ring_empty_descs` counter tells us the kernel saw an
-  empty fill ring; `fill_batch_starved` would tell us WHY — the
-  userspace-side UMEM allocator ran dry. If `rx_fill_ring_empty_descs`
-  is adequate for this investigation's evidence needs (i.e., we do
-  not need to separate "fill batch starved on UMEM" from "fill
-  batch starved because worker never topped up"), this counter may
-  be deferred and the row in the Step 0.4 table proxied against
-  `rx_fill_ring_empty_descs` alone. Decision: captured at the
-  start of Phase C.
-- `completion_reap_max_batch` (per-worker, records the high-water
-  mark of descriptors reaped from the TX completion ring per
-  iteration). Today `outstanding_tx` serves as a proxy: a high
-  and statically-held `outstanding_tx` implies reap is lagging.
-  If the outstanding_tx proxy cannot distinguish "reap cadence is
-  healthy but worker is busy" from "reap is actually late",
-  `completion_reap_max_batch` must land before the investigation
-  concludes on completion-ring behaviour. Decision: captured at
-  the start of Phase C.
+**Counters the plan requires that do NOT yet exist — explicit
+per-counter disposition for this investigation** (Codex round-3 #5(new)
++ round-4 #5):
+
+| Counter | Disposition | Proxy used now | Escalation trigger |
+|-|-|-|-|
+| `fill_batch_starved` | **ACCEPT PROXY** for this investigation | kernel `rx_fill_ring_empty_descs` (authoritative "fill ring seen empty" signal) | If Phase B sees `rx_fill_ring_empty_descs` non-zero AND Step 3 evidence does not disambiguate "UMEM allocator ran dry" from "worker never topped up", file issue + land one-commit `fill_batch_starved` instrumentation PR before concluding on fill-ring behavior. |
+| `completion_reap_max_batch` | **ACCEPT PROXY** for this investigation | `outstanding_tx` stable-vs-monotonic read across the run | If Phase B sees `outstanding_tx` monotonically rising AND that alone cannot distinguish "reap cadence healthy, worker is busy" from "reap is actually late", file issue + land one-commit `completion_reap_max_batch` instrumentation PR before concluding on completion-ring behavior. |
+
+Both rows are marked `DEFERRED-INSTRUMENTATION` in the Step 0.4
+table. They DO NOT block Phase B start — the proxy is explicitly
+accepted as sufficient unless the escalation trigger fires.
 
 **Process**: at the start of Phase C, for each "does not yet exist"
 counter above, decide:
