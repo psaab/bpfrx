@@ -93,3 +93,39 @@ Mitigation: add an explicit global D3 enable/disable flag and define the operati
 ## Where the PR holds up
 
 D3 does run before dataplane bring-up and before any AF_XDP bind path (`pkg/daemon/daemon.go:448-470`, `pkg/daemon/linksetup.go:100-105`). The `ethtool` shell-out is not injection-prone and D3 failures are deliberately best-effort (`pkg/daemon/rss_indirection.go:60-62`, `143-175`). The unit tests cover the core weight-vector edge cases (`pkg/daemon/rss_indirection_test.go:61-129`); the gaps are in scope selection and lifecycle.
+
+## Round 2 verification
+
+ROUND 2: NOT READY — H1 and H2 are only partially fixed, and the rollback/kill-switch work is improved but still incomplete.
+
+### H1
+
+PARTIAL — there is now an explicit call-site mlx5 guard, so a mixed-NIC startup that enumerates `virtio_net` does avoid `ethtool`: `applyRSSIndirection()` reads `drv := execer.readDriver(iface)` and skips unless `drv == mlx5_core` before calling `applyRSSIndirectionOne()` (`pkg/daemon/rss_indirection.go:160-173`, exact guard at `pkg/daemon/rss_indirection.go:165`). The mixed-driver tests exercise that path and assert zero `ethtool` calls on non-mlx5 interfaces (`pkg/daemon/rss_indirection_test.go:193-243`).
+
+The original overbreadth is still not fully fixed. The top-level scan still iterates every interface returned by sysfs and applies to every `mlx5_core` netdev, with no allowlist derived from the userspace binding plan or compiled config (`pkg/daemon/rss_indirection.go:154-173`). The new disable/restore path inherits the same all-mlx5 scope (`pkg/daemon/rss_indirection.go:182-206`). That still conflicts with the validation doc claim that D3 targets interfaces "bound to `xpf-userspace-dp`" (`docs/785-d3-validation.md:5-15`).
+
+### H2
+
+PARTIAL — the daemon reconcile path is now wired correctly, but not every live commit path uses it.
+
+For daemon-managed API commits, the wiring is real: the daemon injects `d.applyConfig` as the server `ApplyFn` (`pkg/grpcapi/server.go:36-55`), and both gRPC and HTTP commit handlers call that callback after `store.Commit()` / `store.CommitConfirmed()` (`pkg/grpcapi/server_config.go:155-186`, `pkg/api/handlers.go:1518-1536`). Inside `applyConfig`, step 21 now recomputes `rssEnabled`/`workers` and calls `reapplyRSSIndirection()` unconditionally when dataplane is enabled, so a dataplane-only commit still triggers the D3 path even if linksetup itself did not change (`pkg/daemon/daemon.go:2283-2298`).
+
+But daemon interactive mode still bypasses that path. In interactive mode the daemon creates a local CLI (`pkg/daemon/daemon.go:1076-1079`); CLI commits call `c.applyToDataplane(compiled)` directly (`pkg/cli/cli_config.go:170-239`), and `applyToDataplane()` compiles the dataplane but never calls `d.applyConfig()` or `reapplyRSSIndirection()` (`pkg/cli/cli.go:1407-1434`; `reapplyRSSIndirection` not found under `pkg/cli`). Worker-count changes are still real dataplane changes on that path because the userspace helper restart key includes `Workers` (`pkg/dataplane/userspace/process.go:24-35`, `957-964`) and the binding-plan key includes `workers=%d` (`pkg/dataplane/userspace/maps_sync.go:1173-1204`). So a live `set system dataplane workers N` committed from the in-process CLI still skips the D3 reapply.
+
+I did not find a grounded "4 -> 2 retires queues and drops packets" race in the current helper. The queue planner keeps one binding per queue and only remaps `worker_id` modulo the new worker count (`userspace-dp/src/main.rs:1122-1154`), so the concrete remaining bug here is the missing commit-path wiring, not steering to unbound retired queues.
+
+### M
+
+PARTIAL — the new knob exists and works on the daemon reconcile path, but it is not fully documented and still does not restore on daemon stop.
+
+`rss-indirection` is now a first-class `system dataplane` schema entry with the expected `enable|disable` surface (`pkg/config/ast.go:1374-1380`). Default is enabled because `RSSIndirectionDisabled` is false by default and the compiler only flips it on for the literal string `disable` (`pkg/config/types.go:460-465`, `pkg/config/compiler_system.go:448-453`); the parser tests pin both the default and the `enable`/`disable` cases (`pkg/config/parser_ast_test.go:2682-2735`). This follows the local `poll-mode` convention of schema-desc + compiler-side accepted values (`pkg/config/compiler_system.go:444-453`).
+
+On the daemon reconcile path, toggling the knob does rerun the D3 code: startup passes `rssEnabled` into `enumerateAndRenameInterfaces()` (`pkg/daemon/daemon.go:453-473`, `pkg/daemon/linksetup.go:45-107`), commit-time reconcile calls `reapplyRSSIndirection()` (`pkg/daemon/daemon.go:2283-2298`), and `enabled=false` actively restores the default table with `ethtool -X <iface> default` (`pkg/daemon/rss_indirection.go:131-141`, `177-207`). But the interactive CLI commit path above still bypasses that logic (`pkg/daemon/daemon.go:1076-1079`, `pkg/cli/cli_config.go:170-239`, `pkg/cli/cli.go:1407-1434`).
+
+The knob is not fully documented. The only user-facing description I found is the schema string in `pkg/config/ast.go:1379`; the validation doc still describes D3 as a startup-only feature and does not mention `rss-indirection enable|disable` at all (`docs/785-d3-validation.md:12-16`). On daemon stop, the table still persists rather than restoring: the shutdown path never calls `restoreDefaultRSSIndirection()` or any equivalent restore (`pkg/daemon/daemon.go:1167-1259`), and that restore helper is only reachable from `applyRSSIndirection(enabled=false, ...)` (`pkg/daemon/rss_indirection.go:131-141`, `182-206`).
+
+### New findings
+
+LOW — No test covers the new commit-time wiring end to end. The added tests prove config compilation of the knob (`pkg/config/parser_ast_test.go:2690-2735`) and the direct helper behavior of `applyRSSIndirection(false, ...)` (`pkg/daemon/rss_indirection_test.go:289-318`), but I found no test for `applyConfig()` step 21 or for the interactive CLI commit path (`reapplyRSSIndirection` / `applyToDataplane` test coverage not found). Mitigation: add a daemon/CLI-level test with an injectable RSS executor that proves gRPC, HTTP, and in-process CLI commits all re-run apply/restore.
+
+PR readiness: NOT READY — the daemon API paths now reapply D3 on commit, but the in-process CLI commit path still bypasses that logic, H1 still touches every mlx5 interface instead of only the userspace allowlist, and shutdown still leaves the RSS table behind.
