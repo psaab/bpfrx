@@ -630,3 +630,88 @@ func TestCompileClassOfServiceAllowsIdempotentReassignment(t *testing.T) {
 		t.Fatalf("iperf-c queue = %d, want 5", fc.Queue)
 	}
 }
+
+// TestCompileClassOfServiceRejectsSameFCOnDifferentQueues pins the
+// second direction of the FC ↔ queue bijection: one forwarding class
+// cannot be assigned to two different queue numbers.
+//
+// This path can arise organically from `apply-groups` / `${node}`
+// expansion producing duplicate entries in an operator's config.
+// Pre-fix the second assignment silently overwrote
+// `ForwardingClasses[name].Queue`, so classifier + scheduler-map
+// references to that FC would resolve to the wrong queue depending
+// on the compile-time iteration order — a silent runtime-routing
+// bug with no warning surface. (Flagged by Codex review of the
+// initial PR #787 revision; that revision guarded only the
+// queue-ID → FC-name direction.)
+func TestCompileClassOfServiceRejectsSameFCOnDifferentQueues(t *testing.T) {
+	lines := []string{
+		"set class-of-service forwarding-classes queue 0 best-effort",
+		"set class-of-service forwarding-classes queue 4 iperf-a",
+		"set class-of-service forwarding-classes queue 5 iperf-a", // conflict
+		"set class-of-service schedulers scheduler-iperf-a transmit-rate 1g",
+		"set class-of-service schedulers scheduler-iperf-a transmit-rate exact",
+		"set class-of-service scheduler-maps bandwidth-limit forwarding-class iperf-a scheduler scheduler-iperf-a",
+		"set system dataplane-type userspace",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal(
+			"expected CompileConfig to REJECT a config that assigns " +
+				"the same forwarding-class to two different queues; got " +
+				"no error. Regression silently overwrites the FC→queue " +
+				"map and mis-routes classifier / scheduler-map references.",
+		)
+	}
+	msg := err.Error()
+	// Error must name the FC and BOTH conflicting queue numbers.
+	if !strings.Contains(msg, "iperf-a") {
+		t.Errorf("error message must name the conflicting FC iperf-a, got: %s", msg)
+	}
+	if !strings.Contains(msg, "queue 4") {
+		t.Errorf("error message must name first queue 4, got: %s", msg)
+	}
+	if !strings.Contains(msg, "queue 5") {
+		t.Errorf("error message must name second queue 5, got: %s", msg)
+	}
+}
+
+// TestCompileClassOfServiceRejectsThreeFCsOnOneQueue pins that the
+// duplicate detection fires on the SECOND collision regardless of
+// how many FCs pile up on one queue — the error catches the
+// earliest conflict in iteration order, not the last.
+func TestCompileClassOfServiceRejectsThreeFCsOnOneQueue(t *testing.T) {
+	lines := []string{
+		"set class-of-service forwarding-classes queue 5 iperf-a",
+		"set class-of-service forwarding-classes queue 5 iperf-b",
+		"set class-of-service forwarding-classes queue 5 iperf-c",
+		"set system dataplane-type userspace",
+	}
+	tree := &ConfigTree{}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected three FCs on one queue to be rejected at compile time")
+	}
+	if !strings.Contains(err.Error(), "queue 5") {
+		t.Errorf("error must reference queue 5, got: %s", err.Error())
+	}
+}
