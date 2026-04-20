@@ -266,4 +266,99 @@ restore-on-disable semantic is the only net-new mild concern and
 warrants a doc sentence but not a code change. No regressions in Go
 idioms; tests compile and pass. Ship it from the Go angle.
 
+---
+
+## Round 3 verification
+
+ROUND 3: merge-ready from Go-quality angle
+
+Scope: Go quality of the round-2 fix code in `d61c1d6b`
+(allowlist builder, CLI `applyConfigFn` plumbing, new tests).
+Architectural correctness of the H1/H2 fixes is Codex's angle.
+
+### Round-2 finding status
+
+10. **Restore-on-disable doc gap — CLOSED doc-only.** `d61c1d6b`
+    (commit body "New Go LOW → CLOSED doc-only") adds an explicit
+    sentence to `docs/785-d3-validation.md` covering the
+    driver-default vs. operator-pre-xpfd distinction. No code change,
+    as recommended.
+
+Prior MEDIUMs / LOWs 1-9, 11-12 unchanged — all CLOSED in round 2.
+
+### Round-3 new findings
+
+1. **Allowlist builder (`UserspaceBoundLinuxInterfaces`,
+   `snapshot.go:77-138`) — CLEAN.** Idiomatic: nil-check, typed
+   dedup via `map[string]struct{}` + sorted slice, reuses the same
+   `userspaceSkipsIngressInterface()` filter as the AF_XDP binding
+   plan (exact lock-step with the binding logic it scopes). O(n) over
+   interfaces + fabrics; no hidden O(n^2). Comment documents scope
+   and return semantics. Never returns an error — matches the
+   "best-effort scoping a best-effort optimization" invariant.
+   One small cost note: internally calls `buildSnapshot()` which
+   builds the full snapshot (policies, NAT, routes, filters, flow,
+   etc.) just to reach the filtered interface list. Fine for commit
+   time (1/commit) but overkill; could factor `buildInterfaceSnapshots`
+   out if this ever runs hot. Not blocking.
+
+2. **Callback plumbing (`applyConfigFn`, `cli.go:76,156`) — CLEAN.**
+   Unexported field, exported setter `SetApplyConfigFn`. Signature
+   `func(*config.Config)` matches `d.applyConfig`. No mutex, but
+   the setter is called once at CLI construction before `Run()` —
+   same convention as `SetVRRPManager`, `SetFabricPeer`, etc. Tests
+   explicitly cover the not-set case
+   (`TestCommitApply_FallsBackWhenFnUnset`). No race.
+
+3. **`commitApply` dispatcher (`cli_config.go:23-29`) — CLEAN.**
+   Three commit forms (`commit`, `commit confirmed`, rollback
+   confirm) all route through `commitApply`; auto-rollback handler
+   at `cli.go:572-581` uses the same dispatch. No dead paths. Error
+   propagation preserved — when `applyConfigFn` is wired, errors
+   log inside `d.applyConfig` (void fn by contract); fallback path
+   keeps the legacy `warning: dataplane apply failed: %v` stderr
+   message. Consistent.
+
+4. **New tests — CLEAN.** `TestReapplyRSSIndirection_EndToEndWritesWeights`
+   (`rss_indirection_test.go:474-502`) exercises the real
+   `reapplyRSSIndirectionWith` path through to the `ethtool -X
+   ge-0-0-1 weight 1 1 1 1 0 0` argv — production code path.
+   `TestCommitApply_*` (`cli_commit_test.go`) calls `commitApply`
+   directly, asserts the dispatch, and covers all three states
+   (wired, not-wired-no-dp, does-not-double-call). Allowlist-builder
+   tests (`snapshot_allowlist_test.go`) cover basic filter, mgmt
+   zone, empty, tunnels. Not table-driven but each case is
+   structurally distinct — splitting into a table would obscure,
+   not clarify. All pass (`go test ./pkg/dataplane/userspace/
+   ./pkg/cli/ ./pkg/daemon/`).
+
+5. **API surface — CLEAN.** Two new exported identifiers:
+   `UserspaceBoundLinuxInterfaces` (cross-package API, exported
+   justifiably) and `SetApplyConfigFn` (public setter, matches the
+   `SetVRRPManager` / `SetFabricPeer` pattern). No unexported
+   identifiers that ought to be exported. `reapplyRSSIndirection` /
+   `reapplyRSSIndirectionWith` stay lowercase. `rssAllowed` /
+   `allowedInterfaces` parameters are purely internal.
+
+6. **Commit message hygiene (`d61c1d6b`) — CLEAN.** Body
+   enumerates each finding (Codex H1, H2, M, new Codex LOW, new Go
+   LOW) with PARTIAL → CLOSED state transitions, exact fix
+   summary, and test inventory. `daemon:` prefix matches repo
+   norm. Co-Authored-By present. No Signed-off-by — consistent
+   with repo history.
+
+7. **Forward-compat on interface adds/removes — CLEAN.**
+   `daemon.go:2309` recomputes the allowlist from the incoming
+   `cfg` inside `applyConfig`, so any interface added/removed or
+   re-zoned between commits regenerates the allowlist on that
+   same commit before `reapplyRSSIndirection` runs. The round-2
+   worry ("snapshot at commit time, stale between commits") does
+   not apply — there is no persisted snapshot; the list is a pure
+   function of the compiled config.
+
+### Merge readiness (round 3)
+
+**YES.** All prior findings closed. No new blocking or non-blocking
+findings. `make test` passes for `pkg/dataplane/userspace/`,
+`pkg/cli/`, `pkg/daemon/` on the current tree. Ship it.
 
