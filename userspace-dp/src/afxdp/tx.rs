@@ -4020,11 +4020,15 @@ pub(super) fn cos_queue_push_back(queue: &mut CoSQueueRuntime, item: CoSPendingT
     if matches!(item, CoSPendingTxItem::Local(_)) {
         queue.local_item_count = queue.local_item_count.saturating_add(1);
     }
-    // #785 Phase 3 — Codex round-3 HIGH: any push_back invalidates
-    // the last-pop snapshot. A subsequent push_front must re-anchor
-    // fresh rather than restoring pre-pop head/tail of a bucket
-    // whose state has since changed underneath us.
-    queue.last_pop_snapshot = None;
+    // #785 Phase 3 — Codex round-3 HIGH + NEW-1: any push_back
+    // invalidates every outstanding pop snapshot. A subsequent
+    // push_front must re-anchor fresh rather than restoring
+    // pre-pop head/tail of a bucket whose state has since changed
+    // underneath us. Cleared in bulk (not per-bucket) because the
+    // cost of a tiny Vec::clear is ~zero and the safety contract is
+    // simpler: after any new enqueue, no rollback can use ANY
+    // snapshot captured before it.
+    queue.pop_snapshot_stack.clear();
     account_cos_queue_flow_enqueue(queue, flow_key, item_len);
     if !queue.flow_fair {
         queue.items.push_back(item);
@@ -4067,7 +4071,16 @@ pub(super) fn cos_queue_push_front(queue: &mut CoSQueueRuntime, item: CoSPending
     // `vtime_pre_batch + bytes(committed)` regardless of how many
     // items the TX ring accepted.
     queue.queue_vtime = queue.queue_vtime.saturating_sub(item_len);
-    let snapshot = queue.last_pop_snapshot.take();
+    // #785 Phase 3 — Codex NEW-1: pop the most recent snapshot off
+    // the LIFO stack. In a batched rollback (scratch popped in LIFO
+    // order), this matches the push order from `cos_queue_pop_front`
+    // — the last pop's snapshot comes off first, restoring its
+    // bucket, then the second-to-last, etc. With a single `Option`
+    // slot, only the first restored item ever got its pre-pop
+    // head/tail; earlier drained buckets fell back to the
+    // `max(tail, queue_vtime) + bytes` re-anchor and could overshoot
+    // their pre-pop head.
+    let snapshot = queue.pop_snapshot_stack.pop();
     let was_empty = queue.flow_bucket_items[bucket].is_empty();
     if was_empty {
         // Bucket is idle (either this item is being restored to a
@@ -4162,19 +4175,25 @@ pub(super) fn cos_queue_pop_front(queue: &mut CoSQueueRuntime) -> Option<CoSPend
         // 2-16), not all 1024.
         let bucket_u16 = cos_queue_min_finish_bucket(queue)?;
         let bucket = usize::from(bucket_u16);
-        // #785 Phase 3 — Codex round-3 HIGH: snapshot pre-pop
-        // bucket + vtime state BEFORE we mutate anything. The
-        // snapshot lets `cos_queue_push_front` restore exact
-        // pre-pop head/tail on a TX-ring-full rollback, which is
-        // the only way to make pop→push_front round-trip
-        // finish-time neutral across BOTH the still-active and
-        // drained-bucket cases (Rust reviewer MEDIUM #1).
+        // #785 Phase 3 — Codex round-3 HIGH + NEW-1: snapshot
+        // pre-pop bucket + vtime state BEFORE we mutate anything,
+        // and push onto the per-queue LIFO stack. Every popped
+        // item gets its own snapshot so a batched rollback (N
+        // pops into scratch, submit a prefix, push_front the tail
+        // in LIFO order) can restore exact pre-pop head/tail for
+        // EVERY item — not just the most recent pop.
         //
-        // `queue_vtime` is also rewound symmetrically in
-        // push_front; the snapshot is the belt to that rewind's
-        // braces — a raw vtime restore alone does not recover
-        // head/tail when the pop drained the bucket.
-        queue.last_pop_snapshot = Some(CoSQueuePopSnapshot {
+        // Earlier revision kept a single `Option<...>`; Codex
+        // NEW-1 flagged that earlier drained buckets in a
+        // multi-pop rollback fell back to the
+        // `max(tail, queue_vtime) + bytes` re-anchor formula,
+        // which can overshoot the pre-pop head when queue_vtime
+        // has advanced since the bucket's original enqueue.
+        //
+        // Stack capacity is preallocated to TX_BATCH_SIZE
+        // (see types.rs), so this push is amortized O(1) and
+        // allocation-free.
+        queue.pop_snapshot_stack.push(CoSQueuePopSnapshot {
             bucket: bucket_u16,
             pre_pop_head_finish: queue.flow_bucket_head_finish_bytes[bucket],
             pre_pop_tail_finish: queue.flow_bucket_tail_finish_bytes[bucket],
@@ -5130,7 +5149,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
             flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             queue_vtime: 0,
-            last_pop_snapshot: None,
+            pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
                 flow_rr_buckets: FlowRrRing::default(),
                 flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                 runnable: false,
@@ -11116,6 +11135,273 @@ mod tests {
         assert_eq!(queue.flow_bucket_items[bucket_a].len(), 1);
     }
 
+    /// #785 Phase 3 Codex round-2 NEW-1 — batched rollback on a
+    /// SINGLE bucket must restore every pre-pop snapshot exactly,
+    /// not just the most recent one.
+    ///
+    /// Scenario: N (=4) items enqueued on one flow, drained into
+    /// scratch in one batch (simulating the TX-ring-full drain
+    /// path), then rolled back in LIFO order via push_front.
+    /// After rollback, every per-bucket field and `queue_vtime`
+    /// must equal its pre-batch value.
+    ///
+    /// Prior revision kept a single `Option<CoSQueuePopSnapshot>`
+    /// that each pop overwrote. On rollback only the FIRST
+    /// push_front (matching the LAST pop) got its snapshot; all
+    /// earlier restorations fell back to the idle-bucket
+    /// `max(tail, queue_vtime) + bytes` re-anchor. For this
+    /// single-bucket case the earlier restorations' ACTIVE branch
+    /// did happen to produce the right answer (the restored item
+    /// took over as the new head via `head -= bytes(front)`), BUT
+    /// the drained-bucket case in the cross-bucket pin below
+    /// overshoots without a per-pop stack. Both pins together
+    /// cover single-bucket and multi-bucket correctness.
+    #[test]
+    fn mqfq_batched_rollback_restores_queue_vtime() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
+        // Advance `queue_vtime` so that later flows anchor ahead
+        // of zero (stresses the cross-bucket bug — an earlier pop
+        // whose bucket drains resets head/tail to 0, then
+        // `max(0, queue_vtime) + bytes` on re-enqueue overshoots
+        // the pre-pop head).
+        queue.queue_vtime = 3000;
+
+        let flow_a = test_session_key(5555, 5201);
+        let bucket_a = cos_flow_bucket_index(0, Some(&flow_a));
+
+        cos_queue_push_back(queue, test_flow_cos_item(5555, 1000));
+        cos_queue_push_back(queue, test_flow_cos_item(5555, 1200));
+        cos_queue_push_back(queue, test_flow_cos_item(5555, 800));
+        cos_queue_push_back(queue, test_flow_cos_item(5555, 1400));
+
+        let pre_batch_head = queue.flow_bucket_head_finish_bytes[bucket_a];
+        let pre_batch_tail = queue.flow_bucket_tail_finish_bytes[bucket_a];
+        let pre_batch_bytes = queue.flow_bucket_bytes[bucket_a];
+        let pre_batch_vtime = queue.queue_vtime;
+        let pre_batch_active = queue.active_flow_buckets;
+        let pre_batch_peak = queue.active_flow_buckets_peak;
+        let pre_batch_items = queue.flow_bucket_items[bucket_a].len();
+        assert_eq!(pre_batch_items, 4);
+
+        // Drain all 4 into scratch. Stack grows to 4 snapshots.
+        let mut scratch: Vec<CoSPendingTxItem> = Vec::with_capacity(4);
+        while let Some(item) = cos_queue_pop_front(queue) {
+            scratch.push(item);
+        }
+        assert_eq!(scratch.len(), 4);
+        assert_eq!(
+            queue.pop_snapshot_stack.len(),
+            4,
+            "NEW-1: every pop must push its own snapshot onto the \
+             per-queue LIFO stack",
+        );
+
+        // Roll back all 4 in LIFO order (scratch.pop()). This
+        // mirrors `restore_exact_local_scratch_to_queue_head_flow_fair`.
+        while let Some(item) = scratch.pop() {
+            cos_queue_push_front(queue, item);
+        }
+
+        assert!(
+            queue.pop_snapshot_stack.is_empty(),
+            "NEW-1: snapshot stack must be fully consumed after a \
+             complete rollback",
+        );
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_a], pre_batch_head,
+            "#785 Phase 3 NEW-1: batched rollback must restore \
+             bucket HEAD finish exactly (single-bucket case)",
+        );
+        assert_eq!(
+            queue.flow_bucket_tail_finish_bytes[bucket_a], pre_batch_tail,
+            "#785 Phase 3 NEW-1: batched rollback must restore \
+             bucket TAIL finish exactly (single-bucket case)",
+        );
+        assert_eq!(
+            queue.flow_bucket_bytes[bucket_a], pre_batch_bytes,
+            "#785 Phase 3 NEW-1: batched rollback must restore \
+             bucket byte count exactly",
+        );
+        assert_eq!(
+            queue.queue_vtime, pre_batch_vtime,
+            "#785 Phase 3 NEW-1: batched rollback must restore \
+             queue_vtime exactly — symmetric per-item rewind",
+        );
+        assert_eq!(
+            queue.active_flow_buckets, pre_batch_active,
+            "#785 Phase 3 NEW-1: batched rollback must leave \
+             active_flow_buckets unchanged",
+        );
+        assert_eq!(
+            queue.active_flow_buckets_peak, pre_batch_peak,
+            "#785 Phase 3 NEW-1: peak counter is monotonic — \
+             rollback must not bump it (no fresh high-water mark)",
+        );
+        assert_eq!(queue.flow_bucket_items[bucket_a].len(), pre_batch_items);
+    }
+
+    /// #785 Phase 3 Codex round-2 NEW-1 — batched rollback across
+    /// MULTIPLE buckets. This is the case the prior single-
+    /// `Option<CoSQueuePopSnapshot>` implementation got wrong:
+    /// earlier drained buckets (i.e. not the MOST-recently-popped
+    /// one) had no snapshot at rollback time and fell back to the
+    /// idle re-anchor `max(tail=0, queue_vtime) + bytes`, which
+    /// overshoots the pre-pop head whenever `queue_vtime` has
+    /// advanced past the bucket's original enqueue point.
+    ///
+    /// Scenario construction:
+    ///   1. Pre-advance `queue_vtime=100`; enqueue A (1500) and B
+    ///      (900) at that frontier. pre-pop head[A]=1600,
+    ///      head[B]=1000.
+    ///   2. Force-advance `queue_vtime=5000` to simulate a long
+    ///      period of other-flow drain activity between enqueue
+    ///      and batch.
+    ///   3. Drain both: pop B (head 1000 < 1600), then pop A.
+    ///      vtime goes 5000 → 5900 → 7400. Both buckets drain,
+    ///      head/tail=0.
+    ///   4. Roll back LIFO. scratch.pop() returns A first, then B.
+    ///
+    /// With per-pop snapshots: A's restore pops snap_A from the
+    /// stack and writes head[A]=1600. B's restore pops snap_B and
+    /// writes head[B]=1000.
+    ///
+    /// Without per-pop snapshots (old single-`Option` impl):
+    /// snapshot held {A, 1600, 1600} (last overwrote). A's restore
+    /// uses it and succeeds. B's restore finds snapshot=None,
+    /// falls through to `account_cos_queue_flow_enqueue`:
+    /// head[B] = max(0, vtime_at_that_point=5000) + 900 = 5900,
+    /// overshooting the pre-pop head of 1000 by 4900. THIS PIN
+    /// TRIPS: without the fix the assertion on B's head-finish
+    /// fails at 5900 != 1000.
+    #[test]
+    fn mqfq_batched_rollback_across_multiple_buckets() {
+        let mut root = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        let queue = &mut root.queues[0];
+        queue.flow_fair = true;
+        queue.flow_hash_seed = 0;
+
+        // Step 1: low vtime so A and B anchor near 0.
+        queue.queue_vtime = 100;
+
+        let flow_a = test_session_key(6001, 5201);
+        let bucket_a = cos_flow_bucket_index(0, Some(&flow_a));
+        let flow_b = test_session_key(6002, 5201);
+        let bucket_b = cos_flow_bucket_index(0, Some(&flow_b));
+        assert_ne!(bucket_a, bucket_b, "test hash collision");
+
+        cos_queue_push_back(queue, test_flow_cos_item(6001, 1500));
+        cos_queue_push_back(queue, test_flow_cos_item(6002, 900));
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_a], 1600);
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_b], 1000);
+
+        // Step 2: simulate other-flow drain activity. vtime
+        // advances past both buckets' head finish times. This is
+        // the condition that makes the old single-Option rollback
+        // overshoot on the earlier-popped bucket.
+        queue.queue_vtime = 5000;
+
+        let pre_batch_head_a = queue.flow_bucket_head_finish_bytes[bucket_a];
+        let pre_batch_tail_a = queue.flow_bucket_tail_finish_bytes[bucket_a];
+        let pre_batch_bytes_a = queue.flow_bucket_bytes[bucket_a];
+        let pre_batch_head_b = queue.flow_bucket_head_finish_bytes[bucket_b];
+        let pre_batch_tail_b = queue.flow_bucket_tail_finish_bytes[bucket_b];
+        let pre_batch_bytes_b = queue.flow_bucket_bytes[bucket_b];
+        let pre_batch_vtime = queue.queue_vtime;
+        let pre_batch_active = queue.active_flow_buckets;
+        let pre_batch_peak = queue.active_flow_buckets_peak;
+        assert_eq!(pre_batch_head_a, 1600);
+        assert_eq!(pre_batch_head_b, 1000);
+        assert_eq!(pre_batch_vtime, 5000);
+        assert_eq!(pre_batch_active, 2);
+
+        // Drain both into scratch. MQFQ picks min-finish-first;
+        // B's head (1400) < A's head (2000), so pop order is B
+        // then A. Both buckets drain to head=tail=0.
+        let mut scratch: Vec<CoSPendingTxItem> = Vec::with_capacity(2);
+        while let Some(item) = cos_queue_pop_front(queue) {
+            scratch.push(item);
+        }
+        assert_eq!(scratch.len(), 2);
+        assert_eq!(queue.pop_snapshot_stack.len(), 2);
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_a], 0);
+        assert_eq!(queue.flow_bucket_head_finish_bytes[bucket_b], 0);
+        assert_eq!(queue.active_flow_buckets, 0);
+
+        // Roll back LIFO. scratch.pop() returns A (popped second)
+        // first, then B. Each push_front consumes its own
+        // snapshot off the stack.
+        while let Some(item) = scratch.pop() {
+            cos_queue_push_front(queue, item);
+        }
+
+        assert!(
+            queue.pop_snapshot_stack.is_empty(),
+            "NEW-1: snapshot stack must be fully consumed after a \
+             complete cross-bucket rollback",
+        );
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_a], pre_batch_head_a,
+            "#785 Phase 3 NEW-1: cross-bucket rollback — A's HEAD \
+             must restore from A's OWN per-pop snapshot, not re- \
+             anchor off the rewound vtime (that overshoots).",
+        );
+        assert_eq!(
+            queue.flow_bucket_tail_finish_bytes[bucket_a], pre_batch_tail_a,
+            "#785 Phase 3 NEW-1: cross-bucket rollback — A's TAIL \
+             must restore exactly.",
+        );
+        assert_eq!(queue.flow_bucket_bytes[bucket_a], pre_batch_bytes_a);
+        assert_eq!(
+            queue.flow_bucket_head_finish_bytes[bucket_b], pre_batch_head_b,
+            "#785 Phase 3 NEW-1: cross-bucket rollback — B's HEAD \
+             must restore exactly (this is the 'most recent pop' \
+             case that worked with the single-snapshot impl too).",
+        );
+        assert_eq!(
+            queue.flow_bucket_tail_finish_bytes[bucket_b], pre_batch_tail_b,
+        );
+        assert_eq!(queue.flow_bucket_bytes[bucket_b], pre_batch_bytes_b);
+        assert_eq!(
+            queue.queue_vtime, pre_batch_vtime,
+            "#785 Phase 3 NEW-1: vtime must rewind symmetrically \
+             across a cross-bucket batch rollback.",
+        );
+        assert_eq!(
+            queue.active_flow_buckets, pre_batch_active,
+            "#785 Phase 3 NEW-1: cross-bucket rollback must re- \
+             activate both buckets.",
+        );
+        assert_eq!(queue.active_flow_buckets_peak, pre_batch_peak);
+    }
+
     /// #785 Phase 3 Codex round-2 MEDIUM — brief-idle re-entry pin.
     /// Previous pins covered the LARGE-idle case (bucket drains,
     /// lots of other traffic flows, bucket re-enqueues far in the
@@ -12484,7 +12770,7 @@ mod tests {
             flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             queue_vtime: 0,
-            last_pop_snapshot: None,
+            pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
@@ -12528,7 +12814,7 @@ mod tests {
             flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             queue_vtime: 0,
-            last_pop_snapshot: None,
+            pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,
@@ -12583,7 +12869,7 @@ mod tests {
             flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
             queue_vtime: 0,
-            last_pop_snapshot: None,
+            pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
             flow_rr_buckets: FlowRrRing::default(),
             flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
             runnable: false,

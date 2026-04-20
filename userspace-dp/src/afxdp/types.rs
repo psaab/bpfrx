@@ -1133,31 +1133,41 @@ pub(super) struct CoSQueueRuntime {
     /// `cos_queue_push_front` (-= pushed bytes, symmetric rewind —
     /// see PR #796 Codex round-3 HIGH).
     pub(super) queue_vtime: u64,
-    /// #785 Phase 3 — Codex round-3 HIGH: snapshot of the bucket
-    /// state at the moment of the most recent `cos_queue_pop_front`,
-    /// used by `cos_queue_push_front` to restore pre-pop head/tail
-    /// when the caller rolls back a pop on TX-ring-full. Without
-    /// this, a push_front to a bucket that drained on pop hits the
-    /// `was_empty` re-anchor branch and writes
-    /// `max(0, queue_vtime) + bytes`, which overshoots the pre-pop
-    /// head by one packet (Rust reviewer MEDIUM #1).
+    /// #785 Phase 3 — Codex round-3 HIGH + NEW-1: LIFO stack of
+    /// bucket-state snapshots captured at each `cos_queue_pop_front`.
+    /// `cos_queue_push_front` pops from the back of the stack on
+    /// rollback so every item in a batched multi-pop restore can
+    /// restore its own pre-pop head/tail exactly — not just the most
+    /// recent pop.
     ///
-    /// Only the MOST RECENT pop's snapshot is preserved — multi-pop
-    /// sequences overwrite. In the common TX-ring-full retry flow,
-    /// pop_front → push_front happens in the same control block
-    /// with no intervening pop, so the snapshot is fresh at
-    /// push_front time. For multi-pop sequences where N pops then
-    /// push_front the tail items in LIFO order, only the FIRST
-    /// push_front uses the snapshot; subsequent ones fall back to
-    /// the rewound-vtime re-anchor (still correctness-safe: the
-    /// per-item `queue_vtime` rewind in push_front is symmetric,
-    /// so the aggregate vtime returns to pre-batch regardless).
+    /// Stack ordering:
+    ///   * `cos_queue_pop_front` pushes onto the back (most recent).
+    ///   * `cos_queue_push_front` pops from the back (LIFO).
+    ///   * `cos_queue_push_back` clears the stack (any new enqueue
+    ///     can invalidate earlier snapshots — bucket state under
+    ///     those snapshots has changed).
+    ///   * Flow-fair drain helpers (`drain_exact_*_flow_fair`) clear
+    ///     the stack at batch start so stale snapshots from a
+    ///     previous batch's successful submit do not leak into the
+    ///     current batch.
     ///
-    /// Consumed (set to `None`) on push_front of the snapshotted
-    /// bucket. Cleared on `cos_queue_push_back` so a new enqueue
-    /// cannot stale-read the snapshot from a bucket that has since
-    /// been modified.
-    pub(super) last_pop_snapshot: Option<CoSQueuePopSnapshot>,
+    /// Size bound: at most `TX_BATCH_SIZE` entries alive at once —
+    /// pop_front on a flow-fair queue is only called from the drain
+    /// helpers, which cap scratch depth at `TX_BATCH_SIZE` and push
+    /// onto the stack once per pop. Preallocated to that capacity so
+    /// no hot-path realloc occurs. Each entry is 24 bytes
+    /// (`CoSQueuePopSnapshot`), so the worst-case footprint is
+    /// 256 × 24 = ~6 KB per queue — on top of the 1024-bucket
+    /// bookkeeping arrays already resident in `CoSQueueRuntime`.
+    ///
+    /// Why a stack and not a single `Option`: earlier drained
+    /// buckets in a batched rollback (e.g. N pops across M buckets,
+    /// all ring-full-retried) need their exact pre-pop head/tail,
+    /// not the `max(tail, queue_vtime) + bytes` re-anchor, which
+    /// can overshoot when `queue_vtime` has already advanced past
+    /// the earlier bucket's original head. Per-pop snapshots make
+    /// every rollback item round-trip neutral.
+    pub(super) pop_snapshot_stack: Vec<CoSQueuePopSnapshot>,
     /// #785 Phase 3 — active-set tracking for flow-fair MQFQ.
     /// Still populated on bucket 0→>0 / >0→0 transitions so that
     /// `cos_queue_front`/`cos_queue_pop_front` can scan just the
