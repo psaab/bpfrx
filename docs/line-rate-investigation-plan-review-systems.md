@@ -1,6 +1,6 @@
 # Line-rate investigation plan — systems / OS review
 
-**ROUND 3: plan-ready YES from systems angle** (tip `dd6234b7`).
+**ROUND 4: plan-ready YES from systems angle** (tip `e55291f0`).
 
 
 Reviewer focus: OS, driver, NIC, syscall, affinity, cache. Codex is
@@ -237,3 +237,41 @@ Round-3 angles:
 Both round-3 findings are diagnostic improvements, not blockers.
 Plan-ready from systems angle: **YES**. Proceed with Phase C
 pre-work (instrumentation decision) then Step 0 gates.
+
+## Round 4 verification
+
+Revision tip `e55291f0`. Plan now 810 lines. Commit message cites
+fold-in of Codex #6/#7(new) and Systems R3-1.
+
+**R3-1 (PCI-BDF-scoped IRQ match) — CLOSED.** New "Step 0.1
+refinement" section at lines 368-374 specifies the exact pattern:
+
+    grep mlx5_comp<N>@pci:$(basename $(readlink /sys/class/net/<iface>/device))
+
+with the instruction "Apply this scoping to every IRQ-affinity row
+in the Step 0 table." This removes the multi-NIC false-match hazard
+that round-3 flagged. One-line, correct, applies uniformly to rows
+0.1-q0 through 0.1-q3. Done.
+
+**S-7 (CPU freq / C-states) — NOT promoted, current form is
+ACCEPTABLE.** Plan still treats Step 0.5 as `governor=performance`
+PASS/FAIL with `Bzy_MHz` / `CPU%c6` as DIAGNOSTIC-only (lines
+295-302, summary row 344, fold-in map lines 762-763 explicitly
+"not a blocking gate"). I recommended promotion in round 3;
+author chose to leave it. For a time-bounded investigation, the
+current shape is defensible because:
+1. `turbostat --interval 1` for 65 s runs during EVERY Step 3
+   capture (line 297-299) — frequency drops will surface in the
+   captured data, not get lost.
+2. Blocking on `governor=performance` catches the most common
+   misconfiguration (tuned defaults, BIOS) at zero code cost.
+3. Adding `intel_idle.max_cstate=1` as a blocking gate would
+   require a VM reboot with kernel args, which inflates the
+   setup cost of every run and is overkill for a 5-run delta
+   protocol where drift appears in turbostat anyway.
+
+If Phase A runs show `Bzy_MHz` drifting between pre and post
+baselines, the investigator can tighten this to a gate then —
+but it's not a blocker now.
+
+**Plan-ready from systems angle: YES.** Proceed.
