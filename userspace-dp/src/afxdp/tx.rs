@@ -3173,42 +3173,6 @@ const COS_TIMER_WHEEL_L0_HORIZON_TICKS: u64 = COS_TIMER_WHEEL_L0_SLOTS as u64;
 /// convergence stays pinned by the gate rather than by the burst.
 const COS_CROSS_WORKER_BURST_NS: u64 = 3_000_000;
 
-/// #785 slice 2 — cross-worker DRR.
-///
-/// Peak-decay window for the rate-gate division denominator. Every
-/// `COS_FAIR_SHARE_PEAK_WINDOW_NS`, each worker snaps its
-/// `local_fair_share_peak` to the live `active_flow_buckets` value,
-/// and also snaps `SharedCoSQueueLease.active_flow_count_peak` to
-/// the live `active_flow_count`. Within a window, peaks grow
-/// monotonically on bucket 0→>0 transitions (capturing the max-ever
-/// flow count during that window and absorbing SFQ bucket-bytes
-/// oscillation between packets). At the window boundary peaks drop
-/// back to reflect whatever flows are actually still active.
-///
-/// Without this decay, peaks pin at their lifetime high-water mark
-/// and a queue that once saw 12 concurrent flows keeps dividing by
-/// 12 forever — on realistic workloads with flow churn (HTTP
-/// short-lived TCP, L7LB terminations) that progressively starves
-/// every worker down to 1/lifetime_peak of the shaper rate. Codex
-/// review on the first slice-2 revision flagged this as HIGH.
-///
-/// 2 s chosen as the trade-off between:
-///
-///   * Shorter (hundreds of ms) — peak-reset fires often, but each
-///     reset temporarily exposes the rate gate to the SFQ bucket-
-///     churn oscillation (1-5 vs true 12) for the ~ms it takes
-///     `add_active_flow` to CAS the peak back up. At 500 ms empirical
-///     variance on iperf3 -P 12 ran 14-22 Gbps across three runs
-///     (individually correct but run-to-run unstable).
-///   * Longer (tens of seconds) — stale high-water marks persist
-///     through flow-count drops, starving workers during ramp-down.
-///
-/// 2 s is ~10× steady-state TCP convergence time at a 20 ms RTT,
-/// so a short reset-exposure window amortises over ~100 drain
-/// cycles. Flows that leave see the gate's denominator drop within
-/// ~2 s, which is acceptable for realistic workloads (L7LB
-/// connection churn horizon is seconds, not sub-second).
-const COS_FAIR_SHARE_PEAK_WINDOW_NS: u64 = 2_000_000_000;
 
 /// ECN CE-marking threshold as a fraction of the relevant cap.
 /// Applied to both the aggregate `buffer_limit` and the per-flow
@@ -3719,20 +3683,37 @@ fn maybe_top_up_local_fair_share(queue: &mut CoSQueueRuntime, now_ns: u64) {
     let Some(lease) = queue.shared_lease.as_ref() else {
         return;
     };
-    // #785 slice 2: decay the windowed peak every
-    // `COS_FAIR_SHARE_PEAK_WINDOW_NS`. Addresses Codex HIGH: without
-    // this, peaks pin at lifetime max and a queue that briefly saw
-    // many concurrent flows keeps dividing by that count forever.
-    // Snap local_fair_share_peak to the live `active_flow_buckets`
-    // value, and delegate the shared snap to the lease so the
-    // cross-worker peak drops too. First deadline (== 0 on a fresh
-    // runtime) fires immediately and arms the timer.
-    if now_ns >= queue.local_fair_share_peak_deadline_ns {
-        queue.local_fair_share_peak = queue.active_flow_buckets;
-        lease.snap_peak_to_current();
-        queue.local_fair_share_peak_deadline_ns =
-            now_ns.saturating_add(COS_FAIR_SHARE_PEAK_WINDOW_NS);
+    // #785 slice 2: idle-only peak reset. Addresses Codex HIGH
+    // (lifetime-pinned starvation on churn) while preserving low
+    // per-flow CoV on steady-state workloads.
+    //
+    // Continuous time-based decay (linear, snap-to-current, or
+    // window-snap) was tried and rolled back because ANY form of
+    // decay based on instantaneous live-count readings samples the
+    // SFQ bucket-bytes oscillation between TCP packets (live count
+    // transiently dips 1-5 when the true count is 12), which bounces
+    // the rate-gate denominator and inflates per-flow CoV from 19 %
+    // to 40-50 %.
+    //
+    // Idle-only reset handles the Codex concern (a queue that
+    // briefly saw many flows no longer divides by that count forever
+    // — specifically, once all flows on the queue complete, the
+    // peak drops to 0 and the next burst rebuilds from scratch)
+    // while NEVER perturbing an active queue. The trade-off: on a
+    // queue with sustained churn that never reaches fully-idle, the
+    // peak remains pinned at the lifetime max. That less-common
+    // case is a documented follow-up target; candidate mechanisms
+    // include EWMA of live count or per-flow idle-deadline tracking.
+    //
+    // No window timer is required for idle detection — the SFQ
+    // accounting (`account_cos_queue_flow_dequeue`) already
+    // decrements `active_flow_buckets` when the last packet drains
+    // from a bucket, so `== 0` is an accurate "worker is idle"
+    // signal each time the drain path is entered.
+    if queue.active_flow_buckets == 0 {
+        queue.local_fair_share_peak = 0;
     }
+    lease.snap_peak_to_current();
     // Use peak counts for both local and total so the division
     // denominator is stable in steady state. SFQ bucket bytes
     // transition to 0 and back between packet arrivals, which
@@ -3742,10 +3723,10 @@ fn maybe_top_up_local_fair_share(queue: &mut CoSQueueRuntime, now_ns: u64) {
     // workers briefly over-rate during dips and starve during
     // spikes. Peak-based counts are a conservative upper bound
     // that converges to the true flow count within ~1 ms on a
-    // steady-state workload and decays back within
-    // `COS_FAIR_SHARE_PEAK_WINDOW_NS` when flows leave. Matching
+    // steady-state workload, and drops to 0 only when the whole
+    // queue goes idle (see `snap_peak_to_current`). Matching
     // peak-vs-peak on both sides preserves the sum-across-workers
-    // == queue_rate invariant within each window.
+    // == queue_rate invariant.
     let total = lease.active_flow_count_peak();
     let local = queue.local_fair_share_peak as u32;
     // Also use the SHARED LEASE's rate, not
@@ -5174,7 +5155,6 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 active_flow_buckets: 0,
                 active_flow_buckets_peak: 0,
                 local_fair_share_peak: 0,
-                local_fair_share_peak_deadline_ns: 0,
                 local_drain_tokens: 0,
                 local_drain_last_refill_ns: 0,
                 local_drain_rate_bytes: 0,
@@ -11608,7 +11588,6 @@ mod tests {
             active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
             local_fair_share_peak: 0,
-            local_fair_share_peak_deadline_ns: 0,
             local_drain_tokens: 0,
             local_drain_last_refill_ns: 0,
             local_drain_rate_bytes: 0,
@@ -11654,7 +11633,6 @@ mod tests {
             active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
             local_fair_share_peak: 0,
-            local_fair_share_peak_deadline_ns: 0,
             local_drain_tokens: 0,
             local_drain_last_refill_ns: 0,
             local_drain_rate_bytes: 0,
@@ -11711,7 +11689,6 @@ mod tests {
             active_flow_buckets: 0,
             active_flow_buckets_peak: 0,
             local_fair_share_peak: 0,
-            local_fair_share_peak_deadline_ns: 0,
             local_drain_tokens: 0,
             local_drain_last_refill_ns: 0,
             local_drain_rate_bytes: 0,
@@ -13371,55 +13348,81 @@ mod tests {
         apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
         let queue = &mut runtime.queues[0];
 
-        // Ramp: 12 flows arrive over the initial window.
-        let now_ns_start = 1_000_000_000u64;
+        // Ramp: 12 flows arrive. Peaks climb to 12 on both sides.
+        let now_ns = 1_000_000_000u64;
         for port in 33001..33013u16 {
             let flow = test_session_key(5201, port);
             account_cos_queue_flow_enqueue(queue, Some(&flow), 1500);
         }
-        // Initial top-up arms the decay deadline.
-        maybe_top_up_local_fair_share(queue, now_ns_start);
+        maybe_top_up_local_fair_share(queue, now_ns);
         assert_eq!(queue.local_fair_share_peak, 12);
         assert_eq!(lease.active_flow_count_peak(), 12);
 
-        // 11 flows leave (their SFQ buckets drain to 0).
+        // 11 flows leave (their SFQ buckets drain to 0). Live counts
+        // drop to 1, but ONE flow is still active — idle-only reset
+        // keeps both peaks pinned.
         for port in 33001..33012u16 {
             let flow = test_session_key(5201, port);
             account_cos_queue_flow_dequeue(queue, Some(&flow), 1500);
         }
-        // Live counts drop; peaks should NOT yet (within window).
         assert_eq!(queue.active_flow_buckets, 1);
         assert_eq!(lease.active_flow_count(), 1);
-        maybe_top_up_local_fair_share(queue, now_ns_start + 1_000_000);
+
+        // Call the refill many times with long gaps — peaks MUST
+        // NOT decay while any flow is still active, because any
+        // decay-while-non-idle samples the SFQ bucket-oscillation
+        // dips and bounces the rate-gate denominator. The test
+        // spaces calls across what would have been multiple decay
+        // windows on the previous revision; peaks must stay at 12.
+        for step_ns in &[10_000_000u64, 100_000_000, 1_000_000_000, 10_000_000_000] {
+            let t = now_ns.saturating_add(*step_ns);
+            maybe_top_up_local_fair_share(queue, t);
+            assert_eq!(
+                queue.local_fair_share_peak, 12,
+                "#785: peak MUST stay pinned while any flow is \
+                 active. Regression = CoV inflates from 19 % to \
+                 40-50 % because per-worker decay boundaries \
+                 desync the rate-gate denominator.",
+            );
+            assert_eq!(
+                lease.active_flow_count_peak(),
+                12,
+                "#785: shared peak MUST stay pinned in lockstep \
+                 with local peak while any flow is active.",
+            );
+        }
+
+        // Drain the final flow — now the queue is fully idle. Peaks
+        // MUST drop to 0 so the NEXT burst of connections rebuilds
+        // the denominator from scratch rather than inheriting the
+        // stale lifetime max.
+        let last_flow = test_session_key(5201, 33012);
+        account_cos_queue_flow_dequeue(queue, Some(&last_flow), 1500);
+        assert_eq!(queue.active_flow_buckets, 0);
+        assert_eq!(lease.active_flow_count(), 0);
+
+        maybe_top_up_local_fair_share(queue, now_ns + 20_000_000_000);
         assert_eq!(
-            queue.local_fair_share_peak, 12,
-            "within decay window the peak MUST stay at the observed \
-             max — otherwise flow-bucket oscillation on the one \
-             remaining flow would immediately drop it",
+            queue.local_fair_share_peak, 0,
+            "#785 Codex HIGH: local peak MUST reset to 0 when this \
+             worker's active_flow_buckets hits 0. Without this reset \
+             the lifetime-pinned starvation mode returns: a queue \
+             that briefly saw 12 flows keeps dividing by 12 forever \
+             after those connections close.",
         );
         assert_eq!(
             lease.active_flow_count_peak(),
-            12,
-            "shared peak must also be sticky within the window",
+            0,
+            "#785 Codex HIGH: shared peak MUST reset when the whole \
+             queue reaches active_flow_count == 0 (every worker \
+             idle). Regression here = daemon-lifetime max pinning.",
         );
 
-        // Cross the decay window boundary.
-        let after_window = now_ns_start + COS_FAIR_SHARE_PEAK_WINDOW_NS + 1;
-        maybe_top_up_local_fair_share(queue, after_window);
-        assert_eq!(
-            queue.local_fair_share_peak, 1,
-            "#785 Codex HIGH: after decay window, local peak MUST \
-             snap to live active_flow_buckets (1). Regression here \
-             re-introduces the lifetime-pinned denominator that \
-             starves workers on flow churn.",
-        );
-        assert_eq!(
-            lease.active_flow_count_peak(),
-            1,
-            "#785 Codex HIGH: shared peak MUST snap too — otherwise \
-             one worker decays locally but the shared denominator \
-             stays pinned and the fair-share math is still stale.",
-        );
+        // Verify the next burst rebuilds peaks from zero.
+        let new_flow = test_session_key(5201, 44001);
+        account_cos_queue_flow_enqueue(queue, Some(&new_flow), 1500);
+        assert_eq!(queue.local_fair_share_peak, 1);
+        assert_eq!(lease.active_flow_count_peak(), 1);
     }
 
     /// #785 slice 2 Codex MEDIUM: rate-source consistency — both

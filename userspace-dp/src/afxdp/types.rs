@@ -1005,32 +1005,26 @@ pub(super) struct CoSQueueRuntime {
     /// without resetting (Codex review: do NOT reset on
     /// snapshot, the doc here is the contract).
     pub(super) active_flow_buckets_peak: u16,
-    /// #785 slice 2: windowed peak of `active_flow_buckets` on this
-    /// worker used as the LOCAL input to the cross-worker fair-share
-    /// rate calculation. Kept SEPARATE from
-    /// `active_flow_buckets_peak` above because that field has a
-    /// "never reset during daemon lifetime" contract from #784
-    /// (operators inspect it to detect SFQ hash collisions).
-    /// Perturbing that semantics by adding a reset for the scheduler
-    /// would regress the diagnostic.
+    /// #785 slice 2: peak of `active_flow_buckets` on this worker
+    /// used as the LOCAL input to the cross-worker fair-share rate
+    /// calculation. Kept SEPARATE from `active_flow_buckets_peak`
+    /// above because that field has a "never reset during daemon
+    /// lifetime" contract from #784 (operators inspect it to detect
+    /// SFQ hash collisions). Perturbing that semantics by adding a
+    /// reset for the scheduler would regress the diagnostic.
     ///
-    /// Bumped on bucket 0→>0 transitions in lockstep with
-    /// `active_flow_buckets_peak`, so it captures the maximum live
-    /// flow count within the current window. Reset to the live
-    /// instantaneous `active_flow_buckets` value every
-    /// `COS_FAIR_SHARE_PEAK_WINDOW_NS` (currently 500 ms) in
-    /// `maybe_top_up_local_fair_share`. The reset is the decay
-    /// mechanism: on flow churn (HTTP short-lived TCP, L7LB
-    /// terminations) the peak stops pinning the rate gate's
-    /// denominator at a stale high-water mark, which would
-    /// progressively starve the worker as flows leave.
+    /// Bumped on bucket 0→>0 transitions. Reset to 0 only when this
+    /// worker's `active_flow_buckets` reaches 0 — i.e. every SFQ
+    /// bucket on this worker is empty, meaning every flow that was
+    /// pinned to this worker by RSS has drained. This idle-only
+    /// reset keeps the peak stable under ALL non-idle workloads
+    /// (empirically critical: any decay based on instantaneous live
+    /// count reads samples the SFQ bucket-bytes oscillation between
+    /// packets and bounces the rate-gate denominator, inflating
+    /// per-flow CoV to 40-50 % vs 19 % on stable peaks). Once the
+    /// worker goes idle, peak drops and the next burst rebuilds it
+    /// from scratch.
     pub(super) local_fair_share_peak: u16,
-    /// Wall-time deadline for the next peak-reset. Absolute monotonic
-    /// nanoseconds. Compared against `now_ns` in
-    /// `maybe_top_up_local_fair_share`; when exceeded the peak snaps
-    /// to the live `active_flow_buckets` and the deadline advances
-    /// by another window.
-    pub(super) local_fair_share_peak_deadline_ns: u64,
     /// #785 cross-worker DRR: per-worker local token bucket that
     /// enforces `fair_share_rate_bytes = lease.rate_bytes()
     /// × (local_fair_share_peak / lease.active_flow_count_peak())` on
@@ -1554,23 +1548,55 @@ impl SharedCoSQueueLease {
         self.active_flow_count_peak.load(Ordering::Relaxed)
     }
 
-    /// Snap `active_flow_count_peak` down to the live
-    /// `active_flow_count`. Called by each worker at the boundary
-    /// of its own peak-decay window (one per
-    /// `COS_FAIR_SHARE_PEAK_WINDOW_NS`, currently 500 ms). Multiple
-    /// workers can snap concurrently; the store is lossy but the
-    /// next `add_active_flow` CAS-walks the peak back up to the
-    /// true max if it under-shot.
+    /// Reset `active_flow_count_peak` to the live count ONLY if
+    /// the live count is zero — i.e., the queue is fully idle,
+    /// every flow has drained across every worker. Addresses the
+    /// Codex HIGH "lifetime-pinned starvation" finding while
+    /// preserving rate-gate denominator stability under all
+    /// non-idle workloads.
     ///
-    /// Must NOT be called from any path that needs peak to be
-    /// monotonic across the daemon's lifetime — this is solely the
-    /// rate-gate's decay hook. The #784 per-worker diagnostic peak
-    /// `CoSQueueRuntime.active_flow_buckets_peak` has its own
-    /// "never reset" contract and a separate field.
+    /// **Why idle-only reset (not linear decay, not snap-to-live):**
+    /// empirical measurements on iperf3 -P 12 showed that ANY form
+    /// of decay based on instantaneous live-count readings — whether
+    /// full snap-to-current at a window boundary or one-unit-per-
+    /// window linear decay — bounces the rate-gate denominator
+    /// because `active_flow_count` transiently dips (to 1-5) between
+    /// TCP packet arrivals on the same flows. Per-worker decay
+    /// boundaries are not synchronized across workers, so at any
+    /// moment one worker's peak has just decayed while another
+    /// still sits at pre-decay max — their (local_peak / shared_peak)
+    /// ratios diverge, the under-peaked worker over-rates its
+    /// share, and per-flow CoV inflates to 40-50 % (vs 19 % on
+    /// non-decaying peaks).
+    ///
+    /// Idle-only reset resolves the conflict: while any flow is
+    /// active on the queue, peak stays pinned at the observed max
+    /// and every worker sees a stable denominator. When all flows
+    /// depart (genuinely — not a transient bucket-empty between
+    /// packets, because `active_flow_count` == 0 iff every SFQ
+    /// bucket on every worker is empty), peak drops to 0, so the
+    /// next burst of connections rebuilds the denominator from
+    /// scratch rather than inheriting the previous burst's peak.
+    ///
+    /// This IS weaker than a continuous-decay mechanism: a queue
+    /// that sees sustained flow churn without ever reaching
+    /// fully-idle state will have its peak pinned at the lifetime
+    /// max, and can under-rate workers accordingly. That shape is
+    /// less common than the Codex HIGH suggested (most realistic
+    /// workloads have quiet periods) but remains a follow-up
+    /// target — candidate mechanisms include EWMA of live count or
+    /// per-flow idle-deadline tracking.
+    ///
+    /// Multiple workers calling concurrently is safe: the store is
+    /// idempotent (all see the same current == 0 and store 0). A
+    /// concurrent `add_active_flow` that races to bump peak above
+    /// 0 wins via the CAS loop in `add_active_flow`.
     #[inline]
     pub(super) fn snap_peak_to_current(&self) {
         let current = self.active_flow_count.load(Ordering::Relaxed);
-        self.active_flow_count_peak.store(current, Ordering::Relaxed);
+        if current == 0 {
+            self.active_flow_count_peak.store(0, Ordering::Relaxed);
+        }
     }
 
     /// Reverse of `add_active_flow`. Uses `saturating_sub` via
