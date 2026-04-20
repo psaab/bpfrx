@@ -9,6 +9,22 @@
 > either folded into a concrete revision in the sections below, or
 > explicitly deferred with rationale in "Deferred findings" at the
 > end.
+>
+> **Round-2 fold-in.** A second round of both reviews produced four
+> additional findings (Codex #4-#7) and three systems-side refinements
+> (R2-1/R2-2/R2-3). Each is folded into a concrete revision:
+> Step 0 is now a per-item PASS/FAIL checklist with a summary table
+> (Codex #4); the CoV rollback gate carries an absolute floor
+> (Codex #5); the latency probe is fully specified with dual-size
+> concurrent `ping`, CPU isolation, and a p99 floor (Codex #6 +
+> R2-1); the ring-quadruple audit is consolidated into a single
+> Step 0.4 counter-by-counter table (Codex #7); `ss -ti` cadence is
+> pinned to every 5 s full-window on all flows (R2-2); `perf stat`
+> scope is pinned to `--per-thread -p <worker_pids>` (R2-3); and an
+> "Instrumentation pre-work" sub-section in Phase C names every
+> counter required by the audit that does NOT currently exist in the
+> code, so those become pre-requisites for the investigation rather
+> than silent holes in the plan.
 
 ## Problem statement
 
@@ -188,15 +204,26 @@ can be the entire answer. Any finding that fires at Step 0 is
 addressed *first*, before any code change, and may eliminate the
 need for further investigation.
 
+**Structure (Codex round-2 #4).** Step 0 is a **per-item
+checklist**, not a single pass/fail gate. Each sub-step below
+MUST produce a discrete PASS/FAIL line, with the observed value
+recorded against the expected value. Step 0 as a whole is NEVER
+just "PASS"; the summary is the table at the end of this section.
+Any FAIL becomes a candidate zero-code fix BEFORE any dataplane
+investigation proceeds. A PASS on some items does not excuse a
+FAIL on another — every item is mandatory.
+
 **0.1 NIC IRQ ↔ worker CPU alignment** (systems S-1 / HIGH #1).
 - `ethtool -x <iface>` to map RSS queues → queue indices.
 - `cat /proc/interrupts | grep mlx5` and
   `cat /proc/irq/<N>/smp_affinity_list` for each mlx5 queue IRQ.
 - Cross-reference: XDP-bound worker N is pinned to CPU N; queue N's
   IRQ MUST land on CPU N (or a same-L2/L3 sibling).
-- **Gate**: misalignment must be fixed at this step (zero-code
-  `echo <cpu> > /proc/irq/<N>/smp_affinity_list`) before
-  proceeding. Re-measure baseline afterwards.
+- **Per-queue PASS/FAIL**: record one line per mlx5 queue: observed
+  `smp_affinity_list` vs expected (worker-N CPU or its sibling).
+  Any single-queue FAIL → overall 0.1 FAIL.
+- **Zero-code fix if FAIL**: `echo <cpu> >
+  /proc/irq/<N>/smp_affinity_list`; re-measure baseline after.
 
 **0.2 NAPI / coalescence / busy-poll audit** (systems S-3 / HIGH
 #3).
@@ -207,9 +234,14 @@ need for further investigation.
 - Confirm `SO_BUSY_POLL` / `SO_PREFER_BUSY_POLL` values actually
   present on the XSK sockets (read from process state or
   binding snapshot).
-- **Gate**: if any value is clearly pathological (e.g., adaptive
-  coalescing forcing high rx-usecs under load, `netdev_budget`
-  too low for 2M pps), tune at sysctl / ethtool level first.
+- **Per-item PASS/FAIL**: each of the fields above produces a
+  separate `observed vs expected` line. Expected values
+  (documented in the Step 0 summary table below): adaptive
+  coalescing OFF, `rx-usecs ≤ 8`, `netdev_budget ≥ 600`,
+  `netdev_budget_usecs ≥ 8000`, `gro_flush_timeout` matches
+  worker polling loop, `SO_BUSY_POLL` = 1 µs, `SO_PREFER_BUSY_POLL`
+  = 1. An item is not quietly accepted because "it looks OK"; each
+  gets its own explicit FAIL disposition if observed ≠ expected.
 
 **0.3 TCP congestion control pinning** (Codex MEDIUM).
 - Record `sysctl net.ipv4.tcp_congestion_control` on BOTH iperf3
@@ -218,29 +250,108 @@ need for further investigation.
   run-to-run variance is confounded.
 - Pin explicitly to a single algorithm (default `cubic` unless a
   specific test case demands otherwise) on both ends.
-- Verify during runs via `ss -ti` on at least one sample flow to
-  confirm the algorithm actually in effect.
+- Verify during runs via `ss -ti` (cadence: Step 3) to confirm the
+  algorithm is in effect on all flows.
+- **PASS/FAIL**: both endpoints show the same pinned algorithm AND
+  `ss -ti` sample confirms it at run-time.
 
-**0.4 Ring-quadruple audit** (systems S-4 / MEDIUM).
-- `ethtool -g ge-0-0-1` and ge-0-0-2.80: current vs max for RX,
-  TX, **fill, and completion** rings. `ring_entries` (default
-  4096) sets all four equally at bind; if any of the four is the
-  bottleneck the symptom differs (TX-ring-full on produce vs
-  completion starvation on reap with no TX-full signal).
-- Record pre-run; this step is cheap and frames H-FWD-1 correctly.
+**0.4 Ring-quadruple audit — single authoritative table** (systems
+S-4 / MEDIUM; Codex round-2 #7). This is the ONE canonical
+ring-inspection section of the plan; Step 5 references this table
+rather than duplicating it.
+
+Inspect RX, TX, fill, and completion rings via `ethtool -g
+<iface>` (current vs max) on both `ge-0-0-1` and `ge-0-0-2.80`.
+`ring_entries` (default 4096) sets all four equally at bind; if
+any of the four is the bottleneck the symptom differs (TX-ring-
+full on produce vs completion starvation on reap, with no
+TX-ring-full signal).
+
+Authoritative counters per ring (named source; any counter not
+currently present in the code is flagged in the Phase C
+"Instrumentation pre-work" sub-section as a pre-req):
+
+| Ring | Primary (authoritative) counter | Secondary counter | Source |
+|-|-|-|-|
+| RX (NIC) | `rx_out_of_buffer` | `rx_missed_errors` / `rx_fifo_errors` | `ethtool -S <iface>` (mlx5) |
+| RX fill (XSK) | `rx_fill_ring_empty_descs` | `fill_batch_starved` **(not yet in code — see Phase C pre-work)** | `xdp_statistics` from XSK sockets |
+| TX (XSK) | `dbg_tx_ring_full` | NIC `tx_dropped` | `userspace-dp` BindingLiveSnapshot |
+| TX (kernel produce path) | `dbg_sendto_enobufs` + `dbg_pending_overflow` + `pending_tx_local_overflow_drops` + `tx_submit_error_drops` | — | `userspace-dp` BindingLiveSnapshot |
+| Completion (XSK) | `completion_reap_max_batch` **(not yet in code — see Phase C pre-work)** | `outstanding_tx` (proxy: high + static = reap lag) | `userspace-dp` BindingLiveSnapshot |
+
+Record pre-run values on all counters that exist; this step is
+cheap and frames H-FWD-1 correctly. If the plan needs a counter
+that does not yet exist (see right-most "source" column), that
+counter is a Phase C prerequisite — see "Instrumentation pre-work"
+under the Phasing section; the investigation does NOT proceed past
+Step 0.4 for that ring without either the counter landing or an
+explicit decision to proxy via a secondary counter for this pass.
+
+**PASS/FAIL**: this sub-step PASSes when all rings on both
+interfaces report zero on their authoritative counter during a
+cold run (no iperf3 load). Any non-zero counter at baseline is a
+FAIL and must be understood before load testing.
 
 **0.5 CPU frequency / C-states** (systems LOW).
 - `cpupower frequency-info` — governor MUST be `performance` on
   worker CPUs. `turbostat --interval 1` for 65 s during each
   validation run (see Step 3) to confirm `Bzy_MHz` doesn't drop
   below base clock and `CPU%c6` stays near zero on worker CPUs.
-- Treat as a diagnostic observable, not an immediate gate —
-  frequency throttling is highlighted in the findings table only
-  if it actually correlates with throughput loss.
+- **PASS/FAIL**: governor=performance on all worker CPUs PASSes
+  this sub-step. Frequency throttling / C-state residency is
+  DIAGNOSTIC only (captured in Step 3) — not a blocking gate.
 
 **0.6 Bind-mode / XDP fallback audit** (Codex MEDIUM).
 - `xsk_bind_mode`, zero-copy vs copy, `XDP_FALLBACK` stats from
   `BindingLiveSnapshot`. Capture once per binding pre-run.
+- **PASS/FAIL**: expected `xsk_bind_mode = zero-copy` on all four
+  workers; `XDP_FALLBACK` counters zero. Any deviation = FAIL.
+
+#### Step 0 summary table (MANDATORY output)
+
+After running 0.1-0.6, emit a table like the below. Step 0 is not
+declared complete until every row has an explicit disposition.
+A whole-step "PASS" summary is NOT acceptable — each row reports
+independently, and the overall status is `X of N audit items
+PASS`. Any FAIL row must be addressed (or explicitly deferred
+with rationale) before Step 1 begins.
+
+| Audit item | Observed | Expected | Status |
+|-|-|-|-|
+| 0.1 IRQ affinity — mlx5 queue 0 on ge-0-0-1 | `smp_affinity_list` = … | worker-0 CPU (or sibling) | PASS / FAIL |
+| 0.1 IRQ affinity — mlx5 queue 1 on ge-0-0-1 | … | worker-1 CPU (or sibling) | PASS / FAIL |
+| 0.1 IRQ affinity — mlx5 queue 2 on ge-0-0-1 | … | worker-2 CPU (or sibling) | PASS / FAIL |
+| 0.1 IRQ affinity — mlx5 queue 3 on ge-0-0-1 | … | worker-3 CPU (or sibling) | PASS / FAIL |
+| 0.2 adaptive coalescing | on/off | off | PASS / FAIL |
+| 0.2 `rx-usecs` | … | ≤ 8 | PASS / FAIL |
+| 0.2 `tx-usecs` | … | ≤ 8 | PASS / FAIL |
+| 0.2 `netdev_budget` | … | ≥ 600 | PASS / FAIL |
+| 0.2 `netdev_budget_usecs` | … | ≥ 8000 | PASS / FAIL |
+| 0.2 `gro_flush_timeout` | … | matches polling loop | PASS / FAIL |
+| 0.2 `SO_BUSY_POLL` | … | 1 µs | PASS / FAIL |
+| 0.2 `SO_PREFER_BUSY_POLL` | … | 1 | PASS / FAIL |
+| 0.3 tcp_congestion_control (client) | … | pinned to `cubic` | PASS / FAIL |
+| 0.3 tcp_congestion_control (server) | … | pinned to `cubic` | PASS / FAIL |
+| 0.3 `ss -ti` algorithm in-run | … | cubic on all flows | PASS / FAIL |
+| 0.4 ge-0-0-1 RX ring | `rx_out_of_buffer` = … | 0 at cold run | PASS / FAIL |
+| 0.4 ge-0-0-1 TX ring | `dbg_tx_ring_full` = … | 0 at cold run | PASS / FAIL |
+| 0.4 ge-0-0-1 fill ring | `rx_fill_ring_empty_descs` = … | 0 at cold run | PASS / FAIL |
+| 0.4 ge-0-0-1 completion ring | `outstanding_tx` stable = … | bounded, not monotonic | PASS / FAIL |
+| 0.4 ge-0-0-2.80 RX ring | `rx_out_of_buffer` = … | 0 at cold run | PASS / FAIL |
+| 0.4 ge-0-0-2.80 TX ring | `dbg_tx_ring_full` = … | 0 at cold run | PASS / FAIL |
+| 0.4 ge-0-0-2.80 fill ring | `rx_fill_ring_empty_descs` = … | 0 at cold run | PASS / FAIL |
+| 0.4 ge-0-0-2.80 completion ring | `outstanding_tx` stable = … | bounded, not monotonic | PASS / FAIL |
+| 0.5 cpufreq governor (worker CPUs) | … | `performance` | PASS / FAIL |
+| 0.6 XSK bind mode | … | zero-copy | PASS / FAIL |
+| 0.6 `XDP_FALLBACK` counters | … | 0 | PASS / FAIL |
+
+**Summary line**: `X of N Step-0 audit items PASS`. If N > X, no
+investigation beyond Step 0 begins until the FAILs are either
+fixed (zero-code) or explicitly deferred with rationale. If the
+Phase C "Instrumentation pre-work" sub-section names counters that
+don't yet exist, their rows in the table above are marked
+`DEFERRED-INSTRUMENTATION` rather than PASS/FAIL, and this also
+counts toward the summary accounting.
 
 ### Step 1: capture userspace-dp counters during both directions (was Step 3)
 
@@ -283,16 +394,45 @@ Now runs AFTER the userspace-side capture.
   variant) during each direction. **Break out `%usr`, `%sys`,
   `%soft`, `%irq`** — not aggregate (systems S-3).
 - Record peak per-CPU %; which CPUs are pinned to the 4 workers?
-- **Latency probe** (systems S-2 / HIGH #2): concurrently run
-  `ping -i 0.01 <dst>` during the iperf3 window, or
-  `sockperf under-load` if available. Capture p50/p99 from the
-  probe. Also extract iperf3 client-side TCP RTT via `ss -ti`
-  samples at 5 s intervals.
-- **Cache-pressure sampling** (systems S-5 / MEDIUM): run
-  `perf stat -e L1-dcache-load-misses,LLC-loads` on worker PIDs
-  during the same window. If L1d miss rate on
-  `cos_queue_min_finish_bucket` > 10 %, lane-compaction /
-  dirty-bucket-bitmap may be a separate unlock.
+- **Latency probe** (systems S-2 / HIGH #2 + Codex round-2 #6 +
+  R2-1). Concurrent dual-size ICMP probe, fully specified:
+  - **Probe source**: `cluster-userspace-host` (same source as the
+    iperf3 client).
+  - **Probe target**: `172.16.80.200` (same target as iperf3).
+  - **CPU isolation**: each ping process is pinned via
+    `taskset -c <unused_cpu>` — specifically NOT the CPU the
+    iperf3 client thread is running on, and NOT a CPU handling
+    RSS/XSK work. Use a dedicated non-worker CPU. Rationale: if
+    the probe shares a CPU with load-test traffic, what we measure
+    is co-scheduled queuing delay on the probe-emitting host, not
+    firewall path latency.
+  - **Dual size, concurrent**: two parallel probe processes run
+    for the full test window (65 s or 185 s matching iperf3),
+    each on its own isolated CPU:
+    - `taskset -c <cpu_a> ping -i 0.01 -s 56 -D -q 172.16.80.200`
+    - `taskset -c <cpu_b> ping -i 0.01 -s 1400 -D -q 172.16.80.200`
+  - **Capture**: two independent p50/p99 pairs per run —
+    `small-probe-p50`, `small-probe-p99`, `large-probe-p50`,
+    `large-probe-p99`. All four land in the validation capture.
+  - Also extract iperf3 client-side TCP RTT via `ss -ti` (see
+    below) — this complements, it does not replace, the ping
+    probe.
+- **`ss -ti` cadence** (R2-2): runs every 5 seconds for the full
+  test window (not just a sample flow). Capture ALL flows (the
+  -i option gives TCP-info for all matching sockets; filter by
+  destination port to scope to the iperf3 flows). Column of
+  interest: RTT / RTTVAR / retrans / cwnd / pacing_rate / cc_algo.
+  This is per-flow, which is stronger evidence than aggregate.
+- **Cache-pressure sampling** (systems S-5 / MEDIUM + R2-3): run
+  `perf stat --per-thread -p $WORKER_PIDS -e
+  L1-dcache-load-misses,LLC-loads,instructions,cycles` during the
+  same window, where `WORKER_PIDS` is obtained via
+  `pgrep -f xpf-userspace-dp` (filtered to the worker threads, not
+  the daemon supervisor). Explicitly NOT system-wide — system-wide
+  would hide a bottleneck worker by averaging over all CPUs. If
+  L1d miss rate on `cos_queue_min_finish_bucket` > 10 % on any
+  worker, lane-compaction / dirty-bucket-bitmap may be a separate
+  unlock.
 - `turbostat --interval 1` also runs in this window (see 0.5).
 - **Expected signals**: H-FWD-2 = one CPU at 100 % while others
   < 80 %, broken out into `%sys` vs `%soft` to implicate pipeline
@@ -305,17 +445,24 @@ Now runs AFTER the userspace-side capture.
 - If single-flow direct = single-flow via fw, the fw is not the
   bottleneck per flow. H-REV-4 becomes non-primary.
 
-### Step 5: ring size + queue count audit
+### Step 5: ring size + queue count audit (deltas only)
 
-- Confirms Step 0.4 inline with the investigation; extends to:
-- `ethtool -g ge-0-0-1` / `ge-0-0-2.80` — **all four rings** (RX,
-  TX, fill, completion) current vs max (systems S-4).
-- `ethtool -l` — combined queue counts.
-- Compare to D3's indirection — are the same queues both AF_XDP-
-  bound AND large enough?
-- **Distinguish TX descriptor starvation (ring full on produce)
-  from completion starvation (reap lags behind driver)** — the
-  two look different in userspace counters.
+**The canonical ring audit is Step 0.4.** Step 5 does NOT re-run
+it; it only captures the follow-on evidence that Step 0.4 does
+not by design (Step 0.4 is cold-run; Step 5 is under-load).
+
+- `ethtool -l` — combined queue counts. Compare to D3's
+  indirection: are the same queues both AF_XDP-bound AND large
+  enough?
+- Diff the Step 0.4 table after a 60 s iperf3 run: any authoritative
+  counter that moved from its cold-run value is load-induced
+  evidence. Use the Step 0.4 table's authoritative column to
+  decide which counter pattern (TX-ring-full on produce vs
+  completion-reap starvation) is in play — Step 0.4 already names
+  them; this step just records deltas.
+- If a required counter was flagged `DEFERRED-INSTRUMENTATION` in
+  Step 0.4, Step 5 cannot conclude on its ring — that becomes a
+  Phase C pre-req per "Instrumentation pre-work".
 
 ### Step 6: reverse-direction topology walk
 
@@ -405,22 +552,42 @@ signal we're trying to measure.
 - Total retransmits (forward direction)
 - Mean CoV (per-flow), median CoV, per-flow min/max spread
   (both 16-flow and 12-flow tests)
-- Latency p50 and p99 from the concurrent probe (both directions)
+- Latency per concurrent probe (both directions): small-probe-p50,
+  small-probe-p99, large-probe-p50, large-probe-p99 (see Step 3 /
+  R2-1 for the probe spec)
 
-**Rollback gate — any ONE of the following triggers rollback:**
-- **CoV regression**: `mean(post-CoV) − mean(pre-CoV) > 2 ×
-  stddev(pre-CoV)` on the 16-flow OR 12-flow test
+**Rollback gate — any ONE of the following triggers rollback.**
+Every gate that compares a delta to a pre-stddev has an
+**absolute floor** so that tight-baseline noise does not trip the
+gate on a trivial run-to-run wiggle (Codex round-2 #5 + #6):
+
+- **CoV regression** (Codex round-2 #5): BOTH conditions must
+  hold —
+  - `mean(post-CoV) − mean(pre-CoV) > 2 × stddev(pre-CoV)`, AND
+  - `mean(post-CoV) − mean(pre-CoV) > 3 percentage points`
+    (`MIN_COV_DELTA_PP = 3`)
+  applied independently to the 16-flow AND 12-flow tests. If
+  EITHER gate fires on EITHER test, rollback.
 - **Retransmit regression**: `mean(post-retr) − mean(pre-retr) >
   100`, OR `mean(post-retr) > 2 × mean(pre-retr)` (the doubling
   rule, whichever is tighter)
-- **Latency regression**: `mean(post-p99) − mean(pre-p99) > 2 ×
-  stddev(pre-p99)`
+- **Latency regression** (Codex round-2 #6): applied independently
+  to `small-probe-p99` AND `large-probe-p99`. For EITHER probe size,
+  BOTH conditions must hold to trip the gate —
+  - `mean(post-p99) − mean(pre-p99) > 2 × stddev(pre-p99)`, AND
+  - `mean(post-p99) − mean(pre-p99) > 20 µs` (absolute jitter
+    floor; sub-20 µs p99 drift is below observable firewall
+    latency noise on this test bed)
 - **Throughput regression**: `mean(post-SUM) < mean(pre-SUM) − 1
-  Gbps` in either direction
+  Gbps` in either direction (unchanged)
 
 This replaces the previous single "> 5 percentage points" absolute
 threshold, which was a single-point rule measured against a frozen
 baseline whose own documented variance overlapped the threshold.
+The floors are an explicit belt-and-braces addition: the stddev
+gate catches meaningful drift relative to observed noise; the
+absolute floor prevents trivial wiggles on tight baselines (e.g.,
+a 0.1 Gbps pre-stddev) from firing the gate.
 
 **Target — success criteria for the overall investigation goal:**
 Five measured runs per direction after one discarded warm-up run.
@@ -466,7 +633,8 @@ Five serialized phases:
    change. Then Steps 1-7. Produces an updated findings doc naming
    the root cause(s).
 3. **Phase C**: per-finding GitHub issue filed. Scope + fix
-   proposal per issue.
+   proposal per issue. See also the "Instrumentation pre-work"
+   sub-section below.
 4. **Phase D**: one PR per issue. HFT-mindset implementation.
    Adversarial review loop per PR until merge-ready.
 5. **Phase E**: final validation — both directions at line rate,
@@ -475,6 +643,67 @@ Five serialized phases:
 
 Stop conditions per phase: a phase doesn't start until the prior
 one is complete + documented + reviewed.
+
+### Phase C pre-work — instrumentation gaps (Codex round-2 #7)
+
+The Step 0.4 ring-audit table names counters that MUST be present
+for the investigation to conclude on fill-ring / completion-ring
+behaviour. Some exist today; some do not. Rather than silently
+leave a hole, the plan names each missing counter explicitly —
+they become Phase C prerequisites (file an issue + land a
+one-commit instrumentation PR) BEFORE the investigation uses them.
+
+**Counters that exist in the current userspace-dp code** (confirmed
+via grep against `userspace-dp/src/**`):
+- `dbg_tx_ring_full` — `userspace-dp/src/afxdp/worker.rs`
+- `dbg_sendto_enobufs` — `userspace-dp/src/afxdp/worker.rs`
+- `dbg_pending_overflow` — `userspace-dp/src/afxdp/worker.rs`
+- `pending_tx_local_overflow_drops` —
+  `userspace-dp/src/afxdp/worker.rs`
+- `tx_submit_error_drops` — `userspace-dp/src/afxdp/worker.rs`
+- `outstanding_tx` — `userspace-dp/src/afxdp/worker.rs`
+- `rx_fill_ring_empty_descs` — surfaced by
+  `userspace-dp/src/xsk_ffi.rs` (kernel `xdp_statistics`); this is
+  the authoritative fill-ring-starvation signal from the kernel
+  and is preferred over an in-process proxy
+- NIC counters (`rx_out_of_buffer`, `tx_dropped`,
+  `rx_fifo_errors`, `rx_missed_errors`) — available via
+  `ethtool -S` on mlx5_core; no in-process instrumentation
+  required
+
+**Counters the plan requires that do NOT yet exist** (pre-req
+before the investigation relies on them):
+- `fill_batch_starved` (per-worker, increments when a fill-ring
+  top-up batch cannot obtain any free UMEM frames). The kernel
+  `rx_fill_ring_empty_descs` counter tells us the kernel saw an
+  empty fill ring; `fill_batch_starved` would tell us WHY — the
+  userspace-side UMEM allocator ran dry. If `rx_fill_ring_empty_descs`
+  is adequate for this investigation's evidence needs (i.e., we do
+  not need to separate "fill batch starved on UMEM" from "fill
+  batch starved because worker never topped up"), this counter may
+  be deferred and the row in the Step 0.4 table proxied against
+  `rx_fill_ring_empty_descs` alone. Decision: captured at the
+  start of Phase C.
+- `completion_reap_max_batch` (per-worker, records the high-water
+  mark of descriptors reaped from the TX completion ring per
+  iteration). Today `outstanding_tx` serves as a proxy: a high
+  and statically-held `outstanding_tx` implies reap is lagging.
+  If the outstanding_tx proxy cannot distinguish "reap cadence is
+  healthy but worker is busy" from "reap is actually late",
+  `completion_reap_max_batch` must land before the investigation
+  concludes on completion-ring behaviour. Decision: captured at
+  the start of Phase C.
+
+**Process**: at the start of Phase C, for each "does not yet exist"
+counter above, decide:
+(a) proxy acceptable for this investigation → document decision
+and keep the Step 0.4 row marked `DEFERRED-INSTRUMENTATION` with
+proxy-counter name recorded; OR
+(b) proxy not acceptable → file an issue, land the one-commit
+instrumentation PR, then the Step 0.4 row flips from `DEFERRED-
+INSTRUMENTATION` to a real PASS/FAIL.
+
+Either outcome is documented; neither is a silent hole.
 
 ## Deferred findings (explicit, with rationale)
 
@@ -503,6 +732,36 @@ dropped.
   / overflow drops / queue path selection / restore helpers.
 - **Systems S-7 (CPU freq / C-states)**: folded as Step 0.5 +
   diagnostic observable in Step 3; not a blocking gate.
+
+### Round-2 findings — fold-in map (none deferred)
+
+Every round-2 finding landed in a concrete section of this plan.
+Listed here for traceability; none are deferred.
+
+- **Codex round-2 #4 (Step 0 per-item gate)**: folded into Step 0
+  preamble + every sub-step PASS/FAIL clause + the mandatory
+  Step 0 summary table at the end of Step 0.
+- **Codex round-2 #5 (CoV rollback floor)**: folded into the
+  "Rollback gate — any ONE of the following triggers rollback"
+  list, CoV bullet — now requires `> 2 × stddev(pre-CoV)` AND
+  `> 3 pp` (`MIN_COV_DELTA_PP = 3`).
+- **Codex round-2 #6 (latency gate spec)**: folded into Step 3
+  "Latency probe" (probe source/target/CPU-isolation/dual-size
+  spec) and the rollback gate (per-size p99 with
+  `> 2 × stddev(pre-p99)` AND `> 20 µs` floor).
+- **Codex round-2 #7 (ring-quadruple consolidation)**: folded into
+  the single Step 0.4 authoritative counter table; Step 5
+  shrinks to deltas-only. Missing counters (`fill_batch_starved`,
+  `completion_reap_max_batch`) named explicitly in Phase C
+  "Instrumentation pre-work".
+- **Systems R2-1 (dual ping size)**: folded into Step 3 dual-size
+  ping spec (`-s 56` and `-s 1400` concurrently, each on its own
+  isolated CPU).
+- **Systems R2-2 (`ss -ti` cadence)**: folded into Step 3 —
+  every 5 s, full window, all flows.
+- **Systems R2-3 (`perf stat` scope)**: folded into Step 3 —
+  `perf stat --per-thread -p $WORKER_PIDS`, with `WORKER_PIDS`
+  from `pgrep -f xpf-userspace-dp`, explicitly not system-wide.
 
 ## Risks
 
