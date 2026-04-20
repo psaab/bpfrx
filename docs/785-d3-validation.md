@@ -141,6 +141,49 @@ requires active flow-to-worker load balancing (D1'), which this
 branch does not include. See `docs/785-phase4-options.md` and the
 separate D1' exploration on branch `pr/785-d1-flow-worker-lb`.
 
+## Interaction with Phase 3 MQFQ
+
+Phase 3 (MQFQ virtual-finish-time ordering inside each worker's
+flow-fair CoS queues) is strictly per-worker state. D3's only job
+is to steer the set of RX queues that receive hashed traffic; it
+does not interact with MQFQ's per-queue `flow_bucket_head_finish_bytes`
+/ `flow_bucket_tail_finish_bytes` accounting at all.
+
+Correctness independence:
+
+- MQFQ reads ONLY `queue.queue_vtime`, `queue.flow_bucket_*`, and the
+  incoming packet's byte count. All three are private to one
+  `CoSQueueRuntime`, which is private to one worker's
+  `CoSInterfaceRuntime`. D3 changes WHICH worker an inbound flow
+  lands on, not how that worker orders its drain.
+- `rss-indirection disable` (the operator kill switch) restores the
+  driver's default equal-weight RSS table. Traffic then spreads
+  across all RX queues — including queues not bound to AF_XDP
+  workers, which fall through to the kernel. That changes the
+  cross-worker flow distribution but does not change MQFQ's
+  per-worker ordering. Phase 3's byte-rate fairness claim holds on
+  whatever subset of flows each worker sees.
+- Adversarial case: D3 allowlist shrinks to a single queue (e.g.
+  operator sets `set system dataplane workers 1` on an mlx5 with 6
+  RX queues). All inbound flows land on worker 0. MQFQ on worker
+  0's flow-fair queue orders those flows by byte rate exactly as
+  it would with D3 disabled — MQFQ has no awareness of the RSS
+  layout.
+- Reverse case: D3 allowlist widens (workers >= queues). The D3
+  guard skips the reshape entirely. MQFQ on each worker's queue
+  continues to provide byte-rate fairness among whatever flows
+  hashed onto that worker.
+
+No shared mutable state is introduced by either feature. MQFQ's new
+fields in `CoSQueueRuntime` (see `userspace-dp/src/afxdp/types.rs`)
+are all per-queue; D3's reshape lives in `pkg/daemon/rss_indirection.go`
+and never reads userspace-dp state. A concrete regression test for
+the interaction is infeasible (it would require instrumenting the
+full NIC RSS pipeline), but the above independence argument is
+structural — a reader can verify it by grepping
+`rss_indirection.go` for any reference to CoS/MQFQ symbols (none)
+and `userspace-dp/src/afxdp/` for any reference to RSS (none).
+
 ## Conclusion
 
 D3 is a clean, low-risk, low-cost improvement that meaningfully
