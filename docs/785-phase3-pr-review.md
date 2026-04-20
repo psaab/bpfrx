@@ -53,3 +53,13 @@ NO. The rebased MQFQ head/tail ordering itself is largely coherent, and the shar
 ROUND 2: OPEN ISSUES REMAIN
 - `NEW-1`: multi-pop rollback only exactly restores the most recently drained bucket.
 - `Finding 3`: the D3 interaction paragraph's final grep-proof sentence is not literally accurate.
+
+## Round 3 verification
+
+- **NEW-1 (MEDIUM)**: CLOSED — 4-pop/4-pushfront rollback is round-trip neutral. `CoSQueuePopSnapshot` stores bucket + pre-pop head/tail (`userspace-dp/src/afxdp/types.rs:1016-1026`); `cos_queue_pop_front()` pushes one snapshot per pop and mutates `queue_vtime`, head/active-set, and bucket bytes (`userspace-dp/src/afxdp/tx.rs:4166-4239`, `userspace-dp/src/afxdp/tx.rs:3924-3948`), while `cos_queue_push_front()` rewinds `queue_vtime`, restores drained buckets from the matching LIFO snapshot or reverses the active-bucket head advance, and re-adds bytes/active state (`userspace-dp/src/afxdp/tx.rs:4047-4163`). Rollback drains scratch in LIFO order until empty (`userspace-dp/src/afxdp/tx.rs:4251-4254`, `userspace-dp/src/afxdp/tx.rs:5620-5647`), and the new 4-item pin checks head, tail, bytes, `queue_vtime`, `active_flow_buckets`, peak, stack-empty, and item count (`userspace-dp/src/afxdp/tx.rs:11160-11256`).
+
+- **Finding 3 (LOW)**: CLOSED — the doc now names the three real RSS mentions in `tx.rs` instead of claiming `userspace-dp/src/afxdp` has none, and scopes the claim to “no RSS state reads” (`docs/785-d3-validation.md:177-200`, `userspace-dp/src/afxdp/tx.rs:5040`, `userspace-dp/src/afxdp/tx.rs:14008`, `userspace-dp/src/afxdp/tx.rs:14159`). That matches the daemon side, which only reshapes/restores RSS tables and does not touch MQFQ runtime state (`pkg/daemon/rss_indirection.go:111-223`).
+
+- **NEW-2 (MEDIUM)**: `pop_snapshot_stack` is not actually bounded to `TX_BATCH_SIZE` or cleared at flow-fair batch start. `cos_queue_pop_front()` always pushes (`userspace-dp/src/afxdp/tx.rs:4196-4200`); flow-fair service paths clear only scratch vectors, not the stack (`userspace-dp/src/afxdp/tx.rs:1894`, `userspace-dp/src/afxdp/tx.rs:2146`), and settle leaves committed-item snapshots resident (`userspace-dp/src/afxdp/tx.rs:2696-2704`, `userspace-dp/src/afxdp/tx.rs:2751-2758`). Production whole-queue drains also pop until empty (`userspace-dp/src/afxdp/worker.rs:1666-1675`, `userspace-dp/src/afxdp/tx.rs:4243-4247`, `userspace-dp/src/afxdp/tx.rs:4895`), so the `userspace-dp/src/afxdp/types.rs:1149-1160` “batch-start clear / at most TX_BATCH_SIZE / ~6 KB per queue” claim is not enforced.
+
+ROUND 3: NOT ready — snapshot-stack size/memory bound is incorrect in the implementation.
