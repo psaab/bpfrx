@@ -61,3 +61,11 @@ FAIL. Ring-quadruple material is split across Step 0.4 and Step 5, and authorita
 **#6(new)** OPEN. The protocol says "compute mean and stddev across the 5 pre-change runs" but never says sample or population.
 **#7(new)** CLOSED. Step 0 says "Any FAIL" is addressed "BEFORE any dataplane investigation proceeds"; no investigation beyond Step 0 begins until fixed/deferred.
 ROUND 3: plan-ready NO — open: #5(new), #6(new)
+
+## Round 4 verification
+ROUND 4: plan-ready NO
+OPEN issues: #5(new)
+
+**#6(new)** CLOSED. Plan lines 579-581 now say all `stddev(pre-X)` references use the "`sample standard deviation`" with "`n−1 divisor, Bessel-corrected`."
+**#7(new)** CLOSED. Plan lines 356-365 now make the Step 0 FAIL path explicit: zero-code FAILs are fixed and re-run, code-required FAILs must choose "`(a) defer ... or (b) land a PR first`," and "`Phase B HALTS as a whole if any FAIL row has neither been fixed nor explicitly deferred in writing.`"
+**#5(new)** OPEN. In lines 705-715, the plan only says `fill_batch_starved` "may be deferred" if `rx_fill_ring_empty_descs` is adequate and records "`Decision: captured at the start of Phase C`"; within lines 693-715, it does not state an explicit accept/reject disposition for each counter.
