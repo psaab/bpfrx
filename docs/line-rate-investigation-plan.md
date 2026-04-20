@@ -353,6 +353,26 @@ don't yet exist, their rows in the table above are marked
 `DEFERRED-INSTRUMENTATION` rather than PASS/FAIL, and this also
 counts toward the summary accounting.
 
+**Control flow on FAIL (Codex round-3 #7(new)).** Explicit:
+1. If any row is FAIL and the fix is zero-code (sysctl, ethtool,
+   cpufreq setting): apply the fix, re-run the specific audit row,
+   confirm PASS, then proceed.
+2. If any row is FAIL and the fix requires code: file a GitHub
+   issue, decide per-row whether to (a) defer with a proxy / rationale
+   (row becomes a DEFERRED-INSTRUMENTATION entry) or (b) land a PR
+   first. Phase B halts on that row until (a) or (b) is decided.
+3. Phase B HALTS as a whole if any FAIL row has neither been fixed
+   nor explicitly deferred in writing. "Don't know yet" is never
+   acceptable — each FAIL row must exit with a named disposition.
+
+### Step 0.1 refinement — PCI-BDF-scoped IRQ match (systems round-3 R3-1)
+
+The raw `/proc/interrupts` regex `mlx5` matches every mlx5 PF, VF,
+and function on a multi-NIC box. The correct match uses
+`readlink /sys/class/net/<iface>/device` to get the PCI BDF, then
+greps `/proc/interrupts` for `mlx5_comp<N>@pci:<bdf>`. Apply this
+scoping to every IRQ-affinity row in the Step 0 table.
+
 ### Step 1: capture userspace-dp counters during both directions (was Step 3)
 
 Runs BEFORE NIC counters (Codex HIGH #1) because userspace
@@ -555,6 +575,15 @@ signal we're trying to measure.
 - Latency per concurrent probe (both directions): small-probe-p50,
   small-probe-p99, large-probe-p50, large-probe-p99 (see Step 3 /
   R2-1 for the probe spec)
+
+**Statistics definition (Codex round-3 #6(new)).** All references
+to `stddev(pre-X)` below use the **sample standard deviation** (n−1
+divisor, Bessel-corrected) over the 5 pre-change measurement runs.
+With n = 5, this is a noisy estimator, which is why every gate also
+has an **absolute floor** — the stddev × 2 rule catches drift
+relative to observed variance; the absolute floor prevents tight
+baselines from firing the gate on trivial wiggles. Both must hold
+to trip the gate.
 
 **Rollback gate — any ONE of the following triggers rollback.**
 Every gate that compares a delta to a pre-stddev has an
