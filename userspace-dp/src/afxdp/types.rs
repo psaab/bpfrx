@@ -734,6 +734,47 @@ impl FlowRrRing {
         self.len -= 1;
         Some(bucket)
     }
+
+    /// #785 Phase 3 — remove a specific bucket ID from the active
+    /// set wherever it sits in the ring. Used by the MQFQ dequeue
+    /// path when the bucket with the minimum virtual-finish-time
+    /// (which may not be at `head`) drains to empty and must
+    /// de-register from the active set.
+    ///
+    /// O(len) — scans the ring. `len` is bounded by the number of
+    /// concurrently active flow buckets, typically 2-16 on
+    /// iperf3-style workloads, up to `COS_FLOW_FAIR_BUCKETS = 1024`
+    /// worst case. Returns `true` if the bucket was found and
+    /// removed.
+    ///
+    /// Implementation: find the position via linear scan, then
+    /// shift subsequent entries left (preserving head-relative
+    /// order). Head stays fixed; `len` decrements. Avoids the
+    /// alternative of "swap with tail then decrement" which would
+    /// reorder the active set — acceptable for membership-only
+    /// semantics but noisy for any future debug invariants that
+    /// assume insertion-order preservation.
+    pub(super) fn remove(&mut self, bucket: u16) -> bool {
+        if self.len == 0 {
+            return false;
+        }
+        let head = usize::from(self.head);
+        let len = usize::from(self.len);
+        for i in 0..len {
+            let idx = (head + i) & COS_FLOW_FAIR_BUCKET_MASK;
+            if self.buf[idx] == bucket {
+                // Shift subsequent entries left by one.
+                for j in i..len - 1 {
+                    let src = (head + j + 1) & COS_FLOW_FAIR_BUCKET_MASK;
+                    let dst = (head + j) & COS_FLOW_FAIR_BUCKET_MASK;
+                    self.buf[dst] = self.buf[src];
+                }
+                self.len -= 1;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub(super) struct FlowRrRingIter<'a> {
@@ -1006,6 +1047,60 @@ pub(super) struct CoSQueueRuntime {
     /// snapshot, the doc here is the contract).
     pub(super) active_flow_buckets_peak: u16,
     pub(super) flow_bucket_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
+    /// #785 Phase 3 — MQFQ virtual-finish-time ordering: per-bucket
+    /// HEAD-packet finish time.
+    ///
+    /// Selection keys off this (the packet that's next to drain
+    /// on this bucket), not the tail-finish, so equal-depth
+    /// backlogged flows interleave `A,B,A,B` rather than burst
+    /// `A,A,B,B`. Codex adversarial review of the first Phase 3
+    /// revision flagged the tail-keyed selection as a correctness
+    /// bug that collapsed MQFQ back to packet-count-fair for
+    /// equal-byte flows.
+    ///
+    /// Invariants maintained by the enqueue/dequeue accounting:
+    ///
+    ///   * On enqueue to a previously-IDLE bucket (pre-enqueue
+    ///     `flow_bucket_bytes[b] == 0`): head[b] = tail[b] =
+    ///     `max(tail[b], queue.vtime) + bytes`.
+    ///   * On enqueue to an ACTIVE bucket: tail[b] += bytes;
+    ///     head[b] unchanged (the head packet is still the same
+    ///     packet).
+    ///   * On pop from a bucket that still has packets: head[b]
+    ///     advances by the NEW head packet's bytes (the packet
+    ///     that's now at front after pop).
+    ///   * On pop that drains the bucket: head[b] = tail[b] = 0
+    ///     so the next re-enqueue re-anchors at `queue.vtime`.
+    ///
+    /// Overflow: at 100 Gbps sustained, u64 wraps at ~46 years of
+    /// uptime. No normalisation needed.
+    ///
+    /// Meaningful only on `flow_fair` queues.
+    pub(super) flow_bucket_head_finish_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
+    /// #785 Phase 3 — MQFQ per-bucket TAIL finish: the finish
+    /// time of the LAST-enqueued packet on this bucket. Used by
+    /// enqueue to compute the next packet's finish (tail + bytes)
+    /// and by empty-bucket detection to decide whether to
+    /// re-anchor at `queue.vtime`. Distinct from head-finish —
+    /// see above. Invariants: `head[b] <= tail[b]` when bucket
+    /// is active; both 0 when bucket is idle.
+    pub(super) flow_bucket_tail_finish_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
+    /// #785 Phase 3 — MQFQ queue virtual time. Updated on every
+    /// dequeue to `finish[bucket]` of the drained bucket. Serves
+    /// as the "catch-up anchor" in the enqueue formula:
+    /// `finish[b] = max(finish[b], queue_vtime) + bytes`. A newly
+    /// arriving flow bucket that's been idle re-anchors to
+    /// `queue_vtime` so it starts competing at the current frontier
+    /// rather than from 0 (which would let it sweep past all
+    /// established flows in bounded rounds).
+    pub(super) queue_vtime: u64,
+    /// #785 Phase 3 — active-set tracking for flow-fair MQFQ.
+    /// Still populated on bucket 0→>0 / >0→0 transitions so that
+    /// `cos_queue_front`/`cos_queue_pop_front` can scan just the
+    /// small active set rather than all 1024 SFQ buckets to find
+    /// the minimum finish time. Semantically a set (membership),
+    /// not a DRR ring — the ordering is governed by
+    /// `flow_bucket_finish_bytes`, not ring position.
     pub(super) flow_rr_buckets: FlowRrRing,
     pub(super) flow_bucket_items: [VecDeque<CoSPendingTxItem>; COS_FLOW_FAIR_BUCKETS],
     pub(super) runnable: bool,
