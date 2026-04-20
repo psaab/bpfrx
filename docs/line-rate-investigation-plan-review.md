@@ -1,3 +1,5 @@
+ROUND 5: plan-ready YES
+
 # Line-rate investigation plan — adversarial review
 
 1. **SEVERITY: HIGH** The plan can falsely rule out the leading forward-path hypothesis because it looks for AF_XDP TX-ring pressure in the wrong place first.
@@ -69,3 +71,9 @@ OPEN issues: #5(new)
 **#6(new)** CLOSED. Plan lines 579-581 now say all `stddev(pre-X)` references use the "`sample standard deviation`" with "`n−1 divisor, Bessel-corrected`."
 **#7(new)** CLOSED. Plan lines 356-365 now make the Step 0 FAIL path explicit: zero-code FAILs are fixed and re-run, code-required FAILs must choose "`(a) defer ... or (b) land a PR first`," and "`Phase B HALTS as a whole if any FAIL row has neither been fixed nor explicitly deferred in writing.`"
 **#5(new)** OPEN. In lines 705-715, the plan only says `fill_batch_starved` "may be deferred" if `rx_fill_ring_empty_descs` is adequate and records "`Decision: captured at the start of Phase C`"; within lines 693-715, it does not state an explicit accept/reject disposition for each counter.
+
+## Round 5 verification
+Criterion 1: PASS. Both rows state `ACCEPT PROXY`, so disposition is explicit.
+Criterion 2: PASS. Each proxy row names a specific proxy: `rx_fill_ring_empty_descs` or `outstanding_tx`.
+Criterion 3: PASS. Each row gives a concrete Phase B escalation trigger tied to named evidence.
+Overall: #5 CLOSED — all rows satisfy all three closure criteria.
