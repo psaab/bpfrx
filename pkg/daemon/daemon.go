@@ -450,11 +450,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if !d.opts.NoDataplane {
 		clusterMode := false
 		nodeID := 0
-		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
-			clusterMode = true
-			nodeID = cfg.Chassis.Cluster.NodeID
+		userspaceWorkers := 0
+		if cfg := d.store.ActiveConfig(); cfg != nil {
+			if cfg.Chassis.Cluster != nil {
+				clusterMode = true
+				nodeID = cfg.Chassis.Cluster.NodeID
+			}
+			// D3 (#785): pass userspace-dp worker count so linksetup can
+			// reshape mlx5 RSS indirection before any AF_XDP bind. Zero
+			// when userspace dataplane is not in use — applyRSSIndirection
+			// treats that as a no-op.
+			if cfg.System.DataplaneType == "userspace" && cfg.System.UserspaceDataplane != nil {
+				userspaceWorkers = cfg.System.UserspaceDataplane.Workers
+			}
 		}
-		if err := enumerateAndRenameInterfaces(nodeID, clusterMode); err != nil {
+		if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers); err != nil {
 			slog.Warn("interface naming failed", "err", err)
 		}
 	}
