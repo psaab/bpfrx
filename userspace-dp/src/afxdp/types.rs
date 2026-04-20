@@ -734,6 +734,47 @@ impl FlowRrRing {
         self.len -= 1;
         Some(bucket)
     }
+
+    /// #785 Phase 3 — remove a specific bucket ID from the active
+    /// set wherever it sits in the ring. Used by the MQFQ dequeue
+    /// path when the bucket with the minimum virtual-finish-time
+    /// (which may not be at `head`) drains to empty and must
+    /// de-register from the active set.
+    ///
+    /// O(len) — scans the ring. `len` is bounded by the number of
+    /// concurrently active flow buckets, typically 2-16 on
+    /// iperf3-style workloads, up to `COS_FLOW_FAIR_BUCKETS = 1024`
+    /// worst case. Returns `true` if the bucket was found and
+    /// removed.
+    ///
+    /// Implementation: find the position via linear scan, then
+    /// shift subsequent entries left (preserving head-relative
+    /// order). Head stays fixed; `len` decrements. Avoids the
+    /// alternative of "swap with tail then decrement" which would
+    /// reorder the active set — acceptable for membership-only
+    /// semantics but noisy for any future debug invariants that
+    /// assume insertion-order preservation.
+    pub(super) fn remove(&mut self, bucket: u16) -> bool {
+        if self.len == 0 {
+            return false;
+        }
+        let head = usize::from(self.head);
+        let len = usize::from(self.len);
+        for i in 0..len {
+            let idx = (head + i) & COS_FLOW_FAIR_BUCKET_MASK;
+            if self.buf[idx] == bucket {
+                // Shift subsequent entries left by one.
+                for j in i..len - 1 {
+                    let src = (head + j + 1) & COS_FLOW_FAIR_BUCKET_MASK;
+                    let dst = (head + j) & COS_FLOW_FAIR_BUCKET_MASK;
+                    self.buf[dst] = self.buf[src];
+                }
+                self.len -= 1;
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub(super) struct FlowRrRingIter<'a> {
@@ -955,6 +996,36 @@ pub(super) struct CoSInterfaceRuntime {
     pub(super) timer_wheel: CoSTimerWheelRuntime,
 }
 
+/// #785 Phase 3 — Codex round-3 HIGH: pop→push_front round-trip
+/// snapshot. Captured by `cos_queue_pop_front` immediately before
+/// advancing `queue_vtime`, consumed by `cos_queue_push_front` to
+/// restore pre-pop head/tail when the popped item rolls back onto
+/// the queue (TX-ring-full retry path).
+///
+/// Without this snapshot, a push_front onto a drained bucket
+/// (Rust reviewer MEDIUM #1) re-anchors head/tail to
+/// `max(0, queue_vtime) + bytes`. Even if `queue_vtime` is rewound
+/// symmetrically, that formula overshoots the pre-pop head by one
+/// packet when the item was freshly enqueued at the pre-pop vtime:
+/// the pre-pop head was `V + X`, the post-pop+rewind anchor would
+/// be `V + X` (correct only by coincidence), but in the general
+/// case where the item was enqueued long before pop (so head
+/// trailed vtime) the rewound-anchor overshoots. Restoring the
+/// snapshot exactly is the only path to true round-trip neutrality.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CoSQueuePopSnapshot {
+    /// The bucket that was popped from. Used to verify the
+    /// push_front is restoring the SAME bucket; a mismatch means
+    /// the snapshot is stale (some other bucket drained in between)
+    /// and the push_front falls back to the standard re-anchor
+    /// path.
+    pub(super) bucket: u16,
+    /// Bucket's HEAD finish time BEFORE the pop-time advance.
+    pub(super) pre_pop_head_finish: u64,
+    /// Bucket's TAIL finish time BEFORE the pop-time advance.
+    pub(super) pre_pop_tail_finish: u64,
+}
+
 pub(super) struct CoSQueueRuntime {
     pub(super) queue_id: u8,
     pub(super) priority: u8,
@@ -1006,6 +1077,112 @@ pub(super) struct CoSQueueRuntime {
     /// snapshot, the doc here is the contract).
     pub(super) active_flow_buckets_peak: u16,
     pub(super) flow_bucket_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
+    /// #785 Phase 3 — MQFQ virtual-finish-time ordering: per-bucket
+    /// HEAD-packet finish time.
+    ///
+    /// Selection keys off this (the packet that's next to drain
+    /// on this bucket), not the tail-finish, so equal-depth
+    /// backlogged flows interleave `A,B,A,B` rather than burst
+    /// `A,A,B,B`. Codex adversarial review of the first Phase 3
+    /// revision flagged the tail-keyed selection as a correctness
+    /// bug that collapsed MQFQ back to packet-count-fair for
+    /// equal-byte flows.
+    ///
+    /// Invariants maintained by the enqueue/dequeue accounting:
+    ///
+    ///   * On enqueue to a previously-IDLE bucket (pre-enqueue
+    ///     `flow_bucket_bytes[b] == 0`): head[b] = tail[b] =
+    ///     `max(tail[b], queue.vtime) + bytes`.
+    ///   * On enqueue to an ACTIVE bucket: tail[b] += bytes;
+    ///     head[b] unchanged (the head packet is still the same
+    ///     packet).
+    ///   * On pop from a bucket that still has packets: head[b]
+    ///     advances by the NEW head packet's bytes (the packet
+    ///     that's now at front after pop).
+    ///   * On pop that drains the bucket: head[b] = tail[b] = 0
+    ///     so the next re-enqueue re-anchors at `queue.vtime`.
+    ///
+    /// Overflow: at 100 Gbps sustained, u64 wraps at ~46 years of
+    /// uptime. No normalisation needed.
+    ///
+    /// Meaningful only on `flow_fair` queues.
+    ///
+    /// Read by `cos_queue_min_finish_bucket` as the selection key
+    /// for MQFQ dequeue ordering.
+    pub(super) flow_bucket_head_finish_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
+    /// #785 Phase 3 — MQFQ per-bucket TAIL finish: the finish
+    /// time of the LAST-enqueued packet on this bucket. Used by
+    /// enqueue to compute the next packet's finish (tail + bytes)
+    /// and by empty-bucket detection to decide whether to
+    /// re-anchor at `queue.vtime`. Distinct from head-finish —
+    /// see above. Invariants: `head[b] <= tail[b]` when bucket
+    /// is active; both 0 when bucket is idle.
+    pub(super) flow_bucket_tail_finish_bytes: [u64; COS_FLOW_FAIR_BUCKETS],
+    /// #785 Phase 3 — MQFQ queue virtual time. Updated on every
+    /// dequeue to `finish[bucket]` of the drained bucket. Serves
+    /// as the "catch-up anchor" in the enqueue formula:
+    /// `finish[b] = max(finish[b], queue_vtime) + bytes`. A newly
+    /// arriving flow bucket that's been idle re-anchors to
+    /// `queue_vtime` so it starts competing at the current frontier
+    /// rather than from 0 (which would let it sweep past all
+    /// established flows in bounded rounds).
+    ///
+    /// Read by `cos_queue_min_finish_bucket` (as the `max(tail, vtime)`
+    /// anchor source on idle-bucket re-entry) and updated by
+    /// `cos_queue_pop_front` (+= drained bytes) and
+    /// `cos_queue_push_front` (-= pushed bytes, symmetric rewind —
+    /// see PR #796 Codex round-3 HIGH).
+    pub(super) queue_vtime: u64,
+    /// #785 Phase 3 — Codex round-3 HIGH + NEW-1: LIFO stack of
+    /// bucket-state snapshots captured at each `cos_queue_pop_front`.
+    /// `cos_queue_push_front` pops from the back of the stack on
+    /// rollback so every item in a batched multi-pop restore can
+    /// restore its own pre-pop head/tail exactly — not just the most
+    /// recent pop.
+    ///
+    /// Stack ordering:
+    ///   * `cos_queue_pop_front` pushes onto the back (most recent).
+    ///   * `cos_queue_push_front` pops from the back (LIFO).
+    ///   * `cos_queue_push_back` clears the stack (any new enqueue
+    ///     can invalidate earlier snapshots — bucket state under
+    ///     those snapshots has changed).
+    ///   * Flow-fair drain helpers (`drain_exact_*_flow_fair`) clear
+    ///     the stack at batch start (not end) so successful-commit
+    ///     chains from prior batches do not leak into the current
+    ///     batch — and so the bound below holds even when a
+    ///     committed submission never called push_front.
+    ///   * Teardown paths (`cos_queue_drain_all` and
+    ///     `reset_binding_cos_runtime`) call
+    ///     `cos_queue_pop_front_no_snapshot` so that drains of
+    ///     >TX_BATCH_SIZE items never grow the stack.
+    ///
+    /// Size bound: at most `TX_BATCH_SIZE` entries alive at once —
+    /// enforced by the batch-start clear above. The hot-path drain
+    /// helpers cap scratch depth at `TX_BATCH_SIZE` and push onto
+    /// the stack once per pop, so ≤ `TX_BATCH_SIZE` snapshots
+    /// accumulate between a drain and its paired push_front /
+    /// commit. `cos_queue_pop_front` contains a `debug_assert!` to
+    /// catch regressions in dev/test. Preallocated to that capacity
+    /// so no hot-path realloc occurs. Each entry is 24 bytes
+    /// (`CoSQueuePopSnapshot`), so the worst-case footprint is
+    /// 256 × 24 = ~6 KB per queue — on top of the 1024-bucket
+    /// bookkeeping arrays already resident in `CoSQueueRuntime`.
+    ///
+    /// Why a stack and not a single `Option`: earlier drained
+    /// buckets in a batched rollback (e.g. N pops across M buckets,
+    /// all ring-full-retried) need their exact pre-pop head/tail,
+    /// not the `max(tail, queue_vtime) + bytes` re-anchor, which
+    /// can overshoot when `queue_vtime` has already advanced past
+    /// the earlier bucket's original head. Per-pop snapshots make
+    /// every rollback item round-trip neutral.
+    pub(super) pop_snapshot_stack: Vec<CoSQueuePopSnapshot>,
+    /// #785 Phase 3 — active-set tracking for flow-fair MQFQ.
+    /// Still populated on bucket 0→>0 / >0→0 transitions so that
+    /// `cos_queue_front`/`cos_queue_pop_front` can scan just the
+    /// small active set rather than all 1024 SFQ buckets to find
+    /// the minimum finish time. Semantically a set (membership),
+    /// not a DRR ring — the ordering is governed by
+    /// `flow_bucket_finish_bytes`, not ring position.
     pub(super) flow_rr_buckets: FlowRrRing,
     pub(super) flow_bucket_items: [VecDeque<CoSPendingTxItem>; COS_FLOW_FAIR_BUCKETS],
     pub(super) runnable: bool,

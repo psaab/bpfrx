@@ -1665,7 +1665,14 @@ fn reset_binding_cos_runtime(binding: &mut BindingWorker) {
     let mut dropped_prepared = Vec::new();
     for root in binding.cos_interfaces.values_mut() {
         for queue in &mut root.queues {
-            while let Some(item) = cos_queue_pop_front(queue) {
+            // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer
+            // LOW: teardown drains the whole queue without a
+            // matching push_front rollback, so no snapshots are
+            // ever consumed. Use the no-snapshot pop variant so
+            // we don't grow pop_snapshot_stack past its documented
+            // TX_BATCH_SIZE bound (the queue may hold more items
+            // than that). The runtime is replaced below anyway.
+            while let Some(item) = cos_queue_pop_front_no_snapshot(queue) {
                 match item {
                     CoSPendingTxItem::Local(_) => {
                         dropped_local = dropped_local.saturating_add(1);
@@ -2245,6 +2252,10 @@ mod tests {
                     active_flow_buckets: 0,
                     active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    queue_vtime: 0,
+                    pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                     runnable,
@@ -2381,6 +2392,10 @@ mod tests {
                 active_flow_buckets: 0,
                 active_flow_buckets_peak: 0,
                 flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                queue_vtime: 0,
+                pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
                 flow_rr_buckets: FlowRrRing::default(),
                 flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                 runnable: true,
@@ -2583,6 +2598,10 @@ mod tests {
                     active_flow_buckets: 0,
                     active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    queue_vtime: 0,
+                    pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                     runnable: false,
@@ -2613,6 +2632,10 @@ mod tests {
                     active_flow_buckets: 0,
                     active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    queue_vtime: 0,
+                    pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                     runnable: false,
@@ -2643,6 +2666,10 @@ mod tests {
                     active_flow_buckets: 0,
                     active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    queue_vtime: 0,
+                    pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                     runnable: false,
@@ -2798,6 +2825,10 @@ mod tests {
                     active_flow_buckets: 0,
                     active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    queue_vtime: 0,
+                    pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                     runnable: false,
@@ -2828,6 +2859,10 @@ mod tests {
                     active_flow_buckets: 0,
                     active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    queue_vtime: 0,
+                    pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                     runnable: false,
@@ -2948,6 +2983,10 @@ mod tests {
                 active_flow_buckets: 0,
                 active_flow_buckets_peak: 0,
                 flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                queue_vtime: 0,
+                pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
                 flow_rr_buckets: FlowRrRing::default(),
                 flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                 runnable: false,
@@ -3113,6 +3152,10 @@ mod tests {
                     active_flow_buckets: 0,
                     active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    queue_vtime: 0,
+                    pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                     runnable: false,
@@ -3143,6 +3186,10 @@ mod tests {
                     active_flow_buckets: 0,
                     active_flow_buckets_peak: 0,
                     flow_bucket_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_head_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    flow_bucket_tail_finish_bytes: [0; COS_FLOW_FAIR_BUCKETS],
+                    queue_vtime: 0,
+                    pop_snapshot_stack: Vec::with_capacity(TX_BATCH_SIZE),
                     flow_rr_buckets: FlowRrRing::default(),
                     flow_bucket_items: std::array::from_fn(|_| VecDeque::new()),
                     runnable: false,
