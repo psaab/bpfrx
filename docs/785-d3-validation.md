@@ -180,9 +180,24 @@ are all per-queue; D3's reshape lives in `pkg/daemon/rss_indirection.go`
 and never reads userspace-dp state. A concrete regression test for
 the interaction is infeasible (it would require instrumenting the
 full NIC RSS pipeline), but the above independence argument is
-structural — a reader can verify it by grepping
-`rss_indirection.go` for any reference to CoS/MQFQ symbols (none)
-and `userspace-dp/src/afxdp/` for any reference to RSS (none).
+structural:
+
+* `grep -r 'cos\|mqfq\|flow_bucket\|queue_vtime' pkg/daemon/rss_indirection.go`
+  returns zero matches — the D3 reshape does not read any MQFQ or
+  CoS runtime state.
+* `grep -rn -i 'rss\|indirection' userspace-dp/src/afxdp/*.rs` returns
+  three hits (`tx.rs:5040`, `tx.rs:14008`, `tx.rs:14159`). All three
+  are commentary inside docstrings explaining the Phase 4 cross-
+  worker fairness problem ("the dominant imbalance source at P=12 /
+  8 workers", "RSS bucket collides across the whole deployment"),
+  never reads of RSS state. There is no code path that consults RSS
+  layout at runtime — MQFQ runs on whatever flows have hashed onto
+  this worker's queue and knows nothing about how the hashing was
+  configured.
+
+D3 decides *which worker* receives a flow; MQFQ orders the flows
+that already arrived on *one worker's* queue. Those are
+non-overlapping responsibilities in non-overlapping codebases.
 
 ## Conclusion
 
