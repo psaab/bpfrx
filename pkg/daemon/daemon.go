@@ -455,6 +455,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// `set system dataplane rss-indirection disable`.
 		rssEnabled := true
 		var rssAllowed []string
+		// #801 Phase-B Step-0 tunables: host-scope governor + netdev
+		// budget; per-iface mlx5 coalescence. All three share the same
+		// allowlist + userspace-dp gating as D3.
+		var (
+			governor         string
+			netdevBudget     int
+			coalesceEnable   bool
+			coalesceRX       int
+			coalesceTX       int
+			userspaceDP      bool
+			coalesceExplicit bool
+		)
 		if cfg := d.store.ActiveConfig(); cfg != nil {
 			if cfg.Chassis.Cluster != nil {
 				clusterMode = true
@@ -465,6 +477,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// when userspace dataplane is not in use — applyRSSIndirection
 			// treats that as a no-op.
 			if cfg.System.DataplaneType == "userspace" && cfg.System.UserspaceDataplane != nil {
+				userspaceDP = true
 				userspaceWorkers = cfg.System.UserspaceDataplane.Workers
 				if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
 					rssEnabled = false
@@ -472,10 +485,37 @@ func (d *Daemon) Run(ctx context.Context) error {
 				// Codex H1: scope D3 to only interfaces that
 				// userspace-dp actually binds AF_XDP sockets on.
 				rssAllowed = dpuserspace.UserspaceBoundLinuxInterfaces(cfg)
+				// #801 knobs.
+				governor = cfg.System.UserspaceDataplane.CPUGovernor
+				netdevBudget = cfg.System.UserspaceDataplane.NetdevBudget
+				coalesceExplicit = cfg.System.UserspaceDataplane.CoalescenceAdaptiveExplicit
+				// coalesceEnable stays false by default — the Step-0
+				// finding is "adaptive=on causes pp99 latency jitter",
+				// so default-off is what the issue asks for. An
+				// explicit `adaptive enable` inverts this.
+				if coalesceExplicit &&
+					!cfg.System.UserspaceDataplane.CoalescenceAdaptiveDisabled {
+					coalesceEnable = true
+				}
+				coalesceRX = cfg.System.UserspaceDataplane.CoalescenceRXUsecs
+				coalesceTX = cfg.System.UserspaceDataplane.CoalescenceTXUsecs
 			}
 		}
 		if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
 			slog.Warn("interface naming failed", "err", err)
+		}
+		// #801: host tunables + coalescence. Runs after the interface
+		// rename but still before the dataplane is loaded — matches
+		// the D3 "before any AF_XDP bind" invariant. Best-effort: any
+		// failure logs and continues.
+		gov, budget := resolvedHostTunables(governor, netdevBudget, userspaceDP)
+		applyHostTunables(gov, budget, realHostTunableFS{})
+		// Coalescence: only touch allowlisted mlx5 interfaces. When
+		// the operator did not set the knob, the default behaviour is
+		// "disable adaptive" (coalesceEnable=false) on every
+		// userspace-dp mlx5 interface.
+		if userspaceDP {
+			applyCoalescence(coalesceEnable, coalesceRX, coalesceTX, rssAllowed, realRSSExecutor{})
 		}
 	}
 
@@ -2302,14 +2342,40 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		rssEnabled := true
 		workers := 0
 		var rssAllowed []string
+		// #801: mirror the startup site so a commit that changes any
+		// of the Step-0 knobs takes effect without a restart.
+		var (
+			governor         string
+			netdevBudget     int
+			coalesceEnable   bool
+			coalesceRX       int
+			coalesceTX       int
+			userspaceDP      bool
+			coalesceExplicit bool
+		)
 		if cfg.System.DataplaneType == "userspace" && cfg.System.UserspaceDataplane != nil {
+			userspaceDP = true
 			workers = cfg.System.UserspaceDataplane.Workers
 			if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
 				rssEnabled = false
 			}
 			rssAllowed = dpuserspace.UserspaceBoundLinuxInterfaces(cfg)
+			governor = cfg.System.UserspaceDataplane.CPUGovernor
+			netdevBudget = cfg.System.UserspaceDataplane.NetdevBudget
+			coalesceExplicit = cfg.System.UserspaceDataplane.CoalescenceAdaptiveExplicit
+			if coalesceExplicit &&
+				!cfg.System.UserspaceDataplane.CoalescenceAdaptiveDisabled {
+				coalesceEnable = true
+			}
+			coalesceRX = cfg.System.UserspaceDataplane.CoalescenceRXUsecs
+			coalesceTX = cfg.System.UserspaceDataplane.CoalescenceTXUsecs
 		}
 		reapplyRSSIndirection(rssEnabled, workers, rssAllowed)
+		gov, budget := resolvedHostTunables(governor, netdevBudget, userspaceDP)
+		applyHostTunables(gov, budget, realHostTunableFS{})
+		if userspaceDP {
+			applyCoalescence(coalesceEnable, coalesceRX, coalesceTX, rssAllowed, realRSSExecutor{})
+		}
 	}
 }
 
