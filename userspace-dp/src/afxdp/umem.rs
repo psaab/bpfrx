@@ -1210,6 +1210,84 @@ mod tests {
         let _: fn(&WorkerUmem, &WorkerUmem) -> bool = WorkerUmem::shares_allocation_with;
         let _: fn(&WorkerUmem) -> *const WorkerUmemInner = WorkerUmem::allocation_ptr;
     }
+
+    #[test]
+    fn tx_latency_hist_shared_umem_oob_offset_stamp_silent_drop() {
+        // #812 Rust round-1 HIGH-1: under `shared_umem = true`
+        // (mlx5 special case), a frame offset can come from the
+        // shared pool such that `offset >> UMEM_FRAME_SHIFT` exceeds
+        // THIS binding's sidecar length. `stamp_submits` MUST drop
+        // the stamp silently — the slot belongs to a different
+        // binding's sidecar and touching it here would either
+        // overflow or corrupt an adjacent binding's accounting.
+        //
+        // Pin: build a small sidecar, drive `stamp_submits` with one
+        // in-range and two out-of-range offsets, assert the in-range
+        // slot landed exactly the stamp and ALL other slots are
+        // untouched. The test also proves a foreign-offset stamp
+        // cannot produce a phantom completion against an adjacent
+        // sidecar slot (the "honest histogram" invariant that
+        // HIGH-1 asked us to pin).
+        let sidecar_len: u64 = 4;
+        let mut sidecar = vec![TX_SIDECAR_UNSTAMPED; sidecar_len as usize];
+        let in_range = 1u64 << UMEM_FRAME_SHIFT; // idx 1, inside
+        let just_past = sidecar_len << UMEM_FRAME_SHIFT; // idx == len
+        let far_past = (sidecar_len + 1000) << UMEM_FRAME_SHIFT; // idx len+1000
+        let ts = 42_000_000_000u64;
+        crate::afxdp::tx::stamp_submits(
+            &mut sidecar,
+            [in_range, just_past, far_past].into_iter(),
+            ts,
+        );
+        // Slot 1 stamped; slots 0, 2, 3 unchanged. OOB offsets
+        // produced NO allocation (slice not grown) and NO mutation
+        // outside the bounds.
+        assert_eq!(sidecar.len(), sidecar_len as usize, "len unchanged");
+        assert_eq!(sidecar[0], TX_SIDECAR_UNSTAMPED);
+        assert_eq!(sidecar[1], ts);
+        assert_eq!(sidecar[2], TX_SIDECAR_UNSTAMPED);
+        assert_eq!(sidecar[3], TX_SIDECAR_UNSTAMPED);
+    }
+
+    #[test]
+    fn tx_latency_hist_shared_umem_oob_offset_reap_no_phantom_bucket() {
+        // #812 Rust round-1 HIGH-1 companion: drive
+        // `record_tx_completions_with_stamp` with an offset that
+        // would index past `sidecar.len()`. `get_mut` returns None
+        // → the fold treats the "stamp" as TX_SIDECAR_UNSTAMPED →
+        // the delta check drops the sample → NO bucket bumped, NO
+        // `count` / `sum_ns` increment. This is the reap-side half
+        // of the "honest histogram" invariant: cross-binding offset
+        // noise cannot produce a phantom completion.
+        let live = BindingLiveState::new();
+        let owner = &live.owner_profile_owner;
+        let sidecar_len: u64 = 4;
+        let mut sidecar = vec![TX_SIDECAR_UNSTAMPED; sidecar_len as usize];
+        // Pre-stamp slot 0 with a legitimate value so a phantom
+        // cross-slot bleed would be visible as a bucket bump.
+        let t0 = 5_000_000_000u64;
+        crate::afxdp::tx::stamp_submits(&mut sidecar, [0u64].into_iter(), t0);
+        // Completion against an OOB offset — must be dropped.
+        let oob_offset = (sidecar_len + 7) << UMEM_FRAME_SHIFT;
+        let (count, sum) = crate::afxdp::tx::record_tx_completions_with_stamp(
+            &mut sidecar,
+            &[oob_offset],
+            t0 + 10_000,
+            owner,
+        );
+        assert_eq!(count, 0, "OOB completion must not be counted");
+        assert_eq!(sum, 0, "OOB completion must not bump sum_ns");
+        for b in 0..TX_SUBMIT_LAT_BUCKETS {
+            assert_eq!(
+                owner.tx_submit_latency_hist[b].load(Ordering::Relaxed),
+                0,
+                "bucket {b} must stay 0 on OOB completion",
+            );
+        }
+        // Slot 0 is still stamped — the OOB reap must not have
+        // touched any in-range slot.
+        assert_eq!(sidecar[0], t0, "in-range slot corrupted by OOB reap");
+    }
 }
 
 /// Raw ring state: (rxP, rxC, frP, frC, txP, txC, crP, crC)

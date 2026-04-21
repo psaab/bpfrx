@@ -56,35 +56,25 @@ where
     }
     for offset in offsets {
         let idx = (offset >> UMEM_FRAME_SHIFT) as usize;
-        // #812 Rust round-1 HIGH-1: debug-assert the offset lands
-        // inside this binding's sidecar. Under `shared_umem = true`
-        // (mlx5 special case), a cross-binding redirect could in
-        // principle produce an offset whose frame index exceeds
-        // `sidecar.len()` — we drop those silently at runtime
-        // (sound: they belong to a different binding and the owner
-        // of that binding is responsible for its own sidecar). The
-        // debug_assert turns that silent drop into a loud test-build
-        // failure so a future regression that routes foreign
-        // offsets through this writer is caught before it ships.
-        debug_assert!(
-            idx < sidecar.len(),
-            "tx_submit_ns sidecar out-of-range: offset={offset} \
-             idx={idx} sidecar_len={} — cross-binding redirect? \
-             (plan §3.3 single-writer invariant)",
-            sidecar.len(),
-        );
+        // #812 Rust round-1 HIGH-1: under `shared_umem = true` (mlx5
+        // special case), frames drawn from the shared pool CAN have
+        // offsets whose `offset >> UMEM_FRAME_SHIFT` exceeds THIS
+        // binding's `total_frames`. Silent-drop is the correct
+        // behaviour: the out-of-range frame belongs to a different
+        // binding's sidecar, and that binding's owner is responsible
+        // for stamping its own slots. Writing into this sidecar at a
+        // bounded-out-of-range index would overflow OR (after a
+        // resize up) corrupt an unrelated slot — `get_mut` returns
+        // None on out-of-range, which keeps the hot path sound.
+        // Pinned by the `tx_latency_hist_shared_umem_oob_offset_*`
+        // tests below.
+        //
+        // `debug_assert!` is deliberately NOT used here: tests drive
+        // this path directly and we want release-parity semantics
+        // (silent drop) to be the PRIMARY pin, not a test-only panic.
         if let Some(slot) = sidecar.get_mut(idx) {
             *slot = ts_submit;
         }
-        // Out-of-range offsets are silently dropped in release
-        // builds — the sidecar is sized to the binding's total
-        // frame count at construction, so an out-of-range index
-        // means either a frame from another UMEM (cross-binding
-        // redirect producing a stale offset — should never reach
-        // the TX writer for this binding) or a builder bug upstream.
-        // Either way, skipping the stamp keeps the hot path
-        // allocation-free and the histogram honest: the reap-time
-        // sentinel check drops the sample.
     }
 }
 
