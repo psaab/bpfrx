@@ -100,7 +100,7 @@ loop.
 - **Commit message explains WHY.** 122-line body with "What
   changes", "Codex adversarial review" (both HIGH findings traced
   end-to-end), "Tests", "Empirical measurements" table, and
-  "Deferred for Phase 4" sections. `docs/785-cross-worker-drr-
+  "Deferred for Phase 4" sections. `docs/pr/785-umbrella/cross-worker-drr-
   retrospective.md §4` referenced for the packet-count-vs-byte-
   rate argument. This is the strongest commit body on the branch.
 - **No D3 (SetApplyConfigFn / apply_config) plumbing touched.**
