@@ -15,6 +15,12 @@ in-cell flow-rate spread under a working CoS pipeline. Y is set to
 those cells (per the round-2 review's "mean + 2 stddev of observed
 spread" rule).
 
+Round-3 finding #2 (HIGH) addition: a 4-cell stddev is a noisy
+estimator of the population stddev and the earlier revision published
+Y=2.72 as a point estimate without a confidence interval. This script
+now emits a nonparametric bootstrap 95% CI for Y so reviewers can see
+how wide the uncertainty around 2.72 really is.
+
 Reverse cells are excluded because §2 of the Step 1 plan already
 documents that reverse traffic is unshaped — those rates are not bound
 by a per-flow byte-rate-fair shaper, so their spread is not the right
@@ -27,6 +33,7 @@ slow-start stragglers, not steady-state shaper output.
 Usage:
     python3 step1-rate-spread-analysis.py
     python3 step1-rate-spread-analysis.py --evidence-dir docs/pr/...
+    python3 step1-rate-spread-analysis.py --bootstrap-trials 100000
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import statistics
 import sys
 from pathlib import Path
@@ -90,6 +98,22 @@ def main(argv: List[str] | None = None) -> int:
         help="Cell basenames to analyze (default: 4 forward shaped cells).",
     )
     p.add_argument("--floor-ratio", type=float, default=0.5)
+    p.add_argument(
+        "--bootstrap-trials",
+        type=int,
+        default=10000,
+        help=(
+            "Nonparametric bootstrap resample count for the "
+            "Y = mean + 2*stddev 95%% CI (round-3 finding #2). "
+            "Pass 0 to skip."
+        ),
+    )
+    p.add_argument(
+        "--bootstrap-seed",
+        type=int,
+        default=42,
+        help="Deterministic RNG seed for the bootstrap.",
+    )
     args = p.parse_args(argv)
 
     if not args.evidence_dir.is_dir():
@@ -127,6 +151,54 @@ def main(argv: List[str] | None = None) -> int:
     print(f"  stddev:                          {stdev:0.4f}")
     print(f"  Y = mean + 2*stddev:             {y_2sigma:0.4f}")
     print(f"  Y rounded for plan:              {math.ceil(y_2sigma * 100) / 100:0.2f}")
+
+    # Bootstrap 95% CI for Y (round-3 finding #2 HIGH).
+    if args.bootstrap_trials > 0 and len(ratios) >= 2:
+        rng = random.Random(args.bootstrap_seed)
+        ys: List[float] = []
+        n = len(ratios)
+        for _ in range(args.bootstrap_trials):
+            resample = [ratios[rng.randrange(n)] for _ in range(n)]
+            m = statistics.mean(resample)
+            # With resampling, stdev can be 0 if all n picks are equal.
+            try:
+                s = statistics.stdev(resample)
+            except statistics.StatisticsError:
+                s = 0.0
+            ys.append(m + 2.0 * s)
+        ys.sort()
+
+        def pct(p: float) -> float:
+            idx = int(round(p * (len(ys) - 1)))
+            return ys[idx]
+
+        lo = pct(0.025)
+        hi = pct(0.975)
+        median = pct(0.5)
+        print()
+        print(
+            f"# Bootstrap 95% CI for Y (trials={args.bootstrap_trials}, "
+            f"seed={args.bootstrap_seed})"
+        )
+        print(f"  Y median (bootstrap): {median:0.4f}")
+        print(f"  Y 95% CI:             [{lo:0.4f}, {hi:0.4f}]")
+        print(
+            "  NOTE: CI is wide because n=4. Threshold Y=2.72 is near the"
+        )
+        print(
+            "  upper end of this CI; true mean+2*sigma over a larger"
+        )
+        print(
+            "  sample could be materially different. Plan §4 commits to"
+        )
+        print(
+            "  re-running this script (with an expanded --cells list) if"
+        )
+        print(
+            "  Step 1 produces new baseline cells and refreshing Y before"
+        )
+        print("  applying Verdict B to the new cells.")
+
     print()
     print("# Citation: docs/pr/line-rate-investigation/evidence-8matrix/")
     print(f"#   {', '.join(name + '.json' for name in args.cells)}")
