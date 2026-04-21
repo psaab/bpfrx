@@ -176,3 +176,12 @@ ROUND 5: plan-ready NO — the with-cos `Z_cos` gating loop is still not cleanly
 7. BLOCKER: one numeric/policy contradiction remains inside the with-cos Verdict-B math. `§4.2` still says "`If real healthy shaped park rate is near 500 / s ... FP could exceed the ≤ 5 % target band; the k ≥ 3 multi-cell rule absorbs that risk.`" (`lines 573-578`), but `§4.6` rewrites the active rule to "`Fire the investigation-level with-cos Verdict B iff `k_B ≥ 2` of the 4 with-cos forward shaped cells`" and summarizes it again as "`k_B ≥ 2 of 4` (50%). Aggregate FP ≈ 0.052 at p = 0.10.`" (`lines 777-812, 834-842`). That stale "`k ≥ 3`" sentence is not just historical context; it sits in the current threshold derivation and directly contradicts the operative `k_B ≥ 2 of 4` rule.
 
 ROUND 6: plan-ready NO — 1 blocker(s) remain.
+
+## Round 7 verification
+
+ROUND 7: plan-ready YES
+
+- Check 1: `§4.2` no longer contains the old `k >= 3` / `k ≥ 3` wording; the relevant scan range is `docs/pr/line-rate-investigation/step1-plan.md:506-583`, and the corrected text explicitly says `§4.6 k_B ≥ 2 of 4` at `:571-573` and `:581-582`.
+- Check 2: headroom math is explicit, not asserted: `500 / 300 = 1.67×` and `500 / 100 = 5×` are derived at `docs/pr/line-rate-investigation/step1-plan.md:552-557`.
+- Check 3: full-file sweep found no active stale numeric/policy contradiction. Remaining `k_B ≥ 3` / `8 with-cos cells` text is historical-only at `:768-781` and `:820-830`; operative rules stay `k_B ≥ 2 of 4` at `:647`, `:783-845`, `:1075-1093`, and `:1127-1133`.
+- Check 4: end-to-end consistency now holds across `§4.2`, `§4.6`, `§8`, and `§9`. One non-blocking seam remains: `§8` uses the shorthand `k_B ≥ 50 % of valid cells` before narrowing it to `k_B ≥ 2 of 4 with-cos forward shaped cells` at `:1075-1077`.
