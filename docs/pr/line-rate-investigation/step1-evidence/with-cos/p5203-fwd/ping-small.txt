@@ -1,0 +1,5 @@
+PING 172.16.80.200 (172.16.80.200) 56(84) bytes of data.
+
+--- 172.16.80.200 ping statistics ---
+5186 packets transmitted, 5185 received, 0.0192827% packet loss, time 59982ms
+rtt min/avg/max/mdev = 0.267/10.861/24.493/3.056 ms, pipe 2

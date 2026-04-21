@@ -1,0 +1,1 @@
+p5201-fwd-with-cos: D n_max=5 n_min=3 park_rate=19878.78/s rate_spread=1.833 worst_ring_w=0@50% small_p99=0.217 large_p99=0.230 sum=0.954 retr=270
