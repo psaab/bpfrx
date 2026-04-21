@@ -717,9 +717,11 @@ Verdict A is safe to act on.
    cells are not all a single (port, direction) repeat run, treat
    Verdict A as the investigation-level signal. §4.2 multi-cell
    aggregation shows `P(≥ 2 of 8 cells fire | 56 % skew) = 0.9949`
-   and `P(≥ 2 of 8 cells fire | fair RSS) = 0.139` — the ≥ 2
-   threshold amplifies signal-to-noise by ~7× versus the
-   single-cell rule.
+   and `P(≥ 2 of 8 cells fire | fair RSS) = 0.0881` — the ≥ 2
+   threshold amplifies signal-to-noise by ~11× versus the
+   single-cell rule (0.9949 / 0.0881 ≈ 11.3 versus 0.6302 / 0.0638
+   ≈ 9.9 for single-cell). The binomial with per-cell FP p = 0.0638
+   gives P(≥ 2 of 8) = 1 - (1-p)^8 - 8·p·(1-p)^7 = 0.0881.
 4. **Structural A.** If all firing cells share the same overloaded
    worker (identified by per-binding `rx_packets` ordering), the
    skew is structural (Toeplitz hash + flow-set specific) and
