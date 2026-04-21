@@ -10,6 +10,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+	"github.com/vishvananda/netlink"
 )
 
 const linkPinPath = "/sys/fs/bpf/xpf/links"
@@ -328,7 +329,20 @@ func (m *Manager) ClearVlanIfaceMap() error {
 }
 
 // AddTxPort adds an interface to the devmap for XDP_REDIRECT.
+//
+// tx_ports is a DEVMAP sized MaxInterfaces; kernel ifindex is used as
+// the dense key. If ifindex >= MaxInterfaces the bpf_map_update_elem
+// would return E2BIG, which bubbles up as "key too big for map" and
+// aborts dataplane compile before ever_ok flips. Guard at the call
+// site so the error names the interface rather than needing journalctl
+// archaeology. See issue #814.
 func (m *Manager) AddTxPort(ifindex int) error {
+	if ifindex < 0 || uint32(ifindex) >= MaxInterfaces {
+		return fmt.Errorf(
+			"AddTxPort: ifindex %d exceeds tx_ports cap %d (raise MAX_INTERFACES in bpf/headers/xpf_common.h)",
+			ifindex, MaxInterfaces,
+		)
+	}
 	tm, ok := m.maps["tx_ports"]
 	if !ok {
 		return fmt.Errorf("tx_ports not found")
@@ -341,6 +355,45 @@ func (m *Manager) AddTxPort(ifindex int) error {
 		return err
 	}
 	m.seedInterfaceCounter(ifindex)
+	return nil
+}
+
+// linkLister is the netlink enumeration surface used by
+// preflightCheckIfindexCaps. Exposed as a package variable so tests
+// can inject a fake without spinning up a netns.
+var linkLister = netlink.LinkList
+
+// preflightCheckIfindexCaps enumerates kernel links and returns a
+// descriptive error if any ifindex already exceeds MaxInterfaces. Called
+// from Manager.Compile() so every compile cycle fires it — catching
+// cases where a new namespace pushed ifindex past the cap between
+// config snapshots, before AddTxPort hits E2BIG deep in zone apply.
+//
+// This is a bonus early-warning gate; the call-site cap checks in
+// AddTxPort and userspace/maps_sync.go are the real guardrails. Both
+// layers exist because interfaces can appear via netlink events at any
+// time (HA reconcile, link hotplug), not only at compile.
+func (m *Manager) preflightCheckIfindexCaps() error {
+	links, err := linkLister()
+	if err != nil {
+		// Non-fatal: a transient netlink error on preflight should not
+		// abort compile. The call-site checks will still fire if any
+		// offending interface is actually touched.
+		slog.Warn("preflightCheckIfindexCaps: netlink.LinkList failed, skipping preflight", "err", err)
+		return nil
+	}
+	for _, l := range links {
+		attrs := l.Attrs()
+		if attrs == nil {
+			continue
+		}
+		if attrs.Index < 0 || uint32(attrs.Index) >= MaxInterfaces {
+			return fmt.Errorf(
+				"preflightCheckIfindexCaps: interface %q ifindex %d exceeds MAX_INTERFACES cap %d (raise MAX_INTERFACES in bpf/headers/xpf_common.h)",
+				attrs.Name, attrs.Index, MaxInterfaces,
+			)
+		}
+	}
 	return nil
 }
 

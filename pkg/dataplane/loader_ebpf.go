@@ -197,6 +197,28 @@ func (m *Manager) loadAllObjects() error {
 	if err != nil {
 		return fmt.Errorf("load Rust xdp_userspace spec: %w", err)
 	}
+	// Load-time drift guard (#814): fail fast if the embedded
+	// userspace_xdp_bpfel.o was built against different MAX_INTERFACES /
+	// BINDING_QUEUES_PER_IFACE values than the Go constants in
+	// constants.go. A stale .o slipping through make generate would
+	// otherwise silently overflow at the first high-ifindex
+	// bindingsMap.Update, exactly the recurrence this PR fixes.
+	if ms, ok := userspaceSpec.Maps["userspace_bindings"]; !ok {
+		return fmt.Errorf("Rust xdp_userspace spec missing map userspace_bindings")
+	} else if ms.MaxEntries != BindingArrayMaxEntries {
+		return fmt.Errorf(
+			"userspace_bindings max_entries drift: embedded=%d, expected=%d (MaxInterfaces=%d * BindingQueuesPerIface=%d in bpf/headers/xpf_common.h). Re-run `make generate`.",
+			ms.MaxEntries, BindingArrayMaxEntries, MaxInterfaces, BindingQueuesPerIface,
+		)
+	}
+	if ms, ok := userspaceSpec.Maps["userspace_ingress_ifaces"]; !ok {
+		return fmt.Errorf("Rust xdp_userspace spec missing map userspace_ingress_ifaces")
+	} else if ms.MaxEntries != MaxInterfaces {
+		return fmt.Errorf(
+			"userspace_ingress_ifaces max_entries drift: embedded=%d, expected=%d (MaxInterfaces in bpf/headers/xpf_common.h). Re-run `make generate`.",
+			ms.MaxEntries, MaxInterfaces,
+		)
+	}
 	for _, name := range []string{
 		"userspace_ctrl",
 		"userspace_bindings",

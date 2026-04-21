@@ -15,6 +15,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 	xpfnft "github.com/psaab/xpf/pkg/nftables"
 	"github.com/vishvananda/netlink"
 )
@@ -517,6 +518,17 @@ ctrlReady:
 			flags = userspaceBindingReady
 		}
 		idx := uint32(binding.Ifindex)*bindingQueuesPerIface + binding.QueueID
+		// Call-site cap guard (#814): the aya Array is sized to
+		// dataplane.BindingArrayMaxEntries = MaxInterfaces *
+		// BindingQueuesPerIface. An ifindex above MaxInterfaces would
+		// overflow the flat index; fail with a legible error instead
+		// of relying on the kernel's "argument list too long" E2BIG.
+		if idx >= dataplane.BindingArrayMaxEntries {
+			return fmt.Errorf(
+				"update userspace_bindings: idx=%d exceeds cap=%d (ifindex=%d queue=%d; raise MAX_INTERFACES in bpf/headers/xpf_common.h)",
+				idx, dataplane.BindingArrayMaxEntries, binding.Ifindex, binding.QueueID,
+			)
+		}
 		val := userspaceBindingValue{
 			Slot:  binding.Slot,
 			Flags: flags,
@@ -539,6 +551,15 @@ ctrlReady:
 				flags = userspaceBindingReady
 			}
 			idx := childIfindex*bindingQueuesPerIface + binding.QueueID
+			// Call-site cap guard (#814): see primary apply above.
+			// VLAN-alias children use their own ifindex here, so the
+			// child (not the parent) is the overflow risk.
+			if idx >= dataplane.BindingArrayMaxEntries {
+				return fmt.Errorf(
+					"update aliased userspace_bindings: idx=%d exceeds cap=%d (child=%d parent=%d queue=%d; raise MAX_INTERFACES in bpf/headers/xpf_common.h)",
+					idx, dataplane.BindingArrayMaxEntries, childIfindex, parentIfindex, binding.QueueID,
+				)
+			}
 			val := userspaceBindingValue{
 				Slot:  binding.Slot,
 				Flags: flags,
@@ -907,6 +928,15 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 			continue
 		}
 		idx := uint32(binding.Ifindex)*bindingQueuesPerIface + binding.QueueID
+		// Call-site cap guard (#814): the watchdog is repair-only and
+		// must not unwind. Log and skip if the ifindex would overflow
+		// the BindingArrayMaxEntries dense cap.
+		if idx >= dataplane.BindingArrayMaxEntries {
+			slog.Warn("userspace: bindings watchdog: ifindex exceeds BindingArrayMaxEntries cap, skipping",
+				"ifindex", binding.Ifindex, "queue", binding.QueueID,
+				"idx", idx, "cap", dataplane.BindingArrayMaxEntries)
+			continue
+		}
 		var val userspaceBindingValue
 		if err := bindingsMap.Lookup(idx, &val); err != nil {
 			slog.Debug("userspace: bindings watchdog lookup failed",
@@ -944,6 +974,16 @@ func (m *Manager) verifyBindingsMapLocked() bool {
 					continue
 				}
 				idx := childIfindex*bindingQueuesPerIface + binding.QueueID
+				// Call-site cap guard (#814): repair-only, log-and-skip
+				// instead of unwinding. VLAN child ifindex is the
+				// overflow risk here.
+				if idx >= dataplane.BindingArrayMaxEntries {
+					slog.Warn("userspace: bindings watchdog alias: ifindex exceeds BindingArrayMaxEntries cap, skipping",
+						"child", childIfindex, "parent", parentIfindex,
+						"queue", binding.QueueID,
+						"idx", idx, "cap", dataplane.BindingArrayMaxEntries)
+					continue
+				}
 				var val userspaceBindingValue
 				if err := bindingsMap.Lookup(idx, &val); err != nil {
 					slog.Debug("userspace: bindings watchdog alias lookup failed",

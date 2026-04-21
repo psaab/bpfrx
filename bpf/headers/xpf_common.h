@@ -140,7 +140,7 @@ struct icmp6hdr {
 
 /* Maximum values */
 #define MAX_ZONES              64
-#define MAX_INTERFACES         2048
+#define MAX_INTERFACES         65536
 #define MAX_LOGICAL_INTERFACES 512
 #define MAX_POLICIES           4096
 #define MAX_RULES_PER_POLICY   256

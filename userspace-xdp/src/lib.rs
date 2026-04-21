@@ -59,7 +59,16 @@ const USERSPACE_CTRL_FLAG_TRACE: u32 = 2;
 const USERSPACE_CTRL_FLAG_NATIVE_GRE: u32 = 4;
 const USERSPACE_CTRL_FLAG_STRICT: u32 = 8;
 const BINDING_QUEUES_PER_IFACE: u32 = 16;
-const BINDING_ARRAY_MAX_ENTRIES: u32 = 1024 * BINDING_QUEUES_PER_IFACE; // 16384
+// MAX_INTERFACES is threaded in from bpf/headers/xpf_common.h via the
+// pkg/dataplane/build-userspace-xdp.sh wrapper, which does
+// `export MAX_INTERFACES=$(awk ... xpf_common.h)` before `cargo build`.
+// This ties the aya Array size to the C-side tx_ports DEVMAP cap so
+// the two constants cannot drift (see issue #814).
+const MAX_INTERFACES: u32 = match u32::from_str_radix(env!("MAX_INTERFACES"), 10) {
+    Ok(v) => v,
+    Err(_) => panic!("MAX_INTERFACES env var must be a u32 decimal literal"),
+};
+const BINDING_ARRAY_MAX_ENTRIES: u32 = MAX_INTERFACES * BINDING_QUEUES_PER_IFACE;
 const USERSPACE_TRACE_STAGE_RECEIVED: u32 = 1;
 const USERSPACE_TRACE_STAGE_BINDING_MISSING: u32 = 2;
 const USERSPACE_TRACE_STAGE_BINDING_NOT_READY: u32 = 3;
@@ -266,11 +275,13 @@ static USERSPACE_CTRL: Array<UserspaceCtrl> = Array::with_max_entries(1, 0);
 static USERSPACE_BINDINGS: Array<UserspaceBindingValue> =
     Array::with_max_entries(BINDING_ARRAY_MAX_ENTRIES, 0);
 
-// Keyed on kernel ifindex which can exceed 1024 on long-lived VMs
-// (incus/k8s ifindex grows monotonically). HashMap tolerates sparse
-// keys so updates never hit E2BIG regardless of ifindex magnitude.
+// Keyed on kernel ifindex which can exceed MAX_INTERFACES on long-lived
+// VMs (incus/k8s ifindex grows monotonically). HashMap tolerates sparse
+// keys so updates never hit E2BIG regardless of ifindex magnitude. The
+// max_entries is bumped to MAX_INTERFACES to keep a single knob on the
+// ifindex axis across every dataplane map (see issue #814).
 #[map(name = "userspace_ingress_ifaces")]
-static USERSPACE_INGRESS_IFACES: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
+static USERSPACE_INGRESS_IFACES: HashMap<u32, u8> = HashMap::with_max_entries(MAX_INTERFACES, 0);
 
 #[map(name = "userspace_heartbeat")]
 static USERSPACE_HEARTBEAT: Array<u64> = Array::with_max_entries(4096, 0);
