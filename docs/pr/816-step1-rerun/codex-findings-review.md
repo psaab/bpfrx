@@ -67,3 +67,22 @@ ROUND 2: OPEN ITEMS PREVENTING ACCEPTANCE
 1. HIGH-1 — Recompute and correct the §4 run1-dropped sensitivity analysis.
 2. MEDIUM-1 — Collapse the summary-table outputs to one canonical, regenerated artifact.
 3. MEDIUM-2 — Add a self-contained risk-by-finding / close-criteria table for the pinned-scipy deferral.
+## Round 3 verification
+
+Summary: 0 HIGH, 2 MEDIUM, 1 LOW. The Round 2 §4 recomputation itself is numerically right: an independent rerun of the committed classifier over `with-cos/p5203-fwd/hist-blocks.jsonl` against the cleaned `fwd-with-cos` baseline returns `p_D1 = 0.0245975402459754`, `stat_D1 = 0.006765690235176574`, matching the published `0.0246` / `+0.00677`. The stale duplicate CSV is gone, the §1.1 `~80x` fix is correct, and the primary verdict is still the conservative full-baseline `k_D1 = 4`. I am not accepting Round 3 yet because the findings doc still contradicts itself on the cleaned-baseline story, the reproducibility table is not yet in the requested Y/N + concrete-artifact form for #817 closure, and one Z_cos prose range remains stale.
+
+1. MEDIUM — The cleaned-baseline sensitivity fix is numerically correct in §4, but the document still contradicts it in §2.
+`docs/pr/816-step1-rerun/findings.md:236-242` still says that dropping `baseline/fwd-with-cos/run1` keeps `p5203-fwd-with-cos` "below any reasonable fire threshold" and that the cell stays quiet. That is now wrong on the committed classifier's own terms. §4 says the opposite at `docs/pr/816-step1-rerun/findings.md:331-355`, and an independent recomputation using the same `scipy.stats.permutation_test` path as the classifier (`test/incus/step1-histogram-classify.py:174-184`) over the committed block artifacts returns `p_D1 = 0.0245975402459754`, `stat_D1 = 0.006765690235176574`, i.e. a cleaned-baseline D1 fire. The document therefore still fails the "not contradicted elsewhere" bar for the Round 2 sensitivity fix.
+Mitigation: update the stale `p5203-fwd-with-cos` narrative in §2 so every cleaned-baseline reference agrees with §4 and keeps `k_D1 = 5` clearly framed as sensitivity-only against the primary full-baseline `k_D1 = 4`.
+
+2. MEDIUM — The new risk-by-finding table exists, but it is still not machine-actionable enough to close #817.
+The table has 7 rows, but the `RNG-sensitive?` column is not actually Y/N as requested: it mixes `NO`, `LOW`, `MEDIUM`, and `N/A` (`docs/pr/816-step1-rerun/findings.md:43-53`). That makes the semantics muddy on rows that still live or die on permutation p-values; e.g. the H2 D1 row is labeled `NO` while its close condition is still `Pinned p_D1 ≤ 0.05` (`docs/pr/816-step1-rerun/findings.md:45`). More importantly, the cleaned-baseline row does not point to a concrete evidence artifact at all; it names a rerun recipe (`docs/pr/816-step1-rerun/findings.md:46`) instead of a specific `docs/pr/816-step1-rerun/evidence/...` file a future reviewer can recompute from. As written, the table is informative, but it still does not fully satisfy the promised "Y/N + exact artifact + close condition" contract for #817 closure.
+Mitigation: convert `RNG-sensitive?` to literal Y/N, and change each RNG-sensitive row to point at concrete evidence inputs under `docs/pr/816-step1-rerun/evidence/` (for the cleaned-baseline row, the specific `hist-blocks.jsonl` / `baseline-blocks.jsonl` artifacts to rerun against).
+
+3. LOW — The Z_cos range fix is only half-applied.
+The first sentence of the replacement prose correctly says the shaped `with-cos-fwd` cluster is `16058-59624 parks/s, n=3`, but the replacement summary immediately below still says `{... shaped cluster: 19867-59624 parks/s, n=3}` (`docs/pr/816-step1-rerun/findings.md:157-163`). That second range still omits `p5204-fwd-with-cos` even though the evidence places it at `16057.73/s` and the paragraph still counts `n=3` (`docs/pr/816-step1-rerun/evidence/with-cos/p5201-fwd/verdict.txt:1`, `docs/pr/816-step1-rerun/evidence/with-cos/p5202-fwd/verdict.txt:1`, `docs/pr/816-step1-rerun/evidence/with-cos/p5204-fwd/verdict.txt:1`).
+Mitigation: update the second prose instance to `16058-59624 parks/s, n=3`, or explicitly exclude `p5204-fwd-with-cos` and stop counting it in `n=3`.
+
+ROUND 3: OPEN ITEMS PREVENTING ACCEPTANCE
+1. MEDIUM-1 — Remove the stale §2 cleaned-baseline narrative so the document no longer contradicts its own §4 recomputation.
+2. MEDIUM-2 — Tighten the §Reproducibility risk-by-finding table to literal Y/N sensitivity labels plus concrete `evidence/` artifacts for every RNG-sensitive row.

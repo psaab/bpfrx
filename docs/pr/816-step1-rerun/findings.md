@@ -40,15 +40,15 @@ total 37 min. Well inside the 120-min budget ceiling.
 
 (Codex Round 2 MED: explicit close-criteria for the scipy-pin deferral.)
 
-| Finding | RNG-sensitive? | Artifact to recompute under pinned scipy | Close condition for #817 |
+| Finding | RNG? | Artifact(s) to recompute under pinned scipy | Close condition for #817 |
 |---|:-:|---|---|
-| H2 D1 verdict (k_D1 ≥ 2 fires across shaped-fwd cells) | NO — stat_obs ≈ 0.9 dwarfs MC SE | `evidence/with-cos/{p5201-fwd,p5202-fwd}/perm-test-results.json` | Pinned p_D1 ≤ 0.05 on both cells |
-| Cleaned-baseline k_D1 = 5 (sensitivity §4) | LOW — p5203-fwd cleaned p=0.0246 is 0.027 above gate | re-run `step1-histogram-classify.py` with run1 dropped from `baseline/fwd-with-cos/` | Pinned cleaned p_D1 stays ≤ 0.05 (or finding gets a sensitivity caveat) |
-| Reverse-cell D1 fires (p5201-rev p=0.021, p5203-rev p=0.036) | MEDIUM — within 2× MC half-width of gate | `evidence/with-cos/{p5201-rev,p5203-rev}/perm-test-results.json` | Pinned p_D1 stays ≤ 0.05 OR cell drops to "near-gate LEAD" framing |
-| D2 downgrade (k_D2 excluded from verdict) | N/A — downgrade is methodological, not RNG | none | Always closed; D2 stays exploratory regardless of scipy |
-| Z_cos bimodal cluster summary | N/A — descriptive | none | Always closed; structural, not statistical |
-| H3-framing rejection | N/A — descriptive | none | Always closed; structural, not statistical |
-| Baseline-outlier identification | N/A — `baseline-blocks.jsonl` per-run summary | optional pinned re-derivation | Always closed; arithmetic, not RNG |
+| H2 D1 verdict (k_D1 ≥ 2 fires across shaped-fwd cells) | Y | `docs/pr/816-step1-rerun/evidence/with-cos/p5201-fwd/{hist-blocks.jsonl,perm-test-results.json}`; `docs/pr/816-step1-rerun/evidence/with-cos/p5202-fwd/{hist-blocks.jsonl,perm-test-results.json}`; `docs/pr/816-step1-rerun/evidence/baseline/fwd-with-cos/baseline-blocks.jsonl` | Pinned `p_D1 ≤ 0.05` on both p5201-fwd and p5202-fwd (currently 0.0001 each — robustness margin enormous) |
+| Cleaned-baseline k_D1 = 5 sensitivity (p5203-fwd flips to fire) | Y | `docs/pr/816-step1-rerun/evidence/with-cos/p5203-fwd/{hist-blocks.jsonl,perm-test-results.json}`; `docs/pr/816-step1-rerun/evidence/baseline/fwd-with-cos/baseline-blocks.jsonl` (lines 13-60 only — drop run1) | Pinned cleaned `p_D1 ≤ 0.05` (currently 0.0246, 0.027 above gate) — if it flips above 0.05, §4 gets a "sensitivity-flips-on-pinned-RNG" caveat but the primary k_D1=4 verdict is unaffected |
+| Reverse-cell D1 fires p5201-rev (p=0.021), p5203-rev (p=0.036) | Y | `docs/pr/816-step1-rerun/evidence/with-cos/p5201-rev/{hist-blocks.jsonl,perm-test-results.json}`; `docs/pr/816-step1-rerun/evidence/with-cos/p5203-rev/{hist-blocks.jsonl,perm-test-results.json}`; `docs/pr/816-step1-rerun/evidence/baseline/rev-with-cos/baseline-blocks.jsonl` | Pinned `p_D1 ≤ 0.05` on each — within 2× MC half-width of gate, so this is the genuinely RNG-sensitive row. If either flips above 0.05, the cell drops from "fire" to "near-gate LEAD"; primary verdict survives because k_D1 stays ≥ 2 from p5201-fwd and p5202-fwd alone |
+| D2 downgrade (k_D2 excluded from verdict) | N | none | Always closed; D2 stays exploratory regardless of scipy version. Methodological decision, not RNG-driven |
+| Z_cos bimodal cluster summary | N | none | Always closed; descriptive. The four park-rate values [16058, 19867, 59624, 0] are deterministic per-cell aggregates, not permutation outputs |
+| H3-framing rejection | N | none | Always closed; structural argument from histogram modes (mode=5 vs mode=9 on the two "both-fire" cells), not RNG-driven |
+| Baseline-outlier identification (run1 is 3.5× outlier) | N | `docs/pr/816-step1-rerun/evidence/baseline/fwd-with-cos/baseline-blocks.jsonl` (per-run T_D1 means in §4 table) | Always closed; arithmetic on per-run T_D1 means, not permutation outputs |
 
 **Acceptance for #817 closure:** all rows above marked "close condition" pass under the pinned environment. Diff committed as `docs/pr/816-step1-rerun/evidence/scipy-pin-validation.md`. If any reverse-cell D1 fire flips to quiet under the pinned RNG, findings.md §1.1 / §3 require an addendum noting the cell now reports as a near-gate LEAD instead of a fire (does not change the verdict; tightens the per-cell story).
 
@@ -159,7 +159,7 @@ The distribution is visibly bimodal (line-rate p5203-fwd = 0; shaped
 cells = 16058-59624 parks/s, n=3). A Gaussian mean+2σ summary is the
 wrong statistic for bimodal data and produces a number that
 corresponds to no real operating point. Replacement summary:
-{line-rate cluster: 0 parks/s; shaped cluster: 19867-59624 parks/s,
+{line-rate cluster: 0 parks/s; shaped cluster: 16058-59624 parks/s,
 n=3}. Phase 4 / AFD calibration must stratify Z_cos by scheduler-
 bound vs line-rate ports; no single threshold is derivable from n=4
 observations that include a zero.
@@ -233,13 +233,15 @@ One-sentence-per-cell narrative:
 - **p5202-rev-with-cos (D, D2 stat-only):** Reverse 18 Gbps, mode=9;
   D2 stat-fire rests on 13 frames in b0-2 across 12 blocks, 11 of
   them in a single block. Not mechanistically meaningful.
-- **p5203-fwd-with-cos (D-escalate, quiet):** Unshaped-equivalent at
-  25 Gbps; histogram shape matches no-cos baseline (`p_D1 = 0.629`,
-  `p_D2 = 1.0`) — NOT a D1/D2 signal, pure D shortfall. **Sensitivity
-  note:** cell mean T_D1 = 0.0248; dropping the run1 baseline outlier
-  (§4) would push the comparison baseline from 0.0274 to 0.0181,
-  making the cell-vs-cleaned-baseline ratio ~1.4× — still below any
-  reasonable fire threshold, but the quiet call becomes less quiet.
+- **p5203-fwd-with-cos (D-escalate, full-baseline quiet → cleaned-baseline FIRES):**
+  Unshaped-equivalent at 25 Gbps; under the primary full-baseline
+  classification `p_D1 = 0.629` (quiet). **Sensitivity (run1 dropped
+  from baseline pool, §4):** the cell flips to `p_D1 = 0.0246, stat_D1
+  = +0.00677` — a D1 fire. The primary verdict reports the conservative
+  full-baseline `k_D1 = 4` and treats this cell as quiet; the cleaned-
+  baseline `k_D1 = 5` framing (which would include this cell) is
+  documented in §4 as the sensitivity-only read. Either way: the H2
+  D1 verdict survives.
 - **p5203-rev-with-cos (D, D1 fires `stat_D1` ≈ 0.012, D2 stat-only):**
   Second "both-fire" cell in the Round-1 framing — but D2 rests on
   3 frames.
