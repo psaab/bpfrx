@@ -100,7 +100,7 @@ func TestApplyCoalescence_NonMlxSkipped(t *testing.T) {
 	f := &fakeRSSExecutor{
 		drivers: map[string]string{"eth0": "virtio_net"},
 	}
-	applyCoalescence(false, 8, 8, []string{"eth0"}, f)
+	applyCoalescence(false, 8, 8, []string{"eth0"}, f, nil)
 	if len(f.calls) != 0 {
 		t.Fatalf("non-mlx5 must not trigger ethtool, got %v", f.calls)
 	}
@@ -108,7 +108,7 @@ func TestApplyCoalescence_NonMlxSkipped(t *testing.T) {
 
 func TestApplyCoalescence_EmptyAllowlist_NoOp(t *testing.T) {
 	f := &fakeRSSExecutor{}
-	applyCoalescence(false, 8, 8, nil, f)
+	applyCoalescence(false, 8, 8, nil, f, nil)
 	if len(f.calls) != 0 {
 		t.Fatalf("empty allowlist must not call ethtool, got %v", f.calls)
 	}
@@ -122,7 +122,7 @@ func TestApplyCoalescence_ZeroUsecs_SubstitutesDefault(t *testing.T) {
 		ethtoolC: map[string][]byte{"mlx0": []byte(mlx5CoalesceProbeAdaptiveOn)},
 	}
 	// rx=0 tx=0 → should resolve to defaultCoalesceRX / defaultCoalesceTX (8).
-	applyCoalescence(false, 0, 0, []string{"mlx0"}, f)
+	applyCoalescence(false, 0, 0, []string{"mlx0"}, f, nil)
 
 	sawWrite := false
 	for _, c := range f.calls {
@@ -158,7 +158,7 @@ func TestApplyCoalescence_IdempotentAtTarget(t *testing.T) {
 		drivers:  map[string]string{"mlx0": "mlx5_core"},
 		ethtoolC: map[string][]byte{"mlx0": []byte(mlx5CoalesceProbeAdaptiveOff)},
 	}
-	applyCoalescence(false, 8, 8, []string{"mlx0"}, f)
+	applyCoalescence(false, 8, 8, []string{"mlx0"}, f, nil)
 	for _, c := range f.calls {
 		if len(c) >= 1 && c[0] == "-C" {
 			t.Fatalf("idempotent path must skip -C write, got %v", c)
@@ -173,7 +173,7 @@ func TestApplyCoalescence_AdaptiveOnProbe_ForcesWrite(t *testing.T) {
 		drivers:  map[string]string{"mlx0": "mlx5_core"},
 		ethtoolC: map[string][]byte{"mlx0": []byte(mlx5CoalesceProbeAdaptiveOn)},
 	}
-	applyCoalescence(false, 8, 8, []string{"mlx0"}, f)
+	applyCoalescence(false, 8, 8, []string{"mlx0"}, f, nil)
 
 	// Expect exactly one -C with adaptive-rx=off adaptive-tx=off.
 	sawOff := false
@@ -201,7 +201,7 @@ func TestApplyCoalescence_AdaptiveEnable_WritesOn(t *testing.T) {
 		drivers:  map[string]string{"mlx0": "mlx5_core"},
 		ethtoolC: map[string][]byte{"mlx0": []byte(mlx5CoalesceProbeAdaptiveOff)},
 	}
-	applyCoalescence(true, 8, 8, []string{"mlx0"}, f)
+	applyCoalescence(true, 8, 8, []string{"mlx0"}, f, nil)
 	sawOn := false
 	for _, c := range f.calls {
 		if len(c) >= 4 && c[0] == "-C" && c[1] == "mlx0" {
@@ -224,7 +224,7 @@ func TestApplyCoalescence_EthtoolMissing_SkipsGracefully(t *testing.T) {
 		drivers: map[string]string{"mlx0": "mlx5_core"},
 		// ethtoolX intentionally unset — runEthtool returns ErrNotFound.
 	}
-	applyCoalescence(false, 8, 8, []string{"mlx0"}, f)
+	applyCoalescence(false, 8, 8, []string{"mlx0"}, f, nil)
 	// Expect exactly one probe call (the -c) and no -C.
 	for _, c := range f.calls {
 		if len(c) >= 1 && c[0] == "-C" {
@@ -243,7 +243,7 @@ func TestApplyCoalescence_MixedAllowlist_OnlyMlxTouched(t *testing.T) {
 		},
 		ethtoolC: map[string][]byte{"mlx0": []byte(mlx5CoalesceProbeAdaptiveOn)},
 	}
-	applyCoalescence(false, 8, 8, []string{"virt0", "mlx0"}, f)
+	applyCoalescence(false, 8, 8, []string{"virt0", "mlx0"}, f, nil)
 	for _, c := range f.calls {
 		if len(c) < 2 {
 			t.Fatalf("malformed call %v", c)

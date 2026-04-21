@@ -452,6 +452,14 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 			if nodeVal(child) == "disable" {
 				cfg.RSSIndirectionDisabled = true
 			}
+		case "claim-host-tunables":
+			// #801 B1 opt-in gate. Defaults false. Only the literal
+			// string "true" turns it on; anything else (including
+			// "false", "enable", and empty) leaves the default-safe
+			// behaviour in which xpfd never touches host-scope knobs.
+			if nodeVal(child) == "true" {
+				cfg.ClaimHostTunables = true
+			}
 		case "cpu-governor":
 			// `performance` | `schedutil` | `default` (skip). Stored
 			// verbatim; daemon maps `default` / "" → no write. Any

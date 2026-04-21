@@ -464,6 +464,20 @@ type UserspaceConfig struct {
 	// default (enabled) and only disabled deploys carry the field.
 	RSSIndirectionDisabled bool `json:"rss_indirection_disabled,omitempty"`
 
+	// ClaimHostTunables is the #801 opt-in gate for host-scope knobs
+	// that are NOT interface-scoped (CPU governor + netdev_budget + the
+	// mlx5 adaptive-coalescence flip). D3's rss-indirection stays bound
+	// to a specific NIC so it is safe to apply by default; the Step-0
+	// knobs reach outside xpfd's interface allowlist and the operator
+	// must explicitly opt in via
+	// `set system dataplane claim-host-tunables true`. When false (the
+	// default), xpfd never writes to cpufreq scaling_governor,
+	// /proc/sys/net/core/netdev_budget, or mlx5 adaptive-rx/tx, even if
+	// the derived default values are non-zero. Per-iface rx-usecs/tx-usecs
+	// are still applied when coalescence is otherwise configured —
+	// those are bound to the same mlx5 interface as D3.
+	ClaimHostTunables bool `json:"claim_host_tunables,omitempty"`
+
 	// Phase B Step-0 tunables (#801). Each is a first-class knob with
 	// a documented default so operators can override without editing
 	// systemd units or sysctl.conf. Omission leaves the zero value and

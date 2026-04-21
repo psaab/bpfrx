@@ -47,7 +47,12 @@ import (
 //
 // Never returns an error — coalescence regressions must not break
 // interface bring-up.
-func applyCoalescence(adaptiveEnable bool, rxUsecs, txUsecs int, allowed []string, execer rssExecutor) {
+//
+// `capture` may be nil. When non-nil, the pre-xpfd adaptive + rx/tx-usecs
+// state of each mlx5 iface is stored on first apply so restore-on-disable
+// (B2) can revert to the operator's original values rather than the
+// kernel's compiled defaults.
+func applyCoalescence(adaptiveEnable bool, rxUsecs, txUsecs int, allowed []string, execer rssExecutor, capture *priorHostTunables) {
 	if len(allowed) == 0 {
 		slog.Debug("linksetup: coalescence skip (empty allowlist)")
 		return
@@ -68,7 +73,7 @@ func applyCoalescence(adaptiveEnable bool, rxUsecs, txUsecs int, allowed []strin
 				"iface", iface, "driver", drv)
 			continue
 		}
-		applyCoalescenceOne(iface, adaptiveEnable, rxUsecs, txUsecs, execer)
+		applyCoalescenceOne(iface, adaptiveEnable, rxUsecs, txUsecs, execer, capture)
 	}
 }
 
@@ -77,7 +82,7 @@ func applyCoalescence(adaptiveEnable bool, rxUsecs, txUsecs int, allowed []strin
 //
 // Separate function (instead of inline loop body) so the per-iface
 // flow can be unit-tested against a single fake executor entry.
-func applyCoalescenceOne(iface string, adaptiveEnable bool, rxUsecs, txUsecs int, execer rssExecutor) {
+func applyCoalescenceOne(iface string, adaptiveEnable bool, rxUsecs, txUsecs int, execer rssExecutor, capture *priorHostTunables) {
 	// Defense in depth: re-check driver at the per-iface level so a
 	// future caller can't accidentally invoke ethtool on a non-mlx5
 	// netdev (parallels rss_indirection's pattern).
@@ -99,6 +104,16 @@ func applyCoalescenceOne(iface string, adaptiveEnable bool, rxUsecs, txUsecs int
 	}
 
 	liveRX, liveTX, liveAdaptRX, liveAdaptTX, parsed := parseEthtoolCoalesce(probe)
+	if parsed {
+		// Capture pre-xpfd state on the first apply so restore-on-disable
+		// can revert to exactly what the operator had before xpfd wrote.
+		capture.captureMlx5Coalesce(iface, mlx5CoalesceState{
+			adaptiveRX: liveAdaptRX,
+			adaptiveTX: liveAdaptTX,
+			rxUsecs:    liveRX,
+			txUsecs:    liveTX,
+		})
+	}
 	if !parsed {
 		// Couldn't parse any of the fields we care about — still try
 		// the write, since the alternative is silent divergence from
@@ -112,6 +127,24 @@ func applyCoalescenceOne(iface string, adaptiveEnable bool, rxUsecs, txUsecs int
 			"iface", iface, "adaptive", adaptiveEnable,
 			"rx_usecs", rxUsecs, "tx_usecs", txUsecs)
 		return
+	}
+	// MIN1: drift detection — live values differ from desired and
+	// from what we captured on first apply.
+	if capture != nil && parsed {
+		if prior, ok := capture.mlx5Adaptive[iface]; ok {
+			driftRX := prior.rxUsecs != liveRX && liveRX != rxUsecs
+			driftTX := prior.txUsecs != liveTX && liveTX != txUsecs
+			driftAdapt := (prior.adaptiveRX != liveAdaptRX || prior.adaptiveTX != liveAdaptTX) &&
+				(liveAdaptRX != adaptiveEnable || liveAdaptTX != adaptiveEnable)
+			if driftRX || driftTX || driftAdapt {
+				slog.Warn("linksetup: coalescence drift detected; overwriting",
+					"iface", iface,
+					"captured_prior_rx_usecs", prior.rxUsecs,
+					"captured_prior_tx_usecs", prior.txUsecs,
+					"live_rx_usecs", liveRX, "live_tx_usecs", liveTX,
+					"writing_rx_usecs", rxUsecs, "writing_tx_usecs", txUsecs)
+			}
+		}
 	}
 
 	adapt := "off"

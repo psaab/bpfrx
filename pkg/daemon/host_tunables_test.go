@@ -113,7 +113,7 @@ func TestApplyCPUGovernor_EmptyString_Skip(t *testing.T) {
 	// untouched. This is the non-userspace-dp default path.
 	f := newFakeHostFS()
 	f.cpufreqPaths = []string{"/sys/cpu0/scaling_governor"}
-	applyCPUGovernor("", f)
+	applyCPUGovernor("", f, nil)
 	if len(f.writes) != 0 {
 		t.Fatalf("empty governor must not write, got %v", f.writes)
 	}
@@ -124,7 +124,7 @@ func TestApplyCPUGovernor_NoCpufreqSysfs_VMNoOp(t *testing.T) {
 	// cpufreq is not exposed by QEMU/KVM. Must not panic, must not
 	// error, must not write.
 	f := newFakeHostFS() // cpufreqPaths = nil
-	applyCPUGovernor("performance", f)
+	applyCPUGovernor("performance", f, nil)
 	if len(f.writes) != 0 {
 		t.Fatalf("VM no-op must not write, got %v", f.writes)
 	}
@@ -142,7 +142,7 @@ func TestApplyCPUGovernor_WritesOnceAcrossAllCPUs(t *testing.T) {
 	for _, p := range f.cpufreqPaths {
 		f.files[p] = []byte("schedutil\n")
 	}
-	applyCPUGovernor("performance", f)
+	applyCPUGovernor("performance", f, nil)
 	if len(f.writes) != 4 {
 		t.Fatalf("want 4 writes (one per cpu), got %d: %v", len(f.writes), f.writes)
 	}
@@ -161,7 +161,7 @@ func TestApplyCPUGovernor_IdempotentWhenAlreadySet(t *testing.T) {
 	}
 	f.files["/sys/cpu0/scaling_governor"] = []byte("performance\n")
 	f.files["/sys/cpu1/scaling_governor"] = []byte("performance")
-	applyCPUGovernor("performance", f)
+	applyCPUGovernor("performance", f, nil)
 	if len(f.writes) != 0 {
 		t.Fatalf("already-set must skip every write, got %v", f.writes)
 	}
@@ -178,7 +178,7 @@ func TestApplyCPUGovernor_PartialFailure_ContinuesOtherCPUs(t *testing.T) {
 	f.writeErrs["/sys/cpu0/scaling_governor"] = &fs.PathError{
 		Op: "write", Path: "/sys/cpu0/scaling_governor", Err: fs.ErrPermission,
 	}
-	applyCPUGovernor("performance", f)
+	applyCPUGovernor("performance", f, nil)
 	if _, ok := f.writes["/sys/cpu1/scaling_governor"]; !ok {
 		t.Fatal("cpu1 must be written even after cpu0 failed")
 	}
@@ -191,7 +191,7 @@ func TestApplyCPUGovernor_PartialFailure_ContinuesOtherCPUs(t *testing.T) {
 
 func TestApplyNetdevBudget_ZeroSentinel_Skip(t *testing.T) {
 	f := newFakeHostFS()
-	applyNetdevBudget(0, f)
+	applyNetdevBudget(0, f, nil)
 	if len(f.writes) != 0 {
 		t.Fatalf("value=0 must skip, got %v", f.writes)
 	}
@@ -202,7 +202,7 @@ func TestApplyNetdevBudget_Negative_Skip(t *testing.T) {
 	// kernel. (The kernel would reject it, but we log and skip instead
 	// of spamming warnings on every reconcile.)
 	f := newFakeHostFS()
-	applyNetdevBudget(-1, f)
+	applyNetdevBudget(-1, f, nil)
 	if len(f.writes) != 0 {
 		t.Fatalf("negative value must skip, got %v", f.writes)
 	}
@@ -211,7 +211,7 @@ func TestApplyNetdevBudget_Negative_Skip(t *testing.T) {
 func TestApplyNetdevBudget_Writes600(t *testing.T) {
 	f := newFakeHostFS()
 	f.files[sysctlPathNetdevBudget] = []byte("300\n")
-	applyNetdevBudget(600, f)
+	applyNetdevBudget(600, f, nil)
 	if f.writes[sysctlPathNetdevBudget] != "600" {
 		t.Fatalf("want 600 written, got %q", f.writes[sysctlPathNetdevBudget])
 	}
@@ -220,7 +220,7 @@ func TestApplyNetdevBudget_Writes600(t *testing.T) {
 func TestApplyNetdevBudget_IdempotentWhenAlreadySet(t *testing.T) {
 	f := newFakeHostFS()
 	f.files[sysctlPathNetdevBudget] = []byte("600\n")
-	applyNetdevBudget(600, f)
+	applyNetdevBudget(600, f, nil)
 	if len(f.writes) != 0 {
 		t.Fatalf("already-set must skip write, got %v", f.writes)
 	}
@@ -234,7 +234,7 @@ func TestApplyNetdevBudget_ReadOnlyProc_LogsAndContinues(t *testing.T) {
 	f.writeErrs[sysctlPathNetdevBudget] = &fs.PathError{
 		Op: "write", Path: sysctlPathNetdevBudget, Err: fs.ErrPermission,
 	}
-	applyNetdevBudget(600, f)
+	applyNetdevBudget(600, f, nil)
 	if _, ok := f.writes[sysctlPathNetdevBudget]; ok {
 		t.Fatal("write recorded despite scripted EACCES")
 	}
@@ -261,7 +261,7 @@ func TestApplyHostTunables_AppliesBoth(t *testing.T) {
 	f.cpufreqPaths = []string{"/sys/cpu0/scaling_governor"}
 	f.files["/sys/cpu0/scaling_governor"] = []byte("schedutil")
 	f.files[sysctlPathNetdevBudget] = []byte("300")
-	applyHostTunables("performance", 600, f)
+	applyHostTunables("performance", 600, f, nil)
 
 	wantOrder := []string{"/sys/cpu0/scaling_governor", sysctlPathNetdevBudget}
 	if !reflect.DeepEqual(f.writeOrder, wantOrder) {

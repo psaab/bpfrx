@@ -1376,9 +1376,10 @@ var setSchema = &schemaNode{children: map[string]*schemaNode{
 			"workers":        {args: 1, desc: "Worker thread count", children: nil},
 			"ring-entries":   {args: 1, desc: "AF_XDP ring entries per queue", children: nil},
 			"poll-mode":      {args: 1, desc: "Worker poll mode (busy-poll or interrupt)", children: nil},
-			"rss-indirection": {args: 1, desc: "mlx5 RSS indirection reshaping (enable|disable)", children: nil},
-			"cpu-governor":    {args: 1, desc: "Host cpufreq governor (performance|schedutil|default)", children: nil},
-			"netdev-budget":   {args: 1, desc: "net.core.netdev_budget value", children: nil},
+			"rss-indirection":     {args: 1, desc: "mlx5 RSS indirection reshaping (enable|disable)", children: nil},
+			"claim-host-tunables": {args: 1, desc: "Allow xpfd to write host-scope tunables (true|false, default false)", children: nil},
+			"cpu-governor":        {args: 1, desc: "Host cpufreq governor (performance|schedutil|default)", children: nil},
+			"netdev-budget":       {args: 1, desc: "net.core.netdev_budget value", children: nil},
 			"coalescence": {desc: "NIC interrupt-coalescence tuning (mlx5)", children: map[string]*schemaNode{
 				"adaptive": {args: 1, desc: "Adaptive coalescing (enable|disable)", children: nil},
 				"rx-usecs": {args: 1, desc: "RX coalescing µs", children: nil},
