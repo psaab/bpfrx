@@ -154,15 +154,23 @@ const _ASSERT_TX_SUBMIT_BUCKET_COUNT_IS_16: () = assert!(TX_SUBMIT_LAT_BUCKETS =
 /// #812: sentinel for unstamped sidecar slots. A completion seen
 /// against this value means the submit stamp was never written (e.g.
 /// a surviving offset across a restart, or a `monotonic_nanos() == 0`
-/// fallback from the VDSO-failure path in `neighbor.rs:8-10`). The
-/// reap path MUST skip the histogram increment for these so the tail
-/// of the distribution is not silently biased toward bucket 0 (plan
-/// §5.4). We pick `u64::MAX` because a legitimate monotonic timestamp
-/// cannot reach it — at nanosecond granularity it is ~585 years of
-/// uptime, well past any deployment lifetime. Crucially we also
-/// canonicalize `monotonic_nanos() == 0` into this sentinel (plan
-/// §6.1 test #5) so a VDSO-blocked kernel does not end up looking
-/// like a legitimate zero-time stamp.
+/// clock-gettime failure where `stamp_submits` early-returned without
+/// touching the slot — `tx.rs::stamp_submits`). The reap path MUST
+/// skip the histogram increment for these so the tail of the
+/// distribution is not silently biased toward bucket 0 (plan §5.4).
+///
+/// We pick `u64::MAX` because a legitimate monotonic timestamp cannot
+/// reach it — at nanosecond granularity it is ~585 years of uptime,
+/// well past any deployment lifetime. This removes any value
+/// collision between "just happened, small stamp" and "unstamped".
+///
+/// Codex round-1 MED + Rust round-1 MED-2: the previous
+/// `canonical_submit_stamp(ts == 0) → sentinel` mapping in `tx.rs`
+/// was in-band signalling on a u64 and has been removed. Clock-
+/// failure is now a no-op at stamp time; the slot's pre-existing
+/// `UNSTAMPED` state (set by `record_tx_completions_with_stamp` on
+/// the previous reap, or by worker construction) is what causes the
+/// reap to skip the sample.
 pub(super) const TX_SIDECAR_UNSTAMPED: u64 = u64::MAX;
 
 /// #709: branchless power-of-two bucket select for nanosecond deltas.
@@ -1011,18 +1019,22 @@ mod tests {
     fn tx_latency_hist_sentinel_skip_for_unstamped_completion() {
         // #812 plan §6.1 test #5 + §5.4. A completion against a
         // sidecar slot that is still at TX_SIDECAR_UNSTAMPED (e.g.
-        // a cross-restart leftover, or a VDSO-failure stamp that
-        // was canonicalised to the sentinel) MUST NOT bump any
-        // bucket. Also pin the `monotonic_nanos() == 0` → sentinel
-        // canonicalisation (Codex MED #5) so a zero-time stamp is
-        // indistinguishable from "never stamped" at reap time.
+        // a cross-restart leftover, or a `monotonic_nanos() == 0`
+        // clock-gettime failure that caused `stamp_submits` to
+        // early-return without touching the slot) MUST NOT bump any
+        // bucket. Pins the Codex round-1 MED + Rust round-1 MED-2
+        // fix: `stamp_submits(..., ts=0)` no longer writes the
+        // sentinel — it returns without touching the sidecar, so the
+        // slot retains its pre-existing "unstamped" state.
         let live = BindingLiveState::new();
         let owner = &live.owner_profile_owner;
         let mut sidecar = vec![TX_SIDECAR_UNSTAMPED; 2];
-        // Offset 0: never stamped at all. Offset 1: stamped with
-        // canonicalised 0 (VDSO-failure simulation).
+        // Offset 0: never stamped at all. Offset 1: attempted stamp
+        // with ts=0 (VDSO-failure simulation) — the new semantics
+        // skip the write entirely, leaving the slot at UNSTAMPED.
         crate::afxdp::tx::stamp_submits(&mut sidecar, [1u64 << UMEM_FRAME_SHIFT].into_iter(), 0);
-        // After canonicalisation both slots should be at the sentinel.
+        // Both slots are UNSTAMPED: slot 0 was never touched, slot 1
+        // was early-returned on the ts=0 gate (NOT sentinel-written).
         assert_eq!(sidecar[0], TX_SIDECAR_UNSTAMPED);
         assert_eq!(sidecar[1], TX_SIDECAR_UNSTAMPED);
         let completed = [0u64, 1u64 << UMEM_FRAME_SHIFT];

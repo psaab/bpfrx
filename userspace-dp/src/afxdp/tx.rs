@@ -1,15 +1,17 @@
 use super::*;
 
-/// #812: canonicalise a monotonic-clock reading into the sidecar
-/// value space. `monotonic_nanos()` returns 0 on clock-gettime
-/// failure (see `neighbor.rs:8-10`, the VDSO-blocked fallback path
-/// documented in plan §3.4a); canonicalising `0 → TX_SIDECAR_UNSTAMPED`
-/// keeps a true zero-time stamp from being confused with a
-/// legitimate measurement at reap time (plan §6.1 test #5).
-#[inline]
-fn canonical_submit_stamp(ts: u64) -> u64 {
-    if ts == 0 { TX_SIDECAR_UNSTAMPED } else { ts }
-}
+/// #812 Codex round-1 MED + Rust round-1 MED-2: replaced the former
+/// `canonical_submit_stamp` in-band mapping of `ts == 0 → sentinel`
+/// with an early-return in `stamp_submits`. The sentinel is
+/// `u64::MAX` (see `umem.rs::TX_SIDECAR_UNSTAMPED`); a legitimate
+/// monotonic timestamp cannot reach it (~585 years at ns granularity).
+/// Previously, the Rust reviewer flagged the `ts == 0` branch as
+/// in-band signalling on a u64. We now skip all sidecar writes on
+/// clock failure rather than overwriting fresh data with the sentinel
+/// — safe because `record_tx_completions_with_stamp` resets each
+/// slot to `TX_SIDECAR_UNSTAMPED` on reap, so a frame whose sidecar
+/// did NOT receive a stamp in the current cycle is already in the
+/// correct "skip at reap time" state.
 
 /// #812: stamp the submit-timestamp sidecar for the accepted prefix
 /// of the current TX batch. Called ONCE per `writer.commit()` at each
@@ -35,24 +37,54 @@ pub(super) fn stamp_submits<I>(sidecar: &mut [u64], offsets: I, ts_submit: u64)
 where
     I: Iterator<Item = u64>,
 {
-    // Canonicalise once per commit so every stamp in the batch shares
-    // a single fresh VDSO read — cheapest stamp cost (plan §3.4
-    // typical ~1.1 ns/packet at `inserted = 256`, ~16 ns/packet at
-    // `inserted = 1`).
-    let stamp = canonical_submit_stamp(ts_submit);
+    // #812 Codex round-1 MED + Rust round-1 MED-2: clock-failure gate.
+    // `monotonic_nanos()` returns 0 on `clock_gettime` failure
+    // (`neighbor.rs:8-10`). On failure we do NOT overwrite sidecar
+    // slots with a sentinel — we return without touching any slot.
+    // `record_tx_completions_with_stamp` resets each slot to
+    // `TX_SIDECAR_UNSTAMPED` on reap, so a slot that skipped its
+    // stamp this cycle already reads as "unstamped" at reap time and
+    // the sample is correctly dropped. This removes the previous
+    // in-band mapping of `ts == 0 → TX_SIDECAR_UNSTAMPED`.
+    //
+    // The sentinel itself stays at `u64::MAX` — a legitimate
+    // monotonic timestamp cannot reach it (~585 years uptime at ns
+    // granularity), so there is no value collision between a
+    // genuine-but-small stamp and "unstamped".
+    if ts_submit == 0 {
+        return;
+    }
     for offset in offsets {
         let idx = (offset >> UMEM_FRAME_SHIFT) as usize;
+        // #812 Rust round-1 HIGH-1: debug-assert the offset lands
+        // inside this binding's sidecar. Under `shared_umem = true`
+        // (mlx5 special case), a cross-binding redirect could in
+        // principle produce an offset whose frame index exceeds
+        // `sidecar.len()` — we drop those silently at runtime
+        // (sound: they belong to a different binding and the owner
+        // of that binding is responsible for its own sidecar). The
+        // debug_assert turns that silent drop into a loud test-build
+        // failure so a future regression that routes foreign
+        // offsets through this writer is caught before it ships.
+        debug_assert!(
+            idx < sidecar.len(),
+            "tx_submit_ns sidecar out-of-range: offset={offset} \
+             idx={idx} sidecar_len={} — cross-binding redirect? \
+             (plan §3.3 single-writer invariant)",
+            sidecar.len(),
+        );
         if let Some(slot) = sidecar.get_mut(idx) {
-            *slot = stamp;
+            *slot = ts_submit;
         }
-        // Out-of-range offsets are silently dropped — the sidecar is
-        // sized to the binding's total frame count at construction,
-        // so an out-of-range index means either a frame from another
-        // UMEM (cross-binding redirect producing a stale offset —
-        // should never reach the TX writer for this binding) or a
-        // builder bug upstream. Either way, skipping the stamp keeps
-        // the hot path allocation-free and the histogram honest: the
-        // reap-time sentinel check drops the sample.
+        // Out-of-range offsets are silently dropped in release
+        // builds — the sidecar is sized to the binding's total
+        // frame count at construction, so an out-of-range index
+        // means either a frame from another UMEM (cross-binding
+        // redirect producing a stale offset — should never reach
+        // the TX writer for this binding) or a builder bug upstream.
+        // Either way, skipping the stamp keeps the hot path
+        // allocation-free and the histogram honest: the reap-time
+        // sentinel check drops the sample.
     }
 }
 

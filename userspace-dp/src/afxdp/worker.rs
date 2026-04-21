@@ -49,8 +49,11 @@ pub(crate) struct BindingWorker {
     /// reap path (`reap_tx_completions`) skips the histogram
     /// increment for these to avoid biasing the tail toward bucket 0
     /// (plan §5.4). A `monotonic_nanos() == 0` return (VDSO failure,
-    /// plan §3.4a / §6.1 test #5) is canonicalised to the sentinel
-    /// at stamp time for the same reason.
+    /// plan §3.4a / §6.1 test #5) causes `stamp_submits` to early-
+    /// return without writing the slot (Codex round-1 MED + Rust
+    /// round-1 MED-2) — the slot's pre-existing UNSTAMPED state
+    /// (from the previous reap or from worker construction) is what
+    /// the reap checks.
     pub(crate) tx_submit_ns: Vec<u64>,
     /// Packets waiting for neighbor resolution. The UMEM frame is held
     /// (not recycled) until the neighbor resolves or the entry times out.
