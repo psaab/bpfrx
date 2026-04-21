@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-04-19
+
+- **Timestamp**: 2026-04-19
+  - **Action**: Issue #800 — Investigated `--workers` vs RSS queue count alignment on loss-userspace cluster. Measured three configs (master 4w/6q, A: 6w/6q, B: 4w/4q) across p5201-fwd/rev (P=16 t=20) and p5203-fwd (P=12 t=10). B regresses both throughput (-0.9 to -1.2 Gbps) and CoV (7-8%) — out. A's first run looked like a clear win but did not reproduce on retest; pooled A-vs-master delta is within 0.1 Gbps noise floor. Neither config clears the plan's +2 Gbps threshold; per plan rules, closing #800 with no PR. Secondary finding: D3 does not restore default RSS indirection when workers is bumped to equal queue count — left weighted to queues 0..3. Proposed as separate issue; out of scope for #800.
+  - **File(s)**: docs/800-workers-queues-investigation.md
+
 ## 2026-04-17
 
 - **Timestamp**: 2026-04-17
