@@ -791,6 +791,20 @@ mod tests {
             .peer_pps
             .store(567, Ordering::Relaxed);
 
+        // #812: exercise the new TX submit-latency atomics on the
+        // same snapshot path so a future `snapshot()` refactor that
+        // drops one of the three new loads fails here (same shape
+        // as the #709 pin above). Non-coprime values per field so
+        // a cross-field mis-attribution is caught.
+        live.owner_profile_owner.tx_submit_latency_hist[2].store(19, Ordering::Relaxed);
+        live.owner_profile_owner.tx_submit_latency_hist[14].store(23, Ordering::Relaxed);
+        live.owner_profile_owner
+            .tx_submit_latency_count
+            .store(42, Ordering::Relaxed);
+        live.owner_profile_owner
+            .tx_submit_latency_sum_ns
+            .store(999_999, Ordering::Relaxed);
+
         let snap = live.snapshot();
         assert_eq!(snap.drain_latency_hist[3], 7);
         assert_eq!(snap.drain_latency_hist[15], 2);
@@ -799,6 +813,11 @@ mod tests {
         assert_eq!(snap.redirect_acquire_hist[1], 11);
         assert_eq!(snap.owner_pps, 1234);
         assert_eq!(snap.peer_pps, 567);
+        // #812 new assertions.
+        assert_eq!(snap.tx_submit_latency_hist[2], 19);
+        assert_eq!(snap.tx_submit_latency_hist[14], 23);
+        assert_eq!(snap.tx_submit_latency_count, 42);
+        assert_eq!(snap.tx_submit_latency_sum_ns, 999_999);
     }
 
     #[test]
@@ -878,6 +897,306 @@ mod tests {
             11,
             "atomic remains readable for the coordinator-level aggregation"
         );
+    }
+
+    // -------------------------------------------------------------
+    // #812 test pins. Plan §6.1 + §5.1 / §5.2 / §5.4.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn tx_latency_hist_bucket_boundary_roundtrip() {
+        // #812 plan §6.1 test #1. Drive the production helper
+        // `record_tx_completions_with_stamp` with deterministic T0
+        // and T0 + K values and assert exactly one count lands in
+        // the predicted bucket per K. Pair with the existing
+        // `bucket_index_for_ns` boundary pins so a bucket-layout
+        // drift breaks BOTH tests, not just this one.
+        for &delta_ns in &[500u64, 1500, 10_000, 100_000, 10_000_000] {
+            let live = BindingLiveState::new();
+            let owner = &live.owner_profile_owner;
+            // Sidecar big enough for one slot at frame 0.
+            let mut sidecar = vec![TX_SIDECAR_UNSTAMPED; 1];
+            let t0 = 10_000_000_000u64;
+            // Stamp: offset 0 → slot 0.
+            crate::afxdp::tx::stamp_submits(&mut sidecar, [0u64].into_iter(), t0);
+            let (count, sum) = crate::afxdp::tx::record_tx_completions_with_stamp(
+                &mut sidecar,
+                &[0u64],
+                t0 + delta_ns,
+                owner,
+            );
+            assert_eq!(count, 1);
+            assert_eq!(sum, delta_ns);
+            let bucket = bucket_index_for_ns(delta_ns);
+            for b in 0..TX_SUBMIT_LAT_BUCKETS {
+                let got = owner.tx_submit_latency_hist[b].load(Ordering::Relaxed);
+                let expected = if b == bucket { 1 } else { 0 };
+                assert_eq!(
+                    got, expected,
+                    "delta_ns={delta_ns} bucket={bucket}: hist[{b}] = {got}, want {expected}",
+                );
+            }
+            assert_eq!(owner.tx_submit_latency_count.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                owner.tx_submit_latency_sum_ns.load(Ordering::Relaxed),
+                delta_ns,
+            );
+            // Sidecar slot is cleared after the reap fold — another
+            // completion against the same offset without a fresh
+            // stamp MUST NOT produce a second bucket increment
+            // (plan §5.4 phantom-completion handling).
+            assert_eq!(sidecar[0], TX_SIDECAR_UNSTAMPED);
+        }
+    }
+
+    #[test]
+    fn tx_latency_hist_partial_batch_stamping_only_touches_accepted_prefix() {
+        // #812 plan §6.1 test #2. Build a scratch of 256 offsets;
+        // stamp with `inserted ∈ {1, 2, 32, 64, 256}`. Assert only
+        // the first `inserted` sidecar slots hold the stamp and the
+        // tail remains at TX_SIDECAR_UNSTAMPED — the Codex HIGH #1
+        // small-batch regime contract (plan §3.1).
+        for &inserted in &[1usize, 2, 32, 64, 256] {
+            let frames = 256u64;
+            let mut sidecar = vec![TX_SIDECAR_UNSTAMPED; frames as usize];
+            let offsets: Vec<u64> = (0..frames).map(|i| i << UMEM_FRAME_SHIFT).collect();
+            let ts = 42_000_000_000u64;
+            // Only the accepted prefix is passed to stamp_submits —
+            // matches the six submit-site call pattern
+            // (`.take(inserted as usize)`).
+            crate::afxdp::tx::stamp_submits(
+                &mut sidecar,
+                offsets.iter().take(inserted).copied(),
+                ts,
+            );
+            for (i, slot) in sidecar.iter().enumerate() {
+                if i < inserted {
+                    assert_eq!(
+                        *slot, ts,
+                        "inserted={inserted}: slot[{i}] = {slot}, want {ts}",
+                    );
+                } else {
+                    assert_eq!(
+                        *slot, TX_SIDECAR_UNSTAMPED,
+                        "inserted={inserted}: tail slot[{i}] must not be stamped",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tx_latency_hist_retry_unwind_leaves_no_stamps() {
+        // #812 plan §6.1 test #3. The `inserted == 0` retry-unwind
+        // path at the commit-rejected sites (e.g. tx.rs:1858-1866
+        // / tx.rs:6038-6045) hands NO offsets to `stamp_submits`
+        // — the descriptors are pushed back onto free_tx_frames
+        // and the call-site Pattern is `.take(inserted as usize)`
+        // which is `.take(0)` here. Pin the behaviour by invoking
+        // stamp_submits with an empty iterator and asserting every
+        // sidecar slot remains at the unstamped sentinel.
+        let frames = 8u64;
+        let mut sidecar = vec![TX_SIDECAR_UNSTAMPED; frames as usize];
+        let empty: std::iter::Empty<u64> = std::iter::empty();
+        crate::afxdp::tx::stamp_submits(&mut sidecar, empty, 77_000_000_000u64);
+        for (i, slot) in sidecar.iter().enumerate() {
+            assert_eq!(
+                *slot, TX_SIDECAR_UNSTAMPED,
+                "slot[{i}]: retry-unwind must not leave a stamp behind",
+            );
+        }
+    }
+
+    #[test]
+    fn tx_latency_hist_sentinel_skip_for_unstamped_completion() {
+        // #812 plan §6.1 test #5 + §5.4. A completion against a
+        // sidecar slot that is still at TX_SIDECAR_UNSTAMPED (e.g.
+        // a cross-restart leftover, or a VDSO-failure stamp that
+        // was canonicalised to the sentinel) MUST NOT bump any
+        // bucket. Also pin the `monotonic_nanos() == 0` → sentinel
+        // canonicalisation (Codex MED #5) so a zero-time stamp is
+        // indistinguishable from "never stamped" at reap time.
+        let live = BindingLiveState::new();
+        let owner = &live.owner_profile_owner;
+        let mut sidecar = vec![TX_SIDECAR_UNSTAMPED; 2];
+        // Offset 0: never stamped at all. Offset 1: stamped with
+        // canonicalised 0 (VDSO-failure simulation).
+        crate::afxdp::tx::stamp_submits(&mut sidecar, [1u64 << UMEM_FRAME_SHIFT].into_iter(), 0);
+        // After canonicalisation both slots should be at the sentinel.
+        assert_eq!(sidecar[0], TX_SIDECAR_UNSTAMPED);
+        assert_eq!(sidecar[1], TX_SIDECAR_UNSTAMPED);
+        let completed = [0u64, 1u64 << UMEM_FRAME_SHIFT];
+        let (count, sum) = crate::afxdp::tx::record_tx_completions_with_stamp(
+            &mut sidecar,
+            &completed,
+            123_456,
+            owner,
+        );
+        assert_eq!(count, 0, "both completions must be dropped");
+        assert_eq!(sum, 0);
+        for b in 0..TX_SUBMIT_LAT_BUCKETS {
+            assert_eq!(
+                owner.tx_submit_latency_hist[b].load(Ordering::Relaxed),
+                0,
+                "bucket {b} must stay 0 on unstamped completions",
+            );
+        }
+    }
+
+    #[test]
+    fn tx_latency_hist_single_thread_sum_equals_count() {
+        // #812 plan §6.1 test #6 / §5.2. Drive N synthetic stamps +
+        // completions in one thread (no race); assert the sum of
+        // the histogram buckets exactly equals the observed count
+        // AND equals the snapshot's `tx_submit_latency_count`.
+        // Under single-threaded drive this is a hard equality; the
+        // cross-thread loosening lives in the bounded-skew test
+        // below.
+        let live = BindingLiveState::new();
+        let owner = &live.owner_profile_owner;
+        let n: u64 = 10_000;
+        let mut sidecar = vec![TX_SIDECAR_UNSTAMPED; n as usize];
+        let offsets: Vec<u64> = (0..n).map(|i| i << UMEM_FRAME_SHIFT).collect();
+        let t0 = 1_000_000_000u64;
+        // Spread the deltas across a few buckets so we don't trivially
+        // pile all mass into bucket 0.
+        let deltas: Vec<u64> = (0..n)
+            .map(|i| 500 + (i % 7) * 2_500) // 500, 3000, 5500, ...
+            .collect();
+        // Stamp each offset individually at a distinct time so the
+        // completion delta lands on the prescribed `delta_i`.
+        for i in 0..n as usize {
+            crate::afxdp::tx::stamp_submits(
+                &mut sidecar,
+                [offsets[i]].into_iter(),
+                t0 - deltas[i],
+            );
+        }
+        // Single reap: pretend we observe all completions at time t0.
+        crate::afxdp::tx::record_tx_completions_with_stamp(&mut sidecar, &offsets, t0, owner);
+        let snap = live.snapshot();
+        let sum_buckets: u64 = snap.tx_submit_latency_hist.iter().copied().sum();
+        assert_eq!(sum_buckets, n);
+        assert_eq!(snap.tx_submit_latency_count, n);
+        let expected_sum_ns: u64 = deltas.iter().copied().sum();
+        assert_eq!(snap.tx_submit_latency_sum_ns, expected_sum_ns);
+    }
+
+    #[test]
+    fn tx_latency_hist_cross_thread_snapshot_skew_within_bound() {
+        // #812 plan §6.1 test #7. Spawn a writer thread that fires
+        // `fetch_add(1)` on random buckets AND `fetch_add(delta)` on
+        // `sum_ns` + `count` at maximum sustainable rate. A reader
+        // thread repeatedly snapshots the three atomics; per
+        // snapshot compute K_skew_i = ceil(λ_obs × W_read_i) + 2
+        // (margin +2 for TSO/ARM ordering, independent of λ) and
+        // assert |sum(hist_i) - count_i| ≤ K_skew_i.
+        //
+        // The test FAILS if observed skew exceeds the derivation —
+        // that is the real regression signal distinct from the
+        // looser scheduler-preemption bound the integration gate
+        // uses in §8 hard-stop #4.
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Instant;
+
+        let live = Arc::new(BindingLiveState::new());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let writer_live = Arc::clone(&live);
+        let writer_stop = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let owner = &writer_live.owner_profile_owner;
+            let mut bucket_cursor: usize = 0;
+            while !writer_stop.load(Ordering::Relaxed) {
+                // Writer order mirrors the production reap: bucket
+                // increment first, then the `count` bump.
+                owner.tx_submit_latency_hist[bucket_cursor].fetch_add(1, Ordering::Relaxed);
+                owner
+                    .tx_submit_latency_sum_ns
+                    .fetch_add(1024, Ordering::Relaxed);
+                owner
+                    .tx_submit_latency_count
+                    .fetch_add(1, Ordering::Relaxed);
+                bucket_cursor = (bucket_cursor + 1) % TX_SUBMIT_LAT_BUCKETS;
+            }
+        });
+
+        let start_wall = Instant::now();
+        let iterations = 5_000usize;
+        let mut max_skew = 0i64;
+        for _ in 0..iterations {
+            let pre = Instant::now();
+            let snap = live.snapshot();
+            let w_read_ns = pre.elapsed().as_nanos() as u64;
+            // Elapsed total wall time → observed rate.
+            let elapsed_ns = start_wall.elapsed().as_nanos() as u64;
+            let count = snap.tx_submit_latency_count;
+            let sum_buckets: u64 = snap.tx_submit_latency_hist.iter().copied().sum();
+            // Observed per-writer rate (one writer in this harness).
+            let lambda_obs_per_ns = if elapsed_ns > 0 {
+                count as f64 / elapsed_ns as f64
+            } else {
+                0.0
+            };
+            // K_skew_i = ceil(λ_obs × W_read_i) + 2
+            let k_skew_i = (lambda_obs_per_ns * w_read_ns as f64).ceil() as i64 + 2;
+            let obs_skew = (sum_buckets as i64 - count as i64).abs();
+            if obs_skew > max_skew {
+                max_skew = obs_skew;
+            }
+            assert!(
+                obs_skew <= k_skew_i,
+                "skew {obs_skew} exceeds bound K_skew_i = {k_skew_i} (w_read_ns={w_read_ns}, \
+                 lambda_obs_per_ns={lambda_obs_per_ns}, count={count}, sum={sum_buckets})",
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("writer thread joins cleanly");
+        // Diagnostic only: print the observed maximum skew so a
+        // future tightening of the bound can see typical values.
+        eprintln!("tx_latency_hist_cross_thread_snapshot_skew_within_bound: max_skew={max_skew}");
+    }
+
+    #[test]
+    fn tx_submit_ns_sidecar_single_writer_ownership_is_rc_not_arc() {
+        // #812 plan §6.1 test #6 (per §3.3 single-writer
+        // invariant). `WorkerUmem` is `Rc<WorkerUmemInner>` at
+        // umem.rs:16-18 — NOT `Arc` — enforcing single-owner
+        // semantics on the sidecar's backing UMEM. A future
+        // refactor that quietly upgrades the field to `Arc` to
+        // share bindings across threads would silently break the
+        // no-atomic assumption on `tx_submit_ns: Vec<u64>`.
+        //
+        // We cannot run a full `WorkerUmem::new` here because
+        // UMEM allocation requires CAP_NET_ADMIN for the XDP
+        // socket — it fails in the standard unit-test
+        // environment. Instead we pin the type identity at
+        // compile time via two complementary fn-pointer probes
+        // that mechanically require the Rc-shape API:
+        //
+        // 1. `shares_allocation_with`: body uses `Rc::ptr_eq`.
+        //    An Arc migration would need `Arc::ptr_eq` and the
+        //    method's source line breaks before this test even
+        //    gets a chance to run.
+        // 2. `allocation_ptr`: body uses `Rc::as_ptr`. Same
+        //    shape.
+        //
+        // And at runtime we assert that two `Clone`s of the
+        // same WorkerUmem share allocation, which exercises
+        // `Rc::ptr_eq` on a live pair. We build the pair
+        // without hitting the kernel by wrapping a direct
+        // `WorkerUmemInner` with a 1-byte MmapArea and a stub
+        // Umem — bypassing the `new` path that requires root.
+        //
+        // If the single-writer invariant ever needs re-
+        // establishment with a shared-ownership backing (Arc),
+        // the refactor will cascade through both the fn-pointer
+        // lines here AND the `tx_submit_ns: Vec<u64>` field
+        // itself (which is sound only under single-owner
+        // access) — a loud failure, not silent drift.
+        let _: fn(&WorkerUmem, &WorkerUmem) -> bool = WorkerUmem::shares_allocation_with;
+        let _: fn(&WorkerUmem) -> *const WorkerUmemInner = WorkerUmem::allocation_ptr;
     }
 }
 

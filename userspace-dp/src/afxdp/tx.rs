@@ -49,6 +49,62 @@ where
     }
 }
 
+/// #812 test hook / decomposition aid: the pure per-offset fold from
+/// `reap_tx_completions`. Takes the sidecar slice, the list of
+/// completed offsets, and an injected `ts_completion` (so tests can
+/// drive deterministic deltas), plus the owner-profile atomic set.
+/// Same shape the live reap path runs — batched aggregation into
+/// local counters followed by at most N_buckets `fetch_add`s — so
+/// unit pins here exercise the production algorithm, not a test-only
+/// fake.
+///
+/// Returns `(count, sum_ns)` for callers that want to assert on the
+/// per-batch delta directly (rather than reading back the atomics
+/// afterward).
+#[inline]
+pub(super) fn record_tx_completions_with_stamp(
+    sidecar: &mut [u64],
+    completed_offsets: &[u64],
+    ts_completion: u64,
+    owner: &OwnerProfileOwnerWrites,
+) -> (u64, u64) {
+    let mut hist_fire_count = 0u64;
+    let mut hist_fire_sum_ns = 0u64;
+    let mut hist_fire_per_bucket = [0u64; TX_SUBMIT_LAT_BUCKETS];
+    for &offset in completed_offsets {
+        let slot_idx = (offset >> UMEM_FRAME_SHIFT) as usize;
+        let ts_submit = match sidecar.get_mut(slot_idx) {
+            Some(slot) => {
+                let v = *slot;
+                *slot = TX_SIDECAR_UNSTAMPED;
+                v
+            }
+            None => TX_SIDECAR_UNSTAMPED,
+        };
+        if ts_submit != TX_SIDECAR_UNSTAMPED && ts_completion >= ts_submit {
+            let delta_ns = ts_completion - ts_submit;
+            let bucket = bucket_index_for_ns(delta_ns);
+            hist_fire_per_bucket[bucket] = hist_fire_per_bucket[bucket].saturating_add(1);
+            hist_fire_count = hist_fire_count.saturating_add(1);
+            hist_fire_sum_ns = hist_fire_sum_ns.saturating_add(delta_ns);
+        }
+    }
+    for (b, add) in hist_fire_per_bucket.iter().enumerate() {
+        if *add != 0 {
+            owner.tx_submit_latency_hist[b].fetch_add(*add, Ordering::Relaxed);
+        }
+    }
+    if hist_fire_count != 0 {
+        owner
+            .tx_submit_latency_count
+            .fetch_add(hist_fire_count, Ordering::Relaxed);
+        owner
+            .tx_submit_latency_sum_ns
+            .fetch_add(hist_fire_sum_ns, Ordering::Relaxed);
+    }
+    (hist_fire_count, hist_fire_sum_ns)
+}
+
 pub(super) fn reap_tx_completions(
     binding: &mut BindingWorker,
     shared_recycles: &mut Vec<(u32, u64)>,
@@ -76,57 +132,19 @@ pub(super) fn reap_tx_completions(
     // `reaped == 1` partial-batch worst case — same shape as the
     // submit-stamp cost analysis in plan §3.4).
     let ts_completion = monotonic_nanos();
-    let mut hist_fire_count = 0u64;
-    let mut hist_fire_sum_ns = 0u64;
-    let mut hist_fire_per_bucket = [0u64; TX_SUBMIT_LAT_BUCKETS];
+    // #812: delegate the per-offset fold to the shared helper so
+    // tests exercising `record_tx_completions_with_stamp` cover the
+    // exact production algorithm — NOT a test-only fake. See unit
+    // pins under `#[cfg(test)]` below.
+    record_tx_completions_with_stamp(
+        &mut binding.tx_submit_ns,
+        &binding.scratch_completed_offsets,
+        ts_completion,
+        &binding.live.owner_profile_owner,
+    );
     for i in 0..binding.scratch_completed_offsets.len() {
         let offset = binding.scratch_completed_offsets[i];
-        // #812: look up the submit stamp and reset the sidecar slot
-        // to the unstamped sentinel BEFORE the delta computation.
-        // Resetting under the owner-thread lookup is safe (single
-        // writer); reap and submit for the same offset do not race
-        // across threads (plan §3.3 single-writer invariant).
-        let slot_idx = (offset >> UMEM_FRAME_SHIFT) as usize;
-        let ts_submit = match binding.tx_submit_ns.get_mut(slot_idx) {
-            Some(slot) => {
-                let v = *slot;
-                *slot = TX_SIDECAR_UNSTAMPED;
-                v
-            }
-            None => TX_SIDECAR_UNSTAMPED,
-        };
-        // Skip unstamped completions (plan §5.4): pre-#812 leftovers
-        // across a restart, canonicalised VDSO-failure stamps, or
-        // frames whose stamp was dropped because the sidecar index
-        // was out-of-range. Bucketing these would silently bias the
-        // tail toward bucket 0.
-        if ts_submit != TX_SIDECAR_UNSTAMPED && ts_completion >= ts_submit {
-            let delta_ns = ts_completion - ts_submit;
-            let bucket = bucket_index_for_ns(delta_ns);
-            hist_fire_per_bucket[bucket] = hist_fire_per_bucket[bucket].saturating_add(1);
-            hist_fire_count = hist_fire_count.saturating_add(1);
-            hist_fire_sum_ns = hist_fire_sum_ns.saturating_add(delta_ns);
-        }
         recycle_completed_tx_offset(binding, shared_recycles, offset);
-    }
-    // Single aggregated RMW per bucket per reap batch (plan §3.4
-    // cache-line cost analysis) — amortises the 3-5 ns fetch_add
-    // over the whole batch. On a healthy run steady state
-    // concentrates mass in buckets 1-4, so at most 4 of the 16
-    // `fetch_add` calls below are non-zero.
-    let owner = &binding.live.owner_profile_owner;
-    for (b, add) in hist_fire_per_bucket.iter().enumerate() {
-        if *add != 0 {
-            owner.tx_submit_latency_hist[b].fetch_add(*add, Ordering::Relaxed);
-        }
-    }
-    if hist_fire_count != 0 {
-        owner
-            .tx_submit_latency_count
-            .fetch_add(hist_fire_count, Ordering::Relaxed);
-        owner
-            .tx_submit_latency_sum_ns
-            .fetch_add(hist_fire_sum_ns, Ordering::Relaxed);
     }
     binding.outstanding_tx = binding.outstanding_tx.saturating_sub(reaped);
     binding.dbg_completions_reaped += reaped as u64;

@@ -1891,4 +1891,86 @@ mod tests {
         assert_eq!(snap.dbg_tx_ring_full, 4);
         assert_eq!(snap.rx_fill_ring_empty_descs, 7);
     }
+
+    #[test]
+    fn tx_latency_hist_serialization_roundtrip() {
+        // #812 plan §6.1 test #4. Construct a BindingCountersSnapshot
+        // with a non-trivial TX submit-latency histogram; JSON-encode,
+        // JSON-decode; assert field-equality — including the Vec<u64>
+        // contents (no length truncation, no reorder).
+        let snap = BindingCountersSnapshot {
+            worker_id: 2,
+            ifindex: 11,
+            queue_id: 5,
+            dbg_tx_ring_full: 0,
+            dbg_sendto_enobufs: 0,
+            dbg_bound_pending_overflow: 0,
+            dbg_cos_queue_overflow: 0,
+            rx_fill_ring_empty_descs: 0,
+            outstanding_tx: 0,
+            tx_errors: 0,
+            tx_submit_error_drops: 0,
+            pending_tx_local_overflow_drops: 0,
+            // Hand-built plausible histogram — bucket 0 heavy,
+            // tail in buckets 6-7, saturation bucket 15 empty.
+            tx_submit_latency_hist: vec![9001, 123, 45, 30, 12, 4, 8, 2, 0, 0, 0, 0, 0, 0, 0, 0],
+            tx_submit_latency_count: 9225,
+            tx_submit_latency_sum_ns: 12_345_678,
+        };
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        let back: BindingCountersSnapshot =
+            serde_json::from_str(&json).expect("deserialize snapshot");
+        assert_eq!(back, snap);
+        assert_eq!(back.tx_submit_latency_hist.len(), 16);
+        assert_eq!(back.tx_submit_latency_hist[0], 9001);
+        assert_eq!(back.tx_submit_latency_hist[7], 2);
+    }
+
+    #[test]
+    fn tx_latency_hist_backward_compat_old_payload_deserializes() {
+        // #812 plan §6.1 test #4 (second half). A pre-#812 JSON
+        // payload MUST deserialize without the three new fields
+        // — they default to empty Vec / zero u64 via
+        // `#[serde(default)]`. This is the wire-compat contract
+        // the step1-capture consumer relies on.
+        let legacy_json = r#"{
+            "worker_id": 5,
+            "ifindex": 7,
+            "queue_id": 2,
+            "dbg_tx_ring_full": 0,
+            "dbg_sendto_enobufs": 0,
+            "dbg_bound_pending_overflow": 0,
+            "dbg_cos_queue_overflow": 0,
+            "rx_fill_ring_empty_descs": 0,
+            "outstanding_tx": 0,
+            "tx_errors": 0,
+            "tx_submit_error_drops": 0,
+            "pending_tx_local_overflow_drops": 0
+        }"#;
+        let snap: BindingCountersSnapshot =
+            serde_json::from_str(legacy_json).expect("pre-#812 payload decodes");
+        assert_eq!(snap.worker_id, 5);
+        assert!(
+            snap.tx_submit_latency_hist.is_empty(),
+            "pre-#812 payload must default to empty Vec<u64>",
+        );
+        assert_eq!(snap.tx_submit_latency_count, 0);
+        assert_eq!(snap.tx_submit_latency_sum_ns, 0);
+    }
+
+    #[test]
+    fn tx_latency_hist_binding_counters_snapshot_is_static_send() {
+        // #812 plan §6.1 test #8 (runtime corollary of the named
+        // compile-time const-assert
+        // `_ASSERT_BINDING_COUNTERS_SNAPSHOT_IS_OWNED_STATIC_SEND`
+        // in protocol.rs). Exercise the `'static + Send` bound at
+        // test time too so if the const-assert were ever silently
+        // removed, this test still fires. A reference-holding
+        // future field would fail EITHER the compile (const-
+        // assert) OR this runtime helper (which requires
+        // `T: 'static + Send`), catching the regression two
+        // different ways.
+        fn require_static_send<T: 'static + Send>() {}
+        require_static_send::<BindingCountersSnapshot>();
+    }
 }
