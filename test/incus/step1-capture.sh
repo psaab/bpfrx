@@ -178,9 +178,13 @@ log "capture cluster-state snapshot (pre)"
 fw "cli -c 'show chassis cluster status'" > "$OUTDIR/cluster-status-pre.txt"
 
 # I9 start-of-run invariant: primary is fw0, no recent fab flap.
-if ! grep -E '^[[:space:]]*primary' "$OUTDIR/cluster-status-pre.txt" \
-   | head -1 | grep -qiE 'fw0|node0'; then
-	suspect "I9: RG0 primary is not fw0 (per cluster-status-pre.txt)"
+# The `show chassis cluster status` format is:
+#   node0  200      primary        no       no       None
+#   node1  100      secondary      no       no       None
+# Find the RG0 block and look at its first "primary"-marked node.
+if ! awk '/Redundancy group: 0/{flag=1; next} /Redundancy group: [1-9]/{flag=0} flag && /primary/ {print; exit}' \
+     "$OUTDIR/cluster-status-pre.txt" | grep -qiE '^(node0|fw0)'; then
+	suspect "I9: RG0 primary is not fw0/node0 (per cluster-status-pre.txt)"
 fi
 
 # §6 CoS-state assertion. The caller decides which COS state to run a
@@ -386,8 +390,11 @@ SAMPLE_LINES=$(wc -l < "$OUTDIR/flow_steer_samples.jsonl")
 if [[ "$SAMPLE_LINES" != "12" ]]; then
 	add_fail "I6: expected 12 samples, got $SAMPLE_LINES"
 else
+	# jq operator precedence: `or` binds tighter than `|`, so the
+	# previous form parsed as `(x) or (y) | length < 8` → boolean has
+	# no length → jq exits non-zero. Parenthesise explicitly.
 	BAD_LINES=$(jq -c 'select((._error // null) != null
-		or (.status.per_binding // []) | length < 8)' \
+		or ((.status.per_binding // []) | length) < 8)' \
 		"$OUTDIR/flow_steer_samples.jsonl" 2>/dev/null | wc -l)
 	if [[ "$BAD_LINES" -gt 0 ]]; then
 		add_fail "I6: $BAD_LINES of 12 samples failed (control_socket_timeout or per_binding < 8)"
@@ -408,20 +415,34 @@ if [[ "$COS" == "with-cos" ]]; then
 	if [[ "$COS_IFACE_COUNT" -lt 1 ]]; then
 		add_fail "I10: with-cos but status.cos_interfaces is empty"
 	fi
-	# Filter-term-counter delta — require any term mentioning the
-	# port number to have non-zero packet delta between cold and post.
-	POST_PKTS=$(jq -r --arg p "$PORT" '
+	# Filter-term-counter delta — the canonical full-cos.set maps
+	# destination-port -> term_name via:
+	#   5201 -> term 0 (iperf-a, 1 Gbps)
+	#   5202 -> term 1 (iperf-b, 10 Gbps)
+	#   5203 -> term 2 (iperf-c, 25 Gbps)
+	#   5204 -> term 3 (best-effort fallthrough, 100 Mbps)
+	# The previous `term_name | test($p)` test using the port string
+	# never matches (term names are "0".."3", not "5201"..). Use the
+	# explicit mapping. Also sum across inet + inet6 families.
+	case "$PORT" in
+		5201) TERM="0" ;;
+		5202) TERM="1" ;;
+		5203) TERM="2" ;;
+		5204) TERM="3" ;;
+		*)    TERM="" ;;
+	esac
+	POST_PKTS=$(jq -r --arg t "$TERM" '
 		(.status.filter_term_counters // [])
-		| map(select(.term_name | test($p)))
+		| map(select(.filter_name == "bandwidth-output" and .term_name == $t))
 		| map(.packets // 0) | add // 0
 	' "$OUTDIR/flow_steer_post.json")
-	COLD_PKTS=$(jq -r --arg p "$PORT" '
+	COLD_PKTS=$(jq -r --arg t "$TERM" '
 		(.status.filter_term_counters // [])
-		| map(select(.term_name | test($p)))
+		| map(select(.filter_name == "bandwidth-output" and .term_name == $t))
 		| map(.packets // 0) | add // 0
 	' "$OUTDIR/flow_steer_cold.json")
 	if [[ "$POST_PKTS" -le "$COLD_PKTS" ]]; then
-		add_fail "I10: filter_term_counters delta is zero on port $PORT (cold=$COLD_PKTS post=$POST_PKTS)"
+		add_fail "I10: filter_term_counters delta is zero on port $PORT term=$TERM (cold=$COLD_PKTS post=$POST_PKTS)"
 	fi
 fi
 
