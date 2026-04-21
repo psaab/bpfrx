@@ -1,5 +1,139 @@
 use super::*;
 
+/// #812 Codex round-1 MED + Rust round-1 MED-2: replaced the former
+/// `canonical_submit_stamp` in-band mapping of `ts == 0 → sentinel`
+/// with an early-return in `stamp_submits`. The sentinel is
+/// `u64::MAX` (see `umem.rs::TX_SIDECAR_UNSTAMPED`); a legitimate
+/// monotonic timestamp cannot reach it (~585 years at ns granularity).
+/// Previously, the Rust reviewer flagged the `ts == 0` branch as
+/// in-band signalling on a u64. We now skip all sidecar writes on
+/// clock failure rather than overwriting fresh data with the sentinel
+/// — safe because `record_tx_completions_with_stamp` resets each
+/// slot to `TX_SIDECAR_UNSTAMPED` on reap, so a frame whose sidecar
+/// did NOT receive a stamp in the current cycle is already in the
+/// correct "skip at reap time" state.
+
+/// #812: stamp the submit-timestamp sidecar for the accepted prefix
+/// of the current TX batch. Called ONCE per `writer.commit()` at each
+/// of the six submit sites (plan §3.1 table) with the scratch
+/// offsets. Only the first `inserted` offsets are stamped; the retry
+/// tail (`scratch[inserted..]`) MUST NOT be stamped because those
+/// descriptors return to `free_tx_frames` and would otherwise produce
+/// phantom completions bucketed against a stale submit time.
+///
+/// Codex round-1 HIGH #1: call sites MUST invoke this AFTER
+/// `writer.commit()` (and `drop(writer)`). Pre-commit stamping
+/// attributed a scheduler preemption window between `insert` and ring
+/// submission to the kernel-visible submit→completion latency, which
+/// is exactly backwards. Post-commit stamping reflects the moment the
+/// ring producer actually became kernel-visible.
+///
+/// Single-writer: the owner worker is the only thread that touches
+/// this sidecar (see plan §3.3 file citations: `WorkerUmem` is `Rc`
+/// at `umem.rs:16-18`, `free_tx_frames` is plain `VecDeque` at
+/// `worker.rs:16`). Plain slice-indexed store — no atomic, no grow.
+#[inline]
+pub(super) fn stamp_submits<I>(sidecar: &mut [u64], offsets: I, ts_submit: u64)
+where
+    I: Iterator<Item = u64>,
+{
+    // #812 Codex round-1 MED + Rust round-1 MED-2: clock-failure gate.
+    // `monotonic_nanos()` returns 0 on `clock_gettime` failure
+    // (`neighbor.rs:8-10`). On failure we do NOT overwrite sidecar
+    // slots with a sentinel — we return without touching any slot.
+    // `record_tx_completions_with_stamp` resets each slot to
+    // `TX_SIDECAR_UNSTAMPED` on reap, so a slot that skipped its
+    // stamp this cycle already reads as "unstamped" at reap time and
+    // the sample is correctly dropped. This removes the previous
+    // in-band mapping of `ts == 0 → TX_SIDECAR_UNSTAMPED`.
+    //
+    // The sentinel itself stays at `u64::MAX` — a legitimate
+    // monotonic timestamp cannot reach it (~585 years uptime at ns
+    // granularity), so there is no value collision between a
+    // genuine-but-small stamp and "unstamped".
+    if ts_submit == 0 {
+        return;
+    }
+    for offset in offsets {
+        let idx = (offset >> UMEM_FRAME_SHIFT) as usize;
+        // #812 Rust round-1 HIGH-1: under `shared_umem = true` (mlx5
+        // special case), frames drawn from the shared pool CAN have
+        // offsets whose `offset >> UMEM_FRAME_SHIFT` exceeds THIS
+        // binding's `total_frames`. Silent-drop is the correct
+        // behaviour: the out-of-range frame belongs to a different
+        // binding's sidecar, and that binding's owner is responsible
+        // for stamping its own slots. Writing into this sidecar at a
+        // bounded-out-of-range index would overflow OR (after a
+        // resize up) corrupt an unrelated slot — `get_mut` returns
+        // None on out-of-range, which keeps the hot path sound.
+        // Pinned by the `tx_latency_hist_shared_umem_oob_offset_*`
+        // tests below.
+        //
+        // `debug_assert!` is deliberately NOT used here: tests drive
+        // this path directly and we want release-parity semantics
+        // (silent drop) to be the PRIMARY pin, not a test-only panic.
+        if let Some(slot) = sidecar.get_mut(idx) {
+            *slot = ts_submit;
+        }
+    }
+}
+
+/// #812 test hook / decomposition aid: the pure per-offset fold from
+/// `reap_tx_completions`. Takes the sidecar slice, the list of
+/// completed offsets, and an injected `ts_completion` (so tests can
+/// drive deterministic deltas), plus the owner-profile atomic set.
+/// Same shape the live reap path runs — batched aggregation into
+/// local counters followed by at most N_buckets `fetch_add`s — so
+/// unit pins here exercise the production algorithm, not a test-only
+/// fake.
+///
+/// Returns `(count, sum_ns)` for callers that want to assert on the
+/// per-batch delta directly (rather than reading back the atomics
+/// afterward).
+#[inline]
+pub(super) fn record_tx_completions_with_stamp(
+    sidecar: &mut [u64],
+    completed_offsets: &[u64],
+    ts_completion: u64,
+    owner: &OwnerProfileOwnerWrites,
+) -> (u64, u64) {
+    let mut hist_fire_count = 0u64;
+    let mut hist_fire_sum_ns = 0u64;
+    let mut hist_fire_per_bucket = [0u64; TX_SUBMIT_LAT_BUCKETS];
+    for &offset in completed_offsets {
+        let slot_idx = (offset >> UMEM_FRAME_SHIFT) as usize;
+        let ts_submit = match sidecar.get_mut(slot_idx) {
+            Some(slot) => {
+                let v = *slot;
+                *slot = TX_SIDECAR_UNSTAMPED;
+                v
+            }
+            None => TX_SIDECAR_UNSTAMPED,
+        };
+        if ts_submit != TX_SIDECAR_UNSTAMPED && ts_completion >= ts_submit {
+            let delta_ns = ts_completion - ts_submit;
+            let bucket = bucket_index_for_ns(delta_ns);
+            hist_fire_per_bucket[bucket] = hist_fire_per_bucket[bucket].saturating_add(1);
+            hist_fire_count = hist_fire_count.saturating_add(1);
+            hist_fire_sum_ns = hist_fire_sum_ns.saturating_add(delta_ns);
+        }
+    }
+    for (b, add) in hist_fire_per_bucket.iter().enumerate() {
+        if *add != 0 {
+            owner.tx_submit_latency_hist[b].fetch_add(*add, Ordering::Relaxed);
+        }
+    }
+    if hist_fire_count != 0 {
+        owner
+            .tx_submit_latency_count
+            .fetch_add(hist_fire_count, Ordering::Relaxed);
+        owner
+            .tx_submit_latency_sum_ns
+            .fetch_add(hist_fire_sum_ns, Ordering::Relaxed);
+    }
+    (hist_fire_count, hist_fire_sum_ns)
+}
+
 pub(super) fn reap_tx_completions(
     binding: &mut BindingWorker,
     shared_recycles: &mut Vec<(u32, u64)>,
@@ -20,6 +154,23 @@ pub(super) fn reap_tx_completions(
     }
     completed.release();
     drop(completed);
+    // #812: completion stamp — single fresh `monotonic_nanos()` for
+    // the entire reap batch (plan §3.1 completion-ts site). Amortised
+    // one VDSO call per reap (worst-case ~15 ns / 256-packet batch =
+    // 0.06 ns/pkt on the steady-state path; ~15 ns/pkt on the
+    // `reaped == 1` partial-batch worst case — same shape as the
+    // submit-stamp cost analysis in plan §3.4).
+    let ts_completion = monotonic_nanos();
+    // #812: delegate the per-offset fold to the shared helper so
+    // tests exercising `record_tx_completions_with_stamp` cover the
+    // exact production algorithm — NOT a test-only fake. See unit
+    // pins under `#[cfg(test)]` below.
+    record_tx_completions_with_stamp(
+        &mut binding.tx_submit_ns,
+        &binding.scratch_completed_offsets,
+        ts_completion,
+        &binding.live.owner_profile_owner,
+    );
     for i in 0..binding.scratch_completed_offsets.len() {
         let offset = binding.scratch_completed_offsets[i];
         recycle_completed_tx_offset(binding, shared_recycles, offset);
@@ -1854,6 +2005,27 @@ fn service_exact_local_queue_direct(
     }));
     writer.commit();
     drop(writer);
+    // #812 Codex round-1 HIGH #1: sample the submit stamp AFTER
+    // `writer.commit()` so a scheduler preemption between `insert`
+    // and the ring submit does NOT inflate the measured latency.
+    // Pre-commit stamping attributed the preemption window to the
+    // kernel (submit→completion), which is exactly the opposite of
+    // what we want to observe. A reused caller `now_ns` would still
+    // leak up to ~1 ms of worker-loop staleness, so we take a fresh
+    // `monotonic_nanos()` here rather than re-using one from the
+    // outer scope. Only the accepted prefix (`.take(inserted as
+    // usize)`) is stamped — the retry tail returns to
+    // `free_tx_frames` and MUST NOT be stamped.
+    let ts_submit = monotonic_nanos();
+    stamp_submits(
+        &mut binding.tx_submit_ns,
+        binding
+            .scratch_exact_local_tx
+            .iter()
+            .take(inserted as usize)
+            .map(|req| req.offset),
+        ts_submit,
+    );
 
     if inserted == 0 {
         let dropped = binding.scratch_exact_local_tx.len() as u64;
@@ -1974,6 +2146,21 @@ fn service_exact_local_queue_direct_flow_fair(
     );
     writer.commit();
     drop(writer);
+    // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — see plan
+    // §3.1 submit-site table (this is the
+    // service_exact_local_queue_direct_flow_fair variant). Stamping
+    // post-commit prevents a preemption window between `insert` and
+    // ring submit from being attributed to submit→completion latency.
+    let ts_submit = monotonic_nanos();
+    stamp_submits(
+        &mut binding.tx_submit_ns,
+        binding
+            .scratch_local_tx
+            .iter()
+            .take(inserted as usize)
+            .map(|(offset, _)| *offset),
+        ts_submit,
+    );
 
     if inserted == 0 {
         let dropped = binding.scratch_local_tx.len() as u64;
@@ -2111,6 +2298,21 @@ fn service_exact_prepared_queue_direct(
     }));
     writer.commit();
     drop(writer);
+    // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — plan
+    // §3.1 submit-site table (the service_exact_prepared_queue_direct
+    // variant). Post-commit stamping ensures the measurement reflects
+    // the moment the ring submission actually landed in the kernel,
+    // not the moment before a potential preemption window.
+    let ts_submit = monotonic_nanos();
+    stamp_submits(
+        &mut binding.tx_submit_ns,
+        binding
+            .scratch_exact_prepared_tx
+            .iter()
+            .take(inserted as usize)
+            .map(|req| req.offset),
+        ts_submit,
+    );
 
     if inserted == 0 {
         let dropped = binding.scratch_exact_prepared_tx.len() as u64;
@@ -2234,6 +2436,20 @@ fn service_exact_prepared_queue_direct_flow_fair(
     }));
     writer.commit();
     drop(writer);
+    // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — plan
+    // §3.1 submit-site table (the
+    // service_exact_prepared_queue_direct_flow_fair variant). See the
+    // exact_local variant above for the preemption-window rationale.
+    let ts_submit = monotonic_nanos();
+    stamp_submits(
+        &mut binding.tx_submit_ns,
+        binding
+            .scratch_prepared_tx
+            .iter()
+            .take(inserted as usize)
+            .map(|req| req.offset),
+        ts_submit,
+    );
 
     if inserted == 0 {
         let dropped = binding.scratch_prepared_tx.len() as u64;
@@ -5934,6 +6150,21 @@ pub(super) fn transmit_batch(
     );
     writer.commit();
     drop(writer);
+    // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — plan
+    // §3.1 submit-site table (the post-CoS backup transmit_batch
+    // variant for local requests). Post-commit stamping prevents a
+    // scheduler preemption window between insert and ring submission
+    // from inflating the observed latency.
+    let ts_submit = monotonic_nanos();
+    stamp_submits(
+        &mut binding.tx_submit_ns,
+        binding
+            .scratch_local_tx
+            .iter()
+            .take(inserted as usize)
+            .map(|(offset, _)| *offset),
+        ts_submit,
+    );
 
     if inserted == 0 {
         binding.dbg_tx_ring_full += 1;
@@ -6148,6 +6379,20 @@ fn transmit_prepared_queue(
     }));
     writer.commit();
     drop(writer);
+    // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — plan
+    // §3.1 submit-site table (the transmit_prepared_queue
+    // continuation variant). Post-commit stamping ensures we measure
+    // kernel-visible submit time, not the pre-submit planning window.
+    let ts_submit = monotonic_nanos();
+    stamp_submits(
+        &mut binding.tx_submit_ns,
+        binding
+            .scratch_prepared_tx
+            .iter()
+            .take(inserted as usize)
+            .map(|req| req.offset),
+        ts_submit,
+    );
 
     if inserted == 0 {
         binding.dbg_tx_ring_full += 1;

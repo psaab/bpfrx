@@ -671,6 +671,17 @@ type BindingStatus struct {
 	DbgCoSQueueOverflow               uint64    `json:"dbg_cos_queue_overflow,omitempty"`
 	RxFillRingEmptyDescs              uint64    `json:"rx_fill_ring_empty_descs,omitempty"`
 	OutstandingTX                     uint32    `json:"outstanding_tx,omitempty"`
+	// #812: per-queue TX submit→completion latency telemetry. 16 log2-
+	// spaced buckets (see Rust `DRAIN_HIST_BUCKETS` wire contract), plus
+	// a total completion count and running sum-ns. Emitted on the rich
+	// BindingStatus AND projected onto BindingCountersSnapshot so
+	// step1-capture consumers can compute per-queue latency
+	// distributions without a second join. omitempty keeps forward-
+	// compat — a pre-#812 helper that lacks these fields decodes into
+	// empty slice / zero u64.
+	TxSubmitLatencyHist               []uint64  `json:"tx_submit_latency_hist,omitempty"`
+	TxSubmitLatencyCount              uint64    `json:"tx_submit_latency_count,omitempty"`
+	TxSubmitLatencySumNs              uint64    `json:"tx_submit_latency_sum_ns,omitempty"`
 	LastHeartbeat                     time.Time `json:"last_heartbeat,omitempty"`
 	LastError                         string    `json:"last_error,omitempty"`
 	LastChange                        time.Time `json:"last_change,omitempty"`
@@ -704,6 +715,17 @@ type BindingCountersSnapshot struct {
 	TXErrors                    uint64 `json:"tx_errors,omitempty"`
 	TxSubmitErrorDrops          uint64 `json:"tx_submit_error_drops,omitempty"`
 	PendingTxLocalOverflowDrops uint64 `json:"pending_tx_local_overflow_drops,omitempty"`
+	// #812: per-queue TX submit→completion latency histogram, pulled
+	// through from BindingStatus so step1-capture consumers can
+	// compute per-queue latency distributions without a second
+	// query. Layout is 16 log2-spaced buckets (see the Rust
+	// `DRAIN_HIST_BUCKETS` wire contract); omitempty on all three
+	// preserves forward-compat — a pre-#812 helper that lacks these
+	// fields decodes into empty slice / zero u64 without the daemon
+	// erroring.
+	TxSubmitLatencyHist    []uint64 `json:"tx_submit_latency_hist,omitempty"`
+	TxSubmitLatencyCount   uint64   `json:"tx_submit_latency_count,omitempty"`
+	TxSubmitLatencySumNs   uint64   `json:"tx_submit_latency_sum_ns,omitempty"`
 }
 
 type ExceptionStatus struct {

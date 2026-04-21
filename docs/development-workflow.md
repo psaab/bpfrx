@@ -185,11 +185,24 @@ Typical round count: 2-3. Observed up to 4.
   historical artifacts in the `docs/pr/<N>/` directory intact).
 - If the PR is part of a stacked series, merge bottom-up.
 
+## Test target is the userspace cluster, never bpfrx
+
+Line-rate, fairness, CoS, and forwarding validation targets ONLY
+the **`loss:xpf-userspace-fw0` / `loss:xpf-userspace-fw1`** cluster.
+The `bpfrx-fw0` / `bpfrx-fw1` eBPF-dataplane cluster is **not** a
+supported measurement surface for these workstreams — its setup,
+config schema, and deploy pipeline are orthogonal.
+
+If an agent captures evidence from `bpfrx-*` VMs, the evidence is
+invalid. Regenerate on the userspace cluster and update the
+referencing doc. This applies to VDSO captures, strace outputs,
+kernel/glibc fingerprints, iperf3 runs, and any counter snapshot.
+
 ## Forwarding health is a continuous gate
 
 At any point during either cycle — plan execution OR code
 implementation — forwarding must stay healthy on the test cluster.
-Specifically:
+Specifically (on the userspace cluster):
 
 - `iperf3 -c 172.16.80.200 -P 4 -t 5 -p 5203` passes with 0
   retransmits after any daemon restart.

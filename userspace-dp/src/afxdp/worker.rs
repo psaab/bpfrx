@@ -32,6 +32,35 @@ pub(crate) struct BindingWorker {
     pub(crate) scratch_exact_local_tx: Vec<ExactLocalScratchTxRequest>,
     pub(crate) scratch_completed_offsets: Vec<u64>,
     pub(crate) scratch_post_recycles: Vec<(u32, u64)>,
+    /// #812: per-UMEM-frame submit timestamp sidecar. Indexed by
+    /// `offset >> UMEM_FRAME_SHIFT`. Pre-allocated once at binding
+    /// construction (length = total UMEM frames) so the hot-path
+    /// stamp write is a single store — NO allocation, NO grow.
+    ///
+    /// Single-writer invariant (plan §3.3): submit and completion for
+    /// one frame offset are the same thread (the owner worker that
+    /// owns this binding's `free_tx_frames` via
+    /// `pop_front`/`push_front`), so plain `Vec<u64>` is correct —
+    /// no atomic needed. `WorkerUmem` is `Rc` (not `Arc`) at
+    /// `umem.rs:16-18`, enforcing single-owner semantics even when
+    /// multiple bindings share a UMEM under the mlx5 special case.
+    ///
+    /// Unstamped slots hold `TX_SIDECAR_UNSTAMPED` (`u64::MAX`) — the
+    /// reap path (`reap_tx_completions`) skips the histogram
+    /// increment for these to avoid biasing the tail toward bucket 0
+    /// (plan §5.4). A `monotonic_nanos() == 0` return (VDSO failure,
+    /// plan §3.4a / §6.1 test #5) causes `stamp_submits` to early-
+    /// return without writing the slot (Codex round-1 MED + Rust
+    /// round-1 MED-2) — the slot's pre-existing UNSTAMPED state
+    /// (from the previous reap or from worker construction) is what
+    /// the reap checks.
+    /// Rust round-1 MED-1: `Box<[u64]>` rather than `Vec<u64>` to
+    /// convey single-size intent at the type level. The sidecar is
+    /// pre-allocated to `total_frames` at binding construction and
+    /// NEVER grown. A future refactor that naively added `push` to
+    /// `Vec<u64>` would silently allocate on the hot path; `Box<[u64]>`
+    /// has no `push` method, so the mistake fails to compile.
+    pub(crate) tx_submit_ns: Box<[u64]>,
     /// Packets waiting for neighbor resolution. The UMEM frame is held
     /// (not recycled) until the neighbor resolves or the entry times out.
     pub(crate) pending_neigh: VecDeque<PendingNeighPacket>,
@@ -319,6 +348,17 @@ impl BindingWorker {
             scratch_exact_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
             scratch_completed_offsets: Vec::with_capacity(ring_entries as usize),
             scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
+            // #812: pre-allocate the submit-timestamp sidecar once,
+            // sized to the binding's total UMEM frame count so every
+            // legal `offset >> UMEM_FRAME_SHIFT` index lands inside
+            // the vec. Initial contents are the unstamped sentinel so
+            // any stray pre-existing offset in flight (cross-restart
+            // completion) is skipped by the reap path (plan §5.4).
+            // Allocation happens here — NEVER on the hot path.
+            // Rust round-1 MED-1: Box<[u64]> — allocate-once, never
+            // grow. `vec![...].into_boxed_slice()` produces an
+            // exactly-sized heap allocation with no spare capacity.
+            tx_submit_ns: vec![TX_SIDECAR_UNSTAMPED; total_frames as usize].into_boxed_slice(),
             pending_neigh: VecDeque::with_capacity(MAX_PENDING_NEIGH),
             scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
             scratch_rst_teardowns: Vec::with_capacity(16),
@@ -4197,4 +4237,12 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) redirect_acquire_hist: [u64; DRAIN_HIST_BUCKETS],
     pub(crate) owner_pps: u64,
     pub(crate) peer_pps: u64,
+    /// #812: per-queue TX submit→completion latency histogram +
+    /// count + sum-ns. Fixed-size array (same pattern as
+    /// `drain_latency_hist`). The array is materialized into a
+    /// `Vec<u64>` only at the JSON/protocol boundary; the snapshot
+    /// itself stays allocation-free.
+    pub(crate) tx_submit_latency_hist: [u64; TX_SUBMIT_LAT_BUCKETS],
+    pub(crate) tx_submit_latency_count: u64,
+    pub(crate) tx_submit_latency_sum_ns: u64,
 }

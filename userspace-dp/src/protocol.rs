@@ -1321,6 +1321,21 @@ pub(crate) struct BindingStatus {
     pub rx_fill_ring_empty_descs: u64,
     #[serde(rename = "outstanding_tx", default)]
     pub outstanding_tx: u32,
+    // #812: per-queue TX submit→completion latency telemetry. Emitted
+    // in the rich BindingStatus shape; also projected onto the focused
+    // `BindingCountersSnapshot` via the `From` impl so the
+    // step1-capture consumer can reach it without a second join.
+    // `drain_latency_hist` at protocol.rs:881 is the sibling wire
+    // contract this mirrors — histograms on the wire are Vec<u64> so
+    // serde needs no schema for the fixed-cap array. Default on all
+    // three preserves backward-compat for pre-#812 helper payloads
+    // (fields absent → zero-valued).
+    #[serde(rename = "tx_submit_latency_hist", default)]
+    pub tx_submit_latency_hist: Vec<u64>,
+    #[serde(rename = "tx_submit_latency_count", default)]
+    pub tx_submit_latency_count: u64,
+    #[serde(rename = "tx_submit_latency_sum_ns", default)]
+    pub tx_submit_latency_sum_ns: u64,
     #[serde(rename = "last_error", default)]
     pub last_error: String,
     #[serde(rename = "last_change", skip_serializing_if = "Option::is_none")]
@@ -1397,7 +1412,41 @@ pub(crate) struct BindingCountersSnapshot {
     pub tx_submit_error_drops: u64,
     #[serde(rename = "pending_tx_local_overflow_drops", default)]
     pub pending_tx_local_overflow_drops: u64,
+    // #812: TX submit→completion latency histogram, pulled through
+    // from BindingStatus so step1-capture consumers can compute
+    // per-queue latency distributions without a second join.
+    // `default` keeps pre-#812 consumers parseable — the fields
+    // simply deserialize as empty/zero.
+    #[serde(rename = "tx_submit_latency_hist", default)]
+    pub tx_submit_latency_hist: Vec<u64>,
+    #[serde(rename = "tx_submit_latency_count", default)]
+    pub tx_submit_latency_count: u64,
+    #[serde(rename = "tx_submit_latency_sum_ns", default)]
+    pub tx_submit_latency_sum_ns: u64,
 }
+
+// #812 (plan §3.5a / §6.1 test #8): compile-time assertion that
+// `BindingCountersSnapshot` can cross the owner-worker →
+// control-socket thread boundary without dragging a live borrow
+// back into the per-worker sidecar. A `'static + Send` bound on a
+// struct type with NO lifetime parameter is mechanically broken by
+// any borrowed field added later (Rust's subtyping rule forces the
+// struct to carry the reference's lifetime `'a`, and only `'a =
+// 'static` satisfies the bound — which is not what a live
+// per-worker snapshot would ever produce). `Send` additionally
+// rejects `Rc<_>` / `Cell<_>` fields. The named const-item ties
+// the failure message to this specific struct so a future
+// `#[derive]` reshuffle that breaks Send/'static trips the build
+// with a targeted error pointing HERE, not in some downstream
+// generic.
+//
+// This is defense-in-depth on top of the JSON round-trip test
+// (§6.1 test #4), which already mechanically requires
+// DeserializeOwned.
+const _ASSERT_BINDING_COUNTERS_SNAPSHOT_IS_OWNED_STATIC_SEND: () = {
+    const fn require_static_send<T: 'static + Send>() {}
+    require_static_send::<BindingCountersSnapshot>();
+};
 
 // #804: was `impl BindingCountersSnapshot { fn from_binding_status(...) }`.
 // Switched to the idiomatic `From` impl so the projection composes with
@@ -1418,6 +1467,13 @@ impl From<&BindingStatus> for BindingCountersSnapshot {
             tx_errors: b.tx_errors,
             tx_submit_error_drops: b.tx_submit_error_drops,
             pending_tx_local_overflow_drops: b.pending_tx_local_overflow_drops,
+            // #812: clone the histogram Vec<u64> by value (owned
+            // copy). Avoids any shared-reference aliasing against
+            // the `BindingStatus` owner and satisfies the
+            // `'static + Send` assert above.
+            tx_submit_latency_hist: b.tx_submit_latency_hist.clone(),
+            tx_submit_latency_count: b.tx_submit_latency_count,
+            tx_submit_latency_sum_ns: b.tx_submit_latency_sum_ns,
         }
     }
 }
