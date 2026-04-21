@@ -1424,6 +1424,20 @@ impl Coordinator {
                 binding.dbg_cos_queue_overflow = snap.dbg_cos_queue_overflow;
                 binding.rx_fill_ring_empty_descs = snap.rx_fill_ring_empty_descs;
                 binding.outstanding_tx = snap.debug_outstanding_tx;
+                // #812: per-queue TX submit→completion latency
+                // telemetry. Materialize the fixed-cap snapshot
+                // array into a freshly-owned Vec<u64> on the wire
+                // boundary — reuses the buffer in-place to avoid
+                // allocator churn when the BindingStatus entry is
+                // refreshed on the ~1s poll cadence.
+                binding
+                    .tx_submit_latency_hist
+                    .resize(snap.tx_submit_latency_hist.len(), 0);
+                binding
+                    .tx_submit_latency_hist
+                    .copy_from_slice(&snap.tx_submit_latency_hist);
+                binding.tx_submit_latency_count = snap.tx_submit_latency_count;
+                binding.tx_submit_latency_sum_ns = snap.tx_submit_latency_sum_ns;
                 binding.last_heartbeat = snap.last_heartbeat;
                 binding.last_error = snap.last_error;
                 binding.ready = binding.registered
@@ -1511,6 +1525,11 @@ impl Coordinator {
                 binding.dbg_cos_queue_overflow = 0;
                 binding.rx_fill_ring_empty_descs = 0;
                 binding.outstanding_tx = 0;
+                // #812: zero the submit-latency histogram when the
+                // binding has no live state (unregistered slot).
+                binding.tx_submit_latency_hist.clear();
+                binding.tx_submit_latency_count = 0;
+                binding.tx_submit_latency_sum_ns = 0;
                 binding.last_heartbeat = None;
                 binding.last_error.clear();
                 binding.ready = false;

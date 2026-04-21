@@ -1409,6 +1409,24 @@ impl BindingLiveState {
             ),
             owner_pps: self.owner_profile_owner.owner_pps.load(Ordering::Relaxed),
             peer_pps: self.owner_profile_peer.peer_pps.load(Ordering::Relaxed),
+            // #812: owner-written TX submit-latency telemetry.
+            // Copied bucket-by-bucket under Relaxed; read-side
+            // tearing acceptable per the §3.6 R2 bounded-skew
+            // semantics and the drain-histogram precedent at
+            // umem.rs:1322-1329. The count/sum scalars are loaded
+            // immediately after the bucket sweep so the snapshot
+            // read window is tight (single owner cacheline).
+            tx_submit_latency_hist: Self::snapshot_hist(
+                &self.owner_profile_owner.tx_submit_latency_hist,
+            ),
+            tx_submit_latency_count: self
+                .owner_profile_owner
+                .tx_submit_latency_count
+                .load(Ordering::Relaxed),
+            tx_submit_latency_sum_ns: self
+                .owner_profile_owner
+                .tx_submit_latency_sum_ns
+                .load(Ordering::Relaxed),
         }
     }
 

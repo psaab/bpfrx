@@ -1809,6 +1809,11 @@ mod tests {
             tx_errors: 9,
             tx_submit_error_drops: 10,
             pending_tx_local_overflow_drops: 11,
+            // #812: populated so wire-key assertions below also cover
+            // the new TX submit-latency fields.
+            tx_submit_latency_hist: vec![13, 14, 15],
+            tx_submit_latency_count: 16,
+            tx_submit_latency_sum_ns: 17,
         };
         let value: serde_json::Value =
             serde_json::to_value(&snap).expect("serialize snapshot to Value");
@@ -1828,6 +1833,11 @@ mod tests {
             "tx_errors",
             "tx_submit_error_drops",
             "pending_tx_local_overflow_drops",
+            // #812: new wire keys — absence from BindingCountersSnapshot
+            // JSON breaks the Go-side step1-capture consumer.
+            "tx_submit_latency_hist",
+            "tx_submit_latency_count",
+            "tx_submit_latency_sum_ns",
         ] {
             assert!(
                 obj.contains_key(key),

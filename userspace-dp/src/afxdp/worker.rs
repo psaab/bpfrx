@@ -4225,4 +4225,12 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) redirect_acquire_hist: [u64; DRAIN_HIST_BUCKETS],
     pub(crate) owner_pps: u64,
     pub(crate) peer_pps: u64,
+    /// #812: per-queue TX submit→completion latency histogram +
+    /// count + sum-ns. Fixed-size array (same pattern as
+    /// `drain_latency_hist`). The array is materialized into a
+    /// `Vec<u64>` only at the JSON/protocol boundary; the snapshot
+    /// itself stays allocation-free.
+    pub(crate) tx_submit_latency_hist: [u64; TX_SUBMIT_LAT_BUCKETS],
+    pub(crate) tx_submit_latency_count: u64,
+    pub(crate) tx_submit_latency_sum_ns: u64,
 }
