@@ -1178,7 +1178,7 @@ mod tests {
         // semantics on the sidecar's backing UMEM. A future
         // refactor that quietly upgrades the field to `Arc` to
         // share bindings across threads would silently break the
-        // no-atomic assumption on `tx_submit_ns: Vec<u64>`.
+        // no-atomic assumption on `tx_submit_ns: Box<[u64]>`.
         //
         // We cannot run a full `WorkerUmem::new` here because
         // UMEM allocation requires CAP_NET_ADMIN for the XDP
@@ -1204,7 +1204,7 @@ mod tests {
         // If the single-writer invariant ever needs re-
         // establishment with a shared-ownership backing (Arc),
         // the refactor will cascade through both the fn-pointer
-        // lines here AND the `tx_submit_ns: Vec<u64>` field
+        // lines here AND the `tx_submit_ns: Box<[u64]>` field
         // itself (which is sound only under single-owner
         // access) — a loud failure, not silent drift.
         let _: fn(&WorkerUmem, &WorkerUmem) -> bool = WorkerUmem::shares_allocation_with;

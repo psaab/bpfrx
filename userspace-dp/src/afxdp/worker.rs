@@ -54,7 +54,13 @@ pub(crate) struct BindingWorker {
     /// round-1 MED-2) — the slot's pre-existing UNSTAMPED state
     /// (from the previous reap or from worker construction) is what
     /// the reap checks.
-    pub(crate) tx_submit_ns: Vec<u64>,
+    /// Rust round-1 MED-1: `Box<[u64]>` rather than `Vec<u64>` to
+    /// convey single-size intent at the type level. The sidecar is
+    /// pre-allocated to `total_frames` at binding construction and
+    /// NEVER grown. A future refactor that naively added `push` to
+    /// `Vec<u64>` would silently allocate on the hot path; `Box<[u64]>`
+    /// has no `push` method, so the mistake fails to compile.
+    pub(crate) tx_submit_ns: Box<[u64]>,
     /// Packets waiting for neighbor resolution. The UMEM frame is held
     /// (not recycled) until the neighbor resolves or the entry times out.
     pub(crate) pending_neigh: VecDeque<PendingNeighPacket>,
@@ -349,7 +355,10 @@ impl BindingWorker {
             // any stray pre-existing offset in flight (cross-restart
             // completion) is skipped by the reap path (plan §5.4).
             // Allocation happens here — NEVER on the hot path.
-            tx_submit_ns: vec![TX_SIDECAR_UNSTAMPED; total_frames as usize],
+            // Rust round-1 MED-1: Box<[u64]> — allocate-once, never
+            // grow. `vec![...].into_boxed_slice()` produces an
+            // exactly-sized heap allocation with no spare capacity.
+            tx_submit_ns: vec![TX_SIDECAR_UNSTAMPED; total_frames as usize].into_boxed_slice(),
             pending_neigh: VecDeque::with_capacity(MAX_PENDING_NEIGH),
             scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
             scratch_rst_teardowns: Vec::with_capacity(16),
