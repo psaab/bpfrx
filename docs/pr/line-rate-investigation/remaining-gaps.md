@@ -5,13 +5,40 @@ issues #799, #800 closed.
 
 ## Stated target
 
-`iperf3 -c 172.16.80.200 -P 16 -t 60 -p 5201` (both directions) on
-the `loss-userspace` test cluster (mlx5 25 Gbps):
+`iperf3 -c 172.16.80.200 -P 16 -t 60 -p <port>` (both directions)
+on the `loss-userspace` test cluster (mlx5 25 Gbps) for **all four
+scheduled ports under the canonical CoS config**:
 
-- **≥ 24 Gbps SUM** (96 % of line) on BOTH directions
-- **≤ 100 retransmits** total over 16 flows in 60 s
-- **No regression** vs current Phase 3 MQFQ + D3 fairness (mean CoV
-  ~38 % on `iperf3 -P 12 -t 20 -p 5203`, 13 `mqfq_*` pins passing)
+| Port | CoS class    | Shaper | Line target per shaper |
+|------|--------------|--------|------------------------|
+| 5201 | iperf-a      | 1.0 G  | ≥ 0.96 Gbps            |
+| 5202 | iperf-b      | 10 G   | ≥ 9.6 Gbps             |
+| 5203 | iperf-c      | 25 G   | ≥ 24 Gbps              |
+| 5204 | best-effort  | 100 M  | ≥ 96 Mbps              |
+
+Canonical CoS config: stored in `docs/pr/line-rate-investigation/
+full-cos.set` (4 forwarding classes, strict scheduler-map,
+bandwidth-output filter with port-to-FC classification, 25 G
+shaping-rate on reth0 unit 80).
+
+**Validation matrix (MANDATORY):**
+
+8 runs total — for each of ports `5201/5202/5203/5204`:
+- `iperf3 -c 172.16.80.200 -P 16 -t60 -p <port>` (forward)
+- `iperf3 -c 172.16.80.200 -P 16 -t60 -p <port> -R` (reverse)
+
+Success criteria for each cell:
+- Mean SUM ≥ 0.96 × shaper rate for that port
+- ≤ 100 retransmits over the 60 s window
+- Fairness (per-flow CoV) not regressed vs the Phase 3 baseline on
+  that shaper (baseline measured separately per shaper rate —
+  tighter shapers have tighter CoV expectations)
+
+Additional regression gates (unchanged from prior plan):
+- 13 `mqfq_*` pins passing
+- `flow_steer_*` pins passing
+- D3 knob semantics still work
+- Forwarding healthy (ping, smoke iperf3) throughout
 
 ## What landed this session
 
