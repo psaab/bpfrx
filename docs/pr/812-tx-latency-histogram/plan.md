@@ -14,7 +14,7 @@
 >   evidence on host + target VM, seccomp remediation documented) and
 >   `evidence/vdso_evidence.md`. Choice: option (a) + (c) — we verified
 >   VDSO is live on the deploy VM via `strace` (host) + `AT_SYSINFO_EHDR`
->   + `/proc/self/maps` (`bpfrx-fw0`), AND we document the explicit
+>   + `/proc/self/maps` (`xpf-userspace-fw0`), AND we document the explicit
 >   dependency on the kernel/glibc/seccomp shape in the plan, with a
 >   named remediation path if a future deployment blocks VDSO.
 > - HIGH #2 — 1% skew tolerance had no test pin AND Bonferroni at α/36
@@ -490,7 +490,7 @@ proportional response.
 
 1. `evidence/vdso_probe.c` — tight loop of 10 000
    `clock_gettime(CLOCK_MONOTONIC)` calls. Built on the build host
-   `packet` (Linux 6.18.5, Debian glibc 2.42) and run under
+   `packet` (Linux 6.18.5, Debian glibc 2.42-14) and run under
    `strace -e clock_gettime`:
 
    ```text
@@ -506,8 +506,8 @@ proportional response.
 
 2. `evidence/vdso_probe2.c` — checks `getauxval(AT_SYSINFO_EHDR)` and
    dumps `/proc/self/maps | grep vdso`. Pushed as a static binary to
-   the deploy VM `bpfrx-fw0` (Linux 6.18.15, Debian glibc 2.42) and
-   run in place. Captured in `evidence/vm_bpfrx_fw0.txt`:
+   the deploy VM `xpf-userspace-fw0` (Linux 7.0.0-rc7+, Debian glibc 2.42-14) and
+   run in place. Captured in `evidence/vm_xpf_userspace_fw0.txt`:
 
    ```text
    AT_SYSINFO_EHDR = 0x7fa6efce0000
@@ -527,7 +527,7 @@ proportional response.
 **Documented dependency + remediation.** The VDSO fast path requires:
 (i) `[vdso]` mapped into the process (kernel-controlled, default on
 Linux x86_64/aarch64); (ii) glibc ≥ 2.14 compiled with VDSO support
-(Debian glibc 2.42 qualifies); (iii) no seccomp filter blocking
+(Debian glibc 2.42-14 qualifies); (iii) no seccomp filter blocking
 `clock_gettime`. If any deployment blocks (iii), the daemon does not
 crash — `monotonic_nanos()` already returns 0 on syscall failure
 (`neighbor.rs:8-10`) and the §5.4 sentinel rule skips the sample.
@@ -841,10 +841,10 @@ Non-negotiables that must not drift. Any violation = block merge.
 
 1. **Hot path: no new lock, no new heap allocation, no new syscall per packet.**
    - `clock_gettime(CLOCK_MONOTONIC)` resolves through VDSO (user-space)
-     on the declared deployment (Debian trixie, glibc 2.42, Linux 6.18
+     on the declared deployment (Debian trixie, glibc 2.42-14, Linux 6.18
      kernel). **Proven**, not assumed — see §3.4a and
      `evidence/vdso_evidence.md` for the strace (host) +
-     `AT_SYSINFO_EHDR` (`bpfrx-fw0` VM) captures. If a future
+     `AT_SYSINFO_EHDR` (`xpf-userspace-fw0` VM) captures. If a future
      deployment installs a seccomp profile that blocks
      `clock_gettime`, the helper degrades to a 0-return and the
      sidecar sentinel drops the sample (§5.4 / §6.1 test #5);

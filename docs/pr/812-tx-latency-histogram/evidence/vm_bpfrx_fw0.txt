@@ -1,4 +1,0 @@
-AT_SYSINFO_EHDR = 0x7fa6efce0000
-clock_gettime OK: tv_sec=1821541 tv_nsec=689011506
----maps---
-7fea2ae03000-7fea2ae05000 r-xp 00000000 00:00 0                          [vdso]

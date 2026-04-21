@@ -20,9 +20,9 @@ The probes are checked into `docs/pr/812-tx-latency-histogram/evidence/`:
 | Where | Kernel | glibc |
 |---|---|---|
 | Build host (`packet`) | Linux 6.18.5+deb14-amd64 | `Debian GLIBC 2.42-11+b1` |
-| Deploy VM (`bpfrx-fw0`) | Linux 6.18.15+deb14-amd64 | `Debian GLIBC 2.42-13` |
+| Deploy VM (`xpf-userspace-fw0`) | Linux 7.0.0-rc7+ | `Debian GLIBC 2.42-14` |
 
-Both are Debian trixie with glibc 2.42 and a kernel in the 6.18 series.
+Both are Debian trixie with glibc 2.42-14 and a kernel in the 6.18 series.
 x86_64 VDSO resolution for `__vdso_clock_gettime` has been unconditional
 on glibc since the mid-2.x series and has been a fast-path on Linux x86_64
 since kernel 2.6.24. aarch64 gained the same VDSO accelerator in glibc 2.33.
@@ -60,7 +60,7 @@ ELF header the kernel mapped into the process at `execve` time. Zero
 means the kernel chose not to map VDSO (typical under seccomp profiles
 that drop it or `CONFIG_COMPAT_VDSO=n` builds).
 
-Command on `bpfrx-fw0`:
+Command on `xpf-userspace-fw0`:
 
 ```console
 $ /tmp/vdso_probe2
@@ -122,5 +122,5 @@ today's baseline.
 - `docs/pr/812-tx-latency-histogram/evidence/strace_host.txt` (raw strace
   output; empty `clock_gettime` line set — the file's mere presence is
   the evidence that strace saw zero syscalls)
-- `docs/pr/812-tx-latency-histogram/evidence/vm_bpfrx_fw0.txt` (VM run
+- `docs/pr/812-tx-latency-histogram/evidence/vm_xpf_userspace_fw0.txt` (VM run
   of `vdso_probe2` + `/proc/self/maps` grep)
