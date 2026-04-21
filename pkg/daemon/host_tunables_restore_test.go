@@ -16,10 +16,13 @@ import (
 	"testing"
 )
 
-// TestApplyStep0Tunables_OptInFalse_WritesNothing pins B1: the daemon
-// path MUST NOT invoke any host-scope write when claim_host_tunables is
-// false, even when governor + budget are explicitly set in config.
-func TestApplyStep0Tunables_OptInFalse_WritesNothing(t *testing.T) {
+// TestApplyStep0Tunables_OptInFalse_SkipsHostScope pins B1 (round 2):
+// the daemon path MUST NOT invoke any host-scope write (cpu governor,
+// netdev_budget) when claim_host_tunables is false, even when those
+// values are explicitly set in config. Coalescence writes are NOT
+// gated (they are interface-scoped, same blast radius as D3) — see
+// TestApplyStep0Tunables_OptInFalse_AppliesCoalescence for that path.
+func TestApplyStep0Tunables_OptInFalse_SkipsHostScope(t *testing.T) {
 	d := &Daemon{}
 	fs := newFakeHostFS()
 	fs.cpufreqPaths = []string{"/sys/cpu0/scaling_governor"}
@@ -30,7 +33,7 @@ func TestApplyStep0Tunables_OptInFalse_WritesNothing(t *testing.T) {
 		ethtoolC: map[string][]byte{"mlx0": []byte(mlx5CoalesceProbeAdaptiveOn)},
 	}
 
-	// claim=false, governor=performance, budget=600 → everything skipped.
+	// claim=false, governor=performance, budget=600 → host-scope skipped.
 	d.applyStep0TunablesWith(
 		true,         // userspaceDP
 		false,        // claimHostTunables — THE GATE
@@ -40,16 +43,100 @@ func TestApplyStep0Tunables_OptInFalse_WritesNothing(t *testing.T) {
 		fs, execer,
 	)
 
-	if len(fs.writes) != 0 {
-		t.Errorf("B1: writes occurred with claim=false: %v", fs.writes)
+	// Host-scope writes MUST NOT happen.
+	if _, ok := fs.writes["/sys/cpu0/scaling_governor"]; ok {
+		t.Errorf("B1: cpu governor write occurred with claim=false: %v", fs.writes)
 	}
-	for _, c := range execer.calls {
-		if len(c) > 0 && c[0] == "-C" {
-			t.Errorf("B1: ethtool -C with claim=false: %v", c)
-		}
+	if _, ok := fs.writes[sysctlPathNetdevBudget]; ok {
+		t.Errorf("B1: netdev_budget write occurred with claim=false: %v", fs.writes)
 	}
 	if d.priorTunablesActive {
 		t.Error("B1: priorTunablesActive must stay false when gated off")
+	}
+}
+
+// TestApplyStep0Tunables_OptInFalse_AppliesCoalescence pins the Codex
+// round-2 fix: coalescence is interface-scoped (same blast radius as
+// D3 RSS indirection) and MUST run regardless of claim-host-tunables.
+// The mlx5 adaptive-off win is the headline #801 result; keeping it
+// behind the opt-in gate would disable it by default for everyone.
+func TestApplyStep0Tunables_OptInFalse_AppliesCoalescence(t *testing.T) {
+	d := &Daemon{}
+	fs := newFakeHostFS()
+	execer := &fakeRSSExecutor{
+		drivers:  map[string]string{"mlx0": "mlx5_core"},
+		ethtoolC: map[string][]byte{"mlx0": []byte(mlx5CoalesceProbeAdaptiveOn)},
+	}
+
+	// claim=false + userspaceDP=true → coalescence still runs.
+	d.applyStep0TunablesWith(
+		true,  // userspaceDP
+		false, // claimHostTunables OFF
+		"", 0, // host-scope values irrelevant
+		false, false, 8, 8,
+		[]string{"mlx0"},
+		fs, execer,
+	)
+
+	// ethtool -C mlx0 adaptive-rx off adaptive-tx off rx-usecs 8 tx-usecs 8
+	sawWrite := false
+	for _, c := range execer.calls {
+		if len(c) < 2 || c[0] != "-C" || c[1] != "mlx0" {
+			continue
+		}
+		kv := map[string]string{}
+		for i := 2; i+1 < len(c); i += 2 {
+			kv[c[i]] = c[i+1]
+		}
+		if kv["adaptive-rx"] == "off" && kv["adaptive-tx"] == "off" &&
+			kv["rx-usecs"] == "8" && kv["tx-usecs"] == "8" {
+			sawWrite = true
+			break
+		}
+	}
+	if !sawWrite {
+		t.Errorf("coalescence-always-on: expected ethtool -C mlx0 adaptive-rx off ..., got %v", execer.calls)
+	}
+	// The capture must be live so shutdown-restore can revert.
+	if d.priorTunables == nil {
+		t.Fatal("coalescence-always-on: priorTunables must be allocated for capture")
+	}
+	if _, ok := d.priorTunables.mlx5Adaptive["mlx0"]; !ok {
+		t.Errorf("coalescence-always-on: want captured mlx0 state, got %v", d.priorTunables.mlx5Adaptive)
+	}
+	// priorTunablesActive is the host-scope opt-in flag — MUST stay
+	// false when the operator didn't claim.
+	if d.priorTunablesActive {
+		t.Error("priorTunablesActive must stay false when host-scope is gated off")
+	}
+}
+
+// TestApplyStep0Tunables_OptInFalse_Shutdown_RestoresCoalescence pins
+// the invariant that coalescence captures under the always-on path are
+// honored by shutdown-restore even when the host-scope claim was
+// never active.
+func TestApplyStep0Tunables_OptInFalse_Shutdown_RestoresCoalescence(t *testing.T) {
+	d := &Daemon{}
+	fs := newFakeHostFS()
+	execer := &fakeRSSExecutor{
+		drivers:  map[string]string{"mlx0": "mlx5_core"},
+		ethtoolC: map[string][]byte{"mlx0": []byte(mlx5CoalesceProbeAdaptiveOn)},
+	}
+
+	// Step 1: apply with claim=false — coalescence captures adaptive=on.
+	d.applyStep0TunablesWith(
+		true, false,
+		"", 0,
+		false, false, 8, 8,
+		[]string{"mlx0"},
+		fs, execer,
+	)
+	if d.priorTunables == nil || len(d.priorTunables.mlx5Adaptive) == 0 {
+		t.Fatal("setup: expected mlx5 capture after coalescence write")
+	}
+	st := d.priorTunables.mlx5Adaptive["mlx0"]
+	if !st.adaptiveRX || !st.adaptiveTX {
+		t.Fatalf("setup: expected captured adaptive=on, got %+v", st)
 	}
 }
 
@@ -104,11 +191,22 @@ func TestApplyStep0Tunables_OptInTrue_CapturesAndWrites(t *testing.T) {
 	}
 }
 
-// TestApplyStep0Tunables_OptInFlipsToFalse_RestoresPreXpfdValues pins
-// B2 restore: when claim_host_tunables flips true → false, every
-// captured value is written back. This is the semantic I1 pins: restore
-// reverts to the EXACT value xpfd read, not the kernel's compiled default.
-func TestApplyStep0Tunables_OptInFlipsToFalse_RestoresPreXpfdValues(t *testing.T) {
+// TestApplyStep0Tunables_OptInFlipsToFalse_RestoresHostScopeOnly pins
+// B2 restore (round-2 semantics split):
+//
+//   - Host-scope knobs (governor + netdev_budget) MUST be reverted
+//     when the claim flips true → false: the operator withdrew their
+//     consent to hold host-wide state.
+//   - Per-interface coalescence captures are RETAINED and the
+//     coalescence state stays applied: coalescence is interface-scoped
+//     and runs regardless of the opt-in. Reverting mlx5 on claim-flip
+//     would silently re-enable adaptive and regress the #801 win
+//     without the operator asking for it. Shutdown-restore is the
+//     correct place for coalescence revert.
+//
+// This is the semantic I1 pins: restore reverts to the EXACT value
+// xpfd read, not the kernel's compiled default.
+func TestApplyStep0Tunables_OptInFlipsToFalse_RestoresHostScopeOnly(t *testing.T) {
 	d := &Daemon{}
 	fs := newFakeHostFS()
 	fs.cpufreqPaths = []string{"/sys/cpu0/scaling_governor"}
@@ -136,7 +234,8 @@ func TestApplyStep0Tunables_OptInFlipsToFalse_RestoresPreXpfdValues(t *testing.T
 		t.Fatalf("setup: budget write failed: %v", fs.writes)
 	}
 
-	// Step 2: flip claim to false. Restore path runs.
+	// Step 2: flip claim to false. Host-scope restore runs;
+	// coalescence stays applied.
 	fs.writes = map[string]string{} // clear to isolate restore writes
 	fs.writeOrder = nil
 	execer.calls = nil
@@ -150,38 +249,48 @@ func TestApplyStep0Tunables_OptInFlipsToFalse_RestoresPreXpfdValues(t *testing.T
 		fs, execer,
 	)
 
-	// I1: restore wrote the pre-xpfd values exactly — NOT kernel default.
+	// I1: host-scope restore wrote the pre-xpfd values exactly.
 	if got := fs.writes["/sys/cpu0/scaling_governor"]; got != "schedutil" {
 		t.Errorf("I1 restore: want schedutil (pre-xpfd), got %q", got)
 	}
 	if got := fs.writes[sysctlPathNetdevBudget]; got != "450" {
 		t.Errorf("I1 restore: want 450 (operator pre-xpfd), got %q (should NOT be kernel default 300)", got)
 	}
-	// mlx5 restore: adaptive-rx/tx=on (pre-xpfd state from probe).
-	sawRestoreOn := false
+
+	// Coalescence MUST NOT be reverted on claim-flip — it is
+	// interface-scoped and the claim does not gate it. Any ethtool -C
+	// call at this point would be the coalescence write for the
+	// still-applied adaptive-off state (which is a no-op via the
+	// probe), not a restore to adaptive=on.
 	for _, c := range execer.calls {
-		if len(c) < 3 || c[0] != "-C" || c[1] != "mlx0" {
+		if len(c) < 2 || c[0] != "-C" || c[1] != "mlx0" {
 			continue
 		}
-		adapt := map[string]string{}
-		for i := 2; i < len(c)-1; i += 2 {
-			adapt[c[i]] = c[i+1]
+		kv := map[string]string{}
+		for i := 2; i+1 < len(c); i += 2 {
+			kv[c[i]] = c[i+1]
 		}
-		if adapt["adaptive-rx"] == "on" && adapt["adaptive-tx"] == "on" &&
-			adapt["rx-usecs"] == "8" && adapt["tx-usecs"] == "8" {
-			sawRestoreOn = true
+		if kv["adaptive-rx"] == "on" || kv["adaptive-tx"] == "on" {
+			t.Errorf("claim-flip must NOT re-enable adaptive coalescence: %v", c)
 		}
-	}
-	if !sawRestoreOn {
-		t.Errorf("I1 restore: want ethtool -C mlx0 adaptive-rx on adaptive-tx on rx-usecs 8 tx-usecs 8, got %v", execer.calls)
 	}
 
-	// Snapshot cleared.
+	// Host-scope snapshot cleared; coalescence capture retained so
+	// shutdown-restore can still revert it.
 	if d.priorTunablesActive {
-		t.Error("priorTunablesActive must be false after restore")
+		t.Error("priorTunablesActive must be false after host-scope restore")
 	}
-	if d.priorTunables != nil {
-		t.Error("priorTunables must be nil after restore")
+	if d.priorTunables == nil {
+		t.Fatal("priorTunables must still exist for coalescence capture")
+	}
+	if _, ok := d.priorTunables.mlx5Adaptive["mlx0"]; !ok {
+		t.Error("mlx5 capture must be retained across claim-flip")
+	}
+	if len(d.priorTunables.governors) != 0 {
+		t.Errorf("governor snapshot must be cleared on claim-flip, got %v", d.priorTunables.governors)
+	}
+	if d.priorTunables.budget != "" {
+		t.Errorf("budget snapshot must be cleared on claim-flip, got %q", d.priorTunables.budget)
 	}
 }
 

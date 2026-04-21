@@ -381,6 +381,28 @@ func applyHostTunables(governor string, budget int, fs hostTunableFS, capture *p
 // /etc/sysctl.d/99-xpf.conf before xpfd started, and xpfd later wrote
 // `powersave`, restore puts it back to `performance` (what was live
 // when xpfd saw it), not to the kernel's hardcoded default.
+//
+// Crash-persistence policy (Codex round-2): this struct lives ONLY
+// in memory on the Daemon. It is never written to disk. Rationale:
+//
+//   - The host-scope values (cpu governor, netdev_budget) are
+//     idempotent across daemon restarts — if xpfd crashes with
+//     governor=performance and netdev_budget=600, the next startup
+//     reads those xpfd-written values as "prior" and continues
+//     writing the same values. No drift, no surprise.
+//   - On crash-recovery, the "restore" path would revert to the
+//     xpfd-written value anyway (identity restore), so persisting
+//     the pre-xpfd snapshot buys nothing the operator didn't have
+//     before the crash.
+//   - Operators who need strict pre-xpfd recovery across crashes
+//     can write their intended values to /etc/sysctl.d/ or to a
+//     systemd ExecStartPre hook — those run before xpfd and are
+//     the canonical place for "this is my baseline" state.
+//
+// A persisted snapshot (option /run/xpf/priortunables.json) was
+// rejected because the write-on-first-apply cost + the extra
+// stat/load on startup exceeds the value we'd get from an
+// identity restore.
 type priorHostTunables struct {
 	// governors maps cpufreq scaling_governor path → original string
 	// (trim-space, no trailing newline). An empty map means the
@@ -471,15 +493,44 @@ func (p *priorHostTunables) captureMlx5Coalesce(iface string, s mlx5CoalesceStat
 // The mlx5 restore is delegated to applyCoalescence (via mlx5execer) to
 // reuse the ethtool -C code path. The governor + budget writes use the
 // host tunable FS directly because they are simple atomic file writes.
+//
+// Crash recovery (Codex round-2): priorTunables lives in memory only.
+// If xpfd crashes after writing host-scope knobs, the next startup
+// reads the xpfd-written values as "prior" (idempotent — the governor
+// and netdev_budget are stable across restarts so this is harmless).
+// This is a documented, deliberate simplification — a persisted
+// snapshot at /run/xpf/priortunables.json would add a write on every
+// first-apply for very little additional safety. Operators who need
+// strict pre-xpfd restore after a crash can write the intended values
+// to /etc/sysctl.d/ or to a systemd ExecStartPre.
 func restoreHostTunables(p *priorHostTunables, fs hostTunableFS, execer rssExecutor) {
 	if p == nil {
 		slog.Debug("linksetup: host tunables restore skip (no capture)")
 		return
 	}
+	restoreHostScopeTunables(p, fs)
+	// mlx5 adaptive + rx/tx-usecs. Reuse ethtool -C via the same
+	// executor used by applyCoalescenceOne.
+	for iface, s := range p.mlx5Adaptive {
+		restoreMlx5Coalesce(iface, s, execer)
+	}
+}
+
+// restoreHostScopeTunables writes only the host-scope captures
+// (cpu governor + netdev_budget) back to the kernel. Used when the
+// `claim-host-tunables` opt-in flips true → false without disabling
+// the rest of the dataplane: per-interface coalescence stays active,
+// so its captures are retained, but the operator has retracted their
+// consent to hold host-global knobs.
+//
+// Errors are logged and swallowed. Safe to call with a nil pointer
+// (no-op).
+func restoreHostScopeTunables(p *priorHostTunables, fs hostTunableFS) {
+	if p == nil {
+		return
+	}
 	// Governor: write each captured path only if its value is
-	// non-empty (skip sentinel). Empty means we captured a node xpfd
-	// did not actually write (defensive — should not happen in
-	// practice, since capture is gated on the write attempt).
+	// non-empty (skip sentinel).
 	restored := 0
 	for path, value := range p.governors {
 		if value == "" {
@@ -505,11 +556,6 @@ func restoreHostTunables(p *priorHostTunables, fs hostTunableFS, execer rssExecu
 			slog.Info("linksetup: netdev_budget restored to pre-xpfd value",
 				"value", p.budget)
 		}
-	}
-	// mlx5 adaptive + rx/tx-usecs. Reuse ethtool -C via the same
-	// executor used by applyCoalescenceOne.
-	for iface, s := range p.mlx5Adaptive {
-		restoreMlx5Coalesce(iface, s, execer)
 	}
 }
 

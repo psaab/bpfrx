@@ -6,7 +6,26 @@
 // priorTunables field so the same snapshot survives startup → commit →
 // disable → shutdown.
 //
-// Transition matrix (opt_in = claim-host-tunables):
+// # Scope split (Codex round-2 fix)
+//
+// Two separate blast radii travel through this file:
+//
+//  1. Host-scope knobs (cpu-governor, netdev_budget): these touch
+//     system-wide kernel state that every other workload on the host
+//     shares. They MUST stay behind the `claim-host-tunables` opt-in
+//     gate per the B1 finding — flipping the CPU governor or raising
+//     netdev_budget silently would violate D3's "only touch what xpfd
+//     owns" invariant.
+//
+//  2. Per-interface coalescence (ethtool -C adaptive / rx-usecs /
+//     tx-usecs): this is interface-scoped — same blast radius as D3's
+//     RSS indirection rewrite. The #801 Step-0 win (REV CoV
+//     7.68%→1.5% on mlx5 adaptive-off) lives entirely in this knob.
+//     It runs regardless of `claim-host-tunables` because the mlx5
+//     interface is already inside xpfd's zone model, identified via
+//     the same `UserspaceBoundLinuxInterfaces` allowlist D3 uses.
+//
+// Transition matrix for the host-scope knobs (opt_in = claim-host-tunables):
 //
 //	prior      new        action
 //	-------    -------    ----------------------------------------------
@@ -16,12 +35,9 @@
 //	true       false      restore (B2), discard snapshot
 //	(shutdown) *          restore (if active) on daemon Stop
 //
-// Per-iface coalescence rx-usecs/tx-usecs is always applied when
-// coalescence is configured — those stay bound to the mlx5 interface
-// allowlist and do not require opt-in. Only the host-scope flip
-// (adaptive on/off) is treated as a "host-scope" claim that requires
-// opt-in, because disabling adaptive across all mlx5 ports affects
-// latency-sensitive neighbours outside xpfd's zone model.
+// Coalescence (interface-scoped) runs on every apply with the same
+// allowlist, capturing its own pre-xpfd state for restore on explicit
+// adaptive re-enable or daemon shutdown.
 package daemon
 
 import (
@@ -54,6 +70,23 @@ func (d *Daemon) applyStep0Tunables(userspaceDP, claimHostTunables bool,
 // applyStep0TunablesWith is the injectable variant used by unit tests.
 // Production callers go through applyStep0Tunables (which pins the FS
 // + executor to the real implementations).
+//
+// The function runs two independent pipelines, deliberately NOT a
+// shared gate (Codex round-2 BLOCKER fix):
+//
+//   - Coalescence (interface-scoped): always runs for userspace-dp
+//     mlx5 interfaces on the `rssAllowed` allowlist, regardless of
+//     `claimHostTunables`. The mlx5 adaptive-off win is the headline
+//     #801 result and defaulting it off behind an opt-in gate would
+//     disable it for everyone who doesn't also opt into the
+//     host-scope knobs. Coalescence captures its own pre-xpfd state
+//     into `d.priorTunables.mlx5Adaptive` so shutdown-restore still
+//     reverts the interfaces xpfd touched.
+//
+//   - Host-scope knobs (cpu-governor, netdev_budget): gated by
+//     `claimHostTunables` per the B1 finding. Same state machine as
+//     before — capture/write on first claim, restore-on-disable when
+//     the opt-in flips back off.
 func (d *Daemon) applyStep0TunablesWith(userspaceDP, claimHostTunables bool,
 	governor string, netdevBudget int,
 	coalesceExplicit, coalesceEnable bool, coalesceRX, coalesceTX int,
@@ -65,42 +98,64 @@ func (d *Daemon) applyStep0TunablesWith(userspaceDP, claimHostTunables bool,
 	active := d.priorTunablesActive
 	d.priorTunablesMu.Unlock()
 
-	// Restore path: previously active, now disabled (or non-userspace).
-	// Must run BEFORE we possibly create a new priorTunables so two
-	// back-to-back apply calls with flipped opt-in don't lose state.
+	// Ensure a snapshot exists for coalescence capture even when the
+	// host-scope opt-in is off. The snapshot is the same struct used
+	// by the host-scope path; only the governors/budget sub-fields
+	// remain empty until (and unless) the operator opts in. This
+	// keeps shutdown-restore honest: interfaces xpfd touched are
+	// reverted even when cpu-governor/netdev_budget were never set.
+	if prior == nil {
+		prior = newPriorHostTunables()
+	}
+
+	// Coalescence always runs for userspace-dp deploys. Empty
+	// allowlist = no-op inside applyCoalescence. The allowlist is
+	// D3-scoped (UserspaceBoundLinuxInterfaces) so we never touch an
+	// mlx5 interface outside xpfd's zone model.
+	if userspaceDP {
+		applyCoalescence(coalesceEnable, coalesceRX, coalesceTX, rssAllowed, execer, prior)
+	}
+
+	// Host-scope restore path: previously claimed, now gated off.
+	// Restore only the host-scope fields (governors + budget); leave
+	// the mlx5Adaptive captures in place because coalescence is still
+	// active and those are the snapshots shutdown-restore relies on.
 	if active && (!userspaceDP || !claimHostTunables) {
-		slog.Info("linksetup: claim-host-tunables disabled, restoring pre-xpfd values")
-		restoreHostTunables(prior, fs, execer)
+		slog.Info("linksetup: claim-host-tunables disabled, restoring pre-xpfd host-scope values")
+		restoreHostScopeTunables(prior, fs)
 		d.priorTunablesMu.Lock()
-		d.priorTunables = nil
+		// Keep the snapshot object alive if coalescence just
+		// captured new mlx5 state; only clear host-scope fields.
+		prior.governors = map[string]string{}
+		prior.budget = ""
+		d.priorTunables = prior
+		// Claim is now off but coalescence may still have captures;
+		// keep priorTunablesActive aligned with claim state so the
+		// same restore path doesn't re-fire next reconcile.
 		d.priorTunablesActive = false
 		d.priorTunablesMu.Unlock()
-		// Per-iface rx-usecs/tx-usecs coalescence: this is part of
-		// the D3-scoped per-iface allowlist. When claim-host-tunables
-		// is OFF, we no longer touch any coalescence state at all
-		// (including rx-usecs), because setting rx-usecs without
-		// touching adaptive would still surface as an unexpected
-		// write to an mlx5 parameter the operator did not authorize.
-		// Interface-scoped is still host-visible: restore covered
-		// both flip + per-iface above.
-		return
-	}
-	// No-op path: never claimed, nothing to do.
-	if !userspaceDP || !claimHostTunables {
-		slog.Debug("linksetup: step0 host tunables skip (claim-host-tunables not set)",
-			"userspace_dp", userspaceDP, "claim", claimHostTunables)
 		return
 	}
 
-	// Claim path: snapshot + write. Allocate a snapshot if this is the
-	// first claimed apply; existing snapshots are reused so
-	// first-apply values survive every reconcile.
-	if !active {
-		prior = newPriorHostTunables()
+	// No-op host-scope path: never claimed, nothing to do there.
+	// Coalescence writes (if any) already happened above.
+	if !userspaceDP || !claimHostTunables {
+		slog.Debug("linksetup: step0 host-scope tunables skip (claim-host-tunables not set)",
+			"userspace_dp", userspaceDP, "claim", claimHostTunables)
+		// Persist the snapshot so coalescence captures survive across
+		// reconciles even when the operator never opts in.
+		d.priorTunablesMu.Lock()
+		d.priorTunables = prior
+		d.priorTunablesMu.Unlock()
+		return
 	}
+
+	// Claim path: snapshot + host-scope write. Host-scope snapshot
+	// fields may already be captured from a previous claimed apply;
+	// applyHostTunables's capture*() helpers are first-apply-wins so
+	// the reconcile case is safe.
 	gov, budget := resolvedHostTunables(governor, netdevBudget, true)
 	applyHostTunables(gov, budget, fs, prior)
-	applyCoalescence(coalesceEnable, coalesceRX, coalesceTX, rssAllowed, execer, prior)
 
 	d.priorTunablesMu.Lock()
 	d.priorTunables = prior
@@ -114,6 +169,13 @@ func (d *Daemon) applyStep0TunablesWith(userspaceDP, claimHostTunables bool,
 // preventing operators from being left with performance governor +
 // netdev_budget=600 after stopping the daemon.
 //
+// Covers both pipelines from applyStep0TunablesWith:
+//   - Host-scope (governor + netdev_budget): captured only when the
+//     claim-host-tunables opt-in was active. `active` flag tells us.
+//   - Per-interface coalescence (mlx5Adaptive map): captured any time
+//     coalescence ran, which is any userspace-dp start regardless of
+//     the opt-in gate (Codex round-2 fix).
+//
 // Best-effort: never returns an error. Safe to call when no tunable
 // was ever captured (no-op).
 func (d *Daemon) restoreStep0TunablesOnShutdown() {
@@ -124,10 +186,29 @@ func (d *Daemon) restoreStep0TunablesOnShutdown() {
 	d.priorTunablesActive = false
 	d.priorTunablesMu.Unlock()
 
-	if !active || prior == nil {
-		slog.Debug("shutdown: host tunables restore skip (never claimed)")
+	if prior == nil {
+		slog.Debug("shutdown: host tunables restore skip (no captures)")
 		return
 	}
-	slog.Info("shutdown: restoring host tunables to pre-xpfd values")
-	restoreHostTunables(prior, realHostTunableFS{}, realRSSExecutor{})
+	// Scope the log message to what we actually restore so operators
+	// can tell a coalescence-only revert from a full host-scope revert.
+	hasHostScope := active && (len(prior.governors) > 0 || prior.budget != "")
+	hasCoalesce := len(prior.mlx5Adaptive) > 0
+	if !hasHostScope && !hasCoalesce {
+		slog.Debug("shutdown: host tunables restore skip (empty captures)")
+		return
+	}
+	slog.Info("shutdown: restoring tunables to pre-xpfd values",
+		"host_scope", hasHostScope, "coalesce_ifaces", len(prior.mlx5Adaptive))
+	// Host-scope restore is gated on `active`: if the opt-in was
+	// already flipped off during runtime, we already restored those
+	// fields in applyStep0TunablesWith; running the write again would
+	// be a no-op but the map may also have been cleared on that path.
+	if active {
+		restoreHostScopeTunables(prior, realHostTunableFS{})
+	}
+	// Coalescence restore always runs when captures exist.
+	for iface, s := range prior.mlx5Adaptive {
+		restoreMlx5Coalesce(iface, s, realRSSExecutor{})
+	}
 }
