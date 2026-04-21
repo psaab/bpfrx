@@ -552,8 +552,11 @@ Z_nocos = 500 parks / s`. Rationale:
   aggregated per-tick expectation is `0.1–0.3` parks per tick,
   and the aggregated per-second rate is `100–300 / s`. The
   `Z_cos = 500 / s` threshold sits comfortably above that
-  envelope (≈1.7–5× headroom) and well below the 1000 / s
-  saturation bound.
+  envelope: headroom ratio = `500 / 300 = 1.67×` at the high end
+  of the expected range, `500 / 100 = 5×` at the low end (hence
+  the "≈1.7–5× headroom" wording). 1000 / s is ~2× the threshold
+  and would indicate runaway token starvation rather than the
+  expected healthy oscillation band.
 
 **Calibration-gap acknowledgement.** `Z_cos = 5 × Z_nocos` is a
 placeholder, not a calibrated value. It is reported in
@@ -575,7 +578,10 @@ shaped park rate is ≤ 100 / s per queue (plausible given tick
 period), `Z_cos = 500` gives expected FP ≪ 5 %. If real healthy
 shaped park rate is near 500 / s (oscillation amplitude larger
 than the rough analysis above), FP could exceed the ≤ 5 %
-target band; the k ≥ 3 multi-cell rule absorbs that risk.
+target band; the `k_B ≥ 2 of 4` multi-cell rule (§4.6) plus the
+§8 Z_cos re-calibration gate absorb that risk — no with-cos
+Verdict B action ships without re-derived Z_cos from Step 1
+data.
 
 *No-cos side FP.* Verified against the no-cos baseline where the
 park counter is structurally near-zero (no active token bucket
