@@ -759,11 +759,17 @@ Let:
   Conservative upper bound: `W_read ≤ 1 µs`.
 - `λ = per-worker completion rate`. Plan-wide steady-state is
   130 Kpps (§3.4). Peak observed on the cluster is 520 Kpps per
-  worker (= 4× steady-state headroom). Conservative upper bound:
-  `λ ≤ 1 Mpps` per worker.
-- `K_skew = ceil(λ × W_read) = ceil(1e6 × 1e-6) = 1` completion.
+  worker (= 4× steady-state headroom). A 2 Mpps per-worker case
+  corresponds to a hypothetical future workload (e.g., small-
+  packet forwarding at the full 25 Gbps line rate: 25 × 10^9 /
+  (8 × 64) ≈ 48.8 Mpps aggregate; at 4 workers = ~12.2 Mpps, or
+  ~2 Mpps per worker under single-direction load). Conservative
+  upper bound used here: `λ ≤ 2 Mpps` per worker — widened from
+  the earlier 1 Mpps to cover the small-packet case (Codex
+  round-3 finding).
+- `K_skew(λ = 2 Mpps) = ceil(2e6 × 1e-6) = 2` completions.
 
-**K_skew = 1 completion maximum**, derived — not assumed. At
+**K_skew = 2 completions maximum**, derived — not assumed. At
 C ≥ 1000 (roughly 8 ms of accumulated completions at 130 Kpps),
 `K_skew / C ≤ 0.1 %`. At C ≥ 10 000 (roughly 77 ms), `K_skew / C ≤
 0.01 %`. The 1% figure quoted in §8 is therefore loose by 2-3
@@ -775,8 +781,8 @@ corruption.
 reasons: (i) the derivation assumes `W_read ≤ 1 µs` but a scheduler
 preemption during the snapshot function can push the reader off-CPU
 for up to 4 ms on a non-RT kernel (CFS quantum); during that
-window the worker can post ~4 000 completions at 1 Mpps. 4 000 /
-C at C = 100 000 = 4% — still over the 1% gate but bounded within
+window the worker can post ~8 000 completions at 2 Mpps. 8 000 /
+C at C = 200 000 = 4 % — still over the 1 % gate but bounded within
 one order of magnitude. (ii) the 1% is an INTEGRATION-LEVEL gate
 that fires on a 60-second `iperf3 -P 16` run; over that duration
 C ≥ 10^7 and K_skew is vanishingly small. The gate is therefore
