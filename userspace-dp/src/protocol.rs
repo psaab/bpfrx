@@ -1307,8 +1307,16 @@ pub(crate) struct BindingStatus {
     pub dbg_tx_ring_full: u64,
     #[serde(rename = "dbg_sendto_enobufs", default)]
     pub dbg_sendto_enobufs: u64,
-    #[serde(rename = "dbg_pending_overflow", default)]
-    pub dbg_pending_overflow: u64,
+    // #804: split from the old conflated `dbg_pending_overflow`. Two
+    // distinct write-sites, two distinct wire keys. Pre-#804 snapshots
+    // will deserialize both as 0 (`default`), which is the right
+    // backward-compat behavior — the old field is no longer present on
+    // the wire and consumers that want totals across either path should
+    // sum the two explicitly.
+    #[serde(rename = "dbg_bound_pending_overflow", default)]
+    pub dbg_bound_pending_overflow: u64,
+    #[serde(rename = "dbg_cos_queue_overflow", default)]
+    pub dbg_cos_queue_overflow: u64,
     #[serde(rename = "rx_fill_ring_empty_descs", default)]
     pub rx_fill_ring_empty_descs: u64,
     #[serde(rename = "outstanding_tx", default)]
@@ -1326,8 +1334,16 @@ pub(crate) struct BindingStatus {
 /// the full operator rationale):
 /// - `dbg_tx_ring_full`: times the XSK TX ring producer returned 0 slots.
 /// - `dbg_sendto_enobufs`: kernel-side TX drop — TX kick returned ENOBUFS.
-/// - `dbg_pending_overflow`: drops from the `bound_pending` FIFO
-///   overflowing its soft cap.
+/// - `dbg_bound_pending_overflow` (#804): drops from the per-binding
+///   `bound_pending` FIFO (`pending_tx_local` / `pending_tx_prepared`)
+///   overflowing its soft cap. **This does not include CoS admission
+///   overflow** — those are counted separately below.
+/// - `dbg_cos_queue_overflow` (#804): drops from the class-of-service
+///   queue admission gate (`enqueue_cos_item`) when the CoS shaping
+///   path rejects the item. Pre-#804 builds conflated this with
+///   `bound_pending` overflow under the old `dbg_pending_overflow` wire
+///   key; the counter was split so operators can disambiguate shaping
+///   pressure from bound-pending pressure.
 /// - `rx_fill_ring_empty_descs`: kernel `xdp_statistics_v2` counter of
 ///   RX fill-ring starvation events.
 /// - `outstanding_tx`: accept-proxy for `completion_reap_max_batch` per
@@ -1337,11 +1353,26 @@ pub(crate) struct BindingStatus {
 ///   `pending_tx_local_overflow_drops`: operator-facing aggregate TX
 ///   drop attribution, re-surfaced here so the triage view does not
 ///   require a second join against `BindingStatus`.
+///
+/// ## Wire-compat
+///
+/// The split is not wire-compatible on the daemon→operator boundary —
+/// we removed the old `dbg_pending_overflow` wire key rather than keep
+/// it aliased, because the whole point of the split is to stop
+/// operators reading a conflated number. On the helper→daemon boundary
+/// both new fields carry `serde(default)` so a helper that pre-dates
+/// this split (no fields present) deserializes as zero rather than
+/// refusing the message.
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct BindingCountersSnapshot {
     #[serde(rename = "worker_id")]
     pub worker_id: u32,
-    #[serde(default)]
+    // #804: explicit rename matches the other fields on this struct
+    // (defensive — default serde field→key mapping is identity, but
+    // making it explicit here prevents a rename of the Rust field name
+    // from silently renaming the wire key and breaking the Go
+    // consumer).
+    #[serde(rename = "ifindex", default)]
     pub ifindex: i32,
     #[serde(rename = "queue_id")]
     pub queue_id: u32,
@@ -1349,8 +1380,13 @@ pub(crate) struct BindingCountersSnapshot {
     pub dbg_tx_ring_full: u64,
     #[serde(rename = "dbg_sendto_enobufs", default)]
     pub dbg_sendto_enobufs: u64,
-    #[serde(rename = "dbg_pending_overflow", default)]
-    pub dbg_pending_overflow: u64,
+    // #804: split wire keys — `default` on both so a helper snapshot
+    // that pre-dates the split (field absent on the wire) deserializes
+    // as 0 rather than failing.
+    #[serde(rename = "dbg_bound_pending_overflow", default)]
+    pub dbg_bound_pending_overflow: u64,
+    #[serde(rename = "dbg_cos_queue_overflow", default)]
+    pub dbg_cos_queue_overflow: u64,
     #[serde(rename = "rx_fill_ring_empty_descs", default)]
     pub rx_fill_ring_empty_descs: u64,
     #[serde(rename = "outstanding_tx", default)]
@@ -1363,19 +1399,20 @@ pub(crate) struct BindingCountersSnapshot {
     pub pending_tx_local_overflow_drops: u64,
 }
 
-impl BindingCountersSnapshot {
-    /// #802: projection from a full `BindingStatus` into the focused
-    /// ring-pressure view. Used by `refresh_status` so the daemon's
-    /// poll path can pick up the triage counters without re-scanning
-    /// every field of `BindingStatus`.
-    pub(crate) fn from_binding_status(b: &BindingStatus) -> Self {
+// #804: was `impl BindingCountersSnapshot { fn from_binding_status(...) }`.
+// Switched to the idiomatic `From` impl so the projection composes with
+// iterator adaptors (`.map(BindingCountersSnapshot::from)`) and any
+// future `into()` callsites get the conversion for free.
+impl From<&BindingStatus> for BindingCountersSnapshot {
+    fn from(b: &BindingStatus) -> Self {
         Self {
             worker_id: b.worker_id,
             ifindex: b.ifindex,
             queue_id: b.queue_id,
             dbg_tx_ring_full: b.dbg_tx_ring_full,
             dbg_sendto_enobufs: b.dbg_sendto_enobufs,
-            dbg_pending_overflow: b.dbg_pending_overflow,
+            dbg_bound_pending_overflow: b.dbg_bound_pending_overflow,
+            dbg_cos_queue_overflow: b.dbg_cos_queue_overflow,
             rx_fill_ring_empty_descs: b.rx_fill_ring_empty_descs,
             outstanding_tx: b.outstanding_tx,
             tx_errors: b.tx_errors,

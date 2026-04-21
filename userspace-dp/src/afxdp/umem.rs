@@ -951,7 +951,21 @@ pub(super) struct BindingLiveState {
     /// read-side publish sink.
     pub(super) dbg_tx_ring_full: AtomicU64,
     pub(super) dbg_sendto_enobufs: AtomicU64,
-    pub(super) dbg_pending_overflow: AtomicU64,
+    /// #802/#804: per-binding `bound_pending` FIFO overflow counter —
+    /// incremented when `bound_pending_tx_local`/`bound_pending_tx_prepared`
+    /// evict an item because the FIFO is above `max_pending_tx`. This is
+    /// strictly the bound-pending path; the class-of-service admission
+    /// overflow has its own counter below. Pre-#804 builds published a
+    /// single `dbg_pending_overflow` that conflated the two sites; that
+    /// wire key was removed in #804 in favor of the split names.
+    pub(super) dbg_bound_pending_overflow: AtomicU64,
+    /// #804: class-of-service queue admission overflow counter —
+    /// incremented in `enqueue_cos_item()` when the CoS admission gate
+    /// rejects the item (flow-share cap + buffer cap exhausted) but the
+    /// caller still needs to account the drop. Separate from
+    /// `dbg_bound_pending_overflow` so operators can disambiguate
+    /// bound-pending pressure from CoS shaping pressure at triage time.
+    pub(super) dbg_cos_queue_overflow: AtomicU64,
     /// #802: kernel XDP statistics v2 `rx_fill_ring_empty_descs` — the
     /// kernel's native cumulative counter of RX fill-ring starvation
     /// events. Published via `store()` (not fetch_add) because the
@@ -1058,7 +1072,8 @@ impl BindingLiveState {
             // published by the worker's per-second debug tick.
             dbg_tx_ring_full: AtomicU64::new(0),
             dbg_sendto_enobufs: AtomicU64::new(0),
-            dbg_pending_overflow: AtomicU64::new(0),
+            dbg_bound_pending_overflow: AtomicU64::new(0),
+            dbg_cos_queue_overflow: AtomicU64::new(0),
             rx_fill_ring_empty_descs: AtomicU64::new(0),
             last_heartbeat: AtomicU64::new(0),
             max_pending_tx: AtomicU32::new(0),
@@ -1291,7 +1306,8 @@ impl BindingLiveState {
             // load-bearing synchronization.
             dbg_tx_ring_full: self.dbg_tx_ring_full.load(Ordering::Relaxed),
             dbg_sendto_enobufs: self.dbg_sendto_enobufs.load(Ordering::Relaxed),
-            dbg_pending_overflow: self.dbg_pending_overflow.load(Ordering::Relaxed),
+            dbg_bound_pending_overflow: self.dbg_bound_pending_overflow.load(Ordering::Relaxed),
+            dbg_cos_queue_overflow: self.dbg_cos_queue_overflow.load(Ordering::Relaxed),
             rx_fill_ring_empty_descs: self.rx_fill_ring_empty_descs.load(Ordering::Relaxed),
             last_heartbeat: monotonic_timestamp_to_datetime(
                 self.last_heartbeat.load(Ordering::Relaxed),

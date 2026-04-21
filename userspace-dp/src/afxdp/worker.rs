@@ -67,7 +67,17 @@ pub(crate) struct BindingWorker {
     pub(crate) dbg_sendto_err: u64,        // sendto returned error (non-EAGAIN/ENOBUFS)
     pub(crate) dbg_sendto_eagain: u64,     // sendto returned EAGAIN/EWOULDBLOCK
     pub(crate) dbg_sendto_enobufs: u64,    // sendto returned ENOBUFS (kernel TX drop)
-    pub(crate) dbg_pending_overflow: u64,  // drops from bound_pending overflow
+    // #802/#804: per-binding bound-pending FIFO overflow — incremented at
+    // the `bound_pending_tx_local`/`bound_pending_tx_prepared` evict
+    // sites only. Pre-#804 this counter was named `dbg_pending_overflow`
+    // and also doubled as the CoS admission overflow accumulator; the
+    // two semantics are now tracked on separate fields so operators can
+    // tell which path is dropping.
+    pub(crate) dbg_bound_pending_overflow: u64,
+    // #804: per-binding class-of-service queue admission overflow —
+    // incremented in `enqueue_cos_item()` when the CoS admission gate
+    // rejects the item.
+    pub(crate) dbg_cos_queue_overflow: u64,
     pub(crate) dbg_tx_tcp_rst: u64,        // TCP RST packets transmitted
     // Ring diagnostics — raw values from xsk_ffi API
     pub(crate) dbg_rx_avail_nonzero: u64, // times rx.available() > 0
@@ -337,7 +347,8 @@ impl BindingWorker {
             dbg_sendto_err: 0,
             dbg_sendto_eagain: 0,
             dbg_sendto_enobufs: 0,
-            dbg_pending_overflow: 0,
+            dbg_bound_pending_overflow: 0,
+            dbg_cos_queue_overflow: 0,
             dbg_tx_tcp_rst: 0,
             dbg_rx_avail_nonzero: 0,
             dbg_rx_avail_max: 0,
@@ -993,7 +1004,7 @@ pub(crate) fn worker_loop(
                     }
                     let _ = write!(
                         binding_summary,
-                        " TX:ring_sub={}/ring_full={}/compl={}/sendto={}/err={}/eagain={}/enobufs={}/overflow={}",
+                        " TX:ring_sub={}/ring_full={}/compl={}/sendto={}/err={}/eagain={}/enobufs={}/bp_overflow={}/cos_overflow={}",
                         b.dbg_tx_ring_submitted,
                         b.dbg_tx_ring_full,
                         b.dbg_completions_reaped,
@@ -1001,7 +1012,8 @@ pub(crate) fn worker_loop(
                         b.dbg_sendto_err,
                         b.dbg_sendto_eagain,
                         b.dbg_sendto_enobufs,
-                        b.dbg_pending_overflow,
+                        b.dbg_bound_pending_overflow,
+                        b.dbg_cos_queue_overflow,
                     );
                     #[cfg(feature = "debug-log")]
                     let _ = write!(binding_summary, "/rst={}", b.dbg_tx_tcp_rst);
@@ -1346,10 +1358,15 @@ pub(crate) fn worker_loop(
                             .dbg_sendto_enobufs
                             .fetch_add(b.dbg_sendto_enobufs, Ordering::Relaxed);
                     }
-                    if b.dbg_pending_overflow != 0 {
+                    if b.dbg_bound_pending_overflow != 0 {
                         b.live
-                            .dbg_pending_overflow
-                            .fetch_add(b.dbg_pending_overflow, Ordering::Relaxed);
+                            .dbg_bound_pending_overflow
+                            .fetch_add(b.dbg_bound_pending_overflow, Ordering::Relaxed);
+                    }
+                    if b.dbg_cos_queue_overflow != 0 {
+                        b.live
+                            .dbg_cos_queue_overflow
+                            .fetch_add(b.dbg_cos_queue_overflow, Ordering::Relaxed);
                     }
                     // #802: kernel xdp_statistics.rx_fill_ring_empty_descs is
                     // already absolute (kernel-cumulative), so publish with
@@ -1382,7 +1399,8 @@ pub(crate) fn worker_loop(
                     b.dbg_sendto_err = 0;
                     b.dbg_sendto_eagain = 0;
                     b.dbg_sendto_enobufs = 0;
-                    b.dbg_pending_overflow = 0;
+                    b.dbg_bound_pending_overflow = 0;
+                    b.dbg_cos_queue_overflow = 0;
                     #[cfg(feature = "debug-log")]
                     {
                         b.dbg_tx_tcp_rst = 0;
@@ -4164,7 +4182,9 @@ pub(crate) struct BindingLiveSnapshot {
     // atomics that are published by the worker's per-second debug tick.
     pub(crate) dbg_tx_ring_full: u64,
     pub(crate) dbg_sendto_enobufs: u64,
-    pub(crate) dbg_pending_overflow: u64,
+    // #802/#804: split — see `BindingLiveState` for write-site semantics.
+    pub(crate) dbg_bound_pending_overflow: u64,
+    pub(crate) dbg_cos_queue_overflow: u64,
     pub(crate) rx_fill_ring_empty_descs: u64,
     pub(crate) last_heartbeat: Option<chrono::DateTime<Utc>>,
     pub(crate) last_error: String,

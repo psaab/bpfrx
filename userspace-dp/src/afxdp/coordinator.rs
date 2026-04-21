@@ -1416,7 +1416,12 @@ impl Coordinator {
                 // `debug_outstanding_tx` for the operator-facing name.
                 binding.dbg_tx_ring_full = snap.dbg_tx_ring_full;
                 binding.dbg_sendto_enobufs = snap.dbg_sendto_enobufs;
-                binding.dbg_pending_overflow = snap.dbg_pending_overflow;
+                // #804: split counters — bound-pending FIFO vs CoS
+                // queue admission. Pre-#804 a single `dbg_pending_overflow`
+                // was published; the wire name was removed because
+                // the semantics were ambiguous for operators.
+                binding.dbg_bound_pending_overflow = snap.dbg_bound_pending_overflow;
+                binding.dbg_cos_queue_overflow = snap.dbg_cos_queue_overflow;
                 binding.rx_fill_ring_empty_descs = snap.rx_fill_ring_empty_descs;
                 binding.outstanding_tx = snap.debug_outstanding_tx;
                 binding.last_heartbeat = snap.last_heartbeat;
@@ -1502,7 +1507,8 @@ impl Coordinator {
                 // has no live state (unregistered slot).
                 binding.dbg_tx_ring_full = 0;
                 binding.dbg_sendto_enobufs = 0;
-                binding.dbg_pending_overflow = 0;
+                binding.dbg_bound_pending_overflow = 0;
+                binding.dbg_cos_queue_overflow = 0;
                 binding.rx_fill_ring_empty_descs = 0;
                 binding.outstanding_tx = 0;
                 binding.last_heartbeat = None;
@@ -2727,13 +2733,18 @@ mod tests {
         let live = BindingLiveState::new();
         live.dbg_tx_ring_full.store(11, Ordering::Relaxed);
         live.dbg_sendto_enobufs.store(13, Ordering::Relaxed);
-        live.dbg_pending_overflow.store(17, Ordering::Relaxed);
+        // #804: two distinct counters — bound-pending FIFO overflow
+        // (17) and CoS queue admission overflow (41). Non-coprime-prime
+        // per field so an accidental swap across the two is caught.
+        live.dbg_bound_pending_overflow.store(17, Ordering::Relaxed);
+        live.dbg_cos_queue_overflow.store(41, Ordering::Relaxed);
         live.rx_fill_ring_empty_descs.store(19, Ordering::Relaxed);
         live.debug_outstanding_tx.store(23, Ordering::Relaxed);
         let snap = live.snapshot();
         assert_eq!(snap.dbg_tx_ring_full, 11);
         assert_eq!(snap.dbg_sendto_enobufs, 13);
-        assert_eq!(snap.dbg_pending_overflow, 17);
+        assert_eq!(snap.dbg_bound_pending_overflow, 17);
+        assert_eq!(snap.dbg_cos_queue_overflow, 41);
         assert_eq!(snap.rx_fill_ring_empty_descs, 19);
         assert_eq!(snap.debug_outstanding_tx, 23);
     }

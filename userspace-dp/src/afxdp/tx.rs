@@ -154,7 +154,10 @@ pub(super) fn pending_tx_capacity(ring_entries: u32) -> usize {
 pub(super) fn bound_pending_tx_local(binding: &mut BindingWorker) {
     while binding.pending_tx_local.len() > binding.max_pending_tx {
         if binding.pending_tx_local.pop_front().is_some() {
-            binding.dbg_pending_overflow += 1;
+            // #804: bound-pending FIFO overflow — distinct from the CoS
+            // queue admission overflow counter. Keep this attribution
+            // precise so operators can tell which path is dropping.
+            binding.dbg_bound_pending_overflow += 1;
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
             // #710: dedicated drop-reason counter. Subset of tx_errors.
             binding
@@ -173,7 +176,10 @@ pub(super) fn bound_pending_tx_prepared(binding: &mut BindingWorker) {
     let limit = binding.max_pending_tx;
     while binding.pending_tx_prepared.len() > limit {
         if let Some(req) = binding.pending_tx_prepared.pop_front() {
-            binding.dbg_pending_overflow += 1;
+            // #804: bound-pending FIFO overflow (prepared side). Same
+            // semantic bucket as `bound_pending_tx_local` — internal
+            // prepared/local distinction is irrelevant to operators.
+            binding.dbg_bound_pending_overflow += 1;
             recycle_prepared_immediately(binding, &req);
             binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
             // #710: same drop category — prepared vs local FIFO is an
@@ -5397,7 +5403,12 @@ fn enqueue_cos_item(
             PreparedTxRecycle::FillOnSlot(_) => binding.free_tx_frames.push_back(offset),
         }
     }
-    binding.dbg_pending_overflow += 1;
+    // #804: CoS admission overflow — NOT bound-pending. Pre-#804 this
+    // site incremented `dbg_pending_overflow` which conflated it with
+    // the bound-pending FIFO evict sites; the two are now tracked on
+    // separate counters so operators can disambiguate CoS shaping
+    // pressure from bound-pending pressure.
+    binding.dbg_cos_queue_overflow += 1;
     binding.live.tx_errors.fetch_add(1, Ordering::Relaxed);
     binding.live.set_error(format!(
         "class-of-service queue overflow on ifindex {} queue {}",

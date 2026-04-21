@@ -803,7 +803,7 @@ fn refresh_status(state: &mut ServerState) {
         .status
         .bindings
         .iter()
-        .map(BindingCountersSnapshot::from_binding_status)
+        .map(BindingCountersSnapshot::from)
         .collect();
     state.status.recent_session_deltas = state.afxdp.recent_session_deltas();
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
@@ -1745,10 +1745,11 @@ mod tests {
 
     #[test]
     fn binding_counters_snapshot_projects_ring_pressure_fields() {
-        // #802: verify projection from BindingStatus into the focused
-        // BindingCountersSnapshot carries every ring-pressure field,
-        // plus the operator-facing TX drop trio re-surfaced for
-        // triage. Non-coprime-prime per field so an accidental
+        // #802/#804: verify projection from BindingStatus into the
+        // focused BindingCountersSnapshot carries every ring-pressure
+        // field (with the #804 split of bound-pending vs CoS queue
+        // overflow), plus the operator-facing TX drop trio re-surfaced
+        // for triage. Non-coprime-prime per field so an accidental
         // re-attribution across fields is caught.
         let binding = BindingStatus {
             slot: 0,
@@ -1757,7 +1758,8 @@ mod tests {
             ifindex: 12,
             dbg_tx_ring_full: 11,
             dbg_sendto_enobufs: 13,
-            dbg_pending_overflow: 17,
+            dbg_bound_pending_overflow: 17,
+            dbg_cos_queue_overflow: 41,
             rx_fill_ring_empty_descs: 19,
             outstanding_tx: 23,
             tx_errors: 29,
@@ -1765,13 +1767,18 @@ mod tests {
             pending_tx_local_overflow_drops: 37,
             ..Default::default()
         };
-        let snap = BindingCountersSnapshot::from_binding_status(&binding);
+        // #804: exercise the `impl From<&BindingStatus>` path. The old
+        // named `from_binding_status` was renamed to the idiomatic
+        // `From` impl so iterator adaptors and `into()` callsites get
+        // the conversion for free.
+        let snap = BindingCountersSnapshot::from(&binding);
         assert_eq!(snap.worker_id, 7);
         assert_eq!(snap.ifindex, 12);
         assert_eq!(snap.queue_id, 4);
         assert_eq!(snap.dbg_tx_ring_full, 11);
         assert_eq!(snap.dbg_sendto_enobufs, 13);
-        assert_eq!(snap.dbg_pending_overflow, 17);
+        assert_eq!(snap.dbg_bound_pending_overflow, 17);
+        assert_eq!(snap.dbg_cos_queue_overflow, 41);
         assert_eq!(snap.rx_fill_ring_empty_descs, 19);
         assert_eq!(snap.outstanding_tx, 23);
         assert_eq!(snap.tx_errors, 29);
@@ -1781,30 +1788,41 @@ mod tests {
 
     #[test]
     fn binding_counters_snapshot_serializes_with_expected_wire_keys() {
-        // #802: the daemon's poll path parses these JSON keys. Pin the
-        // wire names so a rename that breaks the consumer is caught at
-        // CI, not in the field.
+        // #802/#804: the daemon's poll path parses these JSON keys. Pin
+        // the wire names so a rename that breaks the consumer is caught
+        // at CI, not in the field. Uses `serde_json::Value` key
+        // introspection rather than substring matching so a key that
+        // happens to appear inside another field's string value does
+        // not accidentally pass the assertion (the original #802 test
+        // was flagged in round-1 review as brittle for exactly this
+        // reason).
         let snap = BindingCountersSnapshot {
             worker_id: 1,
             ifindex: 2,
             queue_id: 3,
             dbg_tx_ring_full: 4,
             dbg_sendto_enobufs: 5,
-            dbg_pending_overflow: 6,
+            dbg_bound_pending_overflow: 6,
+            dbg_cos_queue_overflow: 12,
             rx_fill_ring_empty_descs: 7,
             outstanding_tx: 8,
             tx_errors: 9,
             tx_submit_error_drops: 10,
             pending_tx_local_overflow_drops: 11,
         };
-        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        let value: serde_json::Value =
+            serde_json::to_value(&snap).expect("serialize snapshot to Value");
+        let obj = value
+            .as_object()
+            .expect("snapshot serializes as a JSON object");
         for key in [
             "worker_id",
             "ifindex",
             "queue_id",
             "dbg_tx_ring_full",
             "dbg_sendto_enobufs",
-            "dbg_pending_overflow",
+            "dbg_bound_pending_overflow",
+            "dbg_cos_queue_overflow",
             "rx_fill_ring_empty_descs",
             "outstanding_tx",
             "tx_errors",
@@ -1812,14 +1830,55 @@ mod tests {
             "pending_tx_local_overflow_drops",
         ] {
             assert!(
-                json.contains(&format!("\"{}\"", key)),
-                "wire key `{key}` missing from snapshot JSON: {json}"
+                obj.contains_key(key),
+                "wire key `{key}` missing from snapshot JSON object: {value}"
             );
         }
+        // #804: the pre-split `dbg_pending_overflow` wire key must not
+        // reappear — that was the conflation the split removed.
+        assert!(
+            !obj.contains_key("dbg_pending_overflow"),
+            "pre-split wire key `dbg_pending_overflow` unexpectedly present: {value}"
+        );
         // Round-trip: the daemon's JSON → Rust decode path must be
         // symmetric with the Rust encode path.
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
         let round: BindingCountersSnapshot =
             serde_json::from_str(&json).expect("deserialize snapshot");
         assert_eq!(round, snap);
+    }
+
+    #[test]
+    fn binding_counters_snapshot_tolerates_pre_split_wire() {
+        // #804: a helper snapshot that pre-dates the
+        // dbg_pending_overflow → {dbg_bound_pending_overflow,
+        // dbg_cos_queue_overflow} split must still deserialize — the
+        // two new fields should default to 0 rather than the decode
+        // failing. This is the compat contract the split relies on.
+        let legacy_json = r#"{
+            "worker_id": 1,
+            "ifindex": 2,
+            "queue_id": 3,
+            "dbg_tx_ring_full": 4,
+            "dbg_sendto_enobufs": 5,
+            "dbg_pending_overflow": 99,
+            "rx_fill_ring_empty_descs": 7,
+            "outstanding_tx": 8,
+            "tx_errors": 9,
+            "tx_submit_error_drops": 10,
+            "pending_tx_local_overflow_drops": 11
+        }"#;
+        let snap: BindingCountersSnapshot =
+            serde_json::from_str(legacy_json).expect("legacy snapshot decodes");
+        // The unknown legacy field is discarded; the two new fields
+        // default to 0 via `serde(default)`. Callers that need a total
+        // across either path must sum the two explicitly — there is no
+        // silent re-attribution of the legacy number to one bucket.
+        assert_eq!(snap.dbg_bound_pending_overflow, 0);
+        assert_eq!(snap.dbg_cos_queue_overflow, 0);
+        // Everything else round-trips as expected.
+        assert_eq!(snap.worker_id, 1);
+        assert_eq!(snap.dbg_tx_ring_full, 4);
+        assert_eq!(snap.rx_fill_ring_empty_descs, 7);
     }
 }
