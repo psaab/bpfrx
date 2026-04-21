@@ -91,3 +91,10 @@ Rust HIGH-1: CLOSED — The two new tests at `userspace-dp/src/afxdp/umem.rs:131
 Round 2 new findings (if any): None; the post-commit move does not add an extra submit-side clock read in the current code because each submit site still takes exactly one `monotonic_nanos()` per `writer.commit()`, and sidecar access remains single-owner userspace code via `&mut BindingWorker` / `Rc` ownership rather than a competing reader on the same slots.
 
 ROUND 2: MERGE NO
+
+## Round 3 verification
+
+HIGH-2: CLOSED — In `tx_latency_hist_cross_thread_snapshot_skew_within_bound`, the reader now runs `while !reader_stop.load(Ordering::Relaxed)` after warmup, the writer’s overlap phase likewise runs `while !writer_stop.load(Ordering::Relaxed)`, and the main thread ends that shared 200 ms window with `stop.store(true, Ordering::Relaxed)`, so the overlap is stop-flag-bounded rather than capped by the old fixed `for _ in 0..iterations`.
+Round 3 new findings (if any): None; after the fixed `for _ in 0..10_000u64` warmup the writer polls the same `AtomicBool` the reader polls, both threads are joined only after `stop.store(true, ...)`, and `Vec::with_capacity(16_384)` is only pre-allocation for a growable `Vec`, so this rewrite does not show a new obvious infinite-loop, missed-stop, or fixed-buffer-overflow path in the test code.
+
+ROUND 3: MERGE YES
