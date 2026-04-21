@@ -1,0 +1,50 @@
+[Tue Apr 21 08:45:45 2026] mlx5_core 0000:08:00.0 ge-0-0-1: Link up
+[Tue Apr 21 08:45:45 2026] 8021q: adding VLAN 0 to HW filter on device ge-0-0-1
+[Tue Apr 21 08:45:45 2026] mlx5_core 0000:08:00.0 mlx5_0: Port: 1 Link ACTIVE
+[Tue Apr 21 16:49:20 2026] net_ratelimit: 80 callbacks suppressed
+[Tue Apr 21 16:49:20 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2.80!
+[Tue Apr 21 16:49:20 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2.50!
+[Tue Apr 21 16:49:20 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address fe80::bf72:16:2 on ge-0-0-1!
+[Tue Apr 21 16:49:20 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2.80!
+[Tue Apr 21 16:49:20 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2.50!
+[Tue Apr 21 16:49:20 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address fe80::bf72:16:2 on ge-0-0-1!
+[Tue Apr 21 16:49:20 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2.80!
+[Tue Apr 21 16:49:20 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2.50!
+[Tue Apr 21 16:49:20 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address fe80::bf72:16:2 on ge-0-0-1!
+[Tue Apr 21 16:49:21 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2.80!
+[Tue Apr 21 16:49:26 2026] net_ratelimit: 112 callbacks suppressed
+[Tue Apr 21 16:49:26 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2!
+[Tue Apr 21 16:49:26 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2.50!
+[Tue Apr 21 16:49:26 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2.80!
+[Tue Apr 21 16:49:26 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address fe80::bf72:16:2 on ge-0-0-1!
+[Tue Apr 21 16:49:26 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2.80!
+[Tue Apr 21 16:49:26 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2!
+[Tue Apr 21 16:49:26 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2.50!
+[Tue Apr 21 16:49:26 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address fe80::bf72:16:2 on ge-0-0-1!
+[Tue Apr 21 16:49:26 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2!
+[Tue Apr 21 16:49:26 2026] ICMPv6: NA: 02:bf:72:16:01:01 advertised our address fe80::bf72:16:1 on ge-0-0-2.80!
+[Tue Apr 21 16:49:34 2026] 8021q: adding VLAN 0 to HW filter on device fab0
+[Tue Apr 21 16:49:35 2026] virtio_net virtio13 ge-0-0-0: single-buffer XDP requires MTU less than 3506
+[Tue Apr 21 16:49:37 2026] 8021q: adding VLAN 0 to HW filter on device em0
+[Tue Apr 21 16:49:38 2026] 8021q: adding VLAN 0 to HW filter on device fab1
+[Tue Apr 21 16:49:38 2026] 8021q: adding VLAN 0 to HW filter on device fxp0
+[Tue Apr 21 16:49:38 2026] 8021q: adding VLAN 0 to HW filter on device em0
+[Tue Apr 21 16:49:38 2026] 8021q: adding VLAN 0 to HW filter on device fab0
+[Tue Apr 21 16:49:38 2026] 8021q: adding VLAN 0 to HW filter on device fab1
+[Tue Apr 21 16:49:38 2026] 8021q: adding VLAN 0 to HW filter on device fxp0
+[Tue Apr 21 16:49:38 2026] mlx5_core 0000:08:00.0 mlx5_0: Port: 1 Link DOWN
+[Tue Apr 21 16:49:39 2026] mlx5_core 0000:08:00.0 ge-0-0-1: Link up
+[Tue Apr 21 16:49:39 2026] 8021q: adding VLAN 0 to HW filter on device ge-0-0-1
+[Tue Apr 21 16:49:39 2026] mlx5_core 0000:08:00.0 mlx5_0: Port: 1 Link ACTIVE
+[Tue Apr 21 16:54:08 2026] net_ratelimit: 22 callbacks suppressed
+[Tue Apr 21 16:54:08 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address 2001:559:8585:ef00::1 on ge-0-0-1!
+[Tue Apr 21 16:54:08 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address fe80::bf72:16:2 on ge-0-0-1!
+[Tue Apr 21 16:54:08 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address 2001:559:8585:ef00::1 on ge-0-0-1!
+[Tue Apr 21 16:54:08 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address fe80::bf72:16:2 on ge-0-0-1!
+[Tue Apr 21 17:27:49 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address 2001:559:8585:ef00::1 on ge-0-0-1!
+[Tue Apr 21 17:27:49 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address fe80::bf72:16:2 on ge-0-0-1!
+[Tue Apr 21 17:27:49 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address 2001:559:8585:ef00::1 on ge-0-0-1!
+[Tue Apr 21 17:27:49 2026] ICMPv6: NA: 02:bf:72:16:02:01 advertised our address fe80::bf72:16:2 on ge-0-0-1!
+[Tue Apr 21 18:36:00 2026] fab1 (unregistering): Released all slaves
+[Tue Apr 21 18:36:00 2026] 8021q: adding VLAN 0 to HW filter on device fab1
+[Tue Apr 21 18:36:01 2026] 8021q: adding VLAN 0 to HW filter on device fab1

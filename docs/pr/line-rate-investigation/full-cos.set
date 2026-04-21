@@ -42,7 +42,9 @@ set firewall family inet filter bandwidth-output term 2 then forwarding-class ip
 set firewall family inet filter bandwidth-output term 2 then count iperf-c
 set firewall family inet filter bandwidth-output term 2 then accept
 
+set firewall family inet filter bandwidth-output term 3 from destination-port 5204
 set firewall family inet filter bandwidth-output term 3 then forwarding-class best-effort
+set firewall family inet filter bandwidth-output term 3 then count best-effort
 set firewall family inet filter bandwidth-output term 3 then accept
 
 set interfaces reth0 unit 80 family inet filter output bandwidth-output

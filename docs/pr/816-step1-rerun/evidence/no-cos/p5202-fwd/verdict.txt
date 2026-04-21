@@ -1,0 +1,1 @@
+p5202-fwd-no-cos: D-escalate n_max=4 n_min=4 park_rate=0.00/s rate_spread=3.864 worst_ring_w=0@50% small_p99=20.195 large_p99=20.164 sum=21.700 retr=2689

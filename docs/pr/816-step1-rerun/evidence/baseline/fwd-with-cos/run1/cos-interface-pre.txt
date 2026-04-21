@@ -1,0 +1,25 @@
+Interface: reth0.80
+  Scheduler map:            bandwidth-limit
+  DSCP classifier:          -
+  IEEE 802.1 classifier:    -
+  DSCP rewrite-rule:        -
+  Shaping rate:             25.00 Gb/s
+  Burst size:               -
+  Output filter (inet):     bandwidth-output
+  Output filter (inet6):    bandwidth-output
+  Owner worker:             -
+  Runtime workers:          1
+  Runtime queues:           nonempty=0 runnable=0
+  Timer wheel sleepers:     level0=0 level1=0
+  Queues:
+    Queue  Owner  Class        Priority  Exact  Transmit rate  Buffer      Queued pkts  Queued bytes  Runnable  Parked  Next wake  Surplus deficit
+    0      0      best-effort  5         yes    100.00 Mb/s    122.07 KiB  0            -             0         0       -          -
+           Drops: flow_share=22  buffer=0  ecn_marked=3413
+           OwnerProfile: drain_p50=2us  drain_p99=8us  drain_invocations=42472
+           DrainShape:   sent_bytes=63343160  park_root=0  park_queue=81251
+    4      1      iperf-a      5         yes    1.00 Gb/s      1.19 MiB    0            -             0         0       -          -
+           Drops: flow_share=0  buffer=0  ecn_marked=0
+    5      2      iperf-b      5         yes    10.00 Gb/s     11.92 MiB   0            -             0         0       -          -
+           Drops: flow_share=0  buffer=0  ecn_marked=0
+    6      3      iperf-c      5         yes    25.00 Gb/s     29.80 MiB   0            -             0         0       -          -
+           Drops: flow_share=0  buffer=0  ecn_marked=0

@@ -1,0 +1,1 @@
+p5204-rev-with-cos: D-escalate n_max=4 n_min=4 park_rate=0.00/s rate_spread=1.766 worst_ring_w=0@50% small_p99=5.135 large_p99=5.474 sum=17.439 retr=335
