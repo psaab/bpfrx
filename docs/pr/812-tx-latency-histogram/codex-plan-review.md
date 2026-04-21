@@ -133,3 +133,12 @@ Round 3 new findings:
   - [LOW] Bucket-0 deferral is actually explicit now. §12 item 8 says "Resolved: explicitly out of scope for #812," cites §11.1/§11.3 R2, and states that verdict B lives in buckets 4-7, C in 8+, D1 in 3-6, D2 in 6-9, D3 in 14-15, with "no classifier statistic reads from bucket 0 at all." This closure is present.
 
 ROUND 3: plan-ready NO
+
+## Round 4 verification
+
+HIGH #2: PARTIAL — `ceil(2e6 × 1e-6) = 2` is correct, but the plan's own 64B/25Gbps/4-worker example implies `λ ≈ 3 Mpps` per worker, so the bound is still understated.
+`2e6 × 1e-6 = 2.0`, so `ceil(2.0) = 2`; on the arithmetic alone, the revised `K_skew = 2` step is correct. The remaining problem is the rate premise: the same paragraph says 25 Gbps at 64B is about 48.8 Mpps aggregate, then about 12.2 Mpps across 4 workers, which is about 3.05 Mpps per worker, not 2 Mpps, so `λ = 2 Mpps` is not the conservative ceiling the text claims. If the intended upper bound is the plan's own small-packet line-rate case, the defensible bound is `λ ≈ 3 Mpps`, giving `K_skew = ceil(3e6 × 1e-6) = 3`. On the off-CPU gate, `4 ms × 2 Mpps = 8000` and `8000/200000 = 4%`, so a 1% gate would trip on a snapshot-thread preemption if the denominator were only a 77 ms accumulation window; that is scheduling jitter, not bucket-accounting corruption, so it would be a false positive in that short-window regime. The gate only makes sense as an integration-level check when `count` is the full long-run total, where a one-off 4 ms preemption is diluted well below 1%.
+
+Round 4 new findings (if any): §11.3 still has the same structural problem from round 3: I do not see an "expected number of runs" formula in the current block-permutation text, and the specified D1/D2 cell statistics are whole-window mass ratios, so permuting 1-second blocks does not change them; the null is therefore degenerate or underspecified. The `const _ASSERT... = { const fn require_static_send<T: 'static + Send>() {} ... }` idiom is sound Rust for asserting `BindingCountersSnapshot: Send + 'static`, although it only proves those trait bounds, not every semantic ownership invariant.
+
+ROUND 4: plan-ready NO
