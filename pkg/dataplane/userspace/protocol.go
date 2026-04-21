@@ -423,6 +423,9 @@ type ProcessStatus struct {
 	Fabrics                []FabricSnapshot                  `json:"fabrics,omitempty"`
 	Queues                 []QueueStatus                     `json:"queues,omitempty"`
 	Bindings               []BindingStatus                   `json:"bindings,omitempty"`
+	// #802: focused per-binding ring-pressure view. Projected from
+	// Bindings by the Rust helper; parallel rather than replacement.
+	PerBinding             []BindingCountersSnapshot         `json:"per_binding,omitempty"`
 	RecentSessionDeltas    []SessionDeltaInfo                `json:"recent_session_deltas,omitempty"`
 	RecentExceptions       []ExceptionStatus                 `json:"recent_exceptions,omitempty"`
 	CoSInterfaces          []CoSInterfaceStatus              `json:"cos_interfaces,omitempty"`
@@ -653,9 +656,37 @@ type BindingStatus struct {
 	DebugPendingTXLocal               uint32    `json:"debug_pending_tx_local,omitempty"`
 	DebugOutstandingTX                uint32    `json:"debug_outstanding_tx,omitempty"`
 	DebugInFlightRecycles             uint32    `json:"debug_in_flight_recycles,omitempty"`
+	// #802: ring-pressure instrumentation mirror fields. See the Rust
+	// `BindingStatus` for semantics and write sites.
+	DbgTxRingFull                     uint64    `json:"dbg_tx_ring_full,omitempty"`
+	DbgSendtoENOBUFS                  uint64    `json:"dbg_sendto_enobufs,omitempty"`
+	DbgPendingOverflow                uint64    `json:"dbg_pending_overflow,omitempty"`
+	RxFillRingEmptyDescs              uint64    `json:"rx_fill_ring_empty_descs,omitempty"`
+	OutstandingTX                     uint32    `json:"outstanding_tx,omitempty"`
 	LastHeartbeat                     time.Time `json:"last_heartbeat,omitempty"`
 	LastError                         string    `json:"last_error,omitempty"`
 	LastChange                        time.Time `json:"last_change,omitempty"`
+}
+
+// BindingCountersSnapshot is the focused per-binding ring-pressure view
+// surfaced on ProcessStatus.PerBinding. It is a strict subset of
+// BindingStatus, emitted by the Rust helper so the daemon's poll path
+// can deserialize only the triage counters when that's all it needs.
+// See the Rust `BindingCountersSnapshot` definition for semantics.
+//
+// #802.
+type BindingCountersSnapshot struct {
+	WorkerID                       uint32 `json:"worker_id"`
+	Ifindex                        int    `json:"ifindex,omitempty"`
+	QueueID                        uint32 `json:"queue_id"`
+	DbgTxRingFull                  uint64 `json:"dbg_tx_ring_full,omitempty"`
+	DbgSendtoENOBUFS               uint64 `json:"dbg_sendto_enobufs,omitempty"`
+	DbgPendingOverflow             uint64 `json:"dbg_pending_overflow,omitempty"`
+	RxFillRingEmptyDescs           uint64 `json:"rx_fill_ring_empty_descs,omitempty"`
+	OutstandingTX                  uint32 `json:"outstanding_tx,omitempty"`
+	TXErrors                       uint64 `json:"tx_errors,omitempty"`
+	TxSubmitErrorDrops             uint64 `json:"tx_submit_error_drops,omitempty"`
+	PendingTxLocalOverflowDrops    uint64 `json:"pending_tx_local_overflow_drops,omitempty"`
 }
 
 type ExceptionStatus struct {

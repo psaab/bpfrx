@@ -1410,6 +1410,15 @@ impl Coordinator {
                 binding.debug_pending_tx_local = snap.debug_pending_tx_local;
                 binding.debug_outstanding_tx = snap.debug_outstanding_tx;
                 binding.debug_in_flight_recycles = snap.debug_in_flight_recycles;
+                // #802: ring-pressure counters — atomic mirrors of
+                // worker-local counters, published on the worker's
+                // per-second debug tick. `outstanding_tx` aliases
+                // `debug_outstanding_tx` for the operator-facing name.
+                binding.dbg_tx_ring_full = snap.dbg_tx_ring_full;
+                binding.dbg_sendto_enobufs = snap.dbg_sendto_enobufs;
+                binding.dbg_pending_overflow = snap.dbg_pending_overflow;
+                binding.rx_fill_ring_empty_descs = snap.rx_fill_ring_empty_descs;
+                binding.outstanding_tx = snap.debug_outstanding_tx;
                 binding.last_heartbeat = snap.last_heartbeat;
                 binding.last_error = snap.last_error;
                 binding.ready = binding.registered
@@ -1489,6 +1498,13 @@ impl Coordinator {
                 binding.debug_pending_tx_local = 0;
                 binding.debug_outstanding_tx = 0;
                 binding.debug_in_flight_recycles = 0;
+                // #802: ring-pressure counters — zero when the binding
+                // has no live state (unregistered slot).
+                binding.dbg_tx_ring_full = 0;
+                binding.dbg_sendto_enobufs = 0;
+                binding.dbg_pending_overflow = 0;
+                binding.rx_fill_ring_empty_descs = 0;
+                binding.outstanding_tx = 0;
                 binding.last_heartbeat = None;
                 binding.last_error.clear();
                 binding.ready = false;
@@ -2699,5 +2715,26 @@ mod tests {
             })
             .sum();
         assert_eq!(total, 15);
+    }
+
+    #[test]
+    fn ring_pressure_counters_round_trip_through_snapshot() {
+        // #802: verify that the new ring-pressure atomics on
+        // BindingLiveState are surfaced via `snapshot()`. Without this
+        // pin, a refactor that drops the new fields from `snapshot()`
+        // would silently zero the operator-facing counters.
+        use std::sync::atomic::Ordering;
+        let live = BindingLiveState::new();
+        live.dbg_tx_ring_full.store(11, Ordering::Relaxed);
+        live.dbg_sendto_enobufs.store(13, Ordering::Relaxed);
+        live.dbg_pending_overflow.store(17, Ordering::Relaxed);
+        live.rx_fill_ring_empty_descs.store(19, Ordering::Relaxed);
+        live.debug_outstanding_tx.store(23, Ordering::Relaxed);
+        let snap = live.snapshot();
+        assert_eq!(snap.dbg_tx_ring_full, 11);
+        assert_eq!(snap.dbg_sendto_enobufs, 13);
+        assert_eq!(snap.dbg_pending_overflow, 17);
+        assert_eq!(snap.rx_fill_ring_empty_descs, 19);
+        assert_eq!(snap.debug_outstanding_tx, 23);
     }
 }

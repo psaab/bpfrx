@@ -1327,6 +1327,48 @@ pub(crate) fn worker_loop(
                     dbg_fwd_tcp_zero_window = 0;
                 }
                 for b in bindings.iter_mut() {
+                    // #802: publish ring-pressure counters into BindingLiveState
+                    // BEFORE resetting the worker-local window. The worker-local
+                    // counters (b.dbg_tx_ring_full, etc.) are accumulated by the
+                    // hot path and reset each ~1s debug tick; without this
+                    // publish they'd never be visible outside the worker thread.
+                    // fetch_add is used because the atomic holds the cumulative
+                    // total while the local counter holds only the current
+                    // window. Relaxed is sufficient — diagnostic counters, no
+                    // synchronization contract.
+                    if b.dbg_tx_ring_full != 0 {
+                        b.live
+                            .dbg_tx_ring_full
+                            .fetch_add(b.dbg_tx_ring_full, Ordering::Relaxed);
+                    }
+                    if b.dbg_sendto_enobufs != 0 {
+                        b.live
+                            .dbg_sendto_enobufs
+                            .fetch_add(b.dbg_sendto_enobufs, Ordering::Relaxed);
+                    }
+                    if b.dbg_pending_overflow != 0 {
+                        b.live
+                            .dbg_pending_overflow
+                            .fetch_add(b.dbg_pending_overflow, Ordering::Relaxed);
+                    }
+                    // #802: kernel xdp_statistics.rx_fill_ring_empty_descs is
+                    // already absolute (kernel-cumulative), so publish with
+                    // store() not fetch_add. Sampling failures are silently
+                    // ignored — the atomic simply retains its last good value.
+                    if let Ok(stats) = b.device.statistics_v2() {
+                        b.live
+                            .rx_fill_ring_empty_descs
+                            .store(stats.rx_fill_ring_empty_descs, Ordering::Relaxed);
+                    }
+                    // #802: outstanding_tx is a transient gauge on BindingWorker
+                    // (current in-flight TX). Publish to the existing atomic
+                    // mirror on BindingLiveState so the snapshot reader sees
+                    // a recent value. store() because it's a gauge, not a
+                    // counter.
+                    b.live
+                        .debug_outstanding_tx
+                        .store(b.outstanding_tx, Ordering::Relaxed);
+
                     b.dbg_fill_submitted = 0;
                     b.dbg_fill_failed = 0;
                     b.dbg_poll_cycles = 0;
@@ -4118,6 +4160,12 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) debug_pending_tx_local: u32,
     pub(crate) debug_outstanding_tx: u32,
     pub(crate) debug_in_flight_recycles: u32,
+    // #802: ring-pressure snapshot fields. Mirrored from BindingLiveState
+    // atomics that are published by the worker's per-second debug tick.
+    pub(crate) dbg_tx_ring_full: u64,
+    pub(crate) dbg_sendto_enobufs: u64,
+    pub(crate) dbg_pending_overflow: u64,
+    pub(crate) rx_fill_ring_empty_descs: u64,
     pub(crate) last_heartbeat: Option<chrono::DateTime<Utc>>,
     pub(crate) last_error: String,
     // #709: owner-profile telemetry snapshot. Fixed-size arrays (no

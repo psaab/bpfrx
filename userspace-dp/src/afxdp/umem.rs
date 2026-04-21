@@ -941,6 +941,24 @@ pub(super) struct BindingLiveState {
     pub(super) debug_pending_tx_local: AtomicU32,
     pub(super) debug_outstanding_tx: AtomicU32,
     pub(super) debug_in_flight_recycles: AtomicU32,
+    /// #802: ring-pressure instrumentation. Cumulative monotonic counters
+    /// mirrored from the worker-local `BindingWorker` fields of the same
+    /// name. Worker increments `b.dbg_tx_ring_full += 1` (etc.) on the hot
+    /// path; the published value here is updated via `fetch_add(delta)`
+    /// at the existing ~1s debug-report tick, BEFORE the local counter is
+    /// reset for the next window. The control-socket snapshot reads from
+    /// these atomics. No hot-path code is touched — this is purely a new
+    /// read-side publish sink.
+    pub(super) dbg_tx_ring_full: AtomicU64,
+    pub(super) dbg_sendto_enobufs: AtomicU64,
+    pub(super) dbg_pending_overflow: AtomicU64,
+    /// #802: kernel XDP statistics v2 `rx_fill_ring_empty_descs` — the
+    /// kernel's native cumulative counter of RX fill-ring starvation
+    /// events. Published via `store()` (not fetch_add) because the
+    /// kernel-side value is already absolute. Sampled from
+    /// `device.statistics_v2()` at the same ~1s debug-report tick as
+    /// the local counters above.
+    pub(super) rx_fill_ring_empty_descs: AtomicU64,
     pub(super) last_heartbeat: AtomicU64,
     pub(super) max_pending_tx: AtomicU32,
     pub(super) last_error: Mutex<String>,
@@ -1036,6 +1054,12 @@ impl BindingLiveState {
             debug_pending_tx_local: AtomicU32::new(0),
             debug_outstanding_tx: AtomicU32::new(0),
             debug_in_flight_recycles: AtomicU32::new(0),
+            // #802: ring-pressure instrumentation sinks. Zero-init;
+            // published by the worker's per-second debug tick.
+            dbg_tx_ring_full: AtomicU64::new(0),
+            dbg_sendto_enobufs: AtomicU64::new(0),
+            dbg_pending_overflow: AtomicU64::new(0),
+            rx_fill_ring_empty_descs: AtomicU64::new(0),
             last_heartbeat: AtomicU64::new(0),
             max_pending_tx: AtomicU32::new(0),
             last_error: Mutex::new(String::new()),
@@ -1261,6 +1285,14 @@ impl BindingLiveState {
             debug_pending_tx_local: self.debug_pending_tx_local.load(Ordering::Relaxed),
             debug_outstanding_tx: self.debug_outstanding_tx.load(Ordering::Relaxed),
             debug_in_flight_recycles: self.debug_in_flight_recycles.load(Ordering::Relaxed),
+            // #802: ring-pressure counters published from the worker's
+            // periodic debug tick. Relaxed load is sufficient — these
+            // are monotonic diagnostic counters, not part of any
+            // load-bearing synchronization.
+            dbg_tx_ring_full: self.dbg_tx_ring_full.load(Ordering::Relaxed),
+            dbg_sendto_enobufs: self.dbg_sendto_enobufs.load(Ordering::Relaxed),
+            dbg_pending_overflow: self.dbg_pending_overflow.load(Ordering::Relaxed),
+            rx_fill_ring_empty_descs: self.rx_fill_ring_empty_descs.load(Ordering::Relaxed),
             last_heartbeat: monotonic_timestamp_to_datetime(
                 self.last_heartbeat.load(Ordering::Relaxed),
                 now_mono,

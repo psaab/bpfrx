@@ -151,6 +151,7 @@ fn run() -> Result<(), String> {
             route_entries: 0,
             worker_heartbeats: Vec::new(),
             cos_no_owner_binding_drops_total: 0,
+            per_binding: Vec::new(),
             ha_groups: Vec::new(),
             fabrics: Vec::new(),
             queues: Vec::new(),
@@ -795,6 +796,15 @@ fn refresh_status(state: &mut ServerState) {
             .iter()
             .all(|b| b.registered && b.armed);
     state.status.queues = summarize_queues(&state.status.bindings);
+    // #802: focused per-binding ring-pressure snapshot. Projected from
+    // the freshly-refreshed BindingStatus entries so this field tracks
+    // the same data source the richer `bindings[]` view exposes.
+    state.status.per_binding = state
+        .status
+        .bindings
+        .iter()
+        .map(BindingCountersSnapshot::from_binding_status)
+        .collect();
     state.status.recent_session_deltas = state.afxdp.recent_session_deltas();
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
     state.status.cos_interfaces = state.afxdp.cos_statuses();
@@ -1731,5 +1741,85 @@ mod tests {
         set_bindings_forwarding_armed(&mut status, false);
         assert!(!status.bindings[0].armed);
         assert!(!status.bindings[1].armed);
+    }
+
+    #[test]
+    fn binding_counters_snapshot_projects_ring_pressure_fields() {
+        // #802: verify projection from BindingStatus into the focused
+        // BindingCountersSnapshot carries every ring-pressure field,
+        // plus the operator-facing TX drop trio re-surfaced for
+        // triage. Non-coprime-prime per field so an accidental
+        // re-attribution across fields is caught.
+        let binding = BindingStatus {
+            slot: 0,
+            queue_id: 4,
+            worker_id: 7,
+            ifindex: 12,
+            dbg_tx_ring_full: 11,
+            dbg_sendto_enobufs: 13,
+            dbg_pending_overflow: 17,
+            rx_fill_ring_empty_descs: 19,
+            outstanding_tx: 23,
+            tx_errors: 29,
+            tx_submit_error_drops: 31,
+            pending_tx_local_overflow_drops: 37,
+            ..Default::default()
+        };
+        let snap = BindingCountersSnapshot::from_binding_status(&binding);
+        assert_eq!(snap.worker_id, 7);
+        assert_eq!(snap.ifindex, 12);
+        assert_eq!(snap.queue_id, 4);
+        assert_eq!(snap.dbg_tx_ring_full, 11);
+        assert_eq!(snap.dbg_sendto_enobufs, 13);
+        assert_eq!(snap.dbg_pending_overflow, 17);
+        assert_eq!(snap.rx_fill_ring_empty_descs, 19);
+        assert_eq!(snap.outstanding_tx, 23);
+        assert_eq!(snap.tx_errors, 29);
+        assert_eq!(snap.tx_submit_error_drops, 31);
+        assert_eq!(snap.pending_tx_local_overflow_drops, 37);
+    }
+
+    #[test]
+    fn binding_counters_snapshot_serializes_with_expected_wire_keys() {
+        // #802: the daemon's poll path parses these JSON keys. Pin the
+        // wire names so a rename that breaks the consumer is caught at
+        // CI, not in the field.
+        let snap = BindingCountersSnapshot {
+            worker_id: 1,
+            ifindex: 2,
+            queue_id: 3,
+            dbg_tx_ring_full: 4,
+            dbg_sendto_enobufs: 5,
+            dbg_pending_overflow: 6,
+            rx_fill_ring_empty_descs: 7,
+            outstanding_tx: 8,
+            tx_errors: 9,
+            tx_submit_error_drops: 10,
+            pending_tx_local_overflow_drops: 11,
+        };
+        let json = serde_json::to_string(&snap).expect("serialize snapshot");
+        for key in [
+            "worker_id",
+            "ifindex",
+            "queue_id",
+            "dbg_tx_ring_full",
+            "dbg_sendto_enobufs",
+            "dbg_pending_overflow",
+            "rx_fill_ring_empty_descs",
+            "outstanding_tx",
+            "tx_errors",
+            "tx_submit_error_drops",
+            "pending_tx_local_overflow_drops",
+        ] {
+            assert!(
+                json.contains(&format!("\"{}\"", key)),
+                "wire key `{key}` missing from snapshot JSON: {json}"
+            );
+        }
+        // Round-trip: the daemon's JSON → Rust decode path must be
+        // symmetric with the Rust encode path.
+        let round: BindingCountersSnapshot =
+            serde_json::from_str(&json).expect("deserialize snapshot");
+        assert_eq!(round, snap);
     }
 }
