@@ -136,3 +136,30 @@ engineering-style bar (see `docs/engineering-style.md`).
 **Crash persistence**: OPEN — the pre-xpfd snapshot lives only in `Daemon.priorTunables`, is created in memory on first claimed apply, and is cleared on restore/shutdown, with no persisted crash-recovery state in this flow. `pkg/daemon/daemon.go:265`, `pkg/daemon/daemon.go:271`, `pkg/daemon/host_tunables_daemon.go:98`, `pkg/daemon/host_tunables_daemon.go:105`, `pkg/daemon/host_tunables_daemon.go:119`, `pkg/daemon/host_tunables_daemon.go:123`
 
 ROUND 2: merge-ready NO — M2 evidence is still only partial, `claim-host-tunables=false` suppresses all coalescence writes, and crash recovery loses the original pre-xpfd snapshot.
+
+## Round 2 responses (commit-by-commit)
+
+### Coalescence-always-on (round-2 BLOCKER, fixed in `f277f60d`)
+
+`applyStep0TunablesWith` now runs coalescence on every userspace-dp
+apply regardless of `claim-host-tunables`. The opt-in gate still
+covers the host-scope knobs (cpu-governor + netdev_budget) because
+those touch shared-host state. Coalescence is interface-scoped — same
+blast radius as D3 RSS indirection — and uses the same
+`UserspaceBoundLinuxInterfaces` allowlist, so the #801 mlx5 win lands
+by default as intended. Shutdown-restore covers both pipelines
+independently. See `pkg/daemon/host_tunables_daemon.go` top-of-file
+comment for the scope split rationale.
+
+### Crash persistence (round-2 BLOCKER — accepted as documented)
+
+Option (b) from the Codex finding: `priorHostTunables` lives in memory
+only. Rationale documented on the struct itself
+(`pkg/daemon/host_tunables.go`): the host-scope values
+(cpu-governor, netdev_budget) are idempotent across daemon restarts,
+so a crash-recovery identity restore is harmless. A persisted
+snapshot at `/run/xpf/priortunables.json` was rejected because the
+first-apply write cost exceeds the marginal safety over the identity
+semantics we already get. Operators who need strict pre-xpfd
+recovery across crashes can set their values via `/etc/sysctl.d/` or
+systemd `ExecStartPre`.
