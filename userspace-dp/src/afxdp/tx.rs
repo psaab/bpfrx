@@ -1,5 +1,54 @@
 use super::*;
 
+/// #812: canonicalise a monotonic-clock reading into the sidecar
+/// value space. `monotonic_nanos()` returns 0 on clock-gettime
+/// failure (see `neighbor.rs:8-10`, the VDSO-blocked fallback path
+/// documented in plan §3.4a); canonicalising `0 → TX_SIDECAR_UNSTAMPED`
+/// keeps a true zero-time stamp from being confused with a
+/// legitimate measurement at reap time (plan §6.1 test #5).
+#[inline]
+fn canonical_submit_stamp(ts: u64) -> u64 {
+    if ts == 0 { TX_SIDECAR_UNSTAMPED } else { ts }
+}
+
+/// #812: stamp the submit-timestamp sidecar for the accepted prefix
+/// of the current TX batch. Called ONCE per `writer.commit()` at each
+/// of the six submit sites (plan §3.1 table) with the scratch
+/// offsets. Only the first `inserted` offsets are stamped; the retry
+/// tail (`scratch[inserted..]`) MUST NOT be stamped because those
+/// descriptors return to `free_tx_frames` and would otherwise produce
+/// phantom completions bucketed against a stale submit time.
+///
+/// Single-writer: the owner worker is the only thread that touches
+/// this sidecar (see plan §3.3 file citations: `WorkerUmem` is `Rc`
+/// at `umem.rs:16-18`, `free_tx_frames` is plain `VecDeque` at
+/// `worker.rs:16`). Plain slice-indexed store — no atomic, no grow.
+#[inline]
+pub(super) fn stamp_submits<I>(sidecar: &mut [u64], offsets: I, ts_submit: u64)
+where
+    I: Iterator<Item = u64>,
+{
+    // Canonicalise once per commit so every stamp in the batch shares
+    // a single fresh VDSO read — cheapest stamp cost (plan §3.4
+    // typical ~1.1 ns/packet at `inserted = 256`, ~16 ns/packet at
+    // `inserted = 1`).
+    let stamp = canonical_submit_stamp(ts_submit);
+    for offset in offsets {
+        let idx = (offset >> UMEM_FRAME_SHIFT) as usize;
+        if let Some(slot) = sidecar.get_mut(idx) {
+            *slot = stamp;
+        }
+        // Out-of-range offsets are silently dropped — the sidecar is
+        // sized to the binding's total frame count at construction,
+        // so an out-of-range index means either a frame from another
+        // UMEM (cross-binding redirect producing a stale offset —
+        // should never reach the TX writer for this binding) or a
+        // builder bug upstream. Either way, skipping the stamp keeps
+        // the hot path allocation-free and the histogram honest: the
+        // reap-time sentinel check drops the sample.
+    }
+}
+
 pub(super) fn reap_tx_completions(
     binding: &mut BindingWorker,
     shared_recycles: &mut Vec<(u32, u64)>,
@@ -1852,6 +1901,21 @@ fn service_exact_local_queue_direct(
         len: req.len,
         options: 0,
     }));
+    // #812: submit stamp. Plan §3.1 — fresh `monotonic_nanos()` after
+    // `insert` returns the accepted count and BEFORE `commit()` so the
+    // stamp captures the moment descriptors become kernel-visible. A
+    // reused caller `now_ns` would leak up to ~1 ms of worker-loop
+    // staleness into the measurement (plan §3.1 R1).
+    let ts_submit = monotonic_nanos();
+    stamp_submits(
+        &mut binding.tx_submit_ns,
+        binding
+            .scratch_exact_local_tx
+            .iter()
+            .take(inserted as usize)
+            .map(|req| req.offset),
+        ts_submit,
+    );
     writer.commit();
     drop(writer);
 
@@ -1971,6 +2035,18 @@ fn service_exact_local_queue_direct_flow_fair(
                 len: req.bytes.len() as u32,
                 options: 0,
             }),
+    );
+    // #812: submit stamp — see plan §3.1 submit-site table (this is
+    // the service_exact_local_queue_direct_flow_fair variant).
+    let ts_submit = monotonic_nanos();
+    stamp_submits(
+        &mut binding.tx_submit_ns,
+        binding
+            .scratch_local_tx
+            .iter()
+            .take(inserted as usize)
+            .map(|(offset, _)| *offset),
+        ts_submit,
     );
     writer.commit();
     drop(writer);
@@ -2109,6 +2185,18 @@ fn service_exact_prepared_queue_direct(
         len: req.len,
         options: 0,
     }));
+    // #812: submit stamp — plan §3.1 submit-site table (the
+    // service_exact_prepared_queue_direct variant).
+    let ts_submit = monotonic_nanos();
+    stamp_submits(
+        &mut binding.tx_submit_ns,
+        binding
+            .scratch_exact_prepared_tx
+            .iter()
+            .take(inserted as usize)
+            .map(|req| req.offset),
+        ts_submit,
+    );
     writer.commit();
     drop(writer);
 
@@ -2232,6 +2320,18 @@ fn service_exact_prepared_queue_direct_flow_fair(
         len: req.len,
         options: 0,
     }));
+    // #812: submit stamp — plan §3.1 submit-site table (the
+    // service_exact_prepared_queue_direct_flow_fair variant).
+    let ts_submit = monotonic_nanos();
+    stamp_submits(
+        &mut binding.tx_submit_ns,
+        binding
+            .scratch_prepared_tx
+            .iter()
+            .take(inserted as usize)
+            .map(|req| req.offset),
+        ts_submit,
+    );
     writer.commit();
     drop(writer);
 
@@ -5932,6 +6032,18 @@ pub(super) fn transmit_batch(
                 options: 0,
             }),
     );
+    // #812: submit stamp — plan §3.1 submit-site table
+    // (the post-CoS backup transmit_batch variant for local requests).
+    let ts_submit = monotonic_nanos();
+    stamp_submits(
+        &mut binding.tx_submit_ns,
+        binding
+            .scratch_local_tx
+            .iter()
+            .take(inserted as usize)
+            .map(|(offset, _)| *offset),
+        ts_submit,
+    );
     writer.commit();
     drop(writer);
 
@@ -6146,6 +6258,18 @@ fn transmit_prepared_queue(
         len: req.len,
         options: 0,
     }));
+    // #812: submit stamp — plan §3.1 submit-site table (the
+    // transmit_prepared_queue continuation variant).
+    let ts_submit = monotonic_nanos();
+    stamp_submits(
+        &mut binding.tx_submit_ns,
+        binding
+            .scratch_prepared_tx
+            .iter()
+            .take(inserted as usize)
+            .map(|req| req.offset),
+        ts_submit,
+    );
     writer.commit();
     drop(writer);
 
