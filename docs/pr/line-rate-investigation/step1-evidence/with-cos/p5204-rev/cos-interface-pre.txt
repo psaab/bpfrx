@@ -1,0 +1,30 @@
+Interface: reth0.80
+  Scheduler map:            bandwidth-limit
+  DSCP classifier:          -
+  IEEE 802.1 classifier:    -
+  DSCP rewrite-rule:        -
+  Shaping rate:             25.00 Gb/s
+  Burst size:               -
+  Output filter (inet):     bandwidth-output
+  Owner worker:             -
+  Runtime workers:          4
+  Runtime queues:           nonempty=0 runnable=0
+  Timer wheel sleepers:     level0=0 level1=0
+  Queues:
+    Queue  Owner  Class        Priority  Exact  Transmit rate  Buffer      Queued pkts  Queued bytes  Runnable  Parked  Next wake  Surplus deficit
+    0      0      best-effort  5         yes    100.00 Mb/s    122.07 KiB  0            -             0         0       -          -
+           Drops: flow_share=733  buffer=9572  ecn_marked=82652
+           OwnerProfile: drain_p50=2us  drain_p99=32us  drain_invocations=1262313
+           DrainShape:   sent_bytes=1930698531  park_root=0  park_queue=1930521
+    4      1      iperf-a      5         yes    1.00 Gb/s      1.19 MiB    0            -             0         0       -          -
+           Drops: flow_share=2302  buffer=0  ecn_marked=2819070
+           OwnerProfile: drain_p50=4us  drain_p99=16us  drain_invocations=10969905
+           DrainShape:   sent_bytes=68648319703  park_root=0  park_queue=10845884
+    5      2      iperf-b      5         yes    10.00 Gb/s     11.92 MiB   0            -             0         0       -          -
+           Drops: flow_share=0  buffer=0  ecn_marked=19434
+           OwnerProfile: drain_p50=8us  drain_p99=32us  drain_invocations=6466783
+           DrainShape:   sent_bytes=155511743057  park_root=0  park_queue=7748467
+    6      3      iperf-c      5         yes    25.00 Gb/s     29.80 MiB   0            -             0         0       -          -
+           Drops: flow_share=0  buffer=0  ecn_marked=0
+           OwnerProfile: drain_p50=32us  drain_p99=262us  drain_invocations=1903992
+           DrainShape:   sent_bytes=436345600317  park_root=0  park_queue=0

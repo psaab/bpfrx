@@ -1,0 +1,1 @@
+p5203-rev-with-cos: A n_max=6 n_min=0 park_rate=0.00/s rate_spread=2.409 worst_ring_w=0@50% small_p99=3.166 large_p99=3.177 sum=15.304 retr=17120

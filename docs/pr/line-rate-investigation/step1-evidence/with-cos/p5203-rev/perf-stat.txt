@@ -1,0 +1,34 @@
+
+ Performance counter stats for thread id '342188,342189,342190,342191':
+
+ xpf-userspace-w-342188            59103.64 msec task-clock                                                            
+ xpf-userspace-w-342189            53972.62 msec task-clock                                                            
+ xpf-userspace-w-342190            59245.17 msec task-clock                                                            
+ xpf-userspace-w-342191            59237.20 msec task-clock                                                            
+ xpf-userspace-w-342188        143760570828      cycles                                                                
+ xpf-userspace-w-342189        115460733754      cycles                                                                
+ xpf-userspace-w-342190        143653592908      cycles                                                                
+ xpf-userspace-w-342191        140573864515      cycles                                                                
+ xpf-userspace-w-342188        147315844204      instructions                                                          
+ xpf-userspace-w-342189        114685121604      instructions                                                          
+ xpf-userspace-w-342190        163282278730      instructions                                                          
+ xpf-userspace-w-342191        147676471987      instructions                                                          
+ xpf-userspace-w-342188          3192457228      cache-references                                                      
+ xpf-userspace-w-342189           337619849      cache-references                                                      
+ xpf-userspace-w-342190          3679308944      cache-references                                                      
+ xpf-userspace-w-342191          3139280961      cache-references                                                      
+ xpf-userspace-w-342188          2672888656      cache-misses                                                          
+ xpf-userspace-w-342189            70012126      cache-misses                                                          
+ xpf-userspace-w-342190          3050843635      cache-misses                                                          
+ xpf-userspace-w-342191          2621475987      cache-misses                                                          
+ xpf-userspace-w-342188          2768882033      L1-dcache-load-misses                                                 
+ xpf-userspace-w-342189          1297099785      L1-dcache-load-misses                                                 
+ xpf-userspace-w-342190          2984121800      L1-dcache-load-misses                                                 
+ xpf-userspace-w-342191          2784655958      L1-dcache-load-misses                                                 
+ xpf-userspace-w-342188     <not supported>      LLC-loads                                                             
+ xpf-userspace-w-342189     <not supported>      LLC-loads                                                             
+ xpf-userspace-w-342190     <not supported>      LLC-loads                                                             
+ xpf-userspace-w-342191     <not supported>      LLC-loads                                                             
+
+      60.002778064 seconds time elapsed
+
