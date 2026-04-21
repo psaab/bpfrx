@@ -69,9 +69,64 @@ pub(super) fn reap_tx_completions(
     }
     completed.release();
     drop(completed);
+    // #812: completion stamp — single fresh `monotonic_nanos()` for
+    // the entire reap batch (plan §3.1 completion-ts site). Amortised
+    // one VDSO call per reap (worst-case ~15 ns / 256-packet batch =
+    // 0.06 ns/pkt on the steady-state path; ~15 ns/pkt on the
+    // `reaped == 1` partial-batch worst case — same shape as the
+    // submit-stamp cost analysis in plan §3.4).
+    let ts_completion = monotonic_nanos();
+    let mut hist_fire_count = 0u64;
+    let mut hist_fire_sum_ns = 0u64;
+    let mut hist_fire_per_bucket = [0u64; TX_SUBMIT_LAT_BUCKETS];
     for i in 0..binding.scratch_completed_offsets.len() {
         let offset = binding.scratch_completed_offsets[i];
+        // #812: look up the submit stamp and reset the sidecar slot
+        // to the unstamped sentinel BEFORE the delta computation.
+        // Resetting under the owner-thread lookup is safe (single
+        // writer); reap and submit for the same offset do not race
+        // across threads (plan §3.3 single-writer invariant).
+        let slot_idx = (offset >> UMEM_FRAME_SHIFT) as usize;
+        let ts_submit = match binding.tx_submit_ns.get_mut(slot_idx) {
+            Some(slot) => {
+                let v = *slot;
+                *slot = TX_SIDECAR_UNSTAMPED;
+                v
+            }
+            None => TX_SIDECAR_UNSTAMPED,
+        };
+        // Skip unstamped completions (plan §5.4): pre-#812 leftovers
+        // across a restart, canonicalised VDSO-failure stamps, or
+        // frames whose stamp was dropped because the sidecar index
+        // was out-of-range. Bucketing these would silently bias the
+        // tail toward bucket 0.
+        if ts_submit != TX_SIDECAR_UNSTAMPED && ts_completion >= ts_submit {
+            let delta_ns = ts_completion - ts_submit;
+            let bucket = bucket_index_for_ns(delta_ns);
+            hist_fire_per_bucket[bucket] = hist_fire_per_bucket[bucket].saturating_add(1);
+            hist_fire_count = hist_fire_count.saturating_add(1);
+            hist_fire_sum_ns = hist_fire_sum_ns.saturating_add(delta_ns);
+        }
         recycle_completed_tx_offset(binding, shared_recycles, offset);
+    }
+    // Single aggregated RMW per bucket per reap batch (plan §3.4
+    // cache-line cost analysis) — amortises the 3-5 ns fetch_add
+    // over the whole batch. On a healthy run steady state
+    // concentrates mass in buckets 1-4, so at most 4 of the 16
+    // `fetch_add` calls below are non-zero.
+    let owner = &binding.live.owner_profile_owner;
+    for (b, add) in hist_fire_per_bucket.iter().enumerate() {
+        if *add != 0 {
+            owner.tx_submit_latency_hist[b].fetch_add(*add, Ordering::Relaxed);
+        }
+    }
+    if hist_fire_count != 0 {
+        owner
+            .tx_submit_latency_count
+            .fetch_add(hist_fire_count, Ordering::Relaxed);
+        owner
+            .tx_submit_latency_sum_ns
+            .fetch_add(hist_fire_sum_ns, Ordering::Relaxed);
     }
     binding.outstanding_tx = binding.outstanding_tx.saturating_sub(reaped);
     binding.dbg_completions_reaped += reaped as u64;
