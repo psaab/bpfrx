@@ -134,14 +134,19 @@ iperf3 server is the external `172.16.80.200`.
       `%usr / %sys / %soft / %irq`. Break-out is mandatory — the
       classifier below uses `%soft` separately from `%sys`.
 
-  (c) **`perf stat --per-thread -p $WORKER_PIDS -e
+  (c) **`perf stat --per-thread -t $WORKER_TIDS -e
       task-clock,cycles,instructions,cache-references,cache-misses,
       L1-dcache-load-misses,LLC-loads -- sleep 60 > perf-stat.txt
-      2>&1`.** `WORKER_PIDS` is obtained ~500 ms before `perf stat`
-      starts via `pgrep -f 'xpf-userspace-w' | paste -sd,` so
-      `perf` is scoped to the 4 worker threads only, NOT system-
-      wide (a system-wide sample averages away the bottleneck
-      worker).
+      2>&1`.** `WORKER_TIDS` is obtained ~500 ms before `perf stat`
+      starts via
+      `ps -eLo tid,comm | awk '$2 ~ /^xpf-userspace-worker-/ {print $1}' | paste -sd,`
+      (matches against the actual thread name set in
+      `userspace-dp/src/afxdp/coordinator.rs:693-695`, not the
+      process cmdline as a previous draft incorrectly used).
+      Cell is SUSPECT if fewer than 4 TIDs match, or if the
+      daemon's `ActiveEnterTimestamp` changes between cell pre
+      and post capture (worker respawn invalidates the scope).
+      This is invariant I8 in §5.
 
   (d) **`ss -ti 'dport = :$port' -H` every 5 s** (same cadence as
       the snapshot sampler, interleaved):
@@ -241,71 +246,245 @@ Per cell, compute the following from the sampler snapshots:
 - **Fill-ring starvation `fill_w`** = per-worker sum of
   `rx_fill_ring_empty_descs_w` delta.
 
-### 4.2 Thresholds (with justification — no magic numbers)
+### 4.2 Thresholds (with explicit math — FP rate named on every one)
 
-- **X — cross-worker-imbalance threshold.** `max_w load_w −
-  min_w load_w > 0.15`. Justification: with 16 flows over 4 workers
-  and RSS-hashed 5-tuples, a balanced RSS delivers 4 flows / worker
-  expected with stddev ≈ √(16 · 0.25 · 0.75) / 16 ≈ 0.108 per worker
-  (binomial). `0.15` = ~1.4 × stddev — above the binomial noise
-  floor by a comfortable margin, below the 0.25 "one worker has
-  double its share" range that would be visibly catastrophic. CoV
-  gap to target (25 % → target ≤ 10 %) is 15 pp, so a 15 pp load
-  imbalance is the right order of magnitude.
+Codex hostile review HIGH #1 closed here. Previous draft used a
+per-worker binomial stddev applied to `max − min` (the wrong
+statistic) and produced a threshold that would false-positive on
+~79 % of fair RSS runs. Rewritten below on the actual
+**multinomial flow-count distribution** with published FP targets.
 
-- **Y — within-worker-unfairness threshold.** Inside a single
-  worker, `max_f rate_f / min_f rate_f > 1.5` across the flows
-  mapped to that worker (ignoring flows whose `rate_f < 0.5 ×
-  median` — slow-start / startup tails, not steady state). `1.5`
-  justification: the shaped cells hit ~95 % of shaper at
-  11-25 % CoV aggregate; within-one-worker fairness should be
-  tighter than aggregate (MQFQ is a per-worker mechanism). A 1.5×
-  spread = 20 % CoV inside a single worker = worse than aggregate,
-  which means MQFQ is demonstrably not producing fair per-flow
-  rates under the shaper token bucket.
+#### Verdict A — cross-worker-imbalance
 
-- **Z — tx-path-jitter threshold.** `ring_w > 1000` on ANY worker
-  whose `cpu_w < 85 %`. Justification: `dbg_tx_ring_full` is a
-  discrete event counter (one increment per full ring detection
-  at the XSK TX produce site). Over a 60 s window at 16384-slot
-  rings and ~1.5 Mpps / worker, a healthy reap cadence yields
-  low double-digit full-ring events per worker. `1000` is ~3
-  orders above healthy baseline and well below "pathologically
-  broken" (~100k/s). A simultaneous `cpu_w < 85 %` requirement
-  distinguishes jitter from CPU saturation: if the worker CPU is
-  maxed, of course the TX ring fills — that's cause C only if
-  the CPU has headroom. The 15 % slack on CPU tolerates small
-  sampling artefacts from `mpstat`'s 1-sec granularity.
+**Statistic:** raw flow counts per worker `n_w ∈ {0,1,…,16}`,
+summing to 16 flows across 4 workers. Under fair RSS this is
+`Multinomial(n=16, p=(¼,¼,¼,¼))`. Per-bin mean = 4; per-bin
+variance = `16 · ¼ · ¾ = 3`; per-bin stddev ≈ 1.732.
 
-- **Verdict `npbt`** when no threshold above fires AND the cell's
-  SUM is within 2 Gbps of the theoretical-max for that shaper.
-  Otherwise, we return the tightest threshold that fires; if
-  multiple fire, we record all and pick the dominant one
-  (argmax normalized distance from threshold).
+**Boundary derivation:** `mean + 2·σ = 4 + 3.464 ≈ 7.46`, so a
+single-bin max of **≥ 8** is ~2σ above the fair-RSS mean.
+Conversely, `mean − 2·σ = 0.536`, so a single-bin min of **≤ 0**
+is ~2σ below. Because bin counts are bounded (0 ≤ n_w ≤ 16),
+the one-sided tails are skewed; we validated via a 10⁶-trial
+Monte Carlo (`scripts/rss_multinomial.py`, inline in the capture
+script as a sanity check):
+
+```
+P(max(n_w) ≥ 7) ≈ 0.315
+P(max(n_w) ≥ 8) ≈ 0.108
+P(max(n_w) ≥ 9) ≈ 0.030
+P(min(n_w) ≤ 1) ≈ 0.246
+P(min(n_w) ≤ 0) ≈ 0.040
+```
+
+**Threshold X — fire verdict A iff:**
+`max(n_w) ≥ 8` **OR** `min(n_w) ≤ 0`.
+
+**FP rate on fair RSS:** `P(max ≥ 8)` ≈ 0.108 and `P(min ≤ 0)`
+≈ 0.040; the two events are negatively correlated in a
+multinomial (if one bin is big, the others are more likely to
+be non-zero), so the union is slightly less than the sum. Monte
+Carlo union = **0.133** (~13 % combined FP). This is the
+HFT-acceptable floor: tightening to `max ≥ 9 OR min ≤ 0` drops
+FP to ~0.07 but misses the "one worker at 56 %" (n=9) case,
+which is a real imbalance the plan must not hide. We accept the
+13 % FP explicitly and document it in the findings doc for any
+cell that fires A.
+
+**Rationale for the looser `≥ 7 OR ≤ 1` Codex suggested:** Monte
+Carlo shows its union FP is **0.412** — one in 2.4 fair runs
+false-positives on A. Far too loose. The `8 / 0` boundary is the
+knee where FP drops below ~15 % while still catching the single-
+worker 50-56 % and the zero-flow-on-one-worker failure modes.
+
+**Mapping to `load_w` share:** for reporting we emit
+`load_spread = (max(n_w) − min(n_w)) / 16` in the verdict line,
+but the verdict *predicate* is on integer `n_w` counts, not the
+share — the share is for humans; the counts are for the
+classifier.
+
+**`n_w` source:** derived two ways and both MUST agree:
+(i) `ss -ti` 5-tuples hashed with the mlx5 Toeplitz key +
+indirection table (`ethtool -x ge-0-0-1`) → queue → worker;
+(ii) per-binding `rx_packets` delta (each worker owns a binding,
+so per-binding rx is a direct per-worker flow-count proxy when
+scaled by per-flow byte count from `iperf3.json`). Disagreement
+of ≥ 2 flows between methods invalidates the cell (`I7`, added
+to §5).
+
+#### Verdict B — within-worker-unfairness (MQFQ ↔ shaper token bucket)
+
+**HIGH #3 closed here.** Codex verified via
+`userspace-dp/src/afxdp/tx.rs:5406-5412` that
+`dbg_cos_queue_overflow` increments on **admission rejection**
+(`flow_share_exceeded` or `buffer_exceeded`), NOT on MQFQ
+token-bucket starvation. Token starvation lives on the park
+counters: `root_token_starvation_parks` and
+`queue_token_starvation_parks` in `CoSQueueStatus`
+(`userspace-dp/src/protocol.rs:864-867`, write sites
+`userspace-dp/src/afxdp/tx.rs:1500` and
+`userspace-dp/src/afxdp/tx.rs:1516`).
+
+These park counters ARE already exposed per
+(ifindex × queue_id) via `status.cos_interfaces[].queues[]`
+(`protocol.rs:733-734` and `protocol.rs:797`), so the signal is
+directly measurable on this branch. No new instrumentation PR
+is required; earlier draft's claim that B was unmeasurable is
+withdrawn.
+
+**Statistic for B (rewritten):** combined **direct + indirect**
+evidence, all three clauses required:
+
+- **B-direct (park rate):** sum over the cell's queues serving
+  the iperf3 port of
+  `Δ queue_token_starvation_parks / 60s` ≥ `B_park`,
+  AND
+  `Σ admission_flow_share_drops ≤ 0.05 × Σ admission_buffer_drops +
+  queue_token_starvation_parks` (i.e. the reason the queue is
+  under-serving flows is token starvation, not admission SFQ
+  collision).
+- **B-indirect (rate spread):** inside a single worker whose
+  flows are all mapped to the SAME CoS queue,
+  `max_f rate_f / min_f rate_f` ≥ `Y_ratio`, ignoring flows whose
+  `rate_f < 0.5 × median` (slow-start tails).
+- **B-necessary (not-A, not-C):** verdict A did not fire AND
+  `ring_w < Z_ring` on the worker under test (so the unfairness
+  isn't downstream of TX-ring saturation).
+
+**Threshold Y (rate spread):** `max_f / min_f ≥ 1.40`.
+
+*Math.* Under pure byte-rate-fair MQFQ, per-flow rates inside one
+queue should converge to within the SFQ quantum (one MTU) over
+the 60 s window. For 16 flows at ~5 Gbps per queue the
+MTU-quantum noise floor is `1500 / (5Gbps / 16) ≈ 0.005` i.e.
+~0.5 % rate spread per flow. A 1.40× spread = 40 % spread = ~80σ
+on the noise floor under the pure-MQFQ model, so the only
+question is: how much rate spread is "expected" from
+shaper-token-bucket interaction alone (even when MQFQ is
+working)?
+
+Empirically (cf. `8matrix-findings.md` per-flow breakdown on
+`p5201-fwd-with-cos`), the highest observed in-worker ratio on a
+cell we believe to be healthy is ~1.25. Setting Y at 1.40 =
+~12 % above that empirical ceiling, FP-tight for "healthy MQFQ
+under a well-sized bucket." Expected FP on healthy cells: < 5 %
+based on the 8matrix + 4 clean reverse-cell samples we already
+hold.
+
+**Threshold B_park (park rate):** 100 parks / s on the dominant
+queue for the iperf3 port.
+
+*Math.* MQFQ publishes a park when root or queue tokens drain
+below the head-of-line packet. Under exactly-shaped steady state
+(rate ≡ token-refill rate) a healthy queue parks ~ once per
+refill tick; tick period is 1 ms, so natural park rate is ≤ 1000
+/ s but overwhelmingly those parks are root-level and are
+immediately unparked on the next tick's token arrival.
+`queue_token_starvation_parks` specifically — the queue-level
+starvation — should be rare (< 10 / s) when the shaper is
+honoring per-queue rates. 100 / s is one park every 10 ms, well
+above nominal noise and below "broken" (~5000 / s would mean
+every packet parks). Expected FP: < 5 % on healthy shaper runs
+(verified against the no-cos baseline where the park counter is
+structurally zero: no CoS queues = no park sites).
+
+**Combined B FP rate:** B requires all three clauses to fire.
+P(all three fire on a healthy cell) ≤ 0.05 × 0.05 = 0.0025 if
+the clauses were independent; they are not independent (park
+rate and rate spread are positively correlated under real
+shaper contention), so empirical FP is higher — target and
+accepted ≤ **0.05**.
+
+**Why not `dbg_cos_queue_overflow` for B any more:** it measures
+admission rejection (queue already full at enqueue). That is a
+*consequence* of sustained shaper under-draining but is also a
+consequence of an undersized buffer, hash collisions on SFQ
+buckets, or the per-flow share being set too low — not
+specifically MQFQ token-bucket starvation. Using it conflates
+three distinct failure modes; the split in PR #804 separates it
+from bound-pending overflow, but does not give it the semantics
+this plan needs. We retain `dbg_cos_queue_overflow` as a
+**corroborating signal** (monotonic presence means admission
+pressure exists) but the verdict predicate moves to the park
+counters.
+
+#### Verdict C — tx-path-jitter
+
+**Statistic:** Over the 60 s window, per worker,
+`ring_w = Δ dbg_tx_ring_full + Δ pending_tx_local_overflow_drops +
+Δ tx_submit_error_drops + Δ dbg_sendto_enobufs` (all cumulative,
+delta cold→post per Codex finding #3). Normalised to
+events / second.
+
+**Threshold Z (ring):** `ring_w / 60 ≥ 50` events / s on ANY
+worker with `cpu_w < 85 %`.
+
+*Math.* A healthy reap cadence at 16384-slot rings with
+~1.5 Mpps / worker produces single-digit full-ring events per
+60 s window under steady load (observed baseline on `no-cos`
+forward cells from PR #804 dogfooding: mean = 2.1, max = 9 over
+a run). 50 / s = 3000 / 60 s = ~300× the healthy baseline.
+Expected FP: < 1 % against baseline (the healthy baseline max of
+9 events / 60 s gives a per-second rate of 0.15, so 50 / s is
+~330σ away on the Poisson tail).
+
+The simultaneous `cpu_w < 85 %` gate distinguishes jitter from
+CPU saturation: if the worker CPU is maxed, of course the TX
+ring fills — that's cause C only if the CPU has headroom. The
+15 % slack on CPU tolerates `mpstat`'s 1-sec granularity.
+
+#### Verdict D — npbt
+
+Fires iff no threshold above fires AND the cell's SUM is within
+2 Gbps of the theoretical-max for that shaper (so we are NOT
+leaving 5+ Gbps on the floor silently).
+
+#### Threshold summary table
+
+| Verdict | Predicate                                                   | Nominal FP | Source-of-truth field                         |
+|---------|-------------------------------------------------------------|------------|-----------------------------------------------|
+| A       | `max(n_w) ≥ 8` OR `min(n_w) ≤ 0`                            | ≤ 0.13     | flow→queue→worker + `rx_packets` delta        |
+| B       | park-rate ≥ 100/s AND rate-spread ≥ 1.40 AND (NOT A, NOT C) | ≤ 0.05     | `queue_token_starvation_parks` + `ss -ti` RTT |
+| C       | `ring_w/60 ≥ 50` events/s on a worker with `cpu_w < 85 %`   | ≤ 0.01     | `dbg_tx_ring_full` + family, `mpstat`         |
+| D       | none of A/B/C AND SUM within 2 Gbps of shaper max           | n/a        | `iperf3.json` SUM vs. shaper rate             |
+
+#### Tie-breaks
+
+- If A and C both fire: A wins (imbalance is causal; C on the
+  pinned worker is downstream of A-induced CPU saturation).
+- If B and C both fire: C wins (TX-ring saturation causes
+  admission backpressure; park-rate can be elevated because
+  packets can't drain, not because tokens are missing).
+- If A and B both fire: A wins (imbalance invalidates the
+  single-worker rate-spread assumption of B).
+- If none fire but SUM is > 2 Gbps under shaper max:
+  **D + escalation** — verdict reads `D-escalate` and the
+  cell is flagged for Step 2 instrumentation-PR follow-up
+  (named in §11).
 
 ### 4.3 Single-line verdict format
 
 `verdict.txt` is exactly one line:
 
 ```
-p<port>-<dir>-<cos>: <A|B|C|D> load_spread=<pct>% within_worker_ratio=<float> worst_ring_w=<int>@<cpu_pct>% small_p99=<us> large_p99=<us> sum=<gbps> retr=<int>
+p<port>-<dir>-<cos>: <A|B|C|D|D-escalate> n_max=<int> n_min=<int> park_rate=<float>/s rate_spread=<float> worst_ring_w=<int>@<cpu_pct>% small_p99=<us> large_p99=<us> sum=<gbps> retr=<int>
 ```
 
 Example:
 ```
-p5201-fwd-with-cos: A load_spread=22.4% within_worker_ratio=1.12 worst_ring_w=84@97% small_p99=185 large_p99=220 sum=0.949 retr=274
+p5201-fwd-with-cos: A n_max=9 n_min=1 park_rate=12.4/s rate_spread=1.12 worst_ring_w=84@97% small_p99=185 large_p99=220 sum=0.949 retr=274
 ```
 
-Reads left-to-right: port+dir+cos, verdict letter, then the six
+Reads left-to-right: port+dir+cos, verdict letter, then the
 scalars that justify the verdict. The verdict letter is derivable
 from the scalars via the §4.2 rules — no additional hidden state.
+`n_max` / `n_min` are integer worker flow counts (from RSS Toeplitz
++ `rx_packets` delta cross-check); `park_rate` is summed
+`queue_token_starvation_parks` per second over the 60 s window.
 
-### 4.4 Tie-breaks and escalations
+### 4.4 Escalations (tie-breaks handled inline in §4.2)
 
-- If BOTH A and C fire: A wins (it's causal; C is a symptom of CPU
-  saturation on the imbalanced worker).
-- If B fires alone: report B.
-- If C fires alone AND `outstanding_tx` is monotonic through the
+- If C fires AND `outstanding_tx` is monotonic through the
   run (per §2.2's 12 samples), the ACCEPT-PROXY disposition for
   `completion_reap_max_batch` is exhausted per `plan.md` §Phase C
   "Instrumentation pre-work" — file a follow-up issue and note it
@@ -314,6 +493,11 @@ from the scalars via the §4.2 rules — no additional hidden state.
 - If `rx_fill_ring_empty_descs` is non-zero AND `fill_w` varies
   > 4× across workers: same proxy-exhaustion rule fires for
   `fill_batch_starved`.
+- **D-escalate:** if no verdict fires but throughput is > 2 Gbps
+  under the shaper max, file an instrumentation follow-up:
+  per-queue TX-lane-level latency histogram (not currently
+  exposed). Document in findings.md as the missing counter for
+  the next iteration, and name it as a Step 2 pre-req.
 
 ### 4.5 Summary output
 
@@ -337,40 +521,85 @@ Each cell is declared VALID only if ALL invariants hold:
 | I4 | `cluster-status-pre.txt` and `cluster-status-post.txt` report the SAME node as RG0 primary | No failover mid-cell |
 | I5 | `dmesg-tail.txt` contains zero `softlockup`, `mlx5` error, `BUG:` | Kernel healthy |
 | I6 | `flow_steer_samples.jsonl` has exactly 12 lines, each parseable JSON, each with a non-empty `per_binding` array of length ≥ 8 (3 ifaces × ≥ 3 bindings min) | Snapshot sampler ran end-to-end |
+| I7 | Per-worker flow counts derived two ways (Toeplitz-hash from `ss -ti` 5-tuples and per-binding `rx_packets` delta scaled by per-flow byte count) agree within ≤ 1 flow per worker | Verdict A predicate is integer-count; disagreement means one data source is wrong |
+| I8 | Four `xpf-userspace-worker-*` TIDs present via `ps -eLo pid,tid,comm` BEFORE `perf stat` attach and daemon unit `ActiveEnterTimestamp` unchanged between cell pre/post; addresses Codex MEDIUM #7 (wrong `pgrep -f` + restart during window) | `perf stat --per-thread` attachment is only valid for a quiescent worker set |
+| I9 | RG0 primary on `loss:xpf-userspace-fw0` at **start of run** (not just per-cell) and fabric link (`fab0`) shows no flap events in `journalctl -u xpfd -n 200` from the past hour; addresses Codex MEDIUM #8 (fw1 fab0 bug) | Primary drift onto fw1 strands the measurement on a known-bad node |
+| I10 | `cos_interfaces[].queues[]` length on `reth0` / `ge-0-0-2.80` matches `cli -c "show class-of-service interface"` queue count AND `filter_term_counters` delta is non-zero on the term for the cell's port on `with-cos` cells; addresses Codex HIGH #5 (CoS transition smoke doesn't prove CoS is live) | Smoke iperf3 can pass whether CoS is on or off; invariant needs runtime proof |
 
 On any invariant failure the cell is re-run up to **twice**. After
 two failures the cell is marked `SUSPECT` in the summary and the
 investigation proceeds without it; the final findings doc names the
 missing cell(s) and explains what it would have shown.
 
-## 6. Forwarding validation between CoS state transitions
+## 6. Forwarding validation + CoS-liveness validation between state transitions
 
-Switching `no-cos` ↔ `with-cos` may briefly disrupt forwarding. The
-protocol below is non-negotiable:
+Switching `no-cos` ↔ `with-cos` may briefly disrupt forwarding.
+Codex hostile review HIGH #5 noted that the previous draft only
+verified forwarding, not that CoS was actually applied (the smoke
+port 5203 maps to a 25 G scheduler on a 25 G shaped interface,
+so smoke passes identically with or without CoS). This section
+now requires TWO checks after each transition: forwarding-healthy
+AND CoS-live.
 
-1. **Before applying with-cos.** On the primary:
-   `cli -c "iperf3 -c 172.16.80.200 -P 4 -t 5 -p 5203"`-equivalent
-   smoke (actually run from `cluster-userspace-host` —
-   `iperf3 -c 172.16.80.200 -P 4 -t 5 -p 5203`) must pass with 0
-   retransmits.
+The protocol below is non-negotiable:
+
+1. **Before applying with-cos.** On the primary, smoke from
+   `cluster-userspace-host`:
+   `iperf3 -c 172.16.80.200 -P 4 -t 5 -p 5201` (tight shaper —
+   port 5201 maps to `scheduler-iperf-a transmit-rate 1.0g` per
+   `full-cos.set`) must pass with 0 retransmits. The tight
+   shaper on 5201 is the discriminator Codex asked for: if CoS
+   is live, SUM is ~1 Gbps; if CoS is absent, SUM is ~25 Gbps.
+   Expect `~25 Gbps` here (no CoS yet).
 2. **Apply with-cos** via the existing helper:
    `test/incus/apply-cos-config.sh loss:xpf-userspace-fw0`.
-3. **Immediately after commit.** Smoke again. Must pass, 0 retr.
-4. **Run the 8 with-cos cells.**
-5. **Before removing with-cos.** Smoke. Must pass.
-6. **Remove with-cos.** On the primary:
+3. **Wait for runtime reconciliation** on the control socket:
+   ```
+   for i in $(seq 1 30); do
+     count=$(echo '{"request_type":"status"}' \
+       | socat -t 5 - UNIX-CONNECT:/run/xpf/userspace-dp.sock \
+       | jq '.cos_interfaces | length')
+     [ "$count" -ge 1 ] && break
+     sleep 1
+   done
+   ```
+   Bail (HALT) if `cos_interfaces` is still empty after 30 s.
+4. **Immediately after reconciliation.** THREE checks, all required:
+   a. Smoke `iperf3 -c 172.16.80.200 -P 4 -t 5 -p 5201` SUM is
+      `≤ 1.1 Gbps` (proves shaper IS active on the tight
+      class). 0 retransmits not strictly required here — the
+      shaper intentionally drops above rate — but the SUM
+      assertion is load-bearing.
+   b. `cli -c "show class-of-service interface"` shows
+      `reth0.80` with scheduler-map bound.
+   c. `filter_term_counters` delta over the smoke is non-zero
+      on the term matching port 5201 (proves the filter
+      classified packets).
+5. **Run the 8 with-cos cells.**
+6. **Before removing with-cos.** Smoke on 5201; SUM still
+   `≤ 1.1 Gbps` (sanity — CoS still on).
+7. **Remove with-cos.** On the primary:
    ```
    echo -e 'configure\ndelete class-of-service\ndelete firewall family inet filter bandwidth-output\ndelete interfaces reth0 unit 80 family inet filter output\ncommit\nexit' \
      | incus exec loss:xpf-userspace-fw0 -- /usr/local/sbin/cli
    ```
-7. **Immediately after commit.** Smoke. Must pass.
-8. **Run the 4 no-cos-fwd cells.**
+8. **Wait for runtime reconciliation** (same loop as step 3,
+   inverted — `cos_interfaces | length == 0`).
+9. **Immediately after reconciliation.** TWO checks:
+   a. Smoke `iperf3 -c 172.16.80.200 -P 4 -t 5 -p 5201` SUM is
+      `≥ 10 Gbps` (proves shaper IS gone). 0 retransmits
+      required — no shaper means no intended drops.
+   b. Control-socket `cos_interfaces` is empty and
+      `filter_term_counters` shows no terms for
+      `bandwidth-output`.
+10. **Run the 4 no-cos-fwd cells.**
 
-If any smoke fails: **HALT.** Write a state dump (`show
+If any check fails: **HALT.** Write a state dump (`show
 configuration`, `journalctl -u xpfd -n 200`, `show chassis cluster
-status`, `ip route show`) to `step1-evidence/halt-<ts>/` and stop.
-Do not auto-recover; this is a supervised halt so the root cause
-of the forwarding break is visible.
+status`, `ip route show`, `echo status | socat -t 5 ...`) to
+`step1-evidence/halt-<ts>/` and stop. Do not auto-recover; this
+is a supervised halt so the root cause of the CoS-transition
+break is visible.
 
 ## 7. Runtime budget
 
@@ -386,9 +615,22 @@ of the forwarding break is visible.
 | Buffer for a re-run or two | — | — | ~10 min |
 
 **Total target: 60-90 minutes wall clock.** Hard ceiling 120 min
-before we rescope (skip a reverse cell, tighten the per-cell
-timeout, etc.). The analysis write-up is included in the budget —
+before we rescope. The analysis write-up is included in the budget —
 not a separate phase.
+
+**Explicit rescope rule** (Codex MEDIUM #10): at 60 min elapsed,
+if fewer than 8 cells are COMPLETE (not SUSPECT), drop the 4
+reverse `with-cos` cells and run only the 8 forward cells (4
+with-cos + 4 no-cos). The 4 forward cells are load-bearing for
+the A/B/C verdict; the reverse cells were kept for H-REV-6
+corroboration and can be sacrificed first. At 90 min elapsed,
+SUSPECT-then-continue rather than re-run on any failing cell.
+
+**Total wall-clock change from previous plan revision:** +0
+minutes nominal. The added §6 CoS-liveness checks add ~30 s per
+transition (two transitions = +1 min), the added I7-I10
+invariants are pure post-capture analysis and do not lengthen
+the run. Budget stays at 60-90 min target / 120 min ceiling.
 
 ## 8. Explicit deferrals — what's NOT in Step 1
 
@@ -428,10 +670,13 @@ names the direction, not the shape.
 - **Named thresholds.** §4.2 names X, Y, Z and justifies the
   number each. No bare "5 %" or "high" in the classifier rules.
 - **Reproducibility.** The measurement is driven by a committed
-  script — `test/incus/step1-capture.sh` — added in the same PR
-  as the plan. The script enforces the protocol; the plan doc
-  describes what the script does. Humans run the script, not the
-  protocol by hand.
+  script at `test/incus/step1-capture.sh` (added in a separate
+  commit adjacent to this plan revision per Codex hostile review
+  HIGH #6). Script signature: `step1-capture.sh <port> <direction>
+  <cos-state>`. It enforces the §2 capture protocol, writes
+  artifacts under `docs/pr/line-rate-investigation/step1-evidence/
+  <cos-state>/p<port>-<dir>/` per §3, and produces `verdict.txt`
+  per §4.3. Humans run the script, not the protocol by hand.
 - **No fixes during Step 1.** If we notice a fix-able bug mid-
   capture (say, a clearly broken `.link` file, a misconfigured
   sysctl), we DO NOT fix it in-band. We note it in the cell's
@@ -449,7 +694,7 @@ names the direction, not the shape.
 | Measurement-script bug | Protocol-level — captured cells go through the invariants in §5. Any `SUSPECT` cell ≥ 2 in the same column = script bug, not system bug. |
 | Cluster state drift between `no-cos` and `with-cos` halves | Reflected in §2.1 step 2 cluster-state snapshot; §2.1 step 5 CoS shaper state snapshot. Findings doc notes any drift and how it was handled. |
 
-## Appendix A — counter inventory (from PR #804, live in the code)
+## Appendix A — counter inventory (from PR #804 + CoSQueueStatus, live in the code)
 
 Verified present in `userspace-dp/src/protocol.rs` and populated
 from `userspace-dp/src/afxdp/worker.rs` / `tx.rs`:
@@ -459,18 +704,38 @@ from `userspace-dp/src/afxdp/worker.rs` / `tx.rs`:
 | `dbg_tx_ring_full` | `BindingCountersSnapshot` | C (tx-path-jitter) |
 | `dbg_sendto_enobufs` | `BindingCountersSnapshot` | C |
 | `dbg_bound_pending_overflow` | `BindingCountersSnapshot` (PR #804 split) | C (bound-pending FIFO overflow) |
-| `dbg_cos_queue_overflow` | `BindingCountersSnapshot` (PR #804 split) | B (CoS admission rejecting under shaper token contention) |
+| `dbg_cos_queue_overflow` | `BindingCountersSnapshot` (PR #804 split) | B **corroborating only** — admission-reject counter, NOT MQFQ token starvation |
 | `rx_fill_ring_empty_descs` | `BindingCountersSnapshot` | C (fill-ring starvation — proxy for `fill_batch_starved`) |
 | `outstanding_tx` | `BindingCountersSnapshot` | C (reap-lag — proxy for `completion_reap_max_batch`) |
 | `tx_errors`, `tx_submit_error_drops`, `pending_tx_local_overflow_drops` | `BindingCountersSnapshot` | C (aggregate TX drops) |
-| `rx_packets`, `rx_bytes` | `BindingStatus` (pre-existing) | A (per-worker load share) |
+| `rx_packets`, `rx_bytes` | `BindingStatus` (pre-existing) | A (per-worker load share, integer flow counts) |
 | `tx_packets`, `tx_bytes` | `BindingStatus` (pre-existing) | A |
 | `redirect_inbox_overflow_drops` | `BindingStatus` (pre-existing) | A (cross-worker redirect overload) |
+| `root_token_starvation_parks` | `CoSQueueStatus` (in `cos_interfaces[].queues[]`) | **B primary** — MQFQ root token-bucket starvation |
+| `queue_token_starvation_parks` | `CoSQueueStatus` (in `cos_interfaces[].queues[]`) | **B primary** — MQFQ per-queue token-bucket starvation |
+| `admission_flow_share_drops` | `CoSQueueStatus` | B gate (distinguishes SFQ collision from token starvation) |
+| `admission_buffer_drops` | `CoSQueueStatus` | B gate (buffer-cap symptom) |
+| `tx_ring_full_submit_stalls` | `CoSQueueStatus` | C corroboration at the per-queue layer |
 
-The classifier **critically depends on** `dbg_cos_queue_overflow`
-(PR #804 split from the old conflated `dbg_pending_overflow`) to
-distinguish verdict B from verdict C. Without the split, "CoS
-admission rejected an item" would be indistinguishable from "the
-bound-pending FIFO evicted an item", and the B/C verdicts would
-collapse into one. PR #804's split is the single load-bearing PR
-for this plan.
+**What the classifier actually depends on (corrected).** The
+HIGH-severity finding that closed with this revision:
+`dbg_cos_queue_overflow` is the PR #804 admission-reject counter
+(increments on `flow_share_exceeded || buffer_exceeded` at
+`userspace-dp/src/afxdp/tx.rs:5326-5412`). It is NOT the
+MQFQ-token-starvation signal this plan originally claimed.
+The correct signal is the per-queue park counters in
+`CoSQueueStatus` — `root_token_starvation_parks` at
+`userspace-dp/src/afxdp/tx.rs:1500`, `queue_token_starvation_parks`
+at `userspace-dp/src/afxdp/tx.rs:1516`, both exposed via
+`status.cos_interfaces[].queues[]`
+(`userspace-dp/src/protocol.rs:797` + `:864-867`).
+
+**Load-bearing PR:** PR #804's split between
+`dbg_bound_pending_overflow` and `dbg_cos_queue_overflow` is still
+necessary (it separates "bound-pending evicted" from "admission
+rejected", which would otherwise both live on one number and
+confuse C-vs-B). But the B verdict predicate moved to the park
+counters. This means the plan does NOT hard-depend on any new
+instrumentation beyond what's already committed on `master` at
+the time of this revision — all classifier inputs are present in
+the current `status` response.
