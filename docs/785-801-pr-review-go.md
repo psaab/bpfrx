@@ -1,3 +1,4 @@
+ROUND 3: merge-ready YES
 ROUND 2: merge-ready YES from Go angle
 
 # PR #803 Go-quality review
@@ -240,3 +241,41 @@ Fresh `go test ./pkg/daemon/ ./pkg/config/` passes; `go build` clean.
 No new blockers. F3/F4 remain style-grade follow-ups. Opt-in gate +
 restore path + shutdown wiring + concurrency + tests + evidence are
 all sound.
+
+## Round 3 verification
+
+Commits reviewed: `f277f60d`, `fe36bc8d`, `96936694`.
+`go build ./...` clean; `go test -run 'Step0|HostTunables|Coalescence'
+./pkg/daemon/...` PASS.
+
+- **Pipeline split — idiomatic.** `applyStep0TunablesWith`
+  (`host_tunables_daemon.go:90-164`) runs two independent pipelines:
+  coalescence always on for `userspaceDP` regardless of the gate; host
+  scope behind `claimHostTunables`. File-level doc (lines 9-40) states
+  the scope rationale; `priorTunables` is lazy-allocated before
+  coalescence so the capture survives claim-false. Claim-flip
+  (true → false) path clears only `governors`/`budget`, retains
+  `mlx5Adaptive` — exactly what shutdown-restore needs. No extra
+  mutex churn; lock is acquired twice (read snapshot, write back).
+- **Test coverage for always-on — solid.** New tests
+  `TestApplyStep0Tunables_OptInFalse_AppliesCoalescence` and
+  `..._Shutdown_RestoresCoalescence` pin the write and capture paths;
+  `..._OptInFlipsToFalse_RestoresHostScopeOnly` asserts coalescence is
+  NOT re-enabled on flip and the capture persists. Existing
+  `_SkipsHostScope` still pins B1. No regression to round-2 matrix.
+- **Crash persistence doc — OK.** `priorHostTunables` struct comment
+  (`host_tunables.go:385-405`) documents in-memory-only policy with the
+  three-bullet rationale (idempotent values, identity restore,
+  sysctl.d escape hatch). `restoreHostTunables` repeats the pointer at
+  line 497-505. Matching narrative is in `docs/785-801-pr-review.md`
+  (Codex's file, untouched by this review).
+- **Evidence layout — sensible.** Split into `baseline-knobs-off/`
+  and `knobs-on/` with 15 JSONs + summary each. `summary.txt` deltas
+  (p5201-fwd +18%, p5201-rev +10%, p5203-fwd noise) match the
+  coalescence-always-on story: p5201 gains come from netdev_budget +
+  host-scope, p5203 noise-level CoV both states.
+
+ROUND 3 verdict: no regression to the round-2 pattern. The split
+correctly elevates coalescence to interface-scope alongside RSS
+indirection, matches the B1/B2 doc in the file header, and is
+fully covered by tests. Merge-ready YES.
