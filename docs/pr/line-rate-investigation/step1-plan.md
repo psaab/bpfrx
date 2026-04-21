@@ -329,6 +329,47 @@ FP_union_max9_or_min0  0.0638   <-- Threshold X (current plan)
 FP_union_max7_or_min1  0.4115
 ```
 
+**Power under the skewed alternative (round-3 finding #3).** The
+previous revisions defended `max ≥ 9` with "we keep 9 so we catch
+the 56 %-single-worker case". The null-case Monte Carlo alone
+does not validate that defense. We now run a second Monte Carlo
+under the alternative hypothesis — worker 0 draws `p0 = 0.56` of
+the multinomial mass, the other three split the remaining
+`0.44 / 3 ≈ 0.1467` each — and report the **true-positive power**
+of Threshold X on that skew. Re-run with:
+
+```
+python3 test/incus/step1-rss-multinomial.py --skewed-worker0 0.56
+```
+
+Output (seed=42, 1e6 trials):
+
+```
+P(max>=9)              0.5959
+P(min<=0)              0.2262
+FP_union_max9_or_min0  0.6302   <-- per-cell fire rate on 56 % skew
+
+# Multi-cell aggregation: P(>= 2 of N cells fire Verdict A)
+  N= 4  max>=9 -> 0.8538
+  N= 8  max>=9 -> 0.9949
+  N=12  max>=9 -> 0.9999
+```
+
+Honest assessment: per-cell power on a 56 % probabilistic skew
+is `~0.63`, NOT the `> 0.99` the prior defense implied. The
+defense survives only via the **multi-cell aggregation rule in
+§4.6 below**: across the 8 forward shaped cells, `P(≥ 2 fire) ≈
+0.995`, which IS the detection guarantee the plan needs. A
+single-cell Verdict A is therefore an unreliable signal on
+this skew — the signal lives in the count across cells. This
+is now load-bearing for §8's Step-2 trigger rule.
+
+If the skew is deterministic (worker 0 *always* lands n=9
+because of a literal Toeplitz hash bug, not a probabilistic
+56 % bias), per-cell power is 1.0 and the above concern does
+not apply. The probabilistic-skew model is the conservative
+case.
+
 **Mapping to `load_w` share:** for reporting we emit
 `load_spread = (max(n_w) − min(n_w)) / 16` in the verdict line,
 but the verdict *predicate* is on integer `n_w` counts, not the
@@ -571,6 +612,87 @@ with one table + a text conclusion. Table columns:
 Plus a paragraph per distinct verdict group summarizing the
 evidence and naming the Step 2 follow-up.
 
+### 4.6 Per-cell FP accumulation + multi-cell aggregation policy
+
+**Round-3 findings #3 + #4 (HIGH) — committed policy.**
+
+The per-cell Verdict A FP rate on fair RSS is 0.0638 (§4.2 Monte
+Carlo, seed=42). Across 12 cells, the expected number of false A
+firings is `12 × 0.0638 = 0.7656`, and
+`P(≥ 1 false A across 12 cells) = 1 - (1 - 0.0638)^12 = 0.5467`.
+**Verdict A on a single cell is therefore NOT a trustable signal.**
+
+The per-cell Verdict A true-positive power under a probabilistic
+56 % skew is only 0.63 (§4.2 power Monte Carlo). A single cell
+that fires A may be noise; a single cell that does not fire A
+under real skew is also plausible. Neither direction of single-cell
+Verdict A is safe to act on.
+
+**Policy for Step 2 triggering (load-bearing; cross-referenced by §8).**
+
+1. **Count Verdict A firings across all valid cells.** `k_A` =
+   number of cells with verdict A, `N_valid` = number of cells that
+   passed §5 invariants. Minimum `N_valid = 8` to apply this rule
+   (below that, rerun / rescope per §7).
+2. **Discount isolated A firings.** If `k_A = 1` AND the neighboring
+   cells (same direction, different ports; same port, different
+   CoS state where applicable) did NOT fire A, the single A is
+   treated as **noise** — Verdict A is NOT reported for the
+   investigation as a whole. Record the cell in findings.md as
+   "A-isolated; not counted" and look at B / C / D signals instead.
+3. **Trust A only when ≥ 2 cells fire.** If `k_A ≥ 2` AND the firing
+   cells are not all a single (port, direction) repeat run, treat
+   Verdict A as the investigation-level signal. §4.2 multi-cell
+   aggregation shows `P(≥ 2 of 8 cells fire | 56 % skew) = 0.9949`
+   and `P(≥ 2 of 8 cells fire | fair RSS) = 0.139` — the ≥ 2
+   threshold amplifies signal-to-noise by ~7× versus the
+   single-cell rule.
+4. **Structural A.** If all firing cells share the same overloaded
+   worker (identified by per-binding `rx_packets` ordering), the
+   skew is structural (Toeplitz hash + flow-set specific) and
+   Verdict A is firmly supported regardless of count. Record the
+   dominant worker ID in findings.md.
+
+For Verdict B, the combined FP rate is ≤ 0.05 (§4.2), so
+`E[false B across 12 cells] ≤ 0.6` and `P(≥ 1 false B) ≤ 0.46`.
+The ≥ 2-cell rule applies to B as well: trust B only when ≥ 2
+cells fire OR when a single cell shows both B-direct (park rate)
+AND B-indirect (rate spread) clauses at ≥ 1.5× their thresholds.
+
+For Verdict C, per-cell FP is < 0.01, so across 12 cells
+`P(≥ 1 false C) ≤ 0.11`. Single-cell C is acceptable.
+
+### 4.7 Threshold Y re-derivation policy
+
+**Round-3 finding #2 (HIGH) — committed policy.**
+
+Y = 2.72 was derived from a 4-cell baseline
+(`evidence-8matrix/p520[1-4]-fwd.json`). The bootstrap 95 % CI
+for Y is `[1.82, 2.88]` (per `test/incus/step1-rate-spread-analysis.py`
+bootstrap output, 10 000 trials, seed=42). Y = 2.72 sits near the
+upper end of that CI — the point estimate is noisy.
+
+**Re-derivation rule.** When Step 1 produces NEW per-flow rate
+captures that expand or replace the baseline (any `no-cos × fwd`
+cell, any with-cos cell that passes §5 I1-I10 and I2 shows SUM
+within ±5 % of the 8-matrix reference), re-run:
+
+```
+python3 test/incus/step1-rate-spread-analysis.py \
+    --cells p5201-fwd p5202-fwd p5203-fwd p5204-fwd \
+            p5201-fwd-new p5202-fwd-new ...
+```
+
+with the expanded cell list BEFORE applying Verdict B to the new
+cells. If the refreshed Y differs from 2.72 by more than the
+original CI half-width (`(2.88 - 1.82) / 2 = 0.53`), update Y in
+the plan before proceeding. Do NOT apply a Verdict B threshold
+that has not been checked against the newest available baseline.
+
+The re-derivation step is idempotent: running it on the current
+4-cell baseline returns Y = 2.72 with CI `[1.82, 2.88]` — no-op
+until new evidence exists.
+
 ## 5. Capture-validity invariants (pre-declared pass/fail ON THE CAPTURE)
 
 Each cell is declared VALID only if ALL invariants hold:
@@ -615,6 +737,19 @@ The protocol below is non-negotiable:
    Expect `~25 Gbps` here (no CoS yet).
 2. **Apply with-cos** via the existing helper:
    `test/incus/apply-cos-config.sh loss:xpf-userspace-fw0`.
+   Round-3 finding #3 (HIGH) closed here: the helper now runs
+   `commit check` first, then commits the destructive deletes
+   and the reapply `set` lines in **one atomic transaction**, and
+   post-commit runs `show class-of-service interface` + greps for
+   `shaper|scheduler|traffic-control-profile|output.*traffic`. If
+   commit-check fails, the script exits 4 with NO live state
+   change. If commit itself fails, the candidate is discarded and
+   the script additionally tries `rollback 1 | commit` to
+   roll-forward onto the last-good config. If post-commit
+   verification fails (CoS "committed" but not runtime-live), the
+   script runs `rollback 1 | commit` and exits 6. No code path
+   leaves the cluster in a no-CoS state without a committed
+   rollback attempt.
 3. **Wait for runtime reconciliation** on the control socket:
    ```
    for i in $(seq 1 30); do
@@ -640,11 +775,27 @@ The protocol below is non-negotiable:
 5. **Run the 8 with-cos cells.**
 6. **Before removing with-cos.** Smoke on 5201; SUM still
    `≤ 1.1 Gbps` (sanity — CoS still on).
-7. **Remove with-cos.** On the primary:
+7. **Remove with-cos.** On the primary. Use `commit check` first,
+   then commit atomically — same pattern as apply-cos-config.sh, so
+   a partial or failed commit does not strand the cluster:
    ```
-   echo -e 'configure\ndelete class-of-service\ndelete firewall family inet filter bandwidth-output\ndelete interfaces reth0 unit 80 family inet filter output\ncommit\nexit' \
-     | incus exec loss:xpf-userspace-fw0 -- /usr/local/sbin/cli
+   incus exec loss:xpf-userspace-fw0 -- /usr/local/sbin/cli <<'EOF'
+   configure
+   delete class-of-service
+   delete firewall family inet filter bandwidth-output
+   delete interfaces reth0 unit 80 family inet filter output
+   delete firewall family inet6 filter bandwidth-output
+   delete interfaces reth0 unit 80 family inet6 filter output
+   commit check
+   exit
+   quit
+   EOF
    ```
+   If `commit check` fails, ABORT — no live state changed. If it
+   passes, re-run the same block but with `commit` instead of
+   `commit check`; if commit itself fails, run
+   `configure; rollback 1; commit; exit; quit` to restore the
+   last-good state.
 8. **Wait for runtime reconciliation** (same loop as step 3,
    inverted — `.status.cos_interfaces | length == 0`).
 9. **Immediately after reconciliation.** TWO checks:
@@ -720,18 +871,26 @@ the run. Budget stays at 60-90 min target / 120 min ceiling.
 
 ## 8. Explicit deferrals — what's NOT in Step 1
 
-Step 1 produces a **classification only**, NOT a fix. Sequels:
+Step 1 produces a **classification only**, NOT a fix. Sequels are
+**gated by the §4.6 multi-cell aggregation policy** (round-3
+findings #3 + #4): single-cell A firings are discounted, and
+Verdict A is only trusted when `k_A ≥ 2`. The same ≥ 2-cell rule
+applies to Verdict B. Below "k_" means count of cells after
+§4.6 discount.
 
-- If verdict is **A (cross-worker-imbalance)** on ≥ 50 % of cells:
-  Step 2 is D1'-class work (flow-to-worker LB). Big. Gated
-  behind a separate design doc; do not kick off implementation.
-- If verdict is **B (within-worker-unfairness)** on ≥ 50 % of
-  cells: Step 2 is AFD / Phase 5 MQFQ ↔ shaper-interaction work.
-  Likely one medium PR.
-- If verdict is **C (tx-path-jitter)**: Step 2 is targeted
-  reap-cadence + produce-path TX-ring-size tuning. Smaller PR,
-  guarded by the existing `mqfq_*` pins + the new ring-pressure
-  counters (regression gate trivially available via PR #804).
+- If **k_A ≥ 50 %** of valid cells (with `k_A ≥ 2` to clear the
+  discount rule): Step 2 is D1'-class work (flow-to-worker LB).
+  Big. Gated behind a separate design doc; do not kick off
+  implementation.
+- If **k_A = 1** with no neighboring A firings: per §4.6, treat
+  as isolated noise. Do NOT trigger D1' work on one cell.
+- If **k_B ≥ 50 %** of valid cells (with `k_B ≥ 2`): Step 2 is AFD /
+  Phase 5 MQFQ ↔ shaper-interaction work. Likely one medium PR.
+- If **k_C ≥ 1**: Step 2 is targeted reap-cadence + produce-path
+  TX-ring-size tuning. Smaller PR, guarded by the existing
+  `mqfq_*` pins + the new ring-pressure counters (regression
+  gate trivially available via PR #804). Single-cell C is
+  acceptable per §4.6 (per-cell FP < 0.01).
 - If verdict is **D (npbt)** on > 75 % of cells: we exhausted the
   current hypothesis set. Step 2 is the design doc for a new
   hypothesis tier — NOT more measurement.
@@ -752,7 +911,13 @@ names the direction, not the shape.
   is evaluated on the *mean* across samples, not a single instant.
   N=12 is below textbook (N=30) but far above N=1 — and 12
   samples × 4 workers gives 48 per-worker observations per cell,
-  which is sufficient for the imbalance test.
+  which is sufficient for the imbalance test. **Cross-cell
+  validity** (§4.6) is handled separately: single-cell Verdict A
+  / B firings are discounted because the per-cell FP rates
+  accumulate to P(≥ 1 false firing across 12 cells) ≈ 0.55 for A
+  and ≈ 0.46 for B — the investigation-level verdict therefore
+  requires k ≥ 2 cells to fire before any Step-2 work is
+  triggered.
 - **Named thresholds.** §4.2 names X, Y, Z and justifies the
   number each. No bare "5 %" or "high" in the classifier rules.
 - **Reproducibility.** The measurement is driven by a committed
@@ -763,13 +928,20 @@ names the direction, not the shape.
   artifacts under `docs/pr/line-rate-investigation/step1-evidence/
   <cos-state>/p<port>-<dir>/` per §3, and produces `verdict.txt`
   per §4.3. Humans run the script, not the protocol by hand.
-  Threshold-X false-positive math is reproduced via the committed
+  Threshold-X false-positive math AND true-positive power under
+  the 56 %-skew alternative is reproduced via the committed
   Monte Carlo `test/incus/step1-rss-multinomial.py` (deterministic
-  seed=42); Threshold-Y empirical derivation is reproduced via
-  `test/incus/step1-rate-spread-analysis.py`, which reads the
-  `evidence-8matrix/` JSON files. Both are dependency-light
-  (Python stdlib only) so any reviewer can re-derive the
-  thresholds in seconds.
+  seed=42; `--skewed-worker0 0.56` for the power case);
+  Threshold-Y empirical derivation AND its bootstrap 95 % CI are
+  reproduced via `test/incus/step1-rate-spread-analysis.py`
+  (`--bootstrap-trials 10000 --bootstrap-seed 42` default), which
+  reads the `evidence-8matrix/` JSON files. Both are
+  dependency-light (Python stdlib only) so any reviewer can
+  re-derive the thresholds in seconds. The CoS apply helper
+  `test/incus/apply-cos-config.sh` is atomic: `commit check`
+  then `commit` in one transaction, with post-commit
+  verification and `rollback 1 | commit` on any failure path
+  (round-3 finding #3 HIGH).
 - **No fixes during Step 1.** If we notice a fix-able bug mid-
   capture (say, a clearly broken `.link` file, a misconfigured
   sysctl), we DO NOT fix it in-band. We note it in the cell's
@@ -781,6 +953,7 @@ names the direction, not the shape.
 | Risk | Mitigation / Rollback |
 |---|---|
 | CoS apply breaks forwarding | §6 protocol halts. State dump captured; investigator re-measures the no-cos baseline from a fresh start. |
+| CoS apply commits deletes but not the re-add (round-3 finding #3) | `apply-cos-config.sh` is atomic: `commit check` precedes `commit`; delete + set are in ONE transaction, so a failed `commit` discards the candidate and live state is unchanged. Post-commit verification runs `show class-of-service interface` and rolls back with `rollback 1 | commit` if CoS is not runtime-live. No code path leaves the cluster in a no-CoS state without a committed rollback attempt. |
 | Primary failover mid-capture | Detected via §5 I4. Cell marked SUSPECT and re-run. If failover repeats across re-runs, STOP — the cluster has a separate bug that invalidates the measurement. |
 | iperf3 server (172.16.80.200) unresponsive | First ping-small / ping-large probe shows it. Re-check cluster connectivity (`cli -c "show route 172.16.80.200"`); if dead, Step 1 can't proceed and we halt. |
 | Counter snapshot missing a field | Means PR #804 didn't cover that counter. Check §4.4 escalation rule; file a one-commit instrumentation PR; don't block Step 1 on a non-essential field. The essential fields are listed in §2.1 step 3. |
