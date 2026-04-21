@@ -137,6 +137,34 @@ const _: () = assert!(DRAIN_HIST_BUCKETS == 16);
 pub(super) const REDIRECT_SAMPLE_MASK: u64 = 0xff;
 const _: () = assert!(REDIRECT_SAMPLE_MASK.count_ones() == REDIRECT_SAMPLE_MASK.trailing_ones());
 
+/// #812: per-queue TX submit→completion latency histogram bucket count.
+///
+/// Same layout and math as `DRAIN_HIST_BUCKETS` (reuses
+/// `bucket_index_for_ns`). Named distinctly so a future re-layout of
+/// either histogram cannot silently drift the other — a rename of one
+/// does not touch the other's wire contract. The paired const-asserts
+/// below tie the two to each other AND pin the bucket count at 16 so
+/// a silent drift on either side becomes a build error pointing at
+/// this specific wire-contract dependency (Codex LOW #13 / plan §3.2).
+pub(super) const TX_SUBMIT_LAT_BUCKETS: usize = DRAIN_HIST_BUCKETS;
+const _ASSERT_TX_SUBMIT_BUCKET_COUNT_MATCHES_DRAIN: () =
+    assert!(TX_SUBMIT_LAT_BUCKETS == DRAIN_HIST_BUCKETS);
+const _ASSERT_TX_SUBMIT_BUCKET_COUNT_IS_16: () = assert!(TX_SUBMIT_LAT_BUCKETS == 16);
+
+/// #812: sentinel for unstamped sidecar slots. A completion seen
+/// against this value means the submit stamp was never written (e.g.
+/// a surviving offset across a restart, or a `monotonic_nanos() == 0`
+/// fallback from the VDSO-failure path in `neighbor.rs:8-10`). The
+/// reap path MUST skip the histogram increment for these so the tail
+/// of the distribution is not silently biased toward bucket 0 (plan
+/// §5.4). We pick `u64::MAX` because a legitimate monotonic timestamp
+/// cannot reach it — at nanosecond granularity it is ~585 years of
+/// uptime, well past any deployment lifetime. Crucially we also
+/// canonicalize `monotonic_nanos() == 0` into this sentinel (plan
+/// §6.1 test #5) so a VDSO-blocked kernel does not end up looking
+/// like a legitimate zero-time stamp.
+pub(super) const TX_SIDECAR_UNSTAMPED: u64 = u64::MAX;
+
 /// #709: branchless power-of-two bucket select for nanosecond deltas.
 ///
 /// Mapping (see `DRAIN_HIST_BUCKETS` for the layout):
@@ -188,6 +216,34 @@ pub(super) struct OwnerProfileOwnerWrites {
     pub(super) drain_latency_hist: [AtomicU64; DRAIN_HIST_BUCKETS],
     pub(super) drain_invocations: AtomicU64,
     pub(super) drain_noop_invocations: AtomicU64,
+    /// #812: per-queue submit→completion latency histogram. Bucket
+    /// layout is shared with `drain_latency_hist` via
+    /// `bucket_index_for_ns`; see `TX_SUBMIT_LAT_BUCKETS` for the
+    /// wire-contract const-asserts. The histogram is written only
+    /// by the owner worker's `reap_tx_completions` site (plan §3.1
+    /// completion-ts site) — single-writer, so `Relaxed` atomics on
+    /// writer AND reader are sufficient; the snapshot path documents
+    /// the bounded read-skew semantics at plan §3.6 R2 and mirrors
+    /// the existing `drain_latency_hist` pattern at
+    /// `umem.rs:1322-1329`.
+    pub(super) tx_submit_latency_hist: [AtomicU64; TX_SUBMIT_LAT_BUCKETS],
+    /// #812: count of completions observed since process start (the
+    /// histogram is monotonic, never reset on snapshot — plan §3.6).
+    /// Within a single-threaded unit test this equals
+    /// `sum(tx_submit_latency_hist)` exactly; across threads the
+    /// relation is `|sum - count| ≤ K_skew` per plan §3.6 R2
+    /// (K_skew = 3 at λ = 3 Mpps and W_read ≤ 1 µs). Unstamped
+    /// completions (plan §5.4) bump neither this counter nor the
+    /// histogram.
+    pub(super) tx_submit_latency_count: AtomicU64,
+    /// #812: running sum of observed completion-minus-submit deltas
+    /// in nanoseconds. Paired with `tx_submit_latency_count` yields a
+    /// discretization-free mean without reconstructing it from
+    /// per-bucket midpoints (plan §12 item 10). `saturating_add` is
+    /// not used — we accept wraparound at ~584 years of accumulated
+    /// monotonic delta time, which is beyond any deployment
+    /// lifetime.
+    pub(super) tx_submit_latency_sum_ns: AtomicU64,
     /// #709: owner-local pps window. Formerly `pps_owner_vs_peer[0]`;
     /// split by writer for cacheline isolation (#746). The owner is
     /// the only writer; peers read through `snapshot()`.
@@ -253,13 +309,19 @@ pub(super) struct OwnerProfilePeerWrites {
 // a packed neighbor — is caught at build time, not at runtime.
 const _: () = assert!(core::mem::align_of::<OwnerProfileOwnerWrites>() == 64);
 const _: () = assert!(core::mem::align_of::<OwnerProfilePeerWrites>() == 64);
-// Size ceiling: owner struct is 16 hist + 3 scalar AtomicU64 = 152 B,
-// padded to 192 B (3 cachelines) at 64-B alignment. Peer struct is
-// 16 hist + 2 scalar AtomicU64 = 144 B, padded to 192 B. Allow up to
-// 5 cachelines (320 B) so a follow-up can add one or two atomics
-// without this assert breaking — but if someone drops a giant field
-// in here, the build fails loudly and forces a reshape decision.
-const _: () = assert!(core::mem::size_of::<OwnerProfileOwnerWrites>() <= 320);
+// Size ceiling. Pre-#812 owner struct shape: 16 drain hist + several
+// scalar AtomicU64 (drain_invocations/noop/owner_pps/
+// drain_sent_bytes_shaped_unconditional/post_drain_backup_bytes/
+// post_drain_backup_cos_drops/post_drain_backup_cos_drop_bytes)
+// = 128 + 56 = 184 B → 192 B padded (3 cachelines). #812 adds 16
+// submit-latency hist atomics (128 B) + 2 scalars (count + sum_ns,
+// 16 B) = 144 B more, landing the struct at 328 B → 384 B padded
+// (6 cachelines). Ceiling set at 448 B (7 cachelines) so a
+// follow-up can add one or two atomics without this assert
+// breaking — but a giant field drop-in still fails loudly.
+// Peer struct is unchanged (16 hist + 2 scalar AtomicU64 = 144 B,
+// padded to 192 B).
+const _: () = assert!(core::mem::size_of::<OwnerProfileOwnerWrites>() <= 448);
 const _: () = assert!(core::mem::size_of::<OwnerProfilePeerWrites>() <= 320);
 
 impl OwnerProfileOwnerWrites {
@@ -272,6 +334,10 @@ impl OwnerProfileOwnerWrites {
             drain_latency_hist: std::array::from_fn(|_| AtomicU64::new(0)),
             drain_invocations: AtomicU64::new(0),
             drain_noop_invocations: AtomicU64::new(0),
+            // #812: zero-init owner-written TX submit latency telemetry.
+            tx_submit_latency_hist: std::array::from_fn(|_| AtomicU64::new(0)),
+            tx_submit_latency_count: AtomicU64::new(0),
+            tx_submit_latency_sum_ns: AtomicU64::new(0),
             owner_pps: AtomicU64::new(0),
             drain_sent_bytes_shaped_unconditional: AtomicU64::new(0),
             post_drain_backup_bytes: AtomicU64::new(0),
