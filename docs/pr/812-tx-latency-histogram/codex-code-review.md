@@ -81,3 +81,13 @@
 - Summary: The bucket math is fine; `0` lands in bucket 0 and `u64::MAX` saturates to 15 without panic.
 - Explanation: `bucket_index_for_ns` uses `(ns | 1).leading_zeros()`, clamps negative results to 0, and caps large values with `.min(DRAIN_HIST_BUCKETS - 1)` in `userspace-dp/src/afxdp/umem.rs:190-193`. The existing boundary pins already cover `0`, the `1024` transitions, and `u64::MAX` at `userspace-dp/src/afxdp/umem.rs:602-632`, so there is no off-by-one bug hiding in the bucket selector.
 - Mitigation: None; leave this helper alone unless you are deliberately changing the wire contract.
+
+## Round 2 verification
+
+HIGH-1: CLOSED — At all six submit sites in `userspace-dp/src/afxdp/tx.rs` (`2006-2027`, `2147-2163`, `2299-2315`, `2437-2452`, `6151-6167`, `6380-6395`), `writer.commit(); drop(writer);` now happens before the single fresh `monotonic_nanos()` and `stamp_submits(...)`, so only the accepted prefix is stamped after the ring submit is made kernel-visible.
+HIGH-2: PARTIAL — `tx_latency_hist_cross_thread_snapshot_skew_within_bound` in `userspace-dp/src/afxdp/umem.rs:1097-1266` now uses real writer and reader `std::thread::spawn` threads plus `Arc<Mutex<Vec<Sample>>>`, and the harness sleeps for `Duration::from_millis(200)` before shutdown, but the reader still exits after a fixed `5_000` iterations instead of sampling strictly for the full wall-duration window.
+MEDIUM: CLOSED — In live code the sidecar sentinel is `u64::MAX` (`userspace-dp/src/afxdp/umem.rs:174`), `stamp_submits` now early-returns on `ts_submit == 0` without writing any slot (`userspace-dp/src/afxdp/tx.rs:40-56`), and I found no executable `canonical_submit_stamp` helper/call site or remaining use of `0` as the unstamped marker in the tx-latency path.
+Rust HIGH-1: CLOSED — The two new tests at `userspace-dp/src/afxdp/umem.rs:1317-1392` call the production helpers `crate::afxdp::tx::stamp_submits` and `record_tx_completions_with_stamp` with genuinely out-of-bounds offsets, and they assert that the OOB stamp/reap paths silently drop those offsets without mutating in-range slots or bumping histogram/count/sum.
+Round 2 new findings (if any): None; the post-commit move does not add an extra submit-side clock read in the current code because each submit site still takes exactly one `monotonic_nanos()` per `writer.commit()`, and sidecar access remains single-owner userspace code via `&mut BindingWorker` / `Rc` ownership rather than a competing reader on the same slots.
+
+ROUND 2: MERGE NO
