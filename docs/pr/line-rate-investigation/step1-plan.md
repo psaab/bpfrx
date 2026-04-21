@@ -540,11 +540,20 @@ Z_nocos = 500 parks / s`. Rationale:
   oscillation envelope while still being well below "broken"
   (1000 / s saturation).
 - The 5× multiplier is specifically chosen to be large enough
-  that healthy shaped oscillation (1–3 parks per tick on average
-  across the cell's queues, ~10–30 / s × 10+ queues ≈ 100–300 /
-  s integrated) does NOT exceed it, and small enough that a
-  genuinely broken shaper (every packet parks, ~thousands / s)
-  does.
+  that healthy shaped oscillation does NOT exceed it, and small
+  enough that a genuinely broken shaper (every packet parks,
+  ~thousands / s) does. Arithmetic (corrected from a prior
+  revision): with tick period `T = 1 ms` and a target
+  steady-state per-queue park rate `Z_per_queue ≈ 10–30 / s`
+  (order-of-magnitude estimate of healthy oscillation), expected
+  parks per tick per queue = `Z × T = (10–30) × 0.001 =
+  0.01–0.03` (i.e., a given queue parks on roughly 1–3% of
+  ticks). Across ~10 active CoS queues for a cell, the
+  aggregated per-tick expectation is `0.1–0.3` parks per tick,
+  and the aggregated per-second rate is `100–300 / s`. The
+  `Z_cos = 500 / s` threshold sits comfortably above that
+  envelope (≈1.7–5× headroom) and well below the 1000 / s
+  saturation bound.
 
 **Calibration-gap acknowledgement.** `Z_cos = 5 × Z_nocos` is a
 placeholder, not a calibrated value. It is reported in
