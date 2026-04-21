@@ -1355,11 +1355,15 @@ blocks, indexed `b = 1..=60`. For each block `b`, define:
   completion-latency saturation; whole-window correlation was
   the broken round-2 formulation.
 
-The cell-level statistic for each verdict is
-`T_v = max_{b ∈ 1..=B} T_v,b` (the peak block value). Peak-
-based reduction is order-sensitive: permuting blocks reassigns
-which block the peak lands in, but the PAIRED comparison
-against baseline blocks (below) makes the null non-degenerate.
+**One composite test per cell per verdict.** The cell-level
+decision for verdict `v ∈ {D1, D2, D3}` is made by comparing
+the cell's set of per-block values `{T_v,b : b ∈ 1..=B}`
+directly to the baseline's per-block values
+`{T_v,b^base : b ∈ 1..=B_base}` — NO max-reduction, NO
+per-cell scalar; the block values themselves are the two
+samples into the permutation test (Codex round-5 fix; the
+earlier `T_v = max_b T_v,b` wording contradicted the mean-
+difference test statistic).
 
 Three composite tests per cell × 12 cells = 36 statistics
 total — same count as the round-1 draft, but we use a
@@ -1375,15 +1379,15 @@ with `permutation_type='independent'`).
   distribution of per-block statistics `{T_v,b^base}` measured
   on the §10 baseline-healthy runs for the same cell
   configuration (same port, same CoS state, same with-/no-cos-
-  fwd). Formally: `F_cell(T_v) = F_base(T_v)`.
-- **Alternative H1:** `F_cell(T_v) stochastically dominates
-  F_base(T_v)` (one-sided; we only care if the cell has MORE
+  fwd). Formally: `F_cell(T_v,b) = F_base(T_v,b)`.
+- **Alternative H1:** `F_cell(T_v,b) stochastically dominates
+  F_base(T_v,b)` (one-sided; we only care if the cell has MORE
   pathological-signal mass than baseline).
 - **Test statistic:** `Δ = mean(T_v,b for b in cell blocks) −
   mean(T_v,b^base for b in baseline blocks)`. This is the
-  Fisher-Pitman mean-difference statistic; order-sensitive
-  because it compares two samples, not a within-window
-  reordering of one.
+  Fisher-Pitman mean-difference statistic on the per-block
+  samples — same objects the null and alternative are defined
+  over.
 - **Null distribution construction:** pool the `B + B_base`
   blocks (≥ 60 cell blocks + ≥ 60 baseline blocks per §10;
   `B_base ≥ 60` required), draw `N_perm = 10 000` random
