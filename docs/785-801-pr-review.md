@@ -108,3 +108,31 @@ pre-xpfd, not kernel default" semantics.
 be resolved before merge. The CLI surface gap and unverifiable
 tuning values are also pre-merge requirements given the project's
 engineering-style bar (see `docs/engineering-style.md`).
+
+## Round 2 verification
+
+**B1**: CLOSED — the only production entry points call `applyStep0Tunables()`, and when `claimHostTunables` is false the code either runs the explicit restore-on-disable path for a previously active claim or returns before any `applyHostTunables()` or `applyCoalescence()` call, so no claiming write bypasses the opt-in gate. `pkg/daemon/daemon.go:531`, `pkg/daemon/daemon.go:2396`, `pkg/daemon/host_tunables_daemon.go:71`, `pkg/daemon/host_tunables_daemon.go:89`, `pkg/daemon/host_tunables_daemon.go:102`
+
+**B2**: CLOSED — governor, `netdev_budget`, and mlx5 coalescence each capture the live value before first write, and the daemon restores that snapshot both on a `true -> false` transition and on shutdown while the claim is active. `pkg/daemon/host_tunables.go:203`, `pkg/daemon/host_tunables.go:212`, `pkg/daemon/host_tunables.go:292`, `pkg/daemon/host_tunables.go:298`, `pkg/daemon/coalescence.go:94`, `pkg/daemon/coalescence.go:110`, `pkg/daemon/host_tunables_daemon.go:71`, `pkg/daemon/host_tunables_daemon.go:119`, `pkg/daemon/daemon.go:1325`
+
+**M1**: CLOSED — `vmHeuristic()` no longer equates “no cpufreq” with “VM”; it checks `/sys/hypervisor/type` and the `hypervisor` CPU flag, and the caller emits `slog.Warn` when neither signal is present, although there is no `systemd-detect-virt` call in the implementation. `pkg/daemon/host_tunables.go:108`, `pkg/daemon/host_tunables.go:116`, `pkg/daemon/host_tunables.go:182`, `pkg/daemon/host_tunables.go:187`
+
+**M2**: PARTIAL — `docs/801-evidence/` now contains a runnable repro script and 5-run JSON captures, but they cover only `p5201-fwd`, `p5201-rev`, and `p5203-fwd`, with no committed baseline-vs-knobs-on labeling or config capture, so the evidence is reproducible but not matched across both states. `docs/801-evidence/repro-matched-5run.sh:12`, `docs/801-evidence/repro-matched-5run.sh:17`, `docs/801-evidence/repro-matched-5run.sh:54`, `docs/801-evidence/repro-matched-5run.sh:110`, `docs/801-evidence/runs/summary.txt:2`, `docs/801-evidence/runs/summary.txt:3`, `docs/801-evidence/runs/summary.txt:4`
+
+**M3**: CLOSED — `claim-host-tunables` is present in `ConfigSetDataplaneKnobs` with description text and is wired into the `set system dataplane` help tree. `pkg/cmdtree/tree.go:869`, `pkg/cmdtree/tree.go:871`, `pkg/cmdtree/tree.go:896`
+
+**MIN1**: CLOSED — governor, `netdev_budget`, and mlx5 coalescence all read the live value before writing and each drift path logs with `slog.Warn`, not `Info` or `Debug`. `pkg/daemon/host_tunables.go:203`, `pkg/daemon/host_tunables.go:224`, `pkg/daemon/host_tunables.go:292`, `pkg/daemon/host_tunables.go:307`, `pkg/daemon/coalescence.go:94`, `pkg/daemon/coalescence.go:140`
+
+**F2**: CLOSED — the first no-cpufreq log is gated by `vmSkipLogOnce`, and every call still falls through to a `slog.Debug` skip line afterward. `pkg/daemon/host_tunables.go:82`, `pkg/daemon/host_tunables.go:86`, `pkg/daemon/host_tunables.go:182`, `pkg/daemon/host_tunables.go:192`
+
+**I1**: CLOSED — `pkg/daemon/host_tunables_restore_test.go` exists, and its opt-in-flip test asserts restore writes back `schedutil` and `450` as the pre-xpfd values rather than kernel defaults. `pkg/daemon/host_tunables_restore_test.go:1`, `pkg/daemon/host_tunables_restore_test.go:111`, `pkg/daemon/host_tunables_restore_test.go:153`, `pkg/daemon/host_tunables_restore_test.go:157`
+
+### Round-2 new angles
+
+**Perf regression check**: OPEN — the summary records the new `p5201` means at 18.44/18.01 Gbps and `p5203` at 22.91 Gbps, but the committed script only runs `iperf3` and never records whether `claim-host-tunables=true` or a baseline config was active, so the drop is unexplained in the evidence rather than tied to a documented noisy-cluster rerun. `docs/801-evidence/runs/summary.txt:2`, `docs/801-evidence/runs/summary.txt:3`, `docs/801-evidence/runs/summary.txt:4`, `docs/801-evidence/repro-matched-5run.sh:2`, `docs/801-evidence/repro-matched-5run.sh:54`
+
+**Opt-in gate semantics**: OPEN — when `claim-host-tunables` is false, the function returns before `applyCoalescence()`, so per-interface mlx5 coalescence writes are gated off too despite nearby comments claiming `rx-usecs/tx-usecs` “continue to run,” which means the default configuration gets no coalescence benefit. `pkg/daemon/host_tunables_daemon.go:78`, `pkg/daemon/host_tunables_daemon.go:89`, `pkg/daemon/host_tunables_daemon.go:103`, `pkg/daemon/daemon.go:529`
+
+**Crash persistence**: OPEN — the pre-xpfd snapshot lives only in `Daemon.priorTunables`, is created in memory on first claimed apply, and is cleared on restore/shutdown, with no persisted crash-recovery state in this flow. `pkg/daemon/daemon.go:265`, `pkg/daemon/daemon.go:271`, `pkg/daemon/host_tunables_daemon.go:98`, `pkg/daemon/host_tunables_daemon.go:105`, `pkg/daemon/host_tunables_daemon.go:119`, `pkg/daemon/host_tunables_daemon.go:123`
+
+ROUND 2: merge-ready NO — M2 evidence is still only partial, `claim-host-tunables=false` suppresses all coalescence writes, and crash recovery loses the original pre-xpfd snapshot.
