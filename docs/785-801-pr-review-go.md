@@ -1,3 +1,5 @@
+ROUND 2: merge-ready YES from Go angle
+
 # PR #803 Go-quality review
 
 Branch: `pr/801-sysctl-coalescence` (commits `7f100cf3`, `c27e09c9`,
@@ -154,3 +156,87 @@ follow-up commit but do not block merge — tests are comprehensive,
 injection-friendly, and cover the exact `Explicit + Disabled` matrix
 the daemon reads. Config schema plumbing is complete on the
 parse/compile/format paths; the CLI tree gap in F1 is pre-existing.
+
+## Round 2 verification
+
+Commits reviewed: `b9698401`, `5100596e`, `0b2a430b`.
+Fresh `go test ./pkg/daemon/ ./pkg/config/` passes; `go build` clean.
+
+### Round-1 findings
+
+- **F1 cmdtree — CLOSED.** `ConfigSetDataplaneKnobs` added in
+  `pkg/cmdtree/tree.go:869-879`, wired at `tree.go:896` under
+  `ConfigTopLevel["set"].Children["system"].Children["dataplane"]`.
+  Surfaces `?` help + tab for rss-indirection, claim-host-tunables,
+  cpu-governor, netdev-budget, and the coalescence subtree
+  (adaptive/rx-usecs/tx-usecs) with per-knob Desc strings.
+
+- **F2 VM-skip log — CLOSED.** `vmSkipLogOnce sync.Once` at
+  `host_tunables.go:86` gates the Info emission. Subsequent reconciles
+  fall through to `slog.Debug` at `host_tunables.go:192-193`. The Once
+  also adjudicates the M1 bare-metal WARN branch (same gate, single
+  emission per process).
+
+- **F3 coalescence adaptive parse — PARTIAL.** `compiler_system.go:490-495`
+  treats `"enable"` as the only positive token and lumps `"disable"`,
+  `""`, and any unknown value into the "adaptive off" branch. Explicit
+  validation of the `enable|disable` vocabulary is still missing —
+  typo like `adaptive disble` silently flips adaptive off. Not a
+  merge blocker (prior R1 call).
+
+- **F4 CoalescenceAdaptiveExplicit + Disabled collapse — PARTIAL
+  (unchanged).** Still two fields on `UserspaceDataplaneConfig`
+  (`types.go:518-519`). Daemon read at `daemon.go:2386-2389` still
+  derives `coalesceEnable` via the combined check. Follow-up, not
+  blocker.
+
+### Round-2 new angles
+
+- **`priorHostTunables` concurrency — OK.** `Daemon.priorTunablesMu
+  sync.Mutex` guards `priorTunables`/`priorTunablesActive`
+  (`daemon.go:271`). All four accessors in `host_tunables_daemon.go`
+  (lines 63/74/105/120) acquire/release correctly. The map mutations
+  inside `captureGovernor`/`captureBudget`/`captureMlx5Coalesce` happen
+  only while the caller owns the logical apply window (startup +
+  serialized `applyConfig` reconcile), so no intra-apply races. Shutdown
+  path reads-then-nils under lock before restoring outside the lock,
+  which is safe because `applyConfig` can't run concurrently with Stop.
+
+- **Restore on SIGTERM — OK.** `restoreStep0TunablesOnShutdown` called
+  from `daemon.go:1325` on the shutdown path, which `signal.NotifyContext`
+  (line 646/648) drives for SIGTERM + SIGINT. Synchronous, no flush/
+  timeout wrapper — sysfs writes are small atomic `os.WriteFile` calls;
+  systemd `TimeoutStopSec=20` is the safety net. Runs on both hitless
+  and fail-closed shutdown.
+
+- **VM heuristic idiomatic — OK.** `vmHeuristic`
+  (`host_tunables.go:105-122`) uses the `hostTunableFS.readFile`
+  abstraction (tests mock without shelling out), probes
+  `/sys/hypervisor/type` then the `/proc/cpuinfo` `hypervisor` flag via
+  line-by-line `strings.Fields` scan. No `systemd-detect-virt` shellout
+  (despite the comment mentioning it) — keeps the dependency surface
+  minimal. No pre-existing VM-detection helper in the repo to unify
+  with; implementation is self-contained.
+
+- **Tests — STRONG.** `host_tunables_restore_test.go` (313 lines, 9
+  tests) covers: B1 opt-in-false-writes-nothing, B2 capture+write,
+  B2 restore-on-flip-reverts-to-pre-xpfd (line 157 pins 450 NOT 300 —
+  the exact "pre-xpfd not kernel default" invariant), first-apply-wins
+  on reconcile, nil-restore no-op, empty-capture no-op, three VM
+  heuristic branches, capture idempotence. Not strictly table-driven
+  but each test is tightly scoped. The I1 invariant comment at line 158
+  is explicit: `"should NOT be kernel default 300"`.
+
+- **Evidence JSONs — REAL.** 15 files under `docs/801-evidence/runs/`.
+  `wc -l` shows 1117/1137/4533 lines per matrix (grows with flow count),
+  with valid iperf3 Start/Intervals/End structure. Tail of
+  `p5201-fwd-1.json` ends in a complete `end.sum_sent` + `cpu_utilization_percent`
+  block; not truncated. `summary.txt` matrix mean/stdev numbers
+  (p5203-fwd stdev 0.188 Gbps across 5 runs) are consistent with the
+  per-file `bits_per_second` sums.
+
+### Round-2 verdict
+
+No new blockers. F3/F4 remain style-grade follow-ups. Opt-in gate +
+restore path + shutdown wiring + concurrency + tests + evidence are
+all sound.
