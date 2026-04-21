@@ -1,0 +1,28 @@
+# Evidence dir: /home/ps/git/bpfrx/docs/pr/line-rate-investigation/evidence-8matrix
+# Cells: ['p5201-fwd', 'p5202-fwd', 'p5203-fwd', 'p5204-fwd']
+# Slow-start floor: < 0.5x median dropped before min()
+
+cell            n    max_gbps    min_gbps    ratio
+p5201-fwd      16      0.0906      0.0413   2.1920
+p5202-fwd      16      0.7121      0.5184   1.3736
+p5203-fwd      16      1.7359      1.0560   1.6439
+p5204-fwd      16      0.0096      0.0042   2.2510
+
+# Verdict B — Threshold Y derivation (max/min ratio per cell)
+  mean across 4 cells:  1.8651
+  stddev:                          0.4267
+  Y = mean + 2*stddev:             2.7186
+  Y rounded for plan:              2.72
+
+# Bootstrap 95% CI for Y (trials=10000, seed=42)
+  Y median (bootstrap): 2.6402
+  Y 95% CI:             [1.8208, 2.8765]
+  NOTE: CI is wide because n=4. Threshold Y=2.72 is near the
+  upper end of this CI; true mean+2*sigma over a larger
+  sample could be materially different. Plan §4 commits to
+  re-running this script (with an expanded --cells list) if
+  Step 1 produces new baseline cells and refreshing Y before
+  applying Verdict B to the new cells.
+
+# Citation: docs/pr/line-rate-investigation/evidence-8matrix/
+#   p5201-fwd.json, p5202-fwd.json, p5203-fwd.json, p5204-fwd.json

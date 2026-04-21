@@ -1,0 +1,21 @@
+# Monte Carlo (skewed): 1000000 trials, 16 flows, p=(0.5600, 0.1467*3), seed=42
+P(max>=7)              0.9021
+P(max>=8)              0.7730
+P(max>=9)              0.5959
+P(min<=0)              0.2262
+P(min<=1)              0.6923
+FP_union_max8_or_min0  0.7862
+FP_union_max9_or_min0  0.6302
+FP_union_max7_or_min1  0.9233
+
+# Verdict A TRUE-POSITIVE power under the skewed alternative
+  max>=9 OR min<=0  -> per-cell fire_rate=0.6302
+  max>=8 OR min<=0  -> per-cell fire_rate=0.7862
+  max>=7 OR min<=1  -> per-cell fire_rate=0.9233
+
+# Multi-cell aggregation: P(>= 2 of N cells fire Verdict A)
+# Used when the skew is systematic across cells (the case the
+# plan cares about — one worker is structurally overloaded).
+  N= 4  max>=9 -> 0.8538  max>=8 -> 0.9672
+  N= 8  max>=9 -> 0.9949  max>=8 -> 0.9999
+  N=12  max>=9 -> 0.9999  max>=8 -> 1.0000

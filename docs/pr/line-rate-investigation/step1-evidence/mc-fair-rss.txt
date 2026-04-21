@@ -1,0 +1,14 @@
+# Monte Carlo: 1000000 trials, 16 flows over 4 workers, seed=42
+P(max>=7)              0.3148
+P(max>=8)              0.1083
+P(max>=9)              0.0298
+P(min<=0)              0.0399
+P(min<=1)              0.2464
+FP_union_max8_or_min0  0.1331
+FP_union_max9_or_min0  0.0638
+FP_union_max7_or_min1  0.4115
+
+# Boundary candidates (Verdict A union FP rate)
+  max>=7 OR min<=1  -> FP=0.4115  (Codex round-1 'looser' suggestion)
+  max>=8 OR min<=0  -> FP=0.1331  (round-1 plan revision)
+  max>=9 OR min<=0  -> FP=0.0638  (current plan — Codex round-2 recommendation)
