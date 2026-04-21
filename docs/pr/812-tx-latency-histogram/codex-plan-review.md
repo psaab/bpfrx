@@ -142,3 +142,16 @@ HIGH #2: PARTIAL — `ceil(2e6 × 1e-6) = 2` is correct, but the plan's own 64B/
 Round 4 new findings (if any): §11.3 still has the same structural problem from round 3: I do not see an "expected number of runs" formula in the current block-permutation text, and the specified D1/D2 cell statistics are whole-window mass ratios, so permuting 1-second blocks does not change them; the null is therefore degenerate or underspecified. The `const _ASSERT... = { const fn require_static_send<T: 'static + Send>() {} ... }` idiom is sound Rust for asserting `BindingCountersSnapshot: Send + 'static`, although it only proves those trait bounds, not every semantic ownership invariant.
 
 ROUND 4: plan-ready NO
+
+## Round 5 verification
+
+HIGH #2: CLOSED — §3.6 now consistently derives `K_skew = 3` from `λ = 3 Mpps` and `W_read ≤ 1 µs`, and every live `K_skew` reference I found reuses that bound. I found no stale live `K_skew = 2` or active `λ = 2 Mpps` math; the only `2 Mpps` mentions left are explicitly historical ("earlier 2 Mpps", "from 2 Mpps to 3 Mpps"), not operative.
+
+Preemption gate: PARTIAL — A single 4 ms CFS preemption contaminates one snapshot call, so in an `N = 20` harness it yields `1/20 = 5 %`, not `> 5 %`; the chronic-issue branch therefore requires at least 2 fired snapshots, so one-off preemption does not trip the hard stop. The math is sound, but the prose should say "2 of 20" explicitly because percentage shorthand obscures that the discriminator is a discrete count threshold.
+
+§11.3 math: PARTIAL — The concrete SciPy call is mostly right: `permutation_type='independent'` matches an independent two-sample block-label permutation, `alternative='greater'` correctly tests whether the cell's pathological-block statistic exceeds baseline, `n_resamples=10_000` is adequate for a `p <= 0.05` gate, and the `p <= 0.05` rejection threshold is stated. The section still contradicts itself, though: it first defines the cell-level statistic as `T_v = max_b T_v,b` and then implements and justifies a mean-difference permutation test over the per-block arrays, so the actual test statistic is not crisply specified.
+
+Round 5 new findings (if any):
+- §11.3's sentence claiming "Peak-based reduction is order-sensitive" is wrong on its own terms: a max over a fixed set of block values is order-invariant, and the accompanying SciPy code does not use the max reduction anyway.
+
+ROUND 5: plan-ready NO
