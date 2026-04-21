@@ -145,6 +145,13 @@ use self::umem::*;
 const USERSPACE_META_MAGIC: u32 = 0x4250_5553;
 const USERSPACE_META_VERSION: u16 = 4;
 const UMEM_FRAME_SIZE: u32 = 4096;
+/// #812: log2 of `UMEM_FRAME_SIZE`, used to index the per-binding
+/// submit-timestamp sidecar (`BindingWorker::tx_submit_ns`). Paired
+/// const-assert below keeps this wired to the frame size so a future
+/// resize (e.g. 2 KiB frames) fails the build instead of silently
+/// indexing the wrong slot.
+const UMEM_FRAME_SHIFT: u32 = 12;
+const _: () = assert!(1u32 << UMEM_FRAME_SHIFT == UMEM_FRAME_SIZE);
 const UMEM_HEADROOM: u32 = 256;
 const RX_BATCH_SIZE: u32 = 256;
 const MIN_RESERVED_TX_FRAMES: u32 = 256;

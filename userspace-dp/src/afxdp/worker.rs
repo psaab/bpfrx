@@ -32,6 +32,26 @@ pub(crate) struct BindingWorker {
     pub(crate) scratch_exact_local_tx: Vec<ExactLocalScratchTxRequest>,
     pub(crate) scratch_completed_offsets: Vec<u64>,
     pub(crate) scratch_post_recycles: Vec<(u32, u64)>,
+    /// #812: per-UMEM-frame submit timestamp sidecar. Indexed by
+    /// `offset >> UMEM_FRAME_SHIFT`. Pre-allocated once at binding
+    /// construction (length = total UMEM frames) so the hot-path
+    /// stamp write is a single store — NO allocation, NO grow.
+    ///
+    /// Single-writer invariant (plan §3.3): submit and completion for
+    /// one frame offset are the same thread (the owner worker that
+    /// owns this binding's `free_tx_frames` via
+    /// `pop_front`/`push_front`), so plain `Vec<u64>` is correct —
+    /// no atomic needed. `WorkerUmem` is `Rc` (not `Arc`) at
+    /// `umem.rs:16-18`, enforcing single-owner semantics even when
+    /// multiple bindings share a UMEM under the mlx5 special case.
+    ///
+    /// Unstamped slots hold `TX_SIDECAR_UNSTAMPED` (`u64::MAX`) — the
+    /// reap path (`reap_tx_completions`) skips the histogram
+    /// increment for these to avoid biasing the tail toward bucket 0
+    /// (plan §5.4). A `monotonic_nanos() == 0` return (VDSO failure,
+    /// plan §3.4a / §6.1 test #5) is canonicalised to the sentinel
+    /// at stamp time for the same reason.
+    pub(crate) tx_submit_ns: Vec<u64>,
     /// Packets waiting for neighbor resolution. The UMEM frame is held
     /// (not recycled) until the neighbor resolves or the entry times out.
     pub(crate) pending_neigh: VecDeque<PendingNeighPacket>,
@@ -319,6 +339,14 @@ impl BindingWorker {
             scratch_exact_local_tx: Vec::with_capacity(TX_BATCH_SIZE),
             scratch_completed_offsets: Vec::with_capacity(ring_entries as usize),
             scratch_post_recycles: Vec::with_capacity(RX_BATCH_SIZE as usize),
+            // #812: pre-allocate the submit-timestamp sidecar once,
+            // sized to the binding's total UMEM frame count so every
+            // legal `offset >> UMEM_FRAME_SHIFT` index lands inside
+            // the vec. Initial contents are the unstamped sentinel so
+            // any stray pre-existing offset in flight (cross-restart
+            // completion) is skipped by the reap path (plan §5.4).
+            // Allocation happens here — NEVER on the hot path.
+            tx_submit_ns: vec![TX_SIDECAR_UNSTAMPED; total_frames as usize],
             pending_neigh: VecDeque::with_capacity(MAX_PENDING_NEIGH),
             scratch_cross_binding_tx: Vec::with_capacity(RX_BATCH_SIZE as usize),
             scratch_rst_teardowns: Vec::with_capacity(16),
