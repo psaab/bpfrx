@@ -970,12 +970,26 @@ applies to Verdict B. Below "k_" means count of cells after
   implementation.
 - If **k_A = 1** with no neighboring A firings: per §4.6, treat
   as isolated noise. Do NOT trigger D1' work on one cell.
-- If **k_B ≥ 50 %** of valid cells (with `k_B ≥ 2` on no-cos,
-  `k_B ≥ 3` on with-cos per §4.6 calibration-gap tightening):
+- If **k_B ≥ 50 %** of valid cells (with `k_B ≥ 2` on no-cos
+  forward cells — see §4.6 no-cos rule; `k_B ≥ 2 of 4 with-cos
+  forward shaped cells` under the calibration-gap rule in §4.6):
   Step 2 is AFD / Phase 5 MQFQ ↔ shaper-interaction work. Likely
   one medium PR. Step 2 MUST ALSO include a Z_cos re-calibration
   task (capture park-rate from the healthy shaped baseline, apply
   mean + 2σ, update the plan) before any AFD fix is merged.
+- **Z_cos gating loop (load-bearing, explicit).** Verdict B under
+  the `with-cos` state BLOCKS on Z_cos re-calibration from Step 1
+  own data. No Step 2 AFD work starts — not design, not
+  scoping, not an issue — until Step 2's first sub-task captures
+  park-rate from at least two with-cos forward shaped cells and
+  re-derives Z_cos via mean + 2σ (per §4.2 calibration-gap rule).
+  Until that re-derivation lands in a plan amendment, any
+  with-cos Verdict B — even at `k_B ≥ 2 of 4` — is **TENTATIVE**
+  and must NOT trigger AFD / Phase 5 work. The re-calibration
+  sub-task is a prerequisite, not a parallel stream. No loophole:
+  a high `k_B` count under with-cos does NOT bypass the gate —
+  the gate is on data provenance (Z_cos source), not on fire
+  count.
 - If **k_C ≥ 1**: Step 2 is targeted reap-cadence + produce-path
   TX-ring-size tuning. Smaller PR, guarded by the existing
   `mqfq_*` pins + the new ring-pressure counters (regression
