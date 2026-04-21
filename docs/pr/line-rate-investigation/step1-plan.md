@@ -80,9 +80,12 @@ iperf3 server is the external `172.16.80.200`.
      `cluster-status-pre.txt`.
 3. **Cold per-binding snapshot.** Via the daemon control socket
    (`/run/xpf/userspace-dp.sock`):
-   - `echo '{"request_type":"status"}' | socat -t 5 - UNIX-CONNECT:
+   - `echo '{"type":"status"}' | socat -t 5 - UNIX-CONNECT:
      /run/xpf/userspace-dp.sock | jq . > flow_steer_cold.json`
-   - The `per_binding` array carries the PR #804 counters:
+   - The `.status.per_binding` array (response is the
+     `ControlResponse` envelope `{ok, status:{...}}` per
+     `userspace-dp/src/protocol.rs:980-992`) carries the PR #804
+     counters:
      `dbg_tx_ring_full`, `dbg_sendto_enobufs`,
      `dbg_bound_pending_overflow`, `dbg_cos_queue_overflow`,
      `rx_fill_ring_empty_descs`, `outstanding_tx`, `tx_errors`,
@@ -122,7 +125,7 @@ iperf3 server is the external `172.16.80.200`.
       samples over the 60 s window:
       ```
       for i in $(seq 0 11); do
-        echo '{"request_type":"status"}' \
+        echo '{"type":"status"}' \
           | socat -t 5 - UNIX-CONNECT:/run/xpf/userspace-dp.sock \
           | jq -c . >> flow_steer_samples.jsonl
         sleep 5
@@ -180,7 +183,7 @@ iperf3 server is the external `172.16.80.200`.
 
 ### 2.3 Post-run (cooldown)
 
-1. `echo '{"request_type":"status"}' | socat -t 5 - UNIX-CONNECT:
+1. `echo '{"type":"status"}' | socat -t 5 - UNIX-CONNECT:
    /run/xpf/userspace-dp.sock | jq . > flow_steer_post.json`.
 2. `ethtool -S ge-0-0-1 | grep -vE ' 0$' > nic-counters-post-ge-0-0-1.txt`
    and the same for `ge-0-0-2`.
@@ -262,12 +265,12 @@ summing to 16 flows across 4 workers. Under fair RSS this is
 variance = `16 · ¼ · ¾ = 3`; per-bin stddev ≈ 1.732.
 
 **Boundary derivation:** `mean + 2·σ = 4 + 3.464 ≈ 7.46`, so a
-single-bin max of **≥ 8** is ~2σ above the fair-RSS mean.
-Conversely, `mean − 2·σ = 0.536`, so a single-bin min of **≤ 0**
-is ~2σ below. Because bin counts are bounded (0 ≤ n_w ≤ 16),
-the one-sided tails are skewed; we validated via a 10⁶-trial
-Monte Carlo (`scripts/rss_multinomial.py`, inline in the capture
-script as a sanity check):
+single-bin max of **≥ 8** is ~2σ above the fair-RSS mean and
+**≥ 9** is ~2.9σ above. Conversely, `mean − 2·σ = 0.536`, so a
+single-bin min of **≤ 0** is ~2σ below. Because bin counts are
+bounded (0 ≤ n_w ≤ 16), the one-sided tails are skewed; we
+validated via a 10⁶-trial Monte Carlo (committed at
+`test/incus/step1-rss-multinomial.py`, deterministic seed=42):
 
 ```
 P(max(n_w) ≥ 7) ≈ 0.315
@@ -278,24 +281,53 @@ P(min(n_w) ≤ 0) ≈ 0.040
 ```
 
 **Threshold X — fire verdict A iff:**
-`max(n_w) ≥ 8` **OR** `min(n_w) ≤ 0`.
+`max(n_w) ≥ 9` **OR** `min(n_w) ≤ 0`.
 
-**FP rate on fair RSS:** `P(max ≥ 8)` ≈ 0.108 and `P(min ≤ 0)`
+**FP rate on fair RSS:** `P(max ≥ 9)` ≈ 0.030 and `P(min ≤ 0)`
 ≈ 0.040; the two events are negatively correlated in a
-multinomial (if one bin is big, the others are more likely to
-be non-zero), so the union is slightly less than the sum. Monte
-Carlo union = **0.133** (~13 % combined FP). This is the
-HFT-acceptable floor: tightening to `max ≥ 9 OR min ≤ 0` drops
-FP to ~0.07 but misses the "one worker at 56 %" (n=9) case,
-which is a real imbalance the plan must not hide. We accept the
-13 % FP explicitly and document it in the findings doc for any
-cell that fires A.
+multinomial (if one bin is big, the others are more likely to be
+non-zero), so the union is slightly less than the sum. Monte
+Carlo union = **0.064** (~6.4 % combined FP) — the script
+output below confirms this number. We tighten from the previous
+draft's `≥ 8 / ≤ 0` (FP ≈ 13.3 %) on the round-2 reviewer's
+explicit recommendation. The `≥ 9 / ≤ 0` boundary still catches
+"one worker at 56 % of work" (n=9) and "one worker idle" (n=0),
+which are the failure modes Verdict A must not hide; it loses
+n=8 (one worker at 50 %), which is borderline and we accept that
+trade for the lower FP rate.
 
-**Rationale for the looser `≥ 7 OR ≤ 1` Codex suggested:** Monte
-Carlo shows its union FP is **0.412** — one in 2.4 fair runs
-false-positives on A. Far too loose. The `8 / 0` boundary is the
-knee where FP drops below ~15 % while still catching the single-
-worker 50-56 % and the zero-flow-on-one-worker failure modes.
+**Why not tighten further to `≥ 10 OR ≤ 0` (FP ≈ 4.5 %):** that
+boundary requires one worker to carry > 62 % of flows before A
+fires. At n=10 a single worker is doing more than 2.5x its fair
+share — by then verdict A has already missed the regime we
+actually care about (one worker overloaded, three idle-ish).
+The 6.4 % FP is the correct knee given how lopsided n=10 already
+is.
+
+**Rationale for the looser `≥ 7 OR ≤ 1` Codex's earlier review
+suggested:** Monte Carlo shows its union FP is **0.412** — one
+in 2.4 fair runs false-positives on A. Far too loose.
+
+**Reproducibility — committed Monte Carlo:** the script is
+`test/incus/step1-rss-multinomial.py` (deterministic seed=42,
+1e6 trials, 16 flows over 4 workers). Re-run with:
+
+```
+python3 test/incus/step1-rss-multinomial.py
+```
+
+Sample output (current repo state, seed=42):
+
+```
+P(max>=7)              0.3148
+P(max>=8)              0.1083
+P(max>=9)              0.0298
+P(min<=0)              0.0399
+P(min<=1)              0.2464
+FP_union_max8_or_min0  0.1331
+FP_union_max9_or_min0  0.0638   <-- Threshold X (current plan)
+FP_union_max7_or_min1  0.4115
+```
 
 **Mapping to `load_w` share:** for reporting we emit
 `load_spread = (max(n_w) − min(n_w)) / 16` in the verdict line,
@@ -345,31 +377,61 @@ evidence, all three clauses required:
   collision).
 - **B-indirect (rate spread):** inside a single worker whose
   flows are all mapped to the SAME CoS queue,
-  `max_f rate_f / min_f rate_f` ≥ `Y_ratio`, ignoring flows whose
-  `rate_f < 0.5 × median` (slow-start tails).
+  `max_f rate_f / min_f rate_f` ≥ `Y_ratio` (= 2.72 per the
+  derivation below), ignoring flows whose `rate_f < 0.5 × median`
+  (slow-start tails).
 - **B-necessary (not-A, not-C):** verdict A did not fire AND
   `ring_w < Z_ring` on the worker under test (so the unfairness
   isn't downstream of TX-ring saturation).
 
-**Threshold Y (rate spread):** `max_f / min_f ≥ 1.40`.
+**Threshold Y (rate spread):** `max_f / min_f ≥ 2.72`.
 
-*Math.* Under pure byte-rate-fair MQFQ, per-flow rates inside one
-queue should converge to within the SFQ quantum (one MTU) over
-the 60 s window. For 16 flows at ~5 Gbps per queue the
-MTU-quantum noise floor is `1500 / (5Gbps / 16) ≈ 0.005` i.e.
-~0.5 % rate spread per flow. A 1.40× spread = 40 % spread = ~80σ
-on the noise floor under the pure-MQFQ model, so the only
-question is: how much rate spread is "expected" from
-shaper-token-bucket interaction alone (even when MQFQ is
-working)?
+*Derivation (round-2 reviewer's "mean + 2·stddev of observed
+spread" rule).* The committed analysis script
+`test/incus/step1-rate-spread-analysis.py` reads the four
+forward shaped cells in
+`docs/pr/line-rate-investigation/evidence-8matrix/`
+(`p5201-fwd.json`, `p5202-fwd.json`, `p5203-fwd.json`,
+`p5204-fwd.json`), extracts each cell's 16 per-flow
+`sender.bits_per_second` values, drops slow-start tails (any
+flow with rate < 0.5 × the cell's median), and computes the
+within-cell `max_f / trimmed_min_f` ratio.
 
-Empirically (cf. `8matrix-findings.md` per-flow breakdown on
-`p5201-fwd-with-cos`), the highest observed in-worker ratio on a
-cell we believe to be healthy is ~1.25. Setting Y at 1.40 =
-~12 % above that empirical ceiling, FP-tight for "healthy MQFQ
-under a well-sized bucket." Expected FP on healthy cells: < 5 %
-based on the 8matrix + 4 clean reverse-cell samples we already
-hold.
+Result (re-runnable with `python3 test/incus/step1-rate-spread-analysis.py`):
+
+```
+cell           n   max_gbps   min_gbps    ratio
+p5201-fwd      16    0.0906     0.0413   2.1920
+p5202-fwd      16    0.7121     0.5184   1.3736
+p5203-fwd      16    1.7359     1.0560   1.6439
+p5204-fwd      16    0.0096     0.0042   2.2510
+mean across 4 cells: 1.8651
+stddev:              0.4267
+Y = mean + 2·stddev: 2.7186  (rounded UP to 2.72)
+```
+
+Y = **2.72**. The earlier draft's `1.40` was hand-waved against
+"~1.25 highest observed" — but the actual 8-matrix shows three
+of the four forward shaped cells exceed 1.40 already, so the
+old Y would have false-positive on the healthy reference
+itself. The data above is from the same 8-matrix runs the rest
+of this plan cites, so the empirical floor is the same one used
+for I2.
+
+The within-cell variance is genuinely larger on tight shapers
+(`p5201`, `p5204` ratios > 2) because Cubic per-flow congestion
+control under a hard rate cap produces oscillating per-flow
+windows that take many seconds to converge, even when MQFQ is
+fair byte-by-byte. The 2.72 threshold accepts that physics; a
+tighter threshold would mistake CC oscillation for shaper
+unfairness.
+
+*Expected FP rate.* Mean + 2·σ on a roughly-Gaussian sample
+gives ~5 % nominal FP. The 4-cell stddev is itself a noisy
+estimate (small N), so the true FP could be in the 5–15 %
+range; we accept that and rely on the AND-with-park-rate gate
+(B-direct) to keep combined FP for verdict B in the ≤ 5 %
+target band.
 
 **Threshold B_park (park rate):** 100 parks / s on the dominant
 queue for the iperf3 port.
@@ -443,8 +505,8 @@ leaving 5+ Gbps on the floor silently).
 
 | Verdict | Predicate                                                   | Nominal FP | Source-of-truth field                         |
 |---------|-------------------------------------------------------------|------------|-----------------------------------------------|
-| A       | `max(n_w) ≥ 8` OR `min(n_w) ≤ 0`                            | ≤ 0.13     | flow→queue→worker + `rx_packets` delta        |
-| B       | park-rate ≥ 100/s AND rate-spread ≥ 1.40 AND (NOT A, NOT C) | ≤ 0.05     | `queue_token_starvation_parks` + `ss -ti` RTT |
+| A       | `max(n_w) ≥ 9` OR `min(n_w) ≤ 0`                            | ≤ 0.064    | flow→queue→worker + `rx_packets` delta        |
+| B       | park-rate ≥ 100/s AND rate-spread ≥ 2.72 AND (NOT A, NOT C) | ≤ 0.05     | `queue_token_starvation_parks` + `ss -ti` RTT |
 | C       | `ring_w/60 ≥ 50` events/s on a worker with `cpu_w < 85 %`   | ≤ 0.01     | `dbg_tx_ring_full` + family, `mpstat`         |
 | D       | none of A/B/C AND SUM within 2 Gbps of shaper max           | n/a        | `iperf3.json` SUM vs. shaper rate             |
 
@@ -520,7 +582,7 @@ Each cell is declared VALID only if ALL invariants hold:
 | I3 | Between every pair of cells: smoke `iperf3 -c 172.16.80.200 -P 4 -t 5 -p 5203` passes with 0 retransmits | Forwarding healthy — measurement didn't break the firewall |
 | I4 | `cluster-status-pre.txt` and `cluster-status-post.txt` report the SAME node as RG0 primary | No failover mid-cell |
 | I5 | `dmesg-tail.txt` contains zero `softlockup`, `mlx5` error, `BUG:` | Kernel healthy |
-| I6 | `flow_steer_samples.jsonl` has exactly 12 lines, each parseable JSON, each with a non-empty `per_binding` array of length ≥ 8 (3 ifaces × ≥ 3 bindings min) | Snapshot sampler ran end-to-end |
+| I6 | `flow_steer_samples.jsonl` has exactly 12 lines, each parseable JSON, each with a non-empty `.status.per_binding` array of length ≥ 8 (3 ifaces × ≥ 3 bindings min). `_error: control_socket_timeout` placeholders count as failures. | Snapshot sampler ran end-to-end |
 | I7 | Per-worker flow counts derived two ways (Toeplitz-hash from `ss -ti` 5-tuples and per-binding `rx_packets` delta scaled by per-flow byte count) agree within ≤ 1 flow per worker | Verdict A predicate is integer-count; disagreement means one data source is wrong |
 | I8 | Four `xpf-userspace-worker-*` TIDs present via `ps -eLo pid,tid,comm` BEFORE `perf stat` attach and daemon unit `ActiveEnterTimestamp` unchanged between cell pre/post; addresses Codex MEDIUM #7 (wrong `pgrep -f` + restart during window) | `perf stat --per-thread` attachment is only valid for a quiescent worker set |
 | I9 | RG0 primary on `loss:xpf-userspace-fw0` at **start of run** (not just per-cell) and fabric link (`fab0`) shows no flap events in `journalctl -u xpfd -n 200` from the past hour; addresses Codex MEDIUM #8 (fw1 fab0 bug) | Primary drift onto fw1 strands the measurement on a known-bad node |
@@ -556,9 +618,9 @@ The protocol below is non-negotiable:
 3. **Wait for runtime reconciliation** on the control socket:
    ```
    for i in $(seq 1 30); do
-     count=$(echo '{"request_type":"status"}' \
+     count=$(echo '{"type":"status"}' \
        | socat -t 5 - UNIX-CONNECT:/run/xpf/userspace-dp.sock \
-       | jq '.cos_interfaces | length')
+       | jq '.status.cos_interfaces | length')
      [ "$count" -ge 1 ] && break
      sleep 1
    done
@@ -584,7 +646,7 @@ The protocol below is non-negotiable:
      | incus exec loss:xpf-userspace-fw0 -- /usr/local/sbin/cli
    ```
 8. **Wait for runtime reconciliation** (same loop as step 3,
-   inverted — `cos_interfaces | length == 0`).
+   inverted — `.status.cos_interfaces | length == 0`).
 9. **Immediately after reconciliation.** TWO checks:
    a. Smoke `iperf3 -c 172.16.80.200 -P 4 -t 5 -p 5201` SUM is
       `≥ 10 Gbps` (proves shaper IS gone). 0 retransmits
@@ -600,6 +662,30 @@ status`, `ip route show`, `echo status | socat -t 5 ...`) to
 `step1-evidence/halt-<ts>/` and stop. Do not auto-recover; this
 is a supervised halt so the root cause of the CoS-transition
 break is visible.
+
+**Failure modes the capture script handles end-to-end** (round-2
+review): the committed `step1-capture.sh` implements three
+explicit error paths so the orchestrator does not silently
+proceed past a broken cell:
+
+1. **CoS apply failure.** Pre-cell, if `with-cos` is requested
+   but `.status.cos_interfaces` is empty, the script invokes
+   `apply-cos-config.sh` once and waits up to 30 s for
+   reconciliation. If apply exits non-zero or `cos_interfaces`
+   stays empty, the script writes a state dump to
+   `step1-evidence/halt-<ts>/` (via `halt_with_dump`) and exits 3.
+2. **Failover detection.** If the post-run control-socket call
+   fails, the script re-runs `cli -c "show chassis cluster
+   status"` to determine whether fw0 is still primary. If the
+   primary moved to fw1 the cell is marked SUSPECT (failover
+   mid-run); if fw0 is still primary but the socket is dead the
+   script halts with a state dump (likely daemon crash).
+3. **Control-socket timeout.** The 12-sample sampler retries each
+   `socat` once on timeout/decode failure. If the second attempt
+   also fails, it writes a placeholder
+   `{"_error":"control_socket_timeout","_sample_ts":...}` line so
+   invariant I6 fires deterministically and the cell is marked
+   SUSPECT instead of silently producing fewer than 12 samples.
 
 ## 7. Runtime budget
 
@@ -677,6 +763,13 @@ names the direction, not the shape.
   artifacts under `docs/pr/line-rate-investigation/step1-evidence/
   <cos-state>/p<port>-<dir>/` per §3, and produces `verdict.txt`
   per §4.3. Humans run the script, not the protocol by hand.
+  Threshold-X false-positive math is reproduced via the committed
+  Monte Carlo `test/incus/step1-rss-multinomial.py` (deterministic
+  seed=42); Threshold-Y empirical derivation is reproduced via
+  `test/incus/step1-rate-spread-analysis.py`, which reads the
+  `evidence-8matrix/` JSON files. Both are dependency-light
+  (Python stdlib only) so any reviewer can re-derive the
+  thresholds in seconds.
 - **No fixes during Step 1.** If we notice a fix-able bug mid-
   capture (say, a clearly broken `.link` file, a misconfigured
   sysctl), we DO NOT fix it in-band. We note it in the cell's
