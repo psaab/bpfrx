@@ -239,7 +239,13 @@ DAEMON_START_PRE=$(fw "systemctl show -p ActiveEnterTimestamp --value xpfd 2>/de
 echo "$DAEMON_START_PRE" > "$OUTDIR/daemon-start-pre.txt"
 
 # Collect worker TIDs per plan §2.2(c) / invariant I8.
-WORKER_TIDS=$(fw "ps -eLo tid,comm | awk '\$2 ~ /^xpf-userspace-worker-/ {print \$1}' | paste -sd,")
+# NOTE: Linux truncates comm to 15 chars (TASK_COMM_LEN=16 incl NUL), so
+# `xpf-userspace-worker-N` shows up as `xpf-userspace-w`. Match both the
+# truncated form and any hypothetical longer form; exclude the daemon
+# thread itself (`xpf-userspace-d`) and the main thread (`xpf-userspace`
+# with nothing after — but main PID == daemon TID so filter on
+# `tid != pid` to be safe).
+WORKER_TIDS=$(fw "ps -eLo pid,tid,comm | awk '\$3 ~ /^xpf-userspace-w/ && \$2 != \$1 {print \$2}' | paste -sd,")
 WORKER_TID_COUNT=$(echo "$WORKER_TIDS" | tr ',' '\n' | grep -c . || true)
 echo "$WORKER_TIDS" > "$OUTDIR/worker-tids.txt"
 if [[ "$WORKER_TID_COUNT" -lt 4 ]]; then
