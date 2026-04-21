@@ -1,5 +1,9 @@
 # PR #804 — Rust-quality review (per-binding ring-pressure counters)
 
+**ROUND 2: merge-ready YES**
+
+
+
 Branch: `pr/802-ring-counter-instrumentation`
 Reviewer focus: Rust idioms, types, test quality, plumbing cleanliness.
 (Correctness of aggregation semantics is the Codex reviewer's lane; I
@@ -188,3 +192,50 @@ MERGE: **YES**, land after addressing the MEDIUM test-quality point
 (either upgrade the substring check to a `serde_json::Value` key check
 or add a Go-side decode test). LOW items are polish; can ride a
 follow-up.
+
+---
+
+## Round 2 verification
+
+Re-reviewed against commits `3008a833` (split + Rust nits) and
+`75a90298` (Go decode mirror) on `pr/802-ring-counter-instrumentation`.
+All round-1 items CLOSED.
+
+- **MEDIUM (substring → JSON-object key check): CLOSED.** `main.rs:1790`
+  `binding_counters_snapshot_serializes_with_expected_wire_keys` now
+  goes through `serde_json::to_value(&snap).as_object()` and asserts
+  each expected key via `obj.contains_key(key)`
+  (`main.rs:1815-1836`). Bonus negative assertion at
+  `main.rs:1839-1842` — `!obj.contains_key("dbg_pending_overflow")`
+  pins that the pre-split wire key is gone, which is the exact
+  contract the Codex split relies on for non-silent re-attribution.
+  Substring false-positive class eliminated.
+
+- **LOW (explicit `#[serde(rename = "ifindex")]`): CLOSED.**
+  `protocol.rs:1375` — `#[serde(rename = "ifindex", default)]` on
+  `BindingCountersSnapshot::ifindex`. Matches the other renamed
+  fields on the struct; defensive comment at `protocol.rs:1370-1374`
+  documents the rationale (identity-today, protect against a future
+  Rust-field rename silently renaming the wire key).
+
+- **LOW (`impl From<&BindingStatus>` replaces `from_binding_status`):
+  CLOSED.** `protocol.rs:1406-1423` — `impl
+  From<&BindingStatus> for BindingCountersSnapshot` with full field
+  projection including both split fields
+  (`dbg_bound_pending_overflow`, `dbg_cos_queue_overflow`). Comment at
+  `protocol.rs:1402-1405` references #804 and notes the composition
+  win with `.map(BindingCountersSnapshot::from)`.
+
+- **NEW test `binding_counters_snapshot_tolerates_pre_split_wire`:
+  PRESENT.** `main.rs:1851-1883`. Decodes a hand-written legacy JSON
+  blob that carries `"dbg_pending_overflow": 99` (the pre-split key)
+  and asserts both new fields deserialize to `0` via
+  `serde(default)`, with the round-tripped fields
+  (`worker_id`, `dbg_tx_ring_full`, `rx_fill_ring_empty_descs`)
+  intact. Pins the Rust-side of the cross-boundary compat contract
+  that `75a90298` mirrors on the Go decode path (Go u64 zero-value
+  via `encoding/json`, confirmed in the commit message and
+  `pkg/dataplane/userspace/protocol.go` diff).
+
+Nothing else regressed. Rust-side test surface expanded, idioms
+tightened, wire contract pinned in both directions. Merge-ready.
