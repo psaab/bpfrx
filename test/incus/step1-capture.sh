@@ -26,6 +26,14 @@
 # Re-run protocol (up to 2 retries) is the caller's responsibility;
 # this script captures a single cell in one attempt.
 #
+# Control-socket schema, exact:
+#   request:  {"type":"status"}                  (per ControlRequest in
+#                                                 userspace-dp/src/protocol.rs:625-627)
+#   response: {"ok":true, "status":{...}}        (per ControlResponse, ibid:980-992)
+#   triage fields live on response.status.{per_binding,cos_interfaces,
+#     filter_term_counters,bindings} (ibid:719-736)
+#   filter-term hit counter is `packets`, NOT `matched_packets` (ibid:919-930)
+#
 set -euo pipefail
 
 usage() {
@@ -73,8 +81,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 FW="loss:xpf-userspace-fw0"
+FW_PEER="loss:xpf-userspace-fw1"
 HOST="loss:cluster-userspace-host"
 IPERF_SERVER="172.16.80.200"
+SOCK="/run/xpf/userspace-dp.sock"
+APPLY_COS_SH="${SCRIPT_DIR}/apply-cos-config.sh"
 
 OUTDIR="$REPO_ROOT/docs/pr/line-rate-investigation/step1-evidence/$COS/p${PORT}-${DIR}"
 mkdir -p "$OUTDIR"
@@ -83,9 +94,71 @@ log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 fw()  { incus exec "$FW"   -- bash -c "$*"; }
 host(){ incus exec "$HOST" -- bash -c "$*"; }
 
+# bail out via verdict.txt + non-zero exit. Marks the cell SUSPECT
+# (per §5: any invariant failure => SUSPECT; re-run is caller's job).
+suspect() {
+	echo "SUSPECT: $*" | tee "$OUTDIR/verdict.txt" >&2
+	exit 1
+}
+
+# fatal halt — for §6 transition failures the plan requires us to
+# stop and dump state rather than retry. Caller must investigate.
+halt_with_dump() {
+	local reason="$1"
+	local ts
+	ts=$(date +%s)
+	local dump="$REPO_ROOT/docs/pr/line-rate-investigation/step1-evidence/halt-${ts}"
+	mkdir -p "$dump"
+	log "HALT: $reason — writing state dump to $dump"
+	fw "cli -c 'show configuration'" > "$dump/show-configuration.txt" 2>&1 || true
+	fw "journalctl -u xpfd -n 200 --no-pager" > "$dump/journalctl-xpfd.txt" 2>&1 || true
+	fw "journalctl -u xpf-userspace-dp -n 200 --no-pager" \
+		> "$dump/journalctl-userspace.txt" 2>&1 || true
+	fw "cli -c 'show chassis cluster status'" > "$dump/cluster-status.txt" 2>&1 || true
+	fw "ip route show" > "$dump/ip-route.txt" 2>&1 || true
+	fw "echo '{\"type\":\"status\"}' | socat -t 5 - UNIX-CONNECT:$SOCK | jq ." \
+		> "$dump/status.json" 2>&1 || true
+	echo "HALT($reason) — dump=$dump" | tee "$OUTDIR/verdict.txt" >&2
+	exit 3
+}
+
+# Query the userspace-dp control socket. Retries once on timeout or
+# decode failure (per round-2 review: "on socket timeout, retry once
+# then mark cell SUSPECT"). Echoes the JSON response on stdout.
+ctl_status() {
+	local out
+	for attempt in 1 2; do
+		if out=$(fw "echo '{\"type\":\"status\"}' | socat -t 5 - UNIX-CONNECT:$SOCK 2>/dev/null | jq ." 2>/dev/null) \
+		   && [[ -n "$out" ]] \
+		   && echo "$out" | jq -e '.ok == true' >/dev/null 2>&1; then
+			echo "$out"
+			return 0
+		fi
+		log "ctl_status attempt $attempt failed; backoff 1s"
+		sleep 1
+	done
+	return 1
+}
+
+# Re-validate that fw0 is RG0 primary via the control socket. Used
+# when ctl_status fails (could be daemon down, could be failover that
+# moved the active to fw1). On detected drift we suspect the cell.
+recheck_primary() {
+	local s
+	if ! s=$(fw "cli -c 'show chassis cluster status' 2>/dev/null"); then
+		return 2
+	fi
+	if echo "$s" | grep -iE 'primary' | head -1 | grep -qiE 'fw0|node0'; then
+		return 0
+	fi
+	return 1
+}
+
 # -- 2.1 pre-run ------------------------------------------------------
 
 log "drain in-flight iperf3 on $FW and $HOST"
+fw_count=0
+host_count=0
 for attempt in 1 2 3; do
 	fw_count=$(fw "ss -tnH 'sport = :5201 or sport = :5202 or sport = :5203 or sport = :5204 or dport = :5201 or dport = :5202 or dport = :5203 or dport = :5204' | wc -l")
 	host_count=$(host "ss -tnH 'sport = :5201 or sport = :5202 or sport = :5203 or sport = :5204 or dport = :5201 or dport = :5202 or dport = :5203 or dport = :5204' | wc -l")
@@ -98,23 +171,61 @@ for attempt in 1 2 3; do
 	sleep 1
 done
 if [[ "$fw_count" != "0" || "$host_count" != "0" ]]; then
-	echo "SUSPECT: could not drain iperf3 after 3 attempts" | tee "$OUTDIR/verdict.txt" >&2
-	exit 1
+	suspect "could not drain iperf3 after 3 attempts"
 fi
 
 log "capture cluster-state snapshot (pre)"
 fw "cli -c 'show chassis cluster status'" > "$OUTDIR/cluster-status-pre.txt"
 
 # I9 start-of-run invariant: primary is fw0, no recent fab flap.
-PRIMARY_NODE=$(grep -E '^[[:space:]]*primary' "$OUTDIR/cluster-status-pre.txt" | head -1 || true)
-if ! echo "$PRIMARY_NODE" | grep -qi 'fw0\|node0'; then
-	echo "SUSPECT(I9): RG0 primary is not fw0: $PRIMARY_NODE" | tee "$OUTDIR/verdict.txt" >&2
-	exit 1
+if ! grep -E '^[[:space:]]*primary' "$OUTDIR/cluster-status-pre.txt" \
+   | head -1 | grep -qiE 'fw0|node0'; then
+	suspect "I9: RG0 primary is not fw0 (per cluster-status-pre.txt)"
 fi
 
+# §6 CoS-state assertion. The caller decides which COS state to run a
+# cell in, but the cluster's actual config must already match — this
+# script does NOT toggle CoS mid-cell (that's the orchestrator's job
+# in the §6 protocol). We just verify and bail loudly if the live
+# state disagrees, so we don't capture a mislabeled cell.
+log "verify live CoS state matches requested COS=$COS"
+PRE_STATUS=$(ctl_status) || halt_with_dump "control socket unreachable on pre-check"
+echo "$PRE_STATUS" > "$OUTDIR/control-status-pre.json"
+COS_LEN_PRE=$(echo "$PRE_STATUS" | jq '.status.cos_interfaces | length')
+case "$COS" in
+	with-cos)
+		if [[ "$COS_LEN_PRE" -lt 1 ]]; then
+			# CoS requested but absent — try one auto-apply per round-2
+			# "on CoS apply failure, bail with error message".
+			log "CoS expected but cos_interfaces is empty; attempting one apply via $APPLY_COS_SH"
+			if ! "$APPLY_COS_SH" "$FW" >>"$OUTDIR/cos-apply.log" 2>&1; then
+				halt_with_dump "with-cos requested but apply-cos-config.sh failed"
+			fi
+			# §6 step 3: wait up to 30 s for runtime reconciliation.
+			ok=0
+			for _i in $(seq 1 30); do
+				PRE_STATUS=$(ctl_status) || true
+				if [[ -n "$PRE_STATUS" ]] && \
+				   [[ "$(echo "$PRE_STATUS" | jq '.status.cos_interfaces | length')" -ge 1 ]]; then
+					ok=1; break
+				fi
+				sleep 1
+			done
+			if [[ "$ok" != "1" ]]; then
+				halt_with_dump "with-cos requested; cos_interfaces still empty 30 s after apply"
+			fi
+			echo "$PRE_STATUS" > "$OUTDIR/control-status-pre.json"
+		fi
+		;;
+	no-cos)
+		if [[ "$COS_LEN_PRE" -ge 1 ]]; then
+			halt_with_dump "no-cos requested but cos_interfaces is non-empty (cluster has live CoS); orchestrator must remove CoS before invoking this script"
+		fi
+		;;
+esac
+
 log "capture cold flow_steer snapshot"
-fw "echo '{\"request_type\":\"status\"}' | socat -t 5 - UNIX-CONNECT:/run/xpf/userspace-dp.sock | jq ." \
-	> "$OUTDIR/flow_steer_cold.json"
+echo "$PRE_STATUS" > "$OUTDIR/flow_steer_cold.json"
 
 log "capture cold NIC counters (ge-0-0-1, ge-0-0-2)"
 fw "ethtool -S ge-0-0-1 | grep -vE ' 0$' || true" > "$OUTDIR/nic-counters-cold-ge-0-0-1.txt"
@@ -124,7 +235,7 @@ log "capture CoS shaper state"
 fw "cli -c 'show class-of-service interface'" > "$OUTDIR/cos-interface-pre.txt"
 
 # I8: record daemon ActiveEnterTimestamp for the worker-restart check.
-DAEMON_START_PRE=$(fw "systemctl show -p ActiveEnterTimestamp --value xpfd || systemctl show -p ActiveEnterTimestamp --value xpf-userspace-dp || true")
+DAEMON_START_PRE=$(fw "systemctl show -p ActiveEnterTimestamp --value xpfd 2>/dev/null || systemctl show -p ActiveEnterTimestamp --value xpf-userspace-dp 2>/dev/null || true")
 echo "$DAEMON_START_PRE" > "$OUTDIR/daemon-start-pre.txt"
 
 # Collect worker TIDs per plan §2.2(c) / invariant I8.
@@ -132,8 +243,7 @@ WORKER_TIDS=$(fw "ps -eLo tid,comm | awk '\$2 ~ /^xpf-userspace-worker-/ {print 
 WORKER_TID_COUNT=$(echo "$WORKER_TIDS" | tr ',' '\n' | grep -c . || true)
 echo "$WORKER_TIDS" > "$OUTDIR/worker-tids.txt"
 if [[ "$WORKER_TID_COUNT" -lt 4 ]]; then
-	echo "SUSPECT(I8): only $WORKER_TID_COUNT worker TIDs found (expected >= 4)" | tee "$OUTDIR/verdict.txt" >&2
-	exit 1
+	suspect "I8: only $WORKER_TID_COUNT worker TIDs found (expected >= 4)"
 fi
 
 # -- 2.2 during run ---------------------------------------------------
@@ -154,29 +264,40 @@ host "iperf3 -c $IPERF_SERVER -P 16 -t 60 -p $PORT $MAYBE_R -J > /tmp/iperf3.jso
 sleep 0.2
 
 log "launch concurrent mpstat + perf stat + samplers (60 s)"
+# Note: the inner loop uses `{"type":"status"}` (the correct request
+# schema; previous draft used the wrong `request_type` key).
 fw "mpstat -P ALL 1 60 > /tmp/mpstat.txt 2>&1 &
     perf stat --per-thread -t $WORKER_TIDS \
       -e task-clock,cycles,instructions,cache-references,cache-misses,L1-dcache-load-misses,LLC-loads \
       -- sleep 60 > /tmp/perf-stat.txt 2>&1 &
     : > /tmp/flow_steer_samples.jsonl
     : > /tmp/ss-samples.jsonl
+    : > /tmp/sampler.err
     for i in \$(seq 0 11); do
-      (
-        ts=\$(date +%s)
-        echo '{\"request_type\":\"status\"}' \
-          | socat -t 5 - UNIX-CONNECT:/run/xpf/userspace-dp.sock \
-          | jq -c --arg ts \"\$ts\" '. + {_sample_ts: \$ts}' \
-          >> /tmp/flow_steer_samples.jsonl
-        {
-          echo \"{\\\"t\\\":\$ts,\\\"flows\\\":[\"
-          ss -tiH \"dport = :$PORT\" | awk 'BEGIN{first=1} {gsub(/\"/,\"\\\\\\\"\");
-               if(first){first=0}else{printf \",\"}; printf \"\\\"%s\\\"\", \$0}'
-          echo \"]}\"
-        } >> /tmp/ss-samples.jsonl
-      )
+      ts=\$(date +%s)
+      tries=0
+      sample=''
+      while [ \$tries -lt 2 ]; do
+        sample=\$(echo '{\"type\":\"status\"}' | socat -t 5 - UNIX-CONNECT:$SOCK 2>>/tmp/sampler.err | jq -c --arg ts \"\$ts\" '. + {_sample_ts: \$ts}' 2>>/tmp/sampler.err || true)
+        if [ -n \"\$sample\" ]; then break; fi
+        tries=\$((tries + 1))
+        sleep 0.5
+      done
+      if [ -z \"\$sample\" ]; then
+        # Emit a placeholder line so I6 can fail this cell deterministically.
+        echo \"{\\\"_sample_ts\\\":\\\"\$ts\\\",\\\"_error\\\":\\\"control_socket_timeout\\\"}\" >> /tmp/flow_steer_samples.jsonl
+      else
+        echo \"\$sample\" >> /tmp/flow_steer_samples.jsonl
+      fi
+      {
+        echo \"{\\\"t\\\":\$ts,\\\"flows\\\":[\"
+        ss -tiH \"dport = :$PORT\" | awk 'BEGIN{first=1} {gsub(/\"/,\"\\\\\\\"\");
+             if(first){first=0}else{printf \",\"}; printf \"\\\"%s\\\"\", \$0}'
+        echo \"]}\"
+      } >> /tmp/ss-samples.jsonl
       sleep 5
     done
-    wait"
+    wait" || log "WARN: during-run command group exited non-zero (will validate via invariants)"
 
 # Wait on iperf3 too.
 host "wait \$(cat /tmp/iperf3-pid) 2>/dev/null || true"
@@ -189,18 +310,29 @@ incus file pull "$FW/tmp/mpstat.txt"              "$OUTDIR/mpstat.txt"
 incus file pull "$FW/tmp/perf-stat.txt"           "$OUTDIR/perf-stat.txt"
 incus file pull "$FW/tmp/flow_steer_samples.jsonl" "$OUTDIR/flow_steer_samples.jsonl"
 incus file pull "$FW/tmp/ss-samples.jsonl"        "$OUTDIR/ss-samples.jsonl"
+incus file pull "$FW/tmp/sampler.err"             "$OUTDIR/sampler.err" 2>/dev/null || true
 
 # -- 2.3 post-run -----------------------------------------------------
 
 log "capture post-run snapshots"
-fw "echo '{\"request_type\":\"status\"}' | socat -t 5 - UNIX-CONNECT:/run/xpf/userspace-dp.sock | jq ." \
-	> "$OUTDIR/flow_steer_post.json"
+# Post-run status: if the control socket is unreachable now, it's a
+# strong signal a failover hit during the cell. Re-check primary; if
+# it moved to fw1 we suspect this cell rather than silently saving
+# garbage.
+if ! POST_STATUS=$(ctl_status); then
+	if recheck_primary; then
+		halt_with_dump "control socket unreachable post-run, but fw0 still primary — daemon may have crashed mid-cell"
+	fi
+	suspect "control socket unreachable post-run AND primary drifted (likely failover during cell)"
+fi
+echo "$POST_STATUS" > "$OUTDIR/flow_steer_post.json"
+
 fw "ethtool -S ge-0-0-1 | grep -vE ' 0$' || true" > "$OUTDIR/nic-counters-post-ge-0-0-1.txt"
 fw "ethtool -S ge-0-0-2 | grep -vE ' 0$' || true" > "$OUTDIR/nic-counters-post-ge-0-0-2.txt"
 fw "cli -c 'show chassis cluster status'" > "$OUTDIR/cluster-status-post.txt"
 fw "dmesg -T | tail -50" > "$OUTDIR/dmesg-tail.txt"
 
-DAEMON_START_POST=$(fw "systemctl show -p ActiveEnterTimestamp --value xpfd || systemctl show -p ActiveEnterTimestamp --value xpf-userspace-dp || true")
+DAEMON_START_POST=$(fw "systemctl show -p ActiveEnterTimestamp --value xpfd 2>/dev/null || systemctl show -p ActiveEnterTimestamp --value xpf-userspace-dp 2>/dev/null || true")
 echo "$DAEMON_START_POST" > "$OUTDIR/daemon-start-post.txt"
 
 # -- 5. post-capture invariants --------------------------------------
@@ -243,14 +375,16 @@ if grep -iE 'softlockup|mlx5.*(error|reset)|BUG:' "$OUTDIR/dmesg-tail.txt" >/dev
 fi
 
 # I6 — flow_steer_samples.jsonl has 12 lines, each valid JSON,
-# each with non-empty per_binding array of length >= 8.
+# each with non-empty per_binding array of length >= 8 under .status.
 SAMPLE_LINES=$(wc -l < "$OUTDIR/flow_steer_samples.jsonl")
 if [[ "$SAMPLE_LINES" != "12" ]]; then
 	add_fail "I6: expected 12 samples, got $SAMPLE_LINES"
 else
-	if ! jq -e 'select(.per_binding | length >= 8)' \
-	     "$OUTDIR/flow_steer_samples.jsonl" >/dev/null; then
-		add_fail "I6: per_binding array too small on one or more samples"
+	BAD_LINES=$(jq -c 'select((._error // null) != null
+		or (.status.per_binding // []) | length < 8)' \
+		"$OUTDIR/flow_steer_samples.jsonl" 2>/dev/null | wc -l)
+	if [[ "$BAD_LINES" -gt 0 ]]; then
+		add_fail "I6: $BAD_LINES of 12 samples failed (control_socket_timeout or per_binding < 8)"
 	fi
 fi
 
@@ -259,31 +393,34 @@ if [[ "$DAEMON_START_PRE" != "$DAEMON_START_POST" ]]; then
 	add_fail "I8: daemon restarted mid-cell ($DAEMON_START_PRE -> $DAEMON_START_POST)"
 fi
 
-# I10 — on with-cos cells, cos_interfaces non-empty AND filter_term_counters
-# delta non-zero on this port's term.
+# I10 — on with-cos cells, cos_interfaces non-empty AND
+# filter_term_counters delta non-zero on this port's term.
+# (Field is `packets`, NOT `matched_packets`; both arrays live under
+# .status, not at the top level.)
 if [[ "$COS" == "with-cos" ]]; then
-	COS_IFACE_COUNT=$(jq '.cos_interfaces | length' "$OUTDIR/flow_steer_post.json")
+	COS_IFACE_COUNT=$(jq '.status.cos_interfaces | length' "$OUTDIR/flow_steer_post.json")
 	if [[ "$COS_IFACE_COUNT" -lt 1 ]]; then
-		add_fail "I10: with-cos but cos_interfaces is empty"
+		add_fail "I10: with-cos but status.cos_interfaces is empty"
 	fi
-	# Filter-term-counter delta — require any term matching dest port
-	# to have non-zero packet/byte delta between cold and post.
-	DELTA=$(jq -r --arg p "$PORT" '
-		(.filter_term_counters // []) as $post
-		| ($post | map(select(.term_name | test($p))) | map(.matched_packets // 0) | add) // 0
+	# Filter-term-counter delta — require any term mentioning the
+	# port number to have non-zero packet delta between cold and post.
+	POST_PKTS=$(jq -r --arg p "$PORT" '
+		(.status.filter_term_counters // [])
+		| map(select(.term_name | test($p)))
+		| map(.packets // 0) | add // 0
 	' "$OUTDIR/flow_steer_post.json")
-	COLD_DELTA=$(jq -r --arg p "$PORT" '
-		(.filter_term_counters // []) as $cold
-		| ($cold | map(select(.term_name | test($p))) | map(.matched_packets // 0) | add) // 0
+	COLD_PKTS=$(jq -r --arg p "$PORT" '
+		(.status.filter_term_counters // [])
+		| map(select(.term_name | test($p)))
+		| map(.packets // 0) | add // 0
 	' "$OUTDIR/flow_steer_cold.json")
-	if [[ "$DELTA" -le "$COLD_DELTA" ]]; then
-		add_fail "I10: filter_term_counters delta is zero on port $PORT (cold=$COLD_DELTA post=$DELTA)"
+	if [[ "$POST_PKTS" -le "$COLD_PKTS" ]]; then
+		add_fail "I10: filter_term_counters delta is zero on port $PORT (cold=$COLD_PKTS post=$POST_PKTS)"
 	fi
 fi
 
 if [[ -n "$FAIL" ]]; then
-	echo "SUSPECT: $FAIL" | tee "$OUTDIR/verdict.txt" >&2
-	exit 1
+	suspect "$FAIL"
 fi
 
 log "all invariants PASS — cell valid; verdict classification deferred to post-run analysis"
