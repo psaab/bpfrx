@@ -261,6 +261,16 @@ type Daemon struct {
 	compileEverSucceeded    bool   // true once any compile completed cleanly
 	compileLastError        string // text of the most recent compile error
 	compileLastErrorUnixSec int64  // timestamp of the most recent compile error
+
+	// priorTunables stores the pre-xpfd values of every host-scope
+	// tunable xpfd has touched, so that restore-on-disable (B2) can
+	// revert to what the operator had before xpfd claimed the host.
+	// Populated lazily on first apply. Restored when claim-host-tunables
+	// transitions from true → false, or on daemon shutdown. See
+	// pkg/daemon/host_tunables.go for capture/restore implementation.
+	priorTunablesMu     sync.Mutex
+	priorTunables       *priorHostTunables
+	priorTunablesActive bool // true once the current config has applied host tunables
 }
 
 // CompileHealth is a snapshot of dataplane compile health (#758).
@@ -455,6 +465,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// `set system dataplane rss-indirection disable`.
 		rssEnabled := true
 		var rssAllowed []string
+		// #801 Phase-B Step-0 tunables: host-scope governor + netdev
+		// budget; per-iface mlx5 coalescence. Host-scope knobs are
+		// GATED by `claim-host-tunables true` (B1). Per-iface knobs
+		// (rx-usecs/tx-usecs) follow the D3 allowlist and are applied
+		// whenever coalescence is configured.
+		var (
+			governor          string
+			netdevBudget      int
+			coalesceEnable    bool
+			coalesceRX        int
+			coalesceTX        int
+			userspaceDP       bool
+			coalesceExplicit  bool
+			claimHostTunables bool
+		)
 		if cfg := d.store.ActiveConfig(); cfg != nil {
 			if cfg.Chassis.Cluster != nil {
 				clusterMode = true
@@ -465,6 +490,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// when userspace dataplane is not in use — applyRSSIndirection
 			// treats that as a no-op.
 			if cfg.System.DataplaneType == "userspace" && cfg.System.UserspaceDataplane != nil {
+				userspaceDP = true
 				userspaceWorkers = cfg.System.UserspaceDataplane.Workers
 				if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
 					rssEnabled = false
@@ -472,11 +498,38 @@ func (d *Daemon) Run(ctx context.Context) error {
 				// Codex H1: scope D3 to only interfaces that
 				// userspace-dp actually binds AF_XDP sockets on.
 				rssAllowed = dpuserspace.UserspaceBoundLinuxInterfaces(cfg)
+				// #801 knobs.
+				claimHostTunables = cfg.System.UserspaceDataplane.ClaimHostTunables
+				governor = cfg.System.UserspaceDataplane.CPUGovernor
+				netdevBudget = cfg.System.UserspaceDataplane.NetdevBudget
+				coalesceExplicit = cfg.System.UserspaceDataplane.CoalescenceAdaptiveExplicit
+				// coalesceEnable stays false by default — the Step-0
+				// finding is "adaptive=on causes pp99 latency jitter",
+				// so default-off is what the issue asks for. An
+				// explicit `adaptive enable` inverts this.
+				if coalesceExplicit &&
+					!cfg.System.UserspaceDataplane.CoalescenceAdaptiveDisabled {
+					coalesceEnable = true
+				}
+				coalesceRX = cfg.System.UserspaceDataplane.CoalescenceRXUsecs
+				coalesceTX = cfg.System.UserspaceDataplane.CoalescenceTXUsecs
 			}
 		}
 		if err := enumerateAndRenameInterfaces(nodeID, clusterMode, userspaceWorkers, rssEnabled, rssAllowed); err != nil {
 			slog.Warn("interface naming failed", "err", err)
 		}
+		// #801: host tunables + coalescence. Runs after the interface
+		// rename but still before the dataplane is loaded — matches
+		// the D3 "before any AF_XDP bind" invariant. Best-effort: any
+		// failure logs and continues.
+		//
+		// B1 opt-in gate: host-scope knobs (governor + netdev_budget +
+		// adaptive-rx/tx flip) only apply when `claim-host-tunables
+		// true` is set. This keeps xpfd from stepping on shared hosts
+		// silently. D3 and per-iface rx-usecs/tx-usecs continue to run
+		// as before — both are interface-scoped.
+		d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
+			coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 	}
 
 	// Initialize routing, FRR, and IPsec managers
@@ -1264,6 +1317,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.dp.Teardown()
 		}
 	}
+
+	// #801 B2: restore any host-scope tunables xpfd claimed to their
+	// pre-xpfd values. No-op if `claim-host-tunables` was never set.
+	// Runs on every shutdown (hitless + fail-closed) so stopping xpfd
+	// leaves the host as xpfd found it.
+	d.restoreStep0TunablesOnShutdown()
 
 	slog.Info("shutdown complete")
 	return runErr
@@ -2302,14 +2361,40 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		rssEnabled := true
 		workers := 0
 		var rssAllowed []string
+		// #801: mirror the startup site so a commit that changes any
+		// of the Step-0 knobs takes effect without a restart.
+		var (
+			governor          string
+			netdevBudget      int
+			coalesceEnable    bool
+			coalesceRX        int
+			coalesceTX        int
+			userspaceDP       bool
+			coalesceExplicit  bool
+			claimHostTunables bool
+		)
 		if cfg.System.DataplaneType == "userspace" && cfg.System.UserspaceDataplane != nil {
+			userspaceDP = true
 			workers = cfg.System.UserspaceDataplane.Workers
 			if cfg.System.UserspaceDataplane.RSSIndirectionDisabled {
 				rssEnabled = false
 			}
 			rssAllowed = dpuserspace.UserspaceBoundLinuxInterfaces(cfg)
+			claimHostTunables = cfg.System.UserspaceDataplane.ClaimHostTunables
+			governor = cfg.System.UserspaceDataplane.CPUGovernor
+			netdevBudget = cfg.System.UserspaceDataplane.NetdevBudget
+			coalesceExplicit = cfg.System.UserspaceDataplane.CoalescenceAdaptiveExplicit
+			if coalesceExplicit &&
+				!cfg.System.UserspaceDataplane.CoalescenceAdaptiveDisabled {
+				coalesceEnable = true
+			}
+			coalesceRX = cfg.System.UserspaceDataplane.CoalescenceRXUsecs
+			coalesceTX = cfg.System.UserspaceDataplane.CoalescenceTXUsecs
 		}
 		reapplyRSSIndirection(rssEnabled, workers, rssAllowed)
+		// #801 B1 + B2: opt-in gate + restore-on-disable.
+		d.applyStep0Tunables(userspaceDP, claimHostTunables, governor, netdevBudget,
+			coalesceExplicit, coalesceEnable, coalesceRX, coalesceTX, rssAllowed)
 	}
 }
 

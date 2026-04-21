@@ -452,6 +452,57 @@ func compileUserspaceDataplane(node *Node, cfg *UserspaceConfig) error {
 			if nodeVal(child) == "disable" {
 				cfg.RSSIndirectionDisabled = true
 			}
+		case "claim-host-tunables":
+			// #801 B1 opt-in gate. Defaults false. Only the literal
+			// string "true" turns it on; anything else (including
+			// "false", "enable", and empty) leaves the default-safe
+			// behaviour in which xpfd never touches host-scope knobs.
+			if nodeVal(child) == "true" {
+				cfg.ClaimHostTunables = true
+			}
+		case "cpu-governor":
+			// `performance` | `schedutil` | `default` (skip). Stored
+			// verbatim; daemon maps `default` / "" → no write. Any
+			// unrecognised governor is also passed through so bare-metal
+			// operators can request `powersave` / `ondemand` if needed
+			// without a config-schema change.
+			cfg.CPUGovernor = nodeVal(child)
+		case "netdev-budget":
+			if v := nodeVal(child); v != "" {
+				cfg.NetdevBudget, _ = strconv.Atoi(v)
+			}
+		case "coalescence":
+			// `coalescence adaptive enable|disable`, `coalescence
+			// rx-usecs <n>`, `coalescence tx-usecs <n>`. All three keys
+			// live under the same node to mirror the Junos shape
+			// (`set system dataplane coalescence <knob> <val>`).
+			for _, sub := range child.Children {
+				switch sub.Name() {
+				case "adaptive":
+					// `enable` → operator opt-out of the "disable by
+					// default" behaviour; `disable` (or any other value,
+					// including "") → apply `ethtool -C adaptive-rx off
+					// adaptive-tx off`. Explicit is set whenever the
+					// knob was written so the daemon can distinguish
+					// "omitted" from "explicitly enable" in logs.
+					v := nodeVal(sub)
+					cfg.CoalescenceAdaptiveExplicit = true
+					if v == "enable" {
+						cfg.CoalescenceAdaptiveDisabled = false
+					} else {
+						// Includes "disable", empty, and unknown values.
+						cfg.CoalescenceAdaptiveDisabled = true
+					}
+				case "rx-usecs":
+					if v := nodeVal(sub); v != "" {
+						cfg.CoalescenceRXUsecs, _ = strconv.Atoi(v)
+					}
+				case "tx-usecs":
+					if v := nodeVal(sub); v != "" {
+						cfg.CoalescenceTXUsecs, _ = strconv.Atoi(v)
+					}
+				}
+			}
 		}
 	}
 	return nil

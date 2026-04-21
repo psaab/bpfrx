@@ -859,15 +859,45 @@ var OperationalTree = map[string]*Node{
 	"exit": {Desc: "Exit CLI"},
 }
 
+// ConfigSetDataplaneKnobs is the `?` help surface for `set system
+// dataplane <knob>`. Codex M3 / Go F1: the schema in pkg/config/ast.go
+// already backs tab completion for these knobs, but `?` help and the
+// explicit per-knob description live in cmdtree. Keeping this map tiny
+// and focused lets us grow it without restating the full config
+// schema here — tab-completion for siblings still falls through to
+// the schema walker.
+var ConfigSetDataplaneKnobs = map[string]*Node{
+	"rss-indirection":     {Desc: "mlx5 RSS indirection reshaping (enable|disable)"},
+	"claim-host-tunables": {Desc: "Allow xpfd to write host-scope tunables (true|false; default false)"},
+	"cpu-governor":        {Desc: "Host cpufreq governor (performance|schedutil|default)"},
+	"netdev-budget":       {Desc: "net.core.netdev_budget value"},
+	"coalescence": {Desc: "NIC interrupt-coalescence tuning (mlx5)", Children: map[string]*Node{
+		"adaptive": {Desc: "Adaptive coalescing (enable|disable)"},
+		"rx-usecs": {Desc: "RX coalescing microseconds"},
+		"tx-usecs": {Desc: "TX coalescing microseconds"},
+	}},
+}
+
 // ConfigTopLevel defines tab completion for config mode top-level commands.
 var ConfigTopLevel = map[string]*Node{
 	"annotate": {Desc: "Annotate the configuration statement"},
 	"copy":     {Desc: "Copy a configuration statement"},
 	"insert":   {Desc: "Insert a new ordered configuration statement"},
 	"rename":   {Desc: "Rename a configuration statement"},
-	"set":      {Desc: "Set a configuration parameter"},
-	"delete":   {Desc: "Delete a configuration statement"},
-	"show":     {Desc: "Show configuration"},
+	"set": {Desc: "Set a configuration parameter", Children: map[string]*Node{
+		"system": {Desc: "System configuration", Children: map[string]*Node{
+			// Codex M3: surface the #785/#801 dataplane knobs so `?`
+			// help and tab completion show descriptions for
+			// rss-indirection / claim-host-tunables / cpu-governor /
+			// netdev-budget / coalescence without the operator having
+			// to guess at the spelling from the issue body. The schema
+			// walker handles completion for every other `set system`
+			// path; this hierarchy only supplies extra descriptions.
+			"dataplane": {Desc: "Userspace dataplane tunables", Children: ConfigSetDataplaneKnobs},
+		}},
+	}},
+	"delete": {Desc: "Delete a configuration statement"},
+	"show":   {Desc: "Show configuration"},
 	"commit": {Desc: "Commit current set of changes", Children: map[string]*Node{
 		"check":     {Desc: "Check correctness of syntax; do not apply changes"},
 		"comment":   {Desc: "Add comment to commit"},

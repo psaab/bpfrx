@@ -2736,6 +2736,136 @@ func TestUserspaceDataplaneRSSIndirectionDisable(t *testing.T) {
 	}
 }
 
+// #801: Phase-B Step-0 knobs — cpu-governor, netdev-budget,
+// coalescence adaptive/rx-usecs/tx-usecs. All live under `system
+// dataplane` alongside the existing rss-indirection switch.
+func TestUserspaceDataplaneStep0Knobs(t *testing.T) {
+	tree := &ConfigTree{}
+	lines := []string{
+		"set system dataplane-type userspace",
+		"set system dataplane binary /usr/local/bin/xpf-userspace-dp",
+		"set system dataplane control-socket /run/xpf/userspace-dp.sock",
+		"set system dataplane state-file /run/xpf/userspace-dp.json",
+		"set system dataplane workers 4",
+		"set system dataplane cpu-governor performance",
+		"set system dataplane netdev-budget 600",
+		"set system dataplane coalescence adaptive disable",
+		"set system dataplane coalescence rx-usecs 16",
+		"set system dataplane coalescence tx-usecs 32",
+	}
+	for _, line := range lines {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp := cfg.System.UserspaceDataplane
+	if dp == nil {
+		t.Fatal("UserspaceDataplane is nil")
+	}
+	if dp.CPUGovernor != "performance" {
+		t.Errorf("CPUGovernor=%q, want performance", dp.CPUGovernor)
+	}
+	if dp.NetdevBudget != 600 {
+		t.Errorf("NetdevBudget=%d, want 600", dp.NetdevBudget)
+	}
+	if !dp.CoalescenceAdaptiveExplicit {
+		t.Error("CoalescenceAdaptiveExplicit=false, want true (operator wrote the knob)")
+	}
+	if !dp.CoalescenceAdaptiveDisabled {
+		t.Error("CoalescenceAdaptiveDisabled=false, want true (explicit disable)")
+	}
+	if dp.CoalescenceRXUsecs != 16 {
+		t.Errorf("CoalescenceRXUsecs=%d, want 16", dp.CoalescenceRXUsecs)
+	}
+	if dp.CoalescenceTXUsecs != 32 {
+		t.Errorf("CoalescenceTXUsecs=%d, want 32", dp.CoalescenceTXUsecs)
+	}
+}
+
+// #801: `coalescence adaptive enable` is the operator override. It
+// must set Explicit=true AND Disabled=false so the daemon re-enables
+// adaptive (mirror of the default).
+func TestUserspaceDataplaneCoalescenceAdaptiveEnable(t *testing.T) {
+	tree := &ConfigTree{}
+	base := []string{
+		"set system dataplane-type userspace",
+		"set system dataplane binary /usr/local/bin/xpf-userspace-dp",
+		"set system dataplane control-socket /run/xpf/userspace-dp.sock",
+		"set system dataplane state-file /run/xpf/userspace-dp.json",
+		"set system dataplane workers 4",
+		"set system dataplane coalescence adaptive enable",
+	}
+	for _, line := range base {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp := cfg.System.UserspaceDataplane
+	if !dp.CoalescenceAdaptiveExplicit {
+		t.Error("Explicit=false, want true")
+	}
+	if dp.CoalescenceAdaptiveDisabled {
+		t.Error("Disabled=true for `adaptive enable`, want false")
+	}
+}
+
+// #801: omitting every knob must leave the defaults at zero so
+// daemon.resolvedHostTunables can substitute the issue's defaults
+// without colliding with an operator value.
+func TestUserspaceDataplaneStep0Knobs_OmittedDefaultsToZero(t *testing.T) {
+	tree := &ConfigTree{}
+	base := []string{
+		"set system dataplane-type userspace",
+		"set system dataplane binary /usr/local/bin/xpf-userspace-dp",
+		"set system dataplane control-socket /run/xpf/userspace-dp.sock",
+		"set system dataplane state-file /run/xpf/userspace-dp.json",
+		"set system dataplane workers 4",
+	}
+	for _, line := range base {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dp := cfg.System.UserspaceDataplane
+	if dp.CPUGovernor != "" {
+		t.Errorf("CPUGovernor=%q, want empty (omitted)", dp.CPUGovernor)
+	}
+	if dp.NetdevBudget != 0 {
+		t.Errorf("NetdevBudget=%d, want 0 (omitted)", dp.NetdevBudget)
+	}
+	if dp.CoalescenceAdaptiveExplicit {
+		t.Error("Explicit=true, want false (omitted)")
+	}
+	if dp.CoalescenceRXUsecs != 0 || dp.CoalescenceTXUsecs != 0 {
+		t.Errorf("RX/TX usecs = %d/%d, want 0/0 (omitted)",
+			dp.CoalescenceRXUsecs, dp.CoalescenceTXUsecs)
+	}
+}
+
 func TestRIPAuthSetSyntax(t *testing.T) {
 	cmds := []string{"set protocols rip neighbor trust0", "set protocols rip authentication-type md5", "set protocols rip authentication-key ripSecret"}
 	tree := &ConfigTree{}
