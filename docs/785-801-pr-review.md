@@ -163,3 +163,11 @@ first-apply write cost exceeds the marginal safety over the identity
 semantics we already get. Operators who need strict pre-xpfd
 recovery across crashes can set their values via `/etc/sysctl.d/` or
 systemd `ExecStartPre`.
+
+## Round 3 verification
+
+- M2 evidence: RESOLVED — `repro-matched-5run.sh` now drives explicit `baseline` and `knobs-on` batches, and both labeled 5-run summaries are committed in `docs/801-evidence/repro-matched-5run.sh:3`, `docs/801-evidence/baseline-knobs-off/summary.txt:1`, and `docs/801-evidence/knobs-on/summary.txt:1`.
+- Opt-in gate blocks coalescence: RESOLVED — `applyStep0TunablesWith()` now calls `applyCoalescence()` before the host-scope opt-in skip path in `pkg/daemon/host_tunables_daemon.go:115` and `pkg/daemon/host_tunables_daemon.go:142`.
+- Crash persistence: RESOLVED — the accepted in-memory-only policy, including the rejected persisted snapshot alternative, is now explicit in `pkg/daemon/host_tunables.go:385` and `pkg/daemon/host_tunables.go:402`.
+
+ROUND 3: merge-ready YES
