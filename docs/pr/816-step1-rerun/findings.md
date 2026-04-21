@@ -36,6 +36,22 @@ total 37 min. Well inside the 120-min budget ceiling.
   correction — all are descriptive / structural, independent of
   permutation p-values).
 
+### Risk-by-finding table — what Path B (#817) closes per finding
+
+(Codex Round 2 MED: explicit close-criteria for the scipy-pin deferral.)
+
+| Finding | RNG-sensitive? | Artifact to recompute under pinned scipy | Close condition for #817 |
+|---|:-:|---|---|
+| H2 D1 verdict (k_D1 ≥ 2 fires across shaped-fwd cells) | NO — stat_obs ≈ 0.9 dwarfs MC SE | `evidence/with-cos/{p5201-fwd,p5202-fwd}/perm-test-results.json` | Pinned p_D1 ≤ 0.05 on both cells |
+| Cleaned-baseline k_D1 = 5 (sensitivity §4) | LOW — p5203-fwd cleaned p=0.0246 is 0.027 above gate | re-run `step1-histogram-classify.py` with run1 dropped from `baseline/fwd-with-cos/` | Pinned cleaned p_D1 stays ≤ 0.05 (or finding gets a sensitivity caveat) |
+| Reverse-cell D1 fires (p5201-rev p=0.021, p5203-rev p=0.036) | MEDIUM — within 2× MC half-width of gate | `evidence/with-cos/{p5201-rev,p5203-rev}/perm-test-results.json` | Pinned p_D1 stays ≤ 0.05 OR cell drops to "near-gate LEAD" framing |
+| D2 downgrade (k_D2 excluded from verdict) | N/A — downgrade is methodological, not RNG | none | Always closed; D2 stays exploratory regardless of scipy |
+| Z_cos bimodal cluster summary | N/A — descriptive | none | Always closed; structural, not statistical |
+| H3-framing rejection | N/A — descriptive | none | Always closed; structural, not statistical |
+| Baseline-outlier identification | N/A — `baseline-blocks.jsonl` per-run summary | optional pinned re-derivation | Always closed; arithmetic, not RNG |
+
+**Acceptance for #817 closure:** all rows above marked "close condition" pass under the pinned environment. Diff committed as `docs/pr/816-step1-rerun/evidence/scipy-pin-validation.md`. If any reverse-cell D1 fire flips to quiet under the pinned RNG, findings.md §1.1 / §3 require an addendum noting the cell now reports as a near-gate LEAD instead of a fire (does not change the verdict; tightens the per-cell story).
+
 ---
 
 ## 1. Verdict (plan §8)
@@ -84,7 +100,7 @@ So the live branch is H2 D1.
 
 ### 1.1 Per-cell stat_D1 heterogeneity (the fires are not uniform)
 
-The four D1 fires span two orders of magnitude of effect size:
+The four D1 fires span ~80× in effect size (largest/smallest stat_obs ratio = 0.969 / 0.0124 ≈ 78×):
 
 | cell | `stat_D1` | p_D1 | regime |
 |---|---:|---:|---|
@@ -140,7 +156,7 @@ is withdrawn.**
 ```
 Park-rate observations on with-cos-fwd cells: [19867, 59624, 0, 16058].
 The distribution is visibly bimodal (line-rate p5203-fwd = 0; shaped
-cells = 19867-59624 parks/s, n=3). A Gaussian mean+2σ summary is the
+cells = 16058-59624 parks/s, n=3). A Gaussian mean+2σ summary is the
 wrong statistic for bimodal data and produces a number that
 corresponds to no real operating point. Replacement summary:
 {line-rate cluster: 0 parks/s; shaped cluster: 19867-59624 parks/s,
@@ -308,23 +324,35 @@ the D1 p-values for `fwd-with-cos` cells depend. The pooled mean for
 fwd-with-cos T_D1 is 0.0274 — ~60 % of that pooled mean comes from
 run1 alone.
 
-**Sensitivity analysis (run1 dropped).**
+<!-- Codex Round 2 LOW: stale evidence/summary-table.csv removed; the
+canonical summary-table.csv at docs/pr/816-step1-rerun/summary-table.csv
+is the single artifact. -->
 
-- **p5203-fwd-with-cos** current `p_D1 = 0.629` (comfortably quiet).
-  Cell mean T_D1 = 0.0248; runs-2-5 baseline mean = 0.0181. With
-  run1 dropped, the cell-vs-cleaned-baseline ratio is ~1.4× — still
-  below any reasonable fire threshold, but the "quiet" call becomes
-  less quiet and would warrant tighter examination in a future round.
-- **p5201-fwd and p5202-fwd** (the near-theoretical-max `stat_D1`
-  fires) are insensitive to dropping run1 — their fires do not
-  depend on the baseline mean's value when `stat_obs ≈ 0.9`
-  (distributional separation is near-saturated).
-- **p5204-fwd** is already SUSPECT via I12; run1 sensitivity does
-  not apply.
+**Sensitivity analysis (run1 dropped) — re-run with the actual classifier
+(`scipy.stats.permutation_test`, `random_state=42`, `n_resamples=10000`,
+48-block cleaned baseline):**
 
-The H2 D1 verdict does not change under run1 dropped; the load-bearing
-fires are robust. But the ordering of the near-gate fires (p5201-rev,
-p5203-rev) and the quiet-vs-nearly-fire line on p5203-fwd would shift.
+| cell | full-baseline p_D1 | full stat_D1 | cleaned p_D1 | cleaned stat_D1 | cleaned fire? |
+|---|---:|---:|---:|---:|:-:|
+| p5201-fwd-with-cos | 0.0001 | +0.969 | 0.0001 | +0.979 | YES (was YES) |
+| p5202-fwd-with-cos | 0.0001 | +0.885 | 0.0001 | +0.895 | YES (was YES) |
+| p5203-fwd-with-cos | 0.629  | −0.003 | **0.0246** | **+0.00677** | **YES (was NO)** |
+
+- **p5203-fwd-with-cos flips from D1-quiet to D1-fire** when run1 is
+  removed from the baseline pool. Codex Round 2 caught this; the
+  prior version of this section understated the effect ("still below
+  any reasonable fire threshold") and was wrong. Recomputed with the
+  same permutation-test machinery the verdict run used.
+- **p5201-fwd and p5202-fwd** are insensitive to run1 — `stat_obs`
+  near 0.9 is far above any baseline-mean perturbation of order 0.02.
+- **p5204-fwd** stays SUSPECT via I12 in either scenario.
+
+**Cleaned-baseline `k_D1 = 5`** (vs full-baseline `k_D1 = 4`). The H2
+D1 verdict not only survives, it strengthens — three shaped-forward
+cells fire D1 instead of two. The full-baseline result was a
+*conservative* read of the same signal; the cleaned-baseline read is
+the more accurate one. Reverse cells and D2 channel are unaffected
+(verified by re-running the classifier with run1 dropped on each).
 
 **Action for future rounds.** Baseline runs must pass a
 **per-baseline-run sanity check** before pooling — re-classify each

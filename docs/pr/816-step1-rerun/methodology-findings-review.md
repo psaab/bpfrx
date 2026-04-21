@@ -402,3 +402,141 @@ ROUND 1: FINDINGS-ACCEPTED NO
 
 Open items: HIGH-M1, HIGH-M2, HIGH-M3, HIGH-M4, MED-M5, MED-M6, MED-M7,
 MED-M8, LOW-M9, LOW-M10.
+
+---
+
+## Round 2 verification
+
+**Commit reviewed:** `bd5c18ee` on branch `pr/816-step1-rerun`.
+Path-decision at `docs/pr/816-step1-rerun/path-decision.md` (Path A:
+in-place revision without re-run; Path B re-run under pinned scipy
+deferred to #817).
+
+Per-finding verification against the revised `findings.md`,
+`summary-table.csv`, and `evidence/with-cos/p5204-fwd/perm-test-
+results.json`:
+
+### HIGH-M1 — D2 downgrade — RESOLVED
+
+`findings.md:62-69` names the degenerate-null framing explicitly.
+`findings.md:184-203` downgrades D2 to "stat-fire" with a raw-frame
+breakdown table (5 / 13 / 3 frames). `findings.md:273-274` excludes
+`k_D2` from the verdict aggregation with "no — exploratory only per
+§2". `§7:515-522` adds a plan-level action to re-specify T_D2 with a
+minimum-count floor before D2 is used in any future round. The
+"statistical fire ≠ mechanistic fire" distinction is now explicit
+throughout. Clean.
+
+### HIGH-M2 — baseline run1 outlier — RESOLVED
+
+New `§4 Baseline outlier` (`findings.md:286-336`) documents the per-run
+table with the 3.5× outlier quantified. Sensitivity analysis correctly
+identifies that p5201-fwd / p5202-fwd fires are insensitive
+(`stat_obs ≈ 0.9` is near-saturated) and that p5203-fwd "quiet" call
+becomes ~1.4× less quiet (does not flip). `§6:446-449` adds a note
+that H-STOP-5 is a count gate and did not catch the distribution drift;
+future plans need a per-run sanity gate. Action item is documented
+(§4:329-336) and explicitly deferred to Step 2 design doc. Clean.
+
+### HIGH-M3 — Z_cos methodology — RESOLVED
+
+`findings.md:137-138` explicitly withdraws the 74,552 figure. The
+replacement summary (`§1.3:141-150`) uses the two-cluster framing I
+recommended ("line-rate cluster: 0 parks/s; shaped cluster: 19,867 -
+59,624 parks/s, n = 3"). `§1.3:152-155` states "no single threshold is
+derivable from n=4 observations that include a zero." AFD calibration
+is flagged as needing stratification. `§7:511-516` carries this into
+Step 2 direction. Clean.
+
+### HIGH-M4 — H3 multi-channel framing — RESOLVED
+
+Verdict changed to **H2 D1** (`findings.md:41-50`). Round 1's H3
+framing is explicitly rejected with three numbered arguments
+(`§1:51-82`): (1) D2 does not pass a mechanistic significance floor,
+(2) the two "both-fire" cells are in structurally disjoint regimes
+(shaped 10 Gbps mode-5 vs reverse 18 Gbps mode-9), (3) the H3
+out-of-family branch also does not fire. The disjoint-regime
+observation is load-bearing and correctly framed — "not two symptoms
+of one upstream cause, but two different workloads whose histograms
+happen to both clip an under-powered D2 gate." Clean.
+
+### MED-M5 — "D4 reap-hold" guess — RESOLVED
+
+`§7:468-508` replaces the single-mechanism "D4 post-submit reap-hold"
+framing with five enumerated candidate mechanisms (submit→DMA stalls,
+RX NAPI budget exhaustion, kernel descheduling, virtualization
+jitter, iperf3 client burstiness) each with specific discriminating
+telemetry. `§7:506-508` has the explicit "data shows D1 fires on
+shaped cells; the data does NOT distinguish among (1) - (5)"
+statement. Clean.
+
+### MED-M6 — 0.79σ MDE not re-validated — RESOLVED
+
+Addressed via the HIGH-M1 D2 downgrade framing rather than a separate
+discussion of σ heterogeneity across pools. The 0.79σ floor is no
+longer invoked in a verdict-bearing way — it survives only as a
+plan-level reference, and the D2 degenerate null is the load-bearing
+explanation for why D2 is unreliable. Both interpretations reach the
+same outcome. Acceptable, but a future plan revision should explicitly
+state that the 0.79σ derivation assumes homoscedastic pools and the
+realized pools are ~4× heterogeneous in σ. Noted for the Step 2 design
+doc; not blocking for this verdict.
+
+### MED-M7 — MC CIs near the D2 gate — RESOLVED BY SUBSUMPTION
+
+With D2 removed from the verdict aggregation (§HIGH-M1), the
+MC-resolution concern for D2 p-values is moot. The D1 p-values are
+not near the gate on the two load-bearing cells (`p = 9.999e-05` on
+p5201-fwd and p5202-fwd). The two near-gate D1 fires (p5201-rev at
+p = 0.021, p5203-rev at p = 0.036) are correctly framed in §1.1 as
+"just above the gate" with `stat_D1 ≈ 0.012-0.017` — their verdict
+contribution is visible in `stat_D1` and the H2 D1 verdict does not
+rest on them alone. Acceptable.
+
+### MED-M8 — effect sizes in summary — RESOLVED
+
+`summary-table.csv` now carries `stat_D1` and `stat_D2` columns
+(confirmed via line 1 header: `cell,pool,verdict_abcd,suspect,
+suspect_reason,i11_pass,i12_pass,i13_pass,p_D1,stat_D1,D1_fire,
+p_D2,stat_D2,D2_fire,mode_bucket,oof_10_13_max,b14_15`). Per-cell
+table in `findings.md:169-182` adds `stat_D1` / `stat_D2` columns.
+`§1.1:85-107` calls out the two-orders-of-magnitude heterogeneity
+explicitly. Clean.
+
+### LOW-M9 — scipy version drift — RESOLVED
+
+`findings.md:16-37` documents the unverified cross-version determinism
+claim honestly, enumerates the low-risk / no-risk finding categories,
+and defers byte-for-byte verification to Path B (issue #817) with
+specific acceptance criteria (verdict letters, sign of `stat_obs`,
+p-values within MC 95% CI half-width). Fair disposition.
+
+### LOW-M10 — dead branch in classifier — ACKNOWLEDGED
+
+Not addressed in the revised commit (classifier code unchanged per
+Path A scope). Non-blocking cosmetic cleanup, as Round 1 flagged.
+Accepted deferral.
+
+### Additional sanity checks
+
+- `p5204-fwd/perm-test-results.json` strict-JSON `null` fix verified
+  (replaces bare `NaN`). `p_D1`, `stat_obs` both serialize as `null`
+  for the I12-suspect cell.
+- `summary-table.csv` A/B/C/D counts (`D = 5, D-escalate = 6`) agree
+  with `findings.md:257-258`. The prose-vs-CSV drift from the earlier
+  revision is called out and reconciled (`§3:260-263`).
+- H-STOP-5 inability to catch the run1 outlier is correctly flagged
+  in `§6:446-449`.
+
+### Verdict
+
+All 4 HIGH findings are resolved. MED-M5, MED-M7, MED-M8 are resolved;
+MED-M6 is resolved-by-subsumption and flagged for a future plan
+revision. LOW-M9 has a fair deferral to #817 with acceptance criteria;
+LOW-M10 deferred cosmetic. The revised H2 D1 verdict is defensible:
+two shaped-forward cells at `stat_D1 ≈ 0.9` are robust, the D2
+channel is correctly excluded, and Step 2 direction is constrained
+to mechanism-discriminating telemetry rather than a specific
+hypothesis.
+
+ROUND 2: FINDINGS-ACCEPTED YES
