@@ -19,6 +19,13 @@ fn canonical_submit_stamp(ts: u64) -> u64 {
 /// descriptors return to `free_tx_frames` and would otherwise produce
 /// phantom completions bucketed against a stale submit time.
 ///
+/// Codex round-1 HIGH #1: call sites MUST invoke this AFTER
+/// `writer.commit()` (and `drop(writer)`). Pre-commit stamping
+/// attributed a scheduler preemption window between `insert` and ring
+/// submission to the kernel-visible submit→completion latency, which
+/// is exactly backwards. Post-commit stamping reflects the moment the
+/// ring producer actually became kernel-visible.
+///
 /// Single-writer: the owner worker is the only thread that touches
 /// this sidecar (see plan §3.3 file citations: `WorkerUmem` is `Rc`
 /// at `umem.rs:16-18`, `free_tx_frames` is plain `VecDeque` at
@@ -1974,11 +1981,19 @@ fn service_exact_local_queue_direct(
         len: req.len,
         options: 0,
     }));
-    // #812: submit stamp. Plan §3.1 — fresh `monotonic_nanos()` after
-    // `insert` returns the accepted count and BEFORE `commit()` so the
-    // stamp captures the moment descriptors become kernel-visible. A
-    // reused caller `now_ns` would leak up to ~1 ms of worker-loop
-    // staleness into the measurement (plan §3.1 R1).
+    writer.commit();
+    drop(writer);
+    // #812 Codex round-1 HIGH #1: sample the submit stamp AFTER
+    // `writer.commit()` so a scheduler preemption between `insert`
+    // and the ring submit does NOT inflate the measured latency.
+    // Pre-commit stamping attributed the preemption window to the
+    // kernel (submit→completion), which is exactly the opposite of
+    // what we want to observe. A reused caller `now_ns` would still
+    // leak up to ~1 ms of worker-loop staleness, so we take a fresh
+    // `monotonic_nanos()` here rather than re-using one from the
+    // outer scope. Only the accepted prefix (`.take(inserted as
+    // usize)`) is stamped — the retry tail returns to
+    // `free_tx_frames` and MUST NOT be stamped.
     let ts_submit = monotonic_nanos();
     stamp_submits(
         &mut binding.tx_submit_ns,
@@ -1989,8 +2004,6 @@ fn service_exact_local_queue_direct(
             .map(|req| req.offset),
         ts_submit,
     );
-    writer.commit();
-    drop(writer);
 
     if inserted == 0 {
         let dropped = binding.scratch_exact_local_tx.len() as u64;
@@ -2109,8 +2122,13 @@ fn service_exact_local_queue_direct_flow_fair(
                 options: 0,
             }),
     );
-    // #812: submit stamp — see plan §3.1 submit-site table (this is
-    // the service_exact_local_queue_direct_flow_fair variant).
+    writer.commit();
+    drop(writer);
+    // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — see plan
+    // §3.1 submit-site table (this is the
+    // service_exact_local_queue_direct_flow_fair variant). Stamping
+    // post-commit prevents a preemption window between `insert` and
+    // ring submit from being attributed to submit→completion latency.
     let ts_submit = monotonic_nanos();
     stamp_submits(
         &mut binding.tx_submit_ns,
@@ -2121,8 +2139,6 @@ fn service_exact_local_queue_direct_flow_fair(
             .map(|(offset, _)| *offset),
         ts_submit,
     );
-    writer.commit();
-    drop(writer);
 
     if inserted == 0 {
         let dropped = binding.scratch_local_tx.len() as u64;
@@ -2258,8 +2274,13 @@ fn service_exact_prepared_queue_direct(
         len: req.len,
         options: 0,
     }));
-    // #812: submit stamp — plan §3.1 submit-site table (the
-    // service_exact_prepared_queue_direct variant).
+    writer.commit();
+    drop(writer);
+    // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — plan
+    // §3.1 submit-site table (the service_exact_prepared_queue_direct
+    // variant). Post-commit stamping ensures the measurement reflects
+    // the moment the ring submission actually landed in the kernel,
+    // not the moment before a potential preemption window.
     let ts_submit = monotonic_nanos();
     stamp_submits(
         &mut binding.tx_submit_ns,
@@ -2270,8 +2291,6 @@ fn service_exact_prepared_queue_direct(
             .map(|req| req.offset),
         ts_submit,
     );
-    writer.commit();
-    drop(writer);
 
     if inserted == 0 {
         let dropped = binding.scratch_exact_prepared_tx.len() as u64;
@@ -2393,8 +2412,12 @@ fn service_exact_prepared_queue_direct_flow_fair(
         len: req.len,
         options: 0,
     }));
-    // #812: submit stamp — plan §3.1 submit-site table (the
-    // service_exact_prepared_queue_direct_flow_fair variant).
+    writer.commit();
+    drop(writer);
+    // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — plan
+    // §3.1 submit-site table (the
+    // service_exact_prepared_queue_direct_flow_fair variant). See the
+    // exact_local variant above for the preemption-window rationale.
     let ts_submit = monotonic_nanos();
     stamp_submits(
         &mut binding.tx_submit_ns,
@@ -2405,8 +2428,6 @@ fn service_exact_prepared_queue_direct_flow_fair(
             .map(|req| req.offset),
         ts_submit,
     );
-    writer.commit();
-    drop(writer);
 
     if inserted == 0 {
         let dropped = binding.scratch_prepared_tx.len() as u64;
@@ -6105,8 +6126,13 @@ pub(super) fn transmit_batch(
                 options: 0,
             }),
     );
-    // #812: submit stamp — plan §3.1 submit-site table
-    // (the post-CoS backup transmit_batch variant for local requests).
+    writer.commit();
+    drop(writer);
+    // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — plan
+    // §3.1 submit-site table (the post-CoS backup transmit_batch
+    // variant for local requests). Post-commit stamping prevents a
+    // scheduler preemption window between insert and ring submission
+    // from inflating the observed latency.
     let ts_submit = monotonic_nanos();
     stamp_submits(
         &mut binding.tx_submit_ns,
@@ -6117,8 +6143,6 @@ pub(super) fn transmit_batch(
             .map(|(offset, _)| *offset),
         ts_submit,
     );
-    writer.commit();
-    drop(writer);
 
     if inserted == 0 {
         binding.dbg_tx_ring_full += 1;
@@ -6331,8 +6355,12 @@ fn transmit_prepared_queue(
         len: req.len,
         options: 0,
     }));
-    // #812: submit stamp — plan §3.1 submit-site table (the
-    // transmit_prepared_queue continuation variant).
+    writer.commit();
+    drop(writer);
+    // #812 Codex round-1 HIGH #1: submit stamp AFTER commit — plan
+    // §3.1 submit-site table (the transmit_prepared_queue
+    // continuation variant). Post-commit stamping ensures we measure
+    // kernel-visible submit time, not the pre-submit planning window.
     let ts_submit = monotonic_nanos();
     stamp_submits(
         &mut binding.tx_submit_ns,
@@ -6343,8 +6371,6 @@ fn transmit_prepared_queue(
             .map(|req| req.offset),
         ts_submit,
     );
-    writer.commit();
-    drop(writer);
 
     if inserted == 0 {
         binding.dbg_tx_ring_full += 1;
