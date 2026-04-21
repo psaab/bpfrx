@@ -656,11 +656,19 @@ type BindingStatus struct {
 	DebugPendingTXLocal               uint32    `json:"debug_pending_tx_local,omitempty"`
 	DebugOutstandingTX                uint32    `json:"debug_outstanding_tx,omitempty"`
 	DebugInFlightRecycles             uint32    `json:"debug_in_flight_recycles,omitempty"`
-	// #802: ring-pressure instrumentation mirror fields. See the Rust
-	// `BindingStatus` for semantics and write sites.
+	// #802/#804: ring-pressure instrumentation mirror fields. See the
+	// Rust `BindingStatus` for semantics and write sites. The #804
+	// split replaces the pre-#804 `dbg_pending_overflow` field with
+	// two distinct wire keys — `dbg_bound_pending_overflow` for the
+	// `bound_pending` FIFO evict sites in `tx.rs`, and
+	// `dbg_cos_queue_overflow` for the class-of-service admission
+	// overflow in `enqueue_cos_item`. A snapshot from a pre-#804
+	// helper deserializes both as 0 (standard Go json zero-value),
+	// which is the right backward-compat behavior.
 	DbgTxRingFull                     uint64    `json:"dbg_tx_ring_full,omitempty"`
 	DbgSendtoENOBUFS                  uint64    `json:"dbg_sendto_enobufs,omitempty"`
-	DbgPendingOverflow                uint64    `json:"dbg_pending_overflow,omitempty"`
+	DbgBoundPendingOverflow           uint64    `json:"dbg_bound_pending_overflow,omitempty"`
+	DbgCoSQueueOverflow               uint64    `json:"dbg_cos_queue_overflow,omitempty"`
 	RxFillRingEmptyDescs              uint64    `json:"rx_fill_ring_empty_descs,omitempty"`
 	OutstandingTX                     uint32    `json:"outstanding_tx,omitempty"`
 	LastHeartbeat                     time.Time `json:"last_heartbeat,omitempty"`
@@ -676,17 +684,26 @@ type BindingStatus struct {
 //
 // #802.
 type BindingCountersSnapshot struct {
-	WorkerID                       uint32 `json:"worker_id"`
-	Ifindex                        int    `json:"ifindex,omitempty"`
-	QueueID                        uint32 `json:"queue_id"`
-	DbgTxRingFull                  uint64 `json:"dbg_tx_ring_full,omitempty"`
-	DbgSendtoENOBUFS               uint64 `json:"dbg_sendto_enobufs,omitempty"`
-	DbgPendingOverflow             uint64 `json:"dbg_pending_overflow,omitempty"`
-	RxFillRingEmptyDescs           uint64 `json:"rx_fill_ring_empty_descs,omitempty"`
-	OutstandingTX                  uint32 `json:"outstanding_tx,omitempty"`
-	TXErrors                       uint64 `json:"tx_errors,omitempty"`
-	TxSubmitErrorDrops             uint64 `json:"tx_submit_error_drops,omitempty"`
-	PendingTxLocalOverflowDrops    uint64 `json:"pending_tx_local_overflow_drops,omitempty"`
+	WorkerID uint32 `json:"worker_id"`
+	Ifindex  int    `json:"ifindex,omitempty"`
+	QueueID  uint32 `json:"queue_id"`
+	DbgTxRingFull    uint64 `json:"dbg_tx_ring_full,omitempty"`
+	DbgSendtoENOBUFS uint64 `json:"dbg_sendto_enobufs,omitempty"`
+	// #804: split from the pre-#804 `dbg_pending_overflow` field. Two
+	// distinct increment sites (bound-pending FIFO evict in tx.rs vs
+	// CoS queue admission in enqueue_cos_item) now publish two
+	// distinct wire keys so operators can disambiguate. A snapshot
+	// from a pre-#804 helper will leave both fields at the Go
+	// zero-value — there is no silent re-attribution of the legacy
+	// counter. Consumers that want a total across either path should
+	// sum these two explicitly.
+	DbgBoundPendingOverflow     uint64 `json:"dbg_bound_pending_overflow,omitempty"`
+	DbgCoSQueueOverflow         uint64 `json:"dbg_cos_queue_overflow,omitempty"`
+	RxFillRingEmptyDescs        uint64 `json:"rx_fill_ring_empty_descs,omitempty"`
+	OutstandingTX               uint32 `json:"outstanding_tx,omitempty"`
+	TXErrors                    uint64 `json:"tx_errors,omitempty"`
+	TxSubmitErrorDrops          uint64 `json:"tx_submit_error_drops,omitempty"`
+	PendingTxLocalOverflowDrops uint64 `json:"pending_tx_local_overflow_drops,omitempty"`
 }
 
 type ExceptionStatus struct {
