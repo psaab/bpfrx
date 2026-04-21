@@ -708,6 +708,16 @@ pub(crate) struct ProcessStatus {
     // is the operator-facing number.
     #[serde(rename = "cos_no_owner_binding_drops_total", default)]
     pub cos_no_owner_binding_drops_total: u64,
+    /// #802: focused per-binding ring-pressure view. Projected from the
+    /// same `BindingLiveState` atomics that back `Self::bindings` — a
+    /// compact snapshot of the counters an operator looks at first when
+    /// triaging XSK ring saturation (TX full, sendto ENOBUFS, pending-
+    /// overflow, fill-ring empty descs, outstanding-tx gauge). Keeping
+    /// it as a parallel field (rather than only embedded in
+    /// `bindings[].*`) lets the daemon pull just the triage counters on
+    /// its poll path without deserializing every field on `BindingStatus`.
+    #[serde(rename = "per_binding", default, skip_serializing_if = "Vec::is_empty")]
+    pub per_binding: Vec<BindingCountersSnapshot>,
     #[serde(rename = "ha_groups", default)]
     pub ha_groups: Vec<HAGroupStatus>,
     #[serde(default)]
@@ -1287,10 +1297,129 @@ pub(crate) struct BindingStatus {
     pub debug_outstanding_tx: u32,
     #[serde(rename = "debug_in_flight_recycles", default)]
     pub debug_in_flight_recycles: u32,
+    // #802: ring-pressure instrumentation. Operator-facing cumulative
+    // counters for XSK ring saturation diagnosis. See the
+    // `line-rate-investigation-plan.md` "DEFERRED-INSTRUMENTATION" rows
+    // for semantics. `outstanding_tx` is a gauge (current value) that
+    // serves as a proxy for `completion_reap_max_batch`; the real
+    // completion-reap-batch histogram is accept-proxy per that plan.
+    #[serde(rename = "dbg_tx_ring_full", default)]
+    pub dbg_tx_ring_full: u64,
+    #[serde(rename = "dbg_sendto_enobufs", default)]
+    pub dbg_sendto_enobufs: u64,
+    // #804: split from the old conflated `dbg_pending_overflow`. Two
+    // distinct write-sites, two distinct wire keys. Pre-#804 snapshots
+    // will deserialize both as 0 (`default`), which is the right
+    // backward-compat behavior — the old field is no longer present on
+    // the wire and consumers that want totals across either path should
+    // sum the two explicitly.
+    #[serde(rename = "dbg_bound_pending_overflow", default)]
+    pub dbg_bound_pending_overflow: u64,
+    #[serde(rename = "dbg_cos_queue_overflow", default)]
+    pub dbg_cos_queue_overflow: u64,
+    #[serde(rename = "rx_fill_ring_empty_descs", default)]
+    pub rx_fill_ring_empty_descs: u64,
+    #[serde(rename = "outstanding_tx", default)]
+    pub outstanding_tx: u32,
     #[serde(rename = "last_error", default)]
     pub last_error: String,
     #[serde(rename = "last_change", skip_serializing_if = "Option::is_none")]
     pub last_change: Option<DateTime<Utc>>,
+}
+
+/// #802: focused per-binding ring-pressure snapshot surfaced on
+/// `ProcessStatus::per_binding`.
+///
+/// Fields (see `docs/line-rate-investigation-plan.md` lines 703-724 for
+/// the full operator rationale):
+/// - `dbg_tx_ring_full`: times the XSK TX ring producer returned 0 slots.
+/// - `dbg_sendto_enobufs`: kernel-side TX drop — TX kick returned ENOBUFS.
+/// - `dbg_bound_pending_overflow` (#804): drops from the per-binding
+///   `bound_pending` FIFO (`pending_tx_local` / `pending_tx_prepared`)
+///   overflowing its soft cap. **This does not include CoS admission
+///   overflow** — those are counted separately below.
+/// - `dbg_cos_queue_overflow` (#804): drops from the class-of-service
+///   queue admission gate (`enqueue_cos_item`) when the CoS shaping
+///   path rejects the item. Pre-#804 builds conflated this with
+///   `bound_pending` overflow under the old `dbg_pending_overflow` wire
+///   key; the counter was split so operators can disambiguate shaping
+///   pressure from bound-pending pressure.
+/// - `rx_fill_ring_empty_descs`: kernel `xdp_statistics_v2` counter of
+///   RX fill-ring starvation events.
+/// - `outstanding_tx`: accept-proxy for `completion_reap_max_batch` per
+///   the investigation plan's disposition. Snapshot of the worker's
+///   current in-flight TX gauge at the last publish tick.
+/// - `tx_errors`, `tx_submit_error_drops`,
+///   `pending_tx_local_overflow_drops`: operator-facing aggregate TX
+///   drop attribution, re-surfaced here so the triage view does not
+///   require a second join against `BindingStatus`.
+///
+/// ## Wire-compat
+///
+/// The split is not wire-compatible on the daemon→operator boundary —
+/// we removed the old `dbg_pending_overflow` wire key rather than keep
+/// it aliased, because the whole point of the split is to stop
+/// operators reading a conflated number. On the helper→daemon boundary
+/// both new fields carry `serde(default)` so a helper that pre-dates
+/// this split (no fields present) deserializes as zero rather than
+/// refusing the message.
+#[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub(crate) struct BindingCountersSnapshot {
+    #[serde(rename = "worker_id")]
+    pub worker_id: u32,
+    // #804: explicit rename matches the other fields on this struct
+    // (defensive — default serde field→key mapping is identity, but
+    // making it explicit here prevents a rename of the Rust field name
+    // from silently renaming the wire key and breaking the Go
+    // consumer).
+    #[serde(rename = "ifindex", default)]
+    pub ifindex: i32,
+    #[serde(rename = "queue_id")]
+    pub queue_id: u32,
+    #[serde(rename = "dbg_tx_ring_full", default)]
+    pub dbg_tx_ring_full: u64,
+    #[serde(rename = "dbg_sendto_enobufs", default)]
+    pub dbg_sendto_enobufs: u64,
+    // #804: split wire keys — `default` on both so a helper snapshot
+    // that pre-dates the split (field absent on the wire) deserializes
+    // as 0 rather than failing.
+    #[serde(rename = "dbg_bound_pending_overflow", default)]
+    pub dbg_bound_pending_overflow: u64,
+    #[serde(rename = "dbg_cos_queue_overflow", default)]
+    pub dbg_cos_queue_overflow: u64,
+    #[serde(rename = "rx_fill_ring_empty_descs", default)]
+    pub rx_fill_ring_empty_descs: u64,
+    #[serde(rename = "outstanding_tx", default)]
+    pub outstanding_tx: u32,
+    #[serde(rename = "tx_errors", default)]
+    pub tx_errors: u64,
+    #[serde(rename = "tx_submit_error_drops", default)]
+    pub tx_submit_error_drops: u64,
+    #[serde(rename = "pending_tx_local_overflow_drops", default)]
+    pub pending_tx_local_overflow_drops: u64,
+}
+
+// #804: was `impl BindingCountersSnapshot { fn from_binding_status(...) }`.
+// Switched to the idiomatic `From` impl so the projection composes with
+// iterator adaptors (`.map(BindingCountersSnapshot::from)`) and any
+// future `into()` callsites get the conversion for free.
+impl From<&BindingStatus> for BindingCountersSnapshot {
+    fn from(b: &BindingStatus) -> Self {
+        Self {
+            worker_id: b.worker_id,
+            ifindex: b.ifindex,
+            queue_id: b.queue_id,
+            dbg_tx_ring_full: b.dbg_tx_ring_full,
+            dbg_sendto_enobufs: b.dbg_sendto_enobufs,
+            dbg_bound_pending_overflow: b.dbg_bound_pending_overflow,
+            dbg_cos_queue_overflow: b.dbg_cos_queue_overflow,
+            rx_fill_ring_empty_descs: b.rx_fill_ring_empty_descs,
+            outstanding_tx: b.outstanding_tx,
+            tx_errors: b.tx_errors,
+            tx_submit_error_drops: b.tx_submit_error_drops,
+            pending_tx_local_overflow_drops: b.pending_tx_local_overflow_drops,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
