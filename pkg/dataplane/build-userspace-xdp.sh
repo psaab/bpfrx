@@ -21,6 +21,16 @@ if [[ -x "${RUSTUP_BIN}" ]]; then
 	"${RUSTUP_BIN}" component add rust-src --toolchain "${TOOLCHAIN}-x86_64-unknown-linux-gnu" >/dev/null 2>&1 || \
 	"${RUSTUP_BIN}" component add rust-src --toolchain "${TOOLCHAIN}" >/dev/null 2>&1 || true
 fi
+# Thread MAX_INTERFACES from the C header into the Rust build so
+# BINDING_ARRAY_MAX_ENTRIES (and userspace_ingress_ifaces max_entries)
+# stay locked to the same value as tx_ports' MAX_INTERFACES. Drift
+# between these constants is the exact failure mode #814 is fixing.
+MAX_INTERFACES="$(awk '/^#define MAX_INTERFACES /{print $3; exit}' "${REPO_ROOT}/bpf/headers/xpf_common.h")"
+if [[ -z "${MAX_INTERFACES}" ]]; then
+	echo "build-userspace-xdp.sh: failed to parse MAX_INTERFACES from ${REPO_ROOT}/bpf/headers/xpf_common.h" >&2
+	exit 1
+fi
+export MAX_INTERFACES
 (
 	cd "${CRATE_DIR}"
 	"${CARGO_BIN}" +"${TOOLCHAIN}" build --release
