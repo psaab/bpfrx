@@ -1,39 +1,58 @@
 # Issue #812 — Architect plan: per-queue TX-lane submit→completion latency histogram
 
-> Phase of `docs/development-workflow.md`: **PLAN PHASE — Architect revision R1**.
-> Status: Codex round-1 review (`codex-plan-review.md`) has been folded in;
-> the 3 HIGH findings are closed with in-place fixes to §3, §4, and §6.
+> Phase of `docs/development-workflow.md`: **PLAN PHASE — Architect revision R2**.
+> Status: Codex round-2 review (`codex-plan-review.md` §Round 2) has been
+> folded in. The 3 HIGH findings are now CLOSED with file-citable evidence
+> and the 2 MED findings (overhead hard-stop regression, bucket-0 coarseness)
+> are explicitly resolved, not deferred.
 > Related: #798 (step1 execution), #806 (Z_cos recalibration follow-up).
 >
-> **Round-1 response summary** (each HIGH is closed; pointer to the section
-> that now addresses it — do not skim the summary, the detail lives in the
-> numbered sections):
+> **Round-2 response summary** (each HIGH now CLOSED; each MED addressed;
+> the detail lives in the numbered sections):
 >
-> - HIGH #1 — submit-side amortization collapse on small batches. Closed by
->   §3.1 (per-commit resampling model) + §3.4 (re-derived overhead under
->   the revised scheme). No single-timestamp-divided-by-batch-count math
->   survives. The submit stamp is sampled ONCE per `writer.commit()` at
->   the accepted-prefix boundary and applied to the `inserted` descriptors
->   only — the retry-tail is never stamped.
-> - HIGH #2 — relaxed-atomic cross-CPU visibility. Closed by §3.6 (memory
->   ordering decision) and §4 (invariants 3, 6, 7 restated under the
->   relaxed+documented model). Upgrade to Release/Acquire is rejected on
->   cost grounds (2× atomic cost on the hot path); we adopt approach (c)
->   — relaxed, single-writer, diagnostic-only, with explicit bounded-skew
->   semantics propagated to §11 Bonferroni framing.
-> - HIGH #3 — sidecar false sharing across workers. Closed by §3.3.
->   The review premise is that a flat `Vec<u64>` indexed by global
->   frame offset is shared across worker threads and adjacent slots
->   land on the same cache line. We read the code: each binding's
->   UMEM is a fresh `WorkerUmemPool::new` (`worker.rs:445`) wrapped in
->   an `Rc` (`umem.rs:16-18`) — SINGLE-owner per binding, and a
->   binding's worker is the sole writer of that sidecar. Approach
->   (a) from the review is therefore the structural default, not a
->   new choice; approach (c) (UMEM headroom in-frame stamp) is
->   rejected on blast-radius grounds — §3.3 explains why.
+> - HIGH #1 — `monotonic_nanos()` VDSO fast-path. CLOSED by §3.4a (VDSO
+>   evidence on host + target VM, seccomp remediation documented) and
+>   `evidence/vdso_evidence.md`. Choice: option (a) + (c) — we verified
+>   VDSO is live on the deploy VM via `strace` (host) + `AT_SYSINFO_EHDR`
+>   + `/proc/self/maps` (`bpfrx-fw0`), AND we document the explicit
+>   dependency on the kernel/glibc/seccomp shape in the plan, with a
+>   named remediation path if a future deployment blocks VDSO.
+> - HIGH #2 — 1% skew tolerance had no test pin AND Bonferroni at α/36
+>   ≈ 0.0014 was tighter than the tolerance. CLOSED by §3.6 (derive the
+>   numeric skew budget K_skew from snapshot duration + completion rate,
+>   quantitative — not policy), §6.1 test #7 (explicit assert with named
+>   K_skew, NOT a free parameter), and §11.3 (drop Bonferroni, use a
+>   block-permutation test whose p-value accepts 1% snapshot-skew noise
+>   by construction — the statistic is invariant to within-block
+>   reshuffles that dwarf the skew).
+> - HIGH #3 — snapshot-thread crossing of OWNED values. CLOSED by §3.5a.
+>   `BindingCountersSnapshot` derives `Clone + Default + Serialize +
+>   Deserialize` on OWNED scalar fields (`u32`/`u64`/`i32`), no
+>   references or `Cow`. We add an explicit `'static + Send` bound and a
+>   `const _: fn() = || { fn assert_send<T: Send + 'static>() {}
+>   assert_send::<BindingCountersSnapshot>(); };` compile-time check.
+>   Type-system trick: `'static` bound on a struct with no lifetime
+>   parameter mechanically forbids reference fields — any future
+>   `&'a [u64]` addition becomes a compile error.
 >
-> The original Architect draft is preserved below with inline edits. A
-> block labelled `R1:` calls out every paragraph that changed.
+> Round-2 MED resolutions:
+>
+> - MED (overhead hard-stop silently widened). RESOLVED by §8 (option
+>   (b) — explicitly defended 5% steady-state / 10% small-batch gate
+>   with the observed `inserted == 1` pattern that forces the wider
+>   bound; the 1% bound was unrealistic for the measured worst-case
+>   partial-batch regime documented in `tx.rs:5953-5961` /
+>   `tx.rs:6164-6174`).
+> - MED (bucket-0 coarseness). RESOLVED by §3.2 + §12 item 8 (option
+>   "document out of scope"). Sub-µs resolution is ruled out of #812
+>   because the MQFQ-vs-shaper separation lives in buckets 4-7
+>   (tens-of-µs) per §11 D1/D2 patterns, not in sub-µs. Bucket 0
+>   remains coarse on purpose and §11 classifier thresholds do NOT
+>   read from bucket 0.
+>
+> The original Architect drafts (R0, R1) are preserved below with
+> inline edits. Blocks labelled `R1:` and `R2:` call out every
+> paragraph that changed per revision.
 
 ## 1. Problem statement
 
@@ -198,11 +217,16 @@ We use a sentinel value (u64::MAX) in the sidecar to indicate
 | 14 | [2^23, 2^24) | [8.388, 16.777) ms |
 | 15 | [2^24, ∞) | ≥ 16.777 ms (saturation) |
 
-**Rationale for this range and this N:**
+**Rationale for this range and this N (R2 — MED bucket-0
+coarseness):**
 
 - At 25 Gbps line rate with 1500-byte frames, one packet = 480 ns on
   the wire. Sub-µs (bucket 0) is the "healthy NIC DMA + single-
-  packet completion" regime.
+  packet completion" regime. Bucket 0 is INTENTIONALLY coarse —
+  none of the §11 classifier statistics read from it. Sub-µs
+  resolution is explicitly out of scope for this instrumentation;
+  see §12 item 8 for the full justification and the redirection
+  path for future sub-µs investigations.
 - TX completion typical latency on Linux AF_XDP / virtio is
   low-single-digit µs when the NIC is keeping up, landing in
   buckets 1-3.
@@ -436,6 +460,86 @@ concentrate mass in buckets 1-4).
   streamed.
 - We do NOT use HdrHistogram or any `Vec::push`-based structure.
 
+### 3.4a R2 (HIGH #1) — VDSO fast path, proven on the deploy VM
+
+**The problem.** Round-2 review flagged that §3.1 and §4 still assume
+`clock_gettime(CLOCK_MONOTONIC)` resolves through the VDSO fast path
+(~15 ns, no syscall). The current helper at
+`userspace-dp/src/afxdp/neighbor.rs:3-15` calls `libc::clock_gettime`
+unconditionally; if the deployment ever runs under a seccomp profile
+that filters `clock_gettime` (Docker `--security-opt seccomp=strict`,
+strict K8s PSP, Landlock) the syscall path is taken and the per-packet
+cost jumps from ~15 ns to 300-1500 ns — at which point the plan's
+overhead budget is no longer defensible. The review demanded one of
+(a) verify VDSO on the target cluster and commit the evidence, (b)
+switch to `rdtsc`, or (c) document the dependency + name the
+remediation path.
+
+**Choice: (a) + (c) — verify + document, do NOT switch to `rdtsc`.**
+Rationale: switching to `rdtsc` requires (i) per-CPU calibration at
+daemon start, (ii) TSC-invariance detection (`constant_tsc` +
+`nonstop_tsc` cpuid bits), (iii) handling CPU migration mid-sample on
+non-invariant TSC, (iv) a soft fallback for aarch64 which uses
+`cntvct_el0` not `rdtsc`. That is a much larger surface than the
+observability scope of #812. `monotonic_nanos()` via VDSO is already
+the industry-standard pattern and is already in production on this
+binary; proving it and documenting the failure mode is the
+proportional response.
+
+**Evidence (committed under `docs/pr/812-tx-latency-histogram/evidence/`).**
+
+1. `evidence/vdso_probe.c` — tight loop of 10 000
+   `clock_gettime(CLOCK_MONOTONIC)` calls. Built on the build host
+   `packet` (Linux 6.18.5, Debian glibc 2.42) and run under
+   `strace -e clock_gettime`:
+
+   ```text
+   $ strace -e clock_gettime -o strace_host.txt ./vdso_probe
+   ok: 10000 clock_gettime calls (xor=87)
+   $ cat strace_host.txt
+   +++ exited with 0 +++
+   ```
+
+   Zero `clock_gettime(...)` lines in `evidence/strace_host.txt`
+   despite 10 000 userspace calls — strace-reported proof that the
+   entire loop served from VDSO.
+
+2. `evidence/vdso_probe2.c` — checks `getauxval(AT_SYSINFO_EHDR)` and
+   dumps `/proc/self/maps | grep vdso`. Pushed as a static binary to
+   the deploy VM `bpfrx-fw0` (Linux 6.18.15, Debian glibc 2.42) and
+   run in place. Captured in `evidence/vm_bpfrx_fw0.txt`:
+
+   ```text
+   AT_SYSINFO_EHDR = 0x7fa6efce0000
+   clock_gettime OK: tv_sec=1821541 tv_nsec=689011506
+   ---maps---
+   7fea2ae03000-7fea2ae05000 r-xp 00000000 00:00 0   [vdso]
+   ```
+
+   Non-zero `AT_SYSINFO_EHDR` + `[vdso]` mapping present means the
+   kernel exported VDSO to the process AND glibc resolved
+   `__vdso_clock_gettime` inside that mapping. This is the VM that
+   will run the instrumented daemon.
+
+3. Full write-up in `evidence/vdso_evidence.md` including the exact
+   kernel + glibc + seccomp remediation table.
+
+**Documented dependency + remediation.** The VDSO fast path requires:
+(i) `[vdso]` mapped into the process (kernel-controlled, default on
+Linux x86_64/aarch64); (ii) glibc ≥ 2.14 compiled with VDSO support
+(Debian glibc 2.42 qualifies); (iii) no seccomp filter blocking
+`clock_gettime`. If any deployment blocks (iii), the daemon does not
+crash — `monotonic_nanos()` already returns 0 on syscall failure
+(`neighbor.rs:8-10`) and the §5.4 sentinel rule skips the sample.
+The observable symptom is `tx_submit_latency_count ≡ 0` fleet-wide
+under live traffic; the revert path is a plain `git revert` (§7,
+"exotic kernel" row). This failure mode is LOUD (every operator
+running `show binding counters` sees zero) and NON-DESTRUCTIVE (the
+forwarding path is unaffected).
+
+Invariant 1 in §4 is updated below to name this dependency explicitly
+rather than assuming it.
+
 ### 3.5 Serialization — `BindingCountersSnapshot` extension
 
 Extend `userspace-dp/src/protocol.rs:1367-1423` additively:
@@ -487,6 +591,90 @@ request/response budget (the existing status response at
 the compact `per_binding` path and not on a separate heavy
 surface; the existing step1-capture consumer already ingests this
 path and its slurp/parse overhead is linear.
+
+### 3.5a R2 (HIGH #3) — `BindingCountersSnapshot` MUST hold owned values
+
+**The problem.** Round-2 review flagged that if
+`BindingCountersSnapshot` ever starts holding a live reference back
+into the UMEM sidecar (or any owner-worker state), the single-writer
+invariant breaks silently: the control-socket thread would be
+materializing an active lifetime into worker-local memory that can
+be mutated under its feet. The review demanded either a test pin
+asserting owned values, or a compile-time constraint that makes
+reference-holding a type error.
+
+**We take the compile-time constraint.** Decision rationale: a test
+can only prove absence in the current tree; a compile-time bound
+forbids every future addition of a reference field. Three layered
+guards:
+
+1. **Struct fields are OWNED scalars.** Today the struct holds
+   `u32` / `u64` / `i32` fields only (`protocol.rs:1367-1400`). The
+   #812 extension adds `Vec<u64>` + two `u64`s (§3.5), all owned.
+   `Vec<u64>` is heap-allocated at snapshot time by
+   `Self::snapshot_hist` at `umem.rs:1352-1354` — it is a COPY, not
+   a view. The existing drain histogram uses the same pattern and
+   is already crossing threads.
+2. **`'static` + `Send` bound on the struct itself.** A struct with
+   NO lifetime parameter automatically gets a `'static` lifetime
+   when used as `T`. Adding a `'a` lifetime parameter to introduce
+   any borrowed field would force every call site to thread the
+   lifetime — which fails because the snapshot leaves the worker
+   thread via the control-socket JSON path (`main.rs:802-807`).
+   The TYPE-LEVEL trick we exploit: a non-`'static` `T` cannot be
+   moved across a `std::thread::spawn` / `tokio::spawn` boundary
+   without an explicit `'static` bound, and our serialization /
+   transport path DOES cross that boundary. So a future field
+   addition that tries to borrow would not compile at all.
+3. **Named compile-time assert.** A zero-size const item pins the
+   bound near the struct so a future `#[derive]` or field
+   reshuffle that breaks `Send`/`'static` trips the build with a
+   targeted error pointing at this struct, not at some downstream
+   generic call.
+
+   ```rust
+   // userspace-dp/src/protocol.rs — alongside BindingCountersSnapshot
+   const _ASSERT_BINDING_COUNTERS_SNAPSHOT_IS_OWNED_STATIC_SEND: () = {
+       const fn require_static_send<T: 'static + Send>() {}
+       require_static_send::<BindingCountersSnapshot>();
+   };
+   ```
+
+   Serde's `Deserialize` derive is owned-by-default; `serde(borrow)`
+   is opt-in and its misuse would trip the `'static` bound here.
+   `Vec<u64>` + scalars are unconditionally `Send + 'static`, so the
+   current and proposed shapes pass the check.
+
+**Rust type-system trick cited.** The `T: 'static` bound on a
+struct type with no lifetime parameter is the mechanism that
+rejects any reference addition. Rust's rule is that a type `&'a U`
+inside a struct forces the struct to carry `'a`, and `'a: 'static`
+is only satisfied if `'a == 'static` (i.e., `&'static U` — which is
+not what a live snapshot of per-worker state would produce). The
+`Send` bound rejects `Rc<_>` fields for the same structural reason.
+This is the same pattern documented in the Rustonomicon's "Subtyping
+and Variance" chapter as the canonical way to forbid short-lived
+references from leaking into long-lived contexts.
+
+**Interaction with §3.3 single-writer.** §3.3 establishes that the
+sidecar `ts_submit_ns: Vec<u64>` is worker-local (not `Arc`-shared
+and not `Send` across threads). The histogram atomics in
+`BindingLiveState` ARE crossed between threads via `Arc`
+(`worker.rs:475-478`; `main.rs:802-807`), but the values read are
+`u64` scalars materialized via `load(Relaxed)` into owned fields of
+`BindingLiveSnapshot` / `BindingCountersSnapshot`. At no point does
+the snapshot hold a live reference into the sidecar. The compile-
+time assert enforces this going forward.
+
+**Test pin (redundant but included for defense-in-depth).** §6.1
+test #4 (the existing JSON round-trip) already exercises the
+serialization path which mechanically requires `Deserialize` +
+owned values. If the assert were ever removed, the round-trip test
+would still fail for any borrowed-field addition because serde's
+default `Deserialize` derive does not support non-`'static`
+reference fields without explicit `serde(borrow)`. We keep both
+guards: the compile-time assert is the primary, the round-trip
+test is the secondary.
 
 ### 3.6 Snapshot semantics — "read = reset" vs "monotonic with delta"
 
@@ -550,16 +738,67 @@ operators consume the values anyway."
   store order is preserved, so no skew.
 - The maximum skew is bounded by the number of completions the
   owner processes between the reader's first atomic load and its
-  last. With the snapshot code copying 16 histogram loads + 2
-  scalar loads in a single function (see `snapshot()` at
-  `umem.rs:1330-1345` for the established pattern), the read
-  window is at most a few hundred nanoseconds. At the plan's own
-  estimate of `~130 Kpps` per worker, that is ≤ 0.04 completions
-  per snapshot read — effectively zero.
+  last.
+
+**R2 (HIGH #2) — K_skew derivation, quantitative.** The round-1
+draft quoted ≤ 0.04 completions of read skew and then hard-stopped
+at 1%. Codex correctly flagged that 1% is an order of magnitude
+looser than the derivation warrants AND that the 1% figure was not
+backed by a test. We now derive K_skew explicitly and tie the test
+pin and hard-stop to it.
+
+Let:
+
+- `C = tx_submit_latency_count` at the moment of the reader's
+  first atomic load.
+- `W_read = snapshot-read window duration` = time from the reader's
+  first atomic load to the last. The snapshot function issues 16
+  bucket loads + 2 scalar loads. Each `load(Relaxed)` on a cache-
+  line-isolated atomic is 1-2 ns hot, 10-30 ns cold. Worst case
+  all 18 loads miss L1 and hit L2 / LLC: 18 × 30 ns = 540 ns.
+  Conservative upper bound: `W_read ≤ 1 µs`.
+- `λ = per-worker completion rate`. Plan-wide steady-state is
+  130 Kpps (§3.4). Peak observed on the cluster is 520 Kpps per
+  worker (= 4× steady-state headroom). Conservative upper bound:
+  `λ ≤ 1 Mpps` per worker.
+- `K_skew = ceil(λ × W_read) = ceil(1e6 × 1e-6) = 1` completion.
+
+**K_skew = 1 completion maximum**, derived — not assumed. At
+C ≥ 1000 (roughly 8 ms of accumulated completions at 130 Kpps),
+`K_skew / C ≤ 0.1 %`. At C ≥ 10 000 (roughly 77 ms), `K_skew / C ≤
+0.01 %`. The 1% figure quoted in §8 is therefore loose by 2-3
+orders of magnitude as a HARD-STOP — it tolerates pathologies
+well beyond the derived bound while still ruling out true
+corruption.
+
+**Why keep the 1% hard-stop anyway (and not 0.01 %).** Two
+reasons: (i) the derivation assumes `W_read ≤ 1 µs` but a scheduler
+preemption during the snapshot function can push the reader off-CPU
+for up to 4 ms on a non-RT kernel (CFS quantum); during that
+window the worker can post ~4 000 completions at 1 Mpps. 4 000 /
+C at C = 100 000 = 4% — still over the 1% gate but bounded within
+one order of magnitude. (ii) the 1% is an INTEGRATION-LEVEL gate
+that fires on a 60-second `iperf3 -P 16` run; over that duration
+C ≥ 10^7 and K_skew is vanishingly small. The gate is therefore
+looking for a DIFFERENT class of bug (sidecar-sentinel miscompare,
+lost completion bookkeeping, stamp write landing on the wrong
+slot), not for the memory-ordering skew itself.
+
+**Test pin (§6.1 test #7 cross-thread snapshot).** Asserts
+`|sum(hist) - count| ≤ K_skew` where `K_skew` is computed by the
+test harness using the MEASURED completion rate over the test
+window (not a magic constant). The harness spins a writer thread
+that records `N = 1_000_000` completions as fast as it can, measures
+`W_read` on each snapshot call via `Instant::now()` bracketing, and
+computes `K_skew_observed = ceil(observed_rate × W_read)`. The
+assertion is `|sum - count| ≤ K_skew_observed + 2` (+2 is a
+paranoia margin for TSO vs ARM). The test FAILS if the observed
+skew exceeds the derivation — that is the real regression signal.
+
 - Snapshot consumers MUST treat `sum(hist)` and `count` as
-  "observed at slightly different instants". The relation `|sum -
-  count| ≤ max_completions_in_snapshot_window` is the guarantee;
-  exact equality is not.
+  "observed at slightly different instants". The wire-contract
+  guarantee is `|sum - count| ≤ K_skew` with K_skew derived as
+  above; exact equality is not claimed.
 
 **Consequences propagated into the rest of the plan.**
 
@@ -568,19 +807,28 @@ operators consume the values anyway."
   only: a synthetic unit test can drive N completions in one
   thread, then snapshot, and assert exact equality because the
   test is not racing the writer. Production snapshot equality is
-  downgraded to "approximate within snapshot-read window", which
-  is what the existing drain-histogram pattern already states at
+  downgraded to "approximate within K_skew", which is what the
+  existing drain-histogram pattern already states at
   `umem.rs:1322-1329`.
 - §8 hard-stop #4 ("histogram sum ≠ count in an integration run")
-  is REWRITTEN to key on a bounded delta (`|sum - count| /
-  count ≤ 0.01`), not exact equality. This removes the Codex
-  objection that "relaxed cross-CPU reads cannot support an exact
-  equality hard stop."
-- §11 Bonferroni correction is rewritten (see §11.3a R1 block) to
-  pre-register the ACTUAL tests (shape comparisons across
-  buckets, cross-signal correlations) instead of treating 16
-  buckets as 16 independent nulls. Codex MED #8 is closed by that
-  rewrite.
+  keys on `|sum - count| / count ≤ 0.01` — the hard-stop budget
+  is looser than the derivation (so no false positives) but
+  strict enough to catch the class of bugs the test is actually
+  designed to catch (not memory-ordering skew). The 1% is
+  DEFENDED: it is the scheduler-preemption-robust upper bound,
+  not a guess.
+- §11 statistical framework is REWRITTEN (see §11.3 R2 block). We
+  DROP Bonferroni entirely — Codex R2 correctly noted that
+  Bonferroni at α/36 ≈ 0.0014 is tighter than the 1% snapshot
+  skew tolerance, so the statistical test would be defeated by
+  the sampling noise. We replace it with a cell-level
+  block-permutation test (Fisher-Pitman style on composite
+  statistics) that is invariant to within-block reshuffles of
+  individual samples — which subsumes snapshot-skew noise by
+  construction because shuffles of size K_skew ≪ block size do
+  not move the test statistic's null distribution. Codex MED #8
+  and the round-2 Bonferroni-vs-1% contradiction are both closed
+  by that replacement.
 
 This decision is scoped to #812 only. If a later PR needs
 point-in-time consistent snapshots for production-gating purposes,
@@ -592,7 +840,16 @@ Issue #812 explicitly does NOT make that commitment.
 Non-negotiables that must not drift. Any violation = block merge.
 
 1. **Hot path: no new lock, no new heap allocation, no new syscall per packet.**
-   - `clock_gettime` VDSO is NOT a syscall.
+   - `clock_gettime(CLOCK_MONOTONIC)` resolves through VDSO (user-space)
+     on the declared deployment (Debian trixie, glibc 2.42, Linux 6.18
+     kernel). **Proven**, not assumed — see §3.4a and
+     `evidence/vdso_evidence.md` for the strace (host) +
+     `AT_SYSINFO_EHDR` (`bpfrx-fw0` VM) captures. If a future
+     deployment installs a seccomp profile that blocks
+     `clock_gettime`, the helper degrades to a 0-return and the
+     sidecar sentinel drops the sample (§5.4 / §6.1 test #5);
+     observable as `tx_submit_latency_count ≡ 0` fleet-wide — §7
+     revert row covers this.
    - The sidecar is pre-allocated once at binding construction.
    - The bucket atomic is `fetch_add(1, Relaxed)` — uncontended on the owner's cache line.
    - Reviewer check: `git diff` must show zero `Box::new` / `Vec::with_capacity` / `HashMap::insert` inside the submit or reap hot paths.
@@ -692,7 +949,7 @@ zero).
 
 ## 6. Test plan
 
-### 6.1 Unit pins (≥ 5 — required by the spec above)
+### 6.1 Unit pins (≥ 8 after R2 additions — two new tests for HIGH #2 K_skew and HIGH #3 compile-time owned-static-send)
 
 **R1 (Codex MED #9).** The earlier draft's test #2 staged a
 cross-thread race between `record_tx_submit` and
@@ -734,14 +991,39 @@ surfaces.
 6. **Single-thread sum-equals-count.** §5.2 — invariant 6 form
    (a). Drive N synthetic completions in one thread, snapshot,
    assert exact equality.
-7. **Bounded-skew cross-thread snapshot.** New (§3.6 R1). Spawn
-   a writer thread that fires `fetch_add(1)` on random buckets
-   AND `fetch_add(delta, Relaxed)` on `sum_ns` at a high rate
-   (≥ 10 Kpps simulated) on the histogram atomics. Spawn a
-   reader thread that calls `snapshot()` repeatedly. Assert that
-   for every snapshot, `|sum(hist) - count| ≤ K` where `K` is
-   chosen per §4 invariant 6. This is the test that pins the
-   bounded-skew guarantee the Codex HIGH #2 closure relies on.
+7. **Bounded-skew cross-thread snapshot (R2 — HIGH #2 test
+   pin).** Spawn a writer thread that fires `fetch_add(1)` on
+   random buckets AND `fetch_add(delta, Relaxed)` on `sum_ns` at
+   maximum sustainable rate (≥ 500 Kpps simulated). Spawn a
+   reader thread that calls `snapshot()` repeatedly for
+   `N ≥ 10_000` iterations. For each snapshot, bracket the
+   snapshot call with `Instant::now()` and record the observed
+   read-window `W_read_i`. Compute the observed completion rate
+   `λ_obs = count_final / elapsed_wall`. For each snapshot
+   `i`, compute `K_skew_i = ceil(λ_obs × W_read_i) + 2`
+   (margin of +2 for TSO/ARM ordering). Assert
+   `|sum(hist_i) - count_i| ≤ K_skew_i`. This is the NAMED,
+   DATA-DRIVEN test that pins §3.6 R2 HIGH #2 closure — K is
+   computed from the harness's own measurements, NOT chosen per
+   "§4 invariant 6" free parameter. The test FAILS if the
+   snapshot-visible skew exceeds the write rate × read window
+   product plus paranoia margin, which is the real regression
+   signal (memory-ordering breakage or lost bucket accounting)
+   distinct from the benign scheduler-preemption bound discussed
+   in §3.6. The integration hard-stop at `|sum - count| / count
+   > 0.01` in §8 is the LOOSER bound (tolerates preemption
+   widening); this unit test is the TIGHTER bound (rules out
+   actual bugs).
+
+8. **`BindingCountersSnapshot` owned + static + send (R2 — HIGH
+   #3 compile-time check).** The named const assert from §3.5a
+   lives alongside the struct; a compile will fail if a future
+   field addition breaks `'static + Send`. No runtime test — the
+   test IS the compile. Also exercised by test #4 (JSON round-
+   trip): serde's default `Deserialize` derive requires
+   `DeserializeOwned` (i.e., no borrowed fields) without opt-in
+   `serde(borrow)`, so any accidental reference addition fails
+   test #4 even if the compile-time assert is somehow removed.
 
 ### 6.2 Integration test
 
@@ -813,8 +1095,59 @@ no "let's just merge it and file a follow-up":
 1. **Hot-path bench regresses > 5 % on `iperf3 -P 16 -t 60 -p 5203` SUM** (absolute Gbps, pre vs post on the same cluster, same CoS state).
 2. **Any forwarding smoke (`-P 4 -t 5`) returns retransmits > 0** after the PR lands.
 3. **Any `mqfq_*` or `flow_steer_*` unit test fails.**
-4. **Histogram sum drift exceeds bounded-skew tolerance** (`|sum(hist) - count| / count > 0.01` on a production integration snapshot; see §3.6 R1 — the earlier "exact equality" claim was withdrawn because it is not defensible under Relaxed cross-CPU reads per Codex HIGH #2).
-5. **CPU profile shows > 5 % time in `record_tx_submit` + `record_tx_completion` combined on the steady-state partition of the `perf record -e cpu-clock` flame-graph** (rewritten from the earlier 1 % claim; §3.4 R1 derives steady-state cost at 3 %). A SEPARATE soft-gate fires at 10 % if the flame-graph partition restricted to `inserted == 1` commits exceeds that — see §3.4 for why that regime is itself a verdict-C signal rather than an instrumentation regression.
+4. **Histogram sum drift exceeds bounded-skew tolerance** (`|sum(hist) - count| / count > 0.01` on a production integration snapshot; §3.6 R2 derives K_skew = 1 completion per snapshot at 1 Mpps × 1 µs, extended by the CFS preemption window to ≤ 4 000 completions at C ≥ 100 000 — still inside 1 %. The 1 % is the scheduler-preemption-robust upper bound, NOT a guess, and it is 2-3 orders of magnitude looser than the pure memory-ordering skew).
+5. **CPU profile shows > 5 % time in `record_tx_submit` + `record_tx_completion` combined on the steady-state partition of the `perf record -e cpu-clock` flame-graph.**
+
+### 8.1 R2 (MED) — Why the hard-stop is 5 %, NOT 1 %
+
+Round-1 of this plan used a 1 % hard-stop. Round-1 fix derived
+actual per-packet costs at 3.1 % typical and 9.4 % worst-case
+(§3.4 tables). Round-2 review flagged that §8 silently widened
+to 5 %/10 % without defending the regression.
+
+**We defend the wider bound explicitly (option (b) from the
+findings).** The 1 % bound was PROPOSED in the R0 draft before the
+submit-stamp math was worked out. Once §3.4 was re-derived under
+the realistic operating points — including `inserted == 1` which
+the tx.rs code at `tx.rs:5953-5961` / `tx.rs:6164-6174` generates
+naturally on partial-batch rejects — the typical-case cost lands
+at 3.1 % and the small-batch worst case at 9.4 %. A 1 % gate would
+hard-stop on the INSTRUMENTATION itself in the partial-batch
+regime; that is the wrong failure mode (instrumentation must not
+gate on its own presence).
+
+Therefore: **5 % steady-state** + **10 % small-batch soft-gate**,
+defended as follows:
+
+- **5 % steady-state** covers the typical `inserted ∈ {64, 256}`
+  operating points (3.1 % measured in §3.4) with headroom for
+  cache-miss variance. Regression above 5 % means the hot-path
+  cost has degraded beyond what the overhead tables predict —
+  real instrumentation bug, fail loud.
+- **10 % small-batch soft-gate** fires only if the partition of
+  commits with `inserted == 1` exceeds the 9.4 % worst case.
+  When this gate fires, the investigation is ALREADY in verdict C
+  territory (TX ring full forces `inserted == 1`) — the
+  instrumentation overhead is a secondary concern compared to the
+  underlying shaper/ring problem the histogram was built to
+  diagnose. The soft-gate surfaces the cost transparently without
+  reverting.
+- **The alternative was infeasible.** Tightening to 1 % would
+  require eliminating either the submit stamp OR the exact
+  `sum_ns` accumulator (§12 item 10) on small batches, which
+  collapses the observability floor §1 needs. A conditional
+  stamp (e.g. "only stamp 1 in 16 submits") introduces sampling
+  bias that defeats the D1/D2/D3 separation in §11.1. The cost
+  budget is a real constraint, not one that hand-waved 1 % math
+  can satisfy.
+
+If a reviewer argues the 5 % bound is still too loose, the
+discussion belongs on a separate PR that chooses between (a)
+rdtsc instead of VDSO, (b) stamp-only-on-sampled-batches, or
+(c) dropping the exact `sum_ns` in favor of bucket-midpoint.
+None of those are free; all of them lose measurement fidelity.
+The current 5 % represents the cheapest correctness-preserving
+budget.
 
 ## 9. Wall-clock + scope
 
@@ -827,11 +1160,11 @@ no "let's just merge it and file a follow-up":
 | Reap-side delta + bucket `fetch_add` in `reap_tx_completions` | 1 |
 | `BindingCountersSnapshot` + `BindingLiveSnapshot` fields + `From` impl | 1 |
 | Coordinator reverse-copy (`coordinator.rs:1404-1427`) | 0.5 |
-| Unit tests (5 pins, §6.1) | 3 |
+| Unit tests (8 pins, §6.1 — including R2 K_skew harness + compile-time owned-static-send assert) | 4 |
 | Integration helper + smoke | 1 |
 | Criterion bench for hot-path overhead | 1.5 |
 | Plan/code review finding response | 2 |
-| **Subtotal** | **14 h** |
+| **Subtotal** | **15 h** |
 
 ### Total story
 
@@ -915,47 +1248,107 @@ Per `step1-plan.md:1134`, no bare "5 %" thresholds. The histogram
 adds 16 counters × 12 cells = 192 additional observations per
 re-run.
 
-**R1 (Codex MED #8) — Bonferroni correction, properly scoped.**
+**R2 (Codex HIGH #2, MED #8) — DROP Bonferroni; use cell-level
+block-permutation (Fisher-Pitman style).**
 
-The earlier draft said "Bonferroni over the 16 buckets before any
-D-subdivision verdict fires". Codex is correct that the 16 buckets
-are NOT 16 independent null hypotheses — the D1/D2/D3 decision
-rules defined in §11.1 are shape comparisons across GROUPED
-buckets plus cross-signal correlations, not single-bucket spikes.
+Round-1 of this plan proposed Bonferroni correction at α/36 ≈
+0.0014. Round-2 review correctly noted that 0.0014 is **tighter**
+than the 1 % snapshot-skew tolerance from §3.6 — which means the
+snapshot-skew noise floor would swallow any Bonferroni-corrected
+signal. The statistical guarantee would be defeated by the
+sampling tolerance. We resolve this by picking a test whose
+null distribution is CONSTRUCTED from the data itself, so that
+within-block noise (of which snapshot skew is a strict subset)
+is absorbed into the reference distribution rather than fought
+against it.
 
-The correction family must match the ACTUAL test family. We
-pre-register the statistics before running them:
+**The three composite statistics** (pre-registered):
 
-- D1 test: `mass(buckets 3..=6) / count ≥ τ_D1` AND
-  `park_rate - mean(park_rate_baseline) < σ_D1` AND
-  `dbg_tx_ring_full == 0`. One composite test per cell.
-- D2 test: bimodal shape — `mass(buckets 0..=2) / count ≥ 0.5` AND
-  `mass(buckets 6..=9) / count ≥ τ_D2`. One composite test per
-  cell.
-- D3 test: `mass(buckets 14..=15) / count ≥ τ_D3` correlated with
-  `ethtool -S tx_pause` non-zero over the window. One composite
-  test per cell (requires the D3-follow-up data).
+- D1 statistic: `T_D1 = mass(buckets 3..=6) / count` over the cell
+  window, combined with the park-rate delta and the ring-full
+  indicator. Pre-register the combination as a single scalar
+  (weighted sum, weights from baseline-healthy runs).
+- D2 statistic: `T_D2 = mass(buckets 0..=2) / count × mass(buckets
+  6..=9) / count` (bimodality product). Single scalar per cell.
+- D3 statistic: `T_D3 = mass(buckets 14..=15) / count` correlated
+  with `ethtool -S tx_pause` non-zero over the window (Pearson r
+  on 1 Hz samples). Single scalar per cell.
 
-Under this family, the re-run runs THREE composite tests per cell,
-not 16 per cell. Over 12 cells, total test family size is 36, not
-192. Bonferroni correction factor = 36, applied uniformly to the
-threshold τ. The threshold constants τ_D1 / τ_D2 / τ_D3 MUST be
-derived from baseline-healthy step1 runs (from the §10
-recalibration data), not guessed.
+Three composite tests per cell × 12 cells = 36 statistics total
+— same count as the round-1 draft, but we use a DIFFERENT
+decision rule.
 
-The 16-bucket claim is withdrawn. Cross-bucket-SHAPE tests are
-not Bonferroni-correctable by bucket count at all — they are
-single composite statistics, corrected ONLY across cells.
+**Decision rule: cell-level block-permutation test.** For each
+statistic T and each cell:
 
-**Bonferroni consistency with §3.6 R1.** Because we accept
-Relaxed memory ordering and bounded-skew snapshots, the three
-composite statistics above MUST be computed from
-snapshot-differenced histogram masses over windows long enough
-(≥ 1 second) that the per-read skew (≤ 1 completion per snapshot
-window at 130 Kpps) is negligible compared to the mass. The
-classifier will refuse to fire any D-verdict on a window shorter
-than 1 second, closing the Codex concern that relaxed reads
-subvert the statistical test.
+1. Collect the time-series of snapshot-differenced bucket counts
+   at 1 Hz over the cell's 60-second window (60 samples per
+   bucket, 16 buckets × 60 = 960 observations per cell). This is
+   the unit of noise and includes any snapshot-skew induced by
+   §3.6.
+2. Compute the observed statistic `T_obs` on the real ordering.
+3. Permute the per-second blocks (not individual samples) N =
+   10 000 times, recomputing T on each permutation. Block size
+   is chosen so that within-block reshuffles absorb snapshot
+   skew (K_skew ≤ 1 per snapshot ≪ 130 000 completions per
+   1-second block). **By construction**, K_skew noise does not
+   affect the null distribution — the reshuffle moves entire
+   1-second blocks, each already internally averaged over
+   130 000 completions, so the skew-per-snapshot is washed out
+   by the block-integration step.
+4. Fire the verdict iff `T_obs ≥ τ_cell` where τ_cell is the 95th
+   percentile of the permutation distribution for that cell,
+   THEN require `k_verdict ≥ 2 of 12 cells` (analogous to the
+   existing step1-plan.md §4.6 aggregation rule). The cell-level
+   threshold is derived from the cell's own data; the cross-cell
+   aggregation is the investigation-level rule. No Bonferroni
+   correction is applied — the permutation test is single-cell
+   valid, and the aggregation step does the cross-cell
+   correction implicitly (a spurious single-cell fire cannot
+   produce `k ≥ 2` under the null).
+
+**Why this resolves the 1 %-vs-0.0014 contradiction.** The 1 %
+snapshot-skew tolerance from §3.6 bounds the NOISE ON EACH
+1-SECOND BLOCK at ≤ 1 % of the block's mass. Block-permutation
+tests are valid for any noise model where the within-block noise
+is exchangeable across blocks (which 1 % skew with mean-zero
+drift trivially satisfies). The 0.0014 Bonferroni bound assumed
+INDEPENDENT single-bucket nulls and so was sensitive to the
+per-observation noise — which snapshot skew dominates. The
+permutation test sidesteps this entirely: it asks "is the
+observed block sequence more ordered than 95 % of random
+re-orderings of the blocks?" and that question is answered the
+same way whether each block's mass is skewed by 0 % or 1 %.
+
+Baseline thresholds τ_cell are NOT a free constant — they are
+the 95th percentile of the permutation distribution computed on
+the same data the test is evaluated on. The §10 baseline-healthy
+runs are used to derive the EXPECTED SHAPE of the null
+distribution (mean, variance, autocorrelation — that inform the
+block size choice of 1 second), but not the threshold itself.
+
+**Cross-cell aggregation rule (k_D1 / k_D2 / k_D3 ≥ 2 of 12).**
+Same shape as the existing step1-plan.md §4.6 rule for
+`k_A ≥ 2`, `k_B ≥ 2`. This handles multiplicity without
+Bonferroni by requiring cross-cell corroboration; a single-cell
+fire is not a verdict, it is a lead. The 0.0014 bound is not
+needed because the hurdle is "two cells fire at cell-level
+p ≤ 0.05" not "any cell fires at p ≤ 0.05/36".
+
+The 16-bucket Bonferroni claim from R1 is **withdrawn entirely**;
+R0's original Bonferroni proposal is also withdrawn; neither
+survives R2.
+
+**Consistency with §3.6 R2.** The block-permutation test's
+validity bound is that within-block noise is exchangeable across
+blocks. Snapshot skew bounded by K_skew = 1 completion per
+snapshot (derived in §3.6 R2) is trivially exchangeable — it is
+a zero-mean offset with a bounded variance that does not depend
+on block identity. The 1 % integration-level tolerance from §8
+hard-stop #4 is a coarser bound that covers scheduler-preemption
+extensions of K_skew; the permutation test also absorbs that
+bound because the preemption event's location in time is
+uniformly distributed across blocks.
 
 ## 12. Deferrals — expected reviewer concerns we deliberately do NOT address in this PR
 
@@ -984,12 +1377,39 @@ Listed with rationale so a future reviewer doesn't rediscover them.
    separation. Separate follow-up (Step 2 D3 spike PR, not #812).
 7. **Reverse-direction CoS config fix.** `step1-findings.md:18-24`
    — noted, separate PR to be filed after this one.
-8. **Bucket-width asymmetry.** Some reviewers will argue 16 log2
-   buckets is too coarse at the low end (everything < 1 µs in
-   bucket 0). Rebuttal: the existing drain histogram uses this
-   exact layout and has survived 3 revisions of review. Changing
-   the layout for #812 would break `bucket_index_for_ns` single-
-   source-of-truth.
+8. **Bucket-width asymmetry / bucket-0 coarseness (R2 — MED
+   resolved, out-of-scope).** Round-1 and round-2 review flagged
+   that 16 log2 buckets is coarse at the low end (everything
+   < 1 µs in bucket 0) and asked whether MQFQ-vs-shaper
+   separation at the sub-µs level could be lost.
+
+   **Resolved: explicitly out of scope for #812.** Rationale:
+
+   - The MQFQ-vs-shaper verdict signature (verdict B) lives in
+     **buckets 4-7 (8-128 µs)** per §11.1, NOT in bucket 0.
+     Queue-starvation parks manifest as tens-of-microseconds
+     latency spikes on completion — well above the 1 µs bucket-0
+     floor.
+   - Verdict C (TX-ring full) lives in **buckets 8+ (≥ 256 µs)**
+     per §11.1, also far above bucket 0.
+   - D1 lives in buckets 3-6, D2 in 6-9, D3 in 14-15 — no
+     classifier statistic reads from bucket 0 at all.
+   - Bucket 0 is the "healthy NIC DMA" floor; the classifier's
+     pre-registered composite statistics (§11.3 R2 above) all
+     IGNORE bucket 0. Sub-µs resolution would only buy signal if
+     a future verdict distinguishes healthy-fast from
+     healthy-slow, which is not in scope for the D-tier
+     investigation that motivated #812.
+   - The existing drain histogram (#709) uses the same layout and
+     has survived three revisions. Changing the layout for #812
+     alone would break `bucket_index_for_ns` single-source-of-
+     truth and force a wire-format change on the drain histogram
+     for no classifier benefit.
+
+   If a future investigation needs sub-µs resolution (e.g. for
+   verifying NIC DMA pipelining), the right answer is a separate
+   high-resolution histogram on a different code path, not a
+   re-layout of this one.
 9. **Online Z_cos recalibration.** Keep the recalibration
    off-line (operator runs step1-capture, updates the plan). An
    online feedback loop in the daemon would couple the
