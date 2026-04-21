@@ -19,12 +19,14 @@
 >   named remediation path if a future deployment blocks VDSO.
 > - HIGH #2 — 1% skew tolerance had no test pin AND Bonferroni at α/36
 >   ≈ 0.0014 was tighter than the tolerance. CLOSED by §3.6 (derive the
->   numeric skew budget K_skew from snapshot duration + completion rate,
->   quantitative — not policy), §6.1 test #7 (explicit assert with named
->   K_skew, NOT a free parameter), and §11.3 (drop Bonferroni, use a
->   block-permutation test whose p-value accepts 1% snapshot-skew noise
->   by construction — the statistic is invariant to within-block
->   reshuffles that dwarf the skew).
+>   numeric skew budget `K_skew = 3` at `λ = 3 Mpps` per worker and
+>   `W_read ≤ 1 µs`, quantitative — not policy; the 1% integration
+>   gate is the CFS-preemption-robust bound and is expected to fire
+>   under a ≥ ~1.5 ms preemption — that is the point), §6.1 test #7
+>   (explicit assert with measured K_skew_observed, NOT a free
+>   parameter), and §11.3 (drop Bonferroni, use a two-sample
+>   Fisher-Pitman block permutation test on per-block statistics — the
+>   round-4 fix of the round-3 degenerate whole-window formulation).
 > - HIGH #3 — snapshot-thread crossing of OWNED values. CLOSED by §3.5a.
 >   `BindingCountersSnapshot` derives `Clone + Default + Serialize +
 >   Deserialize` on OWNED scalar fields (`u32`/`u64`/`i32`), no
@@ -759,47 +761,92 @@ Let:
   Conservative upper bound: `W_read ≤ 1 µs`.
 - `λ = per-worker completion rate`. Plan-wide steady-state is
   130 Kpps (§3.4). Peak observed on the cluster is 520 Kpps per
-  worker (= 4× steady-state headroom). A 2 Mpps per-worker case
-  corresponds to a hypothetical future workload (e.g., small-
-  packet forwarding at the full 25 Gbps line rate: 25 × 10^9 /
-  (8 × 64) ≈ 48.8 Mpps aggregate; at 4 workers = ~12.2 Mpps, or
-  ~2 Mpps per worker under single-direction load). Conservative
-  upper bound used here: `λ ≤ 2 Mpps` per worker — widened from
-  the earlier 1 Mpps to cover the small-packet case (Codex
-  round-3 finding).
-- `K_skew(λ = 2 Mpps) = ceil(2e6 × 1e-6) = 2` completions.
+  worker (= 4× steady-state headroom). The plan's own small-packet
+  line-rate derivation (25 × 10^9 / (8 × 64) ≈ 48.8 Mpps aggregate;
+  at 4 workers ≈ 12.2 Mpps; single-direction per worker ≈
+  3.05 Mpps) is the defensible upper bound. Conservative upper
+  bound used here: `λ ≤ 3 Mpps` per worker — widened from the
+  earlier 2 Mpps to match the plan's own derivation (Codex
+  round-4 finding: `λ = 2 Mpps` understated the bound implied by
+  the 64 B / 25 Gbps / 4-worker arithmetic).
+- `K_skew(λ = 3 Mpps) = ceil(3e6 × 1e-6) = 3` completions.
 
-**K_skew = 2 completions maximum**, derived — not assumed. At
+**K_skew = 3 completions maximum**, derived — not assumed. At
 C ≥ 1000 (roughly 8 ms of accumulated completions at 130 Kpps),
-`K_skew / C ≤ 0.1 %`. At C ≥ 10 000 (roughly 77 ms), `K_skew / C ≤
-0.01 %`. The 1% figure quoted in §8 is therefore loose by 2-3
-orders of magnitude as a HARD-STOP — it tolerates pathologies
-well beyond the derived bound while still ruling out true
-corruption.
+`K_skew / C ≤ 0.3 %`. At C ≥ 10 000 (roughly 77 ms), `K_skew / C
+≤ 0.03 %`. The 1% figure quoted in §8 is therefore loose by 1-2
+orders of magnitude as a pure memory-ordering-skew HARD-STOP —
+it tolerates pathologies well beyond the derived bound while
+still ruling out true corruption.
 
-**Why keep the 1% hard-stop anyway (and not 0.01 %).** Two
-reasons: (i) the derivation assumes `W_read ≤ 1 µs` but a scheduler
-preemption during the snapshot function can push the reader off-CPU
-for up to 4 ms on a non-RT kernel (CFS quantum); during that
-window the worker can post ~8 000 completions at 2 Mpps. 8 000 /
-C at C = 200 000 = 4 % — still over the 1 % gate but bounded within
-one order of magnitude. (ii) the 1% is an INTEGRATION-LEVEL gate
-that fires on a 60-second `iperf3 -P 16` run; over that duration
-C ≥ 10^7 and K_skew is vanishingly small. The gate is therefore
-looking for a DIFFERENT class of bug (sidecar-sentinel miscompare,
-lost completion bookkeeping, stamp write landing on the wrong
-slot), not for the memory-ordering skew itself.
+**Why keep the 1% hard-stop anyway, and what it means under a
+4 ms CFS preemption.** Two things (Codex round-4 finding):
+
+(i) **CFS-preemption arithmetic.** The derivation assumes `W_read
+≤ 1 µs` but a scheduler preemption during the snapshot function
+can push the reader off-CPU for up to 4 ms on a non-RT kernel
+(CFS quantum). During that window the worker can post
+`4 ms × 3 Mpps = 12 000` completions. At C = 200 000 (a 77 ms
+accumulation window that is itself short compared to the 60 s
+integration run), 12 000 / 200 000 = **6 %**. That is ABOVE the
+1% gate and the gate WILL fire under a ~1.5 ms+ preemption on a
+short-window snapshot.
+
+(ii) **The 1% gate is SUPPOSED to fire under a ≥ ~1.5 ms
+preemption. That is the point, not a bug.** We adopt the
+"observability of the event is the point" stance: if the
+snapshot is taken mid-preemption, the resulting histogram IS
+unreliable — the reader's view of `count` is stale relative to
+`sum(hist)` by the number of completions the worker posted while
+the reader was descheduled, and that stale-ness is a measurement
+pathology the integration harness SHOULD surface. A one-off fire
+on a 60-second integration run at C ≥ 10^7 dilutes the
+preemption skew well below 1% (`12 000 / 10^7 = 0.12 %`), so the
+gate does NOT fire in the normal case; a persistent fire signals
+either (a) chronic scheduler pressure on the snapshot thread
+that the test bed cannot isolate, or (b) a true bookkeeping bug
+(sidecar-sentinel miscompare, lost completion, stamp on wrong
+slot). Both are legitimate "do not merge" signals. The gate is
+therefore calibrated as:
+
+- **Pure memory-ordering skew:** `K_skew / C ≤ 0.03 %` (unit-test
+  §6.1 #7 assertion, tight; any breach = memory-ordering bug).
+- **Preemption-extended skew on a short-window integration
+  snapshot:** can reach ~6 % at C = 200 000, and a single
+  snapshot that trips the 1 % gate is investigation-worthy, not
+  automatically a merge block.
+- **Integration hard-stop (§8 #4):** measured on a 60-s run at
+  C ≥ 10^7 where the 1 % bound is robust to a one-off 4 ms
+  preemption (`0.12 % ≪ 1 %`). A sustained ≥ 1 % miss at that
+  scale is either chronic scheduler jitter invalidating the
+  measurement OR a real bookkeeping bug. Both block merge.
+
+The harness distinguishes the two by independent repetition: it
+takes N = 20 snapshots per run and records the per-snapshot
+fire rate. `fire_rate ≤ 5 %` is consistent with random CFS
+preemption (20 × 0.05 = 1 expected fire under baseline scheduler
+jitter on an unpinned run). `fire_rate > 5 %` is the
+"system-not-stable-enough-to-measure" signal and is itself a
+hard-stop condition; see §8 hard-stop #4 for the amended text.
 
 **Test pin (§6.1 test #7 cross-thread snapshot).** Asserts
-`|sum(hist) - count| ≤ K_skew` where `K_skew` is computed by the
-test harness using the MEASURED completion rate over the test
-window (not a magic constant). The harness spins a writer thread
-that records `N = 1_000_000` completions as fast as it can, measures
-`W_read` on each snapshot call via `Instant::now()` bracketing, and
+`|sum(hist) - count| ≤ K_skew_observed + 2` where
+`K_skew_observed` is computed by the test harness using the
+MEASURED completion rate over the test window (not a magic
+constant). The harness spins a writer thread that records
+`N = 1_000_000` completions as fast as it can, measures `W_read`
+on each snapshot call via `Instant::now()` bracketing, and
 computes `K_skew_observed = ceil(observed_rate × W_read)`. The
-assertion is `|sum - count| ≤ K_skew_observed + 2` (+2 is a
-paranoia margin for TSO vs ARM). The test FAILS if the observed
-skew exceeds the derivation — that is the real regression signal.
+`+2` is a paranoia margin INDEPENDENT of K_skew (TSO/ARM
+ordering fence tolerance); it does not change when `λ` widens
+from 2 Mpps to 3 Mpps because it absorbs reordering, not rate.
+The test FAILS if the observed skew exceeds the derivation —
+that is the real regression signal. Under the §3.6 R2 derivation
+at `λ = 3 Mpps`, `W_read ≤ 1 µs`, the expected bound is
+`|sum - count| ≤ 3 + 2 = 5` per snapshot; under preemption of up
+to 4 ms it extends to `≤ 12 000 + 2 = 12 002`, and the test uses
+the MEASURED `W_read` per snapshot so both regimes are covered
+without a separate branch.
 
 - Snapshot consumers MUST treat `sum(hist)` and `count` as
   "observed at slightly different instants". The wire-contract
@@ -823,18 +870,20 @@ skew exceeds the derivation — that is the real regression signal.
   designed to catch (not memory-ordering skew). The 1% is
   DEFENDED: it is the scheduler-preemption-robust upper bound,
   not a guess.
-- §11 statistical framework is REWRITTEN (see §11.3 R2 block). We
+- §11 statistical framework is REWRITTEN (see §11.3 R3 block). We
   DROP Bonferroni entirely — Codex R2 correctly noted that
   Bonferroni at α/36 ≈ 0.0014 is tighter than the 1% snapshot
   skew tolerance, so the statistical test would be defeated by
-  the sampling noise. We replace it with a cell-level
-  block-permutation test (Fisher-Pitman style on composite
-  statistics) that is invariant to within-block reshuffles of
-  individual samples — which subsumes snapshot-skew noise by
-  construction because shuffles of size K_skew ≪ block size do
-  not move the test statistic's null distribution. Codex MED #8
-  and the round-2 Bonferroni-vs-1% contradiction are both closed
-  by that replacement.
+  the sampling noise. We replace it with a cell-level two-sample
+  Fisher-Pitman block permutation test
+  (`scipy.stats.permutation_test` with `permutation_type=
+  'independent'`, `n_resamples=10_000`, `alternative='greater'`)
+  on PER-BLOCK statistics pooled against a baseline-healthy
+  block sample. Codex round-4 finding closed the round-3
+  degeneracy (whole-window mass ratios were order-invariant and
+  gave a trivial null); the round-4 per-block formulation has a
+  non-degenerate null because block identity is the exchangeable
+  unit of a TWO-SAMPLE test, not a within-window shuffle.
 
 This decision is scoped to #812 only. If a later PR needs
 point-in-time consistent snapshots for production-gating purposes,
@@ -1101,7 +1150,9 @@ no "let's just merge it and file a follow-up":
 1. **Hot-path bench regresses > 5 % on `iperf3 -P 16 -t 60 -p 5203` SUM** (absolute Gbps, pre vs post on the same cluster, same CoS state).
 2. **Any forwarding smoke (`-P 4 -t 5`) returns retransmits > 0** after the PR lands.
 3. **Any `mqfq_*` or `flow_steer_*` unit test fails.**
-4. **Histogram sum drift exceeds bounded-skew tolerance** (`|sum(hist) - count| / count > 0.01` on a production integration snapshot; §3.6 R2 derives K_skew = 1 completion per snapshot at 1 Mpps × 1 µs, extended by the CFS preemption window to ≤ 4 000 completions at C ≥ 100 000 — still inside 1 %. The 1 % is the scheduler-preemption-robust upper bound, NOT a guess, and it is 2-3 orders of magnitude looser than the pure memory-ordering skew).
+4. **Histogram sum drift exceeds bounded-skew tolerance** — measured on the 60-s `iperf3 -P 16 -t 60` integration run at C ≥ 10^7, where K_skew = 3 (§3.6 R2: `λ = 3 Mpps`, `W_read = 1 µs`) dilutes to `≤ 0.00003 %` and even a one-off 4 ms CFS preemption dilutes to `12 000 / 10^7 = 0.12 %`. Fail on EITHER of:
+   (a) Aggregate `|sum(hist) - count| / count > 0.01` on the full-run snapshot (`C ≥ 10^7`). A breach at that scale means either sustained scheduler pressure invalidating the measurement OR a real bookkeeping bug; both block merge.
+   (b) Per-snapshot fire rate > 5 % across the harness's N = 20 short-window snapshots (the "system-not-stable-enough-to-measure" signal per §3.6 R2 stance). A random 4 ms CFS preemption can push a SHORT-window snapshot (C ≈ 200 000) to ~6 % skew, tripping the 1 % gate; 1 in 20 is baseline scheduler jitter on an unpinned test bed, > 1 in 20 is chronic.
 5. **CPU profile shows > 5 % time in `record_tx_submit` + `record_tx_completion` combined on the steady-state partition of the `perf record -e cpu-clock` flame-graph.**
 
 ### 8.1 R2 (MED) — Why the hard-stop is 5 %, NOT 1 %
@@ -1254,8 +1305,9 @@ Per `step1-plan.md:1134`, no bare "5 %" thresholds. The histogram
 adds 16 counters × 12 cells = 192 additional observations per
 re-run.
 
-**R2 (Codex HIGH #2, MED #8) — DROP Bonferroni; use cell-level
-block-permutation (Fisher-Pitman style).**
+**R3 (Codex HIGH #2, MED #8, round-4 follow-up) — DROP
+Bonferroni; use two-sample Fisher-Pitman block permutation on
+per-block statistics.**
 
 Round-1 of this plan proposed Bonferroni correction at α/36 ≈
 0.0014. Round-2 review correctly noted that 0.0014 is **tighter**
@@ -1268,70 +1320,134 @@ within-block noise (of which snapshot skew is a strict subset)
 is absorbed into the reference distribution rather than fought
 against it.
 
-**The three composite statistics** (pre-registered):
+**Per-block statistics, not whole-window mass ratios (Codex
+round-4 finding).** The round-2 text defined `T_D1`,
+`T_D2`, `T_D3` as whole-window mass ratios (e.g.
+`mass(buckets 3..=6) / count` over the 60-second window). Those
+are order-invariant: permuting 1-second blocks does not change
+the total, so the permutation null distribution is degenerate
+(every permutation gives the same scalar). Codex is correct.
+The fix is to redefine each statistic as a PER-BLOCK quantity
+whose AGGREGATION is order-sensitive, then use the
+two-sample-style Fisher-Pitman permutation test on
+baseline-vs-cell block populations.
 
-- D1 statistic: `T_D1 = mass(buckets 3..=6) / count` over the cell
-  window, combined with the park-rate delta and the ring-full
-  indicator. Pre-register the combination as a single scalar
-  (weighted sum, weights from baseline-healthy runs).
-- D2 statistic: `T_D2 = mass(buckets 0..=2) / count × mass(buckets
-  6..=9) / count` (bimodality product). Single scalar per cell.
-- D3 statistic: `T_D3 = mass(buckets 14..=15) / count` correlated
-  with `ethtool -S tx_pause` non-zero over the window (Pearson r
-  on 1 Hz samples). Single scalar per cell.
+**The three composite statistics** (pre-registered, per-block):
 
-Three composite tests per cell × 12 cells = 36 statistics total
-— same count as the round-1 draft, but we use a DIFFERENT
-decision rule.
+For each cell the 60-s window is split into B = 60 one-second
+blocks, indexed `b = 1..=60`. For each block `b`, define:
 
-**Decision rule: cell-level block-permutation test.** For each
-statistic T and each cell:
+- `T_D1,b = mass_b(buckets 3..=6) / count_b` — block-local mass
+  ratio in the 4-128 µs range; fires when D1-pattern latency
+  elevation is CONCENTRATED in time rather than smeared. Order-
+  sensitive because the per-block ratio varies while the
+  whole-window ratio does not.
+- `T_D2,b = (mass_b(0..=2) / count_b) × (mass_b(6..=9) /
+  count_b)` — per-block bimodality product. Peaks when the
+  block contains BOTH a healthy mode and a tail-lobe mode
+  simultaneously; distinguishes D2 (intermittent reap lag) from
+  D1 (shifted mean) because D1 concentrates mass in one range,
+  D2 splits it.
+- `T_D3,b = 1{mass_b(14..=15) / count_b > 0} · 1{tx_pause_b >
+  0}` — per-block indicator correlating saturation-bucket mass
+  with non-zero `ethtool -S tx_pause` in the same 1-second
+  block. Fires when LLFC pressure co-locates with
+  completion-latency saturation; whole-window correlation was
+  the broken round-2 formulation.
 
-1. Collect the time-series of snapshot-differenced bucket counts
-   at 1 Hz over the cell's 60-second window (60 samples per
-   bucket, 16 buckets × 60 = 960 observations per cell). This is
-   the unit of noise and includes any snapshot-skew induced by
-   §3.6.
-2. Compute the observed statistic `T_obs` on the real ordering.
-3. Permute the per-second blocks (not individual samples) N =
-   10 000 times, recomputing T on each permutation. Block size
-   is chosen so that within-block reshuffles absorb snapshot
-   skew (K_skew ≤ 1 per snapshot ≪ 130 000 completions per
-   1-second block). **By construction**, K_skew noise does not
-   affect the null distribution — the reshuffle moves entire
-   1-second blocks, each already internally averaged over
-   130 000 completions, so the skew-per-snapshot is washed out
-   by the block-integration step.
-4. Fire the verdict iff `T_obs ≥ τ_cell` where τ_cell is the 95th
-   percentile of the permutation distribution for that cell,
-   THEN require `k_verdict ≥ 2 of 12 cells` (analogous to the
-   existing step1-plan.md §4.6 aggregation rule). The cell-level
-   threshold is derived from the cell's own data; the cross-cell
-   aggregation is the investigation-level rule. No Bonferroni
-   correction is applied — the permutation test is single-cell
-   valid, and the aggregation step does the cross-cell
-   correction implicitly (a spurious single-cell fire cannot
-   produce `k ≥ 2` under the null).
+The cell-level statistic for each verdict is
+`T_v = max_{b ∈ 1..=B} T_v,b` (the peak block value). Peak-
+based reduction is order-sensitive: permuting blocks reassigns
+which block the peak lands in, but the PAIRED comparison
+against baseline blocks (below) makes the null non-degenerate.
+
+Three composite tests per cell × 12 cells = 36 statistics
+total — same count as the round-1 draft, but we use a
+DIFFERENT, formally specified decision rule.
+
+**Decision rule: two-sample Fisher-Pitman block permutation
+test** (Pesarin & Salmaso, *Permutation Tests for Complex
+Data*, 2010, §3.2; implemented as `scipy.stats.permutation_test`
+with `permutation_type='independent'`).
+
+- **Null hypothesis H0:** the distribution of per-block
+  statistics `{T_v,b}` in the test cell is EQUAL to the
+  distribution of per-block statistics `{T_v,b^base}` measured
+  on the §10 baseline-healthy runs for the same cell
+  configuration (same port, same CoS state, same with-/no-cos-
+  fwd). Formally: `F_cell(T_v) = F_base(T_v)`.
+- **Alternative H1:** `F_cell(T_v) stochastically dominates
+  F_base(T_v)` (one-sided; we only care if the cell has MORE
+  pathological-signal mass than baseline).
+- **Test statistic:** `Δ = mean(T_v,b for b in cell blocks) −
+  mean(T_v,b^base for b in baseline blocks)`. This is the
+  Fisher-Pitman mean-difference statistic; order-sensitive
+  because it compares two samples, not a within-window
+  reordering of one.
+- **Null distribution construction:** pool the `B + B_base`
+  blocks (≥ 60 cell blocks + ≥ 60 baseline blocks per §10;
+  `B_base ≥ 60` required), draw `N_perm = 10 000` random
+  partitions into two groups of sizes `(B, B_base)` without
+  replacement, recompute `Δ_perm` on each. Block identity (not
+  individual-observation identity) is the exchangeable unit —
+  this is where the "block" in "block permutation" lives and
+  where within-block snapshot-skew noise of §3.6 is absorbed
+  (each 1-second block internally averages ~130 000
+  completions, so `K_skew = 3` per snapshot dilutes to <
+  0.003 % of the block mass and does not affect the mean
+  statistic).
+- **Rejection threshold:** one-sided empirical p-value
+  `p_v = (1 + #{Δ_perm ≥ Δ_obs}) / (1 + N_perm)`. Reject H0 at
+  the cell level iff `p_v ≤ 0.05`.
+- **Concrete reference implementation:**
+  ```python
+  from scipy.stats import permutation_test
+  res = permutation_test(
+      data=(cell_block_stats, base_block_stats),  # two 1-D arrays
+      statistic=lambda x, y: x.mean() - y.mean(),
+      permutation_type='independent',
+      n_resamples=10_000,
+      alternative='greater',
+      random_state=42,
+  )
+  fire_cell_level = res.pvalue <= 0.05
+  ```
+- **Cross-cell aggregation:** require `k_v ≥ 2 of 12 cells`
+  with `p_v ≤ 0.05` (analogous to the existing
+  step1-plan.md §4.6 aggregation rule). The cell-level test is
+  single-cell valid; the aggregation step does the cross-cell
+  multiplicity correction implicitly — under the null, the
+  probability of `k ≥ 2 of 12` independent cells each firing at
+  `p ≤ 0.05` is `P[Binom(12, 0.05) ≥ 2] ≈ 0.118`; under the
+  alternative, correlated cells push this well above 0.5,
+  giving usable detection power WITHOUT a Bonferroni
+  correction. The harness also reports the raw `k` for manual
+  review.
 
 **Why this resolves the 1 %-vs-0.0014 contradiction.** The 1 %
 snapshot-skew tolerance from §3.6 bounds the NOISE ON EACH
-1-SECOND BLOCK at ≤ 1 % of the block's mass. Block-permutation
-tests are valid for any noise model where the within-block noise
-is exchangeable across blocks (which 1 % skew with mean-zero
-drift trivially satisfies). The 0.0014 Bonferroni bound assumed
-INDEPENDENT single-bucket nulls and so was sensitive to the
-per-observation noise — which snapshot skew dominates. The
-permutation test sidesteps this entirely: it asks "is the
-observed block sequence more ordered than 95 % of random
-re-orderings of the blocks?" and that question is answered the
-same way whether each block's mass is skewed by 0 % or 1 %.
+1-SECOND BLOCK at `K_skew / block_count ≤ 3 / 130 000 ≈ 0.002
+%`; even under a 4 ms CFS preemption the per-block noise stays
+≤ 12 000 / 130 000 ≈ 9 %, uniformly distributed across blocks.
+Two-sample Fisher-Pitman block permutation is valid for any
+noise model where the within-block noise is exchangeable across
+the pooled blocks (the cell-vs-baseline `Δ` statistic only cares
+about differences between block means, so a preemption event
+that lands in block `b_i` rather than block `b_j` does not
+change the pooled distribution's exchangeability under H0).
+The 0.0014 Bonferroni bound assumed INDEPENDENT single-bucket
+nulls and so was sensitive to the per-observation noise — which
+snapshot skew dominates. The permutation test sidesteps this
+entirely: the `Δ` statistic is computed on block means, each
+already averaging ~130 000 completions, so snapshot-level skew
+is washed out by the block-integration step before the test
+statistic is formed.
 
-Baseline thresholds τ_cell are NOT a free constant — they are
-the 95th percentile of the permutation distribution computed on
-the same data the test is evaluated on. The §10 baseline-healthy
-runs are used to derive the EXPECTED SHAPE of the null
-distribution (mean, variance, autocorrelation — that inform the
-block size choice of 1 second), but not the threshold itself.
+Thresholds are NOT a free constant — the `p ≤ 0.05` cutoff is
+the standard one-sided level, and the null distribution is
+constructed from the data itself via the 10 000 permutations
+above. The §10 baseline-healthy runs provide `{T_v,b^base}`,
+the pooled sample that the cell data is tested against.
 
 **Cross-cell aggregation rule (k_D1 / k_D2 / k_D3 ≥ 2 of 12).**
 Same shape as the existing step1-plan.md §4.6 rule for
@@ -1343,18 +1459,25 @@ p ≤ 0.05" not "any cell fires at p ≤ 0.05/36".
 
 The 16-bucket Bonferroni claim from R1 is **withdrawn entirely**;
 R0's original Bonferroni proposal is also withdrawn; neither
-survives R2.
+survives R2; the round-3 "within-window block permutation on
+whole-window mass ratios" formulation is also **withdrawn** (it
+had a degenerate null — Codex round-4 finding). The round-4
+formulation above (two-sample Fisher-Pitman on per-block
+statistics vs a baseline-healthy block pool) is the one that
+ships.
 
-**Consistency with §3.6 R2.** The block-permutation test's
-validity bound is that within-block noise is exchangeable across
-blocks. Snapshot skew bounded by K_skew = 1 completion per
-snapshot (derived in §3.6 R2) is trivially exchangeable — it is
-a zero-mean offset with a bounded variance that does not depend
-on block identity. The 1 % integration-level tolerance from §8
-hard-stop #4 is a coarser bound that covers scheduler-preemption
-extensions of K_skew; the permutation test also absorbs that
-bound because the preemption event's location in time is
-uniformly distributed across blocks.
+**Consistency with §3.6 R2.** The two-sample block-permutation
+test's validity bound is that the pooled blocks are exchangeable
+under H0. Snapshot skew bounded by `K_skew = 3` completions per
+snapshot (derived in §3.6 R2 at `λ = 3 Mpps`) is trivially
+exchangeable — it is a zero-mean offset with bounded variance
+uniform in block identity. The 1 % integration-level tolerance
+from §8 hard-stop #4 covers scheduler-preemption extensions of
+K_skew (up to 12 000 completions per 4 ms preemption); the
+permutation test also absorbs that bound because the preemption
+event's location in time is uniformly distributed across blocks
+under the null, so it contributes to `F_base` and `F_cell`
+identically.
 
 ## 12. Deferrals — expected reviewer concerns we deliberately do NOT address in this PR
 
