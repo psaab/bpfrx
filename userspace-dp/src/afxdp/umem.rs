@@ -1199,9 +1199,14 @@ mod tests {
             while !reader_warm_rd.load(Ordering::Acquire) && Instant::now() < wait_deadline {
                 std::thread::yield_now();
             }
-            let iterations = 5_000usize;
-            let mut local = Vec::with_capacity(iterations);
-            for _ in 0..iterations {
+            // Run for a real wall-clock duration, not a fixed count
+            // (Codex round-2 HIGH-2). The writer+reader loop overlaps
+            // for the entire 200 ms window orchestrated below; the
+            // reader keeps snapshotting until the main thread signals
+            // `stop`, so the observed race window is time-bounded,
+            // not iteration-count-bounded.
+            let mut local = Vec::with_capacity(16_384);
+            while !reader_stop.load(Ordering::Relaxed) {
                 let pre = Instant::now();
                 let snap = reader_live.snapshot();
                 let w_read_ns = pre.elapsed().as_nanos() as u64;
@@ -1210,10 +1215,6 @@ mod tests {
                     snap.tx_submit_latency_hist.iter().copied().sum::<u64>() as i64;
                 let skew = (sum_buckets - count).abs();
                 local.push(Sample { skew, w_read_ns });
-                // Defensive exit if writer stopped early.
-                if reader_stop.load(Ordering::Relaxed) {
-                    break;
-                }
             }
             *reader_samples.lock().unwrap() = local;
         });
