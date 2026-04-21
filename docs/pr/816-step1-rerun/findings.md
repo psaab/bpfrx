@@ -43,10 +43,10 @@ total 37 min. Well inside the 120-min budget ceiling.
 | Finding | RNG? | Artifact(s) to recompute under pinned scipy | Close condition for #817 |
 |---|:-:|---|---|
 | H2 D1 verdict (k_D1 ≥ 2 fires across shaped-fwd cells) | Y | `docs/pr/816-step1-rerun/evidence/with-cos/p5201-fwd/{hist-blocks.jsonl,perm-test-results.json}`; `docs/pr/816-step1-rerun/evidence/with-cos/p5202-fwd/{hist-blocks.jsonl,perm-test-results.json}`; `docs/pr/816-step1-rerun/evidence/baseline/fwd-with-cos/baseline-blocks.jsonl` | Pinned `p_D1 ≤ 0.05` on both p5201-fwd and p5202-fwd (currently 0.0001 each — robustness margin enormous) |
-| Cleaned-baseline k_D1 = 5 sensitivity (p5203-fwd flips to fire) | Y | `docs/pr/816-step1-rerun/evidence/with-cos/p5203-fwd/{hist-blocks.jsonl,perm-test-results.json}`; `docs/pr/816-step1-rerun/evidence/baseline/fwd-with-cos/baseline-blocks.jsonl` (lines 13-60 only — drop run1) | Pinned cleaned `p_D1 ≤ 0.05` (currently 0.0246, 0.027 above gate) — if it flips above 0.05, §4 gets a "sensitivity-flips-on-pinned-RNG" caveat but the primary k_D1=4 verdict is unaffected |
+| Cleaned-baseline k_D1 = 5 sensitivity (p5203-fwd flips to fire) | Y | `docs/pr/816-step1-rerun/evidence/with-cos/p5203-fwd/{hist-blocks.jsonl,perm-test-results.json}`; `docs/pr/816-step1-rerun/evidence/baseline/fwd-with-cos/baseline-blocks.jsonl` (lines 13-60 only — drop run1) | Pinned cleaned `p_D1` stays ≤ 0.05 (current value 0.0246 is 0.0254 below the gate, with MC 95% half-width ≈ 0.0043). If pinned p_D1 rises above 0.05, §4 gets a "sensitivity-flips-on-pinned-RNG" caveat; the primary k_D1=4 verdict is unaffected either way |
 | Reverse-cell D1 fires p5201-rev (p=0.021), p5203-rev (p=0.036) | Y | `docs/pr/816-step1-rerun/evidence/with-cos/p5201-rev/{hist-blocks.jsonl,perm-test-results.json}`; `docs/pr/816-step1-rerun/evidence/with-cos/p5203-rev/{hist-blocks.jsonl,perm-test-results.json}`; `docs/pr/816-step1-rerun/evidence/baseline/rev-with-cos/baseline-blocks.jsonl` | Pinned `p_D1 ≤ 0.05` on each — within 2× MC half-width of gate, so this is the genuinely RNG-sensitive row. If either flips above 0.05, the cell drops from "fire" to "near-gate LEAD"; primary verdict survives because k_D1 stays ≥ 2 from p5201-fwd and p5202-fwd alone |
 | D2 downgrade (k_D2 excluded from verdict) | N | none | Always closed; D2 stays exploratory regardless of scipy version. Methodological decision, not RNG-driven |
-| Z_cos bimodal cluster summary | N | none | Always closed; descriptive. The four park-rate values [16058, 19867, 59624, 0] are deterministic per-cell aggregates, not permutation outputs |
+| Z_cos bimodal cluster summary | N | none | Always closed; descriptive. The four shaped-/line-rate park-rate values are sourced from per-cell `evidence/with-cos/p520{1,2,3,4}-fwd/verdict.txt` files — deterministic per-cell aggregates, not permutation outputs |
 | H3-framing rejection | N | none | Always closed; structural argument from histogram modes (mode=5 vs mode=9 on the two "both-fire" cells), not RNG-driven |
 | Baseline-outlier identification (run1 is 3.5× outlier) | N | `docs/pr/816-step1-rerun/evidence/baseline/fwd-with-cos/baseline-blocks.jsonl` (per-run T_D1 means in §4 table) | Always closed; arithmetic on per-run T_D1 means, not permutation outputs |
 
@@ -154,7 +154,8 @@ Park-rate observations on `with-cos-fwd` cells:
 is withdrawn.**
 
 ```
-Park-rate observations on with-cos-fwd cells: [19867, 59624, 0, 16058].
+Park-rate observations on with-cos-fwd cells (parks/s):
+p5201-fwd 19866.95, p5202-fwd 59624.32, p5203-fwd 0, p5204-fwd 16057.73.
 The distribution is visibly bimodal (line-rate p5203-fwd = 0; shaped
 cells = 16058-59624 parks/s, n=3). A Gaussian mean+2σ summary is the
 wrong statistic for bimodal data and produces a number that
@@ -349,11 +350,12 @@ is the single artifact. -->
   near 0.9 is far above any baseline-mean perturbation of order 0.02.
 - **p5204-fwd** stays SUSPECT via I12 in either scenario.
 
-**Cleaned-baseline `k_D1 = 5`** (vs full-baseline `k_D1 = 4`). The H2
-D1 verdict not only survives, it strengthens — three shaped-forward
-cells fire D1 instead of two. The full-baseline result was a
-*conservative* read of the same signal; the cleaned-baseline read is
-the more accurate one. Reverse cells and D2 channel are unaffected
+**Cleaned-baseline `k_D1 = 5`** is reported here as a sensitivity-only
+read; the **published verdict remains the conservative full-baseline
+`k_D1 = 4`**. Either way the H2 D1 verdict survives — the two near-
+theoretical-max fires (p5201-fwd at stat=0.969 and p5202-fwd at
+stat=0.885) carry the verdict by themselves regardless of which
+baseline read is used. Reverse cells and D2 channel are unaffected
 (verified by re-running the classifier with run1 dropped on each).
 
 **Action for future rounds.** Baseline runs must pass a

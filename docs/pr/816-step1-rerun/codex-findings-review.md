@@ -86,3 +86,22 @@ Mitigation: update the second prose instance to `16058-59624 parks/s, n=3`, or e
 ROUND 3: OPEN ITEMS PREVENTING ACCEPTANCE
 1. MEDIUM-1 — Remove the stale §2 cleaned-baseline narrative so the document no longer contradicts its own §4 recomputation.
 2. MEDIUM-2 — Tighten the §Reproducibility risk-by-finding table to literal Y/N sensitivity labels plus concrete `evidence/` artifacts for every RNG-sensitive row.
+
+## Round 4 verification
+
+Summary: 0 HIGH, 1 MEDIUM, 2 LOW. Round 3 fixed most of the requested items: §2 now names both `p_D1` values for `p5203-fwd-with-cos`, keeps full-baseline `k_D1 = 4` as the published verdict, the risk table now uses `RNG?` with Y/N rows, every cited RNG=Y artifact path exists on disk, the §1.1 `0.969` / `0.0124` / `~80x` framing is intact, and §4 still carries the `k_D1 = 5` vs `k_D1 = 4` sensitivity comparison. I am not accepting Round 4 yet because §4 still undercuts the “primary = conservative full baseline” framing by calling the cleaned-baseline read “the more accurate one,” which reintroduces ambiguity about which number actually drives the verdict. I also found two LOW text issues: one close-condition sentence in the risk table is numerically sloppy, and exact-token grep still finds `19867` in the document.
+
+1. MEDIUM — §4 still leaves the cleaned baseline readable as the primary result.
+`docs/pr/816-step1-rerun/findings.md:236-243` now does what Round 3 promised: it names full-baseline `p_D1 = 0.629`, cleaned-baseline `p_D1 = 0.0246`, says the primary verdict reports conservative full-baseline `k_D1 = 4`, and labels cleaned-baseline `k_D1 = 5` as sensitivity-only. But `docs/pr/816-step1-rerun/findings.md:352-356` then says "`Cleaned-baseline k_D1 = 5` ... the cleaned-baseline read is the more accurate one." In an adversarial read, that sentence upgrades the sensitivity result from "documented alternative read" to "preferred/correct read," which is exactly the ambiguity Round 3 was supposed to remove. The document therefore still contains text in §4 that can be read as making the cleaned baseline the primary result.
+Mitigation: keep §4 explicit that `k_D1 = 5` is sensitivity-only and replace the "more accurate one" sentence with wording that preserves full-baseline `k_D1 = 4` as the sole published verdict.
+
+2. LOW — The cleaned-baseline risk-table close condition is not numerically precise.
+`docs/pr/816-step1-rerun/findings.md:46` says `Pinned cleaned p_D1 ≤ 0.05 (currently 0.0246, 0.027 above gate)`. Current `p_D1 = 0.0246` is below, not above, the `0.05` gate, and the stated `0.027` margin does not match the threshold comparison. The row's artifact paths exist and the core close condition is understandable, but the current-vs-gate language is mathematically wrong in the row that is supposed to be the sensitivity contract for `#817`.
+Mitigation: restate the row with exact current-vs-pinned p-value language only.
+
+3. LOW — The literal `rg 19867` cleanliness check still fails.
+Round 3 corrected both shaped-cluster range prose instances to `16058-59624`, but exact token `19867` still appears at `docs/pr/816-step1-rerun/findings.md:49,157`. `59624` and `16058` still appear as expected at `docs/pr/816-step1-rerun/findings.md:49,157,159,162`. This does not resurrect the stale `19867-59624` range, but it does fail the requested full-file `19867` grep check.
+Mitigation: normalize those remaining raw-value mentions so exact token `19867` no longer appears.
+
+ROUND 4: OPEN ITEMS PREVENTING ACCEPTANCE
+1. MEDIUM-1 — Remove the remaining §4 language that makes cleaned-baseline `k_D1 = 5` read like the preferred/primary verdict.
