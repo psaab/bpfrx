@@ -1096,78 +1096,180 @@ mod tests {
 
     #[test]
     fn tx_latency_hist_cross_thread_snapshot_skew_within_bound() {
-        // #812 plan §6.1 test #7. Spawn a writer thread that fires
-        // `fetch_add(1)` on random buckets AND `fetch_add(delta)` on
-        // `sum_ns` + `count` at maximum sustainable rate. A reader
-        // thread repeatedly snapshots the three atomics; per
-        // snapshot compute K_skew_i = ceil(λ_obs × W_read_i) + 2
-        // (margin +2 for TSO/ARM ordering, independent of λ) and
-        // assert |sum(hist_i) - count_i| ≤ K_skew_i.
+        // #812 plan §6.1 test #7 (Codex round-1 HIGH #2). Spawn a
+        // REAL writer thread and a REAL reader thread (the previous
+        // pin did both halves on the main thread, so the "cross-
+        // thread" label was a lie). The writer drives the PRODUCTION
+        // helpers `stamp_submits` + `record_tx_completions_with_stamp`
+        // — not raw `fetch_add` — so the pin exercises the actual
+        // shipped fold, not a synthetic one.
         //
-        // The test FAILS if observed skew exceeds the derivation —
-        // that is the real regression signal distinct from the
-        // looser scheduler-preemption bound the integration gate
-        // uses in §8 hard-stop #4.
+        // Skew bound (plan §3.6 R2 / §6.1):
+        //   K_skew = ceil(λ_obs × W_read_max) + 2
+        //   λ_obs = count_final / elapsed_wall_ns
+        //         (measured AFTER stopping the writer, per Codex §7)
+        //   W_read_max = max snapshot read window observed
+        //   +2 margin is TSO / ARM re-order allowance, independent of λ
+        //
+        // Pin assertion: max observed |sum − count| across all
+        // reader snapshots ≤ K_skew.
         use std::sync::Arc;
+        use std::sync::Mutex;
         use std::sync::atomic::AtomicBool;
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
 
         let live = Arc::new(BindingLiveState::new());
         let stop = Arc::new(AtomicBool::new(false));
+        let reader_warm = Arc::new(AtomicBool::new(false));
 
+        // Writer: owns its own sidecar (plan §3.3 single-writer
+        // invariant) and runs the real stamp→reap fold in a tight
+        // loop. `sidecar_len = 64` gives the writer room to hold 64
+        // in-flight "frames" without cycling the whole array each
+        // iteration.
         let writer_live = Arc::clone(&live);
         let writer_stop = Arc::clone(&stop);
-        let handle = std::thread::spawn(move || {
+        let writer_warm = Arc::clone(&reader_warm);
+        let writer_handle = std::thread::spawn(move || {
             let owner = &writer_live.owner_profile_owner;
-            let mut bucket_cursor: usize = 0;
+            let sidecar_len: u64 = 64;
+            let mut sidecar: Vec<u64> = vec![TX_SIDECAR_UNSTAMPED; sidecar_len as usize];
+            let offsets: Vec<u64> =
+                (0..sidecar_len).map(|i| i << UMEM_FRAME_SHIFT).collect();
+            let mut cursor: u64 = 0;
+            // Warm phase: run 10k cycles before signalling the reader
+            // so the λ_obs calculation is computed over the steady-
+            // state regime, not startup (Codex §7 / plan §6.1).
+            for _ in 0..10_000u64 {
+                let offset = offsets[(cursor % sidecar_len) as usize];
+                let t_submit = cursor.saturating_add(1);
+                crate::afxdp::tx::stamp_submits(
+                    &mut sidecar,
+                    std::iter::once(offset),
+                    t_submit,
+                );
+                let t_complete = t_submit + 1024;
+                crate::afxdp::tx::record_tx_completions_with_stamp(
+                    &mut sidecar,
+                    &[offset],
+                    t_complete,
+                    owner,
+                );
+                cursor = cursor.wrapping_add(1);
+            }
+            writer_warm.store(true, Ordering::Release);
             while !writer_stop.load(Ordering::Relaxed) {
-                // Writer order mirrors the production reap: bucket
-                // increment first, then the `count` bump.
-                owner.tx_submit_latency_hist[bucket_cursor].fetch_add(1, Ordering::Relaxed);
-                owner
-                    .tx_submit_latency_sum_ns
-                    .fetch_add(1024, Ordering::Relaxed);
-                owner
-                    .tx_submit_latency_count
-                    .fetch_add(1, Ordering::Relaxed);
-                bucket_cursor = (bucket_cursor + 1) % TX_SUBMIT_LAT_BUCKETS;
+                let offset = offsets[(cursor % sidecar_len) as usize];
+                let t_submit = cursor.saturating_add(1);
+                crate::afxdp::tx::stamp_submits(
+                    &mut sidecar,
+                    std::iter::once(offset),
+                    t_submit,
+                );
+                let t_complete = t_submit + 1024;
+                crate::afxdp::tx::record_tx_completions_with_stamp(
+                    &mut sidecar,
+                    &[offset],
+                    t_complete,
+                    owner,
+                );
+                cursor = cursor.wrapping_add(1);
             }
         });
 
-        let start_wall = Instant::now();
-        let iterations = 5_000usize;
-        let mut max_skew = 0i64;
-        for _ in 0..iterations {
-            let pre = Instant::now();
-            let snap = live.snapshot();
-            let w_read_ns = pre.elapsed().as_nanos() as u64;
-            // Elapsed total wall time → observed rate.
-            let elapsed_ns = start_wall.elapsed().as_nanos() as u64;
-            let count = snap.tx_submit_latency_count;
-            let sum_buckets: u64 = snap.tx_submit_latency_hist.iter().copied().sum();
-            // Observed per-writer rate (one writer in this harness).
-            let lambda_obs_per_ns = if elapsed_ns > 0 {
-                count as f64 / elapsed_ns as f64
-            } else {
-                0.0
-            };
-            // K_skew_i = ceil(λ_obs × W_read_i) + 2
-            let k_skew_i = (lambda_obs_per_ns * w_read_ns as f64).ceil() as i64 + 2;
-            let obs_skew = (sum_buckets as i64 - count as i64).abs();
-            if obs_skew > max_skew {
-                max_skew = obs_skew;
-            }
-            assert!(
-                obs_skew <= k_skew_i,
-                "skew {obs_skew} exceeds bound K_skew_i = {k_skew_i} (w_read_ns={w_read_ns}, \
-                 lambda_obs_per_ns={lambda_obs_per_ns}, count={count}, sum={sum_buckets})",
-            );
+        // Reader: dedicated thread that snapshots the binding's
+        // atomics and records every `|sum − count|` plus the
+        // measured read window. The reader captures samples into
+        // a shared Mutex<Vec<_>> the main thread consumes after
+        // join.
+        #[derive(Clone, Copy)]
+        struct Sample {
+            skew: i64,
+            w_read_ns: u64,
         }
+        let samples: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::with_capacity(5_000)));
+        let reader_live = Arc::clone(&live);
+        let reader_stop = Arc::clone(&stop);
+        let reader_warm_rd = Arc::clone(&reader_warm);
+        let reader_samples = Arc::clone(&samples);
+        let reader_handle = std::thread::spawn(move || {
+            // Wait for writer warmup (bounded — don't hang tests if
+            // the writer never warms).
+            let wait_deadline = Instant::now() + Duration::from_secs(2);
+            while !reader_warm_rd.load(Ordering::Acquire) && Instant::now() < wait_deadline {
+                std::thread::yield_now();
+            }
+            let iterations = 5_000usize;
+            let mut local = Vec::with_capacity(iterations);
+            for _ in 0..iterations {
+                let pre = Instant::now();
+                let snap = reader_live.snapshot();
+                let w_read_ns = pre.elapsed().as_nanos() as u64;
+                let count = snap.tx_submit_latency_count as i64;
+                let sum_buckets: i64 =
+                    snap.tx_submit_latency_hist.iter().copied().sum::<u64>() as i64;
+                let skew = (sum_buckets - count).abs();
+                local.push(Sample { skew, w_read_ns });
+                // Defensive exit if writer stopped early.
+                if reader_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            *reader_samples.lock().unwrap() = local;
+        });
+
+        // Let the writer+reader run for a bounded wall window, then
+        // shut the writer down and join both threads.
+        let wall_start = Instant::now();
+        std::thread::sleep(Duration::from_millis(200));
         stop.store(true, Ordering::Relaxed);
-        handle.join().expect("writer thread joins cleanly");
-        // Diagnostic only: print the observed maximum skew so a
-        // future tightening of the bound can see typical values.
-        eprintln!("tx_latency_hist_cross_thread_snapshot_skew_within_bound: max_skew={max_skew}");
+        writer_handle.join().expect("writer thread joins cleanly");
+        reader_handle.join().expect("reader thread joins cleanly");
+        let elapsed_ns = wall_start.elapsed().as_nanos() as u64;
+
+        // Post-hoc: compute λ_obs from final count / elapsed_wall
+        // (plan §6.1 / Codex §7 — NOT from per-snapshot count).
+        let final_snap = live.snapshot();
+        let count_final = final_snap.tx_submit_latency_count;
+        assert!(
+            count_final > 0,
+            "writer thread produced no completions — harness broken",
+        );
+        let lambda_obs_per_ns = count_final as f64 / elapsed_ns.max(1) as f64;
+
+        let gathered = samples.lock().unwrap().clone();
+        assert!(
+            !gathered.is_empty(),
+            "reader thread produced no snapshots — harness broken",
+        );
+        let mut max_skew = 0i64;
+        let mut max_w_read_ns = 0u64;
+        for s in &gathered {
+            if s.skew > max_skew {
+                max_skew = s.skew;
+            }
+            if s.w_read_ns > max_w_read_ns {
+                max_w_read_ns = s.w_read_ns;
+            }
+        }
+        // K_skew bound using the MAX observed read window and the
+        // steady-state λ_obs. +2 is the derivation-independent
+        // margin (plan §3.6 R2).
+        let k_skew = (lambda_obs_per_ns * max_w_read_ns as f64).ceil() as i64 + 2;
+        assert!(
+            max_skew <= k_skew,
+            "cross-thread skew {max_skew} exceeds bound K_skew = {k_skew} \
+             (lambda_obs_per_ns={lambda_obs_per_ns:.6}, \
+             max_w_read_ns={max_w_read_ns}, count_final={count_final}, \
+             samples={})",
+            gathered.len(),
+        );
+        eprintln!(
+            "tx_latency_hist_cross_thread_snapshot_skew_within_bound: \
+             max_skew={max_skew} k_skew={k_skew} \
+             lambda_obs_per_ns={lambda_obs_per_ns:.6} \
+             max_w_read_ns={max_w_read_ns} count_final={count_final}",
+        );
     }
 
     #[test]
