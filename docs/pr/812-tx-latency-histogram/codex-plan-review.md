@@ -155,3 +155,10 @@ Round 5 new findings (if any):
 - §11.3's sentence claiming "Peak-based reduction is order-sensitive" is wrong on its own terms: a max over a fixed set of block values is order-invariant, and the accompanying SciPy code does not use the max reduction anyway.
 
 ROUND 5: plan-ready NO
+
+## Round 6 verification
+
+§11.3 contradiction: CLOSED — At `plan.md:1360-1364` the active spec now says the cell decision compares "the cell's set of per-block values `{T_v,b : b ∈ 1..=B}`" directly to the baseline values "`{T_v,b^base : b ∈ 1..=B_base}`" with "NO max-reduction, NO per-cell scalar; the block values themselves are the two samples into the permutation test." The only surviving max wording is the explicit retraction note at `plan.md:1365-1366`: "earlier `T_v = max_b T_v,b` wording contradicted the mean-difference test statistic," which preserves history but is not operative text. H0, H1, and the statistic are aligned on the same per-block object: H0/H1 are distributions of `{T_v,b}` vs `{T_v,b^base}` at `plan.md:1377-1385`, and `Δ = mean(T_v,b ...) − mean(T_v,b^base ...)` at `plan.md:1386-1389` uses those same samples. I found no other live max-aggregated formulation elsewhere in the document.
+Round 6 new findings (if any): Minor editorial stale cross-reference only: §12 item 8 still says "pre-registered composite statistics (§11.3 R2 above)" at `plan.md:1531-1532`, while the active rewrite block is labeled "R3" at `plan.md:1308-1310`.
+
+ROUND 6: plan-ready YES
