@@ -23,7 +23,7 @@ from the inherited mask. D3 constrains RSS to queues 0..workers-1.
 But nothing asserts `/proc/irq/<N>/smp_affinity_list` for each mlx5
 queue-N IRQ. If queue 2's IRQ fires on CPU 0 while worker 2 busy-polls
 on CPU 4, NAPI runs remote and `reap_tx_completions` (`tx.rs:10`)
-pulls frames a remote CPU filled. `docs/712-cpu-pinning-recipe.md`
+pulls frames a remote CPU filled. `docs/pr/712-cpu-pinning/recipe.md`
 asserts this is set at boot; the plan does not verify it on the
 loss-userspace cluster.
 

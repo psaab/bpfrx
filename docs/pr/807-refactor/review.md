@@ -166,8 +166,8 @@ Neither blocks the merge — they're cleanup in the next round.
 
 ## 6. Files that SHOULD have moved but didn't
 
-- `docs/785-cross-worker-drr-retrospective.md` and
-  `docs/785-perf-fairness-plan.md` stay at `docs/` root. **Correct per
+- `docs/pr/785-umbrella/cross-worker-drr-retrospective.md` and
+  `docs/pr/785-umbrella/perf-fairness-plan.md` stay at `docs/` root. **Correct per
   the README convention** — these are multi-PR retrospectives /
   parent-plans for issue #785 (spans #796 and #797), not single-PR
   adversarial review cycles. Feature-design-doc class. No move

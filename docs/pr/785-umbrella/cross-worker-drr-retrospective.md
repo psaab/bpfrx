@@ -360,7 +360,7 @@ the right scheduler primitive on top.
 
 - `docs/cross-worker-flow-fairness-research.md` — pre-slice-2 algorithm
   survey. MQFQ, AFD, shared-SFQ ranked.
-- `docs/785-perf-fairness-plan.md` — the five-phase plan this
+- `docs/pr/785-umbrella/perf-fairness-plan.md` — the five-phase plan this
   retrospective feeds into. #789 is the execution tracker.
 - PR #785 — slice 1 cleanup.
 - PR #787 — duplicate FC↔queue config rejection.
@@ -372,7 +372,7 @@ the right scheduler primitive on top.
 ## 9. Phase 1 findings (post-PR #787 clean-config baseline)
 
 Executed per issue #790. Canonical plan:
-`docs/785-perf-fairness-plan.md` Phase 1.
+`docs/pr/785-umbrella/perf-fairness-plan.md` Phase 1.
 
 **Hypothesis going in:** PR #787 removed a material rate-source
 confound from every prior #785 measurement. Baseline might already

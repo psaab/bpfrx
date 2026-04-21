@@ -229,7 +229,7 @@ Field meanings (from `BindingLiveState` in `userspace-dp/src/afxdp/umem.rs`):
 
 ### What the shape means for #709
 
-The plan (`docs/709-owner-hotspot-plan.md` §3) lays out a decision
+The plan (`docs/pr/709-owner-hotspot/plan.md` §3) lays out a decision
 tree that converts these counters into a fix path:
 
 - **drain_p99 ≈ drain_p50 (flat right tail).** The owner drain is
