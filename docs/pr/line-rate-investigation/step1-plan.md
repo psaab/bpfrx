@@ -358,11 +358,15 @@ FP_union_max9_or_min0  0.6302   <-- per-cell fire rate on 56 % skew
 Honest assessment: per-cell power on a 56 % probabilistic skew
 is `~0.63`, NOT the `> 0.99` the prior defense implied. The
 defense survives only via the **multi-cell aggregation rule in
-§4.6 below**: across the 8 forward shaped cells, `P(≥ 2 fire) ≈
-0.995`, which IS the detection guarantee the plan needs. A
-single-cell Verdict A is therefore an unreliable signal on
-this skew — the signal lives in the count across cells. This
-is now load-bearing for §8's Step-2 trigger rule.
+§4.6 below**: across the 8 forward cells (4 with-cos-fwd +
+4 no-cos-fwd; Verdict A applies regardless of shaping),
+`P(≥ 2 fire) ≈ 0.995`, which IS the detection guarantee the
+plan needs. A single-cell Verdict A is therefore an
+unreliable signal on this skew — the signal lives in the
+count across cells. This is now load-bearing for §8's Step-2
+trigger rule. (Verdict B, by contrast, has a smaller
+denominator of 4 with-cos-fwd cells — see §4.6 — because B
+requires an active shaper to fire.)
 
 If the skew is deterministic (worker 0 *always* lands n=9
 because of a literal Toeplitz hash bug, not a probabilistic
@@ -493,7 +497,10 @@ runs.
   link rate (which is ~25 G; iperf3 at 25 G fills the link but
   the root token bucket tracks wire rate). 10 / s is a
   conservative noise floor.
-- **`Z_cos = 500 parks / s`** (applies to the 8 with-cos cells),
+- **`Z_cos = 500 parks / s`** (applies to the 4 with-cos
+  **forward shaped** cells — the 4 with-cos reverse cells carry
+  no `bandwidth-output` filter per §1 and therefore have no
+  active CoS queues to park; they are excluded from Verdict B),
   derived as `5 × Z_nocos` per the **calibration-gap rule below**.
 
 **Calibration-gap disclosure (load-bearing).** The ideal
@@ -544,13 +551,15 @@ placeholder, not a calibrated value. It is reported in
 findings.md with the tag `Z_cos=5×Z_nocos (calibration-gap,
 no park-rate data in 8matrix baseline)`, and Step 2 is
 explicitly required to **capture park-rate from at least two
-of the 8 with-cos forward cells on the first complete Step 1
-run and re-derive `Z_cos` via mean + 2σ before accepting any
-Verdict B as final**. Until that re-derivation lands, a
-single-cell Verdict B firing under `with-cos` is treated as
-TENTATIVE (reported but not trusted as an investigation-level
-signal); the §4.6 k ≥ 2 rule is tightened to k ≥ 3 for with-cos
-Verdict B until the calibration gap closes.
+of the 4 with-cos forward shaped cells on the first complete
+Step 1 run and re-derive `Z_cos` via mean + 2σ before
+accepting any Verdict B as final**. Until that re-derivation
+lands, **any** with-cos Verdict B — single-cell or aggregated
+— is TENTATIVE and must not trigger Step 2 AFD work (see §8's
+Z_cos gating-loop rule). The §4.6 `k_B ≥ 2 of 4` rule
+establishes statistical trust in the with-cos Verdict B
+signal; the calibration-gap gate is a separate, stricter
+prerequisite on data provenance — both must clear.
 
 *Expected FP (best-effort under the gap).* If real healthy
 shaped park rate is ≤ 100 / s per queue (plausible given tick
@@ -620,7 +629,7 @@ leaving 5+ Gbps on the floor silently).
 | Verdict | Predicate                                                   | Nominal FP | Source-of-truth field                         |
 |---------|-------------------------------------------------------------|------------|-----------------------------------------------|
 | A       | `max(n_w) ≥ 9` OR `min(n_w) ≤ 0`                            | ≤ 0.064    | flow→queue→worker + `rx_packets` delta        |
-| B       | park-rate ≥ B_park (10/s no-cos, 500/s with-cos — calibration-gap) AND rate-spread ≥ 2.72 AND (NOT A, NOT C) | ≤ 0.05 (no-cos); TENTATIVE under with-cos until Z_cos re-calibrated | `queue_token_starvation_parks` + `ss -ti` RTT |
+| B       | park-rate ≥ B_park (10/s no-cos, 500/s with-cos — calibration-gap) AND rate-spread ≥ 2.72 AND (NOT A, NOT C) | per-cell ≤ 0.05 (no-cos); per-cell ≤ 0.10 (with-cos, assumed under calibration gap) — aggregate with-cos FP 0.052 at `k_B ≥ 2 of 4` per §4.6, but still TENTATIVE until Z_cos re-calibrated (§8 gating loop) | `queue_token_starvation_parks` + `ss -ti` RTT |
 | C       | `ring_w/60 ≥ 50` events/s on a worker with `cpu_w < 85 %`   | ≤ 0.01     | `dbg_tx_ring_full` + family, `mpstat`         |
 | D       | none of A/B/C AND SUM within 2 Gbps of shaper max           | n/a        | `iperf3.json` SUM vs. shaper rate             |
 
@@ -728,22 +737,100 @@ Verdict A is safe to act on.
    Verdict A is firmly supported regardless of count. Record the
    dominant worker ID in findings.md.
 
-For Verdict B, the combined FP rate is ≤ 0.05 (§4.2) on no-cos
-cells, so `E[false B across 12 cells] ≤ 0.6` and
-`P(≥ 1 false B) ≤ 0.46`. The ≥ 2-cell rule applies to B on the
-no-cos half: trust B only when ≥ 2 cells fire OR when a single
+For Verdict B, the combined per-cell FP rate is ≤ 0.05 (§4.2)
+on no-cos cells. Verdict B has a smaller denominator than
+Verdict A because it only applies where a shaper is live: on
+the no-cos side B is evaluated against the 4 no-cos-fwd cells
+(per-cell FP ≤ 0.05, `P(≥ 1 false B across 4) ≤ 0.1855`). The
+≥ 2-cell rule applies to B on the no-cos half: trust B only
+when `k_B ≥ 2 of 4` no-cos-fwd cells fire OR when a single
 cell shows both B-direct (park rate) AND B-indirect (rate
-spread) clauses at ≥ 1.5× their thresholds.
+spread) clauses at ≥ 1.5× their thresholds. On the with-cos
+half B is evaluated against 4 with-cos-fwd shaped cells and
+governed by the rule in "With-cos Verdict B rule" below, with
+the additional Z_cos calibration-gate from §8.
 
-**With-cos tightening (calibration-gap, §4.2 B_park).** Because
-`Z_cos = 5 × Z_nocos` is a placeholder (no park-rate data in
-the 8-matrix baseline), Verdict B under `with-cos` requires
-`k_B ≥ 3` out of the 8 with-cos cells — tightened from the
-generic `k_B ≥ 2` rule — until Step 2 captures park-rate data
-from at least two with-cos cells and re-derives Z_cos via
-mean + 2σ on the healthy shaped baseline. A single with-cos
-Verdict B is reported as TENTATIVE in findings.md and does NOT
-trigger Step 2 AFD work on its own.
+**With-cos matrix size — correction.** The round-3 tightening
+previously referenced "`k_B ≥ 3` out of the 8 with-cos cells".
+That cell count was wrong. Verdict B is only applicable on
+cells where a CoS shaper is actively classifying — i.e., on
+**with-cos forward cells** (`p5201-fwd`, `p5202-fwd`,
+`p5203-fwd`, `p5204-fwd`), which is **4 cells, not 8**. The
+four with-cos REVERSE cells carry no `bandwidth-output` filter
+(see §1: reverse traffic exits on `ge-0-0-1`, unfiltered, so
+reverse traffic under `with-cos` is NOT classified — it is
+unshaped by design), so they cannot exhibit token-bucket
+starvation and are not candidates for Verdict B. The
+denominator for the k_B-under-with-cos rule is therefore 4,
+and any rule phrased as "of the 8 with-cos cells" was
+overcounting the matrix by 2×.
+
+**With-cos Verdict B rule (rewritten on N=4).** Fire the
+investigation-level with-cos Verdict B iff `k_B ≥ 2` of the 4
+with-cos forward shaped cells. Justification by the same
+false-positive method §4.2 uses for k_A:
+
+*Per-cell FP under the calibration gap.* Z_cos = 500 parks/s
+is a placeholder (§4.2 calibration-gap rule); if real healthy
+shaped park rate sits near the tick-derived upper plausible
+envelope, per-cell B-direct FP could run as high as ~0.10
+(matching the per-cell FP band assumed in the k_A power
+analysis; see §4.2 Verdict A `P(max ≥ 9)` ≈ 0.030 plus the
+B-indirect 5–15% band averaging to the same ~0.10 ceiling
+once the AND-of-three-clauses is weakened on the with-cos
+side by the gap). We adopt `p = 0.10` as the conservative
+per-cell FP for this calculation.
+
+*Binomial FP for k_B ≥ 2 of 4.* With per-cell FP p:
+
+```
+P(≥ 2 of 4 | independent cells)
+    = 1 − (1−p)^4 − 4·p·(1−p)^3
+```
+
+Values (computed by §4.2's method, reproducible via a 4-line
+Python snippet or by hand-substitution):
+
+| per-cell p | P(≥ 2 of 4) | Accept? |
+|------------|-------------|---------|
+| 0.05       | 0.0140      | yes — well under 5% investigation-FP target |
+| 0.10       | 0.0523      | **yes — at ~5% target, matches k_A FP band** |
+| 0.15       | 0.1095      | no — overshoots 5% target |
+
+At p = 0.10 the aggregate FP is 0.052 — essentially the same
+5% investigation-level FP the plan accepts for Verdict A
+single-cell detections. **Rule: k_B ≥ 2 of 4 with-cos forward
+shaped cells, with p = 0.10 assumed per-cell FP.**
+
+*Why not k_B ≥ 3 of 4 (the previous draft's 75% fraction).*
+At p = 0.10, P(≥ 3 of 4) = `4·p^3·(1−p) + p^4` = 0.0037.
+That is an extremely tight aggregate FP — far below the 5%
+band the plan accepts elsewhere — but the true-positive
+power also collapses: under a probabilistic alternative with
+per-cell fire rate ~0.4 (plausible for shaper unfairness
+firing in 40% of cells when the defect exists), P(≥ 3 of 4)
+= `4·(0.4)^3·0.6 + (0.4)^4` = 0.1792, versus P(≥ 2 of 4) =
+0.5248. Requiring 3 of 4 cuts detection power by 3× in
+exchange for a FP improvement from 5.2% to 0.4%. Given the
+5% FP target is already met at k ≥ 2, the 3-of-4 rule is
+strictly worse.
+
+*Why fraction-form is the right framing.* `k_B ≥ 2 of 4`
+expresses as 50% of cells fire. If the matrix size changes
+later (e.g., adding an IPv6 shaped port to the canonical
+config), the fraction travels with the math; an absolute
+count does not. Findings.md reports both the count and the
+fraction.
+
+**Policy summary.** With-cos Verdict B rule:
+`k_B ≥ 2 of 4` (50%). Aggregate FP ≈ 0.052 at p = 0.10.
+Single-cell with-cos Verdict B (k_B = 1 of 4) is reported as
+TENTATIVE in findings.md and does NOT trigger Step 2 AFD
+work on its own. Even at `k_B ≥ 2 of 4`, Step 2 AFD work
+remains **gated** on the Z_cos re-calibration sub-task per
+§8's explicit gating loop — the aggregation rule establishes
+statistical trust in the signal; the calibration rule
+establishes data provenance. Both must pass.
 
 For Verdict C, per-cell FP is < 0.01, so across 12 cells
 `P(≥ 1 false C) ≤ 0.11`. Single-cell C is acceptable.
@@ -1017,11 +1104,18 @@ names the direction, not the shape.
   samples × 4 workers gives 48 per-worker observations per cell,
   which is sufficient for the imbalance test. **Cross-cell
   validity** (§4.6) is handled separately: single-cell Verdict A
-  / B firings are discounted because the per-cell FP rates
-  accumulate to P(≥ 1 false firing across 12 cells) ≈ 0.55 for A
-  and ≈ 0.46 for B — the investigation-level verdict therefore
-  requires k ≥ 2 cells to fire before any Step-2 work is
-  triggered.
+  / B firings are discounted because per-cell FP rates
+  accumulate. For Verdict A (denominator 8 forward cells,
+  per-cell FP 0.0638): `P(≥ 1 false A across 8 cells) = 0.4099`.
+  For Verdict B on the no-cos half (denominator 4 no-cos-fwd
+  cells, per-cell FP ≤ 0.05): `P(≥ 1 false B) ≤ 0.1855`. For
+  Verdict B on the with-cos half (denominator 4 with-cos-fwd
+  shaped cells, per-cell FP assumed 0.10 under the Z_cos
+  calibration gap): `P(≥ 1 false B) = 0.3439`. The
+  investigation-level verdict therefore requires `k ≥ 2 of N`
+  cells to fire before any Step-2 work is triggered (see §4.6
+  for the full policy and §8 for the additional Z_cos
+  calibration gate on with-cos Verdict B).
 - **Named thresholds.** §4.2 names X, Y, Z and justifies the
   number each. No bare "5 %" or "high" in the classifier rules.
 - **Reproducibility.** The measurement is driven by a committed
