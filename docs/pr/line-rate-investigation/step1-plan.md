@@ -410,7 +410,10 @@ evidence, all three clauses required:
 
 - **B-direct (park rate):** sum over the cell's queues serving
   the iperf3 port of
-  `Δ queue_token_starvation_parks / 60s` ≥ `B_park`,
+  `Δ queue_token_starvation_parks / 60s` ≥ `B_park`, where
+  `B_park = Z_nocos = 10 parks / s` on no-cos cells and
+  `B_park = Z_cos = 500 parks / s` on with-cos cells (split
+  derivation below; Z_cos is a calibration-gap placeholder),
   AND
   `Σ admission_flow_share_drops ≤ 0.05 × Σ admission_buffer_drops +
   queue_token_starvation_parks` (i.e. the reason the queue is
@@ -474,22 +477,92 @@ range; we accept that and rely on the AND-with-park-rate gate
 (B-direct) to keep combined FP for verdict B in the ≤ 5 %
 target band.
 
-**Threshold B_park (park rate):** 100 parks / s on the dominant
-queue for the iperf3 port.
+**Threshold B_park (park rate) — split by CoS state.** The park
+counter behaves fundamentally differently depending on whether
+CoS shaping is active, so a single threshold cannot cover both
+halves of the matrix without false-positiving on healthy shaped
+runs.
 
-*Math.* MQFQ publishes a park when root or queue tokens drain
-below the head-of-line packet. Under exactly-shaped steady state
-(rate ≡ token-refill rate) a healthy queue parks ~ once per
-refill tick; tick period is 1 ms, so natural park rate is ≤ 1000
-/ s but overwhelmingly those parks are root-level and are
-immediately unparked on the next tick's token arrival.
-`queue_token_starvation_parks` specifically — the queue-level
-starvation — should be rare (< 10 / s) when the shaper is
-honoring per-queue rates. 100 / s is one park every 10 ms, well
-above nominal noise and below "broken" (~5000 / s would mean
-every packet parks). Expected FP: < 5 % on healthy shaper runs
-(verified against the no-cos baseline where the park counter is
-structurally zero: no CoS queues = no park sites).
+- **`Z_nocos = 10 parks / s`** (applies to the 4 no-cos-fwd
+  cells). When CoS is removed, no token bucket is enforcing a
+  per-queue rate. Any non-trivial park rate on
+  `queue_token_starvation_parks` under no-cos is anomalous — the
+  counter is close to structurally zero because the MQFQ
+  root-scheduler path is the only site that can park, and it
+  parks only when packets arrive faster than the advertised
+  link rate (which is ~25 G; iperf3 at 25 G fills the link but
+  the root token bucket tracks wire rate). 10 / s is a
+  conservative noise floor.
+- **`Z_cos = 500 parks / s`** (applies to the 8 with-cos cells),
+  derived as `5 × Z_nocos` per the **calibration-gap rule below**.
+
+**Calibration-gap disclosure (load-bearing).** The ideal
+derivation of `Z_cos` would mirror the Threshold-Y derivation in
+§4.2: read the 4 forward shaped cells in
+`docs/pr/line-rate-investigation/evidence-8matrix/`, extract
+`queue_token_starvation_parks` deltas, compute
+`mean(park_rate) + 2 × stddev(park_rate)` across the 4 cells, and
+use that as the healthy-shaped baseline-derived threshold. We
+verified that this is **not possible** on the current evidence:
+the 8-matrix JSON files
+(`p5201-fwd.json`, `p5202-fwd.json`, `p5203-fwd.json`,
+`p5204-fwd.json`) are raw iperf3 `-J` output with top-level keys
+`{start, intervals, end}` — they contain no control-socket
+snapshot, no `cos_interfaces` array, and no park counters. The
+park-rate fields were not surfaced until PR #804 and the
+`CoSQueueStatus` plumbing this plan is built on, both of which
+postdate the 8-matrix capture. A direct mean-plus-2σ calibration
+is therefore unavailable on this branch.
+
+**Multiplier rule.** In lieu of direct calibration, `Z_cos = 5 ×
+Z_nocos = 500 parks / s`. Rationale:
+
+- A healthy shaped system oscillates: each shaping period
+  (configurable, ~1 ms tick by default) the queue token bucket
+  drains as packets dequeue and refills on the next tick. A park
+  at the queue level is expected near the boundary of each tick
+  window, so a non-zero steady-state park rate is the *signature*
+  of an active shaper, not a fault.
+- The shaping tick period is 1 ms (see
+  `userspace-dp/src/afxdp/tx.rs:1500` and surrounding MQFQ
+  refill code cited in §4.2), giving a theoretical upper bound of
+  1000 parks / s if the queue parks exactly once per tick. A
+  healthy queue does not park every tick — only the ticks where
+  it was head-of-line when tokens went empty — so 500 / s = one
+  park every 2 ticks is a generous cap that accepts the
+  oscillation envelope while still being well below "broken"
+  (1000 / s saturation).
+- The 5× multiplier is specifically chosen to be large enough
+  that healthy shaped oscillation (1–3 parks per tick on average
+  across the cell's queues, ~10–30 / s × 10+ queues ≈ 100–300 /
+  s integrated) does NOT exceed it, and small enough that a
+  genuinely broken shaper (every packet parks, ~thousands / s)
+  does.
+
+**Calibration-gap acknowledgement.** `Z_cos = 5 × Z_nocos` is a
+placeholder, not a calibrated value. It is reported in
+findings.md with the tag `Z_cos=5×Z_nocos (calibration-gap,
+no park-rate data in 8matrix baseline)`, and Step 2 is
+explicitly required to **capture park-rate from at least two
+of the 8 with-cos forward cells on the first complete Step 1
+run and re-derive `Z_cos` via mean + 2σ before accepting any
+Verdict B as final**. Until that re-derivation lands, a
+single-cell Verdict B firing under `with-cos` is treated as
+TENTATIVE (reported but not trusted as an investigation-level
+signal); the §4.6 k ≥ 2 rule is tightened to k ≥ 3 for with-cos
+Verdict B until the calibration gap closes.
+
+*Expected FP (best-effort under the gap).* If real healthy
+shaped park rate is ≤ 100 / s per queue (plausible given tick
+period), `Z_cos = 500` gives expected FP ≪ 5 %. If real healthy
+shaped park rate is near 500 / s (oscillation amplitude larger
+than the rough analysis above), FP could exceed the ≤ 5 %
+target band; the k ≥ 3 multi-cell rule absorbs that risk.
+
+*No-cos side FP.* Verified against the no-cos baseline where the
+park counter is structurally near-zero (no active token bucket
+= no per-queue park sites exercised). Expected FP < 5 % for
+`Z_nocos = 10`.
 
 **Combined B FP rate:** B requires all three clauses to fire.
 P(all three fire on a healthy cell) ≤ 0.05 × 0.05 = 0.0025 if
@@ -547,7 +620,7 @@ leaving 5+ Gbps on the floor silently).
 | Verdict | Predicate                                                   | Nominal FP | Source-of-truth field                         |
 |---------|-------------------------------------------------------------|------------|-----------------------------------------------|
 | A       | `max(n_w) ≥ 9` OR `min(n_w) ≤ 0`                            | ≤ 0.064    | flow→queue→worker + `rx_packets` delta        |
-| B       | park-rate ≥ 100/s AND rate-spread ≥ 2.72 AND (NOT A, NOT C) | ≤ 0.05     | `queue_token_starvation_parks` + `ss -ti` RTT |
+| B       | park-rate ≥ B_park (10/s no-cos, 500/s with-cos — calibration-gap) AND rate-spread ≥ 2.72 AND (NOT A, NOT C) | ≤ 0.05 (no-cos); TENTATIVE under with-cos until Z_cos re-calibrated | `queue_token_starvation_parks` + `ss -ti` RTT |
 | C       | `ring_w/60 ≥ 50` events/s on a worker with `cpu_w < 85 %`   | ≤ 0.01     | `dbg_tx_ring_full` + family, `mpstat`         |
 | D       | none of A/B/C AND SUM within 2 Gbps of shaper max           | n/a        | `iperf3.json` SUM vs. shaper rate             |
 
@@ -653,11 +726,22 @@ Verdict A is safe to act on.
    Verdict A is firmly supported regardless of count. Record the
    dominant worker ID in findings.md.
 
-For Verdict B, the combined FP rate is ≤ 0.05 (§4.2), so
-`E[false B across 12 cells] ≤ 0.6` and `P(≥ 1 false B) ≤ 0.46`.
-The ≥ 2-cell rule applies to B as well: trust B only when ≥ 2
-cells fire OR when a single cell shows both B-direct (park rate)
-AND B-indirect (rate spread) clauses at ≥ 1.5× their thresholds.
+For Verdict B, the combined FP rate is ≤ 0.05 (§4.2) on no-cos
+cells, so `E[false B across 12 cells] ≤ 0.6` and
+`P(≥ 1 false B) ≤ 0.46`. The ≥ 2-cell rule applies to B on the
+no-cos half: trust B only when ≥ 2 cells fire OR when a single
+cell shows both B-direct (park rate) AND B-indirect (rate
+spread) clauses at ≥ 1.5× their thresholds.
+
+**With-cos tightening (calibration-gap, §4.2 B_park).** Because
+`Z_cos = 5 × Z_nocos` is a placeholder (no park-rate data in
+the 8-matrix baseline), Verdict B under `with-cos` requires
+`k_B ≥ 3` out of the 8 with-cos cells — tightened from the
+generic `k_B ≥ 2` rule — until Step 2 captures park-rate data
+from at least two with-cos cells and re-derives Z_cos via
+mean + 2σ on the healthy shaped baseline. A single with-cos
+Verdict B is reported as TENTATIVE in findings.md and does NOT
+trigger Step 2 AFD work on its own.
 
 For Verdict C, per-cell FP is < 0.01, so across 12 cells
 `P(≥ 1 false C) ≤ 0.11`. Single-cell C is acceptable.
@@ -884,8 +968,12 @@ applies to Verdict B. Below "k_" means count of cells after
   implementation.
 - If **k_A = 1** with no neighboring A firings: per §4.6, treat
   as isolated noise. Do NOT trigger D1' work on one cell.
-- If **k_B ≥ 50 %** of valid cells (with `k_B ≥ 2`): Step 2 is AFD /
-  Phase 5 MQFQ ↔ shaper-interaction work. Likely one medium PR.
+- If **k_B ≥ 50 %** of valid cells (with `k_B ≥ 2` on no-cos,
+  `k_B ≥ 3` on with-cos per §4.6 calibration-gap tightening):
+  Step 2 is AFD / Phase 5 MQFQ ↔ shaper-interaction work. Likely
+  one medium PR. Step 2 MUST ALSO include a Z_cos re-calibration
+  task (capture park-rate from the healthy shaped baseline, apply
+  mean + 2σ, update the plan) before any AFD fix is merged.
 - If **k_C ≥ 1**: Step 2 is targeted reap-cadence + produce-path
   TX-ring-size tuning. Smaller PR, guarded by the existing
   `mqfq_*` pins + the new ring-pressure counters (regression
