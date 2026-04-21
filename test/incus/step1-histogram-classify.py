@@ -209,8 +209,12 @@ def classify_cell(
     base_T_D2 = compute_T_D2(baseline_blocks)
 
     if suspect:
-        p_D1, stat_D1 = math.nan, math.nan
-        p_D2, stat_D2 = math.nan, math.nan
+        # Emit strict-JSON `null` (Python None) for unavailable numerics on
+        # suspect cells.  Prior rounds wrote math.nan which json.dump
+        # serializes as bare `NaN` — valid Python but not strict JSON
+        # (Codex Round 1 LOW finding).
+        p_D1, stat_D1 = None, None
+        p_D2, stat_D2 = None, None
     else:
         p_D1, stat_D1 = permutation_pvalue(cell_T_D1, base_T_D1)
         p_D2, stat_D2 = permutation_pvalue(cell_T_D2, base_T_D2)
@@ -350,8 +354,15 @@ def main() -> int:
                 "i13_pass": result["invariants"].get("I13") == "PASS",
                 "verdict_abcd": "",  # populated from existing step1-classify.sh verdict.txt
                 "p_D1": result["channels"]["D1"]["p"],
+                # stat_D1/stat_D2 expose the Fisher-Pitman statistic
+                # (mean-diff) so reviewers can see effect-size heterogeneity
+                # across fires — a binary fire= column collapses stat_obs
+                # ≈ 0.97 (near-theoretical max) against stat_obs ≈ 0.012
+                # (just over the gate) into the same "True" bucket.
+                "stat_D1": result["channels"]["D1"]["stat_obs"],
                 "D1_fire": result["channels"]["D1"]["fire"],
                 "p_D2": result["channels"]["D2"]["p"],
+                "stat_D2": result["channels"]["D2"]["stat_obs"],
                 "D2_fire": result["channels"]["D2"]["fire"],
                 "b14_15": result["exploratory"]["bucket_14_15_mass_fraction"],
                 "oof_10_13_max": result["exploratory"]["out_of_family_bucket_10_13_max"],

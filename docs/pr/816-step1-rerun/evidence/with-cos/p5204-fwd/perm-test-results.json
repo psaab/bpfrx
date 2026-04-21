@@ -18,14 +18,14 @@
   },
   "channels": {
     "D1": {
-      "p": NaN,
+      "p": null,
       "fire": false,
-      "stat_obs": NaN
+      "stat_obs": null
     },
     "D2": {
-      "p": NaN,
+      "p": null,
       "fire": false,
-      "stat_obs": NaN
+      "stat_obs": null
     }
   },
   "exploratory": {
