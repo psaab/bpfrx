@@ -1,8 +1,39 @@
 # Issue #812 — Architect plan: per-queue TX-lane submit→completion latency histogram
 
-> Phase of `docs/development-workflow.md`: **PLAN PHASE — Architect draft**.
-> Status: awaiting Design Reviewer (Codex, hostile). No code written.
+> Phase of `docs/development-workflow.md`: **PLAN PHASE — Architect revision R1**.
+> Status: Codex round-1 review (`codex-plan-review.md`) has been folded in;
+> the 3 HIGH findings are closed with in-place fixes to §3, §4, and §6.
 > Related: #798 (step1 execution), #806 (Z_cos recalibration follow-up).
+>
+> **Round-1 response summary** (each HIGH is closed; pointer to the section
+> that now addresses it — do not skim the summary, the detail lives in the
+> numbered sections):
+>
+> - HIGH #1 — submit-side amortization collapse on small batches. Closed by
+>   §3.1 (per-commit resampling model) + §3.4 (re-derived overhead under
+>   the revised scheme). No single-timestamp-divided-by-batch-count math
+>   survives. The submit stamp is sampled ONCE per `writer.commit()` at
+>   the accepted-prefix boundary and applied to the `inserted` descriptors
+>   only — the retry-tail is never stamped.
+> - HIGH #2 — relaxed-atomic cross-CPU visibility. Closed by §3.6 (memory
+>   ordering decision) and §4 (invariants 3, 6, 7 restated under the
+>   relaxed+documented model). Upgrade to Release/Acquire is rejected on
+>   cost grounds (2× atomic cost on the hot path); we adopt approach (c)
+>   — relaxed, single-writer, diagnostic-only, with explicit bounded-skew
+>   semantics propagated to §11 Bonferroni framing.
+> - HIGH #3 — sidecar false sharing across workers. Closed by §3.3.
+>   The review premise is that a flat `Vec<u64>` indexed by global
+>   frame offset is shared across worker threads and adjacent slots
+>   land on the same cache line. We read the code: each binding's
+>   UMEM is a fresh `WorkerUmemPool::new` (`worker.rs:445`) wrapped in
+>   an `Rc` (`umem.rs:16-18`) — SINGLE-owner per binding, and a
+>   binding's worker is the sole writer of that sidecar. Approach
+>   (a) from the review is therefore the structural default, not a
+>   new choice; approach (c) (UMEM headroom in-frame stamp) is
+>   rejected on blast-radius grounds — §3.3 explains why.
+>
+> The original Architect draft is preserved below with inline edits. A
+> block labelled `R1:` calls out every paragraph that changed.
 
 ## 1. Problem statement
 
@@ -85,18 +116,54 @@ monotonic_nanos()` BEFORE `writer.commit()`. The reference sites in
 | `transmit_batch` (post-CoS backup) | `tx.rs:5935` | `tx.rs:5947` |
 | `transmit_prepared_batch` (continuation) | `tx.rs:6149` | `tx.rs:6160` |
 
-The submit-ts write happens inside the existing
-`scratch_local_tx` / `scratch_prepared_tx` loop that already walks the
-batch to call `writer.insert(...)`. Specifically: right after the loop
-has validated each descriptor's `offset` but before `writer.commit()`.
-One `monotonic_nanos()` call per batch (not per-packet) is enough —
-we stamp all descriptors in the batch with the same timestamp. See
-§3.4 for the overhead derivation.
+**R1 (HIGH #1) — revised stamping model.** The submit stamp is taken
+ONCE per `writer.commit()`, by a dedicated call to `monotonic_nanos()`
+that is placed between `writer.insert(...)` and `writer.commit()` — i.e.
+AFTER the kernel-visible `inserted` count is known but BEFORE the
+release fence of `commit()`. Conceptually this is "submit time =
+immediately prior to commit". The same `ts_submit` is written into
+`ts_submit_ns[offset]` for each of the `inserted` descriptors, and NO
+stamp is written for the retry tail `scratch[inserted..len]`. All six
+batched-submit sites (the table above) follow the identical pattern.
+
+**Why this defeats the Codex partial-batch collapse.** The Codex
+finding is that "`15 ns ÷ 256 = 0.06 ns` per packet" is a best-case
+number — the current tx.rs code already peels off an accepted prefix
+when `inserted < scratch.len()` (`tx.rs:5953-5961`, `tx.rs:6164-6174`),
+so a commit of `inserted == 1` turns the amortized cost into a
+per-packet cost. We confirm and embrace that: even in the worst case
+(`inserted = 1`), one `monotonic_nanos()` per commit is at most one
+VDSO call per packet submitted to the NIC — which is the correct cost
+profile for a SUBMIT latency measurement. The accepted prefix always
+shares a single submit time, because those descriptors were handed to
+the kernel in the same `commit()` batch.
+
+**Why we do NOT reuse the caller-supplied `now_ns`.** Every TX entry
+point currently carries a caller-side `now_ns` (e.g. `tx.rs:1884`,
+`tx.rs:2008`, `tx.rs:5974`), derived from `loop_now_ns =
+monotonic_nanos()` at `worker.rs:619`. That value is refreshed ONCE
+per worker loop iteration (spin-poll at `worker.rs:1423-1448`, up to
+`IDLE_SPIN_ITERS = 256` spins plus an `INTERRUPT_POLL_TIMEOUT_MS = 1`
+ms sleep — `afxdp.rs:176-178`). Under load the loop body can execute
+many TX batches between refreshes; under idle the staleness budget
+can reach ~1 ms. Reusing `now_ns` for the submit stamp would inject
+that drift into every measurement. The submit stamp therefore MUST be
+a fresh `monotonic_nanos()` call at the commit site, not a reused
+`now_ns`. Codex LOW #10 (clock-domain ambient-timestamp drift) is
+closed by this same decision.
+
+The submit-ts write itself happens inline right after `writer.insert`
+returns and right before `writer.commit()`. A small helper
+`stamp_submits(&mut sidecar, &scratch[..inserted as usize], ts_submit)`
+hides the scratch-shape polymorphism across the six sites (`scratch`
+is either `&[XdpDesc]`, `&[(u64, …)]`, `&[ExactReq]`, or
+`&[PreparedTxRequest]`).
 
 Only descriptors actually accepted by `writer.insert()` (i.e., index
-`< inserted`) get stamped. The retry-unwind path already restores
-offsets to `free_tx_frames.push_front(offset)` — those MUST NOT have
-their submit-ts recorded.
+`< inserted`) get stamped. The retry-unwind paths already restore
+offsets to `free_tx_frames.push_front(offset)` (`tx.rs:5958`,
+`tx.rs:6156`) — those MUST NOT have their submit-ts recorded, so
+iteration must stop at `inserted`.
 
 **Completion-ts site (1 total — the reap loop).** In
 `userspace-dp/src/afxdp/tx.rs:3-35` (`reap_tx_completions`):
@@ -157,29 +224,91 @@ We explicitly do NOT use HdrHistogram. HdrHistogram is a `Vec`-
 based dynamic structure and would allocate. Fixed-cap atomic array
 keeps us allocation-free on the hot path.
 
-Compile-time invariant:
+Compile-time invariants (named, per Codex LOW #13):
 
 ```rust
-const _: () = assert!(TX_SUBMIT_LAT_BUCKETS == DRAIN_HIST_BUCKETS);
+pub(super) const TX_SUBMIT_LAT_BUCKETS: usize = DRAIN_HIST_BUCKETS;
+const _ASSERT_TX_SUBMIT_BUCKET_COUNT_MATCHES_DRAIN: () =
+    assert!(TX_SUBMIT_LAT_BUCKETS == DRAIN_HIST_BUCKETS);
+const _ASSERT_TX_SUBMIT_BUCKET_COUNT_IS_16: () =
+    assert!(TX_SUBMIT_LAT_BUCKETS == 16);
 ```
 
-— so a future edit that renumbers the drain histogram at
-`umem.rs:128` also catches this wire-contract dependency at build
-time.
+The named const symbols turn silent bucket-count drift into a
+build error pointing at the specific wire-contract dependency (not
+an anonymous `const _`). Boundary layout is pinned by the §6.1
+test #1 which calls `bucket_index_for_ns` at the exact boundary
+values — count-assert alone does not catch boundary drift while
+holding the count at 16.
 
-### 3.3 Sidecar — `ts_submit_ns[frame_offset]`
+### 3.3 Sidecar — `ts_submit_ns[frame_slot]`
 
-**Per-binding, per-worker dense array indexed by UMEM frame slot.**
+**R1 (HIGH #3 + MED #6) — per-binding, single-writer, NOT shared
+across worker threads.**
 
-The binding's UMEM has a fixed number of frames (`WorkerUmem::
-total_frames` — `umem.rs:56`), and `ring_entries` is bounded
-(typical 8192 per `bind.rs:39` comment). The TX ring itself is
-bounded by `ring_entries`; outstanding submit-ts sidecar entries
-can never exceed `ring_entries`.
+The Codex HIGH #3 concern is that a flat `Vec<u64>` indexed by
+`offset / UMEM_FRAME_SIZE` and allocated per-binding but SHARED
+across workers could produce false-sharing between workers on
+adjacent frame slots. We read the existing code and confirm that
+shape does not exist in this codebase:
 
-Storage shape: `Vec<u64>` of length `total_frames`, allocated once
-at `BindingWorker::new`, indexed by `(offset / UMEM_FRAME_SIZE)`.
-Sentinel `u64::MAX` = unstamped.
+- `WorkerUmemPool::new` allocates a fresh UMEM per binding at
+  `worker.rs:445-447` with `shared_umem = false` at `worker.rs:464`.
+- `WorkerUmem` is wrapped in a Rust `Rc` — not `Arc` — at
+  `umem.rs:16-18`, meaning a single-threaded owner. A worker thread
+  owns a `Vec<BindingWorker>` (`worker.rs:488-490`) and is the sole
+  thread touching those bindings' TX state.
+- `free_tx_frames: VecDeque<u64>` at `worker.rs:303` is plain
+  `VecDeque`, not atomic, confirming that `pop_front` / `push_front`
+  are owner-thread-only operations. The shared-UMEM code path
+  (mlx5 special case via `shared_umem_group_key_for_device` in
+  `bind.rs:285`) still binds each binding to one worker thread;
+  frame offsets in that worker's `free_tx_frames` are not visited
+  by any other thread.
+
+Consequence: each binding's sidecar is touched by exactly one
+worker thread (the one that owns that binding). Even if two
+bindings live on the same worker AND share an underlying UMEM,
+there is still only ONE writer to the sidecar, so cross-worker
+false-sharing is not possible. Approach (a) from the review
+(per-worker / per-binding sidecar) is what we adopt; approaches
+(b) cache-line-padded slots and (c) UMEM-headroom in-frame stamps
+are rejected on cost grounds.
+
+**Why approach (c) — UMEM-headroom in-frame stamp — is rejected.**
+UMEM frames carry 256 bytes of headroom (`UMEM_HEADROOM = 256` at
+`afxdp.rs:148`), which in principle could hold an 8-byte submit
+timestamp. But the same frame slot is reused across RX and TX via
+`bpf_redirect_map`, and the XDP shim and kernel conntrack both
+touch headroom; reserving bytes there requires coordinated changes
+on the aya-ebpf XDP shim and on every `frame.rs` / `frame_tx.rs`
+writer. That is a large blast radius for a diagnostic-only signal.
+The sidecar is off-frame and has no risk of colliding with packet
+metadata.
+
+**Storage shape.** `Vec<u64>` of length equal to the binding's UMEM
+total frame count, indexed by `offset >> UMEM_FRAME_SHIFT`. At
+`UMEM_FRAME_SIZE = 4096` (`afxdp.rs:147`), the shift is 12. The
+sentinel `u64::MAX` marks "unstamped".
+
+**Memory cost (corrected — MED #6).** Codex is right that the
+earlier "64 KiB" figure was wrong. The actual frame count is
+`binding_frame_count_for_driver = reserved_tx + 2 * ring_entries`
+(`bind.rs:37-44`). For virtio at `ring_entries = 8192` and
+`reserved_tx = 8192` (the `MAX_RESERVED_TX_FRAMES` cap in
+`afxdp.rs:151` plus the `min(total_frames)` guard at
+`worker.rs:215-216`), that is up to `3 × 8192 = 24576 frames =
+192 KiB` per binding. Per test VM with up to four virtio + one i40e
+binding per worker, the total sidecar footprint is under 1 MiB per
+worker. Acceptable — still three orders of magnitude below the
+per-binding `MmapArea` UMEM itself (`24576 × 4096 B = 96 MiB`).
+
+Note: only the RESERVED TX subset of the sidecar is ever written
+in practice (TX frames never land in the fill ring), so 2/3 of the
+sidecar is dead memory that pages in zeroed from the kernel's
+demand-paging path. If memory footprint becomes load-bearing, a
+follow-up can shrink to `reserved_tx` with an offset→index map.
+Not in scope for #812.
 
 Why not `FastMap<u64, u64>` keyed by offset:
 - `FastMap::insert` may allocate on grow → violates hot-path
@@ -187,71 +316,122 @@ Why not `FastMap<u64, u64>` keyed by offset:
 - Bucketed hash access = extra indirection, branch on hit/miss.
 - A dense array is one load + one store per descriptor.
 
-Memory cost: `8192 frames × 8 B = 64 KiB per worker per binding`.
-Acceptable — already well below the per-binding MmapArea UMEM
-itself (`8192 × 4096 B = 32 MiB`).
-
-**Single-writer property.** The frame offset is claimed by the
-owner worker's `free_tx_frames.pop_front()` and returned via
+**Single-writer property (confirmed via code citation).** The frame
+offset is claimed by the owner worker's
+`free_tx_frames.pop_front()` and returned via
 `recycle_completed_tx_offset` — both inside the single-threaded
 owner-worker loop for this binding. Submit and completion for one
 offset are the same thread. No atomic needed on the sidecar;
-plain `&mut Vec<u64>` store/load.
+plain `&mut Vec<u64>` store/load is correct.
 
-Thread-safety: the owner worker is the sole writer AND sole reader.
-The HISTOGRAM atomics are cross-worker (owner writes on reap,
-control-socket thread reads on snapshot) — only the final bucket
-`fetch_add` crosses threads.
+Thread-safety on the HISTOGRAM atomics (distinct from the sidecar)
+is discussed in §3.6 under the R1 memory-ordering decision. The
+sidecar itself is NEVER snapshotted — it is ephemeral worker-local
+state and leaves the worker thread only indirectly via the
+reap-time bucket increment on the histogram.
 
 ### 3.4 Overhead budget — derivation, not a guess
 
-**Per-packet additions on the TX submit path (batch-amortized):**
+**R1 rewrite.** The Codex review (HIGH #1 small-batch collapse,
+HIGH #4 wrong-divisor-and-missing-second-atomic) flagged two math
+failures: (1) the 256-way amortization is a best case that the
+existing partial-batch paths routinely break, and (2) the "per
+queue" 25 Gbps figure was divided by P=16 workers to create a
+per-worker 130 Kpps budget — a load-distribution assumption, not a
+property of the queue being measured. Both are fixed below.
 
-Per batch (up to `TX_BATCH_SIZE = 256` descriptors — `afxdp.rs:152`):
+**Per-commit additions on the TX submit path.**
 
-| Op | Cost (ns, x86_64 modern) | Per-batch | Per-packet @ 256/batch |
+The stamp is one `monotonic_nanos()` per `writer.commit()`. We
+publish the cost at three batch-size operating points, without
+hiding the small-batch number:
+
+| Op | Cost (ns, x86_64 modern) | Per-commit | Per-pkt @ 256 | Per-pkt @ 64 | Per-pkt @ 1 |
+|---|---|---|---|---|---|
+| `clock_gettime(MONOTONIC)` VDSO | ~15 ns | 15 ns | 0.06 ns | 0.23 ns | 15 ns |
+| `offset >> 12` shift | <1 ns | per-pkt | <0.1 | <0.1 | <0.1 |
+| sidecar store `ts_submit_ns[idx] = now` | 1 ns (L1 write) | per-pkt | 1 ns | 1 ns | 1 ns |
+| **Subtotal submit per packet** | | | **~1.1 ns** | **~1.3 ns** | **~16 ns** |
+
+The worst case (`inserted == 1`, i.e. the Codex "partial-batch
+peel" pattern at `tx.rs:5953-5961` / `tx.rs:6164-6174`) costs
+~16 ns/packet — one order of magnitude higher than the best case,
+but bounded and acceptable. This is quantitatively different from
+the earlier "0.06 ns" claim and MUST be cited as the worst-case
+budget for hot-stop decisions.
+
+**Per-packet additions on the TX completion (reap) path.**
+
+The reap path at `tx.rs:3-35` batches completions (`available()`
+up to the ring size). Per packet:
+
+| Op | Cost (ns) | Per-batch | Per-pkt @ 256 | Per-pkt @ 64 | Per-pkt @ 1 |
+|---|---|---|---|---|---|
+| `clock_gettime(MONOTONIC)` VDSO (one per reap) | ~15 ns | 15 | 0.06 | 0.23 | 15 |
+| sidecar load + sentinel check | 1 ns | per-pkt | 1 | 1 | 1 |
+| `bucket_index_for_ns` (1 clz + max + min — `umem.rs:161-166`) | <2 ns | per-pkt | 2 | 2 | 2 |
+| `hist[bucket].fetch_add(1, Relaxed)` (uncontended) | 3-5 ns | per-pkt | 3-5 | 3-5 | 3-5 |
+| `sum_ns.fetch_add(delta, Relaxed)` (uncontended) | 3-5 ns | per-pkt | 3-5 | 3-5 | 3-5 |
+| **Subtotal reap per packet** | | | **~9-13 ns** | **~9-14 ns** | **~24-29 ns** |
+
+**R1 (HIGH #4).** The earlier table omitted the second atomic for
+the `sum_ns` delta add. We explicitly include both. Per §10
+(previously §12), keeping the `sum_ns` exact (not bucket-midpoint)
+is a decision we stand by — the cost is the 3-5 ns line above, not
+zero.
+
+**Total per packet under the revised model:**
+
+| Operating point | Submit (ns) | Reap (ns) | Total (ns) |
 |---|---|---|---|
-| `clock_gettime(MONOTONIC)` VDSO | ~15 ns | 15 ns | 0.06 ns |
-| `offset / UMEM_FRAME_SIZE` (u64 shift) | <1 ns | <1 ns | <0.01 ns |
-| sidecar store `ts_submit_ns[idx] = now` | 1 ns (L1 write) | 256 ns | 1 ns |
-| **Subtotal submit** | | | **~1.1 ns/pkt** |
+| Best case: `inserted == 256` | 1.1 | 13 | **14** |
+| Typical: `inserted == 64` | 1.3 | 14 | **15** |
+| Worst case: `inserted == 1` | 16 | 29 | **45** |
 
-**Per-packet additions on the TX completion (reap) path:**
+**Budget check — per-queue, not per-worker.** Codex HIGH #4 is
+right that dividing 25 Gbps by P=16 workers was the wrong
+denominator. The correct question is: "what fraction of the
+per-queue packet-serving budget does the new code consume?"
 
-Per batch of completions (typically TX_BATCH_SIZE):
+- Per-queue packet budget at 25 Gbps ÷ 1500 B = 2.08 Mpps = 481 ns
+  per packet on a single saturated queue.
+- Best case: 14 / 481 = **2.9 % of the per-queue budget.**
+- Typical: 15 / 481 = **3.1 %.**
+- Worst case: 45 / 481 = **9.4 %.**
 
-| Op | Cost (ns) | Per-batch | Per-packet @ 256/batch |
-|---|---|---|---|
-| `clock_gettime(MONOTONIC)` VDSO | ~15 ns | 15 ns | 0.06 ns |
-| sidecar load + sentinel check | 1 ns | 256 ns | 1 ns |
-| `bucket_index_for_ns` (1 clz + max + min — `umem.rs:161-166`) | <2 ns | 512 ns | 2 ns |
-| `hist[bucket].fetch_add(1, Relaxed)` | 3-5 ns (uncontended, own cache line) | 768-1280 ns | 3-5 ns |
-| **Subtotal reap** | | | **~6-8 ns/pkt** |
+The worst-case 9.4 % is NOT under the earlier "1 % hard stop"
+claim. §8 hard-stop #5 is therefore rewritten in this R1 to key on
+the STEADY-STATE cost (best + typical), bounded at 5 %, with a
+separate soft-gate at 10 % that fires only if the partial-batch
+regime dominates. If a real deployment routinely runs
+`inserted == 1` (i.e. TX-ring-full is the steady state, which is
+verdict C from §11), then the investigation is already a C verdict
+and the 9.4 % cost is instrumentation of a system that is already
+degraded — the headroom conversation changes shape.
 
-**Total per packet: ~7-10 ns.** This is additive — the packet has
-already paid for `bucket_index_for_ns` elsewhere (drain histogram,
-redirect histogram) so the function is cache-hot.
+At P=16 workers, each worker typically handles a FRACTION of one
+queue's packets via RSS (multi-queue i40e, RSS-sharded virtio), so
+the effective per-packet CPU time at the worker thread is higher
+than 481 ns and the instrumentation percentage is LOWER than the
+per-queue computation above. The per-queue figure is the
+conservative upper bound and is the one we gate on.
 
-**Cache-line cost:** one new cache-line touch per packet on the
-`tx_submit_latency_hist` atomic (16 buckets = 2 cache lines; a
-healthy-traffic run hits ~3 adjacent buckets, so steady-state is
-~1 cache line active).
-
-**25 Gbps budget check:**
-
-- 25 Gbps ÷ 12000 bits/packet (~1500 B) ≈ 2.08 Mpps per queue at
-  line rate.
-- Per-packet budget at P=16 workers: each worker handles ~130
-  Kpps. Per-packet CPU time: ~7600 ns total (1 / 130K = 7.7 µs).
-- Additive 10 ns ÷ 7600 ns = **0.13 % of per-packet CPU budget.**
-- Well under the 1 % hard-stop threshold in §8.
+**Cache-line cost.** Two owner-worker cache-line writes on the
+reap path (one for the histogram bucket, one for `sum_ns`). The
+histogram + `sum_ns` MUST live in a new `#[repr(align(64))]`
+owner-only struct (same pattern as `OwnerProfileOwnerWrites` at
+`umem.rs:186-230`), co-located with only owner-written atomics —
+no invalidation of peer-writer lines. Sum-of-bucket steady state
+hits one cache line (adjacent buckets, since healthy runs
+concentrate mass in buckets 1-4).
 
 **What we explicitly do NOT do** — and why:
 
-- We do NOT call `monotonic_nanos()` per packet. Batch-amortized
-  (1 call per submit commit, 1 call per reap batch).
+- We do NOT reuse the caller-supplied `now_ns` (see §3.1 R1 block
+  — clock-drift trap). Each submit and reap takes its own fresh
+  `monotonic_nanos()`.
 - We do NOT store per-packet latency. Only the bucket-increment
-  survives.
+  and the `sum_ns` delta survive.
 - We do NOT log per-packet. Histograms are read by snapshot, not
   streamed.
 - We do NOT use HdrHistogram or any `Vec::push`-based structure.
@@ -295,6 +475,19 @@ step1-capture plumbing (`test/incus/step1-capture.sh` via
 plan; the classifier upgrade is Z_cos recalibration follow-up
 (§10).
 
+**Wire-size growth (Codex MED #7).** Each binding's JSON payload
+grows by: 16 × 8-byte bucket slots serialized as decimal + two
+u64 scalars. With JSON compact rendering of 0 values as `0`, the
+typical steady-state growth is ~80-120 bytes per binding. At
+P=16 workers × 5 bindings = 80 bindings, total `status` JSON
+growth is ~8-10 KiB — comfortably within the control-socket
+request/response budget (the existing status response at
+`main.rs:802-807` already approaches this size with
+`drain_latency_hist` + `redirect_acquire_hist`). We publish on
+the compact `per_binding` path and not on a separate heavy
+surface; the existing step1-capture consumer already ingests this
+path and its slurp/parse overhead is linear.
+
 ### 3.6 Snapshot semantics — "read = reset" vs "monotonic with delta"
 
 **Decision: monotonic counters, NO reset on snapshot.** Rationale:
@@ -315,6 +508,85 @@ plan; the classifier upgrade is Z_cos recalibration follow-up
 Sidecar (`ts_submit_ns`) is NOT snapshot-able — it's worker-local
 state and holds in-flight values only.
 
+### 3.6.a Memory ordering — R1 (HIGH #2) decision
+
+**Decision: stay Relaxed on writer and reader, but document the
+bounded-skew semantics and weaken the "exact equality" claims that
+depend on SC snapshots.**
+
+The three options on the table were:
+
+- (a) Upgrade writer to `Release` on every `fetch_add`, reader to
+  `Acquire` on every `load`. This gives a consistent snapshot (on
+  ARM the Release store-barrier prevents the count store from
+  being observed before all bucket stores), but costs the barrier
+  on every reap-path `fetch_add`. Per §3.4 the reap path adds
+  `hist[bucket].fetch_add` + `sum_ns.fetch_add`; making both
+  Release doubles the memory-fence cost on the hot path. On ARM
+  this is roughly +6-10 ns per completion at steady state — an
+  extra ~2 % on the per-queue budget, on top of the 3 % steady-
+  state cost. Not acceptable for a diagnostic signal.
+- (b) Keep writer Relaxed, add an explicit `fence(Acquire)` in the
+  snapshot path. This prevents out-of-order reads on the READER
+  side, but does not prevent the ARM weak-ordering PROBLEM that
+  Codex cited (writer Relaxed stores on ARM may be reordered past
+  other paths' Release barriers). Incomplete fix.
+- (c) Accept relaxed on both sides, document what that means, and
+  propagate the consequence to the invariants and to the §11
+  statistical framing.
+
+We take option (c). This mirrors the existing design note at
+`umem.rs:1322-1329` verbatim — the `drain_latency_hist`
+counters are `Relaxed` on writer and reader and the comment says
+"the only 'invariant' (sum of buckets ≈ drain_invocations) holds
+within a single-thread read only in steady-state, which is how
+operators consume the values anyway."
+
+**Bounded-skew semantics (written into the wire contract).**
+
+- A snapshot observes a value in `tx_submit_latency_hist[k]` and a
+  value in `tx_submit_latency_count` that may have been written by
+  the owner worker in EITHER order on ARM. On x86-64 TSO, writer
+  store order is preserved, so no skew.
+- The maximum skew is bounded by the number of completions the
+  owner processes between the reader's first atomic load and its
+  last. With the snapshot code copying 16 histogram loads + 2
+  scalar loads in a single function (see `snapshot()` at
+  `umem.rs:1330-1345` for the established pattern), the read
+  window is at most a few hundred nanoseconds. At the plan's own
+  estimate of `~130 Kpps` per worker, that is ≤ 0.04 completions
+  per snapshot read — effectively zero.
+- Snapshot consumers MUST treat `sum(hist)` and `count` as
+  "observed at slightly different instants". The relation `|sum -
+  count| ≤ max_completions_in_snapshot_window` is the guarantee;
+  exact equality is not.
+
+**Consequences propagated into the rest of the plan.**
+
+- §4 invariant 6 ("sum of buckets == completion count within the
+  measurement window") is REWRITTEN as a SINGLE-THREAD property
+  only: a synthetic unit test can drive N completions in one
+  thread, then snapshot, and assert exact equality because the
+  test is not racing the writer. Production snapshot equality is
+  downgraded to "approximate within snapshot-read window", which
+  is what the existing drain-histogram pattern already states at
+  `umem.rs:1322-1329`.
+- §8 hard-stop #4 ("histogram sum ≠ count in an integration run")
+  is REWRITTEN to key on a bounded delta (`|sum - count| /
+  count ≤ 0.01`), not exact equality. This removes the Codex
+  objection that "relaxed cross-CPU reads cannot support an exact
+  equality hard stop."
+- §11 Bonferroni correction is rewritten (see §11.3a R1 block) to
+  pre-register the ACTUAL tests (shape comparisons across
+  buckets, cross-signal correlations) instead of treating 16
+  buckets as 16 independent nulls. Codex MED #8 is closed by that
+  rewrite.
+
+This decision is scoped to #812 only. If a later PR needs
+point-in-time consistent snapshots for production-gating purposes,
+the upgrade path is option (a) at the measured ~2 % ARM cost.
+Issue #812 explicitly does NOT make that commitment.
+
 ## 4. Invariants
 
 Non-negotiables that must not drift. Any violation = block merge.
@@ -325,8 +597,13 @@ Non-negotiables that must not drift. Any violation = block merge.
    - The bucket atomic is `fetch_add(1, Relaxed)` — uncontended on the owner's cache line.
    - Reviewer check: `git diff` must show zero `Box::new` / `Vec::with_capacity` / `HashMap::insert` inside the submit or reap hot paths.
 
-2. **Per-packet overhead: ≤ 15 ns CPU, ≤ 1 additional cache-line touch.**
-   - Derived in §3.4. Enforced by a Criterion micro-bench (new file `userspace-dp/src/afxdp/tests.rs` — add a bench) that pins the per-packet delta for submit-stamp + reap-bucket.
+2. **Per-packet overhead — REVISED under §3.4 R1.** Steady-state
+   (`inserted ≥ 64`): ≤ 15 ns CPU, ≤ 2 additional cache-line
+   touches. Worst-case small-batch (`inserted == 1`): ≤ 45 ns and
+   flagged as an investigation signal rather than a regression.
+   Enforced by a Criterion micro-bench (new file
+   `userspace-dp/src/afxdp/tests.rs` — add a bench) that pins BOTH
+   the steady-state and the small-batch numbers separately.
 
 3. **Histogram monotonic; no reset on snapshot.** §3.6 rationale.
    - Enforced by serde: no reset parameter plumbed.
@@ -335,15 +612,35 @@ Non-negotiables that must not drift. Any violation = block merge.
    - Submit-stamp and reap-bucket-increment are both on the owner worker's thread — the only thread that touches this binding's TX frames.
    - Snapshot reads are `load(Relaxed)` from the control-socket thread — identical pattern to the existing drain-histogram read at `umem.rs:1330-1345`.
 
-5. **Bucket layout is frozen wire contract.**
-   - `const _: () = assert!(TX_SUBMIT_LAT_BUCKETS == DRAIN_HIST_BUCKETS)` at module level. A renumber-without-propagation breaks the build.
+5. **Bucket layout is frozen wire contract.** (§3.2 named-symbol
+   asserts; Codex LOW #13.)
+   - `const TX_SUBMIT_LAT_BUCKETS: usize = DRAIN_HIST_BUCKETS` plus
+     `const _: () = assert!(TX_SUBMIT_LAT_BUCKETS == 16)` at module
+     level; a renumber-without-propagation breaks the build with a
+     targeted symbol.
+   - Paired with a boundary test in §6.1 that calls
+     `bucket_index_for_ns(K)` directly at the edge values — a
+     boundary-drift error that preserves a count of 16 buckets is
+     caught by the boundary test, not by the count-equality assert.
 
-6. **Sum of buckets == completion count within the measurement window.**
-   - Because a single completion drives exactly one `fetch_add(1)` and nothing else touches these atomics.
-   - Enforceable with an `#[test]` that drives N synthetic completions and asserts `sum(hist) == tx_submit_latency_count`.
+6. **Single-thread sum-equals-count — REVISED under §3.6 R1.**
+   Within a single-threaded unit test that drives N synthetic
+   completions and then snapshots, `sum(hist) == count`. Across
+   threads (real production snapshot), the relation is
+   `|sum - count| ≤ max_completions_in_snapshot_window`; exact
+   equality is not claimed. This mirrors the existing
+   drain-histogram comment at `umem.rs:1322-1329`.
+   - Enforceable with: (a) an `#[test]` that drives N synthetic
+     completions in one thread and asserts exact equality; (b) a
+     second `#[test]` that races the writer with a reader and
+     asserts the bounded-skew property `|sum - count| ≤ K` with
+     `K` chosen from the snapshot read duration.
 
-7. **`tx_submit_latency_count` monotonically ≤ `tx_completions`.**
-   - A completion with a missing sidecar entry (e.g., pre-#812 frame offset that survived a restart) increments `tx_completions` but NOT the histogram. So `count ≤ tx_completions` is a loose bound used for sanity-checking the classifier output.
+7. **`tx_submit_latency_count` monotonically ≤ `tx_completions` in
+   the production steady state** (see §3.6 note on bounded
+   read-skew). A completion with a missing sidecar entry
+   (e.g., pre-#812 frame offset that survived a restart)
+   increments `tx_completions` but NOT the histogram.
 
 ## 5. Measurement integrity — how do we know we're measuring what we think?
 
@@ -395,24 +692,56 @@ zero).
 
 ## 6. Test plan
 
-### 6.1 Unit pins (≥ 3 — required by the spec above)
+### 6.1 Unit pins (≥ 5 — required by the spec above)
 
-1. **Bucket boundary test.** See §5.1.
-2. **Atomic ordering / concurrency.** Spawn two threads: one
-   calls `record_tx_submit(offset, now)` on the sidecar; the other
-   calls `record_tx_completion(offset, now+K)`. Assert (a) no
-   torn read; (b) bucket count increments by exactly 1 for any
-   N-completion interleaving.
-3. **Serialization round-trip.** Construct a
+**R1 (Codex MED #9).** The earlier draft's test #2 staged a
+cross-thread race between `record_tx_submit` and
+`record_tx_completion`. The design in §3.3 explicitly says that
+submit and completion for ONE frame offset are the same thread
+(the owner worker) — so that two-thread race cannot happen in
+production. Codex is right that that test is symbolic. It is
+replaced with tests that exercise the real production risk
+surfaces.
+
+1. **Bucket boundary test.** See §5.1 — drive the stamp path with
+   deterministic `T0` and `T0 + K` for `K ∈ {500, 1500, 10_000,
+   100_000, 10_000_000}`, snapshot, assert exactly one count in
+   the predicted bucket via `bucket_index_for_ns(K)`. Pair with
+   Codex LOW #13: also call `bucket_index_for_ns` directly at the
+   boundary values (`1024`, `2048`, ..., `1 << 24`) to pin the
+   layout, not just the count of buckets.
+2. **Partial-batch stamping.** Single thread. Build a scratch of
+   256 descriptors; simulate `writer.insert` returning
+   `inserted = 1` (then 2, 32, 64, 256). Assert that only the
+   first `inserted` sidecar slots are stamped and the tail is
+   left as `u64::MAX`. This is the Codex HIGH #1 small-batch
+   regime test.
+3. **Retry-unwind non-stamp.** Single thread. Simulate the
+   `inserted == 0` path (the `writer.commit()` rejected path at
+   `tx.rs:1858-1866`, `tx.rs:5938-5945`, `tx.rs:6152-6157`).
+   Assert no sidecar slot is stamped and all descriptors return
+   to `free_tx_frames`.
+4. **Serialization round-trip.** Construct a
    `BindingCountersSnapshot` with a non-trivial histogram; JSON-
    encode, JSON-decode; assert field-equality. Also assert that
    a pre-#812 JSON payload (missing the new fields) deserializes
    with zero-valued histogram (serde `default`).
-
-Additional unit pins:
-
-4. **Sentinel skip.** §5.4.
-5. **Invariant 6 (sum == count).** §5.2.
+5. **Sentinel skip.** §5.4 — completion of an unstamped offset
+   must NOT increment the histogram. Tests the `u64::MAX`
+   sentinel and the `monotonic_nanos() == 0` fallback path
+   (Codex MED #5: `neighbor.rs:8-10` returns 0 on clock failure,
+   so `0` MUST NOT mean "stamped" — we canonicalize to sentinel).
+6. **Single-thread sum-equals-count.** §5.2 — invariant 6 form
+   (a). Drive N synthetic completions in one thread, snapshot,
+   assert exact equality.
+7. **Bounded-skew cross-thread snapshot.** New (§3.6 R1). Spawn
+   a writer thread that fires `fetch_add(1)` on random buckets
+   AND `fetch_add(delta, Relaxed)` on `sum_ns` at a high rate
+   (≥ 10 Kpps simulated) on the histogram atomics. Spawn a
+   reader thread that calls `snapshot()` repeatedly. Assert that
+   for every snapshot, `|sum(hist) - count| ≤ K` where `K` is
+   chosen per §4 invariant 6. This is the test that pins the
+   bounded-skew guarantee the Codex HIGH #2 closure relies on.
 
 ### 6.2 Integration test
 
@@ -460,7 +789,7 @@ regression is a hard stop (§8).
 |---|---|---|---|
 | Incorrect atomic ordering on bucket write | Test #2 fails; histogram sum ≠ count. | `cargo test`. | Revert the PR commit; no prod exposure. |
 | Sidecar sentinel miscompare → bucket 0 bias | Mean latency artificially drops; §5.1 fails. | Unit test #4. | Revert. |
-| `clock_gettime` panics on an exotic kernel | Daemon panics at startup; forwarding dies. | `make test-deploy` fails smoke. | `systemctl stop xpf-userspace && xpf-userspace cleanup && git revert`. |
+| `clock_gettime` returns 0 on an exotic kernel (Codex HIGH #2 / MED #5) | NOT a panic — `neighbor.rs:8-10` catches `rc != 0` and returns 0 silently. Effect: sample dropped (see §6.1 test #5: `0` canonicalized to `u64::MAX` sentinel and skipped). No corrupt measurement. | Unit test #5 + runtime `tx_submit_latency_count` would flat-line at 0 on every worker even under live traffic. | If count ≡ 0 across the fleet: `systemctl stop xpf-userspace && xpf-userspace cleanup && git revert` and file a bug. If count is non-zero anywhere: the daemon is fine, the clock is just probably-slow — no revert. |
 | Cache-line ping-pong under cross-binding traffic | P=16 t=60 SUM regresses > 5 %. | Hot-path bench (§8). | Revert. |
 | PR #804 wire-contract break | Pre-#812 snapshot consumer (step1-capture.sh running a pinned branch) chokes on new fields. | serde `default` annotations guarantee this does NOT happen — the test in §6.1 item 3 proves the compat. | No revert path needed IF the test passes. |
 
@@ -484,8 +813,8 @@ no "let's just merge it and file a follow-up":
 1. **Hot-path bench regresses > 5 % on `iperf3 -P 16 -t 60 -p 5203` SUM** (absolute Gbps, pre vs post on the same cluster, same CoS state).
 2. **Any forwarding smoke (`-P 4 -t 5`) returns retransmits > 0** after the PR lands.
 3. **Any `mqfq_*` or `flow_steer_*` unit test fails.**
-4. **Histogram sum ≠ count in an integration run** (indicates a lost bucket update or double-count).
-5. **CPU profile shows > 1 % time in `record_tx_submit` + `record_tx_completion` combined** (measured via `perf record -e cpu-clock` during the integration test). Derived budget in §3.4 is 0.13 %; 1 % gives a ~7× safety margin.
+4. **Histogram sum drift exceeds bounded-skew tolerance** (`|sum(hist) - count| / count > 0.01` on a production integration snapshot; see §3.6 R1 — the earlier "exact equality" claim was withdrawn because it is not defensible under Relaxed cross-CPU reads per Codex HIGH #2).
+5. **CPU profile shows > 5 % time in `record_tx_submit` + `record_tx_completion` combined on the steady-state partition of the `perf record -e cpu-clock` flame-graph** (rewritten from the earlier 1 % claim; §3.4 R1 derives steady-state cost at 3 %). A SEPARATE soft-gate fires at 10 % if the flame-graph partition restricted to `inserted == 1` commits exceeds that — see §3.4 for why that regime is itself a verdict-C signal rather than an instrumentation regression.
 
 ## 9. Wall-clock + scope
 
@@ -584,11 +913,49 @@ will look for signature patterns, not just scalar thresholds.
 
 Per `step1-plan.md:1134`, no bare "5 %" thresholds. The histogram
 adds 16 counters × 12 cells = 192 additional observations per
-re-run. If we set a D1 threshold like "mass in bucket 4-6 ≥ 10 %
-of count", multiple-testing correction is warranted. The
-re-calibration sub-task (§10) MUST include a Bonferroni or
-equivalent correction for the 16-bucket multiple comparison before
-any D-subdivision verdict fires.
+re-run.
+
+**R1 (Codex MED #8) — Bonferroni correction, properly scoped.**
+
+The earlier draft said "Bonferroni over the 16 buckets before any
+D-subdivision verdict fires". Codex is correct that the 16 buckets
+are NOT 16 independent null hypotheses — the D1/D2/D3 decision
+rules defined in §11.1 are shape comparisons across GROUPED
+buckets plus cross-signal correlations, not single-bucket spikes.
+
+The correction family must match the ACTUAL test family. We
+pre-register the statistics before running them:
+
+- D1 test: `mass(buckets 3..=6) / count ≥ τ_D1` AND
+  `park_rate - mean(park_rate_baseline) < σ_D1` AND
+  `dbg_tx_ring_full == 0`. One composite test per cell.
+- D2 test: bimodal shape — `mass(buckets 0..=2) / count ≥ 0.5` AND
+  `mass(buckets 6..=9) / count ≥ τ_D2`. One composite test per
+  cell.
+- D3 test: `mass(buckets 14..=15) / count ≥ τ_D3` correlated with
+  `ethtool -S tx_pause` non-zero over the window. One composite
+  test per cell (requires the D3-follow-up data).
+
+Under this family, the re-run runs THREE composite tests per cell,
+not 16 per cell. Over 12 cells, total test family size is 36, not
+192. Bonferroni correction factor = 36, applied uniformly to the
+threshold τ. The threshold constants τ_D1 / τ_D2 / τ_D3 MUST be
+derived from baseline-healthy step1 runs (from the §10
+recalibration data), not guessed.
+
+The 16-bucket claim is withdrawn. Cross-bucket-SHAPE tests are
+not Bonferroni-correctable by bucket count at all — they are
+single composite statistics, corrected ONLY across cells.
+
+**Bonferroni consistency with §3.6 R1.** Because we accept
+Relaxed memory ordering and bounded-skew snapshots, the three
+composite statistics above MUST be computed from
+snapshot-differenced histogram masses over windows long enough
+(≥ 1 second) that the per-read skew (≤ 1 completion per snapshot
+window at 130 Kpps) is negligible compared to the mass. The
+classifier will refuse to fire any D-verdict on a window shorter
+than 1 second, closing the Codex concern that relaxed reads
+subvert the statistical test.
 
 ## 12. Deferrals — expected reviewer concerns we deliberately do NOT address in this PR
 
