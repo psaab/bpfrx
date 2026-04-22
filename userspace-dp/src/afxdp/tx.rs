@@ -90,6 +90,28 @@ where
 /// Returns `(count, sum_ns)` for callers that want to assert on the
 /// per-batch delta directly (rather than reading back the atomics
 /// afterward).
+/// #825: record a single `sendto` kick-latency sample into the owner
+/// atomics. Mirrors the shape of `record_tx_completions_with_stamp`
+/// but without the sidecar fold (the kick site stamps the bracket
+/// directly, no submit/completion indirection). Called once per TX
+/// kick on the hot path from `maybe_wake_tx` after the sentinel
+/// check; `#[inline]` to elide the call overhead.
+///
+/// Single-writer: the owner worker is the only thread that calls
+/// this for a given binding. Readers (`BindingLiveState::snapshot()`)
+/// see the atomics via `Relaxed`; bounded-read-skew semantics per
+/// plan §4 (K_skew inherited from #812 as a conservative upper
+/// bound — kicks occur strictly less frequently than completions).
+#[inline]
+pub(super) fn record_kick_latency(owner: &OwnerProfileOwnerWrites, delta_ns: u64) {
+    let bucket = bucket_index_for_ns(delta_ns);
+    owner.tx_kick_latency_hist[bucket].fetch_add(1, Ordering::Relaxed);
+    owner.tx_kick_latency_count.fetch_add(1, Ordering::Relaxed);
+    owner
+        .tx_kick_latency_sum_ns
+        .fetch_add(delta_ns, Ordering::Relaxed);
+}
+
 #[inline]
 pub(super) fn record_tx_completions_with_stamp(
     sidecar: &mut [u64],
@@ -6435,6 +6457,14 @@ pub(super) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, now_ns: u6
     {
         // Use direct sendto() instead of binding.tx.wake() so we can capture errors.
         let fd = binding.tx.as_raw_fd();
+        // #825 plan §3.3 site 1: two fresh `monotonic_nanos()` calls
+        // bracket the `sendto` syscall. `now_ns` is caller-cached —
+        // stale up to `IDLE_SPIN_ITERS * spin_cost` per #812 §3.1 R1
+        // — so it is NOT suitable for measuring the kick cost; we
+        // need fresh stamps to measure the syscall itself. Cost per
+        // kick: ~30 ns VDSO (2 × ~15 ns) + the atomic fetch_adds in
+        // `record_kick_latency` (≲15 ns), well within the §7 budget.
+        let kick_start = monotonic_nanos();
         let rc = unsafe {
             libc::sendto(
                 fd,
@@ -6445,12 +6475,45 @@ pub(super) fn maybe_wake_tx(binding: &mut BindingWorker, force: bool, now_ns: u6
                 0,
             )
         };
+        let kick_end = monotonic_nanos();
         binding.dbg_sendto_calls += 1;
+        // #825 plan §3.3 LOW-3 R1 sentinel, code-review R1 HIGH-1 hardening:
+        // skip record unless (a) `kick_start != 0` AND (b) `kick_end >=
+        // kick_start`. Both guards are required:
+        //   - `kick_start != 0` catches the asymmetric failure mode where
+        //     the first `monotonic_nanos()` call fails (returns 0) and the
+        //     second succeeds — `kick_end - 0` would saturate bucket 15
+        //     with a bogus-huge delta. It also drops the symmetric
+        //     double-failure case (both 0) so a spurious bucket-0 record
+        //     is not emitted on VDSO outage.
+        //   - `kick_end >= kick_start` catches the backwards-clock /
+        //     end-before-start case (wraparound in the `kick_end -
+        //     kick_start` subtraction would otherwise saturate bucket
+        //     15 with a bogus-huge delta). Both conditions must hold;
+        //     this matches `record_tx_completions_with_stamp`'s
+        //     `ts_completion >= ts_submit` precedent at :113-119.
+        if kick_start != 0 && kick_end >= kick_start {
+            let delta_ns = kick_end - kick_start;
+            record_kick_latency(&binding.live.owner_profile_owner, delta_ns);
+        }
         if rc < 0 {
             let errno = unsafe { *libc::__errno_location() };
             // EAGAIN/EWOULDBLOCK is normal for MSG_DONTWAIT; ENOBUFS means kernel dropped.
             if errno == libc::EAGAIN || errno == libc::EWOULDBLOCK {
                 binding.dbg_sendto_eagain += 1;
+                // #825 plan §3.3 site 1 / §5: parallel atomic to
+                // `dbg_sendto_eagain` (which is worker-local and
+                // never published). Counts outer `sendto` returns
+                // where `errno ∈ {EAGAIN, EWOULDBLOCK}` — the
+                // "ring pushed back" signal T1 (#819 §4.1) keys
+                // off. `dbg_sendto_eagain` stays in place: the
+                // worker-local debug-tick log at
+                // `worker.rs:~1051` continues to work.
+                binding
+                    .live
+                    .owner_profile_owner
+                    .tx_kick_retry_count
+                    .fetch_add(1, Ordering::Relaxed);
             } else if errno == libc::ENOBUFS {
                 binding.dbg_sendto_enobufs += 1;
                 if binding.dbg_sendto_enobufs <= 10 {
