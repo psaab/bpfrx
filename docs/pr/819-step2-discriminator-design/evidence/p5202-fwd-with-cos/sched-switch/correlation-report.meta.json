@@ -1,0 +1,9 @@
+{
+  "verdict": "OUT",
+  "rho": null,
+  "pvalue": null,
+  "duty_cycle_pct": 0.0,
+  "warn_blocks": [
+    11
+  ]
+}

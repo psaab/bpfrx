@@ -233,7 +233,13 @@ log "capture cold flow_steer snapshot"
 # anchor block boundaries to the same timeline as step1's warm samples.
 # Backward-compatible: existing consumers (step1-histogram-classify.py)
 # ignore unknown top-level fields.
-ts=$(date +%s)
+# #823: read the timestamp from the GUEST, not the host — the two
+# clocks can drift tens of seconds apart (unsynced NTP in the incus
+# VM), and step1's warm samples at line 291 use the GUEST clock
+# (`ts=$(date +%s)` inside the `fw` heredoc). Stamping cold with a
+# host clock produces a mismatched anchor that fails step2's
+# snapshot-interval invariant.
+ts=$(fw "date +%s")
 echo "$PRE_STATUS" | jq -c --arg ts "$ts" '. + {_sample_ts: $ts}' > "$OUTDIR/flow_steer_cold.json"
 
 log "capture cold NIC counters (ge-0-0-1, ge-0-0-2)"
@@ -281,10 +287,25 @@ sleep 0.2
 log "launch concurrent mpstat + perf stat + samplers (60 s)"
 # Note: the inner loop uses `{"type":"status"}` (the correct request
 # schema; previous draft used the wrong `request_type` key).
+# STEP1_SKIP_PERF_STAT=1 (#823/#821 follow-up): when composed inside
+# step2-sched-switch-capture.sh, the outer perf record attaches 3
+# tracepoints × 4 TIDs = 12 events to the same TIDs. Combined with
+# step1's perf stat (7 events × 4 TIDs = 28 events) this exceeds the
+# per-task perf event limit and perf record fails with EINVAL
+# ("Failure to open event... error 22"). Skip perf stat when composed;
+# a placeholder file is still emitted for invariant I2 consumers.
+# The env var is evaluated host-side because `fw` (incus exec) doesn't
+# propagate host env to the guest shell.
+if [[ "${STEP1_SKIP_PERF_STAT:-0}" = "1" ]]; then
+  log "STEP1_SKIP_PERF_STAT=1 — skipping perf stat (composed-harness mode)"
+  PERF_STAT_LAUNCH="echo 'SKIPPED: perf stat skipped by STEP1_SKIP_PERF_STAT=1 (composed with step2 harness per #823/#821). perf events would collide.' > /tmp/perf-stat.txt"
+else
+  PERF_STAT_LAUNCH="perf stat --per-thread -t $WORKER_TIDS \
+    -e task-clock,cycles,instructions,cache-references,cache-misses,L1-dcache-load-misses,LLC-loads \
+    -- sleep 60 > /tmp/perf-stat.txt 2>&1 &"
+fi
 fw "mpstat -P ALL 1 60 > /tmp/mpstat.txt 2>&1 &
-    perf stat --per-thread -t $WORKER_TIDS \
-      -e task-clock,cycles,instructions,cache-references,cache-misses,L1-dcache-load-misses,LLC-loads \
-      -- sleep 60 > /tmp/perf-stat.txt 2>&1 &
+    $PERF_STAT_LAUNCH
     : > /tmp/flow_steer_samples.jsonl
     : > /tmp/ss-samples.jsonl
     : > /tmp/sampler.err

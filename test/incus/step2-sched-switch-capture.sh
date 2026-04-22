@@ -54,14 +54,14 @@ if [[ $# -eq 4 ]]; then
 fi
 
 case "$PORT" in
-	5201|5202) ;;
-	*) echo "error: port must be 5201 or 5202, got '$PORT'" >&2; exit 2 ;;
+	5201|5202|5203) ;;
+	*) echo "error: port must be 5201, 5202, or 5203 (5203 for negative control), got '$PORT'" >&2; exit 2 ;;
 esac
 if [[ "$DIR" != "fwd" ]]; then
 	echo "error: direction must be 'fwd', got '$DIR'" >&2; exit 2
 fi
-if [[ "$COS" != "with-cos" ]]; then
-	echo "error: cos-state must be 'with-cos', got '$COS'" >&2; exit 2
+if [[ "$COS" != "with-cos" && "$COS" != "no-cos" ]]; then
+	echo "error: cos-state must be 'with-cos' or 'no-cos', got '$COS'" >&2; exit 2
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -179,7 +179,11 @@ mkdir -p "$STEP2_OUTDIR"
 rm -f "$STEP1_OUTDIR/worker-tids.txt"
 
 log "launching step1-capture.sh $PORT $DIR $COS in background"
-"$SCRIPT_DIR/step1-capture.sh" "$PORT" "$DIR" "$COS" > "$STEP2_OUTDIR/step1-capture.log" 2>&1 &
+# STEP1_SKIP_PERF_STAT=1: step1's per-thread perf stat conflicts with
+# our perf record on the same TIDs (exceeds per-task event limit,
+# EINVAL). step1 handles this env var and emits an empty perf-stat.txt
+# placeholder for downstream consumers.
+STEP1_SKIP_PERF_STAT=1 "$SCRIPT_DIR/step1-capture.sh" "$PORT" "$DIR" "$COS" > "$STEP2_OUTDIR/step1-capture.log" 2>&1 &
 STEP1_PID=$!
 log "  step1-capture.sh PID=$STEP1_PID"
 
@@ -217,24 +221,29 @@ log "  worker TIDs: $WORKER_TIDS"
 
 # Let step1's samplers fire the first (cold) snapshot before we start perf.
 sleep 0.5
-PERF_START_NS="$(date +%s%N)"
-log "PERF_START_NS=$PERF_START_NS"
+# #823: read timestamps from the GUEST, not the host. Host and guest
+# clocks in the incus VM can drift tens of seconds apart (unsynced
+# NTP). step1's sampler uses the guest's `date +%s`; we must match.
+PERF_START_NS="$(incus exec "$FW" -- date +%s%N)"
+log "PERF_START_NS=$PERF_START_NS (guest clock)"
 
 # -- step 5: perf record -----------------------------------------------------
 
 log "spawning perf record on $FW (60 s)"
-# HIGH-3: `-k CLOCK_REALTIME` makes perf emit absolute unix wall-clock
-# timestamps, aligning directly with the `boundaries[]` array (which
-# is derived from `date +%s` in step1-capture.sh).  Without this flag
-# perf defaults to CLOCK_MONOTONIC (boot-relative), which requires a
-# synthetic wall-time anchor; the reducer used to derive that anchor
-# from PERF_START_NS + first-event offset, leaking first-event latency
-# into the block assignment.  CLOCK_REALTIME removes the offsetting.
+# HIGH-3 (Round-2 addendum): `-k CLOCK_REALTIME` was rejected on this
+# kernel's perf with EINVAL ("Failure to open event... error 22").
+# Fallback: use perf's default CLOCK_MONOTONIC and measure the
+# mono→wall offset on the guest just before spawn. The offset is a
+# rigorous one-shot clock conversion (same math NTP uses), NOT
+# inferred from first-event latency. Reducer receives the offset
+# via --mono-wall-offset-ns and applies it: t_wall = t_mono + offset.
+MONO_WALL_OFFSET_NS="$(incus exec "$FW" -- python3 -c \
+	'import time; print(time.time_ns() - time.clock_gettime_ns(time.CLOCK_MONOTONIC))')"
+log "MONO_WALL_OFFSET_NS=$MONO_WALL_OFFSET_NS"
 incus exec "$FW" -- bash -c "
 	set -e
 	rm -f /tmp/sched-switch.perf.data
 	perf record \\
-	    -k CLOCK_REALTIME \\
 	    -e sched:sched_switch \\
 	    -e sched:sched_stat_runtime \\
 	    -e sched:sched_wakeup \\
@@ -309,6 +318,7 @@ python3 "$SCRIPT_DIR/step2-sched-switch-reduce.py" \
 	--step1-samples "$STEP1_OUTDIR/flow_steer_samples.jsonl" \
 	--worker-tids "$WORKER_TIDS" \
 	--perf-start-ns "$PERF_START_NS" \
+	--mono-wall-offset-ns "$MONO_WALL_OFFSET_NS" \
 	> "$STEP2_OUTDIR/off-cpu-hist-by-block.jsonl" || REDUCER_RC=$?
 if [[ "$REDUCER_RC" -eq 5 ]]; then
 	log "reducer reported drift halt (rc=5); classifier will emit SUSPECT"

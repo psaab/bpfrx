@@ -345,6 +345,7 @@ def reduce_events(
     out_stream=None,
     warn_stream=None,
     suspect_reason: str | None = None,
+    mono_wall_offset_ns: int = 0,
 ) -> list[str]:
     """Consume `events` and emit 12 JSONL blocks to `out_stream`.
 
@@ -402,9 +403,16 @@ def reduce_events(
             continue
         prev_perf_ts_ns = ts_ns
 
-        # HIGH-3: perf emits absolute unix wall-clock timestamps under
-        # `-k CLOCK_REALTIME`, so `ts_ns` IS `t_event_wall_ns` directly.
-        t_event_wall_ns = ts_ns
+        # HIGH-3 (Round-2 addendum): `-k CLOCK_REALTIME` was rejected
+        # by the target kernel's perf (EINVAL). Fallback path: perf
+        # emits CLOCK_MONOTONIC timestamps; the capture harness
+        # measures `mono_wall_offset_ns` on the guest (difference
+        # between CLOCK_REALTIME and CLOCK_MONOTONIC at a single
+        # instant) and passes it via --mono-wall-offset-ns. Conversion
+        # is exact: `t_wall = t_mono + offset`. This is NOT inferred
+        # from first-event latency (which was Codex R2 HIGH-3); it's
+        # a one-shot clock measurement (same math NTP uses).
+        t_event_wall_ns = ts_ns + mono_wall_offset_ns
 
         if event == "sched:sched_switch":
             prev_pid = fields.get("prev_pid")
@@ -538,6 +546,18 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         help="wall-clock unix-ns captured right before `perf record` spawn",
     )
+    ap.add_argument(
+        "--mono-wall-offset-ns",
+        type=int,
+        default=0,
+        help=(
+            "HIGH-3 R2 addendum: CLOCK_REALTIME - CLOCK_MONOTONIC at "
+            "capture time (ns). perf emits CLOCK_MONOTONIC on kernels "
+            "that reject `-k CLOCK_REALTIME`; adding this offset to "
+            "each event timestamp converts mono → wall. Default 0 "
+            "preserves CLOCK_REALTIME behavior when available."
+        ),
+    )
     # The following two are retained for backward compat with the plan
     # interface but are currently unused (boundaries come from step1).
     ap.add_argument("--block-size-s", type=float, default=5.0)
@@ -591,6 +611,7 @@ def main(argv: list[str] | None = None) -> int:
         boundaries_ns=boundaries_ns,
         worker_tids=worker_tids,
         perf_start_ns=args.perf_start_ns,
+        mono_wall_offset_ns=args.mono_wall_offset_ns,
         suspect_reason=suspect_reason,
     )
     return EXIT_DRIFT_HALT if drift_halt else 0
