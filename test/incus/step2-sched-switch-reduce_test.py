@@ -340,6 +340,51 @@ class TestReducerNegativeWakeDelta(unittest.TestCase):
     wake-path negative-delta branch is an unreachable defensive guard.
     """
 
+    def test_reducer_equal_ts_wake_delta_zero_accumulates(self):
+        """LOW-7 R3: boundary equal-ts sub-case.
+
+        When a `sched_wakeup` arrives with the EXACT same perf ts as the
+        preceding `sched_switch`, the outer monotonicity guard (strict <)
+        lets both through, and `delta_ns = 0`. The wake-path `delta_ns <
+        0` branch is NOT triggered (0 is not < 0). Expected: the zero
+        duration maps to bucket 0 and accumulates cleanly (no WARN, no
+        skip). This test pins the equal-ts boundary case explicitly.
+        """
+        boundaries = _make_boundaries()
+        step1_start_ns = boundaries[0]
+        tid = 7
+        worker_tids = {tid}
+        t_common = step1_start_ns + 2_000_000_000
+        events = [
+            ("sched:sched_switch", tid, t_common,
+             {"prev_pid": tid, "prev_state": "S"}),
+            ("sched:sched_wakeup", tid, t_common,
+             {"pid": tid}),
+        ]
+        buf = io.StringIO()
+        warn = io.StringIO()
+        warnings = R.reduce_events(
+            events=events,
+            boundaries_ns=boundaries,
+            worker_tids=worker_tids,
+            perf_start_ns=step1_start_ns,
+            out_stream=buf,
+            warn_stream=warn,
+        )
+        # No monotonicity WARN fired (equal ts passes strict < guard).
+        # `reduce_events` returns a list of warning tuples; empty list = no
+        # warnings fired.
+        self.assertEqual(len(warnings), 0, f"unexpected warnings: {warnings}")
+        self.assertNotIn("out-of-order", warn.getvalue())
+        self.assertNotIn("negative delta", warn.getvalue())
+        # Block 0 accumulates a zero-duration event into bucket 0.
+        lines = [json.loads(l) for l in buf.getvalue().strip().split("\n")]
+        self.assertEqual(len(lines), 12)
+        # delta_ns=0 goes to bucket 0 (sub-1µs catch-all); buckets[0] += 0,
+        # so all buckets remain zero. off_cpu_time_3to6 stays zero.
+        self.assertEqual(lines[0]["off_cpu_time_3to6"], 0)
+        self.assertEqual(sum(lines[0]["buckets"]), 0)
+
     def test_reducer_wake_before_switch_triggers_out_of_order(self):
         """Wake arrives with ts earlier than the preceding switch.
 

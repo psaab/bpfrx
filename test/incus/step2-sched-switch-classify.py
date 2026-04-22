@@ -335,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
         "diagnostic": {
             "cell": args.cell,
             "reason": reason,
+            "suspect_reason": suspect_reason,  # LOW-5 R3: moved into diagnostic to keep top-level schema exactly {verdict, rho, pvalue, duty_cycle_pct, warn_blocks}
             "T_D1": T_D1,
             "off_cpu_time_3to6": off_times,
             "voluntary_total_ns": voluntary_total,
@@ -347,8 +348,6 @@ def main(argv: list[str] | None = None) -> int:
             "nominal_window_ns": NOMINAL_WINDOW_NS,
         },
     }
-    if suspect_reason is not None:
-        meta["suspect_reason"] = suspect_reason
     # Sibling meta.json: <report>.md -> <report>.meta.json.
     meta_path = args.out.parent / (args.out.stem + ".meta.json")
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")

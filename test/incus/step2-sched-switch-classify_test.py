@@ -260,9 +260,10 @@ class TestClassifyMetaSchema(unittest.TestCase):
         self.assertEqual(diag["n_blocks"], 12)
         self.assertEqual(len(diag["T_D1"]), 12)
         self.assertEqual(len(diag["off_cpu_time_3to6"]), 12)
-        # `suspect_reason` only present when the reducer flagged drift
-        # halt — this fixture has no drift, so it must be absent.
+        # `suspect_reason` lives under diagnostic (LOW-5 R3 schema), and is
+        # null when the reducer did not flag drift halt.
         self.assertNotIn("suspect_reason", meta)
+        self.assertIsNone(meta["diagnostic"].get("suspect_reason"))
 
 
 class TestClassifyWarnAggregation(unittest.TestCase):
@@ -330,7 +331,8 @@ class TestClassifySuspectFromReducer(unittest.TestCase):
         rc, meta = _run_classifier(hist, off)
         self.assertEqual(rc, 0)
         self.assertEqual(meta["verdict"], "SUSPECT")
-        self.assertEqual(meta.get("suspect_reason"), "drift_ge_5s")
+        self.assertNotIn("suspect_reason", meta)  # LOW-5 R3: moved under diagnostic
+        self.assertEqual(meta["diagnostic"]["suspect_reason"], "drift_ge_5s")
 
     def test_verdict_SUSPECT_from_drift_halt_marker(self):
         """Optional `--drift-halt-marker` path: operator can force
@@ -368,7 +370,8 @@ class TestClassifySuspectFromReducer(unittest.TestCase):
             o_path.unlink()
         self.assertEqual(rc, 0)
         self.assertEqual(meta["verdict"], "SUSPECT")
-        self.assertEqual(meta.get("suspect_reason"), "drift_ge_5s")
+        self.assertNotIn("suspect_reason", meta)  # LOW-5 R3: moved under diagnostic
+        self.assertEqual(meta["diagnostic"]["suspect_reason"], "drift_ge_5s")
 
 
 if __name__ == "__main__":
