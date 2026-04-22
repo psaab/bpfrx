@@ -1761,6 +1761,24 @@ fn cos_runtime_config_changed(current: &ForwardingState, next: &ForwardingState)
 fn reset_binding_cos_runtime(binding: &mut BindingWorker) {
     release_all_cos_root_leases(binding);
     release_all_cos_queue_leases(binding);
+    // #829 R1 code-review HIGH-1: mark this binding's frontier slots
+    // idle on every registered shared_exact queue BEFORE we drop
+    // the runtime. Without this, the slot's AtomicU64 retains its
+    // last-written frontier value forever, stale-pinning
+    // `current_min_frontier` on every subsequent gate decision.
+    for (egress_ifindex, root) in binding.cos_interfaces.iter() {
+        let iface_fast = match binding.cos_fast_interfaces.get(egress_ifindex) {
+            Some(f) => f,
+            None => continue,
+        };
+        for (queue, queue_fast) in root.queues.iter().zip(iface_fast.queue_fast_path.iter()) {
+            if let Some(slot) = queue.frontier_slot {
+                if let Some(lease) = queue_fast.shared_queue_lease.as_ref() {
+                    lease.mark_binding_idle(slot);
+                }
+            }
+        }
+    }
     let mut dropped_local = 0u64;
     let mut dropped_prepared = Vec::new();
     for root in binding.cos_interfaces.values_mut() {
@@ -1784,6 +1802,10 @@ fn reset_binding_cos_runtime(binding: &mut BindingWorker) {
             queue.runnable = false;
             queue.parked = false;
             queue.next_wakeup_tick = 0;
+            // #829: also clear frontier_slot in case the runtime
+            // is re-used in a later reload (defensive; the new
+            // runtime build will re-assign a fresh slot).
+            queue.frontier_slot = None;
         }
         root.nonempty_queues = 0;
         root.runnable_queues = 0;
@@ -2366,6 +2388,7 @@ mod tests {
                     items: VecDeque::from([CoSPendingTxItem::Local(test_tx_request(80))]),
                     local_item_count: 1,
                     drop_counters,
+                    frontier_slot: None,
                     owner_profile: CoSQueueOwnerProfile::new(),
                 }],
                 queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
@@ -2388,6 +2411,7 @@ mod tests {
             root_token_starvation_parks: 5,
             queue_token_starvation_parks: 7,
             tx_ring_full_submit_stalls: 11,
+            cross_binding_lag_parks: 31,
         };
         let counters_b = CoSQueueDropCounters {
             admission_flow_share_drops: 13,
@@ -2396,6 +2420,7 @@ mod tests {
             root_token_starvation_parks: 19,
             queue_token_starvation_parks: 23,
             tx_ring_full_submit_stalls: 29,
+            cross_binding_lag_parks: 43,
         };
 
         let mut first = FastMap::default();
@@ -2506,6 +2531,7 @@ mod tests {
                 items: VecDeque::new(),
                 local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
+                frontier_slot: None,
                 owner_profile: CoSQueueOwnerProfile::new(),
             }],
             queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
@@ -2712,6 +2738,7 @@ mod tests {
                     items: VecDeque::new(),
                     local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
+                frontier_slot: None,
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 CoSQueueRuntime {
@@ -2746,6 +2773,7 @@ mod tests {
                     items: VecDeque::new(),
                     local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
+                frontier_slot: None,
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 CoSQueueRuntime {
@@ -2780,6 +2808,7 @@ mod tests {
                     items: VecDeque::new(),
                     local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
+                frontier_slot: None,
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
             ],
@@ -2939,6 +2968,7 @@ mod tests {
                     items: VecDeque::new(),
                     local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
+                frontier_slot: None,
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 CoSQueueRuntime {
@@ -2973,6 +3003,7 @@ mod tests {
                     items: VecDeque::new(),
                     local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
+                frontier_slot: None,
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
             ],
@@ -3097,6 +3128,7 @@ mod tests {
                 items: VecDeque::new(),
                 local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
+                frontier_slot: None,
                 owner_profile: CoSQueueOwnerProfile::new(),
             }],
             queue_indices_by_priority: std::array::from_fn(|_| Vec::new()),
@@ -3266,6 +3298,7 @@ mod tests {
                     items: VecDeque::new(),
                     local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
+                frontier_slot: None,
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
                 CoSQueueRuntime {
@@ -3300,6 +3333,7 @@ mod tests {
                     items: VecDeque::new(),
                     local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
+                frontier_slot: None,
                     owner_profile: CoSQueueOwnerProfile::new(),
                 },
             ],

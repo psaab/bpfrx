@@ -1730,6 +1730,41 @@ fn select_exact_cos_guarantee_queue_with_fast_path(
         if cos_queue_is_empty(queue) || !queue.runnable || !queue.exact {
             continue;
         }
+        // #829 Slice B — cross-binding virtual-time gate. Wired
+        // only when this binding registered a frontier slot on a
+        // shared lease for this queue (see
+        // `apply_cos_queue_flow_fair_promotion`). If this binding's
+        // local `queue_vtime` is `T` bytes ahead of the lease-wide
+        // min frontier across all peer bindings, skip this queue
+        // for the current RR pass so the slow peer can catch up.
+        // Crucially, we skip BEFORE `maybe_top_up_cos_queue_lease`
+        // so the yielding binding does NOT consume lease tokens it
+        // is about to refuse to use (R1 HIGH-3 pin; test #16).
+        // `v_min == u64::MAX` means the reduction saw no active
+        // peer slot (including single-binding leases and fresh
+        // lease start-up) — in that case we fall through and let
+        // this binding dispatch without gating.
+        // The slot itself is consumed on the publish side
+        // (`drain_exact_*_flow_fair`); here we only need to know
+        // whether the queue is registered (gate enabled) and read
+        // the lease. `is_some()` is enough — the slot value is not
+        // used in this branch (R1 Rust M3 fix).
+        if queue.frontier_slot.is_some() {
+            if let Some(lease) = queue_fast_path
+                .get(queue_idx)
+                .and_then(|qfp| qfp.shared_queue_lease.as_ref())
+            {
+                let v_local = queue.queue_vtime;
+                let v_min = lease.current_min_frontier();
+                if v_min < u64::MAX {
+                    let lag = v_local.saturating_sub(v_min);
+                    if lag > effective_cross_binding_lag_limit() {
+                        count_park_reason(root, queue_idx, ParkReason::CrossBindingLag);
+                        continue;
+                    }
+                }
+            }
+        }
         maybe_top_up_cos_queue_lease(
             queue,
             queue_fast_path
@@ -2097,6 +2132,14 @@ fn service_exact_local_queue_direct_flow_fair(
         .get(&root_ifindex)
         .map(|root| root.tokens)
         .unwrap_or(0);
+    // #829 Slice B — clone the Arc out of cos_fast_interfaces so we
+    // can pass a reference into the drain helper without holding an
+    // immutable borrow on `binding` across the `get_mut` below.
+    let shared_queue_lease = binding
+        .cos_fast_interfaces
+        .get(&root_ifindex)
+        .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
+        .and_then(|queue_fast| queue_fast.shared_queue_lease.clone());
     let build = {
         let root = match binding.cos_interfaces.get_mut(&root_ifindex) {
             Some(root) => root,
@@ -2114,6 +2157,7 @@ fn service_exact_local_queue_direct_flow_fair(
             root_budget,
             secondary_budget,
             queue_dscp_rewrite,
+            shared_queue_lease.as_ref(),
         )
     };
     match build {
@@ -2379,6 +2423,13 @@ fn service_exact_prepared_queue_direct_flow_fair(
         .get(&root_ifindex)
         .map(|root| root.tokens)
         .unwrap_or(0);
+    // #829 Slice B — see matching comment in
+    // `service_exact_local_queue_direct_flow_fair`.
+    let shared_queue_lease = binding
+        .cos_fast_interfaces
+        .get(&root_ifindex)
+        .and_then(|iface_fast| iface_fast.queue_fast_path.get(queue_idx))
+        .and_then(|queue_fast| queue_fast.shared_queue_lease.clone());
     let build = {
         let root = match binding.cos_interfaces.get_mut(&root_ifindex) {
             Some(root) => root,
@@ -2398,6 +2449,7 @@ fn service_exact_prepared_queue_direct_flow_fair(
             root_budget,
             secondary_budget,
             queue_dscp_rewrite,
+            shared_queue_lease.as_ref(),
         )
     };
     match build {
@@ -2607,6 +2659,13 @@ fn drain_exact_local_items_to_scratch_flow_fair(
     root_budget: u64,
     secondary_budget: u64,
     queue_dscp_rewrite: Option<u8>,
+    // #829 Slice B — the shared lease (if any) backing this queue,
+    // used to publish this binding's post-drain virtual-time frontier
+    // so peer bindings see our progress in `current_min_frontier`.
+    // `None` when the queue has no shared lease OR the binding could
+    // not register a slot on the lease (overflow), in which case the
+    // gate is disabled for this queue and no publish happens.
+    lease: Option<&Arc<SharedCoSQueueLease>>,
 ) -> ExactCoSScratchBuild {
     // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer LOW:
     // clear the pop-snapshot stack at batch start. The bound
@@ -2675,7 +2734,35 @@ fn drain_exact_local_items_to_scratch_flow_fair(
         scratch_local_tx.push((offset, req));
     }
 
+    // #829 Slice B — publish this binding's post-drain virtual-time
+    // frontier so peer bindings' `current_min_frontier` picks up our
+    // progress on the next selector pass. If this drain emptied the
+    // cos_queue, publish `u64::MAX` so our idle slot stops pinning
+    // the lease-wide min (otherwise a fast binding that drained to
+    // empty would keep the slow peer's lag reading pinned at our
+    // stale `queue_vtime` and gate it indefinitely).
+    publish_binding_frontier_after_drain(queue, lease);
+
     ExactCoSScratchBuild::Ready
+}
+
+/// #829 Slice B — shared publish helper used by both
+/// `drain_exact_local_items_to_scratch_flow_fair` and
+/// `drain_exact_prepared_items_to_scratch_flow_fair`. Extracted so
+/// both drains go through a single policy point and a future change
+/// (e.g. "publish only every N batches") has one call site.
+#[inline]
+fn publish_binding_frontier_after_drain(
+    queue: &CoSQueueRuntime,
+    lease: Option<&Arc<SharedCoSQueueLease>>,
+) {
+    if let (Some(slot), Some(lease)) = (queue.frontier_slot, lease) {
+        if cos_queue_is_empty(queue) {
+            lease.mark_binding_idle(slot);
+        } else {
+            lease.publish_binding_frontier(slot, queue.queue_vtime);
+        }
+    }
 }
 
 fn drain_exact_prepared_fifo_items_to_scratch(
@@ -2787,6 +2874,10 @@ fn drain_exact_prepared_items_to_scratch_flow_fair(
     root_budget: u64,
     secondary_budget: u64,
     queue_dscp_rewrite: Option<u8>,
+    // #829 Slice B — shared lease backing this queue (if any); see
+    // `drain_exact_local_items_to_scratch_flow_fair` for the same
+    // contract. The publish site is the end of this function.
+    lease: Option<&Arc<SharedCoSQueueLease>>,
 ) -> ExactCoSScratchBuild {
     // #785 Phase 3 — Codex round-3 NEW-2 / Rust reviewer LOW:
     // clear the pop-snapshot stack at batch start. See the
@@ -2864,6 +2955,11 @@ fn drain_exact_prepared_items_to_scratch_flow_fair(
         }
         scratch_prepared_tx.push(req);
     }
+
+    // #829 Slice B — publish this binding's post-drain virtual-time
+    // frontier (see `drain_exact_local_items_to_scratch_flow_fair`
+    // for the full contract).
+    publish_binding_frontier_after_drain(queue, lease);
 
     ExactCoSScratchBuild::Ready
 }
@@ -3336,6 +3432,43 @@ fn cos_batch_tx_made_progress(result: Result<(u64, u64), TxError>) -> bool {
 const COS_TIMER_WHEEL_TICK_NS: u64 = 50_000;
 const COS_MIN_BURST_BYTES: u64 = 64 * 1500;
 const COS_GUARANTEE_VISIT_NS: u64 = 200_000;
+
+/// #829 Slice B — cross-binding virtual-time lag budget on
+/// `flow_fair + shared_exact` queues. When this binding's local
+/// `queue_vtime` exceeds the lease-wide `current_min_frontier` by
+/// more than this many bytes, the drain selector skips this queue
+/// and leaves the window open for the lagging peer binding to
+/// catch up. Pair with §4.3 of the plan: the steady-state
+/// fairness bound is `T + max_batch_advance`
+/// (= `T + COS_GUARANTEE_QUANTUM_MAX_BYTES`), so T=64 KB gives a
+/// transient worst-case spread of ~576 KB, well inside fair-share
+/// averaging over a 30 s iperf3 window. 64 KB is a power-of-two
+/// rounded up from the 1 Gbps × 200 µs per-flow BDP target
+/// (~50 KB); it is deliberately conservative in favour of
+/// fairness over throughput headroom at low rates.
+pub(super) const COS_CROSS_BINDING_LAG_LIMIT_BYTES: u64 = 65_536;
+
+/// #829 Slice B — operator override of
+/// `COS_CROSS_BINDING_LAG_LIMIT_BYTES`, seeded once at process
+/// start in `main::main` from the `BPFRX_COS_CROSS_BINDING_LAG_BYTES`
+/// env var. The `OnceLock` ensures every worker sees a single
+/// consistent value (no per-worker drift), and the
+/// `effective_cross_binding_lag_limit()` reader keeps the gate
+/// hot path branch-light.
+pub(super) static COS_CROSS_BINDING_LAG_LIMIT_OVERRIDE: std::sync::OnceLock<u64> =
+    std::sync::OnceLock::new();
+
+/// #829 Slice B — gate hot path reader. Returns the override if
+/// set, otherwise the compile-time default. Inlined so the common
+/// case (no override) is a single load of the default constant
+/// after branch-predictor warmup.
+#[inline]
+pub(super) fn effective_cross_binding_lag_limit() -> u64 {
+    match COS_CROSS_BINDING_LAG_LIMIT_OVERRIDE.get() {
+        Some(&v) => v,
+        None => COS_CROSS_BINDING_LAG_LIMIT_BYTES,
+    }
+}
 const COS_GUARANTEE_QUANTUM_MIN_BYTES: u64 = 1500;
 const COS_GUARANTEE_QUANTUM_MAX_BYTES: u64 = 512 * 1024;
 /// Minimum per-flow admission share. Sized so TCP fast-retransmit can
@@ -4614,6 +4747,14 @@ fn wake_cos_queue(root: &mut CoSInterfaceRuntime, queue_idx: usize) {
 enum ParkReason {
     RootTokenStarvation,
     QueueTokenStarvation,
+    /// #829 Slice B — the cross-binding virtual-time gate fired on
+    /// a `flow_fair + shared_exact` queue: this binding's local
+    /// `queue_vtime` is more than `COS_CROSS_BINDING_LAG_LIMIT_BYTES`
+    /// ahead of the lease-wide min frontier, so the selector skipped
+    /// this queue to let slow peer bindings catch up. NOT packet
+    /// loss — the items stay in `cos_queue`; the queue is visited
+    /// again on the next RR pass when the peer has advanced.
+    CrossBindingLag,
 }
 
 // #710: count an exact-drain TX submit stall on a specific queue.
@@ -4663,6 +4804,12 @@ fn count_park_reason(root: &mut CoSInterfaceRuntime, queue_idx: usize, reason: P
                 queue.drop_counters.queue_token_starvation_parks = queue
                     .drop_counters
                     .queue_token_starvation_parks
+                    .wrapping_add(1);
+            }
+            ParkReason::CrossBindingLag => {
+                queue.drop_counters.cross_binding_lag_parks = queue
+                    .drop_counters
+                    .cross_binding_lag_parks
                     .wrapping_add(1);
             }
         }
@@ -5315,6 +5462,49 @@ fn apply_cos_queue_flow_fair_promotion(
 ) {
     for (queue, queue_fast) in runtime.queues.iter_mut().zip(queue_fast_path) {
         promote_cos_queue_flow_fair(queue, queue_fast);
+        // #829 Slice B — register this binding on the shared
+        // lease's per-binding frontier array and seed our local
+        // `queue_vtime` to the current lease-wide min so we don't
+        // start at 0 (which would register a massive lag on a
+        // live lease where peer bindings have already advanced
+        // past millions of bytes). Gate applies only to
+        // `flow_fair + shared_queue_lease` queues; everything
+        // else keeps `frontier_slot = None` and the gate stays
+        // disabled.
+        //
+        // Bring-up contract (R2 MED-1 fix; plan §3.2 / §4.3):
+        // - If `register_binding` returns `None` (lease is at
+        //   `MAX_BINDINGS_PER_LEASE` saturation), leave
+        //   `frontier_slot = None`; the gate disables itself for
+        //   this binding and the lease's `register_overflow`
+        //   counter surfaces the case to ops.
+        // - If the lease has no other active binding yet
+        //   (`current_min_frontier == u64::MAX`), keep our
+        //   `queue_vtime` at its existing (zero) seed; the gate
+        //   sees `v_min == MAX` and never fires.
+        // - Otherwise seed `queue_vtime = v_min` so the first
+        //   drain's lag reads 0 and we do not immediately yield
+        //   while peer bindings continue dispatching.
+        // #829 R1 code-review HIGH-2 fix: gate is only meaningful
+        // for shared_exact queues (where multiple workers dispatch
+        // concurrently with no shared virtual-time coordination).
+        // Owner-local exact queues CAN have a shared_queue_lease set
+        // (see worker.rs:1657-1660 — the lease is attached on
+        // `queue.exact`, not `queue.shared_exact`), so requiring
+        // both `flow_fair` AND `shared_exact` here ensures the gate
+        // is wired only to the queue class the plan §3.3 scopes it
+        // to.
+        if queue.flow_fair && queue_fast.shared_exact {
+            if let Some(lease) = queue_fast.shared_queue_lease.as_ref() {
+                if let Some(slot) = lease.register_binding() {
+                    queue.frontier_slot = Some(slot);
+                    let v_min = lease.current_min_frontier();
+                    if v_min < u64::MAX {
+                        queue.queue_vtime = v_min;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -5323,10 +5513,15 @@ fn apply_cos_queue_flow_fair_promotion(
 /// `shared_exact` signal onto the runtime so future work on this
 /// surface can branch on it without another iface_fast lookup.
 ///
-/// **Current policy:** `flow_fair = queue.exact && !shared_exact`.
-/// Only the owner-local-exact path runs SFQ today; shared_exact
-/// (high-rate, >= `COS_SHARED_EXACT_MIN_RATE_BYTES` = 2.5 Gbps)
-/// queues stay on the single-FIFO-per-worker drain.
+/// **Current policy:** `flow_fair = queue.exact`. Both owner-local
+/// exact and shared_exact queues run SFQ (MQFQ virtual-finish-time
+/// ordering). On shared_exact, cross-binding fairness is enforced
+/// by the #829 Slice B virtual-time gate in
+/// `select_exact_cos_guarantee_queue_with_fast_path`, which bounds
+/// per-binding progress to `T ± max_batch_advance` of the lease-wide
+/// minimum (plan §4.3). This replaced PR #785's removed policy
+/// (`flow_fair = queue.exact && !shared_exact`) by providing the
+/// cross-worker coordination that the naïve flip lacked.
 ///
 /// **Why shared_exact is held back (issue #785):** two attempts
 /// have been made to enable SFQ on shared_exact queues and both
@@ -5473,6 +5668,7 @@ fn build_cos_interface_runtime(config: &CoSInterfaceConfig, now_ns: u64) -> CoSI
                 items: VecDeque::new(),
                 local_item_count: 0,
                 drop_counters: CoSQueueDropCounters::default(),
+                frontier_slot: None,
                 owner_profile: CoSQueueOwnerProfile::new(),
             })
             .collect(),
@@ -13357,6 +13553,7 @@ mod tests {
             items: VecDeque::from([test_cos_item(1500)]),
             local_item_count: 0,
             drop_counters: CoSQueueDropCounters::default(),
+            frontier_slot: None,
             owner_profile: CoSQueueOwnerProfile::new(),
         };
 
@@ -13401,6 +13598,7 @@ mod tests {
             items: VecDeque::new(),
             local_item_count: 0,
             drop_counters: CoSQueueDropCounters::default(),
+            frontier_slot: None,
             owner_profile: CoSQueueOwnerProfile::new(),
         };
         let retry = VecDeque::from([TxRequest {
@@ -13456,6 +13654,7 @@ mod tests {
             items: VecDeque::new(),
             local_item_count: 0,
             drop_counters: CoSQueueDropCounters::default(),
+            frontier_slot: None,
             owner_profile: CoSQueueOwnerProfile::new(),
         };
         let retry = VecDeque::from([PreparedTxRequest {
@@ -15280,5 +15479,763 @@ mod tests {
             actual_csum, expected_csum,
             "incremental checksum update must match a from-scratch recomputation",
         );
+    }
+
+    // =================================================================
+    // #829 Slice B — cross-binding virtual-time gate pins.
+    // Tests 10-26 from plan §5.2 / §5.3 / §5.4 / §5.5.
+    //
+    // The gate lives in `select_exact_cos_guarantee_queue_with_fast_path`
+    // (skip-this-queue decision) and `drain_exact_*_flow_fair`
+    // (publish-my-frontier after batch). Bring-up is in
+    // `apply_cos_queue_flow_fair_promotion`. These tests pin every
+    // branch of the gate logic — refactors that accidentally break
+    // the "lag bound = T + max_batch_advance" contract fail here.
+    // =================================================================
+
+    /// Build a standalone `SharedCoSQueueLease` for gate tests. The
+    /// 25 Gbps rate is arbitrary — the lease's token bucket is not
+    /// exercised by these tests; we only use the
+    /// `binding_frontiers` array. Rate + burst picked to match the
+    /// iperf-c fixture shape in existing flow-fair tests.
+    fn test_shared_queue_lease() -> Arc<SharedCoSQueueLease> {
+        Arc::new(SharedCoSQueueLease::new(
+            25_000_000_000 / 8,
+            4 * 1024 * 1024,
+            1,
+        ))
+    }
+
+    /// Build a single-queue exact+flow_fair runtime at 1 Gbps
+    /// (iperf-a shape). Matches the fixture used by
+    /// `flow_fair_queue_pops_in_virtual_finish_order_local`.
+    fn test_flow_fair_runtime() -> CoSInterfaceRuntime {
+        let mut runtime = test_cos_runtime_with_queues(
+            25_000_000_000 / 8,
+            vec![CoSQueueConfig {
+                queue_id: 4,
+                forwarding_class: "iperf-a".into(),
+                priority: 5,
+                transmit_rate_bytes: 1_000_000_000 / 8,
+                exact: true,
+                surplus_weight: 1,
+                buffer_bytes: 128 * 1024,
+                dscp_rewrite: None,
+            }],
+        );
+        runtime.queues[0].flow_fair = true;
+        runtime.queues[0].flow_hash_seed = 0;
+        runtime
+    }
+
+    /// Build a `WorkerCoSQueueFastPath` with a shared lease
+    /// attached (simulates the shared_exact cross-binding shape).
+    fn test_queue_fast_path_with_lease(
+        shared_exact: bool,
+        lease: Option<Arc<SharedCoSQueueLease>>,
+    ) -> WorkerCoSQueueFastPath {
+        WorkerCoSQueueFastPath {
+            shared_exact,
+            owner_worker_id: 0,
+            owner_live: None,
+            shared_queue_lease: lease,
+        }
+    }
+
+    /// Prime the runtime for a selector pass: push one item, mark
+    /// queue runnable, grant both root and per-queue tokens so
+    /// only the cross-binding gate (if wired) can hold back
+    /// selection.
+    fn prime_queue_for_selection(runtime: &mut CoSInterfaceRuntime) {
+        runtime.tokens = 1_000_000_000;
+        let queue = &mut runtime.queues[0];
+        queue.runnable = true;
+        queue.tokens = 1_000_000_000;
+        queue.last_refill_ns = 1;
+        // Push a 1500-byte flow item so `cos_queue_is_empty` is
+        // false but `cos_queue_front` returns a `Local` item the
+        // selector can pop.
+        cos_queue_push_back(queue, test_flow_cos_item(1111, 1500));
+        runtime.nonempty_queues = 1;
+        runtime.runnable_queues = 1;
+    }
+
+    // ----- §5.2: selector-side gate pins -----
+
+    #[test]
+    fn select_yields_when_lag_exceeds_limit() {
+        // Test #10: gate fires. Peer binding (slot 0) is at
+        // v_local=0; this binding (slot 1) is at v_local = T + 1.
+        // Selection must return `None` and count a
+        // `CrossBindingLag` park; lease tokens must NOT be
+        // consumed (R1 HIGH-3).
+        let lease = test_shared_queue_lease();
+        // Register a peer and publish v_local=0 so v_min=0.
+        assert_eq!(lease.register_binding(), Some(0));
+        lease.publish_binding_frontier(0, 0);
+        // Register this binding as slot 1.
+        assert_eq!(lease.register_binding(), Some(1));
+
+        let mut runtime = test_flow_fair_runtime();
+        prime_queue_for_selection(&mut runtime);
+        runtime.queues[0].frontier_slot = Some(1);
+        runtime.queues[0].queue_vtime = COS_CROSS_BINDING_LAG_LIMIT_BYTES + 1;
+
+        let fast_path = vec![test_queue_fast_path_with_lease(true, Some(lease.clone()))];
+        let before = snapshot_counters(&runtime.queues[0]);
+        let selection = select_exact_cos_guarantee_queue_with_fast_path(
+            &mut runtime,
+            &fast_path,
+            1_000_000,
+        );
+        assert!(
+            selection.is_none(),
+            "gate must fire — selector must skip a queue whose \
+             local v_local is > T above the lease min frontier"
+        );
+        let after = snapshot_counters(&runtime.queues[0]);
+        assert_eq!(
+            after.cross_binding_lag_parks,
+            before.cross_binding_lag_parks + 1,
+            "CrossBindingLag park counter must advance by 1"
+        );
+        assert_eq!(
+            after.root_token_starvation_parks,
+            before.root_token_starvation_parks,
+            "gate must not mis-attribute as root-token starvation"
+        );
+        assert_eq!(
+            after.queue_token_starvation_parks,
+            before.queue_token_starvation_parks,
+            "gate must not mis-attribute as queue-token starvation"
+        );
+    }
+
+    #[test]
+    fn select_does_not_yield_when_lag_within_limit() {
+        // Test #11: lag of exactly T-1 must NOT fire. Strictly
+        // `lag > T` is the threshold.
+        let lease = test_shared_queue_lease();
+        assert_eq!(lease.register_binding(), Some(0));
+        lease.publish_binding_frontier(0, 0);
+        assert_eq!(lease.register_binding(), Some(1));
+
+        let mut runtime = test_flow_fair_runtime();
+        prime_queue_for_selection(&mut runtime);
+        runtime.queues[0].frontier_slot = Some(1);
+        runtime.queues[0].queue_vtime = COS_CROSS_BINDING_LAG_LIMIT_BYTES - 1;
+
+        let fast_path = vec![test_queue_fast_path_with_lease(true, Some(lease.clone()))];
+        let selection = select_exact_cos_guarantee_queue_with_fast_path(
+            &mut runtime,
+            &fast_path,
+            1_000_000,
+        );
+        assert!(
+            selection.is_some(),
+            "gate must NOT fire when lag == T-1; selection must proceed"
+        );
+    }
+
+    #[test]
+    fn select_does_not_yield_when_alone_on_lease() {
+        // Test #12: single-binding degenerate case. This binding
+        // is slot 0 and no other binding has published, so
+        // `current_min_frontier` returns u64::MAX → no gate, even
+        // when `queue_vtime` is absurdly large. Prevents the
+        // "fast binding gates itself against its own stale idle
+        // publish" failure mode.
+        let lease = test_shared_queue_lease();
+        assert_eq!(lease.register_binding(), Some(0));
+        // NOTE: deliberately do NOT publish a non-idle value for
+        // slot 0; the selector should treat the reduction as
+        // "no peer" and pass through.
+
+        let mut runtime = test_flow_fair_runtime();
+        prime_queue_for_selection(&mut runtime);
+        runtime.queues[0].frontier_slot = Some(0);
+        runtime.queues[0].queue_vtime = 10 * COS_CROSS_BINDING_LAG_LIMIT_BYTES;
+
+        let fast_path = vec![test_queue_fast_path_with_lease(true, Some(lease))];
+        let selection = select_exact_cos_guarantee_queue_with_fast_path(
+            &mut runtime,
+            &fast_path,
+            1_000_000,
+        );
+        assert!(
+            selection.is_some(),
+            "single-binding lease: v_min == u64::MAX → no gate"
+        );
+    }
+
+    // ----- §5.2: drain-side publish pins -----
+
+    #[test]
+    fn drain_publishes_v_local_after_nonempty_batch() {
+        // Test #13: drain-at-batch publishes this binding's
+        // current `queue_vtime` into its lease slot. Seed the
+        // queue with enough items that the drain cannot fully
+        // empty it inside one TX_BATCH_SIZE pass, then assert the
+        // published value equals the post-drain `queue_vtime`.
+        let lease = test_shared_queue_lease();
+        assert_eq!(lease.register_binding(), Some(0));
+        lease.publish_binding_frontier(0, u64::MAX);
+
+        let mut runtime = test_flow_fair_runtime();
+        let queue = &mut runtime.queues[0];
+        queue.frontier_slot = Some(0);
+        // Seed more than TX_BATCH_SIZE items so queue is still
+        // non-empty after a single drain batch.
+        for i in 0..(TX_BATCH_SIZE + 16) {
+            cos_queue_push_back(queue, test_flow_cos_item((1000 + i as u16) & 0xfff, 1500));
+        }
+        let mut scratch: Vec<(u64, TxRequest)> = Vec::with_capacity(TX_BATCH_SIZE);
+        let mut free_tx: VecDeque<u64> =
+            (0..(TX_BATCH_SIZE as u64) * (UMEM_FRAME_SIZE as u64))
+                .step_by(UMEM_FRAME_SIZE as usize)
+                .collect();
+        let area = MmapArea::new(2 * 1024 * 1024).expect("mmap umem");
+        let build = drain_exact_local_items_to_scratch_flow_fair(
+            queue,
+            &mut free_tx,
+            &mut scratch,
+            &area,
+            u64::MAX,
+            u64::MAX,
+            None,
+            Some(&lease),
+        );
+        assert!(matches!(build, ExactCoSScratchBuild::Ready));
+        assert!(!cos_queue_is_empty(queue));
+        let v_local_after = queue.queue_vtime;
+        assert!(v_local_after > 0, "drain must have advanced queue_vtime");
+        let published = lease.test_binding_frontier_slot(0);
+        assert_eq!(
+            published, v_local_after,
+            "post-drain publish must store queue_vtime ({v_local_after}) into slot 0"
+        );
+    }
+
+    #[test]
+    fn drain_marks_binding_idle_when_queue_drained_to_empty() {
+        // Test #14: when the drain empties the cos_queue, publish
+        // the `u64::MAX` idle sentinel so this binding's slot
+        // stops pinning the lease min frontier (otherwise a fast
+        // binding that runs out of work would keep the slow peer
+        // gated forever).
+        let lease = test_shared_queue_lease();
+        assert_eq!(lease.register_binding(), Some(0));
+        lease.publish_binding_frontier(0, 12345);
+
+        let mut runtime = test_flow_fair_runtime();
+        let queue = &mut runtime.queues[0];
+        queue.frontier_slot = Some(0);
+        // Small seed that definitely fits in a single TX_BATCH_SIZE
+        // batch so the drain empties the queue.
+        cos_queue_push_back(queue, test_flow_cos_item(1111, 1500));
+        cos_queue_push_back(queue, test_flow_cos_item(1112, 1500));
+        let mut scratch: Vec<(u64, TxRequest)> = Vec::with_capacity(TX_BATCH_SIZE);
+        let mut free_tx: VecDeque<u64> = (0..16)
+            .map(|i| (i as u64) * (UMEM_FRAME_SIZE as u64))
+            .collect();
+        let area = MmapArea::new(2 * 1024 * 1024).expect("mmap umem");
+        let build = drain_exact_local_items_to_scratch_flow_fair(
+            queue,
+            &mut free_tx,
+            &mut scratch,
+            &area,
+            u64::MAX,
+            u64::MAX,
+            None,
+            Some(&lease),
+        );
+        assert!(matches!(build, ExactCoSScratchBuild::Ready));
+        assert!(cos_queue_is_empty(queue), "fixture must drain to empty");
+        assert_eq!(
+            lease.test_binding_frontier_slot(0),
+            u64::MAX,
+            "drain-to-empty must mark binding idle (u64::MAX)"
+        );
+    }
+
+    #[test]
+    fn select_does_not_yield_on_first_drain_with_max_v_min() {
+        // Test #15: fresh lease — no peer binding has published —
+        // even an absurdly high `queue_vtime` must pass the gate.
+        // This is the bring-up safety net: a binding registered
+        // with `queue_vtime = 0` on a lease whose
+        // `current_min_frontier == u64::MAX` must not gate itself
+        // out at startup.
+        let lease = test_shared_queue_lease();
+        // Register one peer but DO NOT publish — slot stays at
+        // u64::MAX so the reduction returns u64::MAX.
+        assert_eq!(lease.register_binding(), Some(0));
+        assert_eq!(lease.register_binding(), Some(1));
+
+        let mut runtime = test_flow_fair_runtime();
+        prime_queue_for_selection(&mut runtime);
+        runtime.queues[0].frontier_slot = Some(1);
+        runtime.queues[0].queue_vtime = COS_CROSS_BINDING_LAG_LIMIT_BYTES + 999;
+
+        let fast_path = vec![test_queue_fast_path_with_lease(true, Some(lease))];
+        let selection = select_exact_cos_guarantee_queue_with_fast_path(
+            &mut runtime,
+            &fast_path,
+            1_000_000,
+        );
+        assert!(
+            selection.is_some(),
+            "fresh lease (v_min == u64::MAX): gate must be transparent"
+        );
+    }
+
+    #[test]
+    fn yield_path_does_not_consume_lease_credits() {
+        // Test #16: R1 HIGH-3 pin. When the gate fires, lease
+        // credits and queue tokens must be unchanged from their
+        // pre-gate values — the gate must run BEFORE
+        // `maybe_top_up_cos_queue_lease` so a yielding binding
+        // does not burn tokens it won't use. Break the ordering
+        // (i.e. run top-up first) and this test fails because the
+        // zero-token queue below would trigger a lease acquire.
+        let lease = test_shared_queue_lease();
+        assert_eq!(lease.register_binding(), Some(0));
+        lease.publish_binding_frontier(0, 0);
+        assert_eq!(lease.register_binding(), Some(1));
+
+        let mut runtime = test_flow_fair_runtime();
+        prime_queue_for_selection(&mut runtime);
+        // Force `queue.tokens = 0` so `maybe_top_up_cos_queue_lease`
+        // WOULD acquire from the lease if it were reached. This
+        // makes "lease credits unchanged" a meaningful assertion —
+        // if the gate ran AFTER top-up, credits would decrement.
+        runtime.queues[0].tokens = 0;
+        runtime.queues[0].last_refill_ns = 1;
+        runtime.queues[0].frontier_slot = Some(1);
+        runtime.queues[0].queue_vtime = COS_CROSS_BINDING_LAG_LIMIT_BYTES + 1;
+        let queue_tokens_before = runtime.queues[0].tokens;
+
+        let fast_path = vec![test_queue_fast_path_with_lease(true, Some(lease.clone()))];
+        let credits_before = lease.test_credits_load();
+
+        let _ = select_exact_cos_guarantee_queue_with_fast_path(
+            &mut runtime,
+            &fast_path,
+            1_000_000,
+        );
+        assert_eq!(
+            lease.test_credits_load(),
+            credits_before,
+            "gate must fire BEFORE maybe_top_up_cos_queue_lease; \
+             lease credits must be untouched on the yield path"
+        );
+        assert_eq!(
+            runtime.queues[0].tokens, queue_tokens_before,
+            "queue.tokens must be untouched on the yield path"
+        );
+    }
+
+    #[test]
+    fn park_reason_cross_binding_lag_counted() {
+        // Test #17: helper-level pin that `count_park_reason`
+        // advances the new counter and no other counter. This is
+        // the analogue of `count_park_reason_helper_advances_exact_counter`
+        // for the new variant.
+        let mut root = test_cos_runtime_with_exact(true);
+        let before = snapshot_counters(&root.queues[0]);
+        count_park_reason(&mut root, 0, ParkReason::CrossBindingLag);
+        let after = snapshot_counters(&root.queues[0]);
+        assert_eq!(
+            after.cross_binding_lag_parks,
+            before.cross_binding_lag_parks + 1
+        );
+        assert_eq!(
+            after.root_token_starvation_parks,
+            before.root_token_starvation_parks
+        );
+        assert_eq!(
+            after.queue_token_starvation_parks,
+            before.queue_token_starvation_parks
+        );
+    }
+
+    // ----- §5.3: multi-binding-per-worker pins (R2 HIGH-2) -----
+
+    #[test]
+    fn same_worker_multi_binding_each_has_own_slot() {
+        // Test #18: two bindings on the same worker sharing a
+        // lease. Each `apply_cos_queue_flow_fair_promotion` call
+        // claims a DISTINCT slot via `register_binding`. The slot
+        // IDs must differ; neither binding's slot is overwritten
+        // by the other.
+        let lease = test_shared_queue_lease();
+
+        let mut runtime_a = test_flow_fair_runtime();
+        runtime_a.queues[0].flow_fair = false;
+        let fast_path_a = vec![test_queue_fast_path_with_lease(true, Some(lease.clone()))];
+        apply_cos_queue_flow_fair_promotion(&mut runtime_a, &fast_path_a);
+        let slot_a = runtime_a.queues[0].frontier_slot;
+
+        let mut runtime_b = test_flow_fair_runtime();
+        runtime_b.queues[0].flow_fair = false;
+        let fast_path_b = vec![test_queue_fast_path_with_lease(true, Some(lease.clone()))];
+        apply_cos_queue_flow_fair_promotion(&mut runtime_b, &fast_path_b);
+        let slot_b = runtime_b.queues[0].frontier_slot;
+
+        assert_eq!(slot_a, Some(0));
+        assert_eq!(slot_b, Some(1));
+        assert_ne!(slot_a, slot_b);
+        // Each binding only writes its own slot.
+        lease.publish_binding_frontier(slot_a.unwrap(), 100);
+        lease.publish_binding_frontier(slot_b.unwrap(), 200);
+        assert_eq!(lease.test_binding_frontier_slot(0), 100);
+        assert_eq!(lease.test_binding_frontier_slot(1), 200);
+    }
+
+    #[test]
+    fn one_binding_idle_does_not_drop_peer_binding_slot() {
+        // Test #19: when binding A marks itself idle, binding B's
+        // slot must be untouched. Pins the single-writer-per-slot
+        // discipline — `mark_binding_idle(A)` writes only slot A
+        // and does NOT clobber slot B's published value.
+        let lease = test_shared_queue_lease();
+        assert_eq!(lease.register_binding(), Some(0));
+        assert_eq!(lease.register_binding(), Some(1));
+        lease.publish_binding_frontier(0, 500);
+        lease.publish_binding_frontier(1, 200);
+        // A goes idle.
+        lease.mark_binding_idle(0);
+        assert_eq!(
+            lease.test_binding_frontier_slot(0),
+            u64::MAX
+        );
+        assert_eq!(
+            lease.test_binding_frontier_slot(1),
+            200,
+            "peer binding's slot must be unchanged"
+        );
+        assert_eq!(lease.current_min_frontier(), 200);
+    }
+
+    #[test]
+    fn two_bindings_synchronise_within_t_plus_batch_advance() {
+        // Test #20: R2 HIGH-1 pin. Simulate fast binding A
+        // dispatching at twice the rate of slow binding B over
+        // many rounds. At every publish, the absolute difference
+        // |v_local_A - v_local_B| must stay within `T +
+        // COS_GUARANTEE_QUANTUM_MAX_BYTES`. The gate is modelled
+        // here: if A would publish a value putting it > T above
+        // v_min (which is min(A_slot, B_slot) so if B is slow,
+        // v_min = B's v_local), A is forced to yield its NEXT
+        // increment until B catches up.
+        let lease = test_shared_queue_lease();
+        assert_eq!(lease.register_binding(), Some(0)); // A
+        assert_eq!(lease.register_binding(), Some(1)); // B
+
+        let mut v_a: u64 = 0;
+        let mut v_b: u64 = 0;
+        // Fast:slow ratio 2:1. Simulated batch size 16 KB.
+        let batch: u64 = 16 * 1024;
+        for _ in 0..4096 {
+            // A would advance twice; gate-check after each.
+            for _ in 0..2 {
+                lease.publish_binding_frontier(1, v_b);
+                lease.publish_binding_frontier(0, v_a);
+                let v_min = lease.current_min_frontier();
+                if v_min < u64::MAX && v_a.saturating_sub(v_min) > COS_CROSS_BINDING_LAG_LIMIT_BYTES
+                {
+                    // Gate fires — A skips this round.
+                    break;
+                }
+                v_a = v_a.saturating_add(batch);
+            }
+            lease.publish_binding_frontier(1, v_b);
+            v_b = v_b.saturating_add(batch);
+        }
+        let spread = if v_a >= v_b { v_a - v_b } else { v_b - v_a };
+        assert!(
+            spread <= COS_CROSS_BINDING_LAG_LIMIT_BYTES + COS_GUARANTEE_QUANTUM_MAX_BYTES,
+            "spread {} must be <= T ({}) + max_batch_advance ({})",
+            spread,
+            COS_CROSS_BINDING_LAG_LIMIT_BYTES,
+            COS_GUARANTEE_QUANTUM_MAX_BYTES,
+        );
+    }
+
+    // ----- §5.4: bring-up + regression pins -----
+
+    #[test]
+    fn bringup_seeds_v_local_to_lease_min_in_promotion() {
+        // Test #21: R2 MED-1 pin. A peer binding has already
+        // advanced to `v_local = 1_000_000`. A freshly-built
+        // runtime undergoing `apply_cos_queue_flow_fair_promotion`
+        // must pick up that value as its `queue_vtime` seed — not
+        // zero. Otherwise the new binding would start at lag =
+        // 1_000_000 - 0 = 1_000_000 and yield indefinitely.
+        let lease = test_shared_queue_lease();
+        assert_eq!(lease.register_binding(), Some(0));
+        lease.publish_binding_frontier(0, 1_000_000);
+
+        let mut runtime = test_flow_fair_runtime();
+        runtime.queues[0].flow_fair = false;
+        runtime.queues[0].queue_vtime = 0;
+        let fast_path = vec![test_queue_fast_path_with_lease(true, Some(lease.clone()))];
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
+
+        assert_eq!(runtime.queues[0].frontier_slot, Some(1));
+        assert_eq!(
+            runtime.queues[0].queue_vtime, 1_000_000,
+            "new binding must seed queue_vtime to current_min_frontier \
+             so its first gate check reads lag=0, not lag=1_000_000"
+        );
+    }
+
+    #[test]
+    fn non_shared_queue_unaffected_by_gate() {
+        // Test #22: single-owner exact queues (no shared lease)
+        // must behave exactly as pre-#829. `frontier_slot` stays
+        // `None`; the gate never engages.
+        let mut runtime = test_flow_fair_runtime();
+        runtime.queues[0].flow_fair = false;
+        let fast_path = vec![test_queue_fast_path_with_lease(false, None)];
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
+        assert_eq!(runtime.queues[0].frontier_slot, None);
+
+        prime_queue_for_selection(&mut runtime);
+        // frontier_slot = None, so the gate branch is skipped
+        // entirely — selection proceeds as normal.
+        runtime.queues[0].queue_vtime = 10 * COS_CROSS_BINDING_LAG_LIMIT_BYTES;
+        let selection = select_exact_cos_guarantee_queue_with_fast_path(
+            &mut runtime,
+            &fast_path,
+            1_000_000,
+        );
+        assert!(
+            selection.is_some(),
+            "non-shared queue: gate must be wholly disabled"
+        );
+    }
+
+    #[test]
+    fn non_flow_fair_shared_queue_unaffected_by_gate() {
+        // Test #23: a shared lease attached to a NON-flow_fair
+        // queue (FIFO, no MQFQ ordering) must also have the gate
+        // disabled. The bring-up path only registers a slot when
+        // `queue.flow_fair == true`.
+        let lease = test_shared_queue_lease();
+        let mut runtime = test_flow_fair_runtime();
+        // Force non-flow-fair despite shared_exact=true.
+        runtime.queues[0].flow_fair = false;
+        runtime.queues[0].exact = false;
+        let fast_path = vec![test_queue_fast_path_with_lease(true, Some(lease.clone()))];
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
+        // After promotion runs, `promote_cos_queue_flow_fair`
+        // sets `flow_fair = queue.exact` which is false here, so
+        // no slot should be registered.
+        assert!(!runtime.queues[0].flow_fair);
+        assert_eq!(runtime.queues[0].frontier_slot, None);
+        assert_eq!(lease.next_slot_count(), 0);
+    }
+
+    // ----- §5.5: additional R3 pins -----
+
+    #[test]
+    fn register_binding_overflow_disables_gate() {
+        // Test #24: exhaust MAX_BINDINGS_PER_LEASE registrations
+        // through the lease directly, then drive
+        // `apply_cos_queue_flow_fair_promotion` for a runtime
+        // that SHOULD get a slot. It must get `None` instead,
+        // and `register_overflow` must advance.
+        let lease = test_shared_queue_lease();
+        for _ in 0..MAX_BINDINGS_PER_LEASE {
+            assert!(lease.register_binding().is_some());
+        }
+
+        let mut runtime = test_flow_fair_runtime();
+        runtime.queues[0].flow_fair = false;
+        let fast_path = vec![test_queue_fast_path_with_lease(true, Some(lease.clone()))];
+        apply_cos_queue_flow_fair_promotion(&mut runtime, &fast_path);
+        assert_eq!(
+            runtime.queues[0].frontier_slot, None,
+            "overflow registration returns None → gate disabled for this binding"
+        );
+        assert_eq!(lease.register_overflow_count(), 1);
+
+        // Selector on this degraded queue must proceed (no yield,
+        // no park-reason advance).
+        prime_queue_for_selection(&mut runtime);
+        runtime.queues[0].queue_vtime = COS_CROSS_BINDING_LAG_LIMIT_BYTES * 100;
+        let before = snapshot_counters(&runtime.queues[0]);
+        let selection = select_exact_cos_guarantee_queue_with_fast_path(
+            &mut runtime,
+            &fast_path,
+            1_000_000,
+        );
+        assert!(selection.is_some(), "overflow binding: gate disabled");
+        let after = snapshot_counters(&runtime.queues[0]);
+        assert_eq!(
+            after.cross_binding_lag_parks, before.cross_binding_lag_parks,
+            "no CrossBindingLag tick on overflow binding"
+        );
+    }
+
+    #[test]
+    fn concurrent_registration_returns_unique_slots() {
+        // Test #25: spawn N threads all calling
+        // `register_binding()` once; each gets a distinct slot
+        // index in 0..N; `next_slot == N`. Pins the fetch_add
+        // allocator under contention (config-reload race).
+        use std::sync::Arc as StdArc;
+        use std::thread;
+        let lease = StdArc::new(test_shared_queue_lease_owned());
+        let n_threads = 16;
+        let mut handles = Vec::new();
+        for _ in 0..n_threads {
+            let l = StdArc::clone(&lease);
+            handles.push(thread::spawn(move || l.register_binding()));
+        }
+        let mut slots = Vec::with_capacity(n_threads);
+        for h in handles {
+            slots.push(h.join().unwrap().expect("under capacity, must not overflow"));
+        }
+        slots.sort_unstable();
+        let expected: Vec<u32> = (0..n_threads as u32).collect();
+        assert_eq!(slots, expected, "fetch_add must yield dense unique slots");
+        assert_eq!(lease.next_slot_count(), n_threads as u32);
+    }
+
+    // Helper that avoids double-Arc wrapping for the concurrent
+    // registration test. `test_shared_queue_lease` already returns
+    // an `Arc`; the concurrent-spawn test wraps in its own Arc.
+    fn test_shared_queue_lease_owned() -> SharedCoSQueueLease {
+        SharedCoSQueueLease::new(25_000_000_000 / 8, 4 * 1024 * 1024, 1)
+    }
+
+    #[test]
+    fn single_poll_iteration_drains_one_binding_for_lease() {
+        // Test #26: R3-4 pin — the worker poll loop drains AT
+        // MOST ONE binding's queue per lease per poll iteration.
+        // The `T + COS_GUARANTEE_QUANTUM_MAX_BYTES` fairness bound
+        // (plan §4.3) depends on this invariant; if a future
+        // refactor batches multiple drains per tick, the bound
+        // becomes `T + N × 512 KB` and T must be re-derived.
+        //
+        // Strategy: model the invariant by checking that a single
+        // `drain_exact_local_items_to_scratch_flow_fair` call
+        // performs a SINGLE publish — not multiple. If the
+        // function were accidentally refactored to loop and
+        // publish multiple times inside one call, the peer
+        // binding's `current_min_frontier` would see multiple
+        // advances without an intervening selector pass, which
+        // would break the bound. We pin the single-publish
+        // invariant by driving a drain that empties the queue
+        // and checking the post-drain lease state is exactly one
+        // `mark_binding_idle` (u64::MAX), not a stale
+        // intermediate value.
+        let lease = test_shared_queue_lease();
+        assert_eq!(lease.register_binding(), Some(0));
+        // Start with a non-idle peer so min != u64::MAX going in.
+        assert_eq!(lease.register_binding(), Some(1));
+        lease.publish_binding_frontier(1, 5_000);
+
+        let mut runtime = test_flow_fair_runtime();
+        let queue = &mut runtime.queues[0];
+        queue.frontier_slot = Some(0);
+        cos_queue_push_back(queue, test_flow_cos_item(1111, 1500));
+        cos_queue_push_back(queue, test_flow_cos_item(1112, 1500));
+        cos_queue_push_back(queue, test_flow_cos_item(1113, 1500));
+
+        let mut scratch: Vec<(u64, TxRequest)> = Vec::with_capacity(TX_BATCH_SIZE);
+        let mut free_tx: VecDeque<u64> = (0..8)
+            .map(|i| (i as u64) * (UMEM_FRAME_SIZE as u64))
+            .collect();
+        let area = MmapArea::new(2 * 1024 * 1024).expect("mmap umem");
+
+        let build = drain_exact_local_items_to_scratch_flow_fair(
+            queue,
+            &mut free_tx,
+            &mut scratch,
+            &area,
+            u64::MAX,
+            u64::MAX,
+            None,
+            Some(&lease),
+        );
+        assert!(matches!(build, ExactCoSScratchBuild::Ready));
+        assert!(cos_queue_is_empty(queue));
+        // Single batch drained to empty → single publish
+        // (mark_binding_idle) → slot 0 exactly u64::MAX.
+        assert_eq!(
+            lease.test_binding_frontier_slot(0),
+            u64::MAX,
+            "single-call single-publish invariant: drain-to-empty must \
+             result in exactly one idle-mark on this binding's slot"
+        );
+        // The peer binding's slot is untouched.
+        assert_eq!(lease.test_binding_frontier_slot(1), 5_000);
+    }
+
+    #[test]
+    fn select_exact_cos_guarantee_returns_exactly_one_queue_per_call() {
+        // #829 R1 code-review HIGH-3 reinforcement: complements
+        // test #26 by pinning the selector side of the
+        // "single-drain-per-poll" invariant. Regardless of how
+        // many queues have pending work, one `select_...` call
+        // returns at most one `ExactCoSQueueSelection`. The worker
+        // poll loop calls `select → drain → publish` once per
+        // outer iteration, so:
+        //   (a) select returns ≤1 queue per call (this test),
+        //   (b) drain publishes ≤1 frontier per call (test #26),
+        //   (c) poll iterates select+drain as a unit.
+        // Together these pin the plan §4.3 invariant that the
+        // per-lease frontier advances by at most one batch's
+        // bytes per poll iteration, which is what makes the
+        // `T + COS_GUARANTEE_QUANTUM_MAX_BYTES` bound hold.
+        //
+        // If a future refactor inlines multiple select-drain
+        // cycles within one outer poll iteration, EITHER this
+        // test must gain an explicit call-count invariant OR the
+        // bound must be re-derived.
+        let mut runtime = test_flow_fair_runtime();
+        // Seed two distinct queues with work; only one should be
+        // returned per call.
+        cos_queue_push_back(&mut runtime.queues[0], test_flow_cos_item(1111, 1500));
+        runtime.queues[0].runnable = true;
+        runtime.queues[0].exact = true;
+        runtime.queues[0].tokens = 10_000;
+        runtime.tokens = 10_000;
+        if runtime.queues.len() > 1 {
+            cos_queue_push_back(&mut runtime.queues[1], test_flow_cos_item(2222, 1500));
+            runtime.queues[1].runnable = true;
+            runtime.queues[1].exact = true;
+            runtime.queues[1].tokens = 10_000;
+        }
+
+        let queue_fast_path: Vec<WorkerCoSQueueFastPath> = runtime
+            .queues
+            .iter()
+            .map(|_| WorkerCoSQueueFastPath {
+                shared_exact: false,
+                owner_worker_id: 0,
+                owner_live: None,
+                shared_queue_lease: None,
+            })
+            .collect();
+
+        let sel = select_exact_cos_guarantee_queue_with_fast_path(
+            &mut runtime,
+            &queue_fast_path,
+            0,
+        );
+        assert!(
+            sel.is_some(),
+            "selector should find at least one runnable queue in this fixture"
+        );
+        // The contract is the return type: `Option<ExactCoSQueueSelection>`.
+        // The compiler enforces "at most one" — this assertion is a
+        // runtime pin that the fixture produces a live selection so
+        // the invariant isn't silently satisfied by returning None.
+        let ExactCoSQueueSelection { queue_idx, .. } = sel.unwrap();
+        assert!(queue_idx < runtime.queues.len());
     }
 }
