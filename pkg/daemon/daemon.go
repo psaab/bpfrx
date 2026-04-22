@@ -564,6 +564,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		go d.watchClusterEvents(ctx)
 	}
 
+	// #835 Slice D — start the RSS rebalance loop. Reads live config
+	// state from the rss_indirection.go atomic vars on each tick, so
+	// runtime changes (config reload, kill switch) take effect on the
+	// next tick without restart. Spawned exactly once; ctx
+	// cancellation stops it cleanly. Skipped only when xpfd is run
+	// without a dataplane (--no-dataplane).
+	if !d.opts.NoDataplane {
+		go runRSSRebalanceLoop(ctx, realRSSExecutor{})
+	}
+
 	// Enable IP forwarding — required for the firewall to route packets.
 	if !d.opts.NoDataplane {
 		enableForwarding()

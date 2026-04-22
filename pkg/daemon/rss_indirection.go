@@ -38,7 +38,91 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
+
+// #835 Slice D — package-level state shared between the existing
+// boot/reapply/kill-switch paths and the new RSS rebalance loop in
+// rss_rebalance.go. All ethtool-X writes to RSS indirection serialize
+// on rssWriteMu so reapply, kill-switch, and rebalance can never race.
+//
+// Counter semantics (plan §3.2 / §4.5):
+//   - rssIndirectionEpoch: bumped after a SUCCESSFUL write by any of
+//     the three public entry points. Marks "the table you read may
+//     have changed; re-seed your state on next tick." NOT bumped by
+//     the rebalance loop's own writes (per-iface; doesn't invalidate
+//     peers' state).
+//   - rssConfigGen: bumped on EVERY public-entry INVOCATION
+//     regardless of write success. Marks "RSS config intent
+//     changed." The rebalance loop snapshots this at the top of
+//     each tick and re-checks under the lock; on mismatch, abandons
+//     the in-flight rebalance (handles the failed-apply-then-disable
+//     case the epoch-only check would miss).
+//   - rssEnabled, rssWorkers, rssAllowedRef: live config snapshot
+//     so the rebalance loop sees runtime changes without restart.
+var (
+	rssWriteMu sync.Mutex
+
+	rssIndirectionEpoch atomic.Uint64
+	rssConfigGen        atomic.Uint64
+
+	rssEnabled    atomic.Bool
+	rssWorkers    atomic.Int32
+	rssAllowedRef atomic.Pointer[[]string]
+)
+
+// LoadRSSEpoch returns the current write-completion epoch. Bumped on
+// successful write only.
+func LoadRSSEpoch() uint64 { return rssIndirectionEpoch.Load() }
+
+// BumpRSSEpoch increments the write-completion epoch by one.
+func BumpRSSEpoch() { rssIndirectionEpoch.Add(1) }
+
+// LoadRSSConfigGen returns the config-intent generation counter.
+// Bumped on every public-entry invocation regardless of write success.
+func LoadRSSConfigGen() uint64 { return rssConfigGen.Load() }
+
+// BumpRSSConfigGen increments the config-intent counter by one.
+func BumpRSSConfigGen() { rssConfigGen.Add(1) }
+
+// LoadRSSEnabled returns the live "RSS indirection enabled" flag.
+func LoadRSSEnabled() bool { return rssEnabled.Load() }
+
+// LoadRSSWorkers returns the live worker count.
+func LoadRSSWorkers() int { return int(rssWorkers.Load()) }
+
+// LoadRSSAllowed returns the live allowlist of userspace-dp bound
+// interfaces. Caller must NOT mutate the returned slice. Updated by
+// the public entry points via atomic.Pointer swap on every invocation.
+func LoadRSSAllowed() []string {
+	p := rssAllowedRef.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+// RssWriteMuLock acquires the mutex serializing all RSS indirection
+// writes. Used by the rebalance loop in rss_rebalance.go to coordinate
+// with the boot / reapply / kill-switch paths.
+func RssWriteMuLock() { rssWriteMu.Lock() }
+
+// RssWriteMuUnlock releases the write mutex.
+func RssWriteMuUnlock() { rssWriteMu.Unlock() }
+
+// publishRSSState updates the live atomic config snapshot. Called by
+// the three public entry points on every invocation. **Must be
+// called BEFORE BumpRSSConfigGen** (code-review FA2): a reader that
+// observes the new generation must also observe the new state. The
+// reverse order would let a reader see a new generation but stale
+// (enabled, workers, allowed) values.
+func publishRSSState(enabled bool, workers int, allowed []string) {
+	rssEnabled.Store(enabled)
+	rssWorkers.Store(int32(workers))
+	cp := append([]string(nil), allowed...) // defensive copy
+	rssAllowedRef.Store(&cp)
+}
 
 const (
 	// mlx5Driver is the sysfs driver name we detect D3-eligible NICs by.
@@ -135,7 +219,36 @@ func (realRSSExecutor) listInterfaces() []string {
 //     computed layout, no write is issued.
 //   - Never returns a non-nil error — D3 regressions must not break
 //     interface bring-up.
+// applyRSSIndirection is the public entry point — handles locking,
+// epoch / config-gen bumps, and live-state publishing, then delegates
+// to applyRSSIndirectionLocked under the mutex. Safe for concurrent
+// callers.
 func applyRSSIndirection(enabled bool, workers int, allowed []string, execer rssExecutor) {
+	rssWriteMu.Lock()
+	defer rssWriteMu.Unlock()
+	// Code-review FA2 (HIGH): publish state BEFORE bumping
+	// rssConfigGen so a reader that observes the new generation
+	// also observes the new (enabled, workers, allowed) values.
+	// The reverse order would let the rebalance loop read the new
+	// generation but stale state, then under-lock pass the
+	// generation re-check (gen matches) and overwrite this same-
+	// state reapply with stale weights.
+	publishRSSState(enabled, workers, allowed)
+	BumpRSSConfigGen()
+	wrote := applyRSSIndirectionLocked(enabled, workers, allowed, execer)
+	if wrote {
+		BumpRSSEpoch()
+	}
+}
+
+// applyRSSIndirectionLocked is the actual work. PRECONDITION:
+// rssWriteMu is held by the caller. Returns true if at least one
+// ethtool write was issued (used by the public entry to decide
+// whether to bump the write-completion epoch).
+//
+// Calls into restoreDefaultRSSIndirectionLocked / applyRSSIndirectionOne
+// without re-acquiring the mutex (R4 Finding #2 self-deadlock fix).
+func applyRSSIndirectionLocked(enabled bool, workers int, allowed []string, execer rssExecutor) bool {
 	if !enabled {
 		// Kill switch. Actively restore default (equal-weight) RSS on
 		// every allowlisted mlx5 interface so toggling disable at
@@ -144,20 +257,20 @@ func applyRSSIndirection(enabled bool, workers int, allowed []string, execer rss
 		// ethtool call. The restore is scoped per-interface with the
 		// same driver filter as the apply path, so non-mlx5 netdevs
 		// and non-userspace-dp interfaces are never touched.
-		restoreDefaultRSSIndirection(allowed, execer)
+		wrote := restoreDefaultRSSIndirectionLocked(allowed, execer)
 		slog.Info("linksetup: rss indirection disabled by config",
 			"allowed_count", len(allowed))
-		return
+		return wrote
 	}
 	if workers <= 0 {
 		// Non-userspace deploys (ebpf/dpdk) hit this path every boot —
 		// keep at Debug to avoid info-level noise on the default path.
 		slog.Debug("linksetup: rss indirection skipped (no workers configured)")
-		return
+		return false
 	}
 	if workers == 1 {
 		slog.Info("linksetup: rss indirection skipped (single worker — keep default RSS)")
-		return
+		return false
 	}
 	if len(allowed) == 0 {
 		// No userspace-dp bindings derived from config — nothing to
@@ -167,9 +280,10 @@ func applyRSSIndirection(enabled bool, workers int, allowed []string, execer rss
 		// deploy), not a sysfs error.
 		slog.Debug("linksetup: rss indirection skipped (no userspace-dp bound interfaces)",
 			"workers", workers)
-		return
+		return false
 	}
 
+	wrote := false
 	for _, iface := range allowed {
 		if iface == "lo" {
 			continue
@@ -184,8 +298,11 @@ func applyRSSIndirection(enabled bool, workers int, allowed []string, execer rss
 				"iface", iface, "driver", drv)
 			continue
 		}
-		applyRSSIndirectionOne(iface, workers, execer)
+		if applyRSSIndirectionOne(iface, workers, execer) {
+			wrote = true
+		}
 	}
+	return wrote
 }
 
 // restoreDefaultRSSIndirection is called when the kill switch is engaged.
@@ -195,10 +312,28 @@ func applyRSSIndirection(enabled bool, workers int, allowed []string, execer rss
 // the call site, mirroring applyRSSIndirection's guard. An empty allowlist
 // is a no-op: the restore path must not escape the userspace-dp binding
 // scope (Codex H1).
+// restoreDefaultRSSIndirection is the public entry point for the kill
+// switch. Same locking + bumping contract as applyRSSIndirection.
 func restoreDefaultRSSIndirection(allowed []string, execer rssExecutor) {
-	if len(allowed) == 0 {
-		return
+	rssWriteMu.Lock()
+	defer rssWriteMu.Unlock()
+	// Code-review FA2: publish state before bumping ConfigGen so a
+	// reader observing the new generation also sees the new state.
+	publishRSSState(false, 0, allowed)
+	BumpRSSConfigGen()
+	wrote := restoreDefaultRSSIndirectionLocked(allowed, execer)
+	if wrote {
+		BumpRSSEpoch()
 	}
+}
+
+// restoreDefaultRSSIndirectionLocked. PRECONDITION: rssWriteMu is held.
+// Returns true if at least one ethtool write was issued.
+func restoreDefaultRSSIndirectionLocked(allowed []string, execer rssExecutor) bool {
+	if len(allowed) == 0 {
+		return false
+	}
+	wrote := false
 	for _, iface := range allowed {
 		if iface == "lo" {
 			continue
@@ -211,35 +346,41 @@ func restoreDefaultRSSIndirection(allowed []string, execer rssExecutor) {
 			if isExecNotFound(err) {
 				slog.Warn("linksetup: ethtool binary not found, cannot restore default rss indirection",
 					"iface", iface)
-				return
+				return wrote
 			}
 			slog.Warn("linksetup: ethtool -X default failed",
 				"iface", iface, "err", err,
 				"output", strings.TrimSpace(string(out)))
 			continue
 		}
+		wrote = true
 		slog.Info("linksetup: restored default rss indirection", "iface", iface)
 	}
+	return wrote
 }
 
 // applyRSSIndirectionOne applies the weight-vector to a single mlx5 iface.
-// Errors are logged and swallowed: D3 is best-effort.
+// Errors are logged and swallowed: D3 is best-effort. Returns true if a
+// successful ethtool write happened (caller uses this to decide whether
+// to bump the rssIndirectionEpoch).
 //
-// The caller (applyRSSIndirection) is responsible for driver filtering;
-// this function additionally re-checks the driver as defense in depth so a
-// future caller cannot accidentally invoke ethtool on a non-mlx5 netdev.
-func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
+// PRECONDITION: rssWriteMu is held by the caller (applyRSSIndirectionLocked).
+//
+// The caller is responsible for driver filtering; this function
+// additionally re-checks the driver as defense in depth so a future
+// caller cannot accidentally invoke ethtool on a non-mlx5 netdev.
+func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) bool {
 	if drv := execer.readDriver(iface); drv != mlx5Driver {
 		slog.Debug("linksetup: rss indirection skipped (non-mlx5 driver at per-iface check)",
 			"iface", iface, "driver", drv)
-		return
+		return false
 	}
 	queues := execer.readQueueCount(iface)
 	weights, reason := computeWeightVector(workers, queues)
 	if weights == nil {
 		slog.Info("linksetup: rss indirection skipped", "iface", iface,
 			"workers", workers, "queues", queues, "reason", reason)
-		return
+		return false
 	}
 
 	// Idempotency: read the live table; skip the write if it already
@@ -251,16 +392,16 @@ func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
 		if isExecNotFound(err) {
 			slog.Warn("linksetup: ethtool binary not found, skipping rss indirection",
 				"iface", iface)
-			return
+			return false
 		}
 		slog.Warn("linksetup: ethtool -x failed, skipping rss indirection",
 			"iface", iface, "err", err,
 			"output", strings.TrimSpace(string(out)))
-		return
+		return false
 	}
 	if indirectionTableMatches(out, weights) {
 		slog.Debug("linksetup: rss indirection unchanged", "iface", iface)
-		return
+		return false
 	}
 
 	args := []string{"-X", iface, "weight"}
@@ -271,16 +412,17 @@ func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
 		if isExecNotFound(err) {
 			slog.Warn("linksetup: ethtool binary not found, rss indirection not applied",
 				"iface", iface)
-			return
+			return false
 		}
 		slog.Warn("linksetup: ethtool -X failed",
 			"iface", iface, "weights", weights, "err", err,
 			"output", strings.TrimSpace(string(out)))
-		return
+		return false
 	}
 	slog.Info("linksetup: applied rss indirection",
 		"iface", iface, "workers", workers, "queues", len(weights),
 		"weights", weights)
+	return true
 }
 
 // computeWeightVector returns the weight vector for the given worker and
