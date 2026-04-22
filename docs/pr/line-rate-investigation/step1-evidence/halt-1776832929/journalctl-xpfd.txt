@@ -1,0 +1,200 @@
+Apr 22 04:32:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:32:40.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:32:46 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:32:46.063Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:32:49 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:32:49.966Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:32:51 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:32:51.039Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=3
+Apr 22 04:32:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:32:54.295Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:32:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:32:54.856Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:32:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:32:54.959Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:32:56 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:32:56.024Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:33:01 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:01.031Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:33:05 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:05.148Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:33:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:09.295Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:33:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:09.822Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:33:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:09.933Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:33:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:10.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:33:16 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:16.024Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:33:20 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:20.318Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:33:21 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:21.068Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:33:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:24.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:33:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:24.842Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:33:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:24.955Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:33:26 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:26.071Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:33:35 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:35.497Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:33:36 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:36.060Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:33:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:39.295Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:33:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:39.826Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:33:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:39.941Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:33:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:40.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:33:46 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:46.058Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:33:50 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:50.652Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:33:51 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:51.039Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=4
+Apr 22 04:33:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:54.298Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:33:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:54.855Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:33:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:33:54.974Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:34:01 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:01.047Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:34:05 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:05.821Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:34:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:09.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:34:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:09.835Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:34:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:09.930Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:34:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:10.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:34:16 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:16.034Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:34:20 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:20.934Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:34:21 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:21.021Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:34:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:24.295Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:34:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:24.830Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:34:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:24.934Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:34:26 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:26.057Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:34:36 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:36.024Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:34:36 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:36.076Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:34:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:39.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:34:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:39.852Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:34:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:39.962Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:34:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:40.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:34:46 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:46.057Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:34:51 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:51.047Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=3
+Apr 22 04:34:51 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:51.210Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:34:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:54.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:34:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:54.865Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:34:55 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:55.005Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:34:56 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:34:56.038Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=3
+Apr 22 04:35:01 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:01.069Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:35:06 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:06.463Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:35:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:09.303Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:35:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:09.823Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:35:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:09.928Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:35:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:10.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:35:16 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:16.038Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:35:21 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:21.036Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=4
+Apr 22 04:35:21 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:21.617Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:35:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:24.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:35:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:24.862Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:35:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:24.982Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:35:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:31.055Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:35:36 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:36.050Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:35:36 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:36.760Z level=INFO msg="cluster sync: sweep synced sessions" count=13
+Apr 22 04:35:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:39.298Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:35:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:39.867Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:35:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:40.002Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:35:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:40.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:35:41 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:41.042Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:35:46 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:46.027Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=5
+Apr 22 04:35:51 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:51.024Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:35:52 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:52.017Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:35:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:54.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:35:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:54.843Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:35:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:54.968Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:35:56 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:35:56.068Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=4
+Apr 22 04:36:01 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:01.039Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=5
+Apr 22 04:36:06 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:06.031Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=3
+Apr 22 04:36:07 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:07.124Z level=INFO msg="cluster sync: sweep synced sessions" count=11
+Apr 22 04:36:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:09.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:36:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:09.821Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:36:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:09.919Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:36:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:10.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:36:16 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:16.026Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:36:21 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:21.025Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=5
+Apr 22 04:36:22 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:22.247Z level=INFO msg="cluster sync: sweep synced sessions" count=11
+Apr 22 04:36:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:24.305Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:36:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:24.829Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:36:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:24.926Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:36:26 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:26.050Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:36:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:31.062Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=5
+Apr 22 04:36:36 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:36.053Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:36:37 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:37.464Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:36:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:39.295Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:36:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:39.861Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:36:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:39.984Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:36:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:40.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:36:41 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:41.042Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=4
+Apr 22 04:36:46 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:46.059Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=4
+Apr 22 04:36:51 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:51.066Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:36:52 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:52.572Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:36:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:54.299Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:36:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:54.819Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:36:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:54.915Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:36:56 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:56.039Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=3
+Apr 22 04:37:01 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:01.064Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:37:06 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:06.053Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=3
+Apr 22 04:37:07 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:07.671Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:37:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:09.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:37:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:09.844Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:37:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:09.950Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:37:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:10.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:37:22 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:22.834Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:37:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:24.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:37:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:24.862Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:37:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:24.976Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:37:26 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:26.041Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:37:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:31.033Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=3
+Apr 22 04:37:37 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:37.979Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:37:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:39.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:37:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:39.852Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:37:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:39.950Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:37:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:40.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:37:41 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:41.031Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=3
+Apr 22 04:37:46 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:46.030Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:37:51 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:51.036Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:37:53 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:53.112Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:37:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:54.295Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:37:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:54.844Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:37:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:54.955Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:37:56 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:56.058Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:38:08 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:08.289Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:38:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:09.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:38:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:09.828Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:38:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:09.927Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:38:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:10.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:38:23 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:23.487Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:38:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:24.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:38:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:24.839Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:38:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:24.939Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:38:38 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:38.651Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:38:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:39.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:38:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:39.860Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:38:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:39.998Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:38:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:40.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:38:53 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:53.806Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:38:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:54.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:38:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:54.858Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:38:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:54.962Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:39:08 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:08.953Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:39:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:09.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:39:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:09.834Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:39:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:09.939Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:39:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:10.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:39:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:24.108Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:39:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:24.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:39:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:24.843Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:39:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:24.971Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:39:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:39.274Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:39:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:39.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:39:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:39.822Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:39:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:39.915Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:39:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:40.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:39:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:54.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:39:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:54.439Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:39:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:54.826Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:39:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:54.929Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:40:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:09.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:40:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:09.599Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:40:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:09.848Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:40:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:09.944Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:40:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:10.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:40:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:24.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:40:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:24.762Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:40:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:24.822Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:40:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:24.948Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:40:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:39.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:40:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:39.843Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:40:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:39.949Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:40:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:39.962Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:40:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:40.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:40:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:54.304Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:40:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:54.831Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:40:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:54.958Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:40:55 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:55.100Z level=INFO msg="cluster sync: sweep synced sessions" count=22
+Apr 22 04:41:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:09.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:41:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:09.819Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:41:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:09.936Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:41:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:10.251Z level=INFO msg="cluster sync: sweep synced sessions" count=22
+Apr 22 04:41:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:10.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"

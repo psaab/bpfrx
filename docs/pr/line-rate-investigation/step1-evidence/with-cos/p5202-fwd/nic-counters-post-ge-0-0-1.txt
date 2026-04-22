@@ -1,89 +1,89 @@
 NIC statistics:
-     rx_packets: 836160
-     rx_bytes: 1232295346
-     tx_packets: 255665
-     tx_bytes: 22137951
-     tx_mpwqe_blks: 255659
-     tx_mpwqe_pkts: 255659
-     rx_csum_unnecessary: 12732
-     rx_csum_none: 7225
-     rx_csum_complete: 816203
-     rx_xdp_drop: 519988
+     rx_packets: 836783
+     rx_bytes: 1232339970
+     tx_packets: 266247
+     tx_bytes: 23117272
+     tx_mpwqe_blks: 266241
+     tx_mpwqe_pkts: 266241
+     rx_csum_unnecessary: 12733
+     rx_csum_none: 7761
+     rx_csum_complete: 816289
+     rx_xdp_drop: 519992
      rx_xdp_redirect: 9
-     tx_csum_none: 236871
-     tx_csum_partial: 18794
-     tx_cqes: 255665
+     tx_csum_none: 244426
+     tx_csum_partial: 21821
+     tx_cqes: 266247
      tx_xdp_xmit: 35
      tx_xdp_mpwqe: 32
      tx_xdp_cqes: 32
-     ch_events: 7893845770
-     ch_poll: 11852751595
-     ch_arm: 9299284751
-     ch_aff_change: 2710777
-     ch_force_irq: 976596
-     rx_xsk_packets: 11129
-     rx_xsk_bytes: 1099172
+     ch_events: 8839419142
+     ch_poll: 13056979464
+     ch_arm: 10316459710
+     ch_aff_change: 2710849
+     ch_force_irq: 976617
+     rx_xsk_packets: 13441
+     rx_xsk_bytes: 1250868
      rx_xsk_csum_unnecessary: 3
-     rx_xsk_csum_none: 11126
-     rx_xsk_xdp_drop: 8380458
-     rx_xsk_xdp_redirect: 26134350926
-     rx_xsk_buff_alloc_err: 15898
-     tx_xsk_xmit: 5579504946
-     tx_xsk_mpwqe: 995870779
-     tx_xsk_inlnw: 71923962
-     tx_xsk_cqes: 926866832
+     rx_xsk_csum_none: 13438
+     rx_xsk_xdp_drop: 8406768
+     rx_xsk_xdp_redirect: 29139159302
+     rx_xsk_buff_alloc_err: 15928
+     tx_xsk_xmit: 7032014779
+     tx_xsk_mpwqe: 1082324334
+     tx_xsk_inlnw: 99389648
+     tx_xsk_cqes: 990359177
      rx_out_of_buffer: 261
-     rx_if_down_packets: 7410
+     rx_if_down_packets: 7424
      rx_steer_missed_packets: 5
-     rx_vport_unicast_packets: 26144086521
-     rx_vport_unicast_bytes: 39446611544521
-     tx_vport_unicast_packets: 5579512132
-     tx_vport_unicast_bytes: 5669639635588
-     rx_vport_multicast_packets: 61393
-     rx_vport_multicast_bytes: 7058117
-     tx_vport_multicast_packets: 225205
-     tx_vport_multicast_bytes: 20296975
-     rx_vport_broadcast_packets: 30122
-     rx_vport_broadcast_bytes: 1807320
-     tx_vport_broadcast_packets: 23301
-     tx_vport_broadcast_bytes: 1398060
-     ch0_events: 1491170310
-     ch0_poll: 2213881337
-     ch0_arm: 1737606384
+     rx_vport_unicast_packets: 29148922811
+     rx_vport_unicast_bytes: 43925730660208
+     tx_vport_unicast_packets: 7032026662
+     tx_vport_unicast_bytes: 7539062014321
+     rx_vport_multicast_packets: 67044
+     rx_vport_multicast_bytes: 7773665
+     tx_vport_multicast_packets: 230333
+     tx_vport_multicast_bytes: 20936500
+     rx_vport_broadcast_packets: 31509
+     rx_vport_broadcast_bytes: 1890540
+     tx_vport_broadcast_packets: 24058
+     tx_vport_broadcast_bytes: 1443480
+     ch0_events: 1671896849
+     ch0_poll: 2443714190
+     ch0_arm: 1932180748
      ch0_aff_change: 4
      ch0_force_irq: 1
-     ch1_events: 1418014849
-     ch1_poll: 2099535090
-     ch1_arm: 1650847981
-     ch2_events: 1457821433
-     ch2_poll: 2064665414
-     ch2_arm: 1661161027
-     ch3_events: 1449538407
-     ch3_poll: 2060464053
-     ch3_arm: 1664697929
-     ch4_events: 1035454322
-     ch4_poll: 1695249495
-     ch4_arm: 1286826296
-     ch4_aff_change: 1060225
-     ch4_force_irq: 370019
-     ch5_events: 1041846451
-     ch5_poll: 1718956208
-     ch5_arm: 1298145137
+     ch1_events: 1600151822
+     ch1_poll: 2330281036
+     ch1_arm: 1847029747
+     ch2_events: 1640947325
+     ch2_poll: 2299779926
+     ch2_arm: 1859986648
+     ch3_events: 1632089271
+     ch3_poll: 2293112844
+     ch3_arm: 1861895780
+     ch4_events: 1143826732
+     ch4_poll: 1832387477
+     ch4_arm: 1401662119
+     ch4_aff_change: 1060297
+     ch4_force_irq: 370040
+     ch5_events: 1150507143
+     ch5_poll: 1857703991
+     ch5_arm: 1413704668
      ch5_aff_change: 1650548
      ch5_force_irq: 606576
-     rx0_packets: 159803
-     rx0_bytes: 231195175
+     rx0_packets: 160123
+     rx0_bytes: 231213095
      rx0_csum_complete: 152615
      rx0_csum_unnecessary: 2386
-     rx0_csum_none: 4802
+     rx0_csum_none: 5122
      rx0_xdp_drop: 95270
      rx0_xdp_redirect: 1
-     rx0_xsk_packets: 3915
-     rx0_xsk_bytes: 222807
-     rx0_xsk_csum_none: 3915
-     rx0_xsk_xdp_drop: 156667
-     rx0_xsk_xdp_redirect: 4588386272
-     rx0_xsk_buff_alloc_err: 2857
+     rx0_xsk_packets: 5603
+     rx0_xsk_bytes: 317335
+     rx0_xsk_csum_none: 5603
+     rx0_xsk_xdp_drop: 166575
+     rx0_xsk_xdp_redirect: 5357257557
+     rx0_xsk_buff_alloc_err: 2862
      rx1_packets: 157015
      rx1_bytes: 231112370
      rx1_csum_complete: 153686
@@ -93,35 +93,35 @@ NIC statistics:
      rx1_xsk_packets: 5819
      rx1_xsk_bytes: 754071
      rx1_xsk_csum_none: 5819
-     rx1_xsk_xdp_drop: 51088
-     rx1_xsk_xdp_redirect: 4693504712
-     rx1_xsk_buff_alloc_err: 1838
-     rx2_packets: 258727
-     rx2_bytes: 384902443
-     rx2_csum_complete: 254446
-     rx2_csum_unnecessary: 3979
-     rx2_csum_none: 302
-     rx2_xdp_drop: 159030
-     rx2_xsk_packets: 728
-     rx2_xsk_bytes: 60008
-     rx2_xsk_csum_none: 728
-     rx2_xsk_xdp_drop: 59484
-     rx2_xsk_xdp_redirect: 4877312315
-     rx2_xsk_buff_alloc_err: 3603
-     rx3_packets: 52118
-     rx3_bytes: 77019037
-     rx3_csum_complete: 50997
+     rx1_xsk_xdp_drop: 56393
+     rx1_xsk_xdp_redirect: 5437487685
+     rx1_xsk_buff_alloc_err: 1843
+     rx2_packets: 258873
+     rx2_bytes: 384915021
+     rx2_csum_complete: 254488
+     rx2_csum_unnecessary: 3980
+     rx2_csum_none: 405
+     rx2_xdp_drop: 159032
+     rx2_xsk_packets: 1138
+     rx2_xsk_bytes: 95268
+     rx2_xsk_csum_none: 1138
+     rx2_xsk_xdp_drop: 66369
+     rx2_xsk_xdp_redirect: 5614200324
+     rx2_xsk_buff_alloc_err: 3608
+     rx3_packets: 52275
+     rx3_bytes: 77033163
+     rx3_csum_complete: 51041
      rx3_csum_unnecessary: 797
-     rx3_csum_none: 324
-     rx3_xdp_drop: 32244
+     rx3_csum_none: 437
+     rx3_xdp_drop: 32246
      rx3_xdp_redirect: 2
-     rx3_xsk_packets: 230
-     rx3_xsk_bytes: 27424
+     rx3_xsk_packets: 444
+     rx3_xsk_bytes: 49332
      rx3_xsk_csum_unnecessary: 3
-     rx3_xsk_csum_none: 227
-     rx3_xsk_xdp_drop: 2732954
-     rx3_xsk_xdp_redirect: 5326255074
-     rx3_xsk_buff_alloc_err: 4536
+     rx3_xsk_csum_none: 441
+     rx3_xsk_xdp_drop: 2737166
+     rx3_xsk_xdp_redirect: 6081321183
+     rx3_xsk_buff_alloc_err: 4541
      rx4_packets: 51685
      rx4_bytes: 76987179
      rx4_csum_complete: 50889
@@ -133,7 +133,7 @@ NIC statistics:
      rx4_xsk_csum_none: 57
      rx4_xsk_xdp_drop: 33372
      rx4_xsk_xdp_redirect: 2854448691
-     rx4_xsk_buff_alloc_err: 696
+     rx4_xsk_buff_alloc_err: 701
      rx5_packets: 156812
      rx5_bytes: 231079142
      rx5_csum_complete: 153570
@@ -146,75 +146,75 @@ NIC statistics:
      rx5_xsk_csum_none: 380
      rx5_xsk_xdp_drop: 5346893
      rx5_xsk_xdp_redirect: 3794443862
-     rx5_xsk_buff_alloc_err: 2368
-     tx0_packets: 60481
-     tx0_bytes: 5225320
-     tx0_csum_partial: 2665
-     tx0_mpwqe_blks: 60480
-     tx0_mpwqe_pkts: 60480
-     tx0_csum_none: 57816
-     tx0_cqes: 60481
-     tx1_packets: 53117
-     tx1_bytes: 4578963
-     tx1_csum_partial: 2708
-     tx1_mpwqe_blks: 53117
-     tx1_mpwqe_pkts: 53117
-     tx1_csum_none: 50409
-     tx1_cqes: 53117
-     tx2_packets: 40937
-     tx2_bytes: 3531930
-     tx2_csum_partial: 2849
-     tx2_mpwqe_blks: 40937
-     tx2_mpwqe_pkts: 40937
-     tx2_csum_none: 38088
-     tx2_cqes: 40937
-     tx3_packets: 27794
-     tx3_bytes: 2364233
-     tx3_csum_partial: 2649
-     tx3_mpwqe_blks: 27794
-     tx3_mpwqe_pkts: 27794
-     tx3_csum_none: 25145
-     tx3_cqes: 27794
-     tx4_packets: 36105
-     tx4_bytes: 3168073
-     tx4_csum_partial: 3800
-     tx4_mpwqe_blks: 36102
-     tx4_mpwqe_pkts: 36102
-     tx4_csum_none: 32305
-     tx4_cqes: 36105
-     tx5_packets: 37231
-     tx5_bytes: 3269432
-     tx5_csum_partial: 4123
-     tx5_mpwqe_blks: 37229
-     tx5_mpwqe_pkts: 37229
-     tx5_csum_none: 33108
-     tx5_cqes: 37231
-     tx0_xsk_xmit: 1229776430
-     tx0_xsk_mpwqe: 209727087
-     tx0_xsk_inlnw: 16031405
-     tx0_xsk_cqes: 194588394
-     tx1_xsk_xmit: 1210315904
-     tx1_xsk_mpwqe: 203225166
-     tx1_xsk_inlnw: 15946847
-     tx1_xsk_cqes: 188158054
+     rx5_xsk_buff_alloc_err: 2373
+     tx0_packets: 61696
+     tx0_bytes: 5343416
+     tx0_csum_partial: 3107
+     tx0_mpwqe_blks: 61695
+     tx0_mpwqe_pkts: 61695
+     tx0_csum_none: 58589
+     tx0_cqes: 61696
+     tx1_packets: 54394
+     tx1_bytes: 4704184
+     tx1_csum_partial: 3158
+     tx1_mpwqe_blks: 54394
+     tx1_mpwqe_pkts: 54394
+     tx1_csum_none: 51236
+     tx1_cqes: 54394
+     tx2_packets: 42436
+     tx2_bytes: 3679582
+     tx2_csum_partial: 3339
+     tx2_mpwqe_blks: 42436
+     tx2_mpwqe_pkts: 42436
+     tx2_csum_none: 39097
+     tx2_cqes: 42436
+     tx3_packets: 30421
+     tx3_bytes: 2568480
+     tx3_csum_partial: 3148
+     tx3_mpwqe_blks: 30421
+     tx3_mpwqe_pkts: 30421
+     tx3_csum_none: 27273
+     tx3_cqes: 30421
+     tx4_packets: 38117
+     tx4_bytes: 3361763
+     tx4_csum_partial: 4337
+     tx4_mpwqe_blks: 38114
+     tx4_mpwqe_pkts: 38114
+     tx4_csum_none: 33780
+     tx4_cqes: 38117
+     tx5_packets: 39183
+     tx5_bytes: 3459847
+     tx5_csum_partial: 4732
+     tx5_mpwqe_blks: 39181
+     tx5_mpwqe_pkts: 39181
+     tx5_csum_none: 34451
+     tx5_cqes: 39183
+     tx0_xsk_xmit: 1593424669
+     tx0_xsk_mpwqe: 230699392
+     tx0_xsk_inlnw: 22235430
+     tx0_xsk_cqes: 209892863
+     tx1_xsk_xmit: 1560071414
+     tx1_xsk_mpwqe: 223934224
+     tx1_xsk_inlnw: 22003731
+     tx1_xsk_cqes: 203425951
      tx1_xdp_xmit: 17
      tx1_xdp_mpwqe: 14
      tx1_xdp_cqes: 14
-     tx2_xsk_xmit: 1214401578
-     tx2_xsk_mpwqe: 169819205
-     tx2_xsk_inlnw: 20108030
-     tx2_xsk_cqes: 153288575
-     tx3_xsk_xmit: 1238063232
-     tx3_xsk_mpwqe: 194872619
-     tx3_xsk_inlnw: 15235119
-     tx3_xsk_cqes: 178584164
+     tx2_xsk_xmit: 1587022868
+     tx2_xsk_mpwqe: 192747614
+     tx2_xsk_inlnw: 27944811
+     tx2_xsk_cqes: 170242473
+     tx3_xsk_xmit: 1604538163
+     tx3_xsk_mpwqe: 216716019
+     tx3_xsk_inlnw: 22602987
+     tx3_xsk_cqes: 194549982
      tx3_xdp_xmit: 17
      tx3_xdp_mpwqe: 17
      tx3_xdp_cqes: 17
-     tx4_xsk_xmit: 278029117
-     tx4_xsk_mpwqe: 94988486
-     tx4_xsk_inlnw: 1843292
-     tx4_xsk_cqes: 92700950
+     tx4_xsk_xmit: 278038980
+     tx4_xsk_mpwqe: 94988869
+     tx4_xsk_inlnw: 1843420
+     tx4_xsk_cqes: 92701213
      tx5_xsk_xmit: 408918685
      tx5_xsk_mpwqe: 123238216
      tx5_xsk_inlnw: 2759269

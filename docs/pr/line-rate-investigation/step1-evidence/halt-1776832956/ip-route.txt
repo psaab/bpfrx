@@ -1,0 +1,5 @@
+default nhid 1206 via 172.16.50.1 dev ge-0-0-2.50 proto static metric 20 
+10.0.61.0/24 dev ge-0-0-1 proto kernel scope link src 10.0.61.1 
+10.255.192.40/30 dev gr-0-0-0 proto kernel scope link src 10.255.192.42 linkdown 
+172.16.50.0/24 dev ge-0-0-2.50 proto kernel scope link src 172.16.50.8 
+172.16.80.0/24 dev ge-0-0-2.80 proto kernel scope link src 172.16.80.8 
