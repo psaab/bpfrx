@@ -300,30 +300,59 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--evidence-root", required=True, type=Path)
     ap.add_argument("--output-summary", type=Path, default=None)
+    # #821: restrict cell iteration to a single key of POOL_BY_CELL for the
+    # step2 sister harness.  Strictly additive; default unset = no change
+    # (V8 non-regression).
+    ap.add_argument(
+        "--only-cell",
+        type=str,
+        default=None,
+        help=(
+            "Restrict iteration to a single POOL_BY_CELL key (e.g. "
+            "'with-cos/p5201-fwd'). Skips baseline gather + H-STOP-5 + "
+            "permutation classification + summary-table.csv; only writes "
+            "hist-blocks.jsonl for the selected cell."
+        ),
+    )
     args = ap.parse_args()
 
-    baselines: dict[str, list[dict]] = {}
-    for pool in ("fwd-no-cos", "fwd-with-cos", "rev-with-cos"):
-        blocks = gather_baseline(args.evidence_root, pool)
-        baselines[pool] = blocks
-        # H-STOP-5 (plan §11): require ≥ 3 of 5 baseline runs (≥ 36 blocks)
-        # per pool.  Emit the per-pool serialized blocks for reproducibility
-        # per plan §13 (evidence layout).
-        if len(blocks) < 36:
-            print(
-                f"ERROR: pool {pool} has only {len(blocks)} baseline blocks "
-                "(< 36 required per H-STOP-5); aborting classification",
-                file=sys.stderr,
+    if args.only_cell is not None:
+        if args.only_cell not in POOL_BY_CELL:
+            raise ValueError(
+                f"--only-cell {args.only_cell!r} not a key of POOL_BY_CELL "
+                f"(valid: {sorted(POOL_BY_CELL.keys())})"
             )
-            return 5
-        pool_out = args.evidence_root / "baseline" / pool / "baseline-blocks.jsonl"
-        pool_out.parent.mkdir(parents=True, exist_ok=True)
-        with pool_out.open("w") as f:
-            for blk in blocks:
-                f.write(json.dumps(blk) + "\n")
+        print(
+            "--only-cell: skipping baseline gather and permutation "
+            "classification (hist-blocks.jsonl only)",
+            file=sys.stderr,
+        )
+        cell_iter = [(args.only_cell, POOL_BY_CELL[args.only_cell])]
+        baselines: dict[str, list[dict]] = {}
+    else:
+        baselines = {}
+        for pool in ("fwd-no-cos", "fwd-with-cos", "rev-with-cos"):
+            blocks = gather_baseline(args.evidence_root, pool)
+            baselines[pool] = blocks
+            # H-STOP-5 (plan §11): require ≥ 3 of 5 baseline runs (≥ 36 blocks)
+            # per pool.  Emit the per-pool serialized blocks for reproducibility
+            # per plan §13 (evidence layout).
+            if len(blocks) < 36:
+                print(
+                    f"ERROR: pool {pool} has only {len(blocks)} baseline blocks "
+                    "(< 36 required per H-STOP-5); aborting classification",
+                    file=sys.stderr,
+                )
+                return 5
+            pool_out = args.evidence_root / "baseline" / pool / "baseline-blocks.jsonl"
+            pool_out.parent.mkdir(parents=True, exist_ok=True)
+            with pool_out.open("w") as f:
+                for blk in blocks:
+                    f.write(json.dumps(blk) + "\n")
+        cell_iter = list(POOL_BY_CELL.items())
 
     summary_rows = []
-    for rel_dir, pool in POOL_BY_CELL.items():
+    for rel_dir, pool in cell_iter:
         cell_dir = args.evidence_root / rel_dir
         if not cell_dir.is_dir():
             print(f"WARN: cell dir missing {cell_dir}", file=sys.stderr)
@@ -338,6 +367,11 @@ def main() -> int:
         with (cell_dir / "hist-blocks.jsonl").open("w") as f:
             for b in blocks:
                 f.write(json.dumps(b) + "\n")
+
+        if args.only_cell is not None:
+            # Skip permutation classification + summary-table when scoped
+            # to a single cell; step2 only needs hist-blocks.jsonl.
+            continue
 
         result = classify_cell(rel_dir, blocks, baselines.get(pool, []))
         with (cell_dir / "perm-test-results.json").open("w") as f:
@@ -369,6 +403,10 @@ def main() -> int:
                 "mode_bucket": result["exploratory"]["bucket_mode_index"],
             }
         )
+
+    if args.only_cell is not None:
+        # #821 §3.6: --only-cell skips summary-table.csv.
+        return 0
 
     if summary_rows:
         summary_path = args.output_summary or (

@@ -229,7 +229,12 @@ case "$COS" in
 esac
 
 log "capture cold flow_steer snapshot"
-echo "$PRE_STATUS" > "$OUTDIR/flow_steer_cold.json"
+# #821: stamp cold snapshot with _sample_ts so the step2 reducer can
+# anchor block boundaries to the same timeline as step1's warm samples.
+# Backward-compatible: existing consumers (step1-histogram-classify.py)
+# ignore unknown top-level fields.
+ts=$(date +%s)
+echo "$PRE_STATUS" | jq -c --arg ts "$ts" '. + {_sample_ts: $ts}' > "$OUTDIR/flow_steer_cold.json"
 
 log "capture cold NIC counters (ge-0-0-1, ge-0-0-2)"
 fw "ethtool -S ge-0-0-1 | grep -vE ' 0$' || true" > "$OUTDIR/nic-counters-cold-ge-0-0-1.txt"

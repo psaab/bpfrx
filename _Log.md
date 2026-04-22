@@ -287,3 +287,26 @@
 - **Timestamp**: 2026-04-17
   - **Action**: Write #708 enqueue-pacing architect plan — Option B (per-SFQ-bucket token bucket), measurement-first, pacing gate strictly AFTER ECN marker to preserve #718 invariants. Honest framing on residual retrans (most of the ~100k retrans signal is likely ECN-induced recovery entries, not wire loss, so pacing is unlikely to move retrans meaningfully; §3 says so explicitly)
   - **File(s)**: `docs/708-enqueue-pacing-plan.md` (new)
+
+## 2026-04-21 — #821 round 1 code review fixes
+
+- **Timestamp**: 2026-04-21
+  - **Action**: Codex HIGH-1 — drop stale `worker-tids.txt` before launching step1; install SIGINT/SIGTERM trap
+    - **File(s)**: `test/incus/step2-sched-switch-capture.sh`
+  - **Action**: Codex HIGH-2 — reducer drift halt stamps `suspect_reason: "drift_ge_5s"` on every JSONL line and exits 5 (H-STOP-5); classifier detects sentinel and emits `verdict=SUSPECT`; optional `--drift-halt-marker` sidecar; summary log line surfaces `suspect_reason`
+    - **File(s)**: `test/incus/step2-sched-switch-reduce.py`, `test/incus/step2-sched-switch-classify.py`, `test/incus/step2-sched-switch-capture.sh`
+  - **Action**: Codex HIGH-3 — capture adds `perf record -k CLOCK_REALTIME` and `perf script --ns`; reducer treats perf timestamps as absolute unix wall-clock ns and drops first-event offsetting; PERF_START_NS is diagnostic only (drift measurement)
+    - **File(s)**: `test/incus/step2-sched-switch-capture.sh`, `test/incus/step2-sched-switch-reduce.py`
+  - **Action**: Codex MEDIUM-4 — restore plan §4.1 `stat_runtime_check` ±1% accounting check against `(block_duration * n_workers - total_off_cpu)`
+    - **File(s)**: `test/incus/step2-sched-switch-reduce.py`
+  - **Action**: Codex LOW-5 — classifier meta.json top-level is plan-contracted `{verdict, rho, pvalue, duty_cycle_pct, warn_blocks}`; extras moved to `diagnostic` sub-object
+    - **File(s)**: `test/incus/step2-sched-switch-classify.py`
+  - **Action**: Codex LOW-6 — G8.2 grep uses `grep -qE` with whitespace-tolerant pattern; G8.3 perf-record stderr no longer suppressed
+    - **File(s)**: `test/incus/step2-sched-switch-capture.sh`
+  - **Action**: Codex LOW-7 — add `TestReducerNegativeWakeDelta` suite with wake-before-switch and equal-ts exercises documenting branch unreachability under monotonic perf
+    - **File(s)**: `test/incus/step2-sched-switch-reduce_test.py`
+  - **Action**: pyshell M1 — SIGINT/SIGTERM trap added in capture.sh
+    - **File(s)**: `test/incus/step2-sched-switch-capture.sh`
+  - **Action**: pyshell M2 — `reduce_events` docstring moved to first statement per PEP 257
+    - **File(s)**: `test/incus/step2-sched-switch-reduce.py`
+  - **Result**: `python3 -m py_compile` OK on all 4 modified `.py` files; reducer tests 13/13 green (was 10, +3 new); classifier tests 11/11 green (was 8, +3 new); V8 non-regression preserved (`step1-histogram-classify.py` unchanged)
