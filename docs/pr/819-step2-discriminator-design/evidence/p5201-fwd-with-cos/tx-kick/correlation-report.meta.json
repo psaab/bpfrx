@@ -1,0 +1,19 @@
+{
+  "cell": "p5201-fwd-with-cos",
+  "verdict": "INCONCLUSIVE",
+  "rho_retry": null,
+  "pvalue_retry": null,
+  "rho_kick": -0.7342657342657343,
+  "pvalue_kick": 0.006543490146837884,
+  "elevated_threshold_T_D1": 0.9992244568089274,
+  "elevated_blocks": [
+    1,
+    10,
+    11
+  ],
+  "max_retry_count_delta_in_elevated": 0,
+  "max_kick_latency_mean_ns_in_elevated": 4417.241218895376,
+  "T1_in_witness_block": null,
+  "T1_out_holds": false,
+  "block_count_no_kick": 0
+}

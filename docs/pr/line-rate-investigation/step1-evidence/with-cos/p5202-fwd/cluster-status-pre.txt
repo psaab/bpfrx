@@ -6,9 +6,9 @@ Monitor Failure codes:
 Cluster ID: 22
 Node name: node0
 
-Software version: userspace-forwarding-ok-20260402-bfb00432-660-g75a90298
+Software version: userspace-forwarding-ok-20260402-bfb00432-754-gf7c57c3b
 HA protocol version: 1
-Peer software version: userspace-forwarding-ok-20260402-bfb00432-660-g75a90298
+Peer software version: userspace-forwarding-ok-20260402-bfb00432-754-gf7c57c3b
 Peer HA protocol version: 1
 
 Node   Priority Status         Preempt  Manual   Monitor-failures

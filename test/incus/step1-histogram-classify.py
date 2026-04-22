@@ -98,6 +98,83 @@ def sum_per_binding_hist(snap: dict) -> tuple[np.ndarray, int, int, int]:
     return hist, count, sum_ns, tx_packets
 
 
+# #827 P3 kick-field aggregation. Sole source of truth for per-block
+# kick deltas (the step3 classifier reads the emitted hist-blocks
+# fields and never re-opens raw snapshots).
+KICK_REQUIRED_KEYS = (
+    "tx_kick_latency_hist",
+    "tx_kick_latency_count",
+    "tx_kick_latency_sum_ns",
+    "tx_kick_retry_count",
+)
+
+
+def sum_per_binding_kick(
+    snap: dict, snap_index: int
+) -> tuple[np.ndarray, int, int, int]:
+    """Aggregate per-binding kick counters into cell-level totals.
+
+    Returns (kick_hist, kick_count, kick_sum_ns, kick_retry).
+
+    Enforces K0 (non-vacuous wire-regression guard, #827 plan §4.2):
+      (i) `len(per_binding) >= 1` — empty snapshots rejected.
+      (ii) every entry has all four `tx_kick_*` keys — pre-#826
+           evidence or silent-zero-from-serde(default) rejected.
+
+    Enforces K1 (per-snapshot histogram coherence): sum of kick
+    buckets equals `tx_kick_latency_count` for each binding AND
+    cell-level. Mirror of I13.
+    """
+    status = snap.get("status", snap)
+    per_binding = status.get("per_binding") or status.get("bindings") or []
+    # K0 (i) — empty snapshot.
+    if len(per_binding) < 1:
+        raise ValueError(
+            f"snap[{snap_index}] has empty per_binding — either the daemon "
+            f"exported no bindings or the snapshot was truncated"
+        )
+    hist = np.zeros(16, dtype=np.int64)
+    count = 0
+    sum_ns = 0
+    retry = 0
+    for bi, b in enumerate(per_binding):
+        # K0 (ii) — missing key guard. Use explicit membership check
+        # rather than .get(..., 0) so that pre-#826 evidence fails loud
+        # instead of yielding silent zeros.
+        for key in KICK_REQUIRED_KEYS:
+            if key not in b:
+                raise ValueError(
+                    f"snap[{snap_index}] binding[{bi}] missing key "
+                    f"{key!r} — evidence is pre-#826 / wire regression"
+                )
+        bh = b["tx_kick_latency_hist"] or [0] * 16
+        if len(bh) != 16:
+            raise ValueError(
+                f"snap[{snap_index}] binding[{bi}] tx_kick_latency_hist "
+                f"length {len(bh)}, expected 16 — wire format regression"
+            )
+        bh_arr = np.asarray(bh, dtype=np.int64)
+        b_count = int(b["tx_kick_latency_count"])
+        # K1 per-binding.
+        if bh_arr.sum() != b_count:
+            raise ValueError(
+                f"K1 violation: snap[{snap_index}] binding[{bi}] "
+                f"sum(tx_kick_latency_hist)={bh_arr.sum()} != "
+                f"tx_kick_latency_count={b_count}"
+            )
+        hist += bh_arr
+        count += b_count
+        sum_ns += int(b["tx_kick_latency_sum_ns"])
+        retry += int(b["tx_kick_retry_count"])
+    # K1 cell-level.
+    if hist.sum() != count:
+        raise ValueError(
+            f"K1 violation: snap[{snap_index}] cell-level "
+            f"sum(tx_kick_latency_hist)={hist.sum()} != count={count}"
+        )
+    return hist, count, sum_ns, retry
+
+
 def load_snapshots(cell_dir: Path) -> list[dict]:
     cold_path = cell_dir / "flow_steer_cold.json"
     samples_path = cell_dir / "flow_steer_samples.jsonl"
@@ -124,14 +201,59 @@ def compute_blocks(snaps: list[dict]) -> list[dict]:
     BEFORE any delta is taken, so a compensating corruption across
     snapshots cannot sneak past a delta-only check.  Here we only
     compute arithmetic deltas on already-validated aggregates.
+
+    #827 P3 extension: also aggregates kick counters per snapshot via
+    `sum_per_binding_kick` (which enforces K0 + K1) and cross-snapshot
+    monotonicity (K3) pre-delta. K2 is enforced below alongside the
+    submit-side §9 guard. Step1 is the sole writer of the per-block
+    `tx_kick_*_delta` fields consumed by `step3-tx-kick-classify.py`.
     """
     aggregated = [sum_per_binding_hist(s) for s in snaps]
-    # §9 "count == 0 despite substantial tx_packets" H-STOP branch.
+    kick_aggregated = [sum_per_binding_kick(s, i) for i, s in enumerate(snaps)]
+    # §9 "count == 0 despite substantial tx_packets" H-STOP branch (submit side).
     for i, (_h, c, _s, txp) in enumerate(aggregated):
         if c == 0 and txp > 10_000:
             raise ValueError(
                 f"snapshot {i}: tx_submit_latency_count=0 but tx_packets={txp} "
                 "— #813 wire regression (plan §9)"
+            )
+    # #827 K2 — kick-side analog of the submit-side §9 guard.
+    for i, ((_h, c, _s, _r), (_sh, _sc, _ss, txp)) in enumerate(
+        zip(kick_aggregated, aggregated)
+    ):
+        if c == 0 and txp > 10_000:
+            raise ValueError(
+                f"K2 violation: snapshot {i} tx_kick_latency_count=0 but "
+                f"tx_packets={txp} — #826 wire regression"
+            )
+    # #827 K3 — cross-snapshot monotonicity on cumulative kick counters.
+    # Catches daemon restarts, counter resets, and corruption that would
+    # otherwise cancel inside an arithmetic delta. Enforced pre-delta.
+    for i in range(1, len(kick_aggregated)):
+        h_prev, c_prev, s_prev, r_prev = kick_aggregated[i - 1]
+        h_cur, c_cur, s_cur, r_cur = kick_aggregated[i]
+        if c_cur < c_prev:
+            raise ValueError(
+                f"K3 violation: non-monotonic tx_kick_latency_count "
+                f"between snap[{i - 1}]={c_prev} and snap[{i}]={c_cur}"
+            )
+        if s_cur < s_prev:
+            raise ValueError(
+                f"K3 violation: non-monotonic tx_kick_latency_sum_ns "
+                f"between snap[{i - 1}]={s_prev} and snap[{i}]={s_cur}"
+            )
+        if r_cur < r_prev:
+            raise ValueError(
+                f"K3 violation: non-monotonic tx_kick_retry_count "
+                f"between snap[{i - 1}]={r_prev} and snap[{i}]={r_cur}"
+            )
+        bucket_diff = h_cur - h_prev
+        if np.any(bucket_diff < 0):
+            bad = int(np.argmin(bucket_diff))
+            raise ValueError(
+                f"K3 violation: non-monotonic tx_kick_latency_hist[{bad}] "
+                f"between snap[{i - 1}]={int(h_prev[bad])} and "
+                f"snap[{i}]={int(h_cur[bad])}"
             )
     blocks = []
     for b in range(12):
@@ -144,6 +266,8 @@ def compute_blocks(snaps: list[dict]) -> list[dict]:
             shape = buckets_delta.astype(np.float64) / count_delta
         else:
             shape = np.zeros(16, dtype=np.float64)
+        kh0, kc0, ks0, kr0 = kick_aggregated[b]
+        kh1, kc1, ks1, kr1 = kick_aggregated[b + 1]
         blocks.append(
             {
                 "b": b,
@@ -151,6 +275,10 @@ def compute_blocks(snaps: list[dict]) -> list[dict]:
                 "buckets": [int(x) for x in buckets_delta],
                 "shape": [float(x) for x in shape],
                 "tx_packets_delta": int(tx_packets_delta),
+                "tx_kick_count_delta": int(kc1 - kc0),
+                "tx_kick_sum_ns_delta": int(ks1 - ks0),
+                "tx_kick_retry_delta": int(kr1 - kr0),
+                "tx_kick_hist_delta": [int(x) for x in (kh1 - kh0)],
             }
         )
     return blocks

@@ -1,0 +1,200 @@
+Apr 22 04:36:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:09.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:36:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:09.821Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:36:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:09.919Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:36:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:10.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:36:16 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:16.026Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:36:21 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:21.025Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=5
+Apr 22 04:36:22 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:22.247Z level=INFO msg="cluster sync: sweep synced sessions" count=11
+Apr 22 04:36:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:24.305Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:36:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:24.829Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:36:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:24.926Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:36:26 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:26.050Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:36:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:31.062Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=5
+Apr 22 04:36:36 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:36.053Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:36:37 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:37.464Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:36:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:39.295Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:36:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:39.861Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:36:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:39.984Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:36:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:40.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:36:41 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:41.042Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=4
+Apr 22 04:36:46 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:46.059Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=4
+Apr 22 04:36:51 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:51.066Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:36:52 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:52.572Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:36:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:54.299Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:36:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:54.819Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:36:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:54.915Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:36:56 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:36:56.039Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=3
+Apr 22 04:37:01 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:01.064Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:37:06 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:06.053Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=3
+Apr 22 04:37:07 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:07.671Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:37:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:09.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:37:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:09.844Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:37:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:09.950Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:37:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:10.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:37:22 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:22.834Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:37:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:24.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:37:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:24.862Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:37:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:24.976Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:37:26 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:26.041Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:37:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:31.033Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=3
+Apr 22 04:37:37 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:37.979Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:37:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:39.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:37:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:39.852Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:37:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:39.950Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:37:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:40.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:37:41 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:41.031Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=3
+Apr 22 04:37:46 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:46.030Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:37:51 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:51.036Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=1
+Apr 22 04:37:53 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:53.112Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:37:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:54.295Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:37:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:54.844Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:37:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:54.955Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:37:56 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:37:56.058Z level=INFO msg="userspace: reconciliation drain caught missed deltas" count=2
+Apr 22 04:38:08 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:08.289Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:38:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:09.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:38:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:09.828Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:38:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:09.927Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:38:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:10.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:38:23 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:23.487Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:38:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:24.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:38:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:24.839Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:38:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:24.939Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:38:38 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:38.651Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:38:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:39.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:38:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:39.860Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:38:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:39.998Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:38:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:40.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:38:53 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:53.806Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:38:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:54.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:38:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:54.858Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:38:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:38:54.962Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:39:08 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:08.953Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:39:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:09.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:39:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:09.834Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:39:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:09.939Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:39:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:10.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:39:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:24.108Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:39:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:24.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:39:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:24.843Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:39:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:24.971Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:39:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:39.274Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:39:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:39.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:39:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:39.822Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:39:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:39.915Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:39:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:40.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:39:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:54.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:39:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:54.439Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:39:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:54.826Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:39:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:39:54.929Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:40:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:09.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:40:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:09.599Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:40:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:09.848Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:40:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:09.944Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:40:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:10.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:40:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:24.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:40:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:24.762Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:40:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:24.822Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:40:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:24.948Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:40:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:39.296Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:40:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:39.843Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:40:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:39.949Z level=INFO msg="cluster sync: sweep synced sessions" count=12
+Apr 22 04:40:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:39.962Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:40:40 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:40.806Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:40:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:54.304Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:40:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:54.831Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:40:54 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:54.958Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:40:55 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:40:55.100Z level=INFO msg="cluster sync: sweep synced sessions" count=22
+Apr 22 04:41:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:09.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:41:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:09.819Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:41:09 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:09.936Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:41:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:10.251Z level=INFO msg="cluster sync: sweep synced sessions" count=22
+Apr 22 04:41:10 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:10.805Z level=INFO msg="cluster: fabric_fwd updated" interface=ge-0-0-0 ifindex=4 fib_ifindex=4 local_mac="\x10fj\xfe\xd9U" peer_mac="\x10fj?g`"
+Apr 22 04:41:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:24.295Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:41:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:24.845Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=92
+Apr 22 04:41:24 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:24.955Z level=INFO msg="cluster: neighbor cache warmup complete" ipv4_hosts=12 ipv6_hosts=5
+Apr 22 04:41:25 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:25.407Z level=INFO msg="cluster sync: sweep synced sessions" count=22
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.218Z level=INFO msg="interface bound to VRF" interface=gr-0-0-0 vrf=vrf-sfmix
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.221Z level=INFO msg="interface bound to VRF" interface=fxp0 vrf=vrf-mgmt
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.222Z level=INFO msg="interface bound to VRF" interface=em0 vrf=vrf-mgmt
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.222Z level=INFO msg="interface bound to VRF" interface=fab0 vrf=vrf-mgmt
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.222Z level=INFO msg="interface bound to VRF" interface=fab1 vrf=vrf-mgmt
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.222Z level=INFO msg="mgmt VRF default route installed" interface=fxp0 gw=10.136.126.1 table=999
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.269Z level=INFO msg="tunnel removed" name=gr-0-0-0
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.272Z level=INFO msg="tunnel anchor created" name=gr-0-0-0 mode=tun
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.309Z level=INFO msg="bond removed" name=fab1
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.310Z level=WARN msg="bond member not found" bond=fab1 member=ge-7/0/0 linux=ge-7-0-0 err="Link not found"
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.310Z level=INFO msg="bond created" name=fab1 mode=active-backup members=[ge-7/0/0]
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.342Z level=INFO msg="fabric IPVLAN: removed stale address" name=fab0 addr=fe80::1066:6a00:1fe:d955/64
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.342Z level=INFO msg="host-inbound-traffic compiled" zone=sfmix flags=0x2
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.343Z level=INFO msg="skipping tx_port for tunnel interface" name=gr-0-0-0 ifindex=1815
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.347Z level=INFO msg="skipping TC for tunnel interface" name=gr-0-0-0 ifindex=1815
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.348Z level=INFO msg="zone interface configured" zone=sfmix interface=gr-0/0/0.0 phys_ifindex=1815 vlan_id=0 zone_id=4
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.348Z level=INFO msg="host-inbound-traffic compiled" zone=lan flags=0x100003
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.359Z level=INFO msg="zone interface configured" zone=lan interface=reth1 phys_ifindex=5 vlan_id=0 zone_id=2
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.359Z level=INFO msg="host-inbound-traffic compiled" zone=mgmt flags=0x3
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.366Z level=INFO msg="zone interface configured" zone=mgmt interface=fxp0 phys_ifindex=2 vlan_id=0 zone_id=3
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.367Z level=INFO msg="host-inbound-traffic compiled" zone=control flags=0xffffffff
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.374Z level=INFO msg="zone interface configured" zone=control interface=em0 phys_ifindex=3 vlan_id=0 zone_id=1
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.380Z level=INFO msg="zone interface configured" zone=control interface=fab0 phys_ifindex=4 vlan_id=0 zone_id=1
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.385Z level=INFO msg="zone interface configured" zone=control interface=fab1 phys_ifindex=1816 vlan_id=0 zone_id=1
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.385Z level=INFO msg="host-inbound-traffic compiled" zone=wan flags=0x300002
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.385Z level=INFO msg="VLAN sub-interface configured" parent=ge-0-0-2 vlan_id=50 sub_ifindex=13 zone=wan
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.395Z level=INFO msg="zone interface configured" zone=wan interface=reth0.50 phys_ifindex=6 vlan_id=50 zone_id=5
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.395Z level=INFO msg="VLAN sub-interface configured" parent=ge-0-0-2 vlan_id=80 sub_ifindex=14 zone=wan
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.395Z level=INFO msg="zone interface configured" zone=wan interface=reth0.80 phys_ifindex=6 vlan_id=80 zone_id=5
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.396Z level=INFO msg="recovered RETH original kernel name" iface=ge-0-0-2 originalName=enp9s0f0
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.396Z level=INFO msg="recovered RETH original kernel name" iface=ge-0-0-1 originalName=enp8s0f0
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.396Z level=INFO msg="deleted stale iface_zone entries" count=2
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.413Z level=INFO msg="SNAT egress IP set" interface=reth0.50 ifindex=6 vlan=50 v4=172.16.50.8 v6=2001:559:8585:50::8
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.413Z level=INFO msg="SNAT egress IP set" interface=reth0.80 ifindex=6 vlan=80 v4=172.16.80.8 v6=2001:559:8585:80::8
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.413Z level=INFO msg="source NAT rule compiled" rule-set=lan-to-wan rule=snat from=lan to=wan pool_id=0 rule_idx=0 counter_id=1 src_addr_id=1 dst_addr_id=0 src_addr=0.0.0.0/0 dst_addr=""
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.413Z level=INFO msg="source NAT v6 rule compiled" rule-set=lan-to-wan rule=snat from=lan to=wan pool_id=0 rule_idx=0 counter_id=1 src_addr_id=1 dst_addr_id=0 src_addr=0.0.0.0/0 dst_addr=""
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.413Z level=INFO msg="SNAT egress IP set" interface=reth0.50 ifindex=6 vlan=50 v4=172.16.50.8 v6=2001:559:8585:50::8
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.413Z level=INFO msg="SNAT egress IP set" interface=reth0.80 ifindex=6 vlan=80 v4=172.16.80.8 v6=2001:559:8585:80::8
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.413Z level=INFO msg="source NAT rule compiled" rule-set=lan-to-wan rule=snat6 from=lan to=wan pool_id=1 rule_idx=1 counter_id=2 src_addr_id=2 dst_addr_id=0 src_addr=::/0 dst_addr=""
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.413Z level=INFO msg="source NAT v6 rule compiled" rule-set=lan-to-wan rule=snat6 from=lan to=wan pool_id=1 rule_idx=1 counter_id=2 src_addr_id=2 dst_addr_id=0 src_addr=::/0 dst_addr=""
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.414Z level=INFO msg="SNAT egress IP set" interface=gr-0/0/0.0 ifindex=1815 vlan=0 v4=10.255.192.42 v6=""
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.414Z level=INFO msg="source NAT rule compiled" rule-set=lan-to-sfmix rule=snat from=lan to=sfmix pool_id=2 rule_idx=0 counter_id=3 src_addr_id=1 dst_addr_id=0 src_addr=0.0.0.0/0 dst_addr=""
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.735Z level=INFO msg="default policy compiled" action=deny-all
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.735Z level=INFO msg="compiled firewall filter" name=bandwidth-output family=inet terms=4 rules=4 filter_id=0
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.735Z level=INFO msg="compiled firewall filter" name=sfmix-pbr family=inet terms=2 rules=2 filter_id=1
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.735Z level=INFO msg="compiled firewall filter" name=bandwidth-output family=inet6 terms=4 rules=4 filter_id=2
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.735Z level=INFO msg="assigned filter to interface" interface=ge-0-0-1 vlan=0 family=inet filter=sfmix-pbr
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.735Z level=INFO msg="assigned output filter to interface" interface=ge-0-0-2 vlan=80 family=inet filter=bandwidth-output
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.735Z level=INFO msg="assigned output filter to interface" interface=ge-0-0-2 vlan=80 family=inet6 filter=bandwidth-output
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.736Z level=INFO msg="flow config compiled" tcp_mss_ipsec=0 tcp_mss_gre_in=0 tcp_mss_gre_out=0 allow_dns_reply=1 allow_embedded_icmp=1 tcp_flags=0 app_flags=0 lo0_filter_v4=65535 lo0_filter_v6=65535
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.736Z level=INFO msg="bumped FIB generation counter" generation=1
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.736Z level=INFO msg="config compiled to dataplane" zones=5 addresses=2 applications=0 policy_sets=2
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.744Z level=INFO msg="attached TC egress program" ifindex=2
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.760Z level=INFO msg="attached TC egress program" ifindex=3
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.768Z level=INFO msg="attached TC egress program" ifindex=1816
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.769Z level=INFO msg="attached XDP program" ifindex=2 mode=native
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.769Z level=INFO msg="attached XDP program" ifindex=3 mode=native
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.769Z level=INFO msg="attached XDP program" ifindex=1816 mode=native
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.769Z level=INFO msg="attached XDP program" ifindex=1815 mode=generic
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.820Z level=INFO msg="detached XDP program" ifindex=3
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.821Z level=INFO msg="detached XDP program" ifindex=1816
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.821Z level=INFO msg="detached XDP program" ifindex=1815
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.821Z level=INFO msg="detached XDP program" ifindex=2
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.840Z level=INFO msg="detached TC egress program" ifindex=2
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.856Z level=INFO msg="detached TC egress program" ifindex=3
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.872Z level=INFO msg="detached TC egress program" ifindex=1816
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.873Z level=INFO msg="tuned socket buffer for AF_XDP" path=/proc/sys/net/core/rmem_default from=16777216 to=67108864
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:31.873Z level=INFO msg="tuned socket buffer for AF_XDP" path=/proc/sys/net/core/rmem_max from=16777216 to=67108864
+Apr 22 04:41:31 xpf-userspace-fw0 xpfd[501427]: CTRL_REQ: apply_snapshot generation=2 fib_generation=1 forwarding_armed_before=true
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.016Z level=INFO msg="re-disabled VLAN RX offload after RETH MAC" interface=ge-0-0-2
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.018Z level=INFO msg="removed auto link-local from RETH member" iface=ge-0-0-1 addr=fe80::bf:72ff:fe16:200
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.020Z level=INFO msg="re-disabled VLAN RX offload after RETH MAC" interface=ge-0-0-1
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.021Z level=INFO msg="interface bound to VRF" interface=fxp0 vrf=vrf-mgmt
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.022Z level=INFO msg="interface bound to VRF" interface=em0 vrf=vrf-mgmt
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.022Z level=INFO msg="interface bound to VRF" interface=fab0 vrf=vrf-mgmt
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.024Z level=INFO msg="interface bound to VRF" interface=fab1 vrf=vrf-mgmt
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.024Z level=INFO msg="cluster: restarting heartbeat after VRF rebind" local=10.99.12.1 peer=10.99.12.2 vrf=vrf-mgmt
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.024Z level=INFO msg="cluster: heartbeat started" local=10.99.12.1 peer=10.99.12.2 interval=200ms threshold=5
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.025Z level=INFO msg="FRR config written" path=/etc/frr/frr.conf
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.618Z level=INFO msg="FRR config loaded via vtysh"
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.619Z level=INFO msg="PBR rule added" instance=sfmix tos=0 src="" dst=10.255.192.40/30 table=100
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.642Z level=INFO msg="swanctl config reloaded"
+Apr 22 04:41:32 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:32.691Z level=INFO msg="cluster sync: config sent to peer" size=13630
+Apr 22 04:41:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:39.297Z level=INFO msg="proactive neighbor resolution" resolving=1 total_targets=5
+Apr 22 04:41:39 xpf-userspace-fw0 xpfd[501375]: time=2026-04-22T04:41:39.814Z level=INFO msg="preinstalled kernel neighbor entries from snapshot" count=100
