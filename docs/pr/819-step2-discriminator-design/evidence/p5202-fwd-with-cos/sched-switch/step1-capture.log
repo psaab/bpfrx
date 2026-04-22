@@ -1,0 +1,13 @@
+[19:12:51] drain in-flight iperf3 on loss:xpf-userspace-fw0 and loss:cluster-userspace-host
+[19:12:51] capture cluster-state snapshot (pre)
+[19:12:52] verify live CoS state matches requested COS=with-cos
+[19:12:52] capture cold flow_steer snapshot
+[19:12:52] capture cold NIC counters (ge-0-0-1, ge-0-0-2)
+[19:12:52] capture CoS shaper state
+[19:12:53] start pinned ICMP probes (small + large) on loss:cluster-userspace-host
+[19:12:53] launch iperf3 -c -P 16 -t 60 -p 5202 
+[19:12:54] launch concurrent mpstat + perf stat + samplers (60 s)
+[19:12:54] STEP1_SKIP_PERF_STAT=1 — skipping perf stat (composed-harness mode)
+[19:13:55] retrieve during-run artifacts
+[19:13:56] capture post-run snapshots
+[19:13:57] all invariants PASS — cell valid; verdict classification deferred to post-run analysis

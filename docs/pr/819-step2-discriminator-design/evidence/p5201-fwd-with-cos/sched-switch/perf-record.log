@@ -1,0 +1,4 @@
+Lowering default frequency rate from 4000 to 3000.
+Please consider tweaking /proc/sys/kernel/perf_event_max_sample_rate.
+[ perf record: Woken up 163 times to write data ]
+[ perf record: Captured and wrote 41.065 MB /tmp/sched-switch.perf.data (181932 samples) ]
