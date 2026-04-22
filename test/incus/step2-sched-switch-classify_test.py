@@ -216,24 +216,37 @@ class TestClassifyVerdicts(unittest.TestCase):
 
 class TestClassifyMetaSchema(unittest.TestCase):
     def test_meta_json_schema(self):
+        """LOW-5: top-level keys are the plan §3.1 step 11 contract
+        ({verdict, rho, pvalue, duty_cycle_pct, warn_blocks}); extras
+        live under `diagnostic`.
+        """
         off_times = [int((b + 1) * 250_000_000) for b in range(12)]
         shape_vals = [float(b + 1) * 0.01 for b in range(12)]
         hist = _hist_blocks_with_shape3to6(shape_vals)
         off = _off_cpu_blocks(off_times)
         rc, meta = _run_classifier(hist, off, cell="slug/under/test")
         self.assertEqual(rc, 0)
-        required = [
-            "cell",
+        # Plan-contracted top-level keys — exact set.
+        top_level_required = [
             "verdict",
-            "reason",
             "rho",
             "pvalue",
             "duty_cycle_pct",
+            "warn_blocks",
+        ]
+        for k in top_level_required:
+            self.assertIn(k, meta, f"missing top-level key: {k}")
+        self.assertIn(meta["verdict"], ("IN", "OUT", "INCONCLUSIVE", "SUSPECT"))
+        # Diagnostic sub-object retains the extras for debugging.
+        self.assertIn("diagnostic", meta, "diagnostic sub-object missing")
+        diag = meta["diagnostic"]
+        diag_required = [
+            "cell",
+            "reason",
             "T_D1",
             "off_cpu_time_3to6",
             "voluntary_total_ns",
             "involuntary_total_ns",
-            "warn_blocks",
             "n_blocks",
             "rho_in",
             "rho_out",
@@ -241,13 +254,15 @@ class TestClassifyMetaSchema(unittest.TestCase):
             "duty_out_pct",
             "nominal_window_ns",
         ]
-        for k in required:
-            self.assertIn(k, meta, f"missing key: {k}")
-        self.assertEqual(meta["cell"], "slug/under/test")
-        self.assertEqual(meta["n_blocks"], 12)
-        self.assertEqual(len(meta["T_D1"]), 12)
-        self.assertEqual(len(meta["off_cpu_time_3to6"]), 12)
-        self.assertIn(meta["verdict"], ("IN", "OUT", "INCONCLUSIVE"))
+        for k in diag_required:
+            self.assertIn(k, diag, f"missing diagnostic key: {k}")
+        self.assertEqual(diag["cell"], "slug/under/test")
+        self.assertEqual(diag["n_blocks"], 12)
+        self.assertEqual(len(diag["T_D1"]), 12)
+        self.assertEqual(len(diag["off_cpu_time_3to6"]), 12)
+        # `suspect_reason` only present when the reducer flagged drift
+        # halt — this fixture has no drift, so it must be absent.
+        self.assertNotIn("suspect_reason", meta)
 
 
 class TestClassifyWarnAggregation(unittest.TestCase):
@@ -283,6 +298,77 @@ class TestVerdictHelper(unittest.TestCase):
         # rho=0.9, duty=0.5 -> OUT (low duty)
         v, _ = C.verdict_from(0.9, 0.5)
         self.assertEqual(v, "OUT")
+
+    def test_verdict_from_suspect_short_circuits(self):
+        """HIGH-2: suspect_reason short-circuits to SUSPECT regardless
+        of otherwise-valid rho/duty values.
+        """
+        v, reason = C.verdict_from(0.9, 5.0, suspect_reason="drift_ge_5s")
+        self.assertEqual(v, "SUSPECT")
+        self.assertIn("drift_ge_5s", reason)
+        # Even a low-duty capture flips to SUSPECT (drift dominates).
+        v, _ = C.verdict_from(0.9, 0.1, suspect_reason="drift_ge_5s")
+        self.assertEqual(v, "SUSPECT")
+        # And with rho=None.
+        v, _ = C.verdict_from(None, 50.0, suspect_reason="drift_ge_5s")
+        self.assertEqual(v, "SUSPECT")
+
+
+class TestClassifySuspectFromReducer(unittest.TestCase):
+    """HIGH-2: integration — reducer stamps `suspect_reason` on its
+    JSONL; classifier emits verdict=SUSPECT end-to-end.
+    """
+
+    def test_verdict_SUSPECT_when_reducer_marks_drift(self):
+        off_times = [int((b + 1) * 250_000_000) for b in range(12)]
+        shape_vals = [float(b + 1) * 0.01 for b in range(12)]
+        hist = _hist_blocks_with_shape3to6(shape_vals)
+        off = _off_cpu_blocks(off_times)
+        # Stamp suspect_reason on EVERY block (mirroring reducer output).
+        for blk in off:
+            blk["suspect_reason"] = "drift_ge_5s"
+        rc, meta = _run_classifier(hist, off)
+        self.assertEqual(rc, 0)
+        self.assertEqual(meta["verdict"], "SUSPECT")
+        self.assertEqual(meta.get("suspect_reason"), "drift_ge_5s")
+
+    def test_verdict_SUSPECT_from_drift_halt_marker(self):
+        """Optional `--drift-halt-marker` path: operator can force
+        SUSPECT out-of-band (e.g. capture harness detected the drift
+        halt before even running the classifier).
+        """
+        off_times = [int((b + 1) * 250_000_000) for b in range(12)]
+        shape_vals = [float(b + 1) * 0.01 for b in range(12)]
+        hist = _hist_blocks_with_shape3to6(shape_vals)
+        off = _off_cpu_blocks(off_times)
+        # Write a marker file.
+        marker_fd, marker_path = tempfile.mkstemp(suffix=".txt")
+        os.write(marker_fd, b"drift_ge_5s\n")
+        os.close(marker_fd)
+        h_path = _write_jsonl(hist)
+        o_path = _write_jsonl(off)
+        out_dir = Path(tempfile.mkdtemp())
+        out_md = out_dir / "correlation-report.md"
+        try:
+            rc = C.main(
+                [
+                    "--hist-blocks", str(h_path),
+                    "--off-cpu", str(o_path),
+                    "--cell", "test/cell",
+                    "--out", str(out_md),
+                    "--drift-halt-marker", marker_path,
+                ]
+            )
+            meta = json.loads(
+                (out_dir / "correlation-report.meta.json").read_text()
+            )
+        finally:
+            Path(marker_path).unlink()
+            h_path.unlink()
+            o_path.unlink()
+        self.assertEqual(rc, 0)
+        self.assertEqual(meta["verdict"], "SUSPECT")
+        self.assertEqual(meta.get("suspect_reason"), "drift_ge_5s")
 
 
 if __name__ == "__main__":

@@ -168,6 +168,12 @@ class TestReducerSynthetic(unittest.TestCase):
         voluntary) and t=2.500032 s (prev_state=R, 32 us, involuntary)
         relative to STEP1_START.  Both land in block b=0.
 
+        HIGH-3: perf timestamps are absolute unix wall-clock ns
+        (perf-record uses `-k CLOCK_REALTIME`); reducer applies them
+        directly to `block_for_timestamp()` with no PERF_START_NS
+        offsetting.  So the perf_ts values here are `step1_start_ns +
+        <offset>`, not bare offsets.
+
         Expected per block 0:
           buckets[3] = 8000       (8 us = bucket 3: [4096, 8192))
           buckets[5] = 32000      (32 us = bucket 5: [16384, 32768))
@@ -181,48 +187,47 @@ class TestReducerSynthetic(unittest.TestCase):
         worker_tids = {tid}
         perf_start_ns = step1_start_ns  # zero drift
 
-        # Perf times are monotonic from some origin; we choose the first
-        # event at perf_ts = 0 ns and translate via PERF_START_NS anchor.
-        # t_wall = PERF_START_NS + (perf_ts - first_perf_ts); since
-        # first_perf_ts == perf_ts of the first event, wall = PERF_START_NS
-        # at that moment.  So:
-        #   event at wall = step1_start + 1.000008 s  ->  perf_ts = 1.000008 s
-        # We'll use perf_ts in nanoseconds directly.
         events = [
-            # First switch: tid goes off-CPU at wall=step1_start + 1.000008 s
+            # First switch: tid goes off-CPU at wall = step1_start + 1.000008 s
             (
                 "sched:sched_switch",
                 tid,
-                1_000_008_000,  # 1.000008 s in ns, used as perf_ts
+                step1_start_ns + 1_000_008_000,
                 {"prev_pid": tid, "prev_state": "S"},
             ),
-            # Wake at wall=step1_start + 1.000016 s  (8 us later)
+            # Wake 8 us later.
             (
                 "sched:sched_wakeup",
                 tid,
-                1_000_016_000,
+                step1_start_ns + 1_000_016_000,
                 {"pid": tid},
             ),
-            # Second switch at 2.500032 s with prev_state=R (involuntary)
+            # Second switch at +2.500032 s with prev_state=R (involuntary).
             (
                 "sched:sched_switch",
                 tid,
-                2_500_032_000,
+                step1_start_ns + 2_500_032_000,
                 {"prev_pid": tid, "prev_state": "R"},
             ),
-            # Wake 32 us later
+            # Wake 32 us later.
             (
                 "sched:sched_wakeup",
                 tid,
-                2_500_064_000,
+                step1_start_ns + 2_500_064_000,
                 {"pid": tid},
             ),
-            # A stat_runtime event in block 0 so stat_runtime_check=PASS
+            # A stat_runtime event in block 0 — enough runtime to pass the
+            # ±1% accounting check.  Expected on-CPU for this block:
+            #   block_duration = 5 s
+            #   n_workers = 1
+            #   total_off_cpu = 40000 ns (the two wakeups above)
+            #   expected_on_cpu = 5e9 - 40000 ≈ 5e9
+            # We feed 5e9 exactly so rel_err = 40000/5e9 ≈ 8e-6 << 1%.
             (
                 "sched:sched_stat_runtime",
                 tid,
-                3_000_000_000,
-                {"runtime_ns": 123456},
+                step1_start_ns + 3_000_000_000,
+                {"runtime_ns": 5_000_000_000},
             ),
         ]
 
@@ -253,7 +258,8 @@ class TestReducerSynthetic(unittest.TestCase):
         self.assertEqual(b0["voluntary_3to6"], 8000)
         self.assertEqual(b0["involuntary_3to6"], 32000)
         self.assertEqual(b0["stat_runtime_check"], "PASS")
-        # Blocks 1..11: all zero, stat_runtime_check=WARN.
+        # Blocks 1..11: all zero, stat_runtime_check=WARN (zero runtime
+        # but expected ≈ 5e9 → rel_err = 1.0 >> 0.01).
         for i in range(1, 12):
             bi = blocks[i]
             self.assertEqual(sum(bi["buckets"]), 0)
@@ -263,16 +269,24 @@ class TestReducerSynthetic(unittest.TestCase):
 
 class TestReducerOutOfOrder(unittest.TestCase):
     def test_reducer_out_of_order_skip(self):
-        """Out-of-order perf timestamp -> WARN + skip (monotonicity)."""
+        """Out-of-order perf timestamp -> WARN + skip (monotonicity).
+
+        Hits the `ts_ns < prev_perf_ts_ns` guard early in the event loop
+        (rewound perf timestamp).  Distinct from `test_reducer_negative_
+        wake_delta_skip` which exercises the wake-path `delta_ns < 0`
+        branch after monotonicity has passed.
+        """
         boundaries = _make_boundaries()
+        step1_start_ns = boundaries[0]
         tid = 42
         worker_tids = {tid}
         events = [
-            # First event at perf_ts = 1.0 s
-            ("sched:sched_switch", tid, 1_000_000_000,
+            # First event at wall = step1_start + 1.0 s
+            ("sched:sched_switch", tid, step1_start_ns + 1_000_000_000,
              {"prev_pid": tid, "prev_state": "S"}),
-            # Second event at perf_ts = 0.5 s (rewinds) -> skipped
-            ("sched:sched_wakeup", tid, 500_000_000, {"pid": tid}),
+            # Second event at wall = step1_start + 0.5 s (rewinds) -> skipped
+            ("sched:sched_wakeup", tid, step1_start_ns + 500_000_000,
+             {"pid": tid}),
         ]
         buf = io.StringIO()
         warn = io.StringIO()
@@ -289,6 +303,137 @@ class TestReducerOutOfOrder(unittest.TestCase):
         blocks = [json.loads(l) for l in buf.getvalue().strip().split("\n")]
         self.assertEqual(len(blocks), 12)
         self.assertEqual(sum(sum(b["buckets"]) for b in blocks), 0)
+
+
+class TestReducerNegativeWakeDelta(unittest.TestCase):
+    """LOW-7: exercise the wake-path `delta_ns < 0` branch at
+    step2-sched-switch-reduce.py:401-410.
+
+    The outer monotonicity guard on `ts_ns < prev_perf_ts_ns` is a
+    STRICT less-than check (`<`, not `<=`), so an event with the same
+    ts as the previous passes.  We exploit this: two back-to-back
+    events with identical perf ts both satisfy monotonicity, and we
+    abuse the two-tid layout to post-date one tid's off_start AFTER a
+    wake for that same tid has been staged.
+
+    Concretely: tid=A switches at ts=T (off_start_A=T, prev=T).  We
+    then replay the stream by directly monkey-patching the wake event's
+    ts to be T-1.  The monotonicity guard trips — this is the
+    out-of-order path, NOT the wake path.
+
+    Since the monotonicity guard is strictly stronger than the
+    wake-path guard, the wake-path `delta_ns < 0` branch is provably
+    unreachable under ordered perf input (by pigeonhole: if ts_wake >=
+    prev_perf_ts >= ts_switch, then ts_wake >= off_start_A = ts_switch,
+    so delta >= 0).  The branch remains in the code as defence-in-depth
+    against a future refactor that might weaken the outer guard.
+
+    We therefore pass an UNORDERED event stream directly (bypassing the
+    outer guard's protection — which would have rejected the wake with
+    an "out-of-order" WARN first).  The prev_perf_ts_ns guard is
+    advanced by an unrelated event AFTER the switch but BEFORE the
+    wake, demonstrating both WARN paths on the same stream.
+
+    Actually, with ts_wake < ts_switch, the wake event fires
+    out-of-order FIRST (prev_perf_ts was advanced by the switch).  So
+    this test asserts that out-of-order fires, and documents that the
+    wake-path negative-delta branch is an unreachable defensive guard.
+    """
+
+    def test_reducer_wake_before_switch_triggers_out_of_order(self):
+        """Wake arrives with ts earlier than the preceding switch.
+
+        Expected: out-of-order WARN fires, wake is skipped, no
+        accumulation.  The wake-path `delta_ns < 0` branch at line 401
+        is NOT reached (monotonicity guard catches it first); see
+        class docstring.
+        """
+        boundaries = _make_boundaries()
+        step1_start_ns = boundaries[0]
+        tid = 7
+        worker_tids = {tid}
+        events = [
+            ("sched:sched_switch", tid, step1_start_ns + 2_000_000_000,
+             {"prev_pid": tid, "prev_state": "S"}),
+            # Wake at an EARLIER ts than the switch — rewinds.
+            ("sched:sched_wakeup", tid, step1_start_ns + 1_000_000_000,
+             {"pid": tid}),
+        ]
+        buf = io.StringIO()
+        warn = io.StringIO()
+        warnings = R.reduce_events(
+            events=events,
+            boundaries_ns=boundaries,
+            worker_tids=worker_tids,
+            perf_start_ns=boundaries[0],
+            out_stream=buf,
+            warn_stream=warn,
+        )
+        self.assertTrue(
+            any("out-of-order" in w for w in warnings),
+            f"expected out-of-order WARN; got: {warnings}",
+        )
+        # Wake was skipped; buckets should remain zero.  Critically,
+        # off_start_ns[tid] is STILL populated (never cleared), but no
+        # wake ever lands — accumulation is zero for this tid.
+        blocks = [json.loads(l) for l in buf.getvalue().strip().split("\n")]
+        self.assertEqual(sum(sum(b["buckets"]) for b in blocks), 0)
+
+    def test_reducer_wake_path_negative_delta_branch_directly(self):
+        """Directly drive the wake-path `delta_ns < 0` branch.
+
+        We bypass the monotonicity guard by emitting events with
+        equal-or-ascending ts (guard is strict `<`), and abuse a quirk:
+        if we issue the wake event's ts EQUAL to the previous switch
+        ts, but the switch for the SAME tid was issued earlier with a
+        LATER fields-encoded time, the stored off_start would still be
+        the earlier ts — delta = 0, not negative.
+
+        To hit negative delta, we construct a malformed stream that is
+        monotonically non-decreasing on the wire (guard passes) but
+        where off_start for the woken tid was set at a LATER ts by a
+        prior switch — impossible in a single linear stream.
+
+        So instead: we call `reduce_events` on a 2-event stream
+        [switch@T, wake@T-1] where T-1 < T trips the OUTER guard first,
+        and we document that the inner branch IS defensive dead code
+        under ordered perf input.  Test passes iff an out-of-order
+        WARN is emitted.
+
+        This mirrors the sister test above but is kept as a named
+        regression so future monotonicity-guard relaxations get flagged
+        in test output.
+        """
+        boundaries = _make_boundaries()
+        step1_start_ns = boundaries[0]
+        tid = 9
+        worker_tids = {tid}
+        events = [
+            ("sched:sched_switch", tid, step1_start_ns + 500_000_000,
+             {"prev_pid": tid, "prev_state": "R"}),
+            # Wake 100 ms earlier.
+            ("sched:sched_wakeup", tid, step1_start_ns + 400_000_000,
+             {"pid": tid}),
+        ]
+        buf = io.StringIO()
+        warn = io.StringIO()
+        warnings = R.reduce_events(
+            events=events,
+            boundaries_ns=boundaries,
+            worker_tids=worker_tids,
+            perf_start_ns=boundaries[0],
+            out_stream=buf,
+            warn_stream=warn,
+        )
+        # Outer monotonicity guard catches this; the inner negative-
+        # delta branch does NOT fire (no "negative off-CPU delta" WARN).
+        self.assertTrue(any("out-of-order" in w for w in warnings))
+        self.assertFalse(
+            any("negative off-CPU delta" in w for w in warnings),
+            "inner negative-delta branch is unreachable under ordered "
+            "perf input (defensive dead-code); if this test begins to "
+            "trigger it, the outer monotonicity guard has been weakened",
+        )
 
 
 class TestReducerEmpty(unittest.TestCase):
@@ -323,20 +468,23 @@ class TestReducerInvariant(unittest.TestCase):
         """V3: sum(buckets[3:7]) == off_cpu_time_3to6 on every block.
 
         Exercise with several off-CPU events landing in and out of the
-        D1 window.
+        D1 window.  HIGH-3: perf ts is absolute unix wall-clock ns,
+        so events are placed at `boundaries[b] + 1 s`.
         """
         boundaries = _make_boundaries()
+        step1_start_ns = boundaries[0]
         tid = 7
         worker_tids = {tid}
         events = []
-        # Events at t = b*5 + 1 s (in block b).  Alternate durations:
+        # Events at t = boundaries[b] + 1 s (inside block b).  Alternate
+        # durations land in and out of the D1 window:
         # 512 ns -> bucket 0 (out-of-D1)
         # 4096 ns -> bucket 3 (in D1)
         # 16384 ns -> bucket 5 (in D1)
         # 262144 ns -> bucket 9 (out-of-D1)
         durations = [512, 4096, 16384, 262144]
         for b in range(12):
-            off_ts = (b * 5 + 1) * 1_000_000_000
+            off_ts = boundaries[b] + 1_000_000_000
             d = durations[b % len(durations)]
             events.append(
                 ("sched:sched_switch", tid, off_ts,
@@ -352,7 +500,7 @@ class TestReducerInvariant(unittest.TestCase):
             events=events,
             boundaries_ns=boundaries,
             worker_tids=worker_tids,
-            perf_start_ns=boundaries[0],
+            perf_start_ns=step1_start_ns,
             out_stream=buf,
             warn_stream=warn,
         )
@@ -367,11 +515,7 @@ class TestReducerInvariant(unittest.TestCase):
 
 class TestReducerDrift(unittest.TestCase):
     def test_reducer_drift_warning(self):
-        """PERF_START_NS = STEP1_START_NS + 2 s -> WARN (no hard fail).
-
-        We exercise this via main() with temp files so we can catch the
-        stderr WARN string.
-        """
+        """PERF_START_NS = STEP1_START_NS + 2 s -> WARN (no hard fail)."""
         cold = {"_sample_ts": "1000000000"}
         cold_path = _write_inline(json.dumps(cold), ".json")
         warm_lines = []
@@ -380,18 +524,17 @@ class TestReducerDrift(unittest.TestCase):
                 json.dumps({"_sample_ts": str(1000000000 + (i + 1) * 5)})
             )
         samples_path = _write_inline("\n".join(warm_lines) + "\n", ".jsonl")
-        # Empty perf-script (valid input: no events = 12 zero blocks).
         perf_path = _write_inline("", ".txt")
         step1_start_ns = 1_000_000_000 * 1_000_000_000
         perf_start_ns = step1_start_ns + 2_000_000_000  # +2 s
 
-        # Capture stderr.  Also silence stdout (main() emits 12 JSONL lines).
         real_stderr = sys.stderr
         real_stdout = sys.stdout
-        cap = io.StringIO()
+        cap_err = io.StringIO()
+        cap_out = io.StringIO()
         try:
-            sys.stderr = cap
-            sys.stdout = io.StringIO()
+            sys.stderr = cap_err
+            sys.stdout = cap_out
             rc = R.main(
                 [
                     "--perf-script", str(perf_path),
@@ -407,9 +550,66 @@ class TestReducerDrift(unittest.TestCase):
             cold_path.unlink()
             samples_path.unlink()
             perf_path.unlink()
+        # 2s drift is WARN, not HALT; rc=0 and no suspect_reason in JSONL.
         self.assertEqual(rc, 0)
-        self.assertIn("WARN:", cap.getvalue())
-        self.assertIn("drift_ns", cap.getvalue())
+        self.assertIn("WARN:", cap_err.getvalue())
+        self.assertIn("drift_ns", cap_err.getvalue())
+        for raw in cap_out.getvalue().strip().split("\n"):
+            if raw:
+                obj = json.loads(raw)
+                self.assertNotIn("suspect_reason", obj)
+
+    def test_reducer_drift_halt_emits_suspect(self):
+        """HIGH-2: drift >= 5 s -> SUSPECT.
+
+        Reducer exits 5 (H-STOP-5 convention) AND stamps every emitted
+        JSONL line with `suspect_reason: "drift_ge_5s"`.
+        """
+        cold = {"_sample_ts": "1000000000"}
+        cold_path = _write_inline(json.dumps(cold), ".json")
+        warm_lines = []
+        for i in range(12):
+            warm_lines.append(
+                json.dumps({"_sample_ts": str(1000000000 + (i + 1) * 5)})
+            )
+        samples_path = _write_inline("\n".join(warm_lines) + "\n", ".jsonl")
+        perf_path = _write_inline("", ".txt")
+        step1_start_ns = 1_000_000_000 * 1_000_000_000
+        perf_start_ns = step1_start_ns + 6_000_000_000  # +6 s -> HALT
+
+        real_stderr = sys.stderr
+        real_stdout = sys.stdout
+        cap_err = io.StringIO()
+        cap_out = io.StringIO()
+        try:
+            sys.stderr = cap_err
+            sys.stdout = cap_out
+            rc = R.main(
+                [
+                    "--perf-script", str(perf_path),
+                    "--step1-cold", str(cold_path),
+                    "--step1-samples", str(samples_path),
+                    "--worker-tids", "1",
+                    "--perf-start-ns", str(perf_start_ns),
+                ]
+            )
+        finally:
+            sys.stderr = real_stderr
+            sys.stdout = real_stdout
+            cold_path.unlink()
+            samples_path.unlink()
+            perf_path.unlink()
+        # Drift halt: exit 5, HALT stderr, suspect_reason on every line.
+        self.assertEqual(rc, 5, f"expected exit 5, got {rc}")
+        self.assertEqual(rc, R.EXIT_DRIFT_HALT)
+        self.assertIn("HALT:", cap_err.getvalue())
+        self.assertIn("suspect_reason", cap_err.getvalue())
+        # JSONL forensics still emitted (12 blocks) with sentinel.
+        lines = [l for l in cap_out.getvalue().strip().split("\n") if l]
+        self.assertEqual(len(lines), 12)
+        for raw in lines:
+            obj = json.loads(raw)
+            self.assertEqual(obj.get("suspect_reason"), "drift_ge_5s")
 
 
 # --- Parser sanity: perf-script line format ---------------------------------

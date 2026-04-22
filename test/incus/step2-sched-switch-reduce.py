@@ -64,9 +64,15 @@ INTERVAL_WARN_HI_NS = 7_000_000_000  # 7 s
 INTERVAL_HALT_LO_NS = 1_000_000_000  # 1 s
 INTERVAL_HALT_HI_NS = 30_000_000_000  # 30 s
 
-# stat_runtime_check advisory band: +/- 1 % of nominal 5 s block = 50 ms.
-STAT_RUNTIME_NOMINAL_NS = 5_000_000_000
-STAT_RUNTIME_BAND_NS = 50_000_000  # 50 ms
+# Plan §4.1 stat_runtime_check: PASS if |actual - expected| / expected <= 1%.
+# Block duration is per-block (boundaries[b+1] - boundaries[b]); nominal 5 s
+# is advisory-only for scaling error messages.
+STAT_RUNTIME_REL_TOLERANCE = 0.01  # 1%
+
+# HIGH-2 exit convention: match #816 H-STOP-5 — drift >= 5 s returns 5
+# so wrappers (capture harness, CI) can distinguish "drift halt" from
+# other failures without parsing stderr.
+EXIT_DRIFT_HALT = 5
 
 
 # --- bucket index (port of umem.rs:bucket_index_for_ns) ----------------------
@@ -110,25 +116,26 @@ def bucket_index_for_ns(ns: int) -> int:
 #
 # We only need:
 #   - the event name (sched_switch / sched_wakeup / sched_stat_runtime)
-#   - the timestamp (float seconds, relative to some perf origin)
+#   - the timestamp (float seconds, absolute unix wall-clock — see below)
 #   - for sched_switch: prev_pid, prev_state
 #   - for sched_wakeup: the target pid (field `pid=`, not `target_cpu=`)
 #   - for sched_stat_runtime: the tid (column 2) and `runtime=<ns>`
 #
-# Timestamp format: `12345.678901:` or `12345.678901234:` (ns resolution).
-# We convert to integer ns: int(round(seconds * 1e9)).  `perf script`
-# does NOT give us wall-clock time; instead, step1's _sample_ts values
-# are wall-clock seconds.  For block binning we compare perf timestamps
-# to `t_event_ns = PERF_START_NS + delta_ns_from_first_perf_ts`.
+# Timestamp format: `<unix_secs>.<ns>:` when `perf script --ns` is used
+# with `perf record -k CLOCK_REALTIME`.  We convert to integer ns:
+# `ts_ns = int(left) * 1_000_000_000 + int(right_zero_padded_9)`.
 #
-# See §3.2 HIGH-2 resolution: PERF_START_NS is diagnostic only; block
-# boundaries are actually derived from cold + warm `_sample_ts` values.
-# But perf timestamps are monotonic from kernel boot, not unix time.
-# We therefore need an anchor to translate perf-time -> wall-ns.
+# HIGH-3 resolution (this block replaces the old "PERF_START_NS anchor"
+# translation).  The capture script passes `-k CLOCK_REALTIME` to
+# `perf record`, so each event's `<ts>` IS the absolute unix wall-clock
+# time at which the kernel emitted the tracepoint.  We therefore assign
+# events to blocks via `block_for_timestamp(ts_ns, boundaries_ns)`
+# directly — no `first_perf_ts` offset, no `PERF_START_NS` anchor.
 #
-# Anchor: the first perf event occurs at real wall time ~= PERF_START_NS.
-# We compute `WALL_AT_FIRST_PERF = PERF_START_NS` and use
-# `event_wall_ns = PERF_START_NS + (perf_ts_ns - first_perf_ts_ns)`.
+# `PERF_START_NS` remains diagnostic only: the capture script captures
+# it via `date +%s%N` right before `perf record` starts, and the reducer
+# uses it ONCE to compute `drift_ns = PERF_START_NS - STEP1_START_NS`
+# (the plan §11 hard-stop gauge).  It is NEVER applied per-event.
 
 LINE_HEADER_RE = re.compile(
     r"""^
@@ -337,41 +344,54 @@ def reduce_events(
     perf_start_ns: int,
     out_stream=None,
     warn_stream=None,
+    suspect_reason: str | None = None,
 ) -> list[str]:
+    """Consume `events` and emit 12 JSONL blocks to `out_stream`.
+
+    Events are `(event_name, tid, ts_ns, fields)` tuples where `ts_ns`
+    is an absolute unix wall-clock nanosecond timestamp (perf is recorded
+    with `-k CLOCK_REALTIME`).  Block assignment is `block_for_timestamp(
+    ts_ns, boundaries_ns)` directly — no anchor offset.  `perf_start_ns`
+    is retained in the signature for drift bookkeeping only.
+
+    If `suspect_reason` is non-None, every emitted JSONL line is stamped
+    with a top-level `"suspect_reason"` key (HIGH-2 forensic marker).
+
+    Returns the list of WARN messages (for tests).  Writes WARN lines
+    to `warn_stream` as they occur.
+    """
     # Late-bind defaults so tests that swap sys.stdout / sys.stderr see
     # the swap.  Binding at def-time captures the original streams.
     if out_stream is None:
         out_stream = sys.stdout
     if warn_stream is None:
         warn_stream = sys.stderr
-    """Consume `events` and emit 12 JSONL blocks to `out_stream`.
 
-    Returns the list of WARN messages (for tests).  Writes WARN lines
-    to `warn_stream` as they occur.
-    """
+    # perf_start_ns is not consulted for block assignment (HIGH-3).  It
+    # is retained as a parameter for API stability and for callers that
+    # want to attach drift diagnostics alongside the emitted JSONL.
+    _ = perf_start_ns  # unused on the hot path
+
     warnings: list[str] = []
 
     buckets_by_block = [[0] * N_BUCKETS for _ in range(N_BLOCKS)]
     voluntary_by_block = [0] * N_BLOCKS
     involuntary_by_block = [0] * N_BLOCKS
     runtime_by_block = [0] * N_BLOCKS
+    total_off_cpu_by_block = [0] * N_BLOCKS
+    # Worker count for stat_runtime expected on-CPU computation.  Empty
+    # worker_tids set would make `expected=0` → division guard trips; we
+    # clamp to 1 in that path.
+    n_workers = max(1, len(worker_tids))
 
     # Per-TID off-CPU state.
     off_start_ns: dict[int, int] = {}
     off_state: dict[int, str] = {}
 
-    # Anchor perf timestamps to wall-ns.  The first perf event in the
-    # stream is defined to occur approximately at PERF_START_NS wall time
-    # (reducer is invoked with --perf-start-ns which was captured by the
-    # capture script right before `perf record` spawn).
-    first_perf_ts_ns: int | None = None
-
     # Monotonicity guard: perf-script is time-ordered, but we still defend.
     prev_perf_ts_ns: int = -1
 
     for event, tid, ts_ns, fields in events:
-        if first_perf_ts_ns is None:
-            first_perf_ts_ns = ts_ns
         if ts_ns < prev_perf_ts_ns:
             # Out-of-order perf event; skip.
             msg = (
@@ -382,8 +402,9 @@ def reduce_events(
             continue
         prev_perf_ts_ns = ts_ns
 
-        # Translate perf-time -> wall-ns.
-        t_event_wall_ns = perf_start_ns + (ts_ns - first_perf_ts_ns)
+        # HIGH-3: perf emits absolute unix wall-clock timestamps under
+        # `-k CLOCK_REALTIME`, so `ts_ns` IS `t_event_wall_ns` directly.
+        t_event_wall_ns = ts_ns
 
         if event == "sched:sched_switch":
             prev_pid = fields.get("prev_pid")
@@ -412,6 +433,7 @@ def reduce_events(
                 if 0 <= b < N_BLOCKS:
                     bi = bucket_index_for_ns(delta_ns)
                     buckets_by_block[b][bi] += delta_ns
+                    total_off_cpu_by_block[b] += delta_ns
                     # prev_state classification: startswith("R") -> involuntary
                     if state.startswith("R"):
                         if D1_LO <= bi <= D1_HI:
@@ -444,20 +466,22 @@ def reduce_events(
             warnings.append(msg)
             print(f"WARN: {msg}", file=warn_stream)
 
-        # stat_runtime_check: advisory band.  Expected on-CPU time
-        # per block is roughly (block_width) * num_workers, but we only
-        # have the aggregate sched_stat_runtime total — so we compare
-        # to (boundaries[b+1]-boundaries[b]) * num_workers, clamped
-        # within +- 1 % of nominal.  Simpler: pass if runtime >= 1 ns
-        # (i.e. we saw some stat_runtime events), WARN otherwise.
-        # The #819 plan §4.1 defines "PASS if within +- 1 % of expected
-        # advisory band"; we adopt the pragmatic variant: any positive
-        # runtime in the block passes, zero triggers WARN.
-        #
-        # This keeps the reducer honest when stat_runtime events are
-        # sparse (low-load block) while still catching the "tracepoint
-        # silently disabled" case.
-        if runtime_by_block[b] > 0:
+        # MEDIUM-4: plan §4.1 stat_runtime_check is an accounting check,
+        # not tracepoint presence.  Expected on-CPU time per block is
+        # (block_duration * n_workers) - total_off_cpu.  PASS if the
+        # actual sched_stat_runtime sum is within ±1% of expected; WARN
+        # otherwise.  Block duration is per-block (boundaries differ),
+        # not a fixed 5 s.
+        block_duration_ns = boundaries_ns[b + 1] - boundaries_ns[b]
+        expected_on_cpu_ns = (
+            block_duration_ns * n_workers - total_off_cpu_by_block[b]
+        )
+        actual_on_cpu_ns = runtime_by_block[b]
+        # Guard against degenerate / negative expected (shouldn't happen
+        # in practice; defend so a single bad block can't crash).
+        denom = max(expected_on_cpu_ns, 1)
+        rel_err = abs(actual_on_cpu_ns - expected_on_cpu_ns) / denom
+        if rel_err <= STAT_RUNTIME_REL_TOLERANCE:
             stat_runtime_check = "PASS"
         else:
             stat_runtime_check = "WARN"
@@ -470,6 +494,10 @@ def reduce_events(
             "involuntary_3to6": invol,
             "stat_runtime_check": stat_runtime_check,
         }
+        # HIGH-2: stamp every emitted line with the drift-halt sentinel
+        # so the classifier can emit SUSPECT without a separate marker.
+        if suspect_reason is not None:
+            obj["suspect_reason"] = suspect_reason
         # Invariant check at emit time (V3 gate per plan §8).
         assert (
             sum(obj["buckets"][D1_LO : D1_HI + 1]) == obj["off_cpu_time_3to6"]
@@ -528,16 +556,22 @@ def main(argv: list[str] | None = None) -> int:
 
     step1_start_ns = boundaries_ns[0]
     drift_ns = args.perf_start_ns - step1_start_ns
+    # HIGH-2: drift-halt now stamps each emitted JSONL line with a
+    # `suspect_reason` sentinel AND returns exit 5 (matching #816's
+    # H-STOP-5 convention), so the classifier and capture harness can
+    # both detect the condition without ambiguity.
+    suspect_reason: str | None = None
+    drift_halt = False
     if abs(drift_ns) >= DRIFT_HALT_NS:
         print(
             f"HALT: |PERF_START_NS - STEP1_START_NS| = {abs(drift_ns)} ns >= "
             f"{DRIFT_HALT_NS} ns (nominal snapshot interval); capture invalid "
-            "per plan §11. Emitting JSONL for forensics, classifier should "
-            "emit SUSPECT.",
+            "per plan §11. Emitting JSONL (with suspect_reason sentinel) for "
+            "forensics; classifier will emit SUSPECT.",
             file=sys.stderr,
         )
-        # Still continue — plan §11 says "reducer still emits JSONL for
-        # forensics but classifier emits SUSPECT".
+        suspect_reason = "drift_ge_5s"
+        drift_halt = True
     elif abs(drift_ns) > DRIFT_WARN_NS:
         print(
             f"WARN: drift_ns = {drift_ns} (>|{DRIFT_WARN_NS}| threshold)",
@@ -557,8 +591,9 @@ def main(argv: list[str] | None = None) -> int:
         boundaries_ns=boundaries_ns,
         worker_tids=worker_tids,
         perf_start_ns=args.perf_start_ns,
+        suspect_reason=suspect_reason,
     )
-    return 0
+    return EXIT_DRIFT_HALT if drift_halt else 0
 
 
 if __name__ == "__main__":

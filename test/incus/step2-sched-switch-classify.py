@@ -34,7 +34,6 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Iterable
 
 
 RHO_IN = 0.8
@@ -43,6 +42,11 @@ DUTY_IN_PCT = 1.0
 DUTY_OUT_PCT = 1.0
 NOMINAL_WINDOW_NS = 60_000_000_000  # 60 s
 D1_LO, D1_HI = 3, 6  # inclusive
+
+# HIGH-2: canonical SUSPECT sentinel.  Reducer writes it to every
+# emitted JSONL line when drift exceeds DRIFT_HALT_NS.  Classifier
+# short-circuits to SUSPECT the moment it sees this key.
+SUSPECT_REASON_KEY = "suspect_reason"
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -102,13 +106,25 @@ def spearman_rho(xs: list[float], ys: list[float]) -> tuple[float | None, float 
 
 
 def verdict_from(
-    rho: float | None, duty_cycle_pct: float
+    rho: float | None,
+    duty_cycle_pct: float,
+    suspect_reason: str | None = None,
 ) -> tuple[str, str]:
     """Apply T3 rules.  Returns (verdict, reason).
+
+    HIGH-2: if `suspect_reason` is set, emit SUSPECT immediately and
+    include the reason.  Drift-halt is capture-invalid per plan §11,
+    so a verdict-bucket answer would be misleading.
 
     Low duty-cycle is a sufficient OUT condition independently of rho,
     so we check it before the rho=None degenerate branch.
     """
+    if suspect_reason is not None:
+        return "SUSPECT", (
+            f"capture invalid: {suspect_reason} (plan §11); "
+            f"rho={rho if rho is not None else 'n/a'}, "
+            f"duty={duty_cycle_pct:.3f}%"
+        )
     if duty_cycle_pct < DUTY_OUT_PCT:
         return "OUT", (
             f"duty_cycle_pct={duty_cycle_pct:.3f} < {DUTY_OUT_PCT}"
@@ -144,6 +160,8 @@ def render_report(
     voluntary_total: int,
     involuntary_total: int,
     warn_blocks: list[int],
+    suspect_reason: str | None = None,
+    drift_ns: int | None = None,
 ) -> str:
     lines: list[str] = []
     lines.append(f"# step2 sched_switch correlation report — `{cell}`")
@@ -157,6 +175,15 @@ def render_report(
     lines.append("## Verdict")
     lines.append("")
     lines.append(f"- **{verdict}** — {reason}")
+    if suspect_reason is not None:
+        lines.append("")
+        lines.append(
+            f"> **SUSPECT** — capture invalid per plan §11 "
+            f"(`suspect_reason={suspect_reason}`). "
+            + (f"drift_ns={drift_ns}. " if drift_ns is not None else "")
+            + "All downstream metrics below are forensic only; do not use "
+            "this cell for any IN/OUT discrimination."
+        )
     lines.append("")
     lines.append("## Summary")
     lines.append("")
@@ -206,6 +233,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--off-cpu", required=True, type=Path)
     ap.add_argument("--cell", required=True, type=str)
     ap.add_argument("--out", required=True, type=Path)
+    # HIGH-2: operator hook for out-of-band SUSPECT injection (e.g.
+    # capture harness wants to mark a cell SUSPECT for reasons not
+    # visible in the reducer JSONL).  Reducer-stamped
+    # `suspect_reason` in the JSONL is the primary path.
+    ap.add_argument(
+        "--drift-halt-marker",
+        type=Path,
+        default=None,
+        help="path to a text file whose presence forces verdict=SUSPECT; "
+        "contents (if any) become suspect_reason. Optional.",
+    )
     args = ap.parse_args(argv)
 
     hist_blocks = load_jsonl(args.hist_blocks)
@@ -230,6 +268,20 @@ def main(argv: list[str] | None = None) -> int:
     hist_blocks.sort(key=lambda x: x.get("b", 0))
     off_cpu_blocks.sort(key=lambda x: x.get("b", 0))
 
+    # HIGH-2: detect the reducer-emitted sentinel.  Any block carrying
+    # `suspect_reason` short-circuits to SUSPECT.  Fall back to the
+    # optional --drift-halt-marker sidecar.
+    suspect_reason: str | None = None
+    for blk in off_cpu_blocks:
+        sr = blk.get(SUSPECT_REASON_KEY)
+        if sr:
+            suspect_reason = str(sr)
+            break
+    if suspect_reason is None and args.drift_halt_marker is not None:
+        if args.drift_halt_marker.is_file():
+            marker_text = args.drift_halt_marker.read_text().strip()
+            suspect_reason = marker_text or "drift_halt_marker_present"
+
     T_D1 = compute_T_D1(hist_blocks)
     off_times = [int(b.get("off_cpu_time_3to6", 0)) for b in off_cpu_blocks]
 
@@ -237,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
 
     duty_cycle_pct = 100.0 * sum(off_times) / NOMINAL_WINDOW_NS
 
-    verdict, reason = verdict_from(rho, duty_cycle_pct)
+    verdict, reason = verdict_from(rho, duty_cycle_pct, suspect_reason)
 
     voluntary_total = sum(int(b.get("voluntary_3to6", 0)) for b in off_cpu_blocks)
     involuntary_total = sum(
@@ -263,37 +315,48 @@ def main(argv: list[str] | None = None) -> int:
         voluntary_total=voluntary_total,
         involuntary_total=involuntary_total,
         warn_blocks=warn_blocks,
+        suspect_reason=suspect_reason,
     )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(report)
 
-    meta = {
-        "cell": args.cell,
+    # LOW-5: meta.json core schema is the plan §3.1 step 11 contract:
+    # {verdict, rho, pvalue, duty_cycle_pct, warn_blocks}.  Everything
+    # else is packed into a `diagnostic` sub-object so downstream tools
+    # with an exact-key contract see the plan shape, while humans and
+    # debug tooling still get every intermediate value.
+    meta: dict = {
         "verdict": verdict,
-        "reason": reason,
         "rho": rho,
         "pvalue": pvalue,
         "duty_cycle_pct": duty_cycle_pct,
-        "T_D1": T_D1,
-        "off_cpu_time_3to6": off_times,
-        "voluntary_total_ns": voluntary_total,
-        "involuntary_total_ns": involuntary_total,
         "warn_blocks": warn_blocks,
-        "n_blocks": 12,
-        "rho_in": RHO_IN,
-        "rho_out": RHO_OUT,
-        "duty_in_pct": DUTY_IN_PCT,
-        "duty_out_pct": DUTY_OUT_PCT,
-        "nominal_window_ns": NOMINAL_WINDOW_NS,
+        "diagnostic": {
+            "cell": args.cell,
+            "reason": reason,
+            "T_D1": T_D1,
+            "off_cpu_time_3to6": off_times,
+            "voluntary_total_ns": voluntary_total,
+            "involuntary_total_ns": involuntary_total,
+            "n_blocks": 12,
+            "rho_in": RHO_IN,
+            "rho_out": RHO_OUT,
+            "duty_in_pct": DUTY_IN_PCT,
+            "duty_out_pct": DUTY_OUT_PCT,
+            "nominal_window_ns": NOMINAL_WINDOW_NS,
+        },
     }
+    if suspect_reason is not None:
+        meta["suspect_reason"] = suspect_reason
     # Sibling meta.json: <report>.md -> <report>.meta.json.
     meta_path = args.out.parent / (args.out.stem + ".meta.json")
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")
 
     print(
         f"cell={args.cell} verdict={verdict} rho={rho} "
-        f"duty_cycle_pct={duty_cycle_pct:.3f}",
+        f"duty_cycle_pct={duty_cycle_pct:.3f}"
+        + (f" suspect_reason={suspect_reason}" if suspect_reason else ""),
         file=sys.stderr,
     )
     return 0

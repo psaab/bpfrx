@@ -74,6 +74,26 @@ STEP2_OUTDIR="$REPO_ROOT/docs/pr/819-step2-discriminator-design/evidence/p${PORT
 
 log() { echo "[$(date +%H:%M:%S)] $*" >&2; }
 
+# Pyshell review MED M1: clean up background children on SIGINT/SIGTERM.
+# These PID holders are populated once we launch step1-capture.sh and
+# `perf record` further down.  `exit 130` follows POSIX SIGINT convention.
+STEP1_PID=""
+PERF_PID=""
+cleanup_on_signal() {
+	if [[ -n "${STEP1_PID:-}" ]]; then
+		kill "$STEP1_PID" 2>/dev/null || true
+	fi
+	if [[ -n "${PERF_PID:-}" ]]; then
+		kill "$PERF_PID" 2>/dev/null || true
+	fi
+	# The host-side `incus exec` we backgrounded does NOT terminate the
+	# remote `perf record` when we kill it; stop it explicitly inside
+	# the guest.  pkill is a no-op if perf is already gone.
+	incus exec "$FW" -- pkill -TERM perf 2>/dev/null || true
+	exit 130
+}
+trap cleanup_on_signal INT TERM
+
 # -- G8 preflight -----------------------------------------------------------
 
 g8_preflight() {
@@ -92,8 +112,11 @@ g8_preflight() {
 
 	log "G8.2 check tracepoint surface on $FW (each name grepped individually)"
 	for tp in sched:sched_switch sched:sched_stat_runtime sched:sched_wakeup; do
-		# Use a patterned grep: `perf list <name>` prints `<tp> [Tracepoint ...]`.
-		if incus exec "$FW" -- bash -c "perf list '$tp' 2>/dev/null | grep -qF '$tp'"; then
+		# Plan §5 pattern: `grep -qE '${tp//:/\s*:\s*}'` — tolerate
+		# whitespace around the colon (some perf list outputs format
+		# "sched : sched_switch" at column widths).  LOW-6 fix.
+		local tp_re="${tp//:/\\s*:\\s*}"
+		if incus exec "$FW" -- bash -c "perf list '$tp' 2>/dev/null | grep -qE '$tp_re'"; then
 			log "  tracepoint $tp present"
 		else
 			echo "G8.2 FAIL: $tp not found — bpftrace fallback NOT in #821 scope; HARD STOP" >&2
@@ -102,6 +125,10 @@ g8_preflight() {
 	done
 
 	log "G8.3 perf record privilege smoke on $FW"
+	# LOW-6: keep perf-record stderr visible so plan §5 "command 3 prints
+	# perf stderr" is actually satisfied.  We pipe the subshell's combined
+	# stdout+stderr through sed for indentation.  `perf record` itself is
+	# run WITHOUT the blanket `>/dev/null 2>&1` redirection.
 	if incus exec "$FW" -- bash -c '
 		set -e
 		TID=$(ps -eLo tid,comm | awk "\$2==\"xpf-userspace-w\"{print \$1;exit}")
@@ -110,7 +137,8 @@ g8_preflight() {
 			exit 1
 		fi
 		rm -f /tmp/smoke.data
-		perf record -e sched:sched_switch -t "$TID" -o /tmp/smoke.data -- sleep 1 >/dev/null 2>&1
+		# Keep perf stderr visible; it is valuable context on failure.
+		perf record -e sched:sched_switch -t "$TID" -o /tmp/smoke.data -- sleep 1
 		test -s /tmp/smoke.data
 	' 2>&1 | sed "s|^|  |"; then
 		log "  perf record smoke OK"
@@ -144,6 +172,11 @@ log "mkdir -p $STEP2_OUTDIR"
 mkdir -p "$STEP2_OUTDIR"
 
 # -- step 2: launch step1-capture.sh in background --------------------------
+
+# HIGH-1: drop any stale rendezvous file so the poll below can ONLY
+# succeed when the NEW run writes it.  Otherwise a leftover from a
+# previous capture makes us attach `perf record -t` to stale TIDs.
+rm -f "$STEP1_OUTDIR/worker-tids.txt"
 
 log "launching step1-capture.sh $PORT $DIR $COS in background"
 "$SCRIPT_DIR/step1-capture.sh" "$PORT" "$DIR" "$COS" > "$STEP2_OUTDIR/step1-capture.log" 2>&1 &
@@ -190,10 +223,18 @@ log "PERF_START_NS=$PERF_START_NS"
 # -- step 5: perf record -----------------------------------------------------
 
 log "spawning perf record on $FW (60 s)"
+# HIGH-3: `-k CLOCK_REALTIME` makes perf emit absolute unix wall-clock
+# timestamps, aligning directly with the `boundaries[]` array (which
+# is derived from `date +%s` in step1-capture.sh).  Without this flag
+# perf defaults to CLOCK_MONOTONIC (boot-relative), which requires a
+# synthetic wall-time anchor; the reducer used to derive that anchor
+# from PERF_START_NS + first-event offset, leaking first-event latency
+# into the block assignment.  CLOCK_REALTIME removes the offsetting.
 incus exec "$FW" -- bash -c "
 	set -e
 	rm -f /tmp/sched-switch.perf.data
 	perf record \\
+	    -k CLOCK_REALTIME \\
 	    -e sched:sched_switch \\
 	    -e sched:sched_stat_runtime \\
 	    -e sched:sched_wakeup \\
@@ -236,7 +277,11 @@ done
 
 log "pulling perf.data and rendering perf-script.txt"
 incus file pull "$FW/tmp/sched-switch.perf.data" "$STEP2_OUTDIR/perf.data"
-incus exec "$FW" -- perf script -i /tmp/sched-switch.perf.data > "$STEP2_OUTDIR/perf-script.txt"
+# `--ns` forces nanosecond-resolution timestamps so the reducer sees
+# full precision (default `perf script` format keeps microseconds).
+# Combined with `-k CLOCK_REALTIME` from perf-record, timestamps are
+# absolute unix wall-clock ns.
+incus exec "$FW" -- perf script --ns -i /tmp/sched-switch.perf.data > "$STEP2_OUTDIR/perf-script.txt"
 
 # -- step 8: step1 histogram classifier in single-cell scope ----------------
 
@@ -254,13 +299,24 @@ fi
 # -- step 9: reducer ---------------------------------------------------------
 
 log "running step2 reducer"
+# HIGH-2: reducer returns exit 5 on drift halt (still emits JSONL with
+# suspect_reason sentinel for forensics).  Accept exit 0 (normal) and
+# exit 5 (drift halt, intentional); any other non-zero is a real error.
+REDUCER_RC=0
 python3 "$SCRIPT_DIR/step2-sched-switch-reduce.py" \
 	--perf-script "$STEP2_OUTDIR/perf-script.txt" \
 	--step1-cold "$STEP1_OUTDIR/flow_steer_cold.json" \
 	--step1-samples "$STEP1_OUTDIR/flow_steer_samples.jsonl" \
 	--worker-tids "$WORKER_TIDS" \
 	--perf-start-ns "$PERF_START_NS" \
-	> "$STEP2_OUTDIR/off-cpu-hist-by-block.jsonl"
+	> "$STEP2_OUTDIR/off-cpu-hist-by-block.jsonl" || REDUCER_RC=$?
+if [[ "$REDUCER_RC" -eq 5 ]]; then
+	log "reducer reported drift halt (rc=5); classifier will emit SUSPECT"
+elif [[ "$REDUCER_RC" -ne 0 ]]; then
+	echo "ERROR: reducer exited rc=$REDUCER_RC" >&2
+	echo "SUSPECT: reducer rc=$REDUCER_RC" > "$STEP2_OUTDIR/verdict.txt"
+	exit 1
+fi
 
 # -- step 10: classifier -----------------------------------------------------
 
@@ -274,8 +330,16 @@ python3 "$SCRIPT_DIR/step2-sched-switch-classify.py" \
 # -- step 11: summary log line ----------------------------------------------
 
 VERDICT="UNKNOWN"
+SUSPECT_REASON=""
 if [[ -s "$STEP2_OUTDIR/correlation-report.meta.json" ]]; then
-	# Extract verdict without a python dep (portable jq).
+	# Extract verdict + optional suspect_reason without a python dep.
 	VERDICT=$(jq -r '.verdict // "UNKNOWN"' "$STEP2_OUTDIR/correlation-report.meta.json" 2>/dev/null || echo UNKNOWN)
+	SUSPECT_REASON=$(jq -r '.suspect_reason // empty' "$STEP2_OUTDIR/correlation-report.meta.json" 2>/dev/null || echo "")
 fi
-echo "[$(date +%H:%M:%S)] step2-sched-switch COMPLETE cell=p${PORT}-${DIR}-${COS} outdir=$STEP2_OUTDIR verdict=$VERDICT"
+# HIGH-2: surface SUSPECT in the summary so operators and CI notice
+# capture-invalid runs without opening the meta.json.
+if [[ -n "$SUSPECT_REASON" ]]; then
+	echo "[$(date +%H:%M:%S)] step2-sched-switch COMPLETE cell=p${PORT}-${DIR}-${COS} outdir=$STEP2_OUTDIR verdict=$VERDICT suspect_reason=$SUSPECT_REASON"
+else
+	echo "[$(date +%H:%M:%S)] step2-sched-switch COMPLETE cell=p${PORT}-${DIR}-${COS} outdir=$STEP2_OUTDIR verdict=$VERDICT"
+fi
