@@ -321,36 +321,39 @@ def main(argv: list[str] | None = None) -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(report)
 
-    # LOW-5: meta.json core schema is the plan §3.1 step 11 contract:
-    # {verdict, rho, pvalue, duty_cycle_pct, warn_blocks}.  Everything
-    # else is packed into a `diagnostic` sub-object so downstream tools
-    # with an exact-key contract see the plan shape, while humans and
-    # debug tooling still get every intermediate value.
+    # LOW-5 R4: meta.json is EXACTLY the plan §3.1 step 11 contract:
+    # {verdict, rho, pvalue, duty_cycle_pct, warn_blocks}.  Nothing
+    # else at the top level.  Diagnostic fields (T_D1 series, threshold
+    # constants, suspect_reason, etc.) live in a SIBLING file
+    # `correlation-report.diag.json` so downstream consumers with an
+    # exact-key contract see only the plan shape.
     meta: dict = {
         "verdict": verdict,
         "rho": rho,
         "pvalue": pvalue,
         "duty_cycle_pct": duty_cycle_pct,
         "warn_blocks": warn_blocks,
-        "diagnostic": {
-            "cell": args.cell,
-            "reason": reason,
-            "suspect_reason": suspect_reason,  # LOW-5 R3: moved into diagnostic to keep top-level schema exactly {verdict, rho, pvalue, duty_cycle_pct, warn_blocks}
-            "T_D1": T_D1,
-            "off_cpu_time_3to6": off_times,
-            "voluntary_total_ns": voluntary_total,
-            "involuntary_total_ns": involuntary_total,
-            "n_blocks": 12,
-            "rho_in": RHO_IN,
-            "rho_out": RHO_OUT,
-            "duty_in_pct": DUTY_IN_PCT,
-            "duty_out_pct": DUTY_OUT_PCT,
-            "nominal_window_ns": NOMINAL_WINDOW_NS,
-        },
     }
-    # Sibling meta.json: <report>.md -> <report>.meta.json.
+    diag: dict = {
+        "cell": args.cell,
+        "reason": reason,
+        "suspect_reason": suspect_reason,
+        "T_D1": T_D1,
+        "off_cpu_time_3to6": off_times,
+        "voluntary_total_ns": voluntary_total,
+        "involuntary_total_ns": involuntary_total,
+        "n_blocks": 12,
+        "rho_in": RHO_IN,
+        "rho_out": RHO_OUT,
+        "duty_in_pct": DUTY_IN_PCT,
+        "duty_out_pct": DUTY_OUT_PCT,
+        "nominal_window_ns": NOMINAL_WINDOW_NS,
+    }
+    # Sibling files: <report>.md -> <report>.meta.json + <report>.diag.json.
     meta_path = args.out.parent / (args.out.stem + ".meta.json")
+    diag_path = args.out.parent / (args.out.stem + ".diag.json")
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+    diag_path.write_text(json.dumps(diag, indent=2) + "\n")
 
     print(
         f"cell={args.cell} verdict={verdict} rho={rho} "

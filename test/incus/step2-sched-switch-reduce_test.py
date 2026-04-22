@@ -380,10 +380,14 @@ class TestReducerNegativeWakeDelta(unittest.TestCase):
         # Block 0 accumulates a zero-duration event into bucket 0.
         lines = [json.loads(l) for l in buf.getvalue().strip().split("\n")]
         self.assertEqual(len(lines), 12)
-        # delta_ns=0 goes to bucket 0 (sub-1µs catch-all); buckets[0] += 0,
-        # so all buckets remain zero. off_cpu_time_3to6 stays zero.
+        # LOW-7 R4: explicitly pin the routing path.
+        # bucket_index_for_ns(0) == 0, so delta_ns=0 routes to bucket[0].
+        self.assertEqual(R.bucket_index_for_ns(0), 0)
+        # bucket[0] accumulation of 0 ns leaves the count at 0 ns total.
+        self.assertEqual(lines[0]["buckets"][0], 0)
+        # All other buckets are also zero (no other events).
+        self.assertEqual(lines[0]["buckets"], [0] * 16)
         self.assertEqual(lines[0]["off_cpu_time_3to6"], 0)
-        self.assertEqual(sum(lines[0]["buckets"]), 0)
 
     def test_reducer_wake_before_switch_triggers_out_of_order(self):
         """Wake arrives with ts earlier than the preceding switch.

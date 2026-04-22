@@ -105,6 +105,13 @@ def _off_cpu_blocks(
 def _run_classifier(
     hist_blocks: list[dict], off_blocks: list[dict], cell: str = "test/cell"
 ) -> tuple[int, dict]:
+    rc, meta, _diag = _run_classifier_with_diag(hist_blocks, off_blocks, cell)
+    return rc, meta
+
+
+def _run_classifier_with_diag(
+    hist_blocks: list[dict], off_blocks: list[dict], cell: str = "test/cell"
+) -> tuple[int, dict, dict]:
     h_path = _write_jsonl(hist_blocks)
     o_path = _write_jsonl(off_blocks)
     out_dir = Path(tempfile.mkdtemp())
@@ -119,11 +126,13 @@ def _run_classifier(
             ]
         )
         meta_path = out_dir / "correlation-report.meta.json"
+        diag_path = out_dir / "correlation-report.diag.json"
         meta = json.loads(meta_path.read_text())
+        diag = json.loads(diag_path.read_text()) if diag_path.exists() else {}
     finally:
         h_path.unlink()
         o_path.unlink()
-    return rc, meta
+    return rc, meta, diag
 
 
 class TestClassifyVerdicts(unittest.TestCase):
@@ -216,30 +225,25 @@ class TestClassifyVerdicts(unittest.TestCase):
 
 class TestClassifyMetaSchema(unittest.TestCase):
     def test_meta_json_schema(self):
-        """LOW-5: top-level keys are the plan §3.1 step 11 contract
-        ({verdict, rho, pvalue, duty_cycle_pct, warn_blocks}); extras
-        live under `diagnostic`.
+        """LOW-5 R4: top-level keys are EXACTLY the plan §3.1 step 11
+        contract ({verdict, rho, pvalue, duty_cycle_pct, warn_blocks}).
+        No extras at top level. Diagnostic data lives in a sibling
+        `correlation-report.diag.json` file.
         """
         off_times = [int((b + 1) * 250_000_000) for b in range(12)]
         shape_vals = [float(b + 1) * 0.01 for b in range(12)]
         hist = _hist_blocks_with_shape3to6(shape_vals)
         off = _off_cpu_blocks(off_times)
-        rc, meta = _run_classifier(hist, off, cell="slug/under/test")
+        rc, meta, diag = _run_classifier_with_diag(hist, off, cell="slug/under/test")
         self.assertEqual(rc, 0)
-        # Plan-contracted top-level keys — exact set.
-        top_level_required = [
-            "verdict",
-            "rho",
-            "pvalue",
-            "duty_cycle_pct",
-            "warn_blocks",
-        ]
-        for k in top_level_required:
-            self.assertIn(k, meta, f"missing top-level key: {k}")
+        # Plan-contracted top-level keys — EXACT set (no diagnostic).
+        self.assertEqual(
+            set(meta.keys()),
+            {"verdict", "rho", "pvalue", "duty_cycle_pct", "warn_blocks"},
+            f"meta.json has extra keys: {set(meta.keys())}",
+        )
         self.assertIn(meta["verdict"], ("IN", "OUT", "INCONCLUSIVE", "SUSPECT"))
-        # Diagnostic sub-object retains the extras for debugging.
-        self.assertIn("diagnostic", meta, "diagnostic sub-object missing")
-        diag = meta["diagnostic"]
+        # Diagnostic extras now live in sibling .diag.json.
         diag_required = [
             "cell",
             "reason",
@@ -255,15 +259,13 @@ class TestClassifyMetaSchema(unittest.TestCase):
             "nominal_window_ns",
         ]
         for k in diag_required:
-            self.assertIn(k, diag, f"missing diagnostic key: {k}")
+            self.assertIn(k, diag, f"missing diag key: {k}")
         self.assertEqual(diag["cell"], "slug/under/test")
         self.assertEqual(diag["n_blocks"], 12)
         self.assertEqual(len(diag["T_D1"]), 12)
         self.assertEqual(len(diag["off_cpu_time_3to6"]), 12)
-        # `suspect_reason` lives under diagnostic (LOW-5 R3 schema), and is
-        # null when the reducer did not flag drift halt.
-        self.assertNotIn("suspect_reason", meta)
-        self.assertIsNone(meta["diagnostic"].get("suspect_reason"))
+        # `suspect_reason` lives in diag (not meta), null when no drift.
+        self.assertIsNone(diag.get("suspect_reason"))
 
 
 class TestClassifyWarnAggregation(unittest.TestCase):
@@ -331,8 +333,8 @@ class TestClassifySuspectFromReducer(unittest.TestCase):
         rc, meta = _run_classifier(hist, off)
         self.assertEqual(rc, 0)
         self.assertEqual(meta["verdict"], "SUSPECT")
-        self.assertNotIn("suspect_reason", meta)  # LOW-5 R3: moved under diagnostic
-        self.assertEqual(meta["diagnostic"]["suspect_reason"], "drift_ge_5s")
+        self.assertNotIn("suspect_reason", meta)  # LOW-5 R4: moved to sibling .diag.json
+        self.assertNotIn("diagnostic", meta)
 
     def test_verdict_SUSPECT_from_drift_halt_marker(self):
         """Optional `--drift-halt-marker` path: operator can force
@@ -370,8 +372,8 @@ class TestClassifySuspectFromReducer(unittest.TestCase):
             o_path.unlink()
         self.assertEqual(rc, 0)
         self.assertEqual(meta["verdict"], "SUSPECT")
-        self.assertNotIn("suspect_reason", meta)  # LOW-5 R3: moved under diagnostic
-        self.assertEqual(meta["diagnostic"]["suspect_reason"], "drift_ge_5s")
+        self.assertNotIn("suspect_reason", meta)  # LOW-5 R4: moved to sibling .diag.json
+        self.assertNotIn("diagnostic", meta)
 
 
 if __name__ == "__main__":
