@@ -1336,6 +1336,21 @@ pub(crate) struct BindingStatus {
     pub tx_submit_latency_count: u64,
     #[serde(rename = "tx_submit_latency_sum_ns", default)]
     pub tx_submit_latency_sum_ns: u64,
+    // #825: per-kick `sendto` latency telemetry. Same wire shape
+    // as `tx_submit_latency_*` — 16 log2 buckets via `Vec<u64>`,
+    // plus count, sum-ns, and the EAGAIN/EWOULDBLOCK retry
+    // tally (T1 ring-pushback signal per #819 §4.1). `default`
+    // on each keeps the wire format additive: a pre-#825
+    // helper that lacks these fields deserializes as empty/zero
+    // rather than erroring.
+    #[serde(rename = "tx_kick_latency_hist", default)]
+    pub tx_kick_latency_hist: Vec<u64>,
+    #[serde(rename = "tx_kick_latency_count", default)]
+    pub tx_kick_latency_count: u64,
+    #[serde(rename = "tx_kick_latency_sum_ns", default)]
+    pub tx_kick_latency_sum_ns: u64,
+    #[serde(rename = "tx_kick_retry_count", default)]
+    pub tx_kick_retry_count: u64,
     #[serde(rename = "last_error", default)]
     pub last_error: String,
     #[serde(rename = "last_change", skip_serializing_if = "Option::is_none")]
@@ -1423,6 +1438,19 @@ pub(crate) struct BindingCountersSnapshot {
     pub tx_submit_latency_count: u64,
     #[serde(rename = "tx_submit_latency_sum_ns", default)]
     pub tx_submit_latency_sum_ns: u64,
+    // #825: per-kick `sendto` latency telemetry, pulled through
+    // from BindingStatus so step1-capture / P3 consumers can
+    // compute per-queue kick-latency distributions without a
+    // second join. `default` keeps pre-#825 helpers parseable —
+    // the four fields simply deserialize as empty/zero.
+    #[serde(rename = "tx_kick_latency_hist", default)]
+    pub tx_kick_latency_hist: Vec<u64>,
+    #[serde(rename = "tx_kick_latency_count", default)]
+    pub tx_kick_latency_count: u64,
+    #[serde(rename = "tx_kick_latency_sum_ns", default)]
+    pub tx_kick_latency_sum_ns: u64,
+    #[serde(rename = "tx_kick_retry_count", default)]
+    pub tx_kick_retry_count: u64,
 }
 
 // #812 (plan §3.5a / §6.1 test #8): compile-time assertion that
@@ -1474,6 +1502,14 @@ impl From<&BindingStatus> for BindingCountersSnapshot {
             tx_submit_latency_hist: b.tx_submit_latency_hist.clone(),
             tx_submit_latency_count: b.tx_submit_latency_count,
             tx_submit_latency_sum_ns: b.tx_submit_latency_sum_ns,
+            // #825: same discipline as #812 — owned clone of the
+            // Vec<u64> and by-value scalars. The `'static + Send`
+            // assert at :1446 covers these mechanically (no
+            // borrowed fields; u64 and Vec<u64> are Send).
+            tx_kick_latency_hist: b.tx_kick_latency_hist.clone(),
+            tx_kick_latency_count: b.tx_kick_latency_count,
+            tx_kick_latency_sum_ns: b.tx_kick_latency_sum_ns,
+            tx_kick_retry_count: b.tx_kick_retry_count,
         }
     }
 }
@@ -1665,4 +1701,88 @@ pub(crate) struct SessionDeltaInfo {
     pub fabric_redirect: bool,
     #[serde(rename = "fabric_ingress", default)]
     pub fabric_ingress: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #825 plan §3.9 test #5: wire-format round-trip for
+    // BindingStatus. Construct with non-zero values on all four
+    // kick-latency fields, serialize, deserialize, assert equality.
+    // Companion to the BindingCountersSnapshot round-trip test in
+    // main.rs::tx_latency_hist_serialization_roundtrip — covers
+    // the rich BindingStatus wire shape that
+    // BindingCountersSnapshot projects from.
+    #[test]
+    fn tx_kick_latency_binding_status_wire_roundtrip() {
+        let status = BindingStatus {
+            worker_id: 3,
+            slot: 7,
+            ifindex: 11,
+            queue_id: 2,
+            tx_kick_latency_hist: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            tx_kick_latency_count: 136,
+            tx_kick_latency_sum_ns: 1_234_567,
+            tx_kick_retry_count: 42,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&status).expect("serialize BindingStatus");
+        let back: BindingStatus =
+            serde_json::from_str(&json).expect("deserialize BindingStatus");
+        assert_eq!(back.tx_kick_latency_hist, status.tx_kick_latency_hist);
+        assert_eq!(back.tx_kick_latency_count, status.tx_kick_latency_count);
+        assert_eq!(back.tx_kick_latency_sum_ns, status.tx_kick_latency_sum_ns);
+        assert_eq!(back.tx_kick_retry_count, status.tx_kick_retry_count);
+    }
+
+    // #825 plan §3.9 test #5: pre-#825 JSON payload — fields absent
+    // — must deserialize with the four kick-latency fields defaulted
+    // to empty Vec / zero u64. This pins the additive-wire contract
+    // at the rich BindingStatus layer; the projection into
+    // BindingCountersSnapshot inherits the same defaulting.
+    #[test]
+    fn tx_kick_latency_binding_status_backward_compat() {
+        // Minimum plausible BindingStatus payload predating #825.
+        // All four kick-latency fields absent.
+        let legacy_json = r#"{
+            "worker_id": 1,
+            "slot": 0,
+            "ifindex": 0,
+            "queue_id": 0
+        }"#;
+        let status: BindingStatus =
+            serde_json::from_str(legacy_json).expect("pre-#825 payload decodes");
+        assert!(
+            status.tx_kick_latency_hist.is_empty(),
+            "pre-#825 payload must default to empty Vec<u64>",
+        );
+        assert_eq!(status.tx_kick_latency_count, 0);
+        assert_eq!(status.tx_kick_latency_sum_ns, 0);
+        assert_eq!(status.tx_kick_retry_count, 0);
+    }
+
+    // #825 plan §3.9 test #5 final clause: From<&BindingStatus>
+    // propagates the four kick-latency fields onto
+    // BindingCountersSnapshot — pin that the projection doesn't
+    // silently drop any of them.
+    #[test]
+    fn tx_kick_latency_from_binding_status_propagates() {
+        let status = BindingStatus {
+            worker_id: 5,
+            queue_id: 3,
+            tx_kick_latency_hist: vec![100, 200, 300],
+            tx_kick_latency_count: 600,
+            tx_kick_latency_sum_ns: 987_654,
+            tx_kick_retry_count: 7,
+            ..Default::default()
+        };
+
+        let snap: BindingCountersSnapshot = (&status).into();
+        assert_eq!(snap.tx_kick_latency_hist, status.tx_kick_latency_hist);
+        assert_eq!(snap.tx_kick_latency_count, status.tx_kick_latency_count);
+        assert_eq!(snap.tx_kick_latency_sum_ns, status.tx_kick_latency_sum_ns);
+        assert_eq!(snap.tx_kick_retry_count, status.tx_kick_retry_count);
+    }
 }

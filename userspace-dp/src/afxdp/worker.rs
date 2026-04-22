@@ -4245,4 +4245,13 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) tx_submit_latency_hist: [u64; TX_SUBMIT_LAT_BUCKETS],
     pub(crate) tx_submit_latency_count: u64,
     pub(crate) tx_submit_latency_sum_ns: u64,
+    /// #825: per-kick `sendto` latency histogram + count +
+    /// sum-ns + EAGAIN-retry count. Fixed-size array matches
+    /// `tx_submit_latency_hist`; materialized into a `Vec<u64>`
+    /// at the JSON/protocol boundary, the snapshot itself stays
+    /// allocation-free.
+    pub(crate) tx_kick_latency_hist: [u64; TX_SUBMIT_LAT_BUCKETS],
+    pub(crate) tx_kick_latency_count: u64,
+    pub(crate) tx_kick_latency_sum_ns: u64,
+    pub(crate) tx_kick_retry_count: u64,
 }

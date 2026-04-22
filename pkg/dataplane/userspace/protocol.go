@@ -682,6 +682,17 @@ type BindingStatus struct {
 	TxSubmitLatencyHist               []uint64  `json:"tx_submit_latency_hist,omitempty"`
 	TxSubmitLatencyCount              uint64    `json:"tx_submit_latency_count,omitempty"`
 	TxSubmitLatencySumNs              uint64    `json:"tx_submit_latency_sum_ns,omitempty"`
+	// #825: per-kick `sendto` latency telemetry. 16 log2 buckets
+	// (wire-compatible with `tx_submit_latency_hist` /
+	// `drain_latency_hist`), plus count, sum-ns, and the
+	// EAGAIN/EWOULDBLOCK retry tally (T1 ring-pushback signal per
+	// #819 §4.1). omitempty keeps forward-compat — a pre-#825
+	// helper that lacks these fields decodes into empty slice /
+	// zero uint64.
+	TxKickLatencyHist                 []uint64  `json:"tx_kick_latency_hist,omitempty"`
+	TxKickLatencyCount                uint64    `json:"tx_kick_latency_count,omitempty"`
+	TxKickLatencySumNs                uint64    `json:"tx_kick_latency_sum_ns,omitempty"`
+	TxKickRetryCount                  uint64    `json:"tx_kick_retry_count,omitempty"`
 	LastHeartbeat                     time.Time `json:"last_heartbeat,omitempty"`
 	LastError                         string    `json:"last_error,omitempty"`
 	LastChange                        time.Time `json:"last_change,omitempty"`
@@ -726,6 +737,14 @@ type BindingCountersSnapshot struct {
 	TxSubmitLatencyHist    []uint64 `json:"tx_submit_latency_hist,omitempty"`
 	TxSubmitLatencyCount   uint64   `json:"tx_submit_latency_count,omitempty"`
 	TxSubmitLatencySumNs   uint64   `json:"tx_submit_latency_sum_ns,omitempty"`
+	// #825: per-kick `sendto` latency telemetry, pulled through
+	// from BindingStatus so step1-capture / P3 consumers can
+	// compute per-queue kick-latency distributions without a
+	// second query. omitempty on all four preserves forward-compat.
+	TxKickLatencyHist    []uint64 `json:"tx_kick_latency_hist,omitempty"`
+	TxKickLatencyCount   uint64   `json:"tx_kick_latency_count,omitempty"`
+	TxKickLatencySumNs   uint64   `json:"tx_kick_latency_sum_ns,omitempty"`
+	TxKickRetryCount     uint64   `json:"tx_kick_retry_count,omitempty"`
 }
 
 type ExceptionStatus struct {

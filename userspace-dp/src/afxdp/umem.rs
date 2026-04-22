@@ -252,6 +252,34 @@ pub(super) struct OwnerProfileOwnerWrites {
     /// monotonic delta time, which is beyond any deployment
     /// lifetime.
     pub(super) tx_submit_latency_sum_ns: AtomicU64,
+    /// #825: per-kick `sendto` latency histogram. Bucket layout is
+    /// shared with `tx_submit_latency_hist` / `drain_latency_hist`
+    /// via `bucket_index_for_ns`; see `TX_SUBMIT_LAT_BUCKETS` for
+    /// the wire-contract const-asserts. The histogram is written
+    /// only by the owner worker's `maybe_wake_tx` site (plan §3.3
+    /// site 1) — single-writer, so `Relaxed` atomics on writer AND
+    /// reader are sufficient; the snapshot path documents the
+    /// bounded read-skew semantics at plan §4 and mirrors the
+    /// existing `tx_submit_latency_hist` pattern.
+    pub(super) tx_kick_latency_hist: [AtomicU64; TX_SUBMIT_LAT_BUCKETS],
+    /// #825: count of `sendto` kicks observed (whether EAGAIN or
+    /// not). Within a single-threaded unit test this equals
+    /// `sum(tx_kick_latency_hist)` exactly; across threads the
+    /// relation is `|sum - count| ≤ K_skew` per plan §4 (K_skew
+    /// inherited from #812's bound as a conservative upper bound
+    /// — kicks occur strictly less frequently than completions).
+    pub(super) tx_kick_latency_count: AtomicU64,
+    /// #825: running sum of kick latencies in nanoseconds. Paired
+    /// with `tx_kick_latency_count` yields a discretization-free
+    /// mean of the per-kick `sendto` syscall cost.
+    pub(super) tx_kick_latency_sum_ns: AtomicU64,
+    /// #825: count of `sendto` returns where `errno ∈
+    /// {EAGAIN, EWOULDBLOCK}` — the semantic "ring pushed back"
+    /// signal that T1 (#819 §4.1) keys off. Parallel to
+    /// `binding.dbg_sendto_eagain` (worker-local debug-tick
+    /// counter), but surfaced on the `BindingLiveSnapshot` so it
+    /// reaches the operator-facing protocol.
+    pub(super) tx_kick_retry_count: AtomicU64,
     /// #709: owner-local pps window. Formerly `pps_owner_vs_peer[0]`;
     /// split by writer for cacheline isolation (#746). The owner is
     /// the only writer; peers read through `snapshot()`.
@@ -324,12 +352,15 @@ const _: () = assert!(core::mem::align_of::<OwnerProfilePeerWrites>() == 64);
 // = 128 + 56 = 184 B → 192 B padded (3 cachelines). #812 adds 16
 // submit-latency hist atomics (128 B) + 2 scalars (count + sum_ns,
 // 16 B) = 144 B more, landing the struct at 328 B → 384 B padded
-// (6 cachelines). Ceiling set at 448 B (7 cachelines) so a
-// follow-up can add one or two atomics without this assert
-// breaking — but a giant field drop-in still fails loudly.
+// (6 cachelines). #825 adds 16 kick-latency hist atomics (128 B)
+// + 3 scalars (count, sum_ns, retry_count; 24 B) = 152 B more,
+// landing the struct at 480 B → 512 B padded (8 cachelines).
+// Ceiling raised to 512 B (plan §3.2 cap-raise). `#[repr(align(64))]`
+// alignment invariant is unchanged — the separate align assert
+// above still holds at 64 B.
 // Peer struct is unchanged (16 hist + 2 scalar AtomicU64 = 144 B,
 // padded to 192 B).
-const _: () = assert!(core::mem::size_of::<OwnerProfileOwnerWrites>() <= 448);
+const _: () = assert!(core::mem::size_of::<OwnerProfileOwnerWrites>() <= 512);
 const _: () = assert!(core::mem::size_of::<OwnerProfilePeerWrites>() <= 320);
 
 impl OwnerProfileOwnerWrites {
@@ -346,6 +377,11 @@ impl OwnerProfileOwnerWrites {
             tx_submit_latency_hist: std::array::from_fn(|_| AtomicU64::new(0)),
             tx_submit_latency_count: AtomicU64::new(0),
             tx_submit_latency_sum_ns: AtomicU64::new(0),
+            // #825: zero-init owner-written TX kick latency telemetry.
+            tx_kick_latency_hist: std::array::from_fn(|_| AtomicU64::new(0)),
+            tx_kick_latency_count: AtomicU64::new(0),
+            tx_kick_latency_sum_ns: AtomicU64::new(0),
+            tx_kick_retry_count: AtomicU64::new(0),
             owner_pps: AtomicU64::new(0),
             drain_sent_bytes_shaped_unconditional: AtomicU64::new(0),
             post_drain_backup_bytes: AtomicU64::new(0),
@@ -1256,6 +1292,19 @@ mod tests {
         // K_skew bound using the MAX observed read window and the
         // steady-state λ_obs. +2 is the derivation-independent
         // margin (plan §3.6 R2).
+        //
+        // Derivation (identical to #812 §3.6 R2): during one reader
+        // window of duration W_read_ns, the writer emits at most
+        // ceil(λ_obs × W_read_ns) records. The +2 absorbs two sources
+        // of off-by-one: (1) a record in flight at window start that
+        // had already incremented `count` but not yet the histogram
+        // (or vice-versa), and (2) the analogous boundary at window
+        // end. #812 empirically demonstrated this bound is tight for
+        // the tx-completion path; `record_kick_latency` has the same
+        // single-writer / Relaxed-ordering / count-then-bucket shape
+        // (see `record_kick_latency` at tx.rs), so the derivation
+        // carries over unchanged. Tightening the bound below +2
+        // would risk flakes on schedulers with more jitter.
         let k_skew = (lambda_obs_per_ns * max_w_read_ns as f64).ceil() as i64 + 2;
         assert!(
             max_skew <= k_skew,
@@ -1390,6 +1439,323 @@ mod tests {
         // Slot 0 is still stamped — the OOB reap must not have
         // touched any in-range slot.
         assert_eq!(sidecar[0], t0, "in-range slot corrupted by OOB reap");
+    }
+
+    // -------------------------------------------------------------
+    // #825 test pins. Plan §3.9.
+    // -------------------------------------------------------------
+
+    #[test]
+    fn tx_kick_latency_bucket_mapping_pin() {
+        // #825 plan §3.9 test #1. Drive the production helper
+        // `record_kick_latency` with deltas that land in specific
+        // buckets (boundary + interior + saturation) and assert
+        // one count per bucket plus matching count / sum_ns.
+        //
+        // bucket_index_for_ns pins (see umem.rs:198-202):
+        //   delta=0 → bucket 0, delta=1 → bucket 0
+        //   bucket i occupies 2^(i+9) ≤ delta < 2^(i+10) ns (i>=1)
+        //     so bucket 3 covers [2^12, 2^13) = [4096, 8192)
+        //     bucket 6 covers [2^15, 2^16) = [32768, 65536)
+        //     bucket 14 covers [2^23, 2^24) = [8388608, 16777216)
+        //     bucket 15 saturates at delta >= 2^24 = 16777216
+        let live = BindingLiveState::new();
+        let owner = &live.owner_profile_owner;
+
+        // Pick an interior delta for each target bucket to avoid
+        // boundary ambiguity. The `bucket_index_for_ns` comment
+        // documents sub-1024ns delta → bucket 0, so use delta=500.
+        let samples: [(u64, usize); 5] = [
+            (500, 0),            // sub-1024 → bucket 0
+            (5_000, 3),          // 2^12..2^13 → bucket 3
+            (40_000, 6),         // 2^15..2^16 → bucket 6
+            (10_000_000, 14),    // 2^23..2^24 → bucket 14
+            (100_000_000, 15),   // >= 2^24 → bucket 15 (saturate)
+        ];
+        // Cross-check each delta's expected bucket against the
+        // production helper so a future `bucket_index_for_ns`
+        // change either passes (if the mapping matches) or fails
+        // with a clear error (not a silent regression).
+        for &(delta, expected) in samples.iter() {
+            assert_eq!(
+                bucket_index_for_ns(delta),
+                expected,
+                "bucket mapping drift: delta={delta} expected bucket {expected}",
+            );
+            crate::afxdp::tx::record_kick_latency(owner, delta);
+        }
+
+        let snap = live.snapshot();
+        // Each target bucket bumped exactly once.
+        for &(_delta, bucket) in samples.iter() {
+            assert_eq!(
+                snap.tx_kick_latency_hist[bucket],
+                1,
+                "bucket {bucket} must have exactly 1 sample",
+            );
+        }
+        // Total count matches samples.len(); sum_ns matches the
+        // sum of the deltas we fed.
+        let expected_count = samples.len() as u64;
+        let expected_sum_ns: u64 = samples.iter().map(|(d, _)| *d).sum();
+        assert_eq!(snap.tx_kick_latency_count, expected_count);
+        assert_eq!(snap.tx_kick_latency_sum_ns, expected_sum_ns);
+        // Sum of all buckets equals count (single-thread: exact).
+        let sum_buckets: u64 = snap.tx_kick_latency_hist.iter().copied().sum();
+        assert_eq!(sum_buckets, expected_count);
+    }
+
+    #[test]
+    fn tx_kick_latency_accumulation_pin() {
+        // #825 plan §3.9 test #2. N calls with a fixed delta; assert
+        // count == N, sum_ns == N * delta, sum(hist) == N.
+        let live = BindingLiveState::new();
+        let owner = &live.owner_profile_owner;
+        let n: u64 = 1_000;
+        let delta: u64 = 3_000; // bucket 2 ([2^11, 2^12) = [2048, 4096)).
+        for _ in 0..n {
+            crate::afxdp::tx::record_kick_latency(owner, delta);
+        }
+        let snap = live.snapshot();
+        assert_eq!(snap.tx_kick_latency_count, n);
+        assert_eq!(snap.tx_kick_latency_sum_ns, n * delta);
+        let sum_buckets: u64 = snap.tx_kick_latency_hist.iter().copied().sum();
+        assert_eq!(sum_buckets, n);
+        // All mass landed in the single target bucket.
+        let b = bucket_index_for_ns(delta);
+        assert_eq!(snap.tx_kick_latency_hist[b], n);
+    }
+
+    #[test]
+    fn tx_kick_latency_sentinel_zero_delta_records_bucket_zero() {
+        // #825 plan §3.9 test #3a. delta=0 is a legal sample
+        // (kick_end == kick_start within clock granularity) and
+        // MUST land in bucket 0, not get dropped.
+        let live = BindingLiveState::new();
+        let owner = &live.owner_profile_owner;
+        crate::afxdp::tx::record_kick_latency(owner, 0);
+        let snap = live.snapshot();
+        assert_eq!(snap.tx_kick_latency_count, 1);
+        assert_eq!(snap.tx_kick_latency_sum_ns, 0);
+        assert_eq!(snap.tx_kick_latency_hist[0], 1);
+        // No leakage into any other bucket.
+        let sum_buckets: u64 = snap.tx_kick_latency_hist.iter().copied().sum();
+        assert_eq!(sum_buckets, 1);
+    }
+
+    #[test]
+    fn tx_kick_latency_sentinel_underflow_skipped_at_call_site() {
+        // #825 plan §3.9 test #3b. The skip-on-underflow invariant
+        // (`if kick_start != 0 && kick_end >= kick_start`) lives at
+        // the `maybe_wake_tx` caller, NOT inside
+        // `record_kick_latency`. This test documents that contract by
+        // demonstrating:
+        //   (a) the caller's skip is correct: if the caller instead
+        //       passed `kick_end.wrapping_sub(kick_start)` with
+        //       `kick_end < kick_start` (monotonic_nanos() failure
+        //       on either side), the resulting bogus-large delta
+        //       would saturate at bucket 15 — a visible spike that
+        //       the caller's `kick_start != 0 && kick_end >=
+        //       kick_start` guard prevents.
+        //   (b) `record_kick_latency` itself pins to "well-formed
+        //       inputs only": no in-band sentinel check inside the
+        //       helper, matching `record_tx_completions_with_stamp`'s
+        //       `ts_completion >= ts_submit` pattern at tx.rs:113-119.
+        //
+        // The pin: drive `record_kick_latency` with a synthetic
+        // "underflow would produce this" delta and verify it DOES
+        // get recorded (saturation at bucket 15) — proving the
+        // invariant lives at the call site, not inside the helper.
+        // A future refactor that moves the guard inside the helper
+        // MUST also update this test to match.
+        let live = BindingLiveState::new();
+        let owner = &live.owner_profile_owner;
+        // Pre-computed value a caller using `wrapping_sub` would
+        // produce on underflow (e.g., kick_end=0 from clock failure
+        // AFTER kick_start=100): `0_u64.wrapping_sub(100)` =
+        // `u64::MAX - 99`. At that scale the helper's
+        // `bucket_index_for_ns` saturates at 15 — the visible
+        // "spike" the caller-site `kick_start != 0 && kick_end >=
+        // kick_start` check prevents in production (the `>=` half
+        // catches backwards-clock / end-before-start; the
+        // `!= 0` half catches the asymmetric clock-failure case).
+        let bogus_delta = 0u64.wrapping_sub(100);
+        crate::afxdp::tx::record_kick_latency(owner, bogus_delta);
+        let snap = live.snapshot();
+        assert_eq!(
+            snap.tx_kick_latency_count, 1,
+            "helper has no in-band sentinel — skip lives at call site",
+        );
+        assert_eq!(
+            snap.tx_kick_latency_hist[15], 1,
+            "bogus-large delta saturates at bucket 15",
+        );
+        // Invariant pinned: if a future refactor were to add a
+        // sentinel inside `record_kick_latency`, this assertion
+        // would fail and flag the behavior change explicitly.
+        // The production call site at tx.rs:maybe_wake_tx uses
+        // `if kick_start != 0 && kick_end >= kick_start {
+        // record_kick_latency(...) }` which is the correct guard
+        // location (code-review R1 HIGH-1).
+    }
+
+    #[test]
+    fn tx_kick_retry_count_observable_via_snapshot() {
+        // #825 code-review R1 MED-3: pin that the `tx_kick_retry_count`
+        // field is (a) writable via the same owner-side atomic that the
+        // production call site at tx.rs:maybe_wake_tx EAGAIN branch uses
+        // (`binding.live.owner_profile_owner.tx_kick_retry_count
+        //   .fetch_add(1, Ordering::Relaxed)`) and (b) observable via
+        // `BindingLiveState::snapshot()` with the expected value. This
+        // would fail-loud if a future refactor renamed the field, moved
+        // it off `OwnerProfileOwnerWrites`, or dropped the plumb-through
+        // in `snapshot()` — catching the class of regression Codex's
+        // MED-3 flagged.
+        let live = BindingLiveState::new();
+        let owner = &live.owner_profile_owner;
+        // Mirror the production call-site shape exactly: Relaxed
+        // fetch_add on the AtomicU64. N intentionally small — the
+        // property we pin is plumbing correctness, not performance.
+        let n: u64 = 7;
+        for _ in 0..n {
+            owner.tx_kick_retry_count.fetch_add(1, Ordering::Relaxed);
+        }
+        let snap = live.snapshot();
+        assert_eq!(snap.tx_kick_retry_count, n);
+        // A second snapshot re-reads the same atomic (no reset on
+        // snapshot) — bulk sync publishes absolute values per
+        // protocol.rs plan §3.4 decision.
+        let snap2 = live.snapshot();
+        assert_eq!(snap2.tx_kick_retry_count, n);
+    }
+
+    #[test]
+    fn tx_kick_latency_cross_thread_snapshot_skew_within_bound() {
+        // #825 plan §3.9 test #6 (cross-thread skew harness
+        // mirroring #812's tx_latency_hist_cross_thread_snapshot_skew_within_bound
+        // at umem.rs:1097-1274).
+        //
+        // Spawn a writer thread that calls `record_kick_latency` in
+        // a tight loop; spawn a reader thread that calls
+        // `BindingLiveState::snapshot()` in a tight loop. Assert
+        // the bounded-skew invariant `|sum(hist) - count| ≤ K_skew`
+        // holds for every reader sample.
+        //
+        // K_skew = ceil(λ_obs × W_read_max) + 2 (plan §4 / #812 §3.6 R2).
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+
+        let live = Arc::new(BindingLiveState::new());
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_warm = Arc::new(AtomicBool::new(false));
+
+        // Writer: drives the production helper directly (no
+        // fixture indirection). Each iteration feeds one delta,
+        // so count increments by 1 per call.
+        let writer_live = Arc::clone(&live);
+        let writer_stop = Arc::clone(&stop);
+        let writer_warm = Arc::clone(&reader_warm);
+        let writer_handle = std::thread::spawn(move || {
+            let owner = &writer_live.owner_profile_owner;
+            let mut cursor: u64 = 1;
+            // Warm 10k iters before signalling the reader so λ_obs
+            // is steady-state, not startup.
+            for _ in 0..10_000u64 {
+                crate::afxdp::tx::record_kick_latency(owner, cursor & 0xFFFF);
+                cursor = cursor.wrapping_add(1);
+            }
+            writer_warm.store(true, Ordering::Release);
+            while !writer_stop.load(Ordering::Relaxed) {
+                crate::afxdp::tx::record_kick_latency(owner, cursor & 0xFFFF);
+                cursor = cursor.wrapping_add(1);
+            }
+        });
+
+        #[derive(Clone, Copy)]
+        struct Sample {
+            skew: i64,
+            w_read_ns: u64,
+        }
+        let samples: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::with_capacity(5_000)));
+        let reader_live = Arc::clone(&live);
+        let reader_stop = Arc::clone(&stop);
+        let reader_warm_rd = Arc::clone(&reader_warm);
+        let reader_samples = Arc::clone(&samples);
+        let reader_handle = std::thread::spawn(move || {
+            let wait_deadline = Instant::now() + Duration::from_secs(2);
+            while !reader_warm_rd.load(Ordering::Acquire) && Instant::now() < wait_deadline {
+                std::thread::yield_now();
+            }
+            let mut local = Vec::with_capacity(16_384);
+            while !reader_stop.load(Ordering::Relaxed) {
+                let pre = Instant::now();
+                let snap = reader_live.snapshot();
+                let w_read_ns = pre.elapsed().as_nanos() as u64;
+                let count = snap.tx_kick_latency_count as i64;
+                let sum_buckets: i64 =
+                    snap.tx_kick_latency_hist.iter().copied().sum::<u64>() as i64;
+                let skew = (sum_buckets - count).abs();
+                local.push(Sample { skew, w_read_ns });
+            }
+            *reader_samples.lock().unwrap() = local;
+        });
+
+        let wall_start = Instant::now();
+        std::thread::sleep(Duration::from_millis(200));
+        stop.store(true, Ordering::Relaxed);
+        writer_handle.join().expect("writer thread joins cleanly");
+        reader_handle.join().expect("reader thread joins cleanly");
+        let elapsed_ns = wall_start.elapsed().as_nanos() as u64;
+
+        let final_snap = live.snapshot();
+        let count_final = final_snap.tx_kick_latency_count;
+        assert!(
+            count_final > 0,
+            "writer thread produced no samples — harness broken",
+        );
+        let lambda_obs_per_ns = count_final as f64 / elapsed_ns.max(1) as f64;
+
+        let gathered = samples.lock().unwrap().clone();
+        assert!(
+            !gathered.is_empty(),
+            "reader thread produced no snapshots — harness broken",
+        );
+        let mut max_skew = 0i64;
+        let mut max_w_read_ns = 0u64;
+        for s in &gathered {
+            if s.skew > max_skew {
+                max_skew = s.skew;
+            }
+            if s.w_read_ns > max_w_read_ns {
+                max_w_read_ns = s.w_read_ns;
+            }
+        }
+        // #825 vs #812 margin note. The #812 cross-thread harness
+        // uses margin +2 because its writer path (stamp + reap
+        // fold) is ~50× slower per call than a bare
+        // `record_kick_latency` here (3 × fetch_add). That means
+        // within a single long reader window, instantaneous writer
+        // rate can spike above the global λ_obs. We therefore use
+        // margin factor 2× on the λ×W_read term plus +4 fixed —
+        // still O(λ × W) dominated and still a tight bound, just
+        // sized to the faster writer path.
+        let k_skew = (lambda_obs_per_ns * max_w_read_ns as f64 * 2.0).ceil() as i64 + 4;
+        assert!(
+            max_skew <= k_skew,
+            "cross-thread skew {max_skew} exceeds bound K_skew = {k_skew} \
+             (lambda_obs_per_ns={lambda_obs_per_ns:.6}, \
+             max_w_read_ns={max_w_read_ns}, count_final={count_final}, \
+             samples={})",
+            gathered.len(),
+        );
+        eprintln!(
+            "tx_kick_latency_cross_thread_snapshot_skew_within_bound: \
+             max_skew={max_skew} k_skew={k_skew} \
+             lambda_obs_per_ns={lambda_obs_per_ns:.6} \
+             max_w_read_ns={max_w_read_ns} count_final={count_final}",
+        );
     }
 }
 
@@ -1938,6 +2304,26 @@ impl BindingLiveState {
             tx_submit_latency_sum_ns: self
                 .owner_profile_owner
                 .tx_submit_latency_sum_ns
+                .load(Ordering::Relaxed),
+            // #825: owner-written TX kick-latency telemetry. Same
+            // single-writer / Relaxed-load discipline as the #812
+            // submit-latency block above; bounded-read-skew
+            // semantics per plan §4. Load scalars immediately after
+            // the bucket sweep so the snapshot window is tight.
+            tx_kick_latency_hist: Self::snapshot_hist(
+                &self.owner_profile_owner.tx_kick_latency_hist,
+            ),
+            tx_kick_latency_count: self
+                .owner_profile_owner
+                .tx_kick_latency_count
+                .load(Ordering::Relaxed),
+            tx_kick_latency_sum_ns: self
+                .owner_profile_owner
+                .tx_kick_latency_sum_ns
+                .load(Ordering::Relaxed),
+            tx_kick_retry_count: self
+                .owner_profile_owner
+                .tx_kick_retry_count
                 .load(Ordering::Relaxed),
         }
     }

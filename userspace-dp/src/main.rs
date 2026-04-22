@@ -1814,6 +1814,12 @@ mod tests {
             tx_submit_latency_hist: vec![13, 14, 15],
             tx_submit_latency_count: 16,
             tx_submit_latency_sum_ns: 17,
+            // #825: populated so wire-key assertions below also cover
+            // the new TX kick-latency fields.
+            tx_kick_latency_hist: vec![18, 19, 20],
+            tx_kick_latency_count: 21,
+            tx_kick_latency_sum_ns: 22,
+            tx_kick_retry_count: 23,
         };
         let value: serde_json::Value =
             serde_json::to_value(&snap).expect("serialize snapshot to Value");
@@ -1838,6 +1844,12 @@ mod tests {
             "tx_submit_latency_hist",
             "tx_submit_latency_count",
             "tx_submit_latency_sum_ns",
+            // #825: new wire keys — absence breaks the P3 / step1
+            // kick-latency consumer.
+            "tx_kick_latency_hist",
+            "tx_kick_latency_count",
+            "tx_kick_latency_sum_ns",
+            "tx_kick_retry_count",
         ] {
             assert!(
                 obj.contains_key(key),
@@ -1916,6 +1928,12 @@ mod tests {
             tx_submit_latency_hist: vec![9001, 123, 45, 30, 12, 4, 8, 2, 0, 0, 0, 0, 0, 0, 0, 0],
             tx_submit_latency_count: 9225,
             tx_submit_latency_sum_ns: 12_345_678,
+            // #825: unrelated-to-submit values so the round-trip
+            // also covers the four new fields.
+            tx_kick_latency_hist: vec![4000, 80, 20, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            tx_kick_latency_count: 4105,
+            tx_kick_latency_sum_ns: 7_654_321,
+            tx_kick_retry_count: 42,
         };
         let json = serde_json::to_string(&snap).expect("serialize snapshot");
         let back: BindingCountersSnapshot =

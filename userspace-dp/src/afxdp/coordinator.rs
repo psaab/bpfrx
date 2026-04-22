@@ -1438,6 +1438,21 @@ impl Coordinator {
                     .copy_from_slice(&snap.tx_submit_latency_hist);
                 binding.tx_submit_latency_count = snap.tx_submit_latency_count;
                 binding.tx_submit_latency_sum_ns = snap.tx_submit_latency_sum_ns;
+                // #825: per-kick `sendto` latency telemetry mirrors
+                // the #812 submit-latency copy path above. Resize
+                // the operator-facing Vec<u64> to match the
+                // snapshot's fixed-cap array, then copy bucket
+                // counts and scalars. `tx_kick_retry_count` is the
+                // EAGAIN/EWOULDBLOCK tally (T1 ring-pushback).
+                binding
+                    .tx_kick_latency_hist
+                    .resize(snap.tx_kick_latency_hist.len(), 0);
+                binding
+                    .tx_kick_latency_hist
+                    .copy_from_slice(&snap.tx_kick_latency_hist);
+                binding.tx_kick_latency_count = snap.tx_kick_latency_count;
+                binding.tx_kick_latency_sum_ns = snap.tx_kick_latency_sum_ns;
+                binding.tx_kick_retry_count = snap.tx_kick_retry_count;
                 binding.last_heartbeat = snap.last_heartbeat;
                 binding.last_error = snap.last_error;
                 binding.ready = binding.registered
@@ -1530,6 +1545,12 @@ impl Coordinator {
                 binding.tx_submit_latency_hist.clear();
                 binding.tx_submit_latency_count = 0;
                 binding.tx_submit_latency_sum_ns = 0;
+                // #825: zero the kick-latency histogram + retry
+                // counter when the binding has no live state.
+                binding.tx_kick_latency_hist.clear();
+                binding.tx_kick_latency_count = 0;
+                binding.tx_kick_latency_sum_ns = 0;
+                binding.tx_kick_retry_count = 0;
                 binding.last_heartbeat = None;
                 binding.last_error.clear();
                 binding.ready = false;
