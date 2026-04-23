@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) type FastMap<K, V> = FxHashMap<K, V>;
 pub(super) type FastSet<T> = FxHashSet<T>;
@@ -1207,18 +1207,6 @@ pub(super) struct CoSQueueRuntime {
     // via `ArcSwap`, so reads are consistent without ordering discipline
     // here.
     pub(super) drop_counters: CoSQueueDropCounters,
-    /// #829 Slice B — per-binding slot index on the shared lease's
-    /// `binding_frontiers` array. `Some(slot)` means the cross-
-    /// binding virtual-time gate is wired for this queue (shared
-    /// lease + flow-fair); the owner publishes `queue_vtime` to
-    /// `slot` after every drain batch and reads the lease-wide min
-    /// in the drain selector. `None` means the gate is disabled
-    /// for this queue — single-owner exact queues, non-flow-fair
-    /// queues, and bindings that hit the `MAX_BINDINGS_PER_LEASE`
-    /// overflow all take this path. Populated exactly once from
-    /// `apply_cos_queue_flow_fair_promotion` (see
-    /// `docs/pr/829-slice-b/plan.md` §4.2 / §4.3).
-    pub(super) frontier_slot: Option<u32>,
     // #751: per-queue owner-side drain telemetry. Lives inline on the
     // queue runtime so each queue's drain_latency + drain_invocations
     // are genuinely per-queue rather than a binding-wide rollup
@@ -1275,17 +1263,6 @@ pub(super) struct CoSQueueDropCounters {
     /// packet loss. See #706 / #709 for the downstream causes operators
     /// typically chase when this fires.
     pub(super) tx_ring_full_submit_stalls: u64,
-    /// #829 Slice B — count of times the cross-binding virtual-time
-    /// gate fired on this queue. NOT packet loss — the queue was
-    /// skipped for this RR pass so a peer binding on the same
-    /// shared lease could catch up on its fair share. Elevated
-    /// steady-state values indicate the lag limit T
-    /// (`COS_CROSS_BINDING_LAG_LIMIT_BYTES`) is biting (fairness
-    /// working as designed); zero values on a multi-binding lease
-    /// under load indicate the gate is not engaging (likely a
-    /// `frontier_slot = None` regression or a single-binding
-    /// lease).
-    pub(super) cross_binding_lag_parks: u64,
 }
 
 pub(super) struct CoSTimerWheelRuntime {
@@ -1354,69 +1331,9 @@ impl Default for CoSQueueOwnerProfile {
     }
 }
 
-/// #829 Slice B — maximum number of distinct bindings that can
-/// register a cross-binding frontier slot on a single
-/// `SharedCoSQueueLease`. Each binding owns exactly one slot per
-/// lease and is the single writer for that slot. 64 is comfortable
-/// headroom over typical scale (4-12 workers × 1-2 bindings per
-/// worker on a given lease); per-lease footprint is
-/// `64 × 64 B = 4 KB`, negligible against the ~MB-scale UMEM.
-///
-/// Bindings that request a slot after the array is full fall back
-/// to "no gate" mode on that lease (the `register_overflow`
-/// counter surfaces the case).
-pub(super) const MAX_BINDINGS_PER_LEASE: usize = 64;
-
-/// #829 Slice B — 64-byte cache-line-aligned `AtomicU64`. Each
-/// binding frontier slot is wrapped in this so publish-side stores
-/// from one binding do not invalidate another binding's slot line.
-/// Mirrors the `mpsc_inbox::CachePadded<T>` pattern used on the
-/// MPSC head/tail atomics. Lives here (not re-exported from
-/// `mpsc_inbox`) because the mpsc wrapper is private to that
-/// module and we want this atomic to be self-contained next to its
-/// only consumer.
-#[repr(align(64))]
-#[derive(Debug)]
-pub(super) struct CachePaddedAtomicU64(pub(super) AtomicU64);
-
-impl CachePaddedAtomicU64 {
-    #[inline]
-    pub(super) const fn new(v: u64) -> Self {
-        Self(AtomicU64::new(v))
-    }
-}
-
-// #829 Rust review R1 H1 pin: verify the `#[repr(align(64))]` on an
-// 8-byte payload actually yields a full-cacheline struct so that
-// `Box<[CachePaddedAtomicU64]>` places one atomic per cacheline (no
-// false sharing across adjacent slots). A future refactor that adds
-// a field without re-widening the alignment would trip this at
-// compile time.
-const _: () = {
-    assert!(std::mem::size_of::<CachePaddedAtomicU64>() == 64);
-    assert!(std::mem::align_of::<CachePaddedAtomicU64>() == 64);
-};
-
 pub(super) struct SharedCoSQueueLease {
     config: SharedCoSLeaseConfig,
     state: SharedCoSLeaseState,
-    /// #829 Slice B — per-binding WFQ virtual-time frontiers.
-    /// Slot `i` is single-writer owned by whichever binding
-    /// received `Some(i)` from `register_binding`; all other
-    /// bindings only read it via `current_min_frontier`. Value
-    /// `u64::MAX` means "this slot is idle or unregistered" and is
-    /// excluded from the min.
-    binding_frontiers: Box<[CachePaddedAtomicU64]>,
-    /// #829 Slice B — dense slot allocator cursor. Bumped by
-    /// `register_binding` via `fetch_add`; readers in
-    /// `current_min_frontier` use its `Acquire` load as the active
-    /// prefix bound.
-    next_slot: AtomicU32,
-    /// #829 Slice B — observability counter for bindings that
-    /// requested a slot after `MAX_BINDINGS_PER_LEASE` was
-    /// exhausted. Non-zero surfaces the "64 slots are not enough"
-    /// operational case for a follow-up reclamation PR.
-    register_overflow: AtomicU64,
 }
 
 pub(super) struct SharedCoSRootLease {
@@ -1642,136 +1559,13 @@ fn refill_shared_cos_lease_state(
 impl SharedCoSQueueLease {
     pub(super) fn new(rate_bytes: u64, burst_bytes: u64, active_shards: usize) -> Self {
         let config = compute_shared_cos_lease_config(rate_bytes, burst_bytes, active_shards);
-        let binding_frontiers = (0..MAX_BINDINGS_PER_LEASE)
-            .map(|_| CachePaddedAtomicU64::new(u64::MAX))
-            .collect::<Box<[_]>>();
         Self {
             config,
             state: SharedCoSLeaseState {
                 credits: AtomicU64::new(pack_shared_cos_lease_credits(config.burst_bytes, 0)),
                 last_refill_ns: AtomicU64::new(0),
             },
-            binding_frontiers,
-            next_slot: AtomicU32::new(0),
-            register_overflow: AtomicU64::new(0),
         }
-    }
-
-    /// #829 Slice B — claim a cross-binding frontier slot for this
-    /// binding on this lease. Each binding calls this exactly once
-    /// per lease (from `apply_cos_queue_flow_fair_promotion`);
-    /// slots are dense and assigned in registration order via a
-    /// `fetch_add` so concurrent config-reload registrations never
-    /// collide. Returns `None` once the `MAX_BINDINGS_PER_LEASE`
-    /// budget is exhausted; the requesting binding then falls back
-    /// to "no gate" and bumps `register_overflow`.
-    pub(super) fn register_binding(&self) -> Option<u32> {
-        // #829 Rust review R1 H2: saturate `next_slot` at
-        // MAX_BINDINGS_PER_LEASE so the counter reflects actual
-        // registrations rather than unbounded fetch_add growth
-        // under an overflow-loop. Uses compare_exchange_weak in a
-        // bounded loop; wait-free under no contention.
-        const MAX: u32 = MAX_BINDINGS_PER_LEASE as u32;
-        let mut cur = self.next_slot.load(Ordering::Acquire);
-        loop {
-            if cur >= MAX {
-                self.register_overflow.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-            match self.next_slot.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(cur),
-                Err(actual) => cur = actual,
-            }
-        }
-    }
-
-    /// #829 Slice B — publish this binding's current virtual-time
-    /// frontier (`queue_vtime`) into its slot. `Release` pairs with
-    /// the `Acquire` load in `current_min_frontier` so peer
-    /// bindings observe a coherent monotonic frontier.
-    ///
-    /// Single-writer per slot: the binding that owns `slot` is the
-    /// only caller that ever writes it. `slot` must be a value
-    /// previously returned from `register_binding` on this same
-    /// lease; out-of-range values are silently ignored (defensive
-    /// — bugs would show up as "gate never fires for this slot").
-    pub(super) fn publish_binding_frontier(&self, slot: u32, v_local: u64) {
-        if let Some(cell) = self.binding_frontiers.get(slot as usize) {
-            cell.0.store(v_local, Ordering::Release);
-        }
-    }
-
-    /// #829 Slice B — mark this binding's slot as idle so it no
-    /// longer pins the lease-wide min frontier. Called when the
-    /// owning queue drains to empty, or at binding teardown. Same
-    /// single-writer discipline as `publish_binding_frontier`.
-    pub(super) fn mark_binding_idle(&self, slot: u32) {
-        if let Some(cell) = self.binding_frontiers.get(slot as usize) {
-            cell.0.store(u64::MAX, Ordering::Release);
-        }
-    }
-
-    /// #829 Slice B — compute the current minimum virtual-time
-    /// frontier across all registered bindings on this lease.
-    /// Returns `u64::MAX` when no binding has published a non-idle
-    /// value (the gate treats that as "no peer pressure — do not
-    /// throttle"). The reduction walks the active prefix
-    /// `[0..next_slot)` clamped to `MAX_BINDINGS_PER_LEASE`; idle
-    /// (`u64::MAX`) slots are naturally skipped by the min.
-    ///
-    /// `Acquire` loads pair with the writer-side `Release` in
-    /// `publish_binding_frontier` / `mark_binding_idle`.
-    pub(super) fn current_min_frontier(&self) -> u64 {
-        let active = (self.next_slot.load(Ordering::Acquire) as usize).min(MAX_BINDINGS_PER_LEASE);
-        let mut min = u64::MAX;
-        for cell in self.binding_frontiers.iter().take(active) {
-            let v = cell.0.load(Ordering::Acquire);
-            if v < min {
-                min = v;
-            }
-        }
-        min
-    }
-
-    /// #829 Slice B — observability accessor for the overflow
-    /// counter. Non-zero means some binding could not claim a slot
-    /// and is running without a cross-binding fairness gate on this
-    /// lease.
-    #[cfg(test)]
-    pub(super) fn register_overflow_count(&self) -> u64 {
-        self.register_overflow.load(Ordering::Relaxed)
-    }
-
-    /// #829 Slice B — test-only accessor for `next_slot`; used by
-    /// the registration-density pins.
-    #[cfg(test)]
-    pub(super) fn next_slot_count(&self) -> u32 {
-        self.next_slot.load(Ordering::Relaxed)
-    }
-
-    /// #829 Slice B — test-only accessor for the raw credits atom.
-    /// The yield-path test (§5.2 #16) uses this to pin "lease
-    /// credits unchanged on the yield path" — proving
-    /// `maybe_top_up_cos_queue_lease` did NOT run before the gate.
-    #[cfg(test)]
-    pub(super) fn test_credits_load(&self) -> u64 {
-        self.state.credits.load(Ordering::Acquire)
-    }
-
-    /// #829 Slice B — test-only accessor for the raw binding
-    /// frontier slot value. Exposed because the slot array is a
-    /// private field; tests in `tx.rs` need to inspect it.
-    #[cfg(test)]
-    pub(super) fn test_binding_frontier_slot(&self, slot: u32) -> u64 {
-        self.binding_frontiers
-            .get(slot as usize)
-            .map(|cell| cell.0.load(Ordering::Acquire))
-            .unwrap_or(u64::MAX)
     }
 
     pub(super) fn lease_bytes(&self) -> u64 {
@@ -2047,200 +1841,6 @@ mod tests {
     fn shared_cos_lease_config_clamps_burst_to_packed_range() {
         let lease = SharedCoSRootLease::new(10_000_000, u64::MAX, 1);
         assert_eq!(lease.config.burst_bytes, u32::MAX as u64);
-    }
-
-    // ---------------------------------------------------------------
-    // #829 Slice B — `SharedCoSQueueLease::binding_frontiers`
-    // invariant pins. Tests 1-9 from plan §5.1. These pins cover
-    // initialization, dense slot allocation, single-writer
-    // publish/idle semantics, min-reduction correctness, the
-    // "frontier rises" property (R1 HIGH-1), and concurrent
-    // publish safety.
-    // ---------------------------------------------------------------
-
-    fn test_binding_lease() -> SharedCoSQueueLease {
-        // 64 × 1500 = 96 000, same as tx.rs::COS_MIN_BURST_BYTES.
-        // Inlined here (rather than referenced) because that const
-        // is `mod`-private to tx.rs. The exact value is not
-        // load-bearing for these tests — the lease config is
-        // exercised elsewhere; these tests target the
-        // binding_frontiers array.
-        SharedCoSQueueLease::new(1_000_000, 64 * 1500, 1)
-    }
-
-    #[test]
-    fn lease_binding_frontiers_init_to_max() {
-        // Test #1: a fresh lease has every slot at u64::MAX and no
-        // slots registered yet. `current_min_frontier` must return
-        // u64::MAX so the gate treats "no active peer" as "do not
-        // throttle".
-        let lease = test_binding_lease();
-        assert_eq!(lease.next_slot_count(), 0);
-        assert_eq!(lease.register_overflow_count(), 0);
-        for cell in lease.binding_frontiers.iter() {
-            assert_eq!(cell.0.load(Ordering::Relaxed), u64::MAX);
-        }
-        assert_eq!(lease.current_min_frontier(), u64::MAX);
-    }
-
-    #[test]
-    fn register_binding_returns_dense_slot_indexes() {
-        // Test #2: three sequential register_binding calls must
-        // return 0, 1, 2. This is the "dense within the lease"
-        // property R3 §4.1 — slot IDs are allocator-issued, NOT
-        // derived from worker IDs, so non-dense worker_id (R2
-        // HIGH-3) is sidestepped.
-        let lease = test_binding_lease();
-        assert_eq!(lease.register_binding(), Some(0));
-        assert_eq!(lease.register_binding(), Some(1));
-        assert_eq!(lease.register_binding(), Some(2));
-        assert_eq!(lease.next_slot_count(), 3);
-        assert_eq!(lease.register_overflow_count(), 0);
-    }
-
-    #[test]
-    fn register_binding_overflow_returns_none_increments_counter() {
-        // Test #3: the MAX_BINDINGS_PER_LEASE+1'th registration
-        // returns None AND bumps `register_overflow` for ops
-        // observability. The operator contract is that a non-zero
-        // overflow counter means "some binding is running without
-        // the cross-binding fairness gate — investigate".
-        let lease = test_binding_lease();
-        for i in 0..MAX_BINDINGS_PER_LEASE {
-            assert_eq!(lease.register_binding(), Some(i as u32));
-        }
-        assert_eq!(lease.register_binding(), None);
-        assert_eq!(lease.register_overflow_count(), 1);
-        // A further overflow call bumps the counter again.
-        assert_eq!(lease.register_binding(), None);
-        assert_eq!(lease.register_overflow_count(), 2);
-    }
-
-    #[test]
-    fn publish_binding_frontier_writes_slot() {
-        // Test #4: publish_binding_frontier writes only the
-        // addressed slot. Single-writer-per-slot guarantee is
-        // checked by asserting all OTHER slots retain u64::MAX.
-        let lease = test_binding_lease();
-        assert_eq!(lease.register_binding(), Some(0));
-        assert_eq!(lease.register_binding(), Some(1));
-        assert_eq!(lease.register_binding(), Some(2));
-        lease.publish_binding_frontier(2, 100);
-        assert_eq!(lease.binding_frontiers[2].0.load(Ordering::Relaxed), 100);
-        assert_eq!(
-            lease.binding_frontiers[0].0.load(Ordering::Relaxed),
-            u64::MAX
-        );
-        assert_eq!(
-            lease.binding_frontiers[1].0.load(Ordering::Relaxed),
-            u64::MAX
-        );
-    }
-
-    #[test]
-    fn current_min_frontier_skips_idle_slots() {
-        // Test #5: u64::MAX (idle) slots drop out of the min by
-        // virtue of being the max representable u64. Min here is
-        // 50 from slot 2; slot 1 stays idle and must not pull the
-        // min below 50.
-        let lease = test_binding_lease();
-        assert_eq!(lease.register_binding(), Some(0));
-        assert_eq!(lease.register_binding(), Some(1));
-        assert_eq!(lease.register_binding(), Some(2));
-        assert_eq!(lease.register_binding(), Some(3));
-        lease.publish_binding_frontier(0, 100);
-        lease.publish_binding_frontier(2, 50);
-        assert_eq!(lease.current_min_frontier(), 50);
-    }
-
-    #[test]
-    fn current_min_frontier_returns_max_when_no_active_slots() {
-        // Test #6: fresh lease (no slots registered) reduces to
-        // u64::MAX — the "no peer pressure, do not gate" sentinel.
-        let lease = test_binding_lease();
-        assert_eq!(lease.current_min_frontier(), u64::MAX);
-
-        // Also: registrations with no publishes — all slots still
-        // idle — still reduce to u64::MAX.
-        assert_eq!(lease.register_binding(), Some(0));
-        assert_eq!(lease.register_binding(), Some(1));
-        assert_eq!(lease.current_min_frontier(), u64::MAX);
-    }
-
-    #[test]
-    fn current_min_frontier_rises_when_slow_binding_advances() {
-        // Test #7: R1 HIGH-1 pin. The fix to R0's "frontier is a
-        // stale once-published value" was to recompute the min on
-        // every gate check from live slot values. Slow binding 1
-        // starts at 50; fast binding 0 is at 100; min=50. When the
-        // slow binding advances to 200, the min rises to min(100,
-        // 200) = 100. If the implementation caches a prior min
-        // this assertion fails.
-        let lease = test_binding_lease();
-        assert_eq!(lease.register_binding(), Some(0));
-        assert_eq!(lease.register_binding(), Some(1));
-        lease.publish_binding_frontier(0, 100);
-        lease.publish_binding_frontier(1, 50);
-        assert_eq!(lease.current_min_frontier(), 50);
-        lease.publish_binding_frontier(1, 200);
-        assert_eq!(lease.current_min_frontier(), 100);
-    }
-
-    #[test]
-    fn mark_binding_idle_drops_slot() {
-        // Test #8: mark_binding_idle flips a slot back to u64::MAX
-        // so a fast binding that drained to empty does not pin the
-        // min at its stale high value and gate the peer out.
-        let lease = test_binding_lease();
-        assert_eq!(lease.register_binding(), Some(0));
-        assert_eq!(lease.register_binding(), Some(1));
-        lease.publish_binding_frontier(0, 100);
-        lease.publish_binding_frontier(1, 50);
-        assert_eq!(lease.current_min_frontier(), 50);
-        lease.mark_binding_idle(1);
-        assert_eq!(lease.current_min_frontier(), 100);
-        lease.mark_binding_idle(0);
-        // All slots idle → sentinel.
-        assert_eq!(lease.current_min_frontier(), u64::MAX);
-    }
-
-    #[test]
-    fn publish_concurrent_two_bindings() {
-        // Test #9: spawn two threads each writing its own slot
-        // 100k times with alternating values; at join, the min
-        // must be ≤ the smaller of each thread's final observed
-        // publish value. This pins that concurrent Release stores
-        // are correctly paired with the Acquire loads in
-        // `current_min_frontier` — if the memory ordering is
-        // relaxed to Relaxed, this test becomes flaky in CI.
-        use std::sync::Arc as StdArc;
-        use std::thread;
-        let lease = StdArc::new(test_binding_lease());
-        assert_eq!(lease.register_binding(), Some(0));
-        assert_eq!(lease.register_binding(), Some(1));
-        let a = StdArc::clone(&lease);
-        let b = StdArc::clone(&lease);
-        let ha = thread::spawn(move || {
-            for i in 0..100_000u64 {
-                a.publish_binding_frontier(0, i);
-            }
-            99_999u64
-        });
-        let hb = thread::spawn(move || {
-            for i in 0..100_000u64 {
-                b.publish_binding_frontier(1, i);
-            }
-            99_999u64
-        });
-        let final_a = ha.join().unwrap();
-        let final_b = hb.join().unwrap();
-        let min = lease.current_min_frontier();
-        assert!(
-            min <= final_a.min(final_b),
-            "min {} must be <= smaller final value {}",
-            min,
-            final_a.min(final_b),
-        );
     }
 }
 
