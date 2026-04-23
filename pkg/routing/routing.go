@@ -3,6 +3,7 @@ package routing
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -42,14 +43,27 @@ type InterfaceMonitorStatus struct {
 type Manager struct {
 	nlHandle   *netlink.Handle
 	tunnels    []string                    // currently created tunnel interface names
-	vrfs       []string                    // currently created VRF device names
 	xfrmis     []string                    // currently created xfrmi interface names
 	bonds      []string                    // currently created bond interface names
 	reths      []string                    // currently created RETH interface names
 	keepalives map[string]*keepaliveRunner // tunnel name -> runner
 
+	// vrfsMu serializes all reads and writes of vrfs, and is held for
+	// the full duration of ReconcileVRFs/CreateVRF including the
+	// netlink operations. Callers must not assume ReconcileVRFs is
+	// re-entrant. See docs/pr/844-vrf-idempotent/plan.md.
+	vrfsMu sync.Mutex
+	vrfs   []string // currently managed VRF device names
+
 	mu            sync.Mutex
 	monitorStatus map[int][]InterfaceMonitorStatus // redundancy-group ID -> monitor states
+}
+
+// VRFSpec describes a single VRF by its logical name (no "vrf-"
+// prefix) and its kernel routing table ID.
+type VRFSpec struct {
+	Name    string
+	TableID int
 }
 
 // keepaliveRunner manages the goroutine for a single tunnel's keepalive.
@@ -80,35 +94,254 @@ func (m *Manager) Close() error {
 }
 
 // CreateVRF creates a Linux VRF device and assigns it a routing table.
+// Prefer ReconcileVRFs for multi-VRF config apply; CreateVRF is retained
+// for callers that need single-VRF semantics.
 func (m *Manager) CreateVRF(name string, tableID int) error {
-	vrfName := "vrf-" + name
+	m.vrfsMu.Lock()
+	defer m.vrfsMu.Unlock()
+	return m.createVRFLocked(name, tableID)
+}
 
-	// Check if VRF already exists
-	if _, err := m.nlHandle.LinkByName(vrfName); err == nil {
-		// Already exists, ensure it's up
-		link, _ := m.nlHandle.LinkByName(vrfName)
-		m.nlHandle.LinkSetUp(link)
+// createVRFLocked creates a VRF and appends it to m.vrfs. Caller must
+// hold vrfsMu. External VRFs (already present) are left alone and not
+// adopted into m.vrfs.
+func (m *Manager) createVRFLocked(name string, tableID int) error {
+	vrfName := "vrf-" + name
+	if existing, err := m.nlHandle.LinkByName(vrfName); err == nil {
+		if err := m.nlHandle.LinkSetUp(existing); err != nil {
+			slog.Debug("failed to set existing VRF up", "name", vrfName, "err", err)
+		}
 		slog.Debug("VRF already exists", "name", vrfName, "table", tableID)
 		return nil
 	}
+	added, err := createLinkedVRF(m.nlHandle, vrfName, tableID)
+	if added {
+		m.vrfs = append(m.vrfs, vrfName)
+	}
+	return err
+}
 
+// vrfOps is the minimal netlink surface ReconcileVRFs needs. Satisfied
+// by *netlink.Handle in production; tests substitute a fake.
+type vrfOps interface {
+	LinkByName(string) (netlink.Link, error)
+	LinkAdd(netlink.Link) error
+	LinkDel(netlink.Link) error
+	LinkSetUp(netlink.Link) error
+}
+
+// IsManagedVRF reports whether the given logical VRF name (e.g. "mgmt",
+// "sfmix") is currently in the manager's tracked set. Used by callers
+// that need to gate downstream actions on successful VRF creation.
+func (m *Manager) IsManagedVRF(name string) bool {
+	vrfName := "vrf-" + name
+	m.vrfsMu.Lock()
+	defer m.vrfsMu.Unlock()
+	for _, n := range m.vrfs {
+		if n == vrfName {
+			return true
+		}
+	}
+	return false
+}
+
+// ReconcileVRFs brings the manager's owned-VRF set to match desired.
+//
+// Ownership rules — xpfd is authoritative for the "vrf-<name>"
+// namespace of names appearing in desired. Any VRF whose name appears
+// in desired is considered ours regardless of creator:
+//   - Desired VRF, present in kernel with matching table: no-op
+//     (preserve ifindex). Adopted into m.vrfs if not already there.
+//   - Desired VRF, present in kernel with mismatching table:
+//     LinkDel + LinkAdd (recreate). Adopted into m.vrfs.
+//   - Desired VRF, absent from kernel: LinkAdd, adopted into m.vrfs.
+//   - Non-desired VRF in kernel but NOT in m.vrfs: never touched
+//     (truly external — outside our namespace claim).
+//   - Managed VRF in m.vrfs not in desired: LinkDel, removed from m.vrfs.
+//
+// Holds vrfsMu for the full body including netlink operations. VRF
+// reconcile is low-frequency; lock contention is not a concern and
+// serialized reconciles avoid TOCTOU between concurrent callers.
+func (m *Manager) ReconcileVRFs(desired []VRFSpec) error {
+	m.vrfsMu.Lock()
+	defer m.vrfsMu.Unlock()
+	newVrfs, err := reconcileVRFs(m.nlHandle, m.vrfs, desired)
+	m.vrfs = newVrfs
+	return err
+}
+
+// errLinkNotFound is an internal sentinel wrapper used when the
+// manager generates its own "not found" errors (e.g. from fakes in
+// tests, or from any path not going through the netlink library).
+// netlink.LinkNotFoundError cannot be constructed outside the
+// netlink package because its embedded error field is unexported.
+type errLinkNotFound struct{ error }
+
+// isLinkNotFound reports whether err is a "link not found" error
+// from either the netlink library or the internal sentinel. Other
+// errors (EINVAL, EBUSY, transport failure) must NOT be treated as
+// absence.
+func isLinkNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	var nlNotFound netlink.LinkNotFoundError
+	if errors.As(err, &nlNotFound) {
+		return true
+	}
+	var internal errLinkNotFound
+	return errors.As(err, &internal)
+}
+
+// reconcileVRFs is the pure core of ReconcileVRFs, parameterised on a
+// vrfOps so tests can inject a fake. Returns the new tracked set and
+// the first error encountered (others are logged).
+//
+// Ownership semantics: a VRF is "ours" if its name appears in desired.
+// xpfd is authoritative for the "vrf-<instance>" namespace derived
+// from configured routing instances (plus the well-known "vrf-mgmt").
+// If such a VRF already exists in the kernel (e.g. surviving from a
+// previous daemon instance), reconcileVRFs ADOPTS it into m.vrfs so
+// a later reconcile can manage or delete it. Non-desired kernel VRFs
+// are left strictly alone.
+//
+// Partial-failure contract: if LinkAdd succeeds but a follow-up
+// (LinkByName / LinkSetUp) fails, the VRF is still recorded in the
+// tracked set. Similarly, LinkDel failures retain ownership. This
+// ensures a future reconcile can retry.
+func reconcileVRFs(ops vrfOps, tracked []string, desired []VRFSpec) ([]string, error) {
+	desiredByName := make(map[string]int, len(desired))
+	for _, spec := range desired {
+		desiredByName["vrf-"+spec.Name] = spec.TableID
+	}
+	managed := make(map[string]bool, len(tracked))
+	for _, name := range tracked {
+		managed[name] = true
+	}
+
+	var firstErr error
+	recordErr := func(err error) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	newTracked := make([]string, 0, len(desired))
+
+	for _, spec := range desired {
+		vrfName := "vrf-" + spec.Name
+		link, kerErr := ops.LinkByName(vrfName)
+
+		if kerErr != nil {
+			if !isLinkNotFound(kerErr) {
+				// Transient netlink error — don't assume the VRF is
+				// absent and don't attempt to create it. Next
+				// reconcile will retry. CRUCIALLY: if this name was
+				// already in m.vrfs, retain ownership — otherwise a
+				// transient blip would silently drop us from the
+				// managed set and IsManagedVRF would start lying.
+				if managed[vrfName] {
+					newTracked = append(newTracked, vrfName)
+				}
+				recordErr(fmt.Errorf("lookup VRF %s: %w", vrfName, kerErr))
+				continue
+			}
+			// Genuinely not in kernel — create it.
+			added, err := createLinkedVRF(ops, vrfName, spec.TableID)
+			if added {
+				newTracked = append(newTracked, vrfName)
+			}
+			recordErr(err)
+			continue
+		}
+
+		// Present in kernel. Adopt it — the vrf-<desired-name>
+		// namespace is ours, regardless of who created the device.
+		currentTable := vrfTable(link)
+		if currentTable == uint32(spec.TableID) {
+			if err := ops.LinkSetUp(link); err != nil {
+				slog.Debug("VRF set-up failed (non-fatal)", "name", vrfName, "err", err)
+			}
+			newTracked = append(newTracked, vrfName)
+			continue
+		}
+
+		// Table mismatch — recreate with desired table.
+		slog.Warn("VRF table ID mismatches desired, recreating",
+			"name", vrfName, "old_table", currentTable, "new_table", spec.TableID)
+		if err := ops.LinkDel(link); err != nil {
+			// Delete failed — VRF still exists with wrong table.
+			// Retain ownership so a future reconcile can retry.
+			newTracked = append(newTracked, vrfName)
+			recordErr(fmt.Errorf("delete stale VRF %s: %w", vrfName, err))
+			continue
+		}
+		added, err := createLinkedVRF(ops, vrfName, spec.TableID)
+		if added {
+			newTracked = append(newTracked, vrfName)
+		}
+		recordErr(err)
+	}
+
+	// Delete managed VRFs no longer in desired.
+	for _, existing := range tracked {
+		if _, stillDesired := desiredByName[existing]; stillDesired {
+			continue
+		}
+		link, err := ops.LinkByName(existing)
+		if err != nil {
+			if !isLinkNotFound(err) {
+				// Transient — retain ownership; don't drop silently.
+				newTracked = append(newTracked, existing)
+				recordErr(fmt.Errorf("lookup VRF %s for delete: %w", existing, err))
+			}
+			// Not found: already gone; nothing to do.
+			continue
+		}
+		if err := ops.LinkDel(link); err != nil {
+			// Delete failed — VRF still exists. Retain in tracked so
+			// next reconcile retries instead of losing ownership.
+			newTracked = append(newTracked, existing)
+			recordErr(fmt.Errorf("delete VRF %s: %w", existing, err))
+			continue
+		}
+		slog.Info("VRF removed", "name", existing)
+	}
+
+	return newTracked, firstErr
+}
+
+// createLinkedVRF creates a VRF. Returns (added, err) where added is
+// true if LinkAdd succeeded (even if a follow-up step failed). This
+// lets callers record ownership of partially-created VRFs so a future
+// reconcile can clean them up. Does not append to any tracked list —
+// caller owns tracked-set updates.
+func createLinkedVRF(ops vrfOps, vrfName string, tableID int) (bool, error) {
 	vrf := &netlink.Vrf{
 		LinkAttrs: netlink.LinkAttrs{Name: vrfName},
 		Table:     uint32(tableID),
 	}
-	if err := m.nlHandle.LinkAdd(vrf); err != nil {
-		return fmt.Errorf("create VRF %s: %w", vrfName, err)
+	if err := ops.LinkAdd(vrf); err != nil {
+		return false, fmt.Errorf("create VRF %s: %w", vrfName, err)
 	}
-	link, err := m.nlHandle.LinkByName(vrfName)
+	link, err := ops.LinkByName(vrfName)
 	if err != nil {
-		return fmt.Errorf("find VRF %s: %w", vrfName, err)
+		return true, fmt.Errorf("find VRF %s after add: %w", vrfName, err)
 	}
-	if err := m.nlHandle.LinkSetUp(link); err != nil {
-		return fmt.Errorf("set VRF %s up: %w", vrfName, err)
+	if err := ops.LinkSetUp(link); err != nil {
+		return true, fmt.Errorf("set VRF %s up: %w", vrfName, err)
 	}
-	m.vrfs = append(m.vrfs, vrfName)
 	slog.Info("VRF created", "name", vrfName, "table", tableID)
-	return nil
+	return true, nil
+}
+
+// vrfTable returns the routing table of a VRF link, or 0 if the link
+// is not a VRF (which indicates a namespace collision with a
+// non-VRF device of the same name).
+func vrfTable(link netlink.Link) uint32 {
+	if v, ok := link.(*netlink.Vrf); ok {
+		return v.Table
+	}
+	return 0
 }
 
 // BindInterfaceToVRF binds a network interface to a VRF device.
@@ -127,23 +360,6 @@ func (m *Manager) BindInterfaceToVRF(ifaceName, instanceName string) error {
 		return fmt.Errorf("bind %s to VRF %s: %w", ifaceName, vrfName, err)
 	}
 	slog.Info("interface bound to VRF", "interface", ifaceName, "vrf", vrfName)
-	return nil
-}
-
-// ClearVRFs removes all previously created VRF devices.
-func (m *Manager) ClearVRFs() error {
-	for _, name := range m.vrfs {
-		link, err := m.nlHandle.LinkByName(name)
-		if err != nil {
-			continue
-		}
-		if err := m.nlHandle.LinkDel(link); err != nil {
-			slog.Warn("failed to delete VRF", "name", name, "err", err)
-		} else {
-			slog.Info("VRF removed", "name", name)
-		}
-	}
-	m.vrfs = nil
 	return nil
 }
 
