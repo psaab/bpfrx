@@ -57,7 +57,7 @@ extern void flush_tx_buffers(struct pipeline_ctx *ctx);
 #define CT_NEW         0
 #define CT_ESTABLISHED 1
 #define CT_INVALID     2
-#define CT_DNS_REPLY   3
+/* CT_DNS_REPLY removed — #850 uses META_FLAG_DNS_REPLY_FASTPATH instead. */
 
 /**
  * trace_match — Check if a packet matches the trace filter.
@@ -163,10 +163,6 @@ process_packet(struct rte_mbuf *pkt, struct pipeline_ctx *ctx)
 	    !(meta.nat_flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT)))
 		goto forward;  /* Fast path: established, no NAT */
 
-	/* allow-dns-reply: bypass policy for unsolicited DNS responses */
-	if (ct_result == CT_DNS_REPLY)
-		goto forward;
-
 	/* 6. Policy (replaces xdp_policy, only for new sessions) */
 	if (ct_result == CT_NEW) {
 		int action = policy_check(pkt, &meta, ctx);
@@ -209,6 +205,22 @@ process_packet(struct rte_mbuf *pkt, struct pipeline_ctx *ctx)
 			}
 			goto drop;
 		}
+
+		/* #850: allow-dns-reply fast-path admit. When the DNS-reply
+		 * flag is set AND the resolution doesn't require NAT, admit
+		 * sessionlessly — no conntrack_create, no NAT state to
+		 * anchor.  Falls through to normal session install if NAT
+		 * is needed (so SNAT/NAT64/DNAT state has a GC anchor).
+		 * NAT64 is included defensively; today's DPDK pipeline
+		 * doesn't set SESS_FLAG_NAT64 on new flows before this
+		 * gate, but keeping the check future-proofs against any
+		 * later NAT64 new-flow path. */
+		if ((meta.meta_flags & META_FLAG_DNS_REPLY_FASTPATH) &&
+		    !(meta.nat_flags & (SESS_FLAG_SNAT | SESS_FLAG_DNAT |
+					SESS_FLAG_NAT64))) {
+			goto forward;
+		}
+
 		conntrack_create(pkt, &meta, ctx);
 		ctr_global_inc(ctx, GLOBAL_CTR_SESSIONS_NEW);
 	}

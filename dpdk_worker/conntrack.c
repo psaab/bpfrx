@@ -133,7 +133,7 @@ tcp_mss_clamp(struct rte_mbuf *pkt, struct pkt_meta *meta,
 #define CT_NEW         0
 #define CT_ESTABLISHED 1
 #define CT_INVALID     2
-#define CT_DNS_REPLY   3
+/* CT_DNS_REPLY removed — #850 uses META_FLAG_DNS_REPLY_FASTPATH instead. */
 
 /**
  * ct_tcp_update_state — TCP state machine transition.
@@ -801,13 +801,14 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		}
 	}
 
-	/* allow-dns-reply: permit unsolicited DNS response packets
-	 * (UDP src port 53) without a matching session, bypassing policy. */
+	/* #850: allow-dns-reply sessionless admit. Mark the flag so
+	 * the pipeline knows to skip session creation on Permit; still
+	 * return CT_NEW so policy_check() runs. */
 	if (meta->protocol == PROTO_UDP &&
 	    meta->src_port == rte_cpu_to_be_16(53) &&
 	    ctx->shm->flow_config &&
 	    ctx->shm->flow_config->allow_dns_reply) {
-		return CT_DNS_REPLY;
+		meta->meta_flags |= META_FLAG_DNS_REPLY_FASTPATH;
 	}
 
 	return CT_NEW;
