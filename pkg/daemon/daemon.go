@@ -1565,20 +1565,48 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		slog.Warn("config validation", "warning", w)
 	}
 
-	// 0. Create VRF devices for routing instances (skip forwarding type)
-	if d.routing != nil && len(cfg.RoutingInstances) > 0 {
-		if err := d.routing.ClearVRFs(); err != nil {
-			slog.Warn("failed to clear previous VRFs", "err", err)
+	// 0. Reconcile VRF devices (routing-instance VRFs + management VRF).
+	// ReconcileVRFs is idempotent: VRFs already present with the correct
+	// table ID are preserved (ifindex unchanged). Removed-from-config
+	// VRFs are deleted. External (operator-created) VRFs are never
+	// touched. See docs/pr/844-vrf-idempotent/plan.md.
+	const mgmtVRFName = "mgmt"
+	const mgmtTableID = 999
+	mgmtIfaces := make(map[string]bool)
+	for name := range cfg.Interfaces.Interfaces {
+		if strings.HasPrefix(name, "fxp") || strings.HasPrefix(name, "fab") || strings.HasPrefix(name, "em") {
+			mgmtIfaces[config.LinuxIfName(name)] = true
 		}
+	}
+
+	if d.routing != nil {
+		var desired []routing.VRFSpec
 		for _, ri := range cfg.RoutingInstances {
 			if ri.InstanceType == "forwarding" {
 				slog.Info("forwarding instance, skipping VRF creation",
 					"instance", ri.Name)
 				continue
 			}
-			if err := d.routing.CreateVRF(ri.Name, ri.TableID); err != nil {
-				slog.Warn("failed to create VRF",
-					"instance", ri.Name, "table", ri.TableID, "err", err)
+			desired = append(desired, routing.VRFSpec{
+				Name:    ri.Name,
+				TableID: ri.TableID,
+			})
+		}
+		if len(mgmtIfaces) > 0 {
+			desired = append(desired, routing.VRFSpec{
+				Name:    mgmtVRFName,
+				TableID: mgmtTableID,
+			})
+		}
+		if err := d.routing.ReconcileVRFs(desired); err != nil {
+			slog.Warn("failed to reconcile VRFs", "err", err)
+		}
+	}
+
+	// 0a. Bind routing-instance interfaces to their VRFs.
+	if d.routing != nil {
+		for _, ri := range cfg.RoutingInstances {
+			if ri.InstanceType == "forwarding" {
 				continue
 			}
 			for _, ifaceName := range ri.Interfaces {
@@ -1597,31 +1625,18 @@ func (d *Daemon) applyConfig(cfg *config.Config) {
 		}
 	}
 
-	// 0.5. Create management VRF for fxp* interfaces.
-	// Management/control interfaces (fxp0, fxp1, fab0) are placed in a separate
-	// routing instance so their DHCP/static routes don't pollute the data-plane
-	// routing table. This mirrors Junos __juniper_private1/2__ instances.
+	// 0b. Bind management interfaces (fxp*/fab*/em*) to vrf-mgmt, but
+	// only if ReconcileVRFs actually got vrf-mgmt into the managed set.
+	// If reconcile errored out before vrf-mgmt could be created,
+	// downstream code (applyMgmtVRFRoutes, HA sync) would otherwise
+	// run against a non-existent VRF.
 	d.mgmtVRFInterfaces = nil
-	if d.routing != nil {
-		mgmtIfaces := make(map[string]bool)
-		for name := range cfg.Interfaces.Interfaces {
-			if strings.HasPrefix(name, "fxp") || strings.HasPrefix(name, "fab") || strings.HasPrefix(name, "em") {
-				mgmtIfaces[config.LinuxIfName(name)] = true
-			}
-		}
-		if len(mgmtIfaces) > 0 {
-			const mgmtVRFName = "mgmt"
-			const mgmtTableID = 999
-			if err := d.routing.CreateVRF(mgmtVRFName, mgmtTableID); err != nil {
-				slog.Warn("failed to create management VRF", "err", err)
-			} else {
-				d.mgmtVRFInterfaces = mgmtIfaces
-				for ifName := range mgmtIfaces {
-					if err := d.routing.BindInterfaceToVRF(ifName, mgmtVRFName); err != nil {
-						slog.Warn("failed to bind interface to management VRF",
-							"interface", ifName, "err", err)
-					}
-				}
+	if d.routing != nil && len(mgmtIfaces) > 0 && d.routing.IsManagedVRF(mgmtVRFName) {
+		d.mgmtVRFInterfaces = mgmtIfaces
+		for ifName := range mgmtIfaces {
+			if err := d.routing.BindInterfaceToVRF(ifName, mgmtVRFName); err != nil {
+				slog.Warn("failed to bind interface to management VRF",
+					"interface", ifName, "err", err)
 			}
 		}
 	}
