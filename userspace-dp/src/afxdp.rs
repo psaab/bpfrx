@@ -245,19 +245,6 @@ pub(crate) use self::worker::{
     BindingLiveSnapshot, BindingWorker, SyncedSessionEntry, XskBindMode, fabric_queue_hash,
     push_recent_exception, push_recent_session_delta, worker_loop,
 };
-
-/// #829 Slice B — one-shot operator override for
-/// `COS_CROSS_BINDING_LAG_LIMIT_BYTES`. Called exactly once at
-/// process start from `main::run` when
-/// `BPFRX_COS_CROSS_BINDING_LAG_BYTES` is set and parses. The
-/// underlying `OnceLock` makes the call idempotent — a second
-/// call with the same or different value is silently ignored so
-/// workers that have already read the override stay consistent
-/// with main's prior value. Must be called BEFORE any worker
-/// thread spawns.
-pub(crate) fn set_cos_cross_binding_lag_limit_override(v: u64) -> bool {
-    tx::COS_CROSS_BINDING_LAG_LIMIT_OVERRIDE.set(v).is_ok()
-}
 fn should_install_local_reverse_session(decision: SessionDecision, fabric_ingress: bool) -> bool {
     let fabric_wire_placeholder =
         shared_ops::is_fabric_wire_placeholder(fabric_ingress, false, decision);

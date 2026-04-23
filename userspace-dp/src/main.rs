@@ -85,37 +85,6 @@ fn run() -> Result<(), String> {
         }
     }
     let args = parse_args()?;
-
-    // #829 Slice B — optional operator override of the cross-binding
-    // virtual-time lag budget. Read ONCE here before any worker
-    // spawns so the `OnceLock` inside the dataplane never races
-    // with a hot-path reader. Invalid values are ignored (with a
-    // stderr warning) rather than fatal so ops rollouts cannot
-    // silently brick the daemon on a typo. Default behaviour —
-    // and the shipped value when the env var is unset — is the
-    // compile-time `COS_CROSS_BINDING_LAG_LIMIT_BYTES` (64 KB;
-    // see the const's doc in `afxdp/tx.rs`).
-    if let Ok(raw) = env::var("BPFRX_COS_CROSS_BINDING_LAG_BYTES") {
-        match raw.trim().parse::<u64>() {
-            Ok(v) => {
-                if afxdp::set_cos_cross_binding_lag_limit_override(v) {
-                    eprintln!(
-                        "xpf-userspace-dp: BPFRX_COS_CROSS_BINDING_LAG_BYTES override = {v}"
-                    );
-                } else {
-                    eprintln!(
-                        "xpf-userspace-dp: BPFRX_COS_CROSS_BINDING_LAG_BYTES already set, ignoring {v}"
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "xpf-userspace-dp: ignoring invalid BPFRX_COS_CROSS_BINDING_LAG_BYTES={raw:?}: {e}"
-                );
-            }
-        }
-    }
-
     // Enable NAPI busy polling sysctls only in busy-poll mode.
     // In interrupt mode, skip these so the kernel uses normal interrupt delivery.
     if args.poll_mode == PollMode::BusyPoll {
