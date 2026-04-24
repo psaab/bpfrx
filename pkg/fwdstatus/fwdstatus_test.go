@@ -29,7 +29,7 @@ func TestFormat_LabelsAndOrderEBPF(t *testing.T) {
 	wantLabelsInOrder := []string{
 		"State",
 		"Daemon CPU utilization",
-		"Worker threads utilization",
+		"Worker threads CPU utilization",
 		"Heap utilization",
 		"Buffer utilization",
 		"Uptime:",
@@ -140,7 +140,7 @@ func TestFormat_HeapAndBufferClampButCPUDoesNot(t *testing.T) {
 		t.Errorf("daemon CPU must not clamp to 100 (per-core): %s", out)
 	}
 	// negative worker CPU floors to 0
-	if !regexp.MustCompile(`Worker threads utilization\s+0%\s*/\s*0%\s*/\s*0%`).MatchString(out) {
+	if !regexp.MustCompile(`Worker threads CPU utilization\s+0%\s*/\s*0%\s*/\s*0%`).MatchString(out) {
 		t.Errorf("expected worker CPU floored to 0: %s", out)
 	}
 	// 150% heap clamps to 100

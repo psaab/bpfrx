@@ -17,7 +17,7 @@ func buildSnapshot(now time.Time, count int, daemonRate, activeRate, numWorkers 
 		samples[i] = cpuSample{
 			wall:           now.Add(-time.Duration(count-1-i) * time.Second),
 			daemonCPUNs:    uint64(i) * daemonRate,
-			workerActiveNs: uint64(i) * activeRate,
+			workerThreadNs: uint64(i) * activeRate,
 			workerWallNs:   uint64(i) * numWorkers * 1_000_000_000,
 		}
 	}

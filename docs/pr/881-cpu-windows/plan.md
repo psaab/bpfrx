@@ -1,25 +1,45 @@
-# PR: #881 show chassis forwarding — 5s / 1m / 5m CPU windows + honest worker activity
+# PR: #881 show chassis forwarding — 5s / 1m / 5m CPU windows
 
 ## Goal
 
 Replace the cumulative-since-start CPU% on the `Daemon CPU utilization`
 and `Worker threads CPU utilization` rows with three Junos-style
-sliding windows (5s / 1m / 5m), and fix the worker row to measure
-**dataplane activity** rather than OS thread CPU time.
+sliding windows (5s / 1m / 5m). Cumulative hides current load — a
+daemon that burned 100% for 10s three days ago reads ~0% today.
+Operators diagnose live load, not lifetime averages.
 
-Two problems with the shipped-in-#880 rows:
+## History — worker-row semantic change reverted
 
-1. **Cumulative hides current load.** A daemon that burned 100% for
-   10s three days ago reads ~0% today. Operators diagnose live load,
-   not lifetime averages.
+An earlier iteration of this PR also proposed switching the worker row
+from OS thread CPU (`thread_cpu_ns / wall_ns`) to dataplane activity
+(`Σactive_ns / Σwall_ns` from #869 telemetry). **Empirical validation
+killed that change.** At 25 Gbps iperf3 load on
+`loss:xpf-userspace-fw0`, the activity signal read **0%** per worker
+while `top` and `thread_cpu/wall` showed ~5-10% per worker. Two
+follow-up issues came out of that investigation:
 
-2. **Worker row is dishonest on userspace-dp.** It reports
-   `thread_cpu_ns / wall_ns` (`CLOCK_THREAD_CPUTIME_ID`). In busy-poll
-   mode, a worker spinning on an empty AF_XDP rx-ring shows 100% OS
-   CPU even when forwarding 0 pps. Operators can't distinguish "fully
-   saturated" from "idle-spinning". The #869 telemetry already carries
-   `active_ns` (time in `did_work=true` iterations) — that's the
-   honest forwarding-activity signal.
+- **#883 (P0)** — iperf3 at 25 Gbps entirely bypasses the userspace
+  workers. `ethtool -S ge-0-0-2 | grep rx_xdp_redirect` = **1** over
+  20+ minutes. The XDP shim is attached and configured correctly but
+  packets take `XDP_PASS` to the kernel stack instead of XSK/CPUMAP
+  redirect. Until this lands, workers genuinely see no forwarding
+  traffic.
+- **#884** — `active_ns` accounting in the worker loop undercounts:
+  idle-branch ring-poll CPU (~84s over 1604s) gets bucketed into
+  `idle_block_ns` instead of a poll-CPU bucket. Even if workers did
+  see traffic, the activity signal would be near-zero because all the
+  poll-loop CPU is misclassified.
+
+Both upstream issues defeat `active_ns / wall_ns` as an operator
+signal today. Until #883 + #884 land, the honest default is to keep
+the worker row on `thread_cpu_ns / wall_ns` — the same semantics #880
+shipped. The busy-poll-100% false-positive I was worried about is a
+smaller lie than showing 0% at 25 Gbps.
+
+This PR therefore ships the **windows only**, not the worker-row
+semantic change. Worker row stays on `thread_cpu_ns / wall_ns` with
+the #880 label ("Worker threads CPU utilization"). When #883 and
+#884 are resolved, a follow-up PR can swap to activity-based semantics.
 
 ## Approach — two signals, three windows
 

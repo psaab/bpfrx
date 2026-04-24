@@ -27,10 +27,10 @@ const (
 // cpuSample is one tick of the cumulative-counter ring.  All
 // counters are monotonic nanoseconds.
 type cpuSample struct {
-	wall           time.Time
-	daemonCPUNs    uint64 // /proc/self/stat utime+stime, converted to ns
-	workerActiveNs uint64 // Σ WorkerRuntimeStatus.active_ns across workers
-	workerWallNs   uint64 // Σ WorkerRuntimeStatus.wall_ns across workers
+	wall            time.Time
+	daemonCPUNs     uint64 // /proc/self/stat utime+stime, converted to ns
+	workerThreadNs  uint64 // Σ WorkerRuntimeStatus.thread_cpu_ns across workers
+	workerWallNs    uint64 // Σ WorkerRuntimeStatus.wall_ns across workers
 }
 
 // Sampler maintains a ring of cumulative CPU counters.  One
@@ -48,7 +48,7 @@ type Sampler struct {
 	// Snapshot of the last successfully-read worker telemetry.
 	// On a failed Status() call the sampler reuses these values so
 	// the counter series stays monotonic (see plan §Error handling).
-	lastWorkerActive uint64
+	lastWorkerThread uint64
 	lastWorkerWall   uint64
 }
 
@@ -84,6 +84,11 @@ func (s *Sampler) loop(ctx context.Context) {
 // skipping preserves monotonicity of daemonCPUNs.  On worker
 // telemetry failure the worker counters are held at their
 // previous values (honest zero-rate for that interval).
+//
+// Worker CPU comes from Σthread_cpu_ns (OS thread CPU via
+// CLOCK_THREAD_CPUTIME_ID) divided by Σwall_ns.  NOT Σactive_ns —
+// that was tried and reverted: see #883 (workers bypassed under
+// load) and #884 (active_ns idle-poll undercounting).
 func (s *Sampler) sample(now time.Time) {
 	selfStat, statErr := s.proc.ReadSelfStat()
 	if statErr != nil {
@@ -92,18 +97,18 @@ func (s *Sampler) sample(now time.Time) {
 	daemonNs := ticksToNanos(selfStat.UtimeTicks + selfStat.StimeTicks)
 
 	// Worker counters — userspace-dp only.
-	workerActive, workerWall := s.lastWorkerActive, s.lastWorkerWall
+	workerThread, workerWall := s.lastWorkerThread, s.lastWorkerWall
 	if s.dp != nil {
 		if us, ok := s.dp.(interface {
 			Status() (userspace.ProcessStatus, error)
 		}); ok {
 			if st, err := us.Status(); err == nil {
-				var a, w uint64
+				var tc, w uint64
 				for _, wr := range st.WorkerRuntime {
-					a += wr.ActiveNS
+					tc += wr.ThreadCPUNS
 					w += wr.WallNS
 				}
-				workerActive, workerWall = a, w
+				workerThread, workerWall = tc, w
 			}
 		}
 	}
@@ -112,12 +117,12 @@ func (s *Sampler) sample(now time.Time) {
 	s.ring[s.head] = cpuSample{
 		wall:           now,
 		daemonCPUNs:    daemonNs,
-		workerActiveNs: workerActive,
+		workerThreadNs: workerThread,
 		workerWallNs:   workerWall,
 	}
 	s.head = (s.head + 1) % ringSize
 	s.count++
-	s.lastWorkerActive = workerActive
+	s.lastWorkerThread = workerThread
 	s.lastWorkerWall = workerWall
 	s.mu.Unlock()
 }
@@ -154,16 +159,18 @@ func (s *Sampler) Snapshot() SamplerSnapshot {
 }
 
 // computeCPUWindows returns per-core Daemon CPU% and per-worker-average
-// Worker activity% for the three windows, plus parallel validity
+// Worker thread CPU% for the three windows, plus parallel validity
 // flags.  A window is valid iff the snapshot contains a sample with
 // wall ≤ newest.wall − W.
 //
 // Daemon %: (Δdaemon_cpu_ns / Δwall_ns) × 100 — per-core percent;
 //          can exceed 100% on multi-core.
-// Worker %: (Δworker_active_ns / Δworker_wall_ns) × 100 — fraction
-//          of per-worker wall time spent in did_work=true iterations,
-//          in [0, 100].  Zero when worker_wall didn't advance (eBPF
-//          path or no workers).
+// Worker %: (Δworker_thread_cpu_ns / Δworker_wall_ns) × 100 —
+//          per-worker-average OS thread CPU via CLOCK_THREAD_CPUTIME_ID,
+//          summed across workers.  Busy-poll mode shows ~100% regardless
+//          of traffic (known false-positive); eBPF path has no workers
+//          so Δworker_wall_ns stays 0 and the window flags as invalid.
+//          See #883 / #884 for why we don't use active_ns here.
 func computeCPUWindows(snap SamplerSnapshot) (
 	daemonPct, workerPct [numCPUWindows]float64,
 	daemonValid, workerValid [numCPUWindows]bool,
@@ -195,8 +202,8 @@ func computeCPUWindows(snap SamplerSnapshot) (
 
 		workerWallDelta := newest.workerWallNs - then.workerWallNs
 		if workerWallDelta > 0 {
-			workerActiveDelta := newest.workerActiveNs - then.workerActiveNs
-			workerPct[i] = float64(workerActiveDelta) * 100.0 /
+			workerThreadDelta := newest.workerThreadNs - then.workerThreadNs
+			workerPct[i] = float64(workerThreadDelta) * 100.0 /
 				float64(workerWallDelta)
 			workerValid[i] = true
 		}

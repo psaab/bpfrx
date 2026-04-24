@@ -75,19 +75,20 @@ func Format(fs *ForwardingStatus) string {
 	writeRow(&b, "State", string(fs.State))
 	// CPU rows: three sliding windows (5s / 1m / 5m).  Daemon row
 	// is /proc/self/stat per-core % (can exceed 100 on multi-core;
-	// no upper clamp).  Worker row is per-worker-average activity
-	// fraction in [0, 100]: Σactive_ns / Σwall_ns across workers —
-	// honest "dataplane busy" signal, not OS thread CPU time.
-	// Columns with insufficient history (uptime < window) render
-	// `-`.  On eBPF, the worker row prints the N/A label.
+	// no upper clamp).  Worker row is Σ(thread_cpu_ns) / Σ(wall_ns)
+	// from CLOCK_THREAD_CPUTIME_ID — OS thread CPU, not dataplane
+	// activity (see #883/#884; activity-based signal was tried and
+	// empirically found broken at 25 Gbps).  Columns with insufficient
+	// history (uptime < window) render `-`.  On eBPF, the worker row
+	// prints the N/A label.
 	writeRow(&b, "Daemon CPU utilization",
 		formatWindowRow(fs.DaemonCPUWindows, fs.DaemonCPUWindowValid))
 
 	if fs.WorkerCPUMode == CPUModeEBPFNoWorkers {
-		writeRow(&b, "Worker threads utilization",
+		writeRow(&b, "Worker threads CPU utilization",
 			"N/A — eBPF path has no worker threads")
 	} else {
-		writeRow(&b, "Worker threads utilization",
+		writeRow(&b, "Worker threads CPU utilization",
 			formatWindowRow(fs.WorkerCPUWindows, fs.WorkerCPUWindowValid))
 	}
 
