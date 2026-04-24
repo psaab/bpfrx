@@ -41,8 +41,19 @@ int tc_main_prog(struct __sk_buff *skb)
 	__u16 vlan_id = 0;
 	meta->l3_offset = sizeof(struct ethhdr);
 
-	/* Handle one level of VLAN */
-	if (eth_proto == ETH_P_8021Q || eth_proto == ETH_P_8021AD) {
+	/*
+	 * #851: hardware VLAN offload (mlx5 NETIF_F_HW_VLAN_CTAG_TX) moves the
+	 * tag out of skb->data and into skb->vlan_tci before TCX egress runs
+	 * on the parent.  Check skb->vlan_present first and use skb->vlan_tci;
+	 * fall back to inline parsing for software-tagged frames.  Without
+	 * this, VLAN sub-interface egress reads vlan_id=0 and iface_zone_map
+	 * returns the native-VLAN zone — screen/filter/flood checks are
+	 * silently applied to the wrong zone.
+	 */
+	if (skb->vlan_present) {
+		vlan_id = skb->vlan_tci & 0x0FFF;
+		/* With hwaccel, eth_proto already reflects the inner L3 ethertype. */
+	} else if (eth_proto == ETH_P_8021Q || eth_proto == ETH_P_8021AD) {
 		struct vlan_hdr *vlan = data + sizeof(struct ethhdr);
 		if ((void *)(vlan + 1) > data_end)
 			return TC_ACT_OK;

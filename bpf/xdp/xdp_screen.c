@@ -251,6 +251,17 @@ send_syncookie_synack_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 	*tcp = tcp_hdr;
 	__builtin_memcpy((void *)(tcp + 1), mss_words, 4);
 
+	/* #857: push back the 802.1Q tag xdp_main_prog popped before the
+	 * pipeline so the reply reaches the VLAN client.  Without this the
+	 * SYN-ACK is sent untagged on the physical port, lands on the
+	 * native VLAN, and never reaches clients on tagged sub-interfaces
+	 * — effectively turning SYN-cookie flood protection into a self-DoS
+	 * for VLAN clients. */
+	if (meta->ingress_vlan_present) {
+		if (xdp_vlan_tag_push(ctx, meta->ingress_vlan_id) < 0)
+			return XDP_DROP;
+	}
+
 	return XDP_TX;
 }
 
@@ -375,6 +386,12 @@ send_syncookie_synack_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 
 	*tcp = tcp_hdr;
 	__builtin_memcpy((void *)(tcp + 1), mss_words, 4);
+
+	/* #857: push back 802.1Q tag so reply reaches VLAN clients. */
+	if (meta->ingress_vlan_present) {
+		if (xdp_vlan_tag_push(ctx, meta->ingress_vlan_id) < 0)
+			return XDP_DROP;
+	}
 
 	return XDP_TX;
 }
@@ -516,6 +533,12 @@ validate_syncookie_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 	tcp_hdr.check = ~tcp_csum;
 	*tcp = tcp_hdr;
 
+	/* #857: push back 802.1Q tag so reply reaches VLAN clients. */
+	if (meta->ingress_vlan_present) {
+		if (xdp_vlan_tag_push(ctx, meta->ingress_vlan_id) < 0)
+			return XDP_DROP;
+	}
+
 	return XDP_TX;
 }
 
@@ -637,6 +660,12 @@ validate_syncookie_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 	tcp_csum += tcp_csum >> 16;
 	tcp_hdr.check = ~tcp_csum;
 	*tcp = tcp_hdr;
+
+	/* #857: push back 802.1Q tag so reply reaches VLAN clients. */
+	if (meta->ingress_vlan_present) {
+		if (xdp_vlan_tag_push(ctx, meta->ingress_vlan_id) < 0)
+			return XDP_DROP;
+	}
 
 	return XDP_TX;
 }
