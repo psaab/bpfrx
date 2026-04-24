@@ -688,7 +688,14 @@ pub(crate) fn worker_loop(
             }
             wr_last_loop_ns = loop_now_ns;
             if loop_now_ns.saturating_sub(wr_last_publish_ns) >= WR_PUBLISH_INTERVAL_NS {
-                wr_counters.thread_cpu_ns = sample_thread_cpu_ns();
+                // Skip on transient clock_gettime failure (sample == 0):
+                // overwriting a previously-published nonzero value with 0
+                // would make the Prometheus counter go backwards and
+                // break `rate()` queries.
+                let sampled_cpu_ns = sample_thread_cpu_ns();
+                if sampled_cpu_ns != 0 {
+                    wr_counters.thread_cpu_ns = sampled_cpu_ns;
+                }
                 runtime_atomics.publish(&wr_counters);
                 wr_last_publish_ns = loop_now_ns;
             }

@@ -148,9 +148,15 @@ pub(crate) fn sample_thread_cpu_ns() -> u64 {
 
 /// Return the calling thread's kernel TID (`gettid`) as u64.  Used in
 /// status output so operators can correlate telemetry with `top -H`.
+/// Returns 0 on syscall failure so a wrapped -1 sentinel never escapes
+/// to Prometheus or the CLI.
 pub(crate) fn current_tid() -> u64 {
     // SAFETY: gettid is a pure syscall with no arguments.
-    unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+    let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+    if tid < 0 {
+        return 0;
+    }
+    tid as u64
 }
 
 #[cfg(test)]
@@ -202,8 +208,9 @@ mod tests {
             _acc = _acc.wrapping_add(1);
         }
         let b = sample_thread_cpu_ns();
-        // Either both zero (syscall failed), or b >= a.
-        if a != 0 || b != 0 {
+        // Zero is the syscall-failure sentinel; only assert monotonicity
+        // when both samples succeeded.
+        if a != 0 && b != 0 {
             assert!(b >= a, "thread cpu time must be monotonic: a={a} b={b}");
         }
     }
