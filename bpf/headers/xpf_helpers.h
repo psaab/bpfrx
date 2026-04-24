@@ -201,11 +201,22 @@ resolve_ingress_xdp_target(struct pkt_meta *meta)
 	 * Common-case fast path: established TCP data/ACK packets don't need
 	 * the SYN-centric screen logic. Keep the slow path for the few checks
 	 * that can still apply mid-flow.
+	 *
+	 * #856: require the ACK bit so pure NULL scans (tf==0) never qualify
+	 * for the bypass — they must run xdp_screen's SCREEN_TCP_NO_FLAG
+	 * branch. Gate off when SCREEN_TCP_NO_FLAG is configured so the
+	 * screen check always fires.  We deliberately do NOT gate on
+	 * SCREEN_IP_SWEEP: the ip_sweep counter is keyed only on src+zone
+	 * (no dst IP), so routing every established ACK through it would
+	 * generate false positives on normal forwarding traffic.  ACK-only
+	 * sweep detection is a follow-up (see TODO below).
 	 */
 	if (meta->protocol == PROTO_TCP && !meta->is_fragment) {
 		__u8 tf = meta->tcp_flags;
-		if (!(tf & (0x02 /* SYN */ | 0x01 /* FIN */ |
+		if ((tf & 0x10 /* ACK */) &&
+		    !(tf & (0x02 /* SYN */ | 0x01 /* FIN */ |
 			    0x04 /* RST */ | 0x20 /* URG */)) &&
+		    !(screen_flags & SCREEN_TCP_NO_FLAG) &&
 		    !(screen_flags & SCREEN_LAND_ATTACK) &&
 		    !(meta->addr_family == AF_INET &&
 		      (screen_flags & SCREEN_IP_SOURCE_ROUTE)))
