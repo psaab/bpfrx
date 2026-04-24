@@ -81,6 +81,7 @@ var OperationalTree = map[string]*Node{
 			}},
 			"alarms":         {Desc: "Show chassis alarm status"},
 			"environment":    {Desc: "Show chassis environment"},
+			"forwarding":     {Desc: "Show forwarding daemon status and utilization"},
 			"hardware":       {Desc: "Show installed hardware components"},
 			"routing-engine": {Desc: "Show Routing Engine status"},
 		}},

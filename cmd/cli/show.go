@@ -59,6 +59,8 @@ func (c *ctl) handleShow(args []string) error {
 				return c.showText("chassis-cluster")
 			case "environment":
 				return c.showText("chassis-environment")
+			case "forwarding":
+				return c.showText("chassis-forwarding")
 			case "hardware":
 				return c.showText("chassis-hardware")
 			}
