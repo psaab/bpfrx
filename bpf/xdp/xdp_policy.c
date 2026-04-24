@@ -431,8 +431,8 @@ nat_pool_alloc_v4(__u8 pool_id, __be32 src_ip, __be32 *out_ip, __be16 *out_port)
 	/* CPU-interleaved counter: each CPU gets distinct port sequence.
 	 * CPU 0: 0,16,32..., CPU 1: 1,17,33..., etc.
 	 * Avoids cross-CPU collisions on PERCPU counters. */
-	__u32 cpu = bpf_get_smp_processor_id() & 0xF;
-	__u64 val = ctr->counter++ * 16 + cpu;
+	__u32 cpu = bpf_get_smp_processor_id() & 0x7F;
+	__u64 val = ctr->counter++ * 128 + cpu;
 	__u32 port_range = cfg->port_high - cfg->port_low + 1;
 	if (port_range == 0)
 		port_range = 1;
@@ -483,8 +483,8 @@ nat_pool_alloc_iface_v4(__u8 pool_id, struct pkt_meta *meta,
 			bpf_map_lookup_elem(&nat_port_counters, &pid);
 		if (!ctr)
 			return -1;
-		__u32 cpu = bpf_get_smp_processor_id() & 0xF;
-		__u64 val = ctr->counter++ * 16 + cpu;
+		__u32 cpu = bpf_get_smp_processor_id() & 0x7F;
+		__u64 val = ctr->counter++ * 128 + cpu;
 		__u32 port_range = cfg->port_high - cfg->port_low + 1;
 		if (port_range == 0)
 			port_range = 1;
@@ -516,8 +516,8 @@ nat_pool_alloc_v6(__u8 pool_id, __u8 *src_ip, __u8 *out_ip, __be16 *out_port)
 		return -1;
 
 	/* CPU-interleaved counter (same as v4 above) */
-	__u32 cpu = bpf_get_smp_processor_id() & 0xF;
-	__u64 val = ctr->counter++ * 16 + cpu;
+	__u32 cpu = bpf_get_smp_processor_id() & 0x7F;
+	__u64 val = ctr->counter++ * 128 + cpu;
 	__u32 port_range = cfg->port_high - cfg->port_low + 1;
 	if (port_range == 0)
 		port_range = 1;
@@ -572,8 +572,8 @@ nat_pool_alloc_iface_v6(__u8 pool_id, struct pkt_meta *meta,
 				bpf_map_lookup_elem(&nat_port_counters, &pid);
 			if (!ctr)
 				return -1;
-			__u32 cpu = bpf_get_smp_processor_id() & 0xF;
-			__u64 val = ctr->counter++ * 16 + cpu;
+			__u32 cpu = bpf_get_smp_processor_id() & 0x7F;
+			__u64 val = ctr->counter++ * 128 + cpu;
 			__u32 port_range = cfg->port_high - cfg->port_low + 1;
 			if (port_range == 0)
 				port_range = 1;
@@ -1537,12 +1537,13 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					meta->nat_dst_port : meta->dst_port;
 
 				/*
-				 * Stash original IPs into session_v6_scratch[1]
-				 * (rev_val slot, free by the time we emit events).
-				 * Avoids 48 bytes of stack arrays that pushed the
-				 * combined frame past the 512-byte verifier limit.
+				 * Stash original IPs into session_v6_scratch[2]
+				 * (dedicated orig-stash slot).  #861: previously
+				 * used slot 1 but that's also rev_val, which
+				 * create_session_v6 overwrites — the event reader
+				 * then logged post-NAT addresses as "original".
 				 */
-				__u32 _orig_idx = 1;
+				__u32 _orig_idx = 2;
 				struct session_value_v6 *_orig_stash =
 					bpf_map_lookup_elem(&session_v6_scratch, &_orig_idx);
 				if (_orig_stash) {

@@ -593,8 +593,8 @@ type xpfTcScreenEgressStaticNatValueV6 struct {
 
 type xpfTcScreenEgressValidatedClientKey struct {
 	_       structs.HostLayout
-	SrcIp   uint32
-	DstIp   uint32
+	SrcIp   [16]uint8
+	DstIp   [16]uint8
 	DstPort uint16
 	PadVck  uint16
 }

@@ -433,12 +433,11 @@ validate_syncookie_v4(struct xdp_md *ctx, struct pkt_meta *meta)
 		return -1; /* Not a cookie ACK — fall through to conntrack */
 	}
 
-	/* Cookie valid — add source to validated_clients map */
-	struct validated_client_key vk = {
-		.src_ip   = meta->src_ip.v4,
-		.dst_ip   = meta->dst_ip.v4,
-		.dst_port = meta->dst_port,
-	};
+	/* Cookie valid — add source to validated_clients map.  #859: key
+	 * fields are 16 bytes so v4 addresses zero-extend cleanly. */
+	struct validated_client_key vk = { .dst_port = meta->dst_port };
+	__builtin_memcpy(&vk.src_ip[12], &meta->src_ip.v4, 4);
+	__builtin_memcpy(&vk.dst_ip[12], &meta->dst_ip.v4, 4);
 	struct validated_client_value vv = {
 		.validated_at = meta->now_sec,
 	};
@@ -570,13 +569,11 @@ validate_syncookie_v6(struct xdp_md *ctx, struct pkt_meta *meta)
 		return -1;
 	}
 
-	/* Cookie valid — add source to validated_clients map.
-	 * Use src_ip.v4 (first 4 bytes of v6 addr) as hash key. */
-	struct validated_client_key vk = {
-		.src_ip   = meta->src_ip.v4,
-		.dst_ip   = meta->dst_ip.v4,
-		.dst_port = meta->dst_port,
-	};
+	/* Cookie valid — add source to validated_clients map.  #859: store
+	 * full 16-byte v6 src + dst so whitelist is per-address, not per /32. */
+	struct validated_client_key vk = { .dst_port = meta->dst_port };
+	__builtin_memcpy(vk.src_ip, meta->src_ip.v6, 16);
+	__builtin_memcpy(vk.dst_ip, meta->dst_ip.v6, 16);
 	struct validated_client_value vv = {
 		.validated_at = meta->now_sec,
 	};
@@ -837,12 +834,19 @@ int xdp_screen_prog(struct xdp_md *ctx)
 
 			/* Pure SYN (no ACK) — challenge with cookie */
 			if ((tf & 0x02) && !(tf & 0x10)) {
-				/* Check if source is already validated */
+				/* Check if source is already validated.  #859:
+				 * full 16-byte src/dst for both v4 (zero-extended)
+				 * and v6 (full address). */
 				struct validated_client_key vk = {
-					.src_ip   = meta->src_ip.v4,
-					.dst_ip   = meta->dst_ip.v4,
 					.dst_port = meta->dst_port,
 				};
+				if (meta->addr_family == AF_INET) {
+					__builtin_memcpy(&vk.src_ip[12], &meta->src_ip.v4, 4);
+					__builtin_memcpy(&vk.dst_ip[12], &meta->dst_ip.v4, 4);
+				} else {
+					__builtin_memcpy(vk.src_ip, meta->src_ip.v6, 16);
+					__builtin_memcpy(vk.dst_ip, meta->dst_ip.v6, 16);
+				}
 				if (bpf_map_lookup_elem(&validated_clients, &vk)) {
 					inc_counter(GLOBAL_CTR_SYNCOOKIE_BYPASS);
 					goto pass;
