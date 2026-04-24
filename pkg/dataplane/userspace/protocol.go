@@ -419,6 +419,8 @@ type ProcessStatus struct {
 	NeighborGeneration     uint64                            `json:"neighbor_generation,omitempty"`
 	RouteEntries           int                               `json:"route_entries,omitempty"`
 	WorkerHeartbeats       []time.Time                       `json:"worker_heartbeats,omitempty"`
+	// #869: per-worker busy/idle runtime telemetry.
+	WorkerRuntime          []WorkerRuntimeStatus             `json:"worker_runtime,omitempty"`
 	HAGroups               []HAGroupStatus                   `json:"ha_groups,omitempty"`
 	Fabrics                []FabricSnapshot                  `json:"fabrics,omitempty"`
 	Queues                 []QueueStatus                     `json:"queues,omitempty"`
@@ -517,6 +519,22 @@ type FirewallFilterTermCounterStatus struct {
 
 type HAStateUpdateRequest struct {
 	Groups []HAGroupStatus `json:"groups,omitempty"`
+}
+
+// #869: WorkerRuntimeStatus mirrors the Rust WorkerRuntimeStatus;
+// each entry is one AF_XDP worker thread's cumulative runtime counters,
+// refreshed on the worker's ~1s publish cadence.  All fields omit when
+// zero so older daemons parse correctly.
+type WorkerRuntimeStatus struct {
+	WorkerID     uint32 `json:"worker_id,omitempty"`
+	TID          uint64 `json:"tid,omitempty"`
+	WallNS       uint64 `json:"wall_ns,omitempty"`
+	ActiveNS     uint64 `json:"active_ns,omitempty"`
+	IdleSpinNS   uint64 `json:"idle_spin_ns,omitempty"`
+	IdleBlockNS  uint64 `json:"idle_block_ns,omitempty"`
+	ThreadCPUNS  uint64 `json:"thread_cpu_ns,omitempty"`
+	WorkLoops    uint64 `json:"work_loops,omitempty"`
+	IdleLoops    uint64 `json:"idle_loops,omitempty"`
 }
 
 type HAGroupStatus struct {

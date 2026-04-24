@@ -462,6 +462,9 @@ pub(crate) fn worker_loop(
     shared_cos_root_leases: Arc<ArcSwap<BTreeMap<i32, Arc<SharedCoSRootLease>>>>,
     shared_cos_queue_leases: Arc<ArcSwap<BTreeMap<(i32, u8), Arc<SharedCoSQueueLease>>>>,
     cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
+    // #869: worker-runtime telemetry publish slot.  Worker writes its
+    // local counters here on a ~1s cadence; coordinator reads for status.
+    runtime_atomics: Arc<super::worker_runtime::WorkerRuntimeAtomics>,
 ) {
     pin_current_thread(worker_id);
     const COS_STATUS_INTERVAL_NS: u64 = 100_000_000;
@@ -655,8 +658,48 @@ pub(crate) fn worker_loop(
         forwarding.as_ref(),
     )));
     let mut last_cos_status_ns = monotonic_nanos();
+    // #869: worker-runtime telemetry.  Local counters, published to
+    // `runtime_atomics` on the ~1s cadence below.
+    use super::worker_runtime::{
+        WorkerRuntimeCounters, WorkerRuntimeState, current_tid, sample_thread_cpu_ns,
+    };
+    let mut wr_counters = WorkerRuntimeCounters::default();
+    let mut wr_state = WorkerRuntimeState::IdleBlock;
+    let mut wr_last_loop_ns = monotonic_nanos();
+    let mut wr_last_publish_ns = wr_last_loop_ns;
+    const WR_PUBLISH_INTERVAL_NS: u64 = 1_000_000_000;
+    runtime_atomics.set_tid(current_tid());
     while !stop.load(Ordering::Relaxed) {
         let loop_now_ns = monotonic_nanos();
+        // #869: attribute elapsed delta to the previous loop's state.
+        {
+            let delta = loop_now_ns.saturating_sub(wr_last_loop_ns);
+            wr_counters.wall_ns = wr_counters.wall_ns.wrapping_add(delta);
+            match wr_state {
+                WorkerRuntimeState::Active => {
+                    wr_counters.active_ns = wr_counters.active_ns.wrapping_add(delta);
+                }
+                WorkerRuntimeState::IdleSpin => {
+                    wr_counters.idle_spin_ns = wr_counters.idle_spin_ns.wrapping_add(delta);
+                }
+                WorkerRuntimeState::IdleBlock => {
+                    wr_counters.idle_block_ns = wr_counters.idle_block_ns.wrapping_add(delta);
+                }
+            }
+            wr_last_loop_ns = loop_now_ns;
+            if loop_now_ns.saturating_sub(wr_last_publish_ns) >= WR_PUBLISH_INTERVAL_NS {
+                // Skip on transient clock_gettime failure (sample == 0):
+                // overwriting a previously-published nonzero value with 0
+                // would make the Prometheus counter go backwards and
+                // break `rate()` queries.
+                let sampled_cpu_ns = sample_thread_cpu_ns();
+                if sampled_cpu_ns != 0 {
+                    wr_counters.thread_cpu_ns = sampled_cpu_ns;
+                }
+                runtime_atomics.publish(&wr_counters);
+                wr_last_publish_ns = loop_now_ns;
+            }
+        }
         let loop_now_secs = loop_now_ns / 1_000_000_000;
         let live_validation = shared_validation.load();
         if **live_validation != validation {
@@ -1455,14 +1498,20 @@ pub(crate) fn worker_loop(
         }
         if did_work {
             idle_iters = 0;
+            // #869: classify this iteration for next-loop-top accounting.
+            wr_state = WorkerRuntimeState::Active;
+            wr_counters.work_loops = wr_counters.work_loops.wrapping_add(1);
             continue;
         }
         idle_iters = idle_iters.saturating_add(1);
+        wr_counters.idle_loops = wr_counters.idle_loops.wrapping_add(1);
         match poll_mode {
             crate::PollMode::BusyPoll => {
                 if idle_iters <= IDLE_SPIN_ITERS {
+                    wr_state = WorkerRuntimeState::IdleSpin;
                     std::hint::spin_loop();
                 } else {
+                    wr_state = WorkerRuntimeState::IdleBlock;
                     thread::sleep(Duration::from_micros(IDLE_SLEEP_US));
                 }
             }
@@ -1471,8 +1520,10 @@ pub(crate) fn worker_loop(
                 // Firewall-local TCP flows are ACK-latency-sensitive; blocking
                 // immediately on the first empty poll collapses cwnd badly.
                 if idle_iters <= IDLE_SPIN_ITERS {
+                    wr_state = WorkerRuntimeState::IdleSpin;
                     std::hint::spin_loop();
                 } else if !interrupt_poll_fds.is_empty() {
+                    wr_state = WorkerRuntimeState::IdleBlock;
                     for pfd in &mut interrupt_poll_fds {
                         pfd.revents = 0;
                     }
@@ -1484,6 +1535,7 @@ pub(crate) fn worker_loop(
                         );
                     }
                 } else {
+                    wr_state = WorkerRuntimeState::IdleBlock;
                     thread::sleep(Duration::from_millis(INTERRUPT_POLL_TIMEOUT_MS as u64));
                 }
             }

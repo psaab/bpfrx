@@ -84,6 +84,14 @@ type xpfCollector struct {
 	cosRedirectAcquireBucket *prometheus.Desc
 	cosOwnerPPS              *prometheus.Desc
 	cosPeerPPS               *prometheus.Desc
+	// #869: per-worker busy/idle runtime counters.
+	workerWallSecs      *prometheus.Desc
+	workerActiveSecs    *prometheus.Desc
+	workerIdleSpinSecs  *prometheus.Desc
+	workerIdleBlockSecs *prometheus.Desc
+	workerThreadCPUSecs *prometheus.Desc
+	workerWorkLoops     *prometheus.Desc
+	workerIdleLoops     *prometheus.Desc
 }
 
 func newCollector(srv *Server) *xpfCollector {
@@ -295,6 +303,42 @@ func newCollector(srv *Server) *xpfCollector {
 			"CoS peer-redirected pps (window accumulator, cleared by operator) (#709).",
 			[]string{"ifindex", "queue_id"}, nil,
 		),
+		// #869: per-worker busy/idle runtime counters.
+		workerWallSecs: prometheus.NewDesc(
+			"xpf_userspace_worker_wall_seconds_total",
+			"Monotonic wall seconds observed by the userspace-dp worker loop (#869).",
+			[]string{"worker_id"}, nil,
+		),
+		workerActiveSecs: prometheus.NewDesc(
+			"xpf_userspace_worker_active_seconds_total",
+			"Seconds the userspace-dp worker spent processing packets (#869).",
+			[]string{"worker_id"}, nil,
+		),
+		workerIdleSpinSecs: prometheus.NewDesc(
+			"xpf_userspace_worker_idle_spin_seconds_total",
+			"Seconds the userspace-dp worker spent idle-spinning on empty rings (#869).",
+			[]string{"worker_id"}, nil,
+		),
+		workerIdleBlockSecs: prometheus.NewDesc(
+			"xpf_userspace_worker_idle_block_seconds_total",
+			"Seconds the userspace-dp worker spent blocked in poll()/sleep (#869).",
+			[]string{"worker_id"}, nil,
+		),
+		workerThreadCPUSecs: prometheus.NewDesc(
+			"xpf_userspace_worker_thread_cpu_seconds_total",
+			"CLOCK_THREAD_CPUTIME_ID sample for the userspace-dp worker thread (#869).",
+			[]string{"worker_id"}, nil,
+		),
+		workerWorkLoops: prometheus.NewDesc(
+			"xpf_userspace_worker_work_loops_total",
+			"Worker-loop iterations that did useful packet/ring work (#869).",
+			[]string{"worker_id"}, nil,
+		),
+		workerIdleLoops: prometheus.NewDesc(
+			"xpf_userspace_worker_idle_loops_total",
+			"Worker-loop iterations with no useful work (#869).",
+			[]string{"worker_id"}, nil,
+		),
 	}
 }
 
@@ -338,6 +382,13 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cosRedirectAcquireBucket
 	ch <- c.cosOwnerPPS
 	ch <- c.cosPeerPPS
+	ch <- c.workerWallSecs
+	ch <- c.workerActiveSecs
+	ch <- c.workerIdleSpinSecs
+	ch <- c.workerIdleBlockSecs
+	ch <- c.workerThreadCPUSecs
+	ch <- c.workerWorkLoops
+	ch <- c.workerIdleLoops
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
@@ -355,15 +406,14 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectNATPoolMetrics(ch, dp)
 	c.collectDHCPMetrics(ch)
 	c.collectSystemMetrics(ch)
-	c.collectCoSOwnerProfile(ch, dp)
+	c.collectUserspaceStatus(ch, dp)
 }
 
-// #709: export owner-profile telemetry when the dataplane is the
-// userspace-dp helper. The eBPF-only build path doesn't have this
-// shape (it has no CoS scheduler), so we type-assert on the optional
-// `Status() (dpuserspace.ProcessStatus, error)` interface — if the
-// assertion fails we skip silently (not an error).
-func (c *xpfCollector) collectCoSOwnerProfile(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
+// #709 + #869: single Status() call per scrape, then dispatch to
+// CoS owner profile + worker runtime collectors.  Both features need
+// the same ProcessStatus; calling Status() twice per scrape is
+// wasteful on the userspace-dp control socket.
+func (c *xpfCollector) collectUserspaceStatus(ch chan<- prometheus.Metric, dp dataplane.DataPlane) {
 	provider, ok := dp.(interface {
 		Status() (dpuserspace.ProcessStatus, error)
 	})
@@ -374,6 +424,39 @@ func (c *xpfCollector) collectCoSOwnerProfile(ch chan<- prometheus.Metric, dp da
 	if err != nil {
 		return
 	}
+	c.emitCoSOwnerProfile(ch, status)
+	c.emitWorkerRuntime(ch, status)
+}
+
+// #869: emit per-worker busy/idle runtime counters from a cached
+// ProcessStatus snapshot.
+func (c *xpfCollector) emitWorkerRuntime(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
+	for _, w := range status.WorkerRuntime {
+		label := strconv.FormatUint(uint64(w.WorkerID), 10)
+		toSecs := func(ns uint64) float64 { return float64(ns) / 1e9 }
+		ch <- prometheus.MustNewConstMetric(c.workerWallSecs,
+			prometheus.CounterValue, toSecs(w.WallNS), label)
+		ch <- prometheus.MustNewConstMetric(c.workerActiveSecs,
+			prometheus.CounterValue, toSecs(w.ActiveNS), label)
+		ch <- prometheus.MustNewConstMetric(c.workerIdleSpinSecs,
+			prometheus.CounterValue, toSecs(w.IdleSpinNS), label)
+		ch <- prometheus.MustNewConstMetric(c.workerIdleBlockSecs,
+			prometheus.CounterValue, toSecs(w.IdleBlockNS), label)
+		ch <- prometheus.MustNewConstMetric(c.workerThreadCPUSecs,
+			prometheus.CounterValue, toSecs(w.ThreadCPUNS), label)
+		ch <- prometheus.MustNewConstMetric(c.workerWorkLoops,
+			prometheus.CounterValue, float64(w.WorkLoops), label)
+		ch <- prometheus.MustNewConstMetric(c.workerIdleLoops,
+			prometheus.CounterValue, float64(w.IdleLoops), label)
+	}
+}
+
+// #709: export owner-profile telemetry when the dataplane is the
+// userspace-dp helper. The eBPF-only build path doesn't have this
+// shape (it has no CoS scheduler), so we type-assert on the optional
+// `Status() (dpuserspace.ProcessStatus, error)` interface — if the
+// assertion fails we skip silently (not an error).
+func (c *xpfCollector) emitCoSOwnerProfile(ch chan<- prometheus.Metric, status dpuserspace.ProcessStatus) {
 	for _, iface := range status.CoSInterfaces {
 		ifindexLabel := strconv.Itoa(iface.Ifindex)
 		for _, queue := range iface.Queues {

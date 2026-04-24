@@ -304,6 +304,29 @@ func FormatStatusSummary(status ProcessStatus) string {
 		}
 		fmt.Fprintf(&b, "  Worker %d heartbeat age:    %s\n", i, formatStatusAge(now.Sub(hb)))
 	}
+	// #869: worker runtime table.  Percentages are cumulative since
+	// process start — operators derive live rates with Prometheus
+	// counters via rate().
+	if len(status.WorkerRuntime) > 0 {
+		fmt.Fprintln(&b, "Worker runtime (cumulative since worker start):")
+		fmt.Fprintf(&b, "  %-6s %-8s %-8s %-10s %-11s %-8s %-12s %-12s\n",
+			"Worker", "TID", "Active%", "SpinIdle%", "BlockIdle%", "CPU%", "WorkLoops", "IdleLoops")
+		for _, w := range status.WorkerRuntime {
+			wall := float64(w.WallNS)
+			if wall <= 0 {
+				fmt.Fprintf(&b, "  %-6d %-8d    -        -          -        -   %-12d %-12d\n",
+					w.WorkerID, w.TID, w.WorkLoops, w.IdleLoops)
+				continue
+			}
+			activePct := 100.0 * float64(w.ActiveNS) / wall
+			spinPct := 100.0 * float64(w.IdleSpinNS) / wall
+			blockPct := 100.0 * float64(w.IdleBlockNS) / wall
+			cpuPct := 100.0 * float64(w.ThreadCPUNS) / wall
+			fmt.Fprintf(&b, "  %-6d %-8d %-8.1f %-8.1f %-10.1f %-8.1f %-12d %-12d\n",
+				w.WorkerID, w.TID, activePct, spinPct, blockPct, cpuPct,
+				w.WorkLoops, w.IdleLoops)
+		}
+	}
 	return b.String()
 }
 
