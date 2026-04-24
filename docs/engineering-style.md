@@ -46,6 +46,70 @@ Read this file in full before:
    (e.g. `/sync-history`) are the only exception and must be declared
    in their `SKILL.md`.
 
+## Workflow for every change
+
+Every non-trivial change follows this ordering. It's the target going
+forward — recent PRs have been close but not uniform, and the point of
+writing it down is so the next agent can cite "step N" without having
+to re-derive the pattern. Cross-references point to sections that carry
+the mechanics, so this section is sequencing only.
+
+1. **Issue first.** File a GitHub issue (or pick up an existing one)
+   before writing code. Body: problem, hypothesis, acceptance criteria.
+   The PR later references it by number in the title.
+
+2. **Plan.** Read the existing code, then write a short plan under
+   `docs/pr/<N>-<name>/plan.md` (the `<N>-<name>` prefix follows the
+   existing convention documented in `docs/pr/README.md`) or the
+   plan-mode scratch file: goal, approach, alternatives rejected, files
+   touched, test strategy. No code yet.
+
+3. **Hostile plan review with Codex (`gpt-5.5`).** Spawn via the
+   `codex-rescue` agent; brief it to *critique*, not validate.
+   **Terminal artifact:** Codex returns `PLAN YES` (or equivalent) AND
+   every raised concern has a written disposition in the plan doc
+   (applied, or rejected with reason). If Codex pushes back twice on
+   the same point, assume it's right until you can show otherwise —
+   "Codex stopped objecting" is not agreement. If you and Codex are
+   stuck, stop and ask the user.
+
+4. **Hostile architecture review** — same agent, same terminal rule —
+   when the change touches a boundary: new BPF map, new protocol
+   field, new syscall, cross-dataplane coordination, config/CLI
+   surface. Skip this step for pure-local changes.
+
+5. **Code.** Edit existing files; keep the diff scoped to the plan.
+   Follow "Hot-path coding discipline" and "API shape discipline"
+   below. Scope creep → separate issue + separate PR.
+
+6. **Unit tests that reproduce the failure mode** — see the "Test
+   strength" bullet under "Review discipline" below for what counts as
+   a strong test.
+
+7. **Hostile code review with Codex.** Same terminal rule: Codex
+   returns `MERGE YES` (or equivalent) AND every finding has a written
+   disposition. Fixes go into the same branch before push.
+
+8. **Deploy + feature validation.** Unit tests pass ≠ firewall works.
+   Run at minimum:
+
+   | What changed | Deploy | Validation | Pass criteria |
+   |---|---|---|---|
+   | Any change | `make test-deploy` (standalone) | ping between zones | 0% loss |
+   | Any change | `make test-deploy` | `iperf3 -P 16 -t 30 -p 5203` → 172.16.80.200 | ≥ 23 Gbit/s, no regression vs previous run |
+   | Admission / DSCP / scheduler / queueing | above + re-apply CoS (`./test/incus/apply-cos-config.sh <target>`) | `show class-of-service interface` | targeted counter (`flow_share`, `buffer`, `ecn_marked`) moves in the predicted direction — see [`cos-validation-notes.md`](cos-validation-notes.md) |
+   | NAT / screens / filter / VLAN / IPsec | above | exercise that feature end-to-end from a test host | session / hit counters advance; negative case drops |
+   | HA / VRRP / session sync / fabric | `make cluster-deploy` | `make test-failover` + `make test-ha-crash` | 0 / very low packet loss across failover/failback, both nodes converge |
+
+   When a validation lane can't be run in the test env, say so
+   explicitly in the PR body with the reason. Never claim success for
+   a check that wasn't executed.
+
+9. **PR open + review + merge** — see "PR discipline" and "Merging"
+   below for the body template and mechanics. At this stage: Copilot
+   and Codex review; every comment gets a disposition reply; squash
+   merge once CI is green and findings are resolved.
+
 ## Hot-path coding discipline
 
 ### Allocations
