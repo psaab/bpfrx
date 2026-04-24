@@ -111,6 +111,13 @@ func (m *Manager) loadAllObjects() error {
 	m.maps["nat_pool_ips_v6"] = mainObjs.NatPoolIpsV6
 	m.maps["nat_port_counters"] = mainObjs.NatPortCounters
 	m.maps["session_id_gen"] = mainObjs.SessionIdGen
+	// #854: wire up mirror_config + mirror_counter so SetMirrorConfig /
+	// ClearMirrorConfigs write to the same map instance that XDP and TC
+	// read from.  Without these entries in m.maps, the Go side could not
+	// populate the port-mirror map — pre-existing plumbing gap that
+	// #854's tc_forward map-lookup fix made load-bearing.
+	m.maps["mirror_config"] = mainObjs.MirrorConfig
+	m.maps["mirror_counter"] = mainObjs.MirrorCounter
 	m.maps["interface_counters"] = mainObjs.InterfaceCounters
 	m.maps["default_policy"] = mainObjs.DefaultPolicy
 	m.maps["static_nat_v4"] = mainObjs.StaticNatV4
@@ -188,6 +195,11 @@ func (m *Manager) loadAllObjects() error {
 			"nptv6_rules":        mainObjs.Nptv6Rules,
 			"session_count_src":  mainObjs.SessionCountSrc,
 			"session_count_dst":  mainObjs.SessionCountDst,
+			// #854: share mirror_config and mirror_counter with tail
+			// programs so tc_forward's map lookup sees the entries
+			// SetMirrorConfig writes on the XDP side.
+			"mirror_config":  mainObjs.MirrorConfig,
+			"mirror_counter": mainObjs.MirrorCounter,
 		},
 	}
 

@@ -809,7 +809,15 @@ struct pkt_meta {
 	uint8_t  dscp_rewrite;
 	uint8_t  ip_ihl;
 
-	uint16_t pad_at;
+	/* #855: FIB resolution flag.  fwd_ifindex holds a raw DPDK port_id,
+	 * allocated from 0 by rte_eth_dev_allocate().  Using fwd_ifindex==0
+	 * as a host-inbound sentinel collides with valid transit on port 0.
+	 * Use fib_resolved instead: zone_lookup sets it when a nexthop was
+	 * found; forward_packet gates host-inbound on !fib_resolved.
+	 */
+	uint8_t  fib_resolved;
+
+	uint8_t  pad_fib;
 	uint32_t app_timeout;
 	uint16_t app_id;
 	uint8_t  log_flags;

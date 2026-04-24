@@ -325,13 +325,16 @@ forward_transit:
 	 * fall back to XDP_PASS so the kernel forwards the packet and TC
 	 * egress can use bpf_clone_redirect() to send a copy to the mirror
 	 * port. bpf_clone_redirect is not available in XDP context.
+	 *
+	 * #854: we no longer stash mirror_ifindex/rate in pkt_meta — tc_forward
+	 * re-does the mirror_config lookup on the skb side (keyed on
+	 * skb->ingress_ifindex).  The pkt_meta handoff was racy: tc_main
+	 * partial-memsets past offset 32 and pkt_meta_scratch is PERCPU,
+	 * so XDP→TC cross-CPU carry was unreliable.
 	 */
 	__u32 ingress_key = ctx->ingress_ifindex;
 	struct mirror_config *mcfg = bpf_map_lookup_elem(&mirror_config, &ingress_key);
 	if (mcfg && mcfg->mirror_ifindex != 0) {
-		/* Store mirror info in meta for TC egress to pick up */
-		meta->mirror_ifindex = mcfg->mirror_ifindex;
-		meta->mirror_rate = mcfg->rate;
 		return tunnel_pass(ctx, meta);
 	}
 

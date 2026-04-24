@@ -326,8 +326,12 @@ func (m *Manager) Compile(cfg *config.Config) (*CompileResult, error) {
 				if strings.Contains(err.Error(), "already attached") {
 					continue
 				}
-				slog.Info("native XDP not supported, falling back interface to generic",
-					"ifindex", ifidx, "err", err)
+				// #864: raise to WARN so operators at default log level
+				// see the demotion.  Generic XDP runs in skb-mode with
+				// significantly higher CPU cost and a ~6 Gbps cap.
+				slog.Warn("native XDP unavailable; falling back to generic (skb-mode)",
+					"ifindex", ifidx, "err", err,
+					"impact", "higher CPU, ~6 Gbps cap; fix driver/firmware to restore driver-mode XDP")
 				m.DetachXDP(ifidx)
 				failedNativeXDP[ifidx] = true
 			}

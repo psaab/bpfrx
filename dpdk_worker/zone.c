@@ -279,6 +279,7 @@ skip_ingress_zone:
 		struct fib_nexthop *nh = &ctx->shm->nexthops[nexthop_id];
 
 		meta->fwd_ifindex = nh->port_id;
+		meta->fib_resolved = 1;  /* #855: distinct from port_id==0 */
 		meta->egress_vlan_id = nh->vlan_id;
 		memcpy(meta->fwd_dmac, nh->dmac, 6);
 		memcpy(meta->fwd_smac, nh->smac, 6);

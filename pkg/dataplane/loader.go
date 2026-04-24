@@ -84,6 +84,29 @@ func (m *Manager) IsLoaded() bool {
 	return m.loaded
 }
 
+// xdpAttachModeMatches reports whether the kernel's current XDP attach mode
+// on ifindex matches what AttachXDP is about to request.  Returns true on
+// "probe failed" so we fall through to the existing Update() path rather
+// than punishing transient netlink hiccups.
+//
+// Kernel XDP attach modes (nl/link_linux.go):
+//   XDP_ATTACHED_NONE = 0 — no prog attached
+//   XDP_ATTACHED_DRV  = 1 — driver (native) mode
+//   XDP_ATTACHED_SKB  = 2 — generic (skb) mode
+//   XDP_ATTACHED_HW   = 3 — hw offload
+func xdpAttachModeMatches(ifindex int, wantGeneric bool) bool {
+	l, err := netlink.LinkByIndex(ifindex)
+	if err != nil || l == nil {
+		return true
+	}
+	xdp := l.Attrs().Xdp
+	if xdp == nil || !xdp.Attached {
+		return true
+	}
+	isGeneric := xdp.AttachMode == 2 /* XDP_ATTACHED_SKB */
+	return isGeneric == wantGeneric
+}
+
 // AttachXDP attaches the XDP main program to the given interface.
 // If forceGeneric is true, uses generic (SKB) mode instead of native driver mode.
 // When forceGeneric is false, tries native driver mode only (no automatic fallback).
@@ -107,16 +130,33 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 	}
 
 	// Try to load a previously pinned link and update it atomically.
+	//
+	// #864: before reusing, verify the pinned link's attach mode matches
+	// what the caller requested.  If a previous boot fell back to generic
+	// (skb-mode) and pinned a generic-mode link, we would otherwise keep
+	// running in generic forever — losing native-XDP performance even
+	// after the driver/firmware issue that forced the fallback is resolved,
+	// and leaving IFACE_FLAG_NATIVE_XDP stale in the BPF maps.
 	pinFile := filepath.Join(linkPinPath, fmt.Sprintf("xdp_%d", ifindex))
 	if existing, err := link.LoadPinnedLink(pinFile, nil); err == nil {
-		if err := existing.Update(prog); err == nil {
-			m.xdpLinks[ifindex] = existing
-			slog.Info("updated pinned XDP link", "ifindex", ifindex)
-			return nil
+		if xdpAttachModeMatches(ifindex, forceGeneric) {
+			if err := existing.Update(prog); err == nil {
+				m.xdpLinks[ifindex] = existing
+				slog.Info("updated pinned XDP link", "ifindex", ifindex)
+				return nil
+			}
+			// Update failed (e.g. program type mismatch) — detach + re-attach.
+			existing.Close()
+			os.Remove(pinFile)
+		} else {
+			// Attach mode mismatch — existing pin is generic but we want
+			// driver (or vice versa).  Drop the pin and attach fresh so the
+			// mode picks up correctly and IFACE_FLAG_NATIVE_XDP stays true.
+			slog.Warn("pinned XDP link has wrong attach mode; re-attaching",
+				"ifindex", ifindex, "forceGeneric", forceGeneric)
+			existing.Close()
+			os.Remove(pinFile)
 		}
-		// Update failed (e.g. program type mismatch) — detach old and re-attach.
-		existing.Close()
-		os.Remove(pinFile)
 	}
 
 	// Fresh attachment (first boot or pin was removed/incompatible).
