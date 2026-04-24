@@ -25,6 +25,8 @@ func (c *CLI) showChassis(args []string) error {
 			return c.showChassisCluster(args[1:])
 		case "environment":
 			return c.showChassisEnvironment()
+		case "forwarding":
+			return c.showChassisForwarding()
 		}
 	}
 	cmdtree.PrintTreeHelp("show chassis:", operationalTree, "show", "chassis")

@@ -1,0 +1,9 @@
+cpu  1234 0 567 89012 0 0 0 0 0 0
+cpu0 234 0 123 45678 0 0 0 0 0 0
+intr 123456 0 0 0 0
+ctxt 234567
+btime 1716000000
+processes 12345
+procs_running 1
+procs_blocked 0
+softirq 54321 0 0 0

@@ -22,6 +22,7 @@ import (
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/fwdstatus"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/psaab/xpf/pkg/routing"
@@ -3987,6 +3988,19 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 	case "chassis-hardware":
 		// Alias: same output as "chassis" (CPU, memory, NICs)
 		return s.ShowText(nil, &pb.ShowTextRequest{Topic: "chassis"})
+
+	case "chassis-forwarding":
+		// #877: Junos-style forwarding-daemon health view.
+		fs, err := fwdstatus.Build(
+			s.dp,
+			fwdstatus.OSProcReader{},
+			s.startTime,
+			s.cluster != nil,
+		)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "build forwarding status: %v", err)
+		}
+		buf.WriteString(fwdstatus.Format(fs))
 
 	case "chassis-cluster", "chassis-cluster-status":
 		if s.cluster != nil {
