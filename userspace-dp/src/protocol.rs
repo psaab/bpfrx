@@ -699,6 +699,11 @@ pub(crate) struct ProcessStatus {
     pub route_entries: usize,
     #[serde(rename = "worker_heartbeats", default)]
     pub worker_heartbeats: Vec<DateTime<Utc>>,
+    /// #869: per-worker busy/idle runtime telemetry.  Empty on
+    /// dataplanes that don't publish.  Additive / defaulted for
+    /// backward compatibility with older daemon builds.
+    #[serde(rename = "worker_runtime", default)]
+    pub worker_runtime: Vec<WorkerRuntimeStatus>,
     // #710: cluster-wide aggregate of cross-worker CoS redirects that
     // could not locate a binding for their target egress on the landing
     // worker. Summed across all bindings in `refresh_status` — the
@@ -1028,6 +1033,32 @@ pub(crate) struct ForwardingControlRequest {
 pub(crate) struct HAStateUpdateRequest {
     #[serde(default)]
     pub groups: Vec<HAGroupStatus>,
+}
+
+/// #869: per-worker busy/idle runtime telemetry, published on the
+/// worker's ~1s cadence.  See `userspace-dp/src/afxdp/worker_runtime.rs`.
+/// All fields default to 0 for backward compatibility with daemons that
+/// predate this instrumentation.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct WorkerRuntimeStatus {
+    #[serde(rename = "worker_id", default)]
+    pub worker_id: u32,
+    #[serde(default)]
+    pub tid: u64,
+    #[serde(rename = "wall_ns", default)]
+    pub wall_ns: u64,
+    #[serde(rename = "active_ns", default)]
+    pub active_ns: u64,
+    #[serde(rename = "idle_spin_ns", default)]
+    pub idle_spin_ns: u64,
+    #[serde(rename = "idle_block_ns", default)]
+    pub idle_block_ns: u64,
+    #[serde(rename = "thread_cpu_ns", default)]
+    pub thread_cpu_ns: u64,
+    #[serde(rename = "work_loops", default)]
+    pub work_loops: u64,
+    #[serde(rename = "idle_loops", default)]
+    pub idle_loops: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

@@ -240,6 +240,8 @@ mod coordinator;
 mod tests;
 #[path = "afxdp/worker.rs"]
 mod worker;
+#[path = "afxdp/worker_runtime.rs"]
+mod worker_runtime;
 pub use self::coordinator::Coordinator;
 pub(crate) use self::worker::{
     BindingLiveSnapshot, BindingWorker, SyncedSessionEntry, XskBindMode, fabric_queue_hash,

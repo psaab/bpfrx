@@ -150,6 +150,7 @@ fn run() -> Result<(), String> {
             neighbor_generation: 0,
             route_entries: 0,
             worker_heartbeats: Vec::new(),
+            worker_runtime: Vec::new(),
             cos_no_owner_binding_drops_total: 0,
             per_binding: Vec::new(),
             ha_groups: Vec::new(),
@@ -770,6 +771,8 @@ fn refresh_status(state: &mut ServerState) {
         .map(|s| s.fabrics.clone())
         .unwrap_or_default();
     state.status.worker_heartbeats = state.afxdp.worker_heartbeats();
+    // #869: per-worker busy/idle runtime telemetry.
+    state.status.worker_runtime = state.afxdp.worker_runtime_snapshots();
     state.status.debug_worker_threads = state.afxdp.worker_count();
     state.status.debug_identity_slots = state.afxdp.identity_count();
     state.status.debug_live_slots = state.afxdp.live_count();

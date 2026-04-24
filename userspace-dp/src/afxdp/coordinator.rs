@@ -690,6 +690,9 @@ impl Coordinator {
             let shared_cos_owner_live_by_queue = self.shared_cos_owner_live_by_queue.clone();
             let shared_cos_root_leases = self.shared_cos_root_leases.clone();
             let shared_cos_queue_leases = self.shared_cos_queue_leases.clone();
+            let runtime_atomics =
+                std::sync::Arc::new(super::worker_runtime::WorkerRuntimeAtomics::new());
+            let runtime_atomics_clone = runtime_atomics.clone();
             let join = thread::Builder::new()
                 .name(format!("xpf-userspace-worker-{worker_id}"))
                 .spawn(move || {
@@ -725,6 +728,7 @@ impl Coordinator {
                         shared_cos_root_leases,
                         shared_cos_queue_leases,
                         cos_status_clone,
+                        runtime_atomics_clone,
                     );
                 });
             match join {
@@ -741,6 +745,7 @@ impl Coordinator {
                             commands,
                             session_export_ack,
                             cos_status,
+                            runtime_atomics,
                             join: Some(join),
                         },
                     );
@@ -1162,6 +1167,29 @@ impl Coordinator {
 
     pub fn worker_count(&self) -> usize {
         self.workers.len()
+    }
+
+    /// #869: snapshot per-worker busy/idle runtime counters.  Each row is
+    /// the current `WorkerRuntimeAtomics` publish, most recently written
+    /// on the worker's ~1s publish cadence.
+    pub fn worker_runtime_snapshots(&self) -> Vec<crate::protocol::WorkerRuntimeStatus> {
+        self.workers
+            .iter()
+            .map(|(worker_id, handle)| {
+                let s = handle.runtime_atomics.snapshot();
+                crate::protocol::WorkerRuntimeStatus {
+                    worker_id: *worker_id,
+                    tid: handle.runtime_atomics.tid(),
+                    wall_ns: s.wall_ns,
+                    active_ns: s.active_ns,
+                    idle_spin_ns: s.idle_spin_ns,
+                    idle_block_ns: s.idle_block_ns,
+                    thread_cpu_ns: s.thread_cpu_ns,
+                    work_loops: s.work_loops,
+                    idle_loops: s.idle_loops,
+                }
+            })
+            .collect()
     }
 
     pub fn identity_count(&self) -> usize {

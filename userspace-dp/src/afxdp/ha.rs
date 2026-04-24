@@ -680,6 +680,9 @@ mod tests {
                 commands: worker_commands.clone(),
                 session_export_ack: Arc::new(AtomicU64::new(0)),
                 cos_status: Arc::new(ArcSwap::from_pointee(Vec::new())),
+                runtime_atomics: Arc::new(
+                    super::worker_runtime::WorkerRuntimeAtomics::new(),
+                ),
                 join: None,
             },
         );

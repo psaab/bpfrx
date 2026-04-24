@@ -179,6 +179,8 @@ pub(super) struct WorkerHandle {
     pub(super) commands: Arc<Mutex<VecDeque<WorkerCommand>>>,
     pub(super) session_export_ack: Arc<AtomicU64>,
     pub(super) cos_status: Arc<ArcSwap<Vec<crate::protocol::CoSInterfaceStatus>>>,
+    // #869: per-worker busy/idle runtime telemetry publish slot.
+    pub(super) runtime_atomics: Arc<super::worker_runtime::WorkerRuntimeAtomics>,
     pub(super) join: Option<JoinHandle<()>>,
 }
 
