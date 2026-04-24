@@ -359,13 +359,21 @@ nat64_xlate_6to4(struct xdp_md *ctx, struct pkt_meta *meta)
 		 * Native XDP: compute from scratch. */
 		icmp->checksum = 0;
 		if (!meta->csum_partial) {
+			/* #862: sum up to MTU-sized payload, not 64 u16 = 128B.
+			 * Mirrors finalize_csum_partial at xpf_helpers.h:615-673. */
 			__u32 icmp_csum = 0;
 			__u16 *icmp_w = (__u16 *)icmp;
-			#pragma unroll
-			for (int i = 0; i < 64; i++) {
-				if ((void *)(&icmp_w[i] + 1) <= data_end)
-					icmp_csum += icmp_w[i];
+			#pragma unroll 1
+			for (int i = 0; i < 750; i++) {
+				if ((void *)(icmp_w + 1) > data_end)
+					break;
+				icmp_csum += *icmp_w;
+				icmp_w++;
 			}
+			/* Trailing odd byte */
+			__u8 *icmp_b = (__u8 *)icmp_w;
+			if ((void *)(icmp_b + 1) <= data_end)
+				icmp_csum += (__u32)*icmp_b;
 			icmp->checksum = (__sum16)~csum_fold(icmp_csum);
 		}
 	}
@@ -388,7 +396,17 @@ nat64_xlate_6to4(struct xdp_md *ctx, struct pkt_meta *meta)
 	rval.orig_src_port = old_sport;
 	rval.orig_dst_port = meta->dst_port;
 
-	bpf_map_update_elem(&nat64_state, &rkey, &rval, BPF_NOEXIST);
+	/* #858: check return.  On collision (another flow already has this
+	 * {src_ip,port} tuple) the insert fails with BPF_NOEXIST — forwarding
+	 * the packet with stale state would deliver return traffic to the
+	 * wrong tenant's IPv6 address.  Drop instead.  With the widened
+	 * per-CPU stride (0x7F vs 0xF) in nat_pool_alloc_v4, collisions
+	 * become rare; they were catastrophic before because this return
+	 * value was ignored. */
+	if (bpf_map_update_elem(&nat64_state, &rkey, &rval, BPF_NOEXIST) != 0) {
+		inc_counter(GLOBAL_CTR_NAT_ALLOC_FAIL);
+		return XDP_DROP;
+	}
 
 	inc_counter(GLOBAL_CTR_NAT64_XLATE);
 
@@ -647,12 +665,18 @@ nat64_xlate_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 			csum += bpf_htons(l4_len);
 			csum += bpf_htons((__u16)PROTO_ICMPV6);
 
+			/* #862: sum up to MTU-sized ICMPv6 payload. */
 			__u16 *icmp_w = (__u16 *)icmp6;
-			#pragma unroll
-			for (int i = 0; i < 64; i++) {
-				if ((void *)(&icmp_w[i] + 1) <= data_end)
-					csum += icmp_w[i];
+			#pragma unroll 1
+			for (int i = 0; i < 750; i++) {
+				if ((void *)(icmp_w + 1) > data_end)
+					break;
+				csum += *icmp_w;
+				icmp_w++;
 			}
+			__u8 *icmp_b = (__u8 *)icmp_w;
+			if ((void *)(icmp_b + 1) <= data_end)
+				csum += (__u32)*icmp_b;
 
 			icmp6->icmp6_cksum = (__sum16)~csum_fold(csum);
 		}
@@ -964,14 +988,19 @@ nat64_icmp_error_4to6(struct xdp_md *ctx, struct pkt_meta *meta)
 		csum += bpf_htons(payload_len);
 		csum += bpf_htons((__u16)PROTO_ICMPV6);
 
-		/* Sum ICMPv6 header + embedded IPv6 header + embedded L4.
-		 * Everything from icmp6 to end of payload. */
+		/* #862: sum ICMPv6 header + embedded IPv6 + embedded L4 up to
+		 * MTU, not 128 bytes. */
 		__u16 *w = (__u16 *)icmp6;
-		#pragma unroll
-		for (int i = 0; i < 64; i++) {
-			if ((void *)(&w[i] + 1) <= data_end)
-				csum += w[i];
+		#pragma unroll 1
+		for (int i = 0; i < 750; i++) {
+			if ((void *)(w + 1) > data_end)
+				break;
+			csum += *w;
+			w++;
 		}
+		__u8 *wb = (__u8 *)w;
+		if ((void *)(wb + 1) <= data_end)
+			csum += (__u32)*wb;
 		icmp6->icmp6_cksum = (__sum16)~csum_fold(csum);
 	}
 

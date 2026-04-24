@@ -71,7 +71,11 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, 2); /* index 0: fwd_val, index 1: rev_val */
+	/* index 0: fwd_val, index 1: rev_val,
+	 * index 2: orig-address stash for SESSION_OPEN event emission (#861).
+	 * Previously index 1 was double-used for rev_val and orig stash,
+	 * causing emit_event_nat6_orig to log post-NAT addresses as "original". */
+	__uint(max_entries, 3);
 	__type(key, __u32);
 	__type(value, struct session_value_v6);
 } session_v6_scratch SEC(".maps");

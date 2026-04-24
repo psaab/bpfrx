@@ -582,10 +582,15 @@ struct flood_state {
 
 /* Validated SYN cookie client tracking.
  * Source IPs that passed cookie validation are remembered in an LRU map
- * so subsequent SYNs bypass the challenge during an active flood. */
+ * so subsequent SYNs bypass the challenge during an active flood.
+ *
+ * #859: src_ip / dst_ip are 16 bytes.  For v4 the low 4 bytes carry the
+ * address and high 12 bytes are zero.  For v6 the full 16-byte address
+ * is used; previously the key stored only the first 4 bytes of a v6
+ * source, so one successful handshake whitelisted an entire /32. */
 struct validated_client_key {
-	__be32 src_ip;       /* IPv4 addr (or XOR hash of IPv6) */
-	__be32 dst_ip;
+	__u8   src_ip[16];
+	__u8   dst_ip[16];
 	__be16 dst_port;
 	__u16  pad_vck;
 };
