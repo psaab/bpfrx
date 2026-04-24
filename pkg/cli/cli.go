@@ -122,7 +122,6 @@ func New(store *configstore.Store, dp dataplane.DataPlane, eventBuf *logging.Eve
 	}
 }
 
-// SetRPMResultsFn sets a callback for retrieving live RPM probe results.
 // SetForwardingSampler wires the pkg/fwdstatus Sampler into the CLI
 // so `show chassis forwarding` can read 5s/1m/5m CPU windows.
 // Pass nil to disable windowed CPU display (Build falls back to
@@ -131,6 +130,7 @@ func (c *CLI) SetForwardingSampler(s *fwdstatus.Sampler) {
 	c.fwdSampler = s
 }
 
+// SetRPMResultsFn sets a callback for retrieving live RPM probe results.
 func (c *CLI) SetRPMResultsFn(fn func() []*rpm.ProbeResult) {
 	c.rpmResultsFn = fn
 }

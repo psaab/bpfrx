@@ -189,7 +189,7 @@ Daemon CPU utilization         4% / - / -     (5s / 1m / 5m)
 
 
 - New package file `pkg/fwdstatus/sampler.go`:
-  - `type Sampler struct { mu, ring, head, count, dp, proc, cancel }`
+  - `type Sampler struct { mu, ring, head, count, dp, proc }` (lifetime tied to the ctx passed to Start; no cancel field)
   - `NewSampler(dp DataPlaneAccessor, proc ProcReader) *Sampler`
   - `(s *Sampler) Start(ctx context.Context)` — primes one sample
     synchronously, then launches the 1s-tick goroutine.

@@ -117,6 +117,39 @@ func TestComputeCPUWindows_WorkerWallFlat(t *testing.T) {
 	}
 }
 
+// Counter decrease (e.g. userspace-dp restart reset the cumulative
+// series) must not produce a bogus % — both windows should mark
+// invalid instead of underflowing uint64.
+func TestComputeCPUWindows_NonMonotonicCounters(t *testing.T) {
+	now := time.Now()
+	// 10 samples, normal ramp-up, then the newest sample has SMALLER
+	// cumulative counters than the target lookup sample.
+	samples := make([]cpuSample, 10)
+	for i := 0; i < 9; i++ {
+		samples[i] = cpuSample{
+			wall:           now.Add(-time.Duration(9-i) * time.Second),
+			daemonCPUNs:    uint64(i+1) * 100_000_000,
+			workerThreadNs: uint64(i+1) * 200_000_000,
+			workerWallNs:   uint64(i+1) * 1_000_000_000,
+		}
+	}
+	// Newest sample: wall advanced, but cumulative counters reset.
+	samples[9] = cpuSample{
+		wall:           now,
+		daemonCPUNs:    50_000_000, // < samples[4].daemonCPUNs
+		workerThreadNs: 50_000_000, // < samples[4].workerThreadNs
+		workerWallNs:   500_000_000,
+	}
+	snap := SamplerSnapshot{Samples: samples, Now: now}
+	dPct, wPct, dValid, wValid := computeCPUWindows(snap)
+	if dValid[CPUWindow5s] {
+		t.Errorf("daemon 5s should be invalid after counter decrease, got %.1f%%", dPct[CPUWindow5s])
+	}
+	if wValid[CPUWindow5s] {
+		t.Errorf("worker 5s should be invalid after counter decrease, got %.1f%%", wPct[CPUWindow5s])
+	}
+}
+
 // findSampleAtOrBefore edge cases.
 func TestFindSampleAtOrBefore(t *testing.T) {
 	base := time.Unix(1000, 0)

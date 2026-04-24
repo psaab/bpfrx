@@ -195,13 +195,23 @@ func computeCPUWindows(snap SamplerSnapshot) (
 		if wallDelta <= 0 {
 			continue
 		}
+		// Guard against non-monotonic counters.  A userspace-dp
+		// restart or a brief Status() miscarriage can reset the
+		// cumulative series; an unchecked subtract on uint64 would
+		// underflow to a huge value and pass the clamp-on-display
+		// path, reporting a bogus 9e20%.  Mark the window invalid
+		// in that case so the operator sees `-` until fresh samples
+		// accumulate.
 		wallNs := uint64(wallDelta.Nanoseconds())
-		daemonDelta := newest.daemonCPUNs - then.daemonCPUNs
-		daemonPct[i] = float64(daemonDelta) * 100.0 / float64(wallNs)
-		daemonValid[i] = true
+		if newest.daemonCPUNs >= then.daemonCPUNs {
+			daemonDelta := newest.daemonCPUNs - then.daemonCPUNs
+			daemonPct[i] = float64(daemonDelta) * 100.0 / float64(wallNs)
+			daemonValid[i] = true
+		}
 
-		workerWallDelta := newest.workerWallNs - then.workerWallNs
-		if workerWallDelta > 0 {
+		if newest.workerWallNs > then.workerWallNs &&
+			newest.workerThreadNs >= then.workerThreadNs {
+			workerWallDelta := newest.workerWallNs - then.workerWallNs
 			workerThreadDelta := newest.workerThreadNs - then.workerThreadNs
 			workerPct[i] = float64(workerThreadDelta) * 100.0 /
 				float64(workerWallDelta)
