@@ -81,9 +81,11 @@ func Format(fs *ForwardingStatus) string {
 	if fs.BufferKnown {
 		writeRow(&b, "Buffer utilization",
 			fmt.Sprintf("%.0f percent", clampPercent(fs.BufferPercent)))
-	} else {
+	} else if fs.BufferFollowupRef != 0 {
 		writeRow(&b, "Buffer utilization",
 			fmt.Sprintf("unknown (see #%d)", fs.BufferFollowupRef))
+	} else {
+		writeRow(&b, "Buffer utilization", "unknown")
 	}
 
 	writeRow(&b, "Uptime:", formatUptime(fs.Uptime))

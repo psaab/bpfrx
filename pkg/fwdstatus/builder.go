@@ -11,10 +11,10 @@ import (
 // kernel config we ship sets CONFIG_HZ_100=y, so this is 100 on
 // every supported deployment.  golang.org/x/sys/unix does not expose
 // `Sysconf`/`_SC_CLK_TCK` on Linux and we avoid cgo in this package,
-// so the value is hardcoded.  initSanityCheck validates that a
-// process starttime parses to a plausible value; a pathological
-// custom kernel with a different HZ would flag the issue at startup
-// instead of silently reporting wrong CPU percentages.
+// so the value is hardcoded.  There is no init-time validation; a
+// pathological custom kernel with a different HZ would cause CPU
+// percentages derived from /proc ticks to be inaccurate, but will
+// not crash the daemon.
 const userHZ = 100
 
 // Well-known follow-up issue numbers printed in the rendered output.
@@ -41,9 +41,12 @@ type DataPlaneAccessor interface {
 	GetMapStats() []dataplane.MapStats
 }
 
-// Build gathers all fields of a ForwardingStatus.  It never panics
-// on nil inputs; unreadable sources map to State=Unknown with
-// safe zero-value fallbacks.
+// Build gathers all fields of a ForwardingStatus.  Nil `dp` is
+// tolerated (treated as "dataplane not loaded" → State=Unknown).
+// `proc` must be non-nil; callers that want to bypass /proc should
+// pass a stub implementation that returns os.ErrNotExist — Build
+// maps that into State=Unknown with uptime falling back to
+// `startTime`.
 func Build(
 	dp DataPlaneAccessor,
 	proc ProcReader,
@@ -213,14 +216,15 @@ func pageSize() int {
 	return syscallPageSize
 }
 
-// syscallPageSize is set at init from the OS.
-var syscallPageSize = func() int {
-	// On all Linux we ship, 4096.  Hardcode rather than calling
-	// unix.Getpagesize() to avoid the dependency bloat in this
-	// narrow helper.  Tests inject synthetic RSS values scaled to
-	// this constant.
-	return 4096
-}()
+// syscallPageSize is the page size in bytes used to convert the
+// `resident` field of /proc/self/statm (which is in pages) to
+// bytes.  Hardcoded to 4096 — Linux x86_64/arm64 page size on every
+// mainline kernel config we ship.  We intentionally do NOT call
+// `unix.Getpagesize()` here to keep this package dependency-light;
+// if we ever deploy on a kernel with a non-4K page size (HugeTLBFS
+// main allocation, transparent-hugepage config), Heap% will be
+// inaccurate by a constant factor until this is fetched at runtime.
+var syscallPageSize = 4096
 
 // (A library package must not panic on sensor unreliability.  A
 // malformed /proc/self/stat is caught by Build returning State=Unknown

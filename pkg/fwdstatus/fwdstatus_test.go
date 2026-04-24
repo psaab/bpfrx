@@ -70,6 +70,24 @@ func TestFormat_BufferUnknownUserspace(t *testing.T) {
 	}
 }
 
+// BufferFollowupRef == 0 suppresses the "(see #N)" suffix — callers
+// that don't have a follow-up issue shouldn't see `#0` rendered.
+func TestFormat_BufferUnknownNoRef(t *testing.T) {
+	fs := &ForwardingStatus{
+		State:             StateOnline,
+		BufferKnown:       false,
+		BufferFollowupRef: 0,
+	}
+	out := Format(fs)
+	if !regexp.MustCompile(`Buffer utilization\s+unknown$`).MatchString(strings.TrimRight(out, "\n")) &&
+		!strings.Contains(out, "Buffer utilization                 unknown\n") {
+		t.Errorf("expected plain 'unknown' with no #N, got: %s", out)
+	}
+	if strings.Contains(out, "#0") {
+		t.Errorf("should not render #0: %s", out)
+	}
+}
+
 func TestFormat_BufferKnownPercent(t *testing.T) {
 	fs := &ForwardingStatus{
 		State:         StateOnline,
