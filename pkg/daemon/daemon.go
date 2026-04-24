@@ -38,6 +38,7 @@ import (
 	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/flowexport"
 	"github.com/psaab/xpf/pkg/frr"
+	"github.com/psaab/xpf/pkg/fwdstatus"
 	"github.com/psaab/xpf/pkg/grpcapi"
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
@@ -1047,6 +1048,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Info("HTTP API server started", "addr", d.opts.APIAddr)
 	}
 
+	// #881: forwarding-daemon CPU sampler (5s/1m/5m windows for
+	// `show chassis forwarding`).  Shared between the gRPC server
+	// and the local CLI; both paths call Snapshot() at query time.
+	// Started here so the ring is populated before the first CLI.
+	fwdSampler := fwdstatus.NewSampler(d.dp, fwdstatus.OSProcReader{})
+	fwdSampler.Start(ctx)
+
 	// Start gRPC API server.
 	{
 		// Wrap applyConfig to also sync config to cluster peer after commit.
@@ -1118,6 +1126,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return ""
 			}(),
+			FwdSampler: fwdSampler,
 		})
 		d.grpcSrv = grpcSrv
 		wg.Add(1)
@@ -1135,6 +1144,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if isInteractive() {
 		shell := cli.New(d.store, d.dp, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
 		shell.SetVersion(d.opts.Version)
+		shell.SetForwardingSampler(fwdSampler)
 		// #797 H2: route in-process CLI commits through the daemon's
 		// full reconcile (same path gRPC/HTTP use via ApplyFn) so D3
 		// RSS indirection reapply, cluster/VRRP, DHCP etc. converge

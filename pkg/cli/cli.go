@@ -35,6 +35,7 @@ import (
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
+	"github.com/psaab/xpf/pkg/fwdstatus"
 	"github.com/psaab/xpf/pkg/vrrp"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
@@ -65,6 +66,11 @@ type CLI struct {
 	startTime       time.Time
 
 	vrrpMgr *vrrp.Manager
+
+	// fwdSampler supplies 5s/1m/5m CPU windows to
+	// `show chassis forwarding` (#881).  Nil when no sampler is
+	// wired — Build() falls back to all-invalid windows.
+	fwdSampler *fwdstatus.Sampler
 
 	// applyConfigFn is the daemon's full reconcile callback. When set,
 	// local CLI commits invoke this (the single source of truth used by
@@ -117,6 +123,14 @@ func New(store *configstore.Store, dp dataplane.DataPlane, eventBuf *logging.Eve
 }
 
 // SetRPMResultsFn sets a callback for retrieving live RPM probe results.
+// SetForwardingSampler wires the pkg/fwdstatus Sampler into the CLI
+// so `show chassis forwarding` can read 5s/1m/5m CPU windows.
+// Pass nil to disable windowed CPU display (Build falls back to
+// all-invalid columns and the formatter prints `-`).
+func (c *CLI) SetForwardingSampler(s *fwdstatus.Sampler) {
+	c.fwdSampler = s
+}
+
 func (c *CLI) SetRPMResultsFn(fn func() []*rpm.ProbeResult) {
 	c.rpmResultsFn = fn
 }

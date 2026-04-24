@@ -27,6 +27,7 @@ import (
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/fwdstatus"
 	"github.com/psaab/xpf/pkg/ra"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
@@ -54,6 +55,7 @@ type Config struct {
 	Version          string                           // software version string
 	FabricPeerAddrFn func() []string                  // returns peer fabric IPs (fab0, fab1; empty if standalone)
 	FabricVRFDevice  string                           // VRF for fabric interface (e.g. "vrf-mgmt")
+	FwdSampler       *fwdstatus.Sampler               // #881: 5s/1m/5m CPU windows for `show chassis forwarding`
 }
 
 // Server implements the BpfrxService gRPC service.
@@ -75,6 +77,7 @@ type Server struct {
 	applyFn            func(*config.Config)
 	vrrpMgr            *vrrp.Manager
 	raMgr              *ra.Manager
+	fwdSampler         *fwdstatus.Sampler
 	startTime          time.Time
 	addr               string
 	version            string
@@ -135,6 +138,7 @@ func NewServer(addr string, cfg Config) *Server {
 		applyFn:          cfg.ApplyFn,
 		vrrpMgr:          cfg.VRRPMgr,
 		raMgr:            cfg.RAMgr,
+		fwdSampler:       cfg.FwdSampler,
 		startTime:        time.Now(),
 		addr:             addr,
 		version:          cfg.Version,

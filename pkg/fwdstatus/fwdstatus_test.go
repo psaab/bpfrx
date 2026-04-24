@@ -16,19 +16,20 @@ import (
 
 func TestFormat_LabelsAndOrderEBPF(t *testing.T) {
 	fs := &ForwardingStatus{
-		State:             StateOnline,
-		DaemonCPUPercent:  3.7,
-		WorkerCPUMode:     CPUModeEBPFNoWorkers,
-		HeapPercent:       72.0,
-		BufferPercent:     83.0,
-		BufferKnown:       true,
-		Uptime:            474635 * time.Second,
+		State: StateOnline,
+		DaemonCPUWindows: [numCPUWindows]float64{4, 3, 2},
+		DaemonCPUWindowValid: [numCPUWindows]bool{true, true, true},
+		WorkerCPUMode:  CPUModeEBPFNoWorkers,
+		HeapPercent:    72.0,
+		BufferPercent:  83.0,
+		BufferKnown:    true,
+		Uptime:         474635 * time.Second,
 	}
 	out := Format(fs)
 	wantLabelsInOrder := []string{
 		"State",
 		"Daemon CPU utilization",
-		"Worker threads CPU utilization",
+		"Worker threads utilization",
 		"Heap utilization",
 		"Buffer utilization",
 		"Uptime:",
@@ -51,18 +52,19 @@ func TestFormat_LabelsAndOrderEBPF(t *testing.T) {
 	if !strings.Contains(out, "N/A") {
 		t.Errorf("eBPF worker row should mention N/A: %s", out)
 	}
-	if !regexp.MustCompile(`\d+ percent`).MatchString(out) {
+	if !regexp.MustCompile(`\d+%`).MatchString(out) {
 		t.Errorf("expected percentage: %s", out)
 	}
 }
 
 func TestFormat_BufferUnknownUserspace(t *testing.T) {
 	fs := &ForwardingStatus{
-		State:             StateOnline,
-		WorkerCPUMode:     CPUModeWorkers,
-		WorkerCPUPercent:  45.0,
-		BufferKnown:       false,
-		BufferFollowupRef: 878,
+		State:              StateOnline,
+		WorkerCPUMode:      CPUModeWorkers,
+		WorkerCPUWindows:   [numCPUWindows]float64{45, 40, 35},
+		WorkerCPUWindowValid: [numCPUWindows]bool{true, true, true},
+		BufferKnown:        false,
+		BufferFollowupRef:  878,
 	}
 	out := Format(fs)
 	if !strings.Contains(out, "unknown (see #878)") {
@@ -123,20 +125,22 @@ func TestFormat_UptimeShape(t *testing.T) {
 
 func TestFormat_HeapAndBufferClampButCPUDoesNot(t *testing.T) {
 	fs := &ForwardingStatus{
-		DaemonCPUPercent: 230.4, // multi-core daemon, legitimately >100
-		WorkerCPUMode:    CPUModeWorkers,
-		WorkerCPUPercent: -3.0, // negative is a bug; floor to 0
-		HeapPercent:      150.0,
-		BufferKnown:      true,
-		BufferPercent:    -5.0,
+		DaemonCPUWindows:     [numCPUWindows]float64{230.4, 230.4, 230.4}, // multi-core >100
+		DaemonCPUWindowValid: [numCPUWindows]bool{true, true, true},
+		WorkerCPUMode:        CPUModeWorkers,
+		WorkerCPUWindows:     [numCPUWindows]float64{-3.0, -3.0, -3.0}, // negatives floor to 0
+		WorkerCPUWindowValid: [numCPUWindows]bool{true, true, true},
+		HeapPercent:          150.0,
+		BufferKnown:          true,
+		BufferPercent:        -5.0,
 	}
 	out := Format(fs)
 	// 230% is honest per-core utilization — must not clamp
-	if !regexp.MustCompile(`Daemon CPU utilization\s+230 percent`).MatchString(out) {
+	if !regexp.MustCompile(`Daemon CPU utilization\s+230%\s*/\s*230%\s*/\s*230%`).MatchString(out) {
 		t.Errorf("daemon CPU must not clamp to 100 (per-core): %s", out)
 	}
 	// negative worker CPU floors to 0
-	if !regexp.MustCompile(`Worker threads CPU utilization\s+0 percent`).MatchString(out) {
+	if !regexp.MustCompile(`Worker threads utilization\s+0%\s*/\s*0%\s*/\s*0%`).MatchString(out) {
 		t.Errorf("expected worker CPU floored to 0: %s", out)
 	}
 	// 150% heap clamps to 100
@@ -221,7 +225,7 @@ func TestBuild_Online_eBPF(t *testing.T) {
 	dp := &fakeDP{loaded: true, mapStats: []dataplane.MapStats{
 		{Name: "sessions", MaxEntries: 100, UsedCount: 30},
 	}}
-	fs, err := Build(dp, freshProcReader(), time.Now(), false)
+	fs, err := Build(dp, freshProcReader(), time.Now(), false, SamplerSnapshot{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +244,7 @@ func TestBuild_Online_eBPF(t *testing.T) {
 }
 
 func TestBuild_Unknown_DpNil(t *testing.T) {
-	fs, _ := Build(nil, freshProcReader(), time.Now(), false)
+	fs, _ := Build(nil, freshProcReader(), time.Now(), false, SamplerSnapshot{})
 	if fs.State != StateUnknown {
 		t.Errorf("dp==nil: state %q, want Unknown", fs.State)
 	}
@@ -248,7 +252,7 @@ func TestBuild_Unknown_DpNil(t *testing.T) {
 
 func TestBuild_Unknown_NotLoaded(t *testing.T) {
 	dp := &fakeDP{loaded: false}
-	fs, _ := Build(dp, freshProcReader(), time.Now(), false)
+	fs, _ := Build(dp, freshProcReader(), time.Now(), false, SamplerSnapshot{})
 	if fs.State != StateUnknown {
 		t.Errorf("!IsLoaded: state %q, want Unknown", fs.State)
 	}
@@ -258,7 +262,7 @@ func TestBuild_Unknown_SelfStatErr(t *testing.T) {
 	dp := &fakeDP{loaded: true}
 	proc := freshProcReader()
 	proc.selfStatErr = os.ErrNotExist
-	fs, _ := Build(dp, proc, time.Now(), false)
+	fs, _ := Build(dp, proc, time.Now(), false, SamplerSnapshot{})
 	if fs.State != StateUnknown {
 		t.Errorf("selfStat err: state %q, want Unknown", fs.State)
 	}
@@ -268,7 +272,7 @@ func TestBuild_Unknown_StatmErr(t *testing.T) {
 	dp := &fakeDP{loaded: true}
 	proc := freshProcReader()
 	proc.selfStatmErr = os.ErrNotExist
-	fs, _ := Build(dp, proc, time.Now(), false)
+	fs, _ := Build(dp, proc, time.Now(), false, SamplerSnapshot{})
 	if fs.State != StateUnknown {
 		t.Errorf("statm err: state %q, want Unknown", fs.State)
 	}
@@ -279,7 +283,7 @@ func TestBuild_Unknown_UserspaceStatusErr(t *testing.T) {
 		fakeDP: fakeDP{loaded: true},
 		err:    errors.New("status unavailable"),
 	}
-	fs, _ := Build(dp, freshProcReader(), time.Now(), false)
+	fs, _ := Build(dp, freshProcReader(), time.Now(), false, SamplerSnapshot{})
 	if fs.State != StateUnknown {
 		t.Errorf("userspace Status err: state %q, want Unknown", fs.State)
 	}
@@ -296,7 +300,7 @@ func TestBuild_Degraded_StaleHeartbeat(t *testing.T) {
 			},
 		},
 	}
-	fs, _ := Build(dp, freshProcReader(), time.Now(), false)
+	fs, _ := Build(dp, freshProcReader(), time.Now(), false, SamplerSnapshot{})
 	if fs.State != StateDegraded {
 		t.Errorf("stale hb: state %q, want Degraded", fs.State)
 	}
@@ -317,16 +321,20 @@ func TestBuild_Online_UserspaceFreshHeartbeats(t *testing.T) {
 			},
 		},
 	}
-	fs, _ := Build(dp, freshProcReader(), time.Now(), false)
+	fs, _ := Build(dp, freshProcReader(), time.Now(), false, SamplerSnapshot{})
 	if fs.State != StateOnline {
 		t.Errorf("fresh hb: state %q, want Online", fs.State)
 	}
 	if fs.WorkerCPUMode != CPUModeWorkers {
 		t.Error("userspace should set CPUModeWorkers")
 	}
-	// (30% + 20%) = 50
-	if fs.WorkerCPUPercent < 49 || fs.WorkerCPUPercent > 51 {
-		t.Errorf("worker CPU%%: got %v, want ~50", fs.WorkerCPUPercent)
+	// Worker CPU values now come from the sampler, not sum of
+	// cumulative thread_cpu_ns at Build time. With an empty
+	// SamplerSnapshot, all windows should be invalid.
+	for i, v := range fs.WorkerCPUWindowValid {
+		if v {
+			t.Errorf("empty snapshot: WorkerCPUWindowValid[%d] should be false", i)
+		}
 	}
 	if fs.BufferKnown {
 		t.Error("userspace-dp Buffer should be unknown")
@@ -338,7 +346,7 @@ func TestBuild_Online_UserspaceFreshHeartbeats(t *testing.T) {
 
 func TestBuild_ClusterMode(t *testing.T) {
 	dp := &fakeDP{loaded: true}
-	fs, _ := Build(dp, freshProcReader(), time.Now(), true)
+	fs, _ := Build(dp, freshProcReader(), time.Now(), true, SamplerSnapshot{})
 	if !fs.ClusterMode {
 		t.Error("ClusterMode should be true")
 	}

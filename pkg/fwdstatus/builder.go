@@ -46,12 +46,14 @@ type DataPlaneAccessor interface {
 // `proc` must be non-nil; callers that want to bypass /proc should
 // pass a stub implementation that returns os.ErrNotExist — Build
 // maps that into State=Unknown with uptime falling back to
-// `startTime`.
+// `startTime`.  `snap` carries the 5s/1m/5m CPU history; an empty
+// snapshot renders all window columns as invalid (`-`).
 func Build(
 	dp DataPlaneAccessor,
 	proc ProcReader,
 	startTime time.Time,
 	clusterMode bool,
+	snap SamplerSnapshot,
 ) (*ForwardingStatus, error) {
 	fs := &ForwardingStatus{
 		State:              StateUnknown,
@@ -62,7 +64,7 @@ func Build(
 		ClusterFollowupRef: followupClusterPeer,
 	}
 
-	// --- Uptime + Daemon CPU %: shared PID-start anchor ------------
+	// --- Uptime: shared PID-start anchor ---------------------------
 	selfStat, statErr := proc.ReadSelfStat()
 	stat, btimeErr := proc.ReadStat()
 	hasProcStat := statErr == nil && btimeErr == nil
@@ -70,22 +72,19 @@ func Build(
 	if hasProcStat {
 		pidStart := time.Unix(int64(stat.BootTime)+int64(selfStat.StartTimeTicks)/userHZ, 0)
 		fs.Uptime = time.Since(pidStart)
-
-		wallNs := fs.Uptime.Nanoseconds()
-		if wallNs > 0 {
-			// Per-core percent: 100% = one core fully saturated;
-			// a daemon using 2 cores sustained reports 200%.  This
-			// matches `top` and is honest on CPU-pinned deployments
-			// where normalizing by NumCPU() would under-report load.
-			cpuNs := ticksToNanos(selfStat.UtimeTicks + selfStat.StimeTicks)
-			fs.DaemonCPUPercent = float64(cpuNs) * 100.0 / float64(wallNs)
-		}
 	} else {
 		// Fallback: in-memory daemon start time.  Differs from true
 		// PID-start by ms at most.  State stays Unknown below because
 		// /proc/self/stat was unreadable.
 		fs.Uptime = time.Since(startTime)
 	}
+
+	// --- CPU windows (5s / 1m / 5m) --------------------------------
+	// Populated from the sampler's cumulative-counter ring.  An
+	// empty snap (no sampler wired, or zero samples yet) leaves all
+	// windows invalid — formatter renders `-`.
+	fs.DaemonCPUWindows, fs.WorkerCPUWindows,
+		fs.DaemonCPUWindowValid, fs.WorkerCPUWindowValid = computeCPUWindows(snap)
 
 	// --- Heap % --------------------------------------------------
 	selfStatm, statmErr := proc.ReadSelfStatm()
@@ -145,7 +144,10 @@ func Build(
 		fs.BufferKnown = true
 	}
 
-	// --- Worker CPU % (userspace-dp only) ------------------------
+	// --- Worker path detection (for State + Mode) ----------------
+	// Worker CPU values come from the sampler (above); here we only
+	// need to know whether we're on the userspace path and whether
+	// Status() currently returns an error, for State classification.
 	var usStatus userspace.ProcessStatus
 	var usErr error
 	if dp != nil && isUserspace {
@@ -157,7 +159,6 @@ func Build(
 	}
 	if isUserspace && usErr == nil {
 		fs.WorkerCPUMode = CPUModeWorkers
-		fs.WorkerCPUPercent = sumWorkerCPUPercent(usStatus)
 	}
 
 	// --- State ---------------------------------------------------
@@ -179,21 +180,6 @@ func Build(
 
 func ticksToNanos(ticks uint64) uint64 {
 	return ticks * 1_000_000_000 / userHZ
-}
-
-// sumWorkerCPUPercent returns the cumulative summed CPU% across all
-// workers in the given status.  Each worker contributes
-// thread_cpu_ns / wall_ns * 100; summing yields aggregate daemon
-// worker load (can exceed 100 on multi-core).
-func sumWorkerCPUPercent(st userspace.ProcessStatus) float64 {
-	total := 0.0
-	for _, w := range st.WorkerRuntime {
-		if w.WallNS == 0 {
-			continue
-		}
-		total += float64(w.ThreadCPUNS) * 100.0 / float64(w.WallNS)
-	}
-	return total
 }
 
 // allHeartbeatsFresh returns true iff every heartbeat is within
