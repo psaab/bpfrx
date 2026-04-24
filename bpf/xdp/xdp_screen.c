@@ -708,8 +708,19 @@ int xdp_screen_prog(struct xdp_md *ctx)
 		}
 	}
 
-	/* TCP-specific stateless checks */
-	if (meta->protocol == PROTO_TCP) {
+	/* TCP-specific stateless checks.
+	 *
+	 * Gated on !is_fragment for the same reason as tc_screen_egress.c:
+	 * xdp_main skips parse_l4hdr for fragments, so tcp_flags is always
+	 * 0 under the top-of-pipeline memset.  Without this gate, any
+	 * fragment false-drops as SCREEN_TCP_NO_FLAG when that screen is
+	 * enabled (#853).
+	 *
+	 * TODO(#866): real SCREEN_SYN_FRAG detection requires L4 parse on
+	 * the first fragment.  Until then the SYN_FRAG branch below is
+	 * gated off by !is_fragment and remains intentionally unreachable.
+	 */
+	if (meta->protocol == PROTO_TCP && !meta->is_fragment) {
 		__u8 tf = meta->tcp_flags;
 
 		/* TCP SYN+FIN */
@@ -731,7 +742,8 @@ int xdp_screen_prog(struct xdp_md *ctx)
 		    (tf & 0x20) && meta->dst_port == bpf_htons(139))
 			return screen_drop(meta, SCREEN_WINNUKE);
 
-		/* TCP SYN fragment: SYN on a fragmented packet */
+		/* TCP SYN fragment: unreachable under current !is_fragment
+		 * guard; see TODO(#866) above. */
 		if ((sc->flags & SCREEN_SYN_FRAG) &&
 		    (tf & 0x02) && meta->is_fragment)
 			return screen_drop(meta, SCREEN_SYN_FRAG);
