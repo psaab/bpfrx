@@ -37,18 +37,32 @@ const (
 // are computed by Build; Format does not read /proc or call into the
 // dataplane.
 type ForwardingStatus struct {
-	State             State
-	DaemonCPUPercent  float64
-	WorkerCPUMode     CPUMode
-	WorkerCPUPercent  float64
-	HeapPercent       float64
-	BufferPercent     float64 // Only valid if BufferKnown.
-	BufferKnown       bool    // False on userspace-dp until UMEM telemetry lands.
-	BufferFollowupRef int     // GitHub issue number printed in place of buffer %.
-	Uptime            time.Duration
+	State State
 
-	// ClusterMode = true causes Format to append a deferred-peer note.
-	ClusterMode       bool
+	// CPU windows (5s / 1m / 5m) — indexed by CPUWindow* constants.
+	// DaemonCPUWindows is /proc/self/stat per-core % (can exceed
+	// 100 on multi-core).  WorkerCPUWindows is per-worker-average
+	// activity fraction in [0, 100] — time-weighted Σactive_ns /
+	// Σwall_ns across all workers.  Parallel *Valid flags are
+	// false when the ring doesn't have a sample ≥ W old yet
+	// (short uptime); the formatter renders `-` for invalid cols.
+	DaemonCPUWindows     [numCPUWindows]float64
+	WorkerCPUWindows     [numCPUWindows]float64
+	DaemonCPUWindowValid [numCPUWindows]bool
+	WorkerCPUWindowValid [numCPUWindows]bool
+
+	// WorkerCPUMode distinguishes the eBPF "no workers" path from
+	// the userspace path — on eBPF the worker row prints the
+	// explicit N/A label instead of window values, regardless of
+	// WorkerCPUWindowValid.
+	WorkerCPUMode CPUMode
+
+	HeapPercent        float64
+	BufferPercent      float64 // Only valid if BufferKnown.
+	BufferKnown        bool    // False on userspace-dp until UMEM telemetry lands.
+	BufferFollowupRef  int     // GitHub issue number printed in place of buffer %.
+	Uptime             time.Duration
+	ClusterMode        bool
 	ClusterFollowupRef int
 }
 
@@ -59,20 +73,23 @@ func Format(fs *ForwardingStatus) string {
 	var b strings.Builder
 	b.WriteString("FWDD status:\n")
 	writeRow(&b, "State", string(fs.State))
-	// CPU rows are per-core: 100 percent = one core saturated; a
-	// multi-threaded daemon legitimately shows >100% (e.g. 250%
-	// = 2.5 cores).  Do not clamp — suppressing >100% would hide
-	// real load.  Clamp to a non-negative floor only.
+	// CPU rows: three sliding windows (5s / 1m / 5m).  Daemon row
+	// is /proc/self/stat per-core % (can exceed 100 on multi-core;
+	// no upper clamp).  Worker row is Σ(thread_cpu_ns) / Σ(wall_ns)
+	// from CLOCK_THREAD_CPUTIME_ID — OS thread CPU, not dataplane
+	// activity (see #883/#884; activity-based signal was tried and
+	// empirically found broken at 25 Gbps).  Columns with insufficient
+	// history (uptime < window) render `-`.  On eBPF, the worker row
+	// prints the N/A label.
 	writeRow(&b, "Daemon CPU utilization",
-		fmt.Sprintf("%.0f percent (cumulative since start)", floorZero(fs.DaemonCPUPercent)))
+		formatWindowRow(fs.DaemonCPUWindows, fs.DaemonCPUWindowValid))
 
-	switch fs.WorkerCPUMode {
-	case CPUModeEBPFNoWorkers:
+	if fs.WorkerCPUMode == CPUModeEBPFNoWorkers {
 		writeRow(&b, "Worker threads CPU utilization",
-			"0 percent (N/A — eBPF path has no worker threads)")
-	default:
+			"N/A — eBPF path has no worker threads")
+	} else {
 		writeRow(&b, "Worker threads CPU utilization",
-			fmt.Sprintf("%.0f percent (cumulative since start)", floorZero(fs.WorkerCPUPercent)))
+			formatWindowRow(fs.WorkerCPUWindows, fs.WorkerCPUWindowValid))
 	}
 
 	writeRow(&b, "Heap utilization",
@@ -125,6 +142,20 @@ func floorZero(p float64) float64 {
 		return 0
 	}
 	return p
+}
+
+// formatWindowRow renders three windows as
+// `NN% / NN% / NN%   (5s / 1m / 5m)`.  Invalid columns render `-`.
+func formatWindowRow(pct [numCPUWindows]float64, valid [numCPUWindows]bool) string {
+	cols := [numCPUWindows]string{}
+	for i := 0; i < numCPUWindows; i++ {
+		if valid[i] {
+			cols[i] = fmt.Sprintf("%.0f%%", floorZero(pct[i]))
+		} else {
+			cols[i] = "-"
+		}
+	}
+	return fmt.Sprintf("%-5s / %-5s / %-5s   (5s / 1m / 5m)", cols[0], cols[1], cols[2])
 }
 
 // formatUptime renders a duration as "N days, N hours, N minutes,

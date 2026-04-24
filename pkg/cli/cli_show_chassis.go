@@ -13,11 +13,16 @@ import (
 // #877: local-node MVP.  Cluster peer rendering is stubbed via
 // fwdstatus.ClusterPeerFollowup.
 func (c *CLI) showChassisForwarding() error {
+	var snap fwdstatus.SamplerSnapshot
+	if c.fwdSampler != nil {
+		snap = c.fwdSampler.Snapshot()
+	}
 	fs, err := fwdstatus.Build(
 		c.dp,
 		fwdstatus.OSProcReader{},
 		c.startTime,
 		c.cluster != nil,
+		snap,
 	)
 	if err != nil {
 		return fmt.Errorf("build forwarding status: %w", err)

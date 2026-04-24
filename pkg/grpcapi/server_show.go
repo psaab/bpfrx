@@ -3991,11 +3991,17 @@ func (s *Server) ShowText(_ context.Context, req *pb.ShowTextRequest) (*pb.ShowT
 
 	case "chassis-forwarding":
 		// #877: Junos-style forwarding-daemon health view.
+		// #881: CPU rows are 5s/1m/5m windows from s.fwdSampler.
+		var snap fwdstatus.SamplerSnapshot
+		if s.fwdSampler != nil {
+			snap = s.fwdSampler.Snapshot()
+		}
 		fs, err := fwdstatus.Build(
 			s.dp,
 			fwdstatus.OSProcReader{},
 			s.startTime,
 			s.cluster != nil,
+			snap,
 		)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "build forwarding status: %v", err)
