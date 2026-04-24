@@ -1879,10 +1879,12 @@ fn poll_binding_process_descriptor(
                                 let owner_rg_id =
                                     owner_rg_for_resolution(forwarding, decision.resolution);
                                 flow_cache_owner_rg_id = owner_rg_id;
-                                if allow_unsolicited_dns_reply(forwarding, flow) {
-                                    // Match the XDP fast path: unsolicited DNS replies bypass
-                                    // policy/session install when the flow knob is enabled.
-                                } else if let PolicyAction::Permit = evaluate_policy(
+                                // #850: allow-dns-reply admits sessionless DNS replies
+                                // through policy (not around it). Always evaluate policy;
+                                // the session-install step below is skipped only when
+                                // the knob matches AND no NAT is required (to avoid
+                                // orphan NAT state without a session anchor).
+                                if let PolicyAction::Permit = evaluate_policy(
                                     &forwarding.policy,
                                     &from_zone,
                                     &to_zone,
@@ -1992,8 +1994,19 @@ fn poll_binding_process_descriptor(
                                         recycle_now = false;
                                     } else {
                                         let mut created = 0u64;
+                                        // #850: DNS-reply fast-path skips session install
+                                        // when no NAT is required.  If NAT is required, fall
+                                        // through to normal session install so NAT state is
+                                        // anchored for GC.
+                                        let dns_fastpath_admit =
+                                            allow_unsolicited_dns_reply(forwarding, flow)
+                                                && decision.nat.rewrite_src.is_none()
+                                                && decision.nat.rewrite_dst.is_none()
+                                                && !decision.nat.nat64
+                                                && !decision.nat.nptv6;
                                         let track_in_userspace = decision.resolution.disposition
-                                            != ForwardingDisposition::LocalDelivery;
+                                            != ForwardingDisposition::LocalDelivery
+                                            && !dns_fastpath_admit;
                                         let install_local_reverse =
                                             should_install_local_reverse_session(
                                                 decision,

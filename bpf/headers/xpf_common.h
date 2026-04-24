@@ -201,6 +201,7 @@ struct icmp6hdr {
 #define META_FLAG_TUNNEL             (1 << 3)  /* arrived via tunnel interface */
 #define META_FLAG_FABRIC_FWD         (1 << 4)  /* plain fabric redirect (not zone-encoded) */
 #define META_FLAG_INGRESS_RESOLVED   (1 << 5)  /* ingress zone/routing already resolved */
+#define META_FLAG_DNS_REPLY_FASTPATH (1 << 6)  /* #850: allow-dns-reply sessionless admit */
 
 /* Per-rule logging flags (policy_rule.log and session_value.log_flags) */
 #define LOG_FLAG_SESSION_INIT  (1 << 0)

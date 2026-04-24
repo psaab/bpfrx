@@ -1457,6 +1457,20 @@ int xdp_policy_prog(struct xdp_md *ctx)
 					sess_nat_dst_port = meta->nat_dst_port;
 				}
 
+				/* #850: allow-dns-reply fast-path admit.
+				 * When the DNS-reply flag is set AND no NAT is
+				 * required (so there's no dnat_table/nat64_state
+				 * to leak without a session anchor), admit
+				 * without creating a session.  On NAT-required
+				 * flows, fall through to normal admit-with-session
+				 * so NAT state has a GC anchor. */
+				if ((meta->meta_flags & META_FLAG_DNS_REPLY_FASTPATH) &&
+				    sess_nat_flags == 0) {
+					TRACE_POLICY(meta, ACTION_PERMIT, rule->rule_id);
+					bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+					return XDP_PASS;
+				}
+
 				/* Create session with pre-NAT addresses */
 				if (create_session(meta, rule->rule_id, sess_log,
 						   sess_nat_flags,
@@ -1781,6 +1795,17 @@ int xdp_policy_prog(struct xdp_md *ctx)
 				const __u8 *nat_src_ptr = (sess_nat_flags & SESS_FLAG_SNAT) ? meta->nat_src_ip.v6 : NULL;
 				const __u8 *nat_dst_ptr = (meta->nat_flags & SESS_FLAG_DNAT) ?
 					meta->nat_dst_ip.v6 : NULL;
+
+				/* #850: allow-dns-reply fast-path admit (v6).
+				 * Same invariant as v4: admit sessionlessly only
+				 * when no NAT is required, so there's no NAT
+				 * state to leak. */
+				if ((meta->meta_flags & META_FLAG_DNS_REPLY_FASTPATH) &&
+				    sess_nat_flags == 0) {
+					TRACE_POLICY(meta, ACTION_PERMIT, rule->rule_id);
+					bpf_tail_call(ctx, &xdp_progs, XDP_PROG_FORWARD);
+					return XDP_PASS;
+				}
 
 				/* Create session with pre-NAT addresses */
 				if (create_session_v6(meta, rule->rule_id, sess_log,

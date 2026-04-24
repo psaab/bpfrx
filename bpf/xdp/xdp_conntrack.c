@@ -876,14 +876,16 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 
 				/* allow-dns-reply: permit unsolicited DNS
 				 * response packets (UDP src port 53) without
-				 * a matching session. */
+				 * a matching session — but still run policy
+				 * (#850).  xdp_policy checks
+				 * META_FLAG_DNS_REPLY_FASTPATH and skips
+				 * session creation on Permit, so the admit
+				 * remains sessionless. */
 				if (meta->protocol == PROTO_UDP &&
 				    meta->src_port == __bpf_htons(53)) {
-					if (fc && fc->allow_dns_reply) {
-						bpf_tail_call(ctx, &xdp_progs,
-							XDP_PROG_FORWARD);
-						return XDP_PASS;
-					}
+					if (fc && fc->allow_dns_reply)
+						meta->meta_flags |=
+							META_FLAG_DNS_REPLY_FASTPATH;
 				}
 
 				meta->ct_state = SESS_STATE_NEW;
@@ -954,14 +956,13 @@ int xdp_conntrack_prog(struct xdp_md *ctx)
 
 				/* allow-dns-reply: permit unsolicited DNS
 				 * response packets (UDP src port 53) without
-				 * a matching session. */
+				 * a matching session — but still run policy
+				 * (#850).  See v4 path above. */
 				if (meta->protocol == PROTO_UDP &&
 				    meta->src_port == __bpf_htons(53)) {
-					if (fc && fc->allow_dns_reply) {
-						bpf_tail_call(ctx, &xdp_progs,
-							XDP_PROG_FORWARD);
-						return XDP_PASS;
-					}
+					if (fc && fc->allow_dns_reply)
+						meta->meta_flags |=
+							META_FLAG_DNS_REPLY_FASTPATH;
 				}
 
 				meta->ct_state = SESS_STATE_NEW;

@@ -737,6 +737,15 @@ struct event {
 	uint8_t  pad_event;
 };
 
+/* pkt_meta.meta_flags bits (mirrors xpf_common.h META_FLAG_*). */
+#define META_FLAG_EMBEDDED_ICMP      (1 << 0)
+#define META_FLAG_NAT64_ICMP_ERR     (1 << 1)
+#define META_FLAG_KERNEL_ROUTE       (1 << 2)
+#define META_FLAG_TUNNEL             (1 << 3)
+#define META_FLAG_FABRIC_FWD         (1 << 4)
+#define META_FLAG_INGRESS_RESOLVED   (1 << 5)
+#define META_FLAG_DNS_REPLY_FASTPATH (1 << 6)  /* #850 */
+
 /* ============================================================
  * Packet metadata (mirrors struct pkt_meta in xpf_common.h)
  * Passed through the userspace pipeline by reference.
