@@ -70,14 +70,23 @@ int tc_forward_prog(struct __sk_buff *skb)
 		inc_zone_egress((__u32)meta->egress_zone, meta->pkt_len);
 
 	/*
-	 * Port mirroring: if xdp_forward set mirror_ifindex (because
-	 * the ingress interface has mirroring configured), clone the
-	 * packet to the mirror destination interface.
-	 * bpf_clone_redirect is available in TC but not XDP, which is
-	 * why mirrored traffic falls back to XDP_PASS → kernel fwd → TC.
+	 * Port mirroring: look up mirror_config directly keyed on the skb
+	 * ingress ifindex.  bpf_clone_redirect is available in TC but not
+	 * XDP, which is why mirrored traffic falls back to XDP_PASS → kernel
+	 * fwd → TC.
+	 *
+	 * #854: previously this block read meta->mirror_ifindex set by
+	 * xdp_forward.  That handoff was unreliable for two reasons:
+	 *   (a) tc_main partial-memsets pkt_meta past offset 32, wiping
+	 *       mirror_ifindex/mirror_rate before tc_forward sees them;
+	 *   (b) pkt_meta_scratch is PERCPU, so cross-CPU XDP→TC handoff
+	 *       under XPS/RPS would read a different packet's fields anyway.
+	 * The map lookup avoids both problems.
 	 */
-	if (meta->mirror_ifindex != 0) {
-		__u32 rate = meta->mirror_rate;
+	__u32 mcfg_key = skb->ingress_ifindex;
+	struct mirror_config *mcfg = bpf_map_lookup_elem(&mirror_config, &mcfg_key);
+	if (mcfg && mcfg->mirror_ifindex != 0) {
+		__u32 rate = mcfg->rate;
 		int do_mirror = 1;
 
 		if (rate > 1) {
@@ -98,10 +107,7 @@ int tc_forward_prog(struct __sk_buff *skb)
 		}
 
 		if (do_mirror)
-			bpf_clone_redirect(skb, meta->mirror_ifindex, 0);
-
-		/* Reset so subsequent packets don't inherit stale state */
-		meta->mirror_ifindex = 0;
+			bpf_clone_redirect(skb, mcfg->mirror_ifindex, 0);
 	}
 
 	return TC_ACT_OK;

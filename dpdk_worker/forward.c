@@ -110,10 +110,15 @@ forward_packet(struct rte_mbuf *pkt, struct pkt_meta *meta,
 {
 	uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *);
 
-	/* 0. Host-inbound-traffic check: if no egress interface was
-	 * resolved, the packet is locally destined. Check host-inbound
-	 * policy before passing to the kernel stack. */
-	if (meta->fwd_ifindex == 0) {
+	/* 0. Host-inbound-traffic check: if FIB lookup did NOT resolve an
+	 * egress, the packet is locally destined.  Check host-inbound
+	 * policy before passing to the kernel stack.
+	 *
+	 * #855: gate on !fib_resolved instead of fwd_ifindex == 0.  DPDK
+	 * port_ids are allocated from 0, so raw port_id==0 would false-
+	 * match here and silently drop all transit to port 0.
+	 */
+	if (!meta->fib_resolved) {
 		/* Tunnel bypass: decapsulated inner packets already
 		 * validated at outer transport level — skip zone
 		 * host-inbound restrictions. */
@@ -177,8 +182,10 @@ forward_packet(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		ip6->hop_limits--;
 	}
 
-	/* 2. MAC rewrite (if FIB cache is valid from conntrack) */
-	if (meta->fwd_ifindex != 0) {
+	/* 2. MAC rewrite (if FIB cache is valid from conntrack or zone).
+	 * #855: gate on fib_resolved, not fwd_ifindex != 0, because valid
+	 * DPDK port_id 0 would otherwise skip MAC rewrite. */
+	if (meta->fib_resolved) {
 		struct rte_ether_hdr *eth = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
 		memcpy(&eth->dst_addr, meta->fwd_dmac, 6);
 		memcpy(&eth->src_addr, meta->fwd_smac, 6);

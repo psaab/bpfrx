@@ -509,10 +509,12 @@ conntrack_lookup(struct rte_mbuf *pkt, struct pkt_meta *meta,
 			meta->nat_src_port = sv->nat_src_port;
 			meta->nat_dst_port = sv->nat_dst_port;
 
-			/* FIB cache */
-			if (sv->fib_ifindex != 0 && ctx->shm->fib_gen &&
+			/* FIB cache. #855: use fib_gen != 0 (not fib_ifindex != 0)
+			 * so cached port 0 doesn't look like "no cache written". */
+			if (sv->fib_gen != 0 && ctx->shm->fib_gen &&
 			    sv->fib_gen == *ctx->shm->fib_gen) {
 				meta->fwd_ifindex = sv->fib_ifindex;
+				meta->fib_resolved = 1;
 				memcpy(meta->fwd_dmac, sv->fib_dmac, 6);
 				memcpy(meta->fwd_smac, sv->fib_smac, 6);
 			}
@@ -882,13 +884,17 @@ conntrack_create(struct rte_mbuf *pkt, struct pkt_meta *meta,
 		fwd_val.app_timeout = meta->app_timeout;
 		fwd_val.is_reverse = 0;
 
-		/* FIB cache: store forwarding result from zone_lookup */
-		if (meta->fwd_ifindex != 0 && ctx->shm->fib_gen) {
+		/* FIB cache: store forwarding result from zone_lookup.
+		 * #855: gate on fib_resolved so port 0 resolutions are cached;
+		 * a zero fib_gen is the "no cache" sentinel on restore. */
+		if (meta->fib_resolved && ctx->shm->fib_gen) {
 			fwd_val.fib_ifindex = meta->fwd_ifindex;
 			fwd_val.fib_vlan_id = meta->egress_vlan_id;
 			memcpy(fwd_val.fib_dmac, meta->fwd_dmac, 6);
 			memcpy(fwd_val.fib_smac, meta->fwd_smac, 6);
 			fwd_val.fib_gen = (uint16_t)*ctx->shm->fib_gen;
+			if (fwd_val.fib_gen == 0)
+				fwd_val.fib_gen = 1;  /* never store zero sentinel */
 		}
 
 		/* Build reverse key */
