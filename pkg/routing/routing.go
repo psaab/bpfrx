@@ -143,6 +143,9 @@ type vrfOps interface {
 	LinkAdd(netlink.Link) error
 	LinkDel(netlink.Link) error
 	LinkSetUp(netlink.Link) error
+	// #847: enumerate kernel devices to find orphan VRFs (left
+	// over from a routing-instance rename across a daemon restart).
+	LinkList() ([]netlink.Link, error)
 }
 
 // IsManagedVRF reports whether the given logical VRF name (e.g. "mgmt",
@@ -320,6 +323,47 @@ func reconcileVRFs(ops vrfOps, tracked []string, desired []VRFSpec) ([]string, e
 			continue
 		}
 		slog.Info("VRF removed", "name", existing)
+	}
+
+	// #847: orphan reap. After a routing-instance rename across a
+	// daemon restart, the old vrf-<oldname> persists in the kernel
+	// while m.vrfs is empty (state lost on exit). The "delete
+	// managed VRFs no longer desired" loop above can't catch it
+	// (oldname isn't in tracked). Walk the kernel `vrf-*` namespace
+	// and delete any VRF that is neither in `desired` nor in
+	// `tracked` (already handled). xpfd claims the entire `vrf-*`
+	// namespace per the #844 ownership model — operators must not
+	// pre-create vrf-<X> outside config.
+	links, err := ops.LinkList()
+	if err != nil {
+		// Best-effort: log and continue. The desired/tracked sets
+		// already reflect what we can manage authoritatively.
+		slog.Debug("VRF orphan reap: LinkList failed (non-fatal)", "err", err)
+		return newTracked, firstErr
+	}
+	for _, link := range links {
+		name := link.Attrs().Name
+		if !strings.HasPrefix(name, "vrf-") {
+			continue
+		}
+		if _, ok := link.(*netlink.Vrf); !ok {
+			// Misnamed non-VRF interface (operator-created bridge
+			// named "vrf-foo" or similar). Don't delete.
+			continue
+		}
+		if _, stillDesired := desiredByName[name]; stillDesired {
+			continue
+		}
+		if managed[name] {
+			// Already handled by the tracked-but-not-desired loop above.
+			continue
+		}
+		if err := ops.LinkDel(link); err != nil {
+			slog.Warn("VRF orphan reap: LinkDel failed",
+				"name", name, "err", err)
+			continue
+		}
+		slog.Info("VRF orphan reaped", "name", name)
 	}
 
 	return newTracked, firstErr
