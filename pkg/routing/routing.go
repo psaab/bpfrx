@@ -165,17 +165,22 @@ func (m *Manager) IsManagedVRF(name string) bool {
 
 // ReconcileVRFs brings the manager's owned-VRF set to match desired.
 //
-// Ownership rules — xpfd is authoritative for the "vrf-<name>"
-// namespace of names appearing in desired. Any VRF whose name appears
-// in desired is considered ours regardless of creator:
+// Ownership rules — xpfd is authoritative for the ENTIRE "vrf-*"
+// kernel namespace. Any VRF whose name starts with "vrf-" is
+// considered ours; operators MUST NOT pre-create vrf-<name> devices
+// outside xpfd config.
 //   - Desired VRF, present in kernel with matching table: no-op
 //     (preserve ifindex). Adopted into m.vrfs if not already there.
 //   - Desired VRF, present in kernel with mismatching table:
 //     LinkDel + LinkAdd (recreate). Adopted into m.vrfs.
 //   - Desired VRF, absent from kernel: LinkAdd, adopted into m.vrfs.
-//   - Non-desired VRF in kernel but NOT in m.vrfs: never touched
-//     (truly external — outside our namespace claim).
 //   - Managed VRF in m.vrfs not in desired: LinkDel, removed from m.vrfs.
+//   - #847 orphan: vrf-<X> in kernel but NOT in desired AND NOT in
+//     m.vrfs (e.g. left over from a routing-instance rename across
+//     a daemon restart, where m.vrfs was empty after the restart):
+//     LinkDel via the namespace-claim sweep. xpfd reaps the entire
+//     vrf-* namespace; if an operator created a vrf-<X> for their
+//     own purposes, it WILL be deleted on next apply.
 //
 // Holds vrfsMu for the full body including netlink operations. VRF
 // reconcile is low-frequency; lock contention is not a concern and
@@ -215,13 +220,13 @@ func isLinkNotFound(err error) bool {
 // vrfOps so tests can inject a fake. Returns the new tracked set and
 // the first error encountered (others are logged).
 //
-// Ownership semantics: a VRF is "ours" if its name appears in desired.
-// xpfd is authoritative for the "vrf-<instance>" namespace derived
-// from configured routing instances (plus the well-known "vrf-mgmt").
-// If such a VRF already exists in the kernel (e.g. surviving from a
-// previous daemon instance), reconcileVRFs ADOPTS it into m.vrfs so
-// a later reconcile can manage or delete it. Non-desired kernel VRFs
-// are left strictly alone.
+// Ownership semantics: xpfd is authoritative for the ENTIRE "vrf-*"
+// kernel namespace. A VRF is "ours" by virtue of name prefix; if its
+// logical name appears in desired, reconcileVRFs ADOPTS it into
+// m.vrfs (handles the post-restart case). #847 orphan reap: any
+// kernel "vrf-*" device NOT in desired AND NOT in m.vrfs is also
+// deleted, so operators must NOT pre-create vrf-<name> outside
+// xpfd config.
 //
 // Partial-failure contract: if LinkAdd succeeds but a follow-up
 // (LinkByName / LinkSetUp) fails, the VRF is still recorded in the

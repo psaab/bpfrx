@@ -1717,8 +1717,12 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) {
 	// 0. Reconcile VRF devices (routing-instance VRFs + management VRF).
 	// ReconcileVRFs is idempotent: VRFs already present with the correct
 	// table ID are preserved (ifindex unchanged). Removed-from-config
-	// VRFs are deleted. External (operator-created) VRFs are never
-	// touched. See docs/pr/844-vrf-idempotent/plan.md.
+	// VRFs are deleted. #847: xpfd claims the entire `vrf-*` kernel
+	// namespace — orphan vrf-* devices not in desired and not in
+	// m.vrfs (e.g. left over from a routing-instance rename across
+	// a daemon restart) are also reaped. Operators MUST NOT
+	// pre-create vrf-<name> outside xpfd config. See
+	// docs/pr/844-vrf-idempotent/plan.md.
 	const mgmtVRFName = "mgmt"
 	const mgmtTableID = 999
 	mgmtIfaces := make(map[string]bool)
