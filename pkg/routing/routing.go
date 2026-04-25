@@ -118,8 +118,10 @@ func (m *Manager) CreateVRF(name string, tableID int) error {
 }
 
 // createVRFLocked creates a VRF and appends it to m.vrfs. Caller must
-// hold vrfsMu. External VRFs (already present) are left alone and not
-// adopted into m.vrfs.
+// hold vrfsMu. If the named VRF already exists in the kernel,
+// createVRFLocked leaves it alone and does NOT adopt it into m.vrfs
+// (this single-VRF helper is a fast path; ReconcileVRFs is the
+// adoption / orphan-reap entry point per the namespace-claim policy).
 func (m *Manager) createVRFLocked(name string, tableID int) error {
 	vrfName := "vrf-" + name
 	if existing, err := m.nlHandle.LinkByName(vrfName); err == nil {
@@ -143,6 +145,9 @@ type vrfOps interface {
 	LinkAdd(netlink.Link) error
 	LinkDel(netlink.Link) error
 	LinkSetUp(netlink.Link) error
+	// #847: enumerate kernel devices to find orphan VRFs (left
+	// over from a routing-instance rename across a daemon restart).
+	LinkList() ([]netlink.Link, error)
 }
 
 // IsManagedVRF reports whether the given logical VRF name (e.g. "mgmt",
@@ -162,17 +167,22 @@ func (m *Manager) IsManagedVRF(name string) bool {
 
 // ReconcileVRFs brings the manager's owned-VRF set to match desired.
 //
-// Ownership rules — xpfd is authoritative for the "vrf-<name>"
-// namespace of names appearing in desired. Any VRF whose name appears
-// in desired is considered ours regardless of creator:
+// Ownership rules — xpfd is authoritative for the ENTIRE "vrf-*"
+// kernel namespace. Any VRF whose name starts with "vrf-" is
+// considered ours; operators MUST NOT pre-create vrf-<name> devices
+// outside xpfd config.
 //   - Desired VRF, present in kernel with matching table: no-op
 //     (preserve ifindex). Adopted into m.vrfs if not already there.
 //   - Desired VRF, present in kernel with mismatching table:
 //     LinkDel + LinkAdd (recreate). Adopted into m.vrfs.
 //   - Desired VRF, absent from kernel: LinkAdd, adopted into m.vrfs.
-//   - Non-desired VRF in kernel but NOT in m.vrfs: never touched
-//     (truly external — outside our namespace claim).
 //   - Managed VRF in m.vrfs not in desired: LinkDel, removed from m.vrfs.
+//   - #847 orphan: vrf-<X> in kernel but NOT in desired AND NOT in
+//     m.vrfs (e.g. left over from a routing-instance rename across
+//     a daemon restart, where m.vrfs was empty after the restart):
+//     LinkDel via the namespace-claim sweep. xpfd reaps the entire
+//     vrf-* namespace; if an operator created a vrf-<X> for their
+//     own purposes, it WILL be deleted on next apply.
 //
 // Holds vrfsMu for the full body including netlink operations. VRF
 // reconcile is low-frequency; lock contention is not a concern and
@@ -212,13 +222,13 @@ func isLinkNotFound(err error) bool {
 // vrfOps so tests can inject a fake. Returns the new tracked set and
 // the first error encountered (others are logged).
 //
-// Ownership semantics: a VRF is "ours" if its name appears in desired.
-// xpfd is authoritative for the "vrf-<instance>" namespace derived
-// from configured routing instances (plus the well-known "vrf-mgmt").
-// If such a VRF already exists in the kernel (e.g. surviving from a
-// previous daemon instance), reconcileVRFs ADOPTS it into m.vrfs so
-// a later reconcile can manage or delete it. Non-desired kernel VRFs
-// are left strictly alone.
+// Ownership semantics: xpfd is authoritative for the ENTIRE "vrf-*"
+// kernel namespace. A VRF is "ours" by virtue of name prefix; if its
+// logical name appears in desired, reconcileVRFs ADOPTS it into
+// m.vrfs (handles the post-restart case). #847 orphan reap: any
+// kernel "vrf-*" device NOT in desired AND NOT in m.vrfs is also
+// deleted, so operators must NOT pre-create vrf-<name> outside
+// xpfd config.
 //
 // Partial-failure contract: if LinkAdd succeeds but a follow-up
 // (LinkByName / LinkSetUp) fails, the VRF is still recorded in the
@@ -320,6 +330,51 @@ func reconcileVRFs(ops vrfOps, tracked []string, desired []VRFSpec) ([]string, e
 			continue
 		}
 		slog.Info("VRF removed", "name", existing)
+	}
+
+	// #847: orphan reap. After a routing-instance rename across a
+	// daemon restart, the old vrf-<oldname> persists in the kernel
+	// while m.vrfs is empty (state lost on exit). The "delete
+	// managed VRFs no longer desired" loop above can't catch it
+	// (oldname isn't in tracked). Walk the kernel `vrf-*` namespace
+	// and delete any VRF that is neither in `desired` nor in
+	// `tracked` (already handled).
+	//
+	// xpfd claims the ENTIRE `vrf-*` kernel namespace — operators
+	// must not pre-create vrf-<X> outside config. This is a
+	// stricter policy than the original #844 plan (which preserved
+	// "external" VRFs); the godoc on ReconcileVRFs is the
+	// authoritative contract.
+	links, err := ops.LinkList()
+	if err != nil {
+		// Best-effort: log and continue. The desired/tracked sets
+		// already reflect what we can manage authoritatively.
+		slog.Debug("VRF orphan reap: LinkList failed (non-fatal)", "err", err)
+		return newTracked, firstErr
+	}
+	for _, link := range links {
+		name := link.Attrs().Name
+		if !strings.HasPrefix(name, "vrf-") {
+			continue
+		}
+		if _, ok := link.(*netlink.Vrf); !ok {
+			// Misnamed non-VRF interface (operator-created bridge
+			// named "vrf-foo" or similar). Don't delete.
+			continue
+		}
+		if _, stillDesired := desiredByName[name]; stillDesired {
+			continue
+		}
+		if managed[name] {
+			// Already handled by the tracked-but-not-desired loop above.
+			continue
+		}
+		if err := ops.LinkDel(link); err != nil {
+			slog.Warn("VRF orphan reap: LinkDel failed",
+				"name", name, "err", err)
+			continue
+		}
+		slog.Info("VRF orphan reaped", "name", name)
 	}
 
 	return newTracked, firstErr

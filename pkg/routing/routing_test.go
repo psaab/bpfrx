@@ -2,6 +2,7 @@ package routing
 
 import (
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -20,6 +21,10 @@ type fakeVRFOps struct {
 	dels       int
 	setUps     int
 	byNameHits int
+
+	// #847 orphan-reap test hooks.
+	extraLinks  []netlink.Link // non-VRF links to surface via LinkList
+	linkListErr error          // when set, LinkList returns this error
 }
 
 func newFakeVRFOps() *fakeVRFOps {
@@ -65,6 +70,24 @@ func (f *fakeVRFOps) LinkDel(link netlink.Link) error {
 func (f *fakeVRFOps) LinkSetUp(link netlink.Link) error {
 	f.setUps++
 	return nil
+}
+
+// #847: orphan-reap pass enumerates the kernel `vrf-*` namespace.
+// Returns the seeded VRF links plus any extra non-VRF links the
+// test pre-populated via extraLinks (used to verify the type-assert
+// guard skips misnamed bridges/etc).
+func (f *fakeVRFOps) LinkList() ([]netlink.Link, error) {
+	if f.linkListErr != nil {
+		return nil, f.linkListErr
+	}
+	out := make([]netlink.Link, 0, len(f.links)+len(f.extraLinks))
+	for _, l := range f.links {
+		out = append(out, l)
+	}
+	for _, l := range f.extraLinks {
+		out = append(out, l)
+	}
+	return out, nil
 }
 
 // seed adds a link without going through LinkAdd, so it isn't counted.
@@ -1086,4 +1109,117 @@ func TestIPv6OnlyRibGroupLeaking(t *testing.T) {
 	if !needsLeak {
 		t.Error("vpn-vr with IPv6-only rib-group should need leaking")
 	}
+}
+
+// #847: orphan-reap pass deletes vrf-* kernel devices that aren't
+// in `desired` and weren't in `tracked`. Covers the cross-restart
+// rename leak: m.vrfs is empty after restart, so the existing
+// "tracked-but-not-desired" deletion path can't catch the stale VRF.
+func TestReconcileVRFs_OrphanReap(t *testing.T) {
+	cases := []struct {
+		name        string
+		seeds       map[string]uint32
+		extraLinks  []netlink.Link
+		tracked     []string
+		desired     []VRFSpec
+		wantLinks   map[string]uint32
+		wantVrfs    []string
+		wantOrphans int // expected number of orphan deletions
+	}{
+		{
+			name:    "stale vrf reaped after rename",
+			seeds:   map[string]uint32{"vrf-old": 100},
+			tracked: nil,
+			desired: []VRFSpec{{Name: "new", TableID: 200}},
+			wantLinks: map[string]uint32{
+				"vrf-new": 200,
+			},
+			wantVrfs:    []string{"vrf-new"},
+			wantOrphans: 1,
+		},
+		{
+			name:    "multiple orphans reaped",
+			seeds:   map[string]uint32{"vrf-old1": 100, "vrf-old2": 101, "vrf-keep": 200},
+			tracked: nil,
+			desired: []VRFSpec{{Name: "keep", TableID: 200}},
+			wantLinks: map[string]uint32{
+				"vrf-keep": 200,
+			},
+			wantVrfs:    []string{"vrf-keep"},
+			wantOrphans: 2,
+		},
+		{
+			name: "non-VRF interface with vrf- prefix is left alone",
+			seeds: map[string]uint32{
+				"vrf-real": 100,
+			},
+			extraLinks: []netlink.Link{
+				&netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: "vrf-fake-bridge"}},
+			},
+			tracked:     nil,
+			desired:     []VRFSpec{{Name: "real", TableID: 100}},
+			wantLinks:   map[string]uint32{"vrf-real": 100},
+			wantVrfs:    []string{"vrf-real"},
+			wantOrphans: 0,
+		},
+		{
+			name:        "empty desired with no orphans is no-op",
+			seeds:       map[string]uint32{},
+			tracked:     nil,
+			desired:     nil,
+			wantLinks:   map[string]uint32{},
+			wantVrfs:    nil,
+			wantOrphans: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ops := newFakeVRFOps()
+			for name, table := range tc.seeds {
+				ops.seed(name, table)
+			}
+			ops.extraLinks = tc.extraLinks
+			delsBefore := ops.dels
+
+			got, err := reconcileVRFs(ops, tc.tracked, tc.desired)
+			if err != nil {
+				t.Fatalf("reconcileVRFs: %v", err)
+			}
+			// reflect.DeepEqual([]string{}, nil) is false; treat both as
+			// "empty" for the want=nil cases.
+			if len(got) != 0 || len(tc.wantVrfs) != 0 {
+				if !reflect.DeepEqual(got, tc.wantVrfs) {
+					t.Errorf("tracked: got %v, want %v", got, tc.wantVrfs)
+				}
+			}
+			gotLinks := make(map[string]uint32, len(ops.links))
+			for n, l := range ops.links {
+				gotLinks[n] = l.Table
+			}
+			if !reflect.DeepEqual(gotLinks, tc.wantLinks) {
+				t.Errorf("kernel: got %v, want %v", gotLinks, tc.wantLinks)
+			}
+			gotOrphans := ops.dels - delsBefore - countAlreadyDeleted(tc.tracked, tc.desired)
+			if gotOrphans != tc.wantOrphans {
+				t.Errorf("orphan dels: got %d, want %d", gotOrphans, tc.wantOrphans)
+			}
+		})
+	}
+}
+
+// countAlreadyDeleted counts entries that the existing
+// "tracked-but-not-desired" loop would delete; subtract from total
+// dels to isolate orphan-reap deletions.
+func countAlreadyDeleted(tracked []string, desired []VRFSpec) int {
+	desiredByName := make(map[string]bool, len(desired))
+	for _, d := range desired {
+		desiredByName["vrf-"+d.Name] = true
+	}
+	count := 0
+	for _, t := range tracked {
+		if !desiredByName[t] {
+			count++
+		}
+	}
+	return count
 }
