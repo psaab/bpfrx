@@ -132,10 +132,17 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 	// #863: defer setting IFACE_FLAG_XDP_ATTACHED on iface_zone_map
 	// entries for this ifindex until AFTER a successful attach. The
 	// flag is the tc_main tunnel-egress bypass's positive proof; if
-	// attach fails, the flag must NOT be set.
+	// attach fails, the flag must NOT be set. A flag-set failure on
+	// the success path is logged at WARN — the attach itself
+	// succeeded so we don't unwind, but tc_main's bypass won't fire
+	// for this surface until the next config push runs SetZone (which
+	// re-applies the bit per m.xdpLinks).
 	defer func() {
 		if _, ok := m.xdpLinks[ifindex]; ok {
-			m.setXDPAttachedFlag(ifindex, true)
+			if err := m.setXDPAttachedFlag(ifindex, true); err != nil {
+				slog.Warn("AttachXDP: failed to set IFACE_FLAG_XDP_ATTACHED — tunnel-egress bypass will deny until next SetZone",
+					"ifindex", ifindex, "err", err)
+			}
 		}
 	}()
 
@@ -263,8 +270,16 @@ func (m *Manager) DetachXDP(ifindex int) error {
 	delete(m.xdpLinks, ifindex)
 	// #863: clear IFACE_FLAG_XDP_ATTACHED so the tc_main tunnel-egress
 	// bypass stops accepting traffic from this ingress ifindex as
-	// XDP-validated.
-	m.setXDPAttachedFlag(ifindex, false)
+	// XDP-validated. A failure here is operationally important —
+	// stale flag means tc_main keeps treating this now-detached
+	// surface as XDP-validated until the next AttachXDP/SetZone
+	// rewrites the entry. Return the error so the caller can decide
+	// whether to retry or surface the failure.
+	if err := m.setXDPAttachedFlag(ifindex, false); err != nil {
+		slog.Error("DetachXDP: failed to clear IFACE_FLAG_XDP_ATTACHED — tc_main bypass may stay enabled until next config push",
+			"ifindex", ifindex, "err", err)
+		return fmt.Errorf("detach XDP from ifindex %d: clear flag: %w", ifindex, err)
+	}
 	slog.Info("detached XDP program", "ifindex", ifindex)
 	return nil
 }
@@ -299,10 +314,12 @@ func (m *Manager) DetachXDP(ifindex int) error {
 // In practice the iface_zone_map is BPF-kernel-managed (no I/O), so
 // updates rarely fail; the WARN is a breadcrumb for the operator
 // who notices unexpected bypass behavior.
-func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) {
+func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) error {
 	zm, ok := m.maps["iface_zone_map"]
 	if !ok {
-		return
+		// No iface_zone_map yet (early boot before Compile) — nothing
+		// to flag. Caller treats this as a no-op success.
+		return nil
 	}
 	type kv struct {
 		k IfaceZoneKey
@@ -360,13 +377,22 @@ func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) {
 	if err := iter.Err(); err != nil {
 		slog.Warn("setXDPAttachedFlag: iface_zone_map iterate failed",
 			"ifindex", ifindex, "attached", attached, "err", err)
+		return fmt.Errorf("iface_zone_map iterate: %w", err)
 	}
+	var firstUpdateErr error
 	for _, u := range updates {
 		if err := zm.Update(u.k, u.v, ebpf.UpdateAny); err != nil {
 			slog.Warn("setXDPAttachedFlag: iface_zone_map update failed",
 				"ifindex", ifindex, "vlan", u.k.VlanID, "attached", attached, "err", err)
+			if firstUpdateErr == nil {
+				firstUpdateErr = err
+			}
 		}
 	}
+	if firstUpdateErr != nil {
+		return fmt.Errorf("iface_zone_map update: %w", firstUpdateErr)
+	}
+	return nil
 }
 
 // SetZone maps an {ifindex, vlanID} to a security zone and routing table in the BPF map.
