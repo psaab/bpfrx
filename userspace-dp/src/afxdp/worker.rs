@@ -1475,6 +1475,20 @@ pub(crate) fn worker_loop(
                     b.live
                         .debug_outstanding_tx
                         .store(b.outstanding_tx, Ordering::Relaxed);
+                    // #878: publish UMEM in-flight gauge as a single atomic
+                    // so the daemon's `show chassis forwarding` Buffer% can
+                    // divide by `umem_total_frames` without torn-load risk.
+                    // Computed in this thread from worker-local state, so
+                    // the inputs are mutually consistent at sample time.
+                    let total = b.umem.total_frames();
+                    let free_tx = b.free_tx_frames.len() as u32;
+                    let pending_fill = b.pending_fill_frames.len() as u32;
+                    let inflight = total
+                        .saturating_sub(free_tx)
+                        .saturating_sub(pending_fill);
+                    b.live
+                        .umem_inflight_frames
+                        .store(inflight, Ordering::Relaxed);
 
                     b.dbg_fill_submitted = 0;
                     b.dbg_fill_failed = 0;
@@ -4278,14 +4292,19 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) debug_outstanding_tx: u32,
     pub(crate) debug_in_flight_recycles: u32,
     /// #878: per-binding UMEM total frames (set once at worker
-    /// construction). Combined with `debug_free_tx_frames` and
-    /// `debug_pending_fill_frames` to derive the in-flight ratio
-    /// for the `show chassis forwarding` Buffer% display.
+    /// construction). Used as the denominator for the `show chassis
+    /// forwarding` Buffer% display; numerator comes from
+    /// `umem_inflight_frames` published once per second by the
+    /// owning worker.
     pub(crate) umem_total_frames: u32,
     /// #878: configured TX-ring depth (set once at worker
     /// construction). `outstanding_tx / tx_ring_capacity` is the
     /// second pressure signal aggregated by Buffer%.
     pub(crate) tx_ring_capacity: u32,
+    /// #878: UMEM in-flight gauge published in a single store from
+    /// the worker's per-second debug tick — no torn-load risk on
+    /// the read side.
+    pub(crate) umem_inflight_frames: u32,
     // #802: ring-pressure snapshot fields. Mirrored from BindingLiveState
     // atomics that are published by the worker's per-second debug tick.
     pub(crate) dbg_tx_ring_full: u64,

@@ -162,24 +162,22 @@ func Build(
 	}
 	if isUserspace && usErr == nil {
 		fs.WorkerCPUMode = CPUModeWorkers
-		// #878: derive Buffer% from per-binding UMEM and TX-ring
-		// occupancy. For each binding with published capacities,
-		// compute max(umem_inflight_pct, tx_ring_pct) and aggregate
-		// the overall max across bindings. Bindings whose
-		// UmemTotalFrames is zero (helper hasn't published yet, or
-		// pre-#878 helper) are skipped. If NO binding has
-		// capacities, BufferKnown stays false and the renderer
-		// falls back to "unknown (#878)".
+		// #878: derive Buffer% from per-binding UMEM in-flight and
+		// TX-ring depth. Both inputs come from atomics published by
+		// the worker thread itself in a single store per signal per
+		// ~1s debug tick — no torn-load risk on the read side. For
+		// each binding with published capacities, compute
+		// max(umem%, tx_ring%) and aggregate as max across bindings.
+		// Bindings whose UmemTotalFrames is zero (helper hasn't
+		// published yet, or pre-#878 helper) are skipped. If NO
+		// binding has capacities, BufferKnown stays false and the
+		// renderer falls back to "unknown (#878)".
 		maxPct := 0.0
 		anyKnown := false
 		for _, b := range usStatus.Bindings {
 			var umemPct, txPct float64
 			if b.UmemTotalFrames > 0 {
-				inFlight := int64(b.UmemTotalFrames) - int64(b.DebugFreeTXFrames) - int64(b.DebugPendingFillFrames)
-				if inFlight < 0 {
-					inFlight = 0
-				}
-				umemPct = float64(inFlight) * 100.0 / float64(b.UmemTotalFrames)
+				umemPct = float64(b.UmemInflightFrames) * 100.0 / float64(b.UmemTotalFrames)
 				anyKnown = true
 			}
 			if b.TxRingCapacity > 0 {

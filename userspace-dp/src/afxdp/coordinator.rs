@@ -1438,11 +1438,12 @@ impl Coordinator {
                 binding.debug_pending_tx_local = snap.debug_pending_tx_local;
                 binding.debug_outstanding_tx = snap.debug_outstanding_tx;
                 binding.debug_in_flight_recycles = snap.debug_in_flight_recycles;
-                // #878: per-binding capacities flow into BindingStatus so
-                // the daemon's fwdstatus Buffer% can compute UMEM and
-                // TX-ring fill ratios.
+                // #878: per-binding capacities + in-flight gauge flow
+                // into BindingStatus so the daemon's fwdstatus
+                // Buffer% can compute UMEM and TX-ring fill ratios.
                 binding.umem_total_frames = snap.umem_total_frames;
                 binding.tx_ring_capacity = snap.tx_ring_capacity;
+                binding.umem_inflight_frames = snap.umem_inflight_frames;
                 // #802: ring-pressure counters — atomic mirrors of
                 // worker-local counters, published on the worker's
                 // per-second debug tick. `outstanding_tx` aliases
@@ -1565,12 +1566,13 @@ impl Coordinator {
                 binding.debug_pending_tx_local = 0;
                 binding.debug_outstanding_tx = 0;
                 binding.debug_in_flight_recycles = 0;
-                // #878: capacities zero when the binding has no live
-                // state (slot unregistered). The daemon treats zero
-                // umem_total_frames as "unknown" and falls back to the
-                // legacy "unknown" Buffer% display.
+                // #878: capacities + in-flight gauge zero when the
+                // binding has no live state (slot unregistered). The
+                // daemon treats zero umem_total_frames as "unknown"
+                // and falls back to the legacy Buffer% display.
                 binding.umem_total_frames = 0;
                 binding.tx_ring_capacity = 0;
+                binding.umem_inflight_frames = 0;
                 // #802: ring-pressure counters — zero when the binding
                 // has no live state (unregistered slot).
                 binding.dbg_tx_ring_full = 0;

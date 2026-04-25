@@ -699,6 +699,7 @@ type BindingStatus struct {
 	// legacy "unknown" display.
 	UmemTotalFrames                   uint32    `json:"umem_total_frames,omitempty"`
 	TxRingCapacity                    uint32    `json:"tx_ring_capacity,omitempty"`
+	UmemInflightFrames                uint32    `json:"umem_inflight_frames,omitempty"`
 	// #812: per-queue TX submit→completion latency telemetry. 16 log2-
 	// spaced buckets (see Rust `DRAIN_HIST_BUCKETS` wire contract), plus
 	// a total completion count and running sum-ns. Emitted on the rich
@@ -757,6 +758,7 @@ type BindingCountersSnapshot struct {
 	// for full semantics.
 	UmemTotalFrames             uint32 `json:"umem_total_frames,omitempty"`
 	TxRingCapacity              uint32 `json:"tx_ring_capacity,omitempty"`
+	UmemInflightFrames          uint32 `json:"umem_inflight_frames,omitempty"`
 	TXErrors                    uint64 `json:"tx_errors,omitempty"`
 	TxSubmitErrorDrops          uint64 `json:"tx_submit_error_drops,omitempty"`
 	PendingTxLocalOverflowDrops uint64 `json:"pending_tx_local_overflow_drops,omitempty"`
