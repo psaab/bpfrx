@@ -93,7 +93,9 @@ func New() (*Manager, error) {
 
 // Close releases the netlink handle and stops all keepalive probes.
 func (m *Manager) Close() error {
+	m.ifaceMu.Lock()
 	m.stopAllKeepalives()
+	m.ifaceMu.Unlock()
 	if m.nlHandle != nil {
 		m.nlHandle.Close()
 	}
@@ -733,8 +735,17 @@ func probeICMP(addr string) bool {
 	return true
 }
 
-// GetKeepaliveState returns the keepalive state for a tunnel, or nil if no keepalive is configured.
+// GetKeepaliveState returns the keepalive state for a tunnel, or nil
+// if no keepalive is configured.
+//
+// #848: ifaceMu protects the keepalives map against concurrent
+// startKeepalive / stopAllKeepalives mutations from ApplyTunnels /
+// ClearTunnels. The returned *KeepaliveState pointer is safe to
+// dereference outside the lock — Go GC keeps the value alive even
+// if a subsequent stopAllKeepalives removes it from the map.
 func (m *Manager) GetKeepaliveState(tunnelName string) *KeepaliveState {
+	m.ifaceMu.Lock()
+	defer m.ifaceMu.Unlock()
 	runner, ok := m.keepalives[tunnelName]
 	if !ok {
 		return nil
