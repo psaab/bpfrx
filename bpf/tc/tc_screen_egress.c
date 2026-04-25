@@ -194,11 +194,23 @@ int tc_screen_egress_prog(struct __sk_buff *skb)
 			return screen_drop_tc(meta, SCREEN_IP_SOURCE_ROUTE);
 	}
 
-	/* Ping of Death: oversized ICMP/ICMPv6 */
-	if (sc->flags & SCREEN_PING_OF_DEATH) {
-		if (meta->protocol == PROTO_ICMP ||
-		    meta->protocol == PROTO_ICMPV6) {
-			if (meta->pkt_len > 65535)
+	/* Ping of Death: a fragment whose contribution to the
+	 * reassembled IP datagram would exceed 65535 bytes. See
+	 * xdp_screen.c for the trade-off analysis (current threshold
+	 * uses this fragment's tot_len directly to avoid false-positives
+	 * on near-max legal datagrams; cross-IHL exploits should be
+	 * blocked by SCREEN_IP_SOURCE_ROUTE which drops any IP packet
+	 * with ihl>5). IPv4 only; IPv6 follow-up. */
+	if ((sc->flags & SCREEN_PING_OF_DEATH) &&
+	    meta->addr_family == AF_INET &&
+	    meta->is_fragment &&
+	    meta->l3_offset < 64) {
+		struct iphdr *iph = data + meta->l3_offset;
+		if ((void *)(iph + 1) <= data_end) {
+			__u16 frag_off = bpf_ntohs(iph->frag_off);
+			__u32 offset_bytes = (frag_off & 0x1FFF) << 3;
+			__u32 tot_len = bpf_ntohs(iph->tot_len);
+			if (offset_bytes + tot_len > 65535)
 				return screen_drop_tc(meta, SCREEN_PING_OF_DEATH);
 		}
 	}

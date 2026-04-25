@@ -392,7 +392,8 @@ type xpfXdpZonePktMeta struct {
 	L3Offset           uint16
 	L4Offset           uint16
 	PayloadOffset      uint16
-	PktLen             uint16
+	_                  [2]byte
+	PktLen             uint32
 	IngressZone        uint16
 	EgressZone         uint16
 	IngressIfindex     uint32
@@ -431,7 +432,6 @@ type xpfXdpZonePktMeta struct {
 	MirrorRate    uint32
 	NowSec        uint32
 	PadTime       uint32
-	_             [4]byte
 	KtimeNs       uint64
 }
 

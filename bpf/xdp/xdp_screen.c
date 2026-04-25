@@ -803,11 +803,32 @@ int xdp_screen_prog(struct xdp_md *ctx)
 			return screen_drop(meta, SCREEN_IP_SOURCE_ROUTE);
 	}
 
-	/* Ping of Death: oversized ICMP/ICMPv6 */
-	if (sc->flags & SCREEN_PING_OF_DEATH) {
-		if (meta->protocol == PROTO_ICMP ||
-		    meta->protocol == PROTO_ICMPV6) {
-			if (meta->pkt_len > 65535)
+	/* Ping of Death: a fragment whose contribution to the
+	 * reassembled IP datagram would exceed 65535 bytes. xpf
+	 * doesn't reassemble; check per-fragment:
+	 *
+	 *   reassembled_tot_len = first_frag_ihl + max(offset + payload)
+	 *   ≈ offset_bytes + tot_len  (when this fragment's ihl matches
+	 *     the first fragment's — the typical case)
+	 *
+	 * Limitation: a first fragment with IP options + non-first
+	 * fragments without them can craft offset+tot_len ≤ 65535
+	 * while the reassembled total overflows by up to 40 bytes.
+	 * Operators concerned about this should ALSO enable
+	 * SCREEN_IP_SOURCE_ROUTE, which drops any packet with ihl>5
+	 * and closes the gap. IP options are also blocked by most
+	 * middleboxes. IPv4 only — IPv6 ping-of-death needs
+	 * NEXTHDR_FRAGMENT parsing, filed as follow-up. */
+	if ((sc->flags & SCREEN_PING_OF_DEATH) &&
+	    meta->addr_family == AF_INET &&
+	    meta->is_fragment &&
+	    meta->l3_offset < 64) {
+		struct iphdr *iph = data + meta->l3_offset;
+		if ((void *)(iph + 1) <= data_end) {
+			__u16 frag_off = bpf_ntohs(iph->frag_off);
+			__u32 offset_bytes = (frag_off & 0x1FFF) << 3;
+			__u32 tot_len = bpf_ntohs(iph->tot_len);
+			if (offset_bytes + tot_len > 65535)
 				return screen_drop(meta, SCREEN_PING_OF_DEATH);
 		}
 	}

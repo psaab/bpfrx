@@ -292,7 +292,10 @@ parse_ipv6hdr(void *data, void *data_end, struct pkt_meta *meta)
 
 	meta->ip_ttl      = ip6h->hop_limit;
 	meta->dscp        = (ip6h->priority << 2) | (ip6h->flow_lbl[0] >> 6);
-	meta->pkt_len     = bpf_ntohs(ip6h->payload_len) + 40;
+	/* #860: cast to u32 before the +40 — bpf_ntohs returns u16; the
+	 * sum can wrap u16 for payload_len > 65495 even though pkt_len
+	 * is now u32. */
+	meta->pkt_len     = (__u32)bpf_ntohs(ip6h->payload_len) + 40;
 	meta->addr_family = AF_INET6;
 	meta->is_fragment = 0;
 
@@ -534,7 +537,8 @@ parse_ipv6_l4_fast(void *data, void *data_end, struct pkt_meta *meta)
 	meta->protocol = nexthdr;
 	meta->ip_ttl = ip6h->hop_limit;
 	meta->dscp = (ip6h->priority << 2) | (ip6h->flow_lbl[0] >> 6);
-	meta->pkt_len = bpf_ntohs(ip6h->payload_len) + sizeof(struct ipv6hdr);
+	/* #860: cast to u32 to avoid u16 wrap for jumbo frames. */
+	meta->pkt_len = (__u32)bpf_ntohs(ip6h->payload_len) + sizeof(struct ipv6hdr);
 	meta->addr_family = AF_INET6;
 	meta->is_fragment = 0;
 	meta->l4_offset = meta->l3_offset + sizeof(struct ipv6hdr);
