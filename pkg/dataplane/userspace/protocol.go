@@ -689,6 +689,16 @@ type BindingStatus struct {
 	DbgCoSQueueOverflow               uint64    `json:"dbg_cos_queue_overflow,omitempty"`
 	RxFillRingEmptyDescs              uint64    `json:"rx_fill_ring_empty_descs,omitempty"`
 	OutstandingTX                     uint32    `json:"outstanding_tx,omitempty"`
+	// #878: per-binding UMEM total frames and TX-ring depth, set
+	// once at worker construction. With DebugFreeTXFrames +
+	// DebugPendingFillFrames + OutstandingTX the daemon's
+	// fwdstatus Buffer% computes (umem_inflight / total) and
+	// (outstanding_tx / tx_ring_capacity) per-binding, picks the
+	// max, then aggregates across bindings. Zero on either field
+	// means "not yet published" — fwdstatus falls back to the
+	// legacy "unknown" display.
+	UmemTotalFrames                   uint32    `json:"umem_total_frames,omitempty"`
+	TxRingCapacity                    uint32    `json:"tx_ring_capacity,omitempty"`
 	// #812: per-queue TX submit→completion latency telemetry. 16 log2-
 	// spaced buckets (see Rust `DRAIN_HIST_BUCKETS` wire contract), plus
 	// a total completion count and running sum-ns. Emitted on the rich
@@ -741,6 +751,12 @@ type BindingCountersSnapshot struct {
 	DbgCoSQueueOverflow         uint64 `json:"dbg_cos_queue_overflow,omitempty"`
 	RxFillRingEmptyDescs        uint64 `json:"rx_fill_ring_empty_descs,omitempty"`
 	OutstandingTX               uint32 `json:"outstanding_tx,omitempty"`
+	// #878: per-binding capacities pulled through to the leaner
+	// snapshot so the daemon's fast poller can compute Buffer%
+	// without joining the full BindingStatus. See BindingStatus
+	// for full semantics.
+	UmemTotalFrames             uint32 `json:"umem_total_frames,omitempty"`
+	TxRingCapacity              uint32 `json:"tx_ring_capacity,omitempty"`
 	TXErrors                    uint64 `json:"tx_errors,omitempty"`
 	TxSubmitErrorDrops          uint64 `json:"tx_submit_error_drops,omitempty"`
 	PendingTxLocalOverflowDrops uint64 `json:"pending_tx_local_overflow_drops,omitempty"`

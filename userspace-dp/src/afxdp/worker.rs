@@ -287,6 +287,13 @@ impl BindingWorker {
         // implement it for this family).  Use the binding plan's expected
         // ifindex/queue_id directly — umem.bind() already validated these.
         live.set_socket_binding(binding.ifindex, binding.queue_id, 0);
+        // #878: publish per-binding capacities so the snapshot path can
+        // expose them via the wire BindingStatus. These are write-once
+        // (set here at worker construction) and read-many.
+        live.umem_total_frames
+            .store(total_frames, std::sync::atomic::Ordering::Relaxed);
+        live.tx_ring_capacity
+            .store(ring_entries, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
             "xpf-userspace-dp: binding slot={} fd={} strategy={} bound if{}q{} mode={:?} shared_umem={}",
             binding.slot,
@@ -4270,6 +4277,15 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) debug_pending_tx_local: u32,
     pub(crate) debug_outstanding_tx: u32,
     pub(crate) debug_in_flight_recycles: u32,
+    /// #878: per-binding UMEM total frames (set once at worker
+    /// construction). Combined with `debug_free_tx_frames` and
+    /// `debug_pending_fill_frames` to derive the in-flight ratio
+    /// for the `show chassis forwarding` Buffer% display.
+    pub(crate) umem_total_frames: u32,
+    /// #878: configured TX-ring depth (set once at worker
+    /// construction). `outstanding_tx / tx_ring_capacity` is the
+    /// second pressure signal aggregated by Buffer%.
+    pub(crate) tx_ring_capacity: u32,
     // #802: ring-pressure snapshot fields. Mirrored from BindingLiveState
     // atomics that are published by the worker's per-second debug tick.
     pub(crate) dbg_tx_ring_full: u64,

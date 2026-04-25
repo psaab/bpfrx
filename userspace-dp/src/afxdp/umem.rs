@@ -1885,6 +1885,17 @@ pub(super) struct BindingLiveState {
     pub(super) debug_pending_tx_local: AtomicU32,
     pub(super) debug_outstanding_tx: AtomicU32,
     pub(super) debug_in_flight_recycles: AtomicU32,
+    /// #878: total UMEM frames allocated to this binding. Set once
+    /// at worker construction (after `binding_frame_count_for_driver`)
+    /// and read by the snapshot path. Combined with
+    /// `debug_free_tx_frames` + `debug_pending_fill_frames` this lets
+    /// `show chassis forwarding` compute `umem_inflight_pct` for the
+    /// Buffer% row instead of printing "unknown (#878)".
+    pub(super) umem_total_frames: AtomicU32,
+    /// #878: configured TX-ring depth for this binding. Set once at
+    /// worker construction. `outstanding_tx / tx_ring_capacity` is
+    /// the second pressure signal aggregated by the Buffer% display.
+    pub(super) tx_ring_capacity: AtomicU32,
     /// #802: ring-pressure instrumentation. Cumulative monotonic counters
     /// mirrored from the worker-local `BindingWorker` fields of the same
     /// name. Worker increments `b.dbg_tx_ring_full += 1` (etc.) on the hot
@@ -2012,6 +2023,13 @@ impl BindingLiveState {
             debug_pending_tx_local: AtomicU32::new(0),
             debug_outstanding_tx: AtomicU32::new(0),
             debug_in_flight_recycles: AtomicU32::new(0),
+            // #878: capacities are stored once by the worker at
+            // construction time (in worker.rs after
+            // binding_frame_count_for_driver). Zero here means "not
+            // yet published"; the fwdstatus builder treats zero as
+            // "unknown" and falls back to the legacy display.
+            umem_total_frames: AtomicU32::new(0),
+            tx_ring_capacity: AtomicU32::new(0),
             // #802: ring-pressure instrumentation sinks. Zero-init;
             // published by the worker's per-second debug tick.
             dbg_tx_ring_full: AtomicU64::new(0),
@@ -2244,6 +2262,10 @@ impl BindingLiveState {
             debug_pending_tx_local: self.debug_pending_tx_local.load(Ordering::Relaxed),
             debug_outstanding_tx: self.debug_outstanding_tx.load(Ordering::Relaxed),
             debug_in_flight_recycles: self.debug_in_flight_recycles.load(Ordering::Relaxed),
+            // #878: per-binding UMEM/TX-ring capacities, set once at
+            // worker startup. Zero == not yet published.
+            umem_total_frames: self.umem_total_frames.load(Ordering::Relaxed),
+            tx_ring_capacity: self.tx_ring_capacity.load(Ordering::Relaxed),
             // #802: ring-pressure counters published from the worker's
             // periodic debug tick. Relaxed load is sufficient — these
             // are monotonic diagnostic counters, not part of any

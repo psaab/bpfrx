@@ -138,6 +138,14 @@ func Build(
 		fs.BufferPercent = maxPct
 		fs.BufferKnown = true
 	}
+	// #878: userspace-dp Buffer% is the max across bindings of
+	// max(umem_inflight%, tx_ring%).  An idle binding with no
+	// published capacities (UmemTotalFrames==0) is skipped, so a
+	// fresh boot before the first per-binding publish keeps
+	// BufferKnown=false and the legacy "unknown (#878)" rendering.
+	// Userspace-dp status fetch happens below for State
+	// classification — fold the buffer computation into that lookup
+	// to avoid a second Status() call.
 
 	// --- Worker path detection (for State + Mode) ----------------
 	// Worker CPU values come from the sampler (above); here we only
@@ -154,6 +162,46 @@ func Build(
 	}
 	if isUserspace && usErr == nil {
 		fs.WorkerCPUMode = CPUModeWorkers
+		// #878: derive Buffer% from per-binding UMEM and TX-ring
+		// occupancy. For each binding with published capacities,
+		// compute max(umem_inflight_pct, tx_ring_pct) and aggregate
+		// the overall max across bindings. Bindings whose
+		// UmemTotalFrames is zero (helper hasn't published yet, or
+		// pre-#878 helper) are skipped. If NO binding has
+		// capacities, BufferKnown stays false and the renderer
+		// falls back to "unknown (#878)".
+		maxPct := 0.0
+		anyKnown := false
+		for _, b := range usStatus.Bindings {
+			var umemPct, txPct float64
+			if b.UmemTotalFrames > 0 {
+				inFlight := int64(b.UmemTotalFrames) - int64(b.DebugFreeTXFrames) - int64(b.DebugPendingFillFrames)
+				if inFlight < 0 {
+					inFlight = 0
+				}
+				umemPct = float64(inFlight) * 100.0 / float64(b.UmemTotalFrames)
+				anyKnown = true
+			}
+			if b.TxRingCapacity > 0 {
+				txPct = float64(b.OutstandingTX) * 100.0 / float64(b.TxRingCapacity)
+				anyKnown = true
+			}
+			pct := umemPct
+			if txPct > pct {
+				pct = txPct
+			}
+			if pct > maxPct {
+				maxPct = pct
+			}
+		}
+		if anyKnown {
+			if maxPct > 100.0 {
+				maxPct = 100.0
+			}
+			fs.BufferPercent = maxPct
+			fs.BufferKnown = true
+			fs.BufferFollowupRef = 0
+		}
 	}
 
 	// --- State ---------------------------------------------------

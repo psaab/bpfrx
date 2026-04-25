@@ -1352,6 +1352,21 @@ pub(crate) struct BindingStatus {
     pub rx_fill_ring_empty_descs: u64,
     #[serde(rename = "outstanding_tx", default)]
     pub outstanding_tx: u32,
+    /// #878: per-binding UMEM total frames (set once at worker
+    /// construction). With `debug_free_tx_frames` +
+    /// `debug_pending_fill_frames` this lets the daemon's
+    /// `show chassis forwarding` Buffer% compute an in-flight ratio
+    /// instead of printing "unknown (#878)". `default` keeps the
+    /// wire format additive — a pre-#878 helper that lacks this
+    /// field deserializes as zero, which the daemon treats as
+    /// "not yet published" and falls back to the legacy display.
+    #[serde(rename = "umem_total_frames", default)]
+    pub umem_total_frames: u32,
+    /// #878: configured TX-ring depth.
+    /// `outstanding_tx / tx_ring_capacity` is the second pressure
+    /// signal aggregated by Buffer%.
+    #[serde(rename = "tx_ring_capacity", default)]
+    pub tx_ring_capacity: u32,
     // #812: per-queue TX submit→completion latency telemetry. Emitted
     // in the rich BindingStatus shape; also projected onto the focused
     // `BindingCountersSnapshot` via the `From` impl so the
@@ -1452,6 +1467,15 @@ pub(crate) struct BindingCountersSnapshot {
     pub rx_fill_ring_empty_descs: u64,
     #[serde(rename = "outstanding_tx", default)]
     pub outstanding_tx: u32,
+    /// #878: per-binding UMEM total frames (set once at worker
+    /// construction). Mirrored from BindingStatus; see that field
+    /// for full semantics. The fwdstatus Buffer% display reads this
+    /// from the leaner BindingCountersSnapshot when fast polling.
+    #[serde(rename = "umem_total_frames", default)]
+    pub umem_total_frames: u32,
+    /// #878: configured TX-ring depth. Mirror of BindingStatus.
+    #[serde(rename = "tx_ring_capacity", default)]
+    pub tx_ring_capacity: u32,
     #[serde(rename = "tx_errors", default)]
     pub tx_errors: u64,
     #[serde(rename = "tx_submit_error_drops", default)]
@@ -1523,6 +1547,11 @@ impl From<&BindingStatus> for BindingCountersSnapshot {
             dbg_cos_queue_overflow: b.dbg_cos_queue_overflow,
             rx_fill_ring_empty_descs: b.rx_fill_ring_empty_descs,
             outstanding_tx: b.outstanding_tx,
+            // #878: capacities flow into the leaner snapshot so a
+            // step1-capture consumer reading PerBinding (not the full
+            // BindingStatus) still sees Buffer% inputs.
+            umem_total_frames: b.umem_total_frames,
+            tx_ring_capacity: b.tx_ring_capacity,
             tx_errors: b.tx_errors,
             tx_submit_error_drops: b.tx_submit_error_drops,
             pending_tx_local_overflow_drops: b.pending_tx_local_overflow_drops,
