@@ -262,9 +262,16 @@ func (c *CLI) handleCommit(args []string) error {
 // commitApply (the legacy path used by standalone CLI without a
 // daemon). The atomic path serializes against HTTP/gRPC/event-engine
 // commits via d.applySem.
+//
+// Uses a cancellable context registered with the CLI's Ctrl-C
+// handler so an operator can interrupt a commit that's hung
+// waiting for the apply lock (e.g. a long-running peer-sync apply
+// holding it).
 func (c *CLI) runCommit(comment string) (*config.Config, error) {
 	if c.commitFn != nil {
-		return c.commitFn(context.Background(), comment)
+		ctx, done := c.commitCtx()
+		defer done()
+		return c.commitFn(ctx, comment)
 	}
 	var compiled *config.Config
 	var err error
@@ -283,7 +290,9 @@ func (c *CLI) runCommit(comment string) (*config.Config, error) {
 // runCommitConfirmed is the commit-confirmed analogue of runCommit.
 func (c *CLI) runCommitConfirmed(minutes int) (*config.Config, error) {
 	if c.commitConfirmedFn != nil {
-		return c.commitConfirmedFn(context.Background(), minutes)
+		ctx, done := c.commitCtx()
+		defer done()
+		return c.commitConfirmedFn(ctx, minutes)
 	}
 	compiled, err := c.store.CommitConfirmed(minutes)
 	if err != nil {
@@ -291,4 +300,26 @@ func (c *CLI) runCommitConfirmed(minutes int) (*config.Config, error) {
 	}
 	c.commitApply(compiled)
 	return compiled, nil
+}
+
+// commitCtx returns a cancellable context registered with the CLI's
+// Ctrl-C handler (cmdCancel). The returned `done` cleans up the
+// registration; callers MUST defer it. Used by runCommit /
+// runCommitConfirmed so an operator can interrupt a commit that's
+// hung waiting for the daemon's apply semaphore.
+func (c *CLI) commitCtx() (context.Context, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	c.cmdMu.Lock()
+	c.cmdCancel = cancel
+	c.cmdMu.Unlock()
+	return ctx, func() {
+		c.cmdMu.Lock()
+		if c.cmdCancel != nil {
+			// only clear if still ours (a nested handler hasn't
+			// already replaced it).
+			c.cmdCancel = nil
+		}
+		c.cmdMu.Unlock()
+		cancel()
+	}
 }

@@ -1659,6 +1659,27 @@ func (d *Daemon) commitAndApply(ctx context.Context, comment string, syncPeer bo
 	return compiled, nil
 }
 
+// syncAndApply is the cluster-sync-recv analogue of commitAndApply.
+// Holds applySem across configstore.SyncApply (peer-driven active
+// promotion) + applyConfigLocked, so a peer-sync can't interleave
+// between a local committer's Commit and applyConfig (which would
+// briefly leave store=peer-config but kernel=local-config).
+func (d *Daemon) syncAndApply(ctx context.Context, configText string, chassisPreserve func(*config.ConfigTree)) (*config.Config, error) {
+	if err := d.applySem.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+	defer d.applySem.Release(1)
+
+	compiled, err := d.store.SyncApply(configText, chassisPreserve)
+	if err != nil {
+		return nil, err
+	}
+	if compiled != nil {
+		d.applyConfigLocked(compiled)
+	}
+	return compiled, nil
+}
+
 // commitConfirmedAndApply is the commit-confirmed analogue of
 // commitAndApply. Same atomicity guarantees.
 func (d *Daemon) commitConfirmedAndApply(ctx context.Context, minutes int, syncPeer bool) (*config.Config, error) {

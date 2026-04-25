@@ -339,15 +339,14 @@ func (d *Daemon) handleConfigSync(configText string) {
 	}
 	slog.Info("cluster: accepting config sync from peer", "size", len(configText))
 
-	compiled, err := d.store.SyncApply(configText, nil)
-	if err != nil {
+	// #846: route through syncAndApply so the peer's
+	// SyncApply(active promotion) + applyConfig run atomically
+	// under d.applySem. Without this, a local commitAndApply could
+	// interleave between the two and briefly leave store and kernel
+	// disagreeing.
+	if _, err := d.syncAndApply(context.Background(), configText, nil); err != nil {
 		slog.Error("cluster: config sync apply failed", "err", err)
 		return
-	}
-
-	// Apply the compiled config to the dataplane.
-	if compiled != nil {
-		d.applyConfig(compiled)
 	}
 	slog.Info("cluster: config sync applied successfully")
 }
