@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -994,11 +993,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			GC:       d.gc,
 			Routing:  d.routing,
 			FRR:      d.frr,
-			IPsec:      d.ipsec,
-			DHCP:       d.dhcp,
-			VRRPMgr:    d.vrrpMgr,
-			ApplyFn:    d.applyConfig,
-			ApplyFnCtx: d.applyConfigCtx,
+			IPsec:    d.ipsec,
+			DHCP:     d.dhcp,
+			VRRPMgr:  d.vrrpMgr,
+			ApplyFn:  d.applyConfig,
 			// #758: surface compile state so /health returns 503
 			// when the dataplane has never compiled successfully.
 			CompileHealthFn: func() api.CompileHealthSnapshot {
@@ -1072,16 +1070,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 			d.applyConfig(cfg)
 			d.syncConfigToPeer()
 		}
-		// #846: context-aware variant for gRPC commit handlers.
-		// Returns ErrApplyCanceled if the client cancels before the
-		// apply lock is acquired; otherwise behaves identically.
-		applyAndSyncCtx := func(ctx context.Context, cfg *config.Config) error {
-			if err := d.applyConfigCtx(ctx, cfg); err != nil {
-				return err
-			}
-			d.syncConfigToPeer()
-			return nil
-		}
 		grpcSrv := grpcapi.NewServer(d.opts.GRPCAddr, grpcapi.Config{
 			Store:      d.store,
 			DP:         d.dp,
@@ -1111,8 +1099,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return nil
 			},
-			ApplyFn:    applyAndSync,
-			ApplyFnCtx: applyAndSyncCtx,
+			ApplyFn: applyAndSync,
 			VRRPMgr: d.vrrpMgr,
 			RAMgr:   d.ra,
 			Version: d.opts.Version,
@@ -1552,8 +1539,6 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 	return resolved
 }
 
-// applyConfig applies a compiled config in the correct order:
-// 0. Create VRF devices and bind interfaces (routing instances)
 // bootstrapFromFile reads the text Junos config file and imports it as the
 // initial active configuration. This is called on first start when the DB
 // has no active config yet.
@@ -1582,79 +1567,24 @@ func (d *Daemon) bootstrapFromFile() error {
 	return nil
 }
 
+// applyConfig applies a compiled config in the correct order:
+// 0. Create VRF devices and bind interfaces (routing instances)
 // 1. Create tunnels (so interfaces exist for zone binding)
 // 2. Compile eBPF (attaches XDP/TC to interfaces including tunnels)
 // 3. Install static routes (global + per-instance)
 // 4. Apply FRR config (OSPF/BGP, global + per-VRF)
 // 5. Apply IPsec config (strongSwan)
 //
-// #846: applyConfig is the synchronous entry point. Holds applyMu
-// for the full call to serialize across all entry points. Callers
-// without a request context (DHCP, cluster sync goroutine, event
-// engine, CLI auto-rollback, in-process CLI) use this and block
-// until the lock is released.
+// #846: applyConfig holds applyMu for the full call. All entry
+// points — HTTP/gRPC commits, cluster sync recv, DHCP callbacks,
+// config-poll, dynamic feeds, event engine, in-process CLI commits,
+// CLI auto-rollback — serialize end-to-end through this mutex.
+// Two concurrent commits queue rather than interleave; the
+// operator-visible effect is "second commit waits" instead of
+// "second commit corrupts kernel state".
 func (d *Daemon) applyConfig(cfg *config.Config) {
 	d.applyMu.Lock()
 	defer d.applyMu.Unlock()
-	d.applyConfigLocked(cfg)
-}
-
-// ErrApplyCanceled is returned by applyConfigCtx when the caller's
-// context is canceled before the lock can be acquired. The canceled
-// caller's apply NEVER runs — the configured Config is dropped on
-// the floor. Only an apply that already held the lock at cancel
-// time continues to completion (it cannot be interrupted because
-// the body of applyConfig is not cancellation-safe — kernel route
-// writes, FRR reload, etc.).
-var ErrApplyCanceled = errors.New("applyConfig canceled before lock acquisition")
-
-// applyConfigCtx is the context-aware entry point used by HTTP and
-// gRPC commit handlers. If the caller's context is canceled before
-// we acquire applyMu, returns ErrApplyCanceled and the apply is
-// dropped. The body is identical otherwise.
-//
-// Implementation note: tryLockCtx spawns a goroutine that will
-// eventually acquire+release the lock to keep the mutex's invariant
-// balanced. That goroutine does NOT run the apply body — only the
-// canceling caller's slot is given back; the canceled config is
-// dropped.
-func (d *Daemon) applyConfigCtx(ctx context.Context, cfg *config.Config) error {
-	if !d.tryLockCtx(ctx, &d.applyMu) {
-		return ErrApplyCanceled
-	}
-	defer d.applyMu.Unlock()
-	d.applyConfigLocked(cfg)
-	return nil
-}
-
-// tryLockCtx acquires mu unless ctx is canceled first. On
-// cancellation, returns false but leaves a goroutine running that
-// will acquire-then-release the mutex when it eventually becomes
-// available. This goroutine does NOT execute any caller-visible
-// work — its sole purpose is to balance the lock count for the
-// abandoned acquisition attempt.
-func (d *Daemon) tryLockCtx(ctx context.Context, mu *sync.Mutex) bool {
-	acquired := make(chan struct{})
-	go func() {
-		mu.Lock()
-		close(acquired)
-	}()
-	select {
-	case <-acquired:
-		return true
-	case <-ctx.Done():
-		go func() {
-			<-acquired
-			mu.Unlock()
-		}()
-		return false
-	}
-}
-
-// applyConfigLocked is the existing applyConfig body. Callable
-// only with d.applyMu held — both applyConfig() and applyConfigCtx()
-// route through here.
-func (d *Daemon) applyConfigLocked(cfg *config.Config) {
 	// Reset VIP warning suppression so new config gets fresh warnings.
 	d.vipWarnedIfaces = nil
 

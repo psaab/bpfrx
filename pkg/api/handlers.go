@@ -1515,7 +1515,7 @@ func (s *Server) configDeleteHandler(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]string{"status": "ok"})
 }
 
-func (s *Server) configCommitHandler(w http.ResponseWriter, r *http.Request) {
+func (s *Server) configCommitHandler(w http.ResponseWriter, _ *http.Request) {
 	if s.store.IsConfirmPending() {
 		if err := s.store.ConfirmCommit(); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -1530,18 +1530,7 @@ func (s *Server) configCommitHandler(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	// #846: prefer context-aware ApplyFnCtx so a client cancel/timeout
-	// doesn't queue an apply behind a long FRR reload.
-	if s.applyFnCtx != nil {
-		if err := s.applyFnCtx(r.Context(), compiled); err != nil {
-			if r.Context().Err() == context.DeadlineExceeded {
-				writeError(w, http.StatusRequestTimeout, "apply: "+err.Error())
-				return
-			}
-			writeError(w, http.StatusServiceUnavailable, "apply: "+err.Error())
-			return
-		}
-	} else if s.applyFn != nil {
+	if s.applyFn != nil {
 		s.applyFn(compiled)
 	}
 	writeOK(w, map[string]string{"status": "ok"})
@@ -1699,16 +1688,7 @@ func (s *Server) configCommitConfirmedHandler(w http.ResponseWriter, r *http.Req
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if s.applyFnCtx != nil {
-		if err := s.applyFnCtx(r.Context(), compiled); err != nil {
-			if r.Context().Err() == context.DeadlineExceeded {
-				writeError(w, http.StatusRequestTimeout, "apply: "+err.Error())
-				return
-			}
-			writeError(w, http.StatusServiceUnavailable, "apply: "+err.Error())
-			return
-		}
-	} else if s.applyFn != nil {
+	if s.applyFn != nil {
 		s.applyFn(compiled)
 	}
 	writeOK(w, map[string]string{"status": "ok"})

@@ -140,7 +140,7 @@ func (s *Server) Load(_ context.Context, req *pb.LoadRequest) (*pb.LoadResponse,
 	return &pb.LoadResponse{}, nil
 }
 
-func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
+func (s *Server) Commit(_ context.Context, req *pb.CommitRequest) (*pb.CommitResponse, error) {
 	// If a confirmed commit is pending, confirm it
 	if s.store.IsConfirmPending() {
 		if err := s.store.ConfirmCommit(); err != nil {
@@ -162,16 +162,7 @@ func (s *Server) Commit(ctx context.Context, req *pb.CommitRequest) (*pb.CommitR
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	// #846: prefer context-aware ApplyFnCtx when available so client
-	// cancel/timeout doesn't queue an apply behind a long FRR reload.
-	if s.applyFnCtx != nil {
-		if err := s.applyFnCtx(ctx, compiled); err != nil {
-			if ctx.Err() == context.DeadlineExceeded {
-				return nil, status.Errorf(codes.DeadlineExceeded, "apply: %v", err)
-			}
-			return nil, status.Errorf(codes.Canceled, "apply: %v", err)
-		}
-	} else if s.applyFn != nil {
+	if s.applyFn != nil {
 		s.applyFn(compiled)
 	}
 	return &pb.CommitResponse{Summary: summary}, nil
@@ -184,19 +175,12 @@ func (s *Server) CommitCheck(_ context.Context, _ *pb.CommitCheckRequest) (*pb.C
 	return &pb.CommitCheckResponse{}, nil
 }
 
-func (s *Server) CommitConfirmed(ctx context.Context, req *pb.CommitConfirmedRequest) (*pb.CommitConfirmedResponse, error) {
+func (s *Server) CommitConfirmed(_ context.Context, req *pb.CommitConfirmedRequest) (*pb.CommitConfirmedResponse, error) {
 	compiled, err := s.store.CommitConfirmed(int(req.Minutes))
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
-	if s.applyFnCtx != nil {
-		if err := s.applyFnCtx(ctx, compiled); err != nil {
-			if ctx.Err() == context.DeadlineExceeded {
-				return nil, status.Errorf(codes.DeadlineExceeded, "apply: %v", err)
-			}
-			return nil, status.Errorf(codes.Canceled, "apply: %v", err)
-		}
-	} else if s.applyFn != nil {
+	if s.applyFn != nil {
 		s.applyFn(compiled)
 	}
 	return &pb.CommitConfirmedResponse{}, nil
