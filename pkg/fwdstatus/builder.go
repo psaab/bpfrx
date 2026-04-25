@@ -169,20 +169,22 @@ func Build(
 		// each binding with published capacities, compute
 		// max(umem%, tx_ring%) and aggregate as max across bindings.
 		// Bindings whose UmemTotalFrames is zero (helper hasn't
-		// published yet, or pre-#878 helper) are skipped. If NO
-		// binding has capacities, BufferKnown stays false and the
-		// renderer falls back to "unknown (#878)".
+		// published yet, or pre-#878 helper) are skipped entirely:
+		// the Rust worker writes both capacities atomically at
+		// startup, so a binding without UmemTotalFrames also has no
+		// meaningful TxRingCapacity. Gating on UmemTotalFrames alone
+		// keeps the "all unknown" backward-compat path clean.
 		maxPct := 0.0
 		anyKnown := false
 		for _, b := range usStatus.Bindings {
-			var umemPct, txPct float64
-			if b.UmemTotalFrames > 0 {
-				umemPct = float64(b.UmemInflightFrames) * 100.0 / float64(b.UmemTotalFrames)
-				anyKnown = true
+			if b.UmemTotalFrames == 0 {
+				continue
 			}
+			anyKnown = true
+			umemPct := float64(b.UmemInflightFrames) * 100.0 / float64(b.UmemTotalFrames)
+			var txPct float64
 			if b.TxRingCapacity > 0 {
 				txPct = float64(b.OutstandingTX) * 100.0 / float64(b.TxRingCapacity)
-				anyKnown = true
 			}
 			pct := umemPct
 			if txPct > pct {

@@ -1893,15 +1893,18 @@ pub(super) struct BindingLiveState {
     /// worker construction. `outstanding_tx / tx_ring_capacity` is
     /// the second pressure signal aggregated by the Buffer% display.
     pub(super) tx_ring_capacity: AtomicU32,
-    /// #878: UMEM frames currently in flight (not idle in either
-    /// pool). Computed in the worker's per-second debug tick as
-    /// `total - free_tx_frames.len() - pending_fill_frames.len()` —
-    /// one publish, one read, so the `show chassis forwarding`
-    /// Buffer% can divide by `umem_total_frames` without torn-load
-    /// risk. Approximation by design: cross-field sampling on the
-    /// publish side is acceptable because the per-second cadence
-    /// bounds skew, and the CLI surface is rare-diagnostic, not a
-    /// load-bearing invariant.
+    /// #878: UMEM frames currently in flight (not idle in any pool).
+    /// Computed in the worker's per-second debug tick as
+    /// `total - free_tx_frames.len() - pending_fill_frames.len()
+    ///        - device.pending()` — one publish, one read, so the
+    /// `show chassis forwarding` Buffer% can divide by
+    /// `umem_total_frames` without torn-load risk. Approximation by
+    /// design: cross-field sampling on the publish side is acceptable
+    /// because the per-second cadence bounds skew, and the CLI
+    /// surface is rare-diagnostic, not a load-bearing invariant.
+    /// Subtracting `device.pending()` (the kernel fill ring depth)
+    /// is essential — without it an idle binding reads ~80% because
+    /// AF_XDP keeps the fill ring pre-populated by design.
     pub(super) umem_inflight_frames: AtomicU32,
     /// #802: ring-pressure instrumentation. Cumulative monotonic counters
     /// mirrored from the worker-local `BindingWorker` fields of the same
