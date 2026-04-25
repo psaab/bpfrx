@@ -20,12 +20,16 @@ Specific questions:
    competing for the same shaped class as 100 elephants, what
    is the latency delta from unloaded baseline? Reporting only;
    no SLO baseline exists yet to gate against.
-3. **SFQ bucket collisions.** 100 elephant + 100 mouse flows
-   over 1024 buckets gives negligible collision probability,
-   but a broken flow-key hash would silently degrade fairness;
-   capture `admission_flow_share_drops`, `admission_ecn_marked`,
-   and queue-runtime peak active bucket count as observability
-   to detect that.
+3. **SFQ bucket collisions.** 200 flows over 1024 buckets is
+   the classic birthday-paradox regime — expected unique-bucket
+   count ≈ 1024·(1 − e^(−200/1024)) ≈ 186, so ~14 buckets carry
+   2+ flows on average (~7 % collision rate). Not "negligible",
+   but bounded and below the level where SFQ DRR fairness
+   noticeably degrades. Capture `admission_flow_share_drops`,
+   `admission_ecn_marked`, and queue-runtime peak active bucket
+   count as observability so a broken flow-key hash (which
+   would push collision rate FAR higher) shows up as a delta
+   from this baseline.
 
 ## 2. What this is NOT
 
@@ -53,17 +57,21 @@ Specific questions:
   too much headroom.
 - Workers=6, queue 4 owned by worker 1.
 - Both elephants and mice MUST classify into queue 4
-  (iperf-a). See §4.4 for the firewall-filter fix that makes
-  this happen for netperf's default port 12865.
+  (iperf-a). With the R6 hping3 swap, mice target port 5201
+  (same as elephants), so the existing classifier handles
+  both — see §4.4 for the historical class-collision fix
+  context that no longer applies under the current design.
 
 ## 4. Workload definition
 
 ### 4.1 Elephants
 
-100 long-lived TCP streams via `iperf3`:
+100 long-lived TCP streams via `iperf3` in **text mode** (no
+`-J`; per R4#2 the live cwnd-settle gate needs streaming
+stdout, which `-J` defers until process end):
 
 ```
-iperf3 -c 172.16.80.200 -p 5201 -P 100 -t <duration> -J
+iperf3 -c 172.16.80.200 -p 5201 -P 100 -t <duration> -i 1
 ```
 
 `-P 100` forks 100 parallel TCP streams in a single iperf3
@@ -222,13 +230,18 @@ EXIT-trap branch from prior plan revisions also drops.)
 
 ### 5.1 Elephants
 
-From iperf3 JSON, per-stream `sender.bits_per_second`:
+From iperf3 **text-mode** stdout (per §4.1's `-i 1` without
+`-J`), post-parsed for per-stream interval rows:
 
-- **Aggregate Gbps**: sum of all streams.
+- **Per-stream rate**: parse `[<id>] T1-T2 sec <bytes><unit> ...`
+  lines within the `[t_g, t_g + 50]` window; sum bytes per
+  stream-id, divide by 50 s.
+- **Aggregate Gbps**: sum across all stream rates.
 - **Per-flow CoV**: `stdev(rates) / mean(rates)` across the 100
   streams. Reported as a percentage.
 - **Min/max stream Mbps**: range markers.
-- **Total retransmits**: sanity check on link health.
+- **Total retransmits**: sum of `Retr` column across stream
+  intervals in the same window.
 
 ### 5.2 Mice
 
@@ -664,12 +677,14 @@ with a 95% CI stopping rule.
 
 ## 7. Reproducibility + observability
 
-- **Deterministic ports**: elephants 5201 (iperf-a), mice
-  12865/12866 (iperf-a after the §4.4 filter extension).
+- **Deterministic ports**: elephants AND mice both target port
+  5201, which the existing `cos-iperf-config.set` classifier
+  maps to iperf-a. No firewall-filter extension or
+  rollback-on-EXIT path is needed (§4.4 was removed).
 - **Logging**: each rep writes
-  `/tmp/100e100m/<timestamp>/<rep>/<phase>/` with iperf3 JSON,
-  100 netperf stdout files, mpstat log, RG-watcher log, and
-  computed `summary.txt`.
+  `/tmp/100e100m/<run-ts>/<rep-N>/` with iperf3 text log,
+  100 hping3 stdout files (under `<phase>-mice/`), mpstat
+  JSON, RG-watcher log, and computed `summary.txt`.
 - **Daemon log capture**: at end of run, fetch
   `journalctl -u xpfd --since=<run-T0>` from fw0 and fw1 and
   snapshot alongside the metrics. Captures any rebalance / SFQ

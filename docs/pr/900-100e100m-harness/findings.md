@@ -1,4 +1,4 @@
-# #900 — 100E100M empirical finding (early outcome)
+# 100E100M empirical finding (issue #900, early outcome)
 
 ## TL;DR
 
