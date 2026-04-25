@@ -105,10 +105,38 @@ the mechanics, so this section is sequencing only.
    explicitly in the PR body with the reason. Never claim success for
    a check that wasn't executed.
 
-9. **PR open + review + merge** — see "PR discipline" and "Merging"
-   below for the body template and mechanics. At this stage: Copilot
-   and Codex review; every comment gets a disposition reply; squash
-   merge once CI is green and findings are resolved.
+9. **PR open + Copilot review + Codex re-review + merge** — see
+   "PR discipline" and "Merging" below for the body template and
+   mechanics. Two distinct review surfaces:
+
+   - **GitHub Copilot** auto-posts an inline review on every push to
+     a PR (~30s after `git push`). It catches a different class of
+     issues than Codex: stale comments, unwired fields, accidentally-
+     ignored errors, missing tests. **Always fetch and triage Copilot
+     comments before requesting human review** — pretend they're
+     from a thoughtful but pedantic colleague. Real ones get fixed
+     in the same branch; non-issues get a short reply explaining
+     why.
+
+     Standard fetch:
+     ```
+     gh api repos/<owner>/<repo>/pulls/<N>/comments | \
+       jq -r '.[] | select(.user.login | startswith("copilot")) |
+              "\(.path):\(.line // .original_line) — \(.body)"'
+     ```
+
+   - **Codex hostile code review** runs separately via the
+     `codex-rescue` agent. Same terminal rule as the plan review:
+     Codex returns `MERGE YES` AND every finding has a written
+     disposition. Codex sees the diff with eyes that have not seen
+     Copilot's findings — keep the two reviews independent so they
+     can disagree productively.
+
+   Iterate until BOTH reviewers are clean (or have explicit-with-
+   reason dispositions). Squash merge once CI is green and findings
+   are resolved. If the diff grows in response to review, push and
+   request a re-review — both Copilot and Codex re-fire on the new
+   HEAD.
 
 ## Hot-path coding discipline
 
@@ -218,6 +246,13 @@ the mechanics, so this section is sequencing only.
 - **Trust but verify.** An agent's commit summary describes what it
   intended. Read the diff. Re-run the tests on the updated head before
   approving.
+- **Two independent review surfaces.** Codex (hostile, design-level)
+  and Copilot (inline, mechanical-detail) catch different classes of
+  bugs. Treat them as separate passes; do not skip either. Codex
+  often misses the unwired-field or stale-comment bug that Copilot
+  spots; Copilot often misses the architectural concern that Codex
+  flags. The combined coverage is the point — losing one halves
+  the review.
 
 ### Responding to review (as author)
 
