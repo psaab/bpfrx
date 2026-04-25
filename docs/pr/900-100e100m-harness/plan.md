@@ -95,9 +95,13 @@ contend for shaped capacity.
 ```
 netperf -H 172.16.80.200 -p 12866 -t TCP_RR -l <duration> \
     -- -r 64,64 -P 12865 -O \
-       min_latency,p50_latency,p90_latency,p99_latency,mean_latency,max_latency \
+       min_latency,p50_latency,p90_latency,p99_latency,mean_latency,max_latency,transaction_rate,throughput,throughput_units \
        -b 1 -w 1000  # max 1 burst per 1000us = 1000 RR/s
 ```
+
+(R4 MED#7: `transaction_rate` is netperf's per-omni RPS
+field; without it the harness can't verify the achieved RPS
+target referenced in §5.2 + §10.)
 
 (`-b` and `-w` form netperf's burst-mode pacing — verify in
 implementation; if the version available doesn't support pacing,
@@ -148,29 +152,32 @@ histogram-merge via netperf `-V`.
 3. **Cool-down.** 10 s idle between phases so any CoS queue
    backlog drains.
 4. **Loaded — proper warm-up sequencing (Codex R1#1 / R2 A1
-   / R3#1):**
-   - Start `iperf3 -c <target> -p 5201 -P 100 -t 90 -i 1 -J`
-     in background. The `-t 90` is a safety upper bound: the
-     harness will SIGTERM iperf3 when mice finish (R3#1 fix:
-     prior plan had a fixed -t conflicting with variable
-     gate-firing time).
-   - **Cwnd-settle gate**: poll the iperf3 JSON output for
-     completed `intervals[]` entries (each represents a 1 s
-     summary). Compute `agg_t = intervals[t].sum.bits_per_second`
-     (the 100-stream aggregate at second `t`). Mice start
-     when **3 consecutive `agg_t` samples are within ±10% of
-     their median AND that median is ≥ 0.5 Gb/s**. If the gate
+   / R3#1 / R4#1+#2):**
+   - Start `iperf3 -c <target> -p 5201 -P 100 -t 90 -i 1`
+     **WITHOUT `-J`** (R4#2: `-J` only emits JSON at process
+     end, breaking live polling). Stream text stdout into a
+     log file the gate can `tail -F` while iperf3 is running.
+     The `-t 90` is a safety upper bound: the harness will
+     SIGTERM iperf3 when mice finish.
+   - **Cwnd-settle gate** (text-mode parser): tail the
+     stdout log; iperf3 `-i 1` emits per-stream `[ID]` lines
+     and a `[SUM]` line per second. Parse `[SUM]` aggregate
+     bits/sec values. Gate passes when **3 consecutive
+     `[SUM]` aggregate samples are within ±10% of their
+     median AND that median is ≥ 0.5 Gb/s**. If the gate
      doesn't fire within 20 s, abort the rep and mark it
      invalid.
    - Record `t_g` = the iperf3 elapsed second when the gate
      passed (typically ~3-10 s).
    - Start 100 paced netperf mice for 50 s.
    - When mice finish at `t_g + 50` (iperf3-clock), SIGTERM
-     iperf3.
-   - Elephant CoV is computed using ONLY iperf3 per-stream
-     `intervals[]` entries within `[t_g, t_g + 50]` — this
-     excludes the warm-up and any post-mice tail (R3#1 +
-     R2 B5 closure).
+     iperf3. iperf3's text output already includes per-second
+     intervals on stdout; no JSON to truncate.
+   - Elephant CoV is computed by post-parsing the text log:
+     filter to per-stream lines with `[ID]` rows
+     timestamped within `[t_g, t_g + 50]`, sum bytes per
+     stream, divide by 50 s for per-stream rate. This
+     excludes warm-up and any post-mice tail.
 5. **Cool-down.** 10 s idle. Drain math: queue 4 buffer is
    1.19 MiB observed live; at 1 Gb/s drain rate the time to
    drain a full buffer is ≈ 10 ms. 10 s is ~1000× the worst-
@@ -263,7 +270,10 @@ A rep is **invalidated** (excluded from the aggregate) if any of:
    invalidate.
 3. **CoS counter regression** (Codex finding #7): any monotonic
    counter (`admission_flow_share_drops`, `admission_ecn_marked`,
-   `park_queue_tokens`) decreases between before-snapshot and
+   `drain_park_queue_tokens`, `drain_park_root_tokens`,
+   `root_token_starvation_parks`, `queue_token_starvation_parks`
+   per `pkg/dataplane/userspace/protocol.go:503`) decreases
+   between before-snapshot and
    after-snapshot. Indicates daemon restart mid-rep.
 4. **Elephant aggregate < 0.5 Gb/s**: indicates the firewall is
    not actually engaging the iperf-a shaper, so any mouse
@@ -284,20 +294,41 @@ iperf3-target instance (netserver). The harness orchestrates
 from the bpfrx-fw0 host (the dev machine where this script
 runs).
 
-For each backgrounded container process, the launch pattern is:
+For each backgrounded container process, the launch pattern is
+(R4#4: variables passed as positional args so they expand
+on the host side BEFORE single-quoted-body reaches the
+remote shell):
 
 ```bash
 incus exec ${instance} -- bash -c '
-    <cmd> > /tmp/${out} 2>&1 &
-    echo $! > /tmp/${pidfile}
-'
+    "$@" > "/tmp/$1" 2>&1 &
+    echo $! > "/tmp/$2"
+' _ "${out}" "${pidfile}" -- ${cmd_args[@]}
 ```
 
-The `$!` captures the **container-namespace PID**. To stop:
+Where `_` is `$0` (script name), `${out}` becomes `$1`,
+`${pidfile}` becomes `$2`, then a literal `--` separator, then
+the command and its args. Inside the inner shell `"$@"`
+expands to the command and its args (after the `--`).
+
+For simple cases without complex command args, a clearer
+form uses `printf -v` or explicit substitution:
 
 ```bash
-incus exec ${instance} -- bash -c 'kill -TERM $(cat /tmp/${pidfile}) 2>/dev/null'
-incus exec ${instance} -- rm -f /tmp/${pidfile}
+incus exec ${instance} -- bash -c \
+    "${cmd_template} > /tmp/${out} 2>&1 &
+     echo \$! > /tmp/${pidfile}"
+```
+
+(Double-quoted `bash -c` body: host vars expand, `$!`
+escaped via `\$!` so it expands on the remote.)
+
+To stop:
+
+```bash
+incus exec ${instance} -- bash -c \
+    "kill -TERM \$(cat /tmp/${pidfile}) 2>/dev/null; \
+     rm -f /tmp/${pidfile}"
 ```
 
 To collect output back to the host:
@@ -346,30 +377,41 @@ the sbin path is canonical.
 without an enclosing `configure ... commit ... exit` does NOT
 activate the rollback (per `pkg/configstore/store.go:893-909`,
 rollback only mutates candidate state). All harness cli
-config-mode operations use the heredoc pattern:
+config-mode operations are issued via the cli on the firewall
+instance using the `incus exec ... bash -c "<cli ...>"` pattern
+(R4 MED#5 fix: prior plan example omitted the `incus exec`
+wrapper, which would have run cli locally on the orchestrator
+host where xpfd doesn't run). The cli reads from `os.Stdin`
+without requiring a tty, so a heredoc piped into the cli
+works:
 
 ```bash
-incus exec loss:xpf-userspace-fw0 -- bash -c "/usr/local/sbin/cli <<'EOF'
+incus exec loss:xpf-userspace-fw0 -- bash -c "/usr/local/sbin/cli" <<'EOF'
 configure
 <set/delete commands>
 commit
 exit
-EOF"
+EOF
 ```
+
+The heredoc lives on the host side; bash sends the heredoc
+contents to `incus exec`'s stdin, which forwards to the
+remote `cli` process's stdin. (R4 MED comment: cli stdin is
+fine; `pkg/cli/` reads from `os.Stdin` with no TTY check.)
 
 For rollback specifically:
 
 ```bash
-incus exec loss:xpf-userspace-fw0 -- bash -c "/usr/local/sbin/cli <<'EOF'
+incus exec loss:xpf-userspace-fw0 -- bash -c "/usr/local/sbin/cli" <<'EOF'
 configure
 rollback 1
 commit
 exit
-EOF"
+EOF
 ```
 
 `cli -c <single-cmd>` is reserved for **operational** commands
-only (e.g. `cli -c 'show class-of-service interface'`).
+only (e.g. `incus exec loss:xpf-userspace-fw0 -- /usr/local/sbin/cli -c 'show class-of-service interface'`).
 
 
 
@@ -385,16 +427,26 @@ the system in a clean state.
 2. Set tracker variables: MOUSE_FILTER_APPLIED=0,
    PIDFILES_TO_CLEAN=() (an array of (instance, pidfile)
    tuples), HARNESS_PGID=$(setsid bash -c 'echo $$').
-3. Register EXIT trap (R3#7 / R2 C2). Trap actions, in order:
-   a. For each tracked (instance, pidfile): `incus exec
-      ${instance} -- bash -c 'kill -TERM $(cat /tmp/${pf})
-      2>/dev/null; rm -f /tmp/${pf}'`.
+3. Register EXIT trap (R3#7 / R2 C2 / R4#3).
+   The trap function MUST start with `set +e` and capture the
+   original exit status via `local original_status=$?`,
+   restoring it at the end with `return $original_status`.
+   This ensures every cleanup sub-step runs even when the
+   one before it fails (e.g. incus unreachable mid-cleanup).
+   Trap actions, in order:
+   a. For each tracked (instance, pidfile): run
+      `incus exec ${instance} -- bash -c \
+       "kill -TERM \$(cat /tmp/${pidfile}) 2>/dev/null;
+        rm -f /tmp/${pidfile}"` (host-side var expansion via
+      double-quoted body, R4#4). Each sub-step suffixed with
+      `|| :` so a single failure doesn't propagate.
    b. If MOUSE_FILTER_APPLIED == 1: roll back via the
       heredoc pattern in §6.0 (configure / rollback 1 /
       commit / exit). Do NOT touch the base CoS — that is
-      intentionally persistent post-harness.
+      intentionally persistent post-harness. Suffix `|| :`.
    c. Pull any container output files the harness recorded
       so a debug snapshot is preserved on partial failure.
+      Suffix `|| :`.
 4. Verify both firewall VMs RUNNING via `incus list`.
 5. Assert `systemctl is-active xpfd` returns "active" on
    fw0 AND fw1 (R3 finding closure for incomplete daemon
@@ -428,9 +480,10 @@ the system in a clean state.
    the pidfile pattern from §6.0. Verify with
    `nc -zv 172.16.80.200 12866` from the source.
 10. Apply base CoS via `apply-cos-config.sh` (idempotent).
-11. Apply mouse classifier extension (§4.4) via heredoc:
+11. Apply mouse classifier extension (§4.4) via heredoc-
+    over-incus-exec (R4 MED#5 fix: explicit wrapper):
     ```
-    /usr/local/sbin/cli <<'EOF'
+    incus exec loss:xpf-userspace-fw0 -- bash -c "/usr/local/sbin/cli" <<'EOF'
     configure
     set firewall family inet filter bandwidth-output term mouse from destination-port 12865-12866
     set firewall family inet filter bandwidth-output term mouse then forwarding-class iperf-a
@@ -470,20 +523,23 @@ start, so re-runs do not overwrite (R2 B3).
 5. Stop mpstat (kill the tracked pid).
 6. Sleep 10 s cool-down.
 7. Snapshot CoS counters (mid).
-8. Start mpstat 1 -o JSON for loaded phase.
-9. Start `iperf3 -c <target> -p 5201 -P 100 -t 60 -i 1 -J`
-   in background, output to <rep>/loaded-elephants.json.
-10. Apply cwnd-settle gate (§4.3 step 4): poll the JSON for
-    `intervals[]` entries every 500 ms. Compute
-    `agg_t = intervals[t].sum.bits_per_second`. Pass when
-    3 consecutive `agg_t` are within ±10% of their median
-    AND median ≥ 0.5 Gb/s. Abort + invalidate rep if no pass
-    within 20 s.
+8. Start `mpstat 1 60 -o JSON` for loaded phase (R4 MED#6:
+   count-bounded so SIGTERM is not needed; mpstat finishes
+   on its own with valid JSON).
+9. Start `iperf3 -c <target> -p 5201 -P 100 -t 90 -i 1`
+   (text mode, R4#1+#2) in background, output to
+   <rep>/loaded-elephants.txt.
+10. Apply cwnd-settle gate (§4.3 step 4): tail the text log
+    every 500 ms. Parse `[SUM]` lines for aggregate bits/sec.
+    Pass when 3 consecutive `[SUM]` aggregate samples are
+    within ±10% of their median AND median ≥ 0.5 Gb/s.
+    Abort + invalidate rep if no pass within 20 s.
 11. Run 100 netperf mice for 50 s; capture as in step 4.
-12. Wait for iperf3 to finish (-t 60, will end ~10 s after
-    mice start, so finishes roughly when mice finish).
+12. SIGTERM iperf3 when mice finish (R4#1: stops the
+    elephants-only tail from inflating CoV).
 13. Snapshot CoS counters (after).
-14. Stop loaded-phase mpstat.
+14. mpstat ran for 60 s and exited on its own (no kill
+    needed).
 15. Pull `journalctl -u xpfd --since=<rep_T0>` from fw0 and
     fw1 (R2 A7); grep for cluster transition lines.
     Invalidate rep if any "cluster: primary transition",
@@ -526,13 +582,25 @@ This convention is applied consistently:
 - Across reps for any metric (e.g. across-reps median elephant
   CoV).
 
-**Minimum-valid-rep auto-extension** (R3 MED#13): if fewer
-than **7 reps are valid** after the initial 10, the harness
-runs additional reps in batches of 5 until at least 7 reps
-are valid OR until 20 reps total have been attempted. If 20
-reps still don't yield 7 valid, the harness emits FAIL and
-the operator must investigate environmental issues (see §5.4
-validity flags).
+**Minimum-valid-rep auto-extension** (R3 MED#13 / R4 LOW#10).
+Pinned loop:
+
+```
+attempted_reps = 0
+valid_reps = 0
+while valid_reps < 7 && attempted_reps < 20:
+    batch = min(5, 20 - attempted_reps)
+    if attempted_reps == 0:
+        batch = 10  # initial
+    run `batch` reps
+    attempted_reps += batch
+    valid_reps += <number valid in last batch>
+if valid_reps < 7:
+    FAIL "environmental — operator investigation required"
+```
+
+Strict-less-than gates ensure exactly 20 attempts max, never
+more.
 
 **IQR warning destination** (R3 LOW#15): if IQR > 50% of
 median for any headline metric, the harness emits a
@@ -541,9 +609,17 @@ status) AND records `iqr_warning: true` per-metric in the
 JSON summary. Operator decides whether to re-run with more
 reps; the test does not auto-fail on high IQR.
 
-**Artifact retention** (R3 LOW#16):
+**Artifact retention** (R3 LOW#16 / R4 LOW#11):
 - Default: keep the most recent 5 run directories under
-  `/tmp/100e100m/`; older runs auto-pruned at start.
+  `/tmp/100e100m/`; older runs auto-pruned.
+- **Pruning order** (R4 LOW#11): pruning runs as the FIRST
+  step inside preflight AFTER the EXIT trap is registered
+  (preflight step 4 onward), and BEFORE any cli/CoS
+  mutation. Concretely: insert prune as preflight step 3.5
+  between trap-registration (step 3) and VM-RUNNING check
+  (step 4). If pruning is interrupted mid-rm-rf, the EXIT
+  trap is already armed so the partial state is logged but
+  no system mutation has happened.
 - `--keep-artifacts` flag disables auto-pruning.
 - Per-run directory size is bounded (~6 MB max with 10 reps)
   so 5 runs ≤ 30 MB.
@@ -708,15 +784,39 @@ out of scope for this PR.
 | 15| LOW | IQR-warning action               | §6.4: stderr warning + `iqr_warning: true` in JSON summary; no exit-status change |
 | 16| LOW | No artifact cleanup              | §6.4: keep last 5 run dirs by default; `--keep-artifacts` flag |
 
+### Round 4 (11 findings)
+
+| # | Sev | Topic                            | Resolution |
+|---|-----|----------------------------------|------------|
+| 1 | HIGH| Cross-section iperf3 -t inconsistency | §6.2 step 9 + §12 R3 row updated; -t 90 + SIGTERM at mice-finish is the canonical model |
+| 2 | HIGH| iperf3 -J only emits at end      | Switched to text mode (`-i 1` no `-J`), parse `[SUM]` lines for live gate; post-parse text log for per-stream rates |
+| 3 | HIGH| EXIT trap with `set -e` aborts mid-cleanup | Trap function starts with `set +e` and saves `$?`; every sub-step suffixed `\|\| :` |
+| 4 | HIGH| Single-quoted bash -c bodies don't expand host vars | Two patterns documented in §6.0: positional-arg pass-through `bash -c '...$1...' _ "$host_var"`, and double-quoted body with `\$!` escape |
+| 5 | MED | §6.1 heredoc missing incus exec wrapper | Step 11 now uses `incus exec ... bash -c "/usr/local/sbin/cli" <<'EOF'` form |
+| 6 | MED | mpstat SIGTERM partial JSON      | Use count-bounded `mpstat 1 60 -o JSON` — exits cleanly after 60 samples |
+| 7 | MED | netperf -O missing transaction_rate | Added `transaction_rate,throughput,throughput_units` to the -O field list |
+| 8 | MED | Wrong CoS counter name           | Corrected to `drain_park_queue_tokens` etc. per `protocol.go:503` |
+| 9 | MED | Env file placeholder invalid shell | Use `IPERF3_TARGET_INSTANCE="cluster-userspace-host"` (real value committed in the harness PR) |
+| 10| LOW | Auto-extension loop unpinned     | §6.4 specifies the exact while/break conditions with strict-less-than gates |
+| 11| LOW | Pruning step order unpinned      | Pruning is preflight step 3.5: AFTER trap registration, BEFORE any cli mutation |
+
 ## 13. Environmental config addition
 
-This PR adds one variable to `test/incus/loss-userspace-cluster.env`:
+This PR adds one variable to `test/incus/loss-userspace-cluster.env`
+(R4 MED#9: literal placeholder is invalid shell; use a real
+quoted instance name committed in the PR):
 
 ```
 # iperf3 / netperf target instance (must be RUNNING and have
 # 172.16.80.200 reachable). Required by test-100e100m.sh.
-IPERF3_TARGET_INSTANCE=<name>
+IPERF3_TARGET_INSTANCE="cluster-userspace-host"
 ```
+
+(The actual target instance is determined empirically when
+the harness is wired up — `cluster-userspace-host` is the
+canonical iperf3-server location for this cluster, but if
+the cluster setup uses a separate instance the PR commits
+the correct name.)
 
 The harness sources the env file via the standard
 `BPFRX_CLUSTER_ENV` mechanism used by `cluster-setup.sh`.
