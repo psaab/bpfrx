@@ -3,6 +3,7 @@
 package eventengine
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -14,15 +15,18 @@ import (
 	"github.com/psaab/xpf/pkg/rpm"
 )
 
-// ApplyFn is called after a successful commit to apply the new configuration.
-type ApplyFn func(*config.Config)
+// CommitFn atomically promotes the candidate to active and applies
+// it to the dataplane. The daemon's commitAndApply implementation
+// holds the apply semaphore across both steps so the engine's
+// commit can't interleave with another caller's commit/apply pair.
+type CommitFn func(ctx context.Context, comment string) (*config.Config, error)
 
 // Engine evaluates event-options policies against RPM events.
 type Engine struct {
 	mu       sync.Mutex
 	policies []*config.EventPolicy
 	store    *configstore.Store
-	applyFn  ApplyFn
+	commitFn CommitFn
 
 	// Temporal tracking: policy name → event name → sliding window of timestamps
 	windows map[string]map[string][]time.Time
@@ -34,11 +38,14 @@ type Engine struct {
 // Minimum time between successive triggers of the same policy.
 const policyCooldown = 30 * time.Second
 
-// New creates an event engine.
-func New(store *configstore.Store, applyFn ApplyFn) *Engine {
+// New creates an event engine. commitFn is the daemon's atomic
+// commit+apply callback (see #846); when non-nil, the engine routes
+// its committed configs through it so they serialize with HTTP/gRPC
+// commits. When nil (tests), commits succeed but no apply runs.
+func New(store *configstore.Store, commitFn CommitFn) *Engine {
 	return &Engine{
 		store:       store,
-		applyFn:     applyFn,
+		commitFn:    commitFn,
 		windows:     make(map[string]map[string][]time.Time),
 		lastTrigger: make(map[string]time.Time),
 	}
@@ -281,23 +288,26 @@ func (e *Engine) executeCommands(pol *config.EventPolicy) {
 		}
 	}
 
-	// Commit
-	compiled, err := e.store.Commit()
-	if err != nil {
+	// #846: route through the daemon's atomic commit+apply so this
+	// commit serializes with HTTP/gRPC commits. Without this, the
+	// engine's store.Commit could interleave between another caller's
+	// commit and apply, leaving configstore/kernel divergent.
+	if e.commitFn == nil {
+		// Standalone (tests): just commit; no apply.
+		if _, err := e.store.Commit(); err != nil {
+			slog.Warn("event-options: commit failed", "policy", pol.Name, "err", err)
+		}
+		e.store.ExitConfigure()
+		return
+	}
+	if _, err := e.commitFn(context.Background(), ""); err != nil {
 		slog.Warn("event-options: commit failed", "policy", pol.Name, "err", err)
 		e.store.ExitConfigure()
 		return
 	}
-
-	// Exit configure mode to release the lock
 	e.store.ExitConfigure()
 
 	slog.Info("event-options: configuration committed",
 		"policy", pol.Name,
 		"commands", fmt.Sprintf("%d", len(pol.ThenCommands)))
-
-	// Apply the new configuration
-	if e.applyFn != nil && compiled != nil {
-		e.applyFn(compiled)
-	}
 }

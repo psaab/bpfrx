@@ -854,7 +854,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Start event-options engine if configured.
 	if cfg := d.store.ActiveConfig(); cfg != nil && len(cfg.EventOptions) > 0 {
-		d.eventEngine = eventengine.New(d.store, d.applyConfig)
+		// #846: route through commitAndApply so the engine's commit
+		// serializes with HTTP/gRPC commits under d.applySem.
+		// Event-options changes don't sync to peer (the engine fires
+		// independently on each node based on local RPM events).
+		d.eventEngine = eventengine.New(d.store, func(ctx context.Context, comment string) (*config.Config, error) {
+			return d.commitAndApply(ctx, comment, false)
+		})
 		d.eventEngine.Apply(cfg.EventOptions)
 		if d.rpm != nil {
 			d.rpm.SetEventCallback(d.eventEngine.HandleEvent)
@@ -1175,13 +1181,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 		shell := cli.New(d.store, d.dp, eventBuf, er, d.routing, d.frr, d.ipsec, d.dhcp, d.dhcpRelay, d.cluster)
 		shell.SetVersion(d.opts.Version)
 		shell.SetForwardingSampler(fwdSampler)
-		// #797 H2: route in-process CLI commits through the daemon's
-		// full reconcile so D3 RSS indirection reapply, cluster/VRRP,
-		// DHCP etc. converge on every commit — not only the subset
-		// applyToDataplane() did. Same path gRPC/HTTP commits take
-		// via commitAndApply (which calls applyConfig under
-		// d.applySem).
+		// #797 H2 / #846: route in-process CLI commits through the
+		// daemon's atomic commit+apply so they serialize against
+		// HTTP/gRPC/event-engine commits under d.applySem.
+		// applyConfigFn stays wired for non-commit paths (rollback,
+		// confirm) that still need the full reconcile.
 		shell.SetApplyConfigFn(d.applyConfig)
+		shell.SetCommitFns(
+			func(ctx context.Context, comment string) (*config.Config, error) {
+				// In-process CLI commits don't sync to peer (the
+				// CLI is local; preserves prior per-transport
+				// behavior, same as HTTP).
+				return d.commitAndApply(ctx, comment, false)
+			},
+			func(ctx context.Context, minutes int) (*config.Config, error) {
+				return d.commitConfirmedAndApply(ctx, minutes, false)
+			},
+		)
 		shell.SetRPMResultsFn(func() []*rpm.ProbeResult {
 			if d.rpm != nil {
 				return d.rpm.Results()
