@@ -183,7 +183,11 @@ func indirectionTableIsDefault(output []byte, queueCount int) bool {
     if queueCount <= 0 {
         return false
     }
-    sawAnyRow := false  // R2#2: prevent vacuously-true on empty/unparseable output
+    // R2#2 + R3 LOW: prevent vacuously-true on empty,
+    // unparseable, or value-less ("0:" with no queue tokens)
+    // output. Set the flag only after at least one queue value
+    // has been successfully parsed and verified.
+    sawAnyEntry := false
     for _, line := range bytes.Split(output, []byte{'\n'}) {
         trimmed := bytes.TrimSpace(line)
         if len(trimmed) == 0 {
@@ -197,7 +201,6 @@ func indirectionTableIsDefault(output []byte, queueCount int) bool {
         if err != nil {
             continue
         }
-        sawAnyRow = true
         for j, tok := range bytes.Fields(trimmed[colon+1:]) {
             q, err := strconv.Atoi(string(tok))
             if err != nil {
@@ -207,9 +210,10 @@ func indirectionTableIsDefault(output []byte, queueCount int) bool {
             if q != expected {
                 return false
             }
+            sawAnyEntry = true
         }
     }
-    return sawAnyRow
+    return sawAnyEntry
 }
 ```
 
@@ -269,9 +273,15 @@ locking (none) preserved.
     but in non-round-robin order. Asserts the stricter check.
     (R1 MED #3.)
 11. `TestIndirectionTableIsDefault_EmptyOutput_False`: pure parser
-    test on empty / unparseable output (e.g. from a failed `ethtool
-    -x` that returned 0 bytes). Asserts `sawAnyRow` guard prevents
-    vacuously-true return. (R2 MED #2.)
+    test on empty / unparseable / value-less inputs. Three
+    sub-cases:
+    - empty `[]byte{}` → false (no rows seen)
+    - non-row text only (e.g. just the "RX flow hash..." header)
+      → false (no rows seen)
+    - row index with no queue tokens (e.g. `"0:\n"`) → false
+      (R3 LOW: sawAnyEntry guard, not just sawAnyRow)
+    Asserts the parser distinguishes "no entries parsed" from
+    "all entries match expected pattern".
 12. `TestApplyRSSIndirectionOne_BootSequence_4then6_RestoresDefault`:
     multi-cycle test simulating the actual operator scenario.
     Step 1: workers=4, queues=6, default round-robin live table —
@@ -354,3 +364,9 @@ path) must still pass unchanged.
 | 3 | MED | Runtime queue-count-only changes       | §12 explicit out-of-scope: operator changing `ethtool -L` without config commit is not auto-handled; netlink-watch for ringparam is separate scope |
 | 4 | LOW | Test fixture path unpinned             | §9 test #8 specifies inline-string-literal in the test (small enough to embed, keeps test self-contained) |
 | 5 | LOW | Multi-cycle boot scenario untested     | §9 test #12 added: `BootSequence_4then6_RestoresDefault` covers the full transition end-to-end |
+
+### Round 3 (1 finding)
+
+| # | Sev | Topic                                  | Resolution |
+|---|-----|----------------------------------------|------------|
+| 1 | LOW | sawAnyRow set before queue tokens parsed | Renamed `sawAnyRow` → `sawAnyEntry`, set inside the inner field loop after a value has been parsed AND verified. Test #11 expanded to cover the value-less row case (`"0:\n"`) explicitly |
