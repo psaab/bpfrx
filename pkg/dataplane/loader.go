@@ -336,10 +336,23 @@ func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) error {
 	}
 
 	// Collect the set of {ifindex, vlan_id} keys this XDP attachment
-	// represents. For a physical ifindex this is every entry whose
-	// key.Ifindex matches; for a VLAN sub-iface this is the single
-	// {parent, vlan_id} entry resolved via vlan_iface_map.
+	// represents.
 	targets := make(map[IfaceZoneKey]struct{})
+
+	// On DETACH, also include every entry m.xdpFlagClaims says this
+	// ifindex previously claimed. Without this, a Clear/recreate
+	// cycle in the compile path (ClearIfaceZoneMap deletes BPF
+	// entries before DetachXDP fires) would leave stale claims in
+	// the in-memory map; a later SetZone on the same {ifindex,
+	// vlan_id} would see a non-empty claim set and spuriously
+	// re-flag the entry.
+	if !attached {
+		for k, claims := range m.xdpFlagClaims {
+			if claims[ifindex] {
+				targets[k] = struct{}{}
+			}
+		}
+	}
 
 	// Sub→parent resolution. Distinguish "not a sub-iface" (ENOENT
 	// is the legitimate fast path: lookup returns ErrKeyNotExist
