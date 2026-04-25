@@ -194,10 +194,13 @@ int tc_screen_egress_prog(struct __sk_buff *skb)
 			return screen_drop_tc(meta, SCREEN_IP_SOURCE_ROUTE);
 	}
 
-	/* Ping of Death: a fragment whose offset+payload would
-	 * overflow the 65535-byte reassembled IP datagram limit. See
+	/* Ping of Death: a fragment whose contribution to the
+	 * reassembled IP datagram would exceed 65535 bytes. See
 	 * xdp_screen.c for the design rationale; this mirrors that
-	 * detector on the egress path. IPv4 only (IPv6 follow-up). */
+	 * detector on the egress path. The condition
+	 * `offset_bytes + tot_len > 65535` accounts for the IP header
+	 * (Codex round 2 caught the prior formula's off-by-header
+	 * miss). IPv4 only; IPv6 follow-up. */
 	if ((sc->flags & SCREEN_PING_OF_DEATH) &&
 	    meta->addr_family == AF_INET &&
 	    meta->is_fragment &&
@@ -207,9 +210,7 @@ int tc_screen_egress_prog(struct __sk_buff *skb)
 			__u16 frag_off = bpf_ntohs(iph->frag_off);
 			__u32 offset_bytes = (frag_off & 0x1FFF) << 3;
 			__u32 tot_len = bpf_ntohs(iph->tot_len);
-			__u32 ihl = (__u32)iph->ihl << 2;
-			__u32 frag_payload = (tot_len > ihl) ? (tot_len - ihl) : 0;
-			if (offset_bytes + frag_payload > 65535)
+			if (offset_bytes + tot_len > 65535)
 				return screen_drop_tc(meta, SCREEN_PING_OF_DEATH);
 		}
 	}
