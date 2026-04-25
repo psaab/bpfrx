@@ -74,9 +74,15 @@ type VRFSpec struct {
 }
 
 // keepaliveRunner manages the goroutine for a single tunnel's keepalive.
+//
+// #848: `done` is closed by keepaliveLoop just before it returns.
+// Close() / stopAllKeepalives drain on this channel so the netlink
+// handle is not closed while a keepalive goroutine is still in
+// flight (use-after-close on m.nlHandle).
 type keepaliveRunner struct {
 	cancel context.CancelFunc
 	state  *KeepaliveState
+	done   chan struct{}
 }
 
 // New creates a new routing Manager.
@@ -624,20 +630,32 @@ func closeTuntapFiles(files []*os.File) {
 	}
 }
 
-// stopAllKeepalives cancels all running keepalive goroutines.
+// stopAllKeepalives cancels all running keepalive goroutines and
+// waits for them to exit. Caller MUST hold ifaceMu.
+//
+// #848: draining (not just cancelling) is required because
+// keepaliveLoop touches m.nlHandle on bring-up/down. Close() then
+// closes nlHandle, so any in-flight tick that hadn't yet checked
+// ctx.Done() would use-after-close. The done channel makes the
+// drain explicit.
 func (m *Manager) stopAllKeepalives() {
-	for name, runner := range m.keepalives {
+	runners := m.keepalives
+	m.keepalives = make(map[string]*keepaliveRunner)
+	for name, runner := range runners {
 		runner.cancel()
+		<-runner.done
 		slog.Debug("stopped keepalive", "tunnel", name)
 	}
-	m.keepalives = make(map[string]*keepaliveRunner)
 }
 
 // startKeepalive starts a keepalive probe goroutine for a tunnel.
+// Caller MUST hold ifaceMu.
 func (m *Manager) startKeepalive(tunnelName, remoteAddr string, interval, maxRetries int) {
-	// Stop existing keepalive for this tunnel if any
+	// Stop existing keepalive for this tunnel if any. Drain on done
+	// so the replacement doesn't race the old goroutine on m.nlHandle.
 	if runner, ok := m.keepalives[tunnelName]; ok {
 		runner.cancel()
+		<-runner.done
 	}
 
 	if maxRetries <= 0 {
@@ -652,18 +670,22 @@ func (m *Manager) startKeepalive(tunnelName, remoteAddr string, interval, maxRet
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	m.keepalives[tunnelName] = &keepaliveRunner{
 		cancel: cancel,
 		state:  state,
+		done:   done,
 	}
 
-	go m.keepaliveLoop(ctx, tunnelName, state)
+	go m.keepaliveLoop(ctx, done, tunnelName, state)
 	slog.Info("started keepalive", "tunnel", tunnelName,
 		"remote", remoteAddr, "interval", interval, "retries", maxRetries)
 }
 
 // keepaliveLoop runs periodic ICMP probes to the tunnel remote endpoint.
-func (m *Manager) keepaliveLoop(ctx context.Context, tunnelName string, state *KeepaliveState) {
+// Closes `done` when it returns so stopAllKeepalives can drain.
+func (m *Manager) keepaliveLoop(ctx context.Context, done chan struct{}, tunnelName string, state *KeepaliveState) {
+	defer close(done)
 	ticker := time.NewTicker(time.Duration(state.Interval) * time.Second)
 	defer ticker.Stop()
 
