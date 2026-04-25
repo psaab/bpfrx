@@ -810,29 +810,30 @@ int xdp_screen_prog(struct xdp_md *ctx)
 	 *   reassembled_tot_len = first_frag_ihl_bytes
 	 *                       + max(offset_bytes + frag_payload)
 	 *
-	 * Per RFC 791, non-first fragments may omit non-copied IP
-	 * options, so their ihl can be SMALLER than the first
-	 * fragment's. Trusting this fragment's tot_len (which embeds
-	 * this fragment's ihl) undercounts the reassembled size when
-	 * options exist on the first fragment.
+	 * Trade-off (per Codex iterations):
+	 *   - Threshold = 65475 (worst-case first IHL=60): catches the
+	 *     cross-IHL exploit (first frag has options, non-first
+	 *     fragments omit them) BUT false-positives on legitimate
+	 *     near-max IPv4 datagrams using standard IHL=20 — e.g.
+	 *     44×1480-byte fragments where the last fragment ends at
+	 *     offset+frag_payload=65515.
+	 *   - Threshold = 65535 with this fragment's tot_len (current
+	 *     implementation): zero false positives on legal traffic.
+	 *     MISSES the cross-IHL exploit when first fragment has IP
+	 *     options. Mitigation: SCREEN_IP_SOURCE_ROUTE drops any IP
+	 *     packet with ihl>5; enabling that screen alongside
+	 *     SCREEN_PING_OF_DEATH closes the gap (and is generally
+	 *     advisable — IP options are blocked by most middleboxes).
 	 *
-	 * Without stateful first-fragment tracking, use the worst-case
-	 * first IHL = 60 (max legal) so the threshold catches any
-	 * reassembly overflow regardless of options layout:
+	 * `offset_bytes + tot_len > 65535` is equivalent to
+	 * `offset_bytes + frag_payload + this_ihl > 65535`. IPv4 only
+	 * — IPv6 ping-of-death needs NEXTHDR_FRAGMENT parsing, filed
+	 * as follow-up.
 	 *
-	 *   offset_bytes + frag_payload > 65535 - 60 = 65475
-	 *
-	 * frag_payload is computed using THIS fragment's actual ihl
-	 * (so overestimating "data" only happens if this fragment
-	 * itself reports ihl < 5, which is malformed and dropped
-	 * elsewhere). False-positives are limited to legal max-length
-	 * datagrams that use 40+ bytes of IP options — essentially
-	 * never seen in modern traffic.
-	 *
-	 * Round 1 (#860) widened pkt_len to u32; round 2 fixed the
-	 * off-by-header miss; round 3 fixes the IHL-mismatch edge.
-	 * IPv4 only — IPv6 ping-of-death needs NEXTHDR_FRAGMENT
-	 * parsing, filed as follow-up. */
+	 * History: round 1 widened pkt_len to u32; round 2 added the
+	 * fragment-offset detection; round 3 explored an IHL=60
+	 * worst-case threshold; round 4 reverted on false-positive
+	 * grounds. */
 	if ((sc->flags & SCREEN_PING_OF_DEATH) &&
 	    meta->addr_family == AF_INET &&
 	    meta->is_fragment &&
@@ -842,10 +843,7 @@ int xdp_screen_prog(struct xdp_md *ctx)
 			__u16 frag_off = bpf_ntohs(iph->frag_off);
 			__u32 offset_bytes = (frag_off & 0x1FFF) << 3;
 			__u32 tot_len = bpf_ntohs(iph->tot_len);
-			__u32 ihl_bytes = (__u32)iph->ihl << 2;
-			__u32 frag_payload =
-				(tot_len > ihl_bytes) ? (tot_len - ihl_bytes) : 0;
-			if (offset_bytes + frag_payload > 65475)
+			if (offset_bytes + tot_len > 65535)
 				return screen_drop(meta, SCREEN_PING_OF_DEATH);
 		}
 	}
