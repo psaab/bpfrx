@@ -147,23 +147,30 @@ histogram-merge via netperf `-V`.
    classification path.
 3. **Cool-down.** 10 s idle between phases so any CoS queue
    backlog drains.
-4. **Loaded — proper warm-up sequencing (Codex R1#1 / R2 A1):**
-   - Start `iperf3 -c <target> -p 5201 -P 100 -t 60 -i 1 -J`
-     in background. Run length is exactly 60 s = 10 s warm-up
-     + 50 s mouse-load (Codex R2 B2/B5: prior plan had 80 s,
-     fixed).
+4. **Loaded — proper warm-up sequencing (Codex R1#1 / R2 A1
+   / R3#1):**
+   - Start `iperf3 -c <target> -p 5201 -P 100 -t 90 -i 1 -J`
+     in background. The `-t 90` is a safety upper bound: the
+     harness will SIGTERM iperf3 when mice finish (R3#1 fix:
+     prior plan had a fixed -t conflicting with variable
+     gate-firing time).
    - **Cwnd-settle gate**: poll the iperf3 JSON output for
      completed `intervals[]` entries (each represents a 1 s
      summary). Compute `agg_t = intervals[t].sum.bits_per_second`
-     (the 100-stream aggregate at second `t`). Mice start when
-     **3 consecutive `agg_t` samples are within ±10% of their
-     median AND that median is ≥ 0.5 Gb/s** (the latter rules
-     out the cold-start ramp). If the gate doesn't fire within
-     20 s, abort the rep and mark it invalid.
+     (the 100-stream aggregate at second `t`). Mice start
+     when **3 consecutive `agg_t` samples are within ±10% of
+     their median AND that median is ≥ 0.5 Gb/s**. If the gate
+     doesn't fire within 20 s, abort the rep and mark it
+     invalid.
+   - Record `t_g` = the iperf3 elapsed second when the gate
+     passed (typically ~3-10 s).
    - Start 100 paced netperf mice for 50 s.
-   - When mice finish, also wait for iperf3 to finish (it will
-     stop ~1 s later, since mice started at t=10s and run for
-     50s, ending at t=60s = same as iperf3 -t 60).
+   - When mice finish at `t_g + 50` (iperf3-clock), SIGTERM
+     iperf3.
+   - Elephant CoV is computed using ONLY iperf3 per-stream
+     `intervals[]` entries within `[t_g, t_g + 50]` — this
+     excludes the warm-up and any post-mice tail (R3#1 +
+     R2 B5 closure).
 5. **Cool-down.** 10 s idle. Drain math: queue 4 buffer is
    1.19 MiB observed live; at 1 Gb/s drain rate the time to
    drain a full buffer is ≈ 10 ms. 10 s is ~1000× the worst-
@@ -269,55 +276,181 @@ environmental issue requiring fix before continuing).
 
 ## 6. Implementation outline
 
-### 6.1 Preflight (Codex R1#8 / R2 A6/B1/C1/C2/N1)
+### 6.0 Remote-process management mechanics (R3#4-#9, MED#10/14)
+
+**Container processes (mpstat, netperf, iperf3, netserver)**
+run inside `loss:cluster-userspace-host` (mice, mpstat) or the
+iperf3-target instance (netserver). The harness orchestrates
+from the bpfrx-fw0 host (the dev machine where this script
+runs).
+
+For each backgrounded container process, the launch pattern is:
+
+```bash
+incus exec ${instance} -- bash -c '
+    <cmd> > /tmp/${out} 2>&1 &
+    echo $! > /tmp/${pidfile}
+'
+```
+
+The `$!` captures the **container-namespace PID**. To stop:
+
+```bash
+incus exec ${instance} -- bash -c 'kill -TERM $(cat /tmp/${pidfile}) 2>/dev/null'
+incus exec ${instance} -- rm -f /tmp/${pidfile}
+```
+
+To collect output back to the host:
+
+```bash
+incus file pull ${instance}/tmp/${out} ${HOST_OUT_DIR}/${out}
+```
+
+This pattern is used uniformly for every remote backgrounded
+process. The harness tracks the (instance, pidfile, out-path)
+tuple per process so cleanup can iterate them.
+
+**100 concurrent netperf launch** (R3 MED#10): use a
+controlled-startup pattern to minimize stagger:
+
+```bash
+# Stage 1: write 100 pidfile names + commands to a job-list
+# Stage 2: launch all 100 in a single bash invocation that
+# backgrounds each and captures the PID:
+incus exec ${SOURCE_INSTANCE} -- bash -c '
+    declare -a PIDS
+    for i in $(seq 1 100); do
+        netperf -H 172.16.80.200 -p 12866 -t TCP_RR -l 50 \
+            -- -r 64,64 -P 12865 -O <fields> -b 1 -w 1000 \
+            > /tmp/100e100m/mouse-${i}.txt 2>&1 &
+        PIDS[i]=$!
+    done
+    # Write all PIDs to one file the harness can read
+    printf "%s\n" "${PIDS[@]}" > /tmp/100e100m/mouse-pids.txt
+    # Wait for all
+    wait "${PIDS[@]}"
+'
+```
+
+The 100 backgrounds inside ONE `bash -c` minimize
+startup-time variance (no per-iteration `incus exec` overhead).
+
+**cli binary path** (R3 MED#14): use `/usr/local/sbin/cli` —
+that is the path the cluster-deploy script installs to
+(`test/incus/cluster-setup.sh:644`) and the path on the
+production-deployed VMs. `/usr/local/bin/cli` may shadow on
+some hosts (per global memory) but on the firewall instances
+the sbin path is canonical.
+
+**cli config-mode transactions** (R3#4-5): `cli rollback`
+without an enclosing `configure ... commit ... exit` does NOT
+activate the rollback (per `pkg/configstore/store.go:893-909`,
+rollback only mutates candidate state). All harness cli
+config-mode operations use the heredoc pattern:
+
+```bash
+incus exec loss:xpf-userspace-fw0 -- bash -c "/usr/local/sbin/cli <<'EOF'
+configure
+<set/delete commands>
+commit
+exit
+EOF"
+```
+
+For rollback specifically:
+
+```bash
+incus exec loss:xpf-userspace-fw0 -- bash -c "/usr/local/sbin/cli <<'EOF'
+configure
+rollback 1
+commit
+exit
+EOF"
+```
+
+`cli -c <single-cmd>` is reserved for **operational** commands
+only (e.g. `cli -c 'show class-of-service interface'`).
+
+
+
+### 6.1 Preflight
+
+Order matters (R3#7): register the EXIT trap BEFORE any
+mutation, so a failure between step 1 and step N still leaves
+the system in a clean state.
 
 ```
-1. Verify both firewall VMs RUNNING via `incus list`.
-2. SSH into fw0: assert `systemctl is-active xpfd` returns
-   "active". Same for fw1.
-3. Verify RG0 primary == node0 via cli on fw0; fail loudly
-   if not (manual operator action needed).
-4. Track harness PIDs (R2 A6): the harness assigns itself a
-   process group via `setsid` at start; teardown only sends
-   signals to that pgid. Stale processes from prior CRASHED
-   runs of THIS harness are cleaned by reading
-   /tmp/100e100m/last-pgid (written on each successful start)
-   and `kill -KILL -<pgid>` only that. Do NOT use a global
-   `pkill iperf3` — the loss: remote may host other tenants.
-5. Verify the iperf3 target VM is reachable. Resolve which
-   incus instance owns 172.16.80.200 by reading
-   `loss-userspace-cluster.env` (or hard-coded constant) and
-   `incus exec` into that instance for management. If the
-   instance is not listed in env, fail preflight with a clear
-   message (R2 N1).
-6. On the iperf3 target instance:
-   a. `command -v netserver` || `apt-get update -qq` && `apt-get install -y netperf` (R2 C1: with explicit
-      apt-get update and exit-code check).
-   b. Kill stale netserver in our pgid only.
-   c. Start netserver on port 12866 (`netserver -p 12866`) and
-      verify with `nc -zv 172.16.80.200 12866`.
-7. On `cluster-userspace-host`:
-   a. `command -v netperf` || `apt-get update -qq && apt-get install -y netperf`. Capture stderr; abort
-      with logged error on failure (R2 C1).
-   b. `command -v mpstat` || `apt-get install -y sysstat`
-      (R2 B1).
-8. Apply CoS config via `apply-cos-config.sh` (idempotent).
-9. Apply mouse classifier extension (§4.4) atomically via cli
-   `commit check && commit`.
-10. Register an EXIT trap (R2 C2) that on any exit (success
-    or failure) issues a single `cli` rollback that removes
-    the mouse-classifier term added in step 9, restoring the
-    base CoS fixture. Also kills the harness pgid and
-    netserver-in-our-pgid on the target.
-11. Verify `cli show class-of-service interface` reports
-    queue 4 owner=1, exact=yes, transmit-rate=1Gb/s. Fail if
-    not.
-12. Assert iperf-a queue runtime backlog == 0 (queued_pkts ==
-    0 in the show output) — if non-zero, sleep 5 s and retry
-    up to 3 times.
-13. Snapshot baseline cluster-event log offset on fw0/fw1
+1. Capture run timestamp <run-ts>; create
+   /tmp/100e100m/<run-ts>/.
+2. Set tracker variables: MOUSE_FILTER_APPLIED=0,
+   PIDFILES_TO_CLEAN=() (an array of (instance, pidfile)
+   tuples), HARNESS_PGID=$(setsid bash -c 'echo $$').
+3. Register EXIT trap (R3#7 / R2 C2). Trap actions, in order:
+   a. For each tracked (instance, pidfile): `incus exec
+      ${instance} -- bash -c 'kill -TERM $(cat /tmp/${pf})
+      2>/dev/null; rm -f /tmp/${pf}'`.
+   b. If MOUSE_FILTER_APPLIED == 1: roll back via the
+      heredoc pattern in §6.0 (configure / rollback 1 /
+      commit / exit). Do NOT touch the base CoS — that is
+      intentionally persistent post-harness.
+   c. Pull any container output files the harness recorded
+      so a debug snapshot is preserved on partial failure.
+4. Verify both firewall VMs RUNNING via `incus list`.
+5. Assert `systemctl is-active xpfd` returns "active" on
+   fw0 AND fw1 (R3 finding closure for incomplete daemon
+   state).
+6. Verify RG0 primary == node0 via the operational cli
+   (`/usr/local/sbin/cli -c 'show chassis cluster status'`);
+   fail loudly if not.
+7. Resolve iperf3 target instance (R3#6): read
+   `IPERF3_TARGET_INSTANCE` from
+   `loss-userspace-cluster.env` (which the harness PR
+   adds — see §13). If unset or instance not RUNNING,
+   abort with "iperf3 target instance not configured;
+   add IPERF3_TARGET_INSTANCE to env" message.
+8. Install required tools (R3 MED#11 fix: explicit `if`,
+   not `||/&&`):
+   a. On iperf3 target instance:
+      ```
+      if ! incus exec ${IPERF3_TARGET_INSTANCE} -- \
+           command -v netserver >/dev/null 2>&1; then
+          incus exec ${IPERF3_TARGET_INSTANCE} -- \
+              apt-get update -qq 2>/tmp/apt-update.err || \
+              { echo "apt-get update failed: $(cat /tmp/apt-update.err)" >&2; exit 1; }
+          incus exec ${IPERF3_TARGET_INSTANCE} -- \
+              apt-get install -y netperf || \
+              { echo "netperf install failed on target" >&2; exit 1; }
+      fi
+      ```
+   b. Same pattern on `cluster-userspace-host` for
+      `netperf` and `sysstat` (provides `mpstat`).
+9. On iperf3 target: start netserver on port 12866 using
+   the pidfile pattern from §6.0. Verify with
+   `nc -zv 172.16.80.200 12866` from the source.
+10. Apply base CoS via `apply-cos-config.sh` (idempotent).
+11. Apply mouse classifier extension (§4.4) via heredoc:
+    ```
+    /usr/local/sbin/cli <<'EOF'
+    configure
+    set firewall family inet filter bandwidth-output term mouse from destination-port 12865-12866
+    set firewall family inet filter bandwidth-output term mouse then forwarding-class iperf-a
+    commit check
+    commit
+    exit
+    EOF
+    ```
+    On success, set MOUSE_FILTER_APPLIED=1. On failure,
+    abort (the EXIT trap will not roll back since the
+    flag is still 0).
+12. Verify `cli -c 'show class-of-service interface'`
+    reports queue 4 owner=1, exact=yes, transmit-rate=
+    1 Gb/s. Fail if not.
+13. Assert iperf-a queue runtime backlog == 0 (queued_pkts
+    == 0) — if non-zero, sleep 5 s and retry up to 3 times.
+14. Capture journalctl baseline timestamp for fw0 and fw1
     so per-rep failover detection (R2 A7) can grep
-    journalctl --since=<rep_T0> for cluster transition lines.
+    `journalctl --since=<rep_T0>` for cluster transition
+    lines.
 ```
 
 ### 6.2 Per-rep loop
@@ -374,17 +507,49 @@ start, so re-runs do not overwrite (R2 B3).
    why).
 ```
 
-### 6.4 Run count (Codex finding #1)
+### 6.4 Run count, IQR, and auto-extension
 
-**Default 10 reps.** Total runtime ≈ 10 × (60 + 10 + 80 + 10) =
-~27 min. Plan §3 reports use 10 reps minimum. If the variance
-across the 10 reps gives an IQR > 50% of the median for any
-headline metric, the harness emits a warning recommending
-re-running with `--reps 20`.
+**Default 10 reps.** Total runtime ≈ 10 × (60 + 10 + 70 + 10)
+≈ 25 min.
 
-A future enhancement (out of scope for this PR) is to support
-adaptive bootstrap with a 95% CI stopping rule; for now we
-stick with fixed-N reps and explicit IQR reporting.
+**IQR definition** (R3 MED#12): all percentile reporting uses
+**nearest-rank percentiles**:
+- `p25 = sorted_values[ceil(0.25 × N) − 1]`
+- `p50 = sorted_values[ceil(0.50 × N) − 1]`
+- `p75 = sorted_values[ceil(0.75 × N) − 1]`
+- `p90 = sorted_values[ceil(0.90 × N) − 1]`
+- `IQR = p75 − p25`
+
+This convention is applied consistently:
+- Across the 100 mice's per-process p99 values within a phase
+  (10 reps × 100 mice values).
+- Across reps for any metric (e.g. across-reps median elephant
+  CoV).
+
+**Minimum-valid-rep auto-extension** (R3 MED#13): if fewer
+than **7 reps are valid** after the initial 10, the harness
+runs additional reps in batches of 5 until at least 7 reps
+are valid OR until 20 reps total have been attempted. If 20
+reps still don't yield 7 valid, the harness emits FAIL and
+the operator must investigate environmental issues (see §5.4
+validity flags).
+
+**IQR warning destination** (R3 LOW#15): if IQR > 50% of
+median for any headline metric, the harness emits a
+human-readable warning to **stderr** (not affecting exit
+status) AND records `iqr_warning: true` per-metric in the
+JSON summary. Operator decides whether to re-run with more
+reps; the test does not auto-fail on high IQR.
+
+**Artifact retention** (R3 LOW#16):
+- Default: keep the most recent 5 run directories under
+  `/tmp/100e100m/`; older runs auto-pruned at start.
+- `--keep-artifacts` flag disables auto-pruning.
+- Per-run directory size is bounded (~6 MB max with 10 reps)
+  so 5 runs ≤ 30 MB.
+
+A future enhancement (out of scope) is adaptive bootstrap
+with a 95% CI stopping rule.
 
 ## 7. Reproducibility + observability
 
@@ -416,12 +581,15 @@ stick with fixed-N reps and explicit IQR reporting.
   debugging without paying the full 27-minute test cost.
 - Baseline measurement (with the **current** code, no algorithm
   change) is captured and committed to the PR description as a
-  table:
+  table (R3#2/3 fix: aligned with §5.2/§5.3):
   - elephant aggregate Gbps (median, IQR)
   - elephant per-flow CoV (median, IQR)
-  - mouse median-p99 baseline µs
-  - mouse median-p99 loaded µs
-  - mouse median-p99 delta (µs and × factor)
+  - mouse `p99_p90` baseline µs (median across reps, IQR)
+  - mouse `p99_p90` loaded µs (median across reps, IQR)
+  - mouse `p99_p90` delta (µs)
+  - mouse `p99_max` baseline / loaded / delta (µs)
+  - rep validity table (which reps were valid; reasons for
+    any drops)
 - Rep validity table showing which reps were valid and why any
   were dropped.
 - The PR body explicitly says "this PR does not close
@@ -518,3 +686,37 @@ out of scope for this PR.
 | C2| HIGH| No EXIT trap for filter teardown| EXIT trap in step 10 of preflight: cli rollback removes mouse classifier term, kills pgid |
 | C3| LOW | No --dry-run for development  | `--dry-run` flag added: runs preflight + filter apply + rollback only |
 | N1| HIGH| netserver target undefined    | Preflight reads target from env, `incus exec` for management, fails clearly if not present |
+
+### Round 3 (16 findings)
+
+| # | Sev | Topic                            | Resolution |
+|---|-----|----------------------------------|------------|
+| 1 | HIGH| Variable cwnd-settle vs fixed -t | iperf3 -t 90 (safety upper bound); harness SIGTERMs when mice finish; CoV computed only over [t_g, t_g+50] window |
+| 2 | HIGH| §8 acceptance contradicts §5.2/3 | §8 table now uses p99_p90 + p99_max (median-of-p99 removed everywhere) |
+| 3 | HIGH| Median-p99 still in headline     | Median removed from headline; only p99_p90 + p99_max reported as deltas |
+| 4 | HIGH| `cli rollback` non-interactive   | Heredoc pattern (`configure / rollback 1 / commit / exit`) documented in §6.0 |
+| 5 | HIGH| `cli -c 'rollback'` doesn't work | Same fix as #4; -c reserved for operational commands only |
+| 6 | HIGH| env file lacks IPERF3_TARGET     | Add `IPERF3_TARGET_INSTANCE` to `loss-userspace-cluster.env` (§13) |
+| 7 | HIGH| EXIT trap registered too late    | Trap registered in step 3 of preflight, BEFORE any cli mutation. Tracker flag MOUSE_FILTER_APPLIED gates rollback |
+| 8 | HIGH| Container output collection      | §6.0 pins `incus file pull` from container `/tmp/...` to host `/tmp/100e100m/<run-ts>/...` |
+| 9 | HIGH| mpstat PID is container-side     | §6.0 pins pidfile-on-container pattern: write `$!` from `incus exec`, kill via `incus exec ... kill -TERM $(cat pidfile)` |
+| 10| MED | 100 netperf launch primitive     | §6.0 pins single-`bash -c` background-loop pattern; minimizes startup stagger |
+| 11| MED | apt-get precedence bug           | §6.1 step 8 uses explicit `if ! command -v ...; then ... fi` with stderr capture |
+| 12| MED | IQR not formally defined         | §6.4 defines nearest-rank percentiles + IQR = p75 − p25 |
+| 13| MED | 7 valid reps borderline          | §6.4 auto-extends in batches of 5 up to 20 total if <7 valid |
+| 14| MED | cli binary path unspecified      | §6.0 pins `/usr/local/sbin/cli`; -c only for operational commands |
+| 15| LOW | IQR-warning action               | §6.4: stderr warning + `iqr_warning: true` in JSON summary; no exit-status change |
+| 16| LOW | No artifact cleanup              | §6.4: keep last 5 run dirs by default; `--keep-artifacts` flag |
+
+## 13. Environmental config addition
+
+This PR adds one variable to `test/incus/loss-userspace-cluster.env`:
+
+```
+# iperf3 / netperf target instance (must be RUNNING and have
+# 172.16.80.200 reachable). Required by test-100e100m.sh.
+IPERF3_TARGET_INSTANCE=<name>
+```
+
+The harness sources the env file via the standard
+`BPFRX_CLUSTER_ENV` mechanism used by `cluster-setup.sh`.
