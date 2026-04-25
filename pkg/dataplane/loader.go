@@ -270,8 +270,29 @@ func (m *Manager) DetachXDP(ifindex int) error {
 }
 
 // setXDPAttachedFlag sets or clears IFACE_FLAG_XDP_ATTACHED on every
-// iface_zone_map entry whose key.Ifindex matches. Covers all VLAN
-// sub-interface entries derived from this physical ifindex.
+// iface_zone_map entry whose key.Ifindex matches.
+//
+// xpf attaches XDP only to physical ifindexes (PFs, virtio NICs);
+// the compiler at pkg/dataplane/compiler_iface.go writes
+// iface_zone_map entries keyed by {parent_ifindex, vlan_id} for
+// every VLAN sub-interface of that parent. Iterating by
+// `key.Ifindex == ifindex` therefore covers BOTH the native-VLAN
+// entry (vlan_id=0) AND every VLAN sub-iface entry derived from this
+// physical parent — which is exactly what tc_main needs to gate the
+// tunnel-egress bypass for both untagged and VLAN-tagged ingress
+// (after vlan_iface_map resolution).
+//
+// If a future configuration ever attached XDP to a VLAN sub-iface
+// directly, no iface_zone_map entry would match key.Ifindex ==
+// sub_ifindex, the flag would never get set, and the tc_main bypass
+// would deny — packets get full screen/conntrack treatment, which is
+// safe (more enforcement, not less) but loses the optimization.
+//
+// Iterator and per-entry Update errors are logged at WARN. The flag
+// is best-effort (a leftover stale flag after DetachXDP only matters
+// if the same ifindex is re-bound to a different XDP program later;
+// the next AttachXDP/SetZone re-establishes the correct value), so
+// we don't fail the surrounding operation.
 func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) {
 	zm, ok := m.maps["iface_zone_map"]
 	if !ok {
@@ -301,8 +322,15 @@ func (m *Manager) setXDPAttachedFlag(ifindex int, attached bool) {
 		val.Flags = newFlags
 		updates = append(updates, kv{k: key, v: val})
 	}
+	if err := iter.Err(); err != nil {
+		slog.Warn("setXDPAttachedFlag: iface_zone_map iterate failed",
+			"ifindex", ifindex, "attached", attached, "err", err)
+	}
 	for _, u := range updates {
-		zm.Update(u.k, u.v, ebpf.UpdateAny)
+		if err := zm.Update(u.k, u.v, ebpf.UpdateAny); err != nil {
+			slog.Warn("setXDPAttachedFlag: iface_zone_map update failed",
+				"ifindex", ifindex, "vlan", u.k.VlanID, "attached", attached, "err", err)
+		}
 	}
 }
 
