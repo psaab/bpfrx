@@ -55,7 +55,8 @@ type Config struct {
 	IPsec     *ipsec.Manager
 	DHCP      *dhcp.Manager
 	VRRPMgr   *vrrp.Manager       // native VRRP manager
-	ApplyFn   func(*config.Config) // daemon's applyConfig callback
+	ApplyFn    func(*config.Config)                        // daemon's applyConfig callback (sync)
+	ApplyFnCtx func(context.Context, *config.Config) error // #846: context-aware variant for HTTP commit handlers
 	// CompileHealthFn surfaces dataplane compile state via /health (#758).
 	// Returning a snapshot with EverSucceeded=false and FailureCount>0
 	// makes /health return 503 so operators see the degraded state
@@ -78,6 +79,7 @@ type Server struct {
 	dhcp        *dhcp.Manager
 	vrrpMgr         *vrrp.Manager
 	applyFn         func(*config.Config)
+	applyFnCtx      func(context.Context, *config.Config) error
 	compileHealthFn func() CompileHealthSnapshot
 	startTime       time.Time
 }
@@ -95,6 +97,7 @@ func NewServer(cfg Config) *Server {
 		dhcp:      cfg.DHCP,
 		vrrpMgr:         cfg.VRRPMgr,
 		applyFn:         cfg.ApplyFn,
+		applyFnCtx:      cfg.ApplyFnCtx,
 		compileHealthFn: cfg.CompileHealthFn,
 		startTime:       time.Now(),
 	}

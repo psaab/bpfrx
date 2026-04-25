@@ -49,7 +49,8 @@ type Config struct {
 	RPMResultsFn     func() []*rpm.ProbeResult        // returns live RPM results
 	FeedsFn          func() map[string]feeds.FeedInfo // returns live feed status
 	LLDPNeighborsFn  func() []*lldp.Neighbor          // returns live LLDP neighbors
-	ApplyFn          func(*config.Config)             // daemon's applyConfig callback
+	ApplyFn          func(*config.Config)             // daemon's applyConfig callback (sync)
+	ApplyFnCtx       func(context.Context, *config.Config) error // #846: context-aware variant; commit handlers propagate request ctx so client cancel/timeout doesn't queue forever
 	VRRPMgr          *vrrp.Manager                    // native VRRP manager
 	RAMgr            *ra.Manager                      // embedded RA sender manager
 	Version          string                           // software version string
@@ -75,6 +76,7 @@ type Server struct {
 	feedsFn            func() map[string]feeds.FeedInfo
 	lldpNeighborsFn    func() []*lldp.Neighbor
 	applyFn            func(*config.Config)
+	applyFnCtx         func(context.Context, *config.Config) error
 	vrrpMgr            *vrrp.Manager
 	raMgr              *ra.Manager
 	fwdSampler         *fwdstatus.Sampler
@@ -136,6 +138,7 @@ func NewServer(addr string, cfg Config) *Server {
 		feedsFn:          cfg.FeedsFn,
 		lldpNeighborsFn:  cfg.LLDPNeighborsFn,
 		applyFn:          cfg.ApplyFn,
+		applyFnCtx:       cfg.ApplyFnCtx,
 		vrrpMgr:          cfg.VRRPMgr,
 		raMgr:            cfg.RAMgr,
 		fwdSampler:       cfg.FwdSampler,
