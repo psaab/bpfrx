@@ -278,36 +278,112 @@ pub(super) fn afd_threshold(state: &AFDLiteState) -> u64 { ... }  // helper for 
 
 ### 6.3 Edits to `userspace-dp/src/afxdp/tx.rs`
 
-**Pop commit-points** — call `afd_account_dispatch` AFTER
-the TX-ring insertion succeeds at each of the existing
-sites identified by Codex R1 (line numbers approximate
-against current HEAD; verify before editing):
+#### 6.3.1 FIFO-pop accounting (single-packet path)
 
-- `tx.rs:2926` — successful pop commit (primary pop path).
-- `tx.rs:2957` — successful pop commit (alt path).
-- `tx.rs:2983` — successful pop commit.
-- `tx.rs:3012` — successful pop commit.
-- `tx.rs:3129` — successful pop commit (forwarding).
-- `tx.rs:3170` — successful pop commit (forwarding).
-- `tx.rs:3214` — successful pop commit (forwarding).
-- `tx.rs:3272` — successful pop commit (forwarding).
+For the FIFO single-packet pop sites, the accounting hook
+goes inside the success branch immediately after the per-
+packet `bytes` sum is incremented. The R1-identified sites
+in this category map to the actual success-after-insert
+points:
+
+- `tx.rs:2922-2927` (FIFO local request: after
+  `sent_bytes += req.bytes.len() as u64` per Codex R3
+  Area 6, in the `Some(Local(req))` branch).
+- The matching prepared-frame branch in the same FIFO loop.
 
 At each, gate on `queue.flow_fair && !queue.shared_exact`
-to avoid touching out-of-scope queues.
+and call `afd_account_dispatch(state, bucket, bytes,
+now_ns)`. The `bucket` here is computed via
+`cos_flow_bucket_index(queue.flow_hash_seed, flow_key)`
+on the popped item, before the item is consumed.
 
-**Failure / rollback paths** — *do nothing*. Per §5.2,
-the no-rollback design means failed TX simply doesn't
-account.
+#### 6.3.2 Batch-pop accounting (R3 HIGH 4 fix)
 
-**Selection sites**:
+The R3 review correctly flagged that the batch-pop sites
+at `tx.rs:3129/3170` happen DURING batch construction
+(pre-TX), while the true success sites at `tx.rs:3214/3272`
+only have aggregate `(packets, bytes)` and retry-tail state
+— per-flow bucket identity is lost by then.
+
+**Redesigned batch accounting (matches the no-rollback
+design)**:
+
+1. **During pop**: each batch-pop iteration that adds an
+   item to the in-flight batch buffer ALSO appends a
+   `(bucket_idx, bytes)` tuple to a per-batch staging
+   buffer. The staging buffer is a small `SmallVec` or
+   stack-allocated array (typical batch size ≤ 64; bound
+   to TX_BATCH_SIZE = 256 worst case).
+2. **After `submit_cos_batch` returns the accepted count
+   `N`**: iterate the first `N` staging tuples and call
+   `afd_account_dispatch` for each. The unaccepted tail
+   (positions N..staging_len) is left untouched — those
+   items are pushed back via push_front (existing code),
+   AFD never accounted them.
+3. **On full-batch failure (`inserted == 0`)**: don't
+   iterate at all. Staging buffer dropped. AFD untouched.
+
+This matches the no-rollback contract: AFD is only
+incremented for bytes that successfully transmitted. Partial
+batch acceptance is correctly handled.
+
+**Per-batch staging buffer**: a new `Vec<(u16, u32)>`
+(bucket_idx + bytes_u32, since per-packet bytes ≤ 9000)
+allocated once and reused across batches via clear/reuse.
+Add as a field on `BindingWorker` or as a function-local
+that's reused across calls. Hot-path overhead: one extra
+push-tuple per packet popped (8-16 bytes); insignificant.
+
+**Sites to edit**:
+- `tx.rs:3129/3170` (pop-during-batch): stage tuple.
+- `tx.rs:3214/3272` (submit success): iterate staging
+  prefix N and call `afd_account_dispatch`.
+- `tx.rs:6206/6215/6433/6442` (settle / partial-success):
+  these may also need staging-prefix accounting depending
+  on which path they're on. Verify against actual code at
+  implementation time.
+
+#### 6.3.3 Failure / rollback paths
+
+Per §5.2, do nothing. Failed TX simply doesn't account.
+The staging buffer for batch paths is dropped/cleared.
+
+#### 6.3.4 Selection sites
+
 - `cos_queue_front` (`tx.rs:4262`) → call
   `cos_queue_select_bucket(queue, now_ns)`.
 - `cos_queue_pop_front_inner` (`tx.rs:4464`-area) → same.
 
 The `now_ns` argument is plumbed from the existing call
-chain. Worker hot-paths already have a `now_ns` value
-(from the polling loop's `monotonic_ns()`); pass it
-through.
+chain. Per Codex R3 Area 3, this also requires threading
+through `build_cos_batch_from_queue` and the drain helpers
+(call sites at `tx.rs:2602/2780/3102`). Worker hot-paths
+already have a `now_ns` (from the polling loop's
+`monotonic_ns()`); pass through. Bounded surface — every
+caller already has a clock value at hand.
+
+#### 6.3.5 One-packet-stale on selection (R3 MED 10)
+
+Selection (`cos_queue_select_bucket`) reads `now_ns` but
+does **not** rotate. Rotation happens only inside
+`afd_account_dispatch`, which runs on the success path
+AFTER selection. Consequence: the first selection AFTER a
+window expiry (e.g. window N→N+1 boundary) uses stale
+window-N counters. Once that packet's dispatch hook fires,
+rotation moves state to N+1; subsequent selections are
+fresh.
+
+This is acceptable:
+- 2 ms window × 150 K pps = ~300 packets per window. One
+  stale-selection per window is < 0.4 % of selections.
+- The stale data biases ONE selection toward whatever
+  was over-share at the end of the previous window;
+  bounded by the previous window's threshold (already a
+  fair-share-ish value).
+
+Documented; not mitigated. Mitigation would require
+`cos_queue_front` to take `&mut CoSQueueRuntime`, which
+broadens the call-site change beyond v3 scope.
 
 ### 6.4 Stale-comment cleanup (Codex R2 #8)
 
@@ -364,6 +440,16 @@ state.
 14. `dispatch_success_accounts` — simulate a successful
     TX; assert `bytes_per_flow[b]` and `bytes_total`
     incremented; `active_count` incremented if 0→1.
+15. `batch_partial_success_accounts_only_accepted_prefix`
+    (Codex R3 MED 9): build a staging buffer of 4 entries
+    (3 distinct flow buckets), simulate `submit_cos_batch`
+    accepting only 2 of 4. Assert AFD bytes accounted for
+    only the first 2 staging tuples; the unaccepted tail
+    leaves AFD untouched. Asserts the Codex R3 HIGH 4 fix.
+16. `batch_full_failure_accounts_nothing` — simulate
+    `inserted == 0`. Assert AFD state unchanged.
+17. `batch_full_success_accounts_all` — simulate
+    `inserted == staging_len`. Assert all tuples accounted.
 
 ### 7.3 Test plumbing
 
@@ -378,23 +464,37 @@ test setup for flow-fair-non-shared-exact cases.
 - All Go tests pass.
 - `cargo build --release` clean.
 - Live deploy on `loss:xpf-userspace-fw0/fw1`:
-  - All four CoS classes covered, 16 streams × 60 s × 10 runs
-    each:
-    - **p5201 (iperf-a, 1 Gb/s)**: CoV ≤ 15 % on ≥ 8 of 10.
-    - **p5202 (iperf-b, 10 Gb/s)**: CoV ≤ 25 % on ≥ 8 of 10.
-    - **p5203 (iperf-c, 25 Gb/s)**: CoV ≤ 25 % on ≥ 8 of 10.
-    - **p5204 (best-effort, 100 Mb/s)**: CoV ≤ 25 % on ≥ 8
-      of 10.
-  - **p5202 128 streams 60 s × 1**: CoV ≤ 16.6 %
-    (#900 baseline; do not regress).
-  - **No regression** vs the equivalent baseline (run with
-    AFD-lite disabled at compile-time via a feature gate, OR
-    captured before this PR's deploy) on ANY of the four
-    classes' CoV or aggregate throughput.
-  - 0 collapses (every stream ≥ 1 Mbps for shaped > 16 Mbps;
-    every stream ≥ shaped/16 × 0.5 for narrower classes).
-  - Aggregate per-class throughput ≥ 0.95 × shaped rate.
-  - 0 retransmit regression.
+
+**Merge gates (block merge if not met) — Codex R3 MED 8 fix**:
+The merge gate is **non-regression**, not absolute CoV.
+AFD-lite must not make ANY of the four classes worse than
+the captured-just-before-deploy baseline. Specifically:
+  - CoV per class: AFD-lite-enabled CoV ≤ baseline CoV +
+    1 percentage point on every class (allows for
+    measurement noise; protects against actual regression).
+  - 0 stream collapses on every class (no flow drops below
+    a sentinel threshold).
+  - Aggregate per-class throughput ≥ 0.95 × baseline (no
+    throughput regression worth a percentage point).
+  - 0 retransmit regression vs baseline median.
+  - All Rust + Go unit tests pass.
+  - `make test-failover`: pass.
+
+**Targets (reported, not gating)**:
+  - p5201 CoV ≤ 15 % on ≥ 8 of 10 runs (per #786 Slice C
+    convention).
+  - p5202 CoV ≤ 25 % on ≥ 8 of 10 runs.
+  - p5203 CoV ≤ 25 % on ≥ 8 of 10 runs.
+  - p5204 CoV ≤ 25 % on ≥ 8 of 10 runs.
+  - p5202 128 streams 60 s × 1: CoV ≤ 16.6 % (#900 regression
+    floor — promoted to merge gate via the non-regression
+    rule above).
+
+§9 estimates the realistic gain at 1-3 percentage points;
+the targets above are the v1/v2 design goals which are
+optimistic for v3's reduced single-binding scope. Reviewers
+focus on the non-regression merge gate; the targets are
+ambitions to compare against, not pass/fail thresholds.
 - `make test-failover`: pass (defense — touching the
   CoS dataplane).
 - Codex hostile plan + code review: PLAN-READY YES,
@@ -476,3 +576,18 @@ addressed below.
 | 7 | LOW | Period counter wrap                  | OUT-OF-SCOPE-V3 — period_start_ns is plain u64 ns, no period index |
 | 8 | MED | Stale comments in source             | RESOLVED — §6.4 cleans up `types.rs:1037-1040` + `tx.rs:5326-5329` |
 | 9 | HIGH| Lease plumbing + epsilon shift bug   | RESOLVED — §5.1 `NUM/DEN` fraction (no shift sentinel); §6.3 plumbs `now_ns` from existing call chain (no lease needed) |
+
+### Round 3 (1 HIGH + 3 MED + 2 LOW; v3 plan)
+
+| # | Sev | Topic                                | Resolution |
+|---|-----|--------------------------------------|-----------|
+| 1 | OK  | Single-threaded ownership            | Confirmed via `worker.rs:21,679,984`; coordinator reads only ArcSwap snapshot |
+| 2 | LOW | `Box<AFDLiteState>` clone semantics  | Plan rewording: not "repeatedly cloned" — `CoSQueueRuntime` is rebuilt fresh on plan reconciliation. Box is for off-line allocation, not for sharing. |
+| 3 | LOW | now_ns plumbing surface              | §6.3.4: explicit list of caller sites (build_cos_batch_from_queue, drain helpers at tx.rs:2602/2780/3102); bounded |
+| 4 | HIGH| Pop commit-points conflate pre/post-TX | §6.3.2 redesigned: per-batch staging buffer of (bucket, bytes) tuples; iterate accepted prefix N at submit-success and account only those. Matches no-rollback contract |
+| 5 | OK  | active_count maintenance correctness | Confirmed under single-threaded model |
+| 6 | OK  | Bytes accounting timing              | §6.3.1 specifies the FIFO success branch (after `sent_bytes += req.bytes.len()`) per Area 6 |
+| 7 | OK  | Stale-comment cleanup is comment-only| Confirmed; §6.4 unchanged |
+| 8 | MED | Acceptance bar inconsistency         | §8 split into "merge gates" (non-regression: ≤ baseline + 1pp, no collapses, ≥0.95× throughput, no retransmit regression) and "targets" (the absolute CoV bars from #786 Slice C, reported but non-gating) |
+| 9 | MED | Partial TX-ring success test gap     | §7 tests #15 (partial), #16 (full failure), #17 (full success) added |
+| 10| MED | now_ns unused in selection           | §6.3.5: documented one-packet-stale on selection. ~0.4% of selections at 2ms window × 150K pps. Acceptable; mitigation requires &mut signature change beyond v3 scope |
