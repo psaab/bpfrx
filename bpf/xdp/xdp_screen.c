@@ -805,35 +805,20 @@ int xdp_screen_prog(struct xdp_md *ctx)
 
 	/* Ping of Death: a fragment whose contribution to the
 	 * reassembled IP datagram would exceed 65535 bytes. xpf
-	 * doesn't reassemble, so we detect per-fragment:
+	 * doesn't reassemble; check per-fragment:
 	 *
-	 *   reassembled_tot_len = first_frag_ihl_bytes
-	 *                       + max(offset_bytes + frag_payload)
+	 *   reassembled_tot_len = first_frag_ihl + max(offset + payload)
+	 *   ≈ offset_bytes + tot_len  (when this fragment's ihl matches
+	 *     the first fragment's — the typical case)
 	 *
-	 * Trade-off (per Codex iterations):
-	 *   - Threshold = 65475 (worst-case first IHL=60): catches the
-	 *     cross-IHL exploit (first frag has options, non-first
-	 *     fragments omit them) BUT false-positives on legitimate
-	 *     near-max IPv4 datagrams using standard IHL=20 — e.g.
-	 *     44×1480-byte fragments where the last fragment ends at
-	 *     offset+frag_payload=65515.
-	 *   - Threshold = 65535 with this fragment's tot_len (current
-	 *     implementation): zero false positives on legal traffic.
-	 *     MISSES the cross-IHL exploit when first fragment has IP
-	 *     options. Mitigation: SCREEN_IP_SOURCE_ROUTE drops any IP
-	 *     packet with ihl>5; enabling that screen alongside
-	 *     SCREEN_PING_OF_DEATH closes the gap (and is generally
-	 *     advisable — IP options are blocked by most middleboxes).
-	 *
-	 * `offset_bytes + tot_len > 65535` is equivalent to
-	 * `offset_bytes + frag_payload + this_ihl > 65535`. IPv4 only
-	 * — IPv6 ping-of-death needs NEXTHDR_FRAGMENT parsing, filed
-	 * as follow-up.
-	 *
-	 * History: round 1 widened pkt_len to u32; round 2 added the
-	 * fragment-offset detection; round 3 explored an IHL=60
-	 * worst-case threshold; round 4 reverted on false-positive
-	 * grounds. */
+	 * Limitation: a first fragment with IP options + non-first
+	 * fragments without them can craft offset+tot_len ≤ 65535
+	 * while the reassembled total overflows by up to 40 bytes.
+	 * Operators concerned about this should ALSO enable
+	 * SCREEN_IP_SOURCE_ROUTE, which drops any packet with ihl>5
+	 * and closes the gap. IP options are also blocked by most
+	 * middleboxes. IPv4 only — IPv6 ping-of-death needs
+	 * NEXTHDR_FRAGMENT parsing, filed as follow-up. */
 	if ((sc->flags & SCREEN_PING_OF_DEATH) &&
 	    meta->addr_family == AF_INET &&
 	    meta->is_fragment &&
