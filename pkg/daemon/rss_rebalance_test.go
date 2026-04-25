@@ -518,6 +518,39 @@ func TestApplyWeights_PermanentSkipAfterMaxFailures(t *testing.T) {
 	}
 }
 
+// Copilot review pin: a sample failure must reset
+// consecutiveImbalanced and force firstSample=true. Otherwise a
+// 2-imbalanced + 1-fail + 1-imbalanced sequence would reach
+// stability=3 even though the samples weren't truly consecutive.
+func TestSampleFailure_BreaksConsecutiveImbalanceStreak(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		domainSize:            6,
+		consecutiveImbalanced: 2, // already 2 imbalanced samples
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	reader.err = errors.New("helper unreachable")
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if s.consecutiveImbalanced != 0 {
+		t.Errorf("sample failure must reset consecutiveImbalanced: got %d, want 0",
+			s.consecutiveImbalanced)
+	}
+	if !s.firstSample {
+		t.Errorf("sample failure must force re-baseline (firstSample=true)")
+	}
+}
+
 // Codex MED 2 pin: sample failures (helper unreachable) accumulate
 // in sampleFailures but DO NOT permanently skip the iface — they're
 // recoverable. The first successful sample after a streak of

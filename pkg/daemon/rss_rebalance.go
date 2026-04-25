@@ -169,8 +169,8 @@ type rssRebalanceState struct {
 // restarting this goroutine.
 //
 // reader is nil-safe: if the userspace dataplane is not in use, the
-// caller passes a nil reader and the loop sees rssEnabled==false and
-// returns immediately each tick.
+// caller passes a nil reader and each tick becomes a no-op because
+// there is no signal source to sample from.
 //
 // Stops cleanly on ctx cancellation.
 func runRSSRebalanceLoop(ctx context.Context, execer rssExecutor, reader bindingRXReader) {
@@ -317,6 +317,14 @@ func rebalanceTick(state map[string]*rssRebalanceState, execer rssExecutor, read
 					"iface", iface, "err", allErr,
 					"consecutive_failures", s.sampleFailures)
 			}
+			// Copilot review: a missed sample breaks the
+			// "consecutive samples" stability semantic. Reset the
+			// imbalance streak and force re-baselining of
+			// lastSampleCounters via firstSample so a 2-imbalanced
+			// + 1-fail + 1-imbalanced sequence cannot prematurely
+			// reach the stability threshold on recovery.
+			s.consecutiveImbalanced = 0
+			s.firstSample = true
 			continue
 		}
 		// Reset sample failure counter on any successful read.
@@ -464,13 +472,13 @@ func rebalanceTick(state map[string]*rssRebalanceState, execer rssExecutor, read
 		// while helper bindings have already changed.
 		if LoadRSSApplyInProgress() {
 			RssWriteMuUnlock()
-			s.lastSeenEpoch = LoadRSSEpoch() - 1
+			abandonRebalance(s)
 			continue
 		}
 		// Post-lock ConfigGen re-check (#835 R2 F6 + R4 F3 + R5 F1 + R8 F1).
 		if LoadRSSConfigGen() != genBefore {
 			RssWriteMuUnlock()
-			s.lastSeenEpoch = LoadRSSEpoch() - 1
+			abandonRebalance(s)
 			continue
 		}
 		// #835 R2 FA2: post-lock Epoch re-check. A control-plane
@@ -479,7 +487,7 @@ func rebalanceTick(state map[string]*rssRebalanceState, execer rssExecutor, read
 		// Epoch. Our currentWeights are stale; abandon.
 		if LoadRSSEpoch() != epochBefore {
 			RssWriteMuUnlock()
-			s.lastSeenEpoch = LoadRSSEpoch() - 1
+			abandonRebalance(s)
 			continue
 		}
 		// #835 R7 F1 defence in depth: re-load enabled / workers /
@@ -488,7 +496,7 @@ func rebalanceTick(state map[string]*rssRebalanceState, execer rssExecutor, read
 		if !LoadRSSEnabled() || LoadRSSWorkers() <= 1 ||
 			!ifaceInAllowed(iface, LoadRSSAllowed()) {
 			RssWriteMuUnlock()
-			s.lastSeenEpoch = LoadRSSEpoch() - 1
+			abandonRebalance(s)
 			continue
 		}
 		err := applyWeights(iface, newWeights, execer)
@@ -630,6 +638,22 @@ func applyWeights(iface string, weights []int, execer rssExecutor) error {
 			args, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// abandonRebalance marks per-iface state as "shadow may have
+// drifted" so the next tick re-baselines instead of writing stale
+// weights. Called from the post-lock abandon paths
+// (apply-in-progress, ConfigGen change, Epoch change, control-plane
+// state change).
+//
+// Replaces the earlier `s.lastSeenEpoch = LoadRSSEpoch() - 1`
+// pattern, which relied on uint64 underflow when epoch == 0 to
+// produce a sentinel != current. Setting firstSample = true
+// directly forces re-baselining of lastSampleCounters on the next
+// tick — the explicit intent of all four abandon sites.
+func abandonRebalance(s *rssRebalanceState) {
+	s.firstSample = true
+	s.consecutiveImbalanced = 0
 }
 
 // equalWeights returns a vector of length n filled with the default
