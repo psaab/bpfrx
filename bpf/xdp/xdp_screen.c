@@ -807,19 +807,32 @@ int xdp_screen_prog(struct xdp_md *ctx)
 	 * reassembled IP datagram would exceed 65535 bytes. xpf
 	 * doesn't reassemble, so we detect per-fragment:
 	 *
-	 *   reassembled_tot_len = ihl_bytes + max(offset + frag_payload)
+	 *   reassembled_tot_len = first_frag_ihl_bytes
+	 *                       + max(offset_bytes + frag_payload)
 	 *
-	 * For overflow:
-	 *   offset_bytes + frag_payload + ihl_bytes > 65535
-	 *   ⇔  offset_bytes + tot_len > 65535
-	 *   (since tot_len = ihl_bytes + frag_payload)
+	 * Per RFC 791, non-first fragments may omit non-copied IP
+	 * options, so their ihl can be SMALLER than the first
+	 * fragment's. Trusting this fragment's tot_len (which embeds
+	 * this fragment's ihl) undercounts the reassembled size when
+	 * options exist on the first fragment.
 	 *
-	 * Using the per-fragment tot_len directly accounts for the IP
-	 * header (Codex round 2 caught the off-by-header miss in the
-	 * prior formula). The pre-#860 check `meta->pkt_len > 65535`
-	 * was dead code: pkt_len is derived from IP wire fields capped
-	 * at u16. IPv4 only; IPv6 ping-of-death needs NEXTHDR_FRAGMENT
-	 * parsing — filed as follow-up. */
+	 * Without stateful first-fragment tracking, use the worst-case
+	 * first IHL = 60 (max legal) so the threshold catches any
+	 * reassembly overflow regardless of options layout:
+	 *
+	 *   offset_bytes + frag_payload > 65535 - 60 = 65475
+	 *
+	 * frag_payload is computed using THIS fragment's actual ihl
+	 * (so overestimating "data" only happens if this fragment
+	 * itself reports ihl < 5, which is malformed and dropped
+	 * elsewhere). False-positives are limited to legal max-length
+	 * datagrams that use 40+ bytes of IP options — essentially
+	 * never seen in modern traffic.
+	 *
+	 * Round 1 (#860) widened pkt_len to u32; round 2 fixed the
+	 * off-by-header miss; round 3 fixes the IHL-mismatch edge.
+	 * IPv4 only — IPv6 ping-of-death needs NEXTHDR_FRAGMENT
+	 * parsing, filed as follow-up. */
 	if ((sc->flags & SCREEN_PING_OF_DEATH) &&
 	    meta->addr_family == AF_INET &&
 	    meta->is_fragment &&
@@ -829,7 +842,10 @@ int xdp_screen_prog(struct xdp_md *ctx)
 			__u16 frag_off = bpf_ntohs(iph->frag_off);
 			__u32 offset_bytes = (frag_off & 0x1FFF) << 3;
 			__u32 tot_len = bpf_ntohs(iph->tot_len);
-			if (offset_bytes + tot_len > 65535)
+			__u32 ihl_bytes = (__u32)iph->ihl << 2;
+			__u32 frag_payload =
+				(tot_len > ihl_bytes) ? (tot_len - ihl_bytes) : 0;
+			if (offset_bytes + frag_payload > 65475)
 				return screen_drop(meta, SCREEN_PING_OF_DEATH);
 		}
 	}
