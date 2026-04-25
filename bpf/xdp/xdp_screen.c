@@ -803,11 +803,27 @@ int xdp_screen_prog(struct xdp_md *ctx)
 			return screen_drop(meta, SCREEN_IP_SOURCE_ROUTE);
 	}
 
-	/* Ping of Death: oversized ICMP/ICMPv6 */
-	if (sc->flags & SCREEN_PING_OF_DEATH) {
-		if (meta->protocol == PROTO_ICMP ||
-		    meta->protocol == PROTO_ICMPV6) {
-			if (meta->pkt_len > 65535)
+	/* Ping of Death: a fragment whose offset+payload would
+	 * overflow the 65535-byte reassembled IP datagram limit. xpf
+	 * doesn't reassemble, so we detect at the per-fragment level:
+	 * if (frag_offset_bytes + frag_payload) > 65535, drop the
+	 * fragment (any reassembling host would also reject it). The
+	 * pre-#860 check `meta->pkt_len > 65535` was dead code — pkt_len
+	 * is derived from IP wire fields capped at u16, so the
+	 * comparison was always false. IPv4 only; IPv6 ping-of-death
+	 * needs frag_hdr parsing — filed as follow-up. */
+	if ((sc->flags & SCREEN_PING_OF_DEATH) &&
+	    meta->addr_family == AF_INET &&
+	    meta->is_fragment &&
+	    meta->l3_offset < 64) {
+		struct iphdr *iph = data + meta->l3_offset;
+		if ((void *)(iph + 1) <= data_end) {
+			__u16 frag_off = bpf_ntohs(iph->frag_off);
+			__u32 offset_bytes = (frag_off & 0x1FFF) << 3;
+			__u32 tot_len = bpf_ntohs(iph->tot_len);
+			__u32 ihl = (__u32)iph->ihl << 2;
+			__u32 frag_payload = (tot_len > ihl) ? (tot_len - ihl) : 0;
+			if (offset_bytes + frag_payload > 65535)
 				return screen_drop(meta, SCREEN_PING_OF_DEATH);
 		}
 	}
