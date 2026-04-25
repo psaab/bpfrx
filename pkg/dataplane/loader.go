@@ -148,8 +148,9 @@ func (m *Manager) AttachXDP(ifindex int, forceGeneric bool) error {
 	// attach fails, the flag must NOT be set. A flag-set failure on
 	// the success path is logged at WARN — the attach itself
 	// succeeded so we don't unwind, but tc_main's bypass won't fire
-	// for this surface until the next config push runs SetZone (which
-	// re-applies the bit per m.xdpLinks).
+	// for this surface until the next config push runs SetZone
+	// (which re-claims the surface based on m.xdpLinks[ifindex] and
+	// sets the bit accordingly).
 	defer func() {
 		if _, ok := m.xdpLinks[ifindex]; ok {
 			if err := m.setXDPAttachedFlag(ifindex, true); err != nil {
@@ -467,15 +468,37 @@ func (m *Manager) SetZone(ifindex int, vlanID uint16, zoneID uint16, routingTabl
 	if !ok {
 		return fmt.Errorf("iface_zone_map not found")
 	}
-	// #863: preserve IFACE_FLAG_XDP_ATTACHED across config-driven
-	// rewrites. The flag is owned by AttachXDP/DetachXDP via the
-	// xdpFlagClaims refcount; SetZone consults the claim set for THIS
-	// {ifindex, vlanID} entry. Any non-empty claim set means at least
-	// one XDP attachment still flags this surface (parent native
-	// XDP, sub-iface generic XDP, or both — see compiler.go for the
-	// overlap rules).
+	// #863: preserve / establish IFACE_FLAG_XDP_ATTACHED.
+	//
+	// The bit is owned by AttachXDP/DetachXDP via the xdpFlagClaims
+	// refcount, but SetZone has TWO jobs:
+	//   (a) Re-rewriting an existing entry: keep the bit if any XDP
+	//       attachment still claims this surface (consult
+	//       m.xdpFlagClaims[key]).
+	//   (b) Creating a NEW {ifindex, vlanID} entry while XDP is
+	//       already attached to the physical parent: claim the
+	//       surface NOW so the bit gets set, and so a later
+	//       DetachXDP(parent) cleans it up correctly via the claim
+	//       sweep in setXDPAttachedFlag(false).
+	// Without (b), a new VLAN unit added after AttachXDP would land
+	// without the flag and tc_main's bypass would never fire for
+	// it even though parent XDP runs on the surface.
 	key := IfaceZoneKey{Ifindex: uint32(ifindex), VlanID: vlanID}
-	if claims := m.xdpFlagClaims[key]; len(claims) > 0 {
+	claims := m.xdpFlagClaims[key]
+	if _, parentAttached := m.xdpLinks[ifindex]; parentAttached {
+		if claims == nil {
+			claims = make(map[int]bool)
+			m.xdpFlagClaims[key] = claims
+		}
+		claims[ifindex] = true
+	}
+	// Note: a sub-iface-only XDP attachment under the same surface
+	// won't be discovered by SetZone (would require iterating
+	// vlan_iface_map for every SetZone call). In practice this is
+	// rare — sub-iface generic XDP only fires when the parent has
+	// already attached its XDP (see compiler.go); the parent's claim
+	// covers the surface. Filed as a follow-up if it ever bites.
+	if len(claims) > 0 {
 		flags |= IfaceFlagXDPAttached
 	}
 	val := IfaceZoneValue{
