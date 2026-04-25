@@ -276,22 +276,26 @@ func (m *Manager) DetachXDP(ifindex int) error {
 	if !exists {
 		return nil
 	}
-	l.Unpin()
-	if err := l.Close(); err != nil {
-		return fmt.Errorf("detach XDP from ifindex %d: %w", ifindex, err)
-	}
-	delete(m.xdpLinks, ifindex)
-	// #863: clear IFACE_FLAG_XDP_ATTACHED so the tc_main tunnel-egress
-	// bypass stops accepting traffic from this ingress ifindex as
-	// XDP-validated. A failure here is operationally important —
-	// stale flag means tc_main keeps treating this now-detached
-	// surface as XDP-validated until the next AttachXDP/SetZone
-	// rewrites the entry. Return the error so the caller can decide
-	// whether to retry or surface the failure.
+	// #863: clear IFACE_FLAG_XDP_ATTACHED claims FIRST, before
+	// closing/unpinning the link. If clear fails, the link stays in
+	// m.xdpLinks and a retry of DetachXDP picks up where this one
+	// left off. Doing it the other way around (close then clear)
+	// leaves stale claims with no retry path — the next DetachXDP
+	// early-returns at !exists.
 	if err := m.setXDPAttachedFlag(ifindex, false); err != nil {
 		slog.Error("DetachXDP: failed to clear IFACE_FLAG_XDP_ATTACHED — tc_main bypass may stay enabled until next config push",
 			"ifindex", ifindex, "err", err)
 		return fmt.Errorf("detach XDP from ifindex %d: clear flag: %w", ifindex, err)
+	}
+	l.Unpin()
+	closeErr := l.Close()
+	// Claim cleanup succeeded; the link is conceptually gone whether
+	// or not Close errored. Remove from m.xdpLinks so a retry doesn't
+	// infinite-loop on a stuck-close link, but surface the close
+	// error.
+	delete(m.xdpLinks, ifindex)
+	if closeErr != nil {
+		return fmt.Errorf("detach XDP from ifindex %d: %w", ifindex, closeErr)
 	}
 	slog.Info("detached XDP program", "ifindex", ifindex)
 	return nil
