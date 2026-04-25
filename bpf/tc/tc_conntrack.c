@@ -406,9 +406,35 @@ int tc_conntrack_prog(struct __sk_buff *skb)
 		 * packet.  The inner packet was validated by XDP — the
 		 * outer encapsulation is trusted local kernel work.
 		 * Create a session so XDP ingress can match the return
-		 * (decapsulated reply) via the reverse conntrack entry. */
+		 * (decapsulated reply) via the reverse conntrack entry.
+		 *
+		 * #852: gate this carve-out on positive evidence that XDP
+		 * actually ran on the ingress side. Without this gate, a
+		 * GRE/ESP packet from any non-XDP interface (loopback,
+		 * veth, mgmt NIC) would create a persistent session whose
+		 * REVERSE entry lets return traffic bypass xdp_policy
+		 * entirely. Mirrors the tc_main tunnel-egress gate from
+		 * #863: vlan_iface_map sub→parent resolve, then check
+		 * IFACE_FLAG_XDP_ATTACHED on the {parent, vlan_id} entry. */
 		if (meta->protocol == PROTO_GRE ||
 		    meta->protocol == PROTO_ESP) {
+			__u32 lookup_ifindex = meta->ingress_ifindex;
+			__u16 lookup_vlan = 0;
+			__u32 sub_ifindex = meta->ingress_ifindex;
+			struct vlan_iface_info *vi = bpf_map_lookup_elem(
+				&vlan_iface_map, &sub_ifindex);
+			if (vi) {
+				lookup_ifindex = vi->parent_ifindex;
+				lookup_vlan = vi->vlan_id;
+			}
+			struct iface_zone_key ik = {
+				.ifindex = lookup_ifindex,
+				.vlan_id = lookup_vlan,
+			};
+			struct iface_zone_value *iv = bpf_map_lookup_elem(
+				&iface_zone_map, &ik);
+			if (!iv || !(iv->flags & IFACE_FLAG_XDP_ATTACHED))
+				return TC_ACT_SHOT;
 			if (meta->addr_family == AF_INET)
 				tc_create_session_v4(meta);
 			else
