@@ -74,73 +74,97 @@ ports give 100 distinct 5-tuples for the SFQ hash, fanning into
 
 ### 4.2 Mice
 
-100 paced TCP_RR streams via `netperf`. **Paced** is critical
-(Codex R1#6): unpaced 100×TCP_RR can deliver tens of Gbps of
-offered load, making the mice indistinguishable from elephants.
-We pace each mouse at **1000 RR/s**.
+100 concurrent TCP-SYN probe streams via **hping3** (replaces
+netperf TCP_RR). Reasoning for the swap (R6 self-audit):
 
-**Wire load (Codex R2 A4)**: each TCP_RR transaction is
-REQ(64B payload) + RESP(64B payload) + 2 × ACK. Including
-TCP/IP/Eth headers (~54 B), each transaction puts on the wire
-roughly 64+54 (REQ) + 64+54 (RESP) + 40+40 (ACKs) ≈ 316 B,
-or ~288 B if delayed-ACK coalesces some ACKs (Codex's
-arithmetic). Per-mouse wire rate at 1000 RR/s is
-~2.3-2.5 Mbps. Aggregate across 100 mice ≈ 230-250 Mbps,
-which is **23-25% of the 1 Gb/s shaper** — still meaningfully
-under the elephants' demand and well below saturation, but
-NOT the 5% the prior plan stated. The test is a coexistence
-test, not a tiny-mice-vs-fat-elephants test; both classes
-contend for shaped capacity.
+1. **No daemon needed on the iperf3 target.** hping3 sends
+   raw TCP SYN packets to any listening TCP port; the
+   target's kernel replies SYN-ACK from its existing
+   listening socket (the iperf3 server already bound on
+   port 5201). The prior netperf-based plan required
+   installing + running netserver on 172.16.80.200, which is
+   operator-provisioned and outside our incus management.
+2. **Same forwarding-class as elephants for free.** Mice hit
+   port 5201 just like elephants, so the existing
+   `cos-iperf-config.set` classifier puts them in `iperf-a`.
+   **No firewall-filter extension needed** — the entire §4.4
+   "class collision fix" + corresponding EXIT trap rollback
+   complexity drops from the plan.
+3. **Per-packet RTT samples in stdout.** hping3 emits one
+   `rtt=N.N ms` line per probe, giving raw per-sample
+   latency data — better than netperf's omni summary, which
+   was histogram-binned with ~100 µs resolution. With raw
+   samples we can compute honest p99 and p99.9.
+
+**Pacing**: per-mouse rate **10 SYN/s** (`-i u100000` =
+100 ms gap). Aggregate across 100 mice = 1000 SYN/s.
+Intentionally lower than the prior netperf-based 1000 RR/s
+per mouse because each SYN with a fresh seq creates a
+half-open conntrack entry on the firewall and we do not
+want to fill conntrack during the test (conntrack saturation
+is a different question, see §10).
+
+**Wire load**: each transaction is one SYN out (~64 B with
+headers) + one SYN-ACK back (~64 B) + nothing else (no ACK,
+no FIN — half-open ages out at the target). At 10/s/mouse ×
+64 B × 8 = ~5 Kbps/mouse; aggregate 100 × 5 Kbps =
+**500 Kbps total mouse load**, ~0.05 % of the 1 Gb/s shaper.
+Mice are genuinely tiny relative to elephants — the
+canonical 100E100M shape (latency-sensitive small flows
+vs bandwidth-hungry elephants).
+
+Per-mouse invocation:
 
 ```
-netperf -H 172.16.80.200 -p 12866 -t TCP_RR -l <duration> \
-    -- -r 64,64 -P 12865 -O \
-       min_latency,p50_latency,p90_latency,p99_latency,mean_latency,max_latency,transaction_rate,throughput,throughput_units \
-       -b 1 -w 1000  # max 1 burst per 1000us = 1000 RR/s
+hping3 -S -p 5201 -c 600 -i u100000 \
+    -k -s <unique-source-port> 172.16.80.200
 ```
 
-(R4 MED#7: `transaction_rate` is netperf's per-omni RPS
-field; without it the harness can't verify the achieved RPS
-target referenced in §5.2 + §10.)
+Flags:
+- `-S` send SYN, `-p 5201` destination port (already in
+  iperf-a class)
+- `-c 600` count = 10/s × 60 s
+- `-i u100000` 100 000 µs interval = 10 packets/s
+- `-k` keep source port across the run (so all SYNs from
+  one mouse appear as duplicate-SYNs on the firewall and
+  create exactly ONE half-open conntrack entry per mouse —
+  not one per packet)
+- `-s <port>` unique-per-mouse source port from the
+  ephemeral range; harness allocates 100 distinct values
 
-(`-b` and `-w` form netperf's burst-mode pacing — verify in
-implementation; if the version available doesn't support pacing,
-wrap with `taskset` + sleep loop in the harness.)
+Each of 100 mice runs as a separate hping3 process (per-
+mouse 5-tuple via fixed source port).
 
-Each of 100 mice runs as a separate netperf process (per-process
-TCP connection ⇒ per-mouse 5-tuple).
-
-**Why netperf, not ping/mtr/wrk2:** ping is ICMP (separate CoS
-classifier path); wrk2 is HTTP (extra application stack noise).
-TCP_RR keeps classification tight to the firewall's CoS path
-and exercises the same shaper / SFQ that elephants hit.
+**Why not ping/mtr/wrk2/netperf:** ping is ICMP (separate
+classifier path); wrk2 needs an HTTP server; netperf needs
+netserver on the target. hping3 SYNs traverse the firewall's
+TCP CoS path and exercise the same shaper / SFQ that
+elephants hit, with no server-side daemon required.
 
 **Aggregating per-mouse percentiles (Codex R1#2 / R2 A2):**
-percentile-of-percentiles is biased. Counterexample: with 49
-of 100 mice at L+1ms p99 and 51 at L p99, median-of-p99 reports
-L — a 1 ms regression on half the mice would be invisible.
+percentile-of-percentiles is biased. Counterexample: with
+49 of 100 mice at L+1 ms p99 and 51 at L p99, median-of-p99
+reports L — a 1 ms regression on half the mice would be
+invisible.
 
-Netperf does NOT emit per-transaction samples through `-O`
-(only summary statistics from its internal histogram). The
-aggregation strategy is: report the **full distribution** of
-per-mouse p99 values, exposing four order statistics so a
-regression on any minority of mice surfaces:
+hping3 emits per-packet RTT samples in stdout — unlike
+netperf's omni summary, we have **all 60 000 individual
+samples per phase** (100 mice × 600 packets/mouse). The
+aggregation strategy:
 
-- `p99_min` = min across the 100 mice's p99 values
-- `p99_p50` = median
-- `p99_p90` = 90th percentile (catches the 49/100 case above:
-  90th of {L×51, (L+1ms)×49} = L+1ms)
-- `p99_max` = max (worst-flow watermark)
+- Pool all per-packet RTT samples across the 100 mice into
+  one global distribution per phase. Compute global
+  p50/p90/p99/p99.9 from the merged sample set.
+- Also report the per-mouse p99 distribution (min/p50/p90/
+  max) so a localized degradation on a minority of mice
+  surfaces.
 
-Plus archive the full sorted list of 100 p99 values per phase
-per rep. Headline reports `p99_p90` and `p99_max` as deltas
-vs baseline.
-
-**Sub-100 µs deltas remain out of scope** (Codex R2 A2): the
-netperf histogram bin width is on the order of 100 µs in
-default mode, so claims below that resolution are not
-defensible from this data. A future enhancement could add
-histogram-merge via netperf `-V`.
+Headline reports both:
+- `pooled_p99` and `pooled_p999` (true percentiles across
+  all 60 000 samples — newly possible with raw hping3
+  output)
+- `per_mouse_p99_p90` and `per_mouse_p99_max` (the order
+  statistics from R2 A2)
 
 ### 4.3 Phases
 
@@ -169,8 +193,9 @@ histogram-merge via netperf `-V`.
      invalid.
    - Record `t_g` = the iperf3 elapsed second when the gate
      passed (typically ~3-10 s).
-   - Start 100 paced netperf mice for 50 s.
-   - When mice finish at `t_g + 50` (iperf3-clock), SIGTERM
+   - Start 100 paced hping3 mice for 60 s (10 SYN/s × 60 s
+     × 100 mice = 60 000 RTT samples).
+   - When mice finish at `t_g + 60` (iperf3-clock), SIGTERM
      iperf3. iperf3's text output already includes per-second
      intervals on stdout; no JSON to truncate.
    - Elephant CoV is computed by post-parsing the text log:
@@ -185,33 +210,13 @@ histogram-merge via netperf `-V`.
    teardown / FIN / TIME_WAIT settling.
 6. **Repeat steps 2-5** per repetition.
 
-### 4.4 Class collision fix (Codex finding #3)
+### 4.4 Class collision
 
-The current `test/incus/cos-iperf-config.set` only classifies
-TCP destination port 5201 into `iperf-a`. Netperf-default port
-12865 misses the classifier and lands in best-effort (queue 0,
-100 Mb/s), defeating the test.
-
-We run netperf with **explicit ports**:
-- Control port: 12866 (matches our firewall filter)
-- Data port: 12865 (passed via `-P` to netperf, also matches)
-
-The harness extends the existing CoS classifier filter with a
-single Junos set-line idempotent re-apply at preflight:
-
-```
-set firewall family inet filter bandwidth-output term mouse \
-    from destination-port 12865-12866
-set firewall family inet filter bandwidth-output term mouse \
-    then forwarding-class iperf-a
-```
-
-Mice and elephants now both land in queue 4 (iperf-a). This is
-inserted via `apply-cos-config.sh` style atomic commit so a
-failure rolls back to the previous good config.
-
-`netserver` is started on the iperf3 target on port 12866 by
-the harness preflight if not already running.
+(Removed in R6 self-audit: hping3 mice target port 5201, the
+same port elephants use. The existing `cos-iperf-config.set`
+classifier already maps port 5201 → iperf-a. No firewall-
+filter extension is needed; the entire classifier-rollback
+EXIT-trap branch from prior plan revisions also drops.)
 
 ## 5. Metrics
 
@@ -227,29 +232,40 @@ From iperf3 JSON, per-stream `sender.bits_per_second`:
 
 ### 5.2 Mice
 
-Per-mouse from netperf:
-- min, p50, p90, p99, mean, max latency in µs (from netperf's
-  `-O` summary).
-- transactions/sec achieved (compare to 1000 target — if
-  below, that mouse was bottlenecked).
+Per-mouse from hping3 stdout. Each line of the form
+`len=44 ip=... rtt=N.N ms` contributes one RTT sample.
+Per-mouse aggregate:
+- count of received samples (compare to 600 target — if
+  fewer, that mouse had drops/timeouts).
 
-Across the 100 mice's per-process p99 values, report the
-**full distribution** (R2 A2):
-- `p99_min` (best-flow watermark)
-- `p99_p50` (median)
-- `p99_p90` (catches the 49/100 mice regression case)
-- `p99_max` (worst-flow watermark)
+**Pooled distribution** across all 100 mice's samples (R6
+self-audit: now possible because hping3 emits raw samples,
+unlike netperf):
+- `pooled_p50` µs (median across all 60 000 samples)
+- `pooled_p90` µs
+- `pooled_p99` µs
+- `pooled_p999` µs (newly attainable)
+
+**Per-mouse p99 order statistics** (R2 A2 — still useful
+to catch localized degradations):
+- `per_mouse_p99_p50` (median across 100 mice)
+- `per_mouse_p99_p90` (catches the 49/100 mice regression)
+- `per_mouse_p99_max` (worst-flow watermark)
 - raw sorted list archived per phase per rep
 
-Headline reports `p99_p90` AND `p99_max` as deltas vs baseline.
+Headline reports `pooled_p99`, `pooled_p999`,
+`per_mouse_p99_p90`, and `per_mouse_p99_max`, all as
+deltas vs baseline.
 
 ### 5.3 Comparison
 
 The headline numbers are **deltas from baseline**:
 
 - `elephant_cov_loaded` (%, vs reporting reference 15%)
-- `mouse_p99_p90_loaded - mouse_p99_p90_baseline` (µs)
-- `mouse_p99_max_loaded - mouse_p99_max_baseline` (µs)
+- `pooled_p99_loaded - pooled_p99_baseline` (µs)
+- `pooled_p999_loaded - pooled_p999_baseline` (µs)
+- `per_mouse_p99_p90_loaded - per_mouse_p99_p90_baseline` (µs)
+- `per_mouse_p99_max_loaded - per_mouse_p99_max_baseline` (µs)
 
 These are reporting thresholds only. No issue is closed against
 them by this PR (Codex finding #9). A follow-up issue with a
@@ -442,9 +458,11 @@ the system in a clean state.
 ```
 1. Capture run timestamp <run-ts>; create
    /tmp/100e100m/<run-ts>/.
-2. Set tracker variables: MOUSE_FILTER_APPLIED=0,
-   PIDFILES_TO_CLEAN=() (an array of (instance, pidfile)
-   tuples), HARNESS_PGID=$(setsid bash -c 'echo $$').
+2. Set tracker variables: PIDFILES_TO_CLEAN=() (an array
+   of (instance, pidfile) tuples),
+   HARNESS_PGID=$(setsid bash -c 'echo $$'). (R6 self-audit:
+   MOUSE_FILTER_APPLIED tracker dropped — no classifier
+   extension.)
 3. Register EXIT trap (R3#7 / R2 C2 / R4#3).
    The trap function MUST start with `set +e` and capture the
    original exit status via `local original_status=$?`,
@@ -458,67 +476,48 @@ the system in a clean state.
         rm -f /tmp/${pidfile}"` (host-side var expansion via
       double-quoted body, R4#4). Each sub-step suffixed with
       `|| :` so a single failure doesn't propagate.
-   b. If MOUSE_FILTER_APPLIED == 1: roll back via the
-      heredoc pattern in §6.0 (configure / rollback 1 /
-      commit / exit). Do NOT touch the base CoS — that is
-      intentionally persistent post-harness. Suffix `|| :`.
-   c. Pull any container output files the harness recorded
+   b. Pull any container output files the harness recorded
       so a debug snapshot is preserved on partial failure.
       Suffix `|| :`.
+   (R6 self-audit: classifier-rollback branch dropped — no
+   firewall mutation to undo.)
 4. Verify both firewall VMs RUNNING via `incus list`.
 5. Assert `systemctl is-active xpfd` returns "active" on
-   fw0 AND fw1 (R3 finding closure for incomplete daemon
-   state).
+   fw0 AND fw1.
 6. Verify RG0 primary == node0 via the operational cli
    (`/usr/local/sbin/cli -c 'show chassis cluster status'`);
    fail loudly if not.
-7. Resolve iperf3 target instance (R3#6): read
-   `IPERF3_TARGET_INSTANCE` from
-   `loss-userspace-cluster.env` (which the harness PR
-   adds — see §13). If unset or instance not RUNNING,
-   abort with "iperf3 target instance not configured;
-   add IPERF3_TARGET_INSTANCE to env" message.
-8. Install required tools (R3 MED#11 fix: explicit `if`,
-   not `||/&&`):
-   a. On iperf3 target instance:
-      ```
-      if ! incus exec ${IPERF3_TARGET_INSTANCE} -- \
-           command -v netserver >/dev/null 2>&1; then
-          incus exec ${IPERF3_TARGET_INSTANCE} -- \
-              apt-get update -qq 2>/tmp/apt-update.err || \
-              { echo "apt-get update failed: $(cat /tmp/apt-update.err)" >&2; exit 1; }
-          incus exec ${IPERF3_TARGET_INSTANCE} -- \
-              apt-get install -y netperf || \
-              { echo "netperf install failed on target" >&2; exit 1; }
-      fi
-      ```
-   b. Same pattern on `cluster-userspace-host` for
-      `netperf` and `sysstat` (provides `mpstat`).
-9. On iperf3 target: start netserver on port 12866 using
-   the pidfile pattern from §6.0. Verify with
-   `nc -zv 172.16.80.200 12866` from the source.
-10. Apply base CoS via `apply-cos-config.sh` (idempotent).
-11. Apply mouse classifier extension (§4.4) via heredoc-
-    over-incus-exec (R4 MED#5 fix: explicit wrapper):
-    ```
-    incus exec loss:xpf-userspace-fw0 -- bash -c "/usr/local/sbin/cli" <<'EOF'
-    configure
-    set firewall family inet filter bandwidth-output term mouse from destination-port 12865-12866
-    set firewall family inet filter bandwidth-output term mouse then forwarding-class iperf-a
-    commit check
-    commit
-    exit
-    EOF
-    ```
-    On success, set MOUSE_FILTER_APPLIED=1. On failure,
-    abort (the EXIT trap will not roll back since the
-    flag is still 0).
-12. Verify `cli -c 'show class-of-service interface'`
+7. Verify iperf3 target reachable: from
+   `cluster-userspace-host`,
+   `bash -c '</dev/tcp/172.16.80.200/5201'` should succeed.
+   The target instance is operator-provisioned and
+   intentionally NOT under harness control (R6 self-audit:
+   IPERF3_TARGET_INSTANCE env-file change dropped).
+8. Install required tools on `cluster-userspace-host`
+   (R3 MED#11 explicit `if` pattern):
+   ```
+   if ! incus exec loss:cluster-userspace-host -- \
+        command -v hping3 >/dev/null 2>&1; then
+       incus exec loss:cluster-userspace-host -- \
+           apt-get update -qq 2>/tmp/apt-update.err || \
+           { echo "apt-get update failed: $(cat /tmp/apt-update.err)" >&2; exit 1; }
+       incus exec loss:cluster-userspace-host -- \
+           apt-get install -y hping3 || \
+           { echo "hping3 install failed" >&2; exit 1; }
+   fi
+   if ! incus exec loss:cluster-userspace-host -- \
+        command -v mpstat >/dev/null 2>&1; then
+       incus exec loss:cluster-userspace-host -- \
+           apt-get install -y sysstat || exit 1
+   fi
+   ```
+9. Apply base CoS via `apply-cos-config.sh` (idempotent).
+10. Verify `cli -c 'show class-of-service interface'`
     reports queue 4 owner=1, exact=yes, transmit-rate=
     1 Gb/s. Fail if not.
-13. Assert iperf-a queue runtime backlog == 0 (queued_pkts
+11. Assert iperf-a queue runtime backlog == 0 (queued_pkts
     == 0) — if non-zero, sleep 5 s and retry up to 3 times.
-14. Capture journalctl baseline timestamp for fw0 and fw1
+12. Capture journalctl baseline timestamp for fw0 and fw1
     so per-rep failover detection (R2 A7) can grep
     `journalctl --since=<rep_T0>` for cluster transition
     lines.
@@ -533,54 +532,52 @@ start, so re-runs do not overwrite (R2 B3).
 ```
 1. Mark rep_T0 = now.
 2. Snapshot CoS counters via cli on fw0 (before).
-3. Start `mpstat 1 -o JSON` in background on source,
-   redirected to <rep>/baseline-mpstat.json. Track the pid.
-4. Run 100 netperf mice for 60 s; capture each stdout to
-   <rep>/baseline-mice/<i>.txt. Track aggregate netperf pids
-   in the harness pgid.
-5. Stop mpstat (kill the tracked pid).
-6. Sleep 10 s cool-down.
-7. Snapshot CoS counters (mid).
-8. Start `mpstat 1 60 -o JSON` for loaded phase, output
-   to per-rep path
-   `/tmp/<container-rep-dir>/loaded-mpstat.json`
-   (R4 MED#6 + R5 self-audit #3: parameterized output path
-   for incus file pull).
-   - mpstat is backgrounded but tracked via pidfile so the
-     end-of-rep step can `wait` for its 60 samples to
-     complete (R5 #2 fix: prior plan didn't specify mpstat
-     completion barrier; if rep advanced before mpstat
-     finished, the next rep's mpstat would write to a path
-     potentially colliding with this one's still-open
-     handle).
-9. Start `iperf3 -c <target> -p 5201 -P 100 -t 90 -i 1`
-   (text mode, R4#1+#2) in background, output to
-   <rep>/loaded-elephants.txt.
-10. Apply cwnd-settle gate (§4.3 step 4): tail the text log
-    every 500 ms. Parse `[SUM]` lines for aggregate bits/sec.
-    Pass when 3 consecutive `[SUM]` aggregate samples are
-    within ±10% of their median AND median ≥ 0.5 Gb/s.
-    Abort + invalidate rep if no pass within 20 s.
-11. Run 100 netperf mice for 50 s; capture as in step 4.
-12. SIGTERM iperf3 when mice finish (R4#1: stops the
-    elephants-only tail from inflating CoV).
-13. Snapshot CoS counters (after).
-14. **Wait for mpstat to complete**: poll the mpstat
-    pidfile target via `incus exec ... bash -c "kill -0
-    \$(cat /tmp/${pidfile}) 2>/dev/null"` every 1 s; once
-    the process is gone, mpstat's JSON is finalized.
-    Pull mpstat output to host. (R5 #2 fix: explicit
-    completion barrier so backgrounded mpstat doesn't
-    bleed into the next rep.)
-15. Pull `journalctl -u xpfd --since=<rep_T0>` from fw0 and
+3. Start `mpstat 1 60 -o JSON` for baseline phase in
+   background on source, output to
+   `/tmp/<container-rep-dir>/baseline-mpstat.json`.
+   Track via pidfile.
+4. Run 100 hping3 mice for 60 s (10 SYN/s × 60 s = 600
+   packets/mouse × 100 mice = 60 000 RTT samples).
+   Per-mouse stdout captured to
+   <rep>/baseline-mice/<i>.txt. Each mouse runs as a
+   separate `incus exec ... bash -c '...'` background
+   inside one outer `incus exec` (single-bash-c launch
+   pattern from §6.0 to minimize startup stagger).
+   Source ports allocated from `32768+i` for mouse `i`.
+5. Wait for all 100 hping3 mice to exit (each runs `-c 600
+   -i u100000`, deterministic 60 s).
+6. Wait for baseline mpstat to complete via pidfile poll;
+   pull JSON.
+7. Sleep 10 s cool-down.
+8. Snapshot CoS counters (mid).
+9. Start `mpstat 1 90 -o JSON` for loaded phase, output to
+   `/tmp/<container-rep-dir>/loaded-mpstat.json` (R6
+   self-audit: 90-sample count covers the full elephant
+   run window of `t_g` warm-up + 60 s mice + a few seconds
+   of slack).
+10. Start `iperf3 -c 172.16.80.200 -p 5201 -P 100 -t 90 -i 1`
+    (text mode, R4#1+#2) in background, output to
+    <rep>/loaded-elephants.txt.
+11. Apply cwnd-settle gate (§4.3 step 4): tail the text log
+    every 500 ms. Parse `[SUM]` lines for aggregate
+    bits/sec. Pass when 3 consecutive `[SUM]` aggregate
+    samples are within ±10% of their median AND median ≥
+    0.5 Gb/s. Abort + invalidate rep if no pass within 20 s.
+12. Run 100 hping3 mice for 60 s (same pattern as step 4).
+13. Wait for all hping3 mice to exit.
+14. SIGTERM iperf3 (mice are done).
+15. Snapshot CoS counters (after).
+16. Wait for loaded mpstat to complete via pidfile poll
+    (`kill -0` test every 1 s); pull JSON.
+17. Pull `journalctl -u xpfd --since=<rep_T0>` from fw0 and
     fw1 (R2 A7); grep for cluster transition lines.
     Invalidate rep if any "cluster: primary transition",
     "cluster: secondary transition", or
     "RG readiness: not-ready" appears.
-16. Compute per-rep validity flags (§5.4).
-17. Compute per-rep summary (elephant CoV, mouse p99
-    distribution, deltas).
-18. Sleep 10 s cool-down.
+18. Compute per-rep validity flags (§5.4).
+19. Compute per-rep summary (elephant CoV, pooled mouse
+    p99/p999, per-mouse p99 distribution, deltas).
+20. Sleep 10 s cool-down.
 ```
 
 ### 6.3 Aggregation
@@ -876,23 +873,35 @@ self-audit applied for the questions queued for that round.
 | 7 | MED | CoS counter parsing approach     | §7 now specifies regex captures from `cli show class-of-service interface` text output, mapping to protocol.go fields |
 | 8 | LOW | Incus exec runtime overhead      | §6.4 runtime estimate now includes 3-5 min overhead acknowledgment; total realistic runtime ~28-30 min for 10 reps |
 
-## 13. Environmental config addition
+### Round 6 (operator pushback: drop netperf, drop netserver)
 
-This PR adds one variable to `test/incus/loss-userspace-cluster.env`
-(R4 MED#9: literal placeholder is invalid shell; use a real
-quoted instance name committed in the PR):
+Operator observed that the prior plan required netserver
+running on 172.16.80.200, which is operator-provisioned and
+outside our incus management. Switched mice tool to hping3
+SYN probes against the existing iperf3:5201 endpoint —
+removing the entire netserver dependency.
 
-```
-# iperf3 / netperf target instance (must be RUNNING and have
-# 172.16.80.200 reachable). Required by test-100e100m.sh.
-IPERF3_TARGET_INSTANCE="cluster-userspace-host"
-```
+| # | Topic                                  | Resolution |
+|---|----------------------------------------|------------|
+| 1 | Mice tool: netperf TCP_RR → hping3 SYN | §4.2 rewritten; raw SYN to existing iperf3:5201 |
+| 2 | No netserver on target                 | Dropped from §6.1 preflight |
+| 3 | No firewall classifier extension       | §4.4 reduced to "removed" stub; both elephants and mice already classify into iperf-a via port 5201 |
+| 4 | No EXIT-trap rollback for classifier   | Trap branch dropped; trap now only kills container pidfiles + pulls debug artifacts |
+| 5 | Per-mouse rate 1000 → 10 RR/s          | hping3 SYN with `-k` (keep source port) creates one half-open conntrack entry per mouse, not per packet; lower rate reduces conntrack pressure |
+| 6 | Mouse metrics: pooled distribution     | §5.2: now reports `pooled_p99` and `pooled_p999` (true global percentiles across 60 000 raw samples per phase), in addition to per-mouse p99 order statistics |
+| 7 | Env file change reverted               | §13 dropped IPERF3_TARGET_INSTANCE — target IP hardcoded as 172.16.80.200, which is the existing iperf3 endpoint; preflight only verifies TCP reachability |
 
-(The actual target instance is determined empirically when
-the harness is wired up — `cluster-userspace-host` is the
-canonical iperf3-server location for this cluster, but if
-the cluster setup uses a separate instance the PR commits
-the correct name.)
+## 13. Environmental config
 
-The harness sources the env file via the standard
-`BPFRX_CLUSTER_ENV` mechanism used by `cluster-setup.sh`.
+(R6 self-audit: prior plan revisions added an
+`IPERF3_TARGET_INSTANCE` variable to
+`test/incus/loss-userspace-cluster.env` to support netserver
+management on the iperf3 target. With the hping3 swap in R6,
+no harness-side management of the target is needed —
+preflight only TCP-probes 172.16.80.200:5201 to verify
+reachability. The env-file change is dropped.)
+
+The harness uses `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env`
+solely for resolving the firewall instance names (`xpf-userspace-fw0/fw1`)
+and the source container (`cluster-userspace-host`) — variables
+the env file already contains.
