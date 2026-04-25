@@ -4015,8 +4015,14 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 			localNodeID, chassisForwardingSeparator, localBuf)
 
 		peerBuf, peerErr := s.dialAndShowForwarding(ctx)
-		peerNodeID := s.cluster.PeerNodeID()
-		fmt.Fprintf(&buf, "\nnode%d:\n%s\n", peerNodeID, chassisForwardingSeparator)
+		// Codex round-1 fix: guard against PeerNodeID() returning 0
+		// before the first heartbeat — would produce two `node0:`
+		// headers. If peer was never seen, label it as unknown.
+		peerLabel := "node?"
+		if s.cluster.PeerAlive() {
+			peerLabel = fmt.Sprintf("node%d", s.cluster.PeerNodeID())
+		}
+		fmt.Fprintf(&buf, "\n%s:\n%s\n", peerLabel, chassisForwardingSeparator)
 		if peerErr != nil {
 			fmt.Fprintf(&buf, "FWDD status:\n  (peer unreachable: %s)\n", peerErr)
 		} else {
@@ -5254,6 +5260,16 @@ func (s *Server) buildLocalForwarding() string {
 // FWDD-status block. Injects the `xpf-no-peer:1` outgoing metadata
 // so the peer renders local-only and never recurses back. Returns
 // the peer's formatted block or an error if the peer is unreachable.
+//
+// Timeout note: dialPeer() internally uses context.Background() for
+// its 2s × N-fabric probes (server_diag.go) — that 4s worst-case
+// dial budget is NOT bound by `ctx`. The 5s WithTimeout below only
+// covers the post-dial ShowText RPC. Total worst case is therefore
+// up to ~9s. On the peer side, buildLocalForwarding may block on
+// userspace.Manager.mu during a failover — under that case the
+// 5s outer can fire spuriously and the peer block renders
+// "(peer unreachable)" even on a healthy-but-loaded peer. Future
+// fix: thread ctx into dialPeer to bound the full path.
 func (s *Server) dialAndShowForwarding(ctx context.Context) (string, error) {
 	conn, err := s.dialPeer()
 	if err != nil {
@@ -5261,10 +5277,6 @@ func (s *Server) dialAndShowForwarding(ctx context.Context) (string, error) {
 	}
 	defer conn.Close()
 	client := pb.NewBpfrxServiceClient(conn)
-	// dialPeer already runs a 2s GetStatus probe per fabric (up to
-	// 4s for fab0+fab1). 5s additional outer budget for the actual
-	// ShowText keeps total under ~9s — comfortable headroom for a
-	// peer mid-failover holding userspace.Manager.mu.
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	ctx = metadata.AppendToOutgoingContext(ctx, "xpf-no-peer", "1")

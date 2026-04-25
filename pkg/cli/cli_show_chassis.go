@@ -33,8 +33,11 @@ func (c *CLI) showChassisForwarding() error {
 		localNodeID, chassisForwardingSeparator, localBuf)
 
 	peerBuf, peerErr := c.dialAndShowForwarding()
-	peerNodeID := c.cluster.PeerNodeID()
-	fmt.Printf("\nnode%d:\n%s\n", peerNodeID, chassisForwardingSeparator)
+	peerLabel := "node?"
+	if c.cluster.PeerAlive() {
+		peerLabel = fmt.Sprintf("node%d", c.cluster.PeerNodeID())
+	}
+	fmt.Printf("\n%s:\n%s\n", peerLabel, chassisForwardingSeparator)
 	if peerErr != nil {
 		fmt.Printf("FWDD status:\n  (peer unreachable: %s)\n", peerErr)
 	} else {
