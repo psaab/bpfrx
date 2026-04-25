@@ -38,13 +38,13 @@ type fakeRSSExecutor struct {
 	ethtoolC map[string][]byte
 	// Recorded argvs, in call order. `{"-X", "eth0", "weight", "1", "1", "0", "0"}`, etc.
 	calls [][]string
-	// argvErr returns a scripted (output, error) for an exact argv
-	// prefix match. Used by tests that need to exercise the
-	// generic-error branches in maybeRestoreDefault. Key matches via
-	// strings.HasPrefix on a space-joined argv. For example, key
-	// "-X eth0 default" makes the `ethtool -X eth0 default` invocation
-	// return the scripted error. Checked AFTER the per-iface ethtoolX
-	// / ethtoolC path so test fixtures keep working unchanged.
+	// argvErr returns a scripted (output, error) for an argv-prefix
+	// match. Used by tests that need to exercise the generic-error
+	// branches in maybeRestoreDefault. Key matches via strings.HasPrefix
+	// on a space-joined argv (longest matching prefix wins, for
+	// determinism — see runEthtool). Checked BEFORE the per-iface
+	// ethtoolX / ethtoolC path so a test can override default behavior
+	// for a specific invocation.
 	argvErr map[string]argvErrSpec
 }
 
@@ -62,11 +62,23 @@ func (f *fakeRSSExecutor) runEthtool(args ...string) ([]byte, error) {
 	// precedence so tests can override default behavior for a
 	// specific invocation.
 	if f.argvErr != nil {
+		// Longest-prefix-wins for determinism — Go map iteration
+		// is randomized, so without this two overlapping prefix
+		// keys (e.g. "-X eth0" and "-X eth0 default") would
+		// produce flaky tests.
 		joined := strings.Join(args, " ")
+		var bestPrefix string
+		var bestSpec argvErrSpec
+		matched := false
 		for prefix, spec := range f.argvErr {
-			if strings.HasPrefix(joined, prefix) {
-				return spec.out, spec.err
+			if strings.HasPrefix(joined, prefix) && len(prefix) >= len(bestPrefix) {
+				bestPrefix = prefix
+				bestSpec = spec
+				matched = true
 			}
+		}
+		if matched {
+			return bestSpec.out, bestSpec.err
 		}
 	}
 	if len(args) >= 2 && args[0] == "-x" {
@@ -825,22 +837,6 @@ func TestApplyRSSIndirectionOne_NonMlxDriver_WorkersEqualsQueues_NotTouched(t *t
 	}
 }
 
-// #805 test 17 (Copilot inline #1): queueCount==1 short-circuit.
-// On a single-queue NIC there's no possible concentration to undo;
-// the guard `queues > 1` ensures we don't probe in that case.
-func TestApplyRSSIndirectionOne_QueueCountOne_NoOp(t *testing.T) {
-	f := &fakeRSSExecutor{
-		drivers:  map[string]string{"eth0": mlx5Driver},
-		queues:   map[string]int{"eth0": 1},
-		ethtoolX: map[string][]byte{"eth0": []byte("RX flow hash indirection table for eth0 with 1 RX ring(s):\n    0:      0     0     0     0\n")},
-	}
-	applyRSSIndirectionOne("eth0", 6, f)
-
-	if len(f.calls) != 0 {
-		t.Errorf("queueCount=1 must short-circuit before maybeRestoreDefault, got %v", f.calls)
-	}
-}
-
 // #805 test 16 (Codex LOW #3): empty driver string (sysfs unreadable
 // for that iface). Same expectation as non-mlx5: short-circuit.
 func TestApplyRSSIndirectionOne_EmptyDriver_WorkersEqualsQueues_NotTouched(t *testing.T) {
@@ -854,6 +850,22 @@ func TestApplyRSSIndirectionOne_EmptyDriver_WorkersEqualsQueues_NotTouched(t *te
 	if len(f.calls) != 0 {
 		t.Errorf("empty driver on workers>=queues path → zero ethtool calls, got %v",
 			f.calls)
+	}
+}
+
+// #805 test 17 (Copilot inline #1): queueCount==1 short-circuit.
+// On a single-queue NIC there's no possible concentration to undo;
+// the guard `queues > 1` ensures we don't probe in that case.
+func TestApplyRSSIndirectionOne_QueueCountOne_NoOp(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 1},
+		ethtoolX: map[string][]byte{"eth0": []byte("RX flow hash indirection table for eth0 with 1 RX ring(s):\n    0:      0     0     0     0\n")},
+	}
+	applyRSSIndirectionOne("eth0", 6, f)
+
+	if len(f.calls) != 0 {
+		t.Errorf("queueCount=1 must short-circuit before maybeRestoreDefault, got %v", f.calls)
 	}
 }
 

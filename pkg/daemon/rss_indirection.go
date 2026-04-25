@@ -239,7 +239,7 @@ func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
 	queues := execer.readQueueCount(iface)
 	weights, reason := computeWeightVector(workers, queues)
 	if weights == nil {
-		slog.Info("linksetup: rss indirection skipped", "iface", iface,
+		slog.Info("linksetup: rss weight reshaping skipped", "iface", iface,
 			"workers", workers, "queues", queues, "reason", reason)
 		// #805: When workers >= queues > 1 we previously left the
 		// indirection table alone. That's correct on a fresh install
