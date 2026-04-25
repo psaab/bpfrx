@@ -303,22 +303,19 @@ func (c *CLI) runCommitConfirmed(minutes int) (*config.Config, error) {
 }
 
 // commitCtx returns a cancellable context registered with the CLI's
-// Ctrl-C handler (cmdCancel). The returned `done` cleans up the
-// registration; callers MUST defer it. Used by runCommit /
-// runCommitConfirmed so an operator can interrupt a commit that's
-// hung waiting for the daemon's apply semaphore.
+// Ctrl-C handler via the dedicated commitCancel slot (separate from
+// cmdCancel which is used by external commands). Single-writer per
+// call site means the cleanup can clear unconditionally — the slot
+// is only ever set/cleared by a runCommit pair. The returned `done`
+// MUST be deferred by the caller.
 func (c *CLI) commitCtx() (context.Context, func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	c.cmdMu.Lock()
-	c.cmdCancel = cancel
+	c.commitCancel = cancel
 	c.cmdMu.Unlock()
 	return ctx, func() {
 		c.cmdMu.Lock()
-		if c.cmdCancel != nil {
-			// only clear if still ours (a nested handler hasn't
-			// already replaced it).
-			c.cmdCancel = nil
-		}
+		c.commitCancel = nil
 		c.cmdMu.Unlock()
 		cancel()
 	}

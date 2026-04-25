@@ -96,8 +96,12 @@ type CLI struct {
 	monitorFlow *monitorFlowState
 
 	// Command cancellation: Ctrl-C during a running external command cancels it.
-	cmdMu     sync.Mutex
-	cmdCancel context.CancelFunc
+	// commitCancel is a SEPARATE slot used by handleCommit so an
+	// external-command cancel and a commit cancel can never displace
+	// each other (the slots are single-writer per call site).
+	cmdMu        sync.Mutex
+	cmdCancel    context.CancelFunc
+	commitCancel context.CancelFunc
 }
 
 // New creates a new CLI.
@@ -631,12 +635,21 @@ func (c *CLI) Run() error {
 	go func() {
 		var lastInterrupt time.Time
 		for range sigCh {
-			// If an external command is running, cancel it.
+			// If a commit or an external command is running, cancel
+			// it. commitCancel takes priority because a commit
+			// hanging on the apply semaphore is the only path that
+			// actually needs ctx-aware cancellation; external
+			// commands fall back if no commit is in flight.
 			c.cmdMu.Lock()
-			cancel := c.cmdCancel
+			commitCancel := c.commitCancel
+			cmdCancel := c.cmdCancel
 			c.cmdMu.Unlock()
-			if cancel != nil {
-				cancel()
+			if commitCancel != nil {
+				commitCancel()
+				continue
+			}
+			if cmdCancel != nil {
+				cmdCancel()
 				continue
 			}
 			now := time.Now()
