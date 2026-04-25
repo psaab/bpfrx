@@ -67,7 +67,7 @@ func (s *stubRSSExecutor) listInterfaces() []string { return nil }
 
 // stubBindingRXReader is the test impl of bindingRXReader. Stores
 // scripted per-iface cumulative RX-packet counters keyed by ring
-// index. err override forces ReadBindingRX to fail (used for the
+// index. err override forces ReadAllRX to fail (used for the
 // failure-path test).
 type stubBindingRXReader struct {
 	mu      sync.Mutex
@@ -92,22 +92,20 @@ func (r *stubBindingRXReader) set(iface string, rings map[int]uint64) {
 	r.samples[iface] = cp
 }
 
-func (r *stubBindingRXReader) ReadBindingRX(iface string) (map[int]uint64, error) {
+func (r *stubBindingRXReader) ReadAllRX() (map[string]map[int]uint64, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls++
 	if r.err != nil {
 		return nil, r.err
 	}
-	src, ok := r.samples[iface]
-	if !ok {
-		// No scripted sample for this iface — return empty map.
-		// Matches a helper that has no bindings on this interface.
-		return map[int]uint64{}, nil
-	}
-	out := make(map[int]uint64, len(src))
-	for k, v := range src {
-		out[k] = v
+	out := make(map[string]map[int]uint64, len(r.samples))
+	for iface, rings := range r.samples {
+		cp := make(map[int]uint64, len(rings))
+		for k, v := range rings {
+			cp[k] = v
+		}
+		out[iface] = cp
 	}
 	return out, nil
 }
@@ -536,6 +534,34 @@ func TestSampleFailure_NeverPermanentSkip(t *testing.T) {
 	}
 }
 
+// Copilot review #1 pin: rebalanceTick must fetch all bindings in
+// a single ReadAllRX call regardless of allowlist size, to avoid
+// N status RPCs per tick (which would hold Manager.mu and block
+// other helper operations like HA sync).
+func TestReader_SingleCallPerTick(t *testing.T) {
+	resetRSSGlobals(t)
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.driver["e1"] = mlx5Driver
+	exec.driver["e2"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	exec.queueCount["e1"] = 6
+	exec.queueCount["e2"] = 6
+	reader := newStubBindingRXReader()
+	reader.set("e0", map[int]uint64{0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 5: 1})
+	reader.set("e1", map[int]uint64{0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 5: 1})
+	reader.set("e2", map[int]uint64{0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 5: 1})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0", "e1", "e2"}
+	rssAllowedRef.Store(&a)
+	state := map[string]*rssRebalanceState{}
+	rebalanceTick(state, exec, reader)
+	if reader.calls != 1 {
+		t.Errorf("expected exactly 1 ReadAllRX call per tick, got %d", reader.calls)
+	}
+}
+
 // Codex R2 Q1 pin: userspaceBindingRXReader must filter out
 // non-Bound and non-XSKRegistered BindingStatus entries. Failed
 // bindings stay in the helper's status list with bound=false and
@@ -806,12 +832,12 @@ type bumpingReader struct {
 	bumpOnRCalled *atomic.Bool
 }
 
-func (r *bumpingReader) ReadBindingRX(iface string) (map[int]uint64, error) {
+func (r *bumpingReader) ReadAllRX() (map[string]map[int]uint64, error) {
 	if !r.bumpOnRCalled.Load() {
 		BumpRSSConfigGen()
 		r.bumpOnRCalled.Store(true)
 	}
-	return r.base.ReadBindingRX(iface)
+	return r.base.ReadAllRX()
 }
 
 // epochBumpingReader simulates a control-plane apply that bumps
@@ -821,12 +847,12 @@ type epochBumpingReader struct {
 	bumpOnRCalled *atomic.Bool
 }
 
-func (r *epochBumpingReader) ReadBindingRX(iface string) (map[int]uint64, error) {
+func (r *epochBumpingReader) ReadAllRX() (map[string]map[int]uint64, error) {
 	if !r.bumpOnRCalled.Load() {
 		BumpRSSEpoch()
 		r.bumpOnRCalled.Store(true)
 	}
-	return r.base.ReadBindingRX(iface)
+	return r.base.ReadAllRX()
 }
 
 func TestConcurrency_StaleWeightsAbandonedOnConfigGenChange(t *testing.T) {

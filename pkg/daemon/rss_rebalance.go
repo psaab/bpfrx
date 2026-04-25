@@ -60,15 +60,23 @@ const (
 )
 
 // bindingRXReader returns per-RX-ring cumulative RX packet counters
-// for iface, keyed by ring index. Bindings are 1:1 with RX rings on
-// the AF_XDP zero-copy path, so binding.QueueID is the ring index.
+// across ALL bound interfaces in a single call, keyed by interface
+// name then ring index. Bindings are 1:1 with RX rings on the
+// AF_XDP zero-copy path, so binding.QueueID is the ring index.
+//
+// Single-call shape (Copilot review #1): rebalanceTick samples once
+// per tick rather than once per allowlisted iface, so the
+// underlying userspace helper Status() RPC fires exactly once per
+// sample interval regardless of N — important because Manager.mu
+// is held during the RPC and the helper control socket is also
+// used for HA sync, session installs, and forwarding sync.
 //
 // Returns (nil, error) if the userspace dataplane helper is
-// unavailable. The rebalance loop treats sample errors as recoverable
-// (see rssRebalanceMaxFailures), so transient helper unreachability
-// does not permanently disable rebalance for an iface.
+// unavailable. The rebalance loop treats sample errors as
+// recoverable (see rssRebalanceMaxFailures), so transient helper
+// unreachability does not permanently disable rebalance.
 type bindingRXReader interface {
-	ReadBindingRX(iface string) (map[int]uint64, error)
+	ReadAllRX() (map[string]map[int]uint64, error)
 }
 
 // userspaceBindingRXReader wraps a *dpuserspace.Manager and produces
@@ -77,7 +85,8 @@ type userspaceBindingRXReader struct {
 	mgr *dpuserspace.Manager
 }
 
-// ReadBindingRX returns map[ring_index]cumulative_rx_packets for iface.
+// ReadAllRX returns map[iface]map[ring_index]cumulative_rx_packets
+// from a single Status() RPC.
 //
 // Codex R2 Q1: filter to usable bindings only (Bound &&
 // XSKRegistered). The helper keeps failed/unlive bindings in the
@@ -88,7 +97,7 @@ type userspaceBindingRXReader struct {
 // guard was added to prevent. Filtering at the reader also makes
 // `len(sample)` reflect truly usable queues, so the downstream
 // shape and exact-key-set guards work as intended.
-func (r userspaceBindingRXReader) ReadBindingRX(iface string) (map[int]uint64, error) {
+func (r userspaceBindingRXReader) ReadAllRX() (map[string]map[int]uint64, error) {
 	if r.mgr == nil {
 		return nil, fmt.Errorf("userspace dataplane manager not available")
 	}
@@ -96,15 +105,20 @@ func (r userspaceBindingRXReader) ReadBindingRX(iface string) (map[int]uint64, e
 	if err != nil {
 		return nil, fmt.Errorf("userspace status: %w", err)
 	}
-	out := make(map[int]uint64, len(status.Bindings))
+	out := make(map[string]map[int]uint64)
 	for _, b := range status.Bindings {
-		if b.Interface != iface {
+		if b.Interface == "" {
 			continue
 		}
 		if !b.Bound || !b.XSKRegistered {
 			continue
 		}
-		out[int(b.QueueID)] = b.RXPackets
+		ifaceMap, ok := out[b.Interface]
+		if !ok {
+			ifaceMap = make(map[int]uint64)
+			out[b.Interface] = ifaceMap
+		}
+		ifaceMap[int(b.QueueID)] = b.RXPackets
 	}
 	return out, nil
 }
@@ -188,6 +202,15 @@ func rebalanceTick(state map[string]*rssRebalanceState, execer rssExecutor, read
 		return
 	}
 
+	// Copilot review #1: fetch all bindings once per tick rather
+	// than per-iface. The userspace helper holds Manager.mu during
+	// the Status() RPC and the helper control socket is shared
+	// with HA sync / session installs / forwarding sync, so we
+	// must minimize churn. allBindings is per-tick scope; if the
+	// helper is unreachable we treat every iface's sample as a
+	// recoverable failure (incrementing sampleFailures).
+	allBindings, allErr := reader.ReadAllRX()
+
 	for _, iface := range allowed {
 		if iface == "lo" {
 			continue
@@ -240,24 +263,30 @@ func rebalanceTick(state map[string]*rssRebalanceState, execer rssExecutor, read
 		// that completes during our compute / lock-wait window.
 		tickEpochSnapshot := curEpoch
 
-		sample, err := reader.ReadBindingRX(iface)
-		if err != nil {
+		if allErr != nil {
 			// Codex MED 2: sample failures are recoverable (typically
-			// helper restart). Track them in their own counter, but
-			// do NOT permanentSkip — log periodically and let the
-			// next successful sample reset state. Apply failures
+			// helper restart). Track per-iface in its own counter,
+			// but do NOT permanentSkip — log periodically and let
+			// the next successful sample reset state. Apply failures
 			// (ethtool kernel reject) remain permanently fatal via
 			// applyFailures.
 			s.sampleFailures++
 			if s.sampleFailures == 1 || s.sampleFailures%rssRebalanceMaxFailures == 0 {
 				slog.Warn("rss rebalance: sample read failed",
-					"iface", iface, "err", err,
+					"iface", iface, "err", allErr,
 					"consecutive_failures", s.sampleFailures)
 			}
 			continue
 		}
 		// Reset sample failure counter on any successful read.
 		s.sampleFailures = 0
+		sample := allBindings[iface]
+		if sample == nil {
+			// Helper has no bindings on this iface — treat as empty
+			// rather than nil so downstream code uses zero-traffic
+			// semantics consistently.
+			sample = map[int]uint64{}
+		}
 
 		// Codex R1 HIGH 1 / R2 Q1 strengthened: defensive guard
 		// against helper bindings covering fewer (or different)
@@ -417,7 +446,7 @@ func rebalanceTick(state map[string]*rssRebalanceState, execer rssExecutor, read
 			s.lastSeenEpoch = LoadRSSEpoch() - 1
 			continue
 		}
-		err = applyWeights(iface, newWeights, execer)
+		err := applyWeights(iface, newWeights, execer)
 		// #835 R5 F2: rebalance writes do NOT bump the global Epoch /
 		// ConfigGen — those are control-plane signals only.
 		RssWriteMuUnlock()
