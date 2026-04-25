@@ -825,6 +825,22 @@ func TestApplyRSSIndirectionOne_NonMlxDriver_WorkersEqualsQueues_NotTouched(t *t
 	}
 }
 
+// #805 test 17 (Copilot inline #1): queueCount==1 short-circuit.
+// On a single-queue NIC there's no possible concentration to undo;
+// the guard `queues > 1` ensures we don't probe in that case.
+func TestApplyRSSIndirectionOne_QueueCountOne_NoOp(t *testing.T) {
+	f := &fakeRSSExecutor{
+		drivers:  map[string]string{"eth0": mlx5Driver},
+		queues:   map[string]int{"eth0": 1},
+		ethtoolX: map[string][]byte{"eth0": []byte("RX flow hash indirection table for eth0 with 1 RX ring(s):\n    0:      0     0     0     0\n")},
+	}
+	applyRSSIndirectionOne("eth0", 6, f)
+
+	if len(f.calls) != 0 {
+		t.Errorf("queueCount=1 must short-circuit before maybeRestoreDefault, got %v", f.calls)
+	}
+}
+
 // #805 test 16 (Codex LOW #3): empty driver string (sysfs unreadable
 // for that iface). Same expectation as non-mlx5: short-circuit.
 func TestApplyRSSIndirectionOne_EmptyDriver_WorkersEqualsQueues_NotTouched(t *testing.T) {

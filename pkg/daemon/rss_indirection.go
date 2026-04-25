@@ -250,7 +250,11 @@ func applyRSSIndirectionOne(iface string, workers int, execer rssExecutor) {
 		// and starves queues that now host worker-bound AF_XDP sockets.
 		// Inspect the live table; if it isn't the round-robin default,
 		// restore it.
-		if workers > 1 && workers >= queues && queues > 0 {
+		//
+		// Guard requires queues > 1: with a single-queue NIC there is
+		// no possible concentration to undo (the default and any
+		// "configured" layout both have entry[i] == 0 for every i).
+		if workers > 1 && workers >= queues && queues > 1 {
 			maybeRestoreDefault(iface, queues, execer)
 		}
 		return
