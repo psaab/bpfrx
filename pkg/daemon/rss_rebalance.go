@@ -104,9 +104,23 @@ type rssRebalanceState struct {
 	currentWeights        []int
 	consecutiveImbalanced int
 	lastRebalanceTime     time.Time
-	consecutiveFailures   int
-	permanentSkip         bool
-	lastSeenEpoch         uint64
+	// applyFailures tracks ethtool -X errors only. A run of
+	// rssRebalanceMaxFailures permanently disables rebalance for
+	// this iface — a write that consistently fails is unrecoverable
+	// (kernel rejects our weight vector). Reset on successful apply.
+	applyFailures int
+	// sampleFailures tracks ReadBindingRX errors only — typically
+	// the userspace helper being unreachable mid-restart. These are
+	// recoverable: we reset to 0 on the first successful sample
+	// rather than permanently skipping the iface.
+	sampleFailures int
+	permanentSkip  bool
+	lastSeenEpoch  uint64
+	// sampleShapeWarned suppresses repeated logging of sample-vs-
+	// expected-domain mismatches (e.g. helper queue_count plan less
+	// than sysfs queue count due to cross-iface min). One Warn per
+	// mismatch transition.
+	sampleShapeWarned bool
 }
 
 // runRSSRebalanceLoop is the goroutine entry point. It reads the live
@@ -215,15 +229,54 @@ func rebalanceTick(state map[string]*rssRebalanceState, execer rssExecutor, read
 
 		sample, err := reader.ReadBindingRX(iface)
 		if err != nil {
-			s.consecutiveFailures++
-			if s.consecutiveFailures >= rssRebalanceMaxFailures {
-				slog.Warn("rss rebalance: iface permanently skipped after sample failures",
+			// Codex MED 2: sample failures are recoverable (typically
+			// helper restart). Track them in their own counter, but
+			// do NOT permanentSkip — log periodically and let the
+			// next successful sample reset state. Apply failures
+			// (ethtool kernel reject) remain permanently fatal via
+			// applyFailures.
+			s.sampleFailures++
+			if s.sampleFailures == 1 || s.sampleFailures%rssRebalanceMaxFailures == 0 {
+				slog.Warn("rss rebalance: sample read failed",
 					"iface", iface, "err", err,
-					"failures", s.consecutiveFailures)
-				s.permanentSkip = true
+					"consecutive_failures", s.sampleFailures)
 			}
 			continue
 		}
+		// Reset sample failure counter on any successful read.
+		s.sampleFailures = 0
+
+		// Codex HIGH 1: defensive guard against helper bindings
+		// covering fewer queues than the rebalance domain expects
+		// (e.g. cross-iface queue_count min — see
+		// userspace-dp/src/main.rs:1148). Without this, queues with
+		// no AF_XDP socket look "cold" and the rebalance moves
+		// weight toward them, redirecting traffic into the kernel
+		// fallback path.
+		//
+		// expectedRingCount mirrors the indirection-table active
+		// width (#785). If sample shape doesn't match (helper
+		// covers fewer queues, or sample is empty during a
+		// helper-side reconfigure), skip this tick rather than
+		// rebalance with a partial domain.
+		if len(sample) != expectedRingCount {
+			if !s.sampleShapeWarned {
+				slog.Warn("rss rebalance: sample shape != expected domain — skipping",
+					"iface", iface,
+					"sample_count", len(sample),
+					"expected_domain", expectedRingCount,
+					"workers", workers)
+				s.sampleShapeWarned = true
+			}
+			// Reset baseline so the next matched-shape sample
+			// starts a fresh delta window.
+			s.firstSample = true
+			s.consecutiveImbalanced = 0
+			continue
+		}
+		// Shape matches — clear the warned flag so a future
+		// transition to mismatch logs once again.
+		s.sampleShapeWarned = false
 
 		if s.firstSample {
 			s.lastSampleCounters = sample
@@ -324,11 +377,11 @@ func rebalanceTick(state map[string]*rssRebalanceState, execer rssExecutor, read
 		RssWriteMuUnlock()
 
 		if err != nil {
-			s.consecutiveFailures++
-			if s.consecutiveFailures >= rssRebalanceMaxFailures {
+			s.applyFailures++
+			if s.applyFailures >= rssRebalanceMaxFailures {
 				slog.Warn("rss rebalance: iface permanently skipped after apply failures",
 					"iface", iface, "err", err,
-					"failures", s.consecutiveFailures)
+					"failures", s.applyFailures)
 				s.permanentSkip = true
 			}
 			continue
@@ -336,7 +389,7 @@ func rebalanceTick(state map[string]*rssRebalanceState, execer rssExecutor, read
 		s.currentWeights = newWeights
 		s.lastRebalanceTime = time.Now()
 		s.consecutiveImbalanced = 0
-		s.consecutiveFailures = 0
+		s.applyFailures = 0
 		slog.Info("rss rebalance applied",
 			"iface", iface, "weights", newWeights,
 			"delta_pkts", delta)

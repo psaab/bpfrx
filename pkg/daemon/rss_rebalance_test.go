@@ -494,15 +494,16 @@ func TestApplyWeights_PermanentSkipAfterMaxFailures(t *testing.T) {
 		rebalanceTick(st, exec, reader)
 	}
 	if !s.permanentSkip {
-		t.Errorf("expected permanentSkip after %d failures, got consecutiveFailures=%d",
-			rssRebalanceMaxFailures, s.consecutiveFailures)
+		t.Errorf("expected permanentSkip after %d failures, got applyFailures=%d",
+			rssRebalanceMaxFailures, s.applyFailures)
 	}
 }
 
-// Sample-source failures (helper unreachable) accumulate
-// consecutiveFailures and eventually permanentSkip — same gate as
-// apply failures but on the read path.
-func TestSampleFailure_PermanentSkipAfterMaxFailures(t *testing.T) {
+// Codex MED 2 pin: sample failures (helper unreachable) accumulate
+// in sampleFailures but DO NOT permanently skip the iface — they're
+// recoverable. The first successful sample after a streak of
+// failures must reset the counter back to 0.
+func TestSampleFailure_NeverPermanentSkip(t *testing.T) {
 	resetRSSGlobals(t)
 	s := &rssRebalanceState{currentWeights: equalWeights(6), firstSample: true}
 	exec := newStubRSSExecutor()
@@ -515,12 +516,63 @@ func TestSampleFailure_PermanentSkipAfterMaxFailures(t *testing.T) {
 	a := []string{"e0"}
 	rssAllowedRef.Store(&a)
 	st := map[string]*rssRebalanceState{"e0": s}
-	for i := 0; i < rssRebalanceMaxFailures; i++ {
+	// 3× MaxFailures sample errors must NOT permanently skip.
+	for i := 0; i < 3*rssRebalanceMaxFailures; i++ {
 		rebalanceTick(st, exec, reader)
 	}
-	if !s.permanentSkip {
-		t.Errorf("expected permanentSkip after %d sample failures, got %d",
-			rssRebalanceMaxFailures, s.consecutiveFailures)
+	if s.permanentSkip {
+		t.Errorf("sample failures must not permanentSkip the iface")
+	}
+	if s.sampleFailures != 3*rssRebalanceMaxFailures {
+		t.Errorf("sampleFailures: got %d, want %d", s.sampleFailures, 3*rssRebalanceMaxFailures)
+	}
+	// Recover: clear error and feed a valid sample. sampleFailures
+	// must reset to 0.
+	reader.err = nil
+	reader.set("e0", map[int]uint64{0: 100, 1: 100, 2: 100, 3: 100, 4: 100, 5: 100})
+	rebalanceTick(st, exec, reader)
+	if s.sampleFailures != 0 {
+		t.Errorf("sampleFailures must reset on successful sample: got %d", s.sampleFailures)
+	}
+}
+
+// Codex HIGH 1 pin: when the helper exposes fewer queue bindings
+// than the rebalance domain expects (cross-iface queue_count min in
+// userspace-dp/src/main.rs:1148), skip the rebalance for this tick.
+// Migrating weight toward unbound queues would redirect traffic to
+// the kernel fallback path.
+func TestSampleShape_MismatchSkipsRebalance(t *testing.T) {
+	resetRSSGlobals(t)
+	s := &rssRebalanceState{
+		currentWeights:        equalWeights(6),
+		consecutiveImbalanced: rssRebalanceStability,
+		lastRebalanceTime:     time.Now().Add(-2 * rssRebalanceCooldown),
+		firstSample:           false,
+		lastSampleTime:        time.Now().Add(-2 * time.Second),
+		lastSampleCounters:    map[int]uint64{0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+	}
+	exec := newStubRSSExecutor()
+	exec.driver["e0"] = mlx5Driver
+	exec.queueCount["e0"] = 6
+	reader := newStubBindingRXReader()
+	// expectedRingCount = min(6,6)=6 but helper exposes only 4
+	// bindings (queues 0..3) — workers/queues say 6 but cross-iface
+	// min queue_count limited bindings to 4.
+	reader.set("e0", map[int]uint64{0: 5000, 1: 100, 2: 100, 3: 100})
+	rssEnabled.Store(true)
+	rssWorkers.Store(6)
+	a := []string{"e0"}
+	rssAllowedRef.Store(&a)
+	rebalanceTick(map[string]*rssRebalanceState{"e0": s}, exec, reader)
+	if len(exec.ethtoolXCalls) != 0 {
+		t.Errorf("shape mismatch must skip rebalance write: got %d -X calls",
+			len(exec.ethtoolXCalls))
+	}
+	if !s.firstSample {
+		t.Errorf("shape mismatch must reset firstSample so next matched-shape sample re-baselines")
+	}
+	if s.consecutiveImbalanced != 0 {
+		t.Errorf("shape mismatch must reset consecutiveImbalanced: got %d", s.consecutiveImbalanced)
 	}
 }
 

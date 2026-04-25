@@ -647,23 +647,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
-	// #840 Slice D v2 — start the RSS rebalance loop. Reads live
-	// config state from the rss_indirection.go atomic vars on each
-	// tick, so runtime changes (config reload, kill switch) take
-	// effect on the next tick without restart. The signal source is
-	// the userspace dataplane helper's per-binding RX-packet counter
-	// (1:1 with RX rings under AF_XDP zero-copy). For non-userspace
-	// deploys, a nil reader is passed and the loop is a pure no-op.
-	// Spawned exactly once; ctx cancellation stops it cleanly.
-	// Skipped only when xpfd is run without a dataplane (--no-dataplane).
-	if !d.opts.NoDataplane {
-		var rssReader bindingRXReader
-		if um, ok := d.dp.(*dpuserspace.Manager); ok {
-			rssReader = userspaceBindingRXReader{mgr: um}
-		}
-		go runRSSRebalanceLoop(ctx, realRSSExecutor{}, rssReader)
-	}
-
 	// Remove stale blackhole routes from previous daemon runs before
 	// cluster comms start (which may inject new ones).
 	if d.cluster != nil {
@@ -692,6 +675,31 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// WaitGroup for coordinated shutdown of background goroutines
 	var wg sync.WaitGroup
+
+	// #840 Slice D v2 — start the RSS rebalance loop. Reads live
+	// config state from the rss_indirection.go atomic vars on each
+	// tick, so runtime changes (config reload, kill switch) take
+	// effect on the next tick without restart. The signal source is
+	// the userspace dataplane helper's per-binding RX-packet counter
+	// (1:1 with RX rings under AF_XDP zero-copy). For non-userspace
+	// deploys, a nil reader is passed and the loop is a pure no-op.
+	//
+	// Codex MED 1: spawned with the post-NotifyContext ctx so SIGTERM
+	// / SIGINT cancels the loop directly (rather than waiting for the
+	// outer parent ctx to cancel), and tracked via wg so daemon
+	// shutdown waits for the loop to exit before tearing down the
+	// userspace manager.
+	if !d.opts.NoDataplane {
+		var rssReader bindingRXReader
+		if um, ok := d.dp.(*dpuserspace.Manager); ok {
+			rssReader = userspaceBindingRXReader{mgr: um}
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runRSSRebalanceLoop(ctx, realRSSExecutor{}, rssReader)
+		}()
+	}
 
 	// NOTE: session sync dp wiring + sweep start moved into startClusterComms
 	// goroutine to avoid race: d.sessionSync is created asynchronously.
@@ -1725,6 +1733,18 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) {
 	}
 	// Reset VIP warning suppression so new config gets fresh warnings.
 	d.vipWarnedIfaces = nil
+
+	// Codex HIGH 2 (#840 RSS rebalance race): bump ConfigGen at the
+	// top of applyConfigLocked, BEFORE d.dp.Compile (line ~1998)
+	// changes helper bindings. The rebalance loop's tick-start
+	// ConfigGen snapshot taken before this bump will mismatch the
+	// post-lock re-check, causing any in-flight rebalance to
+	// abandon. Step 21 below (reapplyRSSIndirection at ~line 2583)
+	// bumps ConfigGen again with the new state once the apply
+	// completes — that bump is what publishes the new
+	// (rssEnabled, rssWorkers, rssAllowed). Between these two bumps
+	// the rebalance loop sees no consistent ConfigGen and abandons.
+	BumpRSSConfigGen()
 
 	// Log config validation warnings
 	for _, w := range cfg.Warnings {
