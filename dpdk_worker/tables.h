@@ -91,7 +91,8 @@
 #define GLOBAL_CTR_FLOW_CACHE_MISS       37
 #define GLOBAL_CTR_FLOW_CACHE_FLUSH      38
 #define GLOBAL_CTR_FLOW_CACHE_INVALIDATE 39
-#define GLOBAL_CTR_MAX                   40
+#define GLOBAL_CTR_VLAN_PUSH_FAIL        40
+#define GLOBAL_CTR_MAX                   41
 
 /* ============================================================
  * RX mode constants
