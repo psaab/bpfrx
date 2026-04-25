@@ -12,8 +12,8 @@ attempt to stall:
 
 | Issue | Approach | Outcome |
 |---|---|---|
-| #836 | shared MQFQ HOL-finish-time array | Closed at R7 plan review (7 HIGH; non-commutative quantity) |
-| #840 | RSS rebalance from per-binding RX signal | Implemented + reverted (`docs/pr/835-slice-d-rss/findings.md`); deploy CoV 37.7 % vs 18.5 % baseline; **made fairness worse** |
+| #836 | shared MQFQ HOL-finish-time array | Closed without implementation 2026-04-22; non-commutative quantity (see issue #836 discussion + sibling #837) |
+| #840 | RSS rebalance from per-binding RX signal | Implemented + reverted; revert commit `1c611d01` carries the 37.7 % vs 18.5 % CoV data in its message; **made fairness worse**. See also `docs/pr/835-slice-d-rss/findings.md` for the dead-signal predecessor finding |
 | #838 | per-flow bytes-served counter, periodic reset | 5 plan rounds, 14+ HIGH cumulatively; stuck at structural blocker |
 
 **Empirical baseline (#900) shows the existing scheduler is acceptable
@@ -30,17 +30,20 @@ Recommendation: **stop algorithm work, do measurement.**
 ### #836 — shared HOL-finish-time array
 - Plan tried to share MQFQ virtual finish times across bindings via
   atomic head/tail per bucket.
-- Codex review (`docs/pr/836-shared-flow-vtime/codex-plan-review.md`) found
-  HOL-finish-time is **not commutative**: it's a per-packet timestamp,
-  changes non-additively on every dequeue, rollback needs snapshot
-  state, and concurrent writers can corrupt the ordering.
-- Closed without implementation. Folded into the larger #837
-  redesign.
+- Plan review (in-issue discussion on #836; no docs/pr archive was
+  committed for this issue) concluded HOL-finish-time is **not
+  commutative**: it's a per-packet timestamp, changes non-additively on
+  every dequeue, rollback needs snapshot state, and concurrent writers
+  can corrupt the ordering.
+- Closed without implementation 2026-04-22. The larger redesign that
+  would be needed for cross-binding MQFQ is preserved as #837.
 
 ### #840 — RSS rebalance from per-binding RX signal
 - Implemented. Code review MERGE YES. 33+ unit tests pass.
 - Deployed: 10-run CoV measurement.
-- **Result: CoV 37.7 % enabled vs 18.5 % baseline** (`docs/pr/840-slice-d-v2/findings.md`).
+- **Result: CoV 37.7 % enabled vs 18.5 % baseline** (data captured in
+  the revert commit message at `1c611d01`; no separate findings file
+  was committed for #840).
 - Root cause: the rebalance loop steers RSS hashes toward "underloaded"
   RX rings, but those rings are underloaded *because their flows are
   small*; moving the larger flows onto them creates oscillation and
@@ -198,14 +201,15 @@ worth implementing. Algorithm work is the wrong next step.
 
 ## Files
 
-- `docs/pr/838-afd-lite/plan.md` — five-round plan; preserved as
-  design archive.
-- `docs/pr/836-shared-flow-vtime/` — predecessor; HOL-finish
-  closed-without-implementation.
+- `docs/pr/838-afd-lite/plan.md` — five-round plan archive (R1-R5
+  review responses).
 - `docs/pr/835-slice-d-rss/findings.md` — RSS rebalance signal-dead
-  empirical finding.
-- `docs/pr/840-slice-d-v2/findings.md` — RSS rebalance with valid
-  signal, CoV-worse-than-baseline empirical finding.
-- `docs/pr/900-100e100m-harness/findings.md` — 128-stream baseline
-  acceptable.
+  predecessor finding (the ethtool-S signal was inactive under
+  AF_XDP zero-copy).
+- Commit `1c611d01` — #840 revert; CoV 37.7 % vs 18.5 % baseline
+  data in the commit message body.
+- `docs/pr/900-100e100m-harness/findings.md` — 128-stream baseline,
+  CoV 16.6 %, 0 collapses.
+- Issue #836 (closed 2026-04-22) — predecessor; HOL-finish
+  non-commutative; folded into #837 for any future redesign.
 - `docs/pr/838-afd-lite/findings.md` — this document.

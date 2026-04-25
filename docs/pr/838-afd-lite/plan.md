@@ -688,3 +688,64 @@ addressed below.
 | 11| MED | now_ns plumbing surface incomplete  | RESOLVED — §6.3.3 enumerates the full caller surface including `select_cos_guarantee_batch`, `select_cos_surplus_batch`, `build_cos_batch_from_queue` |
 | 4 | LOW | FIFO path irrelevance                | RESOLVED — §6.3.4 explicit |
 | 6 | LOW | No FIFO ring revert                  | RESOLVED — §6.3.4 + §6.3.5 explicit |
+
+### Round 5 (5 HIGH + 2 MED + 1 LOW; conducted on plan commit `1bbd61c1`)
+
+R5 hostile review of the v3 plan after R4 fixes uncovered a
+**structural blocker** that prior rounds did not surface, plus four
+additional HIGH findings.
+
+| #  | Sev | Topic                                  | Status |
+|----|-----|----------------------------------------|--------|
+| Q9 | HIGH| **Selector blind during scratch-build** | NOT RESOLVED — see narrative below |
+| Q10| HIGH| Period-window staleness on settle      | open   |
+| Q11| HIGH| `active_count` race vs reset           | open   |
+| Q12| HIGH| Settle-site count assumes full submit  | open   |
+| Q13| HIGH| now_ns plumbing depth still incomplete | open   |
+| Q14| MED | Acceptance-bar still ungrounded vs noise floor | open |
+| Q15| MED | Test #15-#17 do not exercise Q9 path   | open   |
+| Q16| LOW | Stale comment in tx.rs:5326-5329       | trivial |
+
+**Q9 (the structural blocker, in the reviewer's wording):**
+> The selector runs during scratch-build (one decision per packet at
+> `service_exact_local_queue_direct_flow_fair` and the prepared
+> equivalent), but accounting happens at *settle* (one
+> `account_per_flow` per *batch* in `settle_*_flow_fair`). The
+> selector is therefore BLIND to packets it has already selected
+> earlier in the current batch — they are still sitting in
+> `scratch_local_tx`, the per-flow counter has not been bumped, and
+> the period-bytes-total has not advanced.
+>
+> With `TX_BATCH_SIZE: usize = 256` (`userspace-dp/src/afxdp.rs:159`)
+> and best-effort fair share at ~16 packets per 2 ms period, the
+> selector can ship multiple periods' worth of packets within one
+> scratch build. AFD never engages on the batch path — exactly the
+> path the v3 plan calls "the PRIMARY workload path" in §6.3.2.
+
+**Why this is structural, not a fix-in-place:** the v3 design's
+*premise* is that account-after-TX-insert (no rollback) is safe
+because the insert-and-account window is short. R5 shows the window
+is one entire batch — 256 × insert decisions before one accounting
+update. The fix would require either:
+
+(a) **provisional per-batch accounting at selection time** (commit
+    bytes to a thread-local shadow of `period_bytes_per_flow`,
+    then reconcile with the shared atomic at settle, with rollback
+    on the rejected-tail). This re-introduces the rollback path
+    that R3-R4 were specifically structured to avoid; the contract
+    of the no-rollback design no longer holds.
+
+(b) **shrink TX_BATCH_SIZE during AFD-active periods**, which has
+    its own throughput cost and breaks the existing batching
+    invariants relied on by the kick-latency path.
+
+Either fix is a structural redesign at v4 scope. The R5 reviewer
+did not propose one; the cost-vs-expected-gain (1-3 pp CoV at most)
+does not justify another round of plan-design effort.
+
+### R5 disposition
+
+The plan does not advance to a v4. See
+`docs/pr/838-afd-lite/findings.md` for the broader negative-finding
+writeup and the recommended path forward (defer algorithm work,
+characterize mouse-latency tail empirically first via #905).
