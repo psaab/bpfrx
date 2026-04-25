@@ -42,11 +42,18 @@ type InterfaceMonitorStatus struct {
 // Manager handles tunnel and VRF lifecycle.
 type Manager struct {
 	nlHandle   *netlink.Handle
-	tunnels    []string                    // currently created tunnel interface names
-	xfrmis     []string                    // currently created xfrmi interface names
-	bonds      []string                    // currently created bond interface names
-	reths      []string                    // currently created RETH interface names
 	keepalives map[string]*keepaliveRunner // tunnel name -> runner
+
+	// #848: ifaceMu serializes all reads and writes of the
+	// tunnels/xfrmis/bonds slices. ApplyTunnels/ApplyXfrmi/
+	// ApplyBonds and their Clear counterparts hold it for the full
+	// duration including netlink calls; GetTunnelStatus snapshots
+	// the slice under the lock and iterates lock-free so a long
+	// gRPC read can't block applyConfig.
+	ifaceMu sync.Mutex
+	tunnels []string // currently created tunnel interface names
+	xfrmis  []string // currently created xfrmi interface names
+	bonds   []string // currently created bond interface names
 
 	// vrfsMu serializes all reads and writes of vrfs, and is held for
 	// the full duration of ReconcileVRFs/CreateVRF including the
@@ -422,7 +429,9 @@ func routeToEntry(m *Manager, r netlink.Route, family int) RouteEntry {
 // Previous tunnels are removed first. Starts keepalive probes for tunnels that have
 // keepalive configured.
 func (m *Manager) ApplyTunnels(tunnels []*config.TunnelConfig) error {
-	if err := m.ClearTunnels(); err != nil {
+	m.ifaceMu.Lock()
+	defer m.ifaceMu.Unlock()
+	if err := m.clearTunnelsLocked(); err != nil {
 		slog.Warn("failed to clear previous tunnels", "err", err)
 	}
 
@@ -735,6 +744,15 @@ func (m *Manager) GetKeepaliveState(tunnelName string) *KeepaliveState {
 
 // ClearTunnels removes all previously created tunnel interfaces.
 func (m *Manager) ClearTunnels() error {
+	m.ifaceMu.Lock()
+	defer m.ifaceMu.Unlock()
+	return m.clearTunnelsLocked()
+}
+
+// clearTunnelsLocked is the lock-free body of ClearTunnels. Caller
+// must hold ifaceMu. Used internally by ApplyTunnels which already
+// holds the lock.
+func (m *Manager) clearTunnelsLocked() error {
 	m.stopAllKeepalives()
 	for _, name := range m.tunnels {
 		link, err := m.nlHandle.LinkByName(name)
@@ -755,7 +773,9 @@ func (m *Manager) ClearTunnels() error {
 // Each VPN with a BindInterface (e.g. "st0.0") gets a unit-specific xfrmi
 // device and a stable XFRM interface ID derived from the st/unit pair.
 func (m *Manager) ApplyXfrmi(vpns map[string]*config.IPsecVPN) error {
-	if err := m.ClearXfrmi(); err != nil {
+	m.ifaceMu.Lock()
+	defer m.ifaceMu.Unlock()
+	if err := m.clearXfrmiLocked(); err != nil {
 		slog.Warn("failed to clear previous xfrmi interfaces", "err", err)
 	}
 
@@ -824,6 +844,14 @@ func (m *Manager) ApplyXfrmi(vpns map[string]*config.IPsecVPN) error {
 
 // ClearXfrmi removes all previously created xfrmi interfaces.
 func (m *Manager) ClearXfrmi() error {
+	m.ifaceMu.Lock()
+	defer m.ifaceMu.Unlock()
+	return m.clearXfrmiLocked()
+}
+
+// clearXfrmiLocked is the lock-free body of ClearXfrmi. Caller must
+// hold ifaceMu. Used internally by ApplyXfrmi.
+func (m *Manager) clearXfrmiLocked() error {
 	for _, name := range m.xfrmis {
 		link, err := m.nlHandle.LinkByName(name)
 		if err != nil {
@@ -852,8 +880,14 @@ type TunnelStatus struct {
 
 // GetTunnelStatus returns the status of managed tunnel interfaces.
 func (m *Manager) GetTunnelStatus() ([]TunnelStatus, error) {
+	// #848: snapshot tunnel names under ifaceMu, then iterate
+	// without the lock so a long netlink probe can't block applyConfig.
+	m.ifaceMu.Lock()
+	names := append([]string(nil), m.tunnels...)
+	m.ifaceMu.Unlock()
+
 	var result []TunnelStatus
-	for _, name := range m.tunnels {
+	for _, name := range names {
 		ts := TunnelStatus{Name: name, State: "down"}
 
 		link, err := m.nlHandle.LinkByName(name)
@@ -1764,8 +1798,9 @@ func resolveRibTable(ribName string, tableIDs map[string]int) int {
 // member-interfaces configured. Uses the bond mode from InterfaceConfig.BondMode
 // (active-backup for fabric bonds, 802.3ad for ae interfaces).
 func (m *Manager) ApplyBonds(interfaces []*config.InterfaceConfig) error {
-	// Clear previous bonds first
-	if err := m.ClearBonds(); err != nil {
+	m.ifaceMu.Lock()
+	defer m.ifaceMu.Unlock()
+	if err := m.clearBondsLocked(); err != nil {
 		slog.Warn("failed to clear previous bonds", "err", err)
 	}
 
@@ -1845,6 +1880,14 @@ func (m *Manager) ApplyBonds(interfaces []*config.InterfaceConfig) error {
 
 // ClearBonds removes all previously created bond devices.
 func (m *Manager) ClearBonds() error {
+	m.ifaceMu.Lock()
+	defer m.ifaceMu.Unlock()
+	return m.clearBondsLocked()
+}
+
+// clearBondsLocked is the lock-free body of ClearBonds. Caller must
+// hold ifaceMu. Used internally by ApplyBonds.
+func (m *Manager) clearBondsLocked() error {
 	for _, name := range m.bonds {
 		link, err := m.nlHandle.LinkByName(name)
 		if err != nil {
@@ -1870,9 +1913,6 @@ func (m *Manager) ApplyRethInterfaces(interfaces map[string]*config.InterfaceCon
 // It scans for any existing reth* bond devices (including stale ones from
 // previous binary versions) and deletes them.
 func (m *Manager) ClearRethInterfaces() error {
-	// First, clear any tracked names from this session.
-	m.reths = nil
-
 	// Scan all links for reth* bond devices left from previous deploys.
 	links, err := m.nlHandle.LinkList()
 	if err != nil {
